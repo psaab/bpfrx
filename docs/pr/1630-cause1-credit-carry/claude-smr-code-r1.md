@@ -116,5 +116,37 @@ enforced guard, not a comment.
   smoke matrix, `make test-failover`. Run after cluster acquisition.
 
 ## Tests
-`cargo test --bin xpf-userspace-dp`: 1542 passed / 0 failed / 2 ignored.
-8 new carry tests + the 4 updated P2 tests all green.
+`cargo test --bin xpf-userspace-dp`: 1543 passed / 0 failed / 2 ignored.
+9 new carry tests + the 4 updated P2 tests all green.
+
+## r1 review-round addenda (post-dispatch)
+
+- **Codex r1** (1 Major + 1 Medium): both were the floored-`lag_epochs`
+  boundary hole (regime-1 admitting up to `(K+1)×EPOCH−ε`, breaching the
+  burst bound by one epoch; and `STALL×EPOCH+1ns` skipping regime-3).
+  FIXED in `4a2b998f7` — regime selection now compares `raw_elapsed_ns`
+  against exact `K×EPOCH` / `STALL×EPOCH` ns thresholds. New
+  `v8_carry_regime_boundaries_use_exact_nanoseconds_not_floored_epochs`
+  pins all three boundaries; ceiling test tightened to assert the
+  worst-case regime-1 grant EQUALS exactly `(2K−1)×rate×EPOCH`.
+- **AGY r1**: MERGE-READY across all six axes (burst bound, Relaxed-fence
+  safety, regime-3 HA cold-resume, carry privacy, u128 arithmetic, P2
+  ordering) with quoted-line evidence; no findings.
+- **Copilot r1**: same boundary Major (already fixed) + a doc nit (PR
+  plan.md held the cause-2 plan by mistake). Both addressed (`7e6f7115f`).
+
+## Cluster validation
+
+- **Scoped Gate-1 SOLO (v4 push, reproducible x3)**: 100m **95.0 %**,
+  1g **95.3 %** of shape — PASS (baseline 81 % / 84 %). Four-class table
+  for the record: parallel four-alone and v6 land 1-3 pp lower at the
+  cause-2 physics floor (documented, not the pass bar).
+- **`make test-failover`: 13 passed / 0 failed** — unclean fw0 reboot →
+  failover → rejoin-as-secondary → manual failover, iperf3 zero-drop
+  through all three transitions. Validates the carry/seqlock/epoch HA
+  path (regime-3 cold-resume on the reused lease across failback).
+- **cause-2 resolved-as-physics** (coordinator §5 measurement): the
+  3g/6g residual improves with parallelism (`-P1` 0.878 → `-P12` 0.949),
+  proving it is ACK-clocked single-flow token-bucket fill, not a
+  fair-share bug. Documented in fairness-regimes.md; PR now
+  `Closes #1630` + `Closes #1643`.

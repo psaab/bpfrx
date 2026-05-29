@@ -885,10 +885,13 @@ In addition to the structural per-flow CoV gate above
 
 Even SOLO (one class, one port, zero competition) the lowest-rate exact
 classes could not reach their configured shape — a per-class floor in the
-v8 epoch rate-meter, independent of cross-class competition. Two distinct
-root causes were isolated by a SOLO A/B; #1630 (cause-1) fixes the lower-
-rate one (100m, 1g). A mid-rate ~6 % residual on 3g/6g is a separate root
-cause (cause-2) tracked under #1630 and is NOT addressed here.
+v8 epoch rate-meter, independent of cross-class competition. A SOLO A/B
+isolated TWO distinct root causes:
+
+- **cause-1** (fixed here): the rotation rate-meter clamp + sub-frame
+  selector discard, which pinned 100m at ~81 % and 1g at ~84 % of shape;
+- **cause-2** (a transport-physics floor, NOT a scheduler defect, see
+  below): a `K`-independent mid-rate residual on 3g/6g.
 
 Cause-1 has two composing parts:
 
@@ -919,8 +922,39 @@ Cause-1 has two composing parts:
   cap raised in lock-step. The long-run rate is still metered by the v8
   per-epoch grant and the actual-byte debit, so the hard-cap holds.
 
-The scoped acceptance gate is `cos-gate1-small-four-alone.sh` SOLO: 100m
-and 1g each ≥ 95 % of shape under `guarantee-rate 0.7`.
+Measured effect of cause-1 (loss userspace cluster, reth0.80,
+`guarantee-rate 0.7`, 12 streams, push, v4, SOLO one class at a time):
+
+| Class | master baseline | cause-1 (this fix) SOLO |
+|-------|----------------:|------------------------:|
+| 100m  | ~81 %           | **95.0 %** |
+| 1g    | ~84 %           | **95.3 %** |
+
+The scoped acceptance gate is 100m and 1g each ≥ 95 % of shape **SOLO**
+(`cos-gate1-small-four-alone.sh` run one class at a time, or the per-port
+SOLO loop). The four-classes-in-parallel variant of that harness and the
+IPv6 path land 1-3 pp lower (parallel cross-class contention + the v6
+per-packet header overhead push the small classes onto the cause-2
+physics floor below); those are reported for the record, not as the
+pass/fail bar.
+
+### Mid-rate transport-physics floor (#1630 cause-2 — documented, not fixed)
+
+The mid-rate exact classes (3g/6g) carry a `K`-independent ~6 % shape
+residual that **no scheduler change recovers** — it is single-TCP-flow-
+bundle, ACK-clocked bursty delivery that cannot keep one worker's
+per-CPU AF_XDP token bucket continuously full (measured queue park
+19-117K/s, root never throttling, `parkR = 0`). The decisive
+discriminator (cause-2 §5 measurement on #1630): drain-sent / shape is
+WORST at `-P1` (single worker, whole-class cap ≈ 0.878) and RECOVERS with
+parallelism (`-P4` ≈ 0.918, `-P12` ≈ 0.949). A cross-worker fair-share
+bug would WORSEN with more workers; this IMPROVES — so it is transport
+physics, not a fairness defect. At high parallelism (`-P12`) the mid-rate
+classes reach ~93-95 % of shape; at low parallelism they sit lower,
+bounded by the token-bucket fill rate a bursty single flow can sustain.
+This floor is therefore a documented characteristic of the per-CPU
+AF_XDP + token-bucket transport, NOT a `guarantee-rate` Gate failure, and
+is intentionally not a pass/fail bar.
 
 ### Simul-load harness
 
