@@ -29,21 +29,22 @@ Edited files:
 | N≤M even placement needs negative dependence = reactive re-steer = forbidden | research plan §5, §7.0 "negative dependence", §8 | GROUNDED |
 | #1203/#789 measured 49–55% CoV at P=12, closed with within-queue-scheduling verdict | research plan §4 (table + verbatim close comment); already in fairness-regimes.md existing #1203 reference | GROUNDED |
 | Two external reviewers (Codex + AGY) reproduced Monte-Carlo + confirmed kill | issue #1649 close comment ("Codex + AGY + Claude SMR all PLAN-READY on the kill"); research plan §11 | GROUNDED |
-| Aggregate throughput unaffected; floor not scheduler bug | research plan §1 ("Aggregate is fine (~17.2 G, the push ceiling); only per-flow distribution ... uneven"), §8 | GROUNDED |
+| Floor is primarily a per-flow distribution effect, not an aggregate defect; aggregate is evaluated against the existing Gate-3 `Nₐ/Nᵥ`-scaled cap (idle-worker draws can lower saturated aggregate) | research plan §1 ("only per-flow distribution ... uneven"; the `-P 6` run sat near its push ceiling), §8; this doc's Gate 3 + saturation-detection scaling | GROUNDED (round-2 corrected — an earlier draft said "aggregate unaffected", which overstated it; see round-2 finding 2) |
 | #1630 cause-1 = low-rate 100m/1g lazy-rotation credit loss; cause-2 = separate mid-rate ~6% residual on 3g/6g | PR #1650 body + its fairness-regimes.md hunk ("a mid-rate ~6 % residual on 3g/6g is a separate root cause (cause-2)"); issue #1630 | GROUNDED — I describe cause-2 only as PR #1650 already characterizes it (a separate mid-rate residual), I do NOT independently assert a "token-bucket fill" mechanism that is not yet merged/verified |
 | Cross-refs #1333/#1304/#1649 + killed chain #1215/#837/#937/#840/#1238/#1243 | issue #1649 (label, body), research plan §9 ("Cross-link #1649, #1203/#789, #840, #937"), MEMORY per-5-tuple kill entries | GROUNDED |
 
-### Coordination with PR #1650 (open, also edits fairness-regimes.md)
+### Coordination with PR #1650 (pre-rebase history)
 
-PR #1650 (`fix/1630-cause1-credit-carry`) inserts a "Small-class per-class
-rate-metering floor (#1630 cause-1)" section near the CoS oversubscription
-area (after the guarantee-rate gates, ~line 883). My new section is inserted
-much earlier (right after "Structural CoV ceiling — worked examples",
-~line 117), so the two hunks do not overlap textually. My #1630 paragraph
-*references* PR #1650's section by name rather than duplicating its content.
-If #1650 merges first, my PR rebases cleanly (disjoint hunks). If mine merges
-first, #1650 rebases cleanly. Item 4 of the brief (note the cause-2 residual)
-is satisfied without clobbering: I name cause-2 exactly as #1650 names it.
+This subsection records the coordination prediction made while PR #1650 was
+still open; the actual outcome is in the "Post-rebase coordination with #1650
+(merged)" section below, which is the current state. Originally: PR #1650
+(`fix/1630-cause1-credit-carry`) inserts a "Small-class per-class rate-metering
+floor (#1630 cause-1)" section in the CoS oversubscription area; this PR's new
+section is inserted much earlier (right after "Structural CoV ceiling — worked
+examples"), so the two hunks are disjoint. The prediction "if #1650 merges
+first, this PR rebases cleanly" held exactly (see below). Item 4 of the brief
+(note the cause-2 residual) is satisfied without clobbering: cause-2 is named
+exactly as #1650 names it.
 
 ## CLAUDE.md claim
 
@@ -151,9 +152,28 @@ CoV floor (RSS multinomial)" after the structural-ceiling examples; #1650's
 "Small-class per-class rate-metering floor (#1630 cause-1)" in the CoS
 oversubscription area). Both sets of additions are preserved per the brief.
 
+## Copilot round-3 findings and resolutions
+
+Copilot returned 3 comments on the rebased HEAD (SHA `8bb1d03f9`), all
+internal-consistency findings about stale self-review / log statements that
+contradicted the post-rebase reality; all 3 addressed:
+
+1. **SMR source-of-truth row still said "aggregate unaffected."** Correct — it
+   contradicted the round-2-corrected fairness-regimes text. FIXED: the row now
+   states the per-flow-distribution framing with the Gate-3 `Nₐ/Nᵥ` scaling and
+   notes the round-2 correction.
+2. **"Coordination with PR #1650 (open)" section stale post-rebase.** Correct —
+   it described #1650 as open/future while the later section says it merged.
+   FIXED: relabeled as "pre-rebase history" and pointed to the post-rebase
+   section as the current state.
+3. **_Log.md round-2 entry described a superseded intermediate state.** Correct
+   — it said the #1650 reference was replaced with stable issue/PR refs, but the
+   rebase restored the in-file link. FIXED: the log entry now records both the
+   round-2 qualifier and the post-rebase restoration.
+
 ## Verdict
 
-ACCURACY-CLEAN (post round-2). Every claim traces to the #1649 research plan (commit `36fcd1b8`),
+ACCURACY-CLEAN (post round-3). Every claim traces to the #1649 research plan (commit `36fcd1b8`),
 PR #1650 / issue #1630 for the cause-1/cause-2 split, issue #1649 for the
 3-reviewer kill, or my own reproduced Monte-Carlo (anchored to the research's
 published 0.87 / 1.54% values). The CLAUDE.md edit ADDS a scoped note and does

@@ -42,11 +42,13 @@
 - **Timestamp**: 2026-05-29
 - **Action**: Addressed Copilot round-2 on PR #1652. Narrowed the N=6
   throughput-CoV prose so it no longer calls a favorable placement the
-  "most common" realization, tightened the operational bullet to frame
+  "most common" realization, and tightened the operational bullet to frame
   aggregate against the existing Gate-3 structural cap instead of a
-  universal "unaffected" claim, replaced the forward in-file #1650
-  section reference with stable issue/PR references, and updated the
-  SMR accuracy note to record the round-2 corrections.
+  universal "unaffected" claim. The #1650 cross-reference was briefly
+  qualified as a future/open-PR pointer, but after the subsequent rebase
+  onto merged master (#1650 = 2723c401b) it was restored to a direct
+  in-file "section below" link, since the Small-class rate-metering section
+  is now present in this file. Updated the SMR accuracy note for both.
 - **File(s)**: `docs/fairness-regimes.md`,
   `docs/pr/1649-doc-floor-curve/claude-smr-accuracy.md`, `_Log.md`
 
