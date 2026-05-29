@@ -28,9 +28,9 @@ here so a continuation can re-fetch by id rather than re-dispatch.
 ## Round 4 (v4)
 | Reviewer | Task ID | Verdict | Doc |
 |---|---|---|---|
-| Codex | (pending r4) | (pending) | codex-plan-r4.md |
-| AGY | (pending r4) | (pending) | agy-plan-r4.md |
-| Claude SMR | n/a | (pending) | claude-smr-plan-r4.md |
+| Codex | task-mpr1hywo-cxrf47 | (pending) | codex-plan-r4.md |
+| AGY | adversarial-review-mpr1hhma-hbycu7 | (pending) | agy-plan-r4.md |
+| Claude SMR | n/a (in-conversation, parent took over after sub-agent 529) | PLAN-READY (2 NITs for /engineer) | claude-smr-plan-r4.md |
 
 ## Notes
 - Gate-R is a CLUSTER measurement (loss:xpf-userspace-fw0/fw1), FIFO with the
