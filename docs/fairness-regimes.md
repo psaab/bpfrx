@@ -256,10 +256,9 @@ is a re-steer.
   at low parallelism). Those are CoS scheduler-internal floors on a
   class hitting its *configured shape*; the RSS multinomial floor
   here is about how *unshaped best-effort flows distribute across
-  workers*. Different mechanism, different layer. The CoS-shaping
-  floors are documented separately under #1630 (a
-  "Small-class per-class rate-metering floor" section is added by
-  the #1630 cause-1 PR #1650; until it lands, see issue #1630).
+  workers*. Different mechanism, different layer — see the
+  "Small-class per-class rate-metering floor (#1630 cause-1)"
+  section below for the CoS-shaping floors.
 
 ## Acceptance gates
 

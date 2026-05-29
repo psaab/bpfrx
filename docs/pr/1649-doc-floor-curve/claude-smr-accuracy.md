@@ -134,9 +134,22 @@ addressed:
    observation is called out as a property of that draw, not a guarantee.
 3. **Dangling in-file cross-reference to the #1650 section.** Correct — the
    "Small-class per-class rate-metering floor" section only exists after PR
-   #1650 merges, so if this PR lands first the reference dangles. FIXED:
-   qualified it as a future/open-PR reference ("added by the #1630 cause-1 PR
-   #1650; until it lands, see issue #1630") instead of an in-file section link.
+   #1650 merges. Initially qualified as a future/open-PR reference. POST-REBASE
+   UPDATE: PR #1650 merged to master (commit `2723c401b`) before this PR; on
+   rebasing onto the new master the "Small-class per-class rate-metering floor
+   (#1630 cause-1)" section is now present in-file (the two PRs' hunks were
+   disjoint, as predicted), so the cross-reference was restored to a direct
+   in-file "section below" link — no longer dangling.
+
+## Post-rebase coordination with #1650 (merged)
+
+PR #1650 (#1630 cause-1) merged to master as `2723c401b` while this PR was in
+review. Rebasing `docs/1649-floor-curve` onto the new master produced only a
+`_Log.md` ordering conflict (both prepend a 2026-05-28 entry); fairness-regimes.md
+auto-merged cleanly because the two sections are disjoint (this PR's "Per-flow
+CoV floor (RSS multinomial)" after the structural-ceiling examples; #1650's
+"Small-class per-class rate-metering floor (#1630 cause-1)" in the CoS
+oversubscription area). Both sets of additions are preserved per the brief.
 
 ## Verdict
 
