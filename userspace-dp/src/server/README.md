@@ -13,12 +13,18 @@ this surface over a Unix socket using a newline-delimited text protocol.
   sysctl tuning, signal handling.
 - `state.rs` — `ServerState`: coordinator handle, latest config
   snapshot, session-table handle, policy state.
-- `handlers.rs` — request dispatch. Stateless handlers per request kind
+- `handlers/` — request dispatch (`handlers/mod.rs` is the
+  `handle_stream` dispatcher). One per-verb file per request kind
   (`apply_snapshot`, `set_forwarding_state`, `set_queue_state`,
   `inject_packet`, `stop_workers`, `rebind`, …).
 - `helpers.rs` — shared daemon-loop utilities (`replan_queues`,
   `replan_bindings_from_candidates`, `summarize_queues`, capability
   checks).
+- `tests.rs` — colocated unit tests for the dispatcher, the per-verb
+  handler error/gating arms, and the pure helper predicates (#1653
+  §3.1). Handlers are driven through the real `handle_stream` call site
+  over a socketpair, so a test fails if the dispatch wiring or
+  status-field population regresses (the #1642 drift class).
 
 ## Request protocol
 
