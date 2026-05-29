@@ -280,6 +280,51 @@ Kill this plan if any reviewer establishes:
   and no faster signal exists, making the "mid-life crash" half of the
   win illusory while the startup window is a real (if small) cost.
 
+## 11a. Claude SMR plan review (round 1) — trending PLAN-KILL on criterion (b)
+
+Reviewing my own plan adversarially as domain SMR, I found a decisive
+fact the issue body **and** plan §5 both missed: **the XDP shim already
+guards the crash-blind blackhole in-band via the per-slot heartbeat
+map.** Evidence (whole-function-verified in `userspace-xdp/src/lib.rs`):
+
+- The shim reads `USERSPACE_HEARTBEAT` per packet (lib.rs:425) and, if
+  `now_ns - last_heartbeat > timeout_ns` where `timeout_ms` defaults to
+  `USERSPACE_DEFAULT_HEARTBEAT_TIMEOUT_MS = 5000` (lib.rs:16, 442–447),
+  it does NOT steer transit — it calls `drop_degraded_transit`
+  (lib.rs:449→463). `drop_degraded_transit` returns `XDP_DROP` for
+  transit in both compat and strict modes (lib.rs:939–946); only
+  local/control may `pass_local_control`.
+- The heartbeat map is the same per-slot value the worker touches every
+  poll tick (`maybe_touch_heartbeat` → `touch_heartbeat` →
+  `update_heartbeat_slot`, bpf_map/mod.rs:204). A crashed worker stops
+  touching it; within ≤5s the shim stops steering transit to that slot.
+
+**Implication for the issue's headline:** the mid-life-crash blackhole
+is **neither latent nor permanent** — it self-heals in the dataplane
+within the same ~5s heartbeat window the plan proposes to enforce from
+the Go side via `binding.Ready` (whose `heartbeat_fresh` is the SAME 5s
+`HEARTBEAT_STALE_AFTER`). For the mid-life crash the Go `binding.Ready`
+gate is therefore **redundant** with an already-shipped per-packet guard.
+
+**Residual incremental coverage:** only the ≤5s *startup* sub-window
+where a worker created its socket, touched the init heartbeat
+(worker/mod.rs:355), then died or failed `register_binding_xsk`
+(worker/mod.rs:472) before its heartbeat went stale — during which
+site 1 has written READY=1 (on `Registered && Armed`) and the heartbeat
+is still fresh. The shim would steer to that dead slot for ≤5s. The gate
+closes exactly this narrow window, at the cost of the §4.3 startup-delay
+window on *every normal bringup* plus modification of the sensitive
+fail-closed path.
+
+**SMR verdict:** PLAN-NEEDS-MAJOR trending PLAN-KILL on criterion (b).
+The motivating "latent crash-blind blackhole" is already mitigated
+in-dataplane on the same timescale. What remains is a ≤5s startup-only
+edge that must be re-justified on its own merits (and may itself be
+covered if the never-registered worker also fails `probeBindingsReady`
+elsewhere — reviewers to confirm). Awaiting Codex + AGY independent
+verification of the lib.rs:449 heartbeat-staleness finding before
+finalizing the kill.
+
 ## 12. Out of scope
 
 - Worker respawn after panic (#925 deferred indefinitely).
