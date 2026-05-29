@@ -9,9 +9,13 @@ Ledger for resuming reviewer sessions across context loss
 - AGY: review-mpre0wvf-wq0j4q
 - Claude SMR: in-conversation (this thread)
 
+## Plan review round 2 (Codex confirmation)
+
+- Codex: task-mpre9ku1-e5pvs2 (NEEDS-MAJOR: Ready !imply Armed — fixed)
+
 ## Code review round 1
 
-- Codex: <pending>
-- AGY: <pending>
-- Copilot: <pending>
+- Codex: task-mpreidym-m4vmgs (round-3 confirm + code review @ 2321c4219)
+- AGY: review-mpref... (dispatching)
+- Copilot: <pending PR open>
 - Claude SMR: in-conversation (this thread)

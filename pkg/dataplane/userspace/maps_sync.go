@@ -1153,7 +1153,8 @@ func (m *Manager) verifyBindingsMapLocked() bool {
 			continue
 		}
 		// BPF map entry is all zeros but the helper says the queue is
-		// registered and armed. Rewrite the entry.
+		// forwarding-live (Registered && Armed && Ready && !Dead, gated
+		// above). Rewrite the entry.
 		flags := uint32(userspaceBindingReady)
 		newVal := userspaceBindingValue{
 			Slot:  binding.Slot,

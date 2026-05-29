@@ -92,7 +92,8 @@ func TestDeadWorkerIDSet(t *testing.T) {
 	if dead[0] || dead[2] {
 		t.Fatalf("deadWorkerIDSet flagged live workers: %v", dead)
 	}
-	// No dead workers -> nil set (so the gate degenerates to b.Ready).
+	// No dead workers -> nil set (so the gate degenerates to
+	// Registered && Armed && Ready).
 	if got := deadWorkerIDSet([]WorkerRuntimeStatus{{WorkerID: 5, Dead: false}}); got != nil {
 		t.Fatalf("deadWorkerIDSet with no dead workers = %v, want nil", got)
 	}
