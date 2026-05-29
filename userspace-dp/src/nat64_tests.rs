@@ -645,6 +645,29 @@ fn nat64_traffic_class_round_trips() {
     let rt_tc = ((v6[0] & 0x0f) << 4) | (v6[1] >> 4);
     assert_eq!(rt_tc, TC_EF_ECT0, "traffic class must survive round trip");
     assert_eq!(v6[0] >> 4, 6);
+
+    // v4 → v6 → v4: the traffic class also survives the opposite round trip.
+    let server_v4 = Ipv4Addr::new(198, 51, 100, 50);
+    let client_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let server_v6: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
+    let client_v6b: Ipv6Addr = "2001:db8::1".parse().unwrap();
+
+    let mut ipv4_pkt = make_ipv4_tcp_packet(server_v4, client_v4, 80, 12345, b"rt2");
+    ipv4_pkt[1] = TC_EF_ECT0;
+    ipv4_pkt[10..12].copy_from_slice(&[0, 0]);
+    let ip_sum = checksum16(&ipv4_pkt[..20]);
+    ipv4_pkt[10..12].copy_from_slice(&ip_sum.to_be_bytes());
+
+    let v6b = translate_v4_to_v6(&ipv4_pkt, server_v6, client_v6b).expect("v4->v6");
+    let v6b_tc = ((v6b[0] & 0x0f) << 4) | (v6b[1] >> 4);
+    assert_eq!(v6b_tc, TC_EF_ECT0);
+
+    let v4b = translate_v6_to_v4(&v6b, server_v4, client_v4).expect("v6->v4");
+    assert_eq!(
+        v4b[1], TC_EF_ECT0,
+        "traffic class must survive v4->v6->v4 round trip"
+    );
+    assert_eq!(checksum16(&v4b[..20]), 0, "IPv4 header checksum must verify");
 }
 
 #[test]
