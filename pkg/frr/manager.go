@@ -378,14 +378,44 @@ func (m *Manager) writeManagedSection(section string) error {
 // chmod/chown are applied to the temp file's open fd before close (and before
 // rename), so the file is never world-visible at the final path with a
 // transient mode, and there is no path-based TOCTOU on the temp name.
+// ownerIDs holds a file's numeric owner uid/gid.
+type ownerIDs struct {
+	uid int
+	gid int
+}
+
+// currentOwner returns the uid/gid of an open file. ok is false when the
+// platform stat cannot be obtained, in which case callers should fall back to
+// attempting a chown rather than assuming a match.
+func currentOwner(f *os.File) (ownerIDs, bool) {
+	fi, err := f.Stat()
+	if err != nil {
+		return ownerIDs{}, false
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return ownerIDs{}, false
+	}
+	return ownerIDs{uid: int(st.Uid), gid: int(st.Gid)}, true
+}
+
 func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	// Resolve a symlink target so the rename replaces the real file, not the
-	// link. EvalSymlinks fails if the final path does not exist yet; in that
-	// case (new file, possibly via a dangling link) fall back to the path
-	// as given.
+	// link. EvalSymlinks succeeds only when the whole chain exists. When the
+	// final component is a *dangling* symlink (target does not exist yet),
+	// EvalSymlinks fails, but os.WriteFile would still follow the link and
+	// create the target — so fall back to Readlink to recover that target
+	// path (resolved relative to the link's directory). Only when path is not
+	// a symlink at all do we use it as given (the genuine new-file case).
 	target := path
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
 		target = resolved
+	} else if linkDest, lerr := os.Readlink(path); lerr == nil {
+		if filepath.IsAbs(linkDest) {
+			target = linkDest
+		} else {
+			target = filepath.Join(filepath.Dir(path), linkDest)
+		}
 	}
 
 	// Preserve the mode/ownership of an existing target across the rename.
@@ -423,16 +453,25 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	}
 	// Apply mode/ownership on the open fd (fchmod/fchown) before rename, so the
 	// final path never appears with a transient mode and there is no path-race
-	// on the temp name. Ownership restore is best-effort: an EPERM when xpfd is
-	// not root must not abort the write, since CreateTemp already created the
-	// file owned by the running process (the common case where xpfd owns
-	// frr.conf).
+	// on the temp name.
 	if err := tmp.Chmod(mode); err != nil {
 		_ = tmp.Close()
 		return fmt.Errorf("chmod temp file: %w", err)
 	}
+	// Preserve ownership only when it actually differs from the temp file's
+	// current owner. CreateTemp makes the file owned by the running process,
+	// so when xpfd already runs as the frr.conf owner (the common case) no
+	// chown is needed and we never call it. When the target's owner differs
+	// and we cannot change it, do NOT silently rename a differently-owned file
+	// over a 0640 frr.conf — that could break ownership and leave FRR unable
+	// to read its config; surface the error instead.
 	if preserveOwner {
-		_ = tmp.Chown(uid, gid)
+		if cur, ok := currentOwner(tmp); !ok || cur.uid != uid || cur.gid != gid {
+			if err := tmp.Chown(uid, gid); err != nil {
+				_ = tmp.Close()
+				return fmt.Errorf("chown temp file to %d:%d: %w", uid, gid, err)
+			}
+		}
 	}
 	// fsync the data before rename so the rename does not point at a file
 	// whose contents are still only in the page cache after a power loss.

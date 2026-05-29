@@ -586,6 +586,42 @@ func TestWriteManagedSection_PreservesSymlink(t *testing.T) {
 	}
 }
 
+// TestWriteManagedSection_DanglingSymlink covers the Copilot round-2 finding:
+// when frr.conf is a symlink whose target does not exist yet, EvalSymlinks
+// fails; os.WriteFile would still follow the link and create the target, so
+// the atomic write must Readlink and write through the link rather than
+// replacing it with a regular file.
+func TestWriteManagedSection_DanglingSymlink(t *testing.T) {
+	dir := t.TempDir()
+	targetPath := filepath.Join(dir, "real-frr.conf") // does NOT exist yet
+	linkPath := filepath.Join(dir, "frr.conf")
+
+	if err := os.Symlink(targetPath, linkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &Manager{frrConf: linkPath}
+	if err := m.writeManagedSection("ip route 10.0.0.0/8 192.168.1.1\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The link must survive and now resolve to a created target.
+	fi, err := os.Lstat(linkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("dangling symlink was replaced by a regular file")
+	}
+	data, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatalf("symlink target was not created: %v", err)
+	}
+	if !strings.Contains(string(data), "192.168.1.1") {
+		t.Errorf("write did not reach the dangling-symlink target:\n%s", string(data))
+	}
+}
+
 func TestGeneratePolicyOptions(t *testing.T) {
 	m := &Manager{frrConf: "/dev/null"}
 	po := &config.PolicyOptionsConfig{
