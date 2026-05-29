@@ -552,6 +552,101 @@ fn translate_v4_to_v6_total_len_larger_than_slice_returns_none() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// #1662: NAT64 must copy the IP traffic class (DSCP + ECN) across translation
+// in BOTH directions. Before the fix the IPv4 TOS byte / IPv6 traffic class was
+// hard-zeroed, so DiffServ marking and end-to-end ECN were lost across the
+// translator. RFC 7915 §4/§5 default is a verbatim full-byte copy (DSCP copied,
+// ECN copied verbatim) — NAT64 is stateless translation, not RFC 6040 tunnel
+// encapsulation.
+//
+// All cases use TOS/TC = 0xBA = (DSCP 46 EF << 2) | ECN 0b10 (ECT(0)). The
+// non-zero ECN nibble means a DSCP-only implementation that dropped ECN would
+// also fail these assertions.
+// ---------------------------------------------------------------------------
+
+/// DSCP 46 (EF) in bits 7:2, ECN 0b10 (ECT(0)) in bits 1:0 → 0xBA.
+const TC_EF_ECT0: u8 = (46u8 << 2) | 0b10;
+
+#[test]
+fn translate_v6_to_v4_copies_traffic_class() {
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(198, 51, 100, 50);
+
+    let mut ipv6_pkt = make_ipv6_tcp_packet(src_v6, dst_v6, 12345, 80, b"qos");
+    // Set the IPv6 traffic class to 0xBA across bytes 0-1 (preserving version
+    // nibble and flow label). TC[7:4] in byte0 low nibble, TC[3:0] in byte1
+    // high nibble. (TCP checksum does not cover the TC byte, so no recompute.)
+    ipv6_pkt[0] = (ipv6_pkt[0] & 0xf0) | (TC_EF_ECT0 >> 4);
+    ipv6_pkt[1] = (ipv6_pkt[1] & 0x0f) | ((TC_EF_ECT0 & 0x0f) << 4);
+    // Sanity: reconstruct and confirm the input really carries 0xBA.
+    let in_tc = ((ipv6_pkt[0] & 0x0f) << 4) | (ipv6_pkt[1] >> 4);
+    assert_eq!(in_tc, TC_EF_ECT0);
+
+    let v4 = translate_v6_to_v4(&ipv6_pkt, snat_v4, dst_v4).expect("translate");
+
+    // IPv4 TOS byte must equal the source traffic class exactly (DSCP+ECN).
+    assert_eq!(v4[1], TC_EF_ECT0, "IPv4 TOS must copy the IPv6 traffic class");
+    // IPv4 header checksum must still verify with the non-zero TOS byte.
+    assert_eq!(checksum16(&v4[..20]), 0, "IPv4 header checksum must verify");
+}
+
+#[test]
+fn translate_v4_to_v6_copies_traffic_class() {
+    let src_v4 = Ipv4Addr::new(198, 51, 100, 50);
+    let dst_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let src_v6: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
+    let dst_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+
+    let mut ipv4_pkt = make_ipv4_tcp_packet(src_v4, dst_v4, 80, 12345, b"qos");
+    // Set the IPv4 TOS byte to 0xBA and recompute the IPv4 header checksum
+    // (the header checksum DOES cover the TOS byte).
+    ipv4_pkt[1] = TC_EF_ECT0;
+    ipv4_pkt[10..12].copy_from_slice(&[0, 0]);
+    let ip_sum = checksum16(&ipv4_pkt[..20]);
+    ipv4_pkt[10..12].copy_from_slice(&ip_sum.to_be_bytes());
+
+    let v6 = translate_v4_to_v6(&ipv4_pkt, src_v6, dst_v6).expect("translate");
+
+    // Reconstruct the IPv6 traffic class from bytes 0-1 and compare exactly.
+    let out_tc = ((v6[0] & 0x0f) << 4) | (v6[1] >> 4);
+    assert_eq!(
+        out_tc, TC_EF_ECT0,
+        "IPv6 traffic class must copy the IPv4 TOS byte"
+    );
+    // Version nibble must remain 6.
+    assert_eq!(v6[0] >> 4, 6, "IPv6 version nibble must be preserved");
+    // Flow label (low nibble of byte 1 + bytes 2-3) must stay 0.
+    assert_eq!(v6[1] & 0x0f, 0, "flow-label high nibble must be 0");
+    assert_eq!(v6[2], 0, "flow label must be 0");
+    assert_eq!(v6[3], 0, "flow label must be 0");
+}
+
+#[test]
+fn nat64_traffic_class_round_trips() {
+    // v6 → v4 → v6: the traffic class survives a full round trip.
+    let client_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(198, 51, 100, 50);
+
+    let mut ipv6_pkt = make_ipv6_tcp_packet(client_v6, dst_v6, 12345, 80, b"rt");
+    ipv6_pkt[0] = (ipv6_pkt[0] & 0xf0) | (TC_EF_ECT0 >> 4);
+    ipv6_pkt[1] = (ipv6_pkt[1] & 0x0f) | ((TC_EF_ECT0 & 0x0f) << 4);
+
+    let v4 = translate_v6_to_v4(&ipv6_pkt, snat_v4, dst_v4).expect("v6->v4");
+    assert_eq!(v4[1], TC_EF_ECT0);
+
+    // Translate the IPv4 packet back to IPv6 (reply direction reuses the same
+    // helper). The TOS byte carried by v4 must reappear in the IPv6 TC.
+    let v6 = translate_v4_to_v6(&v4, dst_v6, client_v6).expect("v4->v6");
+    let rt_tc = ((v6[0] & 0x0f) << 4) | (v6[1] >> 4);
+    assert_eq!(rt_tc, TC_EF_ECT0, "traffic class must survive round trip");
+    assert_eq!(v6[0] >> 4, 6);
+}
+
 #[test]
 fn translate_v4_to_v6_total_len_below_ihl_returns_none() {
     // Total Length shorter than the IPv4 header is nonsensical: reject it.

@@ -146,7 +146,11 @@ pub(crate) fn translate_v6_to_v4(
         return None;
     }
     // IPv6 header fields.
-    let _traffic_class = ((packet[0] & 0x0f) << 4) | (packet[1] >> 4);
+    // Full 8-bit traffic class (DSCP[7:2] | ECN[1:0]) straddling bytes 0-1 of
+    // the IPv6 header. Copied verbatim into the IPv4 TOS byte below per the
+    // RFC 7915 §5 default (DSCP copied, ECN copied verbatim — NAT64 is
+    // stateless translation, not RFC 6040 tunnel encapsulation).
+    let traffic_class = ((packet[0] & 0x0f) << 4) | (packet[1] >> 4);
     let payload_len = u16::from_be_bytes([packet[4], packet[5]]) as usize;
     let next_header = packet[6];
     let hop_limit = packet[7];
@@ -171,7 +175,7 @@ pub(crate) fn translate_v6_to_v4(
 
     // Build IPv4 header.
     out[0] = 0x45; // version=4, IHL=5
-    out[1] = 0; // DSCP/ECN (TODO: copy from traffic class)
+    out[1] = traffic_class; // DSCP/ECN copied from IPv6 traffic class (RFC 7915 §5)
     out[2..4].copy_from_slice(&ipv4_total_len.to_be_bytes());
     // ID = 0, flags = DF (0x4000)
     out[4..6].copy_from_slice(&0u16.to_be_bytes()); // identification
@@ -220,6 +224,10 @@ pub(crate) fn translate_v4_to_v6(
     if ihl < 20 || packet.len() < ihl {
         return None;
     }
+    // IPv4 TOS byte (DSCP[7:2] | ECN[1:0]) — copied verbatim into the IPv6
+    // traffic class below per the RFC 7915 §4 default (DSCP copied, ECN copied
+    // verbatim — NAT64 is stateless translation, not RFC 6040 encapsulation).
+    let tos = packet[1];
     let ttl = packet[8];
     if ttl <= 1 {
         return None; // TTL expired
@@ -254,9 +262,13 @@ pub(crate) fn translate_v4_to_v6(
     let ipv6_total_len = 40 + l4_payload.len();
     let mut out = vec![0u8; ipv6_total_len];
 
-    // Build IPv6 header.
-    out[0] = 0x60; // version=6
-    // flow label and traffic class = 0 for now
+    // Build IPv6 header. The 8-bit traffic class straddles bytes 0-1: TC[7:4]
+    // in the low nibble of byte 0 (alongside the version=6 nibble) and TC[3:0]
+    // in the high nibble of byte 1 (alongside the flow-label high nibble, left
+    // at 0). Mirrors apply_dscp_rewrite_to_frame in afxdp/frame/mod.rs:133-134.
+    out[0] = 0x60 | (tos >> 4); // version=6 | TC[7:4]
+    out[1] = (out[1] & 0x0f) | ((tos & 0x0f) << 4); // TC[3:0] | flow-label nibble (0)
+    // flow label (bytes 2-3 and low nibble of byte 1) = 0
     out[4..6].copy_from_slice(&ipv6_payload_len.to_be_bytes());
     out[6] = next_header;
     out[7] = new_hop_limit;

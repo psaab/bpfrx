@@ -1,6 +1,8 @@
 # #1662 — NAT64 must copy traffic class (DSCP+ECN) across translation
 
-**Status:** DRAFT v1 — pending adversarial plan review (Codex + AGY + Claude SMR)
+**Status:** PLAN-READY v1 — Codex PLAN-READY (task-mpraygb5-6rk1v9), AGY
+PLAN-READY (adversarial-review-mpraypis-m3213h), Claude SMR PLAN-READY. One
+non-blocking Codex nit adopted: `((tos & 0x0f) << 4)` mirrors frame/mod.rs:134.
 
 ## Issue framing
 
