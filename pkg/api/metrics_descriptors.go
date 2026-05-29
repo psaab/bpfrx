@@ -538,13 +538,13 @@ func newCollector(srv *Server) *xpfCollector {
 			[]string{"worker_id", "from_zone", "to_zone", "le"}, nil,
 		),
 		workerColdPathSamplesV3: prometheus.NewDesc(
-			"xpf_userspace_worker_cold_path_samples_total_v3",
+			"xpf_userspace_worker_cold_path_samples_v3_total",
 			"Per-worker / (from_zone, to_zone) count of cold-path latency "+
 				"samples recorded (#1635 direct slot map).",
 			[]string{"worker_id", "from_zone", "to_zone"}, nil,
 		),
 		workerColdPathSumNSV3: prometheus.NewDesc(
-			"xpf_userspace_worker_cold_path_sum_ns_total_v3",
+			"xpf_userspace_worker_cold_path_sum_ns_v3_total",
 			"Per-worker / (from_zone, to_zone) cumulative sum of recorded "+
 				"delta_ns (post baseline subtraction).",
 			[]string{"worker_id", "from_zone", "to_zone"}, nil,
@@ -569,7 +569,11 @@ func newCollector(srv *Server) *xpfCollector {
 			[]string{"worker_id", "version"}, nil,
 		),
 		workerColdPathLayoutUnknownTotal: prometheus.NewDesc(
-			"xpf_userspace_worker_cold_path_layout_version_unknown_total",
+			// Gauge-style state indicator (NOT a counter): emitted as a
+			// GaugeValue=1 when the version is unknown, so the name must
+			// NOT end in `_total` (Copilot code-r4: a `_total` suffix
+			// would mislead operators into rate()-ing a state flag).
+			"xpf_userspace_worker_cold_path_layout_version_unknown",
 			"1 when this worker reported a cold-path wire layout version "+
 				"the collector does not understand (forward-compat guard).",
 			[]string{"worker_id", "version"}, nil,

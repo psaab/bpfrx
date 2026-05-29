@@ -358,7 +358,7 @@ func TestEmitWorkerColdPath_LayoutVersion3_EmitsV3WithZoneLabels(t *testing.T) {
 	var sawSamplesV3, sawBucketLE111, sawVersionGauge bool
 	for _, m := range got {
 		switch descName(m.Desc()) {
-		case "xpf_userspace_worker_cold_path_samples_total_v3":
+		case "xpf_userspace_worker_cold_path_samples_v3_total":
 			lbl := labelsOf(t, m)
 			if lbl["from_zone"] == "2" && lbl["to_zone"] == "5" &&
 				valueOf(t, m) == 5 {
@@ -399,7 +399,7 @@ func TestEmitWorkerColdPath_LayoutVersionUnknown_EmitsWarning(t *testing.T) {
 	var sawUnknown, sawV1, sawV3 bool
 	for _, m := range got {
 		switch descName(m.Desc()) {
-		case "xpf_userspace_worker_cold_path_layout_version_unknown_total":
+		case "xpf_userspace_worker_cold_path_layout_version_unknown":
 			if labelsOf(t, m)["version"] == "99" {
 				sawUnknown = true
 			}
@@ -444,7 +444,7 @@ func TestEmitWorkerColdPath_V3_TwentyZonePairsSeparable(t *testing.T) {
 
 	distinctPairs := map[string]float64{}
 	for _, m := range got {
-		if descName(m.Desc()) != "xpf_userspace_worker_cold_path_samples_total_v3" {
+		if descName(m.Desc()) != "xpf_userspace_worker_cold_path_samples_v3_total" {
 			continue
 		}
 		lbl := labelsOf(t, m)
@@ -482,7 +482,7 @@ func TestEmitWorkerColdPath_V3_SparseEmitsOnlyActiveSlots(t *testing.T) {
 	got := collectFromEmitWorkerRuntime(t, c, status)
 	count := 0
 	for _, m := range got {
-		if descName(m.Desc()) == "xpf_userspace_worker_cold_path_samples_total_v3" {
+		if descName(m.Desc()) == "xpf_userspace_worker_cold_path_samples_v3_total" {
 			count++
 		}
 	}
@@ -516,7 +516,7 @@ func TestEmitWorkerColdPath_V3_OverflowNoSamples(t *testing.T) {
 				sawOverflow1 = true
 			}
 		case "xpf_userspace_worker_cold_path_ns_bucket_v3",
-			"xpf_userspace_worker_cold_path_samples_total_v3":
+			"xpf_userspace_worker_cold_path_samples_v3_total":
 			sawV3Bucket = true
 		}
 	}

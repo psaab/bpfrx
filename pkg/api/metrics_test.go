@@ -236,12 +236,12 @@ func newCollectorWithWorkerDescsOnly() *xpfCollector {
 		workerColdPathClockSource:         mkSource("xpf_userspace_worker_cold_path_clock_source"),
 		workerColdPathSnapshotFailedTotal: mk("xpf_userspace_worker_cold_path_snapshot_failed_total"),
 		workerColdPathBucketV3:            mkZonePairBucket("xpf_userspace_worker_cold_path_ns_bucket_v3"),
-		workerColdPathSamplesV3:           mkZonePair("xpf_userspace_worker_cold_path_samples_total_v3"),
-		workerColdPathSumNSV3:             mkZonePair("xpf_userspace_worker_cold_path_sum_ns_total_v3"),
+		workerColdPathSamplesV3:           mkZonePair("xpf_userspace_worker_cold_path_samples_v3_total"),
+		workerColdPathSumNSV3:             mkZonePair("xpf_userspace_worker_cold_path_sum_ns_v3_total"),
 		workerColdPathBuilderCollisionV3:  mkZonePair("xpf_userspace_worker_cold_path_builder_collision_v3"),
 		workerColdPathOverflowActive:      mk("xpf_userspace_worker_cold_path_overflow_active"),
 		workerColdPathLayoutVersion:       mkVersion("xpf_userspace_worker_cold_path_layout_version"),
-		workerColdPathLayoutUnknownTotal:  mkVersion("xpf_userspace_worker_cold_path_layout_version_unknown_total"),
+		workerColdPathLayoutUnknownTotal:  mkVersion("xpf_userspace_worker_cold_path_layout_version_unknown"),
 	}
 }
 

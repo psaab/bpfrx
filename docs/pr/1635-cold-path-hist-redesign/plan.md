@@ -258,8 +258,8 @@ naturally bounded by active-pair cardinality.
 
 ```
 xpf_userspace_worker_cold_path_ns_bucket_v3{worker_id, from_zone, to_zone, le}
-xpf_userspace_worker_cold_path_samples_total_v3{worker_id, from_zone, to_zone}
-xpf_userspace_worker_cold_path_sum_ns_total_v3{worker_id, from_zone, to_zone}
+xpf_userspace_worker_cold_path_samples_v3_total{worker_id, from_zone, to_zone}
+xpf_userspace_worker_cold_path_sum_ns_v3_total{worker_id, from_zone, to_zone}
 xpf_userspace_worker_cold_path_builder_collision_v3{worker_id, from_zone, to_zone}
 xpf_userspace_worker_cold_path_overflow_active{worker_id}
 xpf_userspace_worker_cold_path_zone_id_out_of_range_total{worker_id}
@@ -407,7 +407,7 @@ Mirror the sparse fields. Add `ColdPathLayoutVersion uint32` and the seven
   series with `from_zone` / `to_zone` labels resolved from the
   `ColdPathActiveZoneFrom` / `ColdPathActiveZoneTo` indices through the snapshot's
   zone-name table.
-- other → emit `cold_path_layout_version_unknown_total` increment + warn.
+- other → emit `cold_path_layout_version_unknown` increment + warn.
 
 `bucketLeV3(idx int) string` returns:
 - `idx < 32` → `strconv.FormatUint(uint64((idx+1)*16-1), 10)` (linear, 15, 31, ..., 511).
@@ -662,3 +662,21 @@ Copilot's formal re-review found three deeper issues; all fixed:
    emitter so the overflow gauge never appeared. **Fix:** `status.rs`
    stamps v3 when `has_data || overflow_active`. Go regression
    `TestEmitWorkerColdPath_V3_OverflowNoSamples`.
+
+### §IMPL.r4 Code-review round-4 fixes (Copilot Prometheus naming)
+
+Copilot's review at the rebased HEAD flagged three Prometheus
+metric-name convention issues (no functional change):
+
+1. `..._samples_total_v3` → `..._samples_v3_total`: a `CounterValue`
+   metric must end in `_total`; the `_v3` suffix after `_total` broke
+   the convention used by the rest of the file.
+2. `..._sum_ns_total_v3` → `..._sum_ns_v3_total`: same fix.
+3. `..._layout_version_unknown_total` → `..._layout_version_unknown`:
+   this is a `GaugeValue=1` state indicator, not a counter, so the
+   `_total` suffix was misleading (operators might `rate()` it). The
+   name now omits `_total`.
+
+The `_ns_bucket_v3` family keeps its name — it carries the `le` label
+and is a histogram bucket (not a `_total` counter), so the `_v3`
+placement is unambiguous.
