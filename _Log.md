@@ -4383,3 +4383,8 @@ top.
 - **Timestamp**: 2026-05-28
   **Action**: AGY r2 re-review (adversarial-review-mpq2jl5d-sqd223): all 4 round-1 fixes verified correct/complete, no new defect, ran Go+Rust suites clean — MERGE-READY. Copilot r2 doc nits fixed (plan path refs + converged status). Post-fix cluster re-validation: cold connect 1.016s, smoke reverse healthy, make test-failover 13/0. Added SMR r2 + AGY r2 docs.
   **File(s)**: docs/pr/1636-cold-connect-mitigation/{claude-smr-code-r2.md,agy-code-r2.md,reviewer-ids.md}, _Log.md
+
+## #1651 B3 dead-host negative neighbor cache
+- **Timestamp**: 2026-05-29
+- **Action**: Implement per-binding short-TTL negative cache; fast-fail at MissingNeighbor buffer site; record at pending_neigh drop site; resolved-wins + TTL invalidation.
+- **File(s)**: userspace-dp/src/afxdp/{mod.rs,neg_neigh.rs (new),neighbor_dispatch.rs,poll_descriptor/mod.rs,types/runtime.rs,worker/mod.rs}

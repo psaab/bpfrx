@@ -108,6 +108,22 @@ pub(super) fn retry_pending_neigh(
             .expect("pending_neigh shrank during retry sweep");
         // Timeout: recycle frame and drop.
         if now_ns.saturating_sub(pkt.queued_ns) > pending_neigh_timeout_ns {
+            // #1651 B3: this dst timed out after best-effort ARP/NDP probes
+            // and never resolved — negatively cache (egress_ifindex,
+            // next_hop) so subsequent cold packets fast-fail at the
+            // MissingNeighbor buffer site instead of re-buffering for
+            // another full PENDING_NEIGH_TIMEOUT. The timeout (not the probe
+            // count) is the signal: the dst never landed in the neighbor
+            // maps within the window. Same lookup key the fast-fail gate
+            // uses (egress_ifindex is the logical/VLAN ifindex at both
+            // sites).
+            if let Some(hop) = pkt.decision.resolution.next_hop {
+                neg_neigh_record(
+                    &mut binding.neg_neigh_cache,
+                    (pkt.decision.resolution.egress_ifindex, hop),
+                    now_ns,
+                );
+            }
             binding.tx_pipeline.pending_fill_frames.push_back(pkt.addr);
             continue;
         }
@@ -499,6 +515,88 @@ mod mirror_tests {
         assert!(
             !forwarded_req.mirror_clone,
             "primary forwarding request must not inherit mirror identity",
+        );
+    }
+
+    /// #1651 B3: a never-resolving pending packet that crosses the timeout
+    /// must (a) be dropped (recycled, removed from the queue) and (b) record
+    /// its (egress_ifindex, next_hop) in the binding's negative cache so
+    /// subsequent cold packets to the same dead host fast-fail.
+    #[test]
+    fn timed_out_pending_neighbor_records_negative_cache() {
+        let mut bindings = vec![
+            BindingWorker::new_for_mirror_test(0, 0, 11, 0),
+            BindingWorker::new_for_mirror_test(1, 0, 22, 0),
+        ];
+        let original_frame = build_ipv4_test_packet(0);
+        unsafe {
+            bindings[0]
+                .umem
+                .area()
+                .slice_mut_unchecked(0, original_frame.len())
+        }
+        .expect("ingress frame")
+        .copy_from_slice(&original_frame);
+
+        let next_hop = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 137));
+        let meta = pending_neighbor_meta(original_frame.len());
+        bindings[0].pending_neigh.push_back(PendingNeighPacket {
+            addr: 0,
+            desc: XdpDesc {
+                addr: 0,
+                len: original_frame.len() as u32,
+                options: 0,
+            },
+            meta,
+            decision: resolved_neighbor_decision(next_hop),
+            flow_key: Some(test_session_key(12345, 443)),
+            queued_ns: 0,
+            // All probes already fired; the dst never resolved.
+            probe_attempts: PROBE_SCHEDULE_NS.len() as u8,
+        });
+
+        // No neighbor for `next_hop` anywhere → unresolved. Use the
+        // compile-time fallback timeout (default ForwardingState leaves
+        // pending_neigh_timeout_ns == 0).
+        let forwarding = ForwardingState::default();
+        let lookup = WorkerBindingLookup::from_bindings(&bindings);
+        let mirror_targets = MirrorTargetMap::default();
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+        let mut shared_recycles = Vec::new();
+        let area = bindings[0].umem.area() as *const MmapArea;
+        let (left, rest) = bindings.split_at_mut(0);
+        let (binding, right) = rest.split_first_mut().expect("ingress binding");
+
+        // now_ns just past the 2s fallback timeout.
+        let now_ns = PENDING_NEIGH_TIMEOUT_NS + 1;
+        retry_pending_neigh(
+            binding,
+            left,
+            0,
+            right,
+            &lookup,
+            &mirror_targets,
+            &forwarding,
+            &dynamic_neighbors,
+            now_ns,
+            unsafe { &*area },
+            &mut shared_recycles,
+        );
+
+        // The packet was dropped (recycled to fill ring, queue drained).
+        assert!(
+            bindings[0].pending_neigh.is_empty(),
+            "timed-out pending packet must be dropped",
+        );
+        // The dead-host key was recorded and is active.
+        let key = (80i32, next_hop); // egress_ifindex 80 per resolved_neighbor_decision
+        assert!(
+            crate::afxdp::neg_neigh::neg_neigh_active(
+                &mut bindings[0].neg_neigh_cache,
+                &key,
+                now_ns,
+            ),
+            "timed-out dst must be negatively cached",
         );
     }
 }

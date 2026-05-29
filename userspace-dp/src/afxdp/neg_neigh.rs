@@ -1,0 +1,167 @@
+//! #1651 Path B3: dead-host negative neighbor cache.
+//!
+//! A per-binding, short-TTL cache of `(egress_ifindex, next_hop)` keys that
+//! failed to resolve within `PENDING_NEIGH_TIMEOUT`. While a dst is present,
+//! un-expired, and still-unresolved, new `MissingNeighbor` packets to it
+//! fast-fail (recycle) at the buffer site instead of each consuming a
+//! `pending_neigh` slot for the full timeout window.
+//!
+//! This is the AGY-r1 HIGH starvation defense from the reopened-#1651
+//! research: a dead-host SYN storm can otherwise saturate the bounded
+//! `pending_neigh` queue (cap `MAX_PENDING_NEIGH`, 800 ms hold each) and
+//! starve LIVE cold connects at the full-queue gate.
+//!
+//! ## Invalidation
+//! - **RTM_NEWNEIGH (host recovered):** lazy resolved-neighbor-wins. The
+//!   caller checks `forwarding.neighbors` then `dynamic_neighbors` BEFORE
+//!   honoring a negative entry; on a resolved hit it calls
+//!   [`neg_neigh_evict`] and forwards normally. The shared netlink monitor
+//!   thread populates `dynamic_neighbors`, so a recovered host that receives
+//!   traffic is evicted on its very next packet — no monitor→per-binding
+//!   coupling needed.
+//! - **TTL:** [`neg_neigh_active`] evicts on access once the entry is older
+//!   than `NEG_NEIGH_TTL_NS`.
+//!
+//! ## Placement
+//! Per-binding (mirrors `pending_neigh`). Touched ONLY by the owning worker
+//! thread (both `poll_descriptor` and `retry_pending_neigh` run on it), so no
+//! `Arc`/`Mutex`/cross-core sync — consistent with the per-queue AF_XDP model.
+
+use super::types::FastMap;
+use super::{MAX_NEG_NEIGH_CACHE, NEG_NEIGH_TTL_NS};
+use std::net::IpAddr;
+
+/// Negative-cache map type: key `(egress_ifindex, next_hop)`, value =
+/// insertion `now_ns`.
+pub(super) type NegNeighCache = FastMap<(i32, IpAddr), u64>;
+
+/// Returns true if `key` is currently negatively cached (present AND
+/// un-expired). Expired entries are evicted on access (lazy TTL).
+///
+/// Does NOT consult the neighbor maps — the caller must check
+/// `forwarding.neighbors` / `dynamic_neighbors` FIRST so a resolved dst wins
+/// (RTM_NEWNEIGH eviction). This keeps the function pure w.r.t. the neighbor
+/// maps and trivially testable.
+pub(super) fn neg_neigh_active(cache: &mut NegNeighCache, key: &(i32, IpAddr), now_ns: u64) -> bool {
+    match cache.get(key) {
+        Some(&inserted) if now_ns.saturating_sub(inserted) < NEG_NEIGH_TTL_NS => true,
+        Some(_) => {
+            // Expired — evict on access so the map self-prunes.
+            cache.remove(key);
+            false
+        }
+        None => false,
+    }
+}
+
+/// Record a dead-host drop at `now_ns`. Bounded by `MAX_NEG_NEIGH_CACHE`: on
+/// overflow (and only when inserting a genuinely new key) the map is cleared
+/// wholesale. `clear()` retains capacity, so this is allocation-free.
+pub(super) fn neg_neigh_record(cache: &mut NegNeighCache, key: (i32, IpAddr), now_ns: u64) {
+    if cache.len() >= MAX_NEG_NEIGH_CACHE && !cache.contains_key(&key) {
+        cache.clear();
+    }
+    cache.insert(key, now_ns);
+}
+
+/// Explicit eviction (resolved-neighbor-wins). Idempotent.
+pub(super) fn neg_neigh_evict(cache: &mut NegNeighCache, key: &(i32, IpAddr)) {
+    cache.remove(key);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::afxdp::{MAX_NEG_NEIGH_CACHE, NEG_NEIGH_TTL_NS};
+    use std::net::Ipv4Addr;
+
+    fn key(last: u8) -> (i32, IpAddr) {
+        (14, IpAddr::V4(Ipv4Addr::new(172, 16, 80, last)))
+    }
+
+    #[test]
+    fn record_then_active_within_ttl() {
+        let mut c = NegNeighCache::default();
+        neg_neigh_record(&mut c, key(137), 1_000);
+        assert!(neg_neigh_active(&mut c, &key(137), 1_000));
+        // Just under TTL: still active.
+        assert!(neg_neigh_active(
+            &mut c,
+            &key(137),
+            1_000 + NEG_NEIGH_TTL_NS - 1
+        ));
+    }
+
+    #[test]
+    fn expires_at_ttl_boundary_and_evicts_on_access() {
+        let mut c = NegNeighCache::default();
+        neg_neigh_record(&mut c, key(137), 1_000);
+        // Exactly TTL elapsed (now - inserted == TTL) is NOT active (< TTL).
+        assert!(!neg_neigh_active(&mut c, &key(137), 1_000 + NEG_NEIGH_TTL_NS));
+        // The expired entry was evicted on access.
+        assert!(!c.contains_key(&key(137)));
+    }
+
+    #[test]
+    fn absent_key_is_not_active() {
+        let mut c = NegNeighCache::default();
+        assert!(!neg_neigh_active(&mut c, &key(99), 5_000));
+    }
+
+    #[test]
+    fn evict_is_idempotent() {
+        let mut c = NegNeighCache::default();
+        neg_neigh_record(&mut c, key(137), 1_000);
+        neg_neigh_evict(&mut c, &key(137));
+        assert!(!neg_neigh_active(&mut c, &key(137), 1_000));
+        // Second evict on an already-absent key is a no-op, no panic.
+        neg_neigh_evict(&mut c, &key(137));
+        assert!(!c.contains_key(&key(137)));
+    }
+
+    #[test]
+    fn resolved_wins_eviction_unsuppresses_recovered_host() {
+        // Simulates the RTM_NEWNEIGH path: a dead host is negatively cached,
+        // then resolves (caller evicts on the resolved-wins check). The same
+        // key must no longer fast-fail.
+        let mut c = NegNeighCache::default();
+        neg_neigh_record(&mut c, key(137), 1_000);
+        assert!(neg_neigh_active(&mut c, &key(137), 1_500));
+        // Host came back → caller evicts.
+        neg_neigh_evict(&mut c, &key(137));
+        assert!(!neg_neigh_active(&mut c, &key(137), 1_500));
+    }
+
+    #[test]
+    fn overflow_clears_then_reinserts_new_key() {
+        let mut c = NegNeighCache::default();
+        // Fill exactly to the cap with distinct keys.
+        for i in 0..MAX_NEG_NEIGH_CACHE {
+            // Spread across two octets so >256 distinct keys are expressible.
+            let k = (14i32, IpAddr::V4(Ipv4Addr::new(10, 0, (i >> 8) as u8, i as u8)));
+            neg_neigh_record(&mut c, k, 1_000);
+        }
+        assert_eq!(c.len(), MAX_NEG_NEIGH_CACHE);
+        // One more NEW key triggers wholesale clear, then inserts the new key.
+        let extra = (14i32, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
+        neg_neigh_record(&mut c, extra, 2_000);
+        assert_eq!(c.len(), 1, "overflow must clear then hold only the new key");
+        assert!(neg_neigh_active(&mut c, &extra, 2_000));
+    }
+
+    #[test]
+    fn at_cap_reinsert_existing_key_does_not_clear() {
+        let mut c = NegNeighCache::default();
+        for i in 0..MAX_NEG_NEIGH_CACHE {
+            let k = (14i32, IpAddr::V4(Ipv4Addr::new(10, 0, (i >> 8) as u8, i as u8)));
+            neg_neigh_record(&mut c, k, 1_000);
+        }
+        assert_eq!(c.len(), MAX_NEG_NEIGH_CACHE);
+        // Re-recording an EXISTING key at cap must NOT clear (the
+        // !contains_key guard) — it just refreshes the timestamp.
+        let existing = (14i32, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)));
+        neg_neigh_record(&mut c, existing, 2_000);
+        assert_eq!(c.len(), MAX_NEG_NEIGH_CACHE);
+        assert!(neg_neigh_active(&mut c, &existing, 2_000));
+    }
+}

@@ -2378,6 +2378,54 @@ pub(super) fn poll_binding_process_descriptor(
                             }
                             ForwardingDisposition::MissingNeighbor => {
                                 telemetry.dbg.missing_neigh += 1;
+                                // #1651 B3: dead-host fast-fail gate. Runs at
+                                // the very top of the MissingNeighbor arm,
+                                // BEFORE the kernel probe, session seed, and
+                                // pending_neigh buffer, so a dead host never
+                                // consumes a queue slot, fires a probe, or
+                                // creates a MissingNeighborSeed session.
+                                //
+                                // Resolved-neighbor-wins (RTM_NEWNEIGH
+                                // invalidation): check static then dynamic
+                                // neighbors FIRST (same order as
+                                // retry_pending_neigh / lookup_neighbor_entry).
+                                // If the dst is now resolved, drop any stale
+                                // negative entry and fall through to normal
+                                // forwarding. Otherwise, if it is still
+                                // negatively cached + un-expired, recycle the
+                                // frame immediately.
+                                if let Some(next_hop) = decision.resolution.next_hop {
+                                    let neg_key =
+                                        (decision.resolution.egress_ifindex, next_hop);
+                                    let resolved = worker_ctx
+                                        .forwarding
+                                        .neighbors
+                                        .contains_key(&neg_key)
+                                        || worker_ctx
+                                            .dynamic_neighbors
+                                            .get(&neg_key)
+                                            .is_some();
+                                    if resolved {
+                                        neg_neigh_evict(
+                                            &mut binding.neg_neigh_cache,
+                                            &neg_key,
+                                        );
+                                    } else if neg_neigh_active(
+                                        &mut binding.neg_neigh_cache,
+                                        &neg_key,
+                                        now_ns,
+                                    ) {
+                                        telemetry.dbg.neg_neigh_fast_fail += 1;
+                                        // Fresh RX descriptor → recycle via
+                                        // scratch_recycle + continue, matching
+                                        // the source-NAT-failure discard
+                                        // pattern. The continue skips the
+                                        // recycle_now epilogue and the
+                                        // session-seed/buffer below.
+                                        binding.scratch.scratch_recycle.push(desc.addr);
+                                        continue;
+                                    }
+                                }
                                 // #919/#922: zero-allocation ID-native resolution.
                                 let (from_zone_id, to_zone_id) = zone_pair_ids_for_flow_with_override(
                                     worker_ctx.forwarding,

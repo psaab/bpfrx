@@ -124,6 +124,15 @@ pub(crate) struct BindingWorker {
     /// Packets waiting for neighbor resolution. The UMEM frame is held
     /// (not recycled) until the neighbor resolves or the entry times out.
     pub(crate) pending_neigh: VecDeque<PendingNeighPacket>,
+    /// #1651 B3: dead-host negative neighbor cache. Key
+    /// `(egress_ifindex, next_hop)`; value = insertion `now_ns`. A dst is
+    /// recorded when it times out in `pending_neigh` without resolving;
+    /// while present + un-expired + still-unresolved, new `MissingNeighbor`
+    /// packets to it fast-fail (recycle) instead of buffering for another
+    /// `PENDING_NEIGH_TIMEOUT`. Per-binding (mirrors `pending_neigh`) —
+    /// touched only by the owning worker thread, no cross-core sync. Lazy
+    /// allocation (grows on first dead-host drop), like `pending_neigh`.
+    pub(crate) neg_neigh_cache: super::neg_neigh::NegNeighCache,
     /// #959 Phase 5: 4 BPF map FDs extracted into `WorkerBpfMaps`.
     /// Field semantics unchanged; access via `binding.bpf_maps.X_fd`.
     pub(crate) bpf_maps: WorkerBpfMaps,
@@ -406,6 +415,8 @@ impl BindingWorker {
             // idle. Start at 0 capacity and let VecDeque grow on push as
             // packets actually queue up.
             pending_neigh: VecDeque::new(),
+            // #1651 B3: lazy-grow (empty until first dead-host drop).
+            neg_neigh_cache: super::neg_neigh::NegNeighCache::default(),
             bpf_maps: WorkerBpfMaps {
                 heartbeat_map_fd,
                 session_map_fd,
@@ -539,6 +550,8 @@ impl BindingWorker {
                 scratch_rst_teardowns: Vec::with_capacity(16),
             },
             pending_neigh: VecDeque::new(),
+            // #1651 B3: lazy-grow (empty until first dead-host drop).
+            neg_neigh_cache: super::neg_neigh::NegNeighCache::default(),
             bpf_maps: WorkerBpfMaps {
                 heartbeat_map_fd: -1,
                 session_map_fd: -1,
@@ -653,6 +666,8 @@ impl BindingWorker {
                 scratch_rst_teardowns: Vec::with_capacity(16),
             },
             pending_neigh: VecDeque::new(),
+            // #1651 B3: lazy-grow (empty until first dead-host drop).
+            neg_neigh_cache: super::neg_neigh::NegNeighCache::default(),
             bpf_maps: WorkerBpfMaps {
                 heartbeat_map_fd: -1,
                 session_map_fd: -1,

@@ -254,6 +254,11 @@ pub(in crate::afxdp) struct DebugPollCounters {
     pub(in crate::afxdp) no_route: u64,
     #[allow(dead_code)]
     pub(in crate::afxdp) missing_neigh: u64,
+    /// #1651 B3: dead-host negative-cache fast-fail count. Bumped when a
+    /// MissingNeighbor packet to a negatively-cached (un-expired,
+    /// still-unresolved) dst is recycled without buffering.
+    #[allow(dead_code)]
+    pub(in crate::afxdp) neg_neigh_fast_fail: u64,
     #[allow(dead_code)]
     pub(in crate::afxdp) policy_deny: u64,
     #[allow(dead_code)]
