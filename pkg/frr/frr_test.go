@@ -410,6 +410,82 @@ func TestWriteManagedSection_NoExistingFile(t *testing.T) {
 	}
 }
 
+// TestWriteManagedSection_OrphanedBeginMarker is the #1646 regression test.
+// A prior torn write (os.WriteFile is not atomic) can leave an orphaned
+// markerBegin with no markerEnd. The pre-fix code skipped the strip entirely
+// when markerEnd was absent, appending a SECOND managed block — and the write
+// after that would over-cut from the orphan begin to the new block's end,
+// deleting everything in between, including unrelated operator/tool config.
+//
+// The fix discards an orphaned-begin tail to EOF. After one writeManagedSection
+// the file must contain exactly one managed block and must NOT carry the torn
+// partial content forward into a state that a subsequent write would over-cut.
+func TestWriteManagedSection_OrphanedBeginMarker(t *testing.T) {
+	dir := t.TempDir()
+	confPath := filepath.Join(dir, "frr.conf")
+
+	m := &Manager{frrConf: confPath}
+
+	// Simulate a torn write: legitimate config, then an orphaned begin marker
+	// with a partial managed body and NO end marker (the write was truncated).
+	torn := "log syslog informational\n" +
+		"ip route 192.0.2.0/24 198.51.100.1\n" + // unrelated, operator-added
+		markerBegin + "\n" +
+		"ip route 10.0.0.0/8 192.168.9.9\n" // partial body, no markerEnd
+	if err := os.WriteFile(confPath, []byte(torn), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// First write after the torn state.
+	if err := m.writeManagedSection("ip route 10.0.0.0/8 192.168.2.1\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	data, _ := os.ReadFile(confPath)
+	got := string(data)
+
+	// Exactly one begin marker — the orphan must have been discarded, not kept.
+	if n := strings.Count(got, markerBegin); n != 1 {
+		t.Errorf("expected exactly 1 begin marker, got %d:\n%s", n, got)
+	}
+	if n := strings.Count(got, markerEnd); n != 1 {
+		t.Errorf("expected exactly 1 end marker, got %d:\n%s", n, got)
+	}
+	// Unrelated operator config above the torn block must survive.
+	if !strings.Contains(got, "ip route 192.0.2.0/24 198.51.100.1") {
+		t.Errorf("unrelated operator config was lost:\n%s", got)
+	}
+	if !strings.Contains(got, "log syslog informational") {
+		t.Errorf("base config lost:\n%s", got)
+	}
+	// The partial torn body must be gone.
+	if strings.Contains(got, "192.168.9.9") {
+		t.Errorf("orphaned partial managed body was not discarded:\n%s", got)
+	}
+	// The new managed route is present.
+	if !strings.Contains(got, "ip route 10.0.0.0/8 192.168.2.1") {
+		t.Errorf("new managed route missing:\n%s", got)
+	}
+
+	// A SECOND write must remain stable and must not over-cut the unrelated
+	// config — this is the step where the pre-fix double-begin state corrupted
+	// the file.
+	if err := m.writeManagedSection("ip route 10.0.0.0/8 192.168.3.3\n"); err != nil {
+		t.Fatal(err)
+	}
+	data, _ = os.ReadFile(confPath)
+	got = string(data)
+	if !strings.Contains(got, "ip route 192.0.2.0/24 198.51.100.1") {
+		t.Errorf("unrelated operator config lost on second write:\n%s", got)
+	}
+	if n := strings.Count(got, markerBegin); n != 1 {
+		t.Errorf("second write: expected 1 begin marker, got %d:\n%s", n, got)
+	}
+	if !strings.Contains(got, "192.168.3.3") {
+		t.Errorf("second write's route missing:\n%s", got)
+	}
+}
+
 func TestGeneratePolicyOptions(t *testing.T) {
 	m := &Manager{frrConf: "/dev/null"}
 	po := &config.PolicyOptionsConfig{

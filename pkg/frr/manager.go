@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -308,17 +309,33 @@ func (m *Manager) writeManagedSection(section string) error {
 		}
 	}
 
-	// Strip existing managed section
+	// Strip existing managed section.
+	//
+	// A correct file has a begin marker followed by an end marker. But a
+	// prior torn write (os.WriteFile is not atomic — a crash or disk-full
+	// mid-write can truncate after the begin marker) can leave an orphaned
+	// markerBegin with no markerEnd. If we only stripped on the both-found
+	// case, the orphan would survive: we would append a second managed block,
+	// leaving two begin markers. The next write's strings.Index(markerEnd)
+	// then matches the new block's end while content[:start] cuts from the
+	// orphaned begin — deleting everything between them, which may include
+	// unrelated FRR config the operator appended. So we treat a begin with no
+	// end as a corrupt tail and discard it to EOF.
 	content := string(existing)
 	if start := strings.Index(content, markerBegin); start >= 0 {
-		end := strings.Index(content, markerEnd)
-		if end >= 0 {
+		if end := strings.Index(content, markerEnd); end >= 0 {
 			end += len(markerEnd)
 			// Also consume the trailing newline
 			if end < len(content) && content[end] == '\n' {
 				end++
 			}
 			content = content[:start] + content[end:]
+		} else {
+			// Orphaned begin marker (torn write): discard from the begin
+			// marker to EOF. Whatever followed an unterminated managed block
+			// is xpf-generated partial config that must not be preserved, and
+			// keeping the orphan begin would cause the next write to over-cut.
+			content = content[:start]
 		}
 	}
 
@@ -330,9 +347,55 @@ func (m *Manager) writeManagedSection(section string) error {
 		content += markerEnd + "\n"
 	}
 
-	if err := os.WriteFile(m.frrConf, []byte(content), 0644); err != nil {
+	// Write atomically: a temp file in the same directory followed by rename,
+	// so a crash or disk-full can never leave frr.conf half-written (which is
+	// what creates the orphaned-begin-marker state handled above in the first
+	// place). rename(2) within a filesystem is atomic.
+	if err := atomicWriteFile(m.frrConf, []byte(content), 0644); err != nil {
 		return fmt.Errorf("write frr.conf: %w", err)
 	}
+	return nil
+}
+
+// atomicWriteFile writes data to a temporary file in the same directory as
+// path and renames it into place. The rename is atomic within a filesystem,
+// so a reader (or a crash) never observes a partially written file. The temp
+// file is removed on any error before the rename completes.
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".frr.conf.tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	tmpName := tmp.Name()
+	// Best-effort cleanup if we return before a successful rename.
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write temp file: %w", err)
+	}
+	// fsync the data before rename so the rename does not point at a file
+	// whose contents are still only in the page cache after a power loss.
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("sync temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp file: %w", err)
+	}
+	if err := os.Chmod(tmpName, perm); err != nil {
+		return fmt.Errorf("chmod temp file: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("rename temp file: %w", err)
+	}
+	cleanup = false
 	return nil
 }
 
