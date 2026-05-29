@@ -21,3 +21,12 @@ PR: #1668  branch: refactor/1635-cold-path-hist-redesign  base: origin/master
 Continuations:
   node /home/ps/.claude/plugins/cache/openai-codex/codex/1.0.4/scripts/codex-companion.mjs status task-mprdwcke-db45pk
   /agy:result adversarial-review-mprdwlwd-2ub6tm
+
+## Round 3 (head b870f4303 — Copilot formal-review fixes: zone-id 64, gen-independent zero-out, overflow gauge)
+| Reviewer   | Task / job id                      | Verdict   |
+|------------|------------------------------------|-----------|
+| Codex      | task-mpreeci9-0dfrx9               | running   |
+| AGY        | adversarial-review-mpreek4k-h6dm4i  | running   |
+| Claude SMR | in-conversation                    | MERGE-READY (verified fixes) |
+| Copilot    | re-review requested @ b870f4303    | requested |
+| Copilot SWE| autonomous commits 7d8d2ab19, 422196ba5 (retry-budget 128->2048->8192) | integrated |
