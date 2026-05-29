@@ -10,3 +10,9 @@
 - AGY: (pending)
 - Copilot: (pending)
 - Claude SMR: in-conversation
+
+## Code review (round 1) — actual IDs
+- Codex: task-mpr5sfbi-hba88j
+- AGY: adversarial-review-mpr5spiq-lcavkt
+- Copilot: requested via @copilot review on PR #1660
+- Claude SMR: in-conversation hostile review (below)

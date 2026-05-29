@@ -2397,24 +2397,27 @@ pub(super) fn poll_binding_process_descriptor(
                                 if let Some(next_hop) = decision.resolution.next_hop {
                                     let neg_key =
                                         (decision.resolution.egress_ifindex, next_hop);
-                                    let resolved = worker_ctx
-                                        .forwarding
-                                        .neighbors
-                                        .contains_key(&neg_key)
-                                        || worker_ctx
-                                            .dynamic_neighbors
-                                            .get(&neg_key)
-                                            .is_some();
-                                    if resolved {
-                                        neg_neigh_evict(
-                                            &mut binding.neg_neigh_cache,
-                                            &neg_key,
-                                        );
-                                    } else if neg_neigh_active(
+                                    // neg_neigh_gate runs the resolved-wins
+                                    // probe (static neighbors THEN dynamic,
+                                    // same order as retry_pending_neigh /
+                                    // lookup_neighbor_entry) and the TTL check.
+                                    // Returns true ⇒ fast-fail this packet.
+                                    let fast_fail = neg_neigh_gate(
                                         &mut binding.neg_neigh_cache,
                                         &neg_key,
                                         now_ns,
-                                    ) {
+                                        || {
+                                            worker_ctx
+                                                .forwarding
+                                                .neighbors
+                                                .contains_key(&neg_key)
+                                                || worker_ctx
+                                                    .dynamic_neighbors
+                                                    .get(&neg_key)
+                                                    .is_some()
+                                        },
+                                    );
+                                    if fast_fail {
                                         telemetry.dbg.neg_neigh_fast_fail += 1;
                                         // Fresh RX descriptor → recycle via
                                         // scratch_recycle + continue, matching

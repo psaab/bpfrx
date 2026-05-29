@@ -597,7 +597,7 @@ use session_delta::{flush_session_deltas, purge_queued_flows_for_closed_deltas};
 
 // #1651 B3: dead-host negative neighbor cache helpers.
 mod neg_neigh;
-use neg_neigh::{neg_neigh_active, neg_neigh_evict, neg_neigh_record};
+use neg_neigh::{neg_neigh_gate, neg_neigh_record};
 
 // Issue 67.2: neighbor-dispatch helpers extracted into
 // afxdp/neighbor_dispatch.rs.

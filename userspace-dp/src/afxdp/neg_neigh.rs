@@ -69,6 +69,38 @@ pub(super) fn neg_neigh_evict(cache: &mut NegNeighCache, key: &(i32, IpAddr)) {
     cache.remove(key);
 }
 
+/// The full dead-host gate decision used at the `MissingNeighbor` handler.
+///
+/// `is_resolved` is the caller-supplied resolved-neighbor probe (static
+/// `forwarding.neighbors` THEN `dynamic_neighbors`, in that order — the
+/// closure encapsulates the lookup so this helper stays decoupled from the
+/// concrete map types and is unit-testable in isolation).
+///
+/// Semantics (resolved-neighbor-wins, then TTL):
+/// - If the dst is now resolved, any stale negative entry is evicted and the
+///   gate returns `false` (proceed to normal forwarding). This is the
+///   RTM_NEWNEIGH invalidation path.
+/// - Else, if the dst is negatively cached + un-expired, return `true`
+///   (fast-fail: caller recycles the frame without buffering / probing /
+///   seeding a session).
+/// - Else return `false` (proceed: first cold connect for this dst, or the
+///   negative entry has expired).
+///
+/// Returns `true` ⇒ the caller must fast-fail this packet.
+pub(super) fn neg_neigh_gate<F: FnOnce() -> bool>(
+    cache: &mut NegNeighCache,
+    key: &(i32, IpAddr),
+    now_ns: u64,
+    is_resolved: F,
+) -> bool {
+    if is_resolved() {
+        neg_neigh_evict(cache, key);
+        false
+    } else {
+        neg_neigh_active(cache, key, now_ns)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,6 +179,54 @@ mod tests {
         neg_neigh_record(&mut c, extra, 2_000);
         assert_eq!(c.len(), 1, "overflow must clear then hold only the new key");
         assert!(neg_neigh_active(&mut c, &extra, 2_000));
+    }
+
+    #[test]
+    fn gate_first_cold_connect_proceeds() {
+        // No negative entry, not resolved → proceed (false). The first cold
+        // connect to a dst must NOT fast-fail (it buffers + probes normally).
+        let mut c = NegNeighCache::default();
+        assert!(!neg_neigh_gate(&mut c, &key(137), 1_000, || false));
+    }
+
+    #[test]
+    fn gate_dead_host_fast_fails_then_resolved_wins() {
+        // The exact poll_descriptor gate decision sequence:
+        let mut c = NegNeighCache::default();
+        // 1) dst dropped at timeout → recorded.
+        neg_neigh_record(&mut c, key(137), 1_000);
+        // 2) repeat cold packet, still unresolved + un-expired → fast-fail.
+        assert!(
+            neg_neigh_gate(&mut c, &key(137), 1_500, || false),
+            "negatively-cached unresolved dst must fast-fail",
+        );
+        // 3) RTM_NEWNEIGH: dst now resolved → gate evicts and proceeds.
+        assert!(
+            !neg_neigh_gate(&mut c, &key(137), 1_600, || true),
+            "resolved dst must NOT fast-fail (resolved-wins)",
+        );
+        // 4) the negative entry was evicted by the resolved-wins branch, so a
+        //    later un-resolved check no longer fast-fails.
+        assert!(
+            !neg_neigh_gate(&mut c, &key(137), 1_700, || false),
+            "resolved-wins must have evicted the negative entry",
+        );
+        assert!(!c.contains_key(&key(137)));
+    }
+
+    #[test]
+    fn gate_expired_entry_proceeds_and_prunes() {
+        let mut c = NegNeighCache::default();
+        neg_neigh_record(&mut c, key(137), 1_000);
+        // Past TTL, still unresolved → gate returns false (proceed) and the
+        // expired entry is pruned by the active() lazy-evict.
+        assert!(!neg_neigh_gate(
+            &mut c,
+            &key(137),
+            1_000 + NEG_NEIGH_TTL_NS,
+            || false
+        ));
+        assert!(!c.contains_key(&key(137)));
     }
 
     #[test]
