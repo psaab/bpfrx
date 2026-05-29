@@ -84,3 +84,17 @@ also fires on out-of-range zone-ids). Fixed all 3 comments. NO behavior/binary c
 | AGY        | MERGE-READY carries forward (comment-only delta) |
 | Claude SMR | MERGE-READY (verified: only doc comments in metrics_descriptors.go / protocol.go / binding.rs changed; cargo+go green) |
 | Copilot    | review @ 16b9dfa7d requested; polling (task bt3l1e6xb) |
+
+## Round 7 — Describe() checked-collector fix (HEAD 0f0db4db3, SUBSTANTIVE Go change)
+Copilot review 4393007808 @ ecb418ab6 found: all 17 cold-path descriptors emitted by
+Collect() but none declared in Describe() (checked-collector contract violation →
+Gather error / 500). Fixed: metrics.go Describe() declares all 17. New regression
+TestColdPathDescriptorsAreDescribed (fail-before 472 undeclared / pass-after 0).
+Plus plan §4.8/§5.2 doc fix (unknown-version metric is a gauge, not increment+warn).
+
+| Reviewer   | Task / job id                      | Verdict   |
+|------------|------------------------------------|-----------|
+| Codex      | task-mprgn0r3-oida5z               | running (re-confirm — real code change) |
+| AGY        | adversarial-review-mprgn840-ti0gac  | running (re-confirm) |
+| Claude SMR | in-conversation                    | MERGE-READY (Describe completeness verified; fail-before/pass-after proven) |
+| Copilot    | re-review @ 0f0db4db3 requested; polling | findings 1+2 addressed |
