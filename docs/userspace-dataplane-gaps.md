@@ -92,7 +92,7 @@ These are not "missing", but they are not pure userspace forwarding either:
 | Kernel-owned traffic (ARP, local delivery, management, some non-IP) | cpumap or kernel pass-through from XDP |
 | GRE / ESP / explicit early filters | Live kernel-owned/tunnel-control cases use cpumap or pass-through; degraded helper/XSK states pass only proven local/control traffic and drop non-local transit |
 | IPsec / XFRM handling | Userspace detects and punts to kernel/slow-path as needed |
-| DataPlane control-plane contract | Userspace manager no longer embeds the legacy `dataplane.DataPlane`; a userspace `LegacyDataPlaneAdapter` owns old-interface compatibility. Operator metadata reads in API/gRPC/CLI/daemon now use `LastApplyResult()` instead of `LastCompileResult()`, with a canary preventing those surfaces from regressing to compile-result metadata. GC and HA session sync now use `SessionStore`/`Telemetry`. The manager still holds a named eBPF shim manager for XDP/map bootstrap state; the API/gRPC/CLI session/counter readers and daemon control paths were relocated to domain interfaces in the closed #1451 removal-phase migration |
+| DataPlane control-plane contract | Userspace manager no longer embeds the legacy `dataplane.DataPlane`; a userspace `LegacyDataPlaneAdapter` owns old-interface compatibility. Operator metadata reads in API/gRPC/CLI/daemon now use `LastApplyResult()` instead of `LastCompileResult()`, with a canary preventing those surfaces from regressing to compile-result metadata. GC and HA session sync use `SessionStore`/`Telemetry`. The manager still holds a named userspace shim manager for XDP/map bootstrap state. API/gRPC/CLI session/counter readers plus daemon control paths still name root `pkg/dataplane` session/counter types (e.g. `SessionKey`, `CounterValue`); those imports are tracked as the intentional, documented allowlist in `pkg/dataplane/retirement_boundary_canary_test.go` and move to a domain package as that type-relocation work continues. This is post-retirement interface cleanup, not a retirement blocker |
 | DPDK backend | Retired in #1525. The historical #1475 backend-local exception for its root `DataPlane` dependency applied pre-retirement; #1527 removes the registration import and #1528 deletes the package. |
 | Dataplane event logging | Session open/close/update are emitted by userspace. Policy-deny, screen-drop, logged routing-instance filter hits, non-PBR input filter logs, output filter logs, cached output-filter hits, and lo0 filter logs now enqueue RT_FLOW frames through the non-blocking Rust event-stream producer with existing per-event rate-limit/loss accounting. Go decode/status handling feeds raw userspace RT_FLOW frames through the same `EventReader.ProcessRawEvent` syslog/local-log path as eBPF, with a deterministic UDP syslog fanout harness for policy deny, screen drop, and filter log. Policy-deny events now carry the snapshot's compiled numeric policy ID; filter-log events carry filter/term/action identity from the matched compiled term. #1379 is closed for the feature-gap audit; the final live cluster syslog proof was delivered in the closed #1477 validation set. |
 | `show system buffers` | Userspace helper-status rendering covers AF_XDP UMEM/TX capacity, CoS queued-byte capacity, helper-published session-table and flow-cache capacity, active-session footer, neighbor counts, and worker queue pressure counters. The Phase 5 denominator decision is explicit: session-table and flow-cache values become fill percentages only from Rust-owned helper fields; neighbor-cache entries remain counters until Rust owns a bounded neighbor-cache capacity. Formatter tests pin that dynamic counts cannot move into the utilization table without real denominators. |
@@ -110,7 +110,7 @@ leases are not synchronized, and new-flow pool-address parity is not promised.
 
 | Issue | Removal phase (closed) |
 |-------|--------------------|
-| #1451 | Migrated remaining API, gRPC, CLI, status, metrics, session, GC, cluster, daemon-control, and userspace shim callers off the legacy eBPF-shaped `dataplane.DataPlane` surface. |
+| #1451 | Closed the eBPF-retirement removal-phase blocker: the userspace manager no longer embeds the legacy `dataplane.DataPlane`, runtime backend selection and forwarding are off the legacy surface, and the operator surfaces moved to apply-result metadata + `SessionStore`/`Telemetry`. Remaining root `pkg/dataplane` session/counter *type* imports in API/gRPC/CLI/daemon are the documented canary allowlist (`retirement_boundary_canary_test.go`) and are post-retirement interface cleanup, not a retirement blocker. |
 | #1473 / #1493 | Split shim-only generation and the userspace shim loader/bootstrap from the legacy in-kernel forwarding loader so the retained shim survives while the legacy XDP/TC programs were removed. |
 | #1476 | Removed legacy BPF source, generated artifacts, and build hooks, preserving the retained AF_XDP userspace shim path. |
 | #1477 | Published the final userspace-only validation artifact set (cluster, screen/flood, CoS, HA, degraded-path evidence). |
@@ -167,12 +167,15 @@ There are two distinct fallback boundaries:
 
 ## Priority Work
 
-The #1373 retirement (including the #1451 runtime-surface migration, the
+The #1373 retirement (including the #1451 removal-phase blocker, the
 #1473/#1493 userspace XDP shim split, the #1476 source removal, and the
-#1477 validation artifact set) is complete. The highest-value remaining
-work on `master` is correctness, operational hardening, and performance
-optimization on the active AF_XDP userspace forwarding path — for example
-CoS regression work (#1614) and cold-path hardening (#1608).
+#1477 validation artifact set) is complete. Residual root `pkg/dataplane`
+session/counter *type* imports in the operator surfaces are post-retirement
+interface cleanup tracked by the canary allowlist, not a retirement blocker.
+The highest-value remaining work on `master` is correctness, operational
+hardening, and performance optimization on the active AF_XDP userspace
+forwarding path — for example CoS regression work (#1614) and cold-path
+hardening (#1608).
 
 Keep #1377, #1448, #1449, and #1450 closed. SNAT helper-restart reset
 behavior, HA persistent-lease gating, and cross-backend selector divergence
