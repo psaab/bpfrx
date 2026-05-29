@@ -30,3 +30,15 @@ Continuations:
 | Claude SMR | in-conversation                    | MERGE-READY (verified fixes) |
 | Copilot    | re-review requested @ b870f4303    | requested |
 | Copilot SWE| autonomous commits 7d8d2ab19, 422196ba5 (retry-budget 128->2048->8192) | integrated |
+
+### Round 3 verdicts (head b870f4303 code; 44c3c3db7 = docs/comments + Go test only)
+| Reviewer   | Task / job id                      | Verdict                         |
+|------------|------------------------------------|---------------------------------|
+| Codex      | task-mpreeci9-0dfrx9               | MERGE-NEEDS-MINOR (docs/comments only — "functional verdict merge-ready"); all stale comments fixed in 44c3c3db7 |
+| AGY        | adversarial-review-mpreek4k-h6dm4i  | MERGE-READY (all 3 r2 fixes verified; injective base-65 index; gen-independent zero-out; overflow gauge) |
+| Claude SMR | in-conversation                    | MERGE-READY                     |
+| Copilot    | re-review @ 44c3c3db7 requested     | 4 r3 NITs (stale comments + Go sparse-wire test) all addressed; awaiting confirm |
+
+Note: AGY + Codex independently confirmed the lone failing test
+(snat_contract_doc_guard) is unrelated pre-existing master drift
+("fail closed" vs "fail-closed" on docs/userspace-dataplane-gaps.md:40).
