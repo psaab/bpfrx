@@ -799,11 +799,11 @@ mod pin_tests {
     /// return the read-back size (the surrounding production recv() loop
     /// ignores its return; this knob must not). Uses a deliberately small
     /// request (256 KiB) so the test does not depend on running as root:
-    /// the kernel doubles the request, then (non-root) clamps the plain
-    /// SO_RCVBUF fallback to rmem_max. 256 KiB is below any realistic
-    /// rmem_max, so no clamp fires and the doubled value (512 KiB) is the
-    /// effective size — flake-proof regardless of privilege or host
-    /// rmem_max.
+    /// the kernel sets buf = 2 * min(request, rmem_max). On a typical host
+    /// rmem_max far exceeds 256 KiB, so the effective size is ~512 KiB; the
+    /// assertion below uses a conservative floor (min(2*req, rmem_max),
+    /// which is always <= the kernel value) so it stays flake-proof across
+    /// privilege levels and any host rmem_max.
     #[test]
     fn neigh_monitor_rcvbuf_enlarges_effective_buffer() {
         const TEST_REQ: libc::c_int = 256 * 1024; // well below typical rmem_max
@@ -818,10 +818,11 @@ mod pin_tests {
 
         let effective = super::set_neigh_monitor_rcvbuf(fd, TEST_REQ);
 
-        // Effective floor: kernel doubles the request, then the non-root
-        // SO_RCVBUF fallback clamps to rmem_max (NOT 2*rmem_max). Read
-        // rmem_max to build the exact expected floor; fall back to the
-        // weaker "grew to at least the request" check if it is unreadable.
+        // Conservative floor: the kernel sets buf = 2 * min(request,
+        // rmem_max) (the non-root SO_RCVBUF fallback clamps to rmem_max,
+        // NOT 2*rmem_max). min(2*req, rmem_max) is always <= that value,
+        // so asserting >= it never false-fails. Fall back to the weaker
+        // "grew to at least the request" check if rmem_max is unreadable.
         let rmem_max = std::fs::read_to_string("/proc/sys/net/core/rmem_max")
             .ok()
             .and_then(|s| s.trim().parse::<i64>().ok());

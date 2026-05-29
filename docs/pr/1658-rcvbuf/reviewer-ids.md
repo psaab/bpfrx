@@ -11,8 +11,18 @@
   CAP_NET_ADMIN) + runtime readback for observability; verified single-fd
   placement.
 
-## Code review (PR)
-- Copilot: pending
-- Codex: pending
-- AGY: pending
-- Claude SMR: pending
+## Code review (PR #1664)
+- Copilot: MERGE-READY equivalent — reviewed all 3 files, generated no
+  comments (clean).
+- Codex: task-mprbc0w5-uxkgn4 BLOCKED (sandbox shell failure, no verdict)
+  -> retried per feedback_codex_infra_must_retry as task-mprc3t6u-juvstu
+  = MERGE-READY (1 minor comment-wording nit on the test docstring,
+  applied; not a blocker).
+- AGY: review-mprbc8hm-cuiivs — MERGE-READY (item-by-item code-grounded
+  verification; independently re-derived the test floor math + errno
+  capture correctness).
+- Claude SMR: MERGE-READY — verified errno capture ordering (force_err
+  before second setsockopt; second last_os_error is the SO_RCVBUF errno,
+  no intervening libc call), FFI types, single-fd placement.
+
+4-of-4 clean.
