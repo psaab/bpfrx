@@ -48,7 +48,20 @@ bash scripts/refactoring-audit.sh > docs/refactoring-audit-current.txt
 ```
 
 The script sorts deterministically with `LC_ALL=C sort -k2,2nr -k3,3`
-(descending LOC, ascending path).
+(descending LOC, ascending path), emits no timestamps, and tolerates
+absent source roots (e.g. `bpf/xdp`/`bpf/tc` after #1476), so repeated
+runs produce byte-identical output.
+
+## Drift guard
+
+`make audit-check` (#1661 item 8) regenerates the heatmap to a temp
+file and `diff`s it against the committed
+`docs/refactoring-audit-current.txt`, failing if they differ or if the
+generator itself errors. Run it after any change that adds, deletes, or
+resizes a `>=1500` LOC source file, then commit the regenerated artifact
+so the two stay in sync. The target is standalone (not wired into `make
+test`/`all`) so an unrelated PR is not blocked until the artifact is
+refreshed; run it explicitly or in a dedicated CI lane.
 
 ## When to refactor a candidate
 
