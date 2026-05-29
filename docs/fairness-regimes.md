@@ -116,6 +116,138 @@ then check `observed_CoV ≤ Cstruct + 0.05`. This makes the gate
 **meaningful for any RSS distribution** and rules out the
 mathematical inconsistency of fixed CoV bands.
 
+## Per-flow CoV floor (RSS multinomial)
+
+`Cstruct` above is the ceiling for *one observed* `{aᵢ}`
+distribution. This section gives the **floor on the distribution
+itself**: how uneven `{aᵢ}` is *expected* to be when `N` flows are
+hashed by RSS into `M` RX queues. The two together bracket the
+problem — `{aᵢ}` will not be flat (this section), and given a
+non-flat `{aᵢ}` the per-flow CoV cannot beat `Cstruct` (above).
+
+This is a canonical reference for the recurring observation that
+`iperf3 -c 172.16.80.200 -p 5210 -P 6` shows a stable bimodal
+per-flow split: ~2 flows pinned slow sharing one worker, ~4 flows
+solo, ≥1 worker idle. **That is the floor, not a scheduler bug.**
+Cross-references: #1333 (symptom report), #1304, #1649 (this
+analysis), and the killed cross-worker-rebalance chain
+#1215 / #837 / #937 / #840 / #1238 / #1243.
+
+### The floor curve
+
+On the loss userspace cluster the dataplane NIC exposes **M = 6
+combined RX queues**, deterministically bound one-per-worker
+(RX queue N delivers to the worker whose AF_XDP socket is bound to
+queue N — `userspace-xdp/src/lib.rs` `select_userspace_queue()`).
+RSS hashes each TCP flow's 5-tuple to one of those 6 queues, so
+`N` flows land as a **multinomial draw** over `M = 6` bins.
+
+The unevenness of that draw is a pure function of `N` and `M`. Two
+useful summaries, both computed by Monte-Carlo (200k trials,
+i.i.d. uniform hashing) and confirmed against closed form:
+
+- **CoV of the per-queue occupancy counts** `{aᵢ}` (how skewed the
+  worker loading is):
+
+  | N flows (M=6) | E[CoV of `{aᵢ}`] | P(≥1 idle worker) |
+  |---:|---:|---:|
+  | 2  | 0.00 | 100%  |
+  | 6  | 0.87 | 98.5% |
+  | 12 | 0.62 | 56%   |
+  | 18 | 0.53 | 21%   |
+  | 24 | 0.50 | 7.6%  |
+
+  At `N = 6` the count-CoV is ≈ **0.87** and the chance of a
+  perfect one-flow-per-queue spread is only
+  `6!/6⁶ ≈ 1.54%`. The curve is high at small `N` (bins are
+  sparsely and unevenly filled) and decreases as `N` grows and the
+  law of large numbers flattens the bins.
+
+- **Live per-flow throughput CoV** is *lower* than the count-CoV
+  for any single realization, because TCP cwnd dynamics and the
+  per-worker scheduler partially smooth it, and because the most
+  common `N = 6` realizations are "4 solo + 1 pair" rather than a
+  worst-case pile-up. The **~17%** observed on the live
+  `-P 6 -p 5210` run is one such favorable realization, mapped
+  through `Cstruct` for its `{aᵢ}`. Do not conflate the two
+  numbers: 0.87 is the *occupancy* CoV of the multinomial; ~17% is
+  the *throughput* CoV of one observed placement. Both are on the
+  floor — neither indicates a defect.
+
+The shape (high at small `N`, decreasing as `N` grows) is the
+takeaway. A small flow count over 6 queues is *expected* to be
+bimodal.
+
+### Why hardware steering does NOT beat the floor
+
+The natural question is "the NIC supports flow steering — can we
+just steer flows one-per-queue?" #1649 researched this directly on
+the deployed NIC and the answer is no. Findings (verbatim ethtool
+evidence in `docs/research/1649-initial-placement/plan.md` §2,
+branch `research/1649-initial-placement`):
+
+- **The #937/#840-named prerequisite EXISTS.** The mlx5 VF accepts
+  exact-5-tuple → RX-queue ntuple rules
+  (`ethtool -N ... action <q>` → `Added rule with ID 1023`) and
+  masked source-port-residue rules
+  (`src-port 0 m 0xfff8 dst-port 5210 m 0x0000`). Rule-table
+  capacity is **1024** (probed to exhaustion =
+  mlx5 `MLX5E_ETHTOOL_FLOW_SPEC_NUM`, NOT the "32k" #1203 assumed),
+  at **~1 ms-class** firmware cost per rule.
+
+- **No static `f(5-tuple) → queue` map beats RSS.** Any rule set
+  installed once (residue buckets, RSS-context layouts, a wider
+  hashed field) is still a *static hash*: for clients using
+  ephemeral source ports it produces i.i.d. queue draws with a
+  fixed probability vector — balanced gives exactly the RSS floor,
+  imbalanced gives worse. Monte-Carlo confirms masked-residue
+  steering lands at CoV ≈ 0.87 (same as RSS) for ephemeral ports,
+  worse (≈ 1.05) for the mod-8 layout. It beats the floor *only*
+  when the generator deliberately coordinates source-port residues
+  with the queue count (`iperf3 --cport` stepping) — a
+  controlled-harness artifact, never production traffic.
+
+- **Even placement of `N ≤ M` flows requires negative
+  dependence** — steering each new flow *away from* already-occupied
+  queues. That is occupancy-aware reactive re-steer, which AF_XDP
+  per-queue UMEM ownership forbids: the SYN is RSS-placed before any
+  exact rule can exist (the ephemeral port is unknowable in
+  advance), so any later correction *moves an established flow* —
+  the forbidden re-steer pattern. #1203/#789 already built and
+  measured that reactive closed-loop form on this exact cluster:
+  **49–55% CoV at P=12** (gate ≤20% not met), closed with "per-flow
+  CoV is bounded by within-queue scheduling, not placement."
+
+Two external reviewers (Codex + Antigravity) independently
+reproduced the Monte-Carlo and confirmed the kill. The general
+theorem: no static placement can create the negative dependence
+between flows needed to make `N ≤ M` flows avoid occupied queues;
+only a reactive controller observing live occupancy can, and that
+is a re-steer.
+
+### What this means operationally
+
+- **Aggregate throughput is unaffected.** A class still fills its
+  share of the ceiling regardless of how its flows distribute
+  across workers; only the *per-flow distribution within the class*
+  is uneven. The structural-throughput gate (Gate 3) and the
+  Cstruct-relative per-flow gate (Gate 2) both already account for
+  this.
+- **It is a transport/RSS-architecture floor, not a scheduler
+  bug.** When an operator or test sees bimodal per-flow rates at
+  low parallelism, the correct response is to read off the floor
+  curve above, not to file a fairness regression.
+- **Distinct from the mid-rate CoS rate-metering residuals**
+  tracked under #1630. #1630 isolated per-class shaping floors in
+  the v8 epoch rate-meter (cause-1: low-rate 100m/1g lazy-rotation
+  credit loss; cause-2: a separate mid-rate ~6% residual on 3g/6g
+  at low parallelism). Those are CoS scheduler-internal floors on a
+  class hitting its *configured shape*; the RSS multinomial floor
+  here is about how *unshaped best-effort flows distribute across
+  workers*. Different mechanism, different layer — see the
+  "Small-class per-class rate-metering floor (#1630)" section for
+  the CoS-shaping floors.
+
 ## Acceptance gates
 
 A measurement run **PASSES** iff ALL of:

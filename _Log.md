@@ -38,6 +38,26 @@
   `test/incus/cos-gate1-small-four-alone.sh`,
   `docs/pr/1630-cause1-credit-carry/plan.md`
 
+## 2026-05-28 — #1649 per-flow CoV floor-curve docs (PLAN-KILL deliverable)
+- **Timestamp**: 2026-05-28
+- **Action**: Docs-only PR closing #1649 (per-flow CoV floor PLAN-KILL).
+  Added a canonical "Per-flow CoV floor (RSS multinomial)" section to
+  `docs/fairness-regimes.md`: the N-into-M=6 multinomial floor curve
+  (E[CoV of `{aᵢ}`] 0.87 at N=6 decreasing with N; P(perfect spread)
+  1.54%), why mlx5 hardware ntuple steering does not beat it (exact +
+  masked-residue steering exist, cap 1024, ~1 ms/rule, but any static
+  hash = i.i.d. draws; even N≤M placement needs negative dependence =
+  forbidden re-steer; #1203/#789 measured 49–55% reactive), and the
+  operational meaning (aggregate unaffected, transport/RSS floor not a
+  scheduler bug; distinct from #1630 CoS rate-metering residuals).
+  Added a CLAUDE.md note that the loss userspace cluster uses mlx5
+  SR-IOV VFs (6 RX queues → 6 workers, native XDP) — additive, did not
+  rewrite the standalone-VM i40e text. All claims grounded in the
+  #1649 research plan @ 36fcd1b86 + reproduced Monte-Carlo. SMR accuracy
+  self-review written.
+- **File(s)**: `docs/fairness-regimes.md`, `CLAUDE.md`,
+  `docs/pr/1649-doc-floor-curve/claude-smr-accuracy.md`, `_Log.md`
+
 ## 2026-05-28 03:07 UTC — #1611 Copilot review addressed
 - **Timestamp**: 2026-05-28 03:07 UTC
 - **Action**: For PR #1616 / issue #1611, addressed two Copilot review findings in `test/incus/cold-path-flooder/src/main.rs`. (1) Reworked the per-second stderr JSON helper so `pps` is derived from the real emit-window duration and the emitted counters are explicitly window deltas (`*_delta`) instead of mixed cumulative/window semantics. Added unit tests covering the computed rate and the zero-window clamp. (2) Reworked the ignored CAP_NET_RAW smoke test so it no longer binds to `lo`; it now uses `XPF_RAW_SOCKET_TEST_IFACE` when provided or auto-probes `/sys/class/net` for an `IFF_UP` Ethernet iface, validates `ARPHRD_ETHER`, and skips cleanly if no suitable iface is available. Updated the #1611 plan doc example/output accordingly.
