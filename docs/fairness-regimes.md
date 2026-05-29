@@ -151,7 +151,7 @@ i.i.d. uniform hashing) and confirmed against closed form:
 
   | N flows (M=6) | E[CoV of `{aᵢ}`] | P(≥1 idle worker) |
   |---:|---:|---:|
-  | 2  | 0.00 | 100%  |
+  | 2  | 1.55 | 100%  |
   | 6  | 0.87 | 98.5% |
   | 12 | 0.62 | 56%   |
   | 18 | 0.53 | 21%   |
@@ -163,16 +163,19 @@ i.i.d. uniform hashing) and confirmed against closed form:
   sparsely and unevenly filled) and decreases as `N` grows and the
   law of large numbers flattens the bins.
 
-- **Live per-flow throughput CoV** is *lower* than the count-CoV
-  for any single realization, because TCP cwnd dynamics and the
-  per-worker scheduler partially smooth it, and because the most
-  common `N = 6` realizations are "4 solo + 1 pair" rather than a
-  worst-case pile-up. The **~17%** observed on the live
-  `-P 6 -p 5210` run is one such favorable realization, mapped
+- **Live per-flow throughput CoV** in the **observed skewed case**
+  (`-P 6 -p 5210`, ~17%) is lower than the 0.87 occupancy CoV
+  because TCP cwnd dynamics and the per-worker scheduler partially
+  smooth the count unevenness, and because the most common `N = 6`
+  realizations are "4 solo + 1 pair" rather than a worst-case
+  pile-up. The ~17% is one such favorable realization, mapped
   through `Cstruct` for its `{aᵢ}`. Do not conflate the two
   numbers: 0.87 is the *occupancy* CoV of the multinomial; ~17% is
-  the *throughput* CoV of one observed placement. Both are on the
-  floor — neither indicates a defect.
+  the *throughput* CoV of one observed placement. (The
+  correspondence does not hold universally: a perfect
+  one-flow-per-queue draw has occupancy CoV = 0 while individual
+  flow rates can still differ.) Both are on the floor — neither
+  indicates a defect.
 
 The shape (high at small `N`, decreasing as `N` grows) is the
 takeaway. A small flow count over 6 queues is *expected* to be
@@ -183,8 +186,7 @@ bimodal.
 The natural question is "the NIC supports flow steering — can we
 just steer flows one-per-queue?" #1649 researched this directly on
 the deployed NIC and the answer is no. Findings (verbatim ethtool
-evidence in `docs/research/1649-initial-placement/plan.md` §2,
-branch `research/1649-initial-placement`):
+evidence in issue #1649, research plan at commit `36fcd1b8`):
 
 - **The #937/#840-named prerequisite EXISTS.** The mlx5 VF accepts
   exact-5-tuple → RX-queue ntuple rules

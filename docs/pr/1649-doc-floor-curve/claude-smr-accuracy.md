@@ -13,7 +13,7 @@ Edited files:
 
 | Claim | Source of truth | Verdict |
 |---|---|---|
-| Loss cluster NIC exposes M=6 combined RX queues bound one-per-worker | `docs/research/1649-initial-placement/plan.md` §2.1 (`ethtool -l ge-0-0-2` → `Combined: 6`) + §3 (`select_userspace_queue()` queue-bound delivery, `userspace-xdp/src/lib.rs:371-635`) | GROUNDED |
+| Loss cluster NIC exposes M=6 combined RX queues bound one-per-worker | #1649 research plan (commit `36fcd1b8`) §2.1 (`ethtool -l ge-0-0-2` → `Combined: 6`) + §3 (`select_userspace_queue()` queue-bound delivery, `userspace-xdp/src/lib.rs:371-635`) | GROUNDED |
 | RX queue N → worker bound to queue N (`select_userspace_queue`) | research plan §3, cites `userspace-xdp/src/lib.rs:371-635` and `:1322` queue-bound delivery | GROUNDED — I cite the function name, not a line number, to avoid line drift |
 | RSS hashes 5-tuple → one of 6 queues; N flows = multinomial draw | research plan §1, §7.0 ("N flows hashed into M RX queues do not distribute one-per-queue") | GROUNDED |
 | E[CoV of `{aᵢ}`] table: N=6→0.87, N=12→0.62, N=18→0.53, N=24→0.50 | My own Monte-Carlo (200k trials, M=6, i.i.d. uniform), reproduced this session. N=6 value 0.874 matches research plan's stated "CoV ≈ 0.87 (RSS uniform)" exactly. Single-bucket closed form `sqrt(N·(1/M)(1−1/M))/(N/M)` gives 0.913 at N=6 (per-bucket, slightly higher than whole-vector E[CoV] — consistent) | GROUNDED — values are mine, cross-checked against research's 0.87 anchor |
@@ -76,7 +76,8 @@ correct. I did not weaken or contradict the iavf bullet.
    the published anchor to 3 significant figures, which validates the model;
    the other rows follow from the same simulation. They are rounded to 2 dp
    and labeled "Monte-Carlo" in the text, not presented as measured live
-   data.
+   data. The N=2 row was corrected from 0.00 to 1.55 following code review
+   (closed form: E[CoV] = (5/6)√2 + (1/6)√5 ≈ 1.55).
 2. The "~17% throughput CoV" is a single live observation from the research
    §1, not a distribution. I present it as one realization, not a curve
    point, precisely to avoid implying it is the expected per-flow CoV (which
@@ -84,7 +85,7 @@ correct. I did not weaken or contradict the iavf bullet.
 
 ## Verdict
 
-ACCURACY-CLEAN. Every claim traces to the #1649 research plan @ `36fcd1b86`,
+ACCURACY-CLEAN. Every claim traces to the #1649 research plan (commit `36fcd1b8`),
 PR #1650 / issue #1630 for the cause-1/cause-2 split, issue #1649 for the
 3-reviewer kill, or my own reproduced Monte-Carlo (anchored to the research's
 published 0.87 / 1.54% values). The CLAUDE.md edit ADDS a scoped note and does
