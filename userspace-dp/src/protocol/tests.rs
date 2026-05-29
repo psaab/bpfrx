@@ -893,3 +893,84 @@ fn wire_invariant_default_specimens() {
         );
     }
 }
+
+// #1642: Rust→Go status-field parity. These serde tests pin the exact wire
+// keys for the four field groups the Go side previously dropped on unmarshal
+// (HAGroupStatus lease telemetry, CoSQueueStatus starvation/ring counters,
+// BindingStatus post-drain backup drops, ProcessStatus event-stream
+// connected/seq/acked). The matching Go decode tests live in
+// pkg/dataplane/userspace/protocol_test.go (*Parity1642). A rename on this
+// side is caught here; the Go side then fails to decode the renamed key.
+
+#[test]
+fn ha_group_status_lease_fields_wire_keys_1642() {
+    let status = HAGroupStatus {
+        rg_id: 1,
+        active: true,
+        watchdog_timestamp: 1,
+        forwarding_active: true,
+        lease_state: "owner".to_string(),
+        lease_until: 9876543210,
+    };
+    let value: serde_json::Value =
+        serde_json::to_value(&status).expect("serialize HAGroupStatus");
+    assert_eq!(value["forwarding_active"], true);
+    assert_eq!(value["lease_state"], "owner");
+    assert_eq!(value["lease_until"], 9876543210u64);
+    let back: HAGroupStatus = serde_json::from_value(value).expect("deserialize HAGroupStatus");
+    assert!(back.forwarding_active);
+    assert_eq!(back.lease_state, "owner");
+    assert_eq!(back.lease_until, 9876543210);
+}
+
+#[test]
+fn cos_queue_status_starvation_counters_wire_keys_1642() {
+    let status = CoSQueueStatus {
+        root_token_starvation_parks: 11,
+        queue_token_starvation_parks: 22,
+        tx_ring_full_submit_stalls: 33,
+        ..Default::default()
+    };
+    let value: serde_json::Value =
+        serde_json::to_value(&status).expect("serialize CoSQueueStatus");
+    assert_eq!(value["root_token_starvation_parks"], 11u64);
+    assert_eq!(value["queue_token_starvation_parks"], 22u64);
+    assert_eq!(value["tx_ring_full_submit_stalls"], 33u64);
+}
+
+#[test]
+fn binding_status_post_drain_backup_cos_drops_wire_keys_1642() {
+    let status = BindingStatus {
+        post_drain_backup_cos_drops: 7,
+        post_drain_backup_cos_drop_bytes: 4096,
+        ..Default::default()
+    };
+    let value: serde_json::Value =
+        serde_json::to_value(&status).expect("serialize BindingStatus");
+    assert_eq!(value["post_drain_backup_cos_drops"], 7u64);
+    assert_eq!(value["post_drain_backup_cos_drop_bytes"], 4096u64);
+    // These are binding-scoped: CoSQueueStatus must NOT also carry them.
+    let cos: serde_json::Value = serde_json::to_value(CoSQueueStatus {
+        post_drain_backup_bytes: 1,
+        ..Default::default()
+    })
+    .expect("serialize CoSQueueStatus");
+    assert!(cos.get("post_drain_backup_cos_drops").is_none());
+    assert!(cos.get("post_drain_backup_cos_drop_bytes").is_none());
+    assert_eq!(cos["post_drain_backup_bytes"], 1u64);
+}
+
+#[test]
+fn process_status_event_stream_fields_wire_keys_1642() {
+    let status = ProcessStatus {
+        event_stream_connected: true,
+        event_stream_seq: 4242,
+        event_stream_acked: 4200,
+        ..Default::default()
+    };
+    let value: serde_json::Value =
+        serde_json::to_value(&status).expect("serialize ProcessStatus");
+    assert_eq!(value["event_stream_connected"], true);
+    assert_eq!(value["event_stream_seq"], 4242u64);
+    assert_eq!(value["event_stream_acked"], 4200u64);
+}

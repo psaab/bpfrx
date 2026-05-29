@@ -582,25 +582,35 @@ type ProcessStatus struct {
 	// #1248: per-CoS-queue active flow distribution by egress ifindex,
 	// queue, and worker. This is the class-specific {a_i} source for
 	// mixed-workload fairness diagnostics.
-	CoSActiveFlowCounts          []CoSActiveFlowCountStatus        `json:"cos_active_flow_counts,omitempty"`
-	CoSActiveFlowCountsTruncated bool                              `json:"cos_active_flow_counts_truncated,omitempty"`
-	RecentSessionDeltas          []SessionDeltaInfo                `json:"recent_session_deltas,omitempty"`
-	RecentExceptions             []ExceptionStatus                 `json:"recent_exceptions,omitempty"`
-	EventStream                  *EventStreamStatus                `json:"event_stream,omitempty"`
-	EventStreamSent              uint64                            `json:"event_stream_sent,omitempty"`
-	EventStreamDropped           uint64                            `json:"event_stream_dropped,omitempty"`
-	CoSInterfaces                []CoSInterfaceStatus              `json:"cos_interfaces,omitempty"`
-	PolicyRuleCounters           []PolicyRuleCounterStatus         `json:"policy_rule_counters,omitempty"`
-	FilterTermCounters           []FirewallFilterTermCounterStatus `json:"filter_term_counters,omitempty"`
-	ThreeColorPolicerCounters    []ThreeColorPolicerStatus         `json:"three_color_policer_counters,omitempty"`
-	SourceNATPools               []SourceNATPoolStatus             `json:"source_nat_pools,omitempty"`
-	LastResolution               *PacketResolution                 `json:"last_resolution,omitempty"`
-	SlowPath                     SlowPathStatus                    `json:"slow_path,omitempty"`
-	LastCacheFlushAt             uint64                            `json:"last_cache_flush_at,omitempty"`    // monotonic secs (#312)
-	DataplaneMode                string                            `json:"dataplane_mode,omitempty"`         // Current active mode: "ebpf_only", "userspace_compat", "userspace_strict"
-	ConfiguredMode               string                            `json:"configured_mode,omitempty"`        // Desired mode from config
-	EntryPrograms                map[int]string                    `json:"entry_programs,omitempty"`         // ifindex -> attached XDP program name
-	DegradedPathCounters         map[string]uint64                 `json:"degraded_path_counters,omitempty"` // reason_name -> count
+	CoSActiveFlowCounts          []CoSActiveFlowCountStatus `json:"cos_active_flow_counts,omitempty"`
+	CoSActiveFlowCountsTruncated bool                       `json:"cos_active_flow_counts_truncated,omitempty"`
+	RecentSessionDeltas          []SessionDeltaInfo         `json:"recent_session_deltas,omitempty"`
+	RecentExceptions             []ExceptionStatus          `json:"recent_exceptions,omitempty"`
+	EventStream                  *EventStreamStatus         `json:"event_stream,omitempty"`
+	EventStreamSent              uint64                     `json:"event_stream_sent,omitempty"`
+	EventStreamDropped           uint64                     `json:"event_stream_dropped,omitempty"`
+	// #1642: the Rust helper serializes these three flat event-stream
+	// fields on ProcessStatus (protocol/control.rs) alongside _sent /
+	// _dropped, but the Go side only declared _sent / _dropped, so
+	// connected / seq / acked were silently dropped. The nested
+	// *EventStreamStatus above carries different, Go-populated counters
+	// (frames_read, decode_errors) the Rust helper never emits. JSON tags
+	// MUST match Rust serde rename(...) exactly.
+	EventStreamConnected      bool                              `json:"event_stream_connected,omitempty"`
+	EventStreamSeq            uint64                            `json:"event_stream_seq,omitempty"`
+	EventStreamAcked          uint64                            `json:"event_stream_acked,omitempty"`
+	CoSInterfaces             []CoSInterfaceStatus              `json:"cos_interfaces,omitempty"`
+	PolicyRuleCounters        []PolicyRuleCounterStatus         `json:"policy_rule_counters,omitempty"`
+	FilterTermCounters        []FirewallFilterTermCounterStatus `json:"filter_term_counters,omitempty"`
+	ThreeColorPolicerCounters []ThreeColorPolicerStatus         `json:"three_color_policer_counters,omitempty"`
+	SourceNATPools            []SourceNATPoolStatus             `json:"source_nat_pools,omitempty"`
+	LastResolution            *PacketResolution                 `json:"last_resolution,omitempty"`
+	SlowPath                  SlowPathStatus                    `json:"slow_path,omitempty"`
+	LastCacheFlushAt          uint64                            `json:"last_cache_flush_at,omitempty"`    // monotonic secs (#312)
+	DataplaneMode             string                            `json:"dataplane_mode,omitempty"`         // Current active mode: "ebpf_only", "userspace_compat", "userspace_strict"
+	ConfiguredMode            string                            `json:"configured_mode,omitempty"`        // Desired mode from config
+	EntryPrograms             map[int]string                    `json:"entry_programs,omitempty"`         // ifindex -> attached XDP program name
+	DegradedPathCounters      map[string]uint64                 `json:"degraded_path_counters,omitempty"` // reason_name -> count
 	// #1636 option C: proactive-neighbor-warm telemetry. WarmDrops counts
 	// warm requests dropped because the bounded warmer queue was full
 	// (transient); WarmDisconnected counts requests dropped because the
@@ -737,6 +747,13 @@ type CoSQueueStatus struct {
 	AdmissionFlowShareDrops uint64 `json:"admission_flow_share_drops,omitempty"`
 	AdmissionBufferDrops    uint64 `json:"admission_buffer_drops,omitempty"`
 	AdmissionEcnMarked      uint64 `json:"admission_ecn_marked,omitempty"`
+	// #1642: shaper starvation / TX-ring-pressure diagnostics the Rust
+	// helper serializes on CoSQueueStatus (protocol/cos.rs). These are
+	// distinct from the DrainPark* fields below (which count drain-loop
+	// parks). JSON tags MUST match Rust serde rename(...) exactly.
+	RootTokenStarvationParks  uint64 `json:"root_token_starvation_parks,omitempty"`
+	QueueTokenStarvationParks uint64 `json:"queue_token_starvation_parks,omitempty"`
+	TxRingFullSubmitStalls    uint64 `json:"tx_ring_full_submit_stalls,omitempty"`
 	// #1304: Rust-owned equal-flow enforcement telemetry. The
 	// measurement-only xpf_fairness_equal_flow_* gauges remain advisory;
 	// these fields describe the opt-in shared v8 queue-lease suppressor.
@@ -783,8 +800,13 @@ type CoSQueueStatus struct {
 	DrainParkQueueTokens                       uint64 `json:"drain_park_queue_tokens,omitempty"`
 	PostDrainBackupBytes                       uint64 `json:"post_drain_backup_bytes,omitempty"`
 	DrainSentBytesShapedUnconditional          uint64 `json:"drain_sent_bytes_shaped_unconditional,omitempty"`
-	PostDrainBackupCosDrops                    uint64 `json:"post_drain_backup_cos_drops,omitempty"`
-	PostDrainBackupCosDropBytes                uint64 `json:"post_drain_backup_cos_drop_bytes,omitempty"`
+	// #1642: post_drain_backup_cos_drops / _cos_drop_bytes were on this
+	// struct, but the Rust helper serializes them on BindingStatus
+	// (protocol/binding.rs), a different JSON nesting level. The Rust
+	// binding-level values never decoded into CoSQueueStatus, so they were
+	// silently dropped. They now live on BindingStatus to match the source.
+	// (PostDrainBackupBytes above is correct here — Rust does serialize
+	// post_drain_backup_bytes on CoSQueueStatus.)
 }
 
 type FirewallFilterTermCounterStatus struct {
@@ -882,6 +904,13 @@ type HAGroupStatus struct {
 	RGID              int    `json:"rg_id"`
 	Active            bool   `json:"active"`
 	WatchdogTimestamp uint64 `json:"watchdog_timestamp,omitempty"`
+	// #1642: lease-telemetry fields the Rust helper serializes on
+	// HAGroupStatus (protocol/binding.rs). Observability only — the HA
+	// failover *decision* is taken from BPF maps via mergeHAStateFromMaps,
+	// not from these. JSON tags MUST match the Rust serde rename(...) exactly.
+	ForwardingActive bool   `json:"forwarding_active,omitempty"`
+	LeaseState       string `json:"lease_state,omitempty"`
+	LeaseUntil       uint64 `json:"lease_until,omitempty"`
 }
 
 type SlowPathStatus struct {
@@ -1150,13 +1179,21 @@ type BindingStatus struct {
 	// #819 §4.1). omitempty keeps forward-compat — a pre-#825
 	// helper that lacks these fields decodes into empty slice /
 	// zero uint64.
-	TxKickLatencyHist  []uint64  `json:"tx_kick_latency_hist,omitempty"`
-	TxKickLatencyCount uint64    `json:"tx_kick_latency_count,omitempty"`
-	TxKickLatencySumNs uint64    `json:"tx_kick_latency_sum_ns,omitempty"`
-	TxKickRetryCount   uint64    `json:"tx_kick_retry_count,omitempty"`
-	LastHeartbeat      time.Time `json:"last_heartbeat,omitempty"`
-	LastError          string    `json:"last_error,omitempty"`
-	LastChange         time.Time `json:"last_change,omitempty"`
+	TxKickLatencyHist  []uint64 `json:"tx_kick_latency_hist,omitempty"`
+	TxKickLatencyCount uint64   `json:"tx_kick_latency_count,omitempty"`
+	TxKickLatencySumNs uint64   `json:"tx_kick_latency_sum_ns,omitempty"`
+	TxKickRetryCount   uint64   `json:"tx_kick_retry_count,omitempty"`
+	// #760 (#1642): the post-drain backup filter drop counters are
+	// binding-scoped in the Rust helper (protocol/binding.rs), not
+	// queue-scoped. They were previously declared on CoSQueueStatus, a
+	// different JSON nesting level, so the Rust binding-level values were
+	// silently dropped on unmarshal. JSON tags MUST match Rust serde
+	// rename(...) exactly.
+	PostDrainBackupCosDrops     uint64    `json:"post_drain_backup_cos_drops,omitempty"`
+	PostDrainBackupCosDropBytes uint64    `json:"post_drain_backup_cos_drop_bytes,omitempty"`
+	LastHeartbeat               time.Time `json:"last_heartbeat,omitempty"`
+	LastError                   string    `json:"last_error,omitempty"`
+	LastChange                  time.Time `json:"last_change,omitempty"`
 }
 
 // BindingCountersSnapshot is the focused per-binding ring-pressure view
