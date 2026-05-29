@@ -1,5 +1,23 @@
 # Action Log
 
+## 2026-05-29 — #1646 frr writeManagedSection torn-write hardening
+- **Timestamp**: 2026-05-29 UTC
+- **Action**: Hardened `writeManagedSection` in pkg/frr/manager.go against
+  torn-write corruption. (1) When markerBegin is present but markerEnd is
+  absent (an orphaned begin from a prior truncated write), discard from the
+  begin marker to EOF instead of skipping the strip — prevents the
+  double-begin state that a later write would over-cut, deleting unrelated
+  operator config. (2) Write frr.conf atomically via new `atomicWriteFile`
+  (temp file in same dir + fsync + chmod + rename) so a crash/disk-full can
+  never leave a half-written file in the first place. Preserve an existing
+  file's mode + best-effort ownership across the inode-replacing rename
+  (Copilot); preserve symlinks via EvalSymlinks/Readlink incl. dangling
+  links, surface chown failures when owner differs (AGY + Copilot r2). Added
+  regression tests TestWriteManagedSection_{OrphanedBeginMarker,
+  PreservesExistingMode,PreservesSymlink,DanglingSymlink}; verified
+  fail-before (2 begin markers, partial body retained) / pass-after.
+- **File(s)**: pkg/frr/manager.go, pkg/frr/frr_test.go
+
 ## 2026-05-29 — #1642 Rust→Go status-field parity drift
 - **Timestamp**: 2026-05-29 UTC
 - **Action**: Fixed 4 field-level JSON parity gaps where the Rust helper

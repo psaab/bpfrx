@@ -410,6 +410,218 @@ func TestWriteManagedSection_NoExistingFile(t *testing.T) {
 	}
 }
 
+// TestWriteManagedSection_OrphanedBeginMarker is the #1646 regression test.
+// A prior torn write (os.WriteFile is not atomic) can leave an orphaned
+// markerBegin with no markerEnd. The pre-fix code skipped the strip entirely
+// when markerEnd was absent, appending a SECOND managed block — and the write
+// after that would over-cut from the orphan begin to the new block's end,
+// deleting everything in between, including unrelated operator/tool config.
+//
+// The fix discards an orphaned-begin tail to EOF. After one writeManagedSection
+// the file must contain exactly one managed block and must NOT carry the torn
+// partial content forward into a state that a subsequent write would over-cut.
+func TestWriteManagedSection_OrphanedBeginMarker(t *testing.T) {
+	dir := t.TempDir()
+	confPath := filepath.Join(dir, "frr.conf")
+
+	m := &Manager{frrConf: confPath}
+
+	// Simulate a torn write: legitimate config, then an orphaned begin marker
+	// with a partial managed body and NO end marker (the write was truncated).
+	torn := "log syslog informational\n" +
+		"ip route 192.0.2.0/24 198.51.100.1\n" + // unrelated, operator-added
+		markerBegin + "\n" +
+		"ip route 10.0.0.0/8 192.168.9.9\n" // partial body, no markerEnd
+	if err := os.WriteFile(confPath, []byte(torn), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// First write after the torn state.
+	if err := m.writeManagedSection("ip route 10.0.0.0/8 192.168.2.1\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	data, _ := os.ReadFile(confPath)
+	got := string(data)
+
+	// Exactly one begin marker — the orphan must have been discarded, not kept.
+	if n := strings.Count(got, markerBegin); n != 1 {
+		t.Errorf("expected exactly 1 begin marker, got %d:\n%s", n, got)
+	}
+	if n := strings.Count(got, markerEnd); n != 1 {
+		t.Errorf("expected exactly 1 end marker, got %d:\n%s", n, got)
+	}
+	// Unrelated operator config above the torn block must survive.
+	if !strings.Contains(got, "ip route 192.0.2.0/24 198.51.100.1") {
+		t.Errorf("unrelated operator config was lost:\n%s", got)
+	}
+	if !strings.Contains(got, "log syslog informational") {
+		t.Errorf("base config lost:\n%s", got)
+	}
+	// The partial torn body must be gone.
+	if strings.Contains(got, "192.168.9.9") {
+		t.Errorf("orphaned partial managed body was not discarded:\n%s", got)
+	}
+	// The new managed route is present.
+	if !strings.Contains(got, "ip route 10.0.0.0/8 192.168.2.1") {
+		t.Errorf("new managed route missing:\n%s", got)
+	}
+
+	// A SECOND write must remain stable and must not over-cut the unrelated
+	// config — this is the step where the pre-fix double-begin state corrupted
+	// the file.
+	if err := m.writeManagedSection("ip route 10.0.0.0/8 192.168.3.3\n"); err != nil {
+		t.Fatal(err)
+	}
+	data, _ = os.ReadFile(confPath)
+	got = string(data)
+	if !strings.Contains(got, "ip route 192.0.2.0/24 198.51.100.1") {
+		t.Errorf("unrelated operator config lost on second write:\n%s", got)
+	}
+	if n := strings.Count(got, markerBegin); n != 1 {
+		t.Errorf("second write: expected 1 begin marker, got %d:\n%s", n, got)
+	}
+	if !strings.Contains(got, "192.168.3.3") {
+		t.Errorf("second write's route missing:\n%s", got)
+	}
+}
+
+// TestWriteManagedSection_PreservesExistingMode guards the Copilot finding on
+// #1646: the atomic temp-file + rename write replaces the inode, so it must
+// reuse the existing file's mode rather than unconditionally applying 0644.
+// frr.conf is commonly deployed 0640; making it world-readable on the next
+// apply would be a permission regression vs the old os.WriteFile path (which
+// preserved the mode of an existing file).
+func TestWriteManagedSection_PreservesExistingMode(t *testing.T) {
+	dir := t.TempDir()
+	confPath := filepath.Join(dir, "frr.conf")
+
+	m := &Manager{frrConf: confPath}
+
+	initial := "log syslog informational\n"
+	if err := os.WriteFile(confPath, []byte(initial), 0640); err != nil {
+		t.Fatal(err)
+	}
+	// Chmod explicitly in case the umask masked bits at create time.
+	if err := os.Chmod(confPath, 0640); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.writeManagedSection("ip route 10.0.0.0/8 192.168.1.1\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	fi, err := os.Stat(confPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != 0640 {
+		t.Errorf("mode not preserved across atomic write: got %o, want 0640", got)
+	}
+
+	// A brand-new file (no existing target) uses the default 0644.
+	freshPath := filepath.Join(dir, "fresh.conf")
+	mf := &Manager{frrConf: freshPath}
+	if err := mf.writeManagedSection("ip route 10.0.0.0/8 Null0\n"); err != nil {
+		t.Fatal(err)
+	}
+	fi, err = os.Stat(freshPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != 0644 {
+		t.Errorf("new file mode: got %o, want 0644", got)
+	}
+}
+
+// TestWriteManagedSection_PreservesSymlink guards the AGY adversarial-review
+// finding on #1646: the old os.WriteFile path followed a symlink and wrote
+// through to its target, whereas a naive rename onto the link path would
+// destroy the link and leave a regular file. xpfd is sometimes pointed at
+// /etc/frr/frr.conf via a symlink; the atomic write must resolve and preserve
+// it.
+func TestWriteManagedSection_PreservesSymlink(t *testing.T) {
+	dir := t.TempDir()
+	realPath := filepath.Join(dir, "real-frr.conf")
+	linkPath := filepath.Join(dir, "frr.conf")
+
+	if err := os.WriteFile(realPath, []byte("log syslog informational\n"), 0640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realPath, linkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &Manager{frrConf: linkPath}
+	if err := m.writeManagedSection("ip route 10.0.0.0/8 192.168.1.1\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	// frr.conf must still be a symlink pointing at the real file.
+	fi, err := os.Lstat(linkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("symlink was replaced by a regular file")
+	}
+	// The managed section must have landed in the real target, through the link.
+	data, err := os.ReadFile(realPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "192.168.1.1") {
+		t.Errorf("write did not reach the symlink target:\n%s", string(data))
+	}
+	if !strings.Contains(string(data), "log syslog informational") {
+		t.Errorf("existing content in symlink target lost:\n%s", string(data))
+	}
+	// Mode of the real target preserved.
+	rfi, err := os.Stat(realPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := rfi.Mode().Perm(); got != 0640 {
+		t.Errorf("symlink target mode not preserved: got %o, want 0640", got)
+	}
+}
+
+// TestWriteManagedSection_DanglingSymlink covers the Copilot round-2 finding:
+// when frr.conf is a symlink whose target does not exist yet, EvalSymlinks
+// fails; os.WriteFile would still follow the link and create the target, so
+// the atomic write must Readlink and write through the link rather than
+// replacing it with a regular file.
+func TestWriteManagedSection_DanglingSymlink(t *testing.T) {
+	dir := t.TempDir()
+	targetPath := filepath.Join(dir, "real-frr.conf") // does NOT exist yet
+	linkPath := filepath.Join(dir, "frr.conf")
+
+	if err := os.Symlink(targetPath, linkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &Manager{frrConf: linkPath}
+	if err := m.writeManagedSection("ip route 10.0.0.0/8 192.168.1.1\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The link must survive and now resolve to a created target.
+	fi, err := os.Lstat(linkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("dangling symlink was replaced by a regular file")
+	}
+	data, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatalf("symlink target was not created: %v", err)
+	}
+	if !strings.Contains(string(data), "192.168.1.1") {
+		t.Errorf("write did not reach the dangling-symlink target:\n%s", string(data))
+	}
+}
+
 func TestGeneratePolicyOptions(t *testing.T) {
 	m := &Manager{frrConf: "/dev/null"}
 	po := &config.PolicyOptionsConfig{
