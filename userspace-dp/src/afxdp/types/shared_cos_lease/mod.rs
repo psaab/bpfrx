@@ -284,9 +284,9 @@ const STALL_THRESHOLD_EPOCHS: u64 = 256;
 /// ceiling so the carry can never push a single rotation above the bound.
 ///
 /// Per-epoch carry DRAIN is additionally capped at `(K − 1) × rate ×
-/// EPOCH` so a normal-recovery rotation that drains a full reservoir
-/// grants `base_cap + (K−1) × base_cap = K × base_cap` — the same K-epoch
-/// ceiling, never more.
+/// EPOCH` so a normal-recovery rotation can add at most `(K−1)` epochs of
+/// rate on top of a `K`-epoch base grant, keeping the single-rotation
+/// maximum at `(2K−1) × rate × EPOCH`.
 const CARRY_MAX_EPOCHS: u64 = MAX_ROTATION_LAG_EPOCHS;
 const CARRY_DRAIN_MAX_EPOCHS: u64 = MAX_ROTATION_LAG_EPOCHS - 1;
 

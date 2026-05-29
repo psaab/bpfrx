@@ -217,8 +217,7 @@ impl SharedCoSQueueLease {
         //   * `elapsed` is the wall-clock lag bounded by `K × EPOCH`
         //     (`MAX_ROTATION_LAG_EPOCHS`) — recovers the rate credit the
         //     old `.min(EPOCH)` clamp discarded for a low-rate class that
-        //     is only visited intermittently, while keeping the per-class
-        //     post-stall burst hard-bounded to `K × rate × EPOCH`;
+        //     is only visited intermittently;
         //   * `carry_draw` releases a bounded slice of the banked deficit
         //     accrued when a single lag exceeded `K × EPOCH`.
         //
@@ -266,9 +265,7 @@ impl SharedCoSQueueLease {
 
         let (elapsed_ns, carry_draw) = if start == 0 || raw_elapsed_ns > stall_window_ns {
             // REGIME 3 — cold-resume. One epoch, drop any stale carry.
-            if start != 0 {
-                v8.epoch.epoch_carry_bytes.store(0, Ordering::Release);
-            }
+            v8.epoch.epoch_carry_bytes.store(0, Ordering::Release);
             (EPOCH_DURATION_NS, 0u64)
         } else if raw_elapsed_ns > k_window_ns {
             // REGIME 2 — bank residual beyond the K-epoch ceiling. Grant

@@ -1072,6 +1072,23 @@ fn v8_carry_first_rotation_is_cold_resume_single_epoch() {
 }
 
 #[test]
+fn v8_carry_first_rotation_drops_stale_carry_even_with_zero_start() {
+    let lease = carry_test_lease();
+    lease
+        .v8
+        .as_ref()
+        .unwrap()
+        .epoch
+        .epoch_carry_bytes
+        .store(CAP_PER_EPOCH_100M, Ordering::Release);
+
+    let _ = lease.acquire_v8(0, EPOCH_DURATION_NS, u64::MAX);
+
+    assert_eq!(published_cap(&lease), CAP_PER_EPOCH_100M);
+    assert_eq!(published_carry(&lease), 0, "start==0 cold-resume drops stale carry");
+}
+
+#[test]
 fn v8_carry_normal_recovery_recovers_lagged_credit() {
     // THE cause-1 fix. A lag within K epochs (regime 1) must grant the
     // FULL lagged credit (`rate × lag`), not the clamped single epoch the
