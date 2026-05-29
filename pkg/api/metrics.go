@@ -153,6 +153,14 @@ type xpfCollector struct {
 	workerColdPathNSPerTSCQ32          *prometheus.Desc
 	workerColdPathClockSource          *prometheus.Desc
 	workerColdPathSnapshotFailedTotal  *prometheus.Desc
+	// #1635 sparse v3 per-zone-pair families (from_zone/to_zone labels).
+	workerColdPathBucketV3            *prometheus.Desc
+	workerColdPathSamplesV3           *prometheus.Desc
+	workerColdPathSumNSV3             *prometheus.Desc
+	workerColdPathBuilderCollisionV3  *prometheus.Desc
+	workerColdPathOverflowActive      *prometheus.Desc
+	workerColdPathLayoutVersion       *prometheus.Desc
+	workerColdPathLayoutUnknownTotal  *prometheus.Desc
 	// #1219: snapshot per-binding distinct active flow count for the
 	// fairness harness (read by test/incus/fairness-harness.sh ->
 	// fairness-eval to compute Cstruct + observed_CoV per

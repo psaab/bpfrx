@@ -546,3 +546,54 @@ aggregate emission, #1622's plan proposes it; not this PR's surface.
   1M-rule (~5000-50000 ns) target.
 
 After this lands → #1622 reopens with the redesigned foundation in place.
+
+---
+
+## §IMPL Implementation deviations from plan v3 (recorded at code time)
+
+The implementation follows plan v3 faithfully with three bounded
+deviations, each justified below:
+
+1. **Slot capacity is 255 assignable, not 256.** `flat_table` uses
+   `u8::MAX` (255) as the "unassigned" sentinel, so slot index 255 can
+   never be handed out (it would be indistinguishable from a miss in
+   `lookup_slot`). The accumulator arrays are still 256-wide for layout
+   identity; `COLD_PATH_ASSIGNABLE_SLOTS = 255` bounds assignment and
+   `overflow_active` trips on the 256th distinct in-range zone-pair.
+   255 is still ~21× the largest known deployment.
+
+2. **Prometheus `from_zone` / `to_zone` labels carry zone-IDs, not
+   zone-names.** The sparse wire payload carries zone-ids; resolving
+   them to names would require plumbing a per-scrape zone-id→name table
+   into the Go collector. Zone-id labels fully satisfy the consumer
+   separability criterion (20 zone-pairs → 20 distinct, non-aliased
+   series). Name resolution can be a follow-up if operators want it.
+
+3. **The §5.5 feature-gated TSC-injection accuracy harness is realized
+   as deterministic unit tests** (`bucket_layout_resolves_low_end_within_2x`
+   + `old_pow2_layout_would_fail_low_end_resolution`) that exercise the
+   real `bucket_index_for_ns_48` / `bucket_upper_bound_ns_48` path and
+   prove the ≤2× per-bucket error at the 10-rule (~50-150 ns) and
+   1M-rule (~5000-50000 ns) targets, plus a fail-before demonstration
+   against the retired 24-bucket layout. This is stronger than a mocked
+   TSC harness for the bucket-resolution criterion and avoids a new
+   cargo feature; an end-to-end TSC-injection harness remains available
+   as a future addition if record→snapshot calibration regressions need
+   coverage.
+
+### Wire-protocol both-sides confirmation (feedback_wire_protocol_both_sides)
+- Rust: `userspace-dp/src/protocol/binding.rs` (sparse `cold_path_active_*`
+  + `cold_path_layout_version` + `cold_path_overflow_active`).
+- Go: `pkg/dataplane/userspace/protocol.go` (mirrored fields; legacy
+  dense v1 fields retained READ-ONLY so a new Go collector still emits
+  correct v1 metrics against a pre-#1635 Rust daemon — plan §3.2 row
+  "v1 Rust / v3 Go").
+
+### Slot zero-out (plan §2.4) realization
+- `forwarding_build` returns `(slot_map, slots_to_zero)`; `slots_to_zero`
+  is stashed on `ForwardingState`. The worker zeroes those slots in each
+  binding's local accumulator at the ForwardingState ArcSwap point
+  (`worker/loop_body/mod.rs`), BEFORE any `record_sample` into the
+  reused slot. The next publish merge overwrites the sibling atomics
+  from the freshly-zeroed local accumulators, so no separate atomic
+  zero-out path is needed on the hot tick.

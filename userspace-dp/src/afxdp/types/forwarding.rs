@@ -80,6 +80,18 @@ pub(in crate::afxdp) struct ForwardingState {
     /// Default) means "unset" — callers fall back to
     /// `PENDING_NEIGH_TIMEOUT_NS`.
     pub(in crate::afxdp) pending_neigh_timeout_ns: u64,
+    /// #1635: direct `(from_zone_id, to_zone_id) → slot` map for the
+    /// cold-path histogram, built at config apply from the configured
+    /// policy zone-pairs. Replaces the splitmix64 16-slot hash. Shared
+    /// by all bindings on a worker; read on every sampled session-miss
+    /// via `lookup_slot`. Rotated via the ForwardingState ArcSwap.
+    pub(in crate::afxdp) cold_path_slot_map:
+        std::sync::Arc<crate::afxdp::cold_path_hist::ColdPathSlotMap>,
+    /// #1635 (plan §2.4): slots whose zone-pair assignment CHANGED in
+    /// this build relative to the previous one. The worker zeroes these
+    /// slots' local accumulators on the swap so a reused slot never
+    /// carries the previous pair's counts.
+    pub(in crate::afxdp) cold_path_slots_to_zero: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

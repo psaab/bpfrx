@@ -527,6 +527,53 @@ func newCollector(srv *Server) *xpfCollector {
 				"starvation'.",
 			[]string{"worker_id"}, nil,
 		),
+		// === #1635 sparse v3 per-zone-pair cold-path families ===
+		workerColdPathBucketV3: prometheus.NewDesc(
+			"xpf_userspace_worker_cold_path_ns_bucket_v3",
+			"Cumulative cold-path policy-eval latency observations per "+
+				"worker / (from_zone, to_zone), bucketed into the #1635 "+
+				"48-bucket log-linear ns histogram (32 linear 16-ns "+
+				"buckets over [0,512) ns + 15 pow-2 buckets + saturate). "+
+				"Compatible with PromQL histogram_quantile() via `le`.",
+			[]string{"worker_id", "from_zone", "to_zone", "le"}, nil,
+		),
+		workerColdPathSamplesV3: prometheus.NewDesc(
+			"xpf_userspace_worker_cold_path_samples_total_v3",
+			"Per-worker / (from_zone, to_zone) count of cold-path latency "+
+				"samples recorded (#1635 direct slot map).",
+			[]string{"worker_id", "from_zone", "to_zone"}, nil,
+		),
+		workerColdPathSumNSV3: prometheus.NewDesc(
+			"xpf_userspace_worker_cold_path_sum_ns_total_v3",
+			"Per-worker / (from_zone, to_zone) cumulative sum of recorded "+
+				"delta_ns (post baseline subtraction).",
+			[]string{"worker_id", "from_zone", "to_zone"}, nil,
+		),
+		workerColdPathBuilderCollisionV3: prometheus.NewDesc(
+			"xpf_userspace_worker_cold_path_builder_collision_v3",
+			"1 if this (from_zone, to_zone) slot saw two distinct packed "+
+				"keys — a snapshot-builder bug with the #1635 direct slot "+
+				"map; should always be 0. 0 otherwise.",
+			[]string{"worker_id", "from_zone", "to_zone"}, nil,
+		),
+		workerColdPathOverflowActive: prometheus.NewDesc(
+			"xpf_userspace_worker_cold_path_overflow_active",
+			"1 if a configured zone-pair could not be assigned a cold-path "+
+				"histogram slot (255-slot capacity exhausted). 0 otherwise.",
+			[]string{"worker_id"}, nil,
+		),
+		workerColdPathLayoutVersion: prometheus.NewDesc(
+			"xpf_userspace_worker_cold_path_layout_version",
+			"1 when this worker's cold-path wire layout has the value of "+
+				"the `version` label (#1635: 3 = sparse log-linear).",
+			[]string{"worker_id", "version"}, nil,
+		),
+		workerColdPathLayoutUnknownTotal: prometheus.NewDesc(
+			"xpf_userspace_worker_cold_path_layout_version_unknown_total",
+			"1 when this worker reported a cold-path wire layout version "+
+				"the collector does not understand (forward-compat guard).",
+			[]string{"worker_id", "version"}, nil,
+		),
 		bindingActiveFlowCount: prometheus.NewDesc(
 			"xpf_userspace_binding_active_flow_count",
 			"Distinct active flows observed in this binding's flow_cache "+

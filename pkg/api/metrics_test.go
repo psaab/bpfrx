@@ -196,6 +196,19 @@ func newCollectorWithWorkerDescsOnly() *xpfCollector {
 		return prometheus.NewDesc(name, name,
 			[]string{"worker_id", "source"}, nil)
 	}
+	// #1635 v3 per-zone-pair descriptors.
+	mkZonePair := func(name string) *prometheus.Desc {
+		return prometheus.NewDesc(name, name,
+			[]string{"worker_id", "from_zone", "to_zone"}, nil)
+	}
+	mkZonePairBucket := func(name string) *prometheus.Desc {
+		return prometheus.NewDesc(name, name,
+			[]string{"worker_id", "from_zone", "to_zone", "le"}, nil)
+	}
+	mkVersion := func(name string) *prometheus.Desc {
+		return prometheus.NewDesc(name, name,
+			[]string{"worker_id", "version"}, nil)
+	}
 	return &xpfCollector{
 		workerWallSecs:                           mk("xpf_userspace_worker_wall_seconds_total"),
 		workerActiveSecs:                         mk("xpf_userspace_worker_active_seconds_total"),
@@ -222,6 +235,13 @@ func newCollectorWithWorkerDescsOnly() *xpfCollector {
 		workerColdPathNSPerTSCQ32:         mk("xpf_userspace_worker_cold_path_ns_per_tsc_q32"),
 		workerColdPathClockSource:         mkSource("xpf_userspace_worker_cold_path_clock_source"),
 		workerColdPathSnapshotFailedTotal: mk("xpf_userspace_worker_cold_path_snapshot_failed_total"),
+		workerColdPathBucketV3:            mkZonePairBucket("xpf_userspace_worker_cold_path_ns_bucket_v3"),
+		workerColdPathSamplesV3:           mkZonePair("xpf_userspace_worker_cold_path_samples_total_v3"),
+		workerColdPathSumNSV3:             mkZonePair("xpf_userspace_worker_cold_path_sum_ns_total_v3"),
+		workerColdPathBuilderCollisionV3:  mkZonePair("xpf_userspace_worker_cold_path_builder_collision_v3"),
+		workerColdPathOverflowActive:      mk("xpf_userspace_worker_cold_path_overflow_active"),
+		workerColdPathLayoutVersion:       mkVersion("xpf_userspace_worker_cold_path_layout_version"),
+		workerColdPathLayoutUnknownTotal:  mkVersion("xpf_userspace_worker_cold_path_layout_version_unknown_total"),
 	}
 }
 
@@ -277,6 +297,14 @@ func collectFromEmitWorkerRuntime(
 		c.workerColdPathNSPerTSCQ32:             {},
 		c.workerColdPathClockSource:             {},
 		c.workerColdPathSnapshotFailedTotal:     {},
+		// #1635 v3 cold-path descriptors.
+		c.workerColdPathBucketV3:           {},
+		c.workerColdPathSamplesV3:          {},
+		c.workerColdPathSumNSV3:            {},
+		c.workerColdPathBuilderCollisionV3: {},
+		c.workerColdPathOverflowActive:     {},
+		c.workerColdPathLayoutVersion:      {},
+		c.workerColdPathLayoutUnknownTotal: {},
 	}
 	for _, m := range got {
 		if _, ok := expected[m.Desc()]; !ok {

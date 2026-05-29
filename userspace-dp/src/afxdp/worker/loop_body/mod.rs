@@ -368,15 +368,15 @@ pub(crate) fn worker_loop(
                                     [slot][b]
                                     .saturating_add(src.buckets[slot][b]);
                             }
-                            // first_key + alias_seen cross-binding merge.
+                            // first_key + builder_collision cross-binding merge.
                             if merged.first_key[slot] == 0 {
                                 merged.first_key[slot] = src.first_key[slot];
                             } else if src.first_key[slot] != 0
                                 && src.first_key[slot] != merged.first_key[slot]
                             {
-                                merged.alias_seen[slot] = true;
+                                merged.builder_collision[slot] = true;
                             }
-                            merged.alias_seen[slot] |= src.alias_seen[slot];
+                            merged.builder_collision[slot] |= src.builder_collision[slot];
                         }
                     }
                     // All bindings on this worker share the same pinned
@@ -420,6 +420,20 @@ pub(crate) fn worker_loop(
             sessions.set_timeouts(new_forwarding.session_timeouts);
 
             forwarding = new_forwarding;
+            // #1635 (plan §2.4): a config apply may have reassigned
+            // cold-path histogram slots to new zone-pairs. Zero those
+            // slots in every binding's worker-local accumulator BEFORE
+            // any record_sample into the reused slot, so a reused slot
+            // never carries the previous zone-pair's counts. The
+            // sibling atomics are zeroed at the next publish merge (a
+            // freshly-zeroed local accumulator overwrites the published
+            // value), so no separate atomic zero-out is needed here.
+            for &slot in forwarding.cold_path_slots_to_zero.iter() {
+                let slot = slot as usize;
+                for binding in bindings.iter_mut() {
+                    binding.cold_path.zero_slot(slot);
+                }
+            }
             let purged_input_dscp = purge_sessions_for_input_dscp_filter_revalidation(
                 &mut sessions,
                 session_map_fd,
