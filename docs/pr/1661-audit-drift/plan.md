@@ -1,6 +1,35 @@
 # #1661 item 8 — Refactoring-audit drift fix + CI/check drift guard
 
-**Status:** DRAFT v1 — pending adversarial plan review (Codex + AGY + Claude SMR)
+**Status:** v2 — incorporates round-1 PLAN-NEEDS-MINOR findings (Codex
+provisional + AGY verified + Claude SMR). Pending round-2 confirmation.
+
+### Round-1 review outcome (all three: PLAN-NEEDS-MINOR)
+- **Codex** (task-mprdz18l-oa4ntx, sandbox infra-blocked → provisional;
+  re-verified task-mpre329g-usqidy): root cause sound; required the make
+  recipe to fail on *script* failure, not just `diff` failure.
+- **AGY** (review-mprdxwky-cqxgzn, verified run): confirmed script exits 1
+  today; confirmed determinism is a total order; flagged (1) recipe
+  silently ignores script failure → use `trap` cleanup + `&&` chaining,
+  (2) `audit_rust`/`audit_go` don't truly tolerate missing dirs either —
+  apply the array guard for symmetry, (3) `|| true` pipeline-precedence
+  trap warning, (4) recommended wiring into `make test`.
+- **Claude SMR**: independently caught the recipe `set -e` issue; resolved
+  open Q4 as standalone (see Decisions).
+
+### Decisions on round-1 findings
+- **ADOPT** recipe hardening: `trap 'rm -f "$$tmp"' EXIT` + `&&` chaining +
+  `|| ( ...; exit 1 )` error path so a generator failure propagates.
+- **ADOPT** the array-guard for `audit_rust`/`audit_go` too (symmetry;
+  removes the "happens to exist today" fragility AGY flagged).
+- **NOTE** the `|| true` precedence trap in the script comment so a future
+  editor doesn't "simplify" into the bug.
+- **REJECT** wiring `audit-check` into `make test` (AGY rec) — keep
+  standalone. Rationale: coupling drift-detection to the default test gate
+  breaks every unrelated PR that legitimately adds/grows a >=1500 LOC file
+  until someone regenerates the artifact. That is high-friction churn on a
+  *docs* artifact and contradicts the project's low-friction discipline.
+  Codex and Claude SMR both favor standalone. The guard is meant to be run
+  on demand / in a dedicated lane, not to gate all Go tests.
 
 ## Issue framing
 
@@ -85,13 +114,16 @@ audit_bpf() {
 }
 ```
 
-`audit_rust`/`audit_go` already tolerate missing dirs because `pkg`,
-`cmd`, `userspace-dp/src`, `userspace-xdp/src` all exist; the same
-defensive shape is applied to BPF for symmetry and future-proofing
-(when the headers-only `bpf/` tree is the steady state). The script
-shebang is `#!/usr/bin/env bash` and it already uses bash arrays
-implicitly via `read`, so `local dirs=()` is safe (no POSIX-sh
-regression).
+The same array-guard shape is applied to **`audit_rust` and `audit_go`
+too** (round-1 AGY finding): they only pass today because `pkg`, `cmd`,
+`userspace-dp/src`, `userspace-xdp/src` happen to exist — a rename or
+sparse checkout would make `find` exit 1 and abort the script again.
+Guarding all three call sites removes that latent fragility. The script
+shebang is `#!/usr/bin/env bash`, so `local dirs=()` arrays are safe (no
+POSIX-sh regression). A comment warns against "simplifying" the guard
+into `find ... || true | while` — `|` binds tighter than `||`, so
+`find || true | while` parses as `find || (true | while)` and the loop
+never runs when `find` succeeds (round-1 AGY precedence trap).
 
 ### Part 2 — regenerate the committed artifact
 
@@ -121,21 +153,32 @@ guarded:
 .PHONY: audit-check
 # Drift guard for the committed refactoring heatmap (#1661 item 8).
 # Regenerates to a temp file and diffs against the committed artifact;
-# fails if they differ. Run after any large-file add/delete/split.
+# fails if they differ OR if the generator itself fails. Run after any
+# large-file add/delete/split, then commit the regenerated artifact.
 audit-check:
 	@tmp=$$(mktemp); \
-	bash scripts/refactoring-audit.sh > "$$tmp"; \
-	if ! diff -u docs/refactoring-audit-current.txt "$$tmp"; then \
-		rm -f "$$tmp"; \
-		echo "ERROR: docs/refactoring-audit-current.txt is stale."; \
+	trap 'rm -f "$$tmp"' EXIT; \
+	bash scripts/refactoring-audit.sh > "$$tmp" && \
+	diff -u docs/refactoring-audit-current.txt "$$tmp" || { \
+		echo "ERROR: docs/refactoring-audit-current.txt is stale or the audit script failed."; \
 		echo "Run: bash scripts/refactoring-audit.sh > docs/refactoring-audit-current.txt"; \
 		exit 1; \
-	fi; \
-	rm -f "$$tmp"; \
+	}; \
 	echo "audit-check: refactoring-audit-current.txt is up to date"
 ```
 
-Add `audit-check` to the top `.PHONY` line.
+Recipe design (round-1 finding — Codex + AGY + Claude SMR all flagged):
+- `trap 'rm -f "$$tmp"' EXIT` guarantees temp-file cleanup on *every*
+  exit path (success, diff-fail, or script-fail) — no leak even when the
+  `&&` chain short-circuits.
+- The generator runs with `&&` so a non-zero exit from
+  `scripts/refactoring-audit.sh` (not just a `diff` mismatch) takes the
+  `|| { ...; exit 1; }` failure path. Make invokes recipe shells without
+  `set -e`, so a bare `;`-separated chain would let a script failure fall
+  through to a spuriously-passing `diff`; the `&&` chain prevents that.
+
+Add `audit-check` to the top `.PHONY` line. It stays **standalone** —
+deliberately NOT a dependency of `test`/`all` (see Decisions above).
 
 ### Determinism
 
