@@ -60,3 +60,15 @@ layout_version_unknown_total→layout_version_unknown (GaugeValue state indicato
 Continuations:
   node /home/ps/.claude/plugins/cache/openai-codex/codex/1.0.4/scripts/codex-companion.mjs status task-mprf0sdn-tkln60
   /agy:result adversarial-review-mprf115e-ujupbb
+
+## Round 5 — out-of-range overflow_active fix + plan metric cleanup (HEAD 207e01c64)
+Copilot fresh review at 9a191d70b (21:14) found: out-of-range zone-pairs (id 65..=255,
+reachable on the Rust path) silently dropped w/o overflow signal; stale
+zone_id_out_of_range_total in plan §2.5. Both fixed in 207e01c64.
+
+| Reviewer   | Task / job id                      | Verdict   |
+|------------|------------------------------------|-----------|
+| Codex      | task-mprfc9u2-ahfcxq               | running (final confirm) |
+| AGY        | adversarial-review-mprfcg9v-z1rvm5  | running (final confirm) |
+| Claude SMR | in-conversation                    | MERGE-READY (overflow fix verified; in-range unaffected) |
+| Copilot    | re-review @ 207e01c64 requested; polling | r5 findings addressed |
