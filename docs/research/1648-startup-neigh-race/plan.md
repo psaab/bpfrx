@@ -1,7 +1,18 @@
 # #1648 — Startup/failover neighbor-dump race: first cold connect ~1s
 
-**Status:** v2 (research-only; /research, not /engineer) — 3-way converged on
-mechanism + fix shape pending Gate-R
+**Status:** v3 (research-only; /research, not /engineer) — AGY r2 split the
+analysis into two windows with DIFFERENT mechanisms; pending r3 convergence
+
+> **v3 KEY CORRECTION (AGY r2, verified):** `initial_neighbor_dump` runs **only
+> once at daemon startup** (`neighbor.rs:514`, inside the detached
+> `neigh_monitor_thread`). The seq=0-multicast-drop (H-0) therefore affects ONLY
+> the windows where `xpfd` (re)starts: **daemon-restart / deploy / crash-promote
+> where fw1 itself reboots**. A **clean VRRP failover** does NOT restart fw1's
+> daemon — fw1's monitor is already in the steady-state `recv()` loop
+> (`neighbor.rs:526-556`), which processes seq=0 events with **no seq filter**.
+> So **5.A.2 cannot fix a clean-failover ~1s** if one exists; that path has a
+> different mechanism (candidate: ENOBUFS desync, AGY r2 (d), or standby map
+> aging). The two windows are now analyzed separately.
 **Branch:** `research/1648-startup-neigh-race`
 **Reviewers:** Codex + AGY + Claude SMR (3-way at /research; Copilot joins at /engineer)
 **Scope:** root-cause the residual ~1s first-connect after daemon restart /
@@ -27,9 +38,18 @@ The issue body (re-scope comment, 2026-05-29) attributes this to
 `request_neighbor_dump` (the RTM_GETNEIGH seed) racing a neighbor-cache flush,
 leaving the dataplane neighbor map empty until the dump lands.
 
-**This plan must (a) verify that exact ordering on the cluster, (b) decide a
-fix, and (c) decide whether failover actually hits the ~1s or whether it is a
+**This plan must (a) verify the ordering on the cluster, (b) decide a fix per
+window, and (c) decide whether failover actually hits the ~1s or whether it is a
 deploy-restart-only artifact** — the latter would justify PLAN-KILL.
+
+**Two distinct windows (v3, per AGY r2):**
+1. **Restart / crash-promote** (xpfd (re)starts → runs `initial_neighbor_dump`):
+   candidate mechanism H-0 (seq=0 multicast drop during the dump); fix 5.A.2.
+2. **Clean VRRP failover** (xpfd stays up → NO dump): H-0 cannot apply; if a ~1s
+   exists here the mechanism is H-D (ENOBUFS desync / standby map aging); fix
+   5.E. The production-relevant failover is BOTH — `make test-failover` uses an
+   unclean reboot (crash-promote, window 1), while a manual `request chassis
+   cluster failover` is clean (window 2). Gate-R measures both.
 
 ---
 
@@ -187,6 +207,31 @@ in ~5ms in steady state (Gate-M proved this). **So H-B alone cannot explain
 1.7s** unless the re-drive path is itself broken during the startup window (i.e.
 H-B collapses into H-A). This must be tested, not assumed.
 
+### H-D (AGY r2, verified): clean-failover ~1s — if real — is NOT H-0
+On a **clean VRRP failover**, fw1's `xpfd` stays up; there is no
+`initial_neighbor_dump`, so the seq=0 drop (H-0) cannot occur. fw1's monitor is
+in the steady-state loop (`neighbor.rs:526-556`) processing seq=0 events with no
+filter. Therefore, *if* R2 shows a clean-failover ~1s for a cold target, the
+mechanism is one of:
+- **H-D.1 ENOBUFS desync (AGY r2 (d)):** the steady-state `recv()` treats any
+  `n <= 0` as `continue` (`neighbor.rs:528`) with no error inspection and no
+  large `SO_RCVBUF`. A netlink multicast buffer overflow (ENOBUFS) on a
+  long-running standby **permanently desynchronizes** `dynamic_neighbors` from
+  the kernel — entries learned-then-missed are never re-dumped (the dump is
+  startup-only). At promote, the cold target's neighbor may be absent from the
+  desynced map even though the kernel has it. **This is a distinct, plausible
+  clean-failover root cause that 5.A.2 does NOT fix.** Candidate fix: on ENOBUFS,
+  re-run a neighbor dump to resync (NOT startup-only).
+- **H-D.2 standby map aging:** `dynamic_neighbors` entries age via RTM_DELNEIGH
+  as the kernel ages NUD state on the standby; an idle cold target's entry is
+  removed and never re-learned (no traffic on standby). At promote the map is
+  cold for that target → first flow re-resolves from scratch (~5ms steady-state
+  per Gate-M — so this alone is NOT ~1s unless it compounds with H-D.1).
+- **Disposition:** clean-failover World 1 → fix is H-D.1 (ENOBUFS resync), NOT
+  5.A.2. Crash-promote World 1 (fw1 reboots) → fix IS 5.A.2 (it's a startup
+  window). Gate-R R2 must label which failover mode reproduces, so /engineer
+  targets the right mechanism.
+
 ### H-C: failover does NOT hit the ~1s (the KILL hypothesis)
 On RG-promote, `on_rg_promote_active` already fires a forced warm pass — but
 **only for routed next-hops + fabric peers, not on-link** (§2.3). So:
@@ -226,7 +271,10 @@ skipped — add DAEMON-SIDE throwaway counters.** On fw0:
    - "first cold SYN queued vs recycled" (Codex HIGH-1) at
      `poll_descriptor/mod.rs:2644/2652`,
    - SO_RCVBUF size + any ENOBUFS/overflow on the monitor socket (Codex
-     MEDIUM-1: netlink overflow is a competing explanation).
+     MEDIUM-1 + AGY r2 (d): netlink overflow is a competing explanation AND the
+     candidate H-D.1 clean-failover root cause — instrument the steady-state
+     `recv() <= 0` branch at `neighbor.rs:528` to log errno, esp. ENOBUFS, on
+     BOTH the active and the long-running standby node).
 3. Also run `ip -ts monitor neigh` on fw0 (separate socket — corroboration only,
    NOT the daemon's view) AND timestamp:
    - T0: worker threads go live (first poll),
@@ -279,11 +327,31 @@ cools the cache — so an idle target's neighbor is likely cold at promote (Worl
    STALE/FAILED (NUD aging + RTM_DELNEIGH propagation), then failover and
    measure. This is the case AGY argues makes World 1 real.
 
-### Quantitative kill bar (SMR CRITICAL-2)
-If R2 first-connect for the on-link targets after a clean failover (including
-the aged-standby case) is **≤200ms in ≥4 of 5 trials, both v4 and v6**, then
-failover is NOT affected → PLAN-KILL (deploy-restart-only artifact). If any
-target reliably hits ~1s post-failover, World 1 is confirmed → ship the fix.
+### R2-crash — unclean reboot promote (Codex r2 HIGH-3)
+`test/incus/test-failover.sh:188` failover is an **unclean `reboot` of fw0**
+(worst-case), not a clean priority-0 handover. Gate-R must measure BOTH:
+- clean promote (priority-0 burst / `request chassis cluster failover`), AND
+- crash promote (`incus exec fw0 -- reboot`) — the path the project's own
+  failover gate exercises.
+The crash path is harsher: fw0 stops advertising abruptly, fw1 promotes on the
+masterDownInterval (~97ms), and any startup-window seed race on fw1 is more
+likely to overlap a cold first connect. Disposition production-relevance on the
+crash-promote result, not just clean.
+
+### Quantitative kill bar (SMR CRITICAL-2 + Codex r2 CRITICAL-1 + AGY r2 (b))
+**Zero-tolerance on the RTO signature (AGY r2 (b)).** The neighbor race is
+probabilistic (VM scheduling / load dependent); a ~20% reproduction rate is a
+real HA bug, so a ≥4/5 "mostly fast" bar would WRONGLY kill it. Revised bar:
+- Measure against a **NEVER-SEEN / AGED target B** (verified absent from fw1's
+  `dynamic_neighbors` before failover — a prelearned target is a false
+  negative), under **both clean and crash promote**, v4 and v6.
+- **PLAN-KILL only if ZERO trials (out of ≥10 per mode/family) exhibit the
+  dropped-SYN RTO signature (~1s connect / two SYNs ~1s apart).** A single RTO
+  signature on the cold target in any mode → World 1 confirmed → ship the fix
+  for that mode (5.A.2 for crash-promote, 5.E for clean-failover).
+- The 200ms ceiling is the steady-state acceptance gate for the *non*-signature
+  trials (they should land in the Gate-M 0.6-3.7ms band); it is not the kill
+  criterion. The kill criterion is the absence of the RTO signature entirely.
 
 ### R3 — decision matrix
 | Outcome | Interpretation | Disposition |
@@ -310,13 +378,20 @@ on-link warming (5.C) unnecessary for the daemon-restart case.
 - **Correctness (SMR OQ-4, Codex/AGY verified):** `parse_neighbor_msg`
   (`neighbor.rs:297`) is idempotent — NEW upserts by NUD state, DEL removes only
   INCOMPLETE/FAILED. Applying a seq=0 NEW during the dump cannot corrupt a
-  dump-seq entry; worst case it applies the same resolved MAC twice. A seq=0 DEL
-  for a not-yet-dumped entry is a no-op. **Must still verify at /engineer** that
-  a stale seq=0 DEL can't remove a freshly-dumped REACHABLE entry — the NUD
-  guard at `neighbor.rs:349-353` (DEL only on INCOMPLETE|FAILED) makes this
-  safe, but pin it with a unit test.
+  dump-seq entry; worst case it applies the same resolved MAC twice. AGY r2 (a)
+  confirms FIFO socket ordering makes eventual consistency hold (a later
+  REACHABLE dump entry overwrites an earlier stale DEL). A seq=0 DEL for a
+  not-yet-dumped entry is a no-op.
+- **MANDATORY guard (AGY r2 (a), verified at `neighbor.rs:438-444`):** the
+  NLMSG_DONE / NLMSG_ERROR handling in the dump loop MUST stay gated on
+  `nlmsg_seq == next_seq`. If 5.A.2 naively processes all seq values, a seq=0
+  multicast message of type NLMSG_DONE/NLMSG_ERROR would prematurely terminate
+  or fail the dump. The fix processes **only type-28/29 (NEW/DEL)** for seq=0;
+  DONE/ERROR remain seq-matched. This is the precise patch shape — not "process
+  all seq=0".
 - **Cost:** ~5-15 LOC in the dump parser. No new threads, no promote-path
-  change, driver-agnostic.
+  change, driver-agnostic. Fixes daemon-restart + crash-promote (fw1 reboot)
+  windows. Does NOT fix clean-failover (see H-D / 5.E).
 
 ### 5.A.3 — Dual-socket design (Codex MEDIUM-3 alternative to 5.A.2)
 Use **two** netlink sockets: one for the one-shot RTM_GETNEIGH dump (closed
@@ -383,9 +458,27 @@ for BOTH daemon-restart and failover-restart windows.** It is driver-agnostic,
 off the promote critical path, and resolves the cold flow in ~5-15ms regardless
 of whether the destination is on-link or routed. 5.C (on-link proactive warm),
 5.B (admission gate), 5.A.1 (blocking pre-dump) are all rejected or
-unnecessary. The failover and daemon-restart windows share the SAME root cause
-(seq=0 multicast drop during the per-restart `initial_neighbor_dump`), so one
-fix covers both — *if* Gate-R confirms H-0.
+unnecessary. The daemon-restart AND crash-promote (fw1 reboot) windows share the
+SAME root cause (seq=0 multicast drop during the per-restart
+`initial_neighbor_dump`), so 5.A.2 covers both — *if* Gate-R confirms H-0.
+**A clean VRRP failover is a SEPARATE window with a different mechanism (H-D);
+if R2 shows clean-failover World 1, the fix is 5.E, not 5.A.2.**
+
+### 5.E — ENOBUFS resync for the steady-state monitor (targets H-D.1, clean failover)
+**Only relevant if Gate-R R2 shows a clean-failover ~1s for a cold target.** The
+steady-state monitor loop (`neighbor.rs:526-556`) treats every `recv() <= 0` as
+`continue` with no error inspection. A netlink multicast buffer overflow
+(ENOBUFS) silently and permanently desyncs `dynamic_neighbors` (the dump is
+startup-only, so there is no resync). Fix:
+- inspect the `recv()` errno; on **ENOBUFS**, re-issue an
+  `initial_neighbor_dump`-style resync (refactor the dump into a callable resync,
+  not startup-only),
+- set a larger `SO_RCVBUF` on the monitor socket to reduce overflow probability,
+- add throwaway ENOBUFS counting to Gate-R R1 (AGY r2 (d)) to confirm whether the
+  standby actually overflows in practice.
+This is off the promote critical path (the resync runs in the monitor thread,
+not on `on_rg_promote_active`). **Verify at Gate-R that ENOBUFS actually occurs
+before building this — it may be theoretical.**
 
 ---
 
@@ -491,30 +584,34 @@ must be run before any code.
 
 ## 10. Recommendation (3-way converged, pre-Gate-R)
 
-**PLAN-READY for Gate-R.** The fix shape is converged; Gate-R confirms the
-mechanism (H-0) and decides production-relevance (R2):
-- **Primary fix (both worlds): 5.A.2** (or 5.A.3 dual-socket) — process seq=0
-  multicast adverts during `initial_neighbor_dump` so the cold flow's probe
-  resolution self-heals in ~5-15ms. ~5-15 LOC, driver-agnostic, off the promote
-  critical path, no VRRP impact. This fixes the daemon-restart window
-  unconditionally and the failover window if R2 = World 1.
-- **If R1 refutes H-0** (counter A = 0 for the target; resolution advert arrives
-  *after* `NLMSG_DONE`): the 1.7s is a never-buffered single-SYN drop (Codex
-  HIGH-1) — investigate the recycle/XDP-readiness path; the fix target shifts
-  but the plan's instrumentation still pins it.
-- **If R2 = World 2** (failover ≤200ms in ≥4/5, both v4+v6, including aged
-  standby): failover is NOT affected → the residual is a `systemctl restart`
-  deploy artifact. Still ship 5.A.2 (cheap, correct, fixes deploy-testing), OR
-  PLAN-KILL if the restart window is also already <200ms. Document the
-  measurement either way.
-- **Rejected:** 5.B (liar-flag gate), 5.C.1/5.C.2 (on-link warm misses the
-  no-prior-session cold target; 5.C.2 redundant with existing prewarm),
-  5.A.1 (blocking pre-dump risks forwarding-arm/failback latency).
+**PLAN-READY for Gate-R.** Gate-R confirms the mechanism per window and decides
+which fix (if any) ships. The two windows are now distinct (AGY r2):
 
-The single most important Gate-R deliverables: (1) **R1 daemon-side counter A**
-(seq-mismatch-skipped-during-dump for the target) — confirms/refutes H-0;
-(2) **R2 failover measurement on an aged, never-seen target** — decides World 1
-vs World 2. Both are cheap and must run before any code.
+- **Daemon-restart + crash-promote (fw1 reboots):** if R1 counter A confirms H-0
+  (seq=0 resolution advert dropped during `initial_neighbor_dump`), ship
+  **5.A.2** (or 5.A.3 dual-socket) — process seq=0 NEW/DEL during the dump while
+  keeping NLMSG_DONE/ERROR seq-matched (AGY r2 (a) guard). ~5-15 LOC,
+  driver-agnostic, no promote-path / VRRP impact.
+- **Clean VRRP failover (fw1 daemon stays up):** H-0 cannot apply here (no dump
+  at promote). If R2 shows clean-failover World 1 on the cold target, the fix is
+  **5.E** (ENOBUFS resync of the steady-state monitor + larger SO_RCVBUF), NOT
+  5.A.2 — but only build 5.E if R1/R2 show ENOBUFS actually occurs (H-D.1).
+- **If R1 refutes H-0** (counter A = 0; resolution arrives after `NLMSG_DONE`):
+  the restart 1.7s is a never-buffered single-SYN drop (Codex HIGH-1) →
+  investigate the recycle / XDP-readiness path.
+- **If the cold target shows ZERO RTO-signature trials in all modes** (AGY r2
+  (b) zero-tolerance bar): failover + restart are not affected → PLAN-KILL the
+  failover scope; still ship 5.A.2 if R1 shows the restart-window drop (cheap,
+  correct deploy fix), or full PLAN-KILL if restart is also clean.
+- **Rejected:** 5.B (liar-flag gate, `neighbor.rs:516/520`), 5.C.1/5.C.2
+  (on-link warm misses the no-prior-session cold target; 5.C.2 redundant with
+  prewarm), 5.A.1 (blocking pre-dump risks forwarding-arm/failback latency).
+
+The decisive Gate-R deliverables: (1) **R1 daemon counter A** + dump duration —
+confirms/refutes H-0 for the restart/crash-promote window; (2) **R2 on an aged,
+never-seen target across BOTH clean and crash promote** — tells us which window
+(if any) is World 1 and therefore which fix (5.A.2 vs 5.E) applies; (3) **ENOBUFS
+counting on the standby** — confirms/refutes H-D.1. All cheap; run before code.
 
 ---
 
@@ -547,5 +644,26 @@ See `reviewer-ids.md` for task IDs. Per-round verdicts appended below.
     daemon-side counters + aged-never-seen-target failover measurement. v2 is
     PLAN-READY pending the Gate-R run at /engineer.
 
-- **r2:** v2 addresses every r1 finding. Awaiting r2 confirmation from Codex +
-  AGY that v2 is PLAN-READY (no new blockers).
+- **r2:** v2 reviewed.
+  - **Codex r2** (`codex-plan-r2.md`): 1C/4H/2M/1L. Two genuinely-new
+    actionable points: CRITICAL-1 (kill bar can false-negative on a prelearned
+    target — tighten to the cold target) and HIGH-3 (`test-failover.sh:188` is
+    an unclean reboot — Gate-R must test crash-promote too). Rest re-confirm r1
+    (already in v2). All ACCEPTED (`codex-findings-r2.md`); folded into v2.1.
+  - **AGY r2** (`agy-plan-r2.md`): **PLAN-NEEDS-REVISION** with a DECISIVE new
+    finding (verified): `initial_neighbor_dump` is **startup-only**
+    (`neighbor.rs:514`), so H-0 cannot affect a clean VRRP failover (fw1 daemon
+    stays up, steady-state loop processes seq=0 with no filter,
+    `neighbor.rs:526-556`). Also: (a) 5.A.2 must keep NLMSG_DONE/ERROR
+    seq-matched; (b) kill bar must be zero-tolerance on the RTO signature (20%
+    repro is a real HA bug); (d) ENOBUFS on the steady-state loop silently
+    desyncs the standby map permanently (candidate clean-failover root cause).
+  - **Claude SMR r2** (`claude-smr-plan-r2.md`): PLAN-READY on v2's scope, but
+    AGY r2's startup-only finding supersedes — I had also missed it.
+  - **Outcome:** NOT converged at r2. v3 splits the analysis into two windows
+    (restart/crash-promote = H-0/5.A.2; clean-failover = H-D/5.E), adds the
+    5.A.2 DONE/ERROR guard, the zero-tolerance kill bar, crash-promote coverage,
+    and ENOBUFS instrumentation + the 5.E fix.
+
+- **r3:** v3 addresses AGY r2 + Codex r2. Awaiting r3 confirmation that the
+  two-window split + 5.E + guards are correct (no new blockers).
