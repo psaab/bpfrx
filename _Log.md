@@ -38,6 +38,18 @@
   `test/incus/cos-gate1-small-four-alone.sh`,
   `docs/pr/1630-cause1-credit-carry/plan.md`
 
+## 2026-05-29 — #1649 floor-curve Copilot round-2 follow-up
+- **Timestamp**: 2026-05-29
+- **Action**: Addressed Copilot round-2 on PR #1652. Narrowed the N=6
+  throughput-CoV prose so it no longer calls a favorable placement the
+  "most common" realization, tightened the operational bullet to frame
+  aggregate against the existing Gate-3 structural cap instead of a
+  universal "unaffected" claim, replaced the forward in-file #1650
+  section reference with stable issue/PR references, and updated the
+  SMR accuracy note to record the round-2 corrections.
+- **File(s)**: `docs/fairness-regimes.md`,
+  `docs/pr/1649-doc-floor-curve/claude-smr-accuracy.md`, `_Log.md`
+
 ## 2026-05-28 — #1649 floor-curve Copilot round-1 follow-up
 - **Timestamp**: 2026-05-28
 - **Action**: Addressed Copilot round-1 (5 findings) on PR #1652. Fixed the
