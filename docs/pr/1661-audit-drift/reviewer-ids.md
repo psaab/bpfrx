@@ -9,7 +9,7 @@ PR: #1671
 - Claude SMR: in-conversation (PLAN-NEEDS-MINOR)
 
 ## Code review (round 1) — PR #1671 @ 4981f0f6a
-- Codex: task-mpre8r8y-c847kc
-- AGY: review-mpre8ybl-ec4oyg
-- Copilot: requested via @copilot review comment
-- Claude SMR: in-conversation
+- Codex: task-mpre8r8y-c847kc (MERGE-NEEDS-MINOR: md historical drift); round 2 task-mprem3yn-4mg706 @ 42efc32be
+- AGY: review-mpre8ybl-ec4oyg (MERGE-READY)
+- Copilot: COMMENTED, 0 inline comments (clean); re-requested @ 42efc32be
+- Claude SMR: in-conversation (MERGE-READY)
