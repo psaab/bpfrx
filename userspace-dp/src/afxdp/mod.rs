@@ -341,6 +341,30 @@ const PENDING_NEIGH_TIMEOUT_NS: u64 = 2_000_000_000; // 2 seconds
 // keeping idle-binding RSS near zero.
 const MAX_PENDING_NEIGH: usize = 4096;
 
+// #1651 B3: dead-host negative neighbor cache (per binding). When a
+// pending_neigh entry times out after best-effort ARP/NDP probes without
+// resolving, its (egress_ifindex, next_hop) is recorded here so subsequent
+// cold packets to the same dead host fast-fail immediately (recycle, no
+// pending_neigh slot consumed) instead of each buffering a SYN for the full
+// PENDING_NEIGH_TIMEOUT. This is the AGY-r1 HIGH starvation defense: a
+// dead-host SYN storm can no longer saturate the bounded pending_neigh queue
+// and drop LIVE cold connects at the full-queue gate.
+//
+// NEG_NEIGH_TTL_NS = 3 s: (a) > the 800 ms fast drop so each storm packet is
+// suppressed across many connection attempts; (b) short enough that a
+// recovered-but-silent host is penalized at most one TTL window. A host that
+// actually recovers AND receives traffic is evicted immediately by the
+// resolved-neighbor-wins check in poll_descriptor (RTM_NEWNEIGH populates the
+// shared dynamic_neighbors), so the TTL only governs recovered-but-silent
+// destinations.
+const NEG_NEIGH_TTL_NS: u64 = 3_000_000_000; // 3 seconds
+// Per-binding cap on the negative cache. A /24 scan touches 254 distinct
+// dsts; 256 covers a full subnet sweep without unbounded growth. On overflow
+// the map is cleared wholesale — a best-effort optimization, so losing
+// suppression for a few dsts only costs one more PENDING_NEIGH_TIMEOUT drop,
+// never correctness. FastMap::clear() retains bucket capacity (no realloc).
+const MAX_NEG_NEIGH_CACHE: usize = 256;
+
 #[inline]
 const fn tx_frame_capacity() -> usize {
     UMEM_FRAME_SIZE as usize
@@ -570,6 +594,10 @@ mod poll_stages;
 // extracted into afxdp/session_delta.rs.
 mod session_delta;
 use session_delta::{flush_session_deltas, purge_queued_flows_for_closed_deltas};
+
+// #1651 B3: dead-host negative neighbor cache helpers.
+mod neg_neigh;
+use neg_neigh::{neg_neigh_gate, neg_neigh_record};
 
 // Issue 67.2: neighbor-dispatch helpers extracted into
 // afxdp/neighbor_dispatch.rs.

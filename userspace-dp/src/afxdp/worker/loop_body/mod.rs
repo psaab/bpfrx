@@ -199,6 +199,9 @@ pub(crate) fn worker_loop(
     let mut dbg_no_route = 0u64;
     #[cfg(feature = "debug-log")]
     let mut dbg_missing_neigh = 0u64;
+    // #1651 B3: dead-host negative-cache fast-fail count.
+    #[cfg(feature = "debug-log")]
+    let mut dbg_neg_neigh_fast_fail = 0u64;
     #[cfg(feature = "debug-log")]
     let mut dbg_policy_deny = 0u64;
     #[cfg(feature = "debug-log")]
@@ -740,6 +743,7 @@ pub(crate) fn worker_loop(
             dbg_session_create += dbg_poll.session_create;
             dbg_no_route += dbg_poll.no_route;
             dbg_missing_neigh += dbg_poll.missing_neigh;
+            dbg_neg_neigh_fast_fail += dbg_poll.neg_neigh_fast_fail;
             dbg_policy_deny += dbg_poll.policy_deny;
             dbg_ha_inactive += dbg_poll.ha_inactive;
             dbg_no_egress_binding += dbg_poll.no_egress_binding;
@@ -991,7 +995,7 @@ pub(crate) fn worker_loop(
                 #[cfg(feature = "debug-log")]
                 eprintln!(
                     "DBG w{}: {:.1}s rx={} tx={} fwd={} local={} sess_hit={} sess_miss={} sess_create={} \
-                     no_route={} miss_neigh={} pol_deny={} ha_inact={} no_egress={} build_fail={} \
+                     no_route={} miss_neigh={} neg_ff={} pol_deny={} ha_inact={} no_egress={} build_fail={} \
                      tx_err={} meta_err={} other={} enq_ok={} enq_ip={} enq_dir={} enq_cp={} sessions={} \
                      DIR:trust_rx={}/wan_rx={}/t2w={}/w2t={} NAT:snat={}/dnat={}/none={}/bld_none={} RST:rx={}/tx={} \
                      SIZE:rx_avg={}/rx_max={}/tx_avg={}/tx_max={}/rx_over={}/seg_miss={} \
@@ -1009,6 +1013,7 @@ pub(crate) fn worker_loop(
                     dbg_session_create,
                     dbg_no_route,
                     dbg_missing_neigh,
+                    dbg_neg_neigh_fast_fail,
                     dbg_policy_deny,
                     dbg_ha_inactive,
                     dbg_no_egress_binding,
@@ -1095,6 +1100,7 @@ pub(crate) fn worker_loop(
                     dbg_session_create = 0;
                     dbg_no_route = 0;
                     dbg_missing_neigh = 0;
+                    dbg_neg_neigh_fast_fail = 0;
                     dbg_policy_deny = 0;
                     dbg_ha_inactive = 0;
                     dbg_no_egress_binding = 0;
