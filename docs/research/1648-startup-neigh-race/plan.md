@@ -231,6 +231,12 @@ mechanism is one of:
   5.A.2. Crash-promote World 1 (fw1 reboots) → fix IS 5.A.2 (it's a startup
   window). Gate-R R2 must label which failover mode reproduces, so /engineer
   targets the right mechanism.
+- **No third window (verified):** the monitor thread is spawned exactly once,
+  gated on `monitor_stop.is_none()` (`bringup.rs:330`), and torn down only in
+  `stop_inner` (`coordinator/mod.rs:199`, full shutdown). A config-reload /
+  reconcile does NOT respawn it, so there is no additional `initial_neighbor_dump`
+  window from config churn or ISSU short of a full daemon restart. The
+  restart-spawn vs steady-state-loop split is complete.
 
 ### H-C: failover does NOT hit the ~1s (the KILL hypothesis)
 On RG-promote, `on_rg_promote_active` already fires a forced warm pass — but
@@ -479,6 +485,13 @@ startup-only, so there is no resync). Fix:
 This is off the promote critical path (the resync runs in the monitor thread,
 not on `on_rg_promote_active`). **Verify at Gate-R that ENOBUFS actually occurs
 before building this — it may be theoretical.**
+- **5.E DEPENDS ON 5.A.2:** the ENOBUFS resync re-runs a dump on the *same*
+  live socket that is still receiving multicast adverts — so it re-introduces
+  the exact seq=0-drop H-0 describes unless the resync uses the 5.A.2-fixed dump
+  (process seq=0 NEW/DEL, keep DONE/ERROR seq-matched) or a 5.A.3 dual-socket.
+  5.E is therefore not independent of 5.A.2 — ship 5.A.2 first, then 5.E reuses
+  the fixed dump. This also means 5.A.2 has standalone value even if Window-1 is
+  ruled World 2 (it is a prerequisite for any future resync).
 
 ---
 
