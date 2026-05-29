@@ -559,7 +559,9 @@ func newCollector(srv *Server) *xpfCollector {
 		workerColdPathOverflowActive: prometheus.NewDesc(
 			"xpf_userspace_worker_cold_path_overflow_active",
 			"1 if a configured zone-pair could not be assigned a cold-path "+
-				"histogram slot (255-slot capacity exhausted). 0 otherwise.",
+				"histogram slot — either the 255-slot capacity was "+
+				"exhausted OR the pair references a zone-id outside the "+
+				"0..=64 direct-table range. 0 otherwise.",
 			[]string{"worker_id"}, nil,
 		),
 		workerColdPathLayoutVersion: prometheus.NewDesc(

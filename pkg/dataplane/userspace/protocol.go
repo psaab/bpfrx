@@ -903,8 +903,9 @@ type WorkerRuntimeStatus struct {
 	ColdPathActiveSumNS            []uint64   `json:"cold_path_active_sum_ns,omitempty"`
 	ColdPathActiveBuckets          [][]uint64 `json:"cold_path_active_buckets,omitempty"`
 	ColdPathActiveBuilderCollision []bool     `json:"cold_path_active_builder_collision,omitempty"`
-	// True if a configured zone-pair could not be assigned a slot
-	// (255-slot capacity exhausted).
+	// True if a configured zone-pair could not be assigned a slot —
+	// either the 255-slot capacity was exhausted OR the pair references
+	// a zone-id outside the 0..=64 direct-table range.
 	ColdPathOverflowActive bool   `json:"cold_path_overflow_active,omitempty"`
 	ColdPathSamplePhase    uint64 `json:"cold_path_sample_phase,omitempty"`
 	ColdPathWrapperUnderflowCount uint64     `json:"cold_path_wrapper_underflow_count,omitempty"`
