@@ -4,8 +4,8 @@ Branch: pr/1661-audit-drift
 Plan commit: 111059e93
 
 ## Plan review (round 1)
-- Codex: <task-id pending>
-- AGY: <task-id pending>
+- Codex: task-mprdxk35-7yoh0d
+- AGY: review-mprdxwky-cqxgzn
 - Claude SMR: in-conversation
 
 ## Code review (round 1)
