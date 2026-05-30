@@ -29,16 +29,31 @@ nothing internal.
   Note: this is the **AST → typed Go struct** stage; the BPF-map
   compilation (zones, policies, NAT IDs, etc.) happens later in
   `pkg/dataplane.Manager.Compile`.
+- `ValueType` — `value_type.go`. Classifies a typed leaf's value
+  (`ValueRate`, `ValueByteSizeOrPercent`, `ValueEnumOf`, ...) and supplies
+  the `?`-completion placeholder via `Placeholder()`. Lives here (not
+  cmdtree) so `setSchema` can carry typed-leaf metadata directly;
+  `pkg/cmdtree` re-exports it via aliases. See `docs/config-schema.md`.
+- `SchemaValidate(tree, cfg)` + the generic walker — `schema_walk.go`.
+  The #1319 commit-check gate. Descends `setSchema` against the AST (the
+  SAME tree the live config-mode `set ... ?` completer walks via
+  `CompleteSetPathWithValues`) and invokes each typed leaf's validator on
+  its value. It is a no-op for untyped subtrees (opt-in per leaf), so
+  per-subsystem typing lands incrementally without touching this walker.
+  Called by `pkg/configstore.compileTree` on the apply-groups-expanded
+  clone BEFORE compile, so garbage like `transmit-rate asd` fails loud at
+  `commit check` even when it arrives through `groups { ... }`. (Re-homed
+  from `pkg/cmdtree.SchemaValidate` in #1319 PR 1.)
 - `Validate*` functions — `schema_validators.go`. Stateless string
   validators (`ValidateRate`, `ValidateByteSize`,
   `ValidateByteSizeOrPercent`,
   `ValidateInteger(min,max)`, `ValidateEnum(allowed)`,
-  `ValidatePercent(min,max)`) for the #1319 typed-leaf gate. Attached
-  to `cmdtree.Node.Validator` fields and dispatched by
-  `cmdtree.SchemaValidate` at commit-check time, on the same
-  apply-groups-expanded tree the compiler consumes, so garbage like
-  `transmit-rate asd` fails loud instead of silently zeroing in the
-  existing parsers. Scheduler `buffer-size` validation accepts byte
+  `ValidatePercent(min,max)`) for the typed-leaf gate. Attached to
+  `setSchema` leaf `validator` fields (and `cmdtree.Node.Validator` for
+  operational leaves) and dispatched by `SchemaValidate` at commit-check
+  time, on the same apply-groups-expanded tree the compiler consumes, so
+  garbage like `transmit-rate asd` fails loud instead of silently zeroing
+  in the existing parsers. Scheduler `buffer-size` validation accepts byte
   sizes with explicit suffixes and percent values with an explicit `%`
   suffix. The compiler stores percent values separately from
   `BufferSizeBytes`; the userspace snapshot adds `buffer_size_percent`

@@ -138,7 +138,7 @@ in git history; `git log -- bpf/xdp/ bpf/tc/` walks the deleted source.
 - **HTTP REST** on 127.0.0.1:8080 — health, Prometheus metrics, config endpoints
 - **CLI** — Interactive Junos-style with tab completion, `?` help, `| match` pipe
 - **Remote CLI** — `cli` binary connects via gRPC
-- **Command Trees** — `pkg/cmdtree/tree.go` is single source of truth for all CLI command trees, tab completion, and `?` help across local CLI, remote CLI, and gRPC server
+- **Command Trees (two-SSOT split, #1319)** — `pkg/cmdtree/tree.go` is the single source of truth for the **operational** tree (`run`/`show`/`clear`/`request`/...): tab completion + `?` help across local CLI, remote CLI, and gRPC. The **config-mode `set`/`delete`/`show`/`edit` grammar** (structural completion, flat-set token grouping, value-slot `?` completion, AND commit-check typed-leaf validation) is owned by `config.setSchema` in `pkg/config/ast.go` + `config.SchemaValidate` in `pkg/config/schema_walk.go` — NOT cmdtree. Config-mode completers route `set` paths through `config.CompleteSetPathWithValues`. Add a config-mode typed leaf by editing `setSchema` (see `docs/config-schema.md`); add an operational command by editing cmdtree.
 
 ## Code Layout
 | Path | Description |

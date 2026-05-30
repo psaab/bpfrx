@@ -1,16 +1,15 @@
 package config_test
 
-// Tests for the #1319 typed-leaf schema gate. SchemaValidate itself
-// lives in pkg/cmdtree (the validators it dispatches to live in
-// pkg/config); we exercise it end-to-end through configstore.Commit /
-// CommitCheck in the configstore tests, and exercise the validators +
+// Tests for the #1319 typed-leaf schema gate. SchemaValidate (and the
+// generic walker it drives) lives in pkg/config and validates the AST
+// against setSchema; we exercise it end-to-end through configstore.Commit
+// / CommitCheck in the configstore tests, and exercise the validators +
 // AST walker here against parsed AST trees.
 
 import (
 	"strings"
 	"testing"
 
-	"github.com/psaab/xpf/pkg/cmdtree"
 	"github.com/psaab/xpf/pkg/config"
 )
 
@@ -25,7 +24,7 @@ func schemaCheck(t *testing.T, input string) error {
 	if len(errs) > 0 {
 		t.Fatalf("parse errors: %v", errs)
 	}
-	return cmdtree.SchemaValidate(tree, nil)
+	return config.SchemaValidate(tree, nil)
 }
 
 func flatSchemaCheck(t *testing.T, cmds ...string) error {
@@ -40,7 +39,7 @@ func flatSchemaCheck(t *testing.T, cmds ...string) error {
 			t.Fatalf("SetPath(%q): %v", cmd, err)
 		}
 	}
-	return cmdtree.SchemaValidate(tree, nil)
+	return config.SchemaValidate(tree, nil)
 }
 
 func TestSchemaValidate_TransmitRate_RejectsGarbage(t *testing.T) {
@@ -316,7 +315,7 @@ func TestSchemaValidate_AcceptedSchedulerValuesCompileAsValidated(t *testing.T) 
 			t.Fatalf("SetPath(%q): %v", cmd, err)
 		}
 	}
-	if err := cmdtree.SchemaValidate(tree, nil); err != nil {
+	if err := config.SchemaValidate(tree, nil); err != nil {
 		t.Fatalf("schema validate: %v", err)
 	}
 	cfg, err := config.CompileConfig(tree)
@@ -353,7 +352,7 @@ func TestSchemaValidate_PercentBufferSizeCompilesAsPercentNotZeroBytes(t *testin
 			t.Fatalf("SetPath(%q): %v", cmd, err)
 		}
 	}
-	if err := cmdtree.SchemaValidate(tree, nil); err != nil {
+	if err := config.SchemaValidate(tree, nil); err != nil {
 		t.Fatalf("schema validate: %v", err)
 	}
 	cfg, err := config.CompileConfig(tree)
@@ -372,8 +371,57 @@ func TestSchemaValidate_PercentBufferSizeCompilesAsPercentNotZeroBytes(t *testin
 	}
 }
 
-// Negative: nodes outside the schedulers subtree are NOT validated.
-// This guards the "only schedulers in this PR" scope contract.
+// TestSchemaValidate_AcceptsLegacyDPDKSubStanza is migrated from the
+// retired pkg/cmdtree schema_validate_test.go (#1528 fixture-strength
+// gate). After #1319 PR 1 the generic walker fans out across ALL
+// top-level subtrees (the class-of-service-only early-return is gone), so
+// this test now guards a sharper invariant: walking the whole AST must
+// still be a no-op for untyped subtrees like the orphaned legacy
+// `system dataplane ...` sub-stanzas that survive the
+// rewriteRetiredDataplaneType bridge. The cos block forces typed-leaf
+// validation to fire; the untyped DPDK leaves must be ignored, not
+// rejected (rejecting them would preempt the operator-facing
+// ErrDPDKDataplaneRetired path and break stored-config rolling upgrade).
+func TestSchemaValidate_AcceptsLegacyDPDKSubStanza(t *testing.T) {
+	tree := &config.ConfigTree{}
+	for _, line := range []string{
+		// class-of-service schedulers block — triggers typed validation.
+		"set class-of-service schedulers be-sched transmit-rate 1g",
+		"set class-of-service schedulers be-sched priority low",
+		"set class-of-service schedulers be-sched buffer-size 10%",
+		// Legacy DPDK shape — untyped, must NOT be rejected.
+		"set system dataplane-type dpdk",
+		"set system dataplane cores 2-5",
+		"set system dataplane memory 2048",
+		"set system dataplane socket-mem \"1024,1024\"",
+		"set system dataplane rx-mode adaptive",
+		"set system dataplane rx-mode idle-threshold 256",
+		"set system dataplane rx-mode resume-threshold 32",
+		"set system dataplane rx-mode sleep-timeout 100",
+		"set system dataplane ports 0000:03:00.0 interface wan0",
+		"set system dataplane ports 0000:03:00.0 rx-mode polling",
+		"set system dataplane ports 0000:03:00.0 cores 2-3",
+		"set system dataplane ports 0000:06:00.0 interface trust0",
+	} {
+		path, err := config.ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
+	}
+	if tree.FindChild("class-of-service") == nil {
+		t.Fatal("fixture invalid: class-of-service subtree missing")
+	}
+	if err := config.SchemaValidate(tree, nil); err != nil {
+		t.Fatalf("SchemaValidate rejected legacy DPDK sub-stanza alongside valid cos block: %v", err)
+	}
+}
+
+// Negative: untyped leaves outside the schedulers subtree are NOT
+// validated even though the walker now descends all subtrees. This guards
+// the "opt-in per leaf" scope contract.
 func TestSchemaValidate_OutsideSchedulersIgnored(t *testing.T) {
 	// `buffer-size purple` under a different parent should not error
 	// at SchemaValidate (no typed-leaf metadata for it elsewhere).
@@ -390,6 +438,49 @@ func TestSchemaValidate_OutsideSchedulersIgnored(t *testing.T) {
     }
 }`); err != nil {
 		t.Fatalf("expected schedulers-only scope; got error on interfaces subtree: %v", err)
+	}
+}
+
+// TestSetPathGrouping_Golden pins the flat-set grouping produced by
+// SetPath over setSchema. #1319 PR 1 adds typed-leaf FIELDS to schemaNode
+// (valueType/valueDesc/valueExamples/validator) but MUST NOT add or alter
+// any `children` map — SetPath's replace-vs-container decision keys on
+// children==nil (ast_edit.go:196), so flipping a leaf to a container is a
+// grouping regression. This golden re-serializes a representative config
+// (including the schedulers typed leaves and the `destination-port <lo> to
+// <hi>` value-tail/range shape) and asserts the round-trip is byte-stable.
+// If a future edit adds children to a typed leaf, the schedulers grouping
+// changes here and this test fires.
+func TestSetPathGrouping_Golden(t *testing.T) {
+	tree := &config.ConfigTree{}
+	cmds := []string{
+		"set class-of-service schedulers be transmit-rate 1g",
+		"set class-of-service schedulers be transmit-rate exact",
+		"set class-of-service schedulers be priority strict-high",
+		"set class-of-service schedulers be buffer-size 16m",
+		"set firewall family inet filter f1 term t1 from destination-port 20000 to 20003",
+		"set security policies from-zone trust to-zone untrust policy p1 match source-address any",
+		"set interfaces ge-0/0/0 unit 0 family inet address 10.0.0.1/24",
+	}
+	for _, cmd := range cmds {
+		path, err := config.ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	const golden = `set class-of-service schedulers be transmit-rate 1g
+set class-of-service schedulers be transmit-rate exact
+set class-of-service schedulers be priority strict-high
+set class-of-service schedulers be buffer-size 16m
+set firewall family inet filter f1 term t1 from destination-port 20000 to 20003
+set security policies from-zone trust to-zone untrust policy p1 match source-address any
+set interfaces ge-0/0/0 unit 0 family inet address 10.0.0.1/24
+`
+	if got := tree.FormatSet(); got != golden {
+		t.Fatalf("SetPath grouping changed (typed-leaf fields must not alter grouping):\n--- got ---\n%s\n--- want ---\n%s", got, golden)
 	}
 }
 

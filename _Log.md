@@ -4424,3 +4424,7 @@ top.
   scripts/test_mtr_report_check.py, scripts/userspace-ha-validation.sh,
   docs/userspace-ha-validation.md, docs/pr/1303-mtr-smoke/plan.md,
   docs/pr/1303-mtr-smoke/reviewer-ids.md, _Log.md
+
+- **Timestamp**: 2026-05-29
+  **Action**: #1319 PR1 — re-home typed-leaf schema onto config.setSchema; generic SchemaValidate walker; wire typed-value `?` completion (symptom-1 fix); retire cmdtree config-mode overlay
+  **File(s)**: pkg/config/value_type.go (new), pkg/config/ast.go (schemaNode typed fields + appendTypedValueCompletions + schedulers typed leaves), pkg/config/schema_walk.go (new generic walker + SchemaValidate), pkg/config/schema_validate_test.go (migrated DPDK test + golden grouping test), pkg/config/schema_walk_internal_test.go (new walker-contract tests), pkg/cmdtree/tree.go (ValueType aliases, removed ConfigClassOfServiceSchedulers + overlay wiring), pkg/cmdtree/schema_validate.go (deleted), pkg/cmdtree/schema_validate_test.go (deleted), pkg/cmdtree/tree_test.go (removed unit-only overlay tests), pkg/configstore/store.go (config.SchemaValidate), pkg/cli/completion_typed_leaf_test.go (new frontend tests), pkg/grpcapi/completion_typed_leaf_test.go (new frontend tests), CLAUDE.md + pkg/cmdtree/README.md + pkg/config/README.md + docs/config-schema.md (two-SSOT doctrine)
