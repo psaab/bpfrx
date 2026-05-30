@@ -133,9 +133,11 @@ cell, but:
   production, with no operator opt-in.
 
 The matching telemetry counter (`dbg.seg_needed_but_none`, incremented in
-`count_forwarded_tcp_segmentation_miss_if_needed`) is the durable,
-operator-visible signal and stays. Only the ad-hoc eprintln becomes
-opt-in.
+`count_forwarded_tcp_segmentation_miss_if_needed`) is `pub(in crate::afxdp)`
+and has **no Go/CLI export**, so it is not operator-visible. Naive gating of
+the eprintln would leave a genuine seg-miss 100% silent in release. The
+`record_exception` call below closes that blindspot. Only the ad-hoc eprintln
+becomes opt-in.
 
 ## Concrete design (v2 — gate + durable operator signal)
 
@@ -145,9 +147,10 @@ block. The `dbg.seg_needed_but_none` counter is unchanged (always
 increments inside the counting helper). No change to the #1283 precheck.
 
 1. **Gate the `DBG SEG_MISS` eprintln behind `cfg!(feature =
-   "debug-log")`** with short-circuit ordering so release builds never
-   touch the per-thread cap cell. Matches the five siblings in this file
-   (lines 254/332/515/663/793).
+   "debug-log")`** inside the existing rate-cap block. Release builds still
+   execute the cap check and `record_exception` (both always-on); only the
+   packet-shape `eprintln!` body is DCE'd. Matches the intent of the five
+   sibling gates in this file (lines 254/332/515/663/793).
 
 2. **Record a first-class exception** so a genuine seg-miss is visible to
    operators in release via `show chassis cluster data-plane statistics`
@@ -216,9 +219,12 @@ seg_needed_but_none` unchanged. CLI stats output unchanged.
   signal of record; only the eprintln becomes opt-in). Verified by the
   existing truth-table test (`#1283` added
   `forwarded_tcp_may_need_segmentation` / seg-miss-counter tests).
-- No allocation change, no hot-path branch added in release (the
-  `cfg!(feature)` collapses to a const-false → the whole block DCEs
-  out, same as the siblings).
+- No allocation change in release. The `cfg!(feature)` collapses to
+  `const false`, so the `eprintln!` body DCEs out, but the rate-cap check
+  and `record_exception` remain in release (intentionally always-on so a
+  genuine seg-miss surfaces under `Recent exceptions`). The behaviour
+  differs from the pure-log siblings in this file which DCE the entire
+  block.
 - No HA / GC / map interaction.
 
 ## Risk assessment
@@ -233,7 +239,9 @@ seg_needed_but_none` unchanged. CLI stats output unchanged.
 ## Test plan
 
 - `cargo build` clean (release, default features → eprintln DCE'd).
-- `cargo build --features debug-log` clean (eprintln retained).
+- `cargo build --features debug-log` — compiles the gated block, but **fails
+  with a pre-existing `ICMPV6_EMBED_LOGGED private` visibility error
+  unrelated to this PR** (tracked in #1678; not in scope here).
 - `cargo test --release` full suite + seg-miss truth-table test 5×.
 - Go suite (no Go change, sanity only).
 - Cluster: already reproduced clean (0 SEG_MISS, 0 non-admission TX
