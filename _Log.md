@@ -4426,6 +4426,40 @@ top.
   docs/pr/1303-mtr-smoke/reviewer-ids.md, _Log.md
 
 - **Timestamp**: 2026-05-29
+  **Action**: #1319 PR1 — re-home typed-leaf schema onto config.setSchema; generic SchemaValidate walker; wire typed-value `?` completion (symptom-1 fix); retire cmdtree config-mode overlay
+  **File(s)**: pkg/config/value_type.go (new), pkg/config/ast.go (schemaNode typed fields + appendTypedValueCompletions + schedulers typed leaves), pkg/config/schema_walk.go (new generic walker + SchemaValidate), pkg/config/schema_validate_test.go (migrated DPDK test + golden grouping test), pkg/config/schema_walk_internal_test.go (new walker-contract tests), pkg/cmdtree/tree.go (ValueType aliases, removed ConfigClassOfServiceSchedulers + overlay wiring), pkg/cmdtree/schema_validate.go (deleted), pkg/cmdtree/schema_validate_test.go (deleted), pkg/cmdtree/tree_test.go (removed unit-only overlay tests), pkg/configstore/store.go (config.SchemaValidate), pkg/cli/completion_typed_leaf_test.go (new frontend tests), pkg/grpcapi/completion_typed_leaf_test.go (new frontend tests), CLAUDE.md + pkg/cmdtree/README.md + pkg/config/README.md + docs/config-schema.md (two-SSOT doctrine)
+
+- **Timestamp**: 2026-05-29
+  **Action**: #1319 PR1 review-response — fix MAJOR (Copilot#1/Codex#1: descendInstanceLevels dropped leftover Keys, hierarchical shorthand `schedulers { be transmit-rate asd; }` bypassed validation) + Codex minor#2 (golden now exercises children==nil replace via double priority set) + Codex minor#3 (stale cmdtree LeafValidator/Node comments)
+  **File(s)**: pkg/config/schema_walk.go (descendInstanceLevels leftover-leaf), pkg/config/schema_validate_test.go (shorthand regression tests + golden double-priority), pkg/cmdtree/tree.go (comment fixes)
+
+- **Timestamp**: 2026-05-29
+  **Action**: #1319 PR1 review-response r2 — fix 2 more MAJORs from Codex re-review: (1) fully-packed container leaf `schedulers be transmit-rate asd` (one node) dropped the leaf — added leftover-Keys synthesis to the container path; (2) known modifier child swallowed trailing garbage `exact bogus` — new validateModifierChild checks no trailing keys + no unexpected descendants
+  **File(s)**: pkg/config/schema_walk.go (container leftover-leaf + validateModifierChild), pkg/config/schema_validate_test.go (TestSchemaValidate_FullyPackedContainerLeaf + TestSchemaValidate_ModifierTrailingGarbage)
+
+- **Timestamp**: 2026-05-29
+  **Action**: #1319 PR1 review-response r3 — fix Codex r3 MINOR: packed-leftover leaves were validated with a singleton sibling set, breaking the cross-sibling split-modifier rule (`schedulers be transmit-rate 1g` + `schedulers be transmit-rate exact` falsely rejected). Refactored leftover-leaf handling to group by container identity across siblings (walkSchemaChildren leftover-group pass + collectInstanceContents batch peel) so peer leftover leaves see each other.
+  **File(s)**: pkg/config/schema_walk.go (packedLeftoverLeaf + leftover grouping in walkSchemaChildren; collectInstanceContents replaces descendInstanceLevels), pkg/config/schema_validate_test.go (TestSchemaValidate_PackedSiblingSplitModifier)
+
+- **Timestamp**: 2026-05-29
+  **Action**: #1319 PR1 review-response r4 — fix Codex r4 MAJOR: multi-level packed chain (`class-of-service schedulers be transmit-rate asd` as one flat node) bypassed validation because the group pass called walkSchemaNode per synthesized leaf, and walkSchemaNode returns nil on a synthesized leaf that is itself a container with further leftover. Fixed by having the group pass recurse via walkSchemaChildren (re-enters the leftover-group pass for nested packed chains; still threads the leaves as siblings).
+  **File(s)**: pkg/config/schema_walk.go (group pass walkSchemaChildren recursion), pkg/config/schema_validate_test.go (TestSchemaValidate_MultiLevelPackedChain)
+
+- **Timestamp**: 2026-05-30
+  **Action**: #1319 PR1 review-response (Copilot swe-agent) — reject malformed multi value-tail ranges so a typed `multi && children==nil` leaf no longer accepts dangling/all-separator `to` tails (e.g. `destination-port to`, `destination-port 20000 to`)
+  **File(s)**: pkg/config/schema_walk.go (multi value-tail separator validation), pkg/config/schema_walk_internal_test.go (dangling-separator regressions)
+- **Timestamp**: 2026-05-29
+  **Action**: #1319 PR1 review-response r5 — fix Codex r5 MAJOR: extra unknown token in a container identity (`class-of-service extra { schedulers be transmit-rate asd; }` / `schedulers be extra { transmit-rate asd; }`) dropped nested typed-leaf validation because the synthesized leftover leaf bundled the block children under the unknown token. Fixed: packedLeftoverLeaf only treats leftover as a packed leaf when leftover[0] resolves under descendSchema; the container path walks block children at descendSchema when the leftover token is unknown (opt-in skip of the token, but nested config still validated).
+  **File(s)**: pkg/config/schema_walk.go (packedLeftoverLeaf known-leftover guard + container-path unknown-leftover child walk), pkg/config/schema_validate_test.go (TestSchemaValidate_ExtraTokenContainerStillValidatesNestedLeaves)
+
+- **Timestamp**: 2026-05-29
+  **Action**: #1319 PR1 review-response r6 — fix Codex r6 MAJOR: extra unknown token after the instance name in the nested-instance path (`schedulers { be extra { transmit-rate asd; } }` → node Keys=["be","extra"]) dropped the nested typed leaf via collectInstanceContents (synthesized "extra" leaf bundled the children, then no-op'd as unknown). Compiler-reachable (names scheduler `be`, walks the child). Fixed: collectInstanceContents now takes the container schema and, when the leftover token after the name is unknown, skips it but appends the node's children to the group so they're walked at the container schema.
+  **File(s)**: pkg/config/schema_walk.go (collectInstanceContents container-schema param + unknown-leftover child append), pkg/config/schema_validate_test.go (extra-token nested-instance cases)
+
+- **Timestamp**: 2026-05-29
+  **Action**: #1319 PR1 review-response r7 — fix Codex r7 MAJOR (surplus-sharing presence-token hid sibling leaf) by rewriting the walker to the COMPILER-FAITHFUL model. Verified compileClassOfService+namedInstances read scheduler leaves ONLY from instance-node CHILDREN; packed Keys[1:] on instance nodes are never compiled. Removed the entire packed-leftover-leaf machinery (packedLeftoverLeaf, leftover-group pass, collectInstanceContents); container/instance path now consumes identity and walks node.Children at the child schema, ignoring compiler-dead packed tails. This fixes the presence-token mis-attribution AND drops over-validation of tokens the compiler discards. Rewrote regression tests to the compiler-faithful contract: child-leaf garbage (canonical block + flat-set symptom-2) rejects; compiler-discarded packed-single-node shorthand is accepted (out of scope per compiled-leaf-only invariant).
+  **File(s)**: pkg/config/schema_walk.go (compiler-faithful walker rewrite + walkInstanceChildren), pkg/config/schema_validate_test.go (rewritten contract tests), docs/config-schema.md (compiler-faithful rule)
+
 - **Action**: #1628 — added per-class waterfill trace-counter
   instrumentation to the CoS guarantee-rate selector. New
   `CoSQueueWaterfillCounters` (phase1_admissions / phase2_admissions /

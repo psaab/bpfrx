@@ -393,6 +393,35 @@ type schemaNode struct {
 	midKeyword   string                 // fixed keyword in the middle of args (e.g., "to-zone")
 	midKeywordAt int                    // 1-based arg position where midKeyword appears (e.g., 2 for "from-zone X to-zone Y")
 	compoundKey  bool                   // children form compound key (e.g., "family inet6" → Keys=["family","inet6"])
+
+	// Typed-leaf metadata (#1319). The zero value (valueType==ValueAny,
+	// validator==nil) is the legacy behaviour: any string accepted, no
+	// schema-time validation, no value-slot examples in `?` completion.
+	// Setting valueType to a non-ValueAny value opts this leaf in to both
+	// the completion path (CompleteSetPathWithValues surfaces valueDesc +
+	// valueExamples + the placeholder) and the validation path
+	// (SchemaValidate invokes validator at commit-check time). Because the
+	// completion path and the validation path read the SAME node, the two
+	// cannot drift — that is the central design property of Option A.
+	//
+	// IMPORTANT: adding these fields is additive and does not affect
+	// SetPath grouping, which keys only on args/children/compoundKey/multi
+	// (ast_edit.go). A schemaNode MUST NOT gain a children map purely to
+	// carry typed-leaf metadata: SetPath's replace-vs-container decision
+	// keys on children==nil (ast_edit.go:196), so flipping a leaf to a
+	// container is a grouping regression. Type the value via these fields,
+	// not via new children.
+	valueType     ValueType     // non-ValueAny marks a typed value slot
+	valueDesc     string        // one-line value-slot description for `?` help
+	valueExamples []string      // illustrative values surfaced in `?` help
+	validator     LeafValidator // commit-check validator for the value slot
+}
+
+// isTypedLeaf reports whether the node carries typed-value metadata
+// (a non-default valueType), i.e. it expects exactly one typed value at
+// its first non-modifier slot.
+func (n *schemaNode) isTypedLeaf() bool {
+	return n != nil && n.valueType != ValueAny
 }
 
 // setSchema defines the Junos configuration tree structure.
@@ -1162,12 +1191,43 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			}},
 		}},
 		"schedulers": {args: 1, multi: true, children: map[string]*schemaNode{
-			"transmit-rate": {args: 1, children: map[string]*schemaNode{
-				"exact": {children: nil},
-			}},
-			"priority":               {args: 1, children: nil},
-			"buffer-size":            {args: 1, children: nil},
-			"surplus-sharing":        {children: nil}, // #915
+			// #1319 typed leaves. Re-homed from the cmdtree overlay
+			// (cmdtree.ConfigClassOfServiceSchedulers, retired in this PR)
+			// onto setSchema so the live config-mode `set ... ?` completer
+			// and the SchemaValidate commit-check gate read one tree. The
+			// `exact` child predates #1319 and is unchanged — adding fields
+			// to transmit-rate does not alter SetPath grouping.
+			"transmit-rate": {
+				args:          1,
+				valueType:     ValueRate,
+				valueDesc:     "Bandwidth (e.g. 100k, 10m, 1g) or bps integer; >= 8 bps",
+				valueExamples: []string{"100k", "10m", "1g", "10g"},
+				validator:     ValidateRate,
+				children: map[string]*schemaNode{
+					"exact": {children: nil},
+				},
+			},
+			"priority": {
+				args:          1,
+				valueType:     ValueEnumOf,
+				valueDesc:     "Scheduler priority (low | medium-low | medium-high | high | strict-high)",
+				valueExamples: []string{"low", "medium-low", "medium-high", "high", "strict-high"},
+				validator: ValidateEnum([]string{
+					"low", "medium-low", "medium-high", "high", "strict-high",
+				}),
+				children: nil,
+			},
+			"buffer-size": {
+				args:          1,
+				valueType:     ValueByteSizeOrPercent,
+				valueDesc:     "Byte-size with explicit k/m/g suffix, or percent of interface CoS burst pool (e.g. 16m, 256k, 10%)",
+				valueExamples: []string{"16m", "256k", "10%"},
+				validator:     ValidateByteSizeOrPercent,
+				children:      nil,
+			},
+			// `surplus-sharing` (#915) and `equal-flow-enforcement` are
+			// presence-only flags — no value to validate.
+			"surplus-sharing":        {children: nil},
 			"equal-flow-enforcement": {children: nil},
 		}},
 		"scheduler-maps": {args: 1, multi: true, children: map[string]*schemaNode{
@@ -1681,6 +1741,32 @@ func CompleteSetPath(tokens []string) []string {
 	return names
 }
 
+// appendTypedValueCompletions appends a typed leaf's placeholder and
+// example values to the completion list for its empty value slot (#1319).
+// For a non-typed node it returns the input unchanged, so callers can use
+// it unconditionally. The placeholder (e.g. "<rate>") is added first when
+// the leaf has no schema-level placeholder of its own, followed by each
+// configured example value. Examples are illustrative completions, NOT the
+// only acceptable inputs — the leaf's validator owns acceptance.
+func appendTypedValueCompletions(results []SchemaCompletion, node *schemaNode) []SchemaCompletion {
+	if !node.isTypedLeaf() {
+		return results
+	}
+	// Only inject the typed placeholder when the node didn't already supply
+	// one via the schema-level `placeholder` field (the provider/placeholder
+	// branches above already prepended that). This keeps a single
+	// angle-bracket token in the output.
+	if node.placeholder == "" {
+		if ph := node.valueType.Placeholder(); ph != "" {
+			results = append(results, SchemaCompletion{Name: ph, Desc: node.valueDesc})
+		}
+	}
+	for _, ex := range node.valueExamples {
+		results = append(results, SchemaCompletion{Name: ex, Desc: node.valueDesc})
+	}
+	return results
+}
+
 // CompleteSetPathWithValues is like CompleteSetPath but uses a ValueProvider
 // to suggest dynamic values at positions where schema expects a name argument.
 // Returns SchemaCompletion pairs with names and descriptions.
@@ -1792,11 +1878,23 @@ func CompleteSetPathWithValues(tokens []string, provider ValueProvider) []Schema
 				if childSchema.placeholder != "" {
 					results = append([]SchemaCompletion{{Name: childSchema.placeholder, Desc: childSchema.desc}}, results...)
 				}
-				return results
+				// Typed-value examples are additive to dynamic provider
+				// results (#1319).
+				return appendTypedValueCompletions(results, childSchema)
 			}
 			// No provider but have a placeholder — show it.
 			if childSchema.placeholder != "" {
-				return []SchemaCompletion{{Name: childSchema.placeholder, Desc: childSchema.desc}}
+				return appendTypedValueCompletions(
+					[]SchemaCompletion{{Name: childSchema.placeholder, Desc: childSchema.desc}},
+					childSchema,
+				)
+			}
+			// #1319: a typed leaf with no valueHint/placeholder surfaces its
+			// own placeholder + example values at the empty value slot. This
+			// is the symptom-1 fix that reaches the live config-mode `set`
+			// completer (e.g. `set ... transmit-rate ?` → <rate> + examples).
+			if childSchema.isTypedLeaf() {
+				return appendTypedValueCompletions(nil, childSchema)
 			}
 			return nil
 		}

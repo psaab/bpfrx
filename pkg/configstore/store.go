@@ -13,7 +13,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/psaab/xpf/pkg/cmdtree"
 	"github.com/psaab/xpf/pkg/config"
 )
 
@@ -179,7 +178,7 @@ func (s *Store) schemaValidateExpandedTree(tree *config.ConfigTree) error {
 		if err := expanded.ExpandGroupsWithVars(vars); err != nil {
 			return fmt.Errorf("apply-groups: %w", err)
 		}
-		return cmdtree.SchemaValidate(expanded, nil)
+		return config.SchemaValidate(expanded, nil)
 	}
 	if err := expanded.ExpandGroups(); err != nil {
 		if strings.Contains(err.Error(), `undefined group "${node}"`) {
@@ -191,7 +190,7 @@ func (s *Store) schemaValidateExpandedTree(tree *config.ConfigTree) error {
 			return fmt.Errorf("apply-groups: %w", err)
 		}
 	}
-	return cmdtree.SchemaValidate(expanded, nil)
+	return config.SchemaValidate(expanded, nil)
 }
 
 // SyncApply applies a config received from the cluster primary.

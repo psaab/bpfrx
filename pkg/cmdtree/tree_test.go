@@ -96,77 +96,11 @@ func TestLookupDesc_ConfigModeResolvesUniquePrefixWords(t *testing.T) {
 	}
 }
 
-// #1319: typed-leaf `?` completion surfaces placeholder + ValueExamples
-// through the real config-mode set tree.
-
-func containsCand(cands []Candidate, name string) (Candidate, bool) {
-	for _, c := range cands {
-		if c.Name == name {
-			return c, true
-		}
-	}
-	return Candidate{}, false
-}
-
-func TestConfigTopLevel_SetIncludesClassOfServiceSchedulers(t *testing.T) {
-	setNode := ConfigTopLevel["set"]
-	if setNode == nil {
-		t.Fatal("missing set node")
-	}
-	cosNode := setNode.Children["class-of-service"]
-	if cosNode == nil {
-		t.Fatalf("set completion tree missing class-of-service: %+v", setNode.Children)
-	}
-	schedulersNode := cosNode.Children["schedulers"]
-	if schedulersNode == nil {
-		t.Fatalf("class-of-service completion tree missing schedulers: %+v", cosNode.Children)
-	}
-	if schedulersNode.Children["<scheduler>"] != ConfigClassOfServiceSchedulers {
-		t.Fatalf("schedulers completion tree is not wired to typed scheduler schema")
-	}
-}
-
-func TestSchedulers_TypedLeaf_QuestionHelpShowsPlaceholderAndExamples(t *testing.T) {
-	// After `sched transmit-rate`, `?` should show the rate placeholder
-	// plus example values.
-	cands := CompleteFromTreeWithDesc(
-		ConfigTopLevel,
-		[]string{"set", "class-of-service", "schedulers", "be", "transmit-rate"},
-		"",
-		nil,
-	)
-	if _, ok := containsCand(cands, "<rate>"); !ok {
-		t.Fatalf("expected <rate> placeholder in `?` candidates, got %+v", cands)
-	}
-	if _, ok := containsCand(cands, "1g"); !ok {
-		t.Fatalf("expected 1g example in `?` candidates, got %+v", cands)
-	}
-}
-
-func TestSchedulers_TypedLeaf_AfterValueShowsModifiers(t *testing.T) {
-	// After `sched transmit-rate 1g`, the value is consumed and `?`
-	// should surface the `exact` modifier child.
-	cands := CompleteFromTreeWithDesc(
-		ConfigTopLevel,
-		[]string{"set", "class-of-service", "schedulers", "be", "transmit-rate", "1g"},
-		"",
-		nil,
-	)
-	if _, ok := containsCand(cands, "exact"); !ok {
-		t.Fatalf("expected `exact` modifier after consumed rate, got %+v", cands)
-	}
-}
-
-func TestSchedulers_TypedLeaf_PriorityEnumExamples(t *testing.T) {
-	cands := CompleteFromTreeWithDesc(
-		ConfigTopLevel,
-		[]string{"set", "class-of-service", "schedulers", "be", "priority"},
-		"",
-		nil,
-	)
-	for _, want := range []string{"strict-high", "low", "high"} {
-		if _, ok := containsCand(cands, want); !ok {
-			t.Fatalf("expected enum example %q for priority, got %+v", want, cands)
-		}
-	}
-}
+// #1319 PR 1 retired the cmdtree config-mode typed-leaf overlay
+// (ConfigClassOfServiceSchedulers) and the unit-test-only
+// CompleteFromTreeWithDesc(ConfigTopLevel, "set", ...) coverage that went
+// with it — that path is NOT the one the live config-mode `set ... ?`
+// completer uses (it routes through config.CompleteSetPathWithValues over
+// setSchema), so testing it was a false-coverage trap. The symptom-1
+// completion behaviour is now pinned at the real frontend boundary in
+// pkg/cli (completeConfigWithDesc) and pkg/grpcapi (completeConfigPairs).

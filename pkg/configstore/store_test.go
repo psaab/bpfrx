@@ -1572,9 +1572,9 @@ func TestLoad_PersistedDPDKDataplaneTypeRewrittenByLoad(t *testing.T) {
 //  2. The orphan sub-stanza (cores, memory, ports, etc) does not
 //     cause schemaValidateExpandedTree or compileExpanded to fail.
 //
-// If a future PR expands cmdtree.SchemaValidate to walk
-// `system dataplane`, this test fires and forces the author to
-// coordinate with rewriteRetiredDataplaneType.
+// If a future PR types a `system dataplane` leaf in setSchema (so
+// config.SchemaValidate's generic walker validates it), this test fires
+// and forces the author to coordinate with rewriteRetiredDataplaneType.
 func TestLoad_PersistedDPDKDataplaneTypeWithSubStanzaRewrittenByLoad(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config")

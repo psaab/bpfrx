@@ -19,89 +19,58 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 )
 
-// ValueType classifies the value a typed-leaf node accepts. #1319 Phase 1.
+// ValueType classifies the value a typed-leaf node accepts. #1319.
 //
-// The zero value, ValueAny, is the legacy behaviour: any string is accepted
-// and no schema-time validation runs. Specifying a non-zero ValueType opts
-// the leaf in to:
-//   - `?` completion surfacing ValueDesc + ValueExamples for the value slot;
-//   - SchemaValidate (pkg/config) invoking the leaf's Validator at commit
-//     check, so garbage like `transmit-rate asd` fails loud at commit time
-//     instead of silently zeroing out the rate inside the compiler.
-//
-// Add new types here only when we're prepared to wire validators for every
-// leaf that adopts them — IP/CIDR/MAC/duration are deliberately deferred
-// (see issue #1319) until the schedulers subtree lands first.
-type ValueType int
+// The canonical definition lives in pkg/config (config.ValueType) so the
+// config-grammar schema (config.setSchema — the live config-mode `set`
+// completion + validation tree) can carry typed-leaf metadata directly
+// without a config→cmdtree→config import cycle. cmdtree re-exports the
+// type + constants + Placeholder via aliases so its operational-tree
+// leaves are unchanged. See #1319 plan §5 ("Type ownership").
+type ValueType = config.ValueType
 
 const (
 	// ValueAny is the legacy default: any string accepted, no validation.
-	ValueAny ValueType = iota
+	ValueAny = config.ValueAny
 	// ValueRate is a Junos bandwidth value (bits/sec) with k/m/g suffix.
-	// Examples: "100k", "10m", "1g". Accepts plain integers.
-	ValueRate
+	ValueRate = config.ValueRate
 	// ValueByteSize is a byte-count value with k/m/g suffix.
-	// Examples: "16k", "1m", "256m".
-	ValueByteSize
+	ValueByteSize = config.ValueByteSize
 	// ValueByteSizeOrPercent is a scheduler buffer size: byte-count with
 	// k/m/g suffix, or percent with an explicit % suffix.
-	ValueByteSizeOrPercent
+	ValueByteSizeOrPercent = config.ValueByteSizeOrPercent
 	// ValuePercent is a percent value in the range [0, 100] (no suffix).
-	ValuePercent
-	// ValueInteger is a bare integer. Range is enforced by the leaf's
-	// Validator (callers use validateInteger(min,max) to bound it).
-	ValueInteger
+	ValuePercent = config.ValuePercent
+	// ValueInteger is a bare integer; range enforced by the Validator.
+	ValueInteger = config.ValueInteger
 	// ValueIdentifier is a bare Junos identifier (no spaces, no quotes).
-	ValueIdentifier
-	// ValueEnumOf is one of a fixed set of names. The allowed set lives
-	// in the leaf's Validator closure (validateEnum).
-	ValueEnumOf
+	ValueIdentifier = config.ValueIdentifier
+	// ValueEnumOf is one of a fixed set of names (set lives in Validator).
+	ValueEnumOf = config.ValueEnumOf
 	// ValueBool is "true" or "false".
-	ValueBool
+	ValueBool = config.ValueBool
 )
 
-// Placeholder returns the angle-bracket placeholder name shown in `?`
-// completion for an unfilled value slot of this type.
-func (v ValueType) Placeholder() string {
-	switch v {
-	case ValueRate:
-		return "<rate>"
-	case ValueByteSize:
-		return "<bytes>"
-	case ValueByteSizeOrPercent:
-		return "<bytes|percent>"
-	case ValuePercent:
-		return "<percent>"
-	case ValueInteger:
-		return "<integer>"
-	case ValueIdentifier:
-		return "<name>"
-	case ValueEnumOf:
-		return "<value>"
-	case ValueBool:
-		return "<true|false>"
-	}
-	return ""
-}
-
-// LeafValidator is invoked by SchemaValidate (this package) on the raw
-// AST value for a typed leaf at commit-check time. cfg is the candidate
-// Config (may be nil if SchemaValidate runs on the raw AST before compile).
-// Validators must return a nil error for accepted input.
+// LeafValidator is the typed-leaf validator signature. cfg is the
+// candidate Config (may be nil when validation runs on the raw AST before
+// compile). Validators return nil for accepted input.
 //
-// We alias config.LeafValidator (same function signature) so cmdtree
-// Nodes can carry validators declared in pkg/config directly. The alias
-// avoids a config→cmdtree→config import cycle: validators live in
-// config (string parsers), the schema walker lives here (typed-leaf
-// dispatch).
+// We alias config.LeafValidator (same function signature) so operational
+// cmdtree Nodes can carry validators declared in pkg/config directly. The
+// config-mode typed-leaf gate (config.SchemaValidate, #1319 PR 1) lives in
+// pkg/config and validates config.setSchema; this alias only serves the
+// operational tree's own typed leaves and the retained `set system
+// dataplane` overlay.
 type LeafValidator = config.LeafValidator
 
 // Node defines a completion tree node with description, children, and optional dynamic values.
 //
-// Phase 1 / #1319: optional typed-leaf fields (ValueType, ValueDesc,
-// ValueExamples, Validator) describe the value a leaf accepts. The zero
+// #1319: optional typed-leaf fields (ValueType, ValueDesc, ValueExamples,
+// Validator) describe the value an OPERATIONAL-tree leaf accepts. The zero
 // value of ValueType is ValueAny — every existing Node is backward
-// compatible by construction.
+// compatible by construction. Config-mode typed leaves live on
+// config.setSchema, not here (see the two-SSOT note at the top of this
+// package / docs/config-schema.md).
 type Node struct {
 	Desc      string
 	Children  map[string]*Node
@@ -1002,64 +971,15 @@ var ConfigSetDataplaneKnobs = map[string]*Node{
 	}},
 }
 
-// ConfigClassOfServiceSchedulers is the per-leaf typed-value schema for
-// `set class-of-service schedulers <name> { ... }` (#1319 Phase 2).
-//
-// It defines the value semantics for the three scheduler leaves the
-// compiler actually consumes today (see
-// pkg/config/compiler_class_of_service.go around lines 227-251):
-// transmit-rate (rate, optional `exact` modifier), priority (enum),
-// and buffer-size (byte-size with optional `temporal` modifier per Junos).
-//
-// The set-mode tab/`?` completer reaches these through
-// ConfigTopLevel["set"].Children["class-of-service"].Children["schedulers"].
-// The existing pkg/config/ast.go schemaNode tree still answers structural
-// completion ("what keywords are valid here") for every other subtree; this
-// map only adds value-slot semantics for the schedulers leaves.
-//
-// Wiring: SchemaValidate (this file) walks the AST against this map
-// at commit-check time; configstore calls SchemaValidate BEFORE the
-// existing compile step so `commit check` fails loud on garbage like
-// `transmit-rate asd`.
-var ConfigClassOfServiceSchedulers = &Node{
-	Desc: "Per-scheduler configuration",
-	Children: map[string]*Node{
-		"transmit-rate": {
-			Desc:          "Transmit rate (bandwidth allocated to this scheduler)",
-			ValueType:     ValueRate,
-			ValueDesc:     "Bandwidth (e.g. 100k, 10m, 1g) or bps integer; >= 8 bps",
-			ValueExamples: []string{"100k", "10m", "1g", "10g"},
-			Validator:     config.ValidateRate,
-			Children: map[string]*Node{
-				"exact": {Desc: "Enforce exact transmit rate (no surplus)"},
-			},
-		},
-		"priority": {
-			Desc:          "Scheduling priority for this queue",
-			ValueType:     ValueEnumOf,
-			ValueDesc:     "Scheduler priority (low | medium-low | medium-high | high | strict-high)",
-			ValueExamples: []string{"low", "medium-low", "medium-high", "high", "strict-high"},
-			Validator: config.ValidateEnum([]string{
-				"low", "medium-low", "medium-high", "high", "strict-high",
-			}),
-		},
-		"buffer-size": {
-			Desc:          "Buffer allocation for this scheduler",
-			ValueType:     ValueByteSizeOrPercent,
-			ValueDesc:     "Byte-size with explicit k/m/g suffix, or percent of interface CoS burst pool (e.g. 16m, 256k, 10%)",
-			ValueExamples: []string{"16m", "256k", "10%"},
-			Validator:     config.ValidateByteSizeOrPercent,
-			Children: map[string]*Node{
-				"temporal": {Desc: "Temporal buffer interpretation (Junos)"},
-			},
-		},
-		// `surplus-sharing` (#915) and `equal-flow-enforcement` are
-		// presence-only flags — no value to validate. We list them for
-		// `?` help completeness.
-		"surplus-sharing":        {Desc: "Allow scheduler to consume surplus bandwidth (opt-in)"},
-		"equal-flow-enforcement": {Desc: "Enforce per-flow equal share within this scheduler"},
-	},
-}
+// #1319 PR 1 retired the cmdtree config-mode typed-leaf overlay
+// (formerly ConfigClassOfServiceSchedulers + cmdtree.SchemaValidate).
+// Config-mode typed leaves now live on pkg/config's setSchema, which is
+// the tree the live `set`/`delete`/`show`/`edit` completer AND the
+// commit-check SchemaValidate gate both read. cmdtree remains the SSOT
+// for the operational ("run") tree; its Node still carries the typed-leaf
+// fields (ValueType/ValueDesc/ValueExamples/Validator) for operational
+// leaves and the retained `set system dataplane` description overlay. See
+// pkg/cmdtree/README.md and docs/config-schema.md for the two-SSOT split.
 
 // ConfigTopLevel defines tab completion for config mode top-level commands.
 var ConfigTopLevel = map[string]*Node{
@@ -1068,11 +988,6 @@ var ConfigTopLevel = map[string]*Node{
 	"insert":   {Desc: "Insert a new ordered configuration statement"},
 	"rename":   {Desc: "Rename a configuration statement"},
 	"set": {Desc: "Set a configuration parameter", Children: map[string]*Node{
-		"class-of-service": {Desc: "Class-of-service configuration", Children: map[string]*Node{
-			"schedulers": {Desc: "Scheduler definitions", Children: map[string]*Node{
-				"<scheduler>": ConfigClassOfServiceSchedulers,
-			}},
-		}},
 		"system": {Desc: "System configuration", Children: map[string]*Node{
 			// Codex M3: surface the #785/#801 dataplane knobs so `?`
 			// help and tab completion show descriptions for

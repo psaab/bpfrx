@@ -1,9 +1,23 @@
 # pkg/cmdtree
 
-Single source of truth for every CLI command tree (operational +
-configuration). Used by the local CLI, the remote CLI, and the gRPC
-tab-completion RPC. Adding a command here automatically propagates to all
-three frontends.
+Single source of truth for the **operational** CLI command tree (`run` /
+`show` / `clear` / `request` / `monitor` / `ping` / ...). Used by the local
+CLI, the remote CLI, and the gRPC tab-completion RPC. Adding an operational
+command here automatically propagates to all three frontends.
+
+> [!IMPORTANT]
+> **Two-SSOT split (#1319).** cmdtree is the SSOT for the OPERATIONAL tree
+> only. The **config-mode `set`/`delete`/`show`/`edit` grammar** — its
+> structural completion, flat-set token grouping, value-slot `?`
+> completion, AND the commit-check typed-leaf validation — is owned by
+> `config.setSchema` in `pkg/config/ast.go`, not by cmdtree. The live
+> config-mode completers (`pkg/cli` `completeConfigWithDesc`, `pkg/grpcapi`
+> `completeConfigPairs`) route `set` paths through
+> `config.CompleteSetPathWithValues` over `setSchema` and never consult a
+> cmdtree config-grammar tree. `ConfigTopLevel` here only carries the
+> top-level keyword set (`set`/`delete`/`commit`/`load`/...) plus the
+> retained `set system dataplane` description overlay. See
+> `docs/config-schema.md` and `pkg/config/README.md`.
 
 ## Entry points
 
@@ -16,62 +30,36 @@ three frontends.
   completion.
 - `OperationalTree` — `tree.go`. Canonical root for `show`, `clear`,
   `request`, `monitor`, `ping`, `traceroute`, etc.
-- `ConfigTopLevel` — root for the `set`/`delete` configuration grammar.
-- `ConfigClassOfServiceSchedulers` — `tree.go`. Per-leaf typed-value
-  schema for `set class-of-service schedulers <name> { ... }` (#1319
-  Phase 2). Reused by the config-mode `set` completion tree and by
-  `SchemaValidate`.
+- `ConfigTopLevel` — root for the config-mode TOP-LEVEL keywords
+  (`set`/`delete`/`show`/`edit`/`commit`/`load`/...). The config-grammar
+  BELOW `set` lives in `config.setSchema`, not here (see the two-SSOT note
+  above). The only sub-`set` content retained in cmdtree is the
+  `set system dataplane` description overlay (#785/#801 knob help).
 - `KeysFromTree(tree)` — `tree.go`. Used by `pkg/cli` and `pkg/grpcapi`
   for Junos-style prefix matching.
-- `WriteHelp`, `LookupDesc`, `PrintTreeHelp`, `CompleteFromTree` — the
-  helper API the three frontends consume.
-- `SchemaValidate(tree, cfg)` — `schema_validate.go`. The commit-check
-  gate (#1319). Walks the AST against typed-leaf cmdtree Nodes and
-  invokes their `Validator` on each value; called by
-  `pkg/configstore.compileTree` against an apply-groups-expanded clone
-  BEFORE compile so garbage like `transmit-rate asd` fails loud at
-  `commit check`, including when it arrives through `groups { ... }`.
+- `WriteHelp`, `LookupDesc`, `PrintTreeHelp`, `CompleteFromTree`,
+  `CompleteFromTreeWithDesc` — the helper API the three frontends consume
+  for the OPERATIONAL tree (and operational typed leaves).
 
-## Typed leaves (#1319)
+## Typed leaves
 
-A `Node` with `ValueType != ValueAny` is a typed leaf: it expects
-exactly one value of the declared kind at the next slot.
+A `Node` with `ValueType != ValueAny` is a typed leaf: it expects exactly
+one value of the declared kind at the next slot, and `?` completion
+surfaces `ValueDesc` + `ValueExamples` + the placeholder
+(`ValueType.Placeholder()`).
 
-- `?` completion surfaces `ValueDesc` + `ValueExamples` so the operator
-  sees what's accepted instead of an empty cursor.
-- `SchemaValidate` invokes the leaf's `Validator` at commit-check.
-  Validators are stateless string-checkers (`config.ValidateRate`,
-  `config.ValidateByteSize`, ...) declared in `pkg/config` so they
-  share the same parsers the compiler uses.
+`ValueType` is defined in `pkg/config` (`config.ValueType`) and re-exported
+here via aliases so cmdtree's operational leaves can carry it without a
+`config → cmdtree → config` import cycle. The typed-leaf fields on `Node`
+serve OPERATIONAL-tree leaves and the retained `set system dataplane`
+overlay.
 
-This PR ships typed leaves only for `class-of-service schedulers`
-(`transmit-rate`, `priority`, `buffer-size`). Every other Node remains
-on `ValueAny` (zero value) — no behaviour change. Leaves are only typed
-when the compiler consumes them today; scheduler-level `shaping-rate`
-is intentionally not listed because shaping is implemented under
-`class-of-service interfaces ... unit ... shaping-rate`.
-
-`transmit-rate exact` is accepted only as the Junos split-modifier form
-when the same scheduler also has a typed `transmit-rate <rate>` value.
-An exact-only scheduler line still fails commit-check because the compiler
-would otherwise treat it as exact-with-zero-rate.
-
-`buffer-size` accepts byte-size values with explicit `k`/`m`/`g` suffixes
-or Junos percent values with an explicit `%` suffix. Percent values are
-compiled into a distinct `buffer_size_percent` snapshot field (#1336);
-the userspace runtime converts them to bytes per interface using the
-resolved CoS burst pool. Bare integers remain rejected because
-`buffer-size 50` is ambiguous between bytes and percent. The aggregate
-percent buffers for scheduler-map entries bound to one interface unit
-must be `<= 100%`. xpf also rejects Junos `0%` because zero is the
-legacy absent-field value on the additive userspace protocol field.
-
-Adding a new typed subtree means:
-
-1. populate `ValueType` + `Validator` on the relevant Node(s);
-2. add a small walker entry to `schema_validate.go` (one per top-level
-   subtree we want gated);
-3. nothing else — no compiler changes, no parser changes.
+**Config-mode typed leaves do NOT live here.** The `class-of-service
+schedulers` typed leaves (`transmit-rate`/`priority`/`buffer-size`) and the
+commit-check gate moved onto `config.setSchema` + `config.SchemaValidate`
+in #1319 PR 1, so the completion path and the validation path read one
+tree and cannot drift. To add a config-mode typed leaf, edit `setSchema`
+(see `docs/config-schema.md`), not cmdtree.
 
 ## Callers
 
