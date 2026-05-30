@@ -12,9 +12,10 @@ folded in below.
   for the same `filter_counters` map. **New explicit rule: a map's read AND
   clear accessors live in the SAME file. Domain-specific counter accessors live
   WITH their domain.** Result: `ReadFilterCounters` + `ClearFilterCounters` →
-  `maps_filter.go`; `ReadFloodCounters` → `maps_screen.go`; NAT counters stay in
-  `maps_nat.go`. `maps_counters.go` holds only cross-cutting/generic counters
-  (global, interface, zone, policy) plus the `ClearAllCounters` orchestrator.
+  `maps_filter.go`; `Read/ClearPolicyCounters` → `maps_policy.go`;
+  `ReadFloodCounters` → `maps_screen.go`; NAT counters stay in `maps_nat.go`.
+  `maps_counters.go` holds only cross-cutting/generic counters (global,
+  interface, zone) plus the `ClearAllCounters` orchestrator.
 - **`maps_screen.go` overstuffed (Codex, accepted).** Port mirroring is a
   distinct surface (dataplane.go:345) → split into `maps_mirror.go`. Screen
   config + session-limit counters stay together in `maps_screen.go` with a
