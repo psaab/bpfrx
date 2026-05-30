@@ -10,42 +10,6 @@ import (
 	"github.com/cilium/ebpf"
 )
 
-// SetFlowTimeout writes a flow timeout value (in seconds) at the given index.
-func (m *Manager) SetFlowTimeout(idx, seconds uint32) error {
-	zm, ok := m.maps["flow_timeouts"]
-	if !ok {
-		return fmt.Errorf("flow_timeouts map not found")
-	}
-	return zm.Update(idx, seconds, ebpf.UpdateAny)
-}
-
-// FlowConfigValue mirrors struct flow_config in xpf_common.h.
-type FlowConfigValue struct {
-	TCPMSSIPsec       uint16
-	TCPMSSGreIn       uint16
-	TCPMSSGreOut      uint16
-	AllowDNSReply     uint8
-	AllowEmbeddedICMP uint8
-	GREAccel          uint8
-	ALGFlags          uint8  // bit 0: DNS disable, bit 1: FTP disable, bit 2: SIP disable, bit 3: TFTP disable
-	Lo0FilterV4       uint16 // filter ID for lo0 inet input (0xFFFF=none)
-	Lo0FilterV6       uint16 // filter ID for lo0 inet6 input (0xFFFF=none)
-	TCPFlags          uint8  // bit 0: no-syn-check, bit 1: rst-invalidate-session
-	AppFlags          uint8  // bit 0: AppID enabled, bit 1: pre-ID session-init log, bit 2: pre-ID session-close log
-}
-
-// Lo0FilterNone is the sentinel value meaning no lo0 filter configured.
-const Lo0FilterNone = uint16(0xFFFF)
-
-// SetFlowConfig writes the global flow configuration (TCP MSS clamp, etc.).
-func (m *Manager) SetFlowConfig(cfg FlowConfigValue) error {
-	zm, ok := m.maps["flow_config_map"]
-	if !ok {
-		return fmt.Errorf("flow_config_map map not found")
-	}
-	return zm.Update(uint32(0), cfg, ebpf.UpdateAny)
-}
-
 // UpdateFabricFwd writes the fabric cross-chassis forwarding config.
 // Pass a zero FabricFwdInfo (Ifindex=0) to disable fabric redirect.
 func (m *Manager) UpdateFabricFwd(info FabricFwdInfo) error {
