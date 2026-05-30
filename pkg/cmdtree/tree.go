@@ -51,24 +51,26 @@ const (
 	ValueBool = config.ValueBool
 )
 
-// LeafValidator is invoked by SchemaValidate (this package) on the raw
-// AST value for a typed leaf at commit-check time. cfg is the candidate
-// Config (may be nil if SchemaValidate runs on the raw AST before compile).
-// Validators must return a nil error for accepted input.
+// LeafValidator is the typed-leaf validator signature. cfg is the
+// candidate Config (may be nil when validation runs on the raw AST before
+// compile). Validators return nil for accepted input.
 //
-// We alias config.LeafValidator (same function signature) so cmdtree
-// Nodes can carry validators declared in pkg/config directly. The alias
-// avoids a config→cmdtree→config import cycle: validators live in
-// config (string parsers), the schema walker lives here (typed-leaf
-// dispatch).
+// We alias config.LeafValidator (same function signature) so operational
+// cmdtree Nodes can carry validators declared in pkg/config directly. The
+// config-mode typed-leaf gate (config.SchemaValidate, #1319 PR 1) lives in
+// pkg/config and validates config.setSchema; this alias only serves the
+// operational tree's own typed leaves and the retained `set system
+// dataplane` overlay.
 type LeafValidator = config.LeafValidator
 
 // Node defines a completion tree node with description, children, and optional dynamic values.
 //
-// Phase 1 / #1319: optional typed-leaf fields (ValueType, ValueDesc,
-// ValueExamples, Validator) describe the value a leaf accepts. The zero
+// #1319: optional typed-leaf fields (ValueType, ValueDesc, ValueExamples,
+// Validator) describe the value an OPERATIONAL-tree leaf accepts. The zero
 // value of ValueType is ValueAny — every existing Node is backward
-// compatible by construction.
+// compatible by construction. Config-mode typed leaves live on
+// config.setSchema, not here (see the two-SSOT note at the top of this
+// package / docs/config-schema.md).
 type Node struct {
 	Desc      string
 	Children  map[string]*Node

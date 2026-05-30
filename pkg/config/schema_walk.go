@@ -155,7 +155,13 @@ func descendInstanceLevels(node *Node, containerSchema *schemaNode, remaining in
 	if node == nil || len(node.Keys) == 0 {
 		return nil
 	}
-	// This node's Keys carry one or more instance-name tokens.
+	// This node's Keys carry one or more instance-name tokens, and possibly
+	// MORE: the parser produces hierarchical shorthand like
+	// `schedulers { be transmit-rate asd; }` as a single node
+	// Keys=["be","transmit-rate","asd"] (instance name + a leaf + value all
+	// packed together). After consuming the instance name(s), any leftover
+	// Keys tokens are a leaf that must still be validated — dropping them
+	// would let `transmit-rate asd` through (Copilot #1).
 	consume := len(node.Keys)
 	if consume > remaining {
 		consume = remaining
@@ -163,6 +169,9 @@ func descendInstanceLevels(node *Node, containerSchema *schemaNode, remaining in
 	newPath := append(append([]string(nil), path...), node.Keys[:consume]...)
 	stillMissing := remaining - consume
 	if stillMissing > 0 {
+		// Need more name tokens than this node supplied: keep peeling from
+		// its children. (A node whose Keys are exactly the names, value-less,
+		// continues nesting.)
 		for _, c := range node.Children {
 			if err := descendInstanceLevels(c, containerSchema, stillMissing, newPath, cfg); err != nil {
 				return err
@@ -170,10 +179,14 @@ func descendInstanceLevels(node *Node, containerSchema *schemaNode, remaining in
 		}
 		return nil
 	}
-	// All instance-name args consumed. Any leftover Keys tokens beyond the
-	// names are leaf content for this instance; but in practice the name is
-	// the whole Keys here. Validate the instance's child leaves at the
-	// container schema level.
+	// All instance-name args consumed. Leftover Keys tokens beyond the names
+	// form a leaf packed onto the instance node (hierarchical shorthand);
+	// validate it at the container schema level alongside any block children.
+	leftover := node.Keys[consume:]
+	if len(leftover) > 0 {
+		leaf := &Node{Keys: leftover, IsLeaf: node.IsLeaf, Children: node.Children}
+		return walkSchemaChildren([]*Node{leaf}, containerSchema, newPath, cfg)
+	}
 	return walkSchemaChildren(node.Children, containerSchema, newPath, cfg)
 }
 

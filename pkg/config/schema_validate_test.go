@@ -441,6 +441,36 @@ func TestSchemaValidate_OutsideSchedulersIgnored(t *testing.T) {
 	}
 }
 
+// TestSchemaValidate_HierarchicalShorthand_RejectsGarbage reproduces the
+// Copilot #1 finding: the parser folds `schedulers { be transmit-rate asd; }`
+// into a single node Keys=["be","transmit-rate","asd"] (instance name + leaf
+// + value packed together). The walker must consume the instance name AND
+// still validate the leftover leaf, or garbage slips through commit-check.
+func TestSchemaValidate_HierarchicalShorthand_RejectsGarbage(t *testing.T) {
+	for _, in := range []string{
+		`class-of-service { schedulers { be transmit-rate asd; } }`,
+		`class-of-service { schedulers { be priority foo; } }`,
+		`class-of-service { schedulers { be transmit-rate 1g typo; } }`,
+	} {
+		if err := schemaCheck(t, in); err == nil {
+			t.Fatalf("expected rejection for shorthand %q, got nil", in)
+		}
+	}
+}
+
+func TestSchemaValidate_HierarchicalShorthand_AcceptsValid(t *testing.T) {
+	for _, in := range []string{
+		`class-of-service { schedulers { be transmit-rate 1g; } }`,
+		`class-of-service { schedulers { be transmit-rate 1g { exact; } } }`,
+		`class-of-service { schedulers { be buffer-size 16m; } }`,
+		`class-of-service { schedulers { be priority strict-high; } }`,
+	} {
+		if err := schemaCheck(t, in); err != nil {
+			t.Fatalf("expected shorthand %q to pass, got %v", in, err)
+		}
+	}
+}
+
 // TestSetPathGrouping_Golden pins the flat-set grouping produced by
 // SetPath over setSchema. #1319 PR 1 adds typed-leaf FIELDS to schemaNode
 // (valueType/valueDesc/valueExamples/validator) but MUST NOT add or alter
@@ -451,12 +481,21 @@ func TestSchemaValidate_OutsideSchedulersIgnored(t *testing.T) {
 // <hi>` value-tail/range shape) and asserts the round-trip is byte-stable.
 // If a future edit adds children to a typed leaf, the schedulers grouping
 // changes here and this test fires.
+//
+// Codex minor #2: to actually exercise the `children == nil` REPLACE path
+// (ast_edit.go:196 — a single-value leaf with no children is replaced, not
+// appended), `priority` is set TWICE with different values. With
+// children==nil the second set replaces the first, so only the latter value
+// survives in the golden. If `priority` ever gained a children map, SetPath
+// would treat it as a named container and APPEND a duplicate sibling instead
+// of replacing — producing two `priority` lines and failing this golden.
 func TestSetPathGrouping_Golden(t *testing.T) {
 	tree := &config.ConfigTree{}
 	cmds := []string{
 		"set class-of-service schedulers be transmit-rate 1g",
 		"set class-of-service schedulers be transmit-rate exact",
 		"set class-of-service schedulers be priority strict-high",
+		"set class-of-service schedulers be priority medium-high",
 		"set class-of-service schedulers be buffer-size 16m",
 		"set firewall family inet filter f1 term t1 from destination-port 20000 to 20003",
 		"set security policies from-zone trust to-zone untrust policy p1 match source-address any",
@@ -473,7 +512,7 @@ func TestSetPathGrouping_Golden(t *testing.T) {
 	}
 	const golden = `set class-of-service schedulers be transmit-rate 1g
 set class-of-service schedulers be transmit-rate exact
-set class-of-service schedulers be priority strict-high
+set class-of-service schedulers be priority medium-high
 set class-of-service schedulers be buffer-size 16m
 set firewall family inet filter f1 term t1 from destination-port 20000 to 20003
 set security policies from-zone trust to-zone untrust policy p1 match source-address any
