@@ -960,9 +960,10 @@ pub(super) fn aggregate_cos_statuses_across_workers(
             // which MUST be captured). Using the worker's per-binding MIN
             // (NOT iface.waterfill_epochs, the cross-binding SUM) is the
             // fix for the multi-binding masking the code review flagged.
-            // The accumulator stays at u64::MAX (entry default is 0, so
-            // seed it) until the first candidate; converted to 0 after
-            // the loop.
+            // Interfaces with at least one candidate are tracked in
+            // `min_epochs_seeded`; interfaces with NO candidate are set to
+            // u64::MAX after the loop (NOT 0) so an idle interface stays
+            // distinguishable from a real 0-epoch lock-in.
             if iface.waterfill_min_epochs_per_worker != u64::MAX {
                 if min_epochs_seeded.insert(iface.ifindex) {
                     entry.waterfill_min_epochs_per_worker =

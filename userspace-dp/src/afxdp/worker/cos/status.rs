@@ -103,13 +103,12 @@ fn finalize_interface_vec(
         // coordinator can distinguish "this worker has no lock-in
         // candidate" (MAX, skip in the cross-worker MIN) from "this
         // worker has a backlogged binding that completed 0 epochs" (0,
-        // the strongest lock-in signal). The coordinator converts MAX to
-        // the operator-facing 0 sentinel after the cross-worker MIN; a
-        // standalone per-worker snapshot read through this path that
-        // never reaches the coordinator would show MAX, which the CLI
-        // also treats as "no candidate". We deliberately do NOT collapse
-        // MAX->0 here to avoid the sentinel collision the code review
-        // flagged.
+        // the strongest lock-in signal). The coordinator PRESERVES MAX on
+        // its aggregated output too (an interface with no active-backlog
+        // candidate stays MAX), and Prometheus suppresses the MAX gauge
+        // while the CLI renders it "none" — so an emitted 0 is always a
+        // real lock-in. We deliberately do NOT collapse MAX->0 here to
+        // avoid the sentinel collision the code review flagged.
         if let Some(queue_map) = queue_maps.remove(&ifindex) {
             iface.queues = queue_map.into_values().collect();
             iface.nonempty_queues = iface

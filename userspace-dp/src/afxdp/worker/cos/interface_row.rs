@@ -43,8 +43,10 @@ pub(super) fn accumulate_interface_root(
     entry.burst_bytes = entry.burst_bytes.max(root.burst_bytes);
     // #1628: seed the per-binding MIN sentinel on the FIRST binding folded
     // for this interface (entry came from or_default() = 0). u64::MAX means
-    // "no active-backlog binding seen yet"; converted to 0 in
-    // finalize_interface_vec. Done before the worker_instances bump so the
+    // "no active-backlog binding seen yet" and is PRESERVED on the wire
+    // (not converted to 0) so the coordinator and Prometheus can tell an
+    // idle interface from a real 0-epoch lock-in. Done before the
+    // worker_instances bump so the
     // `== 0` test reliably fires exactly once per interface entry.
     if entry.worker_instances == 0 {
         entry.waterfill_min_epochs_per_worker = u64::MAX;
