@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Unit tests for scripts/mtr_report_check.py.
 
-Reproduce the #1303 false-fail (external IPv6 final hop silent on a
-healthy dataplane) and the false-pass cases both plan reviewers flagged
-((waiting for reply), %-truncation, integer loss, unparseable loss).
+Pin the classifier's handling of the #1303 silent-external-final-hop
+shape (IPv6 warns, does not fail) and the false-pass cases both plan
+reviewers flagged ((waiting for reply), %-truncation, integer loss,
+unparseable loss). The original #1303 false-fail was a shell-level
+`set -e` crash before the classifier ran (fixed by the `2>&1 || true`
+capture in run_mtr_report), not a classifier defect; these tests cover
+the classifier's target behavior, not that shell-level repro.
 """
 
 from __future__ import annotations
