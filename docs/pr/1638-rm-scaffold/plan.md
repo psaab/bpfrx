@@ -1,9 +1,10 @@
 # #1638 — remove dead parallel-prefix scaffolding (BookEntry + PolicyRule)
 
-**Status:** v2 — PLAN-READY (AGY r1 PLAN-READY; Claude SMR r1 PLAN-READY;
-Codex r1 PLAN-NEEDS-MINOR, both minors addressed in v2: §3.2 read-site wording
-corrected; §4.4 preserves `test_policy_rule_v3_any4_any6_tokens` live
-match-any coverage)
+**Status:** IMPLEMENTED — PR #1676. Plan v2 PLAN-READY (AGY + Claude SMR;
+Codex PLAN-NEEDS-MINOR minors addressed). Code review: AGY MERGE-READY,
+Copilot clean, Claude SMR MERGE-READY, Codex infra-blocked x2. AWAITING-PARENT-
+MERGE posted (cluster-needed: NO — pure dead-field removal, no admitted-path /
+wire touch).
 
 ## 1. Issue framing
 
