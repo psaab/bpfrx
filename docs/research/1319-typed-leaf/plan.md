@@ -1,6 +1,10 @@
 # #1319 — Typed leaf-value schema: research plan (post Phase 1/2)
 
-**Status:** PLAN DRAFT v1 (2026-05-29) — research only, no code.
+**Status:** PLAN v2 (2026-05-29) — research only, no code. v2 folds in
+the round-1 reviewer findings: Codex PLAN-NEEDS-MAJOR (5) + Claude SMR
+PLAN-NEEDS-MAJOR (D1-D5) + AGY PLAN-READY. Five corrections below
+(import-cycle, fields-only/no-children, drop `temporal`, walker contract,
+frontend-boundary tests). Option A stands.
 **Branch:** `research/1319-typed-leaf`
 **Scope:** decide the architecture for continuing the typed-leaf rollout
 after PR #1320 (Phase 1 + schedulers Phase 2, MERGED) and the
@@ -189,38 +193,98 @@ today (§2.1) — Option A makes the doctrine *accurate* by stating that
 `setSchema` is the config-grammar SSOT and cmdtree is the
 operational-tree SSOT, with shared `ValueType`/validator types.
 
-Type definitions (`ValueType`, `LeafValidator`) already live in/near
-`pkg/config`; cmdtree aliases them. Option A keeps the enum where the
-validators are and lets cmdtree keep aliasing for its operational leaves.
+**Type ownership (corrected v2 — Codex#1/SMR-D1).** `ValueType` currently
+lives in `pkg/cmdtree/tree.go:35` and `pkg/cmdtree` already imports
+`pkg/config` (`tree.go:19`). `pkg/config` therefore CANNOT reference
+`cmdtree.ValueType` — that is an import cycle. Only `LeafValidator` lives
+in `pkg/config` today. So Option A's first PR-1 step is a **mechanical
+move**: relocate `ValueType` + its constants + `Placeholder()` from
+`pkg/cmdtree/tree.go` into `pkg/config` (next to the validators), and add
+`type ValueType = config.ValueType` (+ const re-exports) aliases in
+`cmdtree` so its operational-tree leaves are unchanged. After the move,
+`schemaNode` can hold a `valueType config.ValueType` field with no cycle.
 
 ## 6. Proposed plan (Option A), staged
 
 ### PR 1 — Generic walker + completion wiring + reconcile (no new subsystems)
 
-1. Add typed-leaf fields to `schemaNode` (`pkg/config/ast.go`):
-   `valueType ValueType`, `valueDesc string`, `valueExamples []string`,
-   `validator LeafValidator`. Zero values = today's behavior.
-2. Populate the **schedulers** leaves in `setSchema` (the 3 already
-   typed in cmdtree) with these fields — single source for CoS now.
+0. **Move `ValueType` to `pkg/config`** (Codex#1/SMR-D1): relocate the
+   enum + constants + `Placeholder()` from `pkg/cmdtree/tree.go` into
+   `pkg/config`; re-export via `type ValueType = config.ValueType` aliases
+   in `cmdtree`. No behavior change; unblocks the cycle.
+1. **Add typed-leaf fields to `schemaNode`** (`pkg/config/ast.go`):
+   `valueType config.ValueType`, `valueDesc string`,
+   `valueExamples []string`, `validator LeafValidator`. Zero values =
+   today's behavior. **FIELDS ONLY** — PR 1 MUST NOT add or alter any
+   `children` map on a `schemaNode` (Codex#3/SMR-D2). SetPath's
+   replace-vs-container decision keys on `children==nil`
+   (`ast_edit.go:196`); flipping a `children:nil` leaf to a container is
+   a grouping regression. A SetPath grouping golden test (§9) pins this.
+2. **Populate the three schedulers leaves** in `setSchema` with the new
+   fields only: `transmit-rate` → `ValueRate`/`config.ValidateRate`
+   (its `exact` child already exists at `ast.go:1166` — unchanged),
+   `priority` → `ValueEnumOf`/`config.ValidateEnum([...])`,
+   `buffer-size` → `ValueByteSizeOrPercent`/`config.ValidateByteSizeOrPercent`.
+   **Do NOT add `buffer-size temporal`** (Codex#2/SMR-D3): it is in the
+   cmdtree overlay (`tree.go:1053`) but the compiler never consumes it
+   (`compiler_class_of_service.go` buffer-size case reads only the value).
+   Carrying it into `setSchema` would (a) add a `children` map — banned
+   by step 1 — and (b) violate the compiled-leaf-only invariant. Modifier
+   compiled-status table for schedulers: `exact` = compiled (keep);
+   `temporal` = NOT compiled (drop); `surplus-sharing`,
+   `equal-flow-enforcement` = presence-only, compiled (no value to type).
 3. `CompleteSetPathWithValues`: at the value slot, when the leaf has a
    non-`ValueAny` `valueType`, surface `valueDesc` + `valueExamples` +
    `placeholder` (this is the **symptom-1 fix that actually reaches the
-   CLI**).
-4. Replace `walkSchedulers`/`SchemaValidate` with a **generic recursive
-   `validateAST(astNode, schemaNode, path)`** that descends `setSchema`,
-   handles all AST shapes (flat-set `Keys=[...]` vs hierarchical
-   children), and invokes `validator` at typed leaves. Remove the
-   `class-of-service`-only early-return — fan out across all top-level
-   subtrees (a subtree with no typed leaves is a no-op walk).
-5. Move `SchemaValidate` to `pkg/config` (it now walks `setSchema`, owned
-   by `pkg/config`); `pkg/configstore` calls `config.SchemaValidate`.
-   Keep a thin `cmdtree.SchemaValidate` shim or update the one caller.
-6. **Parity tests:** existing `pkg/cmdtree/schema_validate_test.go` +
-   `pkg/config/schema_validate_test.go` cases must pass against the new
-   walker. Add a CLI-path test that `set ... transmit-rate ?` returns
-   `<rate>` + examples through `CompleteSetPathWithValues` (the gap in
-   §2.2). Retire/migrate `cmdtree.ConfigClassOfServiceSchedulers` (note
-   it in README so the doctrine is corrected).
+   CLI**). Coexists with the existing `valueHint`/`provider` path
+   (`ast.go:1789-1800`) — typed-value examples are additive to dynamic
+   provider results.
+4. **Generic recursive walker** replacing `walkSchedulers`. Contract
+   table (Codex#4/SMR-D4) — the walker descends `setSchema` against the
+   AST and must port every special case currently encoded in
+   `walkSchedulers` + `CompleteSetPathWithValues` + `SetPath`:
+
+   | schema feature | AST match rule |
+   |---|---|
+   | `args:0` container | match `Keys[0]==keyword`; recurse into `Children` |
+   | `args:N` named instance | consume keyword + N tokens from `Keys` (flat) or 1 key + N from `Keys[1:]` / children (hier); recurse |
+   | `compoundKey` | consume the following key as part of this node's key, then resolve the sub-child |
+   | `midKeyword`/`midKeywordAt` | the fixed keyword (`to-zone`) sits at arg position `midKeywordAt`; skip it when extracting values |
+   | `multi` | leaf may repeat; validate each occurrence; do not treat as replace |
+   | `wildcard` | instance-name slot; descend into wildcard schema |
+   | typed leaf (`valueType!=ValueAny`) | first non-modifier token is THE value → run `validator`; remaining tokens must match child keywords (e.g. `exact`) |
+   | modifier-only line | `transmit-rate exact` with no rate still fails (the existing `schedulerHasTypedTransmitRate` gate) |
+   | `groups { ... }` | already handled — walker runs on the apply-groups-EXPANDED clone (`store.go:182`), so group bodies are inlined before the walk |
+
+   The walker handles BOTH AST shapes (flat-set `Keys=[a,b,c]` and
+   hierarchical `Keys=[a]` + children). It is opt-in: a schema node with
+   no `validator` and no typed children is a no-op descent.
+5. **Remove the `class-of-service`-only early-return**
+   (`schema_validate.go:43-46`): the new walker fans out from the
+   `setSchema` root across ALL top-level subtrees. Subtrees with no typed
+   leaves cost one shallow descent (acceptable; commit-check is not hot).
+   Move `SchemaValidate` into `pkg/config` (it now walks the
+   `pkg/config`-owned `setSchema`); update the `pkg/configstore` caller
+   (`store.go:182,194`) to `config.SchemaValidate`. Drop the thin cmdtree
+   shim or leave a deprecated forwarder — decide in PR 1.
+6. **Parity + boundary tests** (Codex#5/SMR-D5):
+   - existing `pkg/config/schema_validate_test.go` +
+     `pkg/cmdtree/schema_validate_test.go` cases pass against the new
+     walker (migrate the cmdtree ones into `pkg/config` as the validator
+     moves);
+   - **frontend-boundary** completion tests — NOT just the
+     `CompleteSetPathWithValues` helper: assert
+     `cli.completeConfigWithDesc(["set","class-of-service","schedulers",
+     "x","transmit-rate"], "")` AND the gRPC `completeConfigPairs`
+     equivalent return `<rate>` + examples, including the trailing-space
+     case (`...transmit-rate ` → value slot). This is the exact gap §2.2
+     calls out; testing only the helper would repeat the same mistake.
+   - **SetPath grouping golden test** asserting flat-set grouping is
+     byte-identical before/after PR 1 (guards step 1's fields-only rule).
+   - Retire `cmdtree.ConfigClassOfServiceSchedulers` outright (AGY + SMR
+     agree — dead code on a non-production path is a false-coverage trap);
+     update `pkg/cmdtree/README.md` + CLAUDE.md to state the corrected
+     two-SSOT split.
 7. Docs: `pkg/cmdtree/README.md` + `pkg/config/README.md` +
    `docs/config-schema.md` (new) state the corrected SSOT split and how
    to add a typed leaf (one `setSchema` edit).
@@ -273,10 +337,19 @@ subsystem's doc. No walker/infra changes after PR 1.
 ## 8. Risks
 
 - **Parser dependency on `setSchema`.** `setSchema` drives flat-set token
-  grouping in SetPath. Adding *fields* to `schemaNode` is additive and
-  must not change grouping; PR 1 must assert SetPath grouping is
-  byte-identical (run full parser test suite). This is the main regression
-  surface and why Option A edits fields rather than restructuring nodes.
+  grouping in SetPath, and the replace-vs-container decision keys on
+  `children==nil` (`ast_edit.go:196`). Adding *fields* to `schemaNode` is
+  additive and safe (AGY verified SetPath reads only
+  `args`/`children`/`compoundKey`/`multi`); adding/altering `children` is
+  NOT (Codex#3). PR 1 is fields-only and asserts byte-identical SetPath
+  grouping via a golden test. This is the main regression surface and why
+  Option A edits fields rather than restructuring nodes.
+- **Import cycle.** `ValueType` must move from `cmdtree` to `config`
+  first (Codex#1); skipping this breaks the build. PR-1 step 0.
+- **Compiled-leaf-only drift.** The cmdtree overlay already carries one
+  uncompiled modifier (`buffer-size temporal`, Codex#2). The migration
+  must drop it, not copy it. Each per-subsystem PR re-checks every leaf
+  against the compiler before typing it.
 - **gRPC completer divergence.** Confirm the gRPC `set` completer reaches
   the same value-slot code; add a test.
 - **Doctrine churn.** CLAUDE.md says cmdtree is THE SSOT; Option A
