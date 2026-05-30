@@ -1005,6 +1005,57 @@ set class-of-service interfaces <iface> unit <u>
   priority-low-min-share <bps>
 ```
 
+### Aggregate push ceiling `C_phys` is the per-class denominator (#1578/#1614 §3.A)
+
+Let `C_phys` be the platform's push-direction RX→forward→TX delivery
+ceiling — a **hardware** property (CPU, memory bandwidth, PCIe, worker
+count), NOT a CoS scheduler limit. On the standard `loss:` reference
+cluster (6 mlx5 VF RX queues → 6 workers) `C_phys ≈ 22-24 G`, measured
+consistently across 3-large (22.6 G), 6-large (21.6 G), full-11
+(24.96 G) push and the 22.72 G reverse sanity (#1578, #1614 §2). It is
+**not** a universal product constant; a different platform (different
+core count, NIC, or PCIe layout) has a different `C_phys`.
+
+The denominator every *backlogged* class divides is `C_phys`, NOT the
+sum of configured `transmit-rate`. On the `cos-iperf-config.set`
+fixture the configured exact-shape sum is **109 G — roughly 4.5×
+`C_phys`** — so strict-exact is not simultaneously deliverable. The A4
+commit warning (#1618) fires on exactly this `sum_exact > shaping_rate`
+condition. `park_root = 0` everywhere in the #1614 capture, so the 25 G
+root token bucket never throttles — the limiter is upstream of the root
+token gate, in the forwarding/TX path.
+
+When N classes are simultaneously backlogged, `C_phys` divides among
+them, so per-class %-of-shape **drops as N rises**. Measured
+competitor-count sweep (#1614 §2.4): 3g reaches 94% solo, 69% with one
+competitor, 54% with four — the deficit is set by HOW MANY classes are
+backlogged, not by 3g's owner worker. 18g pushed 14.25 G from a single
+owner worker (`park_root=0`), so the ceiling is an aggregate property,
+not a per-worker funnel. Under full-11 simul the small classes
+therefore land far below their solo rates (#1614 §2.1: 100m=86%,
+1g=63%, 3g=43%, 6g=41%) — this is ceiling-division physics, not a
+scheduler defect.
+
+**Reading divided-ceiling as starvation is a misread.** A guaranteed
+class `i` (guarantee `G_i = R_i × guarantee-rate fraction`) is
+**starved** iff ALL THREE hold:
+
+1. `actual_i < G_i` — the guarantee is unmet; AND
+2. `Σ actual_j > 0` over the *unguaranteed* classes — they ARE getting
+   bandwidth while `i` is short; AND
+3. `Σ G_k < C_phys` over the *guaranteed* classes — the guaranteed
+   demand fits under the ceiling, so there is recoverable headroom.
+
+If `Σ G_k ≥ C_phys`, or all unguaranteed classes sit at 0 G while
+`C_phys` is saturated, the shortfall is divided-ceiling physics, NOT
+scheduler starvation. `C_phys` is not directly emitted at smoke time,
+but condition 3 is conservatively checkable as `Σ G_k < total_recv`
+(the achieved aggregate is a lower bound on `C_phys` under saturation).
+The #1614 §3.B 3g/6g case satisfies all three (small4+24g: `Σ G_k`
+fits under the 18.2 G achieved, 24g getting 12.6 G, 3g/6g at 54/51%) —
+that is the genuine defect SIGNAL, tracked separately in **#1692**
+(instrument-first; mechanism unresolved, no fix chosen here).
+
 ### Acceptance gates under guarantee-rate mode
 
 In addition to the structural per-flow CoV gate above
@@ -1121,7 +1172,11 @@ The Phase 0 sanity check that #1614 v5 was built upon ran on
 2026-05-27 against the loss userspace cluster: simul-load reverse
 direction (all 11 classes parallel) reached 22.72 G aggregate
 with generator CPU 20-58% idle, confirming the firewall (not the
-generator) is the bottleneck the work targets.
+generator) is the bottleneck the work targets. This 22.72 G reverse
+number is the reverse-direction counterpart of the push-direction
+`C_phys` ≈ 22-24 G documented in "Aggregate push ceiling `C_phys` is
+the per-class denominator" above — both directions hit the same
+hardware delivery ceiling on this cluster, NOT a CoS scheduler limit.
 
 ## Open questions for future contract iteration
 
