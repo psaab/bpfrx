@@ -1,6 +1,6 @@
 # #1628 — Empirical per-class waterfill trace counters for the CoS scheduler
 
-**Status:** PLAN-READY v5 — Codex `task-mpruu0t3-syur98` r4 PLAN-READY (no
+**Status:** IMPLEMENTED — 4-of-4 clean code review (Codex+AGY+Copilot+Claude-SMR MERGE-READY) at HEAD ec8790b43; AWAITING-PARENT-SMOKE. See reviewer-ids.md for the full plan(4)+code(4) review trail.
 findings); AGY `adversarial-review-mpruu5b6-4oryi3` r4 PLAN-NEEDS-MINOR (one
 new compile-borrow defect at the eligible-visit sites). v5 applies the AGY fix:
 hoist the `kind` match next to `head_len` so `head`'s borrow ends before any

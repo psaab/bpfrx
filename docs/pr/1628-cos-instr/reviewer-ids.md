@@ -101,3 +101,15 @@ Implemented AGY's structural fix: coordinator preserves u64::MAX for unseeded if
 | AGY | adversarial-review-mprwix7x-06y5gh | (pending) | code r3 |
 | Copilot | (re-requested) | (pending) | code r3 |
 | Claude SMR | (in-conversation) | (pending) | code r3 |
+
+### code r3 verdicts (HEAD e24cf5d0c)
+- Codex task-mprwisuu-49xtfy: MERGE-NEEDS-MINOR — runtime/Prometheus/CLI/tests confirmed correct; only 3 stale live-code comments still said "MAX->0".
+- AGY adversarial-review-mprwix7x-06y5gh: MERGE-READY — full end-to-end verification, no findings.
+
+### code r4 (final, HEAD ec8790b43) — comment-only fix
+- Codex task-mprwof25-wngxrt: MERGE-READY — three comments corrected; searched live code, no remaining old-contract phrasing.
+- AGY: MERGE-READY carried (r3; only delta since was the 3 comment corrections).
+- Copilot: COMMENTED, 0 inline findings (re-reviewed 2026-05-30 05:01 at latest head).
+- Claude SMR: MERGE-READY — verified borrow correctness, counter sites, sentinel handling, wire parity against whole function bodies.
+
+## FINAL: 4-of-4 clean at HEAD ec8790b43. AWAITING-PARENT-SMOKE-1628.
