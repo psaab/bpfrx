@@ -10,8 +10,8 @@ use crate::afxdp::cos::queue_ops::cos_queue_push_back;
 use crate::afxdp::cos::tx_completion::COS_TIMER_WHEEL_TICK_NS;
 use crate::afxdp::tx::test_support::*;
 use crate::afxdp::types::{
-    SharedCoSExactBacklog, SharedCoSQueueLease, SharedCoSRootLease, V8RateMode,
-    WorkerCoSInterfaceFastPath,
+    CoSQueueWaterfillCounters, SharedCoSExactBacklog, SharedCoSQueueLease, SharedCoSRootLease,
+    V8RateMode, WorkerCoSInterfaceFastPath,
 };
 use crate::afxdp::worker::BindingWorker;
 use crate::afxdp::{PROTO_TCP, UMEM_FRAME_SHIFT};
@@ -2077,6 +2077,7 @@ fn restore_cos_local_items_marks_queue_runnable_after_retry() {
         },
         telemetry: crate::afxdp::types::CoSQueueTelemetry {
             drop_counters: CoSQueueDropCounters::default(),
+            waterfill_counters: CoSQueueWaterfillCounters::default(),
             owner_profile: CoSQueueOwnerProfile::new(),
         },
         queue_lease_v8: None,
@@ -2143,6 +2144,7 @@ fn restore_cos_prepared_items_marks_queue_runnable_after_retry() {
         },
         telemetry: crate::afxdp::types::CoSQueueTelemetry {
             drop_counters: CoSQueueDropCounters::default(),
+            waterfill_counters: CoSQueueWaterfillCounters::default(),
             owner_profile: CoSQueueOwnerProfile::new(),
         },
         queue_lease_v8: None,
@@ -2364,4 +2366,141 @@ fn waterfill_guarantee_rate_fraction_consulted_by_selector() {
         r_hi >= r_lo.saturating_mul(2),
         "fraction ratio not reflected in pass1_remaining: lo={r_lo} hi={r_hi}"
     );
+}
+
+// #1628: per-class waterfill trace-counter tests. These pin that the
+// counters increment at the right SITES (not that any one counter is a
+// unique fingerprint — that interpretation requires pairing with
+// queued_bytes + *_starvation_parks per the struct docs).
+
+/// Build a GuaranteeRate root with the ascending-by-rate vec populated
+/// and every exact queue given abundant per-queue tokens so the only
+/// gate is the Phase-1 byte budget.
+fn waterfill_guarantee_rate_root(frac: f64) -> CoSInterfaceRuntime {
+    let mut root = test_mixed_class_root_with_primed_queues();
+    root.oversubscription_policy = CoSOversubscriptionPolicy::GuaranteeRate;
+    root.oversubscription_guarantee_fraction = frac;
+    root.exact_queues_by_rate_ascending = (0..root.queues.len())
+        .filter(|&idx| root.queues[idx].config.exact && root.queues[idx].config.guarantee_enabled)
+        .collect();
+    root.exact_queues_by_rate_ascending
+        .sort_by_key(|&idx| root.queues[idx].config.transmit_rate_bytes);
+    for queue in &mut root.queues {
+        if queue.config.exact {
+            queue.hot.tokens = 128 * 1024;
+        }
+    }
+    root
+}
+
+#[test]
+fn waterfill_counters_phase1_honor_increments_admission_and_visit() {
+    // fraction=1.0: the full quantum_sum budget easily honors the first
+    // (smallest) exact queue in Phase 1.
+    let mut root = waterfill_guarantee_rate_root(1.0);
+    let mut tel = CoSQueueLeaseAcquireTelemetry::default();
+    let s = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
+        .expect("phase-1 selection");
+    let q = &root.queues[s.queue_idx];
+    assert_eq!(
+        q.telemetry.waterfill_counters.phase1_admissions, 1,
+        "Phase-1 honor must bump phase1_admissions on the chosen queue"
+    );
+    assert_eq!(
+        q.telemetry.waterfill_counters.phase2_admissions, 0,
+        "a Phase-1 honor must NOT bump phase2_admissions"
+    );
+    assert!(
+        q.telemetry.waterfill_counters.eligible_visits >= 1,
+        "the honored queue must have been counted as an eligible visit"
+    );
+    // The epoch refill ran exactly once on this first call.
+    assert_eq!(
+        root.waterfill_epochs, 1,
+        "first selection lazily refills the Phase-1 budget = one epoch"
+    );
+    // Budget was sufficient: no Phase-1 break.
+    assert_eq!(
+        root.waterfill_phase1_budget_breaks, 0,
+        "fraction=1.0 must not exhaust the Phase-1 budget on the first queue"
+    );
+}
+
+#[test]
+fn waterfill_counters_proportional_mode_stays_zero() {
+    // Counter-factual: on the Proportional (legacy RR) path, NONE of the
+    // waterfill counters may move. A wrong write site (outside the
+    // waterfill fn) would light these up here.
+    let mut root = test_mixed_class_root_with_primed_queues();
+    for queue in &mut root.queues {
+        if queue.config.exact {
+            queue.hot.tokens = 128 * 1024;
+        }
+    }
+    assert!(matches!(
+        root.oversubscription_policy,
+        CoSOversubscriptionPolicy::Proportional
+    ));
+    let mut tel = CoSQueueLeaseAcquireTelemetry::default();
+    let _ = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
+        .expect("legacy RR selection");
+    assert_eq!(root.waterfill_epochs, 0);
+    assert_eq!(root.waterfill_phase1_budget_breaks, 0);
+    for q in &root.queues {
+        assert_eq!(q.telemetry.waterfill_counters.phase1_admissions, 0);
+        assert_eq!(q.telemetry.waterfill_counters.phase2_admissions, 0);
+        assert_eq!(q.telemetry.waterfill_counters.eligible_visits, 0);
+    }
+}
+
+#[test]
+fn waterfill_counters_budget_break_into_phase2() {
+    // A tiny fraction makes the Phase-1 budget too small to honor even
+    // the first ascending queue's rate-scaled cost, forcing the break
+    // into Phase 2 — which then admits a queue. Assert the per-interface
+    // budget-break counter fires AND a Phase-2 admission is recorded.
+    //
+    // fraction is clamped 0.0..=1.0 at config-apply; here we set it
+    // directly. With frac so small that floor(quantum_sum * frac) <
+    // any single queue's quantum, the first ascending queue's
+    // phase1_cost exceeds the remaining budget at mod.rs:906.
+    let mut root = waterfill_guarantee_rate_root(0.0001);
+    let mut tel = CoSQueueLeaseAcquireTelemetry::default();
+    let s = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
+        .expect("phase-2 selection after budget break");
+    assert_eq!(
+        root.waterfill_phase1_budget_breaks, 1,
+        "an exhausted Phase-1 budget must bump the per-interface break counter"
+    );
+    let q = &root.queues[s.queue_idx];
+    assert_eq!(
+        q.telemetry.waterfill_counters.phase2_admissions, 1,
+        "the Phase-2 walk must bump phase2_admissions on the chosen queue"
+    );
+    assert_eq!(
+        q.telemetry.waterfill_counters.phase1_admissions, 0,
+        "a Phase-2 admission must NOT bump phase1_admissions"
+    );
+    // Epoch refilled once (budget was 0 on entry).
+    assert_eq!(root.waterfill_epochs, 1);
+}
+
+#[test]
+fn waterfill_counters_phase1_admit_flake_5x() {
+    // Stability pin: the Phase-1 honor counters are deterministic across
+    // repeated fresh roots (the selector has no RNG on this path).
+    for _ in 0..5 {
+        let mut root = waterfill_guarantee_rate_root(1.0);
+        let mut tel = CoSQueueLeaseAcquireTelemetry::default();
+        let s = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
+            .expect("phase-1 selection");
+        assert_eq!(
+            root.queues[s.queue_idx]
+                .telemetry
+                .waterfill_counters
+                .phase1_admissions,
+            1
+        );
+        assert_eq!(root.waterfill_epochs, 1);
+    }
 }

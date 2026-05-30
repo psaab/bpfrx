@@ -11,8 +11,8 @@ use crate::afxdp::cos::queue_service::{
 use crate::afxdp::cos::token_bucket::COS_MIN_BURST_BYTES;
 use crate::afxdp::tx::test_support::*;
 use crate::afxdp::types::{
-    COS_FLOW_FAIR_BUCKETS, CoSQueueDropCounters, CoSQueueOwnerProfile, FlowRrRing,
-    SharedCoSExactBacklog, SharedCoSQueueLease,
+    COS_FLOW_FAIR_BUCKETS, CoSQueueDropCounters, CoSQueueOwnerProfile, CoSQueueWaterfillCounters,
+    FlowRrRing, SharedCoSExactBacklog, SharedCoSQueueLease,
 };
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -552,6 +552,7 @@ fn normalize_cos_queue_state_repairs_nonempty_unparked_queue_to_runnable() {
         },
         telemetry: crate::afxdp::types::CoSQueueTelemetry {
             drop_counters: CoSQueueDropCounters::default(),
+            waterfill_counters: CoSQueueWaterfillCounters::default(),
             owner_profile: CoSQueueOwnerProfile::new(),
         },
         queue_lease_v8: None,

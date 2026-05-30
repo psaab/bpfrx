@@ -160,6 +160,25 @@ pub(crate) struct CoSInterfaceStatus {
     pub timer_level0_sleepers: usize,
     #[serde(rename = "timer_level1_sleepers", default)]
     pub timer_level1_sleepers: usize,
+    // #1628: per-interface waterfill-selector trace counters. `epochs` and
+    // `phase1_budget_breaks` are SUMMED across worker instances (cluster
+    // event counters, like timer_level*_sleepers).
+    // `min_epochs_per_worker` is the coordinator's MIN of the per-worker
+    // per-binding MIN over bindings WITH active exact-guarantee backlog
+    // (so a healthy binding/worker cannot mask a sibling locked in
+    // Phase 2). A LOW value relative to `epochs` flags a single stalled
+    // selector; `0` is a HARD lock-in (a backlogged binding that
+    // completed zero epochs). `u64::MAX` is the "no active-backlog
+    // candidate" sentinel (idle interface) and is preserved through
+    // coordinator aggregation so the two cases never collide — Prometheus
+    // suppresses the MAX gauge and the CLI renders it as "none", which
+    // keeps `0` unambiguously meaning hard lock-in (alertable).
+    #[serde(rename = "waterfill_epochs", default)]
+    pub waterfill_epochs: u64,
+    #[serde(rename = "waterfill_phase1_budget_breaks", default)]
+    pub waterfill_phase1_budget_breaks: u64,
+    #[serde(rename = "waterfill_min_epochs_per_worker", default)]
+    pub waterfill_min_epochs_per_worker: u64,
     #[serde(default)]
     pub queues: Vec<CoSQueueStatus>,
 }
@@ -322,6 +341,21 @@ pub(crate) struct CoSQueueStatus {
     /// per-queue write via an `apply_*` early-return / queue miss.
     #[serde(rename = "drain_sent_bytes_shaped_unconditional", default)]
     pub drain_sent_bytes_shaped_unconditional: u64,
+    // #1628: per-class waterfill-selector trace counters, aggregated
+    // across worker instances for this (ifindex, queue_id). Zero on the
+    // Proportional (legacy RR) selector path — non-zero means this
+    // interface is in `guarantee-rate` mode. Diagnostic only; the
+    // scheduler reads none of these. JSON tags MUST match the Go mirror
+    // (pkg/dataplane/userspace/protocol.go) byte-for-byte. See
+    // `types::CoSQueueWaterfillCounters` for the INTERPRETATION contract
+    // (these are evidence to combine with queued_bytes + *_starvation_parks,
+    // not standalone fingerprints).
+    #[serde(rename = "waterfill_phase1_admissions", default)]
+    pub waterfill_phase1_admissions: u64,
+    #[serde(rename = "waterfill_phase2_admissions", default)]
+    pub waterfill_phase2_admissions: u64,
+    #[serde(rename = "waterfill_eligible_visits", default)]
+    pub waterfill_eligible_visits: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]

@@ -917,6 +917,12 @@ pub(super) fn aggregate_cos_statuses_across_workers(
 ) -> Vec<crate::protocol::CoSInterfaceStatus> {
     let mut interfaces = BTreeMap::<i32, crate::protocol::CoSInterfaceStatus>::new();
     let mut queue_maps = BTreeMap::<i32, BTreeMap<u8, crate::protocol::CoSQueueStatus>>::new();
+    // #1628: tracks, per ifindex, whether the backlog-guarded
+    // `waterfill_min_epochs_per_worker` MIN has been seeded by a first
+    // active-exact-backlog worker yet. Cannot use `entry.worker_instances`
+    // (counts idle workers too) nor `or_default()` (seeds 0, which would
+    // pin a `.min()` to 0 forever — the r3 finding).
+    let mut min_epochs_seeded = std::collections::HashSet::<i32>::new();
     for snapshot in worker_snapshots {
         for iface in snapshot.iter() {
             let entry = interfaces.entry(iface.ifindex).or_default();
@@ -935,6 +941,39 @@ pub(super) fn aggregate_cos_statuses_across_workers(
             entry.timer_level1_sleepers = entry
                 .timer_level1_sleepers
                 .saturating_add(iface.timer_level1_sleepers);
+            // #1628: per-interface waterfill counters. epochs +
+            // phase1_budget_breaks SUM across workers (cluster event
+            // counters, like timer_level*_sleepers).
+            entry.waterfill_epochs =
+                entry.waterfill_epochs.saturating_add(iface.waterfill_epochs);
+            entry.waterfill_phase1_budget_breaks = entry
+                .waterfill_phase1_budget_breaks
+                .saturating_add(iface.waterfill_phase1_budget_breaks);
+            // #1628 (code-review MAJOR): MIN-combine the PER-WORKER
+            // `waterfill_min_epochs_per_worker` values, which the worker
+            // side (interface_row.rs) already computed as the MIN over
+            // each worker's OWN bindings-with-active-backlog — so a
+            // healthy binding cannot mask a sibling locked binding within
+            // one worker. A worker reports u64::MAX when it has NO
+            // active-backlog binding (skip it); a backlogged binding that
+            // completed 0 epochs reports 0 (the strongest lock-in signal,
+            // which MUST be captured). Using the worker's per-binding MIN
+            // (NOT iface.waterfill_epochs, the cross-binding SUM) is the
+            // fix for the multi-binding masking the code review flagged.
+            // Interfaces with at least one candidate are tracked in
+            // `min_epochs_seeded`; interfaces with NO candidate are set to
+            // u64::MAX after the loop (NOT 0) so an idle interface stays
+            // distinguishable from a real 0-epoch lock-in.
+            if iface.waterfill_min_epochs_per_worker != u64::MAX {
+                if min_epochs_seeded.insert(iface.ifindex) {
+                    entry.waterfill_min_epochs_per_worker =
+                        iface.waterfill_min_epochs_per_worker;
+                } else {
+                    entry.waterfill_min_epochs_per_worker = entry
+                        .waterfill_min_epochs_per_worker
+                        .min(iface.waterfill_min_epochs_per_worker);
+                }
+            }
             let queue_map = queue_maps.entry(iface.ifindex).or_default();
             for queue in &iface.queues {
                 let q = queue_map.entry(queue.queue_id).or_default();
@@ -1006,6 +1045,17 @@ pub(super) fn aggregate_cos_statuses_across_workers(
                 q.tx_ring_full_submit_stalls = q
                     .tx_ring_full_submit_stalls
                     .saturating_add(queue.tx_ring_full_submit_stalls);
+                // #1628: per-class waterfill trace counters, summed across
+                // worker snapshots (same as the drop/park counters above).
+                q.waterfill_phase1_admissions = q
+                    .waterfill_phase1_admissions
+                    .saturating_add(queue.waterfill_phase1_admissions);
+                q.waterfill_phase2_admissions = q
+                    .waterfill_phase2_admissions
+                    .saturating_add(queue.waterfill_phase2_admissions);
+                q.waterfill_eligible_visits = q
+                    .waterfill_eligible_visits
+                    .saturating_add(queue.waterfill_eligible_visits);
                 // #709: cross-worker aggregation for owner-profile
                 // counters is sum, not max. Histograms and invocation
                 // counters must stay coherent after aggregation;
@@ -1019,6 +1069,18 @@ pub(super) fn aggregate_cos_statuses_across_workers(
     }
     let mut out = Vec::with_capacity(interfaces.len());
     for (ifindex, mut iface) in interfaces {
+        // #1628 (code-review r2, both reviewers): keep the u64::MAX
+        // "no active-exact-backlog candidate" sentinel on the AGGREGATED
+        // output too, rather than letting it collapse to the or_default()
+        // 0. Otherwise an idle interface (0) and a hard 0-epoch lock-in
+        // (0) collide and the metric is unalertable. With MAX preserved,
+        // Prometheus suppresses the idle case (no series) and `0`
+        // unambiguously means a backlogged binding that completed zero
+        // epochs. An interface seeded by at least one active-backlog
+        // worker keeps its real MIN (including a genuine 0).
+        if !min_epochs_seeded.contains(&ifindex) {
+            iface.waterfill_min_epochs_per_worker = u64::MAX;
+        }
         if let Some(queue_map) = queue_maps.remove(&ifindex) {
             iface.queues = queue_map.into_values().collect();
             iface.owner_worker_id = unique_interface_owner_worker_id(&iface.queues);

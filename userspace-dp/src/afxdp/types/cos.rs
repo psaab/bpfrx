@@ -417,6 +417,22 @@ pub(in crate::afxdp) struct CoSInterfaceRuntime {
     /// descending walk (largest-rate-first) the last Phase 2
     /// service event landed.
     pub(in crate::afxdp) waterfill_phase2_cursor: usize,
+    /// #1628: completed waterfill epochs (Phase-1 budget refills) on this
+    /// interface, THIS WORKER's view. Bumped at the lazy Phase-1 refill
+    /// site. NOT a per-queue normalizer (the cross-worker SUM would be
+    /// diluted by worker count); used as a cluster event counter (SUM)
+    /// plus the coordinator's per-worker MIN (`waterfill_min_epochs_per_
+    /// worker` on `CoSInterfaceStatus`), which flags a single worker
+    /// frozen in Phase-2 lock-in. Single-writer owner worker, plain `u64`.
+    pub(in crate::afxdp) waterfill_epochs: u64,
+    /// #1628: times Phase 1 broke into Phase 2 because the next ascending
+    /// queue's rate-scaled cost exceeded the remaining Phase-1 budget.
+    /// Per-INTERFACE not per-queue: the break only ever sees the first
+    /// queue that crosses the boundary, so a per-queue attribution would
+    /// silently miss the larger queues never reached. A high
+    /// breaks-per-epoch ratio means Phase 1 routinely exhausts its budget
+    /// mid-walk. Single-writer owner worker, plain `u64`.
+    pub(in crate::afxdp) waterfill_phase1_budget_breaks: u64,
     // Round-robin cursors for the two guarantee service classes. Exact and
     // non-exact guarantee queues rotate independently — the scheduler gives
     // exact queues strict priority over non-exact guarantee service (the
@@ -879,6 +895,17 @@ pub(in crate::afxdp) struct CoSQueueTelemetry {
     // via `ArcSwap`, so reads are consistent without ordering discipline
     // here.
     pub(in crate::afxdp) drop_counters: CoSQueueDropCounters,
+    // #1628: per-class waterfill-selector trace counters. Kept SEPARATE
+    // from `drop_counters` (which is reserved for packet drops / ECN
+    // marks / token-starvation parks) so scheduler-selection telemetry
+    // does not pollute the drop-reason struct (r1 review). Plain `u64`,
+    // single-writer: the owner worker bumps these on its drain path and
+    // `build_worker_cos_statuses` reads them ON THE SAME WORKER THREAD
+    // before publishing the snapshot via ArcSwap — there is no live
+    // cross-thread read of these fields, so no atomics are needed (same
+    // reasoning as the `drop_counters` park counters, NOT a
+    // tearing-tolerance argument).
+    pub(in crate::afxdp) waterfill_counters: CoSQueueWaterfillCounters,
     // #751: per-queue owner-side drain telemetry. Lives inline on the
     // queue runtime so each queue's drain_latency + drain_invocations
     // are genuinely per-queue rather than a binding-wide rollup
@@ -935,6 +962,46 @@ pub(in crate::afxdp) struct CoSQueueDropCounters {
     /// packet loss. See #706 / #709 for the downstream causes operators
     /// typically chase when this fires.
     pub(in crate::afxdp) tx_ring_full_submit_stalls: u64,
+}
+
+/// #1628: per-class trace counters for the `guarantee-rate` waterfill
+/// selector (`cos/queue_service/mod.rs`
+/// `select_exact_cos_guarantee_queue_waterfill`). These exist to make
+/// the #1630-verified root cause (multi-worker queue-ownership
+/// fragmentation + Phase-1/Phase-2 split) empirically observable; they
+/// do NOT change any scheduling decision. Zero on the Proportional
+/// (legacy RR) selector path, which has no phases — a non-zero value on
+/// a queue is itself a "this interface is in guarantee-rate mode" signal.
+///
+/// Single-writer (owner worker) plain `u64`; read on the same thread by
+/// `build_worker_cos_statuses` and published via ArcSwap (see the field
+/// comment on `CoSQueueTelemetry.waterfill_counters`).
+///
+/// INTERPRETATION (not a single-counter fingerprint — r1 review): a
+/// Phase-2 lock-in is identified only by COMBINING `phase2_admissions`
+/// (climbing) + `phase1_admissions` (flat) with `queued_bytes > 0` and
+/// the `*_starvation_parks` drop counters on the SAME queue row, AND
+/// only for a small class whose configured rate fits the Phase-1 budget;
+/// the same shape on a large above-cutoff class is healthy rate-limiting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::afxdp) struct CoSQueueWaterfillCounters {
+    /// Times this queue was admitted via the Phase-1 (small-first
+    /// honored) ascending walk. Bumped at the Phase-1 honor `return`.
+    pub(in crate::afxdp) phase1_admissions: u64,
+    /// Times this queue was admitted via the Phase-2 (descending
+    /// residual) walk. See the struct-level INTERPRETATION note — this
+    /// is evidence, not a standalone fingerprint.
+    pub(in crate::afxdp) phase2_admissions: u64,
+    /// Times the waterfill selector reached this queue, found it eligible
+    /// (nonempty + runnable + guarantee + exact) and head-present, and
+    /// evaluated it — counted in BOTH phases, BEFORE the root/queue token
+    /// gate (so a token-starved-but-eligible queue is still a visit). A
+    /// backlogged queue PARKED on token starvation is `!runnable` and
+    /// skipped at the eligibility gate, so it shows LOW eligible_visits;
+    /// pair with `*_starvation_parks` to tell "backlogged but parked"
+    /// (low visits + high parks) from "genuinely idle on this owner"
+    /// (low visits + low parks + zero queued_bytes).
+    pub(in crate::afxdp) eligible_visits: u64,
 }
 
 pub(in crate::afxdp) struct CoSTimerWheelRuntime {
