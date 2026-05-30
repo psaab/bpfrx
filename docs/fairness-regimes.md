@@ -1058,12 +1058,43 @@ that is the genuine defect SIGNAL, tracked separately in **#1692**
 
 ### Acceptance gates under guarantee-rate mode
 
-In addition to the structural per-flow CoV gate above
-(`observed_CoV ≤ Cstruct + 0.05`), guarantee-rate runs assert:
+**Per-flow fairness gate (the only one):** the structural #1217
+contract above, `observed_CoV ≤ Cstruct + 0.05`. The flat per-flow-CoV
+gate the original #1614 issue body proposed (body acceptance-line
+"Per-flow CoV ≤ 5% under simultaneous load") is **DROPPED**: per
+#1220/#1244 the per-flow CoV within a class is structural — at the
+multinomial(12,6) RSS floor `Cstruct ≈ 53%` — so a scheduler change
+that does not move per-flow placement cannot lower it, and a flat
+5/10% bar is structurally unreachable. (The #1614 body already cites
+#1217 elsewhere; this rescope resolves that internal inconsistency.)
 
-1. **Small-class absolute guarantee** (classes whose cumulative
-   `R_i` fits under the shaping ceiling): each class hits ≥ 95% of
-   its configured rate under all-class simul load.
+**Per-class %-of-shape gates are bounded by `C_phys`** (see "Aggregate
+push ceiling" above): no simul-load gate may assert per-class numbers
+whose sum exceeds `C_phys`. The ≥95% small-class absolute guarantee
+(gate 1 below) is achievable **SOLO or with few competitors only** —
+under full-11 simul the `C_phys` division puts even 1g at 63%, so that
+guarantee is asserted by the SOLO harness `cos-gate1-small-four-alone.sh`
+(#1630), NOT the full-11 `cos-simul-load-smoke.sh`. The full-11 simul
+harness instead asserts a **divided-ceiling regression floor** (gate 1
+below) that catches a collapse, not the unmet guarantee.
+
+guarantee-rate runs assert:
+
+1. **Small-class absolute guarantee — SOLO / few-competitor only**
+   (classes whose cumulative `R_i` fits under the shaping ceiling):
+   each class hits ≥ 95% of its configured rate. This is verified by
+   `cos-gate1-small-four-alone.sh` (#1630, SOLO one class at a time or
+   the small-four-alone run), where 100m/1g reach 95.0/95.3%. Under
+   **full-11 simul** the `C_phys` division makes ≥95% unreachable for
+   every class (100m=86%, 1g=63%, 3g=43%, 6g=41%; #1614 §2.1), so the
+   full-11 `cos-simul-load-smoke.sh` gate 1 is a **divided-ceiling
+   regression floor** instead: each of 100m/1g/3g/6g must stay above a
+   relaxed per-class floor calibrated below its measured simul value
+   (100m ≥ 60%, 1g ≥ 40%, 3g ≥ 25%, 6g ≥ 25% of shape) so a collapse
+   (e.g. starve-to-zero) trips while normal ceiling-division does not.
+   The ≥95% guarantee for 3g/6g under multi-class contention is a
+   CONFIRMED-but-mechanism-UNRESOLVED defect tracked in **#1692**; it
+   is not asserted here until that issue resolves.
 2. **Priority-low minimum share**: when configured, the
    priority-low queue receives ≥ 95% of its configured
    `priority-low-min-share`.

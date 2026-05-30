@@ -4500,3 +4500,15 @@ top.
   mergeable == MERGEABLE/CLEAN).
 - **File(s)**: _Log.md, docs/pr/1628-cos-instr/reviewer-ids.md (rebase only;
   no code change vs the reviewed HEAD)
+
+## #1691 CoS Path B — push-ceiling doc + #1614 gate rescope
+- **Timestamp**: 2026-05-30
+- **Action**: Document the ~22-24 G push-ceiling C_phys division in
+  fairness-regimes.md (per-class denominator, 3-condition starvation
+  discriminator, Phase 0 reverse cross-ref).
+- **File(s)**: docs/fairness-regimes.md
+- **Action**: Re-scope #1614 gates — drop flat per-flow-CoV gate (#1614
+  body line 113) for #1217 structural; full-11 smoke Gate 1 becomes a
+  divided-ceiling regression floor; >=95% guarantee stays SOLO (#1630).
+- **File(s)**: docs/fairness-regimes.md, test/incus/cos-simul-load-smoke.sh,
+  docs/pr/1614-multi-rss-cos/plan.md
