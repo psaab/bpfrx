@@ -1,10 +1,35 @@
 # #1628 — Empirical per-class waterfill trace counters for the CoS scheduler
 
-**Status:** DRAFT v3 — addresses round-2 PLAN-NEEDS-MAJOR (Codex
-`task-mpru36mt-9tyfq5` + AGY `adversarial-review-mpru3d7g-lmqxlg`, convergent).
-v1 cleared the structural redesign; v2 cleared the counter set; v3 fixes the
-helper borrow shape, the single-worker-masking aggregation, and the
-overclaimed-fingerprint framing. Pending re-review.
+**Status:** DRAFT v4 — addresses round-3 (Codex `task-mprukdm1-lrsriq`
+PLAN-NEEDS-MAJOR, AGY `adversarial-review-mprukj68-etaisl` PLAN-NEEDS-MINOR,
+convergent on one finding). v1 cleared the redesign; v2 the counter set; v3 the
+borrow shape + framing; v4 fixes the MIN-aggregation idle-worker conflation +
+default-0 trap, the small-class qualifier on the lock-in signature, the
+write-site assignment/borrow-ordering, and removes stale helper text. Pending
+re-review.
+
+### v3→v4 reviewer-driven changes (round 3)
+
+- **MAJOR (both, identical fix): `waterfill_min_epochs_per_worker` conflated a
+  Phase-2-locked worker with an idle worker AND had a default-0 trap.** An idle
+  worker never advances `waterfill_epochs` (skips `drain_shaped_tx`'s service
+  path) so a naive MIN reports 0; and `or_default()` seeds 0 so `.min(0)==0`
+  always. → The MIN is now taken **only over interface rows with active
+  exact-guarantee backlog**, seeded on first inclusion via a local
+  `HashSet<ifindex>` (not `worker_instances`, which counts idle workers too).
+  See §4d.
+- **MINOR (AGY): lock-in signature is healthy for large classes above the
+  Phase-1 cutoff.** → `phase2_admissions` doc qualified: the lock-in reading
+  applies ONLY to small classes configured to fit Phase-1; the same shape on a
+  large class is expected rate-limiting. §4a.
+- **MINOR (AGY): write-site typo** — bare `root.x.wrapping_add(1)` is a no-op;
+  all sites now use `x = x.wrapping_add(1)`. §4c.
+- **MINOR (Codex): head-borrow ordering** — per-queue telemetry writes go AFTER
+  `head_len`/`kind` are computed and the `head` borrow ends. §4c.
+- **MINOR (Codex): stale `count_waterfill_event` text** removed from §5 + §7
+  risk row (v3 made all increments inline).
+- Confirmed by both r3: inline disjoint-field root writes compile; v8
+  fair-share deferral correct.
 
 ### v2→v3 reviewer-driven changes (round 2)
 
@@ -172,10 +197,18 @@ pub(in crate::afxdp) struct CoSQueueWaterfillCounters {
     /// class above the Phase-1 cutoff under asymmetric load (r2 finding).
     /// The starving-lock-in case is identified only by COMBINING this with
     /// `queued_bytes > 0` AND `root_token_starvation_parks` /
-    /// `queue_token_starvation_parks` on the same row — a class that has
-    /// backlog AND is being parked AND is only ever Phase-2-admitted is
-    /// the locked-in case; an idle small class with no backlog and no
-    /// parks is healthy residual service. (See §10 Q1.)
+    /// `queue_token_starvation_parks` on the same row, AND ONLY for a
+    /// SMALL class whose rate-scaled cost is configured to fit within the
+    /// Phase-1 budget: such a class that has backlog, is being parked, and
+    /// is only ever Phase-2-admitted is the locked-in case. For a LARGE
+    /// class above the Phase-1 cutoff, the same shape
+    /// (`phase1==0, phase2>0, backlog, parks`) is HEALTHY, expected
+    /// rate-limiting — it was never supposed to win Phase 1. The
+    /// small-vs-large distinction is the operator's (or the consuming
+    /// analysis's) call from the configured `transmit-rate` vs the
+    /// interface Phase-1 budget; this counter does not encode it. An idle
+    /// small class with no backlog and no parks is healthy residual
+    /// service regardless. (See §10 Q1.)
     pub(in crate::afxdp) phase2_admissions: u64,
     /// #1628: times the waterfill selector VISITED this queue and found
     /// it eligible (nonempty + runnable + guarantee + exact) — i.e. the
@@ -225,35 +258,88 @@ pub(in crate::afxdp) waterfill_phase1_budget_breaks: u64,
 
 These SUM across workers in `aggregate_cos_statuses_across_workers` like
 `timer_level0_sleepers` (`coordinator/mod.rs:932`) for the cluster event rate.
-**Additionally**, the coordinator computes a MIN aggregation
-`waterfill_min_epochs_per_worker` (r2 finding F2) using the existing `.max()`
-pattern (`coordinator/mod.rs:927`) with `.min()` instead, seeded from the first
-worker's `waterfill_epochs` so a single worker frozen in Phase-2 lock-in (its
-own `waterfill_epochs` not advancing) drops the MIN even while the SUM climbs.
-This is the stalled-core flag; it lives only on the aggregated
-`CoSInterfaceStatus`, not the per-worker runtime.
+
+**`waterfill_min_epochs_per_worker` MIN aggregation (r2 F2 + r3 fix).** The MIN
+must NOT be a naive `.min()` for two reasons both r3 reviewers caught:
+
+1. **Default-0 trap:** `interfaces.entry(ifindex).or_default()`
+   (`coordinator/mod.rs:922`) seeds every `u64` to 0, so
+   `entry.min(iface.waterfill_epochs)` is **always 0**. Seed on first inclusion.
+2. **Idle-worker conflation:** a worker that owns no backlogged exact-guarantee
+   queue never enters `drain_shaped_tx`'s service path
+   (`queue_service/mod.rs:167`), so its `waterfill_epochs` stays 0 forever — a
+   naive MIN would report 0 (looks like lock-in) when that worker is simply
+   idle, masking a real lock-in on a different worker.
+
+The MIN is therefore taken **only over worker interface rows that have current
+active exact-guarantee backlog**, seeded via a dedicated "first included" flag
+(not `worker_instances`, which counts all workers including idle ones):
+
+```rust
+// per-interface, in aggregate_cos_statuses_across_workers:
+let iface_has_active_exact_backlog = iface.queues.iter().any(|q| {
+    q.exact && q.guarantee_enabled && (q.queued_bytes > 0 || q.queued_packets > 0)
+});
+if iface_has_active_exact_backlog {
+    if min_epochs_seen.insert(iface.ifindex) /* first active worker for ifindex */ {
+        entry.waterfill_min_epochs_per_worker = iface.waterfill_epochs;
+    } else {
+        entry.waterfill_min_epochs_per_worker =
+            entry.waterfill_min_epochs_per_worker.min(iface.waterfill_epochs);
+    }
+}
+// If NO worker has active exact backlog on the interface, the field stays 0
+// (its or_default()) — interpreted as "no active lock-in candidate", NOT
+// "locked at 0". The CLI/Prometheus doc states this explicitly.
+```
+
+`min_epochs_seen` is a local `HashSet<i32>` in the aggregation fn (the
+aggregation already builds local `BTreeMap`s, so one more local set is free).
+The MIN lives only on the aggregated `CoSInterfaceStatus`, not the per-worker
+runtime. A worker locked in Phase 2 *while holding backlog* keeps its
+`waterfill_epochs` frozen and IS included in the MIN, dropping it; an idle
+worker is excluded so it can't poison it.
 
 The per-OWNER fragmentation signal lives on the per-queue `eligible_visits`
 (a queue has one owner, so its row reflects that single worker — F3).
 
 ### 4c. Write sites (all inside `select_exact_cos_guarantee_queue_waterfill`)
 
-Verified against the real control flow (Codex + AGY both confirmed):
+Verified against the real control flow (Codex + AGY both confirmed). All
+increments use the explicit `x = x.wrapping_add(1)` assignment form — a bare
+`x.wrapping_add(1)` expression statement is a no-op (r3 AGY catch).
+
+**Borrow ordering (r3 Codex):** at the per-queue sites, `head` is a `&`-borrow
+of `queue` (`let head = cos_queue_front(queue)`) that is STILL used at the
+return (`mod.rs:920 match head` / `:1011`). A `&mut queue.telemetry` write
+while `head` is live would conflict. So each per-queue site first computes the
+owned scalars it needs (`head_len`, and at the return sites the `kind` match on
+`head`), ending the `head` borrow, THEN bumps `queue.telemetry`. For the
+eligible-visit sites the bump goes after `let head_len = cos_item_len(head)`
+(head no longer needed for the visit count). For the admission sites the bump
+goes after `let kind = match head { ... }` (the last use of `head`), before the
+`return`.
 
 1. **Epoch refill** (`mod.rs:793` `if waterfill_pass1_remaining_bytes == 0`):
-   `root.waterfill_epochs = root.waterfill_epochs.wrapping_add(1);`
-2. **Phase-1 eligible visit** (`mod.rs:832` after the
-   `cos_queue_is_empty || !runnable || ...` continue gate passes and a head is
-   present): bump the queue's `eligible_visits`.
+   `root.waterfill_epochs = root.waterfill_epochs.wrapping_add(1);` (no `queue`
+   borrowed yet — pre-loop).
+2. **Phase-1 eligible visit** (`mod.rs:835` after `let head_len =
+   cos_item_len(head);`): `queue.telemetry.waterfill_counters.eligible_visits =
+   ...wrapping_add(1);`.
 3. **Phase-1 budget-exhausted break** (`mod.rs:906`, before `break` at `:910`):
-   `root.waterfill_phase1_budget_breaks.wrapping_add(1)`.
-4. **Phase-1 honor return** (`mod.rs:924`, before `return Some(...)`): bump the
-   chosen queue's `phase1_admissions`.
-5. **Phase-2 eligible visit** (`mod.rs:982` after the Phase-2 eligibility gate
-   passes and a head is present): bump `eligible_visits` (so the visit count
-   covers both phases' reachability).
-6. **Phase-2 admission return** (`mod.rs:1015`, before `return Some(...)`):
-   bump the chosen queue's `phase2_admissions`.
+   `root.waterfill_phase1_budget_breaks =
+   root.waterfill_phase1_budget_breaks.wrapping_add(1);` (disjoint root field;
+   same pattern as the existing `:913` write — compiles with `queue`/`head`
+   live).
+4. **Phase-1 honor return** (`mod.rs:924`, after `let kind = match head {...}`
+   at `:920`, before `return Some(...)`): bump the chosen queue's
+   `phase1_admissions`.
+5. **Phase-2 eligible visit** (`mod.rs:989` after `let head_len =
+   cos_item_len(head);`): bump `eligible_visits` (so the visit count covers
+   both phases' reachability).
+6. **Phase-2 admission return** (`mod.rs:1015`, after the `kind` match at
+   `:1011`, before `return Some(...)`): bump the chosen queue's
+   `phase2_admissions`.
 
 **All increments are INLINE; no helper that takes `&mut root` (r2 finding
 F1).** A `count_waterfill_event(&mut root, queue_idx, ...)` helper would NOT
@@ -319,9 +405,10 @@ No new borrow is introduced at any site.
 
 ## 5. Public API preservation
 
-No selector / service-fn signature changes. New helper
-`count_waterfill_event` is internal `pub(in crate::afxdp)`. Wire surface is
-additive-only (all `default`), so old↔new deserialize cleanly both directions.
+No selector / service-fn signature changes. No new helper function (the
+counter writes are all inline — see §4c; a `&mut root` helper would not compile
+at the per-queue sites). Wire surface is additive-only (all `default`), so
+old↔new deserialize cleanly both directions.
 
 ## 6. Hidden invariants this change must preserve
 
@@ -345,7 +432,7 @@ additive-only (all `default`), so old↔new deserialize cleanly both directions.
 | Class | Level | Notes |
 |---|---|---|
 | Behavioral regression | LOW | Pure counter increments adjacent to unchanged control flow; scheduler reads none of them. |
-| Lifetime / borrow-checker | LOW | All sites hold the needed `&mut`; helper signature mirrors `count_park_reason`. |
+| Lifetime / borrow-checker | LOW | All increments inline; per-queue writes after the `head` borrow ends, root writes via disjoint fields (the existing `mod.rs:913` pattern). No `&mut root` helper. |
 | Performance regression | LOW | ≤ 1 `u64` write per selection/epoch; rarer than existing `drain_park_*`. Same owner cache line, no new false sharing. |
 | Architectural mismatch | LOW | F2/F3/F5 resolved: scope is strictly the worker-local waterfill selector, dedicated struct, monotonic totals, per-queue signal keyed to single owner. v8 fair-share explicitly deferred to its owning PR. |
 
@@ -367,10 +454,16 @@ additive-only (all `default`), so old↔new deserialize cleanly both directions.
   healthy-residual for above-cutoff classes — the distinguishing signal is the
   paired `queued_bytes`/`*_starvation_parks`, which the unit test sets up
   explicitly in the lock-in fixture and leaves zero in the healthy-idle fixture.
-- Coordinator test: `aggregate_cos_statuses_across_workers` with one worker
-  reporting frozen `waterfill_epochs` and others climbing →
-  `waterfill_min_epochs_per_worker` equals the frozen value while the summed
-  `waterfill_epochs` climbs (the F2 single-worker-mask regression guard).
+- Coordinator tests on `aggregate_cos_statuses_across_workers`:
+  - one worker WITH active exact backlog reporting frozen `waterfill_epochs`
+    and others (also with backlog) climbing → `waterfill_min_epochs_per_worker`
+    equals the frozen value while the summed `waterfill_epochs` climbs (the F2
+    single-worker-mask regression guard);
+  - an IDLE worker (no active exact backlog) reporting `waterfill_epochs == 0`
+    alongside an active worker at a high value → MIN equals the ACTIVE worker's
+    value, NOT 0 (the r3 idle-conflation regression guard);
+  - no worker with active exact backlog → MIN stays 0 (documented "no lock-in
+    candidate" sentinel, not a false lock-in).
 - 5/5 flake loop on the new named tests.
 - Go: `protocol_test.go` serde→Go round-trip parity, `cosfmt_test.go` render,
   `metrics_test.go` descriptor wiring. `go test ./...` 30 packages.
@@ -393,30 +486,21 @@ additive-only (all `default`), so old↔new deserialize cleanly both directions.
   body's broad list — the verified consumer is the worker-local waterfill
   selector, not v8 epoch rotation. Deferred.
 
-## 10. Open questions for adversarial re-review (v3)
+## 10. Open questions for adversarial re-review (v4)
 
-1. **Is the "combine with `queued_bytes` + `*_starvation_parks`" interpretation
-   contract sufficient** to separate starving Phase-2 lock-in from healthy
-   above-cutoff residual service (r2 F3), or is there a residual ambiguity even
-   with the pairing — e.g. a class that is genuinely above the Phase-1 cutoff
-   AND backlogged AND parked (legitimately rate-limited) reads identical to a
-   misconfigured lock-in? If so, is that a counter problem or a fundamentally
-   operator-judgment call the docs should state plainly?
-2. **Does `waterfill_min_epochs_per_worker` (MIN aggregation) actually flag a
-   single frozen worker** given that a worker which is simply *idle* (no
-   backlog at all) also won't advance `waterfill_epochs`? I.e. does MIN-epochs
-   conflate "locked-in worker" with "idle worker"? If yes, what additional
-   pairing (per-worker SUM of `phase2_admissions`?) resolves it, and is that in
-   scope?
-3. **Borrow shape re-verify:** does the inline `root.waterfill_phase1_budget_breaks`
-   write at `mod.rs:906` (with `queue`/`head` live) actually compile, given the
-   existing `root.waterfill_pass1_remaining_bytes` write at `:913` proves the
-   disjoint-field pattern works? Confirm against the real NLL behavior, not the
-   plan's claim.
-4. **Is the MIN seed correct** — seeding from the first worker's
-   `waterfill_epochs` vs `u64::MAX`-then-min — to avoid a spurious 0 when a
-   worker simply hasn't reported yet?
-5. **Scope:** is deferring the v8 fair-share counter (F2 from r1) still the
-   right call, or does the #1630 fix author need it co-landed to avoid a second
-   instrumentation PR? (The deferral was endorsed by both r1 reviewers; re-test
-   it against the v3 framing.)
+1. **Is the small-vs-large-class qualifier on the `phase2_admissions` lock-in
+   reading now correct and complete** (§4a), or is there still a residual
+   ambiguity the docs should state — e.g. a borderline class whose configured
+   `transmit-rate` is right at the Phase-1 budget boundary so it flips between
+   honored and residual epoch-to-epoch?
+2. **Does the active-exact-backlog-guarded MIN (§4d) fully resolve the
+   idle/locked conflation**, or can a worker that has backlog but is parked on
+   token starvation (so its queues show `queued_bytes > 0` but it is NOT
+   actually entering the waterfill selector this instant) still be miscounted
+   into the MIN? Is "has queued_bytes" the right inclusion predicate, or should
+   it be "entered the selector at least once this window"?
+3. **Is the `HashSet<ifindex>` first-inclusion seed (§4d) the simplest correct
+   approach**, or is there a cleaner single-pass formulation (e.g. an
+   `Option<u64>` accumulator per interface)?
+4. **Scope:** is deferring the v8 fair-share counter still the right call? (Both
+   r1 + r3 reviewers endorsed the deferral; re-confirm against v4.)

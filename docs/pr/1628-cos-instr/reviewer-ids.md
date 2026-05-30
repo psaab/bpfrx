@@ -36,6 +36,22 @@ task-id here so a continuation can fetch results by id after session-state loss.
 - F4 eligible_visits misses token-parked-but-backlogged queues (AGY): parked → !runnable → skipped at gate → low eligible_visits reads as "idle". → document eligible_visits + existing root/queue_token_starvation_parks pairing distinguishes starved-park from genuinely-idle; do NOT add a counter (parks already exist).
 - Confirmed OK by both: dedicated struct placement, monotonic redesign, eligible_visits write location (after eligibility/head, before token gate), cutting skipped_not_backlogged.
 
+## Plan review (round 3 — v3 @ c509d75bc)
+
+| Reviewer | Task ID | Verdict | Notes |
+|---|---|---|---|
+| Codex | task-mprukdm1-lrsriq | PLAN-NEEDS-MAJOR | 1 major (MIN idle-conflation) + 2 minor |
+| AGY | adversarial-review-mprukj68-etaisl | PLAN-NEEDS-MINOR | same MIN finding (critical) + 2 minor; advancing |
+| Claude SMR | (in-conversation) | concur | converge on MIN backlog-guard |
+
+### r3 convergent findings (all addressed in plan v4)
+- MAJOR/critical (BOTH, identical fix): waterfill_min_epochs_per_worker conflates a Phase-2-LOCKED worker (frozen epochs, has backlog) with a genuinely IDLE worker (frozen epochs, no backlog → drain_shaped_tx skips, epochs stay 0) AND has a default-0 init trap (or_default() seeds 0, .min(0)=0 always). → Guard the MIN by active exact-guarantee backlog (iface.queues.any(|q| q.exact && q.guarantee_enabled && q.queued_bytes>0)) AND seed via entry.worker_instances==0 (first active). If no active-backlog worker, MIN stays 0.
+- MINOR (AGY): phase2_admissions doc overclaim — lock-in signature applies ONLY for small classes within the Phase-1 budget; large classes above the cutoff legitimately match (backlog+parks+phase2>0+phase1==0). Soften.
+- MINOR (AGY): §4c write-site-3 typo: bare root.x.wrapping_add(1) is a no-op; must be root.x = root.x.wrapping_add(1).
+- MINOR (Codex): per-queue telemetry write must come AFTER head_len/kind computed and the `head` borrow ended (head live at :920 match head / :1011).
+- MINOR (Codex): stale count_waterfill_event text at §5/§7 contradicts the v3 no-helper invariant. Remove.
+- Confirmed by BOTH: inline disjoint-field root writes compile (mod.rs:913 pattern); v8 fair-share deferral correct.
+
 ## Code review (round 1)
 
 | Reviewer | Task ID | Verdict | Notes |
