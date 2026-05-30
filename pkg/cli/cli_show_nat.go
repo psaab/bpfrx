@@ -1,15 +1,13 @@
 package cli
 
 import (
-	"encoding/binary"
 	"fmt"
-	"net/netip"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/natshow"
 )
 
 // handleShowNAT dispatches `show security nat ...` subcommands to the
@@ -453,99 +451,8 @@ func (c *CLI) showNATSourceRuleAll(cfg *config.Config) error {
 // showNATSourceRuleDetail displays Junos-style detailed source NAT rules.
 
 func (c *CLI) showNATSourceRuleDetail(cfg *config.Config) error {
-	if cfg == nil || len(cfg.Security.NAT.Source) == 0 {
-		fmt.Println("No source NAT rules configured")
-		return nil
-	}
-
-	// Count active SNAT sessions per rule-set
-	type ruleSetKey struct{ from, to string }
-	rsSessions := make(map[ruleSetKey]int)
-	cr := c.applyResult()
-	if c.dp != nil && c.dp.IsLoaded() && cr != nil {
-		zoneByID := make(map[uint16]string, len(cr.ZoneIDs))
-		for name, id := range cr.ZoneIDs {
-			zoneByID[id] = name
-		}
-		_ = c.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
-			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
-				rsSessions[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
-			}
-			return true
-		})
-		_ = c.dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
-			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
-				rsSessions[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
-			}
-			return true
-		})
-	}
-
-	ruleIdx := 0
-	for _, rs := range cfg.Security.NAT.Source {
-		for _, rule := range rs.Rules {
-			ruleIdx++
-			action := "interface"
-			if rule.Then.PoolName != "" {
-				action = "pool " + rule.Then.PoolName
-			} else if rule.Then.Off {
-				action = "off"
-			}
-			srcMatch := "0.0.0.0/0"
-			if rule.Match.SourceAddress != "" {
-				srcMatch = rule.Match.SourceAddress
-			}
-			dstMatch := "0.0.0.0/0"
-			if rule.Match.DestinationAddress != "" {
-				dstMatch = rule.Match.DestinationAddress
-			}
-
-			fmt.Printf("source NAT rule: %s\n", rule.Name)
-			fmt.Printf("  Rule-set: %s                        ID: %d\n", rs.Name, ruleIdx)
-			fmt.Printf("    From zone: %s    To zone: %s\n", rs.FromZone, rs.ToZone)
-			fmt.Printf("    Match:\n")
-			fmt.Printf("      Source addresses:      %s\n", srcMatch)
-			fmt.Printf("      Destination addresses: %s\n", dstMatch)
-			if rule.Match.Protocol != "" {
-				fmt.Printf("      IP protocol:           %s\n", rule.Match.Protocol)
-			}
-			fmt.Printf("    Action:                  %s\n", action)
-
-			if rule.Then.PoolName != "" && cfg.Security.NAT.SourcePools != nil {
-				if pool, ok := cfg.Security.NAT.SourcePools[rule.Then.PoolName]; ok {
-					if pool.PersistentNAT != nil {
-						fmt.Printf("    Persistent NAT:          enabled\n")
-					}
-					if len(pool.Addresses) > 0 {
-						fmt.Printf("    Pool addresses:          %s\n", strings.Join(pool.Addresses, ", "))
-					}
-					portLow, portHigh := pool.PortLow, pool.PortHigh
-					if portLow == 0 {
-						portLow = 1024
-					}
-					if portHigh == 0 {
-						portHigh = 65535
-					}
-					fmt.Printf("    Port range:              %d-%d\n", portLow, portHigh)
-				}
-			}
-
-			if c.dp != nil && cr != nil {
-				ruleKey := rs.Name + "/" + rule.Name
-				if cid, ok := cr.NATCounterIDs[ruleKey]; ok {
-					cnt, err := c.dp.ReadNATRuleCounter(uint32(cid))
-					if err == nil {
-						fmt.Printf("    Translation hits:        %d packets  %d bytes\n",
-							cnt.Packets, cnt.Bytes)
-					}
-				}
-			}
-
-			sessions := rsSessions[ruleSetKey{rs.FromZone, rs.ToZone}]
-			fmt.Printf("    Number of sessions:      %d\n", sessions)
-			fmt.Println()
-		}
-	}
+	// #1687: shared with the gRPC ShowText path via pkg/natshow.
+	natshow.RenderSourceRuleDetail(os.Stdout, cfg, c.dp, c.applyResult())
 	return nil
 }
 
@@ -902,113 +809,16 @@ func (c *CLI) showNATDestinationRuleAll(cfg *config.Config) error {
 // showNATDestinationRuleDetail displays Junos-style detailed destination NAT rules.
 
 func (c *CLI) showNATDestinationRuleDetail(cfg *config.Config) error {
-	dnat := cfg.Security.NAT.Destination
-	if dnat == nil || len(dnat.RuleSets) == 0 {
-		fmt.Println("No destination NAT rules configured")
-		return nil
-	}
-
-	// Count active DNAT sessions per rule-set
-	type ruleSetKey struct{ from, to string }
-	rsSessions := make(map[ruleSetKey]int)
-	cr := c.applyResult()
-	if c.dp != nil && c.dp.IsLoaded() && cr != nil {
-		zoneByID := make(map[uint16]string, len(cr.ZoneIDs))
-		for name, id := range cr.ZoneIDs {
-			zoneByID[id] = name
-		}
-		_ = c.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
-			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagDNAT != 0 {
-				rsSessions[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
-			}
-			return true
-		})
-		_ = c.dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
-			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagDNAT != 0 {
-				rsSessions[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
-			}
-			return true
-		})
-	}
-
-	ruleIdx := 0
-	for _, rs := range dnat.RuleSets {
-		for _, rule := range rs.Rules {
-			ruleIdx++
-			action := "off"
-			if rule.Then.PoolName != "" {
-				action = "pool " + rule.Then.PoolName
-			}
-			dstMatch := "0.0.0.0/0"
-			if rule.Match.DestinationAddress != "" {
-				dstMatch = rule.Match.DestinationAddress
-			}
-
-			fmt.Printf("destination NAT rule: %s\n", rule.Name)
-			fmt.Printf("  Rule-set: %s                        ID: %d\n", rs.Name, ruleIdx)
-			fmt.Printf("    From zone: %s    To zone: %s\n", rs.FromZone, rs.ToZone)
-			fmt.Printf("    Match:\n")
-			fmt.Printf("      Destination addresses: %s\n", dstMatch)
-			if rule.Match.DestinationPort != 0 {
-				fmt.Printf("      Destination port:      %d\n", rule.Match.DestinationPort)
-			}
-			if rule.Match.Protocol != "" {
-				fmt.Printf("      IP protocol:           %s\n", rule.Match.Protocol)
-			}
-			if rule.Match.Application != "" {
-				fmt.Printf("      Application:           %s\n", rule.Match.Application)
-			}
-			fmt.Printf("    Action:                  %s\n", action)
-
-			if rule.Then.PoolName != "" && dnat.Pools != nil {
-				if pool, ok := dnat.Pools[rule.Then.PoolName]; ok {
-					fmt.Printf("    Pool address:            %s\n", pool.Address)
-					if pool.Port != 0 {
-						fmt.Printf("    Pool port:               %d\n", pool.Port)
-					}
-				}
-			}
-
-			if c.dp != nil && cr != nil {
-				ruleKey := rs.Name + "/" + rule.Name
-				if cid, ok := cr.NATCounterIDs[ruleKey]; ok {
-					cnt, err := c.dp.ReadNATRuleCounter(uint32(cid))
-					if err == nil {
-						fmt.Printf("    Translation hits:        %d packets  %d bytes\n",
-							cnt.Packets, cnt.Bytes)
-					}
-				}
-			}
-
-			sessions := rsSessions[ruleSetKey{rs.FromZone, rs.ToZone}]
-			fmt.Printf("    Number of sessions:      %d\n", sessions)
-			fmt.Println()
-		}
-	}
+	// #1687: shared with the gRPC ShowText path via pkg/natshow. The
+	// shared renderer carries the full nil/empty guard; the
+	// showNATDestination dispatcher keeps its own pre-guard.
+	natshow.RenderDestRuleDetail(os.Stdout, cfg, c.dp, c.applyResult())
 	return nil
 }
 
 func (c *CLI) showNATStatic(cfg *config.Config) error {
-	if cfg == nil || len(cfg.Security.NAT.Static) == 0 {
-		fmt.Println("No static NAT rules configured.")
-		return nil
-	}
-
-	for _, rs := range cfg.Security.NAT.Static {
-		fmt.Printf("Static NAT rule-set: %s\n", rs.Name)
-		fmt.Printf("  From zone: %s\n", rs.FromZone)
-		for _, rule := range rs.Rules {
-			fmt.Printf("  Rule: %s\n", rule.Name)
-			fmt.Printf("    Match destination-address: %s\n", rule.Match)
-			if rule.IsNPTv6 {
-				fmt.Printf("    Then nptv6-prefix:         %s\n", rule.Then)
-			} else {
-				fmt.Printf("    Then static-nat prefix:    %s\n", rule.Then)
-			}
-		}
-		fmt.Println()
-	}
-
+	// #1687: shared with the gRPC ShowText path via pkg/natshow.
+	natshow.RenderStatic(os.Stdout, cfg)
 	return nil
 }
 
@@ -1033,130 +843,21 @@ func (c *CLI) showNAT64(cfg *config.Config) error {
 }
 
 func (c *CLI) showPersistentNAT() error {
-	if c.dp == nil || c.dp.GetPersistentNAT() == nil {
-		fmt.Println("Persistent NAT table not available")
-		return nil
-	}
-	bindings := c.dp.GetPersistentNAT().All()
-	if len(bindings) == 0 {
-		fmt.Println("No persistent NAT bindings")
-		return nil
-	}
-	fmt.Printf("Total persistent NAT bindings: %d\n\n", len(bindings))
-	fmt.Printf("%-20s %-8s %-20s %-8s %-15s %-10s\n",
-		"Source IP", "SrcPort", "NAT IP", "NATPort", "Pool", "Timeout")
-	for _, b := range bindings {
-		remaining := time.Until(b.LastSeen.Add(b.Timeout))
-		if remaining < 0 {
-			remaining = 0
-		}
-		fmt.Printf("%-20s %-8d %-20s %-8d %-15s %-10s\n",
-			b.SrcIP, b.SrcPort, b.NatIP, b.NatPort, b.PoolName,
-			remaining.Truncate(time.Second))
-	}
+	// #1687: shared with the gRPC ShowText path via pkg/natshow.
+	natshow.RenderPersistent(os.Stdout, c.dp)
 	return nil
 }
 
 // showPersistentNATDetail displays detailed persistent NAT bindings with session counts and age.
 
 func (c *CLI) showPersistentNATDetail() error {
-	if c.dp == nil || c.dp.GetPersistentNAT() == nil {
-		fmt.Println("Persistent NAT table not available")
-		return nil
-	}
-	bindings := c.dp.GetPersistentNAT().All()
-	if len(bindings) == 0 {
-		fmt.Println("No persistent NAT bindings")
-		return nil
-	}
-
-	// #1152: natKey uses a unified `netip.Addr` so v4 and v6 NAT IPs
-	// share one map. v4 sessions use netip.AddrFrom4 (recovered from
-	// the BPF u32 via NativeEndian — see CLAUDE.md "Byte Order"),
-	// v6 sessions use netip.AddrFrom16. Mirrors the producer side in
-	// conntrack/gc.go (Save calls). The pre-fix code used
-	// `b.NatIP.As4()` which panicked on any v6 binding.
-	type natKey struct {
-		addr netip.Addr
-		port uint16
-	}
-	sessionCounts := make(map[natKey]int)
-	if c.dp.IsLoaded() {
-		_ = c.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
-			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
-				// SessionValue.NATSrcIP is a u32 holding the IP's
-				// network-order bytes in native-endian word form
-				// (CLAUDE.md "Byte Order"). Recover the original
-				// 4 bytes via NativeEndian.PutUint32 to match
-				// conntrack/gc.go:277-279's storage path.
-				var ip4 [4]byte
-				binary.NativeEndian.PutUint32(ip4[:], val.NATSrcIP)
-				sessionCounts[natKey{netip.AddrFrom4(ip4), val.NATSrcPort}]++
-			}
-			return true
-		})
-		_ = c.dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
-			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
-				// Match conntrack/gc.go:397 — no Unmap, the binding
-				// stores the 16-byte form for v6 NAT.
-				addr := netip.AddrFrom16(val.NATSrcIP)
-				sessionCounts[natKey{addr, val.NATSrcPort}]++
-			}
-			return true
-		})
-	}
-
-	fmt.Printf("Total persistent NAT bindings: %d\n\n", len(bindings))
-	for i, b := range bindings {
-		if i > 0 {
-			fmt.Println()
-		}
-		remaining := time.Until(b.LastSeen.Add(b.Timeout))
-		if remaining < 0 {
-			remaining = 0
-		}
-
-		sessions := sessionCounts[natKey{b.NatIP, b.NatPort}]
-
-		fmt.Printf("Persistent NAT binding:\n")
-		fmt.Printf("  Internal IP:        %s\n", b.SrcIP)
-		fmt.Printf("  Internal port:      %d\n", b.SrcPort)
-		fmt.Printf("  Reflexive IP:       %s\n", b.NatIP)
-		fmt.Printf("  Reflexive port:     %d\n", b.NatPort)
-		fmt.Printf("  Pool:               %s\n", b.PoolName)
-		if b.PermitAnyRemoteHost {
-			fmt.Printf("  Any remote host:    yes\n")
-		}
-		fmt.Printf("  Current sessions:   %d\n", sessions)
-		fmt.Printf("  Left time:          %s\n", remaining.Truncate(time.Second))
-		fmt.Printf("  Configured timeout: %ds\n", int(b.Timeout.Seconds()))
-	}
+	// #1687: shared with the gRPC ShowText path via pkg/natshow.
+	natshow.RenderPersistentDetail(os.Stdout, c.dp)
 	return nil
 }
 
 func (c *CLI) showNPTv6(cfg *config.Config) error {
-	if cfg == nil || len(cfg.Security.NAT.Static) == 0 {
-		fmt.Println("No NPTv6 rules configured.")
-		return nil
-	}
-
-	found := false
-	for _, rs := range cfg.Security.NAT.Static {
-		for _, rule := range rs.Rules {
-			if !rule.IsNPTv6 {
-				continue
-			}
-			if !found {
-				fmt.Printf("%-20s %-20s %-50s %-50s\n",
-					"Rule-set", "Rule", "External prefix", "Internal prefix")
-				found = true
-			}
-			fmt.Printf("%-20s %-20s %-50s %-50s\n",
-				rs.Name, rule.Name, rule.Match, rule.Then)
-		}
-	}
-	if !found {
-		fmt.Println("No NPTv6 rules configured.")
-	}
+	// #1687: shared with the gRPC ShowText path via pkg/natshow.
+	natshow.RenderNPTv6(os.Stdout, cfg)
 	return nil
 }
