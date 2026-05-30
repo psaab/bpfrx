@@ -1,8 +1,47 @@
 # #1687 — Shared NAT presentation seam (re-scoped)
 
-**Status:** DRAFT v2 — re-scoped after round-1 plan review. Universal
+**Status:** PLAN-READY v3 — round-2 converged (AGY PLAN-READY; Codex
+PLAN-NEEDS-MINOR, both minors folded in below). Universal
 shared-presentation package KILLED; bounded shared NAT renderer
-PROPOSED. Pending round-2 adversarial review.
+(`pkg/natshow`) APPROVED for implementation.
+
+## Round-2 verdicts
+
+- **AGY (adversarial-review-mpsgrpyp-6vmsdo): PLAN-READY.** Reversed its
+  round-1 misread after reading the leaf bodies directly; verified all
+  six leaf renderers byte-identical under sink normalization, the
+  `Reader` interface exact, and zero import-cycle risk.
+- **Codex (task-mpsgrdwm-mvt55w): PLAN-NEEDS-MINOR**, two items now
+  folded in:
+  1. **`nat-dest-rule-detail` leaf precondition.** The gRPC leaf
+     guards `cfg == nil || cfg.Security.NAT.Destination == nil ||
+     len(...RuleSets) == 0` and emits `"No destination NAT rules
+     configured\n"` (server_show_nat.go:195-199). The CLI leaf
+     (`showNATDestinationRuleDetail`, cli_show_nat.go:904) assumes its
+     dispatcher (`showNATDestination`, cli_show_nat.go:551-554) already
+     guarded `cfg == nil || Destination == nil` (emitting the
+     period-suffixed dispatcher message). **Resolution:** the shared
+     `RenderDestRuleDetail` adopts the **gRPC full guard verbatim**
+     (the gRPC behavior is the contract under test). The CLI dispatcher
+     keeps its existing pre-guard unchanged; for the non-empty path it
+     reaches the shared func which renders identically. The CLI golden
+     test asserts the dispatcher path is byte-identical to master.
+  2. **#1451 retirement-boundary canary.** `pkg/natshow` importing root
+     `pkg/dataplane` (unavoidable — the session-iteration callbacks use
+     `dataplane.SessionKey/Value`, and `ReadNATRuleCounter`/
+     `GetPersistentNAT` return `dataplane.CounterValue`/
+     `*dataplane.PersistentNATTable`) is flagged by
+     `TestOperatorPackagesOnlyUseDocumentedLegacyDataplaneImports`
+     (retirement_boundary_canary_test.go:118) unless added to
+     `legacyDataplaneImportAllowlist` (line 31) AND the #1451 docs table
+     in `docs/pr/1373-retire-ebpf-dataplane/README.md:251`.
+     **Resolution:** add `pkg/natshow/*.go` files that import dataplane
+     to both, with the explicit design reason: "shared NAT presenter
+     extracted from server_show_nat.go + cli_show_nat.go (#1687); still
+     names root pkg/dataplane session/counter types until those move to
+     a domain package — net-neutral, consolidates two pre-existing
+     allowlisted surfaces." This is not #1451 regressing: the renderers
+     already lived in two allowlisted files; the import moves with them.
 
 ## Round-1 verdicts and resolution
 
