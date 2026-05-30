@@ -1,8 +1,45 @@
 # #1691 — CoS Path B: document the ~22-24 G push-ceiling division + re-scope #1614 acceptance gates
 
-Status: DRAFT v1 — pending adversarial plan review (Codex + AGY + Claude-SMR)
+Status: DRAFT v2 — Codex r1 (PLAN-NEEDS-MAJOR) + AGY r1 (PLAN-NEEDS-MINOR)
++ Claude-SMR r1 (PLAN-NEEDS-MINOR) folded; pending re-review
 Branch: refactor/1691-cos-push-ceiling-gate-rescope
 Base: origin/master @ 7988d4c25
+
+> v2 CHANGE LOG (folds 3 reviewer rounds — see claude-smr-plan-r1.md,
+> reviewer-ids.md):
+> - **Codex r1 BLOCKING fix:** v1 narrowed smoke Gate 1 to {100m,1g}
+>   asserting ≥95%, justified by the §2.4 small4+24g run (1g=94%). But
+>   `cos-simul-load-smoke.sh` runs ALL 11 classes, where 1g=63% and even
+>   100m=86% (research §2.1). A ≥95% bar is unsatisfiable for EVERY class
+>   under full-11 simul — so v1's narrowed gate STILL failed master with
+>   no dataplane change. v2 moves the ≥95% guarantee gate to where the
+>   research proves it achievable: the SOLO harness
+>   `cos-gate1-small-four-alone.sh` (#1630, untouched). The full-11
+>   `cos-simul-load-smoke.sh` Gate 1 becomes a DIVIDED-CEILING REGRESSION
+>   FLOOR (catches starvation-to-zero, not the unmet guarantee).
+> - **Codex r1 + AGY r1 MAJOR fix:** v1 ungated 3g/6g entirely → a
+>   starve-to-0 regression would pass silently. v2 keeps ALL four small
+>   classes (5201-5204) in the full-11 Gate 1 against a relaxed
+>   per-class regression floor calibrated BELOW today's full-11 values
+>   (100m≥60%, 1g≥40%, 3g≥25%, 6g≥25%), with an explicit
+>   `reported_ungated`-equivalent note that the ≥95% guarantee is NOT
+>   asserted under simul (it lives in the SOLO gate + #1692).
+> - **Codex r1 + AGY r1 fix:** the ~22-24 G number is expressed
+>   algebraically as `C_phys` (the platform's push RX→TX delivery
+>   ceiling), with 22-24 G footnoted as the measured loss-cluster
+>   reference value — NOT a universal product constant.
+> - **Codex r1 + Claude-SMR r1 fix:** the dropped flat per-flow-CoV gate
+>   is named as the concrete artifact — #1614 issue body line 113
+>   ("Per-flow CoV ≤ 5% under simultaneous load") — and the parent issue
+>   checklist is reconciled (a PR/#1614 comment records the drop). The
+>   #1614 body already cites #1217 at line 164, so the body is internally
+>   inconsistent; the rescope resolves it.
+> - **AGY r1 fix:** the starvation discriminator is given a formal
+>   3-condition algebraic definition (actual < guarantee AND unguaranteed
+>   classes allocated AND ΣG < C_phys).
+> - **Codex r1 fix:** explicitly call out that `cos-gate1-small-four-alone.sh`
+>   is the #1630 SOLO gate and is NOT the #1614 simul gate, to avoid
+>   conflation.
 
 This is the **Path B "do first"** deliverable spun out of the #1614
 simul-load CoS-regression research
@@ -92,22 +129,36 @@ three internally consistent.
   ports **5201, 5202, 5203, 5204** (100m, 1g, 3g, 6g) each hit ≥ 95% of
   shape under all-11-class simul load. Comment: "100m, 1g, 3g, 6g all
   fit under 18G; if guarantee-rate mode active, each should hit ≥ 95%."
-  - **This is the bug the rescope fixes.** The research §3.B (and §2.4
-    small4+24g) measured 3g/6g at ~54%/51% under simul contention —
-    they are NOT honored. That under-protection is a CONFIRMED defect
-    with an UNRESOLVED mechanism, deferred to instrument-first #1692.
-    Gate 1 as written would FAIL on master today and conflates the
-    real (settled) small-class guarantee (100m/1g) with the §3.B defect
-    (3g/6g). Asserting a number the production daemon cannot hit, for a
-    reason that is a separate open issue, is exactly the unsatisfiable
-    bar the research flags.
+  - **This is the bug the rescope fixes.** This harness runs ALL 11
+    classes in parallel. Under full-11 simul the research §2.1 measured
+    **100m=86%, 1g=63%, 3g=43%, 6g=41%** — NOT one of the four hits the
+    ≥95% guarantee, because the ~22-24 G ceiling divides among 11
+    backlogged classes (§3.A). The ≥95% guarantee is a SOLO / few-
+    competitor property (§2.4 small4+24g: 100m=94%, 1g=94%; #1630 SOLO
+    A/B: 100m=95.0%, 1g=95.3%). Asserting ≥95% on the full-11 harness is
+    unsatisfiable for EVERY one of the four — including 1g — for the
+    ceiling-division reason the research §2.1/§3.A documents, NOT a
+    fixable bug. (For 3g/6g there is ALSO the separate §3.B
+    under-protection defect deferred to #1692; but even 100m/1g cannot
+    hit ≥95% under full-11.) Gate 1 as written fails master today.
   - The harness COMPUTES `cov_pct` per class but does NOT gate on it —
-    there is no per-flow-CoV pass/fail in the harness code. So the
-    per-flow-CoV "drop" is a doc/charter action, not a harness code
-    deletion. The harness change is narrowing Gate 1 to the classes the
-    contract actually guarantees under simul load.
+    there is no per-flow-CoV pass/fail in the harness code (lines 132,
+    140, 156). So the per-flow-CoV "drop" is a doc/charter action, not a
+    harness code deletion. The harness change is replacing the ≥95%
+    guarantee assertion with a DIVIDED-CEILING REGRESSION FLOOR.
 - Gate 2 (`gate_2_priority_low_min_share`) and Gate 3
   (`gate_3_retrans_floor`) are unaffected by this rescope.
+
+### 3.4 `test/incus/cos-gate1-small-four-alone.sh` — the #1630 SOLO gate (NOT touched, but called out)
+
+This separate harness (`#1630 Gate 1`) runs 5201-5204 with NO large-
+class competition and asserts each ≥ 95% (`cos-gate1-small-four-alone.sh:2`,
+`:63`). That is the SOLO/few-competitor scenario where the ≥95%
+guarantee IS achievable and is the correct home for the guarantee gate.
+This rescope does NOT touch it. The plan explicitly distinguishes it
+from the #1614 full-11 `cos-simul-load-smoke.sh` to avoid conflation
+(Codex r1 finding 6): the guarantee gate stays SOLO; the simul harness
+gets a regression floor only.
 
 ### 3.3 `docs/pr/1614-multi-rss-cos/plan.md` §7 — the historical PR gate list
 
@@ -126,97 +177,155 @@ three internally consistent.
 ### Edit set 1 — push-ceiling-division doc (commit 1)
 
 In `docs/fairness-regimes.md`, expand the CoS oversubscription section
-to add a subsection (placed right after the
-"oversubscription-policy" intro, before "Acceptance gates"):
+to add a subsection (placed right after the "oversubscription-policy"
+intro, before "Acceptance gates"). The ceiling is expressed
+algebraically as `C_phys` with 22-24 G footnoted as the measured
+loss-cluster reference value (Codex r1 finding 3, AGY r1 Q2):
 
-> **### Aggregate push ceiling is the per-class denominator (#1578/#1614 §3.A)**
+> **### Aggregate push ceiling `C_phys` is the per-class denominator (#1578/#1614 §3.A)**
 >
-> The push-direction forwarding throughput of the loss userspace
-> cluster pins at **~22-24 G aggregate** regardless of how many CoS
-> classes are backlogged (#1578 forwarding/TX ceiling). This is
-> RX→forward→TX capacity, NOT a CoS scheduler limit: `park_root = 0`
-> everywhere in the #1614 capture, so the 25 G root token bucket never
-> throttles — the limiter is upstream of the root token gate.
+> Let `C_phys` be the platform's push-direction RX→forward→TX delivery
+> ceiling — a hardware property (CPU, memory, PCIe, worker count), NOT
+> a CoS scheduler limit. On the standard `loss:` reference cluster
+> (6 mlx5 VF RX queues → 6 workers) `C_phys ≈ 22-24 G`, measured
+> consistently across 3-large (22.6 G), 6-large (21.6 G), full-11
+> (24.96 G) push and the 22.72 G reverse sanity (#1578, #1614 §2). It
+> is NOT a universal product constant; a different platform has a
+> different `C_phys`.
 >
-> The denominator every class divides is this ~22-24 G, NOT the sum of
-> configured `transmit-rate`. On the `cos-iperf-config.set` fixture the
-> configured exact-shape sum is **109 G — 4.5× the delivery ceiling**,
+> The denominator every backlogged class divides is `C_phys`, NOT the
+> sum of configured `transmit-rate`. On the `cos-iperf-config.set`
+> fixture the configured exact-shape sum is **109 G — 4.5× `C_phys`**,
 > so strict-exact is not simultaneously deliverable (the A4 commit
 > warning, #1618, fires on exactly this `sum_exact > shaping_rate`
-> condition). When N classes are simultaneously backlogged, the
-> ~22-24 G divides among them; per-class %-of-shape therefore drops as
+> condition). `park_root = 0` everywhere in the #1614 capture, so the
+> 25 G root token bucket never throttles — the limiter is upstream of
+> the root token gate. When N classes are simultaneously backlogged,
+> `C_phys` divides among them; per-class %-of-shape therefore drops as
 > N rises. Measured competitor-count sweep (#1614 §2.4): 3g reaches
-> 94% solo, 69% with one competitor, 54% with four — the deficit is
-> set by HOW MANY classes are backlogged, not by 3g's owner worker.
-> 18g pushed 14.25 G from a single owner worker (`park_root=0`), so the
+> 94% solo, 69% with one competitor, 54% with four — the deficit is set
+> by HOW MANY classes are backlogged, not by 3g's owner worker. 18g
+> pushed 14.25 G from a single owner worker (`park_root=0`), so the
 > ceiling is an aggregate property, not a per-worker funnel.
 >
-> **Reading divided-ceiling as starvation is a misread.** A class at
-> 22% of its configured shape under 11-class simul load is consistent
-> with the ceiling-division physics; it is a starvation SIGNAL only if
-> it falls below its guarantee-rate-protected share with measurable
-> aggregate headroom (the #1614 §3.B case, tracked separately in
-> #1692).
+> **Reading divided-ceiling as starvation is a misread.** A guaranteed
+> class `i` (guarantee `G_i = R_i × guarantee-rate fraction`) is
+> **starved** iff ALL THREE hold:
+> 1. `actual_i < G_i` (guarantee unmet), AND
+> 2. `Σ actual_j > 0` over unguaranteed classes (they ARE getting
+>    bandwidth while `i` is short), AND
+> 3. `Σ G_k < C_phys` over guaranteed classes (the guaranteed demand
+>    fits under the ceiling — there is recoverable headroom).
+>
+> If `Σ G_k ≥ C_phys`, or all unguaranteed classes are at 0 G while
+> `C_phys` is saturated, the shortfall is divided-ceiling physics, NOT
+> scheduler starvation. The #1614 §3.B 3g/6g case satisfies all three
+> (small4+24g: ΣG=10.1 G < 18.2 G achieved, 24g getting 12.6 G, 3g/6g
+> at 54/51%) — that is the genuine defect SIGNAL tracked in #1692.
 
 Also adjust the Phase 0 note (lines ~1120-1124) so it cross-references
-this as the push-direction equivalent of the 22.72 G reverse number,
-making it clear both directions hit the same ~22-24 G physics ceiling.
+this as the push-direction equivalent of the 22.72 G reverse number —
+both directions hit the same `C_phys` ≈ 22-24 G physics ceiling.
 
 ### Edit set 2 — gate rescope (commit 2)
 
 **`docs/fairness-regimes.md` "Acceptance gates under guarantee-rate
 mode":**
 
-1. Rewrite Gate 1 to scope the small-class absolute guarantee to the
-   classes the contract actually honors under simul load — **100m and
-   1g** (the two protected by `guarantee-rate 0.7` small-first per the
-   #1614 §2.4 small4+24g measurement: 100m=94%, 1g=94%). Add an
-   explicit note that 3g/6g under-protection under multi-class
-   contention is a CONFIRMED-but-mechanism-UNRESOLVED defect tracked in
-   #1692 and is NOT asserted by this gate until that issue resolves —
-   with a cross-reference to the divided-ceiling subsection.
-2. Add an explicit statement that the **flat per-flow-CoV gate
-   (≤ 5/10%) is DROPPED**: per #1220/#1244 the per-flow CoV within a
-   class is structural (≈ Cstruct), so the ONLY per-flow fairness gate
-   is the #1217 `observed_CoV ≤ Cstruct + 0.05` structural contract
-   already stated above. Cite #1220/#1244 by issue number.
-3. State that per-class %-of-shape gates are bounded by the §3.A
-   ceiling — gates may not assert per-class numbers whose sum exceeds
-   ~22-24 G.
+1. **Scope the ≥95% small-class guarantee gate to SOLO / few-competitor
+   runs, NOT the full-11 simul harness.** Under full-11, the §3.A
+   ceiling divides so NO class hits ≥95% (100m=86%, 1g=63%; §2.1) — the
+   ≥95% guarantee is achievable only SOLO (`cos-gate1-small-four-alone.sh`,
+   #1630: 100m=95.0%, 1g=95.3%) or with few competitors (§2.4
+   small4+24g: 100m/1g=94%). State that the full-11 simul harness
+   asserts a DIVIDED-CEILING REGRESSION FLOOR instead (below), and that
+   the ≥95% guarantee for 3g/6g under multi-class contention is a
+   CONFIRMED-but-mechanism-UNRESOLVED defect tracked in #1692.
+2. Add an explicit statement that the **flat per-flow-CoV gate is
+   DROPPED**: name the concrete artifact — **#1614 issue body line 113,
+   "Per-flow CoV ≤ 5% under simultaneous load"**. Per #1220/#1244 the
+   per-flow CoV within a class is structural (≈ `Cstruct` ≈ 53% at the
+   multinomial(12,6) floor), so the ONLY per-flow fairness gate is the
+   #1217 `observed_CoV ≤ Cstruct + 0.05` structural contract already
+   stated above. (The #1614 body line 164 already cites #1217 — the
+   body is internally inconsistent; this resolves it.)
+3. State that per-class %-of-shape gates under simul load are bounded by
+   `C_phys` — gates may not assert per-class numbers whose sum exceeds
+   `C_phys`.
 
-**`test/incus/cos-simul-load-smoke.sh` Gate 1:** narrow the
-`gate_1_small_class_guarantees` port set from `(5201, 5202, 5203,
-5204)` to `(5201, 5202)` (100m, 1g only), and rewrite the comment to
-cite the #1614 §3.B / #1692 deferral and the divided-ceiling reason
-3g/6g are not gated under simul load. Keep computing and REPORTING
-3g/6g %-shape (visibility), just stop gating on them. No change to
-Gate 2 / Gate 3 / the reverse Gate 8.
+**`test/incus/cos-simul-load-smoke.sh` Gate 1 — replace the ≥95%
+guarantee with a divided-ceiling regression floor:** keep ALL four
+small-class ports `(5201, 5202, 5203, 5204)` in
+`gate_1_small_class_guarantees` (so a starve-to-zero regression on ANY
+of them still trips — Codex r1 finding 2, AGY r1 Q1), but compute each
+target as a relaxed per-class regression floor calibrated BELOW today's
+full-11 measured value (§2.1: 100m=86%, 1g=63%, 3g=43%, 6g=41%), with
+margin for normal variance:
+
+```python
+# Divided-ceiling regression floor (NOT the ≥95% guarantee, which is
+# SOLO-only — see fairness-regimes.md / #1630 cos-gate1-small-four-alone.sh
+# and the #1614 §3.B 3g/6g defect tracked in #1692). Under full-11 simul
+# the ~22-24 G C_phys ceiling divides among 11 classes, so 100m=86%,
+# 1g=63%, 3g=43%, 6g=41% are EXPECTED (research §2.1). These floors only
+# catch a collapse (e.g. starve-to-zero), not the unmet guarantee.
+SIMUL_FLOOR_PCT = {5201: 0.60, 5202: 0.40, 5203: 0.25, 5204: 0.25}
+...
+if r["port"] in SIMUL_FLOOR_PCT:
+    target = r["shape_gbps"] * SIMUL_FLOOR_PCT[r["port"]]
+```
+
+Rename the gate field to make the semantics unambiguous (e.g.
+`gate_1_small_class_divided_ceiling_floor`) OR keep the key and add a
+`"semantics": "divided-ceiling regression floor, NOT >=95% guarantee
+(SOLO/#1692)"` annotation in the emitted JSON so a `verdict.json`
+reader cannot misread it as the guarantee gate. Keep computing and
+REPORTING all per-class %-shape. No change to Gate 2 / Gate 3 / reverse
+Gate 8.
 
 **`docs/pr/1614-multi-rss-cos/plan.md`:** append a dated "#1614
 research rescope (Path B / #1691)" pointer block at the END of the §7
 gate list (do NOT rewrite the historical criteria in place) recording:
-3g/6g simul guarantee deferred to #1692; per-flow-CoV gate is the
-#1217 structural form (flat bar dropped); per-class gates bounded by
-the §3.A ceiling. SSOT for the live contract is `fairness-regimes.md`.
+the ≥95% 3g/6g simul guarantee (§7 crit 1) is SOLO-only; the full-11
+simul gate is a divided-ceiling regression floor; 3g/6g simul
+under-protection deferred to #1692; the flat per-flow-CoV gate (#1614
+body line 113) is dropped, replaced by the #1217 structural form;
+per-class simul gates bounded by `C_phys`. SSOT for the live contract
+is `fairness-regimes.md`.
+
+**Parent issue reconciliation:** post a comment on #1614 (or note in
+the #1691 PR body, cross-linked) recording that body acceptance-line
+113 ("Per-flow CoV ≤ 5%") is DROPPED per #1220/#1244 in favor of the
+#1217 structural gate, and that the 3g/6g ≥95% simul guarantee is
+deferred to #1692. This closes the open question of where the dropped
+gate physically lives (Claude-SMR r1 F1).
 
 ## 5. Public API preservation
 
-No code API. The smoke harness's `verdict.json` schema is preserved:
-`gate_1_small_class_guarantees` keeps its shape (`classes[]` + `pass`)
-— only the membership of the gated port set changes. Gates 2/3/8
-byte-identical. Any consumer reading the verdict keys still finds them.
+No code API. The smoke harness's `verdict.json` keeps Gate 1's
+`classes[]` + `pass` shape; the gated port set stays all four (5201-
+5204), only the per-port TARGET changes (≥95% → divided-ceiling floor)
+plus an added `semantics` annotation (or a renamed key). Gates 2/3/8
+byte-identical. A consumer reading `gate_1_*.pass` still finds it; the
+annotation prevents misreading the floor as the guarantee.
 
 ## 6. Hidden invariants the change must preserve
 
-- **Gate 1 must still catch a real 100m/1g regression.** Narrowing to
-  5201/5202 keeps the two classes whose guarantee IS contractually
-  honored (#1614 §2.4) under the ≥95% bar. A regression that drops
-  100m or 1g below 95% under simul still fails. We are removing a bar
-  the daemon provably cannot meet for a reason that is a separate open
-  defect — not removing real coverage.
+- **Gate 1 must still catch a real collapse on ALL FOUR small classes.**
+  Keeping 5201-5204 in the gate against a divided-ceiling floor means a
+  starve-to-zero (or near-zero) regression on 100m/1g/3g/6g still trips
+  (Codex r1 finding 2 / AGY r1 Q1). We are NOT ungating any class — we
+  are replacing an unsatisfiable ≥95% guarantee bar (which the full-11
+  ceiling-division makes impossible for every class incl 1g) with a
+  floor calibrated below today's measured value so only a real
+  regression fails.
+- **The ≥95% guarantee gate is preserved where it is achievable** — the
+  SOLO `cos-gate1-small-four-alone.sh` (#1630) is untouched. The
+  guarantee is not weakened; it is asserted in the correct scenario.
 - **3g/6g visibility preserved.** The harness keeps computing and
-  printing 3g/6g %-shape so the #1692 instrument-first round can read
-  the numbers; only the pass/fail assertion is removed.
+  printing 3g/6g %-shape so the #1692 round can read the numbers; the
+  ≥95% guarantee pass/fail (not achievable under simul) is the only
+  thing removed, replaced by the floor.
 - **#1217 structural CoV contract untouched.** The
   `observed_CoV ≤ Cstruct + 0.05` gate is the surviving per-flow
   fairness gate; we are not weakening it, only naming the flat bar it
@@ -229,11 +338,12 @@ byte-identical. Any consumer reading the verdict keys still finds them.
 
 | Class | Level | Rationale |
 |-------|-------|-----------|
-| Behavioral regression | LOW | No code path changed; smoke gate narrowed to classes the daemon honors. Zero dataplane edit. |
+| Behavioral regression | LOW | No code path changed; smoke gate retargeted (not removed). Zero dataplane edit. |
 | Lifetime / borrow-checker | N/A | No Rust touched. |
-| Performance regression | NONE | No hot-path / control-path code change. Docs + one Python gate tuple + comments. |
+| Performance regression | NONE | No hot-path / control-path code change. Docs + one Python gate-target map + comments. |
 | Architectural mismatch (#961/#946-P2) | LOW | This is the research's own recommended Path B "do first"; it documents physics rather than asserting a mechanism. The only mismatch risk is mis-stating the contract — which is the explicit PLAN-KILL criterion. |
-| Coverage-loss risk | MED→reviewed | Narrowing Gate 1 could mask a real 3g/6g improvement/regression. Mitigated: 3g/6g stay reported (not gated), and #1692 owns their gate. Reviewers must confirm this does not hide a regression that today's Gate 1 would catch. |
+| Coverage-loss risk | LOW (was the v1 defect) | v2 keeps ALL FOUR small classes in Gate 1 against a divided-ceiling floor (no class ungated), so a starve-to-zero regression still trips. The floor is calibrated below today's full-11 values; a real collapse fails, normal ceiling-division does not. The ≥95% guarantee stays on the SOLO #1630 gate. |
+| Floor-calibration risk | LOW-MED | Floors (60/40/25/25%) are below §2.1 measured values (86/63/43/41%) with ~30% margin; too-tight would flake, too-loose would miss a partial regression. Reviewers should sanity-check the margin against expected run-to-run variance. |
 
 ## 8. Test plan
 
@@ -244,8 +354,9 @@ task charter. Gates:
 - [ ] `python3 -c "import ast; ast.parse(open('test/incus/cos-simul-load-smoke.sh'...))"` — the embedded Python in the smoke script parses (it is a heredoc'd `python3 - <<PY`; validate by extracting and `python3 -m py_compile`, or run `bash -n` on the script).
 - [ ] `bash -n test/incus/cos-simul-load-smoke.sh` — shell syntax clean.
 - [ ] Go suite stays green: `GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go test ./...` — no Go code touched, but run to confirm no doc-embedded test references broke (the CoS parser commit-warning test `parser_class_of_service_test.go` references the fixture, not the doc).
-- [ ] Internal consistency: the three artifacts (fairness-regimes.md, smoke harness, 1614 plan pointer) agree on (a) which classes Gate 1 covers, (b) the per-flow-CoV gate being the #1217 structural form, (c) the ~22-24 G ceiling as denominator.
-- [ ] `Closes #1691` present in PR body; harness tags stripped from all GitHub-bound text.
+- [ ] Floor-calibration sanity: each per-port floor (60/40/25/25%) is strictly below the §2.1 measured value (86/63/43/41%) with margin, and the embedded Python applies the floor map correctly (extract heredoc + `python3 -m py_compile`).
+- [ ] Internal consistency: the four artifacts (fairness-regimes.md, cos-simul-load-smoke.sh, the #1630 SOLO harness call-out, 1614 plan pointer) agree on (a) the simul Gate 1 being a divided-ceiling floor while ≥95% guarantee is SOLO-only, (b) the per-flow-CoV gate being the #1217 structural form with #1614 body line 113 named as dropped, (c) `C_phys` ≈ 22-24 G as the loss-cluster denominator.
+- [ ] `Closes #1691` present in PR body; harness tags stripped from all GitHub-bound text; #1614 parent-issue checklist reconciled (comment or PR-body cross-link).
 
 NO cargo build/test needed (no Rust touched). NO cluster smoke needed
 (no dataplane change). State this explicitly in the PR.
@@ -264,27 +375,28 @@ NO cargo build/test needed (no Rust touched). NO cluster smoke needed
 
 ## 10. Open questions for adversarial review (each invitable to PLAN-KILL)
 
-1. **Is narrowing smoke Gate 1 from {100m,1g,3g,6g} to {100m,1g} the
-   right move, or does it hide a regression?** The research says 3g/6g
-   are a separate confirmed defect (#1692); but is removing the
-   pass/fail assertion the correct action, or should the gate instead
-   assert a LOWER (divided-ceiling) bar for 3g/6g so a *further*
-   regression below ~52% still trips? PLAN-KILL if removing the
-   assertion entirely loses necessary regression coverage.
-2. **Is the ~22-24 G "physics" framing defensible as a documented
-   contract number, or is it a single-cluster artifact** that should
-   not be enshrined in `fairness-regimes.md` as a denominator? The
-   research measured it on `loss:` only.
-3. **Does the doc rescope correctly characterize the per-flow-CoV
-   drop?** The doc already uses the #1217 structural form, not a flat
-   bar. Is there any remaining flat per-flow-CoV gate anywhere
-   (harness, plan, issue body) that this rescope fails to neutralize,
-   making the "drop" incomplete?
-4. **Is appending a pointer to the archival #1614 plan the right
-   discipline**, or should that doc be left entirely alone (SSOT purely
-   in fairness-regimes.md)?
-5. **Divided-ceiling vs starvation discriminator.** The doc says a
-   class is starved "only if it falls below its guarantee-rate-protected
-   share with measurable aggregate headroom." Is that discriminator
-   precise enough to be useful to an operator, or does it just restate
-   #1692's open question? PLAN-KILL if the framing is circular.
+v2 resolved the round-1 findings (Codex r1 #1/#2 the unsatisfiable gate
++ ungating; AGY r1 Q1 the regression floor; both on `C_phys`; Claude-SMR
+r1 F1/F2 on the dropped-gate artifact + verdict annotation; Codex r1 #5
+the discriminator formula; Codex r1 #6 the SOLO-gate conflation). Open
+for r2:
+
+1. **Are the divided-ceiling floors (60/40/25/25%) calibrated right?**
+   They sit below §2.1 (86/63/43/41%) with ~30% margin. Too tight risks
+   run-to-run flake on a doc-only smoke; too loose misses a partial
+   regression. Is the margin defensible, or should the floor be derived
+   as a fraction of the LAST GREEN run instead of a hardcoded constant?
+2. **Is `C_phys` the right abstraction**, or does naming a symbol for a
+   single measured number over-formalize a hardware artifact? The doc
+   footnotes 22-24 G as the loss-cluster value — is that enough scoping?
+3. **Does the rescope leave any flat per-flow-CoV gate un-neutralized?**
+   v2 names #1614 body line 113 as the dropped artifact. Confirm no
+   other harness/doc/issue still asserts a flat per-flow-CoV bar.
+4. **Is the starvation 3-condition discriminator operationally
+   measurable** from the existing smoke `verdict.json` + control-socket
+   counters, or does it require data the operator does not have at
+   smoke time (making it a #1692 concern, not a Path B deliverable)?
+5. **Should the parent #1614 checklist be edited directly** (it is the
+   gate SSOT the task names) or only reconciled via a comment + the
+   live `fairness-regimes.md` SSOT? Is appending to the archival #1614
+   PR plan the right discipline, or leave it untouched?
