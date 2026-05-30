@@ -11,7 +11,8 @@ use super::tx_completion::cos_tick_for_ns;
 use crate::afxdp::types::{
     COS_PRIORITY_LEVELS, CoSInterfaceConfig, CoSInterfaceRuntime, CoSOversubscriptionPolicy,
     CoSQueueConfigState, CoSQueueDropCounters, CoSQueueHotState, CoSQueueOwnerProfile,
-    CoSQueueRuntime, CoSQueueTelemetry, CoSTimerWheelRuntime, ForwardingState, VMinQueueState,
+    CoSQueueRuntime, CoSQueueTelemetry, CoSQueueWaterfillCounters, CoSTimerWheelRuntime,
+    ForwardingState, VMinQueueState,
 };
 #[allow(unused_imports)]
 use CoSOversubscriptionPolicy as _;
@@ -108,6 +109,8 @@ pub(in crate::afxdp) fn build_cos_interface_runtime(
         exact_queues_by_rate_ascending,
         waterfill_pass1_remaining_bytes: 0,
         waterfill_phase2_cursor: 0,
+        waterfill_epochs: 0,
+        waterfill_phase1_budget_breaks: 0,
         exact_guarantee_rr: 0,
         nonexact_guarantee_rr: 0,
         #[cfg(test)]
@@ -177,6 +180,7 @@ pub(in crate::afxdp) fn build_cos_interface_runtime(
                 },
                 telemetry: CoSQueueTelemetry {
                     drop_counters: CoSQueueDropCounters::default(),
+                    waterfill_counters: CoSQueueWaterfillCounters::default(),
                     owner_profile: CoSQueueOwnerProfile::new(),
                 },
                 queue_lease_v8: None,

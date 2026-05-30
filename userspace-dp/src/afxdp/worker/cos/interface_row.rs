@@ -56,4 +56,15 @@ pub(super) fn accumulate_interface_root(
             .map(std::vec::Vec::len)
             .sum::<usize>(),
     );
+    // #1628: per-interface waterfill trace counters (this worker's view).
+    // Plain `u64`, single-writer (owner worker), read here on the same
+    // worker thread. Summed across this worker's bindings for the
+    // interface, like timer_level*_sleepers; the coordinator then sums
+    // across workers (SUM) and computes the per-worker MIN
+    // (`waterfill_min_epochs_per_worker`). `min_epochs_per_worker` itself
+    // is NOT set here — it is coordinator-only.
+    entry.waterfill_epochs = entry.waterfill_epochs.saturating_add(root.waterfill_epochs);
+    entry.waterfill_phase1_budget_breaks = entry
+        .waterfill_phase1_budget_breaks
+        .saturating_add(root.waterfill_phase1_budget_breaks);
 }

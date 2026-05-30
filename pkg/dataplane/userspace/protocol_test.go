@@ -1264,6 +1264,78 @@ func TestCoSQueueStatusStarvationCountersParity1642(t *testing.T) {
 	}
 }
 
+func TestCoSWaterfillCountersParity1628(t *testing.T) {
+	// Decode wire JSON exactly as Rust CoSQueueStatus / CoSInterfaceStatus
+	// (protocol/cos.rs) emit the #1628 waterfill trace counters; assert the
+	// Go mirror reads each field (JSON tags match byte-for-byte).
+	const rustQueueJSON = `{
+		"queue_id": 5,
+		"waterfill_phase1_admissions": 12,
+		"waterfill_phase2_admissions": 34,
+		"waterfill_eligible_visits": 56
+	}`
+	var gotQueue CoSQueueStatus
+	if err := json.Unmarshal([]byte(rustQueueJSON), &gotQueue); err != nil {
+		t.Fatalf("unmarshal Rust CoSQueueStatus JSON: %v", err)
+	}
+	if gotQueue.WaterfillPhase1Admissions != 12 {
+		t.Errorf("waterfill_phase1_admissions dropped: got %d, want 12", gotQueue.WaterfillPhase1Admissions)
+	}
+	if gotQueue.WaterfillPhase2Admissions != 34 {
+		t.Errorf("waterfill_phase2_admissions dropped: got %d, want 34", gotQueue.WaterfillPhase2Admissions)
+	}
+	if gotQueue.WaterfillEligibleVisits != 56 {
+		t.Errorf("waterfill_eligible_visits dropped: got %d, want 56", gotQueue.WaterfillEligibleVisits)
+	}
+
+	const rustIfaceJSON = `{
+		"ifindex": 80,
+		"waterfill_epochs": 1000,
+		"waterfill_phase1_budget_breaks": 7,
+		"waterfill_min_epochs_per_worker": 3
+	}`
+	var gotIface CoSInterfaceStatus
+	if err := json.Unmarshal([]byte(rustIfaceJSON), &gotIface); err != nil {
+		t.Fatalf("unmarshal Rust CoSInterfaceStatus JSON: %v", err)
+	}
+	if gotIface.WaterfillEpochs != 1000 {
+		t.Errorf("waterfill_epochs dropped: got %d, want 1000", gotIface.WaterfillEpochs)
+	}
+	if gotIface.WaterfillPhase1BudgetBreaks != 7 {
+		t.Errorf("waterfill_phase1_budget_breaks dropped: got %d, want 7", gotIface.WaterfillPhase1BudgetBreaks)
+	}
+	if gotIface.WaterfillMinEpochsPerWorker != 3 {
+		t.Errorf("waterfill_min_epochs_per_worker dropped: got %d, want 3", gotIface.WaterfillMinEpochsPerWorker)
+	}
+
+	// Forward direction: Go-marshaled JSON must carry the exact wire keys
+	// (so a Rust deserializer with #[serde(rename)] reads them).
+	rawQ, _ := json.Marshal(&CoSQueueStatus{
+		WaterfillPhase1Admissions: 1,
+		WaterfillPhase2Admissions: 1,
+		WaterfillEligibleVisits:   1,
+	})
+	rawI, _ := json.Marshal(&CoSInterfaceStatus{
+		WaterfillEpochs:             1,
+		WaterfillPhase1BudgetBreaks: 1,
+		WaterfillMinEpochsPerWorker: 1,
+	})
+	for raw, keys := range map[string][]string{
+		string(rawQ): {"waterfill_phase1_admissions", "waterfill_phase2_admissions", "waterfill_eligible_visits"},
+		string(rawI): {"waterfill_epochs", "waterfill_phase1_budget_breaks", "waterfill_min_epochs_per_worker"},
+	} {
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(raw), &obj); err != nil {
+			t.Fatalf("unmarshal obj: %v", err)
+		}
+		for _, key := range keys {
+			if _, ok := obj[key]; !ok {
+				t.Errorf("wire key %q missing from JSON: %s", key, raw)
+			}
+		}
+	}
+}
+
 func TestBindingStatusPostDrainBackupCosDropsParity1642(t *testing.T) {
 	// Rust serializes post_drain_backup_cos_drops / _cos_drop_bytes on
 	// BindingStatus (protocol/binding.rs), NOT on CoSQueueStatus. Feed

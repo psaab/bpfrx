@@ -804,6 +804,9 @@ fn select_exact_cos_guarantee_queue_waterfill(
         let pass1 = ((quantum_sum as f64) * frac).floor() as u64;
         root.waterfill_pass1_remaining_bytes = pass1;
         root.waterfill_phase2_cursor = 0;
+        // #1628 site 1: completed-epoch / Phase-1-refill counter. Bumped
+        // here (no `queue` borrowed yet) on every lazy refill.
+        root.waterfill_epochs = root.waterfill_epochs.wrapping_add(1);
     }
     // Phase 1: ascending-rate walk. Pick the first runnable queue
     // whose secondary_budget ≤ pass1_remaining. Tracks honored
@@ -833,6 +836,23 @@ fn select_exact_cos_guarantee_queue_waterfill(
             continue;
         };
         let head_len = cos_item_len(head);
+        // #1628 (r4 AGY): hoist `kind` next to `head_len` so `head`'s
+        // immutable borrow of `queue` ends HERE — both are `Copy`. This
+        // lets the per-queue telemetry mutations below (`&mut queue`)
+        // compile, and the `return` reuses `kind` instead of re-matching
+        // `head`.
+        let kind = match head {
+            CoSPendingTxItem::Local(_) => ExactCoSQueueKind::Local,
+            CoSPendingTxItem::Prepared(_) => ExactCoSQueueKind::Prepared,
+        };
+        // #1628 site 2: Phase-1 eligible visit — counted after the
+        // eligibility gate + head-present, BEFORE the token gate, so a
+        // token-starved-but-owned queue is still a visit.
+        queue.telemetry.waterfill_counters.eligible_visits = queue
+            .telemetry
+            .waterfill_counters
+            .eligible_visits
+            .wrapping_add(1);
         if root.tokens < head_len {
             queue
                 .telemetry
@@ -907,6 +927,11 @@ fn select_exact_cos_guarantee_queue_waterfill(
             // Budget exhausted before this ascending queue could
             // be honored. Fall through to Phase 2 (descending
             // walk over queues NOT in honored_mask).
+            // #1628 site 3: Phase-1 budget-exhausted break. Per-INTERFACE
+            // (the break only sees the first crossing queue). Disjoint
+            // `root` field, same pattern as the `:913` write below.
+            root.waterfill_phase1_budget_breaks =
+                root.waterfill_phase1_budget_breaks.wrapping_add(1);
             break;
         }
         // Phase 1 honor: consume the budget, mark honored, return.
@@ -917,10 +942,15 @@ fn select_exact_cos_guarantee_queue_waterfill(
             honored_mask |= 1u64 << queue_idx;
         }
         root.exact_guarantee_rr = (queue_idx + 1) % queue_count;
-        let kind = match head {
-            CoSPendingTxItem::Local(_) => ExactCoSQueueKind::Local,
-            CoSPendingTxItem::Prepared(_) => ExactCoSQueueKind::Prepared,
-        };
+        // #1628 site 4: Phase-1 honor admission. `head` already dropped
+        // (kind hoisted above), so this `&mut queue` write compiles.
+        if let Some(queue) = root.queues.get_mut(queue_idx) {
+            queue.telemetry.waterfill_counters.phase1_admissions = queue
+                .telemetry
+                .waterfill_counters
+                .phase1_admissions
+                .wrapping_add(1);
+        }
         return Some(ExactCoSQueueSelection {
             queue_idx,
             secondary_budget: send_budget,
@@ -987,6 +1017,20 @@ fn select_exact_cos_guarantee_queue_waterfill(
             continue;
         };
         let head_len = cos_item_len(head);
+        // #1628 (r4 AGY): hoist `kind` so `head`'s borrow of `queue` ends
+        // here (both `Copy`), allowing the per-queue telemetry writes
+        // below to compile.
+        let kind = match head {
+            CoSPendingTxItem::Local(_) => ExactCoSQueueKind::Local,
+            CoSPendingTxItem::Prepared(_) => ExactCoSQueueKind::Prepared,
+        };
+        // #1628 site 5: Phase-2 eligible visit — counted after the
+        // eligibility gate + head-present, BEFORE the token gate.
+        queue.telemetry.waterfill_counters.eligible_visits = queue
+            .telemetry
+            .waterfill_counters
+            .eligible_visits
+            .wrapping_add(1);
         if root.tokens < head_len || queue.hot.tokens < head_len {
             // Don't park in Phase 2 — the queue may legitimately
             // wait for next epoch. The legacy selector parks; we
@@ -1008,10 +1052,15 @@ fn select_exact_cos_guarantee_queue_waterfill(
             .max(head_len);
         root.waterfill_phase2_cursor = (phase2_idx + 1) % sorted_indices.len();
         root.exact_guarantee_rr = (queue_idx + 1) % queue_count;
-        let kind = match head {
-            CoSPendingTxItem::Local(_) => ExactCoSQueueKind::Local,
-            CoSPendingTxItem::Prepared(_) => ExactCoSQueueKind::Prepared,
-        };
+        // #1628 site 6: Phase-2 admission. `head` already dropped (kind
+        // hoisted above), so this `&mut queue` write compiles.
+        if let Some(queue) = root.queues.get_mut(queue_idx) {
+            queue.telemetry.waterfill_counters.phase2_admissions = queue
+                .telemetry
+                .waterfill_counters
+                .phase2_admissions
+                .wrapping_add(1);
+        }
         return Some(ExactCoSQueueSelection {
             queue_idx,
             secondary_budget: candidate_budget,

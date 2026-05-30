@@ -934,6 +934,88 @@ func TestEmitCoSDrainPhaseTelemetry_EmitsNonExactExactBacklogCounter(t *testing.
 	}
 }
 
+// #1628: emitCoSWaterfillTelemetry must surface the per-queue admission/
+// visit counters and the per-interface epochs/breaks/min-epochs metrics
+// with the right labels and metric types.
+func TestEmitCoSWaterfillTelemetry_EmitsQueueAndInterfaceMetrics(t *testing.T) {
+	c := &xpfCollector{
+		cosWaterfillPhase1Admissions: prometheus.NewDesc(
+			"xpf_userspace_cos_waterfill_phase1_admissions_total", "t",
+			[]string{"ifindex", "queue_id"}, nil),
+		cosWaterfillPhase2Admissions: prometheus.NewDesc(
+			"xpf_userspace_cos_waterfill_phase2_admissions_total", "t",
+			[]string{"ifindex", "queue_id"}, nil),
+		cosWaterfillEligibleVisits: prometheus.NewDesc(
+			"xpf_userspace_cos_waterfill_eligible_visits_total", "t",
+			[]string{"ifindex", "queue_id"}, nil),
+		cosWaterfillEpochs: prometheus.NewDesc(
+			"xpf_userspace_cos_waterfill_epochs_total", "t",
+			[]string{"ifindex"}, nil),
+		cosWaterfillPhase1BudgetBreaks: prometheus.NewDesc(
+			"xpf_userspace_cos_waterfill_phase1_budget_breaks_total", "t",
+			[]string{"ifindex"}, nil),
+		cosWaterfillMinEpochsPerWorker: prometheus.NewDesc(
+			"xpf_userspace_cos_waterfill_min_epochs_per_worker", "t",
+			[]string{"ifindex"}, nil),
+	}
+	status := dpuserspace.ProcessStatus{
+		CoSInterfaces: []dpuserspace.CoSInterfaceStatus{{
+			Ifindex:                     80,
+			WaterfillEpochs:             1000,
+			WaterfillPhase1BudgetBreaks: 7,
+			WaterfillMinEpochsPerWorker: 3,
+			Queues: []dpuserspace.CoSQueueStatus{{
+				QueueID:                   5,
+				WaterfillPhase1Admissions: 12,
+				WaterfillPhase2Admissions: 34,
+				WaterfillEligibleVisits:   56,
+			}},
+		}},
+	}
+
+	ch := make(chan prometheus.Metric)
+	go func() {
+		c.emitCoSWaterfillTelemetry(ch, status)
+		close(ch)
+	}()
+	counters := map[*prometheus.Desc]float64{}
+	var sawMinGauge bool
+	for m := range ch {
+		var pb dto.Metric
+		if err := m.Write(&pb); err != nil {
+			t.Fatalf("metric.Write: %v", err)
+		}
+		if m.Desc() == c.cosWaterfillMinEpochsPerWorker {
+			if pb.Gauge == nil {
+				t.Fatalf("min_epochs_per_worker must be a gauge: %+v", &pb)
+			}
+			if pb.Gauge.GetValue() != 3 {
+				t.Fatalf("min_epochs gauge: got %v want 3", pb.Gauge.GetValue())
+			}
+			sawMinGauge = true
+			continue
+		}
+		if pb.Counter == nil {
+			t.Fatalf("waterfill metric %s must be a counter: %+v", m.Desc(), &pb)
+		}
+		counters[m.Desc()] = pb.Counter.GetValue()
+	}
+
+	want := map[*prometheus.Desc]float64{
+		c.cosWaterfillPhase1Admissions:   12,
+		c.cosWaterfillPhase2Admissions:   34,
+		c.cosWaterfillEligibleVisits:     56,
+		c.cosWaterfillEpochs:             1000,
+		c.cosWaterfillPhase1BudgetBreaks: 7,
+	}
+	if !reflect.DeepEqual(counters, want) {
+		t.Fatalf("waterfill counter values: got %+v, want %+v", counters, want)
+	}
+	if !sawMinGauge {
+		t.Fatalf("min_epochs_per_worker gauge not emitted")
+	}
+}
+
 // #1219: emitBindingActiveFlowCount must surface the per-binding
 // xpf_userspace_binding_active_flow_count gauge with labels
 // {binding_slot, queue_id, worker_id, iface}. Mirrors the

@@ -239,4 +239,20 @@ pub(super) fn accumulate_queue_row(
             .drain_park_queue_tokens
             .load(Ordering::Relaxed),
     );
+    // #1628: per-class waterfill trace counters. Plain `u64` on
+    // `CoSQueueTelemetry.waterfill_counters`, single-writer (owner worker)
+    // read here on the SAME worker thread (this fn runs in
+    // build_worker_cos_statuses on the owner) — no atomic load needed.
+    // Summed across worker instances like the drop/park counters; a queue
+    // has one owner so only its owner's instance is non-zero in steady
+    // state, and summing is safe regardless.
+    status.waterfill_phase1_admissions = status
+        .waterfill_phase1_admissions
+        .saturating_add(queue.telemetry.waterfill_counters.phase1_admissions);
+    status.waterfill_phase2_admissions = status
+        .waterfill_phase2_admissions
+        .saturating_add(queue.telemetry.waterfill_counters.phase2_admissions);
+    status.waterfill_eligible_visits = status
+        .waterfill_eligible_visits
+        .saturating_add(queue.telemetry.waterfill_counters.eligible_visits);
 }

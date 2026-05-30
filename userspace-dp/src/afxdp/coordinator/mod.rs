@@ -917,6 +917,12 @@ pub(super) fn aggregate_cos_statuses_across_workers(
 ) -> Vec<crate::protocol::CoSInterfaceStatus> {
     let mut interfaces = BTreeMap::<i32, crate::protocol::CoSInterfaceStatus>::new();
     let mut queue_maps = BTreeMap::<i32, BTreeMap<u8, crate::protocol::CoSQueueStatus>>::new();
+    // #1628: tracks, per ifindex, whether the backlog-guarded
+    // `waterfill_min_epochs_per_worker` MIN has been seeded by a first
+    // active-exact-backlog worker yet. Cannot use `entry.worker_instances`
+    // (counts idle workers too) nor `or_default()` (seeds 0, which would
+    // pin a `.min()` to 0 forever — the r3 finding).
+    let mut min_epochs_seeded = std::collections::HashSet::<i32>::new();
     for snapshot in worker_snapshots {
         for iface in snapshot.iter() {
             let entry = interfaces.entry(iface.ifindex).or_default();
@@ -935,6 +941,38 @@ pub(super) fn aggregate_cos_statuses_across_workers(
             entry.timer_level1_sleepers = entry
                 .timer_level1_sleepers
                 .saturating_add(iface.timer_level1_sleepers);
+            // #1628: per-interface waterfill counters. epochs +
+            // phase1_budget_breaks SUM across workers (cluster event
+            // counters, like timer_level*_sleepers).
+            entry.waterfill_epochs =
+                entry.waterfill_epochs.saturating_add(iface.waterfill_epochs);
+            entry.waterfill_phase1_budget_breaks = entry
+                .waterfill_phase1_budget_breaks
+                .saturating_add(iface.waterfill_phase1_budget_breaks);
+            // #1628: waterfill_min_epochs_per_worker — MIN over the
+            // per-worker `waterfill_epochs`, but ONLY over workers that
+            // have current active exact-guarantee backlog on this
+            // interface. An idle worker never advances its epochs (it
+            // skips drain_shaped_tx), so including it would pin the MIN at
+            // 0 and mask a real Phase-2 lock-in on a busy worker (r3
+            // finding). Seed on first inclusion (not or_default()'s 0).
+            let iface_has_active_exact_backlog = iface.queues.iter().any(|q| {
+                q.exact
+                    && q.guarantee_enabled
+                    && (q.queued_bytes > 0 || q.queued_packets > 0)
+            });
+            if iface_has_active_exact_backlog {
+                if min_epochs_seeded.insert(iface.ifindex) {
+                    entry.waterfill_min_epochs_per_worker = iface.waterfill_epochs;
+                } else {
+                    entry.waterfill_min_epochs_per_worker = entry
+                        .waterfill_min_epochs_per_worker
+                        .min(iface.waterfill_epochs);
+                }
+            }
+            // If NO worker has active exact backlog, the field stays at
+            // its or_default() 0 — the documented "no active lock-in
+            // candidate" sentinel, not a false lock-in.
             let queue_map = queue_maps.entry(iface.ifindex).or_default();
             for queue in &iface.queues {
                 let q = queue_map.entry(queue.queue_id).or_default();
@@ -1006,6 +1044,17 @@ pub(super) fn aggregate_cos_statuses_across_workers(
                 q.tx_ring_full_submit_stalls = q
                     .tx_ring_full_submit_stalls
                     .saturating_add(queue.tx_ring_full_submit_stalls);
+                // #1628: per-class waterfill trace counters, summed across
+                // worker snapshots (same as the drop/park counters above).
+                q.waterfill_phase1_admissions = q
+                    .waterfill_phase1_admissions
+                    .saturating_add(queue.waterfill_phase1_admissions);
+                q.waterfill_phase2_admissions = q
+                    .waterfill_phase2_admissions
+                    .saturating_add(queue.waterfill_phase2_admissions);
+                q.waterfill_eligible_visits = q
+                    .waterfill_eligible_visits
+                    .saturating_add(queue.waterfill_eligible_visits);
                 // #709: cross-worker aggregation for owner-profile
                 // counters is sum, not max. Histograms and invocation
                 // counters must stay coherent after aggregation;

@@ -96,6 +96,14 @@ type xpfCollector struct {
 	cosDrainGuaranteeSentBytes                    *prometheus.Desc
 	cosDrainSurplusSentBytes                      *prometheus.Desc
 	cosDrainNonExactSentBytesWhileExactBacklogged *prometheus.Desc
+	// #1628: per-class waterfill-selector trace counters. Per-queue
+	// (admissions/visits) plus per-interface (epochs/breaks/min-epochs).
+	cosWaterfillPhase1Admissions   *prometheus.Desc
+	cosWaterfillPhase2Admissions   *prometheus.Desc
+	cosWaterfillEligibleVisits     *prometheus.Desc
+	cosWaterfillEpochs             *prometheus.Desc
+	cosWaterfillPhase1BudgetBreaks *prometheus.Desc
+	cosWaterfillMinEpochsPerWorker *prometheus.Desc
 	// #1304: Rust-owned opt-in equal-flow enforcement telemetry for
 	// shared v8 CoS queue leases. Kept separate from the
 	// measurement-only xpf_fairness_equal_flow_* estimator gauges.
@@ -263,6 +271,12 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.cosDrainGuaranteeSentBytes
 	ch <- c.cosDrainSurplusSentBytes
 	ch <- c.cosDrainNonExactSentBytesWhileExactBacklogged
+	ch <- c.cosWaterfillPhase1Admissions
+	ch <- c.cosWaterfillPhase2Admissions
+	ch <- c.cosWaterfillEligibleVisits
+	ch <- c.cosWaterfillEpochs
+	ch <- c.cosWaterfillPhase1BudgetBreaks
+	ch <- c.cosWaterfillMinEpochsPerWorker
 	ch <- c.cosEqualFlowEnforcementEnabled
 	ch <- c.cosEqualFlowEnforced
 	ch <- c.cosEqualFlowTargetPerFlowBPS

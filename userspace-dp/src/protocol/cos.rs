@@ -160,6 +160,21 @@ pub(crate) struct CoSInterfaceStatus {
     pub timer_level0_sleepers: usize,
     #[serde(rename = "timer_level1_sleepers", default)]
     pub timer_level1_sleepers: usize,
+    // #1628: per-interface waterfill-selector trace counters. `epochs` and
+    // `phase1_budget_breaks` are SUMMED across worker instances (cluster
+    // event counters, like timer_level*_sleepers).
+    // `min_epochs_per_worker` is the coordinator's MIN over the per-worker
+    // `epochs` values, taken ONLY over workers with active exact-guarantee
+    // backlog (so an idle worker's frozen 0 does not mask a real Phase-2
+    // lock-in on another worker); 0 means "no active lock-in candidate on
+    // this interface", NOT "locked at 0". Set only by the coordinator
+    // aggregation; per-worker snapshots leave it 0.
+    #[serde(rename = "waterfill_epochs", default)]
+    pub waterfill_epochs: u64,
+    #[serde(rename = "waterfill_phase1_budget_breaks", default)]
+    pub waterfill_phase1_budget_breaks: u64,
+    #[serde(rename = "waterfill_min_epochs_per_worker", default)]
+    pub waterfill_min_epochs_per_worker: u64,
     #[serde(default)]
     pub queues: Vec<CoSQueueStatus>,
 }
@@ -322,6 +337,21 @@ pub(crate) struct CoSQueueStatus {
     /// per-queue write via an `apply_*` early-return / queue miss.
     #[serde(rename = "drain_sent_bytes_shaped_unconditional", default)]
     pub drain_sent_bytes_shaped_unconditional: u64,
+    // #1628: per-class waterfill-selector trace counters, aggregated
+    // across worker instances for this (ifindex, queue_id). Zero on the
+    // Proportional (legacy RR) selector path — non-zero means this
+    // interface is in `guarantee-rate` mode. Diagnostic only; the
+    // scheduler reads none of these. JSON tags MUST match the Go mirror
+    // (pkg/dataplane/userspace/protocol.go) byte-for-byte. See
+    // `types::CoSQueueWaterfillCounters` for the INTERPRETATION contract
+    // (these are evidence to combine with queued_bytes + *_starvation_parks,
+    // not standalone fingerprints).
+    #[serde(rename = "waterfill_phase1_admissions", default)]
+    pub waterfill_phase1_admissions: u64,
+    #[serde(rename = "waterfill_phase2_admissions", default)]
+    pub waterfill_phase2_admissions: u64,
+    #[serde(rename = "waterfill_eligible_visits", default)]
+    pub waterfill_eligible_visits: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]

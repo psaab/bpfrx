@@ -26,6 +26,7 @@ func (c *xpfCollector) collectUserspaceStatus(ch chan<- prometheus.Metric, dp ap
 	}
 	c.emitCoSOwnerProfile(ch, status)
 	c.emitCoSDrainPhaseTelemetry(ch, status)
+	c.emitCoSWaterfillTelemetry(ch, status)
 	c.emitCoSEqualFlowEnforcement(ch, status)
 	c.emitWorkerRuntime(ch, status)
 	c.emitUserspaceDynamicBufferMetrics(ch, status)
@@ -852,6 +853,59 @@ func (c *xpfCollector) emitCoSDrainPhaseTelemetry(ch chan<- prometheus.Metric, s
 				c.cosDrainNonExactSentBytesWhileExactBacklogged,
 				prometheus.CounterValue,
 				float64(queue.DrainNonExactSentBytesWhileExactBacklogged),
+				ifindexLabel, queueLabel,
+			)
+		}
+	}
+}
+
+// #1628: per-class waterfill-selector trace counters. Per-queue
+// admissions/visits plus per-interface epochs/breaks (counters) and the
+// min-epochs-per-worker stalled-core flag (gauge). Diagnostic only —
+// these never feed a scheduling decision; they exist to make the
+// #1630-verified Phase-2 lock-in + queue-ownership fragmentation
+// empirically visible. Zero on the Proportional (legacy RR) selector
+// path. Not gated on OwnerWorkerID: a queue's row is owner-attributed
+// already, and the per-interface MIN is computed coordinator-side.
+func (c *xpfCollector) emitCoSWaterfillTelemetry(ch chan<- prometheus.Metric, status dpuserspace.ProcessStatus) {
+	for _, iface := range status.CoSInterfaces {
+		ifindexLabel := strconv.Itoa(iface.Ifindex)
+		ch <- prometheus.MustNewConstMetric(
+			c.cosWaterfillEpochs,
+			prometheus.CounterValue,
+			float64(iface.WaterfillEpochs),
+			ifindexLabel,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			c.cosWaterfillPhase1BudgetBreaks,
+			prometheus.CounterValue,
+			float64(iface.WaterfillPhase1BudgetBreaks),
+			ifindexLabel,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			c.cosWaterfillMinEpochsPerWorker,
+			prometheus.GaugeValue,
+			float64(iface.WaterfillMinEpochsPerWorker),
+			ifindexLabel,
+		)
+		for _, queue := range iface.Queues {
+			queueLabel := strconv.Itoa(queue.QueueID)
+			ch <- prometheus.MustNewConstMetric(
+				c.cosWaterfillPhase1Admissions,
+				prometheus.CounterValue,
+				float64(queue.WaterfillPhase1Admissions),
+				ifindexLabel, queueLabel,
+			)
+			ch <- prometheus.MustNewConstMetric(
+				c.cosWaterfillPhase2Admissions,
+				prometheus.CounterValue,
+				float64(queue.WaterfillPhase2Admissions),
+				ifindexLabel, queueLabel,
+			)
+			ch <- prometheus.MustNewConstMetric(
+				c.cosWaterfillEligibleVisits,
+				prometheus.CounterValue,
+				float64(queue.WaterfillEligibleVisits),
 				ifindexLabel, queueLabel,
 			)
 		}

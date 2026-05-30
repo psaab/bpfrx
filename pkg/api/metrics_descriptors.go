@@ -281,6 +281,36 @@ func newCollector(srv *Server) *xpfCollector {
 			"Non-exact CoS queue bytes sent while at least one exact queue on the same shaped interface still had backlog; non-zero deltas indicate best-effort/uncapped service competing with exact demand (#1369).",
 			[]string{"ifindex", "queue_id"}, nil,
 		),
+		cosWaterfillPhase1Admissions: prometheus.NewDesc(
+			"xpf_userspace_cos_waterfill_phase1_admissions_total",
+			"Times this CoS queue was admitted by the guarantee-rate waterfill Phase-1 (small-first honored) walk. Combine with phase2_admissions + queued_bytes + *_starvation_parks to diagnose Phase-2 lock-in (#1628).",
+			[]string{"ifindex", "queue_id"}, nil,
+		),
+		cosWaterfillPhase2Admissions: prometheus.NewDesc(
+			"xpf_userspace_cos_waterfill_phase2_admissions_total",
+			"Times this CoS queue was admitted by the guarantee-rate waterfill Phase-2 (descending residual) walk. Climbing while phase1_admissions stays flat is evidence (not proof) of Phase-2 lock-in for a small class within the Phase-1 budget (#1628).",
+			[]string{"ifindex", "queue_id"}, nil,
+		),
+		cosWaterfillEligibleVisits: prometheus.NewDesc(
+			"xpf_userspace_cos_waterfill_eligible_visits_total",
+			"Times the guarantee-rate waterfill selector reached this CoS queue eligible (nonempty/runnable/guarantee/exact) and evaluated it (both phases, before the token gate). Low value + high *_starvation_parks = backlogged-but-parked; low + low parks + zero queued = idle on this owner (#1628).",
+			[]string{"ifindex", "queue_id"}, nil,
+		),
+		cosWaterfillEpochs: prometheus.NewDesc(
+			"xpf_userspace_cos_waterfill_epochs_total",
+			"Completed guarantee-rate waterfill epochs (Phase-1 budget refills) on this CoS interface, summed across workers (#1628).",
+			[]string{"ifindex"}, nil,
+		),
+		cosWaterfillPhase1BudgetBreaks: prometheus.NewDesc(
+			"xpf_userspace_cos_waterfill_phase1_budget_breaks_total",
+			"Times the guarantee-rate waterfill Phase-1 walk broke into Phase 2 because the next ascending queue's cost exceeded the remaining Phase-1 budget, summed across workers. High breaks-per-epoch means Phase 1 routinely exhausts its budget mid-walk (#1628).",
+			[]string{"ifindex"}, nil,
+		),
+		cosWaterfillMinEpochsPerWorker: prometheus.NewDesc(
+			"xpf_userspace_cos_waterfill_min_epochs_per_worker",
+			"Minimum waterfill_epochs across workers WITH active exact-guarantee backlog on this CoS interface. A worker locked in Phase-2 keeps its epochs frozen, dropping this MIN even while the summed epochs climb. 0 = no active lock-in candidate on the interface (#1628).",
+			[]string{"ifindex"}, nil,
+		),
 		cosEqualFlowEnforcementEnabled: prometheus.NewDesc(
 			"xpf_userspace_cos_equal_flow_enforcement_enabled",
 			"1 when this exact CoS queue's shared v8 lease is configured for opt-in equal-flow suppression (#1304).",

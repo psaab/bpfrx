@@ -353,6 +353,69 @@ without reading them is how we ship dormant code.
   `xpf_userspace_cos_drain_nonexact_sent_bytes_while_exact_backlogged_total{...}`.
   Expected cardinality per the plan: ≤ 8192 series per histogram.
 
+## Reading the waterfill trace counters (#1628)
+
+For interfaces in `oversubscription-policy guarantee-rate` mode the
+two-phase waterfill selector
+(`select_exact_cos_guarantee_queue_waterfill`) carries per-class trace
+counters. They surface on `show class-of-service interface` and
+Prometheus to make the #1630-verified root cause — multi-worker
+queue-ownership fragmentation + the Phase-1/Phase-2 split — empirically
+visible. They are **diagnostic only**: the scheduler reads none of them,
+and they are zero on the default Proportional (legacy RR) path.
+
+```
+show class-of-service interface reth0.80
+  ...
+  Waterfill:                epochs=412 phase1_budget_breaks=9 min_epochs_per_worker=3
+    Queue 5 ...
+           Waterfill:    phase1_admit=0  phase2_admit=512  eligible_visits=540
+```
+
+Per-queue (a queue has ONE owner worker, so the row reflects that
+worker):
+
+- `phase1_admit` / `phase2_admit` — admissions via the Phase-1
+  (small-first honored) vs Phase-2 (descending residual) walk.
+- `eligible_visits` — times the selector reached this queue eligible and
+  evaluated it (both phases, BEFORE the token gate).
+
+Per-interface (summed across workers, except the MIN):
+
+- `epochs` — completed Phase-1 budget refills (cluster SUM).
+- `phase1_budget_breaks` — times Phase 1 ran out of budget mid-walk and
+  fell into Phase 2 (cluster SUM). High breaks-per-epoch = Phase 1
+  routinely can't honor the ascending set.
+- `min_epochs_per_worker` — MIN of `epochs` across workers WITH active
+  exact-guarantee backlog. A worker locked in Phase 2 keeps its epochs
+  frozen, dropping this MIN well below the SUM — that gap is the
+  single-stalled-core flag. `0` = no active lock-in candidate on the
+  interface (not "locked at 0").
+
+**Interpretation contract — these are EVIDENCE, not standalone
+fingerprints.** `phase1_admit=0, phase2_admit>0` is a Phase-2 lock-in
+ONLY when combined with, on the same queue row:
+
+- `queued_bytes > 0` (the class has backlog), AND
+- `root_token_starvation_parks` / `queue_token_starvation_parks` rising
+  (it is being parked), AND
+- the class is SMALL — its configured `transmit-rate` fits within the
+  interface Phase-1 budget (`shaping-rate × guarantee-fraction`).
+
+For a LARGE class above the Phase-1 cutoff the identical shape
+(`phase1=0, phase2>0, backlog, parks`) is HEALTHY rate-limiting — it was
+never meant to win Phase 1. A class with zero `queued_bytes` and no parks
+is simply idle on that owner, not starved (a token-parked backlogged
+queue is `!runnable` and skipped at the eligibility gate, so it shows LOW
+`eligible_visits` — pair with the park counters to tell parked from
+idle).
+
+Prometheus: `xpf_userspace_cos_waterfill_phase1_admissions_total`,
+`..._phase2_admissions_total`, `..._eligible_visits_total` (per
+`{ifindex, queue_id}`); `xpf_userspace_cos_waterfill_epochs_total`,
+`..._phase1_budget_breaks_total`, and the gauge
+`xpf_userspace_cos_waterfill_min_epochs_per_worker` (per `{ifindex}`).
+
 ## CPU pinning layout for the loss lab
 
 **Measured 2026-04-17 for #712 Option A.** Conclusion: the

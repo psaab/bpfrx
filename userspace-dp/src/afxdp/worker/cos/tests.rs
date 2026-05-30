@@ -190,6 +190,8 @@ fn build_worker_cos_statuses_aggregates_runtime_by_interface_and_queue() {
             exact_queues_by_rate_ascending: Vec::new(),
         waterfill_pass1_remaining_bytes: 0,
         waterfill_phase2_cursor: 0,
+        waterfill_epochs: 0,
+        waterfill_phase1_budget_breaks: 0,
             exact_guarantee_rr: 0,
             nonexact_guarantee_rr: 0,
             #[cfg(test)]
@@ -234,6 +236,8 @@ fn build_worker_cos_statuses_aggregates_runtime_by_interface_and_queue() {
                 },
                 telemetry: crate::afxdp::types::CoSQueueTelemetry {
                     drop_counters,
+                    waterfill_counters:
+                        crate::afxdp::types::CoSQueueWaterfillCounters::default(),
                     owner_profile: CoSQueueOwnerProfile::new(),
                 },
                 queue_lease_v8: None,
@@ -358,6 +362,8 @@ fn build_worker_cos_statuses_sums_owner_profile_without_breaking_hist_invariant(
         exact_queues_by_rate_ascending: Vec::new(),
         waterfill_pass1_remaining_bytes: 0,
         waterfill_phase2_cursor: 0,
+        waterfill_epochs: 0,
+        waterfill_phase1_budget_breaks: 0,
         exact_guarantee_rr: 0,
         nonexact_guarantee_rr: 0,
         #[cfg(test)]
@@ -402,6 +408,7 @@ fn build_worker_cos_statuses_sums_owner_profile_without_breaking_hist_invariant(
             },
             telemetry: crate::afxdp::types::CoSQueueTelemetry {
                 drop_counters: CoSQueueDropCounters::default(),
+                waterfill_counters: CoSQueueWaterfillCounters::default(),
                 owner_profile: CoSQueueOwnerProfile::new(),
             },
             queue_lease_v8: None,
@@ -589,6 +596,8 @@ fn build_worker_cos_statuses_owner_profile_only_surfaces_on_unambiguous_owner_lo
         exact_queues_by_rate_ascending: Vec::new(),
         waterfill_pass1_remaining_bytes: 0,
         waterfill_phase2_cursor: 0,
+        waterfill_epochs: 0,
+        waterfill_phase1_budget_breaks: 0,
         exact_guarantee_rr: 0,
         nonexact_guarantee_rr: 0,
         #[cfg(test)]
@@ -634,6 +643,7 @@ fn build_worker_cos_statuses_owner_profile_only_surfaces_on_unambiguous_owner_lo
                 },
                 telemetry: crate::afxdp::types::CoSQueueTelemetry {
                     drop_counters: CoSQueueDropCounters::default(),
+                    waterfill_counters: CoSQueueWaterfillCounters::default(),
                     owner_profile: CoSQueueOwnerProfile::new(),
                 },
                 queue_lease_v8: None,
@@ -678,6 +688,7 @@ fn build_worker_cos_statuses_owner_profile_only_surfaces_on_unambiguous_owner_lo
                 },
                 telemetry: crate::afxdp::types::CoSQueueTelemetry {
                     drop_counters: CoSQueueDropCounters::default(),
+                    waterfill_counters: CoSQueueWaterfillCounters::default(),
                     owner_profile: CoSQueueOwnerProfile::new(),
                 },
                 queue_lease_v8: None,
@@ -722,6 +733,7 @@ fn build_worker_cos_statuses_owner_profile_only_surfaces_on_unambiguous_owner_lo
                 },
                 telemetry: crate::afxdp::types::CoSQueueTelemetry {
                     drop_counters: CoSQueueDropCounters::default(),
+                    waterfill_counters: CoSQueueWaterfillCounters::default(),
                     owner_profile: CoSQueueOwnerProfile::new(),
                 },
                 queue_lease_v8: None,
@@ -868,6 +880,8 @@ fn build_worker_cos_statuses_owner_profile_stays_zero_for_ambiguous_multi_exact_
         exact_queues_by_rate_ascending: Vec::new(),
         waterfill_pass1_remaining_bytes: 0,
         waterfill_phase2_cursor: 0,
+        waterfill_epochs: 0,
+        waterfill_phase1_budget_breaks: 0,
         exact_guarantee_rr: 0,
         nonexact_guarantee_rr: 0,
         #[cfg(test)]
@@ -913,6 +927,7 @@ fn build_worker_cos_statuses_owner_profile_stays_zero_for_ambiguous_multi_exact_
                 },
                 telemetry: crate::afxdp::types::CoSQueueTelemetry {
                     drop_counters: CoSQueueDropCounters::default(),
+                    waterfill_counters: CoSQueueWaterfillCounters::default(),
                     owner_profile: CoSQueueOwnerProfile::new(),
                 },
                 queue_lease_v8: None,
@@ -957,6 +972,7 @@ fn build_worker_cos_statuses_owner_profile_stays_zero_for_ambiguous_multi_exact_
                 },
                 telemetry: crate::afxdp::types::CoSQueueTelemetry {
                     drop_counters: CoSQueueDropCounters::default(),
+                    waterfill_counters: CoSQueueWaterfillCounters::default(),
                     owner_profile: CoSQueueOwnerProfile::new(),
                 },
                 queue_lease_v8: None,
@@ -1064,6 +1080,8 @@ fn build_worker_cos_statuses_owner_profile_stays_zero_for_ambiguous_multi_interf
         exact_queues_by_rate_ascending: Vec::new(),
         waterfill_pass1_remaining_bytes: 0,
         waterfill_phase2_cursor: 0,
+        waterfill_epochs: 0,
+        waterfill_phase1_budget_breaks: 0,
         exact_guarantee_rr: 0,
         nonexact_guarantee_rr: 0,
         #[cfg(test)]
@@ -1108,6 +1126,7 @@ fn build_worker_cos_statuses_owner_profile_stays_zero_for_ambiguous_multi_interf
             },
             telemetry: crate::afxdp::types::CoSQueueTelemetry {
                 drop_counters: CoSQueueDropCounters::default(),
+                waterfill_counters: CoSQueueWaterfillCounters::default(),
                 owner_profile: CoSQueueOwnerProfile::new(),
             },
             queue_lease_v8: None,
@@ -1263,6 +1282,8 @@ fn build_worker_cos_statuses_surfaces_distinct_per_queue_drain_telemetry() {
         exact_queues_by_rate_ascending: Vec::new(),
         waterfill_pass1_remaining_bytes: 0,
         waterfill_phase2_cursor: 0,
+        waterfill_epochs: 0,
+        waterfill_phase1_budget_breaks: 0,
         exact_guarantee_rr: 0,
         nonexact_guarantee_rr: 0,
         #[cfg(test)]
@@ -1308,6 +1329,7 @@ fn build_worker_cos_statuses_surfaces_distinct_per_queue_drain_telemetry() {
                 },
                 telemetry: crate::afxdp::types::CoSQueueTelemetry {
                     drop_counters: CoSQueueDropCounters::default(),
+                    waterfill_counters: CoSQueueWaterfillCounters::default(),
                     owner_profile: CoSQueueOwnerProfile::new(),
                 },
                 queue_lease_v8: None,
@@ -1352,6 +1374,7 @@ fn build_worker_cos_statuses_surfaces_distinct_per_queue_drain_telemetry() {
                 },
                 telemetry: crate::afxdp::types::CoSQueueTelemetry {
                     drop_counters: CoSQueueDropCounters::default(),
+                    waterfill_counters: CoSQueueWaterfillCounters::default(),
                     owner_profile: CoSQueueOwnerProfile::new(),
                 },
                 queue_lease_v8: None,
@@ -2338,6 +2361,8 @@ fn active_flow_buckets_peak_is_max_not_sum_across_workers() {
             exact_queues_by_rate_ascending: Vec::new(),
         waterfill_pass1_remaining_bytes: 0,
         waterfill_phase2_cursor: 0,
+        waterfill_epochs: 0,
+        waterfill_phase1_budget_breaks: 0,
             exact_guarantee_rr: 0,
             nonexact_guarantee_rr: 0,
             #[cfg(test)]
@@ -2382,6 +2407,7 @@ fn active_flow_buckets_peak_is_max_not_sum_across_workers() {
                 },
                 telemetry: crate::afxdp::types::CoSQueueTelemetry {
                     drop_counters: CoSQueueDropCounters::default(),
+                    waterfill_counters: CoSQueueWaterfillCounters::default(),
                     owner_profile: CoSQueueOwnerProfile::new(),
                 },
                 queue_lease_v8: None,

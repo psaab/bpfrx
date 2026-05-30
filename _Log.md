@@ -4424,3 +4424,31 @@ top.
   scripts/test_mtr_report_check.py, scripts/userspace-ha-validation.sh,
   docs/userspace-ha-validation.md, docs/pr/1303-mtr-smoke/plan.md,
   docs/pr/1303-mtr-smoke/reviewer-ids.md, _Log.md
+
+- **Timestamp**: 2026-05-29
+- **Action**: #1628 — added per-class waterfill trace-counter
+  instrumentation to the CoS guarantee-rate selector. New
+  `CoSQueueWaterfillCounters` (phase1_admissions / phase2_admissions /
+  eligible_visits) on `CoSQueueTelemetry` + per-interface
+  `waterfill_epochs` / `waterfill_phase1_budget_breaks` on
+  `CoSInterfaceRuntime`; written inline at the six waterfill
+  return/break/refill sites (kind hoisted so the head borrow ends before
+  the per-queue mutation). Snapshot aggregation sums per-queue counters
+  (queue_row.rs) and per-interface SUM + backlog-guarded MIN
+  (`waterfill_min_epochs_per_worker`, coordinator/mod.rs) so a single
+  Phase-2-locked worker is visible. Wire surface mirrored across
+  protocol/cos.rs + Go protocol.go; Prometheus descriptors + emit; `show
+  class-of-service` render. Observability only — no scheduling change.
+  Rust 1621 lib + new unit tests 5/5; Go api + userspace parity/emit
+  tests pass. Plan reviewed Codex+AGY through PLAN-READY (4 rounds).
+- **File(s)**: userspace-dp/src/afxdp/types/cos.rs,
+  userspace-dp/src/afxdp/cos/{builders.rs,queue_service/mod.rs,
+  queue_service/tests.rs,tx_completion_tests.rs},
+  userspace-dp/src/afxdp/worker/cos/{queue_row.rs,interface_row.rs,
+  tests.rs}, userspace-dp/src/afxdp/coordinator/{mod.rs,tests.rs},
+  userspace-dp/src/protocol/cos.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  pkg/dataplane/userspace/{protocol.go,protocol_test.go,cosfmt.go},
+  pkg/api/{metrics.go,metrics_descriptors.go,metrics_userspace.go,
+  metrics_test.go}, docs/cos-validation-notes.md,
+  docs/pr/1628-cos-instr/{plan.md,reviewer-ids.md}, _Log.md
