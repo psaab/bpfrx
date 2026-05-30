@@ -240,10 +240,10 @@ landing on physics).
    admit path (§3.B.1).
 4. **NOT simple Phase-2 relegation** — 3g/6g are Phase-1-admitted
    (phase2_admit ≤0.2%).
-5. **STILL OPEN:** v8 lease acquire / shared-exact behavior, root FCFS
+5. **NOT the per-flow CoV** — see §3.2 (structural, PLAN-KILL).
+6. **STILL OPEN:** v8 lease acquire / shared-exact behavior, root FCFS
    pool ordering, and a per-worker budget interaction not visible in the
    aggregated #1628 counters. The /engineer round must instrument these.
-4. **NOT the per-flow CoV** — see §3.2.
 
 ### 3.1 Why the SYMPTOM differs from the original #1614 capture
 
@@ -342,8 +342,12 @@ Independent of Path A:
    the per-class denominator (it is #1578's documented forwarding
    ceiling, not a CoS bug). Sum-exact = 109 G is 4.5× it.
 2. The A4 commit warning (shipped #1618) already fires on
-   `sum_exact > shaping_rate`. Verify it fires for this fixture (it
-   should — 109 G > 25 G) and that the message names the ceiling.
+   `sum_exact > shaping_rate` (`pkg/config/compiler.go:1105`,
+   test `parser_class_of_service_test.go:906`). VERIFIED it WILL fire on
+   this fixture (109 G exact-sum > 25 G shaping) and names the active
+   policy. Path B item 2 is largely already done; the remaining work is
+   wording it to name the §3.A *delivery* ceiling, not just the configured
+   shaping-rate.
 3. Re-scope #1614 gates: per-CLASS achievement is the fixable target
    (Path A); per-FLOW CoV ≤ 5/10% is structurally unreachable (§3.2) and
    must be DROPPED or replaced by the #1217 structural-CoV contract

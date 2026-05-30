@@ -26,3 +26,10 @@ external dispatch; only v2 went to Codex + AGY.
 ## v3 (folds Codex r1 + AGY r1; §3.B reframed UNRESOLVED, instrument-first)
 - Claude SMR r3: PLAN-READY.
 - Codex r2: re-dispatched on v3 (see below).
+- Codex r2 task-mpshjyjq-qxu8ib: PLAN-READY (v3 resolves all r1 MAJORs;
+  one editorial nit §3.C numbering — fixed).
+
+## CONVERGENCE (plan v3): 3-of-3 PLAN-READY
+- Codex r2: PLAN-READY
+- AGY r1: PLAN-READY (epoch-lockout mechanism contributed; SMR cross-checked)
+- Claude SMR r3: PLAN-READY
