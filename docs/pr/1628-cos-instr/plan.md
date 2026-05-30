@@ -1,12 +1,20 @@
 # #1628 — Empirical per-class waterfill trace counters for the CoS scheduler
 
-**Status:** DRAFT v4 — addresses round-3 (Codex `task-mprukdm1-lrsriq`
-PLAN-NEEDS-MAJOR, AGY `adversarial-review-mprukj68-etaisl` PLAN-NEEDS-MINOR,
-convergent on one finding). v1 cleared the redesign; v2 the counter set; v3 the
-borrow shape + framing; v4 fixes the MIN-aggregation idle-worker conflation +
-default-0 trap, the small-class qualifier on the lock-in signature, the
-write-site assignment/borrow-ordering, and removes stale helper text. Pending
-re-review.
+**Status:** PLAN-READY v5 — Codex `task-mpruu0t3-syur98` r4 PLAN-READY (no
+findings); AGY `adversarial-review-mpruu5b6-4oryi3` r4 PLAN-NEEDS-MINOR (one
+new compile-borrow defect at the eligible-visit sites). v5 applies the AGY fix:
+hoist the `kind` match next to `head_len` so `head`'s borrow ends before any
+`queue.telemetry` write. All earlier rounds' findings resolved. Ready to
+implement.
+
+### v4→v5 reviewer-driven change (round 4)
+
+- **AGY r4 (new, real): borrow conflict at the eligible-visit writes.** `head`
+  (`&`-borrow of `queue`) is still used at the `return`'s `match head`, so a
+  `&mut queue.telemetry` write before the return conflicts. → **Hoist
+  `let kind = match head {...}` up next to `head_len`** (both `Copy`), ending
+  `head`'s borrow immediately; all telemetry writes then compile and the return
+  uses the pre-computed `kind`. §4c. Codex r4 was PLAN-READY independently.
 
 ### v3→v4 reviewer-driven changes (round 3)
 
@@ -309,37 +317,45 @@ Verified against the real control flow (Codex + AGY both confirmed). All
 increments use the explicit `x = x.wrapping_add(1)` assignment form — a bare
 `x.wrapping_add(1)` expression statement is a no-op (r3 AGY catch).
 
-**Borrow ordering (r3 Codex):** at the per-queue sites, `head` is a `&`-borrow
-of `queue` (`let head = cos_queue_front(queue)`) that is STILL used at the
-return (`mod.rs:920 match head` / `:1011`). A `&mut queue.telemetry` write
-while `head` is live would conflict. So each per-queue site first computes the
-owned scalars it needs (`head_len`, and at the return sites the `kind` match on
-`head`), ending the `head` borrow, THEN bumps `queue.telemetry`. For the
-eligible-visit sites the bump goes after `let head_len = cos_item_len(head)`
-(head no longer needed for the visit count). For the admission sites the bump
-goes after `let kind = match head { ... }` (the last use of `head`), before the
-`return`.
+**Borrow ordering (r3 Codex + r4 AGY).** At the per-queue sites, `head` is a
+`&`-borrow of `queue` (`let head = cos_queue_front(queue)`). In the current
+source `head` is STILL used at the return (`mod.rs:920 match head` / `:1011`),
+so a `&mut queue.telemetry` write at the eligible-visit site (between the
+`head` definition and the return) would conflict — `head` outlives it. r4 AGY
+flagged this as a real compile defect in the v3/v4 wording. The fix is to
+**hoist the `kind` match next to `head_len`, immediately after `head` is
+obtained, so `head`'s borrow ends right there** (both `head_len: u64` and
+`kind: ExactCoSQueueKind` are `Copy`). After that line `head` is dead, every
+subsequent `queue.telemetry` mutation compiles, and the `return` uses the
+pre-computed `kind` instead of re-matching `head`. This is a small reorder of
+the existing `let kind = match head {...}` (currently at `:920` / `:1011`) up
+to just after `head_len`; no behavior change.
 
 1. **Epoch refill** (`mod.rs:793` `if waterfill_pass1_remaining_bytes == 0`):
    `root.waterfill_epochs = root.waterfill_epochs.wrapping_add(1);` (no `queue`
    borrowed yet — pre-loop).
-2. **Phase-1 eligible visit** (`mod.rs:835` after `let head_len =
-   cos_item_len(head);`): `queue.telemetry.waterfill_counters.eligible_visits =
-   ...wrapping_add(1);`.
+2. **Phase-1 eligible visit** — after hoisting `let head_len = ...; let kind =
+   match head {...};` (so `head` is dead):
+   `queue.telemetry.waterfill_counters.eligible_visits =
+   queue.telemetry.waterfill_counters.eligible_visits.wrapping_add(1);`.
 3. **Phase-1 budget-exhausted break** (`mod.rs:906`, before `break` at `:910`):
    `root.waterfill_phase1_budget_breaks =
    root.waterfill_phase1_budget_breaks.wrapping_add(1);` (disjoint root field;
-   same pattern as the existing `:913` write — compiles with `queue`/`head`
-   live).
-4. **Phase-1 honor return** (`mod.rs:924`, after `let kind = match head {...}`
-   at `:920`, before `return Some(...)`): bump the chosen queue's
-   `phase1_admissions`.
-5. **Phase-2 eligible visit** (`mod.rs:989` after `let head_len =
-   cos_item_len(head);`): bump `eligible_visits` (so the visit count covers
-   both phases' reachability).
-6. **Phase-2 admission return** (`mod.rs:1015`, after the `kind` match at
-   `:1011`, before `return Some(...)`): bump the chosen queue's
-   `phase2_admissions`.
+   same pattern as the existing `:913` write — compiles regardless of the
+   `queue` borrow since it touches a different `root` field).
+4. **Phase-1 honor** (before `return Some(...)`, using the hoisted `kind`):
+   `queue.telemetry.waterfill_counters.phase1_admissions =
+   ...wrapping_add(1);`.
+5. **Phase-2 eligible visit** — after the hoisted `head_len`/`kind` in the
+   Phase-2 body: bump `eligible_visits` (so the visit count covers both phases'
+   reachability).
+6. **Phase-2 admission** (before `return Some(...)`, using the hoisted `kind`):
+   bump the chosen queue's `phase2_admissions`.
+
+The implementation must hoist `kind` in BOTH the Phase-1 ascending loop and the
+Phase-2 descending loop; the unit tests then confirm the `kind`-hoist did not
+change which variant is returned (the selector's Local/Prepared dispatch is
+unaffected).
 
 **All increments are INLINE; no helper that takes `&mut root` (r2 finding
 F1).** A `count_waterfill_event(&mut root, queue_idx, ...)` helper would NOT

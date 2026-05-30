@@ -52,6 +52,17 @@ task-id here so a continuation can fetch results by id after session-state loss.
 - MINOR (Codex): stale count_waterfill_event text at §5/§7 contradicts the v3 no-helper invariant. Remove.
 - Confirmed by BOTH: inline disjoint-field root writes compile (mod.rs:913 pattern); v8 fair-share deferral correct.
 
+## Plan review (round 4 — v4 @ 02aef42c1)
+
+| Reviewer | Task ID | Verdict | Notes |
+|---|---|---|---|
+| Codex | task-mpruu0t3-syur98 | PLAN-READY | no findings; all r3 fixes confirmed |
+| AGY | adversarial-review-mpruu5b6-4oryi3 | PLAN-NEEDS-MINOR | r3 fixes confirmed; 1 NEW borrow defect at eligible-visit sites |
+| Claude SMR | (in-conversation) | PLAN-READY (post-fix) | AGY borrow catch is real; fixed in v5 by hoisting `kind` |
+
+### r4 → v5: AGY's new borrow defect
+At eligible-visit sites `head` (&queue) is live at the return's `match head`, so a &mut queue.telemetry write before the return won't compile. Fix: hoist `let kind = match head {...}` next to `head_len` (both Copy) so head's borrow ends immediately; return uses pre-computed kind. Applied in plan v5 §4c. Codex r4 was PLAN-READY independently; AGY's fix is a pure plan-wording/ordering correction with no counter-set change → no further round needed (the fix is mechanically forced and both reviewers will see it land in the code review).
+
 ## Code review (round 1)
 
 | Reviewer | Task ID | Verdict | Notes |
