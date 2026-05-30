@@ -391,6 +391,8 @@ func validateTypedLeaf(node *Node, leafSchema *schemaNode, parentPath []string, 
 			validatedAny = true
 			lastWasSeparator = false
 		}
+		// Non-empty separator-only tails like ["to"] or ["to", "to"] reach
+		// here with no validated value tokens.
 		if !validatedAny || lastWasSeparator {
 			return typedLeafErrorf(path, "missing value")
 		}

@@ -81,6 +81,7 @@ func TestWalker_MultiValueTail_RejectsMissingValue(t *testing.T) {
 func TestWalker_MultiValueTail_RejectsDanglingSeparator(t *testing.T) {
 	for _, keys := range [][]string{
 		{"destination-port", "to"},
+		{"destination-port", "to", "20000"},
 		{"destination-port", "20000", "to"},
 		{"destination-port", "20000", "to", "to", "20003"},
 	} {
