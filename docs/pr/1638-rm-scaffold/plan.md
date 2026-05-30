@@ -1,6 +1,9 @@
 # #1638 — remove dead parallel-prefix scaffolding (BookEntry + PolicyRule)
 
-**Status:** DRAFT v1 — pending adversarial plan review (Codex + AGY + Claude SMR)
+**Status:** v2 — PLAN-READY (AGY r1 PLAN-READY; Claude SMR r1 PLAN-READY;
+Codex r1 PLAN-NEEDS-MINOR, both minors addressed in v2: §3.2 read-site wording
+corrected; §4.4 preserves `test_policy_rule_v3_any4_any6_tokens` live
+match-any coverage)
 
 ## 1. Issue framing
 
@@ -77,8 +80,13 @@ Whole-crate grep (`grep -rn 'prefixes_v4|prefixes_v6|source_prefixes|
 destination_prefixes|build_rule_side_arc' userspace-dp/src/`):
 - **Outside `policy.rs`/`policy_tests.rs`: ZERO references** to the in-memory
   scaffolding fields.
-- Inside `policy.rs`: only write-sites (Default ctor, Clone impl propagation,
-  the build sites above). No read-sites.
+- Inside `policy.rs`: no *runtime* read-sites. Sites are: Default ctor + Clone
+  impl propagation (writes); the build sites (writes); and `build_rule_side_arc`
+  *reading* `book.prefixes_v4/v6` (policy.rs:628/634/640/646) **solely to
+  populate the dead `PolicyRule.*_prefixes_*` arrays** (Codex r1 correction —
+  these reads exist, but they feed only dead state, so they are removed
+  together with their consumer). No read-site survives that is observed by
+  `try_match_rule` or any evaluate path.
 - Inside `policy_tests.rs`: two dedicated scaffolding test modules
   (BookEntry parallel-prefix tests ~lines 1015-1239, PolicyRule
   parallel-prefix tests ~1245-1870) that assert the scaffolding shape and
@@ -144,6 +152,19 @@ is byte-identical before and after.
 - Delete the two scaffolding test modules + their `const _` size guards
   (1678-1681) + the `v3_rule_full` helper used only by those tests. Range:
   lines 1015 → EOF (1870).
+- **EXCEPTION (Codex r1 correction):** `test_policy_rule_v3_any4_any6_tokens`
+  (1527-1556) is NOT pure-scaffolding — its `assert!(r_any4.source_v4_match_any)`
+  / `!source_v6_match_any` lines (1547-1548, 1552-1553) are the **only** coverage
+  of the `any4`/`any6` token → match-any parse semantics anywhere in the file
+  (verified: zero `any4`/`any6` references in the kept 1-1014 range). This test
+  is **kept in slimmed form** outside the deleted block: drop only its four
+  `source_prefixes_*.is_none()` assertions (1549-1550, 1554-1555), keep the
+  `*_match_any` assertions. It is relocated just above the deleted region so the
+  rest of the block can be removed wholesale.
+- All other tests in 1015-1870 (BookEntry parallel-array shape; PolicyRule
+  array population/clone/size-of; the legacy `source_addresses` array test at
+  1497 — live behavior covered by the kept evaluate tests at 961-1012) assert
+  scaffolding shape only and are deleted.
 - **Keep** the `book()` builder's `prefixes_v4/v6` arguments (686-687) — that
   builds the live `AddressBookSnapshot` wire field, not the dead scaffolding.
 - Keep `address_book_test.go` (Go) untouched — it tests the live wire field.
