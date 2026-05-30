@@ -949,30 +949,30 @@ pub(super) fn aggregate_cos_statuses_across_workers(
             entry.waterfill_phase1_budget_breaks = entry
                 .waterfill_phase1_budget_breaks
                 .saturating_add(iface.waterfill_phase1_budget_breaks);
-            // #1628: waterfill_min_epochs_per_worker — MIN over the
-            // per-worker `waterfill_epochs`, but ONLY over workers that
-            // have current active exact-guarantee backlog on this
-            // interface. An idle worker never advances its epochs (it
-            // skips drain_shaped_tx), so including it would pin the MIN at
-            // 0 and mask a real Phase-2 lock-in on a busy worker (r3
-            // finding). Seed on first inclusion (not or_default()'s 0).
-            let iface_has_active_exact_backlog = iface.queues.iter().any(|q| {
-                q.exact
-                    && q.guarantee_enabled
-                    && (q.queued_bytes > 0 || q.queued_packets > 0)
-            });
-            if iface_has_active_exact_backlog {
+            // #1628 (code-review MAJOR): MIN-combine the PER-WORKER
+            // `waterfill_min_epochs_per_worker` values, which the worker
+            // side (interface_row.rs) already computed as the MIN over
+            // each worker's OWN bindings-with-active-backlog — so a
+            // healthy binding cannot mask a sibling locked binding within
+            // one worker. A worker reports u64::MAX when it has NO
+            // active-backlog binding (skip it); a backlogged binding that
+            // completed 0 epochs reports 0 (the strongest lock-in signal,
+            // which MUST be captured). Using the worker's per-binding MIN
+            // (NOT iface.waterfill_epochs, the cross-binding SUM) is the
+            // fix for the multi-binding masking the code review flagged.
+            // The accumulator stays at u64::MAX (entry default is 0, so
+            // seed it) until the first candidate; converted to 0 after
+            // the loop.
+            if iface.waterfill_min_epochs_per_worker != u64::MAX {
                 if min_epochs_seeded.insert(iface.ifindex) {
-                    entry.waterfill_min_epochs_per_worker = iface.waterfill_epochs;
+                    entry.waterfill_min_epochs_per_worker =
+                        iface.waterfill_min_epochs_per_worker;
                 } else {
                     entry.waterfill_min_epochs_per_worker = entry
                         .waterfill_min_epochs_per_worker
-                        .min(iface.waterfill_epochs);
+                        .min(iface.waterfill_min_epochs_per_worker);
                 }
             }
-            // If NO worker has active exact backlog, the field stays at
-            // its or_default() 0 — the documented "no active lock-in
-            // candidate" sentinel, not a false lock-in.
             let queue_map = queue_maps.entry(iface.ifindex).or_default();
             for queue in &iface.queues {
                 let q = queue_map.entry(queue.queue_id).or_default();

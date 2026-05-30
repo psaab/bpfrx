@@ -1637,22 +1637,20 @@ fn on_rg_promote_active_clears_rate_limit_and_forces_warm() {
 
 #[test]
 fn aggregate_cos_waterfill_epochs_sum_and_min_over_active_workers() {
-    // Two workers, both with active exact-guarantee backlog on the
-    // interface. Worker A is healthy (epochs climbing); worker B is
-    // frozen in Phase-2 lock-in (epochs low). The summed epochs must
-    // climb, but min_epochs_per_worker must reflect the FROZEN worker so
-    // the lock-in is visible (r2/r3 F2 regression guard).
+    // Two workers, both with active exact-guarantee backlog. The
+    // coordinator MIN-combines the PER-WORKER min_epochs_per_worker each
+    // worker already computed over its own bindings (interface_row.rs).
+    // Worker A healthy (epochs 1000), worker B frozen in Phase-2 lock-in
+    // (epochs 3). The summed epochs climb, but the MIN reflects the
+    // frozen worker (F2 regression guard).
     use crate::protocol::{CoSInterfaceStatus, CoSQueueStatus};
 
-    let active_exact_queue = |epochs_dummy: u64| CoSQueueStatus {
+    let active_exact_queue = || CoSQueueStatus {
         queue_id: 4,
         worker_instances: 1,
         exact: true,
         guarantee_enabled: true,
         queued_bytes: 32 * 1024,
-        // epochs live on the interface, not the queue; this arg is unused
-        // beyond documenting intent.
-        waterfill_phase2_admissions: epochs_dummy,
         ..Default::default()
     };
     let worker_healthy = vec![CoSInterfaceStatus {
@@ -1661,7 +1659,10 @@ fn aggregate_cos_waterfill_epochs_sum_and_min_over_active_workers() {
         worker_instances: 1,
         waterfill_epochs: 1000,
         waterfill_phase1_budget_breaks: 4,
-        queues: vec![active_exact_queue(0)],
+        // worker-side per-binding MIN (one active binding here = its own
+        // epochs).
+        waterfill_min_epochs_per_worker: 1000,
+        queues: vec![active_exact_queue()],
         ..Default::default()
     }];
     let worker_frozen = vec![CoSInterfaceStatus {
@@ -1670,7 +1671,8 @@ fn aggregate_cos_waterfill_epochs_sum_and_min_over_active_workers() {
         worker_instances: 1,
         waterfill_epochs: 3, // locked in Phase 2 — barely advanced
         waterfill_phase1_budget_breaks: 900,
-        queues: vec![active_exact_queue(50)],
+        waterfill_min_epochs_per_worker: 3,
+        queues: vec![active_exact_queue()],
         ..Default::default()
     }];
     let owner_by_queue = BTreeMap::from([((80, 4u8), 3u32)]);
@@ -1692,9 +1694,10 @@ fn aggregate_cos_waterfill_epochs_sum_and_min_over_active_workers() {
 
 #[test]
 fn aggregate_cos_waterfill_min_excludes_idle_workers() {
-    // The idle-worker conflation guard (r3): an idle worker (no active
-    // exact backlog) reporting epochs=0 must NOT pin the MIN to 0 — it is
-    // excluded; the MIN reflects only workers WITH active backlog.
+    // The idle-worker conflation guard: an idle worker reports the
+    // u64::MAX "no active-backlog binding" sentinel; the coordinator
+    // skips it so it cannot pin the MIN. The MIN reflects only the
+    // worker WITH a candidate.
     use crate::protocol::{CoSInterfaceStatus, CoSQueueStatus};
 
     let busy = vec![CoSInterfaceStatus {
@@ -1702,6 +1705,7 @@ fn aggregate_cos_waterfill_min_excludes_idle_workers() {
         interface_name: "reth0.80".into(),
         worker_instances: 1,
         waterfill_epochs: 500,
+        waterfill_min_epochs_per_worker: 500,
         queues: vec![CoSQueueStatus {
             queue_id: 4,
             worker_instances: 1,
@@ -1712,13 +1716,14 @@ fn aggregate_cos_waterfill_min_excludes_idle_workers() {
         }],
         ..Default::default()
     }];
-    // Idle worker: same interface, exact queue present but ZERO backlog,
-    // epochs frozen at 0 because it never entered the selector.
+    // Idle worker: reports MAX (no active-backlog binding) per the
+    // worker-side sentinel.
     let idle = vec![CoSInterfaceStatus {
         ifindex: 80,
         interface_name: "reth0.80".into(),
         worker_instances: 1,
         waterfill_epochs: 0,
+        waterfill_min_epochs_per_worker: u64::MAX,
         queues: vec![CoSQueueStatus {
             queue_id: 5,
             worker_instances: 1,
@@ -1735,14 +1740,57 @@ fn aggregate_cos_waterfill_min_excludes_idle_workers() {
     let iface = &aggregated[0];
     assert_eq!(
         iface.waterfill_min_epochs_per_worker, 500,
-        "idle worker (epochs=0, no backlog) must be EXCLUDED from the MIN"
+        "idle worker (MAX sentinel) must be EXCLUDED from the MIN"
     );
 }
 
 #[test]
-fn aggregate_cos_waterfill_min_zero_when_no_active_backlog() {
-    // No worker has active exact backlog → MIN stays 0 (documented "no
-    // active lock-in candidate" sentinel, not a false lock-in).
+fn aggregate_cos_waterfill_min_captures_zero_epoch_lockin() {
+    // A backlogged binding that completed ZERO epochs is the STRONGEST
+    // lock-in signal — the worker reports 0 (NOT the MAX sentinel), and
+    // the coordinator MUST capture it as the MIN even alongside a healthy
+    // worker. This is the sentinel-collision case the code review flagged.
+    use crate::protocol::{CoSInterfaceStatus, CoSQueueStatus};
+
+    let active_exact_queue = || CoSQueueStatus {
+        queue_id: 4,
+        worker_instances: 1,
+        exact: true,
+        guarantee_enabled: true,
+        queued_bytes: 16 * 1024,
+        ..Default::default()
+    };
+    let healthy = vec![CoSInterfaceStatus {
+        ifindex: 80,
+        interface_name: "reth0.80".into(),
+        worker_instances: 1,
+        waterfill_epochs: 900,
+        waterfill_min_epochs_per_worker: 900,
+        queues: vec![active_exact_queue()],
+        ..Default::default()
+    }];
+    let locked_zero = vec![CoSInterfaceStatus {
+        ifindex: 80,
+        interface_name: "reth0.80".into(),
+        worker_instances: 1,
+        waterfill_epochs: 0, // never completed an epoch — hard lock-in
+        waterfill_min_epochs_per_worker: 0,
+        queues: vec![active_exact_queue()],
+        ..Default::default()
+    }];
+    let owner_by_queue = BTreeMap::from([((80, 4u8), 3u32)]);
+    let aggregated =
+        aggregate_cos_statuses_across_workers(&[healthy, locked_zero], &owner_by_queue);
+    assert_eq!(
+        aggregated[0].waterfill_min_epochs_per_worker, 0,
+        "a backlogged 0-epoch worker (lock-in) MUST be captured, not treated as 'no candidate'"
+    );
+}
+
+#[test]
+fn aggregate_cos_waterfill_min_zero_when_no_candidate() {
+    // No worker reports a candidate (all MAX) → MIN stays at the
+    // or_default() 0 "no active lock-in candidate" sentinel.
     use crate::protocol::{CoSInterfaceStatus, CoSQueueStatus};
 
     let worker = vec![CoSInterfaceStatus {
@@ -1750,6 +1798,7 @@ fn aggregate_cos_waterfill_min_zero_when_no_active_backlog() {
         interface_name: "reth0.80".into(),
         worker_instances: 1,
         waterfill_epochs: 777,
+        waterfill_min_epochs_per_worker: u64::MAX,
         queues: vec![CoSQueueStatus {
             queue_id: 4,
             worker_instances: 1,
@@ -1765,8 +1814,7 @@ fn aggregate_cos_waterfill_min_zero_when_no_active_backlog() {
     let aggregated = aggregate_cos_statuses_across_workers(&[worker], &owner_by_queue);
     assert_eq!(
         aggregated[0].waterfill_min_epochs_per_worker, 0,
-        "no active-backlog worker → MIN sentinel 0"
+        "no candidate (all MAX) → MIN sentinel 0"
     );
-    // The SUM still surfaces the epoch activity.
     assert_eq!(aggregated[0].waterfill_epochs, 777);
 }

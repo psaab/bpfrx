@@ -695,16 +695,16 @@ type EventStreamStatus struct {
 }
 
 type CoSInterfaceStatus struct {
-	Ifindex             int              `json:"ifindex,omitempty"`
-	InterfaceName       string           `json:"interface_name,omitempty"`
-	OwnerWorkerID       *uint32          `json:"owner_worker_id,omitempty"`
-	ShapingRateBytes    uint64           `json:"shaping_rate_bytes,omitempty"`
-	BurstBytes          uint64           `json:"burst_bytes,omitempty"`
-	WorkerInstances     int              `json:"worker_instances,omitempty"`
-	NonemptyQueues      int              `json:"nonempty_queues,omitempty"`
-	RunnableQueues      int              `json:"runnable_queues,omitempty"`
-	TimerLevel0Sleepers int              `json:"timer_level0_sleepers,omitempty"`
-	TimerLevel1Sleepers int              `json:"timer_level1_sleepers,omitempty"`
+	Ifindex             int     `json:"ifindex,omitempty"`
+	InterfaceName       string  `json:"interface_name,omitempty"`
+	OwnerWorkerID       *uint32 `json:"owner_worker_id,omitempty"`
+	ShapingRateBytes    uint64  `json:"shaping_rate_bytes,omitempty"`
+	BurstBytes          uint64  `json:"burst_bytes,omitempty"`
+	WorkerInstances     int     `json:"worker_instances,omitempty"`
+	NonemptyQueues      int     `json:"nonempty_queues,omitempty"`
+	RunnableQueues      int     `json:"runnable_queues,omitempty"`
+	TimerLevel0Sleepers int     `json:"timer_level0_sleepers,omitempty"`
+	TimerLevel1Sleepers int     `json:"timer_level1_sleepers,omitempty"`
 	// #1628: per-interface waterfill-selector trace counters. JSON tags
 	// MUST match the Rust serde rename(...) byte-for-byte (protocol/cos.rs).
 	// WaterfillEpochs / WaterfillPhase1BudgetBreaks are SUMMED across

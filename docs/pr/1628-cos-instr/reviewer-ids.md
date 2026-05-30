@@ -63,11 +63,11 @@ task-id here so a continuation can fetch results by id after session-state loss.
 ### r4 → v5: AGY's new borrow defect
 At eligible-visit sites `head` (&queue) is live at the return's `match head`, so a &mut queue.telemetry write before the return won't compile. Fix: hoist `let kind = match head {...}` next to `head_len` (both Copy) so head's borrow ends immediately; return uses pre-computed kind. Applied in plan v5 §4c. Codex r4 was PLAN-READY independently; AGY's fix is a pure plan-wording/ordering correction with no counter-set change → no further round needed (the fix is mechanically forced and both reviewers will see it land in the code review).
 
-## Code review (round 1)
+## Code review (round 1 — PR #1680 @ 50cea5b04)
 
 | Reviewer | Task ID | Verdict | Notes |
 |---|---|---|---|
-| Codex | (pending) | | |
-| AGY | (pending) | | |
-| Copilot | (pending) | | |
-| Claude SMR | (in-conversation) | | |
+| Codex | task-mprvqv3t-gwdmk6 | (pending) | code r1 |
+| AGY | adversarial-review-mprvr07y-c2l0bg | (pending) | code r1 |
+| Copilot | (requested via @copilot review) | (pending) | code r1 |
+| Claude SMR | (in-conversation) | (pending) | code r1 |

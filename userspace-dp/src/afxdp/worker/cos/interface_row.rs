@@ -41,6 +41,14 @@ pub(super) fn accumulate_interface_root(
     }
     entry.shaping_rate_bytes = entry.shaping_rate_bytes.max(root.shaping_rate_bytes);
     entry.burst_bytes = entry.burst_bytes.max(root.burst_bytes);
+    // #1628: seed the per-binding MIN sentinel on the FIRST binding folded
+    // for this interface (entry came from or_default() = 0). u64::MAX means
+    // "no active-backlog binding seen yet"; converted to 0 in
+    // finalize_interface_vec. Done before the worker_instances bump so the
+    // `== 0` test reliably fires exactly once per interface entry.
+    if entry.worker_instances == 0 {
+        entry.waterfill_min_epochs_per_worker = u64::MAX;
+    }
     entry.worker_instances = entry.worker_instances.saturating_add(1);
     entry.timer_level0_sleepers = entry.timer_level0_sleepers.saturating_add(
         root.timer_wheel
@@ -58,13 +66,30 @@ pub(super) fn accumulate_interface_root(
     );
     // #1628: per-interface waterfill trace counters (this worker's view).
     // Plain `u64`, single-writer (owner worker), read here on the same
-    // worker thread. Summed across this worker's bindings for the
-    // interface, like timer_level*_sleepers; the coordinator then sums
-    // across workers (SUM) and computes the per-worker MIN
-    // (`waterfill_min_epochs_per_worker`). `min_epochs_per_worker` itself
-    // is NOT set here — it is coordinator-only.
+    // worker thread. epochs + budget_breaks are SUMMED across this
+    // worker's bindings for the interface, like timer_level*_sleepers;
+    // the coordinator then sums across workers.
     entry.waterfill_epochs = entry.waterfill_epochs.saturating_add(root.waterfill_epochs);
     entry.waterfill_phase1_budget_breaks = entry
         .waterfill_phase1_budget_breaks
         .saturating_add(root.waterfill_phase1_budget_breaks);
+    // #1628 (code-review MAJOR): the MIN-over-active must be PER-BINDING,
+    // not over the worker SUM. A worker can hold MULTIPLE bindings for
+    // one ifindex; summing their epochs first would let a healthy
+    // binding's high epoch count mask a sibling binding locked in
+    // Phase 2 (locked epochs=3 + healthy epochs=1000 → SUM 1003, MIN
+    // never sees 3). So fold the MIN here, where each binding's OWN
+    // `root.waterfill_epochs` and its OWN queue backlog are visible. A
+    // backlogged binding with genuine epochs=0 (the lock-in signal) is
+    // correctly captured because the unseeded marker is u64::MAX, not 0.
+    let binding_has_active_exact_backlog = root.queues.iter().any(|q| {
+        q.config.exact
+            && q.config.guarantee_enabled
+            && (q.hot.queued_bytes > 0 || cos_queue_len(q) > 0)
+    });
+    if binding_has_active_exact_backlog {
+        entry.waterfill_min_epochs_per_worker = entry
+            .waterfill_min_epochs_per_worker
+            .min(root.waterfill_epochs);
+    }
 }
