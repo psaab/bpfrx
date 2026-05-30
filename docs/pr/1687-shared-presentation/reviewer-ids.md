@@ -19,3 +19,8 @@ Branch: refactor/1687-shared-presentation
 - AGY: adversarial-review-mpsheamr-k357o5
 - Copilot: requested via @copilot review
 - Claude-SMR: in-conversation (hostile self-review during implementation)
+
+## Code review round 2 (PR #1689 head b76b04608)
+- Codex: task-mpshohv1-hkpnb4
+- AGY: adversarial-review-mpshop4o-7u3vhh
+- Round-1 verdicts: Codex MERGE-NEEDS-MINOR, AGY MERGE-NEEDS-MINOR (both: lazy applyResult + loaded-path test gap; both fixed @ b76b046)
