@@ -1,19 +1,22 @@
 # #1628 — Empirical per-class waterfill trace counters for the CoS scheduler
 
-**Status:** DRAFT v1 — pending adversarial plan review (Codex + AGY + Claude SMR)
+**Status:** DRAFT v2 — addresses Codex `task-mprtl981-wg7p3w` + AGY
+`adversarial-review-mprtlgg5-txzcuz` round-1 PLAN-NEEDS-MAJOR (both convergent).
+Pending re-review.
 
 ## 1. Issue framing
 
 #1628 asks for empirical per-class trace-counter instrumentation in the CoS
-scheduler so future CoS algorithmic work has the data to identify why a class
-undershoots its guarantee. It was recommended by the #1625 PLAN-KILL (3-of-3)
-as a prerequisite for any new CoS mechanism, then parked 2026-05-28 ("no live
-consumer") with the explicit note that the #1630 CoS-equalize root-cause
-research MAY surface a need for a **narrower** counter set scoped against a
-**verified** need rather than the broad speculative list in the issue body.
+scheduler so future CoS work has the data to identify why a class undershoots
+its guarantee. It was recommended by the #1625 PLAN-KILL (3-of-3) as a
+prerequisite for any new CoS mechanism, then parked 2026-05-28 ("no live
+consumer") with the explicit note that the #1630 root-cause research MAY
+surface a need for a **narrower** counter set scoped against a **verified** need
+rather than the broad speculative list in the issue body (which named
+`coordinator/cos_state.rs` + `rotate_epoch_v8.rs`).
 
-That verified consumer now exists. #1630's research (all-three PLAN-NEEDS-MAJOR,
-verified root cause) concluded:
+That verified consumer now exists. #1630's research (all-three
+PLAN-NEEDS-MAJOR, verified root cause) concluded:
 
 > **Multi-worker queue-ownership fragmentation + flat root shaper.**
 > `coordinator/mod.rs` round-robins each CoS queue to a distinct owner worker
@@ -22,274 +25,300 @@ verified root cause) concluded:
 > (`queue_service/mod.rs:777-1026`) only sees its own ~2 backlogged queues —
 > others are `cos_queue_is_empty` → skipped.
 
-The #1630 issue body further names two concrete code suspects to disambiguate:
-
-1. **Phase-2 lock-in** at `queue_service/mod.rs` waterfill Phase-2 descending
-   walk — "most likely cause" per #1625 reviewers.
-2. **`worker_fair_share` math** in the waterfill Phase-1 budget split.
-
-So this PR scopes the counters to make the waterfill selector's per-class
-decisions empirically visible, mapped 1:1 to #1614's three measured symptoms:
-
-- **Symptom 1 (class starvation / shape undershoot under simul load):** which
-  phase admitted a class (Phase 1 small-first honor vs Phase 2 descending
-  residual) and how often Phase-1 budget was exhausted before the class was
-  reached.
-- **Symptom 2 (push-direction cluster ceiling / fragmentation):** how many
-  exact queues each worker's selector actually *considered* vs *honored* per
-  epoch — the direct fingerprint of the per-worker ~2-queue fragmentation.
-- **Symptom 3 (per-flow CoV under simul):** already covered by the existing
-  `active_flow_buckets_peak` + flow-fair telemetry; this PR adds the
-  **selection-skip-reason** breakdown so an operator can tell a "queue was
-  empty because its owner worker never saw the flow" skip from a
-  "queue had backlog but lost the Phase-1 budget race" skip.
+This PR scopes counters to the **worker-local waterfill selector** — the only
+code path that implements the Phase-1/Phase-2 split #1630 indicts.
 
 ## 2. Honest scope / value framing
 
-This is **observability only** — no scheduling-decision change. The win is not
-cycles or throughput; it is turning the #1630 root cause from "verified by
-reading source" into "confirmed by counters an operator can read from `show
-class-of-service interface` and Prometheus." The acceptance bar in #1628 is:
-"Counters expose enough info to answer: is this an algorithm bug, a
-misconfiguration, or a cluster-ceiling problem?"
+Observability only — no scheduling-decision change. The win is turning the
+#1630 root cause from "verified by reading source" into "confirmed by counters
+readable from `show class-of-service interface` + Prometheus". The cost is a
+handful of `u64` increments at the waterfill selection sites (per-selection /
+per-epoch, **not** per-packet) plus wire/Prometheus/CLI plumbing mirroring the
+existing #710/#751/#760/#1369 owner-profile pattern.
 
-The cost is a handful of `u64` increments at the waterfill selection sites
-(epoch-boundary / per-selection, **not** per-packet) plus wire/Prometheus/CLI
-plumbing that mirrors the existing #710/#751/#760/#1369 owner-profile pattern
-byte-for-byte.
+*If reviewers conclude the counter set is still too broad / speculative, or the
+write sites don't disambiguate the #1630 suspect they claim to, PLAN-KILL is an
+acceptable verdict.*
 
-*If reviewers conclude the counter set is still too broad / speculative, or
-that the chosen write sites don't actually disambiguate the #1630 suspects,
-PLAN-KILL is an acceptable verdict.* The parking note explicitly invites a
-narrower scoping; this plan must justify each counter against a #1630 suspect
-or a #1614 symptom, and any counter that fails that test should be cut.
+### v1→v2 reviewer-driven changes
+
+Both reviewers returned PLAN-NEEDS-MAJOR with convergent fatals. v2 changes:
+
+- **F1 (both): `*_last_epoch` swap is broken** — refill at `mod.rs:793` runs
+  thousands of times/sec but the scraper samples 1/s (transient-sampling
+  loss), AND it **freezes during the Phase-2 lock-in being investigated**
+  (when `waterfill_pass1_remaining_bytes` never reaches 0, the refill block —
+  and thus the swap — never executes). → **All counters are now monotonic
+  `_total`s; the reader rate-computes over the scrape window.** No swap, no
+  freeze, no race.
+- **F2 (both): `worker_fair_share` is NOT diagnosable by waterfill-only
+  counters** — the real per-worker fair share lives in v8 lease state
+  (`shared_cos_lease/mod.rs:407-409`, computed `rotate_epoch_v8.rs:306-310`,
+  enforced `acquire_v8` `shared_cos_lease/mod.rs:1175-1217`). → **Dropped the
+  `worker_fair_share` diagnostic claim entirely.** This PR diagnoses
+  **Phase-2 lock-in** and **per-worker queue-ownership fragmentation** only.
+  A v8 fair-share counter is deferred to the #1630 fix PR, which owns the v8
+  lease surface (§9).
+- **F3 (both): per-interface considered/honored SUMMED across workers hides
+  fragmentation** (6 workers × ~2 queues each → "12 considered" looks
+  healthy). → **Dropped the per-interface considered/honored fields.** Replaced
+  with **per-queue** visit/honor counters that aggregate to the queue's single
+  owner worker, so the per-class row reflects exactly the one worker that owns
+  it (§4b).
+- **F4 (both): `skipped_not_backlogged` summed is ambiguous** (globally-empty
+  vs fragmented-active look identical). → **Cut.** The per-queue
+  visit-vs-admit ratio (below) plus the existing `owner_worker_id` +
+  `queued_bytes` already separate "this class has no load" from "this class's
+  load is funneled to one worker." Re-adding a skip counter without per-worker
+  keying would just reintroduce the noise.
+- **F5 (AGY): semantic pollution** — scheduler-selection counters do not belong
+  in `CoSQueueDropCounters` (reserved for drops/ECN/parks). → **New dedicated
+  `CoSQueueWaterfillCounters` struct on `CoSQueueTelemetry`.**
+- **F6 (both): write-site line correction** — Phase-1 honor `return` is at
+  `mod.rs:924`, not 912. Corrected in §4c.
+- **F7 (both): plain `u64` is correct, rationale was sloppy** —
+  `build_worker_cos_statuses` runs **on the owner worker thread itself**
+  (`worker/loop_body/mod.rs:835-839`), iterating its own thread-local
+  `CoSQueueRuntime` and publishing the built snapshot via `ArcSwap`. There is
+  **no live cross-thread read** of these fields; the increment and the
+  serialization are sequential on the same thread. Plain `u64` is correct for
+  that reason — not "tearing is tolerated." Rationale fixed.
+- **F8 (Codex #3): Phase-1 budget-exhausted only fires on the first queue that
+  crosses the boundary** — larger ascending queues after the `break` are never
+  visited in Phase 1, so a per-queue "budget exhausted before *this* class"
+  would stay silent on them. → The exhaustion event is therefore counted as a
+  **per-interface (root) monotonic total** (`waterfill_phase1_budget_breaks`),
+  not per-queue. It answers "how often did Phase 1 run out of budget mid-walk"
+  without falsely attributing the break to queues never reached.
 
 ## 3. What's already shipped / what this composes with
 
-The per-queue telemetry infrastructure is mature. This PR extends it; it does
-not invent a new mechanism.
-
-- `CoSQueueDropCounters` (`types/cos.rs:899`): plain-`u64`, single-writer
-  (owner worker), park-reason + admission counters. Written via
-  `count_park_reason(root, queue_idx, ParkReason)` (`tx_completion.rs:51`).
+- `CoSQueueDropCounters` (`types/cos.rs:899`): plain `u64`, owner-worker
+  single-writer, drop/ECN/park counters. (NOT extended — F5.)
 - `CoSQueueOwnerProfile` (`types/cos.rs:965`): `AtomicU64` per-queue drain
-  telemetry (guarantee/surplus byte split, park counts, drain hist). Atomic
-  because the snapshot reader runs on a different thread; Relaxed throughout.
+  telemetry. (Atomic because #751 had a binding-scoped rollup read pattern;
+  the new waterfill counters do not need atomics per F7.)
+- `CoSQueueTelemetry` (`types/cos.rs:873`): the container the new
+  `CoSQueueWaterfillCounters` is added to.
 - Snapshot aggregation: `accumulate_queue_row` (`worker/cos/queue_row.rs:50`)
-  sums each worker instance's per-queue counters into one
-  `protocol::CoSQueueStatus` row (Rust `protocol/cos.rs:168`).
-- Wire: serde JSON, every field `#[serde(rename=..., default)]` →
-  backward-compatible additions. Go mirror `pkg/dataplane/userspace/
-  protocol.go:726` (JSON tags MUST match byte-for-byte).
-- Prometheus: `pkg/api/metrics_descriptors.go` + `metrics_userspace.go`.
-- CLI: `pkg/dataplane/userspace/cosfmt.go` `show class-of-service interface`.
+  sums per-worker per-queue counters into one `CoSQueueStatus`.
+- Coordinator cross-worker merge: `aggregate_cos_statuses_across_workers`
+  (`coordinator/mod.rs:914`); per-interface scalars `saturating_add` here
+  (e.g. `timer_level0_sleepers` at `:932`).
+- Wire: serde JSON, additive-only (`#[serde(rename, default)]`); Go mirror
+  `pkg/dataplane/userspace/protocol.go:726` (JSON tags byte-for-byte).
+- Prometheus `pkg/api/metrics_descriptors.go` + `metrics_userspace.go`; CLI
+  `pkg/dataplane/userspace/cosfmt.go`.
 
-The waterfill selector `select_exact_cos_guarantee_queue_waterfill`
-(`queue_service/mod.rs:777-1026`) is the **only** code path that implements the
-`guarantee-rate` Phase-1/Phase-2 split #1630 indicts; the Proportional default
-selector (`select_exact_cos_guarantee_queue_with_lease_telemetry` legacy RR arm)
-does not have phases. So the new phase counters are only ever written from the
-waterfill path; the legacy arm leaves them at zero (which is itself a useful
-"this interface is not in guarantee-rate mode" signal).
+## 4. Concrete design (v2)
 
-## 4. Concrete design
+### 4a. New struct `CoSQueueWaterfillCounters` (on `CoSQueueTelemetry`)
 
-### 4a. New per-queue counters (all `u64`, single-writer owner worker)
-
-Add to `CoSQueueDropCounters` (plain `u64`, NOT atomic — same single-writer
-discipline as the existing park-reason fields; the snapshot reader tolerates
-monotonic tearing exactly as documented on the struct):
+Plain `u64`, owner-worker single-writer (F5, F7). All monotonic (F1).
 
 ```rust
-/// #1628: waterfill Phase-1 (small-first honored set) admissions for
-/// this queue. Incremented once per waterfill Phase-1 honor (the
-/// `return Some(...)` at the end of the ascending walk). Zero on the
-/// Proportional-mode legacy RR path. A class that undershoots its
-/// guarantee with this near zero AND phase2_admissions > 0 is being
-/// served only as Phase-2 residual — the #1630 Phase-2-lock-in
-/// fingerprint.
-pub(in crate::afxdp) waterfill_phase1_admissions: u64,
-/// #1628: waterfill Phase-2 (descending residual) admissions for this
-/// queue. See above.
-pub(in crate::afxdp) waterfill_phase2_admissions: u64,
-/// #1628: count of waterfill selector visits to this queue where the
-/// queue was eligible (nonempty + runnable + guarantee + exact) and
-/// had tokens, but the Phase-1 rate-scaled cost exceeded the remaining
-/// Phase-1 epoch budget — i.e. this queue forced (or would have forced)
-/// the break into Phase 2. This is the direct counter for "Phase-1
-/// budget exhausted before the class was honored" (Symptom 1) and the
-/// `worker_fair_share` math suspect from #1630.
-pub(in crate::afxdp) waterfill_phase1_budget_exhausted: u64,
-/// #1628: count of waterfill selector visits where this queue was
-/// SKIPPED because it was empty/not-runnable from THIS worker's
-/// perspective. High relative to a class's configured presence is the
-/// per-worker queue-ownership fragmentation fingerprint (Symptom 2):
-/// the class exists but this worker's selector never has its backlog.
-pub(in crate::afxdp) waterfill_skipped_not_backlogged: u64,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::afxdp) struct CoSQueueWaterfillCounters {
+    /// #1628: times this queue was admitted via the waterfill Phase-1
+    /// (small-first honored) walk. Bumped at the Phase-1 `return Some`.
+    /// Zero on the Proportional legacy-RR path (no phases).
+    pub(in crate::afxdp) phase1_admissions: u64,
+    /// #1628: times this queue was admitted via the Phase-2 (descending
+    /// residual) walk. #1630 Phase-2-LOCK-IN fingerprint: an
+    /// undershooting class with phase2_admissions climbing while
+    /// phase1_admissions stays flat is locked into best-effort residual
+    /// service — the exact failure #1625/#1630 named. (See §10 Q1 for
+    /// the worked trace.)
+    pub(in crate::afxdp) phase2_admissions: u64,
+    /// #1628: times the waterfill selector VISITED this queue and found
+    /// it eligible (nonempty + runnable + guarantee + exact) — i.e. the
+    /// queue's owner worker actually had its backlog this pass. Pair
+    /// with phase1+phase2 admissions to see how often a visit converted
+    /// to service vs lost the token/budget gate. A class whose owner
+    /// worker never sees its backlog (the fragmentation root cause)
+    /// shows near-zero eligible_visits relative to its configured
+    /// presence — the per-OWNER fragmentation signal that survives
+    /// cross-worker aggregation because the queue has ONE owner.
+    pub(in crate::afxdp) eligible_visits: u64,
+}
 ```
 
-### 4b. New per-interface (root) counters
+### 4b. New per-interface (root) counters on `CoSInterfaceRuntime`
 
-Add to `CoSInterfaceRuntime` (plain `u64`, single-writer). These are
-epoch-scoped aggregates the per-queue counters can't express:
+Plain `u64`, owner-worker single-writer, monotonic (F1, F8).
 
 ```rust
-/// #1628: number of completed waterfill epochs (Phase-1 budget
-/// refills) on this interface since snapshot. Pairs with the per-queue
-/// phaseN_admissions so an operator can normalize "admissions per
-/// epoch". Incremented at the lazy Phase-1 budget refill site.
+/// #1628: completed waterfill epochs (Phase-1 budget refills) on this
+/// interface (this worker's view). Normalizer for the per-queue
+/// admission counters ("admissions per epoch"). Bumped at the lazy
+/// refill site.
 pub(in crate::afxdp) waterfill_epochs: u64,
-/// #1628: count of exact queues CONSIDERED in the current/most-recent
-/// Phase-1 ascending walk on this worker's view of the interface
-/// (length of `exact_queues_by_rate_ascending` that were eligible).
-/// Snapshot reads the last-epoch value. Pairs with
-/// `waterfill_queues_honored_last_epoch` to expose the
-/// considered-vs-honored fragmentation ratio directly (Symptom 2).
-pub(in crate::afxdp) waterfill_queues_considered_last_epoch: u64,
-pub(in crate::afxdp) waterfill_queues_honored_last_epoch: u64,
+/// #1628: times Phase 1 broke into Phase 2 because the next ascending
+/// queue's rate-scaled cost exceeded the remaining Phase-1 budget
+/// (the `break` at mod.rs:910). Per-INTERFACE not per-queue (F8: the
+/// break only sees the first crossing queue; attributing it per-queue
+/// would silently miss the larger queues never reached). A high
+/// breaks-per-epoch ratio means Phase 1 routinely exhausts its budget
+/// mid-walk — the budget-split half of the diagnosis.
+pub(in crate::afxdp) waterfill_phase1_budget_breaks: u64,
 ```
 
-(The "last_epoch" pair is a snapshot of the in-progress epoch counters,
-swapped at epoch refill — same shape as a min/max-over-window gauge. This
-keeps them O(1) and avoids unbounded growth.)
+These sum across workers in `aggregate_cos_statuses_across_workers` exactly
+like `timer_level0_sleepers` (`coordinator/mod.rs:932`). Summing IS the right
+semantic here (unlike the cut considered/honored fields): epochs and
+budget-breaks are events, and the operator wants the cluster-wide event rate;
+the per-OWNER fragmentation signal lives on the per-queue `eligible_visits`
+(F3 — a queue has one owner, so its row already reflects that single worker).
 
 ### 4c. Write sites (all inside `select_exact_cos_guarantee_queue_waterfill`)
 
+Verified against the real control flow (Codex + AGY both confirmed):
+
 1. **Epoch refill** (`mod.rs:793` `if waterfill_pass1_remaining_bytes == 0`):
-   `root.waterfill_epochs = root.waterfill_epochs.wrapping_add(1);` and swap
-   the in-progress considered/honored counts into the `*_last_epoch` fields,
-   reset in-progress to 0.
-2. **Phase-1 honor** (`mod.rs:912` just before `return Some(...)`): bump
-   the chosen queue's `waterfill_phase1_admissions` and the root
-   `waterfill_queues_honored` in-progress counter.
-3. **Phase-1 budget-exhausted break** (`mod.rs:906` `if phase1_cost >
-   remaining`): bump the queue's `waterfill_phase1_budget_exhausted` before
-   `break`.
-4. **Phase-1 skip-not-backlogged** (`mod.rs:817` `cos_queue_is_empty(queue)
-   || !runnable || ...` continue): bump `waterfill_skipped_not_backlogged`.
-   (Considered count is incremented for queues that pass the eligibility gate.)
-5. **Phase-2 admission** (`mod.rs:1015` Phase-2 `return Some(...)`): bump the
-   chosen queue's `waterfill_phase2_admissions`.
+   `root.waterfill_epochs = root.waterfill_epochs.wrapping_add(1);`
+2. **Phase-1 eligible visit** (`mod.rs:832` after the
+   `cos_queue_is_empty || !runnable || ...` continue gate passes and a head is
+   present): bump the queue's `eligible_visits`.
+3. **Phase-1 budget-exhausted break** (`mod.rs:906`, before `break` at `:910`):
+   `root.waterfill_phase1_budget_breaks.wrapping_add(1)`.
+4. **Phase-1 honor return** (`mod.rs:924`, before `return Some(...)`): bump the
+   chosen queue's `phase1_admissions`.
+5. **Phase-2 eligible visit** (`mod.rs:982` after the Phase-2 eligibility gate
+   passes and a head is present): bump `eligible_visits` (so the visit count
+   covers both phases' reachability).
+6. **Phase-2 admission return** (`mod.rs:1015`, before `return Some(...)`):
+   bump the chosen queue's `phase2_admissions`.
 
-All five sites already hold `&mut root` (or `&mut queue` via
-`root.queues[queue_idx]`), so no new borrows are introduced. The increments are
-`wrapping_add(1)` on plain `u64` — identical to the existing
-`count_park_reason` discipline. A small helper
-`count_waterfill_event(root, queue_idx, WaterfillEvent)` mirrors
-`count_park_reason` to keep the formula in one place (engineering-style
-principle 3).
+A single helper `count_waterfill_event(root, queue_idx, WaterfillEvent)`
+(mirroring `count_park_reason`, `tx_completion.rs:51`) centralizes the queue
+counter writes; the two root counters are bumped inline (they don't take a
+queue_idx). Every site already holds the needed `&mut`.
 
-### 4d. Snapshot aggregation (`worker/cos/queue_row.rs`)
+### 4d. Snapshot aggregation
 
-Add six `saturating_add` lines to `accumulate_queue_row` mirroring the existing
-park-counter aggregation (per-queue counters sum across worker instances; the
-root `waterfill_epochs` / considered / honored are surfaced once per interface
-on the interface-status struct, NOT the queue row — they belong on
-`CoSInterfaceStatus`, same nesting as `timer_level0_sleepers`).
+- `accumulate_queue_row` (`worker/cos/queue_row.rs`): 3 `saturating_add` lines
+  for the per-queue waterfill counters (sum across worker instances; correct —
+  a queue has one owner so only its owner's instance is nonzero in the steady
+  state, and summing is safe regardless).
+- `aggregate_cos_statuses_across_workers` (`coordinator/mod.rs:914`): 2
+  `saturating_add` lines for `waterfill_epochs` + `waterfill_phase1_budget_breaks`
+  on the interface row, mirroring `timer_level0_sleepers`.
+- The worker-side interface-status builder
+  (`worker/cos/mod.rs` / `worker/cos/status.rs`) copies the root counters from
+  `CoSInterfaceRuntime` into the per-worker `CoSInterfaceStatus` before the
+  coordinator sum.
 
-### 4e. Wire surface (serde + Go mirror)
+### 4e. Wire surface (serde + Go mirror, F: wire_protocol_both_sides)
 
-- Rust `protocol/cos.rs`: 4 new `u64` on `CoSQueueStatus`, 3 new `u64` on
-  `CoSInterfaceStatus`, each `#[serde(rename="...", default)]`.
+- Rust `protocol/cos.rs`: 3 new `u64` on `CoSQueueStatus`
+  (`waterfill_phase1_admissions`, `waterfill_phase2_admissions`,
+  `waterfill_eligible_visits`), 2 new `u64` on `CoSInterfaceStatus`
+  (`waterfill_epochs`, `waterfill_phase1_budget_breaks`). Each
+  `#[serde(rename="...", default)]`.
 - Go `pkg/dataplane/userspace/protocol.go`: matching fields, JSON tags
-  byte-for-byte. Both sides per `feedback_wire_protocol_both_sides`.
+  byte-for-byte.
 
 ### 4f. Prometheus + CLI
 
-- 7 new Prometheus counter/gauge descriptors in `metrics_descriptors.go` +
-  emit in `metrics_userspace.go` (per-queue counters → `_total`; per-interface
-  considered/honored → gauges; epochs → `_total`).
-- `cosfmt.go`: surface the per-queue waterfill counters in the existing
-  per-queue detail block (they render only when non-zero, matching the
-  existing `q.drainGuaranteeSentBytes != 0 || ...` gate).
+- 5 new Prometheus counter descriptors (`_total`) in
+  `metrics_descriptors.go` + emit in `metrics_userspace.go`.
+- `cosfmt.go`: surface the 3 per-queue waterfill counters in the per-queue
+  detail block, gated `!= 0` like the existing `drainGuaranteeSentBytes`
+  block; the 2 per-interface counters in the interface header block.
 
 ## 5. Public API preservation
 
-No function signature changes to any selector. The new helper
-`count_waterfill_event` is `pub(in crate::afxdp)`-internal. All existing
-`select_*` / `service_*` signatures unchanged. The serde wire surface is
-additive-only (every field `default`), so old Go ↔ new Rust and new Go ↔ old
-Rust both deserialize cleanly.
+No selector / service-fn signature changes. New helper
+`count_waterfill_event` is internal `pub(in crate::afxdp)`. Wire surface is
+additive-only (all `default`), so old↔new deserialize cleanly both directions.
 
 ## 6. Hidden invariants this change must preserve
 
-- **Single-writer discipline:** every new counter is written only by the owner
-  worker on the drain path; the snapshot reader is read-only. Plain `u64` for
-  the `CoSQueueDropCounters` additions (matching existing park counters);
-  the `CoSInterfaceRuntime` root counters are also owner-only.
-- **No new allocation, no per-packet cost:** writes are at per-selection /
-  per-epoch granularity, which is per *batch* at most (one selection drains up
-  to `TX_BATCH_SIZE` frames). Strictly less frequent than the existing
-  `drain_park_*` writes that already live at these sites.
-- **Selection ordering unchanged:** counters are bumped adjacent to existing
-  `return`/`break`/`continue` without moving any of them. Phase-1 budget
-  decrement, RR cursor advance, honored_mask set all stay in place.
-- **Proportional-mode parity:** the legacy RR arm is not touched; its queues
-  report zero waterfill counters (correct — it has no phases).
-- **HA portability:** counters are diagnostic-only, never synced, never read by
-  the scheduler. No effect on session sync / failover.
+- **Single-writer, same-thread read (F7):** every counter is written by the
+  owner worker on the drain path; `build_worker_cos_statuses` reads them on the
+  same worker thread and publishes via `ArcSwap`. No live cross-thread read →
+  plain `u64` correct.
+- **No new allocation, no per-packet cost:** writes are per-selection /
+  per-epoch (per *batch* at most), strictly rarer than the existing
+  `drain_park_*` writes already at these sites.
+- **Selection ordering unchanged:** counters bumped adjacent to existing
+  `return`/`break`/`continue`; budget decrement, RR cursor advance,
+  `honored_mask` set all stay put.
+- **Proportional-mode parity:** legacy RR arm untouched; its queues report zero
+  waterfill counters (a correct "not in guarantee-rate mode" signal).
+- **HA portability:** diagnostic-only, never synced, never read by the
+  scheduler. No failover effect.
 
 ## 7. Risk assessment
 
 | Class | Level | Notes |
 |---|---|---|
-| Behavioral regression | LOW | Pure counter increments adjacent to unchanged control flow; no scheduling decision reads these. 5 write sites, all in one fn. |
-| Lifetime / borrow-checker | LOW | All sites already hold the needed `&mut`. Helper takes `&mut CoSInterfaceRuntime` + `usize` like `count_park_reason`. |
-| Performance regression | LOW | ≤ 1 `u64` write per selection (per batch), strictly rarer than the `drain_park_*` writes already present. Shares the owner's hot cache line — no new false sharing. |
-| Architectural mismatch (#961/#946-P2) | LOW-MED | Risk is that the chosen counters don't actually disambiguate the #1630 suspects. Mitigated by mapping each counter to a named suspect/symptom in §1; reviewers must confirm the mapping holds. |
+| Behavioral regression | LOW | Pure counter increments adjacent to unchanged control flow; scheduler reads none of them. |
+| Lifetime / borrow-checker | LOW | All sites hold the needed `&mut`; helper signature mirrors `count_park_reason`. |
+| Performance regression | LOW | ≤ 1 `u64` write per selection/epoch; rarer than existing `drain_park_*`. Same owner cache line, no new false sharing. |
+| Architectural mismatch | LOW | F2/F3/F5 resolved: scope is strictly the worker-local waterfill selector, dedicated struct, monotonic totals, per-queue signal keyed to single owner. v8 fair-share explicitly deferred to its owning PR. |
 
 ## 8. Test plan
 
 - `cargo build` clean; `cargo test --release` full suite green.
-- New unit tests in `queue_service/tests.rs` that drive the waterfill selector
-  through (a) a Phase-1 honor, (b) a Phase-1 budget-exhausted break into
-  Phase 2, (c) a Phase-2 admission, (d) a not-backlogged skip — and assert each
-  counter increments **exactly** at the expected site and stays zero on the
-  Proportional path. Counter-factual strength: assert phase2 stays 0 when only
-  Phase 1 fires (recreates the #1630 "everything looks like Phase 2" confusion
-  if the write site is wrong).
+- New unit tests in `queue_service/tests.rs` driving the waterfill selector
+  through: (a) Phase-1 honor → `phase1_admissions == 1`, `phase2 == 0`,
+  `eligible_visits >= 1`; (b) Phase-1 budget-exhausted break into Phase 2 →
+  root `waterfill_phase1_budget_breaks == 1`, chosen queue
+  `phase2_admissions == 1`; (c) epoch refill → `waterfill_epochs` advances;
+  (d) Proportional mode → all waterfill counters stay 0 (counter-factual: a
+  wrong write site would light them up on the RR path). Assert the
+  Phase-2-lock-in fingerprint directly: a fixture where the small class is
+  only ever Phase-2-admitted yields `phase2 > 0 && phase1 == 0` on its row.
 - 5/5 flake loop on the new named tests.
-- Go: `protocol_test.go` round-trip (serde→Go JSON parity), `cosfmt_test.go`
-  render, `metrics_test.go` descriptor wiring. `go test ./...` 30 packages.
-- Deploy + smoke on loss userspace cluster is the **PARENT's** job (cluster
-  serialized). This agent posts `<!-- AWAITING-PARENT-SMOKE-1628 -->`.
+- Go: `protocol_test.go` serde→Go round-trip parity, `cosfmt_test.go` render,
+  `metrics_test.go` descriptor wiring. `go test ./...` 30 packages.
+- Smoke (loss userspace cluster) is the PARENT's job (serialized). This agent
+  posts `<!-- AWAITING-PARENT-SMOKE-1628 -->`.
 
 ## 9. Out of scope (explicitly)
 
-- Any change to the waterfill scheduling decision itself (that's #1630's fix).
-- The flat-root-shaper FCFS counters (the root `SharedCoSRootLease` greedy
-  pool) — #1630 names it but the *fix* there is structural; counting FCFS
-  grants per-class would need a new write site in `shared_cos_lease/` and is a
-  separate, larger surface. Deferred; noted for the #1630 fix PR.
-- `rotate_epoch_v8.rs` / `coordinator/cos_state.rs` counters from the #1628
-  body's broad list — the verified #1630 consumer is the *worker-local
-  waterfill selector*, not the v8 epoch rotation. Adding epoch-rotation
-  counters now would be the speculative breadth the parking note warned against.
-  Deferred until a verified consumer needs them.
+- Any waterfill scheduling-decision change (that's #1630's fix).
+- **v8 fair-share observability** (`shared_cos_lease` per-worker fair-share
+  watermark counters). F2: the real `worker_fair_share` lives there, not in the
+  selector. Diagnosing it needs a counter at `acquire_v8`
+  (`shared_cos_lease/mod.rs:1175-1217`) / the epoch-rotate
+  (`rotate_epoch_v8.rs:306`). Deferred to the #1630 FIX PR, which owns and
+  reshapes that surface — instrumenting it now would be throwaway against an
+  unknown fix design (both reviewers concur the deferral is correct).
+- Flat-root-shaper FCFS per-class grant counters (`SharedCoSRootLease`) —
+  separate larger surface; deferred to #1630 fix.
+- `coordinator/cos_state.rs` / `rotate_epoch_v8.rs` counters from the #1628
+  body's broad list — the verified consumer is the worker-local waterfill
+  selector, not v8 epoch rotation. Deferred.
 
-## 10. Open questions for adversarial review
+## 10. Open questions for adversarial re-review
 
-1. **Do these 7 counters actually disambiguate #1630's two named suspects?**
-   Phase-2-lock-in shows as `phase2_admissions >> phase1_admissions` on
-   undershooting classes; `worker_fair_share` math error shows as
-   `phase1_budget_exhausted` firing on small classes that should fit. Is that
-   mapping sound, or is there a third failure mode these miss?
-2. **Is `waterfill_skipped_not_backlogged` the right fragmentation fingerprint,
-   or does the existing `worker_instances` + per-worker queue presence already
-   expose it without a new counter?** (i.e. is this counter redundant?)
-3. **`*_last_epoch` swap semantics** — is snapshotting in-progress
-   considered/honored at epoch refill the right cadence, or should these be
-   plain monotonic `_total`s the reader rate-computes (simpler, no swap race)?
-4. **Plain `u64` vs `AtomicU64`** for the `CoSQueueDropCounters` additions —
-   the existing park counters are plain `u64` and read cross-thread under the
-   "tolerate tearing" doc. The `owner_profile` counters are `AtomicU64`. Which
-   is correct for a counter the snapshot reads? (I claim plain `u64` matches the
-   park-counter precedent; challenge this.)
-5. **Should the per-interface considered/honored live on `CoSInterfaceStatus`
-   or be folded onto every queue row?** I chose interface-level to avoid
-   N-way duplication, but the existing `post_drain_backup_bytes` is
-   broadcast per-queue-row binding-scoped — is there a consumer reason to
-   match that anti-pattern instead?
-6. **Is cutting the v8/coordinator/FCFS counters (the broad #1628 body list)
-   the right call, or does the #1630 fix genuinely need them now** such that
-   deferring forces a second instrumentation PR?
+1. **Worked trace for the Phase-2-lock-in fingerprint:** under the #1630
+   failure, `waterfill_pass1_remaining_bytes` never reaches 0 (Phase-2 returns
+   don't decrement it), so the refill at `mod.rs:793` rarely fires → few
+   `waterfill_epochs`, and the small class is admitted only via Phase 2 →
+   `phase2_admissions` climbs, `phase1_admissions` flat. Does that signature
+   uniquely identify Phase-2 lock-in, or can a healthy guarantee-rate
+   interface produce the same signature transiently?
+2. **Is `eligible_visits` the right fragmentation signal now that it's
+   per-queue (single owner)?** A class whose owner worker rarely sees its
+   backlog shows low `eligible_visits` relative to its `phase*_admissions` on
+   other workers — but with cross-binding redirect the queue has ONE owner, so
+   is there any aggregation path that still blurs this?
+3. **Are the 2 per-interface counters (`waterfill_epochs`,
+   `phase1_budget_breaks`) safe to SUM across workers** (F3 said considered/
+   honored were NOT)? My claim: epochs/breaks are per-worker *events* and the
+   cluster-wide rate is what the operator wants; they are not a
+   "considered set size" that masks fragmentation. Challenge this.
+4. **Does cutting `skipped_not_backlogged` lose a needed signal**, or do
+   `eligible_visits` + `owner_worker_id` + `queued_bytes` fully cover the
+   "no load vs fragmented load" distinction?
+5. **Is the dedicated `CoSQueueWaterfillCounters` struct the right home**, or
+   should these live on `CoSQueueOwnerProfile` (the other per-queue telemetry
+   struct) — noting that one is `AtomicU64` and these are plain `u64`?
+6. **Write-site #2/#5 (`eligible_visits` after the eligibility gate):** is
+   counting at "passed eligibility AND has a head" the right definition of
+   "visited eligibly", or should it count at the gate entry (before the token
+   check) so token-starvation parks are still counted as visits?
