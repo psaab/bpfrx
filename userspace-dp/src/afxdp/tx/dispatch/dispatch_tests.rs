@@ -346,16 +346,16 @@ fn segmentation_miss_recorder_is_rate_capped() {
     }
 
     assert_eq!(cap.get(), 20, "cap counter saturates at 20");
-
-    // Counter-factual: if the cap were absent the counter would have
-    // reached 25. Prove the guard is what stopped it.
-    let mut uncapped = 0u32;
-    for _ in 0..25 {
-        if uncapped < 20 {
-            uncapped += 1;
-        }
-    }
-    assert_eq!(uncapped, cap.get(), "cap logic matches the guard");
+    // The cap must also stop *exception generation*, not just the
+    // counter: prove only 20 exceptions were recorded across 25 calls,
+    // so the 5 over-cap calls never reached `record_exception` (and thus
+    // never locked the `recent_exceptions` mutex on the hot path).
+    assert_eq!(
+        recent_exceptions.lock().expect("lock").len(),
+        20,
+        "no exceptions recorded past the cap — the 5 over-cap calls never \
+         locked the recent_exceptions mutex",
+    );
 }
 
 #[test]
