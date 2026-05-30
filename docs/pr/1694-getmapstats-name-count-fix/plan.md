@@ -68,7 +68,12 @@ defects in its `reportMaps` table:
    MAX_FILTER_RULES`). A BPF ARRAY is pre-allocated: every index key
    exists, so `bm.Iterate()` yields all `MaxEntries` elements, making
    `UsedCount == MaxEntries` unconditionally — a misleading utilization
-   number for `show system buffers` / Prometheus.
+   number. The CLI (`cli_show_system.go`) and gRPC buffers-detail
+   (`server_show.go`) already print `-`/skip array `UsedCount`, and the
+   Prometheus collector (`pkg/api/metrics.go`) does not call
+   `GetMapStats` at all; the only path that surfaces the raw value is
+   the REST `/system/buffers` JSON (`pkg/api/system.go`). So the
+   user-visible impact is confined to that JSON field.
 
 These are confirmed present verbatim on master and pre-date the #1686
 split, so they were out of scope for that pure-code-motion PR.
@@ -108,8 +113,12 @@ only the static descriptor table values change.
 ## Hidden invariants preserved
 
 - Public API: `GetMapStats() []MapStats` unchanged; `MapStats` struct
-  unchanged. Consumers (`apply.go:413`, `dataplane.go:406` interface,
-  `show system buffers`, Prometheus collector) see the same shape.
+  unchanged. Consumers see the same shape: the `dataPlane` interfaces
+  (`apply.go:413`, `dataplane.go:406`), the CLI `show system buffers`
+  renderer (`cli_show_system.go`), the gRPC buffers-detail handler
+  (`server_show.go`), the `pkg/fwdstatus` builder, and the REST
+  `/system/buffers` JSON (`pkg/api/system.go`). The Prometheus
+  collector (`pkg/api/metrics.go`) does NOT consume `GetMapStats`.
 - Iteration safety: the only `countable:true` entries remaining are
   sparse maps (`sessions`, `sessions_v6`, `address_membership`,
   `applications`, `dnat_table`, `dnat_table_v6` — `BPF_MAP_TYPE_HASH`;
