@@ -513,6 +513,33 @@ func TestSchemaValidate_ModifierTrailingGarbage(t *testing.T) {
 	}
 }
 
+// TestSchemaValidate_PackedSiblingSplitModifier reproduces Codex r3 minor:
+// the packed-leftover fix must not break the cross-sibling split-modifier
+// rule. Two sibling packed nodes — a rate and a bare `exact` — are valid
+// together (the `exact` sees its rate sibling), across all three AST
+// shapes the parser produces for the split form.
+func TestSchemaValidate_PackedSiblingSplitModifier(t *testing.T) {
+	for _, in := range []string{
+		// Fully-packed sibling nodes under class-of-service.
+		`class-of-service {
+		    schedulers be transmit-rate 1g;
+		    schedulers be transmit-rate exact;
+		}`,
+		// Instance-name nested, leaf packed, two sibling instances.
+		`class-of-service { schedulers { be transmit-rate 1g; be transmit-rate exact; } }`,
+		// Fully nested block.
+		`class-of-service { schedulers { be { transmit-rate 1g; transmit-rate exact; } } }`,
+	} {
+		if err := schemaCheck(t, in); err != nil {
+			t.Fatalf("expected split-modifier shorthand %q to pass, got %v", in, err)
+		}
+	}
+	// A bare `exact` packed sibling with NO rate sibling still fails.
+	if err := schemaCheck(t, `class-of-service { schedulers be transmit-rate exact; }`); err == nil {
+		t.Fatal("expected exact-only packed leaf (no rate sibling) to fail, got nil")
+	}
+}
+
 // TestSetPathGrouping_Golden pins the flat-set grouping produced by
 // SetPath over setSchema. #1319 PR 1 adds typed-leaf FIELDS to schemaNode
 // (valueType/valueDesc/valueExamples/validator) but MUST NOT add or alter

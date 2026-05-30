@@ -53,6 +53,38 @@ func walkSchemaChildren(nodes []*Node, parent *schemaNode, path []string, cfg *C
 	if parent == nil {
 		return nil
 	}
+	// First, gather "packed leftover" leaves grouped by the container
+	// identity they hang off (e.g. two sibling nodes
+	// `schedulers be transmit-rate 1g` + `schedulers be transmit-rate exact`
+	// both produce a leftover leaf under the same `schedulers be` identity).
+	// These leftover leaves must see EACH OTHER as siblings so the typed
+	// leaf's cross-sibling split-modifier rule works (Codex r3 minor). We
+	// validate each identity group's leftover leaves together, then walk the
+	// rest of each node normally with the leftover stripped.
+	leftoverGroups := map[string][]*Node{}
+	groupSchema := map[string]*schemaNode{}
+	groupPath := map[string][]string{}
+	for _, node := range nodes {
+		if node == nil || len(node.Keys) == 0 {
+			continue
+		}
+		id, descendSchema, idPath, leaf := packedLeftoverLeaf(node, parent, path)
+		if leaf != nil {
+			leftoverGroups[id] = append(leftoverGroups[id], leaf)
+			groupSchema[id] = descendSchema
+			groupPath[id] = idPath
+		}
+	}
+	for id, leaves := range leftoverGroups {
+		// Validate the group's leftover leaves as mutual siblings.
+		gp := groupPath[id]
+		for _, leaf := range leaves {
+			if err := walkSchemaNode(leaf, groupSchema[id], gp, cfg, leaves); err != nil {
+				return err
+			}
+		}
+	}
+
 	for _, node := range nodes {
 		if node == nil || len(node.Keys) == 0 {
 			continue
@@ -62,6 +94,38 @@ func walkSchemaChildren(nodes []*Node, parent *schemaNode, path []string, cfg *C
 		}
 	}
 	return nil
+}
+
+// packedLeftoverLeaf reports whether `node`, resolved against `parent`, is a
+// container that packs a leaf into its leftover Keys (the
+// `schedulers be transmit-rate asd` single-node shape). It returns a group
+// id (the consumed identity path joined), the child schema to validate the
+// leaf at, the consumed identity path, and the synthesized leaf node (nil
+// if there is no leftover or the node is not such a container).
+func packedLeftoverLeaf(node *Node, parent *schemaNode, path []string) (string, *schemaNode, []string, *Node) {
+	childSchema := resolveSchemaChild(parent, node.Keys[0])
+	if childSchema == nil {
+		return "", nil, nil, nil
+	}
+	// Typed leaves are not containers; their value lives in Keys[1:] and is
+	// handled directly by walkSchemaNode.
+	if childSchema.isTypedLeaf() {
+		return "", nil, nil, nil
+	}
+	declaredKeyTokens := 1 + childSchema.args
+	consumed, descendSchema := consumeNodeKeys(node.Keys, childSchema)
+	// Only the fully-supplied-identity shape packs a leftover leaf here; the
+	// instance-name-as-nested-child shape is handled by descendInstanceLevels.
+	if declaredKeyTokens-consumed > 0 && !childSchema.compoundKey {
+		return "", nil, nil, nil
+	}
+	leftover := node.Keys[consumed:]
+	if len(leftover) == 0 {
+		return "", nil, nil, nil
+	}
+	idPath := append(append([]string(nil), path...), node.Keys[:consumed]...)
+	leaf := &Node{Keys: leftover, IsLeaf: node.IsLeaf, Children: node.Children}
+	return strings.Join(idPath, "\x00"), descendSchema, idPath, leaf
 }
 
 // walkSchemaNode matches a single AST node against the current schema
@@ -126,26 +190,34 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, cfg *Config, 
 	// here.
 	missingArgs := declaredKeyTokens - consumed
 	if missingArgs > 0 && !childSchema.compoundKey {
+		// Peel the missing instance-name level(s) off each child, then group
+		// the resulting instance CONTENTS by their fully-resolved identity
+		// path and walk each group together. Grouping is what gives sibling
+		// nodes under the same instance (e.g.
+		// `schedulers { be transmit-rate 1g; be transmit-rate exact; }`)
+		// mutual visibility for the split-modifier rule (Codex r3 minor).
+		groups := map[string][]*Node{}
+		gp := map[string][]string{}
 		for _, c := range node.Children {
-			if err := descendInstanceLevels(c, childSchema, missingArgs, newPath, cfg); err != nil {
+			collectInstanceContents(c, missingArgs, newPath, groups, gp)
+		}
+		for id, contents := range groups {
+			if err := walkSchemaChildren(contents, childSchema, gp[id], cfg); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
 
-	// Leftover Keys beyond this container's identity form a packed leaf:
-	// the parser folds compact statements into one node, e.g.
-	// `class-of-service { schedulers be transmit-rate asd; }` →
-	// Keys=["schedulers","be","transmit-rate","asd"]. After consuming the
-	// `schedulers be` container identity, the leftover ["transmit-rate",
-	// "asd"] is a leaf that must be validated at the child schema level —
-	// dropping it would let garbage through (Codex r2 #1). This complements
-	// descendInstanceLevels, which handles the same packing when the
-	// instance name itself arrives as a nested child.
-	if leftover := node.Keys[consumed:]; len(leftover) > 0 {
-		leaf := &Node{Keys: leftover, IsLeaf: node.IsLeaf, Children: node.Children}
-		return walkSchemaChildren([]*Node{leaf}, descendSchema, newPath, cfg)
+	// Leftover Keys beyond this container's identity form a packed leaf
+	// (the `schedulers be transmit-rate asd` single-node shape). That leaf —
+	// and its block children — are validated by walkSchemaChildren's
+	// leftover-group pass (which gives peer leftover leaves mutual sibling
+	// visibility for the split-modifier rule), so we must NOT also walk
+	// node.Children here: those children belong to the synthesized leaf, not
+	// to this container. Returning leaves them to the group pass.
+	if len(node.Keys[consumed:]) > 0 {
+		return nil
 	}
 
 	return walkSchemaChildren(node.Children, descendSchema, newPath, cfg)
@@ -193,48 +265,45 @@ func validateModifierChild(node *Node, leafSchema *schemaNode, leafPath []string
 	return nil
 }
 
-// descendInstanceLevels handles the hierarchical AST shape where a named
-// container's instance name(s) appear as nested AST child nodes rather
-// than packed into Keys. It peels `remaining` instance-name levels off the
-// AST (each level is one AST child whose Keys[0] is an instance name), then
-// validates the leaves at `containerSchema` once all names are consumed.
-func descendInstanceLevels(node *Node, containerSchema *schemaNode, remaining int, path []string, cfg *Config) error {
+// collectInstanceContents peels `remaining` instance-name level(s) off the
+// hierarchical AST (where a named container's instance name(s) appear as
+// nested AST child nodes rather than packed into the container's Keys) and
+// accumulates the instance's CONTENT nodes into per-identity groups so the
+// caller can walk each group as a mutual-sibling set.
+//
+// "Content" is either a leaf synthesized from leftover Keys packed onto the
+// instance node — the parser folds `schedulers { be transmit-rate asd; }`
+// into one node Keys=["be","transmit-rate","asd"] — or the instance node's
+// block children. Grouping by the resolved identity path gives sibling
+// nodes under one instance (e.g.
+// `schedulers { be transmit-rate 1g; be transmit-rate exact; }`) mutual
+// visibility for the typed leaf's split-modifier rule (Codex r3 minor).
+func collectInstanceContents(node *Node, remaining int, path []string, groups map[string][]*Node, gp map[string][]string) {
 	if node == nil || len(node.Keys) == 0 {
-		return nil
+		return
 	}
-	// This node's Keys carry one or more instance-name tokens, and possibly
-	// MORE: the parser produces hierarchical shorthand like
-	// `schedulers { be transmit-rate asd; }` as a single node
-	// Keys=["be","transmit-rate","asd"] (instance name + a leaf + value all
-	// packed together). After consuming the instance name(s), any leftover
-	// Keys tokens are a leaf that must still be validated — dropping them
-	// would let `transmit-rate asd` through (Copilot #1).
 	consume := len(node.Keys)
 	if consume > remaining {
 		consume = remaining
 	}
 	newPath := append(append([]string(nil), path...), node.Keys[:consume]...)
-	stillMissing := remaining - consume
-	if stillMissing > 0 {
-		// Need more name tokens than this node supplied: keep peeling from
-		// its children. (A node whose Keys are exactly the names, value-less,
-		// continues nesting.)
+	if stillMissing := remaining - consume; stillMissing > 0 {
+		// This node supplied only part of the name; keep peeling from its
+		// children (a value-less name level continues nesting).
 		for _, c := range node.Children {
-			if err := descendInstanceLevels(c, containerSchema, stillMissing, newPath, cfg); err != nil {
-				return err
-			}
+			collectInstanceContents(c, stillMissing, newPath, groups, gp)
 		}
-		return nil
+		return
 	}
-	// All instance-name args consumed. Leftover Keys tokens beyond the names
-	// form a leaf packed onto the instance node (hierarchical shorthand);
-	// validate it at the container schema level alongside any block children.
-	leftover := node.Keys[consume:]
-	if len(leftover) > 0 {
-		leaf := &Node{Keys: leftover, IsLeaf: node.IsLeaf, Children: node.Children}
-		return walkSchemaChildren([]*Node{leaf}, containerSchema, newPath, cfg)
+	id := strings.Join(newPath, "\x00")
+	gp[id] = newPath
+	// Leftover Keys beyond the names form a packed leaf for this instance.
+	if leftover := node.Keys[consume:]; len(leftover) > 0 {
+		groups[id] = append(groups[id], &Node{Keys: leftover, IsLeaf: node.IsLeaf, Children: node.Children})
+		return
 	}
-	return walkSchemaChildren(node.Children, containerSchema, newPath, cfg)
+	// Otherwise the instance's block children are its content.
+	groups[id] = append(groups[id], node.Children...)
 }
 
 // resolveSchemaChild returns the schema node for keyword under parent:

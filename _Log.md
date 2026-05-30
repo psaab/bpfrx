@@ -4436,3 +4436,7 @@ top.
 - **Timestamp**: 2026-05-29
   **Action**: #1319 PR1 review-response r2 — fix 2 more MAJORs from Codex re-review: (1) fully-packed container leaf `schedulers be transmit-rate asd` (one node) dropped the leaf — added leftover-Keys synthesis to the container path; (2) known modifier child swallowed trailing garbage `exact bogus` — new validateModifierChild checks no trailing keys + no unexpected descendants
   **File(s)**: pkg/config/schema_walk.go (container leftover-leaf + validateModifierChild), pkg/config/schema_validate_test.go (TestSchemaValidate_FullyPackedContainerLeaf + TestSchemaValidate_ModifierTrailingGarbage)
+
+- **Timestamp**: 2026-05-29
+  **Action**: #1319 PR1 review-response r3 — fix Codex r3 MINOR: packed-leftover leaves were validated with a singleton sibling set, breaking the cross-sibling split-modifier rule (`schedulers be transmit-rate 1g` + `schedulers be transmit-rate exact` falsely rejected). Refactored leftover-leaf handling to group by container identity across siblings (walkSchemaChildren leftover-group pass + collectInstanceContents batch peel) so peer leftover leaves see each other.
+  **File(s)**: pkg/config/schema_walk.go (packedLeftoverLeaf + leftover grouping in walkSchemaChildren; collectInstanceContents replaces descendInstanceLevels), pkg/config/schema_validate_test.go (TestSchemaValidate_PackedSiblingSplitModifier)
