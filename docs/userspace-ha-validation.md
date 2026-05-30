@@ -137,17 +137,27 @@ The validator does this in order:
    - IPv6 `2607:f8b0:4005:814::200e`
    - the validator treats `ping` exit status `1` as expected for these probes
      when the returned output contains the native time-exceeded response
-10. records one-cycle `mtr` reports to those same public IPv4/IPv6 targets
-11. fails if the first hop is unresolved; IPv4 also requires the final public
-    destination hop to resolve, while IPv6 records an unresolved final
-    internet hop as a warning after the deterministic IPv6 TTL probe has passed
-12. runs one unmeasured warm-up `iperf3` pass for IPv4 and IPv6
-13. runs repeated IPv4 `iperf3` to `172.16.80.200`
-14. runs repeated IPv6 `iperf3` to `2001:559:8585:80::200`
-15. pulls `iperf3 -J` JSON back to the repo host, parses it locally, and fails
+10. asserts the controlled LAN-to-WAN-target reachability ping received
+    replies for both families (the `validate_reachability` gate — this is
+    the IPv6 dataplane forwarding-correctness signal, since the LAN host
+    reaches the WAN-side target only by transiting the userspace dataplane),
+    and asserts the targets do not resolve on-box (`assert_forwarding_route`)
+11. records one-cycle `mtr` reports to the public IPv4/IPv6 targets
+12. for IPv4 (a reliable responder, `1.1.1.1`), fails if the first hop or the
+    final destination hop is unresolved (loss parsed numerically; a
+    `(waiting for reply)` / truncated-`%` / `100%` final hop fails closed).
+    For IPv6 the public `mtr` is observability-only: an unresolved first hop
+    still fails, but any unresolved/silent later or final hop is recorded as
+    a warning. External internet IPv6 routing is not gated by the public
+    trace — it is gated by the controlled ping/TTL/iperf3 legs to the
+    in-control WAN target (see #1303)
+13. runs one unmeasured warm-up `iperf3` pass for IPv4 and IPv6
+14. runs repeated IPv4 `iperf3` to `172.16.80.200`
+15. runs repeated IPv6 `iperf3` to `2001:559:8585:80::200`
+16. pulls `iperf3 -J` JSON back to the repo host, parses it locally, and fails
     if throughput cliffs after startup
-16. retries one marginal near-threshold miss once
-17. optionally records `perf` data on the active firewall
+17. retries one marginal near-threshold miss once
+18. optionally records `perf` data on the active firewall
 
 The dedicated RG failover validator now adds stricter HA gates:
 
@@ -225,14 +235,28 @@ lines, not only the `[SUM]` line, for both:
 A run is still a failure if aggregate traffic recovers but one stream remains
 pinned at `0.00 bits/sec` after failback, or if only one direction recovers.
 
-The validator also treats traceroute visibility as a standard correctness gate.
-It does not require every internet hop to answer. It does require:
+The validator treats forwarding correctness and traceroute visibility as
+distinct concerns. It does not require every internet hop to answer. It does
+require:
 
+- the controlled LAN-to-WAN-target ping (`172.16.80.200` /
+  `2001:559:8585:80::200`) to receive replies for both families. The LAN
+  host reaches these WAN-side targets only by transiting the userspace
+  dataplane, so this is the controlled IPv6/IPv4 forwarding-correctness gate
+  (`validate_reachability`). It also asserts the targets do not resolve
+  on-box, so the transit premise cannot silently drift
+  (`assert_forwarding_route`)
 - the firewall hop to answer TTL-expired probes
-- the final destination hop in IPv4 `mtr` to resolve for `1.1.1.1`
-- IPv6 `mtr` to have a resolved first hop; an unresolved final public IPv6
-  hop to `2607:f8b0:4005:814::200e` is reported as a warning after the
-  deterministic IPv6 TTL-expired probe has passed
+- the final destination hop in IPv4 `mtr` to resolve for `1.1.1.1`. Loss is
+  parsed numerically, so a final hop printed as `(waiting for reply)`, with
+  a column-truncated loss (`100.0` without `%`), with integer `100%` loss,
+  or with an unparseable loss column fails closed
+- IPv6 `mtr` to have a resolved first hop. The public IPv6 trace to
+  `2607:f8b0:4005:814::200e` is **observability-only**: any unresolved or
+  silent later/final hop is recorded as a warning, never a hard failure,
+  because the external endpoint and intermediate ICMPv6 rate-limiting are
+  outside our control (#1303). IPv6 dataplane forwarding is gated by the
+  controlled ping/TTL/iperf3 legs above, not by this external trace
 
 For the TTL / hop-limit probes, a non-zero `ping` exit code is not itself a
 failure. The validator accepts the probe when the returned output contains the
@@ -240,6 +264,8 @@ expected native time-exceeded text from the userspace firewall.
 
 Artifacts kept on `cluster-userspace-host`:
 
+- `/tmp/userspace-ping-v4.out`
+- `/tmp/userspace-ping-v6.out`
 - `/tmp/userspace-ttl-v4.txt`
 - `/tmp/userspace-ttl-v6.txt`
 - `/tmp/userspace-mtr-v4.txt`

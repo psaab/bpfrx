@@ -1,8 +1,11 @@
 # #1303 — IPv6 mtr smoke false-fail: controlled forwarding signal
 
-Status: DRAFT v3 — v1 PLAN-KILLED (both reviewers); v2 PLAN-NEEDS-MAJOR
-(both reviewers endorsed the architecture, flagged classifier/shell/
-scope details). v3 applies every round-2 finding.
+Status: PLAN-READY v3 — Codex (task-mpru1jxi-2lvvap) + AGY
+(adversarial-review-mpru1nhk-15b7f2) both PLAN-READY on v3, confirming
+every round-2 finding (F1-F5) resolved. v1 PLAN-KILLED (both); v2
+PLAN-NEEDS-MAJOR (both endorsed the architecture). Two non-blocking
+plan-doc nits from Codex r3 folded in (test expectation `100.0`→None;
+route-guard scope wording).
 
 ## v2 round-2 outcome (preserved)
 
@@ -198,7 +201,10 @@ assert_forwarding_route() {
 (IPv6 uses `ip -6 route get`; IPv4 uses `ip route get`. The check
 fails if the target is `local` or routed via `dev lo` — i.e. assigned
 on the host itself, which would mean the ping never transits the
-firewall.)
+firewall. It does not attempt to enumerate every possible on-link
+shortcut; `local`/`dev lo` is the concrete drift mode that would make
+the ping a non-transit no-op, and both reviewers confirmed that grep is
+correct for it.)
 
 ### 3. Extract + harden the mtr classifier (for the IPv4 leg)
 
@@ -343,8 +349,9 @@ asks for; it is NOT a blanket no-op, as the table's "yes" rows show.
    (fail-closed via `last_loss is None`).
 10. IPv6 final hop `(waiting for reply) 100.0` (allow=1) → PASS warning.
 11. no hop lines, allow=0 → FAIL; allow=1 → PASS (warning).
-12. `hop_loss_pct` unit: `100.0%`→100.0, `100.0`→100.0, `0.0%`→0.0,
-    `100%`→100.0, line with no `%` and no float → None.
+12. `hop_loss_pct` unit: `100.0%`→100.0, `100.0`→None (no `%` token —
+    fails closed downstream), `0.0%`→0.0, `100%`→100.0, line with no
+    `%` → None.
 13. `hop_unresolved` unit: `???`→True, `(waiting for reply)`→True,
     resolved host→False.
 14. IPv6 addr host with colons in the loss-token line parses correctly

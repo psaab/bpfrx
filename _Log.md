@@ -4403,3 +4403,24 @@ top.
 - **File(s)**: docs/userspace-dataplane-gaps.md,
   docs/pr/1667-snat-docguard/plan.md,
   docs/pr/1667-snat-docguard/reviewer-ids.md, _Log.md
+
+- **Timestamp**: 2026-05-29
+- **Action**: #1303 — robust IPv6 mtr smoke signal. The IPv6 leg of the
+  userspace HA smoke false-failed a healthy dataplane when the external
+  public IPv6 traceroute final hop did not answer. Extracted the inline
+  mtr classifier heredoc to `scripts/mtr_report_check.py` (loss parsed
+  numerically by anchoring on the `%` token, `(waiting for reply)` and
+  unparseable loss fail closed). Demoted the public IPv6 mtr to an
+  observability-only warning; the IPv6 forwarding-correctness signal is
+  now the existing controlled LAN-to-WAN-target ping (asserted via new
+  `validate_reachability`) plus the IPv6 TTL probe and IPv6 iperf3 leg,
+  all under our control and all hard fails. Added `assert_forwarding_route`
+  drift guard and `LC_ALL=C` + `2>&1 || true` capture so `set -e` cannot
+  crash before the classifier/assertion runs. Added
+  `scripts/test_mtr_report_check.py` (22 tests, incl. the issue repro and
+  every reviewer false-pass case). Plan KILLed at v1, NEEDS-MAJOR at v2,
+  all findings applied at v3.
+- **File(s)**: scripts/mtr_report_check.py,
+  scripts/test_mtr_report_check.py, scripts/userspace-ha-validation.sh,
+  docs/userspace-ha-validation.md, docs/pr/1303-mtr-smoke/plan.md,
+  docs/pr/1303-mtr-smoke/reviewer-ids.md, _Log.md
