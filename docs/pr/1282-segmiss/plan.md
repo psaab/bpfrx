@@ -1,6 +1,46 @@
 # #1282 — DBG SEG_MISS journal spam + TX errors on reverse egress ifindex 5
 
-Status: DRAFT v1 — pending adversarial plan review (Codex + AGY + Claude-SMR)
+Status: PLAN-READY v2 — Codex PLAN-NEEDS-MINOR + AGY PLAN-NEEDS-MINOR
+(both minors applied below) + Claude-SMR PLAN-READY.
+
+## Reviewer dispositions (v1 → v2)
+
+- **Codex** (`task-mprtr0ce-hmo6nh`, PLAN-NEEDS-MINOR, ran sandbox-blind,
+  assessed from facts): direction right, do NOT close-with-evidence-only.
+  Minors: (1) include the ancestry `git merge-base --is-ancestor` checks;
+  (2) cite the exact `forwarded_tcp_may_need_segmentation` parsed-offset
+  win; (3) make gate order short-circuit before the cap counter;
+  (4) state the durable operator signal explicitly; (5) validate both
+  feature modes. **All applied.** Honest framing applied: this PR does
+  NOT claim to fix the original SEG_MISS false positive or TX-error
+  accounting — those are already on master (#1283, 85858ec0d).
+- **AGY** (`adversarial-review-mprtr52y-la8h95`, PLAN-NEEDS-MINOR, 1613
+  tests pass): core diagnosis verified accurate, but flagged that
+  Codex's point #4 rests on a false premise — `seg_needed_but_none` is
+  `pub(in crate::afxdp)` and is **never** exported to Go/CLI (verified:
+  it only feeds the periodic `seg_miss={}` debug-log string in
+  `worker/loop_body/mod.rs:1040`). So naive gating makes a genuine
+  production seg-miss **100% silent** (the fallback forwards the
+  oversized frame → silently dropped by NIC/switch → black-holed
+  connection, no trace). **Fix adopted:** surface a genuine seg-miss via
+  the existing `record_exception("tcp_segmentation_miss", ...)`
+  infrastructure so it appears under `Recent exceptions` in `show
+  chassis cluster data-plane statistics`.
+- **Claude-SMR**: PLAN-READY on the gate; ratified AGY's blindspot
+  finding (independently confirmed `seg_needed_but_none` has no Go/CLI
+  surface). Added a rate cap on the `record_exception` call so a
+  pathological per-packet seg-miss cannot spin the `recent_exceptions`
+  mutex on the hot path (engineering-style "rare error → bump counter,
+  continue").
+
+## Ancestry verification (run in worktree)
+
+```
+$ git merge-base --is-ancestor 0ce930385 HEAD && echo "#1283 ancestor"
+#1283 ancestor
+$ git merge-base --is-ancestor 85858ec0d HEAD && echo "TX-attr ancestor"
+TX-attr ancestor
+```
 
 ## Issue framing
 
@@ -97,26 +137,72 @@ The matching telemetry counter (`dbg.seg_needed_but_none`, incremented in
 operator-visible signal and stays. Only the ad-hoc eprintln becomes
 opt-in.
 
-## Concrete design
+## Concrete design (v2 — gate + durable operator signal)
 
-Gate the `SEG_MISS_LOG` eprintln block behind `cfg!(feature =
-"debug-log")`, matching its five siblings in the same file. The counter
-`seg_needed_but_none` is unchanged (always increments — it is the real
-signal). Pure logging-hygiene change; no behavioral change to the
-dataplane, no change to the counter, no change to the #1283 precheck.
+Two changes at the seg-miss site (`tx/dispatch/mod.rs:392-420`), both
+inside the existing `if count_forwarded_tcp_segmentation_miss_if_needed(...)`
+block. The `dbg.seg_needed_but_none` counter is unchanged (always
+increments inside the counting helper). No change to the #1283 precheck.
+
+1. **Gate the `DBG SEG_MISS` eprintln behind `cfg!(feature =
+   "debug-log")`** with short-circuit ordering so release builds never
+   touch the per-thread cap cell. Matches the five siblings in this file
+   (lines 254/332/515/663/793).
+
+2. **Record a first-class exception** so a genuine seg-miss is visible to
+   operators in release via `show chassis cluster data-plane statistics`
+   (`Recent exceptions`). This closes the blindspot AGY identified:
+   `seg_needed_but_none` is `pub(in crate::afxdp)` with no Go/CLI export.
+   The call is rate-capped by the same `< 20`-per-thread counter so a
+   pathological per-packet seg-miss cannot spin the `recent_exceptions`
+   mutex on the hot path.
 
 ```rust
 if count_forwarded_tcp_segmentation_miss_if_needed(
     dbg, copied_source_frame, tcp_segmentation_needed,
 ) {
-    if cfg!(feature = "debug-log") {
-        thread_local! {
-            static SEG_MISS_LOG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-        }
-        SEG_MISS_LOG.with(|c| { /* unchanged eprintln body */ });
+    thread_local! {
+        static SEG_MISS_LOG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
+    SEG_MISS_LOG.with(|c| {
+        let n = c.get();
+        if n < 20 {
+            c.set(n + 1);
+            // Durable, operator-visible signal (release-safe): surfaces
+            // under `Recent exceptions` in data-plane statistics. Rate-
+            // capped to 20/thread so a pathological per-packet seg-miss
+            // cannot spin the recent_exceptions mutex.
+            record_exception(
+                recent_exceptions,
+                ingress_ident,
+                "tcp_segmentation_miss",
+                source_frame.len() as u32,
+                Some(request.meta.into()),
+                None,
+                forwarding,
+            );
+            // Debug-build-only packet-shape sample. Gated to match the
+            // five sibling DBG prints in this file; default features =
+            // [] so this DCEs out of release builds.
+            if cfg!(feature = "debug-log") {
+                let egress_mtu = forwarding.egress
+                    .get(&request.decision.resolution.egress_ifindex)
+                    .or_else(|| forwarding.egress.get(&request.decision.resolution.tx_ifindex))
+                    .map(|e| e.mtu);
+                eprintln!("DBG SEG_MISS[{}]: frame_len={} proto={} egress_if={} tx_if={} egress_mtu={:?} target_if={} src_frame_bytes={}",
+                    n, source_frame.len(), request.meta.protocol,
+                    request.decision.resolution.egress_ifindex,
+                    request.decision.resolution.tx_ifindex,
+                    egress_mtu, request.target_ifindex, source_frame.len());
+            }
+        }
+    });
 }
 ```
+
+I will confirm `recent_exceptions` and `ingress_ident` are in scope at
+the seg-miss site (they are used by the sibling `record_exception` call
+at line 342 inside the same function) before editing.
 
 ## Public API preservation
 
