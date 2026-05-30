@@ -489,6 +489,28 @@ func TestSchemaValidate_FullyPackedContainerLeaf(t *testing.T) {
 	}
 }
 
+// TestSchemaValidate_MultiLevelPackedChain reproduces Codex r4: a fully-flat
+// single node `class-of-service schedulers be transmit-rate asd;` parses to
+// ONE node Keys=["class-of-service","schedulers","be","transmit-rate","asd"]
+// — multiple container levels AND the leaf packed together. The leftover
+// synthesis must RECURSE through the grouping pass (not validate the
+// synthesized leaf once and stop) so the nested packed `transmit-rate asd`
+// is reached. Dropping it was a packed-chain bypass.
+func TestSchemaValidate_MultiLevelPackedChain(t *testing.T) {
+	if err := schemaCheck(t, `class-of-service schedulers be transmit-rate asd;`); err == nil {
+		t.Fatal("expected rejection for multi-level packed chain garbage, got nil")
+	}
+	if err := schemaCheck(t, `class-of-service schedulers be priority foo;`); err == nil {
+		t.Fatal("expected rejection for multi-level packed priority garbage, got nil")
+	}
+	if err := schemaCheck(t, `class-of-service schedulers be transmit-rate 1g;`); err != nil {
+		t.Fatalf("expected multi-level packed valid chain to pass, got %v", err)
+	}
+	if err := schemaCheck(t, `class-of-service schedulers be transmit-rate 1g exact;`); err != nil {
+		t.Fatalf("expected multi-level packed chain with modifier to pass, got %v", err)
+	}
+}
+
 // TestSchemaValidate_ModifierTrailingGarbage reproduces Codex r2 #2: a known
 // modifier child must not swallow trailing garbage. `transmit-rate 1g {
 // exact bogus; }` (hierarchical) and `set ... transmit-rate 1g exact bogus`

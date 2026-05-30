@@ -76,12 +76,16 @@ func walkSchemaChildren(nodes []*Node, parent *schemaNode, path []string, cfg *C
 		}
 	}
 	for id, leaves := range leftoverGroups {
-		// Validate the group's leftover leaves as mutual siblings.
-		gp := groupPath[id]
-		for _, leaf := range leaves {
-			if err := walkSchemaNode(leaf, groupSchema[id], gp, cfg, leaves); err != nil {
-				return err
-			}
+		// Validate the group's leftover leaves as mutual siblings. Recurse
+		// through walkSchemaChildren (NOT walkSchemaNode per leaf) so a
+		// synthesized leaf that is ITSELF a container with further packed
+		// leftover (the multi-level packed chain
+		// `class-of-service schedulers be transmit-rate asd` as one node)
+		// re-enters the leftover-group pass and is not dropped (Codex r4).
+		// walkSchemaChildren also threads `leaves` as the sibling set, so the
+		// split-modifier cross-sibling rule still sees peers.
+		if err := walkSchemaChildren(leaves, groupSchema[id], groupPath[id], cfg); err != nil {
+			return err
 		}
 	}
 

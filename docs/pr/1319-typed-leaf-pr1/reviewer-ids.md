@@ -13,11 +13,22 @@ research/1319-typed-leaf @ c0f6e5a79 (research rounds below).
 - Copilot r1: COMMENTED, 1 inline (same major — descendInstanceLevels leftover drop)
 - Claude SMR r1: in-conversation — removed unused parentSchema param; concurred on the major after Copilot/Codex flagged it
 
-### Round 2 (HEAD 4d6f93ce6 — major + 2 minors fixed)
-- Codex r2: task-mprxlkar-e1auk6 — (pending)
-- Copilot r2: (`@copilot review` re-requested) — (pending)
-- AGY: MERGE-READY stands (r2 covered the unchanged areas; fix is additive)
-- Claude SMR r2: MERGE-READY — fix is minimal + regression-tested, full suite green, 5/5 flake clean
+### Round 2 (HEAD 4d6f93ce6 — major #1 + 2 minors fixed)
+- Codex r2: task-mprxlkar-e1auk6 — MERGE-NEEDS-MAJOR (2 NEW majors: fully-packed container leaf dropped; modifier child swallowed trailing garbage. Confirmed r1 major #1 + minors #2/#3 fixed)
+- Copilot r2: COMMENTED, no inline (original major resolved)
+- Claude SMR r2: concurred; verified probes
+
+### Round 3 (HEAD 48fabf1d3 — both r2 majors fixed)
+- Codex r3: task-mprxv25r-baz5f6 — MERGE-NEEDS-MINOR (1 minor: packed-leftover leaf validated with singleton sibling set → split-modifier siblings falsely rejected. Confirmed both r2 majors + r1 minors fixed)
+- Claude SMR r3: concurred; reproduced the regression via probe
+
+### Round 4 (HEAD c85f61e8b — r3 minor fixed via leftover grouping)
+- Codex r4: task-mpry764r-46otxf — (pending)
+- Copilot: re-requested on latest HEAD — (pending)
+- Claude SMR r4: MERGE-READY — proved no double-validation (validator called exactly once per leaf), no false-reject on realistic multi-subtree configs, all reject cases still reject; full suite green, 5/5 flake clean
+
+### AGY
+- AGY r2 (HEAD f586b9677): adversarial-review-mprxfd4w-at6of4 — MERGE-READY (verified 6 focus areas; missed the packed-leftover majors that Copilot+Codex caught). Fix commits since are additive validation tightening; no new architecture.
 
 ---
 

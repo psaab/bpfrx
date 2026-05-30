@@ -4440,3 +4440,7 @@ top.
 - **Timestamp**: 2026-05-29
   **Action**: #1319 PR1 review-response r3 — fix Codex r3 MINOR: packed-leftover leaves were validated with a singleton sibling set, breaking the cross-sibling split-modifier rule (`schedulers be transmit-rate 1g` + `schedulers be transmit-rate exact` falsely rejected). Refactored leftover-leaf handling to group by container identity across siblings (walkSchemaChildren leftover-group pass + collectInstanceContents batch peel) so peer leftover leaves see each other.
   **File(s)**: pkg/config/schema_walk.go (packedLeftoverLeaf + leftover grouping in walkSchemaChildren; collectInstanceContents replaces descendInstanceLevels), pkg/config/schema_validate_test.go (TestSchemaValidate_PackedSiblingSplitModifier)
+
+- **Timestamp**: 2026-05-29
+  **Action**: #1319 PR1 review-response r4 — fix Codex r4 MAJOR: multi-level packed chain (`class-of-service schedulers be transmit-rate asd` as one flat node) bypassed validation because the group pass called walkSchemaNode per synthesized leaf, and walkSchemaNode returns nil on a synthesized leaf that is itself a container with further leftover. Fixed by having the group pass recurse via walkSchemaChildren (re-enters the leftover-group pass for nested packed chains; still threads the leaves as siblings).
+  **File(s)**: pkg/config/schema_walk.go (group pass walkSchemaChildren recursion), pkg/config/schema_validate_test.go (TestSchemaValidate_MultiLevelPackedChain)
