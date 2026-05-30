@@ -1,8 +1,9 @@
 # #1694 — GetMapStats: stale map names + filter_rules ARRAY mis-count
 
-Status: v2 — Codex PLAN-NEEDS-MAJOR (round 1) addressed; AGY + Claude-SMR
-PLAN-READY (round 1). Reframed acceptance from "maps start reporting at
-runtime" to "static descriptor-table correctness" per Codex finding.
+Status: PLAN-READY — Codex round-2 PLAN-NEEDS-MINOR (stale runtime
+wording in plan.md) addressed; AGY + Claude-SMR PLAN-READY (round 1).
+Reframed acceptance from "maps start reporting at runtime" to "static
+descriptor-table correctness" per Codex round-1 finding.
 
 ## Round-1 review outcome + revision
 
@@ -42,8 +43,6 @@ runtime" to "static descriptor-table correctness" per Codex finding.
 2. Test seam: an **unexported** package-level slice
    `mapStatsReportDescriptors` of an unexported type, read by the test,
    never mutated, never exported. `GetMapStats` ranges over it.
-
-Status: DRAFT v1 — pending one hostile plan-review round (isolated bug fix)
 
 ## Issue framing
 
@@ -85,8 +84,11 @@ Edit the `reportMaps` table in `maps_stats.go` only:
 {"filter_rules", false},       // was true; ARRAY iteration == MaxEntries
 ```
 
-- Names corrected so the two array configs actually resolve in
-  `m.maps` and report Name/Type/MaxEntries/Key/ValueSize (UsedCount
+- Names corrected to match the BPF header names so the two array
+  descriptors resolve in `m.maps` *if those maps are present* — today
+  the userspace shim does not load them, so the fix is a latent
+  descriptor-table correction, not new runtime output. When present
+  they would report Name/Type/MaxEntries/Key/ValueSize (UsedCount
   stays 0, correct for an ARRAY — same treatment already given to the
   other arrays in the table: `zone_configs`, `policy_rules`,
   `snat_rules`, `global_counters`, `policy_counters`).
@@ -109,20 +111,23 @@ only the static descriptor table values change.
   unchanged. Consumers (`apply.go:413`, `dataplane.go:406` interface,
   `show system buffers`, Prometheus collector) see the same shape.
 - Iteration safety: the only `countable:true` entries remaining are
-  genuine HASH maps (`sessions`, `sessions_v6`, `address_book_v4/v6`,
-  `address_membership`, `applications`, `dnat_table`, `dnat_table_v6`)
-  — all `BPF_MAP_TYPE_HASH`/`LRU_HASH`, where iteration counting is
-  valid. No behavioral change to those.
+  sparse maps (`sessions`, `sessions_v6`, `address_membership`,
+  `applications`, `dnat_table`, `dnat_table_v6` — `BPF_MAP_TYPE_HASH`;
+  `address_book_v4/v6` — `BPF_MAP_TYPE_LPM_TRIE`), where iteration
+  counting yields only live entries. No behavioral change to those.
 - Missing-map tolerance: `if !ok || bm == nil { continue }` already
-  guards the lookup; correcting the names makes two previously-skipped
-  entries now resolve. If a map genuinely isn't loaded, behavior is
-  unchanged (still skipped).
+  guards the lookup; correcting the names makes the two descriptors
+  resolve *if those maps are loaded*. They are not loaded by the
+  userspace shim today, so they stay skipped at runtime — the value of
+  the fix is the corrected static table, ready for whenever those maps
+  are surfaced. A genuinely-absent map is unchanged (still skipped).
 
 ## Risk assessment
 
-- Behavioral regression: LOW. Two entries start reporting (were silent);
-  one entry stops reporting a misleading count (reports 0). No
-  consumer asserts on the old wrong values.
+- Behavioral regression: LOW. The name fixes only change output if the
+  renamed maps are present (they are not today); the `filter_rules`
+  flip changes its UsedCount from MaxEntries to 0 if that map is
+  present. No consumer asserts on the old wrong values.
 - Lifetime/borrow: N/A (Go, static table edit).
 - Performance: NONE on the hot path. This is a 1/s-or-slower control
   accessor. Removing `filter_rules` iteration slightly *reduces* work.
