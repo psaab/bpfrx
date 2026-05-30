@@ -1,5 +1,48 @@
 # #1694 — GetMapStats: stale map names + filter_rules ARRAY mis-count
 
+Status: v2 — Codex PLAN-NEEDS-MAJOR (round 1) addressed; AGY + Claude-SMR
+PLAN-READY (round 1). Reframed acceptance from "maps start reporting at
+runtime" to "static descriptor-table correctness" per Codex finding.
+
+## Round-1 review outcome + revision
+
+- **Codex (task-mpsi2hph-dukvbl): PLAN-NEEDS-MAJOR.** All three table
+  defects confirmed real. Major finding: the *current* runtime loads
+  the Rust userspace shim collection plus a fixed `userspaceShimShared
+  MapSpecs()` set (loader_userspace_shim.go:275) — which contains
+  `sessions`, `sessions_v6`, `dnat_table`, `dnat_table_v6`, and
+  counter/infra maps but **NOT** `nat_pool_configs`, `screen_configs`,
+  or `filter_rules`. `Manager.Load()` (the old full-eBPF-collection
+  path) is retired (loader.go:99). So the name fixes do NOT make two
+  maps "start reporting at runtime today" — those maps are absent from
+  `m.maps` regardless of name. The defects are real *descriptor-table*
+  bugs (latent: wrong output if/when those maps are ever surfaced),
+  but the v1 acceptance story was false. Also: `struct filter_rule`
+  (xpf_common.h:800) has no `valid` bit — validity is
+  `filter_config.num_rules/rule_start`, not slot contents, so
+  value-aware counting would be a *different* metric, not a cheap
+  used-count. Refinement: prefer an unexported package-level slice the
+  test reads but never mutates (or a helper returning the literal)
+  over a mutable exported var. **VERIFIED independently** against
+  loader_userspace_shim.go:275-300 and xpf_common.h:800-820.
+- **AGY (adversarial-review-mpsi2q1l-6ucrhb): PLAN-READY.** Same
+  source-grounded confirmation; additionally verified CLI
+  (cli_show_system.go:64-66) and gRPC (server_show.go:1811-1813)
+  already discard array `UsedCount` (print "-"/`continue`); only the
+  REST JSON (system.go:230) exposes raw `UsedCount`, so the
+  `filter_rules` fix only improves that one path. No consumer breaks.
+- **Claude-SMR: PLAN-READY**, crediting Codex's runtime-loading point
+  (I had missed it). Reframed below.
+
+### Revisions applied for v2
+1. Acceptance reframed: this fixes the **static descriptor table's
+   correctness**, not observable runtime output (the three maps aren't
+   loaded by the shim today). The test asserts the descriptor table's
+   names + countability statically — no live `m.maps`.
+2. Test seam: an **unexported** package-level slice
+   `mapStatsReportDescriptors` of an unexported type, read by the test,
+   never mutated, never exported. `GetMapStats` ranges over it.
+
 Status: DRAFT v1 — pending one hostile plan-review round (isolated bug fix)
 
 ## Issue framing
@@ -89,18 +132,22 @@ only the static descriptor table values change.
 
 - `GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go test ./pkg/dataplane/...`
   green.
-- New unit test exercising the corrected descriptor table:
-  - Asserts the `reportMaps` set contains `nat_pool_configs` and
+- New unit test exercising the corrected **static descriptor table**
+  (NOT runtime output — the three fixed maps are not loaded by the
+  userspace shim today; the test validates the table, which is the
+  thing the bug lives in):
+  - Asserts the descriptor set contains `nat_pool_configs` and
     `screen_configs` and NOT the stale `nat_pool_config` /
     `screen_profiles`.
   - Asserts `filter_rules` is in the non-countable set.
-  - Because `reportMaps` is a function-local literal, the test needs a
-    hook. Plan: extract the descriptor table to a package-level
-    `var mapStatsReport = []mapStatDescriptor{...}` (named struct
-    type) so the test can assert names + countability without a live
-    BPF collection. `GetMapStats` ranges over the package var. This is
-    a minimal, mechanical extraction — keeps the fix testable without
-    standing up the dataplane.
+  - Asserts the countability invariant by name: the only entries
+    expected countable are the sparse HASH/LPM_TRIE maps.
+  - Seam: extract the function-local literal to an **unexported**
+    package-level slice `mapStatsReportDescriptors` of an unexported
+    type `mapStatDescriptor{name string; countable bool}`. The test
+    reads it; it is never mutated, never exported, no test-only hook.
+    `GetMapStats` ranges over it. Minimal mechanical extraction; no
+    live BPF collection required.
 - Full `go test ./...` green except the known pre-existing
   pkg/daemon socket-path-overflow sandbox failures (prove identical on
   clean master).
