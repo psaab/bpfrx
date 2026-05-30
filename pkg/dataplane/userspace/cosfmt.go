@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 
@@ -69,6 +70,11 @@ type cosQueueView struct {
 	equalFlowCapHitEvents         uint64
 	equalFlowSuppressedGrantBytes uint64
 	equalFlowFailOpenReason       string
+	// #1628 per-class waterfill trace counters (queue-scoped). Rendered
+	// in the per-queue detail block only when non-zero.
+	waterfillPhase1Admissions uint64
+	waterfillPhase2Admissions uint64
+	waterfillEligibleVisits   uint64
 }
 
 func FormatCoSInterfaceSummary(cfg *config.Config, status *ProcessStatus, selector string) string {
@@ -126,6 +132,29 @@ func FormatCoSInterfaceSummary(cfg *config.Config, status *ProcessStatus, select
 			fmt.Fprintf(&b, "  Timer wheel sleepers:     level0=%d level1=%d\n",
 				view.interfaceState.TimerLevel0Sleepers,
 				view.interfaceState.TimerLevel1Sleepers)
+			// #1628: per-interface guarantee-rate waterfill counters.
+			// Rendered only when the interface ran the waterfill selector
+			// (guarantee-rate mode) — zero on Proportional mode. epochs +
+			// breaks are summed across workers; min_epochs_per_worker is
+			// the MIN over bindings with active exact backlog (a frozen
+			// MIN well below the SUM flags a single Phase-2-locked
+			// selector). The u64::MAX sentinel = "no active-backlog
+			// candidate"; render it as "none" so it is not confused with a
+			// real 0-epoch hard lock-in.
+			minEpochs := view.interfaceState.WaterfillMinEpochsPerWorker
+			minHasCandidate := minEpochs != math.MaxUint64
+			if view.interfaceState.WaterfillEpochs != 0 ||
+				view.interfaceState.WaterfillPhase1BudgetBreaks != 0 ||
+				minHasCandidate {
+				minStr := "none"
+				if minHasCandidate {
+					minStr = strconv.FormatUint(minEpochs, 10)
+				}
+				fmt.Fprintf(&b, "  Waterfill:                epochs=%d phase1_budget_breaks=%d min_epochs_per_worker=%s\n",
+					view.interfaceState.WaterfillEpochs,
+					view.interfaceState.WaterfillPhase1BudgetBreaks,
+					minStr)
+			}
 		}
 		// Build queue views once per interface and share the slice
 		// between the binding-scoped telemetry render and the main
@@ -267,6 +296,21 @@ func FormatCoSInterfaceSummary(cfg *config.Config, status *ProcessStatus, select
 					queue.drainParkQueueTokens,
 				)
 			}
+			if queue.hasWaterfillTelemetry() {
+				// #1628 guarantee-rate waterfill trace row. Phase-1 vs
+				// Phase-2 admissions + eligible visits. Read WITH the
+				// DrainShape park counters and QueuedBytes above to
+				// diagnose Phase-2 lock-in (small class: phase1=0,
+				// phase2>0, backlog+parks) vs healthy residual (large
+				// above-cutoff class, or idle: no backlog/parks).
+				fmt.Fprintf(
+					&b,
+					"           Waterfill:    phase1_admit=%d  phase2_admit=%d  eligible_visits=%d\n",
+					queue.waterfillPhase1Admissions,
+					queue.waterfillPhase2Admissions,
+					queue.waterfillEligibleVisits,
+				)
+			}
 		}
 	}
 	return b.String()
@@ -279,6 +323,15 @@ func (q cosQueueView) hasDrainShapeTelemetry() bool {
 		q.drainNonExactWhileExactBytes != 0 ||
 		q.drainParkRootTokens != 0 ||
 		q.drainParkQueueTokens != 0
+}
+
+// #1628: gate the per-queue waterfill trace row so a queue that never
+// went through the guarantee-rate selector (Proportional mode, or never
+// serviced) stays silent.
+func (q cosQueueView) hasWaterfillTelemetry() bool {
+	return q.waterfillPhase1Admissions != 0 ||
+		q.waterfillPhase2Admissions != 0 ||
+		q.waterfillEligibleVisits != 0
 }
 
 // #709: render a histogram percentile as microseconds. The Rust side
@@ -623,6 +676,10 @@ func buildCoSQueueViews(cfg *config.Config, view cosInterfaceView) []cosQueueVie
 			qv.equalFlowCapHitEvents = runtimeQueue.EqualFlowCapHitEvents
 			qv.equalFlowSuppressedGrantBytes = runtimeQueue.EqualFlowSuppressedGrantBytes
 			qv.equalFlowFailOpenReason = runtimeQueue.EqualFlowFailOpenReason
+			// #1628 copy-through; rendered only when non-zero.
+			qv.waterfillPhase1Admissions = runtimeQueue.WaterfillPhase1Admissions
+			qv.waterfillPhase2Admissions = runtimeQueue.WaterfillPhase2Admissions
+			qv.waterfillEligibleVisits = runtimeQueue.WaterfillEligibleVisits
 			queueViews[qv.queueID] = qv
 		}
 	}

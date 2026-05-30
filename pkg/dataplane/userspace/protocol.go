@@ -695,17 +695,30 @@ type EventStreamStatus struct {
 }
 
 type CoSInterfaceStatus struct {
-	Ifindex             int              `json:"ifindex,omitempty"`
-	InterfaceName       string           `json:"interface_name,omitempty"`
-	OwnerWorkerID       *uint32          `json:"owner_worker_id,omitempty"`
-	ShapingRateBytes    uint64           `json:"shaping_rate_bytes,omitempty"`
-	BurstBytes          uint64           `json:"burst_bytes,omitempty"`
-	WorkerInstances     int              `json:"worker_instances,omitempty"`
-	NonemptyQueues      int              `json:"nonempty_queues,omitempty"`
-	RunnableQueues      int              `json:"runnable_queues,omitempty"`
-	TimerLevel0Sleepers int              `json:"timer_level0_sleepers,omitempty"`
-	TimerLevel1Sleepers int              `json:"timer_level1_sleepers,omitempty"`
-	Queues              []CoSQueueStatus `json:"queues,omitempty"`
+	Ifindex             int     `json:"ifindex,omitempty"`
+	InterfaceName       string  `json:"interface_name,omitempty"`
+	OwnerWorkerID       *uint32 `json:"owner_worker_id,omitempty"`
+	ShapingRateBytes    uint64  `json:"shaping_rate_bytes,omitempty"`
+	BurstBytes          uint64  `json:"burst_bytes,omitempty"`
+	WorkerInstances     int     `json:"worker_instances,omitempty"`
+	NonemptyQueues      int     `json:"nonempty_queues,omitempty"`
+	RunnableQueues      int     `json:"runnable_queues,omitempty"`
+	TimerLevel0Sleepers int     `json:"timer_level0_sleepers,omitempty"`
+	TimerLevel1Sleepers int     `json:"timer_level1_sleepers,omitempty"`
+	// #1628: per-interface waterfill-selector trace counters. JSON tags
+	// MUST match the Rust serde rename(...) byte-for-byte (protocol/cos.rs).
+	// WaterfillEpochs / WaterfillPhase1BudgetBreaks are SUMMED across
+	// workers. WaterfillMinEpochsPerWorker is the coordinator MIN of each
+	// worker's per-binding MIN over bindings with active exact-guarantee
+	// backlog; a LOW value vs Epochs flags a single stalled selector, and
+	// 0 is a HARD lock-in (backlogged binding, zero epochs completed).
+	// math.MaxUint64 is the "no active-backlog candidate" (idle) sentinel,
+	// preserved through aggregation so it never collides with a real 0;
+	// Prometheus suppresses the MAX gauge and the CLI renders it "none".
+	WaterfillEpochs             uint64           `json:"waterfill_epochs,omitempty"`
+	WaterfillPhase1BudgetBreaks uint64           `json:"waterfill_phase1_budget_breaks,omitempty"`
+	WaterfillMinEpochsPerWorker uint64           `json:"waterfill_min_epochs_per_worker,omitempty"`
+	Queues                      []CoSQueueStatus `json:"queues,omitempty"`
 }
 
 type ThreeColorPolicerStatus struct {
@@ -800,6 +813,14 @@ type CoSQueueStatus struct {
 	DrainParkQueueTokens                       uint64 `json:"drain_park_queue_tokens,omitempty"`
 	PostDrainBackupBytes                       uint64 `json:"post_drain_backup_bytes,omitempty"`
 	DrainSentBytesShapedUnconditional          uint64 `json:"drain_sent_bytes_shaped_unconditional,omitempty"`
+	// #1628: per-class waterfill-selector trace counters, aggregated across
+	// worker instances. Zero on the Proportional (legacy RR) path. JSON
+	// tags MUST match Rust serde rename(...) byte-for-byte. These are
+	// EVIDENCE to combine with QueuedBytes + *StarvationParks, not
+	// standalone fingerprints (see Rust CoSQueueWaterfillCounters).
+	WaterfillPhase1Admissions uint64 `json:"waterfill_phase1_admissions,omitempty"`
+	WaterfillPhase2Admissions uint64 `json:"waterfill_phase2_admissions,omitempty"`
+	WaterfillEligibleVisits   uint64 `json:"waterfill_eligible_visits,omitempty"`
 	// #1642: post_drain_backup_cos_drops / _cos_drop_bytes were on this
 	// struct, but the Rust helper serializes them on BindingStatus
 	// (protocol/binding.rs), a different JSON nesting level. The Rust

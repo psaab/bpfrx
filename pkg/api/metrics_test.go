@@ -287,16 +287,16 @@ func collectFromEmitWorkerRuntime(
 		c.workerSessionTableCapacity:               {},
 		c.workerDead:                               {},
 		// #1621 cold-path descriptors.
-		c.workerColdPathBucket:                  {},
-		c.workerColdPathSamples:                 {},
-		c.workerColdPathSumNS:                   {},
-		c.workerColdPathAliasSeen:               {},
-		c.workerColdPathSamplePhase:             {},
-		c.workerColdPathWrapperUnderflow:        {},
-		c.workerColdPathWrapperNSBaseline:       {},
-		c.workerColdPathNSPerTSCQ32:             {},
-		c.workerColdPathClockSource:             {},
-		c.workerColdPathSnapshotFailedTotal:     {},
+		c.workerColdPathBucket:              {},
+		c.workerColdPathSamples:             {},
+		c.workerColdPathSumNS:               {},
+		c.workerColdPathAliasSeen:           {},
+		c.workerColdPathSamplePhase:         {},
+		c.workerColdPathWrapperUnderflow:    {},
+		c.workerColdPathWrapperNSBaseline:   {},
+		c.workerColdPathNSPerTSCQ32:         {},
+		c.workerColdPathClockSource:         {},
+		c.workerColdPathSnapshotFailedTotal: {},
 		// #1635 v3 cold-path descriptors.
 		c.workerColdPathBucketV3:           {},
 		c.workerColdPathSamplesV3:          {},
@@ -931,6 +931,146 @@ func TestEmitCoSDrainPhaseTelemetry_EmitsNonExactExactBacklogCounter(t *testing.
 	}
 	if !reflect.DeepEqual(values, want) {
 		t.Fatalf("drain phase metric values: got %+v, want %+v", values, want)
+	}
+}
+
+// #1628: emitCoSWaterfillTelemetry must surface the per-queue admission/
+// visit counters and the per-interface epochs/breaks/min-epochs metrics
+// with the right labels and metric types.
+func TestEmitCoSWaterfillTelemetry_EmitsQueueAndInterfaceMetrics(t *testing.T) {
+	c := &xpfCollector{
+		cosWaterfillPhase1Admissions: prometheus.NewDesc(
+			"xpf_userspace_cos_waterfill_phase1_admissions_total", "t",
+			[]string{"ifindex", "queue_id"}, nil),
+		cosWaterfillPhase2Admissions: prometheus.NewDesc(
+			"xpf_userspace_cos_waterfill_phase2_admissions_total", "t",
+			[]string{"ifindex", "queue_id"}, nil),
+		cosWaterfillEligibleVisits: prometheus.NewDesc(
+			"xpf_userspace_cos_waterfill_eligible_visits_total", "t",
+			[]string{"ifindex", "queue_id"}, nil),
+		cosWaterfillEpochs: prometheus.NewDesc(
+			"xpf_userspace_cos_waterfill_epochs_total", "t",
+			[]string{"ifindex"}, nil),
+		cosWaterfillPhase1BudgetBreaks: prometheus.NewDesc(
+			"xpf_userspace_cos_waterfill_phase1_budget_breaks_total", "t",
+			[]string{"ifindex"}, nil),
+		cosWaterfillMinEpochsPerWorker: prometheus.NewDesc(
+			"xpf_userspace_cos_waterfill_min_epochs_per_worker", "t",
+			[]string{"ifindex"}, nil),
+	}
+	status := dpuserspace.ProcessStatus{
+		CoSInterfaces: []dpuserspace.CoSInterfaceStatus{{
+			Ifindex:                     80,
+			WaterfillEpochs:             1000,
+			WaterfillPhase1BudgetBreaks: 7,
+			WaterfillMinEpochsPerWorker: 3,
+			Queues: []dpuserspace.CoSQueueStatus{{
+				QueueID:                   5,
+				WaterfillPhase1Admissions: 12,
+				WaterfillPhase2Admissions: 34,
+				WaterfillEligibleVisits:   56,
+			}},
+		}},
+	}
+
+	ch := make(chan prometheus.Metric)
+	go func() {
+		c.emitCoSWaterfillTelemetry(ch, status)
+		close(ch)
+	}()
+	counters := map[*prometheus.Desc]float64{}
+	var sawMinGauge bool
+	for m := range ch {
+		var pb dto.Metric
+		if err := m.Write(&pb); err != nil {
+			t.Fatalf("metric.Write: %v", err)
+		}
+		if m.Desc() == c.cosWaterfillMinEpochsPerWorker {
+			if pb.Gauge == nil {
+				t.Fatalf("min_epochs_per_worker must be a gauge: %+v", &pb)
+			}
+			if pb.Gauge.GetValue() != 3 {
+				t.Fatalf("min_epochs gauge: got %v want 3", pb.Gauge.GetValue())
+			}
+			sawMinGauge = true
+			continue
+		}
+		if pb.Counter == nil {
+			t.Fatalf("waterfill metric %s must be a counter: %+v", m.Desc(), &pb)
+		}
+		counters[m.Desc()] = pb.Counter.GetValue()
+	}
+
+	want := map[*prometheus.Desc]float64{
+		c.cosWaterfillPhase1Admissions:   12,
+		c.cosWaterfillPhase2Admissions:   34,
+		c.cosWaterfillEligibleVisits:     56,
+		c.cosWaterfillEpochs:             1000,
+		c.cosWaterfillPhase1BudgetBreaks: 7,
+	}
+	if !reflect.DeepEqual(counters, want) {
+		t.Fatalf("waterfill counter values: got %+v, want %+v", counters, want)
+	}
+	if !sawMinGauge {
+		t.Fatalf("min_epochs_per_worker gauge not emitted")
+	}
+}
+
+// #1628 (code-review r2): the min_epochs_per_worker gauge is SUPPRESSED
+// when the interface reports the math.MaxUint64 "no active-backlog
+// candidate" sentinel, so an idle interface emits no series and any
+// emitted value (including 0) is a real lock-in signal. A genuine 0
+// (hard lock-in) MUST still be emitted.
+func TestEmitCoSWaterfillTelemetry_SuppressesMaxSentinelButEmitsZeroLockin(t *testing.T) {
+	c := &xpfCollector{
+		cosWaterfillEpochs: prometheus.NewDesc(
+			"xpf_userspace_cos_waterfill_epochs_total", "t", []string{"ifindex"}, nil),
+		cosWaterfillPhase1BudgetBreaks: prometheus.NewDesc(
+			"xpf_userspace_cos_waterfill_phase1_budget_breaks_total", "t", []string{"ifindex"}, nil),
+		cosWaterfillMinEpochsPerWorker: prometheus.NewDesc(
+			"xpf_userspace_cos_waterfill_min_epochs_per_worker", "t", []string{"ifindex"}, nil),
+	}
+	status := dpuserspace.ProcessStatus{
+		CoSInterfaces: []dpuserspace.CoSInterfaceStatus{
+			{ // idle: MAX sentinel → gauge suppressed
+				Ifindex:                     80,
+				WaterfillEpochs:             10,
+				WaterfillMinEpochsPerWorker: math.MaxUint64,
+			},
+			{ // hard 0-epoch lock-in → gauge emitted with value 0
+				Ifindex:                     81,
+				WaterfillEpochs:             5,
+				WaterfillMinEpochsPerWorker: 0,
+			},
+		},
+	}
+	ch := make(chan prometheus.Metric)
+	go func() {
+		c.emitCoSWaterfillTelemetry(ch, status)
+		close(ch)
+	}()
+	minByIfindex := map[string]float64{}
+	for m := range ch {
+		if m.Desc() != c.cosWaterfillMinEpochsPerWorker {
+			continue
+		}
+		var pb dto.Metric
+		if err := m.Write(&pb); err != nil {
+			t.Fatalf("metric.Write: %v", err)
+		}
+		var ifx string
+		for _, lp := range pb.GetLabel() {
+			if lp.GetName() == "ifindex" {
+				ifx = lp.GetValue()
+			}
+		}
+		minByIfindex[ifx] = pb.Gauge.GetValue()
+	}
+	if _, ok := minByIfindex["80"]; ok {
+		t.Fatalf("idle interface (MAX sentinel) must NOT emit the min gauge; got %v", minByIfindex)
+	}
+	if v, ok := minByIfindex["81"]; !ok || v != 0 {
+		t.Fatalf("hard 0-epoch lock-in must emit min gauge = 0; got %v (present=%v)", v, ok)
 	}
 }
 

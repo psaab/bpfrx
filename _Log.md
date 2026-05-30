@@ -4459,3 +4459,44 @@ top.
 - **Timestamp**: 2026-05-29
   **Action**: #1319 PR1 review-response r7 — fix Codex r7 MAJOR (surplus-sharing presence-token hid sibling leaf) by rewriting the walker to the COMPILER-FAITHFUL model. Verified compileClassOfService+namedInstances read scheduler leaves ONLY from instance-node CHILDREN; packed Keys[1:] on instance nodes are never compiled. Removed the entire packed-leftover-leaf machinery (packedLeftoverLeaf, leftover-group pass, collectInstanceContents); container/instance path now consumes identity and walks node.Children at the child schema, ignoring compiler-dead packed tails. This fixes the presence-token mis-attribution AND drops over-validation of tokens the compiler discards. Rewrote regression tests to the compiler-faithful contract: child-leaf garbage (canonical block + flat-set symptom-2) rejects; compiler-discarded packed-single-node shorthand is accepted (out of scope per compiled-leaf-only invariant).
   **File(s)**: pkg/config/schema_walk.go (compiler-faithful walker rewrite + walkInstanceChildren), pkg/config/schema_validate_test.go (rewritten contract tests), docs/config-schema.md (compiler-faithful rule)
+
+- **Action**: #1628 — added per-class waterfill trace-counter
+  instrumentation to the CoS guarantee-rate selector. New
+  `CoSQueueWaterfillCounters` (phase1_admissions / phase2_admissions /
+  eligible_visits) on `CoSQueueTelemetry` + per-interface
+  `waterfill_epochs` / `waterfill_phase1_budget_breaks` on
+  `CoSInterfaceRuntime`; written inline at the six waterfill
+  return/break/refill sites (kind hoisted so the head borrow ends before
+  the per-queue mutation). Snapshot aggregation sums per-queue counters
+  (queue_row.rs) and per-interface SUM + backlog-guarded MIN
+  (`waterfill_min_epochs_per_worker`, coordinator/mod.rs) so a single
+  Phase-2-locked worker is visible. Wire surface mirrored across
+  protocol/cos.rs + Go protocol.go; Prometheus descriptors + emit; `show
+  class-of-service` render. Observability only — no scheduling change.
+  Rust 1621 lib + new unit tests 5/5; Go api + userspace parity/emit
+  tests pass. Plan reviewed Codex+AGY through PLAN-READY (4 rounds).
+- **File(s)**: userspace-dp/src/afxdp/types/cos.rs,
+  userspace-dp/src/afxdp/cos/{builders.rs,queue_service/mod.rs,
+  queue_service/tests.rs,tx_completion_tests.rs},
+  userspace-dp/src/afxdp/worker/cos/{queue_row.rs,interface_row.rs,
+  tests.rs}, userspace-dp/src/afxdp/coordinator/{mod.rs,tests.rs},
+  userspace-dp/src/protocol/cos.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  pkg/dataplane/userspace/{protocol.go,protocol_test.go,cosfmt.go},
+  pkg/api/{metrics.go,metrics_descriptors.go,metrics_userspace.go,
+  metrics_test.go}, docs/cos-validation-notes.md,
+  docs/pr/1628-cos-instr/{plan.md,reviewer-ids.md}, _Log.md
+
+- **Timestamp**: 2026-05-29
+- **Action**: #1628 — rebased PR #1680 onto origin/master (post #1638 dead
+  parallel-prefix scaffolding removal + #1303 smoke change) to clear a
+  CONFLICTING/DIRTY state caused by branching pre-#1638. Only _Log.md
+  conflicted (append-only; kept both entries). policy.rs/policy_tests.rs did
+  not conflict — the branch never edited them, so #1638's removal applied
+  cleanly and build_rule_side_arc is now 0 refs on the branch (was 6). All 8
+  reviewed CoS/metrics files byte-identical pre/post rebase. Retested green
+  (1598 lib + 46/8/16/1, 13 waterfill tests, wire fixture, 5/5 flake; go
+  build + gofmt + pkg tests). Force-pushed f0c31f97c with verification (gh
+  mergeable == MERGEABLE/CLEAN).
+- **File(s)**: _Log.md, docs/pr/1628-cos-instr/reviewer-ids.md (rebase only;
+  no code change vs the reviewed HEAD)

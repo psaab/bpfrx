@@ -398,24 +398,15 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                 thread_local! {
                     static SEG_MISS_LOG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
                 }
-                SEG_MISS_LOG.with(|c| {
-                    let n = c.get();
-                    if n < 20 {
-                        c.set(n + 1);
-                        let egress_mtu = forwarding
-                            .egress
-                            .get(&request.decision.resolution.egress_ifindex)
-                            .or_else(|| forwarding.egress.get(&request.decision.resolution.tx_ifindex))
-                            .map(|e| e.mtu);
-                        eprintln!("DBG SEG_MISS[{}]: frame_len={} proto={} egress_if={} tx_if={} egress_mtu={:?} \
-                             target_if={} src_frame_bytes={}",
-                            n, source_frame.len(), request.meta.protocol,
-                            request.decision.resolution.egress_ifindex,
-                            request.decision.resolution.tx_ifindex,
-                            egress_mtu, request.target_ifindex,
-                            source_frame.len(),
-                        );
-                    }
+                SEG_MISS_LOG.with(|cap| {
+                    record_forwarded_tcp_segmentation_miss(
+                        cap,
+                        recent_exceptions,
+                        ingress_ident,
+                        source_frame,
+                        request,
+                        forwarding,
+                    );
                 });
             }
             if !copied_source_frame {
@@ -946,7 +937,6 @@ fn resolve_pending_forward_target_binding<'a>(
     )
 }
 
-
 #[inline(always)]
 fn count_forwarded_tcp_segmentation_miss_if_needed(
     dbg: &mut DebugPollCounters,
@@ -958,6 +948,71 @@ fn count_forwarded_tcp_segmentation_miss_if_needed(
     }
     dbg.seg_needed_but_none += 1;
     true
+}
+
+/// Surface a genuine TCP segmentation miss to operators, rate-capped per
+/// worker thread.
+///
+/// #1282: when segmentation is needed but both frame builders return
+/// `None`, the dispatcher falls back to forwarding the original oversized
+/// frame, which the NIC/switch/peer then drops — black-holing the flow.
+/// The `dbg.seg_needed_but_none` counter that records this is
+/// `pub(in crate::afxdp)` and is never exported to Go/CLI, so it is not an
+/// operator-visible signal. We record a first-class `tcp_segmentation_miss`
+/// exception so the event shows up under `Recent exceptions` in `show
+/// chassis cluster data-plane statistics` even in release builds.
+///
+/// The recording is rate-capped via the caller-owned `cap` cell (20 per
+/// worker thread) so a pathological per-packet seg-miss cannot spin the
+/// `recent_exceptions` mutex on the hot path. The `DBG SEG_MISS` packet-
+/// shape print is `debug-log`-only, matching the sibling debug prints in
+/// this file; it DCEs out of release builds.
+#[inline(always)]
+fn record_forwarded_tcp_segmentation_miss(
+    cap: &std::cell::Cell<u32>,
+    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    ingress_ident: &BindingIdentity,
+    source_frame: &[u8],
+    request: &PendingForwardRequest,
+    forwarding: &ForwardingState,
+) {
+    let n = cap.get();
+    if n >= 20 {
+        return;
+    }
+    cap.set(n + 1);
+    record_exception(
+        recent_exceptions,
+        ingress_ident,
+        "tcp_segmentation_miss",
+        source_frame.len() as u32,
+        Some(request.meta.into()),
+        None,
+        forwarding,
+    );
+    if cfg!(feature = "debug-log") {
+        let egress_mtu = forwarding
+            .egress
+            .get(&request.decision.resolution.egress_ifindex)
+            .or_else(|| {
+                forwarding
+                    .egress
+                    .get(&request.decision.resolution.tx_ifindex)
+            })
+            .map(|e| e.mtu);
+        eprintln!(
+            "DBG SEG_MISS[{}]: frame_len={} proto={} egress_if={} tx_if={} egress_mtu={:?} \
+             target_if={} src_frame_bytes={}",
+            n,
+            source_frame.len(),
+            request.meta.protocol,
+            request.decision.resolution.egress_ifindex,
+            request.decision.resolution.tx_ifindex,
+            egress_mtu,
+            request.target_ifindex,
+            source_frame.len(),
+        );
+    }
 }
 
 #[inline(always)]

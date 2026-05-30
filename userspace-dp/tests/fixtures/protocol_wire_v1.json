@@ -326,6 +326,9 @@
     "shaping_rate_bytes": 0,
     "timer_level0_sleepers": 0,
     "timer_level1_sleepers": 0,
+    "waterfill_epochs": 0,
+    "waterfill_min_epochs_per_worker": 0,
+    "waterfill_phase1_budget_breaks": 0,
     "worker_instances": 0
   },
   "cos_queue_status": {
@@ -371,6 +374,9 @@
     "surplus_deficit_bytes": 0,
     "transmit_rate_bytes": 0,
     "tx_ring_full_submit_stalls": 0,
+    "waterfill_eligible_visits": 0,
+    "waterfill_phase1_admissions": 0,
+    "waterfill_phase2_admissions": 0,
     "worker_instances": 0
   },
   "cos_scheduler_map_entry_snapshot": {
