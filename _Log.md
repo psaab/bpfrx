@@ -4444,3 +4444,7 @@ top.
 - **Timestamp**: 2026-05-29
   **Action**: #1319 PR1 review-response r4 — fix Codex r4 MAJOR: multi-level packed chain (`class-of-service schedulers be transmit-rate asd` as one flat node) bypassed validation because the group pass called walkSchemaNode per synthesized leaf, and walkSchemaNode returns nil on a synthesized leaf that is itself a container with further leftover. Fixed by having the group pass recurse via walkSchemaChildren (re-enters the leftover-group pass for nested packed chains; still threads the leaves as siblings).
   **File(s)**: pkg/config/schema_walk.go (group pass walkSchemaChildren recursion), pkg/config/schema_validate_test.go (TestSchemaValidate_MultiLevelPackedChain)
+
+- **Timestamp**: 2026-05-30
+  **Action**: #1319 PR1 review-response r5 — reject malformed multi value-tail ranges so a typed `multi && children==nil` leaf no longer accepts dangling/all-separator `to` tails (e.g. `destination-port to`, `destination-port 20000 to`)
+  **File(s)**: pkg/config/schema_walk.go (multi value-tail separator validation), pkg/config/schema_walk_internal_test.go (dangling-separator regressions)

@@ -77,3 +77,19 @@ func TestWalker_MultiValueTail_RejectsMissingValue(t *testing.T) {
 		t.Fatalf("error should describe missing value: %v", err)
 	}
 }
+
+func TestWalker_MultiValueTail_RejectsDanglingSeparator(t *testing.T) {
+	for _, keys := range [][]string{
+		{"destination-port", "to"},
+		{"destination-port", "20000", "to"},
+		{"destination-port", "20000", "to", "to", "20003"},
+	} {
+		err := runMultiValueTail(t, keys)
+		if err == nil {
+			t.Fatalf("expected error for malformed range %v", keys)
+		}
+		if !strings.Contains(err.Error(), "missing value") {
+			t.Fatalf("error should describe missing value for %v: %v", keys, err)
+		}
+	}
+}

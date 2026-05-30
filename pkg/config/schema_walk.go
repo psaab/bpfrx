@@ -375,13 +375,24 @@ func validateTypedLeaf(node *Node, leafSchema *schemaNode, parentPath []string, 
 		if len(values) == 0 {
 			return typedLeafErrorf(path, "missing value")
 		}
+		validatedAny := false
+		lastWasSeparator := false
 		for _, tok := range values {
 			if tok == "to" {
+				if !validatedAny || lastWasSeparator {
+					return typedLeafErrorf(path, "missing value")
+				}
+				lastWasSeparator = true
 				continue
 			}
 			if err := leafSchema.validator(tok, cfg); err != nil {
 				return typedLeafInvalidErrorf(path, tok, err)
 			}
+			validatedAny = true
+			lastWasSeparator = false
+		}
+		if !validatedAny || lastWasSeparator {
+			return typedLeafErrorf(path, "missing value")
 		}
 		return nil
 	}
