@@ -1,6 +1,6 @@
 # #1678 — fix `--features debug-log` build (ICMPV6_EMBED_LOGGED private)
 
-Status: DRAFT v1 — pending adversarial plan review
+Status: PLAN-READY v2 — Codex PLAN-NEEDS-MINOR (Makefile framing, addressed below), AGY PLAN-READY (empirically verified), Claude SMR PLAN-READY
 
 ## Issue framing
 
@@ -111,14 +111,18 @@ cargo targets are `build-userspace-dp` (default features) and `make test`
   be checked locally and can't silently rebreak.
 - (B) Note the gap and do nothing structural.
 
-This plan proposes a minimal, opt-in guard: add a phony Makefile target
-`build-userspace-dp-debug-log` (standalone, not wired into `all`/`test`,
-mirroring the `audit-check` precedent of an opt-in drift guard) that
-compiles the debug-log feature. This gives a one-command rebreak check
-without slowing the default build or inventing CI that doesn't exist.
-Open question for reviewers below: is even target (A) over-reach for a
-one-symbol fix, or is the guard warranted given the feature build was
-silently broken until #1282 stumbled on it?
+This plan adds a minimal, **manual** guard: a phony Makefile target
+`build-userspace-dp-debug-log` (standalone, NOT wired into
+`all`/`build`/`test`, mirroring the `audit-check` precedent of an
+opt-in drift guard) that compiles the debug-log feature. To be precise
+about what this is and is not (Codex round-1 finding): there is no CI in
+this repo, so this target is a **manual convenience for local
+pre-commit validation**, not an automated gate — nothing runs it unless
+a developer invokes it. It does not slow the default build and does not
+invent CI that doesn't exist. AGY round-1 endorsed it as warranted
+(feature builds rot when nothing compiles them); Codex round-1 flagged
+only that the plan must not over-claim it as a "guard that prevents
+rebreak" — corrected here to "manual one-command rebreak check".
 
 ## Risk assessment
 

@@ -11,7 +11,7 @@ BUILD_TIME ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
 LDFLAGS := -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildTime=$(BUILD_TIME)
 
 # eBPF compilation flags
-.PHONY: all generate generate-userspace-xdp build-userspace-xdp build build-ctl build-userspace-dp proto install clean test audit-check test-connectivity test-failover test-double-failover test-active-active test-stress-failover test-ha-crash test-chained-crash test-private-rg test-restart-connectivity
+.PHONY: all generate generate-userspace-xdp build-userspace-xdp build build-ctl build-userspace-dp build-userspace-dp-debug-log proto install clean test audit-check test-connectivity test-failover test-double-failover test-active-active test-stress-failover test-ha-crash test-chained-crash test-private-rg test-restart-connectivity
 
 all: generate build build-ctl
 
@@ -44,6 +44,17 @@ build-ctl:
 build-userspace-dp:
 	$(CARGO) build --manifest-path userspace-dp/Cargo.toml --release
 	install -m 0755 userspace-dp/target/release/xpf-userspace-dp ./xpf-userspace-dp
+
+# Manual build check for the diagnostic `debug-log` feature (#1678).
+# The debug-log build is not the production target and is deliberately
+# NOT wired into `all`/`build`/`test`, mirroring the opt-in
+# `audit-check` precedent. There is no CI in this repo, so this is a
+# developer convenience, not an automated gate: nothing runs it unless
+# invoked. It exists so the feature build (which silently rotted until
+# #1678 because nothing compiled it) can be revalidated with one
+# command before a commit. Compile-only; does not install.
+build-userspace-dp-debug-log:
+	$(CARGO) build --manifest-path userspace-dp/Cargo.toml --release --features debug-log
 
 # Generate protobuf/gRPC code
 proto:
