@@ -11,44 +11,6 @@ import (
 	"github.com/cilium/ebpf"
 )
 
-// SetMirrorConfig writes a port-mirroring entry for the given ingress ifindex.
-func (m *Manager) SetMirrorConfig(ifindex int, mirrorIfindex int, rate uint32) error {
-	zm, ok := m.maps["mirror_config"]
-	if !ok {
-		return fmt.Errorf("mirror_config map not found")
-	}
-	val := MirrorConfig{
-		MirrorIfindex: uint32(mirrorIfindex),
-		Rate:          rate,
-	}
-	return zm.Update(uint32(ifindex), val, ebpf.UpdateAny)
-}
-
-// ClearMirrorConfigs removes all mirror_config entries.
-// mirror_config is a HASH (#756): iterate-and-delete existing keys.
-func (m *Manager) ClearMirrorConfigs() error {
-	zm, ok := m.maps["mirror_config"]
-	if !ok {
-		return fmt.Errorf("mirror_config map not found")
-	}
-	var key uint32
-	var val MirrorConfig
-	iter := zm.Iterate()
-	var keys []uint32
-	for iter.Next(&key, &val) {
-		keys = append(keys, key)
-	}
-	if err := iter.Err(); err != nil {
-		return fmt.Errorf("iterate mirror_config: %w", err)
-	}
-	for _, k := range keys {
-		if err := zm.Delete(k); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
-			return fmt.Errorf("delete mirror_config %d: %w", k, err)
-		}
-	}
-	return nil
-}
-
 // ReadGlobalCounter reads a per-CPU global counter and returns the sum across all CPUs.
 func (m *Manager) ReadGlobalCounter(index uint32) (uint64, error) {
 	zm, ok := m.maps["global_counters"]
