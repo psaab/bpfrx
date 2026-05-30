@@ -382,10 +382,17 @@ validate_ttl_probe() {
 run_mtr_report() {
 	local family="$1" target="$2" outfile="$3"
 	local cmd
+	# Capture mtr output and swallow its exit code: a non-zero mtr exit
+	# (e.g. partial/unanswered public trace) must not crash the validator
+	# under `set -e` before validate_mtr_report can classify the report
+	# and decide whether the result is fatal or observability-only.
+	# LC_ALL=C pins the report wording (`(waiting for reply)`) and the
+	# dot-decimal loss column the classifier parses, so the verdict is
+	# locale-independent.
 	if [[ "$family" == "6" ]]; then
-		cmd="mtr -6 ${target} --report --report-cycles=${MTR_REPORT_CYCLES} > ${outfile}"
+		cmd="LC_ALL=C mtr -6 ${target} --report --report-cycles=${MTR_REPORT_CYCLES} > ${outfile} 2>&1 || true"
 	else
-		cmd="mtr ${target} --report --report-cycles=${MTR_REPORT_CYCLES} > ${outfile}"
+		cmd="LC_ALL=C mtr ${target} --report --report-cycles=${MTR_REPORT_CYCLES} > ${outfile} 2>&1 || true"
 	fi
 	run_host "$cmd"
 }
@@ -394,32 +401,47 @@ validate_mtr_report() {
 	local label="$1" path="$2" allow_unresolved_destination="${3:-0}"
 	local report result
 	report="$(run_host "cat ${path}")"
-	if ! result="$(python3 - <<'PY' "$label" "$report" "$allow_unresolved_destination" 2>&1
-import re
-import sys
-
-label = sys.argv[1]
-report = sys.argv[2]
-allow_unresolved_destination = sys.argv[3] == "1"
-hop_lines = [line for line in report.splitlines() if re.match(r"\s*\d+\.\|--", line)]
-if not hop_lines:
-    raise SystemExit(f"{label} mtr produced no hop lines")
-
-first = hop_lines[0]
-last = hop_lines[-1]
-if "???" in first:
-    raise SystemExit(f"{label} mtr first hop unresolved: {first}")
-if "???" in last or "100.0%" in last:
-    if allow_unresolved_destination:
-        print(f"{label} mtr: warning destination unresolved: {last}")
-        raise SystemExit(0)
-    raise SystemExit(f"{label} mtr destination unresolved: {last}")
-print(f"{label} mtr: ok")
-PY
-	)"; then
+	if ! result="$(python3 "${SCRIPT_DIR}/mtr_report_check.py" \
+		"$label" "$report" "$allow_unresolved_destination" 2>&1)"; then
 		die "$result"
 	fi
 	printf '%s\n' "$result" | tee -a "$summary_file"
+}
+
+# Assert the LAN host actually received ICMP echo replies from the target,
+# so a broken dataplane that lets `ping` exit 0 without delivery (or that
+# the `|| true` capture would otherwise hide) still hard-fails the smoke.
+# This is the controlled forwarding-correctness gate: the LAN host reaches
+# the WAN-side target only by transiting the userspace dataplane.
+validate_reachability() {
+	local label="$1" path="$2"
+	local out
+	out="$(run_host "cat ${path}")"
+	if grep -Eq '(^| )0( packets)? received' <<<"$out"; then
+		die "${label} reachability: target not reached (no replies): ${out}"
+	fi
+	if ! grep -Eq '[1-9][0-9]* (packets )?received' <<<"$out"; then
+		die "${label} reachability: could not confirm replies: ${out}"
+	fi
+	printf '%s reachability: ok\n' "$label" | tee -a "$summary_file"
+}
+
+# Guard against topology drift: the controlled reachability ping only
+# proves forwarding if the target is reached THROUGH the firewall. If the
+# LAN host has the target assigned locally or routed via loopback, the
+# ping never transits the dataplane and the gate would be meaningless.
+assert_forwarding_route() {
+	local family="$1" label="$2" target="$3"
+	local route
+	if [[ "$family" == "6" ]]; then
+		route="$(run_host "ip -6 route get ${target} 2>&1 || true")"
+	else
+		route="$(run_host "ip route get ${target} 2>&1 || true")"
+	fi
+	if grep -Eq '(^|[[:space:]])local([[:space:]]|$)|dev lo([[:space:]]|$)' <<<"$route"; then
+		die "${label} forwarding-route: ${target} resolves on-box (no transit): ${route}"
+	fi
+	printf '%s forwarding-route: %s\n' "$label" "$route" | tee -a "$summary_file"
 }
 
 validate_traceroute_visibility() {
@@ -858,8 +880,16 @@ wait_for_ipv6_default_route || die "cluster userspace host still has no IPv6 def
 ensure_dualstack_wan_neighbors "$ACTIVE_FW"
 
 info "basic reachability checks"
-run_host "ping -c 2 -W 1 ${V4_TEST_TARGET} >/tmp/userspace-ping-v4.out"
-run_host "ping -6 -c 2 -W 1 ${V6_TEST_TARGET} >/tmp/userspace-ping-v6.out"
+# LC_ALL=C pins the ping summary wording so the reply-count parse below is
+# locale-independent. `2>&1 || true` captures stderr and prevents a 100%-
+# loss ping (exit 1 under `set -e`) from crashing the validator before
+# validate_reachability can emit its descriptive failure.
+assert_forwarding_route 4 "ipv4 forwarding" "${V4_TEST_TARGET}"
+assert_forwarding_route 6 "ipv6 forwarding" "${V6_TEST_TARGET}"
+run_host "LC_ALL=C ping -c 2 -W 1 ${V4_TEST_TARGET} >/tmp/userspace-ping-v4.out 2>&1 || true"
+run_host "LC_ALL=C ping -6 -c 2 -W 1 ${V6_TEST_TARGET} >/tmp/userspace-ping-v6.out 2>&1 || true"
+validate_reachability "ipv4 forwarding" "/tmp/userspace-ping-v4.out"
+validate_reachability "ipv6 forwarding" "/tmp/userspace-ping-v6.out"
 
 validate_traceroute_visibility
 
