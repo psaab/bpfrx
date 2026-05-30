@@ -441,81 +441,96 @@ func TestSchemaValidate_OutsideSchedulersIgnored(t *testing.T) {
 	}
 }
 
-// TestSchemaValidate_HierarchicalShorthand_RejectsGarbage reproduces the
-// Copilot #1 finding: the parser folds `schedulers { be transmit-rate asd; }`
-// into a single node Keys=["be","transmit-rate","asd"] (instance name + leaf
-// + value packed together). The walker must consume the instance name AND
-// still validate the leftover leaf, or garbage slips through commit-check.
-func TestSchemaValidate_HierarchicalShorthand_RejectsGarbage(t *testing.T) {
-	for _, in := range []string{
-		`class-of-service { schedulers { be transmit-rate asd; } }`,
-		`class-of-service { schedulers { be priority foo; } }`,
-		`class-of-service { schedulers { be transmit-rate 1g typo; } }`,
-	} {
+// Compiler-faithful contract (resolved across Codex review rounds 1-7).
+//
+// The schedulers compiler (compileClassOfService + namedInstances) reads
+// scheduler leaves ONLY from each instance node's CHILDREN; tokens packed
+// into an instance node's own Keys beyond the scheduler name are NOT
+// compiled. The typed-leaf gate mirrors this exactly: it validates the
+// child leaves where the compiler reads them, and does not reject malformed
+// packed tails the compiler silently discards (rejecting those would be a
+// behaviour change beyond #1319's compiled-leaf-only scope).
+//
+// The flat-set `set class-of-service schedulers <name> <leaf> <value>`
+// shape — the actual symptom-2 path — lands the typed leaf as a CHILD of
+// `schedulers <name>`, so it is compiled and IS validated.
+
+// TestSchemaValidate_ChildLeafGarbageRejected covers the compiler-reachable
+// shapes: a typed leaf carried as a CHILD of the scheduler instance (the
+// flat-set path and the canonical hierarchical block). Garbage values are
+// rejected; valid values pass.
+func TestSchemaValidate_ChildLeafGarbageRejected(t *testing.T) {
+	// Canonical hierarchical block: the typed leaf is a genuine CHILD of the
+	// scheduler instance, which the compiler reads — garbage rejects.
+	reject := []string{
+		`class-of-service { schedulers { be { transmit-rate asd; } } }`,
+		`class-of-service { schedulers { be { priority foo; } } }`,
+		`class-of-service { schedulers { be { buffer-size purple; } } }`,
+	}
+	for _, in := range reject {
 		if err := schemaCheck(t, in); err == nil {
-			t.Fatalf("expected rejection for shorthand %q, got nil", in)
+			t.Fatalf("expected rejection for child-leaf garbage %q, got nil", in)
 		}
 	}
-}
-
-func TestSchemaValidate_HierarchicalShorthand_AcceptsValid(t *testing.T) {
+	// Packed single-node shorthand (`schedulers be transmit-rate asd` as ONE
+	// node with no children): the compiler does NOT compile the packed tail —
+	// it names the scheduler `be` and discards `transmit-rate asd` (the
+	// scheduler ends up with no rate, same as if it were never written). This
+	// is NOT a symptom-2 silent-coerce of a real leaf, so the gate leaves it
+	// alone (rejecting compiler-discarded tokens is out of #1319 scope).
 	for _, in := range []string{
-		`class-of-service { schedulers { be transmit-rate 1g; } }`,
-		`class-of-service { schedulers { be transmit-rate 1g { exact; } } }`,
-		`class-of-service { schedulers { be buffer-size 16m; } }`,
-		`class-of-service { schedulers { be priority strict-high; } }`,
+		`class-of-service { schedulers be transmit-rate asd; }`,
+		`class-of-service { schedulers be priority foo; }`,
 	} {
 		if err := schemaCheck(t, in); err != nil {
-			t.Fatalf("expected shorthand %q to pass, got %v", in, err)
+			t.Fatalf("packed single-node shorthand %q is compiler-discarded; gate must not reject it, got %v", in, err)
+		}
+	}
+	accept := []string{
+		`class-of-service { schedulers be transmit-rate 1g; }`,
+		`class-of-service { schedulers { be { transmit-rate 1g { exact; } } } }`,
+		`class-of-service { schedulers { be buffer-size 16m; } }`,
+		`class-of-service { schedulers { be priority strict-high; } }`,
+	}
+	for _, in := range accept {
+		if err := schemaCheck(t, in); err != nil {
+			t.Fatalf("expected child-leaf valid %q to pass, got %v", in, err)
 		}
 	}
 }
 
-// TestSchemaValidate_FullyPackedContainerLeaf reproduces Codex r2 #1: the
-// parser folds `class-of-service { schedulers be transmit-rate asd; }` into
-// ONE node Keys=["schedulers","be","transmit-rate","asd"] (container
-// identity + leaf + value). After consuming the `schedulers be` container
-// identity, the leftover ["transmit-rate","asd"] is a packed leaf that must
-// still be validated at the child schema level.
-func TestSchemaValidate_FullyPackedContainerLeaf(t *testing.T) {
-	if err := schemaCheck(t, `class-of-service { schedulers be transmit-rate asd; }`); err == nil {
-		t.Fatal("expected rejection for fully-packed container leaf, got nil")
+// TestSchemaValidate_FlatSetSymptom2 is the actual #1319 symptom-2 path:
+// `set class-of-service schedulers be <leaf> <garbage>` lands the leaf as a
+// child of `schedulers be` and is compiled — so commit-check must reject the
+// garbage. These are the cases an operator actually types.
+func TestSchemaValidate_FlatSetSymptom2(t *testing.T) {
+	reject := [][]string{
+		{"set class-of-service schedulers be transmit-rate asd"},
+		{"set class-of-service schedulers be priority foo"},
+		{"set class-of-service schedulers be buffer-size purple"},
+		{"set class-of-service schedulers be transmit-rate 1g typo"},
+		{"set class-of-service schedulers be transmit-rate exact"}, // exact, no rate
 	}
-	if err := schemaCheck(t, `class-of-service { schedulers be priority foo; }`); err == nil {
-		t.Fatal("expected rejection for fully-packed priority garbage, got nil")
+	for _, cmds := range reject {
+		if err := flatSchemaCheck(t, cmds...); err == nil {
+			t.Fatalf("expected rejection for flat-set %v, got nil", cmds)
+		}
 	}
-	if err := schemaCheck(t, `class-of-service { schedulers be transmit-rate 1g; }`); err != nil {
-		t.Fatalf("expected fully-packed valid leaf to pass, got %v", err)
-	}
-}
-
-// TestSchemaValidate_MultiLevelPackedChain reproduces Codex r4: a fully-flat
-// single node `class-of-service schedulers be transmit-rate asd;` parses to
-// ONE node Keys=["class-of-service","schedulers","be","transmit-rate","asd"]
-// — multiple container levels AND the leaf packed together. The leftover
-// synthesis must RECURSE through the grouping pass (not validate the
-// synthesized leaf once and stop) so the nested packed `transmit-rate asd`
-// is reached. Dropping it was a packed-chain bypass.
-func TestSchemaValidate_MultiLevelPackedChain(t *testing.T) {
-	if err := schemaCheck(t, `class-of-service schedulers be transmit-rate asd;`); err == nil {
-		t.Fatal("expected rejection for multi-level packed chain garbage, got nil")
-	}
-	if err := schemaCheck(t, `class-of-service schedulers be priority foo;`); err == nil {
-		t.Fatal("expected rejection for multi-level packed priority garbage, got nil")
-	}
-	if err := schemaCheck(t, `class-of-service schedulers be transmit-rate 1g;`); err != nil {
-		t.Fatalf("expected multi-level packed valid chain to pass, got %v", err)
-	}
-	if err := schemaCheck(t, `class-of-service schedulers be transmit-rate 1g exact;`); err != nil {
-		t.Fatalf("expected multi-level packed chain with modifier to pass, got %v", err)
+	// Valid scheduler, including the split-modifier form (two child leaves).
+	if err := flatSchemaCheck(t,
+		"set class-of-service schedulers be transmit-rate 1g",
+		"set class-of-service schedulers be transmit-rate exact",
+		"set class-of-service schedulers be priority high",
+		"set class-of-service schedulers be buffer-size 16m",
+	); err != nil {
+		t.Fatalf("expected valid flat-set scheduler to pass, got %v", err)
 	}
 }
 
-// TestSchemaValidate_ModifierTrailingGarbage reproduces Codex r2 #2: a known
-// modifier child must not swallow trailing garbage. `transmit-rate 1g {
-// exact bogus; }` (hierarchical) and `set ... transmit-rate 1g exact bogus`
-// (flat → exact → bogus nesting) both carry an extra `bogus` token past the
-// known `exact` modifier that must be rejected.
+// TestSchemaValidate_ModifierTrailingGarbage: a known modifier child must
+// not swallow trailing garbage. `transmit-rate 1g { exact bogus; }`
+// (hierarchical) and the flat `exact -> bogus` nesting both carry an extra
+// `bogus` past the known `exact` modifier and must be rejected.
 func TestSchemaValidate_ModifierTrailingGarbage(t *testing.T) {
 	if err := schemaCheck(t, `class-of-service { schedulers { be { transmit-rate 1g { exact bogus; } } } }`); err == nil {
 		t.Fatal("expected rejection for `exact bogus` trailing garbage, got nil")
@@ -523,76 +538,48 @@ func TestSchemaValidate_ModifierTrailingGarbage(t *testing.T) {
 	if err := flatSchemaCheck(t, "set class-of-service schedulers be transmit-rate 1g exact bogus"); err == nil {
 		t.Fatal("expected rejection for flat `transmit-rate 1g exact bogus`, got nil")
 	}
-	// The clean `exact` modifier still passes both shapes.
 	if err := schemaCheck(t, `class-of-service { schedulers { be { transmit-rate 1g { exact; } } } }`); err != nil {
 		t.Fatalf("expected clean `exact` modifier to pass, got %v", err)
 	}
-	if err := flatSchemaCheck(t,
-		"set class-of-service schedulers be transmit-rate 1g",
-		"set class-of-service schedulers be transmit-rate exact",
-	); err != nil {
-		t.Fatalf("expected split exact to pass, got %v", err)
-	}
 }
 
-// TestSchemaValidate_ExtraTokenContainerStillValidatesNestedLeaves
-// reproduces Codex r5: an unknown extra token in a container's identity
-// (e.g. `class-of-service extra { ... }` or `schedulers be extra { ... }`)
-// must NOT cause the container's nested typed leaves to be dropped. The
-// extra token itself is an opt-in skip (unknown keyword), but the compiler
-// still processes the nested config, so typed garbage underneath must still
-// be rejected.
-func TestSchemaValidate_ExtraTokenContainerStillValidatesNestedLeaves(t *testing.T) {
+// TestSchemaValidate_ExtraTokenStillValidatesChildLeaves: an unknown extra
+// token in a container/instance identity must not hide CHILD leaves from
+// validation. The compiler still names the scheduler and walks its children,
+// so child-leaf garbage under an extra token must still be rejected. The
+// extra token itself is an opt-in skip (Codex r5/r6).
+func TestSchemaValidate_ExtraTokenStillValidatesChildLeaves(t *testing.T) {
 	for _, in := range []string{
-		`class-of-service extra { schedulers be transmit-rate asd; }`,
+		`class-of-service { schedulers { be extra { transmit-rate asd; } } }`,
 		`class-of-service { schedulers be extra { transmit-rate asd; } }`,
 	} {
 		if err := schemaCheck(t, in); err == nil {
-			t.Fatalf("expected rejection for extra-token container with nested garbage %q, got nil", in)
+			t.Fatalf("expected rejection for extra-token nested child garbage %q, got nil", in)
 		}
 	}
-	// An extra token with a VALID nested leaf still passes — the extra token
-	// is opt-in skipped, the valid rate is fine.
-	if err := schemaCheck(t, `class-of-service extra { schedulers be transmit-rate 1g; }`); err != nil {
-		t.Fatalf("expected extra-token container with valid leaf to pass, got %v", err)
-	}
-	// Codex r6: the same bypass via the missing-arg (instance-name nested)
-	// path — `schedulers { be extra { transmit-rate asd; } }` parses to a
-	// node Keys=["be","extra"] (name + extra) with the typed leaf nested.
-	// The compiler names the scheduler `be` and still walks the leaf, so the
-	// gate must too.
-	if err := schemaCheck(t, `class-of-service { schedulers { be extra { transmit-rate asd; } } }`); err == nil {
-		t.Fatal("expected rejection for instance-extra-token nested garbage, got nil")
-	}
 	if err := schemaCheck(t, `class-of-service { schedulers { be extra { transmit-rate 1g; } } }`); err != nil {
-		t.Fatalf("expected instance-extra-token with valid leaf to pass, got %v", err)
+		t.Fatalf("expected extra-token with valid child leaf to pass, got %v", err)
 	}
 }
 
-// TestSchemaValidate_PackedSiblingSplitModifier reproduces Codex r3 minor:
-// the packed-leftover fix must not break the cross-sibling split-modifier
-// rule. Two sibling packed nodes — a rate and a bare `exact` — are valid
-// together (the `exact` sees its rate sibling), across all three AST
-// shapes the parser produces for the split form.
-func TestSchemaValidate_PackedSiblingSplitModifier(t *testing.T) {
+// TestSchemaValidate_PresenceTokenDoesNotHideSiblingLeaves reproduces
+// Codex r7: a KNOWN presence-only token in the instance identity
+// (`schedulers be surplus-sharing { priority foo; }`) must not cause the
+// child `priority foo` to be validated under the presence token's (empty)
+// schema instead of the scheduler schema. The compiler names the scheduler
+// `be`, ignores the `surplus-sharing` Keys token, and applies `priority
+// foo` — so the gate must reject the garbage priority.
+func TestSchemaValidate_PresenceTokenDoesNotHideSiblingLeaves(t *testing.T) {
 	for _, in := range []string{
-		// Fully-packed sibling nodes under class-of-service.
-		`class-of-service {
-		    schedulers be transmit-rate 1g;
-		    schedulers be transmit-rate exact;
-		}`,
-		// Instance-name nested, leaf packed, two sibling instances.
-		`class-of-service { schedulers { be transmit-rate 1g; be transmit-rate exact; } }`,
-		// Fully nested block.
-		`class-of-service { schedulers { be { transmit-rate 1g; transmit-rate exact; } } }`,
+		`class-of-service { schedulers { be surplus-sharing { priority foo; } } }`,
+		`class-of-service { schedulers { be equal-flow-enforcement { transmit-rate asd; } } }`,
 	} {
-		if err := schemaCheck(t, in); err != nil {
-			t.Fatalf("expected split-modifier shorthand %q to pass, got %v", in, err)
+		if err := schemaCheck(t, in); err == nil {
+			t.Fatalf("expected rejection for presence-token-hidden garbage %q, got nil", in)
 		}
 	}
-	// A bare `exact` packed sibling with NO rate sibling still fails.
-	if err := schemaCheck(t, `class-of-service { schedulers be transmit-rate exact; }`); err == nil {
-		t.Fatal("expected exact-only packed leaf (no rate sibling) to fail, got nil")
+	if err := schemaCheck(t, `class-of-service { schedulers { be surplus-sharing { priority high; } } }`); err != nil {
+		t.Fatalf("expected presence-token with valid sibling leaf to pass, got %v", err)
 	}
 }
 

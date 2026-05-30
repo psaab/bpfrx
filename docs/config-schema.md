@@ -73,12 +73,26 @@ Rules:
   `ValidateX(raw string, cfg *Config) error`.
 - The generic walker (`schema_walk.go`) needs **no** changes per leaf — it
   descends `setSchema` and validates any typed leaf it finds. Walker rows it
-  already handles: container/args/compoundKey/midKeyword/wildcard, the
-  standard typed leaf (first token is the value, remaining tokens must be
-  known modifier children), the `multi && children == nil` value-tail/range
-  shape (`destination-port 20000 to 20003`), and the cross-sibling
-  modifier-only line (`transmit-rate exact` is valid only when a sibling
-  supplies the rate).
+  handles: container/args/compoundKey/midKeyword/wildcard, the standard
+  typed leaf (first token is the value, remaining tokens must be known
+  modifier children), the `multi && children == nil` value-tail/range shape
+  (`destination-port 20000 to 20003`, rejecting dangling/all-separator
+  tails), and the cross-sibling modifier-only line (`transmit-rate exact`
+  valid only when a sibling leaf supplies the rate).
+- **Compiler-faithful rule (important).** The walker validates typed leaves
+  exactly where the per-subsystem compiler reads them. For a named-instance
+  container (e.g. `class-of-service schedulers <name> { ... }`) the compiler
+  reads leaves from the instance node's CHILDREN; tokens packed into the
+  instance node's own Keys beyond the name are NOT compiled, so the walker
+  ignores them — it never validates, nor mis-attributes block children to,
+  such packed tokens. This means malformed shorthand the compiler silently
+  discards (e.g. `schedulers be transmit-rate asd` as a single node with no
+  children) is intentionally NOT rejected: rejecting config the compiler
+  ignores is a behaviour change beyond #1319's compiled-leaf-only scope. The
+  real symptom-2 path — `set class-of-service schedulers be transmit-rate
+  asd` — lands the leaf as a CHILD, where it IS compiled and IS rejected.
+  This contract was converged across 7 hostile Codex review rounds; do not
+  re-add packed-tail validation without re-checking compiler reachability.
 
 ## Rollout (#1319)
 
