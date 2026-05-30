@@ -13,3 +13,9 @@ Branch: refactor/1687-shared-presentation
 - Codex: task-mpsgrdwm-mvt55w
 - AGY: adversarial-review-mpsgrpyp-6vmsdo
 - Claude-SMR: in-conversation (verified all six NAT leaf bodies byte-identical; Reader iface exact; nat64 excluded)
+
+## Code review round 1 (PR #1689, head ed21e665d, base 7988d4c25)
+- Codex: task-mpshe1up-ce5u4p
+- AGY: adversarial-review-mpsheamr-k357o5
+- Copilot: requested via @copilot review
+- Claude-SMR: in-conversation (hostile self-review during implementation)
