@@ -1,232 +1,212 @@
-# #1687 — Shared security/NAT/flow presentation package
+# #1687 — Shared NAT presentation seam (re-scoped)
 
-**Status:** DRAFT v1 — pending adversarial plan review. **Author leans PLAN-KILL** (see verdict thesis); inviting reviewers to refute with a viable narrower seam.
+**Status:** DRAFT v2 — re-scoped after round-1 plan review. Universal
+shared-presentation package KILLED; bounded shared NAT renderer
+PROPOSED. Pending round-2 adversarial review.
 
-## Issue framing
+## Round-1 verdicts and resolution
 
-#1687 (promoted from #1661 backlog item 3) asks to factor the
-"duplicated" security/NAT/flow presentation logic in
-`pkg/grpcapi/server_show.go` (2006 LOC) and
-`pkg/cli/cli_show_security.go` (1986 LOC) into a **shared presentation
-package** consumed by both the gRPC and CLI show paths — "a real
-shared-rendering seam, NOT more dispatcher files." The issue states a
-hard invariant: **the two consumers must produce byte-identical output
-post-split**, proven by golden tests on both paths. The issue itself
-authorizes PLAN-KILL "if the duplication isn't cleanly factorable."
+- **Codex (task-mpsghlr7-3p2gg5): PLAN-NEEDS-MAJOR.** "Kill the
+  universal shared renderer (security topics genuinely diverge), but
+  the kill is over-broad — there is a real, clean shared seam for the
+  NAT/status subset. The non-trivial walk (session counting + zoneByID)
+  is duplicated and *identical* between gRPC and CLI."
+- **AGY (adversarial-review-mpsgi8ie-81h4g8): PLAN-KILL.** Agreed the
+  security topics diverge, but dismissed the NAT subset as having "a
+  complex dispatcher hierarchy (summary/pool/rule-set/rule/detail)."
 
-## Honest scope/value framing
+**Resolution (evidence, not vote-count):** AGY's NAT dismissal is wrong.
+It conflated the CLI *dispatcher wrapper* (`showNATSource`'s
+sub-command router, which sends `summary`/`pool`/`rule-set`/`detail` to
+*different leaf functions*) with the *leaf renderer*
+`showNATSourceRuleDetail` itself. I diffed the leaf bodies after
+normalizing only the output sink (`fmt.Fprintf(buf,…)` vs
+`fmt.Printf(…)`) and the `return`/`return nil` wrapper:
 
-If the two paths genuinely produced the same output, a shared renderer
-would delete ~1-2K LOC of duplication and make the operator-facing show
-contract single-sourced. That would be real value.
+| Topic | gRPC | CLI | Rendering body |
+|-------|------|-----|----------------|
+| `nat-source-rule-detail` | server_show_nat.go:99 | cli_show_nat.go:455 | **byte-identical** |
+| `nat-dest-rule-detail` | server_show_nat.go:195 | cli_show_nat.go:904 | **byte-identical** |
+| `persistent-nat-detail` | server_show_nat.go:279 | cli_show_nat.go:1062 | **byte-identical** |
 
-**But the core premise is false on master.** The gRPC and CLI security
-presenters are *independently authored, structurally divergent*
-renderers that only superficially resemble each other. They do not
-produce byte-identical output today, and several do not even produce
-*feature-equivalent* output. A "shared package" that preserved both
-behaviors would need consumer-specific branches at nearly every
-field — i.e. no real shared seam, just a parameterized fork. That is
-precisely the #961 PacketContext / #1544 file-motion dead-end the issue
-and the project's standing rules warn against.
+The *only* diffs are: (1) the receiver/sink in the signature — exactly
+what a shared `Render(w io.Writer, …)` abstracts; (2) `return` vs
+`return nil`; (3) reworded doc-comments describing identical code; (4)
+`Fprintf(buf,"…%d\n\n")` vs `Printf("…%d\n")+Println()`, which emit
+identical bytes. Zero divergence in emitted strings or in the
+session/zone walk. This is sink-only duplicate rendering — a real seam,
+NOT the #961/#1544 dead-end. Codex's verdict stands; this plan adopts
+it. (Memory: AGY is documented low-signal on file-motion refactors —
+feedback_gemini_low_signal_on_refactor; the dispatcher-vs-leaf misread
+is that pattern.)
 
-*If reviewers conclude the perf gain is too small to justify the churn,
-PLAN-KILL is an acceptable verdict.* Here the relevant axis is not perf
-but **architectural fit + contract risk**: forcing the shared seam
-requires either (a) changing operator-visible CLI or gRPC output to
-make them match (a behavior change, not a refactor, and a regression to
-whichever side loses its richer output), or (b) a branch-everywhere
-"shared" type that adds indirection without removing real duplication.
+The simpler NAT tables (`nat-static`, `nat-nptv6`, `persistent-nat`)
+ALSO diff only by sink + wrapper, but their bodies are short (~15-25
+lines each) and they form a coherent family with the detail renderers,
+so they are included for a clean per-topic seam.
 
-## What's already shipped / structure on master
+## Final scope (what this PR does)
 
-- `server_show.go` is **already a topic dispatcher** (`ShowText`): most
-  cases delegate to extracted helpers `server_show_{nat,flow,firewall,
-  security_text,zones_text,...}.go` (the #1043 phased decomposition).
-  The remaining inline cases (alg, address-book, ike, screen-*,
-  routing-options, event-options, backup-router) write to a
-  `*strings.Builder`.
-- `cli_show_security.go` is a set of `(c *CLI) showX()` methods that
-  print directly to **stdout** via `fmt.Println` / `fmt.Printf`, routed
-  by `cli_show_security_dispatch.go`. The CLI does **not** call gRPC
-  `ShowText` for these topics — it has fully independent local
-  renderers.
-- There is **no** existing shared presentation package, and no import
-  of one from either side.
+**KILL** the universal "shared security/NAT/flow presentation package"
+premise. Security topics (`alg`, `address-book`, `applications`,
+`screen-ids-option`, `ike`, `security-log`, `dynamic-address`) are
+genuinely divergent operator contracts (different headers, column
+widths, field syntax, feature sets, sub-commands, runtime sources) and
+are explicitly PRESERVED as-is. The byte-identical invariant the issue
+states is already false for those topics on master; forcing them into a
+shared renderer would regress one consumer (the #961 pattern). This is
+documented and NOT attempted.
 
-## Evidence: the two render paths are divergent, not duplicated
+**BUILD** a bounded shared NAT renderer package, `pkg/natshow/`, with
+sink-only `Render*` functions for the six byte-identical NAT topics.
+Both consumers rewire onto it; output is proven byte-identical
+before/after by golden tests on BOTH the gRPC `ShowText` path and the
+CLI show path.
 
-Four representative parallel pairs, read end-to-end on master:
+### Package shape (module-dir layout)
 
-### 1. `screen-ids-option`
-- gRPC (`server_show.go:194-254`): hardcoded column spacing —
-  `"  Name                                        Value\n"` and
-  `"  TCP land attack                             enabled\n"` (literal
-  spaces baked into each string).
-- CLI (`cli_show_security.go:514-584`): `fmt.Printf("  %-45s %s\n",
-  "Name", "Value")` and `fmt.Printf("  %-45s %s\n", "TCP land attack",
-  "enabled")`.
-- **Verdict:** `%-45s` width vs hand-counted literal spacing → NOT
-  byte-identical. A shared renderer must pick one; either changes the
-  other consumer's output.
+`pkg/natshow/` — files by aspect:
+- `natshow.go` — package doc + the narrow `Reader` interface + shared
+  helpers (`zoneByID`, session-count walks).
+- `static.go` — `RenderStatic`, `RenderNPTv6`.
+- `source.go` — `RenderSourceRuleDetail`.
+- `dest.go` — `RenderDestRuleDetail`.
+- `persistent.go` — `RenderPersistent`, `RenderPersistentDetail`.
 
-### 2. `alg`
-- gRPC (`server_show.go:824-833`): 4 lines —
-  `"SIP:  %s\n" / "FTP: / "TFTP: / "DNS:` via `boolStatus()`.
-- CLI (`cli_show_security.go:1848-1885`): header `"ALG Status:"`, then
-  16 protocols (`DNS FTP H323 MGCP MSRPC PPTP RSH RTSP SCCP SIP SQL
-  SUNRPC TALK TFTP IKE-ESP TWAMP`) via `"  %-9s: %s\n"` with
-  "Enabled"/"Disabled".
-- **Verdict:** completely different content (4 vs 16 protocols),
-  different header, different format. Not factorable without changing
-  one side's behavior.
+### Narrow reader interface (both runtimes already satisfy it)
 
-### 3. `address-book`
-- gRPC (`server_show.go:868-885`): `"Addresses:\n"` + `"  %-20s %s\n"`;
-  `"Address sets:\n"` + `"  %-20s members: %s\n"`. Map iteration (no
-  sort), no name filter, no nested-set `set:` prefix, no member-detail
-  expansion, no empty fallback.
-- CLI (`cli_show_security.go:784-845`): `"  %-24s %s\n"`; name-filter
-  support; nested address-sets shown as `set:NAME`; member-detail
-  expansion when filtered; `"Address book is empty"` fallback.
-- **Verdict:** different column width (20 vs 24) AND the CLI has
-  features gRPC lacks (filter, nested-set prefix, member detail). Not
-  even feature-equivalent.
+```go
+// pkg/natshow/natshow.go
+type Reader interface {
+    IsLoaded() bool
+    IterateSessions(fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error
+    IterateSessionsV6(fn func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error
+    ReadNATRuleCounter(counterID uint32) (dataplane.CounterValue, error)
+    GetPersistentNAT() *dataplane.PersistentNATTable
+}
+```
 
-### 4. `applications`
-- gRPC (`server_show_security_text.go:230-275`): header
-  `"Applications:"`, dense single line `"  %-24s proto=%-6s
-  dst-port=... src-port=... timeout=... alg=... (desc)"`.
-- CLI (`cli_show_security.go:846-973`): header `"User-defined
-  applications:"`, `detail` + `<name>` filter sub-commands, multi-line
-  detail block (`Application:`, `  Description:`, `  IP protocol:`, ...),
-  brief format `"  %-24s protocol: %-6s port: %s"`.
-- **Verdict:** different header text, different field syntax
-  (`proto=tcp` vs `protocol: tcp`), CLI has detail/filter modes gRPC
-  lacks. Not byte-identical, not feature-equivalent.
+Verified: `grpcRuntime` (pkg/grpcapi/runtime.go:12) and `cliRuntime`
+(pkg/cli/runtime.go:28) both declare every method above, so both `dp`
+fields satisfy `natshow.Reader` structurally. `*dataplane.ApplyResult`
+and `*config.Config` are the same concrete types on both sides
+(apply_result.go:5, cli.go:122).
 
-Across all four sampled pairs the output diverges. The "duplication" is
-**parallel evolution of two distinct operator contracts**, not a single
-contract copy-pasted.
+### Function signatures (sink = io.Writer)
 
-## Why the issue's stated invariant cannot be met by a refactor
+```go
+func RenderSourceRuleDetail(w io.Writer, cfg *config.Config, dp Reader, cr *dataplane.ApplyResult)
+func RenderDestRuleDetail(w io.Writer, cfg *config.Config, dp Reader, cr *dataplane.ApplyResult)
+func RenderPersistentDetail(w io.Writer, dp Reader)
+func RenderPersistent(w io.Writer, dp Reader)
+func RenderStatic(w io.Writer, cfg *config.Config)
+func RenderNPTv6(w io.Writer, cfg *config.Config)
+```
 
-The issue's acceptance gate is *byte-identical output before/after on
-both consumers*, proven by golden tests. Golden tests written against
-master would capture two **different** golden files per topic. A shared
-renderer can reproduce at most one of them per topic; reproducing both
-requires per-consumer branches keyed on caller identity at nearly every
-field — which is not a shared seam, it is a fork with a shared name. So:
+A nil `dp`/`cr` reproduces the existing "not loaded" branches. The
+gRPC side passes `&buf` (a `*strings.Builder` is an `io.Writer`); the
+CLI side passes `os.Stdout` (or `c.out` if present) — preserving the
+exact stdout behavior. The trailing-newline shape is normalized to the
+gRPC form (`…\n\n`), which is byte-identical to the CLI's
+`Printf("…\n")+Println()`.
 
-- **Pure code-motion is impossible** (the outputs differ, so you cannot
-  move one body and call it from both).
-- **A genuine shared seam is impossible** without first *unifying the
-  output contract*, which is a behavior change to the CLI and/or gRPC
-  operator-facing surface — out of scope for a refactor, and a
-  regression for whichever side loses its richer output (the CLI's
-  filter/detail/nested-set features, the gRPC's distinct formats).
+### Rewiring
 
-This matches the documented dead-ends: #961 PacketContext (forced a
-shared abstraction that didn't fit), #1544 lesson (file-motion that
-isn't a real seam), and the project's standing rule to kill
-"Refactor: <Pattern>" issues that don't fit codebase reality.
+- gRPC `server_show_nat.go`: each `(s *Server) showNATxxx(... buf)`
+  becomes a one-line `natshow.RenderXxx(buf, cfg, s.dp, s.applyResult())`.
+- CLI `cli_show_nat.go`: each `(c *CLI) showNATxxx(...)` becomes
+  `natshow.RenderXxx(c.out, cfg, c.dp, c.applyResult()); return nil`
+  (the CLI dispatcher sub-command routing in `showNATSource`/
+  `showNATDestination` is UNCHANGED — only the leaf renderer bodies move).
 
-## Concrete design (the only honest options)
+## Commit increments (no monolithic add; true merge commit)
 
-1. **PLAN-KILL (recommended).** The duplication is not cleanly
-   factorable; the byte-identical invariant is already false on master.
-   Label `plan-kill`, close, comment verdicts.
-
-2. **Narrow salvage, IF reviewers find one** — extract only the handful
-   of *genuinely identical, pure config→string helpers* that are
-   byte-for-byte equal on both sides (candidate: `boolStatus`,
-   `firewallFilterTermExpansionCount` vs `filterTermExpansionCount`,
-   `screenSYNCookieCounterRows` which both already delegate to
-   `dpuserspace.FormatSYNCookieCounterRows`). This would be a tiny,
-   honest dedup (tens of LOC), NOT the "shared presentation package"
-   the issue scopes, and would barely move the audit LOC. Reviewers must
-   confirm each candidate is byte-identical before it qualifies.
-
-3. **Re-scope to contract-unification (out of scope here).** A separate,
-   non-refactor work item could *intentionally* unify the CLI and gRPC
-   output for these topics (deciding which format wins per topic), then
-   build the shared renderer on the unified contract. That is a
-   behavior-change project requiring operator sign-off, not #1687.
+1. `pkg/natshow/` package + narrow Reader interface + shared helpers
+   (builds clean, no consumers yet).
+2. Rewire `pkg/grpcapi/server_show_nat.go` onto `natshow`.
+3. Rewire `pkg/cli/cli_show_nat.go` onto `natshow`.
+4. Golden tests: gRPC `ShowText` + CLI show path, byte-identical
+   assertions for all six topics, captured against master output.
+5. Regen `docs/refactoring-audit-current.txt`; doc updates.
 
 ## Public API preservation
 
-N/A under option 1. Under option 2, only internal unexported helpers
-move; no exported gRPC/CLI signatures change.
+No exported gRPC RPC or CLI command signature changes. Only unexported
+renderer bodies move to a new package. `ShowText` topic strings and CLI
+command grammar unchanged.
 
 ## Hidden invariants
 
-- Operator-visible output of every `show` topic on BOTH consumers must
-  not change (the whole point — and the reason the broad split fails).
-- CLI prints to stdout; gRPC accumulates into `*strings.Builder` and
-  returns over the wire. Any shared helper must take an `io.Writer` /
-  `*strings.Builder` sink, not print directly — another structural
-  mismatch the broad split would have to paper over.
+- Output of every rewired topic on BOTH consumers must be
+  byte-identical to master (golden tests enforce).
+- CLI prints to its writer; gRPC accumulates into `*strings.Builder`.
+  Shared funcs take `io.Writer` — both satisfied.
+- Session-count walk semantics (forward-only `IsReverse==0`,
+  `SessFlagSNAT`/`SessFlagDNAT`, zone-by-ID mapping, v4+v6) preserved
+  verbatim — moved, not rewritten.
 
 ## Risk assessment
 
 | Class | Level | Note |
 |-------|-------|------|
-| Behavioral regression | **HIGH** | Forcing a shared renderer changes one consumer's operator-visible output for nearly every sampled topic. |
-| Lifetime/borrow (Go: aliasing) | LOW | Go; not the issue. |
-| Performance | N/A | Control-plane show path, not hot path. |
-| **Architectural mismatch (#961/#1544)** | **HIGH** | Two divergent contracts; "shared" type would be a branch-everywhere fork. This is the kill axis. |
+| Behavioral regression | **LOW** | Pure sink-parameterized code motion of byte-identical bodies; golden tests on both consumers gate it. |
+| Lifetime / aliasing (Go) | LOW | No new shared mutable state; `dp`/`cr` read-only. |
+| Performance | N/A | Control-plane show path. |
+| Architectural mismatch (#961/#1544) | **LOW** | Verified byte-identical bodies + narrow interface both runtimes already satisfy; not a branch-everywhere fork. Security topics correctly excluded. |
 
-## Test plan (if any option 2 salvage proceeds)
+## Test plan
 
-- `GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go test ./...` all green.
-- Golden/snapshot tests on BOTH `grpcapi` `ShowText` and `cli` show
-  paths for every touched topic, asserting output is byte-identical
-  before/after (captured on master first). Any candidate helper that
-  changes either golden is disqualified.
+- `GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go test ./...` — all green.
+- New golden tests in `pkg/grpcapi` and `pkg/cli` asserting the six NAT
+  topics' output is byte-identical to a master-captured fixture, on
+  both consumers.
 - `make audit-check` green on rebased branch; regen
-  `docs/refactoring-audit-current.txt`.
-- No cluster smoke (control-plane only) — state explicitly in PR.
+  `docs/refactoring-audit-current.txt` (server_show_nat.go and
+  cli_show_nat.go both shrink).
+- **No cluster smoke** — this is pure control-plane gRPC/CLI
+  presentation, no dataplane / per-packet path. Stated explicitly in
+  the PR so the smoke-runner does not block.
 
-## Out of scope
+## Out of scope (explicitly)
 
-- Unifying the CLI/gRPC output contract (behavior change; needs its own
-  issue + operator sign-off).
-- The broader grpcapi package restructure (#1661 addendum-4 #24
-  `server_sessions`, addendum-9).
-- #1686 (dataplane/maps.go) — disjoint file scope; no conflict.
+- Security/flow topics (`alg`, `address-book`, `applications`,
+  `screen-*`, `ike`, `security-log`, `dynamic-address`) — divergent
+  contracts, PRESERVED as-is.
+- Any unification of CLI vs gRPC output for divergent topics (behavior
+  change; needs its own issue + operator sign-off).
+- The broader grpcapi package restructure (#1661 addendum-4/9).
+- `filterTermExpansionCount` dedup — below noise floor, not touched
+  unless a firewall renderer seam is opened (it is not, here).
+- #1686 (dataplane/maps.go) — disjoint scope.
 
-## Open questions for adversarial review (each invitable to PLAN-KILL)
+## Open questions for round-2 adversarial review
 
-1. Are the four sampled pairs representative, or is there a large
-   subset of topics where gRPC and CLI **are** byte-identical and
-   cleanly shareable? (If a real shared majority exists, the kill is
-   wrong — produce the list with file:line proof.)
-2. Is option 2 (narrow byte-identical-helper dedup) worth doing at all,
-   or is it churn below the noise floor that should just be left alone?
-3. Does the issue's "byte-identical output post-split" invariant
-   *actually* mean "identical to the consumer's own pre-split output"
-   (my reading), or "identical to each other" (which is already false
-   and would require a behavior change)? Either reading supports KILL of
-   the broad split; confirm.
-4. Is re-scoping to contract-unification (option 3) the right follow-up,
-   or should #1687 simply be closed as not-cleanly-factorable?
-5. Is there any seam I'm missing — e.g. a shared *data-model* (typed
-   intermediate structs) feeding two thin per-consumer formatters —
-   that would dedup the config-walking logic without touching the
-   divergent formatting? Quantify how much of each function is
-   config-walk vs format-emit before answering.
+1. Is `pkg/natshow/` the right home, or should the shared renderer live
+   under an existing neutral package to avoid a new top-level import
+   edge? (It must not import `grpcapi` or `cli` — only `config` +
+   `dataplane`.)
+2. Are the six NAT topics the complete byte-identical set, or did I
+   miss one (e.g. `nat64`)? Diff any candidate before claiming it.
+3. Does normalizing the trailing-newline to the gRPC `\n\n` form change
+   ANY consumer's bytes? (Claim: no — `Printf("…\n")+Println()` ==
+   `Fprintf("…\n\n")`. Refute with a counter-example if wrong.)
+4. Is the narrow `Reader` interface correct, or does any renderer touch
+   a `dp` method not in it (e.g. `ReadNATPortCounter`,
+   `ReadGlobalCounter`)? Verify against both function bodies.
+5. Does excluding the security topics leave #1687 meaningfully
+   addressed, or should the issue be partially closed with a follow-up
+   for the divergent topics?
 
-   **Author's answer (steelman, then rejected):** the config-walk in
-   these functions is trivial (~3 lines: build name slice,
-   `sort.Strings`, range) — there is almost nothing to dedup. The bulk
-   is per-field format-emit, which diverges. Worse, where the walk *is*
-   non-trivial it also diverges: the CLI `address-book` walk has
-   name-filter + nested-`set:` expansion + member-detail that the gRPC
-   walk lacks, so a shared data-model would itself need consumer-keyed
-   walk parameters. And the one genuinely cross-cutting renderer
-   (`FormatSYNCookieCounterRows` + `SumSYNCookieCounters`) is **already
-   shared** in `pkg/dataplane/userspace/statusfmt.go:39,56` — both
-   consumers already call it. The factorable duplication was already
-   factored. The data-model seam does not exist here. Reviewers: refute
-   with a concrete typed-struct design + the per-function walk/format
-   LOC split if you disagree.
+## Pre-resolved before round 2 (author verification)
+
+- **Q2/Q4 resolved.** The six in-scope gRPC renderers (server_show_nat.go
+  lines 22-355) call exactly: `GetPersistentNAT`, `IsLoaded`,
+  `IterateSessions`, `IterateSessionsV6`, `ReadNATRuleCounter` — the
+  `Reader` interface above is exact (no `ReadNATPortCounter` /
+  `ReadGlobalCounter` in scope; those belong to *other* CLI NAT
+  functions like the summary/pool views that stay put).
+- **`nat64` is NOT byte-identical and is EXCLUDED:** gRPC emits
+  `"No NAT64 rule-sets configured\n"` (server_show_nat.go:358) while CLI
+  emits `"No NAT64 rule-sets configured."` (cli_show_nat.go:1017) — a
+  trailing-period divergence. The six topics are the complete
+  byte-identical set.
