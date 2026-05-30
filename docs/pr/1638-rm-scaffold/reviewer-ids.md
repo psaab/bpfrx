@@ -22,7 +22,15 @@ live match-any assertions (only any4/any6 coverage). Preserved in slimmed form.
 |---|---|---|
 PR: #1676. Code HEAD: 7faf07d4ef97d915278e560640cc79999cf7db20
 
-| Codex | task-mpru34qd-akn2s3 | (pending) |
-| AGY | adversarial-review-mpru39ju-blnzhx | (pending) |
-| Copilot | (requested) | (pending) |
-| Claude SMR | inline | (pending) |
+| Codex (r1) | task-mpru34qd-akn2s3 | INFRA-BLOCKED (missing codex-linux-sandbox) — retried |
+| Codex (r2) | task-mpruhdgi-ge37ev | INFRA-BLOCKED AGAIN (sandbox runner absent; "Failed to create unified exec process") |
+| AGY | adversarial-review-mpru39ju-blnzhx | MERGE-READY |
+| Copilot | COMMENTED (0 inline comments) | clean |
+| Claude SMR | inline | MERGE-READY |
+
+Codex sandbox (`codex-linux-sandbox`) is absent from the plugin cache in this
+environment — both code-review attempts failed before any shell command could
+launch. Per feedback_codex_infra_must_retry, Codex was retried once; the retry
+confirmed a persistent (not transient) environment breakage. Merge gate stands
+on AGY MERGE-READY + Copilot clean + Claude SMR MERGE-READY (3-of-4); the
+parent decides whether to wait for Codex infra recovery or merge.
