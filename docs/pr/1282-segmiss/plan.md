@@ -219,12 +219,13 @@ seg_needed_but_none` unchanged. CLI stats output unchanged.
   signal of record; only the eprintln becomes opt-in). Verified by the
   existing truth-table test (`#1283` added
   `forwarded_tcp_may_need_segmentation` / seg-miss-counter tests).
-- No allocation change in release. The `cfg!(feature)` collapses to
-  `const false`, so the `eprintln!` body DCEs out, but the rate-cap check
-  and `record_exception` remain in release (intentionally always-on so a
-  genuine seg-miss surfaces under `Recent exceptions`). The behaviour
-  differs from the pure-log siblings in this file which DCE the entire
-  block.
+- Release behavior changes from "log only" to "record exception + optional
+  log": in release, the `eprintln!` body DCEs out, but the rate-cap branch
+  still executes and, for the first 20 misses per worker, calls
+  `record_exception` (including `build_exception_status` string
+  construction). This is intentional so a genuine seg-miss surfaces under
+  `Recent exceptions`. The behaviour differs from the pure-log siblings in
+  this file which DCE the entire block.
 - No HA / GC / map interaction.
 
 ## Risk assessment
