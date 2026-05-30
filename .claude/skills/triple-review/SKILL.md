@@ -244,6 +244,32 @@ revise the plan** before continuing.
 TMPDIR=/dev/shm CARGO_TARGET_DIR=/dev/shm/cargo cargo build 2>&1 | tail -5
 ```
 
+**Commit in logical increments — never one monolithic `git add -A`.**
+This PR will land via a **merge commit** (Step 9), so the branch's
+commit history is preserved on master verbatim — make it a history
+worth keeping. Commit each self-contained unit of work separately so a
+later `git log` / `git bisect` / `git blame` lands on a tight,
+reviewable change:
+
+- For a file split, one commit per extracted module/aspect (e.g.
+  "extract NAT accessors into maps/nat.go", then "extract session
+  accessors into maps/session.go"), with a final commit wiring the
+  facade. Each commit must build.
+- For a multi-step plan, one commit per plan step.
+- For a bug fix, separate the fix commit from any test-only or
+  refactor-prep commits.
+- Keep generated-artifact regen (e.g.
+  `docs/refactoring-audit-current.txt`) in its own commit, not folded
+  into a logic commit.
+
+Each commit message follows the project convention (CLAUDE.md): a
+specific imperative subject plus a body explaining the *why*,
+implementation notes, and validation, wrapped to ~72 columns. No terse
+checkpoint messages ("wip", "fix", "address review") for production
+work — if a review-fix commit is mechanical, still describe what it
+addresses and why. Build clean at every commit boundary so the merged
+history stays bisectable.
+
 ## Step 6: Test
 
 All gates, in order:
@@ -400,9 +426,19 @@ done
 
 ## Step 7: Open PR
 
+You committed in logical increments during Step 5 — do NOT now collapse
+them with a single `git add -A`. Confirm the history is clean and push
+it as-is (the merge commit in Step 9 preserves these commits on
+master):
+
 ```bash
-git add -A
-git commit -m "<#ISSUE Step N: title>" -m "<body explaining scope, methodology rounds, smoke results>"
+# Sanity-check the branch carries discrete, well-described commits —
+# not one monolith. If everything ended up in a single commit, split it
+# before pushing (git reset --soft origin/master, then re-commit in
+# logical units per Step 5).
+git log --oneline origin/master..HEAD
+git status   # working tree should be clean — all work already committed
+
 git push
 
 gh pr create --title "<#ISSUE Step N: title>" --body "$(cat <<'EOF'
@@ -495,9 +531,18 @@ push a fix commit, re-dispatch reviewers (and re-request
 Copilot via `gh pr edit --add-reviewer Copilot`), wait for
 re-review, then re-merge-check.
 
+**Merge with `--merge` (a true merge commit), NOT `--squash`.** Squash
+collapses the branch's logical commits — which Step 5 deliberately kept
+separate — into one monolithic commit on master, destroying the
+bisectable history and the per-commit `why`. Use a merge commit so each
+implementation/refactor/review-fix commit lands on master intact:
+
 ```bash
-gh pr merge <PR> --squash --auto
-# or `--squash` directly if --auto isn't enabled
+gh pr merge <PR> --merge --auto
+# or `--merge` directly if --auto isn't enabled.
+# NEVER --squash — it produces the monolithic commits this skill avoids.
+# --rebase is acceptable only if the branch history is already linear
+# and you explicitly want no merge commit; default to --merge.
 ```
 
 After merge, save findings to memory if anything non-obvious
@@ -517,6 +562,10 @@ came up:
   requires Copilot in the agreement set.
 - **Dismissing test failures as flakes.** Step 6's 5x flake
   check is non-negotiable.
+- **Monolithic commits.** Step 5 commits in logical increments;
+  Step 9 merges with `--merge`, never `--squash`. A squash-merge of a
+  multi-commit branch collapses the history into one giant commit —
+  exactly what this prevents. Preserve the per-commit `why` on master.
 - **#961 / #946 Phase 2 architectural mismatch.** Step 2's
   risk-assessment table forces explicit consideration; Step 3's
   reviewer prompts ask each reviewer to consider it.
