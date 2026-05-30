@@ -20,7 +20,9 @@ live match-any assertions (only any4/any6 coverage). Preserved in slimmed form.
 
 | Reviewer | Task ID | Verdict |
 |---|---|---|
-| Codex | (pending) | (pending) |
-| AGY | (pending) | (pending) |
-| Copilot | (pending) | (pending) |
+PR: #1676. Code HEAD: 7faf07d4ef97d915278e560640cc79999cf7db20
+
+| Codex | task-mpru34qd-akn2s3 | (pending) |
+| AGY | adversarial-review-mpru39ju-blnzhx | (pending) |
+| Copilot | (requested) | (pending) |
 | Claude SMR | inline | (pending) |
