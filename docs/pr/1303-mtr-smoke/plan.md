@@ -1,267 +1,269 @@
-# #1303 — IPv6 mtr smoke false-fail: robust forwarding signal
+# #1303 — IPv6 mtr smoke false-fail: controlled forwarding signal
 
-Status: DRAFT v1 — pending adversarial plan review (Codex + AGY + Claude SMR)
+Status: DRAFT v2 — v1 PLAN-KILLED by Codex + AGY (both converged on the
+same fatal). Redesigned per their required-redesign direction.
 
-## Issue framing
+## v1 outcome (preserved)
 
-`scripts/userspace-phase-cycle.sh` runs the userspace HA smoke, which
-delegates to `scripts/userspace-ha-validation.sh`. The IPv6 leg of
-`validate_traceroute_visibility()` records a one-cycle `mtr -6` report
-to a public IPv6 target (`2607:f8b0:4005:814::200e`, a Google address)
-and validates it via `validate_mtr_report "ipv6" ... 1`.
+v1 proposed making the public `mtr -6` itself prove forwarding by
+requiring ">=1 resolved hop beyond the first." Both reviewers
+PLAN-KILLed it with the **same** counter-example:
 
-#1303 reports a false-fail: a healthy IPv6 dataplane (TTL probe ok,
-LAN IPv6 ping 3/3, 22 Gb/s iperf, 0 TX errors) was flagged broken
-because the **external final hop** did not answer the ICMPv6 probe
-(`9.|-- ??? 100.0%`). The final-hop responder is outside our control;
-the smoke must not hinge on it.
+- A healthy IPv6 path can forward while every intermediate transit
+  router rate-limits/suppresses ICMPv6 time-exceeded, and the public
+  final hop is also silent. With `MTR_REPORT_CYCLES=1` a single drop
+  forces `???`. The report is then `1.|-- <fw>` / `2..N.|-- ???`,
+  which is **indistinguishable** from a genuine forwarding break.
+  v1's predicate hard-fails that healthy path — a NEW false-fail
+  class, i.e. trading one external-dependent failure for another.
+  (Codex finding 1; AGY finding 1.)
+- AGY also caught: v1's single-hop degenerate falsely PASSes a broken
+  dataplane (mtr stops after hop 1) (AGY 2); the `"100.0%"` literal is
+  fragile — mtr truncates to `100.0` at column width so a named-but-
+  dead final hop slips through as "resolved" (AGY 4); `"???" not in h`
+  counts ICMP-error presentations as forwarding (Codex 2); plus a
+  copy-paste syntax error in the v1 snippet (AGY 3).
 
-## What's already shipped (must compose with)
+Both reviewers' required redesign is the same: **do not use external
+public traceroute intermediate hops to prove forwarding.** Use a
+controlled forwarding signal; treat the public mtr as non-fatal.
 
-#1301 (commit `68f41ffda`) already added the `allow_unresolved_destination`
-parameter and passes `1` for IPv6. Today the IPv6 logic is:
+## The controlled forwarding signal already exists
 
-```
-first = hop_lines[0]; last = hop_lines[-1]
-if "???" in first: FAIL  (first hop unresolved)
-if "???" in last or "100.0%" in last:
-    if allow_unresolved_destination: warn + PASS
-    FAIL
-PASS
-```
-
-This **already** stops the issue's exact failure from being fatal —
-but it over-corrects into a near no-op for IPv6: the only thing the
-IPv6 mtr check now proves is that **hop 1 resolved**. Hop 1 is the
-firewall's own LAN-side address answering an ICMPv6 TTL-expired for a
-packet addressed to it as the gateway. That is pure L3-local liveness,
-**not** evidence the dataplane forwarded anything. If the IPv6
-dataplane were genuinely broken (forwards nothing past itself), the
-report would be `1.|-- <fw>` then `2.|-- ??? 100.0%` ... and the
-current check would warn + PASS. That is the "weaken into a no-op"
-trap #1303 explicitly forbids.
-
-So #1303 is really two-sided:
-1. Don't fail on an unresolved external **final** hop (already done).
-2. Still fail if the IPv6 dataplane forwards nothing — i.e. the smoke
-   must assert *forwarding past the firewall*, not just first-hop
-   liveness.
-
-The docs (`docs/userspace-ha-validation.md:233-234`) currently codify
-the weak "resolved first hop" rule; they must be updated to the new
-contract.
-
-## What the robust IPv6-forwarding signal is
-
-A traceroute/mtr hop list to a public target through the firewall is:
-
-```
-1. <firewall LAN gateway>     <- L3-local liveness (host -> fw)
-2. <first upstream router>    <- REQUIRES the fw to have forwarded the
-3. <next upstream router>        packet off-box and routed the reply back
-...
-N. <public destination>       <- often silent (out of our control)
-```
-
-The packet reaching **hop ≥ 2** and the TTL-expired reply coming back
-is direct proof the userspace dataplane forwarded the IPv6 packet off
-the LAN and the return path works. The external destination answering
-hop N is not.
-
-**Robust rule (IPv6, `allow_unresolved_destination=1`):**
-- no hop lines → FAIL (mtr produced nothing).
-- first hop `???` → FAIL (cannot even reach the firewall).
-- **require at least one resolved hop at index ≥ 1** (a hop *beyond*
-  the first answered) → this is the forwarding-past-the-firewall
-  signal. If every hop after the first is `???`, FAIL with a
-  forwarding-specific message.
-- given forwarding is proven, an unresolved/100%-loss **final** hop is
-  recorded as a warning and PASSES.
-
-This still catches a genuinely-broken IPv6 dataplane (only the firewall
-answers; nothing forwards) and stops false-failing on an unanswered
-external endpoint.
-
-IPv4 behaviour is unchanged: `allow_unresolved_destination=0` still
-requires the final destination (`1.1.1.1`, a reliable responder) to
-resolve. The new "resolved hop beyond first" requirement is strictly
-*additional* for IPv4 too (1.1.1.1 resolving as the last hop already
-implies forwarding), so it does not weaken IPv4.
-
-## Concrete design
-
-The validation Python is currently an inline heredoc inside
-`validate_mtr_report()`, which is untestable in isolation. Extract it
-to a standalone, importable + CLI module so the classification logic
-can be unit-tested against canned mtr reports reproducing both the
-false-fail and the genuine-break.
-
-New file `scripts/mtr_report_check.py`:
-
-```python
-def classify_mtr_report(label, report, allow_unresolved_destination):
-    """Return (ok: bool, message: str).
-
-    ok=False  -> hard failure (caller dies with message)
-    ok=True   -> pass; message is the summary/warning line to log
-    """
-    hop_lines = [l for l in report.splitlines() if re.match(r"\s*\d+\.\|--", l)]
-    if not hop_lines:
-        return False, f"{label} mtr produced no hop lines"
-    first, last = hop_lines[0], hop_lines[-1]
-    if "???" in first:
-        return False, f"{label} mtr first hop unresolved: {first}"
-
-    last_unresolved = ("???" in last) or ("100.0%" in last)
-
-    # Forwarding signal: at least one RESOLVED hop BEYOND the first.
-    # A hop that printed a name/address means a TTL-expired reply came
-    # back from a router past the firewall -> forwarding happened. We
-    # deliberately do NOT also require that hop to be loss-free: with
-    # MTR_REPORT_CYCLES=1 a single resolved intermediate can show
-    # 100.0% loss on that one cycle yet still prove a reply arrived.
-    # "???" (no name at all) is the only thing that means "no reply".
-    forwarded = any("???" not in h for h in hop_lines[1:])
-
-    if last_unresolved:
-        if not allow_unresolved_destination:
-            return False, f"{label} mtr destination unresolved: {last}"
-        if not forwarded:
-            # Only the firewall answered; nothing forwarded off-box.
-            return False, (
-                f"{label} mtr shows no forwarding past the first hop "
-                f"(all hops beyond the firewall unresolved): {last}"
-            )
-        return True, (
-            f"{label} mtr: ok (destination unresolved, forwarding "
-            f"confirmed past first hop): {last}"
-        )
-
-    # Last hop resolved -> destination answered -> forwarding implied.
-    return True, f"{label} mtr: ok"
-```
-
-CLI entrypoint: `argv = [label, report, allow_unresolved("0"/"1")]`,
-print message, exit 0 on ok else exit 1. This preserves the existing
-shell contract: `validate_mtr_report` calls
-`python3 scripts/mtr_report_check.py "$label" "$report" "$allow"`,
-captures stdout, `die`s on non-zero, else `tee`s the message.
-
-`validate_mtr_report()` shell wrapper becomes:
+`userspace-ha-validation.sh` lines 860-862 already run, as a HARD gate
+under `set -euo pipefail` (no `|| true`):
 
 ```bash
-validate_mtr_report() {
-    local label="$1" path="$2" allow_unresolved_destination="${3:-0}"
-    local report result
-    report="$(run_host "cat ${path}")"
-    if ! result="$(python3 "${SCRIPT_DIR}/mtr_report_check.py" \
-        "$label" "$report" "$allow_unresolved_destination" 2>&1)"; then
-        die "$result"
+info "basic reachability checks"
+run_host "ping -c 2 -W 1 ${V4_TEST_TARGET} >/tmp/userspace-ping-v4.out"
+run_host "ping -6 -c 2 -W 1 ${V6_TEST_TARGET} >/tmp/userspace-ping-v6.out"
+```
+
+`V6_TEST_TARGET=2001:559:8585:80::200` is the iperf target on the
+firewall's WAN-side `reth0.80`. The LAN host (`cluster-userspace-host`)
+sits on the LAN side; its only IPv6 route to the `...:80::/64` prefix
+is the RA-learned default route (lines 855-856) pointing at the
+firewall. So this ping is **host -> firewall LAN (reth1.0) -> firewall
+WAN (reth0.80) -> target -> reply back** — it cannot succeed unless the
+userspace dataplane forwards IPv6 in both directions. It is the
+controlled, in-our-control proof of IPv6 dataplane forwarding, and it
+already hard-fails the smoke if forwarding is broken.
+
+The deterministic IPv6 TTL=1 probe (`validate_ttl_probe "ipv6"`,
+lines 438-439) independently asserts the firewall answers ICMPv6
+time-exceeded — the egress/hop-decrement path.
+
+These two gates are exactly the issue's suggested approach #1
+("IPv6 TTL probe success plus LAN IPv6 ping success as sufficient
+dataplane smoke coverage").
+
+## Design
+
+Two coupled changes:
+
+### 1. IPv6 public mtr becomes a non-fatal recorded artifact
+
+For IPv6 (`allow_unresolved_destination=1`) the public `mtr -6` to
+`2607:f8b0:4005:814::200e` no longer hard-fails on ANY hop pattern —
+final hop, intermediate hops, or "all `???` past the firewall." It is
+recorded as an informational/warning line into `$summary_file` and the
+artifact file. Rationale: every fatal interpretation of a public
+external traceroute depends on ICMPv6 behavior we do not control, as
+both reviewers proved. The forwarding-correctness signal is the
+controlled ping + TTL probe, NOT this external trace.
+
+This is **not** a no-op for the smoke as a whole: a genuinely-broken
+IPv6 dataplane is caught by the controlled `ping -6` at line 862
+(hard fail) and by `validate_ttl_probe "ipv6"` (hard fail). The
+external mtr's job is reduced to operator-visible path observability,
+which is all an uncontrolled external traceroute can honestly provide.
+
+The IPv6 mtr is still REQUIRED to run and to produce parseable output;
+"mtr produced no hop lines" (the local mtr binary failing, bad target
+syntax, etc.) remains a recorded warning, not a crash — `set -e` safe.
+
+### 2. Make the controlled-ping forwarding role explicit + assert it
+
+The existing line-862 ping output is captured but never parsed — a
+non-zero `ping` exit is the only failure signal, and `ping -6` to an
+unreachable host on Linux can still exit 0 in some "Destination
+unreachable" ICMP cases. Add an explicit assertion that the controlled
+IPv6 ping actually received replies (so a broken dataplane that lets
+`ping` exit 0 without delivery still fails). New helper:
+
+```bash
+validate_reachability() {
+    local label="$1" path="$2"
+    local out
+    out="$(run_host "cat ${path}")"
+    # "0 received" / "0 packets received" => no forwarding => hard fail.
+    if grep -Eq '(^| )0( packets)? received' <<<"$out"; then
+        die "${label} reachability: target not reached (no replies): ${out}"
     fi
-    printf '%s\n' "$result" | tee -a "$summary_file"
+    if ! grep -Eq '[1-9][0-9]* (packets )?received' <<<"$out"; then
+        die "${label} reachability: could not confirm replies: ${out}"
+    fi
+    printf '%s reachability: ok\n' "$label" | tee -a "$summary_file"
 }
 ```
 
-(`SCRIPT_DIR` is already defined at the top of the script.)
+Wire it after the two pings:
 
-## Edge cases the classifier must handle
+```bash
+run_host "ping -c 2 -W 1 ${V4_TEST_TARGET} >/tmp/userspace-ping-v4.out"
+run_host "ping -6 -c 2 -W 1 ${V6_TEST_TARGET} >/tmp/userspace-ping-v6.out"
+validate_reachability "ipv4 forwarding" "/tmp/userspace-ping-v4.out"
+validate_reachability "ipv6 forwarding" "/tmp/userspace-ping-v6.out"
+```
 
-- Single hop line total, resolved, last==first, destination answered →
-  PASS (degenerate but valid: destination is one hop away).
-- Single hop line total, `???` → first-hop-unresolved FAIL (cannot
-  reach firewall). Correct: this is a real break.
-- A named-but-100%-loss intermediate hop: counts AS forwarding
-  evidence (it replied to a TTL-expired at least once → forwarding
-  happened). Only `???` (no name) means no reply. This keeps the
-  predicate robust to mtr's 1-cycle loss flakiness.
-- mtr `--report-cycles=1`: loss is 0.0% or 100.0% only; the forwarding
-  predicate keys on name-resolution (`???`), not loss%, so it is
-  robust to that.
+This upgrades the implicit ping gate into an explicit, named
+forwarding-correctness gate so the smoke's IPv6-break detection no
+longer rests on `ping`'s exit code alone.
+
+### 3. Extract + harden the mtr classifier (for the IPv4 leg)
+
+The IPv4 leg STILL hard-gates on the final hop (`1.1.1.1`, a reliable
+responder — `allow_unresolved_destination=0`). AGY finding 4 (the
+`100.0%`-vs-`100.0` truncation false-pass) is a real bug on that leg:
+a dead-but-named final hop currently slips through. Fix by parsing the
+loss column numerically instead of substring-matching `"100.0%"`.
+
+Extract the inline heredoc to `scripts/mtr_report_check.py` (importable
++ CLI) so it can be unit-tested:
+
+```python
+def hop_loss_pct(line):
+    """Parse mtr --report hop loss column. Returns float or None."""
+    # mtr --report: "  N.|-- host   LOSS%   SNT ..." ; the loss token is
+    # the first field after the host that ends in '%' OR is numeric.
+    m = re.search(r"\|--\s+(\S+)\s+([0-9]+\.[0-9]+)%?", line)
+    return float(m.group(2)) if m else None
+
+def hop_unresolved(line):
+    return "???" in line
+
+def classify_mtr_report(label, report, allow_unresolved_destination):
+    hop_lines = [l for l in report.splitlines() if re.match(r"\s*\d+\.\|--", l)]
+    if not hop_lines:
+        # Local mtr failure: warning if IPv6-style allow, else hard fail.
+        if allow_unresolved_destination:
+            return True, f"{label} mtr: warning produced no hop lines"
+        return False, f"{label} mtr produced no hop lines"
+    first, last = hop_lines[0], hop_lines[-1]
+    if hop_unresolved(first):
+        return False, f"{label} mtr first hop unresolved: {first}"
+
+    last_loss = hop_loss_pct(last)
+    last_dead = hop_unresolved(last) or (last_loss is not None and last_loss >= 100.0)
+
+    if last_dead:
+        if allow_unresolved_destination:
+            # IPv6 public trace: never fatal; controlled ping+TTL gate it.
+            return True, f"{label} mtr: warning destination unresolved: {last}"
+        return False, f"{label} mtr destination unresolved: {last}"
+    return True, f"{label} mtr: ok"
+```
+
+Note: this version DROPS v1's unsound "forwarded = resolved hop beyond
+first" predicate entirely (both reviewers killed it). IPv6 mtr is now
+purely informational; IPv4 mtr keeps its final-hop gate but with
+correct numeric loss parsing.
+
+Shell wrapper (`validate_mtr_report`) calls
+`python3 "${SCRIPT_DIR}/mtr_report_check.py" "$label" "$report" "$allow"`,
+`die`s on non-zero exit, tees the message. Contract unchanged.
+
+## Why this is not a no-op (the #1303 hard requirement)
+
+| Failure mode | Caught by |
+|---|---|
+| IPv6 dataplane forwards nothing | `validate_reachability "ipv6 forwarding"` (line 862 ping, now asserted) — HARD FAIL |
+| IPv6 hop-decrement / egress broken | `validate_ttl_probe "ipv6"` — HARD FAIL |
+| IPv6 cannot even reach firewall | `validate_reachability` (0 received) — HARD FAIL |
+| External public final hop silent | IPv6 mtr: WARNING (correct — out of our control) |
+| Healthy path, all upstream ICMPv6 rate-limited | IPv6 mtr: WARNING (correct — no longer false-fails) |
+| IPv4 final hop (1.1.1.1) dead/named-dead | IPv4 mtr: HARD FAIL (now via numeric loss, fixes AGY 4) |
+
+The genuine-break catcher moved from the unsound external-trace
+predicate to the controlled forwarding ping — under our control,
+already present, now explicitly asserted.
 
 ## Hidden invariants preserved
 
-- Shell contract: stdout = log line, exit code = pass/fail, `die` on
-  failure. Unchanged.
-- IPv4 leg semantics unchanged (allow=0 path identical outcome).
-- No new remote command, no new control-socket traffic, no hot path.
-- `set -euo pipefail` safe: the `if ! result=$(...)` form already
-  tolerates non-zero exit without tripping `-e`.
+- Shell contract of `validate_mtr_report`: stdout=log, exit=pass/fail,
+  `die` on fail, `set -euo pipefail` safe (`if ! result=$(...)` form).
+- IPv4 mtr leg stays a hard gate (stronger: numeric loss parse).
+- No new remote command beyond reusing the existing ping outputs.
+- No hot path, no Rust, no control-socket traffic.
 
 ## Risk assessment
 
 | Class | Level | Notes |
 |---|---|---|
-| Behavioral regression (smoke) | LOW | IPv4 outcome identical; IPv6 strictly stronger (adds forwarding assertion) but tolerant of external final hop. |
-| Lifetime/borrow | N/A | Shell + Python, no Rust. |
-| Performance | NONE | Off the dataplane; runs once per validation. |
-| Architectural mismatch | LOW | Pure extraction + one added predicate; no new boundary. |
-
-The one real risk: could "at least one resolved hop beyond the first"
-itself false-fail on a network where the immediate upstream router
-rate-limits ICMPv6 TTL-expired but a *later* hop answers? The predicate
-scans **all** hops beyond the first, so any single resolved hop in
-positions 2..N satisfies it. A network where literally no upstream
-router (across all positions) answers but the path still works is
-indistinguishable from a real forwarding break via traceroute alone —
-and in that case the TTL probe + LAN ping legs (separate gates) still
-provide coverage. Documented as the residual.
+| Behavioral (smoke) | LOW | IPv6 break still hard-fails via controlled ping+TTL; external trace correctly demoted to warning; IPv4 leg strengthened. |
+| False-pass | LOW | `validate_reachability` asserts replies received, closing the "ping exit 0 without delivery" gap AGY-style. |
+| False-fail | LOW | external-dependent fatal paths removed; controlled gates are under our control. |
+| Architectural | LOW | reuses existing ping gate; classifier extraction is mechanical. |
 
 ## Test plan
 
-- New `scripts/test_mtr_report_check.py` (unittest), covering:
-  1. IPv6 false-fail repro (issue's exact 9-hop report, hops 1-8
-     resolved, hop 9 `??? 100.0%`, allow=1) → PASS with warning.
-  2. IPv6 genuine break (hop 1 fw resolved, hops 2-9 all `??? 100.0%`,
-     allow=1) → FAIL with forwarding-specific message. **This is the
-     no-op guard.**
-  3. IPv6 first-hop unresolved (allow=1) → FAIL.
-  4. IPv6 healthy full path (all hops resolved incl. destination,
-     allow=1) → PASS, no warning.
-  5. IPv4 destination unresolved (allow=0) → FAIL (unchanged).
-  6. IPv4 healthy (allow=0) → PASS.
-  7. no hop lines → FAIL.
-  8. single resolved hop, destination answered → PASS.
+`scripts/test_mtr_report_check.py` (unittest):
+1. IPv6 issue repro (hops 1-8 resolved, hop 9 `??? 100.0`, allow=1)
+   → PASS with warning.
+2. IPv6 all-upstream-`???` (hop1 fw, hops 2-9 `???`, allow=1) → PASS
+   with warning (this is the case v1 wrongly hard-failed; the break is
+   now caught by the ping gate, not here).
+3. IPv6 first-hop unresolved (allow=1) → FAIL.
+4. IPv4 final hop `1.1.1.1` resolved 0% loss (allow=0) → PASS.
+5. IPv4 final hop `??? 100.0` (allow=0) → FAIL.
+6. **IPv4 final hop named but `100.0` loss, no `%`** (allow=0) → FAIL
+   (the AGY-4 truncation case — must NOT false-pass).
+7. IPv4 final hop named `0.0%` → PASS.
+8. no hop lines, allow=0 → FAIL; allow=1 → PASS (warning).
+9. `hop_loss_pct` unit cases incl. `100.0` vs `100.0%` vs `0.0%`.
+
+Plus shell-level coverage of `validate_reachability` parsing
+(0-received → fail; N-received → ok), runnable without the cluster:
+add cases to `scripts/userspace_ha_validation_matrix_test.py` or a
+small dedicated reachability-parse test by sourcing the function.
+
 - `shellcheck scripts/userspace-ha-validation.sh` clean.
 - `python3 -m py_compile` both Python files.
-- Existing `scripts/userspace_ha_validation_matrix_test.py` still
-  passes (dry-run matrix path untouched).
-- The script still runs end-to-end (cluster smoke owned by parent).
+- Existing matrix test still passes.
+- Cluster smoke: owned by PARENT (this is a smoke-script change; the
+  only real validation is running it on the loss userspace cluster).
 
 ## Out of scope
 
-- Switching `MTR_V6_TARGET` to a controlled LAN responder (issue's
-  alternative suggestion). Keeping the public target preserves
-  external-path coverage; the robust predicate makes the public
-  target's final-hop silence non-fatal. Not changing the target keeps
-  the diff minimal and the external-reachability signal intact.
-- IPv4 leg behaviour changes.
+- Changing `MTR_V6_TARGET` to a controlled responder (issue option 3):
+  unnecessary now that the public trace is non-fatal and the
+  controlled ping carries the forwarding signal. Keeping the public
+  target preserves operator-visible external path observability.
+- IPv4 mtr demotion: IPv4 keeps its final-hop gate (1.1.1.1 is a
+  reliable responder, unlike the public IPv6 target).
 - Any dataplane/Rust change.
 
-## Open questions for adversarial review
+## Open questions for adversarial review (round 2)
 
-1. Is "≥1 resolved hop beyond the first" the right forwarding proof,
-   or can a healthy network legitimately show every intermediate hop
-   `???` while still forwarding (ICMP rate-limiting on every upstream)?
-   If so, is the TTL-probe + LAN-ping coverage enough to justify it,
-   or should the forwarding signal instead be cross-checked against the
-   separate LAN IPv6 ping result?
-2. The forwarding predicate now keys on name-resolution (`???`), not
-   loss%, specifically to survive mtr 1-cycle loss flakiness. Is there
-   a case where a hop prints a resolved name without an actual
-   TTL-expired reply having arrived (e.g. mtr caching a prior name)?
-   If so the predicate could over-count forwarding. Verify mtr does
-   not print a name for a hop that produced zero replies this run.
-3. Should the genuine-break case (only firewall answers) be a hard
-   FAIL, or is that too aggressive given mtr's 1-cycle flakiness — i.e.
-   should `MTR_REPORT_CYCLES` be bumped for IPv6 so the forwarding
-   predicate is statistically stable before we make it load-bearing?
-4. Is extracting the Python to a standalone file the right call, or
-   does it fragment the validator (one more file to keep in sync)?
-   Inline-but-tested-via-subprocess is the alternative.
-5. Does the IPv4 leg need the same "forwarding past first hop"
-   assertion for symmetry, or is "final hop 1.1.1.1 resolved"
-   sufficient (it already implies forwarding)?
+1. Is the controlled `ping -6 2001:559:8585:80::200` genuinely a
+   forwarding path (host→fw→WAN target), or could the host reach it
+   without transiting the dataplane (e.g. an unexpected on-link route)?
+   Topology in CLAUDE.md says LAN host reaches `...:80::/64` only via
+   RA default → firewall; confirm no shortcut.
+2. Is `validate_reachability`'s grep robust across iputs/busybox ping
+   summary formats on the LAN host image? ("2 received" vs "2 packets
+   received" vs "received, 0% packet loss").
+3. Should the IPv6 mtr warning still be surfaced loudly enough that a
+   regression in external path observability is noticeable, or is a
+   tee'd warning sufficient?
+4. Is demoting the IPv6 mtr to pure-warning acceptable given the issue
+   says "must still catch a genuinely-broken IPv6 dataplane"? (Claim:
+   yes, because the catch moved to the controlled ping+TTL gates, which
+   are hard fails — verify the table above is complete.)
+5. Numeric loss parse: does `hop_loss_pct`'s regex correctly extract
+   the loss column on real `mtr --report` lines (host field can be a
+   name, an IPv6 addr with colons, or `(waiting for reply)`)? Provide
+   a counter-example if it mis-parses.
 
-If reviewers conclude the change is wrong-shaped or the forwarding
-predicate is unsound, PLAN-KILL / PLAN-NEEDS-MAJOR is an acceptable
-verdict.
+If reviewers conclude the IPv6-mtr demotion weakens coverage below the
+issue's bar, PLAN-NEEDS-MAJOR / PLAN-KILL is acceptable.
