@@ -113,9 +113,14 @@ func TestRenderDestRuleDetailGolden(t *testing.T) {
 }
 
 func TestRenderDestRuleDetailEmpty(t *testing.T) {
-	// nil cfg, nil Destination, and empty RuleSets all share the gRPC
-	// guard message.
-	for _, c := range []*config.Config{nil, {}} {
+	// All three branches of the gRPC guard share the same message:
+	// nil cfg, non-nil cfg with nil Destination, and non-nil
+	// Destination with zero RuleSets (the len(RuleSets)==0 branch that
+	// the CLI dispatcher's pre-guard does NOT cover — so the shared
+	// renderer must, and this case proves it).
+	withEmptyRuleSets := &config.Config{}
+	withEmptyRuleSets.Security.NAT.Destination = &config.DestinationNATConfig{RuleSets: nil}
+	for _, c := range []*config.Config{nil, {}, withEmptyRuleSets} {
 		var b strings.Builder
 		RenderDestRuleDetail(&b, c, nil, nil)
 		if got, want := b.String(), "No destination NAT rules configured\n"; got != want {
