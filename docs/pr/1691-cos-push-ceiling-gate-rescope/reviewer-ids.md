@@ -13,3 +13,12 @@ Plan v1 @ e88c653b234cd4c0e77063dc0f4f330bceee3126
 - Claude-SMR: PLAN-READY (r1 F1/F2 folded into v2; divided-ceiling floor + #1614 body line 113 named)
 
 Convergence: 3-of-3 (+ Claude-SMR seat) PLAN-READY at v2. Proceed to implement.
+
+## Code review (PR #1695, HEAD fdf5b6f98)
+- Codex: task-mpsioodc-f9r73r
+- AGY: adversarial-review-mpsioxb2-g9yivn
+- Copilot: requested (@copilot review posted)
+- Claude-SMR: MERGE-READY — impl faithfully matches plan v2; floors
+  60/40/25/25% < measured 86/63/43/41% (master passes) and > 0
+  (collapse trips); pass=all(c.pass); semantics annotation present;
+  3-condition discriminator doc-only; zero dataplane code.
