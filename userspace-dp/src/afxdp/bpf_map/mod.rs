@@ -868,7 +868,7 @@ pub(super) static SESSION_PUBLISH_VERIFY_OK: AtomicU64 = AtomicU64::new(0);
 pub(super) static SESSION_PUBLISH_VERIFY_FAIL: AtomicU64 = AtomicU64::new(0);
 pub(super) static SESSION_CREATIONS_LOGGED: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "debug-log")]
-static ICMPV6_EMBED_LOGGED: AtomicU32 = AtomicU32::new(0);
+pub(super) static ICMPV6_EMBED_LOGGED: AtomicU32 = AtomicU32::new(0);
 
 // The pinned map path keeps the historical "fallback" spelling for
 // mixed-version shim compatibility. Operator-facing names use
