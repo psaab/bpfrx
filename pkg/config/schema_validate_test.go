@@ -556,6 +556,17 @@ func TestSchemaValidate_ExtraTokenContainerStillValidatesNestedLeaves(t *testing
 	if err := schemaCheck(t, `class-of-service extra { schedulers be transmit-rate 1g; }`); err != nil {
 		t.Fatalf("expected extra-token container with valid leaf to pass, got %v", err)
 	}
+	// Codex r6: the same bypass via the missing-arg (instance-name nested)
+	// path — `schedulers { be extra { transmit-rate asd; } }` parses to a
+	// node Keys=["be","extra"] (name + extra) with the typed leaf nested.
+	// The compiler names the scheduler `be` and still walks the leaf, so the
+	// gate must too.
+	if err := schemaCheck(t, `class-of-service { schedulers { be extra { transmit-rate asd; } } }`); err == nil {
+		t.Fatal("expected rejection for instance-extra-token nested garbage, got nil")
+	}
+	if err := schemaCheck(t, `class-of-service { schedulers { be extra { transmit-rate 1g; } } }`); err != nil {
+		t.Fatalf("expected instance-extra-token with valid leaf to pass, got %v", err)
+	}
 }
 
 // TestSchemaValidate_PackedSiblingSplitModifier reproduces Codex r3 minor:

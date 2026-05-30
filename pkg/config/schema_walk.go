@@ -217,7 +217,7 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, cfg *Config, 
 		groups := map[string][]*Node{}
 		gp := map[string][]string{}
 		for _, c := range node.Children {
-			collectInstanceContents(c, missingArgs, newPath, groups, gp)
+			collectInstanceContents(c, childSchema, missingArgs, newPath, groups, gp)
 		}
 		for id, contents := range groups {
 			if err := walkSchemaChildren(contents, childSchema, gp[id], cfg); err != nil {
@@ -306,7 +306,7 @@ func validateModifierChild(node *Node, leafSchema *schemaNode, leafPath []string
 // nodes under one instance (e.g.
 // `schedulers { be transmit-rate 1g; be transmit-rate exact; }`) mutual
 // visibility for the typed leaf's split-modifier rule (Codex r3 minor).
-func collectInstanceContents(node *Node, remaining int, path []string, groups map[string][]*Node, gp map[string][]string) {
+func collectInstanceContents(node *Node, containerSchema *schemaNode, remaining int, path []string, groups map[string][]*Node, gp map[string][]string) {
 	if node == nil || len(node.Keys) == 0 {
 		return
 	}
@@ -319,15 +319,27 @@ func collectInstanceContents(node *Node, remaining int, path []string, groups ma
 		// This node supplied only part of the name; keep peeling from its
 		// children (a value-less name level continues nesting).
 		for _, c := range node.Children {
-			collectInstanceContents(c, stillMissing, newPath, groups, gp)
+			collectInstanceContents(c, containerSchema, stillMissing, newPath, groups, gp)
 		}
 		return
 	}
 	id := strings.Join(newPath, "\x00")
 	gp[id] = newPath
-	// Leftover Keys beyond the names form a packed leaf for this instance.
+	// Leftover Keys beyond the names. When the leftover's first token is a
+	// KNOWN child of the container schema, it is a packed leaf (and its block
+	// children are that leaf's modifiers) — keep them bundled. When the token
+	// is UNKNOWN (e.g. `schedulers { be extra { transmit-rate asd; } }`), the
+	// `extra` token is an opt-in skip, but the node's block children are
+	// nested config the compiler still reaches (it names the scheduler `be`
+	// and walks the children), so they MUST be walked at the container schema
+	// rather than dropped under the unknown token (Codex r6).
 	if leftover := node.Keys[consume:]; len(leftover) > 0 {
-		groups[id] = append(groups[id], &Node{Keys: leftover, IsLeaf: node.IsLeaf, Children: node.Children})
+		if resolveSchemaChild(containerSchema, leftover[0]) != nil {
+			groups[id] = append(groups[id], &Node{Keys: leftover, IsLeaf: node.IsLeaf, Children: node.Children})
+			return
+		}
+		// Unknown leftover token: skip it, but still validate nested config.
+		groups[id] = append(groups[id], node.Children...)
 		return
 	}
 	// Otherwise the instance's block children are its content.
