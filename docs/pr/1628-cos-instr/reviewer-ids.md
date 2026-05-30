@@ -21,6 +21,21 @@ task-id here so a continuation can fetch results by id after session-state loss.
 7. plain u64 correct (build_worker_cos_statuses runs ON the worker thread, published via ArcSwap — no live cross-thread read); fix the rationale wording.
 8. phase1_budget_exhausted only fires on first queue crossing boundary; larger queues after it silent (Codex #3).
 
+## Plan review (round 2 — v2 @ 9aa961aac)
+
+| Reviewer | Task ID | Verdict | Notes |
+|---|---|---|---|
+| Codex | task-mpru36mt-9tyfq5 | PLAN-NEEDS-MAJOR | 2 major (overclaim) + 1 minor (borrow); redesign validated |
+| AGY | adversarial-review-mpru3d7g-lmqxlg | PLAN-NEEDS-MAJOR | 4 findings, convergent w/ Codex |
+| Claude SMR | (in-conversation) | PLAN-NEEDS-MAJOR | concur; counters correct, framing overclaims |
+
+### r2 convergent findings (all addressed in plan v3)
+- F1 borrow shape (Codex-minor + AGY-major): count_waterfill_event(&mut root,..) won't compile while queue=&mut root.queues[idx] is live. → inline queue.telemetry.waterfill_counters.X += 1; root counters via disjoint field borrow.
+- F2 summing masks single-worker lock-in (both): summed waterfill_epochs across 6 workers drowns one frozen worker. → add coordinator MIN-aggregation waterfill_min_epochs_per_worker (follows the existing .max() pattern at coordinator/mod.rs:927).
+- F3 signature not unique (both): healthy asymmetric/idle load → same phase2>0/phase1=0/epochs-frozen footprint. → reframe as evidence COMBINED with queued_bytes>0 + *_starvation_parks; soften test assertions.
+- F4 eligible_visits misses token-parked-but-backlogged queues (AGY): parked → !runnable → skipped at gate → low eligible_visits reads as "idle". → document eligible_visits + existing root/queue_token_starvation_parks pairing distinguishes starved-park from genuinely-idle; do NOT add a counter (parks already exist).
+- Confirmed OK by both: dedicated struct placement, monotonic redesign, eligible_visits write location (after eligibility/head, before token gate), cutting skipped_not_backlogged.
+
 ## Code review (round 1)
 
 | Reviewer | Task ID | Verdict | Notes |

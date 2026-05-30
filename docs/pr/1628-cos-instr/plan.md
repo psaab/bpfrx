@@ -1,8 +1,49 @@
 # #1628 — Empirical per-class waterfill trace counters for the CoS scheduler
 
-**Status:** DRAFT v2 — addresses Codex `task-mprtl981-wg7p3w` + AGY
-`adversarial-review-mprtlgg5-txzcuz` round-1 PLAN-NEEDS-MAJOR (both convergent).
-Pending re-review.
+**Status:** DRAFT v3 — addresses round-2 PLAN-NEEDS-MAJOR (Codex
+`task-mpru36mt-9tyfq5` + AGY `adversarial-review-mpru3d7g-lmqxlg`, convergent).
+v1 cleared the structural redesign; v2 cleared the counter set; v3 fixes the
+helper borrow shape, the single-worker-masking aggregation, and the
+overclaimed-fingerprint framing. Pending re-review.
+
+### v2→v3 reviewer-driven changes (round 2)
+
+Both r2 reviewers confirmed the v2 counter set, struct placement, monotonic
+redesign, `eligible_visits` write location, and the `skipped_not_backlogged`
+cut. The remaining findings were framing/API-shape, not counter-set:
+
+- **F1 borrow shape (Codex minor + AGY major):** a
+  `count_waterfill_event(&mut root, queue_idx, ...)` helper will NOT compile at
+  the Phase-1/Phase-2 sites because `let queue = &mut root.queues[queue_idx]`
+  is already live there (unlike `count_park_reason`, which is only ever called
+  at the end of an iteration after `queue` is dropped). → **Per-queue counters
+  are incremented INLINE via the live `queue` borrow**
+  (`queue.telemetry.waterfill_counters.X = ...wrapping_add(1)`); the two
+  per-interface root counters are bumped via disjoint `root` field borrows
+  (also inline). No helper for the queue events.
+- **F2 cross-worker summing masks a single frozen worker (both):** if one
+  worker locks into Phase 2, its `waterfill_epochs` freezes at a low value, but
+  summing across 6 workers lets the 5 healthy cores' climbing counters drown
+  it. → **Add a coordinator-level MIN aggregation
+  `waterfill_min_epochs_per_worker`** (follows the existing `.max()` pattern at
+  `coordinator/mod.rs:927`). A single stalled core drops the MIN to its frozen
+  value even while the SUM climbs — the stalled-core flag the operator needs.
+- **F3 the Phase-2 signature is NOT unique (both):** a healthy interface under
+  asymmetric/idle load (small classes idle, a large class above the Phase-1
+  cutoff) naturally produces `phase2>0, phase1=0, epochs frozen`. →
+  **Reframed throughout: these counters are EVIDENCE to be combined with the
+  existing per-queue depth/park telemetry, not a standalone fingerprint.** The
+  starving-lock-in case is distinguished from healthy-idle by pairing with
+  `queued_bytes > 0` AND `root_token_starvation_parks` /
+  `queue_token_starvation_parks` on the same row (both already on
+  `CoSQueueStatus`). Test assertions softened accordingly.
+- **F4 `eligible_visits` undercounts token-parked-but-backlogged queues
+  (AGY):** a backlogged queue parked on token starvation is `!runnable` →
+  skipped at the eligibility gate (`mod.rs:818`) → low `eligible_visits`,
+  which alone reads as "idle". → **Documented the pairing:** low
+  `eligible_visits` + high `*_starvation_parks` = backlogged-but-starved; low
+  `eligible_visits` + low parks = genuinely idle. No new counter — the park
+  counters already capture this (they fire at the park sites `mod.rs:855/878`).
 
 ## 1. Issue framing
 
@@ -125,21 +166,34 @@ pub(in crate::afxdp) struct CoSQueueWaterfillCounters {
     /// Zero on the Proportional legacy-RR path (no phases).
     pub(in crate::afxdp) phase1_admissions: u64,
     /// #1628: times this queue was admitted via the Phase-2 (descending
-    /// residual) walk. #1630 Phase-2-LOCK-IN fingerprint: an
-    /// undershooting class with phase2_admissions climbing while
-    /// phase1_admissions stays flat is locked into best-effort residual
-    /// service — the exact failure #1625/#1630 named. (See §10 Q1 for
-    /// the worked trace.)
+    /// residual) walk. EVIDENCE for #1630 Phase-2 lock-in, NOT a unique
+    /// fingerprint: `phase2_admissions` climbing while `phase1_admissions`
+    /// stays flat ALSO occurs on a healthy guarantee-rate interface for a
+    /// class above the Phase-1 cutoff under asymmetric load (r2 finding).
+    /// The starving-lock-in case is identified only by COMBINING this with
+    /// `queued_bytes > 0` AND `root_token_starvation_parks` /
+    /// `queue_token_starvation_parks` on the same row — a class that has
+    /// backlog AND is being parked AND is only ever Phase-2-admitted is
+    /// the locked-in case; an idle small class with no backlog and no
+    /// parks is healthy residual service. (See §10 Q1.)
     pub(in crate::afxdp) phase2_admissions: u64,
     /// #1628: times the waterfill selector VISITED this queue and found
     /// it eligible (nonempty + runnable + guarantee + exact) — i.e. the
-    /// queue's owner worker actually had its backlog this pass. Pair
-    /// with phase1+phase2 admissions to see how often a visit converted
-    /// to service vs lost the token/budget gate. A class whose owner
-    /// worker never sees its backlog (the fragmentation root cause)
-    /// shows near-zero eligible_visits relative to its configured
-    /// presence — the per-OWNER fragmentation signal that survives
-    /// cross-worker aggregation because the queue has ONE owner.
+    /// queue's owner worker actually had its backlog this pass. Counted
+    /// AFTER the eligibility gate (nonempty+runnable+guarantee+exact) and
+    /// head-present check, BEFORE the root/queue token gate — so a queue
+    /// that is eligible but token-starved IS counted as a visit.
+    ///
+    /// Interpretation requires pairing (r2 finding F4): a backlogged queue
+    /// PARKED on token starvation is marked `!runnable` and skipped at the
+    /// eligibility gate, so it shows LOW `eligible_visits`. Therefore:
+    ///   * low eligible_visits + high `*_starvation_parks` (same row) =
+    ///     backlogged but starved/parked — NOT idle.
+    ///   * low eligible_visits + low parks + zero queued_bytes =
+    ///     genuinely idle (no load funneled to this owner).
+    /// The park counters that disambiguate already exist on CoSQueueStatus
+    /// (`root_token_starvation_parks` / `queue_token_starvation_parks`),
+    /// so no new counter is added for the parked case.
     pub(in crate::afxdp) eligible_visits: u64,
 }
 ```
@@ -150,9 +204,14 @@ Plain `u64`, owner-worker single-writer, monotonic (F1, F8).
 
 ```rust
 /// #1628: completed waterfill epochs (Phase-1 budget refills) on this
-/// interface (this worker's view). Normalizer for the per-queue
-/// admission counters ("admissions per epoch"). Bumped at the lazy
-/// refill site.
+/// interface, THIS WORKER'S view. Bumped at the lazy refill site.
+///
+/// NOT a per-queue normalizer (r2 finding): per-queue `phase*_admissions`
+/// are owner-local, but the summed cross-worker `waterfill_epochs`
+/// includes other workers' epochs, so the ratio would be diluted by
+/// worker count. Used as a cluster event counter (SUM) PLUS the
+/// per-worker MIN below — a single worker locked into Phase 2 freezes
+/// its own `waterfill_epochs`, which the SUM hides but the MIN exposes.
 pub(in crate::afxdp) waterfill_epochs: u64,
 /// #1628: times Phase 1 broke into Phase 2 because the next ascending
 /// queue's rate-scaled cost exceeded the remaining Phase-1 budget
@@ -164,12 +223,18 @@ pub(in crate::afxdp) waterfill_epochs: u64,
 pub(in crate::afxdp) waterfill_phase1_budget_breaks: u64,
 ```
 
-These sum across workers in `aggregate_cos_statuses_across_workers` exactly
-like `timer_level0_sleepers` (`coordinator/mod.rs:932`). Summing IS the right
-semantic here (unlike the cut considered/honored fields): epochs and
-budget-breaks are events, and the operator wants the cluster-wide event rate;
-the per-OWNER fragmentation signal lives on the per-queue `eligible_visits`
-(F3 — a queue has one owner, so its row already reflects that single worker).
+These SUM across workers in `aggregate_cos_statuses_across_workers` like
+`timer_level0_sleepers` (`coordinator/mod.rs:932`) for the cluster event rate.
+**Additionally**, the coordinator computes a MIN aggregation
+`waterfill_min_epochs_per_worker` (r2 finding F2) using the existing `.max()`
+pattern (`coordinator/mod.rs:927`) with `.min()` instead, seeded from the first
+worker's `waterfill_epochs` so a single worker frozen in Phase-2 lock-in (its
+own `waterfill_epochs` not advancing) drops the MIN even while the SUM climbs.
+This is the stalled-core flag; it lives only on the aggregated
+`CoSInterfaceStatus`, not the per-worker runtime.
+
+The per-OWNER fragmentation signal lives on the per-queue `eligible_visits`
+(a queue has one owner, so its row reflects that single worker — F3).
 
 ### 4c. Write sites (all inside `select_exact_cos_guarantee_queue_waterfill`)
 
@@ -190,10 +255,30 @@ Verified against the real control flow (Codex + AGY both confirmed):
 6. **Phase-2 admission return** (`mod.rs:1015`, before `return Some(...)`):
    bump the chosen queue's `phase2_admissions`.
 
-A single helper `count_waterfill_event(root, queue_idx, WaterfillEvent)`
-(mirroring `count_park_reason`, `tx_completion.rs:51`) centralizes the queue
-counter writes; the two root counters are bumped inline (they don't take a
-queue_idx). Every site already holds the needed `&mut`.
+**All increments are INLINE; no helper that takes `&mut root` (r2 finding
+F1).** A `count_waterfill_event(&mut root, queue_idx, ...)` helper would NOT
+compile at the Phase-1/Phase-2 sites: unlike `count_park_reason` (called only
+at end-of-iteration, after `queue`/`head` are dropped), these sites have
+`let queue = &mut root.queues[queue_idx]` and `let head = cos_queue_front(queue)`
+live through the `return`/`break`, so passing the whole `&mut root` to a
+function (which could touch `root.queues`) overlaps the existing borrow.
+
+The increments are therefore:
+
+- **Per-queue counters** (`eligible_visits`, `phase1_admissions`,
+  `phase2_admissions`): direct on the live borrow,
+  `queue.telemetry.waterfill_counters.<field> =
+  queue.telemetry.waterfill_counters.<field>.wrapping_add(1);`.
+- **Root counters** (`waterfill_epochs`, `waterfill_phase1_budget_breaks`):
+  direct `root.<field> = root.<field>.wrapping_add(1);`. This is the SAME
+  disjoint-field pattern the existing selector already uses — `mod.rs:913`
+  writes `root.waterfill_pass1_remaining_bytes` and `:919` writes
+  `root.exact_guarantee_rr` while `queue`/`head` are still live and compile
+  today. `root.waterfill_phase1_budget_breaks` (added at the `:906` branch,
+  before the `break`) and `root.waterfill_epochs` (added at the `:793` pre-loop
+  refill, where no `queue` is borrowed yet) are provably the same shape.
+
+No new borrow is introduced at any site.
 
 ### 4d. Snapshot aggregation
 
@@ -213,19 +298,24 @@ queue_idx). Every site already holds the needed `&mut`.
 
 - Rust `protocol/cos.rs`: 3 new `u64` on `CoSQueueStatus`
   (`waterfill_phase1_admissions`, `waterfill_phase2_admissions`,
-  `waterfill_eligible_visits`), 2 new `u64` on `CoSInterfaceStatus`
-  (`waterfill_epochs`, `waterfill_phase1_budget_breaks`). Each
-  `#[serde(rename="...", default)]`.
+  `waterfill_eligible_visits`), 3 new `u64` on `CoSInterfaceStatus`
+  (`waterfill_epochs`, `waterfill_phase1_budget_breaks`,
+  `waterfill_min_epochs_per_worker`). Each `#[serde(rename="...", default)]`.
+  `waterfill_min_epochs_per_worker` is only ever set by the coordinator MIN
+  aggregation (per-worker `CoSInterfaceStatus` leaves it 0; the coordinator
+  fills it from the worker `waterfill_epochs` values).
 - Go `pkg/dataplane/userspace/protocol.go`: matching fields, JSON tags
   byte-for-byte.
 
 ### 4f. Prometheus + CLI
 
-- 5 new Prometheus counter descriptors (`_total`) in
-  `metrics_descriptors.go` + emit in `metrics_userspace.go`.
+- 5 new Prometheus counter descriptors (`_total`) for the per-queue +
+  per-interface monotonic counters, plus 1 gauge for
+  `waterfill_min_epochs_per_worker`, in `metrics_descriptors.go` + emit in
+  `metrics_userspace.go`.
 - `cosfmt.go`: surface the 3 per-queue waterfill counters in the per-queue
   detail block, gated `!= 0` like the existing `drainGuaranteeSentBytes`
-  block; the 2 per-interface counters in the interface header block.
+  block; the 3 per-interface counters in the interface header block.
 
 ## 5. Public API preservation
 
@@ -268,9 +358,19 @@ additive-only (all `default`), so old↔new deserialize cleanly both directions.
   root `waterfill_phase1_budget_breaks == 1`, chosen queue
   `phase2_admissions == 1`; (c) epoch refill → `waterfill_epochs` advances;
   (d) Proportional mode → all waterfill counters stay 0 (counter-factual: a
-  wrong write site would light them up on the RR path). Assert the
-  Phase-2-lock-in fingerprint directly: a fixture where the small class is
-  only ever Phase-2-admitted yields `phase2 > 0 && phase1 == 0` on its row.
+  wrong write site would light them up on the RR path); (e)
+  `eligible_visits` counts a token-starved-but-backlogged queue on the visit
+  where it is still `runnable` (before the park marks it `!runnable`).
+- The tests assert the COUNTERS increment at the right sites, NOT that any one
+  counter is a unique fingerprint (r2 F3): the `phase2>0 && phase1==0` shape is
+  asserted to occur, but the test docstring records that this shape is also
+  healthy-residual for above-cutoff classes — the distinguishing signal is the
+  paired `queued_bytes`/`*_starvation_parks`, which the unit test sets up
+  explicitly in the lock-in fixture and leaves zero in the healthy-idle fixture.
+- Coordinator test: `aggregate_cos_statuses_across_workers` with one worker
+  reporting frozen `waterfill_epochs` and others climbing →
+  `waterfill_min_epochs_per_worker` equals the frozen value while the summed
+  `waterfill_epochs` climbs (the F2 single-worker-mask regression guard).
 - 5/5 flake loop on the new named tests.
 - Go: `protocol_test.go` serde→Go round-trip parity, `cosfmt_test.go` render,
   `metrics_test.go` descriptor wiring. `go test ./...` 30 packages.
@@ -293,32 +393,30 @@ additive-only (all `default`), so old↔new deserialize cleanly both directions.
   body's broad list — the verified consumer is the worker-local waterfill
   selector, not v8 epoch rotation. Deferred.
 
-## 10. Open questions for adversarial re-review
+## 10. Open questions for adversarial re-review (v3)
 
-1. **Worked trace for the Phase-2-lock-in fingerprint:** under the #1630
-   failure, `waterfill_pass1_remaining_bytes` never reaches 0 (Phase-2 returns
-   don't decrement it), so the refill at `mod.rs:793` rarely fires → few
-   `waterfill_epochs`, and the small class is admitted only via Phase 2 →
-   `phase2_admissions` climbs, `phase1_admissions` flat. Does that signature
-   uniquely identify Phase-2 lock-in, or can a healthy guarantee-rate
-   interface produce the same signature transiently?
-2. **Is `eligible_visits` the right fragmentation signal now that it's
-   per-queue (single owner)?** A class whose owner worker rarely sees its
-   backlog shows low `eligible_visits` relative to its `phase*_admissions` on
-   other workers — but with cross-binding redirect the queue has ONE owner, so
-   is there any aggregation path that still blurs this?
-3. **Are the 2 per-interface counters (`waterfill_epochs`,
-   `phase1_budget_breaks`) safe to SUM across workers** (F3 said considered/
-   honored were NOT)? My claim: epochs/breaks are per-worker *events* and the
-   cluster-wide rate is what the operator wants; they are not a
-   "considered set size" that masks fragmentation. Challenge this.
-4. **Does cutting `skipped_not_backlogged` lose a needed signal**, or do
-   `eligible_visits` + `owner_worker_id` + `queued_bytes` fully cover the
-   "no load vs fragmented load" distinction?
-5. **Is the dedicated `CoSQueueWaterfillCounters` struct the right home**, or
-   should these live on `CoSQueueOwnerProfile` (the other per-queue telemetry
-   struct) — noting that one is `AtomicU64` and these are plain `u64`?
-6. **Write-site #2/#5 (`eligible_visits` after the eligibility gate):** is
-   counting at "passed eligibility AND has a head" the right definition of
-   "visited eligibly", or should it count at the gate entry (before the token
-   check) so token-starvation parks are still counted as visits?
+1. **Is the "combine with `queued_bytes` + `*_starvation_parks`" interpretation
+   contract sufficient** to separate starving Phase-2 lock-in from healthy
+   above-cutoff residual service (r2 F3), or is there a residual ambiguity even
+   with the pairing — e.g. a class that is genuinely above the Phase-1 cutoff
+   AND backlogged AND parked (legitimately rate-limited) reads identical to a
+   misconfigured lock-in? If so, is that a counter problem or a fundamentally
+   operator-judgment call the docs should state plainly?
+2. **Does `waterfill_min_epochs_per_worker` (MIN aggregation) actually flag a
+   single frozen worker** given that a worker which is simply *idle* (no
+   backlog at all) also won't advance `waterfill_epochs`? I.e. does MIN-epochs
+   conflate "locked-in worker" with "idle worker"? If yes, what additional
+   pairing (per-worker SUM of `phase2_admissions`?) resolves it, and is that in
+   scope?
+3. **Borrow shape re-verify:** does the inline `root.waterfill_phase1_budget_breaks`
+   write at `mod.rs:906` (with `queue`/`head` live) actually compile, given the
+   existing `root.waterfill_pass1_remaining_bytes` write at `:913` proves the
+   disjoint-field pattern works? Confirm against the real NLL behavior, not the
+   plan's claim.
+4. **Is the MIN seed correct** — seeding from the first worker's
+   `waterfill_epochs` vs `u64::MAX`-then-min — to avoid a spurious 0 when a
+   worker simply hasn't reported yet?
+5. **Scope:** is deferring the v8 fair-share counter (F2 from r1) still the
+   right call, or does the #1630 fix author need it co-landed to avoid a second
+   instrumentation PR? (The deferral was endorsed by both r1 reviewers; re-test
+   it against the v3 framing.)
