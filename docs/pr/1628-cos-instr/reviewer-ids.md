@@ -113,3 +113,28 @@ Implemented AGY's structural fix: coordinator preserves u64::MAX for unseeded if
 - Claude SMR: MERGE-READY — verified borrow correctness, counter sites, sentinel handling, wire parity against whole function bodies.
 
 ## FINAL: 4-of-4 clean at HEAD ec8790b43. AWAITING-PARENT-SMOKE-1628.
+
+## REBASE onto origin/master (post #1638 + #1303)
+
+PR #1680 was branched pre-#1638 so it still carried the dead parallel-prefix
+scaffolding (build_rule_side_arc) #1638 removed — GitHub reported CONFLICTING.
+Rebased onto origin/master (d68e4dfe1). Only conflict was _Log.md (append-only;
+kept both #1303 + #1628 entries). policy.rs/policy_tests.rs did NOT conflict —
+my branch never edited them, so master's #1638 removal applied cleanly.
+
+Post-rebase verification:
+- New HEAD f0c31f97c; 0 commits behind origin/master.
+- build_rule_side_arc refs on branch: 0 (scaffolding gone — matches master).
+- All 8 reviewed CoS/metrics files byte-identical (same blob hash) pre/post
+  rebase → the 4-of-4 MERGE-READY verdicts carry forward unchanged.
+- diff vs master = the same 24 CoS+docs files; no policy.rs.
+- cargo test: 1598 lib + 46 + 8 + 16 + 1 = all 0 failed (1598 down from 1623
+  is exactly the policy-scaffolding tests #1638 removed); 13 waterfill tests
+  green; wire golden fixture valid; 5/5 flake.
+- go build ./... clean; gofmt clean; pkg/api + pkg/dataplane/userspace pass.
+- Force-pushed f0c31f97c (verified: remote ls-remote == local HEAD; gh
+  headRefOid == f0c31f97c; gh mergeable == MERGEABLE / CLEAN).
+
+Verdicts still valid at rebased HEAD f0c31f97c (clean rebase, reviewed code
+byte-identical): Codex MERGE-READY (task-mprwof25-wngxrt), AGY MERGE-READY
+(adversarial-review-mprwix7x-06y5gh), Copilot 0-findings, Claude SMR MERGE-READY.

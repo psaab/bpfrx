@@ -4452,3 +4452,17 @@ top.
   pkg/api/{metrics.go,metrics_descriptors.go,metrics_userspace.go,
   metrics_test.go}, docs/cos-validation-notes.md,
   docs/pr/1628-cos-instr/{plan.md,reviewer-ids.md}, _Log.md
+
+- **Timestamp**: 2026-05-29
+- **Action**: #1628 — rebased PR #1680 onto origin/master (post #1638 dead
+  parallel-prefix scaffolding removal + #1303 smoke change) to clear a
+  CONFLICTING/DIRTY state caused by branching pre-#1638. Only _Log.md
+  conflicted (append-only; kept both entries). policy.rs/policy_tests.rs did
+  not conflict — the branch never edited them, so #1638's removal applied
+  cleanly and build_rule_side_arc is now 0 refs on the branch (was 6). All 8
+  reviewed CoS/metrics files byte-identical pre/post rebase. Retested green
+  (1598 lib + 46/8/16/1, 13 waterfill tests, wire fixture, 5/5 flake; go
+  build + gofmt + pkg tests). Force-pushed f0c31f97c with verification (gh
+  mergeable == MERGEABLE/CLEAN).
+- **File(s)**: _Log.md, docs/pr/1628-cos-instr/reviewer-ids.md (rebase only;
+  no code change vs the reviewed HEAD)
