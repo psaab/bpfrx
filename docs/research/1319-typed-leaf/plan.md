@@ -1,10 +1,11 @@
 # #1319 — Typed leaf-value schema: research plan (post Phase 1/2)
 
-**Status:** PLAN v2 (2026-05-29) — research only, no code. v2 folds in
+**Status:** PLAN v2.1 (2026-05-29) — research only, no code. v2 folds in
 the round-1 reviewer findings: Codex PLAN-NEEDS-MAJOR (5) + Claude SMR
 PLAN-NEEDS-MAJOR (D1-D5) + AGY PLAN-READY. Five corrections below
 (import-cycle, fields-only/no-children, drop `temporal`, walker contract,
-frontend-boundary tests). Option A stands.
+frontend-boundary tests). v2.1 adds the `multi && children==nil`
+value-tail/range walker row (Codex r2). Option A stands.
 **Branch:** `research/1319-typed-leaf`
 **Scope:** decide the architecture for continuing the typed-leaf rollout
 after PR #1320 (Phase 1 + schedulers Phase 2, MERGED) and the
@@ -250,7 +251,8 @@ move**: relocate `ValueType` + its constants + `Placeholder()` from
    | `args:N` named instance | consume keyword + N tokens from `Keys` (flat) or 1 key + N from `Keys[1:]` / children (hier); recurse |
    | `compoundKey` | consume the following key as part of this node's key, then resolve the sub-child |
    | `midKeyword`/`midKeywordAt` | the fixed keyword (`to-zone`) sits at arg position `midKeywordAt`; skip it when extracting values |
-   | `multi` | leaf may repeat; validate each occurrence; do not treat as replace |
+   | `multi` (with children) | leaf may repeat; validate each occurrence; do not treat as replace |
+   | `multi && children==nil` value-tail / range | mirror `SetPath`'s rule (`ast_edit.go:237-244`): if the token after the value is a known sibling keyword the leaf ends and siblings continue; otherwise the remaining tokens are a value-tail under THIS leaf (e.g. `destination-port 20000 to 20003` / compiler shape `destination-port 20000 { to 30000; }`, `compiler_nat.go:682`). For a typed such leaf, validate each value token in the tail per its `valueType` (a range tail `<lo> to <hi>` validates `<lo>` and `<hi>`, treating `to` as the fixed mid-token); do NOT flag the tail as an "unknown modifier" |
    | `wildcard` | instance-name slot; descend into wildcard schema |
    | typed leaf (`valueType!=ValueAny`) | first non-modifier token is THE value → run `validator`; remaining tokens must match child keywords (e.g. `exact`) |
    | modifier-only line | `transmit-rate exact` with no rate still fails (the existing `schedulerHasTypedTransmitRate` gate) |
