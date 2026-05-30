@@ -40,9 +40,9 @@ research/1319-typed-leaf @ c0f6e5a79 (research rounds below).
 - Codex r8: task-mprzo9hr-m6e3gt/019e77a3 — **MERGE-READY**. Verified the compiler-faithful premise with a probe transcript (compileClassOfService reads leaves only from inst.node.Children; packed Keys ignored); confirmed every compiler-reachable garbage rejects (incl. r7 presence-token), packed shorthand genuinely compiler-discarded, walker has no dead code + terminates, full + focused suites green.
 - Copilot r5 (commit 1035e4aae @ 06:51:10): COMMENTED, 0 open inline — **clean on final HEAD**.
 - Claude SMR r8: **MERGE-READY** — drove the compiler-faithful rewrite; verified compileClassOfService+namedInstances read only instance children; probed every AST shape (flat-set/canonical/packed/extra-token/presence-token) against both SchemaValidate and CompileConfig; symptom-1 frontend tests pass; SetPath golden + two-SSOT docs intact.
-- AGY final (HEAD 1035e4aae): adversarial-review-mprzyscf-xrggdm — (pending; r2 was MERGE-READY).
+- AGY final (HEAD 1035e4aae): adversarial-review-mprzyscf-xrggdm — **MERGE-READY** (verified import-cycle move, frontend completions, SetPath golden, cmdtree overlay retirement, compiler-faithful walker).
 
-## Gate: Codex MERGE-READY + Copilot clean + Claude SMR MERGE-READY on final HEAD 1035e4aae; AGY final pending.
+## Gate: 4-of-4 MERGE-READY on final HEAD 1035e4aae — Codex r8 + Copilot (0 inline) + Claude SMR + AGY. CLI/config only (no cluster smoke). Symptom-1 fixed: `set class-of-service schedulers x transmit-rate ?` => `<rate> 100k 10m 1g 10g`.
 
 ---
 
