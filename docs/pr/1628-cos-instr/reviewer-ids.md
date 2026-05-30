@@ -84,3 +84,20 @@ At eligible-visit sites `head` (&queue) is live at the return's `match head`, so
 | AGY | adversarial-review-mprw7n4e-hm2lb9 | (pending) | code r2 |
 | Copilot | (re-requested) | (pending) | code r2 |
 | Claude SMR | (in-conversation) | (pending) | code r2 |
+
+### code r2 verdicts (HEAD 9a0637fa2)
+- Codex task-mprw7i7m-6l2dej: MERGE-NEEDS-MINOR — runtime MIN fix verified correct; only the doc text "0 = no candidate" now lies (zero-epoch-lockin test proves a real backlogged 0-epoch lock-in also exports 0).
+- AGY adversarial-review-mprw7n4e-hm2lb9: MERGE-NEEDS-MINOR — same sentinel collision; recommended preserving u64::MAX through aggregation + suppressing the MAX gauge in Prometheus (the chosen fix).
+- Copilot: re-requested, pending.
+
+### code r2 fix → r3 (HEAD e24cf5d0c)
+Implemented AGY's structural fix: coordinator preserves u64::MAX for unseeded ifindex (not or_default 0); Prometheus suppresses the MAX gauge (idle = no series, so any emitted value incl 0 is a real lock-in, alertable); CLI renders MAX as "none"; doc text corrected on all 4 surfaces. Tests: aggregate MIN stays MAX when no candidate + Go suppress-MAX/emit-0 test.
+
+## Code review (round 3 — HEAD e24cf5d0c)
+
+| Reviewer | Task ID | Verdict | Notes |
+|---|---|---|---|
+| Codex | task-mprwisuu-49xtfy | (pending) | code r3 confirm sentinel fix |
+| AGY | adversarial-review-mprwix7x-06y5gh | (pending) | code r3 |
+| Copilot | (re-requested) | (pending) | code r3 |
+| Claude SMR | (in-conversation) | (pending) | code r3 |
