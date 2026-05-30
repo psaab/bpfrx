@@ -1,0 +1,26 @@
+# #1687 reviewer task IDs
+
+Plan commit: a3503af65b299a97a500a24bda57c5f2ec46660d
+Branch: refactor/1687-shared-presentation
+
+## Plan review round 1
+- Codex: task-mpsghlr7-3p2gg5
+- AGY: adversarial-review-mpsgi8ie-81h4g8
+- Claude-SMR: in-conversation (author thesis = lean PLAN-KILL, steelmanned data-model seam)
+- Outcome: Codex PLAN-NEEDS-MAJOR (NAT seam exists), AGY PLAN-KILL (misread dispatcher vs leaf). Resolved → re-scope.
+
+## Plan review round 2 (v2 = bounded natshow seam, commit ba2fbcb58)
+- Codex: task-mpsgrdwm-mvt55w
+- AGY: adversarial-review-mpsgrpyp-6vmsdo
+- Claude-SMR: in-conversation (verified all six NAT leaf bodies byte-identical; Reader iface exact; nat64 excluded)
+
+## Code review round 1 (PR #1689, head ed21e665d, base 7988d4c25)
+- Codex: task-mpshe1up-ce5u4p
+- AGY: adversarial-review-mpsheamr-k357o5
+- Copilot: requested via @copilot review
+- Claude-SMR: in-conversation (hostile self-review during implementation)
+
+## Code review round 2 (PR #1689 head b76b04608)
+- Codex: task-mpshohv1-hkpnb4
+- AGY: adversarial-review-mpshop4o-7u3vhh
+- Round-1 verdicts: Codex MERGE-NEEDS-MINOR, AGY MERGE-NEEDS-MINOR (both: lazy applyResult + loaded-path test gap; both fixed @ b76b046)

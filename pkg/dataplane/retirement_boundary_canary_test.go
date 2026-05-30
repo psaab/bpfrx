@@ -70,11 +70,14 @@ var legacyDataplaneImportAllowlist = map[string]string{
 	"pkg/grpcapi/server_show.go":               "gRPC show dispatcher still reaches legacy dataplane state",
 	"pkg/grpcapi/server_show_cluster_text.go":  "cluster text output still reads legacy dataplane state",
 	"pkg/grpcapi/server_show_flow.go":          "flow text output still uses legacy session keys and values",
-	"pkg/grpcapi/server_show_nat.go":           "NAT text output still uses legacy NAT/session metadata",
 	"pkg/grpcapi/server_show_policies_text.go": "policy text output still uses legacy counters",
 	"pkg/grpcapi/server_show_security_text.go": "security text output still uses legacy counters and filter types",
 	"pkg/grpcapi/server_show_status.go":        "status output still reads legacy dataplane state",
 	"pkg/grpcapi/server_show_zones.go":         "zone output still uses legacy dataplane types",
+	"pkg/natshow/natshow.go":                   "#1687 shared NAT presenter Reader interface names root pkg/dataplane session/counter types (SessionKey, CounterValue, PersistentNATTable); net-neutral consolidation of the import that previously lived in server_show_nat.go + cli_show_nat.go",
+	"pkg/natshow/source.go":                    "#1687 shared source-NAT rule-detail renderer iterates legacy SessionKey/Value via the Reader",
+	"pkg/natshow/dest.go":                      "#1687 shared dest-NAT rule-detail renderer iterates legacy SessionKey/Value via the Reader",
+	"pkg/natshow/persistent.go":                "#1687 shared persistent-NAT renderers iterate legacy SessionKey/Value and read PersistentNATTable via the Reader",
 }
 
 // retainedShimBoundaryBuildTagAllowlist enumerates files that may
