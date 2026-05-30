@@ -44,14 +44,14 @@ func (s *Server) showPersistentNAT(buf *strings.Builder) {
 // including pool details, translation hit counters, and active session
 // counts per rule-set.
 func (s *Server) showNATSourceRuleDetail(cfg *config.Config, buf *strings.Builder) {
-	natshow.RenderSourceRuleDetail(buf, cfg, s.dp, s.applyResult())
+	natshow.RenderSourceRuleDetail(buf, cfg, s.dp, s.applyResult)
 }
 
 // showNATDestRuleDetail renders detailed destination NAT rule
 // information, including pool address/port, translation hit counters,
 // and active session counts per rule-set.
 func (s *Server) showNATDestRuleDetail(cfg *config.Config, buf *strings.Builder) {
-	natshow.RenderDestRuleDetail(buf, cfg, s.dp, s.applyResult())
+	natshow.RenderDestRuleDetail(buf, cfg, s.dp, s.applyResult)
 }
 
 // showPersistentNATDetail renders per-binding detail for persistent-NAT

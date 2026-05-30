@@ -75,12 +75,12 @@ func TestGRPCNATWrappersMatchSharedRenderers(t *testing.T) {
 		{
 			"source-rule-detail",
 			func(b *strings.Builder) { s.showNATSourceRuleDetail(cfg, b) },
-			func(b *strings.Builder) { natshow.RenderSourceRuleDetail(b, cfg, s.dp, s.applyResult()) },
+			func(b *strings.Builder) { natshow.RenderSourceRuleDetail(b, cfg, s.dp, s.applyResult) },
 		},
 		{
 			"dest-rule-detail",
 			func(b *strings.Builder) { s.showNATDestRuleDetail(cfg, b) },
-			func(b *strings.Builder) { natshow.RenderDestRuleDetail(b, cfg, s.dp, s.applyResult()) },
+			func(b *strings.Builder) { natshow.RenderDestRuleDetail(b, cfg, s.dp, s.applyResult) },
 		},
 		{
 			"static",

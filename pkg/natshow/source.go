@@ -11,12 +11,22 @@ import (
 
 // RenderSourceRuleDetail renders detailed source NAT rule information,
 // including pool details, translation hit counters, and active session
-// counts per rule-set. A nil dp/cr reproduces the "not loaded" path
-// (no session counts, no translation hits).
-func RenderSourceRuleDetail(w io.Writer, cfg *config.Config, dp Reader, cr *dataplane.ApplyResult) {
+// counts per rule-set.
+//
+// crFn lazily supplies the apply result (zone-ID and NAT-counter maps);
+// it is invoked only after the empty-config guard, preserving the
+// master ordering where the consumer's applyResult() was called after
+// the guard (so an empty config never touches dataplane state). A nil
+// crFn, or a crFn returning nil, reproduces the "not loaded" path (no
+// session counts, no translation hits).
+func RenderSourceRuleDetail(w io.Writer, cfg *config.Config, dp Reader, crFn func() *dataplane.ApplyResult) {
 	if cfg == nil || len(cfg.Security.NAT.Source) == 0 {
 		io.WriteString(w, "No source NAT rules configured\n")
 		return
+	}
+	var cr *dataplane.ApplyResult
+	if crFn != nil {
+		cr = crFn()
 	}
 	// Count active SNAT sessions per rule-set
 	type ruleSetKey struct{ from, to string }

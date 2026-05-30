@@ -452,7 +452,7 @@ func (c *CLI) showNATSourceRuleAll(cfg *config.Config) error {
 
 func (c *CLI) showNATSourceRuleDetail(cfg *config.Config) error {
 	// #1687: shared with the gRPC ShowText path via pkg/natshow.
-	natshow.RenderSourceRuleDetail(os.Stdout, cfg, c.dp, c.applyResult())
+	natshow.RenderSourceRuleDetail(os.Stdout, cfg, c.dp, c.applyResult)
 	return nil
 }
 
@@ -812,7 +812,7 @@ func (c *CLI) showNATDestinationRuleDetail(cfg *config.Config) error {
 	// #1687: shared with the gRPC ShowText path via pkg/natshow. The
 	// shared renderer carries the full nil/empty guard; the
 	// showNATDestination dispatcher keeps its own pre-guard.
-	natshow.RenderDestRuleDetail(os.Stdout, cfg, c.dp, c.applyResult())
+	natshow.RenderDestRuleDetail(os.Stdout, cfg, c.dp, c.applyResult)
 	return nil
 }
 

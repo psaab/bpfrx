@@ -17,12 +17,20 @@ import (
 // "No destination NAT rules configured" line). The CLI dispatcher keeps
 // its own pre-guard; for the non-empty path it routes here and renders
 // identically.
-func RenderDestRuleDetail(w io.Writer, cfg *config.Config, dp Reader, cr *dataplane.ApplyResult) {
+//
+// crFn lazily supplies the apply result; like RenderSourceRuleDetail it
+// is invoked only after the empty-config guard, preserving the master
+// ordering where applyResult() ran after the guard.
+func RenderDestRuleDetail(w io.Writer, cfg *config.Config, dp Reader, crFn func() *dataplane.ApplyResult) {
 	if cfg == nil || cfg.Security.NAT.Destination == nil || len(cfg.Security.NAT.Destination.RuleSets) == 0 {
 		io.WriteString(w, "No destination NAT rules configured\n")
 		return
 	}
 	dnat := cfg.Security.NAT.Destination
+	var cr *dataplane.ApplyResult
+	if crFn != nil {
+		cr = crFn()
+	}
 	type ruleSetKey struct{ from, to string }
 	rsSessions := make(map[ruleSetKey]int)
 	if dp != nil && dp.IsLoaded() && cr != nil {

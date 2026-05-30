@@ -75,12 +75,12 @@ func TestCLINATWrappersMatchSharedRenderers(t *testing.T) {
 		{
 			"source-rule-detail",
 			func() error { return c.showNATSourceRuleDetail(cfg) },
-			func(b *strings.Builder) { natshow.RenderSourceRuleDetail(b, cfg, dp, c.applyResult()) },
+			func(b *strings.Builder) { natshow.RenderSourceRuleDetail(b, cfg, dp, c.applyResult) },
 		},
 		{
 			"dest-rule-detail",
 			func() error { return c.showNATDestinationRuleDetail(cfg) },
-			func(b *strings.Builder) { natshow.RenderDestRuleDetail(b, cfg, dp, c.applyResult()) },
+			func(b *strings.Builder) { natshow.RenderDestRuleDetail(b, cfg, dp, c.applyResult) },
 		},
 		{
 			"static",
