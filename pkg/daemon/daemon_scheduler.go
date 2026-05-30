@@ -153,7 +153,8 @@ func (d *Daemon) updatePolicyScheduleStateLocked(cfg *config.Config, activeState
 		return
 	}
 	// Both in-tree backends satisfy policyScheduleStateUpdater
-	// directly: *dataplane.Manager via pkg/dataplane/maps.go:1497
+	// directly: *dataplane.Manager via UpdatePolicyScheduleState in
+	// pkg/dataplane/maps_policy.go
 	// and *dataplane/userspace.LegacyDataPlaneAdapter via
 	// pkg/dataplane/userspace/legacy_dataplane.go:161. The legacyDP()
 	// fallback branch was dead code; removed in #1519.

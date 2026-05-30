@@ -5,6 +5,11 @@ import (
 	"net"
 )
 
+// Shared map-key encoding helpers.
+// Same-package split of maps.go (#1686): byte-order + IP conversion helpers
+// used by both the map accessors and compiler*.go. They must stay in package
+// dataplane (referenced by compiler_nat.go / compiler_filter.go / compiler.go).
+
 // htons converts a uint16 from host to network byte order.
 func htons(v uint16) uint16 {
 	var b [2]byte
@@ -31,8 +36,3 @@ func ipTo16Bytes(ip net.IP) [16]byte {
 	copy(b[:], ip.To16())
 	return b
 }
-
-// --- Hitless restart: delete-stale methods ---
-// These methods remove map entries that are no longer present in the new config,
-// AFTER new entries have been written. This avoids the clear-then-repopulate
-// window where BPF programs see empty maps.

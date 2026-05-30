@@ -347,7 +347,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 				d.dp = nil
 			} else {
 				// natSeeder is satisfied by both *dataplane.Manager
-				// (legacy eBPF — maps.go:1589/1611) and the userspace
+				// (legacy eBPF — SeedNATPortCounters in maps_nat.go,
+				// SeedSessionIDCounter in maps_session.go) and the userspace
 				// *LegacyDataPlaneAdapter (via embedded bpfShim). The
 				// seed methods are no-ops on the userspace fast path
 				// but harmless to invoke. The legacyDP() round-trip is
