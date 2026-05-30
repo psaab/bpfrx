@@ -1,5 +1,4 @@
 [REFACTOR]   2983  userspace-dp/src/afxdp/poll_descriptor/mod.rs
-[REFACTOR]   2113  pkg/dataplane/maps.go
 [REFACTOR]   2085  pkg/routing/routing.go
 [REFACTOR]   2055  pkg/config/types.go
 [REFACTOR]   2021  pkg/config/ast.go
