@@ -18,8 +18,8 @@ Plan commit: 0aef1ec88
 - AGY: adversarial-review-mpru1nhk-15b7f2 (PLAN-READY; F1-F5 all resolved)
 - Claude SMR: inline
 
-## Code review round (to fill)
-- Codex:
-- AGY:
-- Copilot:
+## Code review round 1 (PR #1677 @ 7566464cf)
+- Codex: task-mpru7z9l-uiowoi
+- AGY: adversarial-review-mpru81xj-n1b4he
+- Copilot: requested (@copilot review)
 - Claude SMR: inline

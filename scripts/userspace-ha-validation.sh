@@ -386,10 +386,13 @@ run_mtr_report() {
 	# (e.g. partial/unanswered public trace) must not crash the validator
 	# under `set -e` before validate_mtr_report can classify the report
 	# and decide whether the result is fatal or observability-only.
+	# LC_ALL=C pins the report wording (`(waiting for reply)`) and the
+	# dot-decimal loss column the classifier parses, so the verdict is
+	# locale-independent.
 	if [[ "$family" == "6" ]]; then
-		cmd="mtr -6 ${target} --report --report-cycles=${MTR_REPORT_CYCLES} > ${outfile} 2>&1 || true"
+		cmd="LC_ALL=C mtr -6 ${target} --report --report-cycles=${MTR_REPORT_CYCLES} > ${outfile} 2>&1 || true"
 	else
-		cmd="mtr ${target} --report --report-cycles=${MTR_REPORT_CYCLES} > ${outfile} 2>&1 || true"
+		cmd="LC_ALL=C mtr ${target} --report --report-cycles=${MTR_REPORT_CYCLES} > ${outfile} 2>&1 || true"
 	fi
 	run_host "$cmd"
 }

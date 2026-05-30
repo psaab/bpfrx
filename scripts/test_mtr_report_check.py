@@ -70,9 +70,14 @@ class HopParseTests(unittest.TestCase):
 class ClassifyIPv6Tests(unittest.TestCase):
     """allow_unresolved_destination=1 — public IPv6 trace is observability."""
 
-    def test_issue_repro_silent_external_final_hop_passes(self) -> None:
-        # The #1303 case: hops 1-8 resolved, hop 9 is the silent public
-        # endpoint. Must PASS with a warning, NOT false-fail.
+    def test_silent_external_final_hop_warns_not_fails(self) -> None:
+        # The #1303 shape: hops 1-8 resolved, hop 9 is the silent public
+        # endpoint. The classifier must WARN (pass), not fail. (The
+        # original #1303 false-fail was the SHELL-level `set -e` crash on
+        # a non-zero `mtr` exit before the classifier ran; that is fixed
+        # by the `2>&1 || true` capture in run_mtr_report, not here. The
+        # post-#1301 classifier already warned on this shape — this test
+        # pins that the extracted classifier preserves it.)
         lines = [HEADER] + [hop(i, f"rtr{i}.net", "0.0%") for i in range(1, 9)]
         lines.append(hop(9, "???", "100.0%"))
         ok, msg = mtr.classify_mtr_report("ipv6", report(*lines), True)
