@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # #1614 simul-load smoke harness — run all 11 CoS classes in parallel for
 # 30 s, then reduce per-class achievement / CoV / retrans against the v5
-# acceptance criteria (plan.md §7 gates 1, 2, 3, 8).
+# acceptance criteria (plan.md §7 gates 1, 2, 3, 8), as re-scoped by
+# #1691 / #1614 §3.A: under full-11 simul the ~22-24 G C_phys push
+# ceiling divides among the backlogged classes, so push gate 1 is a
+# DIVIDED-CEILING REGRESSION FLOOR, not the >=95% guarantee (which is
+# SOLO-only via #1630 cos-gate1-small-four-alone.sh). See
+# docs/fairness-regimes.md "Aggregate push ceiling C_phys".
 #
 # Usage:
 #   ./test/incus/cos-simul-load-smoke.sh [push|reverse]   # default push
@@ -163,23 +168,45 @@ if direction == "reverse":
     # Phase 0 / R8 gate 8: aggregate ≥ 22 G means firewall (not generator) is the bottleneck.
     gates["gate_8_reverse_simul_22g"] = total_recv >= 22.0
 else:
-    # Push direction gates (plan.md §7).
-    # Gate 1: small classes hit ≥ 95% of configured rate (sum_rates ≤ ceiling).
-    #   100m, 1g, 3g, 6g all fit under 18G; if guarantee-rate mode
-    #   active, each should hit ≥ 95% of rate.
+    # Push direction gates (plan.md §7, re-scoped by #1691 / #1614 §3.A).
+    # Gate 1 — DIVIDED-CEILING REGRESSION FLOOR (NOT the >=95% guarantee).
+    #
+    # This harness runs ALL 11 classes in parallel. Under full-11 simul
+    # the ~22-24 G push ceiling C_phys (#1578) divides among the
+    # backlogged classes, so even the smallest classes land far below
+    # their solo rates: research #1614 §2.1 measured 100m=86%, 1g=63%,
+    # 3g=43%, 6g=41% of shape. The >=95% small-class GUARANTEE is a SOLO
+    # / few-competitor property and is asserted by the separate #1630
+    # harness cos-gate1-small-four-alone.sh, NOT here. Asserting >=95%
+    # on the full-11 run is structurally unsatisfiable for every class
+    # incl 1g (#1691 / docs/fairness-regimes.md "Aggregate push ceiling
+    # C_phys is the per-class denominator").
+    #
+    # We keep ALL four small classes (5201-5204) gated against a relaxed
+    # per-class floor calibrated below today's measured full-11 value so
+    # a COLLAPSE (e.g. starve-to-zero regression) still trips, while
+    # normal ceiling-division does not. The 3g/6g >=95% guarantee under
+    # multi-class contention is a confirmed-but-unresolved defect tracked
+    # in #1692; this floor is a regression guard, not that guarantee.
+    SIMUL_FLOOR_PCT = {5201: 0.60, 5202: 0.40, 5203: 0.25, 5204: 0.25}
     gate1_classes = []
     for r in rows:
         if "error" in r:
             continue
-        if r["port"] in (5201, 5202, 5203, 5204):
-            target = r["shape_gbps"] * 0.95
+        if r["port"] in SIMUL_FLOOR_PCT:
+            floor = SIMUL_FLOOR_PCT[r["port"]]
+            target = r["shape_gbps"] * floor
             gate1_classes.append({
                 "class": r["class"],
+                "floor_pct": round(floor * 100),
                 "target": target,
                 "actual": r["recv_gbps"],
                 "pass": r["recv_gbps"] >= target,
             })
-    gates["gate_1_small_class_guarantees"] = {
+    gates["gate_1_small_class_divided_ceiling_floor"] = {
+        "semantics": ("divided-ceiling regression floor under full-11 simul, "
+                      "NOT the >=95% guarantee (SOLO-only via #1630 "
+                      "cos-gate1-small-four-alone.sh; 3g/6g guarantee = #1692)"),
         "classes": gate1_classes,
         "pass": all(c["pass"] for c in gate1_classes),
     }

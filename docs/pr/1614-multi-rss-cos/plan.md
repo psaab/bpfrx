@@ -600,6 +600,29 @@ by baseline. v3 criteria are honest about what Axis A delivers:
 PR-1 conditionally MERGEABLE on 4-of-4 reviewers (Codex, AGY,
 Copilot, Claude SMR) + gates 1, 2, 3, 5, 6, 7, 8 PASSING.
 
+> **#1614 research rescope (Path B / #1691, 2026-05-30).** The §7
+> acceptance criteria above are re-scoped by the #1614 simul-load
+> research (`docs/research/1614-simul-load-diagnosis/plan.md`). The
+> live SSOT for the CoS contract is `docs/fairness-regimes.md`; these
+> historical criteria are NOT rewritten in place. Changes:
+> - **§7 crit 1 (small-class ≥95%) is SOLO / few-competitor only.**
+>   Under full-11 simul the ~22-24 G push ceiling `C_phys` (#1578)
+>   divides among the backlogged classes, so even 1g lands at 63%
+>   (research §2.1: 100m=86%, 1g=63%, 3g=43%, 6g=41%). The ≥95%
+>   guarantee is asserted by the SOLO harness
+>   `cos-gate1-small-four-alone.sh` (#1630); the full-11
+>   `cos-simul-load-smoke.sh` gate 1 is now a divided-ceiling
+>   regression floor (100m≥60%, 1g≥40%, 3g≥25%, 6g≥25% of shape).
+> - **3g/6g ≥95% simul guarantee deferred to #1692** — confirmed
+>   defect SIGNAL, mechanism unresolved (instrument-first).
+> - **§7 crit 4 / the flat per-flow-CoV gate is DROPPED.** The original
+>   #1614 issue body's "Per-flow CoV ≤ 5% under simultaneous load" is
+>   structurally unreachable per #1220/#1244 (Cstruct ≈ 53% at the
+>   multinomial(12,6) floor). The only per-flow fairness gate is the
+>   #1217 structural `observed_CoV ≤ Cstruct + 0.05`.
+> - **Per-class simul gates are bounded by `C_phys`** — no gate may
+>   assert per-class numbers whose sum exceeds the delivery ceiling.
+
 ## 8. Kill-chain respect (vs closed PLAN-KILLs)
 
 | Closed | Killed because | This plan |
