@@ -108,7 +108,7 @@ cargo targets are `build-userspace-dp` (default features) and `make test`
 
 - (A) Add a `build-userspace-dp-debug-log` Makefile target that runs
   `cargo build --release --features debug-log` so the feature build can
-  be checked locally and can't silently rebreak.
+  be checked locally with a one-command manual rebreak check.
 - (B) Note the gap and do nothing structural.
 
 This plan adds a minimal, **manual** guard: a phony Makefile target
