@@ -87,31 +87,22 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, cfg *Config, 
 	}
 
 	if childSchema.isTypedLeaf() && childSchema.validator != nil {
-		// Typed leaf: node.Keys[1:] are the value/modifier tokens; any AST
-		// children are modifier keywords (e.g. `transmit-rate 1g { exact; }`
-		// → child Keys=["exact"]). The leaf keyword is the only identity
-		// token.
+		// Typed leaf: node.Keys[1:] are the value/modifier tokens. The leaf
+		// keyword is the only identity token.
 		if err := validateTypedLeaf(node, childSchema, path, siblings, cfg); err != nil {
 			return err
 		}
-		// Validate modifier CHILDREN: each child keyword must be a known
-		// modifier of this leaf (e.g. `exact`). A child on a leaf with no
-		// schema children, or an unrecognized child keyword, is an unknown
-		// modifier — the flat-set grouping nests trailing modifier tokens
-		// as children (`transmit-rate 1g typo` → child Keys=["typo"]).
+		// Validate modifier CHILDREN. The flat-set grouping and hierarchical
+		// blocks both nest trailing modifier tokens as children
+		// (`transmit-rate 1g { exact; }` → child Keys=["exact"];
+		// `transmit-rate 1g exact bogus` → child exact → child bogus). Each
+		// modifier child must be a known modifier keyword with NO extra
+		// tokens packed in its Keys and NO unexpected descendants.
 		leafPath := append(append([]string(nil), path...), keyword)
 		for _, c := range node.Children {
-			if len(c.Keys) == 0 {
-				continue
+			if err := validateModifierChild(c, childSchema, leafPath, cfg); err != nil {
+				return err
 			}
-			if childSchema.children == nil {
-				return typedLeafErrorf(leafPath, "unknown modifier %q", c.Keys[0])
-			}
-			if _, ok := childSchema.children[c.Keys[0]]; !ok {
-				return typedLeafErrorf(leafPath, "unknown modifier %q", c.Keys[0])
-			}
-			// Known modifier (e.g. `exact`) — presence-only, nothing to
-			// validate further.
 		}
 		return nil
 	}
@@ -143,7 +134,63 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, cfg *Config, 
 		return nil
 	}
 
+	// Leftover Keys beyond this container's identity form a packed leaf:
+	// the parser folds compact statements into one node, e.g.
+	// `class-of-service { schedulers be transmit-rate asd; }` →
+	// Keys=["schedulers","be","transmit-rate","asd"]. After consuming the
+	// `schedulers be` container identity, the leftover ["transmit-rate",
+	// "asd"] is a leaf that must be validated at the child schema level —
+	// dropping it would let garbage through (Codex r2 #1). This complements
+	// descendInstanceLevels, which handles the same packing when the
+	// instance name itself arrives as a nested child.
+	if leftover := node.Keys[consumed:]; len(leftover) > 0 {
+		leaf := &Node{Keys: leftover, IsLeaf: node.IsLeaf, Children: node.Children}
+		return walkSchemaChildren([]*Node{leaf}, descendSchema, newPath, cfg)
+	}
+
 	return walkSchemaChildren(node.Children, descendSchema, newPath, cfg)
+}
+
+// validateModifierChild validates one AST child of a typed leaf (e.g.
+// `exact` under `transmit-rate 1g`). A modifier is presence-only: it must
+// be a known child keyword of the leaf, carry NO extra tokens in its Keys
+// (`exact bogus` → leftover `bogus` is unknown), and have NO unexpected
+// descendants of its own (`exact { bogus; }`). Modifiers themselves carry
+// no typed value, so we only assert the keyword is recognized and nothing
+// trails it.
+func validateModifierChild(node *Node, leafSchema *schemaNode, leafPath []string, cfg *Config) error {
+	if node == nil || len(node.Keys) == 0 {
+		return nil
+	}
+	mod := node.Keys[0]
+	if leafSchema.children == nil {
+		return typedLeafErrorf(leafPath, "unknown modifier %q", mod)
+	}
+	modSchema, ok := leafSchema.children[mod]
+	if !ok {
+		return typedLeafErrorf(leafPath, "unknown modifier %q", mod)
+	}
+	// No tokens may trail the modifier keyword in its Keys.
+	if len(node.Keys) > 1 {
+		return typedLeafErrorf(leafPath, "unknown modifier %q", node.Keys[1])
+	}
+	// No descendants may hang off a presence-only modifier.
+	modPath := append(append([]string(nil), leafPath...), mod)
+	for _, c := range node.Children {
+		if len(c.Keys) == 0 {
+			continue
+		}
+		// If the modifier schema itself declares children (future nested
+		// modifiers), recurse; otherwise any descendant is unknown.
+		if modSchema != nil && modSchema.children != nil {
+			if err := validateModifierChild(c, modSchema, modPath, cfg); err != nil {
+				return err
+			}
+			continue
+		}
+		return typedLeafErrorf(modPath, "unknown modifier %q", c.Keys[0])
+	}
+	return nil
 }
 
 // descendInstanceLevels handles the hierarchical AST shape where a named

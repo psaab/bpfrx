@@ -471,6 +471,48 @@ func TestSchemaValidate_HierarchicalShorthand_AcceptsValid(t *testing.T) {
 	}
 }
 
+// TestSchemaValidate_FullyPackedContainerLeaf reproduces Codex r2 #1: the
+// parser folds `class-of-service { schedulers be transmit-rate asd; }` into
+// ONE node Keys=["schedulers","be","transmit-rate","asd"] (container
+// identity + leaf + value). After consuming the `schedulers be` container
+// identity, the leftover ["transmit-rate","asd"] is a packed leaf that must
+// still be validated at the child schema level.
+func TestSchemaValidate_FullyPackedContainerLeaf(t *testing.T) {
+	if err := schemaCheck(t, `class-of-service { schedulers be transmit-rate asd; }`); err == nil {
+		t.Fatal("expected rejection for fully-packed container leaf, got nil")
+	}
+	if err := schemaCheck(t, `class-of-service { schedulers be priority foo; }`); err == nil {
+		t.Fatal("expected rejection for fully-packed priority garbage, got nil")
+	}
+	if err := schemaCheck(t, `class-of-service { schedulers be transmit-rate 1g; }`); err != nil {
+		t.Fatalf("expected fully-packed valid leaf to pass, got %v", err)
+	}
+}
+
+// TestSchemaValidate_ModifierTrailingGarbage reproduces Codex r2 #2: a known
+// modifier child must not swallow trailing garbage. `transmit-rate 1g {
+// exact bogus; }` (hierarchical) and `set ... transmit-rate 1g exact bogus`
+// (flat → exact → bogus nesting) both carry an extra `bogus` token past the
+// known `exact` modifier that must be rejected.
+func TestSchemaValidate_ModifierTrailingGarbage(t *testing.T) {
+	if err := schemaCheck(t, `class-of-service { schedulers { be { transmit-rate 1g { exact bogus; } } } }`); err == nil {
+		t.Fatal("expected rejection for `exact bogus` trailing garbage, got nil")
+	}
+	if err := flatSchemaCheck(t, "set class-of-service schedulers be transmit-rate 1g exact bogus"); err == nil {
+		t.Fatal("expected rejection for flat `transmit-rate 1g exact bogus`, got nil")
+	}
+	// The clean `exact` modifier still passes both shapes.
+	if err := schemaCheck(t, `class-of-service { schedulers { be { transmit-rate 1g { exact; } } } }`); err != nil {
+		t.Fatalf("expected clean `exact` modifier to pass, got %v", err)
+	}
+	if err := flatSchemaCheck(t,
+		"set class-of-service schedulers be transmit-rate 1g",
+		"set class-of-service schedulers be transmit-rate exact",
+	); err != nil {
+		t.Fatalf("expected split exact to pass, got %v", err)
+	}
+}
+
 // TestSetPathGrouping_Golden pins the flat-set grouping produced by
 // SetPath over setSchema. #1319 PR 1 adds typed-leaf FIELDS to schemaNode
 // (valueType/valueDesc/valueExamples/validator) but MUST NOT add or alter

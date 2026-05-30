@@ -4432,3 +4432,7 @@ top.
 - **Timestamp**: 2026-05-29
   **Action**: #1319 PR1 review-response — fix MAJOR (Copilot#1/Codex#1: descendInstanceLevels dropped leftover Keys, hierarchical shorthand `schedulers { be transmit-rate asd; }` bypassed validation) + Codex minor#2 (golden now exercises children==nil replace via double priority set) + Codex minor#3 (stale cmdtree LeafValidator/Node comments)
   **File(s)**: pkg/config/schema_walk.go (descendInstanceLevels leftover-leaf), pkg/config/schema_validate_test.go (shorthand regression tests + golden double-priority), pkg/cmdtree/tree.go (comment fixes)
+
+- **Timestamp**: 2026-05-29
+  **Action**: #1319 PR1 review-response r2 — fix 2 more MAJORs from Codex re-review: (1) fully-packed container leaf `schedulers be transmit-rate asd` (one node) dropped the leaf — added leftover-Keys synthesis to the container path; (2) known modifier child swallowed trailing garbage `exact bogus` — new validateModifierChild checks no trailing keys + no unexpected descendants
+  **File(s)**: pkg/config/schema_walk.go (container leftover-leaf + validateModifierChild), pkg/config/schema_validate_test.go (TestSchemaValidate_FullyPackedContainerLeaf + TestSchemaValidate_ModifierTrailingGarbage)
