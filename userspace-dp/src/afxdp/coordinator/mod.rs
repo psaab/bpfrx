@@ -1068,6 +1068,18 @@ pub(super) fn aggregate_cos_statuses_across_workers(
     }
     let mut out = Vec::with_capacity(interfaces.len());
     for (ifindex, mut iface) in interfaces {
+        // #1628 (code-review r2, both reviewers): keep the u64::MAX
+        // "no active-exact-backlog candidate" sentinel on the AGGREGATED
+        // output too, rather than letting it collapse to the or_default()
+        // 0. Otherwise an idle interface (0) and a hard 0-epoch lock-in
+        // (0) collide and the metric is unalertable. With MAX preserved,
+        // Prometheus suppresses the idle case (no series) and `0`
+        // unambiguously means a backlogged binding that completed zero
+        // epochs. An interface seeded by at least one active-backlog
+        // worker keeps its real MIN (including a genuine 0).
+        if !min_epochs_seeded.contains(&ifindex) {
+            iface.waterfill_min_epochs_per_worker = u64::MAX;
+        }
         if let Some(queue_map) = queue_maps.remove(&ifindex) {
             iface.queues = queue_map.into_values().collect();
             iface.owner_worker_id = unique_interface_owner_worker_id(&iface.queues);

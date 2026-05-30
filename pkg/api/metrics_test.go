@@ -1016,6 +1016,64 @@ func TestEmitCoSWaterfillTelemetry_EmitsQueueAndInterfaceMetrics(t *testing.T) {
 	}
 }
 
+// #1628 (code-review r2): the min_epochs_per_worker gauge is SUPPRESSED
+// when the interface reports the math.MaxUint64 "no active-backlog
+// candidate" sentinel, so an idle interface emits no series and any
+// emitted value (including 0) is a real lock-in signal. A genuine 0
+// (hard lock-in) MUST still be emitted.
+func TestEmitCoSWaterfillTelemetry_SuppressesMaxSentinelButEmitsZeroLockin(t *testing.T) {
+	c := &xpfCollector{
+		cosWaterfillEpochs: prometheus.NewDesc(
+			"xpf_userspace_cos_waterfill_epochs_total", "t", []string{"ifindex"}, nil),
+		cosWaterfillPhase1BudgetBreaks: prometheus.NewDesc(
+			"xpf_userspace_cos_waterfill_phase1_budget_breaks_total", "t", []string{"ifindex"}, nil),
+		cosWaterfillMinEpochsPerWorker: prometheus.NewDesc(
+			"xpf_userspace_cos_waterfill_min_epochs_per_worker", "t", []string{"ifindex"}, nil),
+	}
+	status := dpuserspace.ProcessStatus{
+		CoSInterfaces: []dpuserspace.CoSInterfaceStatus{
+			{ // idle: MAX sentinel → gauge suppressed
+				Ifindex:                     80,
+				WaterfillEpochs:             10,
+				WaterfillMinEpochsPerWorker: math.MaxUint64,
+			},
+			{ // hard 0-epoch lock-in → gauge emitted with value 0
+				Ifindex:                     81,
+				WaterfillEpochs:             5,
+				WaterfillMinEpochsPerWorker: 0,
+			},
+		},
+	}
+	ch := make(chan prometheus.Metric)
+	go func() {
+		c.emitCoSWaterfillTelemetry(ch, status)
+		close(ch)
+	}()
+	minByIfindex := map[string]float64{}
+	for m := range ch {
+		if m.Desc() != c.cosWaterfillMinEpochsPerWorker {
+			continue
+		}
+		var pb dto.Metric
+		if err := m.Write(&pb); err != nil {
+			t.Fatalf("metric.Write: %v", err)
+		}
+		var ifx string
+		for _, lp := range pb.GetLabel() {
+			if lp.GetName() == "ifindex" {
+				ifx = lp.GetValue()
+			}
+		}
+		minByIfindex[ifx] = pb.Gauge.GetValue()
+	}
+	if _, ok := minByIfindex["80"]; ok {
+		t.Fatalf("idle interface (MAX sentinel) must NOT emit the min gauge; got %v", minByIfindex)
+	}
+	if v, ok := minByIfindex["81"]; !ok || v != 0 {
+		t.Fatalf("hard 0-epoch lock-in must emit min gauge = 0; got %v (present=%v)", v, ok)
+	}
+}
+
 // #1219: emitBindingActiveFlowCount must surface the per-binding
 // xpf_userspace_binding_active_flow_count gauge with labels
 // {binding_slot, queue_id, worker_id, iface}. Mirrors the

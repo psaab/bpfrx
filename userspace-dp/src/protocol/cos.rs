@@ -163,12 +163,16 @@ pub(crate) struct CoSInterfaceStatus {
     // #1628: per-interface waterfill-selector trace counters. `epochs` and
     // `phase1_budget_breaks` are SUMMED across worker instances (cluster
     // event counters, like timer_level*_sleepers).
-    // `min_epochs_per_worker` is the coordinator's MIN over the per-worker
-    // `epochs` values, taken ONLY over workers with active exact-guarantee
-    // backlog (so an idle worker's frozen 0 does not mask a real Phase-2
-    // lock-in on another worker); 0 means "no active lock-in candidate on
-    // this interface", NOT "locked at 0". Set only by the coordinator
-    // aggregation; per-worker snapshots leave it 0.
+    // `min_epochs_per_worker` is the coordinator's MIN of the per-worker
+    // per-binding MIN over bindings WITH active exact-guarantee backlog
+    // (so a healthy binding/worker cannot mask a sibling locked in
+    // Phase 2). A LOW value relative to `epochs` flags a single stalled
+    // selector; `0` is a HARD lock-in (a backlogged binding that
+    // completed zero epochs). `u64::MAX` is the "no active-backlog
+    // candidate" sentinel (idle interface) and is preserved through
+    // coordinator aggregation so the two cases never collide — Prometheus
+    // suppresses the MAX gauge and the CLI renders it as "none", which
+    // keeps `0` unambiguously meaning hard lock-in (alertable).
     #[serde(rename = "waterfill_epochs", default)]
     pub waterfill_epochs: u64,
     #[serde(rename = "waterfill_phase1_budget_breaks", default)]

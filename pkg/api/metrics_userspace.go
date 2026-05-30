@@ -1,6 +1,7 @@
 package api
 
 import (
+	"math"
 	"strconv"
 	"time"
 
@@ -882,12 +883,19 @@ func (c *xpfCollector) emitCoSWaterfillTelemetry(ch chan<- prometheus.Metric, st
 			float64(iface.WaterfillPhase1BudgetBreaks),
 			ifindexLabel,
 		)
-		ch <- prometheus.MustNewConstMetric(
-			c.cosWaterfillMinEpochsPerWorker,
-			prometheus.GaugeValue,
-			float64(iface.WaterfillMinEpochsPerWorker),
-			ifindexLabel,
-		)
+		// #1628 (code-review r2): u64::MAX is the "no active-backlog
+		// lock-in candidate" sentinel — suppress the gauge entirely for
+		// idle interfaces so the emitted series is alertable: an emitted
+		// value of 0 then unambiguously means a hard 0-epoch lock-in (a
+		// backlogged binding that completed zero epochs), not "idle".
+		if iface.WaterfillMinEpochsPerWorker != math.MaxUint64 {
+			ch <- prometheus.MustNewConstMetric(
+				c.cosWaterfillMinEpochsPerWorker,
+				prometheus.GaugeValue,
+				float64(iface.WaterfillMinEpochsPerWorker),
+				ifindexLabel,
+			)
+		}
 		for _, queue := range iface.Queues {
 			queueLabel := strconv.Itoa(queue.QueueID)
 			ch <- prometheus.MustNewConstMetric(

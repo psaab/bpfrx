@@ -308,7 +308,7 @@ func newCollector(srv *Server) *xpfCollector {
 		),
 		cosWaterfillMinEpochsPerWorker: prometheus.NewDesc(
 			"xpf_userspace_cos_waterfill_min_epochs_per_worker",
-			"Minimum waterfill_epochs across workers WITH active exact-guarantee backlog on this CoS interface. A worker locked in Phase-2 keeps its epochs frozen, dropping this MIN even while the summed epochs climb. 0 = no active lock-in candidate on the interface (#1628).",
+			"Minimum waterfill_epochs across workers/bindings WITH active exact-guarantee backlog on this CoS interface. A worker/binding locked in Phase-2 keeps its epochs frozen, dropping this MIN even while the summed epochs climb; a value of 0 is a hard lock-in (a backlogged binding that completed zero epochs). The gauge is SUPPRESSED (no series) for an idle interface with no active-backlog candidate, so any emitted value — including 0 — is a real lock-in signal and alertable with `< N` (#1628).",
 			[]string{"ifindex"}, nil,
 		),
 		cosEqualFlowEnforcementEnabled: prometheus.NewDesc(

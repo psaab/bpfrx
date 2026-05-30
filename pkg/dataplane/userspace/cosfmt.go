@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 
@@ -135,15 +136,24 @@ func FormatCoSInterfaceSummary(cfg *config.Config, status *ProcessStatus, select
 			// Rendered only when the interface ran the waterfill selector
 			// (guarantee-rate mode) — zero on Proportional mode. epochs +
 			// breaks are summed across workers; min_epochs_per_worker is
-			// the MIN over workers with active exact backlog (a frozen MIN
-			// well below the SUM flags a single Phase-2-locked worker).
+			// the MIN over bindings with active exact backlog (a frozen
+			// MIN well below the SUM flags a single Phase-2-locked
+			// selector). The u64::MAX sentinel = "no active-backlog
+			// candidate"; render it as "none" so it is not confused with a
+			// real 0-epoch hard lock-in.
+			minEpochs := view.interfaceState.WaterfillMinEpochsPerWorker
+			minHasCandidate := minEpochs != math.MaxUint64
 			if view.interfaceState.WaterfillEpochs != 0 ||
 				view.interfaceState.WaterfillPhase1BudgetBreaks != 0 ||
-				view.interfaceState.WaterfillMinEpochsPerWorker != 0 {
-				fmt.Fprintf(&b, "  Waterfill:                epochs=%d phase1_budget_breaks=%d min_epochs_per_worker=%d\n",
+				minHasCandidate {
+				minStr := "none"
+				if minHasCandidate {
+					minStr = strconv.FormatUint(minEpochs, 10)
+				}
+				fmt.Fprintf(&b, "  Waterfill:                epochs=%d phase1_budget_breaks=%d min_epochs_per_worker=%s\n",
 					view.interfaceState.WaterfillEpochs,
 					view.interfaceState.WaterfillPhase1BudgetBreaks,
-					view.interfaceState.WaterfillMinEpochsPerWorker)
+					minStr)
 			}
 		}
 		// Build queue views once per interface and share the slice

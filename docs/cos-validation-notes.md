@@ -386,11 +386,15 @@ Per-interface (summed across workers, except the MIN):
 - `phase1_budget_breaks` — times Phase 1 ran out of budget mid-walk and
   fell into Phase 2 (cluster SUM). High breaks-per-epoch = Phase 1
   routinely can't honor the ascending set.
-- `min_epochs_per_worker` — MIN of `epochs` across workers WITH active
-  exact-guarantee backlog. A worker locked in Phase 2 keeps its epochs
-  frozen, dropping this MIN well below the SUM — that gap is the
-  single-stalled-core flag. `0` = no active lock-in candidate on the
-  interface (not "locked at 0").
+- `min_epochs_per_worker` — coordinator MIN of each worker's per-binding
+  MIN over its bindings WITH active exact-guarantee backlog (so a healthy
+  binding cannot mask a sibling binding locked in Phase 2 within one
+  worker). A LOW value vs `epochs` is the single-stalled-selector flag;
+  `0` is a HARD lock-in (a backlogged binding that completed zero epochs).
+  An idle interface with no active-backlog candidate carries the
+  `u64::MAX` sentinel, which Prometheus SUPPRESSES (no series) and the CLI
+  renders as `none` — so any emitted value, including `0`, is a real
+  lock-in signal and alertable with `< N`.
 
 **Interpretation contract — these are EVIDENCE, not standalone
 fingerprints.** `phase1_admit=0, phase2_admit>0` is a Phase-2 lock-in

@@ -67,7 +67,20 @@ At eligible-visit sites `head` (&queue) is live at the return's `match head`, so
 
 | Reviewer | Task ID | Verdict | Notes |
 |---|---|---|---|
-| Codex | task-mprvqv3t-gwdmk6 | (pending) | code r1 |
-| AGY | adversarial-review-mprvr07y-c2l0bg | (pending) | code r1 |
-| Copilot | (requested via @copilot review) | (pending) | code r1 |
-| Claude SMR | (in-conversation) | (pending) | code r1 |
+| Codex | task-mprvqv3t-gwdmk6 | MERGE-NEEDS-MAJOR | code r1: per-binding MIN masking (multi-binding/worker SUM hides locked sibling); borrow/wire/counters confirmed OK |
+| AGY | adversarial-review-mprvr07y-c2l0bg | MERGE-READY | code r1: missed the multi-binding case (assumed 1 binding/worker/iface) |
+| Copilot | n/a | COMMENTED (no findings) | code r1: reviewed 23/23 files, generated no comments |
+| Claude SMR | (in-conversation) | concur w/ Codex | the multi-binding MIN masking is real |
+
+### code r1 fix → r2 (HEAD 9a0637fa2)
+- MAJOR (Codex): per-worker interface_row SUM masked a locked sibling binding before the coordinator MIN. FIXED: per-binding MIN in interface_row.rs (u64::MAX = no-candidate sentinel on the worker wire; 0 = backlogged 0-epoch lock-in, captured not collided). Coordinator MIN-combines per-worker MINs skipping MAX. New worker-side regression test + zero-epoch-lockin coordinator test.
+- MINOR (Codex): gofmt metrics_test.go + protocol.go. DONE.
+
+## Code review (round 2 — HEAD 9a0637fa2)
+
+| Reviewer | Task ID | Verdict | Notes |
+|---|---|---|---|
+| Codex | task-mprw7i7m-6l2dej | (pending) | code r2 — re-review the MIN fix |
+| AGY | adversarial-review-mprw7n4e-hm2lb9 | (pending) | code r2 |
+| Copilot | (re-requested) | (pending) | code r2 |
+| Claude SMR | (in-conversation) | (pending) | code r2 |

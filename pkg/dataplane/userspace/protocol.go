@@ -708,10 +708,13 @@ type CoSInterfaceStatus struct {
 	// #1628: per-interface waterfill-selector trace counters. JSON tags
 	// MUST match the Rust serde rename(...) byte-for-byte (protocol/cos.rs).
 	// WaterfillEpochs / WaterfillPhase1BudgetBreaks are SUMMED across
-	// workers. WaterfillMinEpochsPerWorker is the coordinator MIN over
-	// per-worker epochs, taken only over workers with active
-	// exact-guarantee backlog; 0 means "no active lock-in candidate", not
-	// "locked at 0".
+	// workers. WaterfillMinEpochsPerWorker is the coordinator MIN of each
+	// worker's per-binding MIN over bindings with active exact-guarantee
+	// backlog; a LOW value vs Epochs flags a single stalled selector, and
+	// 0 is a HARD lock-in (backlogged binding, zero epochs completed).
+	// math.MaxUint64 is the "no active-backlog candidate" (idle) sentinel,
+	// preserved through aggregation so it never collides with a real 0;
+	// Prometheus suppresses the MAX gauge and the CLI renders it "none".
 	WaterfillEpochs             uint64           `json:"waterfill_epochs,omitempty"`
 	WaterfillPhase1BudgetBreaks uint64           `json:"waterfill_phase1_budget_breaks,omitempty"`
 	WaterfillMinEpochsPerWorker uint64           `json:"waterfill_min_epochs_per_worker,omitempty"`

@@ -1788,9 +1788,12 @@ fn aggregate_cos_waterfill_min_captures_zero_epoch_lockin() {
 }
 
 #[test]
-fn aggregate_cos_waterfill_min_zero_when_no_candidate() {
-    // No worker reports a candidate (all MAX) → MIN stays at the
-    // or_default() 0 "no active lock-in candidate" sentinel.
+fn aggregate_cos_waterfill_min_max_sentinel_when_no_candidate() {
+    // No worker reports a candidate (all u64::MAX) → the AGGREGATED MIN
+    // stays u64::MAX (NOT 0), so an idle interface is distinguishable
+    // from a hard 0-epoch lock-in. Prometheus suppresses the MAX gauge
+    // and the CLI renders it as "none"; only a genuine 0-epoch lock-in
+    // emits 0 (code-review r2, both reviewers).
     use crate::protocol::{CoSInterfaceStatus, CoSQueueStatus};
 
     let worker = vec![CoSInterfaceStatus {
@@ -1813,8 +1816,9 @@ fn aggregate_cos_waterfill_min_zero_when_no_candidate() {
     let owner_by_queue = BTreeMap::from([((80, 4u8), 3u32)]);
     let aggregated = aggregate_cos_statuses_across_workers(&[worker], &owner_by_queue);
     assert_eq!(
-        aggregated[0].waterfill_min_epochs_per_worker, 0,
-        "no candidate (all MAX) → MIN sentinel 0"
+        aggregated[0].waterfill_min_epochs_per_worker,
+        u64::MAX,
+        "no candidate (all MAX) → aggregated MIN stays the MAX sentinel, NOT 0"
     );
     assert_eq!(aggregated[0].waterfill_epochs, 777);
 }
