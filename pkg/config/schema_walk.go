@@ -127,6 +127,20 @@ func packedLeftoverLeaf(node *Node, parent *schemaNode, path []string) (string, 
 	if len(leftover) == 0 {
 		return "", nil, nil, nil
 	}
+	// The leftover is only a real packed leaf when its first token resolves
+	// to a known child (or wildcard) of the container's child schema. If it
+	// is an UNKNOWN token (e.g. `class-of-service extra { ... }`), the
+	// leftover is not a typed leaf and the node's block children are nested
+	// container config, not leaf modifiers — leave it to the normal container
+	// path so the children are still walked at descendSchema (Codex r5). We
+	// also do NOT carry node.Children onto the synthesized leaf unless the
+	// leftover resolves to a typed leaf: for an untyped-but-known leftover
+	// (e.g. a plain container packed inline) the children belong to that
+	// inner container, which walkSchemaNode reaches via normal recursion.
+	leftSchema := resolveSchemaChild(descendSchema, leftover[0])
+	if leftSchema == nil {
+		return "", nil, nil, nil
+	}
 	idPath := append(append([]string(nil), path...), node.Keys[:consumed]...)
 	leaf := &Node{Keys: leftover, IsLeaf: node.IsLeaf, Children: node.Children}
 	return strings.Join(idPath, "\x00"), descendSchema, idPath, leaf
@@ -213,15 +227,25 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, cfg *Config, 
 		return nil
 	}
 
-	// Leftover Keys beyond this container's identity form a packed leaf
-	// (the `schedulers be transmit-rate asd` single-node shape). That leaf —
-	// and its block children — are validated by walkSchemaChildren's
-	// leftover-group pass (which gives peer leftover leaves mutual sibling
-	// visibility for the split-modifier rule), so we must NOT also walk
-	// node.Children here: those children belong to the synthesized leaf, not
-	// to this container. Returning leaves them to the group pass.
-	if len(node.Keys[consumed:]) > 0 {
-		return nil
+	// Leftover Keys beyond this container's identity. When the leftover is a
+	// KNOWN packed leaf (its first token resolves under descendSchema), it —
+	// and its block children, which are the leaf's modifiers — are validated
+	// by walkSchemaChildren's leftover-group pass (which also gives peer
+	// leftover leaves mutual sibling visibility). In that case we must NOT
+	// re-walk node.Children here, so we return.
+	//
+	// When the leftover's first token is UNKNOWN (e.g.
+	// `class-of-service extra { schedulers be transmit-rate asd; }`), the
+	// `extra` token is an opt-in skip, but the node's block children are
+	// nested container config that the compiler still processes — so they
+	// MUST be walked at descendSchema rather than dropped (Codex r5).
+	if leftover := node.Keys[consumed:]; len(leftover) > 0 {
+		if resolveSchemaChild(descendSchema, leftover[0]) != nil {
+			// Known packed leaf — handled by the group pass.
+			return nil
+		}
+		// Unknown leftover token: skip it, but still validate nested config.
+		return walkSchemaChildren(node.Children, descendSchema, newPath, cfg)
 	}
 
 	return walkSchemaChildren(node.Children, descendSchema, newPath, cfg)

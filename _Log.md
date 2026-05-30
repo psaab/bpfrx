@@ -4446,5 +4446,8 @@ top.
   **File(s)**: pkg/config/schema_walk.go (group pass walkSchemaChildren recursion), pkg/config/schema_validate_test.go (TestSchemaValidate_MultiLevelPackedChain)
 
 - **Timestamp**: 2026-05-30
-  **Action**: #1319 PR1 review-response r5 — reject malformed multi value-tail ranges so a typed `multi && children==nil` leaf no longer accepts dangling/all-separator `to` tails (e.g. `destination-port to`, `destination-port 20000 to`)
+  **Action**: #1319 PR1 review-response (Copilot swe-agent) — reject malformed multi value-tail ranges so a typed `multi && children==nil` leaf no longer accepts dangling/all-separator `to` tails (e.g. `destination-port to`, `destination-port 20000 to`)
   **File(s)**: pkg/config/schema_walk.go (multi value-tail separator validation), pkg/config/schema_walk_internal_test.go (dangling-separator regressions)
+- **Timestamp**: 2026-05-29
+  **Action**: #1319 PR1 review-response r5 — fix Codex r5 MAJOR: extra unknown token in a container identity (`class-of-service extra { schedulers be transmit-rate asd; }` / `schedulers be extra { transmit-rate asd; }`) dropped nested typed-leaf validation because the synthesized leftover leaf bundled the block children under the unknown token. Fixed: packedLeftoverLeaf only treats leftover as a packed leaf when leftover[0] resolves under descendSchema; the container path walks block children at descendSchema when the leftover token is unknown (opt-in skip of the token, but nested config still validated).
+  **File(s)**: pkg/config/schema_walk.go (packedLeftoverLeaf known-leftover guard + container-path unknown-leftover child walk), pkg/config/schema_validate_test.go (TestSchemaValidate_ExtraTokenContainerStillValidatesNestedLeaves)

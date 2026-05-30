@@ -535,6 +535,29 @@ func TestSchemaValidate_ModifierTrailingGarbage(t *testing.T) {
 	}
 }
 
+// TestSchemaValidate_ExtraTokenContainerStillValidatesNestedLeaves
+// reproduces Codex r5: an unknown extra token in a container's identity
+// (e.g. `class-of-service extra { ... }` or `schedulers be extra { ... }`)
+// must NOT cause the container's nested typed leaves to be dropped. The
+// extra token itself is an opt-in skip (unknown keyword), but the compiler
+// still processes the nested config, so typed garbage underneath must still
+// be rejected.
+func TestSchemaValidate_ExtraTokenContainerStillValidatesNestedLeaves(t *testing.T) {
+	for _, in := range []string{
+		`class-of-service extra { schedulers be transmit-rate asd; }`,
+		`class-of-service { schedulers be extra { transmit-rate asd; } }`,
+	} {
+		if err := schemaCheck(t, in); err == nil {
+			t.Fatalf("expected rejection for extra-token container with nested garbage %q, got nil", in)
+		}
+	}
+	// An extra token with a VALID nested leaf still passes — the extra token
+	// is opt-in skipped, the valid rate is fine.
+	if err := schemaCheck(t, `class-of-service extra { schedulers be transmit-rate 1g; }`); err != nil {
+		t.Fatalf("expected extra-token container with valid leaf to pass, got %v", err)
+	}
+}
+
 // TestSchemaValidate_PackedSiblingSplitModifier reproduces Codex r3 minor:
 // the packed-leftover fix must not break the cross-sibling split-modifier
 // rule. Two sibling packed nodes — a rate and a bare `exact` — are valid
