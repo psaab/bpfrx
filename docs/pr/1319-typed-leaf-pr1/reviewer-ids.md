@@ -23,12 +23,26 @@ research/1319-typed-leaf @ c0f6e5a79 (research rounds below).
 - Claude SMR r3: concurred; reproduced the regression via probe
 
 ### Round 4 (HEAD c85f61e8b — r3 minor fixed via leftover grouping)
-- Codex r4: task-mpry764r-46otxf — (pending)
-- Copilot: re-requested on latest HEAD — (pending)
-- Claude SMR r4: MERGE-READY — proved no double-validation (validator called exactly once per leaf), no false-reject on realistic multi-subtree configs, all reject cases still reject; full suite green, 5/5 flake clean
+- Codex r4: task-mpry764r-46otxf — MERGE-NEEDS-MAJOR (multi-level packed chain `class-of-service schedulers be transmit-rate asd` as one flat node dropped; group pass must recurse). Confirmed r3 minor + r1 minor#2/#3 fixed.
+- Claude SMR r4: proved no double-validation; concurred on the chain bug.
 
-### AGY
-- AGY r2 (HEAD f586b9677): adversarial-review-mprxfd4w-at6of4 — MERGE-READY (verified 6 focus areas; missed the packed-leftover majors that Copilot+Codex caught). Fix commits since are additive validation tightening; no new architecture.
+### Round 5 (HEAD 8da91bcfc — r4 chain bug fixed via group-pass recursion)
+- Codex r5: task-mprxv25r-baz5f6/019e7775 — MERGE-NEEDS-MAJOR (extra unknown token in container identity `class-of-service extra { schedulers be transmit-rate asd; }` dropped nested typed leaves). Confirmed r4 chain fixed + Copilot separator commits correct.
+- Copilot swe-agent: pushed d5d3243de/d0d16afdb (multi value-tail separator hardening — reject dangling/all-`to` tails). Reviewed + kept; rebased my work on top.
+
+### Round 6 (HEAD ad2da1893 — r5 extra-token fixed)
+- Codex r6: task-... /019e778d — MERGE-NEEDS-MAJOR (instance-path extra token `schedulers { be extra { transmit-rate asd; } }` dropped nested leaf). Confirmed r5 fixed + separator hardening correct.
+
+### Round 7 (HEAD ffe8b7976 — r6 instance-extra fixed)
+- Codex r7: task-mprz4suw-r7tl50 — MERGE-NEEDS-MAJOR (presence-token `schedulers { be surplus-sharing { priority foo; } }` mis-attributed child to the presence token's schema → `priority foo` accepted but compiler-applied). This finding exposed the design premise flaw behind the whole leftover machinery.
+
+### Round 8 (HEAD 1035e4aae — COMPILER-FAITHFUL rewrite)
+- Codex r8: task-mprzo9hr-m6e3gt/019e77a3 — **MERGE-READY**. Verified the compiler-faithful premise with a probe transcript (compileClassOfService reads leaves only from inst.node.Children; packed Keys ignored); confirmed every compiler-reachable garbage rejects (incl. r7 presence-token), packed shorthand genuinely compiler-discarded, walker has no dead code + terminates, full + focused suites green.
+- Copilot r5 (commit 1035e4aae @ 06:51:10): COMMENTED, 0 open inline — **clean on final HEAD**.
+- Claude SMR r8: **MERGE-READY** — drove the compiler-faithful rewrite; verified compileClassOfService+namedInstances read only instance children; probed every AST shape (flat-set/canonical/packed/extra-token/presence-token) against both SchemaValidate and CompileConfig; symptom-1 frontend tests pass; SetPath golden + two-SSOT docs intact.
+- AGY final (HEAD 1035e4aae): adversarial-review-mprzyscf-xrggdm — (pending; r2 was MERGE-READY).
+
+## Gate: Codex MERGE-READY + Copilot clean + Claude SMR MERGE-READY on final HEAD 1035e4aae; AGY final pending.
 
 ---
 
