@@ -119,8 +119,10 @@ impl WgEngine {
     ///
     /// Enforces the at-most-one-pending-per-peer cap: if the peer already
     /// has a pending reservation, it is aborted (removed from `pending` and
-    /// its placeholder dropped from the demux map) before the new one is
-    /// installed. Returns the reserved local index.
+    /// its `pending_by_peer` marker) before the new one is recorded. A
+    /// pending reservation never lives in the live-session demux map
+    /// (`sessions_by_local_index`), so nothing is removed there. Returns the
+    /// reserved local index.
     fn reserve_pending(
         &self,
         peer_pubkey: [u8; WG_KEY_LEN],
@@ -208,6 +210,24 @@ impl WgEngine {
         );
         by_peer.insert(peer_pubkey, local_index);
         Ok(local_index)
+    }
+
+    /// Test-only: deterministically exercise the under-lock peer recheck in
+    /// `reserve_pending_locked` — the exact code path that closes the
+    /// create_initiation TOCTOU (Codex round-4). The production gap (peer
+    /// removed between `create_initiation`'s pre-lock `peer_arc` and the
+    /// locked reserve) is a narrow race that a concurrency test cannot hit
+    /// reliably; this drives the fixed branch directly by acquiring
+    /// `reconcile_lock` and calling `reserve_pending_locked` exactly as the
+    /// completion paths do, after the peer has been removed.
+    #[cfg(test)]
+    pub(crate) fn try_reserve_pending_for_test(
+        &self,
+        peer_pubkey: [u8; WG_KEY_LEN],
+        role: SessionRole,
+    ) -> Result<u32, HandshakeError> {
+        let _guard = self.reconcile_lock.lock().unwrap();
+        self.reserve_pending_locked(peer_pubkey, None, role)
     }
 
     /// Release a pending reservation (handshake failed before completion).

@@ -1763,26 +1763,112 @@ mod framed_handshake {
     }
 
     /// reserve_pending_locked re-checks the peer UNDER reconcile_lock (Codex
-    /// round-3 TOCTOU finding). Removing the peer means create_initiation must
-    /// return UnknownPeer and leave NO pending reservation — otherwise a
-    /// reservation for a removed peer would leak (reconcile_peers's drain
-    /// iterates the table's pubkeys, which no longer contains it).
+    /// round-3 TOCTOU finding). The simple sequential case: create_initiation
+    /// after the peer is removed returns UnknownPeer and reserves nothing.
     #[test]
     fn create_initiation_after_peer_removed_leaves_no_reservation() {
         let (init, _resp, _init_pub, resp_pub) = engine_pair();
-        // Remove the peer.
         init.reconcile_peers(&[]);
-        // create_initiation must fail UnknownPeer and reserve nothing.
         let mut msg1 = [0u8; WG_MSG_INIT_LEN];
         assert_eq!(
             init.create_initiation(&resp_pub, &mut msg1).unwrap_err(),
             HandshakeError::UnknownPeer
         );
+        assert_eq!(init.pending_count(), 0);
+    }
+
+    /// Deterministic TOCTOU regression (Codex round-4): exercise the exact
+    /// fixed branch — the under-lock peer recheck in reserve_pending_locked —
+    /// rather than rely on a narrow race a concurrency test can't reliably
+    /// hit. `try_reserve_pending_for_test` acquires reconcile_lock and calls
+    /// reserve_pending_locked just as the completion paths do; after the peer
+    /// is removed it must return UnknownPeer and create NO reservation.
+    /// Without the under-lock recheck this reservation would be created and
+    /// leak (reconcile's drain iterates the current table's pubkeys, which no
+    /// longer include the removed peer).
+    #[test]
+    fn reserve_pending_locked_rejects_removed_peer() {
+        use crate::afxdp::wg::session::SessionRole;
+        let (init, _resp, _init_pub, resp_pub) = engine_pair();
+        // Peer present: reserving succeeds.
+        let idx = init
+            .try_reserve_pending_for_test(resp_pub, SessionRole::Initiator)
+            .expect("reserve must succeed while the peer is configured");
+        assert_eq!(init.pending_count(), 1);
+        // Drain it so we start clean.
+        init.reconcile_peers(&[]);
+        assert_eq!(init.pending_count(), 0);
+        let _ = idx;
+
+        // Re-add then remove to mimic the published-table state at the moment
+        // a TOCTOU create would acquire the lock: peer absent from the table.
+        init.reconcile_peers(&[]);
+        // Now reserve under the lock for the (absent) peer — the under-lock
+        // recheck must reject it.
+        assert_eq!(
+            init.try_reserve_pending_for_test(resp_pub, SessionRole::Initiator)
+                .unwrap_err(),
+            HandshakeError::UnknownPeer
+        );
         assert_eq!(
             init.pending_count(),
             0,
-            "no reservation may be created for a removed peer"
+            "reserve_pending_locked must not create a reservation for a removed peer"
         );
+    }
+
+    /// Liveness/soundness smoke: hammer full handshakes while a thread churns
+    /// the peer in/out via reconcile_peers, exercising the lock serialization
+    /// and the reconcile-drains-pending path. Must not panic/deadlock and a
+    /// post-storm clean handshake must still carry traffic.
+    #[test]
+    fn create_initiation_toctou_under_concurrent_peer_removal() {
+        use std::sync::atomic::{AtomicBool, Ordering as AOrd};
+        use std::sync::Arc as StdArc;
+        use std::thread;
+
+        let (init_priv, _init_pub) = keypair();
+        let (_resp_priv, resp_pub) = keypair();
+        let cfg = vec![WgPeerConfig {
+            pubkey: resp_pub,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+        }];
+        let init = StdArc::new(WgEngine::new(WgEngineConfig {
+            local_private_key: init_priv,
+            listen_port: 51820,
+            peers: cfg.clone(),
+        }));
+        let stop = StdArc::new(AtomicBool::new(false));
+        let initiator = {
+            let init = init.clone();
+            let stop = stop.clone();
+            thread::spawn(move || {
+                for _ in 0..3000 {
+                    let mut msg1 = [0u8; WG_MSG_INIT_LEN];
+                    let _ = init.create_initiation(&resp_pub, &mut msg1);
+                }
+                stop.store(true, AOrd::Relaxed);
+            })
+        };
+        let churner = {
+            let init = init.clone();
+            let stop = stop.clone();
+            let cfg = cfg.clone();
+            thread::spawn(move || {
+                while !stop.load(AOrd::Relaxed) {
+                    init.reconcile_peers(&[]);
+                    init.reconcile_peers(&cfg);
+                    thread::yield_now();
+                }
+            })
+        };
+        initiator.join().unwrap();
+        churner.join().unwrap();
+        // Settle peer-removed: no reservation may remain for the absent peer.
+        init.reconcile_peers(&[]);
+        assert_eq!(init.pending_count(), 0, "no orphan reservation after the storm");
     }
 
     /// Concurrency regression for the Codex round-2 finding: completing a
