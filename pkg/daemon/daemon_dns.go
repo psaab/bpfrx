@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -250,9 +251,33 @@ func (r *dnsReconciler) atomicWrite(content string) error {
 // re-create the /run/systemd/resolve stub that the base-image symlink
 // points at. Masking is sticky across reboots; the unmask path for a
 // future resolved-owner mode is documented in docs/dns-ownership.md.
+//
+// It is idempotent and quiet:
+//   - On a systemd-less host (no /run/systemd/system — containers/CI) it
+//     is a no-op success; there is no resolved to fight.
+//   - When the unit is already `masked` it returns success without
+//     re-running systemctl, since `disable --now` on a masked unit fails
+//     and would otherwise spam a false "second owner" warning on every
+//     commit / DHCP change. Reaching the desired end-state (masked) is
+//     the success condition, not a fresh transition.
 func disableMaskResolved() error {
+	// No systemd → nothing to disable/mask. /run/systemd/system is the
+	// canonical "booted with systemd" probe (sd_booted(3)).
+	if _, err := os.Stat("/run/systemd/system"); err != nil {
+		return nil
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+
+	// Already masked? Then we are at the desired end-state — do nothing.
+	// `systemctl is-enabled` prints `masked` (exit non-zero) for a masked
+	// unit; key off the stdout token, not the exit code.
+	out, _ := exec.CommandContext(ctx, "systemctl", "is-enabled", "systemd-resolved.service").CombinedOutput()
+	if strings.TrimSpace(string(out)) == "masked" {
+		return nil
+	}
+
 	if out, err := exec.CommandContext(ctx, "systemctl", "disable", "--now", "systemd-resolved.service").CombinedOutput(); err != nil {
 		return fmt.Errorf("disable --now systemd-resolved: %w (%s)", err, string(out))
 	}

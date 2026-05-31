@@ -27,7 +27,11 @@ startup, and on every DHCP address change it:
    `EXDEV`/`EBUSY` and xpf falls back to an in-place write.
 4. Disables + masks `systemd-resolved.service`. Masking also defeats its
    socket-activation units, so resolved cannot be re-started to recreate
-   the `/run/systemd/resolve/stub-resolv.conf` target.
+   the `/run/systemd/resolve/stub-resolv.conf` target. This step is
+   idempotent and quiet: on a systemd-less host (no `/run/systemd/system`,
+   e.g. containers/CI) it is a no-op, and once the unit is already
+   `masked` it does nothing (so commits / DHCP changes do not spam a
+   false "second owner" warning).
 5. Removes stale resolved drop-ins (`bpfrx.conf` legacy + `xpf.conf`).
 
 The reconciler runs under the daemon's `applySem` (apply serialization
