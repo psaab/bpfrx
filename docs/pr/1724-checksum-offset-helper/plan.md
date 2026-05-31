@@ -1,6 +1,45 @@
 # #1724 — dedup the 5 offset-lookup `match protocol` checksum sites via a statically-dispatched helper
 
-**Status:** DRAFT v3 — Codex PLAN-NEEDS-MINOR + AGY PLAN-KILL(LOC-bloat) both addressed; pending re-review convergence
+**Status:** DRAFT v4 — Codex r2 PLAN-NEEDS-MAJOR (two correctness bugs) fixed; pending re-review convergence
+
+## v4 changelog (addressing Codex round-2 PLAN-NEEDS-MAJOR — two real bugs)
+
+Codex round-2 found two genuine correctness defects in the v3
+family-independent offset helper. Both are fixed in v4 by **splitting the
+offset helper per family** (the form AGY's round-1 alternative and Codex
+both endorse) and keeping `checked_add` at the call site:
+
+1. **BUG (Codex r2 #2): IPv4 protocol-58 behavior change.** v3's
+   family-independent `l4_checksum_offset` added `PROTO_ICMPV6 => 2`
+   unconditionally. But the current IPv4 offset matches (checksum.rs:278,
+   367) have NO ICMPv6 arm — an IPv4 packet with protocol 58 hits
+   `_ => return Some(())` (no-op) today. The IPv4 NAT adjust paths
+   (mod.rs:711/715) call the v4 helpers WITHOUT protocol filtering, so v3
+   would make IPv4/proto-58 adjust offset `ihl+2` — a live behavior change.
+   **Fix:** `l4_checksum_field_delta_v4` has NO ICMPv6 arm; only the v6
+   variant does.
+2. **BUG (Codex r2 #1): overflow vs unsupported-protocol conflation.** v3's
+   helper returned `base.checked_add(delta)`, folding `checked_add`
+   overflow into the same `None` the call site mapped to `Some(())` (no-op
+   success). But the original v4 sites do `ihl.checked_add(16)?` — overflow
+   → `None` (FAILURE). v3 silently turned recognized-protocol overflow into
+   success. **Fix:** the helper returns ONLY the per-protocol delta
+   (`Option<usize>` where `None` == unsupported protocol). The `checked_add`
+   stays at the call site with `?`, preserving overflow-as-failure.
+
+Consequence: the call site reverts from a single `let-else` to the
+`match { Some(d)=>d, None=>return Some(()) }` + `base.checked_add(delta)?`
+form (4 lines + 1). This is ~LOC-neutral on the offset path, NOT the
+−14 v3 claimed (Codex r2 #3: rustfmt also expands the one-liner let-else to
+3 lines regardless). The honest value of the refactor is therefore the
+**centralization of the offset table per family and the v4/v6
+zero-checksum-canonicalization asymmetry into named, doc-commented,
+unit-tested predicates** — NOT a LOC reduction. If reviewers judge that
+centralization insufficient to justify ~LOC-neutral churn in
+correctness-critical code, **PLAN-KILL remains the right call.**
+
+Also fixed stale-naming doc drift Codex r2 #4 flagged (old
+`adjust_zero_checksum_is_illegal` / "two helpers" references).
 
 ## v3 changelog (addressing AGY round-1 PLAN-KILL: LOC-negative payoff)
 
@@ -82,9 +121,11 @@ risk that a future edit fixes the offset in 4 places and forgets the 5th),
 and centralize the correctness-critical v4/v6 zero-checksum guard
 asymmetry in one named, doc-commented, unit-tested predicate. There is
 **no measurable runtime win** — the `#[inline(always)]` fns fold to the
-same code. With the v3 `let-else` shape the offset path is **−14 LOC**
-(28 → 14); the predicate path is roughly LOC-neutral but turns 5 inline
-`matches!` expressions into 5 named-predicate calls.
+same code. With the v4 corrected (per-family, call-site `checked_add`)
+shape the offset path is roughly **LOC-neutral** (the v3 `−14` claim was
+wrong — Codex r2 #3); the value is centralizing the offset table per
+family and the v4/v6 canonicalization asymmetry into named, doc-commented,
+unit-tested predicates rather than 5 open-coded `match`/`matches!` blocks.
 
 *If reviewers conclude the dedup doesn't cleanly share enough to justify
 the helper (over-abstraction worse than a little duplication), PLAN-KILL
@@ -139,29 +180,40 @@ offset helper.** The arms could *consume* the same delta constants for the
 field offset, but doing so does not reduce the match (each arm still needs
 its own body), so it is churn without dedup. Plan keeps Class B untouched.
 
-## Concrete design (v3)
+## Concrete design (v4)
 
-Three small `#[inline(always)]` statically-dispatched free functions (no
-`dyn`, no trait, no generics — zero dynamic dispatch). The offset helper
-takes the L4 BASE so the call site is a single `let-else`.
+Four small `#[inline(always)]` statically-dispatched free functions (no
+`dyn`, no trait, no generics — zero dynamic dispatch). The offset is split
+per family so IPv4 protocol 58 keeps its current no-op behavior; the
+`checked_add` stays at the call site so overflow remains a failure.
 
 ```rust
-/// Absolute offset of the L4 checksum field within `packet`, given the L4
-/// header `base` (the IPv4 IHL, or 40 for the fixed IPv6 header). The
-/// field deltas are family-independent: TCP=+16, UDP=+6 in both families,
-/// and ICMPv6=+2 only ever applies on v6 (v4 callers never pass
-/// PROTO_ICMPV6 — IPv4 ICMP has no entry and falls to `None`). `None` =>
-/// no L4 checksum field this module adjusts (IPv4 ICMP, unknown) → caller
-/// no-ops with `Some(())`, never propagates as a failure.
+/// Per-protocol delta of the L4 checksum field from the start of the IPv4
+/// L4 header. `None` => protocol carries no L4 checksum field this module
+/// adjusts (IPv4 ICMP, IPv4 protocol 58, unknown) → caller no-ops with
+/// `Some(())`. NOTE: NO ICMPv6 arm — IPv4 packets never carry ICMPv6, and
+/// the IPv4 NAT adjust paths call this without protocol filtering, so a
+/// stray ICMPv6 arm would change live behavior (Codex r2 #2).
 #[inline(always)]
-fn l4_checksum_offset(protocol: u8, base: usize) -> Option<usize> {
-    let delta = match protocol {
-        PROTO_TCP => 16,
-        PROTO_UDP => 6,
-        PROTO_ICMPV6 => 2,
-        _ => return None,
-    };
-    base.checked_add(delta)
+fn l4_checksum_field_delta_v4(protocol: u8) -> Option<usize> {
+    match protocol {
+        PROTO_TCP => Some(16),
+        PROTO_UDP => Some(6),
+        _ => None,
+    }
+}
+
+/// Per-protocol delta of the L4 checksum field from the start of the IPv6
+/// L4 header (after the fixed 40-byte IPv6 header). `None` => no adjusted
+/// L4 checksum field (unknown) → caller no-ops with `Some(())`.
+#[inline(always)]
+fn l4_checksum_field_delta_v6(protocol: u8) -> Option<usize> {
+    match protocol {
+        PROTO_TCP => Some(16),
+        PROTO_UDP => Some(6),
+        PROTO_ICMPV6 => Some(2),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -193,20 +245,20 @@ fn adjust_zero_checksum_illegal(protocol: u8, family: ChecksumFamily) -> bool {
 }
 ```
 
-Rationale: the offset is genuinely single-source across all 5 sites and the
-helper absorbs both the delta table AND the `base + delta` arithmetic, so
-the call site is one `let-else` line — that is what makes the refactor
-LOC-negative. The zero-canonicalization guard legitimately differs by
-family (the #1724 correctness point), so it carries a `ChecksumFamily` arg
-with both arms written out. `l4_udp_checksum_optional` is kept separate per
-both reviewers so the RFC-768 skip is not confused with canonicalization.
-Every caller passes a literal `V4`/`V6`; under `#[inline(always)]` the
-match folds to a constant → identical codegen to today, zero dynamic
-dispatch.
+Rationale: the offset delta table is single-sourced PER FAMILY (v4 has no
+ICMPv6 arm, preserving current IPv4-proto-58 no-op behavior). The
+`checked_add` stays at the call site so overflow remains a failure (`?`),
+NOT folded into the unsupported-protocol `None`. The zero-canonicalization
+guard legitimately differs by family (the #1724 correctness point), so it
+carries a `ChecksumFamily` arg with both arms written out.
+`l4_udp_checksum_optional` is kept separate per both reviewers so the
+RFC-768 skip is not confused with canonicalization. Every caller passes a
+literal family; under `#[inline(always)]` the match folds to a constant →
+identical codegen to today, zero dynamic dispatch.
 
-### Call-site transformation (Class A site 1 shown)
+### Call-site transformation (Class A site 1, IPv4, shown)
 
-Before (5 lines for the match + 1 for the guard):
+Before (4 lines for the match + 1 for the guard):
 ```rust
 let checksum_offset = match protocol {
     PROTO_TCP => ihl.checked_add(16)?,
@@ -216,35 +268,42 @@ let checksum_offset = match protocol {
 ...
 if matches!(protocol, PROTO_UDP) && updated == 0 { updated = 0xffff; }
 ```
-After (1 line for the offset + 1 for the guard):
+After:
 ```rust
-let Some(checksum_offset) = l4_checksum_offset(protocol, ihl) else {
-    return Some(());   // unknown proto → no-op success (NOT a failure)
+let delta = match l4_checksum_field_delta_v4(protocol) {
+    Some(d) => d,
+    None => return Some(()),      // unsupported proto → no-op success
 };
+let checksum_offset = ihl.checked_add(delta)?;   // overflow → None (failure), preserved
 ...
 if adjust_zero_checksum_illegal(protocol, ChecksumFamily::V4) && updated == 0 {
     updated = 0xffff;
 }
 ```
 
-- Site 2/4 (v6): `l4_checksum_offset(protocol, 40)`.
-- Site 5 (`adjust_l4_checksum_ipv6_addr_bytes`): `l4_checksum_offset(protocol, 40)`
-  yields `56`/`46`/`42` exactly (`40+16`/`40+6`/`40+2`), replacing the
-  hard-coded constants. Build-time codegen check confirms the
-  `#[inline(always)]` fn still folds to constant offsets.
+- Site 1/3 (v4): `l4_checksum_field_delta_v4` + `ihl.checked_add(delta)?`.
+- Site 2/4 (v6): `l4_checksum_field_delta_v6` + `40usize.checked_add(delta)?`.
+- Site 5 (`adjust_l4_checksum_ipv6_addr_bytes`): v6 delta +
+  `40usize.checked_add(delta)?` yields `56`/`46`/`42` exactly
+  (`40+16`/`40+6`/`40+2`), replacing the hard-coded constants. Build-time
+  codegen check confirms the `#[inline(always)]` fn still folds to constant
+  offsets.
 - Site 3 (`adjust_l4_checksum_ipv4_words`) pre-adjust skip (checksum.rs:376)
   becomes `if l4_udp_checksum_optional(protocol) && current == 0 { return
   Some(()); }` — RFC-768 concept kept textually separate.
 
-`let-else` is mandatory over `?`: `?` on the `Option<usize>` would `return
-None` (a failure) but the original `_` arm is `return Some(())` (no-op
-success).
+The `match { None => return Some(()) }` form (NOT `?`) is mandatory: the
+helper's `None` means unsupported protocol (no-op success), whereas `?`
+would `return None` (a failure). Overflow failure is preserved separately
+by the `checked_add(delta)?` at the call site.
 
 ## Public API preservation
 
 NO public signatures change. The 7 `pub(in crate::afxdp)` / `pub(super)`
-functions keep identical signatures and visibility. The two new helpers are
-private (`fn`, file-local). No callers in `frame/mod.rs`, `nat64.rs`,
+functions keep identical signatures and visibility. The four new helpers
+(`l4_checksum_field_delta_v4`, `l4_checksum_field_delta_v6`,
+`l4_udp_checksum_optional`, `adjust_zero_checksum_illegal`) are private
+(`fn`, file-local). No callers in `frame/mod.rs`, `nat64.rs`,
 `poll_stages.rs`, `tx/tcp_segmentation.rs`, `frame/build/*` are touched.
 
 ## Hidden invariants the change must preserve
@@ -280,10 +339,12 @@ private (`fn`, file-local). No callers in `frame/mod.rs`, `nat64.rs`,
   `simd_checksum_tests` parity / one's-complement-wrap + `frame/tests.rs`
   checksum tests) green.
 - **New unit tests** in `checksum.rs` test module:
-  - `l4_checksum_offset(proto, base)`: returns `base+16`/`base+6`/`None` for
-    TCP/UDP/IPv4-ICMP, and `base+2` for ICMPV6; `None` for unknown. Asserted
-    for `base=20` (v4 IHL) and `base=40` (v6), and that `base=40` reproduces
-    `56/46/42`.
+  - `l4_checksum_field_delta_v4(proto)`: `Some(16)`/`Some(6)` for TCP/UDP;
+    **`None` for IPv4 ICMP, protocol 58 (ICMPv6), and unknown** (the
+    proto-58 no-op regression guard from Codex r2 #2).
+  - `l4_checksum_field_delta_v6(proto)`: `Some(16)`/`Some(6)`/`Some(2)` for
+    TCP/UDP/ICMPV6; `None` for unknown. Assert `40 + delta` reproduces
+    `56/46/42` for site 5.
   - `adjust_zero_checksum_illegal`: true for (V4, UDP) only — false for
     (V4, TCP/ICMP/ICMPV6); true for (V6, UDP) and (V6, ICMPV6) — false for
     (V6, TCP).
@@ -316,7 +377,7 @@ for AGY + SMR:
 1. **Is the dedup worth it at all?** 5 sites, ~20-30 LOC saved, zero perf.
    Over-abstraction (PLAN-KILL) or genuine maintainability win (offset
    table single-source)? Codex round-1 said "worth doing after the edits".
-2. **Predicate name + scope.** Is `adjust_zero_checksum_is_illegal` with
+2. **Predicate name + scope.** Is `adjust_zero_checksum_illegal` with
    the "incremental-adjust ONLY" doc comment a sufficiently clear guard
    against a future dev extending it to `recompute_l4_checksum_ipv6` (which
    would change behavior on the v6-ICMPv6 arm)? Or should the predicate
