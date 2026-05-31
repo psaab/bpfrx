@@ -92,3 +92,37 @@ func TestValidateRoutingRuleWindowWarnings(t *testing.T) {
 		}
 	})
 }
+
+// TestValidateConfigSurfacesRoutingRuleWindowWarnings asserts the
+// over-limit warnings actually flow out of the commit-time entry point
+// ValidateConfig, not just the standalone helper. If the wiring in
+// ValidateConfig were dropped, the operator would lose the warning even
+// though the helper-level tests above still pass.
+func TestValidateConfigSurfacesRoutingRuleWindowWarnings(t *testing.T) {
+	cfg := &Config{}
+	for i := 0; i < 101; i++ {
+		cfg.RoutingOptions.StaticRoutes = append(cfg.RoutingOptions.StaticRoutes,
+			&StaticRoute{Destination: "10.0.0.0/8", NextTable: "vr"})
+	}
+	for i := 0; i < 51; i++ {
+		cfg.RoutingInstances = append(cfg.RoutingInstances,
+			&RoutingInstanceConfig{InterfaceRoutesRibGroup: "leak"})
+	}
+
+	warnings := ValidateConfig(cfg)
+	var sawNextTable, sawRibGroup bool
+	for _, w := range warnings {
+		if strings.Contains(w, "next-table") && strings.Contains(w, "ignored at") {
+			sawNextTable = true
+		}
+		if strings.Contains(w, "rib-group") && strings.Contains(w, "ignored at") {
+			sawRibGroup = true
+		}
+	}
+	if !sawNextTable {
+		t.Errorf("ValidateConfig did not surface the next-table over-limit warning; got %v", warnings)
+	}
+	if !sawRibGroup {
+		t.Errorf("ValidateConfig did not surface the rib-group over-limit warning; got %v", warnings)
+	}
+}

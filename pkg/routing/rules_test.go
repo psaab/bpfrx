@@ -260,6 +260,14 @@ func TestRibGroupRulesPriorityCap(t *testing.T) {
 			t.Fatalf("expected 50 tables * 2 = 100 rules at the limit, got %d", total)
 		}
 		assertAllRulesInRange(t, ops, ribGroupRulePriority, ribGroupRulePriority+100)
+		// The 50th (last admitted) table must occupy the final in-range
+		// pair: IPv4 at 33098, IPv6 at 33099.
+		if !hasPriority(ops, unix.AF_INET, ribGroupRulePriority+98) {
+			t.Errorf("expected IPv4 rule at the last in-range slot %d", ribGroupRulePriority+98)
+		}
+		if !hasPriority(ops, unix.AF_INET6, ribGroupRulePriority+99) {
+			t.Errorf("expected IPv6 rule at the last in-range slot %d", ribGroupRulePriority+99)
+		}
 	})
 
 	t.Run("over-limit", func(t *testing.T) {
@@ -274,6 +282,12 @@ func TestRibGroupRulesPriorityCap(t *testing.T) {
 			t.Fatalf("expected cap to hold at 100 rules (50 tables), got %d", total)
 		}
 		assertAllRulesInRange(t, ops, ribGroupRulePriority, ribGroupRulePriority+100)
+		// The 51st table (would-be slots 33100/33101) must be absent.
+		if hasPriority(ops, unix.AF_INET, ribGroupRulePriority+100) ||
+			hasPriority(ops, unix.AF_INET6, ribGroupRulePriority+101) {
+			t.Errorf("51st table leaked beyond the cleared window (slot %d/%d present)",
+				ribGroupRulePriority+100, ribGroupRulePriority+101)
+		}
 
 		// Re-apply must not leak: all programmed rules are inside the
 		// cleared window.
@@ -285,6 +299,17 @@ func TestRibGroupRulesPriorityCap(t *testing.T) {
 			t.Fatalf("re-apply leaked rib-group rules: expected 100, got %d", total)
 		}
 	})
+}
+
+// hasPriority reports whether any rule in the family was programmed at
+// the exact priority.
+func hasPriority(ops *fakeRuleOps, family, prio int) bool {
+	for _, r := range ops.rules[family] {
+		if r.Priority == prio {
+			return true
+		}
+	}
+	return false
 }
 
 // assertAllRulesInRange fails the test if any programmed rule in either
