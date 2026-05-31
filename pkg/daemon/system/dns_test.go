@@ -61,6 +61,17 @@ func TestRenderResolvedDropin(t *testing.T) {
 				"Domains=example.com corp.example.com lab.example.com\n",
 		},
 		{
+			// Compatibility invariant: with no domain-name, the
+			// de-dup guard must NOT drop an empty-string search
+			// element, so the render matches the old
+			// strings.Join(search, " ") byte-for-byte. (Parser-
+			// unreachable today, but the guard keeps the renderer
+			// total and pins the divergence-free behavior.)
+			name: "empty-string search element is preserved when domain-name unset",
+			in:   ResolvedDropinInput{DomainSearch: []string{""}},
+			want: dropinHeader + "Domains=\n",
+		},
+		{
 			// De-dup: a search entry equal to the (non-empty)
 			// domain-name is dropped so the primary domain is not
 			// repeated; distinct suffixes keep their order.
