@@ -3,6 +3,7 @@ package config
 // Security policy domain: zones, policies, NAT, screen/IDS, address book,
 // applications, flow/session, ALG, logging, IPsec/IKE, dynamic-address
 // feeds, and the [edit schedulers] policy time-range scheduler.
+
 // SchedulerConfig defines a time-based policy scheduler.
 type SchedulerConfig struct {
 	Name      string

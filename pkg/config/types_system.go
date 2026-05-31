@@ -3,6 +3,7 @@ package config
 // System and platform-services configuration: system stanza, userspace
 // dataplane, syslog, SNMP, login, REST API auth, RPM, flow-monitoring,
 // forwarding-options, firewall filters/policers, and DHCP server/relay.
+
 // SystemConfig holds system-level configuration.
 type SystemConfig struct {
 	HostName                 string

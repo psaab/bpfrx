@@ -2,6 +2,7 @@ package config
 
 // Chassis cluster, redundancy groups, interface/IP monitoring, event
 // policies, and bridge domains.
+
 // ChassisConfig holds chassis-level configuration (clustering, etc).
 type ChassisConfig struct {
 	Cluster *ClusterConfig

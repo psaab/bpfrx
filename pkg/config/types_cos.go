@@ -3,6 +3,7 @@ package config
 // Class-of-service: forwarding classes, DSCP/IEEE-802.1p classifiers and
 // rewrite rules, queue schedulers, scheduler-maps, per-interface shaping,
 // and fairness expectations.
+
 // ClassOfServiceConfig holds CoS forwarding classes, schedulers,
 // scheduler-maps, and per-interface shaping configuration.
 type ClassOfServiceConfig struct {

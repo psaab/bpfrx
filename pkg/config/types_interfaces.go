@@ -2,6 +2,7 @@ package config
 
 // Physical and logical interface configuration: units, VRRP, DHCPv4/v6
 // client options, and aggregated-ether (LAG) options.
+
 // InterfacesConfig holds interface configuration.
 type InterfacesConfig struct {
 	Interfaces map[string]*InterfaceConfig

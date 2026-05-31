@@ -3,6 +3,7 @@ package config
 // Routing: routing-options, policy-options, dynamic protocols
 // (OSPF/OSPFv3/BGP/RIP/IS-IS/LLDP), router advertisement, tunnels, and
 // VRF routing instances.
+
 // PolicyOptionsConfig holds prefix-lists, communities, as-paths, and policy-statements for routing control.
 type PolicyOptionsConfig struct {
 	PrefixLists      map[string]*PrefixList
