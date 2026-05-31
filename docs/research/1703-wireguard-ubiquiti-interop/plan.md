@@ -1,6 +1,7 @@
 # #1703 — WireGuard interop with Ubiquiti (UniFi Network 10.4+, EdgeOS, UDM): research plan
 
-Revision: r3 (r2 + Codex r2 fix: split S2 handshake gate vs S3 transport gate)
+Revision: r4 (r3 + Codex r3 fix: S2 acceptance is handshake-message validity +
+session derivation, NOT peer `latest handshake` which is key-confirmation-gated)
 Branch: `research/1703-wireguard-ubiquiti-interop`
 Scope: `/research` only. No production code, no PR. Deliverable = converged
 plan-of-action + 3-reviewer verdicts + issue comment. Implementation gated on
@@ -420,13 +421,20 @@ wireguard-go/kernel WG is byte-identical to what UniFi runs.
    type byte + reserved + sender/receiver index, `mac1` = **keyed-BLAKE2s**
    (NOT HMAC; SMR r1 #3) over `HASH("mac1----" || peer.static_public)`, `mac2`
    (zeros until a cookie is seen), and the TAI64N timestamp carried as the
-   Noise PAYLOAD of msg 1. **Acceptance: flip the HANDSHAKE-ONLY xfails green**
-   — i.e. Test 1a/2a (a valid msg1/msg2 is emitted/parsed, `mac1` verifies
-   against the peer pubkey, TAI64N present and monotonic, and the peer's
-   `wg show` reports `latest handshake` non-zero). It does NOT assert
-   ping/iperf transport — that requires the production hot path wired in S3, so
-   the transport-flow assertions (Test 1b/2b) stay xfail until S3
-   (Codex r2 finding). S2 may complete a handshake through a thin
+   Noise PAYLOAD of msg 1. **Acceptance: flip the HANDSHAKE-MESSAGE xfails
+   green** — i.e. Test 1a/2a (xpf emits a valid msg1 / replies with a valid
+   msg2, `mac1` verifies against the peer pubkey, TAI64N present and monotonic,
+   and xpf CONSUMES the peer's msg2/msg1 and DERIVES a transport session).
+   **S2 acceptance must NOT depend on the peer's `wg show` `latest handshake`
+   field** — kernel WG (`wg_timers_handshake_complete`) marks a handshake
+   "complete" only after the first authenticated data/keepalive
+   (key-confirmation) packet, which is C4/S5 work, not S2 (Codex r3 finding).
+   Asserting `latest handshake` in S2 would force a zero-length transport send
+   into S2 and re-create the test-only-path risk in a subtler form. S2 asserts
+   handshake-message validity + session derivation; key-confirmation
+   observability lands with C4/S5; full transport lands in S3. It does NOT
+   assert ping/iperf transport (Test 1b/2b stay xfail until S3, Codex r2
+   finding). S2 may complete the handshake message exchange through a thin
    control-thread harness without the AF_XDP worker carrying data. TAI64N MUST
    be monotonic and persisted across control-plane restart + HA-replicated
    (SMR r1 #1) so xpf never DoSes its own handshakes with a backwards
@@ -473,8 +481,12 @@ AF_XDP hot path are implemented in different sub-issues (Codex r2 finding):
 
 - **Test 1a (xpf initiator handshake → wg responder):** xpf emits a valid msg1
   (correct type byte, sender_index, `mac1` verifying against wg's pubkey,
-  monotonic TAI64N); assert wg's `latest handshake` becomes non-zero. Lands in
-  S1 as **xfail** (wg drops today: no mac1/type/TAI64N). **S2** flips green.
+  monotonic TAI64N); wg accepts msg1 and emits a valid msg2; xpf consumes msg2
+  and derives a transport session. Assert via wireguard-go's accept/log (msg1
+  authenticated, msg2 sent) and xpf-side session derivation — NOT via wg's
+  `latest handshake`, which only flips after key confirmation (Test 2c / C4).
+  Lands in S1 as **xfail** (wg drops today: no mac1/type/TAI64N). **S2** flips
+  green.
 - **Test 1b (xpf→wg transport):** ping/iperf inner flow round-trips; `wg show`
   payload counters increment. xfail until **S3** (real hot-path encap/decap).
 - **Test 2a (wg initiator handshake → xpf responder):** wg initiates; assert

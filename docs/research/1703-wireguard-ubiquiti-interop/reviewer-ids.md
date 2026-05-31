@@ -9,3 +9,12 @@
 - Claude-SMR: claude-smr-plan-r2.md — PLAN-READY (all r1 findings closed)
 - Codex: (round-2 pending)
 - AGY: (round-2 pending)
+
+## Round 3
+- Codex: codex-companion round-3 job (adversarial-review) — 1 finding: S2 must not assert peer `latest handshake` (key-confirmation gated). Closed in r4.
+- Claude-SMR: claude-smr-plan-r4.md — PLAN-READY (Codex r3 closed)
+
+## Round 2 (detail)
+- Codex r2 job: 1 finding (S2/S3 gating) — closed in r3
+- AGY r2 job adversarial-review-mpt4vk82-e97hod: lost (searched wrong worktree path; infra artifact, not a verdict)
+- AGY r2 RETRY job adversarial-review-mpt53bi2-4xnrt9: (pending)
