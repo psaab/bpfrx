@@ -236,12 +236,23 @@ FIB lookup which may return different results in multi-VRF deployments.
 
 ## Phase 6: SYN Cookie Implementation (H4)
 
-Status: Not Started
+Status: Done. The userspace screen module mints and validates SYN
+cookies. `ScreenVerdict::SynCookieChallenge` is emitted from
+`screen/mod.rs`, enqueued as a SYN-ACK in
+`afxdp/poll_descriptor/mod.rs` and counted via `syn_cookie_syn_ack_sent`
+(`afxdp/poll_descriptor/cookie_reply.rs`); ACK validation is in
+`screen/mod.rs` and wired at `afxdp/poll_stages.rs`. The cookie codec,
+SipHash24 MAC, and validated-client cache live in
+`userspace-dp/src/screen/syncookie.rs`. Remaining open items are
+under-flood benchmark/validation and the stateful `syn-proxy` mode (not
+implemented). The design notes below are retained for historical
+context.
 
-### Root Cause
+### Root Cause (historical)
 
-Screen module drops SYN floods but cannot issue SYN-ACK cookies like the
-eBPF dataplane (`xdp_screen.c`).
+Before #1374 the userspace screen module dropped SYN floods but could
+not issue SYN-ACK cookies like the eBPF dataplane (`xdp_screen.c`); the
+sections below describe the design that closed that gap.
 
 ### Fix
 
