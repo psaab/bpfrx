@@ -73,6 +73,16 @@ type Daemon struct {
 	ipsec                      *ipsec.Manager
 	ra                         *ra.Manager
 	dhcp                       *dhcp.Manager
+	// dnsBootDone gates the #1715 DNS boot policy. It is false during the
+	// single boot-time applyConfig (which runs before DHCP clients start,
+	// so the lease set is empty) and set true immediately after. While
+	// false, an empty DNS merge only repairs a dangling/stub/missing
+	// /etc/resolv.conf and never clobbers a pre-existing good file; once
+	// true, an empty merge is a declarative "clear DNS" (deleting all
+	// `name-server` / expiring the last lease clears the file). Written
+	// once after the boot apply and read only under applySem in
+	// reconcileDNSLocked.
+	dnsBootDone                bool
 	dhcpServer                 *dhcpserver.Manager
 	feeds                      *feeds.Manager
 	rpm                        *rpm.Manager

@@ -882,10 +882,19 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 		slog.Warn("failed to update VRRP instances", "err", err)
 	}
 
-	// 9. Apply system DNS and NTP configuration
-	d.applySystemDNS(cfg)
+	// 9. Apply system DNS and NTP configuration.
+	//
+	// #1715: a single locked reconcileDNS owns /etc/resolv.conf as a
+	// managed plain file (resolved disabled+masked), merging static
+	// `system name-server` with live DHCP-learned servers. It replaces
+	// the prior applySystemDNS (resolved drop-in + restart) and
+	// applyDNSService (disable resolved) pair, whose apply order
+	// (write-drop-in-then-disable) was a self-inflicted race that left
+	// /etc/resolv.conf a dangling symlink. bootEmptyRepairOnly is set
+	// before DHCP clients start so the first apply does not blank a good
+	// resolv.conf when no static name-server is configured yet.
+	d.reconcileDNSLocked(cfg, !d.dnsBootDone)
 	d.applySystemNTP(cfg)
-	d.applyDNSService(cfg)
 
 	// 9.5. Apply system hostname, timezone, and kernel tuning
 	d.applyHostname(cfg)

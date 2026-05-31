@@ -370,6 +370,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 			d.applyConfig(cfg)
 		}
 	}
+	// #1715: the boot-time DNS reconcile (inside the apply above) ran
+	// before DHCP clients start, so its empty-merge policy was
+	// repair-only. From here on, an empty DNS merge means "clear DNS".
+	// Set under applySem so reconcileDNSLocked (which reads it) never
+	// races: applyConfig has released the lock by now, and every later
+	// reader re-acquires it.
+	_ = d.applySem.Acquire(context.Background(), 1)
+	d.dnsBootDone = true
+	d.applySem.Release(1)
 
 	// Remove stale blackhole routes from previous daemon runs before
 	// cluster comms start (which may inject new ones).
