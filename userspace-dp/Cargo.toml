@@ -26,6 +26,16 @@ smallvec = "1.13"
 # output queues. The transitive crypto set includes
 # chacha20poly1305/curve25519-dalek/blake2 and ring.
 snow = "0.10"
+# WireGuard S1 (#1709): on-wire handshake framing + TAI64N. blake2 backs
+# the MAC1 keyed-BLAKE2s-128 over HASH("mac1----"||recipient_pub) and the
+# WG construction-hash KAT vectors; curve25519-dalek derives the engine's
+# local static public key (MontgomeryPoint::mul_base_clamped) once at
+# construction for inbound MAC1 verification. Both are already in the
+# transitive crypto set via snow at these exact locked versions —
+# promoting them to direct deps changes no resolved version, only the
+# visibility (verified: cargo tree shows blake2 0.10.6, dalek 4.1.3).
+blake2 = "0.10"
+curve25519-dalek = "4.1"
 # zeroize is already pulled transitively by curve25519-dalek/snow; we
 # pin the version we use directly for the engine's static-key state
 # so the WG private key is wiped on engine drop. Cost: zero — just a

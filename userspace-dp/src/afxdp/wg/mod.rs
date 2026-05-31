@@ -43,6 +43,7 @@ pub(crate) mod mss;
 pub(crate) mod peer;
 pub(crate) mod scratch;
 pub(crate) mod session;
+pub(crate) mod tai64n;
 
 #[cfg(test)]
 #[path = "tests.rs"]
