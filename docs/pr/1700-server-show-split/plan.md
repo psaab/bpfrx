@@ -1,6 +1,12 @@
 # #1700 — `pkg/grpcapi/server_show.go` intra-package decomposition
 
-Status: DRAFT v1 — pending adversarial plan review
+Status: v2 — PLAN-READY (Claude-SMR + AGY PLAN-READY/MINOR; Codex
+PLAN-NEEDS-MAJOR on v1 doc-text staleness only, all invariants
+confirmed). v2 incorporates: zero new files (AGY+Codex#1), consistent
+shared-`*strings.Builder` helper shapes (Codex#2), runtime-branch
+golden coverage via deterministic stubs + normalizer (Codex#3+AGY#6),
+and ShowText-local (not package-wide) cfg single-fetch phrasing
+(Codex caveat).
 
 ## 1. Issue framing
 
@@ -44,14 +50,10 @@ or "not byte-identical" kill does.)
   helpers in 12 existing `server_show_*.go` files. Each carries a
   `// #1043 Phase N: case body extracted to <file>` breadcrumb.
 - #1687: NAT renderers → `pkg/natshow` (cross-consumer share).
-- This plan composes with both: new extractions land in the SAME
-  existing topic files where a topic already has a home (e.g. `ike`
-  → `server_show_security_text.go` alongside `showIPsecStatistics`),
-  and create a small number of new files only for topics with no
-  existing home (routing-options/forwarding-options/vlans →
-  `server_show_routing_text.go`; the route-* / test-* / firewall-
-  filter / class-of-service / screen-* prefix handlers →
-  `server_show_prefix.go`).
+- This plan composes with both. **v2: ZERO new files** (AGY + Codex
+  finding #1) — every helper lands in an EXISTING domain file (see §4
+  table), all of which have ample room below the 1500-LOC floor
+  (largest receiver post-move ~850 LOC per Codex's audit).
 
 ## 4. Concrete design
 
@@ -84,42 +86,42 @@ Two branch shapes exist and each maps to one helper signature:
    firewall-filter:, and the trailing default `monitor-security-flow`
    / `log:` / unknown-topic block). These already `return
    &pb.ShowTextResponse{...}, nil` or `return nil, status.Errorf(...)`
-   early. They become:
+   early.
+
+   **v2 helper shape (Codex finding #2 — pick ONE shape):** every
+   prefix handler takes the SHARED `buf` and returns
+   `(*pb.ShowTextResponse, error)`, because the shared `buf` is
+   provably empty at first-prefix-check (line 97 declares it, nothing
+   writes before line 100) and reusing it avoids a redundant
+   `strings.Builder` allocation (AGY refinement #2):
 
    ```go
    func (s *Server) showRouteTable(req *pb.ShowTextRequest,
-       cfg *config.Config) (*pb.ShowTextResponse, error)
+       cfg *config.Config, buf *strings.Builder) (*pb.ShowTextResponse, error)
    ```
 
    and `ShowText` becomes, for each prefix branch:
 
    ```go
    if strings.HasPrefix(req.Topic, "route-table:") {
-       return s.showRouteTable(req, cfg)
+       return s.showRouteTable(req, cfg, &buf)
    }
    ```
 
    The error-returning `switch` cases that currently do
    `if err := s.showX(...); err != nil { return nil, err }` are
-   ALREADY one-liners and stay as-is (no change needed) — they were
-   extracted in #1043. Only the still-inline ones move.
+   ALREADY one-liners and stay as-is — extracted in #1043. Only the
+   still-inline ones move.
 
-The trailing default block (`monitor-security-flow` / `log:` /
-unknown) returns errors; it becomes a helper returning
-`(*pb.ShowTextResponse, error)` and the default case becomes
-`default: return s.showDefaultTopic(req, &buf)`. Because the default
-already may have written `buf` content earlier? — NO: inspection
-confirms the default branch is reached only when no prior case
-matched, and it writes only its own content before the shared
-`return &pb.ShowTextResponse{Output: buf.String()}, nil`. The
-`monitor-security-flow` arm writes to `buf` then falls through to the
-shared return; the `log:` arm `buf.Write(out)` then shared return;
-the else arm returns an error. The helper must reproduce exactly:
-write to its own buffer and return the response, OR take `&buf` and
-return only `(handled, err)`. To preserve byte-identity with zero
-risk, the default helper takes `*strings.Builder` and returns
-`error`; `ShowText` keeps the final `return &pb.ShowTextResponse{
-Output: buf.String()}, nil` so the default arm is:
+**Default block.** The trailing default (`monitor-security-flow` /
+`log:` / unknown) is mutually exclusive with every case (no
+`fallthrough`; confirmed by AGY + Codex) and writes only its own
+content before the shared
+`return &pb.ShowTextResponse{Output: buf.String()}, nil` (~line 1982).
+For consistency with the existing error-returning cases
+(`commit-history`, `route-all`), the default helper takes the shared
+`*strings.Builder` and returns only `error`; `ShowText` keeps the
+final shared return:
 
    ```go
    default:
@@ -128,27 +130,33 @@ Output: buf.String()}, nil` so the default arm is:
        }
    ```
 
-This is identical in structure to existing error-returning cases
-(e.g. `commit-history`, `route-all`).
+This is the SINGLE consistent rule: switch-case bodies and the
+default take `(cfg, *buf)` / `(req, *buf)` and write to the shared
+buf; prefix handlers take `(req, cfg, *buf)` and return the response
+directly (they are early-returns). No helper allocates its own
+buffer.
 
-### File assignment (topic seams)
+### File assignment (topic seams) — v2, ZERO new files
 
-| New/existing file | Helpers moved in |
+Per AGY refinement #1 + Codex finding #1, no new files. Every helper
+lands in an existing domain file (post-move LOC stays well under 1500;
+largest receiver ~850 per Codex):
+
+| Existing file | Helpers moved in |
 |---|---|
-| `server_show_prefix.go` (NEW) | route-table/route-protocol/route-prefix; class-of-service; test-policy/test-routing/test-zone; firewall-filter; default (monitor-security-flow/log:/unknown) |
-| `server_show_security_text.go` (existing) | screen-ids-option/screen-statistics/screen-statistics-all/screen-ids-option-detail prefix handlers; `screen` case; `ike` case; alg; dynamic-address; address-book |
-| `server_show_routing_text.go` (NEW) | routing-options; forwarding-options; forwarding-options-port-mirroring; vlans; routing-instances; routing-instances-detail; route-instance; bfd-peers; route-map |
-| `server_show_system.go` (existing) | backup-router; login; internet-options; root-authentication; core-dumps; task; buffers; buffers-detail; ntp-adjacent system topics; `log` case |
-| `server_show_flow.go` (existing) | ipv6-router-advertisement (RA is flow/interface-adjacent) — OR `server_show_interfaces_text.go`; reviewer call |
-| `server_show_events.go` (existing) | event-options |
+| `server_show_routes_text.go` | route-table:/route-protocol:/route-prefix: prefix handlers; test-routing:; routing-options; routing-instances; routing-instances-detail; route-instance; route-map; bfd-peers |
+| `server_show_firewall.go` | firewall-filter: prefix handler; test-policy: prefix handler; `firewallFilterTermExpansionCount` already lives here / moves here |
+| `server_show_interfaces_text.go` | class-of-service[:] prefix handler; vlans; ipv6-router-advertisement |
+| `server_show_zones_text.go` | test-zone: prefix handler |
+| `server_show_forwarding.go` | forwarding-options; forwarding-options-port-mirroring |
+| `server_show_security_text.go` | screen-ids-option:/screen-statistics:/screen-statistics-all/screen-ids-option-detail: prefix handlers; `screen` case; `ike`; alg; dynamic-address; address-book; `screenSYNCookieCounterRows` |
+| `server_show_system.go` | backup-router; login; internet-options; root-authentication; core-dumps; task; buffers; buffers-detail; `log` case; default (monitor-security-flow/log:/unknown); `writeRPMConfig` |
+| `server_show_events.go` | event-options |
 
-Exact home for a couple of borderline topics (ipv6-router-
-advertisement, screen prefix handlers) is an open question for
-reviewers (§11). The `screenSYNCookieCounterRows`,
-`firewallFilterTermExpansionCount`, and `writeRPMConfig` free
-functions move with their consuming topic (screen-* → security_text;
-firewall-filter → prefix; writeRPMConfig stays where `rpm`-adjacent
-helpers live or moves to system).
+Free functions move with their consuming topic:
+`screenSYNCookieCounterRows` → security_text;
+`firewallFilterTermExpansionCount` → firewall;
+`writeRPMConfig` → system (RPM-adjacent).
 
 ## 5. Public API preservation
 
@@ -161,11 +169,14 @@ are unchanged.
 ## 6. Hidden invariants the change must preserve
 
 - **Byte-identical output** for every topic — guarded by golden
-  tests (§9). `cfg := s.store.ActiveConfig()` is read once at the top
-  of `ShowText` and passed into helpers; helpers must NOT re-fetch
-  (re-fetch could observe a different active config mid-call). All
-  helpers receive `cfg` as a parameter — no helper calls
-  `s.store.ActiveConfig()`.
+  tests (§9). **ShowText-local** invariant (NOT package-wide — Codex
+  caveat: existing helpers `showRPM`, `showAlarms` already re-fetch
+  config independently): `cfg := s.store.ActiveConfig()` is read once
+  at the top of `ShowText` and the still-inline bodies being extracted
+  here all read that single `cfg` and NONE re-fetch. The extracted
+  helpers therefore receive `cfg` as a parameter and must NOT call
+  `s.store.ActiveConfig()` themselves — preserving the current
+  single-fetch behavior of these specific branches.
 - **Dispatch order** — prefix handlers run before the switch; the
   switch order is irrelevant (exact-match) but the prefix `if`-chain
   order is preserved (no prefix is a prefix of another that would
@@ -220,14 +231,37 @@ output into a `map[topic]want` baked into a new
 `server_show_golden_test.go`. After the split, the same test re-runs
 `ShowText` and asserts equality. Because the baseline is captured
 pre-split and the test is committed in the FIRST commit (before any
-extraction), every subsequent extraction commit is gated by it. Any
-topic whose output can't be reproduced deterministically with a
-fixture (e.g. `storage` shells out to `df`, `core-dumps` lists
-`/var/cores`, `task` reads runtime) is covered by a structural assert
-(non-empty / no panic) plus manual diff of the moved code, and that
-limitation is documented in the test. The topics that DO render
-purely from `cfg` (the large majority: alg, ike, vlans, routing-*,
-forwarding-*, screen, address-book, etc.) get exact byte asserts.
+extraction), every subsequent extraction commit is gated by it.
+
+**v2 — runtime-branch coverage (Codex finding #3 + AGY refinement
+#6).** A cfg-only fixture is NOT a sufficient byte-identity proof: a
+silent-divergence hazard exists for topics with output behind RUNTIME
+state, not just `cfg`. Specifically:
+- `dynamic-address` (server_show.go:839/855) renders prefix counts
+  and "Last fetch ... ago" from `s.feedsFn` + `time.Since`. With
+  `feedsFn == nil` the whole inner branch is skipped and a regression
+  there goes undetected.
+- `screen-statistics:` / `screen-statistics-all` / `firewall-filter:`
+  hit-count rows and `ipv6-router-advertisement` status read runtime
+  counters / RA-manager state.
+
+The golden fixture therefore wires deterministic stubs so these
+branches are EXERCISED with stable output: set `s.feedsFn` to a fixed
+`map[string]feeds.FeedInfo` with a FIXED `LastFetch` timestamp; seed
+counter/RA state where the test `Server` allows. A **normalizer**
+(regex substitution of any residual dynamic tokens — durations,
+timestamps, sizes, goroutine/alloc numbers — to `<DATE>`/`<NUM>`/
+`<SIZE>` placeholders) is applied to BOTH the baseline and the
+post-split output so even the genuinely non-deterministic shell-out
+topics (`storage`→`df`, `core-dumps`→`/var/cores`, `task`→runtime,
+`log:`→`tail`) get a normalized byte-assert rather than a weak
+non-empty/no-panic check. Where a topic cannot be made deterministic
+even after normalization, that exact topic is named in the test with
+a documented rationale and falls back to a structural assert.
+
+Topics that render purely from `cfg` (the large majority: alg, ike,
+vlans, routing-*, forwarding-*, screen, address-book, etc.) get exact
+byte asserts directly.
 
 ## 10. Out of scope (explicitly)
 
@@ -239,41 +273,30 @@ forwarding-*, screen, address-book, etc.) get exact byte asserts.
   (a larger redesign; this PR keeps the if-chain + switch and only
   moves bodies). Could be a follow-up.
 
-## 11. Open questions for adversarial review
+## 11. Adversarial-review resolutions (round 1)
 
-1. **Is the default-block extraction byte-safe?** The default arm
-   shares the final `return &pb.ShowTextResponse{Output: buf.String()}`
-   with all switch cases. My design has the default helper write to
-   the SAME `&buf` and return only `error`, preserving the shared
-   return. Is there any path where the default block currently relies
-   on `buf` already containing content from a prior branch? (My read:
-   no — default is mutually exclusive with all cases.) Confirm.
-2. **Prefix-handler return shape.** Extracting each prefix handler as
-   `(req, cfg) (*pb.ShowTextResponse, error)` changes the call site
-   from inline `return &pb.ShowTextResponse{...}, nil` to `return
-   s.showX(req, cfg)`. Each handler builds its OWN local `buf`. Is
-   there any cross-handler `buf` sharing? (My read: each prefix branch
-   builds on the shared `buf` which is empty at that point because
-   prefix handlers are the first thing checked. Confirm the shared
-   `buf` is provably empty when each prefix handler runs — it is
-   declared `var buf strings.Builder` at line 97 and nothing writes
-   before the first prefix check.) If a handler must keep using the
-   shared `buf`, the signature should instead be `(req, cfg, buf)
-   (*resp, error)` to avoid a second allocation and any divergence.
-   Which is correct?
-3. **File-to-topic assignment.** Is `ipv6-router-advertisement` better
-   in `server_show_interfaces_text.go` than flow? Is the `screen*`
-   prefix family better split from the `screen` case? Push back if the
-   seams are wrong.
-4. **`cfg` single-fetch invariant.** Confirm no extracted helper
-   should call `s.store.ActiveConfig()` itself, and that passing the
-   once-fetched `cfg` is strictly behavior-preserving (it is the
-   current behavior — `cfg` is fetched once at top).
-5. **Golden test sufficiency.** Is a fixture-config-driven golden
-   table over all cfg-rendered topics + structural asserts for the
-   shell-out topics a sufficient byte-identity proof, or is there a
-   topic whose extraction can silently diverge undetected? Name it.
-6. **Does this decompose cleanly at all?** If the reviewer believes
-   the topics do NOT decompose along clean seams (e.g. helpers share
-   too much local state with the dispatcher), PLAN-KILL is the right
-   call.
+All six round-1 open questions were resolved by Claude-SMR + AGY +
+Codex with quoted-line evidence; no PLAN-KILL counterexample found.
+
+1. **Default-block byte-safety** — CONFIRMED safe by AGY + Codex.
+   Default is mutually exclusive (no `fallthrough`), `buf` empty on
+   entry (server_show.go:1954-1982), helper writes only its own
+   content. Resolved.
+2. **Prefix-handler shape** — RESOLVED to `(req, cfg, *buf) (*resp,
+   error)` reusing the shared (provably-empty, line 97→100) buf; no
+   redundant allocation, no divergence. Single consistent rule for all
+   helper shapes (§4).
+3. **File-to-topic assignment** — RESOLVED to ZERO new files (AGY #1 +
+   Codex #1); §4 table assigns every helper to an existing domain
+   file; largest receiver ~850 LOC, none crosses 1500.
+4. **`cfg` single-fetch** — CONFIRMED ShowText-local (Codex caveat:
+   not package-wide; existing `showRPM`/`showAlarms` re-fetch). No
+   extracted helper re-fetches; §6.
+5. **Golden-test sufficiency** — Codex named `dynamic-address`
+   (runtime `feedsFn`/`time.Since` branch) and screen/firewall-filter
+   counters / RA status as silent-divergence hazards under a cfg-only
+   fixture. RESOLVED: §9 wires deterministic stubs (fixed `feedsFn`
+   + `LastFetch`) and a normalizer over both baseline and post-split
+   output so runtime + shell-out topics get normalized byte-asserts.
+6. **Clean decomposition?** — CONFIRMED: same proven #1043 pattern,
+   opaque same-package body motion; not a #961/#946-P2 trap.
