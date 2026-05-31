@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -160,6 +161,169 @@ func TestNextTableRulesApply_Fake(t *testing.T) {
 	}
 	if got := ops.count(unix.AF_INET6); got != 1 {
 		t.Errorf("expected 1 IPv6 rule, got %d", got)
+	}
+}
+
+// TestNextTableRulesPriorityCap exercises the #1706 hard cap: programming
+// more next-table routes than the clear() window (100 priorities) must
+// stop at the boundary so every programmed rule stays inside the range
+// clear() scans — otherwise rules at prio >= 200 leak permanently. The
+// boundary case (exactly 100 routes) programs the full set; one over
+// triggers the cap.
+func TestNextTableRulesPriorityCap(t *testing.T) {
+	mkRoutes := func(n int) []*config.StaticRoute {
+		routes := make([]*config.StaticRoute, n)
+		for i := 0; i < n; i++ {
+			// Distinct /24 destinations, all pointing at the same table.
+			routes[i] = &config.StaticRoute{
+				Destination: fmt.Sprintf("10.%d.%d.0/24", i/256, i%256),
+				NextTable:   "dmz-vr",
+			}
+		}
+		return routes
+	}
+	instances := []*config.RoutingInstanceConfig{{Name: "dmz-vr", TableID: 101}}
+
+	// Exactly at the window size: all 100 admitted, none beyond range.
+	t.Run("at-limit", func(t *testing.T) {
+		ops := newFakeRuleOps()
+		nt := &nextTableManager{ops: ops}
+		if err := nt.Apply(mkRoutes(100), instances); err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		total := ops.count(unix.AF_INET) + ops.count(unix.AF_INET6)
+		if total != 100 {
+			t.Fatalf("expected all 100 routes programmed at the limit, got %d", total)
+		}
+		assertAllRulesInRange(t, ops, nextTableRulePriority, nextTableRulePriority+100)
+	})
+
+	// One over the window: cap fires, only 100 admitted, none out of range.
+	t.Run("over-limit", func(t *testing.T) {
+		ops := newFakeRuleOps()
+		nt := &nextTableManager{ops: ops}
+		if err := nt.Apply(mkRoutes(150), instances); err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		total := ops.count(unix.AF_INET) + ops.count(unix.AF_INET6)
+		if total != 100 {
+			t.Fatalf("expected cap to hold at 100 programmed rules, got %d", total)
+		}
+		assertAllRulesInRange(t, ops, nextTableRulePriority, nextTableRulePriority+100)
+
+		// Re-apply must leave no residue: every programmed rule is inside
+		// clear()'s window, so clear-then-add keeps the count stable. A
+		// leaked rule at prio >= 200 would survive clear() and grow the set.
+		if err := nt.Apply(mkRoutes(150), instances); err != nil {
+			t.Fatalf("Apply (second): %v", err)
+		}
+		total = ops.count(unix.AF_INET) + ops.count(unix.AF_INET6)
+		if total != 100 {
+			t.Fatalf("re-apply leaked rules: expected 100, got %d", total)
+		}
+	})
+}
+
+// TestRibGroupRulesPriorityCap exercises the #1706 hard cap for rib-group
+// rules. Each leaking table consumes TWO priorities (v4+v6), so the
+// window of 100 priorities fits 50 tables. The 50th table must program at
+// slots 33098/33099 (the last in-range pair); the 51st must be rejected.
+func TestRibGroupRulesPriorityCap(t *testing.T) {
+	mkConfig := func(n int) (map[string]*config.RibGroup, []*config.RoutingInstanceConfig) {
+		ribGroups := map[string]*config.RibGroup{}
+		instances := make([]*config.RoutingInstanceConfig, n)
+		for i := 0; i < n; i++ {
+			rgName := fmt.Sprintf("leak-%d", i)
+			// Import a different table than the source so needsLeak is true.
+			ribGroups[rgName] = &config.RibGroup{
+				Name:       rgName,
+				ImportRibs: []string{"inet.0"}, // main table 254 != source
+			}
+			instances[i] = &config.RoutingInstanceConfig{
+				Name:                    fmt.Sprintf("vr-%d", i),
+				TableID:                 1000 + i, // distinct source tables
+				InterfaceRoutesRibGroup: rgName,
+			}
+		}
+		return ribGroups, instances
+	}
+
+	t.Run("at-limit", func(t *testing.T) {
+		ops := newFakeRuleOps()
+		rg := &ribGroupManager{ops: ops}
+		ribGroups, instances := mkConfig(50)
+		if err := rg.Apply(ribGroups, instances); err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		total := ops.count(unix.AF_INET) + ops.count(unix.AF_INET6)
+		if total != 100 {
+			t.Fatalf("expected 50 tables * 2 = 100 rules at the limit, got %d", total)
+		}
+		assertAllRulesInRange(t, ops, ribGroupRulePriority, ribGroupRulePriority+100)
+		// The 50th (last admitted) table must occupy the final in-range
+		// pair: IPv4 at 33098, IPv6 at 33099.
+		if !hasPriority(ops, unix.AF_INET, ribGroupRulePriority+98) {
+			t.Errorf("expected IPv4 rule at the last in-range slot %d", ribGroupRulePriority+98)
+		}
+		if !hasPriority(ops, unix.AF_INET6, ribGroupRulePriority+99) {
+			t.Errorf("expected IPv6 rule at the last in-range slot %d", ribGroupRulePriority+99)
+		}
+	})
+
+	t.Run("over-limit", func(t *testing.T) {
+		ops := newFakeRuleOps()
+		rg := &ribGroupManager{ops: ops}
+		ribGroups, instances := mkConfig(60)
+		if err := rg.Apply(ribGroups, instances); err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		total := ops.count(unix.AF_INET) + ops.count(unix.AF_INET6)
+		if total != 100 {
+			t.Fatalf("expected cap to hold at 100 rules (50 tables), got %d", total)
+		}
+		assertAllRulesInRange(t, ops, ribGroupRulePriority, ribGroupRulePriority+100)
+		// The 51st table (would-be slots 33100/33101) must be absent.
+		if hasPriority(ops, unix.AF_INET, ribGroupRulePriority+100) ||
+			hasPriority(ops, unix.AF_INET6, ribGroupRulePriority+101) {
+			t.Errorf("51st table leaked beyond the cleared window (slot %d/%d present)",
+				ribGroupRulePriority+100, ribGroupRulePriority+101)
+		}
+
+		// Re-apply must not leak: all programmed rules are inside the
+		// cleared window.
+		if err := rg.Apply(ribGroups, instances); err != nil {
+			t.Fatalf("Apply (second): %v", err)
+		}
+		total = ops.count(unix.AF_INET) + ops.count(unix.AF_INET6)
+		if total != 100 {
+			t.Fatalf("re-apply leaked rib-group rules: expected 100, got %d", total)
+		}
+	})
+}
+
+// hasPriority reports whether any rule in the family was programmed at
+// the exact priority.
+func hasPriority(ops *fakeRuleOps, family, prio int) bool {
+	for _, r := range ops.rules[family] {
+		if r.Priority == prio {
+			return true
+		}
+	}
+	return false
+}
+
+// assertAllRulesInRange fails the test if any programmed rule in either
+// family has a priority outside [lo, hi) — i.e. a rule clear() would not
+// remove. This is the invariant the #1706 priority caps guarantee.
+func assertAllRulesInRange(t *testing.T, ops *fakeRuleOps, lo, hi int) {
+	t.Helper()
+	for _, family := range []int{unix.AF_INET, unix.AF_INET6} {
+		for _, r := range ops.rules[family] {
+			if r.Priority < lo || r.Priority >= hi {
+				t.Errorf("rule priority %d outside cleared window [%d,%d) — would leak",
+					r.Priority, lo, hi)
+			}
+		}
 	}
 }
 

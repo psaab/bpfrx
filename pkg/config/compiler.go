@@ -1064,6 +1064,75 @@ func ValidateConfig(cfg *Config) []string {
 		warnings = append(warnings, validateCoSOversubscriptionWarnings(cos)...)
 	}
 
+	// #1706: the next-table and rib-group ip-rule reconcilers program
+	// into fixed 100-priority windows that their clear() passes scan.
+	// The applier hard-caps at the window boundary so out-of-range rules
+	// never leak, but a config that exceeds the window would be silently
+	// truncated at apply time. Surface the over-limit condition here at
+	// commit time so the operator sees it before applying.
+	warnings = append(warnings, validateRoutingRuleWindowWarnings(cfg)...)
+
+	return warnings
+}
+
+// validateRoutingRuleWindowWarnings emits commit-time warnings when a
+// config would program more next-table or rib-group ip rules than the
+// applier's fixed priority window can hold (see pkg/routing/rules.go:
+// nextTableRulePriority window of 100, ribGroupRulePriority window of
+// 100 split into 50 v4+v6 pairs). The counts here are CONSERVATIVE
+// upper bounds computed from the same inputs the applier consumes —
+// they intentionally do NOT replicate the applier's exact skip/dedup
+// logic (unknown-instance skips, self-only rib-groups, duplicate source
+// tables), so they may warn slightly early but never miss a real
+// truncation. The runtime accepts the config; the apply-time cap is the
+// hard guard against the rule leak.
+func validateRoutingRuleWindowWarnings(cfg *Config) []string {
+	var warnings []string
+
+	// next-table: the applier feeds it the global inet + inet6 static
+	// routes (daemon_apply.go), counting those with a NextTable set.
+	const nextTableWindow = 100
+	nextTableRoutes := 0
+	for _, sr := range cfg.RoutingOptions.StaticRoutes {
+		if sr != nil && sr.NextTable != "" {
+			nextTableRoutes++
+		}
+	}
+	for _, sr := range cfg.RoutingOptions.Inet6StaticRoutes {
+		if sr != nil && sr.NextTable != "" {
+			nextTableRoutes++
+		}
+	}
+	if nextTableRoutes > nextTableWindow {
+		warnings = append(warnings, fmt.Sprintf(
+			"routing-options: %d static routes use next-table, but only %d can be "+
+				"programmed as ip rules; routes beyond the limit will be ignored at "+
+				"apply time. Reduce the number of next-table routes.",
+			nextTableRoutes, nextTableWindow))
+	}
+
+	// rib-group: the applier walks routing-instances and programs two ip
+	// rules (v4+v6) per source table that references an interface-routes
+	// rib-group. Window of 100 priorities fits 50 such tables.
+	const ribGroupTableLimit = 50
+	ribGroupInstances := 0
+	for _, inst := range cfg.RoutingInstances {
+		if inst == nil {
+			continue
+		}
+		if inst.InterfaceRoutesRibGroup != "" || inst.InterfaceRoutesRibGroupV6 != "" {
+			ribGroupInstances++
+		}
+	}
+	if ribGroupInstances > ribGroupTableLimit {
+		warnings = append(warnings, fmt.Sprintf(
+			"routing-options: %d routing-instances reference an interface-routes "+
+				"rib-group, but only %d leaking tables can be programmed as ip rules "+
+				"(two priorities each); instances beyond the limit will be ignored at "+
+				"apply time. Reduce the number of rib-group-leaking instances.",
+			ribGroupInstances, ribGroupTableLimit))
+	}
+
 	return warnings
 }
 
