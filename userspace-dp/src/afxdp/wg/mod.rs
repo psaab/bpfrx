@@ -31,6 +31,17 @@ pub(crate) mod allowed_ips;
 pub(crate) mod dscp;
 pub(crate) mod engine;
 pub(crate) mod framing;
+// WireGuard S1 (#1709): on-wire handshake-message framing (type 1/2,
+// MAC1/MAC2) and the TAI64N timestamp. Kept out of engine.rs (WATCH-tier)
+// so the security-critical framing is auditable in isolation and the
+// engine stays under the modularity threshold.
+pub(crate) mod handshake;
+// WG handshake orchestration on WgEngine (the three slow-path entry points —
+// create_initiation, consume_response, consume_initiation_create_response —
+// plus the two-phase index reservation). Split out of engine.rs to keep it under
+// the modularity threshold; same `wg` module, so it reaches engine internals
+// via `pub(in crate::afxdp::wg)` visibility.
+pub(crate) mod handshake_session;
 pub(crate) mod mss;
 // `outer` module deleted in #1440. Its scaffold helpers
 // (write_outer_eth, write_outer_ipv4_udp, outer_l2_len,
@@ -43,6 +54,7 @@ pub(crate) mod mss;
 pub(crate) mod peer;
 pub(crate) mod scratch;
 pub(crate) mod session;
+pub(crate) mod tai64n;
 
 #[cfg(test)]
 #[path = "tests.rs"]
@@ -89,6 +101,30 @@ pub(crate) const WG_TYPE_DATA: u8 = 4;
 
 /// Poly1305 authentication tag length.
 pub(crate) const POLY1305_TAG_LEN: usize = 16;
+
+/// MAC1/MAC2 field length on a WG handshake message (keyed-BLAKE2s-128
+/// output = 16 bytes). Used by `handshake.rs`.
+pub(crate) const WG_MAC_LEN: usize = 16;
+
+/// MAC1 label, hashed with the recipient's static public key to form the
+/// keyed-BLAKE2s MAC1 key: `key = BLAKE2s-256(LABEL_MAC1 || recipient_pub)`
+/// (WireGuard protocol page; wireguard-go `device/cookie.go` `Init`).
+pub(crate) const WG_LABEL_MAC1: &[u8; 8] = b"mac1----";
+
+/// Cookie label (used by the type-3 cookie-reply MAC2 path — out of scope
+/// for S1, defined here for completeness / future use). `cookie--`.
+pub(crate) const WG_LABEL_COOKIE: &[u8; 8] = b"cookie--";
+
+/// WG handshake message 1 (initiation) wire length:
+///   type(1) + reserved(3) + sender_index(4) + ephemeral(32)
+///   + encrypted_static(32+16) + encrypted_timestamp(12+16)
+///   + mac1(16) + mac2(16) = 148.
+pub(crate) const WG_MSG_INIT_LEN: usize = 148;
+
+/// WG handshake message 2 (response) wire length:
+///   type(1) + reserved(3) + sender_index(4) + receiver_index(4)
+///   + ephemeral(32) + encrypted_nothing(0+16) + mac1(16) + mac2(16) = 92.
+pub(crate) const WG_MSG_RESPONSE_LEN: usize = 92;
 
 /// Transport data header on the wire:
 ///   - type        u8  = 4

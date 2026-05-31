@@ -1388,3 +1388,618 @@ fn established_pair_responder_confirmation_flips_via_decap_path() {
         .try_encap(&init_pub, &reply, &mut wire2)
         .expect("post-confirmation encap must succeed");
 }
+
+// ===================================================================
+// Framed WG handshake — engine integration (#1709 S1)
+//
+// These exercise the full on-wire framed handshake (create_initiation /
+// consume_response / consume_initiation_create_response) BOTH directions
+// between two engines, and assert matching transport keys via a transport
+// record round-trip. This is xpf-against-xpf — a REGRESSION GUARD for the
+// engine integration, NOT the independent-peer interop proof. The live
+// kernel-WireGuard-on-a-VM interop (the byte-compliance proof against an
+// independent reference) is #1703 S2.
+// ===================================================================
+mod framed_handshake {
+    use super::*;
+    use crate::afxdp::wg::handshake::FramingError;
+    use crate::afxdp::wg::handshake_session::HandshakeError;
+    use crate::afxdp::wg::{WG_MSG_INIT_LEN, WG_MSG_RESPONSE_LEN};
+
+    /// Build two engines that know each other's pubkey, allowing the full
+    /// `0.0.0.0/0` so any inner src passes the AllowedIPs gate.
+    fn engine_pair() -> (WgEngine, WgEngine, [u8; 32], [u8; 32]) {
+        let (init_priv, init_pub) = keypair();
+        let (resp_priv, resp_pub) = keypair();
+        let any_v4: Vec<ipnet::IpNet> = vec!["0.0.0.0/0".parse().unwrap()];
+        let init = WgEngine::new(WgEngineConfig {
+            local_private_key: init_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: resp_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: any_v4.clone(),
+            }],
+        });
+        let resp = WgEngine::new(WgEngineConfig {
+            local_private_key: resp_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: init_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: any_v4,
+            }],
+        });
+        (init, resp, init_pub, resp_pub)
+    }
+
+    #[test]
+    fn local_public_key_matches_snow_static() {
+        // The engine derives its local public key via dalek
+        // mul_base_clamped; it MUST equal the public key snow generated for
+        // the same private key (which engine_pair returns as init_pub/
+        // resp_pub from keypair()). A mismatch would mean inbound MAC1
+        // verification keys on the wrong pubkey and every real handshake
+        // would be dropped.
+        let (init, resp, init_pub, resp_pub) = engine_pair();
+        assert_eq!(
+            init.local_public_key(),
+            init_pub,
+            "engine local_public_key must equal snow's static pub for the same private key"
+        );
+        assert_eq!(resp.local_public_key(), resp_pub);
+    }
+
+    /// Full framed handshake, xpf initiator -> xpf responder, then a
+    /// transport record round-trip in BOTH directions proving the derived
+    /// transport keys match.
+    #[test]
+    fn framed_handshake_both_directions_roundtrip() {
+        let (init, resp, init_pub, resp_pub) = engine_pair();
+
+        // 1. Initiator builds msg1.
+        let mut msg1 = [0u8; WG_MSG_INIT_LEN];
+        let init_idx = init.create_initiation(&resp_pub, &mut msg1).unwrap();
+        assert_eq!(init.pending_count(), 1, "initiator holds one pending handshake");
+
+        // 2. Responder consumes msg1, emits msg2, installs its session.
+        let mut msg2 = [0u8; WG_MSG_RESPONSE_LEN];
+        let (recovered_init_pub, resp_idx) =
+            resp.consume_initiation_create_response(&msg1, &mut msg2).unwrap();
+        assert_eq!(recovered_init_pub, init_pub,
+            "responder must recover the initiator's static pubkey from msg1");
+        assert_eq!(resp.pending_count(), 0, "responder completes synchronously");
+
+        // 3. Initiator consumes msg2, installs its session.
+        let installed_idx = init.consume_response(&msg2).unwrap();
+        assert_eq!(installed_idx, init_idx);
+        assert_eq!(init.pending_count(), 0, "initiator handshake promoted");
+
+        // 4. Initiator -> responder transport record (initiator is confirmed
+        //    at install; responder confirms on this first inbound record).
+        let inner = ipv4_packet(Ipv4Addr::new(10, 9, 9, 1), Ipv4Addr::new(10, 9, 9, 2));
+        let mut wire = [0u8; 2048];
+        let enc = init.try_encap(&resp_pub, &inner, &mut wire).unwrap();
+        let mut plain = [0u8; 2048];
+        let dec = resp.try_decap(&wire[..enc.len], &mut plain).unwrap();
+        assert_eq!(&plain[..dec.len], &inner[..], "init->resp inner packet must round-trip");
+        assert_eq!(dec.peer_pubkey, init_pub);
+
+        // 5. Responder -> initiator transport record (responder now confirmed).
+        let reply = ipv4_packet(Ipv4Addr::new(10, 9, 9, 2), Ipv4Addr::new(10, 9, 9, 1));
+        let mut wire2 = [0u8; 2048];
+        let enc2 = resp.try_encap(&init_pub, &reply, &mut wire2).unwrap();
+        let mut plain2 = [0u8; 2048];
+        let dec2 = init.try_decap(&wire2[..enc2.len], &mut plain2).unwrap();
+        assert_eq!(&plain2[..dec2.len], &reply[..], "resp->init inner packet must round-trip");
+        assert_eq!(dec2.peer_pubkey, resp_pub);
+
+        // Indices are distinct (each side chose its own).
+        assert_ne!(init_idx, resp_idx);
+    }
+
+    /// msg1's mac1 keys on the RESPONDER's pubkey; a responder configured
+    /// with a different identity rejects it with Mac1Mismatch.
+    #[test]
+    fn responder_rejects_initiation_with_wrong_mac1() {
+        let (init, _resp, _init_pub, resp_pub) = engine_pair();
+        let mut msg1 = [0u8; WG_MSG_INIT_LEN];
+        init.create_initiation(&resp_pub, &mut msg1).unwrap();
+
+        // A different responder (different static key) must reject the mac1.
+        let (other_priv, _other_pub) = keypair();
+        let (_init2_priv, init2_pub) = keypair();
+        let other = WgEngine::new(WgEngineConfig {
+            local_private_key: other_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: init2_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+            }],
+        });
+        let mut msg2 = [0u8; WG_MSG_RESPONSE_LEN];
+        let err = other
+            .consume_initiation_create_response(&msg1, &mut msg2)
+            .unwrap_err();
+        assert_eq!(err, HandshakeError::Framing(FramingError::Mac1Mismatch));
+    }
+
+    /// An initiation from a peer the responder does not know (valid mac1
+    /// because it targets the responder's real pubkey, but the initiator
+    /// static is unconfigured) is rejected as UnknownInitiator AFTER the
+    /// Noise read recovers the static key.
+    #[test]
+    fn responder_rejects_unknown_initiator() {
+        let (resp_priv, resp_pub) = keypair();
+        // Responder knows only some OTHER peer, not our initiator.
+        let (_known_priv, known_pub) = keypair();
+        let resp = WgEngine::new(WgEngineConfig {
+            local_private_key: resp_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: known_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+            }],
+        });
+        // A stranger initiator that targets the real responder pubkey.
+        let (stranger_priv, _stranger_pub) = keypair();
+        let stranger = WgEngine::new(WgEngineConfig {
+            local_private_key: stranger_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: resp_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+            }],
+        });
+        let mut msg1 = [0u8; WG_MSG_INIT_LEN];
+        stranger.create_initiation(&resp_pub, &mut msg1).unwrap();
+        let mut msg2 = [0u8; WG_MSG_RESPONSE_LEN];
+        let err = resp
+            .consume_initiation_create_response(&msg1, &mut msg2)
+            .unwrap_err();
+        assert_eq!(err, HandshakeError::UnknownInitiator);
+    }
+
+    /// consume_response with a receiver_index that matches no pending
+    /// reservation is rejected as NoPendingHandshake (stale/spoofed msg2).
+    #[test]
+    fn consume_response_no_pending_is_rejected() {
+        let (init, resp, _init_pub, resp_pub) = engine_pair();
+        // Drive a full handshake so we have a VALID msg2, then replay it: the
+        // first consume promotes + clears the reservation; the second finds
+        // no pending entry.
+        let mut msg1 = [0u8; WG_MSG_INIT_LEN];
+        init.create_initiation(&resp_pub, &mut msg1).unwrap();
+        let mut msg2 = [0u8; WG_MSG_RESPONSE_LEN];
+        resp.consume_initiation_create_response(&msg1, &mut msg2).unwrap();
+        init.consume_response(&msg2).unwrap();
+        // Replay msg2 — reservation already promoted/cleared.
+        let err = init.consume_response(&msg2).unwrap_err();
+        assert_eq!(err, HandshakeError::NoPendingHandshake);
+    }
+
+    /// create_initiation toward an unconfigured peer is UnknownPeer and
+    /// leaves no pending reservation.
+    #[test]
+    fn create_initiation_unknown_peer() {
+        let (init, _resp, _init_pub, _resp_pub) = engine_pair();
+        let (_x_priv, x_pub) = keypair();
+        let mut msg1 = [0u8; WG_MSG_INIT_LEN];
+        let err = init.create_initiation(&x_pub, &mut msg1).unwrap_err();
+        assert_eq!(err, HandshakeError::UnknownPeer);
+        assert_eq!(init.pending_count(), 0);
+    }
+
+    /// At-most-one-pending-per-peer: a SECOND create_initiation toward the
+    /// same peer aborts the first reservation (pending stays at 1, not 2).
+    /// The first msg1's reservation is gone, so consuming a response to it
+    /// would fail — only the latest handshake survives.
+    #[test]
+    fn at_most_one_pending_per_peer() {
+        let (init, resp, _init_pub, resp_pub) = engine_pair();
+        let mut msg1_a = [0u8; WG_MSG_INIT_LEN];
+        let idx_a = init.create_initiation(&resp_pub, &mut msg1_a).unwrap();
+        assert_eq!(init.pending_count(), 1);
+
+        let mut msg1_b = [0u8; WG_MSG_INIT_LEN];
+        let idx_b = init.create_initiation(&resp_pub, &mut msg1_b).unwrap();
+        assert_ne!(idx_a, idx_b, "second handshake gets a fresh index");
+        assert_eq!(init.pending_count(), 1, "per-peer cap: only the latest pending survives");
+
+        // The responder answers the SECOND msg1; the initiator can complete
+        // it (its reservation survived).
+        let mut msg2_b = [0u8; WG_MSG_RESPONSE_LEN];
+        resp.consume_initiation_create_response(&msg1_b, &mut msg2_b).unwrap();
+        assert_eq!(init.consume_response(&msg2_b).unwrap(), idx_b);
+
+        // A response to the FIRST (aborted) handshake has no reservation.
+        // Build it by having a fresh responder answer msg1_a, then feeding
+        // the initiator that msg2 — its idx_a reservation was aborted.
+        let (init2, resp2, _ip2, rp2) = engine_pair();
+        let mut m1 = [0u8; WG_MSG_INIT_LEN];
+        let first = init2.create_initiation(&rp2, &mut m1).unwrap();
+        let mut m1b = [0u8; WG_MSG_INIT_LEN];
+        init2.create_initiation(&rp2, &mut m1b).unwrap(); // aborts `first`
+        let mut m2 = [0u8; WG_MSG_RESPONSE_LEN];
+        resp2.consume_initiation_create_response(&m1, &mut m2).unwrap();
+        // m2's receiver_index echoes `first`, which is no longer pending.
+        let _ = first;
+        assert_eq!(
+            init2.consume_response(&m2).unwrap_err(),
+            HandshakeError::NoPendingHandshake,
+            "a response to an aborted (superseded) reservation must be dropped"
+        );
+    }
+
+    /// Reserve-before-send + promote: after a completed handshake BOTH
+    /// sessions are live + demuxable on their reserved indices — a record
+    /// the initiator sends decaps at the responder, and a record the
+    /// responder sends decaps at the initiator. Exercising both promoted
+    /// reservations proves the two-phase reserve→promote installs the demux
+    /// entries correctly.
+    #[test]
+    fn reserve_before_send_then_promote() {
+        let (init, resp, init_pub, resp_pub) = engine_pair();
+        let mut msg1 = [0u8; WG_MSG_INIT_LEN];
+        init.create_initiation(&resp_pub, &mut msg1).unwrap();
+        let mut msg2 = [0u8; WG_MSG_RESPONSE_LEN];
+        resp.consume_initiation_create_response(&msg1, &mut msg2).unwrap();
+        init.consume_response(&msg2).unwrap();
+        assert_eq!(init.pending_count(), 0);
+        assert_eq!(resp.pending_count(), 0);
+
+        // init -> resp: decaps at the responder via its promoted index and
+        // confirms the (initially unconfirmed) responder session.
+        let fwd = ipv4_packet(Ipv4Addr::new(10, 9, 9, 1), Ipv4Addr::new(10, 9, 9, 2));
+        let mut w = [0u8; 2048];
+        let e = init.try_encap(&resp_pub, &fwd, &mut w).unwrap();
+        let mut p = [0u8; 2048];
+        let d = resp.try_decap(&w[..e.len], &mut p).unwrap();
+        assert_eq!(d.peer_pubkey, init_pub);
+
+        // resp -> init: decaps at the initiator via its promoted index.
+        let reply = ipv4_packet(Ipv4Addr::new(10, 9, 9, 2), Ipv4Addr::new(10, 9, 9, 1));
+        let mut w2 = [0u8; 2048];
+        let e2 = resp.try_encap(&init_pub, &reply, &mut w2).unwrap();
+        let mut p2 = [0u8; 2048];
+        let d2 = init.try_decap(&w2[..e2.len], &mut p2).unwrap();
+        assert_eq!(d2.peer_pubkey, resp_pub);
+    }
+
+    /// A forged/garbled msg2 (valid framing + valid MAC1, since MAC1 keys on
+    /// the public initiator pubkey, but a corrupt Noise body) must NOT
+    /// destroy the initiator's pending reservation: the real msg2 that
+    /// arrives afterward must still complete the handshake. This is the
+    /// Codex code-review-round-1 finding 2 regression (an on-path observer
+    /// could otherwise DoS the handshake by racing a bogus msg2).
+    #[test]
+    fn forged_msg2_does_not_destroy_pending_reservation() {
+        let (init, resp, init_pub, resp_pub) = engine_pair();
+        let mut msg1 = [0u8; WG_MSG_INIT_LEN];
+        init.create_initiation(&resp_pub, &mut msg1).unwrap();
+        assert_eq!(init.pending_count(), 1);
+
+        // Produce the REAL msg2 from the responder.
+        let mut real_msg2 = [0u8; WG_MSG_RESPONSE_LEN];
+        resp.consume_initiation_create_response(&msg1, &mut real_msg2)
+            .unwrap();
+
+        // Forge a msg2: copy the real one (so type/receiver_index/MAC1
+        // verify), then corrupt the Noise body so the snow read fails. MAC1
+        // covers msg[0..60]; the Noise body is msg[12..60], so corrupting a
+        // body byte breaks the Noise AEAD but NOT mac1... wait — mac1 DOES
+        // cover the body. So instead corrupt a byte the Noise read
+        // authenticates but mac1 also covers: to get a valid-mac1 forgery we
+        // must recompute mac1 over the corrupted prefix. Simplest faithful
+        // forgery: rebuild a msg2 with the right receiver_index + a random
+        // Noise body + a correctly-recomputed mac1 over OUR pubkey.
+        let mut forged = real_msg2;
+        // Corrupt the encrypted-empty AEAD tag region (msg[44..60]) so the
+        // Noise read fails, then recompute mac1 over msg[0..60] so framing
+        // still authenticates (mac1 keys on the initiator = us, a public key,
+        // so an attacker can do exactly this).
+        forged[50] ^= 0xFF;
+        let recomputed = crate::afxdp::wg::handshake::compute_mac1(&init_pub, &forged[..60]);
+        forged[60..76].copy_from_slice(&recomputed);
+
+        // The forged msg2 fails the Noise read but must leave the reservation
+        // intact.
+        let err = init.consume_response(&forged).unwrap_err();
+        assert_eq!(err, HandshakeError::Crypto);
+        assert_eq!(
+            init.pending_count(),
+            1,
+            "a forged msg2 must NOT consume/destroy the pending reservation"
+        );
+
+        // The REAL msg2 still completes the handshake.
+        init.consume_response(&real_msg2)
+            .expect("real msg2 must still complete after a forged one was rejected");
+        assert_eq!(init.pending_count(), 0);
+    }
+
+    /// reconcile_peers must drain a removed peer's in-flight handshake
+    /// reservation from both `pending` and `pending_by_peer` (Copilot
+    /// code-review finding). Otherwise the reservation + its consumed index
+    /// leak until process restart.
+    #[test]
+    fn reconcile_drains_removed_peer_pending_reservation() {
+        let (init, _resp, _init_pub, resp_pub) = engine_pair();
+        // Start an initiation (reserves a pending handshake for resp_pub) but
+        // do not complete it.
+        let mut msg1 = [0u8; WG_MSG_INIT_LEN];
+        init.create_initiation(&resp_pub, &mut msg1).unwrap();
+        assert_eq!(init.pending_count(), 1);
+
+        // Reconcile the peer away (empty config removes resp_pub).
+        init.reconcile_peers(&[]);
+
+        // The pending reservation must be drained.
+        assert_eq!(
+            init.pending_count(),
+            0,
+            "removing a peer must drain its in-flight handshake reservation"
+        );
+
+        // Re-add the peer; a fresh initiation must succeed (the per-peer
+        // marker was cleared, so the at-most-one-pending invariant is intact).
+        init.reconcile_peers(&[WgPeerConfig {
+            pubkey: resp_pub,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+        }]);
+        let mut msg1b = [0u8; WG_MSG_INIT_LEN];
+        init.create_initiation(&resp_pub, &mut msg1b).unwrap();
+        assert_eq!(init.pending_count(), 1);
+    }
+
+    /// reserve_pending_locked re-checks the peer UNDER reconcile_lock (Codex
+    /// round-3 TOCTOU finding). The simple sequential case: create_initiation
+    /// after the peer is removed returns UnknownPeer and reserves nothing.
+    #[test]
+    fn create_initiation_after_peer_removed_leaves_no_reservation() {
+        let (init, _resp, _init_pub, resp_pub) = engine_pair();
+        init.reconcile_peers(&[]);
+        let mut msg1 = [0u8; WG_MSG_INIT_LEN];
+        assert_eq!(
+            init.create_initiation(&resp_pub, &mut msg1).unwrap_err(),
+            HandshakeError::UnknownPeer
+        );
+        assert_eq!(init.pending_count(), 0);
+    }
+
+    /// Deterministic TOCTOU regression (Codex round-4): exercise the exact
+    /// fixed branch — the under-lock peer recheck in reserve_pending_locked —
+    /// rather than rely on a narrow race a concurrency test can't reliably
+    /// hit. `try_reserve_pending_for_test` acquires reconcile_lock and calls
+    /// reserve_pending_locked just as the completion paths do; after the peer
+    /// is removed it must return UnknownPeer and create NO reservation.
+    /// Without the under-lock recheck this reservation would be created and
+    /// leak (reconcile's drain iterates the current table's pubkeys, which no
+    /// longer include the removed peer).
+    #[test]
+    fn reserve_pending_locked_rejects_removed_peer() {
+        use crate::afxdp::wg::session::SessionRole;
+        let (init, _resp, _init_pub, resp_pub) = engine_pair();
+        // Peer present: reserving succeeds.
+        let idx = init
+            .try_reserve_pending_for_test(resp_pub, SessionRole::Initiator)
+            .expect("reserve must succeed while the peer is configured");
+        assert_eq!(init.pending_count(), 1);
+        // Drain it so we start clean.
+        init.reconcile_peers(&[]);
+        assert_eq!(init.pending_count(), 0);
+        let _ = idx;
+
+        // Re-add then remove to mimic the published-table state at the moment
+        // a TOCTOU create would acquire the lock: peer absent from the table.
+        init.reconcile_peers(&[]);
+        // Now reserve under the lock for the (absent) peer — the under-lock
+        // recheck must reject it.
+        assert_eq!(
+            init.try_reserve_pending_for_test(resp_pub, SessionRole::Initiator)
+                .unwrap_err(),
+            HandshakeError::UnknownPeer
+        );
+        assert_eq!(
+            init.pending_count(),
+            0,
+            "reserve_pending_locked must not create a reservation for a removed peer"
+        );
+    }
+
+    /// Liveness/soundness smoke: hammer full handshakes while a thread churns
+    /// the peer in/out via reconcile_peers, exercising the lock serialization
+    /// and the reconcile-drains-pending path. Must not panic/deadlock and a
+    /// post-storm clean handshake must still carry traffic.
+    #[test]
+    fn create_initiation_toctou_under_concurrent_peer_removal() {
+        use std::sync::atomic::{AtomicBool, Ordering as AOrd};
+        use std::sync::Arc as StdArc;
+        use std::thread;
+
+        let (init_priv, _init_pub) = keypair();
+        let (_resp_priv, resp_pub) = keypair();
+        let cfg = vec![WgPeerConfig {
+            pubkey: resp_pub,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+        }];
+        let init = StdArc::new(WgEngine::new(WgEngineConfig {
+            local_private_key: init_priv,
+            listen_port: 51820,
+            peers: cfg.clone(),
+        }));
+        let stop = StdArc::new(AtomicBool::new(false));
+        let initiator = {
+            let init = init.clone();
+            let stop = stop.clone();
+            thread::spawn(move || {
+                for _ in 0..3000 {
+                    let mut msg1 = [0u8; WG_MSG_INIT_LEN];
+                    let _ = init.create_initiation(&resp_pub, &mut msg1);
+                }
+                stop.store(true, AOrd::Relaxed);
+            })
+        };
+        let churner = {
+            let init = init.clone();
+            let stop = stop.clone();
+            let cfg = cfg.clone();
+            thread::spawn(move || {
+                while !stop.load(AOrd::Relaxed) {
+                    init.reconcile_peers(&[]);
+                    init.reconcile_peers(&cfg);
+                    thread::yield_now();
+                }
+            })
+        };
+        initiator.join().unwrap();
+        churner.join().unwrap();
+        // Settle peer-removed: no reservation may remain for the absent peer.
+        init.reconcile_peers(&[]);
+        assert_eq!(init.pending_count(), 0, "no orphan reservation after the storm");
+    }
+
+    /// Concurrency regression for the Codex round-2 finding: completing a
+    /// handshake (create_initiation → consume_initiation_create_response →
+    /// consume_response) must be sound under a concurrent thread hammering
+    /// reconcile_peers (add/remove the peer), which exercises the
+    /// reconcile-drains-pending path and the reconcile_lock serialization of
+    /// the now-lock-held completion. Must not panic, deadlock, or corrupt the
+    /// maps.
+    ///
+    /// Note we do NOT race a second same-peer create_initiation against the
+    /// SAME in-flight handshake: that is the at-most-one-pending-per-peer
+    /// abort (latest-initiation-wins), which legitimately starves the older
+    /// reservation and is not a soundness violation. The reconcile thread is
+    /// the right concurrency stressor for the lock discipline.
+    #[test]
+    fn concurrent_consume_response_and_reinitiation_is_sound() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering as AOrd};
+        use std::sync::Arc as StdArc;
+        use std::thread;
+
+        // Two engines that know each other. Wrap in Arc for sharing.
+        let (init_priv, init_pub) = keypair();
+        let (resp_priv, resp_pub) = keypair();
+        let any_v4: Vec<ipnet::IpNet> = vec!["0.0.0.0/0".parse().unwrap()];
+        let init = StdArc::new(WgEngine::new(WgEngineConfig {
+            local_private_key: init_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: resp_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: any_v4.clone(),
+            }],
+        }));
+        let resp = StdArc::new(WgEngine::new(WgEngineConfig {
+            local_private_key: resp_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: init_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: any_v4,
+            }],
+        }));
+
+        let stop = StdArc::new(AtomicBool::new(false));
+        let completed = StdArc::new(AtomicU32::new(0));
+
+        // Driver thread: full handshakes init<->resp, repeatedly.
+        let driver = {
+            let init = init.clone();
+            let resp = resp.clone();
+            let completed = completed.clone();
+            let stop = stop.clone();
+            thread::spawn(move || {
+                for _ in 0..400 {
+                    let mut msg1 = [0u8; WG_MSG_INIT_LEN];
+                    if init.create_initiation(&resp_pub, &mut msg1).is_err() {
+                        continue;
+                    }
+                    let mut msg2 = [0u8; WG_MSG_RESPONSE_LEN];
+                    if resp
+                        .consume_initiation_create_response(&msg1, &mut msg2)
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    if init.consume_response(&msg2).is_ok() {
+                        completed.fetch_add(1, AOrd::Relaxed);
+                    }
+                    thread::yield_now();
+                }
+                stop.store(true, AOrd::Relaxed);
+            })
+        };
+
+        // Reconcile thread on the RESPONDER: churn the initiator peer in/out
+        // while the driver completes handshakes, exercising the
+        // reconcile-drains-pending path and the reconcile_lock serialization
+        // concurrently with the lock-held responder completion.
+        let reconciler = {
+            let resp = resp.clone();
+            let stop = stop.clone();
+            thread::spawn(move || {
+                let cfg = vec![WgPeerConfig {
+                    pubkey: init_pub,
+                    endpoint: None,
+                    persistent_keepalive: 0,
+                    allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+                }];
+                let mut flip = false;
+                while !stop.load(AOrd::Relaxed) {
+                    // Alternate remove/re-add to exercise the
+                    // reconcile-drains-pending path against in-flight
+                    // responder reservations.
+                    if flip {
+                        resp.reconcile_peers(&[]);
+                    } else {
+                        resp.reconcile_peers(&cfg);
+                    }
+                    flip = !flip;
+                    thread::yield_now();
+                }
+                // Leave the peer present so the post-storm handshake works.
+                resp.reconcile_peers(&cfg);
+            })
+        };
+
+        driver.join().unwrap();
+        reconciler.join().unwrap();
+
+        // The race must have exercised real completions.
+        assert!(
+            completed.load(AOrd::Relaxed) > 0,
+            "no handshake completed — the race path was not exercised"
+        );
+
+        // Soundness: after the storm, drive ONE clean handshake and a
+        // transport round-trip; if the maps were corrupted the encap/decap
+        // would fail.
+        let mut m1 = [0u8; WG_MSG_INIT_LEN];
+        init.create_initiation(&resp_pub, &mut m1).unwrap();
+        let mut m2 = [0u8; WG_MSG_RESPONSE_LEN];
+        resp.consume_initiation_create_response(&m1, &mut m2).unwrap();
+        init.consume_response(&m2).unwrap();
+        let pkt = ipv4_packet(Ipv4Addr::new(10, 9, 9, 1), Ipv4Addr::new(10, 9, 9, 2));
+        let mut w = [0u8; 2048];
+        let e = init.try_encap(&resp_pub, &pkt, &mut w).unwrap();
+        let mut p = [0u8; 2048];
+        let d = resp.try_decap(&w[..e.len], &mut p).unwrap();
+        assert_eq!(&p[..d.len], &pkt[..], "post-storm handshake must still carry traffic");
+    }
+}

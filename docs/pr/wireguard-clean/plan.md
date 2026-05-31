@@ -431,6 +431,17 @@ existing pattern of `recycle_ingress_frame(...)` before every
 
 ### On-wire handshake framing scope (explicit boundary)
 
+> **UPDATE (#1709 S1, DONE):** the type-1 MessageInitiation and type-2
+> MessageResponse on-wire framing (type byte, reserved, sender/receiver
+> index, MAC1 = keyed-BLAKE2s-128 over `HASH("mac1----"||recipient_pub)`,
+> MAC2 zeros) AND the 12-byte TAI64N timestamp as the Noise payload of
+> msg1 now exist in `wg/handshake.rs` + `wg/tai64n.rs`, wired into the
+> engine's `create_initiation` / `consume_response` /
+> `consume_initiation_create_response` (in `wg/handshake_session.rs`).
+> Type-3 CookieReply + MAC2 generation/verification remain OUT (#1703
+> S7). The boundary text below describes the pre-#1709 engine; it is kept
+> for historical context.
+
 This engine does NOT build or parse the WireGuard handshake message
 on-wire framing (type-1 MessageInitiation, type-2 MessageResponse,
 type-3 CookieReply, MAC1/MAC2 fields, the TAI64N timestamp slot, the
@@ -464,10 +475,14 @@ data record only.
   `afxdp/tx/dispatch.rs:430`) and in the ingress decap classifier
   in `poll_descriptor.rs`. Engine exists and is tested but is not on
   the hot path yet.
-- WG handshake outer-framing layer (MessageInitiation/MessageResponse
-  outer bytes around the Noise sub-message, MAC1/MAC2, TAI64N).
-  Engine ships the Noise sub-message bytes only; the integration
-  PR will wrap them.
+- ~~WG handshake outer-framing layer (MessageInitiation/MessageResponse
+  outer bytes around the Noise sub-message, MAC1/MAC2, TAI64N).~~
+  **DONE in #1709 S1** for msg type 1/2 + MAC1 + TAI64N (build + parse,
+  both roles). Type-3 CookieReply + MAC2 generation/verification are
+  still OUT (#1703 S7). Independent-peer interop (live kernel-WireGuard
+  on a VM) is #1703 S2 — S1 is validated by spec known-answer vectors +
+  an xpf-against-xpf framed-handshake regression, NOT yet against an
+  independent reference.
 - Go control-plane mapping from Junos `set security ipsec ...` /
   `set interfaces st0...` to WG snapshot fields.
 - HA / RG-aware session migration on failover.

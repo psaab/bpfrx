@@ -347,6 +347,7 @@ dependencies = [
  "fiat-crypto",
  "rustc_version",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -1143,10 +1144,13 @@ name = "xpf-userspace-dp"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "blake2",
  "cc",
  "chrono",
  "criterion",
  "ctrlc",
+ "curve25519-dalek",
+ "getrandom 0.2.17",
  "io-uring",
  "ipnet",
  "libbpf-sys",

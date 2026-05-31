@@ -54,12 +54,19 @@
 
 use super::allowed_ips::AllowedIps;
 use super::framing::{encode_data_header, parse_data_header};
+// PendingHandshake is defined alongside the handshake orchestration in
+// handshake_session.rs (same `wg` module); the engine struct holds a map of
+// them, so it imports the type here.
+use super::handshake_session::PendingHandshake;
 use super::peer::Peer;
 use super::session::{REJECT_AFTER_MESSAGES, ReplayDecision, WgSession};
+use super::tai64n::Tai64nClock;
 use super::{
-    POLY1305_TAG_LEN, WG_DATA_HEADER_LEN, WG_NOISE_PATTERN, WG_PROTOCOL_ID_BYTES, WG_ZERO_PSK,
+    POLY1305_TAG_LEN, WG_DATA_HEADER_LEN, WG_KEY_LEN, WG_NOISE_PATTERN, WG_PROTOCOL_ID_BYTES,
+    WG_ZERO_PSK,
 };
 use arc_swap::ArcSwap;
+use curve25519_dalek::MontgomeryPoint;
 use rustc_hash::FxHashMap;
 use snow::{Builder, HandshakeState};
 use std::mem::MaybeUninit;
@@ -254,6 +261,33 @@ pub(crate) struct WgEngine {
     /// WG and wireguard-go both do this. snow internally zeroizes
     /// its own copies; this is for the engine's persistent copy.
     local_private_key: Zeroizing<[u8; 32]>,
+    /// Local X25519 static PUBLIC key, derived once at construction from
+    /// `local_private_key` via `MontgomeryPoint::mul_base_clamped` (the
+    /// same clamped base-point multiply snow uses for its static key).
+    /// Needed to verify the MAC1 on an INBOUND handshake message — kernel
+    /// WG keys mac1 on the recipient's static public key, and for an
+    /// inbound message the recipient is us. Derived once so the parse hot
+    /// path (slow path, but still) does not repeat the base-point multiply
+    /// and so a "private-key-as-public" swap cannot creep in.
+    /// `pub(in crate::afxdp::wg)` so the handshake orchestration in
+    /// `handshake_session.rs` (a sibling file, same `wg` module) can read it.
+    pub(in crate::afxdp::wg) local_public_key: [u8; WG_KEY_LEN],
+    /// Monotonic TAI64N clock for the initiator handshake timestamp.
+    /// In-process strict monotonicity; cross-restart persistence is a
+    /// future control-plane concern (#1703 S6).
+    pub(in crate::afxdp::wg) tai64n_clock: Tai64nClock,
+    /// In-flight handshakes keyed by OUR reserved local index. A handshake
+    /// is recorded here BEFORE the message carrying that index goes on the
+    /// wire, then promoted to a live `WgSession` on completion. See the
+    /// two-phase reservation discipline in `reserve_pending`.
+    pub(in crate::afxdp::wg) pending: RwLock<FxHashMap<u32, PendingHandshake>>,
+    /// At-most-one-pending-per-peer index: maps a peer pubkey to its
+    /// current pending reservation's local index. A new initiation from a
+    /// peer aborts that peer's prior pending reservation, bounding pending
+    /// state to O(configured peers) under a valid-MAC1 initiation flood
+    /// (the reservation step is reached only after snow authenticates the
+    /// static-key AEAD).
+    pub(in crate::afxdp::wg) pending_by_peer: RwLock<FxHashMap<[u8; WG_KEY_LEN], u32>>,
     /// UDP port we listen on for inbound. Stored for diagnostics
     /// and for the slow-path responder.
     listen_port: u16,
@@ -265,20 +299,26 @@ pub(crate) struct WgEngine {
     /// prevent stale-Arc install races across peer removal. Hot path
     /// does NOT take this lock — readers only touch `table` via
     /// `.load()`.
-    reconcile_lock: std::sync::Mutex<()>,
+    pub(in crate::afxdp::wg) reconcile_lock: std::sync::Mutex<()>,
     /// Demux map: receiver_index → session. Receiver indices are
     /// chosen locally at handshake time so they uniquely identify
     /// a session for as long as it lives. Kept out of `PeerTable`
     /// because session install / rotation is independent of peer
     /// reconcile; only peer REMOVAL touches both (we drain a
     /// dropped peer's sessions out of this map during reconcile).
-    sessions_by_local_index: RwLock<FxHashMap<u32, Arc<WgSession>>>,
+    pub(in crate::afxdp::wg) sessions_by_local_index: RwLock<FxHashMap<u32, Arc<WgSession>>>,
 }
 
 impl WgEngine {
     pub(crate) fn new(config: WgEngineConfig) -> Self {
+        let local_public_key =
+            MontgomeryPoint::mul_base_clamped(config.local_private_key).to_bytes();
         let engine = Self {
             local_private_key: Zeroizing::new(config.local_private_key),
+            local_public_key,
+            tai64n_clock: Tai64nClock::new(),
+            pending: RwLock::new(FxHashMap::default()),
+            pending_by_peer: RwLock::new(FxHashMap::default()),
             listen_port: config.listen_port,
             table: ArcSwap::from_pointee(PeerTable::empty()),
             reconcile_lock: std::sync::Mutex::new(()),
@@ -286,6 +326,13 @@ impl WgEngine {
         };
         engine.reconcile_peers(&config.peers);
         engine
+    }
+
+    /// xpf's local static public key (X25519). The peer needs this to
+    /// configure us as its peer and to compute the MAC1 on messages it
+    /// sends us. Slow path / config-surface use.
+    pub(crate) fn local_public_key(&self) -> [u8; WG_KEY_LEN] {
+        self.local_public_key
     }
 
     pub(crate) fn listen_port(&self) -> u16 {
@@ -389,6 +436,28 @@ impl WgEngine {
                 by_index.remove(li);
             }
         }
+        // Drain in-flight HANDSHAKE RESERVATIONS for removed peers too
+        // (Copilot code-review finding). A peer with a pending (not-yet-
+        // completed) handshake leaves an entry in `pending` keyed by our
+        // reserved index and a `pending_by_peer` marker keyed by its pubkey.
+        // Without draining these on peer removal, the reservation (and its
+        // consumed index) would leak until process restart, and a stale
+        // per-peer marker could mis-fire the at-most-one-pending-per-peer
+        // abort after config churn. `pending_by_peer` is keyed by pubkey, so
+        // we drain directly for each removed pubkey. Still under
+        // `reconcile_lock`, consistent with `reserve_pending`/`release_pending`.
+        {
+            let mut pending = self.pending.write().unwrap();
+            let mut by_peer = self.pending_by_peer.write().unwrap();
+            for pubkey in old.peer_index_by_pubkey.keys() {
+                if new_index.contains_key(pubkey) {
+                    continue;
+                }
+                if let Some(reserved_idx) = by_peer.remove(pubkey) {
+                    pending.remove(&reserved_idx);
+                }
+            }
+        }
         // Publish the new table. Atomic release-store; any reader
         // doing `.load()` after this point sees the new table whole.
         self.table.store(Arc::new(PeerTable {
@@ -414,7 +483,7 @@ impl WgEngine {
         self.load_table()
     }
 
-    fn peer_arc(&self, pubkey: &[u8; 32]) -> Option<Arc<Peer>> {
+    pub(in crate::afxdp::wg) fn peer_arc(&self, pubkey: &[u8; 32]) -> Option<Arc<Peer>> {
         let table = self.load_table();
         let idx = *table.peer_index_by_pubkey.get(pubkey)?;
         table.peers.get(idx as usize).cloned()
@@ -449,6 +518,19 @@ impl WgEngine {
         // in published tables. This is slow path, so mutex cost is
         // acceptable and keeps install/reconcile linearizable.
         let _reconcile_guard = self.reconcile_lock.lock().unwrap();
+        self.install_session_locked(pubkey, session)
+    }
+
+    /// Lock-free core of `install_session`: the caller MUST already hold
+    /// `reconcile_lock`. Exposed (module-private) so the handshake
+    /// completion path can hold `reconcile_lock` across the take-state →
+    /// snow-read → install critical section without re-entering the
+    /// non-reentrant mutex (which would deadlock). See `consume_response`.
+    pub(in crate::afxdp::wg) fn install_session_locked(
+        &self,
+        pubkey: &[u8; 32],
+        session: Arc<WgSession>,
+    ) -> Result<(), InstallSessionError> {
         let Some(peer) = self.peer_arc(pubkey) else {
             return Err(InstallSessionError::UnknownPeer);
         };
