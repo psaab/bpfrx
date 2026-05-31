@@ -120,9 +120,19 @@ func (t *tunnelManager) Apply(tunnels []*config.TunnelConfig) error {
 				// this name already exists, check if it's already a TUN.
 				// If it's a different type (e.g. dummy), delete and recreate.
 				if existing, lookupErr := t.ops.LinkByName(tc.Name); lookupErr == nil {
-					if _, isTun := existing.(*netlink.Tuntap); isTun {
+					if existingTun, isTun := existing.(*netlink.Tuntap); isTun {
 						slog.Info("tunnel anchor already exists as TUN, reusing",
 							"name", tc.Name)
+						// Operate on the kernel-fetched link (which carries
+						// the real ifindex and attributes) rather than the
+						// freshly-constructed, ifindex-less anchor. The
+						// subsequent LinkSetUp/AddrAdd would otherwise rely
+						// on the netlink library re-resolving the index by
+						// name (ensureIndex) while still reading stale
+						// non-index LinkAttrs off the fresh struct.
+						// existingTun.Fds is nil on a kernel-fetched Tuntap,
+						// so closeTuntapFiles below is a safe no-op.
+						anchor = existingTun
 						goto anchorReady
 					}
 					slog.Info("replacing non-TUN tunnel anchor",
