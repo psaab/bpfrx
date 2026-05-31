@@ -1,6 +1,8 @@
 # Plan: #1713 — systemd-resolved renderer drops domain-search when domain-name is set
 
-- **Status**: DRAFT v1 — pending adversarial plan review
+- **Status**: PLAN-READY v2 — Codex PLAN-NEEDS-MINOR (addressed), AGY
+  PLAN-READY, Claude-SMR PLAN-READY. v2 fixes the resolved.conf ordering
+  rationale, the de-dup precision, and the empty-search-element guard.
 - **Issue**: #1713
 - **Branch**: refactor/1713-resolved-dns-renderer
 - **Coordinate with**: #1715 (DNS-ownership research; converged PLAN-READY
@@ -49,9 +51,10 @@ wrong (see §11 Q1).
 ## 3. systemd-resolved `Domains=` semantics (verified)
 
 Per `resolved.conf(5)`: `Domains=` takes a space-separated list of
-domains. A bare domain is a **search domain** (appended to single-label
-lookups). A domain prefixed with `~` is a **routing-only domain** (used
-for split-DNS routing, NOT search). xpf's `domain-name` is the Junos
+domains processed **in the specified order**. A bare domain is a
+**search domain** (a suffix appended to single-label lookups, tried in
+list order). A domain prefixed with `~` is a **routing-only domain**
+(used for split-DNS routing, NOT search). xpf's `domain-name` is the Junos
 primary domain — it functions as both the host's primary domain and a
 search domain in classic resolv.conf (`domain` + `search` semantics).
 Rendering it as the FIRST bare entry in the combined list preserves the
@@ -64,10 +67,21 @@ Domains=<domain-name> <search-domain-1> <search-domain-2> ...
 ```
 
 with `domain-name` first (when set), followed by each `domain-search`
-entry in config order. De-duplication: if `domain-name` also appears in
-`domain-search`, drop the duplicate from the search portion so resolved
-does not see a repeated entry (resolved tolerates duplicates, but a
-clean list is better and the test pins it).
+entry in config order. Because bare entries are an **ordered** search
+list, putting `domain-name` first preserves its primary-domain
+precedence (it is searched before the explicit search domains), and the
+relative order of the distinct search domains is unchanged.
+
+**De-duplication (precise rule):** skip a `domain-search` entry ONLY
+when `domain-name` is non-empty AND the search entry string-equals it.
+This removes the redundant *second* occurrence of the primary domain
+(its first occurrence already leads the list) without reordering any
+distinct suffix. The guard is `if domainName != "" && d == domainName`
+(not bare `d == domainName`) so an empty `domain-name` never causes an
+empty-string search element to be silently dropped — that path is
+parser-unreachable today but the guard keeps the renderer total and
+prevents a latent divergence from the old code's
+`strings.Join(search, " ")`.
 
 ## 4. What already exists
 
@@ -143,7 +157,7 @@ func combinedDomains(domainName string, search []string) []string {
 		out = append(out, domainName)
 	}
 	for _, d := range search {
-		if d == domainName {
+		if domainName != "" && d == domainName {
 			continue
 		}
 		out = append(out, d)
@@ -200,9 +214,11 @@ func (d *Daemon) applySystemDNS(cfg *config.Config) {
 ### 5c. New test `pkg/daemon/system/dns_test.go`
 
 Table-driven, covering: empty (→ ""), DNS-only, domain-name only,
-domain-search only, COMBINED domain-name + domain-search (the #1713
-case), and the de-dup case (domain-name repeated in domain-search). Each
-asserts the exact rendered string.
+domain-search only, DNS+domain-name, DNS+domain-search, COMBINED
+domain-name + domain-search (the #1713 case), and the de-dup case
+(domain-name repeated in domain-search). Each asserts the exact rendered
+string — pinning both the `DNS=`-before-`Domains=` line ordering and the
+combined-list content.
 
 ## 6. Public API preservation
 
@@ -281,10 +297,13 @@ combine fix + the new pure-renderer seam + its test.
    already emits it bare; making it routing-only would change existing
    single-domain behavior. KILL if this reasoning is wrong.)
 2. **De-dup correctness.** Is dropping a `domain-search` entry equal to
-   `domain-name` safe, or does resolved assign different precedence to
-   the first vs later occurrence such that de-dup changes resolution
-   order? (resolved treats `Domains=` as an unordered search set for
-   bare entries — order only matters for `~` routing specificity.)
+   `domain-name` safe? resolved processes bare `Domains=` entries as an
+   **ordered** search list, so order does matter — but removing the
+   redundant *later* occurrence of the primary domain (which already
+   leads the list) does NOT reorder any distinct suffix, so resolution
+   order of the real search domains is preserved. The guard is scoped
+   to `domainName != "" && d == domainName` so no empty-string element
+   is ever dropped.
 3. **Extraction vs in-place fix.** Is extracting `pkg/daemon/system/dns.go`
    justified for #1713 alone, or is it churn that should wait for #1715?
    (#1715's plan §7 explicitly requests #1713 create this seam first.
