@@ -1,17 +1,20 @@
 # #1709 — WireGuard S1: wire-protocol compliance (TAI64N + handshake framing) validated by spec known-answer vectors (live kernel-WireGuard interop = S2)
 
-Status: **PLAN-READY v3** — round-1 plan review complete: Codex
-(task-mpt6qx4i-i04py6) PLAN-NEEDS-MAJOR, AGY (adversarial-review-mpt6r70o-ebe5a4)
-PLAN-NEEDS-MAJOR, Claude-SMR PLAN-NEEDS-MINOR. v3 addresses ALL major findings
-(see §v3-convergence). v2→v3: TAI64N epoch offset corrected to
-`0x400000000000000a` + nanos whitening (AGY-2); two-phase index reservation to
-close the blackhole race (AGY-1/Codex-4); `local_public_key` added for inbound
-MAC1 (Codex-2); TAI64N persistence story reconciled (Codex-3); S1 gate
-strengthened to require FULL byte-exact msg1/msg2 KATs (Codex-1/SMR-2);
-S1/S2 boundary ratified Option (b+). v2→v1: dropped wireguard-go; reference =
-kernel WireGuard on a real VM (never a container); spec-KAT in-tree gate.
+Status: **PLAN-READY v4** — round-2 plan review complete and CONVERGED:
+AGY (adversarial-review-mpt7315l-j522br) **PLAN-READY**, Codex
+(task-mpt72t96-tcx9m8) **PLAN-NEEDS-MINOR** (all 6 round-1 majors confirmed
+resolved; one KAT-naming text fix). Claude-SMR PLAN-NEEDS-MINOR (round-1). v4
+folds the two round-2 implementation caveats: the TAI64N nanos carry MUST
+trigger at `>= 1_000_000_000` not `0xFF000000` (AGY round-2 math bug — a strict
+peer rejects nanos `>= 10^9`), and the reservation layer caps pending
+handshakes at ONE per peer pubkey to bound an authenticated-msg1-flood DoS
+(AGY round-2), plus the explicit `msg2_full_kat_fixed_ephemeral` requirement
+(Codex round-2). **Cleared to implement.**
 
-> Pending a confirming round-2 from Codex + AGY on v3 before code lands.
+History: round-1 Codex+AGY PLAN-NEEDS-MAJOR / SMR PLAN-NEEDS-MINOR (no KILL);
+v3 addressed all majors (§v3-convergence); round-2 confirmed + 2 minor caveats
+folded into v4 (§v4-round2). v1→v2: dropped wireguard-go, reference = kernel
+WireGuard on a real VM (never a container), spec-KAT in-tree gate.
 
 Issue: #1709 (part of #1703 umbrella). Branch:
 `refactor/1709-wireguard-s1-wire-protocol-compliance`.
@@ -235,13 +238,18 @@ byte-identical to the reference and avoid the timing side-channel. (A peer does
 not *require* it — it only byte-compares — but matching the reference is the
 S1 contract.)
 
-**Carry / monotonicity spec (NEW in v3 per Codex-3):** the monotonic clock
-returns `max(now_tai64n, last + 1_whitened_tick)`. Because nanos are whitened
-to a `0x1000000`-ns (~16.7 ms) granularity, the monotonic "+1" increment is one
-whitened tick = `0x1000000` ns; on nanos overflow past `0xFF000000` the carry
-rolls into the seconds field (`secs += 1; nanos = 0`). Stored as the 12-byte
-big-endian value so lexicographic byte-compare == numeric compare (matches
-`tai64n.go`'s `bytes.Compare`).
+**Carry / monotonicity spec (v3, CORRECTED in v4 per AGY round-2):** the
+monotonic clock returns `max(now_tai64n, last + 1_whitened_tick)`. Nanos are
+whitened to a `0x1000000`-ns (~16.7 ms) granularity, so the monotonic "+1"
+increment is one whitened tick = `0x1000000` ns. **The carry into seconds MUST
+trigger when the advanced nanos reach `>= 1_000_000_000` (`0x3B9ACA00`), NOT at
+`0xFF000000`** — a TAI64N nanos field must be a valid sub-second value `< 10^9`
+or a strict kernel-WG / wireguard-go peer rejects the datagram as malformed.
+Worked example (AGY): max whitened nanos = `0x3B000000` (989,852,672); adding
+one tick `0x1000000` → `0x3C000000` (1,006,632,960) which is `> 10^9` ⇒ MUST
+carry (`secs += 1; nanos = 0`). Stored as the 12-byte big-endian value so
+lexicographic byte-compare == numeric compare (matches `tai64n.go`'s
+`bytes.Compare`). A `tai64n_carry_at_1e9` test pins this boundary.
 
 **Monotonicity invariant (research §9, SMR r1 #1):** kernel WG rejects a msg1
 whose TAI64N is `<=` the last one it accepted from that peer — so xpf MUST emit
@@ -369,10 +377,11 @@ durable fix (disk persist) lands in S6.
 msg1/msg2 MAC1 requires xpf's OWN static public key (the recipient key for
 inbound messages). Today `WgEngineConfig`/`WgEngine` store only
 `local_private_key` (`engine.rs:173`, `:256`). v3 adds a `local_public_key:
-[u8; 32]` derived ONCE at `WgEngine::new` from the private key
-(X25519 base-point mult via `curve25519-dalek` — already in `Cargo.lock` at
-4.1.3 — or snow's `Builder::generate_keypair` is NOT it; use the dalek
-`x25519(secret, basepoint)` clamp). Storing it avoids re-deriving per parse and
+[u8; 32]` derived ONCE at `WgEngine::new` from the private key. **Impl note
+(Codex round-2):** in `curve25519-dalek` 4.1.3 use
+`MontgomeryPoint::mul_base_clamped(secret).to_bytes()` — this matches snow's
+own static-key derivation exactly, so the stored `local_public_key` equals what
+the peer authenticates. Storing it avoids re-deriving per parse and
 prevents the "private-key-as-public" / swapped-key class of bug under
 implementation pressure. A unit test asserts `local_public_key` equals snow's
 notion of our static pub for the same private key.
@@ -425,9 +434,23 @@ This means:
   - The reservation must be released on handshake failure/timeout so a dropped
     handshake does not leak the index forever (mirrors the
     `reconcile_peers` drain discipline for dropped sessions).
-  - Tests: `reserve_before_send_then_promote`, and a concurrent-reservation
-    test proving two in-flight handshakes never both claim the same index and
-    no completed handshake is left un-demuxable.
+  - **At-most-one-pending-per-peer (NEW in v4 — AGY round-2 DoS finding).**
+    MAC1 keys only on xpf's *public* responder key, so an attacker can flood
+    valid-MAC1 msg1s. If the responder reserved an index + stored a pending
+    `HandshakeState` for *every* inbound msg1, it could exhaust the 32-bit
+    index space / blow memory. **Invariant: each peer pubkey holds at most ONE
+    pending reservation; a new initiation from a peer ABORTS and releases that
+    peer's prior pending reservation before reserving a new one.** This bounds
+    pending state to O(num configured peers), not O(inbound msg1 rate). (Note:
+    `consume_initiation` only reaches the reservation step *after* snow
+    `read_message` authenticates the static-key AEAD, so an unauthenticated
+    flood is already rejected pre-reservation; the per-peer cap bounds the
+    authenticated-but-incomplete case.)
+  - Tests: `reserve_before_send_then_promote`; a concurrent-reservation test
+    proving two in-flight handshakes never both claim the same index and no
+    completed handshake is left un-demuxable; and
+    `at_most_one_pending_per_peer` (a second init from a peer releases the
+    first pending reservation).
 
 Exact return shapes keep `HandshakeState` engine-internal where possible
 (SMR-6): the engine holds the pending `HandshakeState` keyed by the reserved
@@ -470,13 +493,16 @@ SMR-R1.)
   - `mac1_keys_on_recipient_static_pub` — build msg1 toward responder R; assert
     mac1 verifies under `HASH("mac1----"||R_pub)` and FAILS under a different
     pubkey (catches the swapped-key bug).
-  - **`msg1_full_kat_fixed_ephemeral` (SMR-2, REQUIRED)** — with a pinned
-    local-static + ephemeral (snow `fixed_ephemeral`) + a fixed TAI64N, assert
-    the entire deterministic 148-byte msg1 and its 16-byte mac1 over
-    `msg[0..116]`. This is the one test that catches an offset/endianness bug
-    in the framing *assembly* that per-field KATs miss. (If a fixed-ephemeral
-    builder is not cleanly reachable, fall back to asserting mac1 over a
-    captured msg-prefix — still catches the offset bug.)
+  - **`msg1_full_kat_fixed_ephemeral` + `msg2_full_kat_fixed_ephemeral`
+    (SMR-2 / Codex-1, BOTH REQUIRED)** — with pinned local-static + ephemeral
+    + a fixed TAI64N, assert the entire deterministic 148-byte msg1 (and its
+    16-byte mac1 over `msg[0..116]`) AND the entire 92-byte msg2 (mac1 over
+    `msg[0..60]`). These are the two tests that catch an offset/endianness bug
+    in the framing *assembly* that per-field KATs miss. snow 0.10 exposes
+    `Builder::fixed_ephemeral_key_for_testing_only`, so the fixed-ephemeral
+    path IS reachable — **no fallback is permitted for these full-message
+    KATs** (Codex round-2). A `WgEngine` test-only hook threads the fixed
+    ephemeral into `create_initiation`/`consume_initiation_create_response`.
   - `msg1_layout_byte_offsets` / `msg2_layout_byte_offsets` — assert the
     148/92-byte total, type byte = 1/2, reserved zeros, LE indices at the right
     offsets, snow body at offset 8/12, mac1/mac2 at the tail.
@@ -488,9 +514,11 @@ SMR-R1.)
     `(secs, nanos)`, including the **`+10` epoch offset** (AGY-2) and the
     **nanos whitening** (v3); `tai64n_strictly_monotonic` (N calls strictly
     increase by byte-compare even with a frozen/backwards clock, with the
-    one-whitened-tick carry into seconds on nanos overflow — §4.3);
-    **`tai64n_concurrent_monotonic` (SMR-4)** (N threads calling `now()` yield
-    N strictly-ordered distinct values).
+    one-whitened-tick carry into seconds — §4.3);
+    **`tai64n_carry_at_1e9` (AGY round-2)** (carry triggers at nanos
+    `>= 1_000_000_000`, NOT `0xFF000000` — a strict peer rejects nanos `>= 10^9`
+    as malformed); **`tai64n_concurrent_monotonic` (SMR-4)** (N threads calling
+    `now()` yield N strictly-ordered distinct values).
   - `framing_roundtrip` — `build_initiation` then `parse_initiation` recovers
     the sender_index + noise body; `parse` rejects TooShort / BadType /
     Mac1Mismatch.
@@ -691,9 +719,14 @@ pass unchanged.
   (handshake framing round-trip, mac1 key-on-recipient, TAI64N monotonic,
   TooShort/BadType/Mac1Mismatch arms).
 - **Spec KAT vector tests** (§5.4a) — **the S1 success criterion** under
-  Option (b): `construction_hashes_match_spec`, `mac1_keyed_blake2s_128_kat`,
-  `mac1_keys_on_recipient_static_pub`, `msg1/msg2_layout_byte_offsets`,
-  `tai64n_encoding_kat`, `tai64n_strictly_monotonic`, `framing_roundtrip`,
+  Option (b+): `construction_hashes_match_spec`, `mac1_keyed_blake2s_128_kat`,
+  `mac1_keys_on_recipient_static_pub`, **`msg1_full_kat_fixed_ephemeral`**,
+  **`msg2_full_kat_fixed_ephemeral`** (both full byte-exact wire-image KATs —
+  Codex round-2 requires both named), `msg1_layout_byte_offsets`,
+  `msg2_layout_byte_offsets`, `parse_initiation_accepts_nonzero_mac2`,
+  `tai64n_encoding_kat`, `tai64n_strictly_monotonic`, `tai64n_carry_at_1e9`,
+  `tai64n_concurrent_monotonic`, `framing_roundtrip`,
+  `reserve_before_send_then_promote`, `at_most_one_pending_per_peer`,
   `engine_self_handshake_with_framing`.
 - **5× flake** on the framing tests (esp. `engine_self_handshake_with_framing`
   and `tai64n_strictly_monotonic`) — must be 5/5.
@@ -933,3 +966,44 @@ is keyed-BLAKE2s-128, S1/S2 boundary = Option (b+).
 All MAJOR/CRITICAL findings are addressed in v3. Remaining work is a confirming
 round-2 (Codex + AGY) on v3, then implement per §5 with the strengthened
 §5.4a gate.
+
+---
+
+## v4-round2 — confirming plan-review (Codex + AGY on v3)
+
+Round-2 reviews of plan v3 (@ `b9e8bb00a`):
+
+- **AGY** (`adversarial-review-mpt7315l-j522br`): **PLAN-READY**. Confirmed all
+  three AGY-round-1 findings resolved (index blackhole race closed by two-phase
+  reservation; epoch offset + nanos whitening correct; NTP/restart self-DoS
+  correctly scoped to an S2 runbook item + S6 durable fix) and all Codex
+  findings resolved. Raised TWO new implementation caveats (both folded into
+  v4):
+  1. **TAI64N nanos-carry math (MUST-FIX):** carry into seconds must trigger at
+     advanced nanos `>= 1_000_000_000` (`0x3B9ACA00`), NOT at `0xFF000000`. Max
+     whitened nanos `0x3B000000` + one tick `0x1000000` = `0x3C000000`
+     (1,006,632,960) `> 10^9` ⇒ a strict kernel-WG/wireguard-go peer rejects a
+     nanos `>= 10^9` as malformed. → §4.3 corrected; `tai64n_carry_at_1e9` test
+     added.
+  2. **Pending-reservation state-exhaustion DoS:** MAC1 keys only on xpf's
+     public key, so valid-MAC1 msg1 floods are cheap to forge. The reservation
+     layer must cap pending handshakes at ONE per peer pubkey (a new init from a
+     peer aborts+releases that peer's prior pending). → §5.3 invariant +
+     `at_most_one_pending_per_peer` test added. (Mitigated further by the fact
+     that the reservation step is reached only after snow authenticates the
+     static-key AEAD.)
+
+- **Codex** (`task-mpt72t96-tcx9m8`): **PLAN-NEEDS-MINOR**. No majors remain;
+  confirmed Codex-1..5 + AGY-2 resolved. One text fix: §5.4a named only
+  `msg1_full_kat_fixed_ephemeral` — add `msg2_full_kat_fixed_ephemeral` and
+  list both in §9; snow exposes `fixed_ephemeral_key_for_testing_only` so the
+  fallback path is disallowed for these KATs. Impl note: derive
+  `local_public_key` via `MontgomeryPoint::mul_base_clamped(secret).to_bytes()`
+  to match snow. → §5.4a + §9 + §5.3 updated.
+
+**Convergence:** AGY PLAN-READY, Codex PLAN-NEEDS-MINOR (text-only, addressed in
+v4), Claude-SMR PLAN-NEEDS-MINOR (round-1, addressed in v3/v4). All MAJOR and
+CRITICAL findings across both rounds are resolved in plan v4. **Cleared to
+implement** per §5 with the strengthened §5.4a/§9 gate and the §5.3 reservation
++ §4.3 TAI64N invariants. A round-3 reviewer pass is not required — the only
+open round-2 items were text/impl-note fixes now in v4.
