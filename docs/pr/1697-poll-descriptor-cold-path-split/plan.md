@@ -1,12 +1,14 @@
 # #1697 — Extract cold-path/exception helpers out of poll_descriptor/mod.rs
 
-**Status:** DRAFT v2 — revised after round-1 PLAN-KILL (Codex + AGY) +
-PLAN-NEEDS-MINOR (Claude-SMR). All three converged on one fixable defect:
-v1's blanket `#[inline(never)]` policy was wrong for the guard-wrappers
-reachable from the `#[inline(always)]` flow-cache fast path. v2 adopts
-the salvage path all three reviewers endorsed: keep the common-case
-guard inline; split only the rare/heavy bodies into
-`#[cold] #[inline(never)]` callees. Re-dispatched for round 2.
+**Status:** PLAN-READY (v2 + round-2 precision edits). Round 2: AGY
+PLAN-READY, Claude-SMR PLAN-READY, Codex PLAN-NEEDS-MINOR (three
+classification/test-plan wording edits, all applied below). The v1
+load-bearing defect (blanket `#[inline(never)]` on guard-wrappers
+reachable from the `#[inline(always)]` flow-cache fast path) is fixed:
+v2 keeps those wrappers `#[inline]` so the common-case guard folds into
+the hot path, and splits only the rare/heavy bodies into
+`#[cold] #[inline(never)]` callees — the salvage path all three round-1
+reviewers endorsed.
 
 ## Round-1 verdicts and how v2 addresses them
 
@@ -130,10 +132,21 @@ behavior or perturb the order-coupled hot loop.
 
 ## 4. Hot/cold classification (the load-bearing claim)
 
-Every helper proposed for extraction runs ONLY on a non-established
-path. Established/steady-state packets are handled entirely inside
-`stage_flow_cache_hit` (the `#[inline(always)]` fast path) and never
-reach these helpers. Call-site evidence (mod.rs line numbers):
+Most helpers proposed for extraction run only on a non-established
+path. The exceptions — helpers reachable on a per-packet established
+path — are the three WARM/HOT wrappers below, which is exactly why v2
+keeps them `#[inline]` (guard folds into the hot path) rather than
+`#[inline(never)]`. Specifically (round-2 Codex precision edits):
+`evaluate_non_pbr_input_filter` is reached both on session-miss AND as
+the DSCP-sensitive session-hit tail (via
+`evaluate_dscp_..._on_session_hit` at mod.rs:239, because
+flow_cache.rs:285-302 does not cache DSCP-sensitive filters);
+`apply_lo0_filter_action` is reached after a session hit at
+mod.rs:700-702 for `ForwardingDisposition::LocalDelivery` (host-bound,
+not transit — `is_cacheable` at forwarding.rs:223-227 only caches
+`ForwardCandidate | FabricRedirect`), so it can run per-packet on
+local-delivery established traffic but never on the transit flow-cache
+fast path. Call-site evidence (mod.rs line numbers):
 
 | Helper | Call sites | Path | Cold? |
 |--------|-----------|------|-------|
@@ -194,7 +207,9 @@ the repo's existing pattern at `tx/dispatch/slow_path.rs:23`).
      — leaf helpers; `#[inline]` (called from both inline and cold
      callers; trivial bodies, let rustc decide).
    - `fn evaluate_non_pbr_input_filter` — `#[cold] #[inline(never)]`
-     (session-miss per-flow-once).
+     (session-miss per-flow-once AND the DSCP-sensitive session-hit
+     tail; in both cases it is the rare post-guard body, never the
+     common-case hot path — the cheap guards are upstream and inline).
    - `fn evaluate_non_pbr_input_filter_log_only` —
      `#[cold] #[inline(never)]` (flow-cache insert, per-flow-once).
    - `fn evaluate_dscp_sensitive_input_filter_on_session_hit` —
@@ -218,7 +233,12 @@ the repo's existing pattern at `tx/dispatch/slow_path.rs:23`).
      (new thin split) so the heavy `emit_filter_log_event` call lives
      out of line.
    - `fn apply_lo0_filter_action` — `#[cold] #[inline(never)]`
-     (host-bound lo0 traffic only).
+     (host-bound local-delivery traffic; reached after a session hit at
+     mod.rs:700-702 only for `ForwardingDisposition::LocalDelivery`,
+     never on the transit flow-cache fast path — `is_cacheable` at
+     forwarding.rs:223-227 caches only `ForwardCandidate |
+     FabricRedirect`. Host-bound traffic is low-rate vs transit, so
+     cold is appropriate even though it is per-packet for that subset).
    Visibility `pub(super)` so both `mod.rs` and the sibling
    `flow_cache_hit.rs` can call them via `super::filter::*`.
 
@@ -312,8 +332,10 @@ consumer and it keeps calling `emit_cached_input_filter_log` /
   and `syn_cookie_reply_budget_preserves_tx_batch_reserve` (the tests
   that move with `cookie_reply.rs`).
 - **F1 regression guard (the round-1 KILL trigger) — `cargo asm`
-  spot-check:** disassemble `stage_flow_cache_hit` and confirm the
-  hot flow-cache-hit path does NOT emit an unconditional per-packet
+  spot-check:** because `stage_flow_cache_hit` is `#[inline(always)]`
+  it has no standalone symbol — disassemble its inlining host
+  `poll_binding_process_descriptor` (round-2 Codex note) and confirm
+  the hot flow-cache-hit path does NOT emit an unconditional per-packet
   `call` into `filter::emit_cached_input_filter_log` /
   `emit_cached_output_filter_log` (i.e. the `None` guard inlined and
   only a *conditional* rare call remains, or no call when no filter log
