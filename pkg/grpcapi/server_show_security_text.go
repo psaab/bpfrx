@@ -25,12 +25,26 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	"github.com/psaab/xpf/pkg/feeds"
+	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+// screenSYNCookieCounterRows renders the aggregated userspace
+// SYN-cookie counters (moved from server_show.go in #1700).
+func (s *Server) screenSYNCookieCounterRows() string {
+	status, err := s.userspaceDataplaneStatus()
+	if err != nil {
+		return ""
+	}
+	return dpuserspace.FormatSYNCookieCounterRows(dpuserspace.SumSYNCookieCounters(status))
+}
 
 // showIPsecStatistics renders the IPsec SA table with active-tunnel
 // count and per-SA byte counters.
@@ -330,5 +344,491 @@ func (s *Server) showSecurityAlarms(cfg *config.Config, topic string, buf *strin
 	} else if !detail {
 		fmt.Fprintf(buf, "%d security alarm(s) currently active\n", alarmCount)
 		buf.WriteString("  run 'show security alarms detail' for details\n")
+	}
+}
+
+// --- #1700: residual ShowText security/screen branches ---
+//
+// The four screen-* prefix handlers and the `screen`, `ike`, `alg`,
+// `dynamic-address`, and `address-book` switch cases moved here from
+// server_show.go verbatim (only `&buf` → `buf`). Prefix handlers
+// return the response directly because they were early-returns in the
+// dispatcher; the shared buf they receive is empty on entry.
+
+func (s *Server) showScreenIDSOption(req *pb.ShowTextRequest, cfg *config.Config, buf *strings.Builder) (*pb.ShowTextResponse, error) {
+	profileName := strings.TrimPrefix(req.Topic, "screen-ids-option:")
+	if cfg == nil || len(cfg.Security.Screen) == 0 {
+		buf.WriteString("No screen profiles configured\n")
+	} else {
+		profile, ok := cfg.Security.Screen[profileName]
+		if !ok {
+			fmt.Fprintf(buf, "Screen profile '%s' not found\n", profileName)
+		} else {
+			fmt.Fprintf(buf, "Screen object status:\n\n")
+			fmt.Fprintf(buf, "  Name                                        Value\n")
+			if profile.TCP.Land {
+				fmt.Fprintf(buf, "  TCP land attack                             enabled\n")
+			}
+			if profile.TCP.SynFin {
+				fmt.Fprintf(buf, "  TCP SYN+FIN                                 enabled\n")
+			}
+			if profile.TCP.NoFlag {
+				fmt.Fprintf(buf, "  TCP no-flag                                 enabled\n")
+			}
+			if profile.TCP.FinNoAck {
+				fmt.Fprintf(buf, "  TCP FIN-no-ACK                              enabled\n")
+			}
+			if profile.TCP.WinNuke {
+				fmt.Fprintf(buf, "  TCP WinNuke                                 enabled\n")
+			}
+			if profile.TCP.SynFrag {
+				fmt.Fprintf(buf, "  TCP SYN fragment                            enabled\n")
+			}
+			if profile.TCP.SynFlood != nil {
+				fmt.Fprintf(buf, "  TCP SYN flood attack threshold              %d\n",
+					profile.TCP.SynFlood.AttackThreshold)
+				if profile.TCP.SynFlood.SourceThreshold > 0 {
+					fmt.Fprintf(buf, "  TCP SYN flood source threshold              %d\n",
+						profile.TCP.SynFlood.SourceThreshold)
+				}
+				if profile.TCP.SynFlood.DestinationThreshold > 0 {
+					fmt.Fprintf(buf, "  TCP SYN flood destination threshold          %d\n",
+						profile.TCP.SynFlood.DestinationThreshold)
+				}
+				if profile.TCP.SynFlood.Timeout > 0 {
+					fmt.Fprintf(buf, "  TCP SYN flood timeout                       %d\n",
+						profile.TCP.SynFlood.Timeout)
+				}
+			}
+			if profile.ICMP.PingDeath {
+				fmt.Fprintf(buf, "  ICMP ping of death                          enabled\n")
+			}
+			if profile.ICMP.FloodThreshold > 0 {
+				fmt.Fprintf(buf, "  ICMP flood threshold                        %d\n",
+					profile.ICMP.FloodThreshold)
+			}
+			if profile.IP.SourceRouteOption {
+				fmt.Fprintf(buf, "  IP source route option                      enabled\n")
+			}
+			if profile.UDP.FloodThreshold > 0 {
+				fmt.Fprintf(buf, "  UDP flood threshold                         %d\n",
+					profile.UDP.FloodThreshold)
+			}
+			// Show which zones use this profile
+			var zones []string
+			for name, zone := range cfg.Security.Zones {
+				if zone.ScreenProfile == profileName {
+					zones = append(zones, name)
+				}
+			}
+			if len(zones) > 0 {
+				sort.Strings(zones)
+				fmt.Fprintf(buf, "\n  Bound to zones: %s\n", strings.Join(zones, ", "))
+			}
+		}
+	}
+	return &pb.ShowTextResponse{Output: buf.String()}, nil
+}
+
+func (s *Server) showScreenStatistics(req *pb.ShowTextRequest, cfg *config.Config, buf *strings.Builder) (*pb.ShowTextResponse, error) {
+	zoneName := strings.TrimPrefix(req.Topic, "screen-statistics:")
+	if cfg == nil {
+		buf.WriteString("No active configuration\n")
+	} else if s.dp == nil || !s.dp.IsLoaded() {
+		buf.WriteString("Dataplane not loaded\n")
+	} else {
+		cr := s.applyResult()
+		if cr == nil {
+			buf.WriteString("No compile result available\n")
+		} else {
+			zoneID, ok := cr.ZoneIDs[zoneName]
+			if !ok {
+				fmt.Fprintf(buf, "Zone '%s' not found\n", zoneName)
+			} else {
+				fs, err := s.dp.ReadFloodCounters(zoneID)
+				if err != nil {
+					fmt.Fprintf(buf, "Error reading flood counters: %v\n", err)
+				} else {
+					screenProfile := ""
+					if z, ok := cfg.Security.Zones[zoneName]; ok {
+						screenProfile = z.ScreenProfile
+					}
+					fmt.Fprintf(buf, "Screen statistics for zone '%s':\n", zoneName)
+					if screenProfile != "" {
+						fmt.Fprintf(buf, "  Screen profile: %s\n", screenProfile)
+					}
+					fmt.Fprintf(buf, "  %-30s %s\n", "Counter", "Value")
+					fmt.Fprintf(buf, "  %-30s %d\n", "SYN flood events", fs.SynCount)
+					fmt.Fprintf(buf, "  %-30s %d\n", "ICMP flood events", fs.ICMPCount)
+					fmt.Fprintf(buf, "  %-30s %d\n", "UDP flood events", fs.UDPCount)
+					buf.WriteString(s.screenSYNCookieCounterRows())
+				}
+			}
+		}
+	}
+	return &pb.ShowTextResponse{Output: buf.String()}, nil
+}
+
+func (s *Server) showScreenStatisticsAll(cfg *config.Config, buf *strings.Builder) (*pb.ShowTextResponse, error) {
+	if cfg == nil {
+		buf.WriteString("No active configuration\n")
+	} else if s.dp == nil || !s.dp.IsLoaded() {
+		buf.WriteString("Dataplane not loaded\n")
+	} else if cr := s.applyResult(); cr == nil {
+		buf.WriteString("No compile result available\n")
+	} else {
+		var zones []string
+		for name := range cr.ZoneIDs {
+			zones = append(zones, name)
+		}
+		sort.Strings(zones)
+		for _, zoneName := range zones {
+			zoneID := cr.ZoneIDs[zoneName]
+			fs, err := s.dp.ReadFloodCounters(zoneID)
+			if err != nil {
+				continue
+			}
+			screenProfile := ""
+			if z, ok := cfg.Security.Zones[zoneName]; ok {
+				screenProfile = z.ScreenProfile
+			}
+			fmt.Fprintf(buf, "Screen statistics for zone '%s':\n", zoneName)
+			if screenProfile != "" {
+				fmt.Fprintf(buf, "  Screen profile: %s\n", screenProfile)
+			}
+			fmt.Fprintf(buf, "  %-30s %s\n", "Counter", "Value")
+			fmt.Fprintf(buf, "  %-30s %d\n", "SYN flood events", fs.SynCount)
+			fmt.Fprintf(buf, "  %-30s %d\n", "ICMP flood events", fs.ICMPCount)
+			fmt.Fprintf(buf, "  %-30s %d\n", "UDP flood events", fs.UDPCount)
+			buf.WriteString("\n")
+		}
+		buf.WriteString(s.screenSYNCookieCounterRows())
+	}
+	return &pb.ShowTextResponse{Output: buf.String()}, nil
+}
+
+func (s *Server) showScreenIDSOptionDetail(req *pb.ShowTextRequest, cfg *config.Config, buf *strings.Builder) (*pb.ShowTextResponse, error) {
+	profileName := strings.TrimPrefix(req.Topic, "screen-ids-option-detail:")
+	if cfg == nil || len(cfg.Security.Screen) == 0 {
+		buf.WriteString("No screen profiles configured\n")
+	} else {
+		profile, ok := cfg.Security.Screen[profileName]
+		if !ok {
+			fmt.Fprintf(buf, "Screen profile '%s' not found\n", profileName)
+		} else {
+			fmt.Fprintf(buf, "Screen object status (detail):\n\n")
+			fmt.Fprintf(buf, "  %-45s %-12s %s\n", "Name", "Value", "Default")
+			enabledS := func(v bool) string {
+				if v {
+					return "enabled"
+				}
+				return "disabled"
+			}
+			fmt.Fprintf(buf, "  %-45s %-12s %s\n", "TCP land attack", enabledS(profile.TCP.Land), "disabled")
+			fmt.Fprintf(buf, "  %-45s %-12s %s\n", "TCP SYN+FIN", enabledS(profile.TCP.SynFin), "disabled")
+			fmt.Fprintf(buf, "  %-45s %-12s %s\n", "TCP no-flag", enabledS(profile.TCP.NoFlag), "disabled")
+			fmt.Fprintf(buf, "  %-45s %-12s %s\n", "TCP FIN-no-ACK", enabledS(profile.TCP.FinNoAck), "disabled")
+			fmt.Fprintf(buf, "  %-45s %-12s %s\n", "TCP WinNuke", enabledS(profile.TCP.WinNuke), "disabled")
+			fmt.Fprintf(buf, "  %-45s %-12s %s\n", "TCP SYN fragment", enabledS(profile.TCP.SynFrag), "disabled")
+			if profile.TCP.SynFlood != nil {
+				fmt.Fprintf(buf, "  %-45s %-12s %s\n", "TCP SYN flood protection", "enabled", "disabled")
+				fmt.Fprintf(buf, "  %-45s %-12d %s\n", "  Attack threshold", profile.TCP.SynFlood.AttackThreshold, "200")
+				if profile.TCP.SynFlood.AlarmThreshold > 0 {
+					fmt.Fprintf(buf, "  %-45s %-12d %s\n", "  Alarm threshold", profile.TCP.SynFlood.AlarmThreshold, "512")
+				} else {
+					fmt.Fprintf(buf, "  %-45s %-12s %s\n", "  Alarm threshold", "(default)", "512")
+				}
+				if profile.TCP.SynFlood.SourceThreshold > 0 {
+					fmt.Fprintf(buf, "  %-45s %-12d %s\n", "  Source threshold", profile.TCP.SynFlood.SourceThreshold, "4000")
+				} else {
+					fmt.Fprintf(buf, "  %-45s %-12s %s\n", "  Source threshold", "(default)", "4000")
+				}
+				if profile.TCP.SynFlood.DestinationThreshold > 0 {
+					fmt.Fprintf(buf, "  %-45s %-12d %s\n", "  Destination threshold", profile.TCP.SynFlood.DestinationThreshold, "4000")
+				} else {
+					fmt.Fprintf(buf, "  %-45s %-12s %s\n", "  Destination threshold", "(default)", "4000")
+				}
+				if profile.TCP.SynFlood.Timeout > 0 {
+					fmt.Fprintf(buf, "  %-45s %-12d %s\n", "  Timeout (seconds)", profile.TCP.SynFlood.Timeout, "20")
+				} else {
+					fmt.Fprintf(buf, "  %-45s %-12s %s\n", "  Timeout (seconds)", "(default)", "20")
+				}
+			} else {
+				fmt.Fprintf(buf, "  %-45s %-12s %s\n", "TCP SYN flood protection", "disabled", "disabled")
+			}
+			fmt.Fprintf(buf, "  %-45s %-12s %s\n", "ICMP ping of death", enabledS(profile.ICMP.PingDeath), "disabled")
+			if profile.ICMP.FloodThreshold > 0 {
+				fmt.Fprintf(buf, "  %-45s %-12d %s\n", "ICMP flood threshold", profile.ICMP.FloodThreshold, "1000")
+			} else {
+				fmt.Fprintf(buf, "  %-45s %-12s %s\n", "ICMP flood threshold", "disabled", "disabled")
+			}
+			fmt.Fprintf(buf, "  %-45s %-12s %s\n", "IP source route option", enabledS(profile.IP.SourceRouteOption), "disabled")
+			fmt.Fprintf(buf, "  %-45s %-12s %s\n", "IP teardrop", enabledS(profile.IP.TearDrop), "disabled")
+			if profile.UDP.FloodThreshold > 0 {
+				fmt.Fprintf(buf, "  %-45s %-12d %s\n", "UDP flood threshold", profile.UDP.FloodThreshold, "1000")
+			} else {
+				fmt.Fprintf(buf, "  %-45s %-12s %s\n", "UDP flood threshold", "disabled", "disabled")
+			}
+			var zones []string
+			for name, zone := range cfg.Security.Zones {
+				if zone.ScreenProfile == profileName {
+					zones = append(zones, name)
+				}
+			}
+			if len(zones) > 0 {
+				sort.Strings(zones)
+				fmt.Fprintf(buf, "\n  Bound to zones: %s\n", strings.Join(zones, ", "))
+			} else {
+				fmt.Fprintf(buf, "\n  Bound to zones: (none)\n")
+			}
+		}
+	}
+	return &pb.ShowTextResponse{Output: buf.String()}, nil
+}
+
+func (s *Server) showScreen(cfg *config.Config, buf *strings.Builder) {
+	if cfg == nil || len(cfg.Security.Screen) == 0 {
+		buf.WriteString("No screen profiles configured\n")
+	} else {
+		// Build reverse map: profile name -> zones
+		zonesByProfile := make(map[string][]string)
+		for name, zone := range cfg.Security.Zones {
+			if zone.ScreenProfile != "" {
+				zonesByProfile[zone.ScreenProfile] = append(zonesByProfile[zone.ScreenProfile], name)
+			}
+		}
+		var names []string
+		for name := range cfg.Security.Screen {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			profile := cfg.Security.Screen[name]
+			fmt.Fprintf(buf, "Screen profile: %s\n", name)
+			if profile.TCP.Land {
+				buf.WriteString("  TCP LAND attack detection: enabled\n")
+			}
+			if profile.TCP.SynFin {
+				buf.WriteString("  TCP SYN+FIN detection: enabled\n")
+			}
+			if profile.TCP.NoFlag {
+				buf.WriteString("  TCP no-flag detection: enabled\n")
+			}
+			if profile.TCP.FinNoAck {
+				buf.WriteString("  TCP FIN-no-ACK detection: enabled\n")
+			}
+			if profile.TCP.WinNuke {
+				buf.WriteString("  TCP WinNuke detection: enabled\n")
+			}
+			if profile.TCP.SynFrag {
+				buf.WriteString("  TCP SYN fragment detection: enabled\n")
+			}
+			if profile.TCP.SynFlood != nil {
+				fmt.Fprintf(buf, "  TCP SYN flood protection: attack-threshold %d\n",
+					profile.TCP.SynFlood.AttackThreshold)
+			}
+			if profile.ICMP.PingDeath {
+				buf.WriteString("  ICMP ping-of-death detection: enabled\n")
+			}
+			if profile.ICMP.FloodThreshold > 0 {
+				fmt.Fprintf(buf, "  ICMP flood protection: threshold %d\n",
+					profile.ICMP.FloodThreshold)
+			}
+			if profile.IP.SourceRouteOption {
+				buf.WriteString("  IP source-route option detection: enabled\n")
+			}
+			if profile.UDP.FloodThreshold > 0 {
+				fmt.Fprintf(buf, "  UDP flood protection: threshold %d\n",
+					profile.UDP.FloodThreshold)
+			}
+			if zones, ok := zonesByProfile[name]; ok {
+				sort.Strings(zones)
+				fmt.Fprintf(buf, "  Applied to zones: %s\n", strings.Join(zones, ", "))
+			}
+			buf.WriteString("\n")
+		}
+		// Per-type drop counters
+		if s.dp != nil && s.dp.IsLoaded() {
+			readCtr := func(idx uint32) uint64 {
+				v, _ := s.dp.ReadGlobalCounter(idx)
+				return v
+			}
+			totalDrops := readCtr(dataplane.GlobalCtrScreenDrops)
+			fmt.Fprintf(buf, "Total screen drops: %d\n", totalDrops)
+			if totalDrops > 0 {
+				screenCounters := []struct {
+					idx  uint32
+					name string
+				}{
+					{dataplane.GlobalCtrScreenSynFlood, "SYN flood"},
+					{dataplane.GlobalCtrScreenICMPFlood, "ICMP flood"},
+					{dataplane.GlobalCtrScreenUDPFlood, "UDP flood"},
+					{dataplane.GlobalCtrScreenLandAttack, "LAND attack"},
+					{dataplane.GlobalCtrScreenPingOfDeath, "Ping of death"},
+					{dataplane.GlobalCtrScreenTearDrop, "Teardrop"},
+					{dataplane.GlobalCtrScreenTCPSynFin, "TCP SYN+FIN"},
+					{dataplane.GlobalCtrScreenTCPNoFlag, "TCP no flag"},
+					{dataplane.GlobalCtrScreenTCPFinNoAck, "TCP FIN no ACK"},
+					{dataplane.GlobalCtrScreenWinNuke, "WinNuke"},
+					{dataplane.GlobalCtrScreenIPSrcRoute, "IP source route"},
+					{dataplane.GlobalCtrScreenSynFrag, "SYN fragment"},
+				}
+				for _, sc := range screenCounters {
+					v := readCtr(sc.idx)
+					if v > 0 {
+						fmt.Fprintf(buf, "  %-25s %d\n", sc.name+":", v)
+					}
+				}
+			}
+		}
+	}
+}
+
+func (s *Server) showAlg(cfg *config.Config, buf *strings.Builder) {
+	if cfg == nil {
+		buf.WriteString("No active configuration\n")
+	} else {
+		alg := cfg.Security.ALG
+		fmt.Fprintf(buf, "SIP:  %s\n", boolStatus(!alg.SIPDisable))
+		fmt.Fprintf(buf, "FTP:  %s\n", boolStatus(!alg.FTPDisable))
+		fmt.Fprintf(buf, "TFTP: %s\n", boolStatus(!alg.TFTPDisable))
+		fmt.Fprintf(buf, "DNS:  %s\n", boolStatus(!alg.DNSDisable))
+	}
+}
+
+func (s *Server) showDynamicAddress(cfg *config.Config, buf *strings.Builder) {
+	if cfg == nil || len(cfg.Security.DynamicAddress.FeedServers) == 0 {
+		buf.WriteString("No dynamic address feeds configured\n")
+	} else {
+		var runtimeFeeds map[string]feeds.FeedInfo
+		if s.feedsFn != nil {
+			runtimeFeeds = s.feedsFn()
+		}
+		for name, feed := range cfg.Security.DynamicAddress.FeedServers {
+			fmt.Fprintf(buf, "Feed server: %s\n", name)
+			fmt.Fprintf(buf, "  URL: %s\n", feed.URL)
+			if feed.FeedName != "" {
+				fmt.Fprintf(buf, "  Feed name: %s\n", feed.FeedName)
+			}
+			if feed.UpdateInterval > 0 {
+				fmt.Fprintf(buf, "  Update interval: %ds\n", feed.UpdateInterval)
+			}
+			if feed.HoldInterval > 0 {
+				fmt.Fprintf(buf, "  Hold interval: %ds\n", feed.HoldInterval)
+			}
+			if fi, ok := runtimeFeeds[name]; ok {
+				fmt.Fprintf(buf, "  Prefixes: %d\n", fi.Prefixes)
+				if !fi.LastFetch.IsZero() {
+					age := time.Since(fi.LastFetch).Truncate(time.Second)
+					fmt.Fprintf(buf, "  Last fetch: %s (%s ago)\n", fi.LastFetch.Format("2006-01-02 15:04:05"), age)
+				} else {
+					fmt.Fprintf(buf, "  Last fetch: never\n")
+				}
+			}
+			buf.WriteString("\n")
+		}
+	}
+}
+
+func (s *Server) showAddressBook(cfg *config.Config, buf *strings.Builder) {
+	if cfg == nil || cfg.Security.AddressBook == nil {
+		buf.WriteString("No address book configured\n")
+	} else {
+		ab := cfg.Security.AddressBook
+		if len(ab.Addresses) > 0 {
+			buf.WriteString("Addresses:\n")
+			for name, addr := range ab.Addresses {
+				fmt.Fprintf(buf, "  %-20s %s\n", name, addr.Value)
+			}
+		}
+		if len(ab.AddressSets) > 0 {
+			buf.WriteString("Address sets:\n")
+			for name, as := range ab.AddressSets {
+				fmt.Fprintf(buf, "  %-20s members: %s\n", name, strings.Join(as.Addresses, ", "))
+			}
+		}
+	}
+}
+
+func (s *Server) showIKE(cfg *config.Config, buf *strings.Builder) {
+	if cfg == nil || len(cfg.Security.IPsec.Gateways) == 0 {
+		buf.WriteString("No IKE gateways configured\n")
+	} else {
+		names := make([]string, 0, len(cfg.Security.IPsec.Gateways))
+		for name := range cfg.Security.IPsec.Gateways {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			gw := cfg.Security.IPsec.Gateways[name]
+			fmt.Fprintf(buf, "IKE gateway: %s\n", name)
+			if gw.Address != "" {
+				fmt.Fprintf(buf, "  Remote address:     %s\n", gw.Address)
+			}
+			if gw.DynamicHostname != "" {
+				fmt.Fprintf(buf, "  Dynamic hostname:   %s\n", gw.DynamicHostname)
+			}
+			if gw.LocalAddress != "" {
+				fmt.Fprintf(buf, "  Local address:      %s\n", gw.LocalAddress)
+			}
+			if gw.ExternalIface != "" {
+				fmt.Fprintf(buf, "  External interface: %s\n", gw.ExternalIface)
+			}
+			if gw.LocalCertificate != "" {
+				fmt.Fprintf(buf, "  Local certificate:  %s\n", gw.LocalCertificate)
+			}
+			if gw.IKEPolicy != "" {
+				fmt.Fprintf(buf, "  IKE policy:         %s\n", gw.IKEPolicy)
+				if pol, ok := cfg.Security.IPsec.IKEPolicies[gw.IKEPolicy]; ok {
+					fmt.Fprintf(buf, "    Mode:     %s\n", pol.Mode)
+					fmt.Fprintf(buf, "    Proposal: %s\n", pol.Proposals)
+				}
+			}
+			ver := gw.Version
+			if ver == "" {
+				ver = "v1+v2"
+			}
+			fmt.Fprintf(buf, "  IKE version:        %s\n", ver)
+			if gw.DeadPeerDetect != "" {
+				fmt.Fprintf(buf, "  DPD:                %s\n", gw.DeadPeerDetect)
+				if gw.DPDInterval > 0 {
+					fmt.Fprintf(buf, "  DPD interval:       %ds\n", gw.DPDInterval)
+				}
+				if gw.DPDThreshold > 0 {
+					fmt.Fprintf(buf, "  DPD threshold:      %d\n", gw.DPDThreshold)
+				}
+			}
+			if gw.NoNATTraversal {
+				buf.WriteString("  NAT-T:              disabled\n")
+			} else if gw.NATTraversal == "force" {
+				buf.WriteString("  NAT-T:              force\n")
+			} else if gw.NATTraversal == "enable" {
+				buf.WriteString("  NAT-T:              enabled\n")
+			}
+			if gw.LocalIDValue != "" {
+				fmt.Fprintf(buf, "  Local identity:     %s %s\n", gw.LocalIDType, gw.LocalIDValue)
+			}
+			if gw.RemoteIDValue != "" {
+				fmt.Fprintf(buf, "  Remote identity:    %s %s\n", gw.RemoteIDType, gw.RemoteIDValue)
+			}
+			buf.WriteString("\n")
+		}
+		// IKE proposals
+		if len(cfg.Security.IPsec.IKEProposals) > 0 {
+			pNames := make([]string, 0, len(cfg.Security.IPsec.IKEProposals))
+			for name := range cfg.Security.IPsec.IKEProposals {
+				pNames = append(pNames, name)
+			}
+			sort.Strings(pNames)
+			buf.WriteString("IKE proposals:\n")
+			for _, name := range pNames {
+				p := cfg.Security.IPsec.IKEProposals[name]
+				fmt.Fprintf(buf, "  %s: auth=%s enc=%s dh=group%d", name, p.AuthMethod, p.EncryptionAlg, p.DHGroup)
+				if p.LifetimeSeconds > 0 {
+					fmt.Fprintf(buf, " lifetime=%ds", p.LifetimeSeconds)
+				}
+				buf.WriteString("\n")
+			}
+		}
 	}
 }
