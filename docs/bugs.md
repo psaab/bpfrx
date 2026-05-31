@@ -514,11 +514,14 @@ VF appears as enp10s0f0 inside VM (NOT enp10s0 as initially expected).
 - **Fix:** Add startup reconciliation sweep that scans kernel routes for RTN_BLACKHOLE matching RETH subnets and removes them
 - **Files:** `pkg/daemon/daemon.go:148` (blackholeRoutes map)
 
-### IPv6 VRRP advertisements not implemented (LOW — feature gap)
-- **Symptom:** `sendAdvert` (`instance.go:617-628`) stubs out IPv6 path with `_ = pkt`. VIP management (addVIPs/removeVIPs) and Neighbor Discovery work for IPv6, but no VRRPv3 adverts are sent over IPv6. Peer nodes relying on IPv6 VRRP adverts will never see them → timeout → split-brain
-- **Impact:** IPv6-only VRRP deployments non-functional. Dual-stack works because IPv4 adverts maintain state. IPv6 VIPs still managed correctly via IPv4 VRRP state machine
-- **Fix:** Implement IPv6 raw socket (ip6:112), IPv6 VRRP packet sending (src: link-local, dst: ff02::12, hop limit 255), IPv6 checksum with pseudo-header. Update AF_PACKET filter for ethertype 0x86DD
-- **Files:** `pkg/vrrp/instance.go:617-628`
+### IPv6 VRRP advertisements (RESOLVED — implemented)
+- **Status:** Implemented for both send and receive. `sendAdvert`
+  (`pkg/vrrp/instance.go`) sends VRRPv3 IPv6 adverts when IPv6 VIPs are
+  present via `sendPacketIPv6` (src: link-local, dst: `ff02::12`, hop
+  limit 255, pseudo-header checksum). `receiverIPv6` (ip6:112) and
+  `parseAfPacketIPv6` handle receive; the AF_PACKET BPF filter in
+  `pkg/vrrp/manager.go` matches ethertype `0x86DD` for both tagged and
+  untagged frames. No remaining IPv6 send/receive gap.
 
 ## Sprint ha-fixes-2 (2026-03-01) — Issues #84, #86, #87, #92, #93
 
