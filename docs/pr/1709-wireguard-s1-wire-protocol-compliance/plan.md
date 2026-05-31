@@ -375,23 +375,39 @@ pass alone. No runtime external dependency is introduced:
 - `keyed-BLAKE2s-128(MAC1key, b"abc")`
   = `78df3b0a90577688ce9d272d04a8fb90`
 
-Test suite (`wg/handshake.rs` + `wg/tai64n.rs` `#[cfg(test)]`):
+Test suite (`wg/handshake.rs` + `wg/tai64n.rs` `#[cfg(test)]`). **Per SMR-1,
+every KAT below is DUAL-SOURCE: assert against BOTH the baked hex literal AND
+an in-test re-derivation from raw `blake2` calls — a transcription typo fails
+the re-derivation, an implementation bug fails the baked vector.** (I verified
+all four §5.4a vectors reproduce from `blake2 0.10` first-principles — see
+SMR-R1.)
   - `construction_hashes_match_spec` — assert xpf's computed InitialChainKey /
-    InitialHash equal the hex above (this independently re-derives what snow's
+    InitialHash equal the hex above (independently re-derives what snow's
     prologue already mixes, proving the framing layer agrees with the engine).
   - `mac1_keyed_blake2s_128_kat` — assert the keyed-BLAKE2s-128 vector above
-    (proves keyed-BLAKE2s, NOT HMAC, and the 16-byte output width — the
-    research §7 SMR r1 #3 hazard).
+    (proves keyed-BLAKE2s via `Blake2sMac<U16>`, NOT HMAC, and the 16-byte
+    output width — the research §7 SMR r1 #3 hazard).
   - `mac1_keys_on_recipient_static_pub` — build msg1 toward responder R; assert
     mac1 verifies under `HASH("mac1----"||R_pub)` and FAILS under a different
     pubkey (catches the swapped-key bug).
+  - **`msg1_full_kat_fixed_ephemeral` (SMR-2, REQUIRED)** — with a pinned
+    local-static + ephemeral (snow `fixed_ephemeral`) + a fixed TAI64N, assert
+    the entire deterministic 148-byte msg1 and its 16-byte mac1 over
+    `msg[0..116]`. This is the one test that catches an offset/endianness bug
+    in the framing *assembly* that per-field KATs miss. (If a fixed-ephemeral
+    builder is not cleanly reachable, fall back to asserting mac1 over a
+    captured msg-prefix — still catches the offset bug.)
   - `msg1_layout_byte_offsets` / `msg2_layout_byte_offsets` — assert the
     148/92-byte total, type byte = 1/2, reserved zeros, LE indices at the right
     offsets, snow body at offset 8/12, mac1/mac2 at the tail.
+  - **`parse_initiation_accepts_nonzero_mac2` (SMR-5, REQUIRED)** — parse must
+    accept a msg with mac2 != 0 (a peer that holds our cookie sets it); mac2 is
+    skip-verified in S1, NOT treated as malformed. Cookie generation is S7.
   - `tai64n_encoding_kat` — assert the 12-byte layout (BE u64 `2^62+secs` ||
-    BE u32 nanos) for a fixed `(secs, nanos)`, and `tai64n_strictly_monotonic`
+    BE u32 nanos) for a fixed `(secs, nanos)`; `tai64n_strictly_monotonic`
     (N calls strictly increase by byte-compare even with a frozen/backwards
-    clock).
+    clock); **`tai64n_concurrent_monotonic` (SMR-4)** (N threads calling
+    `now()` yield N strictly-ordered distinct values).
   - `framing_roundtrip` — `build_initiation` then `parse_initiation` recovers
     the sender_index + noise body; `parse` rejects TooShort / BadType /
     Mac1Mismatch.
@@ -630,3 +646,114 @@ pass unchanged.
    PR. PLAN-review MUST return an explicit (a)/(b) verdict. Reference peer =
    kernel WireGuard on a real VM regardless. PLAN-KILL if neither boundary
    gives a coherent S1.
+
+---
+
+## SMR-R1 — Claude domain-SMR hostile plan review (round 1)
+
+Reviewer: Claude (in-conversation), acting as crypto/protocol + CPU-arch +
+SW-design SMR per the triple-review-includes-Claude-SMR rule. Stance: hostile;
+PLAN-KILL is on the table for wire/crypto work. Findings are grounded in
+independent verification I ran before writing this (not just reading the plan).
+
+### Independent verification performed (evidence, not assertion)
+
+1. **snow IK msg1 byte-layout is byte-exact for WG msg1 inner — VERIFIED.**
+   Read `snow-0.10.0/src/handshakestate.rs:223-322` (`_write_message`)
+   end-to-end. The token loop writes `E` → 32-byte ephemeral (`message[..32]`,
+   `mix_hash(pubkey)`), then `S` → `encrypt_and_mix_hash(self.s.pubkey(), ..)`
+   = 48 bytes. **Then, unconditionally after the loop**
+   (`handshakestate.rs:315-317`):
+   `encrypt_and_mix_hash(payload, &mut message[byte_index..])`. So msg1 body =
+   `e[32] || enc_s[48] || enc_payload[len+16]`. Passing the 12-byte TAI64N as
+   `payload` yields `e[32]||enc_s[48]||enc_ts[28]` = 108 bytes — **identical to
+   WG msg1 inner**, and the timestamp IS mix-hashed into the transcript exactly
+   as kernel WG does (`ConsumeMessageInitiation` mix-hashes `msg.Timestamp`).
+   Q1 is **RESOLVED**: there is no snow-side length prefix or extra MixHash;
+   the payload is the last AEAD chunk. (Caveat held for S2: this is a
+   structural proof; the live kernel-wg test still must verify the AEAD tag.)
+
+2. **KAT vectors reproduce from Rust `blake2` first-principles — VERIFIED.**
+   I wrote a throwaway Rust bin using `blake2 0.10` (the locked version) and
+   recomputed all four §5.4a vectors. All four match the plan's hex AND the Go
+   oracle byte-for-byte: ICK `60e26d..cd36`, IH `2211b3..9ef3`, MAC1 key
+   `172c34..0a4e`, MAC1("abc") `78df3b0a90577688ce9d272d04a8fb90`. Critically,
+   the MAC is `Blake2sMac<U16>` via `KeyInit::new_from_slice(key)` —
+   **keyed-BLAKE2s-128, NOT HMAC** — and it produces the correct value, so the
+   `blake2` crate is the right primitive and the implementation is feasible
+   with a locked dep. Q2 is **RESOLVED** (keyed-BLAKE2s-128, key =
+   BLAKE2s-256("mac1----"||recipient_pub)); the plan's reading is correct.
+
+### Findings
+
+- **SMR-1 (MINOR, accept): make the KAT tests dual-source (Q6).** Per my own
+  verification path, the strongest test is BOTH a baked hex literal AND an
+  in-test re-derivation from raw `blake2` — a transcription typo fails the
+  re-derivation, an implementation bug fails the baked vector. The plan §5.4a
+  now says this; keep it as a hard requirement, not a "should".
+
+- **SMR-2 (MINOR, accept): add a full-msg1 KAT against a pinned ephemeral.**
+  The construction-hash + MAC1 KATs are necessary but not sufficient — they do
+  not exercise the *assembly* of the 148-byte msg1. snow's `Builder` supports
+  a fixed ephemeral (`fixed_ephemeral` path seen in `_write_message:236`); with
+  pinned local-static + ephemeral + a fixed TAI64N, the entire 148-byte msg1
+  (and the 16-byte mac1 over `msg[0..116]`) is deterministic and can be a KAT.
+  This is the single test that would catch an offset/endianness bug in the
+  framing assembly that the per-field KATs miss. Add it to §5.4a. (If snow does
+  not cleanly expose a fixed-ephemeral builder at the engine layer, fall back to
+  asserting the mac1 over a captured msg-prefix — still catches the offset bug.)
+
+- **SMR-3 (S1/S2 boundary, Q7 — CONCUR with (b), with a condition).** I agree
+  the live kernel-wg-on-VM interop belongs in S2: it now needs a VM peer +
+  cross-VM UDP reachability + (likely) `apt install wireguard-tools` on the
+  peer, which is real harness surface that does not belong bolted onto a
+  security-critical framing PR. BUT the condition: S1 must NOT claim "interop"
+  in any operator-facing doc or the CLAUDE.md feature list — S1 ships
+  "wire-protocol framing + TAI64N, spec-vector-validated; independent-peer
+  interop proven in S2." The research plan §10 already gates the feature-list
+  line on S3; keep S1's claim honest. With that, (b) is the right call.
+
+- **SMR-4 (MED, must-address-in-impl): TAI64N monotonicity is necessary but
+  the plan understates the within-process race.** The clock is a
+  `Mutex<[u8;12]>` returning strictly-increasing values — fine. But the WG
+  self-DoS hazard is per *remote peer*, and kernel WG compares the new
+  timestamp against the **last accepted** one *for that peer*. A single global
+  monotonic clock is sufficient (any strictly-increasing source works — WG does
+  not require wall-clock accuracy, only monotonicity), so the global clock is
+  correct. The real S1 risk is narrower: if two initiations to the *same* peer
+  are built concurrently, both must get distinct, ordered TAI64Ns — which the
+  mutex guarantees. No KILL; flag for the impl to add a test that N concurrent
+  `now()` calls yield N strictly-ordered values. Deferring disk-persistence to
+  S6 is acceptable **because S1 has no daemon** — a process with no persisted
+  state cannot regress a clock it never reloads. Concur with the deferral.
+
+- **SMR-5 (MINOR): mac2 skip-on-parse must be explicit and tested.** S1 emits
+  mac2 = zeros and does not verify inbound mac2. A compliant quiet-tunnel peer
+  sends mac2 = zeros, so this interops; but the parse path must *accept*
+  non-zero mac2 (a peer that has issued us a cookie would set it) without
+  treating it as malformed — i.e. parse must not reject on mac2 != 0. Add a
+  `parse_initiation_accepts_nonzero_mac2` test. (Cookie *generation* is S7.)
+
+- **SMR-6 (design, LOW): the four engine entry points should not leak
+  `HandshakeState` across the engine boundary if avoidable.** §5.3 sketches
+  `consume_response(hs: HandshakeState, ..)`. Passing the in-progress snow
+  state out and back in is the pattern the existing tests use, but it widens
+  the engine's public surface with a snow type. Prefer the engine holding the
+  pending `HandshakeState` in a small slow-path map keyed by sender_index (the
+  initiator chose it; the responder echoes it), so the API trades only
+  `[u8;32]`/byte-slices. Not a KILL — but resolve the boundary shape in Step 5
+  and prefer the narrower one. (This also pre-stages the S3 integration where
+  the coordinator thread owns pending handshakes.)
+
+### Verdict
+
+**PLAN-NEEDS-MINOR.** The architecture is sound and the two highest-risk wire
+claims (snow byte-exactness; keyed-BLAKE2s-128 MAC1 + the KAT vectors) are
+**independently verified by me**, not merely asserted. The design correctly
+isolates framing into new modules (engine.rs stays WATCH-tier), preserves the
+slow-path-only-crypto boundary, and the snow payload==timestamp mapping is
+exact. Minor items SMR-1/-2/-5 tighten the test gate; SMR-4/-6 are impl-time
+notes; SMR-3 ratifies S1/S2 boundary Option (b) with an honesty condition on
+the interop claim. **No KILL.** Proceed to implement once Codex + AGY converge
+(both must also ratify (a)-vs-(b)); fold SMR-1/-2/-5 into §5.4a as hard test
+requirements before coding.
