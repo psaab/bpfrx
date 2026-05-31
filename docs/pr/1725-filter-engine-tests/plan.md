@@ -1,6 +1,23 @@
 # #1725 — Test coverage for filter/engine evaluation path
 
-**Status:** DRAFT v1 — pending adversarial plan review
+**Status:** PLAN-READY v2 — Codex PLAN-NEEDS-MINOR (corrections folded),
+AGY PLAN-READY (0 false positives, all 9 gaps genuinely uncovered),
+Claude-SMR PLAN-NEEDS-MINOR (same two corrections + fold accessors into
+one test). Consensus: proceed.
+
+## v2 corrections from review
+
+- **`FilterAction::Reject` is NOT untested repo-wide** — it is asserted
+  in `afxdp/tx/cos_classify_tests.rs` and `afxdp/event_emit.rs`. The
+  genuine gap is narrower: no test drives a `reject` term through the
+  **plain `evaluate_filter` engine path** to assert the returned
+  `FilterResult.action == Reject`. Gap #1 reworded to that.
+- **IPv6 input-interface eval was overclaimed** — `interface_filter_assignment`
+  defines `filter_input_v6` (tests.rs:1290) but the input eval call uses
+  `is_v6=false` (tests.rs:1346). So the v6 `evaluate_interface_filter`
+  input path is also uncovered; folded into gap #4.
+- **Gap #8 (thin accessors)** — grouped into ONE compact table-driven
+  test (`thin_accessor_predicates`), not four boilerplate tests.
 
 ## Issue framing
 
@@ -53,10 +70,11 @@ full read of tests.rs + all three engine files.
 
 ### Genuine gaps (this PR fills these)
 
-1. **`FilterAction::Reject` verdict** — never tested anywhere. The reject
-   action (`compiler.rs:373`) is a distinct verdict with documented
-   fail-closed semantics; no test proves a `reject` term yields
-   `FilterAction::Reject`.
+1. **`FilterAction::Reject` via the plain `evaluate_filter` path** — the
+   reject action (`compiler.rs:373`) is asserted elsewhere
+   (`cos_classify_tests.rs`, `event_emit.rs`) but no test drives a
+   `reject` term through `evaluate_filter` and asserts the returned
+   `FilterResult.action == FilterAction::Reject`.
 2. **Missing-filter-key / empty-filter → default Accept** —
    `evaluate_filter` against an absent `filter_key`, and against a filter
    with zero terms, both must return `FilterResult::default()`
@@ -65,10 +83,12 @@ full read of tests.rs + all three engine files.
    `evaluate_filter_ref_tx_selection_*` / `evaluate_filter_ref_tx_selection_cached`
    with a V4 src + V6 dst (the `_ => default` arm) returns default.
    Never tested.
-4. **IPv6 baseline `evaluate_filter` + `evaluate_lo0_filter`** — the v6
-   `evaluate_filter` and v6 lo0 evaluation paths
-   (`evaluate_filter_ref_counted_v6`, `evaluate_lo0_filter` is_v6=true)
-   are not exercised by a plain (non-tx-selection) evaluate test.
+4. **IPv6 baseline evaluate paths** — the v6 `evaluate_filter`
+   (`evaluate_filter_ref_counted_v6`), v6 `evaluate_lo0_filter`
+   (is_v6=true), and the v6 `evaluate_interface_filter` input path are
+   not exercised by a plain (non-tx-selection) evaluate test.
+   `interface_filter_assignment` defines `filter_input_v6` but only calls
+   the input evaluator with `is_v6=false` (tests.rs:1346).
 5. **`evaluate_filter_counted` hit-counter increment (baseline path)** —
    counter increment is tested for the tx-selection/output paths, but the
    plain `evaluate_filter_counted` → `evaluate_filter_ref_counted` counter
