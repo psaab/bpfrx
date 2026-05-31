@@ -58,9 +58,10 @@ func TestMatchPoliciesHandlerValidation(t *testing.T) {
 	s := &Server{store: matchPoliciesAPIStore(t)}
 
 	tests := []struct {
-		name     string
-		query    url.Values
-		wantCode int
+		name      string
+		query     url.Values
+		wantCode  int
+		wantMatch bool // for 200 cases: must data.matched be true?
 	}{
 		{
 			name:     "invalid src_ip",
@@ -78,14 +79,16 @@ func TestMatchPoliciesHandlerValidation(t *testing.T) {
 			wantCode: 400,
 		},
 		{
-			name:     "empty ips match any",
-			query:    url.Values{"from_zone": {"trust"}, "to_zone": {"untrust"}},
-			wantCode: 200,
+			name:      "empty ips match any",
+			query:     url.Values{"from_zone": {"trust"}, "to_zone": {"untrust"}},
+			wantCode:  200,
+			wantMatch: true,
 		},
 		{
-			name:     "valid in-term ip",
-			query:    url.Values{"from_zone": {"trust"}, "to_zone": {"untrust"}, "src_ip": {"10.0.1.5"}, "dst_ip": {"10.0.1.6"}},
-			wantCode: 200,
+			name:      "valid in-term ip",
+			query:     url.Values{"from_zone": {"trust"}, "to_zone": {"untrust"}, "src_ip": {"10.0.1.5"}, "dst_ip": {"10.0.1.6"}},
+			wantCode:  200,
+			wantMatch: true,
 		},
 	}
 
@@ -102,6 +105,10 @@ func TestMatchPoliciesHandlerValidation(t *testing.T) {
 			var resp struct {
 				Success bool   `json:"success"`
 				Error   string `json:"error"`
+				Data    struct {
+					Matched    bool   `json:"matched"`
+					PolicyName string `json:"policy_name"`
+				} `json:"data"`
 			}
 			if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 				t.Fatalf("unmarshal response: %v; body: %s", err, rr.Body.String())
@@ -113,8 +120,17 @@ func TestMatchPoliciesHandlerValidation(t *testing.T) {
 				if resp.Error == "" {
 					t.Fatalf("error message empty on 400; body: %s", rr.Body.String())
 				}
-			} else if !resp.Success {
+				return
+			}
+			if !resp.Success {
 				t.Fatalf("success = false on 200; body: %s", rr.Body.String())
+			}
+			// Assert the actual verdict, not just the envelope — a silent
+			// default-deny would otherwise pass the 200 cases.
+			gotMatch := resp.Data.Matched && resp.Data.PolicyName == "restricted-allow"
+			if gotMatch != tt.wantMatch {
+				t.Fatalf("matched=%v policy=%q, want match=%v; body: %s",
+					resp.Data.Matched, resp.Data.PolicyName, tt.wantMatch, rr.Body.String())
 			}
 		})
 	}

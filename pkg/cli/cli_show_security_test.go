@@ -201,9 +201,10 @@ func TestShowMatchPoliciesValidation(t *testing.T) {
 	c := &CLI{}
 
 	tests := []struct {
-		name    string
-		args    []string
-		wantErr bool
+		name      string
+		args      []string
+		wantErr   bool
+		wantMatch bool // for the no-error cases: must the simulator report a match?
 	}{
 		{
 			name:    "invalid source-ip",
@@ -221,14 +222,16 @@ func TestShowMatchPoliciesValidation(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:    "empty ips match any",
-			args:    []string{"from-zone", "trust", "to-zone", "untrust"},
-			wantErr: false,
+			name:      "empty ips match any",
+			args:      []string{"from-zone", "trust", "to-zone", "untrust"},
+			wantErr:   false,
+			wantMatch: true,
 		},
 		{
-			name:    "valid in-term ip",
-			args:    []string{"from-zone", "trust", "to-zone", "untrust", "source-ip", "10.0.1.5", "destination-ip", "10.0.1.6"},
-			wantErr: false,
+			name:      "valid in-term ip",
+			args:      []string{"from-zone", "trust", "to-zone", "untrust", "source-ip", "10.0.1.5", "destination-ip", "10.0.1.6"},
+			wantErr:   false,
+			wantMatch: true,
 		},
 	}
 
@@ -249,6 +252,105 @@ func TestShowMatchPoliciesValidation(t *testing.T) {
 			}
 			if err != nil {
 				t.Fatalf("showMatchPolicies(%v) error = %v, want nil", tt.args, err)
+			}
+			// Assert the actual simulator verdict, not just "no error" — a
+			// silent default-deny would otherwise pass the no-error cases.
+			gotMatch := strings.Contains(out, "Matching policy") && strings.Contains(out, "restricted-allow")
+			if gotMatch != tt.wantMatch {
+				t.Fatalf("showMatchPolicies(%v) match=%v, want %v; out = %q", tt.args, gotMatch, tt.wantMatch, out)
+			}
+		})
+	}
+}
+
+// TestTestPolicyValidation covers the operational `test policy` CLI
+// simulator (pkg/cli/cli_request.go testPolicy), a separate in-process
+// copy of the matcher. Malformed IPs must error rather than
+// wildcard-match; empty/valid inputs report a match (#1711).
+func TestTestPolicyValidation(t *testing.T) {
+	store := configstore.New(filepath.Join(t.TempDir(), "xpf.conf"))
+	if err := store.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure() error = %v", err)
+	}
+	if err := store.LoadOverride(`
+security {
+    address-book {
+        global {
+            address trust-net 10.0.1.0/24;
+        }
+    }
+    zones {
+        security-zone trust;
+        security-zone untrust;
+    }
+    policies {
+        from-zone trust to-zone untrust {
+            policy restricted-allow {
+                match { source-address trust-net; destination-address trust-net; application any; }
+                then { permit; }
+            }
+        }
+    }
+}
+`); err != nil {
+		t.Fatalf("LoadOverride() error = %v", err)
+	}
+	if _, err := store.Commit(); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	c := &CLI{store: store}
+
+	tests := []struct {
+		name      string
+		args      []string
+		wantErr   bool
+		wantMatch bool
+	}{
+		{
+			name:    "invalid source-ip",
+			args:    []string{"from-zone", "trust", "to-zone", "untrust", "source-ip", "10.0.0.999"},
+			wantErr: true,
+		},
+		{
+			name:    "invalid destination-ip",
+			args:    []string{"from-zone", "trust", "to-zone", "untrust", "destination-ip", "garbage"},
+			wantErr: true,
+		},
+		{
+			name:      "empty ips match any",
+			args:      []string{"from-zone", "trust", "to-zone", "untrust"},
+			wantErr:   false,
+			wantMatch: true,
+		},
+		{
+			name:      "valid in-term ip",
+			args:      []string{"from-zone", "trust", "to-zone", "untrust", "source-ip", "10.0.1.5"},
+			wantErr:   false,
+			wantMatch: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var err error
+			out := captureStdout(t, func() {
+				err = c.testPolicy(tt.args)
+			})
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("testPolicy(%v) returned no error; out = %q (false-positive #1711)", tt.args, out)
+				}
+				if strings.Contains(out, "Policy match") {
+					t.Fatalf("testPolicy(%v) printed a match for malformed input: %q", tt.args, out)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("testPolicy(%v) error = %v, want nil", tt.args, err)
+			}
+			gotMatch := strings.Contains(out, "Policy match") && strings.Contains(out, "restricted-allow")
+			if gotMatch != tt.wantMatch {
+				t.Fatalf("testPolicy(%v) match=%v, want %v; out = %q", tt.args, gotMatch, tt.wantMatch, out)
 			}
 		})
 	}
