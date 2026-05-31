@@ -108,24 +108,28 @@ The package already separates schema *behaviour* from the grammar
 The grammar *definition* itself (`schemaNode`, `setSchema`, `init`) and the
 *completion* surface (`CompleteSetPath*`, `ResolveConsumedSetPathTokens`)
 are the only schema members still living in `ast.go`. This plan finishes the
-family by giving them `schema.go`.
+family by splitting them across `schema.go` (grammar SSOT) and
+`schema_complete.go` (completion/resolution helpers).
 
 ## 4. Concrete design
 
-Create `pkg/config/schema.go` (`package config`, imports `fmt`, `strings`).
-Move verbatim, in source order, from `ast.go`:
+Create two files:
 
-1. `ValueHint` type + its `const (...)` block (lines 354–371).
-2. `SchemaCompletion` struct (373–377).
-3. `ValueProvider` type (379–381).
-4. `schemaNode` struct + all doc comments (383–418).
-5. `isTypedLeaf` method (420–425).
-6. `setSchema` var literal (427–1700).
-7. `init()` groups-wildcard wiring (1702–1713).
-8. `CompleteSetPath` (1728–1742).
-9. `appendTypedValueCompletions` (1744–1768).
-10. `CompleteSetPathWithValues` (1770–1939).
-11. `ResolveConsumedSetPathTokens` (1941–2021).
+1. `pkg/config/schema.go` (`package config`, imports `strings`) with the
+   grammar SSOT moved verbatim from `ast.go`:
+   - `schemaNode` struct + all doc comments
+   - `isTypedLeaf` method
+   - `setSchema` var literal
+   - `init()` groups-wildcard wiring
+2. `pkg/config/schema_complete.go` (`package config`, imports `fmt`) with the
+   completion/resolution helpers moved verbatim from `ast.go`:
+   - `ValueHint` type + its `const (...)` block
+   - `SchemaCompletion` struct
+   - `ValueProvider` type
+   - `CompleteSetPath`
+   - `appendTypedValueCompletions`
+   - `CompleteSetPathWithValues`
+   - `ResolveConsumedSetPathTokens`
 
 `ast.go` retains, unchanged:
 - `Node` / `ConfigTree` types + accessors (1–140).
