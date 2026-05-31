@@ -280,11 +280,16 @@ func disableMaskResolved() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Already masked? Then we are at the desired end-state — do nothing.
-	// `systemctl is-enabled` prints `masked` (exit non-zero) for a masked
-	// unit; key off the stdout token, not the exit code.
+	// `systemctl is-enabled` prints a status token (and exits non-zero for
+	// masked/not-found); key off the stdout token, not the exit code.
+	//   - `masked`: already at the desired end-state — do nothing.
+	//   - `not-found`: systemd-resolved is not installed, so it cannot run
+	//     as a second resolver owner; nothing to disable/mask. Treating it
+	//     as success avoids a spurious "second owner" warning on every
+	//     reconcile on minimal installs that lack the resolved package.
 	out, _ := exec.CommandContext(ctx, "systemctl", "is-enabled", "systemd-resolved.service").CombinedOutput()
-	if strings.TrimSpace(string(out)) == "masked" {
+	switch strings.TrimSpace(string(out)) {
+	case "masked", "not-found":
 		return nil
 	}
 
