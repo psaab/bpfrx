@@ -51,8 +51,13 @@ PLAN-KILL / revise is the right call — accuracy is the whole point.
 ## Edits (minimal)
 
 - `docs/feature-gaps.md:377` — reword description + status.
-- `docs/userspace-performance-plan.md:81` — reword H4 row.
-- `docs/bugs.md:517-521` — remove the stale entry.
+- `docs/userspace-performance-plan.md:81` — reword H4 row, and flip the
+  fuller "Phase 6: SYN Cookie Implementation" section
+  (`Status: Not Started` → Done) so both references agree.
+- `docs/bugs.md:517-521` — replace the stale "not implemented" entry
+  with a RESOLVED note recording where the implementation lives (rather
+  than deleting the heading outright, so the resolution stays
+  discoverable).
 
 ## Out of scope
 
