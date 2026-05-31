@@ -82,6 +82,19 @@ func (n *nextTableManager) Apply(routes []*config.StaticRoute, instances []*conf
 			family = unix.AF_INET6
 		}
 
+		// Hard-cap the priority inside the window that clear() scans
+		// (nextTableRulePriority .. nextTableRulePriority+100). A rule
+		// programmed at or beyond the upper bound would never be removed
+		// on a later apply and would leak permanently. Stop programming
+		// further next-table routes once the window is exhausted, matching
+		// the pbrManager cap pattern below. ValidateConfig emits a
+		// commit-time warning before this point is ever reached.
+		if prio >= nextTableRulePriority+100 {
+			slog.Warn("next-table rule limit reached; ignoring further next-table routes",
+				"limit", 100, "destination", sr.Destination, "instance", sr.NextTable)
+			break
+		}
+
 		rule := netlink.NewRule()
 		rule.Dst = dst
 		rule.Table = tableID
