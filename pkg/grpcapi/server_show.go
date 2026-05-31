@@ -7,66 +7,10 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/psaab/xpf/pkg/config"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
-	"github.com/psaab/xpf/pkg/rpm"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
-
-func writeRPMConfig(buf *strings.Builder, cfg *config.Config) {
-	if cfg == nil {
-		buf.WriteString("No active configuration\n")
-		return
-	}
-	if cfg.Services.RPM == nil || len(cfg.Services.RPM.Probes) == 0 {
-		buf.WriteString("No RPM probes configured\n")
-		return
-	}
-
-	buf.WriteString("RPM Probe Configuration:\n")
-	for _, probeName := range rpm.SortedProbeNames(cfg.Services.RPM.Probes) {
-		probe := cfg.Services.RPM.Probes[probeName]
-		for _, testName := range rpm.SortedTestNames(probe.Tests) {
-			rpm.WriteConfiguredTest(buf, probeName, testName, probe.Tests[testName])
-			buf.WriteString("\n")
-		}
-	}
-}
-
-func firewallFilterTermExpansionCount(cfg *config.Config, term *config.FirewallFilterTerm) uint32 {
-	nSrc := len(term.SourceAddresses)
-	for _, ref := range term.SourcePrefixLists {
-		if !ref.Except {
-			if pl, ok := cfg.PolicyOptions.PrefixLists[ref.Name]; ok {
-				nSrc += len(pl.Prefixes)
-			}
-		}
-	}
-	if nSrc == 0 {
-		nSrc = 1
-	}
-	nDst := len(term.DestAddresses)
-	for _, ref := range term.DestPrefixLists {
-		if !ref.Except {
-			if pl, ok := cfg.PolicyOptions.PrefixLists[ref.Name]; ok {
-				nDst += len(pl.Prefixes)
-			}
-		}
-	}
-	if nDst == 0 {
-		nDst = 1
-	}
-	nDstPorts := len(term.DestinationPorts)
-	if nDstPorts == 0 {
-		nDstPorts = 1
-	}
-	nSrcPorts := len(term.SourcePorts)
-	if nSrcPorts == 0 {
-		nSrcPorts = 1
-	}
-	return uint32(nSrc * nDst * nDstPorts * nSrcPorts)
-}
 
 // --- Operational show RPCs ---
 

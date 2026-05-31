@@ -395,3 +395,39 @@ func (s *Server) showFirewallFilter(req *pb.ShowTextRequest, cfg *config.Config,
 	}
 	return &pb.ShowTextResponse{Output: buf.String()}, nil
 }
+
+// firewallFilterTermExpansionCount returns the rule-expansion count
+// for a filter term (moved from server_show.go in #1700).
+func firewallFilterTermExpansionCount(cfg *config.Config, term *config.FirewallFilterTerm) uint32 {
+	nSrc := len(term.SourceAddresses)
+	for _, ref := range term.SourcePrefixLists {
+		if !ref.Except {
+			if pl, ok := cfg.PolicyOptions.PrefixLists[ref.Name]; ok {
+				nSrc += len(pl.Prefixes)
+			}
+		}
+	}
+	if nSrc == 0 {
+		nSrc = 1
+	}
+	nDst := len(term.DestAddresses)
+	for _, ref := range term.DestPrefixLists {
+		if !ref.Except {
+			if pl, ok := cfg.PolicyOptions.PrefixLists[ref.Name]; ok {
+				nDst += len(pl.Prefixes)
+			}
+		}
+	}
+	if nDst == 0 {
+		nDst = 1
+	}
+	nDstPorts := len(term.DestinationPorts)
+	if nDstPorts == 0 {
+		nDstPorts = 1
+	}
+	nSrcPorts := len(term.SourcePorts)
+	if nSrcPorts == 0 {
+		nSrcPorts = 1
+	}
+	return uint32(nSrc * nDst * nDstPorts * nSrcPorts)
+}

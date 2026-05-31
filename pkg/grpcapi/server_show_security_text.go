@@ -32,6 +32,7 @@ import (
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/feeds"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
+	"github.com/psaab/xpf/pkg/rpm"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -829,6 +830,28 @@ func (s *Server) showIKE(cfg *config.Config, buf *strings.Builder) {
 				}
 				buf.WriteString("\n")
 			}
+		}
+	}
+}
+
+// writeRPMConfig renders the configured RPM probe set (moved from
+// server_show.go in #1700; consumed by showRPM and the rpm test).
+func writeRPMConfig(buf *strings.Builder, cfg *config.Config) {
+	if cfg == nil {
+		buf.WriteString("No active configuration\n")
+		return
+	}
+	if cfg.Services.RPM == nil || len(cfg.Services.RPM.Probes) == 0 {
+		buf.WriteString("No RPM probes configured\n")
+		return
+	}
+
+	buf.WriteString("RPM Probe Configuration:\n")
+	for _, probeName := range rpm.SortedProbeNames(cfg.Services.RPM.Probes) {
+		probe := cfg.Services.RPM.Probes[probeName]
+		for _, testName := range rpm.SortedTestNames(probe.Tests) {
+			rpm.WriteConfiguredTest(buf, probeName, testName, probe.Tests[testName])
+			buf.WriteString("\n")
 		}
 	}
 }
