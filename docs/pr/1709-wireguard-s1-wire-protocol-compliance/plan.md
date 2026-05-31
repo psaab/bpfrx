@@ -1007,3 +1007,45 @@ CRITICAL findings across both rounds are resolved in plan v4. **Cleared to
 implement** per §5 with the strengthened §5.4a/§9 gate and the §5.3 reservation
 + §4.3 TAI64N invariants. A round-3 reviewer pass is not required — the only
 open round-2 items were text/impl-note fixes now in v4.
+
+---
+
+## Implementation deviations from the v4 plan sketch
+
+The sections above are the pre-implementation design. The shipped code
+(PR #1716) diverged in these ways as the code-review rounds hardened it; this
+note reconciles the plan with reality (Codex final-review docs nit):
+
+- **`FramingError::TooShort` → `WrongLength`.** The §5.2 sketch listed a
+  `TooShort` variant and the parsers sliced a fixed prefix. The shipped
+  parsers require the EXACT 148/92-byte length (rejecting too-long datagrams,
+  not just too-short — Copilot finding), so the variant is `WrongLength`. The
+  `BadType` check is also strict over the full 32-bit LE type word
+  (`is_canonical_type`, rejecting non-zero reserved bytes — Codex code-review).
+
+- **Reservation lives in `pending` only, never in `sessions_by_local_index`.**
+  The §5.3 sketch described reserving the index "in `sessions_by_local_index`
+  as a pending placeholder." The shipped two-phase reservation records the
+  pending handshake ONLY in a separate `pending` map (+ a `pending_by_peer`
+  cap); the index allocator treats both `pending` and the live demux map as
+  reserved. The live demux entry is inserted ONLY on completion. There is no
+  placeholder in `sessions_by_local_index`.
+
+- **`promote_pending` replaced by lock-held inline completion.** The sketch had
+  a `promote_pending` that installed-then-cleared. After the Codex round-2/3
+  concurrency findings, the entire handshake completion runs under
+  `reconcile_lock`: `consume_response` / `consume_initiation_create_response`
+  call the lock-free `install_session_locked` + `clear_reservation_locked`
+  directly (no separate `promote_pending`), and `reserve_pending_locked`
+  re-checks the peer under the lock to close a create/remove TOCTOU.
+
+- **`PendingHandshake.peer_index` dropped** (Claude-SMR): both completion paths
+  derive the session's peer index from the parsed message, so the field was
+  dead.
+
+- **`reconcile_peers` drains pending reservations** for removed peers (Copilot
+  finding), keeping pending state bounded to O(configured peers).
+
+These are correctness hardenings discovered in review, not scope changes; the
+S1 contract (TAI64N + framing, spec-KAT-validated, both roles, live kernel-WG
+interop deferred to S2) is unchanged.
