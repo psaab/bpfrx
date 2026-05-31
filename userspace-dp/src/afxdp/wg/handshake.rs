@@ -356,16 +356,23 @@ mod tests {
         assert_eq!(hex(&ih), ih_hex);
     }
 
-    /// MAC1 KAT: keyed-BLAKE2s-128, NOT HMAC. Dual-source — assert the
-    /// baked hex AND re-derive `compute_mac1`'s key independently. Also
-    /// assert HMAC over the same inputs is DIFFERENT, locking the
-    /// keyed-vs-HMAC distinction (Codex round-2 computed the HMAC value).
+    /// MAC1 KAT: keyed-BLAKE2s-128, NOT HMAC. Dual-source — assert the baked
+    /// hex AND re-derive `compute_mac1`'s key independently. The baked value
+    /// `78df3b0a...` is the keyed-BLAKE2s-128 output; an HMAC-BLAKE2s
+    /// implementation over the same key + message would instead produce
+    /// `778123b8eb3dffafb3cc980b88b84bbc` (independently computed by Codex in
+    /// the plan-review), so pinning the keyed value to this exact hex would
+    /// fail loudly if `compute_mac1` were ever switched to HMAC — locking the
+    /// keyed-vs-HMAC distinction without taking an `hmac` dependency.
     #[test]
     fn mac1_keyed_blake2s_128_kat() {
         let pk = [0x42u8; 32];
-        // compute_mac1 over message "abc".
+        // compute_mac1 over message "abc" — the keyed-BLAKE2s-128 value.
         let mac = compute_mac1(&pk, b"abc");
         assert_eq!(hex(&mac), "78df3b0a90577688ce9d272d04a8fb90");
+        // The HMAC-BLAKE2s value over the same inputs is documented-different;
+        // this is NOT it, confirming compute_mac1 is keyed-BLAKE2s.
+        assert_ne!(hex(&mac), "778123b8eb3dffafb3cc980b88b84bbc");
 
         // Independently re-derive the MAC1 key and confirm.
         let key = {

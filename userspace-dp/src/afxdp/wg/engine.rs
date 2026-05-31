@@ -436,6 +436,28 @@ impl WgEngine {
                 by_index.remove(li);
             }
         }
+        // Drain in-flight HANDSHAKE RESERVATIONS for removed peers too
+        // (Copilot code-review finding). A peer with a pending (not-yet-
+        // completed) handshake leaves an entry in `pending` keyed by our
+        // reserved index and a `pending_by_peer` marker keyed by its pubkey.
+        // Without draining these on peer removal, the reservation (and its
+        // consumed index) would leak until process restart, and a stale
+        // per-peer marker could mis-fire the at-most-one-pending-per-peer
+        // abort after config churn. `pending_by_peer` is keyed by pubkey, so
+        // we drain directly for each removed pubkey. Still under
+        // `reconcile_lock`, consistent with `reserve_pending`/`release_pending`.
+        {
+            let mut pending = self.pending.write().unwrap();
+            let mut by_peer = self.pending_by_peer.write().unwrap();
+            for pubkey in old.peer_index_by_pubkey.keys() {
+                if new_index.contains_key(pubkey) {
+                    continue;
+                }
+                if let Some(reserved_idx) = by_peer.remove(pubkey) {
+                    pending.remove(&reserved_idx);
+                }
+            }
+        }
         // Publish the new table. Atomic release-store; any reader
         // doing `.load()` after this point sees the new table whole.
         self.table.store(Arc::new(PeerTable {

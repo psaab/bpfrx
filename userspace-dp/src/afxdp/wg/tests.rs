@@ -1725,4 +1725,40 @@ mod framed_handshake {
             .expect("real msg2 must still complete after a forged one was rejected");
         assert_eq!(init.pending_count(), 0);
     }
+
+    /// reconcile_peers must drain a removed peer's in-flight handshake
+    /// reservation from both `pending` and `pending_by_peer` (Copilot
+    /// code-review finding). Otherwise the reservation + its consumed index
+    /// leak until process restart.
+    #[test]
+    fn reconcile_drains_removed_peer_pending_reservation() {
+        let (init, _resp, _init_pub, resp_pub) = engine_pair();
+        // Start an initiation (reserves a pending handshake for resp_pub) but
+        // do not complete it.
+        let mut msg1 = [0u8; WG_MSG_INIT_LEN];
+        init.create_initiation(&resp_pub, &mut msg1).unwrap();
+        assert_eq!(init.pending_count(), 1);
+
+        // Reconcile the peer away (empty config removes resp_pub).
+        init.reconcile_peers(&[]);
+
+        // The pending reservation must be drained.
+        assert_eq!(
+            init.pending_count(),
+            0,
+            "removing a peer must drain its in-flight handshake reservation"
+        );
+
+        // Re-add the peer; a fresh initiation must succeed (the per-peer
+        // marker was cleared, so the at-most-one-pending invariant is intact).
+        init.reconcile_peers(&[WgPeerConfig {
+            pubkey: resp_pub,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+        }]);
+        let mut msg1b = [0u8; WG_MSG_INIT_LEN];
+        init.create_initiation(&resp_pub, &mut msg1b).unwrap();
+        assert_eq!(init.pending_count(), 1);
+    }
 }
