@@ -208,6 +208,19 @@ func (rg *ribGroupManager) Apply(ribGroups map[string]*config.RibGroup, instance
 		if leakedTables[sourceTable] {
 			continue
 		}
+
+		// Each leaked table consumes TWO priorities (IPv4 then IPv6).
+		// clear() only scans [ribGroupRulePriority, ribGroupRulePriority+100),
+		// so a pair that would place the IPv6 rule (prio+1) at or beyond the
+		// upper bound must be rejected as a unit — otherwise it leaks
+		// permanently across applies. Stop before marking the table leaked
+		// so a capped table is not recorded as done. ValidateConfig emits a
+		// commit-time warning before this point is ever reached.
+		if prio+1 >= ribGroupRulePriority+100 {
+			slog.Warn("rib-group rule limit reached; ignoring further leaking tables",
+				"limit", 100, "instance", inst.Name, "table", sourceTable)
+			break
+		}
 		leakedTables[sourceTable] = true
 
 		// Add IPv4 rule
