@@ -39,18 +39,25 @@ import (
 // still get a normalized byte-assert rather than a weak non-empty
 // check.
 //
-// Coverage scoping: topics whose moved logic sits behind a live
-// netlink-backed routing.Manager (route-table/route-protocol/
-// route-prefix/test-routing/routing-options/route-instance/route-map/
-// bfd-peers) or a loaded dataplane (screen-statistics*) render their
-// "manager not available" / "dataplane not loaded" guard in this unit
-// fixture — that guard is the realistic unattached-manager path and is
-// itself part of the moved body. test-policy and test-zone DO exercise
-// the real comma/key=value parse + cfg lookup paths (fixture has zones
-// + policy p1); dynamic-address and firewall-filter exercise their
-// runtime feedsFn / hit-counter branches via the stubbed feedsFn and
-// FilterTermCounters. The full active-routing render paths are covered
-// by the routing package's own tests, not duplicated here.
+// Coverage scoping (precise per Codex review):
+//   - Gated behind a live netlink-backed routing.Manager (nil here →
+//     "Routing manager not available" guard, itself part of the moved
+//     body): route-table/route-protocol/route-prefix/test-routing.
+//   - Gated behind the FRR manager (nil here → "FRR not available"):
+//     route-map, bfd-peers.
+//   - Gated behind a loaded dataplane (not loaded here): screen-
+//     statistics*.
+//   - route-instance hits the missing-filter usage path (no filter set
+//     on the request) — also a moved guard branch.
+//   - routing-options renders real config from the fixture (static
+//     routes, AS number), not a guard.
+//   - test-policy and test-zone DO exercise the real comma/key=value
+//     parse + cfg lookup paths (fixture has zones + policy p1).
+//   - dynamic-address and firewall-filter exercise their runtime
+//     feedsFn / hit-counter branches via the stubbed feedsFn and
+//     FilterTermCounters.
+// The full active routing/FRR render paths are covered by the routing
+// and frr packages' own tests, not duplicated here.
 
 // goldenFixedFetch is a fixed timestamp used for the dynamic-address
 // feed "last fetch ... ago" rendering so its output is deterministic.
