@@ -1,6 +1,7 @@
 package api
 
 import (
+	"net"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -326,6 +327,20 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 		},
 	}
 
+	// collectInterfaceCounters only emits when net.InterfaceByName succeeds
+	// for the resolved kernel name. The config binds "lo" (resolves to the
+	// loopback), which exists on any normal host — but a restricted sandbox
+	// may deny the netlink lookup. Probe once and only assert the interface
+	// sentinel where loopback is actually resolvable, so the family is
+	// covered wherever the environment permits without a false failure on
+	// netlink-denied runners (same posture as the optional DHCP family).
+	_, loErr := net.InterfaceByName("lo")
+	ifaceResolvable := loErr == nil
+	if !ifaceResolvable {
+		t.Logf("net.InterfaceByName(\"lo\") unavailable in this environment "+
+			"(%v); skipping the interface descriptor family only", loErr)
+	}
+
 	reg := prometheus.NewPedanticRegistry()
 	reg.MustRegister(newCollector(srv))
 
@@ -347,20 +362,22 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 	// a single desc) also fails this canary.
 	names := gatheredNames(mfs)
 	want := []string{
-		"xpf_packets_total",           // collectGlobalCounters
-		"xpf_interface_packets_total", // collectInterfaceCounters (lo)
-		"xpf_zone_packets_total",      // collectZoneCounters
-		"xpf_policy_hits_total",       // collectPolicyCounters
-		"xpf_filter_hits_total",       // collectFilterCounters
-		"xpf_nat_pool_total_ports",    // collectNATPoolMetrics
-		"xpf_sessions_active",         // collectSessionGauges
-		"xpf_daemon_uptime_seconds",   // collectSystemMetrics
-		"xpf_userspace_worker_dead",   // emitWorkerRuntime
+		"xpf_packets_total",         // collectGlobalCounters
+		"xpf_zone_packets_total",    // collectZoneCounters
+		"xpf_policy_hits_total",     // collectPolicyCounters
+		"xpf_filter_hits_total",     // collectFilterCounters
+		"xpf_nat_pool_total_ports",  // collectNATPoolMetrics
+		"xpf_sessions_active",       // collectSessionGauges
+		"xpf_daemon_uptime_seconds", // collectSystemMetrics
+		"xpf_userspace_worker_dead", // emitWorkerRuntime
 		"xpf_userspace_worker_cold_path_samples_v3_total", // cold-path v3
 		"xpf_cos_drain_invocations_total",                 // CoS owner profile
 		"xpf_userspace_three_color_policer_drops_total",   // three-color policer
 		"xpf_userspace_source_nat_pool_live_flows",        // userspace SNAT pool
 		"xpf_userspace_neighbor_warm_drops_total",         // neighbor-warm
+	}
+	if ifaceResolvable {
+		want = append(want, "xpf_interface_packets_total") // collectInterfaceCounters (lo)
 	}
 	if dhcpWired {
 		want = append(want, "xpf_dhcp_leases_active") // collectDHCPMetrics
