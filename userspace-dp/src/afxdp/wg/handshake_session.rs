@@ -86,13 +86,12 @@ pub(in crate::afxdp::wg) struct PendingHandshake {
     /// Our locally-chosen index (the reservation key). The peer echoes
     /// it as the `receiver_index` of the message it sends back.
     local_index: u32,
-    /// The peer's index, learned from the message it sent us. For the
-    /// responder path this is msg1.sender_index (known at reserve time);
-    /// for the initiator path it is filled in from msg2.sender_index on
-    /// completion.
-    peer_index: u32,
     /// Initiator or responder — determines the session-confirmation gate
-    /// (see `WgSession`).
+    /// (see `WgSession`). The peer's index is NOT stored here: both
+    /// completion paths derive the session's `peer_index` directly from the
+    /// message they just parsed (msg2.sender_index for the initiator,
+    /// msg1.sender_index for the responder), so the pending record only
+    /// needs the reservation key + role + identity.
     role: SessionRole,
 }
 
@@ -103,11 +102,14 @@ impl WgEngine {
     // These compose snow + handshake.rs framing + the TAI64N clock into the
     // full on-wire WG handshake. They run on the CONTROL/coordinator thread
     // only — never the AF_XDP poll worker (the hot encap/decap paths never
-    // build a HandshakeState). Index allocation follows the two-phase
-    // reservation discipline: an index is reserved in `sessions_by_local_index`
-    // (as a placeholder via `pending`) BEFORE the message carrying it is
-    // emitted, so a concurrent handshake cannot steal it and blackhole the
-    // resulting session.
+    // build a HandshakeState). Index allocation follows a two-phase
+    // reservation discipline: a local index is recorded in `pending` (which
+    // the index allocator treats as reserved alongside the live demux map)
+    // BEFORE the message carrying it is emitted, so a concurrent handshake
+    // cannot steal it and blackhole the resulting session. Promotion installs
+    // the live demux entry BEFORE clearing the reservation, so the index is
+    // never absent from both maps during the hand-off. All reservation
+    // mutations are serialized by `reconcile_lock`.
     // ===================================================================
 
     /// Reserve a fresh, collision-free local index and register a pending
@@ -123,7 +125,6 @@ impl WgEngine {
         &self,
         peer_pubkey: [u8; WG_KEY_LEN],
         state: Option<HandshakeState>,
-        peer_index: u32,
         role: SessionRole,
     ) -> Result<u32, HandshakeError> {
         let _guard = self.reconcile_lock.lock().unwrap();
@@ -175,7 +176,6 @@ impl WgEngine {
                 state,
                 peer_pubkey,
                 local_index,
-                peer_index,
                 role,
             },
         );
@@ -232,12 +232,12 @@ impl WgEngine {
             .map_err(|_| HandshakeError::Internal)?;
 
         // Reserve the local index + register the pending handshake BEFORE
-        // emitting the message (two-phase reservation). For the initiator
-        // the peer_index is not yet known (filled from msg2); use 0 as a
-        // placeholder. The snow state is stashed after we write msg1 (which
-        // mutates it) so it can resume in `consume_response`.
+        // emitting the message (two-phase reservation). The snow state is
+        // stashed (as `Some`) after we write msg1 (which mutates it) so it
+        // can resume in `consume_response`; the peer's index is learned from
+        // msg2 at that point.
         let local_index =
-            self.reserve_pending(*peer_pubkey, None, 0, SessionRole::Initiator)?;
+            self.reserve_pending(*peer_pubkey, None, SessionRole::Initiator)?;
 
         // Build the snow msg1 body with the TAI64N as the Noise payload.
         let tai64n = self.tai64n_clock.now();
@@ -387,12 +387,8 @@ impl WgEngine {
         // Reserve our responder sender_index BEFORE emitting msg2. The
         // responder completes synchronously in this call, so the pending
         // entry is a bare reservation marker (state = None).
-        let local_index = self.reserve_pending(
-            peer_pubkey,
-            None,
-            peer_sender_index,
-            SessionRole::Responder,
-        )?;
+        let local_index =
+            self.reserve_pending(peer_pubkey, None, SessionRole::Responder)?;
 
         // Build the snow msg2 body (empty Noise payload).
         let mut noise_body = [0u8; MSG_RESPONSE_NOISE_LEN];
