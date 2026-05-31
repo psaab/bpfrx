@@ -19,6 +19,76 @@
 use crate::afxdp::{PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+/// Address family for the L4 checksum-offset / zero-checksum helpers.
+/// Only ever passed as a compile-time-literal at the call sites, so the
+/// `#[inline(always)]` helpers fold the match to a constant.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChecksumFamily {
+    V4,
+    V6,
+}
+
+/// Per-protocol delta of the L4 checksum field from the start of the IPv4
+/// L4 header (add the IPv4 IHL to get the packet offset). `None` => the
+/// protocol carries no L4 checksum field this module adjusts (IPv4 ICMP,
+/// IPv4 protocol 58, unknown) → the caller no-ops with `Some(())`.
+///
+/// NOTE: there is deliberately NO `PROTO_ICMPV6` arm here. IPv4 packets
+/// never carry ICMPv6, and the IPv4 NAT adjust paths call the v4 helpers
+/// without protocol filtering, so a stray ICMPv6 arm would adjust at
+/// `ihl + 2` for protocol 58 instead of no-op'ing — a live behavior change.
+#[inline(always)]
+fn l4_checksum_field_delta_v4(protocol: u8) -> Option<usize> {
+    match protocol {
+        PROTO_TCP => Some(16),
+        PROTO_UDP => Some(6),
+        _ => None,
+    }
+}
+
+/// Per-protocol delta of the L4 checksum field from the start of the IPv6
+/// L4 header (add the fixed 40-byte IPv6 header to get the packet offset).
+/// `None` => no adjusted L4 checksum field (unknown) → caller no-ops.
+#[inline(always)]
+fn l4_checksum_field_delta_v6(protocol: u8) -> Option<usize> {
+    match protocol {
+        PROTO_TCP => Some(16),
+        PROTO_UDP => Some(6),
+        PROTO_ICMPV6 => Some(2),
+        _ => None,
+    }
+}
+
+/// Whether a received IPv4 UDP datagram carries an OPTIONAL checksum that
+/// may legitimately be 0x0000 (RFC 768 — the checksum is optional for IPv4
+/// UDP and 0x0000 means "no checksum was computed"). The incremental-adjust
+/// path must NOT fabricate a checksum for such a packet, so it skips.
+///
+/// This is a DISTINCT concept from `adjust_zero_checksum_illegal` (which
+/// canonicalizes a freshly-computed 0x0000 to 0xFFFF). It is intentionally
+/// kept as its own predicate so the two RFC concepts are not conflated.
+#[inline(always)]
+fn l4_udp_checksum_optional(protocol: u8) -> bool {
+    protocol == PROTO_UDP
+}
+
+/// Whether a freshly-computed L4 checksum of 0x0000 must be canonicalized
+/// to 0xFFFF on the INCREMENTAL-ADJUST sites. IPv4: UDP only. IPv6: UDP and
+/// ICMPv6 (RFC 2460 §8.1 / RFC 8200 forbid a transmitted 0x0000 for both,
+/// since 0x0000 has the "no checksum" meaning for IPv4 UDP).
+///
+/// SCOPE: this describes the incremental `adjust_l4_checksum_*` sites ONLY.
+/// It deliberately does NOT describe `recompute_l4_checksum_ipv6`, whose
+/// ICMPv6 arm writes the raw sum without canonicalizing 0 → 0xFFFF — a
+/// pre-existing asymmetry this module preserves and does not unify here.
+#[inline(always)]
+fn adjust_zero_checksum_illegal(protocol: u8, family: ChecksumFamily) -> bool {
+    match family {
+        ChecksumFamily::V4 => protocol == PROTO_UDP,
+        ChecksumFamily::V6 => matches!(protocol, PROTO_UDP | PROTO_ICMPV6),
+    }
+}
+
 pub(in crate::afxdp) fn checksum16(bytes: &[u8]) -> u16 {
     checksum16_finish(checksum16_add_bytes(0, bytes))
 }
@@ -275,18 +345,18 @@ pub(in crate::afxdp) fn adjust_l4_checksum_ipv4(
     old_dst: Ipv4Addr,
     new_dst: Ipv4Addr,
 ) -> Option<()> {
-    let checksum_offset = match protocol {
-        PROTO_TCP => ihl.checked_add(16)?,
-        PROTO_UDP => ihl.checked_add(6)?,
-        _ => return Some(()),
+    let delta = match l4_checksum_field_delta_v4(protocol) {
+        Some(d) => d,
+        None => return Some(()),
     };
+    let checksum_offset = ihl.checked_add(delta)?;
     let current = u16::from_be_bytes([
         *packet.get(checksum_offset)?,
         *packet.get(checksum_offset + 1)?,
     ]);
     let mut updated = checksum16_adjust(current, &ipv4_words(old_src), &ipv4_words(new_src));
     updated = checksum16_adjust(updated, &ipv4_words(old_dst), &ipv4_words(new_dst));
-    if matches!(protocol, PROTO_UDP) && updated == 0 {
+    if adjust_zero_checksum_illegal(protocol, ChecksumFamily::V4) && updated == 0 {
         updated = 0xffff;
     }
     packet
@@ -304,19 +374,18 @@ pub(in crate::afxdp) fn adjust_l4_checksum_ipv6(
     old_dst: Ipv6Addr,
     new_dst: Ipv6Addr,
 ) -> Option<()> {
-    let checksum_offset = match protocol {
-        PROTO_TCP => 40usize.checked_add(16)?,
-        PROTO_UDP => 40usize.checked_add(6)?,
-        PROTO_ICMPV6 => 40usize.checked_add(2)?,
-        _ => return Some(()),
+    let delta = match l4_checksum_field_delta_v6(protocol) {
+        Some(d) => d,
+        None => return Some(()),
     };
+    let checksum_offset = 40usize.checked_add(delta)?;
     let current = u16::from_be_bytes([
         *packet.get(checksum_offset)?,
         *packet.get(checksum_offset + 1)?,
     ]);
     let mut updated = checksum16_adjust(current, &ipv6_words(old_src), &ipv6_words(new_src));
     updated = checksum16_adjust(updated, &ipv6_words(old_dst), &ipv6_words(new_dst));
-    if matches!(protocol, PROTO_UDP | PROTO_ICMPV6) && updated == 0 {
+    if adjust_zero_checksum_illegal(protocol, ChecksumFamily::V6) && updated == 0 {
         updated = 0xffff;
     }
     packet
@@ -364,20 +433,20 @@ pub(in crate::afxdp) fn adjust_l4_checksum_ipv4_words(
     old_words: &[u16],
     new_words: &[u16],
 ) -> Option<()> {
-    let checksum_offset = match protocol {
-        PROTO_TCP => ihl.checked_add(16)?,
-        PROTO_UDP => ihl.checked_add(6)?,
-        _ => return Some(()),
+    let delta = match l4_checksum_field_delta_v4(protocol) {
+        Some(d) => d,
+        None => return Some(()),
     };
+    let checksum_offset = ihl.checked_add(delta)?;
     let current = u16::from_be_bytes([
         *packet.get(checksum_offset)?,
         *packet.get(checksum_offset + 1)?,
     ]);
-    if matches!(protocol, PROTO_UDP) && current == 0 {
+    if l4_udp_checksum_optional(protocol) && current == 0 {
         return Some(());
     }
     let updated = checksum16_adjust(current, old_words, new_words);
-    let updated = if matches!(protocol, PROTO_UDP) && updated == 0 {
+    let updated = if adjust_zero_checksum_illegal(protocol, ChecksumFamily::V4) && updated == 0 {
         0xffff
     } else {
         updated
@@ -414,18 +483,17 @@ pub(in crate::afxdp) fn adjust_l4_checksum_ipv6_words(
     old_words: &[u16],
     new_words: &[u16],
 ) -> Option<()> {
-    let checksum_offset = match protocol {
-        PROTO_TCP => 40usize.checked_add(16)?,
-        PROTO_UDP => 40usize.checked_add(6)?,
-        PROTO_ICMPV6 => 40usize.checked_add(2)?,
-        _ => return Some(()),
+    let delta = match l4_checksum_field_delta_v6(protocol) {
+        Some(d) => d,
+        None => return Some(()),
     };
+    let checksum_offset = 40usize.checked_add(delta)?;
     let current = u16::from_be_bytes([
         *packet.get(checksum_offset)?,
         *packet.get(checksum_offset + 1)?,
     ]);
     let mut updated = checksum16_adjust(current, old_words, new_words);
-    if matches!(protocol, PROTO_UDP | PROTO_ICMPV6) && updated == 0 {
+    if adjust_zero_checksum_illegal(protocol, ChecksumFamily::V6) && updated == 0 {
         updated = 0xffff;
     }
     packet
@@ -441,18 +509,18 @@ pub(super) fn adjust_l4_checksum_ipv6_addr_bytes(
     old_addr: &[u8; 16],
     new_addr: &[u8; 16],
 ) -> Option<()> {
-    let checksum_offset = match protocol {
-        PROTO_TCP => 56usize,
-        PROTO_UDP => 46usize,
-        PROTO_ICMPV6 => 42usize,
-        _ => return Some(()),
+    let delta = match l4_checksum_field_delta_v6(protocol) {
+        Some(d) => d,
+        None => return Some(()),
     };
+    // 40 + {16,6,2} reproduces the previous absolute constants 56/46/42.
+    let checksum_offset = 40usize.checked_add(delta)?;
     let current = u16::from_be_bytes([
         *packet.get(checksum_offset)?,
         *packet.get(checksum_offset + 1)?,
     ]);
     let mut updated = checksum16_adjust_ipv6_addr_bytes(current, old_addr, new_addr);
-    if matches!(protocol, PROTO_UDP | PROTO_ICMPV6) && updated == 0 {
+    if adjust_zero_checksum_illegal(protocol, ChecksumFamily::V6) && updated == 0 {
         updated = 0xffff;
     }
     packet
