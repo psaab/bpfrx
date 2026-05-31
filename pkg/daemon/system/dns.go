@@ -5,8 +5,8 @@
 // filesystem or systemctl side effects, so they can be unit tested
 // directly and reused by sibling packages without importing daemon
 // internals. The daemon's apply/executor wrappers (e.g.
-// daemon_system.go applySystemDNS) call these and handle the write,
-// idempotence comparison, and service restart.
+// daemon_dns.go reconcileDNS) call these and handle the write,
+// idempotence comparison, symlink replacement, and resolved state.
 package system
 
 import (
