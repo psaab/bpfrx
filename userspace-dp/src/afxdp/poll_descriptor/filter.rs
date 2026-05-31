@@ -29,8 +29,14 @@
 //     rare/exception bodies: #[cold] #[inline(never)] for .text.unlikely
 //     placement away from the hot loop's cache lines.
 //
-// Bodies are byte-for-byte identical to their previous location in
-// mod.rs except for the inline attributes and the one tail split.
+// Bodies are behavior-identical to their previous location in mod.rs.
+// The only deltas are: the inline attributes (#[inline] ->
+// #[cold] #[inline(never)] on the cold leaves), pub(super) visibility,
+// the emit_cached_output_filter_log tail split, and rustfmt
+// re-collapsing the now-shorter emit_input_filter_log_match call in
+// emit_cached_input_filter_log onto one line (the call previously sat
+// in a wider context that forced a multiline layout). No logic,
+// side-effect ordering, counter increments, or allocation sites change.
 
 use super::*;
 
