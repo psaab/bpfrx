@@ -1,6 +1,49 @@
 # #1710 — SNMPv3 USM: zero authParams by position, not by length heuristic
 
-Status: DRAFT v1 — pending adversarial plan review
+Status: v2 — Codex PLAN-NEEDS-MINOR (4 minors addressed below) + AGY
+PLAN-READY. Core positional design ratified by both; no KILL
+counterexample found.
+
+## Adversarial review resolution (round 1)
+
+- **Codex** (task-mpta4cny-05mmyf): PLAN-NEEDS-MINOR. Core design immune
+  to the collision; no KILL counterexample. 4 minors, all resolved below.
+- **AGY** (adversarial-review-mpta4okq-75xv55): PLAN-READY, with a
+  bounds-checking hardening note (same as Codex minor #1).
+
+Resolutions:
+
+1. **Bounded parse invariant (Codex #1 / AGY hardening).** The locator
+   MUST decode every child TLV from its **parent value slice**, never from
+   `pkt[cursor:]`, so a nested length cannot escape its enclosing
+   SEQUENCE/OCTET-STRING. `berEncodedLen` returns the *advertised* size
+   without bounds-checking it fits (agent.go:988-996); the safety comes
+   from `berDecodeHeader`/`berDecodeOctetString` decoding against the
+   bounded container slice (agent.go:812-815, 882-885). Implementation:
+   the locator descends by slicing the parent's value (returned by
+   `berDecodeHeader`) and accumulates the absolute offset as
+   `base += headerBytes` on descent / `base += berEncodedLen(field)` on
+   sibling-skip, where each step first decodes from the bounded slice (so
+   an over-run returns err → ok=false). Every cursor advance is also
+   guarded by an explicit `start >= 0 && end <= len(pkt)` check before the
+   range is returned.
+2. **`ok` semantics (Codex #2).** The locator parses through the **sixth**
+   USM field (privParams) before returning `ok=true`, matching
+   `handleV3Packet`'s requirement that privParams decode (v3.go:208-212).
+   `ok=true` therefore means "the USM sequence is well-formed through
+   privParams and authParams is locatable." Documented on the helper.
+3. **Long-form length test (Codex #3).** Test 7 added: a packet whose
+   `msgSecurityParameters` OCTET STRING (and outer SEQUENCE) carry a
+   long-form (>127) BER length, exercising the multi-byte
+   `headerBytes = 1 + lenBytes` path (`berDecodeLength` long-form,
+   agent.go:824-838).
+4. **authParams-length wording (Codex #4).** Corrected: `verifyAuth`
+   rejects `len(receivedMAC) != truncLen` *before* calling
+   `zeroAuthParams` (v3.go:376-379), so a non-truncLen authParams never
+   reaches the zeroing path. The locator zeroes the on-wire authParams
+   value range regardless of its length, but for any packet that gets that
+   far the length already equals `truncLen`. The earlier "zero
+   unexpected-length authParams as received" rationale is withdrawn.
 
 ## Issue framing
 
