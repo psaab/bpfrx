@@ -1,6 +1,39 @@
 # #1706 — Fix four latent routing-correctness defects in pkg/routing
 
-Status: DRAFT v1 — pending adversarial plan review
+Status: v2 — PLAN-READY (Codex PLAN-NEEDS-MAJOR on silent truncation
+addressed by adding commit-time warnings; AGY PLAN-READY all four;
+defect 1 reframed as robustness cleanup per both reviewers)
+
+## Adversarial plan review outcome (round 1, commit d90bc3523)
+
+- **Codex** (isolated session): Defect 2 PLAN-READY; Defect 1 PLAN-KILL
+  *as a correctness defect* (benign in prod via ensureIndex name
+  re-resolution) — demote to optional robustness cleanup; Defect 3/4
+  math+placement correct but PLAN-NEEDS-MAJOR because the apply-time cap
+  silently truncates an over-limit config that still commits cleanly —
+  wants commit-time rejection OR explicit acceptance of the Junos
+  divergence.
+- **AGY**: all four PLAN-READY. Confirmed defect-1 benign-but-fix-worthy
+  (ensureIndex patches only Index, not other LinkAttrs; reassignment
+  cleaner than relying on the library fallback; `existingTun.Fds` nil →
+  closeTuntapFiles safe no-op). Confirmed defect-2 panic 100% real.
+  Confirmed defect-4 boundary math exact (50th table → 33098/33099;
+  51st rejected). All four config paths reachable.
+
+### Resolution applied in v2
+
+- **Defect 1**: KEEP the fix but reframe as a robustness/clarity cleanup,
+  not a production correctness bug (honest framing per both reviewers).
+- **Defect 3/4 (Codex NEEDS-MAJOR)**: add commit-time warnings in
+  `config.ValidateConfig` that fire when the raw config exceeds the
+  programmable window (>100 next-table routes; >50 rib-group-leaking
+  instances). These are CONSERVATIVE UPPER BOUNDS computed from the same
+  inputs the applier consumes (global+inet6 static routes with NextTable
+  set; instances referencing a non-empty interface-routes rib-group),
+  so they never miss a real truncation, and they do NOT replicate the
+  applier's exact dedup/skip logic (avoiding validator/applier drift).
+  The apply-time hard cap stays as defense-in-depth against the
+  permanent rule leak. This is a fifth commit.
 
 ## Issue framing
 
