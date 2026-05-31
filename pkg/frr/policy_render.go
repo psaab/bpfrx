@@ -14,7 +14,6 @@
 //   - bfdProfile, bfdProfileName
 //   - generateProtocols (OSPF/OSPFv3/BGP/RIP/ISIS)
 //   - generatePolicyOptions (prefix-lists, route-maps, communities)
-//   - ifaceNetwork (called from OSPF rendering inside generateProtocols)
 package frr
 
 import (
@@ -115,8 +114,15 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 		}
 		for _, area := range ospf.Areas {
 			for _, iface := range area.Interfaces {
-				fmt.Fprintf(&b, " network %s area %s\n",
-					ifaceNetwork(iface.Name), area.ID)
+				// OSPFv2 area membership is activated per-interface in the
+				// "interface <name>" block below via "ip ospf area <id>", NOT
+				// with a "network <prefix> area" statement here. A global
+				// "network 0.0.0.0/0 area" matches EVERY IPv4 interface in
+				// the VRF (over-activation; render order silently decides the
+				// area when multiple areas exist), and FRR ospfd does not
+				// support mixing "network" and "ip ospf" activation on one
+				// instance (#1712). passive-interface directives are
+				// independent of activation and remain under "router ospf".
 				if ospf.PassiveDefault {
 					if iface.NoPassive {
 						fmt.Fprintf(&b, " no passive-interface %s\n", iface.Name)
@@ -143,40 +149,43 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 			b.WriteString(m.resolveRedistribute(export, policyOptions))
 		}
 		b.WriteString("exit\n!\n")
-		// OSPF interface settings (cost, authentication, BFD)
+		// OSPF interface settings + per-interface area activation. The
+		// "interface <name>" block is emitted UNCONDITIONALLY for every
+		// configured OSPF interface because "ip ospf area <id>" is now the
+		// sole activation mechanism (the global "network 0.0.0.0/0 area"
+		// line was removed above, #1712). Cost / network-type / auth / BFD
+		// lines remain optional within the block.
 		for _, area := range ospf.Areas {
 			for _, iface := range area.Interfaces {
-				if iface.Cost > 0 || iface.NetworkType != "" || iface.AuthType != "" || iface.BFD {
-					fmt.Fprintf(&b, "interface %s\n", iface.Name)
-					if iface.Cost > 0 {
-						fmt.Fprintf(&b, " ip ospf cost %d\n", iface.Cost)
-					}
-					if iface.NetworkType != "" {
-						fmt.Fprintf(&b, " ip ospf network %s\n", iface.NetworkType)
-					}
-					if iface.AuthType == "md5" {
-						b.WriteString(" ip ospf authentication message-digest\n")
-						keyID := iface.AuthKeyID
-						if keyID == 0 {
-							keyID = 1
-						}
-						fmt.Fprintf(&b, " ip ospf message-digest-key %d md5 %s\n", keyID, iface.AuthKey)
-					} else if iface.AuthType == "simple" {
-						b.WriteString(" ip ospf authentication\n")
-						fmt.Fprintf(&b, " ip ospf authentication-key %s\n", iface.AuthKey)
-					}
-					if iface.BFD {
-						if iface.BFDInterval > 0 || iface.BFDMultiplier > 0 {
-							profile := bfdProfileName(iface.BFDInterval, iface.BFDMultiplier)
-							bfdProfiles[profile] = bfdProfile{iface.BFDInterval, iface.BFDMultiplier}
-							fmt.Fprintf(&b, " ip ospf bfd profile %s\n", profile)
-						} else {
-							b.WriteString(" ip ospf bfd\n")
-						}
-					}
-					fmt.Fprintf(&b, " ip ospf area %s\n", area.ID)
-					b.WriteString("exit\n!\n")
+				fmt.Fprintf(&b, "interface %s\n", iface.Name)
+				if iface.Cost > 0 {
+					fmt.Fprintf(&b, " ip ospf cost %d\n", iface.Cost)
 				}
+				if iface.NetworkType != "" {
+					fmt.Fprintf(&b, " ip ospf network %s\n", iface.NetworkType)
+				}
+				if iface.AuthType == "md5" {
+					b.WriteString(" ip ospf authentication message-digest\n")
+					keyID := iface.AuthKeyID
+					if keyID == 0 {
+						keyID = 1
+					}
+					fmt.Fprintf(&b, " ip ospf message-digest-key %d md5 %s\n", keyID, iface.AuthKey)
+				} else if iface.AuthType == "simple" {
+					b.WriteString(" ip ospf authentication\n")
+					fmt.Fprintf(&b, " ip ospf authentication-key %s\n", iface.AuthKey)
+				}
+				if iface.BFD {
+					if iface.BFDInterval > 0 || iface.BFDMultiplier > 0 {
+						profile := bfdProfileName(iface.BFDInterval, iface.BFDMultiplier)
+						bfdProfiles[profile] = bfdProfile{iface.BFDInterval, iface.BFDMultiplier}
+						fmt.Fprintf(&b, " ip ospf bfd profile %s\n", profile)
+					} else {
+						b.WriteString(" ip ospf bfd\n")
+					}
+				}
+				fmt.Fprintf(&b, " ip ospf area %s\n", area.ID)
+				b.WriteString("exit\n!\n")
 			}
 		}
 	}
@@ -481,14 +490,6 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 	}
 
 	return b.String()
-}
-
-// ifaceNetwork returns a placeholder network string for an interface.
-// In real use FRR matches based on interface addresses. Used inside
-// generateProtocols (OSPF area network rendering).
-func ifaceNetwork(name string) string {
-	// Use 0.0.0.0/0 as a catch-all; FRR resolves per-interface
-	return "0.0.0.0/0"
 }
 
 // generatePolicyOptions emits FRR prefix-list / route-map / community-list /
