@@ -1,6 +1,15 @@
 # #1699 — split pkg/config/ast.go: separate config-mode schema grammar from AST node types
 
-**Status:** DRAFT v1 — pending adversarial plan review
+**Status:** v2 — PLAN-READY. Round 1: Codex PLAN-NEEDS-MINOR, AGY
+PLAN-READY, Claude-SMR PLAN-READY. Seam unanimously judged real. v2
+adopts all four Codex minors (both reviewers independently recommended
+the `schema_complete.go` split): (1) split the completion functions into
+`schema_complete.go` so both new files land below the audit threshold;
+(2) update `docs/config-schema.md` + `pkg/config/README.md` references
+from `ast.go` to the new files; (3) `schema.go` imports only `strings`
+(grammar literal needs neither `fmt` nor `strings` directly, but
+`isTypedLeaf`/`appendTypedValueCompletions` move with completion code);
+(4) corrected the audit-tag wording — see below.
 
 ## 1. Issue framing
 
@@ -53,16 +62,28 @@ The value is exactly what the issue states: get `ast.go` back under the
 what it is, alongside the other `schema_*` files, so the next contributor
 editing the grammar (or the AST shape) opens the right file.
 
-Concrete blast radius:
-- `ast.go`: 2021 → ~373 LOC (drops off the `[REFACTOR]` heatmap entirely).
-- new `schema.go`: ~1670 LOC. It will itself carry the `[REFACTOR]` tag
-  because `setSchema` is one large literal — but that literal is the
-  *single source of truth* for the entire Junos config grammar; it is data,
-  not branching logic, and splitting the grammar tree across files would
-  hurt readability and the "one tree drives four things" property the docs
-  call out. Keeping the grammar in one cohesive file is the correct
-  end-state; the heatmap tag on a data-literal SSOT is acceptable and is
-  noted in the regenerated audit artifact.
+Concrete blast radius (v2, with the `schema_complete.go` split):
+- `ast.go`: 2021 → ~373 LOC (drops off the heatmap entirely).
+- new `schema.go`: ~1390 LOC — the `schemaNode` type + the `setSchema`
+  grammar literal + `init()` + `isTypedLeaf`. This is `[WATCH]` (1500-1999
+  is `[WATCH]`; ≥2000 is `[REFACTOR]` per `scripts/refactoring-audit.sh:55`).
+  At ~1390 it is actually *below* even the `[WATCH]` floor, so it does not
+  appear on the heatmap at all.
+- new `schema_complete.go`: ~310 LOC — `ValueHint` enum, `SchemaCompletion`,
+  `ValueProvider`, the completion/resolution functions
+  (`CompleteSetPath`, `appendTypedValueCompletions`,
+  `CompleteSetPathWithValues`, `ResolveConsumedSetPathTokens`). Well under
+  threshold.
+
+  Audit-tag note (Codex r1 finding): v1 wrongly called a ~1670 LOC single
+  file `[REFACTOR]`; the real threshold is `[REFACTOR]` ≥2000 /
+  `[WATCH]` 1500-1999 (`scripts/refactoring-audit.sh:55`,
+  `docs/refactoring-audit.md:5`). The v2 two-file split sidesteps the
+  question — both files land below the `[WATCH]` floor — which is why both
+  Codex and AGY recommended it. The grammar SSOT (`setSchema`) still stays
+  whole in one file; only the procedural completion logic separates out,
+  exactly mirroring how `schema_walk.go` already separates the walker logic
+  from the grammar data.
 
 **If reviewers conclude the perf gain is too small to justify the churn,
 PLAN-KILL is an acceptable verdict.** (Here there is no perf gain at all —
