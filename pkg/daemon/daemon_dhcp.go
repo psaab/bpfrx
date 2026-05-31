@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net"
 	"path/filepath"
-	"slices"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dhcp"
@@ -40,10 +39,19 @@ func (d *Daemon) startDHCPClients(ctx context.Context, cfg *config.Config) {
 		if activeCfg := d.store.ActiveConfig(); activeCfg != nil {
 			if d.dhcpLeaseChangeRequiresRecompile(activeCfg) {
 				slog.Info("DHCP address changed, recompiling dataplane")
+				// applyConfig runs reconcileDNSLocked, so DNS is
+				// reconciled with the new lease set on this path.
 				d.applyConfig(activeCfg)
 			} else {
 				slog.Info("DHCP address changed on management-only interface, refreshing management routes")
 				d.applyMgmtVRFRoutes()
+				// #1715 (fw0 class): a management-only interface (e.g.
+				// fxp0 DHCPv4) takes this branch and does NOT recompile,
+				// so DNS would never reconcile without this call. Route
+				// the DHCP-learned DNS through the locked reconciler so
+				// the box always picks up DHCP nameservers, not just on
+				// dataplane-relevant interfaces.
+				d.reconcileDNSFromDHCP()
 			}
 		}
 	})
@@ -83,7 +91,6 @@ func (d *Daemon) startDHCPClients(ctx context.Context, cfg *config.Config) {
 				if unit.DHCPv6Client != nil {
 					dm.SetDHCPv6Options(dhcpIface, &dhcp.DHCPv6Options{
 						Stateless:  unit.DHCPv6Client.ClientType == "stateless",
-						UpdateDNS:  slices.Contains(unit.DHCPv6Client.ReqOptions, "dns-server"),
 						IATypes:    unit.DHCPv6Client.ClientIATypes,
 						PDPrefLen:  unit.DHCPv6Client.PrefixDelegatingPrefixLen,
 						PDSubLen:   unit.DHCPv6Client.PrefixDelegatingSubPrefLen,

@@ -12,7 +12,6 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -63,8 +62,11 @@ type DHCPv4Options struct {
 
 // DHCPv6Options holds client behavior options for DHCPv6.
 type DHCPv6Options struct {
-	Stateless  bool     // true = send Information-Request only (no IA_NA/IA_PD)
-	UpdateDNS  bool     // true = install DNS servers to /etc/resolv.conf
+	Stateless bool // true = send Information-Request only (no IA_NA/IA_PD)
+	// UpdateDNS retired (#1715): the DHCP client no longer writes
+	// /etc/resolv.conf. The daemon's reconcileDNS always merges
+	// DHCP-learned servers (from Leases()) with static config regardless
+	// of any per-client flag, so the box is never resolver-less.
 	IATypes    []string // "ia-na", "ia-pd" — which IA types to request
 	PDPrefLen  int      // preferred prefix length hint for IA_PD (0 = no hint)
 	PDSubLen   int      // sub-prefix length for deriving /64s (0 = not set)
@@ -450,20 +452,16 @@ func (m *Manager) LeaseFor(ifaceName string, af AddressFamily) *Lease {
 	return &lc
 }
 
-// installDNS writes DHCP-learned nameservers to /etc/resolv.conf.
-func (m *Manager) installDNS(lease *Lease) {
-	if len(lease.DNS) == 0 {
-		return
-	}
-	var buf strings.Builder
-	buf.WriteString("# Managed by xpf DHCP client — do not edit\n")
-	for _, dns := range lease.DNS {
-		fmt.Fprintf(&buf, "nameserver %s\n", dns)
-	}
-	if err := os.WriteFile("/etc/resolv.conf", []byte(buf.String()), 0644); err != nil {
-		slog.Warn("DHCP: failed to install DNS", "err", err)
-	}
-}
+// #1715: the DHCP client no longer writes /etc/resolv.conf. DNS
+// ownership moved to the daemon's single applySem-locked reconcileDNS,
+// which reads DHCP-learned servers from Leases() (lease.DNS is populated
+// for both families) and merges them with static `system name-server`.
+// The client only stores the lease and fires the debounced
+// onAddressChange callback (scheduleRecompile), which the daemon routes
+// to reconcileDNSFromDHCP. The former installDNS file write — which
+// wrote through the dangling resolv.conf symlink and failed silently,
+// and which clobbered the other family's servers with no merge — is
+// removed.
 
 // runDHCPv4 runs the DHCPv4 DORA cycle with retries and renewal.
 // Note: our client always performs a full DORA (Discover→Offer→Request→Ack)
@@ -725,9 +723,10 @@ func (m *Manager) runDHCPv6(ctx context.Context, ifaceName string) {
 			}
 		}
 
-		if v6opts != nil && v6opts.UpdateDNS {
-			m.installDNS(lease)
-		}
+		// #1715: DNS install is no longer done here. lease.DNS is stored
+		// below and the daemon's reconcileDNS reads it from Leases();
+		// the debounced scheduleRecompile() (further down) fires the
+		// onAddressChange callback that drives the reconcile.
 
 		m.mu.Lock()
 		m.leases[key] = lease
