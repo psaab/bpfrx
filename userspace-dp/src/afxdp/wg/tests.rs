@@ -1762,6 +1762,29 @@ mod framed_handshake {
         assert_eq!(init.pending_count(), 1);
     }
 
+    /// reserve_pending_locked re-checks the peer UNDER reconcile_lock (Codex
+    /// round-3 TOCTOU finding). Removing the peer means create_initiation must
+    /// return UnknownPeer and leave NO pending reservation — otherwise a
+    /// reservation for a removed peer would leak (reconcile_peers's drain
+    /// iterates the table's pubkeys, which no longer contains it).
+    #[test]
+    fn create_initiation_after_peer_removed_leaves_no_reservation() {
+        let (init, _resp, _init_pub, resp_pub) = engine_pair();
+        // Remove the peer.
+        init.reconcile_peers(&[]);
+        // create_initiation must fail UnknownPeer and reserve nothing.
+        let mut msg1 = [0u8; WG_MSG_INIT_LEN];
+        assert_eq!(
+            init.create_initiation(&resp_pub, &mut msg1).unwrap_err(),
+            HandshakeError::UnknownPeer
+        );
+        assert_eq!(
+            init.pending_count(),
+            0,
+            "no reservation may be created for a removed peer"
+        );
+    }
+
     /// Concurrency regression for the Codex round-2 finding: completing a
     /// handshake (create_initiation → consume_initiation_create_response →
     /// consume_response) must be sound under a concurrent thread hammering

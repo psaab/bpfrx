@@ -141,14 +141,27 @@ impl WgEngine {
         state: Option<HandshakeState>,
         role: SessionRole,
     ) -> Result<u32, HandshakeError> {
+        // Re-check the peer is configured UNDER the lock (Codex round-3
+        // TOCTOU finding). `create_initiation` checks `peer_arc` before
+        // acquiring reconcile_lock; if `reconcile_peers(&[])` removes the
+        // peer in that gap, reserving here would create a pending entry for a
+        // peer absent from the published table. `reconcile_peers`'s
+        // pending-drain iterates the OLD table's pubkeys, so it would never
+        // drain this entry — it would leak until response / re-add / restart.
+        // Re-checking under the lock makes reservation linearizable with peer
+        // removal: a peer removed before we acquire the lock yields
+        // UnknownPeer and no reservation is created.
+        if self.peer_arc(&peer_pubkey).is_none() {
+            return Err(HandshakeError::UnknownPeer);
+        }
         let by_index = self.sessions_by_local_index.read().unwrap();
         let mut pending = self.pending.write().unwrap();
         let mut by_peer = self.pending_by_peer.write().unwrap();
 
         // Abort any prior PENDING (not-yet-completed) handshake for this
         // peer (DoS bound: at most one pending reservation per peer). The
-        // `pending_by_peer` marker is cleared by `promote_pending` on
-        // completion, so a still-present marker can only point at an
+        // `pending_by_peer` marker is cleared by `clear_reservation_locked`
+        // on completion, so a still-present marker can only point at an
         // incomplete reservation living in `pending` — NOT at a live
         // session in `by_index`. We therefore drop only the `pending`
         // entry and the marker; we must NOT touch `by_index`, or we would
@@ -177,12 +190,13 @@ impl WgEngine {
         // Reserve the index by recording the pending handshake. The
         // reservation lives in `pending` (NOT in the live-session demux
         // map): the index allocator above rejects any candidate already
-        // present in `pending` OR `by_index`, and the whole reserve/promote
-        // sequence is serialized by `reconcile_lock`, so a concurrent
-        // handshake or `install_session` cannot claim this index until we
-        // either promote it (insert the live session) or release it. decap
-        // never sees a half-built session because the live entry is only
-        // inserted by `promote_pending` → `install_session` on completion.
+        // present in `pending` OR `by_index`, and the whole reserve →
+        // complete sequence is serialized by `reconcile_lock`, so a
+        // concurrent handshake or `install_session` cannot claim this index
+        // until the completion path inserts the live session (via
+        // `install_session_locked`) or releases the reservation. decap never
+        // sees a half-built session because the live entry is only inserted
+        // by `install_session_locked` on completion.
         pending.insert(
             local_index,
             PendingHandshake {
