@@ -1,22 +1,17 @@
-# #1711 — Policy simulator `MatchPolicies`: reject malformed IP at the gRPC boundary
+# #1711 — Policy simulator: reject malformed IP at all three boundaries
 
-Status: DRAFT v1 — pending adversarial plan review
+Status: PLAN-READY v2 — expanded to all three simulator boundaries
+after Codex + AGY both returned PLAN-NEEDS-MAJOR on the gRPC-only v1.
 
 ## Issue framing
 
-`pkg/grpcapi/server_cluster.go` `MatchPolicies` (the gRPC policy
-simulator behind `show security match-policies`) does:
+The policy simulator (`show security match-policies`) parses the
+operator-supplied source/destination IP with `net.ParseIP` and feeds
+the result to `matchPolicyAddr`:
 
 ```go
-parsedSrc := net.ParseIP(req.SourceIp)
-parsedDst := net.ParseIP(req.DestinationIp)
-```
-
-`net.ParseIP` returns `nil` for **both** an empty string and a
-syntactically invalid string. `matchPolicyAddr` then treats
-`ip == nil` as an unconditional wildcard match:
-
-```go
+parsedSrc := net.ParseIP(req.SourceIp)   // grpc
+...
 func matchPolicyAddr(addrs []string, ip net.IP, cfg *config.Config) bool {
 	if len(addrs) == 0 || ip == nil { // ip==nil → matches every term
 		return true
@@ -25,208 +20,208 @@ func matchPolicyAddr(addrs []string, ip net.IP, cfg *config.Config) bool {
 }
 ```
 
-So feeding the simulator a non-empty but malformed source/dest IP
-(e.g. `source-ip 10.0.0.999` or `source-ip garbage`) makes the
-address match always succeed, producing a **false-positive PERMIT
-verdict** in the simulation output. This is diagnostic-only (the
-simulator, not the dataplane enforcement path), so it does not admit
-real traffic, but it gives the operator a misleading answer for bad
-input.
+`net.ParseIP` returns `nil` for **both** an empty string and a
+syntactically invalid string. `matchPolicyAddr` treats `ip == nil` as
+an unconditional wildcard, so a **non-empty malformed** IP (e.g.
+`source-ip 10.0.0.999` or `source-ip garbage`) silently matches every
+policy term → **false-positive PERMIT verdict** in the simulator
+output. Diagnostic-only (does not admit real traffic), but misleading.
 
-The issue is explicit that two of the three `ip == nil` triggers are
-*correct*:
+Two of the three `ip == nil` triggers are *correct* and must be kept:
 
-- `len(addrs) == 0` → the policy term itself lists no addresses →
-  Junos "any" semantics. **Keep.**
-- empty `req.SourceIp` / `req.DestinationIp` → the operator did not
-  constrain that tuple field → "any" / unspecified. This is how the
-  CLI is used (`source-ip` / `destination-ip` are optional args;
-  omitting them is a legitimate "match against any source"). **Keep.**
-- non-empty but invalid `req.SourceIp` / `req.DestinationIp` →
-  operator typo / malformed input → currently silently becomes "any".
-  **This is the bug.**
+- `len(addrs) == 0` → the policy term lists no addresses → Junos "any".
+- empty `SourceIp` / `DestinationIp` → operator left the tuple field
+  unconstrained → "any" / unspecified (the dominant CLI usage; the
+  `source-ip`/`destination-ip` args are optional).
+
+Only the **non-empty-but-invalid** case is the bug.
+
+## v1 → v2: why scope expanded (adversarial review)
+
+v1 fixed only the gRPC handler. Codex (`task-mpta3t25-pi958d`) and AGY
+(`adversarial-review-mpta4os9-m2em4w`) both returned **PLAN-NEEDS-MAJOR**
+with the same blocking finding: `show security match-policies` is
+served by **three independent in-process copies** of this matcher, and
+a gRPC-only fix leaves two of them false-positiveing:
+
+1. **gRPC** — `pkg/grpcapi/server_cluster.go:123` `MatchPolicies`,
+   matcher at `:174`. Used by the remote `cli` binary
+   (`cmd/cli/show.go:882`) and any direct gRPC client.
+2. **Local interactive CLI** — `pkg/cli/cli_show_security.go:1888`
+   `(*CLI).showMatchPolicies`, dispatched in-process at
+   `pkg/cli/cli_show_security_dispatch.go:332`, parses at `:1939`,
+   matches via its own `pkg/cli/cli_helpers.go:189` copy. **Does NOT
+   call the gRPC handler** — runs the whole simulation locally.
+   Counterexample (Codex): local `show security match-policies ...
+   source-ip garbage ...` still prints `Matching policy` after a
+   gRPC-only fix.
+3. **HTTP REST** — `pkg/api/security.go:184` `matchPoliciesHandler`
+   (route `GET /api/v1/security/match`, `pkg/api/server.go:153`),
+   parses at `:193`, matches via its own `pkg/api/security.go:229`
+   copy. Automation/UI clients remain vulnerable under a gRPC-only fix.
+
+To genuinely close #1711 ("operator running the simulator gets a false
+permit for malformed input"), validate at **all three** boundaries.
 
 ## Honest scope/value framing
 
-This is a single-function input-validation fix on a diagnostic gRPC
-RPC. It is not a perf change and not a refactor. The value is purely
-correctness of operator-facing output for malformed input: instead of
-a misleading PERMIT verdict, the operator gets a clear
-`InvalidArgument` error naming the bad field/value.
-
-If reviewers conclude the perf gain is too small to justify the churn,
-PLAN-KILL is an acceptable verdict. (There is no perf dimension here;
-the relevant kill criterion would be "the fix is wrong / breaks the
-legit any-path / belongs elsewhere".)
-
-## What's already shipped / partially relevant
-
-- `pkg/cli/cli_helpers.go` carries a **near-identical duplicate**
-  `matchPolicyAddr` / `matchPolicyAddrSet` (local-CLI path,
-  `pkg/cli` package). The local-CLI `showMatchPolicies`
-  (`pkg/cli/cli_show_security.go:1888`) has the same `net.ParseIP`
-  →`nil`→wildcard shape and the same latent false-positive on
-  malformed input.
-- The issue scopes the fix to the **gRPC** `server_cluster.go`
-  handler. See "Out of scope" + Open Question 5 on whether to also
-  fix the local-CLI twin in the same PR.
+Input-validation fix on three diagnostic entry points. Not perf, not a
+refactor. Value: correctness of operator-facing output for malformed
+input — a clear error instead of a misleading PERMIT. PLAN-KILL would
+only be warranted if the fix were wrong or broke the legit "any" path;
+neither reviewer found that — the core rule is sound.
 
 ## Concrete design
 
-Validate the two IP fields at the top of `MatchPolicies`, *after* the
-`cfg == nil` short-circuit, *before* the `net.ParseIP` calls feed the
-matcher. Distinguish empty (legit "any") from non-empty-invalid (error):
+Inline a non-empty-invalid guard at each of the three boundaries,
+before the existing `net.ParseIP` feeds the matcher. Each boundary
+keeps its native error type. The three `matchPolicyAddr` copies are
+**unchanged** — after the guard, the only remaining `ip == nil` cause
+is an *empty* (unspecified → any) input, which is intended. We do NOT
+consolidate the three copies in this PR (separate refactor concern).
+
+### gRPC — `pkg/grpcapi/server_cluster.go`
 
 ```go
-func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) (*pb.MatchPoliciesResponse, error) {
-	cfg := s.store.ActiveConfig()
-	if cfg == nil {
-		return &pb.MatchPoliciesResponse{}, nil
-	}
-
-	// An empty source/destination IP means "unspecified" (match any),
-	// which is a legitimate simulator query. A NON-EMPTY but malformed
-	// value is an operator error: net.ParseIP would return nil and the
-	// matcher would silently treat nil as a wildcard, yielding a
-	// false-positive PERMIT verdict (#1711). Reject it explicitly.
-	if req.SourceIp != "" && net.ParseIP(req.SourceIp) == nil {
-		return nil, status.Errorf(codes.InvalidArgument,
-			"invalid source-ip %q", req.SourceIp)
-	}
-	if req.DestinationIp != "" && net.ParseIP(req.DestinationIp) == nil {
-		return nil, status.Errorf(codes.InvalidArgument,
-			"invalid destination-ip %q", req.DestinationIp)
-	}
-
-	parsedSrc := net.ParseIP(req.SourceIp)
-	parsedDst := net.ParseIP(req.DestinationIp)
-	...
+if req.SourceIp != "" && net.ParseIP(req.SourceIp) == nil {
+	return nil, status.Errorf(codes.InvalidArgument, "invalid source-ip %q", req.SourceIp)
 }
+if req.DestinationIp != "" && net.ParseIP(req.DestinationIp) == nil {
+	return nil, status.Errorf(codes.InvalidArgument, "invalid destination-ip %q", req.DestinationIp)
+}
+parsedSrc := net.ParseIP(req.SourceIp)
+parsedDst := net.ParseIP(req.DestinationIp)
 ```
 
-`matchPolicyAddr` is **unchanged**: with the guard above, by the time
-it sees `ip == nil` the only remaining cause is an *empty* input
-(unspecified → any), which is the intended Junos semantics. The
-`len(addrs) == 0` arm is also unchanged (policy-term "any").
+`status`/`codes`/`net` already imported.
 
-Notes:
-- Empty-string check uses `req.SourceIp != ""` (not a trimmed
-  compare) — the proto field is a plain `string`; the CLI only
-  populates it from an explicit `source-ip <token>` arg, so a
-  whitespace-only value is itself malformed and should be rejected.
-  `net.ParseIP(" 1.2.3.4")` returns nil, so a leading-space value
-  takes the InvalidArgument path, which is the correct behavior.
-- `status` + `codes` are already imported in `server_cluster.go`
-  (lines 17-18). No new imports.
-- We call `net.ParseIP` twice for each field on the valid path (once
-  in the guard, once for `parsedSrc`/`parsedDst`). This is a
-  diagnostic RPC invoked interactively at human rate; the redundant
-  parse is negligible and keeps the guard self-contained and obviously
-  correct. Open Question 4 asks whether to instead reuse the parsed
-  value.
+### Local CLI — `pkg/cli/cli_show_security.go`
+
+```go
+if srcIP != "" && net.ParseIP(srcIP) == nil {
+	return fmt.Errorf("invalid source-ip %q", srcIP)
+}
+if dstIP != "" && net.ParseIP(dstIP) == nil {
+	return fmt.Errorf("invalid destination-ip %q", dstIP)
+}
+parsedSrc := net.ParseIP(srcIP)
+parsedDst := net.ParseIP(dstIP)
+```
+
+`fmt`/`net` already imported. Returned error propagates to the console.
+
+### HTTP REST — `pkg/api/security.go`
+
+```go
+srcIPStr := r.URL.Query().Get("src_ip")
+if srcIPStr != "" && net.ParseIP(srcIPStr) == nil {
+	writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid src_ip %q", srcIPStr))
+	return
+}
+dstIPStr := r.URL.Query().Get("dst_ip")
+if dstIPStr != "" && net.ParseIP(dstIPStr) == nil {
+	writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid dst_ip %q", dstIPStr))
+	return
+}
+srcIP := net.ParseIP(srcIPStr)
+dstIP := net.ParseIP(dstIPStr)
+```
+
+Needs `"fmt"` added to imports (`net`/`net/http` already present).
+`writeError(w, http.StatusBadRequest, ...)` is the existing helper
+(`pkg/api/api.go:44`).
+
+## Empty-vs-invalid discriminator (reviewer-confirmed)
+
+`field != "" && net.ParseIP(field) == nil`. Codex + AGY both confirmed
+no legitimate caller passes a non-empty sentinel (`any`, `0.0.0.0/0`,
+or a CIDR) in the IP field — the CLI and REST clients only copy a raw
+IP token. Resolved open questions:
+
+- `"0.0.0.0"` / `"::"` parse fine → valid path, matched by address-book
+  containment. Correct, no special-casing.
+- CIDR-in-IP-field (`10.0.0.0/24`) → `net.ParseIP` returns nil → now
+  rejected as invalid. The field contract is a single IP; the matcher
+  uses `cidr.Contains(ip)` against address-book entries, not the
+  reverse. Rejecting is correct.
+- Whitespace-only / leading-space values → `net.ParseIP` returns nil →
+  rejected. Correct.
 
 ## Public API preservation
 
-- `MatchPolicies` gRPC signature unchanged.
-- `MatchPoliciesRequest` / `MatchPoliciesResponse` proto unchanged.
-- `matchPolicyAddr` / `matchPolicyAddrSet` signatures and bodies
-  unchanged.
-- New behavior: a previously-accepted (and silently-wildcarded)
-  malformed IP now returns `codes.InvalidArgument`. This is a
-  behavior change on an error/garbage input path, not on any valid
-  query. The CLI caller (`cmd/cli/show.go:882`) already surfaces the
-  gRPC error via `return fmt.Errorf("%v", err)`, so the operator sees
-  the message.
+- gRPC `MatchPolicies` signature + proto unchanged.
+- REST route + `MatchPoliciesResult` shape unchanged (error uses the
+  existing `Response{Success:false,Error:...}` envelope at 400).
+- `(*CLI).showMatchPolicies` signature unchanged (already returns
+  `error`).
+- All three `matchPolicyAddr` / `matchPolicyAddrSet` bodies unchanged.
+- New behavior only on the malformed-input path.
 
-## Hidden invariants the change must preserve
+## Hidden invariants preserved
 
-1. **Empty-IP "any" path preserved** — omitting source-ip and/or
-   destination-ip must still simulate against "any" (the dominant CLI
-   usage). Guarded by the `!= ""` precondition.
-2. **Policy-term "any" preserved** — `len(addrs) == 0` arm untouched.
-3. **No new imports / no import cycle** — `codes`/`status` already in
-   the file.
-4. **Error surfacing** — gRPC `status.Error` propagates to the remote
-   CLI (`cmd/cli`) and the embedded local path; verify the embedded
-   local CLI (`pkg/cli`) does not call this gRPC handler (it has its
-   own in-process matcher), so the gRPC fix covers only the remote
-   `cli` binary + any direct gRPC client. (See Open Question 5.)
-5. **Determinism** — `MatchPolicies` is read-only against
-   `ActiveConfig()`; adding the guard introduces no state.
+1. Empty-IP "any" path — guarded by `!= ""`.
+2. Policy-term "any" (`len(addrs)==0`) — matcher untouched.
+3. No new import cycles — gRPC/CLI imports already present; REST adds
+   stdlib `fmt`.
+4. Read-only against `ActiveConfig()` — no new state.
 
 ## Risk assessment
 
 | Class | Level | Notes |
 |-------|-------|-------|
-| Behavioral regression | LOW | Only changes the malformed-input path. Valid queries and empty/any queries unchanged. Worst case if the empty-vs-invalid boundary is wrong: a legit query gets rejected — covered by tests for empty + valid + invalid. |
-| Lifetime / borrow | N/A | Go; no borrow checker. |
-| Performance | NONE | Interactive diagnostic RPC; one extra `net.ParseIP` per non-empty field. |
-| Architectural mismatch | LOW | Boundary input validation at the gRPC handler is the idiomatic location; matches existing `status.Error(codes.InvalidArgument, ...)` usage in the package. |
+| Behavioral regression | LOW | Only the malformed-input path changes; valid + empty/any unchanged, covered by tests at all three boundaries. |
+| Lifetime / borrow | N/A | Go. |
+| Performance | NONE | Interactive diagnostic paths; one extra ParseIP per non-empty field. |
+| Architectural mismatch | LOW | Boundary input validation is the idiomatic location; matches existing `codes.InvalidArgument` / `writeError(400)` usage. |
 
 ## Test plan
 
-New test in `pkg/grpcapi/server_cluster_test.go` (new file), package
-`grpcapi`, using the existing `configstore.New` + `LoadOverride` +
-`Commit` + `&Server{store: store}` scaffolding (mirrors
-`server_show_zones_test.go`):
+Per Codex: invalid-IP tests use a **restricted address-book term**
+(not only permit-any) so they prove the actual false-positive shape —
+with the bug the malformed IP would match a term it should not, and
+the fix turns that into an error rather than a (wrong) match. Also
+include an empty-means-any preservation test and a valid-match test.
 
-1. `TestMatchPoliciesRejectsInvalidSourceIP` — config with a
-   permit-any policy from trust→untrust; request with
-   `SourceIp: "10.0.0.999"` (or `"not-an-ip"`); assert the call
-   returns an error with `status.Code(err) == codes.InvalidArgument`
-   and the response is **not** a PERMIT verdict (resp nil on error).
-2. `TestMatchPoliciesRejectsInvalidDestinationIP` — same for
-   destination.
-3. `TestMatchPoliciesEmptyIPsMatchAny` — request with both IPs empty
-   against the permit-any policy → `Matched == true`, action permit,
-   **no error** (proves the legit "any" path is preserved).
-4. `TestMatchPoliciesValidIPMatches` — request with a valid
-   `SourceIp`/`DestinationIp` that falls inside an address-book term →
-   correct match, no error (proves valid path unaffected).
+- `pkg/grpcapi/server_cluster_test.go` (new):
+  - `TestMatchPoliciesRejectsInvalidSourceIP` — restricted src term;
+    `SourceIp:"10.0.0.999"` → `codes.InvalidArgument`, resp nil.
+  - `TestMatchPoliciesRejectsInvalidDestinationIP` — same for dest.
+  - `TestMatchPoliciesEmptyIPsMatchAny` — both IPs empty vs permit-any
+    → `Matched==true`, no error (empty-any preserved).
+  - `TestMatchPoliciesValidIPMatches` — valid IP inside the restricted
+    term → matched, no error (valid path unaffected).
+- `pkg/cli/cli_show_security_test.go` (append
+  `TestShowMatchPoliciesValidation`):
+  - invalid source-ip / destination-ip → non-nil error, no
+    "Matching policy" output.
+  - empty IPs → no error, simulates against any.
+- `pkg/api/security_test.go` (new):
+  - invalid `src_ip` / `dst_ip` query → HTTP 400, `Success:false`.
+  - empty / valid → 200.
 
-Gates (control-plane / gRPC diagnostic change — NO cluster smoke):
-
+Gates (control-plane diagnostic change — NO cluster smoke):
 - `go build ./...` clean.
-- `go vet ./pkg/grpcapi/...` clean.
-- `go test ./pkg/grpcapi/...` — new tests pass + existing pass.
-- Full Go suite `go test ./...` green.
-- New named test 5× loop (no flake).
-- `make audit-check` only if a file crosses the size threshold (this
-  change adds <15 LOC to a 600-line file + one new test file — should
-  not trip it; will verify).
+- `go vet ./pkg/grpcapi/... ./pkg/cli/... ./pkg/api/...` clean.
+- `go test ./pkg/grpcapi/... ./pkg/cli/... ./pkg/api/...` pass.
+- Full `go test ./...` green.
+- New named tests 5× loop, no flake.
+- `make audit-check` only if a file crosses the size threshold (each
+  edit adds <15 LOC; verify it does not trip).
 
 ## Out of scope (explicitly)
 
-- **`pkg/cli/cli_helpers.go` + `pkg/cli/cli_show_security.go`
-  local-CLI twin.** Same latent bug, different package, not named by
-  the issue. Open Question 5 asks reviewers whether to fold it in.
-  Default plan: gRPC-only per issue scope; file a follow-up for the
-  CLI twin if reviewers prefer scope discipline.
-- Consolidating the two `matchPolicyAddr` copies into one shared
-  helper (a refactor, separate concern).
-- Any proto/schema change.
+- Consolidating the three `matchPolicyAddr` copies into one shared
+  helper (a refactor; deliberately deferred to keep this a tight bug
+  fix). Noted as a possible follow-up.
+- Any proto / schema / route change.
 
-## Open questions for adversarial review
+## Open questions — resolved by review
 
-1. **Empty-vs-invalid boundary.** Is `req.SourceIp != "" &&
-   net.ParseIP(...) == nil` the correct discriminator? Is there any
-   legitimate caller that passes a non-empty sentinel like `"any"` or
-   `"0.0.0.0/0"` as the IP field (which would now be rejected)? Grep
-   of CLI callers shows only raw IP tokens — but confirm.
-2. **Should `"0.0.0.0"` / `"::"` be accepted?** They parse fine via
-   `net.ParseIP` (valid IPs), so they take the valid path and match
-   per address-book containment. That seems correct — confirm no
-   special-casing is wanted.
-3. **CIDR input.** The field is documented as an IP, not a CIDR.
-   `net.ParseIP("10.0.0.0/24")` returns nil → would now be rejected as
-   InvalidArgument. Previously it silently wildcarded. Is rejecting
-   CIDR-in-IP-field the right call, or should we accept a CIDR? (Plan
-   position: reject — the field contract is a single IP; matcher uses
-   `cidr.Contains(ip)` against address-book entries, not the reverse.)
-4. **Double-parse.** Acceptable on a diagnostic RPC, or should we
-   parse once and branch on nil+empty? (Plan position: keep the guard
-   self-contained for clarity; cost is nil at human invocation rate.)
-5. **Local-CLI twin scope.** Fold the identical
-   `pkg/cli` fix into this PR, or keep gRPC-only per the issue and
-   file a follow-up? PLAN-KILL is *not* warranted either way — this is
-   a scope-boundary question.
+1. Discriminator correctness → confirmed (no non-empty sentinel
+   callers).
+2. `0.0.0.0`/`::` acceptance → correct as-is.
+3. CIDR-in-IP-field → reject (field contract is a single IP).
+4. Double-parse → acceptable on diagnostic paths.
+5. Twin scope → **resolved by expanding to all three boundaries** (the
+   blocking finding). gRPC-only would not close the operator-visible
+   bug.
