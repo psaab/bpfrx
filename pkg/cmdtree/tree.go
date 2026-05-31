@@ -953,7 +953,7 @@ var OperationalTree = map[string]*Node{
 }
 
 // ConfigSetDataplaneKnobs is the `?` help surface for `set system
-// dataplane <knob>`. Codex M3 / Go F1: the schema in pkg/config/ast.go
+// dataplane <knob>`. Codex M3 / Go F1: the schema in pkg/config/schema.go
 // already backs tab completion for these knobs, but `?` help and the
 // explicit per-knob description live in cmdtree. Keeping this map tiny
 // and focused lets us grow it without restating the full config
