@@ -278,53 +278,70 @@ impl WgEngine {
     /// handshake, and install the derived transport session.
     ///
     /// Verifies the framing (mac1 over OUR public key) and that the
-    /// response's `receiver_index` matches a pending reservation we hold.
-    /// On success the pending handshake is promoted to a live `WgSession`
-    /// (initiator role, confirmed at install) and registered for inbound
-    /// demux. Returns the local index of the installed session.
+    /// response's `receiver_index` matches a pending INITIATOR reservation we
+    /// hold. On success the pending handshake is promoted to a live
+    /// `WgSession` (initiator role, confirmed at install) and registered for
+    /// inbound demux. Returns the local index of the installed session.
+    ///
+    /// Invariants this method preserves (Codex code-review round 1, findings
+    /// 1 & 2):
+    ///   - The pending reservation is NEVER removed before the live session
+    ///     is installed: the index stays present in `pending` until
+    ///     `promote_pending` installs it into `sessions_by_local_index` (and
+    ///     only then clears the reservation), so there is no window where the
+    ///     index is absent from both maps and a concurrent `reserve_pending`
+    ///     could re-allocate it.
+    ///   - A msg2 that fails Noise authentication does NOT destroy the
+    ///     reservation. MAC1 keys on the (public) initiator pubkey, so an
+    ///     on-path observer can forge a msg2 with a valid MAC1 but a bogus
+    ///     Noise body; if such a forgery consumed the pending state, it would
+    ///     DoS the real handshake. snow's `read_message` restores its
+    ///     symmetric state on a failed read, so we put the borrowed
+    ///     `HandshakeState` back and keep waiting for a valid (or
+    ///     retransmitted) response.
     pub(crate) fn consume_response(&self, msg: &[u8]) -> Result<u32, HandshakeError> {
         let parsed = handshake::parse_response(msg, &self.local_public_key)?;
-        // Take the pending handshake addressed by receiver_index.
-        let mut ph = {
+
+        // Borrow the snow state out of the pending entry WITHOUT removing the
+        // reservation. We validate role/index under the lock, then take the
+        // state (leaving the entry in place as a still-reserved marker with
+        // `state = None`) and release the lock before the crypto.
+        let (peer_pubkey, mut state) = {
             let mut pending = self.pending.write().unwrap();
-            pending
-                .remove(&parsed.receiver_index)
-                .ok_or(HandshakeError::NoPendingHandshake)?
-        };
-        // Copy the metadata out before consuming `ph.state` (avoids a
-        // partial-move borrow conflict).
-        let local_index = ph.local_index;
-        let peer_pubkey = ph.peer_pubkey;
-        let role = ph.role;
-        // It must be an initiator-role handshake (we sent msg1).
-        if role != SessionRole::Initiator || local_index != parsed.receiver_index {
-            // A mismatched role/index means this response does not belong to
-            // this reservation; drop it and release the now-removed entry's
-            // peer marker.
-            self.release_pending(parsed.receiver_index);
-            return Err(HandshakeError::ReceiverIndexMismatch);
-        }
-        // Recover the resumable initiator snow state.
-        let mut state = match ph.state.take() {
-            Some(s) => s,
-            None => {
-                // An initiator reservation must carry its snow state. A
-                // missing state means the reservation was never completed by
-                // create_initiation (e.g. aborted mid-build); drop it.
-                self.release_pending(parsed.receiver_index);
-                return Err(HandshakeError::NoPendingHandshake);
+            let ph = pending
+                .get_mut(&parsed.receiver_index)
+                .ok_or(HandshakeError::NoPendingHandshake)?;
+            if ph.role != SessionRole::Initiator {
+                // A response addressed at a responder-role reservation does
+                // not belong here; leave the reservation untouched.
+                return Err(HandshakeError::ReceiverIndexMismatch);
             }
+            let peer_pubkey = ph.peer_pubkey;
+            let state = ph
+                .state
+                .take()
+                .ok_or(HandshakeError::NoPendingHandshake)?;
+            (peer_pubkey, state)
         };
-        // Drive snow to completion with the peer's msg2 body.
+        let local_index = parsed.receiver_index;
+
+        // Drive snow to completion with the peer's msg2 body. On failure,
+        // snow has restored its internal state, so we reinstate the borrowed
+        // HandshakeState into the (still-present) reservation and report
+        // Crypto — a forged/garbled msg2 must not kill the pending handshake.
         let mut sink = [0u8; MSG_RESPONSE_NOISE_LEN];
         if state.read_message(parsed.noise_body, &mut sink).is_err() {
-            self.release_pending(parsed.receiver_index);
+            self.restore_pending_state(local_index, state);
             return Err(HandshakeError::Crypto);
         }
         let transport = match state.into_stateless_transport_mode() {
             Ok(t) => t,
             Err(_) => {
-                self.release_pending(parsed.receiver_index);
+                // into_stateless_transport_mode consumed `state`, so we cannot
+                // put it back; this only fails if the handshake is not
+                // finished, which cannot happen after a successful msg2 read.
+                // Release the reservation rather than leak it.
+                self.release_pending(local_index);
                 return Err(HandshakeError::Crypto);
             }
         };
@@ -335,7 +352,23 @@ impl WgEngine {
             peer_pubkey,
             SessionRole::Initiator,
         ));
+        // promote_pending installs the live session BEFORE clearing the
+        // reservation (no absent-from-both-maps window).
         self.promote_pending(local_index, peer_pubkey, session)
+    }
+
+    /// Put a borrowed initiator `HandshakeState` back into its pending
+    /// reservation after a failed msg2 read, so the reservation survives a
+    /// forged/garbled response and a later valid retransmit can complete it.
+    /// If the reservation vanished while we held no lock (e.g. a concurrent
+    /// re-initiation to the same peer aborted it), the state is simply
+    /// dropped — there is nothing to restore.
+    fn restore_pending_state(&self, local_index: u32, state: HandshakeState) {
+        let _guard = self.reconcile_lock.lock().unwrap();
+        let mut pending = self.pending.write().unwrap();
+        if let Some(ph) = pending.get_mut(&local_index) {
+            ph.state = Some(state);
+        }
     }
 
     /// Responder path: parse a peer's framed WG type-1 initiation, run snow

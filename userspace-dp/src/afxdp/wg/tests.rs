@@ -1673,4 +1673,56 @@ mod framed_handshake {
         let d2 = init.try_decap(&w2[..e2.len], &mut p2).unwrap();
         assert_eq!(d2.peer_pubkey, resp_pub);
     }
+
+    /// A forged/garbled msg2 (valid framing + valid MAC1, since MAC1 keys on
+    /// the public initiator pubkey, but a corrupt Noise body) must NOT
+    /// destroy the initiator's pending reservation: the real msg2 that
+    /// arrives afterward must still complete the handshake. This is the
+    /// Codex code-review-round-1 finding 2 regression (an on-path observer
+    /// could otherwise DoS the handshake by racing a bogus msg2).
+    #[test]
+    fn forged_msg2_does_not_destroy_pending_reservation() {
+        let (init, resp, init_pub, resp_pub) = engine_pair();
+        let mut msg1 = [0u8; WG_MSG_INIT_LEN];
+        init.create_initiation(&resp_pub, &mut msg1).unwrap();
+        assert_eq!(init.pending_count(), 1);
+
+        // Produce the REAL msg2 from the responder.
+        let mut real_msg2 = [0u8; WG_MSG_RESPONSE_LEN];
+        resp.consume_initiation_create_response(&msg1, &mut real_msg2)
+            .unwrap();
+
+        // Forge a msg2: copy the real one (so type/receiver_index/MAC1
+        // verify), then corrupt the Noise body so the snow read fails. MAC1
+        // covers msg[0..60]; the Noise body is msg[12..60], so corrupting a
+        // body byte breaks the Noise AEAD but NOT mac1... wait — mac1 DOES
+        // cover the body. So instead corrupt a byte the Noise read
+        // authenticates but mac1 also covers: to get a valid-mac1 forgery we
+        // must recompute mac1 over the corrupted prefix. Simplest faithful
+        // forgery: rebuild a msg2 with the right receiver_index + a random
+        // Noise body + a correctly-recomputed mac1 over OUR pubkey.
+        let mut forged = real_msg2;
+        // Corrupt the encrypted-empty AEAD tag region (msg[44..60]) so the
+        // Noise read fails, then recompute mac1 over msg[0..60] so framing
+        // still authenticates (mac1 keys on the initiator = us, a public key,
+        // so an attacker can do exactly this).
+        forged[50] ^= 0xFF;
+        let recomputed = crate::afxdp::wg::handshake::compute_mac1(&init_pub, &forged[..60]);
+        forged[60..76].copy_from_slice(&recomputed);
+
+        // The forged msg2 fails the Noise read but must leave the reservation
+        // intact.
+        let err = init.consume_response(&forged).unwrap_err();
+        assert_eq!(err, HandshakeError::Crypto);
+        assert_eq!(
+            init.pending_count(),
+            1,
+            "a forged msg2 must NOT consume/destroy the pending reservation"
+        );
+
+        // The REAL msg2 still completes the handshake.
+        init.consume_response(&real_msg2)
+            .expect("real msg2 must still complete after a forged one was rejected");
+        assert_eq!(init.pending_count(), 0);
+    }
 }

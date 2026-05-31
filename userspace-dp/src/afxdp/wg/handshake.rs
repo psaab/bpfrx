@@ -205,7 +205,14 @@ pub(crate) fn parse_initiation<'a>(
     our_static_pub: &[u8; WG_KEY_LEN],
 ) -> Result<ParsedInitiation<'a>, FramingError> {
     let msg = msg.get(..WG_MSG_INIT_LEN).ok_or(FramingError::TooShort)?;
-    if msg[M1_TYPE] != WG_TYPE_INITIATION {
+    // WG's message_type is a 32-bit little-endian word: a canonical
+    // initiation is exactly 0x00000001, i.e. type byte = 1 AND the three
+    // reserved bytes = 0. wireguard-go / kernel WG read the full u32 and
+    // reject a non-canonical high byte, so we do too (strict parse). This is
+    // also belt-and-suspenders: mac1 already covers bytes [0..116] including
+    // the reserved bytes, so a forged non-zero-reserved datagram would fail
+    // mac1 regardless — but rejecting it up front keeps us byte-strict.
+    if !is_canonical_type(msg, WG_TYPE_INITIATION) {
         return Err(FramingError::BadType);
     }
     // Verify mac1 over msg[0..116] BEFORE handing the body to snow — kernel
@@ -219,12 +226,22 @@ pub(crate) fn parse_initiation<'a>(
     if !macs_equal(&expect, &got) {
         return Err(FramingError::Mac1Mismatch);
     }
-    // bytes [1..4] reserved (accept non-zero for robustness); mac2 skipped.
+    // mac2 (msg[132..148]) is skip-verified in S1 (cookie handling is S7).
     let sender_index = u32::from_le_bytes([msg[4], msg[5], msg[6], msg[7]]);
     Ok(ParsedInitiation {
         sender_index,
         noise_body: &msg[M1_NOISE..M1_MAC1],
     })
+}
+
+/// True iff `msg`'s leading 4 bytes are exactly the little-endian u32
+/// `expected_type` — i.e. the type byte matches AND the three reserved bytes
+/// are zero. WG transmits `message_type` as a u32; a compliant peer's
+/// initiation/response always has zero reserved bytes.
+#[inline]
+fn is_canonical_type(msg: &[u8], expected_type: u8) -> bool {
+    let word = u32::from_le_bytes([msg[0], msg[1], msg[2], msg[3]]);
+    word == expected_type as u32
 }
 
 /// A WG type-2 response produced by [`build_response`].
@@ -283,7 +300,9 @@ pub(crate) fn parse_response<'a>(
     our_static_pub: &[u8; WG_KEY_LEN],
 ) -> Result<ParsedResponse<'a>, FramingError> {
     let msg = msg.get(..WG_MSG_RESPONSE_LEN).ok_or(FramingError::TooShort)?;
-    if msg[M2_TYPE] != WG_TYPE_RESPONSE {
+    // Strict 32-bit LE type word (type byte 2 + zero reserved). See
+    // `parse_initiation` / `is_canonical_type`.
+    if !is_canonical_type(msg, WG_TYPE_RESPONSE) {
         return Err(FramingError::BadType);
     }
     let expect = compute_mac1(our_static_pub, &msg[..M2_MAC1]);
@@ -508,6 +527,39 @@ mod tests {
         let mut buf = [0u8; WG_MSG_INIT_LEN];
         buf[0] = WG_TYPE_RESPONSE;
         assert_eq!(parse_initiation(&buf, &pub_k).unwrap_err(), FramingError::BadType);
+    }
+
+    /// Strict 32-bit-LE type word: a correct type byte but a NON-ZERO
+    /// reserved byte must be rejected (the type is the u32 `0x00000001`, not
+    /// just byte 0). A real WG peer always sends zero reserved bytes; this
+    /// rejects non-canonical datagrams up front (Codex code-review finding 3).
+    #[test]
+    fn parse_rejects_nonzero_reserved_bytes() {
+        let resp_pub = [0x5Au8; 32];
+        let noise = [0x3Cu8; MSG_INIT_NOISE_LEN];
+        let mut buf = [0u8; WG_MSG_INIT_LEN];
+        build_initiation(&mut buf, 0x1234, &noise, &resp_pub).unwrap();
+        // Sanity: canonical build parses.
+        assert!(parse_initiation(&buf, &resp_pub).is_ok());
+        // Flip a reserved byte — must be rejected as BadType (the high bytes
+        // of the type word are non-zero), regardless of mac1.
+        buf[2] = 0x01;
+        assert_eq!(
+            parse_initiation(&buf, &resp_pub).unwrap_err(),
+            FramingError::BadType
+        );
+
+        // Same for the response.
+        let init_pub = [0xA5u8; 32];
+        let rnoise = [0xC3u8; MSG_RESPONSE_NOISE_LEN];
+        let mut rbuf = [0u8; WG_MSG_RESPONSE_LEN];
+        build_response(&mut rbuf, 1, 2, &rnoise, &init_pub).unwrap();
+        assert!(parse_response(&rbuf, &init_pub).is_ok());
+        rbuf[1] = 0xFF;
+        assert_eq!(
+            parse_response(&rbuf, &init_pub).unwrap_err(),
+            FramingError::BadType
+        );
     }
 
     /// S1 must SKIP-verify mac2: a peer that holds our cookie sets a
