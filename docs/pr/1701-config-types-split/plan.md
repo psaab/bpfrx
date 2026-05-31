@@ -1,10 +1,18 @@
 # #1701 — Split `pkg/config/types.go` (2055 LOC) by domain
 
-**Status:** DRAFT v2 — incorporates AGY r1 domain-cohesion fixes (IPsec/IKE
-and DynamicAddress/Feed → security; SchedulerConfig → security, not CoS);
-pending Codex r1 + Claude-SMR r1 convergence
+**Status:** PLAN-READY v2.1 — three-way convergence:
+- AGY r1: PLAN-NEEDS-MAJOR (3 domain-cohesion re-buckets) → fixed in v2.
+- Codex r1 (task-mpt54ogw-bnbj6h): v1 PLAN-NEEDS-MAJOR (same 3 buckets),
+  v2 "closer to PLAN-NEEDS-MINOR" with 2 minors (name-level symbol diff;
+  stale LOC framing) → both fixed in v2.1.
+- Claude-SMR r1 (claude-smr-plan-r1.md): PLAN-READY, independent
+  verification of const/iota inventory + concurrence with AGY re-buckets.
 
 ## Changelog
+- **v2.1:** Codex r1 minors: (§5) replace count-only symbol reconciliation
+  with a name-level sorted-identifier diff (counts prove shape, names prove
+  identity); (§2) correct the stale "150–450 LOC" framing to "~140–595 LOC"
+  now that security absorbs IPsec + DynamicAddress.
 - **v2:** AGY r1 returned PLAN-NEEDS-MAJOR with three valid domain-cohesion
   re-buckets (all verified against the `SecurityConfig` struct nesting in
   types.go and the Junos hierarchy):
@@ -44,7 +52,7 @@ This is a pure maintainability/navigability refactor. No runtime behavior
 changes, no perf delta — `types.go` is compiled identically whether it is
 one file or seven in the same package. The win is:
 
-- 2055 LOC → ~7 files of 150–450 LOC each, grouped by Junos config domain,
+- 2055 LOC → 7 files of ~140–595 LOC each, grouped by Junos config domain,
   so a contributor editing NAT types is not scrolling past SNMP and OSPF.
 - Lower merge-conflict surface for the parallel refactor backlog (sibling
   PRs #1697/#1698/#1700 touch other large files; domain files reduce the
@@ -200,9 +208,14 @@ Per the task's gate definition, the gate is:
       unix-socket test failures are known artifacts; reproduce them on
       clean `origin/master` FIRST and prove they are pre-existing (not
       introduced by this PR) per the no-test-dismissal rule.
-- [ ] Symbol-count reconciliation: `grep -c` of `^type `/`^func `/`^const `/
-      `^var ` across the new file set equals the pre-split count in the
-      original `types.go`.
+- [ ] **Name-level symbol-set reconciliation** (Codex r1 §5): not just a
+      count, but a sorted-identifier diff. Extract the exported/declared
+      identifier set (`^type X`, `^func X`/`^func (recv) X`, each name in
+      `const (...)`/`var` blocks) from the pre-split `types.go` on
+      `origin/master` and from the post-split file set, then `diff` the two
+      sorted name lists — it MUST be empty. Counts (175 type / 16 func /
+      4 const / 1 var) prove shape; the name diff proves identity (catches
+      a renamed/dropped/duplicated symbol that counts would miss).
 - [ ] `make audit-check` PASSES after regenerating
       `docs/refactoring-audit-current.txt` (regen done LAST, post-rebase
       onto current master, to avoid the #1671 parallel-refactor audit-drift
