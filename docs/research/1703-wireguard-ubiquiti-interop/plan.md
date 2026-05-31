@@ -1,7 +1,6 @@
 # #1703 — WireGuard interop with Ubiquiti (UniFi Network 10.4+, EdgeOS, UDM): research plan
 
-Revision: r2 (addresses Codex r1 findings 1-3, AGY r1 findings 1-2,
-Claude-SMR r1 findings 1-3)
+Revision: r3 (r2 + Codex r2 fix: split S2 handshake gate vs S3 transport gate)
 Branch: `research/1703-wireguard-ubiquiti-interop`
 Scope: `/research` only. No production code, no PR. Deliverable = converged
 plan-of-action + 3-reviewer verdicts + issue comment. Implementation gated on
@@ -421,17 +420,27 @@ wireguard-go/kernel WG is byte-identical to what UniFi runs.
    type byte + reserved + sender/receiver index, `mac1` = **keyed-BLAKE2s**
    (NOT HMAC; SMR r1 #3) over `HASH("mac1----" || peer.static_public)`, `mac2`
    (zeros until a cookie is seen), and the TAI64N timestamp carried as the
-   Noise PAYLOAD of msg 1. **Acceptance: flip S1 Test 1 + Test 2 from xfail to
-   green** (initiator + responder). TAI64N MUST be monotonic and persisted
-   across control-plane restart + HA-replicated (SMR r1 #1) so xpf never DoSes
-   its own handshakes with a backwards timestamp. Handshake construction runs
-   on the control/coordinator thread, never the poll worker (AGY r1 #2).
-   Quad-review, security-critical, in isolation (per #1492 lesson).
+   Noise PAYLOAD of msg 1. **Acceptance: flip the HANDSHAKE-ONLY xfails green**
+   — i.e. Test 1a/2a (a valid msg1/msg2 is emitted/parsed, `mac1` verifies
+   against the peer pubkey, TAI64N present and monotonic, and the peer's
+   `wg show` reports `latest handshake` non-zero). It does NOT assert
+   ping/iperf transport — that requires the production hot path wired in S3, so
+   the transport-flow assertions (Test 1b/2b) stay xfail until S3
+   (Codex r2 finding). S2 may complete a handshake through a thin
+   control-thread harness without the AF_XDP worker carrying data. TAI64N MUST
+   be monotonic and persisted across control-plane restart + HA-replicated
+   (SMR r1 #1) so xpf never DoSes its own handshakes with a backwards
+   timestamp. Handshake construction runs on the control/coordinator thread,
+   never the poll worker (AGY r1 #2). Quad-review, security-critical, in
+   isolation (per #1492 lesson).
 3. **#1703-S3 (dataplane activation):** encap/decap call sites + runtime
    `TunnelEndpoint` + reconcile; recycle discipline on every drop path; set DF
    + honor PMTUD on the outer header and document "no userspace IP reassembly"
    as a hard operational limit (AGY r1 #1, O1). Wire the `mss.rs` clamp on the
-   hot path.
+   hot path. **Acceptance: flip the TRANSPORT-FLOW xfails green** — Test 1b/2b
+   (ping/iperf inner flow round-trips through the AF_XDP worker; `wg show`
+   payload-byte counters increment in both directions). S3 is where wire
+   compliance is proven end-to-end on the REAL hot path, not a harness shim.
 4. **#1703-S4 (PSK):** parameterize psk2 end-to-end (C3).
 5. **#1703-S5 (timers + keepalive + empty-record):** persistent-keepalive emit
    + REKEY/REJECT-AFTER-TIME + endpoint DDNS re-resolve/roam (D2/D3) AND accept
@@ -458,18 +467,24 @@ S2 is the critical path; S6 is the largest but lowest-risk and lands last.
 - **Stand-in for UniFi:** `wireguard-go` (userspace) or kernel `wg` in a
   network namespace. Byte-identical handshake/parser/MAC/TAI64N to UniFi's
   kernel WG. Generate a keypair with `wg genkey | tee priv | wg pubkey`.
-- **Test 1 (xpf initiator → wg responder):** configure xpf with the wg peer's
-  pubkey + endpoint; assert (a) wg `latest handshake` becomes non-zero, (b) a
-  ping/iperf inner flow round-trips, (c) `wg show` counters increment. Lands in
-  S1 as **xfail** (wg drops the initiation today: no mac1/type/TAI64N). S2's
-  acceptance is flipping it green.
-- **Test 2 (wg initiator → xpf responder):** wg initiates; assert xpf parses
-  msg 1, replies with a valid msg 2 (mac1 over wg's pubkey), and transport
-  flows. Lands in S1 as **xfail** (xpf cannot parse/emit handshake framing
-  today). S2 flips it green.
-- **Test 2b (empty keepalive):** after a session is up, wg sends a keepalive
+Tests split into a HANDSHAKE gate (S2 flips green) and a TRANSPORT-FLOW gate
+(S3 flips green), because completing a handshake and carrying data on the real
+AF_XDP hot path are implemented in different sub-issues (Codex r2 finding):
+
+- **Test 1a (xpf initiator handshake → wg responder):** xpf emits a valid msg1
+  (correct type byte, sender_index, `mac1` verifying against wg's pubkey,
+  monotonic TAI64N); assert wg's `latest handshake` becomes non-zero. Lands in
+  S1 as **xfail** (wg drops today: no mac1/type/TAI64N). **S2** flips green.
+- **Test 1b (xpf→wg transport):** ping/iperf inner flow round-trips; `wg show`
+  payload counters increment. xfail until **S3** (real hot-path encap/decap).
+- **Test 2a (wg initiator handshake → xpf responder):** wg initiates; assert
+  xpf parses msg1 and replies with a valid msg2 (mac1 over wg's pubkey, correct
+  receiver_index). xfail until **S2**.
+- **Test 2b (wg→xpf transport):** transport flows through xpf's AF_XDP worker.
+  xfail until **S3**.
+- **Test 2c (empty keepalive):** after a session is up, wg sends a keepalive
   (empty transport record); assert xpf accepts it (no MalformedInner) and
-  updates last-rx. xfail until C4/S5.
+  updates last-rx. xfail until **C4/S5**.
 - **Test 3 (PSK on):** repeat with `PresharedKey` set on both ends; assert
   handshake completes. FAILS today (hardcoded zero PSK).
 - **Test 4 (keepalive/NAT):** xpf behind a NAT netns, 25 s keepalive; assert the
@@ -481,7 +496,8 @@ S2 is the critical path; S6 is the largest but lowest-risk and lands last.
   the WAN path. UniFi hardware optional; if available, a final manual interop
   against a real UniFi Network 10.4+ Gateway closes the issue.
 
-A passing Test 1 + Test 2 against wireguard-go is the definition of "wire
+A passing Test 1a + 2a (handshake, after S2) followed by Test 1b + 2b
+(transport, after S3) against wireguard-go is the definition of "wire
 compliant" and is the minimum bar before any UniFi claim.
 
 ---
