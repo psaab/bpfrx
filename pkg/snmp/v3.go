@@ -834,32 +834,23 @@ func (a *Agent) buildV3Response(msgID int, reqFlags byte, user *usmUser,
 	return wholeMsg
 }
 
-// insertAuthMAC finds the zeroed auth placeholder in a packet and replaces it with the HMAC.
+// insertAuthMAC writes the computed HMAC into the USM
+// msgAuthenticationParameters field of a freshly built SNMPv3 response.
+//
+// It locates the field by USM position via usmAuthParamsRange (the same
+// positional locator zeroAuthParams uses) rather than scanning for the first
+// all-zero OCTET STRING of length truncLen. The old heuristic could land on
+// an earlier all-zero field of the same length -- e.g. an all-zero
+// truncLen-byte engineID or username -- and corrupt it instead of the
+// authParams placeholder (the response-path sibling of #1710). The
+// end-start == len(authMAC) check guards against writing a MAC of the wrong
+// length into a mismatched slot.
 func insertAuthMAC(pkt, authMAC []byte, truncLen int) {
-	for i := 0; i < len(pkt)-truncLen; i++ {
-		if pkt[i] == tagOctetString {
-			length, lenBytes, err := berDecodeLength(pkt[i+1:])
-			if err != nil {
-				continue
-			}
-			if length == truncLen {
-				start := i + 1 + lenBytes
-				if start+truncLen <= len(pkt) {
-					allZero := true
-					for j := start; j < start+truncLen; j++ {
-						if pkt[j] != 0 {
-							allZero = false
-							break
-						}
-					}
-					if allZero {
-						copy(pkt[start:start+truncLen], authMAC)
-						return
-					}
-				}
-			}
-		}
+	start, end, ok := usmAuthParamsRange(pkt)
+	if !ok || end-start != truncLen || end-start != len(authMAC) {
+		return
 	}
+	copy(pkt[start:end], authMAC)
 }
 
 // V3UserInfo returns user info for display (without passwords).

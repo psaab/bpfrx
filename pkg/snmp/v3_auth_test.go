@@ -212,6 +212,58 @@ func TestUsmAuthParamsRange_LocatesField(t *testing.T) {
 	if !ok || s2 != start || e2 != end {
 		t.Fatalf("locator non-deterministic: got %d..%d ok=%v, want %d..%d", s2, e2, ok, start, end)
 	}
+
+	// Independently walk the BER structure (NOT via usmAuthParamsRange) to
+	// derive the authParams offset, so the exact-offset assertion does not
+	// depend on the function under test.
+	wantStart, wantEnd := independentAuthParamsOffset(t, pkt)
+	if wantStart != start || wantEnd != end {
+		t.Fatalf("locator range %d..%d disagrees with independent walk %d..%d", start, end, wantStart, wantEnd)
+	}
+}
+
+// independentAuthParamsOffset computes the authParams value byte range by an
+// independent manual walk of the BER structure, deliberately NOT calling
+// usmAuthParamsRange, so it can cross-check the function under test.
+func independentAuthParamsOffset(t *testing.T, pkt []byte) (start, end int) {
+	t.Helper()
+	hdrLen := func(slice []byte) int {
+		_, lb, err := berDecodeLength(slice[1:])
+		if err != nil {
+			t.Fatalf("berDecodeLength: %v", err)
+		}
+		return 1 + lb
+	}
+	// Outer SEQUENCE.
+	base := hdrLen(pkt)
+	body := pkt[base:]
+	skip := func(slice []byte) int { return berEncodedLen(slice) }
+	// version INTEGER.
+	base += skip(body)
+	body = pkt[base:]
+	// header SEQUENCE.
+	base += skip(body)
+	body = pkt[base:]
+	// secParams OCTET STRING -> descend into its value (the USM SEQUENCE).
+	base += hdrLen(body)
+	body = pkt[base:]
+	// USM SEQUENCE -> descend into its body.
+	base += hdrLen(body)
+	body = pkt[base:]
+	// engineID, boots, time, userName -> skip 4 fields.
+	for i := 0; i < 4; i++ {
+		base += skip(body)
+		body = pkt[base:]
+	}
+	// authParams OCTET STRING -> value range.
+	vh := hdrLen(body)
+	length, _, err := berDecodeLength(body[1:])
+	if err != nil {
+		t.Fatalf("berDecodeLength authParams: %v", err)
+	}
+	start = base + vh
+	end = start + length
+	return start, end
 }
 
 // TestZeroAuthParams_ZeroesOnlyAuthParams confirms zeroAuthParams blanks
@@ -240,6 +292,82 @@ func TestZeroAuthParams_ZeroesOnlyAuthParams(t *testing.T) {
 	// engineID bytes survive.
 	if !bytes.Contains(pkt, engineID) {
 		t.Fatal("engineID was zeroed by zeroAuthParams (bug #1710)")
+	}
+}
+
+// buildV3PlaceholderPacket builds a v3 USM message with the authParams field
+// left as an all-zero placeholder (not yet signed). engineID is used verbatim
+// so a caller can supply an all-zero truncLen-length engineID to exercise the
+// response-path collision that the old insertAuthMAC heuristic was prone to.
+func buildV3PlaceholderPacket(authProto string, userName string, engineID []byte) []byte {
+	truncLen := authTruncLen(authProto)
+	authPlaceholder := make([]byte, truncLen)
+	usmFields := berEncodeTLV(tagOctetString, engineID)
+	usmFields = append(usmFields, berEncodeIntegerTLV(1)...)
+	usmFields = append(usmFields, berEncodeIntegerTLV(2)...)
+	usmFields = append(usmFields, berEncodeTLV(tagOctetString, []byte(userName))...)
+	usmFields = append(usmFields, berEncodeTLV(tagOctetString, authPlaceholder)...)
+	usmFields = append(usmFields, berEncodeTLV(tagOctetString, nil)...)
+	usmOctet := berEncodeTLV(tagOctetString, berEncodeTLV(tagSequence, usmFields))
+
+	hdr := berEncodeIntegerTLV(42)
+	hdr = append(hdr, berEncodeIntegerTLV(maxPacketSize)...)
+	hdr = append(hdr, berEncodeTLV(tagOctetString, []byte{msgFlagAuth})...)
+	hdr = append(hdr, berEncodeIntegerTLV(usmSecurityModel)...)
+	hdrSeq := berEncodeTLV(tagSequence, hdr)
+
+	scopedBody := berEncodeTLV(tagOctetString, engineID)
+	scopedBody = append(scopedBody, berEncodeTLV(tagOctetString, nil)...)
+	scopedBody = append(scopedBody, berEncodeTLV(0xA2, nil)...) // GetResponse PDU, empty
+	scopedPDU := berEncodeTLV(tagSequence, scopedBody)
+
+	msgBody := berEncodeIntegerTLV(snmpVersion3)
+	msgBody = append(msgBody, hdrSeq...)
+	msgBody = append(msgBody, usmOctet...)
+	msgBody = append(msgBody, scopedPDU...)
+	return berEncodeTLV(tagSequence, msgBody)
+}
+
+// TestInsertAuthMAC_TargetsAuthParams confirms insertAuthMAC writes the MAC
+// into the authParams field located by position, even when an earlier field
+// (an all-zero truncLen-length engineID) would have matched the old all-zero
+// length heuristic first — the response-path sibling of #1710.
+func TestInsertAuthMAC_TargetsAuthParams(t *testing.T) {
+	authProto := "sha"
+	truncLen := authTruncLen(authProto) // 12
+	// engineID of exactly truncLen all-zero bytes: a decoy the OLD heuristic
+	// would have matched (all-zero, length 12) before authParams.
+	engineID := make([]byte, truncLen)
+	pkt := buildV3PlaceholderPacket(authProto, "user", engineID)
+
+	start, end, ok := usmAuthParamsRange(pkt)
+	if !ok {
+		t.Fatal("locator failed on placeholder packet")
+	}
+
+	mac := bytes.Repeat([]byte{0x5A}, truncLen)
+	insertAuthMAC(pkt, mac, truncLen)
+
+	// The MAC must land in authParams.
+	if !bytes.Equal(pkt[start:end], mac) {
+		t.Fatalf("authParams not set to MAC; got %x", pkt[start:end])
+	}
+	// The all-zero engineID decoy must NOT have received the MAC: it precedes
+	// authParams, so if the old heuristic ran it would be 0x5A here.
+	idx := bytes.Index(pkt, mac)
+	if idx != start {
+		t.Fatalf("MAC found at offset %d, expected only at authParams start %d (decoy corrupted)", idx, start)
+	}
+}
+
+// TestInsertAuthMAC_WrongLengthNoOp confirms insertAuthMAC refuses to write a
+// MAC whose length does not match the authParams slot.
+func TestInsertAuthMAC_WrongLengthNoOp(t *testing.T) {
+	pkt := buildV3PlaceholderPacket("sha", "user", []byte{0x80, 0x00, 0x1f, 0x88})
+	before := append([]byte{}, pkt...)
+	insertAuthMAC(pkt, bytes.Repeat([]byte{0x5A}, 8), 12) // 8 != truncLen 12
+	if !bytes.Equal(before, pkt) {
+		t.Fatal("insertAuthMAC mutated packet with mismatched MAC length")
 	}
 }
 
