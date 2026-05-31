@@ -2,8 +2,11 @@ package grpcapi
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"time"
 
+	"github.com/psaab/xpf/pkg/config"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"github.com/psaab/xpf/pkg/logging"
 )
@@ -68,4 +71,42 @@ func (s *Server) GetEvents(_ context.Context, req *pb.GetEventsRequest) (*pb.Get
 		})
 	}
 	return resp, nil
+}
+
+// --- #1700: residual ShowText branches ---
+
+func (s *Server) showEventOptions(cfg *config.Config, buf *strings.Builder) {
+	if cfg == nil || len(cfg.EventOptions) == 0 {
+		buf.WriteString("No event-options configured\n")
+	} else {
+		for _, ep := range cfg.EventOptions {
+			fmt.Fprintf(buf, "Policy: %s\n", ep.Name)
+			if len(ep.Events) > 0 {
+				fmt.Fprintf(buf, "  Events: %s\n", strings.Join(ep.Events, ", "))
+			}
+			for _, w := range ep.WithinClauses {
+				fmt.Fprintf(buf, "  Within: %d seconds", w.Seconds)
+				if w.TriggerOn > 0 {
+					fmt.Fprintf(buf, ", trigger on %d", w.TriggerOn)
+				}
+				if w.TriggerUntil > 0 {
+					fmt.Fprintf(buf, ", trigger until %d", w.TriggerUntil)
+				}
+				buf.WriteString("\n")
+			}
+			if len(ep.AttributesMatch) > 0 {
+				buf.WriteString("  Attributes match:\n")
+				for _, am := range ep.AttributesMatch {
+					fmt.Fprintf(buf, "    %s\n", am)
+				}
+			}
+			if len(ep.ThenCommands) > 0 {
+				buf.WriteString("  Then commands:\n")
+				for _, cmd := range ep.ThenCommands {
+					fmt.Fprintf(buf, "    %s\n", cmd)
+				}
+			}
+			buf.WriteString("\n")
+		}
+	}
 }

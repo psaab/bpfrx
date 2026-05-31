@@ -23,11 +23,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -301,6 +304,236 @@ func (s *Server) showSystemSyslog(buf *strings.Builder) {
 		fmt.Fprintln(buf, "Syslog users:")
 		for _, u := range sys.Users {
 			fmt.Fprintf(buf, "  %-20s %s %s\n", u.User, u.Facility, u.Severity)
+		}
+	}
+}
+
+// --- #1700: residual ShowText branches ---
+
+func (s *Server) showLogin(cfg *config.Config, buf *strings.Builder) {
+	if cfg == nil || cfg.System.Login == nil || len(cfg.System.Login.Users) == 0 {
+		buf.WriteString("No login users configured\n")
+	} else {
+		fmt.Fprintf(buf, "%-16s %-6s %-14s %s\n", "User", "UID", "Class", "SSH Keys")
+		for _, u := range cfg.System.Login.Users {
+			uid := "-"
+			if u.UID > 0 {
+				uid = strconv.Itoa(u.UID)
+			}
+			class := u.Class
+			if class == "" {
+				class = "-"
+			}
+			keys := strconv.Itoa(len(u.SSHKeys))
+			fmt.Fprintf(buf, "%-16s %-6s %-14s %s\n", u.Name, uid, class, keys)
+		}
+	}
+}
+
+func (s *Server) showInternetOptions(cfg *config.Config, buf *strings.Builder) {
+	if cfg == nil || cfg.System.InternetOptions == nil {
+		buf.WriteString("No internet-options configured\n")
+	} else {
+		io := cfg.System.InternetOptions
+		buf.WriteString("Internet options:\n")
+		fmt.Fprintf(buf, "  no-ipv6-reject-zero-hop-limit: %s\n", boolStatus(io.NoIPv6RejectZeroHopLimit))
+	}
+}
+
+func (s *Server) showRootAuthentication(cfg *config.Config, buf *strings.Builder) {
+	if cfg == nil || cfg.System.RootAuthentication == nil {
+		buf.WriteString("No root authentication configured\n")
+	} else {
+		ra := cfg.System.RootAuthentication
+		if ra.EncryptedPassword != "" {
+			buf.WriteString("Root password: configured (encrypted)\n")
+		}
+		if len(ra.SSHKeys) > 0 {
+			fmt.Fprintf(buf, "Root SSH keys: %d\n", len(ra.SSHKeys))
+			for _, key := range ra.SSHKeys {
+				// Show key type and fingerprint prefix
+				parts := strings.Fields(key)
+				if len(parts) >= 2 {
+					comment := ""
+					if len(parts) >= 3 {
+						comment = " " + parts[2]
+					}
+					fmt.Fprintf(buf, "  %s%s\n", parts[0], comment)
+				}
+			}
+		}
+	}
+}
+
+func (s *Server) showCoreDumps(cfg *config.Config, buf *strings.Builder) {
+	dirs := []string{"/var/crash", "/var/lib/systemd/coredump"}
+	var found bool
+	for _, dir := range dirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			if !found {
+				fmt.Fprintf(buf, "%-40s %-20s %10s\n", "Name", "Date", "Size")
+				found = true
+			}
+			fmt.Fprintf(buf, "%-40s %-20s %10d\n", e.Name(), info.ModTime().Format("2006-01-02 15:04:05"), info.Size())
+		}
+	}
+	if !found {
+		buf.WriteString("No core dumps found\n")
+	}
+}
+
+func (s *Server) showTask(cfg *config.Config, buf *strings.Builder) {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	uptime := time.Since(s.startTime).Truncate(time.Second)
+	buf.WriteString("Task: xpfd daemon\n")
+	fmt.Fprintf(buf, "  Goroutines: %d\n", runtime.NumGoroutine())
+	fmt.Fprintf(buf, "  Memory allocated: %.1f MB\n", float64(m.Alloc)/1024/1024)
+	fmt.Fprintf(buf, "  System memory: %.1f MB\n", float64(m.Sys)/1024/1024)
+	fmt.Fprintf(buf, "  GC cycles: %d\n", m.NumGC)
+	fmt.Fprintf(buf, "  Uptime: %s\n", uptime)
+}
+
+func (s *Server) showBuffers(cfg *config.Config, buf *strings.Builder) {
+	if s.dp != nil {
+		if provider, ok := s.dp.(userspaceStatusProvider); ok {
+			status, err := provider.Status()
+			if err != nil {
+				fmt.Fprintf(buf, "Userspace buffer metrics unavailable: %v\n", err)
+			} else {
+				buf.WriteString(dpuserspace.FormatSystemBuffers(status, false))
+				v4, v6 := s.dp.SessionCount()
+				if v4 > 0 || v6 > 0 {
+					fmt.Fprintf(buf, "\nActive sessions: %d IPv4, %d IPv6, %d total\n", v4, v6, v4+v6)
+				}
+			}
+		} else {
+			stats := s.dp.GetMapStats()
+			if len(stats) == 0 {
+				buf.WriteString("No BPF maps available\n")
+			} else {
+				fmt.Fprintf(buf, "%-24s %-14s %10s %10s %8s %s\n", "Map", "Type", "Max", "Used", "Usage%", "Status")
+				buf.WriteString(strings.Repeat("-", 78) + "\n")
+				var warnings int
+				for _, st := range stats {
+					usage := "-"
+					used := "-"
+					sts := ""
+					if st.Type != "Array" && st.Type != "PerCPUArray" {
+						used = fmt.Sprintf("%d", st.UsedCount)
+						if st.MaxEntries > 0 {
+							pct := float64(st.UsedCount) / float64(st.MaxEntries) * 100
+							usage = fmt.Sprintf("%.1f%%", pct)
+							if pct >= 90 {
+								sts = "CRITICAL"
+								warnings++
+							} else if pct >= 80 {
+								sts = "WARNING"
+								warnings++
+							}
+						}
+					}
+					fmt.Fprintf(buf, "%-24s %-14s %10d %10s %8s %s\n", st.Name, st.Type, st.MaxEntries, used, usage, sts)
+				}
+				if warnings > 0 {
+					fmt.Fprintf(buf, "\n%d map(s) at high utilization — consider increasing max_entries\n", warnings)
+				}
+			}
+			v4, v6 := s.dp.SessionCount()
+			if v4 > 0 || v6 > 0 {
+				fmt.Fprintf(buf, "\nActive sessions: %d IPv4, %d IPv6, %d total\n", v4, v6, v4+v6)
+			}
+		}
+	} else {
+		buf.WriteString("Dataplane not loaded\n")
+	}
+}
+
+func (s *Server) showBuffersDetail(cfg *config.Config, buf *strings.Builder) {
+	if s.dp != nil {
+		if provider, ok := s.dp.(userspaceStatusProvider); ok {
+			status, err := provider.Status()
+			if err != nil {
+				fmt.Fprintf(buf, "Userspace buffer metrics unavailable: %v\n", err)
+			} else {
+				buf.WriteString(dpuserspace.FormatSystemBuffers(status, true))
+				v4, v6 := s.dp.SessionCount()
+				if v4 > 0 || v6 > 0 {
+					fmt.Fprintf(buf, "\nActive sessions: %d IPv4, %d IPv6, %d total\n", v4, v6, v4+v6)
+				}
+			}
+		} else {
+			stats := s.dp.GetMapStats()
+			if len(stats) == 0 {
+				buf.WriteString("No BPF maps available\n")
+			} else {
+				type mapDetail struct {
+					name      string
+					mapType   string
+					max       uint32
+					used      uint32
+					keySize   uint32
+					valueSize uint32
+					pct       float64
+				}
+				var details []mapDetail
+				for _, st := range stats {
+					if st.Type == "Array" || st.Type == "PerCPUArray" {
+						continue
+					}
+					pct := float64(0)
+					if st.MaxEntries > 0 {
+						pct = float64(st.UsedCount) / float64(st.MaxEntries) * 100
+					}
+					details = append(details, mapDetail{
+						name: st.Name, mapType: st.Type, max: st.MaxEntries,
+						used: st.UsedCount, keySize: st.KeySize, valueSize: st.ValueSize, pct: pct,
+					})
+				}
+				sort.Slice(details, func(i, j int) bool {
+					return details[i].pct > details[j].pct
+				})
+				buf.WriteString("BPF Map Details (sorted by utilization):\n\n")
+				for _, d := range details {
+					sts := "OK"
+					if d.pct >= 90 {
+						sts = "CRITICAL"
+					} else if d.pct >= 80 {
+						sts = "WARNING"
+					}
+					fmt.Fprintf(buf, "Map: %s\n", d.name)
+					fmt.Fprintf(buf, "  Type: %s, Max: %d, Used: %d, Usage: %.1f%%\n", d.mapType, d.max, d.used, d.pct)
+					fmt.Fprintf(buf, "  Key size: %d bytes, Value size: %d bytes\n", d.keySize, d.valueSize)
+					fmt.Fprintf(buf, "  Status: %s\n\n", sts)
+				}
+			}
+			v4, v6 := s.dp.SessionCount()
+			if v4 > 0 || v6 > 0 {
+				fmt.Fprintf(buf, "Active sessions: %d IPv4, %d IPv6, %d total\n", v4, v6, v4+v6)
+			}
+		}
+	} else {
+		buf.WriteString("Dataplane not loaded\n")
+	}
+}
+
+func (s *Server) showBackupRouter(cfg *config.Config, buf *strings.Builder) {
+	if cfg == nil || cfg.System.BackupRouter == "" {
+		buf.WriteString("No backup router configured\n")
+	} else {
+		fmt.Fprintf(buf, "Backup router: %s\n", cfg.System.BackupRouter)
+		if cfg.System.BackupRouterDst != "" {
+			fmt.Fprintf(buf, "  Destination: %s\n", cfg.System.BackupRouterDst)
+		} else {
+			buf.WriteString("  Destination: 0.0.0.0/0 (default)\n")
 		}
 	}
 }

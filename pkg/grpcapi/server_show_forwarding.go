@@ -3,8 +3,10 @@ package grpcapi
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/psaab/xpf/pkg/config"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/fwdstatus"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
@@ -86,4 +88,87 @@ func (s *Server) dialAndShowForwarding(ctx context.Context) (string, error) {
 		return "", err
 	}
 	return resp.Output, nil
+}
+
+// --- #1700: residual ShowText branches ---
+
+func (s *Server) showForwardingOptions(cfg *config.Config, buf *strings.Builder) {
+	if cfg == nil {
+		buf.WriteString("No active configuration\n")
+	} else {
+		fo := &cfg.ForwardingOptions
+		hasContent := false
+		if fo.FamilyInet6Mode != "" {
+			fmt.Fprintf(buf, "Family inet6 mode: %s\n", fo.FamilyInet6Mode)
+			hasContent = true
+		}
+		if fo.Sampling != nil && len(fo.Sampling.Instances) > 0 {
+			buf.WriteString("Sampling:\n")
+			for name, inst := range fo.Sampling.Instances {
+				fmt.Fprintf(buf, "  Instance: %s\n", name)
+				if inst.InputRate > 0 {
+					fmt.Fprintf(buf, "    Input rate: 1/%d\n", inst.InputRate)
+				}
+				for _, fam := range []*config.SamplingFamily{inst.FamilyInet, inst.FamilyInet6} {
+					if fam == nil {
+						continue
+					}
+					for _, fs := range fam.FlowServers {
+						fmt.Fprintf(buf, "    Flow server: %s:%d\n", fs.Address, fs.Port)
+						if fs.Version9Template != "" {
+							fmt.Fprintf(buf, "      Version 9 template: %s\n", fs.Version9Template)
+						}
+					}
+					if fam.SourceAddress != "" {
+						fmt.Fprintf(buf, "    Source address: %s\n", fam.SourceAddress)
+					}
+					if fam.InlineJflow {
+						buf.WriteString("    Inline jflow: enabled\n")
+					}
+					if fam.InlineJflowSourceAddress != "" {
+						fmt.Fprintf(buf, "    Inline jflow source: %s\n", fam.InlineJflowSourceAddress)
+					}
+				}
+			}
+			hasContent = true
+		}
+		if fo.DHCPRelay != nil {
+			buf.WriteString("DHCP relay: (see 'show dhcp-relay' for details)\n")
+			hasContent = true
+		}
+		if fo.PortMirroring != nil && len(fo.PortMirroring.Instances) > 0 {
+			buf.WriteString("Port mirroring: (see 'show forwarding-options port-mirroring' for details)\n")
+			hasContent = true
+		}
+		if !hasContent {
+			buf.WriteString("No forwarding-options configured\n")
+		}
+	}
+}
+
+func (s *Server) showForwardingOptionsPortMirroring(cfg *config.Config, buf *strings.Builder) {
+	if cfg == nil {
+		buf.WriteString("No active configuration\n")
+	} else {
+		pm := cfg.ForwardingOptions.PortMirroring
+		if pm == nil || len(pm.Instances) == 0 {
+			buf.WriteString("No port-mirroring instances configured\n")
+		} else {
+			for name, inst := range pm.Instances {
+				fmt.Fprintf(buf, "Instance: %s\n", name)
+				if inst.InputRate > 0 {
+					fmt.Fprintf(buf, "  Input rate: 1/%d\n", inst.InputRate)
+				} else {
+					buf.WriteString("  Input rate: all packets\n")
+				}
+				if len(inst.Input) > 0 {
+					fmt.Fprintf(buf, "  Input interfaces: %s\n", strings.Join(inst.Input, ", "))
+				}
+				if inst.Output != "" {
+					fmt.Fprintf(buf, "  Output interface: %s\n", inst.Output)
+				}
+				buf.WriteString("\n")
+			}
+		}
+	}
 }

@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
+	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
 
 // showZonesDetail renders per-zone configuration plus dataplane traffic
@@ -177,4 +178,54 @@ func (s *Server) showZonesDetail(cfg *config.Config, buf *strings.Builder) {
 		}
 		buf.WriteString("\n")
 	}
+}
+
+// --- #1700: residual ShowText branches ---
+
+func (s *Server) showTestZone(req *pb.ShowTextRequest, cfg *config.Config, buf *strings.Builder) (*pb.ShowTextResponse, error) {
+	params := strings.TrimPrefix(req.Topic, "test-zone:")
+	var ifName string
+	for _, kv := range strings.Split(params, ",") {
+		parts := strings.SplitN(kv, "=", 2)
+		if len(parts) == 2 && parts[0] == "interface" {
+			ifName = parts[1]
+		}
+	}
+	if cfg == nil {
+		buf.WriteString("No active configuration\n")
+	} else if ifName == "" {
+		buf.WriteString("Missing interface parameter\n")
+	} else {
+		found := false
+		for zoneName, zone := range cfg.Security.Zones {
+			for _, iface := range zone.Interfaces {
+				if iface == ifName {
+					fmt.Fprintf(buf, "Interface %s belongs to zone: %s\n", ifName, zoneName)
+					if zone.Description != "" {
+						fmt.Fprintf(buf, "  Description: %s\n", zone.Description)
+					}
+					if zone.ScreenProfile != "" {
+						fmt.Fprintf(buf, "  Screen:      %s\n", zone.ScreenProfile)
+					}
+					if zone.HostInboundTraffic != nil {
+						if len(zone.HostInboundTraffic.SystemServices) > 0 {
+							fmt.Fprintf(buf, "  Host-inbound services: %s\n", strings.Join(zone.HostInboundTraffic.SystemServices, ", "))
+						}
+						if len(zone.HostInboundTraffic.Protocols) > 0 {
+							fmt.Fprintf(buf, "  Host-inbound protocols: %s\n", strings.Join(zone.HostInboundTraffic.Protocols, ", "))
+						}
+					}
+					found = true
+					break
+				}
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			fmt.Fprintf(buf, "Interface %s is not assigned to any security zone\n", ifName)
+		}
+	}
+	return &pb.ShowTextResponse{Output: buf.String()}, nil
 }

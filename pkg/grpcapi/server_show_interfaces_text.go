@@ -22,6 +22,8 @@ import (
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"github.com/vishvananda/netlink"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -262,4 +264,116 @@ func (s *Server) showInterfacesStatistics(buf *strings.Builder) error {
 			st.RxErrors, st.TxErrors)
 	}
 	return nil
+}
+
+// --- #1700: residual ShowText branches ---
+
+func (s *Server) showClassOfService(req *pb.ShowTextRequest, cfg *config.Config, buf *strings.Builder) (*pb.ShowTextResponse, error) {
+	selector := ""
+	if strings.HasPrefix(req.Topic, "class-of-service:") {
+		selector = strings.TrimPrefix(req.Topic, "class-of-service:")
+	}
+	var status *dpuserspace.ProcessStatus
+	if userspaceStatus, err := s.userspaceDataplaneStatus(); err == nil {
+		status = &userspaceStatus
+	}
+	buf.WriteString(dpuserspace.FormatCoSInterfaceSummary(cfg, status, selector))
+	return &pb.ShowTextResponse{Output: buf.String()}, nil
+}
+
+func (s *Server) showVLANs(cfg *config.Config, buf *strings.Builder) {
+	if cfg == nil || len(cfg.Interfaces.Interfaces) == 0 {
+		buf.WriteString("No VLANs configured\n")
+	} else {
+		ifZone := make(map[string]string)
+		for zoneName, zone := range cfg.Security.Zones {
+			for _, iface := range zone.Interfaces {
+				ifZone[iface] = zoneName
+			}
+		}
+		type vlanEntry struct {
+			iface  string
+			unit   int
+			vlanID int
+			zone   string
+			trunk  bool
+		}
+		var entries []vlanEntry
+		for _, ifc := range cfg.Interfaces.Interfaces {
+			for unitNum, unit := range ifc.Units {
+				if unit.VlanID > 0 || ifc.VlanTagging {
+					entries = append(entries, vlanEntry{
+						iface:  ifc.Name,
+						unit:   unitNum,
+						vlanID: unit.VlanID,
+						zone:   ifZone[ifc.Name],
+						trunk:  ifc.VlanTagging,
+					})
+				}
+			}
+		}
+		if len(entries) == 0 {
+			buf.WriteString("No VLANs configured\n")
+		} else {
+			sort.Slice(entries, func(i, j int) bool {
+				if entries[i].iface != entries[j].iface {
+					return entries[i].iface < entries[j].iface
+				}
+				return entries[i].unit < entries[j].unit
+			})
+			fmt.Fprintf(buf, "%-16s %-6s %-8s %-12s %s\n", "Interface", "Unit", "VLAN ID", "Zone", "Mode")
+			for _, e := range entries {
+				mode := "access"
+				if e.trunk {
+					mode = "trunk"
+				}
+				vid := fmt.Sprintf("%d", e.vlanID)
+				if e.vlanID == 0 {
+					vid = "native"
+				}
+				fmt.Fprintf(buf, "%-16s %-6d %-8s %-12s %s\n", e.iface, e.unit, vid, e.zone, mode)
+			}
+		}
+	}
+}
+
+func (s *Server) showIPv6RouterAdvertisement(cfg *config.Config, buf *strings.Builder) {
+	if s.raMgr == nil {
+		fmt.Fprintln(buf, "Router Advertisements: not available")
+	} else {
+		senders := s.raMgr.Status()
+		if len(senders) == 0 {
+			fmt.Fprintln(buf, "Router Advertisements: no active senders")
+		} else {
+			fmt.Fprintf(buf, "Router Advertisement: %d active sender(s)\n\n", len(senders))
+			for _, info := range senders {
+				fmt.Fprintf(buf, "Interface: %s\n", info.Interface)
+				fmt.Fprintf(buf, "  Source address:     %s\n", info.SrcAddr)
+				fmt.Fprintf(buf, "  Router lifetime:    %ds\n", info.Lifetime)
+				fmt.Fprintf(buf, "  Preference:         %s\n", info.Preference)
+				fmt.Fprintf(buf, "  Max RA interval:    %ds\n", info.MaxInterval)
+				fmt.Fprintf(buf, "  Min RA interval:    %ds\n", info.MinInterval)
+				if info.Managed {
+					fmt.Fprintln(buf, "  Managed flag:       on")
+				}
+				if info.Other {
+					fmt.Fprintln(buf, "  Other config flag:  on")
+				}
+				if info.LinkMTU > 0 {
+					fmt.Fprintf(buf, "  Link MTU:           %d\n", info.LinkMTU)
+				}
+				for _, pfx := range info.Prefixes {
+					fmt.Fprintf(buf, "  Prefix:             %s\n", pfx)
+				}
+				if len(info.DNSServers) > 0 {
+					fmt.Fprintf(buf, "  DNS servers:        %s\n", strings.Join(info.DNSServers, ", "))
+				}
+				if info.NAT64Prefix != "" {
+					fmt.Fprintf(buf, "  PREF64:             %s\n", info.NAT64Prefix)
+				}
+				fmt.Fprintf(buf, "  Last RA sent:       %s\n", info.LastRA)
+				fmt.Fprintln(buf)
+			}
+		}
+	}
 }
