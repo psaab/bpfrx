@@ -6,6 +6,16 @@ import (
 	"testing"
 )
 
+func authTestEngineID(engineID []byte, longForm bool) []byte {
+	engineID = append([]byte{}, engineID...)
+	if !longForm {
+		return engineID
+	}
+	// Pad the engineID so the USM sequence (and its OCTET STRING wrapper)
+	// exceed 127 bytes, forcing long-form BER length encoding.
+	return append(engineID, bytes.Repeat([]byte{0xAB}, 200)...)
+}
+
 // buildV3AuthPacket constructs a complete SNMPv3 authNoPriv message for the
 // given user/engine parameters and returns the on-wire bytes together with
 // the byte range of the (real) msgAuthenticationParameters value. The
@@ -25,11 +35,7 @@ func buildV3AuthPacket(t *testing.T, authProto string, userName string, engineID
 	}
 	truncLen := authTruncLen(authProto)
 
-	if longForm {
-		// Pad the engineID so the USM sequence (and its OCTET STRING wrapper)
-		// exceed 127 bytes, forcing long-form BER length encoding.
-		engineID = append(append([]byte{}, engineID...), bytes.Repeat([]byte{0xAB}, 200)...)
-	}
+	engineID = authTestEngineID(engineID, longForm)
 
 	// USM security parameters with a zeroed authParams placeholder.
 	authPlaceholder := make([]byte, truncLen)
@@ -85,6 +91,7 @@ func buildV3AuthPacket(t *testing.T, authProto string, userName string, engineID
 // built by buildV3AuthPacket.
 func runVerify(t *testing.T, authProto, userName string, engineID []byte, longForm bool) bool {
 	t.Helper()
+	engineID = authTestEngineID(engineID, longForm)
 	hashFn, hashLen := authHashFunc(authProto)
 	authKey := passwordToKey("the-auth-password-1234", engineID, hashFn, hashLen)
 	if authKey == nil {
