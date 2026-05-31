@@ -8,7 +8,7 @@
 //     backup-router, cluster-mode defaults, ECMP).
 //   - policy_render.go:  Protocols + policy rendering (OSPF/OSPFv3/BGP/RIP/
 //     ISIS, policy-options, redistribute, BFD profile
-//     dedup, ifaceNetwork helper).
+//     dedup).
 //   - vtysh.go:          frrExecutor interface + realExecutor + thin raw
 //     Get* shells.
 //   - status_parse.go:   Parsed Get* methods + their public types +
