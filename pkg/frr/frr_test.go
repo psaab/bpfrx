@@ -139,14 +139,81 @@ func TestGenerateProtocols_OSPF(t *testing.T) {
 	if !strings.Contains(got, "ospf router-id 1.1.1.1\n") {
 		t.Error("missing router-id")
 	}
-	if !strings.Contains(got, "network 0.0.0.0/0 area 0.0.0.0\n") {
-		t.Error("missing network statement")
+	// #1712: OSPFv2 area membership must be rendered per-interface via
+	// "ip ospf area <id>" under "interface <name>", NEVER as a global
+	// "network <prefix> area" catch-all (which matches every IPv4
+	// interface in the VRF). Reject any "network ... area ..." line.
+	if strings.Contains(got, "network 0.0.0.0/0") {
+		t.Errorf("must not emit catch-all 'network 0.0.0.0/0', got:\n%s", got)
+	}
+	if strings.Contains(got, " area ") && strings.Contains(got, " network ") {
+		// Defensive: no "network <x> area <y>" line of any prefix.
+		for _, line := range strings.Split(got, "\n") {
+			ln := strings.TrimSpace(line)
+			if strings.HasPrefix(ln, "network ") && strings.Contains(ln, " area ") {
+				t.Errorf("must not emit 'network ... area ...' activation, got line: %q", ln)
+			}
+		}
+	}
+	if !strings.Contains(got, "interface trust0\n ip ospf area 0.0.0.0\nexit\n") {
+		t.Errorf("missing per-interface 'ip ospf area' activation for trust0, got:\n%s", got)
+	}
+	if !strings.Contains(got, "interface dmz0\n ip ospf area 0.0.0.0\nexit\n") {
+		t.Errorf("missing per-interface 'ip ospf area' activation for dmz0, got:\n%s", got)
 	}
 	if !strings.Contains(got, "passive-interface dmz0\n") {
 		t.Error("missing passive-interface")
 	}
 	if strings.Contains(got, "passive-interface trust0") {
 		t.Error("trust0 should not be passive")
+	}
+}
+
+// TestGenerateProtocols_OSPFTwoAreasUnrelatedIface proves the #1712 fix:
+// with two areas each holding a distinct interface, every interface is
+// activated in its OWN area via a per-interface "ip ospf area" line, no
+// global "network ... area" catch-all is emitted, and an L3 interface
+// that is NOT in any OSPF area (here "untrust0", simply absent from
+// ospf.Areas) is never activated. Under the old "network 0.0.0.0/0 area"
+// rendering, the catch-all would have activated untrust0 too and let
+// render order decide which area trust0/dmz0 landed in.
+func TestGenerateProtocols_OSPFTwoAreasUnrelatedIface(t *testing.T) {
+	m := New()
+	ospf := &config.OSPFConfig{
+		RouterID: "1.1.1.1",
+		Areas: []*config.OSPFArea{
+			{ID: "0.0.0.0", Interfaces: []*config.OSPFInterface{{Name: "trust0"}}},
+			{ID: "0.0.0.1", Interfaces: []*config.OSPFInterface{{Name: "dmz0"}}},
+		},
+	}
+	got := m.generateProtocols(ospf, nil, nil, nil, nil, "", 0, nil)
+
+	// No catch-all of any prefix.
+	if strings.Contains(got, "network 0.0.0.0/0") {
+		t.Errorf("must not emit catch-all 'network 0.0.0.0/0', got:\n%s", got)
+	}
+	for _, line := range strings.Split(got, "\n") {
+		ln := strings.TrimSpace(line)
+		if strings.HasPrefix(ln, "network ") && strings.Contains(ln, " area ") {
+			t.Errorf("must not emit 'network ... area ...' activation, got line: %q", ln)
+		}
+	}
+
+	// Each configured interface activated in its OWN area.
+	if !strings.Contains(got, "interface trust0\n ip ospf area 0.0.0.0\nexit\n") {
+		t.Errorf("trust0 not activated in area 0.0.0.0, got:\n%s", got)
+	}
+	if !strings.Contains(got, "interface dmz0\n ip ospf area 0.0.0.1\nexit\n") {
+		t.Errorf("dmz0 not activated in area 0.0.0.1, got:\n%s", got)
+	}
+
+	// An interface not in any OSPF area must never be activated. Exactly
+	// two "ip ospf area" activation lines should appear (trust0, dmz0).
+	if n := strings.Count(got, "ip ospf area "); n != 2 {
+		t.Errorf("expected exactly 2 'ip ospf area' activations, got %d:\n%s", n, got)
+	}
+	if strings.Contains(got, "untrust0") {
+		t.Errorf("unrelated interface untrust0 must never appear in OSPF config, got:\n%s", got)
 	}
 }
 
