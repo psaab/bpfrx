@@ -36,6 +36,10 @@ snow = "0.10"
 # visibility (verified: cargo tree shows blake2 0.10.6, dalek 4.1.3).
 blake2 = "0.10"
 curve25519-dalek = "4.1"
+# Random WG handshake indices (opaque demux tags). Already transitive via
+# snow/curve25519-dalek at 0.2.x; promoted to a direct dep for the engine's
+# index allocator.
+getrandom = "0.2"
 # zeroize is already pulled transitively by curve25519-dalek/snow; we
 # pin the version we use directly for the engine's static-key state
 # so the WG private key is wiped on engine drop. Cost: zero — just a

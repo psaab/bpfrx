@@ -1388,3 +1388,289 @@ fn established_pair_responder_confirmation_flips_via_decap_path() {
         .try_encap(&init_pub, &reply, &mut wire2)
         .expect("post-confirmation encap must succeed");
 }
+
+// ===================================================================
+// Framed WG handshake — engine integration (#1709 S1)
+//
+// These exercise the full on-wire framed handshake (create_initiation /
+// consume_response / consume_initiation_create_response) BOTH directions
+// between two engines, and assert matching transport keys via a transport
+// record round-trip. This is xpf-against-xpf — a REGRESSION GUARD for the
+// engine integration, NOT the independent-peer interop proof. The live
+// kernel-WireGuard-on-a-VM interop (the byte-compliance proof against an
+// independent reference) is #1703 S2.
+// ===================================================================
+mod framed_handshake {
+    use super::*;
+    use crate::afxdp::wg::engine::HandshakeError;
+    use crate::afxdp::wg::handshake::FramingError;
+    use crate::afxdp::wg::{WG_MSG_INIT_LEN, WG_MSG_RESPONSE_LEN};
+
+    /// Build two engines that know each other's pubkey, allowing the full
+    /// `0.0.0.0/0` so any inner src passes the AllowedIPs gate.
+    fn engine_pair() -> (WgEngine, WgEngine, [u8; 32], [u8; 32]) {
+        let (init_priv, init_pub) = keypair();
+        let (resp_priv, resp_pub) = keypair();
+        let any_v4: Vec<ipnet::IpNet> = vec!["0.0.0.0/0".parse().unwrap()];
+        let init = WgEngine::new(WgEngineConfig {
+            local_private_key: init_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: resp_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: any_v4.clone(),
+            }],
+        });
+        let resp = WgEngine::new(WgEngineConfig {
+            local_private_key: resp_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: init_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: any_v4,
+            }],
+        });
+        (init, resp, init_pub, resp_pub)
+    }
+
+    #[test]
+    fn local_public_key_matches_snow_static() {
+        // The engine derives its local public key via dalek
+        // mul_base_clamped; it MUST equal the public key snow generated for
+        // the same private key (which engine_pair returns as init_pub/
+        // resp_pub from keypair()). A mismatch would mean inbound MAC1
+        // verification keys on the wrong pubkey and every real handshake
+        // would be dropped.
+        let (init, resp, init_pub, resp_pub) = engine_pair();
+        assert_eq!(
+            init.local_public_key(),
+            init_pub,
+            "engine local_public_key must equal snow's static pub for the same private key"
+        );
+        assert_eq!(resp.local_public_key(), resp_pub);
+    }
+
+    /// Full framed handshake, xpf initiator -> xpf responder, then a
+    /// transport record round-trip in BOTH directions proving the derived
+    /// transport keys match.
+    #[test]
+    fn framed_handshake_both_directions_roundtrip() {
+        let (init, resp, init_pub, resp_pub) = engine_pair();
+
+        // 1. Initiator builds msg1.
+        let mut msg1 = [0u8; WG_MSG_INIT_LEN];
+        let init_idx = init.create_initiation(&resp_pub, &mut msg1).unwrap();
+        assert_eq!(init.pending_count(), 1, "initiator holds one pending handshake");
+
+        // 2. Responder consumes msg1, emits msg2, installs its session.
+        let mut msg2 = [0u8; WG_MSG_RESPONSE_LEN];
+        let (recovered_init_pub, resp_idx) =
+            resp.consume_initiation_create_response(&msg1, &mut msg2).unwrap();
+        assert_eq!(recovered_init_pub, init_pub,
+            "responder must recover the initiator's static pubkey from msg1");
+        assert_eq!(resp.pending_count(), 0, "responder completes synchronously");
+
+        // 3. Initiator consumes msg2, installs its session.
+        let installed_idx = init.consume_response(&msg2).unwrap();
+        assert_eq!(installed_idx, init_idx);
+        assert_eq!(init.pending_count(), 0, "initiator handshake promoted");
+
+        // 4. Initiator -> responder transport record (initiator is confirmed
+        //    at install; responder confirms on this first inbound record).
+        let inner = ipv4_packet(Ipv4Addr::new(10, 9, 9, 1), Ipv4Addr::new(10, 9, 9, 2));
+        let mut wire = [0u8; 2048];
+        let enc = init.try_encap(&resp_pub, &inner, &mut wire).unwrap();
+        let mut plain = [0u8; 2048];
+        let dec = resp.try_decap(&wire[..enc.len], &mut plain).unwrap();
+        assert_eq!(&plain[..dec.len], &inner[..], "init->resp inner packet must round-trip");
+        assert_eq!(dec.peer_pubkey, init_pub);
+
+        // 5. Responder -> initiator transport record (responder now confirmed).
+        let reply = ipv4_packet(Ipv4Addr::new(10, 9, 9, 2), Ipv4Addr::new(10, 9, 9, 1));
+        let mut wire2 = [0u8; 2048];
+        let enc2 = resp.try_encap(&init_pub, &reply, &mut wire2).unwrap();
+        let mut plain2 = [0u8; 2048];
+        let dec2 = init.try_decap(&wire2[..enc2.len], &mut plain2).unwrap();
+        assert_eq!(&plain2[..dec2.len], &reply[..], "resp->init inner packet must round-trip");
+        assert_eq!(dec2.peer_pubkey, resp_pub);
+
+        // Indices are distinct (each side chose its own).
+        assert_ne!(init_idx, resp_idx);
+    }
+
+    /// msg1's mac1 keys on the RESPONDER's pubkey; a responder configured
+    /// with a different identity rejects it with Mac1Mismatch.
+    #[test]
+    fn responder_rejects_initiation_with_wrong_mac1() {
+        let (init, _resp, _init_pub, resp_pub) = engine_pair();
+        let mut msg1 = [0u8; WG_MSG_INIT_LEN];
+        init.create_initiation(&resp_pub, &mut msg1).unwrap();
+
+        // A different responder (different static key) must reject the mac1.
+        let (other_priv, _other_pub) = keypair();
+        let (_init2_priv, init2_pub) = keypair();
+        let other = WgEngine::new(WgEngineConfig {
+            local_private_key: other_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: init2_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+            }],
+        });
+        let mut msg2 = [0u8; WG_MSG_RESPONSE_LEN];
+        let err = other
+            .consume_initiation_create_response(&msg1, &mut msg2)
+            .unwrap_err();
+        assert_eq!(err, HandshakeError::Framing(FramingError::Mac1Mismatch));
+    }
+
+    /// An initiation from a peer the responder does not know (valid mac1
+    /// because it targets the responder's real pubkey, but the initiator
+    /// static is unconfigured) is rejected as UnknownInitiator AFTER the
+    /// Noise read recovers the static key.
+    #[test]
+    fn responder_rejects_unknown_initiator() {
+        let (resp_priv, resp_pub) = keypair();
+        // Responder knows only some OTHER peer, not our initiator.
+        let (_known_priv, known_pub) = keypair();
+        let resp = WgEngine::new(WgEngineConfig {
+            local_private_key: resp_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: known_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+            }],
+        });
+        // A stranger initiator that targets the real responder pubkey.
+        let (stranger_priv, _stranger_pub) = keypair();
+        let stranger = WgEngine::new(WgEngineConfig {
+            local_private_key: stranger_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: resp_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+            }],
+        });
+        let mut msg1 = [0u8; WG_MSG_INIT_LEN];
+        stranger.create_initiation(&resp_pub, &mut msg1).unwrap();
+        let mut msg2 = [0u8; WG_MSG_RESPONSE_LEN];
+        let err = resp
+            .consume_initiation_create_response(&msg1, &mut msg2)
+            .unwrap_err();
+        assert_eq!(err, HandshakeError::UnknownInitiator);
+    }
+
+    /// consume_response with a receiver_index that matches no pending
+    /// reservation is rejected as NoPendingHandshake (stale/spoofed msg2).
+    #[test]
+    fn consume_response_no_pending_is_rejected() {
+        let (init, resp, _init_pub, resp_pub) = engine_pair();
+        // Drive a full handshake so we have a VALID msg2, then replay it: the
+        // first consume promotes + clears the reservation; the second finds
+        // no pending entry.
+        let mut msg1 = [0u8; WG_MSG_INIT_LEN];
+        init.create_initiation(&resp_pub, &mut msg1).unwrap();
+        let mut msg2 = [0u8; WG_MSG_RESPONSE_LEN];
+        resp.consume_initiation_create_response(&msg1, &mut msg2).unwrap();
+        init.consume_response(&msg2).unwrap();
+        // Replay msg2 — reservation already promoted/cleared.
+        let err = init.consume_response(&msg2).unwrap_err();
+        assert_eq!(err, HandshakeError::NoPendingHandshake);
+    }
+
+    /// create_initiation toward an unconfigured peer is UnknownPeer and
+    /// leaves no pending reservation.
+    #[test]
+    fn create_initiation_unknown_peer() {
+        let (init, _resp, _init_pub, _resp_pub) = engine_pair();
+        let (_x_priv, x_pub) = keypair();
+        let mut msg1 = [0u8; WG_MSG_INIT_LEN];
+        let err = init.create_initiation(&x_pub, &mut msg1).unwrap_err();
+        assert_eq!(err, HandshakeError::UnknownPeer);
+        assert_eq!(init.pending_count(), 0);
+    }
+
+    /// At-most-one-pending-per-peer: a SECOND create_initiation toward the
+    /// same peer aborts the first reservation (pending stays at 1, not 2).
+    /// The first msg1's reservation is gone, so consuming a response to it
+    /// would fail — only the latest handshake survives.
+    #[test]
+    fn at_most_one_pending_per_peer() {
+        let (init, resp, _init_pub, resp_pub) = engine_pair();
+        let mut msg1_a = [0u8; WG_MSG_INIT_LEN];
+        let idx_a = init.create_initiation(&resp_pub, &mut msg1_a).unwrap();
+        assert_eq!(init.pending_count(), 1);
+
+        let mut msg1_b = [0u8; WG_MSG_INIT_LEN];
+        let idx_b = init.create_initiation(&resp_pub, &mut msg1_b).unwrap();
+        assert_ne!(idx_a, idx_b, "second handshake gets a fresh index");
+        assert_eq!(init.pending_count(), 1, "per-peer cap: only the latest pending survives");
+
+        // The responder answers the SECOND msg1; the initiator can complete
+        // it (its reservation survived).
+        let mut msg2_b = [0u8; WG_MSG_RESPONSE_LEN];
+        resp.consume_initiation_create_response(&msg1_b, &mut msg2_b).unwrap();
+        assert_eq!(init.consume_response(&msg2_b).unwrap(), idx_b);
+
+        // A response to the FIRST (aborted) handshake has no reservation.
+        // Build it by having a fresh responder answer msg1_a, then feeding
+        // the initiator that msg2 — its idx_a reservation was aborted.
+        let (init2, resp2, _ip2, rp2) = engine_pair();
+        let mut m1 = [0u8; WG_MSG_INIT_LEN];
+        let first = init2.create_initiation(&rp2, &mut m1).unwrap();
+        let mut m1b = [0u8; WG_MSG_INIT_LEN];
+        init2.create_initiation(&rp2, &mut m1b).unwrap(); // aborts `first`
+        let mut m2 = [0u8; WG_MSG_RESPONSE_LEN];
+        resp2.consume_initiation_create_response(&m1, &mut m2).unwrap();
+        // m2's receiver_index echoes `first`, which is no longer pending.
+        let _ = first;
+        assert_eq!(
+            init2.consume_response(&m2).unwrap_err(),
+            HandshakeError::NoPendingHandshake,
+            "a response to an aborted (superseded) reservation must be dropped"
+        );
+    }
+
+    /// Reserve-before-send + promote: after a completed handshake BOTH
+    /// sessions are live + demuxable on their reserved indices — a record
+    /// the initiator sends decaps at the responder, and a record the
+    /// responder sends decaps at the initiator. Exercising both promoted
+    /// reservations proves the two-phase reserve→promote installs the demux
+    /// entries correctly.
+    #[test]
+    fn reserve_before_send_then_promote() {
+        let (init, resp, init_pub, resp_pub) = engine_pair();
+        let mut msg1 = [0u8; WG_MSG_INIT_LEN];
+        init.create_initiation(&resp_pub, &mut msg1).unwrap();
+        let mut msg2 = [0u8; WG_MSG_RESPONSE_LEN];
+        resp.consume_initiation_create_response(&msg1, &mut msg2).unwrap();
+        init.consume_response(&msg2).unwrap();
+        assert_eq!(init.pending_count(), 0);
+        assert_eq!(resp.pending_count(), 0);
+
+        // init -> resp: decaps at the responder via its promoted index and
+        // confirms the (initially unconfirmed) responder session.
+        let fwd = ipv4_packet(Ipv4Addr::new(10, 9, 9, 1), Ipv4Addr::new(10, 9, 9, 2));
+        let mut w = [0u8; 2048];
+        let e = init.try_encap(&resp_pub, &fwd, &mut w).unwrap();
+        let mut p = [0u8; 2048];
+        let d = resp.try_decap(&w[..e.len], &mut p).unwrap();
+        assert_eq!(d.peer_pubkey, init_pub);
+
+        // resp -> init: decaps at the initiator via its promoted index.
+        let reply = ipv4_packet(Ipv4Addr::new(10, 9, 9, 2), Ipv4Addr::new(10, 9, 9, 1));
+        let mut w2 = [0u8; 2048];
+        let e2 = resp.try_encap(&init_pub, &reply, &mut w2).unwrap();
+        let mut p2 = [0u8; 2048];
+        let d2 = init.try_decap(&w2[..e2.len], &mut p2).unwrap();
+        assert_eq!(d2.peer_pubkey, resp_pub);
+    }
+}
