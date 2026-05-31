@@ -19,7 +19,6 @@ import (
 // by *netlink.Handle in production; tests substitute a fake.
 type linkOps interface {
 	LinkByName(name string) (netlink.Link, error)
-	LinkByIndex(index int) (netlink.Link, error)
 	LinkAdd(netlink.Link) error
 	LinkDel(netlink.Link) error
 	LinkSetUp(netlink.Link) error
