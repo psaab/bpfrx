@@ -10,3 +10,4 @@
 [WATCH]      1652  cmd/cli/show.go
 [WATCH]      1617  pkg/dataplane/userspace/maps_sync.go
 [WATCH]      1520  userspace-dp/src/afxdp/coordinator/mod.rs
+[WATCH]      1502  pkg/config/compiler.go
