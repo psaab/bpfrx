@@ -94,8 +94,12 @@ const _: () = assert!(M2_MAC2 + WG_MAC_LEN == WG_MSG_RESPONSE_LEN);
 /// path counts them); a malformed or unauthenticated message is dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FramingError {
-    /// Buffer shorter than the fixed message length.
-    TooShort,
+    /// The datagram length is not EXACTLY the fixed message size. WG
+    /// handshake messages are fixed-length (148 / 92 bytes); kernel WG and
+    /// wireguard-go reject `len != MessageInitiationSize` / `MessageResponseSize`
+    /// outright. We reject both too-short AND too-long (a trailing-garbage
+    /// datagram whose 148/92-byte prefix happens to verify must not parse).
+    WrongLength,
     /// Output buffer too small to hold the framed message.
     OutputTooSmall,
     /// `message_type` byte is not the expected 1 (init) or 2 (response).
@@ -204,7 +208,11 @@ pub(crate) fn parse_initiation<'a>(
     msg: &'a [u8],
     our_static_pub: &[u8; WG_KEY_LEN],
 ) -> Result<ParsedInitiation<'a>, FramingError> {
-    let msg = msg.get(..WG_MSG_INIT_LEN).ok_or(FramingError::TooShort)?;
+    // WG handshake messages are fixed-length; require EXACTLY 148 bytes
+    // (kernel WG / wireguard-go reject any other length).
+    if msg.len() != WG_MSG_INIT_LEN {
+        return Err(FramingError::WrongLength);
+    }
     // WG's message_type is a 32-bit little-endian word: a canonical
     // initiation is exactly 0x00000001, i.e. type byte = 1 AND the three
     // reserved bytes = 0. wireguard-go / kernel WG read the full u32 and
@@ -299,7 +307,9 @@ pub(crate) fn parse_response<'a>(
     msg: &'a [u8],
     our_static_pub: &[u8; WG_KEY_LEN],
 ) -> Result<ParsedResponse<'a>, FramingError> {
-    let msg = msg.get(..WG_MSG_RESPONSE_LEN).ok_or(FramingError::TooShort)?;
+    if msg.len() != WG_MSG_RESPONSE_LEN {
+        return Err(FramingError::WrongLength);
+    }
     // Strict 32-bit LE type word (type byte 2 + zero reserved). See
     // `parse_initiation` / `is_canonical_type`.
     if !is_canonical_type(msg, WG_TYPE_RESPONSE) {
@@ -523,13 +533,37 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_short_and_bad_type() {
+    fn parse_rejects_wrong_length_and_bad_type() {
         let pub_k = [0x99u8; 32];
         // Too short.
         assert_eq!(
             parse_initiation(&[0u8; 100], &pub_k).unwrap_err(),
-            FramingError::TooShort
+            FramingError::WrongLength
         );
+        // Too LONG: a valid 148-byte msg1 with trailing garbage must be
+        // rejected (Copilot finding — fixed-length messages, no truncation).
+        let resp_pub = [0x5Bu8; 32];
+        let noise = [0x2Du8; MSG_INIT_NOISE_LEN];
+        let mut over = vec![0u8; WG_MSG_INIT_LEN + 8];
+        build_initiation(&mut over[..WG_MSG_INIT_LEN], 9, &noise, &resp_pub).unwrap();
+        assert_eq!(
+            parse_initiation(&over, &resp_pub).unwrap_err(),
+            FramingError::WrongLength,
+            "an oversized datagram must NOT parse by truncation"
+        );
+        // The exact-length prefix still parses on its own.
+        assert!(parse_initiation(&over[..WG_MSG_INIT_LEN], &resp_pub).is_ok());
+
+        // Same for the response: too-long is rejected.
+        let init_pub = [0x6Cu8; 32];
+        let rnoise = [0x3Eu8; MSG_RESPONSE_NOISE_LEN];
+        let mut rover = vec![0u8; WG_MSG_RESPONSE_LEN + 4];
+        build_response(&mut rover[..WG_MSG_RESPONSE_LEN], 1, 2, &rnoise, &init_pub).unwrap();
+        assert_eq!(
+            parse_response(&rover, &init_pub).unwrap_err(),
+            FramingError::WrongLength
+        );
+
         // Wrong type byte (response bytes parsed as initiation).
         let mut buf = [0u8; WG_MSG_INIT_LEN];
         buf[0] = WG_TYPE_RESPONSE;
