@@ -353,6 +353,14 @@ functions keep identical signatures and visibility. The four new helpers
     adjusted checksum computes to 0 yields `0xFFFF` (the #1669-trap
     regression); a v4 ICMP/TCP packet computing to 0 is left unchanged
     (no canonicalization).
+  - **Overflow/no-op call-site regression (Codex r3):** call
+    `adjust_l4_checksum_ipv4*` with a recognized proto (TCP/UDP) and an
+    `ihl` so large that `ihl.checked_add(delta)` overflows `usize` —
+    assert the fn returns `None` (failure preserved, the round-2 bug-#1
+    guard). Call the same fn with IPv4 protocol 58 (ICMPv6) and any `ihl`
+    — assert it returns `Some(())` no-op (round-2 bug-#2 guard), i.e. the
+    helper's `_ => None` path maps to no-op success and never reads the
+    packet at `ihl+2`.
 - 5× flake loop on the checksum test module.
 - Go suite (`go test ./...`) — known pre-existing
   `pkg/dataplane/userspace` sandbox unix-socket failures proven
