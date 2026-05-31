@@ -876,6 +876,15 @@ func ValidateConfig(cfg *Config) []string {
 		warnings = append(warnings, "system services dns dns-proxy configured but DNS proxy/forwarder runtime is not implemented")
 	}
 
+	// #1715: `system services dns` no longer selects a systemd-resolved
+	// owner runtime branch. xpf owns /etc/resolv.conf directly as a
+	// managed plain file and keeps resolved disabled+masked regardless of
+	// this stanza. Warn so an operator who set it expecting resolved is
+	// not surprised that resolved stays off.
+	if cfg.System.Services != nil && cfg.System.Services.DNSEnabled {
+		warnings = append(warnings, "system services dns: resolved-owner mode is not supported; xpf manages /etc/resolv.conf directly and keeps systemd-resolved disabled+masked")
+	}
+
 	if fm := cfg.Services.FlowMonitoring; fm != nil {
 		checkExtWarning := func(kind, name string, exts []string) {
 			for _, ext := range exts {
