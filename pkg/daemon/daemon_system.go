@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
-	"github.com/psaab/xpf/pkg/daemon/system"
 	"github.com/psaab/xpf/pkg/logging"
 	"github.com/vishvananda/netlink"
 )
@@ -233,47 +232,13 @@ func isProcessDisabled(cfg *config.Config, name string) bool {
 	return false
 }
 
-func (d *Daemon) applySystemDNS(cfg *config.Config) {
-	const dropinDir = "/etc/systemd/resolved.conf.d"
-	const dropinPath = dropinDir + "/xpf.conf"
-
-	content := system.RenderResolvedDropin(system.ResolvedDropinInput{
-		NameServers:  cfg.System.NameServers,
-		DomainName:   cfg.System.DomainName,
-		DomainSearch: cfg.System.DomainSearch,
-	})
-
-	if content == "" {
-		// Remove drop-in if no DNS config and file exists.
-		if _, err := os.Stat(dropinPath); err == nil {
-			os.Remove(dropinPath)
-			restartResolved()
-		}
-		return
-	}
-
-	current, _ := os.ReadFile(dropinPath)
-	if string(current) == content {
-		return // no change
-	}
-
-	os.MkdirAll(dropinDir, 0755)
-	if err := os.WriteFile(dropinPath, []byte(content), 0644); err != nil {
-		slog.Warn("failed to write resolved drop-in", "path", dropinPath, "err", err)
-		return
-	}
-	slog.Info("DNS config applied via resolved", "domain", cfg.System.DomainName,
-		"search", cfg.System.DomainSearch, "servers", cfg.System.NameServers)
-	restartResolved()
-}
-
-func restartResolved() {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if out, err := exec.CommandContext(ctx, "systemctl", "restart", "systemd-resolved").CombinedOutput(); err != nil {
-		slog.Warn("failed to restart systemd-resolved", "err", err, "output", string(out))
-	}
-}
+// DNS reconciliation moved to daemon_dns.go (#1715): xpf owns
+// /etc/resolv.conf as a managed plain file via a single applySem-locked
+// reconcileDNS. The former applySystemDNS (resolved drop-in + restart),
+// restartResolved, and applyDNSService (disable resolved) were removed —
+// their write-then-disable apply order was the dangling-symlink race.
+// RenderResolvedDropin remains in pkg/daemon/system for any future
+// resolved-owner mode but is no longer wired into the apply path.
 
 const (
 	chronySourcesPath   = "/etc/chrony/sources.d/xpf.sources"
@@ -411,18 +376,6 @@ func (d *Daemon) applySystemNTP(cfg *config.Config) {
 		"servers", cfg.System.NTPServers,
 		"threshold", cfg.System.NTPThreshold,
 		"action", cfg.System.NTPThresholdAction)
-}
-
-// applyDNSService manages systemd-resolved based on system { services { dns } }.
-func (d *Daemon) applyDNSService(cfg *config.Config) {
-	if cfg.System.Services == nil {
-		return
-	}
-	if cfg.System.Services.DNSEnabled {
-		exec.Command("systemctl", "enable", "--now", "systemd-resolved").Run()
-	} else {
-		exec.Command("systemctl", "disable", "--now", "systemd-resolved").Run()
-	}
 }
 
 // applyKernelTuning sets kernel sysctl parameters from config.

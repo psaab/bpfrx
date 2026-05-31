@@ -1189,6 +1189,59 @@ func TestDNSProxyWarned(t *testing.T) {
 	}
 }
 
+// #1715: `system services dns` must emit a commit-check warning that
+// resolved-owner mode is unsupported (xpf owns /etc/resolv.conf directly,
+// resolved stays disabled+masked).
+func TestServicesDNSResolvedOwnerWarned(t *testing.T) {
+	input := `system {
+    services {
+        dns;
+    }
+}`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if errs != nil {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("unexpected compile error: %v", err)
+	}
+	if cfg.System.Services == nil || !cfg.System.Services.DNSEnabled {
+		t.Fatal("expected DNSEnabled to be recorded")
+	}
+	found := false
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "resolved-owner mode is not supported") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected resolved-owner warning, got %v", cfg.Warnings)
+	}
+}
+
+// #1715: no `system services dns` stanza ⇒ no resolved-owner warning.
+func TestServicesDNSResolvedOwnerSilentWhenUnset(t *testing.T) {
+	input := `system {
+    host-name fw0;
+}`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if errs != nil {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("unexpected compile error: %v", err)
+	}
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "resolved-owner mode is not supported") {
+			t.Fatalf("did not expect resolved-owner warning, got %v", cfg.Warnings)
+		}
+	}
+}
+
 func TestParseLoginClass(t *testing.T) {
 	input := `system {
     login {
