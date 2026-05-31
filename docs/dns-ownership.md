@@ -58,8 +58,17 @@ stable across daemon restarts regardless of internal lease map ordering.
 
 DNS for a DHCP-only box becomes available when the first lease arrives and
 fires the reconciler. After boot, an empty merge (operator deleted all
-`name-server`, or the last lease expired) is treated as a real "clear
-DNS": the header-only file is written so stale servers do not leak.
+`name-server`, and the DHCP manager holds no lease) is treated as a real
+"clear DNS": the header-only file is written so stale servers do not leak.
+
+A lease stops contributing DNS when its DHCP client is stopped or the
+interface is deconfigured (which removes it from the manager). On a
+transient renewal/rebind failure the manager deliberately keeps the last
+lease — and keeps using its address — until a fresh DORA succeeds, so the
+lease's DNS is retained for as long as the box is still bound to that
+address (a firewall must not blackhole its own management resolver
+mid-renewal). DNS therefore clears when no held lease and no static
+`name-server` remain, not on a momentary renewal hiccup.
 
 ## `system services dns`
 

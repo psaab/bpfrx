@@ -81,10 +81,20 @@ func newDNSReconciler() *dnsReconciler {
 	}
 }
 
-// mergeDNSInput builds the renderer input from static config plus live
-// DHCP leases. Precedence: static `system name-server` first, then
-// DHCPv4, then DHCPv6, de-duplicated (static is authoritative; DHCP
-// augments, never overrides). domain-name / domain-search come from
+// mergeDNSInput builds the renderer input from static config plus the
+// DHCP leases the manager currently holds. Precedence: static
+// `system name-server` first, then DHCPv4, then DHCPv6, de-duplicated
+// (static is authoritative; DHCP augments, never overrides).
+//
+// Lease lifecycle note: dhcp.Leases() reflects the manager's held leases.
+// A lease is dropped (and thus stops contributing DNS) when its client is
+// stopped or the interface is deconfigured; on a transient
+// renewal/rebind failure the manager intentionally keeps the last lease
+// and keeps using its address until a fresh DORA succeeds, so its DNS is
+// retained too — matching the address it is still bound to (a firewall
+// must not blackhole its own management resolver mid-renewal). DNS only
+// truly clears when no held lease and no static name-server remain.
+// domain-name / domain-search come from
 // static config only (DHCP domain options are not consumed here).
 func mergeDNSInput(cfg *config.Config, leases []*dhcp.Lease) system.ResolvedDropinInput {
 	seen := make(map[string]struct{})
