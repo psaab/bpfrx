@@ -2091,7 +2091,13 @@ fn evaluate_filter_empty_filter_returns_default_accept() {
         80,
         0,
     );
-    assert_eq!(result.action, FilterAction::Accept);
+    // A compiled-but-empty filter must fall through to the full default,
+    // distinguishable from the missing-key path: the filter exists with zero
+    // terms, so a compiler bug that dropped empty filters would also surface
+    // here.
+    assert_eq!(result, FilterResult::default());
+    let filter = state.filters.get("inet:empty").expect("empty filter compiled");
+    assert!(filter.terms.is_empty());
 }
 
 // --- Gap 3: address-family mismatch (V4 src + V6 dst) takes the default arm ---
@@ -2121,7 +2127,9 @@ fn evaluate_filter_mixed_address_family_returns_default_accept() {
         80,
         0,
     );
-    assert_eq!(result.action, FilterAction::Accept);
+    // The default arm must produce the full default result, not just an Accept
+    // action with leftover rewrite/routing/forwarding-class fields.
+    assert_eq!(result, FilterResult::default());
 }
 
 // --- Gap 4: IPv6 baseline evaluate_filter / lo0 / interface-input paths ---
@@ -2520,32 +2528,57 @@ fn interface_filter_tx_selection_wrappers_dispatch_and_default() {
 // --- Gap 8: thin accessor predicates (grouped, table-driven) ---
 #[test]
 fn thin_accessor_predicates() {
-    let ifaces = vec![crate::InterfaceSnapshot {
-        name: "reth1.0".into(),
-        ifindex: 21,
-        // Input filter with both a forwarding-class (tx-selection) term and a
-        // DSCP-match term.
-        filter_input_v4: "accessor-in".into(),
-        // Output filter with a DSCP-match term.
-        filter_output_v4: "accessor-out".into(),
-        ..Default::default()
-    }];
+    // Two separate input ifindices so the TX-selection and DSCP-match
+    // accessors are cross-checked: ifindex 21 is TX-selection-only (a
+    // forwarding-class term, no DSCP match), ifindex 22 is DSCP-only (a DSCP
+    // match, no forwarding class). An accessor that consulted the wrong set
+    // (aliasing bug) would flip on one of the cross-negative assertions
+    // below. ifindex 23 carries a DSCP-match output filter.
+    let ifaces = vec![
+        crate::InterfaceSnapshot {
+            name: "reth1.0".into(),
+            ifindex: 21,
+            filter_input_v4: "tx-only-in".into(),
+            ..Default::default()
+        },
+        crate::InterfaceSnapshot {
+            name: "reth1.1".into(),
+            ifindex: 22,
+            filter_input_v4: "dscp-only-in".into(),
+            ..Default::default()
+        },
+        crate::InterfaceSnapshot {
+            name: "reth1.2".into(),
+            ifindex: 23,
+            filter_output_v4: "dscp-out".into(),
+            ..Default::default()
+        },
+    ];
     let state = parse_filter_state(
         &[
             FirewallFilterSnapshot {
-                name: "accessor-in".into(),
+                name: "tx-only-in".into(),
                 family: "inet".into(),
                 terms: vec![FirewallTermSnapshot {
                     name: "classify".into(),
                     protocols: vec!["tcp".into()],
-                    dscp_values: vec![46],
                     action: "accept".into(),
                     forwarding_class: "iperf-a".into(),
                     ..Default::default()
                 }],
             },
             FirewallFilterSnapshot {
-                name: "accessor-out".into(),
+                name: "dscp-only-in".into(),
+                family: "inet".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "match-ef".into(),
+                    dscp_values: vec![46],
+                    action: "accept".into(),
+                    ..Default::default()
+                }],
+            },
+            FirewallFilterSnapshot {
+                name: "dscp-out".into(),
                 family: "inet".into(),
                 terms: vec![FirewallTermSnapshot {
                     name: "match-ef".into(),
@@ -2561,19 +2594,21 @@ fn thin_accessor_predicates() {
         "",
     );
 
-    // tx_selection accessors: input v4 has a forwarding-class term, so it
-    // affects TX-selection; v6 has no filter at all.
+    // TX-selection accessor reads the TX-selection set, NOT the DSCP set:
+    // true on the TX-only ifindex, false on the DSCP-only ifindex.
     assert!(interface_filter_affects_tx_selection(&state, 21, false));
+    assert!(!interface_filter_affects_tx_selection(&state, 22, false));
     assert!(!interface_filter_affects_tx_selection(&state, 21, true));
     assert!(filter_state_has_input_tx_selection(&state, false));
     assert!(!filter_state_has_input_tx_selection(&state, true));
 
-    // cache_sensitive DSCP-match accessors: input and output v4 both carry a
-    // DSCP-match term; v6 carries none.
-    assert!(interface_input_filter_has_dscp_match(&state, 21, false));
-    assert!(!interface_input_filter_has_dscp_match(&state, 21, true));
-    assert!(interface_output_filter_has_dscp_match(&state, 21, false));
-    assert!(!interface_output_filter_has_dscp_match(&state, 21, true));
+    // DSCP-match accessor reads the DSCP set, NOT the TX-selection set:
+    // true on the DSCP-only ifindex, false on the TX-only ifindex.
+    assert!(interface_input_filter_has_dscp_match(&state, 22, false));
+    assert!(!interface_input_filter_has_dscp_match(&state, 21, false));
+    assert!(!interface_input_filter_has_dscp_match(&state, 22, true));
+    assert!(interface_output_filter_has_dscp_match(&state, 23, false));
+    assert!(!interface_output_filter_has_dscp_match(&state, 23, true));
     // No filter bound to an unrelated ifindex.
     assert!(!interface_input_filter_has_dscp_match(&state, 99, false));
     assert!(!interface_filter_affects_tx_selection(&state, 99, false));
