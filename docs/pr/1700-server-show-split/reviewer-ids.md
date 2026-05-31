@@ -8,3 +8,10 @@
   `(req, cfg, buf)` signature for prefix handlers, not fresh local buf).
 
 Plan commit: ee8812eec6ff9229df6c0dd9c15bab6351e6fde0
+
+## Code review round 1 (PR #1707)
+- Codex: task-mpt58dac-kdjois
+- AGY adversarial: adversarial-review-mpt58j48-5rxe8y
+- Claude-SMR: in-progress (verbatim spot-check)
+
+PR head: 86105b99c
