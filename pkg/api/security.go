@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"sort"
@@ -190,8 +191,24 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 
 	fromZone := r.URL.Query().Get("from_zone")
 	toZone := r.URL.Query().Get("to_zone")
-	srcIP := net.ParseIP(r.URL.Query().Get("src_ip"))
-	dstIP := net.ParseIP(r.URL.Query().Get("dst_ip"))
+
+	// A non-empty but malformed src_ip/dst_ip would parse to nil and be
+	// treated as a wildcard by matchPolicyAddr, yielding a false-positive
+	// PERMIT verdict in the simulator (#1711). Reject it with 400. An
+	// empty value still means "unspecified" (match any).
+	srcIPStr := r.URL.Query().Get("src_ip")
+	if srcIPStr != "" && net.ParseIP(srcIPStr) == nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid src_ip %q", srcIPStr))
+		return
+	}
+	dstIPStr := r.URL.Query().Get("dst_ip")
+	if dstIPStr != "" && net.ParseIP(dstIPStr) == nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid dst_ip %q", dstIPStr))
+		return
+	}
+
+	srcIP := net.ParseIP(srcIPStr)
+	dstIP := net.ParseIP(dstIPStr)
 	dstPort := queryInt(r, "dst_port", 0)
 	proto := r.URL.Query().Get("protocol")
 

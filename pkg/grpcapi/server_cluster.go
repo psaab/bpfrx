@@ -126,6 +126,19 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 		return &pb.MatchPoliciesResponse{}, nil
 	}
 
+	// An empty source/destination IP means "unspecified" (match any),
+	// which is a legitimate simulator query. A NON-EMPTY but malformed
+	// value is an operator error: net.ParseIP returns nil and
+	// matchPolicyAddr treats nil as a wildcard, which would yield a
+	// false-positive PERMIT verdict (#1711). Reject it explicitly so the
+	// simulator never silently turns garbage input into "any".
+	if req.SourceIp != "" && net.ParseIP(req.SourceIp) == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid source-ip %q", req.SourceIp)
+	}
+	if req.DestinationIp != "" && net.ParseIP(req.DestinationIp) == nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid destination-ip %q", req.DestinationIp)
+	}
+
 	parsedSrc := net.ParseIP(req.SourceIp)
 	parsedDst := net.ParseIP(req.DestinationIp)
 	dstPort := int(req.DestinationPort)
