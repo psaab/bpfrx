@@ -1,7 +1,12 @@
 # #1698 — `pkg/routing/routing.go` domain-manager split (re-attempt post-#1544-kill)
 
-**Status:** DRAFT v2 — addresses round-1 review (Codex PLAN-NEEDS-MAJOR,
-AGY PLAN-READY, Claude-SMR PLAN-NEEDS-MINOR)
+**Status:** PLAN-READY v3 — round-2 converged. Codex
+`task-mpt4aqba-bpf7yc` PLAN-NEEDS-MINOR (all 4 minors folded in below),
+AGY `adversarial-review-mpt4aywc-kpvyc9` PLAN-READY, Claude-SMR
+PLAN-READY. v3 folds the round-2 minors (accurate ops-interface method
+lists incl. `LinkSetMaster` not `LinkSetMasterByIndex`; `rethManager`/
+`monitorManager` borrow `nlHandle`; new fake-`ruleOps` test plan;
+`Close()` concurrency caveat) into §5.2, §9, and the constructor sketch.
 
 ## Round-1 review resolution (v1 → v2)
 
@@ -219,25 +224,42 @@ acceptance criteria, each domain depends on a minimal ops interface, not
 a concrete `*netlink.Handle`. `*netlink.Handle` satisfies all of them in
 production; tests substitute fakes.
 
-- `vrfOps` — already exists (routing.go:143), unchanged.
-- `linkOps` — `LinkByName`/`LinkAdd`/`LinkDel`/`LinkSetUp`/`LinkSetDown`/
-  `LinkSetMasterByIndex`/`AddrAdd` etc. — the surface tunnel/xfrm/bond
-  apply/clear actually use. (Define from the methods grep'd in those
-  bodies; keep it minimal.)
-- `ruleOps` — `RuleAdd`/`RuleDel`/`RuleList` — the surface the three rule
-  reconcilers use (verified: routing.go:1507, 1616, 1649, 1657). This is
-  the interface that finally makes `ribGroupManager`/`pbrManager`/
-  `nextTableManager` unit-testable without netlink — the exact gap
-  `routing_test.go:549` documents today.
-- `routeReader` keeps a `routeLister` (`RouteListFiltered`/`RouteGet`) for
-  the same reason.
+Interface method lists are derived from an exhaustive grep of every
+`m.nlHandle.<Method>` call (round-2 both reviewers audited these; the
+v2 lists had two naming errors now fixed):
 
-This is bounded extra work (define 3 small interfaces over methods the
-code already calls) and is the load-bearing difference from #1544: the
-killed plan narrowed *no* interface. If a reviewer judges these
-interfaces add no real testability over the status quo, that is a
-legitimate KILL signal — but the rule-domain `ruleOps` directly closes a
-gap the existing test suite calls out.
+- `vrfOps` — already exists (routing.go:143):
+  `LinkByName`/`LinkAdd`/`LinkDel`/`LinkSetUp`/`LinkList`. Note
+  `BindInterfaceToVRF` additionally calls **`LinkSetMaster`** (routing.go:429)
+  and `LinkByName`; fold `LinkSetMaster` into the VRF domain's ops surface.
+- `linkOps` (tunnel/xfrm/bond) —
+  `LinkByName`/`LinkAdd`/`LinkDel`/`LinkSetUp`/`LinkSetDown`/`AddrAdd`/
+  `AddrList`/**`LinkSetMaster`** (NOT `LinkSetMasterByIndex` — the code at
+  routing.go:429 uses `LinkSetMaster(link, master)`). `AddrList` is used
+  by `GetTunnelStatus`.
+- `ruleOps` (rule reconcilers) — `RuleAdd`/`RuleDel`/`RuleList` (verified:
+  routing.go:1507, 1616, 1649, 1657). This is the interface that finally
+  makes `nextTableManager`/`ribGroupManager`/`pbrManager` unit-testable
+  without netlink — the exact gap `routing_test.go:549` (and :940)
+  document today.
+- `routeLister` (routeReader) — `RouteListFiltered`/`RouteList`/
+  `LinkByIndex`/`LinkByName` (verified: routing.go:442, 480, 1045, 1106;
+  index→name translation for route entries). NOT just `RouteListFiltered`/
+  `RouteGet` as v2 said.
+- `rethManager` is **NOT a pure stub** (round-2 correction): although
+  `ApplyRethInterfaces`/`RethNames` are no-ops, `ClearRethInterfaces`
+  (routing.go:2005) is live — it is called on every apply
+  (`daemon_apply.go:295`) and uses `LinkList`/`LinkDel` to reap legacy
+  RETH bonds. So `rethManager` borrows `nlHandle` (or a `linkOps`-subset
+  with `LinkList`/`LinkDel`), not `&rethManager{}` empty.
+- `monitorManager` needs `LinkByName` (`ApplyInterfaceMonitors`,
+  routing.go:2044) in addition to its `monMu`+`monitorStatus` map.
+
+This is bounded extra work (define small interfaces over methods the code
+already calls) and is the load-bearing difference from #1544: the killed
+plan narrowed *no* interface. The new test plan (§9) adds fake-`ruleOps`
+tests that exercise rib-group / next-table / PBR rule reconcile without
+netlink — proving the seam, not just asserting it.
 
 ### Façade sketch
 
@@ -269,8 +291,8 @@ func New() (*Manager, error) {
     m.ribGroup = &ribGroupManager{nl: h}
     m.pbr      = &pbrManager{nl: h}
     m.bond     = &bondManager{nl: h}
-    m.reth     = &rethManager{}
-    m.monitor  = &monitorManager{monitorStatus: map[int][]InterfaceMonitorStatus{}}
+    m.reth     = &rethManager{nl: h} // ClearRethInterfaces is live (LinkList/LinkDel)
+    m.monitor  = &monitorManager{nl: h, monitorStatus: map[int][]InterfaceMonitorStatus{}}
     return m, nil
 }
 
@@ -284,6 +306,18 @@ func (m *Manager) Close() error {
     return nil
 }
 ```
+
+**`Close()` concurrency caveat (Codex round-2 #4):** today `Close()` holds
+`ifaceMu` while calling `stopAllKeepalives()`, which incidentally waits
+for in-flight tunnel/xfrm/bond apply/clear that hold the same lock. After
+the lock split there is no manager-wide lock, so `Close()` no longer
+serializes against a concurrent `ApplyXfrmi`/`ApplyBonds`. This is not a
+regression: **there is no daemon caller of `routing.Close()`** (verified
+— grep finds no `routing.*Close()` call outside tests), and `stopAll()`
+still drains keepalive goroutines before the handle closes (#848
+preserved). The plan documents `Close` as not safe to call concurrently
+with public apply/read methods — the same contract that holds today in
+practice (single-threaded shutdown).
 
 The domain structs hold `nl *netlink.Handle` (a **borrowed** reference,
 not an owner — only the façade closes it). Domain-internal methods are
@@ -374,6 +408,18 @@ fns". Verified count: 26 methods + exported free fns above.)
 - `GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go test ./pkg/routing/...`
   — all 20 existing routing tests pass unchanged (they call exported
   methods + the `vrfOps` fake, which both survive).
+- **NEW fake-`ruleOps` tests (Codex round-2 #3) — proves the testability
+  seam, not just asserts it.** Add a `fakeRuleOps` (in-memory ip-rule
+  table recording `RuleAdd`/`RuleDel`/`RuleList`) and at least:
+  - `TestRibGroupRulesApply_Fake` — drive `ribGroupManager` over the fake,
+    assert the expected `RuleAdd` calls for a multi-VRF leak (closes the
+    `routing_test.go:549` "cannot test ip-rule creation without netlink"
+    gap directly).
+  - `TestNextTableRulesApply_Fake` and `TestPBRRulesApply_Fake` —
+    same pattern for next-table and PBR reconcile (clear-then-add).
+  These tests construct the domain manager directly with the fake — i.e.
+  WITHOUT building the whole `routing.Manager` — which is the concrete
+  demonstration that the split delivered per-domain testability.
 - Full Go suite `go test ./...` — green (no call-site edits outside
   `pkg/routing/`, so no downstream package changes expected).
 - 5× flake loop on `TestReconcileVRFs` and `TestMultiVRFRibGroupLeaking`
