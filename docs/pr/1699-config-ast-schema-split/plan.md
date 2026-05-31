@@ -6,10 +6,9 @@ adopts all four Codex minors (both reviewers independently recommended
 the `schema_complete.go` split): (1) split the completion functions into
 `schema_complete.go` so both new files land below the audit threshold;
 (2) update `docs/config-schema.md` + `pkg/config/README.md` references
-from `ast.go` to the new files; (3) `schema.go` imports only `strings`
-(grammar literal needs neither `fmt` nor `strings` directly, but
-`isTypedLeaf`/`appendTypedValueCompletions` move with completion code);
-(4) corrected the audit-tag wording — see below.
+from `ast.go` to the new files; (3) imports are minimal — `schema.go`
+needs none (pure grammar literal), `schema_complete.go` imports only
+`strings`; (4) corrected the audit-tag wording — see below.
 
 ## 1. Issue framing
 
@@ -115,13 +114,15 @@ family by splitting them across `schema.go` (grammar SSOT) and
 
 Create two files:
 
-1. `pkg/config/schema.go` (`package config`, imports `strings`) with the
-   grammar SSOT moved verbatim from `ast.go`:
+1. `pkg/config/schema.go` (`package config`, no imports — the grammar
+   literal and `isTypedLeaf` reference no stdlib) with the grammar SSOT
+   moved verbatim from `ast.go`:
    - `schemaNode` struct + all doc comments
    - `isTypedLeaf` method
    - `setSchema` var literal
    - `init()` groups-wildcard wiring
-2. `pkg/config/schema_complete.go` (`package config`, imports `fmt`) with the
+2. `pkg/config/schema_complete.go` (`package config`, imports only
+   `strings` for the prefix-matching in the completers) with the
    completion/resolution helpers moved verbatim from `ast.go`:
    - `ValueHint` type + its `const (...)` block
    - `SchemaCompletion` struct
