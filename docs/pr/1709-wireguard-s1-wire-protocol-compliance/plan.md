@@ -1,6 +1,12 @@
-# #1709 — WireGuard S1: wire-protocol compliance (TAI64N + handshake framing) validated vs wireguard-go reference
+# #1709 — WireGuard S1: wire-protocol compliance (TAI64N + handshake framing) validated by spec known-answer vectors (live kernel-WireGuard interop = S2)
 
-Status: **DRAFT v1 — pending adversarial plan review** (Codex + AGY + Claude-SMR)
+Status: **DRAFT v2 — pending adversarial plan review** (Codex + AGY +
+Claude-SMR). v2 changes from v1: dropped the wireguard-go-as-library interop
+harness (user rejected a Go reference for a Rust dataplane); the independent
+reference peer is now the **Linux kernel WireGuard module on a real incus VM**
+(never a container); S1's in-tree gate is **spec known-answer vectors**, and
+the recommended S1/S2 boundary defers the live kernel-wg-VM interop test to S2
+(plan-review to ratify (a) vs (b)).
 
 Issue: #1709 (part of #1703 umbrella). Branch:
 `refactor/1709-wireguard-s1-wire-protocol-compliance`.
@@ -32,8 +38,9 @@ demuxes on `sender_index` (absent), and rejects any datagram whose MAC1 does
 not verify against `BLAKE2s-keyed(HASH("mac1----" || our_static_pub), msg)`.
 
 **S1 scope** (this PR — note #1709 folds research-plan S1 *and* S2 into one
-deliverable, since the issue title is "wire-protocol compliance … validated
-vs wireguard-go reference"):
+deliverable: "wire-protocol compliance — TAI64N + handshake framing —
+validated vs a WireGuard reference"; the reference is now kernel WireGuard,
+and the live interop test is recommended to land in S2, see §5.4/Q7):
 
 1. **TAI64N timestamp** — a monotonic 12-byte TAI64N clock, carried as the
    Noise payload of WG message 1 (encrypted_timestamp), persisted so it never
@@ -44,10 +51,25 @@ vs wireguard-go reference"):
 3. **Initiator path first** (xpf emits a valid msg1, consumes a valid msg2,
    derives a transport session), **then responder path** (xpf parses a peer
    msg1, replies with a valid msg2).
-4. **Automated interop harness vs wireguard-go** that completes a full
-   handshake **both directions** against the independent reference and asserts
-   matching transport-key derivation. **This harness is the success
-   criterion**; an xpf-against-itself test is explicitly insufficient.
+4. **Spec known-answer vector tests (in-tree gate)** that pin the WG
+   construction hashes (InitialChainKey/InitialHash), the MAC1 keyed-BLAKE2s
+   construction, and the TAI64N encoding to authoritative reference values —
+   self-contained, no external peer, runs in plain `cargo test` anywhere.
+5. **Live kernel-WireGuard interop (on a real VM peer)** — xpf's Rust
+   handshake completes **both directions** against a **Linux kernel WireGuard**
+   peer (`ip link add wgX type wireguard` + `wg set`), asserting matching
+   transport-key derivation. Reference peer = **kernel WireGuard running on an
+   actual incus VIRTUAL-MACHINE** (DECIDED by the user) — never a container
+   (containers share the host kernel and cannot independently use the WG
+   module). Byte-identical to what UniFi / EdgeOS / UDM run; no Go toolchain.
+   **This live test is the ultimate interop proof**; an xpf-against-itself test
+   is explicitly insufficient. Because the live test now requires a dedicated
+   VM peer + UDP-reachability wiring between the xpf VM and the peer VM (a
+   non-trivial harness), **the recommended S1/S2 boundary is: S1 = framing +
+   spec-vector unit tests (provable by `cargo test` anywhere, no peer/VM); the
+   live kernel-wg-on-VM interop test moves to S2 alongside the datapath/UDP
+   wiring.** Plan-review (Codex+AGY+SMR) must ratify this boundary — see §5.4(b)
+   and Q7.
 
 **Out of scope** (later #1703 S-steps): dataplane hot-path encap/decap wiring
 (S3 / research-plan S3), keepalive + REKEY/REJECT-AFTER timers + endpoint
@@ -66,8 +88,10 @@ with any compliant peer; after S1 it provably can, against the reference
 implementation, in both roles. The cost is ~400–600 LOC of
 security-critical crypto framing plus a Go interop harness. The honest risk
 is that the framing has a byte-level bug that the harness must catch — which
-is exactly why the harness against an **independent** reference (wireguard-go,
-not xpf's own snow round-trip) is the load-bearing artifact.
+is exactly why the gate is built from **canonical spec known-answer vectors**
+(independent of xpf's own code), with the live test against an **independent**
+reference (kernel WireGuard on a VM, not xpf's own snow round-trip) as the
+S2-opening artifact.
 
 If the framing were judged not worth the security-review burden in isolation,
 the right call is PLAN-KILL — but the research plan already converged
@@ -105,23 +129,29 @@ crypto/replay/AllowedIPs library:
   Passing the 12-byte TAI64N as the snow `payload` makes
   `encrypted_payload == encrypted_timestamp` byte-for-byte. snow msg2 body =
   `e[32] || encrypted_empty[16]` == WG msg2 `Ephemeral[32] || Empty[16]`.
-- **wireguard-go is fetchable + buildable in this sandbox.** `go run` against
-  `golang.zx2c4.com/wireguard@v0.0.0-20260522210424-ecfc5a8d5446` succeeds;
-  `tai64n.Now()` returns 12 bytes; `device` exports
-  `MessageInitiationSize=148`, `MessageResponseSize=92`,
-  `MessageInitiationType=1`, `MessageResponseType=2`, and the struct layouts
-  match the spec (`Type,Sender,Ephemeral[32],Static[48],Timestamp[28],
-  MAC1[16],MAC2[16]` = 148). `tun/netstack` (gvisor, **no root**) +
-  `conn.NewDefaultBind` (real UDP socket) both build — so a full wireguard-go
-  `Device` can run in-process over loopback UDP with no TUN/root requirement.
+- **WG message layouts are byte-confirmed against the spec.** WG msg1 =
+  `Type(1)+reserved(3)+Sender(4)+Ephemeral(32)+Static(48)+Timestamp(28)+
+  MAC1(16)+MAC2(16)` = 148; msg2 =
+  `Type(1)+reserved(3)+Sender(4)+Receiver(4)+Ephemeral(32)+Empty(16)+
+  MAC1(16)+MAC2(16)` = 92 (whitepaper §5.4; cross-checked against the
+  canonical layout). snow's IK msg1/msg2 bodies occupy the
+  `Ephemeral..Timestamp` (108 B) and `Ephemeral..Empty` (48 B) middles exactly.
+- **KAT oracle values are precomputed (offline).** The canonical construction
+  constants (InitialChainKey, InitialHash, MAC1 key, keyed-BLAKE2s-128) were
+  computed offline once and are baked as hex literals into the unit tests
+  (§5.4a). **No Go toolchain, no wireguard-go, no network at test time** — the
+  vectors are static.
 - **`blake2 0.10.6` is already in `Cargo.lock`** (transitive via snow) — MAC1
-  keyed-BLAKE2s needs no new direct dependency beyond promoting `blake2` to a
+  keyed-BLAKE2s needs no new locked dependency beyond promoting `blake2` to a
   direct `Cargo.toml` entry (same locked version, no tree change).
-- **`wg` / `wireguard-go` binaries are NOT installed**; `wireguard-tools` is
-  apt-candidate only. The harness therefore uses the **wireguard-go Go module
-  as a library** (vendored via `go.mod`, already in the module cache), NOT a
-  system `wg` binary. This is documented as the chosen approach (issue asks to
-  "install/vendor it or use kernel `wg` — document the approach").
+- **Kernel WireGuard is available on the loss VM (verified).** On
+  `loss:xpf-userspace-fw0`: `modinfo wireguard` →
+  `/lib/modules/7.0.0-rc7+/.../wireguard.ko.xz`; `ip link add wgX type
+  wireguard` succeeds (CREATE_OK). `ip` is present; **`wg`/`wg-quick`
+  userspace tools are NOT yet installed** (only the kernel module + `ip`), so
+  the live harness must either `apt-get install wireguard-tools` on the VM or
+  configure the reference interface via netlink/`ip`. This is the reference
+  peer for the live interop test (DECIDED).
 
 ---
 
@@ -324,55 +354,113 @@ existing tests already pass `HandshakeState` around, so the boundary is proven.
 Sender/receiver index allocation reuses the existing demux discipline
 (`install_session` already enforces global `local_index` uniqueness).
 
-### 5.4 Interop harness — `userspace-dp/tests/wg_interop/` + Go reference
+### 5.4 Verification: spec KAT vectors (in-tree gate) + deferred live harness
 
-**Architecture (decided after probing wireguard-go's API):**
+**(a) Spec known-answer vector tests — the buildable-now, self-contained gate.**
+These pin xpf's framing to authoritative WireGuard reference values with NO
+external peer, so they run in plain `cargo test` on any box. The values below
+were computed offline from the canonical WG construction (BLAKE2s over the
+documented labels/identifier; an offline BLAKE2s oracle produced the expected
+hex). Per Q6, the tests should ALSO re-derive these from raw `blake2` calls in
+the same test so neither a transcription typo nor an implementation bug can
+pass alone. No runtime external dependency is introduced:
 
-1. A **Rust integration test** (`userspace-dp/tests/wg_interop.rs`) that builds
-   a `WgEngine` and exercises `create_initiation` / `consume_response` /
-   `consume_initiation_create_response`, exchanging raw bytes with the Go
-   reference over a **loopback UDP socket**.
-2. The **independent reference** is a small Go program
-   (`test/wg-interop-peer/`, its own `go.mod` pinning
-   `golang.zx2c4.com/wireguard`) that stands up a real wireguard-go `Device`
-   with a `tun/netstack` TUN (no root) + `conn.NewDefaultBind` UDP socket,
-   configured via `IpcSet` (private key, peer pubkey, allowed-ips, endpoint =
-   the Rust test's UDP socket). The Rust test spawns this peer as a subprocess,
-   reads its chosen UDP port + public key from stdout, and drives the exchange.
+- `InitialChainKey = BLAKE2s-256("Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s")`
+  = `60e26daef327efc02ec335e2a025d2d016eb4206f87277f52d38d1988b78cd36`
+- `InitialHash = BLAKE2s-256(InitialChainKey || "WireGuard v1 zx2c4 Jason@zx2c4.com")`
+  = `2211b361081ac566691243db458ad5322d9c6c662293e8b70ee19c65ba079ef3`
+- MAC1 key for recipient pubkey `0x42`×32
+  = `BLAKE2s-256("mac1----" || pubkey)`
+  = `172c34d6807bd7acef1a2471f20e928626c23ce0b9f90b326cf5f82d12480a4e`
+- `keyed-BLAKE2s-128(MAC1key, b"abc")`
+  = `78df3b0a90577688ce9d272d04a8fb90`
 
-   - **Direction A (xpf initiator → wireguard-go responder):** Rust
-     `create_initiation` → send UDP datagram to the Go peer → the Go Device's
-     real receive path runs `CheckMAC1` + `ConsumeMessageInitiation` (verifies
-     mac1 against xpf's framing, decrypts the TAI64N, checks monotonicity) →
-     Go emits a real type-2 → Rust `consume_response` derives the transport
-     session. **Assert:** Go accepted msg1 (no drop — observable because it
-     sends a msg2; we parse the type-2 we receive) AND xpf derived a session
-     whose transport key matches (proven by a subsequent transport-record
-     round-trip below).
-   - **Direction B (wireguard-go initiator → xpf responder):** configure the Go
-     peer with `PersistentKeepalive`/an endpoint so it initiates; Rust receives
-     the UDP datagram, `consume_initiation_create_response` parses + replies;
-     Go consumes the type-2 and the handshake completes on the Go side.
-     **Assert:** xpf parsed a real wireguard-go msg1 (mac1 verified, TAI64N
-     decrypted) and emitted a msg2 that wireguard-go accepted.
-   - **Key-confirmation / matching transport keys:** after each direction, send
-     ONE WireGuard transport DATA record (type 4) carrying a tiny inner IP
-     packet from xpf's `try_encap` and assert the Go peer decrypts it
-     (delivers to its netstack TUN), and vice-versa. This is the
-     "derives matching transport keys" proof the task demands. *(This is a
-     transport record, not the AF_XDP datapath — it uses the existing
-     spec-compliant `framing.rs` over the loopback UDP socket, NOT
-     `poll_descriptor.rs`. So it stays within S1's "no datapath change"
-     boundary while still proving end-to-end key agreement.)*
+Test suite (`wg/handshake.rs` + `wg/tai64n.rs` `#[cfg(test)]`):
+  - `construction_hashes_match_spec` — assert xpf's computed InitialChainKey /
+    InitialHash equal the hex above (this independently re-derives what snow's
+    prologue already mixes, proving the framing layer agrees with the engine).
+  - `mac1_keyed_blake2s_128_kat` — assert the keyed-BLAKE2s-128 vector above
+    (proves keyed-BLAKE2s, NOT HMAC, and the 16-byte output width — the
+    research §7 SMR r1 #3 hazard).
+  - `mac1_keys_on_recipient_static_pub` — build msg1 toward responder R; assert
+    mac1 verifies under `HASH("mac1----"||R_pub)` and FAILS under a different
+    pubkey (catches the swapped-key bug).
+  - `msg1_layout_byte_offsets` / `msg2_layout_byte_offsets` — assert the
+    148/92-byte total, type byte = 1/2, reserved zeros, LE indices at the right
+    offsets, snow body at offset 8/12, mac1/mac2 at the tail.
+  - `tai64n_encoding_kat` — assert the 12-byte layout (BE u64 `2^62+secs` ||
+    BE u32 nanos) for a fixed `(secs, nanos)`, and `tai64n_strictly_monotonic`
+    (N calls strictly increase by byte-compare even with a frozen/backwards
+    clock).
+  - `framing_roundtrip` — `build_initiation` then `parse_initiation` recovers
+    the sender_index + noise body; `parse` rejects TooShort / BadType /
+    Mac1Mismatch.
+  - `engine_self_handshake_with_framing` — drive both engine roles through the
+    NEW framed `create_initiation`/`consume_initiation_create_response`/
+    `consume_response` path (not just raw snow) and assert both sides derive a
+    transport session that encrypts/decrypts a record. *This is xpf-against-xpf
+    and is explicitly NOT sufficient as the interop proof — it is a regression
+    guard for the engine integration; the LIVE harness in (b) is the interop
+    gate.*
 
-3. **Self-contained build:** the Go reference is built by the test via
-   `go build` (module cache already populated; documented `go.mod`). If the
-   Go toolchain or network is unavailable, the interop test is gated behind a
-   `WG_INTEROP=1` env / a `#[ignore]`-with-reason so `cargo test` stays green
-   on a bare box, BUT the gate is **on by default in the dev/CI path** and the
-   PR's acceptance requires it green. (Open question for review: ignore-by-
-   default vs hard-required — I lean "required, with a clear skip message if
-   `go` is absent, and run it explicitly in the gate.")
+**(b) Live kernel-WireGuard interop (on a real VM peer) — reference DECIDED,
+S1/S2 boundary RECOMMENDED = defer to S2, to be RATIFIED in plan-review.**
+The ultimate interop proof uses an *independent* reference = the **Linux
+kernel WireGuard** module on a real incus VM (never a container — containers
+share the host kernel and cannot use the WG module / create `type wireguard`
+links). Either launch a dedicated lightweight Debian-13 VM
+(`incus launch images:debian/13 <name> --vm`) or reuse an existing real VM
+(e.g. `bpfrx-fw`), attach it to a network the xpf VM (`xpf-userspace-fw0`,
+itself a VM) can reach, and configure kernel `wg`:
+
+```
+# on the PEER VM (root; wireguard-tools installed via apt if absent):
+ip link add wgref type wireguard
+wg set wgref private-key <ref.priv> listen-port <P> \
+   peer <xpf.pub> allowed-ips 0.0.0.0/0 endpoint <xpf_vm_ip>:<Q>
+ip addr add 10.<x>.<y>.1/24 dev wgref; ip link set wgref up
+# Direction A: xpf create_initiation -> UDP <peer_vm_ip>:<P>; kernel wg
+#   verifies mac1 + decrypts TAI64N + replies type-2; xpf consume_response
+#   derives the session. Assert via `wg show wgref` (latest-handshake / rx
+#   counters) AND xpf-side session derivation + a transport-record round-trip.
+# Direction B: kernel wg initiates (persistent-keepalive 1); xpf
+#   consume_initiation_create_response replies; assert `wg show` completes.
+```
+
+**The load-bearing sequencing question (the user flagged it; plan-review MUST
+ratify):** a *live* handshake requires (i) xpf to actually send/receive the
+handshake UDP datagrams and (ii) a dedicated VM peer + UDP reachability wiring
+between the two VMs. The AF_XDP datapath wiring is research-plan S3. Two
+options:
+
+- **Option (a) — minimal test-only UDP socket harness in S1.** Add a small
+  test/ops-only `std::net::UdpSocket` (control thread, NOT the AF_XDP worker)
+  that pumps S1's bytes to/from the kernel-wg VM endpoint, plus the incus VM
+  provisioning + cross-VM network wiring under `test/incus/`. Proves wire
+  compliance against a real kernel peer without touching the hot path — but the
+  VM provisioning + cross-VM reachability harness is now non-trivial
+  (a new VM lifecycle + network attach), which is real surface to build and
+  maintain inside a security-critical framing PR.
+- **Option (b) — S1 = framing + spec-vector unit tests; live kernel-wg-on-VM
+  interop → S2 (RECOMMENDED).** Keep S1 self-contained and provable by
+  `cargo test` anywhere (no peer, no VM, no network). The live kernel-wg-VM
+  interop test lands in S2 alongside the datapath/UDP wiring it naturally
+  shares (the same UDP send/recv plumbing serves both the live test and the
+  datapath). This gives a clean, reviewable S1 (pure wire-protocol correctness)
+  and avoids bolting a VM-lifecycle + cross-VM-network harness onto the
+  crypto-framing PR.
+
+**My recommendation flips to (b)** given the user's correction: the live test
+now needs a real VM peer + cross-VM UDP reachability, which is meaningfully
+more harness than a loopback socket and is better built once, in S2, next to
+the datapath UDP plumbing. S1's falsifiability rests on the spec KAT vectors
+(§5.4a) — which pin every framing/MAC1/TAI64N byte to the canonical
+construction — plus the engine self-handshake-with-framing regression. The
+independent-peer proof is S2's opening gate. **Whatever the verdict, the
+reference peer is kernel WireGuard on a real VM, never a container.**
+**Plan-review must return an explicit (a) vs (b) verdict.**
+
+Per the task: S1 needs **no CoS/iperf cluster smoke** (no datapath change).
 
 ### 5.5 Files touched
 
@@ -384,11 +472,17 @@ Sender/receiver index allocation reuses the existing demux discipline
   TAI64N clock field; target delta < ~150 LOC to stay well under 2000)
 - EDIT `userspace-dp/Cargo.toml` (promote `blake2` to a direct dep at the
   already-locked 0.10.6)
-- NEW `userspace-dp/tests/wg_interop.rs` (Rust harness driver)
-- NEW `test/wg-interop-peer/{go.mod,go.sum,main.go}` (wireguard-go reference)
-- EDIT `docs/wireguard-interop.md` (NEW: harness recipe + wire-compliance
-  status) and flip the relevant OUT items in `docs/pr/wireguard-clean/plan.md`
-  to DONE for handshake framing + TAI64N.
+- (Option a only, if ratified) NEW `test/incus/wg-interop.sh` + a `make`
+  target that provisions a Debian-13 `--vm` kernel-wg peer, wires cross-VM UDP
+  reachability, and drives the test-only UDP socket harness. NOT built under
+  Option (b) — the live kernel-wg-VM interop test moves to S2.
+- EDIT `docs/wireguard-interop.md` (NEW: wire-compliance status + the
+  kernel-wg-on-VM interop recipe, marked S2 under Option b) and flip the
+  relevant OUT items in `docs/pr/wireguard-clean/plan.md` to DONE for handshake
+  framing + TAI64N.
+- NO `test/wg-interop-peer/` Go module, NO `golang.zx2c4.com/wireguard`
+  dependency — wireguard-go is rejected; the reference is kernel WireGuard on a
+  real VM.
 
 ---
 
@@ -416,8 +510,8 @@ pass unchanged.
   mutex; never regresses within a process. Cross-restart persistence hook
   exposed but disk-write deferred (S5/S6) — documented.
 - **mac1 keys on the RECIPIENT's static pub** (responder for msg1, initiator
-  for msg2) — the most common framing bug; the harness against wireguard-go is
-  what catches a swapped key.
+  for msg2) — the most common framing bug; the `mac1_keys_on_recipient_static_pub`
+  KAT test (and, in S2, the live kernel-wg peer) is what catches a swapped key.
 - **No mac2/cookie state** in S1 — emit zeros, skip-verify on parse; a peer
   under load that sends a type-3 cookie reply is out of scope (S7) and must not
   wedge — but S1's harness runs a quiet tunnel, so no cookie is sent.
@@ -433,10 +527,10 @@ pass unchanged.
 |---|---|---|
 | Behavioral regression (existing engine) | **LOW** | Additive; existing tests unchanged; Noise transcript untouched. |
 | Lifetime / borrow-checker | **LOW** | Framing is byte-shuffling over caller slices; `ParsedInitiation` borrows the input like `framing.rs::ParsedDataHeader` already does. |
-| Wire-correctness (byte-level) | **HIGH** | The whole point. Mitigated by the wireguard-go harness (independent reference) — a wrong byte ⇒ Go drops ⇒ test fails. This is the gate. |
-| TAI64N monotonicity / self-DoS | **MED** | Mitigated by mutex-guarded strictly-increasing clock + harness re-handshake. Cross-restart persistence deferred (documented). |
+| Wire-correctness (byte-level) | **HIGH** | The whole point. Mitigated by spec KAT vectors pinning construction hashes / MAC1 / TAI64N / message layouts to canonical values (§5.4a); the independent-peer proof against kernel WireGuard is S2 (Option b) — a wrong byte ⇒ KAT mismatch ⇒ test fails, and in S2 ⇒ kernel wg drops. |
+| TAI64N monotonicity / self-DoS | **MED** | Mitigated by mutex-guarded strictly-increasing clock + the `tai64n_strictly_monotonic` test. Cross-restart persistence deferred (documented). |
 | Architectural mismatch (#961/#946-P2 dead-end) | **LOW** | Design matches snow's proven `write_message(payload)` boundary; not a speculative rearchitecture. The research plan already validated Path A 3-of-3. |
-| Harness flakiness (subprocess/UDP) | **MED** | Loopback UDP + spawned Go peer can race on startup; mitigated by reading the peer's ready-line from stdout before driving, bounded timeouts, and the 5×flake gate. |
+| S1/S2 boundary mis-scope | **MED** | If the live interop test belongs in S1 (Option a) but is deferred, S1 ships an unproven-against-peer framing. Mitigated by the KAT vectors (canonical, independent of xpf) + plan-review's explicit (a)/(b) ratification. |
 
 ---
 
@@ -446,21 +540,27 @@ pass unchanged.
 - `cargo test --release` full suite — all existing + new unit tests
   (handshake framing round-trip, mac1 key-on-recipient, TAI64N monotonic,
   TooShort/BadType/Mac1Mismatch arms).
-- **Interop harness** `cargo test --release --test wg_interop` (both
-  directions vs wireguard-go) — **the success criterion**.
-- **5× flake** on the two interop tests (`wg_interop_xpf_initiator` and
-  `wg_interop_xpf_responder`) — must be 5/5.
-- Go suite `go test ./...` (30 packages) — the new `test/wg-interop-peer/` is
-  its own module so it does not pollute the main Go build; confirm the main
-  suite is unaffected.
+- **Spec KAT vector tests** (§5.4a) — **the S1 success criterion** under
+  Option (b): `construction_hashes_match_spec`, `mac1_keyed_blake2s_128_kat`,
+  `mac1_keys_on_recipient_static_pub`, `msg1/msg2_layout_byte_offsets`,
+  `tai64n_encoding_kat`, `tai64n_strictly_monotonic`, `framing_roundtrip`,
+  `engine_self_handshake_with_framing`.
+- **5× flake** on the framing tests (esp. `engine_self_handshake_with_framing`
+  and `tai64n_strictly_monotonic`) — must be 5/5.
+- Go suite `go test ./...` (30 packages) — confirm unaffected (no Go code added
+  in S1; the kernel-wg harness, if Option a, is shell + incus, not Go).
 - `make audit-check` — confirm engine.rs stays < 2000 LOC and the new files
   are registered; regen `docs/refactoring-audit-current.txt` if a wg file
   crosses 1500.
-- **NO cluster smoke for S1.** This is handshake/wire-protocol + an
-  integration test, **not a datapath change** (no encap/decap on the AF_XDP
-  hot path — that is S3). The CoS/iperf3 matrix exercises the AF_XDP fast path,
-  which S1 does not touch. Stated explicitly per the task. The cluster smoke
-  belongs to research-plan S3 when the engine goes on the hot path.
+- **(Option a only)** live kernel-wg-on-VM interop, run on the cluster via
+  `test/incus/wg-interop.sh` — both directions handshake-complete against a
+  real Debian-13 `--vm` kernel WireGuard peer. Under the RECOMMENDED Option (b)
+  this moves to S2.
+- **NO CoS/iperf cluster smoke for S1.** This is handshake/wire-protocol, **not
+  a datapath change** (no encap/decap on the AF_XDP hot path — that is S3). The
+  CoS/iperf3 matrix exercises the AF_XDP fast path, which S1 does not touch.
+  Stated explicitly per the task. The CoS/iperf cluster smoke belongs to
+  research-plan S3 when the engine goes on the hot path.
 
 ---
 
@@ -486,34 +586,47 @@ pass unchanged.
    msg1 `write_message(tai64n_12b, out)` produces `e[32] || enc_s[48] ||
    enc_ts[28]` identical to WG msg1 inner. Is there any snow-side framing
    (length prefix, extra MixHash of the payload at a different point) that
-   diverges from kernel WG's `encrypt(timestamp)` so the harms only surface as
-   a tag-verify failure on the Go side? (Probe says lengths match; demand the
-   harness prove the AEAD verifies, not just the length.)
-2. **mac1 = keyed-BLAKE2s-128, not HMAC.** Confirm against wireguard-go
-   `cookie.go` that it's `blake2s.New128(key)` keyed (not HMAC-BLAKE2s), key =
-   `BLAKE2s-256(LABEL_MAC1 || recipient_static_pub)` (32-byte hash used as the
-   16-output keyed-BLAKE2s key). Wrong hash width or HMAC vs keyed ⇒ silent
-   drop. Is my "HASH = BLAKE2s-256, MAC = keyed-BLAKE2s-128" reading correct?
+   diverges from kernel WG's `encrypt(timestamp)` so the harm only surfaces as
+   a tag-verify failure on the peer side? (Probe says lengths match; the S2
+   live kernel-wg test is the ultimate proof — but does S1 need a stronger
+   in-tree assertion than length, e.g. a KAT for the full msg1 against a
+   pinned ephemeral?)
+2. **mac1 = keyed-BLAKE2s-128, not HMAC.** Confirm against the canonical WG
+   construction that it's keyed-BLAKE2s (`blake2s` with the key param, NOT
+   HMAC-BLAKE2s), key = `BLAKE2s-256(LABEL_MAC1 || recipient_static_pub)`
+   (32-byte hash used as the keyed-BLAKE2s key, 16-byte output). The KAT vector
+   in §5.4a (`78df3b0a90577688ce9d272d04a8fb90` for key over 0x42×32 pubkey,
+   message `b"abc"`) pins this. Wrong hash width or HMAC vs keyed ⇒ silent drop.
+   Is my "HASH = BLAKE2s-256, MAC = keyed-BLAKE2s-128" reading correct?
 3. **Is in-process TAI64N monotonicity + a deferred persist hook acceptable
    for S1**, or must S1 land disk persistence (research §9 ties it to S2)? I
    argue persistence belongs with daemon/config integration (S6) since S1 has
-   no daemon wiring. Kill the deferral if a reviewer shows S1's harness can
-   regress the clock.
-4. **Is the wireguard-go-as-library harness a sufficient independent
-   reference**, or does the task's intent require the kernel `wg` /
-   `wg-quick` path (apt-install in the env)? wireguard-go is byte-identical to
-   kernel WG (same author, same protocol) and needs no root via `netstack`;
-   kernel `wg` needs root + a netns + module load. I claim wireguard-go is the
-   stronger, more portable independent reference. Refute if the loopback-UDP +
-   netstack peer is not a faithful stand-in.
+   no daemon wiring. Kill the deferral if a reviewer shows S1 can ship a
+   handshake path that regresses the clock.
+4. **Are the spec KAT vectors (§5.4a) a sufficient S1 merge gate** with the
+   live kernel-wg-on-VM test deferred to S2 (Option b)? The KAT vectors pin the
+   framing/MAC1/TAI64N bytes to the canonical construction (independent of
+   xpf's own code), but they do not prove an independent kernel peer accepts
+   the datagram. Is "KAT vectors green + engine self-handshake-with-framing
+   green" enough to merge S1? (Tied to Q7.)
 5. **Index allocation / receiver_index echo.** msg2 must echo msg1's
    sender_index as its receiver_index, and the responder's own sender_index
    must be installed for inbound demux. Does the existing `install_session`
    uniqueness discipline compose cleanly with framing-chosen indices, or is
-   there a race when the harness drives both roles in one process?
-6. **Harness `go test` / cargo boundary.** Is spawning a Go subprocess from a
-   Rust integration test the right seam, or should the harness be a Go test
-   that shells out to a tiny xpf framing CLI? I chose Rust-drives-Go because
-   the security-critical bytes are xpf's and must be asserted in xpf's test;
-   the reference is the dependency. Is the subprocess/UDP harness too flaky to
-   be a merge gate (the 5×flake gate is meant to answer this)?
+   there a race when both roles are driven in one process?
+6. **Are the precomputed KAT hex values trustworthy** given they were generated
+   from an offline oracle (the canonical BLAKE2s construction)? Should the test
+   instead re-derive them from first principles (raw `blake2` calls in the
+   test) so the test does not depend on a transcribed magic constant — i.e.
+   assert xpf's framing-layer hash == an independently-computed
+   `blake2s::Blake2s256` call in the same test, rather than a baked hex string?
+   (I lean: do BOTH — bake the hex AND re-derive — so a transcription typo and
+   an implementation bug can't both pass.)
+7. **S1/S2 boundary: (a) test-only UDP socket + VM-peer harness in S1, or (b)
+   defer the live kernel-wg-on-VM interop to S2?** (See §5.4b.) I recommend (b):
+   the live test now needs a dedicated VM peer + cross-VM UDP reachability, a
+   non-trivial harness better built once in S2 next to the datapath UDP
+   plumbing; S1 stays a clean, `cargo test`-provable wire-protocol-correctness
+   PR. PLAN-review MUST return an explicit (a)/(b) verdict. Reference peer =
+   kernel WireGuard on a real VM regardless. PLAN-KILL if neither boundary
+   gives a coherent S1.
