@@ -17,6 +17,7 @@
 
 mod cookie_reply;
 mod flow_cache_hit;
+mod nat_exception;
 mod rx_telemetry;
 
 use flow_cache_hit::{FlowCacheOutcome, stage_flow_cache_hit};
@@ -32,59 +33,7 @@ use super::*;
 use crate::policy::{evaluate_policy_result_with_len, evaluate_policy_with_len};
 
 use cookie_reply::{SynCookieReply, enqueue_syn_cookie_reply};
-
-#[inline]
-fn source_nat_decision_for_flow(
-    forwarding: &ForwardingState,
-    from_zone: &str,
-    to_zone: &str,
-    egress_ifindex: i32,
-    flow: &SessionFlow,
-    now_ns: u64,
-) -> Result<NatDecision, SourceNatFailure> {
-    if let Some(decision) = forwarding.static_nat.match_snat(flow.src_ip, from_zone) {
-        return Ok(decision);
-    }
-    match match_source_nat_for_flow_result_at(
-        forwarding,
-        from_zone,
-        to_zone,
-        egress_ifindex,
-        flow,
-        now_ns,
-    ) {
-        SourceNatLookup::Matched(decision) => Ok(decision),
-        SourceNatLookup::NoMatch => Ok(NatDecision::default()),
-        SourceNatLookup::Unavailable(failure) => Err(failure),
-    }
-}
-
-#[inline]
-fn record_source_nat_failure(
-    telemetry: &mut TelemetryContext,
-    worker_ctx: &WorkerContext,
-    meta: UserspaceDpMeta,
-    flow: &SessionFlow,
-    from_zone_id: u16,
-    to_zone_id: u16,
-    packet_length: u32,
-    failure: &SourceNatFailure,
-) {
-    telemetry.counters.touched = true;
-    telemetry.counters.exception_packets += 1;
-    let mut debug = ResolutionDebug::from_flow(meta.ingress_ifindex as i32, flow);
-    debug.from_zone = Some(from_zone_id);
-    debug.to_zone = Some(to_zone_id);
-    record_source_nat_exception(
-        worker_ctx.recent_exceptions,
-        &worker_ctx.ident,
-        packet_length,
-        Some(meta),
-        Some(&debug),
-        worker_ctx.forwarding,
-        failure,
-    );
-}
+use nat_exception::{record_source_nat_failure, source_nat_decision_for_flow};
 
 #[inline]
 fn filter_log_ingress_zone_id(
