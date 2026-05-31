@@ -1996,3 +1996,674 @@ fn input_dscp_filter_families_changed_detects_filter_removed_from_interface() {
         (true, false)
     );
 }
+
+// ============================================================
+// #1725 — engine evaluation coverage gaps
+//
+// filter/tests.rs already covers most of eval.rs / tx_selection.rs /
+// cache_sensitive.rs. The tests below fill the nine genuinely-uncovered
+// behaviors identified in docs/pr/1725-filter-engine-tests/plan.md:
+// Reject via the plain evaluate_filter path; missing-filter / empty-filter
+// default; address-family mismatch default; IPv6 baseline evaluate / lo0 /
+// interface-input paths; baseline counter increment; the non-routing
+// (PBR-reject) variant; the FilterState-keyed tx_selection wrappers; the
+// thin accessor predicates; and cached-vs-runtime baseline parity.
+// ============================================================
+
+// --- Gap 1: FilterAction::Reject through the plain evaluate_filter path ---
+#[test]
+fn evaluate_filter_returns_reject_action() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "reject-filter".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "reject-telnet".into(),
+                protocols: vec!["tcp".into()],
+                destination_ports: vec!["23".into()],
+                action: "reject".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+    );
+    let result = evaluate_filter(
+        &state,
+        "inet:reject-filter",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        40000,
+        23,
+        0,
+    );
+    assert_eq!(result.action, FilterAction::Reject);
+}
+
+// --- Gap 2: missing filter key + empty filter both fall through to Accept ---
+#[test]
+fn evaluate_filter_missing_key_returns_default_accept() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "present".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "deny-all".into(),
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+    );
+    // A key that was never compiled must return the implicit Accept default,
+    // never panic and never reach into an unrelated filter.
+    let result = evaluate_filter(
+        &state,
+        "inet:does-not-exist",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        1234,
+        80,
+        0,
+    );
+    assert_eq!(result.action, FilterAction::Accept);
+    assert_eq!(result, FilterResult::default());
+}
+
+#[test]
+fn evaluate_filter_empty_filter_returns_default_accept() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "empty".into(),
+            family: "inet".into(),
+            terms: vec![],
+        }],
+        &[],
+    );
+    let result = evaluate_filter(
+        &state,
+        "inet:empty",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        1234,
+        80,
+        0,
+    );
+    // A compiled-but-empty filter must fall through to the full default,
+    // distinguishable from the missing-key path: the filter exists with zero
+    // terms, so a compiler bug that dropped empty filters would also surface
+    // here.
+    assert_eq!(result, FilterResult::default());
+    let filter = state.filters.get("inet:empty").expect("empty filter compiled");
+    assert!(filter.terms.is_empty());
+}
+
+// --- Gap 3: address-family mismatch (V4 src + V6 dst) takes the default arm ---
+#[test]
+fn evaluate_filter_mixed_address_family_returns_default_accept() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "deny-all".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "deny".into(),
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+    );
+    // A V4 source with a V6 destination hits the `_ => default` arm in
+    // evaluate_filter_ref_counted rather than matching the discard term.
+    let result = evaluate_filter(
+        &state,
+        "inet:deny-all",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V6("2001:db8::2".parse().unwrap()),
+        PROTO_TCP,
+        1234,
+        80,
+        0,
+    );
+    // The default arm must produce the full default result, not just an Accept
+    // action with leftover rewrite/routing/forwarding-class fields.
+    assert_eq!(result, FilterResult::default());
+}
+
+// --- Gap 4: IPv6 baseline evaluate_filter / lo0 / interface-input paths ---
+#[test]
+fn evaluate_filter_ipv6_matches_term() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "v6-filter".into(),
+            family: "inet6".into(),
+            terms: vec![
+                FirewallTermSnapshot {
+                    name: "deny-from-doc".into(),
+                    source_addresses: vec!["2001:db8::/32".into()],
+                    action: "discard".into(),
+                    ..Default::default()
+                },
+                FirewallTermSnapshot {
+                    name: "allow-rest".into(),
+                    action: "accept".into(),
+                    ..Default::default()
+                },
+            ],
+        }],
+        &[],
+    );
+    // In-prefix source matches the discard term.
+    let denied = evaluate_filter(
+        &state,
+        "inet6:v6-filter",
+        IpAddr::V6("2001:db8::100".parse().unwrap()),
+        IpAddr::V6("2001:db8::200".parse().unwrap()),
+        PROTO_TCP,
+        40000,
+        443,
+        0,
+    );
+    assert_eq!(denied.action, FilterAction::Discard);
+    // Out-of-prefix source falls through to the accept term.
+    let allowed = evaluate_filter(
+        &state,
+        "inet6:v6-filter",
+        IpAddr::V6("2001:db9::1".parse().unwrap()),
+        IpAddr::V6("2001:db8::200".parse().unwrap()),
+        PROTO_TCP,
+        40000,
+        443,
+        0,
+    );
+    assert_eq!(allowed.action, FilterAction::Accept);
+}
+
+#[test]
+fn evaluate_lo0_filter_ipv6_path() {
+    let state = parse_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "protect-RE-v6".into(),
+            family: "inet6".into(),
+            terms: vec![
+                FirewallTermSnapshot {
+                    name: "allow-ssh".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["22".into()],
+                    action: "accept".into(),
+                    ..Default::default()
+                },
+                FirewallTermSnapshot {
+                    name: "deny-rest".into(),
+                    action: "discard".into(),
+                    ..Default::default()
+                },
+            ],
+        }],
+        &[],
+        &[],
+        "",
+        "protect-RE-v6",
+    );
+    let accepted = evaluate_lo0_filter(
+        &state,
+        true,
+        IpAddr::V6("2001:db8::1".parse().unwrap()),
+        IpAddr::V6("2001:db8::2".parse().unwrap()),
+        PROTO_TCP,
+        40000,
+        22,
+        0,
+    );
+    assert_eq!(accepted.action, FilterAction::Accept);
+    let discarded = evaluate_lo0_filter(
+        &state,
+        true,
+        IpAddr::V6("2001:db8::1".parse().unwrap()),
+        IpAddr::V6("2001:db8::2".parse().unwrap()),
+        PROTO_TCP,
+        40000,
+        80,
+        0,
+    );
+    assert_eq!(discarded.action, FilterAction::Discard);
+}
+
+#[test]
+fn evaluate_interface_filter_ipv6_input_path() {
+    let ifaces = vec![crate::InterfaceSnapshot {
+        name: "reth0.80".into(),
+        ifindex: 9,
+        filter_input_v6: "edge-in-v6".into(),
+        ..Default::default()
+    }];
+    let state = parse_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "edge-in-v6".into(),
+            family: "inet6".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "deny-web".into(),
+                protocols: vec!["tcp".into()],
+                destination_ports: vec!["443".into()],
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+        &ifaces,
+        "",
+        "",
+    );
+    let result = evaluate_interface_filter(
+        &state,
+        9,
+        true,
+        IpAddr::V6("2001:db8::10".parse().unwrap()),
+        IpAddr::V6("2001:db8::200".parse().unwrap()),
+        PROTO_TCP,
+        49152,
+        443,
+        0,
+    );
+    assert_eq!(result.action, FilterAction::Discard);
+}
+
+// --- Gap 5: baseline evaluate_filter_counted hit-counter increment (v4 + v6) ---
+#[test]
+fn evaluate_filter_counted_increments_term_counter() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "counted".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "count-web".into(),
+                protocols: vec!["tcp".into()],
+                destination_ports: vec!["80".into()],
+                action: "accept".into(),
+                count: "web-hits".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+    );
+    let result = evaluate_filter_counted(
+        &state,
+        "inet:counted",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        40000,
+        80,
+        0,
+        1400,
+    );
+    assert_eq!(result.action, FilterAction::Accept);
+    let filter = state.filters.get("inet:counted").expect("counted filter");
+    let term = filter.terms.first().expect("first term");
+    assert_eq!(term.counter.packets.load(Ordering::Relaxed), 1);
+    assert_eq!(term.counter.bytes.load(Ordering::Relaxed), 1400);
+
+    // A non-matching packet (wrong port) must not bump the counter.
+    let miss = evaluate_filter_counted(
+        &state,
+        "inet:counted",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        40000,
+        443,
+        0,
+        1400,
+    );
+    assert_eq!(miss.action, FilterAction::Accept);
+    assert_eq!(term.counter.packets.load(Ordering::Relaxed), 1);
+    assert_eq!(term.counter.bytes.load(Ordering::Relaxed), 1400);
+}
+
+#[test]
+fn evaluate_filter_counted_increments_term_counter_ipv6() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "counted6".into(),
+            family: "inet6".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "count-web".into(),
+                protocols: vec!["tcp".into()],
+                destination_ports: vec!["80".into()],
+                action: "accept".into(),
+                count: "web-hits-v6".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+    );
+    let result = evaluate_filter_counted(
+        &state,
+        "inet6:counted6",
+        IpAddr::V6("2001:db8::1".parse().unwrap()),
+        IpAddr::V6("2001:db8::2".parse().unwrap()),
+        PROTO_TCP,
+        40000,
+        80,
+        0,
+        1500,
+    );
+    assert_eq!(result.action, FilterAction::Accept);
+    let filter = state.filters.get("inet6:counted6").expect("counted filter");
+    let term = filter.terms.first().expect("first term");
+    assert_eq!(term.counter.packets.load(Ordering::Relaxed), 1);
+    assert_eq!(term.counter.bytes.load(Ordering::Relaxed), 1500);
+}
+
+// --- Gap 6: evaluate_interface_filter_non_routing_counted PBR-reject behavior ---
+#[test]
+fn interface_filter_non_routing_counted_defers_pbr_term() {
+    let ifaces = vec![crate::InterfaceSnapshot {
+        name: "reth1.0".into(),
+        ifindex: 12,
+        filter_input_v4: "mixed-pbr".into(),
+        ..Default::default()
+    }];
+    let state = parse_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "mixed-pbr".into(),
+            family: "inet".into(),
+            terms: vec![
+                FirewallTermSnapshot {
+                    name: "route-to-blue".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["5201".into()],
+                    action: "accept".into(),
+                    count: "pbr-hits".into(),
+                    routing_instance: "blue".into(),
+                    ..Default::default()
+                },
+                FirewallTermSnapshot {
+                    name: "plain-deny".into(),
+                    protocols: vec!["udp".into()],
+                    destination_ports: vec!["53".into()],
+                    action: "discard".into(),
+                    count: "dns-hits".into(),
+                    ..Default::default()
+                },
+            ],
+        }],
+        &[],
+        &ifaces,
+        "",
+        "",
+    );
+
+    // A packet that matches the routing-instance term must short-circuit to
+    // the default (route-lookup wins) and must NOT increment that term's
+    // counter — the non-routing evaluator returns before recording.
+    let pbr = evaluate_interface_filter_non_routing_counted(
+        &state,
+        12,
+        false,
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        40000,
+        5201,
+        0,
+        1400,
+    );
+    assert_eq!(pbr.action, FilterAction::Accept);
+    assert!(pbr.routing_instance.is_empty());
+    let filter = state.iface_filter_v4_fast.get(&12).expect("input filter");
+    assert_eq!(filter.terms[0].counter.packets.load(Ordering::Relaxed), 0);
+
+    // A packet matching the plain (non-routing) term gets its action and a
+    // counter bump as normal.
+    let plain = evaluate_interface_filter_non_routing_counted(
+        &state,
+        12,
+        false,
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_UDP,
+        40000,
+        53,
+        0,
+        500,
+    );
+    assert_eq!(plain.action, FilterAction::Discard);
+    assert_eq!(filter.terms[1].counter.packets.load(Ordering::Relaxed), 1);
+    assert_eq!(filter.terms[1].counter.bytes.load(Ordering::Relaxed), 500);
+}
+
+// --- Gap 7: FilterState-keyed tx_selection dispatch wrappers ---
+#[test]
+fn interface_filter_tx_selection_wrappers_dispatch_and_default() {
+    let ifaces = vec![crate::InterfaceSnapshot {
+        name: "reth0.80".into(),
+        ifindex: 7,
+        filter_input_v4: "tx-in".into(),
+        filter_output_v4: "tx-out".into(),
+        ..Default::default()
+    }];
+    let state = parse_filter_state(
+        &[
+            FirewallFilterSnapshot {
+                name: "tx-in".into(),
+                family: "inet".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "classify-in".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["5201".into()],
+                    action: "accept".into(),
+                    forwarding_class: "iperf-a".into(),
+                    ..Default::default()
+                }],
+            },
+            FirewallFilterSnapshot {
+                name: "tx-out".into(),
+                family: "inet".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "classify-out".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["5202".into()],
+                    action: "accept".into(),
+                    forwarding_class: "iperf-b".into(),
+                    ..Default::default()
+                }],
+            },
+        ],
+        &[],
+        &ifaces,
+        "",
+        "",
+    );
+
+    let input = evaluate_interface_filter_tx_selection_counted(
+        &state,
+        7,
+        false,
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        40000,
+        5201,
+        0,
+        1400,
+    );
+    assert_eq!(input.action, FilterAction::Accept);
+    assert_eq!(input.forwarding_class, Some("iperf-a"));
+
+    let output = evaluate_interface_output_filter_tx_selection_counted(
+        &state,
+        7,
+        false,
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        40000,
+        5202,
+        0,
+        1400,
+    );
+    assert_eq!(output.action, FilterAction::Accept);
+    assert_eq!(output.forwarding_class, Some("iperf-b"));
+
+    // No filter bound to an unrelated ifindex returns the default.
+    let none_in = evaluate_interface_filter_tx_selection_counted(
+        &state,
+        99,
+        false,
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        40000,
+        5201,
+        0,
+        1400,
+    );
+    assert_eq!(none_in.action, FilterAction::Accept);
+    assert_eq!(none_in.forwarding_class, None);
+}
+
+// --- Gap 8: thin accessor predicates (grouped, table-driven) ---
+#[test]
+fn thin_accessor_predicates() {
+    // Two separate input ifindices so the TX-selection and DSCP-match
+    // accessors are cross-checked: ifindex 21 is TX-selection-only (a
+    // forwarding-class term, no DSCP match), ifindex 22 is DSCP-only (a DSCP
+    // match, no forwarding class). An accessor that consulted the wrong set
+    // (aliasing bug) would flip on one of the cross-negative assertions
+    // below. ifindex 23 carries a DSCP-match output filter.
+    let ifaces = vec![
+        crate::InterfaceSnapshot {
+            name: "reth1.0".into(),
+            ifindex: 21,
+            filter_input_v4: "tx-only-in".into(),
+            ..Default::default()
+        },
+        crate::InterfaceSnapshot {
+            name: "reth1.1".into(),
+            ifindex: 22,
+            filter_input_v4: "dscp-only-in".into(),
+            ..Default::default()
+        },
+        crate::InterfaceSnapshot {
+            name: "reth1.2".into(),
+            ifindex: 23,
+            filter_output_v4: "dscp-out".into(),
+            ..Default::default()
+        },
+    ];
+    let state = parse_filter_state(
+        &[
+            FirewallFilterSnapshot {
+                name: "tx-only-in".into(),
+                family: "inet".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "classify".into(),
+                    protocols: vec!["tcp".into()],
+                    action: "accept".into(),
+                    forwarding_class: "iperf-a".into(),
+                    ..Default::default()
+                }],
+            },
+            FirewallFilterSnapshot {
+                name: "dscp-only-in".into(),
+                family: "inet".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "match-ef".into(),
+                    dscp_values: vec![46],
+                    action: "accept".into(),
+                    ..Default::default()
+                }],
+            },
+            FirewallFilterSnapshot {
+                name: "dscp-out".into(),
+                family: "inet".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "match-ef".into(),
+                    dscp_values: vec![46],
+                    action: "accept".into(),
+                    ..Default::default()
+                }],
+            },
+        ],
+        &[],
+        &ifaces,
+        "",
+        "",
+    );
+
+    // TX-selection accessor reads the TX-selection set, NOT the DSCP set:
+    // true on the TX-only ifindex, false on the DSCP-only ifindex.
+    assert!(interface_filter_affects_tx_selection(&state, 21, false));
+    assert!(!interface_filter_affects_tx_selection(&state, 22, false));
+    assert!(!interface_filter_affects_tx_selection(&state, 21, true));
+    assert!(filter_state_has_input_tx_selection(&state, false));
+    assert!(!filter_state_has_input_tx_selection(&state, true));
+
+    // DSCP-match accessor reads the DSCP set, NOT the TX-selection set:
+    // true on the DSCP-only ifindex, false on the TX-only ifindex.
+    assert!(interface_input_filter_has_dscp_match(&state, 22, false));
+    assert!(!interface_input_filter_has_dscp_match(&state, 21, false));
+    assert!(!interface_input_filter_has_dscp_match(&state, 22, true));
+    assert!(interface_output_filter_has_dscp_match(&state, 23, false));
+    assert!(!interface_output_filter_has_dscp_match(&state, 23, true));
+    // No filter bound to an unrelated ifindex.
+    assert!(!interface_input_filter_has_dscp_match(&state, 99, false));
+    assert!(!interface_filter_affects_tx_selection(&state, 99, false));
+}
+
+// --- Gap 9: cached-vs-runtime baseline parity for a plain (no-policer) term ---
+#[test]
+fn cached_and_runtime_tx_selection_agree_on_plain_term() {
+    let ifaces = vec![crate::InterfaceSnapshot {
+        name: "reth0.80".into(),
+        ifindex: 30,
+        filter_input_v4: "parity".into(),
+        ..Default::default()
+    }];
+    let state = parse_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "parity".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "classify".into(),
+                protocols: vec!["tcp".into()],
+                destination_ports: vec!["5201".into()],
+                action: "accept".into(),
+                forwarding_class: "iperf-a".into(),
+                dscp_rewrite: Some(46),
+                log: true,
+                ..Default::default()
+            }],
+        }],
+        &[],
+        &ifaces,
+        "",
+        "",
+    );
+    let filter = state.iface_filter_v4_fast.get(&30).expect("input filter");
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+
+    let runtime = evaluate_filter_ref_tx_selection_runtime_counted(
+        filter, src, dst, PROTO_TCP, 40000, 5201, 0, 0, 1,
+    );
+    let cached = evaluate_filter_ref_tx_selection_cached(filter, src, dst, PROTO_TCP, 40000, 5201, 0);
+
+    // A term with no three-color policer must yield identical action,
+    // forwarding-class, DSCP rewrite, and log-match identity on both paths.
+    assert_eq!(runtime.action, cached.action);
+    assert_eq!(runtime.action, FilterAction::Accept);
+    assert_eq!(
+        runtime.forwarding_class,
+        cached.forwarding_class.as_deref()
+    );
+    assert_eq!(runtime.forwarding_class, Some("iperf-a"));
+    assert_eq!(runtime.dscp_rewrite, cached.dscp_rewrite);
+    assert_eq!(runtime.dscp_rewrite, Some(46));
+    assert_eq!(runtime.log_match, cached.log_match);
+    assert!(runtime.log_match.is_some());
+    assert!(!runtime.policer_drop);
+}
