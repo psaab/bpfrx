@@ -36,6 +36,7 @@
 
 use std::sync::Arc;
 
+use super::filter::{emit_cached_input_filter_log, emit_cached_output_filter_log};
 use super::worker::{WorkerFlowCacheState, WorkerScratch, WorkerTxCounters, WorkerTxPipeline};
 use super::*;
 
