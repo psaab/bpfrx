@@ -1,6 +1,25 @@
 # #1701 — Split `pkg/config/types.go` (2055 LOC) by domain
 
-**Status:** DRAFT v1 — pending adversarial plan review
+**Status:** DRAFT v2 — incorporates AGY r1 domain-cohesion fixes (IPsec/IKE
+and DynamicAddress/Feed → security; SchedulerConfig → security, not CoS);
+pending Codex r1 + Claude-SMR r1 convergence
+
+## Changelog
+- **v2:** AGY r1 returned PLAN-NEEDS-MAJOR with three valid domain-cohesion
+  re-buckets (all verified against the `SecurityConfig` struct nesting in
+  types.go and the Junos hierarchy):
+  - IPsec/IKE types (`IPsecConfig`…`IPsecVPN`) moved from `types_routing.go`
+    to `types_security.go` — they nest under `SecurityConfig.IPsec`
+    (types.go:1205) and live at `[edit security ike/ipsec]` in Junos.
+  - `DynamicAddressConfig`/`FeedServer`/`FeedEntry`/`AddressBinding` moved
+    from `types_system.go` to `types_security.go` — they nest under
+    `SecurityConfig.DynamicAddress` (types.go:1206), `[edit security
+    dynamic-address]`.
+  - `SchedulerConfig` (the `[edit schedulers]` time-range scheduler with
+    StartTime/StopTime, referenced by `Policy.SchedulerName`) moved from
+    `types_cos.go` to `types_security.go` — it is NOT a CoS queue scheduler
+    (`CoSScheduler` stays in CoS). Name-collision trap avoided.
+  The §3 layout table and LOC estimates are updated accordingly.
 
 ## 1. Issue framing
 
@@ -65,20 +84,26 @@ This is identical in shape to #1699 (which split `ast.go` into
 | `types.go` (kept) | `Config` root struct + interface-name/resolution helpers: `LinuxIfName`, `InterfaceSlot`, `SlotToNodeID`, `(*Config).RethToPhysical`, `ResolveReth`, `ResolveFab`, `ResolveKernelIfName`, `DHCPLeaseKey`, `IRBToBridge`, `(*Config).TunnelNameMap` | ~340 |
 | `types_chassis.go` | `ChassisConfig`, `ClusterConfig`, `RedundancyGroup`, `InterfaceMonitor`, `IPMonitoring`, `IPMonitorTarget`, `EventPolicy`, `EventWithin`, `BridgeDomainConfig` | ~110 |
 | `types_interfaces.go` | `InterfacesConfig`, `InterfaceConfig`, `AggregatedEtherOptions`, `InterfaceUnit`, `VRRPGroup`, `DHCPv6ClientConfig`, `DHCPInetOptions` | ~100 |
-| `types_security.go` | `SecurityConfig`, `FlowConfig`, `FlowTraceoptions`, `TracePacketFilter`, `ALGConfig`, `TCPSessionConfig`, `LogConfig`, `SyslogTransport`, `SyslogStream`, `SSHKnownHostKey`, `PreIDDefaultPolicy`, `ZoneConfig`, `HostInboundTraffic`, `ZonePairPolicies`, `Policy`, `PolicyMatch`, `PolicyAction`+const, `PolicyLog`, all NAT (`NATConfig` … `StaticNATRule`, `NATType`+const), all Screen (`LimitSessionScreen` … `SynFloodConfig`), `AddressBook`, `Address`, `AddressSet`, `ApplicationsConfig`, `ApplicationSet`, `Application` | ~470 |
-| `types_routing.go` | `PolicyOptionsConfig`, `ASPathDef`, `CommunityDef`, `PrefixList`, `PolicyStatement`, `PolicyTerm`, `RouteFilter`, `RoutingOptionsConfig`, `GenerateRoute`, `RibGroup`, `NextHopEntry`, `StaticRoute`, `ProtocolsConfig`, `LLDPConfig`/`LLDPInterface`, OSPFv3/`RIPConfig`/ISIS, `RAInterfaceConfig`/`RAPrefix`, OSPF, BGP, `TunnelConfig`, `IPsecConfig` … `IPsecVPN`, `RoutingInstanceConfig` | ~430 |
-| `types_cos.go` | `SchedulerConfig`, `ClassOfServiceConfig`, `CoSForwardingClass`, all `CoS*` classifier/rewrite/scheduler/interface types, `CoSFairnessExpectation` | ~150 |
-| `types_system.go` | `SystemConfig`, `UserspaceConfig`, `SharedUMEMConfig`, `RootAuthConfig`, `ArchivalConfig`, `InternetOptionsConfig`, `SystemServicesConfig`, `SSHServiceConfig`, `WebManagementConfig`, `APIAuthConfig`/`APIAuthUser`, syslog/`SNMP*`, `LoginClassPermission`+const+`LoginClassPermissions` var, `LoginConfig`/`LoginUser`, `ServicesConfig`, RPM (`RPMConfig`/`RPMProbe`/`RPMTest`+6 `Effective*` methods+`Default*` const block), flow-monitoring/NetFlow, `ForwardingOptionsConfig`/port-mirror, DHCP relay, sampling, `FirewallConfig` … `PrefixListRef`, DHCP server, dynamic-address feeds | ~450 |
+| `types_security.go` | `SchedulerConfig` (`[edit schedulers]` time-range), `SecurityConfig`, `FlowConfig`, `FlowTraceoptions`, `TracePacketFilter`, `ALGConfig`, `TCPSessionConfig`, `LogConfig`, `SyslogTransport`, `SyslogStream`, `SSHKnownHostKey`, `PreIDDefaultPolicy`, `ZoneConfig`, `HostInboundTraffic`, `ZonePairPolicies`, `Policy`, `PolicyMatch`, `PolicyAction`+const, `PolicyLog`, all NAT (`NATConfig` … `StaticNATRule`, `NATType`+const), all Screen (`LimitSessionScreen` … `SynFloodConfig`), `AddressBook`, `Address`, `AddressSet`, `ApplicationsConfig`, `ApplicationSet`, `Application`, all IPsec/IKE (`IPsecConfig` … `IPsecVPN`), DynamicAddress (`DynamicAddressConfig`/`FeedServer`/`FeedEntry`/`AddressBinding`) | ~595 |
+| `types_routing.go` | `PolicyOptionsConfig`, `ASPathDef`, `CommunityDef`, `PrefixList`, `PolicyStatement`, `PolicyTerm`, `RouteFilter`, `RoutingOptionsConfig`, `GenerateRoute`, `RibGroup`, `NextHopEntry`, `StaticRoute`, `ProtocolsConfig`, `LLDPConfig`/`LLDPInterface`, OSPFv3/`RIPConfig`/ISIS, `RAInterfaceConfig`/`RAPrefix`, OSPF, BGP, `TunnelConfig`, `RoutingInstanceConfig` | ~340 |
+| `types_cos.go` | `ClassOfServiceConfig`, `CoSForwardingClass`, all `CoS*` classifier/rewrite/scheduler/interface types (incl. CoS queue `CoSScheduler`), `CoSFairnessExpectation` | ~140 |
+| `types_system.go` | `SystemConfig`, `UserspaceConfig`, `SharedUMEMConfig`, `RootAuthConfig`, `ArchivalConfig`, `InternetOptionsConfig`, `SystemServicesConfig`, `SSHServiceConfig`, `WebManagementConfig`, `APIAuthConfig`/`APIAuthUser`, syslog/`SNMP*`, `LoginClassPermission`+const+`LoginClassPermissions` var, `LoginConfig`/`LoginUser`, `ServicesConfig`, RPM (`RPMConfig`/`RPMProbe`/`RPMTest`+6 `Effective*` methods+`Default*` const block), flow-monitoring/NetFlow, `ForwardingOptionsConfig`/port-mirror, DHCP relay, sampling, `FirewallConfig` … `PrefixListRef`, DHCP server | ~420 |
 
 Domain assignment follows the `Config` root struct's own field grouping
-(`Security`, `Interfaces`, `RoutingOptions`+`Protocols`+`RoutingInstances`,
+AND the nesting of types under `SecurityConfig` (types.go:1194-1210):
+`Security`, `Interfaces`, `RoutingOptions`+`Protocols`+`RoutingInstances`,
 `ClassOfService`, `System`+`Services`+`ForwardingOptions`+`Firewall`,
-`Chassis`+`EventOptions`+`BridgeDomains`). `Firewall`/`Services`/
-`ForwardingOptions`/DHCP-server land in `types_system.go` as the
-"platform services" bucket; NAT/screen/zones/applications land in
-`types_security.go` as the security-policy bucket. The exact bucket of a
-borderline type (e.g. `FirewallConfig` vs security) is a reviewer
-question (§11 Q4) — it does not affect correctness, only cohesion.
+`Chassis`+`EventOptions`+`BridgeDomains`. Per AGY r1, types that nest
+under `SecurityConfig` — IPsec/IKE (`SecurityConfig.IPsec`) and
+DynamicAddress/Feed (`SecurityConfig.DynamicAddress`) — go in
+`types_security.go`, not routing/system. `SchedulerConfig` is the
+`[edit schedulers]` time-range scheduler (Policy.SchedulerName), distinct
+from the CoS queue `CoSScheduler`, so it goes in `types_security.go` not
+`types_cos.go`. `Firewall`/`Services`/`ForwardingOptions`/DHCP-server land
+in `types_system.go` as the "platform services" bucket; NAT/screen/zones/
+applications land in `types_security.go` as the security-policy bucket. The
+exact bucket of a borderline type (e.g. `FirewallConfig` vs security) is a
+reviewer question (§11 Q4) — it does not affect correctness, only cohesion.
 
 ## 4. Mechanical method — byte-identical motion
 
