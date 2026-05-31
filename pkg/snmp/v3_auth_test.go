@@ -91,6 +91,9 @@ func buildV3AuthPacket(t *testing.T, authProto string, userName string, engineID
 // built by buildV3AuthPacket.
 func runVerify(t *testing.T, authProto, userName string, engineID []byte, longForm bool) bool {
 	t.Helper()
+	// Resolve the on-wire engineID once here so the localized authKey is
+	// derived from the exact engineID that appears in the packet. Pass
+	// longForm=false to buildV3AuthPacket so it does not pad a second time.
 	engineID = authTestEngineID(engineID, longForm)
 	hashFn, hashLen := authHashFunc(authProto)
 	authKey := passwordToKey("the-auth-password-1234", engineID, hashFn, hashLen)
@@ -98,7 +101,7 @@ func runVerify(t *testing.T, authProto, userName string, engineID []byte, longFo
 		t.Fatalf("passwordToKey returned nil")
 	}
 
-	pkt, start, end := buildV3AuthPacket(t, authProto, userName, engineID, authKey, longForm)
+	pkt, start, end := buildV3AuthPacket(t, authProto, userName, engineID, authKey, false)
 
 	a := &Agent{
 		engineID:   engineID,
