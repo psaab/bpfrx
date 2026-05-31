@@ -41,8 +41,7 @@ func (x *xfrmManager) Apply(vpns map[string]*config.IPsecVPN) error {
 		}
 
 		// Check if already exists
-		if _, err := x.ops.LinkByName(ifName); err == nil {
-			link, _ := x.ops.LinkByName(ifName)
+		if link, err := x.ops.LinkByName(ifName); err == nil {
 			x.ops.LinkSetUp(link)
 			slog.Debug("xfrmi already exists", "name", ifName, "if_id", ifID)
 			// Track if not already tracked
