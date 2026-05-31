@@ -16,7 +16,7 @@ leaves may be typed (`Node.ValueType` / `ValueDesc` / `ValueExamples` /
 ## Config-mode grammar → `pkg/config` `setSchema`
 
 The `set` / `delete` / `show` / `edit` configuration grammar is owned by
-`config.setSchema` (a tree of `schemaNode` in `pkg/config/ast.go`), NOT by
+`config.setSchema` (a tree of `schemaNode` in `pkg/config/schema.go`), NOT by
 cmdtree. `setSchema` drives **four** things off one tree:
 
 1. **Structural completion** — what keywords are valid at each position.
@@ -24,7 +24,8 @@ cmdtree. `setSchema` drives **four** things off one tree:
    `Node.Keys` (`SetPath`, `ast_edit.go`). This is parser-critical: the
    replace-vs-container decision keys on `children == nil`.
 3. **Value-slot `?` completion** — for a typed leaf, the placeholder
-   (`<rate>`) + example values (`CompleteSetPathWithValues`, `ast.go`).
+   (`<rate>`) + example values (`CompleteSetPathWithValues`,
+   `schema_complete.go`).
 4. **Commit-check validation** — the typed-leaf gate
    (`SchemaValidate` + the generic walker in `schema_walk.go`).
 
@@ -40,7 +41,7 @@ only supplies the config-mode TOP-LEVEL keywords (`set`/`delete`/`commit`/
 
 ## How to add a config-mode typed leaf
 
-Edit the leaf's `schemaNode` in `setSchema` (`pkg/config/ast.go`). Set:
+Edit the leaf's `schemaNode` in `setSchema` (`pkg/config/schema.go`). Set:
 
 ```go
 "transmit-rate": {

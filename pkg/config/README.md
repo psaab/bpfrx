@@ -16,6 +16,13 @@ nothing internal.
   Parses one flat-set line into the path components. The caller then
   applies that path with `tree.SetPath()` to build the AST.
 - `ConfigTree` — `ast.go`. Hierarchical node tree built by both shapes.
+  `ast.go` owns the AST node types (`Node`, `ConfigTree`) and tree
+  navigation/mutation helpers — the parser's data model.
+- `setSchema` + `schemaNode` — `schema.go` (split out of `ast.go` in
+  #1699). The config-mode grammar SSOT; see `docs/config-schema.md`.
+  Completion / path-resolution helpers (`CompleteSetPath`,
+  `CompleteSetPathWithValues`, `ResolveConsumedSetPathTokens`) live in
+  `schema_complete.go`.
 - `Config` — `types.go`. The fully typed result every consumer wants.
 - `CompileConfig(tree) (*Config, error)` — `compiler.go`. AST-to-typed-
   struct walker. Clones the tree, expands `apply-groups` (with

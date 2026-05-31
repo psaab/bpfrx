@@ -10,7 +10,7 @@ command here automatically propagates to all three frontends.
 > only. The **config-mode `set`/`delete`/`show`/`edit` grammar** — its
 > structural completion, flat-set token grouping, value-slot `?`
 > completion, AND the commit-check typed-leaf validation — is owned by
-> `config.setSchema` in `pkg/config/ast.go`, not by cmdtree. The live
+> `config.setSchema` in `pkg/config/schema.go`, not by cmdtree. The live
 > config-mode completers (`pkg/cli` `completeConfigWithDesc`, `pkg/grpcapi`
 > `completeConfigPairs`) route `set` paths through
 > `config.CompleteSetPathWithValues` over `setSchema` and never consult a
