@@ -67,7 +67,6 @@ var legacyDataplaneImportAllowlist = map[string]string{
 	"pkg/grpcapi/runtime.go":                   "#1516 grpcRuntime interface declares the narrow gRPC dataplane surface; still depends on root pkg/dataplane type names (SessionKey, CounterValue, etc.) until those types move to a domain package",
 	"pkg/grpcapi/server_helpers.go":            "gRPC helpers still format legacy dataplane types and bridge runtime accessors",
 	"pkg/grpcapi/server_sessions.go":           "gRPC session RPCs still use legacy session types",
-	"pkg/grpcapi/server_show.go":               "gRPC show dispatcher still reaches legacy dataplane state",
 	"pkg/grpcapi/server_show_cluster_text.go":  "cluster text output still reads legacy dataplane state",
 	"pkg/grpcapi/server_show_flow.go":          "flow text output still uses legacy session keys and values",
 	"pkg/grpcapi/server_show_policies_text.go": "policy text output still uses legacy counters",
