@@ -429,7 +429,8 @@ impl WgEngine {
     /// peer, build a framed WG type-2 response, reserve our responder
     /// sender_index, and install the derived (unconfirmed) transport
     /// session. Writes the 92-byte response at `out[0..92]` and returns
-    /// `(our_sender_index, peer_pubkey)`.
+    /// `(peer_pubkey, our_sender_index)` — pubkey first, matching the return
+    /// expression below.
     pub(crate) fn consume_initiation_create_response(
         &self,
         msg: &[u8],

@@ -36,8 +36,9 @@ pub(crate) mod framing;
 // so the security-critical framing is auditable in isolation and the
 // engine stays under the modularity threshold.
 pub(crate) mod handshake;
-// WG handshake orchestration on WgEngine (the four slow-path entry points +
-// the two-phase index reservation). Split out of engine.rs to keep it under
+// WG handshake orchestration on WgEngine (the three slow-path entry points —
+// create_initiation, consume_response, consume_initiation_create_response —
+// plus the two-phase index reservation). Split out of engine.rs to keep it under
 // the modularity threshold; same `wg` module, so it reaches engine internals
 // via `pub(in crate::afxdp::wg)` visibility.
 pub(crate) mod handshake_session;
