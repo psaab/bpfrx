@@ -4512,10 +4512,3 @@ top.
   divided-ceiling regression floor; >=95% guarantee stays SOLO (#1630).
 - **File(s)**: docs/fairness-regimes.md, test/incus/cos-simul-load-smoke.sh,
   docs/pr/1614-multi-rss-cos/plan.md
-
-## #1698 routing.go domain-manager split — Copilot review fix
-- **Timestamp**: 2026-05-31
-- **Action**: Fix double `LinkByName` call in xfrmManager.Apply: result of
-  first call was discarded and the lookup repeated immediately. Collapsed to
-  a single call that reuses the returned link for LinkSetUp.
-- **File(s)**: pkg/routing/xfrm.go
