@@ -697,3 +697,215 @@ mod simd_checksum_tests {
         assert_eq!(direct, composed);
     }
 }
+
+#[cfg(test)]
+mod l4_offset_helper_tests {
+    use super::*;
+    use crate::afxdp::PROTO_ICMP;
+
+    #[test]
+    fn v4_field_delta_table() {
+        // IPv4: TCP +16, UDP +6. No ICMPv6 arm — IPv4 packets never carry
+        // ICMPv6 and the IPv4 NAT adjust paths call the v4 helper without
+        // protocol filtering, so PROTO_ICMPV6 MUST fall through to None
+        // (no-op), not produce ihl+2.
+        assert_eq!(l4_checksum_field_delta_v4(PROTO_TCP), Some(16));
+        assert_eq!(l4_checksum_field_delta_v4(PROTO_UDP), Some(6));
+        assert_eq!(l4_checksum_field_delta_v4(PROTO_ICMP), None);
+        assert_eq!(l4_checksum_field_delta_v4(PROTO_ICMPV6), None);
+        assert_eq!(l4_checksum_field_delta_v4(0), None);
+    }
+
+    #[test]
+    fn v6_field_delta_table() {
+        // IPv6: TCP +16, UDP +6, ICMPv6 +2.
+        assert_eq!(l4_checksum_field_delta_v6(PROTO_TCP), Some(16));
+        assert_eq!(l4_checksum_field_delta_v6(PROTO_UDP), Some(6));
+        assert_eq!(l4_checksum_field_delta_v6(PROTO_ICMPV6), Some(2));
+        assert_eq!(l4_checksum_field_delta_v6(PROTO_ICMP), None);
+        assert_eq!(l4_checksum_field_delta_v6(0), None);
+    }
+
+    #[test]
+    fn v6_addr_bytes_offsets_match_old_constants() {
+        // adjust_l4_checksum_ipv6_addr_bytes previously hard-coded
+        // 56/46/42; now derived as 40 + delta. Confirm bit-identical.
+        for (proto, want) in [(PROTO_TCP, 56usize), (PROTO_UDP, 46), (PROTO_ICMPV6, 42)] {
+            let delta = l4_checksum_field_delta_v6(proto).expect("v6 proto has delta");
+            assert_eq!(40usize + delta, want, "proto {proto}");
+        }
+    }
+
+    #[test]
+    fn udp_checksum_optional_is_udp_only() {
+        assert!(l4_udp_checksum_optional(PROTO_UDP));
+        assert!(!l4_udp_checksum_optional(PROTO_TCP));
+        assert!(!l4_udp_checksum_optional(PROTO_ICMPV6));
+        assert!(!l4_udp_checksum_optional(PROTO_ICMP));
+    }
+
+    #[test]
+    fn zero_checksum_illegal_preserves_v4_v6_asymmetry() {
+        // The #1669 trap: IPv4 canonicalizes UDP zero only; IPv6
+        // canonicalizes BOTH UDP and ICMPv6 zero. A blind unify would
+        // break ICMPv6.
+        // IPv4: UDP only.
+        assert!(adjust_zero_checksum_illegal(PROTO_UDP, ChecksumFamily::V4));
+        assert!(!adjust_zero_checksum_illegal(PROTO_TCP, ChecksumFamily::V4));
+        assert!(!adjust_zero_checksum_illegal(
+            PROTO_ICMPV6,
+            ChecksumFamily::V4
+        ));
+        assert!(!adjust_zero_checksum_illegal(
+            PROTO_ICMP,
+            ChecksumFamily::V4
+        ));
+        // IPv6: UDP and ICMPv6.
+        assert!(adjust_zero_checksum_illegal(PROTO_UDP, ChecksumFamily::V6));
+        assert!(adjust_zero_checksum_illegal(
+            PROTO_ICMPV6,
+            ChecksumFamily::V6
+        ));
+        assert!(!adjust_zero_checksum_illegal(PROTO_TCP, ChecksumFamily::V6));
+        assert!(!adjust_zero_checksum_illegal(
+            PROTO_ICMP,
+            ChecksumFamily::V6
+        ));
+    }
+
+    /// Build a minimal IPv4 + L4 frame (no Ethernet) for adjust tests.
+    /// `proto` goes in the IPv4 protocol byte; src/dst at the usual
+    /// offsets. Returns a 60-byte buffer (20 IHL + 40 payload room).
+    fn ipv4_frame(proto: u8) -> Vec<u8> {
+        let mut p = vec![0u8; 60];
+        p[0] = 0x45; // version 4, IHL 5
+        p[9] = proto;
+        // src 10.0.0.1, dst 10.0.0.2
+        p[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        p[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        p
+    }
+
+    #[test]
+    fn ipv4_proto_58_is_noop_not_adjusted() {
+        // Regression guard (Codex r2 #2): an IPv4 packet with protocol 58
+        // (ICMPv6 number) must hit the helper's None arm and no-op via
+        // Some(()), NOT adjust the bytes at ihl+2. Verify the packet is
+        // untouched.
+        let mut p = ipv4_frame(PROTO_ICMPV6);
+        let before = p.clone();
+        let r = adjust_l4_checksum_ipv4(
+            &mut p,
+            20,
+            PROTO_ICMPV6,
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 1, 1, 1),
+            Ipv4Addr::new(10, 0, 0, 2),
+            Ipv4Addr::new(10, 2, 2, 2),
+        );
+        assert_eq!(r, Some(()));
+        assert_eq!(p, before, "IPv4 proto-58 must not be adjusted");
+
+        // Same for the *_words and *_src/_dst entry points.
+        let mut p = ipv4_frame(PROTO_ICMPV6);
+        let before = p.clone();
+        assert_eq!(
+            adjust_l4_checksum_ipv4_src(
+                &mut p,
+                20,
+                PROTO_ICMPV6,
+                Ipv4Addr::new(10, 0, 0, 1),
+                Ipv4Addr::new(10, 1, 1, 1),
+            ),
+            Some(())
+        );
+        assert_eq!(p, before, "IPv4 proto-58 (_src) must not be adjusted");
+    }
+
+    #[test]
+    fn ipv4_recognized_proto_overflow_returns_none() {
+        // Regression guard (Codex r2 #1): a recognized protocol (TCP/UDP)
+        // with an IHL so large that ihl.checked_add(delta) overflows usize
+        // must return None (failure), NOT Some(()) (no-op success). The
+        // helper returns Some(delta) for the recognized proto; the
+        // overflow is caught by the call-site `?` on checked_add.
+        let mut p = ipv4_frame(PROTO_TCP);
+        assert_eq!(
+            adjust_l4_checksum_ipv4(
+                &mut p,
+                usize::MAX,
+                PROTO_TCP,
+                Ipv4Addr::new(10, 0, 0, 1),
+                Ipv4Addr::new(10, 1, 1, 1),
+                Ipv4Addr::new(10, 0, 0, 2),
+                Ipv4Addr::new(10, 2, 2, 2),
+            ),
+            None,
+            "recognized-proto overflow must propagate as None failure"
+        );
+        // Unsupported proto with the same overflowing ihl must still no-op
+        // (it returns Some(()) before ever touching checked_add).
+        let mut p = ipv4_frame(PROTO_ICMP);
+        assert_eq!(
+            adjust_l4_checksum_ipv4(
+                &mut p,
+                usize::MAX,
+                PROTO_ICMP,
+                Ipv4Addr::new(10, 0, 0, 1),
+                Ipv4Addr::new(10, 1, 1, 1),
+                Ipv4Addr::new(10, 0, 0, 2),
+                Ipv4Addr::new(10, 2, 2, 2),
+            ),
+            Some(()),
+            "unsupported proto must no-op regardless of ihl"
+        );
+    }
+
+    #[test]
+    fn ipv6_icmpv6_zero_canonicalizes_to_ffff() {
+        // The #1669-trap end-to-end check: an ICMPv6 packet whose adjusted
+        // checksum computes to 0 must be written as 0xFFFF, not 0x0000.
+        // Construct an IPv6 frame and choose the stored checksum + address
+        // delta so the incremental adjust lands on 0.
+        //
+        // adjust_l4_checksum_ipv6_words computes:
+        //   updated = checksum16_adjust(current, old_words, new_words)
+        // We want updated == 0. Pick old_words == new_words so the adjust
+        // is identity: updated = current. Then set the stored checksum so
+        // that the "current" read at offset 42 is 0 — but a stored 0 read
+        // would already be 0 and identity-adjust keeps it 0, triggering
+        // the canonicalization to 0xFFFF.
+        let mut p = vec![0u8; 60];
+        p[6] = PROTO_ICMPV6; // next-header
+        // ICMPv6 checksum field is at 40 + 2 = 42. Start it at 0.
+        p[42] = 0;
+        p[43] = 0;
+        let same = ipv6_words(Ipv6Addr::LOCALHOST);
+        let r = adjust_l4_checksum_ipv6_words(&mut p, PROTO_ICMPV6, &same, &same);
+        assert_eq!(r, Some(()));
+        // current=0, identity adjust -> 0, canonicalized -> 0xffff.
+        assert_eq!(
+            u16::from_be_bytes([p[42], p[43]]),
+            0xffff,
+            "ICMPv6 computed-zero must canonicalize to 0xffff"
+        );
+    }
+
+    #[test]
+    fn ipv4_tcp_zero_not_canonicalized() {
+        // Counterpart: IPv4 TCP computing to 0 is left as 0 (only IPv4 UDP
+        // canonicalizes on v4). Identity-adjust a stored-0 TCP checksum.
+        let mut p = ipv4_frame(PROTO_TCP);
+        // TCP checksum at ihl + 16 = 36. Start at 0.
+        p[36] = 0;
+        p[37] = 0;
+        let same = ipv4_words(Ipv4Addr::new(10, 0, 0, 1));
+        let r = adjust_l4_checksum_ipv4_words(&mut p, 20, PROTO_TCP, &same, &same);
+        assert_eq!(r, Some(()));
+        assert_eq!(
+            u16::from_be_bytes([p[36], p[37]]),
+            0,
+            "IPv4 TCP computed-zero must NOT canonicalize"
+        );
+    }
+}
