@@ -22,11 +22,11 @@ import (
 	"github.com/psaab/xpf/pkg/dhcpserver"
 	"github.com/psaab/xpf/pkg/feeds"
 	"github.com/psaab/xpf/pkg/frr"
+	"github.com/psaab/xpf/pkg/fwdstatus"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"github.com/psaab/xpf/pkg/ipsec"
 	"github.com/psaab/xpf/pkg/lldp"
 	"github.com/psaab/xpf/pkg/logging"
-	"github.com/psaab/xpf/pkg/fwdstatus"
 	"github.com/psaab/xpf/pkg/ra"
 	"github.com/psaab/xpf/pkg/routing"
 	"github.com/psaab/xpf/pkg/rpm"
@@ -35,19 +35,19 @@ import (
 
 // Config configures the gRPC server.
 type Config struct {
-	Store            *configstore.Store
-	DP               grpcRuntime
-	EventBuf         *logging.EventBuffer
-	GC               *conntrack.GC
-	Routing          *routing.Manager
-	FRR              *frr.Manager
-	IPsec            *ipsec.Manager
-	Cluster          *cluster.Manager
-	DHCP             *dhcp.Manager
-	DHCPServer       *dhcpserver.Manager
-	RPMResultsFn     func() []*rpm.ProbeResult        // returns live RPM results
-	FeedsFn          func() map[string]feeds.FeedInfo // returns live feed status
-	LLDPNeighborsFn  func() []*lldp.Neighbor          // returns live LLDP neighbors
+	Store           *configstore.Store
+	DP              grpcRuntime
+	EventBuf        *logging.EventBuffer
+	GC              *conntrack.GC
+	Routing         *routing.Manager
+	FRR             *frr.Manager
+	IPsec           *ipsec.Manager
+	Cluster         *cluster.Manager
+	DHCP            *dhcp.Manager
+	DHCPServer      *dhcpserver.Manager
+	RPMResultsFn    func() []*rpm.ProbeResult        // returns live RPM results
+	FeedsFn         func() map[string]feeds.FeedInfo // returns live feed status
+	LLDPNeighborsFn func() []*lldp.Neighbor          // returns live LLDP neighbors
 	// #846: atomic commit+apply callbacks. The daemon holds its
 	// apply semaphore across configstore.Commit, applyConfig, and
 	// (for gRPC) syncConfigToPeer, so two concurrent committers
@@ -56,12 +56,12 @@ type Config struct {
 	// (handlers translate to DeadlineExceeded/Canceled).
 	CommitFn          func(ctx context.Context, comment string) (*config.Config, error)
 	CommitConfirmedFn func(ctx context.Context, minutes int) (*config.Config, error)
-	VRRPMgr          *vrrp.Manager                    // native VRRP manager
-	RAMgr            *ra.Manager                      // embedded RA sender manager
-	Version          string                           // software version string
-	FabricPeerAddrFn func() []string                  // returns peer fabric IPs (fab0, fab1; empty if standalone)
-	FabricVRFDevice  string                           // VRF for fabric interface (e.g. "vrf-mgmt")
-	FwdSampler       *fwdstatus.Sampler               // #881: 5s/1m/5m CPU windows for `show chassis forwarding`
+	VRRPMgr           *vrrp.Manager      // native VRRP manager
+	RAMgr             *ra.Manager        // embedded RA sender manager
+	Version           string             // software version string
+	FabricPeerAddrFn  func() []string    // returns peer fabric IPs (fab0, fab1; empty if standalone)
+	FabricVRFDevice   string             // VRF for fabric interface (e.g. "vrf-mgmt")
+	FwdSampler        *fwdstatus.Sampler // #881: 5s/1m/5m CPU windows for `show chassis forwarding`
 }
 
 // Server implements the BpfrxService gRPC service.
@@ -115,29 +115,29 @@ func (s *Server) userspaceDataplaneControl() (userspaceControlProvider, error) {
 // gRPC is ever exposed on non-loopback addresses.
 func NewServer(addr string, cfg Config) *Server {
 	return &Server{
-		store:            cfg.Store,
-		dp:               cfg.DP,
-		eventBuf:         cfg.EventBuf,
-		gc:               cfg.GC,
-		routing:          cfg.Routing,
-		frr:              cfg.FRR,
-		ipsec:            cfg.IPsec,
-		cluster:          cfg.Cluster,
-		dhcp:             cfg.DHCP,
-		dhcpServer:       cfg.DHCPServer,
-		rpmResultsFn:     cfg.RPMResultsFn,
+		store:             cfg.Store,
+		dp:                cfg.DP,
+		eventBuf:          cfg.EventBuf,
+		gc:                cfg.GC,
+		routing:           cfg.Routing,
+		frr:               cfg.FRR,
+		ipsec:             cfg.IPsec,
+		cluster:           cfg.Cluster,
+		dhcp:              cfg.DHCP,
+		dhcpServer:        cfg.DHCPServer,
+		rpmResultsFn:      cfg.RPMResultsFn,
 		feedsFn:           cfg.FeedsFn,
 		lldpNeighborsFn:   cfg.LLDPNeighborsFn,
 		commitFn:          cfg.CommitFn,
 		commitConfirmedFn: cfg.CommitConfirmedFn,
-		vrrpMgr:          cfg.VRRPMgr,
-		raMgr:            cfg.RAMgr,
-		fwdSampler:       cfg.FwdSampler,
-		startTime:        time.Now(),
-		addr:             addr,
-		version:          cfg.Version,
-		fabricPeerAddrFn: cfg.FabricPeerAddrFn,
-		fabricVRFDevice:  cfg.FabricVRFDevice,
+		vrrpMgr:           cfg.VRRPMgr,
+		raMgr:             cfg.RAMgr,
+		fwdSampler:        cfg.FwdSampler,
+		startTime:         time.Now(),
+		addr:              addr,
+		version:           cfg.Version,
+		fabricPeerAddrFn:  cfg.FabricPeerAddrFn,
+		fabricVRFDevice:   cfg.FabricVRFDevice,
 	}
 }
 

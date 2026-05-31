@@ -13,11 +13,14 @@ package grpcapi
 
 import (
 	"fmt"
+	"net"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
 
 // showFirewall renders the `cli show firewall` output. Writes to
@@ -154,4 +157,241 @@ func (s *Server) showFirewall(cfg *config.Config, buf *strings.Builder) {
 	}
 	printFilters("inet", cfg.Firewall.FiltersInet)
 	printFilters("inet6", cfg.Firewall.FiltersInet6)
+}
+
+// --- #1700: residual ShowText branches ---
+
+func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf *strings.Builder) (*pb.ShowTextResponse, error) {
+	params := strings.TrimPrefix(req.Topic, "test-policy:")
+	var fromZone, toZone, srcIP, dstIP, proto string
+	var dstPort int
+	for _, kv := range strings.Split(params, ",") {
+		parts := strings.SplitN(kv, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		switch parts[0] {
+		case "from":
+			fromZone = parts[1]
+		case "to":
+			toZone = parts[1]
+		case "src":
+			srcIP = parts[1]
+		case "dst":
+			dstIP = parts[1]
+		case "port":
+			dstPort, _ = strconv.Atoi(parts[1])
+		case "proto":
+			proto = parts[1]
+		}
+	}
+	if cfg == nil {
+		buf.WriteString("No active configuration\n")
+	} else if fromZone == "" || toZone == "" {
+		buf.WriteString("Missing from/to zone parameters\n")
+	} else {
+		parsedSrc := net.ParseIP(srcIP)
+		parsedDst := net.ParseIP(dstIP)
+		found := false
+		for _, zpp := range cfg.Security.Policies {
+			if zpp.FromZone != fromZone || zpp.ToZone != toZone {
+				continue
+			}
+			for _, pol := range zpp.Policies {
+				if !matchShowPolicyAddr(pol.Match.SourceAddresses, parsedSrc, cfg) {
+					continue
+				}
+				if !matchShowPolicyAddr(pol.Match.DestinationAddresses, parsedDst, cfg) {
+					continue
+				}
+				if !matchShowPolicyApp(pol.Match.Applications, proto, dstPort, cfg) {
+					continue
+				}
+				action := policyActionName(pol.Action)
+				fmt.Fprintf(buf, "Policy match:\n")
+				fmt.Fprintf(buf, "  From zone: %s\n  To zone:   %s\n", fromZone, toZone)
+				fmt.Fprintf(buf, "  Policy:    %s\n", pol.Name)
+				fmt.Fprintf(buf, "  Action:    %s\n", action)
+				found = true
+				break
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			// Check global policies
+			for _, pol := range cfg.Security.GlobalPolicies {
+				if !matchShowPolicyAddr(pol.Match.SourceAddresses, parsedSrc, cfg) {
+					continue
+				}
+				if !matchShowPolicyAddr(pol.Match.DestinationAddresses, parsedDst, cfg) {
+					continue
+				}
+				if !matchShowPolicyApp(pol.Match.Applications, proto, dstPort, cfg) {
+					continue
+				}
+				action := policyActionName(pol.Action)
+				fmt.Fprintf(buf, "Policy match (global):\n")
+				fmt.Fprintf(buf, "  Policy:    %s\n", pol.Name)
+				fmt.Fprintf(buf, "  Action:    %s\n", action)
+				found = true
+				break
+			}
+		}
+		if !found {
+			fmt.Fprintf(buf, "Default deny (no matching policy for %s -> %s)\n", fromZone, toZone)
+		}
+	}
+	return &pb.ShowTextResponse{Output: buf.String()}, nil
+}
+
+func (s *Server) showFirewallFilter(req *pb.ShowTextRequest, cfg *config.Config, buf *strings.Builder) (*pb.ShowTextResponse, error) {
+	filterTopic := strings.TrimPrefix(req.Topic, "firewall-filter:")
+	filterName := filterTopic
+	requestedFamily := ""
+	if idx := strings.LastIndex(filterTopic, ":"); idx > 0 {
+		filterName = filterTopic[:idx]
+		requestedFamily = filterTopic[idx+1:]
+	}
+	if cfg == nil {
+		buf.WriteString("No active configuration\n")
+	} else {
+		var filter *config.FirewallFilter
+		var family string
+		switch requestedFamily {
+		case "":
+			if f, ok := cfg.Firewall.FiltersInet[filterName]; ok {
+				filter = f
+				family = "inet"
+			} else if f, ok := cfg.Firewall.FiltersInet6[filterName]; ok {
+				filter = f
+				family = "inet6"
+			}
+		case "inet":
+			filter = cfg.Firewall.FiltersInet[filterName]
+			family = "inet"
+		case "inet6":
+			filter = cfg.Firewall.FiltersInet6[filterName]
+			family = "inet6"
+		default:
+			fmt.Fprintf(buf, "invalid family: %s\n", requestedFamily)
+			return &pb.ShowTextResponse{Output: buf.String()}, nil
+		}
+		if filter == nil {
+			if requestedFamily != "" {
+				fmt.Fprintf(buf, "Filter not found: %s (family %s)\n", filterName, requestedFamily)
+			} else {
+				fmt.Fprintf(buf, "Filter not found: %s\n", filterName)
+			}
+		} else {
+			var userspaceStatus *dpuserspace.ProcessStatus
+			if status, err := s.userspaceDataplaneStatus(); err == nil {
+				userspaceStatus = &status
+			}
+			userspaceCounters := dpuserspace.BuildFirewallFilterTermCounterIndex(userspaceStatus)
+			var filterIDs map[string]uint32
+			if s.dp != nil && s.dp.IsLoaded() {
+				if cr := s.applyResult(); cr != nil {
+					filterIDs = cr.FilterIDs
+				}
+			}
+			var ruleStart uint32
+			var hasCounters bool
+			if filterIDs != nil {
+				if fid, ok := filterIDs[family+":"+filterName]; ok {
+					if fcfg, err := s.dp.ReadFilterConfig(fid); err == nil {
+						ruleStart = fcfg.RuleStart
+						hasCounters = true
+					}
+				}
+			}
+			fmt.Fprintf(buf, "Filter: %s (family %s)\n", filterName, family)
+			ruleOffset := ruleStart
+			for _, term := range filter.Terms {
+				fmt.Fprintf(buf, "\n  Term: %s\n", term.Name)
+				if term.DSCP != "" {
+					fmt.Fprintf(buf, "    from dscp %s\n", term.DSCP)
+				}
+				if term.Protocol != "" {
+					fmt.Fprintf(buf, "    from protocol %s\n", term.Protocol)
+				}
+				for _, addr := range term.SourceAddresses {
+					fmt.Fprintf(buf, "    from source-address %s\n", addr)
+				}
+				for _, pl := range term.SourcePrefixLists {
+					if pl.Except {
+						fmt.Fprintf(buf, "    from source-prefix-list %s except\n", pl.Name)
+					} else {
+						fmt.Fprintf(buf, "    from source-prefix-list %s\n", pl.Name)
+					}
+				}
+				for _, addr := range term.DestAddresses {
+					fmt.Fprintf(buf, "    from destination-address %s\n", addr)
+				}
+				for _, pl := range term.DestPrefixLists {
+					if pl.Except {
+						fmt.Fprintf(buf, "    from destination-prefix-list %s except\n", pl.Name)
+					} else {
+						fmt.Fprintf(buf, "    from destination-prefix-list %s\n", pl.Name)
+					}
+				}
+				if len(term.SourcePorts) > 0 {
+					fmt.Fprintf(buf, "    from source-port %s\n", strings.Join(term.SourcePorts, ", "))
+				}
+				if len(term.DestinationPorts) > 0 {
+					fmt.Fprintf(buf, "    from destination-port %s\n", strings.Join(term.DestinationPorts, ", "))
+				}
+				if term.ICMPType >= 0 {
+					fmt.Fprintf(buf, "    from icmp-type %d\n", term.ICMPType)
+				}
+				if term.ICMPCode >= 0 {
+					fmt.Fprintf(buf, "    from icmp-code %d\n", term.ICMPCode)
+				}
+				if term.RoutingInstance != "" {
+					fmt.Fprintf(buf, "    then routing-instance %s\n", term.RoutingInstance)
+				}
+				if term.ForwardingClass != "" {
+					fmt.Fprintf(buf, "    then forwarding-class %s\n", term.ForwardingClass)
+				}
+				if term.LossPriority != "" {
+					fmt.Fprintf(buf, "    then loss-priority %s\n", term.LossPriority)
+				}
+				if term.Log {
+					buf.WriteString("    then log\n")
+				}
+				if term.Count != "" {
+					fmt.Fprintf(buf, "    then count %s\n", term.Count)
+				}
+				action := term.Action
+				if action == "" {
+					action = "accept"
+				}
+				fmt.Fprintf(buf, "    then %s\n", action)
+				numRules := firewallFilterTermExpansionCount(cfg, term)
+				var totalPkts, totalBytes uint64
+				if hasCounters {
+					for i := uint32(0); i < numRules; i++ {
+						if ctrs, err := s.dp.ReadFilterCounters(ruleOffset + i); err == nil {
+							totalPkts += ctrs.Packets
+							totalBytes += ctrs.Bytes
+						}
+					}
+					ruleOffset += numRules
+				}
+				userspaceCounter, userspaceOk := userspaceCounters[dpuserspace.FirewallFilterTermCounterKey{
+					Family: family, FilterName: filterName, TermName: term.Name,
+				}]
+				if userspaceOk {
+					totalPkts += userspaceCounter.Packets
+					totalBytes += userspaceCounter.Bytes
+				}
+				if hasCounters || userspaceOk {
+					fmt.Fprintf(buf, "    Hit count: %d packets, %d bytes\n", totalPkts, totalBytes)
+				}
+			}
+			buf.WriteString("\n")
+		}
+	}
+	return &pb.ShowTextResponse{Output: buf.String()}, nil
 }
