@@ -72,6 +72,13 @@ func (f *fakeVRFOps) LinkSetUp(link netlink.Link) error {
 	return nil
 }
 
+// LinkSetMaster is part of vrfOps (used by BindInterfaceToVRF). The
+// reconcile path never calls it; the fake just records nothing and
+// succeeds so *fakeVRFOps satisfies the interface.
+func (f *fakeVRFOps) LinkSetMaster(link, master netlink.Link) error {
+	return nil
+}
+
 // #847: orphan-reap pass enumerates the kernel `vrf-*` namespace.
 // Returns the seeded VRF links plus any extra non-VRF links the
 // test pre-populated via extraLinks (used to verify the type-assert
@@ -950,27 +957,30 @@ func TestKeepaliveDefaults(t *testing.T) {
 
 func TestInterfaceMonitorStatuses(t *testing.T) {
 	// Test the monitor state storage and retrieval without netlink.
-	m := &Manager{
+	// Post-#1698 the monitor state lives on the monitorManager domain,
+	// which is independently constructible — exercise it directly
+	// rather than reaching into Manager internals.
+	mm := &monitorManager{
 		monitorStatus: make(map[int][]InterfaceMonitorStatus),
 	}
 
 	// No monitors → nil
-	if got := m.InterfaceMonitorStatuses(); got != nil {
+	if got := mm.Statuses(); got != nil {
 		t.Errorf("expected nil for empty monitors, got %v", got)
 	}
 
 	// Set some state directly
-	m.mu.Lock()
-	m.monitorStatus[0] = []InterfaceMonitorStatus{
+	mm.mu.Lock()
+	mm.monitorStatus[0] = []InterfaceMonitorStatus{
 		{Interface: "trust0", Weight: 255, Up: true},
 	}
-	m.monitorStatus[1] = []InterfaceMonitorStatus{
+	mm.monitorStatus[1] = []InterfaceMonitorStatus{
 		{Interface: "untrust0", Weight: 200, Up: true},
 		{Interface: "dmz0", Weight: 100, Up: false},
 	}
-	m.mu.Unlock()
+	mm.mu.Unlock()
 
-	got := m.InterfaceMonitorStatuses()
+	got := mm.Statuses()
 	if got == nil {
 		t.Fatal("expected non-nil monitor statuses")
 	}
@@ -989,7 +999,7 @@ func TestInterfaceMonitorStatuses(t *testing.T) {
 
 	// Verify returned map is a copy (modify doesn't affect original)
 	got[0] = nil
-	if m.InterfaceMonitorStatuses()[0] == nil {
+	if mm.Statuses()[0] == nil {
 		t.Error("modifying returned map should not affect original")
 	}
 }
