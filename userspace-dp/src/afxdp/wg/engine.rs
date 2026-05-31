@@ -518,6 +518,19 @@ impl WgEngine {
         // in published tables. This is slow path, so mutex cost is
         // acceptable and keeps install/reconcile linearizable.
         let _reconcile_guard = self.reconcile_lock.lock().unwrap();
+        self.install_session_locked(pubkey, session)
+    }
+
+    /// Lock-free core of `install_session`: the caller MUST already hold
+    /// `reconcile_lock`. Exposed (module-private) so the handshake
+    /// completion path can hold `reconcile_lock` across the take-state →
+    /// snow-read → install critical section without re-entering the
+    /// non-reentrant mutex (which would deadlock). See `consume_response`.
+    pub(in crate::afxdp::wg) fn install_session_locked(
+        &self,
+        pubkey: &[u8; 32],
+        session: Arc<WgSession>,
+    ) -> Result<(), InstallSessionError> {
         let Some(peer) = self.peer_arc(pubkey) else {
             return Err(InstallSessionError::UnknownPeer);
         };

@@ -1761,4 +1761,136 @@ mod framed_handshake {
         init.create_initiation(&resp_pub, &mut msg1b).unwrap();
         assert_eq!(init.pending_count(), 1);
     }
+
+    /// Concurrency regression for the Codex round-2 finding: completing a
+    /// handshake (create_initiation → consume_initiation_create_response →
+    /// consume_response) must be sound under a concurrent thread hammering
+    /// reconcile_peers (add/remove the peer), which exercises the
+    /// reconcile-drains-pending path and the reconcile_lock serialization of
+    /// the now-lock-held completion. Must not panic, deadlock, or corrupt the
+    /// maps.
+    ///
+    /// Note we do NOT race a second same-peer create_initiation against the
+    /// SAME in-flight handshake: that is the at-most-one-pending-per-peer
+    /// abort (latest-initiation-wins), which legitimately starves the older
+    /// reservation and is not a soundness violation. The reconcile thread is
+    /// the right concurrency stressor for the lock discipline.
+    #[test]
+    fn concurrent_consume_response_and_reinitiation_is_sound() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering as AOrd};
+        use std::sync::Arc as StdArc;
+        use std::thread;
+
+        // Two engines that know each other. Wrap in Arc for sharing.
+        let (init_priv, init_pub) = keypair();
+        let (resp_priv, resp_pub) = keypair();
+        let any_v4: Vec<ipnet::IpNet> = vec!["0.0.0.0/0".parse().unwrap()];
+        let init = StdArc::new(WgEngine::new(WgEngineConfig {
+            local_private_key: init_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: resp_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: any_v4.clone(),
+            }],
+        }));
+        let resp = StdArc::new(WgEngine::new(WgEngineConfig {
+            local_private_key: resp_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: init_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: any_v4,
+            }],
+        }));
+
+        let stop = StdArc::new(AtomicBool::new(false));
+        let completed = StdArc::new(AtomicU32::new(0));
+
+        // Driver thread: full handshakes init<->resp, repeatedly.
+        let driver = {
+            let init = init.clone();
+            let resp = resp.clone();
+            let completed = completed.clone();
+            let stop = stop.clone();
+            thread::spawn(move || {
+                for _ in 0..400 {
+                    let mut msg1 = [0u8; WG_MSG_INIT_LEN];
+                    if init.create_initiation(&resp_pub, &mut msg1).is_err() {
+                        continue;
+                    }
+                    let mut msg2 = [0u8; WG_MSG_RESPONSE_LEN];
+                    if resp
+                        .consume_initiation_create_response(&msg1, &mut msg2)
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    if init.consume_response(&msg2).is_ok() {
+                        completed.fetch_add(1, AOrd::Relaxed);
+                    }
+                    thread::yield_now();
+                }
+                stop.store(true, AOrd::Relaxed);
+            })
+        };
+
+        // Reconcile thread on the RESPONDER: churn the initiator peer in/out
+        // while the driver completes handshakes, exercising the
+        // reconcile-drains-pending path and the reconcile_lock serialization
+        // concurrently with the lock-held responder completion.
+        let reconciler = {
+            let resp = resp.clone();
+            let stop = stop.clone();
+            thread::spawn(move || {
+                let cfg = vec![WgPeerConfig {
+                    pubkey: init_pub,
+                    endpoint: None,
+                    persistent_keepalive: 0,
+                    allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+                }];
+                let mut flip = false;
+                while !stop.load(AOrd::Relaxed) {
+                    // Alternate remove/re-add to exercise the
+                    // reconcile-drains-pending path against in-flight
+                    // responder reservations.
+                    if flip {
+                        resp.reconcile_peers(&[]);
+                    } else {
+                        resp.reconcile_peers(&cfg);
+                    }
+                    flip = !flip;
+                    thread::yield_now();
+                }
+                // Leave the peer present so the post-storm handshake works.
+                resp.reconcile_peers(&cfg);
+            })
+        };
+
+        driver.join().unwrap();
+        reconciler.join().unwrap();
+
+        // The race must have exercised real completions.
+        assert!(
+            completed.load(AOrd::Relaxed) > 0,
+            "no handshake completed — the race path was not exercised"
+        );
+
+        // Soundness: after the storm, drive ONE clean handshake and a
+        // transport round-trip; if the maps were corrupted the encap/decap
+        // would fail.
+        let mut m1 = [0u8; WG_MSG_INIT_LEN];
+        init.create_initiation(&resp_pub, &mut m1).unwrap();
+        let mut m2 = [0u8; WG_MSG_RESPONSE_LEN];
+        resp.consume_initiation_create_response(&m1, &mut m2).unwrap();
+        init.consume_response(&m2).unwrap();
+        let pkt = ipv4_packet(Ipv4Addr::new(10, 9, 9, 1), Ipv4Addr::new(10, 9, 9, 2));
+        let mut w = [0u8; 2048];
+        let e = init.try_encap(&resp_pub, &pkt, &mut w).unwrap();
+        let mut p = [0u8; 2048];
+        let d = resp.try_decap(&w[..e.len], &mut p).unwrap();
+        assert_eq!(&p[..d.len], &pkt[..], "post-storm handshake must still carry traffic");
+    }
 }

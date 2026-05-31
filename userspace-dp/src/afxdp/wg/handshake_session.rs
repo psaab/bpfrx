@@ -128,6 +128,19 @@ impl WgEngine {
         role: SessionRole,
     ) -> Result<u32, HandshakeError> {
         let _guard = self.reconcile_lock.lock().unwrap();
+        self.reserve_pending_locked(peer_pubkey, state, role)
+    }
+
+    /// Lock-free core of `reserve_pending`: caller MUST hold `reconcile_lock`.
+    /// Used by the responder path, which holds the lock across
+    /// reserve → build msg2 → install so a concurrent same-peer initiation
+    /// cannot abort the reservation mid-completion (Codex round-2 race).
+    fn reserve_pending_locked(
+        &self,
+        peer_pubkey: [u8; WG_KEY_LEN],
+        state: Option<HandshakeState>,
+        role: SessionRole,
+    ) -> Result<u32, HandshakeError> {
         let by_index = self.sessions_by_local_index.read().unwrap();
         let mut pending = self.pending.write().unwrap();
         let mut by_peer = self.pending_by_peer.write().unwrap();
@@ -283,14 +296,18 @@ impl WgEngine {
     /// `WgSession` (initiator role, confirmed at install) and registered for
     /// inbound demux. Returns the local index of the installed session.
     ///
-    /// Invariants this method preserves (Codex code-review round 1, findings
-    /// 1 & 2):
-    ///   - The pending reservation is NEVER removed before the live session
-    ///     is installed: the index stays present in `pending` until
-    ///     `promote_pending` installs it into `sessions_by_local_index` (and
-    ///     only then clears the reservation), so there is no window where the
-    ///     index is absent from both maps and a concurrent `reserve_pending`
-    ///     could re-allocate it.
+    /// Invariants this method preserves (Codex code-review rounds 1 & 2):
+    ///   - The ENTIRE completion (validate → take snow state → Noise read →
+    ///     install → clear reservation) runs while holding `reconcile_lock`.
+    ///     `reserve_pending` / `release_pending` / `reconcile_peers` also take
+    ///     `reconcile_lock`, so no concurrent re-initiation to the same peer
+    ///     can abort this in-flight reservation, and no concurrent
+    ///     reservation/install can observe a window where the index is absent
+    ///     from both `pending` and `sessions_by_local_index`. The Noise read
+    ///     is slow-path crypto run under the slow-path lock — handshakes are
+    ///     never on the AF_XDP hot path, so the lock hold is acceptable.
+    ///     (Round-2 finding: the earlier lock-drop-during-read version still
+    ///     allowed the per-peer abort to remove the entry mid-read.)
     ///   - A msg2 that fails Noise authentication does NOT destroy the
     ///     reservation. MAC1 keys on the (public) initiator pubkey, so an
     ///     on-path observer can forge a msg2 with a valid MAC1 but a bogus
@@ -301,47 +318,45 @@ impl WgEngine {
     ///     retransmitted) response.
     pub(crate) fn consume_response(&self, msg: &[u8]) -> Result<u32, HandshakeError> {
         let parsed = handshake::parse_response(msg, &self.local_public_key)?;
+        let local_index = parsed.receiver_index;
 
-        // Borrow the snow state out of the pending entry WITHOUT removing the
-        // reservation. We validate role/index under the lock, then take the
-        // state (leaving the entry in place as a still-reserved marker with
-        // `state = None`) and release the lock before the crypto.
+        // Hold reconcile_lock across the whole completion so the reservation
+        // cannot be aborted out from under us and the index never disappears
+        // from both maps.
+        let _guard = self.reconcile_lock.lock().unwrap();
+
+        // Validate + take the snow state. The entry stays in `pending`
+        // (state = None) so the index remains reserved.
         let (peer_pubkey, mut state) = {
             let mut pending = self.pending.write().unwrap();
             let ph = pending
-                .get_mut(&parsed.receiver_index)
+                .get_mut(&local_index)
                 .ok_or(HandshakeError::NoPendingHandshake)?;
             if ph.role != SessionRole::Initiator {
-                // A response addressed at a responder-role reservation does
-                // not belong here; leave the reservation untouched.
                 return Err(HandshakeError::ReceiverIndexMismatch);
             }
             let peer_pubkey = ph.peer_pubkey;
-            let state = ph
-                .state
-                .take()
-                .ok_or(HandshakeError::NoPendingHandshake)?;
+            let state = ph.state.take().ok_or(HandshakeError::NoPendingHandshake)?;
             (peer_pubkey, state)
         };
-        let local_index = parsed.receiver_index;
 
-        // Drive snow to completion with the peer's msg2 body. On failure,
-        // snow has restored its internal state, so we reinstate the borrowed
-        // HandshakeState into the (still-present) reservation and report
-        // Crypto — a forged/garbled msg2 must not kill the pending handshake.
+        // Drive snow to completion. On a failed read, snow restored its
+        // symmetric state, so put the HandshakeState back into the (still
+        // locked, still present) reservation — a forged/garbled msg2 must not
+        // kill the pending handshake.
         let mut sink = [0u8; MSG_RESPONSE_NOISE_LEN];
         if state.read_message(parsed.noise_body, &mut sink).is_err() {
-            self.restore_pending_state(local_index, state);
+            if let Some(ph) = self.pending.write().unwrap().get_mut(&local_index) {
+                ph.state = Some(state);
+            }
             return Err(HandshakeError::Crypto);
         }
         let transport = match state.into_stateless_transport_mode() {
             Ok(t) => t,
             Err(_) => {
-                // into_stateless_transport_mode consumed `state`, so we cannot
-                // put it back; this only fails if the handshake is not
-                // finished, which cannot happen after a successful msg2 read.
-                // Release the reservation rather than leak it.
-                self.release_pending(local_index);
+                // Unreachable after a successful msg2 read; clear the
+                // reservation rather than leak it.
+                self.clear_reservation_locked(local_index, &peer_pubkey);
                 return Err(HandshakeError::Crypto);
             }
         };
@@ -352,22 +367,26 @@ impl WgEngine {
             peer_pubkey,
             SessionRole::Initiator,
         ));
-        // promote_pending installs the live session BEFORE clearing the
-        // reservation (no absent-from-both-maps window).
-        self.promote_pending(local_index, peer_pubkey, session)
+        // Install the live session, then clear the reservation — both under
+        // the reconcile_lock we already hold (install_session_locked must NOT
+        // re-take it).
+        let result = match self.install_session_locked(&peer_pubkey, session) {
+            Ok(()) => Ok(local_index),
+            Err(InstallSessionError::UnknownPeer) => Err(HandshakeError::UnknownPeer),
+            Err(InstallSessionError::LocalIndexCollision) => Err(HandshakeError::Internal),
+        };
+        self.clear_reservation_locked(local_index, &peer_pubkey);
+        result
     }
 
-    /// Put a borrowed initiator `HandshakeState` back into its pending
-    /// reservation after a failed msg2 read, so the reservation survives a
-    /// forged/garbled response and a later valid retransmit can complete it.
-    /// If the reservation vanished while we held no lock (e.g. a concurrent
-    /// re-initiation to the same peer aborted it), the state is simply
-    /// dropped — there is nothing to restore.
-    fn restore_pending_state(&self, local_index: u32, state: HandshakeState) {
-        let _guard = self.reconcile_lock.lock().unwrap();
+    /// Clear a reservation's `pending` entry and its `pending_by_peer` marker
+    /// (if it still points at this index). Caller MUST hold `reconcile_lock`.
+    fn clear_reservation_locked(&self, local_index: u32, peer_pubkey: &[u8; WG_KEY_LEN]) {
         let mut pending = self.pending.write().unwrap();
-        if let Some(ph) = pending.get_mut(&local_index) {
-            ph.state = Some(state);
+        pending.remove(&local_index);
+        let mut by_peer = self.pending_by_peer.write().unwrap();
+        if by_peer.get(peer_pubkey) == Some(&local_index) {
+            by_peer.remove(peer_pubkey);
         }
     }
 
@@ -417,23 +436,26 @@ impl WgEngine {
             return Err(HandshakeError::UnknownInitiator);
         }
 
-        // Reserve our responder sender_index BEFORE emitting msg2. The
-        // responder completes synchronously in this call, so the pending
-        // entry is a bare reservation marker (state = None).
+        // Hold reconcile_lock across reserve → build msg2 → install so a
+        // concurrent same-peer initiation cannot abort our reservation between
+        // reserve and install (Codex round-2 race). The responder completes
+        // synchronously in this single call, so the pending entry is a bare
+        // reservation marker (state = None).
+        let _guard = self.reconcile_lock.lock().unwrap();
         let local_index =
-            self.reserve_pending(peer_pubkey, None, SessionRole::Responder)?;
+            self.reserve_pending_locked(peer_pubkey, None, SessionRole::Responder)?;
 
         // Build the snow msg2 body (empty Noise payload).
         let mut noise_body = [0u8; MSG_RESPONSE_NOISE_LEN];
         let n = match state.write_message(&[], &mut noise_body) {
             Ok(n) => n,
             Err(_) => {
-                self.release_pending(local_index);
+                self.clear_reservation_locked(local_index, &peer_pubkey);
                 return Err(HandshakeError::Crypto);
             }
         };
         if n != MSG_RESPONSE_NOISE_LEN {
-            self.release_pending(local_index);
+            self.clear_reservation_locked(local_index, &peer_pubkey);
             return Err(HandshakeError::Crypto);
         }
         // Frame the response: receiver_index echoes the initiator's
@@ -445,7 +467,7 @@ impl WgEngine {
             &noise_body,
             &peer_pubkey,
         ) {
-            self.release_pending(local_index);
+            self.clear_reservation_locked(local_index, &peer_pubkey);
             return Err(e.into());
         }
 
@@ -453,7 +475,7 @@ impl WgEngine {
         let transport = match state.into_stateless_transport_mode() {
             Ok(t) => t,
             Err(_) => {
-                self.release_pending(local_index);
+                self.clear_reservation_locked(local_index, &peer_pubkey);
                 return Err(HandshakeError::Crypto);
             }
         };
@@ -464,55 +486,19 @@ impl WgEngine {
             peer_pubkey,
             SessionRole::Responder,
         ));
-        // Promote the reservation to a live session (clears the pending
-        // marker + per-peer marker, installs for demux). The responder
-        // session installs UNCONFIRMED — egress is gated until the first
-        // authenticated inbound transport record (WgSession key-confirmation).
-        self.promote_pending(local_index, peer_pubkey, session)?;
-        Ok((peer_pubkey, local_index))
-    }
-
-    /// Promote a completed pending handshake to a live session: install the
-    /// session for inbound demux + on the peer, then clear the reservation
-    /// bookkeeping. Returns the session's local index.
-    ///
-    /// Ordering matters: we `install_session` (which inserts the live entry
-    /// into `sessions_by_local_index` under `reconcile_lock`) BEFORE removing
-    /// the `pending` reservation. While install runs, the index is present
-    /// in BOTH `pending` and (newly) `by_index`; the index allocator in
-    /// `reserve_pending` rejects any candidate present in EITHER map (all
-    /// under `reconcile_lock`), so no concurrent handshake can claim this
-    /// index during the hand-off. Removing the reservation first would open
-    /// a window where the index is in neither map and a concurrent reserve
-    /// could collide.
-    fn promote_pending(
-        &self,
-        local_index: u32,
-        peer_pubkey: [u8; WG_KEY_LEN],
-        session: Arc<WgSession>,
-    ) -> Result<u32, HandshakeError> {
-        // Install the live session first. The reservation guaranteed
-        // `local_index` was free of any LIVE session; `install_session`
-        // re-checks under the reconcile lock and a same-index live collision
-        // here would be an engine bug.
-        let result = match self.install_session(&peer_pubkey, session) {
-            Ok(()) => Ok(local_index),
+        // Install the live session (UNCONFIRMED — egress gated until the first
+        // authenticated inbound transport record), then clear the reservation.
+        // Both under the reconcile_lock we already hold.
+        let install = match self.install_session_locked(&peer_pubkey, session) {
+            Ok(()) => Ok(()),
             Err(InstallSessionError::UnknownPeer) => Err(HandshakeError::UnknownPeer),
             Err(InstallSessionError::LocalIndexCollision) => Err(HandshakeError::Internal),
         };
-        // Clear the reservation bookkeeping regardless of install outcome:
-        // on success the live entry now owns the index; on failure the
-        // reservation must not linger.
-        {
-            let mut pending = self.pending.write().unwrap();
-            pending.remove(&local_index);
-            let mut by_peer = self.pending_by_peer.write().unwrap();
-            if by_peer.get(&peer_pubkey) == Some(&local_index) {
-                by_peer.remove(&peer_pubkey);
-            }
-        }
-        result
+        self.clear_reservation_locked(local_index, &peer_pubkey);
+        install?;
+        Ok((peer_pubkey, local_index))
     }
+
 }
 
 /// Allocate a non-zero pseudo-random u32 for a handshake index. WG indices
