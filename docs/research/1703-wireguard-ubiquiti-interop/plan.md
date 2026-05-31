@@ -1,6 +1,7 @@
 # #1703 — WireGuard interop with Ubiquiti (UniFi Network 10.4+, EdgeOS, UDM): research plan
 
-Revision: r1 (DRAFT for 3-way hostile review — Codex + AGY + Claude-SMR)
+Revision: r2 (addresses Codex r1 findings 1-3, AGY r1 findings 1-2,
+Claude-SMR r1 findings 1-3)
 Branch: `research/1703-wireguard-ubiquiti-interop`
 Scope: `/research` only. No production code, no PR. Deliverable = converged
 plan-of-action + 3-reviewer verdicts + issue comment. Implementation gated on
@@ -138,8 +139,20 @@ matching snow's resolver and WG whitepaper §5.4.6). §5.4.6 16-byte padding is
 applied on encap (`engine.rs:530-552`) and trimmed on decap
 (`engine.rs:842-889`). Replay window is RFC 6479 64-bit
 (`session.rs:177-256`); `REJECT_AFTER_MESSAGES = u64::MAX - 2^13`
-(`session.rs:28`, test `:350`). This layer would interoperate **if** a session
-ever got established — but it can't, because the handshake never completes.
+(`session.rs:28`, test `:350`). This layer would interoperate for NON-EMPTY
+data records **if** a session ever got established — but it can't, because the
+handshake never completes.
+
+**Caveat (Codex r1 finding 1 — EMPTY data records are NOT handled):** WireGuard
+sends zero-length encrypted transport packets as keepalives AND as the
+key-confirmation packet (www.wireguard.com/protocol). xpf's `try_decap` REJECTS
+these: after AEAD it calls `inner_src_ip(&out[..n])` (`engine.rs:740`) and
+`inner_ip_len_after_decap` which starts `pkt.first()?` (`engine.rs:842-843`),
+both of which fail on a zero-length plaintext → `DecapError::MalformedInner`.
+The engine docstring even scopes out *"keepalives that double as data records"*
+(`engine.rs:33-34`). So an authenticated empty keepalive from a UniFi/kernel
+peer would be dropped, and last-rx / endpoint-roam / timer logic could never
+observe it. This is an interop-relevant gap, NOT already-works — see S5 below.
 
 ### 2.4 PSK is hardcoded to all-zero (config-blocking for PSK peers)
 
@@ -228,7 +241,7 @@ So the chain `Junos config → typed Go struct → snapshot DTO → Rust runtime
 
 | # | Question | Verdict | Evidence |
 |---|----------|---------|----------|
-| 1 | Wire compliance (msg 1–4, MAC1/MAC2, TAI64N, identifier) | **WIRE GAP** — data record (type 4) compliant; handshake (type 1/2) framing, MAC1/MAC2, sender_index, type byte, and TAI64N timestamp all ABSENT. Noise transcript init + identifier correct. | §2.2, §2.3; `engine.rs:26-35`; `framing.rs`; protocol spec |
+| 1 | Wire compliance (msg 1–4, MAC1/MAC2, TAI64N, identifier) | **WIRE GAP** — non-empty data record (type 4) compliant; handshake (type 1/2) framing, MAC1/MAC2, sender_index, type byte, and TAI64N timestamp all ABSENT; EMPTY keepalive/key-confirm records rejected (C4); outer DSCP/ECN diverges (C5). Noise transcript init + identifier correct. | §2.2, §2.3; `engine.rs:26-35,33-34,740,842`; `framing.rs`; `dscp.rs`; protocol spec |
 | 2 | PSK configurable? | **CONFIG/CODE GAP** — hardcoded `WG_ZERO_PSK`; no non-zero path. Correct only for no-PSK peers. | §2.4; `engine.rs:800,823`; `mod.rs:69` |
 | 3 | persistent-keepalive exposed? | **CODE GAP** — field exists, no timer emits keepalives; no config feed. | §2.6; `peer.rs:49-60` |
 | 4 | MTU / MSS interop | **UNWIRED (math correct)** — `wg_tcp_mss` correct + tested; call site short-circuited; UniFi 1420 MTU compatible. | §2.6; `mss.rs`; plan doc:338-349 |
@@ -258,14 +271,44 @@ surface) plus two correctness/feature gaps (PSK, keepalive/roaming timers).
   - B2: compiler + `tunnels.go` (or a new path) populating the `Wg*` snapshot
     fields.
   - B3: runtime `TunnelEndpoint` extension + reconcile from snapshot.
-- **(a) already-works (engine-level, pending a feed):** data-record framing,
-  replay window, AllowedIPs (v4+v6+default), MSS math, DSCP shift, cryptokey-
-  routing safety, peer reconcile, session rotation.
+- **(a) already-works (engine-level, pending a feed):** NON-EMPTY data-record
+  framing, replay window, AllowedIPs (v4+v6+default), MSS math, cryptokey-
+  routing safety, peer reconcile, session rotation. (DSCP shift and empty-data
+  handling were demoted out of this bucket — see C4/C5 below.)
 - **(d) Ubiquiti-quirk to accommodate:**
   - D1: cookie-reply (type 3) handling under UniFi load (at minimum don't wedge;
     ideally MAC2 retry).
   - D2: endpoint may be DDNS ⇒ periodic re-resolve.
   - D3: keepalive 25 s expected for the firewall-behind-NAT direction.
+- **(c) additional gaps surfaced in r1 review:**
+  - C4 (Codex r1 #1): accept authenticated ZERO-LENGTH transport records as
+    keepalive / key-confirmation — update replay + last-rx + endpoint state and
+    SKIP the inner-IP AllowedIPs check for the empty case. Required for both
+    keepalive interop AND WG's responder key-confirmation packet.
+  - C5 (Codex r1 #2): outer DSCP/ECN. xpf's `dscp.rs:14-19` writes
+    `(dscp & 0x3F) << 2` and clears ECN (`dscp.rs:8-9`; test `tests.rs:386-405`
+    asserts EF → outer TOS `0xb8`). The WG protocol page specifies transport
+    packets SHOULD use DSCP 0 and copy ECN per RFC 6040. This will not make
+    UniFi drop packets, but it is a wire-behavior divergence. Decide in S7:
+    either document as an intentional xpf divergence (operator-visible) OR
+    default outer DSCP to CS0 + implement RFC 6040 ECN copy.
+- **(operational boundary) AGY r1 findings:**
+  - O1 (AGY #1): xpf is pure-userspace AF_XDP — it bypasses the kernel IP
+    reassembly engine, so a FRAGMENTED outer-UDP WG datagram cannot be
+    reassembled (fragment 1 fails the Poly1305 tag, fragment 2 has no UDP
+    header). This is a fatal operational limit for any over-MTU WAN path
+    (applies to GRE today too, but WG's larger overhead makes it more likely).
+    Mitigation in S3/S5: enforce inner-flow MSS clamp on the hot path via
+    `mss.rs`, set DF on the outer header / honor PMTUD, and DOCUMENT
+    "no userspace reassembly" as a hard limit.
+  - O2 (AGY #2): handshakes (snow `HandshakeState` build + X25519 DH) may heap-
+    allocate; they MUST stay off the AF_XDP poll worker. The engine design
+    already reserves `build_initiator_handshake`/`build_responder_handshake`
+    for the control thread (plan doc:202-210) and the hot encap/decap paths
+    never build a `HandshakeState`. S2/S3 acceptance criterion: PRESERVE this
+    boundary — handshake framing + MAC + TAI64N construction run on the
+    coordinator/control thread; the worker only touches the post-handshake
+    `StatelessTransportState`. This is a don't-regress gate, not new work.
 
 ---
 
@@ -367,22 +410,44 @@ wireguard-go/kernel WG is byte-identical to what UniFi runs.
 
 ## 7. Proposed sub-issue decomposition (for /engineer, post-approval)
 
-1. **#1703-S1 (test harness):** wireguard-go/kernel-WG interop test fixture +
-   CI/cluster runner. Drives xpf engine through a real WG peer. (No production
-   code; enables all later gates.)
-2. **#1703-S2 (handshake framing + TAI64N):** build/parse WG msg type 1/2,
-   mac1/mac2, sender/receiver index, TAI64N payload + responder monotonic check.
-   Gated by S1 green (initiator + responder). Quad-review, security-critical.
+1. **#1703-S1 (test harness):** wireguard-go/kernel-WG interop fixture +
+   CI/cluster runner with packet assertions/parsers. Lands against current
+   HEAD with **Test 1 and Test 2 marked expected-fail (`#[ignore]` / xfail)** —
+   they MUST fail today (no mac1/type/TAI64N), so S1's acceptance is "harness
+   runs and the xfail tests fail for the documented reason," NOT "tests green."
+   No production WG-framing code; the harness may contain a reference parser
+   for assertions only. This resolves the Codex r1 #3 gating contradiction.
+2. **#1703-S2 (handshake framing + TAI64N):** build/parse WG msg type 1/2:
+   type byte + reserved + sender/receiver index, `mac1` = **keyed-BLAKE2s**
+   (NOT HMAC; SMR r1 #3) over `HASH("mac1----" || peer.static_public)`, `mac2`
+   (zeros until a cookie is seen), and the TAI64N timestamp carried as the
+   Noise PAYLOAD of msg 1. **Acceptance: flip S1 Test 1 + Test 2 from xfail to
+   green** (initiator + responder). TAI64N MUST be monotonic and persisted
+   across control-plane restart + HA-replicated (SMR r1 #1) so xpf never DoSes
+   its own handshakes with a backwards timestamp. Handshake construction runs
+   on the control/coordinator thread, never the poll worker (AGY r1 #2).
+   Quad-review, security-critical, in isolation (per #1492 lesson).
 3. **#1703-S3 (dataplane activation):** encap/decap call sites + runtime
-   `TunnelEndpoint` + reconcile; recycle discipline on every drop path.
-4. **#1703-S4 (PSK):** parameterize psk2 end-to-end.
-5. **#1703-S5 (timers):** persistent-keepalive emit + REKEY/REJECT-AFTER-TIME +
-   endpoint DDNS re-resolve/roam.
+   `TunnelEndpoint` + reconcile; recycle discipline on every drop path; set DF
+   + honor PMTUD on the outer header and document "no userspace IP reassembly"
+   as a hard operational limit (AGY r1 #1, O1). Wire the `mss.rs` clamp on the
+   hot path.
+4. **#1703-S4 (PSK):** parameterize psk2 end-to-end (C3).
+5. **#1703-S5 (timers + keepalive + empty-record):** persistent-keepalive emit
+   + REKEY/REJECT-AFTER-TIME + endpoint DDNS re-resolve/roam (D2/D3) AND accept
+   authenticated zero-length transport records as keepalive/key-confirmation
+   (C4 / Codex r1 #1): update replay + last-rx + endpoint, skip the inner-IP
+   AllowedIPs check for the empty case.
 6. **#1703-S6 (config surface):** Junos grammar (`setSchema`) + typed struct +
    compiler + `tunnels.go` population + base64↔hex key handling +
    `SchemaValidate` (reject dup pubkeys per `engine.rs:347-359`).
-7. **#1703-S7 (cookie reply + IPv6 outer):** type-3 handling under load; v6
-   outer encap.
+7. **#1703-S7 (cookie reply + IPv6 outer + DSCP/ECN):** type-3 handling under
+   load; v6 outer encap; resolve C5 (outer DSCP CS0 + RFC 6040 ECN copy, or
+   document the divergence).
+8. **#1703-S8 (HA / RG session migration):** SMR r1 #2 — on RG failover, a WG
+   session + replay window must migrate or deliberately re-handshake so the
+   tunnel does not black-hole. plan doc:473 lists this OUT of the engine PR;
+   carry it forward here. (May fold into S5 if scope is small.)
 
 S2 is the critical path; S6 is the largest but lowest-risk and lands last.
 
@@ -395,11 +460,16 @@ S2 is the critical path; S6 is the largest but lowest-risk and lands last.
   kernel WG. Generate a keypair with `wg genkey | tee priv | wg pubkey`.
 - **Test 1 (xpf initiator → wg responder):** configure xpf with the wg peer's
   pubkey + endpoint; assert (a) wg `latest handshake` becomes non-zero, (b) a
-  ping/iperf inner flow round-trips, (c) `wg show` counters increment. FAILS
-  today: wg drops the initiation (no mac1/type/TAI64N).
+  ping/iperf inner flow round-trips, (c) `wg show` counters increment. Lands in
+  S1 as **xfail** (wg drops the initiation today: no mac1/type/TAI64N). S2's
+  acceptance is flipping it green.
 - **Test 2 (wg initiator → xpf responder):** wg initiates; assert xpf parses
   msg 1, replies with a valid msg 2 (mac1 over wg's pubkey), and transport
-  flows. FAILS today (xpf cannot parse/emit handshake outer framing).
+  flows. Lands in S1 as **xfail** (xpf cannot parse/emit handshake framing
+  today). S2 flips it green.
+- **Test 2b (empty keepalive):** after a session is up, wg sends a keepalive
+  (empty transport record); assert xpf accepts it (no MalformedInner) and
+  updates last-rx. xfail until C4/S5.
 - **Test 3 (PSK on):** repeat with `PresharedKey` set on both ends; assert
   handshake completes. FAILS today (hardcoded zero PSK).
 - **Test 4 (keepalive/NAT):** xpf behind a NAT netns, 25 s keepalive; assert the
@@ -434,6 +504,13 @@ compliant" and is the minimum bar before any UniFi claim.
 - **Config grammar shape:** Junos models WG as `set interfaces wg0 ...` (vendor
   style) vs `set security ...`. Needs a decision in S6; out of scope for this
   research verdict.
+- **Outer-UDP fragmentation (AGY r1 #1):** no userspace reassembly exists; an
+  over-PMTU WG datagram is unrecoverable. S3 must set DF + clamp MSS + document
+  the limit. This is the single most likely silent-failure mode in production.
+- **Empty-record AllowedIPs bypass (Codex r1 #1):** C4 must skip the inner-IP
+  gate ONLY for genuinely zero-length authenticated plaintext — a non-empty but
+  malformed inner must still be dropped. The branch must key off the decrypted
+  length being exactly 0, not off "inner_src_ip returned None."
 
 ## 10. Documentation contract
 
