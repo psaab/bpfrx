@@ -1,12 +1,17 @@
 # #1709 — WireGuard S1: wire-protocol compliance (TAI64N + handshake framing) validated by spec known-answer vectors (live kernel-WireGuard interop = S2)
 
-Status: **DRAFT v2 — pending adversarial plan review** (Codex + AGY +
-Claude-SMR). v2 changes from v1: dropped the wireguard-go-as-library interop
-harness (user rejected a Go reference for a Rust dataplane); the independent
-reference peer is now the **Linux kernel WireGuard module on a real incus VM**
-(never a container); S1's in-tree gate is **spec known-answer vectors**, and
-the recommended S1/S2 boundary defers the live kernel-wg-VM interop test to S2
-(plan-review to ratify (a) vs (b)).
+Status: **PLAN-READY v3** — round-1 plan review complete: Codex
+(task-mpt6qx4i-i04py6) PLAN-NEEDS-MAJOR, AGY (adversarial-review-mpt6r70o-ebe5a4)
+PLAN-NEEDS-MAJOR, Claude-SMR PLAN-NEEDS-MINOR. v3 addresses ALL major findings
+(see §v3-convergence). v2→v3: TAI64N epoch offset corrected to
+`0x400000000000000a` + nanos whitening (AGY-2); two-phase index reservation to
+close the blackhole race (AGY-1/Codex-4); `local_public_key` added for inbound
+MAC1 (Codex-2); TAI64N persistence story reconciled (Codex-3); S1 gate
+strengthened to require FULL byte-exact msg1/msg2 KATs (Codex-1/SMR-2);
+S1/S2 boundary ratified Option (b+). v2→v1: dropped wireguard-go; reference =
+kernel WireGuard on a real VM (never a container); spec-KAT in-tree gate.
+
+> Pending a confirming round-2 from Codex + AGY on v3 before code lands.
 
 Issue: #1709 (part of #1703 umbrella). Branch:
 `refactor/1709-wireguard-s1-wire-protocol-compliance`.
@@ -42,9 +47,13 @@ deliverable: "wire-protocol compliance — TAI64N + handshake framing —
 validated vs a WireGuard reference"; the reference is now kernel WireGuard,
 and the live interop test is recommended to land in S2, see §5.4/Q7):
 
-1. **TAI64N timestamp** — a monotonic 12-byte TAI64N clock, carried as the
-   Noise payload of WG message 1 (encrypted_timestamp), persisted so it never
-   regresses across control-plane restart.
+1. **TAI64N timestamp** — an **in-process strictly-monotonic** 12-byte TAI64N
+   clock (epoch base `0x400000000000000a`, whitened nanos — §4.3), carried as
+   the Noise payload of WG message 1 (encrypted_timestamp). S1 guarantees
+   monotonicity *within a process*; cross-restart disk persistence is deferred
+   to the control-plane integration (S6) and exposed here only as a
+   `seed_high_water`/`high_water` hook — S1 has no daemon to persist from
+   (Codex-3 inconsistency fixed in v3; §4.3, §5.2).
 2. **WG handshake framing** (message types 1 & 2) on **build + parse** paths:
    type byte, `reserved_zero[3]`, sender/receiver index, MAC1, MAC2 (zeros
    until a cookie is observed), wrapping snow's Noise body.
@@ -206,15 +215,39 @@ offset size field
   (Responder's mac1 keys on the **initiator's** static pub — the recipient of
   msg2.) `mac2` zeros in S1.
 
-### 4.3 TAI64N (12 bytes)
+### 4.3 TAI64N (12 bytes) — CORRECTED in v3 per AGY-2
 
-TAI64N label = `(2^62) + unix_seconds` as a big-endian u64 (8 bytes) followed
-by a big-endian u32 nanoseconds (4 bytes) = 12 bytes (whitepaper §5.4.2;
-wireguard-go `tai64n/tai64n.go`, `tai64n.Now()` returned 12 bytes in the
-probe). **Monotonicity invariant (research §9, SMR r1 #1):** kernel WG rejects
-a msg1 whose TAI64N is `<=` the last one it accepted from that peer — so xpf
-MUST emit a strictly increasing TAI64N or it DoSes its own re-handshakes.
-S1 ties the value to the wall clock AND a persisted high-water mark (see §5.4).
+TAI64N label = **`0x400000000000000a + unix_seconds`** (= `2^62 + 10 +
+unix_seconds`) as a big-endian u64 (8 bytes), followed by a big-endian u32
+nanoseconds (4 bytes) = 12 bytes. **The `+ 10` is the leap-second offset (TAI
+was 10 s ahead of UTC at the 1970 epoch) and is MANDATORY** — kernel WG uses
+`ktime_get_real_seconds() + 0x400000000000000aULL` and wireguard-go
+`tai64n/tai64n.go` uses `base = uint64(0x400000000000000a)`. v1/v2's plain
+`2^62` was wrong by 10 s (AGY plan-review finding 2); a strict peer with a
+narrow handshake-replay window could drop it as stale.
+
+**Nanos whitening (NEW in v3, not flagged by reviewers — found while verifying
+AGY-2 against `tai64n.go`):** the reference masks the low 24 bits of the nanos
+field: `nano = uint32(t.Nanosecond()) &^ (0x1000000 - 1)` (i.e.
+`nano & 0xFF000000`). This whitens the sub-~16 ms component to avoid leaking a
+fine-grained clock. xpf MUST apply the same `&^ 0x00FFFFFF` mask to be
+byte-identical to the reference and avoid the timing side-channel. (A peer does
+not *require* it — it only byte-compares — but matching the reference is the
+S1 contract.)
+
+**Carry / monotonicity spec (NEW in v3 per Codex-3):** the monotonic clock
+returns `max(now_tai64n, last + 1_whitened_tick)`. Because nanos are whitened
+to a `0x1000000`-ns (~16.7 ms) granularity, the monotonic "+1" increment is one
+whitened tick = `0x1000000` ns; on nanos overflow past `0xFF000000` the carry
+rolls into the seconds field (`secs += 1; nanos = 0`). Stored as the 12-byte
+big-endian value so lexicographic byte-compare == numeric compare (matches
+`tai64n.go`'s `bytes.Compare`).
+
+**Monotonicity invariant (research §9, SMR r1 #1):** kernel WG rejects a msg1
+whose TAI64N is `<=` the last one it accepted from that peer — so xpf MUST emit
+a strictly increasing TAI64N or it DoSes its own re-handshakes. S1 enforces
+in-process strict monotonicity via a `Mutex<[u8;12]>`; cross-restart disk
+persistence is deferred (see §5.2 — reconciled in v3 per Codex-3).
 
 ### 4.4 Construction / identifier (already correct — do NOT change)
 
@@ -293,34 +326,56 @@ We parse-skip it. Documented; S7 adds verification.
 ### 5.2 New `wg/tai64n.rs`
 
 ```rust
-/// Monotonic TAI64N clock. 12 bytes: BE u64 (2^62 + unix_secs) || BE u32 nanos.
+/// In-process strictly-monotonic TAI64N clock. 12 bytes:
+/// BE u64 (0x400000000000000a + unix_secs) || BE u32 (nanos &^ 0x00FFFFFF).
 pub(crate) struct Tai64nClock { last: Mutex<[u8; 12]> }
 
 impl Tai64nClock {
     /// Returns a TAI64N strictly greater than every prior return value
-    /// from this clock (monotonic). Derived from `SystemTime::now()` but
-    /// clamped up to `last + 1ns` if the wall clock went backwards.
+    /// from this clock. Computes the whitened TAI64N from
+    /// `SystemTime::now()`; if that is `<= last`, returns
+    /// `last + one whitened tick` (carry into seconds on nanos overflow
+    /// past 0xFF000000). Big-endian layout ⇒ byte-compare == numeric.
     pub(crate) fn now(&self) -> [u8; 12];
-    /// Seed from a persisted high-water mark (control-plane restart).
+    /// Seed from a persisted high-water mark (control-plane restart, S6).
     pub(crate) fn seed_high_water(&self, hw: [u8; 12]);
     pub(crate) fn high_water(&self) -> [u8; 12];
 }
 ```
 
-Monotonicity is enforced by byte-comparing the freshly-computed TAI64N against
-`last` (TAI64N big-endian layout is monotonic under lexicographic byte
-compare) and bumping the nanos field if not strictly greater. Persistence
-(write `high_water()` to disk / HA-replicate) is the **control plane's**
-responsibility; S1 provides `seed_high_water`/`high_water` and wires an
-in-memory clock into the engine. **Cross-restart persistence to a file is
-deferred to S5/S6 control-plane work** — S1 documents the hook and proves
-monotonicity within a process; the harness does not restart xpf. (Flagged as
-an open question for review: is in-process monotonicity + a documented persist
-hook sufficient for S1, or must S1 land the disk persist? The research plan
-§9 ties persistence to S2; I argue the disk write belongs with the config
-surface in S6 since there is no daemon integration in S1.)
+Monotonicity is enforced by byte-comparing the freshly-computed (whitened)
+TAI64N against `last`; on `<=`, advance by one whitened tick (`0x1000000` ns),
+carrying into the seconds field on overflow (§4.3 carry spec). The big-endian
+layout makes lexicographic byte-compare equal numeric compare (matches
+`tai64n.go`'s `bytes.Compare`).
+
+**Persistence — reconciled in v3 (Codex-3):** S1 guarantees only *in-process*
+monotonicity. The `seed_high_water`/`high_water` hooks exist so a future
+control-plane (S6) can persist + HA-replicate the high-water mark, but **S1
+does NOT write to disk** — and that is correct, not a gap, because **S1 has no
+daemon**: an unintegrated engine with no reloaded state cannot regress a clock
+it never reloads (SMR-4). The earlier §1 "persisted so it never regresses"
+wording was inconsistent with this deferral and is fixed in v3. AGY's
+operational note (an NTP step-back or rapid restart of an *integrated* xpf
+could silently wedge a peer that still holds the old high-water mark) is real
+and is captured as an **S2 testing runbook item**: when restarting xpf during
+S2 VM interop, flush the peer's WG state (`ip link del wgref; ip link add
+wgref type wireguard`) to clear its in-memory per-peer TAI64N high-water. The
+durable fix (disk persist) lands in S6.
 
 ### 5.3 Engine slow-path entry points (thin, in engine.rs — small delta)
+
+**Local public key (NEW in v3, Codex-2 — REQUIRED).** Parsing an inbound
+msg1/msg2 MAC1 requires xpf's OWN static public key (the recipient key for
+inbound messages). Today `WgEngineConfig`/`WgEngine` store only
+`local_private_key` (`engine.rs:173`, `:256`). v3 adds a `local_public_key:
+[u8; 32]` derived ONCE at `WgEngine::new` from the private key
+(X25519 base-point mult via `curve25519-dalek` — already in `Cargo.lock` at
+4.1.3 — or snow's `Builder::generate_keypair` is NOT it; use the dalek
+`x25519(secret, basepoint)` clamp). Storing it avoids re-deriving per parse and
+prevents the "private-key-as-public" / swapped-key class of bug under
+implementation pressure. A unit test asserts `local_public_key` equals snow's
+notion of our static pub for the same private key.
 
 The engine already holds the local private key and the snow builders. Add four
 slow-path methods that compose snow + handshake.rs + the TAI64N clock. These
@@ -329,30 +384,55 @@ poll worker; the engine's hot encap/decap never build a HandshakeState):
 
 ```rust
 impl WgEngine {
-    /// Full initiator step: build snow msg1 with a TAI64N payload, frame it
-    /// as a WG type-1 with mac1 over the peer pubkey. Returns the wire bytes
-    /// + the in-progress HandshakeState (caller drives msg2 next) + the
-    /// locally-chosen sender_index.
+    /// Full initiator step: RESERVE a fresh local sender_index in the demux
+    /// map FIRST (two-phase, see below), then build snow msg1 with a TAI64N
+    /// payload, frame it as a WG type-1 with mac1 over the peer pubkey.
     pub(crate) fn create_initiation(&self, peer_pubkey: &[u8;32], out: &mut [u8])
         -> Result<InitiationBuilt, HandshakeError>;
 
     /// Consume a peer's type-2 response against the pending HandshakeState,
-    /// derive the StatelessTransportState. Verifies framing + receiver_index.
-    pub(crate) fn consume_response(&self, hs: HandshakeState, msg: &[u8])
-        -> Result<WgSession-ish, HandshakeError>;
+    /// derive the StatelessTransportState, and PROMOTE the reserved index to
+    /// a live session. Verifies framing + that receiver_index == our reserved
+    /// sender_index.
+    pub(crate) fn consume_response(&self, msg: &[u8])
+        -> Result<DerivedSession, HandshakeError>;
 
-    /// Responder: parse a peer type-1, run snow read_message (recovering the
-    /// peer's TAI64N + static pub), identify the peer, build a framed type-2.
+    /// Responder: parse a peer type-1 (mac1 over OUR local_public_key), run
+    /// snow read_message (recovering the peer's TAI64N + static pub), identify
+    /// the peer, RESERVE our responder sender_index, build a framed type-2
+    /// whose receiver_index echoes msg1.sender_index.
     pub(crate) fn consume_initiation_create_response(&self, msg: &[u8], out: &mut [u8])
         -> Result<ResponseBuilt, HandshakeError>;
 }
 ```
 
-Exact return shapes (whether to expose `HandshakeState` across the boundary or
-keep it engine-internal) are an implementation detail resolved in Step 5; the
-existing tests already pass `HandshakeState` around, so the boundary is proven.
-Sender/receiver index allocation reuses the existing demux discipline
-(`install_session` already enforces global `local_index` uniqueness).
+**Two-phase index reservation (NEW in v3 — AGY-1 / Codex-4, the blackhole
+race).** The v2 plan's "allocate then `install_session`" is unsafe: a responder
+that transmits msg2 carrying sender_index `R` and only *afterward* calls
+`install_session` can lose the `R` slot to a concurrent handshake, fail the
+install with `LocalIndexCollision`, and then **silently blackhole** the
+initiator's data records (they demux to `UnknownSession`). The fix: a
+**reservation** invariant — the local index MUST be inserted into a
+reservation set / `sessions_by_local_index` (as a pending placeholder) **before
+the handshake message carrying it is written to `out`/sent on the wire**. On
+reservation collision, regenerate the index and retry BEFORE transmission.
+`consume_response` / `consume_initiation_create_response` then *promote* the
+reserved index to a live `WgSession` (never a fresh insert that could collide).
+This means:
+  - `install_session`'s existing global-uniqueness check (`engine.rs:437-491`)
+    is necessary but NOT sufficient — it guards completed installs, not pending
+    reservations. v3 adds a pending-index reservation layer in front of it.
+  - The reservation must be released on handshake failure/timeout so a dropped
+    handshake does not leak the index forever (mirrors the
+    `reconcile_peers` drain discipline for dropped sessions).
+  - Tests: `reserve_before_send_then_promote`, and a concurrent-reservation
+    test proving two in-flight handshakes never both claim the same index and
+    no completed handshake is left un-demuxable.
+
+Exact return shapes keep `HandshakeState` engine-internal where possible
+(SMR-6): the engine holds the pending `HandshakeState` keyed by the reserved
+sender_index, so the four methods trade only `[u8;32]` / byte slices, not snow
+types. Resolved concretely in Step 5.
 
 ### 5.4 Verification: spec KAT vectors (in-tree gate) + deferred live harness
 
@@ -403,11 +483,14 @@ SMR-R1.)
   - **`parse_initiation_accepts_nonzero_mac2` (SMR-5, REQUIRED)** — parse must
     accept a msg with mac2 != 0 (a peer that holds our cookie sets it); mac2 is
     skip-verified in S1, NOT treated as malformed. Cookie generation is S7.
-  - `tai64n_encoding_kat` — assert the 12-byte layout (BE u64 `2^62+secs` ||
-    BE u32 nanos) for a fixed `(secs, nanos)`; `tai64n_strictly_monotonic`
-    (N calls strictly increase by byte-compare even with a frozen/backwards
-    clock); **`tai64n_concurrent_monotonic` (SMR-4)** (N threads calling
-    `now()` yield N strictly-ordered distinct values).
+  - `tai64n_encoding_kat` — assert the 12-byte layout (BE u64
+    `0x400000000000000a + secs` || BE u32 `nanos &^ 0x00FFFFFF`) for a fixed
+    `(secs, nanos)`, including the **`+10` epoch offset** (AGY-2) and the
+    **nanos whitening** (v3); `tai64n_strictly_monotonic` (N calls strictly
+    increase by byte-compare even with a frozen/backwards clock, with the
+    one-whitened-tick carry into seconds on nanos overflow — §4.3);
+    **`tai64n_concurrent_monotonic` (SMR-4)** (N threads calling `now()` yield
+    N strictly-ordered distinct values).
   - `framing_roundtrip` — `build_initiation` then `parse_initiation` recovers
     the sender_index + noise body; `parse` rejects TooShort / BadType /
     Mac1Mismatch.
@@ -466,17 +549,65 @@ options:
   and avoids bolting a VM-lifecycle + cross-VM-network harness onto the
   crypto-framing PR.
 
-**My recommendation flips to (b)** given the user's correction: the live test
-now needs a real VM peer + cross-VM UDP reachability, which is meaningfully
-more harness than a loopback socket and is better built once, in S2, next to
-the datapath UDP plumbing. S1's falsifiability rests on the spec KAT vectors
-(§5.4a) — which pin every framing/MAC1/TAI64N byte to the canonical
-construction — plus the engine self-handshake-with-framing regression. The
-independent-peer proof is S2's opening gate. **Whatever the verdict, the
-reference peer is kernel WireGuard on a real VM, never a container.**
-**Plan-review must return an explicit (a) vs (b) verdict.**
+**RATIFIED in v3 — Option (b+), all three reviewers concur.** Codex
+(PLAN-NEEDS-MAJOR), AGY (PLAN-NEEDS-MAJOR), and Claude-SMR all recommend
+**Option (b)** for development isolation — the live test now needs a real VM
+peer + cross-VM SR-IOV UDP reachability, meaningfully more harness than a
+loopback socket and better built once in S2 next to the datapath UDP plumbing
+— **but with a strict governance condition (the "+"):**
+
+> **The S1 framing+TAI64N code MUST NOT be claimed as "interop-capable" in any
+> operator doc / CLAUDE.md feature line, and S1's branch should land such that
+> the independent-peer proof is enforced before any production interop claim.**
+> Codex: "If full byte-exact msg1/msg2 KATs are not added, choose Option (a)."
+> AGY: "do not present S1 in isolation as interop; the live VM test is the
+> absolute gate." SMR-3: same honesty condition.
+
+So S1's gate is **strengthened**: the §5.4a suite is NOT merely
+construction/MAC/layout KATs + a self-handshake — it MUST include the
+**full deterministic byte-exact msg1 AND msg2 KATs** (fixed static + fixed
+ephemeral + fixed TAI64N → exact 148/92-byte wire image + mac1), which is the
+only in-tree test that catches a symmetric build/parse bug (e.g. wrong index
+endianness) that the self-handshake would pass. With those full-message KATs,
+(b+) is a legitimate S1 crypto gate; the live kernel-wg-on-VM test (S2) is the
+independent-peer confirmation. **Reference peer is kernel WireGuard on a real
+VM, never a container.**
 
 Per the task: S1 needs **no CoS/iperf cluster smoke** (no datapath change).
+
+### 5.4c S2 live-interop peer-VM spec (NOT built in S1 — recorded for S2)
+
+The user pinned the S2 reference-peer wiring; recorded here so the S2 plan
+inherits it. The kernel-wg peer is a Debian-13 incus **VM** on the **same LAN
+segment** as `loss:cluster-userspace-host`, mirroring its SR-IOV device so xpf
+reaches it identically:
+
+```
+incus launch images:debian/13 wg-kpeer --vm
+incus config device add wg-kpeer eth0 nic nictype=sriov parent=mlx1 vlan=3667
+# static LAN config inside the VM:
+#   IPv4 10.0.61.103/24      (next free; .102 = cluster-userspace-host, .1 = xpf reth1 VIP)
+#   IPv6 2001:559:8585:ef00::103/64
+#   default route via 10.0.61.1
+# then kernel wg (VM ⇒ real kernel, module loads):
+ip link add wgref type wireguard
+wg set wgref private-key <ref.priv> listen-port <P> \
+   peer <xpf.pub> allowed-ips 0.0.0.0/0 endpoint 10.0.61.1:<Q>
+ip addr add <wg-overlay>/24 dev wgref; ip link set wgref up
+```
+
+Direction A: xpf initiates to `10.0.61.103:<P>`. Direction B: kernel wg
+initiates (persistent-keepalive 1) to xpf's WG UDP endpoint at the LAN VIP.
+
+**SR-IOV VF availability constraint (verified, must re-check at S2 provision
+time):** `mlx1` already backs `cluster-userspace-host` (VF id 2) and
+`cluster-lan-host` (VF id 3); the cluster also consumes mlx0/mlx1 VFs for the
+fw0/fw1 dataplane. Mellanox PFs typically expose ≥8 VFs so a free VF (id ≥4) is
+expected, but the host `sriov_numvfs` was not enumerable from the worktree
+shell. **S2 must verify a free VF on `mlx1` exists before launching `wg-kpeer`;
+if none is free, document the constraint and either bump `sriov_numvfs` or
+reuse an existing spare real VM (`bpfrx-fw`) attached to the same VLAN-3667
+segment.**
 
 ### 5.5 Files touched
 
@@ -485,9 +616,12 @@ Per the task: S1 needs **no CoS/iperf cluster smoke** (no datapath change).
 - EDIT `userspace-dp/src/afxdp/wg/mod.rs` (register modules, add consts
   LABEL_MAC1; ~10 LOC)
 - EDIT `userspace-dp/src/afxdp/wg/engine.rs` (4 thin slow-path methods +
-  TAI64N clock field; target delta < ~150 LOC to stay well under 2000)
+  TAI64N clock field + `local_public_key` field/derivation + pending-index
+  reservation layer; target delta < ~150 LOC to stay well under 2000 — AGY
+  re-confirmed ~1846 LOC, well under threshold)
 - EDIT `userspace-dp/Cargo.toml` (promote `blake2` to a direct dep at the
-  already-locked 0.10.6)
+  already-locked 0.10.6; `curve25519-dalek` 4.1.3 is already in `Cargo.lock`
+  for the X25519 `local_public_key` derivation — promote if needed)
 - (Option a only, if ratified) NEW `test/incus/wg-interop.sh` + a `make`
   target that provisions a Debian-13 `--vm` kernel-wg peer, wires cross-VM UDP
   reachability, and drives the test-only UDP socket harness. NOT built under
@@ -757,3 +891,45 @@ notes; SMR-3 ratifies S1/S2 boundary Option (b) with an honesty condition on
 the interop claim. **No KILL.** Proceed to implement once Codex + AGY converge
 (both must also ratify (a)-vs-(b)); fold SMR-1/-2/-5 into §5.4a as hard test
 requirements before coding.
+
+---
+
+## v3-convergence — round-1 plan-review findings + dispositions
+
+Three independent hostile reviews of plan v2 (@ `2b51e4b4d` / `14ce2c020`):
+
+- **Codex** (`task-mpt6qx4i-i04py6`): **PLAN-NEEDS-MAJOR**. Independently
+  recomputed the MAC1 KAT (and showed HMAC gives a different value —
+  `778123b8...`), confirmed snow IK byte-layout + prologue/psk transcript,
+  confirmed the recipient-key direction. Recommended Option (b) strengthened.
+- **AGY** (`adversarial-review-mpt6r70o-ebe5a4`): **PLAN-NEEDS-MAJOR**.
+  Independently recomputed the MAC1 KAT via a Python BLAKE2s oracle (match),
+  confirmed snow byte-exactness + prologue + psk2, re-confirmed engine.rs stays
+  ~1846 LOC. Found the TAI64N epoch-offset bug and the index blackhole race.
+  Recommended Option (b+).
+- **Claude-SMR**: **PLAN-NEEDS-MINOR** (see §SMR-R1). Independently verified
+  snow `_write_message` payload handling end-to-end and recomputed all four KAT
+  vectors from the Rust `blake2` crate first-principles.
+
+All three converged: design is sound (no KILL), snow byte-exactness holds, MAC1
+is keyed-BLAKE2s-128, S1/S2 boundary = Option (b+).
+
+| # | Finding | Source | Severity | Disposition in v3 |
+|---|---|---|---|---|
+| 1 | TAI64N epoch offset must be `0x400000000000000a` (= `2^62 + 10`), not `2^62` | AGY-2 | MAJOR | FIXED §4.3 + corrected `tai64n_encoding_kat`. Verified against `tai64n.go` `base`. |
+| 2 | Nanos must be whitened `&^ 0x00FFFFFF` to match the reference | Claude (found verifying AGY-2) | MED | ADDED §4.3 + test asserts whitening. |
+| 3 | Index-allocation blackhole race — reserve index BEFORE sending msg | AGY-1 / Codex-4 | CRITICAL | FIXED §5.3 two-phase reservation layer + release-on-fail + concurrent test. |
+| 4 | `local_public_key` missing — inbound MAC1 parse needs OUR static pub | Codex-2 | MAJOR | ADDED §5.3 — derive once at `new`, store, test vs snow. |
+| 5 | TAI64N persistence story inconsistent (§1 "persisted" vs §5.2 deferred); specify nanos carry | Codex-3 | MAJOR | FIXED §1 + §5.2 — in-process monotonic only; disk persist = S6; carry spec'd §4.3. |
+| 6 | S1 KAT too weak — need full deterministic msg1/msg2 wire-body KATs | Codex-1 / SMR-2 | MAJOR | REQUIRED §5.4a `msg1_full_kat_fixed_ephemeral` (+ msg2). |
+| 7 | KAT tests must be dual-source (baked hex AND in-test re-derive) | SMR-1 | MINOR | REQUIRED §5.4a. |
+| 8 | `parse` must accept non-zero mac2 (skip-verify, not malformed) | SMR-5 | MINOR | REQUIRED §5.4a `parse_initiation_accepts_nonzero_mac2`. |
+| 9 | Concurrent-TAI64N-monotonic test | SMR-4 | MINOR | REQUIRED §5.4a. |
+| 10 | NTP step-back / restart self-DoS during integrated testing | AGY-3 | DOC | S2 runbook item (flush peer WG state); durable fix = S6 disk persist. |
+| 11 | Keep `HandshakeState` engine-internal (narrow boundary) | SMR-6 | LOW | §5.3 — engine holds pending HS keyed by reserved index. |
+| 12 | Option (b+): don't claim operator-facing interop until S2 proves it | Codex/AGY/SMR-3 | GOVERNANCE | §5.4b — strengthened S1 gate (full KATs) + honesty condition. |
+| 13 | S2 peer-VM SR-IOV wiring (mlx1/vlan3667, 10.0.61.103) + free-VF check | user | INFO | RECORDED §5.4c for the S2 plan. |
+
+All MAJOR/CRITICAL findings are addressed in v3. Remaining work is a confirming
+round-2 (Codex + AGY) on v3, then implement per §5 with the strengthened
+§5.4a gate.
