@@ -21,6 +21,13 @@ Record Codex / AGY / Gemini task-ids here so continuations can fetch by id
 - Fixes pushed @ bd80112a5 (consume_response reservation rework, restore-on-fail, strict type)
 
 ## Code review round 2 (PR #1716 @ bd80112a5)
-- Codex re-review: task-mpt8qqkg-lcclp2 (dispatched, confirming fixes)
+- Codex re-review: task-mpt8qqkg-lcclp2 — MERGE-NEEDS-MAJOR (consume_response still dropped pending lock before Noise read; per-peer abort could remove in-flight reservation mid-read)
+- Copilot: re-requested; found reconcile-drain-pending gap + MAC1-KAT-comment (fixed @ 76f78b443)
+- Claude-SMR: confirmed no double reconcile_lock acquisition
+
+## Code review round 3 (PR #1716 @ 3f6dda484)
+- Fix: entire handshake completion now under reconcile_lock (install_session_locked / reserve_pending_locked / clear_reservation_locked lock-free cores)
+- Codex re-review: task-mpt93h8p-uwj8eg (dispatched)
+- AGY re-review: adversarial-review-mpt93sxe-c3756h (dispatched)
 - Copilot: re-requested via @copilot review
-- Claude-SMR: fixes self-verified (forged-msg2 regression green, no absent-from-both-maps window)
+- Claude-SMR: verified no path re-takes reconcile_lock (no deadlock); completion paths lock exactly once
