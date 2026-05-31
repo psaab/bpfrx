@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -103,10 +104,23 @@ func mergeDNSInput(cfg *config.Config, leases []*dhcp.Lease) system.ResolvedDrop
 			add(ns)
 		}
 	}
-	// DHCPv4 leases first, then DHCPv6, each in lease order.
+	// DHCPv4 leases first, then DHCPv6. Within a family, leases are
+	// sorted by interface name so the merge is deterministic regardless
+	// of dhcp.Leases() map-iteration order — otherwise resolver priority
+	// (and the byte-for-byte idempotence compare) would flap when two
+	// interfaces in the same family both learn DNS.
+	sorted := make([]*dhcp.Lease, 0, len(leases))
+	for _, l := range leases {
+		if l != nil {
+			sorted = append(sorted, l)
+		}
+	}
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].Interface < sorted[j].Interface
+	})
 	for _, fam := range []dhcp.AddressFamily{dhcp.AFInet, dhcp.AFInet6} {
-		for _, l := range leases {
-			if l == nil || l.Family != fam {
+		for _, l := range sorted {
+			if l.Family != fam {
 				continue
 			}
 			for _, ip := range l.DNS {
@@ -128,13 +142,17 @@ func mergeDNSInput(cfg *config.Config, leases []*dhcp.Lease) system.ResolvedDrop
 // masks systemd-resolved.
 //
 // bootEmptyRepairOnly selects the §5b.4 boot policy: when true (first
-// startup apply, before any DHCP lease) and the merged nameserver set is
-// empty, an existing non-dangling regular /etc/resolv.conf is left
-// untouched — only a dangling / symlinked file is repaired. When false
-// (an explicit runtime commit or a DHCP change), an empty merge is a
-// declarative "clear DNS" and the header-only managed file is written so
-// removing all name-servers / expiring the last lease actually clears
-// the resolver instead of leaking stale servers.
+// startup apply, before any DHCP lease) and there are NO nameservers to
+// install (a search-only render is not a usable resolver), an existing
+// non-dangling regular /etc/resolv.conf is left untouched — only a
+// dangling / symlinked / missing file is repaired. The guard keys off
+// the nameserver set (not in.Empty()) so a config carrying only
+// domain-name/domain-search with no static name-server and no lease does
+// not blank a good resolver file at boot. When false (an explicit
+// runtime commit or a DHCP change), a no-nameserver render is a
+// declarative "clear DNS" and the managed file is written so removing
+// all name-servers / expiring the last lease actually clears the
+// resolver instead of leaking stale servers.
 func (r *dnsReconciler) reconcile(in system.ResolvedDropinInput, bootEmptyRepairOnly bool) {
 	// Always converge resolved off + remove stale drop-ins, regardless of
 	// whether resolv.conf needs rewriting, so a previously-installed
@@ -158,11 +176,13 @@ func (r *dnsReconciler) reconcile(in system.ResolvedDropinInput, bootEmptyRepair
 	isSymlink := lerr == nil && fi.Mode()&os.ModeSymlink != 0
 	missing := os.IsNotExist(lerr)
 
-	// Boot empty-merge policy: no DNS to install and a good regular file
-	// already exists → repair only a bad (symlink/missing) target, never
-	// clobber a good file. A symlink (e.g. the dangling stub) or a
-	// missing file IS repaired below by writing the header-only file.
-	if in.Empty() && bootEmptyRepairOnly && !isSymlink && !missing && lerr == nil {
+	// Boot empty-merge policy: no nameservers to install and a good
+	// regular file already exists → repair only a bad (symlink/missing)
+	// target, never clobber a good file. A symlink (e.g. the dangling
+	// stub) or a missing file IS repaired below by writing the managed
+	// file. Keyed on the nameserver set, not in.Empty(), so a
+	// domain-name/domain-search-only config does not blank a good file.
+	if len(in.NameServers) == 0 && bootEmptyRepairOnly && !isSymlink && !missing && lerr == nil {
 		return
 	}
 

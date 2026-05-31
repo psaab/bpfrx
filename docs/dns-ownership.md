@@ -36,12 +36,21 @@ lock), so it never races a concurrent commit or a DHCP-driven reconcile.
 ## Boot-time behavior
 
 The boot config apply runs **before** DHCP clients start, so there are no
-DHCP leases yet. If the merged nameserver set is empty at boot (no static
-`name-server`, no leases), xpf:
+DHCP leases yet. If there are **no nameservers** to install at boot (no
+static `name-server`, no leases — a search-only render is not a usable
+resolver), xpf:
 
 - **repairs** a dangling / stub / missing `/etc/resolv.conf` by writing a
-  valid header-only managed file, but
+  valid managed file, but
 - **does not clobber** a pre-existing good (regular-file) `resolv.conf`.
+
+The boot guard keys off the nameserver set, not "all DNS fields empty",
+so a config carrying only `domain-name` / `domain-search` (no static
+`name-server`) does not blank a good resolver file at boot.
+
+DHCP-learned servers are merged deterministically: DHCPv4 before DHCPv6,
+and within a family sorted by interface name, so resolver priority is
+stable across daemon restarts regardless of internal lease map ordering.
 
 DNS for a DHCP-only box becomes available when the first lease arrives and
 fires the reconciler. After boot, an empty merge (operator deleted all

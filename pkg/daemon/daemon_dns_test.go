@@ -233,3 +233,43 @@ func TestMergeDNSInputNilConfigEmptyLeases(t *testing.T) {
 		t.Fatalf("expected empty merge, got %+v", in)
 	}
 }
+
+// Boot policy must key off the nameserver set, not in.Empty(): a config
+// with only domain-name/domain-search (no static name-server, no lease)
+// must NOT clobber a good resolv.conf at boot.
+func TestReconcileBootDomainOnlyDoesNotClobberGoodFile(t *testing.T) {
+	dir := t.TempDir()
+	r, _ := newTestReconciler(t, dir)
+	good := "# hand-written\nnameserver 1.2.3.4\n"
+	if err := os.WriteFile(r.resolvConfPath, []byte(good), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// domain-name set, but no nameservers → search-only render, not a
+	// usable resolver. Boot must leave the good file intact.
+	in := system.ResolvedDropinInput{DomainName: "example.com", DomainSearch: []string{"corp.example.com"}}
+	r.reconcile(in, true /* bootEmptyRepairOnly */)
+	if got := readFile(t, r.resolvConfPath); got != good {
+		t.Fatalf("boot domain-only merge clobbered good file: %q", got)
+	}
+}
+
+// Deterministic merge ordering: multiple leases in the same family must
+// be sorted by interface name so resolver priority + the idempotence
+// compare are stable regardless of dhcp.Leases() map order.
+func TestMergeDNSInputDeterministicLeaseOrder(t *testing.T) {
+	mk := func(iface string, fam dhcp.AddressFamily, addr string) *dhcp.Lease {
+		return &dhcp.Lease{Interface: iface, Family: fam, DNS: []netip.Addr{netip.MustParseAddr(addr)}}
+	}
+	// Two v4 leases on different interfaces, presented in two opposite
+	// orders; merged output must be identical (sorted by interface).
+	a := []*dhcp.Lease{mk("ge-0-0-2", dhcp.AFInet, "9.9.9.9"), mk("ge-0-0-1", dhcp.AFInet, "1.1.1.1")}
+	b := []*dhcp.Lease{mk("ge-0-0-1", dhcp.AFInet, "1.1.1.1"), mk("ge-0-0-2", dhcp.AFInet, "9.9.9.9")}
+	inA := mergeDNSInput(nil, a)
+	inB := mergeDNSInput(nil, b)
+	want := []string{"1.1.1.1", "9.9.9.9"} // ge-0-0-1 before ge-0-0-2
+	for _, in := range []system.ResolvedDropinInput{inA, inB} {
+		if len(in.NameServers) != 2 || in.NameServers[0] != want[0] || in.NameServers[1] != want[1] {
+			t.Fatalf("non-deterministic / wrong order: %v, want %v", in.NameServers, want)
+		}
+	}
+}
