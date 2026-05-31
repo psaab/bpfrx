@@ -1402,8 +1402,8 @@ fn established_pair_responder_confirmation_flips_via_decap_path() {
 // ===================================================================
 mod framed_handshake {
     use super::*;
-    use crate::afxdp::wg::engine::HandshakeError;
     use crate::afxdp::wg::handshake::FramingError;
+    use crate::afxdp::wg::handshake_session::HandshakeError;
     use crate::afxdp::wg::{WG_MSG_INIT_LEN, WG_MSG_RESPONSE_LEN};
 
     /// Build two engines that know each other's pubkey, allowing the full
