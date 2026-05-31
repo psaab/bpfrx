@@ -97,7 +97,12 @@ func newDescriptorCoverageStore(t *testing.T) *configstore.Store {
 	if _, err := store.LoadSet(strings.Join([]string{
 		// Zones (zone IDs assigned by the compiler; the fake DP's
 		// LastApplyResult supplies the ZoneIDs the collector reads).
-		"set security zones security-zone trust",
+		// Bind interface "lo" to the trust zone so
+		// collectInterfaceCounters resolves ResolveKernelIfName("lo")=="lo"
+		// and net.InterfaceByName("lo") succeeds (loopback always exists),
+		// driving the xpf_interface_* descriptor family.
+		"set interfaces lo unit 0 family inet",
+		"set security zones security-zone trust interfaces lo.0",
 		"set security zones security-zone untrust",
 		// Zone-pair policy with count, plus a global policy with count.
 		"set security policies from-zone trust to-zone untrust policy allow match source-address any",
@@ -291,17 +296,25 @@ func gatheredNames(mfs []*dto.MetricFamily) map[string]bool {
 func TestCollectorDescriptorCoverage(t *testing.T) {
 	store := newDescriptorCoverageStore(t)
 	gc := conntrack.NewGC(nil, time.Minute)
-	dhcpMgr, err := dhcp.New(t.TempDir(), nil)
-	if err != nil {
-		t.Fatalf("dhcp.New: %v", err)
-	}
-	defer dhcpMgr.Close()
 
 	srv := &Server{
 		store:     store,
 		gc:        gc,
-		dhcp:      dhcpMgr,
 		startTime: time.Now(),
+	}
+	// dhcp.New opens a netlink handle, which a restricted sandbox may
+	// refuse ("operation not permitted"). The DHCP family is one of many;
+	// don't fail the whole descriptor canary on environment privilege.
+	// When the manager is available we wire it (Leases() is empty) and
+	// assert its sentinel; otherwise we skip just that family.
+	dhcpWired := false
+	if dhcpMgr, err := dhcp.New(t.TempDir(), nil); err == nil {
+		defer dhcpMgr.Close()
+		srv.dhcp = dhcpMgr
+		dhcpWired = true
+	} else {
+		t.Logf("dhcp.New unavailable in this environment (%v); skipping the "+
+			"DHCP descriptor family only", err)
 	}
 	srv.dp = &descriptorCoverageDP{
 		Manager: dataplane.New(),
@@ -333,25 +346,158 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 	// future change that drops an entire family (rather than mis-declaring
 	// a single desc) also fails this canary.
 	names := gatheredNames(mfs)
-	for _, want := range []string{
-		"xpf_packets_total",        // collectGlobalCounters
-		"xpf_zone_packets_total",   // collectZoneCounters
-		"xpf_policy_hits_total",    // collectPolicyCounters
-		"xpf_filter_hits_total",    // collectFilterCounters
-		"xpf_nat_pool_total_ports", // collectNATPoolMetrics
-		"xpf_sessions_active",      // collectSessionGauges
-		"xpf_dhcp_leases_active",   // collectDHCPMetrics
-		"xpf_daemon_uptime_seconds", // collectSystemMetrics
-		"xpf_userspace_worker_dead", // emitWorkerRuntime
+	want := []string{
+		"xpf_packets_total",           // collectGlobalCounters
+		"xpf_interface_packets_total", // collectInterfaceCounters (lo)
+		"xpf_zone_packets_total",      // collectZoneCounters
+		"xpf_policy_hits_total",       // collectPolicyCounters
+		"xpf_filter_hits_total",       // collectFilterCounters
+		"xpf_nat_pool_total_ports",    // collectNATPoolMetrics
+		"xpf_sessions_active",         // collectSessionGauges
+		"xpf_daemon_uptime_seconds",   // collectSystemMetrics
+		"xpf_userspace_worker_dead",   // emitWorkerRuntime
 		"xpf_userspace_worker_cold_path_samples_v3_total", // cold-path v3
 		"xpf_cos_drain_invocations_total",                 // CoS owner profile
 		"xpf_userspace_three_color_policer_drops_total",   // three-color policer
 		"xpf_userspace_source_nat_pool_live_flows",        // userspace SNAT pool
 		"xpf_userspace_neighbor_warm_drops_total",         // neighbor-warm
-	} {
-		if !names[want] {
+	}
+	if dhcpWired {
+		want = append(want, "xpf_dhcp_leases_active") // collectDHCPMetrics
+	}
+	for _, name := range want {
+		if !names[name] {
 			t.Errorf("expected metric family %q in gathered output but it was "+
-				"absent — its collect path did not emit (coverage gap)", want)
+				"absent — its collect path did not emit (coverage gap)", name)
 		}
 	}
+}
+
+// TestFairnessThroughputDescriptorCoverage closes the coverage gap the
+// single-Gather canary cannot reach deterministically: the
+// fairness-throughput + equal-flow estimator descriptors emit only when
+// the rolling FairnessThroughputWindow has a prior sample and a positive
+// duration between updates (and FlowWorkerMap rows). Rather than depend on
+// the window timing inside one Collect(), this test captures the
+// Describe() descriptor set and drives the fairness emitters directly over
+// two timed updates, asserting every emitted descriptor is declared — the
+// same checked-collector contract, applied to the timing-gated families.
+func TestFairnessThroughputDescriptorCoverage(t *testing.T) {
+	store := newDescriptorCoverageStore(t)
+	c := newCollector(&Server{store: store})
+
+	declared := describedSet(c)
+
+	queueID := uint8(4)
+	fwk := dpuserspace.FlowTupleStatus{
+		AddrFamily: 4, Protocol: 6,
+		SrcIP: "10.0.0.1", DstIP: "10.0.0.2", SrcPort: 1234, DstPort: 80,
+	}
+	mkStatus := func(bytes uint64) dpuserspace.ProcessStatus {
+		return dpuserspace.ProcessStatus{
+			Workers: 2,
+			CoSActiveFlowCounts: []dpuserspace.CoSActiveFlowCountStatus{
+				{Ifindex: 80, QueueID: 4, WorkerID: 0, ActiveFlowCount: 1},
+			},
+			FlowWorkerMap: []dpuserspace.FlowWorkerStatus{
+				{
+					EgressIfindex:  80,
+					CoSQueueID:     &queueID,
+					WorkerID:       0,
+					ForwardWireKey: fwk,
+					ObservedBytes:  bytes,
+				},
+			},
+		}
+	}
+
+	// Two updates with a real positive duration so the window produces a
+	// throughput summary (and, with a per-flow delta, the equal-flow
+	// estimator). Drive emitFairnessThroughputGauges directly; it persists
+	// the window on c across calls.
+	collect := func(status dpuserspace.ProcessStatus) []prometheus.Metric {
+		ch := make(chan prometheus.Metric)
+		go func() {
+			c.emitFairnessThroughputGauges(ch, status)
+			close(ch)
+		}()
+		var got []prometheus.Metric
+		for m := range ch {
+			got = append(got, m)
+		}
+		return got
+	}
+	_ = collect(mkStatus(1_000_000)) // seed sample
+	time.Sleep(2 * time.Millisecond) // positive window duration
+	got := collect(mkStatus(9_000_000))
+
+	// Also drive the equal-flow estimator emitter directly with a valid
+	// estimate so its descriptor family is exercised regardless of window
+	// state (mirrors TestEmitFairnessEqualFlowEstimateGauges shape).
+	estRow := dpuserspace.FairnessThroughputSummary{
+		EqualFlowEstimate: dpuserspace.FairnessEqualFlowEstimate{
+			Valid:                true,
+			TargetPerFlowBPS:     3200,
+			ObservedBPS:          16000,
+			CappedBPS:            12800,
+			SuppressedBPS:        3200,
+			ThroughputLossRatio:  0.2,
+			ActiveWorkers:        2,
+			SampledActiveWorkers: 2,
+			Workers: []dpuserspace.FairnessEqualFlowWorkerEstimate{
+				{WorkerID: 0, ObservedBPS: 9600, ObservedPerFlow: 3200, CapBPS: 9600},
+				{WorkerID: 1, ObservedBPS: 6400, ObservedPerFlow: 6400, CapBPS: 3200, SuppressedBPS: 3200},
+			},
+		},
+	}
+	estCh := make(chan prometheus.Metric)
+	go func() {
+		c.emitFairnessEqualFlowEstimateGauges(estCh, estRow, "80", "4")
+		close(estCh)
+	}()
+	for m := range estCh {
+		got = append(got, m)
+	}
+
+	if len(got) == 0 {
+		t.Fatal("fairness emitters produced no metrics — window/fixture not wired")
+	}
+	var undeclared []string
+	sawThroughput, sawEqualFlow := false, false
+	for _, m := range got {
+		d := m.Desc()
+		if _, ok := declared[d]; !ok {
+			undeclared = append(undeclared, descName(d))
+		}
+		switch descName(d) {
+		case "xpf_fairness_observed_cov":
+			sawThroughput = true
+		case "xpf_fairness_equal_flow_observed_bps":
+			sawEqualFlow = true
+		}
+	}
+	if len(undeclared) > 0 {
+		t.Fatalf("fairness emitters produced %d descriptor(s) not declared in "+
+			"Describe() (checked-collector contract violation — add them to "+
+			"Describe()): %v", len(undeclared), undeclared)
+	}
+	if !sawThroughput {
+		t.Error("fairness throughput summary did not emit xpf_fairness_observed_cov " +
+			"— window timing fixture is not driving summaries")
+	}
+	if !sawEqualFlow {
+		t.Error("equal-flow estimator did not emit xpf_fairness_equal_flow_observed_bps")
+	}
+}
+
+// describedSet captures the full Describe() descriptor set of a collector.
+func describedSet(c *xpfCollector) map[*prometheus.Desc]struct{} {
+	ch := make(chan *prometheus.Desc, 256)
+	c.Describe(ch)
+	close(ch)
+	out := map[*prometheus.Desc]struct{}{}
+	for d := range ch {
+		out[d] = struct{}{}
+	}
+	return out
 }
