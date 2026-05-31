@@ -40,10 +40,16 @@ func (x *xfrmManager) Apply(vpns map[string]*config.IPsecVPN) error {
 			continue
 		}
 
-		// Check if already exists
-		if _, err := x.ops.LinkByName(ifName); err == nil {
-			link, _ := x.ops.LinkByName(ifName)
-			x.ops.LinkSetUp(link)
+		// Check if already exists. Reuse the link from this single
+		// lookup: calling LinkByName a second time and ignoring its
+		// error risked passing a nil link to LinkSetUp on a transient
+		// second-lookup failure, which panics inside netlink's LinkSetUp
+		// (link.Attrs() on a nil interface).
+		if link, err := x.ops.LinkByName(ifName); err == nil {
+			if upErr := x.ops.LinkSetUp(link); upErr != nil {
+				slog.Warn("failed to bring up existing xfrmi",
+					"name", ifName, "err", upErr)
+			}
 			slog.Debug("xfrmi already exists", "name", ifName, "if_id", ifID)
 			// Track if not already tracked
 			found := false
