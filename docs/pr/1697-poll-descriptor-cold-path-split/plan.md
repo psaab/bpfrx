@@ -1,6 +1,37 @@
 # #1697 — Extract cold-path/exception helpers out of poll_descriptor/mod.rs
 
-**Status:** DRAFT v1 — pending adversarial plan review (Codex + AGY + Claude-SMR)
+**Status:** DRAFT v2 — revised after round-1 PLAN-KILL (Codex + AGY) +
+PLAN-NEEDS-MINOR (Claude-SMR). All three converged on one fixable defect:
+v1's blanket `#[inline(never)]` policy was wrong for the guard-wrappers
+reachable from the `#[inline(always)]` flow-cache fast path. v2 adopts
+the salvage path all three reviewers endorsed: keep the common-case
+guard inline; split only the rare/heavy bodies into
+`#[cold] #[inline(never)]` callees. Re-dispatched for round 2.
+
+## Round-1 verdicts and how v2 addresses them
+
+- **Codex (task-mpt40s8e-dannse): PLAN-KILL** — *"not killed because
+  cold leaf extraction is inherently cosmetic ... killed because the
+  plan as written extracts warm/hot guard wrappers and forces calls
+  from the flow-cache fast path."* Salvage: keep `emit_cached_*` + DSCP
+  guard path inline, split only their rare emit/eval bodies into
+  `#[cold] #[inline(never)]`.
+- **AGY (adversarial-review-mpt40vtg-n4ss4x): PLAN-KILL** — same F1
+  regression (forced per-packet `call` + 96-byte `UserspaceDpMeta`
+  by-value copy ×2 on every cache hit). Same salvage path. Also raised
+  the "12% file reduction is low value" objection (addressed in §2).
+- **Claude-SMR: PLAN-NEEDS-MINOR** — same F1; recommended
+  `#[cold]` alongside `#[inline(never)]` for true-exception leaves and a
+  `cargo asm` regression guard asserting NO new per-packet call into
+  `emit_cached_*`.
+
+**New round-1 finding incorporated (Codex):** flow_cache.rs:285
+documents that DSCP-sensitive filters are NOT flow-cached ("DSCP-
+sensitive filters must be re-evaluated on every packet"). So for a
+config with DSCP-sensitive input filters,
+`evaluate_dscp_sensitive_input_filter_on_session_hit` IS the
+established-flow per-packet path, not a per-flow-once path. v2 keeps it
+`#[inline]` with the cheap `has_dscp_match` guard hoisted/inlined.
 
 ## 1. Issue framing
 
@@ -57,6 +88,22 @@ filter log) or never (steady-state established traffic flows entirely
 through `stage_flow_cache_hit`). The justification is structural
 hygiene + I-cache discipline, not a throughput number.
 
+**On the round-1 "12% reduction / still a monolith" objection (AGY):**
+the objection is fair as a ceiling — `mod.rs` stays the largest file
+because the 2400-LOC order-coupled hot fn cannot be split (the #946
+Phase-2 verdict, which the issue itself cites). This PR does NOT claim
+to de-monolith the hot fn. Its claims are narrower and concrete: (1)
+move the file below 2600 LOC, eliminating the worst REFACTOR-tier
+offender's 3K-line status and making the cold surface independently
+navigable; (2) give the true-exception bodies `#[cold]` section
+placement so the hot loop's own bytes are not interleaved with
+NAT-failure / filter-log code. If reviewers judge (1)+(2) insufficient
+to justify three new files, PLAN-KILL remains acceptable — but the
+salvage path all three round-1 reviewers volunteered (keep guards
+inline, split rare bodies cold) is exactly what v2 now does, which is
+the normal disposition of a "killed-but-salvageable" plan, not a dead
+architecture.
+
 **If reviewers conclude the perf gain is too small to justify the
 churn, PLAN-KILL is an acceptable verdict.** The bar this plan must
 clear: the helpers being moved must be genuinely COLD (not on the
@@ -105,57 +152,91 @@ reach these helpers. Call-site evidence (mod.rs line numbers):
 | `filter_log_egress_zone_id` | 370 (internal) | helper-of-helpers | yes |
 | `source_nat_decision_for_flow`/etc. | — | — | — |
 
-**Two helpers are warm, not cold, and are the main PLAN-KILL risk:**
+**Three helpers are WARM/HOT, not cold — they must stay `#[inline]`
+(round-1 fix; v1 wrongly proposed `#[inline(never)]`):**
 
 - `emit_cached_input_filter_log` / `emit_cached_output_filter_log` are
-  invoked from inside `stage_flow_cache_hit` (the `#[inline(always)]`
-  HOT fast path), at flow_cache_hit.rs:127/134. They guard on
-  `cached_descriptor.input_filter_log.is_some()` /
-  `tx_selection.filter_log.is_some()` — i.e. they early-return for the
-  overwhelmingly common no-filter-logging case, so the hot body is just
-  a branch + `call`. Marking them `#[inline(never)]` is *correct* here
-  (it keeps the cold emit body out of the inlined fast path), but they
-  must be reachable from `flow_cache_hit.rs`, so they cannot move into
-  a `mod`-private sibling — they go into a sibling that
-  `flow_cache_hit.rs` can `use`.
+  invoked UNCONDITIONALLY from inside `stage_flow_cache_hit` (the
+  `#[inline(always)]` HOT fast path), at flow_cache_hit.rs:127/134 —
+  i.e. on EVERY established-flow packet. They early-return on the
+  common no-filter-logging case (mod.rs:339, mod.rs:362). v1's
+  `#[inline(never)]` would force two unconditional per-packet `call`s
+  plus a 96-byte `UserspaceDpMeta` by-value copy each, just to return
+  `None` — a hot-path regression. **v2: keep `#[inline]`; the `None`
+  guard inlines into the fast path; the rare non-`None` tail delegates
+  to a `#[cold] #[inline(never)]` callee.**
 
 - `evaluate_dscp_sensitive_input_filter_on_session_hit` (line 677) runs
-  on a session *hit* but is itself gated by
-  `interface_input_filter_has_dscp_match` returning early when no DSCP
-  filter is configured. It is warm-but-guarded; `#[inline(never)]` is
-  defensible because the body past the guard is cold.
+  on EVERY session-HIT packet for a config with DSCP-sensitive input
+  filters — because flow_cache.rs:285 documents that DSCP-sensitive
+  filters are deliberately NOT flow-cached ("must be re-evaluated on
+  every packet"). So for that config class this is the established-flow
+  per-packet path. Its `interface_input_filter_has_dscp_match` guard is
+  INSIDE the fn (mod.rs:232), so `#[inline(never)]` would force a call
+  before the guard. **v2: keep `#[inline]` so the cheap guard inlines;
+  the post-guard body calls the cold `evaluate_non_pbr_input_filter`.**
 
 ## 5. Concrete design
 
 Create three cold sibling modules under
-`userspace-dp/src/afxdp/poll_descriptor/`:
+`userspace-dp/src/afxdp/poll_descriptor/`. **Inline policy is
+per-function, NOT blanket `#[inline(never)]`** (round-1 fix): a helper
+reachable from the `#[inline(always)]` flow-cache fast path keeps
+`#[inline]` so its cheap common-case guard folds into the hot path; the
+rare/heavy tail is split into a `#[cold] #[inline(never)]` callee.
+True-exception leaves get `#[cold] #[inline(never)]` directly (matching
+the repo's existing pattern at `tx/dispatch/slow_path.rs:23`).
 
 1. **`filter.rs`** — interface-input-filter evaluation + filter-log
    emission (the largest cold cluster):
    - `struct NonPbrInputFilterEval` (move from mod.rs:128)
    - `fn filter_log_ingress_zone_id`, `fn filter_log_egress_zone_id`
-   - `fn evaluate_non_pbr_input_filter`
-   - `fn evaluate_non_pbr_input_filter_log_only`
-   - `fn evaluate_dscp_sensitive_input_filter_on_session_hit`
-   - `fn emit_input_filter_log_match`
-   - `fn emit_cached_input_filter_log` (used by flow_cache_hit.rs)
-   - `fn emit_cached_output_filter_log` (used by flow_cache_hit.rs)
-   - `fn apply_lo0_filter_action`
-   All become `#[inline(never)]`. Visibility `pub(super)` so both
-   `mod.rs` and the sibling `flow_cache_hit.rs` can call them via
-   `super::filter::*`.
+     — leaf helpers; `#[inline]` (called from both inline and cold
+     callers; trivial bodies, let rustc decide).
+   - `fn evaluate_non_pbr_input_filter` — `#[cold] #[inline(never)]`
+     (session-miss per-flow-once).
+   - `fn evaluate_non_pbr_input_filter_log_only` —
+     `#[cold] #[inline(never)]` (flow-cache insert, per-flow-once).
+   - `fn evaluate_dscp_sensitive_input_filter_on_session_hit` —
+     **`#[inline]`** (per-packet on the DSCP-filter config class — see
+     round-1 Codex finding / flow_cache.rs:285). The cheap
+     `interface_input_filter_has_dscp_match` guard at mod.rs:232 MUST
+     stay inline at the front so the common no-DSCP-filter case is a
+     branch + early return with no call. The post-guard body calls
+     `evaluate_non_pbr_input_filter` which is the cold callee.
+   - `fn emit_input_filter_log_match` — `#[cold] #[inline(never)]`
+     (filter LOG action, exception).
+   - `fn emit_cached_input_filter_log` (called from flow_cache_hit.rs
+     HOT path) — **`#[inline]`**. Its `None`-guard at mod.rs:339 must
+     fold into the fast path. The non-`None` body delegates to
+     `emit_input_filter_log_match` (the cold callee), so the only thing
+     inlined into the hot path is the guard + the rare `call`.
+   - `fn emit_cached_output_filter_log` (called from flow_cache_hit.rs
+     HOT path) — **`#[inline]`**, same shape: `None`-guard at
+     mod.rs:362 inlines; the emit tail delegates to a
+     `#[cold] #[inline(never)]` inner `emit_cached_output_filter_log_tail`
+     (new thin split) so the heavy `emit_filter_log_event` call lives
+     out of line.
+   - `fn apply_lo0_filter_action` — `#[cold] #[inline(never)]`
+     (host-bound lo0 traffic only).
+   Visibility `pub(super)` so both `mod.rs` and the sibling
+   `flow_cache_hit.rs` can call them via `super::filter::*`.
 
 2. **`nat_exception.rs`** — source-NAT decision + failure recorder:
-   - `fn source_nat_decision_for_flow`
-   - `fn record_source_nat_failure`
-   `#[inline(never)]`, `pub(super)`.
+   - `fn source_nat_decision_for_flow` — `#[cold] #[inline(never)]`
+     (session-miss SNAT eval, per-flow-once).
+   - `fn record_source_nat_failure` — `#[cold] #[inline(never)]`
+     (SNAT exhaustion exception only).
+   `pub(super)`.
 
 3. **`cookie_reply.rs`** — SYN-cookie reply enqueue machinery:
    - `const SYN_COOKIE_REPLY_PENDING_RESERVE`
    - `enum SynCookieReply`
-   - `fn syn_cookie_reply_budget_available`
-   - `fn enqueue_syn_cookie_reply`
-   `#[inline(never)]`, `pub(super)` (enum + fns).
+   - `fn syn_cookie_reply_budget_available` — `#[inline]` (tiny, called
+     only from `enqueue_syn_cookie_reply`, already-cold caller).
+   - `fn enqueue_syn_cookie_reply` — `#[cold] #[inline(never)]`
+     (SYN-cookie challenge / DDoS path, never on established flows).
+   `pub(super)` (enum + fns).
 
 Each module starts with `use super::*;` (same pattern as
 `flow_cache_hit.rs` / `rx_telemetry.rs`) to pull `BindingWorker`,
@@ -230,12 +311,20 @@ consumer and it keeps calling `emit_cached_input_filter_log` /
   `syn_cookie_reply_enqueues_host_generated_frame_without_transit_policy_metadata`
   and `syn_cookie_reply_budget_preserves_tx_batch_reserve` (the tests
   that move with `cookie_reply.rs`).
-- `cargo asm` (or `--emit=asm` + symbol grep) spot-check: confirm
-  `poll_binding_process_descriptor` emits `call` edges into
-  `nat_exception::record_source_nat_failure` /
-  `filter::emit_input_filter_log_match` (proving they did NOT inline
-  back), and confirm the hot flow-cache-hit path does NOT emit an
-  unconditional per-packet call into `filter::emit_cached_*`.
+- **F1 regression guard (the round-1 KILL trigger) — `cargo asm`
+  spot-check:** disassemble `stage_flow_cache_hit` and confirm the
+  hot flow-cache-hit path does NOT emit an unconditional per-packet
+  `call` into `filter::emit_cached_input_filter_log` /
+  `emit_cached_output_filter_log` (i.e. the `None` guard inlined and
+  only a *conditional* rare call remains, or no call when no filter log
+  is configured). Likewise confirm `evaluate_dscp_..._on_session_hit`'s
+  `has_dscp_match` guard inlined into the session-hit path. Conversely,
+  confirm the true-exception leaves (`nat_exception::record_source_nat_failure`,
+  `filter::emit_input_filter_log_match`, `apply_lo0_filter_action`,
+  `cookie_reply::enqueue_syn_cookie_reply`) DID land out of line
+  (own symbols, `.text.unlikely` placement under `#[cold]`). This is
+  the explicit guard against re-introducing the F1 per-packet
+  regression.
 - Go suite: `go test ./...` (30 packages) — unaffected, sanity only.
 - Deploy on loss userspace cluster; **full CoS smoke matrix**
   (HOT-PATH change): Pass A CoS-disabled (v4+v6 × push+reverse +
