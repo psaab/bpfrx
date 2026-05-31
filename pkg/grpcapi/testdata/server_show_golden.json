@@ -6,6 +6,7 @@
   "buffers": "Userspace Buffer Utilization:\n  unavailable: helper status does not include bounded userspace capacity gauges\n  required status fields: per_binding[].umem_total_frames, per_binding[].umem_inflight_frames, per_binding[].tx_ring_capacity, per_binding[].outstanding_tx\n  dynamic status fields: session_table_entries/max_sessions, per_binding[].flow_cache_capacity, neighbor_cache_capacity\n  bindings[] mirrors with the same fields are also accepted\n\nUserspace Status Counters:\nCounter                          Scope                           Value\n----------------------------------------------------------------------\nSYN-cookie challenges            aggregate                           2\nSYN-cookie ACK valid             aggregate                           5\n",
   "buffers-detail": "Userspace Buffer Utilization:\n  unavailable: helper status does not include bounded userspace capacity gauges\n  required status fields: per_binding[].umem_total_frames, per_binding[].umem_inflight_frames, per_binding[].tx_ring_capacity, per_binding[].outstanding_tx\n  dynamic status fields: session_table_entries/max_sessions, per_binding[].flow_cache_capacity, neighbor_cache_capacity\n  bindings[] mirrors with the same fields are also accepted\n\nUserspace Status Counters:\nCounter                          Scope                           Value\n----------------------------------------------------------------------\nSYN-cookie challenges            aggregate                           2\nSYN-cookie ACK valid             aggregate                           5\nSYN-cookie challenges            worker 0/queue 0/slot 0             2\nSYN-cookie ACK valid             worker 0/queue 0/slot 0             5\n",
   "class-of-service": "No class-of-service interfaces configured\n",
+  "core-dumps": "No core dumps found\n",
   "dynamic-address": "Feed server: office\n  URL: http://example.com/feed\n  Prefixes: 42\n  Last fetch: \u003cTS\u003e (\u003cAGE\u003e ago)\n\n",
   "event-options": "Policy: ep1\n  Events: SNMP_TRAP_LINK_DOWN\n\n",
   "firewall-filter:bandwidth-output": "Filter: bandwidth-output (family inet)\n\n  Term: 0\n    from destination-port 80\n    then accept\n    Hit count: 7 packets, \u003cSIZE\u003e\n\n",
@@ -32,8 +33,8 @@
   "screen-statistics-all": "Dataplane not loaded\n",
   "screen-statistics:untrust-screen": "Dataplane not loaded\n",
   "task": "Task: xpfd daemon\n  Goroutines: \u003cNUM\u003e\n  Memory allocated: \u003cSIZE\u003e\n  System memory: \u003cSIZE\u003e\n  GC cycles: \u003cNUM\u003e\n  Uptime: \u003cDUR\u003e\n",
-  "test-policy:from trust to untrust src 10.0.1.1 dst 10.0.2.1 port 80 proto tcp": "Missing from/to zone parameters\n",
-  "test-routing:dest 10.0.2.1": "Routing manager not available\n",
-  "test-zone:ge-0-0-0": "Missing interface parameter\n",
+  "test-policy:from=trust,to=untrust,src=10.0.1.1,dst=10.0.2.1,port=80,proto=tcp": "Policy match:\n  From zone: trust\n  To zone:   untrust\n  Policy:    p1\n  Action:    permit\n",
+  "test-routing:dest=10.0.2.1": "Routing manager not available\n",
+  "test-zone:interface=ge-0-0-0.0": "Interface ge-0-0-0.0 belongs to zone: trust\n",
   "vlans": "No VLANs configured\n"
 }

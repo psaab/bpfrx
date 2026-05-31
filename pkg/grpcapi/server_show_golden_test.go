@@ -38,6 +38,19 @@ import (
 // genuinely environment-dependent topics (storage/core-dumps/task/log)
 // still get a normalized byte-assert rather than a weak non-empty
 // check.
+//
+// Coverage scoping: topics whose moved logic sits behind a live
+// netlink-backed routing.Manager (route-table/route-protocol/
+// route-prefix/test-routing/routing-options/route-instance/route-map/
+// bfd-peers) or a loaded dataplane (screen-statistics*) render their
+// "manager not available" / "dataplane not loaded" guard in this unit
+// fixture — that guard is the realistic unattached-manager path and is
+// itself part of the moved body. test-policy and test-zone DO exercise
+// the real comma/key=value parse + cfg lookup paths (fixture has zones
+// + policy p1); dynamic-address and firewall-filter exercise their
+// runtime feedsFn / hit-counter branches via the stubbed feedsFn and
+// FilterTermCounters. The full active-routing render paths are covered
+// by the routing package's own tests, not duplicated here.
 
 // goldenFixedFetch is a fixed timestamp used for the dynamic-address
 // feed "last fetch ... ago" rendering so its output is deterministic.
@@ -58,9 +71,11 @@ var goldenShowTopics = []string{
 	"screen-statistics:untrust-screen",
 	"screen-statistics-all",
 	"screen-ids-option-detail:untrust-screen",
-	"test-policy:from trust to untrust src 10.0.1.1 dst 10.0.2.1 port 80 proto tcp",
-	"test-routing:dest 10.0.2.1",
-	"test-zone:ge-0-0-0",
+	// test-* topics are comma-separated key=value (matching the cmd/cli
+	// producers in cmd/cli/main.go and the helpers' comma/`=` parsers).
+	"test-policy:from=trust,to=untrust,src=10.0.1.1,dst=10.0.2.1,port=80,proto=tcp",
+	"test-routing:dest=10.0.2.1",
+	"test-zone:interface=ge-0-0-0.0",
 	"firewall-filter:bandwidth-output",
 	"firewall-filter:bandwidth-output:inet",
 	// switch cases (cfg-rendered)
@@ -84,13 +99,13 @@ var goldenShowTopics = []string{
 	"bfd-peers",
 	"route-map",
 	"ipv6-router-advertisement",
-	"backup-router",
 	// default arm
 	"monitor-security-flow",
 	// shell-out / runtime topics (normalized)
 	"buffers",
 	"buffers-detail",
 	"task",
+	"core-dumps",
 }
 
 // goldenNormalizers collapse non-deterministic tokens so the captured
