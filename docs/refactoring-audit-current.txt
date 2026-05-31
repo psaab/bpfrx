@@ -1,5 +1,4 @@
 [REFACTOR]   2437  userspace-dp/src/afxdp/poll_descriptor/mod.rs
-[REFACTOR]   2085  pkg/routing/routing.go
 [REFACTOR]   2055  pkg/config/types.go
 [REFACTOR]   2006  pkg/grpcapi/server_show.go
 [WATCH]      1986  pkg/cli/cli_show_security.go

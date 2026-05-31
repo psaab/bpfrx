@@ -9,18 +9,46 @@ This package owns netlink object lifecycles. FRR (`pkg/frr`) owns the
 kernel route table; this package owns the *interfaces* routes hang off
 of.
 
+## Structure (#1698 domain split)
+
+`Manager` (`routing.go`) is a thin **façade**: it owns the single
+`*netlink.Handle` and delegates every public method to an unexported
+per-domain manager. Each domain owns its own sub-state + its own lock
+and depends on a narrow netlink-facing ops interface (`vrfOps`,
+`routeLister`, `linkOps`, `ruleOps`) rather than the concrete handle,
+which makes each domain unit-testable with a fake (see `rules_test.go`'s
+`fakeRuleOps` and `routing_test.go`'s `fakeVRFOps`).
+
+| File | Domain | Owns |
+|------|--------|------|
+| `routing.go` | `Manager` façade | sole `*netlink.Handle`, domain refs |
+| `vrf.go` | `vrfManager` | VRF lifecycle + `BindInterfaceToVRF`; own `mu` + tracked set |
+| `routes.go` | `routeReader` | kernel routing-table reads (`routeLister`) |
+| `routeformat.go` | free fns | Junos `show route` formatters |
+| `tunnel.go` | `tunnelManager` | GRE/IPIP tunnels + keepalive goroutines; own `mu` |
+| `xfrm.go` | `xfrmManager` | XFRM/IPsec interface lifecycle; own `mu` |
+| `rules.go` | `nextTableManager` / `ribGroupManager` / `pbrManager` | policy-routing ip-rule reconcilers (`ruleOps`, stateless) |
+| `bond.go` | `bondManager` | bond device lifecycle; own `mu` |
+| `reth.go` | `rethManager` | stale `reth*` bond cleanup |
+| `monitor.go` | `monitorManager` | interface-monitor HA signal; own `mu` |
+
+The tunnel domain depends on the VRF domain (`tunnelManager.vrfBinder`)
+to bind tunnel interfaces to a routing-instance VRF;
+`BindInterfaceToVRF` takes no lock, so there is no lock-ordering cycle.
+
 ## Entry points
 
-- `Manager` — `routing.go`.
-- `VRFSpec` — `routing.go`.
-- `KeepaliveState` — `routing.go`. Per-tunnel probe status.
-- `TunnelStatus` — `routing.go`.
-- `RouteEntry` — `routing.go`.
-- `InterfaceMonitorStatus` — `routing.go`.
+All public methods remain on `*Manager` with unchanged signatures and
+delegate to the owning domain. Exported types:
+
+- `Manager` — `routing.go` (façade).
+- `VRFSpec` — `vrf.go`.
+- `KeepaliveState` — `tunnel.go`. Per-tunnel probe status.
+- `TunnelStatus` — `tunnel.go`.
+- `RouteEntry`, `TableRoutes` — `routes.go`.
+- `PBRRule` — `rules.go`.
+- `InterfaceMonitorStatus` — `monitor.go`.
 - `New() (*Manager, error)` — `routing.go`.
-- `ApplyTunnels(tunnels []*config.TunnelConfig) error` — `routing.go`.
-- `ReconcileVRFs(desired []VRFSpec) error` — `routing.go`.
-- `ApplyXfrmi(vpns map[string]*config.IPsecVPN) error` — `routing.go`.
 
 ## Callers
 
@@ -33,9 +61,9 @@ of.
 ## ip-rule priorities
 
 - `100–199`: next-table inter-VRF leaking (static routes with
-  `next-table` directive). `nextTableRulePriority` in `routing.go`.
+  `next-table` directive). `nextTableRulePriority` in `rules.go`.
 - `31000–31999`: PBR (firewall-filter `routing-instance` action).
-  `pbrRulePriority` in `routing.go`.
+  `pbrRulePriority` in `rules.go`.
 - `33000–33099`: rib-group inter-VRF leaking (`from all lookup
   <table>`).
 - main table at `32766`. The next-table range sits **before** main
@@ -44,10 +72,17 @@ of.
 
 ## Gotchas
 
-- #848: `ifaceMu` serializes tunnel/xfrmi/bond slice access. Long-running
-  reads snapshot under the lock and iterate the copy lock-free.
-- `vrfsMu` is a separate lock. `ReconcileVRFs` holds it for the entire
-  netlink reconciliation; it isn't re-entrant.
+- #848 / #1698: each interface domain (`tunnelManager`, `xfrmManager`,
+  `bondManager`) now has its own lock instead of one shared `ifaceMu`.
+  The split is safe because no operation crossed those domains under one
+  lock; keepalives belong to the tunnel domain. Long-running reads
+  (`GetTunnelStatus`) snapshot under the tunnel lock and iterate the
+  copy lock-free.
+- `vrfManager` holds its own lock for the entire netlink reconciliation;
+  `ReconcileVRFs` isn't re-entrant.
+- `Manager.Close()` is not safe to call concurrently with the public
+  apply/read methods (single-threaded-shutdown contract; no daemon
+  caller of `Close` today).
 - Keepalive runner goroutines drain on the `done` channel before the
   netlink handle is closed. Closing the handle while a goroutine still
   holds it would be a use-after-close.
