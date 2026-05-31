@@ -78,7 +78,7 @@ This active phase order supersedes the older issue-first ordering below.
 | H1 | In-flight TX timeout missing | `in_flight_prepared_recycles` in tx.rs | Kernel never completing TX → permanent UMEM frame leak |
 | H2 | Session sync race between shared map and BPF map | `upsert_synced_session()` | Window during HA failover where BPF/shared maps disagree |
 | H3 | Incomplete reverse session metadata | `build_reverse_session_from_forward_match()` | Routing table + DSCP lost on reverse path |
-| H4 | SYN cookies not implemented | screen.rs | SYN flood protection degrades to rate-limiting only |
+| H4 | SYN-cookie benchmark/validation gap (`syn-proxy` mode unimplemented) | `screen/syncookie.rs`, `screen/mod.rs` | Userspace `syn-cookie` IS implemented (codec + SipHash24 MAC + validated-client cache in `syncookie.rs`, wired via `screen/mod.rs`, hot-path `syn_cookie_syn_ack_sent` counter). Open items: under-flood benchmark/validation, plus the stateful `syn-proxy` mode is not implemented. |
 
 ### MEDIUM
 
