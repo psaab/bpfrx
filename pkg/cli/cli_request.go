@@ -211,6 +211,17 @@ func (c *CLI) testPolicy(args []string) error {
 		return nil
 	}
 
+	// A non-empty but malformed source/destination IP would parse to
+	// nil and be treated as a wildcard by matchPolicyAddr, yielding a
+	// false-positive policy match (#1711). Reject it explicitly. An
+	// empty value still means "unspecified" (match any).
+	if srcIP != "" && net.ParseIP(srcIP) == nil {
+		return fmt.Errorf("invalid source-ip %q", srcIP)
+	}
+	if dstIP != "" && net.ParseIP(dstIP) == nil {
+		return fmt.Errorf("invalid destination-ip %q", dstIP)
+	}
+
 	parsedSrc := net.ParseIP(srcIP)
 	parsedDst := net.ParseIP(dstIP)
 

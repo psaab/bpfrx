@@ -189,6 +189,13 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 		buf.WriteString("No active configuration\n")
 	} else if fromZone == "" || toZone == "" {
 		buf.WriteString("Missing from/to zone parameters\n")
+	} else if srcIP != "" && net.ParseIP(srcIP) == nil {
+		// A non-empty but malformed src would parse to nil and be treated
+		// as a wildcard by matchShowPolicyAddr, yielding a false-positive
+		// policy match (#1711). Report it instead. Empty still means any.
+		fmt.Fprintf(buf, "invalid src %q\n", srcIP)
+	} else if dstIP != "" && net.ParseIP(dstIP) == nil {
+		fmt.Fprintf(buf, "invalid dst %q\n", dstIP)
 	} else {
 		parsedSrc := net.ParseIP(srcIP)
 		parsedDst := net.ParseIP(dstIP)

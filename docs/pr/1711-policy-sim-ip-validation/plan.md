@@ -1,7 +1,37 @@
-# #1711 — Policy simulator: reject malformed IP at all three boundaries
+# #1711 — Policy simulator: reject malformed IP at all five boundaries
 
-Status: PLAN-READY v2 — expanded to all three simulator boundaries
-after Codex + AGY both returned PLAN-NEEDS-MAJOR on the gRPC-only v1.
+Status: PLAN-READY v3 — expanded to all FIVE simulator entry points
+after the round-2 hostile CODE review (Codex + AGY) found two more
+in-process copies of the matcher beyond the three in v2.
+
+## v2 → v3: round-2 code review (two more simulator copies)
+
+The round-2 hostile code review on PR #1721 (Codex
+`task-mptayaxl-m5m8ks`, AGY `adversarial-review-mptayhsi-15ez9v`, both
+MERGE-NEEDS-MAJOR) found that "the simulator" has FIVE entry points,
+not three. v2 fixed three; v3 adds the remaining two:
+
+4. **Local CLI `test policy`** — `pkg/cli/cli_request.go` `testPolicy`,
+   dispatched as the operational `test policy` command. Separate copy,
+   uses the `pkg/cli/cli_helpers.go` matcher. Returns `error` → guard
+   returns `fmt.Errorf`.
+5. **gRPC ShowText `test-policy:`** — `pkg/grpcapi/server_show_firewall.go`
+   `showTestPolicy`, dispatched from `ShowText`. Uses a fourth matcher
+   copy `matchShowPolicyAddr` (`server_cluster.go:302`). Renders
+   diagnostic text into a buffer rather than returning a structured
+   error, so the guard writes an `invalid src/dst` line (matching its
+   existing "Missing from/to zone parameters" style) and skips matching.
+
+Round-2 also flagged: the branch was stale (forked before #1709/#1712/
+#1713/#1714) — fixed by rebasing onto current origin/master; and the
+CLI/REST positive tests only checked `err==nil`/status — strengthened
+to assert the actual match verdict (`Matching policy`/`Policy match` +
+policy name; `data.matched`).
+
+The nil-config early-return (gRPC/REST/CLI return before validation
+when there is no active config) is a documented contract nit, NOT the
+bug: with no config there are no policies to match, so no false-positive
+PERMIT is possible. Left as-is.
 
 ## Issue framing
 

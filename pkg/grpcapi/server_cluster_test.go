@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/configstore"
@@ -168,5 +169,42 @@ func TestMatchPoliciesValidIPOutsideTermNoFalsePositive(t *testing.T) {
 	}
 	if resp.Matched {
 		t.Fatalf("out-of-term IP unexpectedly matched; restricted term not enforced: resp = %+v", resp)
+	}
+}
+
+// TestShowTestPolicyRejectsInvalidIP covers the ShowText "test-policy:"
+// simulator (the operational `test policy` command served via gRPC),
+// which is a separate copy of the matcher (matchShowPolicyAddr). A
+// non-empty malformed IP must not produce a "Policy match" line.
+func TestShowTestPolicyRejectsInvalidIP(t *testing.T) {
+	s := &Server{store: matchPoliciesTestStore(t)}
+
+	resp, err := s.ShowText(context.Background(), &pb.ShowTextRequest{
+		Topic: "test-policy:from=trust,to=untrust,src=10.0.0.999",
+	})
+	if err != nil {
+		t.Fatalf("ShowText(test-policy invalid src) error = %v", err)
+	}
+	if strings.Contains(resp.Output, "Policy match") {
+		t.Fatalf("invalid src produced a policy match (false-positive #1711): %q", resp.Output)
+	}
+	if !strings.Contains(resp.Output, "invalid src") {
+		t.Fatalf("output = %q, want an invalid-src diagnostic", resp.Output)
+	}
+}
+
+// TestShowTestPolicyEmptyIPMatches proves the ShowText simulator still
+// treats empty IPs as "any" (matches the restricted-term policy).
+func TestShowTestPolicyEmptyIPMatches(t *testing.T) {
+	s := &Server{store: matchPoliciesTestStore(t)}
+
+	resp, err := s.ShowText(context.Background(), &pb.ShowTextRequest{
+		Topic: "test-policy:from=trust,to=untrust",
+	})
+	if err != nil {
+		t.Fatalf("ShowText(test-policy empty IPs) error = %v", err)
+	}
+	if !strings.Contains(resp.Output, "Policy match") || !strings.Contains(resp.Output, "restricted-allow") {
+		t.Fatalf("empty-IP test-policy did not match; empty-means-any regressed: %q", resp.Output)
 	}
 }
