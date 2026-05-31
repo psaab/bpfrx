@@ -381,7 +381,7 @@ func (a *Agent) verifyAuth(user *usmUser, receivedMAC []byte) bool {
 	// Build a copy of the whole packet with authParams zeroed.
 	pkt := make([]byte, len(a.lastPacket))
 	copy(pkt, a.lastPacket)
-	zeroAuthParams(pkt, truncLen)
+	zeroAuthParams(pkt)
 
 	mac := hmac.New(hashFn, user.authKey)
 	mac.Write(pkt)
@@ -392,34 +392,181 @@ func (a *Agent) verifyAuth(user *usmUser, receivedMAC []byte) bool {
 	return hmac.Equal(computed, receivedMAC)
 }
 
-// zeroAuthParams finds the auth params OCTET STRING in a raw SNMPv3 packet and zeroes it.
-func zeroAuthParams(pkt []byte, truncLen int) {
-	for i := 0; i < len(pkt)-truncLen-1; i++ {
-		if pkt[i] == tagOctetString {
-			length, lenBytes, err := berDecodeLength(pkt[i+1:])
-			if err != nil {
-				continue
-			}
-			if length == truncLen {
-				start := i + 1 + lenBytes
-				if start+truncLen <= len(pkt) {
-					nonZero := false
-					for j := start; j < start+truncLen; j++ {
-						if pkt[j] != 0 {
-							nonZero = true
-							break
-						}
-					}
-					if nonZero {
-						for j := start; j < start+truncLen; j++ {
-							pkt[j] = 0
-						}
-						return
-					}
-				}
-			}
-		}
+// zeroAuthParams blanks the USM msgAuthenticationParameters value in a raw
+// SNMPv3 packet (in place) before HMAC recomputation, per RFC 3414 §6.3.1.
+//
+// It locates authParams by its POSITION in the parsed USM
+// security-parameters SEQUENCE (#1710), not by a length heuristic. The
+// previous implementation scanned for the first non-zero OCTET STRING whose
+// BER length matched the HMAC truncation length, which mistakenly zeroed
+// msgUserName (a 12- or 24-char username collides with truncLen) or a
+// truncLen-byte msgAuthoritativeEngineID instead of authParams, locking the
+// user out of SNMPv3. If the packet is not a well-formed v3 USM message the
+// function is a no-op, so HMAC then runs over the unmodified copy and
+// verifyAuth fails closed.
+func zeroAuthParams(pkt []byte) {
+	start, end, ok := usmAuthParamsRange(pkt)
+	if !ok {
+		return
 	}
+	for j := start; j < end; j++ {
+		pkt[j] = 0
+	}
+}
+
+// usmAuthParamsRange walks the SNMPv3 message in pkt to the USM
+// msgAuthenticationParameters field and returns the [start,end) byte range
+// of its OCTET STRING value within pkt. ok is true only when the message is
+// well-formed all the way through the sixth USM field (msgPrivacyParameters),
+// matching the parse requirements of handleV3Packet; ok=true therefore means
+// "the USM sequence parsed cleanly and authParams is locatable."
+//
+// The field is found by RFC 3414 position — engineID, boots, time,
+// msgUserName, msgAuthenticationParameters, msgPrivacyParameters — so a
+// username or engineID whose length happens to equal the HMAC truncation
+// length is never mistaken for authParams.
+//
+// Every descent decodes the child TLV from its parent's bounded value slice
+// (returned by berDecodeHeader/berDecodeOctetString), never from a raw
+// pkt[cursor:] window, so a nested length cannot escape its enclosing
+// SEQUENCE/OCTET STRING: an over-running length makes the bounded decode
+// return an error and ok=false. The absolute cursor into pkt is advanced by
+// the byte counts the bounded decode consumed.
+func usmAuthParamsRange(pkt []byte) (start, end int, ok bool) {
+	// Outer message SEQUENCE.
+	tag, msgBody, err := berDecodeHeader(pkt)
+	if err != nil || tag != tagSequence {
+		return 0, 0, false
+	}
+	// base = absolute offset of msgBody[0] within pkt = the outer SEQUENCE's
+	// TLV header length. berEncodedLen(pkt) is header+value and len(msgBody)
+	// is value, so their difference is the header length — independent of
+	// whether the outer SEQUENCE fills the whole datagram.
+	outerHdr := berEncodedLen(pkt) - len(msgBody)
+	if outerHdr < 0 {
+		return 0, 0, false
+	}
+	base := outerHdr
+
+	// version INTEGER.
+	cur := msgBody
+	off, ok := advancePastTLV(cur, tagInteger)
+	if !ok {
+		return 0, 0, false
+	}
+	base += off
+	cur = cur[off:]
+
+	// msgGlobalData header SEQUENCE.
+	off, ok = advancePastTLV(cur, tagSequence)
+	if !ok {
+		return 0, 0, false
+	}
+	base += off
+	cur = cur[off:]
+
+	// msgSecurityParameters OCTET STRING wrapping the USM SEQUENCE.
+	secParams, _, err := berDecodeOctetString(cur)
+	if err != nil {
+		return 0, 0, false
+	}
+	// Absolute offset of the OCTET STRING value (the USM bytes) within pkt:
+	// the value sits after this OCTET STRING's TLV header.
+	usmHdrLen := berEncodedLen(cur) - len(secParams)
+	if usmHdrLen < 0 {
+		return 0, 0, false
+	}
+	usmBase := base + usmHdrLen
+
+	// USM SEQUENCE.
+	tag, usmBody, err := berDecodeHeader(secParams)
+	if err != nil || tag != tagSequence {
+		return 0, 0, false
+	}
+	usmSeqHdr := berEncodedLen(secParams) - len(usmBody)
+	if usmSeqHdr < 0 {
+		return 0, 0, false
+	}
+	usmBodyBase := usmBase + usmSeqHdr
+
+	// USM fields by position: engineID, boots, time, userName, authParams.
+	f := usmBody
+	fbase := usmBodyBase
+
+	// msgAuthoritativeEngineID OCTET STRING.
+	off, ok = advancePastTLV(f, tagOctetString)
+	if !ok {
+		return 0, 0, false
+	}
+	fbase += off
+	f = f[off:]
+
+	// msgAuthoritativeEngineBoots INTEGER.
+	off, ok = advancePastTLV(f, tagInteger)
+	if !ok {
+		return 0, 0, false
+	}
+	fbase += off
+	f = f[off:]
+
+	// msgAuthoritativeEngineTime INTEGER.
+	off, ok = advancePastTLV(f, tagInteger)
+	if !ok {
+		return 0, 0, false
+	}
+	fbase += off
+	f = f[off:]
+
+	// msgUserName OCTET STRING.
+	off, ok = advancePastTLV(f, tagOctetString)
+	if !ok {
+		return 0, 0, false
+	}
+	fbase += off
+	f = f[off:]
+
+	// msgAuthenticationParameters OCTET STRING — the field to blank.
+	authVal, afterAuth, err := berDecodeOctetString(f)
+	if err != nil {
+		return 0, 0, false
+	}
+	authHdrLen := berEncodedLen(f) - len(authVal)
+	if authHdrLen < 0 {
+		return 0, 0, false
+	}
+	start = fbase + authHdrLen
+	end = start + len(authVal)
+	if start < 0 || end > len(pkt) || start > end {
+		return 0, 0, false
+	}
+
+	// msgPrivacyParameters OCTET STRING — parse to confirm well-formedness
+	// (matches handleV3Packet, which requires privParams to decode).
+	if _, _, err := berDecodeOctetString(afterAuth); err != nil {
+		return 0, 0, false
+	}
+
+	return start, end, true
+}
+
+// advancePastTLV decodes one TLV of the expected tag from the bounded slice
+// data and returns the number of bytes it occupies (header + value), so the
+// caller can advance both its slice and an absolute cursor in lockstep. ok is
+// false if the tag does not match or the TLV is malformed/truncated relative
+// to data's bounds.
+func advancePastTLV(data []byte, expectTag byte) (consumed int, ok bool) {
+	if len(data) == 0 || data[0] != expectTag {
+		return 0, false
+	}
+	tag, _, err := berDecodeHeader(data)
+	if err != nil || tag != expectTag {
+		return 0, false
+	}
+	n := berEncodedLen(data)
+	if n <= 0 || n > len(data) {
+		return 0, false
+	}
+	return n, true
 }
 
 // decryptPDU decrypts an encrypted scopedPDU using the user's privacy key.
