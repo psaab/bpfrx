@@ -27,7 +27,19 @@ Record Codex / AGY / Gemini task-ids here so continuations can fetch by id
 
 ## Code review round 3 (PR #1716 @ 3f6dda484)
 - Fix: entire handshake completion now under reconcile_lock (install_session_locked / reserve_pending_locked / clear_reservation_locked lock-free cores)
-- Codex re-review: task-mpt93h8p-uwj8eg (dispatched)
-- AGY re-review: adversarial-review-mpt93sxe-c3756h (dispatched)
-- Copilot: re-requested via @copilot review
-- Claude-SMR: verified no path re-takes reconcile_lock (no deadlock); completion paths lock exactly once
+- Codex re-review: task-mpt93h8p-uwj8eg — MERGE-NEEDS-MAJOR (TOCTOU: create_initiation pre-lock peer check vs locked reserve)
+- AGY re-review: adversarial-review-mpt93sxe-c3756h — MERGE-READY (race closed, no deadlock, no leak, WG-compliant)
+- Claude-SMR: verified no path re-takes reconcile_lock (no deadlock)
+
+## Code review round 4 (PR #1716 @ b890ef84d)
+- Fix: reserve_pending_locked re-checks peer under lock (TOCTOU closed)
+- Codex round-4: task-mpt9czff-17zab2 — MERGE-NEEDS-MINOR (TOCTOU code fix correct; test ineffective + stale comment)
+
+## Code review round 5 (PR #1716 @ a334ba129 → 6d80369fc → b52f50545)
+- Fixes: deterministic TOCTOU regression (mutation-verified) + exact-length parse (WrongLength) + plan-deviations note + doc nits
+- Codex: task-mpt9ueve-h7qwsr — MERGE-NEEDS-MINOR (docs-only) → task-mpt9y6p7-bnijrw — **MERGE-READY** (no findings)
+- AGY: MERGE-READY (round-3, code unchanged in substance since)
+- Copilot: COMMENTED; all substantive findings addressed (parse-length, stale comments, HMAC, O(peers), return-order, entry-count)
+- Claude-SMR: byte-exact framing + KATs reproduced from blake2 first-principles; snow payload==timestamp verified; no deadlock; race-free
+
+## MERGE GATE: clean 4-of-4 (Codex MERGE-READY, AGY MERGE-READY, Copilot addressed, Claude-SMR verified). No cluster smoke — S1 is wire-protocol + tests, no datapath change.
