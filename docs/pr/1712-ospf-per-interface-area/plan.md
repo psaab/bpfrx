@@ -1,6 +1,31 @@
 # #1712 — FRR OSPFv2 per-interface `ip ospf area` (drop `network 0.0.0.0/0 area`)
 
-**Status:** DRAFT v1 — pending adversarial plan review
+**Status:** PLAN-READY v2 — Codex PLAN-NEEDS-MINOR (task-mpta3w3q-yvxr2c,
+minors folded in below), AGY PLAN-READY (adversarial-review-mpta426w-nrlywl),
+Claude-SMR PLAN-READY. No PLAN-KILL.
+
+### v2 deltas from adversarial review (Codex minors)
+
+- **FRR forbids mixing `network` and `ip ospf` activation** on the same
+  instance — this makes deleting the global `network` line not just an
+  improvement but *required* for a well-formed config.
+- **Test invariant strengthened:** assert the rendered OSPFv2 config contains
+  NO `network ... area ...` line at all (not merely no `network 0.0.0.0/0`).
+- **"Exactly one interface block" claim corrected:** `generateInterfaceSettings`
+  (config_render.go:65, called before `generateProtocols` per manager.go:261)
+  can already emit an earlier `interface <name>` block for bandwidth /
+  point-to-point. Multiple FRR `interface` stanzas for the same name are legal
+  (FRR merges them). The real invariant is **one OSPFv2 `ip ospf area`
+  activation line per configured OSPF interface**, not one interface block.
+- **VRF claim qualified:** bare `interface <name>` + `ip ospf area` is correct
+  for this repo's Linux-VRF model (interface enslaved to VRF independently;
+  OSPFv3 already relies on it). Not asserted as universal across all FRR zebra
+  backends.
+- **Mandatory implementation constraint (Claude-SMR):** the interface block
+  MUST be emitted UNCONDITIONALLY for every OSPF interface — today it is gated
+  on `cost/network-type/auth/BFD`. A plain interface (none of those) currently
+  relies solely on the `network` line for activation; if the block stays
+  conditional, plain interfaces silently lose OSPF entirely.
 
 ## Issue framing
 
