@@ -1,8 +1,12 @@
 # Plan of Action — #1733 Phase 1: hard-reject `workers > 32` when equal-flow enforcement is enabled
 
-- **Status**: DRAFT v2 — round-1 converged MAJOR (Codex + AGY) folded in:
-  the commit-time reject MUST be paired with a Load/SyncApply rewrite
-  bridge or upgrade/HA-sync blacks out. Section 5.2/5.3 rewritten.
+- **Status**: DRAFT v3 — round-2: AGY PLAN-READY; Codex flagged a
+  semantic-set-parity defect in the v2 AST-walk rewrite (false-strip on
+  `${node}`/split-stanza/group configs whose EFFECTIVE workers ≤32).
+  ADOPTED Codex's cleaner design: a **lenient compile mode** on
+  Load/SyncApply that downgrades ONLY this validator to a loud warning
+  (no AST mutation, effective workers computed once by the real compiler).
+  §5.2 rewritten; AGY's log-phrasing minor folded in as the warning text.
 - **Issue**: #1733 (sub-issue of #1731; research plan
   `research/1731-cos-mqfq-generalize:docs/research/1731-cos-mqfq-generalize/plan.md` §4.3)
 - **Base**: master `c9e552689` (canary-green #1723 lineage; latest merge #1730)
@@ -32,11 +36,11 @@ count is parsed by `compiler_system.go:443-446` (`strconv.Atoi`, no max) and
 `commit`/`commit check` time — hard-reject when
 `workers > 32 AND any scheduler has equal-flow-enforcement` — instead of
 fail-opening silently at runtime in release. Pair the commit-time reject
-with a **Load/SyncApply rewrite bridge** (mirroring
-`rewriteRetiredDataplaneType`) so a legacy persisted/peer-synced config
-does NOT black out daemon boot or break HA sync. Plus surface the existing
-dataplane fail-open-reason gauge as the runtime visibility for the
-condition.
+with a **lenient compile mode** on `Store.Load` / `Store.SyncApply` that
+downgrades ONLY this one validator to a loud `cfg.Warnings` entry (+ WARN
+log) so a legacy persisted/peer-synced config does NOT black out daemon
+boot or break HA sync. Plus surface the existing dataplane
+fail-open-reason gauge as the runtime visibility for the condition.
 
 **Out of scope / deferred to #1731-e:** removing the 32 cap by replacing
 the stack-scratch arrays with reusable heap scratch owned by `V8State`.
@@ -162,61 +166,70 @@ if err := validateEqualFlowWorkerCapStrict(cfg); err != nil {
 `validatePolicySchedulerReferencesStrict` reading `cfg.Security` directly;
 `cfg.System.UserspaceDataplane` is the only pointer hop, nil-guarded above.
 
-### 5.2 Load/SyncApply rewrite bridge (round-1 MAJOR — REQUIRED)
+### 5.2 Lenient compile mode on Load/SyncApply (round-1 MAJOR + round-2 parity fix)
 
-**The round-1 fatal (Codex + AGY converged):** my v1 claimed a legacy
+**Round-1 fatal (Codex + AGY converged):** my v1 claimed a legacy
 `workers>32 + equal-flow` config is "NOT auto-rejected at `Store.Load`".
-That is FALSE and verified false: `Store.Load()` (`configstore/store.go:105`)
-and `Store.SyncApply()` (`:222`) both call `s.compileTree(tree)` →
-`CompileConfig`/`CompileConfigForNode` → `compileExpanded` → the strict
-accumulator. Wiring the reject into the accumulator ALONE would, on a node
-upgraded past this gate:
-- fail `Store.Load()` at boot → daemon runs with nil active config (blind);
-- fail `Store.SyncApply()` on an upgraded standby receiving a >32+equal-flow
-  config from an un-upgraded primary → HA config-sync alarm loop.
+FALSE and verified: `Store.Load()` (`configstore/store.go:105`) and
+`Store.SyncApply()` (`:222`) both call `s.compileTree(tree)` ->
+`CompileConfig`/`CompileConfigForNode` -> `compileExpanded` -> the strict
+accumulator. A bare accumulator reject would blackout boot + break HA sync.
 
-**Fix — mirror `rewriteRetiredDataplaneType` (`configstore/dataplane_retire.go`).**
-Add `rewriteEqualFlowOverWorkerCap(tree, caller)` invoked AFTER parse,
-BEFORE compile, in BOTH `Store.Load()` (after the existing
-`rewriteRetiredDataplaneType(tree, LoadCaller)` at `store.go:103`) and
-`Store.SyncApply()` (after `:214`'s retired rewrite, `SyncCaller`). It:
-1. Discovers the effective worker count by walking
-   `system { dataplane { ... } }` for a `workers` leaf, handling BOTH AST
-   shapes verified empirically:
-   - normal: `dataplane` -> leaf `Keys:["workers","N"]`;
-   - redundant `set system dataplane userspace workers N`
-     (`compiler_system.go:415-436`): `dataplane` -> leaf
-     `Keys:["userspace","workers","N"]` (3-key leaf — the walk must match
-     a `workers` token anywhere in the dataplane leaf keys, not only
-     `Keys[0]=="workers"`).
-   Walk top-level AND `groups { <g> { system {...} } }` nesting — reuse the
-   existing `systemBlocksOf` / `groupsBlocksOf` / `systemBlocksOfNode`
-   helpers in `dataplane_retire.go`. Absent `workers` leaf => effective
-   count 1 (`lifecycle.rs:257`) => rewrite is a no-op.
-2. If `workers > MaxEqualFlowWorkers`, strip every
-   `equal-flow-enforcement` leaf (AST shape verified: `class-of-service`
-   -> `schedulers <name>` -> leaf `Keys:["equal-flow-enforcement"]`) from
-   both top-level and grouped `class-of-service` stanzas, logging one
-   `slog.Warn` per strip with caller-specific remediation.
+**Round-2 refinement (Codex):** my v2 proposed an AST-walk rewrite that
+strips `equal-flow-enforcement` when a raw-tree `workers` leaf > 32. That
+has a **semantic-set-parity defect**: the raw AST walk does NOT replicate
+the compiler's effective-config computation. `CompileConfig` /
+`CompileConfigForNode` run `ExpandGroups`/`ExpandGroupsWithVars` BEFORE
+`compileExpanded` (`compiler.go:51,82`). So a config like
+`groups { node0 { system dataplane workers 64 } }` + `apply-groups
+"${node}"` + equal-flow has EFFECTIVE workers 64 only on node0; on node1 it
+is the default (≤32). A raw walk would **false-strip** equal-flow on node1
+(and on a generic non-node compile). The validator, by contrast, sees the
+correctly-expanded per-node effective config and would NOT reject node1.
+Threshold-constant parity does not fix this — it is *worker-discovery*
+parity that is broken, and re-implementing group expansion in the rewrite
+is exactly the duplication that would drift.
 
-**Why stripping equal-flow is the behaviorally-correct rewrite (not a
-silent override):** a legacy `workers>32 + equal-flow` config was ALREADY
-fail-opening equal-flow at runtime in release (the exact bug #1733
-documents). Removing the leaf on load therefore *preserves the actual
-running behavior* (equal-flow effectively off), boots clean, and warns —
-precisely analogous to rewriting a retired `dataplane-type` to the
-userspace default. The operator's next `commit` that re-adds equal-flow
-without reducing workers will hard-reject, surfacing the limit.
+**Adopted fix — lenient compile mode (Codex's design).** Add a compile
+variant that runs the IDENTICAL pipeline (same expansion, same node
+context, same effective config) but downgrades ONLY
+`validateEqualFlowWorkerCapStrict` from a hard error to a
+`cfg.Warnings` append + one `slog`-style WARN. Everything else stays
+strict.
 
-Threshold parity: the rewrite uses the SAME `MaxEqualFlowWorkers` constant
-as the commit-time validator, so reject-set and rewrite-set are identical
-by construction (no skew).
+Concretely:
+- Thread a `strictMode` (or a `lenientEqualFlowWorkerCap bool`) through
+  `compileExpanded`: `CompileConfig`/`CompileConfigForNode` (strict, used
+  by candidate commit) keep today's behavior; new
+  `CompileConfigLenient`/`CompileConfigForNodeLenient` set the lenient flag.
+  In `compileExpanded`, when lenient, the equal-flow-worker-cap validator's
+  error is appended to `cfg.Warnings` instead of `strictErrs`.
+- `Store.compileTree` gains a lenient sibling (or a mode arg) used ONLY by
+  `Store.Load()` and `Store.SyncApply()`. Candidate commit / `commit
+  check` (`Store.CommitCheck`/`Commit`/`CommitConfirmed`, which compile
+  `s.candidate` directly — AGY confirmed they do NOT go through Load/Sync)
+  stay strict and hard-reject.
 
-Caller phrasing: reuse the existing `retireRewriteCaller`
-(LoadCaller/SyncCaller) — its local-`commit` vs update-the-primary
-distinction matches this case exactly. (If reuse turns out to couple the
-two rewrites awkwardly at implementation, fall back to a parallel
-two-value enum; the doc comment will cross-reference either way.)
+**Why this is correct and beats the AST rewrite:**
+- The effective worker count is computed ONCE, by the real compiler, with
+  the right node context — zero re-implementation, zero false-strip.
+- A legacy `workers>32 + equal-flow` config loads/sync-applies clean; the
+  equal-flow leaf stays in the typed config and the runtime continues to
+  fail-open it exactly as it does today — *running behavior preserved*,
+  identical to the pre-gate release (the AGY "preserve running behavior"
+  property holds, without mutating the tree).
+- The operator sees the condition via `cfg.Warnings` (surfaced by
+  `show ... | display ... warnings` / commit warnings) and the WARN log;
+  their next candidate commit that keeps the combo hard-rejects.
+
+**Warning text (AGY r2 minor):** do NOT reuse the retired-dataplane
+phrasing. The lenient-path warning is equal-flow-specific, e.g.
+`"system dataplane workers %d exceeds the equal-flow cap of %d: equal-flow
+fairness is silently disabled at runtime; reduce workers or remove
+equal-flow-enforcement (this config was tolerated on load/sync — your next
+commit will be rejected)"`. The Load vs Sync remediation hint differs
+(local `commit` vs update the un-upgraded primary), mirroring
+`retireRewriteCaller.remediation()` but with equal-flow wording.
 
 ### 5.3 Runtime visibility (the "status counter for the fail-open reason")
 
@@ -268,22 +281,25 @@ change (the `equal-flow-enforcement` and `workers` set-paths already exist).
   is untouched. ✓
 - **Load/SyncApply tolerance (round-1 MAJOR)**: a legacy persisted/synced
   `workers>32 + equal-flow` config must NOT blackout-boot or break HA sync;
-  the §5.2 rewrite bridge strips equal-flow (preserving the already-running
-  fail-open behavior) and warns, exactly as `rewriteRetiredDataplaneType`
-  does for retired backends. ✓
-- **Rewrite/reject threshold parity**: both use `MaxEqualFlowWorkers` — the
-  rewrite cannot strip a config the validator would have accepted, nor vice
-  versa. ✓
+  the §5.2 lenient compile mode downgrades ONLY this validator to a warning
+  on Load/Sync so the config loads clean, equal-flow stays in the typed
+  config, and the runtime continues to fail-open it as today. ✓
+- **Effective-config parity (round-2 MAJOR)**: leniency uses the SAME
+  compile pipeline (same group expansion, same node context) as the strict
+  path, so the lenient warning fires on EXACTLY the configs the strict
+  reject would — no false-strip on `${node}`/split-stanza/group configs
+  whose effective workers ≤32. ✓ (This is why AST mutation was rejected.)
 
 ## 8. Risk assessment
 
 | Class | Level | Note |
 |-------|-------|------|
-| Behavioral regression | LOW | Additive validator + load/sync rewrite. The rewrite strips equal-flow only when workers>32 — which was already fail-opening at runtime — so running behavior is preserved. Valid configs (<=32 workers, or equal-flow absent) compile unchanged. |
-| Upgrade / HA-sync regression | MED→LOW | Round-1 MAJOR: bare accumulator reject would blackout boot + break sync. MITIGATED by the §5.2 Load/SyncApply rewrite bridge mirroring the proven `rewriteRetiredDataplaneType` pattern. Must be covered by configstore tests (§9). |
+| Behavioral regression | LOW | Additive validator + lenient Load/Sync mode. On load the equal-flow leaf is untouched and the runtime fail-opens it as today — running behavior preserved. Valid configs (<=32 effective workers, or equal-flow absent) compile unchanged. |
+| Upgrade / HA-sync regression | MED→LOW | Round-1 MAJOR: bare accumulator reject would blackout boot + break sync. MITIGATED by §5.2 lenient compile mode (downgrade-to-warning on Load/SyncApply only). Covered by configstore + compiler tests (§9). |
+| False-strip / semantic-parity | round-2 MAJOR → RESOLVED | The v2 AST-walk could false-strip equal-flow on `${node}`/group configs whose effective workers ≤32. ELIMINATED by computing effective workers via the real compiler in lenient mode (no separate worker-discovery). |
 | Lifetime / borrow | N/A (Go) | No Rust change. |
-| Performance regression | NONE | Validator runs once per `commit`, O(schedulers); rewrite once per Load/SyncApply, O(tree). No hot-path touch. |
-| Architectural mismatch | LOW | Locus is the established `*Config`-scoped strict-validator pattern (`validatePolicySchedulerReferencesStrict`) + the established Load/SyncApply rewrite-bridge pattern (`rewriteRetiredDataplaneType`). Both are precedented in-tree. |
+| Performance regression | NONE | Validator runs once per compile, O(schedulers). No hot-path touch, no extra tree walk. |
+| Architectural mismatch | LOW | Lenient-compile-mode + `*Config`-scoped strict validator are both standard control-plane patterns. No AST mutation of stored config. |
 
 ## 9. Test plan
 
@@ -303,13 +319,21 @@ change (the `equal-flow-enforcement` and `workers` set-paths already exist).
   four-validator accumulation OR add a dedicated accumulation assertion so
   a silent removal of the new append is caught (same rationale as the
   comment at `compiler_test.go:168-186`).
-- **Load/SyncApply rewrite tests** (`pkg/configstore`, mirroring
-  `TestRewriteRetiredDataplaneType`): assert that a tree with
-  `workers 33` + `equal-flow-enforcement` (a) loads/sync-applies WITHOUT a
-  compile error (no blackout), (b) has the `equal-flow-enforcement` leaf
-  stripped post-rewrite, (c) leaves equal-flow intact when `workers <= 32`,
-  (d) covers the `groups { ... }`-nested workers + CoS shape. This is the
-  regression gate for the round-1 MAJOR.
+- **Lenient-mode compiler tests** (`pkg/config`): assert
+  `CompileConfigLenient` on `workers 33` + equal-flow returns NO error,
+  with a `cfg.Warnings` entry naming the cap; and that strict
+  `CompileConfig` on the SAME tree returns the hard error. Boundary:
+  `workers 32` + equal-flow → no warning, no error in both modes.
+- **Semantic-parity test (round-2 MAJOR gate)** (`pkg/config`): a config
+  with `workers 64` inside `groups { node0 { ... } }` + `apply-groups
+  "${node}"` + equal-flow — `CompileConfigForNode(tree, 1)` (node1, group
+  not applied) must NOT warn/reject (effective workers ≤32), while
+  `CompileConfigForNode(tree, 0)` (node0) lenient-warns and strict-rejects.
+  This is the test that an AST-walk rewrite would have failed.
+- **Store Load/SyncApply tests** (`pkg/configstore`): assert a persisted /
+  peer-synced `workers 33` + equal-flow config loads / sync-applies WITHOUT
+  error (no blackout) and produces a warning; and that a `workers 32` +
+  equal-flow config is unaffected. Regression gate for round-1 MAJOR.
 - **Go suite**: `go test ./...` (30 packages) green.
 - **Cargo lease tests** (regression, no code change):
   `cargo test --release -p userspace-dp shared_cos_lease` (the
@@ -327,47 +351,53 @@ change (the `equal-flow-enforcement` and `workers` set-paths already exist).
 - A new Prometheus counter (the existing reason-labelled
   `xpf_userspace_cos_equal_flow_fail_open` gauge already covers runtime
   visibility).
-- Auto-reducing workers or any silent config mutation OTHER than the
-  load/sync equal-flow strip (which only matches the already-running
-  fail-open behavior).
+- Auto-reducing workers or any config MUTATION on load/sync. The lenient
+  mode does NOT mutate the tree — it only downgrades the validator verdict.
 - Mirroring the reject in `lifecycle.rs` arg-parse (the daemon receives an
   already-validated config from the control plane; double-validating in the
-  helper is redundant — see Open Question Q2).
+  helper is redundant).
 
-## 11. Open questions for adversarial review (round-2)
+## 11. Open questions for adversarial review (round-3)
 
-Round-1 RESOLVED (verified, see §): Q-locus — no supported bypass of
-`CompileConfig` (Codex + AGY both confirmed Load/SyncApply/commit all
-route through it). Q-threshold — `> 32` exact, no off-by-one (both
-confirmed: id 32 is first `active_outside_scratch` at len 33). Q-dodge —
-equal-flow already requires transmit-rate exact (`compiler.go:427`),
-cannot slip past. Q-visibility — existing reason-labelled gauge +
-commit-check error + WARN log is sufficient; no new counter. Q-constant —
-hand-synced const with cross-ref accepted (AGY: pragmatic; #1731-e retires
-both); a canary test asserting parity is the cheap insurance (Codex
-suggestion — adopted, see below).
+ROUND-1 RESOLVED (verified): Q-locus — no supported bypass of
+`CompileConfig` (Load/SyncApply/commit all route through it). Q-threshold —
+`> 32` exact (id 32 is first `active_outside_scratch` at len 33). Q-dodge —
+equal-flow already requires transmit-rate exact (`compiler.go:427`).
+Q-visibility — existing reason-labelled gauge + reject error + WARN
+sufficient; no new counter. Q-constant — hand-synced const + parity canary
+test (adopted §9).
 
-Open for round-2:
+ROUND-2 RESOLVED: the v2 AST-walk rewrite is ABANDONED for a semantic-set
+parity defect (false-strip on `${node}`/group/split-stanza configs whose
+effective workers ≤32). Replaced by the lenient-compile-mode design
+(§5.2), which computes effective workers via the real compiler — no
+worker-discovery duplication, no false-strip. AGY's log-phrasing minor
+folded into the warning text.
 
-1. **Rewrite-bridge correctness (the round-1 MAJOR fix)**: is stripping
-   `equal-flow-enforcement` on Load/SyncApply when workers>32 the right
-   rewrite (preserving the already-running fail-open behavior), or should
-   the bridge instead leave equal-flow and reduce/clamp workers? (Belief:
-   strip equal-flow — clamping workers would silently change the dataplane
-   worker topology, a far larger behavioral change than removing a knob
-   that was already a runtime no-op. Mirrors retired-dataplane strip.)
-2. **Rewrite caller reuse**: reuse `retireRewriteCaller` (Load/Sync) vs a
-   new parallel enum — any coupling hazard from reuse?
-3. **Constant-parity canary**: should a Go test assert
-   `MaxEqualFlowWorkers == 32` with a comment pinning it to
-   `rotate_epoch_v8.rs:71`'s `MAX_WORKERS_SCRATCH` (Codex r1 suggestion)?
-   (Belief: yes — cheap, catches a future Rust-side bump that forgets Go.
-   Adopted in §9.)
-4. **Worker-count discovery in the rewrite**: the rewrite reads `workers`
-   from the AST (pre-compile). Are there worker-count forms the AST walk
-   could miss (e.g. `set system dataplane userspace workers N` redundant
-   path at `compiler_system.go:415-436`, or split `system` stanzas)? The
-   walk must cover the same shapes `compileUserspaceDataplane` accepts.
-5. **Default-workers semantics in the rewrite**: if no `workers` leaf is
-   present, the effective count is 1 (`lifecycle.rs:257`), so the rewrite
-   is a no-op — confirm the walk treats "absent" as <=32, never as >32.
+Open for round-3:
+
+1. **Lenient-mode plumbing shape**: is threading a `strictMode` flag /
+   adding `CompileConfigLenient` siblings the cleanest way to downgrade ONE
+   validator, or is there a less invasive hook? (Belief: a single bool
+   threaded into `compileExpanded` that routes this one validator's error
+   to `cfg.Warnings` is minimal and local.)
+2. **Candidate-path strictness**: confirm `CommitCheck`/`Commit`/
+   `CommitConfirmed` compile `s.candidate` WITHOUT the lenient flag so
+   operator edits still hard-reject (AGY confirmed they bypass Load/Sync;
+   re-verify in implementation).
+3. **Rollback path** — RESOLVED in plan: `Store.Rollback` (`store.go:946`)
+   only swaps `s.candidate` (no compile); the compile happens on the
+   subsequent `Commit` (strict). So an operator rolling back to a legacy
+   >32+equal-flow config and committing it correctly gets the hard reject
+   (active operator action, not a passive load). Lenient applies ONLY to
+   `Store.Load` (`:105`) and `Store.SyncApply` (`:222`); `compileTree`
+   stays strict for all commit paths — implement as a separate
+   `compileTreeLenient` rather than a flag on the shared `compileTree`.
+4. **Worker-count source for the validator** — the validator reads the
+   TYPED `cfg.System.UserspaceDataplane.Workers` (post-compile), NOT the
+   AST, so every worker-count form `compileUserspaceDataplane` accepts
+   (normal leaf, redundant `userspace`-prefixed leaf, split `system`
+   stanzas) is already normalized to one int by the compiler. This is the
+   key advantage over the abandoned AST walk: discovery parity is free.
+   Absent `workers` => `cfg.Workers == 0` => `0 <= 32` => no reject (the
+   runtime defaults to 1; 0/absent is correctly treated as ≤cap).
