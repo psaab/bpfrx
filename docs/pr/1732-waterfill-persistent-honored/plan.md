@@ -1,11 +1,13 @@
 # Plan — #1732 CoS GuaranteeRate waterfill: persistent honored set + alloc-free hot path
 
-- **Status**: v3 — round-2 findings folded. Codex r2 PLAN-NEEDS-MAJOR + AGY
-  r2 PLAN-NEEDS-MINOR converged on the SAME refinement: the bitset must be
-  keyed by ORDINAL position in `exact_queues_by_rate_ascending`, not by
-  `queue_idx`, and the cap must be surfaced at build time. Both folded
-  (Option A: ordinal keying). Claude-SMR concurs. Pending round-3 review.
-- **Status history**: v2 — round-1 Phase-1-skip FATAL folded; v1 — DRAFT.
+- **Status**: v4 — round-3 findings folded. Codex r3 PLAN-NEEDS-MAJOR + AGY
+  r3 PLAN-NEEDS-MINOR converged on the SAME two fixes: (1) keep an ordinal
+  `j < 64` guard at the set/skip sites (release strips the debug_assert, so
+  `1u64 << i` with `i >= 64` would wrap to bit 0 and silently corrupt queue
+  0's tracking); (2) §6 had stale `queue_idx < 64` text contradicting the
+  ordinal keying. Both folded. Claude-SMR concurs. Pending round-3 re-verify.
+- **Status history**: v3 — round-2 ordinal-keying folded; v2 — round-1
+  Phase-1-skip FATAL folded; v1 — DRAFT.
 - **Issue**: #1732 (sub-issue of #1731, item #2 / §4.2 of the ENGINEER-READY plan)
 - **Mode**: `/engineer` (= triple-review)
 - **Base**: `origin/master` @ `c9e552689`
@@ -45,7 +47,8 @@ shaped-service path:
 This is a correctness + hot-path-alloc fix, not a throughput headliner.
 
 - **Alloc removed:** one `Vec<usize>` clone (length = exact-queue count,
-  typically ≤8, ≤64 by the existing bitmask guard) per selector call. At a
+  typically ≤8; the honored-set tracking is bounded to ≤64 by the ordinal
+  bitset) per selector call. At a
   few-KB allocator cost amortized per service selection, the absolute cycle
   win is modest — but it is a strict per-batch heap alloc on the shaped hot
   path, which the engineering-style rules forbid outright regardless of
@@ -162,17 +165,29 @@ is taken — no overlapping borrow, no alloc. The loop bound `ascending_len`
 is captured once (the vec is runtime read-only). Index access uses `[]`,
 in-bounds by construction (`i < ascending_len`).
 
-**(c) Phase-1 honor sets the persistent bit (keyed by ORDINAL `i`).** At the
-honor site (`:941`), replace `honored_mask |= 1u64 << queue_idx;` with
-`root.waterfill_honored_epoch_bits |= 1u64 << i;` (ordinal `i`, no
-`queue_idx < 64` guard needed — `i < ascending_len ≤ 64` by the
-`debug_assert`; in release if a malformed config somehow exceeds 64, only
-ordinals ≥64 go untracked, and the build-time warning in §4.4 surfaces it).
-This write happens before the `return`, so the bit persists into the next
-call. **Round-2 F3′ fix:** the prior `queue_idx` key meant a queue at root
-index ≥64 was never marked even when only 2 exact queues existed (ordinals
-0,1); ordinal keying makes the ≤64 bound depend only on the exact-queue
-COUNT, which is the quantity actually bounded.
+**(c) Phase-1 honor sets the persistent bit (keyed by ORDINAL `i`, guarded
+`i < 64`).** At the honor site (`:941`), replace
+`honored_mask |= 1u64 << queue_idx;` with:
+
+```rust
+if i < 64 {
+    root.waterfill_honored_epoch_bits |= 1u64 << i;
+}
+```
+
+**Round-3 safety fix (Codex + AGY):** the `i < 64` guard is REQUIRED, not
+optional. The `debug_assert!(ascending_len <= 64)` is stripped in release;
+if a malformed config has >64 exact queues, `i` reaches ≥64 and `1u64 << 64`
+in release WRAPS (Rust masks the shift amount mod 64) to `1u64 << 0`,
+silently corrupting queue-0's honored bit. The `i < 64` guard makes ordinals
+≥64 conservatively untracked (never shift-overflow) — they remain
+honor-eligible every call, the same conservative behavior the old local mask
+had, but now keyed by ordinal so the bound is the exact-queue COUNT. This
+write happens before the `return`, so the bit persists into the next call.
+**Round-2 F3′ fix retained:** the prior `queue_idx` key meant a queue at
+root index ≥64 was never marked even when only 2 exact queues existed
+(ordinals 0,1); ordinal keying makes the ≤64 bound depend only on the
+exact-queue COUNT, which is the quantity actually bounded.
 
 **(c′) Phase-1 ALSO skips already-honored queues (round-1 FATAL fix —
 Codex + AGY converged).** This is the load-bearing correctness fix that
@@ -193,8 +208,9 @@ at the TOP of the Phase-1 loop body — immediately after computing
 // honored this epoch is skipped (by ORDINAL `i`) so the ascending
 // walk advances to the next-smallest queue instead of re-honoring
 // the smallest one every call (the documented small-rate-ascending
-// waterfill intent).
-if (root.waterfill_honored_epoch_bits & (1u64 << i)) != 0 {
+// waterfill intent). `i < 64` guards the shift (release strips the
+// debug_assert; ordinals >=64 are conservatively untracked).
+if i < 64 && (root.waterfill_honored_epoch_bits & (1u64 << i)) != 0 {
     continue;
 }
 ```
@@ -218,7 +234,10 @@ with `root.waterfill_honored_epoch_bits`:
 ```rust
 // pos_from_end is the ascending-vec ORDINAL of the queue being
 // visited in the descending walk — the same key Phase 1 set.
-if (root.waterfill_honored_epoch_bits & (1u64 << pos_from_end)) != 0 {
+// `pos_from_end < 64` guards the shift (same reason as Phase 1).
+if pos_from_end < 64
+    && (root.waterfill_honored_epoch_bits & (1u64 << pos_from_end)) != 0
+{
     // skip — already honored in Phase 1 this epoch
 }
 ```
@@ -228,9 +247,11 @@ and `[pos_from_end]` directly; `pos_from_end` (`= len - 1 - phase2_idx`) is
 the ordinal into the ascending vec, so `1u64 << pos_from_end` tests the same
 bit Phase 1 set for that queue. Each index read copies a `usize` out before
 any `&mut root.queues[..]` borrow, so borrow-split holds. The
-`phase2_idx`/`start_phase2`/cursor arithmetic is unchanged. (Because both
-`pos_from_end` and `i` are ordinals `< ascending_len ≤ 64`, no `< 64` guard
-is needed in Phase 2 either.)
+`phase2_idx`/`start_phase2`/cursor arithmetic is unchanged. The
+`pos_from_end < 64` guard mirrors Phase 1's `i < 64` guard (round-3 safety
+fix): in a release build with >64 exact queues an unguarded `1u64 <<
+pos_from_end` would wrap and corrupt a low-ordinal queue's bit; the guard
+leaves ordinals ≥64 conservatively untracked.
 
 **Borrow-checker note.** The reads of `root.waterfill_honored_epoch_bits`
 and `root.exact_queues_by_rate_ascending[..]` in Phase 2 happen *before* the
@@ -289,9 +310,15 @@ This decouples the bit range from `queue_idx` entirely:
   the latent root-cause bug; ordinal keying eliminates it. With ordinal
   keying there is no silent untracked-queue case for any config with ≤64
   exact queues, regardless of how high the root indices run.
+- **`i < 64` / `pos_from_end < 64` ordinal guards at the set/skip sites
+  (round-3 safety fix — the actual safety mechanism).** Because the
+  `debug_assert` is stripped in release, the guards are what prevent
+  `1u64 << (>=64)` from wrapping and corrupting a low-ordinal bit. Ordinals
+  ≥64 are conservatively untracked (honor-eligible every call), never a
+  shift overflow. This is the load-bearing safety property; the assert and
+  warning below are diagnostics on top of it.
 - **`debug_assert!(ascending_len <= 64)`** at the selector top (stripped in
-  release; fires in test/CI). In a release build a >64-exact-queue config
-  would leave ordinals ≥64 untracked — but:
+  release; fires in test/CI as a developer tripwire).
 - **In-scope build-time warning (round-2 AGY+Codex required this).** At
   `build_cos_interface_runtime` (control-plane cold path, runs once per
   interface; zero hot-path cost) emit a one-time
@@ -323,10 +350,15 @@ This decouples the bit range from `queue_idx` entirely:
   start), set on each Phase-1 honor, read by Phase 2, never read after the
   next refill. The exhaustion reset (`:1072`) does not clear directly but
   forces a refill-clear next call — verified covers both exit paths.
-- **`queue_idx < 64` guard:** preserved at both set (`:941`) and skip
-  (`:985`) sites. Queues ≥64 are neither marked nor skipped — identical to
-  prior local-mask behavior (conservative: such a queue is serviced in both
-  phases, never starved).
+- **Ordinal `< 64` shift guard (NOT `queue_idx < 64`):** the bitset is keyed
+  by ASCENDING-VEC ORDINAL, so the guard is `i < 64` at the Phase-1 set/skip
+  sites and `pos_from_end < 64` at the Phase-2 skip site — NOT `queue_idx <
+  64`. (The old local mask used `queue_idx`, which was the latent F3′ bug;
+  do NOT reintroduce it.) Ordinals ≥64 are conservatively untracked
+  (honor-eligible every call, never starved, never shift-overflow) —
+  matching the old local mask's conservative spirit but bounded by the
+  exact-queue COUNT instead of the root index. The guard is the release-safe
+  mechanism (the `debug_assert` is a stripped tripwire).
 - **Borrow-split / lifetime:** index-copy-before-`&mut` discipline holds; no
   new lifetime that the old clone hid. (The clone existed *only* to dodge the
   borrow conflict between iterating `exact_queues_by_rate_ascending` and
@@ -539,3 +571,30 @@ PLAN-NEEDS-MINOR converged independently on the SAME refinement:
 
 **§9 amendment:** this PR also touches `userspace-dp/src/afxdp/cos/builders.rs`
 for the build-time over-64 warning (in addition to the field init).
+
+## 13. Round-3 adversarial review findings (folded into v4)
+
+Round-3 ran on plan v3 (`3ed53fbd0`). Codex r3 PLAN-NEEDS-MAJOR and AGY r3
+PLAN-NEEDS-MINOR converged on the SAME two fixes:
+
+- **Release shift-overflow (Codex MAJOR + AGY, with worked example): the
+  `i < 64` / `pos_from_end < 64` guards are MANDATORY.** v3 removed the
+  guard and relied on the `debug_assert`, which is stripped in release. AGY's
+  trace: with >64 exact queues, `1u64 << 64` in release wraps to `1u64 << 0`,
+  so honoring ordinal 64 sets bit 0 and silently corrupts queue-0's tracking
+  (queue 0 wrongly skipped, or ordinal 64 wrongly skip-tested against bit 0).
+  Since §4.4 keeps >64 as warning-only in release, this path is reachable.
+  **Folded:** §4.2 (c)/(c′)/(d) keep ordinal `< 64` guards at all three
+  set/skip sites; ordinals ≥64 are conservatively untracked. §4.4 reframes
+  the guard as the load-bearing safety mechanism (assert + warning are
+  diagnostics on top). The build-time warning still surfaces the cap.
+- **§6 stale text (Codex + AGY): "`queue_idx < 64` guard preserved"**
+  contradicted the v3 ordinal keying and would mislead an implementer into
+  reintroducing the F3′ bug. **Folded:** §6 now says the guard is ordinal
+  `i`/`pos_from_end < 64`, explicitly NOT `queue_idx < 64`.
+- **Codex r3 + AGY r3 confirmed:** ordinal mapping between Phase 1 (`i`) and
+  Phase 2 (`pos_from_end = len-1-phase2_idx`) is consistent, no off-by-one;
+  clear-at-refill is the only correct clear point; the ascending vec is built
+  once and runtime read-only (no remap hazard); all §8/§9 line citations
+  accurate; HA-no-sync correct. No NEW issue beyond the two above.
+- **AGY r3 was review-only** (verified clean worktree).
