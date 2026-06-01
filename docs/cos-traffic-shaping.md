@@ -908,8 +908,10 @@ Notes for this specific test:
   alarm-loop; the operator's next `commit` is rejected until they reduce
   workers or remove `equal-flow-enforcement`. Watch the
   `xpf_userspace_cos_equal_flow_fail_open{reason="unsampled_active_worker"}`
-  gauge for the runtime fail-open signal. Removing the 32-worker cap
-  entirely is tracked as #1731-e.
+  gauge for the runtime fail-open signal, and
+  `xpf_fairness_equal_flow_unsampled_active_workers` for the exact count of
+  active workers that fell outside the sampled scratch. Removing the
+  32-worker cap entirely is tracked as #1731-e.
 - `loss-priority` on CoS DSCP / 802.1p classifiers is accepted for syntax
   compatibility but is not enforced yet
 - `loss-priority` on CoS DSCP rewrite-rules is accepted for syntax

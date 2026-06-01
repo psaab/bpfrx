@@ -117,3 +117,59 @@ func TestStoreSyncApply_ToleratesEqualFlowOverWorkerCap(t *testing.T) {
 		t.Fatal("SyncApply must preserve equal-flow-enforcement (warning-only, no mutation)")
 	}
 }
+
+// TestCommitCheck_RejectsEqualFlowOverWorkerCap is the store-level
+// strict-commit regression gate: an operator candidate edit that puts
+// workers > MaxEqualFlowWorkers with equal-flow-enforcement must be
+// hard-rejected by CommitCheck AND Commit (they use the strict
+// compileTree, not the lenient load/sync path). This pins the asymmetry:
+// load/sync tolerate (above), but a deliberate operator commit does not.
+func TestCommitCheck_RejectsEqualFlowOverWorkerCap(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	for _, cmd := range []string{
+		"system dataplane-type userspace",
+		"system dataplane workers 33",
+		"class-of-service schedulers ef-sched transmit-rate 10m exact",
+		"class-of-service schedulers ef-sched equal-flow-enforcement",
+	} {
+		if err := s.SetFromInput(cmd); err != nil {
+			t.Fatalf("SetFromInput(%q): %v", cmd, err)
+		}
+	}
+	_, err := s.CommitCheck()
+	if err == nil {
+		t.Fatal("expected CommitCheck to reject >cap equal-flow config, got nil")
+	}
+	if !strings.Contains(err.Error(), "equal-flow-enforcement is unsupported") {
+		t.Fatalf("CommitCheck error should reference the worker cap: %v", err)
+	}
+	// Commit must refuse the same way (also strict).
+	if _, err := s.Commit(); err == nil {
+		t.Fatal("expected Commit to reject >cap equal-flow config, got nil")
+	}
+}
+
+// TestCommitCheck_AcceptsEqualFlowAtWorkerCap is the boundary companion:
+// exactly MaxEqualFlowWorkers workers + equal-flow commits cleanly.
+func TestCommitCheck_AcceptsEqualFlowAtWorkerCap(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	for _, cmd := range []string{
+		"system dataplane-type userspace",
+		"system dataplane workers 32",
+		"class-of-service schedulers ef-sched transmit-rate 10m exact",
+		"class-of-service schedulers ef-sched equal-flow-enforcement",
+	} {
+		if err := s.SetFromInput(cmd); err != nil {
+			t.Fatalf("SetFromInput(%q): %v", cmd, err)
+		}
+	}
+	if _, err := s.CommitCheck(); err != nil {
+		t.Fatalf("CommitCheck at the worker cap returned error: %v", err)
+	}
+}
