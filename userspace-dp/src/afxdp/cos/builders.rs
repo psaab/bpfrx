@@ -83,6 +83,30 @@ pub(in crate::afxdp) fn build_cos_interface_runtime(
         .collect();
     exact_queues_by_rate_ascending
         .sort_by_key(|&idx| config.queues[idx].transmit_rate_bytes);
+    // #1732: the GuaranteeRate waterfill honored-set bitset is a `u64`
+    // keyed by ordinal position in `exact_queues_by_rate_ascending`, so it
+    // tracks at most 64 exact guarantee-rate queues per interface. Beyond
+    // 64, ordinals ≥64 are conservatively untracked (the selector guards
+    // the shift with `ordinal < 64`), which means those queues are
+    // honor-eligible every selector call and may be over-served relative to
+    // the waterfill contract. This is far outside any realistic Junos CoS
+    // config (hardware queues are conventionally 0..7), but surface it to
+    // the operator via journald so the condition is observable rather than
+    // silent. Control-plane cold path: this runs when a per-worker
+    // per-interface runtime is built (first enqueue for that ifindex, and
+    // again on a runtime rebuild), so for an offending >64-queue config the
+    // line may repeat per worker/per rebuild rather than literally once
+    // globally — acceptable for a misconfiguration warning, and still off
+    // the per-packet hot path entirely.
+    if exact_queues_by_rate_ascending.len() > 64 {
+        eprintln!(
+            "xpf-userspace-dp: CoS interface has {} exact guarantee-rate \
+             queues (>64); waterfill honored-set tracking is capped at 64 — \
+             exact queues beyond the first 64 (by ascending rate) may be \
+             over-served",
+            exact_queues_by_rate_ascending.len()
+        );
+    }
     // #916: transparent root. When `shaping_rate_bytes == 0` the root
     // bucket is bypassed by `maybe_top_up_cos_root_lease`; pre-fill
     // tokens to the burst cap so the very first packet doesn't see
@@ -109,6 +133,7 @@ pub(in crate::afxdp) fn build_cos_interface_runtime(
         exact_queues_by_rate_ascending,
         waterfill_pass1_remaining_bytes: 0,
         waterfill_phase2_cursor: 0,
+        waterfill_honored_epoch_bits: 0,
         waterfill_epochs: 0,
         waterfill_phase1_budget_breaks: 0,
         exact_guarantee_rr: 0,
