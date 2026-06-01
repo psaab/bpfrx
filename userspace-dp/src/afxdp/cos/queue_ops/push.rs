@@ -16,8 +16,85 @@ use super::*;
 // decomposition is the round-2 PLAN-READY split. Plan doc:
 // docs/pr/1355-cos-push-split/plan.md.
 
+/// #1735: lazy flow-fair promotion probe for NON-exact shaped queues.
+///
+/// Runs at the top of `cos_queue_push_back`. For a queue that is
+/// `flow_fair_eligible` but not yet promoted (`flow_fair_state` is
+/// `None`), it decides whether the INCOMING item introduces a SECOND
+/// distinct flow and, if so, promotes the queue to flow-fair MQFQ.
+///
+/// **#1183 fast-path contract — the load-bearing reason this is
+/// hash-free.** The probe never computes a flow hash. It compares the
+/// incoming item's `Option<&SessionKey>` to the FIFO front's key
+/// structurally (the derived `PartialEq` on `SessionKey`):
+///   - eligible-but-already-promoted (`flow_fair_state.is_some()`) →
+///     return immediately (the normal MQFQ branch handles it);
+///   - not eligible → return immediately;
+///   - empty FIFO → first packet, single flow → stay FIFO, no hash;
+///   - same key as the front (incl. both `None`) → still one flow →
+///     stay FIFO, no hash.
+/// Only a genuine second distinct flow triggers promotion. So a
+/// single-flow / uncontended best-effort queue's `push_back` adds only
+/// a boolean load, a null-`Box` test, a `front()` read (already in
+/// cache), and a short-circuiting key compare — never a hash, never a
+/// 232 KB allocation. (AGY plan-review: <0.5 ns CoS-OFF, ~1-3 ns
+/// uncontended CoS-ON; within per-packet jitter.)
+#[inline]
+fn maybe_promote_best_effort(queue: &mut CoSQueueRuntime, incoming: &CoSPendingTxItem) {
+    if !queue.config.flow_fair_eligible || queue.flow_fair_state.is_some() {
+        return;
+    }
+    let Some(front) = queue.hot.items.front() else {
+        return; // empty FIFO → single flow
+    };
+    if cos_item_flow_key(front) == cos_item_flow_key(incoming) {
+        return; // same flow as the FIFO front (or both keyless) → one flow
+    }
+    // Genuine contention: a second distinct flow. Promote.
+    promote_to_flow_fair(queue);
+}
+
+/// #1735: migrate a non-exact FIFO queue onto the flow-fair MQFQ path.
+///
+/// Robust to ANY resident flow mix (Codex round-1 Q2 remedy): drains
+/// the resident FIFO and re-enqueues each item through the SAME
+/// `cos_queue_push_back` accounting path the MQFQ hot path uses, so
+/// each item is hashed into its own bucket and there is no bespoke
+/// finish-time arithmetic to drift. The probe makes a >1-flow resident
+/// FIFO unreachable (see plan §4.3.1 induction), but correctness no
+/// longer DEPENDS on that — belt and suspenders.
+///
+/// `local_item_count` net-zero handoff: items are MOVED, not added, so
+/// the per-item `local_item_count` decrement here cancels the increment
+/// the re-`push_back` performs. Re-`push_back` finds
+/// `flow_fair_state.is_some()` so the probe short-circuits (no
+/// recursion) and the item enqueues via the MQFQ branch.
+///
+/// v8 lease / V_min: non-exact queues carry `queue_lease_v8 == None`
+/// and `v_min.vtime_floor == None`, so the lease-mirror block in
+/// `account_cos_queue_flow_enqueue` is a no-op here (asserted in test).
+#[inline]
+fn promote_to_flow_fair(queue: &mut CoSQueueRuntime) {
+    let resident: VecDeque<CoSPendingTxItem> = std::mem::take(&mut queue.hot.items);
+    queue.flow_fair_state = Some(Box::new(FlowFairState::new(cos_flow_hash_seed_from_os())));
+    for item in resident {
+        if matches!(item, CoSPendingTxItem::Local(_)) {
+            queue.hot.local_item_count = queue.hot.local_item_count.saturating_sub(1);
+        }
+        cos_queue_push_back(queue, item);
+    }
+}
+
 #[inline]
 pub(in crate::afxdp) fn cos_queue_push_back(queue: &mut CoSQueueRuntime, item: CoSPendingTxItem) {
+    // #1735: lazy flow-fair promotion probe (hash-free; see
+    // `maybe_promote_best_effort`). Runs FIRST so the rest of this fn
+    // observes the post-promotion `flow_fair()` state. On a promoted
+    // queue this is a single `is_some()` short-circuit. The migration
+    // (if it fires) re-enqueues resident items through this same fn;
+    // the incoming `item` below is then accounted exactly once by the
+    // normal path.
+    maybe_promote_best_effort(queue, &item);
     let item_len = cos_item_len(&item);
     let flow_key = cos_item_flow_key(&item);
     // #774: maintain local_item_count alongside the queue pushes

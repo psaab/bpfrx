@@ -16,7 +16,10 @@ use crate::afxdp::types::{
 };
 use crate::afxdp::worker::BindingWorker;
 
-use super::queue_ops::{cos_item_len, cos_queue_front, cos_queue_is_empty, cos_queue_push_front};
+use super::queue_ops::{
+    cos_item_len, cos_queue_front, cos_queue_is_empty, cos_queue_push_front,
+    maybe_demote_drained_best_effort,
+};
 use super::token_bucket::{maybe_top_up_cos_root_lease, release_cos_root_lease};
 
 // ============================================================================
@@ -686,6 +689,12 @@ pub(in crate::afxdp) fn apply_cos_send_result(
             // apply_direct_exact_send_result write so the sum across
             // all sites equals the bytes the CoS scheduler accounted.
             account_queue_drain_sent_bytes(queue, phase, sent_bytes, exact_backlogged);
+            // #1735: lazy demotion at this quiescent settle boundary —
+            // strictly after restore_cos_local_items_inner and the
+            // queued_bytes settle above, so a partial-commit retry
+            // leaves the queue non-quiescent and is NOT demoted. No-op
+            // on exact / non-eligible / non-promoted queues.
+            maybe_demote_drained_best_effort(queue);
         }
         if debit_nonexact_surplus_budget {
             if let Some(backlog) = shared_exact_backlog.as_ref() {
@@ -790,6 +799,10 @@ pub(in crate::afxdp) fn apply_cos_prepared_result(
             // flowing through this path. Same Relaxed semantics as
             // the other three apply_* sites.
             account_queue_drain_sent_bytes(queue, phase, sent_bytes, exact_backlogged);
+            // #1735: lazy demotion at this quiescent settle boundary
+            // (prepared variant). See apply_cos_send_result for the
+            // ordering rationale.
+            maybe_demote_drained_best_effort(queue);
         }
         if debit_nonexact_surplus_budget {
             if let Some(backlog) = shared_exact_backlog.as_ref() {
