@@ -353,7 +353,12 @@ func (t *tunnelManager) applyWireguardTunLocked(tc *config.TunnelConfig) error {
 	// open_tun on the same name would then fail.
 	mustCreate := err != nil
 	if err == nil {
-		if _, isTun := link.(*netlink.Tuntap); !isTun {
+		tt, isTuntap := link.(*netlink.Tuntap)
+		if !isTuntap || tt.Mode != netlink.TUNTAP_MODE_TUN {
+			// Not a TUN (a TAP, or some other type entirely). The Rust
+			// side opens it with IFF_TUN, so a TAP would fail there;
+			// delete + recreate as a TUN rather than mutate the wrong
+			// device (Codex r3 MINOR).
 			slog.Info("replacing non-TUN link before wireguard tun create",
 				"name", tc.Name, "type", link.Type())
 			if delErr := t.ops.LinkDel(link); delErr != nil {

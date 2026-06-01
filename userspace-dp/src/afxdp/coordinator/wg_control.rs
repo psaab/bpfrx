@@ -157,16 +157,13 @@ pub(super) fn wg_control_loop(
             match socket.recv_from(&mut sock_buf) {
                 Ok((len, from)) if len > 0 => {
                     did_work = true;
-                    // Learn / refresh the peer endpoint from the source of
-                    // any inbound datagram (WG roaming + responder-only
-                    // support). We only have one configured peer in S2a,
-                    // so attributing inbound to it is unambiguous; the
-                    // engine still cryptographically authenticates the
-                    // session, so a spoofed source cannot inject traffic,
-                    // only (at worst) redirect our egress — bounded to the
-                    // same single peer.
-                    effective_endpoint = Some(from);
-                    dispatch_inbound(
+                    // Learn / refresh the peer endpoint from `from` ONLY
+                    // after the datagram cryptographically authenticates
+                    // (Codex r3 MAJOR): updating on any inbound packet
+                    // would let a spoofed source redirect our encrypted
+                    // egress. dispatch_inbound returns true only on a
+                    // successful consume_*/try_decap.
+                    let authenticated = dispatch_inbound(
                         &engine,
                         &socket,
                         &mut tun,
@@ -177,6 +174,9 @@ pub(super) fn wg_control_loop(
                         &tunnel_name,
                         &recent_exceptions,
                     );
+                    if authenticated {
+                        effective_endpoint = Some(from);
+                    }
                 }
                 Ok(_) => break,
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -223,14 +223,13 @@ pub(super) fn wg_control_loop(
         } else {
             // Responder-only peer that hasn't been heard from yet: drain
             // the TUN so the kernel does not back up, but we have no
-            // endpoint to send to until the peer initiates. Apply the same
-            // WG_RX_BURST bound used in the initiator path to prevent a
-            // TUN flood from starving the socket-read direction.
+            // endpoint to send to until the peer initiates. Bounded by
+            // WG_RX_BURST (Codex r3 MAJOR — an unbounded drain under
+            // continuous local traffic could starve socket RX and delay
+            // stop/join during reconcile).
             for _ in 0..WG_RX_BURST {
                 match tun.read(&mut tun_buf) {
-                    Ok(len) if len > 0 => {
-                        did_work = true;
-                    }
+                    Ok(len) if len > 0 => did_work = true,
                     _ => break,
                 }
             }
@@ -281,26 +280,39 @@ pub(super) fn wg_control_loop(
 /// that VRF is NOT yet supported — SO_BINDTODEVICE/VRF-fd binding is
 /// owned by the S6 multi-instance work (#1434). S2a single-tunnel scope
 /// is the default table.
+///
+/// IPV6_V6ONLY must be cleared BEFORE bind (Linux rejects it post-bind
+/// with EINVAL — Codex r3 MAJOR), so the v6 socket is created with raw
+/// libc, the option is set, then bind() is called. On any v6 failure we
+/// fall back to a plain v4 bind so v4 peers (the common case) work.
 fn bind_wg_socket(port: u16) -> io::Result<UdpSocket> {
-    match UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, port)) {
-        Ok(sock) => {
-            if clear_ipv6_v6only(&sock).is_err() {
-                // Could not guarantee dual-stack; rebind v4 so v4 peers work.
-                drop(sock);
-                return UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port));
-            }
-            Ok(sock)
-        }
+    match bind_dual_stack_v6(port) {
+        Ok(sock) => Ok(sock),
         Err(_) => UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port)),
     }
 }
 
-/// Clear IPV6_V6ONLY so a `[::]` socket also accepts v4-mapped peers.
-fn clear_ipv6_v6only(sock: &UdpSocket) -> io::Result<()> {
+/// Create a `[::]:port` UDP socket with IPV6_V6ONLY cleared before bind.
+fn bind_dual_stack_v6(port: u16) -> io::Result<UdpSocket> {
+    use std::os::fd::FromRawFd;
+    // socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0)
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_INET6,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // Own the fd immediately so any early return closes it.
+    let sock = unsafe { UdpSocket::from_raw_fd(fd) };
+    // Clear IPV6_V6ONLY BEFORE bind.
     let off: libc::c_int = 0;
     let rc = unsafe {
         libc::setsockopt(
-            sock.as_raw_fd(),
+            fd,
             libc::IPPROTO_IPV6,
             libc::IPV6_V6ONLY,
             &off as *const _ as *const libc::c_void,
@@ -310,7 +322,25 @@ fn clear_ipv6_v6only(sock: &UdpSocket) -> io::Result<()> {
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(())
+    // bind([::]:port)
+    let addr = libc::sockaddr_in6 {
+        sin6_family: libc::AF_INET6 as libc::sa_family_t,
+        sin6_port: port.to_be(),
+        sin6_flowinfo: 0,
+        sin6_addr: libc::in6_addr { s6_addr: [0u8; 16] },
+        sin6_scope_id: 0,
+    };
+    let rc = unsafe {
+        libc::bind(
+            fd,
+            &addr as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(sock)
 }
 
 /// Build + send a fresh initiation toward the peer endpoint. A send
@@ -337,7 +367,12 @@ fn drive_initiation(
     }
 }
 
-/// Dispatch one inbound WG datagram on its type byte.
+/// Dispatch one inbound WG datagram on its type byte. Returns `true`
+/// iff the datagram cryptographically AUTHENTICATED (a successful
+/// consume_initiation/consume_response/try_decap) — the caller uses that
+/// to gate endpoint-learning so a spoofed source cannot redirect egress
+/// (Codex r3 MAJOR). Type-3 (cookie), unknown, and any failed
+/// authentication return `false`.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_inbound(
     engine: &crate::afxdp::wg::WgEngine,
@@ -349,9 +384,9 @@ fn dispatch_inbound(
     response_buf: &mut [u8],
     tunnel_name: &str,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
-) {
+) -> bool {
     let Some(&wg_type) = datagram.first() else {
-        return;
+        return false;
     };
     match wg_type {
         crate::afxdp::wg::WG_TYPE_INITIATION => {
@@ -359,20 +394,26 @@ fn dispatch_inbound(
                 Ok((_peer_pubkey, _local_index)) => {
                     let len = crate::afxdp::wg::WG_MSG_RESPONSE_LEN;
                     let _ = socket.send_to(&response_buf[..len], from);
+                    true
                 }
                 Err(_e) => {
                     debug_log!("WG[{}]: drop initiation reason={:?}", tunnel_name, _e);
+                    false
                 }
             }
         }
-        crate::afxdp::wg::WG_TYPE_RESPONSE => {
-            if let Err(_e) = engine.consume_response(datagram) {
+        crate::afxdp::wg::WG_TYPE_RESPONSE => match engine.consume_response(datagram) {
+            Ok(_) => true,
+            Err(_e) => {
                 debug_log!("WG[{}]: drop response reason={:?}", tunnel_name, _e);
+                false
             }
-        }
+        },
         crate::afxdp::wg::WG_TYPE_COOKIE => {
-            // Cookie/MAC2 reply handling is S7; drop for now.
+            // Cookie/MAC2 reply handling is S7; drop for now. Not
+            // authenticated for endpoint-learning purposes.
             debug_log!("WG[{}]: drop cookie (S7)", tunnel_name);
+            false
         }
         crate::afxdp::wg::WG_TYPE_DATA => {
             match engine.try_decap(datagram, decap_buf) {
@@ -388,14 +429,17 @@ fn dispatch_inbound(
                             format!("wg_tun_write:{e}"),
                         );
                     }
+                    true
                 }
                 Err(_e) => {
                     debug_log!("WG[{}]: drop transport reason={:?}", tunnel_name, _e);
+                    false
                 }
             }
         }
         _ => {
             debug_log!("WG[{}]: drop unknown type {}", tunnel_name, wg_type);
+            false
         }
     }
 }
