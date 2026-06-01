@@ -16,6 +16,7 @@ Plan commits: v1 `019e713f1`, v2 `c841cdb29`, v3 (this).
   rp_filter + port-conflict hazards)
 - Claude-SMR: verified TUN finding; adopted coherent wgN TUN model.
 
-## Plan review round 3 — confirming v3 folds
-- Codex: (pending dispatch)
-- AGY: (pending dispatch)
+## Plan review round 3 — CONVERGED PLAN-READY
+- Codex: `wg-s2a-plan-r3-1780274137` — PLAN-NEEDS-MINOR (TUN-read MTU pad-aware guard; folded)
+- AGY: `adversarial-review-mpuh8tsf-qvo8cp` — PLAN-READY (MTU cap + persistent TUN + telemetry + DNAT note; folded)
+- Claude-SMR: agree; v3-final folds all three rounds. CLEARED TO IMPLEMENT.

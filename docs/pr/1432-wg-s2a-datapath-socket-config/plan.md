@@ -1,21 +1,17 @@
 # #1432 / #1703 S2a — WireGuard datapath bring-up: engine instantiation + kernel-socket WG RX/TX (ESP precedent) + egress encap call site + runtime TunnelEndpoint hydration + Go DTO population + minimal config
 
-Status: **PLAN-READY v3 — round-2 adversarial review CONVERGED.** Codex
-(`wg-s2a-plan-r2-1780273508`) PLAN-NEEDS-MAJOR and AGY
-(`adversarial-review-mpugvd7u-fp5fma`) PLAN-NEEDS-MINOR confirmed the v2 RX-model
-pivot (ESP precedent → kernel socket) and reload fix are sound, and converged on
-the SAME mandatory edit: the shim early-return MUST also require
-`is_local_destination` or it steals transit/DNAT UDP on the WG port and bypasses
-the policy engine. v3 folds that, plus Codex's catch that the inner-decap
-reinject path (`local_tunnel_deliveries`) is **kernel/TUN delivery, NOT the
-AF_XDP policy pipeline** — so v3 adopts the coherent **TUN model** (a `wgN` TUN
-netdev, kernel-routed both directions, the exact IPsec/GRE-local-origin
-precedent), plus AGY's operational hazards (`rp_filter` drops + kernel-WG port
-conflict). See §11 (convergence).
+Status: **PLAN-READY v3-final — round-3 adversarial review CONVERGED.** Round 3:
+AGY (`adversarial-review-mpuh8tsf-qvo8cp`) **PLAN-READY**; Codex
+(`wg-s2a-plan-r3-1780274137`) **PLAN-NEEDS-MINOR** (the single MTU fold, now
+applied). Both confirmed the two r2 majors resolved. v3-final folds the round-3
+items: persistent `wgN` TUN (no reload flap), `wgN` MTU cap + exact pad-aware
+encap MTU guard in BOTH directions, telemetry double-count consolidation, and
+the DNAT-to-WG-port known-limitation note. **Cleared to implement.** See §11c.
 
-Earlier: v2 (c841cdb29) round-1 CONVERGED PLAN-NEEDS-MAJOR (Codex+AGY) on two
-blockers — WG RX ownership + reload stability — both resolved; DRAFT v1
-(019e713f1).
+History: v3 (74fce808c) round-2 CONVERGED (Codex MAJOR → shim `is_local_destination`
++ TUN-vs-policy reinject; AGY MINOR); v2 (c841cdb29) round-1 CONVERGED
+PLAN-NEEDS-MAJOR (RX ownership + reload, both resolved); DRAFT v1 (019e713f1).
+Full per-round detail in §11 / §11b / §11c.
 
 Issue: #1432 (re-scoped to #1703 S2). This PR is **S2a** — datapath + socket +
 config bring-up. **S2b** (live kernel-WG-on-VM interop test + smoke) is #1736,
@@ -207,6 +203,11 @@ tunnel-interface path so `buildTunnelEndpointSnapshots` can emit it.
 - `snapshotHasNativeGRE` stays GRE-only; add a parallel `snapshotHasWireGuard`
   if the maps_sync path needs to know (likely not for S2a — the Rust side keys
   off `mode`).
+- **Go creates the persistent `wgN` netdev** (networkd or `ip tuntap add ... mode
+  tun` with persist) BEFORE the Rust thread attaches, sets its MTU to
+  `outer_mtu - WG_OVERHEAD - 15`, assigns the inner address, and installs the
+  inner route via it (FRR/networkd) — so a reload does not flap the netdev
+  (AGY r3 Hazard B) and the kernel has a route to write decapped inner onto.
 - **Config grammar**: minimal — reuse the existing `set interfaces <wg-if>
   tunnel mode wireguard` + new `wireguard { listen-port; private-key; peer { ...
   public-key; allowed-ips; endpoint; } }` leaves, OR (simpler for S2a) a flat
@@ -257,9 +258,23 @@ A new `coordinator` aux thread (one per WG endpoint, modeled on
 (§3.4): the kernel delivers WG-port UDP to a real socket; the thread reads it
 directly. No worker→control packet channel in S2a.**
 
-- Open the `wgN` TUN (`open_tun`, `slowpath.rs:349`), non-blocking. The Go side
-  must create + address + route the `wgN` netdev (networkd, like other tunnel
-  interfaces) so the kernel has an inner route via it.
+- Open the `wgN` TUN (`open_tun`, `slowpath.rs:349`), non-blocking. **The `wgN`
+  netdev MUST be PERSISTENT** (`TUNSETPERSIST`, or pre-created via `ip tuntap add
+  dev wgN mode tun` by the Go control plane / networkd before the Rust thread
+  attaches) — AGY r3 Hazard B. A transient TUN fd is deleted on close, so a
+  config reload (which stops/joins aux threads, `coordinator/mod.rs:209`) would
+  otherwise destroy `wgN` and its addresses + FRR routes every reload. The Go
+  side creates + addresses + routes the persistent `wgN` (networkd, like other
+  tunnel interfaces) so the kernel has an inner route via it.
+- **`wgN` MTU** (AGY r3 Hazard A / Codex r3): the Go side sets the `wgN` MTU to
+  `outer_mtu - WG_OVERHEAD - 15` (worst-case pad) — e.g. 1420 for v4-outer,
+  1400 for v6-outer at a 1500 outer MTU — so the kernel never writes a
+  plaintext packet that, once encapped, exceeds the outer MTU and forces outer
+  IP fragmentation. The TUN-read encap path ALSO enforces an exact guard:
+  `WG_DATA_HEADER_LEN + pad_to_16(inner.len()) + POLY1305_TAG_LEN + outer_l3l4
+  <= outer_mtu` → else drop + `wg_mtu_drops` (symmetric with the transit-encap
+  guard, §7; the existing `wg/mss.rs:48,59,92` already reserves worst-case pad
+  for TCP MSS).
 - Bind `UdpSocket` to `:wg_listen_port` (v4 + v6). If a host kernel WireGuard
   interface already claims the port, the bind fails `EADDRINUSE` — surface a
   clear error + counter; userspace-WG and kernel-WG on the same port are
@@ -418,7 +433,8 @@ path pays only the `ctrl.wg_rx` predicate (0 when no WG configured).
 | Engine reload churn (TAI64N/sessions) | **LOW** | RESOLVED §4.2 — identity reuse + high-water seed. |
 | Architectural mismatch (#961/#946-P2) | **LOW** | Aux-thread + egress-encap-branch + kernel-socket-RX templates all already exist (GRE local-origination, ESP/IKE). Composition, not new architecture. |
 | WG RX delivery (kernel socket vs AF_XDP) | **LOW** | RESOLVED §3.4 — WG-to-firewall is local-destination UDP, passed to kernel via `cpumap_or_pass` (ESP precedent `lib.rs:469`); kernel socket receives it. Shim early-return makes it deterministic. |
-| UMEM integration on encap | **MED** | WG outer adds `WG_OVERHEAD_V4=60`/`V6=80` (`mod.rs:138-141`) + ≤15 B pad. `try_encap` bound-checks before side effects (`engine.rs:627-633`). The copy path sizes the UMEM frame for `inner + WG_OVERHEAD`; a non-TCP inner exceeding `MTU - WG_OVERHEAD` is an explicit drop + `wg_mtu_drops` (no userspace reassembly), NOT a descriptor overflow. |
+| UMEM / MTU on encap (both r3) | **MED** | WG outer adds `WG_OVERHEAD_V4=60`/`V6=80` (`mod.rs:138-141`) **+ ≤15 B pad** (`pad_to_16`). `try_encap` bound-checks before side effects (`engine.rs:627-633`). BOTH encap paths (transit copy + TUN-read) enforce the exact guard `WG_DATA_HEADER_LEN + pad_to_16(inner.len()) + POLY1305_TAG_LEN + outer_l3l4 <= outer_mtu` → drop + `wg_mtu_drops` (no userspace reassembly, no descriptor overflow). The Go side caps `wgN` MTU at `outer_mtu - WG_OVERHEAD - 15` so the kernel never hands oversized inner that would force outer IP fragmentation (AGY r3 Hazard A). `wg/mss.rs:48,59,92` already reserves worst-case pad for TCP MSS. |
+| Telemetry double-count (AGY r3 Hazard C) | **LOW** | Consolidate bytes/packets counters across the transit-encap (`frame/mod.rs:237`) and TUN-read-encap sites so WG egress is not under/over-reported. Test asserts a single round-trip increments the WG egress counter exactly once. |
 | Kernel `rp_filter` silent drop (AGY r2) | **MED** | WG outer datagrams pass to the kernel; if strict `rp_filter` is on and the kernel routing table (userspace-managed by xpf/FRR) lacks a route back to the peer's public IP, the kernel silently drops inbound WG. Runbook (§8) must set `net.ipv4.conf.<wan>.rp_filter=0/2` or ensure a kernel route to the peer exists. The `wgN` TUN gives the kernel an inner route; the outer-peer route is the gap. |
 | Transit/DNAT UDP-on-WG-port policy bypass (both r2, RESOLVED) | **LOW** | The shim early-return requires `is_local_destination` (§4.5) so only WG-to-firewall is shunted to the kernel; transit stays on the policy engine. Test `shim_transit_udp_on_wg_port_stays_on_dataplane`. |
 | Kernel-WG port conflict (AGY r2) | **LOW** | `UdpSocket` bind fails `EADDRINUSE` if a kernel `wgX` claims the port; surfaced as a clear error + counter; userspace-WG and kernel-WG on the same port are mutually exclusive (documented). |
@@ -462,12 +478,17 @@ path pays only the `ctrl.wg_rx` predicate (0 when no WG configured).
   Pass B CoS-enabled per-class 5201-5206. **Required: best-effort + per-class
   numbers identical to a no-WG baseline (0 retrans, line rate on the multi-
   stream reverse).** This is the #1183/#1545 fast-path guard.
-- **Deploy/runbook note (AGY r2):** WG outer datagrams transit the kernel; the
-  deploy must ensure inbound WG is not `rp_filter`-dropped — set
-  `net.ipv4.conf.<wan>.rp_filter` to 0 (off) or 2 (loose), or ensure the kernel
-  routing table has a route to the peer's public IP. (Carried into the S2b
-  live-interop runbook, #1736.) Also: the WG `listen-port` must not collide with
-  a host kernel `wgX` interface (bind `EADDRINUSE`).
+- **Deploy/runbook notes:** (a, AGY r2) WG outer datagrams transit the kernel;
+  the deploy must ensure inbound WG is not `rp_filter`-dropped — set
+  `net.ipv4.conf.<wan>.rp_filter` to 0/2, or ensure the kernel routing table has
+  a route to the peer's public IP. (b, AGY r2) the WG `listen-port` must not
+  collide with a host kernel `wgX` (bind `EADDRINUSE`). (c, AGY r3) the `wgN` TUN
+  is persistent + MTU-capped (§4.3). (d, AGY r3) **DNAT-to-WG-port limitation**:
+  if AF_XDP DNAT rules forward inbound WG-port traffic targeting a host public
+  IP to an internal host, the `is_local_destination` shim guard still steals it
+  to the kernel (dst is locally-owned) — documented as a known limitation; a
+  non-issue for the standard topology where the xpf host IS the VPN terminator.
+  (Carried into the S2b live-interop runbook, #1736.)
 - `make audit-check`.
 - `make test-failover` only if S2a touches HA/bringup. **Assertion: it does
   NOT** — single-tunnel S2a adds a WG endpoint + aux thread but does not change
@@ -567,9 +588,31 @@ All round-1 findings folded.
 
 v3 folds: the mandatory `is_local_destination` shim guard (§4.5), the explicit
 TUN model (§1, §3.4, §4.3), the `rp_filter` + port-conflict hazards (§7, §8),
-and the encap-sites cleanup (§4.4, §10.7). Codex (the stricter r2 verdict) had
-two majors, both resolved by the TUN-model adoption + the shim guard; AGY's r2
-was already NEEDS-MINOR. v3 is **cleared to implement.** A short round-3
-confirming pass is optional (the changes are folds of the reviewers' own
-prescribed fixes, not a new architecture); will dispatch one to close the loop
-before code lands.
+and the encap-sites cleanup (§4.4, §10.7).
+
+## 11c. v3-final convergence (round 3 — PLAN-READY)
+
+- **AGY** (`adversarial-review-mpuh8tsf-qvo8cp`): **PLAN-READY.** Confirmed the
+  `wgN` TUN model coherent, the `is_local_destination` guard sufficient, no
+  double-encap. Surfaced three folds: **(A) `wgN` MTU** must be capped at
+  `outer_mtu - WG_OVERHEAD - 15` or the kernel hands oversized inner that forces
+  outer IP fragmentation; **(B) TUN persistence** — a transient TUN fd is
+  deleted on close, so a config reload (`coordinator/mod.rs:209` stops/joins aux
+  threads) would flap `wgN` and destroy its addresses + FRR routes every reload;
+  use `TUNSETPERSIST` / pre-create; **(C) telemetry** — consolidate byte/packet
+  counters across the transit-encap + TUN-read-encap sites. Plus a DNAT-to-WG-
+  port known-limitation note.
+- **Codex** (`wg-s2a-plan-r3-1780274137`): **PLAN-NEEDS-MINOR.** Both r2 majors
+  confirmed resolved (explicit TUN/kernel delivery; shim no longer port-only).
+  One minor: the TUN-read MTU handling was underspecified — require the exact
+  `WG_OVERHEAD + pad_to_16(inner.len()) <= outer_mtu` guard (pad-aware, not just
+  `inner + WG_OVERHEAD`) in BOTH the transit and TUN-read directions; `wg/mss.rs`
+  already reserves worst-case pad. No-double-encap, shim guard, and engine-reuse-
+  vs-TUN-reload all confirmed sound.
+- **Claude-SMR** (this thread): folded all three AGY items + Codex's pad-aware
+  MTU guard into §4.1 (Go creates persistent MTU-capped `wgN`), §4.3 (persistent
+  TUN + exact MTU guard), §7 (MTU + telemetry rows), §8 (DNAT runbook note).
+
+**Converged PLAN-READY** (AGY READY, Codex MINOR fully folded, Claude-SMR
+agree). All findings across 3 rounds are folds of the reviewers' own prescribed
+fixes — no open architectural question. **Cleared to implement S2a.**
