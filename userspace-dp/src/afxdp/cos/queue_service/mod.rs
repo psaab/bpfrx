@@ -806,10 +806,11 @@ fn select_exact_cos_guarantee_queue_waterfill(
         root.waterfill_phase2_cursor = 0;
         // #1732: a new epoch starts here — clear the persistent honored
         // bitset so this epoch's Phase-1 honors start fresh. This is the
-        // single clear point: the exhaustion path (`:1072` below) resets
-        // `pass1_remaining` to 0, which forces this refill block (and thus
-        // this clear) on the next selector call, so both epoch-exit paths
-        // are covered without a redundant double-clear.
+        // single clear point: the exhaustion-reset path at the END of this
+        // function (after the Phase-2 loop) sets `pass1_remaining` to 0,
+        // which forces this refill block (and thus this clear) on the next
+        // selector call, so both epoch-exit paths are covered without a
+        // redundant double-clear.
         root.waterfill_honored_epoch_bits = 0;
         // #1628 site 1: completed-epoch / Phase-1-refill counter. Bumped
         // here (no `queue` borrowed yet) on every lazy refill.

@@ -92,8 +92,12 @@ pub(in crate::afxdp) fn build_cos_interface_runtime(
     // the waterfill contract. This is far outside any realistic Junos CoS
     // config (hardware queues are conventionally 0..7), but surface it to
     // the operator via journald so the condition is observable rather than
-    // silent. Control-plane cold path (runs once per interface on first
-    // enqueue); zero hot-path cost.
+    // silent. Control-plane cold path: this runs when a per-worker
+    // per-interface runtime is built (first enqueue for that ifindex, and
+    // again on a runtime rebuild), so for an offending >64-queue config the
+    // line may repeat per worker/per rebuild rather than literally once
+    // globally — acceptable for a misconfiguration warning, and still off
+    // the per-packet hot path entirely.
     if exact_queues_by_rate_ascending.len() > 64 {
         eprintln!(
             "xpf-userspace-dp: CoS interface has {} exact guarantee-rate \
