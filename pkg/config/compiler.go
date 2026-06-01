@@ -63,11 +63,15 @@ func CompileConfig(tree *ConfigTree) (*Config, error) {
 }
 
 // CompileConfigLenient is CompileConfig with the #1733 equal-flow
-// worker-cap validator downgraded to a warning. Use ONLY on the
-// Store.Load path so an already-persisted unsupported config boots
-// through (the dataplane already silently fail-opens equal-flow above
-// MaxEqualFlowWorkers, so tolerating the config preserves running
-// behavior). Candidate commit must use the strict CompileConfig.
+// worker-cap validator downgraded to a warning. Use on TOLERANT paths
+// that compile an already-active / already-persisted config the operator
+// did not just author — e.g. Store.Load of a persisted config — so an
+// upgraded node boots through (the dataplane already silently fail-opens
+// equal-flow above MaxEqualFlowWorkers, so tolerating the config preserves
+// running behavior). MUST NOT be used on the candidate-commit path:
+// commit / commit-check use the strict CompileConfig so new operator edits
+// hard-reject. The node-aware sibling CompileConfigForNodeLenient covers
+// the cluster paths (Store.SyncApply, peer-interface display).
 func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 	return compileConfigWithOpts(tree, compileOpts{lenientEqualFlowWorkerCap: true})
 }
@@ -111,8 +115,12 @@ func CompileConfigForNode(tree *ConfigTree, nodeID int) (*Config, error) {
 }
 
 // CompileConfigForNodeLenient is CompileConfigForNode with the #1733
-// equal-flow worker-cap validator downgraded to a warning. Use ONLY on
-// the Store.SyncApply path (see CompileConfigLenient).
+// equal-flow worker-cap validator downgraded to a warning. Use on
+// node-aware TOLERANT paths that compile an already-active / peer-synced
+// config the local operator did not just author: Store.SyncApply (HA
+// peer-sync ingress) and the read-only peer-interface display re-compiles
+// (cli_show_interfaces.go, server_show_interfaces.go). MUST NOT be used on
+// the candidate-commit path — see CompileConfigLenient.
 func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) {
 	return compileConfigForNodeWithOpts(tree, nodeID, compileOpts{lenientEqualFlowWorkerCap: true})
 }
