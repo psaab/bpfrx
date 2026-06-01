@@ -1,6 +1,8 @@
 # Plan — #1732 CoS GuaranteeRate waterfill: persistent honored set + alloc-free hot path
 
-- **Status**: DRAFT v1 — pending adversarial plan review
+- **Status**: v2 — round-1 findings folded (Codex PLAN-NEEDS-MAJOR + AGY
+  PLAN-NEEDS-MAJOR converged on the Phase-1-skip gap; Claude-SMR concurs).
+  Pending round-2 adversarial review.
 - **Issue**: #1732 (sub-issue of #1731, item #2 / §4.2 of the ENGINEER-READY plan)
 - **Mode**: `/engineer` (= triple-review)
 - **Base**: `origin/master` @ `c9e552689`
@@ -151,6 +153,43 @@ replace `honored_mask |= 1u64 << queue_idx;` with
 `queue_idx < 64`). This write happens before the `return`, so the bit
 persists into the next call.
 
+**(c′) Phase-1 ALSO skips already-honored queues (round-1 FATAL fix —
+Codex + AGY converged).** This is the load-bearing correctness fix that
+plan v1 MISSED. Phase 1 always restarts at the smallest ascending queue
+(`:817`) and returns immediately on a honor (`:954`). A persistent bitset
+read *only* by Phase 2 does NOT stop the smallest queue from being
+re-honored on every selector call within the epoch: each call re-enters
+Phase 1, honors the smallest queue (decrementing `pass1_remaining` by its
+small `phase1_cost`), and returns — so the smallest queue monopolizes the
+entire Phase-1 budget and the larger ascending queues never receive their
+one Phase-1 honor before the budget is exhausted. **This is precisely the
+"skews to the lowest-rate queue" symptom the issue describes.** Therefore,
+at the TOP of the Phase-1 loop body — immediately after computing
+`queue_idx`, before the eligibility gate at `:820` — add:
+
+```rust
+// #1732: at-most-once Phase-1 honor per epoch. A queue already
+// honored this epoch is skipped so the ascending walk advances to
+// the next-smallest queue instead of re-honoring the smallest one
+// every call (the documented small-rate-ascending waterfill intent).
+if queue_idx < 64 && (root.waterfill_honored_epoch_bits & (1u64 << queue_idx)) != 0 {
+    continue;
+}
+```
+
+With this, each Phase-1 honor advances the honored set by one queue; once
+every eligible exact queue is honored (or the budget is exhausted mid-walk),
+Phase 1 finds nothing to honor and falls through to Phase 2, which serves
+the residual to the larger queues (descending) skipping the same honored
+set. The bitset is the single source of truth for "honored this epoch,"
+read by BOTH phases, cleared at the next epoch's refill. This makes the
+two-phase ascending-Phase1 / descending-Phase2 algorithm match the
+documented waterfill contract (`docs/fairness-regimes.md`).
+
+Queues at `queue_idx >= 64` are NOT skipped (the guard is conservative):
+they remain honor-eligible every call, identical to today's behavior for
+the un-tracked range. See §4.4 for the cap disposition.
+
 **(d) Phase-2 reads the persistent bitset.** Phase 2 (`:960-1069`) currently
 references the dead local `honored_mask` at `:985`. Replace the Phase-2
 length/index references to the cloned `sorted_indices` with
@@ -178,16 +217,60 @@ body the reads are sequenced before the `&mut` borrow on every iteration —
 exactly the discipline the existing code already uses for the telemetry
 `root` field writes at `:933` and `:944`.
 
-### 4.3 No semantic change to honored-within-a-single-call
+### 4.3 Semantic change (intended) and what does NOT change
 
-In the old code, Phase 1 set the local bit at `:942` and returned at `:954`
-on a honor — so the only time Phase 2 ran in the *same* call was after a
-Phase-1 break (`:935`) with **zero** honors that call (`honored_mask` still
-0). Under the new code, the same single-call path sees
-`waterfill_honored_epoch_bits` carrying the honors from *prior* calls this
-epoch — which is the entire point and the documented-correct behavior. There
-is no call in which the old local mask carried information the new persistent
-field doesn't; the persistent field is a strict superset.
+**Intended change (the fix):** within an epoch, each exact queue is honored
+in Phase 1 **at most once** (via (c′)). Previously the smallest queue was
+re-honored on every call until the budget ran out. Now the Phase-1 budget is
+distributed across the ascending queues, one honor each, smallest-first —
+the documented waterfill behavior. Phase-2 residual then reaches the larger
+queues (skipping the honored small ones) instead of re-serving the small
+ones. **This is the exact-class distribution change that mandates the #1217
+CoV gate.**
+
+**What does NOT change:** the Phase-1 honor ORDER (still ascending,
+smallest-first); the budget refill math (`quantum_sum × fraction`); the
+per-honor `phase1_cost` decrement; the token/lease gates; parking;
+`exact_guarantee_rr` advance; all `waterfill_counters` increment sites; the
+Phase-2 descending cursor arithmetic. Only the honored-set source (local →
+persistent) and the addition of the Phase-1 skip change behavior.
+
+### 4.4 The `<64` exact-queue cap disposition (round-1 finding — Codex + AGY)
+
+Both round-1 reviewers flagged that a *persistent* honored set makes the
+silent `queue_idx < 64` guard load-bearing: a queue at Vec-index ≥64 is
+never marked, so it is skipped by neither phase and could be double-serviced
+relative to the intended at-most-once contract.
+
+**Disposition for THIS PR (isolated #2 fix):**
+
+- The `<64` guard is **pre-existing** (`:941`, `:985`) and the prior local
+  mask had identical silent-cap semantics. This fix does not *regress*
+  idx≥64 behavior — such a queue is honor-eligible every call in both old
+  and new code (the old code had NO Phase-1 skip at all, so EVERY queue,
+  including <64, was re-honorable; the new code restricts <64 queues to
+  at-most-once and leaves ≥64 queues at the old every-call behavior).
+- `queue_idx` is the index into `root.queues`, i.e. the **count of
+  configured CoS queues** (forwarding classes) on the interface — not the
+  Junos `queue_id` (which the schema allows 0..255 and which is a *separate*
+  lookup). Reaching 64 *distinct exact guarantee-rate forwarding classes on
+  one interface* is far outside any realistic Junos CoS config (Junos
+  hardware queues are conventionally 0..7).
+- **Defensive guard added by this PR:** a `debug_assert!(ascending_len <=
+  64, ...)` at the top of the selector documenting the invariant (stripped
+  in release, fires in test/CI if a fixture ever exceeds it), plus a doc
+  comment on the new field. This surfaces the cap to developers without
+  adding a hot-path branch or a control-plane reject.
+- **Hard config-reject is explicitly OUT OF SCOPE / deferred.** It mirrors
+  #1731 §4.3 item #3 (the 32-worker hard-reject), which the #1731 plan
+  scoped as a *separate* sub-issue (#1733, in flight on a sibling worktree)
+  precisely because a commit-check reject is a Go control-plane change with
+  its own test surface. Folding a >64-exact-queue commit-check into this
+  isolated Rust hot-path fix would be scope-creep. If reviewers insist the
+  cap MUST be surfaced to the operator in this PR, the cheapest in-scope
+  option is to log a one-time warning at `build_cos_interface_runtime` when
+  the exact-queue count exceeds 64; this PR proposes the `debug_assert` +
+  doc as sufficient for the isolated fix and invites reviewers to rule.
 
 ## 5. Public API preservation
 
@@ -230,7 +313,7 @@ field doesn't; the persistent field is a strict superset.
 
 | Class | Level | Notes |
 |-------|-------|-------|
-| Behavioral regression | **MED** | Phase-2 distribution genuinely changes (the point). Bounded by the #1217 CoV gate + a new distribution unit test. Phase-1 honor order unchanged; only the residual walk corrects. |
+| Behavioral regression | **MED-HIGH** | BOTH phases' distribution genuinely changes (the point): Phase 1 now honors each queue at most once per epoch (was: re-honor smallest every call), and Phase 2 skips the persistent honored set. Bounded by the #1217 CoV gate + the new distribution unit test. Phase-1 honor ORDER (ascending) and the budget math are unchanged. |
 | Lifetime / borrow-checker | **LOW** | Index-copy-before-`&mut` is the existing discipline; the clone only ever masked this borrow conflict. Build proves it. |
 | Performance regression | **LOW** | Strictly removes an alloc; adds two `u64` field accesses (a bit-or and a masked test) that replace the local-mask ops 1:1. No new per-iteration cost. |
 | Architectural mismatch (#961 / #946-P2) | **LOW** | Not an architecture change; an incremental field add + alloc removal on an existing, tested selector. The #1731 plan (3-reviewer PLAN-READY) ranks this the lowest-risk sub-issue. |
@@ -274,9 +357,26 @@ field doesn't; the persistent field is a strict superset.
 - #1731 items #1 (generalize MQFQ to non-exact), #3 (32-worker cap), #4
   (FQ-CoDel), #5 (now_ns refresh), #6 (bucket telemetry) — separate
   sub-issues. #1733 (equal-flow worker cap) is in flight on a sibling
-  worktree; no file overlap with this change beyond the shared CoS module
-  tree (this PR touches only `queue_service/mod.rs`, `types/cos.rs`,
-  `builders.rs`, `queue_service/tests.rs`).
+  worktree.
+- A hard config-reject for >64 exact guarantee-rate queues on one interface
+  — deferred (§4.4), mirroring #1731 §4.3's separate-sub-issue scoping of
+  the analogous 32-worker reject.
+
+**Files this PR touches** (round-1 Codex Finding-2: a non-`Default`
+`CoSInterfaceRuntime` field also requires updating explicit struct literals
+in the worker CoS tests):
+
+- `userspace-dp/src/afxdp/types/cos.rs` — new field.
+- `userspace-dp/src/afxdp/cos/builders.rs` — init `= 0`.
+- `userspace-dp/src/afxdp/cos/queue_service/mod.rs` — selector rewrite.
+- `userspace-dp/src/afxdp/cos/queue_service/tests.rs` — distribution test +
+  any local `CoSInterfaceRuntime { .. }` literals.
+- `userspace-dp/src/afxdp/worker/cos/tests.rs` — 7 explicit
+  `CoSInterfaceRuntime { .. }` literals (Codex cited lines 176, 348, 582,
+  866, 1066, 1268, 2347) gain `waterfill_honored_epoch_bits: 0`.
+- Any other explicit `CoSInterfaceRuntime { .. }` literal the build surfaces
+  (the implementation will grep `CoSInterfaceRuntime {` across the tree and
+  update every site; the build is the backstop).
 - #1735 (MQFQ generalize) will build on this; keep the field naming and
   epoch-clear placement cohesive with that follow-up (the honored bitset is
   exact-only today; the generalize work may extend the eligible set but does
@@ -320,3 +420,42 @@ field doesn't; the persistent field is a strict superset.
    local mask had the same silent cap; the fix preserves it. Reviewers may
    argue the cap should be surfaced — but that is arguably out-of-scope
    scope-creep for this isolated fix.)
+
+## 11. Round-1 adversarial review findings (folded into v2)
+
+Three reviewers ran on plan v1 (`b1b3581e`). Codex (PLAN-NEEDS-MAJOR) and
+AGY (PLAN-NEEDS-MAJOR) converged independently on the same FATAL gap;
+Claude-SMR concurred. All folded:
+
+- **F1 (FATAL — Codex + AGY + Claude-SMR): Phase 1 must also skip honored
+  queues.** v1 only had Phase 2 read the persistent set. Because Phase 1
+  restarts at the smallest queue and returns on honor, the smallest queue
+  would be re-honored every call and monopolize the budget — the exact skew
+  the issue reports. v1 would NOT have fixed the headline bug. **Folded:**
+  §4.2 (c′) adds the at-most-once Phase-1 skip; the bitset is now the SSOT
+  read by both phases. §4.3 documents the (intended) Phase-1 semantic change.
+- **F2 (MAJOR — Codex): incomplete file scope.** A non-`Default`
+  `CoSInterfaceRuntime` field needs 7 explicit struct-literal updates in
+  `worker/cos/tests.rs` (and any others the build surfaces). **Folded:** §9
+  file list corrected; implementation greps `CoSInterfaceRuntime {`.
+- **F3 (MAJOR — Codex + AGY): the `<64` silent cap becomes load-bearing.**
+  **Folded:** §4.4 — disposition is `debug_assert` + doc for the isolated
+  fix; hard config-reject deferred to a separate sub-issue (mirroring how
+  #1731 §4.3 scopes the analogous 32-worker reject as its own item).
+  Reviewers invited to rule whether a one-time build-time warning is
+  required in-scope.
+- **Borrow-checker (Codex + AGY both): the index-loop compiles under NLL** as
+  described (index-copy-before-`&mut`). AGY confirmed by building a patched
+  artifact (its edits were review-only scaffolding and have been reverted;
+  the worktree is clean — the implementation will be written fresh per this
+  plan). Codex confirmed by static read.
+- **Distribution / HA (Codex): no huge-queue starvation, no HA-sync need.**
+  Phase-2 cursor resets to 0 (largest) at refill; the fix redistributes
+  residual rather than starving. The bitset is within-epoch scheduler state,
+  not HA-synced (worker aggregation exports only `waterfill_epochs` /
+  `waterfill_phase1_budget_breaks`). No `make test-failover`.
+
+**Process note:** AGY wrote a full implementation into the worktree during
+its "review." Per project policy (AGY is review-only) those edits were
+reverted and the worktree verified clean; the implementation below is
+written from this plan, not adopted from AGY.
