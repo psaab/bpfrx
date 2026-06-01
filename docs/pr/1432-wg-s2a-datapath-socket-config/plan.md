@@ -1,24 +1,21 @@
 # #1432 / #1703 S2a — WireGuard datapath bring-up: engine instantiation + kernel-socket WG RX/TX (ESP precedent) + egress encap call site + runtime TunnelEndpoint hydration + Go DTO population + minimal config
 
-Status: **PLAN-READY v2 — round-1 adversarial review CONVERGED.** Codex
-(`wg-s2a-plan-r1-1780272812`) PLAN-NEEDS-MAJOR and AGY
-(`adversarial-review-mpugg9lm-mlr55n`) PLAN-NEEDS-MAJOR agreed on the SAME two
-blockers (WG RX ownership + engine-reload stability) plus identical minors.
-Claude-SMR (this thread) independently verified the code and found that **both
-reviewers' shared premise was over-stated**: a kernel `UdpSocket` on
-`wg_listen_port` CAN receive WG datagrams, because WG-to-firewall is
-local-destination UDP that the XDP shim already passes to the kernel via
-`cpumap_or_pass` — exactly the ESP/non-native-GRE precedent at
-`userspace-xdp/src/lib.rs:469-475`. v2 therefore adopts the **ESP-precedent
-kernel-socket RX model (Option A)** for S2a (lowest-risk, no shim change, RX
-works via a real socket, decap in the control thread), and DEFERS the
-AF_XDP-hot-path decap stage (Option B, which needs a shim steering change) to a
-post-S2 perf follow-up. This dissolves the RX-ownership blocker AND removes the
-`stage_wg_decap` hot-path gate + worker→control channel-flood concern entirely.
-The reload blocker is resolved via the `previous: Option<&ForwardingState>`
-engine-carry. See §11 (v2 convergence).
+Status: **PLAN-READY v3 — round-2 adversarial review CONVERGED.** Codex
+(`wg-s2a-plan-r2-1780273508`) PLAN-NEEDS-MAJOR and AGY
+(`adversarial-review-mpugvd7u-fp5fma`) PLAN-NEEDS-MINOR confirmed the v2 RX-model
+pivot (ESP precedent → kernel socket) and reload fix are sound, and converged on
+the SAME mandatory edit: the shim early-return MUST also require
+`is_local_destination` or it steals transit/DNAT UDP on the WG port and bypasses
+the policy engine. v3 folds that, plus Codex's catch that the inner-decap
+reinject path (`local_tunnel_deliveries`) is **kernel/TUN delivery, NOT the
+AF_XDP policy pipeline** — so v3 adopts the coherent **TUN model** (a `wgN` TUN
+netdev, kernel-routed both directions, the exact IPsec/GRE-local-origin
+precedent), plus AGY's operational hazards (`rp_filter` drops + kernel-WG port
+conflict). See §11 (convergence).
 
-Earlier: DRAFT v1 (commit 019e713f1) — pending adversarial plan review.
+Earlier: v2 (c841cdb29) round-1 CONVERGED PLAN-NEEDS-MAJOR (Codex+AGY) on two
+blockers — WG RX ownership + reload stability — both resolved; DRAFT v1
+(019e713f1).
 
 Issue: #1432 (re-scoped to #1703 S2). This PR is **S2a** — datapath + socket +
 config bring-up. **S2b** (live kernel-WG-on-VM interop test + smoke) is #1736,
@@ -57,17 +54,26 @@ datapath for **one tunnel**, initiator-capable, so that:
   steered to the kernel deterministically (mirroring the ESP/GRE local-delivery
   branches), then a real `UdpSocket` does both RX and TX. No hot-path decap
   stage and no worker→control channel in S2a.
-- **Egress encap**: forwarding decisions that target a WG tunnel endpoint encap
-  the inner IP via `wg_engine.try_encap(...)` on the AF_XDP TX copy path and emit
-  a UDP/WG outer datagram (the perf-relevant direction stays on the dataplane).
-- **Ingress decap**: WG transport records arrive on the control-thread socket;
-  the thread calls `wg_engine.try_decap(...)`, AllowedIPs-gates the inner src,
-  and re-injects the plaintext inner IP into the normal forwarding pipeline.
-  Pushing transport decap onto the AF_XDP hot path (`stage_wg_decap`) is the
-  Option-B perf optimization, **deferred to a post-S2 follow-up** — it requires
-  a shim steering change (WG-port → XSK instead of kernel) and brings the
-  channel/flood/gating complexity both reviewers flagged. S2a keeps RX on the
-  proven IPsec-style kernel-socket path.
+- **A `wgN` TUN netdev** is the inner interface (the IPsec/GRE-local-origin
+  precedent — `tunnel.rs:36 open_tun`). The kernel routes inner traffic to/from
+  it; xpf does not re-implement inner routing/policy in S2a.
+- **Egress encap**: inner IP packets the kernel routes to the `wgN` TUN are read
+  by the control thread, encapped via `wg_engine.try_encap(...)`, and sent on the
+  `UdpSocket`. Transit traffic the AF_XDP forwarding decision targets at the WG
+  tunnel endpoint also encaps at `frame/mod.rs:237` (a `mode=="wireguard"`
+  branch beside the GRE call) — both the transit and locally-originated egress
+  sites get the mode branch, mirroring how GRE wires both.
+- **Ingress decap**: WG transport records arrive on the control-thread
+  `UdpSocket` (kernel-delivered via `cpumap_or_pass`, §3.4); the thread calls
+  `wg_engine.try_decap(...)`, AllowedIPs-gates the inner src, and **writes the
+  plaintext inner IP to the `wgN` TUN** — the kernel then routes/firewalls it
+  (the same re-entry IPsec inner traffic uses via XFRM). This is **kernel/TUN
+  delivery, NOT the AF_XDP policy engine** (Codex r2): xpf policy on the decapped
+  inner is a later enhancement; the AllowedIPs gate is S2a's inner-src control.
+  Pushing transport decap onto the AF_XDP hot path (`stage_wg_decap`, with inner
+  traffic staying on the userspace policy engine) is the Option-B perf path,
+  **deferred to a post-S2 follow-up** — it needs a shim steering change (WG-port
+  → XSK) and the channel/gating complexity both reviewers flagged.
 
 S2a ends at **unit-tested wiring + a fast-path no-regress smoke**. The live
 kernel-WG interop proof is S2b (#1736).
@@ -245,14 +251,27 @@ tunnel-interface path so `buildTunnelEndpointSnapshots` can emit it.
 
 A new `coordinator` aux thread (one per WG endpoint, modeled on
 `spawn_local_tunnel_sources`), `wg_control_loop` in a new
-`coordinator/wg_control.rs`. **RX model RESOLVED (v2, both reviewers' blocker
-#1) via the ESP precedent (§3.4): the kernel delivers WG-port UDP to a real
-socket; the thread reads it directly. No worker→control channel in S2a.**
+`coordinator/wg_control.rs`. The thread owns three handles: the `WgEngine`
+(`Arc`), a `UdpSocket` (outer transport, RX+TX), and the `wgN` **TUN** (inner).
+**RX model RESOLVED (v2, both reviewers' blocker #1) via the ESP precedent
+(§3.4): the kernel delivers WG-port UDP to a real socket; the thread reads it
+directly. No worker→control packet channel in S2a.**
 
-- Bind `UdpSocket` to `:wg_listen_port` (v4 + v6). Set a read timeout; `recv_from`
-  in a poll loop with a stop flag. Because the shim early-return (§4.5) steers
-  WG-port UDP to `cpumap_or_pass` (kernel), this socket receives ALL inbound WG
-  datagrams — handshake AND transport.
+- Open the `wgN` TUN (`open_tun`, `slowpath.rs:349`), non-blocking. The Go side
+  must create + address + route the `wgN` netdev (networkd, like other tunnel
+  interfaces) so the kernel has an inner route via it.
+- Bind `UdpSocket` to `:wg_listen_port` (v4 + v6). If a host kernel WireGuard
+  interface already claims the port, the bind fails `EADDRINUSE` — surface a
+  clear error + counter; userspace-WG and kernel-WG on the same port are
+  mutually exclusive (AGY r2). Set a read timeout; poll with a stop flag.
+  Because the shim early-return (§4.5) steers WG-port **local-destination** UDP
+  to `cpumap_or_pass` (kernel), this socket receives ALL inbound WG datagrams —
+  handshake AND transport.
+- **TUN-read egress**: inner IP packets the kernel routes onto `wgN` are read
+  from the TUN, `try_encap`'d, and sent on the `UdpSocket` to the peer endpoint.
+  This is the locally-originated + kernel-routed egress (mirrors the GRE
+  local-origin TUN-read loop, `tunnel.rs:72-89`). The transit AF_XDP egress
+  (§4.4) is the other encap site.
 - **Inbound** datagram, dispatch on the WG type byte:
   - type 1 (initiation) → `engine.consume_initiation_create_response(msg, out)`
     → `socket.send_to(out, peer)` (the response). Promotes a responder session.
@@ -260,13 +279,12 @@ socket; the thread reads it directly. No worker→control channel in S2a.**
     initiator session.
   - type 3 (cookie) → drop + counter (S7).
   - type 4 (transport) → `engine.try_decap(record, scratch)` → AllowedIPs
-    inner-src gate (`allowed_ips.rs`) → **re-inject the plaintext inner IP into
-    forwarding** via the existing local-delivery reinject machinery
-    (`tx/dispatch/slow_path.rs` / `local_tunnel_deliveries`, the same channel
-    GRE/IPsec local-origination uses) so the inner packet runs normal policy +
-    routing. Decap is slow-path (control thread), NOT the AF_XDP hot path in
-    S2a; the perf-relevant direction is egress encap (§4.4), which stays on the
-    dataplane.
+    inner-src gate (`allowed_ips.rs`) → **write the plaintext inner IP to the
+    `wgN` TUN** (`tun.write_all`, the same fd `tunnel.rs:56` writes
+    `local_tunnel_deliveries` packets to). The kernel then routes/firewalls the
+    inner packet. Decap is slow-path (control thread), NOT the AF_XDP hot path;
+    inner traffic re-enters via the kernel (TUN), not the AF_XDP policy engine
+    (Codex r2). The perf-relevant transit egress stays on the dataplane (§4.4).
 - **Initiator bring-up**: if `wg_endpoint` is configured, on thread start (and
   on a coarse session-absent timer) call `engine.create_initiation(peer_pubkey,
   out)` + `socket.send_to(out, wg_endpoint)`. (Persistent-keepalive + REKEY
@@ -280,9 +298,15 @@ socket; the thread reads it directly. No worker→control channel in S2a.**
   preserved, §6). This is the ONLY worker→control coupling in S2a and it carries
   no packet data, just a debounced "please initiate" edge.
 
-### 4.4 Rust: egress encap call site (gated, fast-path-zero-cost)
+### 4.4 Rust: egress encap call sites (gated, fast-path-zero-cost)
 
-At `frame/mod.rs:237` (and the TSO + local-origination sites), replace the
+Two encap sites get the WG mode branch in S2a: the **transit copy path**
+(`frame/mod.rs:237`, for forwarded traffic) and the **TUN-read local-origin
+path** (`tunnel.rs:189`'s `encapsulate_native_gre_frame` call, reached only by
+the WG control thread's TUN read, §4.3). TSO is excluded (returns false for
+tunnels, `tx/dispatch/mod.rs:1026`), and the GRE coordinator local-origin
+spawner is GRE-only (`coordinator/mod.rs:342`) — the WG control thread is its
+own TUN-read loop, so no change there. At `frame/mod.rs:237` replace the
 unconditional GRE call with:
 
 ```rust
@@ -312,20 +336,25 @@ thread, §3.4/§4.3). Ingress WG is gated in two cheap places, both zero-cost fo
 non-WG traffic:
 
 1. **`userspace-xdp` shim early-return** (the §3.4 ESP-precedent steering): one
-   branch beside `:469 PROTO_ESP` / `:473 PROTO_GRE`:
+   branch beside `:469 PROTO_ESP` / `:473 PROTO_GRE`. **It MUST require
+   `is_local_destination` (both reviewers r2, mandatory)** — a port-only check
+   would steal transit/DNAT UDP that happens to use the WG port and shunt it to
+   the kernel, **bypassing the userspace policy engine** (a security/policy
+   bypass if host IP-forwarding is on):
    ```rust
-   if parsed.protocol == PROTO_UDP && ctrl.wg_rx && is_wg_listen_port(&parsed) {
+   if parsed.protocol == PROTO_UDP && ctrl.wg_rx
+       && is_local_destination(&parsed)        // MANDATORY — not transit
+       && is_wg_listen_port(&parsed) {
        return Ok(cpumap_or_pass(ctrl)); // WG → kernel → control-thread socket
    }
    ```
    `ctrl.wg_rx` is a per-CPU control flag (0 when no WG tunnel is configured →
    the branch is a single predicate the compiler folds away the body of); the
    port check reads the WG listen port from the control block. Non-WG UDP never
-   pays more than the `ctrl.wg_rx` test. (Carrying the listen port to the shim
-   reuses the existing `UserspaceCtrl` control-block plumbing; if that is too
-   invasive for S2a, fall back to `is_local_destination` already routing WG to
-   the kernel for the responder case — but the explicit early-return makes RX
-   deterministic regardless of local-address/session state and is preferred.)
+   pays more than the `ctrl.wg_rx` test. `is_local_destination` is the existing
+   `USERSPACE_LOCAL_V4/V6` check (`lib.rs:1211`) that already gates local
+   delivery (`lib.rs:532`) — reusing it keeps transit on the policy engine and
+   makes WG RX deterministic regardless of session state.
 2. **`has_wg_tunnels: bool` on `ForwardingState`** — any userspace path that
    would consult WG state short-circuits on this single bool when false. No
    `FastSet<u16>` probe on the per-packet UDP path (round-1 reviewers'
@@ -390,6 +419,9 @@ path pays only the `ctrl.wg_rx` predicate (0 when no WG configured).
 | Architectural mismatch (#961/#946-P2) | **LOW** | Aux-thread + egress-encap-branch + kernel-socket-RX templates all already exist (GRE local-origination, ESP/IKE). Composition, not new architecture. |
 | WG RX delivery (kernel socket vs AF_XDP) | **LOW** | RESOLVED §3.4 — WG-to-firewall is local-destination UDP, passed to kernel via `cpumap_or_pass` (ESP precedent `lib.rs:469`); kernel socket receives it. Shim early-return makes it deterministic. |
 | UMEM integration on encap | **MED** | WG outer adds `WG_OVERHEAD_V4=60`/`V6=80` (`mod.rs:138-141`) + ≤15 B pad. `try_encap` bound-checks before side effects (`engine.rs:627-633`). The copy path sizes the UMEM frame for `inner + WG_OVERHEAD`; a non-TCP inner exceeding `MTU - WG_OVERHEAD` is an explicit drop + `wg_mtu_drops` (no userspace reassembly), NOT a descriptor overflow. |
+| Kernel `rp_filter` silent drop (AGY r2) | **MED** | WG outer datagrams pass to the kernel; if strict `rp_filter` is on and the kernel routing table (userspace-managed by xpf/FRR) lacks a route back to the peer's public IP, the kernel silently drops inbound WG. Runbook (§8) must set `net.ipv4.conf.<wan>.rp_filter=0/2` or ensure a kernel route to the peer exists. The `wgN` TUN gives the kernel an inner route; the outer-peer route is the gap. |
+| Transit/DNAT UDP-on-WG-port policy bypass (both r2, RESOLVED) | **LOW** | The shim early-return requires `is_local_destination` (§4.5) so only WG-to-firewall is shunted to the kernel; transit stays on the policy engine. Test `shim_transit_udp_on_wg_port_stays_on_dataplane`. |
+| Kernel-WG port conflict (AGY r2) | **LOW** | `UdpSocket` bind fails `EADDRINUSE` if a kernel `wgX` claims the port; surfaced as a clear error + counter; userspace-WG and kernel-WG on the same port are mutually exclusive (documented). |
 
 ## 8. Test plan
 
@@ -413,8 +445,11 @@ path pays only the `ctrl.wg_rx` predicate (0 when no WG configured).
     `MTU - WG_OVERHEAD` is dropped + `wg_mtu_drops` incremented, UMEM frame
     untouched.
   - `shim_steers_wg_listen_port_to_kernel` — the `userspace-xdp` early-return
-    returns `cpumap_or_pass` for `UDP/listen_port` and is inert
-    (`ctrl.wg_rx == 0`) otherwise.
+    returns `cpumap_or_pass` for **local-destination** `UDP/listen_port` and is
+    inert (`ctrl.wg_rx == 0`) otherwise.
+  - `shim_transit_udp_on_wg_port_stays_on_dataplane` — a TRANSIT (non-local-dst)
+    UDP packet on `wg_listen_port` is NOT shunted to the kernel (the
+    `is_local_destination` guard, §4.5) — it stays on the XSK/policy path.
   - Go: `buildTunnelEndpointSnapshots` populates `Wg*` for a `mode=wireguard`
     tunnel; `mode=gre` unchanged.
   - Go: privkey not serialized into the state snapshot.
@@ -427,6 +462,12 @@ path pays only the `ctrl.wg_rx` predicate (0 when no WG configured).
   Pass B CoS-enabled per-class 5201-5206. **Required: best-effort + per-class
   numbers identical to a no-WG baseline (0 retrans, line rate on the multi-
   stream reverse).** This is the #1183/#1545 fast-path guard.
+- **Deploy/runbook note (AGY r2):** WG outer datagrams transit the kernel; the
+  deploy must ensure inbound WG is not `rp_filter`-dropped — set
+  `net.ipv4.conf.<wan>.rp_filter` to 0 (off) or 2 (loose), or ensure the kernel
+  routing table has a route to the peer's public IP. (Carried into the S2b
+  live-interop runbook, #1736.) Also: the WG `listen-port` must not collide with
+  a host kernel `wgX` interface (bind `EADDRINUSE`).
 - `make audit-check`.
 - `make test-failover` only if S2a touches HA/bringup. **Assertion: it does
   NOT** — single-tunnel S2a adds a WG endpoint + aux thread but does not change
@@ -464,12 +505,12 @@ S8 HA migration; post-S2 perf benchmarking.
 6. **S2a/S2b split soundness.** RESOLVED: sound (Codex finding 3, AGY). S2a lands
    ONLY as gated wiring + no-regress smoke; it is NOT advertised as "WG works"
    until S2b's live interop passes. The plan and PR will state this explicitly.
-7. **Encap sites.** RESOLVED: only `frame/mod.rs:237` is needed for S2a. TSO is
-   not live for tunnels (`tx/dispatch/mod.rs:1026` returns false when
-   `tunnel_endpoint_id != 0`; `tx/tcp_segmentation.rs:21` returns `None`), and
-   local-origination spawning is GRE-only (`coordinator/mod.rs:342`). The TSO +
-   local-origination sites return a non-breaking unsupported-outcome in S2a and
-   wire later (Codex finding 6).
+7. **Encap sites.** RESOLVED: S2a wires the transit copy path
+   (`frame/mod.rs:237`) and the WG control thread's own TUN-read egress (§4.3,
+   reusing the `tunnel.rs:189` encap with a mode branch). TSO is not live for
+   tunnels (`tx/dispatch/mod.rs:1026` returns false; `tx/tcp_segmentation.rs:21`
+   returns `None`), and the GRE coordinator local-origin spawner stays GRE-only
+   (`coordinator/mod.rs:342`). (Codex r1 finding 6 / r2.)
 
 ## 11. v2 convergence (round 1)
 
@@ -494,6 +535,41 @@ S8 HA migration; post-S2 perf benchmarking.
   blocker #1 into a one-line shim early-return rather than a full AF_XDP demux
   redesign. Both blockers are resolved in v2 (§3.4, §4.2, §4.3, §4.5).
 
-All round-1 findings folded. v2 is cleared to implement pending a confirming
-re-review (the RX-model pivot is material enough to warrant one round-2 pass
-from Codex + AGY before code lands).
+All round-1 findings folded.
+
+## 11b. v3 convergence (round 2 — confirming the RX-model pivot)
+
+- **Codex** (`wg-s2a-plan-r2-1780273508`): **PLAN-NEEDS-MAJOR.** Confirmed the
+  ESP-precedent RX claim, the reload fix, and egress placement as sound. Two NEW
+  majors v2 introduced: (1) the shim early-return was too broad — port-only
+  steering steals transit/DNAT UDP on the WG port and shunts it to the kernel,
+  bypassing policy; must require `is_local_destination`. (2) The decap reinject
+  via `local_tunnel_deliveries` writes to a **TUN fd** (`tunnel.rs:52`,
+  kernel delivery), NOT the AF_XDP policy pipeline — v2's "runs normal policy"
+  claim was wrong; needs an explicit kernel-TUN-delivery scoping or a real
+  control→forwarding injection design. Minor: stale "TSO + local-origination"
+  parenthetical.
+- **AGY** (`adversarial-review-mpugvd7u-fp5fma`): **PLAN-NEEDS-MINOR.** Same
+  mandatory edit (shim must require `is_local_destination` — flagged as a
+  security/policy-bypass CAUTION). Plus two operational hazards: kernel
+  `rp_filter` silently drops inbound WG when the userspace-managed kernel
+  routing table lacks a route to the peer's public IP (runbook `sysctl` note);
+  and `EADDRINUSE` if a kernel `wgX` claims the port. Confirmed reload, egress
+  zero-cost, NoSession atomic, and the S2a/S2b split as sound.
+- **Claude-SMR** (this thread): verified Codex's TUN finding (`tunnel.rs:36
+  open_tun`, `:56 tun.write_all`) — the `local_tunnel_deliveries` path IS the
+  TUN, so v3 adopts the coherent **`wgN` TUN model** end-to-end (kernel-routed
+  inner both directions, control thread owns UdpSocket + TUN + engine), the
+  exact IPsec/GRE-local-origin precedent. This makes Codex's blocker #2 a
+  deliberate, honest design choice (inner re-enters via the kernel, not the
+  AF_XDP policy engine; AllowedIPs is the S2a inner-src control) rather than a
+  defect, and resolves both r2 majors.
+
+v3 folds: the mandatory `is_local_destination` shim guard (§4.5), the explicit
+TUN model (§1, §3.4, §4.3), the `rp_filter` + port-conflict hazards (§7, §8),
+and the encap-sites cleanup (§4.4, §10.7). Codex (the stricter r2 verdict) had
+two majors, both resolved by the TUN-model adoption + the shim guard; AGY's r2
+was already NEEDS-MINOR. v3 is **cleared to implement.** A short round-3
+confirming pass is optional (the changes are folds of the reviewers' own
+prescribed fixes, not a new architecture); will dispatch one to close the loop
+before code lands.
