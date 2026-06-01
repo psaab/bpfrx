@@ -553,9 +553,11 @@ func validateClassOfServiceStrict(cos *ClassOfServiceConfig) error {
 // fairness is NOT enforced above this worker count in release builds
 // (the only guard in the dataplane is a `debug_assert`, stripped in
 // release). Rather than accept a config the dataplane will silently
-// fail-open on, reject it loudly at commit (validateEqualFlowWorkerCapStrict)
-// and strip equal-flow on legacy load/sync
-// (configstore.rewriteEqualFlowOverWorkerCap).
+// fail-open on, reject it loudly at commit
+// (validateEqualFlowWorkerCapStrict) and, on the tolerant load / peer-sync
+// paths, downgrade the same check to a warning so an already-persisted
+// legacy config still boots (CompileConfigLenient /
+// configstore.Store.compileTreeLenient).
 //
 // Removing this cap entirely (reusable heap scratch in the v8 rotation)
 // is tracked as #1731-e; this Go constant and the Rust MAX_WORKERS_SCRATCH
