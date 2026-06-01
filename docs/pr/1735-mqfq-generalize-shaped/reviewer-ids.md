@@ -10,9 +10,9 @@ lose Codex session state).
 - Claude-SMR: in-conversation (this agent)
 
 ## Code review
-- Codex: <pending>
-- AGY: <pending>
-- Copilot: <pending>
+- Codex: task-mpujl4vn-yt2an6
+- AGY: adversarial-review-mpujlac9-54uf0b
+- Copilot: requested on PR #1740
 
 ## Plan-review outcome (converged DESIGN-READY)
 - Codex r1 (task-mpuie4sw-l40kxh): PLAN-KILL on Q2 fragility → all findings folded into v2.
