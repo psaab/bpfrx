@@ -1,6 +1,11 @@
 # Plan v1 — CoS waterfill: anchor Phase-1 budget to shaped cap + stable honor charge + time refresh (#1743)
 
-**Status: DRAFT v1 — pending adversarial plan review**
+**Status: PLAN-READY v2 — Codex PLAN-NEEDS-MINOR (addressed), AGY PLAN-READY, Claude-SMR PLAN-READY**
+
+v2 changes vs v1: corrected fixture math (10 exact classes,
+quantum_sum=2,651,076 B → ×0.7=1,855,753 B, ratio 4.24×); added
+undersubscribed shaped-root unit test; added RISK-1 zero-budget
+mitigation (Hunk A clamps pass1 ≥ QUANTUM_MIN when frac > 0).
 
 ## §1 Issue framing
 
@@ -68,11 +73,13 @@ if root.waterfill_pass1_remaining_bytes == 0 {
     ...
 }
 ```
-For the smoke fixture (Σ R_i = 109 Gbps over 11 classes, shaper
-25 Gbps, fraction 0.7): `quantum_sum × frac ≈ 1.91 MB` vs the
-shaper-delivered `cap × frac = 25e9/8 × 200µs × 0.7 = 437.5 KB`.
-Phase-1 budget is ~4.24× the bytes the root can deliver per epoch
-→ Phase-1 honors EVERY class → Phase-2 never reached. **CONFIRMED.**
+For the smoke fixture (10 exact classes 100m..24g, Σ R_i = 109
+Gbps, shaper 25 Gbps, fraction 0.7): with the 512 KiB quantum clamp
+`quantum_sum = 2,651,076 B`, so legacy `quantum_sum × frac =
+1,855,753 B` vs the shaper-delivered `cap × frac = 25e9/8 × 200µs ×
+0.7 = 437,500 B`. Phase-1 budget is 1,855,753/437,500 = **4.24×**
+the bytes the root can deliver per epoch → Phase-1 honors EVERY
+class → Phase-2 never reached. **CONFIRMED.**
 
 ### Point 2 — Phase-1 honor undercharged (mod.rs:941-945, :956, :975-976, :1023-1025)
 ```rust
@@ -133,7 +140,14 @@ let pass1 = if root.shaping_rate_bytes == 0 {
 } else {
     let cap_per_epoch = ((root.shaping_rate_bytes as u128)
         * (COS_GUARANTEE_VISIT_NS as u128) / 1_000_000_000u128) as u64;
-    ((cap_per_epoch as f64) * frac).floor() as u64
+    let raw = ((cap_per_epoch as f64) * frac).floor() as u64;
+    // AGY RISK-1: a tiny-positive fraction floors pass1 to 0, which
+    // makes `exhausted` true on every selector call → refill +
+    // cursor-reset thrash → Phase-2 starves from index 0. Since the
+    // dispatch gate already requires frac > 0, clamp pass1 to at
+    // least one min-quantum so at least the smallest class is
+    // honorable and the exhausted path can't fire every call.
+    raw.max(COS_GUARANTEE_QUANTUM_MIN_BYTES)
 };
 ```
 (`root.shaping_rate_bytes` is bytes/s — same unit
@@ -242,6 +256,11 @@ untouched.
     (Hunk C — honored bits cleared on timed refresh)
   - `waterfill_phase2_cursor_only_resets_on_exhausted_path`
     (cursor preservation invariant)
+  - `waterfill_pass1_undersubscribed_shaper_honors_all_classes`
+    (Codex r1 #6 — shaper > Σ R_i: pass1 ≥ quantum_sum, all classes
+    honorable in Phase-1, no spurious Phase-2 push)
+  - `waterfill_pass1_tiny_fraction_clamped_to_min_quantum`
+    (AGY RISK-1 — frac→0 floor does not zero pass1)
 - Existing waterfill + worker CoS test literals updated for the
   new field.
 - 5/5 flake on the most-affected new test.
