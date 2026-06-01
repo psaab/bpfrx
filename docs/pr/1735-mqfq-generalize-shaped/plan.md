@@ -1,7 +1,10 @@
 # Plan of Action — #1735 (#1731-d): generalize per-flow MQFQ to all shaped queues
 
 - **Status**: v2 — folds Codex round-1 PLAN-KILL findings (task-mpuie4sw-l40kxh). Pending re-review (Codex + AGY + Claude-SMR)
-- **Issue**: #1735 (sub-issue of #1731; subsumes #7)
+- **Issue**: #1735 (sub-issue of #1731; folds in the #1731 research
+  plan's finding #7 — residual queue-level → flow-level. NOTE: "#7" is
+  the research-plan finding index, NOT GitHub issue #7, which is an
+  unrelated, already-closed SNAT egress-source bug.)
 - **Base**: master `7eaec5a2a` (includes #1732 `waterfill_honored_epoch_bits` @ PR #1737, and #1733/#1734)
 - **Research plan (DESIGN-READY, fully specified)**: `docs/research/1731-cos-mqfq-generalize/plan.md` §4.1 (on branch `research/1731-cos-mqfq-generalize`, commit `34112deee`)
 - **Reviewer ledger**: `docs/pr/1735-mqfq-generalize-shaped/reviewer-ids.md`
@@ -374,8 +377,10 @@ the same worker thread.
 `surplus_deficit` DWRR ACROSS queues. Once a selected non-exact queue is
 flow-fair, `cos_queue_front` / `cos_queue_pop_front` (via
 `build_cos_batch_from_queue`) pop in MQFQ order INSIDE it. Inter-queue
-DWRR + intra-queue MQFQ falls out of existing dispatch. **#7 (residual
-queue-level → flow-level) closes for free** — no separate work.
+DWRR + intra-queue MQFQ falls out of existing dispatch. **The #1731
+research plan's finding #7 (residual queue-level → flow-level) folds in
+for free** — no separate work. (Research-plan finding index, NOT GitHub
+issue #7, which is an unrelated SNAT bug.)
 
 ### 4.6 Exact rate caps preserved
 

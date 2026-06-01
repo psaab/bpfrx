@@ -72,7 +72,9 @@ mod.rs for further file-level breakdown.
   ~232 KB footprint. Surplus DWRR across queues + MQFQ inside the
   selected queue compose for free: `build_cos_batch_from_queue` already
   pops via `cos_queue_front`/`cos_queue_pop_front`, both dispatching on
-  `flow_fair()` (this also closes #7, residual queue-level → flow-level).
+  `flow_fair()`. This also folds in the residual/best-effort
+  queue-level → flow-level item from the #1731 research plan (its
+  finding #7; NOT GitHub issue #7, which is an unrelated SNAT bug).
 - Single-writer per FlowFairState. The owner worker that polls a
   binding is the same worker that owns the queue's
   `FlowFairState`; therefore `observed_bps` updates and reads do not

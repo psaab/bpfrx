@@ -1340,15 +1340,27 @@ fn best_effort_promotes_on_first_differing_flow_with_correct_migration() {
     cos_queue_push_back(queue, test_flow_cos_item(200, 1000));
     assert!(queue.flow_fair_state.is_some(), "second flow promotes");
     let ff = test_flow_fair_state(queue);
-    // Two distinct flows now tracked.
-    assert_eq!(ff.active_flow_buckets, 2, "A and B each in their own bucket");
-    // Migrated flow A bytes preserved + flow B bytes accounted, no loss.
+    // Collision-aware: the OS-seeded hash MAY (rarely) collide flow A and
+    // flow B into the same 4096-bucket slot. Derive the expected bucket
+    // layout from the ACTUAL runtime seed so the assertions are
+    // deterministic regardless of collision (Copilot review).
     let seed = ff.flow_hash_seed;
     let bucket_a = cos_flow_bucket_index(seed, Some(&test_session_key(100, 5201)));
     let bucket_b = cos_flow_bucket_index(seed, Some(&test_session_key(200, 5201)));
-    assert_ne!(bucket_a, bucket_b, "distinct flows hash to distinct buckets");
-    assert_eq!(ff.flow_bucket_bytes[bucket_a], total_a, "migrated A bytes intact");
-    assert_eq!(ff.flow_bucket_bytes[bucket_b], 1000, "B accounted once");
+    if bucket_a == bucket_b {
+        // Hash collision: both flows share one bucket. Bytes accumulate
+        // there; one active bucket. (Migration + accounting still correct.)
+        assert_eq!(ff.active_flow_buckets, 1, "collision: single shared bucket");
+        assert_eq!(
+            ff.flow_bucket_bytes[bucket_a],
+            total_a + 1000,
+            "collision: A+B bytes share the bucket, none lost"
+        );
+    } else {
+        assert_eq!(ff.active_flow_buckets, 2, "A and B each in their own bucket");
+        assert_eq!(ff.flow_bucket_bytes[bucket_a], total_a, "migrated A bytes intact");
+        assert_eq!(ff.flow_bucket_bytes[bucket_b], 1000, "B accounted once");
+    }
     // FIFO is drained into buckets; local_item_count nets to all 4 items.
     assert!(queue.hot.items.is_empty(), "FIFO emptied by migration");
     assert_eq!(queue.hot.local_item_count, 4, "no double-count / loss");
@@ -1369,16 +1381,26 @@ fn promoted_best_effort_pops_in_mqfq_interleave_not_fifo_bursts() {
     }
     cos_queue_push_back(queue, test_flow_cos_item(200, 1500)); // mouse B (promotes)
     assert!(queue.flow_fair());
-    // Pop everything; record the flow of each popped item by length-equal
-    // src_port reconstruction via the session key.
+    let seed = test_flow_fair_state(queue).flow_hash_seed;
+    let bucket_e = cos_flow_bucket_index(seed, Some(&test_session_key(100, 5201)));
+    let bucket_m = cos_flow_bucket_index(seed, Some(&test_session_key(200, 5201)));
+    // Pop everything; record the flow of each popped item by src_port.
     let mut order = Vec::new();
     while let Some(item) = cos_queue_pop_front(queue) {
         let port = cos_item_flow_key(&item).map(|k| k.src_port).unwrap_or(0);
         order.push(port);
     }
     assert_eq!(order.len(), 9);
-    // The mouse (200) must appear before the LAST elephant packet — a
-    // pure FIFO would put it dead last. MQFQ frontends it.
+    if bucket_e == bucket_m {
+        // Rare hash collision: both flows share one bucket, so MQFQ
+        // degenerates to FIFO within it and the mouse (enqueued last) is
+        // legitimately last. The cross-flow interleave property only
+        // applies to distinct buckets; nothing to assert here.
+        return;
+    }
+    // Distinct buckets: the mouse (200) must appear before the LAST
+    // elephant packet — a pure FIFO would put it dead last. MQFQ
+    // frontends it.
     let mouse_pos = order.iter().position(|&p| p == 200).unwrap();
     assert!(
         mouse_pos < order.len() - 1,
@@ -1406,24 +1428,37 @@ fn best_effort_elephant_vs_mice_per_flow_fairness() {
         cos_queue_push_back(queue, test_flow_cos_item(999, 1500)); // elephant
     }
     let ff = test_flow_fair_state(queue);
-    assert_eq!(ff.active_flow_buckets, 5, "4 mice + 1 elephant = 5 buckets");
+    // Collision-aware (Copilot review): with 4096 buckets the 5 flows
+    // MAY (rarely) collide. Derive the distinct-bucket set under the
+    // ACTUAL runtime seed and assert against THAT, so the test is
+    // deterministic regardless of collision. The fairness property —
+    // the first MQFQ round touches every DISTINCT bucket (no flow
+    // starved behind the elephant) — holds either way.
     let seed = ff.flow_hash_seed;
-    // Each mouse occupies exactly 1500 bytes in its bucket; the elephant
-    // 200*1500. Per-flow head-finish ordering means the first popped
-    // items rotate across the 5 flows rather than draining the elephant
-    // wholesale. Pop the first 5 and assert all 5 flows are represented
-    // (no starvation in the first round).
-    let mut seen = std::collections::HashSet::new();
-    for _ in 0..5 {
-        let item = cos_queue_pop_front(queue).expect("item");
-        seen.insert(cos_item_flow_key(&item).map(|k| k.src_port).unwrap_or(0));
+    let mut distinct_buckets = std::collections::HashSet::new();
+    for port in [301u16, 302, 303, 304, 999] {
+        distinct_buckets.insert(cos_flow_bucket_index(seed, Some(&test_session_key(port, 5201))));
     }
-    let _ = seed;
+    let n_buckets = distinct_buckets.len();
     assert_eq!(
-        seen.len(),
-        5,
-        "first MQFQ round must touch all 5 flows (no mouse starved); saw {:?}",
-        seen
+        usize::from(ff.active_flow_buckets),
+        n_buckets,
+        "active_flow_buckets must equal the distinct-bucket count under the seed"
+    );
+    // Pop the first `n_buckets` items and assert each touches a distinct
+    // bucket — the first MQFQ round visits every active flow's bucket
+    // rather than draining the elephant wholesale (no starvation).
+    let mut seen_buckets = std::collections::HashSet::new();
+    for _ in 0..n_buckets {
+        let item = cos_queue_pop_front(queue).expect("item");
+        let b = cos_flow_bucket_index(seed, cos_item_flow_key(&item));
+        seen_buckets.insert(b);
+    }
+    assert_eq!(
+        seen_buckets.len(),
+        n_buckets,
+        "first MQFQ round must touch every active bucket (no flow starved); saw {:?}",
+        seen_buckets
     );
 }
 
