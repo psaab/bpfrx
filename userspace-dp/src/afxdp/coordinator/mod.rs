@@ -9,6 +9,7 @@ mod refresh_bindings;
 mod session_manager;
 mod status;
 mod supervisor;
+mod wg_control;
 mod worker_manager;
 pub(crate) use bpf_maps::BpfMaps;
 pub(crate) use cos_state::SharedCoSState;
@@ -28,6 +29,9 @@ pub struct Coordinator {
     pub(crate) slow_path: Option<Arc<SlowPathReinjector>>,
     pub(crate) local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>>,
     pub(crate) tunnel_sources: BTreeMap<u16, LocalTunnelSourceHandle>,
+    /// #1432 S2a: WG control threads keyed by tunnel_endpoint_id. Same
+    /// stop/join handle shape as `tunnel_sources`.
+    pub(crate) wg_control_threads: BTreeMap<u16, LocalTunnelSourceHandle>,
     pub(crate) last_slow_path_status: SlowPathStatus,
     pub(in crate::afxdp) ha: HaState,
     pub(crate) cos: SharedCoSState,
@@ -66,6 +70,7 @@ impl Coordinator {
             slow_path: None,
             local_tunnel_deliveries: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             tunnel_sources: BTreeMap::new(),
+            wg_control_threads: BTreeMap::new(),
             last_slow_path_status: SlowPathStatus::default(),
             ha: HaState::new(),
             cos: SharedCoSState::new(),
@@ -217,6 +222,18 @@ impl Coordinator {
         self.tunnel_sources.clear();
         self.local_tunnel_deliveries
             .store(Arc::new(BTreeMap::new()));
+        // #1432 S2a: stop + join WG control threads. The persistent wgN
+        // TUN is owned by the Go control plane and intentionally NOT
+        // torn down here (it must survive a reload — AGY r3 Hazard B).
+        for handle in self.wg_control_threads.values_mut() {
+            handle.stop.store(true, Ordering::Relaxed);
+        }
+        for (_, handle) in self.wg_control_threads.iter_mut() {
+            if let Some(join) = handle.join.take() {
+                let _ = join.join();
+            }
+        }
+        self.wg_control_threads.clear();
         self.workers.stop_and_clear(
             self.bpf_maps.map_fd.as_ref(),
             self.bpf_maps.heartbeat_map_fd.as_ref(),
@@ -428,6 +445,80 @@ impl Coordinator {
         }
         self.local_tunnel_deliveries
             .store(Arc::new(local_tunnel_deliveries));
+    }
+
+    /// #1432 S2a: spawn one WG control thread per `mode == "wireguard"`
+    /// tunnel endpoint. Each thread owns the shared `Arc<WgEngine>` (from
+    /// `forwarding.wg_engines`), a `UdpSocket` bound on the WG listen
+    /// port, and the persistent `wgN` TUN. Modeled on
+    /// `spawn_local_tunnel_sources`.
+    fn spawn_wg_control_threads(&mut self) {
+        if !self.forwarding.has_wg_tunnels {
+            return;
+        }
+        for endpoint in self.forwarding.tunnel_endpoints.values() {
+            if endpoint.mode != "wireguard" {
+                continue;
+            }
+            let Some(engine) = self.forwarding.wg_engines.get(&endpoint.id).cloned() else {
+                continue;
+            };
+            let Some(tunnel_name) = self
+                .forwarding
+                .ifindex_to_name
+                .get(&endpoint.logical_ifindex)
+                .cloned()
+            else {
+                continue;
+            };
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_clone = stop.clone();
+            let recent_exceptions = self.recent_exceptions.clone();
+            let tunnel_endpoint_id = endpoint.id;
+            let listen_port = endpoint.wg_listen_port;
+            let peer_endpoint = endpoint.wg_endpoint;
+            let thread_tunnel_name = tunnel_name.clone();
+            let join = spawn_supervised_aux(
+                format!("xpf-wg-control-{tunnel_name}"),
+                move || {
+                    wg_control::wg_control_loop(
+                        thread_tunnel_name,
+                        tunnel_endpoint_id,
+                        engine,
+                        listen_port,
+                        peer_endpoint,
+                        recent_exceptions,
+                        stop_clone,
+                    );
+                },
+            );
+            match join {
+                Ok(join) => {
+                    self.wg_control_threads.insert(
+                        tunnel_endpoint_id,
+                        LocalTunnelSourceHandle {
+                            stop,
+                            join: Some(join),
+                        },
+                    );
+                }
+                Err(err) => {
+                    if let Ok(mut recent) = self.recent_exceptions.lock() {
+                        push_recent_exception(
+                            &mut recent,
+                            ExceptionStatus {
+                                timestamp: Utc::now(),
+                                interface: tunnel_name,
+                                reason: format!(
+                                    "spawn_wg_control_failed:{tunnel_endpoint_id}:{err}"
+                                ),
+                                ..ExceptionStatus::default()
+                            },
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Refresh fabric link info from updated snapshots. Called when the

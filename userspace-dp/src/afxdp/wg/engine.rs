@@ -307,7 +307,23 @@ pub(crate) struct WgEngine {
     /// reconcile; only peer REMOVAL touches both (we drain a
     /// dropped peer's sessions out of this map during reconcile).
     pub(in crate::afxdp::wg) sessions_by_local_index: RwLock<FxHashMap<u32, Arc<WgSession>>>,
+    /// Worker→control "please initiate a handshake" edge (#1432 S2a
+    /// §4.3). When an egress `try_encap` hits `NoSession`, the worker
+    /// records the current monotonic time here via a single relaxed
+    /// atomic compare-and-store, rate-limited to at most one edge per
+    /// `WG_HANDSHAKE_REQUEST_MIN_INTERVAL_NS`. The control thread polls
+    /// and consumes it. This is the ONLY worker→control coupling in S2a
+    /// and it carries no packet data — the worker never builds a
+    /// `HandshakeState` (control-thread-only crypto invariant, §6). `0`
+    /// means "no pending request".
+    pub(in crate::afxdp::wg) handshake_request_ns: std::sync::atomic::AtomicU64,
 }
+
+/// Minimum spacing between worker-driven "please initiate" edges
+/// (#1432 S2a). Bounds the NoSession signal under a packet flood to one
+/// edge per second so a stream of pre-handshake packets cannot spin the
+/// control thread.
+pub(crate) const WG_HANDSHAKE_REQUEST_MIN_INTERVAL_NS: u64 = 1_000_000_000;
 
 impl std::fmt::Debug for WgEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -336,9 +352,56 @@ impl WgEngine {
             table: ArcSwap::from_pointee(PeerTable::empty()),
             reconcile_lock: std::sync::Mutex::new(()),
             sessions_by_local_index: RwLock::new(FxHashMap::default()),
+            handshake_request_ns: std::sync::atomic::AtomicU64::new(0),
         };
         engine.reconcile_peers(&config.peers);
         engine
+    }
+
+    /// Worker side of the NoSession handshake-request edge (#1432 S2a
+    /// §4.3). Records a "please initiate" request at `now_ns`, rate-
+    /// limited to one edge per `WG_HANDSHAKE_REQUEST_MIN_INTERVAL_NS`.
+    /// Hot-path safe: a single relaxed load plus an at-most-one relaxed
+    /// store, no lock, no handshake state. Returns `true` if this call
+    /// recorded a fresh edge.
+    pub(crate) fn request_handshake(&self, now_ns: u64) -> bool {
+        use std::sync::atomic::Ordering;
+        let last = self.handshake_request_ns.load(Ordering::Relaxed);
+        if last != 0 && now_ns.saturating_sub(last) < WG_HANDSHAKE_REQUEST_MIN_INTERVAL_NS {
+            return false;
+        }
+        // Relaxed is sufficient: the control thread only needs eventual
+        // visibility of the edge, and a lost race merely defers the
+        // initiation by one poll tick (the next NoSession re-arms it).
+        self.handshake_request_ns.store(now_ns, Ordering::Relaxed);
+        true
+    }
+
+    /// Control side of the NoSession edge. Returns `true` if a handshake
+    /// request is pending and clears it. Slow path (control thread).
+    pub(crate) fn take_handshake_request(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.handshake_request_ns.swap(0, Ordering::Relaxed) != 0
+    }
+
+    /// The pubkey of the first (S2a: only) configured peer, if any.
+    /// Used by the control thread to drive initiator bring-up without
+    /// re-plumbing the peer config through the spawn site.
+    pub(crate) fn first_peer_pubkey(&self) -> Option<[u8; WG_KEY_LEN]> {
+        self.load_table().peers.first().map(|p| p.pubkey)
+    }
+
+    /// Whether the named peer currently has a confirmed (usable for
+    /// egress) transport session. Control thread uses this to decide
+    /// whether to (re-)initiate a handshake. Slow path.
+    pub(crate) fn peer_has_confirmed_session(&self, pubkey: &[u8; 32]) -> bool {
+        let Some(peer) = self.peer_arc(pubkey) else {
+            return false;
+        };
+        matches!(
+            peer.current.read().unwrap().as_ref(),
+            Some(session) if session.is_confirmed()
+        )
     }
 
     /// xpf's local static public key (X25519). The peer needs this to
