@@ -43,6 +43,11 @@ const userspaceCtrlFlagCPUMap = 1
 const userspaceCtrlFlagTrace = 2
 const userspaceCtrlFlagNativeGRE = 4
 const userspaceCtrlFlagStrict = 8
+
+// userspaceCtrlFlagWgRx (#1432 S2a) is set iff at least one WireGuard
+// tunnel is configured. The shim gates its per-packet WG steering branch
+// on this single bit so non-WG traffic never even loads wg_listen_port.
+const userspaceCtrlFlagWgRx = 16
 const bindingQueuesPerIface = 16 // must match BINDING_QUEUES_PER_IFACE in BPF
 
 const userspaceBindingReady = 1
@@ -139,13 +144,17 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 	if snapshotHasNativeGRE(snapshot) {
 		ctrlFlags |= userspaceCtrlFlagNativeGRE
 	}
+	wgPort := snapshotWgListenPort(snapshot)
+	if wgPort != 0 {
+		ctrlFlags |= userspaceCtrlFlagWgRx
+	}
 	ctrl := userspaceCtrlValue{
 		Enabled:            0,
 		MetadataVersion:    userspaceMetadataVersion,
 		Workers:            uint32(cfg.Workers),
 		QueueCount:         uint32(maxInt(cfg.Workers, 1)),
 		Flags:              ctrlFlags,
-		WgListenPort:       snapshotWgListenPort(snapshot),
+		WgListenPort:       wgPort,
 		ConfigGeneration:   0,
 		FIBGeneration:      0,
 		HeartbeatTimeoutMS: 30000,
@@ -282,6 +291,9 @@ func (m *Manager) blindFailClosedUserspaceCtrlLocked(
 		disabled.ConfigGeneration = snapshot.Generation
 		disabled.FIBGeneration = snapshot.FIBGeneration
 		disabled.WgListenPort = snapshotWgListenPort(snapshot)
+		if disabled.WgListenPort != 0 {
+			disabled.Flags |= userspaceCtrlFlagWgRx
+		}
 		if snapshotHasNativeGRE(snapshot) {
 			disabled.Flags |= userspaceCtrlFlagNativeGRE
 		}
@@ -332,6 +344,10 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 	if snapshotHasNativeGRE(m.lastSnapshot) {
 		ctrlFlags |= userspaceCtrlFlagNativeGRE
 	}
+	wgPort := snapshotWgListenPort(m.lastSnapshot)
+	if wgPort != 0 {
+		ctrlFlags |= userspaceCtrlFlagWgRx
+	}
 
 	zero := uint32(0)
 	ctrl := userspaceCtrlValue{
@@ -340,7 +356,7 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		Workers:            uint32(maxInt(status.Workers, 1)),
 		QueueCount:         uint32(queueCountFromBindings(status.Bindings)),
 		Flags:              ctrlFlags,
-		WgListenPort:       snapshotWgListenPort(m.lastSnapshot),
+		WgListenPort:       wgPort,
 		ConfigGeneration:   status.LastSnapshotGeneration,
 		FIBGeneration:      status.LastFIBGeneration,
 		HeartbeatTimeoutMS: 30000,
