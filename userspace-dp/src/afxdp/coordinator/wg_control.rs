@@ -223,12 +223,16 @@ pub(super) fn wg_control_loop(
         } else {
             // Responder-only peer that hasn't been heard from yet: drain
             // the TUN so the kernel does not back up, but we have no
-            // endpoint to send to until the peer initiates.
-            while let Ok(len) = tun.read(&mut tun_buf) {
-                if len == 0 {
-                    break;
+            // endpoint to send to until the peer initiates. Apply the same
+            // WG_RX_BURST bound used in the initiator path to prevent a
+            // TUN flood from starving the socket-read direction.
+            for _ in 0..WG_RX_BURST {
+                match tun.read(&mut tun_buf) {
+                    Ok(len) if len > 0 => {
+                        did_work = true;
+                    }
+                    _ => break,
                 }
-                did_work = true;
             }
         }
 

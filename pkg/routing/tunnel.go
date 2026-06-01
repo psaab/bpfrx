@@ -24,6 +24,7 @@ type linkOps interface {
 	LinkSetUp(netlink.Link) error
 	LinkSetDown(netlink.Link) error
 	LinkSetMaster(netlink.Link, netlink.Link) error
+	LinkSetMTU(netlink.Link, int) error
 	LinkList() ([]netlink.Link, error)
 	AddrAdd(netlink.Link, *netlink.Addr) error
 	AddrDel(netlink.Link, *netlink.Addr) error
@@ -350,6 +351,7 @@ func (t *tunnelManager) applyWireguardTunLocked(tc *config.TunnelConfig) error {
 	// dummy) must be deleted and recreated, not mutated — otherwise we'd
 	// bring up + address + VRF-bind the wrong device, and the Rust side's
 	// open_tun on the same name would then fail.
+	mustCreate := err != nil
 	if err == nil {
 		if _, isTun := link.(*netlink.Tuntap); !isTun {
 			slog.Info("replacing non-TUN link before wireguard tun create",
@@ -357,10 +359,10 @@ func (t *tunnelManager) applyWireguardTunLocked(tc *config.TunnelConfig) error {
 			if delErr := t.ops.LinkDel(link); delErr != nil {
 				return fmt.Errorf("replace non-tun wireguard link %s: %w", tc.Name, delErr)
 			}
-			err = fmt.Errorf("recreate") // fall into the create branch below
+			mustCreate = true
 		}
 	}
-	if err != nil {
+	if mustCreate {
 		// Create a persistent TUN. NonPersist:false keeps the netdev
 		// alive after the creating fd closes, so a reload that does not
 		// touch this device leaves it (and its routes) intact.
@@ -382,7 +384,7 @@ func (t *tunnelManager) applyWireguardTunLocked(tc *config.TunnelConfig) error {
 		// (AGY M4 / Copilot C4 — a stale MTU on reuse, including a
 		// pre-created device, would otherwise persist).
 		if link.Attrs().MTU != mtu {
-			if mtuErr := netlink.LinkSetMTU(link, mtu); mtuErr != nil {
+			if mtuErr := t.ops.LinkSetMTU(link, mtu); mtuErr != nil {
 				slog.Warn("failed to update wireguard tun mtu",
 					"name", tc.Name, "mtu", mtu, "err", mtuErr)
 			} else {

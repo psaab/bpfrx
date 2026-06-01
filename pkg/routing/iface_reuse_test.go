@@ -81,9 +81,10 @@ func (f *fakeLinkOps) LinkSetUp(l netlink.Link) error {
 	return nil
 }
 
-func (f *fakeLinkOps) LinkSetDown(l netlink.Link) error      { return nil }
-func (f *fakeLinkOps) LinkSetMaster(l, m netlink.Link) error { return nil }
-func (f *fakeLinkOps) LinkList() ([]netlink.Link, error)     { return nil, nil }
+func (f *fakeLinkOps) LinkSetDown(l netlink.Link) error        { return nil }
+func (f *fakeLinkOps) LinkSetMaster(l, m netlink.Link) error   { return nil }
+func (f *fakeLinkOps) LinkSetMTU(l netlink.Link, mtu int) error { return nil }
+func (f *fakeLinkOps) LinkList() ([]netlink.Link, error)       { return nil, nil }
 
 func (f *fakeLinkOps) AddrAdd(l netlink.Link, a *netlink.Addr) error {
 	_ = l.Attrs()
