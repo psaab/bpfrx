@@ -752,20 +752,30 @@ fn select_exact_cos_guarantee_queue_with_lease_telemetry(
 //
 // Per-call state (carried on `CoSInterfaceRuntime`):
 //   - `waterfill_pass1_remaining_bytes`: Phase 1 budget remaining
-//     in the current epoch. Initialized lazily to
-//     `(quantum_sum × guarantee_fraction).floor()` whenever it's
-//     zero on entry (one full epoch == one full ascending walk +
-//     one descending Phase 2 walk).
+//     in the current epoch. #1743: refilled to
+//     `(shaping_rate_bytes × COS_GUARANTEE_VISIT_NS / 1e9 ×
+//     guarantee_fraction)` for a SHAPED root (the documented
+//     "fraction × cap" contract), or the legacy
+//     `(quantum_sum × guarantee_fraction)` for a transparent
+//     (unshaped) root, clamped to ≥ one min-quantum. Refilled on
+//     EITHER the exhausted (`pass1 == 0`) path OR the time-based
+//     path (`elapsed ≥ COS_GUARANTEE_VISIT_NS`).
 //   - `waterfill_phase2_cursor`: where Phase 2's descending walk
 //     last stopped; lets the selector resume on subsequent calls.
+//     Reset to 0 ONLY on the exhausted refill path; the time-based
+//     refresh PRESERVES it (#1743 Hunk C).
+//   - `waterfill_epoch_start_ns`: timestamp of the last refill,
+//     drives the time-based refresh (#1743).
 //
 // Each call returns ONE queue selection. The selector first tries
-// Phase 1 (ascending walk; each selection decrements
-// `pass1_remaining` by the chosen queue's secondary_budget). When
-// Phase 1 has insufficient budget for the next ascending queue,
-// the selector enters Phase 2 (descending walk through queues
-// NOT honored in Phase 1). When Phase 2 exhausts, the epoch
-// resets and Phase 1 budget is refilled.
+// Phase 1 (ascending walk; each Phase-1 honor decrements
+// `pass1_remaining` by the chosen queue's STABLE configured
+// quantum `phase1_cost`, #1743 Hunk B — NOT the token-clamped
+// send budget). When Phase 1 has insufficient budget for the next
+// ascending queue, the selector enters Phase 2 (descending walk
+// through queues NOT honored in Phase 1; Phase 2 does NOT debit
+// `pass1`). When Phase 2 exhausts, the epoch resets and Phase 1
+// budget is refilled.
 //
 // AGY r2 #1's equal-rate starvation concern is bounded by
 // stable sort (queues with identical rates retain queue_id
@@ -808,7 +818,7 @@ fn select_exact_cos_guarantee_queue_waterfill(
         // dispatch gate also requires fraction > 0. We use f64 → u64
         // with a floor + saturating cast guarded by the multiplication.
         let frac = root.oversubscription_guarantee_fraction;
-        let pass1 = if root.shaping_rate_bytes == 0 {
+        let raw_pass1 = if root.shaping_rate_bytes == 0 {
             // Transparent (unshaped) root: there is no shaper-delivered
             // cap to anchor against, so fall back to the legacy
             // `quantum_sum × fraction` over the current eligible set.
@@ -832,14 +842,18 @@ fn select_exact_cos_guarantee_queue_waterfill(
             let cap_per_epoch = ((root.shaping_rate_bytes as u128)
                 * (COS_GUARANTEE_VISIT_NS as u128)
                 / 1_000_000_000u128) as u64;
-            let raw = ((cap_per_epoch as f64) * frac).floor() as u64;
-            // AGY RISK-1: a tiny-positive fraction floors `raw` to 0,
-            // which would make `exhausted` true on every selector call →
-            // refill + cursor-reset thrash → Phase-2 starves from index 0.
-            // Clamp to at least one min-quantum so the smallest class is
-            // honorable and the exhausted path can't fire every call.
-            raw.max(COS_GUARANTEE_QUANTUM_MIN_BYTES)
+            ((cap_per_epoch as f64) * frac).floor() as u64
         };
+        // AGY RISK-1 (Codex code-r1 #2): a tiny-positive fraction floors
+        // `raw_pass1` to 0 on EITHER branch — the dispatch gate admits any
+        // `fraction > 0`, including transparent + tiny-fraction. A zero
+        // budget makes `exhausted` true on every selector call → refill +
+        // cursor-reset thrash → Phase-2 starves from index 0. Clamp BOTH
+        // branches to at least one min-quantum so the smallest class is
+        // honorable and the exhausted path can't fire every call. (The
+        // clamp is a no-op for normal fractions where raw_pass1 already
+        // exceeds the smallest quantum.)
+        let pass1 = raw_pass1.max(COS_GUARANTEE_QUANTUM_MIN_BYTES);
         root.waterfill_pass1_remaining_bytes = pass1;
         root.waterfill_epoch_start_ns = now_ns;
         // #1732/#1743: clear the persistent honored bitset on EVERY refill

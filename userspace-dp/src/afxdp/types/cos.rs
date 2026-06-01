@@ -406,11 +406,14 @@ pub(in crate::afxdp) struct CoSInterfaceRuntime {
     pub(in crate::afxdp) exact_queues_by_rate_ascending: Vec<usize>,
     /// #1614 A1: Phase 1 byte budget remaining in the current
     /// service epoch (one RR cycle through the sorted vec).
-    /// Initialized to `(quantum_sum × guarantee_fraction).floor()`
-    /// at the start of each cycle. Decremented per successful
-    /// Phase 1 selection by the chosen queue's secondary_budget.
-    /// When it drops below the next-queue's quantum, the selector
-    /// switches to Phase 2 residual distribution.
+    /// #1743: refilled to `(shaping_rate_bytes × COS_GUARANTEE_VISIT_NS
+    /// / 1e9 × guarantee_fraction)` for a SHAPED root (the documented
+    /// "fraction × cap" contract) or the legacy `(quantum_sum ×
+    /// guarantee_fraction)` for a transparent root, clamped to ≥ one
+    /// min-quantum. Decremented per successful Phase 1 honor by the
+    /// chosen queue's STABLE configured quantum (`phase1_cost`, NOT the
+    /// token-clamped send budget). When it drops below the next queue's
+    /// quantum, the selector switches to Phase 2 residual distribution.
     pub(in crate::afxdp) waterfill_pass1_remaining_bytes: u64,
     /// #1614 A1: descending-rate cursor into the sorted vec for
     /// Phase 2 residual distribution. Tracks where in the

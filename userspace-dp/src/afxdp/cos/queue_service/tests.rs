@@ -2662,13 +2662,20 @@ fn waterfill_counters_budget_break_into_phase2() {
     // phase1_cost exceeds the remaining budget at mod.rs:906.
     let mut root = waterfill_guarantee_rate_root(0.0001);
     // #1743: use a TRANSPARENT root (shaping_rate_bytes == 0) so the
-    // Phase-1 budget takes the legacy `quantum_sum × fraction` path and a
-    // tiny fraction can genuinely floor it below the smallest quantum,
-    // forcing the break. The shaped path now clamps pass1 to at least one
-    // min-quantum (AGY RISK-1), so a shaped root can no longer produce a
-    // budget below the smallest phase1_cost — that anti-thrash clamp is
-    // verified separately in waterfill_pass1_tiny_fraction_clamped_to_min.
+    // Phase-1 budget takes the legacy `quantum_sum × fraction` path. The
+    // budget floors to 0 and the symmetric anti-thrash clamp (Codex r1 #2)
+    // raises it to one min-quantum (1500 B). To force the Phase-1 break we
+    // need every exact queue's quantum to EXCEED that clamped 1500 B floor,
+    // so bump the exact queues to 3 Gbps (quantum 75,000 B ≫ 1500). The
+    // clamped 1500 B budget is then below every quantum and Phase 1 breaks
+    // immediately into Phase 2. (The clamp itself is verified separately in
+    // waterfill_pass1_tiny_fraction_clamped_to_min_quantum.)
     root.shaping_rate_bytes = 0;
+    for q in &mut root.queues {
+        if q.config.exact {
+            q.config.transmit_rate_bytes = 3_000_000_000 / 8;
+        }
+    }
     let mut tel = CoSQueueLeaseAcquireTelemetry::default();
     let s = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
         .expect("phase-2 selection after budget break");
@@ -2805,11 +2812,18 @@ fn waterfill_pass1_refreshes_on_time_tick_clears_honored_bits() {
     // time-based path must refresh pass1 AND clear the persistent honored
     // bitset once `now_ns - epoch_start >= COS_GUARANTEE_VISIT_NS`, while
     // PRESERVING the Phase-2 cursor.
+    //
+    // Codex code-r1: use the DEFAULT 187,500,000 B/s shaper (cap_per_epoch
+    // == quantum_sum == 37,500 B) so at fraction 0.7 the budget is 26,250 B
+    // — enough to honor q0 (2,500) + q1 (10,000) in Phase 1 but NOT q2
+    // (25,000) — which forces a Phase-2 admit and advances the cursor to a
+    // NONZERO value. A 25 Gbps override here would budget 437,500 B, honor
+    // all three queues in Phase 1, never advance Phase 2, and leave the
+    // cursor at 0 — making the preservation assertion vacuous.
     let mut root = waterfill_three_unequal_exact_root(0.7);
-    root.shaping_rate_bytes = 25_000_000_000 / 8;
     let mut tel = CoSQueueLeaseAcquireTelemetry::default();
-    // Epoch 1 at t = 1ns: honor some small classes (sets honored bits) and
-    // advance the Phase-2 cursor.
+    // Epoch 1 at t = 1ns: honor q0+q1 (sets honored bits) and serve q2 in
+    // Phase 2 (advances the cursor to nonzero).
     for _ in 0..3 {
         let _ = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel);
     }
@@ -2818,6 +2832,11 @@ fn waterfill_pass1_refreshes_on_time_tick_clears_honored_bits() {
         "honored bits accumulate within epoch 1"
     );
     let cursor_after_epoch1 = root.waterfill_phase2_cursor;
+    assert_ne!(
+        cursor_after_epoch1, 0,
+        "epoch 1 must have advanced the Phase-2 cursor (a Phase-2 admit \
+         occurred) so the preservation assertion below is non-vacuous"
+    );
     let pass1_mid_epoch = root.waterfill_pass1_remaining_bytes;
     assert_ne!(pass1_mid_epoch, 0, "pass1 is non-zero mid-epoch (not exhausted)");
     let epochs_before = root.waterfill_epochs;
