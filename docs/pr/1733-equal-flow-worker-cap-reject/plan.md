@@ -1,12 +1,13 @@
 # Plan of Action — #1733 Phase 1: hard-reject `workers > 32` when equal-flow enforcement is enabled
 
-- **Status**: DRAFT v3 — round-2: AGY PLAN-READY; Codex flagged a
-  semantic-set-parity defect in the v2 AST-walk rewrite (false-strip on
-  `${node}`/split-stanza/group configs whose EFFECTIVE workers ≤32).
-  ADOPTED Codex's cleaner design: a **lenient compile mode** on
-  Load/SyncApply that downgrades ONLY this validator to a loud warning
-  (no AST mutation, effective workers computed once by the real compiler).
-  §5.2 rewritten; AGY's log-phrasing minor folded in as the warning text.
+- **Status**: PLAN-READY (v3, round-3 converged). Round-3 Codex + AGY both
+  flagged the SAME final item — read-only peer-display active-tree
+  re-compiles (`cli_show_interfaces.go`, `server_show_interfaces.go`) must
+  be lenient too — now fixed. AGY independently verified all other v3
+  points sound. Design history: v1 (accumulator-only) killed by the
+  Load/SyncApply blackout MAJOR; v2 (AST-walk rewrite) killed by Codex's
+  semantic-set-parity defect; v3 lenient-compile-mode adopted. Implemented
+  + tested; see §9 results.
 - **Issue**: #1733 (sub-issue of #1731; research plan
   `research/1731-cos-mqfq-generalize:docs/research/1731-cos-mqfq-generalize/plan.md` §4.3)
 - **Base**: master `c9e552689` (canary-green #1723 lineage; latest merge #1730)
@@ -289,6 +290,15 @@ change (the `equal-flow-enforcement` and `workers` set-paths already exist).
   path, so the lenient warning fires on EXACTLY the configs the strict
   reject would — no false-strip on `${node}`/split-stanza/group configs
   whose effective workers ≤32. ✓ (This is why AST mutation was rejected.)
+- **Read-only active-tree re-compiles must be lenient (round-3, Codex +
+  AGY converged)**: the peer-interface display paths
+  `cli_show_interfaces.go:577` and `server_show_interfaces.go:436`
+  re-compile the (already lenient-loaded) active tree for the peer node and
+  swallow errors with `if err == nil`. A STRICT re-compile there would now
+  error on a tolerated legacy config and silently drop peer-interface
+  display on a healthy cluster. Both switched to
+  `CompileConfigForNodeLenient`. ✓ (Audited all `config.CompileConfig*`
+  callers — these two are the only non-commit active-tree re-compiles.)
 
 ## 8. Risk assessment
 
@@ -325,11 +335,14 @@ change (the `equal-flow-enforcement` and `workers` set-paths already exist).
   `CompileConfig` on the SAME tree returns the hard error. Boundary:
   `workers 32` + equal-flow → no warning, no error in both modes.
 - **Semantic-parity test (round-2 MAJOR gate)** (`pkg/config`): a config
-  with `workers 64` inside `groups { node0 { ... } }` + `apply-groups
-  "${node}"` + equal-flow — `CompileConfigForNode(tree, 1)` (node1, group
-  not applied) must NOT warn/reject (effective workers ≤32), while
-  `CompileConfigForNode(tree, 0)` (node0) lenient-warns and strict-rejects.
-  This is the test that an AST-walk rewrite would have failed.
+  with `workers 64` inside `groups { node0 { ... } }` + a benign
+  `groups { node1 { ... } }` (no workers) + `apply-groups "${node}"` +
+  equal-flow — `CompileConfigForNode(tree, 1)` (node1, node0 group not
+  applied) must NOT warn/reject (effective workers ≤32), while
+  `CompileConfigForNode(tree, 0)` (node0) strict-rejects and
+  `CompileConfigForNodeLenient(tree, 0)` warns. The benign `node1` group is
+  required so `${node}` expansion for node1 does not error on an undefined
+  group (Codex r3). This is the test an AST-walk rewrite would have failed.
 - **Store Load/SyncApply tests** (`pkg/configstore`): assert a persisted /
   peer-synced `workers 33` + equal-flow config loads / sync-applies WITHOUT
   error (no blackout) and produces a warning; and that a `workers 32` +

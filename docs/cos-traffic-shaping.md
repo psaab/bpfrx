@@ -892,6 +892,24 @@ Notes for this specific test:
   throughput can drop substantially when one active worker is much slower than
   its peers. The suppressor fails open when an active worker looks merely quiet
   rather than demand-saturated.
+- **`equal-flow-enforcement` is supported on at most 32 worker threads**
+  (`set system dataplane workers <= 32`). The v8 lease rotation samples
+  per-worker state from a 32-entry stack scratch
+  (`MAX_WORKERS_SCRATCH` in
+  `userspace-dp/src/afxdp/types/shared_cos_lease/rotate_epoch_v8.rs`); above
+  32 workers an active worker beyond index 31 makes the publisher fail open
+  with reason `unsampled_active_worker`, silently disabling equal-flow for
+  that epoch. To prevent a silent fairness fail-open, **a `commit` of
+  `workers > 32` together with any `equal-flow-enforcement` scheduler is
+  hard-rejected** (#1733). An already-persisted or HA-peer-synced config in
+  that state is tolerated on load/sync (it boots with a loud warning and
+  the runtime continues to fail-open equal-flow exactly as before) so an
+  upgraded node does not blackout-boot and HA config sync does not
+  alarm-loop; the operator's next `commit` is rejected until they reduce
+  workers or remove `equal-flow-enforcement`. Watch the
+  `xpf_userspace_cos_equal_flow_fail_open{reason="unsampled_active_worker"}`
+  gauge for the runtime fail-open signal. Removing the 32-worker cap
+  entirely is tracked as #1731-e.
 - `loss-priority` on CoS DSCP / 802.1p classifiers is accepted for syntax
   compatibility but is not enforced yet
 - `loss-priority` on CoS DSCP rewrite-rules is accepted for syntax
