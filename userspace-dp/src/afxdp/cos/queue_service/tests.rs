@@ -2496,10 +2496,11 @@ fn waterfill_persistent_honored_set_distributes_phase1_across_queues() {
     // The persistent bitset carries q0 and q1's ORDINAL bits across calls
     // within the epoch (ordinal == queue_idx here). q2 (ordinal 2) is never
     // honored in Phase 1, so its bit stays clear.
-    assert_ne!(
+    assert_eq!(
         root.waterfill_honored_epoch_bits & 0b011,
-        0,
-        "ordinals 0 and 1 must be marked honored within the epoch"
+        0b011,
+        "BOTH ordinals 0 and 1 must be marked honored within the epoch \
+         (each small queue took exactly one Phase-1 honor)"
     );
     assert_eq!(
         root.waterfill_honored_epoch_bits & 0b100,
