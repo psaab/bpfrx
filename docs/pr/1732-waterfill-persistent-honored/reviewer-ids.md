@@ -20,8 +20,16 @@ AGY adversarial-review review-only).
 | r4 | AGY | PLAN-READY | adversarial-review-mpuh2urn-5h7qvv |
 | r4 | Claude-SMR | concur — PLAN-READY | in-conversation |
 
-## Code review (filled during Step 8)
+## Code review (PR #1737)
 
 | Round | Reviewer | Verdict | Job/session |
 |-------|----------|---------|-------------|
-| | | | |
+| r1 | Codex | MERGE-NEEDS-MINOR (weak bitset assertion — fixed) | session codex-1732-code-r1-* |
+| r1 | AGY | MERGE-READY (review-only, clean) | adversarial-review-mpuhfz05-or7qa5 |
+| r1 | Claude-SMR | MERGE-READY (impl matches plan, all guards present) | in-conversation |
+| r1 | Copilot | infra-DOWN — pending/triggered | — |
+
+Note: Codex's minor (assert_ne → assert_eq on the honored bitset) fixed in
+commit 9162c4e09. fmt-drift Codex noted is sandbox rustfmt 1.9.0 vs the
+repo's committed style; repo has no CI fmt gate and the diffs land on
+pre-existing code, so not a blocker.
