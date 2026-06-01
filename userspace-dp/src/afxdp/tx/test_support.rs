@@ -10,12 +10,15 @@ use crate::afxdp::cos::builders::build_cos_interface_runtime;
 use crate::afxdp::types::{CoSQueueRuntime, FlowFairState};
 
 pub(in crate::afxdp) fn enable_test_flow_fair(queue: &mut CoSQueueRuntime) {
-    queue.config.flow_fair = true;
+    // #1735: the runtime gate is `flow_fair_state.is_some()`. Allocate
+    // the state (which flips `flow_fair()` to true) and mark eligibility
+    // so promotion/demotion-aware logic sees a coherent queue.
+    queue.config.flow_fair_eligible = true;
     queue.flow_fair_state = Some(Box::new(FlowFairState::new(0)));
 }
 
 pub(in crate::afxdp) fn disable_test_flow_fair(queue: &mut CoSQueueRuntime) {
-    queue.config.flow_fair = false;
+    // #1735: drop the state to flip `flow_fair()` to false.
     queue.flow_fair_state = None;
 }
 
@@ -464,7 +467,7 @@ pub(in crate::afxdp) fn test_flow_fair_exact_queue_16_flows() -> CoSInterfaceRun
         }],
     );
     let queue = &mut root.queues[0];
-    queue.config.flow_fair = true;
+    queue.config.flow_fair_eligible = true;
     queue.flow_fair_state = Some(Box::new(FlowFairState::new(0)));
     root
 }
@@ -583,7 +586,7 @@ pub(in crate::afxdp) fn attach_test_vtime_floor(
     // V_min sync only kicks in on shared_exact; mark accordingly so
     // `cos_queue_v_min_continue` doesn't early-return.
     queue.config.shared_exact = true;
-    queue.config.flow_fair = true;
+    queue.config.flow_fair_eligible = true;
     if queue.flow_fair_state.is_none() {
         queue.flow_fair_state = Some(Box::new(FlowFairState::new(0)));
     }

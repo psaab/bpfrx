@@ -155,7 +155,10 @@ pub(in crate::afxdp) fn build_cos_interface_runtime(
                     // from CoSSchedulerSnapshot.surplus_sharing).
                     surplus_sharing: queue.surplus_sharing,
                     equal_flow_enforcement: queue.equal_flow_enforcement,
-                    flow_fair: false,
+                    // #1735: set by `promote_cos_queue_flow_fair`. The
+                    // runtime flow-fair gate is `flow_fair_state.is_some()`;
+                    // this bit only marks eligibility for lazy promotion.
+                    flow_fair_eligible: false,
                     // Populated by `promote_cos_queue_flow_fair` from the
                     // live `WorkerCoSQueueFastPath.shared_exact` signal.
                     shared_exact: false,
@@ -193,6 +196,7 @@ pub(in crate::afxdp) fn build_cos_interface_runtime(
                     wheel_slot: 0,
                     items: VecDeque::new(),
                     local_item_count: 0,
+                    cos_demote_empty_settles: 0,
                 },
                 flow_fair_state: None,
                 v_min: VMinQueueState {

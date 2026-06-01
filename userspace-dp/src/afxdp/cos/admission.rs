@@ -506,8 +506,23 @@ fn promote_cos_queue_flow_fair(
     // Attempt A regression (22.3 → 16.3 Gbps).
     // `apply_cos_admission_ecn_policy` still uses the aggregate arm
     // on shared_exact (per-flow ECN remains rate-unaware).
-    queue.config.flow_fair = queue.config.exact;
-    queue.flow_fair_state = if queue.flow_fair() {
+    // #1735: every queue that reaches this promotion path is on an
+    // interface with a `CoSInterfaceRuntime` (forwarding-only /
+    // transparent interfaces never build one — the #1183 "useful CoS
+    // state" gate), so every such queue is ELIGIBLE to run flow-fair
+    // MQFQ, exact or not. Eligibility is decoupled from the runtime
+    // gate (`flow_fair_state.is_some()`).
+    queue.config.flow_fair_eligible = true;
+    // Exact queues promote EAGERLY at build (today's behavior — they
+    // always carry expected flows, and the V_min / v8-lease
+    // coordination on shared_exact assumes a stable `flow_fair_state`
+    // for the interface's lifetime). Non-exact eligible queues stay
+    // `None` here and promote lazily via the hash-free front-key
+    // contention probe in `cos_queue_push_back` only once a SECOND
+    // distinct flow arrives — so single-flow / uncontended best-effort
+    // queues never pay the FlowFairState footprint or the per-packet
+    // hash (the #1183 fast-path boundary).
+    queue.flow_fair_state = if queue.config.exact {
         Some(Box::new(FlowFairState::new(cos_flow_hash_seed_from_os())))
     } else {
         None

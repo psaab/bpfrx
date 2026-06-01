@@ -38,6 +38,43 @@ mod.rs for further file-level breakdown.
 
 ## Notable invariants
 
+- **Flow-fair gate is `flow_fair_state.is_some()` (#1735).** The runtime
+  `CoSQueueRuntime::flow_fair()` accessor returns
+  `flow_fair_state.is_some()`, NOT `config.flow_fair`. The invariant
+  `flow_fair() == flow_fair_state.is_some()` is therefore structurally
+  unbreakable — a `None`-state queue always dispatches the cheap FIFO
+  branch and allocation is the only thing that flips the gate.
+  `config.flow_fair_eligible` (the renamed `config.flow_fair`) means
+  "this shaped queue MAY ever run flow-fair MQFQ" and is decoupled from
+  the runtime gate.
+- **Per-flow MQFQ runs on ALL shaped queues, not just exact (#1735).**
+  `promote_cos_queue_flow_fair` marks every queue that reaches it
+  (exact AND non-exact) `flow_fair_eligible`. Exact queues promote
+  EAGERLY at build (allocate `FlowFairState` immediately, never demote —
+  their V_min / v8-lease coordination assumes stable state). Non-exact
+  eligible queues (best-effort / residual) promote LAZILY: a hash-free
+  front-key contention probe in `cos_queue_push_back`
+  (`maybe_promote_best_effort`) compares the incoming item's
+  `Option<&SessionKey>` to the FIFO front structurally (NO hash) and
+  promotes only on the FIRST genuinely-distinct flow. A single-flow /
+  uncontended best-effort queue stays a trivial FIFO and pays zero hash
+  and zero `FlowFairState` footprint — the #1183 best-effort fast-path
+  boundary. Forwarding-only / transparent interfaces never build a
+  `CoSInterfaceRuntime`, so their queues never become eligible.
+  `promote_to_flow_fair` migrates the resident FIFO by re-enqueueing
+  each item through the normal MQFQ accounting path (hashing each into
+  its own bucket — correct for any flow mix). When a lazily-promoted
+  non-exact queue settles fully drained for
+  `COS_DEMOTE_EMPTY_SETTLE_HYSTERESIS` consecutive batch settles,
+  `maybe_demote_drained_best_effort` (called at the end of
+  `apply_cos_send_result` / `apply_cos_prepared_result`, after the retry
+  restore) drops its `FlowFairState` box so idle queues release the
+  ~232 KB footprint. Surplus DWRR across queues + MQFQ inside the
+  selected queue compose for free: `build_cos_batch_from_queue` already
+  pops via `cos_queue_front`/`cos_queue_pop_front`, both dispatching on
+  `flow_fair()`. This also folds in the residual/best-effort
+  queue-level → flow-level item from the #1731 research plan (its
+  finding #7; NOT GitHub issue #7, which is an unrelated SNAT bug).
 - Single-writer per FlowFairState. The owner worker that polls a
   binding is the same worker that owns the queue's
   `FlowFairState`; therefore `observed_bps` updates and reads do not
