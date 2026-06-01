@@ -172,36 +172,42 @@ Add field `waterfill_epoch_start_ns: u64` to `CoSInterfaceRuntime`
 let elapsed = now_ns.saturating_sub(root.waterfill_epoch_start_ns);
 let time_refresh = elapsed >= COS_GUARANTEE_VISIT_NS;
 let exhausted = root.waterfill_pass1_remaining_bytes == 0;
+// SHIPPED (r3): refill the BUDGET on time_refresh || exhausted, but
+// clear honored bits ONLY on a genuine epoch boundary.
 if time_refresh || exhausted {
     root.waterfill_pass1_remaining_bytes = pass1; // (Hunk A)
     root.waterfill_epoch_start_ns = now_ns;
-    root.waterfill_honored_epoch_bits = 0;   // clear EACH epoch
+    if time_refresh || root.waterfill_epoch_wrap_pending {
+        root.waterfill_honored_epoch_bits = 0;    // clear on boundary only
+    }
+    root.waterfill_epoch_wrap_pending = false;
     root.waterfill_epochs = root.waterfill_epochs.wrapping_add(1);
-    // (r2 update — see invariant 2 below: the exhausted-path cursor
-    // reset shown here was REMOVED in the shipped code.)
+    // NOTE: the cursor is NOT reset here (r2); only the Phase-2 wrap
+    // `None` path resets the cursor + arms epoch_wrap_pending.
 }
 ```
-> **r2 amendment (Codex code-r2):** the `if exhausted { cursor = 0 }`
-> block above was REMOVED. NEITHER refill path resets the Phase-2
-> cursor; the only reset is the genuine Phase-2 wrap at the
-> end-of-function `None` path. See invariant 2.
+> **r2/r3 amendments (Codex code review):**
+> - **r2** — the original `if exhausted { cursor = 0 }` was REMOVED;
+>   NEITHER refill path resets the Phase-2 cursor.
+> - **r3** — the honored-bits clear was moved off the bare
+>   `exhausted` path. It now fires ONLY on the time tick OR a genuine
+>   Phase-2 wrap (`waterfill_epoch_wrap_pending`, set by the `None`
+>   path). A bare mid-walk `pass1 == 0` refills the budget but keeps
+>   the bits, so an exact-fit honor cannot re-honor the same queue
+>   forever (the r3 livelock). See invariants 1–2.
 
 **CRITICAL invariants:**
-1. Honored bits cleared on BOTH refresh paths (master only clears
-   on exhausted — without this the time refresh leaves stale
-   honored bits and both phases skip honored queues forever; this
-   is the #1732-interaction wrinkle the #1630 branch never had).
+1. Honored bits cleared ONLY on a genuine epoch boundary — the 200µs
+   time tick OR a Phase-2 wrap (`waterfill_epoch_wrap_pending`). NOT
+   on every budget refill: a bare mid-walk `pass1 == 0` refill keeps
+   the bits (r3 — else an all-min-quantum exact-fit config livelocks
+   Phase 1 on q0 and never reaches Phase 2). Forward progress is
+   guaranteed because the time tick fires at least every 200µs.
 2. Phase-2 cursor reset ONLY on a genuine Phase-2 WRAP (the
-   end-of-function `None` path) — NEITHER refill path touches it.
-   (r1 design reset on the exhausted path per the #1630 r4 intent,
-   but Codex code-r2 showed a degenerate all-min-quantum config can
-   land pass1 at exactly 0 after one Phase-1 honor and re-enter the
-   exhausted path every call, restarting the descending walk and
-   starving Phase-2 within a 200µs window. Removing the reset keeps
-   the cursor continuous across epochs on both refill paths, which
-   is the stronger form of the same #1630 r4 continuity invariant.)
-3. `waterfill_epochs` bump moves into the shared `if` so the
-   counter still increments once per refresh on either path.
+   end-of-function `None` path) — NEITHER refill path touches it
+   (r2 — the #1630 r4 continuity invariant, hardened).
+3. `waterfill_epochs` bumps on every budget refill (either trigger);
+   it counts refreshes, not RR completions.
 
 ## §6 Public API preservation
 No public signatures change. `select_exact_cos_guarantee_queue_
@@ -211,8 +217,8 @@ untouched.
 
 ## §7 Hidden invariants preserved
 - **#1732 persistent honored bits** preserved; cleared once per
-  epoch on EITHER refresh path (single clear point semantics
-  maintained — both epoch-exit paths funnel through the refill).
+  epoch on a genuine boundary (time tick OR Phase-2 wrap, r3) — NOT
+  on a bare mid-walk `pass1 == 0` refill.
 - **Side-effect ordering**: honor charge → mark honored → advance
   RR → telemetry → return, unchanged.
 - **Allocation**: no heap alloc added; iterates the persistent

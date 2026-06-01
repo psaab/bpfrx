@@ -440,8 +440,12 @@ pub(in crate::afxdp) struct CoSInterfaceRuntime {
     /// the Phase-1 budget (skew toward the lowest-rate queue). This bitset
     /// is now persisted across selector calls, read by BOTH phases (so each
     /// queue is honored at most once per epoch, smallest-first, and Phase 2
-    /// serves the residual to the larger un-honored queues), and CLEARED at
-    /// the lazy Phase-1 refill where `waterfill_epochs` bumps. The set/skip
+    /// serves the residual to the larger un-honored queues). #1743 r3: it is
+    /// CLEARED only on a genuine epoch boundary — the 200µs time tick OR a
+    /// Phase-2 WRAP (`waterfill_epoch_wrap_pending`) — NOT on every Phase-1
+    /// budget refill (`waterfill_epochs` still bumps on every refill, but a
+    /// bare mid-walk `pass1 == 0` refill must keep the bits so an exact-fit
+    /// honor does not re-honor the same queue forever). The set/skip
     /// sites guard the shift with `ordinal < 64`, so a (malformed) config
     /// with >64 exact queues leaves ordinals ≥64 conservatively untracked
     /// rather than wrapping `1u64 << (≥64)`. Single-writer owner worker.
