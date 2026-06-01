@@ -12,3 +12,8 @@
 
 ## Code review round 2 (commit fcbdf1f04 — review-fix verification)
 - Codex: re-dispatched
+
+## Code review round 2 result + round 3
+- Codex r2: task-mpvcikph-cgum6h (MERGE-NEEDS-MINOR — degenerate min-quantum exhausted-path cursor-reset thrash; fixed in b2fb8028b by removing the exhausted-path cursor reset)
+- Codex r3: task-mpvd64p6-e1gppr (re-review of cursor-reset removal)
+- Copilot: addressed audit line-count (non-issue, snapshot current) + epoch doc phrase (fixed 69bf42892)
