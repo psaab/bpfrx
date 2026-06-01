@@ -34,7 +34,7 @@ mod cos;
 mod nat;
 mod resolution;
 mod security;
-mod snapshot;
+pub(crate) mod snapshot;
 
 #[cfg(test)]
 mod tests;

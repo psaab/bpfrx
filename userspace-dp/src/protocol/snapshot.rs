@@ -445,3 +445,57 @@ pub(crate) struct UserspaceCapabilities {
     pub unsupported_reasons: Vec<String>,
 }
 
+
+#[cfg(test)]
+mod wg_snapshot_tests {
+    use super::*;
+
+    // #1432 S2a privkey hygiene: wg_local_privkey_hex is skip_serializing
+    // so the on-disk state snapshot the helper persists never leaks the
+    // private key, while deserialization (control-socket delivery) still
+    // populates it via the default path.
+    #[test]
+    fn wg_local_privkey_hex_is_skipped_in_state_snapshot() {
+        let snap = TunnelEndpointSnapshot {
+            id: 1,
+            mode: "wireguard".into(),
+            wg_local_privkey_hex:
+                "a01010101010101010101010101010101010101010101010101010101010101a".into(),
+            wg_peer_pubkey_hex:
+                "b02020202020202020202020202020202020202020202020202020202020202b".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(
+            !json.contains("wg_local_privkey_hex"),
+            "private key field must be skip_serializing, got: {json}"
+        );
+        assert!(
+            !json.contains("a01010101"),
+            "private key value must not appear in serialized snapshot"
+        );
+        // The non-secret peer pubkey IS serialized.
+        assert!(json.contains("wg_peer_pubkey_hex"));
+
+        // Deserialization (control-socket path) still populates the key.
+        let with_key = r#"{"id":1,"mode":"wireguard","wg_local_privkey_hex":"a01010101010101010101010101010101010101010101010101010101010101a"}"#;
+        let parsed: TunnelEndpointSnapshot = serde_json::from_str(with_key).unwrap();
+        assert_eq!(
+            parsed.wg_local_privkey_hex,
+            "a01010101010101010101010101010101010101010101010101010101010101a"
+        );
+    }
+
+    // The redacted Debug impl must not print the private key.
+    #[test]
+    fn wg_local_privkey_redacted_in_debug() {
+        let snap = TunnelEndpointSnapshot {
+            id: 1,
+            mode: "wireguard".into(),
+            wg_local_privkey_hex: "deadbeefdeadbeef".into(),
+            ..Default::default()
+        };
+        let dbg = format!("{snap:?}");
+        assert!(!dbg.contains("deadbeef"), "Debug must redact the private key: {dbg}");
+    }
+}

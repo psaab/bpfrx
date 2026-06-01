@@ -4522,3 +4522,14 @@ top.
     pkg/config/schema.go (wireguardSchemaNode in tunnel + unit tunnel),
     pkg/dataplane/userspace/tunnels.go (populate Wg* DTO, gate src/dst for WG),
     pkg/routing/tunnel.go (applyWireguardTunLocked persistent TUN, no flap)
+
+- **Timestamp**: 2026-05-31
+  **Action**: Rust + Go S2a tests; bug fix in NoSession edge (sentinel collision)
+  **File(s)**: userspace-dp/src/afxdp/wg/{engine.rs,tests.rs},
+    userspace-dp/src/afxdp/forwarding_build/tests.rs,
+    userspace-dp/src/afxdp/frame/wg.rs (MTU helper+tests),
+    userspace-dp/src/protocol/snapshot.rs (privkey skip-serialize tests),
+    pkg/dataplane/userspace/manager_test.go, pkg/config/parser_routing_test.go
+  Note: fixed request_handshake/take_handshake_request to use a separate
+  AtomicBool pending flag + AtomicU64 rate-limit clock (the single-u64
+  design collided the 0 sentinel with a t=0 timestamp).

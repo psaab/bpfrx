@@ -5120,3 +5120,115 @@ func TestSessionSocketPathEmpty(t *testing.T) {
 		t.Fatalf("sessionSocketPath() = %q, want empty", got)
 	}
 }
+
+// #1432 S2a: a mode=="wireguard" tunnel populates the Wg* DTO fields and
+// is not dropped by the GRE source/destination gate (WG carries the peer
+// in wg_endpoint and may have no source/destination).
+func TestBuildTunnelEndpointSnapshotsPopulatesWireGuard(t *testing.T) {
+	const privHex = "a01010101010101010101010101010101010101010101010101010101010101a"
+	const peerHex = "b02020202020202020202020202020202020202020202020202020202020202b"
+	cfg := &config.Config{}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"wg0": {
+			Name: "wg0",
+			Tunnel: &config.TunnelConfig{
+				Name:              "wg0",
+				Mode:              "wireguard",
+				WgListenPort:      51820,
+				WgLocalPrivkeyHex: privHex,
+				WgPeerPubkeyHex:   peerHex,
+				WgAllowedIPs:      []string{"10.0.0.0/24", "10.0.1.0/24"},
+				WgEndpoint:        "203.0.113.1:51820",
+				WgKeepaliveSecs:   25,
+			},
+		},
+	}
+	endpoints := buildTunnelEndpointSnapshots(cfg, []InterfaceSnapshot{
+		{Name: "wg0", LinuxName: "wg0", Ifindex: 42, Zone: "vpn"},
+	})
+	if len(endpoints) != 1 {
+		t.Fatalf("len(endpoints) = %d, want 1 (WG endpoint must not be dropped)", len(endpoints))
+	}
+	e := endpoints[0]
+	if e.Mode != "wireguard" {
+		t.Fatalf("mode = %q, want wireguard", e.Mode)
+	}
+	if e.WgListenPort != 51820 {
+		t.Fatalf("wg_listen_port = %d, want 51820", e.WgListenPort)
+	}
+	if e.WgLocalPrivkeyHex != privHex {
+		t.Fatalf("wg_local_privkey_hex not populated")
+	}
+	if e.WgPeerPubkeyHex != peerHex {
+		t.Fatalf("wg_peer_pubkey_hex = %q, want %q", e.WgPeerPubkeyHex, peerHex)
+	}
+	if len(e.WgAllowedIPs) != 2 {
+		t.Fatalf("wg_allowed_ips = %v, want 2 entries", e.WgAllowedIPs)
+	}
+	if e.WgEndpoint != "203.0.113.1:51820" {
+		t.Fatalf("wg_endpoint = %q", e.WgEndpoint)
+	}
+	if e.WgKeepaliveSecs != 25 {
+		t.Fatalf("wg_keepalive_secs = %d, want 25", e.WgKeepaliveSecs)
+	}
+	// IPv4 peer endpoint -> inet outer family.
+	if e.OuterFamily != "inet" {
+		t.Fatalf("outer family = %q, want inet for IPv4 endpoint", e.OuterFamily)
+	}
+}
+
+// A GRE tunnel must be unaffected by the WG relaxation: a GRE endpoint
+// with no source/destination is still dropped.
+func TestBuildTunnelEndpointSnapshotsGREStillRequiresSourceDest(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"gr-0/0/0": {
+			Name:   "gr-0/0/0",
+			Tunnel: &config.TunnelConfig{Name: "gr-0-0-0", Mode: "gre"}, // no src/dst
+		},
+	}
+	endpoints := buildTunnelEndpointSnapshots(cfg, []InterfaceSnapshot{
+		{Name: "gr-0/0/0", LinuxName: "gr-0-0-0", Ifindex: 99},
+	})
+	if len(endpoints) != 0 {
+		t.Fatalf("GRE endpoint without source/destination must be dropped, got %d", len(endpoints))
+	}
+}
+
+// The WG local private key is delivered to the Rust dataplane over the
+// control socket (the Go DTO serializes it with omitempty), but the Rust
+// side marks it skip_serializing so the on-disk state snapshot the
+// helper persists never contains it (verified in the Rust suite by
+// wg_local_privkey_hex_is_skipped_in_state_snapshot). This Go test pins
+// the control-channel contract: the private key round-trips over the
+// wire (so Rust can build the engine) while a snapshot with an empty key
+// carries no privkey field at all (omitempty).
+func TestTunnelEndpointSnapshotPrivkeyControlChannelContract(t *testing.T) {
+	const privHex = "a01010101010101010101010101010101010101010101010101010101010101a"
+	withKey := TunnelEndpointSnapshot{
+		ID:                1,
+		Mode:              "wireguard",
+		WgLocalPrivkeyHex: privHex,
+		WgPeerPubkeyHex:   "b02020202020202020202020202020202020202020202020202020202020202b",
+	}
+	b, err := json.Marshal(withKey)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got TunnelEndpointSnapshot
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.WgLocalPrivkeyHex != privHex {
+		t.Fatalf("private key must round-trip over the control channel for engine build")
+	}
+	// An endpoint with no private key must omit the field entirely.
+	noKey := TunnelEndpointSnapshot{ID: 1, Mode: "wireguard"}
+	nb, err := json.Marshal(noKey)
+	if err != nil {
+		t.Fatalf("marshal noKey: %v", err)
+	}
+	if strings.Contains(string(nb), "wg_local_privkey_hex") {
+		t.Fatalf("empty private key must be omitted, got %s", nb)
+	}
+}

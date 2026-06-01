@@ -309,14 +309,18 @@ pub(crate) struct WgEngine {
     pub(in crate::afxdp::wg) sessions_by_local_index: RwLock<FxHashMap<u32, Arc<WgSession>>>,
     /// Worker→control "please initiate a handshake" edge (#1432 S2a
     /// §4.3). When an egress `try_encap` hits `NoSession`, the worker
-    /// records the current monotonic time here via a single relaxed
-    /// atomic compare-and-store, rate-limited to at most one edge per
+    /// arms this edge via a single relaxed atomic store, rate-limited by
+    /// `handshake_request_last_ns` to at most one edge per
     /// `WG_HANDSHAKE_REQUEST_MIN_INTERVAL_NS`. The control thread polls
     /// and consumes it. This is the ONLY worker→control coupling in S2a
     /// and it carries no packet data — the worker never builds a
-    /// `HandshakeState` (control-thread-only crypto invariant, §6). `0`
-    /// means "no pending request".
-    pub(in crate::afxdp::wg) handshake_request_ns: std::sync::atomic::AtomicU64,
+    /// `HandshakeState` (control-thread-only crypto invariant, §6).
+    pub(in crate::afxdp::wg) handshake_request_pending: std::sync::atomic::AtomicBool,
+    /// Monotonic timestamp of the last accepted request edge (0 = never).
+    /// Used only for the rate-limit gate; distinct from the pending flag
+    /// so a request at `now_ns == 0` (tests) is not confused with "no
+    /// request".
+    pub(in crate::afxdp::wg) handshake_request_last_ns: std::sync::atomic::AtomicU64,
 }
 
 /// Minimum spacing between worker-driven "please initiate" edges
@@ -352,7 +356,8 @@ impl WgEngine {
             table: ArcSwap::from_pointee(PeerTable::empty()),
             reconcile_lock: std::sync::Mutex::new(()),
             sessions_by_local_index: RwLock::new(FxHashMap::default()),
-            handshake_request_ns: std::sync::atomic::AtomicU64::new(0),
+            handshake_request_pending: std::sync::atomic::AtomicBool::new(false),
+            handshake_request_last_ns: std::sync::atomic::AtomicU64::new(0),
         };
         engine.reconcile_peers(&config.peers);
         engine
@@ -366,14 +371,20 @@ impl WgEngine {
     /// recorded a fresh edge.
     pub(crate) fn request_handshake(&self, now_ns: u64) -> bool {
         use std::sync::atomic::Ordering;
-        let last = self.handshake_request_ns.load(Ordering::Relaxed);
+        let last = self.handshake_request_last_ns.load(Ordering::Relaxed);
+        // `last == 0` means "never requested" → always allow the first.
         if last != 0 && now_ns.saturating_sub(last) < WG_HANDSHAKE_REQUEST_MIN_INTERVAL_NS {
             return false;
         }
         // Relaxed is sufficient: the control thread only needs eventual
         // visibility of the edge, and a lost race merely defers the
         // initiation by one poll tick (the next NoSession re-arms it).
-        self.handshake_request_ns.store(now_ns, Ordering::Relaxed);
+        // Store a non-zero clock so a request at now_ns==0 still gates
+        // subsequent requests (the +1 only shifts the rate-limit window
+        // by 1ns, immaterial against a 1s interval).
+        self.handshake_request_last_ns
+            .store(now_ns.max(1), Ordering::Relaxed);
+        self.handshake_request_pending.store(true, Ordering::Relaxed);
         true
     }
 
@@ -381,7 +392,7 @@ impl WgEngine {
     /// request is pending and clears it. Slow path (control thread).
     pub(crate) fn take_handshake_request(&self) -> bool {
         use std::sync::atomic::Ordering;
-        self.handshake_request_ns.swap(0, Ordering::Relaxed) != 0
+        self.handshake_request_pending.swap(false, Ordering::Relaxed)
     }
 
     /// The pubkey of the first (S2a: only) configured peer, if any.

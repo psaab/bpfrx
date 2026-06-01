@@ -29,6 +29,18 @@ const fn pad_to_16(n: usize) -> usize {
     (n + 15) & !15
 }
 
+/// The exact pad-aware encapped wire size for an `inner_len`-byte inner
+/// packet plus the outer L3/L4 (IP + UDP). Used by the MTU guard so a
+/// frame that would exceed the egress MTU is dropped rather than forcing
+/// outer IP fragmentation (plan §7, Codex r3). Pulled out of
+/// `wg_encap_frame` so the arithmetic is unit-testable in isolation.
+#[inline]
+fn wg_encapped_size(inner_len: usize, outer_v6: bool) -> usize {
+    let outer_ip_len = if outer_v6 { 40 } else { 20 };
+    let wg_record_len = WG_DATA_HEADER_LEN + pad_to_16(inner_len) + POLY1305_TAG_LEN;
+    wg_record_len + outer_ip_len + 8
+}
+
 pub(super) fn wg_encap_frame(
     inner_frame: &[u8],
     inner_meta: impl Into<ForwardPacketMeta>,
@@ -70,8 +82,7 @@ pub(super) fn wg_encap_frame(
         .filter(|m| *m > 0)
         .unwrap_or(1500);
     let wg_record_len = WG_DATA_HEADER_LEN + pad_to_16(inner_packet.len()) + POLY1305_TAG_LEN;
-    let outer_l3l4 = outer_ip_len + 8; // outer IP + UDP
-    if wg_record_len + outer_l3l4 > outer_mtu {
+    if wg_encapped_size(inner_packet.len(), outer_v6) > outer_mtu {
         // wg_mtu_drops would be incremented on a real counter store here;
         // S2a surfaces this via the explicit drop (None) + the control
         // thread's symmetric guard. Telemetry consolidation is on the
@@ -200,4 +211,50 @@ fn udp6_checksum(src: std::net::Ipv6Addr, dst: std::net::Ipv6Addr, udp: &[u8]) -
     }
     let csum = !(sum as u16);
     if csum == 0 { 0xffff } else { csum }
+}
+
+#[cfg(test)]
+mod wg_frame_tests {
+    use super::*;
+
+    #[test]
+    fn pad_to_16_rounds_up() {
+        assert_eq!(pad_to_16(0), 0);
+        assert_eq!(pad_to_16(1), 16);
+        assert_eq!(pad_to_16(16), 16);
+        assert_eq!(pad_to_16(17), 32);
+    }
+
+    #[test]
+    fn wg_encapped_size_is_pad_aware() {
+        // inner 1 byte: pads to 16; record = 16 (hdr) + 16 (pad) + 16
+        // (tag) = 48; + outer v4 IP(20) + UDP(8) = 76.
+        assert_eq!(wg_encapped_size(1, false), 16 + 16 + 16 + 20 + 8);
+        // v6 adds 20 more for the bigger outer IP header.
+        assert_eq!(
+            wg_encapped_size(1, true),
+            wg_encapped_size(1, false) + 20
+        );
+        // An inner already a 16-multiple does not over-pad.
+        assert_eq!(
+            wg_encapped_size(32, false),
+            WG_DATA_HEADER_LEN + 32 + POLY1305_TAG_LEN + 20 + 8
+        );
+    }
+
+    #[test]
+    fn wg_mtu_guard_drops_oversize_inner() {
+        // At a 1500-byte v4 outer MTU the largest inner that fits is
+        // 1500 - 20 - 8 - 16 - 16 = 1440, padded to a 16-multiple. A
+        // 1441-byte inner pads to 1456 and overflows.
+        let mtu = 1500usize;
+        assert!(
+            wg_encapped_size(1440, false) <= mtu,
+            "1440-byte inner must fit a 1500 v4 outer MTU"
+        );
+        assert!(
+            wg_encapped_size(1441, false) > mtu,
+            "1441-byte inner (pads to 1456) must overflow and be dropped"
+        );
+    }
 }

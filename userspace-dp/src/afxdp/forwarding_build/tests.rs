@@ -1883,3 +1883,112 @@ fn pending_neigh_timeout_fast_with_jiffy_rounded_252() {
     let got = compute_pending_neigh_timeout_ns(&one_iface_map(), &reader);
     assert_eq!(got, PENDING_NEIGH_TIMEOUT_FAST_NS);
 }
+
+// ---------------------------------------------------------------------
+// #1432 S2a — WireGuard endpoint hydration + engine reload stability.
+// ---------------------------------------------------------------------
+
+const WG_TEST_PRIVKEY_HEX: &str =
+    "a01010101010101010101010101010101010101010101010101010101010101a";
+const WG_TEST_PEERKEY_HEX: &str =
+    "b02020202020202020202020202020202020202020202020202020202020202b";
+
+fn wg_snapshot(listen_port: u16, allowed: &[&str], endpoint: &str) -> ConfigSnapshot {
+    ConfigSnapshot {
+        tunnel_endpoints: vec![crate::protocol::snapshot::TunnelEndpointSnapshot {
+            id: 7,
+            interface: "wg0".into(),
+            linux_name: "wg0".into(),
+            ifindex: 42,
+            mode: "wireguard".into(),
+            wg_listen_port: listen_port,
+            wg_local_privkey_hex: WG_TEST_PRIVKEY_HEX.into(),
+            wg_peer_pubkey_hex: WG_TEST_PEERKEY_HEX.into(),
+            wg_allowed_ips: allowed.iter().map(|s| s.to_string()).collect(),
+            wg_endpoint: endpoint.into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn wg_endpoint_hydrates_runtime_tunnel_endpoint() {
+    let snap = wg_snapshot(51820, &["10.0.0.0/24"], "203.0.113.1:51820");
+    let state = build_forwarding_state(&snap);
+    assert!(state.has_wg_tunnels, "WG endpoint sets has_wg_tunnels");
+    let ep = state.tunnel_endpoints.get(&7).expect("WG endpoint present");
+    assert_eq!(ep.mode, "wireguard");
+    assert_eq!(ep.wg_listen_port, 51820);
+    assert_eq!(ep.wg_allowed_ips.len(), 1);
+    assert_eq!(
+        ep.wg_endpoint,
+        Some("203.0.113.1:51820".parse().unwrap())
+    );
+    // Engine instantiated and keyed by endpoint id.
+    assert!(state.wg_engines.contains_key(&7), "engine instantiated");
+    assert_eq!(state.wg_engines.get(&7).unwrap().listen_port(), 51820);
+}
+
+#[test]
+fn wg_endpoint_with_malformed_key_is_dropped() {
+    let mut snap = wg_snapshot(51820, &[], "");
+    snap.tunnel_endpoints[0].wg_local_privkey_hex = "deadbeef".into(); // wrong length
+    let state = build_forwarding_state(&snap);
+    assert!(
+        !state.tunnel_endpoints.contains_key(&7),
+        "endpoint with malformed key must be dropped, not half-installed"
+    );
+    assert!(!state.has_wg_tunnels);
+}
+
+#[test]
+fn wg_reload_reuses_engine_when_identity_unchanged() {
+    let snap = wg_snapshot(51820, &["10.0.0.0/24"], "203.0.113.1:51820");
+    let prev = build_forwarding_state(&snap);
+    let prev_engine = prev.wg_engines.get(&7).unwrap().clone();
+    // Rebuild with the SAME config, threading `previous`.
+    let next = build_forwarding_state_with_policy_counters_and_previous(
+        &snap,
+        &PolicyCounterStore::default(),
+        Some(&prev),
+    )
+    .unwrap();
+    let next_engine = next.wg_engines.get(&7).unwrap();
+    assert!(
+        std::sync::Arc::ptr_eq(&prev_engine, next_engine),
+        "unchanged WG identity must reuse the same engine Arc (no reconcile)"
+    );
+}
+
+#[test]
+fn wg_reload_seeds_high_water_on_identity_change() {
+    let snap = wg_snapshot(51820, &["10.0.0.0/24"], "203.0.113.1:51820");
+    let prev = build_forwarding_state(&snap);
+    // Advance the prior engine's TAI64N clock via an initiation.
+    let prev_engine = prev.wg_engines.get(&7).unwrap();
+    let peer_pub = prev_engine.first_peer_pubkey().unwrap();
+    let mut out = [0u8; crate::afxdp::wg::WG_MSG_INIT_LEN];
+    prev_engine.create_initiation(&peer_pub, &mut out).unwrap();
+    let prev_hw = prev_engine.tai64n_high_water().expect("clock advanced");
+
+    // Change the identity (different listen port) so a fresh engine is built.
+    let snap2 = wg_snapshot(51821, &["10.0.0.0/24"], "203.0.113.1:51820");
+    let next = build_forwarding_state_with_policy_counters_and_previous(
+        &snap2,
+        &PolicyCounterStore::default(),
+        Some(&prev),
+    )
+    .unwrap();
+    let next_engine = next.wg_engines.get(&7).unwrap();
+    assert!(
+        !std::sync::Arc::ptr_eq(prev_engine, next_engine),
+        "changed identity must build a fresh engine"
+    );
+    assert_eq!(next_engine.listen_port(), 51821);
+    let next_hw = next_engine.tai64n_high_water().expect("seeded from prior");
+    assert!(
+        next_hw >= prev_hw,
+        "fresh engine TAI64N high-water must be seeded >= the prior engine's"
+    );
+}

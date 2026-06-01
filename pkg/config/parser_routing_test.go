@@ -3171,3 +3171,58 @@ func TestRoutingInstanceRibInet6(t *testing.T) {
 		t.Errorf("Interface = %q, want reth2.0", nh.Interface)
 	}
 }
+
+// #1432 S2a: the minimal `tunnel wireguard { ... }` stanza compiles to
+// the TunnelConfig Wg* fields via parseTunnelWireguard.
+func TestWireGuardTunnelSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set interfaces wg0 tunnel mode wireguard",
+		"set interfaces wg0 tunnel wireguard listen-port 51820",
+		"set interfaces wg0 tunnel wireguard private-key a01010101010101010101010101010101010101010101010101010101010101a",
+		"set interfaces wg0 tunnel wireguard peer public-key b02020202020202020202020202020202020202020202020202020202020202b",
+		"set interfaces wg0 tunnel wireguard peer allowed-ips 10.0.0.0/24",
+		"set interfaces wg0 tunnel wireguard peer allowed-ips 10.0.1.0/24",
+		"set interfaces wg0 tunnel wireguard peer endpoint 203.0.113.1:51820",
+		"set interfaces wg0 tunnel wireguard peer persistent-keepalive 25",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	ifc := cfg.Interfaces.Interfaces["wg0"]
+	if ifc == nil || ifc.Tunnel == nil {
+		t.Fatal("wg0 tunnel config not found")
+	}
+	tc := ifc.Tunnel
+	if tc.Mode != "wireguard" {
+		t.Errorf("Mode = %q, want wireguard", tc.Mode)
+	}
+	if tc.WgListenPort != 51820 {
+		t.Errorf("WgListenPort = %d, want 51820", tc.WgListenPort)
+	}
+	if tc.WgLocalPrivkeyHex != "a01010101010101010101010101010101010101010101010101010101010101a" {
+		t.Errorf("WgLocalPrivkeyHex not parsed: %q", tc.WgLocalPrivkeyHex)
+	}
+	if tc.WgPeerPubkeyHex != "b02020202020202020202020202020202020202020202020202020202020202b" {
+		t.Errorf("WgPeerPubkeyHex = %q", tc.WgPeerPubkeyHex)
+	}
+	if len(tc.WgAllowedIPs) != 2 {
+		t.Errorf("WgAllowedIPs = %v, want 2 entries", tc.WgAllowedIPs)
+	}
+	if tc.WgEndpoint != "203.0.113.1:51820" {
+		t.Errorf("WgEndpoint = %q", tc.WgEndpoint)
+	}
+	if tc.WgKeepaliveSecs != 25 {
+		t.Errorf("WgKeepaliveSecs = %d, want 25", tc.WgKeepaliveSecs)
+	}
+}

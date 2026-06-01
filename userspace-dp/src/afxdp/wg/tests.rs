@@ -2003,3 +2003,156 @@ mod framed_handshake {
         assert_eq!(&p[..d.len], &pkt[..], "post-storm handshake must still carry traffic");
     }
 }
+
+// ---------------------------------------------------------------------
+// #1432 S2a — datapath wiring tests (control-thread coupling helpers).
+// ---------------------------------------------------------------------
+
+#[test]
+fn wg_request_handshake_is_rate_limited_per_interval() {
+    use super::engine::WG_HANDSHAKE_REQUEST_MIN_INTERVAL_NS;
+    let engine = WgEngine::new(WgEngineConfig {
+        local_private_key: keypair().0,
+        listen_port: 51820,
+        peers: vec![],
+    });
+    // First edge at t=0 records.
+    assert!(engine.request_handshake(0), "first request must record an edge");
+    // A flood within the interval must NOT record additional edges.
+    for t in 1..1000u64 {
+        assert!(
+            !engine.request_handshake(t),
+            "request within the rate-limit interval must be suppressed at t={t}"
+        );
+    }
+    // After the interval elapses, a fresh edge is allowed again.
+    assert!(
+        engine.request_handshake(WG_HANDSHAKE_REQUEST_MIN_INTERVAL_NS + 1),
+        "request after the interval must record a fresh edge"
+    );
+}
+
+#[test]
+fn wg_take_handshake_request_consumes_a_single_edge() {
+    let engine = WgEngine::new(WgEngineConfig {
+        local_private_key: keypair().0,
+        listen_port: 51820,
+        peers: vec![],
+    });
+    assert!(!engine.take_handshake_request(), "no edge pending initially");
+    engine.request_handshake(0);
+    assert!(engine.take_handshake_request(), "pending edge must be taken");
+    assert!(
+        !engine.take_handshake_request(),
+        "edge must be cleared after one take"
+    );
+}
+
+#[test]
+fn wg_no_session_encap_triggers_single_init_per_interval() {
+    use super::engine::WG_HANDSHAKE_REQUEST_MIN_INTERVAL_NS;
+    // Engine with a configured peer but no installed session: try_encap
+    // returns NoSession, and the control-thread coupling fires exactly
+    // one edge per interval under a flood (the rate-limiter bound).
+    let (_init_priv, init_pub) = keypair();
+    let (_resp_priv, resp_pub) = keypair();
+    let engine = WgEngine::new(WgEngineConfig {
+        local_private_key: _init_priv,
+        listen_port: 51820,
+        peers: vec![WgPeerConfig {
+            pubkey: resp_pub,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+        }],
+    });
+    let _ = init_pub;
+    let pkt = ipv4_packet(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2));
+    let mut out = [0u8; 2048];
+    // Simulate a flood of NoSession packets at the same instant; the
+    // control-thread edge must fire exactly once.
+    let mut edges = 0usize;
+    for _ in 0..256 {
+        match engine.try_encap(&resp_pub, &pkt, &mut out) {
+            Err(EncapError::NoSession) => {
+                if engine.request_handshake(0) {
+                    edges += 1;
+                }
+            }
+            other => panic!("expected NoSession, got {other:?}"),
+        }
+    }
+    assert_eq!(edges, 1, "exactly one handshake edge per interval under flood");
+    // The control thread consumes the single edge.
+    assert!(engine.take_handshake_request());
+    // After the interval, another flood produces one more edge.
+    assert!(engine.request_handshake(WG_HANDSHAKE_REQUEST_MIN_INTERVAL_NS + 1));
+}
+
+#[test]
+fn wg_first_peer_pubkey_and_confirmed_session_helpers() {
+    let (init_engine, _resp_engine, _init_pub, resp_pub) =
+        established_pair(vec!["10.0.0.0/24".parse().unwrap()], vec!["10.0.0.0/24".parse().unwrap()]);
+    assert_eq!(
+        init_engine.first_peer_pubkey(),
+        Some(resp_pub),
+        "first_peer_pubkey returns the configured peer"
+    );
+    // The initiator session is installed pre-confirmed.
+    assert!(
+        init_engine.peer_has_confirmed_session(&resp_pub),
+        "established initiator session is confirmed"
+    );
+    // An engine with a peer but no session reports no confirmed session.
+    let no_session = WgEngine::new(WgEngineConfig {
+        local_private_key: keypair().0,
+        listen_port: 51820,
+        peers: vec![WgPeerConfig {
+            pubkey: resp_pub,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec![],
+        }],
+    });
+    assert!(!no_session.peer_has_confirmed_session(&resp_pub));
+}
+
+#[test]
+fn wg_tai64n_high_water_seed_round_trips_across_engines() {
+    // The reload path seeds a fresh engine's TAI64N high-water from the
+    // prior engine so initiator-timestamp monotonicity survives a
+    // config change rebuild.
+    let priv_key = keypair().0;
+    let resp_pub = keypair().1;
+    let old = WgEngine::new(WgEngineConfig {
+        local_private_key: priv_key,
+        listen_port: 51820,
+        peers: vec![WgPeerConfig {
+            pubkey: resp_pub,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec![],
+        }],
+    });
+    // Drive an initiation so the clock advances past its initial state.
+    let mut out = [0u8; super::WG_MSG_INIT_LEN];
+    old.create_initiation(&resp_pub, &mut out).unwrap();
+    let hw = old.tai64n_high_water().expect("clock advanced");
+
+    let fresh = WgEngine::new(WgEngineConfig {
+        local_private_key: priv_key,
+        listen_port: 51820,
+        peers: vec![WgPeerConfig {
+            pubkey: resp_pub,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec![],
+        }],
+    });
+    fresh.seed_tai64n_high_water(hw);
+    let fresh_hw = fresh.tai64n_high_water().expect("seeded");
+    assert!(
+        fresh_hw >= hw,
+        "seeded high-water must be >= the prior engine's: {fresh_hw:?} >= {hw:?}"
+    );
+}
