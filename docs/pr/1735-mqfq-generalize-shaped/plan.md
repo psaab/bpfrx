@@ -327,6 +327,18 @@ fn maybe_demote_drained_best_effort(queue: &mut CoSQueueRuntime) {
 }
 ```
 
+**Q4 implementation refinement (found during impl):** the
+`pop_snapshot_stack.is_empty()` term was DROPPED from the predicate. The
+non-exact service path (`build_cos_batch_from_queue` →
+`cos_queue_pop_front` with snapshots) leaves committed-batch snapshots
+on the stack, and nothing clears them while the queue stays idle (only a
+subsequent `cos_queue_push_back` clears, at push.rs:38). Those snapshots
+are STALE once the queue is fully drained (no resident items to roll
+back to). Gating on the stack would make demotion structurally
+impossible for non-exact queues. The final predicate is
+`active_flow_buckets == 0 && flow_rr_buckets empty && queued_bytes == 0`;
+dropping the `FlowFairState` box discards the stale snapshots safely.
+
 **Q4 ordering (round-1 Codex):** `maybe_demote_drained_best_effort` runs
 at the END of `apply_cos_send_result` / `apply_cos_prepared_result`,
 strictly AFTER `restore_cos_local_items_inner` has push_fronted every
