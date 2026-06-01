@@ -4513,6 +4513,32 @@ top.
 - **File(s)**: docs/fairness-regimes.md, test/incus/cos-simul-load-smoke.sh,
   docs/pr/1614-multi-rss-cos/plan.md
 
+## #1733 Phase 1 — hard-reject workers>32 + equal-flow (lenient on load/sync)
+- **Timestamp**: 2026-05-31
+- **Action**: Add validateEqualFlowWorkerCapStrict + MaxEqualFlowWorkers
+  const (mirrors rotate_epoch_v8.rs MAX_WORKERS_SCRATCH=32); wire into the
+  #1538 strict-validator accumulator. Commit-time hard-reject of
+  workers>32 with any equal-flow-enforcement scheduler (was a silent
+  release-build runtime fail-open).
+- **File(s)**: pkg/config/compiler.go,
+  pkg/config/compiler_equal_flow_worker_cap_test.go
+- **Action**: Lenient compile mode (CompileConfigLenient /
+  CompileConfigForNodeLenient + Store.compileTreeLenient) used ONLY by
+  Store.Load + Store.SyncApply so an upgraded node boots / HA sync
+  converges on a legacy config (downgrade reject -> cfg.Warnings + WARN,
+  no AST mutation). Effective workers computed by the real compiler =>
+  no false-strip on ${node}/group/split-stanza configs (round-2 fix).
+- **File(s)**: pkg/config/compiler.go, pkg/configstore/store.go,
+  pkg/configstore/equal_flow_worker_cap.go,
+  pkg/configstore/equal_flow_worker_cap_test.go
+- **Action**: Switch read-only peer-interface active-tree re-compiles to
+  CompileConfigForNodeLenient so a tolerated legacy active config does not
+  silently drop peer-interface display (round-3 Codex+AGY converged).
+- **File(s)**: pkg/cli/cli_show_interfaces.go,
+  pkg/grpcapi/server_show_interfaces.go
+- **Action**: Document the 32-worker equal-flow cap + tolerance behavior.
+- **File(s)**: docs/cos-traffic-shaping.md
+
 ## #1432 WireGuard S2a — datapath + UDP socket + config bring-up
 
 - **Timestamp**: 2026-05-31

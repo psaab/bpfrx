@@ -417,6 +417,29 @@ pub(in crate::afxdp) struct CoSInterfaceRuntime {
     /// descending walk (largest-rate-first) the last Phase 2
     /// service event landed.
     pub(in crate::afxdp) waterfill_phase2_cursor: usize,
+    /// #1732: persistent Phase-1 honored bitset for the current waterfill
+    /// epoch. Bit `j` set ⇔ the exact queue at ORDINAL position `j` in
+    /// `exact_queues_by_rate_ascending` was honored in Phase 1 this epoch.
+    /// Keyed by ASCENDING-VEC ORDINAL, NOT by `queue_idx` (the `queues`
+    /// index): both phases iterate this same sorted vec, so ordinal `j`
+    /// unambiguously identifies one queue, and the bit range is bounded by
+    /// `exact_queues_by_rate_ascending.len()` (≤64) regardless of how high
+    /// the underlying `queue_idx` values run. The ordinal keying is the
+    /// fix for the latent defect in the prior function-local `queue_idx`-
+    /// keyed mask, which (a) reset to 0 every selector call so Phase 2 —
+    /// entered on a *later* call than the Phase-1 honors — saw an empty
+    /// mask and could not skip already-honored queues (the documented
+    /// "approximates" skew), and (b) was never read by Phase 1 at all, so
+    /// the smallest-rate queue was re-honored on every call and monopolised
+    /// the Phase-1 budget (skew toward the lowest-rate queue). This bitset
+    /// is now persisted across selector calls, read by BOTH phases (so each
+    /// queue is honored at most once per epoch, smallest-first, and Phase 2
+    /// serves the residual to the larger un-honored queues), and CLEARED at
+    /// the lazy Phase-1 refill where `waterfill_epochs` bumps. The set/skip
+    /// sites guard the shift with `ordinal < 64`, so a (malformed) config
+    /// with >64 exact queues leaves ordinals ≥64 conservatively untracked
+    /// rather than wrapping `1u64 << (≥64)`. Single-writer owner worker.
+    pub(in crate::afxdp) waterfill_honored_epoch_bits: u64,
     /// #1628: completed waterfill epochs (Phase-1 budget refills) on this
     /// interface, THIS WORKER's view. Bumped at the lazy Phase-1 refill
     /// site. NOT a per-queue normalizer (the cross-worker SUM would be
