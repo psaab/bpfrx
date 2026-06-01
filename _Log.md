@@ -4538,3 +4538,39 @@ top.
   pkg/grpcapi/server_show_interfaces.go
 - **Action**: Document the 32-worker equal-flow cap + tolerance behavior.
 - **File(s)**: docs/cos-traffic-shaping.md
+
+## #1432 WireGuard S2a — datapath + UDP socket + config bring-up
+
+- **Timestamp**: 2026-05-31
+  **Action**: Go config DTO + parser + persistent wgN TUN (S2a increment 1)
+  **File(s)**: pkg/config/types_routing.go (Wg* fields on TunnelConfig),
+    pkg/config/compiler_interfaces.go (parseTunnelWireguard + peer),
+    pkg/config/schema.go (wireguardSchemaNode in tunnel + unit tunnel),
+    pkg/dataplane/userspace/tunnels.go (populate Wg* DTO, gate src/dst for WG),
+    pkg/routing/tunnel.go (applyWireguardTunLocked persistent TUN, no flap)
+
+- **Timestamp**: 2026-05-31
+  **Action**: Rust + Go S2a tests; bug fix in NoSession edge (sentinel collision)
+  **File(s)**: userspace-dp/src/afxdp/wg/{engine.rs,tests.rs},
+    userspace-dp/src/afxdp/forwarding_build/tests.rs,
+    userspace-dp/src/afxdp/frame/wg.rs (MTU helper+tests),
+    userspace-dp/src/protocol/snapshot.rs (privkey skip-serialize tests),
+    pkg/dataplane/userspace/manager_test.go, pkg/config/parser_routing_test.go
+  Note: fixed request_handshake/take_handshake_request to use a separate
+  AtomicBool pending flag + AtomicU64 rate-limit clock (the single-u64
+  design collided the 0 sentinel with a t=0 timestamp).
+
+- **Timestamp**: 2026-05-31
+  **Action**: v6 retrans smoke-hold investigation + zero-cost shim fix + attribution
+  **File(s)**: userspace-xdp/src/lib.rs (USERSPACE_CTRL_FLAG_WG_RX flag-gate +
+    wg_steer_to_kernel #[inline(never)]#[cold]), pkg/dataplane/userspace/maps_sync.go
+    (set WG_RX flag at 3 ctrl write sites)
+  Finding: same-session matched A/B on loss cluster (8x v6 -P12 -R each):
+    MASTER (no #1739): 0,0,0,113,0,0,0,8 (v4 sanity 2271 retr). FIXED (#1739):
+    64,0,0,0,0,113,4,71 with 3 throughput-collapse runs (7-15G). Both intermittent
+    non-zero; FIXED clean-run spikes (<=71) <= MASTER (113). Cluster degraded
+    mid-session (collapses). Attribution: v6 retrans is environmental run-to-run
+    variance on the current cluster, NOT a #1739 regression — master spikes too.
+    Kept the zero-cost shim fix regardless (flag-gate => non-WG path pays only a
+    flags bit-test; xdp delta vs master +89 inlined insns -> +34 cold-helper insns,
+    none executed on non-WG path).

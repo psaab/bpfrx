@@ -21,12 +21,18 @@ import (
 )
 
 type userspaceCtrlValue struct {
-	Enabled            uint32
-	MetadataVersion    uint32
-	Workers            uint32
-	QueueCount         uint32
-	Flags              uint32
-	Pad                uint32
+	Enabled         uint32
+	MetadataVersion uint32
+	Workers         uint32
+	QueueCount      uint32
+	Flags           uint32
+	// WgListenPort (#1432 S2a) occupies the former Pad slot before the
+	// u64 ConfigGeneration (the ABI alignment pad the Rust shim's
+	// UserspaceCtrl also exposes as wg_listen_port). Low 16 bits carry
+	// the WG listen port; 0 means no WG tunnel is configured (the shim's
+	// per-CPU "wg_rx" gate). The shim steers local-destination UDP on
+	// this port to the kernel.
+	WgListenPort       uint32
 	ConfigGeneration   uint64
 	FIBGeneration      uint32
 	HeartbeatTimeoutMS uint32
@@ -37,6 +43,11 @@ const userspaceCtrlFlagCPUMap = 1
 const userspaceCtrlFlagTrace = 2
 const userspaceCtrlFlagNativeGRE = 4
 const userspaceCtrlFlagStrict = 8
+
+// userspaceCtrlFlagWgRx (#1432 S2a) is set iff at least one WireGuard
+// tunnel is configured. The shim gates its per-packet WG steering branch
+// on this single bit so non-WG traffic never even loads wg_listen_port.
+const userspaceCtrlFlagWgRx = 16
 const bindingQueuesPerIface = 16 // must match BINDING_QUEUES_PER_IFACE in BPF
 
 const userspaceBindingReady = 1
@@ -133,12 +144,17 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 	if snapshotHasNativeGRE(snapshot) {
 		ctrlFlags |= userspaceCtrlFlagNativeGRE
 	}
+	wgPort := snapshotWgListenPort(snapshot)
+	if wgPort != 0 {
+		ctrlFlags |= userspaceCtrlFlagWgRx
+	}
 	ctrl := userspaceCtrlValue{
 		Enabled:            0,
 		MetadataVersion:    userspaceMetadataVersion,
 		Workers:            uint32(cfg.Workers),
 		QueueCount:         uint32(maxInt(cfg.Workers, 1)),
 		Flags:              ctrlFlags,
+		WgListenPort:       wgPort,
 		ConfigGeneration:   0,
 		FIBGeneration:      0,
 		HeartbeatTimeoutMS: 30000,
@@ -274,6 +290,10 @@ func (m *Manager) blindFailClosedUserspaceCtrlLocked(
 		disabled.QueueCount = uint32(workers)
 		disabled.ConfigGeneration = snapshot.Generation
 		disabled.FIBGeneration = snapshot.FIBGeneration
+		disabled.WgListenPort = snapshotWgListenPort(snapshot)
+		if disabled.WgListenPort != 0 {
+			disabled.Flags |= userspaceCtrlFlagWgRx
+		}
 		if snapshotHasNativeGRE(snapshot) {
 			disabled.Flags |= userspaceCtrlFlagNativeGRE
 		}
@@ -324,6 +344,10 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 	if snapshotHasNativeGRE(m.lastSnapshot) {
 		ctrlFlags |= userspaceCtrlFlagNativeGRE
 	}
+	wgPort := snapshotWgListenPort(m.lastSnapshot)
+	if wgPort != 0 {
+		ctrlFlags |= userspaceCtrlFlagWgRx
+	}
 
 	zero := uint32(0)
 	ctrl := userspaceCtrlValue{
@@ -332,6 +356,7 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		Workers:            uint32(maxInt(status.Workers, 1)),
 		QueueCount:         uint32(queueCountFromBindings(status.Bindings)),
 		Flags:              ctrlFlags,
+		WgListenPort:       wgPort,
 		ConfigGeneration:   status.LastSnapshotGeneration,
 		FIBGeneration:      status.LastFIBGeneration,
 		HeartbeatTimeoutMS: 30000,
@@ -1511,6 +1536,27 @@ func snapshotHasNativeGRE(snapshot *ConfigSnapshot) bool {
 		}
 	}
 	return false
+}
+
+// snapshotWgListenPort returns the WireGuard listen port for the shim
+// ctrl block (#1432 S2a). S2a supports a single WG tunnel, so the first
+// configured mode=="wireguard" endpoint's listen port wins. 0 means no
+// WG tunnel (the shim's per-CPU wg_rx gate stays off). The shim packs
+// this into the low 16 bits of UserspaceCtrl.wg_listen_port and steers
+// local-destination UDP on this port to the kernel.
+func snapshotWgListenPort(snapshot *ConfigSnapshot) uint32 {
+	if snapshot == nil {
+		return 0
+	}
+	for _, endpoint := range snapshot.TunnelEndpoints {
+		if endpoint.ID == 0 || endpoint.Mode != "wireguard" {
+			continue
+		}
+		if endpoint.WgListenPort != 0 {
+			return uint32(endpoint.WgListenPort)
+		}
+	}
+	return 0
 }
 
 func buildNATTranslatedLocalAddressExclusions(snapshot *ConfigSnapshot) (map[uint32]bool, map[[16]byte]bool) {

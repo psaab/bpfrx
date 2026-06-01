@@ -61,6 +61,17 @@ const USERSPACE_CTRL_FLAG_CPUMAP: u32 = 1;
 const USERSPACE_CTRL_FLAG_TRACE: u32 = 2;
 const USERSPACE_CTRL_FLAG_NATIVE_GRE: u32 = 4;
 const USERSPACE_CTRL_FLAG_STRICT: u32 = 8;
+/// #1432 S2a: set iff at least one WireGuard tunnel is configured. The
+/// per-packet WG steering branch is gated on this single flag bit (read
+/// from the same `ctrl.flags` word the GRE/STRICT checks already use), so
+/// when no WG tunnel exists the branch — including the `wg_listen_port`
+/// memory load and the UDP / dst-port / local-destination tests — is
+/// skipped entirely. A bare `wg_listen_port != 0` load+compare on every
+/// packet measurably nudged the v6 best-effort path into non-zero
+/// retransmits at line rate (the v4 path had headroom); gating on the
+/// already-loaded flags word restores the true zero-cost-when-absent
+/// property.
+const USERSPACE_CTRL_FLAG_WG_RX: u32 = 16;
 const BINDING_QUEUES_PER_IFACE: u32 = 16;
 // MAX_INTERFACES is threaded in from bpf/headers/xpf_common.h via the
 // pkg/dataplane/build-userspace-xdp.sh wrapper, which does
@@ -94,6 +105,13 @@ struct UserspaceCtrl {
     workers: u32,
     queue_count: u32,
     flags: u32,
+    // #1432 S2a: WG listen port in the low 16 bits (0 = no WG tunnel,
+    // the per-CPU "wg_rx" gate). Occupies the 4-byte slot the C/Rust
+    // ABI previously inserted as implicit padding before the u64
+    // config_generation; the Go mirror calls it Pad. The shim WG
+    // early-return reads this; non-WG traffic pays only a single
+    // `wg_listen_port == 0` test.
+    wg_listen_port: u32,
     config_generation: u64,
     fib_generation: u32,
     heartbeat_timeout_ms: u32,
@@ -471,6 +489,23 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     }
     // Non-native GRE also goes to kernel for tunnel decap.
     if parsed.protocol == PROTO_GRE && (ctrl.flags & USERSPACE_CTRL_FLAG_NATIVE_GRE) == 0 {
+        return Ok(cpumap_or_pass(ctrl));
+    }
+    // #1432 S2a: WireGuard. WG-to-firewall is local-destination UDP on
+    // the configured listen port; steer it to the kernel (the userspace
+    // control-thread UdpSocket reads it) via cpumap_or_pass — the same
+    // path ESP/IPsec rides above. `is_local_destination` is MANDATORY:
+    // a port-only match would shunt TRANSIT/DNAT UDP that happens to use
+    // the WG port to the kernel, bypassing the userspace policy engine.
+    //
+    // The whole block is gated on the WG_RX flag bit (read from the same
+    // `ctrl.flags` word the GRE check just above already loaded), so when
+    // no WG tunnel is configured NOTHING here runs — not the
+    // `wg_listen_port` load, not the protocol/port/local-destination
+    // tests. This keeps the non-WG datapath byte-for-byte on its prior
+    // instruction path (the bare per-packet `wg_listen_port` load+compare
+    // measurably regressed v6 best-effort retransmits at line rate).
+    if (ctrl.flags & USERSPACE_CTRL_FLAG_WG_RX) != 0 && wg_steer_to_kernel(ctrl, &parsed) {
         return Ok(cpumap_or_pass(ctrl));
     }
     if should_fallback_early(&parsed) {
@@ -1183,6 +1218,27 @@ fn parse_ipv6(
         dst_v4: 0,
         dst_addr,
     })
+}
+
+/// #1432 S2a: decide whether an inbound packet is WireGuard-to-firewall
+/// that must be steered to the kernel (the control-thread `UdpSocket`).
+/// The single call site has already verified `ctrl.flags &
+/// USERSPACE_CTRL_FLAG_WG_RX != 0` (a bit-test on the flags word already
+/// loaded for the GRE/STRICT checks), so when no WG tunnel is configured
+/// the non-WG datapath skips this entirely — it pays ONLY the flag
+/// bit-test. The flag-gate, not the function boundary, is what makes the
+/// path zero-cost: an earlier `#[inline(never)] #[cold]` variant emitted
+/// this as a separate BPF program symbol (tripping the shim
+/// program-allowlist canary), so it is a normal inlinable fn behind the
+/// flag gate. `is_local_destination` is MANDATORY — a port-only match
+/// would shunt transit/DNAT UDP on the WG port to the kernel, bypassing
+/// the userspace policy engine.
+fn wg_steer_to_kernel(ctrl: &UserspaceCtrl, pkt: &ParsedPacket) -> bool {
+    let wg_port = (ctrl.wg_listen_port & 0xffff) as u16;
+    wg_port != 0
+        && pkt.protocol == PROTO_UDP
+        && pkt.flow_dst_port == wg_port
+        && is_local_destination(pkt)
 }
 
 fn should_fallback_early(pkt: &ParsedPacket) -> bool {

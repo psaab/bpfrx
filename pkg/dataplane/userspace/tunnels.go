@@ -41,7 +41,14 @@ func buildTunnelEndpointSnapshots(cfg *config.Config, interfaces []InterfaceSnap
 	out := make([]TunnelEndpointSnapshot, 0)
 	var nextID uint16 = 1
 	addEndpoint := func(ifName string, tunnel *config.TunnelConfig) {
-		if tunnel == nil || tunnel.Source == "" || tunnel.Destination == "" || nextID == 0 {
+		if tunnel == nil || nextID == 0 {
+			return
+		}
+		// WireGuard endpoints carry the peer in WgEndpoint and need no
+		// Source/Destination (#1432 S2a); a WG endpoint configured with
+		// only WgEndpoint must not be dropped by the GRE source/dest gate.
+		isWireguard := tunnel.Mode == "wireguard"
+		if !isWireguard && (tunnel.Source == "" || tunnel.Destination == "") {
 			return
 		}
 		iface, ok := ifaceByName[ifName]
@@ -70,7 +77,16 @@ func buildTunnelEndpointSnapshots(cfg *config.Config, interfaces []InterfaceSnap
 				redundancyGroup = rgByAddress[src.String()]
 			}
 		}
-		out = append(out, TunnelEndpointSnapshot{
+		// For WG the outer family follows the peer endpoint address
+		// (the Source/Destination heuristic above sees empty strings).
+		if isWireguard && tunnel.WgEndpoint != "" {
+			if host, _, err := net.SplitHostPort(tunnel.WgEndpoint); err == nil {
+				if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+					outerFamily = "inet6"
+				}
+			}
+		}
+		snap := TunnelEndpointSnapshot{
 			ID:              nextID,
 			Interface:       ifName,
 			LinuxName:       iface.LinuxName,
@@ -85,7 +101,16 @@ func buildTunnelEndpointSnapshots(cfg *config.Config, interfaces []InterfaceSnap
 			Key:             tunnel.Key,
 			TTL:             tunnel.TTL,
 			TransportTable:  transportTable,
-		})
+		}
+		if isWireguard {
+			snap.WgListenPort = tunnel.WgListenPort
+			snap.WgLocalPrivkeyHex = tunnel.WgLocalPrivkeyHex
+			snap.WgPeerPubkeyHex = tunnel.WgPeerPubkeyHex
+			snap.WgAllowedIPs = tunnel.WgAllowedIPs
+			snap.WgEndpoint = tunnel.WgEndpoint
+			snap.WgKeepaliveSecs = tunnel.WgKeepaliveSecs
+		}
+		out = append(out, snap)
 		nextID++
 	}
 	for _, name := range names {

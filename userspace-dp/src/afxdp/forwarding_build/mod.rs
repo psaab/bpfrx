@@ -28,6 +28,7 @@ mod cos;
 mod fib;
 mod interfaces;
 mod tunnels;
+mod wg;
 mod zones;
 
 #[cfg(test)]
@@ -138,6 +139,11 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
 
     zones::populate_zones(snapshot, &mut state);
     tunnels::populate_tunnel_endpoints(snapshot, &mut state);
+    // #1432 S2a: instantiate one WgEngine per mode=="wireguard" endpoint,
+    // reusing the previous state's engine Arc when the endpoint config is
+    // unchanged (TAI64N + live sessions survive the commit) and seeding a
+    // fresh engine's TAI64N high-water from the prior engine otherwise.
+    wg::populate_wg_engines(&mut state, previous);
 
     let iface_ctx = interfaces::populate_interfaces(
         snapshot,

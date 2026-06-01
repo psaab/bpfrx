@@ -24,8 +24,10 @@ type linkOps interface {
 	LinkSetUp(netlink.Link) error
 	LinkSetDown(netlink.Link) error
 	LinkSetMaster(netlink.Link, netlink.Link) error
+	LinkSetMTU(netlink.Link, int) error
 	LinkList() ([]netlink.Link, error)
 	AddrAdd(netlink.Link, *netlink.Addr) error
+	AddrDel(netlink.Link, *netlink.Addr) error
 	AddrList(netlink.Link, int) ([]netlink.Addr, error)
 }
 
@@ -97,6 +99,17 @@ func (t *tunnelManager) Apply(tunnels []*config.TunnelConfig) error {
 	}
 
 	for _, tc := range tunnels {
+		// WireGuard TUNs are persistent (#1432 S2a, AGY Hazard B): never
+		// delete-and-recreate on reload — that would flap wgN and destroy
+		// its addresses + FRR routes every commit. applyWireguardTunLocked
+		// reuses an existing wgN in place.
+		if tc.Mode == "wireguard" {
+			if err := t.applyWireguardTunLocked(tc); err != nil {
+				slog.Warn("failed to apply wireguard tunnel",
+					"name", tc.Name, "err", err)
+			}
+			continue
+		}
 		if existing, err := t.ops.LinkByName(tc.Name); err == nil {
 			if err := t.ops.LinkDel(existing); err != nil {
 				slog.Warn("failed to replace existing tunnel link",
@@ -282,6 +295,181 @@ func (t *tunnelManager) Apply(tunnels []*config.TunnelConfig) error {
 		}
 	}
 
+	return nil
+}
+
+// WG per-packet outer overhead (must mirror userspace-dp
+// afxdp/wg/mod.rs WG_OVERHEAD_V4/V6): outer IP + UDP(8) + WG data
+// header(16) + Poly1305 tag(16). Plus up to 15 bytes of §5.4.6 pad.
+const (
+	wgOverheadV4 = 20 + 8 + 16 + 16 // 60
+	wgOverheadV6 = 40 + 8 + 16 + 16 // 80
+	wgPadWorst   = 15
+)
+
+// wgTunMTUForEndpoint computes the inner (wgN) MTU cap (#1432 S2a, AGY
+// Hazard A / H2). The kernel must never hand the WG control thread a
+// plaintext packet that, once encapped with the worst-case overhead
+// plus §5.4.6 pad, exceeds the outer MTU and forces outer IP
+// fragmentation. The overhead depends on the outer IP family (the WG
+// peer endpoint address): IPv6-outer is 20 bytes larger. The outer MTU
+// is assumed to be a standard 1500 (S2a single-tunnel); the control
+// thread also enforces an exact pad-aware guard (wg_control.rs), so this
+// is the first line, not the only one.
+func wgTunMTUForEndpoint(tc *config.TunnelConfig) int {
+	const outerMTU = 1500
+	// A configured v4 endpoint uses the v4 overhead; a v6 endpoint (or a
+	// responder-only/roaming endpoint with no configured address, which
+	// the Rust control thread may LEARN as v6 — Codex r4 MAJOR) uses the
+	// larger v6 overhead so the kernel never hands the control thread an
+	// inner packet that the v6-aware encap guard would then drop.
+	overhead := wgOverheadV6
+	if tc.WgEndpoint != "" {
+		if host, _, err := net.SplitHostPort(tc.WgEndpoint); err == nil {
+			if ip := net.ParseIP(host); ip != nil && ip.To4() != nil {
+				overhead = wgOverheadV4
+			}
+		}
+	}
+	return outerMTU - overhead - wgPadWorst
+}
+
+// applyWireguardTunLocked creates (or reuses) the persistent wgN TUN
+// netdev for a WireGuard tunnel endpoint and configures its MTU,
+// addresses, and VRF binding. The device is intentionally NOT tracked
+// in t.tunnels: clearLocked must not delete it on reload (AGY Hazard B
+// — flapping wgN destroys its addresses and FRR routes every commit).
+//
+// Known S2a limitation (AGY M1): because the device is untracked, a WG
+// tunnel REMOVED from the config is not torn down by clearLocked and
+// leaks until `ip link del` or daemon restart. S2a single-tunnel scope
+// accepts this in exchange for reload stability; multi-instance teardown
+// is owned by the S6 grammar work (#1434).
+//
+// The Rust control thread (coordinator/wg_control.rs) attaches to this
+// persistent device by name.
+func (t *tunnelManager) applyWireguardTunLocked(tc *config.TunnelConfig) error {
+	mtu := wgTunMTUForEndpoint(tc)
+	link, err := t.ops.LinkByName(tc.Name)
+	// Copilot C3: only reuse an existing link if it is actually a TUN/TAP.
+	// A name collision with some other interface type (e.g. a leftover
+	// dummy) must be deleted and recreated, not mutated — otherwise we'd
+	// bring up + address + VRF-bind the wrong device, and the Rust side's
+	// open_tun on the same name would then fail.
+	mustCreate := err != nil
+	if err == nil {
+		tt, isTuntap := link.(*netlink.Tuntap)
+		if !isTuntap || tt.Mode != netlink.TUNTAP_MODE_TUN {
+			// Not a TUN (a TAP, or some other type entirely). The Rust
+			// side opens it with IFF_TUN, so a TAP would fail there;
+			// delete + recreate as a TUN rather than mutate the wrong
+			// device (Codex r3 MINOR).
+			slog.Info("replacing non-TUN link before wireguard tun create",
+				"name", tc.Name, "type", link.Type())
+			if delErr := t.ops.LinkDel(link); delErr != nil {
+				return fmt.Errorf("replace non-tun wireguard link %s: %w", tc.Name, delErr)
+			}
+			mustCreate = true
+		}
+	}
+	if mustCreate {
+		// Create a persistent TUN. NonPersist:false keeps the netdev
+		// alive after the creating fd closes, so a reload that does not
+		// touch this device leaves it (and its routes) intact.
+		tun := &netlink.Tuntap{
+			LinkAttrs:  netlink.LinkAttrs{Name: tc.Name, MTU: mtu},
+			Mode:       netlink.TUNTAP_MODE_TUN,
+			Flags:      netlink.TUNTAP_NO_PI,
+			Queues:     1,
+			NonPersist: false,
+		}
+		if addErr := t.ops.LinkAdd(tun); addErr != nil {
+			return fmt.Errorf("create wireguard tun %s: %w", tc.Name, addErr)
+		}
+		closeTuntapFiles(tun.Fds)
+		link = tun
+		// vishvananda/netlink creates a TUN via TUNSETIFF and may return
+		// before the generic LinkAttrs.MTU is applied, leaving the kernel
+		// device at its default MTU on first apply (Codex r4 MAJOR).
+		// Set the MTU explicitly after create so the inner cap is live
+		// immediately, not only after a later reload.
+		if mtuErr := t.ops.LinkSetMTU(link, mtu); mtuErr != nil {
+			slog.Warn("failed to set wireguard tun mtu on create",
+				"name", tc.Name, "mtu", mtu, "err", mtuErr)
+		}
+		slog.Info("wireguard tun created", "name", tc.Name, "mtu", mtu)
+	} else {
+		// Reuse in place; reconcile the MTU if the config changed it
+		// (AGY M4 / Copilot C4 — a stale MTU on reuse, including a
+		// pre-created device, would otherwise persist).
+		if link.Attrs().MTU != mtu {
+			if mtuErr := t.ops.LinkSetMTU(link, mtu); mtuErr != nil {
+				slog.Warn("failed to update wireguard tun mtu",
+					"name", tc.Name, "mtu", mtu, "err", mtuErr)
+			} else {
+				slog.Info("wireguard tun mtu updated", "name", tc.Name, "mtu", mtu)
+			}
+		}
+		slog.Debug("wireguard tun reused", "name", tc.Name)
+	}
+
+	if err := t.ops.LinkSetUp(link); err != nil {
+		slog.Warn("failed to bring up wireguard tun", "name", tc.Name, "err", err)
+	}
+
+	// Symmetric address reconciliation (Copilot C5): because the device
+	// is persistent and never recreated, addresses removed from the config
+	// would otherwise survive every reload and keep being routed. Add
+	// configured addresses not yet present, and delete present addresses
+	// not in the config — while preserving the device itself.
+	want := make(map[string]bool, len(tc.Addresses))
+	for _, addrStr := range tc.Addresses {
+		addr, parseErr := netlink.ParseAddr(addrStr)
+		if parseErr != nil {
+			slog.Warn("invalid wireguard tun address",
+				"name", tc.Name, "addr", addrStr, "err", parseErr)
+			continue
+		}
+		want[addr.IPNet.String()] = true
+	}
+	existing := map[string]bool{}
+	if addrs, listErr := t.ops.AddrList(link, netlink.FAMILY_ALL); listErr == nil {
+		for i := range addrs {
+			a := addrs[i]
+			key := a.IPNet.String()
+			existing[key] = true
+			// Skip link-local (fe80::) — the kernel manages it.
+			if !want[key] && a.IP != nil && !a.IP.IsLinkLocalUnicast() {
+				if delErr := t.ops.AddrDel(link, &a); delErr != nil {
+					slog.Warn("failed to remove stale wireguard tun address",
+						"name", tc.Name, "addr", key, "err", delErr)
+				} else {
+					slog.Info("removed stale wireguard tun address",
+						"name", tc.Name, "addr", key)
+				}
+			}
+		}
+	}
+	for _, addrStr := range tc.Addresses {
+		addr, parseErr := netlink.ParseAddr(addrStr)
+		if parseErr != nil {
+			continue
+		}
+		if existing[addr.IPNet.String()] {
+			continue
+		}
+		if addErr := t.ops.AddrAdd(link, addr); addErr != nil {
+			slog.Warn("failed to add wireguard tun address",
+				"name", tc.Name, "addr", addrStr, "err", addErr)
+		}
+	}
+
+	if tc.RoutingInstance != "" {
+		if bindErr := t.vrfBinder.BindInterfaceToVRF(tc.Name, tc.RoutingInstance); bindErr != nil {
+			slog.Warn("failed to bind wireguard tun to VRF",
+				"name", tc.Name, "vrf", tc.RoutingInstance, "err", bindErr)
+		}
+	}
 	return nil
 }
 

@@ -9,6 +9,7 @@ mod refresh_bindings;
 mod session_manager;
 mod status;
 mod supervisor;
+mod wg_control;
 mod worker_manager;
 pub(crate) use bpf_maps::BpfMaps;
 pub(crate) use cos_state::SharedCoSState;
@@ -28,6 +29,12 @@ pub struct Coordinator {
     pub(crate) slow_path: Option<Arc<SlowPathReinjector>>,
     pub(crate) local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>>,
     pub(crate) tunnel_sources: BTreeMap<u16, LocalTunnelSourceHandle>,
+    /// #1432 S2a: WG control threads keyed by tunnel_endpoint_id. The
+    /// `usize` is the address of the `Arc<WgEngine>` the thread was
+    /// spawned with, so the runtime-refresh reconcile can detect a
+    /// config change (fresh engine ⇒ different Arc ⇒ restart) vs an
+    /// unchanged endpoint (reused Arc ⇒ keep the thread running).
+    pub(crate) wg_control_threads: BTreeMap<u16, (LocalTunnelSourceHandle, usize)>,
     pub(crate) last_slow_path_status: SlowPathStatus,
     pub(in crate::afxdp) ha: HaState,
     pub(crate) cos: SharedCoSState,
@@ -66,6 +73,7 @@ impl Coordinator {
             slow_path: None,
             local_tunnel_deliveries: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             tunnel_sources: BTreeMap::new(),
+            wg_control_threads: BTreeMap::new(),
             last_slow_path_status: SlowPathStatus::default(),
             ha: HaState::new(),
             cos: SharedCoSState::new(),
@@ -217,6 +225,18 @@ impl Coordinator {
         self.tunnel_sources.clear();
         self.local_tunnel_deliveries
             .store(Arc::new(BTreeMap::new()));
+        // #1432 S2a: stop + join WG control threads. The persistent wgN
+        // TUN is owned by the Go control plane and intentionally NOT
+        // torn down here (it must survive a reload — AGY r3 Hazard B).
+        for (handle, _) in self.wg_control_threads.values_mut() {
+            handle.stop.store(true, Ordering::Relaxed);
+        }
+        for (_, (handle, _)) in self.wg_control_threads.iter_mut() {
+            if let Some(join) = handle.join.take() {
+                let _ = join.join();
+            }
+        }
+        self.wg_control_threads.clear();
         self.workers.stop_and_clear(
             self.bpf_maps.map_fd.as_ref(),
             self.bpf_maps.heartbeat_map_fd.as_ref(),
@@ -430,6 +450,120 @@ impl Coordinator {
             .store(Arc::new(local_tunnel_deliveries));
     }
 
+    /// #1432 S2a: reconcile WG control threads against the current
+    /// `forwarding.wg_engines`. Called from both initial worker bring-up
+    /// AND `refresh_runtime_snapshot` (Copilot C1: a same-plan apply that
+    /// adds/removes/changes a WG endpoint must not leave stale threads).
+    ///
+    /// Per endpoint id:
+    ///   - running thread whose endpoint vanished, is no longer WG, or
+    ///     whose engine `Arc` address changed (a config change rebuilt a
+    ///     fresh engine — `forwarding_build::wg`) ⇒ stop + join + drop.
+    ///   - a WG engine with no running thread (or just stopped above) ⇒
+    ///     spawn a fresh control thread bound to the current engine.
+    /// An unchanged endpoint (reused engine Arc, §4.2) keeps its thread.
+    fn spawn_wg_control_threads(&mut self) {
+        // Current WG engines keyed by id, with their Arc address identity.
+        let mut desired: BTreeMap<u16, usize> = BTreeMap::new();
+        for endpoint in self.forwarding.tunnel_endpoints.values() {
+            if endpoint.mode != "wireguard" {
+                continue;
+            }
+            if let Some(engine) = self.forwarding.wg_engines.get(&endpoint.id) {
+                desired.insert(endpoint.id, Arc::as_ptr(engine) as usize);
+            }
+        }
+
+        // Stop + join threads that are stale (gone, or engine Arc changed).
+        let stale: Vec<u16> = self
+            .wg_control_threads
+            .iter()
+            .filter(|(id, (_, engine_ptr))| desired.get(id) != Some(engine_ptr))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stale {
+            if let Some((mut handle, _)) = self.wg_control_threads.remove(&id) {
+                handle.stop.store(true, Ordering::Relaxed);
+                if let Some(join) = handle.join.take() {
+                    let _ = join.join();
+                }
+            }
+        }
+
+        // Spawn threads for WG engines that have none running.
+        for endpoint in self.forwarding.tunnel_endpoints.values() {
+            if endpoint.mode != "wireguard" {
+                continue;
+            }
+            let id = endpoint.id;
+            if self.wg_control_threads.contains_key(&id) {
+                continue;
+            }
+            let Some(engine) = self.forwarding.wg_engines.get(&id).cloned() else {
+                continue;
+            };
+            let engine_ptr = Arc::as_ptr(&engine) as usize;
+            let Some(tunnel_name) = self
+                .forwarding
+                .ifindex_to_name
+                .get(&endpoint.logical_ifindex)
+                .cloned()
+            else {
+                continue;
+            };
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_clone = stop.clone();
+            let recent_exceptions = self.recent_exceptions.clone();
+            let tunnel_endpoint_id = id;
+            let listen_port = endpoint.wg_listen_port;
+            let peer_endpoint = endpoint.wg_endpoint;
+            let thread_tunnel_name = tunnel_name.clone();
+            let join = spawn_supervised_aux(
+                format!("xpf-wg-control-{tunnel_name}"),
+                move || {
+                    wg_control::wg_control_loop(
+                        thread_tunnel_name,
+                        tunnel_endpoint_id,
+                        engine,
+                        listen_port,
+                        peer_endpoint,
+                        recent_exceptions,
+                        stop_clone,
+                    );
+                },
+            );
+            match join {
+                Ok(join) => {
+                    self.wg_control_threads.insert(
+                        tunnel_endpoint_id,
+                        (
+                            LocalTunnelSourceHandle {
+                                stop,
+                                join: Some(join),
+                            },
+                            engine_ptr,
+                        ),
+                    );
+                }
+                Err(err) => {
+                    if let Ok(mut recent) = self.recent_exceptions.lock() {
+                        push_recent_exception(
+                            &mut recent,
+                            ExceptionStatus {
+                                timestamp: Utc::now(),
+                                interface: tunnel_name,
+                                reason: format!(
+                                    "spawn_wg_control_failed:{tunnel_endpoint_id}:{err}"
+                                ),
+                                ..ExceptionStatus::default()
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Refresh fabric link info from updated snapshots. Called when the
     /// Go daemon's refreshFabricFwd resolves a peer MAC that wasn't
     /// available at initial snapshot build time.
@@ -555,6 +689,11 @@ impl Coordinator {
         }
         self.shared_validation.store(Arc::new(self.validation));
         self.ha.forwarding.store(Arc::new(self.forwarding.clone()));
+        // #1432 S2a (Copilot C1): reconcile WG control threads on every
+        // runtime-snapshot refresh, not just initial bring-up, so a
+        // same-plan apply that adds/removes/changes a WG endpoint starts,
+        // stops, or restarts the matching UDP/TUN control thread.
+        self.spawn_wg_control_threads();
         self.refresh_cos_owner_worker_map_from_identities();
         self.ha
             .fabrics

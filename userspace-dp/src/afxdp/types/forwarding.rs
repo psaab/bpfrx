@@ -22,6 +22,16 @@ pub(in crate::afxdp) struct ForwardingState {
     pub(in crate::afxdp) routes_v6: FastMap<String, Vec<RouteEntryV6>>,
     pub(in crate::afxdp) tunnel_endpoints: FastMap<u16, TunnelEndpoint>,
     pub(in crate::afxdp) tunnel_endpoint_by_ifindex: FastMap<i32, u16>,
+    /// WireGuard engines keyed by tunnel_endpoint_id (#1432 S2a). One
+    /// per `mode == "wireguard"` endpoint. Shared (`Arc`) so workers
+    /// hold the engine across a forwarding-state ArcSwap; engine
+    /// identity is reused across reloads when the endpoint config is
+    /// unchanged (see `forwarding_build::wg`), so the TAI64N clock and
+    /// live sessions survive a commit that does not touch the tunnel.
+    pub(in crate::afxdp) wg_engines: FastMap<u16, std::sync::Arc<crate::afxdp::wg::WgEngine>>,
+    /// True iff any WG engine is configured. Cheap single-bool gate so
+    /// non-WG paths never probe `wg_engines` per packet (#1432 §4.5).
+    pub(in crate::afxdp) has_wg_tunnels: bool,
     pub(in crate::afxdp) neighbors: FastMap<(i32, IpAddr), NeighborEntry>,
     pub(in crate::afxdp) ifindex_to_name: FastMap<i32, String>,
     pub(in crate::afxdp) ifindex_to_config_name: FastMap<i32, String>,
@@ -152,7 +162,7 @@ pub(in crate::afxdp) struct EgressInterface {
 }
 
 #[allow(dead_code)]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(in crate::afxdp) struct TunnelEndpoint {
     pub(in crate::afxdp) id: u16,
     pub(in crate::afxdp) logical_ifindex: i32,
@@ -164,6 +174,47 @@ pub(in crate::afxdp) struct TunnelEndpoint {
     pub(in crate::afxdp) key: u32,
     pub(in crate::afxdp) ttl: u8,
     pub(in crate::afxdp) transport_table: String,
+    // WireGuard (#1432 S2a). Populated only when mode == "wireguard".
+    pub(in crate::afxdp) wg_listen_port: u16,
+    /// Local static X25519 private key, hex-decoded. Zeroized on drop
+    /// and redacted in Debug — must never leak via `{:?}` or the
+    /// on-disk state snapshot.
+    pub(in crate::afxdp) wg_local_privkey: zeroize::Zeroizing<[u8; 32]>,
+    pub(in crate::afxdp) wg_peer_pubkey: [u8; 32],
+    pub(in crate::afxdp) wg_allowed_ips: Vec<ipnet::IpNet>,
+    pub(in crate::afxdp) wg_endpoint: Option<std::net::SocketAddr>,
+    pub(in crate::afxdp) wg_keepalive_secs: u16,
+}
+
+impl std::fmt::Debug for TunnelEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact wg_local_privkey end-to-end (#1432 S2a invariant).
+        f.debug_struct("TunnelEndpoint")
+            .field("id", &self.id)
+            .field("logical_ifindex", &self.logical_ifindex)
+            .field("redundancy_group", &self.redundancy_group)
+            .field("mode", &self.mode)
+            .field("outer_family", &self.outer_family)
+            .field("source", &self.source)
+            .field("destination", &self.destination)
+            .field("key", &self.key)
+            .field("ttl", &self.ttl)
+            .field("transport_table", &self.transport_table)
+            .field("wg_listen_port", &self.wg_listen_port)
+            .field(
+                "wg_local_privkey",
+                &if self.mode == "wireguard" {
+                    "<redacted>"
+                } else {
+                    "<unset>"
+                },
+            )
+            .field("wg_peer_pubkey", &self.wg_peer_pubkey)
+            .field("wg_allowed_ips", &self.wg_allowed_ips)
+            .field("wg_endpoint", &self.wg_endpoint)
+            .field("wg_keepalive_secs", &self.wg_keepalive_secs)
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

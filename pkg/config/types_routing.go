@@ -1,5 +1,7 @@
 package config
 
+import "fmt"
+
 // Routing: routing-options, policy-options, dynamic protocols
 // (OSPF/OSPFv3/BGP/RIP/IS-IS/LLDP), router advertisement, tunnels, and
 // VRF routing instances.
@@ -300,6 +302,37 @@ type TunnelConfig struct {
 	Keepalive       int      // keepalive interval in seconds (0 = disabled)
 	KeepaliveRetry  int      // number of missed keepalives before declaring down (0 = default 3)
 	AnchorOnly      bool     // create a dummy anchor instead of a kernel tunnel device
+
+	// WireGuard (#1432 S2a). Populated only when Mode == "wireguard".
+	// Minimal generic surface (the #1703 "generic stanza") — not the
+	// full Junos wireguard grammar (S6). The engine keys encap on
+	// WgPeerPubkeyHex, NOT AllowedIPs LPM (cryptokey-routing safety).
+	WgListenPort      uint16   // local UDP listen port for inbound WG
+	WgLocalPrivkeyHex string   // local static X25519 private key (hex, 64 chars)
+	WgPeerPubkeyHex   string   // peer static X25519 public key (hex)
+	WgAllowedIPs      []string // peer AllowedIPs (CIDR); decap inner-src gate only
+	WgEndpoint        string   // optional peer endpoint IP:port (initiator role)
+	WgKeepaliveSecs   uint16   // optional persistent-keepalive seconds (0 = off)
+}
+
+// String redacts WgLocalPrivkeyHex so a `%v`/`%s`/slog format of a
+// TunnelConfig never leaks the WireGuard private key (#1432 S2a privkey
+// hygiene, AGY M2). The Rust side already zeroizes + redacts its copy;
+// this closes the Go-side cleartext-log exposure.
+func (tc *TunnelConfig) String() string {
+	if tc == nil {
+		return "<nil>"
+	}
+	priv := "<unset>"
+	if tc.WgLocalPrivkeyHex != "" {
+		priv = "<redacted>"
+	}
+	return fmt.Sprintf("TunnelConfig{Name:%s Mode:%s Source:%s Destination:%s "+
+		"WgListenPort:%d WgLocalPrivkeyHex:%s WgPeerPubkeyHex:%s "+
+		"WgAllowedIPs:%v WgEndpoint:%s WgKeepaliveSecs:%d}",
+		tc.Name, tc.Mode, tc.Source, tc.Destination,
+		tc.WgListenPort, priv, tc.WgPeerPubkeyHex,
+		tc.WgAllowedIPs, tc.WgEndpoint, tc.WgKeepaliveSecs)
 }
 
 // RoutingInstanceConfig represents a VRF-based routing instance.

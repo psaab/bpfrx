@@ -360,4 +360,5 @@ pub(super) fn bring_up_workers(
         coord.neighbors.warm_stop = Some(warm_stop);
     }
     coord.spawn_local_tunnel_sources();
+    coord.spawn_wg_control_threads();
 }

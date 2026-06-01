@@ -55,7 +55,7 @@ fn parse_outer_addresses(frame: &[u8], meta: UserspaceDpMeta) -> Option<(IpAddr,
     }
 }
 
-fn packet_trimmed_len(packet: &[u8], addr_family: u8) -> Option<usize> {
+pub(in crate::afxdp) fn packet_trimmed_len(packet: &[u8], addr_family: u8) -> Option<usize> {
     match addr_family as i32 {
         libc::AF_INET => {
             if packet.len() < 20 {

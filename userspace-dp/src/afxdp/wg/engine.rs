@@ -307,6 +307,39 @@ pub(crate) struct WgEngine {
     /// reconcile; only peer REMOVAL touches both (we drain a
     /// dropped peer's sessions out of this map during reconcile).
     pub(in crate::afxdp::wg) sessions_by_local_index: RwLock<FxHashMap<u32, Arc<WgSession>>>,
+    /// Worker→control "please initiate a handshake" edge (#1432 S2a
+    /// §4.3). When an egress `try_encap` hits `NoSession`, the worker
+    /// arms this edge via a single relaxed atomic store, rate-limited by
+    /// `handshake_request_last_ns` to at most one edge per
+    /// `WG_HANDSHAKE_REQUEST_MIN_INTERVAL_NS`. The control thread polls
+    /// and consumes it. This is the ONLY worker→control coupling in S2a
+    /// and it carries no packet data — the worker never builds a
+    /// `HandshakeState` (control-thread-only crypto invariant, §6).
+    pub(in crate::afxdp::wg) handshake_request_pending: std::sync::atomic::AtomicBool,
+    /// Monotonic timestamp of the last accepted request edge (0 = never).
+    /// Used only for the rate-limit gate; distinct from the pending flag
+    /// so a request at `now_ns == 0` (tests) is not confused with "no
+    /// request".
+    pub(in crate::afxdp::wg) handshake_request_last_ns: std::sync::atomic::AtomicU64,
+}
+
+/// Minimum spacing between worker-driven "please initiate" edges
+/// (#1432 S2a). Bounds the NoSession signal under a packet flood to one
+/// edge per second so a stream of pre-handshake packets cannot spin the
+/// control thread.
+pub(crate) const WG_HANDSHAKE_REQUEST_MIN_INTERVAL_NS: u64 = 1_000_000_000;
+
+impl std::fmt::Debug for WgEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact all key material. Only the non-secret listen port is
+        // surfaced — `local_private_key` must never reach a log line,
+        // and the peer table / session maps carry session keys behind
+        // their own types. This keeps `ForwardingState`'s derived
+        // `Debug` (which now holds `Arc<WgEngine>`) leak-free.
+        f.debug_struct("WgEngine")
+            .field("listen_port", &self.listen_port)
+            .finish_non_exhaustive()
+    }
 }
 
 impl WgEngine {
@@ -323,9 +356,70 @@ impl WgEngine {
             table: ArcSwap::from_pointee(PeerTable::empty()),
             reconcile_lock: std::sync::Mutex::new(()),
             sessions_by_local_index: RwLock::new(FxHashMap::default()),
+            handshake_request_pending: std::sync::atomic::AtomicBool::new(false),
+            handshake_request_last_ns: std::sync::atomic::AtomicU64::new(0),
         };
         engine.reconcile_peers(&config.peers);
         engine
+    }
+
+    /// Worker side of the NoSession handshake-request edge (#1432 S2a
+    /// §4.3). Records a "please initiate" request at `now_ns`, rate-
+    /// limited to one edge per `WG_HANDSHAKE_REQUEST_MIN_INTERVAL_NS`.
+    /// Hot-path safe: a single relaxed load plus an at-most-one relaxed
+    /// store, no lock, no handshake state. Returns `true` if this call
+    /// recorded a fresh edge.
+    pub(crate) fn request_handshake(&self, now_ns: u64) -> bool {
+        use std::sync::atomic::Ordering;
+        let last = self.handshake_request_last_ns.load(Ordering::Relaxed);
+        // `last == 0` means "never requested" → always allow the first.
+        if last != 0 && now_ns.saturating_sub(last) < WG_HANDSHAKE_REQUEST_MIN_INTERVAL_NS {
+            return false;
+        }
+        // Claim the rate-limit window with a CAS so exactly one concurrent
+        // NoSession caller wins per interval (Copilot: a plain load+store
+        // let multiple workers all observe the stale `last` and re-arm the
+        // edge each tick). A CAS failure means another worker already
+        // claimed the window; we drop without re-arming. Relaxed is
+        // sufficient — the control thread only needs eventual visibility,
+        // and a lost CAS merely means a peer worker recorded the edge.
+        let stamp = now_ns.max(1);
+        if self
+            .handshake_request_last_ns
+            .compare_exchange(last, stamp, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
+        }
+        self.handshake_request_pending.store(true, Ordering::Relaxed);
+        true
+    }
+
+    /// Control side of the NoSession edge. Returns `true` if a handshake
+    /// request is pending and clears it. Slow path (control thread).
+    pub(crate) fn take_handshake_request(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.handshake_request_pending.swap(false, Ordering::Relaxed)
+    }
+
+    /// The pubkey of the first (S2a: only) configured peer, if any.
+    /// Used by the control thread to drive initiator bring-up without
+    /// re-plumbing the peer config through the spawn site.
+    pub(crate) fn first_peer_pubkey(&self) -> Option<[u8; WG_KEY_LEN]> {
+        self.load_table().peers.first().map(|p| p.pubkey)
+    }
+
+    /// Whether the named peer currently has a confirmed (usable for
+    /// egress) transport session. Control thread uses this to decide
+    /// whether to (re-)initiate a handshake. Slow path.
+    pub(crate) fn peer_has_confirmed_session(&self, pubkey: &[u8; 32]) -> bool {
+        let Some(peer) = self.peer_arc(pubkey) else {
+            return false;
+        };
+        matches!(
+            peer.current.read().unwrap().as_ref(),
+            Some(session) if session.is_confirmed()
+        )
     }
 
     /// xpf's local static public key (X25519). The peer needs this to
@@ -337,6 +431,24 @@ impl WgEngine {
 
     pub(crate) fn listen_port(&self) -> u16 {
         self.listen_port
+    }
+
+    /// Seed the engine's TAI64N high-water mark from a prior engine's
+    /// snapshot so a fresh engine built on a config change does not
+    /// regress the initiator timestamp the peer last accepted (#1432
+    /// S2a reload stability, §4.2). Slow path / build-time only.
+    pub(crate) fn seed_tai64n_high_water(
+        &self,
+        hw: [u8; super::tai64n::TAI64N_LEN],
+    ) {
+        self.tai64n_clock.seed_high_water(hw);
+    }
+
+    /// Snapshot the engine's current TAI64N high-water mark, if any, so
+    /// a successor engine can be seeded from it across a config-change
+    /// rebuild (#1432 S2a). `None` before the first handshake.
+    pub(crate) fn tai64n_high_water(&self) -> Option<[u8; super::tai64n::TAI64N_LEN]> {
+        self.tai64n_clock.high_water()
     }
 
     /// Reconcile the engine's peer table against a new config
