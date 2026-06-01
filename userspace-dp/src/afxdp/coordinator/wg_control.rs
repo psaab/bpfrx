@@ -126,6 +126,14 @@ pub(super) fn wg_control_loop(
 
     let peer_pubkey = engine.first_peer_pubkey();
     let mut last_initiate_ns: u64 = 0;
+    // The endpoint used for egress + re-init. Starts at the configured
+    // `wg_endpoint` (initiator role) and is LEARNED from the source of
+    // any inbound WG datagram for a responder-only peer (Codex BLOCKER:
+    // a responder-only peer has no configured endpoint, so without
+    // endpoint-learning the TUN-read egress would have nowhere to send
+    // and the tunnel would black-hole the reply path). This is the WG
+    // endpoint-roaming behavior peer.rs documents as required.
+    let mut effective_endpoint: Option<SocketAddr> = peer_endpoint;
     // 64 KiB scratch for both directions (max IP packet; WG records are
     // smaller). Single allocation at thread start — no per-packet alloc.
     let mut sock_buf = vec![0u8; 65_535];
@@ -136,9 +144,9 @@ pub(super) fn wg_control_loop(
     // Initial initiator bring-up: if an endpoint is configured, kick a
     // handshake immediately so the tunnel comes up without waiting for
     // egress traffic.
-    if let (Some(ep), Some(pk)) = (peer_endpoint, peer_pubkey) {
+    if let (Some(ep), Some(pk)) = (effective_endpoint, peer_pubkey) {
         last_initiate_ns = monotonic_nanos();
-        drive_initiation(&engine, &socket, &pk, ep, &mut encap_buf);
+        drive_initiation(&engine, &socket, &pk, ep, &mut encap_buf, &tunnel_name, &recent_exceptions);
     }
 
     while !stop.load(Ordering::Relaxed) {
@@ -149,6 +157,15 @@ pub(super) fn wg_control_loop(
             match socket.recv_from(&mut sock_buf) {
                 Ok((len, from)) if len > 0 => {
                     did_work = true;
+                    // Learn / refresh the peer endpoint from the source of
+                    // any inbound datagram (WG roaming + responder-only
+                    // support). We only have one configured peer in S2a,
+                    // so attributing inbound to it is unambiguous; the
+                    // engine still cryptographically authenticates the
+                    // session, so a spoofed source cannot inject traffic,
+                    // only (at worst) redirect our egress — bounded to the
+                    // same single peer.
+                    effective_endpoint = Some(from);
                     dispatch_inbound(
                         &engine,
                         &socket,
@@ -175,7 +192,7 @@ pub(super) fn wg_control_loop(
         }
 
         // --- Egress: TUN → engine → kernel socket ---
-        if let (Some(ep), Some(pk)) = (peer_endpoint, peer_pubkey) {
+        if let (Some(ep), Some(pk)) = (effective_endpoint, peer_pubkey) {
             for _ in 0..WG_RX_BURST {
                 match tun.read(&mut tun_buf) {
                     Ok(len) if len > 0 => {
@@ -203,16 +220,35 @@ pub(super) fn wg_control_loop(
                     }
                 }
             }
+        } else {
+            // Responder-only peer that hasn't been heard from yet: drain
+            // the TUN so the kernel does not back up, but we have no
+            // endpoint to send to until the peer initiates.
+            while let Ok(len) = tun.read(&mut tun_buf) {
+                if len == 0 {
+                    break;
+                }
+                did_work = true;
+            }
         }
 
         // --- Initiator re-init: NoSession edge OR coarse timer ---
-        if let (Some(ep), Some(pk)) = (peer_endpoint, peer_pubkey) {
+        // Only initiate toward an endpoint we actually know (configured
+        // OR learned). A responder-only peer we have never heard from has
+        // no endpoint, so we wait for it to initiate.
+        if let (Some(ep), Some(pk)) = (effective_endpoint, peer_pubkey) {
             let now = monotonic_nanos();
             let requested = engine.take_handshake_request();
             let timer_due = now.saturating_sub(last_initiate_ns) >= WG_INITIATOR_POLL_NS;
-            if (requested || timer_due) && !engine.peer_has_confirmed_session(&pk) {
+            // Only the configured-initiator role re-drives on the timer; a
+            // purely learned endpoint (responder-only) initiates only on
+            // an explicit NoSession egress request, never on the bare
+            // timer, so we don't spam a peer that is the designated
+            // initiator.
+            let allow_timer = peer_endpoint.is_some() && timer_due;
+            if (requested || allow_timer) && !engine.peer_has_confirmed_session(&pk) {
                 last_initiate_ns = now;
-                drive_initiation(&engine, &socket, &pk, ep, &mut encap_buf);
+                drive_initiation(&engine, &socket, &pk, ep, &mut encap_buf, &tunnel_name, &recent_exceptions);
                 did_work = true;
             }
         }
@@ -225,28 +261,75 @@ pub(super) fn wg_control_loop(
 }
 
 /// Bind the WG listen socket. Prefer a v6 dual-stack bind so a single
-/// socket serves v4-mapped and v6 peers; fall back to v4.
+/// socket serves both v4-mapped and v6 peers; fall back to a v4 bind if
+/// the v6 bind fails.
+///
+/// Codex MAJOR: a bare `[::]` bind is v6-ONLY on hosts where
+/// `net.ipv6.bindv6only=1`, silently black-holing v4 peers. We clear
+/// `IPV6_V6ONLY` on the fd before returning so the dual-stack guarantee
+/// holds regardless of the sysctl default. If clearing it fails (e.g. a
+/// hardened kernel forbids it), fall back to a v4 bind so v4 peers — the
+/// common case — are never left unserved.
+///
+/// VRF/routing-instance note (Codex BLOCKER, S2a known limitation): this
+/// socket binds the wildcard address in the MAIN routing table. A WG
+/// tunnel placed inside a routing-instance whose peer route lives only in
+/// that VRF is NOT yet supported — SO_BINDTODEVICE/VRF-fd binding is
+/// owned by the S6 multi-instance work (#1434). S2a single-tunnel scope
+/// is the default table.
 fn bind_wg_socket(port: u16) -> io::Result<UdpSocket> {
     match UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, port)) {
-        Ok(sock) => Ok(sock),
+        Ok(sock) => {
+            if clear_ipv6_v6only(&sock).is_err() {
+                // Could not guarantee dual-stack; rebind v4 so v4 peers work.
+                drop(sock);
+                return UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port));
+            }
+            Ok(sock)
+        }
         Err(_) => UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port)),
     }
 }
 
-/// Build + send a fresh initiation toward the peer endpoint. Errors are
-/// best-effort (the next tick retries); a missing session keeps the
-/// timer armed.
+/// Clear IPV6_V6ONLY so a `[::]` socket also accepts v4-mapped peers.
+fn clear_ipv6_v6only(sock: &UdpSocket) -> io::Result<()> {
+    let off: libc::c_int = 0;
+    let rc = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::IPPROTO_IPV6,
+            libc::IPV6_V6ONLY,
+            &off as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Build + send a fresh initiation toward the peer endpoint. A send
+/// error is surfaced as an exception (the next tick retries); a missing
+/// session keeps the timer armed.
 fn drive_initiation(
     engine: &crate::afxdp::wg::WgEngine,
     socket: &UdpSocket,
     peer_pubkey: &[u8; 32],
     endpoint: SocketAddr,
     out: &mut [u8],
+    tunnel_name: &str,
+    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
 ) {
-    if let Ok(local_index) = engine.create_initiation(peer_pubkey, out) {
+    if let Ok(_local_index) = engine.create_initiation(peer_pubkey, out) {
         let len = crate::afxdp::wg::WG_MSG_INIT_LEN;
-        let _ = socket.send_to(&out[..len], endpoint);
-        let _ = local_index;
+        if let Err(e) = socket.send_to(&out[..len], endpoint) {
+            record_local_tunnel_exception(
+                recent_exceptions,
+                tunnel_name,
+                format!("wg_initiation_send:{endpoint}:{e}"),
+            );
+        }
     }
 }
 

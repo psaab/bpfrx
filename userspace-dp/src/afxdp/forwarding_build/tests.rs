@@ -1992,3 +1992,18 @@ fn wg_reload_seeds_high_water_on_identity_change() {
         "fresh engine TAI64N high-water must be seeded >= the prior engine's"
     );
 }
+
+#[test]
+fn wg_endpoint_with_zero_listen_port_is_dropped() {
+    // A WG tunnel with no listen port cannot bind a socket and is
+    // invisible to the shim gate; it must be dropped, not installed as a
+    // half-dead tunnel binding port 0 (Codex MAJOR).
+    let snap = wg_snapshot(0, &["10.0.0.0/24"], "203.0.113.1:51820");
+    let state = build_forwarding_state(&snap);
+    assert!(
+        !state.tunnel_endpoints.contains_key(&7),
+        "WG endpoint with listen_port 0 must be dropped"
+    );
+    assert!(!state.has_wg_tunnels);
+    assert!(!state.wg_engines.contains_key(&7));
+}

@@ -55,6 +55,13 @@ pub(super) fn populate_tunnel_endpoints(
         let mut wg_allowed_ips: Vec<ipnet::IpNet> = Vec::new();
         let mut wg_endpoint: Option<SocketAddr> = None;
         if is_wireguard {
+            // A WG tunnel with no listen port cannot bind a socket and is
+            // invisible to the shim steering gate (wg_listen_port == 0 ⇒
+            // "no WG"). Drop it rather than install a half-dead tunnel
+            // that binds port 0 (Codex MAJOR).
+            if endpoint.wg_listen_port == 0 {
+                continue;
+            }
             if decode_wg_key_hex(&endpoint.wg_local_privkey_hex, &mut wg_local_privkey).is_err() {
                 continue;
             }
