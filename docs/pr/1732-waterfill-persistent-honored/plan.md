@@ -1,13 +1,10 @@
 # Plan — #1732 CoS GuaranteeRate waterfill: persistent honored set + alloc-free hot path
 
-- **Status**: v4 — round-3 findings folded. Codex r3 PLAN-NEEDS-MAJOR + AGY
-  r3 PLAN-NEEDS-MINOR converged on the SAME two fixes: (1) keep an ordinal
-  `j < 64` guard at the set/skip sites (release strips the debug_assert, so
-  `1u64 << i` with `i >= 64` would wrap to bit 0 and silently corrupt queue
-  0's tracking); (2) §6 had stale `queue_idx < 64` text contradicting the
-  ordinal keying. Both folded. Claude-SMR concurs. Pending round-3 re-verify.
-- **Status history**: v3 — round-2 ordinal-keying folded; v2 — round-1
-  Phase-1-skip FATAL folded; v1 — DRAFT.
+- **Status**: PLAN-READY (v4). Round-4: Codex r4 PLAN-READY + AGY r4
+  PLAN-READY + Claude-SMR concur. All round-1/2/3 findings folded.
+- **Status history**: v4 — round-3 release shift-overflow guard + §6 fix;
+  v3 — round-2 ordinal-keying folded; v2 — round-1 Phase-1-skip FATAL
+  folded; v1 — DRAFT.
 - **Issue**: #1732 (sub-issue of #1731, item #2 / §4.2 of the ENGINEER-READY plan)
 - **Mode**: `/engineer` (= triple-review)
 - **Base**: `origin/master` @ `c9e552689`
