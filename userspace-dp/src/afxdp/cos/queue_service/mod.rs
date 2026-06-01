@@ -804,18 +804,47 @@ fn select_exact_cos_guarantee_queue_waterfill(
         let pass1 = ((quantum_sum as f64) * frac).floor() as u64;
         root.waterfill_pass1_remaining_bytes = pass1;
         root.waterfill_phase2_cursor = 0;
+        // #1732: a new epoch starts here — clear the persistent honored
+        // bitset so this epoch's Phase-1 honors start fresh. This is the
+        // single clear point: the exhaustion path (`:1072` below) resets
+        // `pass1_remaining` to 0, which forces this refill block (and thus
+        // this clear) on the next selector call, so both epoch-exit paths
+        // are covered without a redundant double-clear.
+        root.waterfill_honored_epoch_bits = 0;
         // #1628 site 1: completed-epoch / Phase-1-refill counter. Bumped
         // here (no `queue` borrowed yet) on every lazy refill.
         root.waterfill_epochs = root.waterfill_epochs.wrapping_add(1);
     }
     // Phase 1: ascending-rate walk. Pick the first runnable queue
-    // whose secondary_budget ≤ pass1_remaining. Tracks honored
-    // queues via a bitmask so Phase 2 can skip them. (Bitmask is
-    // safe up to 64 exact queues; deployments well below that.)
-    let mut honored_mask: u64 = 0;
-    let sorted_indices: Vec<usize> = root.exact_queues_by_rate_ascending.clone();
-    for queue_idx in &sorted_indices {
-        let queue_idx = *queue_idx;
+    // whose secondary_budget ≤ pass1_remaining that has NOT already been
+    // honored this epoch.
+    //
+    // #1732: the honored set is the persistent `waterfill_honored_epoch_bits`
+    // on `root`, keyed by the ASCENDING-VEC ORDINAL `i` (NOT `queue_idx`).
+    // It is read by BOTH phases and cleared at the epoch refill above, so
+    // each queue is honored at most once per epoch: without the Phase-1 skip
+    // the smallest-rate queue would be re-honored on every selector call and
+    // monopolise the Phase-1 budget (the lowest-rate skew this fix targets).
+    // Iterating by index over the persistent vec avoids the per-call heap
+    // clone the old code used solely to dodge the `&mut root.queues` borrow
+    // conflict; `queue_idx` is copied out (a `Copy` `usize`) before the
+    // `&mut` borrow, so borrow-split holds with no allocation.
+    let ascending_len = root.exact_queues_by_rate_ascending.len();
+    debug_assert!(
+        ascending_len <= 64,
+        "waterfill honored bitset is u64; >64 exact guarantee queues on one \
+         interface is unsupported (ordinal bit range overflow)"
+    );
+    for i in 0..ascending_len {
+        let queue_idx = root.exact_queues_by_rate_ascending[i];
+        // #1732: at-most-once Phase-1 honor per epoch. Skip a queue already
+        // honored this epoch (by ORDINAL `i`) so the ascending walk advances
+        // to the next-smallest queue instead of re-honoring the smallest one
+        // every call. `i < 64` guards the shift (release strips the
+        // debug_assert; ordinals ≥64 are conservatively untracked).
+        if i < 64 && (root.waterfill_honored_epoch_bits & (1u64 << i)) != 0 {
+            continue;
+        }
         let queue = &mut root.queues[queue_idx];
         if cos_queue_is_empty(queue)
             || !queue.hot.runnable
@@ -925,8 +954,8 @@ fn select_exact_cos_guarantee_queue_waterfill(
         // Phase 2 descending walk.
         if phase1_cost > root.waterfill_pass1_remaining_bytes {
             // Budget exhausted before this ascending queue could
-            // be honored. Fall through to Phase 2 (descending
-            // walk over queues NOT in honored_mask).
+            // be honored. Fall through to Phase 2 (descending walk over
+            // queues NOT in the persistent honored set).
             // #1628 site 3: Phase-1 budget-exhausted break. Per-INTERFACE
             // (the break only sees the first crossing queue). Disjoint
             // `root` field, same pattern as the `:913` write below.
@@ -938,8 +967,12 @@ fn select_exact_cos_guarantee_queue_waterfill(
         root.waterfill_pass1_remaining_bytes = root
             .waterfill_pass1_remaining_bytes
             .saturating_sub(phase1_cost);
-        if queue_idx < 64 {
-            honored_mask |= 1u64 << queue_idx;
+        // #1732: mark this queue honored for the rest of the epoch by its
+        // ASCENDING-VEC ORDINAL `i` (persists into later selector calls; both
+        // phases skip it). `i < 64` guards the shift; ordinals ≥64 are left
+        // untracked rather than wrapping `1u64 << (≥64)`.
+        if i < 64 {
+            root.waterfill_honored_epoch_bits |= 1u64 << i;
         }
         root.exact_guarantee_rr = (queue_idx + 1) % queue_count;
         // #1628 site 4: Phase-1 honor admission. `head` already dropped
@@ -957,33 +990,39 @@ fn select_exact_cos_guarantee_queue_waterfill(
             kind,
         });
     }
-    // Phase 2: descending-rate walk over queues NOT honored above.
-    // honored_mask is empty on this call (we returned on Phase 1
-    // success), so we must rely on the persistent honored set: a
-    // queue is "honored already this epoch" iff
-    // pass1_remaining_bytes < its quantum_bytes (its visit was
-    // skipped this iteration). We approximate by walking
-    // descending and picking the largest queue whose tokens can
-    // sustain a send; this matches the plan's "residual
-    // distributed proportionally to larger queues" intent.
+    // Phase 2: descending-rate walk over queues NOT honored in Phase 1
+    // this epoch.
+    //
+    // #1732: this reads the SAME persistent `waterfill_honored_epoch_bits`
+    // that Phase 1 sets, keyed by the ascending-vec ORDINAL `pos_from_end`,
+    // so it correctly skips queues that already took their Phase-1 guarantee
+    // this epoch and serves the residual to the larger un-honored queues —
+    // the documented descending-residual intent. (Previously this checked an
+    // empty function-local `honored_mask`, which is why the old comment here
+    // admitted it only "approximated".) Iterating `exact_queues_by_rate_
+    // ascending` by index avoids the heap clone the old code used.
     let mut phase2_idx = root.waterfill_phase2_cursor;
-    if phase2_idx >= sorted_indices.len() {
+    if phase2_idx >= ascending_len {
         phase2_idx = 0;
     }
     let start_phase2 = phase2_idx;
     // Walk descending starting from the cursor position
     // (interpreted as "position in the descending walk"). Use a
     // bounded loop to avoid scanning forever.
-    for _step in 0..sorted_indices.len() {
-        // Map cursor → descending iteration: sorted_indices is
-        // ascending, so index from the END.
-        let pos_from_end = sorted_indices.len() - 1 - phase2_idx;
-        let queue_idx = sorted_indices[pos_from_end];
-        // Skip queues honored above (bitmask check; safe to skip
-        // even when bitmask is stale, this just defers their
-        // service one round).
-        if queue_idx < 64 && (honored_mask & (1u64 << queue_idx)) != 0 {
-            phase2_idx = (phase2_idx + 1) % sorted_indices.len();
+    for _step in 0..ascending_len {
+        // Map cursor → descending iteration: the ascending vec is
+        // ascending, so index from the END. `pos_from_end` is the
+        // ascending-vec ORDINAL of the queue visited here — the same key
+        // Phase 1 set.
+        let pos_from_end = ascending_len - 1 - phase2_idx;
+        let queue_idx = root.exact_queues_by_rate_ascending[pos_from_end];
+        // Skip queues honored in Phase 1 this epoch (persistent bitset,
+        // keyed by ordinal). `pos_from_end < 64` guards the shift; ordinals
+        // ≥64 are conservatively untracked (same reason as Phase 1).
+        if pos_from_end < 64
+            && (root.waterfill_honored_epoch_bits & (1u64 << pos_from_end)) != 0
+        {
+            phase2_idx = (phase2_idx + 1) % ascending_len;
             if phase2_idx == start_phase2 {
                 break;
             }
@@ -995,7 +1034,7 @@ fn select_exact_cos_guarantee_queue_waterfill(
             || !queue.config.guarantee_enabled
             || !queue.config.exact
         {
-            phase2_idx = (phase2_idx + 1) % sorted_indices.len();
+            phase2_idx = (phase2_idx + 1) % ascending_len;
             if phase2_idx == start_phase2 {
                 break;
             }
@@ -1010,7 +1049,7 @@ fn select_exact_cos_guarantee_queue_waterfill(
         );
         lease_telemetry.add_assign(top_up);
         let Some(head) = cos_queue_front(queue) else {
-            phase2_idx = (phase2_idx + 1) % sorted_indices.len();
+            phase2_idx = (phase2_idx + 1) % ascending_len;
             if phase2_idx == start_phase2 {
                 break;
             }
@@ -1036,7 +1075,7 @@ fn select_exact_cos_guarantee_queue_waterfill(
             // wait for next epoch. The legacy selector parks; we
             // skip silently here because Phase 2 service is
             // best-effort residual, not a guarantee.
-            phase2_idx = (phase2_idx + 1) % sorted_indices.len();
+            phase2_idx = (phase2_idx + 1) % ascending_len;
             if phase2_idx == start_phase2 {
                 break;
             }
@@ -1050,7 +1089,7 @@ fn select_exact_cos_guarantee_queue_waterfill(
             .tokens
             .min(cos_guarantee_visit_cap_bytes())
             .max(head_len);
-        root.waterfill_phase2_cursor = (phase2_idx + 1) % sorted_indices.len();
+        root.waterfill_phase2_cursor = (phase2_idx + 1) % ascending_len;
         root.exact_guarantee_rr = (queue_idx + 1) % queue_count;
         // #1628 site 6: Phase-2 admission. `head` already dropped (kind
         // hoisted above), so this `&mut queue` write compiles.
