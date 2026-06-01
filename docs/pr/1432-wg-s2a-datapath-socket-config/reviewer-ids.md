@@ -20,3 +20,11 @@ Plan commits: v1 `019e713f1`, v2 `c841cdb29`, v3 (this).
 - Codex: `wg-s2a-plan-r3-1780274137` — PLAN-NEEDS-MINOR (TUN-read MTU pad-aware guard; folded)
 - AGY: `adversarial-review-mpuh8tsf-qvo8cp` — PLAN-READY (MTU cap + persistent TUN + telemetry + DNAT note; folded)
 - Claude-SMR: agree; v3-final folds all three rounds. CLEARED TO IMPLEMENT.
+
+## Implementation review (PR #1739)
+- Codex r1 (impl): session `wg-s2a-impl-r1-*` — 2 BLOCKER + 3 MAJOR; all addressed.
+- AGY r1 (impl): `adversarial-review-mpuiq5an-p0yg0d` — 2 HIGH + 3 MED + 1 LOW; addressed/accepted.
+- Copilot r1: 5 inline (C1 reconcile, C2 MTU guard, C3 non-TUN link, C4 MTU reuse, C5 sym addr); addressed.
+- Codex r3 (confirm): session `wg-s2a-impl-r3-*` (task b9752ybbl) — dispatched.
+- AGY r2 (confirm): `adversarial-review-mpujhrq5-1gnajw` — dispatched.
+- Claude-SMR: in-conversation hostile review each round; ctrl ABI byte-match, fast-path zero-cost, reload Arc reuse, control-thread-only crypto all verified.
