@@ -318,11 +318,16 @@ const (
 // is the first line, not the only one.
 func wgTunMTUForEndpoint(tc *config.TunnelConfig) int {
 	const outerMTU = 1500
-	overhead := wgOverheadV4
+	// A configured v4 endpoint uses the v4 overhead; a v6 endpoint (or a
+	// responder-only/roaming endpoint with no configured address, which
+	// the Rust control thread may LEARN as v6 — Codex r4 MAJOR) uses the
+	// larger v6 overhead so the kernel never hands the control thread an
+	// inner packet that the v6-aware encap guard would then drop.
+	overhead := wgOverheadV6
 	if tc.WgEndpoint != "" {
 		if host, _, err := net.SplitHostPort(tc.WgEndpoint); err == nil {
-			if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
-				overhead = wgOverheadV6
+			if ip := net.ParseIP(host); ip != nil && ip.To4() != nil {
+				overhead = wgOverheadV4
 			}
 		}
 	}
@@ -383,6 +388,15 @@ func (t *tunnelManager) applyWireguardTunLocked(tc *config.TunnelConfig) error {
 		}
 		closeTuntapFiles(tun.Fds)
 		link = tun
+		// vishvananda/netlink creates a TUN via TUNSETIFF and may return
+		// before the generic LinkAttrs.MTU is applied, leaving the kernel
+		// device at its default MTU on first apply (Codex r4 MAJOR).
+		// Set the MTU explicitly after create so the inner cap is live
+		// immediately, not only after a later reload.
+		if mtuErr := t.ops.LinkSetMTU(link, mtu); mtuErr != nil {
+			slog.Warn("failed to set wireguard tun mtu on create",
+				"name", tc.Name, "mtu", mtu, "err", mtuErr)
+		}
 		slog.Info("wireguard tun created", "name", tc.Name, "mtu", mtu)
 	} else {
 		// Reuse in place; reconcile the MTU if the config changed it
