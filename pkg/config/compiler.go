@@ -39,9 +39,40 @@ var ErrEBPFDataplaneRetired = errors.New(
 		"use 'set system dataplane-type userspace' " +
 		"(see #1373)")
 
+// compileOpts carries per-call compilation policy. It is threaded into
+// compileExpanded so the strict commit path and the tolerant
+// load/peer-sync path can share the identical compile + group-expansion
+// pipeline while differing on a single, narrow validator's severity.
+type compileOpts struct {
+	// lenientEqualFlowWorkerCap downgrades the
+	// validateEqualFlowWorkerCapStrict family from a hard compile error
+	// to a cfg.Warnings entry. Set ONLY on the Store.Load / Store.SyncApply
+	// paths (#1733): a node upgraded past the worker-cap gate must still
+	// boot an already-persisted >32-worker + equal-flow config, and an
+	// upgraded standby must still accept such a config peer-synced from an
+	// un-upgraded primary, rather than blacking out or alarm-looping HA
+	// sync. Candidate commit / commit-check stay strict (lenient stays
+	// false there) so new operator edits hard-reject loudly.
+	lenientEqualFlowWorkerCap bool
+}
+
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
 // It clones the tree before expansion so the original tree is not mutated.
 func CompileConfig(tree *ConfigTree) (*Config, error) {
+	return compileConfigWithOpts(tree, compileOpts{})
+}
+
+// CompileConfigLenient is CompileConfig with the #1733 equal-flow
+// worker-cap validator downgraded to a warning. Use ONLY on the
+// Store.Load path so an already-persisted unsupported config boots
+// through (the dataplane already silently fail-opens equal-flow above
+// MaxEqualFlowWorkers, so tolerating the config preserves running
+// behavior). Candidate commit must use the strict CompileConfig.
+func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
+	return compileConfigWithOpts(tree, compileOpts{lenientEqualFlowWorkerCap: true})
+}
+
+func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	// Clone the tree before expanding groups — the caller's tree must retain
 	// groups and apply-groups nodes for display (show configuration groups).
 	tree = tree.Clone()
@@ -60,7 +91,7 @@ func CompileConfig(tree *ConfigTree) (*Config, error) {
 		}
 	}
 
-	cfg, err := compileExpanded(tree)
+	cfg, err := compileExpanded(tree, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -76,6 +107,17 @@ func CompileConfig(tree *ConfigTree) (*Config, error) {
 // resolves to group "node0"). This supports a single shared config for both
 // nodes in a chassis cluster.
 func CompileConfigForNode(tree *ConfigTree, nodeID int) (*Config, error) {
+	return compileConfigForNodeWithOpts(tree, nodeID, compileOpts{})
+}
+
+// CompileConfigForNodeLenient is CompileConfigForNode with the #1733
+// equal-flow worker-cap validator downgraded to a warning. Use ONLY on
+// the Store.SyncApply path (see CompileConfigLenient).
+func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) {
+	return compileConfigForNodeWithOpts(tree, nodeID, compileOpts{lenientEqualFlowWorkerCap: true})
+}
+
+func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts) (*Config, error) {
 	tree = tree.Clone()
 
 	vars := map[string]string{"node": fmt.Sprintf("node%d", nodeID)}
@@ -83,12 +125,12 @@ func CompileConfigForNode(tree *ConfigTree, nodeID int) (*Config, error) {
 		return nil, fmt.Errorf("apply-groups: %w", err)
 	}
 
-	return compileExpanded(tree)
+	return compileExpanded(tree, opts)
 }
 
 // compileExpanded compiles an already-expanded (groups resolved) ConfigTree
 // into a typed Config. Shared by CompileConfig and CompileConfigForNode.
-func compileExpanded(tree *ConfigTree) (*Config, error) {
+func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	cfg := &Config{
 		Security: SecurityConfig{
 			Zones:  make(map[string]*ZoneConfig),
@@ -291,6 +333,20 @@ func compileExpanded(tree *ConfigTree) (*Config, error) {
 	if err := validatePolicySchedulerReferencesStrict(cfg); err != nil {
 		strictErrs = append(strictErrs, err)
 	}
+	if err := validateEqualFlowWorkerCapStrict(cfg); err != nil {
+		// #1733: on the tolerant load/peer-sync path this unsupported
+		// combination is downgraded to a loud warning instead of a hard
+		// reject, so a node upgraded past the gate still boots an
+		// already-persisted config and HA sync does not alarm-loop. The
+		// dataplane already silently fail-opens equal-flow above the cap,
+		// so keeping the config as-is preserves running behavior. The
+		// operator's next candidate commit (strict) hard-rejects.
+		if opts.lenientEqualFlowWorkerCap {
+			cfg.Warnings = append(cfg.Warnings, err.Error())
+		} else {
+			strictErrs = append(strictErrs, err)
+		}
+	}
 	if err := errors.Join(strictErrs...); err != nil {
 		return nil, err
 	}
@@ -479,6 +535,61 @@ func validateClassOfServiceStrict(cos *ClassOfServiceConfig) error {
 					"sum of buffer-size percent across all schedulers is %.4g%% "+
 					"(must not exceed 100%%)",
 				schedMap.Name, totalPercent)
+		}
+	}
+	return nil
+}
+
+// MaxEqualFlowWorkers is the supported worker-thread ceiling for CoS
+// equal-flow-enforcement. It mirrors MAX_WORKERS_SCRATCH in
+// userspace-dp/src/afxdp/types/shared_cos_lease/rotate_epoch_v8.rs:71.
+//
+// The v8 lease rotation sizes its per-worker scratch arrays from this
+// compile-time constant and clamps the sampled worker set to it
+// (`n_workers = len.min(MAX_WORKERS_SCRATCH)`). Any worker beyond this
+// index is "outside scratch": rotate_epoch_v8.rs sets
+// `active_outside_scratch`, and publish_equal_flow_epoch_v8.rs:30 then
+// silently takes `fail_open(UnsampledActiveWorker)` — equal-flow
+// fairness is NOT enforced above this worker count in release builds
+// (the only guard in the dataplane is a `debug_assert`, stripped in
+// release). Rather than accept a config the dataplane will silently
+// fail-open on, reject it loudly at commit (validateEqualFlowWorkerCapStrict)
+// and strip equal-flow on legacy load/sync
+// (configstore.rewriteEqualFlowOverWorkerCap).
+//
+// Removing this cap entirely (reusable heap scratch in the v8 rotation)
+// is tracked as #1731-e; this Go constant and the Rust MAX_WORKERS_SCRATCH
+// must be retired together. TestMaxEqualFlowWorkersMatchesRustScratch
+// pins the value so a future Rust-side change cannot silently desync.
+const MaxEqualFlowWorkers = 32
+
+// validateEqualFlowWorkerCapStrict rejects a config that enables CoS
+// equal-flow-enforcement on more worker threads than the v8 lease
+// rotation can sample (MaxEqualFlowWorkers). Above the cap, equal-flow
+// fairness silently fail-opens in release builds (see the constant's
+// doc comment); a loud commit-time rejection surfaces the unsupported
+// combination to the operator instead.
+//
+// This is one of the independent strict-validator families accumulated
+// in compileExpanded (it reads only cfg.System.UserspaceDataplane and
+// cfg.ClassOfService, depends on no other validator, and fail-fasts on
+// the first offending scheduler).
+func validateEqualFlowWorkerCapStrict(cfg *Config) error {
+	if cfg == nil || cfg.ClassOfService == nil {
+		return nil
+	}
+	usd := cfg.System.UserspaceDataplane
+	if usd == nil || usd.Workers <= MaxEqualFlowWorkers {
+		return nil
+	}
+	for _, sched := range cfg.ClassOfService.Schedulers {
+		if sched != nil && sched.EqualFlowEnforcement {
+			return fmt.Errorf(
+				"class-of-service scheduler %q equal-flow-enforcement is unsupported "+
+					"with system dataplane workers %d (max %d): equal-flow fairness "+
+					"silently fail-opens above %d workers; reduce workers or remove "+
+					"equal-flow-enforcement (cap removal tracked as #1731-e)",
+				sched.Name, usd.Workers, MaxEqualFlowWorkers, MaxEqualFlowWorkers)
 		}
 	}
 	return nil
