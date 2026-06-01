@@ -376,14 +376,21 @@ impl WgEngine {
         if last != 0 && now_ns.saturating_sub(last) < WG_HANDSHAKE_REQUEST_MIN_INTERVAL_NS {
             return false;
         }
-        // Relaxed is sufficient: the control thread only needs eventual
-        // visibility of the edge, and a lost race merely defers the
-        // initiation by one poll tick (the next NoSession re-arms it).
-        // Store a non-zero clock so a request at now_ns==0 still gates
-        // subsequent requests (the +1 only shifts the rate-limit window
-        // by 1ns, immaterial against a 1s interval).
-        self.handshake_request_last_ns
-            .store(now_ns.max(1), Ordering::Relaxed);
+        // Claim the rate-limit window with a CAS so exactly one concurrent
+        // NoSession caller wins per interval (Copilot: a plain load+store
+        // let multiple workers all observe the stale `last` and re-arm the
+        // edge each tick). A CAS failure means another worker already
+        // claimed the window; we drop without re-arming. Relaxed is
+        // sufficient — the control thread only needs eventual visibility,
+        // and a lost CAS merely means a peer worker recorded the edge.
+        let stamp = now_ns.max(1);
+        if self
+            .handshake_request_last_ns
+            .compare_exchange(last, stamp, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
+        }
         self.handshake_request_pending.store(true, Ordering::Relaxed);
         true
     }

@@ -2156,3 +2156,43 @@ fn wg_tai64n_high_water_seed_round_trips_across_engines() {
         "seeded high-water must be >= the prior engine's: {fresh_hw:?} >= {hw:?}"
     );
 }
+
+#[test]
+fn wg_request_handshake_single_edge_under_concurrent_callers() {
+    // Copilot: a plain load+store let multiple concurrent NoSession
+    // callers all observe the stale `last` and each re-arm the edge. The
+    // CAS claim guarantees exactly one caller wins the rate-limit window
+    // per interval. Spawn N threads all calling request_handshake(now=1)
+    // simultaneously; exactly one must observe `true`.
+    use std::sync::Arc as StdArc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let engine = StdArc::new(WgEngine::new(WgEngineConfig {
+        local_private_key: keypair().0,
+        listen_port: 51820,
+        peers: vec![],
+    }));
+    let wins = StdArc::new(AtomicUsize::new(0));
+    let start = StdArc::new(std::sync::Barrier::new(16));
+    let mut handles = Vec::new();
+    for _ in 0..16 {
+        let e = engine.clone();
+        let w = wins.clone();
+        let b = start.clone();
+        handles.push(std::thread::spawn(move || {
+            b.wait();
+            // All callers use the same timestamp inside one interval.
+            if e.request_handshake(1) {
+                w.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    assert_eq!(
+        wins.load(Ordering::Relaxed),
+        1,
+        "exactly one concurrent caller must win the rate-limit window"
+    );
+    assert!(engine.take_handshake_request(), "the winning edge is pending");
+}
