@@ -1,6 +1,6 @@
 # Plan of Action — #1735 (#1731-d): generalize per-flow MQFQ to all shaped queues
 
-- **Status**: DRAFT v1 — pending adversarial plan review (Codex + AGY + Claude-SMR)
+- **Status**: v2 — folds Codex round-1 PLAN-KILL findings (task-mpuie4sw-l40kxh). Pending re-review (Codex + AGY + Claude-SMR)
 - **Issue**: #1735 (sub-issue of #1731; subsumes #7)
 - **Base**: master `7eaec5a2a` (includes #1732 `waterfill_honored_epoch_bits` @ PR #1737, and #1733/#1734)
 - **Research plan (DESIGN-READY, fully specified)**: `docs/research/1731-cos-mqfq-generalize/plan.md` §4.1 (on branch `research/1731-cos-mqfq-generalize`, commit `34112deee`)
@@ -195,64 +195,101 @@ fast path pays ZERO hash. `None == None` (both keyless) is treated as
 bucket-0 behavior for keyless on a promoted queue, and avoids promoting
 on keyless noise).
 
-`promote_to_flow_fair`:
+`promote_to_flow_fair` — **v2: HASH EACH migrated item into its
+correct bucket** (does NOT assume the FIFO is single-flow). This is the
+round-1 Codex Q2 remedy: even though the probe induction (§4.3.1)
+proves a None+eligible FIFO is always 0-or-1-flow, migration that
+*depends* on that invariant is a fragility Codex correctly flagged.
+Hashing each item is provably correct for ANY resident flow mix at
+cost = (FIFO depth) hashes, paid ONCE per promotion (a rare event), and
+reuses the exact `account_cos_queue_flow_enqueue` accounting so there is
+no parallel finish-time math to get wrong:
 
 ```rust
 fn promote_to_flow_fair(queue: &mut CoSQueueRuntime) {
-    let mut ff = Box::new(FlowFairState::new(cos_flow_hash_seed_from_os()));
-    // queue.hot.items is single-flow (probe guarantee). Bulk-move into
-    // one bucket, hash that one flow ONCE.
-    let bucket = match queue.hot.items.front() {
-        Some(front) => cos_flow_bucket_index(ff.flow_hash_seed, cos_item_flow_key(front)),
-        None => { queue.flow_fair_state = Some(ff); return; } // defensive; probe guarantees non-empty
-    };
-    let mut total = 0u64;
-    let mut head_finish_set = false;
-    for item in queue.hot.items.drain(..) {
-        let len = cos_item_len(&item);
-        total = total.saturating_add(len);
-        // tail advances sequentially from queue_vtime=0 base; preserves
-        // FIFO order within the single flow.
-        let new_tail = ff.flow_bucket_tail_finish_bytes[bucket]
-            .max(ff.queue_vtime)
-            .saturating_add(len);
-        ff.flow_bucket_tail_finish_bytes[bucket] = new_tail;
-        if !head_finish_set {
-            ff.flow_bucket_head_finish_bytes[bucket] = new_tail;
-            head_finish_set = true;
+    // Take the resident FIFO out, install empty flow-fair state, then
+    // re-enqueue each item through the SAME accounting path the MQFQ
+    // hot path uses — no bespoke finish-time arithmetic to drift.
+    let resident: VecDeque<CoSPendingTxItem> = std::mem::take(&mut queue.hot.items);
+    queue.flow_fair_state = Some(Box::new(FlowFairState::new(cos_flow_hash_seed_from_os())));
+    // flow_fair() is now true. Re-enqueue preserving FIFO order. Decrement
+    // local_item_count first so re-push_back's increment nets to zero
+    // (items are MOVED, not added). Each item is hashed into its own
+    // bucket, so a multi-flow FIFO migrates correctly (defensive — the
+    // probe makes >1 flow unreachable, but correctness no longer
+    // DEPENDS on that).
+    for item in resident {
+        if matches!(item, CoSPendingTxItem::Local(_)) {
+            queue.hot.local_item_count = queue.hot.local_item_count.saturating_sub(1);
         }
-        ff.flow_bucket_items[bucket].push_back(item);
+        cos_queue_push_back(queue, item); // now takes the MQFQ branch
     }
-    if total > 0 {
-        ff.flow_bucket_bytes[bucket] = total;
-        ff.active_flow_buckets = 1;
-        ff.active_flow_buckets_peak = 1;
-        ff.flow_rr_buckets.push_back(bucket as u16);
-        // v8 lease mirror NOT needed: non-exact queues have queue_lease_v8
-        // == None (verified types/cos.rs:558 doc — "None for non-flow-fair,
-        // non-exact ... queues"). Confirm at impl time.
-    }
-    queue.flow_fair_state = Some(ff);
-    // local_item_count is unchanged — items moved, not added/removed.
-    // The push_back caller proceeds: flow_fair() is now true, so the
-    // incoming (differing) item enqueues via the normal MQFQ branch
-    // into ITS bucket, bumping active_flow_buckets to 2.
 }
 ```
 
+Re-entrancy note: `cos_queue_push_back` calls
+`maybe_promote_best_effort` at its top, but on the re-push the state is
+already `Some`, so the probe's `flow_fair_state.is_some()` guard returns
+immediately (zero cost) and the item enqueues via the MQFQ branch. No
+infinite recursion, no re-probe. The `pop_snapshot_stack.clear()` at
+push.rs:38 is a no-op on the freshly-allocated empty stack.
+
+**v8 lease / V_min:** non-exact queues have `queue_lease_v8 == None`
+and `v_min.vtime_floor == None` (verified `types/cos.rs:558` +
+`:875` docs — both `None` for non-exact). `account_cos_queue_flow_enqueue`'s
+lease-mirror block (`accounting.rs:74`) is gated on
+`queue.queue_lease_v8.as_ref()` being `Some`, so it is a no-op on
+non-exact queues. Confirm at impl with an assert in the migration test.
+
 **Ordering inside `cos_queue_push_back`:** call `maybe_promote_best_effort`
-FIRST (before `account_cos_queue_flow_enqueue`). After it returns,
-`flow_fair()` reflects the post-promotion state, so the existing
-`account_cos_queue_flow_enqueue` + bucket-push branch handles the
-incoming item correctly. The accounting for the *migrated* items is
-done inline in `promote_to_flow_fair` (it sets `flow_bucket_bytes`,
-`active_flow_buckets`, finish-times directly), so we must NOT
-double-account them via `account_cos_queue_flow_enqueue`. The incoming
-item IS accounted by the normal path. **This is the migration seam the
-research plan calls "the riskiest seam, made trivial."** Property tests
-(§9) pin: post-promotion `flow_bucket_bytes[bucket]` == sum of migrated
-lens; `active_flow_buckets` == distinct-flow-count; pop order ==
-original FIFO order for the migrated flow followed by MQFQ interleave.
+FIRST (before the `pop_snapshot_stack.clear()` and
+`account_cos_queue_flow_enqueue`). `maybe_promote_best_effort` does the
+FULL migration (re-enqueueing every resident item through the MQFQ
+accounting path) so when it returns, `flow_fair()` is true and the
+resident items are already accounted in their buckets. The *incoming*
+item then falls through to the existing
+`account_cos_queue_flow_enqueue` + MQFQ bucket-push branch unchanged —
+it is accounted exactly once, by the normal path. Migrated items are
+accounted exactly once, by the re-push inside `promote_to_flow_fair`.
+**No double-accounting** because migration empties `hot.items` via
+`mem::take` before re-pushing, and the incoming item was never in
+`hot.items`. **This is the migration seam the research plan calls "the
+riskiest seam, made trivial" — v2 makes it correctness-independent of
+the single-flow claim by hashing each item.** Property tests (§9) pin:
+post-promotion sum of all `flow_bucket_bytes` == sum of (migrated +
+incoming) lens; `active_flow_buckets` == distinct-flow-count;
+`local_item_count` unchanged; pop order == MQFQ interleave with FIFO
+order preserved within each flow.
+
+#### 4.3.1 Induction proof: a None+eligible queue is always 0-or-1-flow
+
+(Round-1 Codex Q2 adjudication — see §11.) Claim: while
+`flow_fair_state == None && flow_fair_eligible`, `queue.hot.items`
+holds at most one distinct flow key. The only writers to `hot.items`
+on a None queue are `cos_queue_push_back` (probe-gated) and
+`cos_queue_push_front` (retry restore, not probe-gated).
+- **Base:** empty queue — 0 flows. ✓
+- **push_back step:** the probe compares the FIFO front key to the
+  incoming key. If equal (or queue empty) → stays 1 flow. If different →
+  `promote_to_flow_fair` runs and the queue is no longer None. So a
+  push_back never leaves a None queue with 2 distinct flows. ✓
+- **push_front (retry restore) step:** retry items are the
+  un-submitted tail of a batch that `build_cos_batch_from_queue` popped
+  from THIS queue. On a None queue that batch was popped contiguously
+  from the FIFO front (`build_cos_batch_from_queue` pops via
+  `cos_queue_pop_front`, which on a None queue is `hot.items.pop_front`),
+  so the batch — and thus the retry — is a subset of the queue's then-
+  resident single flow. `drain_shaped_tx → submit_cos_batch →
+  apply_cos_send_result → restore_cos_local_items_inner` is **synchronous
+  on one worker thread**; no foreign `push_back` interleaves between the
+  drain and the restore. So push_front re-inserts the same single flow. ✓
+
+The induction holds, so the probe-based promotion is correct. **v2
+additionally makes `promote_to_flow_fair` correct even if the induction
+were violated** (it hashes each item), so the implementation does not
+rely on the proof — the proof justifies the *probe's promote-trigger*
+(promote on first divergence is sufficient), while per-item hashing
+makes the *migration* unconditionally correct. Belt and suspenders.
 
 ### 4.4 Piece 4 — lazy demotion at quiescent settle (with hysteresis)
 
@@ -264,20 +301,43 @@ queued_bytes settle, for a queue that is `flow_fair_eligible &&
 ```rust
 fn maybe_demote_drained_best_effort(queue: &mut CoSQueueRuntime) {
     let Some(ff) = queue.flow_fair_state.as_ref() else { return; };
-    // Quiescent: fully drained AND no in-flight rollback snapshots.
-    if ff.active_flow_buckets != 0 || !ff.pop_snapshot_stack.is_empty() {
-        queue.cos_demote_empty_settles = 0; // reset hysteresis
+    // Quiescent: fully drained AND no in-flight rollback snapshots AND
+    // no resident items in ANY bucket. The three checks are belt-and-
+    // suspenders (Q4): active_flow_buckets==0 already implies every
+    // bucket drained, but cos_queue_is_empty (flow_rr_buckets empty)
+    // is the authoritative "no items" predicate and pins the
+    // invariant against any future accounting drift. queued_bytes==0
+    // cross-checks the byte accounting.
+    if ff.active_flow_buckets != 0
+        || !ff.pop_snapshot_stack.is_empty()
+        || !ff.flow_rr_buckets.is_empty()
+        || queue.hot.queued_bytes != 0
+    {
+        queue.hot.cos_demote_empty_settles = 0; // reset hysteresis
         return;
     }
     // R6 hysteresis: demote only after K consecutive empty settles so a
     // queue oscillating 1<->2 flows doesn't thrash alloc/free of 232 KB.
-    queue.cos_demote_empty_settles = queue.cos_demote_empty_settles.saturating_add(1);
-    if queue.cos_demote_empty_settles >= COS_DEMOTE_EMPTY_SETTLE_HYSTERESIS {
+    queue.hot.cos_demote_empty_settles =
+        queue.hot.cos_demote_empty_settles.saturating_add(1);
+    if queue.hot.cos_demote_empty_settles >= COS_DEMOTE_EMPTY_SETTLE_HYSTERESIS {
         queue.flow_fair_state = None; // drops the ~232 KB box
-        queue.cos_demote_empty_settles = 0;
+        queue.hot.cos_demote_empty_settles = 0;
     }
 }
 ```
+
+**Q4 ordering (round-1 Codex):** `maybe_demote_drained_best_effort` runs
+at the END of `apply_cos_send_result` / `apply_cos_prepared_result`,
+strictly AFTER `restore_cos_local_items_inner` has push_fronted every
+retry item back into the queue and AFTER `queued_bytes` is settled.
+Codex's concern — "a partial-commit retry can leave restored items while
+the counters indicate quiescence" — is answered by this ordering: the
+retry restore *bumps* `active_flow_buckets` (push_front of a drained
+bucket increments it via `push_front_drained_bucket_*`) and
+`queued_bytes` BEFORE the demote check reads them, so a queue with
+restored items is NOT seen as quiescent and is NOT demoted. The demote
+only fires when restore left nothing (full commit, empty queue).
 
 Demotion is exact-queue-EXEMPT: exact queues promoted eagerly at build
 stay promoted for the interface's lifetime (today's behavior — they
@@ -328,9 +388,10 @@ No control-plane / wire / Go change. All edits are
 `cos_queue_push_back/push_front/pop_front*/front/is_empty/len`,
 `apply_cos_send_result/apply_cos_prepared_result`. New private helpers:
 `maybe_promote_best_effort`, `promote_to_flow_fair`,
-`session_keys_equal`, `maybe_demote_drained_best_effort`. New field:
+`session_keys_equal`, `maybe_demote_drained_best_effort`,
+`promote_to_flow_fair`. New field:
 `CoSQueueConfigState.flow_fair_eligible` (rename of `flow_fair`),
-`CoSQueueHotState.cos_demote_empty_settles`.
+`CoSQueueHotState.cos_demote_empty_settles: u8`.
 
 ## 6. Hidden invariants the change must preserve
 
@@ -443,3 +504,83 @@ No control-plane / wire / Go change. All edits are
    exact queues promote eagerly (state always Some)? Audit every
    `config.flow_fair` reader (coordinator/mod.rs:1001, queue_row.rs:110,
    the `flow_fair_eligible` rename targets) for a now-divergent meaning.
+
+## 11. Round-1 adjudication (Codex PLAN-KILL → v2 remedies)
+
+Codex round-1 (`task-mpuie4sw-l40kxh`) returned PLAN-KILL. Each
+finding and the v2 remedy:
+
+- **[Q2 critical — front-key guard not a single-flow guarantee]:**
+  Codex is right that *relying* on the front-key probe to guarantee a
+  single-flow FIFO for migration is fragile. **Remedy:** §4.3
+  `promote_to_flow_fair` v2 hashes EACH migrated item into its own
+  bucket via the existing `account_cos_queue_flow_enqueue` path, so
+  migration is correct for ANY flow mix — it no longer depends on the
+  single-flow claim. §4.3.1 additionally proves (induction) the FIFO is
+  in fact 0-or-1-flow, but that proof now only justifies *when to
+  promote* (first divergence is sufficient), not migration correctness.
+  Codex's counter-example (restore push_front making a None queue
+  mixed) is shown non-materializing in §4.3.1 (synchronous single-
+  thread drain→restore, retry is a subset of the resident single flow),
+  AND is rendered harmless by per-item hashing regardless.
+- **[Q3 high — admission/promotion ordering asymmetry]:** The promoting
+  packet is admitted under FIFO (1-flow, buffer-bound) semantics, then
+  promotes. This is byte-identical to TODAY's best-effort admission for
+  that packet (best-effort queues have no per-flow cap today). The
+  per-flow gate that appears post-promotion only *tightens* admission,
+  and the first packet of any flow always passes the per-flow gate (its
+  bucket is empty, `prospective_active` reserves +1, so
+  `cos_queue_flow_share_limit` admits). So there is no off-by-one DROP:
+  the promoting packet is admitted under rules no stricter than today,
+  and the next packet sees the (looser-or-equal at flow-start) per-flow
+  gate. ECN: the promoting packet is marked under the aggregate arm
+  (today's best-effort behavior); subsequent packets use the per-flow
+  arm. No mis-mark — both are valid congestion signals. Test: assert the
+  promoting packet's admit/mark decision equals the pre-change
+  best-effort decision.
+- **[Q4 high — demotion quiescence not provable]:** §4.4 v2 tightens the
+  predicate to `active_flow_buckets==0 && pop_snapshot_stack empty &&
+  flow_rr_buckets empty && queued_bytes==0`, and pins the ORDERING:
+  demote runs AFTER `restore_cos_local_items_inner`, so any restored
+  retry item has already re-bumped `active_flow_buckets`/`queued_bytes`
+  and blocks demotion. A partial-commit retry therefore CANNOT be seen
+  as quiescent. Demotion only fires on a fully-committed empty queue.
+- **[Q5 high — cost not proven byte-identical; measure first]:** Agreed
+  — the plan does NOT claim byte-identical without proof. The
+  uncontended single-flow push_back adds exactly: one
+  `config.flow_fair_eligible` byte load + `flow_fair_state.is_some()`
+  (a null-pointer test on the `Option<Box>`) + `hot.items.front()`
+  (already loaded — the FIFO is touched by the existing push) + a
+  `cos_item_flow_key` front read + `session_keys_equal` short-circuit
+  (returns on first field mismatch; both-None returns "same"). All on
+  data already in cache. **This is gated, not assumed:** Pass-A CoS-OFF
+  `-P12 -R` line-rate (~23G) is a HARD merge-blocker (§8), and impl adds
+  a criterion-style microbench (push_back single-flow ns) to the test
+  suite. If `-P12 -R` regresses, PLAN-KILL on measurement.
+- **[Q6 medium — flow_fair()=is_some() broad change; audit incomplete]:**
+  Completed audit. `config.flow_fair` readers: (a) `flow_fair()`
+  accessor (rewritten); (b) `promote_cos_queue_flow_fair` writer
+  (rewritten to set `flow_fair_eligible` + eager exact promotion);
+  (c) status snapshot `queue_row.rs:110` sets `status.flow_fair` from
+  the runtime `flow_fair()` — now reports a non-exact queue as flow_fair
+  iff currently promoted, which is MORE accurate, not a regression;
+  (d) `coordinator/mod.rs:1001` OR-aggregates the status field across
+  workers — unaffected (consumes the snapshot field, not config).
+  Exact queues: `is_some()` is always true (eager promotion at build,
+  never demoted), so exact behavior is byte-identical. Test:
+  exact-queue flow_fair()==true at build and after drain-to-empty
+  (no demotion).
+- **[Migration seam / lease — under-specified]:** §4.3 v2 reuses
+  `account_cos_queue_flow_enqueue` (single accounting source of truth)
+  and documents the `local_item_count` net-zero handoff + the
+  `queue_lease_v8 == None` / `vtime_floor == None` no-op on non-exact
+  queues (asserted in the migration test).
+- **[Q7 — cross-worker physics]:** Codex agrees this is broadly aligned
+  (per-worker state, exact-gated lease). v2 keeps all new state
+  per-worker per-queue; non-exact queues never touch a peer's XSK.
+
+Conclusion: every Codex finding is either (a) a real fragility now
+removed by per-item-hash migration + tightened demotion predicate +
+completed audit, or (b) a "measure before accepting" that the smoke
+kill-gate already enforces. None is an architectural dead-end. v2 is
+submitted for re-review.

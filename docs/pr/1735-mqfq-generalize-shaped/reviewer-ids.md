@@ -5,8 +5,8 @@ task-ids here so continuations can fetch by id (long-running agents
 lose Codex session state).
 
 ## Plan review (round 1)
-- Codex: <pending>
-- AGY: <pending>
+- Codex: task-mpuie4sw-l40kxh
+- AGY: adversarial-review-mpuieaih-7pfw74
 - Claude-SMR: in-conversation (this agent)
 
 ## Code review
