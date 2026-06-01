@@ -37,9 +37,31 @@
 //!     (frame/mod.rs).
 
 use super::*;
+use crate::afxdp::wg::{POLY1305_TAG_LEN, WG_DATA_HEADER_LEN};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::os::fd::AsRawFd;
+
+/// Outer MTU assumed for the WG transport path (S2a single-tunnel;
+/// matches the Go-side wgN MTU cap in pkg/routing/tunnel.go). The exact
+/// pad-aware guard below drops any inner packet whose encapped size
+/// would exceed this, mirroring the transit-egress guard in
+/// frame/wg.rs (plan §4.3, §7 — the guard must hold in BOTH directions).
+const WG_OUTER_MTU: usize = 1500;
+
+/// Round `n` up to the nearest multiple of 16 (WG §5.4.6 pad).
+#[inline]
+const fn pad_to_16(n: usize) -> usize {
+    (n + 15) & !15
+}
+
+/// Exact pad-aware encapped wire size for an `inner_len`-byte inner
+/// packet plus the outer L3/L4. Mirrors `frame::wg::wg_encapped_size`.
+#[inline]
+fn wg_encapped_size(inner_len: usize, outer_v6: bool) -> usize {
+    let outer_ip_len = if outer_v6 { 40 } else { 20 };
+    WG_DATA_HEADER_LEN + pad_to_16(inner_len) + POLY1305_TAG_LEN + outer_ip_len + 8
+}
 
 /// Socket/TUN read budget per poll tick — drains a bounded burst before
 /// yielding so a flood cannot starve the TUN-read direction (and vice
@@ -306,6 +328,20 @@ fn encap_and_send(
     tunnel_name: &str,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
 ) {
+    // Exact pad-aware MTU guard (plan §4.3 / AGY H1) — symmetric with the
+    // transit-egress guard in frame/wg.rs. Drop oversize inner rather
+    // than emitting an outer datagram the kernel must fragment. The wgN
+    // TUN MTU (Go-side) is the first line; this is defense-in-depth for a
+    // mis-set MTU or a jumbo inner read off the TUN.
+    if wg_encapped_size(inner_ip.len(), endpoint.is_ipv6()) > WG_OUTER_MTU {
+        debug_log!(
+            "WG[{}]: drop oversize inner {} (encapped > {})",
+            tunnel_name,
+            inner_ip.len(),
+            WG_OUTER_MTU
+        );
+        return;
+    }
     match engine.try_encap(peer_pubkey, inner_ip, out) {
         Ok(outcome) => {
             if let Err(e) = socket.send_to(&out[..outcome.len], endpoint) {
