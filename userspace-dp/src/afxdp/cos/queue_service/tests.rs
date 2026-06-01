@@ -2662,13 +2662,14 @@ fn waterfill_counters_budget_break_into_phase2() {
     // phase1_cost exceeds the remaining budget at mod.rs:906.
     let mut root = waterfill_guarantee_rate_root(0.0001);
     // #1743: use a TRANSPARENT root (shaping_rate_bytes == 0) so the
-    // Phase-1 budget takes the legacy `quantum_sum × fraction` path. The
-    // budget floors to 0 and the symmetric anti-thrash clamp (Codex r1 #2)
-    // raises it to one min-quantum (1500 B). To force the Phase-1 break we
-    // need every exact queue's quantum to EXCEED that clamped 1500 B floor,
-    // so bump the exact queues to 3 Gbps (quantum 75,000 B ≫ 1500). The
-    // clamped 1500 B budget is then below every quantum and Phase 1 breaks
-    // immediately into Phase 2. (The clamp itself is verified separately in
+    // Phase-1 budget takes the legacy `quantum_sum × fraction` path. After
+    // bumping the exact queues to 3 Gbps (quantum 75,000 B), raw pass1 =
+    // floor(quantum_sum × 0.0001) is a few bytes, which the symmetric
+    // anti-thrash clamp (Codex r1 #2) raises to one min-quantum (1500 B).
+    // To force the Phase-1 break we need every exact queue's quantum to
+    // EXCEED that clamped 1500 B floor — 75,000 B ≫ 1500 — so the clamped
+    // budget is below every quantum and Phase 1 breaks immediately into
+    // Phase 2. (The clamp itself is verified separately in
     // waterfill_pass1_tiny_fraction_clamped_to_min_quantum.)
     root.shaping_rate_bytes = 0;
     for q in &mut root.queues {
@@ -2864,8 +2865,8 @@ fn waterfill_pass1_refreshes_on_time_tick_clears_honored_bits() {
     );
     assert_eq!(
         root.waterfill_phase2_cursor, cursor_after_epoch1,
-        "the time-based refresh must PRESERVE the Phase-2 cursor (only the \
-         exhausted path resets it)"
+        "the time-based refresh must PRESERVE the Phase-2 cursor (#1743 r2: \
+         neither refill path resets it — only a genuine Phase-2 wrap does)"
     );
 }
 
@@ -2930,5 +2931,35 @@ fn waterfill_pass1_tiny_fraction_clamped_to_min_quantum() {
         root.waterfill_phase1_budget_breaks, 1,
         "Phase-1 broke because the clamped budget (1500) is below the \
          smallest quantum (2500)"
+    );
+}
+
+#[test]
+fn waterfill_exhausted_refill_does_not_reset_phase2_cursor() {
+    // #1743 (Codex code-r2): the exhausted (`pass1 == 0`) refill path must
+    // NOT reset the Phase-2 cursor. A degenerate config can land pass1 at
+    // exactly 0 after a Phase-1 honor (phase1_cost == the remaining budget),
+    // returning before Phase 2 — so an exhausted-refill cursor reset on the
+    // next call would restart the descending walk from the largest class and
+    // starve it. Only a genuine Phase-2 wrap (the end-of-function `None`
+    // path) may reset the cursor. Pin that an exhausted refill preserves a
+    // nonzero cursor.
+    let mut root = waterfill_three_unequal_exact_root(0.7);
+    let mut tel = CoSQueueLeaseAcquireTelemetry::default();
+    // Drive epoch 1 to advance the Phase-2 cursor to a nonzero value (q0+q1
+    // honored Phase-1, q2 served Phase-2 — see the time-tick test).
+    for _ in 0..3 {
+        let _ = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel);
+    }
+    let cursor = root.waterfill_phase2_cursor;
+    assert_ne!(cursor, 0, "precondition: Phase-2 cursor advanced in epoch 1");
+    // Force the exhausted refill path WITHOUT advancing the clock (so it is
+    // the exhausted trigger, not the time-based one) by zeroing pass1.
+    root.waterfill_pass1_remaining_bytes = 0;
+    let _ = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel);
+    assert_eq!(
+        root.waterfill_phase2_cursor, cursor,
+        "the exhausted refill path must PRESERVE the Phase-2 cursor; only a \
+         genuine Phase-2 wrap (`None` path) may reset it"
     );
 }

@@ -762,8 +762,9 @@ fn select_exact_cos_guarantee_queue_with_lease_telemetry(
 //     path (`elapsed ≥ COS_GUARANTEE_VISIT_NS`).
 //   - `waterfill_phase2_cursor`: where Phase 2's descending walk
 //     last stopped; lets the selector resume on subsequent calls.
-//     Reset to 0 ONLY on the exhausted refill path; the time-based
-//     refresh PRESERVES it (#1743 Hunk C).
+//     Reset to 0 ONLY on a genuine Phase-2 WRAP (the end-of-function
+//     `None` path); NEITHER refill path touches it, so the descending
+//     walk advances continuously across epochs (#1743 Hunk C / r2).
 //   - `waterfill_epoch_start_ns`: timestamp of the last refill,
 //     drives the time-based refresh (#1743).
 //
@@ -804,12 +805,14 @@ fn select_exact_cos_guarantee_queue_waterfill(
     //       below every remaining quantum and small classes stop being
     //       honored after a few epochs. The time-based path refreshes the
     //       budget once per 200µs visit window even while Phase-2 keeps
-    //       draining root tokens. CRITICAL: the time-based path does NOT
-    //       reset `waterfill_phase2_cursor` (only the exhausted (a) path
-    //       does) so the descending RR walk advances through ALL large
-    //       classes across epochs rather than restarting at the largest
-    //       every 200µs (the residual-starvation regression #1630 r4
-    //       caught). Both paths clear the persistent honored bitset.
+    //       draining root tokens. CRITICAL: NEITHER refill path resets
+    //       `waterfill_phase2_cursor` (#1743 r2 — only a genuine Phase-2
+    //       wrap at the end-of-function `None` path does) so the descending
+    //       RR walk advances through ALL large classes across epochs rather
+    //       than restarting at the largest (the residual-starvation
+    //       regression #1630 r4 caught, and the sub-200µs thrash Codex r2
+    //       found in the degenerate min-quantum case). Both refill paths
+    //       clear the persistent honored bitset.
     let elapsed_since_refresh = now_ns.saturating_sub(root.waterfill_epoch_start_ns);
     let time_refresh = elapsed_since_refresh >= COS_GUARANTEE_VISIT_NS;
     let exhausted = root.waterfill_pass1_remaining_bytes == 0;
@@ -865,12 +868,20 @@ fn select_exact_cos_guarantee_queue_waterfill(
         // (the `i < 64` check below), so the per-call re-honor monopoly
         // #1732 fixed is not reintroduced.
         root.waterfill_honored_epoch_bits = 0;
-        if exhausted {
-            // Legacy exhausted path also resets the Phase-2 cursor to 0,
-            // matching pre-#1743 behaviour. The time-based path must NOT
-            // (see the CRITICAL note above).
-            root.waterfill_phase2_cursor = 0;
-        }
+        // #1743 (Codex code-r2): NEITHER refill path resets the Phase-2
+        // cursor here. A degenerate all-min-quantum config can land pass1 at
+        // exactly 0 after a single Phase-1 honor (phase1_cost == the clamped
+        // min budget), returning BEFORE Phase 2 — so resetting the cursor on
+        // the `exhausted` refill would restart the descending walk from the
+        // largest class on every such call and starve it within a 200µs
+        // window. The cursor's ONLY legitimate reset is a genuine Phase-2
+        // WRAP: the end-of-function `None` path sets both pass1 = 0 and
+        // cursor = 0 when a full descending cycle serviced nothing. Resetting
+        // solely there means the cursor advances continuously across epochs
+        // on BOTH refill paths — exactly the #1630 r4 continuity invariant —
+        // and closes the sub-VISIT_NS thrash window the old exhausted-path
+        // reset opened. (`exhausted` is still read above as a refill trigger.)
+        //
         // #1628 site 1: completed-epoch / Phase-1-refill counter. Bumped
         // here (no `queue` borrowed yet) on every refill, either path.
         root.waterfill_epochs = root.waterfill_epochs.wrapping_add(1);
