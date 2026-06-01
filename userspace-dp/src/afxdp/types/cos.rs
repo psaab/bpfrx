@@ -405,7 +405,10 @@ pub(in crate::afxdp) struct CoSInterfaceRuntime {
     /// waterfill phase 1 greedy honor loop.
     pub(in crate::afxdp) exact_queues_by_rate_ascending: Vec<usize>,
     /// #1614 A1: Phase 1 byte budget remaining in the current
-    /// service epoch (one RR cycle through the sorted vec).
+    /// service epoch. #1743: an epoch ends on EITHER a Phase-2 wrap
+    /// (full RR cycle through the sorted vec) OR a 200µs time tick —
+    /// it is no longer strictly one RR cycle, so `waterfill_epochs`
+    /// counts budget refreshes (either trigger), not RR completions.
     /// #1743: refilled to `(shaping_rate_bytes × COS_GUARANTEE_VISIT_NS
     /// / 1e9 × guarantee_fraction)` for a SHAPED root (the documented
     /// "fraction × cap" contract) or the legacy `(quantum_sum ×
