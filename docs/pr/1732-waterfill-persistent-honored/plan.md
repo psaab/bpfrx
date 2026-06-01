@@ -1,8 +1,11 @@
 # Plan — #1732 CoS GuaranteeRate waterfill: persistent honored set + alloc-free hot path
 
-- **Status**: v2 — round-1 findings folded (Codex PLAN-NEEDS-MAJOR + AGY
-  PLAN-NEEDS-MAJOR converged on the Phase-1-skip gap; Claude-SMR concurs).
-  Pending round-2 adversarial review.
+- **Status**: v3 — round-2 findings folded. Codex r2 PLAN-NEEDS-MAJOR + AGY
+  r2 PLAN-NEEDS-MINOR converged on the SAME refinement: the bitset must be
+  keyed by ORDINAL position in `exact_queues_by_rate_ascending`, not by
+  `queue_idx`, and the cap must be surfaced at build time. Both folded
+  (Option A: ordinal keying). Claude-SMR concurs. Pending round-3 review.
+- **Status history**: v2 — round-1 Phase-1-skip FATAL folded; v1 — DRAFT.
 - **Issue**: #1732 (sub-issue of #1731, item #2 / §4.2 of the ENGINEER-READY plan)
 - **Mode**: `/engineer` (= triple-review)
 - **Base**: `origin/master` @ `c9e552689`
@@ -86,19 +89,26 @@ reuses exactly this discipline.
 Add immediately after `waterfill_phase2_cursor` (`:419`):
 
 ```rust
-/// #1732: persistent Phase-1 honored bitset for the current
-/// waterfill epoch. Bit `q` set ⇔ exact queue index `q` was honored
-/// in Phase 1 this epoch. Previously a function-local `honored_mask`
-/// that reset to 0 every call, so Phase 2 (entered on a *later* call
-/// than the Phase-1 honors) saw an empty mask and could not skip
-/// already-honored queues — the documented "approximates" skew. Now
-/// persisted across selector calls and CLEARED at the lazy Phase-1
-/// refill (where `waterfill_epochs` bumps), so Phase 2's descending
-/// residual walk correctly skips queues that already took their
-/// Phase-1 guarantee this epoch. Bounded to ≤64 exact queues by the
-/// existing `queue_idx < 64` guard at the honor/skip sites; queues at
-/// index ≥64 are never marked nor skipped (same conservative behavior
-/// as the prior local mask). Single-writer owner worker, plain `u64`.
+/// #1732: persistent Phase-1 honored bitset for the current waterfill
+/// epoch. Bit `j` set ⇔ the exact queue at ORDINAL position `j` in
+/// `exact_queues_by_rate_ascending` was honored in Phase 1 this epoch.
+/// Keyed by ASCENDING-VEC ORDINAL, NOT by `queue_idx` (the root.queues
+/// index): both phases iterate this same sorted vec, so ordinal `j`
+/// unambiguously identifies one queue, and the bit range is bounded by
+/// `exact_queues_by_rate_ascending.len()` (≤64) regardless of how high
+/// the underlying `queue_idx` values run — see round-2 finding F3′
+/// (the prior `queue_idx`-keyed local mask was silently broken for
+/// configs with exact queues at root index ≥64; ordinal keying fixes
+/// that root-cause). Previously a function-local `honored_mask` reset
+/// to 0 every call, so Phase 2 (entered on a *later* call than the
+/// Phase-1 honors) saw an empty mask and could not skip already-honored
+/// queues — the documented "approximates" skew — AND Phase 1 had no
+/// skip at all so the smallest queue was re-honored every call. Now
+/// persisted across selector calls, read by BOTH phases, and CLEARED at
+/// the lazy Phase-1 refill (where `waterfill_epochs` bumps), so the
+/// ascending Phase-1 walk honors each queue at most once per epoch and
+/// the descending Phase-2 walk serves the residual to the larger queues
+/// skipping the honored set. Single-writer owner worker, plain `u64`.
 pub(in crate::afxdp) waterfill_honored_epoch_bits: u64,
 ```
 
@@ -133,25 +143,36 @@ borrow begins (split-borrow discipline, same shape as the existing
 
 ```rust
 let ascending_len = root.exact_queues_by_rate_ascending.len();
+debug_assert!(
+    ascending_len <= 64,
+    "waterfill honored bitset is u64; >64 exact guarantee queues on one \
+     interface is unsupported (ordinal bit range overflow)"
+);
 for i in 0..ascending_len {
     let queue_idx = root.exact_queues_by_rate_ascending[i];
     let queue = &mut root.queues[queue_idx];
     ...
 ```
 
+`i` is the ASCENDING-VEC ORDINAL (the bitset key, `i < ascending_len ≤ 64`).
 `root.exact_queues_by_rate_ascending[i]` is read and copied into the `Copy`
-local `queue_idx` (a `usize`), ending the immutable borrow of `root` before
-`&mut root.queues[queue_idx]` is taken — no overlapping borrow, no alloc.
-The loop bound `ascending_len` is captured once (the vec is runtime
-read-only, so the length cannot change mid-loop; capturing it also avoids
-re-borrowing `root` for `.len()` inside the loop). Index access uses `[]`
-which is in-bounds by construction (`i < ascending_len`).
+local `queue_idx` (a `usize`, the root.queues index used for queue access),
+ending the immutable borrow of `root` before `&mut root.queues[queue_idx]`
+is taken — no overlapping borrow, no alloc. The loop bound `ascending_len`
+is captured once (the vec is runtime read-only). Index access uses `[]`,
+in-bounds by construction (`i < ascending_len`).
 
-**(c) Phase-1 honor sets the persistent bit.** At the honor site (`:941`),
-replace `honored_mask |= 1u64 << queue_idx;` with
-`root.waterfill_honored_epoch_bits |= 1u64 << queue_idx;` (still guarded by
-`queue_idx < 64`). This write happens before the `return`, so the bit
-persists into the next call.
+**(c) Phase-1 honor sets the persistent bit (keyed by ORDINAL `i`).** At the
+honor site (`:941`), replace `honored_mask |= 1u64 << queue_idx;` with
+`root.waterfill_honored_epoch_bits |= 1u64 << i;` (ordinal `i`, no
+`queue_idx < 64` guard needed — `i < ascending_len ≤ 64` by the
+`debug_assert`; in release if a malformed config somehow exceeds 64, only
+ordinals ≥64 go untracked, and the build-time warning in §4.4 surfaces it).
+This write happens before the `return`, so the bit persists into the next
+call. **Round-2 F3′ fix:** the prior `queue_idx` key meant a queue at root
+index ≥64 was never marked even when only 2 exact queues existed (ordinals
+0,1); ordinal keying makes the ≤64 bound depend only on the exact-queue
+COUNT, which is the quantity actually bounded.
 
 **(c′) Phase-1 ALSO skips already-honored queues (round-1 FATAL fix —
 Codex + AGY converged).** This is the load-bearing correctness fix that
@@ -169,10 +190,11 @@ at the TOP of the Phase-1 loop body — immediately after computing
 
 ```rust
 // #1732: at-most-once Phase-1 honor per epoch. A queue already
-// honored this epoch is skipped so the ascending walk advances to
-// the next-smallest queue instead of re-honoring the smallest one
-// every call (the documented small-rate-ascending waterfill intent).
-if queue_idx < 64 && (root.waterfill_honored_epoch_bits & (1u64 << queue_idx)) != 0 {
+// honored this epoch is skipped (by ORDINAL `i`) so the ascending
+// walk advances to the next-smallest queue instead of re-honoring
+// the smallest one every call (the documented small-rate-ascending
+// waterfill intent).
+if (root.waterfill_honored_epoch_bits & (1u64 << i)) != 0 {
     continue;
 }
 ```
@@ -182,13 +204,9 @@ every eligible exact queue is honored (or the budget is exhausted mid-walk),
 Phase 1 finds nothing to honor and falls through to Phase 2, which serves
 the residual to the larger queues (descending) skipping the same honored
 set. The bitset is the single source of truth for "honored this epoch,"
-read by BOTH phases, cleared at the next epoch's refill. This makes the
-two-phase ascending-Phase1 / descending-Phase2 algorithm match the
+read by BOTH phases by ordinal, cleared at the next epoch's refill. This
+makes the two-phase ascending-Phase1 / descending-Phase2 algorithm match the
 documented waterfill contract (`docs/fairness-regimes.md`).
-
-Queues at `queue_idx >= 64` are NOT skipped (the guard is conservative):
-they remain honor-eligible every call, identical to today's behavior for
-the un-tracked range. See §4.4 for the cap disposition.
 
 **(d) Phase-2 reads the persistent bitset.** Phase 2 (`:960-1069`) currently
 references the dead local `honored_mask` at `:985`. Replace the Phase-2
@@ -198,15 +216,21 @@ length/index references to the cloned `sorted_indices` with
 with `root.waterfill_honored_epoch_bits`:
 
 ```rust
-if queue_idx < 64 && (root.waterfill_honored_epoch_bits & (1u64 << queue_idx)) != 0 {
+// pos_from_end is the ascending-vec ORDINAL of the queue being
+// visited in the descending walk — the same key Phase 1 set.
+if (root.waterfill_honored_epoch_bits & (1u64 << pos_from_end)) != 0 {
     // skip — already honored in Phase 1 this epoch
 }
 ```
 
 The Phase-2 descending walk reads `root.exact_queues_by_rate_ascending.len()`
-and `[pos_from_end]` directly. As above, each index read copies a `usize`
-out before any `&mut root.queues[..]` borrow, so borrow-split holds. The
-`phase2_idx`/`start_phase2`/cursor arithmetic is unchanged.
+and `[pos_from_end]` directly; `pos_from_end` (`= len - 1 - phase2_idx`) is
+the ordinal into the ascending vec, so `1u64 << pos_from_end` tests the same
+bit Phase 1 set for that queue. Each index read copies a `usize` out before
+any `&mut root.queues[..]` borrow, so borrow-split holds. The
+`phase2_idx`/`start_phase2`/cursor arithmetic is unchanged. (Because both
+`pos_from_end` and `i` are ordinals `< ascending_len ≤ 64`, no `< 64` guard
+is needed in Phase 2 either.)
 
 **Borrow-checker note.** The reads of `root.waterfill_honored_epoch_bits`
 and `root.exact_queues_by_rate_ascending[..]` in Phase 2 happen *before* the
@@ -223,10 +247,20 @@ exactly the discipline the existing code already uses for the telemetry
 in Phase 1 **at most once** (via (c′)). Previously the smallest queue was
 re-honored on every call until the budget ran out. Now the Phase-1 budget is
 distributed across the ascending queues, one honor each, smallest-first —
-the documented waterfill behavior. Phase-2 residual then reaches the larger
-queues (skipping the honored small ones) instead of re-serving the small
-ones. **This is the exact-class distribution change that mandates the #1217
-CoV gate.**
+the documented waterfill behavior. When Phase 1 breaks mid-walk (the next
+ascending queue's `phase1_cost` exceeds the remaining budget), Phase 2
+serves the residual to the *not-yet-honored* (larger) queues descending,
+skipping the honored set, instead of re-serving the small ones. **This is
+the exact-class distribution change that mandates the #1217 CoV gate.**
+
+**Empty-epoch boundary (Codex r2 Finding-3 — clarified, benign).** If every
+eligible exact queue gets honored in Phase 1 while budget remains, both
+phases then skip every queue and the selector returns `None` for that one
+call (the existing `:1070-1074` exhaustion path resets `pass1_remaining = 0`),
+and the next call refills + clears into a fresh epoch. This is a transient
+empty-boundary return, NOT a deadlock and NOT a starvation — it occurs only
+when all guarantees are already met. The plan does NOT claim Phase 2 serves
+residual when there is no unhonored queue.
 
 **What does NOT change:** the Phase-1 honor ORDER (still ascending,
 smallest-first); the budget refill math (`quantum_sum × fraction`); the
@@ -235,42 +269,42 @@ per-honor `phase1_cost` decrement; the token/lease gates; parking;
 Phase-2 descending cursor arithmetic. Only the honored-set source (local →
 persistent) and the addition of the Phase-1 skip change behavior.
 
-### 4.4 The `<64` exact-queue cap disposition (round-1 finding — Codex + AGY)
+### 4.4 The 64-queue cap disposition (round-2 finding F3′ — Codex + AGY)
 
-Both round-1 reviewers flagged that a *persistent* honored set makes the
-silent `queue_idx < 64` guard load-bearing: a queue at Vec-index ≥64 is
-never marked, so it is skipped by neither phase and could be double-serviced
-relative to the intended at-most-once contract.
+**Round-2 sharpening:** both reviewers proved that a `queue_idx`-keyed
+bitset with `debug_assert!(ascending_len <= 64)` is WRONG — a config with
+only two exact queues but at root indices 65/66 has `ascending_len == 2`
+(passes the assert) yet `1u64 << 65` is undefined-shift / silently
+untracked. The cap was the wrong invariant for the wrong key.
 
-**Disposition for THIS PR (isolated #2 fix):**
+**Resolution (Option A — both reviewers' recommended fix): key the bitset by
+ORDINAL position `i`/`pos_from_end` in `exact_queues_by_rate_ascending`.**
+This decouples the bit range from `queue_idx` entirely:
 
-- The `<64` guard is **pre-existing** (`:941`, `:985`) and the prior local
-  mask had identical silent-cap semantics. This fix does not *regress*
-  idx≥64 behavior — such a queue is honor-eligible every call in both old
-  and new code (the old code had NO Phase-1 skip at all, so EVERY queue,
-  including <64, was re-honorable; the new code restricts <64 queues to
-  at-most-once and leaves ≥64 queues at the old every-call behavior).
-- `queue_idx` is the index into `root.queues`, i.e. the **count of
-  configured CoS queues** (forwarding classes) on the interface — not the
-  Junos `queue_id` (which the schema allows 0..255 and which is a *separate*
-  lookup). Reaching 64 *distinct exact guarantee-rate forwarding classes on
-  one interface* is far outside any realistic Junos CoS config (Junos
-  hardware queues are conventionally 0..7).
-- **Defensive guard added by this PR:** a `debug_assert!(ascending_len <=
-  64, ...)` at the top of the selector documenting the invariant (stripped
-  in release, fires in test/CI if a fixture ever exceeds it), plus a doc
-  comment on the new field. This surfaces the cap to developers without
-  adding a hot-path branch or a control-plane reject.
-- **Hard config-reject is explicitly OUT OF SCOPE / deferred.** It mirrors
-  #1731 §4.3 item #3 (the 32-worker hard-reject), which the #1731 plan
-  scoped as a *separate* sub-issue (#1733, in flight on a sibling worktree)
-  precisely because a commit-check reject is a Go control-plane change with
-  its own test surface. Folding a >64-exact-queue commit-check into this
-  isolated Rust hot-path fix would be scope-creep. If reviewers insist the
-  cap MUST be surfaced to the operator in this PR, the cheapest in-scope
-  option is to log a one-time warning at `build_cos_interface_runtime` when
-  the exact-queue count exceeds 64; this PR proposes the `debug_assert` +
-  doc as sufficient for the isolated fix and invites reviewers to rule.
+- The bitset key is now bounded by `ascending_len` (the COUNT of exact
+  guarantee-rate queues), which IS the quantity `debug_assert!(ascending_len
+  <= 64)` correctly bounds. No `all(qi < 64)` check is needed; the assert is
+  now sufficient and correct.
+- The prior `queue_idx` key (in both the old local mask AND plan v1/v2) was
+  the latent root-cause bug; ordinal keying eliminates it. With ordinal
+  keying there is no silent untracked-queue case for any config with ≤64
+  exact queues, regardless of how high the root indices run.
+- **`debug_assert!(ascending_len <= 64)`** at the selector top (stripped in
+  release; fires in test/CI). In a release build a >64-exact-queue config
+  would leave ordinals ≥64 untracked — but:
+- **In-scope build-time warning (round-2 AGY+Codex required this).** At
+  `build_cos_interface_runtime` (control-plane cold path, runs once per
+  interface; zero hot-path cost) emit a one-time
+  `eprintln!("xpf-userspace-dp: CoS interface ... has {n} exact
+  guarantee-rate queues (>64); waterfill honored-set tracking is capped at
+  64 — queues beyond 64 may be over-served")` when
+  `exact_queues_by_rate_ascending.len() > 64`. This surfaces the limit to
+  the operator (journald) without a hot-path branch.
+- **Hard config-reject (commit-check) remains OUT OF SCOPE / deferred**,
+  mirroring #1731 §4.3's separate scoping of the analogous 32-worker reject
+  (#1733). The ordinal-keyed bitset + debug_assert + build-time warning is
+  the complete in-scope answer; a Go commit-check reject is a larger,
+  separately-testable control-plane change.
 
 ## 5. Public API preservation
 
@@ -324,18 +358,26 @@ relative to the intended at-most-once contract.
 - Full cargo suite (`cargo test --release`).
 - 5× flake on the new distribution test + the existing
   `waterfill_*` named tests.
-- New distribution test (`queue_service/tests.rs`): **3+ exact queues at
-  unequal `transmit_rate_bytes`**, abundant per-queue tokens so the only
-  gate is the Phase-1 byte budget, `fraction` chosen so Phase 1 honors a
-  strict subset (the small queues) and Phase 2 must serve the residual.
-  Drain a multi-selection sequence and assert the **per-epoch service order /
-  byte distribution across >1 selection** — specifically that:
-  (i) the persistent honored set causes Phase 2 to skip the Phase-1-honored
-  small queues and reach the larger ones, and
-  (ii) the visible per-queue selection counts across one full epoch differ
-  from the broken-mask behavior (a queue honored in Phase 1 is NOT re-served
-  in Phase 2 of the same epoch). This is exactly the pin the `:2318` test
-  explicitly declined to make.
+- New distribution test (`queue_service/tests.rs`). **Determinism spec
+  (Codex r2 Finding-5):** 3+ exact queues at `transmit_rate_bytes` chosen so
+  their computed `cos_guarantee_quantum_bytes` are DISTINCT and NOT all
+  clamped to the `COS_GUARANTEE_QUANTUM_MIN_BYTES` floor (i.e. rates high
+  enough that `rate × COS_GUARANTEE_VISIT_NS / 1e9` exceeds the min clamp);
+  set BOTH `root.tokens` AND every `queue.hot.tokens` abundant (the selector
+  gates on root tokens at `:856`/`:1034` and queue tokens at `:879` — both
+  must be non-binding so the Phase-1 byte budget is the only gate); fixed
+  `now_ns`; no shared lease; `runnable = true`; manually-primed multi-item
+  backlog per queue. `fraction` chosen so Phase 1 honors a strict subset of
+  the small queues before breaking. Drain a multi-selection sequence (one
+  full epoch) and assert the **per-epoch service order across >1 selection**:
+  (i) selection N honors the N-th-smallest queue (ascending, at-most-once) —
+  the smallest queue is NOT re-honored on selection 2;
+  (ii) once Phase 1 breaks, Phase 2 serves a NOT-yet-honored larger queue,
+  never a Phase-1-honored one;
+  (iii) across the epoch each honored queue is selected in Phase 1 exactly
+  once. This is exactly the pin the `:2318` test explicitly declined to make.
+  A companion assertion contrasts with the broken-mask behavior (the smallest
+  queue would have been selected on every Phase-1 call).
 - Go suite (`go test ./...`) — no Go change expected; run for safety.
 - **CoS smoke matrix** on `loss:xpf-userspace-fw0/fw1`: v4
   (`172.16.80.200`) + v6 (`2001:559:8585:80::200`) × push/`-R` ×
@@ -459,3 +501,41 @@ Claude-SMR concurred. All folded:
 its "review." Per project policy (AGY is review-only) those edits were
 reverted and the worktree verified clean; the implementation below is
 written from this plan, not adopted from AGY.
+
+## 12. Round-2 adversarial review findings (folded into v3)
+
+Round-2 ran on plan v2 (`e94bd0482`). Codex r2 PLAN-NEEDS-MAJOR and AGY r2
+PLAN-NEEDS-MINOR converged independently on the SAME refinement:
+
+- **F3′ (Codex MAJOR + AGY MINOR — the decisive one): the bitset keyed by
+  `queue_idx` with `debug_assert!(ascending_len <= 64)` is the WRONG
+  invariant.** `exact_queues_by_rate_ascending` holds root.queues indices
+  from `0..config.queues.len()` (`builders.rs:81`); a config with 2 exact
+  queues at root indices 65/66 has `ascending_len == 2` (passes the assert)
+  but `1u64 << 65` is an out-of-range shift / silently untracked. **Folded:**
+  §4.1 + §4.2 re-key the bitset by ORDINAL position `i`/`pos_from_end` in the
+  ascending vec (both reviewers' recommended Option A). The bit range is now
+  bounded by the exact-queue COUNT (≤64), which the `debug_assert` correctly
+  enforces. No `queue_idx < 64` guard remains.
+- **Build-time warning now in scope (Codex + AGY both required it).**
+  §4.4 adds a one-time `eprintln!` at `build_cos_interface_runtime`
+  (control-plane cold path) when the exact-queue count exceeds 64, so the
+  cap is operator-visible in journald even in release. Hard config-reject
+  stays deferred (mirrors #1731 §4.3's 32-worker reject scoping).
+- **Codex r2 Finding-3 (empty-epoch return): plan text overstated Phase 2.**
+  When ALL queues are honored with budget left, Phase 2 has no residual
+  target and the selector returns `None` for that call (benign; next call
+  refills+clears). **Folded:** §4.3 clarified — no claim that Phase 2 serves
+  residual when nothing is unhonored.
+- **Codex r2 Finding-5 (test determinism): "unequal rates" is insufficient.**
+  `cos_guarantee_quantum_bytes` clamps at the min floor; rates must produce
+  DISTINCT unclamped quantums, and `root.tokens` (not just per-queue tokens)
+  must be abundant. **Folded:** §8 test spec tightened.
+- **Codex r2 confirmed:** the Phase-1-skip fix correctly distributes the
+  budget across queues smallest-first one-honor-each (hand-traced
+  q_small→q_mid→q_big, no off-by-one); clear-at-refill is still the only
+  correct clear point; no stale-bits-into-fresh-budget path.
+- **AGY r2 was review-only this round** (no worktree edits; verified clean).
+
+**§9 amendment:** this PR also touches `userspace-dp/src/afxdp/cos/builders.rs`
+for the build-time over-64 warning (in addition to the field init).
