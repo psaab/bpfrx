@@ -1,7 +1,24 @@
-# #1432 / #1703 S2a — WireGuard AF_XDP datapath wiring: engine instantiation + UDP socket + encap/decap call sites + runtime TunnelEndpoint hydration + Go DTO population + minimal config
+# #1432 / #1703 S2a — WireGuard datapath bring-up: engine instantiation + kernel-socket WG RX/TX (ESP precedent) + egress encap call site + runtime TunnelEndpoint hydration + Go DTO population + minimal config
 
-Status: **DRAFT v1 — pending adversarial plan review** (Codex + AGY + Claude-SMR,
-maximally hostile: new datapath + crypto-adjacent + UMEM + hot-path cost).
+Status: **PLAN-READY v2 — round-1 adversarial review CONVERGED.** Codex
+(`wg-s2a-plan-r1-1780272812`) PLAN-NEEDS-MAJOR and AGY
+(`adversarial-review-mpugg9lm-mlr55n`) PLAN-NEEDS-MAJOR agreed on the SAME two
+blockers (WG RX ownership + engine-reload stability) plus identical minors.
+Claude-SMR (this thread) independently verified the code and found that **both
+reviewers' shared premise was over-stated**: a kernel `UdpSocket` on
+`wg_listen_port` CAN receive WG datagrams, because WG-to-firewall is
+local-destination UDP that the XDP shim already passes to the kernel via
+`cpumap_or_pass` — exactly the ESP/non-native-GRE precedent at
+`userspace-xdp/src/lib.rs:469-475`. v2 therefore adopts the **ESP-precedent
+kernel-socket RX model (Option A)** for S2a (lowest-risk, no shim change, RX
+works via a real socket, decap in the control thread), and DEFERS the
+AF_XDP-hot-path decap stage (Option B, which needs a shim steering change) to a
+post-S2 perf follow-up. This dissolves the RX-ownership blocker AND removes the
+`stage_wg_decap` hot-path gate + worker→control channel-flood concern entirely.
+The reload blocker is resolved via the `previous: Option<&ForwardingState>`
+engine-carry. See §11 (v2 convergence).
+
+Earlier: DRAFT v1 (commit 019e713f1) — pending adversarial plan review.
 
 Issue: #1432 (re-scoped to #1703 S2). This PR is **S2a** — datapath + socket +
 config bring-up. **S2b** (live kernel-WG-on-VM interop test + smoke) is #1736,
@@ -31,15 +48,26 @@ datapath for **one tunnel**, initiator-capable, so that:
   allowed-ips, endpoint, keepalive).
 - The Rust runtime hydrates a `TunnelEndpoint` with those fields, instantiates a
   `WgEngine` per WG endpoint, and reconciles its peer set.
-- A **control-thread** UDP socket binds `wg_listen_port`, drives the S1
+- A **control-thread** UDP socket binds `wg_listen_port` and drives the S1
   handshake methods (`create_initiation` / `consume_response` /
-  `consume_initiation_create_response`), and transmits/receives WG datagrams.
+  `consume_initiation_create_response`). **WG datagrams reach this socket via
+  the kernel** — the XDP shim passes local-destination UDP (which WG-to-firewall
+  is) to the kernel stack via `cpumap_or_pass`, the same path ESP/IPsec already
+  rides (§3.4, §4.3). S2a adds a one-line shim early-return so WG-port UDP is
+  steered to the kernel deterministically (mirroring the ESP/GRE local-delivery
+  branches), then a real `UdpSocket` does both RX and TX. No hot-path decap
+  stage and no worker→control channel in S2a.
 - **Egress encap**: forwarding decisions that target a WG tunnel endpoint encap
-  the inner IP via `wg_engine.try_encap(...)` and emit a UDP/WG outer datagram.
-- **Ingress decap**: inbound `UDP/<listen_port>` WG transport records are
-  decapped via `wg_engine.try_decap(...)`, AllowedIPs-gated on the inner src,
-  and re-injected as plaintext into the normal forwarding pipeline; WG handshake
-  datagrams (type 1/2/3) are handed to the control thread.
+  the inner IP via `wg_engine.try_encap(...)` on the AF_XDP TX copy path and emit
+  a UDP/WG outer datagram (the perf-relevant direction stays on the dataplane).
+- **Ingress decap**: WG transport records arrive on the control-thread socket;
+  the thread calls `wg_engine.try_decap(...)`, AllowedIPs-gates the inner src,
+  and re-injects the plaintext inner IP into the normal forwarding pipeline.
+  Pushing transport decap onto the AF_XDP hot path (`stage_wg_decap`) is the
+  Option-B perf optimization, **deferred to a post-S2 follow-up** — it requires
+  a shim steering change (WG-port → XSK instead of kernel) and brings the
+  channel/flood/gating complexity both reviewers flagged. S2a keeps RX on the
+  proven IPsec-style kernel-socket path.
 
 S2a ends at **unit-tested wiring + a fast-path no-regress smoke**. The live
 kernel-WG interop proof is S2b (#1736).
@@ -113,17 +141,38 @@ Verified against `origin/master` @ c9e552689 in this worktree.
 - `frame/tcp_segmentation.rs:309`: TSO path GRE encap (per-segment).
 - `tunnel.rs:189`: local-origination GRE encap (the aux tunnel-source thread).
 
-### 3.4 The ingress decap model (GRE analogue)
-- `poll_stages.rs:142 stage_native_gre_decap` calls
-  `try_native_gre_decap_from_frame(raw_frame, meta, forwarding)` and returns
-  `(new_meta, Option<Vec<u8>>)` — the decapped inner frame flows on as the
-  active slice. WG decap follows the same stage shape (`UDP/<listen_port>` →
-  `wg_engine.try_decap` → inner IP frame).
-- `poll_stages.rs:425 stage_ipsec_passthrough_check` is the **control-thread
-  handoff template**: a `LocalDelivery` `SessionDecision` +
-  `maybe_reinject_slow_path_from_frame` reinjects ESP/IKE to the kernel.
-  WG **handshake** datagrams (type 1/2/3) use the same handoff to the WG
-  control thread (not the kernel TUN — an in-process channel to the aux thread).
+### 3.4 The WG RX model — ESP/IPsec precedent (Claude-SMR finding, v2)
+
+The XDP shim does NOT capture all WG ingress. WG-to-firewall is
+**local-destination UDP** (dst = a firewall WAN address, dst_port =
+`wg_listen_port`), and the shim passes local-destination traffic to the KERNEL:
+- `userspace-xdp/src/lib.rs:532 is_local_destination(&parsed)` →
+  `:543 return Ok(cpumap_or_pass(ctrl))`; and the session-hit local-delivery
+  branch (`:500-515`) does the same.
+- `cpumap_or_pass` (`:1006-1016`) is **kernel delivery** ("Deliver IP packets to
+  the kernel"): cpumap redirect → kernel stack, else `XDP_PASS` → kernel stack.
+- **The decisive precedent**: ESP rides exactly this path —
+  `:469 if parsed.protocol == PROTO_ESP { return Ok(cpumap_or_pass(ctrl)); }`
+  with the comment *"ESP still relies on the kernel XFRM path... delivers to the
+  kernel stack reliably"*; non-native GRE the same at `:473`. IPsec's userspace
+  (strongSwan IKE on UDP/500/4500) and XFRM both work because `cpumap_or_pass`
+  reaches kernel-bound sockets. **A kernel `UdpSocket` bound on `wg_listen_port`
+  therefore CAN receive WG datagrams.** Both round-1 reviewers over-stated "the
+  kernel socket sees nothing" — that is true only if WG were steered to XSK,
+  which it is not today.
+
+S2a follows the ESP precedent: add one early-return in the shim
+(`PROTO_UDP && dst_port == wg_listen_port → cpumap_or_pass`, mirroring `:469`)
+so WG-port UDP is steered to the kernel **deterministically** (independent of
+session/local-address state), and the control thread's `UdpSocket` does both RX
+and TX. The decap happens in the control thread (slow path), then the plaintext
+inner IP is re-injected into forwarding.
+
+The Option-B AF_XDP-hot-path decap (`stage_wg_decap` on the poll worker, steer
+WG-port → XSK) is the eventual perf win but needs a shim **steering** change and
+the channel/gating/flood machinery both reviewers flagged; it is **deferred to a
+post-S2 perf follow-up**, gated on a measured bottleneck (the #966–#969
+precedent). S2a's RX is the proven IPsec-style kernel path.
 
 ### 3.5 The coordinator aux-thread template
 - `coordinator/mod.rs:339 spawn_local_tunnel_sources` spawns one
@@ -168,50 +217,68 @@ tunnel-interface path so `buildTunnelEndpointSnapshots` can emit it.
   `forwarding_build/tunnels.rs` when `endpoint.mode == "wireguard"` (hex-decode
   with validation; skip endpoint on bad key length).
 - `ForwardingState` gains `wg_engines: FastMap<u16, Arc<WgEngine>>` keyed by
-  tunnel_endpoint_id. Built in `build_forwarding_state` after tunnel population:
-  for each `mode == "wireguard"` endpoint, `WgEngine::new(WgEngineConfig {
-  local_private_key, listen_port, ... })` + `reconcile_peers(&[WgPeerConfig{
-  pubkey, allowed_ips, endpoint, keepalive }])`.
-- **Engine reuse across config reloads** is a hazard (a fresh `WgEngine` per
-  reload drops the in-process TAI64N high-water + live sessions → re-handshake
-  storm / monotonicity regression). **Decision: S2a keeps the engine in a
-  reload-stable holder** (an `ArcSwap`/map carried across
-  `build_forwarding_state` so an unchanged WG endpoint keeps its engine), OR
-  documents the re-handshake-on-reload limitation as an S2a-accepted cost with
-  an S5 fix. **Plan-review Q2** — this is the highest-risk decision.
+  tunnel_endpoint_id, plus a `has_wg_tunnels: bool` (§4.5).
+- **Engine reload stability — RESOLVED (v2, both reviewers' blocker #2).** A
+  fresh `WgEngine` per reload resets the TAI64N clock to a new instance
+  (`engine.rs:319` constructs a new `Tai64nClock`) and drops live sessions; a
+  kernel peer rejects any TAI64N `<=` the last it accepted (`tai64n.rs:5`), so a
+  fresh engine on every commit causes a re-handshake storm and can permanently
+  black-hole a tunnel. Fix: `build_forwarding_state_with_policy_counters_and_previous`
+  already threads `previous: Option<&ForwardingState>` (`forwarding_build/mod.rs:131`).
+  For each `mode == "wireguard"` endpoint:
+  - **Identity-stable reuse**: if `previous.wg_engines` holds an engine for the
+    same `(id, listen_port, local_privkey, peer_pubkey, allowed_ips, endpoint,
+    keepalive)` tuple, **clone the existing `Arc<WgEngine>` and do NOT call
+    `reconcile_peers`** (avoids mutating shared engine state that old
+    `ForwardingState` Arcs still held by workers across reload would observe —
+    `worker/loop_body/mod.rs:98` holds the old Arc until `:406` refreshes it).
+  - **Config-changed**: construct a fresh `WgEngine` but **seed its TAI64N
+    high-water** from the previous engine via the S1 `seed_high_water` hook
+    (`tai64n.rs:48` — already exists for exactly this) so monotonicity survives
+    the rebuild. Then `reconcile_peers` on the fresh engine only.
+  This keeps engine mutation OUT of the shared-Arc cross-reload window and
+  preserves TAI64N monotonicity. (Live transport sessions are dropped on a real
+  config change — acceptable: a config change re-handshakes once, seeded above
+  so the peer accepts it. S5 adds session migration if needed.)
 
 ### 4.3 Rust: the WG control thread (UDP socket + handshake driver)
 
 A new `coordinator` aux thread (one per WG endpoint, modeled on
 `spawn_local_tunnel_sources`), `wg_control_loop` in a new
-`coordinator/wg_control.rs`:
+`coordinator/wg_control.rs`. **RX model RESOLVED (v2, both reviewers' blocker
+#1) via the ESP precedent (§3.4): the kernel delivers WG-port UDP to a real
+socket; the thread reads it directly. No worker→control channel in S2a.**
 
-- Bind `UdpSocket` to `0.0.0.0:wg_listen_port` (+ v6) on the **transport_table /
-  outer interface** — set non-blocking, `recv_from` in a poll loop with a stop
-  flag.
-- **Inbound** datagram: peek WG type byte.
+- Bind `UdpSocket` to `:wg_listen_port` (v4 + v6). Set a read timeout; `recv_from`
+  in a poll loop with a stop flag. Because the shim early-return (§4.5) steers
+  WG-port UDP to `cpumap_or_pass` (kernel), this socket receives ALL inbound WG
+  datagrams — handshake AND transport.
+- **Inbound** datagram, dispatch on the WG type byte:
   - type 1 (initiation) → `engine.consume_initiation_create_response(msg, out)`
     → `socket.send_to(out, peer)` (the response). Promotes a responder session.
   - type 2 (response) → `engine.consume_response(msg)` → completes the
     initiator session.
-  - type 3 (cookie) → drop (S7).
-  - type 4 (transport) → this should normally arrive on the AF_XDP datapath
-    (decap stage), NOT the control socket. If it arrives here (e.g. kernel
-    delivered it), it is the slow-path fallback: `engine.try_decap` + inject the
-    plaintext to the kernel/forwarding. **S2a: drop type-4 on the control socket
-    with a counter** (the datapath path is the supported one); document.
+  - type 3 (cookie) → drop + counter (S7).
+  - type 4 (transport) → `engine.try_decap(record, scratch)` → AllowedIPs
+    inner-src gate (`allowed_ips.rs`) → **re-inject the plaintext inner IP into
+    forwarding** via the existing local-delivery reinject machinery
+    (`tx/dispatch/slow_path.rs` / `local_tunnel_deliveries`, the same channel
+    GRE/IPsec local-origination uses) so the inner packet runs normal policy +
+    routing. Decap is slow-path (control thread), NOT the AF_XDP hot path in
+    S2a; the perf-relevant direction is egress encap (§4.4), which stays on the
+    dataplane.
 - **Initiator bring-up**: if `wg_endpoint` is configured, on thread start (and
-  on a session-absent timer) call `engine.create_initiation(peer_pubkey, out)`
-  + `socket.send_to(out, wg_endpoint)`. (Persistent-keepalive + REKEY timers are
-  S5 — S2a does the initial handshake + a coarse re-init-if-no-session.)
-- **Handshake datagrams from the datapath**: the ingress decap stage hands WG
-  type-1/2/3 datagrams to this thread via an mpsc channel (the §3.4 handoff),
-  because the listen-port UDP socket on the kernel side will NOT see datagrams
-  that the AF_XDP program already consumed. **Plan-review Q3** — does the kernel
-  UDP socket actually receive the handshake (AF_XDP steers only steered queues),
-  or must ALL WG datagrams (handshake + transport) come through the AF_XDP
-  ingress and be demuxed there? This determines whether the control thread reads
-  a real `UdpSocket` or only an in-process channel fed by the datapath.
+  on a coarse session-absent timer) call `engine.create_initiation(peer_pubkey,
+  out)` + `socket.send_to(out, wg_endpoint)`. (Persistent-keepalive + REKEY
+  timers are S5 — S2a does the initial handshake + re-init-if-no-session.)
+- **Egress NoSession trigger**: when the TX encap path (§4.4) hits
+  `EncapError::NoSession`, it signals this thread to initiate a handshake. To
+  avoid a NoSession packet stream flooding the signal, the trigger is an
+  **atomic rate-limiter** (a `last_init_ns` `AtomicU64` on the engine's per-peer
+  state, checked with a coarse interval) — the worker does a single relaxed
+  atomic compare, never builds handshake state (control-thread-only invariant
+  preserved, §6). This is the ONLY worker→control coupling in S2a and it carries
+  no packet data, just a debounced "please initiate" edge.
 
 ### 4.4 Rust: egress encap call site (gated, fast-path-zero-cost)
 
@@ -234,24 +301,36 @@ at `tx/dispatch/mod.rs:443`). `wg_encap_frame` looks up
 inner_ip, scratch)`, and writes the UDP/WG outer via
 `frame::headers::{write_eth_header_slice, write_ipv4_header, write_udp_header}`
 (per the `mod.rs:46-53` note). On `EncapError::NoSession` (handshake not yet
-complete) → drop the packet + trigger a handshake init via the control thread
-(channel signal) + counter. Reuses `WgWorkerScratch` — **no per-packet alloc**.
+complete) → drop the packet + a **rate-limited atomic** edge to the control
+thread (§4.3, `last_init_ns` AtomicU64 — one relaxed atomic, no handshake state
+on the worker) + counter. Reuses `WgWorkerScratch` — **no per-packet alloc**.
 
-### 4.5 Rust: ingress decap stage (gated)
+### 4.5 Rust: ingress RX gating — shim early-return, NOT a hot-path decap stage
 
-A new `stage_wg_decap` in `poll_stages.rs`, modeled on `stage_native_gre_decap`,
-placed in the same stage region. Gate: only enters when the parsed outer is
-`UDP && dst_port == any configured wg_listen_port` (a cheap set membership; the
-common case is a miss and falls through with zero cost). On a WG `UDP` match:
-- type 4 (transport) → `engine.try_decap(record, scratch)` → AllowedIPs inner-
-  src gate (`allowed_ips.rs`) → return the inner IP frame as the decap `Vec<u8>`
-  (same `(meta, Option<Vec<u8>>)` shape).
-- type 1/2/3 (handshake) → hand to the control thread via mpsc + recycle the
-  frame (no forwarding). Same `RecycleAndContinue` shape as IPsec passthrough.
+v2 has **no `stage_wg_decap` on the poll worker** (decap is in the control
+thread, §3.4/§4.3). Ingress WG is gated in two cheap places, both zero-cost for
+non-WG traffic:
 
-The listen-port set is precomputed in `ForwardingState` (a small
-`FastSet<u16>`) so the gate is one hash probe; non-WG traffic (the overwhelming
-majority) never touches the engine.
+1. **`userspace-xdp` shim early-return** (the §3.4 ESP-precedent steering): one
+   branch beside `:469 PROTO_ESP` / `:473 PROTO_GRE`:
+   ```rust
+   if parsed.protocol == PROTO_UDP && ctrl.wg_rx && is_wg_listen_port(&parsed) {
+       return Ok(cpumap_or_pass(ctrl)); // WG → kernel → control-thread socket
+   }
+   ```
+   `ctrl.wg_rx` is a per-CPU control flag (0 when no WG tunnel is configured →
+   the branch is a single predicate the compiler folds away the body of); the
+   port check reads the WG listen port from the control block. Non-WG UDP never
+   pays more than the `ctrl.wg_rx` test. (Carrying the listen port to the shim
+   reuses the existing `UserspaceCtrl` control-block plumbing; if that is too
+   invasive for S2a, fall back to `is_local_destination` already routing WG to
+   the kernel for the responder case — but the explicit early-return makes RX
+   deterministic regardless of local-address/session state and is preferred.)
+2. **`has_wg_tunnels: bool` on `ForwardingState`** — any userspace path that
+   would consult WG state short-circuits on this single bool when false. No
+   `FastSet<u16>` probe on the per-packet UDP path (round-1 reviewers'
+   minor #4): the shim handles steering; the userspace dataplane never inspects
+   the WG port per packet in S2a.
 
 ### 4.6 What S2a does NOT touch
 - No persistent-keepalive emit, no REKEY/REJECT-AFTER timer scheduling, no
@@ -268,25 +347,29 @@ All S1 `pub(crate)` engine signatures unchanged
 `consume_initiation_create_response`/`install_session`/`reconcile_peers`/
 `local_public_key`/`listen_port`). The `Wg*` DTO field names + JSON tags
 unchanged (wire-compat). New code only ADDS: runtime `TunnelEndpoint` `wg_*`
-fields, `ForwardingState.wg_engines` + `wg_listen_ports`, `coordinator/
-wg_control.rs`, the gated encap/decap branches. GRE path byte-for-byte
-unchanged.
+fields, `ForwardingState.wg_engines` + `has_wg_tunnels`, `coordinator/
+wg_control.rs`, the gated egress encap branch, and the `userspace-xdp` shim
+WG-port early-return. GRE path byte-for-byte unchanged; the shim non-WG UDP
+path pays only the `ctrl.wg_rx` predicate (0 when no WG configured).
 
 ## 6. Hidden invariants the change must preserve
 
-- **Handshake crypto is control-thread only** (S1 §7). The encap/decap on the
-  poll worker take only `RwLock::read` on `peer.current` /
-  `sessions_by_local_index` — they NEVER build a `HandshakeState`. The control
-  thread owns all `create_initiation`/`consume_*` calls.
-- **No hot-path allocation** (#1207/#946). Encap/decap reuse `WgWorkerScratch`;
-  no `vec![]` per packet.
-- **Non-WG fast-path zero-cost** (#1183/#1545). The encap branch is inside the
-  already-tunneled copy path (plain forward never reaches it); the decap gate is
-  one `FastSet<u16>` probe that misses for all non-WG traffic. Smoke must show
-  best-effort line rate unchanged with a WG endpoint configured.
-- **Engine reload stability** — an unchanged WG endpoint must KEEP its engine
-  across config reloads (TAI64N high-water + live sessions), or the
-  re-handshake-on-reload cost must be explicitly accepted + documented (§4.2).
+- **Handshake crypto is control-thread only** (S1 §7). The egress encap on the
+  poll worker takes only `RwLock::read` on `peer.current` — it NEVER builds a
+  `HandshakeState`. The control thread owns all
+  `create_initiation`/`consume_*`/`try_decap` calls. The worker→control NoSession
+  signal is a single relaxed atomic carrying no packet data (§4.3).
+- **No hot-path allocation** (#1207/#946). Egress encap reuses `WgWorkerScratch`;
+  no `vec![]` per packet. (Decap is control-thread, off the hot path.)
+- **Non-WG fast-path zero-cost** (#1183/#1545). The egress encap branch is inside
+  the already-tunneled copy path (plain forward never reaches it,
+  `tx/dispatch/mod.rs:443`); the ingress shim early-return pays only the
+  `ctrl.wg_rx` predicate (0 when no WG configured); the userspace dataplane does
+  NO per-packet WG port probe (§4.5). Smoke must show best-effort line rate
+  unchanged with a WG endpoint configured.
+- **Engine reload stability** (§4.2, RESOLVED) — identity-stable reuse of
+  `Arc<WgEngine>` from `previous` (no `reconcile_peers` on the shared Arc); on
+  config change, fresh engine seeded from the prior TAI64N high-water.
 - **Cryptokey-routing**: encap keys on `wg_peer_pubkey` (forwarding decision),
   NOT AllowedIPs LPM; decap AllowedIPs-gates the inner src. S2a must not invert
   this.
@@ -300,13 +383,13 @@ unchanged.
 
 | Class | Level | Notes |
 |---|---|---|
-| Behavioral regression (non-WG fast path) | **MED→HIGH** | The encap/decap gating is the crux. Mitigation: branch lives only in the already-tunneled copy path; decap gate is a single hash probe; smoke proves CoS-off + CoS-on line rate unchanged with WG configured. PLAN-KILL if a reviewer shows the gate touches the plain-forward path. |
-| Lifetime / borrow-checker | **MED** | New aux thread shares `Arc<WgEngine>` + forwarding; the encap scratch is `RefCell` (single-threaded worker). The decap `Option<Vec<u8>>` shape mirrors GRE. |
-| Silent black-hole / mis-demux | **MED** | Decap demux on `receiver_index` is S1-tested; the handshake handoff channel + `create_initiation`-on-NoSession is new. Tests: encap→decap self-loopback round-trip; NoSession triggers init exactly once. |
-| Engine reload churn (TAI64N/sessions) | **MED** | §4.2 Q2 — the open decision. |
-| Architectural mismatch (#961/#946-P2) | **LOW** | The aux-thread + decap-stage + encap-branch templates already exist (GRE/IPsec). This is composition, not a new architecture. |
-| AF_XDP-vs-kernel-UDP handshake delivery | **MED** | §4.3 Q3 — whether handshake datagrams reach a kernel `UdpSocket` or must be demuxed off the AF_XDP path. Wrong assumption = handshake never completes. Must be resolved before implement. |
-| UMEM integration on encap | **MED** | The WG outer datagram is larger than inner (overhead 60–80 B); the copy path must size the UMEM frame for `inner + WG_OVERHEAD`. MSS clamp (`wg/mss.rs`) bounds inner TCP; non-TCP >MTU is the no-reassembly S2b case. |
+| Behavioral regression (non-WG fast path) | **MED** | Egress branch lives only in the already-tunneled copy path; ingress shim early-return pays only `ctrl.wg_rx`; no per-packet WG port probe in the userspace DP (§4.5). Smoke proves CoS-off + CoS-on line rate unchanged with WG configured. PLAN-KILL if a reviewer shows a gate touches the plain-forward path. |
+| Lifetime / borrow-checker | **MED** | New aux thread owns `Arc<WgEngine>` + `UdpSocket`; the encap scratch is `RefCell` (single-threaded worker). Reinject reuses the `local_tunnel_deliveries` `SyncSender<Vec<u8>>` shape. |
+| Silent black-hole / mis-demux | **MED** | Decap demux on `receiver_index` is S1-tested; RX-via-kernel-socket is the ESP precedent (§3.4). Tests: encap→decap round-trip; NoSession atomic fires once per interval; shim steers WG-port to kernel. |
+| Engine reload churn (TAI64N/sessions) | **LOW** | RESOLVED §4.2 — identity reuse + high-water seed. |
+| Architectural mismatch (#961/#946-P2) | **LOW** | Aux-thread + egress-encap-branch + kernel-socket-RX templates all already exist (GRE local-origination, ESP/IKE). Composition, not new architecture. |
+| WG RX delivery (kernel socket vs AF_XDP) | **LOW** | RESOLVED §3.4 — WG-to-firewall is local-destination UDP, passed to kernel via `cpumap_or_pass` (ESP precedent `lib.rs:469`); kernel socket receives it. Shim early-return makes it deterministic. |
+| UMEM integration on encap | **MED** | WG outer adds `WG_OVERHEAD_V4=60`/`V6=80` (`mod.rs:138-141`) + ≤15 B pad. `try_encap` bound-checks before side effects (`engine.rs:627-633`). The copy path sizes the UMEM frame for `inner + WG_OVERHEAD`; a non-TCP inner exceeding `MTU - WG_OVERHEAD` is an explicit drop + `wg_mtu_drops` (no userspace reassembly), NOT a descriptor overflow. |
 
 ## 8. Test plan
 
@@ -314,13 +397,24 @@ unchanged.
   new wiring tests).
 - New unit/integration tests:
   - `wg_encap_then_decap_roundtrip` — encap an inner IPv4 frame through a live
-    session, decap it back, assert byte-identical inner.
-  - `wg_decap_gate_misses_non_wg_udp` — a non-listen-port UDP frame falls
-    through `stage_wg_decap` untouched.
-  - `wg_encap_no_session_triggers_single_init` — first packet with no session
-    drops + signals exactly one handshake init.
-  - `wg_handshake_datagram_routed_to_control_thread` — type-1/2 on the decap
-    stage is handed off + recycled, not forwarded.
+    session (TX path), decap it back through the control-thread `try_decap`,
+    assert byte-identical inner.
+  - `wg_encap_no_session_triggers_single_init_per_interval` — first packet with
+    no session drops + the `last_init_ns` atomic fires exactly once per interval
+    under a packet flood (proves the rate-limiter bounds the signal).
+  - `wg_control_loop_dispatch` — type-1 → response sent; type-2 → session
+    completes; type-3 → dropped+counted; type-4 → decap + AllowedIPs gate +
+    reinject. (Drives `wg_control_loop` against an in-memory socket double.)
+  - `wg_reload_reuses_engine_when_identity_unchanged` + `..._seeds_high_water_on_change`
+    — the §4.2 reload contract: unchanged endpoint reuses the same `Arc`
+    (pointer-eq) without `reconcile_peers`; a changed endpoint gets a fresh
+    engine whose TAI64N high-water ≥ the prior engine's.
+  - `wg_encap_mtu_oversize_drops_not_corrupts` — a non-TCP inner exceeding
+    `MTU - WG_OVERHEAD` is dropped + `wg_mtu_drops` incremented, UMEM frame
+    untouched.
+  - `shim_steers_wg_listen_port_to_kernel` — the `userspace-xdp` early-return
+    returns `cpumap_or_pass` for `UDP/listen_port` and is inert
+    (`ctrl.wg_rx == 0`) otherwise.
   - Go: `buildTunnelEndpointSnapshots` populates `Wg*` for a `mode=wireguard`
     tunnel; `mode=gre` unchanged.
   - Go: privkey not serialized into the state snapshot.
@@ -344,38 +438,62 @@ S2b live interop (#1736); S4 PSK; S5 timers/keepalive/roaming/TAI64N-persist;
 S6 Junos grammar + CLI + multi-instance (#1434); S7 cookie/MAC2/IPv6-outer/DSCP;
 S8 HA migration; post-S2 perf benchmarking.
 
-## 10. Open questions for adversarial review (each invitable to PLAN-KILL)
+## 10. Questions — resolutions after round 1 (Codex + AGY + Claude-SMR)
 
-1. **Config surface (§4.1).** Is a minimal `tunnel mode wireguard` + flat `wg_*`
-   attributes the right S2a surface, or does even the minimal config force the
-   S6 grammar decision now? Kill/redirect if the config can't compile to the DTO
-   without committing to S6.
-2. **Engine reload stability (§4.2).** Must S2a carry the `WgEngine` across
-   config reloads (reload-stable holder), or is re-handshake-on-reload an
-   acceptable S2a cost? A fresh engine per reload drops TAI64N high-water +
-   sessions → re-handshake storm + monotonicity regression against a peer that
-   still holds the old high-water. **Highest-risk decision.**
-3. **Handshake datagram delivery (§4.3/§4.5).** Do WG handshake datagrams (and
-   transport) reach a kernel `UdpSocket` bound on `wg_listen_port`, or does the
-   AF_XDP program consume ALL ingress on the steered queues so EVERYTHING must
-   be demuxed off the datapath and fed to the control thread via channel? This
-   determines whether the control thread owns a real socket for RX or only TX.
-   Wrong = handshake never completes. **Must be resolved before implement.**
-4. **Fast-path cost (§4.4/§4.5).** Is the decap gate (`FastSet<u16>` probe on
-   every ingress UDP) truly zero-cost for non-WG traffic at line rate, or does
-   adding a probe to the UDP ingress path regress best-effort? Kill if the probe
-   can't be hoisted to a per-binding precomputed flag.
-5. **Encap UMEM sizing (§7).** Does the copy path correctly size the UMEM frame
-   for `inner + WG_OVERHEAD`, and what happens to a non-TCP inner packet that
-   exceeds `MTU - WG_OVERHEAD` (no userspace reassembly)? S2a must drop-not-
-   corrupt; confirm the buffer math.
-6. **S2a/S2b split soundness.** Is shipping datapath wiring WITHOUT the live
-   interop proof acceptable, given the wiring is unit-tested + self-loopback +
-   fast-path-no-regress smoke? Or must S2a and S2b co-ship? I argue the split is
-   sound (the engine is dead until wired; the wiring is gated + inert for non-WG;
-   the live proof is a separable VM-harness surface per consolidation Q4). Kill
-   the split if a half-wired datapath is judged unshippable.
-7. **Is `frame/mod.rs:237` the only encap site that matters for S2a**, or do the
-   TSO (`tcp_segmentation.rs:309`) + local-origination (`tunnel.rs:189`) sites
-   ALSO need WG wiring for a minimally-functional single tunnel, or can they
-   return a "WG-unsupported-on-this-path" drop in S2a and land in a follow-up?
+1. **Config surface (§4.1).** RESOLVED: minimal `tunnel mode wireguard` + flat
+   `wg_*` attributes; compiles to the DTO without committing to S6 grammar. Both
+   reviewers agreed (Codex finding 6, AGY).
+2. **Engine reload stability (§4.2).** RESOLVED (both reviewers' blocker #2):
+   identity-stable `Arc<WgEngine>` reuse from `previous` (no `reconcile_peers` on
+   the shared Arc, avoiding mutation of state old worker Arcs observe); on config
+   change, fresh engine seeded from the prior TAI64N high-water.
+3. **WG RX delivery (§3.4/§4.3).** RESOLVED (both reviewers' blocker #1, refined
+   by Claude-SMR): WG-to-firewall is local-destination UDP → kernel via
+   `cpumap_or_pass` (ESP precedent `lib.rs:469`); a kernel `UdpSocket` receives
+   it. S2a adds a deterministic shim early-return and keeps RX on the kernel
+   socket (Option A). The AF_XDP-hot-path decap (Option B) needs a shim steering
+   change and is deferred to a post-S2 perf follow-up. This removes the
+   `stage_wg_decap` hot-path stage + worker→control packet channel entirely.
+4. **Fast-path cost (§4.5).** RESOLVED: no `FastSet<u16>` per-packet probe; the
+   shim early-return pays only `ctrl.wg_rx`, and the userspace DP carries a
+   single `has_wg_tunnels` bool. Both reviewers' minor #4 folded.
+5. **Encap UMEM/MTU (§7).** RESOLVED: copy path sizes for `inner + WG_OVERHEAD`;
+   non-TCP >MTU → explicit drop + `wg_mtu_drops` (no userspace reassembly), no
+   descriptor overflow. `try_encap` bound-checks before side effects
+   (`engine.rs:627-633`).
+6. **S2a/S2b split soundness.** RESOLVED: sound (Codex finding 3, AGY). S2a lands
+   ONLY as gated wiring + no-regress smoke; it is NOT advertised as "WG works"
+   until S2b's live interop passes. The plan and PR will state this explicitly.
+7. **Encap sites.** RESOLVED: only `frame/mod.rs:237` is needed for S2a. TSO is
+   not live for tunnels (`tx/dispatch/mod.rs:1026` returns false when
+   `tunnel_endpoint_id != 0`; `tx/tcp_segmentation.rs:21` returns `None`), and
+   local-origination spawning is GRE-only (`coordinator/mod.rs:342`). The TSO +
+   local-origination sites return a non-breaking unsupported-outcome in S2a and
+   wire later (Codex finding 6).
+
+## 11. v2 convergence (round 1)
+
+- **Codex** (`wg-s2a-plan-r1-1780272812`): **PLAN-NEEDS-MAJOR.** Two blockers:
+  (1) WG RX ownership "internally contradictory and not implementable as
+  written"; (2) reload-stable engine reuse mandatory but the v1 "reuse +
+  reconcile" was snapshot-unsafe. Minors: ingress probe not zero-cost; UMEM/MTU
+  needs explicit drop tests; only the primary encap site is required;
+  control-thread-only invariant OK if NoSession is a bounded signal.
+- **AGY** (`adversarial-review-mpugg9lm-mlr55n`): **PLAN-NEEDS-MAJOR.** Same two
+  blockers + the same minors (asymmetric UDP model, `previous`-state engine
+  carry, `has_wg_tunnels` + bitmask gating, worker→control rate-limit, MTU
+  drop-not-corrupt). (AGY edited the plan during review per the known pattern;
+  the edit was REVERTED — AGY is review-only — and its sound resolutions folded
+  here by hand.)
+- **Claude-SMR** (this thread): independently verified the code. **Key
+  correction to BOTH reviewers' shared premise**: a kernel `UdpSocket` on
+  `wg_listen_port` CAN receive WG datagrams, because the shim passes
+  local-destination UDP to the kernel via `cpumap_or_pass` — the exact ESP/IPsec
+  path (`lib.rs:467-475`). This makes Option A (kernel-socket RX, no shim
+  steering rewrite, no hot-path decap stage) the lowest-risk S2a, dissolving
+  blocker #1 into a one-line shim early-return rather than a full AF_XDP demux
+  redesign. Both blockers are resolved in v2 (§3.4, §4.2, §4.3, §4.5).
+
+All round-1 findings folded. v2 is cleared to implement pending a confirming
+re-review (the RX-model pivot is material enough to warrant one round-2 pass
+from Codex + AGY before code lands).
