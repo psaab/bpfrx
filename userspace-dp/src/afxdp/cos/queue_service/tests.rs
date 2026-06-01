@@ -2368,6 +2368,192 @@ fn waterfill_guarantee_rate_fraction_consulted_by_selector() {
     );
 }
 
+/// #1732: build a GuaranteeRate root with THREE exact queues at distinct,
+/// unequal `transmit_rate_bytes` chosen so each queue's
+/// `cos_guarantee_quantum_bytes` is DISTINCT and strictly above the
+/// `COS_GUARANTEE_QUANTUM_MIN_BYTES` (1500) floor (so the Phase-1 cost
+/// ordering is rate-driven, not all clamped to the min). queue_idx order ==
+/// ascending-rate order so a returned `queue_idx` directly names the
+/// ascending ordinal. Every queue gets abundant per-queue tokens AND the
+/// root gets abundant tokens, so the ONLY gate is the Phase-1 byte budget
+/// (`fraction × quantum_sum`) — the selector gates on root tokens (`:856`,
+/// `:1034`) and queue tokens (`:879`), all made non-binding here.
+///
+/// Rates: 100 Mbps / 400 Mbps / 1 Gbps → quantums 2500 / 10000 / 25000 B
+/// (rate_bytes × 200_000 ns / 1e9). quantum_sum = 37500.
+fn waterfill_three_unequal_exact_root(frac: f64) -> CoSInterfaceRuntime {
+    fn exact_queue(queue_id: u8, fc: &str, rate_bytes: u64) -> CoSQueueConfig {
+        CoSQueueConfig {
+            queue_id,
+            forwarding_class: fc.into(),
+            priority: 5,
+            transmit_rate_bytes: rate_bytes,
+            guarantee_enabled: true,
+            exact: true,
+            surplus_sharing: false,
+            equal_flow_enforcement: false,
+            surplus_weight: 1,
+            buffer_bytes: COS_MIN_BURST_BYTES,
+            dscp_rewrite: None,
+            codel_target_ns: 0,
+        }
+    }
+    let mut root = test_cos_runtime_with_queues(
+        10_000_000_000 / 8,
+        vec![
+            exact_queue(0, "exact-100m", 100_000_000 / 8),
+            exact_queue(1, "exact-400m", 400_000_000 / 8),
+            exact_queue(2, "exact-1g", 1_000_000_000 / 8),
+        ],
+    );
+    root.oversubscription_policy = CoSOversubscriptionPolicy::GuaranteeRate;
+    root.oversubscription_guarantee_fraction = frac;
+    // Built at config-apply time in production; rebuild here (stable sort by
+    // ascending rate keeps queue_idx order, so ordinal i == queue_idx).
+    root.exact_queues_by_rate_ascending = (0..root.queues.len())
+        .filter(|&idx| root.queues[idx].config.exact && root.queues[idx].config.guarantee_enabled)
+        .collect();
+    root.exact_queues_by_rate_ascending
+        .sort_by_key(|&idx| root.queues[idx].config.transmit_rate_bytes);
+    // Root tokens abundant so the root-token gate never fires.
+    root.tokens = 8 * 1024 * 1024;
+    for queue in &mut root.queues {
+        // Abundant per-queue tokens (queue-token gate never fires) + frozen
+        // refill clock so the selector sees a steady token bucket. Multi-item
+        // backlog so no queue drains to empty across the epoch's selections.
+        queue.hot.tokens = 1024 * 1024;
+        queue.hot.last_refill_ns = 1;
+        queue.hot.runnable = true;
+        for _ in 0..8 {
+            queue.hot.items.push_back(test_cos_item(1500));
+        }
+        queue.hot.queued_bytes = 8 * 1500;
+    }
+    root.nonempty_queues = root.queues.len();
+    root.runnable_queues = root.queues.len();
+    root
+}
+
+#[test]
+fn waterfill_persistent_honored_set_distributes_phase1_across_queues() {
+    // #1732: the persistent honored set makes Phase 1 honor each exact
+    // queue AT MOST ONCE per epoch, smallest-rate-first, instead of
+    // re-honoring the smallest queue on every selector call (the lowest-rate
+    // skew the issue reports). With three exact queues at quantums
+    // 2500/10000/25000 and fraction=0.4, the Phase-1 budget is
+    // floor(37500 * 0.4) = 15000 bytes:
+    //   - selection 1: honor q0 (cost 2500), budget -> 12500
+    //   - selection 2: q0 SKIPPED (already honored), honor q1 (cost 10000),
+    //     budget -> 2500
+    //   - selection 3: q0,q1 SKIPPED; q1->q2 cost 25000 > 2500 -> Phase 1
+    //     breaks, Phase 2 serves the largest un-honored queue q2
+    // The OLD (broken) selector would re-honor q0 on selections 2 and 3
+    // because Phase 1 had no honored-skip, monopolising the budget on the
+    // smallest queue.
+    let mut root = waterfill_three_unequal_exact_root(0.4);
+    let mut tel = CoSQueueLeaseAcquireTelemetry::default();
+
+    let s1 = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
+        .expect("selection 1");
+    let s2 = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
+        .expect("selection 2");
+    let s3 = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
+        .expect("selection 3");
+
+    // Per-epoch service order across >1 selection: ascending, at-most-once.
+    assert_eq!(s1.queue_idx, 0, "selection 1 honors the smallest-rate queue");
+    assert_eq!(
+        s2.queue_idx, 1,
+        "selection 2 must advance to the next-smallest queue, NOT re-honor q0 \
+         (this is the broken-mask behavior the fix corrects)"
+    );
+    assert_eq!(
+        s3.queue_idx, 2,
+        "selection 3 must reach the largest queue (Phase 2 residual after the \
+         Phase-1 budget is exhausted), NOT re-serve a honored queue"
+    );
+
+    // Each of the two small queues took exactly one Phase-1 admission; the
+    // largest queue took a Phase-2 admission (no Phase-1 honor — its cost
+    // exceeded the residual budget).
+    assert_eq!(
+        root.queues[0].telemetry.waterfill_counters.phase1_admissions, 1,
+        "q0 honored once in Phase 1"
+    );
+    assert_eq!(
+        root.queues[1].telemetry.waterfill_counters.phase1_admissions, 1,
+        "q1 honored once in Phase 1"
+    );
+    assert_eq!(
+        root.queues[2].telemetry.waterfill_counters.phase1_admissions, 0,
+        "q2 not honored in Phase 1 (budget exhausted before it)"
+    );
+    assert_eq!(
+        root.queues[2].telemetry.waterfill_counters.phase2_admissions, 1,
+        "q2 served as Phase-2 residual"
+    );
+
+    // The persistent bitset carries q0 and q1's ORDINAL bits across calls
+    // within the epoch (ordinal == queue_idx here). q2 (ordinal 2) is never
+    // honored in Phase 1, so its bit stays clear.
+    assert_ne!(
+        root.waterfill_honored_epoch_bits & 0b011,
+        0,
+        "ordinals 0 and 1 must be marked honored within the epoch"
+    );
+    assert_eq!(
+        root.waterfill_honored_epoch_bits & 0b100,
+        0,
+        "ordinal 2 (the Phase-2-served queue) must NOT be marked Phase-1-honored"
+    );
+}
+
+#[test]
+fn waterfill_honored_set_clears_on_epoch_refill() {
+    // #1732: the honored bitset must clear at the lazy Phase-1 refill so a
+    // new epoch starts with a fresh honored set (otherwise the smallest
+    // queue would be permanently skipped after its first honor). Drive the
+    // selector until the epoch exhausts, force a refill by zeroing the
+    // Phase-1 budget, and confirm the bitset is cleared and the smallest
+    // queue is honored FIRST again in the next epoch.
+    let mut root = waterfill_three_unequal_exact_root(0.4);
+    let mut tel = CoSQueueLeaseAcquireTelemetry::default();
+
+    // Epoch 1: drive three selections (q0, q1, then Phase-2 q2).
+    for _ in 0..3 {
+        let _ = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel);
+    }
+    assert_ne!(
+        root.waterfill_honored_epoch_bits, 0,
+        "honored bits accumulate within an epoch"
+    );
+
+    // Force the epoch boundary: zero the Phase-1 budget so the next call
+    // takes the lazy-refill path (the same effect as the natural exhaustion
+    // reset at the end of the selector).
+    root.waterfill_pass1_remaining_bytes = 0;
+    let epochs_before = root.waterfill_epochs;
+
+    let s_next = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
+        .expect("first selection of the new epoch");
+
+    assert_eq!(
+        root.waterfill_epochs,
+        epochs_before + 1,
+        "refill must bump the epoch counter"
+    );
+    assert_eq!(
+        s_next.queue_idx, 0,
+        "after the refill clears the honored set, the smallest queue is \
+         honored first again (not permanently skipped)"
+    );
+    // Only q0's ordinal bit is set in the fresh epoch.
+    assert_eq!(
+        root.waterfill_honored_epoch_bits, 0b001,
+        "fresh epoch: only the just-honored smallest queue (ordinal 0) is marked"
+    );
+}
+
 // #1628: per-class waterfill trace-counter tests. These pin that the
 // counters increment at the right SITES (not that any one counter is a
 // unique fingerprint — that interpretation requires pairing with
