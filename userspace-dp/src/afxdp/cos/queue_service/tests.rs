@@ -2400,8 +2400,15 @@ fn waterfill_three_unequal_exact_root(frac: f64) -> CoSInterfaceRuntime {
             codel_target_ns: 0,
         }
     }
+    // #1743: the Phase-1 budget is now `shaper × VISIT_NS × fraction`, not
+    // `quantum_sum × fraction`. Pin the shaper so cap_per_epoch equals the
+    // quantum_sum (37,500 B) — `shaper × 200µs = 37,500` ⇒ shaper =
+    // 187,500,000 B/s (1.5 Gbps). That keeps the per-epoch budget identical
+    // to the pre-#1743 `quantum_sum`-based value at any fraction, so the
+    // budget-break-into-Phase-2 semantics these tests pin are preserved
+    // under the corrected formula.
     let mut root = test_cos_runtime_with_queues(
-        10_000_000_000 / 8,
+        187_500_000,
         vec![
             exact_queue(0, "exact-100m", 100_000_000 / 8),
             exact_queue(1, "exact-400m", 400_000_000 / 8),
@@ -2531,10 +2538,14 @@ fn waterfill_honored_set_clears_on_epoch_refill() {
         "honored bits accumulate within an epoch"
     );
 
-    // Force the epoch boundary: zero the Phase-1 budget so the next call
-    // takes the lazy-refill path (the same effect as the natural exhaustion
-    // reset at the end of the selector).
+    // Force a GENUINE epoch boundary: zero the Phase-1 budget AND arm
+    // `waterfill_epoch_wrap_pending`, exactly as the end-of-function Phase-2
+    // WRAP (`None`) path does. #1743 r3: a bare `pass1 == 0` alone refills the
+    // budget but does NOT clear the honored bits (that avoids the exact-fit
+    // livelock); only the time tick or a genuine wrap clears them — which is
+    // what this #1732 test means by "epoch boundary".
     root.waterfill_pass1_remaining_bytes = 0;
+    root.waterfill_epoch_wrap_pending = true;
     let epochs_before = root.waterfill_epochs;
 
     let s_next = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
@@ -2654,6 +2665,22 @@ fn waterfill_counters_budget_break_into_phase2() {
     // any single queue's quantum, the first ascending queue's
     // phase1_cost exceeds the remaining budget at mod.rs:906.
     let mut root = waterfill_guarantee_rate_root(0.0001);
+    // #1743: use a TRANSPARENT root (shaping_rate_bytes == 0) so the
+    // Phase-1 budget takes the legacy `quantum_sum × fraction` path. After
+    // bumping the exact queues to 3 Gbps (quantum 75,000 B), raw pass1 =
+    // floor(quantum_sum × 0.0001) is a few bytes, which the symmetric
+    // anti-thrash clamp (Codex r1 #2) raises to one min-quantum (1500 B).
+    // To force the Phase-1 break we need every exact queue's quantum to
+    // EXCEED that clamped 1500 B floor — 75,000 B ≫ 1500 — so the clamped
+    // budget is below every quantum and Phase 1 breaks immediately into
+    // Phase 2. (The clamp itself is verified separately in
+    // waterfill_pass1_tiny_fraction_clamped_to_min_quantum.)
+    root.shaping_rate_bytes = 0;
+    for q in &mut root.queues {
+        if q.config.exact {
+            q.config.transmit_rate_bytes = 3_000_000_000 / 8;
+        }
+    }
     let mut tel = CoSQueueLeaseAcquireTelemetry::default();
     let s = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
         .expect("phase-2 selection after budget break");
@@ -2692,4 +2719,308 @@ fn waterfill_counters_phase1_admit_flake_5x() {
         );
         assert_eq!(root.waterfill_epochs, 1);
     }
+}
+
+// ---------------------------------------------------------------------------
+// #1743: shaper-anchored Phase-1 budget + stable honor charge + time refresh.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn waterfill_pass1_anchored_to_shaper_per_epoch() {
+    // #1743 Hunk A: for a SHAPED root the Phase-1 budget must be
+    // `shaper × VISIT_NS × fraction`, NOT `quantum_sum × fraction`. The
+    // smoke fixture is oversubscribed (Σ R_i ≫ shaper), so the old formula
+    // over-budgeted pass1 by ~4× and Phase-2 never fired. Pin the corrected
+    // budget directly: a 25 Gbps shaper at fraction 0.7 yields
+    // floor(25e9/8 × 200µs × 0.7) = floor(625_000 × 0.7) = 437_500 B,
+    // regardless of how large the sum of configured class rates is.
+    let mut root = waterfill_three_unequal_exact_root(0.7);
+    root.shaping_rate_bytes = 25_000_000_000 / 8;
+    // First selector call takes the exhausted refill path (pass1 seeded 0)
+    // and computes the shaper-anchored budget. Inspect it before any honor
+    // debit by checking the value the refill installs: drive one call then
+    // add back the single honor charge it consumed.
+    let mut tel = CoSQueueLeaseAcquireTelemetry::default();
+    let s = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
+        .expect("first selection");
+    let charged = cos_guarantee_quantum_bytes(&root.queues[s.queue_idx])
+        .max(1500 /* head_len of the primed 1500-byte item */);
+    let installed_budget = root.waterfill_pass1_remaining_bytes + charged;
+    assert_eq!(
+        installed_budget, 437_500,
+        "Phase-1 budget must be shaper × VISIT_NS × fraction (437,500 B at \
+         25 Gbps / 0.7), not the oversubscribed quantum_sum × fraction"
+    );
+}
+
+#[test]
+fn waterfill_pass1_transparent_root_fallback_to_quantum_sum() {
+    // #1743 Hunk A: a TRANSPARENT root (shaping_rate_bytes == 0) has no
+    // shaper-delivered cap to anchor against, so it must fall back to the
+    // legacy quantum_sum × fraction. Quanta 2500/10000/25000, sum 37,500;
+    // fraction 0.4 ⇒ budget floor(37_500 × 0.4) = 15_000 B.
+    let mut root = waterfill_three_unequal_exact_root(0.4);
+    root.shaping_rate_bytes = 0;
+    let mut tel = CoSQueueLeaseAcquireTelemetry::default();
+    let s = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
+        .expect("first selection");
+    let charged = cos_guarantee_quantum_bytes(&root.queues[s.queue_idx]).max(1500);
+    let installed_budget = root.waterfill_pass1_remaining_bytes + charged;
+    assert_eq!(
+        installed_budget, 15_000,
+        "transparent-root budget must use quantum_sum × fraction (15,000 B)"
+    );
+}
+
+#[test]
+fn waterfill_phase1_honor_charge_is_configured_quantum_not_tokens() {
+    // #1743 Hunk B: the Phase-1 honor charge must be the STABLE configured
+    // quantum, NOT `queue.hot.tokens.min(quantum)`. Under v8-lease pressure
+    // tokens collapse toward one frame; the old charge then fell to head_len,
+    // the queue was marked fully honored for ~one frame, and Phase-2 skipped
+    // it. With the fixed charge a token-pressured small queue still consumes
+    // its full quantum against pass1 (or is left for Phase-2 if it does not
+    // fit), so the budget is spent honestly.
+    //
+    // Shaper anchored so the budget equals quantum_sum (37,500 B) at frac 1.0
+    // (see waterfill_three_unequal_exact_root). Pin q1's tokens to exactly
+    // one frame; its configured quantum is 10,000 B (400 Mbps × 200µs).
+    let mut root = waterfill_three_unequal_exact_root(1.0);
+    // q0 quantum 2,500; q1 quantum 10,000; q2 quantum 25,000; sum 37,500.
+    // Starve q1's token bank to one frame to exercise the old undercharge.
+    root.queues[1].hot.tokens = 1500;
+    let q1_quantum = cos_guarantee_quantum_bytes(&root.queues[1]);
+    assert!(
+        q1_quantum > root.queues[1].hot.tokens,
+        "precondition: configured quantum exceeds the depleted token bank"
+    );
+    let mut tel = CoSQueueLeaseAcquireTelemetry::default();
+    // Selection 1 honors q0 (smallest). Selection 2 reaches q1.
+    let _ = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
+        .expect("selection 1");
+    let budget_before_q1 = root.waterfill_pass1_remaining_bytes;
+    let s2 = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
+        .expect("selection 2");
+    assert_eq!(s2.queue_idx, 1, "selection 2 honors q1");
+    let charged = budget_before_q1 - root.waterfill_pass1_remaining_bytes;
+    assert_eq!(
+        charged, q1_quantum,
+        "Phase-1 must charge q1's FULL configured quantum ({q1_quantum} B), \
+         not its depleted token bank (1500 B) — the #1743 undercharge"
+    );
+}
+
+#[test]
+fn waterfill_pass1_refreshes_on_time_tick_clears_honored_bits() {
+    // #1743 Hunk C: under saturation Phase-2 does not decrement pass1, so the
+    // budget never hits 0 and the legacy exhausted-refill never fires. The
+    // time-based path must refresh pass1 AND clear the persistent honored
+    // bitset once `now_ns - epoch_start >= COS_GUARANTEE_VISIT_NS`, while
+    // PRESERVING the Phase-2 cursor.
+    //
+    // Codex code-r1: use the DEFAULT 187,500,000 B/s shaper (cap_per_epoch
+    // == quantum_sum == 37,500 B) so at fraction 0.7 the budget is 26,250 B
+    // — enough to honor q0 (2,500) + q1 (10,000) in Phase 1 but NOT q2
+    // (25,000) — which forces a Phase-2 admit and advances the cursor to a
+    // NONZERO value. A 25 Gbps override here would budget 437,500 B, honor
+    // all three queues in Phase 1, never advance Phase 2, and leave the
+    // cursor at 0 — making the preservation assertion vacuous.
+    let mut root = waterfill_three_unequal_exact_root(0.7);
+    let mut tel = CoSQueueLeaseAcquireTelemetry::default();
+    // Epoch 1 at t = 1ns: honor q0+q1 (sets honored bits) and serve q2 in
+    // Phase 2 (advances the cursor to nonzero).
+    for _ in 0..3 {
+        let _ = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel);
+    }
+    assert_ne!(
+        root.waterfill_honored_epoch_bits, 0,
+        "honored bits accumulate within epoch 1"
+    );
+    let cursor_after_epoch1 = root.waterfill_phase2_cursor;
+    assert_ne!(
+        cursor_after_epoch1, 0,
+        "epoch 1 must have advanced the Phase-2 cursor (a Phase-2 admit \
+         occurred) so the preservation assertion below is non-vacuous"
+    );
+    let pass1_mid_epoch = root.waterfill_pass1_remaining_bytes;
+    assert_ne!(pass1_mid_epoch, 0, "pass1 is non-zero mid-epoch (not exhausted)");
+    let epochs_before = root.waterfill_epochs;
+
+    // Advance the clock past one VISIT_NS without ever zeroing pass1. The
+    // time-based refresh must fire on the next call.
+    let next_ns = 1 + COS_GUARANTEE_VISIT_NS + 1;
+    let _ = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], next_ns, &mut tel)
+        .expect("selection after time refresh");
+
+    assert_eq!(
+        root.waterfill_epochs,
+        epochs_before + 1,
+        "the time-based refresh must bump the epoch counter"
+    );
+    assert_eq!(
+        root.waterfill_epoch_start_ns, next_ns,
+        "the refresh must re-seed epoch_start_ns to now_ns"
+    );
+    // The honored bitset was cleared at the refresh, then the smallest queue
+    // was re-honored on this same call — so only ordinal 0's bit is set now.
+    assert_eq!(
+        root.waterfill_honored_epoch_bits, 0b001,
+        "timed refresh must clear honored bits, then Phase-1 re-honors q0"
+    );
+    assert_eq!(
+        root.waterfill_phase2_cursor, cursor_after_epoch1,
+        "the time-based refresh must PRESERVE the Phase-2 cursor (#1743 r2: \
+         neither refill path resets it — only a genuine Phase-2 wrap does)"
+    );
+}
+
+#[test]
+fn waterfill_pass1_undersubscribed_shaper_honors_all_classes() {
+    // Codex r1 #6: when the shaper is UNDERSUBSCRIBED (shaper > Σ R_i) the
+    // cap-anchored budget is ≥ quantum_sum, so Phase-1 can honor every class
+    // without spuriously pushing any to Phase-2. Shaper 10 Gbps, quanta
+    // 2500/10000/25000 (sum 37,500), fraction 1.0 ⇒ cap_per_epoch =
+    // floor(10e9/8 × 200µs) = 250,000 B ⇒ budget 250,000 ≫ 37,500.
+    let mut root = waterfill_three_unequal_exact_root(1.0);
+    root.shaping_rate_bytes = 10_000_000_000 / 8;
+    let mut tel = CoSQueueLeaseAcquireTelemetry::default();
+    let s1 = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
+        .expect("s1");
+    let s2 = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
+        .expect("s2");
+    let s3 = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
+        .expect("s3");
+    assert_eq!((s1.queue_idx, s2.queue_idx, s3.queue_idx), (0, 1, 2));
+    for qi in 0..3 {
+        assert_eq!(
+            root.queues[qi].telemetry.waterfill_counters.phase1_admissions, 1,
+            "queue {qi} must be honored in Phase 1 under an undersubscribed shaper"
+        );
+        assert_eq!(
+            root.queues[qi].telemetry.waterfill_counters.phase2_admissions, 0,
+            "no class should fall to Phase 2 when shaper > Σ R_i"
+        );
+    }
+}
+
+#[test]
+fn waterfill_pass1_tiny_fraction_clamped_to_min_quantum() {
+    // AGY RISK-1: a tiny-positive fraction floors the shaped budget to 0,
+    // which would make `exhausted` true every call → refill + cursor-reset
+    // thrash. The shaped path clamps pass1 to ≥ COS_GUARANTEE_QUANTUM_MIN_BYTES
+    // so at least the smallest class is honorable and the exhausted path does
+    // not fire on every selector call.
+    let mut root = waterfill_three_unequal_exact_root(0.0000001);
+    root.shaping_rate_bytes = 25_000_000_000 / 8;
+    let mut tel = CoSQueueLeaseAcquireTelemetry::default();
+    // The tiny fraction floors raw to 0; the clamp installs pass1 =
+    // COS_GUARANTEE_QUANTUM_MIN_BYTES (1500). 1500 is below the smallest
+    // class quantum (2500), so Phase-1 breaks immediately into Phase-2 —
+    // which still admits the largest un-honored queue. The point: pass1 is
+    // NOT 0, so the exhausted path does not fire on every call.
+    let s = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
+        .expect("first selection still admits via Phase-2");
+    // Phase-1 broke before honoring anyone and Phase-2 does not debit pass1,
+    // so the installed clamped budget is observable directly.
+    assert_eq!(
+        root.waterfill_pass1_remaining_bytes, COS_GUARANTEE_QUANTUM_MIN_BYTES,
+        "a tiny fraction must clamp the Phase-1 budget to one min-quantum, \
+         not floor it to 0"
+    );
+    assert_eq!(
+        root.queues[s.queue_idx].telemetry.waterfill_counters.phase2_admissions, 1,
+        "the budget-broke selection is served by Phase-2"
+    );
+    assert_eq!(
+        root.waterfill_phase1_budget_breaks, 1,
+        "Phase-1 broke because the clamped budget (1500) is below the \
+         smallest quantum (2500)"
+    );
+}
+
+#[test]
+fn waterfill_exhausted_refill_does_not_reset_phase2_cursor() {
+    // #1743 (Codex code-r2): the exhausted (`pass1 == 0`) refill path must
+    // NOT reset the Phase-2 cursor. A degenerate config can land pass1 at
+    // exactly 0 after a Phase-1 honor (phase1_cost == the remaining budget),
+    // returning before Phase 2 — so an exhausted-refill cursor reset on the
+    // next call would restart the descending walk from the largest class and
+    // starve it. Only a genuine Phase-2 wrap (the end-of-function `None`
+    // path) may reset the cursor. Pin that an exhausted refill preserves a
+    // nonzero cursor.
+    let mut root = waterfill_three_unequal_exact_root(0.7);
+    let mut tel = CoSQueueLeaseAcquireTelemetry::default();
+    // Drive epoch 1 to advance the Phase-2 cursor to a nonzero value (q0+q1
+    // honored Phase-1, q2 served Phase-2 — see the time-tick test).
+    for _ in 0..3 {
+        let _ = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel);
+    }
+    let cursor = root.waterfill_phase2_cursor;
+    assert_ne!(cursor, 0, "precondition: Phase-2 cursor advanced in epoch 1");
+    // Force the exhausted refill path WITHOUT advancing the clock (so it is
+    // the exhausted trigger, not the time-based one) by zeroing pass1.
+    root.waterfill_pass1_remaining_bytes = 0;
+    let _ = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel);
+    assert_eq!(
+        root.waterfill_phase2_cursor, cursor,
+        "the exhausted refill path must PRESERVE the Phase-2 cursor; only a \
+         genuine Phase-2 wrap (`None` path) may reset it"
+    );
+}
+
+#[test]
+fn waterfill_exact_fit_honor_does_not_livelock_phase1() {
+    // #1743 (Codex code-r3): the deeper degenerate-config defect. When a
+    // Phase-1 exact-fit honor subtracts the budget to exactly 0, the next
+    // call's bare `exhausted` refill must NOT clear the honored bitset — only
+    // a genuine epoch boundary (time tick OR Phase-2 wrap) clears it.
+    // Clearing on a bare mid-walk `pass1 == 0` re-enabled a livelock: q0
+    // honored → pass1=0 → next call clears q0's bit → q0 re-honored → … with
+    // Phase 2 NEVER reached, starving every larger class.
+    //
+    // Fixture: shaper 187,500,000 B/s (cap_per_epoch == quantum_sum ==
+    // 37,500 B); fraction tuned so the Phase-1 budget == q0's quantum exactly
+    // (2,500 B). q0 (100m, quantum 2,500) is an exact-fit honor; q1 (400m,
+    // 10,000) and q2 (1g, 25,000) must still get Phase-2 service.
+    let mut root = waterfill_three_unequal_exact_root(2_500.0 / 37_500.0);
+    let mut tel = CoSQueueLeaseAcquireTelemetry::default();
+
+    // Call 1: Phase-1 honors q0 (cost 2,500), pass1 → 0.
+    let s1 = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
+        .expect("call 1");
+    assert_eq!(s1.queue_idx, 0, "call 1 honors q0 (smallest, exact-fit)");
+    assert_eq!(
+        root.waterfill_pass1_remaining_bytes, 0,
+        "the exact-fit honor drained pass1 to exactly 0"
+    );
+
+    // Drive several more calls at the SAME now_ns (no time tick) and confirm
+    // a non-q0 queue is serviced — i.e. Phase 2 IS reached, no livelock. With
+    // the pre-r3 bug (clearing bits on bare exhausted) q0 would be re-honored
+    // on every call and q1/q2 would never run.
+    let mut serviced_non_q0 = false;
+    let mut q0_admits = 0u64;
+    for _ in 0..8 {
+        if let Some(s) =
+            select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
+        {
+            if s.queue_idx == 0 {
+                q0_admits += 1;
+            } else {
+                serviced_non_q0 = true;
+            }
+        }
+    }
+    assert!(
+        serviced_non_q0,
+        "Phase 2 must service a larger class within a few calls — q0's \
+         exact-fit honor must not livelock Phase 1 (the #1743 r3 defect)"
+    );
+    // q0 is honored at most once per genuine epoch boundary, not on every
+    // bare-exhausted refill. Over 8 same-tick calls it cannot dominate.
+    assert!(
+        q0_admits <= 2,
+        "q0 must not be re-honored on every bare-exhausted refill (got \
+         {q0_admits} Phase-1 admits in 8 same-tick calls)"
+    );
 }

@@ -405,12 +405,18 @@ pub(in crate::afxdp) struct CoSInterfaceRuntime {
     /// waterfill phase 1 greedy honor loop.
     pub(in crate::afxdp) exact_queues_by_rate_ascending: Vec<usize>,
     /// #1614 A1: Phase 1 byte budget remaining in the current
-    /// service epoch (one RR cycle through the sorted vec).
-    /// Initialized to `(quantum_sum × guarantee_fraction).floor()`
-    /// at the start of each cycle. Decremented per successful
-    /// Phase 1 selection by the chosen queue's secondary_budget.
-    /// When it drops below the next-queue's quantum, the selector
-    /// switches to Phase 2 residual distribution.
+    /// service epoch. #1743: an epoch ends on EITHER a Phase-2 wrap
+    /// (full RR cycle through the sorted vec) OR a 200µs time tick —
+    /// it is no longer strictly one RR cycle, so `waterfill_epochs`
+    /// counts budget refreshes (either trigger), not RR completions.
+    /// #1743: refilled to `(shaping_rate_bytes × COS_GUARANTEE_VISIT_NS
+    /// / 1e9 × guarantee_fraction)` for a SHAPED root (the documented
+    /// "fraction × cap" contract) or the legacy `(quantum_sum ×
+    /// guarantee_fraction)` for a transparent root, clamped to ≥ one
+    /// min-quantum. Decremented per successful Phase 1 honor by the
+    /// chosen queue's STABLE configured quantum (`phase1_cost`, NOT the
+    /// token-clamped send budget). When it drops below the next queue's
+    /// quantum, the selector switches to Phase 2 residual distribution.
     pub(in crate::afxdp) waterfill_pass1_remaining_bytes: u64,
     /// #1614 A1: descending-rate cursor into the sorted vec for
     /// Phase 2 residual distribution. Tracks where in the
@@ -434,8 +440,12 @@ pub(in crate::afxdp) struct CoSInterfaceRuntime {
     /// the Phase-1 budget (skew toward the lowest-rate queue). This bitset
     /// is now persisted across selector calls, read by BOTH phases (so each
     /// queue is honored at most once per epoch, smallest-first, and Phase 2
-    /// serves the residual to the larger un-honored queues), and CLEARED at
-    /// the lazy Phase-1 refill where `waterfill_epochs` bumps. The set/skip
+    /// serves the residual to the larger un-honored queues). #1743 r3: it is
+    /// CLEARED only on a genuine epoch boundary — the 200µs time tick OR a
+    /// Phase-2 WRAP (`waterfill_epoch_wrap_pending`) — NOT on every Phase-1
+    /// budget refill (`waterfill_epochs` still bumps on every refill, but a
+    /// bare mid-walk `pass1 == 0` refill must keep the bits so an exact-fit
+    /// honor does not re-honor the same queue forever). The set/skip
     /// sites guard the shift with `ordinal < 64`, so a (malformed) config
     /// with >64 exact queues leaves ordinals ≥64 conservatively untracked
     /// rather than wrapping `1u64 << (≥64)`. Single-writer owner worker.
@@ -456,6 +466,30 @@ pub(in crate::afxdp) struct CoSInterfaceRuntime {
     /// breaks-per-epoch ratio means Phase 1 routinely exhausts its budget
     /// mid-walk. Single-writer owner worker, plain `u64`.
     pub(in crate::afxdp) waterfill_phase1_budget_breaks: u64,
+    /// #1743: monotonic nanosecond timestamp of the most recent waterfill
+    /// Phase-1 epoch refill. The selector refreshes the Phase-1 budget when
+    /// `now_ns - waterfill_epoch_start_ns >= COS_GUARANTEE_VISIT_NS` (200µs)
+    /// in addition to the `pass1 == 0` budget-spent path. Without the
+    /// time-based refresh, Phase-2 selections (which do NOT decrement the
+    /// Phase-1 budget) let the budget freeze at a small non-zero value under
+    /// saturation, so small classes stop being honored after a few epochs.
+    /// Worker-local runtime; NOT HA-synced (same class as the other
+    /// waterfill_* fields above). Single-writer owner worker, plain `u64`.
+    pub(in crate::afxdp) waterfill_epoch_start_ns: u64,
+    /// #1743 (Codex code-r3): true when a genuine epoch boundary is pending
+    /// — set ONLY by the end-of-function Phase-2 WRAP (`None`) path, which
+    /// also zeroes `waterfill_pass1_remaining_bytes` and the cursor. The
+    /// distinction matters because `pass1` can also reach 0 mid-walk when a
+    /// Phase-1 exact-fit honor subtracts the last bytes; that is NOT an epoch
+    /// boundary. The honored-bitset is cleared (allowing queues to be
+    /// re-honored) ONLY on the time tick OR when this flag is set — NOT on
+    /// every `pass1 == 0` refill. Clearing on a bare mid-walk `pass1 == 0`
+    /// re-enabled a degenerate all-min-quantum livelock (q0 honored → pass1=0
+    /// → clear bits → q0 re-honored → … with Phase 2 never reached). A bare
+    /// `pass1 == 0` still REFILLS the budget so Phase 1 can resume, but with
+    /// the honored bits intact the already-honored small queue is skipped and
+    /// the walk advances / breaks to Phase 2. Single-writer owner worker.
+    pub(in crate::afxdp) waterfill_epoch_wrap_pending: bool,
     // Round-robin cursors for the two guarantee service classes. Exact and
     // non-exact guarantee queues rotate independently — the scheduler gives
     // exact queues strict priority over non-exact guarantee service (the

@@ -193,6 +193,8 @@ fn build_worker_cos_statuses_aggregates_runtime_by_interface_and_queue() {
         waterfill_honored_epoch_bits: 0,
         waterfill_epochs: 0,
         waterfill_phase1_budget_breaks: 0,
+        waterfill_epoch_start_ns: 0,
+        waterfill_epoch_wrap_pending: false,
             exact_guarantee_rr: 0,
             nonexact_guarantee_rr: 0,
             #[cfg(test)]
@@ -367,6 +369,8 @@ fn build_worker_cos_statuses_sums_owner_profile_without_breaking_hist_invariant(
         waterfill_honored_epoch_bits: 0,
         waterfill_epochs: 0,
         waterfill_phase1_budget_breaks: 0,
+        waterfill_epoch_start_ns: 0,
+        waterfill_epoch_wrap_pending: false,
         exact_guarantee_rr: 0,
         nonexact_guarantee_rr: 0,
         #[cfg(test)]
@@ -603,6 +607,8 @@ fn build_worker_cos_statuses_owner_profile_only_surfaces_on_unambiguous_owner_lo
         waterfill_honored_epoch_bits: 0,
         waterfill_epochs: 0,
         waterfill_phase1_budget_breaks: 0,
+        waterfill_epoch_start_ns: 0,
+        waterfill_epoch_wrap_pending: false,
         exact_guarantee_rr: 0,
         nonexact_guarantee_rr: 0,
         #[cfg(test)]
@@ -891,6 +897,8 @@ fn build_worker_cos_statuses_owner_profile_stays_zero_for_ambiguous_multi_exact_
         waterfill_honored_epoch_bits: 0,
         waterfill_epochs: 0,
         waterfill_phase1_budget_breaks: 0,
+        waterfill_epoch_start_ns: 0,
+        waterfill_epoch_wrap_pending: false,
         exact_guarantee_rr: 0,
         nonexact_guarantee_rr: 0,
         #[cfg(test)]
@@ -1094,6 +1102,8 @@ fn build_worker_cos_statuses_owner_profile_stays_zero_for_ambiguous_multi_interf
         waterfill_honored_epoch_bits: 0,
         waterfill_epochs: 0,
         waterfill_phase1_budget_breaks: 0,
+        waterfill_epoch_start_ns: 0,
+        waterfill_epoch_wrap_pending: false,
         exact_guarantee_rr: 0,
         nonexact_guarantee_rr: 0,
         #[cfg(test)]
@@ -1298,6 +1308,8 @@ fn build_worker_cos_statuses_surfaces_distinct_per_queue_drain_telemetry() {
         waterfill_honored_epoch_bits: 0,
         waterfill_epochs: 0,
         waterfill_phase1_budget_breaks: 0,
+        waterfill_epoch_start_ns: 0,
+        waterfill_epoch_wrap_pending: false,
         exact_guarantee_rr: 0,
         nonexact_guarantee_rr: 0,
         #[cfg(test)]
@@ -2380,6 +2392,8 @@ fn active_flow_buckets_peak_is_max_not_sum_across_workers() {
         waterfill_honored_epoch_bits: 0,
         waterfill_epochs: 0,
         waterfill_phase1_budget_breaks: 0,
+        waterfill_epoch_start_ns: 0,
+        waterfill_epoch_wrap_pending: false,
             exact_guarantee_rr: 0,
             nonexact_guarantee_rr: 0,
             #[cfg(test)]
