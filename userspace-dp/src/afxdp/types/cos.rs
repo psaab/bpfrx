@@ -465,16 +465,27 @@ pub(in crate::afxdp) struct CoSInterfaceRuntime {
     /// #1743: monotonic nanosecond timestamp of the most recent waterfill
     /// Phase-1 epoch refill. The selector refreshes the Phase-1 budget when
     /// `now_ns - waterfill_epoch_start_ns >= COS_GUARANTEE_VISIT_NS` (200µs)
-    /// in addition to the legacy `pass1 == 0` exhausted path. Without the
+    /// in addition to the `pass1 == 0` budget-spent path. Without the
     /// time-based refresh, Phase-2 selections (which do NOT decrement the
     /// Phase-1 budget) let the budget freeze at a small non-zero value under
     /// saturation, so small classes stop being honored after a few epochs.
-    /// The timed-refresh path clears `waterfill_honored_epoch_bits` but
-    /// PRESERVES `waterfill_phase2_cursor` (only the exhausted path resets
-    /// the cursor) so the Phase-2 descending RR walk stays continuous across
-    /// epochs. Worker-local runtime; NOT HA-synced (same class as the other
+    /// Worker-local runtime; NOT HA-synced (same class as the other
     /// waterfill_* fields above). Single-writer owner worker, plain `u64`.
     pub(in crate::afxdp) waterfill_epoch_start_ns: u64,
+    /// #1743 (Codex code-r3): true when a genuine epoch boundary is pending
+    /// — set ONLY by the end-of-function Phase-2 WRAP (`None`) path, which
+    /// also zeroes `waterfill_pass1_remaining_bytes` and the cursor. The
+    /// distinction matters because `pass1` can also reach 0 mid-walk when a
+    /// Phase-1 exact-fit honor subtracts the last bytes; that is NOT an epoch
+    /// boundary. The honored-bitset is cleared (allowing queues to be
+    /// re-honored) ONLY on the time tick OR when this flag is set — NOT on
+    /// every `pass1 == 0` refill. Clearing on a bare mid-walk `pass1 == 0`
+    /// re-enabled a degenerate all-min-quantum livelock (q0 honored → pass1=0
+    /// → clear bits → q0 re-honored → … with Phase 2 never reached). A bare
+    /// `pass1 == 0` still REFILLS the budget so Phase 1 can resume, but with
+    /// the honored bits intact the already-honored small queue is skipped and
+    /// the walk advances / breaks to Phase 2. Single-writer owner worker.
+    pub(in crate::afxdp) waterfill_epoch_wrap_pending: bool,
     // Round-robin cursors for the two guarantee service classes. Exact and
     // non-exact guarantee queues rotate independently — the scheduler gives
     // exact queues strict priority over non-exact guarantee service (the

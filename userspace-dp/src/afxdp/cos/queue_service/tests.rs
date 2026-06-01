@@ -2538,10 +2538,14 @@ fn waterfill_honored_set_clears_on_epoch_refill() {
         "honored bits accumulate within an epoch"
     );
 
-    // Force the epoch boundary: zero the Phase-1 budget so the next call
-    // takes the lazy-refill path (the same effect as the natural exhaustion
-    // reset at the end of the selector).
+    // Force a GENUINE epoch boundary: zero the Phase-1 budget AND arm
+    // `waterfill_epoch_wrap_pending`, exactly as the end-of-function Phase-2
+    // WRAP (`None`) path does. #1743 r3: a bare `pass1 == 0` alone refills the
+    // budget but does NOT clear the honored bits (that avoids the exact-fit
+    // livelock); only the time tick or a genuine wrap clears them — which is
+    // what this #1732 test means by "epoch boundary".
     root.waterfill_pass1_remaining_bytes = 0;
+    root.waterfill_epoch_wrap_pending = true;
     let epochs_before = root.waterfill_epochs;
 
     let s_next = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
@@ -2961,5 +2965,62 @@ fn waterfill_exhausted_refill_does_not_reset_phase2_cursor() {
         root.waterfill_phase2_cursor, cursor,
         "the exhausted refill path must PRESERVE the Phase-2 cursor; only a \
          genuine Phase-2 wrap (`None` path) may reset it"
+    );
+}
+
+#[test]
+fn waterfill_exact_fit_honor_does_not_livelock_phase1() {
+    // #1743 (Codex code-r3): the deeper degenerate-config defect. When a
+    // Phase-1 exact-fit honor subtracts the budget to exactly 0, the next
+    // call's bare `exhausted` refill must NOT clear the honored bitset — only
+    // a genuine epoch boundary (time tick OR Phase-2 wrap) clears it.
+    // Clearing on a bare mid-walk `pass1 == 0` re-enabled a livelock: q0
+    // honored → pass1=0 → next call clears q0's bit → q0 re-honored → … with
+    // Phase 2 NEVER reached, starving every larger class.
+    //
+    // Fixture: shaper 187,500,000 B/s (cap_per_epoch == quantum_sum ==
+    // 37,500 B); fraction tuned so the Phase-1 budget == q0's quantum exactly
+    // (2,500 B). q0 (100m, quantum 2,500) is an exact-fit honor; q1 (400m,
+    // 10,000) and q2 (1g, 25,000) must still get Phase-2 service.
+    let mut root = waterfill_three_unequal_exact_root(2_500.0 / 37_500.0);
+    let mut tel = CoSQueueLeaseAcquireTelemetry::default();
+
+    // Call 1: Phase-1 honors q0 (cost 2,500), pass1 → 0.
+    let s1 = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
+        .expect("call 1");
+    assert_eq!(s1.queue_idx, 0, "call 1 honors q0 (smallest, exact-fit)");
+    assert_eq!(
+        root.waterfill_pass1_remaining_bytes, 0,
+        "the exact-fit honor drained pass1 to exactly 0"
+    );
+
+    // Drive several more calls at the SAME now_ns (no time tick) and confirm
+    // a non-q0 queue is serviced — i.e. Phase 2 IS reached, no livelock. With
+    // the pre-r3 bug (clearing bits on bare exhausted) q0 would be re-honored
+    // on every call and q1/q2 would never run.
+    let mut serviced_non_q0 = false;
+    let mut q0_admits = 0u64;
+    for _ in 0..8 {
+        if let Some(s) =
+            select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
+        {
+            if s.queue_idx == 0 {
+                q0_admits += 1;
+            } else {
+                serviced_non_q0 = true;
+            }
+        }
+    }
+    assert!(
+        serviced_non_q0,
+        "Phase 2 must service a larger class within a few calls — q0's \
+         exact-fit honor must not livelock Phase 1 (the #1743 r3 defect)"
+    );
+    // q0 is honored at most once per genuine epoch boundary, not on every
+    // bare-exhausted refill. Over 8 same-tick calls it cannot dominate.
+    assert!(
+        q0_admits <= 2,
+        "q0 must not be re-honored on every bare-exhausted refill (got \
+         {q0_admits} Phase-1 admits in 8 same-tick calls)"
     );
 }
