@@ -177,19 +177,29 @@ if time_refresh || exhausted {
     root.waterfill_epoch_start_ns = now_ns;
     root.waterfill_honored_epoch_bits = 0;   // clear EACH epoch
     root.waterfill_epochs = root.waterfill_epochs.wrapping_add(1);
-    if exhausted {
-        root.waterfill_phase2_cursor = 0;    // ONLY exhausted resets cursor
-    }
+    // (r2 update — see invariant 2 below: the exhausted-path cursor
+    // reset shown here was REMOVED in the shipped code.)
 }
 ```
+> **r2 amendment (Codex code-r2):** the `if exhausted { cursor = 0 }`
+> block above was REMOVED. NEITHER refill path resets the Phase-2
+> cursor; the only reset is the genuine Phase-2 wrap at the
+> end-of-function `None` path. See invariant 2.
+
 **CRITICAL invariants:**
 1. Honored bits cleared on BOTH refresh paths (master only clears
    on exhausted — without this the time refresh leaves stale
    honored bits and both phases skip honored queues forever; this
    is the #1732-interaction wrinkle the #1630 branch never had).
-2. Phase-2 cursor reset ONLY on the exhausted path (Codex #1630
-   r4 invariant — resetting on every timed refresh starves classes
-   deep in the descending walk).
+2. Phase-2 cursor reset ONLY on a genuine Phase-2 WRAP (the
+   end-of-function `None` path) — NEITHER refill path touches it.
+   (r1 design reset on the exhausted path per the #1630 r4 intent,
+   but Codex code-r2 showed a degenerate all-min-quantum config can
+   land pass1 at exactly 0 after one Phase-1 honor and re-enter the
+   exhausted path every call, restarting the descending walk and
+   starving Phase-2 within a 200µs window. Removing the reset keeps
+   the cursor continuous across epochs on both refill paths, which
+   is the stronger form of the same #1630 r4 continuity invariant.)
 3. `waterfill_epochs` bump moves into the shared `if` so the
    counter still increments once per refresh on either path.
 
