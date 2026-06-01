@@ -5,6 +5,7 @@ mod checksum;
 mod headers;
 mod inspect;
 mod tcp;
+mod wg;
 
 // #1440 consolidated outer-header serializers. Re-exported at
 // `frame::write_eth_header`, `frame::write_eth_header_slice`, and
@@ -234,7 +235,17 @@ pub(super) fn build_forwarded_frame_from_frame(
     )?;
     out.truncate(written);
     if decision.resolution.tunnel_endpoint_id != 0 {
-        return encapsulate_native_gre_frame(&out, meta, decision, forwarding);
+        // The endpoint is already fetched for the GRE builder; the
+        // `mode` match reads a &str already in hand — no new branch on
+        // the plain-forward fast path (#1432 §4.4).
+        let mode = forwarding
+            .tunnel_endpoints
+            .get(&decision.resolution.tunnel_endpoint_id)
+            .map(|e| e.mode.as_str());
+        return match mode {
+            Some("wireguard") => wg::wg_encap_frame(&out, meta, decision, forwarding),
+            _ => encapsulate_native_gre_frame(&out, meta, decision, forwarding),
+        };
     }
     Some(out)
 }

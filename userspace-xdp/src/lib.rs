@@ -94,6 +94,13 @@ struct UserspaceCtrl {
     workers: u32,
     queue_count: u32,
     flags: u32,
+    // #1432 S2a: WG listen port in the low 16 bits (0 = no WG tunnel,
+    // the per-CPU "wg_rx" gate). Occupies the 4-byte slot the C/Rust
+    // ABI previously inserted as implicit padding before the u64
+    // config_generation; the Go mirror calls it Pad. The shim WG
+    // early-return reads this; non-WG traffic pays only a single
+    // `wg_listen_port == 0` test.
+    wg_listen_port: u32,
     config_generation: u64,
     fib_generation: u32,
     heartbeat_timeout_ms: u32,
@@ -472,6 +479,24 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     // Non-native GRE also goes to kernel for tunnel decap.
     if parsed.protocol == PROTO_GRE && (ctrl.flags & USERSPACE_CTRL_FLAG_NATIVE_GRE) == 0 {
         return Ok(cpumap_or_pass(ctrl));
+    }
+    // #1432 S2a: WireGuard. WG-to-firewall is local-destination UDP on
+    // the configured listen port; steer it to the kernel (the userspace
+    // control-thread UdpSocket reads it) via cpumap_or_pass — the same
+    // path ESP/IPsec rides above. `is_local_destination` is MANDATORY:
+    // a port-only match would shunt TRANSIT/DNAT UDP that happens to use
+    // the WG port to the kernel, bypassing the userspace policy engine.
+    // `wg_listen_port == 0` (no WG configured) folds the body away, so
+    // non-WG UDP pays only a single compare.
+    {
+        let wg_port = (ctrl.wg_listen_port & 0xffff) as u16;
+        if wg_port != 0
+            && parsed.protocol == PROTO_UDP
+            && parsed.flow_dst_port == wg_port
+            && is_local_destination(&parsed)
+        {
+            return Ok(cpumap_or_pass(ctrl));
+        }
     }
     if should_fallback_early(&parsed) {
         record_trace(
