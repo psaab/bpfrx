@@ -309,6 +309,19 @@ pub(crate) struct WgEngine {
     pub(in crate::afxdp::wg) sessions_by_local_index: RwLock<FxHashMap<u32, Arc<WgSession>>>,
 }
 
+impl std::fmt::Debug for WgEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact all key material. Only the non-secret listen port is
+        // surfaced — `local_private_key` must never reach a log line,
+        // and the peer table / session maps carry session keys behind
+        // their own types. This keeps `ForwardingState`'s derived
+        // `Debug` (which now holds `Arc<WgEngine>`) leak-free.
+        f.debug_struct("WgEngine")
+            .field("listen_port", &self.listen_port)
+            .finish_non_exhaustive()
+    }
+}
+
 impl WgEngine {
     pub(crate) fn new(config: WgEngineConfig) -> Self {
         let local_public_key =
@@ -337,6 +350,24 @@ impl WgEngine {
 
     pub(crate) fn listen_port(&self) -> u16 {
         self.listen_port
+    }
+
+    /// Seed the engine's TAI64N high-water mark from a prior engine's
+    /// snapshot so a fresh engine built on a config change does not
+    /// regress the initiator timestamp the peer last accepted (#1432
+    /// S2a reload stability, §4.2). Slow path / build-time only.
+    pub(crate) fn seed_tai64n_high_water(
+        &self,
+        hw: [u8; super::tai64n::TAI64N_LEN],
+    ) {
+        self.tai64n_clock.seed_high_water(hw);
+    }
+
+    /// Snapshot the engine's current TAI64N high-water mark, if any, so
+    /// a successor engine can be seeded from it across a config-change
+    /// rebuild (#1432 S2a). `None` before the first handshake.
+    pub(crate) fn tai64n_high_water(&self) -> Option<[u8; super::tai64n::TAI64N_LEN]> {
+        self.tai64n_clock.high_water()
     }
 
     /// Reconcile the engine's peer table against a new config
