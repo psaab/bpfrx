@@ -4106,7 +4106,7 @@ apply-groups [ "${node}" common ];
 	if err := clone0.ExpandGroupsWithVars(vars0); err != nil {
 		t.Fatalf("ExpandGroupsWithVars node0: %v", err)
 	}
-	cfg0, err := compileExpanded(clone0)
+	cfg0, err := compileExpanded(clone0, compileOpts{})
 	if err != nil {
 		t.Fatalf("compile node0: %v", err)
 	}
@@ -4121,7 +4121,7 @@ apply-groups [ "${node}" common ];
 	if err := clone1.ExpandGroupsWithVars(vars1); err != nil {
 		t.Fatalf("ExpandGroupsWithVars node1: %v", err)
 	}
-	cfg1, err := compileExpanded(clone1)
+	cfg1, err := compileExpanded(clone1, compileOpts{})
 	if err != nil {
 		t.Fatalf("compile node1: %v", err)
 	}
