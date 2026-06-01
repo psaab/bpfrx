@@ -102,10 +102,14 @@ func (s *Store) Load() error {
 	// up so the operator can fix the config from CLI.
 	rewriteRetiredDataplaneType(tree, LoadCaller)
 
-	compiled, err := s.compileTree(tree)
+	// #1733: tolerate (warn, don't reject) an already-persisted
+	// workers>32 + equal-flow-enforcement config on local boot so an
+	// upgraded node does not blackout-boot. See compileTreeLenient.
+	compiled, err := s.compileTreeLenient(tree)
 	if err != nil {
 		return fmt.Errorf("compile config: %w", err)
 	}
+	warnEqualFlowWorkerCap(compiled, LoadCaller)
 
 	s.active = tree
 	s.compiled = compiled
@@ -168,6 +172,40 @@ func (s *Store) compileTree(tree *config.ConfigTree) (*config.Config, error) {
 	return config.CompileConfig(tree)
 }
 
+// compileTreeLenient is compileTree with the #1733 equal-flow worker-cap
+// validator downgraded to a warning. It is used ONLY by the passive
+// load (Store.Load) and HA peer-sync (Store.SyncApply) ingress paths, NOT
+// by any operator-driven candidate commit / commit-check path.
+//
+// Rationale: Store.Load and Store.SyncApply compile a config the operator
+// did NOT just author — a persisted active config on local boot, or a
+// config pushed from a possibly-un-upgraded cluster primary. After the
+// commit-time worker-cap gate (#1733) lands, a strict reject here would
+// (a) fail Store.Load on an upgraded node carrying a legacy
+// workers>32 + equal-flow config, leaving the daemon with no active
+// config (operational blackout), and (b) fail Store.SyncApply on an
+// upgraded standby receiving such a config from an un-upgraded primary,
+// alarm-looping HA config sync. The dataplane already silently fail-opens
+// equal-flow above MaxEqualFlowWorkers, so tolerating the config with a
+// loud warning preserves the exact running behavior while surfacing the
+// condition; the operator's next strict candidate commit rejects it.
+//
+// This mirrors the rewriteRetiredDataplaneType tolerance bridge (which
+// runs just before compile on these same two paths) but uses validator
+// leniency rather than AST mutation, so the effective worker count is
+// computed by the real compiler (post-group-expansion, per-node) and the
+// warning fires on EXACTLY the configs the strict reject would — no
+// false-positive on a config whose effective per-node workers are <= cap.
+func (s *Store) compileTreeLenient(tree *config.ConfigTree) (*config.Config, error) {
+	if err := s.schemaValidateExpandedTree(tree); err != nil {
+		return nil, err
+	}
+	if s.nodeID >= 0 {
+		return config.CompileConfigForNodeLenient(tree, s.nodeID)
+	}
+	return config.CompileConfigLenient(tree)
+}
+
 func (s *Store) schemaValidateExpandedTree(tree *config.ConfigTree) error {
 	if tree == nil {
 		return nil
@@ -219,10 +257,14 @@ func (s *Store) SyncApply(content string, chassisPreserve func(*config.ConfigTre
 	// operator updates the primary.
 	rewriteRetiredDataplaneType(tree, SyncCaller)
 
-	compiled, err := s.compileTree(tree)
+	// #1733: tolerate (warn, don't reject) a workers>32 + equal-flow
+	// config peer-synced from a possibly-un-upgraded primary so HA config
+	// sync does not alarm-loop. See compileTreeLenient.
+	compiled, err := s.compileTreeLenient(tree)
 	if err != nil {
 		return nil, fmt.Errorf("sync config compile error: %w", err)
 	}
+	warnEqualFlowWorkerCap(compiled, SyncCaller)
 
 	// Push current active to history.
 	s.history.Push(&HistoryEntry{
