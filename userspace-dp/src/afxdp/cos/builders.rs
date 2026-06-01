@@ -136,6 +136,10 @@ pub(in crate::afxdp) fn build_cos_interface_runtime(
         waterfill_honored_epoch_bits: 0,
         waterfill_epochs: 0,
         waterfill_phase1_budget_breaks: 0,
+        // #1743: 0 forces the first selector call to take the exhausted
+        // refill path (pass1 starts at 0) which seeds epoch_start_ns to
+        // the live now_ns; from then on the time-based refresh drives it.
+        waterfill_epoch_start_ns: 0,
         exact_guarantee_rr: 0,
         nonexact_guarantee_rr: 0,
         #[cfg(test)]

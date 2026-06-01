@@ -456,6 +456,19 @@ pub(in crate::afxdp) struct CoSInterfaceRuntime {
     /// breaks-per-epoch ratio means Phase 1 routinely exhausts its budget
     /// mid-walk. Single-writer owner worker, plain `u64`.
     pub(in crate::afxdp) waterfill_phase1_budget_breaks: u64,
+    /// #1743: monotonic nanosecond timestamp of the most recent waterfill
+    /// Phase-1 epoch refill. The selector refreshes the Phase-1 budget when
+    /// `now_ns - waterfill_epoch_start_ns >= COS_GUARANTEE_VISIT_NS` (200µs)
+    /// in addition to the legacy `pass1 == 0` exhausted path. Without the
+    /// time-based refresh, Phase-2 selections (which do NOT decrement the
+    /// Phase-1 budget) let the budget freeze at a small non-zero value under
+    /// saturation, so small classes stop being honored after a few epochs.
+    /// The timed-refresh path clears `waterfill_honored_epoch_bits` but
+    /// PRESERVES `waterfill_phase2_cursor` (only the exhausted path resets
+    /// the cursor) so the Phase-2 descending RR walk stays continuous across
+    /// epochs. Worker-local runtime; NOT HA-synced (same class as the other
+    /// waterfill_* fields above). Single-writer owner worker, plain `u64`.
+    pub(in crate::afxdp) waterfill_epoch_start_ns: u64,
     // Round-robin cursors for the two guarantee service classes. Exact and
     // non-exact guarantee queues rotate independently — the scheduler gives
     // exact queues strict priority over non-exact guarantee service (the

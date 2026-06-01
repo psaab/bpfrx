@@ -784,36 +784,81 @@ fn select_exact_cos_guarantee_queue_waterfill(
     if queue_count == 0 || root.exact_queues_by_rate_ascending.is_empty() {
         return None;
     }
-    // Phase 1 epoch refill: when `pass1_remaining` is zero we're
-    // either at first call OR just completed an epoch. Compute the
-    // new budget from `quantum_sum × fraction`. quantum_sum is
-    // taken over the current eligible set (runnable + nonempty)
-    // so a transiently empty queue doesn't inflate the budget
-    // it would consume.
-    if root.waterfill_pass1_remaining_bytes == 0 {
-        let mut quantum_sum: u64 = 0;
-        for &qi in &root.exact_queues_by_rate_ascending {
-            quantum_sum =
-                quantum_sum.saturating_add(cos_guarantee_quantum_bytes(&root.queues[qi]));
-        }
-        // fraction is clamped 0.0..1.0 at config-apply time; here
-        // we use f64 → u64 with saturating cast guarded by the
-        // multiplication via f64. The result fits in u64 because
-        // quantum_sum ≤ 512 KB × N_queues and fraction ≤ 1.0.
+    // Phase 1 epoch refill. Two trigger conditions:
+    //   (a) `pass1 == 0` — legacy "budget exhausted" path. Preserved
+    //       semantics including resetting the Phase-2 cursor to 0. Also
+    //       the first-call path (pass1 seeds to 0 in the builder).
+    //   (b) #1743 time-based: `elapsed >= COS_GUARANTEE_VISIT_NS` since
+    //       the last refill. Phase-2 selections do NOT decrement `pass1`,
+    //       so under saturation `pass1` freezes at a small non-zero value
+    //       below every remaining quantum and small classes stop being
+    //       honored after a few epochs. The time-based path refreshes the
+    //       budget once per 200µs visit window even while Phase-2 keeps
+    //       draining root tokens. CRITICAL: the time-based path does NOT
+    //       reset `waterfill_phase2_cursor` (only the exhausted (a) path
+    //       does) so the descending RR walk advances through ALL large
+    //       classes across epochs rather than restarting at the largest
+    //       every 200µs (the residual-starvation regression #1630 r4
+    //       caught). Both paths clear the persistent honored bitset.
+    let elapsed_since_refresh = now_ns.saturating_sub(root.waterfill_epoch_start_ns);
+    let time_refresh = elapsed_since_refresh >= COS_GUARANTEE_VISIT_NS;
+    let exhausted = root.waterfill_pass1_remaining_bytes == 0;
+    if time_refresh || exhausted {
+        // fraction is clamped 0.0..1.0 at config-apply time; the
+        // dispatch gate also requires fraction > 0. We use f64 → u64
+        // with a floor + saturating cast guarded by the multiplication.
         let frac = root.oversubscription_guarantee_fraction;
-        let pass1 = ((quantum_sum as f64) * frac).floor() as u64;
+        let pass1 = if root.shaping_rate_bytes == 0 {
+            // Transparent (unshaped) root: there is no shaper-delivered
+            // cap to anchor against, so fall back to the legacy
+            // `quantum_sum × fraction` over the current eligible set.
+            // The result fits in u64 because quantum_sum ≤ 512 KB ×
+            // N_queues and fraction ≤ 1.0.
+            let mut quantum_sum: u64 = 0;
+            for &qi in &root.exact_queues_by_rate_ascending {
+                quantum_sum =
+                    quantum_sum.saturating_add(cos_guarantee_quantum_bytes(&root.queues[qi]));
+            }
+            ((quantum_sum as f64) * frac).floor() as u64
+        } else {
+            // #1743 Hunk A: anchor pass1 to the shaper-delivered bytes
+            // per epoch × fraction — the documented contract "fraction ×
+            // cap" where cap = shaper × VISIT_NS (docs/fairness-regimes.md).
+            // The legacy `quantum_sum × fraction` over-provisioned pass1
+            // by ~4× for any oversubscribed config (Σ R_i > shaper), so
+            // Phase 2 never fired and the selector degenerated to
+            // ascending RR over all classes. shaping_rate_bytes is
+            // bytes/sec; the u128 product is overflow-safe.
+            let cap_per_epoch = ((root.shaping_rate_bytes as u128)
+                * (COS_GUARANTEE_VISIT_NS as u128)
+                / 1_000_000_000u128) as u64;
+            let raw = ((cap_per_epoch as f64) * frac).floor() as u64;
+            // AGY RISK-1: a tiny-positive fraction floors `raw` to 0,
+            // which would make `exhausted` true on every selector call →
+            // refill + cursor-reset thrash → Phase-2 starves from index 0.
+            // Clamp to at least one min-quantum so the smallest class is
+            // honorable and the exhausted path can't fire every call.
+            raw.max(COS_GUARANTEE_QUANTUM_MIN_BYTES)
+        };
         root.waterfill_pass1_remaining_bytes = pass1;
-        root.waterfill_phase2_cursor = 0;
-        // #1732: a new epoch starts here — clear the persistent honored
-        // bitset so this epoch's Phase-1 honors start fresh. This is the
-        // single clear point: the exhaustion-reset path at the END of this
-        // function (after the Phase-2 loop) sets `pass1_remaining` to 0,
-        // which forces this refill block (and thus this clear) on the next
-        // selector call, so both epoch-exit paths are covered without a
-        // redundant double-clear.
+        root.waterfill_epoch_start_ns = now_ns;
+        // #1732/#1743: clear the persistent honored bitset on EVERY refill
+        // (both the exhausted and the time-based path) so this epoch's
+        // Phase-1 honors start fresh. Without clearing on the time-based
+        // path, honored bits would persist forever and both phases would
+        // skip every once-honored queue — the same starvation in a new
+        // guise. Phase 1 still skips already-honored bits WITHIN an epoch
+        // (the `i < 64` check below), so the per-call re-honor monopoly
+        // #1732 fixed is not reintroduced.
         root.waterfill_honored_epoch_bits = 0;
+        if exhausted {
+            // Legacy exhausted path also resets the Phase-2 cursor to 0,
+            // matching pre-#1743 behaviour. The time-based path must NOT
+            // (see the CRITICAL note above).
+            root.waterfill_phase2_cursor = 0;
+        }
         // #1628 site 1: completed-epoch / Phase-1-refill counter. Bumped
-        // here (no `queue` borrowed yet) on every lazy refill.
+        // here (no `queue` borrowed yet) on every refill, either path.
         root.waterfill_epochs = root.waterfill_epochs.wrapping_add(1);
     }
     // Phase 1: ascending-rate walk. Pick the first runnable queue
@@ -932,17 +977,25 @@ fn select_exact_cos_guarantee_queue_waterfill(
         // Picked. #1630 (P2): decouple the two roles the quantum used
         // to play. The Phase-1 budget gate / consumption stays on the
         // RATE-SCALED quantum (`phase1_cost`) so the small-first
-        // ordering and the `quantum_sum × fraction` Phase-1 budget
-        // remain consistent with `oversubscription_guarantee_fraction`.
+        // ordering and the shaper-anchored Phase-1 budget remain
+        // consistent with `oversubscription_guarantee_fraction`.
         // The actual per-visit send budget (`send_budget`) is the
         // FRAME-count cap so a queue whose token bucket has banked
         // several frames (#1630 P1) drains them whole instead of
         // discarding the sub-frame remainder of the small quantum.
-        let phase1_cost = queue
-            .hot
-            .tokens
-            .min(cos_guarantee_quantum_bytes(queue))
-            .max(head_len);
+        //
+        // #1743 Hunk B: charge the STABLE configured quantum, NOT
+        // `queue.hot.tokens.min(quantum)`. Under v8-lease pressure
+        // `queue.hot.tokens` collapses toward one frame, which collapsed
+        // `phase1_cost` to `head_len`: the queue then trivially passed
+        // the budget gate, consumed almost none of `pass1`, yet was
+        // marked fully honored (below) — so Phase-2 skipped it
+        // (phase2_admit stayed 0) while pass1 never neared exhaustion.
+        // The honor decision must reflect the queue's full guaranteed
+        // share for the epoch, independent of its current token bank.
+        // (`send_budget` keeps the token clamp — it bounds the bytes
+        // actually drained this visit, which legitimately tracks tokens.)
+        let phase1_cost = cos_guarantee_quantum_bytes(queue).max(head_len);
         let send_budget = queue
             .hot
             .tokens
