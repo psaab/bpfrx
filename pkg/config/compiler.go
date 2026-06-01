@@ -46,13 +46,17 @@ var ErrEBPFDataplaneRetired = errors.New(
 type compileOpts struct {
 	// lenientEqualFlowWorkerCap downgrades the
 	// validateEqualFlowWorkerCapStrict family from a hard compile error
-	// to a cfg.Warnings entry. Set ONLY on the Store.Load / Store.SyncApply
-	// paths (#1733): a node upgraded past the worker-cap gate must still
-	// boot an already-persisted >32-worker + equal-flow config, and an
-	// upgraded standby must still accept such a config peer-synced from an
-	// un-upgraded primary, rather than blacking out or alarm-looping HA
-	// sync. Candidate commit / commit-check stay strict (lenient stays
-	// false there) so new operator edits hard-reject loudly.
+	// to a cfg.Warnings entry. Set on the TOLERANT paths that compile an
+	// already-active / persisted / peer-synced config the local operator
+	// did not just author — Store.Load, Store.SyncApply, and the read-only
+	// peer-interface display re-compiles (#1733). A node upgraded past the
+	// worker-cap gate must still boot an already-persisted >32-worker +
+	// equal-flow config, an upgraded standby must still accept such a
+	// config peer-synced from an un-upgraded primary, and `show interfaces`
+	// must still render peer interfaces — rather than blacking out,
+	// alarm-looping HA sync, or silently dropping display. Candidate commit
+	// / commit-check stay strict (lenient stays false there) so new
+	// operator edits hard-reject loudly.
 	lenientEqualFlowWorkerCap bool
 }
 
