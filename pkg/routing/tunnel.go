@@ -97,6 +97,17 @@ func (t *tunnelManager) Apply(tunnels []*config.TunnelConfig) error {
 	}
 
 	for _, tc := range tunnels {
+		// WireGuard TUNs are persistent (#1432 S2a, AGY Hazard B): never
+		// delete-and-recreate on reload — that would flap wgN and destroy
+		// its addresses + FRR routes every commit. applyWireguardTunLocked
+		// reuses an existing wgN in place.
+		if tc.Mode == "wireguard" {
+			if err := t.applyWireguardTunLocked(tc); err != nil {
+				slog.Warn("failed to apply wireguard tunnel",
+					"name", tc.Name, "err", err)
+			}
+			continue
+		}
 		if existing, err := t.ops.LinkByName(tc.Name); err == nil {
 			if err := t.ops.LinkDel(existing); err != nil {
 				slog.Warn("failed to replace existing tunnel link",
@@ -282,6 +293,83 @@ func (t *tunnelManager) Apply(tunnels []*config.TunnelConfig) error {
 		}
 	}
 
+	return nil
+}
+
+// wgTunMTU is the inner (wgN) MTU cap (#1432 S2a, AGY Hazard A). The
+// kernel must never hand the WG control thread a plaintext packet that,
+// once encapped with the worst-case WG overhead (outer IP+UDP+data
+// header+tag = WG_OVERHEAD_V4 = 60) plus up to 15 bytes of §5.4.6 pad,
+// exceeds a 1500-byte outer MTU and forces outer IP fragmentation.
+// 1500 - 60 - 15 = 1425; round down to 1420 to leave headroom for a
+// VLAN-tagged outer path. The control-thread encap also enforces an
+// exact pad-aware guard (see userspace-dp wg_control.rs), so this cap is
+// the first line, not the only one.
+const wgTunMTU = 1420
+
+// applyWireguardTunLocked creates (or reuses) the persistent wgN TUN
+// netdev for a WireGuard tunnel endpoint and configures its MTU,
+// addresses, and VRF binding. The device is intentionally NOT tracked
+// in t.tunnels: clearLocked must not delete it on reload (AGY Hazard B
+// — flapping wgN destroys its addresses and FRR routes every commit).
+// The Rust control thread (coordinator/wg_control.rs) attaches to this
+// persistent device by name.
+func (t *tunnelManager) applyWireguardTunLocked(tc *config.TunnelConfig) error {
+	link, err := t.ops.LinkByName(tc.Name)
+	if err != nil {
+		// Create a persistent TUN. NonPersist:false keeps the netdev
+		// alive after the creating fd closes, so a reload that does not
+		// touch this device leaves it (and its routes) intact.
+		tun := &netlink.Tuntap{
+			LinkAttrs:  netlink.LinkAttrs{Name: tc.Name, MTU: wgTunMTU},
+			Mode:       netlink.TUNTAP_MODE_TUN,
+			Flags:      netlink.TUNTAP_NO_PI,
+			Queues:     1,
+			NonPersist: false,
+		}
+		if addErr := t.ops.LinkAdd(tun); addErr != nil {
+			return fmt.Errorf("create wireguard tun %s: %w", tc.Name, addErr)
+		}
+		closeTuntapFiles(tun.Fds)
+		link = tun
+		slog.Info("wireguard tun created", "name", tc.Name, "mtu", wgTunMTU)
+	} else {
+		slog.Debug("wireguard tun reused", "name", tc.Name)
+	}
+
+	if err := t.ops.LinkSetUp(link); err != nil {
+		slog.Warn("failed to bring up wireguard tun", "name", tc.Name, "err", err)
+	}
+
+	// Reconcile addresses: add any configured address not already present.
+	existing := map[string]bool{}
+	if addrs, listErr := t.ops.AddrList(link, netlink.FAMILY_ALL); listErr == nil {
+		for _, a := range addrs {
+			existing[a.IPNet.String()] = true
+		}
+	}
+	for _, addrStr := range tc.Addresses {
+		addr, parseErr := netlink.ParseAddr(addrStr)
+		if parseErr != nil {
+			slog.Warn("invalid wireguard tun address",
+				"name", tc.Name, "addr", addrStr, "err", parseErr)
+			continue
+		}
+		if existing[addr.IPNet.String()] {
+			continue
+		}
+		if addErr := t.ops.AddrAdd(link, addr); addErr != nil {
+			slog.Warn("failed to add wireguard tun address",
+				"name", tc.Name, "addr", addrStr, "err", addErr)
+		}
+	}
+
+	if tc.RoutingInstance != "" {
+		if bindErr := t.vrfBinder.BindInterfaceToVRF(tc.Name, tc.RoutingInstance); bindErr != nil {
+			slog.Warn("failed to bind wireguard tun to VRF",
+				"name", tc.Name, "vrf", tc.RoutingInstance, "err", bindErr)
+		}
+	}
 	return nil
 }
 

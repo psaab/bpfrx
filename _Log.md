@@ -4512,3 +4512,13 @@ top.
   divided-ceiling regression floor; >=95% guarantee stays SOLO (#1630).
 - **File(s)**: docs/fairness-regimes.md, test/incus/cos-simul-load-smoke.sh,
   docs/pr/1614-multi-rss-cos/plan.md
+
+## #1432 WireGuard S2a — datapath + UDP socket + config bring-up
+
+- **Timestamp**: 2026-05-31
+  **Action**: Go config DTO + parser + persistent wgN TUN (S2a increment 1)
+  **File(s)**: pkg/config/types_routing.go (Wg* fields on TunnelConfig),
+    pkg/config/compiler_interfaces.go (parseTunnelWireguard + peer),
+    pkg/config/schema.go (wireguardSchemaNode in tunnel + unit tunnel),
+    pkg/dataplane/userspace/tunnels.go (populate Wg* DTO, gate src/dst for WG),
+    pkg/routing/tunnel.go (applyWireguardTunLocked persistent TUN, no flap)

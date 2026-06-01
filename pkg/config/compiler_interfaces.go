@@ -177,6 +177,8 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 					} else if v := nodeVal(prop); v != "" {
 						tc.RoutingInstance = v
 					}
+				case "wireguard":
+					parseTunnelWireguard(tc, prop)
 				}
 			}
 			ifc.Tunnel = tc
@@ -262,6 +264,8 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 								tc.KeepaliveRetry = n
 							}
 						}
+					case "wireguard":
+						parseTunnelWireguard(tc, prop)
 					}
 				}
 				unit.Tunnel = tc
@@ -509,6 +513,71 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 		ifaces.Interfaces[ifName] = ifc
 	}
 	return nil
+}
+
+// parseTunnelWireguard fills the WireGuard fields on tc from a
+// `wireguard { ... }` node under a tunnel stanza (#1432 S2a). The
+// minimal generic grammar is:
+//
+//	tunnel {
+//	    mode wireguard;
+//	    wireguard {
+//	        listen-port 51820;
+//	        private-key <64-hex>;
+//	        peer {
+//	            public-key <64-hex>;
+//	            allowed-ips <cidr>;   # repeatable
+//	            endpoint <ip:port>;
+//	            persistent-keepalive <secs>;
+//	        }
+//	    }
+//	}
+//
+// This is intentionally narrower than the eventual Junos wireguard
+// grammar (S6); it compiles to the TunnelEndpointSnapshot Wg* DTO
+// fields without committing to that surface.
+func parseTunnelWireguard(tc *TunnelConfig, wgNode *Node) {
+	for _, prop := range wgNode.Children {
+		switch prop.Name() {
+		case "listen-port":
+			if v := nodeVal(prop); v != "" {
+				if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 65535 {
+					tc.WgListenPort = uint16(n)
+				}
+			}
+		case "private-key":
+			if v := nodeVal(prop); v != "" {
+				tc.WgLocalPrivkeyHex = v
+			}
+		case "peer":
+			parseTunnelWireguardPeer(tc, prop)
+		}
+	}
+}
+
+func parseTunnelWireguardPeer(tc *TunnelConfig, peerNode *Node) {
+	for _, prop := range peerNode.Children {
+		switch prop.Name() {
+		case "public-key":
+			if v := nodeVal(prop); v != "" {
+				tc.WgPeerPubkeyHex = v
+			}
+		case "allowed-ips":
+			if v := nodeVal(prop); v != "" {
+				tc.WgAllowedIPs = append(tc.WgAllowedIPs, v)
+			}
+		case "endpoint":
+			if v := nodeVal(prop); v != "" {
+				tc.WgEndpoint = v
+			}
+		case "persistent-keepalive":
+			if v := nodeVal(prop); v != "" {
+				if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= 65535 {
+					tc.WgKeepaliveSecs = uint16(n)
+				}
+			}
+		}
+	}
 }
 
 // parseMSSValue extracts MSS value from either "node { mss VALUE; }" or "node VALUE;" syntax.

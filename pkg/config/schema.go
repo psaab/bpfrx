@@ -396,6 +396,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"routing-instance": {desc: "Routing instance", children: map[string]*schemaNode{
 				"destination": {desc: "Destination routing instance", args: 1, children: nil},
 			}},
+			"wireguard": wireguardSchemaNode(),
 		}},
 		"unit": {desc: "Logical unit number", args: 1, valueHint: ValueHintUnitNumber, placeholder: "<unit-number>", children: map[string]*schemaNode{
 			"description":    {desc: "Text description", args: 1, placeholder: "<text>", children: nil},
@@ -413,6 +414,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				"routing-instance": {desc: "Routing instance", children: map[string]*schemaNode{
 					"destination": {desc: "Destination routing instance", args: 1, placeholder: "<name>", children: nil},
 				}},
+				"wireguard": wireguardSchemaNode(),
 			}},
 			"family": {desc: "Protocol family", compoundKey: true, children: map[string]*schemaNode{
 				"inet": {desc: "IPv4 protocol", children: map[string]*schemaNode{
@@ -1343,5 +1345,26 @@ func init() {
 			continue
 		}
 		groupWild.children[k] = v
+	}
+}
+
+// wireguardSchemaNode returns the config-mode schema subtree for the
+// `tunnel wireguard { ... }` stanza (#1432 S2a). Minimal generic
+// surface — listen-port / private-key / peer{public-key, allowed-ips,
+// endpoint, persistent-keepalive}. See parseTunnelWireguard in
+// compiler_interfaces.go for the matching parse.
+func wireguardSchemaNode() *schemaNode {
+	return &schemaNode{
+		desc: "WireGuard tunnel parameters",
+		children: map[string]*schemaNode{
+			"listen-port": {desc: "UDP listen port", args: 1, placeholder: "<port>", children: nil},
+			"private-key": {desc: "Local static private key (hex)", args: 1, placeholder: "<hex-key>", children: nil},
+			"peer": {desc: "WireGuard peer", children: map[string]*schemaNode{
+				"public-key":           {desc: "Peer static public key (hex)", args: 1, placeholder: "<hex-key>", children: nil},
+				"allowed-ips":          {desc: "Peer allowed IPs (CIDR)", args: 1, multi: true, placeholder: "<prefix>", children: nil},
+				"endpoint":             {desc: "Peer endpoint (ip:port)", args: 1, placeholder: "<ip:port>", children: nil},
+				"persistent-keepalive": {desc: "Persistent keepalive seconds", args: 1, placeholder: "<seconds>", children: nil},
+			}},
+		},
 	}
 }
