@@ -433,7 +433,12 @@ func (s *Server) showInterfacesTerse(cfg *config.Config, filterName string) (*pb
 			}
 			tree := s.store.ActiveTree()
 			if tree != nil {
-				peerCfg, err := config.CompileConfigForNode(tree, peerNodeID)
+				// #1733: lenient compile — the active tree was already
+				// tolerated on load (workers>32 + equal-flow is warned,
+				// not rejected, on Store.Load). A strict re-compile here
+				// would error on such a legacy config and silently drop
+				// peer-interface display via the err==nil guard below.
+				peerCfg, err := config.CompileConfigForNodeLenient(tree, peerNodeID)
 				if err == nil {
 					for physName, ifCfg := range peerCfg.Interfaces.Interfaces {
 						if _, isLocal := cfg.Interfaces.Interfaces[physName]; isLocal {
