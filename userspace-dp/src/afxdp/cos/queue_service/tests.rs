@@ -2046,7 +2046,7 @@ fn restore_cos_local_items_marks_queue_runnable_after_retry() {
             exact: true,
             surplus_sharing: false,
             equal_flow_enforcement: false,
-            flow_fair: false,
+            flow_fair_eligible: false,
             shared_exact: false,
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
@@ -2065,6 +2065,7 @@ fn restore_cos_local_items_marks_queue_runnable_after_retry() {
             wheel_slot: 0,
             items: VecDeque::new(),
             local_item_count: 0,
+            cos_demote_empty_settles: 0,
         },
         flow_fair_state: None,
         v_min: crate::afxdp::types::VMinQueueState {
@@ -2113,7 +2114,7 @@ fn restore_cos_prepared_items_marks_queue_runnable_after_retry() {
             exact: true,
             surplus_sharing: false,
             equal_flow_enforcement: false,
-            flow_fair: false,
+            flow_fair_eligible: false,
             shared_exact: false,
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
@@ -2132,6 +2133,7 @@ fn restore_cos_prepared_items_marks_queue_runnable_after_retry() {
             wheel_slot: 0,
             items: VecDeque::new(),
             local_item_count: 0,
+            cos_demote_empty_settles: 0,
         },
         flow_fair_state: None,
         v_min: crate::afxdp::types::VMinQueueState {

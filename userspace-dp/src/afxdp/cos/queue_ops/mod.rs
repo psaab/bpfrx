@@ -9,7 +9,7 @@ use crate::afxdp::types::{CoSPendingTxItem, CoSQueuePopSnapshot, CoSQueueRuntime
 use crate::afxdp::TX_BATCH_SIZE;
 use crate::session::SessionKey;
 
-use super::flow_hash::{cos_flow_bucket_index, cos_item_flow_key};
+use super::flow_hash::{cos_flow_bucket_index, cos_flow_hash_seed_from_os, cos_item_flow_key};
 
 // #1034 P1: MQFQ V_min coordination split into a sibling submodule.
 mod v_min;
@@ -180,6 +180,69 @@ pub(in crate::afxdp) const V_MIN_CONSECUTIVE_SKIP_HARD_CAP: u32 = 8;
 /// peers to either catch up or visibly persist as out-of-band, and
 /// short enough that mouse-latency budgets (#905) are unaffected.
 pub(in crate::afxdp) const V_MIN_SUSPENSION_BATCHES: u32 = 1000;
+
+/// #1735: consecutive quiescent batch settles required before a
+/// lazily-promoted non-exact flow-fair queue is demoted back to FIFO
+/// (dropping its ~232 KB `FlowFairState`). Hysteresis so a queue
+/// oscillating 1<->2 flows does not thrash the alloc/free. 4 settles is
+/// long enough to ride out a brief gap between bursts of the same flow
+/// pair, short enough that a genuinely idle best-effort queue releases
+/// the footprint within a handful of drain ticks.
+pub(in crate::afxdp) const COS_DEMOTE_EMPTY_SETTLE_HYSTERESIS: u8 = 4;
+
+/// #1735: lazy demotion at a quiescent batch-settle boundary.
+///
+/// Called at the END of `apply_cos_send_result` / `apply_cos_prepared_result`,
+/// strictly AFTER `restore_cos_local_items_inner` has push_fronted any
+/// retry items back and `queued_bytes` is settled. Only NON-exact
+/// lazily-promoted queues demote; exact queues promote eagerly at build
+/// and stay promoted for the interface's lifetime (their V_min / v8
+/// lease coordination assumes a stable `flow_fair_state`).
+///
+/// Quiescence predicate (Codex round-1 Q4): the queue must be fully
+/// drained — `active_flow_buckets == 0 && flow_rr_buckets empty &&
+/// queued_bytes == 0`. Because this runs AFTER the retry restore (which
+/// re-bumps `active_flow_buckets` / `queued_bytes` via push_front of
+/// each retried item), a partial-commit retry leaves the queue
+/// non-quiescent and blocks demotion — demote fires only on a
+/// fully-committed empty queue.
+///
+/// Note we do NOT gate on an empty `pop_snapshot_stack`. The non-exact
+/// service path (`build_cos_batch_from_queue` → `cos_queue_pop_front`
+/// with snapshots) leaves committed-batch snapshots on the stack, and
+/// nothing clears them while the queue stays idle (only a subsequent
+/// `cos_queue_push_back` does, at push.rs:38). Those snapshots are
+/// STALE the moment the queue is fully drained — they describe
+/// pre-pop bucket state for items that have all committed, with no
+/// resident items left to roll back to. Gating on the stack would make
+/// demotion structurally impossible. Dropping the whole `FlowFairState`
+/// box discards the stale snapshots safely; the next promotion starts
+/// from a fresh empty stack.
+#[inline]
+pub(in crate::afxdp) fn maybe_demote_drained_best_effort(queue: &mut CoSQueueRuntime) {
+    // Exact queues never demote (eager promotion is permanent).
+    if queue.config.exact || !queue.config.flow_fair_eligible {
+        return;
+    }
+    let Some(ff) = queue.flow_fair_state.as_ref() else {
+        return;
+    };
+    if ff.active_flow_buckets != 0
+        || !ff.flow_rr_buckets.is_empty()
+        || queue.hot.queued_bytes != 0
+    {
+        queue.hot.cos_demote_empty_settles = 0;
+        return;
+    }
+    queue.hot.cos_demote_empty_settles = queue.hot.cos_demote_empty_settles.saturating_add(1);
+    if queue.hot.cos_demote_empty_settles >= COS_DEMOTE_EMPTY_SETTLE_HYSTERESIS {
+        // Drop the ~232 KB FlowFairState box (incl. any stale committed-
+        // batch snapshots); the queue reverts to the cheap FIFO path
+        // until the front-key probe re-promotes it.
+        queue.flow_fair_state = None;
+        queue.hot.cos_demote_empty_settles = 0;
+    }
+}
 
 #[inline]
 pub(in crate::afxdp) fn cos_item_len(item: &CoSPendingTxItem) -> u64 {

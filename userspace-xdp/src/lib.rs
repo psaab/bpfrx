@@ -1222,19 +1222,17 @@ fn parse_ipv6(
 
 /// #1432 S2a: decide whether an inbound packet is WireGuard-to-firewall
 /// that must be steered to the kernel (the control-thread `UdpSocket`).
-/// Marked `#[inline(never)] #[cold]` so the WG-steering code — the
-/// `wg_listen_port` load, the protocol/port tests, and the
-/// `is_local_destination` map lookup — is laid out OUT of the hot
-/// forwarding path and is reached only via the flag-gated call at the
-/// single call site. The caller has already verified `ctrl.flags &
-/// USERSPACE_CTRL_FLAG_WG_RX != 0`, so this body only runs when a WG
-/// tunnel is configured; with no WG tunnel the non-WG datapath never
-/// calls in here and pays only the flag bit-test (the flags word is
-/// already loaded for the GRE/STRICT checks). `is_local_destination`
-/// is MANDATORY — a port-only match would shunt transit/DNAT UDP on the
-/// WG port to the kernel, bypassing the userspace policy engine.
-#[inline(never)]
-#[cold]
+/// The single call site has already verified `ctrl.flags &
+/// USERSPACE_CTRL_FLAG_WG_RX != 0` (a bit-test on the flags word already
+/// loaded for the GRE/STRICT checks), so when no WG tunnel is configured
+/// the non-WG datapath skips this entirely — it pays ONLY the flag
+/// bit-test. The flag-gate, not the function boundary, is what makes the
+/// path zero-cost: an earlier `#[inline(never)] #[cold]` variant emitted
+/// this as a separate BPF program symbol (tripping the shim
+/// program-allowlist canary), so it is a normal inlinable fn behind the
+/// flag gate. `is_local_destination` is MANDATORY — a port-only match
+/// would shunt transit/DNAT UDP on the WG port to the kernel, bypassing
+/// the userspace policy engine.
 fn wg_steer_to_kernel(ctrl: &UserspaceCtrl, pkt: &ParsedPacket) -> bool {
     let wg_port = (ctrl.wg_listen_port & 0xffff) as u16;
     wg_port != 0

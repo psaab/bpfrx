@@ -564,9 +564,19 @@ impl CoSQueueRuntime {
         self.config.queue_id
     }
 
+    /// #1735: the flow-fair gate is now `flow_fair_state.is_some()`,
+    /// NOT `config.flow_fair`. This makes the invariant
+    /// `flow_fair() == flow_fair_state.is_some()` structurally
+    /// unbreakable: a queue with `None` state always dispatches through
+    /// the cheap FIFO branch, and allocation (eager for exact, lazy for
+    /// non-exact promoted) is the ONLY thing that flips the gate. Every
+    /// `if queue.flow_fair() { ...flow_fair_state.expect()... }` site
+    /// is now provably unreachable on the `None` side. `config.exact`
+    /// (eager promotion) and `config.flow_fair_eligible` (may EVER
+    /// promote) are decoupled from this runtime gate.
     #[inline]
     pub(in crate::afxdp) fn flow_fair(&self) -> bool {
-        self.config.flow_fair
+        self.flow_fair_state.is_some()
     }
 
     #[inline]
@@ -609,7 +619,20 @@ pub(in crate::afxdp) struct CoSQueueConfigState {
     /// exact queues. The coordinator turns this into
     /// `V8RateMode::EqualFlowSuppress` for shared v8 leases.
     pub(in crate::afxdp) equal_flow_enforcement: bool,
-    pub(in crate::afxdp) flow_fair: bool,
+    /// #1735: renamed from `flow_fair`. Decoupled from the runtime
+    /// `flow_fair()` gate (now `flow_fair_state.is_some()`). This bit
+    /// means "this queue MAY ever run flow-fair MQFQ" — set for every
+    /// shaped CoS queue that reaches `promote_cos_queue_flow_fair`
+    /// (exact AND non-exact). Exact queues additionally promote
+    /// EAGERLY at build (allocate `flow_fair_state` immediately);
+    /// non-exact eligible queues stay `None` until the lazy
+    /// front-key contention probe in `cos_queue_push_back` promotes
+    /// them on the first differing flow. Forwarding-only / transparent
+    /// interfaces never build a `CoSInterfaceRuntime` (the #1183
+    /// "useful CoS state" gate), so their queues never reach promotion
+    /// and stay ineligible — preserving the #1183 best-effort
+    /// fast-path boundary.
+    pub(in crate::afxdp) flow_fair_eligible: bool,
     /// #785: cached shadow of `WorkerCoSQueueFastPath.shared_exact`
     /// populated by `promote_cos_queue_flow_fair`. Under the current
     /// promotion policy (`flow_fair = queue.exact`), shared_exact
@@ -660,6 +683,16 @@ pub(in crate::afxdp) struct CoSQueueHotState {
     /// the hot path at line rate. Owner-only writes; no atomic
     /// needed (same discipline as `queued_bytes`).
     pub(in crate::afxdp) local_item_count: u32,
+    /// #1735: consecutive quiescent batch-settle observations on a
+    /// lazily-promoted NON-exact flow-fair queue. Incremented by
+    /// `maybe_demote_drained_best_effort` when the queue settles fully
+    /// drained; reset to 0 on any non-quiescent settle. When it reaches
+    /// `COS_DEMOTE_EMPTY_SETTLE_HYSTERESIS` the queue demotes
+    /// (`flow_fair_state = None`, dropping the ~232 KB box). Hysteresis
+    /// prevents a queue oscillating 1<->2 flows from thrashing the
+    /// alloc/free of `FlowFairState`. Always 0 on exact queues (they
+    /// never demote) and on non-eligible queues.
+    pub(in crate::afxdp) cos_demote_empty_settles: u8,
 }
 
 /// Flow-fair MQFQ state. Only allocated when `queue.flow_fair() == true`.
