@@ -26,6 +26,7 @@ type linkOps interface {
 	LinkSetMaster(netlink.Link, netlink.Link) error
 	LinkList() ([]netlink.Link, error)
 	AddrAdd(netlink.Link, *netlink.Addr) error
+	AddrDel(netlink.Link, *netlink.Addr) error
 	AddrList(netlink.Link, int) ([]netlink.Addr, error)
 }
 
@@ -344,6 +345,21 @@ func wgTunMTUForEndpoint(tc *config.TunnelConfig) int {
 func (t *tunnelManager) applyWireguardTunLocked(tc *config.TunnelConfig) error {
 	mtu := wgTunMTUForEndpoint(tc)
 	link, err := t.ops.LinkByName(tc.Name)
+	// Copilot C3: only reuse an existing link if it is actually a TUN/TAP.
+	// A name collision with some other interface type (e.g. a leftover
+	// dummy) must be deleted and recreated, not mutated — otherwise we'd
+	// bring up + address + VRF-bind the wrong device, and the Rust side's
+	// open_tun on the same name would then fail.
+	if err == nil {
+		if _, isTun := link.(*netlink.Tuntap); !isTun {
+			slog.Info("replacing non-TUN link before wireguard tun create",
+				"name", tc.Name, "type", link.Type())
+			if delErr := t.ops.LinkDel(link); delErr != nil {
+				return fmt.Errorf("replace non-tun wireguard link %s: %w", tc.Name, delErr)
+			}
+			err = fmt.Errorf("recreate") // fall into the create branch below
+		}
+	}
 	if err != nil {
 		// Create a persistent TUN. NonPersist:false keeps the netdev
 		// alive after the creating fd closes, so a reload that does not
@@ -363,7 +379,8 @@ func (t *tunnelManager) applyWireguardTunLocked(tc *config.TunnelConfig) error {
 		slog.Info("wireguard tun created", "name", tc.Name, "mtu", mtu)
 	} else {
 		// Reuse in place; reconcile the MTU if the config changed it
-		// (AGY M4 — a stale MTU on reuse would otherwise persist).
+		// (AGY M4 / Copilot C4 — a stale MTU on reuse, including a
+		// pre-created device, would otherwise persist).
 		if link.Attrs().MTU != mtu {
 			if mtuErr := netlink.LinkSetMTU(link, mtu); mtuErr != nil {
 				slog.Warn("failed to update wireguard tun mtu",
@@ -379,18 +396,42 @@ func (t *tunnelManager) applyWireguardTunLocked(tc *config.TunnelConfig) error {
 		slog.Warn("failed to bring up wireguard tun", "name", tc.Name, "err", err)
 	}
 
-	// Reconcile addresses: add any configured address not already present.
-	existing := map[string]bool{}
-	if addrs, listErr := t.ops.AddrList(link, netlink.FAMILY_ALL); listErr == nil {
-		for _, a := range addrs {
-			existing[a.IPNet.String()] = true
-		}
-	}
+	// Symmetric address reconciliation (Copilot C5): because the device
+	// is persistent and never recreated, addresses removed from the config
+	// would otherwise survive every reload and keep being routed. Add
+	// configured addresses not yet present, and delete present addresses
+	// not in the config — while preserving the device itself.
+	want := make(map[string]bool, len(tc.Addresses))
 	for _, addrStr := range tc.Addresses {
 		addr, parseErr := netlink.ParseAddr(addrStr)
 		if parseErr != nil {
 			slog.Warn("invalid wireguard tun address",
 				"name", tc.Name, "addr", addrStr, "err", parseErr)
+			continue
+		}
+		want[addr.IPNet.String()] = true
+	}
+	existing := map[string]bool{}
+	if addrs, listErr := t.ops.AddrList(link, netlink.FAMILY_ALL); listErr == nil {
+		for i := range addrs {
+			a := addrs[i]
+			key := a.IPNet.String()
+			existing[key] = true
+			// Skip link-local (fe80::) — the kernel manages it.
+			if !want[key] && a.IP != nil && !a.IP.IsLinkLocalUnicast() {
+				if delErr := t.ops.AddrDel(link, &a); delErr != nil {
+					slog.Warn("failed to remove stale wireguard tun address",
+						"name", tc.Name, "addr", key, "err", delErr)
+				} else {
+					slog.Info("removed stale wireguard tun address",
+						"name", tc.Name, "addr", key)
+				}
+			}
+		}
+	}
+	for _, addrStr := range tc.Addresses {
+		addr, parseErr := netlink.ParseAddr(addrStr)
+		if parseErr != nil {
 			continue
 		}
 		if existing[addr.IPNet.String()] {

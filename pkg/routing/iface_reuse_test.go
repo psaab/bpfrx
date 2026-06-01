@@ -91,6 +91,11 @@ func (f *fakeLinkOps) AddrAdd(l netlink.Link, a *netlink.Addr) error {
 	return nil
 }
 
+func (f *fakeLinkOps) AddrDel(l netlink.Link, a *netlink.Addr) error {
+	_ = l.Attrs()
+	return nil
+}
+
 func (f *fakeLinkOps) AddrList(l netlink.Link, family int) ([]netlink.Addr, error) {
 	return nil, nil
 }
