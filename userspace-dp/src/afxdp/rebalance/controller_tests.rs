@@ -36,9 +36,13 @@ struct MockTransport {
     demote_ok: bool,
     install_ok: bool,
     next_loc: u32,
-    /// Per-key origin as the mock "session table" sees it, so tests can
-    /// confirm there is always >= 1 owner across a rollback.
-    origins: std::collections::HashMap<u16, &'static str>,
+    /// When true, restore_owner returns false (simulates an ack timeout / key
+    /// absent on W_old) so tests can exercise the gated reverse barrier.
+    restore_fails: bool,
+    /// Per-(worker,key) origin as the mock "session table" sees it, so tests
+    /// can confirm there is always >= 1 owner across a rollback even when a
+    /// flow has lived on more than one worker over a chain of moves.
+    origins: std::collections::HashMap<(u32, u16), &'static str>,
 }
 
 impl MockTransport {
@@ -63,7 +67,7 @@ impl BarrierTransport for MockTransport {
     fn promote(&mut self, worker_id: u32, key: &SessionKey) -> bool {
         self.calls.push(format!("promote:{worker_id}:{}", key.src_port));
         if self.promote_ok {
-            self.origins.insert(key.src_port, "rebalanced_owner");
+            self.origins.insert((worker_id, key.src_port), "rebalanced_owner");
         }
         self.promote_ok
     }
@@ -71,18 +75,24 @@ impl BarrierTransport for MockTransport {
         self.calls.push(format!("demote:{worker_id}:{}", key.src_port));
         // W_old's local copy was the original owner; demote flips it to the
         // inert RebalancedOut. The promoted W_new owner is unaffected.
+        if self.demote_ok {
+            self.origins.insert((worker_id, key.src_port), "rebalanced_out");
+        }
         self.demote_ok
     }
     fn restore_owner(&mut self, worker_id: u32, key: &SessionKey) -> bool {
         self.calls.push(format!("restore:{worker_id}:{}", key.src_port));
-        self.origins.insert(key.src_port, "owner");
+        if self.restore_fails {
+            return false;
+        }
+        self.origins.insert((worker_id, key.src_port), "owner");
         true
     }
     fn demote_replica(&mut self, worker_id: u32, key: &SessionKey) -> bool {
         self.calls.push(format!("replica:{worker_id}:{}", key.src_port));
         // Only demote the W_new owner to a replica; never below 0 owners.
-        if self.origins.get(&key.src_port) == Some(&"rebalanced_owner") {
-            self.origins.insert(key.src_port, "replica");
+        if self.origins.get(&(worker_id, key.src_port)) == Some(&"rebalanced_owner") {
+            self.origins.insert((worker_id, key.src_port), "replica");
         }
         true
     }
@@ -343,8 +353,117 @@ fn teardown_live_move_uses_reverse_barrier() {
     let replica_idx = tx.calls.iter().position(|c| c.starts_with("replica:")).unwrap();
     assert!(restore_idx < delete_idx, "restore before delete: {:?}", tx.calls);
     assert!(delete_idx < replica_idx, "delete before replica-demote: {:?}", tx.calls);
+    // #1748 review #2: restore must target W_OLD (worker 0, the hottest source
+    // and RSS-natural worker), NOT W_new (worker 1). The pre-fix worker_for_old
+    // returned entry.new_worker and would have restored worker 1 here.
+    assert!(
+        tx.calls[restore_idx].starts_with("restore:0:"),
+        "teardown must restore W_old (worker 0), got {:?}", tx.calls[restore_idx]
+    );
+    // And the replica-demote must target W_new (worker 1).
+    assert!(
+        tx.calls[replica_idx].starts_with("replica:1:"),
+        "teardown must demote W_new (worker 1), got {:?}", tx.calls[replica_idx]
+    );
     assert_eq!(c.metrics().rules_active, 0);
     assert_eq!(c.metrics().deletes_total, 1);
+}
+
+#[test]
+fn teardown_live_move_restore_failure_keeps_w_new_owner() {
+    // #1748 review #4: if the W_old restore ack fails during teardown, the rule
+    // is still deleted but W_new is LEFT as owner (no replica-demote) so >= 1
+    // cleanup owner remains.
+    let mut c = test_controller(cfg());
+    let mut tx = MockTransport::good();
+    let input = RebalanceTickInput {
+        ifindex: 1,
+        workers: vec![worker(0, 400.0), worker(1, 100.0)],
+        flows: vec![flow(1001, 0, 120.0)],
+        now_secs: 10,
+    };
+    c.tick(&input, &mut tx);
+    let input2 = RebalanceTickInput { now_secs: 12, ..input };
+    c.tick(&input2, &mut tx).expect("move committed");
+    tx.calls.clear();
+    tx.restore_fails = true;
+    c.teardown_all(&mut tx, |_w, _k| true);
+    // Rule deleted, restore attempted, but NO replica-demote of W_new.
+    assert!(tx.calls.iter().any(|c| c.starts_with("delete:")));
+    assert!(tx.calls.iter().any(|c| c.starts_with("restore:0:")));
+    assert!(
+        !tx.calls.iter().any(|c| c.starts_with("replica:")),
+        "must NOT demote W_new when W_old restore fails: {:?}", tx.calls
+    );
+    // W_new (worker 1, src_port 1001) is still the rebalanced_owner.
+    assert!(tx.owners() >= 1, "restore-fail teardown keeps >= 1 owner");
+    let rf = c.metrics().moves_skipped.get(&SkipReason::RestoreFailed).copied().unwrap_or(0);
+    assert!(rf >= 1, "restore_failed skip recorded");
+}
+
+#[test]
+fn second_move_chain_replaces_rule_and_reverse_barriers_prior_owner() {
+    // #1748 review #6: ForwardFlow -> RebalancedOwner(W1) -> RebalancedOwner(W2)
+    // through the CONTROLLER ledger. The second move of the same key must
+    // delete the prior rule, reverse-barrier the prior owner (restore W_old,
+    // demote prior W_new), then forward-barrier to the third worker, and
+    // REPLACE (not append) the ledger entry.
+    let mut c = test_controller(RebalanceConfig {
+        imbalance_threshold: 1.30,
+        rebalance_interval_secs: 0, // allow back-to-back moves in the test
+        max_rules: 8,
+    });
+    let mut tx = MockTransport::good();
+
+    // First move: flow 1001 on worker 0 (hottest) -> worker 2 (coolest).
+    let in1 = RebalanceTickInput {
+        ifindex: 1,
+        workers: vec![worker(0, 400.0), worker(1, 250.0), worker(2, 100.0)],
+        flows: vec![flow(1001, 0, 120.0)],
+        now_secs: 10,
+    };
+    c.tick(&in1, &mut tx);
+    let in1b = RebalanceTickInput { now_secs: 11, ..in1 };
+    let mv1 = c.tick(&in1b, &mut tx).expect("first move");
+    assert_eq!(mv1.old_worker, 0);
+    assert_eq!(mv1.new_worker, 2);
+    assert_eq!(c.metrics().rules_active, 1, "one rule after first move");
+
+    // Clear the cooldown so the same key is eligible again, and present a
+    // topology where the SAME flow 1001 now sits on worker 2 (its new home)
+    // which is now the hottest, and worker 1 is coolest -> second move
+    // 2 -> 1. select_move keys on the flow's current worker_id.
+    c.clear_cooldown_for_test();
+    tx.calls.clear();
+    let installs_before = c.metrics().installs_total;
+    let in2 = RebalanceTickInput {
+        ifindex: 1,
+        workers: vec![worker(0, 100.0), worker(1, 90.0), worker(2, 400.0)],
+        flows: vec![flow(1001, 2, 120.0)],
+        now_secs: 20,
+    };
+    c.tick(&in2, &mut tx);
+    let in2b = RebalanceTickInput { now_secs: 21, ..in2 };
+    let mv2 = c.tick(&in2b, &mut tx).expect("second move");
+    assert_eq!(mv2.old_worker, 2, "second move sources from the prior new_worker");
+    assert_eq!(mv2.new_worker, 1);
+
+    // Ledger REPLACED, not appended: still exactly one rule for the key.
+    assert_eq!(c.metrics().rules_active, 1, "second move replaces, not appends");
+    // The prior rule (loc 100) was deleted before the new install.
+    assert!(
+        tx.calls.iter().any(|c| c == "delete:100"),
+        "prior rule loc 100 must be deleted on second move: {:?}", tx.calls
+    );
+    // Prior owner reverse-barriered: restore prior W_old (0), demote prior
+    // W_new (2). Then forward barrier to the third worker (promote 1).
+    let del_idx = tx.calls.iter().position(|c| c == "delete:100").unwrap();
+    let promote1_idx = tx.calls.iter().position(|c| c.starts_with("promote:1:")).unwrap();
+    assert!(del_idx < promote1_idx, "prior rule deleted before new forward barrier: {:?}", tx.calls);
+    // A new rule was installed for the third move.
+    assert_eq!(c.metrics().installs_total, installs_before + 1);
+    // Ownership ends correct: exactly the third worker's entry is the owner.
+    assert!(tx.owners() >= 1, "chain keeps >= 1 owner: {:?}", tx.origins);
 }
 
 #[test]

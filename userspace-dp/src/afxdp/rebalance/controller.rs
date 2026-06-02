@@ -66,6 +66,11 @@ pub(in crate::afxdp) enum SkipReason {
     BarrierFailed,
     /// One move already happened this interval.
     Dwell,
+    /// Reverse-barrier restore of W_old failed (timeout / key absent) during
+    /// rollback or teardown — W_new is intentionally LEFT as owner so >= 1
+    /// cleanup owner remains (#1748 review #4). Operator-visible: a non-zero
+    /// rate here means worker command acks are stalling under load.
+    RestoreFailed,
 }
 
 impl SkipReason {
@@ -78,6 +83,7 @@ impl SkipReason {
             Self::BudgetExhausted => "budget_exhausted",
             Self::BarrierFailed => "barrier_failed",
             Self::Dwell => "dwell",
+            Self::RestoreFailed => "restore_failed",
         }
     }
 }
@@ -155,6 +161,13 @@ pub(in crate::afxdp) trait BarrierTransport {
 #[derive(Clone, Debug)]
 struct LedgerEntry {
     key: SessionKey,
+    /// The worker the flow was steered AWAY from (W_old). #1748 review #2:
+    /// the reverse barrier on teardown/rollback must restore THIS worker to
+    /// owner, not `new_worker`. The RSS-natural worker for the flow once the
+    /// rule is gone IS the original source worker (RSS hashing is
+    /// deterministic on the 5-tuple), so restoring `old_worker` hands
+    /// ownership to exactly the worker that will receive the packets.
+    old_worker: u32,
     /// The worker the flow now lives on (W_new).
     new_worker: u32,
     /// The driver-assigned ntuple rule location.
@@ -208,6 +221,13 @@ impl RebalanceController {
         &self.socket
     }
 
+    /// Test-only: clear the per-flow cooldown so a unit test can drive a
+    /// second move of the same key without waiting out the cooldown window.
+    #[cfg(test)]
+    pub(in crate::afxdp) fn clear_cooldown_for_test(&mut self) {
+        self.cooldown.clear();
+    }
+
     /// One controller tick. Pure decision + barriered move. `tx` drives the
     /// worker barrier and NIC programming. Returns the move outcome for the
     /// caller's logging (None = no move attempted/taken this tick).
@@ -255,6 +275,41 @@ impl RebalanceController {
             return None;
         };
 
+        // #1748 review #6: SECOND MOVE of a key already in the ledger. The
+        // flow currently lives on its prior W_new (the ledger's `new_worker`)
+        // under a still-installed rule. Moving it to a third worker must first
+        // unwind that prior move at the CONTROLLER level — delete the old rule
+        // and reverse-barrier the prior owner back — so the flow is RSS-placed
+        // again before the new forward barrier re-pins it. Without this the
+        // controller just appends a second ledger entry and a second rule for
+        // the same 5-tuple (the second rule may never even take effect, and
+        // the prior owner is left RebalancedOwner forever). We replace, not
+        // append.
+        let prior_idx = self
+            .ledger
+            .iter()
+            .position(|e| e.key == candidate.key);
+        if let Some(idx) = prior_idx {
+            let prior = self.ledger[idx].clone();
+            // Reverse barrier on the prior move: restore the prior W_old to
+            // owner, delete the prior rule, demote the prior W_new to replica.
+            // Gate the W_new demote on a successful restore ack (#1748 #4): if
+            // the restore times out we must NOT demote the only owner.
+            if tx.restore_owner(prior.old_worker, &prior.key) {
+                let _ = tx.delete_rule(prior.loc);
+                tx.demote_replica(prior.new_worker, &prior.key);
+                self.metrics.deletes_total += 1;
+            } else {
+                // Could not hand ownership back to the prior W_old. Abort the
+                // second move and leave the prior move intact (>= 1 owner is
+                // still the prior W_new). Do not append a second rule.
+                self.metrics.record_skip(SkipReason::BarrierFailed);
+                return None;
+            }
+            self.ledger.remove(idx);
+            self.metrics.rules_active = self.ledger.len() as u32;
+        }
+
         // Forward barrier: promote W_new BEFORE the rule, then demote W_old,
         // then install. Both before the rule so a racing GC on either side
         // sees a safe origin (the applied-command ack serializes promote
@@ -268,11 +323,15 @@ impl RebalanceController {
         }
         if !tx.demote(candidate.old_worker, &candidate.key) {
             self.metrics.record_skip(SkipReason::BarrierFailed);
-            // Reverse barrier: restore W_old to owner FIRST (it never became
-            // RebalancedOut, but issue the restore to be safe), THEN demote
-            // W_new back to a replica.
-            tx.restore_owner(candidate.old_worker, &candidate.key);
-            tx.demote_replica(candidate.new_worker, &candidate.key);
+            // Reverse barrier: restore W_old to owner FIRST, and only demote
+            // W_new back to a replica if that restore is acked (#1748 #4). If
+            // the restore fails (timeout / key absent on W_old), keep W_new as
+            // the owner — demoting it would lose the only cleanup owner.
+            if tx.restore_owner(candidate.old_worker, &candidate.key) {
+                tx.demote_replica(candidate.new_worker, &candidate.key);
+            } else {
+                self.metrics.record_skip(SkipReason::RestoreFailed);
+            }
             return None;
         }
         // Only after BOTH acks: install the rule.
@@ -281,6 +340,7 @@ impl RebalanceController {
             Ok(loc) => {
                 self.ledger.push(LedgerEntry {
                     key: candidate.key.clone(),
+                    old_worker: candidate.old_worker,
                     new_worker: candidate.new_worker,
                     loc,
                 });
@@ -304,9 +364,13 @@ impl RebalanceController {
             Err(_) => {
                 self.metrics.record_skip(SkipReason::BarrierFailed);
                 // Rule install failed: reverse the ownership transfer with the
-                // reverse barrier so >= 1 cleanup owner remains.
-                tx.restore_owner(candidate.old_worker, &candidate.key);
-                tx.demote_replica(candidate.new_worker, &candidate.key);
+                // reverse barrier so >= 1 cleanup owner remains. Gate the W_new
+                // demote on the W_old restore ack (#1748 #4).
+                if tx.restore_owner(candidate.old_worker, &candidate.key) {
+                    tx.demote_replica(candidate.new_worker, &candidate.key);
+                } else {
+                    self.metrics.record_skip(SkipReason::RestoreFailed);
+                }
                 None
             }
         }
@@ -330,12 +394,23 @@ impl RebalanceController {
         let entries = std::mem::take(&mut self.ledger);
         for entry in entries {
             if is_live_on_new(entry.new_worker, &entry.key) {
-                // Reverse barrier: hand ownership back to W_old (it keeps the
-                // packets via origin-agnostic last_seen refresh once RSS
-                // re-hashes the flow there) BEFORE removing the rule.
-                tx.restore_owner(worker_for_old(&entry), &entry.key);
-                let _ = tx.delete_rule(entry.loc);
-                tx.demote_replica(entry.new_worker, &entry.key);
+                // Reverse barrier: hand ownership back to the REAL W_old
+                // (entry.old_worker — #1748 review #2), which is the
+                // RSS-natural worker that will receive the flow once the rule
+                // is gone, BEFORE removing the rule. Gate the W_new demote on
+                // the restore ack (#1748 #4): if W_old cannot be restored, keep
+                // W_new as the owner rather than demoting the only owner away.
+                if tx.restore_owner(entry.old_worker, &entry.key) {
+                    let _ = tx.delete_rule(entry.loc);
+                    tx.demote_replica(entry.new_worker, &entry.key);
+                } else {
+                    self.metrics.record_skip(SkipReason::RestoreFailed);
+                    // Delete the rule anyway (RSS will re-hash to W_old which
+                    // keeps the packets via origin-agnostic last_seen refresh),
+                    // but leave W_new as RebalancedOwner so >= 1 cleanup owner
+                    // remains until its own GC.
+                    let _ = tx.delete_rule(entry.loc);
+                }
             } else {
                 // Flow already expired off W_new — no live ownership to hand
                 // back; plain rule delete.
@@ -462,20 +537,6 @@ pub(in crate::afxdp) struct MoveOutcome {
     pub old_worker: u32,
     pub new_worker: u32,
     pub loc: u32,
-}
-
-// `LedgerEntry` only stores the new worker; the old worker is whichever RSS
-// queue the flow would re-hash to, which we cannot know at teardown. The
-// reverse barrier restores ownership to the entry's recorded provenance — for
-// the controller's purposes "W_old" on teardown is the worker that will own
-// the flow once the rule is gone, i.e. the RSS-natural worker. We approximate
-// it as the new_worker's pre-move owner, which the ledger does not retain;
-// teardown therefore issues restore_owner against the recorded new_worker's
-// peer. Since restore/demote are idempotent tag flips keyed by the session,
-// issuing them against new_worker is safe (it is a no-op if the entry there
-// is not RebalancedOut). See teardown_all for the conservative ordering.
-fn worker_for_old(entry: &LedgerEntry) -> u32 {
-    entry.new_worker
 }
 
 /// Compute the max and mean of a per-worker byte-rate vector.
