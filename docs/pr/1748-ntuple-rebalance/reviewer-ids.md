@@ -83,3 +83,8 @@ Continuations fetch by id (Codex loses session state >30min).
 - AGY r2: MERGE-READY (still holds)
 - Copilot: re-review on bbed6eeb found 1 soundness (unsafe socket aliasing in teardown) + 4 doc/test minors → dispatched to agent
 - core protocol + second-move path BLESSED; pending the aliasing fix + minors
+
+## LIVE CoV GATE round 1 (deploy @ 6202831ff) — FAILED, 2 runtime bugs
+- Bug1: ε-band rejects every move (eval at ~24/s status-rate -> ~40ms noisy byte-rate window; CoV 0.3 but 0 installs, all skips=epsilon). Fix: rate over >=rebalance_interval + re-derive ε + projected-improvement math; unit test CoV-0.3 -> >=1 install.
+- Bug2: live config reconcile no-op (bidirectional) — controller constructs/tears-down only on boot, not live commit/config-sync. Fix snapshot-apply reconcile + None<->Some transition test.
+- Both dispatched to impl agent. Re-validate LIVE after redeploy. Unit tests + miri + 9 review rounds did NOT catch these (behavioral/runtime).
