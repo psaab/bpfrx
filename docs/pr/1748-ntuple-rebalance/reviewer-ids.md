@@ -26,3 +26,8 @@ Continuations fetch by id (Codex loses session state >30min).
 - Codex: /tmp/codex-1748-r4.txt, bash bg `bgiy46xot` — pending (verifying barrier + dedicated promote close r3 findings)
 - AGY: adversarial-review-mpwqtig4-0q0vg7 — pending
 - Claude-SMR: PLAN-READY (barrier reuses session_export_ack idiom; dedicated origin-only promote specified) — doc on reconcile
+
+## Plan review round 4 (plan v4 @ d3016b922)
+- Codex: /tmp/codex-1748-r4.txt, bash bg `bgiy46xot` — PLAN-NEEDS-MAJOR (TTL race: promote near-expiry replica -> GC removes sole owner; rollback order unsafe; ack must be {seq,key,origin,result})
+- AGY: adversarial-review-mpwqtig4-0q0vg7 — PLAN-READY (### Verdict: PLAN-NEEDS-MINOR)
+- Claude-SMR: PLAN-READY concur-with-Codex (both r4 findings real; folded to v5)

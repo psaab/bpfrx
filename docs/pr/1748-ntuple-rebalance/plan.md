@@ -1,8 +1,20 @@
 # #1748 Step 1 — reactive cross-worker ntuple rebalance controller (forward-direction, default-OFF)
 
-- **Status**: DRAFT v4 — round-3 NEEDS-MAJOR addressed (applied-command barrier
-  + dedicated origin-only promote), pending round-4 re-review
+- **Status**: DRAFT v5 — round-4 NEEDS-MAJOR addressed (liveness-refresh promote
+  + structured ack + reverse-barrier rollback), pending round-5 re-review
 - **Issue**: #1748
+
+### Round-4 review outcome (Codex NEEDS-MAJOR, AGY READY)
+AGY r4 = PLAN-READY (confirmed exclusions + SNAT release via shared
+`Arc<PortAllocatorShared>` works post-handoff + dedicated promote sound). Codex
+r4 = NEEDS-MAJOR, two verified refinements both folded into v5 §4.5: (1) the
+barrier still races if the promoted replica is near its own GC timeout → promote
+must do a liveness-only `last_seen`/wheel refresh (no delta/publish/NAT); (2)
+rollback must be a REVERSE barrier (restore W_old→owner + ack, THEN
+W_new→replica) — the naive order re-opens zero-owner; plus the ack must be
+structured `{seq,key,origin,result}`, not a bare `AtomicU64`. Codex confirmed
+the r3 generic-helper finding is closed and the dedicated origin-only promote is
+the right design.
 
 ### Round-3 review outcome (Codex NEEDS-MAJOR, AGY READY, SMR self-corrected)
 AGY r3 = PLAN-READY (verified the full suppression set + NAT-realloc avoidance +
@@ -233,10 +245,28 @@ sequence pattern (`ha.rs:170-182`):
 3. ONLY THEN install the ntuple rule.
 
 This guarantees W_new is the committed owner before W_old is demoted → there is
-always ≥1 cleanup owner; zero-owner is impossible. The barrier also bounds the
-transfer well under `SESSION_GC_INTERVAL_NS`. If any ack times out or the ioctl
-fails, roll back (W_new→replica, W_old→owner) — a racing GC during rollback sees
-exactly one owner (idempotent).
+always ≥1 cleanup owner; zero-owner is impossible.
+
+**Liveness refresh on promote (Codex r4 — required).** "Replica present" is not
+sufficient: W_new's materialized replica could be ms from its own GC timeout, so
+after promote+ack but before the rule installs, W_new's GC could remove the sole
+owner → zero owners. The dedicated promote API therefore ALSO refreshes
+`last_seen_ns` + re-buckets the wheel (`push_to_wheel`) when it flips the origin
+— a liveness-only refresh that still emits NO delta, NO publish, NO NAT change.
+This makes the promoted owner provably non-expiring across the move budget,
+independent of its prior TTL. (Belt-and-suspenders: the eligibility check also
+prefers replicas with `ttl_remaining ≥ move-budget`.)
+
+**Ack payload (Codex r4).** The rebalance ack cannot be a bare `AtomicU64` like
+the raw `session_export_ack` counter; it must let the controller read back
+`{seq, key, origin, result}` so it confirms the EXACT key reached the EXACT
+origin (`RebalancedOwner` / `RebalancedOut`) before proceeding.
+
+**Rollback is a REVERSE barrier (Codex r4).** On ack-timeout or ioctl failure,
+the same independent-queue hazard applies — so rollback must restore in the safe
+order: **restore W_old→owner, block for its ack, THEN demote W_new→replica**.
+Applying `W_new→replica` first would re-open the zero-owner window. A racing GC
+during the reverse-barrier rollback always sees ≥1 owner.
 
 **`RebalancedOwner` vs `RebalancedOut` get OPPOSITE HA treatment:**
 `RebalancedOut` is inert (excluded from demote/refresh/export). `RebalancedOwner`
