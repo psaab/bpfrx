@@ -701,6 +701,7 @@ fn resolve_cos_queue_id_prefers_egress_output_filter_forwarding_class() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            flow_rebalance: None,
         }),
         ..Default::default()
     };
@@ -806,6 +807,7 @@ fn resolve_cos_queue_id_uses_reverse_output_source_port_filter() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            flow_rebalance: None,
         }),
         ..Default::default()
     };
@@ -956,6 +958,7 @@ fn resolve_cached_cos_tx_selection_prefers_egress_output_filter_and_keeps_counte
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            flow_rebalance: None,
         }),
         ..Default::default()
     };
@@ -1072,6 +1075,7 @@ fn resolve_cos_queue_id_uses_ingress_input_filter_when_no_output_filter_exists()
                     },
                 ],
             }],
+            flow_rebalance: None,
         }),
         ..Default::default()
     };
@@ -1187,6 +1191,7 @@ fn resolve_cached_cos_tx_selection_uses_ingress_input_filter_when_no_output_exis
                     },
                 ],
             }],
+            flow_rebalance: None,
         }),
         ..Default::default()
     };
@@ -1268,6 +1273,7 @@ fn resolve_cached_cos_tx_selection_keeps_counter_only_output_filter_hits() {
                     scheduler: "be-sched".into(),
                 }],
             }],
+            flow_rebalance: None,
         }),
         ..Default::default()
     };
@@ -1349,6 +1355,7 @@ fn resolve_cos_tx_selection_counts_counter_only_output_filter_hits() {
                     scheduler: "be-sched".into(),
                 }],
             }],
+            flow_rebalance: None,
         }),
         ..Default::default()
     };
@@ -1579,6 +1586,7 @@ fn resolve_cos_tx_selection_uses_ingress_filter_dscp_rewrite_when_no_output_filt
                     },
                 ],
             }],
+            flow_rebalance: None,
         }),
         ..Default::default()
     };
@@ -1670,6 +1678,7 @@ fn resolve_cos_tx_selection_skips_ingress_filter_without_tx_selection_effects() 
                     scheduler: "be-sched".into(),
                 }],
             }],
+            flow_rebalance: None,
         }),
         ..Default::default()
     };
@@ -1814,6 +1823,7 @@ fn resolve_cos_queue_id_falls_back_to_default_queue_without_filter_match() {
                     scheduler: "be-sched".into(),
                 }],
             }],
+            flow_rebalance: None,
         }),
         ..Default::default()
     };
@@ -1903,6 +1913,7 @@ fn resolve_cos_queue_id_uses_dscp_classifier_when_filters_do_not_set_class() {
                 codel_target_ns: 0,
                 },
             ],
+            flow_rebalance: None,
         }),
         ..Default::default()
     };
@@ -2235,6 +2246,7 @@ fn resolve_cos_queue_id_preserves_ingress_classification_when_output_filter_has_
                     },
                 ],
             }],
+            flow_rebalance: None,
         }),
         ..Default::default()
     };
@@ -2318,6 +2330,7 @@ fn resolve_cos_tx_selection_preserves_output_filter_dscp_rewrite_without_forward
                     scheduler: "be-sched".into(),
                 }],
             }],
+            flow_rebalance: None,
         }),
         ..Default::default()
     };

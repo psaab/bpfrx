@@ -1757,3 +1757,223 @@ fn refresh_for_ha_activation_updates_peer_synced_entries() {
     let lookup = table.lookup(&key, 3_000_000, 0x10).expect("session");
     assert_eq!(lookup.decision.resolution.egress_ifindex, 99);
 }
+
+
+// ── #1748 rebalance origin-mutator + suppression tests ──────────────
+
+/// promote_rebalanced_owner is a TAG FLIP + liveness only: it must NOT push
+/// any delta (no Open), must NOT mutate decision/metadata, and must leave the
+/// origin at RebalancedOwner. (The SessionTable layer owns no shared-map /
+/// conntrack / NAT state, so "no shared publish/upsert, no conntrack write, no
+/// NAT refcount change" reduces here to "no delta + no field mutation"; the
+/// glue layer's BarrierTransport calls only this API, never publish/upsert.)
+#[test]
+fn promote_rebalanced_owner_is_side_effect_free() {
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    let now = 1_000_000_000u64;
+    // W_new holds a materialized synced replica (WorkerLocalImport).
+    assert!(table.install_with_protocol_with_origin(
+        key.clone(),
+        decision(),
+        metadata(),
+        SessionOrigin::WorkerLocalImport,
+        now,
+        PROTO_TCP,
+        0x10,
+    ));
+    // WorkerLocalImport install emits no delta (peer-synced replica).
+    assert!(table.drain_deltas(8).is_empty());
+
+    let promoted = table.promote_rebalanced_owner(&key, now + 5_000_000);
+    assert!(promoted, "promote returns true for a present key");
+    // No delta whatsoever — NOT an Open (update_session would have emitted one).
+    assert!(
+        table.drain_deltas(8).is_empty(),
+        "promote_rebalanced_owner must push NO delta"
+    );
+    // Origin is now the local owner RebalancedOwner, which is NOT peer-synced.
+    assert_eq!(table.origin_of(&key), Some(SessionOrigin::RebalancedOwner));
+    assert!(!SessionOrigin::RebalancedOwner.is_peer_synced());
+    // decision + metadata are untouched by the tag flip.
+    let lookup = table.lookup(&key, now + 6_000_000, 0x10).expect("session present");
+    assert_eq!(lookup.decision, decision());
+    assert_eq!(lookup.metadata, metadata());
+}
+
+/// Second-move chain: a flow that was rebalanced once (RebalancedOwner on
+/// W_new) is moved AGAIN to a third worker. The controller treats the current
+/// local owner generically, so a second promote on the third worker's replica
+/// keeps ownership correct (origin stays a local owner, never reverts to a
+/// peer-synced import). Models ForwardFlow -> RebalancedOwner ->
+/// RebalancedOwner(third).
+#[test]
+fn second_move_chain_keeps_local_ownership() {
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    let now = 1_000_000_000u64;
+    // Original owner: a plain local ForwardFlow.
+    assert!(table.install_with_protocol_with_origin(
+        key.clone(),
+        decision(),
+        metadata(),
+        SessionOrigin::ForwardFlow,
+        now,
+        PROTO_TCP,
+        0x10,
+    ));
+    let _ = table.drain_deltas(8);
+    // First move: promote to RebalancedOwner.
+    assert!(table.promote_rebalanced_owner(&key, now + 1_000_000));
+    assert_eq!(table.origin_of(&key), Some(SessionOrigin::RebalancedOwner));
+    // Second move: promote again (the third worker's replica). Still a local
+    // owner; never peer-synced.
+    assert!(table.promote_rebalanced_owner(&key, now + 2_000_000));
+    assert_eq!(table.origin_of(&key), Some(SessionOrigin::RebalancedOwner));
+    assert!(!table.origin_of(&key).unwrap().is_peer_synced());
+    assert!(
+        table.drain_deltas(8).is_empty(),
+        "neither promote emits a delta"
+    );
+}
+
+/// A RebalancedOut entry (the abandoned W_old copy) must emit NO Close delta on
+/// its local-only GC expiry — that delta would cascade-delete the live flow
+/// W_new owns. The forward expiry path is the shared-state release site; this
+/// pins the Close-delta suppression at session/mod.rs.
+#[test]
+fn rebalanced_out_expiry_emits_no_close_delta() {
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    let then = 1_000_000_000u64;
+    assert!(table.install_with_protocol_with_origin(
+        key.clone(),
+        decision(),
+        metadata(),
+        SessionOrigin::ForwardFlow,
+        then,
+        PROTO_TCP,
+        0x10,
+    ));
+    let _ = table.drain_deltas(8);
+    // Demote to RebalancedOut (the W_old abandoned copy).
+    assert!(table.demote_rebalanced_out(&key));
+    assert_eq!(table.origin_of(&key), Some(SessionOrigin::RebalancedOut));
+    // Age it out.
+    table.last_gc_ns = then + 301_000_000_000;
+    let expired = table.expire_stale_entries(then + 302_000_000_000);
+    assert_eq!(expired.len(), 1, "the abandoned copy does age out locally");
+    assert_eq!(expired[0].key, key);
+    assert_eq!(expired[0].origin, SessionOrigin::RebalancedOut);
+    // CRITICAL: no Close delta — W_new owns the shared cleanup.
+    assert!(
+        table.drain_deltas(8).is_empty(),
+        "RebalancedOut expiry must NOT push a Close delta"
+    );
+}
+
+/// A real RebalancedOwner expiry (W_new, the true owner) DOES emit a Close
+/// delta — exactly one worker owns end-of-flow cleanup. The counter-factual to
+/// the suppression test above: ownership is preserved, not lost.
+#[test]
+fn rebalanced_owner_expiry_emits_close_delta() {
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    let then = 1_000_000_000u64;
+    assert!(table.install_with_protocol_with_origin(
+        key.clone(),
+        decision(),
+        metadata(),
+        SessionOrigin::WorkerLocalImport,
+        then,
+        PROTO_TCP,
+        0x10,
+    ));
+    let _ = table.drain_deltas(8);
+    assert!(table.promote_rebalanced_owner(&key, then));
+    table.last_gc_ns = then + 301_000_000_000;
+    let expired = table.expire_stale_entries(then + 302_000_000_000);
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].origin, SessionOrigin::RebalancedOwner);
+    let deltas = table.drain_deltas(8);
+    assert_eq!(deltas.len(), 1, "the real owner emits Close on expiry");
+    assert_eq!(deltas[0].kind, SessionDeltaKind::Close);
+}
+
+/// demote_owner_rg must NOT rewrite a RebalancedOut entry to SyncImport (that
+/// would re-enable the shared cleanup W_new owns). It DOES demote a
+/// RebalancedOwner like a normal local owner (RebalancedOwner is not
+/// peer-synced) so HA failover still works.
+#[test]
+fn demote_owner_rg_excludes_rebalanced_out_but_demotes_owner() {
+    let mut table = SessionTable::new();
+    let now = 1_000_000_000u64;
+
+    // RebalancedOut entry on owner RG 1.
+    let out_key = key_v4();
+    assert!(table.install_with_protocol_with_origin(
+        out_key.clone(),
+        decision(),
+        metadata(),
+        SessionOrigin::ForwardFlow,
+        now,
+        PROTO_TCP,
+        0x10,
+    ));
+    assert!(table.demote_rebalanced_out(&out_key));
+
+    // RebalancedOwner entry on owner RG 1.
+    let owner_key = key_v6();
+    let mut owner_md = metadata();
+    owner_md.owner_rg_id = 1;
+    assert!(table.install_with_protocol_with_origin(
+        owner_key.clone(),
+        decision(),
+        owner_md,
+        SessionOrigin::WorkerLocalImport,
+        now,
+        PROTO_UDP,
+        0x00,
+    ));
+    assert!(table.promote_rebalanced_owner(&owner_key, now));
+
+    table.demote_owner_rg(1);
+
+    // RebalancedOut stays inert.
+    assert_eq!(table.origin_of(&out_key), Some(SessionOrigin::RebalancedOut));
+    // RebalancedOwner demotes to SyncImport like ForwardFlow.
+    assert_eq!(table.origin_of(&owner_key), Some(SessionOrigin::SyncImport));
+}
+
+/// restore_rebalanced_owner (reverse-barrier step) flips a RebalancedOut entry
+/// back to a local owner + refreshes liveness; demote_rebalanced_replica flips
+/// a RebalancedOwner back to a worker-local replica. Together they implement
+/// the reverse barrier that always leaves >= 1 cleanup owner.
+#[test]
+fn reverse_barrier_mutators_round_trip() {
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    let now = 1_000_000_000u64;
+    assert!(table.install_with_protocol_with_origin(
+        key.clone(),
+        decision(),
+        metadata(),
+        SessionOrigin::ForwardFlow,
+        now,
+        PROTO_TCP,
+        0x10,
+    ));
+    let _ = table.drain_deltas(8);
+    assert!(table.demote_rebalanced_out(&key));
+    assert_eq!(table.origin_of(&key), Some(SessionOrigin::RebalancedOut));
+    // Reverse-barrier restore: back to a local owner.
+    assert!(table.restore_rebalanced_owner(&key, now + 1_000_000));
+    assert_eq!(table.origin_of(&key), Some(SessionOrigin::ForwardFlow));
+    // Replica demotion: a RebalancedOwner becomes WorkerLocalImport.
+    assert!(table.promote_rebalanced_owner(&key, now + 2_000_000));
+    assert_eq!(table.origin_of(&key), Some(SessionOrigin::RebalancedOwner));
+    assert!(table.demote_rebalanced_replica(&key));
+    assert_eq!(table.origin_of(&key), Some(SessionOrigin::WorkerLocalImport));
+    // None of these mutators emit deltas.
+    assert!(table.drain_deltas(8).is_empty());
+}

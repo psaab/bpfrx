@@ -559,7 +559,8 @@ fn refresh_runtime_snapshot_rebuilds_cos_owner_worker_map_from_identities() {
         dscp_classifiers: vec![],
         ieee8021_classifiers: vec![],
         dscp_rewrite_rules: vec![],
-    });
+            flow_rebalance: None,
+        });
 
     coordinator.refresh_runtime_snapshot(&snapshot);
 

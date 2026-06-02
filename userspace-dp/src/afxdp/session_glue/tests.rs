@@ -3928,3 +3928,146 @@ fn apply_worker_commands_dispatch_order_pin_with_demote_dedup() {
         "DemoteOwnerRGS first-occurrence order must be preserved"
     );
 }
+
+
+// ── #1748 RebalancedOut terminal/purge suppression tests ────────────
+
+/// delete_terminal_filtered_session on a RebalancedOut entry (the abandoned
+/// W_old copy) must NOT remove the SHARED session-map entry that W_new is
+/// actively forwarding against. The local slab entry is still removed (W_old
+/// reclaims its own memory) but the shared state survives.
+#[test]
+fn terminal_filtered_session_rebalanced_out_keeps_shared_state() {
+    let mut sessions = SessionTable::new();
+    let key = test_key();
+    let now = 1_000_000_000u64;
+
+    // Install the local copy as RebalancedOut on W_old.
+    assert!(sessions.install_with_protocol_with_origin(
+        key.clone(),
+        test_decision(),
+        test_metadata(),
+        SessionOrigin::ForwardFlow,
+        now,
+        PROTO_TCP,
+        0x10,
+    ));
+    // Drain the install Open delta so the post-cleanup assertion is clean.
+    let _ = sessions.drain_deltas(8);
+    assert!(sessions.demote_rebalanced_out(&key));
+
+    // W_new owns the shared session entry.
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = Vec::new();
+    let shared_entry = SyncedSessionEntry {
+        key: key.clone(),
+        decision: test_decision(),
+        metadata: test_metadata(),
+        origin: SessionOrigin::WorkerLocalImport,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    };
+    publish_shared_session(
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        &shared_owner_rg_indexes,
+        &shared_entry,
+    );
+    assert_eq!(shared_sessions.lock().unwrap().len(), 1);
+
+    // W_old's terminal cleanup of its RebalancedOut copy.
+    delete_terminal_filtered_session(
+        &mut sessions,
+        -1,
+        -1,
+        -1,
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        &shared_owner_rg_indexes,
+        &peer_worker_commands,
+        &key,
+        test_decision(),
+        &test_metadata(),
+        SessionOrigin::RebalancedOut,
+    );
+
+    // CRITICAL: the SHARED entry W_new owns survives.
+    assert_eq!(
+        shared_sessions.lock().unwrap().len(),
+        1,
+        "RebalancedOut terminal cleanup must NOT remove the shared session entry"
+    );
+    // No DeleteSynced broadcast was queued (peer_worker_commands empty here,
+    // but the early return also skips replicate_session_delete).
+    // The local slab entry IS removed.
+    assert!(sessions.entry_with_origin(&key).is_none());
+    // No Close delta emitted.
+    assert!(sessions.drain_deltas(8).is_empty());
+}
+
+/// Counter-factual: the SAME teardown on a normal (non-rebalanced) origin DOES
+/// remove the shared session entry. Proves the suppression is origin-specific,
+/// not a blanket no-op.
+#[test]
+fn terminal_filtered_session_normal_origin_removes_shared_state() {
+    let mut sessions = SessionTable::new();
+    let key = test_key();
+    let now = 1_000_000_000u64;
+    assert!(sessions.install_with_protocol_with_origin(
+        key.clone(),
+        test_decision(),
+        test_metadata(),
+        SessionOrigin::ForwardFlow,
+        now,
+        PROTO_TCP,
+        0x10,
+    ));
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = Vec::new();
+    let shared_entry = SyncedSessionEntry {
+        key: key.clone(),
+        decision: test_decision(),
+        metadata: test_metadata(),
+        origin: SessionOrigin::ForwardFlow,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    };
+    publish_shared_session(
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        &shared_owner_rg_indexes,
+        &shared_entry,
+    );
+    assert_eq!(shared_sessions.lock().unwrap().len(), 1);
+
+    delete_terminal_filtered_session(
+        &mut sessions,
+        -1,
+        -1,
+        -1,
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        &shared_owner_rg_indexes,
+        &peer_worker_commands,
+        &key,
+        test_decision(),
+        &test_metadata(),
+        SessionOrigin::ForwardFlow,
+    );
+
+    assert_eq!(
+        shared_sessions.lock().unwrap().len(),
+        0,
+        "a normal-origin terminal cleanup DOES remove the shared session entry"
+    );
+}

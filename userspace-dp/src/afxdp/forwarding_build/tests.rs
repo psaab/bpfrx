@@ -182,6 +182,7 @@ fn build_cos_state_translates_scheduler_map_entries() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            flow_rebalance: None,
         }),
         ..Default::default()
     };
@@ -246,6 +247,7 @@ fn build_cos_state_resolves_percent_buffer_size_from_interface_burst_pool() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            flow_rebalance: None,
         }),
         ..Default::default()
     };
@@ -301,6 +303,7 @@ fn build_cos_state_prefers_legacy_byte_buffer_when_both_fields_present() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            flow_rebalance: None,
         }),
         ..Default::default()
     };
@@ -383,6 +386,7 @@ fn build_cos_state_propagates_surplus_sharing_from_snapshot() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            flow_rebalance: None,
         }),
         ..Default::default()
     };
@@ -476,6 +480,7 @@ fn build_cos_state_derives_exact_queue_default_burst_from_queue_rate() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            flow_rebalance: None,
         }),
         ..Default::default()
     };
@@ -534,6 +539,7 @@ fn build_cos_state_uses_effective_transmit_rate_for_surplus_weight() {
                     scheduler: "be-sched".into(),
                 }],
             }],
+            flow_rebalance: None,
         }),
         ..Default::default()
     };
@@ -584,6 +590,7 @@ fn build_cos_state_marks_no_rate_scheduler_map_queue_residual_only() {
                     scheduler: "be-sched".into(),
                 }],
             }],
+            flow_rebalance: None,
         }),
         ..Default::default()
     };
@@ -1024,6 +1031,7 @@ fn build_cos_state_includes_zero_shaping_rate_interface() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            flow_rebalance: None,
         }),
         ..Default::default()
     };
@@ -1079,6 +1087,7 @@ fn build_cos_state_zero_shaping_rate_queue_inherits_transparent() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            flow_rebalance: None,
         }),
         ..Default::default()
     };
@@ -1137,6 +1146,7 @@ fn build_cos_state_no_rate_exact_surplus_equal_flow_is_residual_only() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            flow_rebalance: None,
         }),
         ..Default::default()
     };
@@ -1194,6 +1204,7 @@ fn build_cos_state_mixed_zero_and_nonzero_shaping_rate() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            flow_rebalance: None,
         }),
         ..Default::default()
     };
@@ -1255,6 +1266,7 @@ fn build_cos_state_skips_interface_with_no_cos_config() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            flow_rebalance: None,
         }),
         ..Default::default()
     };
@@ -1316,7 +1328,8 @@ fn build_cos_state_admits_each_cos_field_in_isolation() {
                 dscp_value: 0,
             }],
         }],
-    };
+            flow_rebalance: None,
+        };
     let cases: &[(i32, &str, InterfaceSnapshot)] = &[
         (
             201,
@@ -1456,7 +1469,8 @@ fn build_cos_state_skips_interface_with_unresolvable_named_references() {
                 dscp_value: 0,
             }],
         }],
-    };
+            flow_rebalance: None,
+        };
     // Each typo'd reference (one CoS field non-empty but unresolvable)
     // must NOT admit the interface to CoSState.
     let cases: &[(i32, &str, InterfaceSnapshot)] = &[
@@ -1541,6 +1555,7 @@ fn build_cos_state_skips_interface_with_resolvable_but_empty_scheduler_map() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            flow_rebalance: None,
         }),
         ..Default::default()
     };
@@ -1593,6 +1608,7 @@ fn build_cos_state_skips_interface_with_scheduler_map_all_undefined_forwarding_c
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            flow_rebalance: None,
         }),
         ..Default::default()
     };
@@ -1637,7 +1653,8 @@ fn build_cos_state_skips_classifier_only_mapping_to_unmaterialized_queue() {
         }],
         ieee8021_classifiers: vec![],
         dscp_rewrite_rules: vec![],
-    };
+            flow_rebalance: None,
+        };
     let snapshot = ConfigSnapshot {
         interfaces: vec![InterfaceSnapshot {
             ifindex: 501,
@@ -1678,7 +1695,8 @@ fn build_cos_state_admits_classifier_mapping_to_materialized_queue() {
         }],
         ieee8021_classifiers: vec![],
         dscp_rewrite_rules: vec![],
-    };
+            flow_rebalance: None,
+        };
     let snapshot = ConfigSnapshot {
         interfaces: vec![InterfaceSnapshot {
             ifindex: 502,
@@ -1725,7 +1743,8 @@ fn build_cos_state_skips_rewrite_only_mapping_to_unmaterialized_class() {
                 dscp_value: 0x2e,
             }],
         }],
-    };
+            flow_rebalance: None,
+        };
     let snapshot = ConfigSnapshot {
         interfaces: vec![InterfaceSnapshot {
             ifindex: 503,
@@ -1765,7 +1784,8 @@ fn build_cos_state_admits_rewrite_only_mapping_to_materialized_class() {
                 dscp_value: 0,
             }],
         }],
-    };
+            flow_rebalance: None,
+        };
     let snapshot = ConfigSnapshot {
         interfaces: vec![InterfaceSnapshot {
             ifindex: 504,
