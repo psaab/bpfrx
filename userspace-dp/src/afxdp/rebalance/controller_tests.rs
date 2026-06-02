@@ -776,3 +776,100 @@ fn realistic_imbalance_produces_an_install_not_epsilon_skip() {
     // And the projected post-move CoV is a real improvement over baseline.
     assert!(cov > 0.25, "baseline CoV was the imbalanced ~0.3");
 }
+
+// ── #1748 live BUG #1 (r5): zero per-flow rate must NOT stall the move ──
+
+/// The DECISIVE regression for the second live failure. On the loss cluster
+/// the per-WORKER rate was correct (CoV 0.64) but EVERY per-flow byte-rate read
+/// ~0 because the flow-cache observed_bytes counter resets on eviction, so the
+/// controller skipped every candidate (epsilon/no-eligible) and made zero
+/// installs. This feeds the controller exactly that pathology — a real
+/// per-worker imbalance with ALL per-flow rates 0 — and asserts the
+/// worker-rate-derived fallback still produces an install. The pre-fix code
+/// (which used flow.byte_rate directly and bailed on rate 0) makes no move
+/// here; the fix derives the move magnitude from the reliable worker rate.
+#[test]
+fn zero_per_flow_rate_with_real_worker_imbalance_still_installs() {
+    // R1 baseline partition [2,2,1,1,4,2]; worker rates from tx_bytes are
+    // reliable and show CoV ~0.46. ALL per-flow rates are 0 (the live bug).
+    let workers = vec![
+        worker(0, 2.80e9),
+        worker(1, 2.80e9),
+        worker(2, 1.40e9),
+        worker(3, 1.40e9),
+        worker(4, 5.60e9), // 4 flows <- hottest
+        worker(5, 2.80e9),
+    ];
+    let cov = byte_rate_cov(&workers);
+    assert!(cov > 0.40, "fixture is a real worker-rate imbalance (CoV {cov})");
+
+    // 12 flows, every one with byte_rate == 0.0 (direct signal dead).
+    let flows = vec![
+        flow(3000, 0, 0.0), flow(3001, 0, 0.0),
+        flow(3002, 1, 0.0), flow(3003, 1, 0.0),
+        flow(3004, 2, 0.0),
+        flow(3005, 3, 0.0),
+        flow(3006, 4, 0.0), flow(3007, 4, 0.0),
+        flow(3008, 4, 0.0), flow(3009, 4, 0.0), // hottest worker's 4 flows
+        flow(3010, 5, 0.0), flow(3011, 5, 0.0),
+    ];
+
+    let mut c = test_controller(cfg());
+    let mut tx = MockTransport::good();
+    let input = RebalanceTickInput { ifindex: 5, workers, flows, now_secs: 10 };
+    c.tick(&input, &mut tx); // dwell
+    let input2 = RebalanceTickInput { now_secs: 11, ..input };
+    let outcome = c.tick(&input2, &mut tx);
+
+    assert!(
+        outcome.is_some(),
+        "a real worker imbalance with zero direct per-flow rates MUST still \
+         install via the worker-rate fallback; skips={:?}", c.metrics().moves_skipped
+    );
+    assert_eq!(c.metrics().installs_total, 1);
+    let mv = outcome.unwrap();
+    assert_eq!(mv.old_worker, 4, "move sources from the reliable hottest worker");
+    // It must NOT be charged as a no-eligible-flow skip on the committing tick.
+    let neff = c.metrics().moves_skipped.get(&SkipReason::NoEligibleFlow).copied().unwrap_or(0);
+    assert_eq!(neff, 0, "fallback estimate makes the hottest worker's flows eligible");
+}
+
+/// When the hottest worker genuinely has NO flows in the map (empty per-flow
+/// signal AND no flows to estimate over), the skip is NoEligibleFlow — NOT
+/// epsilon. Disambiguation guard for the metric (so the live log/metric points
+/// at the real cause).
+#[test]
+fn no_flows_on_hottest_worker_is_no_eligible_flow_not_epsilon() {
+    let workers = vec![
+        worker(0, 1.40e9),
+        worker(4, 5.60e9), // hottest, but no flows attributed to it
+    ];
+    // All flows attributed to worker 0, none to the hottest worker 4.
+    let flows = vec![flow(4000, 0, 1.40e9), flow(4001, 0, 1.40e9)];
+    let mut c = test_controller(cfg());
+    let mut tx = MockTransport::good();
+    let input = RebalanceTickInput { ifindex: 5, workers, flows, now_secs: 10 };
+    c.tick(&input, &mut tx);
+    let input2 = RebalanceTickInput { now_secs: 11, ..input };
+    assert!(c.tick(&input2, &mut tx).is_none(), "no flows on hottest -> no move");
+    let neff = c.metrics().moves_skipped.get(&SkipReason::NoEligibleFlow).copied().unwrap_or(0);
+    let eps = c.metrics().moves_skipped.get(&SkipReason::Epsilon).copied().unwrap_or(0);
+    assert!(neff >= 1, "must record no_eligible_flow when the hottest worker has no flows");
+    assert_eq!(eps, 0, "must NOT mislabel an empty per-flow signal as epsilon");
+}
+
+/// cumulative_to_rate across two real eval ticks with the SAME key yields a
+/// non-zero rate; an eviction-reset (cur < prev) yields 0 — documenting why
+/// the direct per-flow signal is flaky and the worker-rate fallback exists.
+#[test]
+fn cumulative_to_rate_real_two_tick_keying() {
+    // Tick A primes the baseline; tick B (1s later) sees +1.4e9 bytes.
+    let t_a = 10_000_000_000u64;
+    let t_b = t_a + 1_000_000_000;
+    // Same flow, cumulative advanced by 1.4e9 over 1s => 1.4e9 B/s.
+    let rate = cumulative_to_rate(5_400_000_000, 4_000_000_000, t_b, t_a);
+    assert!((rate - 1.4e9).abs() < 1.0, "non-zero rate across two ticks: {rate}");
+    // Eviction reset between ticks: cumulative dropped below the prior sample.
+    let reset = cumulative_to_rate(100_000, 4_000_000_000, t_b, t_a);
+    assert_eq!(reset, 0.0, "an eviction reset reads 0, NOT a negative rate");
+}

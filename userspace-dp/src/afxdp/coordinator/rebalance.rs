@@ -13,7 +13,7 @@
 use super::*;
 use crate::afxdp::rebalance::{
     BarrierTransport, FlowSample, RebalanceConfig, RebalanceController, RebalanceTickInput,
-    WorkerByteRate, cumulative_to_rate, flow_spec_from_key, NtupleSocket,
+    WorkerByteRate, cumulative_to_rate, debug_log_rebalance, flow_spec_from_key, NtupleSocket,
 };
 use crate::afxdp::rebalance::ntuple::FlowSpec5Tuple;
 use crate::afxdp::RebalanceAck;
@@ -265,12 +265,32 @@ impl super::Coordinator {
             // First observation of this flow => no rate yet (a brand-new flow's
             // first-tick cumulative is not a window rate). cumulative_to_rate
             // also handles a cumulative reset on re-home via saturating_sub.
-            let rate = match self.rebalance_last_flow_bytes.get(&key) {
-                Some(&(prev_bytes, prev_ns)) => {
+            let prev_sample = self.rebalance_last_flow_bytes.get(&key).copied();
+            let rate = match prev_sample {
+                Some((prev_bytes, prev_ns)) => {
                     cumulative_to_rate(cumulative, prev_bytes, now_ns, prev_ns)
                 }
                 None => 0.0,
             };
+            // #1748 live BUG #1 instrumentation: ground-truth per-flow rate
+            // sourcing. ONE line per flow per eval, gated to `debug-log` builds
+            // (compiled out of release). Shows whether observed_bytes advances
+            // across evals (rate > 0) or the cumulative is stuck / resetting
+            // (prev shown so a reset is visible as cur < prev). Read via
+            // `journalctl -u xpfd | grep REBALANCE_FLOW`.
+            debug_log_rebalance!(
+                "REBALANCE_FLOW ifindex={} worker={} proto={} {}:{}->{}:{} cur_bytes={} prev={:?} rate={:.3e}",
+                ifindex,
+                row.worker_id,
+                key.protocol,
+                key.src_ip,
+                key.src_port,
+                key.dst_ip,
+                key.dst_port,
+                cumulative,
+                prev_sample,
+                rate,
+            );
             self.rebalance_last_flow_bytes
                 .insert(key.clone(), (cumulative, now_ns));
             seen_flow_keys.insert(key.clone());
@@ -292,6 +312,23 @@ impl super::Coordinator {
             let flows = per_iface_flows.remove(&ifindex).unwrap_or_default();
             if workers.len() < 2 {
                 continue;
+            }
+            // #1748 live BUG #1 instrumentation: ground-truth per-EVAL summary
+            // of the per-worker rate vector + how many flows have a positive
+            // rate. Gated to `debug-log` builds. Read via
+            // `journalctl -u xpfd | grep REBALANCE_EVAL`.
+            #[cfg(feature = "debug-log")]
+            {
+                let worker_rates: Vec<(u32, f64)> =
+                    workers.iter().map(|w| (w.worker_id, w.byte_rate)).collect();
+                let flows_positive = flows.iter().filter(|f| f.byte_rate > 0.0).count();
+                debug_log_rebalance!(
+                    "REBALANCE_EVAL ifindex={} workers={:?} flows={} flows_with_positive_rate={}",
+                    ifindex,
+                    worker_rates,
+                    flows.len(),
+                    flows_positive,
+                );
             }
             if !self.rebalance_controllers.contains_key(&ifindex) {
                 // Lazily construct the controller + open the ntuple socket the

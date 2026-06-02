@@ -19,6 +19,21 @@ use std::net::IpAddr;
 use super::ntuple::{FlowProto, FlowSpec5Tuple};
 use crate::session::SessionKey;
 
+/// #1748 live BUG #1 instrumentation. Emits a per-eval diagnostic line to
+/// stderr (journald) ONLY in `debug-log` feature builds, so production release
+/// builds compile it out entirely (zero cost, removable). Mirrors the
+/// `debug_log!` pattern in `session/mod.rs`. Build the helper with
+/// `--features debug-log` to read these lines via `journalctl -u xpfd`.
+#[allow(unused_macros)]
+macro_rules! debug_log_rebalance {
+    ($($arg:tt)*) => {
+        #[cfg(feature = "debug-log")]
+        eprintln!($($arg)*);
+    };
+}
+#[allow(unused_imports)]
+pub(in crate::afxdp) use debug_log_rebalance;
+
 /// Operator-tunable knobs compiled from the `class-of-service flow-rebalance`
 /// config leaf. Absent leaf => `None` controller => default path untouched.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -60,6 +75,13 @@ pub(in crate::afxdp) enum SkipReason {
     Magnitude,
     /// Projected byte-rate CoV improvement did not exceed epsilon.
     Epsilon,
+    /// #1748 live BUG #1 disambiguation: the hottest worker had NO eligible
+    /// candidate flow with a positive byte-rate to move — distinct from a real
+    /// epsilon reject (a candidate existed but its projected CoV gain was too
+    /// small). A high rate here while worker CoV is large means the per-flow
+    /// rate signal is broken (flows missing from the map, mismatched worker_id,
+    /// or zero per-flow rate), NOT that the move math is too conservative.
+    NoEligibleFlow,
     /// Rule budget exhausted (STOP — no eviction).
     BudgetExhausted,
     /// Barrier failed (ack timeout / key absent / ioctl error) — rolled back.
@@ -80,6 +102,7 @@ impl SkipReason {
             Self::Cooldown => "cooldown",
             Self::Magnitude => "magnitude",
             Self::Epsilon => "epsilon",
+            Self::NoEligibleFlow => "no_eligible_flow",
             Self::BudgetExhausted => "budget_exhausted",
             Self::BarrierFailed => "barrier_failed",
             Self::Dwell => "dwell",
@@ -488,17 +511,54 @@ impl RebalanceController {
             .collect();
         candidates.sort_by(|a, b| b.byte_rate.total_cmp(&a.byte_rate));
 
+        let candidate_count = candidates.len();
+        // #1748 live BUG #1 ROOT-CAUSE FIX: the direct per-flow byte-rate
+        // (observed_bytes delta) is an unreliable signal under real traffic —
+        // the per-flow-cache `observed_bytes` counter RESETS whenever the entry
+        // is evicted + re-inserted (LRU / generation / collision), so across a
+        // 1s eval window a heavy flow frequently reads rate ~0 (cur < prev =>
+        // saturating_sub => 0). That made every candidate look like a 0-rate
+        // flow, project_move shifted ~0 bytes, and the move never cleared the
+        // epsilon band (installs=0 on the live gate). The per-WORKER rate
+        // (tx_bytes delta) IS reliable (CoV 0.64 was computed from it), so when
+        // a flow's direct rate is missing we ESTIMATE it from the reliable
+        // worker rate: the hottest worker's rate divided evenly across its
+        // candidate flows. This is the physically-correct expectation for
+        // RSS-hashed equal flows and lets the controller make a beneficial move
+        // off the reliable signal instead of stalling on the flaky one.
+        let fallback_per_flow_rate = if candidate_count > 0 {
+            hottest.byte_rate / candidate_count as f64
+        } else {
+            0.0
+        };
         let mut had_cooldown_skip = false;
         let mut had_magnitude_skip = false;
+        // #1748 live BUG #1: track whether ANY candidate flow reached the
+        // epsilon comparison with a POSITIVE (estimated) byte-rate. If none did
+        // (no flows on the hottest worker at all, or a zero hottest rate), the
+        // skip is NoEligibleFlow, NOT a genuine epsilon reject.
+        let mut reached_epsilon_with_positive_rate = false;
         let mut best: Option<(MoveCandidate, f64)> = None;
         for flow in candidates {
             if self.cooldown.contains_key(&flow.key) {
                 had_cooldown_skip = true;
                 continue;
             }
+            // Effective move magnitude: the direct per-flow rate when present,
+            // else the reliable worker-rate-derived estimate (see above).
+            let move_rate = if flow.byte_rate > 0.0 {
+                flow.byte_rate
+            } else {
+                fallback_per_flow_rate
+            };
+            // A zero-rate move cannot improve CoV (project_move shifts ~0
+            // bytes); only possible if the hottest worker's own rate is 0.
+            if move_rate <= 0.0 {
+                continue;
+            }
             // Magnitude guard: moving it must not make the destination the new
-            // hottest worker (flow rate <= gap/2).
-            if flow.byte_rate > gap / 2.0 {
+            // hottest worker (move magnitude <= gap/2).
+            if move_rate > gap / 2.0 {
                 had_magnitude_skip = true;
                 continue;
             }
@@ -507,10 +567,11 @@ impl RebalanceController {
                 &input.workers,
                 hottest.worker_id,
                 coolest.worker_id,
-                flow.byte_rate,
+                move_rate,
             );
             let projected_cov = byte_rate_cov(&projected);
             let improvement = baseline_cov - projected_cov;
+            reached_epsilon_with_positive_rate = true;
             if improvement <= EPSILON_COV_IMPROVEMENT {
                 continue;
             }
@@ -529,14 +590,41 @@ impl RebalanceController {
         if let Some((cand, _)) = best {
             return Some(cand);
         }
-        // No winning move — attribute the dominant skip reason.
-        let reason = if had_magnitude_skip {
+        // No winning move — attribute the dominant skip reason. Magnitude and
+        // cooldown are real eligibility rejects on a positive-rate flow. A real
+        // epsilon reject requires a positive-rate candidate that reached the
+        // projection. Otherwise the hottest worker simply had no movable flow
+        // with a positive rate -> NoEligibleFlow (the live-BUG-1 signature).
+        let reason = if reached_epsilon_with_positive_rate {
+            SkipReason::Epsilon
+        } else if had_magnitude_skip {
             SkipReason::Magnitude
         } else if had_cooldown_skip {
             SkipReason::Cooldown
         } else {
-            SkipReason::Epsilon
+            SkipReason::NoEligibleFlow
         };
+        // #1748 live BUG #1 instrumentation: when imbalanced but no move is
+        // taken, emit ONE debug line per eval with the ground-truth vectors so
+        // a single deploy disambiguates "per-flow rate is zero" (NoEligibleFlow)
+        // from "move math too conservative" (Epsilon). Gated to the
+        // `debug-log` feature so it is OFF in normal release builds.
+        debug_log_rebalance!(
+            "REBALANCE_SKIP ifindex={} reason={} baseline_cov={:.4} eps={:.4} \
+             hottest_w={} hottest_rate={:.3e} coolest_w={} coolest_rate={:.3e} gap={:.3e} \
+             candidate_flows_on_hottest={} flows_total={}",
+            input.ifindex,
+            reason.as_str(),
+            baseline_cov,
+            EPSILON_COV_IMPROVEMENT,
+            hottest.worker_id,
+            hottest.byte_rate,
+            coolest.worker_id,
+            coolest.byte_rate,
+            gap,
+            candidate_count,
+            input.flows.len(),
+        );
         self.metrics.record_skip(reason);
         None
     }
