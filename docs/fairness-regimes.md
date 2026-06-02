@@ -231,6 +231,24 @@ between flows needed to make `N ≤ M` flows avoid occupied queues;
 only a reactive controller observing live occupancy can, and that
 is a re-steer.
 
+> **#1748 refinement (the re-steer is the answer, done right).** The
+> kill above is correct for *static* steering and for the *count-blind*
+> reactive controller #1203/#789 built. It is NOT a physics ceiling on
+> reactive **established-flow re-pin**. The #1748 R1 spike re-ran the
+> "forbidden re-steer" on this exact cluster with **byte-rate-aware**
+> selection (move the heaviest flow on the hottest worker, not flatten
+> flow *count*) and took per-flow CoV **16.8% → 2.3–4.2% with aggregate
+> up** — beating the floor ~12×. The #1203 49–55% was the count-blind
+> controller defect, not the placement mechanism. #1748 ships this as a
+> **default-OFF, opt-in** forward-direction reactive rebalancer
+> (`class-of-service flow-rebalance`); the move is a barriered ownership
+> transfer so the re-steer does not cascade-delete the live flow's shared
+> session state. See `docs/cos-flow-rebalance.md`. The cost the static
+> analysis correctly flags — re-pinning moves an established flow — is
+> paid as a bounded, hysteresis-gated, ≪1 Hz rule churn, not the 12
+> simultaneous mid-flight moves that produced the spike's retransmit
+> burst.
+
 ### What this means operationally
 
 - **This is primarily a per-flow distribution effect, not an
