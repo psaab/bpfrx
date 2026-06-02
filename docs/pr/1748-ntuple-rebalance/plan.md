@@ -1,8 +1,20 @@
 # #1748 Step 1 — reactive cross-worker ntuple rebalance controller (forward-direction, default-OFF)
 
-- **Status**: DRAFT v5 — round-4 NEEDS-MAJOR addressed (liveness-refresh promote
-  + structured ack + reverse-barrier rollback), pending round-5 re-review
+- **Status**: DRAFT v6 — round-5 NEEDS-MAJOR addressed (teardown-of-live-move is
+  a reverse barrier), pending round-6 re-review
 - **Issue**: #1748
+
+### Round-5 review outcome (Codex NEEDS-MAJOR, AGY READY)
+AGY r5 = PLAN-READY (verified wheel lazy-cleanup safe + reverse-barrier rollback
+1→2→1). Codex r5 confirmed BOTH r4 findings closed (liveness-refresh +
+`push_to_wheel` fix the near-expiry race; structured ack closes the bare-counter
+ambiguity) and found one more verified MAJOR — the symmetric teardown case: rule
+removal/disable of a still-live move re-hashes the flow to W_old (which keeps
+packets via origin-agnostic `last_seen` refresh, `session/mod.rs:560,581`) but is
+cleanup-suppressed, so W_new expires the only owner → leak. v6 makes teardown of
+a live move a reverse barrier (restore W_old→owner+ack, delete rule, demote
+W_new→replica+ack), and articulates the general principle: ownership is
+barriered across every rule transition; only an already-dead flow skips it.
 
 ### Round-4 review outcome (Codex NEEDS-MAJOR, AGY READY)
 AGY r4 = PLAN-READY (confirmed exclusions + SNAT release via shared
@@ -282,10 +294,26 @@ origin-only mutation API** that flips `origin` in place and does nothing else.
 Unit tests assert: no delta pushed, no shared-map publish/upsert, no conntrack
 write, no NAT refcount change across the promote.
 
-On rule removal / flow close / disable: delete the ntuple rule; the flow
-re-hashes back to RSS naturally (W_new's `RebalancedOwner` entry is the
-authoritative owner). On **failover**, the standby has no rules → RSS fallback
-(correct; fairness re-converges) — documented in operator docs.
+**Teardown of a LIVE move is also a (reverse) barrier (Codex r5 — required).**
+Removing the ntuple rule sends the flow back to W_old via RSS. W_old's local-hit
+path refreshes `last_seen`/wheel regardless of origin (`session/mod.rs:560,581`)
+so it keeps the packets — but W_old is still `RebalancedOut`/cleanup-suppressed,
+while W_new stops seeing packets and eventually expires the *only* cleanup owner
+→ shared-state leak. So **any rule teardown of a still-live move must reverse the
+ownership first**: restore W_old→owner (liveness refresh) + ack, delete the
+ntuple rule, THEN demote W_new→replica + ack. This is the same reverse barrier as
+rollback. The ONLY "just delete the rule" case is flow-close *after* the owner
+(W_new) has already expired the session — there is no live ownership to hand
+back. Disable / reconcile that tears down live moves MUST use the reverse
+barrier; a plain rule-flush on disable is a correctness bug.
+
+On **failover**, the standby has no rules → RSS fallback (correct; fairness
+re-converges) — documented in operator docs.
+
+**General principle (all rounds converge here):** ownership is barriered across
+*every* rule transition — install (forward barrier: promote→demote→rule),
+rollback (reverse barrier), and teardown of a live move (reverse barrier).
+Only a transition on an *already-dead* flow needs no barrier.
 
 ### 4.3 Config knob (default-OFF)
 `pkg/config/schema.go` typed leaf under `class-of-service` (or `chassis`/

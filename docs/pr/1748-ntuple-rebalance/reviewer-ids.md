@@ -36,3 +36,8 @@ Continuations fetch by id (Codex loses session state >30min).
 - Codex: /tmp/codex-1748-r5.txt, bash bg `bd3w287b2` — pending (verify liveness-refresh + reverse-barrier rollback close r4)
 - AGY: adversarial-review-mpwqzh2x-p37bkx — pending
 - Claude-SMR: PLAN-READY (liveness-refresh kills the near-expiry race; reverse-barrier rollback is the correct order)
+
+## Plan review round 5 (plan v5 @ 929dbd403)
+- Codex: /tmp/codex-1748-r5.txt, bash bg `bd3w287b2` — PLAN-NEEDS-MAJOR (r4 findings CLOSED; new: teardown of live move not barriered -> leak)
+- AGY: adversarial-review-mpwqzh2x-p37bkx — PLAN-READY
+- Claude-SMR: PLAN-READY concur-with-Codex (teardown barrier real; folded to v6)
