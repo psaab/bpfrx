@@ -1,7 +1,8 @@
 # Research plan — #1748 Cross-worker per-flow REBALANCE (re-steer of established flows) on mlx5 VFs
 
-- **Revision**: r2 (post round-1: Codex PLAN-READY-kill, Claude SMR PLAN-READY-kill, AGY **PLAN-KILL-OVERTURNED**). Verdict changed.
-- **Status**: **PLAN-NEEDS-WORK → scoped feasibility-prototype** for Path 2 (ntuple HW re-pin). NOT a clean kill; NOT yet PLAN-READY-to-ship.
+- **Revision**: r2 (CONVERGED). Round-1: Codex + Claude SMR PLAN-READY-kill, AGY PLAN-KILL-OVERTURNED. Round-2: all three converge on **PLAN-NEEDS-WORK (overturn correct, R1-spike gate)**.
+- **Status**: **PLAN-NEEDS-WORK → scoped feasibility-prototype** for Path 2 (ntuple HW re-pin), gated on the R1 spike. Kill WITHDRAWN. NOT yet PLAN-READY-to-ship.
+- **Converged verdicts**: Codex r2 = PLAN-NEEDS-WORK (overturn correct, R1-spike gate); AGY r2 = PLAN-NEEDS-WORK (overturn correct, R1-spike gate); Claude SMR r2 = PLAN-NEEDS-WORK (kill withdrawn, R1-spike gate).
 - **Skill**: `/research` (research-only; stop at PLAN-READY or PLAN-KILL; no code; docs only)
 - **Issue**: #1748 (label `perf`)
 - **Worktree**: `.claude/worktrees/1748-mlx5-flow-rebalance`, branch `research/1748-mlx5-flow-rebalance`
@@ -122,6 +123,41 @@ clear it)? This requires reading the #1203 controller (`feature/1215-...`
 branch) and either reproducing its limit or identifying the fixable defect.
 **If R1 shows placement itself is floor-bound, Path 2 is killed here** — and
 this is the most likely kill point.
+
+**Decisive disambiguating evidence found in r2 (Codex):** the #789 work tree
+holds TWO contradictory data points on the SAME cluster:
+- `refactor/789-fairness-via-ntuple:docs/pr/789-fairness-via-ntuple/findings-experiment-1.md`
+  — *manual* exact mlx5 ntuple rules dropped per-flow CoV **62.5% → 3.8%** on
+  iperf-c P=12 (12 flows within ±5% of mean), concluding "within-worker
+  fairness is excellent; the 62.5% baseline is dominated by CROSS-worker
+  variance, not within-worker scheduling." Aggregate dropped 24% only because
+  the crude port-bitmask scheme idled 3 queues — not a mechanism cost.
+- `refactor/789-phase2-byte-rate:docs/pr/789-phase2-byte-rate/plan.md` — the
+  *closed-loop controller* reached only **49–55% CoV** while "correctly driving
+  each queue to 2 flows."
+
+The contradiction localizes R1's risk precisely: **the placement MECHANISM is
+not floor-bound (manual = 3.8%); the #1203 CONTROLLER was the limiter.** R1's
+job is to confirm the manual 3.8% reproduces for *established-flow exact re-pin*
+(not just connect-time placement) and then identify why the closed-loop
+controller regressed to 49–55% (convergence lag? re-steer-during-flight churn?
+hysteresis? the very Wall-B transient R3?). This makes the spike high-value:
+it is likely to *pass* the mechanism check and turn the work toward fixing the
+controller, OR to reveal that established-flow re-pin specifically (vs
+connect-time placement) hits the 49–55% wall — either is a clean decision.
+
+**Root cause of the #1203 controller regression (AGY r2, quoted PR history):**
+the #1203 controller flattened per-queue *flow count* only
+(`pr-history.md:19239`) and **deferred byte-rate-aware candidate selection to
+Phase 2** because it added a per-packet cache-line write to the worker hot path
+(`pr-history.md:19283`). An even *count* partition (2,2,2,2,2,2) still yields
+high CoV when one flow is a 3 Gb/s elephant and its queue-mate is a mouse. So
+the 49–55% was a **count-blind controller defect**, not a placement-physics
+floor. R1's controller-side requirement is therefore concrete: candidate
+selection must be **byte-rate aware** (move the flow whose transfer most
+flattens the per-worker *byte-rate*, not flow-count), which re-opens the
+hot-path-telemetry-write cost question #1203 deferred. This is the substance the
+follow-on controller design (post-R1) must solve.
 
 ### R2. Reverse direction is not moved.
 Re-pinning the forward 5-tuple does not move the reverse flow (server→client),
