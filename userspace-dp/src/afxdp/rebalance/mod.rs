@@ -18,6 +18,10 @@
 //                        protocol + metrics + per-flow cooldown/hysteresis.
 
 mod controller;
-mod ntuple;
+pub(in crate::afxdp) mod ntuple;
 
-pub(in crate::afxdp) use controller::{RebalanceConfig, RebalanceController, RebalanceMetrics};
+pub(in crate::afxdp) use controller::{
+    BarrierTransport, FlowSample, MoveOutcome, RebalanceConfig, RebalanceController,
+    RebalanceMetrics, RebalanceTickInput, SkipReason, WorkerByteRate, flow_spec_from_key,
+};
+pub(in crate::afxdp) use ntuple::NtupleSocket;

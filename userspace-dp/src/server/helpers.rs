@@ -14,6 +14,12 @@ use sha2::{Digest, Sha256};
 use std::io::{self, Write};
 
 pub(crate) fn refresh_status(state: &mut ServerState) {
+    // #1748: drive one rebalance controller tick at the status cadence
+    // (~1 Hz). Default-OFF: a single Option::is_none() early-return inside
+    // tick_rebalance when the knob is unset (no ioctl socket, no per-tick
+    // work). This reuses the existing status path's worker telemetry + the
+    // flow-worker map; it adds NO new control-socket caller.
+    state.afxdp.tick_rebalance();
     state.afxdp.refresh_bindings(&mut state.status.bindings);
     let writer_status = state.state_writer.status();
     state.status.io_uring_active = writer_status.active;
@@ -132,6 +138,8 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
         state.status.event_stream_dropped = es_stats.dropped;
     }
     state.status.last_cache_flush_at = state.afxdp.last_cache_flush_at();
+    // #1748: per-interface rebalance controller telemetry (empty when off).
+    state.status.flow_rebalance = state.afxdp.flow_rebalance_status();
 }
 
 pub(crate) fn forwarding_unsupported_error(cap: &UserspaceCapabilities) -> String {

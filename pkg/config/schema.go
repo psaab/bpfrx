@@ -886,6 +886,37 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				"scheduler-map": {args: 1, children: nil},
 			}},
 		}},
+		// #1748: default-OFF opt-in reactive cross-worker ntuple rebalance
+		// controller. Absent => the userspace-dp controller is never
+		// constructed (byte-identical default path). imbalance-threshold is
+		// expressed as a percent of the mean per-worker byte-rate (e.g. 130
+		// means move when the hottest worker exceeds 1.30x the mean).
+		"flow-rebalance": {children: map[string]*schemaNode{
+			"imbalance-threshold": {
+				args:          1,
+				valueType:     ValueInteger,
+				valueDesc:     "Hottest-worker byte-rate as a percent of the mean that triggers a move (101..1000; e.g. 130 = 1.30x)",
+				valueExamples: []string{"120", "130", "150"},
+				validator:     ValidateInteger(101, 1000),
+				children:      nil,
+			},
+			"rebalance-interval": {
+				args:          1,
+				valueType:     ValueInteger,
+				valueDesc:     "Minimum seconds between rule installs (>= 1)",
+				valueExamples: []string{"1", "2", "5"},
+				validator:     ValidateInteger(1, 3600),
+				children:      nil,
+			},
+			"max-rules": {
+				args:          1,
+				valueType:     ValueInteger,
+				valueDesc:     "Hard cap on concurrently-installed ntuple rules per interface (1..1024)",
+				valueExamples: []string{"16", "64", "256"},
+				validator:     ValidateInteger(1, 1024),
+				children:      nil,
+			},
+		}},
 		"fairness": {children: map[string]*schemaNode{
 			"rss-expectation": {children: map[string]*schemaNode{
 				"ifindex": {args: 1, multi: true, children: map[string]*schemaNode{

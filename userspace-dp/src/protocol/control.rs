@@ -11,7 +11,7 @@ use super::binding::{
     BindingCountersSnapshot, BindingStatus, ExceptionStatus, HAGroupStatus, QueueStatus,
     SessionDeltaInfo, WorkerRuntimeStatus,
 };
-use super::cos::{CoSActiveFlowCountStatus, CoSInterfaceStatus};
+use super::cos::{CoSActiveFlowCountStatus, CoSInterfaceStatus, FlowRebalanceStatus};
 use super::nat::SourceNatPoolStatus;
 use super::resolution::{FlowWorkerStatus, PacketResolution};
 use super::security::{
@@ -228,6 +228,10 @@ pub(crate) struct ProcessStatus {
     /// Monotonic timestamp (secs) of the last HA flow cache flush (#312).
     #[serde(rename = "last_cache_flush_at", default)]
     pub last_cache_flush_at: u64,
+    /// #1748: per-interface reactive rebalance controller telemetry. Empty
+    /// when the knob is off (no controllers constructed).
+    #[serde(rename = "flow_rebalance", default)]
+    pub flow_rebalance: Vec<FlowRebalanceStatus>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

@@ -773,5 +773,31 @@ func newCollector(srv *Server) *xpfCollector {
 			"Proactive neighbor-warm requests dropped because the warmer worker thread died; warming is disabled until daemon restart (#1636).",
 			nil, nil,
 		),
+		// #1748: reactive ntuple rebalance controller telemetry, per ifindex.
+		flowRebalanceRulesActive: prometheus.NewDesc(
+			"xpf_userspace_flow_rebalance_rules_active",
+			"Number of ntuple flow-steering rules currently installed by the reactive rebalance controller (#1748).",
+			[]string{"ifindex"}, nil,
+		),
+		flowRebalanceInstallsTotal: prometheus.NewDesc(
+			"xpf_userspace_flow_rebalance_installs_total",
+			"Total ntuple rebalance rules installed since start (#1748).",
+			[]string{"ifindex"}, nil,
+		),
+		flowRebalanceDeletesTotal: prometheus.NewDesc(
+			"xpf_userspace_flow_rebalance_deletes_total",
+			"Total ntuple rebalance rules deleted since start (#1748).",
+			[]string{"ifindex"}, nil,
+		),
+		flowRebalanceMovesSkippedTotal: prometheus.NewDesc(
+			"xpf_userspace_flow_rebalance_moves_skipped_total",
+			"Candidate moves skipped, by reason (balanced, cooldown, magnitude, epsilon, budget_exhausted, barrier_failed, dwell) (#1748).",
+			[]string{"ifindex", "reason"}, nil,
+		),
+		flowRebalanceWorkerByterateCoV: prometheus.NewDesc(
+			"xpf_userspace_flow_rebalance_worker_byterate_cov",
+			"Coefficient of variation of per-worker byte-rate observed by the rebalance controller at the last tick (#1748).",
+			[]string{"ifindex"}, nil,
+		),
 	}
 }

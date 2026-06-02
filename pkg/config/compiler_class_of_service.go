@@ -442,6 +442,34 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 		}
 	}
 
+	// #1748: opt-in reactive ntuple rebalance controller. Presence of the
+	// block (even empty) enables the controller; absent => nil => off.
+	if frNode := node.FindChild("flow-rebalance"); frNode != nil {
+		fr := &CoSFlowRebalance{}
+		if v := nodeVal(frNode.FindChild("imbalance-threshold")); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 101 || n > 1000 {
+				return fmt.Errorf("class-of-service flow-rebalance imbalance-threshold %q: expected 101..1000", v)
+			}
+			fr.ImbalanceThresholdPercent = uint32(n)
+		}
+		if v := nodeVal(frNode.FindChild("rebalance-interval")); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 1 || n > 3600 {
+				return fmt.Errorf("class-of-service flow-rebalance rebalance-interval %q: expected 1..3600", v)
+			}
+			fr.RebalanceIntervalSecs = uint32(n)
+		}
+		if v := nodeVal(frNode.FindChild("max-rules")); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 1 || n > 1024 {
+				return fmt.Errorf("class-of-service flow-rebalance max-rules %q: expected 1..1024", v)
+			}
+			fr.MaxRules = uint32(n)
+		}
+		cos.FlowRebalance = fr
+	}
+
 	return nil
 }
 

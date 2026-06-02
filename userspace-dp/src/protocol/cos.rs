@@ -21,6 +21,44 @@ pub(crate) struct ClassOfServiceSnapshot {
     pub schedulers: Vec<CoSSchedulerSnapshot>,
     #[serde(rename = "scheduler_maps", default)]
     pub scheduler_maps: Vec<CoSSchedulerMapSnapshot>,
+    /// #1748: opt-in reactive ntuple rebalance config. `None` => the
+    /// controller is never constructed (byte-identical default path). JSON
+    /// rename MUST match the Go `flow_rebalance` tag — the wire format is the
+    /// contract.
+    #[serde(rename = "flow_rebalance", default, skip_serializing_if = "Option::is_none")]
+    pub flow_rebalance: Option<CoSFlowRebalanceSnapshot>,
+}
+
+/// #1748: rebalance controller config, mirrored from
+/// `config.CoSFlowRebalance`. Zero sub-fields mean "use the controller's
+/// built-in defaults".
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub(crate) struct CoSFlowRebalanceSnapshot {
+    #[serde(rename = "imbalance_threshold_percent", default)]
+    pub imbalance_threshold_percent: u32,
+    #[serde(rename = "rebalance_interval_secs", default)]
+    pub rebalance_interval_secs: u32,
+    #[serde(rename = "max_rules", default)]
+    pub max_rules: u32,
+}
+
+/// #1748: per-interface rebalance controller telemetry, exported to the Go
+/// Prometheus collector. One row per live controller (per steered ifindex).
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
+pub(crate) struct FlowRebalanceStatus {
+    #[serde(default)]
+    pub ifindex: i32,
+    #[serde(rename = "rules_active", default)]
+    pub rules_active: u32,
+    #[serde(rename = "installs_total", default)]
+    pub installs_total: u64,
+    #[serde(rename = "deletes_total", default)]
+    pub deletes_total: u64,
+    /// Skip counts keyed by reason label (e.g. "magnitude", "cooldown").
+    #[serde(rename = "moves_skipped", default)]
+    pub moves_skipped: std::collections::BTreeMap<String, u64>,
+    #[serde(rename = "worker_byterate_cov", default)]
+    pub worker_byterate_cov: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

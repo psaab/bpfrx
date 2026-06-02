@@ -4,6 +4,7 @@ mod cos_state;
 mod ha_state;
 mod inject;
 mod neighbor_manager;
+mod rebalance;
 mod reconcile;
 mod refresh_bindings;
 mod session_manager;
@@ -64,6 +65,18 @@ pub struct Coordinator {
     /// stably; written exactly once when the worker dies, read at most
     /// once per gRPC status poll (~1 Hz). Not on the packet hot path.
     pub(crate) worker_panics: BTreeMap<u32, Arc<Mutex<Option<String>>>>,
+    /// #1748: opt-in reactive ntuple rebalance config from the
+    /// `class-of-service flow-rebalance` leaf. `None` => default-OFF: the
+    /// controller is never constructed, no ioctl socket, no per-tick work.
+    pub(in crate::afxdp) rebalance_config: Option<crate::afxdp::rebalance::RebalanceConfig>,
+    /// #1748: per-ifindex live rebalance controllers, constructed lazily on
+    /// the first tick after the knob is enabled and a worker is bound to that
+    /// interface. Each owns its ethtool ntuple socket + rule ledger.
+    pub(in crate::afxdp) rebalance_controllers:
+        BTreeMap<i32, crate::afxdp::rebalance::RebalanceController>,
+    /// #1748: last per-(worker) tx_bytes sample + monotonic ns, for deriving
+    /// byte-rate across the controller tick window. Keyed by worker_id.
+    pub(in crate::afxdp) rebalance_last_tx_bytes: BTreeMap<u32, (u64, u64)>,
 }
 
 impl Coordinator {
@@ -98,6 +111,9 @@ impl Coordinator {
             last_cache_flush_at: Arc::new(AtomicU64::new(0)),
             rg_epochs: Arc::new(std::array::from_fn(|_| AtomicU32::new(0))),
             worker_panics: BTreeMap::new(),
+            rebalance_config: None,
+            rebalance_controllers: BTreeMap::new(),
+            rebalance_last_tx_bytes: BTreeMap::new(),
         }
     }
 
@@ -204,6 +220,12 @@ impl Coordinator {
     }
 
     pub(crate) fn stop_inner(&mut self, clear_synced_state: bool) {
+        // #1748: remove every installed ntuple rule on shutdown so no orphan
+        // HW rule survives the daemon. Plain deletes are correct here: the
+        // whole dataplane is tearing down, so there is no live flow whose
+        // ownership needs handing back (the reverse barrier protects against a
+        // live-flow leak, which cannot happen when all workers stop).
+        self.teardown_all_rebalance_rules_plain();
         if let Some(stop) = self.neighbors.monitor_stop.take() {
             stop.store(true, Ordering::Relaxed);
         }

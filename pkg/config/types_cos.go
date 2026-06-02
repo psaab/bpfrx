@@ -15,6 +15,26 @@ type ClassOfServiceConfig struct {
 	SchedulerMaps        map[string]*CoSSchedulerMap
 	Interfaces           map[string]*CoSInterface
 	FairnessExpectations []*CoSFairnessExpectation
+	// FlowRebalance is the #1748 opt-in reactive ntuple rebalance knob.
+	// nil => disabled (the userspace-dp controller is never constructed and
+	// the default forwarding path is byte-identical).
+	FlowRebalance *CoSFlowRebalance
+}
+
+// CoSFlowRebalance holds the #1748 reactive cross-worker ntuple rebalance
+// controller knobs. Presence of the block (even with all defaults) enables
+// the controller; absence keeps it off.
+type CoSFlowRebalance struct {
+	// ImbalanceThresholdPercent: hottest-worker byte-rate as a percent of
+	// the mean that triggers a move (e.g. 130 = 1.30x). 0 => controller
+	// default (130).
+	ImbalanceThresholdPercent uint32
+	// RebalanceIntervalSecs: minimum seconds between rule installs. 0 =>
+	// controller default (1).
+	RebalanceIntervalSecs uint32
+	// MaxRules: hard cap on concurrently-installed ntuple rules per
+	// interface. 0 => controller default (64).
+	MaxRules uint32
 }
 
 // CoSForwardingClass maps a forwarding-class name to a queue number.

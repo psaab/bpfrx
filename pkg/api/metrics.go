@@ -216,6 +216,12 @@ type xpfCollector struct {
 	// operator-visible signal for the warmer in production builds.
 	neighborWarmDropsTotal        *prometheus.Desc
 	neighborWarmDisconnectedTotal *prometheus.Desc
+	// #1748: reactive ntuple rebalance controller telemetry, per ifindex.
+	flowRebalanceRulesActive      *prometheus.Desc
+	flowRebalanceInstallsTotal    *prometheus.Desc
+	flowRebalanceDeletesTotal     *prometheus.Desc
+	flowRebalanceMovesSkippedTotal *prometheus.Desc
+	flowRebalanceWorkerByterateCoV *prometheus.Desc
 }
 
 func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
@@ -364,6 +370,11 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.fairnessEqualFlowWorkerSuppressedBPS
 	ch <- c.neighborWarmDropsTotal
 	ch <- c.neighborWarmDisconnectedTotal
+	ch <- c.flowRebalanceRulesActive
+	ch <- c.flowRebalanceInstallsTotal
+	ch <- c.flowRebalanceDeletesTotal
+	ch <- c.flowRebalanceMovesSkippedTotal
+	ch <- c.flowRebalanceWorkerByterateCoV
 }
 
 func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {

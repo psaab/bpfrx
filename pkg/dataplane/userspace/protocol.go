@@ -176,6 +176,19 @@ type ClassOfServiceSnapshot struct {
 	DSCPRewriteRules    []CoSDSCPRewriteRuleSnapshot    `json:"dscp_rewrite_rules,omitempty"`
 	Schedulers          []CoSSchedulerSnapshot          `json:"schedulers,omitempty"`
 	SchedulerMaps       []CoSSchedulerMapSnapshot       `json:"scheduler_maps,omitempty"`
+	// FlowRebalance is the #1748 opt-in reactive ntuple rebalance config.
+	// Omitted => the userspace-dp controller is never constructed. JSON tag
+	// MUST match the Rust serde rename(...) exactly — the wire format is the
+	// contract.
+	FlowRebalance *CoSFlowRebalanceSnapshot `json:"flow_rebalance,omitempty"`
+}
+
+// CoSFlowRebalanceSnapshot mirrors config.CoSFlowRebalance over the wire.
+// Zero sub-fields tell the Rust controller to use its built-in defaults.
+type CoSFlowRebalanceSnapshot struct {
+	ImbalanceThresholdPercent uint32 `json:"imbalance_threshold_percent,omitempty"`
+	RebalanceIntervalSecs     uint32 `json:"rebalance_interval_secs,omitempty"`
+	MaxRules                  uint32 `json:"max_rules,omitempty"`
 }
 
 type CoSForwardingClassSnapshot struct {
@@ -617,6 +630,20 @@ type ProcessStatus struct {
 	// warmer worker thread died (fatal — warming disabled until restart).
 	NeighborWarmDropsTotal        uint64 `json:"neighbor_warm_drops_total,omitempty"`
 	NeighborWarmDisconnectedTotal uint64 `json:"neighbor_warm_disconnected_total,omitempty"`
+	// #1748: per-interface reactive ntuple rebalance controller telemetry.
+	// Empty when the knob is off. JSON tag MUST match the Rust serde
+	// rename("flow_rebalance").
+	FlowRebalance []FlowRebalanceStatus `json:"flow_rebalance,omitempty"`
+}
+
+// FlowRebalanceStatus mirrors the Rust protocol::FlowRebalanceStatus row.
+type FlowRebalanceStatus struct {
+	Ifindex           int               `json:"ifindex,omitempty"`
+	RulesActive       uint32            `json:"rules_active,omitempty"`
+	InstallsTotal     uint64            `json:"installs_total,omitempty"`
+	DeletesTotal      uint64            `json:"deletes_total,omitempty"`
+	MovesSkipped      map[string]uint64 `json:"moves_skipped,omitempty"`
+	WorkerByterateCoV float64           `json:"worker_byterate_cov,omitempty"`
 }
 
 // MarshalJSON intentionally uses a value receiver so both ProcessStatus values

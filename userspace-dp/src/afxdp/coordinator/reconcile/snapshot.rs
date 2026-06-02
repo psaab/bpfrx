@@ -50,6 +50,18 @@ pub(super) fn apply_snapshot(
         fib_generation: snapshot.fib_generation,
     };
     coord.policy_counters.reconcile_rules(&snapshot.policies);
+    // #1748: reconcile the opt-in rebalance knob. Translate the wire snapshot
+    // into the controller's RebalanceConfig (filling zero sub-fields with the
+    // controller defaults). When the knob transitions to absent/disabled, tear
+    // down every live controller (reverse-barriering still-live moves) so no
+    // orphan HW rules survive a config change.
+    let new_rebalance_config = snapshot
+        .class_of_service
+        .as_ref()
+        .and_then(|cos| cos.flow_rebalance)
+        .map(super::super::rebalance::rebalance_config_from_snapshot)
+        .filter(|cfg| cfg.is_enabled());
+    coord.reconcile_rebalance_config(new_rebalance_config);
     coord.forwarding = new_forwarding;
     coord.shared_validation.store(Arc::new(coord.validation));
     coord

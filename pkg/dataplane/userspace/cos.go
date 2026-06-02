@@ -11,7 +11,7 @@ func buildClassOfServiceSnapshot(cfg *config.Config) *ClassOfServiceSnapshot {
 		return nil
 	}
 	cos := cfg.ClassOfService
-	if len(cos.ForwardingClasses) == 0 && len(cos.DSCPClassifiers) == 0 && len(cos.IEEE8021Classifiers) == 0 && len(cos.DSCPRewriteRules) == 0 && len(cos.Schedulers) == 0 && len(cos.SchedulerMaps) == 0 && len(cos.Interfaces) == 0 {
+	if len(cos.ForwardingClasses) == 0 && len(cos.DSCPClassifiers) == 0 && len(cos.IEEE8021Classifiers) == 0 && len(cos.DSCPRewriteRules) == 0 && len(cos.Schedulers) == 0 && len(cos.SchedulerMaps) == 0 && len(cos.Interfaces) == 0 && cos.FlowRebalance == nil {
 		return nil
 	}
 	snap := &ClassOfServiceSnapshot{}
@@ -171,6 +171,17 @@ func buildClassOfServiceSnapshot(cfg *config.Config) *ClassOfServiceSnapshot {
 				})
 			}
 			snap.SchedulerMaps = append(snap.SchedulerMaps, mapSnap)
+		}
+	}
+
+	// #1748: forward the opt-in rebalance knob. Presence (even all-zero
+	// sub-fields) enables the userspace-dp controller; the Rust side fills
+	// zeros with its defaults.
+	if cos.FlowRebalance != nil {
+		snap.FlowRebalance = &CoSFlowRebalanceSnapshot{
+			ImbalanceThresholdPercent: cos.FlowRebalance.ImbalanceThresholdPercent,
+			RebalanceIntervalSecs:     cos.FlowRebalance.RebalanceIntervalSecs,
+			MaxRules:                  cos.FlowRebalance.MaxRules,
 		}
 	}
 

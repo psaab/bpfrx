@@ -40,6 +40,49 @@ func (c *xpfCollector) collectUserspaceStatus(ch chan<- prometheus.Metric, dp ap
 	c.emitFairnessRSSGauges(ch, status)
 	c.emitFairnessThroughputGauges(ch, status)
 	c.emitNeighborWarmCounters(ch, status)
+	c.emitFlowRebalanceMetrics(ch, status)
+}
+
+// emitFlowRebalanceMetrics exposes the #1748 reactive ntuple rebalance
+// controller telemetry per ifindex. Empty when the knob is off (no series
+// emitted), so the default-OFF path produces no rebalance metrics.
+func (c *xpfCollector) emitFlowRebalanceMetrics(ch chan<- prometheus.Metric, status dpuserspace.ProcessStatus) {
+	for _, r := range status.FlowRebalance {
+		ifindex := strconv.Itoa(r.Ifindex)
+		ch <- prometheus.MustNewConstMetric(
+			c.flowRebalanceRulesActive,
+			prometheus.GaugeValue,
+			float64(r.RulesActive),
+			ifindex,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			c.flowRebalanceInstallsTotal,
+			prometheus.CounterValue,
+			float64(r.InstallsTotal),
+			ifindex,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			c.flowRebalanceDeletesTotal,
+			prometheus.CounterValue,
+			float64(r.DeletesTotal),
+			ifindex,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			c.flowRebalanceWorkerByterateCoV,
+			prometheus.GaugeValue,
+			r.WorkerByterateCoV,
+			ifindex,
+		)
+		for reason, count := range r.MovesSkipped {
+			ch <- prometheus.MustNewConstMetric(
+				c.flowRebalanceMovesSkippedTotal,
+				prometheus.CounterValue,
+				float64(count),
+				ifindex,
+				reason,
+			)
+		}
+	}
 }
 
 // emitNeighborWarmCounters exposes the #1636 proactive-neighbor-warm
