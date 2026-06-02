@@ -41,3 +41,8 @@ Continuations fetch by id (Codex loses session state >30min).
 - Codex: /tmp/codex-1748-r5.txt, bash bg `bd3w287b2` — PLAN-NEEDS-MAJOR (r4 findings CLOSED; new: teardown of live move not barriered -> leak)
 - AGY: adversarial-review-mpwqzh2x-p37bkx — PLAN-READY
 - Claude-SMR: PLAN-READY concur-with-Codex (teardown barrier real; folded to v6)
+
+## Plan review round 6 (plan v6 @ a37206bfa)
+- Codex: /tmp/codex-1748-r6.txt, bash bg `b8px03pgf` — pending (transition-set completeness: second-move, rule-cap eviction, failover-mid-move)
+- AGY: pending
+- Claude-SMR: PLAN-READY (transition set {install,rollback,teardown,dead} appears complete; second-move + eviction are instances of the same barrier principle)
