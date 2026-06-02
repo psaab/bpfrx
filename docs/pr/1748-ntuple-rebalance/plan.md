@@ -1,7 +1,22 @@
 # #1748 Step 1 — reactive cross-worker ntuple rebalance controller (forward-direction, default-OFF)
 
-- **Status**: DRAFT v1 — pending adversarial plan review
+- **Status**: DRAFT v2 — round-1 NEEDS-MAJOR addressed, pending re-review
 - **Issue**: #1748
+
+### Round-1 review outcome (verdict: PLAN-NEEDS-MAJOR)
+AGY found a **verified correctness kill** that v1 missed (and that R1's 70s
+spike was too short to expose): the **stale-owner GC cascade**. When the
+controller steers flow F off W_old, W_old keeps F's forward entry with
+`origin=ForwardFlow` (NOT peer-synced — confirmed `session/entry.rs:78`). When
+that frozen entry ages out, `expire_stale_entries` (`session/mod.rs:431`) takes
+the `!is_peer_synced() && !is_transient_local_seed()` branch → pushes a
+`SessionDeltaKind::Close` → which deletes the **shared** session map entry and
+broadcasts `DeleteSynced` to all workers including W_new — **killing the flow
+now active on W_new**. Claude-SMR independently flagged a narrower
+session-replication-eligibility gap (NEEDS-MINOR) and v2 folds both. Codex
+cleared control-socket + scope (its full verdict was lost to an output-capture
+glitch; it re-attacks v2 fresh). v1's claim "no migration code needed; stale
+copy ages out silently" was **wrong** and is corrected in §3/§4.5.
 - **Branch**: `engineer/1748-ntuple-rebalance`
 - **Predecessors**: converged research plan (`research-plan.md`); R1 spike PASS
   (`r1-spike-findings.md`: CoV 16.8%→2.3–4.2%, aggregate preserved, established-
@@ -41,7 +56,16 @@ that does that move automatically.
   (`poll_descriptor/mod.rs:1267`/`:1480`); the active-node packet path gates
   forwarding on owner-RG-active, never on which worker owns the session
   (`forwarding/mod.rs:541`, `session_glue/mod.rs:137`). So a flow steered to a
-  new RX queue forwards correctly with no migration code.
+  new RX queue **forwards** correctly — BUT (round-1 correction) the move is NOT
+  free of state work: W_old's now-stale `ForwardFlow` entry must be explicitly
+  demoted so its GC expiry does not cascade-delete the live flow (§4.5).
+- **Origin-aware deletion plumbing already exists**: both
+  `delete_session_map_entry_for_removed_session_with_origin(...)` and
+  `delete_session_map_redirect_for_session(...)`
+  (`worker/loop_body/mod.rs:660-687`) already take `origin`, and
+  `bpf_map/mod.rs:3 uses_kernel_local_session_map_entry()` already distinguishes
+  local vs shared entries by origin — so the §4.5 fix extends an existing
+  origin-gated path, not a new subsystem.
 - **Occupancy telemetry**: `coordinator/status.rs:195-206` already aggregates
   per-`(ifindex, queue_id, worker_id)` active-flow counts; per-worker
   `tx_bytes: AtomicU64` (`umem/mod.rs:387`) supplies byte-rate.
@@ -91,6 +115,55 @@ cadence (NOT per-packet, NOT per-poll — gated to ≤1 decision/dwell-interval)
 
 Bounded churn: at most one install per `rebalance_interval` (default ≥1 s),
 hard cap `max_rules` (≪1024) with graceful RSS fallback for the rest.
+
+**Round-1 refinements to the selection/eligibility logic:**
+- **Move-eligibility gate (SMR)**: a flow is eligible only if (a) age >
+  `session-sync interval + margin` AND (b) the target worker already holds a
+  peer-synced replica (`is_peer_synced()` present). This guarantees the target
+  worker's flow-cache miss resolves to the EXISTING session/NAT binding, never
+  the `*_on_session_miss` NAT-realloc family (`forwarding/mod.rs:1026-1164`).
+- **One move per tick (AGY)** — never move >1 flow per `rebalance_interval`, to
+  bound the R3 reorder (the R1 7601-retrans burst was 12 simultaneous moves).
+- **Magnitude guard against thrash (AGY)**: abort the move unless the chosen
+  flow's byte-rate ≤ (source_worker_rate − dest_worker_rate); i.e. moving it
+  must not make the destination the new hottest worker. Plus a per-flow
+  `cooldown` ≥ several intervals and an ε-band (move only if projected
+  byte-rate CoV improves by > ε). Stop condition: "no single eligible move
+  reduces byte-rate CoV by > ε" — terminates (finite flows, monotone objective
+  under the ε-band), cannot oscillate.
+
+### 4.5 Move protocol — origin demotion (the round-1 must-fix)
+A move is a 3-step coordinator sequence, NOT just a rule install:
+1. **Demote on W_old (before the rule):** send a new
+   `WorkerCommand::DemoteRebalanced{key}` to the worker that currently owns F's
+   forward entry, setting its `origin` to a **new `SessionOrigin::RebalancedOut`
+   variant**. Doing this *before* the ntuple rule means even a racing GC tick
+   sees the safe origin.
+2. **`RebalancedOut` GC semantics:** on expiry, `expire_stale_entries` removes
+   ONLY the local `SessionTable` entry — it must **suppress** the `Close` delta
+   (`session/mod.rs:431` condition gains `&& !origin.is_rebalanced_out()`),
+   **suppress** the shared session-map delete
+   (`delete_session_map_entry_for_removed_session_with_origin` /
+   `delete_session_map_redirect_for_session` skip the shared-map op for
+   `RebalancedOut`, mirroring how `uses_kernel_local_session_map_entry`
+   already gates local vs shared), **suppress** the `DeleteSynced`
+   broadcast, AND **suppress the SNAT release**
+   (`release_source_nat_allocation`, `worker/loop_body/mod.rs:670`) — verified
+   hazard: it calls `pool_allocator.release_flow(flow, translated)` keyed by the
+   flow 5-tuple, ungated by origin, so W_old's early expiry would free the SNAT
+   port while W_new's live flow still uses it (the port could then be reassigned
+   to a new flow → collision/break). For `RebalancedOut`, skip the release; W_new
+   (the surviving owner of the same flow + same translation) releases it on its
+   own eventual close. W_new owns the shared entry now and refreshes it from
+   ingress.
+3. **Install the ntuple rule** (forward 5-tuple → W_new's queue) via
+   `SIOCETHTOOL`. W_new's replica (`WorkerLocalImport`, peer-synced) keeps the
+   flow alive and its `last_seen_ns` advances with the arriving packets.
+
+On rule removal / flow close / disable: delete the ntuple rule; the flow
+re-hashes back to RSS naturally (W_new's entry is already the authoritative
+shared one, no further demotion needed). `RebalancedOut` is a local-only,
+delta-suppressed origin — it never participates in HA promotion or sync.
 
 ### 4.3 Config knob (default-OFF)
 `pkg/config/schema.go` typed leaf under `class-of-service` (or `chassis`/
@@ -148,11 +221,19 @@ schema leaf + one control-message field (additive, default zero).
 - Full 1024-rule eviction policy refinement (R5) beyond a simple budget+cooldown.
 
 ## 10. Open questions for adversarial review (each invitable to PLAN-KILL)
-1. **R4 correctness**: does re-pinning ONLY the forward 5-tuple on ONLY the
-   active node break reverse-companion resolution or session-sync on the peer?
-   Research §0 says replicas exist on all workers so forwarding is fine — find a
-   packet-path or sync site that gates on the *specific* worker and breaks. If
-   one exists, KILL (HA can't be deferred).
+0. **(v2) Does `RebalancedOut` fully close the GC cascade?** v2 suppresses FOUR
+   sites on W_old's stale-entry expiry: Close delta, shared session-map delete,
+   `DeleteSynced` broadcast, and SNAT release (all verified as real hazards).
+   Re-attack: is there any OTHER GC/sync site that acts on W_old's expiring
+   entry and touches shared state W_new depends on — conntrack-map mirror delete
+   (`conntrack_v4_fd`/`conntrack_v6_fd` in
+   `delete_session_map_entry_for_removed_session_with_origin`), alias/redirect
+   cleanup, flow-cache invalidation broadcast, or the reverse-companion entry?
+   Name it with a quoted line or confirm the four-point set is complete.
+1. **R4 correctness**: with §4.5 demotion in place, does re-pinning ONLY the
+   forward 5-tuple on ONLY the active node still break reverse-companion
+   resolution or peer session-sync? Find a residual per-worker gate. (v1 KILL
+   risk now addressed by §4.5 — re-attack it.)
 2. **R3 transient**: is the per-move reorder bounded enough to avoid TCP resets
    under incremental single-flow moves, or does even one move risk a reset?
 3. **`ethtool_rxnfc` UAPI**: is the struct/union layout correct across the
