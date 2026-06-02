@@ -58,3 +58,10 @@ Continuations fetch by id (Codex loses session state >30min).
 - AGY: (job id below) — pending
 - Copilot: triggered on PR #1749
 - Claude-SMR: pending (hostile diff read)
+
+## CODE review round 1 (PR #1749 @ a5621aa12) — MERGE-NEEDS-MAJOR
+- Codex: /tmp/codex-1748-code-r1.txt, bash bg `b2cov2wgl` — 7 findings (#1 mask REFUTED by hardware readback; #2-#7 real)
+- AGY: adversarial-review-mpwt5rpk-w9trzi — teardown bug (confirms #2) + startup-reconcile minor
+- Copilot: COMMENTED — cumulative-bytes-as-rate (#8 new) + confirms #2
+- Claude-SMR: MERGE-READY-pending; verified core + refuted #1 empirically on mlx5
+- Fixes dispatched to impl agent (8 real + minor); #1 stays as-is
