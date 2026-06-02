@@ -31,3 +31,8 @@ Continuations fetch by id (Codex loses session state >30min).
 - Codex: /tmp/codex-1748-r4.txt, bash bg `bgiy46xot` — PLAN-NEEDS-MAJOR (TTL race: promote near-expiry replica -> GC removes sole owner; rollback order unsafe; ack must be {seq,key,origin,result})
 - AGY: adversarial-review-mpwqtig4-0q0vg7 — PLAN-READY (### Verdict: PLAN-NEEDS-MINOR)
 - Claude-SMR: PLAN-READY concur-with-Codex (both r4 findings real; folded to v5)
+
+## Plan review round 5 (plan v5 @ 929dbd403)
+- Codex: /tmp/codex-1748-r5.txt, bash bg `bd3w287b2` — pending (verify liveness-refresh + reverse-barrier rollback close r4)
+- AGY: adversarial-review-mpwqzh2x-p37bkx — pending
+- Claude-SMR: PLAN-READY (liveness-refresh kills the near-expiry race; reverse-barrier rollback is the correct order)
