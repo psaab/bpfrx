@@ -945,9 +945,10 @@ fn equal_flow_active_sample_is_sticky_max_within_epoch() {
     assert_eq!(slot_count, 10, "sticky-max must keep the high count");
 }
 
-/// #1745 critical race: a stale acquirer (snapshotted an older epoch tag)
-/// must NEVER write its tag backwards over a slot the rotation already
-/// advanced to a newer epoch.
+/// #1745 critical race: a stale acquirer (snapshotted a different epoch
+/// tag) must NEVER write its tag over a slot the rotation already advanced
+/// to a different epoch. The helper matches on tag EQUALITY, so any
+/// mismatch (forward, backward, OR wrapped) no-ops.
 #[test]
 fn equal_flow_active_sample_never_writes_tag_backwards() {
     let lease = new_equal_flow_lease();
@@ -962,6 +963,35 @@ fn equal_flow_active_sample_never_writes_tag_backwards() {
         PackedEpochGrant::unpack(v8.worker_equal_flow_active_samples[0].0.load(Ordering::Acquire));
     assert_eq!(slot_tag, 5, "stale acquirer must not write tag backwards");
     assert_eq!(slot_count, 0, "stale acquirer must not corrupt the count");
+}
+
+/// #1745 / Codex code-review HIGH: the u32 epoch tag wraps every ~9.94
+/// days at the 200µs epoch. A stale acquirer holding `my_tag = u32::MAX`
+/// racing a rotation that reset the slot to the freshly-wrapped epoch
+/// `(0, 0)` must NOT write its wrapped-old tag backwards. Equality
+/// matching makes `0 != u32::MAX` a clean no-op; a relational
+/// `curr_tag > my_tag` check would have failed (`0 > u32::MAX == false`)
+/// and corrupted the fresh epoch-0 slot.
+#[test]
+fn equal_flow_active_sample_safe_across_tag_wrap() {
+    let lease = new_equal_flow_lease();
+    let v8 = lease.v8.as_ref().expect("v8 lease");
+    // Rotation has just wrapped: slot freshly reset to epoch tag 0.
+    v8.worker_equal_flow_active_samples[0]
+        .0
+        .store(PackedEpochGrant::pack(0, 0), Ordering::Release);
+    // A stale acquirer from the pre-wrap epoch (my_tag = u32::MAX) records.
+    record_equal_flow_active_sample(&v8.worker_equal_flow_active_samples[0], u32::MAX, 99);
+    let (slot_tag, slot_count) =
+        PackedEpochGrant::unpack(v8.worker_equal_flow_active_samples[0].0.load(Ordering::Acquire));
+    assert_eq!(slot_tag, 0, "wrapped stale acquirer must not write tag backwards");
+    assert_eq!(slot_count, 0, "wrapped stale acquirer must not corrupt the count");
+    // And the legitimate epoch-0 acquirer still records normally.
+    record_equal_flow_active_sample(&v8.worker_equal_flow_active_samples[0], 0, 7);
+    let (slot_tag2, slot_count2) =
+        PackedEpochGrant::unpack(v8.worker_equal_flow_active_samples[0].0.load(Ordering::Acquire));
+    assert_eq!(slot_tag2, 0);
+    assert_eq!(slot_count2, 7, "fresh epoch-0 acquirer records its sample");
 }
 
 /// #1745: the default `CstructDefault` rate mode must never touch the

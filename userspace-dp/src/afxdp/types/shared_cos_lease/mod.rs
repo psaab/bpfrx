@@ -1729,28 +1729,35 @@ fn bump_epoch_event(pg: &PackedEpochGrant, my_tag: u32) {
 /// sample. Records `max(curr, active_flows)` for the current epoch tag.
 ///
 /// CRITICAL race safety: an acquirer snapshots `my_tag` from the seqlock
-/// before this call; a rotation may then advance the slot to a newer
-/// epoch. Tags are monotonically increasing per rotation
-/// (`new_tag = (seq>>1)+1`), so `curr_tag > my_tag` unambiguously means
-/// "rotation happened after our snapshot" — abort, never write a stale
-/// tag backwards over the rotation's fresh `(new_tag, 0)` slot. On
-/// `curr_tag < my_tag` (slot not yet swapped by this epoch's rotation, or
-/// we are the first writer) install the fresh sample; do NOT carry the
-/// prior epoch's count forward. Mirrors the tag discipline of
-/// `bump_epoch_event` / `worker_grant_bump`.
+/// before this call. The rotation winner installs the fresh `(new_tag, 0)`
+/// into every sample slot (the gated swap in `rotate_epoch_v8`) BEFORE it
+/// publishes the new epoch via the seqlock seq store, so by the time any
+/// acquirer observes `my_tag = N` the slot already carries tag `N`. The
+/// only writable case is therefore `curr_tag == my_tag`; on any mismatch
+/// we no-op.
+///
+/// The match is **tag EQUALITY, not ordering** — identical to the
+/// discipline of `bump_epoch_event` / `worker_grant_bump`. A relational
+/// `curr_tag > my_tag` check would be UNSAFE at the `u32` tag wrap (every
+/// ~9.94 days at the 200 µs epoch): a stale acquirer holding
+/// `my_tag = u32::MAX` racing a rotation that reset the slot to `(0, 0)`
+/// would see `0 > u32::MAX == false` and write its wrapped-old tag
+/// backwards over the fresh epoch (Codex code-review HIGH). Equality
+/// no-ops on the wrap mismatch exactly as it does on any other rotation,
+/// dropping at most one sample — the same tolerated, wrap-safe behaviour
+/// the sibling helpers already rely on.
 #[inline]
 fn record_equal_flow_active_sample(pg: &PackedEpochGrant, my_tag: u32, active_flows: u32) {
     loop {
         let curr = pg.0.load(Ordering::Acquire);
         let (curr_tag, curr_count) = PackedEpochGrant::unpack(curr);
-        if curr_tag > my_tag {
-            return; // rotation advanced past our epoch; never write backwards
+        if curr_tag != my_tag {
+            return; // rotation occurred (incl. tag wrap); drop this sample
         }
-        let new = if curr_tag == my_tag {
-            PackedEpochGrant::pack(my_tag, curr_count.max(active_flows))
-        } else {
-            PackedEpochGrant::pack(my_tag, active_flows)
-        };
+        if curr_count >= active_flows {
+            return; // already at or above the sticky-max; nothing to do
+        }
+        let new = PackedEpochGrant::pack(my_tag, active_flows);
         if pg
             .0
             .compare_exchange_weak(curr, new, Ordering::AcqRel, Ordering::Acquire)
