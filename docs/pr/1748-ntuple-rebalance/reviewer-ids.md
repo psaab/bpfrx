@@ -71,3 +71,9 @@ Continuations fetch by id (Codex loses session state >30min).
 - AGY: (job below) — pending
 - Copilot: re-triggered
 - spot-check: #2/#4/#5/#7/#8 verified in code by parent
+
+## CODE review round 2 (PR #1749 @ 6447c0e4f) — MERGE-NEEDS-MAJOR
+- Codex: /tmp/codex-1748-code-r2.txt, bash bg `bn7sigt5c` — 8 prior fixes HOLD; MAJOR+2min in second-move path (wrong old_worker; metric; ignored delete_rule fail)
+- AGY: adversarial-review-mpwu5ytx-b94ixo — MERGE-READY
+- Copilot: re-triggered
+- second-move fixes dispatched to impl agent
