@@ -1,6 +1,7 @@
 # #1748 Step 1 — reactive cross-worker ntuple rebalance controller (forward-direction, default-OFF)
 
-- **Status**: DRAFT v2 — round-1 NEEDS-MAJOR addressed, pending re-review
+- **Status**: DRAFT v3 — round-2 NEEDS-MAJOR addressed (two-origin ownership
+  transfer), pending round-3 re-review
 - **Issue**: #1748
 
 ### Round-1 review outcome (verdict: PLAN-NEEDS-MAJOR)
@@ -17,6 +18,22 @@ session-replication-eligibility gap (NEEDS-MINOR) and v2 folds both. Codex
 cleared control-socket + scope (its full verdict was lost to an output-capture
 glitch; it re-attacks v2 fresh). v1's claim "no migration code needed; stale
 copy ages out silently" was **wrong** and is corrected in §3/§4.5.
+
+### Round-2 review outcome (verdict: PLAN-NEEDS-MAJOR, all three)
+Codex + AGY + Claude-SMR all NEEDS-MAJOR, converged on the same design. v2's
+single-origin `RebalancedOut` demotion fixed *premature* cleanup but: (Codex #1/
+AGY) missed the **conntrack mirror delete** — `delete_session_map_entry_..._with_origin`
+deletes conntrack + redirect keys ungated by origin (`bpf_map/mod.rs:952,1032,1037`);
+(Codex #2) created a **never-cleanup leak** — W_new's replica is `WorkerLocalImport`
+(peer-synced) so *its* eventual real expiry is ALSO Close-suppressed → no worker
+owns shared-map/peer cleanup when the flow truly ends; (Codex #3) `RebalancedOut`
+leaks through `demote_owner_rg` (`session/mod.rs:1030,1039`),
+`refresh_owner_rgs` (`:32,80`), and peer export (`session_glue/mod.rs:420,436`).
+v3 resolves all three with a **two-origin ownership transfer** (§4.5).
+**Confirmed by reviewers:** ethtool ioctl direction correct + exact UAPI layout
+(AGY, §4.1); eligibility gate bypasses the NAT-miss path
+(`resolve_flow_session_decision`, `session_glue/mod.rs:886`); selection is
+mathematically convergent (cooldown + `≤ gap/2` + ε-band); scope coherent.
 - **Branch**: `engineer/1748-ntuple-rebalance`
 - **Predecessors**: converged research plan (`research-plan.md`); R1 spike PASS
   (`r1-spike-findings.md`: CoV 16.8%→2.3–4.2%, aggregate preserved, established-
@@ -97,6 +114,21 @@ Single `ioctl(fd, SIOCETHTOOL=0x8946, &ifreq{ifr_name, ifr_data:&rxnfc})`.
 Structured `errno` (e.g. `ENOSPC` at the 1024 cap, `EOPNOTSUPP` non-mlx5) — no
 text parsing. Programs the **local** node's interface only.
 
+**Exact UAPI layout (AGY-verified against kernel `ethtool.h`, x86-64) — assert
+at compile time:**
+- `struct ethtool_rx_flow_spec` = **168 B**: `flow_type` u32 @0; `h_u` union @4
+  (52 B); `h_ext` @56 (20 B); `m_u` union @76 (52 B); `m_ext` @128 (20 B); pad
+  @148 (4 B); `ring_cookie` u64 @152; `location` u32 @160; pad @164 (4 B).
+- `struct ethtool_rxnfc` = **192 B**: `cmd` u32 @0; `flow_type` u32 @4; `data`
+  u64 @8; `fs` @16 (168 B); `rule_cnt`/`rss_context` u32 @184; pad @188;
+  `rule_locs` `[u32;0]` flexible @192.
+- For TCP4: `flow_type=TCP_V4_FLOW(0x03)`, `h_u.tcp_ip4_spec{ip4src,ip4dst,
+  psrc,pdst}`, masks in `m_u` (0 = match, 0xff..= wildcard — kernel inverts),
+  `ring_cookie` = target queue index, `location = RX_CLS_LOC_ANY` to auto-assign.
+- `cmd = ETHTOOL_SRXCLSRLINS(0x32)` insert, `0x31` del, `0x30` getall.
+- `size_of::<EthtoolRxnfc>() == 192` and field-offset asserts gate the build; a
+  live insert→`GRXCLSRLALL`→read-back round-trip test validates wire semantics.
+
 ### 4.2 Controller loop (coordinator-level, low cadence)
 New `rebalance/controller.rs`, ticked from the existing coordinator status
 cadence (NOT per-packet, NOT per-poll — gated to ≤1 decision/dwell-interval):
@@ -132,38 +164,52 @@ hard cap `max_rules` (≪1024) with graceful RSS fallback for the rest.
   reduces byte-rate CoV by > ε" — terminates (finite flows, monotone objective
   under the ε-band), cannot oscillate.
 
-### 4.5 Move protocol — origin demotion (the round-1 must-fix)
-A move is a 3-step coordinator sequence, NOT just a rule install:
-1. **Demote on W_old (before the rule):** send a new
-   `WorkerCommand::DemoteRebalanced{key}` to the worker that currently owns F's
-   forward entry, setting its `origin` to a **new `SessionOrigin::RebalancedOut`
-   variant**. Doing this *before* the ntuple rule means even a racing GC tick
-   sees the safe origin.
-2. **`RebalancedOut` GC semantics:** on expiry, `expire_stale_entries` removes
-   ONLY the local `SessionTable` entry — it must **suppress** the `Close` delta
-   (`session/mod.rs:431` condition gains `&& !origin.is_rebalanced_out()`),
-   **suppress** the shared session-map delete
-   (`delete_session_map_entry_for_removed_session_with_origin` /
-   `delete_session_map_redirect_for_session` skip the shared-map op for
-   `RebalancedOut`, mirroring how `uses_kernel_local_session_map_entry`
-   already gates local vs shared), **suppress** the `DeleteSynced`
-   broadcast, AND **suppress the SNAT release**
-   (`release_source_nat_allocation`, `worker/loop_body/mod.rs:670`) — verified
-   hazard: it calls `pool_allocator.release_flow(flow, translated)` keyed by the
-   flow 5-tuple, ungated by origin, so W_old's early expiry would free the SNAT
-   port while W_new's live flow still uses it (the port could then be reassigned
-   to a new flow → collision/break). For `RebalancedOut`, skip the release; W_new
-   (the surviving owner of the same flow + same translation) releases it on its
-   own eventual close. W_new owns the shared entry now and refreshes it from
-   ingress.
-3. **Install the ntuple rule** (forward 5-tuple → W_new's queue) via
-   `SIOCETHTOOL`. W_new's replica (`WorkerLocalImport`, peer-synced) keeps the
-   flow alive and its `last_seen_ns` advances with the arriving packets.
+### 4.5 Move protocol — two-origin ownership transfer (round-2 must-fix)
+A move is a genuine **ownership transfer** W_old → W_new. Two new
+`SessionOrigin` variants make the handoff correct:
+- **`RebalancedOut`** — the abandoned copy on W_old. Suppress-everything: never
+  cleans up shared state, never exports/syncs/promotes; ages out local-only.
+- **`RebalancedOwner`** — the promoted owner on W_new. Behaves like `ForwardFlow`
+  for cleanup/export/sync (emits Close on REAL expiry, deletes shared map +
+  conntrack, broadcasts `DeleteSynced`, releases SNAT) — so exactly one worker
+  owns end-of-flow cleanup. `is_peer_synced()` stays false for it (it is a
+  local owner, not an import) so it is NOT Close-suppressed.
+
+Coordinator sequence (one move per `rebalance_interval`):
+1. **Eligibility**: flow age > `session-sync interval + margin` AND a fresh
+   target-worker replica-present ack (W_new holds the materialized synced
+   replica — `resolve_flow_session_decision`, `session_glue/mod.rs:886` — so the
+   first steered packet hits it and bypasses the `*_on_session_miss` NAT-realloc
+   family). Magnitude `≤ gap/2`, cooldown clear, projected CoV gain `> ε`.
+2. **Promote W_new (before the rule):** `WorkerCommand::PromoteRebalanced{key}`
+   sets W_new's existing replica `origin = RebalancedOwner` — **tag flip only,
+   no NAT reallocation, no republish**. W_new is now the single cleanup owner.
+3. **Demote W_old (before the rule):** `WorkerCommand::DemoteRebalanced{key}`
+   sets W_old's forward entry `origin = RebalancedOut`. Doing both demote+promote
+   before the rule means a racing GC tick on either side sees safe origins.
+4. **Install the ntuple rule** (forward 5-tuple → W_new's queue) via
+   `SIOCETHTOOL`. W_new's `RebalancedOwner` entry's `last_seen_ns` advances with
+   the arriving packets; W_old's `RebalancedOut` entry freezes and ages out.
+
+**`RebalancedOut` GC/HA suppression — the complete set (all code-verified):**
+- **Close delta**: `session/mod.rs:431` gains `&& !origin.is_rebalanced_out()`.
+- **Shared session-map redirect + conntrack delete**: early-return guard at the
+  top of `delete_session_map_entry_for_removed_session_with_origin`
+  (`bpf_map/mod.rs`) — `if origin == RebalancedOut { return; }` (AGY's surgical
+  fix; covers both the redirect-key delete `:952` AND the conntrack delete
+  `:1032/:1037` in one guard, since W_new owns those entries now).
+- **`DeleteSynced` broadcast**: gated off for `RebalancedOut`.
+- **SNAT release**: `release_source_nat_allocation` (`worker/loop_body/mod.rs:670`)
+  skipped for `RebalancedOut` (W_new releases it on its own close).
+- **HA/export path exclusions**: `demote_owner_rg` (`session/mod.rs:1030,1039`)
+  must NOT rewrite `RebalancedOut`→`SyncImport`; `refresh_owner_rgs`
+  (`:32,80`) must NOT republish it; peer export (`session_glue/mod.rs:420,436`)
+  must NOT emit an Open delta for it.
 
 On rule removal / flow close / disable: delete the ntuple rule; the flow
-re-hashes back to RSS naturally (W_new's entry is already the authoritative
-shared one, no further demotion needed). `RebalancedOut` is a local-only,
-delta-suppressed origin — it never participates in HA promotion or sync.
+re-hashes back to RSS naturally (W_new's `RebalancedOwner` entry is the
+authoritative owner). On **failover**, the standby has no rules → RSS fallback
+(correct; fairness re-converges) — documented in operator docs.
 
 ### 4.3 Config knob (default-OFF)
 `pkg/config/schema.go` typed leaf under `class-of-service` (or `chassis`/
