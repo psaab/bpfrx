@@ -92,6 +92,16 @@ pub struct Coordinator {
     /// cumulative bytes. Keyed by the flow's SessionKey.
     pub(in crate::afxdp) rebalance_last_flow_bytes:
         std::collections::HashMap<crate::session::SessionKey, (u64, u64)>,
+    /// #1748 live BUG #1: monotonic ns of the last rebalance EVALUATION.
+    /// tick_rebalance is invoked at the ~24/s status-poll cadence, but the
+    /// per-flow byte-rate signal (observed_bytes from the flow-worker map) only
+    /// refreshes ~every 65ms/65k-packets, so sampling every ~42ms yields a
+    /// near-zero/noisy per-flow rate -> the projected-CoV improvement never
+    /// clears the epsilon band and NO move is ever made. We therefore only
+    /// SAMPLE byte-rates + run the controller tick once per rebalance_interval
+    /// (>= 1s), so the rate window spans the interval and is stable. 0 = never
+    /// evaluated yet (the first tick evaluates).
+    pub(in crate::afxdp) rebalance_last_eval_ns: u64,
 }
 
 impl Coordinator {
@@ -131,6 +141,7 @@ impl Coordinator {
             rebalance_sockets: BTreeMap::new(),
             rebalance_last_tx_bytes: BTreeMap::new(),
             rebalance_last_flow_bytes: std::collections::HashMap::new(),
+            rebalance_last_eval_ns: 0,
         }
     }
 
@@ -722,6 +733,13 @@ impl Coordinator {
         };
         self.policy_counters.reconcile_rules(&snapshot.policies);
         self.forwarding = new_forwarding;
+        // #1748 live BUG #2: reconcile the flow-rebalance knob on the SAME-PLAN
+        // live-commit path too. A flow-rebalance-only `commit` does not change
+        // the binding plan, so it routes here (not through apply_snapshot);
+        // without this call, enabling/disabling the knob was a no-op until a
+        // daemon restart. This is idempotent — if the config is unchanged,
+        // reconcile_rebalance_config sees no transition and does nothing.
+        self.reconcile_rebalance_from_snapshot(snapshot);
         if self.forwarding.fabrics.is_empty() && !preserved_fabrics.is_empty() {
             self.forwarding.fabrics = preserved_fabrics;
         } else if !preserved_fabrics.is_empty() {

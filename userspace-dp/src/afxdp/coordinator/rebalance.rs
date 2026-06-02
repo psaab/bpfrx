@@ -55,6 +55,28 @@ const REBALANCE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const REBALANCE_ACK_POLL: Duration = Duration::from_millis(2);
 
 impl super::Coordinator {
+    /// #1748 live BUG #2: translate a config snapshot's `class_of_service.
+    /// flow_rebalance` block into the controller config and reconcile. This is
+    /// the SINGLE entry point both snapshot-apply paths call so the knob is
+    /// honored on a live `commit` (same-plan `refresh_runtime_snapshot`) and at
+    /// boot / binding-plan-change (`apply_snapshot`) identically. Before this
+    /// fix, only `apply_snapshot` (the binding-plan-change / boot path) called
+    /// `reconcile_rebalance_config`, so a flow-rebalance-only commit — which is
+    /// `same_plan` and routes through `refresh_runtime_snapshot` — never
+    /// constructed or tore down the controller until a daemon restart.
+    pub(in crate::afxdp) fn reconcile_rebalance_from_snapshot(
+        &mut self,
+        snapshot: &crate::ConfigSnapshot,
+    ) {
+        let new_config = snapshot
+            .class_of_service
+            .as_ref()
+            .and_then(|cos| cos.flow_rebalance)
+            .map(rebalance_config_from_snapshot)
+            .filter(|cfg| cfg.is_enabled());
+        self.reconcile_rebalance_config(new_config);
+    }
+
     /// Reconcile the rebalance config on a snapshot apply. On disable, tear
     /// down every live controller first (reverse-barrier any still-live move,
     /// then delete its HW rule) so no orphan rule survives the config change.
@@ -63,6 +85,15 @@ impl super::Coordinator {
         new_config: Option<RebalanceConfig>,
     ) {
         let now_changed = self.rebalance_config != new_config;
+        // #1748 live BUG #2: this is now called on EVERY same-plan snapshot
+        // refresh (every commit), not just config changes, so it MUST be a
+        // no-op when the config is unchanged. Bail early — do not clear the
+        // sampling window (clearing it every commit would re-prime the
+        // baseline and stop a stable >= 1s rate window from ever forming,
+        // re-introducing the BUG #1 epsilon stall).
+        if !now_changed {
+            return;
+        }
         if new_config.is_none() && !self.rebalance_controllers.is_empty() {
             // Disabled: drain + tear down every controller.
             let ifindexes: Vec<i32> = self.rebalance_controllers.keys().copied().collect();
@@ -71,22 +102,21 @@ impl super::Coordinator {
             }
         }
         self.rebalance_config = new_config;
-        if now_changed {
-            // Config churn (threshold/interval/budget) rebuilds controllers
-            // lazily on the next tick with the new config; tear the old ones
-            // down so they pick up the new budget/threshold cleanly.
-            if new_config.is_some() && !self.rebalance_controllers.is_empty() {
-                let ifindexes: Vec<i32> =
-                    self.rebalance_controllers.keys().copied().collect();
-                for ifindex in ifindexes {
-                    self.teardown_rebalance_controller(ifindex);
-                }
+        // Config churn (threshold/interval/budget) rebuilds controllers lazily
+        // on the next tick with the new config; tear the old ones down so they
+        // pick up the new budget/threshold cleanly.
+        if new_config.is_some() && !self.rebalance_controllers.is_empty() {
+            let ifindexes: Vec<i32> = self.rebalance_controllers.keys().copied().collect();
+            for ifindex in ifindexes {
+                self.teardown_rebalance_controller(ifindex);
             }
         }
         // Reset the byte-rate sampling window so the first tick after a config
-        // change does not see a bogus huge delta.
+        // change does not see a bogus huge delta, and re-arm the eval timer so
+        // a freshly-enabled controller evaluates on its next tick.
         self.rebalance_last_tx_bytes.clear();
         self.rebalance_last_flow_bytes.clear();
+        self.rebalance_last_eval_ns = 0;
     }
 
     /// Tear down one interface's controller: reverse-barrier its live moves,
@@ -137,6 +167,7 @@ impl super::Coordinator {
         self.rebalance_sockets.clear();
         self.rebalance_last_tx_bytes.clear();
         self.rebalance_last_flow_bytes.clear();
+        self.rebalance_last_eval_ns = 0;
     }
 
     /// Drive one controller tick at the status cadence. Default-OFF fast path:
@@ -150,6 +181,26 @@ impl super::Coordinator {
         };
         let now_ns = monotonic_nanos();
         let now_secs = now_ns / 1_000_000_000;
+
+        // #1748 live BUG #1: evaluate at the rebalance_interval cadence, NOT
+        // every status-poll tick (~24/s). The per-flow byte-rate signal
+        // (observed_bytes from the flow-worker map) only refreshes
+        // ~every 65ms/65k-packets, so sampling every ~42ms saw a stale
+        // snapshot -> per-flow rate delta ~0 -> projected CoV improvement
+        // below epsilon -> EVERY candidate skipped as "epsilon" and no move
+        // was ever made (the live CoV gate observed installs_total=0 with the
+        // epsilon counter climbing ~24/s). Gating the SAMPLE here makes the
+        // rate window span the full rebalance_interval (>= 1s), which is
+        // stable and spans several snapshot refreshes. The first call primes
+        // the baseline sample (rate 0, no move) and arms the timer; the next
+        // call >= interval later computes a real rate.
+        let eval_interval_ns = config.rebalance_interval_secs.max(1) * 1_000_000_000;
+        if self.rebalance_last_eval_ns != 0
+            && now_ns.saturating_sub(self.rebalance_last_eval_ns) < eval_interval_ns
+        {
+            return;
+        }
+        self.rebalance_last_eval_ns = now_ns;
 
         // 1. Per-worker byte-rate over the window, grouped by the ifindex each
         //    worker's binding is bound to.

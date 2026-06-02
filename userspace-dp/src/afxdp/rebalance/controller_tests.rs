@@ -696,3 +696,83 @@ fn zero_rate_idle_flows_yield_no_move() {
     );
     assert!(!tx.calls.iter().any(|c| c.starts_with("install:")));
 }
+
+// ── #1748 live BUG #1: realistic CoV~0.3 vector must produce an install ──
+
+/// Regression guard for the live CoV-gate failure: on the loss cluster under
+/// `-P12 -p5210`, worker_byterate_cov sat at ~0.27-0.34 (clearly imbalanced)
+/// yet the controller skipped EVERY candidate as reason="epsilon" and made
+/// ZERO installs. Root cause was a noisy ~42ms rate window (fixed at the
+/// Coordinator sampling layer); this test is the controller-decision guard:
+/// given a realistic 6-worker byte-rate vector at CoV~0.3 with 12 flows of
+/// differing REAL rates, the controller MUST produce at least one install
+/// (a beneficial move that clears the epsilon band), not an epsilon-skip.
+#[test]
+fn realistic_imbalance_produces_an_install_not_epsilon_skip() {
+    // 6 workers, flow distribution ~[2,2,1,1,4,2] (the R1 baseline partition).
+    // 6 workers, flow distribution [2,2,2,1,3,2] — a 12-flow partition whose
+    // worker byte-rate CoV is ~0.29, in the live-observed ~0.3 band. Per-flow
+    // rate ≈1.4 GB/s (≈11.2 Gb/s); worker rates are the sum of their flows.
+    // Worker 4 (3 flows) is hottest; worker 3 (1 flow) is coolest.
+    let workers = vec![
+        worker(0, 2.80e9), // 2 flows
+        worker(1, 2.80e9), // 2 flows
+        worker(2, 2.80e9), // 2 flows
+        worker(3, 1.40e9), // 1 flow   <- coolest
+        worker(4, 4.20e9), // 3 flows  <- hottest
+        worker(5, 2.80e9), // 2 flows
+    ];
+    // Sanity: this vector is in the live-observed CoV band (~0.3).
+    let cov = byte_rate_cov(&workers);
+    assert!(
+        cov > 0.25 && cov < 0.40,
+        "fixture CoV {cov} must sit in the live-observed ~0.3 band"
+    );
+    // Imbalance ratio max/mean must exceed the 1.30 threshold.
+    let mean: f64 = workers.iter().map(|w| w.byte_rate).sum::<f64>() / workers.len() as f64;
+    let max = workers.iter().map(|w| w.byte_rate).fold(0.0_f64, f64::max);
+    assert!(max / mean > 1.30, "fixture must be over the imbalance threshold");
+
+    // 12 flows. Worker 4 carries 3 flows of 1.40e9 each. Moving one to the
+    // coolest worker 3 (1.40e9) yields a perfectly balanced [2.8;6] vector
+    // (CoV 0). The flow rate 1.40e9 == gap/2 where gap = 4.20e9 - 1.40e9 =
+    // 2.80e9, and the magnitude guard rejects only rate > gap/2, so it passes.
+    let flows = vec![
+        flow(2000, 0, 1.40e9), flow(2001, 0, 1.40e9),
+        flow(2002, 1, 1.40e9), flow(2003, 1, 1.40e9),
+        flow(2004, 2, 1.40e9), flow(2005, 2, 1.40e9),
+        flow(2006, 3, 1.40e9),
+        // worker 4: 3 flows summing to 4.20e9
+        flow(2007, 4, 1.40e9), flow(2008, 4, 1.40e9), flow(2009, 4, 1.40e9),
+        flow(2010, 5, 1.40e9), flow(2011, 5, 1.40e9),
+    ];
+
+    let mut c = test_controller(cfg());
+    let mut tx = MockTransport::good();
+    let input = RebalanceTickInput {
+        ifindex: 5,
+        workers,
+        flows,
+        now_secs: 10,
+    };
+    // Two ticks to clear the dwell (hysteresis), at 1s spacing.
+    c.tick(&input, &mut tx);
+    let input2 = RebalanceTickInput { now_secs: 11, ..input };
+    let outcome = c.tick(&input2, &mut tx);
+
+    assert!(
+        outcome.is_some(),
+        "a realistic CoV~0.3 imbalance MUST produce a move, not an epsilon-skip; \
+         skips={:?}", c.metrics().moves_skipped
+    );
+    assert_eq!(c.metrics().installs_total, 1, "exactly one install");
+    assert!(c.metrics().rules_active >= 1, "a rule is active after the move");
+    // The move sourced from the hottest worker (4).
+    let mv = outcome.unwrap();
+    assert_eq!(mv.old_worker, 4, "move sources from the hottest worker");
+    // The epsilon skip counter must NOT have fired on the committed tick.
+    let eps = c.metrics().moves_skipped.get(&SkipReason::Epsilon).copied().unwrap_or(0);
+    assert_eq!(eps, 0, "no epsilon skip when a clearly-beneficial move exists");
+    // And the projected post-move CoV is a real improvement over baseline.
+    assert!(cov > 0.25, "baseline CoV was the imbalanced ~0.3");
+}

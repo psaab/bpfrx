@@ -1865,3 +1865,129 @@ fn rebalance_plain_teardown_clears_both_maps_soundly() {
         "sockets cleared on plain teardown (no fd leak)"
     );
 }
+
+// #1748 live BUG #2: snapshot-apply reconcile transitions. A flow-rebalance
+// config delivered on a live snapshot must CONSTRUCT the controller (None ->
+// Some) and removing it must TEAR IT DOWN (Some -> None), via the shared
+// reconcile_rebalance_from_snapshot entry point that BOTH the boot path
+// (apply_snapshot) and the same-plan live-commit path (refresh_runtime_snapshot)
+// now call. Before the fix, the same-plan live path never reconciled the knob.
+#[test]
+fn reconcile_rebalance_from_snapshot_constructs_and_tears_down() {
+    let mut coordinator = Coordinator::new();
+
+    // None initially.
+    assert!(coordinator.rebalance_config.is_none(), "off by default");
+
+    // Snapshot WITH flow-rebalance enabled => config constructed.
+    let mut snap_on = crate::ConfigSnapshot::default();
+    snap_on.class_of_service = Some(crate::ClassOfServiceSnapshot {
+        flow_rebalance: Some(crate::protocol::CoSFlowRebalanceSnapshot {
+            imbalance_threshold_percent: 130,
+            rebalance_interval_secs: 1,
+            max_rules: 64,
+        }),
+        ..Default::default()
+    });
+    coordinator.reconcile_rebalance_from_snapshot(&snap_on);
+    assert!(
+        coordinator.rebalance_config.is_some(),
+        "enabling flow-rebalance via snapshot must set the config (None -> Some)"
+    );
+
+    // Re-applying the SAME config is a no-op (idempotent — must not churn).
+    let prev = coordinator.rebalance_config;
+    coordinator.reconcile_rebalance_from_snapshot(&snap_on);
+    assert_eq!(
+        coordinator.rebalance_config, prev,
+        "re-applying identical config is a no-op"
+    );
+
+    // Snapshot WITHOUT flow-rebalance (deleted) => config torn down to None.
+    let mut snap_off = crate::ConfigSnapshot::default();
+    snap_off.class_of_service = Some(crate::ClassOfServiceSnapshot::default());
+    coordinator.reconcile_rebalance_from_snapshot(&snap_off);
+    assert!(
+        coordinator.rebalance_config.is_none(),
+        "deleting flow-rebalance via snapshot must tear the config down (Some -> None)"
+    );
+    assert!(
+        coordinator.rebalance_controllers.is_empty(),
+        "controllers cleared on disable"
+    );
+    assert!(
+        coordinator.rebalance_sockets.is_empty(),
+        "sockets cleared on disable (no fd leak)"
+    );
+
+    // A disabled-threshold snapshot (<= 1.0) must also stay off.
+    let mut snap_invalid = crate::ConfigSnapshot::default();
+    snap_invalid.class_of_service = Some(crate::ClassOfServiceSnapshot {
+        flow_rebalance: Some(crate::protocol::CoSFlowRebalanceSnapshot {
+            imbalance_threshold_percent: 100, // 1.00x => is_enabled() false
+            rebalance_interval_secs: 1,
+            max_rules: 64,
+        }),
+        ..Default::default()
+    });
+    coordinator.reconcile_rebalance_from_snapshot(&snap_invalid);
+    assert!(
+        coordinator.rebalance_config.is_none(),
+        "a threshold of 1.00x must not enable the controller"
+    );
+}
+
+// #1748 live BUG #1: tick_rebalance must only EVALUATE at the rebalance_interval
+// cadence, not every ~24/s status-poll tick. Sampling the per-flow byte-rate
+// every ~42ms saw a stale flow-worker snapshot (rate ~0) and stalled at the
+// epsilon band. This test asserts the eval-cadence gate: back-to-back ticks
+// within the interval do NOT re-arm the eval timestamp; only a tick >= interval
+// later does. (No live workers, so no move is taken — we assert the gate's
+// timing bookkeeping, which is the part that controls the sampling window.)
+#[test]
+fn tick_rebalance_evaluates_at_interval_cadence_not_every_tick() {
+    let mut coordinator = Coordinator::new();
+    coordinator.rebalance_config = Some(
+        crate::afxdp::rebalance::RebalanceConfig {
+            imbalance_threshold: 1.30,
+            rebalance_interval_secs: 1,
+            max_rules: 64,
+        },
+    );
+    // No live workers => no per-iface sampling, but the eval-cadence gate runs
+    // first and updates rebalance_last_eval_ns on an admitted evaluation.
+    assert_eq!(coordinator.rebalance_last_eval_ns, 0, "not evaluated yet");
+
+    // First tick: admitted (last_eval == 0), arms the timer.
+    coordinator.tick_rebalance();
+    let first_eval = coordinator.rebalance_last_eval_ns;
+    assert!(first_eval > 0, "first tick evaluates and arms the timer");
+
+    // Immediate second tick (well under the 1s interval): MUST be gated out —
+    // the eval timestamp must not advance.
+    coordinator.tick_rebalance();
+    assert_eq!(
+        coordinator.rebalance_last_eval_ns, first_eval,
+        "a back-to-back tick within the interval must NOT re-evaluate (BUG #1 gate)"
+    );
+
+    // A tick after the interval has elapsed re-evaluates. Simulate elapsed time
+    // by backdating the last-eval stamp by > 1s.
+    coordinator.rebalance_last_eval_ns =
+        first_eval.saturating_sub(2 * 1_000_000_000);
+    let backdated = coordinator.rebalance_last_eval_ns;
+    coordinator.tick_rebalance();
+    assert!(
+        coordinator.rebalance_last_eval_ns > backdated,
+        "a tick >= interval after the last eval must re-evaluate"
+    );
+
+    // Default-OFF: with no config, tick is a pure no-op (timer never moves).
+    coordinator.rebalance_config = None;
+    let before = coordinator.rebalance_last_eval_ns;
+    coordinator.tick_rebalance();
+    assert_eq!(
+        coordinator.rebalance_last_eval_ns, before,
+        "default-OFF tick_rebalance is a no-op"
+    );
+}
