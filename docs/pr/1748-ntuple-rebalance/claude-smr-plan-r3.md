@@ -50,3 +50,14 @@ State this ordering+timing invariant explicitly; do not leave it implicit.
 
 Net: architecture is sound and now complete. Proceed to implement once Codex +
 AGY r3 concur, folding the single-tick ordering invariant into §4.5.
+
+---
+## SELF-CORRECTION (post Codex r3)
+My race analysis above was WRONG. I claimed "per-worker loop serialization"
+makes the promote/demote ordering safe — but that only serializes commands vs GC
+*within one worker*. The two commands go to TWO independent per-worker queues
+(`loop_body/mod.rs:591`), with no cross-worker ordering. Codex correctly showed
+W_old can demote before W_new promotes → a real zero-owner window. The fix is an
+applied-command barrier (ack between promote and demote), now in v4 §4.5. This
+is exactly the SMR-soft-pass → Codex-catches-real-race pattern the methodology
+guards against; recording it.

@@ -1,8 +1,19 @@
 # #1748 Step 1 — reactive cross-worker ntuple rebalance controller (forward-direction, default-OFF)
 
-- **Status**: DRAFT v3 — round-2 NEEDS-MAJOR addressed (two-origin ownership
-  transfer), pending round-3 re-review
+- **Status**: DRAFT v4 — round-3 NEEDS-MAJOR addressed (applied-command barrier
+  + dedicated origin-only promote), pending round-4 re-review
 - **Issue**: #1748
+
+### Round-3 review outcome (Codex NEEDS-MAJOR, AGY READY, SMR self-corrected)
+AGY r3 = PLAN-READY (verified the full suppression set + NAT-realloc avoidance +
+exhaustive-match detail). Codex r3 = NEEDS-MAJOR with a verified race the v3
+"single-tick" claim got wrong: worker command queues are independent per-worker
+async queues (`loop_body/mod.rs:591`), so W_old can demote before W_new promotes
+→ zero-owner window. Claude-SMR concurs and **self-corrects** (my r3 race
+analysis conflated per-worker loop serialization with cross-worker command
+ordering — there is none). v4 adds the applied-command **barrier** (§4.5,
+reusing `session_export_ack`) and a dedicated origin-only promote API (no Open
+delta — `update_session:843` would otherwise emit one).
 
 ### Round-1 review outcome (verdict: PLAN-NEEDS-MAJOR)
 AGY found a **verified correctness kill** that v1 missed (and that R1's 70s
@@ -206,23 +217,40 @@ Coordinator sequence (one move per `rebalance_interval`):
   (`:32,80`) must NOT republish it; peer export (`session_glue/mod.rs:420,436`)
   must NOT emit an Open delta for it.
 
-**Ordering + timing invariant (SMR r3 — required):** the controller MUST issue
-promote(W_new) → demote(W_old) → rule-install within a SINGLE rebalance tick,
-and `rebalance_interval` (and the move-sequence duration) MUST be ≪
-`SESSION_GC_INTERVAL_NS` so no GC sweep interleaves the transfer. Per-worker
-loop serialization (commands + `expire_stale_entries` run in the same
-single-threaded worker loop) then guarantees GC on W_old never observes a stale
-`ForwardFlow`, and there is always ≥1 owner (zero-owner impossible; transient
-two-owner is harmless — neither expires in the sub-tick window).
+**Applied-command barrier (Codex r3 — required; supersedes the v3 single-tick
+claim).** v3 wrongly assumed promote→demote ordering held; the worker command
+queues are **independent per-worker async queues** (each worker drains only its
+own `commands`, `loop_body/mod.rs:591`), so W_old could apply
+`DemoteRebalanced` *before* W_new applies `PromoteRebalanced` → a real
+**zero-owner window** (W_old `RebalancedOut`/suppressed, W_new still
+`WorkerLocalImport`/Close+export-suppressed). The move MUST therefore use an
+applied-command **barrier**, reusing the existing `session_export_ack`
+sequence pattern (`ha.rs:170-182`):
+1. Send `PromoteRebalanced{key}` to W_new; **block until W_new acks** the key is
+   `RebalancedOwner`.
+2. THEN send `DemoteRebalanced{key}` to W_old; **block until W_old acks** the key
+   is `RebalancedOut`.
+3. ONLY THEN install the ntuple rule.
+
+This guarantees W_new is the committed owner before W_old is demoted → there is
+always ≥1 cleanup owner; zero-owner is impossible. The barrier also bounds the
+transfer well under `SESSION_GC_INTERVAL_NS`. If any ack times out or the ioctl
+fails, roll back (W_new→replica, W_old→owner) — a racing GC during rollback sees
+exactly one owner (idempotent).
 
 **`RebalancedOwner` vs `RebalancedOut` get OPPOSITE HA treatment:**
 `RebalancedOut` is inert (excluded from demote/refresh/export). `RebalancedOwner`
 is a normal *local owner* — on a real RG failover it MUST demote to `SyncImport`
 like `ForwardFlow` (i.e. it participates in `demote_owner_rg`/export/sync
 normally; it is excluded only from the *rebalance* suppression, not from HA).
-The promote is a tag-flip on `origin` ONLY — no re-publish, no NAT re-resolve
-(a unit test asserts the SNAT allocation owner/refcount is unchanged across
-promote).
+The promote is a tag-flip on `origin` ONLY — no re-publish, no NAT re-resolve.
+**It must NOT reuse the generic `update_session` / `maybe_promote_synced_session`
+helpers (Codex r3):** `update_session:843` emits an Open delta whenever a
+peer-synced entry becomes non-peer-synced, and `promote.rs:99` republishes +
+shared-map-upserts + replicates. `PromoteRebalanced` needs a **dedicated
+origin-only mutation API** that flips `origin` in place and does nothing else.
+Unit tests assert: no delta pushed, no shared-map publish/upsert, no conntrack
+write, no NAT refcount change across the promote.
 
 On rule removal / flow close / disable: delete the ntuple rule; the flow
 re-hashes back to RSS naturally (W_new's `RebalancedOwner` entry is the

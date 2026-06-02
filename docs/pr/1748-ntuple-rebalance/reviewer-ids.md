@@ -16,3 +16,8 @@ Continuations fetch by id (Codex loses session state >30min).
 - Codex: foreground-isolated (CODEX_COMPANION_SESSION_ID=1748-plan-r3-*), output /tmp/codex-1748-r3.txt, bash bg id `baw2rokje` — pending
 - AGY: adversarial-review-mpwqkxjl-cy4m05 — pending
 - Claude-SMR: claude-smr-plan-r3.md — PLAN-READY (with single-tick ordering invariant folded into §4.5)
+
+## Plan review round 3 (plan v3 @ 0f52cc85b)
+- Codex: /tmp/codex-1748-r3.txt, bash bg `baw2rokje` — PLAN-NEEDS-MAJOR (async-queue zero-owner race; promote must not reuse update_session/maybe_promote_synced_session)
+- AGY: adversarial-review-mpwqkxjl-cy4m05 — PLAN-READY
+- Claude-SMR: claude-smr-plan-r3.md — was READY, SELF-CORRECTED to concur with Codex NEEDS-MAJOR
