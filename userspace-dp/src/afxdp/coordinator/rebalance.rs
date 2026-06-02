@@ -252,7 +252,7 @@ impl super::Coordinator {
 
     /// Snapshot the per-interface rebalance metrics for the Prometheus
     /// collector. Returns (ifindex, metrics) for every live controller.
-    pub fn rebalance_metrics(
+    pub(in crate::afxdp) fn rebalance_metrics(
         &self,
     ) -> Vec<(i32, crate::afxdp::rebalance::RebalanceMetrics)> {
         self.rebalance_controllers

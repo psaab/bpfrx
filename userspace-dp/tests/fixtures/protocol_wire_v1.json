@@ -714,6 +714,7 @@
     "fabrics": [],
     "filter_term_counters": [],
     "flow_cache_capacity": 0,
+    "flow_rebalance": [],
     "flow_worker_map": [],
     "flow_worker_map_truncated": false,
     "forwarding_armed": false,
