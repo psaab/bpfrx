@@ -11,3 +11,8 @@ Continuations fetch by id (Codex loses session state >30min).
 - Codex: foreground-isolated (CODEX_COMPANION_SESSION_ID=1748-plan-r2-*), output /tmp/codex-1748-r2.txt — PLAN-NEEDS-MAJOR (conntrack 5th site, no-close-owner leak, RebalancedOut HA/export leaks; ioctl direction CONFIRMED correct)
 - AGY: adversarial-review-mpwq7ctx-qc5xfm — pending
 - Claude-SMR: claude-smr-plan-r2.md — PLAN-NEEDS-MAJOR (concur)
+
+## Plan review round 3 (plan v3 @ 0f52cc85b)
+- Codex: foreground-isolated (CODEX_COMPANION_SESSION_ID=1748-plan-r3-*), output /tmp/codex-1748-r3.txt, bash bg id `baw2rokje` — pending
+- AGY: adversarial-review-mpwqkxjl-cy4m05 — pending
+- Claude-SMR: claude-smr-plan-r3.md — PLAN-READY (with single-tick ordering invariant folded into §4.5)

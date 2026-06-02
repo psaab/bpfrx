@@ -206,6 +206,24 @@ Coordinator sequence (one move per `rebalance_interval`):
   (`:32,80`) must NOT republish it; peer export (`session_glue/mod.rs:420,436`)
   must NOT emit an Open delta for it.
 
+**Ordering + timing invariant (SMR r3 — required):** the controller MUST issue
+promote(W_new) → demote(W_old) → rule-install within a SINGLE rebalance tick,
+and `rebalance_interval` (and the move-sequence duration) MUST be ≪
+`SESSION_GC_INTERVAL_NS` so no GC sweep interleaves the transfer. Per-worker
+loop serialization (commands + `expire_stale_entries` run in the same
+single-threaded worker loop) then guarantees GC on W_old never observes a stale
+`ForwardFlow`, and there is always ≥1 owner (zero-owner impossible; transient
+two-owner is harmless — neither expires in the sub-tick window).
+
+**`RebalancedOwner` vs `RebalancedOut` get OPPOSITE HA treatment:**
+`RebalancedOut` is inert (excluded from demote/refresh/export). `RebalancedOwner`
+is a normal *local owner* — on a real RG failover it MUST demote to `SyncImport`
+like `ForwardFlow` (i.e. it participates in `demote_owner_rg`/export/sync
+normally; it is excluded only from the *rebalance* suppression, not from HA).
+The promote is a tag-flip on `origin` ONLY — no re-publish, no NAT re-resolve
+(a unit test asserts the SNAT allocation owner/refcount is unchanged across
+promote).
+
 On rule removal / flow close / disable: delete the ntuple rule; the flow
 re-hashes back to RSS naturally (W_new's `RebalancedOwner` entry is the
 authoritative owner). On **failover**, the standby has no rules → RSS fallback
