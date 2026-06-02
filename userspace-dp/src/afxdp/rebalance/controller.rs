@@ -270,7 +270,7 @@ impl RebalanceController {
             return None;
         }
 
-        let Some(candidate) = self.select_move(input) else {
+        let Some(mut candidate) = self.select_move(input) else {
             // select_move records the precise skip reason.
             return None;
         };
@@ -291,21 +291,45 @@ impl RebalanceController {
             .position(|e| e.key == candidate.key);
         if let Some(idx) = prior_idx {
             let prior = self.ledger[idx].clone();
+            // #1748 review-r2 MAJOR: `old_worker` is the RSS-natural worker for
+            // the 5-tuple — the worker the flow lands on when NO rebalance rule
+            // exists. RSS is deterministic on the tuple, so this is INVARIANT
+            // across moves. On a second move `candidate.old_worker` is the prior
+            // W_new (the flow's *current* worker mid-move), NOT the RSS-natural
+            // worker. Carry the prior entry's `old_worker` forward so (a) the
+            // forward-barrier demote below targets the correct worker and (b)
+            // the replacement ledger entry records the RSS-natural worker, so a
+            // later teardown restores it (not the prior W_new).
+            candidate.old_worker = prior.old_worker;
             // Reverse barrier on the prior move: restore the prior W_old to
             // owner, delete the prior rule, demote the prior W_new to replica.
             // Gate the W_new demote on a successful restore ack (#1748 #4): if
             // the restore times out we must NOT demote the only owner.
-            if tx.restore_owner(prior.old_worker, &prior.key) {
-                let _ = tx.delete_rule(prior.loc);
-                tx.demote_replica(prior.new_worker, &prior.key);
-                self.metrics.deletes_total += 1;
-            } else {
+            if !tx.restore_owner(prior.old_worker, &prior.key) {
                 // Could not hand ownership back to the prior W_old. Abort the
                 // second move and leave the prior move intact (>= 1 owner is
                 // still the prior W_new). Do not append a second rule.
+                // #1748 review-r2 MINOR: this is a restore-ack failure — record
+                // RestoreFailed, matching the other three restore-fail sites.
+                self.metrics.record_skip(SkipReason::RestoreFailed);
+                return None;
+            }
+            // #1748 review-r2 MINOR: handle the prior-rule delete failure. If
+            // the delete fails we must NOT proceed to install a new rule for
+            // the same 5-tuple — that re-creates the duplicate-HW-rule hazard
+            // #6 fixed. Abort the move this tick and KEEP the prior ledger
+            // entry (the prior rule is still installed and still steering to
+            // the prior W_new). We restored W_old above, but restore_owner is
+            // an idempotent tag flip and the prior W_new is still
+            // RebalancedOwner, so >= 1 owner holds; the next tick retries the
+            // delete. Do NOT demote the prior W_new here (its rule still
+            // routes traffic to it).
+            if tx.delete_rule(prior.loc).is_err() {
                 self.metrics.record_skip(SkipReason::BarrierFailed);
                 return None;
             }
+            tx.demote_replica(prior.new_worker, &prior.key);
+            self.metrics.deletes_total += 1;
             self.ledger.remove(idx);
             self.metrics.rules_active = self.ledger.len() as u32;
         }

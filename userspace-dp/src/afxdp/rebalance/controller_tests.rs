@@ -39,6 +39,9 @@ struct MockTransport {
     /// When true, restore_owner returns false (simulates an ack timeout / key
     /// absent on W_old) so tests can exercise the gated reverse barrier.
     restore_fails: bool,
+    /// When true, delete_rule returns an error (simulates an ioctl failure) so
+    /// tests can exercise the second-move prior-rule delete-failure branch.
+    delete_fails: bool,
     /// Per-(worker,key) origin as the mock "session table" sees it, so tests
     /// can confirm there is always >= 1 owner across a rollback even when a
     /// flow has lived on more than one worker over a chain of moves.
@@ -108,6 +111,9 @@ impl BarrierTransport for MockTransport {
     }
     fn delete_rule(&mut self, loc: u32) -> std::io::Result<()> {
         self.calls.push(format!("delete:{loc}"));
+        if self.delete_fails {
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+        }
         Ok(())
     }
 }
@@ -445,7 +451,12 @@ fn second_move_chain_replaces_rule_and_reverse_barriers_prior_owner() {
     c.tick(&in2, &mut tx);
     let in2b = RebalanceTickInput { now_secs: 21, ..in2 };
     let mv2 = c.tick(&in2b, &mut tx).expect("second move");
-    assert_eq!(mv2.old_worker, 2, "second move sources from the prior new_worker");
+    // #1748 review-r2 MAJOR: old_worker is the RSS-natural worker for the
+    // tuple, INVARIANT across moves. Even though the flow currently sits on
+    // worker 2 (its prior new home), the second move's old_worker must be the
+    // ORIGINAL RSS-natural worker 0 — carried forward from the prior ledger
+    // entry — NOT the prior W_new (2).
+    assert_eq!(mv2.old_worker, 0, "second move old_worker is the RSS-natural worker (0), not prior W_new (2)");
     assert_eq!(mv2.new_worker, 1);
 
     // Ledger REPLACED, not appended: still exactly one rule for the key.
@@ -455,15 +466,125 @@ fn second_move_chain_replaces_rule_and_reverse_barriers_prior_owner() {
         tx.calls.iter().any(|c| c == "delete:100"),
         "prior rule loc 100 must be deleted on second move: {:?}", tx.calls
     );
-    // Prior owner reverse-barriered: restore prior W_old (0), demote prior
-    // W_new (2). Then forward barrier to the third worker (promote 1).
+    // The prior-move unwind restores the prior W_old (0), NOT the prior W_new.
+    let unwind_restore = tx.calls.iter().position(|c| c.starts_with("restore:0:")).unwrap();
     let del_idx = tx.calls.iter().position(|c| c == "delete:100").unwrap();
+    assert!(unwind_restore < del_idx, "prior W_old (0) restored before prior rule delete: {:?}", tx.calls);
+    // #1748 review-r2 MAJOR: the new forward-barrier demote targets the
+    // RSS-natural W_old (0), NOT the prior W_new (2). The pre-fix code demoted
+    // worker 2 here.
     let promote1_idx = tx.calls.iter().position(|c| c.starts_with("promote:1:")).unwrap();
+    let demote_fwd_idx = tx.calls.iter().rposition(|c| c.starts_with("demote:0:"))
+        .expect("forward-barrier demote must target RSS-natural W_old 0");
+    assert!(
+        !tx.calls[promote1_idx..].iter().any(|c| c.starts_with("demote:2:")),
+        "forward-barrier demote must NOT target prior W_new (2): {:?}", tx.calls
+    );
     assert!(del_idx < promote1_idx, "prior rule deleted before new forward barrier: {:?}", tx.calls);
+    assert!(promote1_idx < demote_fwd_idx, "promote W_new(1) before demote W_old(0): {:?}", tx.calls);
     // A new rule was installed for the third move.
     assert_eq!(c.metrics().installs_total, installs_before + 1);
     // Ownership ends correct: exactly the third worker's entry is the owner.
     assert!(tx.owners() >= 1, "chain keeps >= 1 owner: {:?}", tx.origins);
+
+    // #1748 review-r2 MAJOR: teardown after the W0->W2->W1 chain must restore
+    // the RSS-natural worker 0, NOT the prior W_new (2) or the immediately
+    // prior worker. The replacement ledger entry must carry old_worker=0.
+    tx.calls.clear();
+    c.teardown_all(&mut tx, |_w, _k| true);
+    let td_restore = tx.calls.iter().find(|c| c.starts_with("restore:")).expect("teardown restore");
+    assert!(
+        td_restore.starts_with("restore:0:"),
+        "teardown after a chain must restore the RSS-natural worker 0, got {td_restore:?} (calls {:?})", tx.calls
+    );
+}
+
+#[test]
+fn second_move_delete_failure_keeps_prior_entry_no_duplicate_rule() {
+    // #1748 review-r2 MINOR: if the prior-rule delete fails on a second move,
+    // the controller must NOT install a new rule (duplicate-HW-rule hazard).
+    // It keeps the prior ledger entry and skips the move this tick.
+    let mut c = test_controller(RebalanceConfig {
+        imbalance_threshold: 1.30,
+        rebalance_interval_secs: 0,
+        max_rules: 8,
+    });
+    let mut tx = MockTransport::good();
+
+    // First move: flow 1001 on worker 0 -> worker 2.
+    let in1 = RebalanceTickInput {
+        ifindex: 1,
+        workers: vec![worker(0, 400.0), worker(1, 250.0), worker(2, 100.0)],
+        flows: vec![flow(1001, 0, 120.0)],
+        now_secs: 10,
+    };
+    c.tick(&in1, &mut tx);
+    let in1b = RebalanceTickInput { now_secs: 11, ..in1 };
+    c.tick(&in1b, &mut tx).expect("first move");
+    assert_eq!(c.metrics().rules_active, 1);
+    let installs_before = c.metrics().installs_total;
+
+    // Second move attempt with delete failing.
+    c.clear_cooldown_for_test();
+    tx.calls.clear();
+    tx.delete_fails = true;
+    let in2 = RebalanceTickInput {
+        ifindex: 1,
+        workers: vec![worker(0, 100.0), worker(1, 90.0), worker(2, 400.0)],
+        flows: vec![flow(1001, 2, 120.0)],
+        now_secs: 20,
+    };
+    c.tick(&in2, &mut tx);
+    let in2b = RebalanceTickInput { now_secs: 21, ..in2 };
+    let mv2 = c.tick(&in2b, &mut tx);
+    assert!(mv2.is_none(), "second move aborts when the prior-rule delete fails");
+    // Prior ledger entry KEPT — still exactly one rule.
+    assert_eq!(c.metrics().rules_active, 1, "prior entry kept on delete failure");
+    // NO new rule installed (no duplicate HW rule).
+    assert_eq!(c.metrics().installs_total, installs_before, "no new rule on delete failure");
+    assert!(!tx.calls.iter().any(|c| c.starts_with("install:")), "no install on delete failure: {:?}", tx.calls);
+    let bf = c.metrics().moves_skipped.get(&SkipReason::BarrierFailed).copied().unwrap_or(0);
+    assert!(bf >= 1, "barrier_failed skip recorded on delete failure");
+}
+
+#[test]
+fn second_move_restore_failure_records_restore_failed() {
+    // #1748 review-r2 MINOR: the second-move prior-unwind restore-fail branch
+    // records RestoreFailed (consistent with the other restore-fail sites),
+    // not BarrierFailed, and keeps the prior entry.
+    let mut c = test_controller(RebalanceConfig {
+        imbalance_threshold: 1.30,
+        rebalance_interval_secs: 0,
+        max_rules: 8,
+    });
+    let mut tx = MockTransport::good();
+    let in1 = RebalanceTickInput {
+        ifindex: 1,
+        workers: vec![worker(0, 400.0), worker(1, 250.0), worker(2, 100.0)],
+        flows: vec![flow(1001, 0, 120.0)],
+        now_secs: 10,
+    };
+    c.tick(&in1, &mut tx);
+    let in1b = RebalanceTickInput { now_secs: 11, ..in1 };
+    c.tick(&in1b, &mut tx).expect("first move");
+    let installs_before = c.metrics().installs_total;
+
+    c.clear_cooldown_for_test();
+    tx.calls.clear();
+    tx.restore_fails = true;
+    let in2 = RebalanceTickInput {
+        ifindex: 1,
+        workers: vec![worker(0, 100.0), worker(1, 90.0), worker(2, 400.0)],
+        flows: vec![flow(1001, 2, 120.0)],
+        now_secs: 20,
+    };
+    c.tick(&in2, &mut tx);
+    let in2b = RebalanceTickInput { now_secs: 21, ..in2 };
+    assert!(c.tick(&in2b, &mut tx).is_none(), "second move aborts when prior restore fails");
+    assert_eq!(c.metrics().rules_active, 1, "prior entry kept on restore failure");
+    assert_eq!(c.metrics().installs_total, installs_before, "no new rule on restore failure");
+    let rf = c.metrics().moves_skipped.get(&SkipReason::RestoreFailed).copied().unwrap_or(0);
+    assert!(rf >= 1, "restore_failed (not barrier_failed) skip recorded on second-move restore fail");
 }
 
 #[test]
