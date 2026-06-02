@@ -306,11 +306,17 @@ set class-of-service schedulers <s> equal-flow-target-policy (slowest | mean | i
     existing loop, then `candidate_target = sum_grants / sum_flows`
     (single division, no per-flow loop growth, same zero/overflow
     guards as today's `per_flow == 0` check).
-  - `IdealShare`: `candidate_target = self.config.rate_bytes_per_epoch /
+  - `IdealShare`: `candidate_target = nominal_epoch_cap /
     total_active_flows` (the literal nominal share = the documented
-    ~2.0 G no-op). `total_active_flows` is already summed in the
-    rotation (`rotate_epoch_v8.rs:226-231`); thread it in or recompute
-    over the sampled set.
+    ~2.0 G no-op). There is NO `rate_bytes_per_epoch` field — the
+    per-epoch nominal cap is derived in the rotation as `new_cap` from
+    `self.config.rate_bytes` × `elapsed_ns`
+    (`rotate_epoch_v8.rs:310-312`), and `total_flows` is summed at
+    `rotate_epoch_v8.rs:226-231`. Implementation must thread `new_cap`
+    (or recompute `rate_bytes`×EPOCH) and `total_flows` into the publish
+    call (both are computed AFTER the current
+    `publish_equal_flow_epoch_v8` call site at line 141, so the call
+    order or the threaded values must be adjusted).
   - All three keep the EWMA smoothing, the valid-streak gate, the
     fail-open guards, and the `max_worker_cap` telemetry publication
     unchanged — they only choose `candidate_target`. The r1 "Q1 identity"
