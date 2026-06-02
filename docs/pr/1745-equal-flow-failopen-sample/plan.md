@@ -1,6 +1,9 @@
 # #1745 — equal-flow-enforcement permanent fail-open: sample active-flow demand at acquire-time, not rotation-boundary
 
-Status: DRAFT v1 — pending adversarial plan review
+Status: v2 — Codex PLAN-NEEDS-MAJOR + AGY PLAN-NEEDS-MINOR + Claude-SMR
+PLAN-NEEDS-MAJOR converged; all findings folded in. Q1 (the PLAN-KILL
+question) resolved NOT-KILL by both external reviewers with independent
+proofs (see "Why acquire-time sampling fixes it").
 
 ## Issue framing
 
@@ -88,15 +91,28 @@ and HOW the active-flow + demand signal is captured:
    from it: a worker is "sampled" iff `sampled_active_flows[id] > 0 &&
    demanded[id] && prev_grants[id] > 0`.
 
-3. Crucially: at a 24 Gb/s exact shape with a ~32 KB bank, a busy worker
-   drains the bank in ~10 µs and therefore calls `acquire_v8` ~20×/200 µs
-   epoch — so it WILL be sampled in nearly every epoch. The current bug
-   bites the worker only in the epochs where its consumption stayed under
-   the bank AND the rotation instant landed between its acquire calls.
-   The sticky-max sample closes that window: any active acquire anywhere
-   in the epoch leaves a nonzero sample that survives to the rotation
-   swap, instead of relying on the demand boolean + a separate
-   instantaneous flow-count read agreeing at one nanosecond.
+3. Crucially — **single-epoch sticky-max is provably sufficient** (Q1,
+   resolved NOT-KILL by both Codex and AGY independently). Exact queues
+   have NO autonomous local token refill: `queue.hot.tokens` is refilled
+   ONLY via `acquire_via_lease`→`acquire_v8` (`token_bucket.rs:204-209`),
+   and every transmitted byte debits the bucket (`tx_completion.rs:679`).
+   The watermark is `lease_bytes().max(BANK).min(buffer_bytes…)`
+   (`token_bucket.rs:196-200`) — at most ~512 KB
+   (`COS_ROOT_LEASE_MAX_BYTES`, `mod.rs:760`), at least the 8-frame
+   ~32 KB bank. So any worker that sends a single packet drops below the
+   watermark and is forced to call `acquire_v8` on its next selector
+   visit — within the same or the immediately following epoch. Worked:
+   even at 1 Mb/s (~25 B/epoch) the bucket falls under the watermark every
+   epoch. The ONLY worker that stays banked across a whole epoch is one
+   carrying literally zero traffic, and excluding such a worker from the
+   sample set is the correct, desired semantics. There is no plausible
+   "busy worker stays fully banked across multiple consecutive epochs"
+   counterexample — the kill scenario does not exist.
+
+   The sticky-max sample (recorded at any active acquire, surviving the
+   single epoch until the rotation swap) replaces the brittle requirement
+   that the per-epoch demand boolean AND a separate instantaneous
+   flow-bucket read agree at the single rotation nanosecond.
 
 4. The publisher no longer fail-opens merely because some *currently*
    (rotation-instant) active worker had no sample — it only counts the
@@ -153,41 +169,127 @@ if active {
 ```
 
 `record_equal_flow_active_sample` is a new tag-checked max-CAS helper
-(sibling of `bump_epoch_event`/`worker_grant_bump`): if `curr_tag !=
-my_tag`, install `(my_tag, active_flows)`; else install `(my_tag,
-max(curr_count, active_flows))`. Same bounded-CAS shape, no allocation,
-hot-path-clean. The `EqualFlowSuppress` guard means `CstructDefault`
-leases never touch the new array → default path unchanged.
+(sibling of `bump_epoch_event`/`worker_grant_bump`). **It must NEVER
+write backwards over a newer epoch** (Codex Finding 1 + AGY Finding 3 —
+critical race): an old acquirer holding a stale `my_tag` could otherwise
+overwrite the rotation's fresh `(new_tag, 0)` slot with `(my_tag,
+active_flows)`, corrupting the new epoch's sample. The race-free shape
+(compares `curr_tag` against `my_tag`, aborts on a future tag):
+
+```rust
+#[inline]
+fn record_equal_flow_active_sample(pg: &PackedEpochGrant, my_tag: u32, active_flows: u32) {
+    loop {
+        let curr = pg.0.load(Ordering::Acquire);
+        let (curr_tag, curr_count) = PackedEpochGrant::unpack(curr);
+        // A rotation already advanced the slot to a newer epoch — abort,
+        // never write a stale tag backwards. Tags are monotonically
+        // increasing per rotation (seq>>1)+1, so `curr_tag > my_tag`
+        // unambiguously means "rotation happened after our snapshot".
+        if curr_tag > my_tag {
+            return;
+        }
+        let new = if curr_tag == my_tag {
+            PackedEpochGrant::pack(my_tag, curr_count.max(active_flows))
+        } else {
+            // curr_tag < my_tag: first active acquire of this epoch; the
+            // slot still carries the prior epoch's value (it has not been
+            // swapped yet, or we are the first writer). Install fresh —
+            // do NOT carry the stale count forward.
+            PackedEpochGrant::pack(my_tag, active_flows)
+        };
+        if pg
+            .0
+            .compare_exchange_weak(curr, new, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+```
+
+Tag monotonicity: `new_tag = ((seq>>1)+1)` at rotation
+(`rotate_epoch_v8.rs:53`); tags only increase, so `curr_tag > my_tag`
+safely means "newer epoch." The `EqualFlowSuppress` guard means
+`CstructDefault` leases never touch the new array → default path
+unchanged.
 
 ### rotate_epoch_v8 swap (`rotate_epoch_v8.rs`)
 
-In the STEP-2 loop, swap the new array slot alongside the existing demand
-swap and capture a per-worker `sampled_active_flows_by_worker[id]` from
-the returned old value (tag-checked: only count when the swapped-out tag
-matches the just-ended epoch's tag = `seq>>1`, else 0). Pass it to
-`publish_equal_flow_epoch_v8`. The `EqualFlowSuppress`-only publish branch
-already guards the call (`:123`).
+**The new-array swap MUST be gated on `EqualFlowSuppress`** (Codex
+Finding 2 + AGY Finding 5): the existing STEP-2 loop (`:83-112`) runs for
+ALL v8 rate modes, so adding the swap there unconditionally would impose
+a new per-worker `AcqRel` swap per rotation on the `CstructDefault`
+default path, breaking byte-equivalence. Instead, do the new swap inside
+the existing `if v8.rate_mode == V8RateMode::EqualFlowSuppress` block
+(`:123`) that already guards the publish call, in a dedicated loop:
+
+```rust
+let mut sampled_active_flows_by_worker = [0u32; MAX_WORKERS_SCRATCH];
+if v8.rate_mode == V8RateMode::EqualFlowSuppress {
+    for id in 0..v8.worker_equal_flow_active_samples.len() {
+        let old_sample = v8.worker_equal_flow_active_samples[id]
+            .0
+            .swap(new_packed_zero, Ordering::AcqRel);
+        let (old_tag, old_count) = PackedEpochGrant::unpack(old_sample);
+        if id < n_workers && old_tag == (seq >> 1) as u32 {
+            sampled_active_flows_by_worker[id] = old_count;
+        }
+    }
+    publish_equal_flow_epoch_v8(
+        v8, new_tag, n_workers, active_outside_scratch,
+        &active_by_worker, &sampled_active_flows_by_worker,
+        &demanded_by_worker, &prev_grants,
+    );
+} else {
+    v8.equal_flow.disable_for_epoch(new_tag);
+}
+```
+
+The tag check `old_tag == (seq>>1)` only counts samples from the
+just-ended epoch (the slot is reset to `new_packed_zero = pack(new_tag,
+0)`, so a slot never written this epoch swaps out as `(prior_tag, …)` and
+is correctly excluded as 0).
 
 ### publish_equal_flow_epoch_v8 (`publish_equal_flow_epoch_v8.rs`)
 
 Add `sampled_active_flows_by_worker: &[u32]` parameter. Replace the
-sample-set derivation:
+sample-set derivation. **Per Codex Finding 4, do NOT drop the
+active-but-unsampled bail entirely** — that would let a worker which
+genuinely participated (demanded or was granted bytes) but whose sample
+we missed be silently ignored while two other workers set the class
+target. The refined rule, per worker `id` in `0..n_workers`:
 
-- A worker is in the sample set iff `sampled_active_flows[id] > 0 &&
-  demanded_by_worker[id] && prev_grants[id] > 0`.
-- Compute the per-flow target from the sampled set's
-  `prev_grants[id] / sampled_active_flows[id]` (clip-to-SLOWEST `min`,
-  UNCHANGED — see Out-of-scope #1746).
-- `max_worker_cap` derived from `smoothed * sampled_active_flows[id]`
-  over the sampled set.
-- Require sampled-set size `>= 2` → else `InsufficientSampledWorkers`.
-- Do NOT fail-open merely because a `worker_active_flow_buckets`-active
-  worker was not in the sampled set (drop the `:43-47`
-  active-but-unsampled hard bail).
+- If `!active_by_worker[id]` → skip (not a class participant).
+- Else if `sampled_active_flows[id] > 0 && demanded_by_worker[id] &&
+  prev_grants[id] > 0` → IN the sample set.
+- Else if `demanded_by_worker[id] || prev_grants[id] > 0` → the worker
+  DID participate this epoch but we failed to capture a usable sample →
+  **fail-open `UnsampledActiveWorker`** (preserve the safety bail for a
+  real-but-unsampled participant).
+- Else (active flow-bucket nonzero but zero demand AND zero grants AND
+  zero sample) → genuinely idle-at-rotation background worker →
+  **exclude from the set, do NOT fail-open** (this is the banked-worker
+  case the fix targets; such a worker, if it had real traffic, would have
+  a sample per the Q1 proof).
+- Compute the per-flow target over the sample set:
+  `prev_grants[id] / sampled_active_flows[id]`, clip-to-SLOWEST `min`
+  (UNCHANGED — see Out-of-scope #1746).
+- `max_worker_cap` = `max over sampled set of smoothed *
+  sampled_active_flows[id]`.
+- Require sample-set size `>= 2` → else `InsufficientSampledWorkers`.
 - Keep `active_outside_scratch` → `UnsampledActiveWorker` hard fail-open
   for the real >32-worker case (`:30-34`).
 - Keep all downstream guards: `ZeroTarget`, `ArithmeticInvalid`,
-  `LowDemandWorker` (util gate), `NotEnoughValidStreak`, smoothing.
+  `LowDemandWorker` (util gate — this is the structural protection
+  against a stale-high sticky-max over-suppressing after flow teardown,
+  per AGY Q2), `NotEnoughValidStreak`, smoothing.
+
+Note the `max_worker_cap`/per-flow math uses `sampled_active_flows[id]`
+(the swapped sticky-max), NOT the live `worker_active_flow_buckets`, so
+the published cap is internally consistent with the sample that produced
+the target.
 
 The acquire-side `equal_flow_cap_v8` (`mod.rs:1606`) is UNCHANGED — it
 keeps multiplying the published per-flow target by the live
@@ -195,13 +297,29 @@ keeps multiplying the published per-flow target by the live
 
 ### Regression test (unit)
 
-`equal_flow_forced_insufficient_sampled_workers_leaves_suppression_unchanged`:
-build an `EqualFlowSuppress` lease, drive a single-worker (`-P1`-style)
-epoch so the publisher bails `InsufficientSampledWorkers`, assert
-`suppressed_grant_bytes` and `cap_hit_events` are both unchanged across
-the fail-open epoch. Plus a positive test that two banked-style workers
-(sampled via the new acquire-time path with sticky-max) now reach
-`enforced=1` where the rotation-instant path would have fail-opened.
+1. `equal_flow_forced_insufficient_sampled_workers_leaves_suppression_unchanged`:
+   build an `EqualFlowSuppress` lease, drive a single-worker (`-P1`-style)
+   epoch so the publisher bails `InsufficientSampledWorkers`, assert
+   `suppressed_grant_bytes` and `cap_hit_events` are both unchanged across
+   the fail-open epoch (validation gate 3).
+2. Positive test: two workers sampled via the new acquire-time sticky-max
+   path now reach `enforced=1`. Critically, model the banked path by NOT
+   re-bumping the instantaneous demand on the enforcing epoch — assert the
+   pre-fix rotation-instant logic would have fail-opened but the
+   sticky-max sample carries the worker through.
+3. **Sticky-max correctness test**: within one epoch, record a high
+   active-flow count then a lower one (flow teardown) for the same
+   worker; assert the swapped-out sample is the MAX (not last-write).
+4. **Teardown over-suppression guard test** (AGY Q2 / Codex Finding 5):
+   drive a worker whose grants fall below the util gate after a sample
+   recorded a high flow count; assert the epoch fails open
+   `LowDemandWorker` rather than publishing an over-low target.
+5. **Tag-backwards race test**: simulate a stale acquirer
+   (`record_equal_flow_active_sample` with `my_tag < curr_tag`) and assert
+   the slot is NOT overwritten (no backwards tag write).
+6. **Default-path byte-equivalence test**: a `CstructDefault` lease must
+   leave `worker_equal_flow_active_samples` all-zero after several
+   acquire + rotation cycles (no new atomic writes on the default path).
 
 ## Public API preservation
 
@@ -242,7 +360,7 @@ the fail-open epoch. Plus a positive test that two banked-style workers
 | Behavioral regression (default path) | LOW | All new state gated on `EqualFlowSuppress`; `CstructDefault` untouched. Verified by grep + the default-mode test. |
 | Lifetime / borrow-checker | LOW | One more `Box<[PackedEpochGrant]>` field + one `&[u32]` param. No new borrows across the seqlock. |
 | Performance regression | LOW-on-default / LOW | Default path: zero new work. EqualFlow path: one extra Relaxed load + one bounded CAS per active acquire — same class as the existing demand bump right beside it. |
-| Architectural mismatch | MEDIUM | The fix only helps if banked busy workers DO call acquire_v8 at least once per (or per few) epoch. Open Question 1 stress-tests this. If a worker can stay banked for many consecutive epochs at the validation shape, the fix is insufficient and the design needs a different sample source → PLAN-KILL territory. |
+| Architectural mismatch | LOW (was MEDIUM) | Q1 resolved NOT-KILL: exact queues have no autonomous refill, so any byte-sending worker is forced to acquire_v8 within the epoch (Codex + AGY independent proofs). Only zero-traffic workers stay banked, and excluding them is correct. The single-epoch sticky-max sample is provably sufficient. |
 
 ## Test plan
 
@@ -276,7 +394,33 @@ the fail-open epoch. Plus a positive test that two banked-style workers
   struct (tracked follow-up from PR #1588).
 - Any change to the >32-worker scratch cap (#1733).
 
-## Open questions for adversarial review
+## Open questions for adversarial review — RESOLVED in round 1
+
+All six resolved by Codex (PLAN-NEEDS-MAJOR) + AGY (PLAN-NEEDS-MINOR) +
+Claude-SMR (PLAN-NEEDS-MAJOR), converged into v2 above:
+
+- **Q1 (sufficiency / the kill question): NOT-KILL.** Both external
+  reviewers gave independent proofs that exact queues have no autonomous
+  refill, so any worker sending ≥1 byte drops below the watermark and is
+  forced to `acquire_v8` within the epoch; only a zero-traffic worker
+  stays banked and excluding it is correct. No multi-epoch-banked
+  counterexample exists.
+- **Q2 (sticky-max vs last-write): max is correct;** last-write would
+  publish a noisy transient denominator. Stale-high after teardown is
+  caught by the `LowDemandWorker` 80% util gate (regression test #4).
+- **Q3 (tag race): CRITICAL — fixed.** Helper now aborts on
+  `curr_tag > my_tag`, never writes a stale tag backwards.
+- **Q4 (dropping the bail): refined, not dropped.** Keep the bail for a
+  demanded-or-granted-but-unsampled participant; only exclude truly idle
+  workers. `sampled >= 2` retained.
+- **Q5 (HA): acceptable.** New array built unconditionally at
+  `len = max_worker_id + 1` in lock-step with `worker_grants`; fresh
+  process-local telemetry, no rehydration needed.
+- **Q6 (default-path byte-equivalence): fixed** by gating the
+  rotation-side swap on `EqualFlowSuppress` (not just the acquire-side
+  record). Regression test #6 asserts it.
+
+### Original open questions (kept for the record)
 
 1. **Is acquire-time sampling actually sufficient?** At the validation
    shape (24 Gb/s, ~32 KB bank), does every busy worker call `acquire_v8`
