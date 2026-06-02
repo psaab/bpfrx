@@ -228,11 +228,23 @@ impl Coordinator {
     }
 
     pub(crate) fn stop_inner(&mut self, clear_synced_state: bool) {
-        // #1748: remove every installed ntuple rule on shutdown so no orphan
-        // HW rule survives the daemon. Plain deletes are correct here: the
-        // whole dataplane is tearing down, so there is no live flow whose
-        // ownership needs handing back (the reverse barrier protects against a
-        // live-flow leak, which cannot happen when all workers stop).
+        // #1748: remove every installed ntuple rule here so no orphan HW rule
+        // survives. PLAIN deletes (no reverse barrier) are correct on BOTH
+        // paths this runs on — final shutdown AND reconcile-teardown
+        // (stop_inner(false)) — for the same reason (#1748 review #3, verified):
+        // stop_inner stops + joins ALL worker threads via
+        // `self.workers.stop_and_clear(...)` below, which destroys each
+        // worker's per-thread SessionTable, and with it every RebalancedOut /
+        // RebalancedOwner origin (those local-only rebalance origins are NEVER
+        // published to the shared synced-session table — that is the whole
+        // point of the suppression set). On reconcile bring-up the worker
+        // SessionTables are rebuilt fresh by replaying the preserved SHARED
+        // synced sessions, which carry SyncImport origins, not the rebalance
+        // origins. So there is no live ownership to hand back across a reconcile
+        // either: no RebalancedOut/Owner entry can be stranded, because none
+        // survives the worker teardown. The reverse barrier protects a leak
+        // that requires the owning worker to keep running, which cannot happen
+        // when every worker is joined here.
         self.teardown_all_rebalance_rules_plain();
         if let Some(stop) = self.neighbors.monitor_stop.take() {
             stop.store(true, Ordering::Relaxed);
