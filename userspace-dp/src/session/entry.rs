@@ -56,6 +56,21 @@ pub(crate) enum SessionOrigin {
     SharedPromote,
     #[allow(dead_code)] // enum variant for completeness
     WorkerLocalImport,
+    /// #1748: the abandoned forward copy on the OLD worker (W_old) after
+    /// the ntuple rebalance controller has steered a flow to a NEW worker.
+    /// Suppress-everything: its GC expiry / purge / terminal-filter cleanup
+    /// must NOT release or delete any shared state (shared session map,
+    /// conntrack mirror, SNAT allocation, DeleteSynced broadcast) because
+    /// W_new now owns that state. Ages out local-only.
+    RebalancedOut,
+    /// #1748: the promoted owner on the NEW worker (W_new) after a move.
+    /// Behaves like a normal LOCAL owner for cleanup/export/sync — it emits
+    /// Close on real expiry, deletes shared map + conntrack, broadcasts
+    /// DeleteSynced, releases SNAT — so exactly one worker owns end-of-flow
+    /// cleanup. `is_peer_synced()` stays FALSE for it (it is a local owner,
+    /// not an import) so it is NOT Close-suppressed, and it demotes to
+    /// SyncImport on a real RG failover like ForwardFlow.
+    RebalancedOwner,
 }
 
 impl SessionOrigin {
@@ -69,7 +84,18 @@ impl SessionOrigin {
             Self::SharedMaterialize => "shared_materialize",
             Self::SharedPromote => "shared_promote",
             Self::WorkerLocalImport => "worker_local_import",
+            Self::RebalancedOut => "rebalanced_out",
+            Self::RebalancedOwner => "rebalanced_owner",
         }
+    }
+
+    /// #1748: true for the abandoned W_old copy after a rebalance move.
+    /// Every shared-state release/delete keyed by a session is gated on
+    /// `!is_rebalanced_out()` so W_old's eventual local-only cleanup never
+    /// touches the state W_new now owns. `RebalancedOwner` returns false —
+    /// it IS the cleanup owner.
+    pub(crate) fn is_rebalanced_out(self) -> bool {
+        matches!(self, Self::RebalancedOut)
     }
 
     /// Returns true for origins that represent peer-synced sessions.

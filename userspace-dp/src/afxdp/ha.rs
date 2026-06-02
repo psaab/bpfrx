@@ -413,6 +413,11 @@ impl super::Coordinator {
             if entry.origin.is_peer_synced() {
                 continue;
             }
+            // #1748: never export the abandoned W_old rebalance copy on bulk
+            // sync — W_new is the exporting owner.
+            if entry.origin.is_rebalanced_out() {
+                continue;
+            }
             // Skip fabric-ingress sessions (same exclusion as export_forward_sessions_for_owner_rgs).
             if entry.metadata.fabric_ingress {
                 continue;

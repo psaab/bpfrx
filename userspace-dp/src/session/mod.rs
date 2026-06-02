@@ -431,6 +431,11 @@ impl SessionTable {
                         if !metadata.is_reverse
                             && !removed.origin.is_peer_synced()
                             && !removed.origin.is_transient_local_seed()
+                            // #1748: the abandoned W_old copy must NOT emit a
+                            // Close delta on its local-only expiry — W_new owns
+                            // the shared session/conntrack/SNAT state now, and a
+                            // Close here would cascade-delete the live flow.
+                            && !removed.origin.is_rebalanced_out()
                         {
                             self.push_delta(SessionDelta {
                                 kind: SessionDeltaKind::Close,
@@ -943,6 +948,86 @@ impl SessionTable {
         self.update_session(req, false)
     }
 
+    /// #1748: dedicated origin-only mutation for the rebalance controller's
+    /// PromoteRebalanced barrier step. Flips W_new's existing materialized
+    /// replica `origin` to `RebalancedOwner` IN PLACE and does a liveness-only
+    /// refresh (`last_seen_ns` + `push_to_wheel`) so the promoted owner is
+    /// provably non-expiring across the move budget, independent of its prior
+    /// TTL.
+    ///
+    /// It MUST NOT reuse `update_session` (which emits an Open delta when a
+    /// peer-synced entry becomes non-peer-synced, mod.rs:843+) or
+    /// `maybe_promote_synced_session` (which republishes + shared-map-upserts +
+    /// replicates, promote.rs). This is a TAG FLIP + liveness only: NO delta,
+    /// NO shared-map publish/upsert, NO conntrack write, NO NAT realloc, NO
+    /// `decision`/`metadata` mutation, NO epoch bump.
+    ///
+    /// Returns true if the key was present and the origin is now
+    /// `RebalancedOwner` (idempotent: a no-op re-flip still returns true).
+    pub fn promote_rebalanced_owner(&mut self, key: &SessionKey, now_ns: u64) -> bool {
+        let touched = if let Some(entry) = self.entry_by_key_mut(key) {
+            entry.origin = SessionOrigin::RebalancedOwner;
+            // Liveness-only refresh — Codex r4: "replica present" is not
+            // enough; W_new's replica could be ms from its own GC timeout.
+            entry.last_seen_ns = now_ns;
+            true
+        } else {
+            false
+        };
+        if touched {
+            // Re-bucket so a racing GC tick between promote-ack and rule
+            // install cannot expire the sole cleanup owner.
+            self.push_to_wheel(key, now_ns);
+        }
+        touched
+    }
+
+    /// #1748: dedicated origin-only mutation for the rebalance controller's
+    /// DemoteRebalanced barrier step. Flips W_old's forward entry `origin` to
+    /// `RebalancedOut` IN PLACE so its eventual local-only GC expiry / purge /
+    /// terminal-filter cleanup is fully suppressed (the abandoned copy never
+    /// touches the shared state W_new now owns).
+    ///
+    /// TAG FLIP ONLY — no liveness refresh (the abandoned copy should age out),
+    /// no delta, no publish, no NAT change. Returns true if the key was
+    /// present.
+    pub fn demote_rebalanced_out(&mut self, key: &SessionKey) -> bool {
+        if let Some(entry) = self.entry_by_key_mut(key) {
+            entry.origin = SessionOrigin::RebalancedOut;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// #1748: reverse-barrier restore. On rollback / teardown-of-a-live-move,
+    /// W_old's `RebalancedOut` entry is handed ownership back BEFORE W_new is
+    /// demoted, so there is always >= 1 cleanup owner. Flips the origin back to
+    /// a normal local owner (`ForwardFlow`) and does a liveness-only refresh so
+    /// the restored owner does not immediately expire. No delta, no publish, no
+    /// NAT change. Returns true if the key was present.
+    pub fn restore_rebalanced_owner(&mut self, key: &SessionKey, now_ns: u64) -> bool {
+        let touched = if let Some(entry) = self.entry_by_key_mut(key) {
+            entry.origin = SessionOrigin::ForwardFlow;
+            entry.last_seen_ns = now_ns;
+            true
+        } else {
+            false
+        };
+        if touched {
+            self.push_to_wheel(key, now_ns);
+        }
+        touched
+    }
+
+    /// #1748: read the current origin of a session, for ack confirmation
+    /// (the structured PromoteRebalanced/DemoteRebalanced ack carries the
+    /// observed origin so the controller verifies the EXACT key reached the
+    /// EXACT origin before proceeding).
+    pub fn origin_of(&self, key: &SessionKey) -> Option<SessionOrigin> {
+        self.entry_by_key(key).map(|entry| entry.origin)
+    }
+
     pub fn emit_open_delta_with_origin(
         &mut self,
         key: SessionKey,
@@ -1036,6 +1121,17 @@ impl SessionTable {
             let Some(entry) = self.entry_by_key_mut(&key) else {
                 continue;
             };
+            // #1748: RebalancedOut is the inert abandoned W_old copy — it is
+            // excluded from the rebalance suppression set's HA handling and
+            // must NOT be rewritten to SyncImport (that would re-enable the
+            // shared cleanup W_new owns). RebalancedOwner is a normal local
+            // owner and DOES demote to SyncImport on failover, handled by the
+            // `!is_peer_synced()` branch below (RebalancedOwner is not
+            // peer-synced).
+            if entry.origin.is_rebalanced_out() {
+                demoted_keys.push(key);
+                continue;
+            }
             if !entry.origin.is_peer_synced() {
                 entry.origin = SessionOrigin::SyncImport;
             }

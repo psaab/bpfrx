@@ -668,13 +668,19 @@ pub(crate) fn worker_loop(
         let expired_entries = sessions.expire_stale_entries(loop_now_ns);
         let expired = expired_entries.len() as u64;
         for expired_entry in expired_entries {
-            release_source_nat_allocation(
-                &forwarding.source_nat_rules,
-                &expired_entry.key,
-                expired_entry.decision.nat,
-                expired_entry.metadata.is_reverse,
-                loop_now_ns,
-            );
+            // #1748: the abandoned W_old copy (RebalancedOut) must NOT release
+            // the SNAT allocation on its local-only GC expiry — W_new owns the
+            // session and releases the SNAT port on its own real close. A
+            // double-release here would free a port W_new is still using.
+            if !expired_entry.origin.is_rebalanced_out() {
+                release_source_nat_allocation(
+                    &forwarding.source_nat_rules,
+                    &expired_entry.key,
+                    expired_entry.decision.nat,
+                    expired_entry.metadata.is_reverse,
+                    loop_now_ns,
+                );
+            }
             delete_session_map_entry_for_removed_session_with_origin(
                 session_map_fd,
                 &expired_entry.key,

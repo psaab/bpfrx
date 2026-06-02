@@ -34,6 +34,11 @@ pub(in crate::afxdp::session_glue) fn handle_refresh_owner_rgs(
         if metadata.owner_rg_id <= 0 && !metadata.fabric_ingress {
             return;
         }
+        // #1748: never republish the abandoned W_old copy — it is inert and
+        // W_new owns the shared session-map entry.
+        if origin.is_rebalanced_out() {
+            return;
+        }
         let flow = SessionFlow {
             src_ip: key.src_ip,
             dst_ip: key.dst_ip,

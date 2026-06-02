@@ -295,13 +295,19 @@ pub(super) fn purge_sessions_for_input_dscp_filter_revalidation(
     });
     let purged = stale.len();
     for (key, decision, metadata, origin) in stale {
-        release_source_nat_allocation(
-            &forwarding.source_nat_rules,
-            &key,
-            decision.nat,
-            metadata.is_reverse,
-            now_ns,
-        );
+        // #1748: an interface-down / admin purge on W_old must NOT release the
+        // SNAT port the abandoned RebalancedOut copy carries — W_new owns the
+        // live session and the SNAT allocation. Double-release would free a
+        // port W_new is still using.
+        if !origin.is_rebalanced_out() {
+            release_source_nat_allocation(
+                &forwarding.source_nat_rules,
+                &key,
+                decision.nat,
+                metadata.is_reverse,
+                now_ns,
+            );
+        }
         delete_terminal_filtered_session(
             sessions,
             session_map_fd,
@@ -379,6 +385,13 @@ pub(super) fn delete_terminal_filtered_session(
     metadata: &SessionMetadata,
     origin: SessionOrigin,
 ) {
+    // #1748: `delete_session_map_entry_for_removed_session_with_origin` already
+    // early-returns for RebalancedOut (no redirect/conntrack delete). The rest
+    // of the shared-state teardown below must ALSO be suppressed for the
+    // abandoned W_old copy: removing the SHARED session-map entry, broadcasting
+    // DeleteSynced, or emitting a Close delta would all tear down the state
+    // W_new is actively forwarding against. The local slab entry is still
+    // removed so W_old reclaims its own memory.
     delete_session_map_entry_for_removed_session_with_origin(
         session_map_fd,
         key,
@@ -389,6 +402,9 @@ pub(super) fn delete_terminal_filtered_session(
         conntrack_v6_fd,
     );
     sessions.delete(key);
+    if origin.is_rebalanced_out() {
+        return;
+    }
     remove_shared_session(
         shared_sessions,
         shared_nat_sessions,
@@ -421,6 +437,9 @@ pub(in crate::afxdp::session_glue) fn export_forward_sessions_for_owner_rgs(
             || origin.is_peer_synced()
             || origin.is_transient_local_seed()
             || metadata.fabric_ingress
+            // #1748: the abandoned W_old copy must not be exported as an Open
+            // delta to the peer — W_new is the exporting owner now.
+            || origin.is_rebalanced_out()
         {
             continue;
         }

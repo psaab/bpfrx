@@ -1029,6 +1029,14 @@ pub(super) fn delete_session_map_entry_for_removed_session_with_origin(
     conntrack_v4_fd: c_int,
     conntrack_v6_fd: c_int,
 ) {
+    // #1748: the abandoned W_old copy after a rebalance move must NOT delete
+    // any shared session-map redirect key OR conntrack mirror entry — W_new
+    // now owns those entries and is actively forwarding against them. AGY's
+    // surgical fix: one early-return guard covers both the redirect-key delete
+    // and the conntrack delete below.
+    if origin.is_rebalanced_out() {
+        return;
+    }
     delete_session_map_redirect_for_session(map_fd, key, decision, metadata, origin);
     if uses_kernel_local_session_map_entry(decision, metadata, origin) {
         delete_bpf_conntrack_entry(conntrack_v4_fd, conntrack_v6_fd, key);
