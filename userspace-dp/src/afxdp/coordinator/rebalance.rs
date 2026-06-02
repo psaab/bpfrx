@@ -363,6 +363,10 @@ impl super::Coordinator {
         // even if a previous command timed out without being acked (in which
         // case rebalance_ack_seq would not have advanced, causing a collision
         // if we derived the new seq from it).
+        // Relaxed is sufficient: we only need uniqueness across barrier_command
+        // calls, which are always made from the same coordinator thread. The
+        // seq is delivered to the worker via the command queue (Mutex), which
+        // establishes the necessary happens-before for the worker's ack.
         let seq = handle.rebalance_cmd_seq.fetch_add(1, Ordering::Relaxed) + 1;
         {
             let Ok(mut pending) = handle.commands.lock() else {
@@ -376,10 +380,12 @@ impl super::Coordinator {
                 // Read the structured slot and confirm key + origin.
                 if let Ok(slot) = handle.rebalance_ack.lock() {
                     if let Some(ack) = slot.as_ref() {
-                        // Only accept an exact-seq match. If ack.seq > seq
-                        // the slot was overwritten by a later command before
-                        // we polled; keep waiting until the deadline rather
-                        // than returning the wrong ack's result.
+                        // ack.seq == seq → exact match; return the result.
+                        // ack.seq > seq  → slot overwritten by a later command
+                        //   before we polled; keep waiting until the deadline
+                        //   rather than returning the wrong ack's result.
+                        // ack.seq < seq  → stale ack from a prior command;
+                        //   keep polling until the worker writes our seq.
                         if ack.seq == seq {
                             return ack_confirms(ack, key, expected);
                         }

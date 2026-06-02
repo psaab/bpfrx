@@ -194,29 +194,38 @@ impl Default for EthtoolRxnfc {
     }
 }
 
-/// Union matching the kernel's `ifreq.ifr_ifru` payload. The largest kernel
-/// arm is `struct ifmap` (24 bytes on x86_64), which sets the union size and
-/// therefore `sizeof(struct ifreq)` to 40 bytes. We mirror that size so the
-/// kernel's `copy_from_user(sizeof(struct ifreq))` does not read past our
-/// allocation. For SIOCETHTOOL only the `data` arm is accessed.
+/// Union matching the kernel's `ifreq.ifr_ifru` payload. The union itself is
+/// 24 bytes on x86_64 (dominated by `struct ifmap`'s 24-byte layout), making
+/// `sizeof(struct ifreq)` = 16 (ifr_name) + 24 (union) = 40 bytes. We mirror
+/// that union size so the kernel's `copy_from_user(sizeof(struct ifreq))` does
+/// not read past our allocation. For SIOCETHTOOL only the `data` arm is used.
 #[repr(C)]
 union EthtoolIfru {
     /// The `ifr_data` arm: pointer to an ethtool command struct.
+    ///
+    /// # Safety
+    /// When `data` is active, it must point to a valid, correctly-sized
+    /// ethtool command struct (e.g. `EthtoolRxnfc`) that outlives the ioctl
+    /// call. The caller is responsible for upholding this invariant.
     data: *mut libc::c_void,
-    /// Padding to `sizeof(struct ifmap)` = 24 bytes on x86_64, which is the
-    /// largest arm in the kernel union and determines `sizeof(struct ifreq)`.
+    /// Padding arm: sizes the union to 24 bytes, matching `sizeof(struct ifmap)`
+    /// on x86_64 (the largest arm of the kernel's `ifreq.ifr_ifru` union).
     _pad: [u8; 24],
 }
 
 /// `struct ifreq` carrying `ifr_data` = pointer to an ethtool command.
-/// The union above pads the struct to 40 bytes, matching the kernel ABI on
-/// x86_64, so `copy_from_user(sizeof(struct ifreq))` stays in bounds.
+/// `sizeof(EthtoolIfreq)` == 40 bytes on x86_64 (IFNAMSIZ=16 + union=24),
+/// matching the kernel ABI so `copy_from_user(sizeof(struct ifreq))` is safe.
 #[repr(C)]
 struct EthtoolIfreq {
     ifr_name: [libc::c_char; libc::IFNAMSIZ],
     ifru: EthtoolIfru,
 }
 
+// Enforce the 40-byte ABI match on x86_64 (IFNAMSIZ=16 + ifru union=24).
+// On other architectures the kernel's struct ifreq may differ; ntuple ioctl
+// support is mlx5-specific and therefore x86_64-only in practice.
+#[cfg(target_arch = "x86_64")]
 const _: () = assert!(
     std::mem::size_of::<EthtoolIfreq>() == 40,
     "EthtoolIfreq must be 40 bytes (sizeof(struct ifreq) on x86_64)",
