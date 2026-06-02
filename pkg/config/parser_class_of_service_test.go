@@ -1504,9 +1504,11 @@ func TestCompileClassOfServiceFlowRebalanceSetSyntax(t *testing.T) {
 	}
 }
 
-// #1748: a bare flow-rebalance block (no sub-leaves) still enables the
-// controller (presence = on); the Rust side fills zeros with its defaults.
-func TestCompileClassOfServiceFlowRebalanceBareEnables(t *testing.T) {
+// #1748: setting a SINGLE flow-rebalance sub-leaf (here max-rules) enables the
+// controller — presence of the block = on — and the unset sub-leaves
+// (imbalance-threshold, rebalance-interval) stay zero so the Rust side fills
+// them with its built-in defaults.
+func TestCompileClassOfServiceFlowRebalanceSingleSubLeafEnables(t *testing.T) {
 	tree := &ConfigTree{}
 	for _, line := range []string{
 		"set class-of-service flow-rebalance max-rules 16",
@@ -1527,8 +1529,16 @@ func TestCompileClassOfServiceFlowRebalanceBareEnables(t *testing.T) {
 	if cfg.ClassOfService == nil || cfg.ClassOfService.FlowRebalance == nil {
 		t.Fatal("flow-rebalance block must enable the controller")
 	}
-	if cfg.ClassOfService.FlowRebalance.MaxRules != 16 {
-		t.Errorf("max-rules = %d, want 16", cfg.ClassOfService.FlowRebalance.MaxRules)
+	fr := cfg.ClassOfService.FlowRebalance
+	if fr.MaxRules != 16 {
+		t.Errorf("max-rules = %d, want 16", fr.MaxRules)
+	}
+	// Unset sub-leaves stay zero (the Rust controller fills its defaults).
+	if fr.ImbalanceThresholdPercent != 0 {
+		t.Errorf("imbalance-threshold = %d, want 0 (unset)", fr.ImbalanceThresholdPercent)
+	}
+	if fr.RebalanceIntervalSecs != 0 {
+		t.Errorf("rebalance-interval = %d, want 0 (unset)", fr.RebalanceIntervalSecs)
 	}
 }
 

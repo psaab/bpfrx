@@ -33,8 +33,9 @@ set class-of-service flow-rebalance rebalance-interval 1
 set class-of-service flow-rebalance max-rules 64
 ```
 
-All sub-leaves are optional; the bare `set class-of-service flow-rebalance`
-block (any sub-leaf present) enables the controller with defaults.
+Each sub-leaf is individually optional, but the `flow-rebalance` block is
+created by setting at least one of them. Setting any one sub-leaf enables the
+controller; the unset sub-leaves take the defaults below.
 
 | Leaf | Units | Default | Range | Meaning |
 |---|---|---|---|---|
@@ -124,7 +125,7 @@ Per-interface Prometheus gauges/counters (`{ifindex}` label):
 - `xpf_userspace_flow_rebalance_installs_total` / `_deletes_total`.
 - `xpf_userspace_flow_rebalance_moves_skipped_total{reason}` — why a candidate
   move was not taken (`balanced`, `cooldown`, `magnitude`, `epsilon`,
-  `budget_exhausted`, `barrier_failed`, `dwell`).
+  `budget_exhausted`, `barrier_failed`, `dwell`, `restore_failed`).
 - `xpf_userspace_flow_rebalance_worker_byterate_cov` — the live per-worker
   byte-rate CoV the controller observed at the last tick (this is the metric
   the feature is trying to drive down).
