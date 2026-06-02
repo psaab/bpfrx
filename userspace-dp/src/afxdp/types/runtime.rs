@@ -29,6 +29,12 @@ pub(in crate::afxdp) struct WorkerHandle {
     /// pending seq, then reads the slot to confirm key + origin.
     pub(in crate::afxdp) rebalance_ack: Arc<Mutex<Option<super::RebalanceAck>>>,
     pub(in crate::afxdp) rebalance_ack_seq: Arc<AtomicU64>,
+    /// #1748: coordinator-side command sequence generator. Incremented by
+    /// `fetch_add` for each new barrier command so every command gets a
+    /// strictly-unique seq regardless of whether a previous command timed
+    /// out without being acked (in which case `rebalance_ack_seq` would
+    /// not have advanced, causing a collision if we derived seq from it).
+    pub(in crate::afxdp) rebalance_cmd_seq: Arc<AtomicU64>,
     pub(in crate::afxdp) cos_status: Arc<ArcSwap<Vec<crate::protocol::CoSInterfaceStatus>>>,
     // #869: per-worker busy/idle runtime telemetry publish slot.
     pub(in crate::afxdp) runtime_atomics: Arc<super::worker_runtime::WorkerRuntimeAtomics>,

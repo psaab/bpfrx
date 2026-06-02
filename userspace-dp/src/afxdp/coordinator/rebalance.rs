@@ -202,6 +202,14 @@ impl super::Coordinator {
             let Some(key) = session_key_from_tuple(&row.session_key) else {
                 continue;
             };
+            // ntuple rules only support TCP and UDP; skip other protocols
+            // (e.g. ICMP) so flow_spec_from_key never misencodes them as UDP
+            // and we never transfer ownership without a matching HW rule.
+            if key.protocol != super::super::PROTO_TCP
+                && key.protocol != super::super::PROTO_UDP
+            {
+                continue;
+            }
             let cumulative = row.observed_bytes;
             // First observation of this flow => no rate yet (a brand-new flow's
             // first-tick cumulative is not a window rate). cumulative_to_rate
@@ -350,10 +358,12 @@ impl super::Coordinator {
         let Some(handle) = self.workers.handles.get(&worker_id) else {
             return false;
         };
-        // Monotonic per-worker seq: reuse the rebalance_ack_seq as the
-        // generator base + 1 so each command has a strictly-increasing seq the
-        // worker echoes back.
-        let seq = handle.rebalance_ack_seq.load(Ordering::Acquire).saturating_add(1);
+        // Use the dedicated coordinator-side command seq generator (not the
+        // ack seq) so each command gets a unique, strictly-increasing seq
+        // even if a previous command timed out without being acked (in which
+        // case rebalance_ack_seq would not have advanced, causing a collision
+        // if we derived the new seq from it).
+        let seq = handle.rebalance_cmd_seq.fetch_add(1, Ordering::Relaxed) + 1;
         {
             let Ok(mut pending) = handle.commands.lock() else {
                 return false;
@@ -366,7 +376,11 @@ impl super::Coordinator {
                 // Read the structured slot and confirm key + origin.
                 if let Ok(slot) = handle.rebalance_ack.lock() {
                     if let Some(ack) = slot.as_ref() {
-                        if ack.seq >= seq {
+                        // Only accept an exact-seq match. If ack.seq > seq
+                        // the slot was overwritten by a later command before
+                        // we polled; keep waiting until the deadline rather
+                        // than returning the wrong ack's result.
+                        if ack.seq == seq {
                             return ack_confirms(ack, key, expected);
                         }
                     }

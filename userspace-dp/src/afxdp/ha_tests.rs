@@ -241,6 +241,7 @@ fn update_ha_state_prewarms_split_rg_reverse_sessions_on_activation() {
             session_export_ack: Arc::new(AtomicU64::new(0)),
             rebalance_ack: Arc::new(Mutex::new(None)),
             rebalance_ack_seq: Arc::new(AtomicU64::new(0)),
+            rebalance_cmd_seq: Arc::new(AtomicU64::new(0)),
             cos_status: Arc::new(ArcSwap::from_pointee(Vec::new())),
             runtime_atomics: Arc::new(super::worker_runtime::WorkerRuntimeAtomics::new()),
             cold_path_atomics: Arc::new(

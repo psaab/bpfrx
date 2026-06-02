@@ -194,13 +194,33 @@ impl Default for EthtoolRxnfc {
     }
 }
 
-/// `struct ifreq` carrying `ifr_data` = pointer to an ethtool command. We
-/// mirror `slowpath.rs`'s IfReq but with the data-pointer union arm.
+/// Union matching the kernel's `ifreq.ifr_ifru` payload. The largest kernel
+/// arm is `struct ifmap` (24 bytes on x86_64), which sets the union size and
+/// therefore `sizeof(struct ifreq)` to 40 bytes. We mirror that size so the
+/// kernel's `copy_from_user(sizeof(struct ifreq))` does not read past our
+/// allocation. For SIOCETHTOOL only the `data` arm is accessed.
+#[repr(C)]
+union EthtoolIfru {
+    /// The `ifr_data` arm: pointer to an ethtool command struct.
+    data: *mut libc::c_void,
+    /// Padding to `sizeof(struct ifmap)` = 24 bytes on x86_64, which is the
+    /// largest arm in the kernel union and determines `sizeof(struct ifreq)`.
+    _pad: [u8; 24],
+}
+
+/// `struct ifreq` carrying `ifr_data` = pointer to an ethtool command.
+/// The union above pads the struct to 40 bytes, matching the kernel ABI on
+/// x86_64, so `copy_from_user(sizeof(struct ifreq))` stays in bounds.
 #[repr(C)]
 struct EthtoolIfreq {
     ifr_name: [libc::c_char; libc::IFNAMSIZ],
-    ifr_data: *mut libc::c_void,
+    ifru: EthtoolIfru,
 }
+
+const _: () = assert!(
+    std::mem::size_of::<EthtoolIfreq>() == 40,
+    "EthtoolIfreq must be 40 bytes (sizeof(struct ifreq) on x86_64)",
+);
 
 impl EthtoolIfreq {
     fn new(ifname: &str, data: *mut libc::c_void) -> io::Result<Self> {
@@ -215,7 +235,7 @@ impl EthtoolIfreq {
         for (idx, b) in bytes.iter().enumerate() {
             ifr_name[idx] = *b as libc::c_char;
         }
-        Ok(Self { ifr_name, ifr_data: data })
+        Ok(Self { ifr_name, ifru: EthtoolIfru { data } })
     }
 }
 
@@ -284,7 +304,7 @@ impl NtupleSocket {
             &self.ifname,
             rxnfc as *mut EthtoolRxnfc as *mut libc::c_void,
         )?;
-        // SAFETY: ifr.ifr_data points at a valid, correctly-sized rxnfc; the
+        // SAFETY: ifr.ifru.data points at a valid, correctly-sized rxnfc; the
         // kernel reads/writes only within sizeof(ethtool_rxnfc).
         let rc = unsafe { libc::ioctl(self.sock, SIOCETHTOOL, &mut ifr) };
         if rc < 0 {

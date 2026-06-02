@@ -177,6 +177,7 @@ pub(super) fn bring_up_workers(
         // is on, so the default-OFF path is byte-identical (slots stay zero).
         let rebalance_ack = Arc::new(Mutex::new(None::<crate::afxdp::RebalanceAck>));
         let rebalance_ack_seq = Arc::new(AtomicU64::new(0));
+        let rebalance_cmd_seq = Arc::new(AtomicU64::new(0));
         let cos_status = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let commands = worker_command_queues
             .get(&worker_id)
@@ -301,6 +302,7 @@ pub(super) fn bring_up_workers(
                         session_export_ack,
                         rebalance_ack,
                         rebalance_ack_seq,
+                        rebalance_cmd_seq,
                         cos_status,
                         runtime_atomics,
                         cold_path_atomics,
