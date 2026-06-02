@@ -1020,6 +1020,21 @@ impl SessionTable {
         touched
     }
 
+    /// #1748: reverse-barrier replica demotion. After W_old has been restored
+    /// to owner, W_new's `RebalancedOwner` entry is flipped back to a
+    /// worker-local materialized replica (`WorkerLocalImport`) so it no longer
+    /// claims cleanup ownership. TAG FLIP ONLY — no delta, no publish, no NAT
+    /// change, no liveness refresh (the replica resumes its normal TTL).
+    /// Returns true if the key was present.
+    pub fn demote_rebalanced_replica(&mut self, key: &SessionKey) -> bool {
+        if let Some(entry) = self.entry_by_key_mut(key) {
+            entry.origin = SessionOrigin::WorkerLocalImport;
+            true
+        } else {
+            false
+        }
+    }
+
     /// #1748: read the current origin of a session, for ack confirmation
     /// (the structured PromoteRebalanced/DemoteRebalanced ack carries the
     /// observed origin so the controller verifies the EXACT key reached the

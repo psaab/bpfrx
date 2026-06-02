@@ -217,6 +217,11 @@ pub(super) struct WorkerCommandResults {
     /// no `BindingWorker` access — the outer poll loop in `worker.rs`
     /// dispatches based on this flag.
     pub vacate_all_shared_exact_slots: bool,
+    /// #1748: structured acks accumulated for each rebalance command applied
+    /// this tick. The outer loop writes each into the worker's
+    /// `rebalance_ack` slot + publishes the seq (Release) so the controller's
+    /// barrier can confirm key + origin before proceeding.
+    pub rebalance_acks: Vec<crate::afxdp::RebalanceAck>,
 }
 
 fn force_live_redirect_for_worker_synced_entry(
@@ -477,6 +482,7 @@ pub(super) fn apply_worker_commands(
                     exported_sequences: Vec::new(),
                     shaped_tx_requests: Vec::new(),
                     vacate_all_shared_exact_slots: false,
+                    rebalance_acks: Vec::new(),
                 };
             }
             core::mem::take(&mut *pending)
@@ -487,6 +493,7 @@ pub(super) fn apply_worker_commands(
                 exported_sequences: Vec::new(),
                 shaped_tx_requests: Vec::new(),
                 vacate_all_shared_exact_slots: false,
+                rebalance_acks: Vec::new(),
             };
         }
     };
@@ -499,6 +506,7 @@ pub(super) fn apply_worker_commands(
     let mut exported_sequences = Vec::new();
     let mut shaped_tx_requests = Vec::new();
     let mut vacate_all_shared_exact_slots = false;
+    let mut rebalance_acks: Vec<crate::afxdp::RebalanceAck> = Vec::new();
     for cmd in pending {
         match cmd {
             WorkerCommand::DemoteOwnerRGS { owner_rgs } => {
@@ -578,6 +586,52 @@ pub(super) fn apply_worker_commands(
                 // `worker.rs:818-822` dispatch).
                 vacate_all_shared_exact_slots = true;
             }
+            // #1748: rebalance ownership-transfer barrier steps. Each is a
+            // dedicated origin-only mutation on the SessionTable (no delta, no
+            // shared publish, no NAT). The structured ack carries the observed
+            // origin so the controller confirms the EXACT key reached the EXACT
+            // state before the barrier proceeds. `result=false` when the key is
+            // absent (the controller rolls back).
+            WorkerCommand::PromoteRebalanced { seq, key } => {
+                let result = sessions.promote_rebalanced_owner(&key, now_ns);
+                rebalance_acks.push(crate::afxdp::RebalanceAck {
+                    seq,
+                    origin: sessions.origin_of(&key),
+                    key,
+                    result,
+                });
+            }
+            WorkerCommand::DemoteRebalanced { seq, key } => {
+                let result = sessions.demote_rebalanced_out(&key);
+                rebalance_acks.push(crate::afxdp::RebalanceAck {
+                    seq,
+                    origin: sessions.origin_of(&key),
+                    key,
+                    result,
+                });
+            }
+            WorkerCommand::RestoreRebalancedOwner { seq, key } => {
+                let result = sessions.restore_rebalanced_owner(&key, now_ns);
+                rebalance_acks.push(crate::afxdp::RebalanceAck {
+                    seq,
+                    origin: sessions.origin_of(&key),
+                    key,
+                    result,
+                });
+            }
+            WorkerCommand::DemoteRebalancedReplica { seq, key } => {
+                // Reverse barrier: hand W_new's RebalancedOwner back to a
+                // worker-local replica. WorkerLocalImport is the correct
+                // resting origin for a materialized synced replica that this
+                // worker holds but does not own.
+                let result = sessions.demote_rebalanced_replica(&key);
+                rebalance_acks.push(crate::afxdp::RebalanceAck {
+                    seq,
+                    origin: sessions.origin_of(&key),
+                    key,
+                    result,
+                });
+            }
         }
     }
     WorkerCommandResults {
@@ -585,6 +639,7 @@ pub(super) fn apply_worker_commands(
         exported_sequences,
         shaped_tx_requests,
         vacate_all_shared_exact_slots,
+        rebalance_acks,
     }
 }
 

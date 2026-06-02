@@ -22,6 +22,13 @@ pub(in crate::afxdp) struct WorkerHandle {
     pub(in crate::afxdp) heartbeat: Arc<AtomicU64>,
     pub(in crate::afxdp) commands: Arc<Mutex<VecDeque<WorkerCommand>>>,
     pub(in crate::afxdp) session_export_ack: Arc<AtomicU64>,
+    /// #1748: structured rebalance command ack slot. The worker writes the
+    /// `{seq,key,origin,result}` after applying a Promote/Demote/Restore
+    /// rebalance command, then publishes the seq into `rebalance_ack_seq`
+    /// (Release). The controller polls `rebalance_ack_seq` (Acquire) for its
+    /// pending seq, then reads the slot to confirm key + origin.
+    pub(in crate::afxdp) rebalance_ack: Arc<Mutex<Option<super::RebalanceAck>>>,
+    pub(in crate::afxdp) rebalance_ack_seq: Arc<AtomicU64>,
     pub(in crate::afxdp) cos_status: Arc<ArcSwap<Vec<crate::protocol::CoSInterfaceStatus>>>,
     // #869: per-worker busy/idle runtime telemetry publish slot.
     pub(in crate::afxdp) runtime_atomics: Arc<super::worker_runtime::WorkerRuntimeAtomics>,
@@ -234,6 +241,38 @@ pub(in crate::afxdp) enum WorkerCommand {
     /// this command sets a flag in `WorkerCommandResults`; the outer
     /// poll loop dispatches via `vacate_all_shared_exact_slots`.
     VacateAllSharedExactSlots,
+    /// #1748: rebalance forward-barrier step 1 — flip W_new's existing
+    /// materialized replica `origin` to RebalancedOwner (tag flip +
+    /// liveness-only refresh, nothing else). The worker stores a structured
+    /// ack `{seq,key,origin,result}` so the controller confirms the EXACT key
+    /// reached RebalancedOwner before installing the ntuple rule.
+    PromoteRebalanced { seq: u64, key: SessionKey },
+    /// #1748: rebalance forward-barrier step 2 — flip W_old's forward entry
+    /// `origin` to RebalancedOut (tag flip only). Acked structurally.
+    DemoteRebalanced { seq: u64, key: SessionKey },
+    /// #1748: reverse-barrier step — restore W_old's RebalancedOut entry back
+    /// to a local owner (ForwardFlow) + liveness refresh, used on rollback and
+    /// teardown of a live move. Acked structurally.
+    RestoreRebalancedOwner { seq: u64, key: SessionKey },
+    /// #1748: reverse-barrier step — demote W_new's RebalancedOwner entry back
+    /// to a worker-local replica (WorkerLocalImport), used on rollback and
+    /// teardown of a live move (after W_old has been restored). Acked
+    /// structurally.
+    DemoteRebalancedReplica { seq: u64, key: SessionKey },
+}
+
+/// #1748: structured per-worker rebalance command ack. Unlike the raw
+/// `session_export_ack` AtomicU64 counter, the controller must read back the
+/// EXACT key and observed origin so it confirms the move reached the intended
+/// state (RebalancedOwner / RebalancedOut / restored / replica) before the
+/// barrier proceeds. `result` is false when the key was absent on the worker
+/// (the controller treats that as a failed step and rolls back).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::afxdp) struct RebalanceAck {
+    pub(in crate::afxdp) seq: u64,
+    pub(in crate::afxdp) key: SessionKey,
+    pub(in crate::afxdp) origin: Option<SessionOrigin>,
+    pub(in crate::afxdp) result: bool,
 }
 
 #[derive(Default)]

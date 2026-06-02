@@ -33,6 +33,10 @@ pub(crate) fn worker_loop(
     stop: Arc<AtomicBool>,
     heartbeat: Arc<AtomicU64>,
     session_export_ack: Arc<AtomicU64>,
+    // #1748: structured rebalance command ack slot + lock-free published seq.
+    // Written only when this worker applies a Promote/Demote rebalance command.
+    rebalance_ack: Arc<Mutex<Option<crate::afxdp::RebalanceAck>>>,
+    rebalance_ack_seq: Arc<AtomicU64>,
     poll_mode: crate::PollMode,
     dnat_fds: DnatTableFds,
     shared_fabrics: Arc<ArcSwap<Vec<FabricLink>>>,
@@ -609,6 +613,7 @@ pub(crate) fn worker_loop(
                 exported_sequences: Vec::new(),
                 shaped_tx_requests: Vec::new(),
                 vacate_all_shared_exact_slots: false,
+                rebalance_acks: Vec::new(),
             }
         };
         let WorkerCommandResults {
@@ -616,7 +621,23 @@ pub(crate) fn worker_loop(
             exported_sequences,
             shaped_tx_requests,
             vacate_all_shared_exact_slots,
+            rebalance_acks,
         } = command_results;
+        // #1748: publish each rebalance command ack. Write the structured
+        // {seq,key,origin,result} into the slot, THEN publish the seq
+        // (Release) so the controller that observes the seq (Acquire) is
+        // guaranteed to read the matching slot. Acks are applied in command
+        // order; the controller barriers on one outstanding seq at a time, so
+        // the last write for its pending seq is the one it reads.
+        if !rebalance_acks.is_empty() {
+            for ack in rebalance_acks {
+                let seq = ack.seq;
+                if let Ok(mut slot) = rebalance_ack.lock() {
+                    *slot = Some(ack);
+                }
+                rebalance_ack_seq.store(seq, Ordering::Release);
+            }
+        }
         // #941 Work item C: HA-demotion vacate. The
         // VacateAllSharedExactSlots WorkerCommand cannot be processed
         // inside `apply_worker_commands` (no BindingWorker access);

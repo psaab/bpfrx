@@ -170,6 +170,13 @@ pub(super) fn bring_up_workers(
         let stop = Arc::new(AtomicBool::new(false));
         let heartbeat = Arc::new(AtomicU64::new(monotonic_nanos()));
         let session_export_ack = Arc::new(AtomicU64::new(0));
+        // #1748: structured rebalance command ack slot + lock-free published
+        // seq. Allocated even when the rebalance controller is disabled — the
+        // worker only ever writes them when it applies a Promote/Demote
+        // rebalance command, which the controller only enqueues when the knob
+        // is on, so the default-OFF path is byte-identical (slots stay zero).
+        let rebalance_ack = Arc::new(Mutex::new(None::<crate::afxdp::RebalanceAck>));
+        let rebalance_ack_seq = Arc::new(AtomicU64::new(0));
         let cos_status = Arc::new(ArcSwap::from_pointee(Vec::new()));
         let commands = worker_command_queues
             .get(&worker_id)
@@ -189,6 +196,8 @@ pub(super) fn bring_up_workers(
         let stop_clone = stop.clone();
         let heartbeat_clone = heartbeat.clone();
         let session_export_ack_clone = session_export_ack.clone();
+        let rebalance_ack_clone = rebalance_ack.clone();
+        let rebalance_ack_seq_clone = rebalance_ack_seq.clone();
         let commands_clone = commands.clone();
         let peer_commands_clone = worker_command_queues
             .iter()
@@ -257,6 +266,8 @@ pub(super) fn bring_up_workers(
                     stop_clone,
                     heartbeat_clone,
                     session_export_ack_clone,
+                    rebalance_ack_clone,
+                    rebalance_ack_seq_clone,
                     worker_poll_mode,
                     dnat_fds,
                     shared_fabrics,
@@ -288,6 +299,8 @@ pub(super) fn bring_up_workers(
                         heartbeat,
                         commands,
                         session_export_ack,
+                        rebalance_ack,
+                        rebalance_ack_seq,
                         cos_status,
                         runtime_atomics,
                         cold_path_atomics,
