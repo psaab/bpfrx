@@ -52,3 +52,9 @@ Continuations fetch by id (Codex loses session state >30min).
 - AGY: adversarial-review-mpwr6tev-7agzdw — PLAN-NEEDS-MINOR (2 terminal-path gates; pre-declared their incorporation = PLAN-READY)
 - Claude-SMR: PLAN-READY
 - v7 @ folds AGY's two terminal-path gates → CONVERGED PLAN-READY
+
+## CODE review round 1 (PR #1749 @ a5621aa12)
+- Codex: /tmp/codex-1748-code-r1.txt, bash bg `b2cov2wgl` — pending
+- AGY: (job id below) — pending
+- Copilot: triggered on PR #1749
+- Claude-SMR: pending (hostile diff read)
