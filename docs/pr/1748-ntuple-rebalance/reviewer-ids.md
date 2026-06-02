@@ -77,3 +77,9 @@ Continuations fetch by id (Codex loses session state >30min).
 - AGY: adversarial-review-mpwu5ytx-b94ixo — MERGE-READY
 - Copilot: re-triggered
 - second-move fixes dispatched to impl agent
+
+## CODE review round 3 (PR #1749 @ cabdfd37c — second-move fixes)
+- Codex: /tmp/codex-1748-code-r3.txt, bash bg `b0mac8r4u` — MERGE-READY (all 3 second-move issues resolved, no findings)
+- AGY r2: MERGE-READY (still holds)
+- Copilot: re-review on bbed6eeb found 1 soundness (unsafe socket aliasing in teardown) + 4 doc/test minors → dispatched to agent
+- core protocol + second-move path BLESSED; pending the aliasing fix + minors
