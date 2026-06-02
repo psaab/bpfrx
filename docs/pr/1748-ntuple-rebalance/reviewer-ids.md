@@ -65,3 +65,9 @@ Continuations fetch by id (Codex loses session state >30min).
 - Copilot: COMMENTED — cumulative-bytes-as-rate (#8 new) + confirms #2
 - Claude-SMR: MERGE-READY-pending; verified core + refuted #1 empirically on mlx5
 - Fixes dispatched to impl agent (8 real + minor); #1 stays as-is
+
+## CODE review round 2 (PR #1749 @ 6447c0e4f — fixes)
+- Codex: /tmp/codex-1748-code-r2.txt, bash bg `bn7sigt5c` — pending
+- AGY: (job below) — pending
+- Copilot: re-triggered
+- spot-check: #2/#4/#5/#7/#8 verified in code by parent
