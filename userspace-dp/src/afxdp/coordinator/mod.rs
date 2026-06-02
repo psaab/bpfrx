@@ -71,9 +71,17 @@ pub struct Coordinator {
     pub(in crate::afxdp) rebalance_config: Option<crate::afxdp::rebalance::RebalanceConfig>,
     /// #1748: per-ifindex live rebalance controllers, constructed lazily on
     /// the first tick after the knob is enabled and a worker is bound to that
-    /// interface. Each owns its ethtool ntuple socket + rule ledger.
+    /// interface. Holds the rule ledger + cooldown + metrics.
     pub(in crate::afxdp) rebalance_controllers:
         BTreeMap<i32, crate::afxdp::rebalance::RebalanceController>,
+    /// #1748 review-r3 (soundness): the per-ifindex ethtool ntuple sockets,
+    /// kept SEPARATE from `rebalance_controllers` so the socket can be borrowed
+    /// as the BarrierTransport (`&NtupleSocket`) while the matching controller
+    /// is borrowed `&mut` for its tick/teardown — independent borrows, no
+    /// aliasing. The two maps are kept in lockstep (same ifindex key set):
+    /// constructed together on lazy bring-up, removed together on teardown.
+    pub(in crate::afxdp) rebalance_sockets:
+        BTreeMap<i32, crate::afxdp::rebalance::NtupleSocket>,
     /// #1748: last per-(worker) tx_bytes sample + monotonic ns, for deriving
     /// byte-rate across the controller tick window. Keyed by worker_id.
     pub(in crate::afxdp) rebalance_last_tx_bytes: BTreeMap<u32, (u64, u64)>,
@@ -120,6 +128,7 @@ impl Coordinator {
             worker_panics: BTreeMap::new(),
             rebalance_config: None,
             rebalance_controllers: BTreeMap::new(),
+            rebalance_sockets: BTreeMap::new(),
             rebalance_last_tx_bytes: BTreeMap::new(),
             rebalance_last_flow_bytes: std::collections::HashMap::new(),
         }

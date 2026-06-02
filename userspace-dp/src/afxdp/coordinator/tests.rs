@@ -1823,3 +1823,45 @@ fn aggregate_cos_waterfill_min_max_sentinel_when_no_candidate() {
     );
     assert_eq!(aggregated[0].waterfill_epochs, 777);
 }
+
+// #1748 review-r3 (soundness): exercise the rebalance teardown wiring that
+// previously aliased the controller's socket through a raw pointer during a
+// &mut self call. With the socket split into a separate Coordinator map, this
+// path is borrow-checked. The test constructs a controller + a real loopback
+// ntuple socket in the two lockstep maps, then runs the plain teardown and
+// asserts both maps are cleared with no panic / no aliasing UB. (An empty
+// ledger drives no worker barrier commands, so no live workers are needed.)
+#[test]
+fn rebalance_plain_teardown_clears_both_maps_soundly() {
+    let mut coordinator = Coordinator::new();
+    // Open a real ethtool socket on the loopback device. If the sandbox denies
+    // it, skip — the soundness property under test is the borrow structure,
+    // which still compiles regardless.
+    let Ok(sock) = crate::afxdp::rebalance::NtupleSocket::open("lo") else {
+        eprintln!("rebalance_plain_teardown_clears_both_maps_soundly: skipped (no lo ethtool socket)");
+        return;
+    };
+    let ifindex = 1;
+    coordinator.rebalance_sockets.insert(ifindex, sock);
+    coordinator.rebalance_controllers.insert(
+        ifindex,
+        crate::afxdp::rebalance::RebalanceController::new(
+            crate::afxdp::rebalance::RebalanceConfig::default(),
+        ),
+    );
+    assert_eq!(coordinator.rebalance_controllers.len(), 1);
+    assert_eq!(coordinator.rebalance_sockets.len(), 1);
+
+    // The formerly-unsafe path. Must not panic and must clear both maps in
+    // lockstep.
+    coordinator.teardown_all_rebalance_rules_plain();
+
+    assert!(
+        coordinator.rebalance_controllers.is_empty(),
+        "controllers cleared on plain teardown"
+    );
+    assert!(
+        coordinator.rebalance_sockets.is_empty(),
+        "sockets cleared on plain teardown (no fd leak)"
+    );
+}

@@ -97,13 +97,16 @@ impl super::Coordinator {
         let Some(mut controller) = self.rebalance_controllers.remove(&ifindex) else {
             return;
         };
-        let socket_ptr: *const NtupleSocket = controller.socket();
-        // SAFETY: the controller owns the socket for the duration of teardown;
-        // we only read it through the transport. `self` (for the barrier) and
-        // the socket do not alias mutably.
+        // #1748 review-r3 (soundness): take the socket OUT of its separate map
+        // so it is an owned local, independent of `self`. The transport borrows
+        // the local socket + `&self` for the barrier; the controller is a
+        // separate owned local. No aliasing, no raw pointer.
+        let Some(socket) = self.rebalance_sockets.remove(&ifindex) else {
+            return;
+        };
         let mut tx = CoordinatorBarrierTransport {
             coord: self,
-            socket: unsafe { &*socket_ptr },
+            socket: &socket,
         };
         controller.teardown_all(&mut tx, |_w, _k| true);
     }
@@ -117,16 +120,21 @@ impl super::Coordinator {
             let Some(mut controller) = self.rebalance_controllers.remove(&ifindex) else {
                 continue;
             };
-            let socket_ptr: *const NtupleSocket = controller.socket();
-            // SAFETY: controller owns the socket for the teardown; the no-op
-            // barrier transport only reads it.
+            // #1748 review-r3 (soundness): owned-local socket, separate from the
+            // owned-local controller — no aliasing / raw pointer.
+            let Some(socket) = self.rebalance_sockets.remove(&ifindex) else {
+                continue;
+            };
             let mut tx = CoordinatorBarrierTransport {
                 coord: self,
-                socket: unsafe { &*socket_ptr },
+                socket: &socket,
             };
             // is_live_on_new = false => plain delete for every entry.
             controller.teardown_all(&mut tx, |_w, _k| false);
         }
+        // Any sockets without a controller (shouldn't happen — maps are kept in
+        // lockstep) are still dropped here so no fd leaks across a teardown.
+        self.rebalance_sockets.clear();
         self.rebalance_last_tx_bytes.clear();
         self.rebalance_last_flow_bytes.clear();
     }
@@ -253,8 +261,12 @@ impl super::Coordinator {
                                 "xpf-rebalance: startup orphan reconcile on {ifname} (ifindex {ifindex}) failed: {e}"
                             ),
                         }
+                        // Keep the two maps in lockstep: socket in
+                        // rebalance_sockets, ledger/metrics in
+                        // rebalance_controllers.
+                        self.rebalance_sockets.insert(ifindex, sock);
                         self.rebalance_controllers
-                            .insert(ifindex, RebalanceController::new(config, sock));
+                            .insert(ifindex, RebalanceController::new(config));
                     }
                     Err(e) => {
                         eprintln!(
@@ -266,20 +278,23 @@ impl super::Coordinator {
             }
 
             let input = RebalanceTickInput { ifindex, workers, flows, now_secs };
-            // Take the controller out so the barrier transport can borrow
-            // `self` mutably without aliasing the controller. Put it back.
+            // #1748 review-r3 (soundness): take BOTH the controller and its
+            // socket out as independent owned locals, run the tick (transport
+            // borrows the local socket + `&self`; controller is borrowed `&mut`
+            // separately — no aliasing, no raw pointer), then put both back.
             let mut controller = self.rebalance_controllers.remove(&ifindex).unwrap();
-            let socket_ptr: *const NtupleSocket = controller.socket();
+            let socket = self
+                .rebalance_sockets
+                .remove(&ifindex)
+                .expect("rebalance_sockets kept in lockstep with rebalance_controllers");
             let outcome = {
-                // SAFETY: the controller (and its socket) is owned here for the
-                // tick; the transport borrows `self` for command queues + the
-                // socket by shared ref. They do not alias mutably.
                 let mut tx = CoordinatorBarrierTransport {
                     coord: self,
-                    socket: unsafe { &*socket_ptr },
+                    socket: &socket,
                 };
                 controller.tick(&input, &mut tx)
             };
+            self.rebalance_sockets.insert(ifindex, socket);
             if let Some(mv) = outcome {
                 slog_debug_rebalance_move(ifindex, &mv);
             }

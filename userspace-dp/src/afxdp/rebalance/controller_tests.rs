@@ -4,7 +4,7 @@
 // is mocked so the move protocol is exercised without a live Coordinator/NIC.
 
 use super::*;
-use super::super::ntuple::{FlowSpec5Tuple, NtupleSocket};
+use super::super::ntuple::FlowSpec5Tuple;
 use crate::session::SessionKey;
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -118,14 +118,11 @@ impl BarrierTransport for MockTransport {
     }
 }
 
-/// Build a controller with a throwaway socket. The socket is never used in
-/// these tests (the mock transport programs "the NIC"), so a loopback ethtool
-/// socket open is acceptable; if it fails (sandbox), fall back to the lo
-/// device which always exists.
+/// Build a controller. #1748 review-r3: the controller no longer owns the
+/// NtupleSocket (it lives separately on the Coordinator), so these tests drive
+/// the move protocol purely through the MockTransport — no real socket needed.
 fn test_controller(config: RebalanceConfig) -> RebalanceController {
-    let socket = NtupleSocket::open("lo")
-        .expect("open ethtool socket on lo");
-    RebalanceController::new(config, socket)
+    RebalanceController::new(config)
 }
 
 fn cfg() -> RebalanceConfig {

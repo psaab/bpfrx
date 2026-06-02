@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 
-use super::ntuple::{FlowProto, FlowSpec5Tuple, NtupleSocket};
+use super::ntuple::{FlowProto, FlowSpec5Tuple};
 use crate::session::SessionKey;
 
 /// Operator-tunable knobs compiled from the `class-of-service flow-rebalance`
@@ -174,11 +174,20 @@ struct LedgerEntry {
     loc: u32,
 }
 
-/// Persistent controller state for one interface. Owns the NtupleSocket only
-/// when the knob is enabled.
+/// Persistent controller state for one interface (ledger + cooldown +
+/// hysteresis + metrics). The NtupleSocket is owned separately by the
+/// Coordinator (see the struct comment below) so it can be borrowed as the
+/// BarrierTransport while the controller is borrowed `&mut`.
 pub(in crate::afxdp) struct RebalanceController {
+    // #1748 review-r3 (soundness): the NtupleSocket is deliberately NOT owned
+    // by the controller. The barrier transport needs a shared `&NtupleSocket`
+    // while the controller's tick/teardown take `&mut self`; owning the socket
+    // here and aliasing it through a raw pointer into the transport during a
+    // `&mut self` call is undefined behavior under stacked borrows. The socket
+    // lives in the Coordinator's separate `rebalance_sockets` map so the socket
+    // and the controller are independent borrows; the socket is passed to
+    // tick/teardown_all via the BarrierTransport `tx` parameter.
     config: RebalanceConfig,
-    socket: NtupleSocket,
     ledger: Vec<LedgerEntry>,
     /// Per-flow cooldown: key -> monotonic secs until which it is ineligible.
     cooldown: HashMap<SessionKey, u64>,
@@ -197,13 +206,9 @@ const DWELL_TICKS_REQUIRED: u32 = 2;
 const EPSILON_COV_IMPROVEMENT: f64 = 0.02;
 
 impl RebalanceController {
-    pub(in crate::afxdp) fn new(
-        config: RebalanceConfig,
-        socket: NtupleSocket,
-    ) -> Self {
+    pub(in crate::afxdp) fn new(config: RebalanceConfig) -> Self {
         Self {
             config,
-            socket,
             ledger: Vec::new(),
             cooldown: HashMap::new(),
             last_move_secs: 0,
@@ -214,11 +219,6 @@ impl RebalanceController {
 
     pub(in crate::afxdp) fn metrics(&self) -> &RebalanceMetrics {
         &self.metrics
-    }
-
-    /// Borrow the owned NtupleSocket as a BarrierTransport rule programmer.
-    pub(in crate::afxdp) fn socket(&self) -> &NtupleSocket {
-        &self.socket
     }
 
     /// Test-only: clear the per-flow cooldown so a unit test can drive a
