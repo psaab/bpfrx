@@ -830,6 +830,27 @@ impl BindingLiveState {
         (snapshot.rows.clone(), snapshot.truncated)
     }
 
+    /// #1748: cumulative TX bytes for this binding's live state. The
+    /// rebalance controller samples this per worker across a window to derive
+    /// per-worker byte-rate (the selection objective). Relaxed is fine — the
+    /// controller only needs an approximate rate over ~1 s.
+    pub(in crate::afxdp) fn tx_bytes(&self) -> u64 {
+        self.tx_bytes.load(Ordering::Relaxed)
+    }
+
+    /// #1748: ifindex this binding's socket is bound to (0 if unbound). Lets
+    /// the controller scope its observation/steering to a single NIC.
+    pub(in crate::afxdp) fn socket_ifindex(&self) -> i32 {
+        self.socket_ifindex.load(Ordering::Relaxed)
+    }
+
+    /// #1748: RX queue index this binding's socket is bound to. With AF_XDP
+    /// the queue id maps 1:1 to a worker, so this is the ntuple `ring_cookie`
+    /// target queue for a move onto this worker.
+    pub(in crate::afxdp) fn socket_queue_id(&self) -> u32 {
+        self.socket_queue_id.load(Ordering::Relaxed)
+    }
+
     /// Publish this binding's per-CoS active-flow counts.
     ///
     /// Unlike `flow_worker_map`, this per-binding snapshot has no local

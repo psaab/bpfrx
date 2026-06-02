@@ -372,6 +372,8 @@ const fn tx_frame_capacity() -> usize {
 
 #[path = "coordinator/mod.rs"]
 mod coordinator;
+// #1748: reactive cross-worker ntuple rebalance controller (default-OFF).
+mod rebalance;
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
