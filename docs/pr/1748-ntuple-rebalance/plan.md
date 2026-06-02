@@ -1,0 +1,168 @@
+# #1748 Step 1 — reactive cross-worker ntuple rebalance controller (forward-direction, default-OFF)
+
+- **Status**: DRAFT v1 — pending adversarial plan review
+- **Issue**: #1748
+- **Branch**: `engineer/1748-ntuple-rebalance`
+- **Predecessors**: converged research plan (`research-plan.md`); R1 spike PASS
+  (`r1-spike-findings.md`: CoV 16.8%→2.3–4.2%, aggregate preserved, established-
+  flow mid-flight re-pin on `ge-0-0-1`).
+
+## 1. Issue framing
+
+The per-flow CoV on shaped ports swings 14–29% (`-P12`) because RSS hashes the
+N flows unevenly across the 6 mlx5 VF RX queues → workers serve different flow
+counts (`[2,2,1,1,4,2]`), and a worker's capacity splits among *its* flows. The
+#1746 equal-flow cap can only clip fast flows down; it can't lift slow flows.
+The only lever that lifts slow flows *and* preserves aggregate is moving an
+established flow off an overloaded worker onto an idle one — proven in R1 to
+take CoV to 2.3–4.2% with aggregate *up*. This PR builds the reactive controller
+that does that move automatically.
+
+## 2. Honest scope/value framing
+
+- **Value**: lift `-P12` shaped-port CoV from ~16–29% toward the balanced floor
+  (~3–4% measured), WITHOUT the #1746 cap's aggregate loss. This is the only
+  mechanism that improves the structural ceiling `Cstruct` rather than operating
+  within it.
+- **Scope of THIS PR (deliberately bounded)**: a **default-OFF, opt-in**
+  forward-direction reactive rebalancer in Rust `userspace-dp`:
+  observe per-worker byte-rate imbalance → pick the flow whose move most
+  flattens the per-worker byte-rate → install one exact-5-tuple ntuple rule via
+  a direct `SIOCETHTOOL`/`ethtool_rxnfc` ioctl → bounded rule budget + hysteresis
+  + dwell (≪1 Hz rule churn). Plus the config knob, metrics, and operator docs.
+- *If reviewers conclude the perf gain is too small to justify the churn, or
+  that R4 (HA) cannot be made safe in this increment, PLAN-KILL is an acceptable
+  verdict.*
+
+## 3. What's already shipped / composes-with
+
+- **Session substrate (research §0, verified)**: HA replication pre-installs
+  forward+reverse session replicas on every sibling worker
+  (`poll_descriptor/mod.rs:1267`/`:1480`); the active-node packet path gates
+  forwarding on owner-RG-active, never on which worker owns the session
+  (`forwarding/mod.rs:541`, `session_glue/mod.rs:137`). So a flow steered to a
+  new RX queue forwards correctly with no migration code.
+- **Occupancy telemetry**: `coordinator/status.rs:195-206` already aggregates
+  per-`(ifindex, queue_id, worker_id)` active-flow counts; per-worker
+  `tx_bytes: AtomicU64` (`umem/mod.rs:387`) supplies byte-rate.
+- **Flow 5-tuples**: `flow_cache.rs` holds per-flow keys (incl. NAT rewrite
+  ports — see R7).
+- **ioctl precedent**: `slowpath.rs` already does `libc::ioctl` on an
+  `AF_INET`/`SOCK_DGRAM` socket (`SIOCGIFFLAGS`/`SIOCSIFFLAGS`/`TUNSETIFF`).
+- **#1746 cap + #1230 lease**: complementary (within-worker levers); this changes
+  `{aᵢ}` itself. No conflict (research §6).
+
+## 4. Concrete design
+
+### 4.1 NIC programming — direct ioctl, no shell-out, no genetlink crate
+The rust-netlink `ethtool` crate does **not** expose rxnfc/flow-classification
+rules (verified on docs.rs: only feature/coalesce/ring/channel/link/pause/FEC/
+timestamp). Flow rules are ioctl-only. New module
+`userspace-dp/src/afxdp/rebalance/ntuple.rs`:
+
+```rust
+// mirrors slowpath.rs's libc::ioctl-on-AF_INET-socket pattern
+#[repr(C)] struct EthtoolRxnfc { cmd: u32, flow_type: u32, /* h_u, m_u union */
+    data: u64, fs: EthtoolRxFlowSpec, rule_cnt: u32, rule_locs: [u32;0] }
+// ETHTOOL_SRXCLSRLINS=0x32, SRXCLSRLDEL=0x31, GRXCLSRLALL=0x30
+fn insert_rule(ifname, FlowSpec5Tuple, queue) -> io::Result<u32 /*loc*/>
+fn delete_rule(ifname, loc) -> io::Result<()>
+fn list_locs(ifname) -> io::Result<Vec<u32>>   // for reconcile/cleanup
+```
+Single `ioctl(fd, SIOCETHTOOL=0x8946, &ifreq{ifr_name, ifr_data:&rxnfc})`.
+Structured `errno` (e.g. `ENOSPC` at the 1024 cap, `EOPNOTSUPP` non-mlx5) — no
+text parsing. Programs the **local** node's interface only.
+
+### 4.2 Controller loop (coordinator-level, low cadence)
+New `rebalance/controller.rs`, ticked from the existing coordinator status
+cadence (NOT per-packet, NOT per-poll — gated to ≤1 decision/dwell-interval):
+1. Read per-worker byte-rate over the last window (Δtx_bytes/Δt per worker on the
+   target ifindex).
+2. If `max_worker / mean > imbalance_threshold` AND it has persisted ≥
+   `dwell_ticks` (hysteresis): pick the **heaviest single flow** on the hottest
+   worker whose move to the **least-loaded** worker most flattens the per-worker
+   byte-rate vector (byte-rate-aware selection — the fix for #1203's count-blind
+   defect, research §4 R1).
+3. Install one exact-5-tuple rule (forward direction) → least-loaded queue.
+   Record (5-tuple→loc,queue) in an in-memory ledger.
+4. Stop conditions: byte-rate CoV below target, or rule budget exhausted, or no
+   move improves the objective. Never oscillate (a flow re-pinned within
+   `cooldown` is ineligible).
+
+Bounded churn: at most one install per `rebalance_interval` (default ≥1 s),
+hard cap `max_rules` (≪1024) with graceful RSS fallback for the rest.
+
+### 4.3 Config knob (default-OFF)
+`pkg/config/schema.go` typed leaf under `class-of-service` (or `chassis`/
+forwarding-options — reviewer Q): `flow-rebalance` with sub-leaves
+`imbalance-threshold`, `rebalance-interval`, `max-rules`. Compiles to a
+userspace-dp control message; absent ⇒ controller never constructs its ioctl
+socket and installs zero rules (byte-identical default path).
+
+### 4.4 Metrics
+`xpf_userspace_flow_rebalance_{rules_active, installs_total, deletes_total,
+moves_skipped_total{reason}, worker_byterate_cov}` per ifindex.
+
+## 5. Public API preservation
+No existing Rust pub-fn signatures change. New module is additive. Go: one new
+schema leaf + one control-message field (additive, default zero).
+
+## 6. Hidden invariants to preserve
+- **Default-OFF is byte-identical**: no ioctl socket, no rules, no extra
+  per-tick work when the knob is unset (gated construction).
+- **Control-socket contention** (CLAUDE.md): the controller must NOT add a
+  >1 Hz control-socket caller; it reads worker telemetry already collected by
+  the status path and programs the NIC directly (not via the control socket).
+- **No per-packet/per-poll cost**: decision loop is coordinator-cadence only.
+- **ioctl safety**: `ethtool_rxnfc` layout must match the kernel UAPI exactly
+  (size/align) — compile-time `size_of` assertion + a parity test.
+- **Rule lifecycle**: every installed rule is tracked and deleted on disable,
+  flow-close, daemon shutdown, and reconcile (no orphan HW rules across config
+  changes — `list_locs` reconcile on startup clears stale xpf-owned rules).
+
+## 7. Risk assessment
+| Class | Level | Note |
+|---|---|---|
+| Behavioral regression | LOW (OFF) / MED (ON) | OFF is byte-identical; ON adds HW steering — R3 transient reorder is the main correctness watch |
+| Lifetime/borrow | LOW | additive module, owns its own state/socket |
+| Performance regression | LOW | coordinator-cadence, ≪1 Hz rule writes; ~1 ms/rule firmware off the hot path |
+| Architectural mismatch | MED | R4 (HA mirroring) deferred — must prove forward-only single-node re-pin is HA-*correct* (not just fairness) this increment, or KILL |
+
+## 8. Test plan
+- cargo build + full suite; new `ntuple.rs` UAPI size/parity test + controller
+  unit tests (selection objective, hysteresis, budget, oscillation guard) 5×.
+- Go suite (schema leaf + compile).
+- Deploy on loss cluster. **R1-equivalent live gate**: enable knob, `-P12 -p5210`
+  push, confirm controller drives per-worker `{aᵢ}` toward balance and per-flow
+  CoV ≤10% with aggregate not regressed and bounded retransmits (incremental
+  moves, not the 7601 bulk-move artifact). Default-OFF control run unchanged.
+- Full Pass A/B smoke matrix (v4+v6 × push+reverse × CoS-off/on).
+- **`make test-failover`** MUST stay clean (touches placement on an HA cluster).
+
+## 9. Out of scope (explicit follow-ups)
+- **R2 reverse-direction** rule pair (forward-only this PR; documented).
+- **R4 HA peer rule-mirroring** for fairness *continuity* across failover (this
+  PR proves correctness; mirroring for sustained post-failover fairness is a
+  follow-up). After failover the new primary falls back to RSS until it
+  re-converges — fairness, not correctness, regresses.
+- Full 1024-rule eviction policy refinement (R5) beyond a simple budget+cooldown.
+
+## 10. Open questions for adversarial review (each invitable to PLAN-KILL)
+1. **R4 correctness**: does re-pinning ONLY the forward 5-tuple on ONLY the
+   active node break reverse-companion resolution or session-sync on the peer?
+   Research §0 says replicas exist on all workers so forwarding is fine — find a
+   packet-path or sync site that gates on the *specific* worker and breaks. If
+   one exists, KILL (HA can't be deferred).
+2. **R3 transient**: is the per-move reorder bounded enough to avoid TCP resets
+   under incremental single-flow moves, or does even one move risk a reset?
+3. **`ethtool_rxnfc` UAPI**: is the struct/union layout correct across the
+   target kernel (7.0.0-rc7+) and is `SIOCETHTOOL` the right path vs the ethtool
+   netlink family (confirm flow rules truly aren't in genetlink)?
+4. **Selection objective**: is "move the heaviest flow on the hottest worker"
+   provably convergent (not oscillating) with hysteresis, or can it thrash like
+   #840 (CoV 37.7% vs 18.5%)?
+5. **Schema placement**: is `class-of-service flow-rebalance` the right grammar
+   home, or does this belong under `chassis`/`forwarding-options`?
+6. **Scope honesty**: is a forward-only, single-node, default-OFF increment a
+   coherent shippable unit, or does it only become useful once R2+R4 land (→
+   ship nothing until then)?
