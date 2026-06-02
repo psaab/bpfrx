@@ -759,9 +759,17 @@ fn equal_flow_fail_open_after_enforcement_does_not_reuse_stale_cap() {
     let granted = lease.acquire_v8(0, 4 * EPOCH_DURATION_NS, 10_000);
     assert_eq!(granted, 8_000);
     assert!(!lease.v8_equal_flow_enforced());
+    // #1745: the sample set is now the acquire-time sticky-max. In epoch 3
+    // only worker 1 acquired (the seed's `acquire_v8(1, 3*EPOCH, 1)`), so
+    // at the epoch-4 rotation worker 0 is active-at-rotation but with no
+    // epoch-3 demand/grant/sample — an idle-at-rotation worker that is
+    // correctly EXCLUDED (not blamed as UnsampledActiveWorker). With only
+    // worker 1 sampled, the publisher bails InsufficientSampledWorkers.
+    // The load-bearing assertions (not enforced, grant = ordinary share,
+    // no stale cap reuse) are unchanged.
     assert_eq!(
         lease.v8_equal_flow_fail_open_reason(),
-        V8EqualFlowFailOpenReason::UnsampledActiveWorker
+        V8EqualFlowFailOpenReason::InsufficientSampledWorkers
     );
 }
 
@@ -786,9 +794,17 @@ fn equal_flow_fail_open_for_unsampled_active_worker() {
     let _ = lease.acquire_v8(0, EPOCH_DURATION_NS, 1_000);
     let _ = lease.acquire_v8(0, 2 * EPOCH_DURATION_NS, 1_000);
     assert!(!lease.v8_equal_flow_enforced());
+    // #1745: worker 1 has a nonzero rehydrated flow bucket but never
+    // acquired (sent zero traffic this window) -> no demand/grant/sample
+    // -> idle-at-rotation, correctly EXCLUDED rather than blamed. Only
+    // worker 0 is a real participant, so the publisher bails
+    // InsufficientSampledWorkers (one sampled worker), which is the
+    // accurate reason. This is precisely the banked/idle decoupling the
+    // fix introduces: a flow-bucket-nonzero-but-silent worker no longer
+    // forces a fail-open on behalf of the truly-active worker.
     assert_eq!(
         lease.v8_equal_flow_fail_open_reason(),
-        V8EqualFlowFailOpenReason::UnsampledActiveWorker
+        V8EqualFlowFailOpenReason::InsufficientSampledWorkers
     );
 }
 
@@ -815,9 +831,13 @@ fn equal_flow_fail_open_for_quiet_active_worker_without_demand_or_grant() {
     let _ = lease.acquire_v8(0, EPOCH_DURATION_NS, 8_000);
     let _ = lease.acquire_v8(0, 2 * EPOCH_DURATION_NS, 8_000);
     assert!(!lease.v8_equal_flow_enforced());
+    // #1745: worker 1 is "quiet active" — a nonzero flow bucket but no
+    // demand/grant/sample (it never acquired). It is the idle-at-rotation
+    // exclude case, so it no longer forces an UnsampledActiveWorker bail.
+    // Only worker 0 is sampled -> InsufficientSampledWorkers.
     assert_eq!(
         lease.v8_equal_flow_fail_open_reason(),
-        V8EqualFlowFailOpenReason::UnsampledActiveWorker
+        V8EqualFlowFailOpenReason::InsufficientSampledWorkers
     );
 }
 
@@ -834,6 +854,196 @@ fn equal_flow_fail_open_for_nonzero_low_demand_worker() {
     assert_eq!(
         lease.v8_equal_flow_fail_open_reason(),
         V8EqualFlowFailOpenReason::LowDemandWorker
+    );
+}
+
+// === #1745: acquire-time active-flow sampling regression tests ===
+
+/// #1745 regression: a forced `InsufficientSampledWorkers` epoch must
+/// leave `suppressed_grant_bytes` and `cap_hit_events` untouched (it is a
+/// fail-open, not a suppression). Validation gate 3.
+#[test]
+fn equal_flow_insufficient_sampled_workers_leaves_suppression_unchanged() {
+    let lease = new_equal_flow_lease();
+    // Single active worker (-P1-style): it acquires alone, so the
+    // publisher can never reach the sampled>=2 threshold.
+    lease.rehydrate_worker_active_count(0, 1);
+    let _ = lease.acquire_v8(0, EPOCH_DURATION_NS, 1_000);
+    let _ = lease.acquire_v8(0, 2 * EPOCH_DURATION_NS, 1_000);
+    assert!(!lease.v8_equal_flow_enforced());
+    assert_eq!(
+        lease.v8_equal_flow_fail_open_reason(),
+        V8EqualFlowFailOpenReason::InsufficientSampledWorkers
+    );
+    let suppressed_before = lease.v8_equal_flow_suppressed_grant_bytes();
+    let cap_hits_before = lease.v8_equal_flow_cap_hit_events();
+    // Drive another fail-open epoch with the same single worker.
+    let _ = lease.acquire_v8(0, 3 * EPOCH_DURATION_NS, 1_000);
+    assert!(!lease.v8_equal_flow_enforced());
+    assert_eq!(
+        lease.v8_equal_flow_suppressed_grant_bytes(),
+        suppressed_before,
+        "fail-open epoch must not increment suppressed_grant_bytes"
+    );
+    assert_eq!(
+        lease.v8_equal_flow_cap_hit_events(),
+        cap_hits_before,
+        "fail-open epoch must not increment cap_hit_events"
+    );
+}
+
+/// #1745 positive: two workers sampled via the acquire-time sticky-max
+/// path reach enforcement. Crucially, the worker that is "ahead" stops
+/// re-acquiring on the enforcing epoch (models the banked exact queue
+/// that skips acquire_v8 while it has tokens); the OTHER worker's acquire
+/// triggers the rotation. Enforcement must still publish because both
+/// workers left a sticky-max sample in the just-ended epoch, even though
+/// only one of them demands on the rotating epoch itself.
+#[test]
+fn equal_flow_enforces_from_acquire_time_samples_when_ahead_worker_banks() {
+    let lease = new_equal_flow_lease();
+    lease.rehydrate_worker_active_count(0, 4);
+    lease.rehydrate_worker_active_count(1, 1);
+
+    // Epoch 1 + 2: both workers acquire (both leave samples + demand).
+    let _ = lease.acquire_v8(0, EPOCH_DURATION_NS, 8_000);
+    let _ = lease.acquire_v8(1, EPOCH_DURATION_NS, 1_800);
+    let _ = lease.acquire_v8(0, 2 * EPOCH_DURATION_NS, 8_000);
+    let _ = lease.acquire_v8(1, 2 * EPOCH_DURATION_NS, 1_800);
+    assert!(!lease.v8_equal_flow_enforced());
+
+    // Epoch 3 rotation: only worker 1 acquires (worker 0 is "banked" and
+    // skips acquire). The epoch-2 samples for BOTH workers were captured
+    // at acquire time, so the publisher has a 2-worker sample set and
+    // enforces. Under the pre-#1745 rotation-instant logic worker 0 would
+    // have been active-but-undemanded and forced a fail-open.
+    let _ = lease.acquire_v8(1, 3 * EPOCH_DURATION_NS, 1);
+    assert!(
+        lease.v8_equal_flow_enforced(),
+        "enforcement must trigger from acquire-time samples even when the \
+         ahead worker banks and skips acquire on the rotating epoch"
+    );
+    assert!(lease.v8_equal_flow_target_per_flow() > 0);
+    assert!(lease.v8_equal_flow_worker_cap() > 0);
+}
+
+/// #1745: the sample is a STICKY-MAX across the epoch, not last-write. A
+/// worker that records a high flow count then a lower one (flow teardown)
+/// in the same epoch must contribute the MAX to the rotation sample.
+#[test]
+fn equal_flow_active_sample_is_sticky_max_within_epoch() {
+    let lease = new_equal_flow_lease();
+    let v8 = lease.v8.as_ref().expect("v8 lease");
+    // Use the published epoch tag the slot was reset to at construction
+    // (tag 0). Record high then low for worker 0.
+    let tag = v8.equal_flow.epoch_tag.load(Ordering::Acquire);
+    record_equal_flow_active_sample(&v8.worker_equal_flow_active_samples[0], tag, 10);
+    record_equal_flow_active_sample(&v8.worker_equal_flow_active_samples[0], tag, 3);
+    let (slot_tag, slot_count) =
+        PackedEpochGrant::unpack(v8.worker_equal_flow_active_samples[0].0.load(Ordering::Acquire));
+    assert_eq!(slot_tag, tag);
+    assert_eq!(slot_count, 10, "sticky-max must keep the high count");
+}
+
+/// #1745 critical race: a stale acquirer (snapshotted a different epoch
+/// tag) must NEVER write its tag over a slot the rotation already advanced
+/// to a different epoch. The helper matches on tag EQUALITY, so any
+/// mismatch (forward, backward, OR wrapped) no-ops.
+#[test]
+fn equal_flow_active_sample_never_writes_tag_backwards() {
+    let lease = new_equal_flow_lease();
+    let v8 = lease.v8.as_ref().expect("v8 lease");
+    // Simulate a rotation having advanced the slot to epoch tag 5, count 0.
+    v8.worker_equal_flow_active_samples[0]
+        .0
+        .store(PackedEpochGrant::pack(5, 0), Ordering::Release);
+    // A stale acquirer holding my_tag = 3 tries to record.
+    record_equal_flow_active_sample(&v8.worker_equal_flow_active_samples[0], 3, 99);
+    let (slot_tag, slot_count) =
+        PackedEpochGrant::unpack(v8.worker_equal_flow_active_samples[0].0.load(Ordering::Acquire));
+    assert_eq!(slot_tag, 5, "stale acquirer must not write tag backwards");
+    assert_eq!(slot_count, 0, "stale acquirer must not corrupt the count");
+}
+
+/// #1745 / Codex code-review HIGH: the u32 epoch tag wraps every ~9.94
+/// days at the 200µs epoch. A stale acquirer holding `my_tag = u32::MAX`
+/// racing a rotation that reset the slot to the freshly-wrapped epoch
+/// `(0, 0)` must NOT write its wrapped-old tag backwards. Equality
+/// matching makes `0 != u32::MAX` a clean no-op; a relational
+/// `curr_tag > my_tag` check would have failed (`0 > u32::MAX == false`)
+/// and corrupted the fresh epoch-0 slot.
+#[test]
+fn equal_flow_active_sample_safe_across_tag_wrap() {
+    let lease = new_equal_flow_lease();
+    let v8 = lease.v8.as_ref().expect("v8 lease");
+    // Rotation has just wrapped: slot freshly reset to epoch tag 0.
+    v8.worker_equal_flow_active_samples[0]
+        .0
+        .store(PackedEpochGrant::pack(0, 0), Ordering::Release);
+    // A stale acquirer from the pre-wrap epoch (my_tag = u32::MAX) records.
+    record_equal_flow_active_sample(&v8.worker_equal_flow_active_samples[0], u32::MAX, 99);
+    let (slot_tag, slot_count) =
+        PackedEpochGrant::unpack(v8.worker_equal_flow_active_samples[0].0.load(Ordering::Acquire));
+    assert_eq!(slot_tag, 0, "wrapped stale acquirer must not write tag backwards");
+    assert_eq!(slot_count, 0, "wrapped stale acquirer must not corrupt the count");
+    // And the legitimate epoch-0 acquirer still records normally.
+    record_equal_flow_active_sample(&v8.worker_equal_flow_active_samples[0], 0, 7);
+    let (slot_tag2, slot_count2) =
+        PackedEpochGrant::unpack(v8.worker_equal_flow_active_samples[0].0.load(Ordering::Acquire));
+    assert_eq!(slot_tag2, 0);
+    assert_eq!(slot_count2, 7, "fresh epoch-0 acquirer records its sample");
+}
+
+/// #1745: the default `CstructDefault` rate mode must never touch the
+/// acquire-time sample array, on either the acquire or rotation side.
+#[test]
+fn equal_flow_default_mode_never_records_active_samples() {
+    let lease = SharedCoSQueueLease::new_v8(50_000_000, 256 * 1024, 2, 1);
+    lease.rehydrate_worker_active_count(0, 4);
+    lease.rehydrate_worker_active_count(1, 1);
+    let _ = lease.acquire_v8(0, EPOCH_DURATION_NS, 8_000);
+    let _ = lease.acquire_v8(1, EPOCH_DURATION_NS, 2_000);
+    let _ = lease.acquire_v8(0, 2 * EPOCH_DURATION_NS, 8_000);
+    let _ = lease.acquire_v8(1, 2 * EPOCH_DURATION_NS, 2_000);
+    let v8 = lease.v8.as_ref().expect("v8 lease");
+    for slot in v8.worker_equal_flow_active_samples.iter() {
+        assert_eq!(
+            slot.0.load(Ordering::Acquire),
+            0,
+            "CstructDefault path must leave the equal-flow sample array untouched"
+        );
+    }
+}
+
+/// #1745 / Codex Finding 4 safety: a worker that demanded-or-was-granted
+/// bytes but whose acquire-time sample is missing (a real participant we
+/// failed to sample, e.g. via the tag-backwards race) must keep the
+/// `UnsampledActiveWorker` fail-open rather than be silently excluded.
+#[test]
+fn equal_flow_unsampled_real_participant_still_fails_open() {
+    let lease = new_equal_flow_lease();
+    lease.rehydrate_worker_active_count(0, 4);
+    lease.rehydrate_worker_active_count(1, 1);
+    // Both workers acquire for two epochs to build demand + grants +
+    // samples, reaching the verge of enforcement.
+    let _ = lease.acquire_v8(0, EPOCH_DURATION_NS, 8_000);
+    let _ = lease.acquire_v8(1, EPOCH_DURATION_NS, 1_800);
+    let _ = lease.acquire_v8(0, 2 * EPOCH_DURATION_NS, 8_000);
+    let _ = lease.acquire_v8(1, 2 * EPOCH_DURATION_NS, 1_800);
+    // Before the next rotation, wipe worker 0's epoch-2 sample slot so it
+    // becomes a "demanded+granted but unsampled" participant at rotation.
+    let v8 = lease.v8.as_ref().expect("v8 lease");
+    v8.worker_equal_flow_active_samples[0]
+        .0
+        .store(0, Ordering::Release);
+    // Worker 1 triggers the rotation into epoch 3.
+    let _ = lease.acquire_v8(1, 3 * EPOCH_DURATION_NS, 1);
+    assert!(!lease.v8_equal_flow_enforced());
+    assert_eq!(
+        lease.v8_equal_flow_fail_open_reason(),
+        V8EqualFlowFailOpenReason::UnsampledActiveWorker,
+        "a demanded/granted-but-unsampled real participant must keep the \
+         safety fail-open, not be silently excluded"
     );
 }
 

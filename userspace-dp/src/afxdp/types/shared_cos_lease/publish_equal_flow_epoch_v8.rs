@@ -23,7 +23,7 @@ pub(super) fn publish_equal_flow_epoch_v8(
     n_workers: usize,
     active_outside_scratch: bool,
     active_by_worker: &[bool],
-    active_flows_by_worker: &[u32],
+    sampled_active_flows_by_worker: &[u32],
     demanded_by_worker: &[bool],
     prev_grants: &[u32],
 ) {
@@ -33,6 +33,25 @@ pub(super) fn publish_equal_flow_epoch_v8(
         return;
     }
 
+    // #1745: derive the equal-flow sample set from the acquire-time
+    // sticky-max active-flow samples, NOT the rotation-instant
+    // worker_active_flow_buckets read. A worker is in the set iff it has a
+    // usable sample (nonzero acquire-time active-flow sample) AND it both
+    // demanded lease credit and was granted bytes this epoch.
+    //
+    // Three cases per active worker:
+    //   - usable sample + demanded + granted  -> in the sample set
+    //   - participated (demanded OR granted) but no usable sample
+    //     -> a real participant we failed to sample: keep the safety
+    //        fail-open (UnsampledActiveWorker)
+    //   - active flow-bucket nonzero but no demand AND no grants AND no
+    //     sample -> genuinely idle-at-rotation worker (the banked-worker
+    //     case this fix targets): EXCLUDE from the set, do NOT fail open.
+    //       Per the #1745 sufficiency proof, a worker carrying real
+    //       traffic cannot stay banked across a whole epoch (exact queues
+    //       have no autonomous refill; any sent byte drops the bucket
+    //       below the watermark and forces acquire_v8), so such a worker
+    //       legitimately sent nothing this epoch.
     let mut active_workers = 0u32;
     let mut sampled_workers = 0u32;
     for id in 0..n_workers {
@@ -40,12 +59,18 @@ pub(super) fn publish_equal_flow_epoch_v8(
             continue;
         }
         active_workers = active_workers.saturating_add(1);
-        if !demanded_by_worker[id] || prev_grants[id] == 0 {
+        let has_sample =
+            sampled_active_flows_by_worker[id] > 0 && demanded_by_worker[id] && prev_grants[id] > 0;
+        if has_sample {
+            sampled_workers = sampled_workers.saturating_add(1);
+        } else if demanded_by_worker[id] || prev_grants[id] > 0 {
+            // Real participant we could not sample cleanly: fail open
+            // rather than set the class target from an incomplete set.
             v8.equal_flow
                 .fail_open(new_tag, V8EqualFlowFailOpenReason::UnsampledActiveWorker);
             return;
         }
-        sampled_workers = sampled_workers.saturating_add(1);
+        // else: idle-at-rotation worker — excluded, no fail-open.
     }
 
     if active_workers == 0 {
@@ -68,11 +93,10 @@ pub(super) fn publish_equal_flow_epoch_v8(
         if !active_by_worker[id] {
             continue;
         }
-        let active_flows = active_flows_by_worker[id] as u64;
-        if active_flows == 0 {
-            v8.equal_flow
-                .fail_open(new_tag, V8EqualFlowFailOpenReason::ArithmeticInvalid);
-            return;
+        // Only the sampled set contributes to the target / cap math.
+        let active_flows = sampled_active_flows_by_worker[id] as u64;
+        if active_flows == 0 || !demanded_by_worker[id] || prev_grants[id] == 0 {
+            continue;
         }
         let per_flow = (prev_grants[id] as u64) / active_flows;
         if per_flow == 0 {
@@ -128,11 +152,18 @@ pub(super) fn publish_equal_flow_epoch_v8(
             .fail_open(new_tag, V8EqualFlowFailOpenReason::ZeroTarget);
         return;
     }
+    // #1745: cap is derived over the SAMPLED set, using the same
+    // sticky-max sample that produced the target, so the published cap is
+    // internally consistent with the published per-flow target.
     for id in 0..n_workers {
         if !active_by_worker[id] {
             continue;
         }
-        let Some(worker_cap) = smoothed.checked_mul(active_flows_by_worker[id] as u64) else {
+        let sample = sampled_active_flows_by_worker[id] as u64;
+        if sample == 0 || !demanded_by_worker[id] || prev_grants[id] == 0 {
+            continue;
+        }
+        let Some(worker_cap) = smoothed.checked_mul(sample) else {
             v8.equal_flow
                 .fail_open(new_tag, V8EqualFlowFailOpenReason::ArithmeticInvalid);
             return;

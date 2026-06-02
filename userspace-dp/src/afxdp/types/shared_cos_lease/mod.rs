@@ -421,6 +421,24 @@ struct V8State {
     /// peer from a naturally quiet peer whose active-flow counter is
     /// merely nonzero. Length = max_worker_id + 1.
     worker_demand_events: Box<[PackedEpochGrant]>,
+    /// #1745: per-worker tagged max active-flow sample, recorded at
+    /// `acquire_v8` time (when the worker requests lease credit while
+    /// active). Each slot is packed (epoch_tag, max_active_flows_seen).
+    /// Decouples the equal-flow sample set from the rotation-instant
+    /// `worker_active_flow_buckets` read + the per-epoch demand boolean,
+    /// which together missed exact-queue workers running on banked tokens:
+    /// they skip `acquire_v8` at the bank watermark
+    /// (`cos/token_bucket.rs`) and so did not bump demand for an epoch
+    /// whose consumption stayed under the bank, even while their flow
+    /// bucket was nonzero. Recorded ONLY in `EqualFlowSuppress` rate mode
+    /// (the default `CstructDefault` path never touches this array, on
+    /// both the acquire and rotation sides — see the gates in
+    /// `acquire_v8` and `rotate_epoch_v8`). Swapped at rotation alongside
+    /// `worker_demand_events`. Length = max_worker_id + 1, in lock-step
+    /// with `worker_grants`. Single-writer-per-slot on the acquire side
+    /// (only worker `id` writes its slot); rotation winner is the sole
+    /// swapper.
+    worker_equal_flow_active_samples: Box<[PackedEpochGrant]>,
     equal_flow: V8EqualFlowSuppressState,
 }
 
@@ -1069,6 +1087,15 @@ impl SharedCoSQueueLease {
             .map(|_| PackedEpochGrant::new())
             .collect::<Vec<_>>()
             .into_boxed_slice();
+        // #1745: per-worker acquire-time active-flow sample slots, same
+        // size + tag-checked-CAS pattern as worker_demand_events. Built
+        // unconditionally so it stays in lock-step with worker_grants on
+        // every lease rebuild (HA failover, config change); only WRITTEN
+        // in EqualFlowSuppress mode.
+        let worker_equal_flow_active_samples = (0..len)
+            .map(|_| PackedEpochGrant::new())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Self {
             config,
             state: SharedCoSLeaseState {
@@ -1083,6 +1110,7 @@ impl SharedCoSQueueLease {
                 worker_fair_share,
                 worker_starvation_events,
                 worker_demand_events,
+                worker_equal_flow_active_samples,
                 equal_flow: V8EqualFlowSuppressState::new(),
             }),
         }
@@ -1183,13 +1211,26 @@ impl SharedCoSQueueLease {
             return 0;
         }
 
-        let active = v8
+        let active_flows = v8
             .worker_active_flow_buckets
             .get(worker_id)
-            .map(|a| a.load(Ordering::Relaxed) > 0)
-            .unwrap_or(false);
+            .map(|a| a.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        let active = active_flows > 0;
         if active {
             bump_epoch_event(&v8.worker_demand_events[worker_id], my_tag);
+            // #1745: in EqualFlowSuppress mode, record a tagged sticky-max
+            // active-flow sample at acquire time. This is the sample source
+            // the rotation/publisher uses for the equal-flow set, decoupled
+            // from the rotation-instant flow-bucket read. The default
+            // CstructDefault path is byte-unaffected (no write here).
+            if v8.rate_mode == V8RateMode::EqualFlowSuppress {
+                record_equal_flow_active_sample(
+                    &v8.worker_equal_flow_active_samples[worker_id],
+                    my_tag,
+                    active_flows,
+                );
+            }
         }
         let equal_flow_cap = self.equal_flow_cap_v8(v8, worker_id, my_tag);
         let equal_flow_enforced = equal_flow_cap.is_some();
@@ -1681,6 +1722,49 @@ fn bump_epoch_event(pg: &PackedEpochGrant, my_tag: u32) {
         let new = PackedEpochGrant::pack(curr_tag, curr_count + 1);
         let _ =
             pg.0.compare_exchange_weak(curr, new, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
+/// #1745: tag-checked sticky-max record of a per-worker active-flow
+/// sample. Records `max(curr, active_flows)` for the current epoch tag.
+///
+/// CRITICAL race safety: an acquirer snapshots `my_tag` from the seqlock
+/// before this call. The rotation winner installs the fresh `(new_tag, 0)`
+/// into every sample slot (the gated swap in `rotate_epoch_v8`) BEFORE it
+/// publishes the new epoch via the seqlock seq store, so by the time any
+/// acquirer observes `my_tag = N` the slot already carries tag `N`. The
+/// only writable case is therefore `curr_tag == my_tag`; on any mismatch
+/// we no-op.
+///
+/// The match is **tag EQUALITY, not ordering** — identical to the
+/// discipline of `bump_epoch_event` / `worker_grant_bump`. A relational
+/// `curr_tag > my_tag` check would be UNSAFE at the `u32` tag wrap (every
+/// ~9.94 days at the 200 µs epoch): a stale acquirer holding
+/// `my_tag = u32::MAX` racing a rotation that reset the slot to `(0, 0)`
+/// would see `0 > u32::MAX == false` and write its wrapped-old tag
+/// backwards over the fresh epoch (Codex code-review HIGH). Equality
+/// no-ops on the wrap mismatch exactly as it does on any other rotation,
+/// dropping at most one sample — the same tolerated, wrap-safe behaviour
+/// the sibling helpers already rely on.
+#[inline]
+fn record_equal_flow_active_sample(pg: &PackedEpochGrant, my_tag: u32, active_flows: u32) {
+    loop {
+        let curr = pg.0.load(Ordering::Acquire);
+        let (curr_tag, curr_count) = PackedEpochGrant::unpack(curr);
+        if curr_tag != my_tag {
+            return; // rotation occurred (incl. tag wrap); drop this sample
+        }
+        if curr_count >= active_flows {
+            return; // already at or above the sticky-max; nothing to do
+        }
+        let new = PackedEpochGrant::pack(my_tag, active_flows);
+        if pg
+            .0
+            .compare_exchange_weak(curr, new, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return;
+        }
     }
 }
 

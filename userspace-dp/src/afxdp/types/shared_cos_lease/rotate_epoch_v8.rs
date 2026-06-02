@@ -75,7 +75,6 @@ impl SharedCoSQueueLease {
         let mut demanded_by_worker = [false; MAX_WORKERS_SCRATCH];
         let mut prev_grants = [0u32; MAX_WORKERS_SCRATCH];
         let mut active_by_worker = [false; MAX_WORKERS_SCRATCH];
-        let mut active_flows_by_worker = [0u32; MAX_WORKERS_SCRATCH];
         let mut active_outside_scratch = false;
 
         // STEP 2: swap event slots, track per-worker signal/demand flags.
@@ -97,7 +96,6 @@ impl SharedCoSQueueLease {
                 .unwrap_or(0);
             if id < n_workers {
                 active_by_worker[id] = active > 0;
-                active_flows_by_worker[id] = active;
                 demanded_by_worker[id] = old_demand_count > 0;
                 if active > 0 && old_starvation_count > 0 {
                     signaled_by_worker[id] = true;
@@ -121,13 +119,32 @@ impl SharedCoSQueueLease {
         }
 
         if v8.rate_mode == V8RateMode::EqualFlowSuppress {
+            // #1745: swap the acquire-time active-flow sample slots and
+            // capture the just-ended epoch's sticky-max per worker. This
+            // swap is INSIDE the EqualFlowSuppress branch so the default
+            // CstructDefault path performs zero extra atomic ops per
+            // rotation. A slot is only counted when its swapped-out tag
+            // matches the just-ended epoch tag (= seq>>1); a slot never
+            // written this epoch swaps out with the prior tag and is
+            // correctly excluded as 0.
+            let just_ended_tag = (seq >> 1) as u32;
+            let mut sampled_active_flows_by_worker = [0u32; MAX_WORKERS_SCRATCH];
+            for id in 0..v8.worker_equal_flow_active_samples.len() {
+                let old_sample = v8.worker_equal_flow_active_samples[id]
+                    .0
+                    .swap(new_packed_zero, Ordering::AcqRel);
+                let (old_tag, old_count) = PackedEpochGrant::unpack(old_sample);
+                if id < n_workers && old_tag == just_ended_tag {
+                    sampled_active_flows_by_worker[id] = old_count;
+                }
+            }
             publish_equal_flow_epoch_v8(
                 v8,
                 new_tag,
                 n_workers,
                 active_outside_scratch,
                 &active_by_worker,
-                &active_flows_by_worker,
+                &sampled_active_flows_by_worker,
                 &demanded_by_worker,
                 &prev_grants,
             );
