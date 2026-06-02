@@ -77,6 +77,13 @@ pub struct Coordinator {
     /// #1748: last per-(worker) tx_bytes sample + monotonic ns, for deriving
     /// byte-rate across the controller tick window. Keyed by worker_id.
     pub(in crate::afxdp) rebalance_last_tx_bytes: BTreeMap<u32, (u64, u64)>,
+    /// #1748 review #8: last per-FLOW cumulative observed_bytes sample +
+    /// monotonic ns, for deriving each flow's byte-RATE across the tick window.
+    /// FlowCacheEntry.observed_bytes is CUMULATIVE, so a long-lived idle flow
+    /// would otherwise look "hottest"; the controller selects on rate, not
+    /// cumulative bytes. Keyed by the flow's SessionKey.
+    pub(in crate::afxdp) rebalance_last_flow_bytes:
+        std::collections::HashMap<crate::session::SessionKey, (u64, u64)>,
 }
 
 impl Coordinator {
@@ -114,6 +121,7 @@ impl Coordinator {
             rebalance_config: None,
             rebalance_controllers: BTreeMap::new(),
             rebalance_last_tx_bytes: BTreeMap::new(),
+            rebalance_last_flow_bytes: std::collections::HashMap::new(),
         }
     }
 

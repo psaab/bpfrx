@@ -22,6 +22,7 @@ pub(in crate::afxdp) mod ntuple;
 
 pub(in crate::afxdp) use controller::{
     BarrierTransport, FlowSample, MoveOutcome, RebalanceConfig, RebalanceController,
-    RebalanceMetrics, RebalanceTickInput, SkipReason, WorkerByteRate, flow_spec_from_key,
+    RebalanceMetrics, RebalanceTickInput, SkipReason, WorkerByteRate, cumulative_to_rate,
+    flow_spec_from_key,
 };
 pub(in crate::afxdp) use ntuple::NtupleSocket;

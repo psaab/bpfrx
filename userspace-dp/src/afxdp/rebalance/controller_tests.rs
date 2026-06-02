@@ -502,3 +502,79 @@ fn flow_spec_from_key_encodes_network_order_v4() {
     assert_eq!(spec.dst_ip[0], u32::from_ne_bytes([172, 16, 80, 200]));
     assert_eq!(spec.src_ip[0].to_ne_bytes(), [10, 0, 61, 102]);
 }
+
+// ── #1748 review #8: cumulative-bytes -> byte-RATE derivation ────────
+
+#[test]
+fn cumulative_to_rate_basic_delta_over_time() {
+    // 1000 bytes accrued over 1s window => 1000 B/s.
+    let prev_ns = 1_000_000_000u64;
+    let now_ns = prev_ns + 1_000_000_000; // +1s
+    assert!((cumulative_to_rate(2000, 1000, now_ns, prev_ns) - 1000.0).abs() < 1e-6);
+    // 500 bytes over 0.5s => 1000 B/s.
+    let half = prev_ns + 500_000_000;
+    assert!((cumulative_to_rate(1500, 1000, half, prev_ns) - 1000.0).abs() < 1e-6);
+}
+
+#[test]
+fn cumulative_to_rate_first_sample_and_reset_are_zero() {
+    let prev_ns = 1_000_000_000u64;
+    // now <= prev => 0 (no elapsed time).
+    assert_eq!(cumulative_to_rate(5000, 1000, prev_ns, prev_ns), 0.0);
+    // cumulative went backwards (flow re-homed, cache reset) => 0, not negative.
+    let now_ns = prev_ns + 1_000_000_000;
+    assert_eq!(cumulative_to_rate(100, 9000, now_ns, prev_ns), 0.0);
+}
+
+#[test]
+fn long_lived_idle_flow_not_selected_over_recent_burst() {
+    // #1748 review #8 regression: with the OLD signal (cumulative bytes), a
+    // long-lived idle flow with huge cumulative bytes would be picked as the
+    // "heaviest". With the correct RATE signal, an idle flow has rate ~0 and a
+    // recently-bursting flow has a high rate, so the burst flow is selected.
+    //
+    // Both flows live on the hottest worker 0. flow A is long-lived-but-idle
+    // (rate 0), flow B is bursting (rate 120). select_move must pick B.
+    let mut c = test_controller(cfg());
+    let input = RebalanceTickInput {
+        ifindex: 1,
+        workers: vec![worker(0, 400.0), worker(1, 100.0)],
+        flows: vec![
+            flow(7001, 0, 0.0),    // long-lived, now idle: RATE 0
+            flow(7002, 0, 120.0),  // recently bursting: RATE 120
+        ],
+        now_secs: 10,
+    };
+    let mut tx = MockTransport::good();
+    c.tick(&input, &mut tx); // dwell
+    let input2 = RebalanceTickInput { now_secs: 12, ..input };
+    let mv = c.tick(&input2, &mut tx).expect("a move is taken");
+    assert_eq!(
+        mv.key.src_port, 7002,
+        "the recently-bursting flow (7002), not the idle long-lived flow (7001), must be moved"
+    );
+}
+
+#[test]
+fn zero_rate_idle_flows_yield_no_move() {
+    // If every flow on the hottest worker has rate 0 (all long-lived idle),
+    // moving any of them cannot improve the byte-rate CoV, so no move is taken
+    // (the magnitude/epsilon guards reject a 0-rate move).
+    let mut c = test_controller(cfg());
+    let input = RebalanceTickInput {
+        ifindex: 1,
+        // Worker 0 looks hottest by some other flow, but the eligible flows on
+        // it are all idle.
+        workers: vec![worker(0, 400.0), worker(1, 100.0)],
+        flows: vec![flow(8001, 0, 0.0), flow(8002, 0, 0.0)],
+        now_secs: 10,
+    };
+    let mut tx = MockTransport::good();
+    c.tick(&input, &mut tx);
+    let input2 = RebalanceTickInput { now_secs: 12, ..input };
+    assert!(
+        c.tick(&input2, &mut tx).is_none(),
+        "no move when all eligible flows are idle (rate 0)"
+    );
+    assert!(!tx.calls.iter().any(|c| c.starts_with("install:")));
+}

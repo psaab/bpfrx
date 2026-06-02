@@ -574,6 +574,28 @@ pub(in crate::afxdp) fn byte_rate_cov(workers: &[WorkerByteRate]) -> f64 {
     var.sqrt() / mean
 }
 
+/// #1748 review #8: derive a byte-RATE from two CUMULATIVE byte-count samples
+/// taken at `prev_ns` and `now_ns`. Single source of truth for both the
+/// per-worker (tx_bytes) and per-flow (observed_bytes) rate derivation in the
+/// Coordinator tick. Returns 0 when there is no prior sample, no elapsed time,
+/// or the cumulative counter went backwards (a flow re-homing to a different
+/// worker's cache entry resets its cumulative to ~0 — saturating_sub yields 0).
+pub(in crate::afxdp) fn cumulative_to_rate(
+    cumulative: u64,
+    prev_cumulative: u64,
+    now_ns: u64,
+    prev_ns: u64,
+) -> f64 {
+    if now_ns <= prev_ns {
+        return 0.0;
+    }
+    let dt = (now_ns - prev_ns) as f64 / 1_000_000_000.0;
+    if dt <= 0.0 {
+        return 0.0;
+    }
+    cumulative.saturating_sub(prev_cumulative) as f64 / dt
+}
+
 /// Project the per-worker byte-rate vector after moving `flow_rate` from
 /// `from` to `to`. Returns a fresh vector (cheap — ~6 workers).
 fn project_move(

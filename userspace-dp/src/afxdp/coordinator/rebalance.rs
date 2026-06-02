@@ -13,7 +13,7 @@
 use super::*;
 use crate::afxdp::rebalance::{
     BarrierTransport, FlowSample, RebalanceConfig, RebalanceController, RebalanceTickInput,
-    WorkerByteRate, flow_spec_from_key, NtupleSocket,
+    WorkerByteRate, cumulative_to_rate, flow_spec_from_key, NtupleSocket,
 };
 use crate::afxdp::rebalance::ntuple::FlowSpec5Tuple;
 use crate::afxdp::RebalanceAck;
@@ -86,6 +86,7 @@ impl super::Coordinator {
         // Reset the byte-rate sampling window so the first tick after a config
         // change does not see a bogus huge delta.
         self.rebalance_last_tx_bytes.clear();
+        self.rebalance_last_flow_bytes.clear();
     }
 
     /// Tear down one interface's controller: reverse-barrier its live moves,
@@ -127,6 +128,7 @@ impl super::Coordinator {
             controller.teardown_all(&mut tx, |_w, _k| false);
         }
         self.rebalance_last_tx_bytes.clear();
+        self.rebalance_last_flow_bytes.clear();
     }
 
     /// Drive one controller tick at the status cadence. Default-OFF fast path:
@@ -153,15 +155,10 @@ impl super::Coordinator {
             let queue_id = live.socket_queue_id();
             let tx_bytes = live.tx_bytes();
             let rate = match self.rebalance_last_tx_bytes.get(&worker_id) {
-                Some(&(prev_bytes, prev_ns)) if now_ns > prev_ns => {
-                    let dt = (now_ns - prev_ns) as f64 / 1_000_000_000.0;
-                    if dt > 0.0 {
-                        (tx_bytes.saturating_sub(prev_bytes)) as f64 / dt
-                    } else {
-                        0.0
-                    }
+                Some(&(prev_bytes, prev_ns)) => {
+                    cumulative_to_rate(tx_bytes, prev_bytes, now_ns, prev_ns)
                 }
-                _ => 0.0,
+                None => 0.0,
             };
             self.rebalance_last_tx_bytes
                 .insert(worker_id, (tx_bytes, now_ns));
@@ -172,14 +169,24 @@ impl super::Coordinator {
                 .push(WorkerByteRate { worker_id, queue_id, byte_rate: rate });
         }
 
-        // 2. Per-flow samples (5-tuple key + worker + byte-rate) grouped by
+        // 2. Per-flow samples (5-tuple key + worker + byte-RATE) grouped by
         //    ifindex, from the flow-worker map telemetry.
+        //
+        // #1748 review #8: row.observed_bytes is CUMULATIVE bytes for the
+        // cached flow, NOT a per-window rate. Using cumulative bytes as the
+        // selection signal makes a long-lived but now-idle flow look "hottest"
+        // forever, so the controller would pick the wrong flow to move and the
+        // magnitude<=gap/2 guard (which compares against per-worker rates)
+        // would be meaningless. Derive an actual byte-RATE = (current_cumulative
+        // - last_sample_cumulative) / elapsed, maintaining a per-flow previous
+        // sample across ticks (the controller runs at a fixed cadence).
         let mut per_iface_flows: BTreeMap<i32, Vec<FlowSample>> = BTreeMap::new();
         let (rows, _truncated) = self.flow_worker_map();
+        let mut seen_flow_keys: std::collections::HashSet<SessionKey> =
+            std::collections::HashSet::new();
         for row in rows {
             // Only forward-direction flows on the steered ifindex with a
-            // resolvable 5-tuple. The flow-worker row carries observed_bytes
-            // over the window for byte-rate-aware selection.
+            // resolvable 5-tuple.
             let ifindex = row.ifindex;
             if ifindex <= 0 || !per_iface_workers.contains_key(&ifindex) {
                 continue;
@@ -187,12 +194,29 @@ impl super::Coordinator {
             let Some(key) = session_key_from_tuple(&row.session_key) else {
                 continue;
             };
+            let cumulative = row.observed_bytes;
+            // First observation of this flow => no rate yet (a brand-new flow's
+            // first-tick cumulative is not a window rate). cumulative_to_rate
+            // also handles a cumulative reset on re-home via saturating_sub.
+            let rate = match self.rebalance_last_flow_bytes.get(&key) {
+                Some(&(prev_bytes, prev_ns)) => {
+                    cumulative_to_rate(cumulative, prev_bytes, now_ns, prev_ns)
+                }
+                None => 0.0,
+            };
+            self.rebalance_last_flow_bytes
+                .insert(key.clone(), (cumulative, now_ns));
+            seen_flow_keys.insert(key.clone());
             per_iface_flows.entry(ifindex).or_default().push(FlowSample {
                 key,
                 worker_id: row.worker_id,
-                byte_rate: row.observed_bytes as f64,
+                byte_rate: rate,
             });
         }
+        // Prune previous-sample entries for flows that disappeared this tick so
+        // the map does not grow unbounded across the daemon's lifetime.
+        self.rebalance_last_flow_bytes
+            .retain(|k, _| seen_flow_keys.contains(k));
 
         // 3. Tick each steered interface's controller.
         let ifindexes: Vec<i32> = per_iface_workers.keys().copied().collect();
