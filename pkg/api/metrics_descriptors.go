@@ -791,7 +791,7 @@ func newCollector(srv *Server) *xpfCollector {
 		),
 		flowRebalanceMovesSkippedTotal: prometheus.NewDesc(
 			"xpf_userspace_flow_rebalance_moves_skipped_total",
-			"Candidate moves skipped, by reason (balanced, cooldown, magnitude, epsilon, budget_exhausted, barrier_failed, dwell, restore_failed) (#1748).",
+			"Candidate moves skipped, by reason (balanced, cooldown, magnitude, epsilon, no_eligible_flow, budget_exhausted, barrier_failed, dwell, restore_failed) (#1748).",
 			[]string{"ifindex", "reason"}, nil,
 		),
 		flowRebalanceWorkerByterateCoV: prometheus.NewDesc(

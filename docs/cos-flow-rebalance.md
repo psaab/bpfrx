@@ -125,7 +125,10 @@ Per-interface Prometheus gauges/counters (`{ifindex}` label):
 - `xpf_userspace_flow_rebalance_installs_total` / `_deletes_total`.
 - `xpf_userspace_flow_rebalance_moves_skipped_total{reason}` — why a candidate
   move was not taken (`balanced`, `cooldown`, `magnitude`, `epsilon`,
-  `budget_exhausted`, `barrier_failed`, `dwell`, `restore_failed`).
+  `no_eligible_flow`, `budget_exhausted`, `barrier_failed`, `dwell`,
+  `restore_failed`). `no_eligible_flow` (distinct from `epsilon`) means the
+  hottest worker had no movable flow with a positive rate — a per-flow signal
+  problem, not a too-conservative move threshold.
 - `xpf_userspace_flow_rebalance_worker_byterate_cov` — the live per-worker
   byte-rate CoV the controller observed at the last tick (this is the metric
   the feature is trying to drive down).
