@@ -1466,3 +1466,112 @@ func TestCompileClassOfServiceRejectsThreeFCsOnOneQueue(t *testing.T) {
 		t.Errorf("error must reference queue 5, got: %s", err.Error())
 	}
 }
+
+// #1748: flow-rebalance leaf compiles to CoSFlowRebalance; absent => nil.
+func TestCompileClassOfServiceFlowRebalanceSetSyntax(t *testing.T) {
+	lines := []string{
+		"set class-of-service flow-rebalance imbalance-threshold 130",
+		"set class-of-service flow-rebalance rebalance-interval 2",
+		"set class-of-service flow-rebalance max-rules 64",
+		"set system dataplane-type userspace",
+	}
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+	if cfg.ClassOfService == nil || cfg.ClassOfService.FlowRebalance == nil {
+		t.Fatal("expected FlowRebalance set")
+	}
+	fr := cfg.ClassOfService.FlowRebalance
+	if fr.ImbalanceThresholdPercent != 130 {
+		t.Errorf("imbalance-threshold = %d, want 130", fr.ImbalanceThresholdPercent)
+	}
+	if fr.RebalanceIntervalSecs != 2 {
+		t.Errorf("rebalance-interval = %d, want 2", fr.RebalanceIntervalSecs)
+	}
+	if fr.MaxRules != 64 {
+		t.Errorf("max-rules = %d, want 64", fr.MaxRules)
+	}
+}
+
+// #1748: a bare flow-rebalance block (no sub-leaves) still enables the
+// controller (presence = on); the Rust side fills zeros with its defaults.
+func TestCompileClassOfServiceFlowRebalanceBareEnables(t *testing.T) {
+	tree := &ConfigTree{}
+	for _, line := range []string{
+		"set class-of-service flow-rebalance max-rules 16",
+		"set system dataplane-type userspace",
+	} {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+	if cfg.ClassOfService == nil || cfg.ClassOfService.FlowRebalance == nil {
+		t.Fatal("flow-rebalance block must enable the controller")
+	}
+	if cfg.ClassOfService.FlowRebalance.MaxRules != 16 {
+		t.Errorf("max-rules = %d, want 16", cfg.ClassOfService.FlowRebalance.MaxRules)
+	}
+}
+
+// #1748: default-OFF — no flow-rebalance block => nil (controller never built).
+func TestCompileClassOfServiceFlowRebalanceAbsentIsNil(t *testing.T) {
+	tree := &ConfigTree{}
+	for _, line := range []string{
+		"set class-of-service forwarding-classes queue 0 best-effort",
+		"set system dataplane-type userspace",
+	} {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+	if cfg.ClassOfService != nil && cfg.ClassOfService.FlowRebalance != nil {
+		t.Fatal("absent flow-rebalance block must compile to nil (default-OFF)")
+	}
+}
+
+// #1748: out-of-range imbalance-threshold is rejected at compile.
+func TestCompileClassOfServiceFlowRebalanceRejectsOutOfRange(t *testing.T) {
+	tree := &ConfigTree{}
+	for _, line := range []string{
+		"set class-of-service flow-rebalance imbalance-threshold 50",
+		"set system dataplane-type userspace",
+	} {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
+	}
+	if _, err := CompileConfig(tree); err == nil {
+		t.Fatal("imbalance-threshold 50 (< 101) must be rejected")
+	}
+}

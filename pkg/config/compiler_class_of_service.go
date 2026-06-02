@@ -446,21 +446,28 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 	// block (even empty) enables the controller; absent => nil => off.
 	if frNode := node.FindChild("flow-rebalance"); frNode != nil {
 		fr := &CoSFlowRebalance{}
-		if v := nodeVal(frNode.FindChild("imbalance-threshold")); v != "" {
+		// nodeVal panics on a nil node; a sub-leaf may be absent, so guard.
+		leafVal := func(name string) string {
+			if child := frNode.FindChild(name); child != nil {
+				return nodeVal(child)
+			}
+			return ""
+		}
+		if v := leafVal("imbalance-threshold"); v != "" {
 			n, err := strconv.Atoi(v)
 			if err != nil || n < 101 || n > 1000 {
 				return fmt.Errorf("class-of-service flow-rebalance imbalance-threshold %q: expected 101..1000", v)
 			}
 			fr.ImbalanceThresholdPercent = uint32(n)
 		}
-		if v := nodeVal(frNode.FindChild("rebalance-interval")); v != "" {
+		if v := leafVal("rebalance-interval"); v != "" {
 			n, err := strconv.Atoi(v)
 			if err != nil || n < 1 || n > 3600 {
 				return fmt.Errorf("class-of-service flow-rebalance rebalance-interval %q: expected 1..3600", v)
 			}
 			fr.RebalanceIntervalSecs = uint32(n)
 		}
-		if v := nodeVal(frNode.FindChild("max-rules")); v != "" {
+		if v := leafVal("max-rules"); v != "" {
 			n, err := strconv.Atoi(v)
 			if err != nil || n < 1 || n > 1024 {
 				return fmt.Errorf("class-of-service flow-rebalance max-rules %q: expected 1..1024", v)
