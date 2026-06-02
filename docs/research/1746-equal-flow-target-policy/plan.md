@@ -4,7 +4,9 @@
   (non-work-conserving); evaluate mean / global-fair-rate target.
 - **Mode**: `/research` — converge a plan; STOP at PLAN-READY/PLAN-KILL.
   No PR, no production code in this skill.
-- **Revision**: r1 (DRAFT)
+- **Revision**: r2 — resolves the r1 naming knot (default ≡ `slowest`),
+  fixes the §10 model (consistent observed-band model), adds the F1
+  live-measurement ship-gate, commits to the sibling info-metric.
 - **Branch**: `research/1746-equal-flow-target-policy`
 - **Base**: `origin/master` @ `ecdc16f2e` (post-#1745 fail-open fix +
   audit regen).
@@ -67,16 +69,37 @@ Two facts collide:
    duplicate #1748.**
 
 **Scope of #1746**: make the equal-flow *target policy* an
-operator-selectable knob — `ideal-share` (current/default, documented as a
-no-op in capacity-limited regimes), `clip-to-mean`, `clip-to-slowest` —
-where each policy is computed from the **live cross-worker achieved
-rates** the #1745 sampler already collects. Ship an HONEST throughput-vs-
-fairness tradeoff table per policy, a metric to confirm which policy is
-active, and **byte-unchanged default behavior** when the knob is unset.
+operator-selectable knob with THREE genuinely distinct values, each
+computed from the **live cross-worker achieved rates** the #1745 sampler
+already collects:
+
+- **`slowest`** — the CURRENT math (`candidate_target.min(per_flow)`,
+  clip every flow to the slowest sampled per-flow rate). **This is the
+  byte-unchanged default**: unset config (`""`) maps to `slowest`, and
+  the named value `slowest` produces byte-identical lease behavior.
+  Named honestly after what the code actually does (the r1 plan
+  mis-named this `ideal-share`).
+- **`mean`** — `Σ prev_grants[id] / Σ active_flows[id]` over the sampled
+  set (aggregate-weighted mean achieved per-flow rate). Clips the lucky
+  outliers toward the mean; keeps more aggregate than `slowest`.
+- **`ideal-share`** — literal `scheduler_rate / total_active_flows` (the
+  Junos-style nominal equal share). Documented as a **no-op in
+  capacity-limited regimes** (the #1745 A/B target was exactly this
+  2.0 G figure and clipped nothing). Offered only for operators who want
+  the nominal-share semantics; NOT the default.
+
+Ship an HONEST throughput-vs-fairness tradeoff table per policy
+(§10), a metric to confirm which policy is active (§5.3), and
+**byte-unchanged default behavior** when the knob is unset (default ≡
+`slowest` ≡ current `min` math — no `"" vs named` divergence).
 
 PLAN-KILL is an acceptable outcome if reviewers conclude that *no*
 cap-based target policy delivers meaningful operator-visible fairness in
-the regime that matters, i.e. #1748 supersedes this entirely.
+the regime that matters, i.e. #1748 supersedes this entirely. The
+mitigating design choice for that risk is the **F1 live-measurement
+ship-gate** (§8.2 / §9 Q3): `mean` ships only if the /engineer smoke
+shows a *measured* material CoV reduction; if it is a live no-op
+(sample-set collapse), the issue PLAN-KILLs at /engineer time.
 
 ---
 
@@ -147,13 +170,15 @@ Data flow, end to end:
 ## 3. Goal / success criteria
 
 - Operator can select the equal-flow target policy per-scheduler.
-  Default (knob unset) = current `ideal-share` semantics → **byte-for-byte
-  identical** lease behavior and identical snapshot/wire bytes for
-  existing configs (proven by an unchanged-snapshot test).
-- `clip-to-mean` and `clip-to-slowest` compute their target from the
-  same per-worker samples already collected; both reduce per-flow CoV vs
-  default in the binding regime, measured by **ground-truth iperf per-
-  stream CoV** (NOT `cos_active_flow_count`, #1741).
+  Default (knob unset, `""`) ≡ `slowest` = current `min` math →
+  **byte-for-byte identical** lease behavior and identical snapshot/wire
+  bytes for existing configs (proven by an unchanged-snapshot test).
+- `mean` computes its target (`Σgrants / Σflows`) from the same
+  per-worker samples already collected, and must show a **measured**
+  per-flow CoV reduction vs `slowest` in the binding regime (ground-truth
+  iperf per-stream CoV, NOT `cos_active_flow_count`, #1741) — the F1
+  ship-gate (§8.2). `ideal-share` is the literal nominal share, retained
+  as a documented no-op for nominal-share semantics.
 - A single operator-visible signal states which policy is active per
   queue (extend the existing fail-open-reason / target telemetry; no new
   high-frequency control-socket traffic).
@@ -169,49 +194,56 @@ surplus-sharing (#915) or flow-fair (#1735) paths; changing the default.
 
 ## 4. The structural problem, worked precisely
 
-Loss cluster, 6 mlx5 VF workers, `-P12` → 12 flows RSS-hashed across 6
-workers. Observed banding (issue comment): per-flow rates 0.87 / 1.29 /
-1.63 / 1.81 G corresponding to workers carrying 4 / 3 / 2 / 1 flows
-respectively (each worker ≈ saturated at ~3.5 G aggregate). Aggregate
-≈ 16–17 G; CoV(per-flow) ≈ 14–29 %.
+Loss cluster, 6 mlx5 VF workers. The exact per-flow banding the #1745 A/B
+reported is **0.87 / 1.29 / 1.63 / 1.81 G**. Those four bands are
+internally consistent with a **10-flow** distribution of `{4, 3, 2, 1}`
+flows on four loaded workers (the remaining workers idle): a worker with
+`k` flows gives each `≈ W/k`. The nominal run was `-P12`; with RSS
+hashing two of the twelve flows collide onto already-loaded workers, so
+the *observed* banding is the 10-distinct-flow shape above. To keep the
+arithmetic checkable we model the **observed-band (10-flow)** case — the
+exact A/B numbers — and note the `-P12` nominal separately. (The r1 plan
+mixed a `-P12=12` claim with a `{1,2,3,4}=10` model and a wrong 16–17 G
+baseline; both Codex and AGY flagged this. Corrected below.)
 
 The shaper rate is 24 G `exact`, but the **achievable** aggregate is
-bounded by the 6-worker × per-worker-core ceiling, NOT 24 G — the class
-is *worker-capacity-limited*, not *shaper-limited*, in this test. That is
-why `target = 24G/12 = 2.0 G` clips nothing: the binding constraint is
-worker CPU, and every flow is already below 2.0 G.
+bounded by per-worker core capacity, NOT 24 G — the class is
+*worker-capacity-limited*, not *shaper-limited*, in this test. That is
+why `ideal-share = 24G/12 = 2.0 G` clips nothing: every flow is already
+below 2.0 G.
 
-For a per-flow CAP at target `T`:
-- A flow on a worker with `k` flows runs at ≈ `min(W/k, T)` where `W` ≈
-  per-worker capacity (~3.5 G).
-- Workers with `k` such that `W/k > T` get clipped to `T`; the rest are
-  untouched.
-- Freed bytes on a clipped worker **cannot** migrate to a starved worker
-  (different queue/CPU) → aggregate drops by the clipped amount; it is
-  **non-work-conserving** for any `T < max_k(W/k)`.
+For a per-flow CAP at target `T`, a flow on a worker with `k` flows runs
+at `≈ min(W/k, T)`. Workers with `W/k > T` get clipped; the rest are
+untouched. Freed bytes on a clipped worker **cannot** migrate to a
+starved worker (different queue/CPU) → aggregate drops by the clipped
+amount: **non-work-conserving** for any `T < max_k(W/k)`.
 
-So the candidate policies, with `W ≈ 3.5 G` and flow distribution
-{1,2,3,4} flows on 4 of the 6 workers (2 idle):
+Corrected observed-band (10-flow) model — flow rates
+`[0.87×4, 1.29×3, 1.63×2, 1.81×1]`, baseline aggregate **12.42 G**,
+baseline per-flow CoV **27.7 %** (matches the independent Codex and AGY
+recomputations):
 
-| Policy | Target `T` | Flows clipped | Per-flow CoV effect | Aggregate effect |
-|---|---|---|---|---|
-| `ideal-share` (current default) | scheduler/flows = 2.0 G | none (all < 2.0 G) | none (no-op) | none |
-| `clip-to-mean` | mean achieved ≈ 1.3 G | 1-flow (1.8 G) and 2-flow (1.63 G) workers → 1.3 G | top outliers removed; floor (0.87 G) UNCHANGED → partial CoV win | drops by clipped surplus (~1–2 G) |
-| `clip-to-slowest` | min achieved ≈ 0.87 G | every worker with >0.87 G | near-flat (all ≈ 0.87 G) | ~40 % aggregate loss (17 → ~10.5 G) |
+| Policy | Target `T` | Flows clipped | Aggregate | Per-flow CoV | Lifts 0.87 G floor? |
+|---|---|---|---|---|---|
+| `ideal-share` | 24G/12 = 2.0 G | none (all < 2.0 G) | 12.42 G (no-op) | 27.7 % (no-op) | NO |
+| `mean` | Σgrants/Σflows = **1.242 G** | 1.29 / 1.63 / 1.81 bands → 1.242 G | **10.93 G** (−12.0 %) | **16.7 %** (−40 % relative) | NO |
+| `slowest` (= current default `min`) | min achieved = 0.87 G | every band > 0.87 G | **8.70 G** (−30.0 %) | **~0 %** | NO |
 
-The hard limit, restated for the plan record: **the 0.87 G floor is never
-raised by any of these.** Raising it requires cross-worker capacity =
-#1748.
+The hard limit, restated: **the 0.87 G floor is identical across ALL
+three policies.** Raising it requires work-conserving cross-worker
+capacity = **#1748** (which the AGY r1 review correctly shows yields
++101 % to the starved flows, +40.9 % aggregate, 0 % CoV — but that is a
+different, repeatedly-killed hardware-steering problem, not this issue).
 
-NOTE the asymmetry vs. the issue title: the issue title says current
-behavior IS clip-to-slowest, and the #1745 A/B says current behavior is a
-no-op at 2.0 G. Both are true at different times: the `min` reduction
-*intends* clip-to-slowest (~0.87 G) but the fail-open guards + sample-set
-collapse + EWMA frequently push the *published* target up to the
-lightly-loaded subset's rate (2.0 G) or fail open entirely, which is why
-it behaves as a no-op live. **This is a design tension the plan must
-resolve, not paper over** (see §6 Path A vs the "fix the denominator"
-alternative).
+NOTE the resolved asymmetry vs. the issue title: the title says current
+behavior IS clip-to-slowest; the #1745 A/B observed a no-op at 2.0 G.
+Both are explained by the fail-open guards + sample-set collapse + EWMA:
+the `min` reduction *intends* `slowest` (~0.87 G) but frequently fails
+open or collapses the sampled set to the lightly-loaded subset, so the
+*published* target drifts up to ~2.0 G and clips nothing live. **This is
+exactly the F1 risk** — see §8.2/§9 Q3: `mean` is subject to the SAME
+sample-set-collapse failure mode, so it ships only on a measured live
+win.
 
 ---
 
@@ -223,7 +255,7 @@ Add a childless-value leaf under each scheduler, adjacent to
 `equal-flow-enforcement` at `schema.go:867`:
 
 ```
-set class-of-service schedulers <s> equal-flow-target-policy (ideal-share | clip-to-mean | clip-to-slowest)
+set class-of-service schedulers <s> equal-flow-target-policy (slowest | mean | ideal-share)
 ```
 
 - `schema.go`: replace the childless `"equal-flow-target-policy"` with a
@@ -232,10 +264,14 @@ set class-of-service schedulers <s> equal-flow-target-policy (ideal-share | clip
   the value-slot `?` completion + commit-check typed-leaf validation per
   `docs/config-schema.md`.
 - `compiler_class_of_service.go`: parse the value into a new
-  `sched.EqualFlowTargetPolicy string` (default `""` ≡ `ideal-share`).
+  `sched.EqualFlowTargetPolicy string`. **Default `""` maps to
+  `slowest`** (the current `min` math) — there is NO `"" vs named`
+  divergence, because `slowest` IS the current default behavior.
   Commit-check WARNING (not error) if the policy is set but
   `equal-flow-enforcement` is absent (matches the existing #1733
-  warn-not-strip discipline for equal-flow on a non-exact scheduler).
+  warn-not-strip discipline). Additional WARNING when `mean`/`slowest`
+  is selected, documenting the §10 aggregate cost (operator-footgun
+  mitigation per AGY r1).
 - Snapshot: add `EqualFlowTargetPolicy string
   json:"equal_flow_target_policy,omitempty"` to the scheduler snapshot
   in `protocol.go`. `omitempty` + empty-default keeps the wire bytes
@@ -243,12 +279,12 @@ set class-of-service schedulers <s> equal-flow-target-policy (ideal-share | clip
 
 ### 5.2 Rust runtime
 
-- `protocol/cos.rs`: add `#[serde(rename =
-  "equal_flow_target_policy", default)] pub equal_flow_target_policy:
-  String` (or a small `enum EqualFlowTargetPolicy { IdealShare,
-  ClipToMean, ClipToSlowest }` with `#[serde(default)]` →
-  `IdealShare`). `default` keeps old snapshots decoding to the current
-  behavior.
+- `protocol/cos.rs`: add a small
+  `enum EqualFlowTargetPolicy { Slowest, Mean, IdealShare }` with
+  `#[serde(default)]` → `Slowest` (NOT IdealShare — `Slowest` is the
+  byte-unchanged default). `default` keeps old snapshots decoding to the
+  current behavior. The empty string `""` and missing field both decode
+  to `Slowest`.
 - `forwarding_build/cos.rs`: copy the policy onto the intermediate
   `CoSQueueConfig`, gated identically to `equal_flow_enforcement` (only
   meaningful when that is on).
@@ -260,77 +296,89 @@ set class-of-service schedulers <s> equal-flow-target-policy (ideal-share | clip
 - `publish_equal_flow_epoch_v8.rs`: this is the ONLY math change. Replace
   the single `candidate_target = candidate_target.min(per_flow)` (line
   129) with a policy-driven reduction over the SAME sampled
-  `(prev_grants[id], active_flows[id])` pairs:
-  - `IdealShare` (default): preserve the EXACT current code path
-    byte-for-byte (the `min` reduction) — see §6 caveat: "default = byte-
-    unchanged" means default is the current `min`, even though §1
-    describes that as a no-op. We do NOT change the default's math.
-  - `ClipToMean`: target = `sum(prev_grants[id]) /
-    sum(active_flows[id])` over the sampled set (aggregate-weighted mean
-    per-flow rate). Single division, no per-flow loop growth.
-  - `ClipToSlowest`: target = `min` (identical to current default math),
-    but distinguished from `IdealShare` ONLY by the metric label
-    (they compute the same value today). **OPEN QUESTION for reviewers
-    (§9 Q1):** is a distinct `ClipToSlowest` label justified if it is
-    numerically identical to `IdealShare`'s `min`? Candidate
-    resolution: make `IdealShare` literally publish `scheduler_rate /
-    total_active_flows` (the "ideal" 2.0 G — the documented no-op) and
-    make `ClipToSlowest` the `min`-of-achieved (~0.87 G). That gives
-    three genuinely distinct targets and matches the operator's mental
-    model from the A/B comment.
-  - All policies keep the EWMA smoothing, the valid-streak gate, the
+  `(prev_grants[id], active_flows[id])` pairs (Codex r1 angle 3 + AGY r1
+  angle 3 both confirmed these are already in scope at lines 97-101):
+  - `Slowest` (DEFAULT, `""` decodes here): preserve the EXACT current
+    code path byte-for-byte — keep `candidate_target.min(per_flow)`. No
+    behavior change vs master for unset configs.
+  - `Mean`: accumulate `sum_grants += prev_grants[id]` and
+    `sum_flows += active_flows[id]` over the sampled set inside the
+    existing loop, then `candidate_target = sum_grants / sum_flows`
+    (single division, no per-flow loop growth, same zero/overflow
+    guards as today's `per_flow == 0` check).
+  - `IdealShare`: `candidate_target = self.config.rate_bytes_per_epoch /
+    total_active_flows` (the literal nominal share = the documented
+    ~2.0 G no-op). `total_active_flows` is already summed in the
+    rotation (`rotate_epoch_v8.rs:226-231`); thread it in or recompute
+    over the sampled set.
+  - All three keep the EWMA smoothing, the valid-streak gate, the
     fail-open guards, and the `max_worker_cap` telemetry publication
-    unchanged — they operate on the chosen `candidate_target`.
+    unchanged — they only choose `candidate_target`. The r1 "Q1 identity"
+    problem is GONE: `Slowest` = `min`, `Mean` = `Σ/Σ`, `IdealShare` =
+    nominal share — three distinct values, and the default is `Slowest`
+    (not `IdealShare`), so unset and named never diverge.
 
 ### 5.3 Telemetry (which policy is active)
 
 - Add `equal_flow_target_policy: String` to the queue status
-  (`protocol/cos.rs` status struct + `status.rs:464-473` population) and
-  a Prometheus label/gauge — reuse the existing
-  `cosEqualFlowTargetPerFlowBPS` desc; add a sibling info-style metric
-  `xpf_userspace_cos_equal_flow_target_policy{policy="..."}` OR a label
-  on the existing target gauge. The operator confirms policy via
-  `show class-of-service ... ` and `/metrics`. No new control-socket
-  request (status poll already carries the queue block at 1/s).
+  (`protocol/cos.rs` status struct + `status.rs:464-473` population).
+- **COMMIT to a sibling info metric**
+  `xpf_userspace_cos_equal_flow_target_policy{iface,queue,policy="slowest|mean|ideal-share"} 1`
+  — do NOT relabel the existing `cosEqualFlowTargetPerFlowBPS` gauge
+  (Codex r1 angle 5 + AGY r1 angle 4: relabeling changes downstream
+  series identity). The operator confirms the active policy via
+  `show class-of-service` and `/metrics`. **No new control-socket
+  request** — the status poll already carries the queue block at 1/s
+  (`status.rs:464-473`); this piggybacks on it (CLAUDE.md control-socket
+  contention rule, confirmed compliant by both r1 reviewers).
 
 ---
 
 ## 6. Multiple path options
 
-### Path A — three-value enum knob, default = current `min` math (this plan, §5)
-- Minimal blast radius: one Rust math branch, one Go enum leaf, one
-  snapshot field, one status field/metric. Default byte-unchanged.
-- Honest: ships clip-to-mean as the only *new* useful policy; documents
-  that none lift the floor.
-- Risk: `clip-to-slowest` vs `ideal-share` numeric identity (Q1).
+### Path A — three-value enum knob (`slowest`/`mean`/`ideal-share`), default ≡ `slowest`, gated on F1 (this plan, §5)
+- Minimal blast radius: one Rust match in `publish_equal_flow_epoch_v8`,
+  one Go enum leaf, one snapshot field, one status field + one sibling
+  info-metric. Default byte-unchanged (`slowest` = current `min`).
+- The r1 naming knot is resolved: three numerically distinct targets,
+  default is `slowest` (not the literal share), so unset and named never
+  diverge.
+- `mean` ships ONLY if the F1 live-measurement gate (§8.2) shows a
+  measured material CoV win — so it cannot ship as a third silent no-op.
 
-### Path B — "fix the denominator" instead of a knob
-- Argument: the live no-op is a BUG (the published 2.0 G is the
-  lightly-loaded subset's rate, not the slowest), so just make the
-  default correctly clip-to-slowest-of-ACHIEVED and skip the knob.
-- Rejected as the *primary* path because (a) it changes default behavior
-  (violates the byte-unchanged contract), and (b) clip-to-slowest is
-  non-work-conserving (~40 % aggregate loss) — making it the silent
-  default is operator-hostile. But the underlying observation (published
-  target ≠ slowest achieved) IS a real defect; Path A's Q1 resolution
-  (make the three policies genuinely distinct) folds the fix in as an
-  opt-in.
+### Path B — "fix the denominator" silently in the default
+- Make the default correctly clip-to-slowest-of-ACHIEVED (fix the live
+  no-op) without a knob. Rejected: changes default behavior (violates the
+  byte-unchanged contract) AND silently imposes the ~30 % aggregate cost
+  of `slowest` on every existing equal-flow config — operator-hostile.
+  The honest version of this is simply `slowest` as an OPT-IN value with
+  a commit-check cost warning (folded into Path A).
 
-### Path C — PLAN-KILL
-- Argument: a per-flow cap is structurally one-directional; clip-to-mean
-  buys a partial CoV win at an aggregate cost and clip-to-slowest is
-  strictly worse than doing nothing for most operators; the only policy
-  an operator would actually want (lift the floor) is #1748. So the knob
-  is busywork that ships two footguns.
-- Counter: clip-to-mean is a legitimate, Junos-absent-but-defensible
-  "shave the lucky outliers" policy an operator MIGHT want for jitter-
-  sensitive workloads; and the telemetry/honesty improvements have
-  standalone value. Reviewers decide whether that justifies the surface.
+### Path C — PLAN-KILL in favor of #1748 (AGY r1 verdict)
+- AGY r1 argues: the cap is one-directional (`mod.rs:1237`), so `mean`
+  and `slowest` destroy 12 % / 30 % aggregate while the 0.87 G starved
+  floor is *identical* to baseline — a throughput-destroying footgun; the
+  only real fix is #1748 (work-conserving rebalance: +101 % to starved
+  flows, +40.9 % aggregate, 0 % CoV).
+- **Counter (Claude-SMR r1):** AGY's kill is a *default-policy*
+  objection. The plan keeps the default unchanged and makes `mean` /
+  `slowest` strictly opt-in with a commit-check cost WARNING. By AGY's
+  OWN numbers `mean` delivers a **40 % relative CoV reduction at 12 %
+  aggregate cost** — a legitimate jitter-vs-throughput trade an operator
+  with a latency-sensitive class may rationally choose
+  (`feedback_junos_feature_parity`: do not refuse operator knobs because
+  one setting can be misused). "#1748 is better" ≠ "#1746 is worthless":
+  #1748 is multi-month, repeatedly plan-killed hardware steering
+  (#937/#840/#1211/#1693/#1742); `mean` is a ~1-day opt-in math branch.
+  The two are complementary, not exclusive. AGY's "ideal-share ==
+  clip-to-slowest" identity claim was the r1 naming defect, now resolved
+  — it is not a structural impossibility.
 
-**Recommended: Path A with the Q1 resolution** (three genuinely distinct
-targets), pending reviewer convergence. PLAN-KILL (Path C) is on the
-table if reviewers judge clip-to-mean's win too marginal to justify the
-config surface.
+**Recommended: Path A** with the F1 ship-gate as the safety valve that
+addresses AGY's footgun concern empirically. If the /engineer smoke shows
+`mean` is a live no-op (sample-set collapse, the §4 failure mode), the
+issue PLAN-KILLs at /engineer time — converting AGY's blanket kill into a
+measured decision rather than a pre-emptive one.
 
 ---
 
@@ -367,8 +415,8 @@ Go (`pkg/`):
 Docs (contract — required by CLAUDE.md):
 - `docs/config-schema.md` — new typed leaf.
 - `docs/fairness-regimes.md` and/or `docs/cos-traffic-shaping.md` — the
-  §10 tradeoff table + the explicit "no policy lifts the floor → #1748"
-  statement.
+  §4 corrected tradeoff table + the explicit "no policy lifts the floor →
+  #1748" statement + the per-policy commit-check cost warning.
 
 ---
 
@@ -377,16 +425,24 @@ Docs (contract — required by CLAUDE.md):
 ### 8.1 Unit (no hardware)
 - `publish_equal_flow_epoch_v8`: table test with synthetic
   `(prev_grants, sampled_active_flows)` per worker proving:
-  - `IdealShare` → unchanged value vs master for the same inputs
-    (byte-identical default).
-  - `ClipToMean` → `Σgrants / Σflows`.
-  - `ClipToSlowest` → distinct from IdealShare per Q1 resolution.
+  - `Slowest` (default) → byte-identical `candidate_target` vs master for
+    the same inputs (the `min`).
+  - `Mean` → `Σgrants / Σflows` over the sampled set.
+  - `IdealShare` → `rate_per_epoch / total_active_flows`, distinct from
+    both.
   - Fail-open guards / EWMA / streak gate fire identically for all three.
 - Go snapshot round-trip: a config WITHOUT the policy leaf serializes to
-  byte-identical JSON vs master (omitempty proof).
+  byte-identical JSON vs master (omitempty proof); a config WITH
+  `equal-flow-target-policy slowest` ALSO serializes such that the Rust
+  side produces byte-identical lease behavior to unset.
 - Go compiler: policy parsed; warning (not error) when set without
-  enforcement; rejected enum value caught at commit.
-- Schema completion: the 3 enum tokens complete at the value slot.
+  enforcement; per-policy cost warning emitted for `mean`/`slowest`;
+  rejected enum value caught at commit.
+- Schema completion: the 3 enum tokens (`slowest`/`mean`/`ideal-share`)
+  complete at the value slot.
+- Coordinator: a live policy change (e.g. `slowest` → `mean`) forces a
+  lease rebuild (`matches_config_v8` includes the policy) — assert the
+  stale lease is NOT reused (F3).
 
 ### 8.2 Smoke (loss userspace cluster — at /engineer time, NOT in /research)
 Per `feedback_cos_iperf3_per_class` + `feedback_smoke_v4_and_v6` +
@@ -397,10 +453,17 @@ must run the full matrix on `loss:xpf-userspace-fw0`:
 - Capture ground-truth **iperf per-stream CoV** (not
   `cos_active_flow_count`), aggregate Gb/s, and `cap_hit_events` /
   `suppressed_grant_bytes` / `fail_open_reason` for each policy.
-- Acceptance: `ideal-share` ≈ master baseline (no-op); `clip-to-mean`
-  shows lower CoV than `ideal-share` AND aggregate within the predicted
-  band; `clip-to-slowest` shows lowest CoV at the predicted ~40 %
-  aggregate cost. Numbers replace the §10 placeholders.
+- **F1 SHIP-GATE (the safety valve for AGY's footgun concern):** `mean`
+  ships ONLY if it shows a **measured** material per-flow CoV reduction
+  vs `slowest`-disabled baseline (target: ≥~30 % relative CoV reduction
+  at ≤~15 % aggregate cost, Q3). If `mean` is a LIVE NO-OP — i.e. the
+  same sample-set-collapse / EWMA-drift failure mode that makes the
+  current target a no-op (§4) pushes `Σgrants/Σflows` above the top band
+  so it clips nothing — then **PLAN-KILL the issue at /engineer time** in
+  favor of #1748. This converts AGY r1's pre-emptive blanket kill into a
+  measured, evidence-based decision.
+- Acceptance baseline: `slowest`-as-default ≈ master baseline; the named
+  `slowest` value reproduces it; `ideal-share` ≈ no-op; `mean` per F1.
 - Per `feedback_runnable_repro_before_measurement_claim`: ≥2–3× per cell,
   validate the per-flow counter sums to N streams, re-apply CoS after
   deploy (deploy wipes CoS).
@@ -414,64 +477,58 @@ must run the full matrix on `loss:xpf-userspace-fw0`:
 
 ## 9. Open questions for reviewers
 
-- **Q1 (identity):** Is `clip-to-slowest` worth a distinct enum value if
-  it equals the current `min` math, OR should we adopt the Q1 resolution
-  (IdealShare = literal `scheduler_rate/total_flows`; ClipToSlowest =
-  `min`-of-achieved) so all three are distinct? The Q1 resolution makes
-  the DEFAULT (`""` → IdealShare) byte-unchanged only if today's default
-  ALSO publishes `scheduler_rate/total_flows`. **It does NOT** — today's
-  default is the `min`. So adopting Q1 means: default(`""`) MUST map to
-  the current `min` math to stay byte-unchanged, and `ideal-share` the
-  *named* value becomes the literal-share variant — i.e. the unset
-  default and the named `ideal-share` would DIFFER. Reviewers must
-  resolve this naming/back-compat knot. (Candidate: name the default-
-  equivalent value `slowest` and reserve `ideal-share` for the literal
-  share; document `""` ≡ `slowest`.)
+- **Q1 (RESOLVED in r2):** the naming knot is closed. Default `""` ≡
+  `slowest` ≡ current `min` math (byte-unchanged); `mean` = `Σ/Σ`;
+  `ideal-share` = literal nominal share. Three distinct values, no
+  `"" vs named` divergence. Reviewers: confirm this resolution is
+  coherent.
 - **Q2 (cap telemetry):** `current_worker_cap` is published but never
-  enforced. Do we (a) leave it as-is, (b) wire it as a secondary
-  per-worker ceiling, or (c) delete the dead telemetry? Recommend (a)
-  for this issue (no behavior change); flag (c) as a possible follow-up
-  refactor.
-- **Q3 (kill threshold):** If clip-to-mean's measured CoV win is <~30 %
-  relative reduction at >~10 % aggregate cost, is the knob worth the
-  config surface, or PLAN-KILL in favor of #1748?
-- **Q4 (default policy):** Confirm default MUST remain the current `min`
-  behavior (byte-unchanged), NOT clip-to-mean — i.e. we do not improve
-  the out-of-box behavior, only add opt-in policies. Per the standing
-  "default byte-unchanged" contract, yes; reviewers confirm.
+  enforced (`mod.rs:1647-1681` enforces only `current_target_per_flow`).
+  Do we (a) leave it as-is, (b) wire it as a secondary per-worker
+  ceiling, or (c) delete the dead telemetry? Recommend (a) for this issue
+  (no behavior change); flag (c) as a possible follow-up refactor.
+- **Q3 (F1 ship-gate threshold):** confirm the §8.2 gate threshold —
+  `mean` ships only on ≥~30 % relative CoV reduction at ≤~15 % aggregate
+  cost; otherwise PLAN-KILL at /engineer time. Reviewers may tighten the
+  numbers.
+- **Q4 (default policy) — RESOLVED:** default MUST remain the current
+  `min` (`slowest`) behavior, byte-unchanged; we add opt-in policies
+  only, we do NOT improve out-of-box behavior. Confirm.
 
 ---
 
-## 10. Throughput-vs-fairness tradeoff table (HONEST; #1745 A/B-backed)
+## 10. Throughput-vs-fairness tradeoff table
 
-`-P12`, port 5210, scheduler-24g exact, 6 mlx5 VF workers, loss cluster.
-Per-flow values are the observed banding 0.87 / 1.29 / 1.63 / 1.81 G.
-
-| Policy | Target | Binds on | Per-flow CoV (predicted) | Aggregate (predicted) | Lifts floor? |
-|---|---|---|---|---|---|
-| `ideal-share` / default (current `min`→published ~2.0 G in practice) | ~2.0 G | nothing | 14–29 % (= baseline, no-op) | ~16–17 G (baseline) | NO |
-| `clip-to-mean` | Σgrants/Σflows ≈ 1.3 G | 1-flow + 2-flow workers | partial ↓ (top outliers gone; 0.87 floor stays) | ~14–16 G (−1 to −2 G) | NO |
-| `clip-to-slowest` | min achieved ≈ 0.87 G | every >0.87 G flow | near-0 (all ≈ 0.87) | ~10.5 G (−40 %) | NO |
+The corrected, internally-consistent tradeoff table is **§4** (the
+observed-band 10-flow model: baseline 12.42 G / CoV 27.7 %; `mean`
+T=1.242 G → 10.93 G / 16.7 % (−12 % agg, −40 % rel CoV); `slowest`
+T=0.87 G → 8.70 G / ~0 %; 0.87 G floor identical across all three). The
+r1 placeholder table that lived here (with the `-P12`/`{1,2,3,4}` flow-
+count mismatch and the 16–17 G baseline) is superseded — see §4. The
+/engineer smoke (§8.2) replaces the §4 predictions with measured
+per-policy values and applies the F1 ship-gate.
 
 **The freed capacity from clipping CANNOT reach the slow flows** (they
 are on different saturated workers). Lifting the 0.87 G floor is
 work-conserving cross-worker rebalance = **#1748**, NOT this issue.
-Numbers above are predictions from the #1745 A/B banding; the /engineer
-smoke replaces them with measured per-policy values (§8.2).
 
 ## 11. Risks & rollback
 
 - **Risk: default behavior drift.** Mitigated by the omitempty snapshot
-  field + `#[serde(default)]` + the byte-unchanged snapshot test + the
-  IdealShare-maps-to-current-`min` rule (Q1/Q4). If any of those slip,
-  the smoke's `ideal-share` cell diverging from master baseline catches
-  it.
+  field + `#[serde(default)]` → `Slowest` + the byte-unchanged snapshot
+  test + the `Slowest`-maps-to-current-`min` rule (Q1/Q4). If any slip,
+  the smoke's default cell diverging from master baseline catches it.
 - **Risk: lease rebuild churn.** `matches_config_v8` must include the
   policy so a live policy change rebuilds; otherwise a stale lease keeps
-  the old policy. Covered by a coordinator test.
-- **Risk: non-work-conserving footgun.** `clip-to-slowest` costs ~40 %
-  aggregate; mitigated by it being strictly opt-in + a commit-check
-  WARNING documenting the aggregate cost + the §10 table in operator
-  docs.
+  the old policy. Covered by the F3 coordinator test (§8.1).
+- **Risk: non-work-conserving footgun (AGY r1).** `slowest` costs ~30 %
+  and `mean` ~12 % aggregate; mitigated by both being strictly opt-in +
+  a commit-check WARNING documenting the §4 aggregate cost + the F1
+  live-measurement ship-gate that PLAN-KILLs `mean` if it is a measured
+  no-op. The default is unaffected.
+- **Risk: `mean` is a live no-op (the §4 sample-set-collapse failure
+  mode).** This is the central technical risk; the F1 ship-gate (§8.2)
+  is the explicit mitigation — `mean` does not ship unless it measurably
+  works.
 - **Rollback**: revert the PR; unset configs are unaffected (default
   unchanged). No data migration.
