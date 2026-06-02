@@ -21,3 +21,8 @@ Continuations fetch by id (Codex loses session state >30min).
 - Codex: /tmp/codex-1748-r3.txt, bash bg `baw2rokje` — PLAN-NEEDS-MAJOR (async-queue zero-owner race; promote must not reuse update_session/maybe_promote_synced_session)
 - AGY: adversarial-review-mpwqkxjl-cy4m05 — PLAN-READY
 - Claude-SMR: claude-smr-plan-r3.md — was READY, SELF-CORRECTED to concur with Codex NEEDS-MAJOR
+
+## Plan review round 4 (plan v4 @ d3016b922)
+- Codex: /tmp/codex-1748-r4.txt, bash bg `bgiy46xot` — pending (verifying barrier + dedicated promote close r3 findings)
+- AGY: adversarial-review-mpwqtig4-0q0vg7 — pending
+- Claude-SMR: PLAN-READY (barrier reuses session_export_ack idiom; dedicated origin-only promote specified) — doc on reconcile
