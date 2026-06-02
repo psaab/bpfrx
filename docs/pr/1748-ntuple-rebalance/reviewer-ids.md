@@ -46,3 +46,9 @@ Continuations fetch by id (Codex loses session state >30min).
 - Codex: /tmp/codex-1748-r6.txt, bash bg `b8px03pgf` — pending (transition-set completeness: second-move, rule-cap eviction, failover-mid-move)
 - AGY: pending
 - Claude-SMR: PLAN-READY (transition set {install,rollback,teardown,dead} appears complete; second-move + eviction are instances of the same barrier principle)
+
+## Plan review round 6 (plan v6 @ a37206bfa) → CONVERGED
+- Codex: /tmp/codex-1748-r6.txt, bash bg `b8px03pgf` — PLAN-READY (no blocking transition gap)
+- AGY: adversarial-review-mpwr6tev-7agzdw — PLAN-NEEDS-MINOR (2 terminal-path gates; pre-declared their incorporation = PLAN-READY)
+- Claude-SMR: PLAN-READY
+- v7 @ folds AGY's two terminal-path gates → CONVERGED PLAN-READY

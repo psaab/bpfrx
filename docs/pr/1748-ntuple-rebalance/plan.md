@@ -1,8 +1,25 @@
 # #1748 Step 1 — reactive cross-worker ntuple rebalance controller (forward-direction, default-OFF)
 
-- **Status**: DRAFT v6 — round-5 NEEDS-MAJOR addressed (teardown-of-live-move is
-  a reverse barrier), pending round-6 re-review
+- **Status**: **PLAN-READY v7** — converged after 6 hostile rounds. Codex r6
+  PLAN-READY; AGY r6 PLAN-NEEDS-MINOR with two terminal-path gates whose
+  incorporation AGY pre-declared as its PLAN-READY condition (now folded);
+  Claude-SMR PLAN-READY.
 - **Issue**: #1748
+
+### Round-6 outcome → CONVERGED (PLAN-READY)
+Codex r6 = PLAN-READY: "no blocking transition gap found" — transition set
+{install (fwd barrier), rollback (rev), teardown-of-live (rev), dead-flow
+(trivial)} complete; second-move `W_new→W_third` covered (treat the current
+local owner generically, not literally `ForwardFlow`); rule-cap eviction
+correctly out-of-scope (controller stops at budget, no eviction); RG failover
+covered (`RebalancedOwner` demotes like a normal owner, standby has no rules);
+reverse-companion GC emits no Close (gated `!is_reverse`) and reverse NAT release
+is a no-op. AGY r6 = PLAN-NEEDS-MINOR with two more `RebalancedOut` gates on the
+**terminal/purge** paths (`session_glue/mod.rs:298` SNAT release,
+`:392 remove_shared_session`) — folded into the §4.5 suppression set; AGY stated
+their incorporation = PLAN-READY. **Implementation pins (Codex):** tests for the
+second-move chain `ForwardFlow→RebalancedOwner→RebalancedOwner(third)` and for
+`max_rules` budget-exhaustion proving no eviction/delete occurs.
 
 ### Round-5 review outcome (Codex NEEDS-MAJOR, AGY READY)
 AGY r5 = PLAN-READY (verified wheel lazy-cleanup safe + reverse-barrier rollback
@@ -240,6 +257,17 @@ Coordinator sequence (one move per `rebalance_interval`):
   must NOT rewrite `RebalancedOut`→`SyncImport`; `refresh_owner_rgs`
   (`:32,80`) must NOT republish it; peer export (`session_glue/mod.rs:420,436`)
   must NOT emit an Open delta for it.
+- **Terminal/purge path exclusions (AGY r6 — the suppression is NOT GC-only):**
+  the same `RebalancedOut` gate must cover the worker purge + terminal-filter
+  paths, which are separate from `expire_stale_entries`: (a) the purge loop at
+  `session_glue/mod.rs:298` must skip `release_source_nat_allocation` for
+  `RebalancedOut` (else an interface-down/admin purge on W_old double-releases
+  the SNAT port W_new still owns); (b) `delete_terminal_filtered_session`
+  (`session_glue/mod.rs:392`) must skip `remove_shared_session` for
+  `RebalancedOut` (else W_old's terminal cleanup deletes the SHARED session-map
+  entry W_new is actively forwarding against). General rule: **every site that
+  releases/deletes shared state keyed by a session must be `RebalancedOut`-gated**
+  — GC expiry, purge, and terminal-filter alike.
 
 **Applied-command barrier (Codex r3 — required; supersedes the v3 single-tick
 claim).** v3 wrongly assumed promote→demote ordering held; the worker command
