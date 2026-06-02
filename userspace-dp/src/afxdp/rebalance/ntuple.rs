@@ -31,6 +31,7 @@ const ETHTOOL_GRXCLSRLALL: u32 = 0x0000_0030; // get all classification rule loc
 const ETHTOOL_SRXCLSRLDEL: u32 = 0x0000_0031; // delete a classification rule
 const ETHTOOL_SRXCLSRLINS: u32 = 0x0000_0032; // insert a classification rule
 const ETHTOOL_GRXCLSRLCNT: u32 = 0x0000_0029; // get count of classification rules
+const ETHTOOL_GRXCLSRULE: u32 = 0x0000_002e; // get a single classification rule
 
 /// flow_type values (ethtool.h enum). 0x01 = TCP/IPv4 spec (`tcp_ip4_spec`);
 /// the plan's "0x03" was SCTP_V4_FLOW — corrected here against the header.
@@ -349,9 +350,13 @@ impl NtupleSocket {
         if count == 0 {
             return Ok(Vec::new());
         }
-        // Over-allocate a flat byte buffer: the fixed 192 B header followed by
-        // `count` u32 locations.
-        let total = size_of::<EthtoolRxnfc>() + (count as usize) * size_of::<u32>();
+        // The flexible `rule_locs[]` member starts at offset 188 (#1748 review
+        // #7), NOT at size_of::<EthtoolRxnfc>() (192). The struct rounds up to
+        // 192 for u64 alignment, but the kernel writes the location array
+        // beginning at the field offset. Allocate from the field offset so the
+        // first location is not skipped and the read offsets match.
+        let locs_off = offset_of!(EthtoolRxnfc, rule_locs);
+        let total = locs_off + (count as usize) * size_of::<u32>();
         let mut buf = vec![0u8; total];
         {
             // SAFETY: buf is at least sizeof(EthtoolRxnfc); we initialize the
@@ -382,7 +387,6 @@ impl NtupleSocket {
             unsafe { (*hdr).rule_cnt }.min(count) as usize
         };
         let mut out = Vec::with_capacity(returned);
-        let locs_off = size_of::<EthtoolRxnfc>();
         for i in 0..returned {
             let off = locs_off + i * size_of::<u32>();
             let bytes: [u8; 4] = buf[off..off + 4].try_into().unwrap();
@@ -390,13 +394,58 @@ impl NtupleSocket {
         }
         Ok(out)
     }
+
+    /// #1748 AGY minor: startup orphan reconcile. A crashed/killed daemon
+    /// leaves its installed ntuple rules in the NIC's hardware rule table (HW
+    /// state is not torn down on SIGKILL). On controller construction we
+    /// enumerate every existing rule on the interface and delete it, so a fresh
+    /// run does not accumulate stale rules from a previous run and never trips
+    /// the rule-table cap with dead entries.
+    ///
+    /// NOTE: this clears ALL flow-classification rules on the interface. On the
+    /// userspace-dp dataplane these VFs are daemon-owned; flow-steering ntuple
+    /// rules are not independently operator-managed there (see CLAUDE.md loss
+    /// cluster topology). Returns the number of rules removed.
+    pub(crate) fn reconcile_orphans(&self) -> io::Result<usize> {
+        let locs = self.list_locs()?;
+        let mut removed = 0usize;
+        for loc in locs {
+            // delete_rule maps ENOENT -> Ok, so a rule that vanished between
+            // the list and the delete is not an error.
+            self.delete_rule(loc)?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
+    /// Read back a single installed rule's flow spec via `ETHTOOL_GRXCLSRULE`.
+    /// Test-only readback used by `live_insert_list_delete_round_trip` to
+    /// assert the canonical inverted-mask encoding (#1748 review #1).
+    #[cfg(test)]
+    pub(crate) fn get_rule(&self, loc: u32) -> io::Result<EthtoolRxFlowSpec> {
+        let mut rxnfc = EthtoolRxnfc {
+            cmd: ETHTOOL_GRXCLSRULE,
+            ..EthtoolRxnfc::default()
+        };
+        rxnfc.fs.location = loc;
+        self.ioctl(&mut rxnfc)?;
+        Ok(rxnfc.fs)
+    }
 }
 
-/// Build the `ethtool_rx_flow_spec` for an exact 5-tuple. Masks: a 0 bit in
-/// `m_u` means "match this bit"; an all-ones field means "wildcard" — so an
-/// exact match sets every relevant mask field to 0. `ring_cookie` carries
-/// the destination queue; `location = RX_CLS_LOC_ANY` lets the driver pick a
-/// free slot.
+/// Build the `ethtool_rx_flow_spec` for an exact 5-tuple.
+///
+/// MASK POLARITY (hardware-confirmed, #1748 review #1 — do NOT "fix" this to
+/// the intuitive all-ones=match convention): the ethtool rxnfc mask is
+/// INVERTED — a 0 bit in `m_u` means "match this bit", an all-ones field means
+/// "don't care / wildcard". Verified empirically on the live mlx5 VF: an exact
+/// CLI rule (`ethtool -N <if> flow-type tcp4 src-ip ... action <q>`) reads back
+/// via `ethtool -n <if>` as `Src/Dest IP mask: 0.0.0.0`, `Src/Dest port mask:
+/// 0x0`, `TOS mask: 0xff`. So an exact 5-tuple match sets every addr/port mask
+/// field to 0 (match) and TOS mask to 0xff (wildcard). `live_insert_list_delete_round_trip`
+/// readback-asserts these canonical masks. `ring_cookie` carries the
+/// destination queue; `location = RX_CLS_LOC_ANY` lets the driver pick a free
+/// slot.
 fn build_flow_spec(flow: &FlowSpec5Tuple, queue: u32) -> EthtoolRxFlowSpec {
     let mut fs = EthtoolRxFlowSpec {
         ring_cookie: queue as u64,

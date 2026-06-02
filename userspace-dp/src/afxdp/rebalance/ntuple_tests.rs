@@ -38,6 +38,21 @@ fn uapi_rxnfc_offsets_match_kernel() {
     assert_eq!(offset_of!(EthtoolRxnfc, rule_locs), 188);
 }
 
+/// #1748 review #7: list_locs reads the flexible rule_locs[] array from the
+/// FIELD offset (188), NOT size_of::<EthtoolRxnfc>() (192). Reading from 192
+/// would skip the first returned location. This pins the offset list_locs
+/// uses against the size, which differ by the 4-byte trailing alignment pad.
+#[test]
+fn rule_locs_field_offset_is_not_struct_size() {
+    assert_eq!(offset_of!(EthtoolRxnfc, rule_locs), 188);
+    assert_eq!(size_of::<EthtoolRxnfc>(), 192);
+    assert_ne!(
+        offset_of!(EthtoolRxnfc, rule_locs),
+        size_of::<EthtoolRxnfc>(),
+        "list_locs must read from the field offset (188), not the struct size (192)"
+    );
+}
+
 #[test]
 fn build_flow_spec_tcp4_exact_match_encoding() {
     let flow = FlowSpec5Tuple {
@@ -123,6 +138,21 @@ fn live_insert_list_delete_round_trip() {
         before.len() + 1,
         "exactly one rule added"
     );
+    // #1748 review #1: read the rule back and assert the canonical INVERTED
+    // mask encoding the live mlx5 NIC confirmed — tuple mask fields = 0
+    // (match), TOS mask = 0xff (wildcard). This pins the hardware-confirmed
+    // polarity so the masks are not "corrected" to the intuitive convention.
+    let fs = sock.get_rule(loc).expect("get_rule readback");
+    let m_ip4src = u32::from_ne_bytes(fs.m_u.hdata[0..4].try_into().unwrap());
+    let m_ip4dst = u32::from_ne_bytes(fs.m_u.hdata[4..8].try_into().unwrap());
+    let m_psrc = u16::from_ne_bytes(fs.m_u.hdata[8..10].try_into().unwrap());
+    let m_pdst = u16::from_ne_bytes(fs.m_u.hdata[10..12].try_into().unwrap());
+    let m_tos = fs.m_u.hdata[12];
+    assert_eq!(m_ip4src, 0, "src-ip mask must be 0.0.0.0 (exact match)");
+    assert_eq!(m_ip4dst, 0, "dst-ip mask must be 0.0.0.0 (exact match)");
+    assert_eq!(m_psrc, 0, "src-port mask must be 0x0 (exact match)");
+    assert_eq!(m_pdst, 0, "dst-port mask must be 0x0 (exact match)");
+    assert_eq!(m_tos, 0xff, "TOS mask must be 0xff (wildcard)");
     sock.delete_rule(loc).expect("delete rule");
     let cleaned = sock.list_locs().expect("list after delete");
     assert!(

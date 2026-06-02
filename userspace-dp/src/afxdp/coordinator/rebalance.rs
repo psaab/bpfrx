@@ -216,6 +216,19 @@ impl super::Coordinator {
                 };
                 match NtupleSocket::open(&ifname) {
                     Ok(sock) => {
+                        // #1748 AGY minor: clear any orphan ntuple rules left
+                        // by a previous (crashed) daemon run on this interface
+                        // before we start installing fresh ones, so stale HW
+                        // rules cannot accumulate or exhaust the rule-table cap.
+                        match sock.reconcile_orphans() {
+                            Ok(0) => {}
+                            Ok(n) => eprintln!(
+                                "xpf-rebalance: cleared {n} orphan ntuple rule(s) on {ifname} (ifindex {ifindex}) at startup"
+                            ),
+                            Err(e) => eprintln!(
+                                "xpf-rebalance: startup orphan reconcile on {ifname} (ifindex {ifindex}) failed: {e}"
+                            ),
+                        }
                         self.rebalance_controllers
                             .insert(ifindex, RebalanceController::new(config, sock));
                     }
