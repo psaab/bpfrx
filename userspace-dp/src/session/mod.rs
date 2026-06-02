@@ -1136,15 +1136,22 @@ impl SessionTable {
             let Some(entry) = self.entry_by_key_mut(&key) else {
                 continue;
             };
-            // #1748: RebalancedOut is the inert abandoned W_old copy — it is
-            // excluded from the rebalance suppression set's HA handling and
-            // must NOT be rewritten to SyncImport (that would re-enable the
-            // shared cleanup W_new owns). RebalancedOwner is a normal local
-            // owner and DOES demote to SyncImport on failover, handled by the
-            // `!is_peer_synced()` branch below (RebalancedOwner is not
-            // peer-synced).
+            // #1748 review #5: RebalancedOut is the inert abandoned W_old copy.
+            // It must be excluded from the rebalance suppression set's HA
+            // handling AND must NOT be returned in `demoted_keys`. The
+            // demoted_keys list is NOT benign bookkeeping: the
+            // DemoteOwnerRGS handler republishes the shared session-map entry
+            // for each demoted key (publish_worker_session_map_entry,
+            // session_glue/commands/demote_owner_rgs.rs) AND pushes the key to
+            // `cancelled_keys`, which the worker loop uses to call
+            // delete_session_map_redirect_for_session
+            // (worker/loop_body/mod.rs) — the raw, NOT origin-gated, redirect
+            // delete. Either would tear down the shared redirect/session-map
+            // state W_new is actively forwarding against. So skip the push
+            // entirely. (RebalancedOwner is a normal local owner and DOES
+            // demote to SyncImport on failover via the `!is_peer_synced()`
+            // branch below.)
             if entry.origin.is_rebalanced_out() {
-                demoted_keys.push(key);
                 continue;
             }
             if !entry.origin.is_peer_synced() {

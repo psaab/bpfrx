@@ -1937,12 +1937,24 @@ fn demote_owner_rg_excludes_rebalanced_out_but_demotes_owner() {
     ));
     assert!(table.promote_rebalanced_owner(&owner_key, now));
 
-    table.demote_owner_rg(1);
+    let demoted = table.demote_owner_rg(1);
 
     // RebalancedOut stays inert.
     assert_eq!(table.origin_of(&out_key), Some(SessionOrigin::RebalancedOut));
     // RebalancedOwner demotes to SyncImport like ForwardFlow.
     assert_eq!(table.origin_of(&owner_key), Some(SessionOrigin::SyncImport));
+    // #1748 review #5: the RebalancedOut key must NOT appear in demoted_keys —
+    // downstream the DemoteOwnerRGS handler republishes the shared session-map
+    // entry and pushes the key to cancelled_keys (which deletes the redirect
+    // alias W_new owns). The RebalancedOwner key MUST appear (normal demote).
+    assert!(
+        !demoted.contains(&out_key),
+        "RebalancedOut key must NOT be returned in demoted_keys: {demoted:?}"
+    );
+    assert!(
+        demoted.contains(&owner_key),
+        "RebalancedOwner key must be returned in demoted_keys: {demoted:?}"
+    );
 }
 
 /// restore_rebalanced_owner (reverse-barrier step) flips a RebalancedOut entry
