@@ -1,362 +1,255 @@
 # Research plan — #1748 Cross-worker per-flow REBALANCE (re-steer of established flows) on mlx5 VFs
 
-- **Revision**: r1 (DRAFT — pre-review)
-- **Status**: PLAN-KILL (proposed) — see §10. Reviewers must falsify the kill or ratify it.
+- **Revision**: r2 (post round-1: Codex PLAN-READY-kill, Claude SMR PLAN-READY-kill, AGY **PLAN-KILL-OVERTURNED**). Verdict changed.
+- **Status**: **PLAN-NEEDS-WORK → scoped feasibility-prototype** for Path 2 (ntuple HW re-pin). NOT a clean kill; NOT yet PLAN-READY-to-ship.
 - **Skill**: `/research` (research-only; stop at PLAN-READY or PLAN-KILL; no code; docs only)
 - **Issue**: #1748 (label `perf`)
-- **Worktree**: `.claude/worktrees/1748-research-mlx5-flow-rebalance`, branch `research/1748-mlx5-flow-rebalance`
+- **Worktree**: `.claude/worktrees/1748-mlx5-flow-rebalance`, branch `research/1748-mlx5-flow-rebalance`
 - **Base**: origin/master @ `ecdc16f2e`
 
 ---
 
-## 0. TL;DR for the reviewer
-
-#1748 asks whether the mlx5 VF capability surface (native XDP, exact/masked
-ntuple steering, 6 RX queues → 6 workers) finally makes **cross-worker
-per-flow REBALANCE** — moving an *already-established* long-lived flow off an
-overloaded worker onto an idle one — tractable, after four prior kills
-(#840 RSS table, #899 per-flow XDP_REDIRECT, #936 cross-worker MQFQ, #937
-ingress XDP_REDIRECT) and one direct predecessor (#1649 initial-placement).
-
-The honest distinction #1748 raises is real: **#1649 forbade re-steer by fiat
-("programmed once, NEVER re-steered"). #1748 explicitly asks to evaluate the
-re-steer itself.** This plan does NOT lean on #1649's by-fiat exclusion. It
-evaluates re-steer of an established flow on its merits, on the two physically
-distinct mechanisms #1748 names (ntuple HW re-pin vs XDP_REDIRECT), against
-the **two independent walls** that both prior chains hit.
-
-**Proposed verdict: PLAN-KILL.** The mlx5 capability delta (which is genuine
-and verified) changes the *delivery primitive availability* but does NOT
-change either wall:
-
-- **Wall A — AF_XDP queue-binding (kills XDP_REDIRECT path):** permanent
-  zero-copy physics. `xsk_rcv_check()` enforces
-  `xs->queue_id == xdp->rxq->queue_index`. Verbatim-cited in #937 by both
-  Codex and Gemini against current 7.x source. mlx5 native XDP does not touch
-  this; CPUMAP does not bypass it.
-
-- **Wall B — per-worker session/UMEM ownership (kills the ntuple HW re-pin
-  path even though the primitive exists):** moving an established flow's RX
-  queue with an ntuple rule succeeds at the HW/`xsk_rcv_check` layer (packets
-  legitimately arrive on the new queue's socket), but **strands the flow's
-  session, conntrack, flow-cache, and MQFQ state on the old worker.** There is
-  no cross-worker session-migration mechanism, and the flow cache is
-  explicitly per-worker with "no cross-worker cache-line traffic"
-  (`userspace-dp/src/afxdp/flow_cache.rs:146`). This is the structural reason
-  #1649 forbade re-steer; #1748 forces us to confront it head-on rather than
-  assume it, and the confrontation confirms it.
-
-The mlx5 ntuple primitive #1748 hoped would change the verdict is the *same*
-primitive #1649 already found, measured (cap 1024, ~1 ms/rule), and showed
-cannot beat the multinomial floor without a re-steer — and the re-steer it
-would enable is blocked by Wall B, not by #1649's fiat. So the newer hardware
-does not revive the line. PLAN-KILL is the proposed outcome; reviewers are
-asked to falsify Wall A or Wall B with a quoted-line/measured counter-example
-or ratify the kill.
-
----
-
-## 1. Problem statement (verbatim from #1748 + live evidence)
-
-Live A/B (#1746): per-flow CoV swings 14–29% on `-P12` shaped ports, driven by
-RSS flow-count imbalance across the 6 VF workers (1-flow worker → ~1.8 G/flow,
-4-flow worker → ~0.87 G/flow). A per-flow rate **cap** (the #1746 equal-flow
-knob) provably cannot fix this: it only clips fast flows down, never lifts slow
-flows up, because the spare capacity is on a *different worker's* queue. The
-only mechanism that lifts slow flows (fairness WITHOUT aggregate loss) is
-moving flows off overloaded workers onto idle ones — i.e. **cross-worker
-rebalance of established flows.** #1748 is that mechanism.
-
-This is a per-flow *distribution* effect, not an aggregate-throughput defect
-(`docs/fairness-regimes.md`, "What this means operationally"). The structural
-ceiling `Cstruct` for a given `{aᵢ}` is the best any scheduler can do; the only
-way to beat `Cstruct` is to change `{aᵢ}` itself — which requires moving an
-established flow to a different worker.
-
-## 2. Hardware capability findings (mlx5 VF — re-verified live 2026-06-01)
-
-Re-probed `loss:xpf-userspace-fw0:ge-0-0-2` (the iperf path, reth0.80) read-only
-this session. Verbatim:
-
-```
-$ ethtool -i ge-0-0-2
-driver: mlx5_core
-version: 7.0.0-rc7+
-firmware-version: 26.48.1000 (MT_0000000531)
-bus-info: 0000:09:00.0
-
-$ ethtool -l ge-0-0-2
-Combined: 6   (pre-set max 6, current 6)        # 6 RX queues = 6 workers
-
-$ ethtool -k ge-0-0-2 | grep -iE 'ntuple|hashing'
-ntuple-filters: off                              # togglable on (per #1649)
-receive-hashing: on
-
-$ ethtool -n ge-0-0-2
-6 RX rings available
-Total 0 rules                                    # clean; no leftover rules
-
-$ uname -r (in VM)
-7.0.0-rc7+
-```
-
-This matches #1649's findings (commit `36fcd1b8`) exactly. Capabilities
-established by #1649 and not re-probed disruptively this session (cluster is
-shared/serialized for smoke — no rule inserts performed):
-
-- **Exact 5-tuple → RX-queue ntuple steering works**: `ethtool -N ... action N`
-  → `Added rule with ID 1023`. (#1649 verbatim)
-- **Masked src-port-residue steering works**: `src-port 0 m 0xfff8` etc. (#1649)
-- **Rule-table capacity = 1024** (probed to exhaustion; = mlx5
-  `MLX5E_ETHTOOL_FLOW_SPEC_NUM`). (#1649)
-- **Per-rule cost ~1 ms-class** firmware-synchronous command. (#1649)
-- **Native XDP + `ndo_xdp_xmit`** present on mlx5 VF (CLAUDE.md "XDP on
-  SR-IOV Interfaces"; #1649).
-
-**The #1748 premise is correct: the primitive #840/#937 named as missing
-EXISTS on this NIC.** The question is whether it changes the verdict. It does
-not — see §4–§6.
-
-## 3. Prior-art kill ledger (what each kill actually turned on)
-
-| Issue | Mechanism | Hardware at kill | Load-bearing kill reason |
-|---|---|---|---|
-| #840 | RSS *indirection table* tuning | mlx5 VF | Global hash buckets; can't move a *long-lived* flow (table change only affects future hashes). Empirically net-negative (CoV 37.7% vs 18.5% baseline). |
-| #899 | per-flow XDP_REDIRECT | i40e/iavf era; closed on #900 empirical (scheduler scaled fine) | Re-opened as #937. |
-| #936 | cross-worker MQFQ shared vtime | mlx5 VF | Throttle-only (stall fast workers); ~43% aggregate hit. Later subsumed by PR #1230 fair-share lease (iperf-e CoV 60→13.3%). |
-| #937 | ingress XDP_REDIRECT (before UMEM bind) | mlx5 VF, kernel 7.0-rc | **Wall A**: `xsk_rcv_check()` device+queue validation; CPUMAP doesn't bypass; verbatim Codex+Gemini against 7.x source. |
-| #1649 | HW ntuple **initial** placement (no re-steer) | mlx5 VF, 7.0-rc7+ | Static `f(tuple)→queue` = i.i.d. multinomial draw = RSS floor (CoV ≈0.87 at N=6); reactive exact-rule placement IS a re-steer (SYN RSS-placed before ephemeral port knowable). 3-way converged kill. |
-
-**Key observation:** every kill on the *current* mlx5 hardware (#840, #936,
-#937, #1649) already had the mlx5 capabilities #1748 cites. The kills did not
-turn on "the hardware lacks ntuple steering" — they turned on Wall A (XSKMAP)
-or the multinomial theorem (#1649) or the throttle trade-off (#936). #1748's
-hardware-delta premise is therefore *already incorporated* in the most recent
-kills. The genuinely-new question #1748 adds is the re-steer of an established
-flow via ntuple — which #1649 forbade by fiat and this plan evaluates on
-merits (§5, Wall B).
-
-## 4. RQ2 — per-flow XDP_REDIRECT between VFs/queues (Wall A)
-
-**Verdict: blocked, permanently, by AF_XDP zero-copy physics. mlx5 native XDP
-+ `ndo_xdp_xmit` does not change this.**
-
-The XDP shim's `select_userspace_queue()` (`userspace-xdp/src/lib.rs:1364`)
-returns `rx_queue_index % queue_count` and carries the load-bearing comment
-(`:1378-1385`):
-
-> AF_XDP delivery is queue-bound. XDP may only redirect to a socket bound to
-> the packet's actual RX queue. Hashing to a different userspace queue here
-> silently strands packets between redirect intent and ring delivery.
-
-Kernel mechanism (verbatim from #937 Codex review, current 7.x):
-`xsk_rcv_check()` enforces `xs->dev == xdp->rxq->dev` AND
-`xs->queue_id == xdp->rxq->queue_index` before delivery. A
-`bpf_redirect_map(XSKMAP, slot)` to a socket bound to a *different* queue is
-silently dropped (no error counter). `ndo_xdp_xmit` is the TX-side hook for
-redirecting to *another netdev*; it is irrelevant to cross-RX-queue delivery
-on the same netdev. CPUMAP moves an `xdp_frame` to another CPU/kthread but does
-NOT change RX-queue provenance (Codex: "CPU != RX queue"; cpumap.c has a TODO
-for `queue_index` propagation) — a subsequent XSKMAP redirect still hits
-`xsk_rcv_check()`.
-
-The 2026 "leased/peered queue" patches Codex cited extend validation for
-leased queues; they do **not** add arbitrary cross-queue delivery. No reviewer
-across #937 found a primitive that falsifies this.
-
-**Conclusion RQ2: XDP_REDIRECT cross-worker rebalance is impossible on AF_XDP
-zero-copy regardless of mlx5 capabilities. Unchanged from #937.**
-
-## 5. RQ1 + RQ3 — ntuple HW re-pin of an established flow (Wall B)
-
-This is the genuinely-new evaluation #1748 demands (#1649 forbade it by fiat).
-
-**RQ1 sub-question (does ntuple re-pin a live flow's RX queue?):** Plausibly
-YES at the HW layer. An `ethtool -N flow-type tcp4 ... action 5` rule with the
-exact 5-tuple of an *established* flow directs that flow's future packets to RX
-queue 5. Unlike #840's indirection-table (which only changes the hash for
-*future* flows), an exact-tuple rule is a HW override that takes effect for the
-matching live flow. After the rule lands, packets arrive on RX queue 5, whose
-XSK socket belongs to worker 5 → `xsk_rcv_check()` *passes* (queue now matches).
-So unlike Wall A, the delivery primitive does not block this.
-
-**Wall B (why it still fails):** the flow's *session state* does not move with
-it. On this dataplane, a flow's conntrack/session entry, its flow-cache entry,
-and its MQFQ bucket all live on the **worker that first ingressed it** (the old
-worker, queue 2). The flow cache is per-worker by construction:
-
-> `userspace-dp/src/afxdp/flow_cache.rs:146`: "...atomics and no cross-worker
-> cache-line traffic."
-
-There is **no cross-worker session-migration mechanism** in the dataplane
-(grep of `userspace-dp/src/afxdp/*.rs` for migrate/steal/work-shar finds only
-mirror-clone TX paths and HA owner-RG export — neither migrates a live
-forwarding session between local workers). After an ntuple re-pin:
-
-1. Worker 5 receives packets for a flow it has no flow-cache/session entry for
-   → forced full session-table lookup miss path, or (worse) a *second* session
-   gets created on worker 5 while worker 2 still holds the original. Conntrack
-   correctness (NAT mappings, TCP state, seq tracking) is now split across two
-   workers with no synchronization.
-2. The old worker (2) keeps any half-open TX/retransmit state and its MQFQ
-   accounting; the new worker (5) starts cold. Mid-stream reordering and
-   likely TCP reset.
-
-This is *exactly* the forbidden re-steer pattern the entire chain was killed
-on, and #1649's verbatim general statement covers it:
-
-> #1649: "any later correction MOVES an established flow ... the forbidden
-> re-steer pattern."
-
-The mlx5 ntuple primitive makes the re-steer *physically expressible* (it was
-always expressible — #840 used the indirection table; #1649 used exact rules),
-but the re-steer was never blocked by *expressibility*. It is blocked by the
-**lack of cross-worker session migration** — Wall B — which is independent of
-the NIC and unchanged by mlx5.
-
-**RQ3 (rebalance policy — which flows, hysteresis, HA consistency):** moot if
-Wall B holds, but worth recording the HA constraint as an *additional*
-independent blocker: a moved flow must land on the matching worker on BOTH
-cluster nodes or session-sync breaks. The HA session-sync owner derivation
-(`pkg/cluster` + `userspace-dp/src/afxdp/ha.rs` owner-RG export) keys session
-ownership to the ingress worker derived from the *local* RSS placement. An
-ntuple re-pin on node 0 would have to be mirrored on node 1's NIC with an
-identical rule AND the synced session would have to be re-homed on node 1's
-worker 5 — but node 1's worker 5 has no migration intake either (Wall B
-applies per-node). So even granting Wall B were solvable on one node, HA
-doubles the requirement. This is a *consequence* of Wall B, not an independent
-reason to revive.
-
-## 6. RQ — does ntuple re-pin beat the multinomial floor at all? (#1649 theorem)
-
-Even setting Wall B aside (hypothetically): would moving flows even help? Only
-a *reactive, occupancy-aware* controller could, and #1649 proved (3-way
-converged, Codex+AGY Monte-Carlo, 200k trials) that:
-
-- Any **static** `f(5-tuple) → queue` produces i.i.d. multinomial draws =
-  the RSS floor (CoV ≈ 0.87 at N=6, M=6) for ephemeral ports; worse if
-  imbalanced. No static scheme creates the negative dependence needed for
-  N≤M flows to avoid occupied queues.
-- A **reactive** controller (observe occupancy, move the offending flow) IS
-  the re-steer — and #1203/#789 already *built and measured* that reactive
-  closed-loop form on this exact cluster: **49–55% CoV at P=12** (gate ≤20%
-  not met), closed with "per-flow CoV is bounded by within-queue scheduling,
-  not placement."
-
-So the reactive rebalance #1748 proposes is not novel-unmeasured: its closest
-realizable form was measured at 49–55% CoV and did not clear the gate, *and*
-that measurement was taken without even paying Wall B's session-migration
-cost (it re-steered by other means and still failed).
-
-## 7. RQ4 — interaction with #1746 equal-flow cap + waterfill
-
-#1746 (equal-flow cap, default-OFF) clips fast flows to lift fairness CoV
-22%→8.6% by *capping*, accepting aggregate loss on the capped flows. #1748's
-premise is that rebalance would lift slow flows *without* aggregate loss,
-making the cap unnecessary. Since #1748 is PLAN-KILL (Walls A+B), the
-interaction is: **the #1746 cap remains the only shipped lever** for the
-shaped-port CoV symptom. Rebalance does not replace it because rebalance is not
-feasible. No code interaction to design.
-
-Note: PR #1230's per-worker fair-share lease (which closed #936) already
-provides cross-worker *coordination* of the per-flow share via
-`epoch_total_granted` — it equalizes the *rate each worker grants per active
-flow* without moving flows. That is the architecturally-permitted form of
-cross-worker fairness (coordinate the scheduler, don't move the packets), and
-it is already shipped. #1748's "move the packets" form is the blocked one.
-
-## 8. Multiple Path Options (as required by /research)
-
-Three mechanisms are physically distinct; all are evaluated and all fail:
-
-- **Path 1 — XDP_REDIRECT rebalance (the #899/#937 form).** KILLED by Wall A
-  (`xsk_rcv_check` queue binding). Not revived by mlx5 native XDP / `ndo_xdp_xmit`.
-- **Path 2 — ntuple exact-5-tuple HW re-pin of established flows (the new
-  #1748 angle).** Delivery primitive EXISTS and survives `xsk_rcv_check`
-  (packets legitimately arrive on the new queue), but KILLED by Wall B
-  (no cross-worker session migration; flow cache per-worker; conntrack/MQFQ
-  stranded). HA doubles the requirement. And per #1649/§6 it wouldn't beat
-  the floor even if Wall B were solved (reactive form measured 49–55% CoV).
-- **Path 3 — hybrid (XDP_REDIRECT for delivery + ntuple for HW assist).**
-  Inherits Wall A from Path 1; no combination removes both walls.
-
-There is no fourth viable mechanism. The only architecturally-permitted
-cross-worker fairness form — coordinate the scheduler rather than move
-packets — is *already shipped* (PR #1230 fair-share lease; #1746 equal-flow
-cap). #1748 specifically asks for the move-packets form, which is what is
-blocked.
-
-## 9. Cost/benefit at absolute scale (RQ5)
-
-Even under the most optimistic hypothetical (Wall B magically solved, single
-node only):
-
-- **Benefit:** lift the worst-case `-P12` shaped-port CoV from 14–29% toward
-  `Cstruct` for a balanced `{aᵢ}`. The *realized* benefit ceiling is bounded
-  by the #1203/#789 measurement (49–55% CoV achieved by the reactive form) —
-  i.e. it did not even reach the ≤20% gate. So the benefit is speculative and
-  the one realized data point is below-gate.
-- **Cost:** a cross-worker session-migration subsystem (does not exist; would
-  need locked conntrack handoff, flow-cache transfer, MQFQ re-accounting,
-  in-flight TX drain to avoid reorder), HA double-programming, ntuple rule
-  churn at ~1 ms/rule against a 1024-rule cap (production flow counts vastly
-  exceed 1024 → fall back to RSS floor for the overflow), and a reactive
-  controller polling per-worker occupancy at >1 Hz on the contended control
-  socket (CLAUDE.md control-socket contention rule). This is multi-month
-  architecture work to chase a benefit whose one realized measurement is
-  below the gate.
-
-**Cost/benefit: strongly negative.** This is the same conclusion the chain
-reached; mlx5 does not move it.
-
-## 10. Recommendation — PLAN-KILL
-
-Proposed outcome: **PLAN-KILL**, label `plan-kill`, close per
-`feedback_plan_kill_label_required`. The mlx5 capability delta is real and was
-the right thing to re-check, but it changes only the *delivery-primitive
-availability* for Path 2, which was never the blocker. The two walls stand:
-
-- **Wall A** kills XDP_REDIRECT (Path 1/3) — permanent zero-copy physics,
-  verbatim 7.x source, re-confirmed by #937.
-- **Wall B** kills ntuple HW re-pin (Path 2) — no cross-worker session
-  migration; mlx5 makes the move expressible but not *safe*. This is the wall
-  #1649 named by fiat and #1748 forced us to confront on merits — it holds.
-
-And independently, per #1649's converged multinomial theorem and the
-#1203/#789 realized 49–55% CoV measurement, even a hypothetical Wall-B-free
-reactive rebalance does not beat the floor for production ephemeral-port
-traffic.
-
-**The shipped, architecturally-permitted answer to the #1746 symptom is:**
-(1) PR #1230 fair-share lease (cross-worker scheduler coordination, no packet
-moves), and (2) the #1746 equal-flow cap (operator opt-in, accepts aggregate
-loss). #1748's "move the packets" form adds no reachable benefit over these.
-
-**Documentation deliverable on kill:** `docs/fairness-regimes.md` already has
-the "Why hardware steering does NOT beat the floor" subsection (from #1649).
-Add a one-paragraph note there explicitly distinguishing *initial placement*
-(killed #1649) from *re-steer/rebalance of established flows* (killed #1748,
-Wall B), so the next person who notices "but #1649 only forbade re-steer by
-fiat" finds the on-merits Wall-B analysis instead of re-opening. This is a
-docs-only follow-up at `/engineer` time, NOT part of this research.
-
-## 11. Reviewer falsification targets (be hostile — quote lines / measure)
-
-To overturn PLAN-KILL, a reviewer must produce ONE of:
-
-1. **Falsify Wall A:** a current-kernel (≥7.0) mechanism + citation showing
-   XSKMAP (or any AF_XDP) delivery to a socket bound to a *different* RX queue
-   than the packet's `xdp->rxq->queue_index` succeeds. (CPUMAP staging does not
-   count — show the subsequent XSK delivery passing `xsk_rcv_check`.)
-2. **Falsify Wall B:** point to an existing cross-worker session-migration path
-   in `userspace-dp/src/afxdp/` (conntrack + flow-cache + MQFQ) that a moved
-   flow could use, OR a credible bounded design for one that does not
-   re-introduce cross-worker cache-line contention (the explicit
-   `flow_cache.rs:146` non-goal) and survives HA double-homing.
-3. **Falsify §6:** a static-or-reactive placement scheme + Monte-Carlo or
-   measurement showing it beats CoV ≈ 0.87 at N=6 M=6 for *ephemeral* ports
-   without coordinating source ports (the #1649 harness artifact).
-
-Absent at least one, ratify PLAN-KILL. Do not KILL the *kill* on stale grounds
-(e.g. "the hardware can't steer") — the hardware CAN steer; that is conceded
-and is not the blocker.
+## 0. What changed in r2 (the load-bearing finding)
+
+r1 proposed PLAN-KILL on two walls. **Codex + Claude SMR ratified the kill;
+AGY overturned it** by falsifying Wall B with quoted code, and I independently
+verified AGY's claims against master. The verification stands:
+
+- **Wall A still holds** (XDP_REDIRECT path dead): `xsk_rcv_check()` enforces
+  `xs->queue_id == xdp->rxq->queue_index`; mlx5 native XDP / `ndo_xdp_xmit` /
+  CPUMAP do not bypass. Codex re-cited current 7.x source; the shim encodes it
+  at `userspace-xdp/src/lib.rs:1364`. Path 1 (XDP_REDIRECT) and Path 3 (hybrid)
+  are permanently blocked. **Conceded by all three reviewers.**
+
+- **Wall B is FALSIFIED for the same-node, active-node case** (Path 2, ntuple
+  re-pin). The original Wall-B claim ("re-steer strands the session, splits
+  conntrack, creates a duplicate on the cold worker") is materially wrong on
+  this dataplane, because the HA session-replication machinery already
+  pre-installs a *forwarding-ready* replica of every session on every sibling
+  worker:
+
+  - **Forward AND reverse entries are replicated to all peer workers on
+    creation** — `replicate_session_upsert(worker_ctx.peer_worker_commands,
+    &forward_entry)` (`poll_descriptor/mod.rs:1267`) and the reverse companion
+    via `replicate_session_upsert(peer_worker_commands, &reverse_entry)`
+    (`shared_ops.rs:618`).
+  - **The receiving worker re-resolves with LOCAL egress** in
+    `handle_upsert_synced` (`session_glue/commands/upsert_synced.rs`): doc
+    comment "By resolving on receipt (even on standby), sessions are
+    immediately forwarding-ready." The replica origin is
+    `SessionOrigin::WorkerLocalImport` (`shared_ops.rs:51` →
+    `worker_replica_origin()`; test `tests.rs:473`), which
+    `is_peer_synced() == true`.
+  - **The active-node packet path has NO per-worker ownership gate.**
+    `enforce_ha_resolution_snapshot` (`forwarding/mod.rs:524`) and
+    `owner_rg_is_locally_active` (`session_glue/mod.rs:137`) gate forwarding on
+    the **owner RG being forwarding-active on this node** — never on *which
+    worker* holds the session. So any worker on the active node can forward any
+    session whose RG is locally active. A re-steered packet on worker 5 misses
+    the flow cache once, finds the pre-replicated locally-resolved session in
+    its `SessionTable`, passes HA enforcement, and forwards. No duplicate, no
+    split conntrack.
+  - **Organic handoff via local GC**: local expiration
+    (`worker/loop_body/mod.rs`) does NOT broadcast deletes, so worker 2's stale
+    copy ages out while worker 5's copy stays alive on the new stream — zero
+    cross-worker locks (consistent with the `flow_cache.rs:143` shared-nothing
+    non-goal, which is about the per-tick hot path, not this slow handoff).
+  - **CoS rate-estimator skip-ramp** (`cos/fairness.rs:93`) initializes
+    `observed_bps` from `inst_bps` on the first post-idle sample, so the moved
+    flow's scheduling state converges immediately on worker 5.
+
+  **This is a genuine research discovery: #1649 forbade re-steer "by fiat",
+  and that fiat hid the fact that the HA replication substrate already makes a
+  same-node worker handoff safe.** The mlx5 ntuple primitive (exact-5-tuple →
+  RX-queue, cap 1024, ~1 ms/rule, verified #1649 + re-probed this session)
+  provides the steering mechanism; the session substrate provides the safe
+  landing. Path 2 is therefore NOT killable on Wall B.
+
+This plan is rewritten as a **scoped feasibility-prototype** for Path 2, with
+the real remaining risks (which AGY underweighted) called out honestly so the
+user can decide whether to fund the prototype.
+
+## 1. Problem statement (unchanged)
+
+Per-flow CoV 14–29% on `-P12` shaped ports from RSS flow-count imbalance across
+the 6 VF workers (1-flow worker → ~1.8 G/flow, 4-flow → ~0.87 G/flow). A rate
+**cap** (#1746 equal-flow) only clips fast flows down; it cannot lift slow
+flows because the spare capacity is on a different worker's queue. The only
+mechanism that lifts slow flows without aggregate loss is moving an established
+flow off an overloaded worker onto an idle one — cross-worker rebalance. #1748.
+
+## 2. Hardware capability (verified — see r1 §2, re-probed 2026-06-01)
+
+`ge-0-0-2` = mlx5_core VF, kernel 7.0.0-rc7+, 6 combined RX queues, ntuple
+togglable, rule cap 1024 (#1649 probed to exhaustion), ~1 ms/rule firmware
+cost. Exact-5-tuple and masked-residue steering both accepted (#1649). Daemon
+already has an `ethtool -X` RSS-programming abstraction (`rssExecutor`,
+`pkg/daemon/rss_indirection.go`) with mlx5-allowlist guards — a precedent for
+adding `ethtool -N` ntuple programming on the same plumbing.
+
+## 3. Recommended mechanism — Path 2: reactive ntuple HW re-pin
+
+When a controller detects worker load imbalance, install an exact-5-tuple
+`ethtool -N` rule mapping a chosen long-lived flow's 5-tuple → the least-loaded
+worker's RX queue. The flow's future packets steer to the new RX queue, where
+the pre-replicated session is already forwarding-ready (§0). No mid-flight
+state migration code is required (the substrate exists); the new code is the
+**controller + ntuple programming + HA mirroring + safety bounds**.
+
+Why Path 2 and not Path 1/3: Path 1/3 require XDP_REDIRECT across RX queues,
+which Wall A permanently blocks. Path 2 changes the *hardware* steering
+upstream of `xsk_rcv_check`, so the packet legitimately arrives on the target
+queue's socket and the check passes.
+
+## 4. The genuinely-open risks (must be resolved in the prototype — AGY underweighted these)
+
+AGY's "no code changes needed, just turn it on" is too strong. The session
+substrate is ready, but a *shippable* rebalancer must close these:
+
+### R1. Does it actually beat the floor, or did #1203/#789 already prove it doesn't?
+#1649's converged multinomial theorem says *static* placement = RSS floor
+(CoV ≈ 0.87 at N=6 M=6 for ephemeral ports; Codex independently exact-
+enumerated 6^6 → E[CoV]=0.8740). Path 2 is **reactive**, not static — it
+*observes occupancy and moves the offending flow*, which is exactly the
+negative-dependence the theorem says only a reactive controller can create. BUT
+#1203/#789 *built and measured a reactive closed-loop placement controller on
+this exact cluster and got 49–55% CoV at P=12* (gate ≤20% not met), closing
+with "per-flow CoV is bounded by within-queue scheduling, not placement." The
+prototype's FIRST gate must answer: was #1203's 49–55% a property of placement
+itself (→ Path 2 also fails the gate → KILL), or of #1203's specific controller
+design / convergence speed / hysteresis (→ Path 2 with a better controller may
+clear it)? This requires reading the #1203 controller (`feature/1215-...`
+branch) and either reproducing its limit or identifying the fixable defect.
+**If R1 shows placement itself is floor-bound, Path 2 is killed here** — and
+this is the most likely kill point.
+
+### R2. Reverse direction is not moved.
+Re-pinning the forward 5-tuple does not move the reverse flow (server→client),
+which RSS-hashes independently to a possibly-different worker. For a push test
+the forward direction carries the data, so forward-only re-pin may suffice for
+the throughput-CoV symptom — but `-R` (reverse) tests and bidirectional
+workloads need the reverse rule too, doubling rule consumption and adding a
+second steering decision. The prototype must measure both push and `-R`
+(per `feedback_smoke_push_and_reverse`).
+
+### R3. Transient correctness window.
+Between rule install (~1 ms firmware) and the old worker's in-flight TX
+draining, packets of the same flow can briefly arrive on BOTH workers
+(reordering risk) or the flow-cache on worker 5 is cold (one-time miss → slow
+path). Must verify no TCP reset and bounded reordering under a real transfer
+(bpftrace on `xdp:xdp_redirect_err` is NOT the right tool here — packets are
+not redirected, they are HW-steered — so verify via per-worker RX counters +
+iperf3 retransmit count).
+
+### R4. HA double-homing.
+A moved flow must steer to the matching worker on BOTH cluster nodes or
+session-sync's reverse-companion resolution diverges. The ntuple rule must be
+mirrored to the peer node's NIC (peer uses `ge-7-0-1`/`ge-7-0-2`, same mlx5
+model). Cross-node RSS placement differs, so "matching worker" means matching
+*queue index* — the controller must program identical (5-tuple → queue) rules
+on both nodes and verify the peer's worker N holds the replica (it does, via
+the same replication path). `make test-failover` must stay clean.
+
+### R5. Rule-cap + cost + control-socket contention.
+1024-rule cap vs production flow counts (vastly >1024 → only the heaviest-
+imbalance flows get rules, rest fall back to RSS floor — acceptable, but the
+selection policy must be bounded). ~1 ms/rule synchronous firmware cost means
+the controller cannot churn rules per-tick; needs hysteresis + a low rebalance
+cadence (≪1 Hz of rule writes) and must NOT add a high-frequency control-socket
+caller (CLAUDE.md control-socket contention rule). #840's lesson: a rebalancer
+that thrashes *degrades* fairness (CoV 37.7% vs 18.5%). Hysteresis/convergence-
+detection (#897 line) is mandatory, not optional.
+
+### R6. Flow-selection policy.
+Which flow to move (heaviest on the hot worker? the one whose move most
+flattens `{aᵢ}`?), when (occupancy threshold + dwell), and stop conditions.
+Must converge, not oscillate. This is the substance of RQ3.
+
+## 5. Multiple Path Options (final)
+
+- **Path 1 — XDP_REDIRECT rebalance.** DEAD (Wall A). All three reviewers agree.
+- **Path 2 — reactive ntuple HW re-pin of established flows.** VIABLE substrate
+  (Wall B falsified §0); gated on R1–R6, especially **R1 (does it beat the
+  floor — the #1203 49–55% precedent is the main kill risk)**. **Recommended
+  feasibility-prototype target.**
+- **Path 3 — hybrid.** DEAD (inherits Wall A).
+
+## 6. Interaction with #1746 cap + #1230 fair-share lease (RQ4)
+
+#1746 equal-flow cap (default-OFF) clips fast flows — a within-worker lever.
+PR #1230 fair-share lease coordinates per-flow share across workers via
+`epoch_total_granted` *without moving packets* — already shipped. Path 2 is
+complementary: it changes `{aᵢ}` (the placement) so the *structural ceiling*
+`Cstruct` itself improves, which neither the cap nor the lease can do (they
+operate within a fixed `{aᵢ}`). If Path 2 ships and flattens `{aᵢ}`, the #1746
+cap becomes largely unnecessary for the RSS-skew symptom; until then the cap is
+the only operator lever. They do not conflict.
+
+## 7. Cost/benefit at absolute scale (RQ5)
+
+- **Benefit (if R1 passes):** lift `-P12` shaped-port CoV from 14–29% toward
+  the balanced-`{aᵢ}` floor (~0% for a perfect spread), WITHOUT the aggregate
+  loss the #1746 cap incurs — by moving the slow flows to idle workers rather
+  than clipping the fast ones. This is the only mechanism that improves the
+  structural ceiling.
+- **Benefit ceiling / main risk:** bounded by R1. #1203's realized 49–55% CoV
+  is a below-gate data point for a reactive placement controller on this exact
+  cluster. The prototype must beat it or the line dies at R1.
+- **Cost:** controller + `ethtool -N` programming (extends existing
+  `rssExecutor` plumbing) + HA peer-mirroring + hysteresis + telemetry. No
+  cross-worker session-migration subsystem is needed (the substrate exists) —
+  this is materially LESS code than r1 assumed. Bounded rule churn (≪1 Hz),
+  1024-rule cap with graceful RSS fallback.
+
+**Cost/benefit: conditionally positive, gated on R1.** The substrate discovery
+(§0) removes the largest cost item r1 assumed. The dominant risk is now
+empirical (does reactive placement beat the floor), not architectural.
+
+## 8. Recommended next step
+
+Move #1748 to a **bounded feasibility prototype** that resolves R1 FIRST and
+cheaply (before any production controller code):
+
+1. **R1 spike (read-only + manual ethtool, no daemon code):** on the loss
+   cluster during a maintenance window, run `-P6 -p5210`, read live `{aᵢ}` from
+   `xpf_userspace_binding_active_flow_count`, then *manually* `ethtool -N` re-pin
+   the 5-tuples of the flows on the most-loaded worker to idle queues, and
+   measure per-flow CoV before/after over a 60 s steady-state window per
+   `docs/fairness-regimes.md` gates. If CoV does NOT materially improve (stays
+   near the #1203 49–55% band or the floor), **PLAN-KILL at R1** with the
+   measurement as the kill evidence. If it improves toward the balanced floor,
+   proceed.
+2. Only if R1 passes: design the controller (R2–R6), re-review, then `/engineer`.
+
+This R1 spike is itself a research step (manual ethtool, no production code) and
+can be run under `/research` follow-up or as the first `/engineer` gate. It is
+the cheapest possible falsification of the whole line.
+
+## 9. Verdict and convergence path
+
+r2 verdict: **PLAN-NEEDS-WORK** — the kill is withdrawn (Wall B falsified and
+verified), but Path 2 is NOT yet PLAN-READY-to-ship because R1 (does reactive
+placement beat the floor) is unresolved and is the historical kill point
+(#1203 49–55%). The convergent landing the reviewers should converge ON is:
+"Path 1/3 dead (Wall A); Path 2 substrate viable (Wall B falsified); fund the
+R1 spike as the next gate." Reviewers: confirm Wall A, confirm the Wall-B
+falsification is correctly verified (not over-claimed), and stress-test whether
+R1 can plausibly pass given the #1203 precedent, or whether R1's likely failure
+means we should KILL now rather than spend the spike.
+
+## 10. Reviewer falsification targets (r2 — be hostile)
+
+1. **Re-attack Wall-B falsification:** find a packet-path code site where a
+   `WorkerLocalImport` / peer-synced session on the *active* node is rejected
+   for forwarding by a per-worker (not per-RG) check, OR where the
+   reverse-companion replica is NOT present on sibling workers. If you find
+   one, Wall B is back and the kill is restored. (I checked
+   `enforce_ha_resolution_snapshot` and `owner_rg_is_locally_active` — no
+   per-worker gate. Prove me wrong with a quoted line.)
+2. **Pre-judge R1:** argue from the #1203 controller design (on
+   `feature/1215-per5tuple-fairness`) + the multinomial theorem whether reactive
+   re-pin can plausibly beat 49–55% CoV, or whether placement is floor-bound
+   regardless of controller quality → if the latter, recommend KILL-NOW over
+   the spike.
+3. **Re-attack Wall A:** any current-kernel cross-RX-queue AF_XDP delivery that
+   passes `xsk_rcv_check`. (Path 1 revival.)
