@@ -535,13 +535,14 @@ consume the entire machine. Consequences (all measured in #1752 on
   ~0% idle). The workers busy-poll; NET_RX softirq for the same queues runs on
   the *same* cores (no separate IRQ core); and the Go control plane's GC +
   scheduler threads share those cores too (they do not get a dedicated one).
-- **A configured CoS shape can sit ABOVE the box's forwarding ceiling, in which
-  case it never engages.** On this cluster, forwarding tops out CPU-bound at
-  ~16 Gb/s with CoS enabled (the per-packet shaping path costs ~19% CPU) and
-  ~23 Gb/s with CoS disabled — both well under, e.g., a 24G `transmit-rate
-  exact` scheduler. The shaper's `exact` cap only bites if the box can first
-  push past it; here it cannot, so the cap is inert and the observed rate is the
-  CPU ceiling, not the shape.
+- **A configured CoS shape can sit ABOVE the box's forwarding ceiling, so the
+  cap never becomes the binding constraint.** On this cluster, forwarding tops
+  out CPU-bound at ~16 Gb/s with CoS enabled (the per-packet shaping code path
+  still executes and costs ~19% CPU) and ~23 Gb/s with CoS disabled — both
+  well under, e.g., a 24G `transmit-rate exact` scheduler. The shaper's `exact`
+  cap only bites if the box can first push past it; here it cannot, so the
+  observed rate is determined by the CPU ceiling rather than the configured
+  shape.
 - **"Headroom" does not exist at this sizing — there is no idle core to absorb a
   burst, a GC pause, or added per-packet work.** Freeing CPU on the hot path
   (e.g. #1753 session-refresh in-place mutation) buys margin but does not raise
@@ -555,12 +556,12 @@ N/N/N ceiling.
 
 > **Profiling caveat on this kernel/NIC:** `mlx5_core` ships compressed
 > (`.ko.xz`), so `perf` rounds sample PCs in *unexported* static driver
-> functions to the nearest *exported* symbol. On the loss cluster this
-> mis-attributes real AF_XDP TX/RX wake `sendto()` cost (`mlx5e_xsk_wakeup` is
-> static) to adjacent exported symbols such as the `mlx5_crypto_*_dek_*` family —
-> there is **no crypto DEK work** on a plain forwarding path. Validate any
-> kernel-symbol attribution with a `bpftrace` kprobe call-count before trusting
-> the perf `%` (#1752).
+> functions to the nearest *exported* symbol. On the loss cluster this can
+> mis-attribute real AF_XDP TX/RX wake `sendto()` cost (`mlx5e_xsk_wakeup` is
+> static) to adjacent exported symbols such as the `mlx5_crypto_*_dek_*`
+> family — whether any real crypto DEK activity is present on a forwarding-only
+> path remains an open question in #1752. Validate any kernel-symbol attribution
+> with a `bpftrace` kprobe call-count before trusting the perf `%` (#1752).
 
 ## Configuration
 
