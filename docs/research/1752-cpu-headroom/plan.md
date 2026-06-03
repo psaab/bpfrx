@@ -1,6 +1,6 @@
 # #1752 — P48/5210 CPU-bound at 16 Gb/s: where the cycles go
 
-**Status: v2 — Claude SMR PLAN-READY-WITH-MINORS folded; Codex + AGY r1 pending**
+**Status: v3 — folds Codex + AGY r1 (PLAN-NEEDS-MAJOR). Adds Path E (session in-place mutation, code-verified), softens crypto causality (kTLS/IPsec/rekey), scrubs all HA-node config experiments, gates Path A. Re-dispatched for r2.**
 
 This is a *diagnosis-first* research doc. The empirical profile is already
 captured live on `loss:xpf-userspace-fw0` (flow-rebalance OFF, native XDP,
@@ -24,44 +24,64 @@ Datapath healthy: `xdp mode DEFAULT` (native), `ethtool -S` shows all
 
 | Cost center | Self-time | Addressable? | Evidence |
 |---|---|---|---|
-| **CoS exact-guarantee shaping** | **~19%** | **Yes (SW)** | 7 `cos_*` fns; A/B: CoS ON 16.0 → OFF 23.4 Gb/s (+46%) |
-| **mlx5 crypto DEK churn** | **~5.6%** | **Likely (config/SW)** | `mlx5_crypto_{modify,fill,create_bulk,pool_remove}_dek*`; HW offload `off [fixed]` but 16 xfrm policies + strongSwan active |
-| mlx5 driver RX (zero-copy) | ~28% (softirq) | No (inherent) | `mlx5e_napi_poll`, `xsk_skb_from_cqe_linear`, `xp_raw_get_dma` at 1.39 Mpps |
-| flow/session hashbrown churn | ~4.5% | Maybe (SW) | `remove_entry` 2.73 + `insert` 1.72 |
-| worker poll/forward core | remainder | Partly | `poll_binding_process_descriptor`, `worker_loop`, `transmit_prepared_queue` |
+| **CoS exact-guarantee shaping** | **~19% CPU** | **Yes (SW)** | 7 `cos_*` fns; A/B CoS ON 16.0 vs OFF 23.4 Gb/s (gross; goodput TBD) |
+| **session refresh remove+restore churn** | **~4.5%** | **Yes (SW), lowest risk** | `update_session` (session/mod.rs:803) does `remove_entry`(:1119)+`restore_entry`(:1176) **per packet** to bump timestamps → `remove_entry` 2.73 + slab `insert` 1.72. In-place `get_mut` recaptures it |
+| **mlx5 crypto DEK pool churn** | **~5.6%** | **Unknown — trace first** | `mlx5_crypto_{modify,fill,create_bulk,pool_remove}_dek*`. DEK pool is generic mlx5 crypto machinery used by **both kTLS and IPsec offload**; strongSwan/16-xfrm is *a* candidate, not proven. HW offload `off [fixed]` on VFs |
+| mlx5 driver RX (zero-copy) | ~28% (softirq) | Partly | physics inherent at 1.39 Mpps, BUT NAPI budget / busy-poll / IRQ-worker isolation / queue count / XDP-prog cost are levers. `mlx5e_napi_poll`, `xsk_skb_from_cqe_linear`, `xp_raw_get_dma` |
+| worker poll/forward + XDP prog | remainder | Partly | `poll_binding_process_descriptor`, `worker_loop`, `bpf_prog_*` (our XDP), `transmit_prepared_queue` |
 
 ## 3. Honest scope/value framing
 
-- **Finding 1 (CoS ~19%)** is the headline. The *firm* number is the **~19% CPU
-  self-time** freed (flat profile; `cos_*` symbols vanish CoS-OFF). The
-  throughput figure is noisier — the CoS-OFF arm hit 23.4 Gb/s **with ~26,835
-  retr** (vs ~1,469 CoS-ON), so iperf's sender Gb/s overstates goodput: call it
-  **up to ~7.4 Gb/s gross, less in goodput.** Crypto-DEK churn was present in
-  *both* A/B arms, so it does not confound this delta. The win is large — but
-  the CoS exact-guarantee path has been refactored many times (#959, #1207
-  PLAN-KILL, #1545 PLAN-KILL); a CPU-reduction attempt risks another kill.
-  Value is large; tractability is the open question.
-- **Finding 2 (crypto DEK ~5.6%)** is the cheapest to investigate and possibly
-  *free*: forwarded iperf traffic on reth0.80 is not encrypted, so per-packet
-  DEK key programming is unexpected. If it is the test-env strongSwan/xfrm
-  config (not a production path), the win may be smoke-env-only — that itself is
-  worth knowing (it inflates every CoS measurement we take).
-- **Finding 3 (driver RX ~28%)** is inherent at 1.39 Mpps on a 6/6 box. Not
-  code. Listed for completeness so we don't chase it in software.
+- **Finding 1 (CoS ~19%)** is the headline *CPU* cost — the firm number is the
+  **~19% self-time** freed (flat profile; `cos_*` symbols vanish CoS-OFF). The
+  throughput figure is softer: the CoS-OFF arm hit 23.4 Gb/s **with ~26,835
+  retr** (vs ~1,469 CoS-ON), so iperf's sender Gb/s overstates goodput — state
+  it as **~19% CPU; one A/B showed up to +7.4 Gb/s gross sender throughput,
+  goodput TBD.** (Caveat: CoS-off changes loss/backpressure/retransmit and
+  packet rate, so crypto-DEK was *present* in both arms but not provably
+  *constant* — the clean claim is the CPU%, not the Gb/s.) The win is large but
+  the CoS exact-guarantee path has prior micro-opt PLAN-KILLs (#1207, #1545) —
+  those killed tiny prizes, not a 19% one, but they warn the path is hard.
+- **Finding 2 — session refresh churn ~4.5% (NEW, code-grounded, recommended
+  first).** `update_session` (session/mod.rs:803) refreshes an established flow
+  by `remove_entry` + `restore_entry` — tearing down and rebuilding the
+  `key_to_handle` map, forward-NAT index, owner-RG index and slab slot **on
+  every packet**, only to rewrite `last_seen_ns`/`expires_after_ns`. A
+  steady-state flow should do zero index churn. In-place `get_mut(handle)`
+  mutation recaptures ~4.5% at low risk (the key/indices don't change on a
+  pure refresh; only update an index if a NAT-relevant metadata field actually
+  changed). Lowest kill-risk of any lever — this is the cleanest code win.
+- **Finding 3 (crypto DEK ~5.6%)** is cheap to *investigate* but the mechanism
+  is **not yet proven**. The mlx5 DEK pool is generic crypto machinery used by
+  both kTLS and IPsec offload; "unexpected on plain forwarding" is right, but
+  "probably strongSwan/xfrm" is a hypothesis, not a finding. A non-invasive perf
+  stack trace must precede any config theory. If it turns out to be a test-env
+  artifact, the win may be smoke-env-only — still worth knowing (it inflates
+  every measurement here).
+- **Finding 4 (driver RX ~28%)** is *mostly* inherent at 1.39 Mpps, but not
+  categorically un-addressable: NAPI budget, busy-poll, IRQ/worker isolation,
+  queue count, RSS shape and our own XDP-program cost all move it. Separate
+  driver physics from xpf/XDP work before declaring any part "not code."
 - If reviewers conclude no SW path yields meaningful headroom on a 6/6 VM,
   **PLAN-KILL (with the "scale = more vCPUs+queues" conclusion) is an
   acceptable verdict.**
 
 ## 4. Path options (the decision under review)
 
-- **Path A — CoS hot-path CPU reduction.** Profile within the CoS path
-  (push/pop/service/drain), find the dominant sub-cost, attempt a targeted
-  reduction. High value, high kill-risk. Needs its own /research before /engineer.
-- **Path B — Root-cause mlx5 crypto DEK churn FIRST.** Determine *why*
-  forwarding triggers DEK pool create/remove/reset with HW offload off. Decide:
-  config fix (disable an offload/IPsec path on the data VFs), driver/kernel
-  interaction, or expected. Cheapest, possibly free, and de-noises all other
-  CoS measurements. **Recommended first.**
+- **Path E — session refresh in-place mutation (NEW).** Replace the per-packet
+  `remove_entry`+`restore_entry` in `update_session` with `get_mut`-based
+  in-place field mutation; touch an index only when a NAT-relevant field
+  actually changes. ~4.5% CPU, code-grounded, lowest kill-risk. **Recommended
+  first code win** — small, isolated, no architectural premise to fail.
+- **Path B — non-invasive root-cause of mlx5 crypto DEK churn.** Capture the
+  calling stack (kTLS vs IPsec-offload vs rekey timer) BEFORE any config theory.
+  Cheap, may be free, de-noises every other measurement. **Recommended in
+  parallel with E** (it's diagnostic, not code).
+- **Path A — CoS hot-path CPU reduction.** *Gated:* keep ONLY as its own future
+  /research that (a) sub-profiles within push/pop/service/drain to a concrete
+  dominant sub-cost, and (b) carries an explicit no-code PLAN-KILL exit if that
+  sub-cost is not locally reducible. Do not attempt a vague "refactor CoS for
+  perf" — that is exactly the #1207/#1545 kill pattern. High value, high risk.
 - **Path C — IRQ/worker core separation.** Requires growing the VM beyond 6
   vCPU + adding RX queues so NET_RX softirq lands off the worker cores. Infra
   change, not code; quantify expected gain before committing.
@@ -70,21 +90,33 @@ Datapath healthy: `xdp mode DEFAULT` (native), `ethtool -S` shows all
 
 ## 5. Concrete next step if approved
 
-Recommended sequencing: **B → (measure) → A or C**.
+Recommended sequencing: **E (code win) + B (diagnostic, parallel) → then decide
+A (gated) / C / D**. E and B are independent and both low-risk.
 
-Path B investigation steps (no production code; diagnostic). Non-invasive
-first; the invasive A/B is **gated** on what the trace shows:
-1. **(non-invasive, hard gate)** `mlx5_core` DEK trace: `perf record -g` on
-   `mlx5_crypto_modify_dek_key`, capture the kernel stack that *calls* it under
-   `-P48 5210` (TX completion? ASO? strongSwan rekey timer?). Also confirm
-   per-packet vs periodic by sampling rate vs pps.
-2. Correlate with `ip xfrm state`/`policy` churn and strongSwan rekey logs.
-3. **Only if step 1/2 implicate strongSwan/xfrm**: invasive A/B (stop strongSwan
-   + flush xfrm), re-run `-P48 5210`, re-profile. Run this on the **standalone
-   test VM** or on fw1 while fw0 holds RG-0 — **never on the live RG-0 primary**,
-   because IPsec SA sync reacts to SA teardown. Revert immediately after.
-4. Decide config vs driver vs expected; file the fix as a separate /engineer
-   issue if there is a clean lever.
+**Path E** (the code win, deferred to its own /engineer):
+1. Sub-profile `update_session`/`upsert_synced_with_origin` to confirm the
+   index-rebuild dominates (not the field writes).
+2. Design `get_mut(handle)` in-place mutation preserving the peer-synced
+   promotion/rejection branches and the wheel/delta side effects; update an
+   index ONLY when its key-relevant input changed (NAT mapping, owner-RG).
+3. Property/differential test: in-place path must be observably identical to
+   remove+restore for every branch (reject, promote, local-refresh).
+4. Re-profile `-P48 5210` to confirm `remove_entry`/`insert` self-time drops.
+
+**Path B** investigation steps (no production code; diagnostic). Non-invasive
+ONLY; the invasive A/B is **out of scope on the cluster**:
+1. **(non-invasive, hard gate)** `perf record -g` on
+   `mlx5_crypto_modify_dek_key` under `-P48 5210`; capture the calling stack
+   (kTLS DEK pool? IPsec xfrm-device key-add? rekey timer?) and confirm
+   per-packet vs periodic by event-rate vs pps.
+2. Correlate with `ip xfrm state`/`policy` churn + strongSwan rekey logs +
+   whether kTLS is in use anywhere on the box.
+3. **The strongSwan-stop / xfrm-flush A/B is NOT run on any HA cluster node**
+   (XFRM state is not RG-scoped; flushing perturbs SA sync, rekey, and the
+   measurement). If a config A/B is needed at all, it runs ONLY on the isolated
+   standalone test VM. Default: do not run it — the stack trace should suffice.
+4. Decide config vs driver vs expected; file a separate /engineer issue only if
+   there is a clean, safe lever.
 
 ## 6. Public API / behavior preservation
 
@@ -94,20 +126,26 @@ would each get their own plan + review before code.
 
 ## 7. Hidden invariants / risks of the *experiment*
 
-- Stopping strongSwan / flushing xfrm on fw0 must be reverted; the cluster's HA
-  IPsec SA sync may react — do it RG-0-primary-only, briefly, and restore.
+- **No strongSwan-stop / xfrm-flush on any HA cluster node** (corrected from v1).
+  XFRM state is not RG-scoped; flushing it perturbs SA sync, rekey and peer
+  behavior. Crypto root-cause is the non-invasive stack trace only; any config
+  A/B is standalone-VM-only and is the exception, not the default.
 - CoS A/B teardown must use the full fixture delete (class-of-service + the
   bandwidth-output filter bindings) or `commit check` fails and Pass-A is a
   silent no-op (already hit + handled in the smoke skill).
+- Path E must preserve `update_session`'s peer-synced promotion/rejection
+  semantics and the wheel-push / Open-delta side effects exactly — verified by
+  differential test before any re-profile.
 
 ## 8. Risk assessment
 
 | Class | Level | Note |
 |---|---|---|
 | Behavioral regression (research) | LOW | diagnostic only, no prod code |
-| Measurement validity | MED | throughput noisy + deploy wipes CoS; A/B must re-apply CoS + repeat |
-| Architectural mismatch (Path A) | HIGH | CoS path twice PLAN-KILLed for churn-vs-gain |
-| Crypto root-cause ambiguity (Path B) | MED | mechanism not yet proven; step 1 trace resolves it |
+| Path E (session in-place mutation) | LOW-MED | isolated fn; risk is preserving peer-synced/wheel/delta semantics — differential test gates it |
+| Measurement validity | MED | throughput noisy + deploy wipes CoS; A/B must re-apply CoS + repeat; Gb/s claim is gross not goodput |
+| Architectural mismatch (Path A) | HIGH | CoS path twice PLAN-KILLed; only as gated sub-profile w/ no-code exit |
+| Crypto root-cause ambiguity (Path B) | MED | mechanism unproven (kTLS vs IPsec vs rekey); non-invasive trace resolves it; no HA-node config A/B |
 
 ## 9. Test/validation plan (for the research experiments)
 
