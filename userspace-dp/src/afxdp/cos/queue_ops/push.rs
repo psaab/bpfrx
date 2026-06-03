@@ -73,10 +73,20 @@ fn maybe_promote_best_effort(queue: &mut CoSQueueRuntime, incoming: &CoSPendingT
 /// v8 lease / V_min: non-exact queues carry `queue_lease_v8 == None`
 /// and `v_min.vtime_floor == None`, so the lease-mirror block in
 /// `account_cos_queue_flow_enqueue` is a no-op here (asserted in test).
-#[inline]
+///
+/// #1755: `#[cold] #[inline(never)]`. This is the only caller of the
+/// ~352 KB `FlowFairState` constructor on the push path; keeping it
+/// out-of-line ensures the giant-frame materialisation never inflates the
+/// hot `cos_queue_push_back` frame (it used to `__rust_probestack`-touch a
+/// 352 KB frame on EVERY push). Promotion fires at most once per
+/// best-effort-queue lifetime (#1735 hysteresis), so out-lining it has no
+/// hot-path cost. Paired with `FlowFairState::new_boxed`, which builds
+/// directly into the heap so even this cold frame stays small.
+#[cold]
+#[inline(never)]
 fn promote_to_flow_fair(queue: &mut CoSQueueRuntime) {
     let resident: VecDeque<CoSPendingTxItem> = std::mem::take(&mut queue.hot.items);
-    queue.flow_fair_state = Some(Box::new(FlowFairState::new(cos_flow_hash_seed_from_os())));
+    queue.flow_fair_state = Some(FlowFairState::new_boxed(cos_flow_hash_seed_from_os()));
     for item in resident {
         if matches!(item, CoSPendingTxItem::Local(_)) {
             queue.hot.local_item_count = queue.hot.local_item_count.saturating_sub(1);

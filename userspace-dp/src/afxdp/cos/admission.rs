@@ -523,7 +523,10 @@ fn promote_cos_queue_flow_fair(
     // queues never pay the FlowFairState footprint or the per-packet
     // hash (the #1183 fast-path boundary).
     queue.flow_fair_state = if queue.config.exact {
-        Some(Box::new(FlowFairState::new(cos_flow_hash_seed_from_os())))
+        // #1755: new_boxed builds the ~352 KB FlowFairState directly into
+        // the heap, so the giant struct never lands on this build-time
+        // frame.
+        Some(FlowFairState::new_boxed(cos_flow_hash_seed_from_os()))
     } else {
         None
     };

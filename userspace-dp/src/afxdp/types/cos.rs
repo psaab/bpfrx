@@ -908,6 +908,15 @@ pub(in crate::afxdp) struct FlowFairState {
 }
 
 impl FlowFairState {
+    /// Owned-value constructor. Retained for tests that genuinely need an
+    /// owned `FlowFairState` on the stack (`fairness.rs`/`worker/cos/tests.rs`).
+    ///
+    /// **Do not call this on any production/hot path.** `FlowFairState` is
+    /// ~352 KB; returning it by value forces the caller's frame to reserve
+    /// and `__rust_probestack`-touch the whole 352 KB (#1755). Production
+    /// promotion sites (`promote_to_flow_fair`, `admission.rs`,
+    /// `test_support.rs`) must use `new_boxed`, which builds directly into a
+    /// heap allocation so the giant temporary never lands on any stack frame.
     pub(in crate::afxdp) fn new(flow_hash_seed: u64) -> Self {
         Self {
             queue_vtime: 0,
@@ -924,6 +933,90 @@ impl FlowFairState {
             flow_bucket_observed_bps: [0; COS_FLOW_FAIR_BUCKETS],
             flow_bucket_last_tx_ns: [0; COS_FLOW_FAIR_BUCKETS],
             flow_bucket_pending_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+        }
+    }
+
+    /// #1755 — heap constructor that builds `FlowFairState` directly into a
+    /// `Box` without ever materialising the ~352 KB struct on the stack.
+    ///
+    /// Rust has no guaranteed placement-new into `Box`, so the by-value
+    /// `new()` return slot is the actual 352 KB temporary that forces the
+    /// `__rust_probestack` 352 KB-frame loop in `cos_queue_push_back` /
+    /// `promote_to_flow_fair`. This constructor allocates an uninitialised
+    /// `Box<MaybeUninit<Self>>` and writes every field exactly once through
+    /// raw pointers, then `assume_init`s it. No giant temporary is ever
+    /// created.
+    ///
+    /// SAFETY contract (verified by the `flow_fair_state_tests` field-
+    /// equivalence test and `cargo +nightly miri`):
+    ///   * Every one of the 14 fields is written exactly once below — keep
+    ///     this in lockstep with the struct definition and with `new()`.
+    ///   * `flow_bucket_items` (`[VecDeque; N]`) and `pop_snapshot_stack`
+    ///     (`Vec`) are NON-trivial types: a zeroed `Vec`/`VecDeque` is NOT a
+    ///     valid initialised representation, so they MUST be written with a
+    ///     real value (`VecDeque::new()` / `Vec::with_capacity`), never left
+    ///     to `write_bytes(0)`. `Box::new_zeroed().assume_init()` /
+    ///     transmute-from-zeroed would be UB for exactly this reason and is
+    ///     deliberately not used.
+    ///   * `flow_rr_buckets: FlowRrRing` is POD (`[u16; N]` + two `u16`)
+    ///     whose `Default` is all-zero; its bytes are zeroed in place
+    ///     (`write_bytes(0)`) rather than materialising an 8 KB `Default`
+    ///     temporary on the stack.
+    ///   * The POD `[u64; N]` / `[u32; N]` arrays and scalars are zeroed via
+    ///     `write_bytes`/`write(0)` to match `new()`'s `[0; N]` values.
+    ///   * Drop-safety: the body is panic-free. The two heap-allocating
+    ///     writes (`Box::new_uninit` for the struct, `Vec::with_capacity`
+    ///     for `pop_snapshot_stack`) abort on OOM rather than unwinding, and
+    ///     `Vec::with_capacity(TX_BATCH_SIZE)` cannot capacity-overflow
+    ///     (`TX_BATCH_SIZE` is a small fixed constant). Every other write is
+    ///     infallible. So no path unwinds through partially-initialised
+    ///     memory, and no field is ever both initialised and then dropped on
+    ///     unwind — no drop-on-unwind scaffold is required.
+    pub(in crate::afxdp) fn new_boxed(flow_hash_seed: u64) -> Box<Self> {
+        use std::ptr::addr_of_mut;
+
+        let mut uninit: Box<std::mem::MaybeUninit<Self>> = Box::new_uninit();
+        // SAFETY: `ptr` points at a freshly-allocated, properly-aligned,
+        // uninitialised `FlowFairState`. Each `addr_of_mut!` derives a raw
+        // pointer to a distinct field without forming a reference to the
+        // uninitialised whole, and every field is written exactly once
+        // before `assume_init`. See the SAFETY contract above.
+        unsafe {
+            let ptr = uninit.as_mut_ptr();
+
+            // Scalars / small POD fields.
+            addr_of_mut!((*ptr).queue_vtime).write(0);
+            addr_of_mut!((*ptr).flow_hash_seed).write(flow_hash_seed);
+            addr_of_mut!((*ptr).active_flow_buckets).write(0);
+            addr_of_mut!((*ptr).active_flow_buckets_peak).write(0);
+
+            // POD bucket arrays — zeroed in place, matching `[0; N]`.
+            addr_of_mut!((*ptr).flow_bucket_bytes).write_bytes(0, 1);
+            addr_of_mut!((*ptr).flow_bucket_head_finish_bytes).write_bytes(0, 1);
+            addr_of_mut!((*ptr).flow_bucket_tail_finish_bytes).write_bytes(0, 1);
+            addr_of_mut!((*ptr).flow_bucket_tx_bytes).write_bytes(0, 1);
+            addr_of_mut!((*ptr).flow_bucket_observed_bps).write_bytes(0, 1);
+            addr_of_mut!((*ptr).flow_bucket_last_tx_ns).write_bytes(0, 1);
+            addr_of_mut!((*ptr).flow_bucket_pending_bytes).write_bytes(0, 1);
+
+            // POD ring (`[u16; N]` + two `u16`); `Default` == all-zero, so
+            // zero in place to avoid an 8 KB stack temporary.
+            addr_of_mut!((*ptr).flow_rr_buckets).write_bytes(0, 1);
+
+            // NON-trivial collection fields — MUST be written with real
+            // initialised values; a zeroed Vec/VecDeque is invalid.
+            //
+            // Write each `VecDeque` directly into its slot rather than via
+            // `array::from_fn`, which would materialise the full 128 KB
+            // `[VecDeque; N]` array as a stack temporary first — exactly the
+            // large-frame footgun this constructor exists to avoid.
+            let items = addr_of_mut!((*ptr).flow_bucket_items) as *mut VecDeque<CoSPendingTxItem>;
+            for i in 0..COS_FLOW_FAIR_BUCKETS {
+                items.add(i).write(VecDeque::new());
+            }
+            addr_of_mut!((*ptr).pop_snapshot_stack).write(Vec::with_capacity(TX_BATCH_SIZE));
+
+            uninit.assume_init()
         }
     }
 }
@@ -1216,3 +1309,83 @@ impl<'a> Iterator for FlowRrRingIter<'a> {
 //    larger constant would silently truncate.
 const _: () = assert!(COS_FLOW_FAIR_BUCKETS.is_power_of_two());
 const _: () = assert!(COS_FLOW_FAIR_BUCKETS <= u16::MAX as usize);
+
+#[cfg(test)]
+mod flow_fair_state_tests {
+    use super::*;
+
+    /// #1755: `new_boxed` must initialise every field to byte-for-byte the
+    /// same value as the by-value `new()` constructor. This is the
+    /// field-equivalence guard for the unsafe `MaybeUninit` builder — if a
+    /// field is added to `FlowFairState` and not written in `new_boxed`,
+    /// `assume_init` would read uninitialised memory; this test (run under
+    /// `cargo +nightly miri`) catches that as UB, and even without miri it
+    /// catches a value mismatch.
+    #[test]
+    fn new_boxed_matches_new_field_for_field() {
+        let seed = 0x1234_5678_9abc_def0_u64;
+        let owned = FlowFairState::new(seed);
+        let boxed = FlowFairState::new_boxed(seed);
+
+        assert_eq!(boxed.queue_vtime, owned.queue_vtime);
+        assert_eq!(boxed.flow_hash_seed, owned.flow_hash_seed);
+        assert_eq!(boxed.flow_hash_seed, seed);
+        assert_eq!(boxed.active_flow_buckets, owned.active_flow_buckets);
+        assert_eq!(boxed.active_flow_buckets_peak, owned.active_flow_buckets_peak);
+        assert_eq!(boxed.flow_bucket_bytes, owned.flow_bucket_bytes);
+        assert_eq!(
+            boxed.flow_bucket_head_finish_bytes,
+            owned.flow_bucket_head_finish_bytes
+        );
+        assert_eq!(
+            boxed.flow_bucket_tail_finish_bytes,
+            owned.flow_bucket_tail_finish_bytes
+        );
+        assert_eq!(boxed.flow_bucket_tx_bytes, owned.flow_bucket_tx_bytes);
+        assert_eq!(boxed.flow_bucket_observed_bps, owned.flow_bucket_observed_bps);
+        assert_eq!(boxed.flow_bucket_last_tx_ns, owned.flow_bucket_last_tx_ns);
+        assert_eq!(boxed.flow_bucket_pending_bytes, owned.flow_bucket_pending_bytes);
+
+        // Collection fields: every bucket queue is a real, empty VecDeque;
+        // the pop-snapshot stack is empty with the preallocated capacity.
+        assert_eq!(boxed.flow_bucket_items.len(), COS_FLOW_FAIR_BUCKETS);
+        assert!(boxed.flow_bucket_items.iter().all(|q| q.is_empty()));
+        assert!(boxed.pop_snapshot_stack.is_empty());
+        // `with_capacity` guarantees AT LEAST the requested capacity; match
+        // the same `>=` contract `owned` (via `new()`) satisfies rather than
+        // pinning an exact value the allocator is free to round up.
+        assert!(boxed.pop_snapshot_stack.capacity() >= TX_BATCH_SIZE);
+        assert!(owned.pop_snapshot_stack.capacity() >= TX_BATCH_SIZE);
+
+        // FlowRrRing zero-init equivalence (POD).
+        assert!(boxed.flow_rr_buckets.is_empty());
+        assert_eq!(boxed.flow_rr_buckets.len(), owned.flow_rr_buckets.len());
+        assert_eq!(boxed.flow_rr_buckets.front(), owned.flow_rr_buckets.front());
+    }
+
+    /// Exercise the collection fields enough to prove they are genuinely
+    /// initialised (a zeroed VecDeque would UB/abort here, not silently
+    /// pass) — reserve/push on a couple of buckets and the snapshot stack.
+    #[test]
+    fn new_boxed_collections_are_usable() {
+        let mut boxed = FlowFairState::new_boxed(7);
+        // Reserving + reading capacity touches the VecDeque's internal
+        // raw-vec pointer/cap; a zeroed VecDeque would be invalid here.
+        boxed.flow_bucket_items[0].reserve(4);
+        boxed.flow_bucket_items[COS_FLOW_FAIR_BUCKETS - 1].reserve(4);
+        assert!(boxed.flow_bucket_items[0].capacity() >= 4);
+        assert!(boxed.flow_bucket_items[COS_FLOW_FAIR_BUCKETS - 1].capacity() >= 4);
+        assert_eq!(boxed.flow_bucket_items[0].len(), 0);
+
+        boxed.pop_snapshot_stack.push(CoSQueuePopSnapshot {
+            bucket: 3,
+            pre_pop_head_finish: 10,
+            pre_pop_tail_finish: 20,
+            pre_pop_queue_vtime: 30,
+        });
+        assert_eq!(boxed.pop_snapshot_stack.len(), 1);
+        assert_eq!(boxed.pop_snapshot_stack[0].bucket, 3);
+        // Dropping `boxed` here drops all 4096 VecDeques + the Vec; under
+        // miri this proves every collection field is a valid drop target.
+    }
+}
