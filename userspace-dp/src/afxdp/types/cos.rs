@@ -947,9 +947,9 @@ impl FlowFairState {
     /// raw pointers, then `assume_init`s it. No giant temporary is ever
     /// created.
     ///
-    /// SAFETY contract (verified by `flow_fair_state_new_boxed_*` tests and
-    /// `cargo +nightly miri`):
-    ///   * Every one of the 12 fields is written exactly once below — keep
+    /// SAFETY contract (verified by the `flow_fair_state_tests` field-
+    /// equivalence test and `cargo +nightly miri`):
+    ///   * Every one of the 14 fields is written exactly once below — keep
     ///     this in lockstep with the struct definition and with `new()`.
     ///   * `flow_bucket_items` (`[VecDeque; N]`) and `pop_snapshot_stack`
     ///     (`Vec`) are NON-trivial types: a zeroed `Vec`/`VecDeque` is NOT a
@@ -964,10 +964,14 @@ impl FlowFairState {
     ///     temporary on the stack.
     ///   * The POD `[u64; N]` / `[u32; N]` arrays and scalars are zeroed via
     ///     `write_bytes`/`write(0)` to match `new()`'s `[0; N]` values.
-    ///   * Drop-safety: the body is panic-free (every write is infallible —
-    ///     allocation aside, which aborts/unwinds before any field is
-    ///     written), so no field is ever both initialised and then dropped
-    ///     on unwind. No drop-on-unwind scaffold is required.
+    ///   * Drop-safety: the body is panic-free. The two heap-allocating
+    ///     writes (`Box::new_uninit` for the struct, `Vec::with_capacity`
+    ///     for `pop_snapshot_stack`) abort on OOM rather than unwinding, and
+    ///     `Vec::with_capacity(TX_BATCH_SIZE)` cannot capacity-overflow
+    ///     (`TX_BATCH_SIZE` is a small fixed constant). Every other write is
+    ///     infallible. So no path unwinds through partially-initialised
+    ///     memory, and no field is ever both initialised and then dropped on
+    ///     unwind — no drop-on-unwind scaffold is required.
     pub(in crate::afxdp) fn new_boxed(flow_hash_seed: u64) -> Box<Self> {
         use std::ptr::addr_of_mut;
 
