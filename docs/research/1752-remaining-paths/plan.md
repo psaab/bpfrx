@@ -1,140 +1,163 @@
 # #1752 remaining paths — B / A / C-D / E-follow-up
 
-**Status: DRAFT v1 — pending adversarial plan review (Codex + AGY + Claude SMR)**
+**Status: v2 — folds Codex r1 (PLAN-NEEDS-MAJOR) + AGY r1 (PLAN-NEEDS-MAJOR). Re-dispatched for r2.**
 
-Path E shipped (PR #1753, `380bbb8ed`). This doc dispositions the four remaining
-levers on the #1752 umbrella. **Headline: Path B is killed by live evidence —
-the "crypto DEK churn" is a perf symbolization artifact, not real work.**
+v2 changes after live verification:
+- **Path B is NOT killed — it is RE-SCOPED.** The "crypto DEK churn" is a perf
+  symbolization artifact (kprobe = 0 calls), but AGY's hypothesis verified: the
+  real cost is the **AF_XDP TX/RX wake `sendto()` kick path** (~108K sendto/s),
+  which IS software-recoverable via wake-interval tuning.
+- Path A defer stands, enriched with AGY's verified concrete sub-levers.
+- **Path C re-scoped** from "operator only" to a real software lever (workers are
+  already core-pinned; move them off core 0 and give it to the Go control plane).
+- **Path E-follow-up = KILL** (AGY: if transient port reuse pre-GC occurs the
+  re-assert is structurally necessary, so the ~1% isn't spurious).
+- Evidence committed under `evidence/`.
+
+Path E (session in-place refresh) shipped (PR #1753, `380bbb8ed`). This doc
+dispositions the four remaining levers on the #1752 umbrella.
 
 ## 1. Issue framing
 
 #1752 found `-P48 -p5210` forwarding CPU-bound at 16 Gb/s on a 6-vCPU/6-queue/
-6-worker box (no headroom by design). Levers identified: B (mlx5 crypto DEK
-~5.6%), A (CoS shaping ~19%), C/D (core scaling / document), E (session refresh
-churn — shipped). This research dispositions B, A, C/D, and the E follow-up.
+6-worker box (no headroom by design). Levers: B (mlx5 "crypto DEK" ~5.6%), A (CoS
+shaping ~19%), C/D (core scaling / document), E (session churn — shipped).
 
-## 2. PATH B — KILL (crypto DEK churn is a perf symbolization artifact)
+## 2. PATH B — RE-SCOPE: TX/RX wake `sendto()` kick reduction (was mis-framed as crypto DEK)
 
-**Evidence (live, `-P48 -p5210`, this branch):**
-- perf flat self-time steadily shows `mlx5_crypto_modify_dek_key` ~3.5% +
-  `dek_fill_key`/`create_dek_bulk`/`dek_pool_remove_bulk`/`create_dek_key`/
-  `dek_bulk_reset_synced` ≈ **~5.5% total**, reproducible across 4 windows.
-- **bpftrace kprobe call counts over 8 s of full load:**
-  `mlx5e_napi_poll` = **3,579,581 calls**; `mlx5_crypto_modify_dek_key` =
-  **0 calls** (also `dek_pool_remove_bulk` = 0, `create_dek_bulk` = 0 over 10 s).
-- strongSwan: no rekey activity in the logs during the run.
+**The crypto-DEK framing is dead (artifact).** Evidence
+(`evidence/pathb-crypto-dek-artifact.md`): perf shows ~5.5% in
+`mlx5_crypto_modify_dek_key` et al., but a bpftrace kprobe on it fires **0 times
+in 8–10 s** of full load (vs `mlx5e_napi_poll` = 3,579,581). mlx5_core ships
+compressed (`mlx5_core.ko.xz`); perf rounds PCs in unexported static functions to
+the nearest exported symbol — the crypto DEK family at kallsyms `0xc0a801xx`.
+`perf annotate` of the symbol disassembles to `mlx5e_port_linkspeed` code,
+confirming broken compressed-module resolution.
 
-**Conclusion:** the DEK functions are **never invoked**. perf attributes samples
-whose PCs land in *unexported* mlx5_core datapath code to the nearest *exported*
-symbol — which in this build is the crypto DEK family (sparse module symbol
-table). The ~5.5% is real mlx5_core RX/TX datapath cost (the same inherent ~28%
-driver bucket as `napi_poll`/`xsk_skb_from_cqe_linear`), **not** recoverable
-spurious crypto work. The original #1752 framing ("unexpected, possibly free")
-was wrong — a measurement artifact, caught by validating the metric (kprobe
-call-count) against the perf %.
+**The real cost (AGY hypothesis, verified):** the workers kick the AF_XDP TX/RX
+rings via `sendto()`: `xsk_sendmsg` ~110K/s, worker `sendto` ~108K/s,
+`mlx5e_xsk_wakeup` ~15.5K/s (8 s under load). `mlx5e_xsk_wakeup` is
+static/unexported → its samples misattribute to the crypto symbols. The kick is
+already gated by `needs_wakeup()` (rings.rs:142-145) + `TX_WAKE_MIN_INTERVAL_NS
+= 50_000` (mod.rs:302); RX-wake also uses `sendto` (rings.rs:182-198).
 
-**Action:** PLAN-KILL Path B. No xpf code/config lever exists. (If anyone
-revisits, the only honest follow-up is a kernel-side ftrace
-`function_graph`/`/proc/kallsyms`-aware re-symbolization to confirm which real
-mlx5_core function the addresses belong to — a kernel-debug exercise, not xpf
-work, and not worth it given the cost is inherent driver datapath either way.)
+**Lever (real, recoverable):** widen the wake interval / batch more TX before
+kicking, cutting the ~108K sendto/s. **Tradeoff:** higher TX latency + ring
+backpressure risk — so the win is not free and may be modest.
+
+**Action:** own `/research` for Path B. It must (a) attribute what fraction of
+the misattributed bucket is the wake path vs other unexported mlx5 datapath
+(perf `--kallsyms` / a debug uncompressed module, or kprobe-time accounting),
+(b) propose a wake-interval/batch change, (c) A/B `TX_WAKE_MIN_INTERVAL_NS`
+(e.g. 50µs → 100–200µs) measuring CPU **and** TX latency + throughput + retrans,
+(d) carry a no-win PLAN-KILL exit if widening the interval doesn't net-recover
+CPU without latency regression.
 
 ## 3. PATH A — CoS hot-path CPU reduction (~19%): defer to its own gated /research
 
-Still the only real remaining *software* CPU lever. Sub-profile (this branch,
-CoS-on, flat self-time):
-- `cos_queue_push_back` **5.70%**, `cos_queue_pop_front_inner_with_cap` **3.49%**,
-  `service_exact_guarantee_queue_direct_with_info` **3.13%**,
-  `ingest_cos_pending_tx_with_provenance` 1.90%, `publish_cos_exact_backlog`
-  1.79%, `enqueue_cos_item` 1.63%, `drain_shaped_tx` 1.58%,
-  `account_cos_queue_flow_enqueue` 1.03% ≈ **~19%**.
+The only large remaining lever. Sub-profile (CoS-on flat self-time):
+`cos_queue_push_back` 5.70% + `pop_front` 3.49% + `service_exact_guarantee_queue`
+3.13% + `ingest_cos_pending_tx` 1.90% + `publish_cos_exact_backlog` 1.79% +
+`enqueue_cos_item` 1.63% + `drain_shaped_tx` 1.58% + `account_..._enqueue` 1.03%
+≈ ~19%. The dominant sub-cost is per-packet enqueue/dequeue (~9.2%).
 
-The dominant sub-cost is the **per-packet enqueue/dequeue** of the
-exact-guarantee queue (`push_back` + `pop_front` ≈ 9.2%). Path A is real value
-(~7.4 Gb/s gross when CoS is off) but **high kill-risk** — the CoS path has two
-prior micro-opt PLAN-KILLs (#1207 queue_service skeleton, #1545 mirror clone).
+AGY (verified against `push.rs`/`pop.rs`/`mod.rs`) identified concrete candidate
+sub-levers worth carrying into Path A's research — `push_back`/`pop_front` are
+NOT a plain queue op; they do promotion probing, local-item counters, snapshot
+invalidation, flow accounting, bucket hashing, active-bucket tracking, min-finish
+scans, vtime updates, dequeue accounting:
+- **flow-hash caching** — stash the classifier's 32-bit hash in
+  `TxRequest`/`PreparedTxRequest` (types/tx.rs) to skip re-hashing the 5-tuple in
+  `cos_flow_bucket_index` per enqueue;
+- **structural-compare bypass** — compare cached u32 hashes in
+  `maybe_promote_best_effort` instead of 64-byte `SessionKey` structural match;
+- **descriptor-indexed queuing** — queue `u32` frame indices in the round-robin
+  rings, not 100+ byte `CoSPendingTxItem` (types/cos.rs);
+- **min-bucket O(1)** — short-circuit `cos_queue_min_finish_bucket` for 1 active
+  queue + maintain an incremental min-pointer/heap instead of O(N) per packet.
 
-**Action:** do NOT attempt Path A from this umbrella doc. It needs its own deep
-`/research` that (a) annotates `cos_queue_push_back`/`pop_front` to a concrete
-reducible cost (bookkeeping? bounds checks? cache-line layout? per-flow
-accounting?), (b) proposes a targeted change, (c) carries an explicit
-no-code-PLAN-KILL exit if the sub-cost is irreducible. File as a separate issue.
+**Action:** still its own gated `/research` (CoS path has #1207/#1545 kill
+history; these candidates need design + differential review + smoke). High value,
+high risk. Do NOT optimize blindly from this umbrella doc.
 
-## 4. PATH C / D — core scaling / document the ceiling
+## 4. PATH C / D — control-plane core isolation / document
 
-- **C (IRQ/worker core separation):** the futex profile (#1752 follow-up) showed
-  the Go control plane's GC + the dataplane workers share all 6 cores; the
-  dataplane busy-polls (no lock contention). Real headroom needs **more vCPUs +
-  RX queues** with IRQs/Go pinned off the worker cores — an **operator/infra
-  decision**, not xpf code. No code lever on the current 6/6 VM.
-- **D (document):** make the 6/6 = no-headroom sizing explicit in operator docs
-  (`docs/`), incl. that the 24g shape sits above the box's forwarding ceiling so
-  it never engages, and that scaling = vCPU+queue+worker count.
+**C is a real software lever (corrected from v1).** Workers are *already*
+core-pinned (`sched_setaffinity`, neighbor.rs:737); the futex profile showed the
+Go control plane's GC threads run across all 6 cores and preempt the busy-polling
+Rust workers. **Lever:** pin the Go process to core 0 (cpuset / `GOMAXPROCS=1` +
+affinity) and pin the 6 workers to cores 1–5 — dedicating one core to the control
+plane. **Cost:** loses a worker core (6→5 workers), so this is a *tradeoff* A/B,
+not a free win, on a box where workers are the throughput unit.
 
-**Action:** ship **D** as a small docs-only PR (no review gauntlet needed per the
-triple-review "pure documentation" exclusion). **C** is an operator
-recommendation, captured in the same doc; not an xpf change.
+- **Action C:** own small `/research` + A/B (5 workers on clean cores + Go on
+  core 0 vs 6 shared workers) measuring aggregate throughput + jitter/RX drops.
+- **Action D:** docs-only PR — make the 6/6 = no-headroom sizing explicit
+  (existing `docs/userspace-dataplane-architecture.md` already states the
+  6-workers-plus-headroom target; extend it). Not "no review" — a sizing/perf doc
+  gets a normal doc review, just not the full Codex+Gemini+smoke gauntlet.
 
-## 5. PATH E follow-up — full skip of the secondary re-assert (~1%): defer, gated
+## 5. PATH E follow-up — KILL (full skip of the secondary re-assert, ~1%)
 
-Path E retained the 4 secondary-index re-assert inserts for exact parity. Fully
-skipping them on the no-reindex hot path recovers the remaining ~1% **only if**
-secondary keys are provably unique across all live sessions (incl. the transient
-NAT-port-reuse / not-yet-GC'd window). 
+AGY's argument (accepted): the re-assert inserts exist because
+`restore_entry`/`index_forward_nat_key` unconditionally re-assert; if transient
+NAT-port reuse can place a colliding live session before the prior session's GC
+window closes, the re-assert is **structurally necessary** for conntrack
+correctness — so the ~1% is NOT spurious. Optimizing it away risks
+mis-routed/poisoned reverse lookups. The uniqueness-proof + fuzz-test burden far
+exceeds ~1% on a CPU-bound box.
 
-**Action:** low priority. If pursued, its own `/research` must (a) prove the
-uniqueness invariant from the NAT allocator + identity-reverse bijection +
-GC-window analysis, and (b) add a property test that fuzzes for a colliding
-live-session pair. ~1% on a CPU-bound box is marginal vs the proof burden.
+**Action:** PLAN-KILL the E follow-up. Path E as shipped (with the re-assert
+retained) is the correct terminal state.
 
 ## 6. Honest scope/value framing
 
-The only substantial remaining CPU lever is **Path A (~19%)**, and it is
-high-risk. **Path B is dead (artifact).** C/D are operator/doc. E-follow-up is
-~1% behind a hard proof. *If reviewers agree, the right outcome is: kill B,
-document C/D, spin Path A into its own gated research, defer E-follow-up — i.e.
-this umbrella doc itself produces no production code beyond the D docs PR.*
+Real remaining levers, after verification: **A (~19%, high-risk, own research)**;
+**B (TX-wake kicks, recoverable but modest + latency tradeoff, own research)**;
+**C (control-plane core isolation, tradeoff A/B)**; **D (docs)**. **E-follow-up
+killed.** No production code ships from THIS umbrella doc beyond the D docs PR;
+A/B/C each spin into their own gated research. *If reviewers think B or C won't
+net-recover CPU without a throughput/latency regression, killing them here
+(rather than spinning research) is acceptable.*
 
 ## 7. Risk assessment
 
 | Path | Verdict | Risk if pursued |
 |---|---|---|
-| B | KILL | n/a — no lever exists (artifact) |
-| A | own /research | HIGH (architectural; #1207/#1545 kill pattern) |
-| C | operator note | n/a — infra decision |
+| B | own /research (re-scoped to TX-wake) | MED — latency/backpressure tradeoff; win may be modest |
+| A | own /research | HIGH — CoS architectural; #1207/#1545 kill pattern |
+| C | own /research (A/B) | MED — loses a worker core; may not net-win |
 | D | docs PR | LOW |
-| E-follow-up | defer | MED (uniqueness proof burden vs ~1%) |
+| E-follow-up | KILL | n/a |
 
 ## 8. Test/validation plan
 
-- Path B kill: the kprobe-call-count vs perf-% evidence above is the proof; no
-  code. (Reviewers: try to refute the artifact claim — is there a path where the
-  DEK functions ARE called but the kprobe missed, e.g. inlined/tail-called?)
-- Path D docs PR: doc-drift guard only.
-- A and E-follow-up: deferred to their own research; no validation here.
+- Path B kill-of-crypto-framing: the kprobe-call-count + annotate evidence
+  (`evidence/`) is the proof. Re-scoped B's own research owns the wake-interval A/B.
+- Path D docs PR: doc-drift guard.
+- A / B / C: deferred to their own research; no code validation here.
 
 ## 9. Out of scope
 
-- Implementing Path A (separate gated research).
-- Implementing the E follow-up (separate gated research).
-- Re-symbolizing mlx5_core to name the real function under the artifact (kernel
-  debug, not xpf).
+- Implementing A, B (wake tuning), or C (core isolation) — each its own research.
+- Naming the exact unexported mlx5_core function under the artifact beyond "TX/RX
+  wake path" (would need an uncompressed debug module; the kprobe evidence already
+  establishes it is NOT crypto and IS the sendto-kick path).
 
 ## 10. Open questions for adversarial review
 
-1. **Refute the Path B artifact claim:** is there any mechanism by which
-   `mlx5_crypto_modify_dek_key` consumes 3.5% CPU while a kprobe on it fires 0
-   times in 8 s (e.g. the kprobe attaching to the wrong symbol, tail-call
-   elision, the function being a thunk)? `napi_poll` on the same probe fired
-   3.58M times, proving the kprobe mechanism works. Is the artifact conclusion
-   sound, or is more evidence needed (kallsyms address-range check, `perf
-   annotate`)?
-2. Is killing Path B premature — should we re-symbolize to name the real hot
-   function first (could it reveal a *different* recoverable lever hiding under
-   the misattribution)?
-3. Path A sub-cost: is `cos_queue_push_back` at 5.7% plausibly reducible, or is
-   it irreducible per-packet enqueue work (→ Path A should also be killed, not
-   just deferred)?
-4. Is the D docs-only-PR exclusion from the review gauntlet appropriate here?
-5. E-follow-up: is ~1% on a CPU-bound box ever worth a uniqueness-proof + fuzz
-   test, or should it be explicitly killed rather than deferred?
+1. **Path B fraction:** the kprobe proves the ~5.5% is not crypto and the wake
+   path runs at ~108K sendto/s — but is the wake path actually the bulk of that
+   misattributed bucket, or only part (with the rest being genuinely-inherent
+   unexported datapath)? Does the re-scope over-promise recoverable CPU?
+2. **Path B tradeoff:** at `TX_WAKE_MIN_INTERVAL_NS=50µs` already gating, is there
+   real slack to widen without TX latency / ring-backpressure regression, or is
+   the current value near-optimal (→ B should also be killed)?
+3. **Path C:** does dedicating a core to the Go control plane (5 workers vs 6)
+   plausibly net-win, or does losing a worker on a worker-bound box dominate?
+4. **Path A:** are AGY's sub-levers (flow-hash caching, descriptor-indexed
+   queuing) actually safe given the CoS fairness invariants, or do they perturb
+   the exact-guarantee/vtime semantics (the #1207/#1545 trap)?
+5. **Path E-follow-up KILL:** is the "re-assert is structurally necessary"
+   correctness argument airtight, or is there a provable uniqueness invariant that
+   would make the ~1% genuinely recoverable (→ defer not kill)?
