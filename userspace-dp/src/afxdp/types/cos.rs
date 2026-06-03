@@ -1351,7 +1351,11 @@ mod flow_fair_state_tests {
         assert_eq!(boxed.flow_bucket_items.len(), COS_FLOW_FAIR_BUCKETS);
         assert!(boxed.flow_bucket_items.iter().all(|q| q.is_empty()));
         assert!(boxed.pop_snapshot_stack.is_empty());
-        assert_eq!(boxed.pop_snapshot_stack.capacity(), TX_BATCH_SIZE);
+        // `with_capacity` guarantees AT LEAST the requested capacity; match
+        // the same `>=` contract `owned` (via `new()`) satisfies rather than
+        // pinning an exact value the allocator is free to round up.
+        assert!(boxed.pop_snapshot_stack.capacity() >= TX_BATCH_SIZE);
+        assert!(owned.pop_snapshot_stack.capacity() >= TX_BATCH_SIZE);
 
         // FlowRrRing zero-init equivalence (POD).
         assert!(boxed.flow_rr_buckets.is_empty());
