@@ -1,17 +1,23 @@
 # #1752 remaining paths — B / A / C-D / E-follow-up
 
-**Status: v3 — folds Codex r2 (PLAN-NEEDS-MINOR, B wording/TX-vs-RX) + AGY r2 (E-followup self-reversal → recast as collision-reachability correctness investigation; C 16.7% bar). Re-dispatched for r3.**
+**Status: v4 (PLAN-READY pending AGY r3) — Codex r3 PLAN-READY (stale summary fixed); Claude SMR PLAN-READY.**
 
-v2 changes after live verification:
-- **Path B is NOT killed — it is RE-SCOPED.** The "crypto DEK churn" is a perf
-  symbolization artifact (kprobe = 0 calls), but AGY's hypothesis verified: the
-  real cost is the **AF_XDP TX/RX wake `sendto()` kick path** (~108K sendto/s),
-  which IS software-recoverable via wake-interval tuning.
-- Path A defer stands, enriched with AGY's verified concrete sub-levers.
-- **Path C re-scoped** from "operator only" to a real software lever (workers are
-  already core-pinned; move them off core 0 and give it to the Go control plane).
-- **Path E-follow-up = KILL** (AGY: if transient port reuse pre-GC occurs the
-  re-assert is structurally necessary, so the ~1% isn't spurious).
+Disposition summary (after live verification + 3 review rounds):
+- **Path B — RE-SCOPED (not killed):** the "crypto DEK churn" is a perf
+  symbolization artifact (kprobe = 0 calls); the real cost is the AF_XDP TX/RX
+  wake `sendto()` kick path — a **verified participant** in the misattributed
+  bucket and a candidate for recoverable CPU, **recoverable fraction TBD**
+  (needs TX-vs-RX per-site attribution first). Own /research, tradeoff-gated.
+- **Path A — defer** to its own gated /research, enriched with AGY's verified
+  CoS sub-levers. The only large lever; high kill-risk.
+- **Path C — re-scoped** to a real software lever (workers already core-pinned;
+  dedicate core 0 to the Go control plane) but **likely a net loss** (6→5 workers
+  = ~16.7% capacity cut); own A/B with a high bar + kill exit.
+- **Path E-follow-up — collision-reachability *correctness* investigation** (AGY
+  self-reversed r1→r2): reachability of two live sessions sharing a secondary key
+  decides whether the re-assert is harmless (~1% perf) or a latent NAT-corruption
+  bug. Pre-existing behavior; #1753 preserved it byte-identically.
+- **Path D — docs PR** (document the 6/6 no-headroom ceiling).
 - Evidence committed under `evidence/`.
 
 Path E (session in-place refresh) shipped (PR #1753, `380bbb8ed`). This doc
