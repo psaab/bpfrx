@@ -1,6 +1,6 @@
 # #1752 — P48/5210 CPU-bound at 16 Gb/s: where the cycles go
 
-**Status: DRAFT v1 — pending adversarial plan review (Codex + AGY + Claude SMR)**
+**Status: v2 — Claude SMR PLAN-READY-WITH-MINORS folded; Codex + AGY r1 pending**
 
 This is a *diagnosis-first* research doc. The empirical profile is already
 captured live on `loss:xpf-userspace-fw0` (flow-rebalance OFF, native XDP,
@@ -32,7 +32,12 @@ Datapath healthy: `xdp mode DEFAULT` (native), `ethtool -S` shows all
 
 ## 3. Honest scope/value framing
 
-- **Finding 1 (CoS ~19%)** is the headline — worth ~7.4 Gb/s on this path — but
+- **Finding 1 (CoS ~19%)** is the headline. The *firm* number is the **~19% CPU
+  self-time** freed (flat profile; `cos_*` symbols vanish CoS-OFF). The
+  throughput figure is noisier — the CoS-OFF arm hit 23.4 Gb/s **with ~26,835
+  retr** (vs ~1,469 CoS-ON), so iperf's sender Gb/s overstates goodput: call it
+  **up to ~7.4 Gb/s gross, less in goodput.** Crypto-DEK churn was present in
+  *both* A/B arms, so it does not confound this delta. The win is large — but
   the CoS exact-guarantee path has been refactored many times (#959, #1207
   PLAN-KILL, #1545 PLAN-KILL); a CPU-reduction attempt risks another kill.
   Value is large; tractability is the open question.
@@ -67,14 +72,17 @@ Datapath healthy: `xdp mode DEFAULT` (native), `ethtool -S` shows all
 
 Recommended sequencing: **B → (measure) → A or C**.
 
-Path B investigation steps (no production code; diagnostic):
-1. `mlx5_core` DEK trace: `perf record -e` on `mlx5_crypto_modify_dek_key`,
-   capture the kernel stack that *calls* it under `-P48 5210` (is it TX
-   completion, ASO, or strongSwan rekey?).
+Path B investigation steps (no production code; diagnostic). Non-invasive
+first; the invasive A/B is **gated** on what the trace shows:
+1. **(non-invasive, hard gate)** `mlx5_core` DEK trace: `perf record -g` on
+   `mlx5_crypto_modify_dek_key`, capture the kernel stack that *calls* it under
+   `-P48 5210` (TX completion? ASO? strongSwan rekey timer?). Also confirm
+   per-packet vs periodic by sampling rate vs pps.
 2. Correlate with `ip xfrm state`/`policy` churn and strongSwan rekey logs.
-3. A/B: with strongSwan stopped + xfrm flushed on fw0 (smoke-env only),
-   re-run `-P48 5210` and re-profile — does the DEK family vanish and does
-   throughput rise? Quantify.
+3. **Only if step 1/2 implicate strongSwan/xfrm**: invasive A/B (stop strongSwan
+   + flush xfrm), re-run `-P48 5210`, re-profile. Run this on the **standalone
+   test VM** or on fw1 while fw0 holds RG-0 — **never on the live RG-0 primary**,
+   because IPsec SA sync reacts to SA teardown. Revert immediately after.
 4. Decide config vs driver vs expected; file the fix as a separate /engineer
    issue if there is a clean lever.
 
