@@ -556,9 +556,20 @@ impl RebalanceController {
             if move_rate <= 0.0 {
                 continue;
             }
-            // Magnitude guard: moving it must not make the destination the new
-            // hottest worker (move magnitude <= gap/2).
-            if move_rate > gap / 2.0 {
+            // Magnitude guard (#1748 live BLOCKER B — relaxed from gap/2 to
+            // gap). `gap = hottest - coolest`. The guard's purpose is anti-
+            // thrash: a move must not make the DESTINATION more loaded than the
+            // SOURCE was before the move. That bound is `coolest + move_rate <=
+            // hottest`, i.e. `move_rate <= gap` — NOT `gap/2`. The old `gap/2`
+            // ("don't overshoot the midpoint") rejected the worker-rate fallback
+            // estimate (hottest/candidate_count) whenever the hottest worker had
+            // few but heavy flows: e.g. hottest 4.5G with 2 flows => est 2.25G
+            // vs (4.5-1.0)/2 = 1.75G => rejected, even though moving it clearly
+            // improves balance. The epsilon band below already guarantees the
+            // move REDUCES CoV, and the per-flow cooldown prevents oscillation,
+            // so gap/2 was redundant AND too strict — it dominated the live skip
+            // counter (magnitude) and blocked every beneficial move.
+            if move_rate > gap {
                 had_magnitude_skip = true;
                 continue;
             }

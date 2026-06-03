@@ -288,12 +288,13 @@ fn budget_exhaustion_stops_no_eviction() {
 fn magnitude_guard_rejects_overlarge_flow() {
     let mut c = test_controller(cfg());
     let mut tx = MockTransport::good();
-    // gap = 400 - 100 = 300; gap/2 = 150. The only flow on the hottest worker
-    // is 250 bytes/s > 150, so the magnitude guard must reject it.
+    // #1748 live BLOCKER B: the guard is `move_rate > gap` (relaxed from
+    // gap/2). gap = 400 - 100 = 300. A 350 byte/s flow exceeds gap, so moving
+    // it would overload the destination past the old hottest -> reject.
     let input = RebalanceTickInput {
         ifindex: 1,
         workers: vec![worker(0, 400.0), worker(1, 100.0)],
-        flows: vec![flow(1001, 0, 250.0)],
+        flows: vec![flow(1001, 0, 350.0)],
         now_secs: 10,
     };
     c.tick(&input, &mut tx);
@@ -302,6 +303,33 @@ fn magnitude_guard_rejects_overlarge_flow() {
     assert!(!tx.calls.iter().any(|c| c.starts_with("install:")));
     let mag = c.metrics().moves_skipped.get(&SkipReason::Magnitude).copied().unwrap_or(0);
     assert!(mag >= 1, "magnitude skip recorded: {:?}", c.metrics().moves_skipped);
+}
+
+#[test]
+fn magnitude_guard_admits_flow_between_half_gap_and_gap() {
+    // #1748 live BLOCKER B regression: a flow whose rate is in (gap/2, gap] was
+    // WRONGLY rejected by the old gap/2 guard even though moving it improves
+    // balance. With the relaxed `> gap` guard it must now be ADMITTED.
+    // workers [450, 100]: gap = 350, gap/2 = 175. A 250 byte/s flow (between
+    // 175 and 350) clears the magnitude guard; moving it -> [200, 350] which is
+    // more balanced (CoV drops), so it must install.
+    let mut c = test_controller(cfg());
+    let mut tx = MockTransport::good();
+    let input = RebalanceTickInput {
+        ifindex: 1,
+        workers: vec![worker(0, 450.0), worker(1, 100.0)],
+        flows: vec![flow(1001, 0, 250.0), flow(1002, 0, 200.0)],
+        now_secs: 10,
+    };
+    c.tick(&input, &mut tx);
+    let input2 = RebalanceTickInput { now_secs: 12, ..input };
+    let outcome = c.tick(&input2, &mut tx);
+    assert!(
+        outcome.is_some(),
+        "a flow in (gap/2, gap] must clear the relaxed magnitude guard and \
+         install; skips={:?}", c.metrics().moves_skipped
+    );
+    assert_eq!(c.metrics().installs_total, 1);
 }
 
 #[test]
@@ -674,15 +702,18 @@ fn long_lived_idle_flow_not_selected_over_recent_burst() {
 }
 
 #[test]
-fn zero_rate_idle_flows_yield_no_move() {
-    // If every flow on the hottest worker has rate 0 (all long-lived idle),
-    // moving any of them cannot improve the byte-rate CoV, so no move is taken
-    // (the magnitude/epsilon guards reject a 0-rate move).
+fn zero_rate_idle_flows_still_move_via_worker_rate_fallback() {
+    // #1748 live BUG #1/#r5: per-flow rates are an unreliable signal (the
+    // flow-cache observed_bytes counter resets on eviction), so flows commonly
+    // read rate 0 under load. The worker-rate fallback estimates the move
+    // magnitude as hottest.byte_rate/candidate_count when the direct per-flow
+    // rate is 0 — so a clear WORKER-rate imbalance with zero per-flow rates
+    // MUST still move (this is the whole point of the fallback). Worker 0 at
+    // 400 with 2 idle flows => est 200/flow, gap 300 => clears the magnitude
+    // guard and improves CoV.
     let mut c = test_controller(cfg());
     let input = RebalanceTickInput {
         ifindex: 1,
-        // Worker 0 looks hottest by some other flow, but the eligible flows on
-        // it are all idle.
         workers: vec![worker(0, 400.0), worker(1, 100.0)],
         flows: vec![flow(8001, 0, 0.0), flow(8002, 0, 0.0)],
         now_secs: 10,
@@ -691,8 +722,31 @@ fn zero_rate_idle_flows_yield_no_move() {
     c.tick(&input, &mut tx);
     let input2 = RebalanceTickInput { now_secs: 12, ..input };
     assert!(
+        c.tick(&input2, &mut tx).is_some(),
+        "a real worker-rate imbalance with zero per-flow rates MUST move via \
+         the fallback; skips={:?}", c.metrics().moves_skipped
+    );
+    assert_eq!(c.metrics().installs_total, 1);
+}
+
+#[test]
+fn truly_balanced_workers_yield_no_move() {
+    // The genuine no-move case: the WORKER rates themselves are balanced (under
+    // the imbalance threshold), so no candidate worker is hot enough to move
+    // from — recorded as Balanced, never reaching select_move.
+    let mut c = test_controller(cfg());
+    let input = RebalanceTickInput {
+        ifindex: 1,
+        workers: vec![worker(0, 300.0), worker(1, 300.0), worker(2, 300.0)],
+        flows: vec![flow(8101, 0, 100.0), flow(8102, 1, 100.0), flow(8103, 2, 100.0)],
+        now_secs: 10,
+    };
+    let mut tx = MockTransport::good();
+    c.tick(&input, &mut tx);
+    let input2 = RebalanceTickInput { now_secs: 12, ..input };
+    assert!(
         c.tick(&input2, &mut tx).is_none(),
-        "no move when all eligible flows are idle (rate 0)"
+        "balanced worker rates yield no move"
     );
     assert!(!tx.calls.iter().any(|c| c.starts_with("install:")));
 }
