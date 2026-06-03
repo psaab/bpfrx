@@ -152,6 +152,16 @@ func (c *xpfCollector) emitUserspaceDynamicBufferMetrics(ch chan<- prometheus.Me
 		)
 	}
 
+	// #1760: NAT reverse-key 1:N collision displacement counter. Emitted
+	// unconditionally (cumulative CounterValue, not gated on a session-
+	// table denominator) so a 0 is a real published "no collisions" signal
+	// rather than an absent series.
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceNatReverseKeyCollisions,
+		prometheus.CounterValue,
+		float64(status.NatReverseKeyCollisions),
+	)
+
 	var activeFlows, flowCapacity uint64
 	for _, b := range status.Bindings {
 		activeFlows += uint64(b.ActiveFlowCount)
@@ -534,6 +544,8 @@ func (c *xpfCollector) emitWorkerRuntime(ch chan<- prometheus.Metric, status dpu
 			prometheus.GaugeValue, float64(w.SessionTableEntries), label)
 		ch <- prometheus.MustNewConstMetric(c.workerSessionTableCapacity,
 			prometheus.GaugeValue, float64(w.MaxSessions), label)
+		ch <- prometheus.MustNewConstMetric(c.workerNatReverseKeyCollisions,
+			prometheus.CounterValue, float64(w.NatReverseKeyCollisions), label)
 		var deadValue float64
 		if w.Dead {
 			deadValue = 1

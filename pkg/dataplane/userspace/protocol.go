@@ -560,7 +560,14 @@ type ProcessStatus struct {
 	NeighborEntries                  int                   `json:"neighbor_entries,omitempty"`
 	SessionTableEntries              uint64                `json:"session_table_entries,omitempty"`
 	MaxSessions                      uint64                `json:"max_sessions,omitempty"`
-	FlowCacheCapacity                uint64                `json:"flow_cache_capacity,omitempty"`
+	// #1760: aggregate NAT reverse-key displacement events summed across
+	// the per-worker session tables -- the latent 1:N collision (#1758)
+	// made observable. Near-precise upper bound on live collisions (counts
+	// displacement events, not distinct flow-pairs). Nonzero triggers the
+	// structural-fix research; does NOT resolve #1760. omitempty for
+	// mixed Rust/Go daemon back-compat.
+	NatReverseKeyCollisions uint64 `json:"nat_reverse_key_collisions,omitempty"`
+	FlowCacheCapacity       uint64 `json:"flow_cache_capacity,omitempty"`
 	NeighborCacheCapacity            uint64                `json:"neighbor_cache_capacity,omitempty"`
 	NeighborGeneration               uint64                `json:"neighbor_generation,omitempty"`
 	RouteEntries                     int                   `json:"route_entries,omitempty"`
@@ -869,6 +876,10 @@ type WorkerRuntimeStatus struct {
 	CoSQueueLeaseAcquireV8GrantedBytes uint64 `json:"cos_queue_lease_acquire_v8_granted_bytes,omitempty"`
 	SessionTableEntries                uint64 `json:"session_table_entries,omitempty"`
 	MaxSessions                        uint64 `json:"max_sessions,omitempty"`
+	// #1760: cumulative NAT reverse-key displacement events on this
+	// worker's SessionTable nat_reverse_index (#1758). omitempty for
+	// mixed-version back-compat.
+	NatReverseKeyCollisions uint64 `json:"nat_reverse_key_collisions,omitempty"`
 	// #925 Phase 1+2 (catch+report+observe): Dead == true means the
 	// worker_loop panicked and the supervisor caught it. Set-only
 	// today — cleared only by daemon restart. Phase 2 surfaces this

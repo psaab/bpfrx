@@ -129,8 +129,10 @@ type xpfCollector struct {
 	workerCoSQueueLeaseAcquireV8GrantedBytes *prometheus.Desc
 	workerSessionTableEntries                *prometheus.Desc
 	workerSessionTableCapacity               *prometheus.Desc
+	workerNatReverseKeyCollisions            *prometheus.Desc
 	userspaceSessionTableEntries             *prometheus.Desc
 	userspaceSessionTableCapacity            *prometheus.Desc
+	userspaceNatReverseKeyCollisions         *prometheus.Desc
 	userspaceFlowCacheActiveFlows            *prometheus.Desc
 	userspaceFlowCacheCapacity               *prometheus.Desc
 	// #1379: daemon-side userspace event-stream transport counters.
@@ -298,8 +300,10 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.workerCoSQueueLeaseAcquireV8GrantedBytes
 	ch <- c.workerSessionTableEntries
 	ch <- c.workerSessionTableCapacity
+	ch <- c.workerNatReverseKeyCollisions
 	ch <- c.userspaceSessionTableEntries
 	ch <- c.userspaceSessionTableCapacity
+	ch <- c.userspaceNatReverseKeyCollisions
 	ch <- c.userspaceFlowCacheActiveFlows
 	ch <- c.userspaceFlowCacheCapacity
 	ch <- c.userspaceEventStreamFramesTotal
