@@ -2164,6 +2164,13 @@ fn inplace_randomized_sequence_matches_reference() {
         md.owner_rg_id = (next() % 3) as i32; // 0,1,2
         md.is_reverse = next() % 5 == 0;
         let ha = next() % 7 == 0;
+        // Vary tcp_flags so the FIN/RST `closing` + `expires_after_ns` branch is
+        // exercised, not only the steady-state tcp_flags=0 path.
+        let tcp_flags = match next() % 4 {
+            0 => TCP_FIN,
+            1 => TCP_RST,
+            _ => 0,
+        };
         let now = 2_000 + step * 10;
         let req = SessionUpdate {
             key: k,
@@ -2172,7 +2179,7 @@ fn inplace_randomized_sequence_matches_reference() {
             origin,
             now_ns: now,
             protocol: k.protocol,
-            tcp_flags: 0,
+            tcp_flags,
         };
         let r1 = ip.update_session(req.clone(), ha);
         let r2 = reference_update_session(&mut rf, req, ha);
@@ -2187,5 +2194,96 @@ fn inplace_randomized_sequence_matches_reference() {
             })
             .collect();
         assert_tables_equiv(&mut ip, &mut rf, &keys, &probes, &[0, 1, 2]);
+    }
+}
+
+/// Verbatim reproduction of the pre-#1752 remove+restore refresh_for_ha_transition.
+fn reference_refresh_for_ha_transition(
+    table: &mut SessionTable,
+    key: &SessionKey,
+    decision: SessionDecision,
+    metadata: SessionMetadata,
+    now_ns: u64,
+) -> bool {
+    let Some(mut entry) = table.remove_entry(key) else {
+        return false;
+    };
+    entry.decision = decision;
+    entry.metadata = metadata;
+    entry.install_epoch = table.next_epoch();
+    entry.last_seen_ns = now_ns;
+    table.restore_entry(key.clone(), entry);
+    table.push_to_wheel(key, now_ns);
+    true
+}
+
+#[test]
+fn inplace_ha_transition_matches_reference() {
+    let key = key_v4();
+    // Plain transition (no index change) + a reindex transition (nat rewrite +
+    // owner_rg change) so both the skip and the reindex branch are covered.
+    for (dec, mut md) in [(decision(), metadata()), (nat_rewrite(), metadata())] {
+        md.owner_rg_id = 2; // differs from baseline owner_rg_id=1 -> reindex
+        let (mut ip, mut rf) =
+            two_tables_with(&key, decision(), metadata(), SessionOrigin::SyncImport, 1_000);
+        let probe_old = reverse_wire_key(&key, NatDecision::default());
+        let probe_new = reverse_wire_key(&key, dec.nat);
+        assert!(ip.refresh_for_ha_transition(&key, dec, md.clone(), 2_000));
+        assert!(reference_refresh_for_ha_transition(&mut rf, &key, dec, md, 2_000));
+        assert_tables_equiv(
+            &mut ip,
+            &mut rf,
+            &[key.clone()],
+            &[probe_old, probe_new],
+            &[0, 1, 2],
+        );
+    }
+}
+
+#[test]
+fn inplace_vacant_handle_returns_false_no_panic() {
+    // key_to_handle points at a slab slot that was never allocated -> the
+    // entries.get(handle) == None guard must return false without panicking.
+    let key = key_v4();
+    let mut t = SessionTable::new();
+    t.key_to_handle.insert(key.clone(), 9999u32);
+    let req = SessionUpdate {
+        key: &key,
+        decision: decision(),
+        metadata: metadata(),
+        origin: SessionOrigin::ForwardFlow,
+        now_ns: 2_000,
+        protocol: PROTO_TCP,
+        tcp_flags: 0,
+    };
+    assert!(!t.update_session(req, false));
+    // refresh_for_ha_transition shares the same guard.
+    assert!(!t.refresh_for_ha_transition(&key, decision(), metadata(), 2_000));
+}
+
+#[test]
+fn inplace_fin_rst_closing_matches_reference() {
+    // FIN/RST set `closing` and shorten expires_after_ns; verify the in-place
+    // path writes them identically to the reference for both flags.
+    let key = key_v4();
+    for flags in [TCP_FIN, TCP_RST, TCP_FIN | TCP_RST] {
+        let (mut ip, mut rf) =
+            two_tables_with(&key, decision(), metadata(), SessionOrigin::ForwardFlow, 1_000);
+        let req = SessionUpdate {
+            key: &key,
+            decision: decision(),
+            metadata: metadata(),
+            origin: SessionOrigin::ForwardFlow,
+            now_ns: 2_000,
+            protocol: PROTO_TCP,
+            tcp_flags: flags,
+        };
+        assert!(ip.update_session(req.clone(), false));
+        assert!(reference_update_session(&mut rf, req, false));
+        assert!(
+            ip.entry_by_key(&key).expect("entry").closing,
+            "closing should be set for flags {flags:#x}"
+        );
+        assert_tables_equiv(&mut ip, &mut rf, &[key.clone()], &[], &[1, 2]);
     }
 }
