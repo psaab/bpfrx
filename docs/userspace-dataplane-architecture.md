@@ -517,6 +517,51 @@ CPU 7: main thread + io_uring + kernel
 Per-worker ceiling: ~4-5 Gbps (includes kernel NAPI overhead on same CPU).
 RSS queue count should match worker count for optimal distribution.
 
+### Sizing Headroom — the N-vCPU / N-queue / N-worker "no-headroom" regime
+
+The "CPU Layout" above is the **recommended** sizing: an 8-vCPU VM running 6
+workers leaves CPU 6 for the Go daemon (`xpfd`) and CPU 7 for the main thread +
+kernel. That spare-core margin is what the `workers + 2` tuning guideline below
+buys. When a VM is sized with **workers == vCPUs** there is no spare core, and
+the box enters a *no-headroom* regime worth understanding before reading a
+profile or sizing a shaper.
+
+**The loss userspace cluster (`loss:xpf-userspace-fw0/fw1`) is exactly this
+case: 6 vCPU = 6 mlx5 RX queues = 6 AF_XDP workers.** The dataplane is sized to
+consume the entire machine. Consequences (all measured in #1752 on
+`-P48 -p5210`):
+
+- **All 6 cores run ~100% busy under load** (≈ `60% usr / 8% sys / 28% softirq`,
+  ~0% idle). The workers busy-poll; NET_RX softirq for the same queues runs on
+  the *same* cores (no separate IRQ core); and the Go control plane's GC +
+  scheduler threads share those cores too (they do not get a dedicated one).
+- **A configured CoS shape can sit ABOVE the box's forwarding ceiling, in which
+  case it never engages.** On this cluster, forwarding tops out CPU-bound at
+  ~16 Gb/s with CoS enabled (the per-packet shaping path costs ~19% CPU) and
+  ~23 Gb/s with CoS disabled — both well under, e.g., a 24G `transmit-rate
+  exact` scheduler. The shaper's `exact` cap only bites if the box can first
+  push past it; here it cannot, so the cap is inert and the observed rate is the
+  CPU ceiling, not the shape.
+- **"Headroom" does not exist at this sizing — there is no idle core to absorb a
+  burst, a GC pause, or added per-packet work.** Freeing CPU on the hot path
+  (e.g. #1753 session-refresh in-place mutation) buys margin but does not raise
+  aggregate throughput when the binding constraint is elsewhere (the CoS path).
+
+**To gain real headroom, scale the box, not the code:** add vCPUs **and** RX
+queues **and** workers together (`ethtool -L <dev> combined N` + `workers N`),
+keeping the `workers + 2` margin so the daemon and kernel get their own cores.
+Reducing per-packet CPU cost only helps once the box is no longer at the
+N/N/N ceiling.
+
+> **Profiling caveat on this kernel/NIC:** `mlx5_core` ships compressed
+> (`.ko.xz`), so `perf` rounds sample PCs in *unexported* static driver
+> functions to the nearest *exported* symbol. On the loss cluster this
+> mis-attributes real AF_XDP TX/RX wake `sendto()` cost (`mlx5e_xsk_wakeup` is
+> static) to adjacent exported symbols such as the `mlx5_crypto_*_dek_*` family —
+> there is **no crypto DEK work** on a plain forwarding path. Validate any
+> kernel-symbol attribution with a `bpftrace` kprobe call-count before trusting
+> the perf `%` (#1752).
+
 ## Configuration
 
 ```junos
