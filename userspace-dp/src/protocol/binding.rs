@@ -52,6 +52,13 @@ pub struct WorkerRuntimeStatus {
     /// Capacity of this worker's Rust-owned SessionTable.
     #[serde(rename = "max_sessions", default)]
     pub max_sessions: u64,
+    /// #1760: cumulative NAT reverse-key displacement events on this
+    /// worker's SessionTable nat_reverse_index — the latent 1:N collision
+    /// (#1758) made observable. A near-precise upper bound on live
+    /// collisions (counts displacement *events*, not distinct flow-pairs).
+    /// `default` so an older daemon that predates this counter emits 0.
+    #[serde(rename = "nat_reverse_key_collisions", default)]
+    pub nat_reverse_key_collisions: u64,
     /// #925: true if the worker_loop thread panicked and the supervisor
     /// caught it. Set once on first panic; never cleared in Phase 1.
     /// Operators see DEAD in `cli show chassis forwarding` and must

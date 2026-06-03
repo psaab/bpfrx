@@ -384,6 +384,7 @@ impl super::Coordinator {
                         .cos_queue_lease_acquire_v8_granted_bytes,
                     session_table_entries: s.session_table_entries,
                     max_sessions: s.max_sessions,
+                    nat_reverse_key_collisions: s.nat_reverse_key_collisions,
                     dead,
                     panic_message,
                     thread_cpu_ns_60s: w.thread_cpu_ns,

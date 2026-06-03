@@ -337,6 +337,8 @@ pub(crate) fn worker_loop(
                 refresh_worker_cos_queue_lease_runtime_counters(&mut wr_counters, &bindings);
                 wr_counters.session_table_entries = sessions.len() as u64;
                 wr_counters.max_sessions = sessions.max_sessions() as u64;
+                wr_counters.nat_reverse_key_collisions =
+                    sessions.nat_reverse_key_collisions();
                 runtime_atomics.publish(&wr_counters, loop_now_ns);
                 // #1621: alongside the runtime publish, merge each
                 // binding's cold-path worker-local counters into a
