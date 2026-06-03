@@ -13,9 +13,18 @@ Branch: `research/1750-reliable-flow-feed` (docs only; no production code).
 | r2 | Codex | session 019e8b09-490a-7451-bd41-c8d37fcafa1e (gpt-5.5) | PLAN-NEEDS-MAJOR | 3 r1 majors closed; StaleFlowSnapshot unbounded defer; name the flow_worker_map() API change; D already fixed on branch |
 | r2 | AGY | adversarial-review-mpxdevby-5iqxdy | PLAN-NEEDS-MINOR | 3 r1 majors verified CLOSED; only StaleFlowSnapshot livelock (use snapshot-age, not count-vs-rows) |
 | r2 | Claude-SMR | claude-smr-plan-r2.md | PLAN-NEEDS-MINOR | converges: bounded snapshot-age defer; D already fixed; name API change |
-| r3 | Codex | (pending) | | confirm v3 |
-| r3 | AGY | (pending) | | confirm v3 |
-| r3 | Claude-SMR | claude-smr-plan-r3.md | | confirm v3 |
+| r3 | Codex | session 019e8b0e-ce20-7aa0-a578-b37f12f3d4be (gpt-5.5) | PLAN-NEEDS-MINOR→closed | r2 MAJOR closed; sole MINOR = flow_worker_map() 2nd consumer (helpers.rs:124) — folded v4 |
+| r3 | AGY | adversarial-review-mpxdmsds-5k0kxu | PLAN-NEEDS-MINOR→closed | snapshot-age defer livelock-free + covers transient; sole MINOR = same helpers.rs consumer — folded v4 |
+| r3 | Claude-SMR | claude-smr-plan-r3.md | PLAN-READY | spine triple-verified; r3 MINOR folded |
+
+## r3 convergence → PLAN-READY v4
+Codex r3 + AGY r3 both validate the bounded snapshot-AGE defer (livelock-free,
+covers transient publish lag) and raise the SAME single MINOR: `flow_worker_map()`
+has a second consumer `server/helpers.rs:124` (status/wire path), so the API
+change must preserve/update it. Folded into v4 §5 + §6.1 (add a controller-facing
+accessor OR update both call sites; don't break the status/wire export). With
+that, no open finding remains: Claude-SMR PLAN-READY, Codex + AGY MINOR resolved.
+Converged at v4.
 
 ## r2 convergence
 All three confirm the r1 MAJORs are closed. Single shared defect: the

@@ -1,14 +1,14 @@
 # #1750 — reliable per-flow 5-tuple feed for the #1748 rebalance controller
 
-- **Status**: PLAN v3 — r2 hostile round folded (Codex PLAN-NEEDS-MAJOR, AGY
-  PLAN-NEEDS-MINOR, Claude-SMR PLAN-NEEDS-MINOR — all converge on ONE defect:
-  the `StaleFlowSnapshot` defer was livelock-unsafe). v3 fixes: (1) staleness is
-  now a bounded snapshot-AGE check, never count-vs-rows; (2) cause D is
-  acknowledged as ALREADY FIXED on the branch (re-verify live) — a residual
-  empty candidate set is then necessarily cause C (post-filter loss), diagnosed
-  not deferred; (3) the `flow_worker_map()` consumer-API change is named;
-  (4) worker_id is on `identities (BindingIdentity)`, not live state.
-  r1 folded the 3 MAJORs (atomic-publish false, cause D, dead §6.3).
+- **Status**: **PLAN-READY v4** — converged after 3 hostile rounds.
+  r3: Claude-SMR PLAN-READY; Codex PLAN-NEEDS-MINOR + AGY PLAN-NEEDS-MINOR, both
+  on the SAME single point (`flow_worker_map()` has a second consumer
+  `server/helpers.rs:124` — the API change must preserve the status/wire path),
+  now folded into §5 + §6.1 → all open findings closed. r2 closed the
+  `StaleFlowSnapshot` livelock (bounded snapshot-AGE defer). r1 closed the 3
+  MAJORs (atomic-publish false → bundle; cause D keying → already fixed on
+  branch; dead §6.3 → cold-path side-table deferred). PLAN-KILL rejected by all
+  three. Awaiting manual approval via `/engineer 1750`.
 - **Issue**: #1750
 - **Mode**: `/research` — stops at PLAN-READY / PLAN-KILL. No PR, no production
   code touched in this skill.
@@ -364,11 +364,12 @@ heterogeneous gate proves it needed.**
   (the `AtomicU32`-vs-`ArcSwap` skew is structurally gone). The standalone
   `active_flow_count` `AtomicU32` stays for Prometheus; the controller reads
   ONLY the bundled snapshot.
-- **Consumer API (Codex r2):** `Coordinator::flow_worker_map()`
-  (`status.rs:168`) returns `(Vec<rows>, bool)` today and `rebalance.rs:273`
-  reads `let (rows, _truncated) = self.flow_worker_map()` — NO count. Change it
-  to surface the bundled per-(ifindex,worker) count + `published_ns` so the
-  controller's decision uses them.
+- **Consumer API (Codex r2/r3):** `Coordinator::flow_worker_map()`
+  (`status.rs:168`) returns `(Vec<rows>, bool)` today. It has TWO consumers: the
+  controller (`rebalance.rs:273`, reads NO count) and the status/wire path
+  (`server/helpers.rs:124`). Add a controller-facing accessor that surfaces the
+  bundled per-(ifindex,worker) count + `published_ns`, OR extend the return and
+  update both call sites — but do NOT break the status/wire row export.
 
 ### 6.2 Keying (kept) + bounded snapshot-AGE staleness defer
 - **Keying (cause D — ALREADY on the branch):** `tick_rebalance`
@@ -412,8 +413,14 @@ catch these (behavioral/runtime)." So the increment MUST land with:
 - New `SkipReason::StaleFlowSnapshot` is an additive metric label
   (matches the `no_eligible_flow` precedent, commit `b219d1280`); it fires on
   snapshot-AGE staleness and is bounded so it cannot mask a persistent skip.
-- `flow_worker_map()` return type changes (rows-only → bundled count+timestamp)
-  — internal `pub(crate)` API; the controller is the only consumer.
+- `flow_worker_map()` return type changes (rows-only → bundled count+timestamp).
+  **Two consumers (Codex r3):** the rebalance controller (`rebalance.rs:273`)
+  AND the status/wire path (`server/helpers.rs:124`,
+  `let (flow_worker_map, flow_worker_map_truncated) = state.afxdp.flow_worker_map()`).
+  The API change MUST preserve the status/wire consumer — either keep the
+  existing `(rows, truncated)` accessor for the wire path and add a sibling that
+  also returns the bundled count+timestamp for the controller, or update BOTH
+  call sites. Do not break the status JSON / Prometheus row export.
 - No hot-path cost added; the optional side-table (Path 2) is cold-path only.
 
 ## 8. Hidden invariants to preserve
