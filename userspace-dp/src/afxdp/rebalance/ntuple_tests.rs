@@ -78,8 +78,19 @@ fn build_flow_spec_tcp4_exact_match_encoding() {
     assert_eq!(psrc, flow.src_port);
     assert_eq!(pdst, flow.dst_port);
 
-    // Exact match: addr/port mask fields are 0 (0 bit = "match this bit").
-    assert_eq!(&fs.m_u.hdata[0..12], &[0u8; 12], "5-tuple mask is exact");
+    // #1748 live BLOCKER A: the INPUT mask is DIRECT (1 = match), so an exact
+    // 5-tuple match sets ip4src/ip4dst masks to 0xffff_ffff and psrc/pdst masks
+    // to 0xffff, with the tos mask 0 (a non-zero tos mask makes mlx5 EINVAL).
+    let m_ip4src = u32::from_ne_bytes(fs.m_u.hdata[0..4].try_into().unwrap());
+    let m_ip4dst = u32::from_ne_bytes(fs.m_u.hdata[4..8].try_into().unwrap());
+    let m_psrc = u16::from_ne_bytes(fs.m_u.hdata[8..10].try_into().unwrap());
+    let m_pdst = u16::from_ne_bytes(fs.m_u.hdata[10..12].try_into().unwrap());
+    let m_tos = fs.m_u.hdata[12];
+    assert_eq!(m_ip4src, 0xffff_ffff, "src-ip mask must be all-ones (match)");
+    assert_eq!(m_ip4dst, 0xffff_ffff, "dst-ip mask must be all-ones (match)");
+    assert_eq!(m_psrc, 0xffff, "src-port mask must be all-ones (match)");
+    assert_eq!(m_pdst, 0xffff, "dst-port mask must be all-ones (match)");
+    assert_eq!(m_tos, 0, "tos mask MUST be 0 (mlx5 rejects a non-zero tos mask)");
 }
 
 #[test]
@@ -96,8 +107,10 @@ fn build_flow_spec_tcp6_uses_v6_flow_type() {
     assert_eq!(fs.ring_cookie, 5);
     let ip6src0 = u32::from_ne_bytes(fs.h_u.hdata[0..4].try_into().unwrap());
     assert_eq!(ip6src0, 1);
-    // src+dst (32 B) addr-mask exact.
-    assert_eq!(&fs.m_u.hdata[0..32], &[0u8; 32]);
+    // src+dst (32 B) addr mask is all-ones (1 = match), and the tclass mask
+    // (byte 36) is 0 — the v6 analogue of the tos-mask-must-be-0 rule.
+    assert_eq!(&fs.m_u.hdata[0..32], &[0xffu8; 32], "v6 addr mask is all-ones");
+    assert_eq!(fs.m_u.hdata[36], 0, "tclass mask must be 0");
 }
 
 /// Live insert -> GRXCLSRLALL readback -> delete round-trip. Gated to run
@@ -138,21 +151,22 @@ fn live_insert_list_delete_round_trip() {
         before.len() + 1,
         "exactly one rule added"
     );
-    // #1748 review #1: read the rule back and assert the canonical INVERTED
-    // mask encoding the live mlx5 NIC confirmed — tuple mask fields = 0
-    // (match), TOS mask = 0xff (wildcard). This pins the hardware-confirmed
-    // polarity so the masks are not "corrected" to the intuitive convention.
+    // #1748 live BLOCKER A: read the rule back via GRXCLSRULE and assert the
+    // DIRECT mask the driver stored — all-ones on the matched 5-tuple fields,
+    // tos mask 0. (GRXCLSRULE returns the raw stored flow_spec, i.e. what we
+    // passed in; ethtool(8)'s `-n` display COMPLEMENTS the mask for humans,
+    // which is what an earlier round misread as "0.0.0.0 = match".)
     let fs = sock.get_rule(loc).expect("get_rule readback");
     let m_ip4src = u32::from_ne_bytes(fs.m_u.hdata[0..4].try_into().unwrap());
     let m_ip4dst = u32::from_ne_bytes(fs.m_u.hdata[4..8].try_into().unwrap());
     let m_psrc = u16::from_ne_bytes(fs.m_u.hdata[8..10].try_into().unwrap());
     let m_pdst = u16::from_ne_bytes(fs.m_u.hdata[10..12].try_into().unwrap());
     let m_tos = fs.m_u.hdata[12];
-    assert_eq!(m_ip4src, 0, "src-ip mask must be 0.0.0.0 (exact match)");
-    assert_eq!(m_ip4dst, 0, "dst-ip mask must be 0.0.0.0 (exact match)");
-    assert_eq!(m_psrc, 0, "src-port mask must be 0x0 (exact match)");
-    assert_eq!(m_pdst, 0, "dst-port mask must be 0x0 (exact match)");
-    assert_eq!(m_tos, 0xff, "TOS mask must be 0xff (wildcard)");
+    assert_eq!(m_ip4src, 0xffff_ffff, "src-ip mask must be all-ones (match)");
+    assert_eq!(m_ip4dst, 0xffff_ffff, "dst-ip mask must be all-ones (match)");
+    assert_eq!(m_psrc, 0xffff, "src-port mask must be all-ones (match)");
+    assert_eq!(m_pdst, 0xffff, "dst-port mask must be all-ones (match)");
+    assert_eq!(m_tos, 0, "tos mask must be 0 (mlx5 rejects a non-zero tos mask)");
     sock.delete_rule(loc).expect("delete rule");
     let cleaned = sock.list_locs().expect("list after delete");
     assert!(

@@ -42,6 +42,12 @@ const UDP_V6_FLOW: u32 = 0x06;
 
 /// Special location: let the driver auto-assign any suitable free slot.
 const RX_CLS_LOC_ANY: u32 = 0xffff_ffff;
+/// Flag bit OR'd into the GRXCLSRLCNT `data` reply when the DRIVER manages
+/// rule locations (auto-assign). When set, ethtool(8) SKIPS the GRXCLSRLALL
+/// location-list scan (`rxclass.c` `rmgr_init`: `if (driver_select) return 0`)
+/// — and so must we, or the scan can EINVAL on such drivers (mlx5 auto-assigns
+/// via RX_CLS_LOC_ANY).
+const RX_CLS_LOC_SPECIAL: u32 = 0x8000_0000;
 
 /// `struct ethtool_tcpip4_spec` (ethtool.h) — 16 B. Network-order fields.
 #[repr(C)]
@@ -356,16 +362,26 @@ impl NtupleSocket {
         }
     }
 
-    /// Return the count of currently-defined classification rules (the
-    /// `data` field is the table size; `rule_cnt` is the live count). Used by
-    /// the controller's budget check and startup reconcile.
+    /// Return the count of currently-defined classification rules. On return
+    /// `rule_cnt` is the live count and `data` is the table size with the
+    /// `RX_CLS_LOC_SPECIAL` flag set iff the driver manages rule locations.
+    /// Matches ethtool(8) `rxclass_get_dev_info` (cmd=GRXCLSRLCNT, data=0 in).
     pub(crate) fn rule_count(&self) -> io::Result<u32> {
+        Ok(self.rule_count_and_driver_select()?.0)
+    }
+
+    /// `(rule_cnt, driver_select)`. `driver_select` is true when the NIC driver
+    /// manages rule locations (auto-assign) — in which case the GRXCLSRLALL
+    /// location-list scan must be skipped (ethtool does the same).
+    fn rule_count_and_driver_select(&self) -> io::Result<(u32, bool)> {
         let mut rxnfc = EthtoolRxnfc {
             cmd: ETHTOOL_GRXCLSRLCNT,
             ..EthtoolRxnfc::default()
         };
+        // ethtool sets data=0 before the call; default() already zeroes it.
         self.ioctl(&mut rxnfc)?;
-        Ok(rxnfc.rule_cnt)
+        let driver_select = (rxnfc.data as u32 & RX_CLS_LOC_SPECIAL) != 0;
+        Ok((rxnfc.rule_cnt, driver_select))
     }
 
     /// List the locations of all currently-defined rules via
@@ -375,17 +391,33 @@ impl NtupleSocket {
     /// array back. Used for reconcile/cleanup of stale xpf-owned rules on
     /// startup.
     pub(crate) fn list_locs(&self) -> io::Result<Vec<u32>> {
-        let count = self.rule_count()?;
+        let (count, driver_select) = self.rule_count_and_driver_select()?;
+        // #1748 live BLOCKER A: when the driver manages rule locations
+        // (auto-assign — mlx5 via RX_CLS_LOC_ANY), ethtool(8) SKIPS the
+        // GRXCLSRLALL location-list scan entirely (rxclass.c rmgr_init:
+        // `if (driver_select) return 0`). Issuing GRXCLSRLALL anyway can EINVAL
+        // on such drivers — the exact startup `reconcile_orphans` EINVAL seen
+        // on the live mlx5 VF. We cannot enumerate locations on a driver-select
+        // NIC, so return empty: the controller tracks its OWN installed rule
+        // locations in its in-memory ledger and deletes them by loc directly,
+        // so orphan-enumeration is best-effort and safely skipped here.
+        if driver_select {
+            return Ok(Vec::new());
+        }
         if count == 0 {
             return Ok(Vec::new());
         }
-        // The flexible `rule_locs[]` member starts at offset 188 (#1748 review
-        // #7), NOT at size_of::<EthtoolRxnfc>() (192). The struct rounds up to
-        // 192 for u64 alignment, but the kernel writes the location array
-        // beginning at the field offset. Allocate from the field offset so the
-        // first location is not skipped and the read offsets match.
+        // Buffer layout matches ethtool(8) `rxclass_rule_getall` EXACTLY
+        // (rxclass.c): `calloc(1, sizeof(ethtool_rxnfc) + count*sizeof(u32))`.
+        // The kernel `ethtool_rxnfc_copy_to_user` does TWO writes: the full
+        // `size`=sizeof(ethtool_rxnfc)=192-byte struct over [0,192), THEN the
+        // `count` u32 locations starting at `offsetof(rule_locs)`=188 (they
+        // overlap [188,192)). Sizing to `sizeof(EthtoolRxnfc) + count*4` (NOT
+        // offsetof+count*4) guarantees the 192-byte struct write never runs off
+        // the end for the count==1 edge, byte-for-byte matching ethtool. We
+        // READ each location back from offset 188 (#1748 #7).
         let locs_off = offset_of!(EthtoolRxnfc, rule_locs);
-        let total = locs_off + (count as usize) * size_of::<u32>();
+        let total = size_of::<EthtoolRxnfc>() + (count as usize) * size_of::<u32>();
         let mut buf = vec![0u8; total];
         {
             // SAFETY: buf is at least sizeof(EthtoolRxnfc); we initialize the
@@ -464,17 +496,27 @@ impl NtupleSocket {
 
 /// Build the `ethtool_rx_flow_spec` for an exact 5-tuple.
 ///
-/// MASK POLARITY (hardware-confirmed, #1748 review #1 — do NOT "fix" this to
-/// the intuitive all-ones=match convention): the ethtool rxnfc mask is
-/// INVERTED — a 0 bit in `m_u` means "match this bit", an all-ones field means
-/// "don't care / wildcard". Verified empirically on the live mlx5 VF: an exact
-/// CLI rule (`ethtool -N <if> flow-type tcp4 src-ip ... action <q>`) reads back
-/// via `ethtool -n <if>` as `Src/Dest IP mask: 0.0.0.0`, `Src/Dest port mask:
-/// 0x0`, `TOS mask: 0xff`. So an exact 5-tuple match sets every addr/port mask
-/// field to 0 (match) and TOS mask to 0xff (wildcard). `live_insert_list_delete_round_trip`
-/// readback-asserts these canonical masks. `ring_cookie` carries the
-/// destination queue; `location = RX_CLS_LOC_ANY` lets the driver pick a free
-/// slot.
+/// MASK POLARITY (#1748 live BLOCKER A — the kernel/driver INPUT mask is
+/// DIRECT, NOT inverted). The `m_u` mask passed INTO ETHTOOL_SRXCLSRLINS uses
+/// 1-bits to mean "match this bit": the mlx5 driver copies `m_u` verbatim into
+/// the hardware match criteria and only matches a field when its mask is
+/// non-zero (`net/.../en_fs_ethtool.c set_ip4/set_tcp`: `if (ip4src_m) {...}`),
+/// and `validate_tcpudp4` REJECTS a non-zero TOS mask with -EINVAL
+/// (`if (l4_mask->tos) return -EINVAL`). So for an exact 5-tuple match:
+///   - ip4src/ip4dst masks = 0xffff_ffff (match every address bit)
+///   - psrc/pdst masks     = 0xffff      (match every port bit)
+///   - tos/tclass mask     = 0           (MUST be 0 or the driver EINVALs)
+///
+/// A previous round set these the opposite way (tuple masks 0, tos 0xff) after
+/// MISREADING `ethtool -n` READBACK output: ethtool(8) DISPLAYS the stored mask
+/// inverted (it prints the complement, so a stored all-ones match shows as
+/// "0.0.0.0"), but the value the kernel READS from user space is the direct
+/// mask. That inverted setup made every SRXCLSRLINS fail with EINVAL (tos mask
+/// 0xff) on the live mlx5 VF. The `lo` round-trip unit test did not exercise
+/// the mlx5 validate path so it could not catch it.
+///
+/// `ring_cookie` carries the destination RX queue (must be < num_channels, or
+/// the driver EINVALs); `location = RX_CLS_LOC_ANY` auto-assigns a free slot.
 fn build_flow_spec(flow: &FlowSpec5Tuple, queue: u32) -> EthtoolRxFlowSpec {
     let mut fs = EthtoolRxFlowSpec {
         ring_cookie: queue as u64,
@@ -497,13 +539,14 @@ fn build_flow_spec(flow: &FlowSpec5Tuple, queue: u32) -> EthtoolRxFlowSpec {
                 _pad: [0; 3],
             };
             fs.h_u = EthtoolFlowUnion::from_tcpip4(spec);
-            // Exact match: all addr/port mask fields = 0; tos wildcarded.
+            // Exact match: all addr/port mask bits set (1 = match), tos mask 0
+            // (a non-zero tos mask makes the mlx5 driver return -EINVAL).
             let mask = EthtoolTcpip4Spec {
-                ip4src: 0,
-                ip4dst: 0,
-                psrc: 0,
-                pdst: 0,
-                tos: 0xff,
+                ip4src: 0xffff_ffff,
+                ip4dst: 0xffff_ffff,
+                psrc: 0xffff,
+                pdst: 0xffff,
+                tos: 0,
                 _pad: [0; 3],
             };
             fs.m_u = EthtoolFlowUnion::from_tcpip4(mask);
@@ -523,12 +566,13 @@ fn build_flow_spec(flow: &FlowSpec5Tuple, queue: u32) -> EthtoolRxFlowSpec {
                 _pad: [0; 3],
             };
             fs.h_u = EthtoolFlowUnion::from_tcpip6(spec);
+            // Exact match: all addr/port mask bits set, tclass mask 0.
             let mask = EthtoolTcpip6Spec {
-                ip6src: [0; 4],
-                ip6dst: [0; 4],
-                psrc: 0,
-                pdst: 0,
-                tclass: 0xff,
+                ip6src: [0xffff_ffff; 4],
+                ip6dst: [0xffff_ffff; 4],
+                psrc: 0xffff,
+                pdst: 0xffff,
+                tclass: 0,
                 _pad: [0; 3],
             };
             fs.m_u = EthtoolFlowUnion::from_tcpip6(mask);
