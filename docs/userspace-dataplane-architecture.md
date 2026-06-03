@@ -556,12 +556,17 @@ N/N/N ceiling.
 
 > **Profiling caveat on this kernel/NIC:** `mlx5_core` ships compressed
 > (`.ko.xz`), so `perf` rounds sample PCs in *unexported* static driver
-> functions to the nearest *exported* symbol. On the loss cluster this can
-> mis-attribute real AF_XDP TX/RX wake `sendto()` cost (`mlx5e_xsk_wakeup` is
-> static) to adjacent exported symbols such as the `mlx5_crypto_*_dek_*`
-> family — whether any real crypto DEK activity is present on a forwarding-only
-> path remains an open question in #1752. Validate any kernel-symbol attribution
-> with a `bpftrace` kprobe call-count before trusting the perf `%` (#1752).
+> functions to the nearest *exported* symbol. On the loss cluster this
+> mis-attributes real AF_XDP TX/RX wake `sendto()` cost (`mlx5e_xsk_wakeup` is
+> static) to adjacent exported symbols such as the `mlx5_crypto_*_dek_*` family.
+> This is not an open question: a `bpftrace` kprobe on
+> `mlx5_crypto_modify_dek_key` recorded **0 calls** over 8-10 s of full load
+> (while `mlx5e_napi_poll` recorded ~3.6M), i.e. those functions are not
+> executing — there is **no crypto DEK work** on a plain forwarding path; the
+> cost is the wake `sendto()` path. (What #1752 leaves open is the *separate*
+> question of how much of that wake cost is recoverable — see #1754, not whether
+> crypto is involved.) Takeaway: validate any kernel-symbol attribution with a
+> `bpftrace` kprobe call-count before trusting the perf `%`.
 
 ## Configuration
 
