@@ -815,8 +815,9 @@ impl SessionTable {
         // every index (key_to_handle map, slab slot with a NEW handle, all four
         // secondary indices) plus ~3 SessionMetadata clones on EVERY packet of an
         // established flow, only to bump timestamps. We now mutate the slab record
-        // in place and touch the secondary indices only when a key-relevant input
-        // (nat / is_reverse / owner_rg_id) actually changed. Behavior is
+        // in place, gating value-guarded secondary-index REMOVES on key-relevant
+        // input changes (nat / is_reverse / owner_rg_id) while still re-asserting
+        // secondary-index ADDS every refresh (restore_entry parity). Behavior is
         // byte-identical (modulo the opaque slab handle value); see
         // docs/pr/1752-session-inplace-refresh/plan.md.
         let Some(&handle) = self.key_to_handle.get(key) else {
@@ -851,8 +852,7 @@ impl SessionTable {
             // unconditionally re-asserts the entry's own secondary ADDS. To stay
             // byte-identical (incl. re-winning a displaced secondary-index
             // collision), re-assert the OLD adds before bailing.
-            let reject = (old_origin.is_peer_synced() && new_peer)
-                || (!old_origin.is_peer_synced() && new_peer);
+            let reject = new_peer;
             if reject {
                 self.index_forward_nat_key_parts(
                     key,
@@ -1288,7 +1288,8 @@ impl SessionTable {
     /// #1752 Path E: no longer used by the refresh paths (`update_session` /
     /// `refresh_for_ha_transition` now mutate in place). Retained as the
     /// reference half of the remove+restore round-trip the differential tests
-    /// compare against, so it is test-only in release builds.
+    /// compare against, so in release builds it is retained as dead-code-allowed
+    /// test reference logic (not conditionally compiled out).
     #[cfg_attr(not(test), allow(dead_code))]
     fn restore_entry(&mut self, key: SessionKey, entry: SessionEntry) -> Option<SessionEntry> {
         let record = SessionRecord {
