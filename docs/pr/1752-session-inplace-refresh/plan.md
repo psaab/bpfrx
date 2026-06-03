@@ -1,6 +1,6 @@
 # #1752 Path E — session refresh in-place mutation
 
-**Status: v3 — folds Codex r2 (PLAN-NEEDS-MAJOR, reject-path re-assert) + Gemini r2 (PLAN-READY). Re-dispatched for r3.**
+**Status: v4 (PLAN-READY) — Gemini r3 PLAN-READY; Codex r3 NEEDS-MINOR (handle-normalized test wording) folded; Claude SMR PLAN-READY. Proceeding to implement.**
 
 v2 changes: (a) secondary-index **adds are always re-asserted** (matches today's
 unconditional `index_forward_nat_key` insert exactly, incl. the
@@ -221,9 +221,14 @@ No public signature changes. `update_session`, `refresh_local`,
 
 - `cargo build` + full `cargo test --release` (1763+ lib tests) clean.
 - **Differential test (new, the gate)**: keep a reference remove+restore helper
-  in the test module; assert the in-place result is byte-identical (entry fields
-  + all four index maps + `key_to_handle` + `owner_rg_sessions` + deltas + wheel
-  state) to the reference across ALL of:
+  in the test module; assert **handle-normalized behavioral equivalence** to the
+  reference (NOT raw `u32` map equality — in-place preserves the slab handle
+  while remove+restore allocates a fresh one, so raw `key_to_handle`/
+  `owner_rg_sessions`/index values legitimately differ; Codex r3). Compare:
+  canonical entry fields by session key; every lookup (forward + all reverse/NAT/
+  wire/translated lookups) resolves to the same logical entry; owner-RG
+  membership as the set of session **keys** (not handles); the collision winner
+  by session key; deltas; wheel state. Cover ALL of:
   - local refresh, peer→local promote, peer→peer reject, local←peer reject,
     ha_activation refresh;
   - `reindex` triggers: NAT mapping change, owner_rg `0→>0`, `>0→0`, `>0→>0'`,
