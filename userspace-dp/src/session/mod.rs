@@ -157,6 +157,24 @@ pub(crate) struct SessionTable {
     create_drops: u64,
     delta_drops: u64,
     delta_drained: u64,
+    /// #1760: cumulative count of NAT reverse-key displacement events on
+    /// `nat_reverse_index`. Incremented whenever the per-flow secondary-
+    /// index insert (`index_forward_nat_key_parts`, the `reverse_wire_key`
+    /// insert) displaces a DIFFERENT handle for the same reverse key K —
+    /// i.e. two distinct sessions resolved to the same external reverse
+    /// tuple, the latent 1:N collision the #1758 research documented
+    /// (interface-mode SNAT / DNAT-to-shared-backend / NAT64 / non-
+    /// bijective static NAT — pool-mode SNAT is immune).
+    ///
+    /// This is a near-precise upper bound on live 1:N collisions, NOT an
+    /// exact distinct-flow-pair count: it measures displacement *events*,
+    /// so one colliding active pair can increment repeatedly as packets
+    /// alternate across the per-packet re-assert (#1753). A zero counter
+    /// is strong evidence the collision never fires; a nonzero value is
+    /// the trigger to scope the structural fix (deferred to its own
+    /// /research — this counter does NOT resolve #1760). Worker-owned,
+    /// single-threaded — plain u64, no atomics (mirrors `create_drops`).
+    nat_reverse_key_collisions: u64,
     /// #965: bucketed timer wheel that mirrors `entries`. Pop one
     /// bucket per tick (1 s) instead of scanning the whole HashMap.
     /// Wheel entries hold `(SessionKey, scheduled_tick)` — NOT the
@@ -196,6 +214,7 @@ impl SessionTable {
             create_drops: 0,
             delta_drops: 0,
             delta_drained: 0,
+            nat_reverse_key_collisions: 0,
             wheel: SessionWheel::new(),
             last_pop_stats: WheelPopStats::default(),
         }
@@ -279,6 +298,14 @@ impl SessionTable {
 
     pub fn max_sessions(&self) -> usize {
         self.max_sessions
+    }
+
+    /// #1760: cumulative NAT reverse-key displacement events on
+    /// `nat_reverse_index` (see the field doc). Published per-worker on
+    /// the ~1 Hz runtime cadence and aggregated into
+    /// `ProcessStatus.nat_reverse_key_collisions` for operators.
+    pub fn nat_reverse_key_collisions(&self) -> u64 {
+        self.nat_reverse_key_collisions
     }
 
     // ── #964 Step 1 internal helpers ─────────────────────────────
@@ -1354,8 +1381,22 @@ impl SessionTable {
                 self.reverse_translated_index.insert(translated, handle);
             }
         } else {
-            self.nat_reverse_index
+            // #1760: detect the NAT reverse-key 1:N collision cheaply.
+            // FxHashMap::insert returns the displaced value, so a
+            // collision is observable with no extra lookup on this
+            // per-packet re-assert path (#1753). A displaced handle that
+            // differs from the one we are installing means a DIFFERENT
+            // session previously owned this reverse key K — the latent
+            // 1:N collision (#1758). Value-guarded removal keeps the
+            // displaced handle near-always live, so this is a near-precise
+            // upper bound on live collisions. See the field doc.
+            let prev = self
+                .nat_reverse_index
                 .insert(reverse_wire_key(key, nat), handle);
+            if matches!(prev, Some(old) if old != handle) {
+                self.nat_reverse_key_collisions =
+                    self.nat_reverse_key_collisions.saturating_add(1);
+            }
             let reverse_canonical = reverse_canonical_key(key, nat);
             if reverse_canonical != *key {
                 self.nat_reverse_index.insert(reverse_canonical, handle);
