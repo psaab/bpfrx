@@ -2220,10 +2220,16 @@ fn reference_refresh_for_ha_transition(
 #[test]
 fn inplace_ha_transition_matches_reference() {
     let key = key_v4();
-    // Plain transition (no index change) + a reindex transition (nat rewrite +
-    // owner_rg change) so both the skip and the reindex branch are covered.
-    for (dec, mut md) in [(decision(), metadata()), (nat_rewrite(), metadata())] {
-        md.owner_rg_id = 2; // differs from baseline owner_rg_id=1 -> reindex
+    // Case 0: identical decision + metadata (owner_rg_id stays 1, nat unchanged)
+    // -> the no-reindex/skip branch. Case 1: nat rewrite + owner_rg 1->2 -> the
+    // reindex branch. Baseline metadata() has owner_rg_id=1, so case 0 must NOT
+    // mutate md (else it would also reindex).
+    let reindex_md = {
+        let mut m = metadata();
+        m.owner_rg_id = 2;
+        m
+    };
+    for (dec, md) in [(decision(), metadata()), (nat_rewrite(), reindex_md)] {
         let (mut ip, mut rf) =
             two_tables_with(&key, decision(), metadata(), SessionOrigin::SyncImport, 1_000);
         let probe_old = reverse_wire_key(&key, NatDecision::default());
