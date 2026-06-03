@@ -37,6 +37,23 @@ pub(in crate::afxdp) fn ensure_cos_interface_runtime(
     if binding.cos.cos_interfaces.contains_key(&egress_ifindex) {
         return true;
     }
+    // #1755: the build/insert tail materialises a ~36 KB `CoSInterfaceRuntime`
+    // by value, which forces a `__rust_probestack` 36 KB-frame loop. With
+    // this `#[inline]` outer fn doing only the two early-exits above, that
+    // probe ran on EVERY ingress packet before the `contains_key` hot exit.
+    // Out-line the cold tail so the 36 KB frame lives only in the callee,
+    // which fires at most once per (binding, egress-ifindex).
+    ensure_cos_interface_runtime_cold(binding, forwarding, egress_ifindex, now_ns)
+}
+
+#[cold]
+#[inline(never)]
+fn ensure_cos_interface_runtime_cold(
+    binding: &mut BindingWorker,
+    forwarding: &ForwardingState,
+    egress_ifindex: i32,
+    now_ns: u64,
+) -> bool {
     let Some(config) = forwarding.cos.interfaces.get(&egress_ifindex) else {
         return false;
     };
@@ -47,19 +64,17 @@ pub(in crate::afxdp) fn ensure_cos_interface_runtime(
     {
         return false;
     }
-    {
-        let mut runtime = build_cos_interface_runtime(config, now_ns);
-        if let Some(iface_fast) = binding.cos.cos_fast_interfaces.get(&egress_ifindex) {
-            apply_cos_queue_flow_fair_promotion(
-                &mut runtime,
-                &iface_fast.queue_fast_path,
-                binding.worker_id,
-            );
-        }
-        binding.cos.cos_interfaces.insert(egress_ifindex, runtime);
-        binding.cos.cos_interface_order.push(egress_ifindex);
-        binding.cos.cos_interface_order.sort_unstable();
+    let mut runtime = build_cos_interface_runtime(config, now_ns);
+    if let Some(iface_fast) = binding.cos.cos_fast_interfaces.get(&egress_ifindex) {
+        apply_cos_queue_flow_fair_promotion(
+            &mut runtime,
+            &iface_fast.queue_fast_path,
+            binding.worker_id,
+        );
     }
+    binding.cos.cos_interfaces.insert(egress_ifindex, runtime);
+    binding.cos.cos_interface_order.push(egress_ifindex);
+    binding.cos.cos_interface_order.sort_unstable();
     true
 }
 
