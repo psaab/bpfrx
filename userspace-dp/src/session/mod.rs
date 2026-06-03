@@ -815,8 +815,8 @@ impl SessionTable {
         // every index (key_to_handle map, slab slot with a NEW handle, all four
         // secondary indices) plus ~3 SessionMetadata clones on EVERY packet of an
         // established flow, only to bump timestamps. We now mutate the slab record
-        // in place, gating value-guarded secondary-index REMOVES on key-relevant
-        // input changes (nat / is_reverse / owner_rg_id) while still re-asserting
+        // in place, gating secondary-index REMOVES on key-relevant input changes
+        // (nat / is_reverse / owner_rg_id) while still re-asserting
         // secondary-index ADDS every refresh (restore_entry parity). Behavior is
         // byte-identical (modulo the opaque slab handle value); see
         // docs/pr/1752-session-inplace-refresh/plan.md.
@@ -852,8 +852,8 @@ impl SessionTable {
             // unconditionally re-asserts the entry's own secondary ADDS. To stay
             // byte-identical (incl. re-winning a displaced secondary-index
             // collision), re-assert the OLD adds before bailing.
-            let reject = new_peer;
-            if reject {
+            let should_reject_update = new_peer;
+            if should_reject_update {
                 self.index_forward_nat_key_parts(
                     key,
                     handle,
