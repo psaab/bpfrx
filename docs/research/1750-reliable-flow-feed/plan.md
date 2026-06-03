@@ -1,10 +1,14 @@
 # #1750 — reliable per-flow 5-tuple feed for the #1748 rebalance controller
 
-- **Status**: PLAN v2 — r1 hostile round folded (Codex PLAN-NEEDS-MAJOR, AGY
-  PLAN-NEEDS-MAJOR, Claude-SMR PLAN-NEEDS-MAJOR self-corrected). v1's
-  "atomic publish" claim was FALSE; a second independent zero-install root
-  cause (slot vs worker_id keying) was missed; §6.3 carry-forward was dead
-  code. All three folded below.
+- **Status**: PLAN v3 — r2 hostile round folded (Codex PLAN-NEEDS-MAJOR, AGY
+  PLAN-NEEDS-MINOR, Claude-SMR PLAN-NEEDS-MINOR — all converge on ONE defect:
+  the `StaleFlowSnapshot` defer was livelock-unsafe). v3 fixes: (1) staleness is
+  now a bounded snapshot-AGE check, never count-vs-rows; (2) cause D is
+  acknowledged as ALREADY FIXED on the branch (re-verify live) — a residual
+  empty candidate set is then necessarily cause C (post-filter loss), diagnosed
+  not deferred; (3) the `flow_worker_map()` consumer-API change is named;
+  (4) worker_id is on `identities (BindingIdentity)`, not live state.
+  r1 folded the 3 MAJORs (atomic-publish false, cause D, dead §6.3).
 - **Issue**: #1750
 - **Mode**: `/research` — stops at PLAN-READY / PLAN-KILL. No PR, no production
   code touched in this skill.
@@ -106,25 +110,24 @@ The controller does NOT read count and rows from one atomic snapshot. It reads:
 Four candidate consumer-side causes (D added in r1):
 
 - **(D) Slot-vs-worker_id keying mismatch (Codex r1 — independent zero-install
-  bug).** `Coordinator::tick_rebalance` iterates `for (&worker_id, live) in
-  &self.workers.live` (`coordinator/rebalance.rs:209`) and labels the key
-  `worker_id` — but `workers.live` is **keyed by `binding.slot`**
-  (`worker_manager.rs:6` doc: "`live` and `identities` are keyed by binding
-  `slot`"; `bringup.rs:47` `coord.workers.live.insert(binding.slot, ...)`). The
-  published flow rows carry the REAL `binding.worker_id`
-  (`debug_state.rs`/`poll_descriptor/mod.rs:434-436`), and `select_move`
-  filters `f.worker_id == hottest.worker_id` (`controller.rs:507-511`). When
-  `slot != worker_id` (shared-UMEM / multi-binding-per-worker configs), the
-  per-worker rate vector is keyed by SLOT while the flow rows are keyed by
-  WORKER_ID → the equality filter yields `candidate_count == 0` →
-  `no_eligible_flow` → zero installs, **independent of any feed-reliability
-  fix.** On the 6-queue/6-worker mlx5 smoke cluster `slot == worker_id` (1:1)
-  is likely, making the bug *latent there* but real elsewhere. The increment
-  MUST make worker-identity keying consistent end-to-end (key the rate vector
-  by the published `worker_id`, OR carry `slot` on the rows and key both by
-  slot — pick ONE and apply it through `WorkerByteRate`, `FlowSample`, and the
-  `select_move` filter). The live trace MUST check the worker-id match, not
-  just row presence.
+  bug; ALREADY FIXED on the branch by the parallel patch).** The bug:
+  `tick_rebalance` formerly iterated `for (&worker_id, live) in
+  &self.workers.live` and labelled the key `worker_id` — but `workers.live` is
+  **keyed by `binding.slot`** (`worker_manager.rs:6` doc; `bringup.rs:47`
+  `live.insert(binding.slot, ...)`), while published rows carry the REAL
+  `binding.worker_id` and `select_move` filters
+  `f.worker_id == hottest.worker_id` (`controller.rs:507-511`). When
+  `slot != worker_id` the rate vector was keyed by SLOT and the rows by
+  WORKER_ID → `candidate_count == 0` → `no_eligible_flow` → zero installs,
+  independent of any feed fix. **The current `engineer/1748-ntuple-rebalance`
+  HEAD already fixes this** (`rebalance.rs:207-256`, comment "#1748 live BUG
+  (r6)"): it joins `live` (slot) → `identities` (slot→`BindingIdentity{
+  worker_id, queue_id, ifindex}`) and keys `WorkerByteRate` by the real
+  `worker_id` (the same id-space the rows use), summing tx_bytes across a
+  worker's bindings. So D is NOT an open blocker — re-verify it live, and note
+  that **after A (bundle) AND D (keying, already done), a still-empty candidate
+  set is necessarily cause C (post-filter loss) and must be diagnosed directly,
+  not papered over by a defer.**
 
 - **(A) Empty-on-first-publish / publish-cadence skew.** The row `ArcSwap`
   starts empty (`umem/mod.rs:636`, `ArcSwap::from_pointee(Vec::new())`) and is
@@ -281,31 +284,39 @@ No re-architecture is warranted; the increment is a feed-reliability fix.
 
 ### Path 1 — Single-snapshot consume + worker-id keying fix + cadence hardening (RECOMMENDED)
 Three parts:
-1. **Bundle count into the row snapshot (fixes the non-atomic dual-publish).**
-   Extend `FlowWorkerMapSnapshot` (`umem/mod.rs:250-255`) to carry the
-   per-binding `active_flow_count` and publish BOTH from the one
-   `active_flow_debug_entries` tuple in the SAME `ArcSwap` store
-   (`debug_state.rs:216-249`). The controller then reads count and rows from one
-   atomic load and never cross-references an out-of-band Prometheus count.
-2. **Fix the slot-vs-worker_id keying (cause D — independent zero-install
-   bug).** Key the controller's per-worker rate vector (`WorkerByteRate`) by the
-   SAME identifier the rows carry. Either (a) carry `worker_id` alongside the
-   `slot` key when building `per_iface_workers` in `tick_rebalance`
-   (`rebalance.rs:209-228`) and filter `f.worker_id == hottest.worker_id` against
-   that, or (b) carry `slot` on the published rows and key the filter by slot.
-   Pick ONE and apply it through `WorkerByteRate`, `FlowSample`, and
-   `select_move`'s filter (`controller.rs:507-511`). Add a unit test with
-   `slot != worker_id`.
-3. **Staleness/first-publish guard.** If a worker's bundled `active_flow_count`
-   > 0 but its row list is empty (stale, pre-first-publish, or one-tick
-   age-out), record a new `SkipReason::StaleFlowSnapshot` and DEFER one tick —
-   do not record terminal `no_eligible_flow`. Keep the worker-rate fallback for
-   magnitude.
-- **Pros:** smallest change set that fixes BOTH the publish skew (A) AND the
-  keying bug (D) — either of which alone keeps installs at 0; uses the
-  proven-reliable scan; no hot-path cost.
-- **Cons:** does not improve heterogeneous selection (still worker-rate
-  estimate). Acceptable for the P12 homogeneous gate; heterogeneous is Path 2.
+1. **Bundle count into the row snapshot + change the consumer API (fixes the
+   non-atomic dual-publish A).** Extend `FlowWorkerMapSnapshot`
+   (`umem/mod.rs:250-255`) to carry the per-binding `active_flow_count` AND a
+   monotonic publish-timestamp (`published_ns`), populated from the one
+   `active_flow_debug_entries` tuple + `now_ns` in the SAME `ArcSwap` store
+   (`debug_state.rs:216-249`). **Then change the consumer API:**
+   `Coordinator::flow_worker_map()` (`status.rs:168`) currently returns
+   `(Vec<rows>, bool)` and the controller reads `let (rows, _truncated) =
+   self.flow_worker_map()` (`rebalance.rs:273`) — NO count at all (Codex r2).
+   Surface the bundled per-(ifindex,worker) count + timestamp to the controller
+   so its decision reads count, rows, and freshness from one atomic load.
+2. **Keying (cause D) — ALREADY FIXED on the branch; keep + test.** The branch
+   already joins `live` (slot) → `identities` (slot→`BindingIdentity{worker_id}`,
+   `types/forwarding.rs:342-348`) and keys `WorkerByteRate` by the real
+   `worker_id` (`rebalance.rs:207-256`). Keep it; add a `slot != worker_id`
+   unit test proving `candidate_count > 0`. (worker_id is on **identities
+   (BindingIdentity)**, NOT `BindingLiveState` — Codex/AGY r2 precision.)
+3. **Bounded snapshot-AGE staleness defer (NOT count-vs-rows — r2 fix).** Both
+   r2 reviewers showed a count-vs-rows guard is broken: after bundling,
+   `count>0 && rows.empty` is impossible for a non-truncated snapshot (same
+   scan), and gating on the *filtered* list LIVELOCKS when a worker carries only
+   non-steerable traffic (ICMP / unsteered ports keep `active_flow_count > 0`
+   forever). So the defer MUST key on SNAPSHOT AGE: if the bundled
+   `published_ns` is older than `N × publish-interval`, record
+   `SkipReason::StaleFlowSnapshot` and defer; after a bounded number of
+   consecutive stale ticks, fall through to a real terminal skip + diagnostic
+   (never defer forever). A *fresh* snapshot with zero steerable candidates is
+   `NoEligibleFlow` (cause C — diagnose the filter, do not defer). Keep the
+   worker-rate fallback for magnitude.
+- **Pros:** smallest change set; (A) bundle + (D, already done) keying together
+  unblock installs; snapshot-age defer is livelock-free; no hot-path cost.
+- **Cons:** does not improve heterogeneous selection (worker-rate estimate).
+  Acceptable for the P12 homogeneous gate; heterogeneous is Path 2.
 
 ### Path 2 — Path 1 + cold-path eviction side-table OR ordinal selection
 Add to Path 1 an accurate per-flow magnitude signal for heterogeneous
@@ -332,40 +343,48 @@ A dedicated hot-path reservoir/sketch of (5-tuple→bytes) per worker.
 Only if the live trace proves the scan itself is unreliable in steady state and
 no cheap carry-forward fixes it. Code analysis makes this improbable.
 
-**Recommendation: Path 1 (all three parts — snapshot-bundle + worker-id keying
-fix + staleness defer) as the blocker-clearing increment. It must fix BOTH the
-non-atomic dual-publish (A) AND the slot/worker_id keying (D); either alone
-keeps installs at 0. Defer Path 2's heterogeneous magnitude work until the live
-trace + a heterogeneous gate prove it needed. Gate the design on a pre-code
-`REBALANCE_FLOW`/`REBALANCE_EVAL` debug-log trace (already on the branch) that
-confirms which of A/B/C/D is the LIVE cause AND checks the worker-id match, not
-just row presence.**
+**Recommendation: Path 1 as the blocker-clearing increment. Part 1 (bundle
+count+timestamp into the snapshot + change the `flow_worker_map()` consumer API)
+fixes the non-atomic dual-publish (A); part 2 (worker-id keying) is ALREADY done
+on the branch — keep + test; part 3 (bounded snapshot-AGE defer) handles
+transient publish lag without livelocking. Run the pre-code
+`REBALANCE_FLOW`/`REBALANCE_EVAL` debug-log trace FIRST to confirm the live
+cause: after A + the existing D fix, if candidates are still empty it is cause C
+(post-filter loss — diagnose the ifindex/parse/proto filter directly, do NOT
+paper over with the defer). Defer Path 2's heterogeneous magnitude work until a
+heterogeneous gate proves it needed.**
 
 ## 6. Concrete design (Path 1; Path 2 deferred unless live trace forces it)
 
-### 6.1 Bundle count into the row snapshot (fix the non-atomic dual-publish)
-- `FlowWorkerMapSnapshot` (`umem/mod.rs:250-255`) gains a per-binding
-  `active_flow_count: u32` field, populated from the same
-  `active_flow_debug_entries` tuple already computed at `debug_state.rs:220`.
-  Zero new scan. Count and rows are then published in ONE `ArcSwap` store, so a
-  reader loads them atomically together — the `AtomicU32`-vs-`ArcSwap` skew
-  (Codex/AGY r1) is structurally gone. (The standalone `active_flow_count`
-  `AtomicU32` can stay for Prometheus, but the controller reads only the bundled
-  snapshot.)
+### 6.1 Bundle count+timestamp into the snapshot + change the consumer API (fix A)
+- `FlowWorkerMapSnapshot` (`umem/mod.rs:250-255`) gains `active_flow_count: u32`
+  and `published_ns: u64`, populated from the one `active_flow_debug_entries`
+  tuple + `now_ns` at `debug_state.rs:220`. Zero new scan. Count, rows, and
+  timestamp publish in ONE `ArcSwap` store → a reader loads them atomically
+  (the `AtomicU32`-vs-`ArcSwap` skew is structurally gone). The standalone
+  `active_flow_count` `AtomicU32` stays for Prometheus; the controller reads
+  ONLY the bundled snapshot.
+- **Consumer API (Codex r2):** `Coordinator::flow_worker_map()`
+  (`status.rs:168`) returns `(Vec<rows>, bool)` today and `rebalance.rs:273`
+  reads `let (rows, _truncated) = self.flow_worker_map()` — NO count. Change it
+  to surface the bundled per-(ifindex,worker) count + `published_ns` so the
+  controller's decision uses them.
 
-### 6.2 Fix worker-identity keying + staleness defer (`rebalance.rs` / `controller.rs`)
-- **Keying (cause D):** key `WorkerByteRate` by the SAME identifier the rows
-  carry. `tick_rebalance` (`rebalance.rs:209-228`) currently labels the
-  `workers.live` SLOT key as `worker_id`; carry the binding's real `worker_id`
-  onto `WorkerByteRate` (it is available on the live state /
-  identities) and filter `f.worker_id == hottest.worker_id`
-  (`controller.rs:507-511`) against that. Add a unit test with
-  `slot != worker_id` proving `candidate_count > 0`.
-- **Staleness defer (causes A/B-age-out):** when the hottest worker has zero
-  candidate rows but its bundled `active_flow_count > 0`, record a new
-  `SkipReason::StaleFlowSnapshot` (additive label, matches the
-  `no_eligible_flow` precedent) and DEFER one tick — not terminal
-  `NoEligibleFlow`. `NoEligibleFlow` then means a genuine "no movable flow".
+### 6.2 Keying (kept) + bounded snapshot-AGE staleness defer
+- **Keying (cause D — ALREADY on the branch):** `tick_rebalance`
+  (`rebalance.rs:207-256`) joins `live` (slot) → `identities`
+  (slot→`BindingIdentity{worker_id}`, `types/forwarding.rs:342-348`) and keys
+  `WorkerByteRate` by the real `worker_id`. Keep it; add a `slot != worker_id`
+  unit test proving `candidate_count > 0`. (worker_id is on **identities
+  (BindingIdentity)**, not `BindingLiveState`.)
+- **Bounded snapshot-AGE defer (r2 — NOT count-vs-rows):** if the hottest
+  worker's bundled `published_ns` is older than `N × publish-interval`, record
+  `SkipReason::StaleFlowSnapshot` and defer; cap consecutive stale defers (e.g.
+  ≤ a few ticks) then fall through to a real terminal skip + diagnostic — never
+  defer forever (avoids the livelock both r2 reviewers flagged on non-steerable
+  traffic). A FRESH snapshot with zero steerable candidates is `NoEligibleFlow`
+  = cause C (post-filter loss); diagnose the ifindex/parse/proto filter
+  directly, do NOT defer.
 - Keep the worker-rate fallback for magnitude (already present).
 
 ### 6.3 (Path 2, deferred) cold-path eviction side-table for per-flow magnitude
@@ -391,7 +410,10 @@ catch these (behavioral/runtime)." So the increment MUST land with:
   set. The snapshot `active_flow_count` field already exists for the harness
   (#1219/#1294); reusing it is additive.
 - New `SkipReason::StaleFlowSnapshot` is an additive metric label
-  (matches the `no_eligible_flow` precedent, commit `b219d1280`).
+  (matches the `no_eligible_flow` precedent, commit `b219d1280`); it fires on
+  snapshot-AGE staleness and is bounded so it cannot mask a persistent skip.
+- `flow_worker_map()` return type changes (rows-only → bundled count+timestamp)
+  — internal `pub(crate)` API; the controller is the only consumer.
 - No hot-path cost added; the optional side-table (Path 2) is cold-path only.
 
 ## 8. Hidden invariants to preserve
@@ -422,9 +444,10 @@ catch these (behavioral/runtime)." So the increment MUST land with:
   -p5210, capture `REBALANCE_FLOW`/`REBALANCE_EVAL`; record which of A/B/C/D is
   live AND verify the row `worker_id` matches the rate vector's key (cause D).
   This selects whether Path 1 alone suffices or Path 2 is needed.
-- Unit: `stale_snapshot_defers_not_no_eligible_flow`;
-  `slot_ne_worker_id_still_selects` (cause D regression);
-  count/rows single-snapshot consistency; (if Path 2)
+- Unit: `stale_snapshot_age_defers_then_falls_through_bounded` (defer is
+  bounded, no livelock); `fresh_snapshot_zero_candidates_is_no_eligible_flow`
+  (cause C is NOT deferred); `slot_ne_worker_id_still_selects` (cause D
+  regression); count/rows single-snapshot consistency; (if Path 2)
   `observed_bytes_survives_eviction_via_sidetable`.
 - cargo build + full suite + 5× flake of controller tests; go suite (label).
 - **Live CoV gate (acceptance):** enable knob, P12 -p5210, installs_total > 0,
