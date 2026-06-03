@@ -1,6 +1,45 @@
 # #1760 — NAT reverse-key 1:N collision telemetry counter
 
-**Status: DRAFT v1 — pending adversarial plan review (Codex + Gemini + Claude SMR)**
+**Status: PLAN-READY v2 — Codex r1 PLAN-NEEDS-MINOR (3 findings folded), Gemini
+r1 PLAN-READY, Claude SMR concur. No architectural objection; counter is scoped
+observability, #1760 stays OPEN.**
+
+> v2 changelog (folds Codex r1 minors):
+> - **Stale line numbers corrected.** The instrumentation site is the
+>   `nat_reverse_index.insert(reverse_wire_key(...), handle)` at
+>   `session/mod.rs:1357-1358` inside `index_forward_nat_key_parts`
+>   (`:1343`), reached via `index_forward_nat_key` (`:1322`). (Plan v1
+>   cited the pre-split `:1217`.) Sibling inserts:
+>   `reverse_translated_index` `:1354`, `reverse_canonical` `:1361`,
+>   `forward_wire_index` `:1365`.
+> - **Added the missing Rust plumbing hop.** `WorkerRuntimeStatus` is
+>   constructed in `afxdp/coordinator/status.rs:372` from
+>   `runtime_atomics.snapshot()` (`:262`), beside
+>   `session_table_entries: s.session_table_entries` (`:385`). The new
+>   field MUST be wired there or the wire value stays 0.
+> - **Metric semantics sharpened.** The counter measures *displacement
+>   events* (a `nat_reverse_index` insert displaced a different handle),
+>   NOT distinct colliding flow-pairs nor unique keys. One colliding
+>   active pair can increment repeatedly as packets alternate across the
+>   per-packet re-assert. This is still the right "does it happen / is
+>   arbitration hot" signal (a 0 is strong evidence the collision never
+>   fires); a nonzero value triggers the structural-fix research, it is
+>   not an exact live-pair count.
+>
+> Reviewer convergence on the open questions: Codex + Gemini agree
+> `nat_reverse_index` is the correct *single* site (the four NAT vectors
+> all collide on the reverse-wire tuple; `forward_wire`/`reverse_canonical`
+> would double-count or use original endpoints; `key_to_handle` reverse-
+> companion collision is coupled to the same event and only warranted as a
+> separate "reverse companion eviction" metric, deferred). Gemini argues
+> the value-guarded removal (`remove_forward_nat_index`) makes the proxy a
+> near-precise live-displacement count (a displaced `old` is guaranteed to
+> be a session that did not value-guard-remove its own key); Claude SMR
+> concurs it is substantially de-noised but keeps the honest "displacement
+> events / upper bound" label (residual noise: a failed-guard GC removal or
+> an HA bulk-sync `upsert_synced` displacement). Both: no measurable hot-
+> path cost, no borrow hazard, serde parity correct, not an architectural
+> smuggle.
 
 ## 1. Issue framing
 
@@ -68,18 +107,18 @@ actionable), PLAN-KILL is an acceptable verdict.*
 
 ## 4. The defect-observable site (code walk)
 
-`index_forward_nat_key` → `index_forward_nat_key_parts`
-(`session/mod.rs:1204-1234`) is the single choke point where every
-forward-entry secondary index insert happens. For a non-reverse entry it
-does up to three inserts into single-valued maps:
+`index_forward_nat_key` (`session/mod.rs:1322`) →
+`index_forward_nat_key_parts` (`:1343`) is the single choke point where
+every forward-entry secondary index insert happens. For a non-reverse
+entry it does up to three inserts into single-valued maps:
 
 ```rust
-self.nat_reverse_index.insert(reverse_wire_key(key, decision.nat), handle); // :1217
-// reverse_canonical (when != key)                                          // :1221
-// forward_wire (when != key) -> forward_wire_index                         // :1225
+self.nat_reverse_index.insert(reverse_wire_key(key, nat), handle);        // :1357-1358 (THE site)
+// reverse_canonical (when != key) -> nat_reverse_index                    // :1361
+// forward_wire (when != key) -> forward_wire_index                        // :1365
 ```
 
-For a reverse entry it inserts into `reverse_translated_index` (`:1214`).
+For a reverse entry it inserts into `reverse_translated_index` (`:1354`).
 
 The 1:N collision per #1758 §4/§4a manifests at **`nat_reverse_index`**
 (the reverse_wire_key insert at `:1217` — this is THE site the four NAT
@@ -96,13 +135,13 @@ and/or `key_to_handle`.
 ### 5.1 Detection — cheap-proxy upper bound (default)
 
 `HashMap::insert` returns the previously-stored value. Replace the bare
-insert at `index_forward_nat_key_parts:1217` with a displaced-handle
+insert at `index_forward_nat_key_parts:1357-1358` with a displaced-handle
 check:
 
 ```rust
 let prev = self
     .nat_reverse_index
-    .insert(reverse_wire_key(key, decision.nat), handle);
+    .insert(reverse_wire_key(key, nat), handle);
 if matches!(prev, Some(old) if old != handle) {
     self.nat_reverse_key_collisions =
         self.nat_reverse_key_collisions.saturating_add(1);
@@ -111,16 +150,21 @@ if matches!(prev, Some(old) if old != handle) {
 
 Zero extra lookup; the displaced value is already returned by `insert`.
 
-**This is an UPPER BOUND on true live collisions.** It also counts benign
-stale-handle overwrites — e.g. a freed-then-reused session whose old
-handle still lingered in the index, or a re-assert that re-wins `K` after
-a transient displacement. The counter therefore answers "how often does a
-*different* handle occupy `K` at insert time" — which is a strict
-superset of "two live sessions share `K`". This is documented as the
-counter's semantics (§5.4) and is the right first signal: a counter that
-stays at 0 in production proves the collision never fires; a nonzero
-counter is the trigger to invest in the precise structural fix. (Per
-#1758 Claude-SMR rec 3 and the issue's "cheap proxy preferred default".)
+**This counts DISPLACEMENT EVENTS — an upper bound on distinct live 1:N
+collisions, but a near-precise one** (Gemini r1). Because removal is
+value-guarded (`remove_forward_nat_index`: a session only deletes `K` if
+`nat_reverse_index[K] == its own handle`), a displaced `old != handle`
+almost always means `old` is a *live* session that was just out-arbitrated
+— a real collision. Residual noise (why "upper bound", Claude SMR): a GC
+removal that failed its stale-handle guard, or an HA bulk-sync
+`upsert_synced` displacement, can also increment. It is NOT a count of
+distinct colliding flow-pairs nor unique keys — one colliding active pair
+increments repeatedly as packets alternate across the per-packet
+re-assert (Codex r1 finding #2). It is exactly the right first signal: a
+counter that stays at 0 in production is strong evidence the collision
+never fires; a nonzero counter triggers the precise structural-fix
+research. (Per #1758 Claude-SMR rec 3 and the issue's "cheap proxy
+preferred default".)
 
 ### 5.2 Precise variant (NOT chosen unless reviewers argue otherwise)
 
@@ -163,27 +207,35 @@ pub fn nat_reverse_key_collisions(&self) -> u64 {
 3. **WorkerRuntimeAtomics** (`worker_runtime.rs:112+`): add
    `pub nat_reverse_key_collisions: AtomicU64,`, init `::new(0)`,
    `store(..., Relaxed)` in `publish` (~:215), `load(Relaxed)` in
-   snapshot (~:284). Cumulative counter → simple Relaxed (matches
+   `snapshot` (~:284). Cumulative counter → simple Relaxed (matches
    `session_table_entries`, NOT the seqlock window tuple).
-4. **WorkerRuntimeStatus (Rust)** (`protocol/binding.rs:49+`):
+4. **Coordinator status build** (`afxdp/coordinator/status.rs:372`,
+   Codex r1 finding #1): the `WorkerRuntimeStatus` is constructed here
+   from `let s = runtime_atomics.snapshot()` (`:262`); add
+   `nat_reverse_key_collisions: s.nat_reverse_key_collisions,` beside
+   `session_table_entries: s.session_table_entries` (`:385`). Without
+   this hop the wire field stays 0.
+5. **WorkerRuntimeStatus (Rust)** (`protocol/binding.rs:49+`):
    `#[serde(rename = "nat_reverse_key_collisions", default)] pub nat_reverse_key_collisions: u64,`
-5. **WorkerRuntimeStatus (Go)** (`protocol.go:870+`):
+6. **WorkerRuntimeStatus (Go)** (`protocol.go:870+`):
    `NatReverseKeyCollisions uint64 \`json:"nat_reverse_key_collisions,omitempty"\``
-6. **Top-level ProcessStatus aggregation (Rust)** (`server/helpers.rs:48`):
+7. **Top-level ProcessStatus aggregation (Rust)** (`server/helpers.rs:48`):
    sum across `worker_runtime` like `session_table_entries`:
    `state.status.nat_reverse_key_collisions = worker_runtime.iter().map(|w| w.nat_reverse_key_collisions).sum();`
-   Field added to `control.rs` ProcessStatus (`#[serde(rename = ...)]`)
-   and to lifecycle default init (`server/lifecycle.rs:96` neighborhood).
-7. **Top-level ProcessStatus (Go)** (`protocol.go:561+`):
+   Field added to `control.rs` ProcessStatus (`#[serde(rename = ...)]`,
+   ~:62) and to lifecycle default init (`server/lifecycle.rs:96`
+   neighborhood).
+8. **Top-level ProcessStatus (Go)** (`protocol.go:561+`):
    `NatReverseKeyCollisions uint64 \`json:"nat_reverse_key_collisions,omitempty"\``
-8. **Prometheus** (`pkg/api`): add descriptor
+9. **Prometheus** (`pkg/api`): add descriptor
    `xpf_userspace_session_nat_reverse_key_collisions_total`
    (CounterValue, top-level aggregate) in `metrics_descriptors.go` +
    `metrics.go` field + `Describe` + emit in
    `metrics_userspace.go`. Per-worker label variant
    `xpf_userspace_worker_session_nat_reverse_key_collisions_total`
    alongside the per-worker `workerSessionTableEntries` emit (~:533).
-9. **`show system buffers`** (`buffersfmt.go`): add label
+   Update `metrics_descriptor_coverage_test.go` + `metrics_test.go`.
+10. **`show system buffers`** (`buffersfmt.go`): add label
    `systemBufferLabelNatReverseKeyCollisions = "NAT reverse-key collisions"`
    and `appendCounter(systemBufferLabelNatReverseKeyCollisions, "aggregate", status.NatReverseKeyCollisions)`
    in `systemBufferCounterRows` (counter only — no capacity denominator,
