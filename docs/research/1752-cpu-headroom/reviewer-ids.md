@@ -8,3 +8,8 @@ Branch: research/cpu-headroom-p48-cpu-headroom
 - AGY:   adversarial-review-mpy7jkm4-u5zbaj
 - Claude SMR: docs/research/1752-cpu-headroom/claude-smr-plan-r1.md
 - Copilot: N/A in /research (joins at /engineer)
+
+## Round 2 @ decbf7a91
+- Codex: task-mpy7w99t-nhgkoj
+- AGY:   adversarial-review-mpy7w9jt-assa1o
+- Claude SMR: claude-smr-plan-r2.md (PLAN-READY)
