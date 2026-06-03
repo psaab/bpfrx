@@ -1,6 +1,6 @@
 # #1752 remaining paths — B / A / C-D / E-follow-up
 
-**Status: v2 — folds Codex r1 (PLAN-NEEDS-MAJOR) + AGY r1 (PLAN-NEEDS-MAJOR). Re-dispatched for r2.**
+**Status: v3 — folds Codex r2 (PLAN-NEEDS-MINOR, B wording/TX-vs-RX) + AGY r2 (E-followup self-reversal → recast as collision-reachability correctness investigation; C 16.7% bar). Re-dispatched for r3.**
 
 v2 changes after live verification:
 - **Path B is NOT killed — it is RE-SCOPED.** The "crypto DEK churn" is a perf
@@ -41,17 +41,24 @@ static/unexported → its samples misattribute to the crypto symbols. The kick i
 already gated by `needs_wakeup()` (rings.rs:142-145) + `TX_WAKE_MIN_INTERVAL_NS
 = 50_000` (mod.rs:302); RX-wake also uses `sendto` (rings.rs:182-198).
 
-**Lever (real, recoverable):** widen the wake interval / batch more TX before
-kicking, cutting the ~108K sendto/s. **Tradeoff:** higher TX latency + ring
-backpressure risk — so the win is not free and may be modest.
+**Lever (candidate):** the wake path is a **verified participant** in the
+misattributed bucket and a **leading candidate** for recoverable CPU, but the
+evidence is count-based (`sendto`/`xsk_sendmsg` ~108–110K/s) — it does **not**
+yet prove the whole ~5.5% is wake-path *time*; `mlx5e_xsk_wakeup` itself is only
+~15.5K/s (Codex r2). **Recoverable fraction = TBD.** Widening the wake interval /
+batching cuts the *TX* kick rate, at a TX-latency + ring-backpressure tradeoff.
 
-**Action:** own `/research` for Path B. It must (a) attribute what fraction of
-the misattributed bucket is the wake path vs other unexported mlx5 datapath
-(perf `--kallsyms` / a debug uncompressed module, or kprobe-time accounting),
-(b) propose a wake-interval/batch change, (c) A/B `TX_WAKE_MIN_INTERVAL_NS`
-(e.g. 50µs → 100–200µs) measuring CPU **and** TX latency + throughput + retrans,
-(d) carry a no-win PLAN-KILL exit if widening the interval doesn't net-recover
-CPU without latency regression.
+**Action:** own `/research` for Path B. **Step 1 (mandatory): TX-vs-RX per-site
+attribution.** `TX_WAKE_MIN_INTERVAL_NS` only gates the **TX** kick (rings.rs:237);
+**RX-wake** independently does `poll` + `sendto` (rings.rs:154,187), so the ~108K
+sendto/s is TX+RX combined and TX-interval tuning attacks only part of it. Attribute
+the misattributed CPU bucket to TX-kick vs RX-wake vs genuinely-inherent unexported
+datapath (kprobe-time accounting / an uncompressed debug `mlx5_core.ko`) BEFORE
+proposing a change. Then (b) propose a wake-interval/batch change scoped to the
+site that actually dominates, (c) A/B it (e.g. `TX_WAKE_MIN_INTERVAL_NS` 50µs →
+100–200µs) measuring CPU **and** TX latency + throughput + retrans, (d) no-win
+PLAN-KILL exit if it doesn't net-recover CPU without a latency/backpressure
+regression (50µs may already be near-optimal).
 
 ## 3. PATH A — CoS hot-path CPU reduction (~19%): defer to its own gated /research
 
@@ -92,23 +99,44 @@ not a free win, on a box where workers are the throughput unit.
 
 - **Action C:** own small `/research` + A/B (5 workers on clean cores + Go on
   core 0 vs 6 shared workers) measuring aggregate throughput + jitter/RX drops.
+  **High bar (AGY r2):** 6→5 workers is a ~16.7% raw packet-processing capacity
+  cut; the Go-GC preemption jitter/drops must be proven to cost *more* than that
+  16.7% before this nets out positive on a worker-bound box. Likely a net loss
+  unless GC preemption is severe — the A/B must clear that bar or PLAN-KILL.
 - **Action D:** docs-only PR — make the 6/6 = no-headroom sizing explicit
   (existing `docs/userspace-dataplane-architecture.md` already states the
   6-workers-plus-headroom target; extend it). Not "no review" — a sizing/perf doc
   gets a normal doc review, just not the full Codex+Gemini+smoke gauntlet.
 
-## 5. PATH E follow-up — KILL (full skip of the secondary re-assert, ~1%)
+## 5. PATH E follow-up — RE-SCOPE to a collision-reachability *correctness* investigation (not a perf opt)
 
-AGY's argument (accepted): the re-assert inserts exist because
-`restore_entry`/`index_forward_nat_key` unconditionally re-assert; if transient
-NAT-port reuse can place a colliding live session before the prior session's GC
-window closes, the re-assert is **structurally necessary** for conntrack
-correctness — so the ~1% is NOT spurious. Optimizing it away risks
-mis-routed/poisoned reverse lookups. The uniqueness-proof + fuzz-test burden far
-exceeds ~1% on a CPU-bound box.
+AGY argued **both sides** across rounds, which is the tell that this is subtle:
+- r1: the re-assert is *structurally necessary* → KILL the followup.
+- r2: the re-assert *causes NAT corruption* under collision → resurrect it as a
+  fix. AGY r2's worked trace: S1 owns secondary key K; S2 (port reuse) overwrites
+  K→S2; S1 refresh **re-asserts** K→S1 (hijacks S2); S1 later expires and its
+  value-guarded removal (now sees K→S1) **deletes K**, permanently breaking S2's
+  reverse path. Without the re-assert, K stays →S2 and S1's removal skips it
+  (value-guard mismatch) → S2 survives.
 
-**Action:** PLAN-KILL the E follow-up. Path E as shipped (with the re-assert
-retained) is the correct terminal state.
+**Both hinge on one unproven fact: can two *live* sessions derive the same
+secondary key K?** If the NAT allocator guarantees unique external tuples among
+live sessions (and identity-reverse is bijective), the collision is **unreachable**
+and re-assert vs not is behaviorally identical → the followup is the original pure
+~1% perf (low value, defer/kill). If the collision **is** reachable (transient
+port reuse before the prior session's GC), AGY r2's trace makes the re-assert a
+**latent NAT-corruption bug** — and note this behavior is **pre-existing**: #1753
+Path E preserved the old remove+restore re-assert byte-identically (all 4
+reviewers verified parity), so it neither introduced nor fixed it.
+
+**Action:** own `/research` framed as **correctness-first, not perf**. Step 1:
+prove or disprove collision reachability (read the NAT allocator's
+external-tuple-uniqueness + liveness-before-reuse logic + the GC window vs
+refresh cadence). Then: if **unreachable** → followup is pure ~1% perf, PLAN-KILL
+or defer; if **reachable** → it is a bug fix (remove the re-assert) with a repro
+test demonstrating the S2-reverse-path deletion, prioritized above the perf
+framing. Do NOT pre-commit to kill or resurrect — the reachability analysis
+decides.
 
 ## 6. Honest scope/value framing
 
@@ -128,7 +156,7 @@ net-recover CPU without a throughput/latency regression, killing them here
 | A | own /research | HIGH — CoS architectural; #1207/#1545 kill pattern |
 | C | own /research (A/B) | MED — loses a worker core; may not net-win |
 | D | docs PR | LOW |
-| E-follow-up | KILL | n/a |
+| E-follow-up | own /research (correctness-first) | reachability decides: unreachable→pure ~1% perf (defer/kill); reachable→latent NAT-corruption bug fix |
 
 ## 8. Test/validation plan
 
@@ -158,6 +186,8 @@ net-recover CPU without a throughput/latency regression, killing them here
 4. **Path A:** are AGY's sub-levers (flow-hash caching, descriptor-indexed
    queuing) actually safe given the CoS fairness invariants, or do they perturb
    the exact-guarantee/vtime semantics (the #1207/#1545 trap)?
-5. **Path E-follow-up KILL:** is the "re-assert is structurally necessary"
-   correctness argument airtight, or is there a provable uniqueness invariant that
-   would make the ~1% genuinely recoverable (→ defer not kill)?
+5. **Path E-follow-up:** AGY flipped (r1 "necessary" → r2 "causes corruption").
+   Is the collision (two live sessions, same secondary key) REACHABLE given the
+   NAT allocator's external-tuple uniqueness + liveness-before-reuse + the GC
+   window? If unreachable, re-assert is harmless (pure ~1% perf); if reachable,
+   AGY r2's NAT-corruption trace makes removing it a bug fix. Which is it?
