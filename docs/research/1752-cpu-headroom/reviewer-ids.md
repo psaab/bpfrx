@@ -10,6 +10,6 @@ Branch: research/cpu-headroom-p48-cpu-headroom
 - Copilot: N/A in /research (joins at /engineer)
 
 ## Round 2 @ decbf7a91
-- Codex: task-mpy7w99t-nhgkoj
+- Codex: task-mpy7w99t-nhgkoj (session lost) -> re-dispatched task-mpy82huy-uql811
 - AGY:   adversarial-review-mpy7w9jt-assa1o
 - Claude SMR: claude-smr-plan-r2.md (PLAN-READY)
