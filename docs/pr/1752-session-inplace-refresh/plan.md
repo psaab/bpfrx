@@ -1,6 +1,15 @@
 # #1752 Path E — session refresh in-place mutation
 
-**Status: DRAFT v1 — pending adversarial plan review (Codex + Gemini)**
+**Status: v2 — folds Codex r1 (PLAN-NEEDS-MAJOR) + Gemini r1 (PLAN-NEEDS-MINOR). Re-dispatched.**
+
+v2 changes: (a) secondary-index **adds are always re-asserted** (matches today's
+unconditional `index_forward_nat_key` insert exactly, incl. the
+collision-displacement re-win case Codex flagged) — only the value-guarded
+*removes* are gated on `reindex`; (b) restore the stale-handle + primary-key
+guard (`entries.get` + `record.key == *key`, return false) that v1's pseudocode
+dropped; (c) private index helpers take `NatDecision`/`is_reverse`/owner fields
+directly (no metadata shim); (d) expanded differential + collision + randomized
+test plan; (e) honest value revised to ~3–3.5% (re-assert retained).
 
 Implements Path E from the converged research plan
 (`docs/research/1752-cpu-headroom/plan.md`, PLAN-READY @ 0fdda93f0): eliminate
@@ -44,12 +53,17 @@ identical → **zero index operations**.
 
 ## 3. Honest scope/value framing
 
-Target ~4.5% CPU on the saturated 6/6 cluster — directly recoverable, isolated
-to one function, no architectural premise. Secondary win: removes ~3
-`SessionMetadata` clones per refresh and the per-call `no_index_points_at` debug
-scan. *If reviewers conclude the perf gain is too small to justify the churn, or
-that the in-place reindex predicate cannot be made provably complete, PLAN-KILL
-is an acceptable verdict.*
+Target **~3–3.5% CPU** on the saturated 6/6 cluster (revised down from a naive
+~4.5%: v2 retains the 4 secondary-index re-assert inserts for exact-parity, so
+the win is the eliminated slab remove+insert (the measured 1.72% `insert` + the
+slab part of `remove_entry`'s 2.73%), the `key_to_handle` remove+insert, 2 of 3
+`SessionMetadata` clones, the value-guarded *removes* on the hot path, and the
+`no_index_points_at` debug scan). Isolated to one function, no architectural
+premise. *If reviewers conclude the perf gain is too small to justify the churn,
+or that the in-place change cannot preserve secondary-index semantics exactly,
+PLAN-KILL is an acceptable verdict.* (Full skip of the re-assert inserts — the
+remaining ~1% — is an explicit out-of-scope follow-up gated on a proven
+secondary-key uniqueness invariant + property test; see §10/§11.)
 
 ## 4. What's already shipped
 
@@ -68,16 +82,22 @@ pub fn update_session(&mut self, req: SessionUpdate<'_>, ha_activation: bool) ->
     let SessionUpdate { key, decision, metadata, origin, now_ns, protocol, tcp_flags } = req;
     let Some(&handle) = self.key_to_handle.get(key) else { return false };
 
-    // Snapshot the index-relevant + collision-relevant OLD state (all Copy
-    // except we avoid cloning metadata on the hot path).
-    let (old_origin, old_nat, old_is_reverse, old_owner_rg) = {
-        let r = &self.entries[handle as usize];
-        (r.entry.origin, r.entry.decision.nat, r.entry.metadata.is_reverse,
-         r.entry.metadata.owner_rg_id)
-    };
+    // STALE-HANDLE + PRIMARY-KEY GUARD (parity with remove_entry:1127/1144 and
+    // record_by_key_mut:314): never index the slab raw — a stale key_to_handle
+    // could point at a vacant or reused slot.
+    let Some(record) = self.entries.get(handle as usize) else { return false };
+    if record.key != *key { return false; }
 
-    // Collision rules — IDENTICAL to current semantics, but reject is now a
-    // pure early return (no remove+restore round-trip).
+    // Snapshot OLD index-relevant + collision-relevant state (all Copy).
+    let old_origin = record.entry.origin;
+    let old_nat = record.entry.decision.nat;
+    let old_is_reverse = record.entry.metadata.is_reverse;
+    let old_owner_rg = record.entry.metadata.owner_rg_id;
+    // (immutable borrow of `record` ends here)
+
+    // Collision rules — IDENTICAL to current semantics; reject is now a pure
+    // early return (today's reject does remove_entry then restore_entry then
+    // returns false → net-state-neutral, confirmed by both reviewers).
     if !ha_activation {
         let new_peer = origin.is_peer_synced();
         if old_origin.is_peer_synced() && !new_peer { /* promote: allow */ }
@@ -86,22 +106,22 @@ pub fn update_session(&mut self, req: SessionUpdate<'_>, ha_activation: bool) ->
         // both local: allow
     }
 
-    // Reindex predicate — complete per §2 (key + handle invariant).
+    // Reindex predicate — complete per §2 (key + handle invariant). Gates only
+    // the value-guarded REMOVES of the OLD secondary keys.
     let reindex = old_nat != decision.nat
         || old_is_reverse != metadata.is_reverse
         || old_owner_rg != metadata.owner_rg_id;
 
     if reindex {
-        // Tear down OLD secondary indices (value-guarded; key + handle same).
-        // Need an old-metadata shim carrying is_reverse + owner_rg_id; build a
-        // minimal one or pass fields. (impl detail: small owned snapshot.)
-        self.remove_forward_nat_index(key, handle, old_decision, &old_md_shim);
+        // Tear down OLD secondary keys. Helpers take the OLD nat/is_reverse/
+        // owner fields directly (no metadata shim, no clone).
+        self.remove_forward_nat_index_parts(key, handle, old_nat, old_is_reverse);
         remove_owner_rg_index_entry(&mut self.owner_rg_sessions, old_owner_rg, handle);
     }
 
     let epoch = self.next_epoch();
     {
-        let r = &mut self.entries[handle as usize];   // get_mut, scoped
+        let r = self.entries.get_mut(handle as usize).expect("handle validated above");
         r.entry.decision = decision;
         r.entry.metadata = metadata.clone();           // single clone (parity)
         r.entry.origin = origin;
@@ -109,10 +129,17 @@ pub fn update_session(&mut self, req: SessionUpdate<'_>, ha_activation: bool) ->
         r.entry.last_seen_ns = now_ns;
         r.entry.expires_after_ns = session_timeout_ns(protocol, tcp_flags, &self.timeouts);
         r.entry.closing = matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN|TCP_RST)) != 0;
+        // entry.wheel_tick deliberately preserved (parity with restore_entry).
     }
-    if reindex {
-        self.index_forward_nat_key(key, handle, decision, &metadata);
-    }
+
+    // ALWAYS re-assert the secondary ADDS — byte-identical to today's
+    // unconditional index_forward_nat_key insert in restore_entry. For the
+    // no-reindex case the keys are unchanged so this re-inserts key→same handle
+    // (idempotent when unique; re-wins when a collision displaced us — exactly
+    // today's behavior). For the reindex case it installs the NEW keys after the
+    // removes above. This is what preserves the unconditional-insert /
+    // value-guarded-remove collision semantics Codex flagged.
+    self.index_forward_nat_key(key, handle, decision, &metadata);
 
     self.push_to_wheel(key, now_ns);
     if old_origin.is_peer_synced() && !origin.is_peer_synced() && !metadata.is_reverse {
@@ -122,13 +149,15 @@ pub fn update_session(&mut self, req: SessionUpdate<'_>, ha_activation: bool) ->
 }
 ```
 
-Borrow shape: `next_epoch`/`remove_*`/`index_*`/`push_*` all take `&mut self`;
-the `get_mut` borrow is scoped to the field-write block so it never overlaps
-them. The old-decision/old-metadata snapshot for the reindex-teardown is taken
-*before* the field write (impl: capture `old_decision` = `r.entry.decision` and
-an owned `SessionMetadata` shim with old `is_reverse`/`owner_rg_id` in the
-snapshot block; only built when `reindex` is true to keep the hot path
-clone-free).
+Borrow shape (confirmed feasible by both reviewers): the immutable `get`
+snapshot drops before any `&mut self` call; `next_epoch`/`remove_*`/`index_*`/
+`push_*` take `&mut self`; the `get_mut` borrow is scoped to the field-write
+block. Zero clones on the hot path beyond the single mandatory
+`metadata.clone()` into the entry. **Impl note:** add a private
+`remove_forward_nat_index_parts(key, handle, nat, is_reverse)` (the existing
+`remove_forward_nat_index` re-derived these from a `&SessionMetadata`; the new
+variant takes the parts so the reindex teardown needs no old-metadata shim).
+`refresh_for_ha_transition` (:918) gets the identical treatment.
 
 `refresh_for_ha_transition` (:918) gets the same treatment (it also removes +
 restores, no collision rules, never changes nat/owner_rg in practice but apply
@@ -147,9 +176,16 @@ No public signature changes. `update_session`, `refresh_local`,
    peer→peer reject; local←peer reject; local→local refresh) must behave
    identically. In-place makes reject a no-op early return — observably
    identical to remove+restore-then-return-false (net state unchanged).
-2. **Index completeness**: reindex predicate must catch every case where a
-   secondary-index key changes. Proven by §2 (indices depend only on key+nat+
-   is_reverse+owner_rg; key & handle invariant). **This is the #1 review target.**
+2. **Index semantics (v2)**: secondary ADDS are always re-asserted (parity with
+   today's unconditional `index_forward_nat_key`), so the unconditional-insert /
+   value-guarded-remove collision behavior is preserved exactly even if two live
+   sessions transiently derive the same secondary key. The `reindex` predicate
+   gates only the value-guarded REMOVES of the OLD keys; it is complete per §2
+   (indices depend only on key+nat+is_reverse+owner_rg; key & handle invariant).
+   **This is the #1 review target.**
+2b. **Stale-handle / primary-key guard**: `entries.get(handle)` + `record.key ==
+   *key` before any mutation; mismatch → return false (no-op), matching
+   `remove_entry`'s release-mode guards. Never `entries[handle]` (panic/corrupt).
 3. **Wheel**: `push_to_wheel(key, now_ns)` unchanged; entry's `wheel_tick`
    field is preserved across in-place mutation (we do NOT reset it to 0, unlike
    install which sets wheel_tick:0). Current remove+restore preserves wheel_tick
@@ -175,13 +211,25 @@ No public signature changes. `update_session`, `refresh_local`,
 ## 9. Test plan
 
 - `cargo build` + full `cargo test --release` (1763+ lib tests) clean.
-- **Differential test (new, the gate)**: for each branch (local refresh, peer→
-  local promote, peer→peer reject, local←peer reject, ha_activation, nat change,
-  owner_rg change, is_reverse entry), assert the in-place result is
-  byte-identical (entry fields + all four index maps + key_to_handle + deltas) to
-  the old remove+restore implementation. Implement by keeping a reference
-  remove+restore helper in the test module and comparing table snapshots.
-- 5×flake on the differential test + the heaviest existing session test.
+- **Differential test (new, the gate)**: keep a reference remove+restore helper
+  in the test module; assert the in-place result is byte-identical (entry fields
+  + all four index maps + `key_to_handle` + `owner_rg_sessions` + deltas + wheel
+  state) to the reference across ALL of:
+  - local refresh, peer→local promote, peer→peer reject, local←peer reject,
+    ha_activation refresh;
+  - `reindex` triggers: NAT mapping change, owner_rg `0→>0`, `>0→0`, `>0→>0'`,
+    is_reverse toggle, NAT64 / NPTv6 decisions;
+  - **secondary-index collision** (Codex Major #1): two live sessions whose
+    derived secondary key collides — refresh one, assert the in-place table
+    matches the reference (the re-assert re-wins identically);
+  - **stale/wrong-key guard**: stale `key_to_handle` → vacant slot, and reused
+    slot holding a different `record.key` → both return false, no mutation;
+  - `refresh_for_ha_transition` liveness parity;
+  - a bounded **randomized update-sequence** property test (random installs +
+    refreshes + promotes + owner_rg flips) comparing in-place vs reference table
+    snapshots each step.
+- 5×flake on the differential + randomized tests + the heaviest existing
+  session test.
 - Go suite (30 pkgs).
 - Smoke matrix on loss userspace cluster: Pass A (CoS off) v4+v6 push+`-R` +
   `-P12 -R` line-rate; Pass B per-class 5201-5206 v4+v6 push+`-R`.
@@ -197,8 +245,22 @@ No public signature changes. `update_session`, `refresh_local`,
   remove_entry (they change identity / may replace a different session; in-place
   there is a measurable but smaller win — deferred, noted as a follow-up).
 - GC / `lookup_and_remove` / terminal paths — unchanged.
+- **Full skip of the secondary re-assert inserts** (the remaining ~1%):
+  deferred follow-up, gated on a *proven* secondary-key uniqueness invariant
+  across all live sessions (incl. the transient NAT-port-reuse / not-yet-GC'd
+  window) + a property test. v2 keeps the re-assert for exact parity.
 
 ## 11. Open questions for adversarial review
+
+**r1 resolutions (v2):** Q1 predicate completeness — confirmed by both reviewers
+(indices depend only on key+nat+is_reverse+owner_rg; key & handle invariant);
+**but** Codex's deeper point (unconditional-insert collision re-assert) is now
+handled by always re-asserting the ADDS, so v2 no longer depends on a uniqueness
+proof. Q2 reject-early-return net-neutral — confirmed by both. Q3 borrow/zero-clone
+hot path — confirmed feasible. Q4 owner_rg transition — works via reindex branch;
+added owner_rg `0↔>0`/`>0→>0'` + ha_transition tests. Q5 wheel_tick parity —
+confirmed. Q6 differential sufficiency — added collision + stale-handle +
+randomized property tests (Codex wanted them; cheap insurance). Remaining for r2:
 
 1. Is the reindex predicate (`old_nat != nat || old_is_reverse != is_reverse ||
    old_owner_rg != owner_rg`) provably complete, or is there an index whose key
