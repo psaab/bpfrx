@@ -14,7 +14,7 @@ pub(in crate::afxdp) fn enable_test_flow_fair(queue: &mut CoSQueueRuntime) {
     // the state (which flips `flow_fair()` to true) and mark eligibility
     // so promotion/demotion-aware logic sees a coherent queue.
     queue.config.flow_fair_eligible = true;
-    queue.flow_fair_state = Some(Box::new(FlowFairState::new(0)));
+    queue.flow_fair_state = Some(FlowFairState::new_boxed(0));
 }
 
 pub(in crate::afxdp) fn disable_test_flow_fair(queue: &mut CoSQueueRuntime) {
@@ -468,7 +468,7 @@ pub(in crate::afxdp) fn test_flow_fair_exact_queue_16_flows() -> CoSInterfaceRun
     );
     let queue = &mut root.queues[0];
     queue.config.flow_fair_eligible = true;
-    queue.flow_fair_state = Some(Box::new(FlowFairState::new(0)));
+    queue.flow_fair_state = Some(FlowFairState::new_boxed(0));
     root
 }
 
@@ -588,7 +588,7 @@ pub(in crate::afxdp) fn attach_test_vtime_floor(
     queue.config.shared_exact = true;
     queue.config.flow_fair_eligible = true;
     if queue.flow_fair_state.is_none() {
-        queue.flow_fair_state = Some(Box::new(FlowFairState::new(0)));
+        queue.flow_fair_state = Some(FlowFairState::new_boxed(0));
     }
     floor
 }
