@@ -82,9 +82,12 @@ pub struct Coordinator {
     /// constructed together on lazy bring-up, removed together on teardown.
     pub(in crate::afxdp) rebalance_sockets:
         BTreeMap<i32, crate::afxdp::rebalance::NtupleSocket>,
-    /// #1748: last per-(worker) tx_bytes sample + monotonic ns, for deriving
-    /// byte-rate across the controller tick window. Keyed by worker_id.
-    pub(in crate::afxdp) rebalance_last_tx_bytes: BTreeMap<u32, (u64, u64)>,
+    /// #1748: last per-worker tx_bytes sample + monotonic ns, for deriving
+    /// byte-rate across the controller tick window. Keyed by (ifindex,
+    /// worker_id) — the REAL worker_id (from BindingIdentity), aggregated
+    /// across all of that worker's bindings on the ifindex (#1748 live r6:
+    /// `workers.live` is slot-keyed, not worker_id-keyed).
+    pub(in crate::afxdp) rebalance_last_tx_bytes: BTreeMap<(i32, u32), (u64, u64)>,
     /// #1748 review #8: last per-FLOW cumulative observed_bytes sample +
     /// monotonic ns, for deriving each flow's byte-RATE across the tick window.
     /// FlowCacheEntry.observed_bytes is CUMULATIVE, so a long-lived idle flow

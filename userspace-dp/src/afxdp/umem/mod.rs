@@ -838,6 +838,24 @@ impl BindingLiveState {
         self.tx_bytes.load(Ordering::Relaxed)
     }
 
+    /// #1748 test-only: set the cumulative tx_bytes so a coordinator test can
+    /// drive the rebalance controller's per-worker rate sampling without a
+    /// live forwarding path.
+    #[cfg(test)]
+    pub(in crate::afxdp) fn test_set_tx_bytes(&self, v: u64) {
+        self.tx_bytes.store(v, Ordering::Relaxed);
+    }
+
+    /// #1748 test-only: publish a flow-worker-map snapshot so a coordinator
+    /// test can drive the controller's per-flow 5-tuple feed directly.
+    #[cfg(test)]
+    pub(in crate::afxdp) fn test_publish_flow_worker_map(
+        &self,
+        rows: Vec<crate::protocol::FlowWorkerStatus>,
+    ) {
+        self.publish_flow_worker_map(rows, false);
+    }
+
     /// #1748: ifindex this binding's socket is bound to (0 if unbound). Lets
     /// the controller scope its observation/steering to a single NIC.
     pub(in crate::afxdp) fn socket_ifindex(&self) -> i32 {

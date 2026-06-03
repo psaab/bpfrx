@@ -202,31 +202,61 @@ impl super::Coordinator {
         }
         self.rebalance_last_eval_ns = now_ns;
 
-        // 1. Per-worker byte-rate over the window, grouped by the ifindex each
-        //    worker's binding is bound to.
-        let mut per_iface_workers: BTreeMap<i32, Vec<WorkerByteRate>> = BTreeMap::new();
-        let mut worker_ifindex: BTreeMap<u32, i32> = BTreeMap::new();
-        for (&worker_id, live) in &self.workers.live {
-            let ifindex = live.socket_ifindex();
+        // 1. Per-worker byte-rate over the window, grouped by ifindex.
+        //
+        // #1748 live BUG (r6): `self.workers.live` is keyed by binding SLOT,
+        // NOT by worker_id (see WorkerManager doc: live/identities are
+        // slot-keyed, only `handles` is worker_id-keyed). The previous code
+        // treated the live map key as the worker_id, so the per-worker rate
+        // vector was keyed by SLOT while the flow-worker-map rows carry the
+        // real `binding.worker_id`. select_move's `f.worker_id ==
+        // hottest.worker_id` then NEVER matched (slot != worker_id), so the
+        // hottest worker always had zero candidate flows -> NoEligibleFlow ->
+        // zero installs under load, even though the flow list was populated.
+        //
+        // Fix: join `live` (slot -> BindingLiveState) with `identities` (slot
+        // -> BindingIdentity{worker_id, queue_id, ifindex}) and aggregate by
+        // the REAL worker_id — the same id-space the flow rows use. A worker
+        // may own several bindings/slots on one ifindex; sum their tx_bytes and
+        // keep the (lowest-slot) queue_id as the ntuple ring_cookie target for
+        // that worker's RX queue.
+        let mut agg: BTreeMap<(i32, u32), (u64, u32)> = BTreeMap::new(); // (ifindex,worker)->(tx_bytes,queue_id)
+        for (slot, live) in &self.workers.live {
+            let Some(identity) = self.workers.identities.get(slot) else {
+                continue;
+            };
+            let ifindex = identity.ifindex;
             if ifindex <= 0 {
                 continue;
             }
-            let queue_id = live.socket_queue_id();
-            let tx_bytes = live.tx_bytes();
-            let rate = match self.rebalance_last_tx_bytes.get(&worker_id) {
+            let entry = agg.entry((ifindex, identity.worker_id)).or_insert((0, identity.queue_id));
+            entry.0 = entry.0.saturating_add(live.tx_bytes());
+            // Prefer the lowest queue_id deterministically (stable ring_cookie).
+            if identity.queue_id < entry.1 {
+                entry.1 = identity.queue_id;
+            }
+        }
+        let mut per_iface_workers: BTreeMap<i32, Vec<WorkerByteRate>> = BTreeMap::new();
+        let mut seen_worker_keys: std::collections::HashSet<(i32, u32)> =
+            std::collections::HashSet::new();
+        for ((ifindex, worker_id), (tx_bytes, queue_id)) in agg {
+            let rate = match self.rebalance_last_tx_bytes.get(&(ifindex, worker_id)) {
                 Some(&(prev_bytes, prev_ns)) => {
                     cumulative_to_rate(tx_bytes, prev_bytes, now_ns, prev_ns)
                 }
                 None => 0.0,
             };
             self.rebalance_last_tx_bytes
-                .insert(worker_id, (tx_bytes, now_ns));
-            worker_ifindex.insert(worker_id, ifindex);
+                .insert((ifindex, worker_id), (tx_bytes, now_ns));
+            seen_worker_keys.insert((ifindex, worker_id));
             per_iface_workers
                 .entry(ifindex)
                 .or_default()
                 .push(WorkerByteRate { worker_id, queue_id, byte_rate: rate });
         }
+        // Prune stale per-worker samples so the window map can't grow unbounded.
+        self.rebalance_last_tx_bytes
+            .retain(|k, _| seen_worker_keys.contains(k));
 
         // 2. Per-flow samples (5-tuple key + worker + byte-RATE) grouped by
         //    ifindex, from the flow-worker map telemetry.
@@ -313,20 +343,31 @@ impl super::Coordinator {
             if workers.len() < 2 {
                 continue;
             }
-            // #1748 live BUG #1 instrumentation: ground-truth per-EVAL summary
-            // of the per-worker rate vector + how many flows have a positive
-            // rate. Gated to `debug-log` builds. Read via
-            // `journalctl -u xpfd | grep REBALANCE_EVAL`.
+            // #1748 live BUG #1/r6 instrumentation: ground-truth per-EVAL
+            // summary. Emits the per-worker rate vector AND the per-worker FLOW
+            // COUNT the controller sees (so a debug build can confirm the
+            // controller's flow list now matches binding_active_flow_count after
+            // the slot->worker_id join fix). Gated to `debug-log` builds. Read
+            // via `journalctl -u xpfd | grep REBALANCE_EVAL`.
             #[cfg(feature = "debug-log")]
             {
                 let worker_rates: Vec<(u32, f64)> =
                     workers.iter().map(|w| (w.worker_id, w.byte_rate)).collect();
+                // Per-worker flow count keyed by the REAL worker_id (matches
+                // the worker rate vector's id-space). If a worker shows a rate
+                // but 0 flows here, the join/feed is still broken for it.
+                let mut flows_per_worker: std::collections::BTreeMap<u32, usize> =
+                    std::collections::BTreeMap::new();
+                for f in &flows {
+                    *flows_per_worker.entry(f.worker_id).or_insert(0) += 1;
+                }
                 let flows_positive = flows.iter().filter(|f| f.byte_rate > 0.0).count();
                 debug_log_rebalance!(
-                    "REBALANCE_EVAL ifindex={} workers={:?} flows={} flows_with_positive_rate={}",
+                    "REBALANCE_EVAL ifindex={} workers={:?} flows={} flows_per_worker={:?} flows_with_positive_rate={}",
                     ifindex,
                     worker_rates,
                     flows.len(),
+                    flows_per_worker,
                     flows_positive,
                 );
             }

@@ -1991,3 +1991,148 @@ fn tick_rebalance_evaluates_at_interval_cadence_not_every_tick() {
         "default-OFF tick_rebalance is a no-op"
     );
 }
+
+// #1748 live BUG (r6): the controller's per-worker rate vector was keyed by
+// binding SLOT (the `workers.live` map key) while the flow-worker-map rows
+// carry the real `binding.worker_id`. With slot != worker_id (the norm),
+// select_move's `f.worker_id == hottest.worker_id` never matched, so the
+// hottest worker always had ZERO candidate flows -> NoEligibleFlow -> zero
+// installs under load even though binding_active_flow_count showed flows.
+//
+// This test reproduces that id-space mismatch (slot deliberately != worker_id)
+// with a real per-worker tx_bytes imbalance and a populated flow-worker map
+// whose rows carry the real worker_ids, then drives tick_rebalance and asserts
+// the controller does NOT record NoEligibleFlow for the steered ifindex — i.e.
+// the slot->worker_id join now lets the flow list match the worker rate vector.
+#[test]
+fn tick_rebalance_joins_flows_to_workers_by_real_worker_id_not_slot() {
+    use crate::protocol::{FlowTupleStatus, FlowWorkerStatus};
+    let mut coordinator = Coordinator::new();
+    coordinator.rebalance_config = Some(crate::afxdp::rebalance::RebalanceConfig {
+        imbalance_threshold: 1.30,
+        rebalance_interval_secs: 1,
+        max_rules: 64,
+    });
+    // ifindex 5 maps to loopback so the lazy controller can open a real
+    // ethtool socket; the move attempt is fine — we assert on the skip reason,
+    // not on a committed install (no worker handles => barrier would fail, but
+    // that is BarrierFailed, NOT NoEligibleFlow).
+    let ifindex = 5;
+    if crate::afxdp::rebalance::NtupleSocket::open("lo").is_err() {
+        eprintln!("tick_rebalance_joins...: skipped (no lo ethtool socket)");
+        return;
+    }
+    coordinator.forwarding.ifindex_to_name.insert(ifindex, "lo".to_string());
+
+    // 6 workers on ifindex 5. CRITICAL: slot != worker_id (slot = 100+w,
+    // worker_id = 10+w) — the exact id-space split that broke the join.
+    // tx_bytes give the R1 [2,2,2,1,3,2] partition (worker 14 hottest).
+    let tx_for = |w: u32| -> u64 {
+        match w {
+            14 => 4_200_000_000, // hottest (3 flows)
+            13 => 1_400_000_000, // coolest (1 flow)
+            _ => 2_800_000_000,  // 2 flows each
+        }
+    };
+    let worker_ids = [10u32, 11, 12, 13, 14, 15];
+    for (i, &w) in worker_ids.iter().enumerate() {
+        let slot = 100 + i as u32;
+        let live = std::sync::Arc::new(crate::afxdp::BindingLiveState::new());
+        live.test_set_tx_bytes(tx_for(w));
+        // Flow rows for this worker: rows carry the REAL worker_id (w), as the
+        // live publish path does. Worker 14 gets 3 flows, 13 gets 1, else 2.
+        let nflows = match w { 14 => 3, 13 => 1, _ => 2 };
+        let mut rows = Vec::new();
+        for f in 0..nflows {
+            let sport = (1000 + (w as u16) * 10 + f as u16) as u16;
+            rows.push(FlowWorkerStatus {
+                slot,
+                queue_id: i as u32,
+                worker_id: w,
+                interface: "lo".into(),
+                ifindex,
+                ingress_ifindex: ifindex,
+                session_key: FlowTupleStatus {
+                    addr_family: libc::AF_INET as u8,
+                    protocol: 6,
+                    src_ip: "10.0.61.102".to_string(),
+                    dst_ip: "172.16.80.200".to_string(),
+                    src_port: sport,
+                    dst_port: 5210,
+                },
+                ..Default::default()
+            });
+        }
+        live.test_publish_flow_worker_map(rows);
+        coordinator.workers.live.insert(slot, live);
+        coordinator.workers.identities.insert(
+            slot,
+            BindingIdentity {
+                slot,
+                queue_id: i as u32,
+                worker_id: w,
+                interface: "lo".into(),
+                ifindex,
+            },
+        );
+    }
+
+    // Drive several evals so the rate window fills and the hysteresis dwell
+    // clears, letting the controller actually reach select_move. Each eval
+    // advances every worker's cumulative tx_bytes by one window's worth and
+    // backdates the eval timer so the cadence gate admits the eval.
+    for round in 0..5u64 {
+        for (i, &w) in worker_ids.iter().enumerate() {
+            let slot = 100 + i as u32;
+            if let Some(live) = coordinator.workers.live.get(&slot) {
+                // Cumulative grows by `tx_for(w)` bytes per ~1s window.
+                live.test_set_tx_bytes(tx_for(w).saturating_mul(round + 1));
+            }
+        }
+        // Backdate the prior eval so the >= rebalance_interval gate admits this
+        // one (first round has last_eval == 0 and is admitted unconditionally).
+        if coordinator.rebalance_last_eval_ns != 0 {
+            coordinator.rebalance_last_eval_ns = coordinator
+                .rebalance_last_eval_ns
+                .saturating_sub(2 * 1_000_000_000);
+        }
+        coordinator.tick_rebalance();
+    }
+
+    // The decisive assertion: with the slot->worker_id join fixed, the hottest
+    // worker's flows are visible to the controller, so it does NOT record
+    // NoEligibleFlow. Pre-fix (per-worker vector keyed by slot, flows keyed by
+    // worker_id) EVERY post-dwell eval recorded no_eligible_flow because the
+    // hottest worker (by slot) had no flow with a matching worker_id.
+    let status = coordinator.flow_rebalance_status();
+    let row = status
+        .iter()
+        .find(|s| s.ifindex == ifindex)
+        .expect("a controller exists for the steered ifindex");
+    // Per-worker rates were built (non-degenerate CoV) — proves we got past
+    // sampling regardless of the join.
+    assert!(
+        row.worker_byterate_cov > 0.0,
+        "per-worker rates were built; skips={:?}", row.moves_skipped
+    );
+    // The join is correct iff the controller reached a real move decision
+    // without a NoEligibleFlow skip. (With handles absent the move attempt
+    // fails the ack barrier => BarrierFailed, NOT NoEligibleFlow — either an
+    // install or a BarrierFailed proves select_move found a candidate.)
+    let no_eligible = row.moves_skipped.get("no_eligible_flow").copied().unwrap_or(0);
+    assert_eq!(
+        no_eligible, 0,
+        "slot->worker_id join must make the hottest worker's flows eligible \
+         (no NoEligibleFlow); skips={:?}", row.moves_skipped
+    );
+    let reached_decision = row.installs_total > 0
+        || row.moves_skipped.get("barrier_failed").copied().unwrap_or(0) > 0
+        || row.moves_skipped.get("magnitude").copied().unwrap_or(0) > 0
+        || row.moves_skipped.get("epsilon").copied().unwrap_or(0) > 0;
+    assert!(
+        reached_decision,
+        "controller must reach select_move's move decision (install/barrier/\
+         magnitude/epsilon), proving flows joined to the hottest worker; \
+         skips={:?} installs={}", row.moves_skipped, row.installs_total
+    );
+}
