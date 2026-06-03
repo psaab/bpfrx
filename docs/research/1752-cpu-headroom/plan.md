@@ -1,6 +1,6 @@
 # #1752 — P48/5210 CPU-bound at 16 Gb/s: where the cycles go
 
-**Status: v3 — folds Codex + AGY r1 (PLAN-NEEDS-MAJOR). Adds Path E (session in-place mutation, code-verified), softens crypto causality (kTLS/IPsec/rekey), scrubs all HA-node config experiments, gates Path A. Re-dispatched for r2.**
+**Status: v4 (PLAN-READY) — Codex r2 + Claude SMR r2 PLAN-READY; AGY r1 blockers all folded (r2 infra-truncated). Codex non-blocking nit fixed.**
 
 This is a *diagnosis-first* research doc. The empirical profile is already
 captured live on `loss:xpf-userspace-fw0` (flow-rebalance OFF, native XDP,
@@ -120,9 +120,10 @@ ONLY; the invasive A/B is **out of scope on the cluster**:
 
 ## 6. Public API / behavior preservation
 
-None touched in research. Any Path-B config experiment is smoke-env only
-(strongSwan stop / xfrm flush on fw0) and reverted after measurement. Path A/C
-would each get their own plan + review before code.
+None touched in research. Any Path-B config experiment is **standalone-test-VM
+only** (strongSwan stop / xfrm flush) — **never on fw0/fw1 or any HA node** (see
+§5/§7) — and reverted after measurement. Path A/C would each get their own plan +
+review before code.
 
 ## 7. Hidden invariants / risks of the *experiment*
 
@@ -169,8 +170,9 @@ would each get their own plan + review before code.
 3. With HW crypto offload `off [fixed]` on the VFs, what mlx5 path legitimately
    programs DEKs from a plain-forwarding worker? Is this a known mlx5 6.18
    behavior?
-4. Is Path B's strongSwan-stop A/B safe on an HA node, even briefly, given
-   IPsec SA sync?
+4. Is Path B's strongSwan-stop A/B safe on an HA node? **(RESOLVED v3: NO — it
+   is not run on any HA node; Path B is non-invasive stack-trace only, any
+   config A/B is standalone-test-VM only.)**
 5. Should Path A be attempted at all given #1207/#1545 CoS-path PLAN-KILLs, or
    is the honest answer "document the 6/6 ceiling (Path D) + only chase Path B"?
 6. Is there a 5th cost center the table misses (e.g. the ~4.5% hashbrown churn —
