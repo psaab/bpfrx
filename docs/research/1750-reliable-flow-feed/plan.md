@@ -1,6 +1,10 @@
 # #1750 — reliable per-flow 5-tuple feed for the #1748 rebalance controller
 
-- **Status**: PLAN DRAFT v1 (pre-review)
+- **Status**: PLAN v2 — r1 hostile round folded (Codex PLAN-NEEDS-MAJOR, AGY
+  PLAN-NEEDS-MAJOR, Claude-SMR PLAN-NEEDS-MAJOR self-corrected). v1's
+  "atomic publish" claim was FALSE; a second independent zero-install root
+  cause (slot vs worker_id keying) was missed; §6.3 carry-forward was dead
+  code. All three folded below.
 - **Issue**: #1750
 - **Mode**: `/research` — stops at PLAN-READY / PLAN-KILL. No PR, no production
   code touched in this skill.
@@ -44,9 +48,11 @@ patch is being attempted on the branch; this plan is the design answer
 ## 2. Key code-grounded finding (changes the framing)
 
 **The active-flow COUNT and the 5-tuple ROW LIST are produced by the *same*
-single scan and published *atomically together*. They cannot disagree at the
-binding level for ≤256 flows.** Evidence (all on `origin/master`, identical on
-the engineer branch):
+single scan, but they are published to readers as TWO INDEPENDENT atomics — so a
+reader CAN observe a fresh count with stale (or empty) rows.** (v1 wrongly
+claimed they are "published atomically together"; Codex + AGY r1 both quoted the
+two-store reality. Corrected below.) Evidence (all on `origin/master`, identical
+on the engineer branch):
 
 - `FlowCache::active_flow_debug_entries(limit)`
   (`flow_cache.rs:465`) iterates the cache once and returns
@@ -57,9 +63,18 @@ the engineer branch):
   (`flow_cache.rs:441`).
 - `publish_binding_debug_state` (`umem/debug_state.rs:216-249`) calls that scan
   once with `limit = FLOW_WORKER_MAP_MAX_PER_BINDING = 256`
-  (`flow_cache.rs:18`), then stores `active_flow_count` and the row vector from
-  the **same returned tuple**. So `xpf_userspace_binding_active_flow_count` and
-  the `flow_worker_map` rows are two projections of one scan.
+  (`flow_cache.rs:18`). It then performs **two separate atomic publishes** from
+  the one returned tuple: `binding.live.active_flow_count.store(active_flow_count,
+  Ordering::Relaxed)` (an `AtomicU32`, `debug_state.rs:223-224`) and
+  `binding.live.publish_flow_worker_map(rows, truncated)` →
+  `self.flow_worker_map.store(Arc::new(FlowWorkerMapSnapshot{rows, truncated}))`
+  (a separate `ArcSwap`, `umem/mod.rs:817-824`). `FlowWorkerMapSnapshot` carries
+  **only rows + truncated** — NOT the count (`umem/mod.rs:250-255`). So
+  `xpf_userspace_binding_active_flow_count` and the `flow_worker_map` rows are
+  two projections of one scan but two independent stores → a reader (coordinator
+  tick or Prometheus scrape) can read a fresh count with a stale/empty row
+  snapshot. **This non-atomic dual-publish is the actual skew, and the fix is to
+  bundle the count INTO the row snapshot (Path 1).**
 - The row cap is **256/binding**; a worker carrying 3 flows cannot be truncated
   below 3. `truncated` only drops rows *above* 256.
 - `active_entry_age` (`flow_cache.rs:453`) returns `None` for
@@ -71,12 +86,13 @@ the engineer branch):
   count and rows** between (re-)insert and its next hit, and visible to BOTH
   thereafter — they move together.
 
-**Consequence:** the issue's literal symptom ("count says 3, rows say empty")
-implies a *cross-snapshot skew* or a *consumer-side filter bug*, NOT a
-fundamental flow_cache enumeration deficiency. The flow_cache scan IS the
-reliable per-worker enumeration the issue's Q1 is asking for; it is the very
-mechanism that makes the count reliable. The defect is in how the controller
-consumes it.
+**Consequence:** the issue's literal symptom ("count says 3, rows say empty") is
+a *non-atomic dual-publish / cross-snapshot skew* and/or a *consumer-side keying
+or filter bug*, NOT a fundamental flow_cache enumeration deficiency. The
+flow_cache scan IS the reliable per-worker enumeration the issue's Q1 is asking
+for; it is the very mechanism that makes the count reliable. The defect is in
+(a) how the count and rows are published (two atomics) and (b) how the
+controller consumes/keys them.
 
 ### 2.1 Where the consumer-side skew/loss actually comes from
 
@@ -87,7 +103,28 @@ The controller does NOT read count and rows from one atomic snapshot. It reads:
 - and the human/operator compares against the *separately scraped* Prometheus
   `binding_active_flow_count` (a third read instant).
 
-Three candidate consumer-side causes, in descending likelihood:
+Four candidate consumer-side causes (D added in r1):
+
+- **(D) Slot-vs-worker_id keying mismatch (Codex r1 — independent zero-install
+  bug).** `Coordinator::tick_rebalance` iterates `for (&worker_id, live) in
+  &self.workers.live` (`coordinator/rebalance.rs:209`) and labels the key
+  `worker_id` — but `workers.live` is **keyed by `binding.slot`**
+  (`worker_manager.rs:6` doc: "`live` and `identities` are keyed by binding
+  `slot`"; `bringup.rs:47` `coord.workers.live.insert(binding.slot, ...)`). The
+  published flow rows carry the REAL `binding.worker_id`
+  (`debug_state.rs`/`poll_descriptor/mod.rs:434-436`), and `select_move`
+  filters `f.worker_id == hottest.worker_id` (`controller.rs:507-511`). When
+  `slot != worker_id` (shared-UMEM / multi-binding-per-worker configs), the
+  per-worker rate vector is keyed by SLOT while the flow rows are keyed by
+  WORKER_ID → the equality filter yields `candidate_count == 0` →
+  `no_eligible_flow` → zero installs, **independent of any feed-reliability
+  fix.** On the 6-queue/6-worker mlx5 smoke cluster `slot == worker_id` (1:1)
+  is likely, making the bug *latent there* but real elsewhere. The increment
+  MUST make worker-identity keying consistent end-to-end (key the rate vector
+  by the published `worker_id`, OR carry `slot` on the rows and key both by
+  slot — pick ONE and apply it through `WorkerByteRate`, `FlowSample`, and the
+  `select_move` filter). The live trace MUST check the worker-id match, not
+  just row presence.
 
 - **(A) Empty-on-first-publish / publish-cadence skew.** The row `ArcSwap`
   starts empty (`umem/mod.rs:636`, `ArcSwap::from_pointee(Vec::new())`) and is
@@ -107,9 +144,15 @@ Three candidate consumer-side causes, in descending likelihood:
   (`config_generation`/`fib_generation`, `flow_cache.rs:625-651`) fires only on
   a control-socket `bump_fib_generation` (`server/handlers/mod.rs:110`) i.e. a
   config/route change, and `owner_rg_epoch` only on HA failover — neither
-  recurs under steady iperf. So (B) is unlikely to be the steady-state cause at
-  P12, but MUST be verified live (it would dominate at high flow-count /
-  hot-set workloads, which is the controller's real target regime).
+  recurs under steady iperf. So eviction-driven (B) is unlikely at P12 line
+  rate, but MUST be verified live (it would dominate at high flow-count /
+  hot-set workloads, the controller's real target regime). **Additional (B)
+  mechanism (AGY r1): age-out at low PPS.** `active_entry_age` counts an entry
+  active only for `< ACTIVE_WINDOW_EPOCHS = 10` epochs ≈ 650 ms
+  (`flow_cache.rs:453-459`); a flow quieter than ~1 pkt / 650 ms ages out
+  between packets and drops from BOTH count and rows periodically — a real
+  "rows empty for a live flow" mechanism the consumer must tolerate (defer one
+  tick, not terminal `no_eligible_flow`).
 
 - **(C) Consumer filter drop.** `rebalance.rs:248-300` drops a row if
   `ifindex <= 0 || !per_iface_workers.contains_key(&ifindex)` (ifindex is
@@ -181,19 +224,24 @@ for the heterogeneous ordinal case (Q2), and even then a coarse fix suffices.**
 - The reset is one line: `insert` builds the entry with
   `observed_bytes = pkt_len` (`flow_cache.rs:370`). A re-insert of an
   *already-present-then-evicted* key loses the prior accumulation.
-- **Cheap carry-forward options (no per-packet cost):**
-  1. On `insert`, if the set already holds the same key (the dedup-on-insert
-     branch, `flow_cache.rs:686-694`), keep the existing `observed_bytes`
-     instead of overwriting — covers the common "stale decision refresh"
-     re-insert. Zero hot-path cost (the branch is already taken on the miss
-     path, not per-packet).
-  2. For LRU-evicted-then-readmitted keys, a tiny per-binding
-     `HashMap<SessionKey,u64>` "recent bytes" side table updated only on
-     eviction (cold path) — bounded, owner-only, no per-packet work.
-  3. Switch the controller to an *ordinal* signal: rank candidate flows by the
-     row's `age_epochs` + a monotonic per-flow packet counter that survives
-     re-insert (carry-forward as in option 1). The controller only needs "which
-     is heaviest", not a calibrated rate.
+- **CORRECTION (Codex + AGY r1): the dedup-on-insert branch is DEAD CODE in
+  production.** The hot path always `lookup_counted` first
+  (`poll_descriptor/flow_cache_hit.rs:94`); a hit skips `insert`, and a miss
+  means the key is absent OR was just deleted inside `lookup_counted` on a
+  generation/epoch/lease mismatch (`flow_cache.rs:625-652`). So when `insert`
+  runs it never finds a matching key to dedup (`flow_cache.rs:686-694`) — a
+  carry-forward there NEVER executes and does NOT fix the reset under LRU
+  eviction churn. v1's "cheap option 1" is invalid; drop it.
+- **The only correct carry-forward is a cold-path eviction side-table:** a tiny
+  bounded per-binding `HashMap<SessionKey,u64>` "recent bytes" updated only when
+  an entry is evicted (LRU displacement `flow_cache.rs:705-710`, or
+  generation/lease delete in `lookup_counted`), read back into the new entry's
+  `observed_bytes` on the next `insert` of that key. Owner-only, cold-path, no
+  per-packet work. Bounded by an LRU/size cap so it cannot grow unbounded.
+- **Or switch the controller to an ordinal signal** (rank candidate flows by
+  `age_epochs` + the worker-rate/count estimate) and skip per-flow byte
+  accounting entirely — the controller only needs "which flow is heaviest", and
+  for homogeneous traffic the estimate already gives that.
 - Per-flow byte accounting is therefore NOT fundamentally unreliable; the
   reset is an artifact of overwrite-on-insert, fixable on the cold path.
 - **However:** if A/B/C shows the *list* itself is reliable in steady state and
@@ -210,46 +258,67 @@ reactive ntuple controller remains the only mechanism that improves `Cstruct`.
 No re-architecture is warranted; the increment is a feed-reliability fix.
 
 ### Q5 — honest cost/benefit
-- **If A (cadence/first-publish skew) is the live cause:** fix is a few lines
-  (atomic count+rows snapshot already exists; add an eligibility-time freshness
-  check + ensure the controller never compares against an out-of-band count).
-  Near-zero hot-path cost, unblocks the whole PR. **High benefit / negligible
-  cost → ship.**
-- **If B (eviction churn) is the live cause:** fix is carry-forward (cold-path)
-  + possibly raising `ACTIVE_WINDOW_EPOCHS` or making the scan use a
-  longer-lived "seen recently" mark. Low hot-path cost. **Ship.**
+- **If D (slot/worker_id keying) is the live cause:** fix is keying the rate
+  vector by the row identifier (Path 1 part 2) + a `slot != worker_id` test.
+  Few lines, no hot-path cost. **Ship.** (Strong candidate even on the 6:6
+  cluster — verify whether slot == worker_id there before assuming it is
+  latent.)
+- **If A (non-atomic dual-publish skew) is the live cause:** fix is bundling the
+  count into `FlowWorkerMapSnapshot` (Path 1 part 1) + the staleness defer.
+  Few lines, no hot-path cost. **Ship.**
+- **If B (eviction churn / low-PPS age-out) is the live cause:** fix is the
+  cold-path eviction side-table OR ordinal selection (Path 2) + the staleness
+  defer; possibly a longer "seen recently" mark. Low hot-path cost. **Ship.**
 - **If C (consumer filter/parse bug) is the live cause:** trivial fix in
   `rebalance.rs`. **Ship.**
 - **PLAN-KILL trigger:** only if the live `REBALANCE_FLOW`/`REBALANCE_EVAL`
-  trace shows the flow_cache scan *itself* (not the consumer) drops active
-  forward flows in steady state AND no cold-path carry-forward restores them —
-  which the code analysis says is improbable at P12. Honest stance: **this is
-  very likely a cheap fix, not a kill.**
+  trace shows the flow_cache scan *itself* (not the publish/keying/consumer)
+  drops active forward flows in steady state AND no cold-path side-table
+  restores them — improbable at P12. Honest stance: **this is a cheap fix, not
+  a kill.**
 
 ## 5. Multiple Path Options
 
-### Path 1 — Single-snapshot consume + cadence hardening (RECOMMENDED)
-Make the controller read the **count and the 5-tuple rows from one atomic
-`flow_worker_map` snapshot** (extend the published snapshot to carry the
-per-binding `active_flow_count` alongside the rows, so the controller never
-cross-references an out-of-band Prometheus count). Add a first-publish / staleness
-guard: if a worker's snapshot is empty but its `active_flow_count` > 0 (stale or
-pre-first-publish), defer the move one tick rather than recording
-`no_eligible_flow`. Keep the existing worker-rate fallback for magnitude.
-- **Pros:** smallest change; uses the proven-reliable scan; eliminates the
-  cross-snapshot skew that is the most likely live cause (A); no hot-path cost.
+### Path 1 — Single-snapshot consume + worker-id keying fix + cadence hardening (RECOMMENDED)
+Three parts:
+1. **Bundle count into the row snapshot (fixes the non-atomic dual-publish).**
+   Extend `FlowWorkerMapSnapshot` (`umem/mod.rs:250-255`) to carry the
+   per-binding `active_flow_count` and publish BOTH from the one
+   `active_flow_debug_entries` tuple in the SAME `ArcSwap` store
+   (`debug_state.rs:216-249`). The controller then reads count and rows from one
+   atomic load and never cross-references an out-of-band Prometheus count.
+2. **Fix the slot-vs-worker_id keying (cause D — independent zero-install
+   bug).** Key the controller's per-worker rate vector (`WorkerByteRate`) by the
+   SAME identifier the rows carry. Either (a) carry `worker_id` alongside the
+   `slot` key when building `per_iface_workers` in `tick_rebalance`
+   (`rebalance.rs:209-228`) and filter `f.worker_id == hottest.worker_id` against
+   that, or (b) carry `slot` on the published rows and key the filter by slot.
+   Pick ONE and apply it through `WorkerByteRate`, `FlowSample`, and
+   `select_move`'s filter (`controller.rs:507-511`). Add a unit test with
+   `slot != worker_id`.
+3. **Staleness/first-publish guard.** If a worker's bundled `active_flow_count`
+   > 0 but its row list is empty (stale, pre-first-publish, or one-tick
+   age-out), record a new `SkipReason::StaleFlowSnapshot` and DEFER one tick —
+   do not record terminal `no_eligible_flow`. Keep the worker-rate fallback for
+   magnitude.
+- **Pros:** smallest change set that fixes BOTH the publish skew (A) AND the
+  keying bug (D) — either of which alone keeps installs at 0; uses the
+  proven-reliable scan; no hot-path cost.
 - **Cons:** does not improve heterogeneous selection (still worker-rate
-  estimate). Acceptable for the P12 homogeneous gate; heterogeneous is a
-  documented follow-up.
+  estimate). Acceptable for the P12 homogeneous gate; heterogeneous is Path 2.
 
-### Path 2 — Path 1 + cold-path `observed_bytes` carry-forward
-Add Path 1 plus the dedup-insert carry-forward (Q3 option 1) and optional
-eviction side-table (option 2) so the per-flow rate signal survives re-insert,
-restoring an accurate per-flow magnitude for heterogeneous traffic.
+### Path 2 — Path 1 + cold-path eviction side-table OR ordinal selection
+Add to Path 1 an accurate per-flow magnitude signal for heterogeneous
+(elephant+mice) traffic, via EITHER:
+- the bounded cold-path **eviction side-table** (Q3, corrected) that carries
+  `observed_bytes` across LRU/generation eviction — the dedup-insert
+  carry-forward is dead code and is NOT used; OR
+- switching the controller to an **ordinal** "heaviest flow" signal
+  (`age_epochs` + worker-rate/count estimate) and dropping per-flow byte
+  accounting from the decision entirely.
 - **Pros:** correct elephant-vs-mice selection; still no per-packet cost.
-- **Cons:** more surface; only matters if heterogeneous fairness is in scope
-  for the increment. Carry-forward across an LRU eviction needs the side table
-  (bounded but new state).
+- **Cons:** the side-table is bounded but new state; only matters if
+  heterogeneous fairness is in scope for the increment.
 
 ### Path 3 — New per-worker sampled flow table (REJECTED unless A/B/C forces it)
 A dedicated hot-path reservoir/sketch of (5-tuple→bytes) per worker.
@@ -263,40 +332,51 @@ A dedicated hot-path reservoir/sketch of (5-tuple→bytes) per worker.
 Only if the live trace proves the scan itself is unreliable in steady state and
 no cheap carry-forward fixes it. Code analysis makes this improbable.
 
-**Recommendation: Path 1 as the blocker-clearing increment, with Path 2's
-dedup-insert carry-forward folded in as a low-cost ordinal improvement for
-heterogeneous traffic. Gate the choice on the live `REBALANCE_FLOW` trace
-(already on the branch) confirming which of A/B/C is the live cause.**
+**Recommendation: Path 1 (all three parts — snapshot-bundle + worker-id keying
+fix + staleness defer) as the blocker-clearing increment. It must fix BOTH the
+non-atomic dual-publish (A) AND the slot/worker_id keying (D); either alone
+keeps installs at 0. Defer Path 2's heterogeneous magnitude work until the live
+trace + a heterogeneous gate prove it needed. Gate the design on a pre-code
+`REBALANCE_FLOW`/`REBALANCE_EVAL` debug-log trace (already on the branch) that
+confirms which of A/B/C/D is the LIVE cause AND checks the worker-id match, not
+just row presence.**
 
-## 6. Concrete design (Path 1 + Path 2 dedup carry-forward)
+## 6. Concrete design (Path 1; Path 2 deferred unless live trace forces it)
 
-### 6.1 Extend the published snapshot to carry count with rows
-- `FlowWorkerMapSnapshot` (umem) gains a per-binding `active_flow_count: u32`
-  field, populated from the same `active_flow_debug_entries` tuple already
-  computed at `debug_state.rs:220`. Zero new scan.
-- `Coordinator::flow_worker_map()` already aggregates rows; add a sibling that
-  also returns the per-(ifindex,worker) count from the same snapshot, OR have
-  the controller key candidates only off the rows it actually received and
-  treat an "empty rows but positive published count" worker as **stale, defer**.
+### 6.1 Bundle count into the row snapshot (fix the non-atomic dual-publish)
+- `FlowWorkerMapSnapshot` (`umem/mod.rs:250-255`) gains a per-binding
+  `active_flow_count: u32` field, populated from the same
+  `active_flow_debug_entries` tuple already computed at `debug_state.rs:220`.
+  Zero new scan. Count and rows are then published in ONE `ArcSwap` store, so a
+  reader loads them atomically together — the `AtomicU32`-vs-`ArcSwap` skew
+  (Codex/AGY r1) is structurally gone. (The standalone `active_flow_count`
+  `AtomicU32` can stay for Prometheus, but the controller reads only the bundled
+  snapshot.)
 
-### 6.2 Controller consume change (`rebalance.rs` / `controller.rs`)
-- Build `per_iface_flows` exactly as today, but additionally track, per worker,
-  whether its snapshot was *fresh* (published within N× the publish interval).
-- In `select_move`, when the hottest worker has zero candidate rows but a
-  positive published `active_flow_count`, record a new
-  `SkipReason::StaleFlowSnapshot` (distinct from `NoEligibleFlow`) and **defer**
-  (do not count it as a terminal no-op). `NoEligibleFlow` then means a genuine
-  "no movable flow" only.
+### 6.2 Fix worker-identity keying + staleness defer (`rebalance.rs` / `controller.rs`)
+- **Keying (cause D):** key `WorkerByteRate` by the SAME identifier the rows
+  carry. `tick_rebalance` (`rebalance.rs:209-228`) currently labels the
+  `workers.live` SLOT key as `worker_id`; carry the binding's real `worker_id`
+  onto `WorkerByteRate` (it is available on the live state /
+  identities) and filter `f.worker_id == hottest.worker_id`
+  (`controller.rs:507-511`) against that. Add a unit test with
+  `slot != worker_id` proving `candidate_count > 0`.
+- **Staleness defer (causes A/B-age-out):** when the hottest worker has zero
+  candidate rows but its bundled `active_flow_count > 0`, record a new
+  `SkipReason::StaleFlowSnapshot` (additive label, matches the
+  `no_eligible_flow` precedent) and DEFER one tick — not terminal
+  `NoEligibleFlow`. `NoEligibleFlow` then means a genuine "no movable flow".
 - Keep the worker-rate fallback for magnitude (already present).
 
-### 6.3 Cold-path `observed_bytes` carry-forward (Path 2 component)
-- In `FlowCache::insert` dedup-on-insert branch (`flow_cache.rs:686-694`), when
-  replacing an existing same-key entry, set
-  `new.observed_bytes = new.observed_bytes.saturating_add(existing.observed_bytes)`
-  (carry forward) instead of overwriting. Cold path (miss/refresh only), no
-  per-packet cost.
-- (Optional, deferred) eviction side-table for LRU-evicted-then-readmitted
-  keys — only if heterogeneous live data shows it is needed.
+### 6.3 (Path 2, deferred) cold-path eviction side-table for per-flow magnitude
+- **NOT the dead dedup-insert branch** (Codex/AGY r1: unreachable in
+  production). If a heterogeneous gate proves accurate per-flow magnitude is
+  needed: a bounded per-binding `HashMap<SessionKey,u64>` updated only on
+  eviction (LRU displacement `flow_cache.rs:705-710` + the
+  generation/lease deletes in `lookup_counted` `flow_cache.rs:625-652`), read
+  back on the next `insert` of that key. Cold-path, owner-only, LRU-capped.
+- Alternative: drop per-flow byte accounting and use the ordinal
+  (`age_epochs` + worker-rate/count) signal. Decide from the live trace.
 
 ### 6.4 Validation harness (the part that was missing in #1748)
 The #1748 ledger is explicit: "Unit tests + miri + 9 review rounds did NOT
@@ -312,7 +392,7 @@ catch these (behavioral/runtime)." So the increment MUST land with:
   (#1219/#1294); reusing it is additive.
 - New `SkipReason::StaleFlowSnapshot` is an additive metric label
   (matches the `no_eligible_flow` precedent, commit `b219d1280`).
-- No hot-path cost added; carry-forward is cold-path only.
+- No hot-path cost added; the optional side-table (Path 2) is cold-path only.
 
 ## 8. Hidden invariants to preserve
 - **No per-packet/per-poll cost** (CLAUDE.md): the scan is already owner-cadence
@@ -322,25 +402,30 @@ catch these (behavioral/runtime)." So the increment MUST land with:
   collected telemetry (ArcSwap snapshot), not a new >1 Hz control-socket call.
 - **Count/rows atomicity**: count and rows MUST come from one snapshot; the
   fix's whole point is to stop the cross-snapshot skew.
-- **`last_used_epoch == 0` sentinel** semantics unchanged; carry-forward only
-  touches `observed_bytes`.
+- **`last_used_epoch == 0` sentinel** semantics unchanged; the optional
+  side-table only touches `observed_bytes`.
+- **Worker-identity keying** must be consistent end-to-end after the fix: the
+  rate vector and the flow rows MUST be keyed by the same identifier.
 
 ## 9. Risk assessment
 | Class | Level | Note |
 |---|---|---|
 | Behavioral regression | LOW (OFF) | #1748 is default-OFF; feed work gated |
-| Hot-path perf | NONE | scan unchanged; carry-forward cold-path |
-| Wrong root cause | MED | mitigated by mandatory debug-log live trace BEFORE coding (identify A/B/C) |
-| Heterogeneous selection still weak | LOW/MED | Path 2 carry-forward addresses; else documented follow-up |
+| Hot-path perf | NONE | scan unchanged; optional side-table cold-path |
+| Wrong root cause | MED | mitigated by mandatory debug-log live trace BEFORE coding (identify A/B/C/D + worker-id match) |
+| Latent keying bug (D) on other configs | MED | fixed by Path 1 part 2; `slot != worker_id` unit test |
+| Heterogeneous selection still weak | LOW/MED | Path 2 side-table/ordinal addresses; else documented follow-up |
 | Live-gate still 0 installs | MED | acceptance = live CoV gate, not unit tests |
 
 ## 10. Test plan (for the eventual `/engineer` increment)
 - **Pre-code live trace:** `--features debug-log` deploy on loss cluster, P12
-  -p5210, capture `REBALANCE_FLOW`/`REBALANCE_EVAL`; record which of A/B/C is
-  live. This selects whether 6.1/6.2 alone suffices or 6.3 is needed.
-- Unit: `stale_snapshot_defers_not_no_eligible_flow`; carry-forward
-  `observed_bytes_survives_dedup_reinsert`; count/rows single-snapshot
-  consistency.
+  -p5210, capture `REBALANCE_FLOW`/`REBALANCE_EVAL`; record which of A/B/C/D is
+  live AND verify the row `worker_id` matches the rate vector's key (cause D).
+  This selects whether Path 1 alone suffices or Path 2 is needed.
+- Unit: `stale_snapshot_defers_not_no_eligible_flow`;
+  `slot_ne_worker_id_still_selects` (cause D regression);
+  count/rows single-snapshot consistency; (if Path 2)
+  `observed_bytes_survives_eviction_via_sidetable`.
 - cargo build + full suite + 5× flake of controller tests; go suite (label).
 - **Live CoV gate (acceptance):** enable knob, P12 -p5210, installs_total > 0,
   per-flow CoV ≤ 10%, aggregate not regressed, bounded retransmits.
