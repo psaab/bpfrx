@@ -1,6 +1,6 @@
 # #1752 Path E — session refresh in-place mutation
 
-**Status: v2 — folds Codex r1 (PLAN-NEEDS-MAJOR) + Gemini r1 (PLAN-NEEDS-MINOR). Re-dispatched.**
+**Status: v3 — folds Codex r2 (PLAN-NEEDS-MAJOR, reject-path re-assert) + Gemini r2 (PLAN-READY). Re-dispatched for r3.**
 
 v2 changes: (a) secondary-index **adds are always re-asserted** (matches today's
 unconditional `index_forward_nat_key` insert exactly, incl. the
@@ -95,15 +95,22 @@ pub fn update_session(&mut self, req: SessionUpdate<'_>, ha_activation: bool) ->
     let old_owner_rg = record.entry.metadata.owner_rg_id;
     // (immutable borrow of `record` ends here)
 
-    // Collision rules — IDENTICAL to current semantics; reject is now a pure
-    // early return (today's reject does remove_entry then restore_entry then
-    // returns false → net-state-neutral, confirmed by both reviewers).
+    // Collision rules — IDENTICAL to current semantics. NOTE (Codex r2): today's
+    // reject path does remove_entry THEN restore_entry THEN returns false, and
+    // restore_entry's unconditional index_forward_nat_key RE-ASSERTS this entry's
+    // own secondary ADDS even on reject. To stay byte-identical, the reject
+    // branches must re-assert too (parts-based, zero-clone) before returning.
     if !ha_activation {
         let new_peer = origin.is_peer_synced();
-        if old_origin.is_peer_synced() && !new_peer { /* promote: allow */ }
-        else if old_origin.is_peer_synced() && new_peer { return false; }
-        else if !old_origin.is_peer_synced() && new_peer { return false; }
-        // both local: allow
+        let reject = (old_origin.is_peer_synced() && new_peer)      // peer→peer
+                  || (!old_origin.is_peer_synced() && new_peer);     // local←peer
+        if reject {
+            // Re-assert OLD secondary ADDS (entry unchanged), then bail — matches
+            // restore_entry's re-assert on the current reject path exactly.
+            self.index_forward_nat_key_parts(key, handle, old_nat, old_is_reverse, old_owner_rg);
+            return false;
+        }
+        // else: peer→local promote, or local→local refresh: fall through to accept.
     }
 
     // Reindex predicate — complete per §2 (key + handle invariant). Gates only
@@ -176,13 +183,15 @@ No public signature changes. `update_session`, `refresh_local`,
    peer→peer reject; local←peer reject; local→local refresh) must behave
    identically. In-place makes reject a no-op early return — observably
    identical to remove+restore-then-return-false (net state unchanged).
-2. **Index semantics (v2)**: secondary ADDS are always re-asserted (parity with
-   today's unconditional `index_forward_nat_key`), so the unconditional-insert /
-   value-guarded-remove collision behavior is preserved exactly even if two live
-   sessions transiently derive the same secondary key. The `reindex` predicate
-   gates only the value-guarded REMOVES of the OLD keys; it is complete per §2
-   (indices depend only on key+nat+is_reverse+owner_rg; key & handle invariant).
-   **This is the #1 review target.**
+2. **Index semantics (v3)**: secondary ADDS are always re-asserted (parity with
+   today's unconditional `index_forward_nat_key` in `restore_entry`) on BOTH the
+   accept path AND the reject path (Codex r2: today's reject = remove+restore+
+   false, and restore re-asserts). A new private `index_forward_nat_key_parts(key,
+   handle, nat, is_reverse, owner_rg)` re-asserts from Copy parts (zero clone) on
+   the reject path; the accept path uses the full `index_forward_nat_key` with the
+   new metadata in hand. The `reindex` predicate gates only the value-guarded
+   REMOVES of the OLD keys; it is complete per §2 (indices depend only on
+   key+nat+is_reverse+owner_rg; key & handle invariant). **#1 review target.**
 2b. **Stale-handle / primary-key guard**: `entries.get(handle)` + `record.key ==
    *key` before any mutation; mismatch → return false (no-op), matching
    `remove_entry`'s release-mode guards. Never `entries[handle]` (panic/corrupt).
@@ -222,6 +231,9 @@ No public signature changes. `update_session`, `refresh_local`,
   - **secondary-index collision** (Codex Major #1): two live sessions whose
     derived secondary key collides — refresh one, assert the in-place table
     matches the reference (the re-assert re-wins identically);
+  - **reject-path collision re-assert** (Codex r2): a displaced-collision session
+    hit with a REJECTED update (peer→peer AND local←peer) must re-win its
+    secondary key identically to today's remove+restore-then-false;
   - **stale/wrong-key guard**: stale `key_to_handle` → vacant slot, and reused
     slot holding a different `record.key` → both return false, no mutation;
   - `refresh_for_ha_transition` liveness parity;
@@ -260,7 +272,10 @@ proof. Q2 reject-early-return net-neutral — confirmed by both. Q3 borrow/zero-
 hot path — confirmed feasible. Q4 owner_rg transition — works via reindex branch;
 added owner_rg `0↔>0`/`>0→>0'` + ha_transition tests. Q5 wheel_tick parity —
 confirmed. Q6 differential sufficiency — added collision + stale-handle +
-randomized property tests (Codex wanted them; cheap insurance). Remaining for r2:
+randomized property tests (Codex wanted them; cheap insurance). **r2 resolution (v3):** Gemini r2 PLAN-READY. Codex r2 NEEDS-MAJOR — accepted-
+path re-assert was correct but the REJECT branches returned before re-asserting,
+diverging from today's restore-on-reject. v3 re-asserts on reject via
+`index_forward_nat_key_parts` and adds reject-path collision tests. Remaining:
 
 1. Is the reindex predicate (`old_nat != nat || old_is_reverse != is_reverse ||
    old_owner_rg != owner_rg`) provably complete, or is there an index whose key
