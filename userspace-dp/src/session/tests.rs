@@ -1757,3 +1757,539 @@ fn refresh_for_ha_activation_updates_peer_synced_entries() {
     let lookup = table.lookup(&key, 3_000_000, 0x10).expect("session");
     assert_eq!(lookup.decision.resolution.egress_ifindex, 99);
 }
+
+// ---------------------------------------------------------------------------
+// #1752 Path E: in-place refresh differential tests.
+//
+// The pre-#1752 update_session did remove_entry + mutate + restore_entry. The
+// in-place rewrite must be behaviorally equivalent (handle-normalized — the
+// slab handle VALUE legitimately differs because remove+restore allocates a
+// fresh slot while in-place keeps the slot). `reference_update_session` below
+// reproduces the OLD path verbatim; every scenario applies the same op to two
+// tables and asserts equivalence via observable views (entries, lookups,
+// owner-RG key sets, deltas) — never raw u32 handles.
+// ---------------------------------------------------------------------------
+
+/// Verbatim reproduction of the pre-#1752 remove+restore update_session.
+fn reference_update_session(
+    table: &mut SessionTable,
+    req: SessionUpdate<'_>,
+    ha_activation: bool,
+) -> bool {
+    let SessionUpdate {
+        key,
+        decision,
+        metadata,
+        origin,
+        now_ns,
+        protocol,
+        tcp_flags,
+    } = req;
+    let Some(mut entry) = table.remove_entry(key) else {
+        return false;
+    };
+    if !ha_activation {
+        if entry.origin.is_peer_synced() && !origin.is_peer_synced() {
+        } else if entry.origin.is_peer_synced() && origin.is_peer_synced() {
+            table.restore_entry(key.clone(), entry);
+            return false;
+        } else if !entry.origin.is_peer_synced() && origin.is_peer_synced() {
+            table.restore_entry(key.clone(), entry);
+            return false;
+        }
+    }
+    let was_peer_synced = entry.origin.is_peer_synced();
+    entry.decision = decision;
+    entry.metadata = metadata.clone();
+    entry.origin = origin;
+    entry.install_epoch = table.next_epoch();
+    entry.last_seen_ns = now_ns;
+    entry.expires_after_ns = session_timeout_ns(protocol, tcp_flags, &table.timeouts);
+    entry.closing = matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0;
+    table.restore_entry(key.clone(), entry);
+    table.push_to_wheel(key, now_ns);
+    if was_peer_synced && !origin.is_peer_synced() && !metadata.is_reverse {
+        table.push_delta(SessionDelta {
+            kind: SessionDeltaKind::Open,
+            key: key.clone(),
+            decision,
+            metadata,
+            origin,
+            fabric_redirect_sync: false,
+        });
+    }
+    true
+}
+
+fn entries_equiv(a: &SessionTable, b: &SessionTable, key: &SessionKey) -> bool {
+    match (a.entry_by_key(key), b.entry_by_key(key)) {
+        (Some(ea), Some(eb)) => {
+            ea.decision == eb.decision
+                && ea.metadata == eb.metadata
+                && ea.origin == eb.origin
+                && ea.install_epoch == eb.install_epoch
+                && ea.last_seen_ns == eb.last_seen_ns
+                && ea.expires_after_ns == eb.expires_after_ns
+                && ea.closing == eb.closing
+                && ea.wheel_tick == eb.wheel_tick
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn sorted_keys(mut v: Vec<SessionKey>) -> Vec<String> {
+    let mut s: Vec<String> = v.drain(..).map(|k| format!("{k:?}")).collect();
+    s.sort();
+    s
+}
+
+/// Assert handle-normalized equivalence of two tables across entries, the
+/// reverse/wire NAT lookups for the given probe keys, owner-RG key sets, and
+/// drained deltas.
+fn assert_tables_equiv(
+    inplace: &mut SessionTable,
+    reference: &mut SessionTable,
+    keys: &[SessionKey],
+    probe_keys: &[SessionKey],
+    owner_rgs: &[i32],
+) {
+    assert_eq!(inplace.len(), reference.len(), "len mismatch");
+    for k in keys {
+        assert!(entries_equiv(inplace, reference, k), "entry mismatch for {k:?}");
+    }
+    for pk in probe_keys {
+        assert_eq!(
+            inplace.find_forward_nat_match(pk).map(|m| m.key),
+            reference.find_forward_nat_match(pk).map(|m| m.key),
+            "find_forward_nat_match diverged for {pk:?}"
+        );
+        assert_eq!(
+            inplace.find_forward_wire_match(pk).map(|m| m.key),
+            reference.find_forward_wire_match(pk).map(|m| m.key),
+            "find_forward_wire_match diverged for {pk:?}"
+        );
+    }
+    assert_eq!(
+        sorted_keys(inplace.owner_rg_session_keys(owner_rgs)),
+        sorted_keys(reference.owner_rg_session_keys(owner_rgs)),
+        "owner_rg_session_keys diverged"
+    );
+    assert_eq!(
+        inplace.drain_deltas(256),
+        reference.drain_deltas(256),
+        "deltas diverged"
+    );
+}
+
+fn nat_rewrite() -> SessionDecision {
+    SessionDecision {
+        resolution: resolution(),
+        nat: NatDecision {
+            rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))),
+            rewrite_src_port: Some(40001),
+            ..NatDecision::default()
+        },
+    }
+}
+
+/// Build two identical tables with `key` installed at the given origin.
+fn two_tables_with(
+    key: &SessionKey,
+    decision: SessionDecision,
+    md: SessionMetadata,
+    origin: SessionOrigin,
+    now: u64,
+) -> (SessionTable, SessionTable) {
+    let mut a = SessionTable::new();
+    let mut b = SessionTable::new();
+    for t in [&mut a, &mut b] {
+        assert!(t.install_with_protocol_with_origin(
+            key.clone(),
+            decision,
+            md.clone(),
+            origin,
+            now,
+            key.protocol,
+            0,
+        ));
+    }
+    (a, b)
+}
+
+#[test]
+fn inplace_local_refresh_matches_reference() {
+    let key = key_v4();
+    let (mut ip, mut rf) = two_tables_with(&key, decision(), metadata(), SessionOrigin::ForwardFlow, 1_000);
+    let req = |now| SessionUpdate {
+        key: &key,
+        decision: decision(),
+        metadata: metadata(),
+        origin: SessionOrigin::ForwardFlow,
+        now_ns: now,
+        protocol: PROTO_TCP,
+        tcp_flags: 0,
+    };
+    assert!(ip.update_session(req(2_000), false));
+    assert!(reference_update_session(&mut rf, req(2_000), false));
+    assert_tables_equiv(&mut ip, &mut rf, &[key.clone()], &[], &[1, 2]);
+}
+
+#[test]
+fn inplace_peer_to_local_promote_matches_reference() {
+    let key = key_v4();
+    let (mut ip, mut rf) = two_tables_with(&key, decision(), metadata(), SessionOrigin::SyncImport, 1_000);
+    let req = SessionUpdate {
+        key: &key,
+        decision: decision(),
+        metadata: metadata(),
+        origin: SessionOrigin::ForwardFlow,
+        now_ns: 2_000,
+        protocol: PROTO_TCP,
+        tcp_flags: 0,
+    };
+    let r1 = ip.update_session(req.clone(), false);
+    let r2 = reference_update_session(&mut rf, req, false);
+    assert_eq!(r1, r2);
+    assert!(r1, "promote should succeed");
+    assert_tables_equiv(&mut ip, &mut rf, &[key.clone()], &[], &[1, 2]);
+}
+
+#[test]
+fn inplace_peer_to_peer_reject_matches_reference() {
+    let key = key_v4();
+    let (mut ip, mut rf) = two_tables_with(&key, decision(), metadata(), SessionOrigin::SyncImport, 1_000);
+    let req = SessionUpdate {
+        key: &key,
+        decision: decision(),
+        metadata: metadata(),
+        origin: SessionOrigin::SyncImport,
+        now_ns: 2_000,
+        protocol: PROTO_TCP,
+        tcp_flags: 0,
+    };
+    assert!(!ip.update_session(req.clone(), false));
+    assert!(!reference_update_session(&mut rf, req, false));
+    assert_tables_equiv(&mut ip, &mut rf, &[key.clone()], &[], &[1, 2]);
+}
+
+#[test]
+fn inplace_local_from_peer_reject_matches_reference() {
+    let key = key_v4();
+    let (mut ip, mut rf) = two_tables_with(&key, decision(), metadata(), SessionOrigin::ForwardFlow, 1_000);
+    let req = SessionUpdate {
+        key: &key,
+        decision: decision(),
+        metadata: metadata(),
+        origin: SessionOrigin::SyncImport,
+        now_ns: 2_000,
+        protocol: PROTO_TCP,
+        tcp_flags: 0,
+    };
+    assert!(!ip.update_session(req.clone(), false));
+    assert!(!reference_update_session(&mut rf, req, false));
+    assert_tables_equiv(&mut ip, &mut rf, &[key.clone()], &[], &[1, 2]);
+}
+
+#[test]
+fn inplace_ha_activation_matches_reference() {
+    let key = key_v4();
+    let (mut ip, mut rf) = two_tables_with(&key, decision(), metadata(), SessionOrigin::SyncImport, 1_000);
+    // ha_activation=true always applies regardless of origin.
+    let req = SessionUpdate {
+        key: &key,
+        decision: decision(),
+        metadata: metadata(),
+        origin: SessionOrigin::SyncImport,
+        now_ns: 3_000,
+        protocol: PROTO_TCP,
+        tcp_flags: 0,
+    };
+    assert!(ip.update_session(req.clone(), true));
+    assert!(reference_update_session(&mut rf, req, true));
+    assert_tables_equiv(&mut ip, &mut rf, &[key.clone()], &[], &[1, 2]);
+}
+
+#[test]
+fn inplace_nat_reindex_matches_reference() {
+    let key = key_v4();
+    // baseline: default nat. refresh: nat rewrite -> reverse index keys change.
+    let (mut ip, mut rf) = two_tables_with(&key, decision(), metadata(), SessionOrigin::ForwardFlow, 1_000);
+    let probe_old = reverse_wire_key(&key, NatDecision::default());
+    let probe_new = reverse_wire_key(&key, nat_rewrite().nat);
+    let req = SessionUpdate {
+        key: &key,
+        decision: nat_rewrite(),
+        metadata: metadata(),
+        origin: SessionOrigin::ForwardFlow,
+        now_ns: 2_000,
+        protocol: PROTO_TCP,
+        tcp_flags: 0,
+    };
+    assert!(ip.update_session(req.clone(), false));
+    assert!(reference_update_session(&mut rf, req, false));
+    assert_tables_equiv(&mut ip, &mut rf, &[key.clone()], &[probe_old, probe_new], &[1, 2]);
+}
+
+#[test]
+fn inplace_owner_rg_transitions_match_reference() {
+    let key = key_v4();
+    for (from_rg, to_rg) in [(1i32, 2i32), (1, 0), (0, 1)] {
+        let mut md_from = metadata();
+        md_from.owner_rg_id = from_rg;
+        let (mut ip, mut rf) =
+            two_tables_with(&key, decision(), md_from, SessionOrigin::ForwardFlow, 1_000);
+        let mut md_to = metadata();
+        md_to.owner_rg_id = to_rg;
+        let req = SessionUpdate {
+            key: &key,
+            decision: decision(),
+            metadata: md_to,
+            origin: SessionOrigin::ForwardFlow,
+            now_ns: 2_000,
+            protocol: PROTO_TCP,
+            tcp_flags: 0,
+        };
+        assert!(ip.update_session(req.clone(), false));
+        assert!(reference_update_session(&mut rf, req, false));
+        assert_tables_equiv(&mut ip, &mut rf, &[key.clone()], &[], &[0, 1, 2]);
+    }
+}
+
+#[test]
+fn inplace_reject_reasserts_displaced_collision_like_reference() {
+    // Simulate a secondary-index collision: another (bogus) handle has displaced
+    // this session's reverse-wire index slot. Today's reject path re-asserts via
+    // remove+restore; in-place re-asserts via index_forward_nat_key_parts. Both
+    // must re-win the slot identically.
+    let key = key_v4();
+    let (mut ip, mut rf) =
+        two_tables_with(&key, decision(), metadata(), SessionOrigin::ForwardFlow, 1_000);
+    let collide = reverse_wire_key(&key, NatDecision::default());
+    for t in [&mut ip, &mut rf] {
+        t.nat_reverse_index.insert(collide.clone(), 9999u32);
+    }
+    // local<-peer reject (origin SyncImport on a local entry).
+    let req = SessionUpdate {
+        key: &key,
+        decision: decision(),
+        metadata: metadata(),
+        origin: SessionOrigin::SyncImport,
+        now_ns: 2_000,
+        protocol: PROTO_TCP,
+        tcp_flags: 0,
+    };
+    assert!(!ip.update_session(req.clone(), false));
+    assert!(!reference_update_session(&mut rf, req, false));
+    // Both must have re-won the displaced slot back to the real session.
+    assert_tables_equiv(&mut ip, &mut rf, &[key.clone()], &[collide], &[1, 2]);
+}
+
+#[test]
+fn inplace_accept_reasserts_displaced_collision_like_reference() {
+    let key = key_v4();
+    let (mut ip, mut rf) =
+        two_tables_with(&key, decision(), metadata(), SessionOrigin::ForwardFlow, 1_000);
+    let collide = reverse_wire_key(&key, NatDecision::default());
+    for t in [&mut ip, &mut rf] {
+        t.nat_reverse_index.insert(collide.clone(), 9999u32);
+    }
+    let req = SessionUpdate {
+        key: &key,
+        decision: decision(),
+        metadata: metadata(),
+        origin: SessionOrigin::ForwardFlow,
+        now_ns: 2_000,
+        protocol: PROTO_TCP,
+        tcp_flags: 0,
+    };
+    assert!(ip.update_session(req.clone(), false));
+    assert!(reference_update_session(&mut rf, req, false));
+    assert_tables_equiv(&mut ip, &mut rf, &[key.clone()], &[collide], &[1, 2]);
+}
+
+#[test]
+fn inplace_stale_handle_returns_false_no_panic() {
+    let key = key_v4();
+    let other = key_v6();
+    let mut t = SessionTable::new();
+    assert!(t.install_with_protocol_with_origin(
+        key.clone(), decision(), metadata(), SessionOrigin::ForwardFlow, 1_000, key.protocol, 0,
+    ));
+    assert!(t.install_with_protocol_with_origin(
+        other.clone(), decision(), metadata(), SessionOrigin::ForwardFlow, 1_000, other.protocol, 0,
+    ));
+    // Point `key` at `other`'s handle => primary-key guard must reject.
+    let other_handle = *t.key_to_handle.get(&other).expect("other handle");
+    t.key_to_handle.insert(key.clone(), other_handle);
+    let req = SessionUpdate {
+        key: &key,
+        decision: decision(),
+        metadata: metadata(),
+        origin: SessionOrigin::ForwardFlow,
+        now_ns: 2_000,
+        protocol: PROTO_TCP,
+        tcp_flags: 0,
+    };
+    // Must not panic and must not mutate the unrelated `other` session.
+    let before = t.entry_by_key(&other).map(|e| e.last_seen_ns);
+    assert!(!t.update_session(req, false));
+    assert_eq!(t.entry_by_key(&other).map(|e| e.last_seen_ns), before);
+}
+
+#[test]
+fn inplace_randomized_sequence_matches_reference() {
+    // Deterministic LCG (Math.random is unavailable in this env; fixed seed).
+    let mut state: u64 = 0x9E3779B97F4A7C15;
+    let mut next = || {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (state >> 33) as u32
+    };
+    let keys = [key_v4(), key_v6()];
+    let mut ip = SessionTable::new();
+    let mut rf = SessionTable::new();
+    // Install both keys identically.
+    for t in [&mut ip, &mut rf] {
+        for k in &keys {
+            assert!(t.install_with_protocol_with_origin(
+                k.clone(), decision(), metadata(), SessionOrigin::ForwardFlow, 1_000, k.protocol, 0,
+            ));
+        }
+    }
+    for step in 0..400u64 {
+        let k = &keys[(next() % 2) as usize];
+        let origin = if next() % 3 == 0 { SessionOrigin::SyncImport } else { SessionOrigin::ForwardFlow };
+        let dec = if next() % 4 == 0 { nat_rewrite() } else { decision() };
+        let mut md = metadata();
+        md.owner_rg_id = (next() % 3) as i32; // 0,1,2
+        md.is_reverse = next() % 5 == 0;
+        let ha = next() % 7 == 0;
+        // Vary tcp_flags so the FIN/RST `closing` + `expires_after_ns` branch is
+        // exercised, not only the steady-state tcp_flags=0 path.
+        let tcp_flags = match next() % 4 {
+            0 => TCP_FIN,
+            1 => TCP_RST,
+            _ => 0,
+        };
+        let now = 2_000 + step * 10;
+        let req = SessionUpdate {
+            key: k,
+            decision: dec,
+            metadata: md,
+            origin,
+            now_ns: now,
+            protocol: k.protocol,
+            tcp_flags,
+        };
+        let r1 = ip.update_session(req.clone(), ha);
+        let r2 = reference_update_session(&mut rf, req, ha);
+        assert_eq!(r1, r2, "accept/reject diverged at step {step}");
+        let probes: Vec<SessionKey> = keys
+            .iter()
+            .flat_map(|kk| {
+                [
+                    reverse_wire_key(kk, NatDecision::default()),
+                    reverse_wire_key(kk, nat_rewrite().nat),
+                ]
+            })
+            .collect();
+        assert_tables_equiv(&mut ip, &mut rf, &keys, &probes, &[0, 1, 2]);
+    }
+}
+
+/// Verbatim reproduction of the pre-#1752 remove+restore refresh_for_ha_transition.
+fn reference_refresh_for_ha_transition(
+    table: &mut SessionTable,
+    key: &SessionKey,
+    decision: SessionDecision,
+    metadata: SessionMetadata,
+    now_ns: u64,
+) -> bool {
+    let Some(mut entry) = table.remove_entry(key) else {
+        return false;
+    };
+    entry.decision = decision;
+    entry.metadata = metadata;
+    entry.install_epoch = table.next_epoch();
+    entry.last_seen_ns = now_ns;
+    table.restore_entry(key.clone(), entry);
+    table.push_to_wheel(key, now_ns);
+    true
+}
+
+#[test]
+fn inplace_ha_transition_matches_reference() {
+    let key = key_v4();
+    // Case 0: identical decision + metadata (owner_rg_id stays 1, nat unchanged)
+    // -> the no-reindex/skip branch. Case 1: nat rewrite + owner_rg 1->2 -> the
+    // reindex branch. Baseline metadata() has owner_rg_id=1, so case 0 must NOT
+    // mutate md (else it would also reindex).
+    let reindex_md = {
+        let mut m = metadata();
+        m.owner_rg_id = 2;
+        m
+    };
+    for (dec, md) in [(decision(), metadata()), (nat_rewrite(), reindex_md)] {
+        let (mut ip, mut rf) =
+            two_tables_with(&key, decision(), metadata(), SessionOrigin::SyncImport, 1_000);
+        let probe_old = reverse_wire_key(&key, NatDecision::default());
+        let probe_new = reverse_wire_key(&key, dec.nat);
+        assert!(ip.refresh_for_ha_transition(&key, dec, md.clone(), 2_000));
+        assert!(reference_refresh_for_ha_transition(&mut rf, &key, dec, md, 2_000));
+        assert_tables_equiv(
+            &mut ip,
+            &mut rf,
+            &[key.clone()],
+            &[probe_old, probe_new],
+            &[0, 1, 2],
+        );
+    }
+}
+
+#[test]
+fn inplace_vacant_handle_returns_false_no_panic() {
+    // key_to_handle points at a slab slot that was never allocated -> the
+    // entries.get(handle) == None guard must return false without panicking.
+    let key = key_v4();
+    let mut t = SessionTable::new();
+    t.key_to_handle.insert(key.clone(), 9999u32);
+    let req = SessionUpdate {
+        key: &key,
+        decision: decision(),
+        metadata: metadata(),
+        origin: SessionOrigin::ForwardFlow,
+        now_ns: 2_000,
+        protocol: PROTO_TCP,
+        tcp_flags: 0,
+    };
+    assert!(!t.update_session(req, false));
+    // refresh_for_ha_transition shares the same guard.
+    assert!(!t.refresh_for_ha_transition(&key, decision(), metadata(), 2_000));
+}
+
+#[test]
+fn inplace_fin_rst_closing_matches_reference() {
+    // FIN/RST set `closing` and shorten expires_after_ns; verify the in-place
+    // path writes them identically to the reference for both flags.
+    let key = key_v4();
+    for flags in [TCP_FIN, TCP_RST, TCP_FIN | TCP_RST] {
+        let (mut ip, mut rf) =
+            two_tables_with(&key, decision(), metadata(), SessionOrigin::ForwardFlow, 1_000);
+        let req = SessionUpdate {
+            key: &key,
+            decision: decision(),
+            metadata: metadata(),
+            origin: SessionOrigin::ForwardFlow,
+            now_ns: 2_000,
+            protocol: PROTO_TCP,
+            tcp_flags: flags,
+        };
+        assert!(ip.update_session(req.clone(), false));
+        assert!(reference_update_session(&mut rf, req, false));
+        assert!(
+            ip.entry_by_key(&key).expect("entry").closing,
+            "closing should be set for flags {flags:#x}"
+        );
+        assert_tables_equiv(&mut ip, &mut rf, &[key.clone()], &[], &[1, 2]);
+    }
+}

@@ -810,35 +810,105 @@ impl SessionTable {
             protocol,
             tcp_flags,
         } = req;
-        let Some(mut entry) = self.remove_entry(key) else {
+        // #1752 Path E: in-place refresh. The prior implementation did
+        // `remove_entry` + mutate + `restore_entry`, which tore down and rebuilt
+        // every index (key_to_handle map, slab slot with a NEW handle, all four
+        // secondary indices) plus ~3 SessionMetadata clones on EVERY packet of an
+        // established flow, only to bump timestamps. We now mutate the slab record
+        // in place, gating secondary-index REMOVES on key-relevant input changes
+        // (nat / is_reverse / owner_rg_id) while still re-asserting
+        // secondary-index ADDS every refresh (restore_entry parity). Behavior is
+        // byte-identical (modulo the opaque slab handle value); see
+        // docs/pr/1752-session-inplace-refresh/plan.md.
+        let Some(&handle) = self.key_to_handle.get(key) else {
             return false;
         };
+        // Stale-handle + primary-key guard (parity with remove_entry): never
+        // index the slab raw — a stale key_to_handle could point at a vacant or
+        // reused slot. On mismatch behave like remove_entry returning None.
+        let Some(record) = self.entries.get(handle as usize) else {
+            debug_assert!(
+                false,
+                "update_session: key_to_handle had stale handle {} for {:?}",
+                handle, key
+            );
+            return false;
+        };
+        if record.key != *key {
+            debug_assert!(false, "update_session: stale key_to_handle for {:?}", key);
+            return false;
+        }
+        // Snapshot the OLD index-relevant + collision-relevant state (all Copy).
+        let old_origin = record.entry.origin;
+        let old_nat = record.entry.decision.nat;
+        let old_is_reverse = record.entry.metadata.is_reverse;
+        let old_owner_rg = record.entry.metadata.owner_rg_id;
+
         if !ha_activation {
-            if entry.origin.is_peer_synced() && !origin.is_peer_synced() {
-                // Peer-synced entry being promoted by local traffic — allow
-            } else if entry.origin.is_peer_synced() && origin.is_peer_synced() {
-                // Both peer-synced: reject (refresh_local on synced entry)
-                self.restore_entry(key.clone(), entry);
-                return false;
-            } else if !entry.origin.is_peer_synced() && origin.is_peer_synced() {
-                // Local entry: reject peer data trying to overwrite
-                self.restore_entry(key.clone(), entry);
+            let new_peer = origin.is_peer_synced();
+            // Reject: both peer-synced (refresh_local on a synced entry) OR peer
+            // data trying to overwrite a local entry. The prior code reached this
+            // via remove_entry + restore_entry + return false, and restore_entry
+            // unconditionally re-asserts the entry's own secondary ADDS. To stay
+            // byte-identical (incl. re-winning a displaced secondary-index
+            // collision), re-assert the OLD adds before bailing.
+            let should_reject_update = new_peer;
+            if should_reject_update {
+                self.index_forward_nat_key_parts(
+                    key,
+                    handle,
+                    old_nat,
+                    old_is_reverse,
+                    old_owner_rg,
+                );
                 return false;
             }
-            // Both local: allow (local refresh of local entry)
+            // Else: peer→local promote, or local→local refresh — fall through.
         }
-        let was_peer_synced = entry.origin.is_peer_synced();
-        entry.decision = decision;
-        entry.metadata = metadata.clone();
-        entry.origin = origin;
-        entry.install_epoch = self.next_epoch();
-        entry.last_seen_ns = now_ns;
-        entry.expires_after_ns = session_timeout_ns(protocol, tcp_flags, &self.timeouts);
-        entry.closing = matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0;
-        self.restore_entry(key.clone(), entry);
-        // #965: schedule the refreshed entry. Last_seen / expires_after
-        // were rewritten above; push_to_wheel is throttled and will only
-        // emit a new wheel entry if the canonical tick changed.
+        let was_peer_synced = old_origin.is_peer_synced();
+
+        // Reindex only when a secondary-index input changed (§2 of the plan:
+        // indices depend only on key + nat + is_reverse + owner_rg_id, and key +
+        // handle are invariant here). Gates only the value-guarded REMOVES.
+        let reindex = old_nat != decision.nat
+            || old_is_reverse != metadata.is_reverse
+            || old_owner_rg != metadata.owner_rg_id;
+        if reindex {
+            self.remove_forward_nat_index_parts(key, handle, old_nat, old_is_reverse);
+            remove_owner_rg_index_entry(&mut self.owner_rg_sessions, old_owner_rg, handle);
+        }
+
+        let epoch = self.next_epoch();
+        {
+            let record = self
+                .entries
+                .get_mut(handle as usize)
+                .expect("handle validated above");
+            record.entry.decision = decision;
+            record.entry.metadata = metadata.clone();
+            record.entry.origin = origin;
+            record.entry.install_epoch = epoch;
+            record.entry.last_seen_ns = now_ns;
+            record.entry.expires_after_ns = session_timeout_ns(protocol, tcp_flags, &self.timeouts);
+            record.entry.closing =
+                matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0;
+            // wheel_tick deliberately preserved (parity with restore_entry).
+        }
+        // Always re-assert the secondary ADDS — byte-identical to restore_entry's
+        // unconditional index_forward_nat_key. For the no-reindex case this
+        // re-inserts the same keys→handle (idempotent when unique, re-wins on a
+        // collision); for the reindex case it installs the NEW keys after the
+        // removes above.
+        self.index_forward_nat_key_parts(
+            key,
+            handle,
+            decision.nat,
+            metadata.is_reverse,
+            metadata.owner_rg_id,
+        );
+        // #965: schedule the refreshed entry. Last_seen / expires_after were
+        // rewritten above; push_to_wheel is throttled and will only emit a new
+        // wheel entry if the canonical tick changed.
         self.push_to_wheel(key, now_ns);
         // Emit open delta when promoting a peer-synced entry to local
         if was_peer_synced && !origin.is_peer_synced() && !metadata.is_reverse {
@@ -922,14 +992,55 @@ impl SessionTable {
         metadata: SessionMetadata,
         now_ns: u64,
     ) -> bool {
-        let Some(mut entry) = self.remove_entry(key) else {
+        // #1752 Path E: in-place (mirrors update_session, minus collision rules
+        // — this path always applies). No expires_after_ns / closing rewrite,
+        // matching the prior behavior.
+        let Some(&handle) = self.key_to_handle.get(key) else {
             return false;
         };
-        entry.decision = decision;
-        entry.metadata = metadata;
-        entry.install_epoch = self.next_epoch();
-        entry.last_seen_ns = now_ns;
-        self.restore_entry(key.clone(), entry);
+        let Some(record) = self.entries.get(handle as usize) else {
+            debug_assert!(
+                false,
+                "refresh_for_ha_transition: stale handle {} for {:?}",
+                handle, key
+            );
+            return false;
+        };
+        if record.key != *key {
+            debug_assert!(
+                false,
+                "refresh_for_ha_transition: stale key_to_handle for {:?}",
+                key
+            );
+            return false;
+        }
+        let old_nat = record.entry.decision.nat;
+        let old_is_reverse = record.entry.metadata.is_reverse;
+        let old_owner_rg = record.entry.metadata.owner_rg_id;
+        // Capture the new index parts before `metadata` is moved into the record.
+        let new_nat = decision.nat;
+        let new_is_reverse = metadata.is_reverse;
+        let new_owner_rg = metadata.owner_rg_id;
+
+        let reindex =
+            old_nat != new_nat || old_is_reverse != new_is_reverse || old_owner_rg != new_owner_rg;
+        if reindex {
+            self.remove_forward_nat_index_parts(key, handle, old_nat, old_is_reverse);
+            remove_owner_rg_index_entry(&mut self.owner_rg_sessions, old_owner_rg, handle);
+        }
+
+        let epoch = self.next_epoch();
+        {
+            let record = self
+                .entries
+                .get_mut(handle as usize)
+                .expect("handle validated above");
+            record.entry.decision = decision;
+            record.entry.metadata = metadata;
+            record.entry.install_epoch = epoch;
+            record.entry.last_seen_ns = now_ns;
+        }
+        self.index_forward_nat_key_parts(key, handle, new_nat, new_is_reverse, new_owner_rg);
         // #965: schedule the refreshed entry for expiration check.
         self.push_to_wheel(key, now_ns);
         true
@@ -1173,6 +1284,13 @@ impl SessionTable {
     /// #964 Step 1: re-insert an entry that was just `remove_entry`'d.
     /// Returns None always — kept return type for API compatibility
     /// with the prior FxHashMap-based shape.
+    ///
+    /// #1752 Path E: no longer used by the refresh paths (`update_session` /
+    /// `refresh_for_ha_transition` now mutate in place). Retained as the
+    /// reference half of the remove+restore round-trip the differential tests
+    /// compare against, so in release builds it is retained as dead-code-allowed
+    /// test reference logic (not conditionally compiled out).
+    #[cfg_attr(not(test), allow(dead_code))]
     fn restore_entry(&mut self, key: SessionKey, entry: SessionEntry) -> Option<SessionEntry> {
         let record = SessionRecord {
             key: key.clone(),
@@ -1208,26 +1326,48 @@ impl SessionTable {
         decision: SessionDecision,
         metadata: &SessionMetadata,
     ) {
-        if metadata.is_reverse {
-            let translated = translated_session_key(key, decision.nat);
+        self.index_forward_nat_key_parts(
+            key,
+            handle,
+            decision.nat,
+            metadata.is_reverse,
+            metadata.owner_rg_id,
+        );
+    }
+
+    /// #1752 Path E: secondary-index insert from the Copy parts the index
+    /// actually depends on (`nat`, `is_reverse`, `owner_rg_id`). Lets the
+    /// in-place refresh path re-assert (and reindex) without cloning a
+    /// `SessionMetadata` / `SessionDecision`. `index_forward_nat_key` delegates
+    /// here so the two stay bit-identical.
+    fn index_forward_nat_key_parts(
+        &mut self,
+        key: &SessionKey,
+        handle: u32,
+        nat: NatDecision,
+        is_reverse: bool,
+        owner_rg_id: i32,
+    ) {
+        if is_reverse {
+            let translated = translated_session_key(key, nat);
             if translated != *key {
                 self.reverse_translated_index.insert(translated, handle);
             }
         } else {
             self.nat_reverse_index
-                .insert(reverse_wire_key(key, decision.nat), handle);
-            let reverse_canonical = reverse_canonical_key(key, decision.nat);
+                .insert(reverse_wire_key(key, nat), handle);
+            let reverse_canonical = reverse_canonical_key(key, nat);
             if reverse_canonical != *key {
                 self.nat_reverse_index.insert(reverse_canonical, handle);
             }
-            let forward_wire = forward_wire_key(key, decision.nat);
+            let forward_wire = forward_wire_key(key, nat);
             if forward_wire != *key {
                 self.forward_wire_index.insert(forward_wire, handle);
             }
         }
-        if metadata.owner_rg_id > 0 {
+        if owner_rg_id > 0 {
             self.owner_rg_sessions
-                .entry(metadata.owner_rg_id)
+                .entry(owner_rg_id)
                 .or_default()
                 .insert(handle);
         }
@@ -1244,8 +1384,22 @@ impl SessionTable {
         decision: SessionDecision,
         metadata: &SessionMetadata,
     ) {
-        if metadata.is_reverse {
-            let translated = translated_session_key(key, decision.nat);
+        self.remove_forward_nat_index_parts(key, handle, decision.nat, metadata.is_reverse);
+    }
+
+    /// #1752 Path E: value-guarded secondary-index removal from the Copy parts
+    /// (`nat`, `is_reverse`). Used by the in-place reindex teardown so it needs
+    /// no `SessionMetadata`/`SessionDecision` clone. `remove_forward_nat_index`
+    /// delegates here.
+    fn remove_forward_nat_index_parts(
+        &mut self,
+        key: &SessionKey,
+        handle: u32,
+        nat: NatDecision,
+        is_reverse: bool,
+    ) {
+        if is_reverse {
+            let translated = translated_session_key(key, nat);
             if matches!(
                 self.reverse_translated_index.get(&translated),
                 Some(stored) if *stored == handle
@@ -1254,18 +1408,18 @@ impl SessionTable {
             }
             return;
         }
-        let reverse_wire = reverse_wire_key(key, decision.nat);
+        let reverse_wire = reverse_wire_key(key, nat);
         if matches!(self.nat_reverse_index.get(&reverse_wire), Some(stored) if *stored == handle) {
             self.nat_reverse_index.remove(&reverse_wire);
         }
-        let reverse_canonical = reverse_canonical_key(key, decision.nat);
+        let reverse_canonical = reverse_canonical_key(key, nat);
         if matches!(
             self.nat_reverse_index.get(&reverse_canonical),
             Some(stored) if *stored == handle
         ) {
             self.nat_reverse_index.remove(&reverse_canonical);
         }
-        let forward_wire = forward_wire_key(key, decision.nat);
+        let forward_wire = forward_wire_key(key, nat);
         if matches!(self.forward_wire_index.get(&forward_wire), Some(stored) if *stored == handle) {
             self.forward_wire_index.remove(&forward_wire);
         }
