@@ -341,3 +341,9 @@ pub(in crate::afxdp) fn cos_item_len(item: &CoSPendingTxItem) -> u64 {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+// #1763 — fused select+pop fairness-neutrality differential test (the
+// hard gate: proves byte-identical selection vs the original double-scan).
+#[cfg(test)]
+#[path = "fused_diff_tests.rs"]
+mod fused_diff_tests;

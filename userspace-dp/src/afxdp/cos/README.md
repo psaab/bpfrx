@@ -70,9 +70,22 @@ mod.rs for further file-level breakdown.
   `apply_cos_send_result` / `apply_cos_prepared_result`, after the retry
   restore) drops its `FlowFairState` box so idle queues release the
   ~232 KB footprint. Surplus DWRR across queues + MQFQ inside the
-  selected queue compose for free: `build_cos_batch_from_queue` already
-  pops via `cos_queue_front`/`cos_queue_pop_front`, both dispatching on
-  `flow_fair()`. This also folds in the residual/best-effort
+  selected queue compose for free: `build_cos_batch_from_queue` and the
+  cap-aware exact drains pop via the fused select+pop pair
+  `cos_queue_peek_min_bucket` + `cos_queue_pop_known_bucket` (#1763),
+  both dispatching on `flow_fair()`. The MQFQ min-head-finish scan
+  (`cos_queue_min_finish_bucket`, an O(N) linear scan over the active
+  flow-bucket ring, N≈14 measured under iperf3 -P48) used to run twice
+  per dequeue — once for the `cos_queue_front*` peek and again inside the
+  `cos_queue_pop_front*` re-scan, with no queue mutation between — so the
+  fused pair hands the peek's selected bucket straight to the pop and
+  removes the redundant scan. A `target_bps == u64::MAX` no-cap fast path
+  scans only `flow_bucket_head_finish_bytes`, skipping the dead
+  `flow_bucket_observed_bps` load. Both levers are fairness-neutral by
+  construction (byte-identical bucket selection and dequeue order),
+  pinned by the `fused_diff_tests.rs` differential test against the
+  retained `cos_queue_pop_front*` reference oracle. This also folds in
+  the residual/best-effort
   queue-level → flow-level item from the #1731 research plan (its
   finding #7; NOT GitHub issue #7, which is an unrelated SNAT bug).
 - Single-writer per FlowFairState. The owner worker that polls a
