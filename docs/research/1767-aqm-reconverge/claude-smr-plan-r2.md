@@ -67,3 +67,9 @@ point, treat it as the documented Gemini/AGY-low-signal-on-refactor /
 contrarian pattern and merge on Codex(KILL) + Claude-SMR(KILL) + the
 grounded §12; the burden is on the dissent to exhibit throughput the
 6/6 box cannot physically produce.
+
+## Round 2 outcome: 3-way CONVERGED PLAN-KILL
+
+AGY round 2 (adversarial-review-mpz6ltys-oqdpeb) CONCEDED to PLAN-KILL, validating both section-12 rebuttal claims against the code (per-binding root_budget at service.rs:42-47, SharedCoSRootLease.acquire shares token budget not serve capacity, #1757 6/6 CPU-bound). Quote: "Because the hot worker's physical packet processing capacity is constrained by the saturated CPU core, CWFSP cannot raise the performance of slow flows... The recommendation to PLAN-KILL all three proposed mechanisms is sound."
+
+Final: Codex PLAN-KILL + Claude SMR PLAN-KILL + AGY PLAN-KILL (conceded). 3-way converged.
