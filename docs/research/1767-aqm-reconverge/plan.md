@@ -175,8 +175,17 @@ codepoint). So:
 
 - **Marking the cold worker's flows** (to drag them DOWN to the hot
   worker's rate) DOES reduce CoV — but this is **clip-to-slowest /
-  Harrison-Bergeron**. It is *exactly* what equal-flow-enforcement v8
-  already does deterministically and losslessly via a hard cap. Doing
+  Harrison-Bergeron**. It is the **same policy family** as
+  equal-flow-enforcement v8 (lower the fast cold-worker flows toward
+  the slowest sampled per-flow rate). The equivalence is *policy-level*,
+  not implementation-exact: v8 is deterministic, sampled, smoothed,
+  fail-open-guarded, and byte-capped
+  (`publish_equal_flow_epoch_v8.rs:101,129` — `min` of sampled prior
+  per-flow grants, then 3:1 smooth; enforce `target × active_flows`),
+  whereas ECN-on-cold is sender/RTT-dependent and noisy. A *softer*
+  ECN-on-cold policy buys more aggregate only by accepting a higher
+  CoV — that is not cross-worker re-convergence and still does not
+  raise the slow flows. v8 already does the clip losslessly. Doing
   it via ECN instead is strictly worse: it relies on the sender
   honoring ECE, it injects RTT-scale convergence lag and oscillation,
   and classic ECN's once-per-RTT binary response is a far coarser
@@ -251,15 +260,22 @@ v8 as "equal split".**
 - `drain.rs:165` / `compute_drain_target_bps` already paces each bucket
   to `queue_bw / active_flow_buckets` — the **local** per-flow share.
 - The issue asks: pace to the **cross-worker** fair share instead.
-  The cross-worker fair per-flow share is `total_class_bw / total_flows`.
-  Pacing the hot worker's flows to that target means **capping them
-  below** `C/a_hot` would require... no — `total_bw/total_flows` for
-  a skewed draw is *higher* than `C/a_hot` (the hot worker has more
-  than its proportional share of flows). To deliver
-  `total_bw/total_flows` to each of the hot worker's `a_hot` flows, the
-  hot worker would need `a_hot × total_bw/total_flows > C` egress
-  capacity — **which it does not have.** Pacing UP is impossible (you
-  cannot pace a flow faster than its worker's capacity / its TCP cwnd).
+  The cross-worker fair per-flow share is `T = total_class_bw /
+  total_flows`. For a skewed draw the hot worker holds more than its
+  proportional share of flows (`a_hot` above the mean), so `T > C/a_hot`
+  (today's hot-worker per-flow rate). Delivering `T` to each of the hot
+  worker's `a_hot` flows is the strict inequality
+
+  ```
+  a_hot · T  >  C_hot      (hot worker over-subscribed: a_hot > mean)
+  ```
+
+  i.e. the required hot-worker egress service **strictly exceeds** that
+  worker's capacity `C_hot`. A pacer is a *cap/defer* actuator: it can
+  withhold or delay, never manufacture worker capacity, TCP cwnd, or
+  cross-queue service. So pacing the hot worker's flows UP to `T` is
+  impossible by the inequality above (Codex review confirmed this
+  framing). Pacing DOWN is the only direction available to a pacer.
 - So "pace to cross-worker fair share" degenerates to: pace the **cold**
   worker's flows DOWN to `total_bw/total_flows`. That is again
   clip-to-slowest = **exactly equal-flow-enforcement v8**, which ships.
@@ -426,7 +442,102 @@ the fast ones) flips this to PLAN-READY. We assert none exists.
 | Mechanism | Plumbing exists? | Converges cross-worker? | Verdict |
 |---|---|---|---|
 | Per-worker ECN CE-mark off oversubscription signal (4.1) | Yes (ecn.rs, ZC-proven) | **No** — strands idle (hot) or = worse equal-flow (cold); inert on non-ECN repro | **PLAN-KILL** |
-| Per-worker/per-flow pace to cross-worker fair share (4.2) | Yes (drain.rs MQFQ) | **No** — pace-up impossible; pace-down = equal-flow v8 (already shipped) | **PLAN-KILL / redundant** |
+| Per-worker/per-flow pace to cross-worker fair share (4.2) | Yes (drain.rs MQFQ) | **No** — pace-up impossible (defer-only actuator + CPU-bound serve cap, §12); pace-down = equal-flow v8 (already shipped). AGY's surplus-sharing CWFSP rebutted in §12 (budget ≠ serve capacity on the #1757 6/6 CPU-bound box). | **PLAN-KILL / redundant** |
 | Selective AQM drop RED/CoDel on hot worker (4.3) | Partial (drop paths exist) | **No** — same idle/clip; destroys 0-retrans; re-tread #704/#707 | **PLAN-KILL** |
 
 **Overall: PLAN-KILL. The floor is the floor.**
+
+---
+
+## 12. Rebuttal to AGY round-1 PLAN-READY (Cross-Worker Fair-Share
+Pacing + surplus-sharing)
+
+AGY round 1 dissented to PLAN-READY, proposing **CWFSP**: enable
+`surplus-sharing`, compute a global target
+`T = root_bw / total_active_flows_across_all_workers`, pace every bucket
+to `T`, and claim the hot worker's slow flows are then "paced UP to S/4
+(drawing surplus tokens)" while the cold worker's fast flows are paced
+down — converging work-conservingly with zero retransmits.
+
+**The mechanism does not work. Two independent, fatal errors.**
+
+### 12.1 Budget ≠ serve capacity — the hot worker is CPU-bound, not
+budget-bound
+
+AGY's step 4 — "hot flows scale up to consume the extra rate [from
+surplus tokens]" — conflates **shaper token budget** (shareable
+cross-worker via `shared_root_lease.acquire()`,
+`cos/token_bucket.rs:82`) with **worker serve capacity** (CPU core +
+TX-ring drain, NOT shareable — it is pinned to the worker that owns the
+RSS-bound binding).
+
+`root_budget` in the drain path is **per-binding**:
+`binding.cos.cos_interfaces.get(&root_ifindex).tokens`
+(`cos/queue_service/service.rs:42-47`). Each worker owns its own
+`CoSInterfaceRuntime` in its own `cos_interfaces` FastMap
+(`worker/cos_state.rs:29`). Surplus-sharing lets the hot worker *acquire
+more root tokens* — i.e. more *permission to send* — but the hot worker
+still has to **serve** those bytes on its own CPU core.
+
+Per #1757 (closed), the cluster is **6 vCPU = 6 RX queues = 6 workers,
+no CPU headroom — all 6 cores run 100% under load**, and "the box tops
+out ~16 Gb/s CoS-on, ~23 Gb/s CoS-off, **both CPU-bound**." So the hot
+worker's serve capacity `C_hot` IS its saturated CPU core. Its `a_hot`
+flows split `C_hot` no matter how much *token budget* surplus-sharing
+hands it. Granting more budget to a core that is already at 100% does
+**nothing** — it cannot manufacture CPU. The inequality of §4.2 stands
+unchanged: `a_hot · T > C_hot`, and `C_hot` is fixed by the pinned CPU,
+not by the (now-liftable) token cap.
+
+AGY's "lift the static cap with surplus-sharing" lifts the *budget* cap.
+The *binding* cap is the worker's CPU/serve rate, which surplus-sharing
+cannot lift because serve capacity is pinned to the RSS-bound worker —
+the exact AF_XDP ZC constraint the whole issue is about.
+
+### 12.2 Pacing is a cap/defer actuator — it cannot raise a slow flow
+
+Even setting CPU aside, AGY's "paced UP" is a category error. The drain
+pacer (`cos_queue_peek_min_bucket` / `cos_queue_pop_known_bucket` with
+`target_bps`, `drain.rs:217,242`) only **defers over-cap buckets**.
+Raising the target from `C/a` to `T` *removes* a cap; it does not
+*inject* cwnd. A flow's rate is `min(cwnd/RTT, pace_target)`. The slow
+flow is slow because it is **cwnd/service-limited**, not pace-limited —
+removing its (already non-binding) pace cap changes nothing. For its
+cwnd to grow it must successfully put more bytes on the wire per RTT,
+which requires the hot worker to actually **serve** them — back to
+§12.1's CPU wall.
+
+A pacer can only *lower* the cold worker's fast flows (defer them). That
+is the pace-DOWN direction the plan already credits — and pace-down to
+the slowest rate is **clip-to-slowest**, i.e. equal-flow-enforcement v8
+re-derived (§4.2), with the *same* idle-capacity outcome on the
+CPU-bound box. AGY's own steps concede the cold flows are "paced down to
+S/4"; only the "hot paced up" half is novel, and that half is the false
+half.
+
+### 12.3 Does surplus-sharing + ECN-on-cold beat the v8 hard cap (AGY
+point 2)?
+
+AGY claims a "work-conserving equality" regime where marking cold flows
+frees budget the hot worker's surplus draws. Same refutation: the freed
+*budget* is unconsumable as *throughput* by a CPU-saturated hot worker.
+On a box WITH genuine CPU headroom (not the #1757 6/6 box) the hot
+worker could serve more — but then the system was never CPU-bound and
+the cold worker's flows were not capacity-limited either, so you are in
+the within-worker / bufferbloat regime (§6 revisit criterion 1), not the
+#1765 cross-worker problem. On the actual repro hardware the regime AGY
+needs does not exist.
+
+### 12.4 AccECN/L4S (AGY point 3) — AGY agrees it does not flip
+
+AGY concurs (its §1.3): AccECN/L4S sharpen the actuator but do not
+change its sign or the routing constraint. No disagreement.
+
+### 12.5 Verdict after rebuttal
+
+CWFSP reduces to: **pace cold down (works = clip-to-slowest = v8) +
+pace hot up (impossible: defer-only actuator + CPU-bound serve
+capacity).** It is not a new work-conserving mechanism; it is v8's
+clip-to-slowest wearing a pacing label, with the throughput-recovery
+half resting on manufacturing CPU that the 6/6 box does not have.
+**PLAN-KILL stands on all three mechanisms.**
