@@ -20,3 +20,15 @@ Plan v1 SHA: bb4f6bf70b96534152cfab31ffb0a2764a022ae7
   bound" label (residual noise: failed-guard GC removal, HA upsert_synced).
 
 Verdict: PLAN-READY v2.
+
+## Code review round 1 (PR #1762, head 190d9a368)
+- Gemini r1: task-mpyqdh0o-obvlzv (background)
+- Codex r1: foreground
+
+## Code review round 1 verdicts (PR #1762)
+- Codex r1: MERGE-NEEDS-MINOR — only finding: protocol.go gofmt drift
+  (fixed in d77faa928). Everything else verified correct. -> MERGE-READY.
+- Gemini r1 (task-mpyqdh0o-obvlzv): MERGE-READY (reviewed head 190d9a368;
+  gofmt-only follow-up doesn't affect any finding).
+- Claude SMR: MERGE-READY.
+- Copilot: requested via API, polling.
