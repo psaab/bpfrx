@@ -566,12 +566,12 @@ type ProcessStatus struct {
 	// displacement events, not distinct flow-pairs). Nonzero triggers the
 	// structural-fix research; does NOT resolve #1760. omitempty for
 	// mixed Rust/Go daemon back-compat.
-	NatReverseKeyCollisions uint64 `json:"nat_reverse_key_collisions,omitempty"`
-	FlowCacheCapacity       uint64 `json:"flow_cache_capacity,omitempty"`
-	NeighborCacheCapacity            uint64                `json:"neighbor_cache_capacity,omitempty"`
-	NeighborGeneration               uint64                `json:"neighbor_generation,omitempty"`
-	RouteEntries                     int                   `json:"route_entries,omitempty"`
-	WorkerHeartbeats                 []time.Time           `json:"worker_heartbeats,omitempty"`
+	NatReverseKeyCollisions uint64      `json:"nat_reverse_key_collisions,omitempty"`
+	FlowCacheCapacity       uint64      `json:"flow_cache_capacity,omitempty"`
+	NeighborCacheCapacity   uint64      `json:"neighbor_cache_capacity,omitempty"`
+	NeighborGeneration      uint64      `json:"neighbor_generation,omitempty"`
+	RouteEntries            int         `json:"route_entries,omitempty"`
+	WorkerHeartbeats        []time.Time `json:"worker_heartbeats,omitempty"`
 	// #869: per-worker busy/idle runtime telemetry.
 	WorkerRuntime []WorkerRuntimeStatus `json:"worker_runtime,omitempty"`
 	HAGroups      []HAGroupStatus       `json:"ha_groups,omitempty"`
