@@ -37,9 +37,13 @@ pub(in crate::afxdp) use drain::{
 // #1034 P3: push + pop ops split into siblings.
 mod pop;
 mod push;
-pub(in crate::afxdp) use pop::{
-    cos_queue_pop_front, cos_queue_pop_front_no_snapshot, cos_queue_pop_front_with_cap,
-};
+// #1763: `cos_queue_pop_front` / `cos_queue_pop_front_with_cap` are now
+// fused out of production (peek_min_bucket + pop_known_bucket); they
+// survive as the reference single-pop API for tests, so the re-export
+// is test-only in non-test builds.
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(in crate::afxdp) use pop::{cos_queue_pop_front, cos_queue_pop_front_with_cap};
+pub(in crate::afxdp) use pop::{cos_queue_pop_front_no_snapshot, cos_queue_pop_known_bucket};
 pub(in crate::afxdp) use push::{cos_queue_push_back, cos_queue_push_front};
 
 #[inline]
@@ -97,8 +101,23 @@ pub(in crate::afxdp) fn cos_queue_len(queue: &CoSQueueRuntime) -> usize {
 /// flows on a single queue), the replacement is a min-heap keyed by
 /// `flow_bucket_head_finish_bytes`. For iperf3-sized workloads the
 /// linear scan is cache-friendlier and simpler.
+///
+/// #1763 Lever B — no-cap fast path. When `target_bps == u64::MAX`
+/// (every `cos_queue_front` / `cos_queue_pop_front` caller, i.e. the
+/// whole best-effort builder) `observed <= u64::MAX` is always true,
+/// so `eligible == fallback` always holds and the two-pass plus the
+/// second strided `flow_bucket_observed_bps` load are dead work. The
+/// no-cap branch scans only `flow_bucket_head_finish_bytes`, removing
+/// one big-array load per bucket (the two arrays live on different
+/// cache lines, so this halves the per-bucket cache-miss exposure).
+/// The selected bucket is **byte-identical** to the cap-aware pass at
+/// `target_bps == u64::MAX`: both return the lowest-finish active
+/// bucket (first-wins on ties, since `<` is strict).
 #[inline]
 fn cos_queue_min_finish_bucket(ff: &FlowFairState, target_bps: u64) -> Option<u16> {
+    if target_bps == u64::MAX {
+        return cos_queue_min_finish_bucket_no_cap(ff);
+    }
     let mut eligible: Option<u16> = None;
     let mut eligible_finish = u64::MAX;
     let mut fallback: Option<u16> = None;
@@ -117,6 +136,26 @@ fn cos_queue_min_finish_bucket(ff: &FlowFairState, target_bps: u64) -> Option<u1
         }
     }
     eligible.or(fallback)
+}
+
+/// #1763 Lever B — the `target_bps == u64::MAX` specialization of
+/// `cos_queue_min_finish_bucket`. Single pass, single big-array load
+/// per bucket. Returns the lowest-`flow_bucket_head_finish_bytes`
+/// active bucket, first-wins on ties — identical selection to the
+/// cap-aware loop evaluated at `target_bps == u64::MAX`, where every
+/// bucket is eligible so `eligible` collapses onto `fallback`.
+#[inline]
+fn cos_queue_min_finish_bucket_no_cap(ff: &FlowFairState) -> Option<u16> {
+    let mut best: Option<u16> = None;
+    let mut best_finish = u64::MAX;
+    for bucket in ff.flow_rr_buckets.iter() {
+        let finish = ff.flow_bucket_head_finish_bytes[usize::from(bucket)];
+        if finish < best_finish {
+            best_finish = finish;
+            best = Some(bucket);
+        }
+    }
+    best
 }
 
 #[inline]
@@ -158,6 +197,53 @@ pub(in crate::afxdp) fn cos_queue_front_with_cap(
     let bucket = usize::from(cos_queue_min_finish_bucket(ff, target_bps)?);
     ff.flow_bucket_items[bucket].front()
 }
+
+/// #1763 Lever A — fused select+peek that ALSO returns the selected
+/// MQFQ bucket id so the caller can pop that exact bucket via
+/// `cos_queue_pop_known_bucket` without a second min-finish scan.
+///
+/// The drain hot paths peek-then-pop with NO queue mutation between
+/// the two calls, so the second `cos_queue_min_finish_bucket` scan
+/// inside `cos_queue_pop_front*` re-derives the identical bucket. This
+/// helper hands the peek's chosen bucket to the pop so the redundant
+/// scan is removed on every committed pop.
+///
+/// Selection is byte-identical to `cos_queue_front_with_cap`: it calls
+/// the same `cos_queue_min_finish_bucket`. The returned `bucket` is the
+/// active-set winner; the returned item is that bucket's head.
+///
+/// FIFO (non-flow-fair) queues return a `MIN_FINISH_BUCKET_FIFO`
+/// sentinel for the bucket; `cos_queue_pop_known_bucket` ignores the
+/// bucket on the FIFO path (it pops the hot deque directly), so the
+/// sentinel never indexes a bucket array.
+#[inline]
+pub(in crate::afxdp) fn cos_queue_peek_min_bucket(
+    queue: &CoSQueueRuntime,
+    target_bps: u64,
+) -> Option<(u16, &CoSPendingTxItem)> {
+    if !queue.flow_fair() {
+        return queue
+            .hot
+            .items
+            .front()
+            .map(|item| (MIN_FINISH_BUCKET_FIFO, item));
+    }
+    let ff = queue
+        .flow_fair_state
+        .as_ref()
+        .expect("cos_queue_peek_min_bucket: flow_fair queue without flow_fair_state");
+    let bucket_u16 = cos_queue_min_finish_bucket(ff, target_bps)?;
+    let item = ff.flow_bucket_items[usize::from(bucket_u16)].front()?;
+    Some((bucket_u16, item))
+}
+
+/// #1763 — sentinel bucket id returned by `cos_queue_peek_min_bucket`
+/// for FIFO (non-flow-fair) queues. `cos_queue_pop_known_bucket`
+/// branches on `queue.flow_fair()` and never indexes a bucket array
+/// with this value on the FIFO path, so the exact value is immaterial;
+/// it is documented as "not a real bucket" for the debug_assert and
+/// reader clarity.
+pub(in crate::afxdp) const MIN_FINISH_BUCKET_FIFO: u16 = u16::MAX;
 
 /// #917 — V_min sync throttle decision. Plan §3.3 v2 cadence:
 /// K=8 + mandatory check at drain-batch start (`pop_count == 1`).
