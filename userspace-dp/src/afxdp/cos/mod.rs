@@ -25,7 +25,9 @@ pub(super) use queue_ops::{
     cos_queue_push_front, cos_queue_restore_front, cos_queue_v_min_consume_suspension,
     cos_queue_v_min_continue, publish_committed_queue_vtime,
 };
-// #1763: test-only reference single-pop API (fused out of production).
+// #1763: reference single-pop API retained for tests (fused out of the
+// production drain paths). Still present in non-test builds;
+// `allow(unused_imports)` only suppresses the dead re-export lint there.
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(super) use queue_ops::{cos_queue_pop_front, cos_queue_pop_front_with_cap};
 pub(super) use queue_service::drain_shaped_tx;

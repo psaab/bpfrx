@@ -79,7 +79,7 @@ fn cos_queue_pop_front_inner_with_cap(
     let ff = queue
         .flow_fair_state
         .as_ref()
-        .expect("cos_queue_pop_front_inner: flow_fair queue without flow_fair_state");
+        .expect("cos_queue_pop_front_inner_with_cap: flow_fair queue without flow_fair_state");
     // #785 Phase 3 — MQFQ: pop from the bucket whose head
     // packet has the smallest virtual-finish-time, not DRR
     // rotation order. The active set (`flow_rr_buckets`) is
@@ -110,6 +110,7 @@ fn cos_queue_pop_front_inner_with_cap(
 /// trust the no-mutation invariant and skip the second scan entirely.
 ///
 /// `MIN_FINISH_BUCKET_FIFO` selects the non-flow-fair hot-deque path.
+#[inline]
 pub(in crate::afxdp) fn cos_queue_pop_known_bucket(
     queue: &mut CoSQueueRuntime,
     bucket_u16: u16,
