@@ -4574,3 +4574,7 @@ top.
     Kept the zero-cost shim fix regardless (flag-gate => non-WG path pays only a
     flags bit-test; xdp delta vs master +89 inlined insns -> +34 cold-helper insns,
     none executed on non-WG path).
+
+## 2026-06-04T07:28Z — #1767 AQM re-convergence research
+- **Action**: Drafted plan v1 (PLAN-KILL all 3 mechanisms; ECN/AQM/pacing cannot converge cross-worker — freed bandwidth on hot worker unconsumable by cold-worker flows under ZC pinning; clip-to-slowest = already-shipped equal-flow-enforcement v8)
+- **File(s)**: docs/research/1767-aqm-reconverge/plan.md
