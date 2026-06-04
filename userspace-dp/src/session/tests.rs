@@ -2293,3 +2293,118 @@ fn inplace_fin_rst_closing_matches_reference() {
         assert_tables_equiv(&mut ip, &mut rf, &[key.clone()], &[], &[1, 2]);
     }
 }
+
+// ── #1760: NAT reverse-key 1:N collision telemetry counter ───────────
+//
+// Reproduces the latent collision documented by the #1758 research:
+// under interface-mode SNAT (rewrite_src = Some(egress), rewrite_src_port
+// = None), two distinct internal hosts using the SAME ephemeral source
+// port to the SAME external server translate to the SAME reverse wire key
+// K. The single-valued nat_reverse_index can only point at one of them,
+// so the second install displaces the first — a displacement event the
+// counter must observe.
+
+/// Interface-mode SNAT decision: rewrite only the source IP to `egress`,
+/// leave the source port untranslated (rewrite_src_port = None). This is
+/// the default SNAT mode and the #1758 reachable collision vector.
+fn iface_snat_decision(egress: Ipv4Addr) -> SessionDecision {
+    SessionDecision {
+        resolution: resolution(),
+        nat: NatDecision {
+            rewrite_src: Some(IpAddr::V4(egress)),
+            ..NatDecision::default()
+        },
+    }
+}
+
+#[test]
+fn nat_reverse_key_collision_counter_increments_on_displacement() {
+    let mut table = SessionTable::new();
+    let now = 1_000_000_000u64;
+    let egress = Ipv4Addr::new(203, 0, 113, 9);
+
+    // Two distinct internal hosts, SAME ephemeral source port, SAME
+    // external server — interface-mode SNAT'd to the SAME egress IP.
+    // reverse_wire_key for both = {src=8.8.8.8:443, dst=203.0.113.9:5555}
+    // (port comes from the untranslated original src_port). Identical K.
+    let mut s1 = key_v4();
+    s1.src_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    s1.src_port = 5555;
+    let mut s2 = key_v4();
+    s2.src_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+    s2.src_port = 5555;
+    assert_ne!(s1, s2, "the two forward keys must be distinct sessions");
+
+    let dec = iface_snat_decision(egress);
+    // Guard the repro precondition: the two distinct forward keys really
+    // do derive the same reverse wire key.
+    assert_eq!(
+        reverse_wire_key(&s1, dec.nat),
+        reverse_wire_key(&s2, dec.nat),
+        "interface-mode SNAT must make the two flows share reverse key K",
+    );
+
+    // First install: K -> S1. No prior occupant, so no displacement.
+    assert!(table.install_with_protocol(s1.clone(), dec, metadata(), now, PROTO_TCP, 0x10));
+    assert_eq!(
+        table.nat_reverse_key_collisions(),
+        0,
+        "a single install with no prior K occupant must not count",
+    );
+
+    // Second install: K -> S2 displaces the live S1 -> one collision.
+    assert!(table.install_with_protocol(s2.clone(), dec, metadata(), now, PROTO_TCP, 0x10));
+    assert_eq!(
+        table.nat_reverse_key_collisions(),
+        1,
+        "S2 install displacing live S1 on shared K must count exactly once",
+    );
+
+    // Re-asserting S2's own ownership (refresh re-asserts the same handle)
+    // must NOT count — the displaced handle equals the installing handle.
+    let refresh_ns = now + 2 * WHEEL_TICK_NS;
+    let req = SessionUpdate {
+        key: &s2,
+        decision: dec,
+        metadata: metadata(),
+        origin: SessionOrigin::ForwardFlow,
+        now_ns: refresh_ns,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    };
+    assert!(table.update_session(req, false));
+    assert_eq!(
+        table.nat_reverse_key_collisions(),
+        1,
+        "S2 re-asserting its own K ownership must not count (old == handle)",
+    );
+}
+
+#[test]
+fn nat_reverse_key_collision_counter_zero_without_collision() {
+    // Two flows with DISTINCT reverse keys (different source ports) under
+    // interface-mode SNAT must never increment the collision counter.
+    let mut table = SessionTable::new();
+    let now = 1_000_000_000u64;
+    let dec = iface_snat_decision(Ipv4Addr::new(203, 0, 113, 9));
+
+    let mut a = key_v4();
+    a.src_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    a.src_port = 5555;
+    let mut b = key_v4();
+    b.src_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+    b.src_port = 6666; // distinct port -> distinct reverse wire key
+    assert_ne!(
+        reverse_wire_key(&a, dec.nat),
+        reverse_wire_key(&b, dec.nat),
+        "distinct source ports must yield distinct reverse keys",
+    );
+
+    assert!(table.install_with_protocol(a, dec, metadata(), now, PROTO_TCP, 0x10));
+    assert!(table.install_with_protocol(b, dec, metadata(), now, PROTO_TCP, 0x10));
+    assert_eq!(
+        table.nat_reverse_key_collisions(),
+        0,
+        "non-colliding flows must leave the collision counter at 0",
+    );
+}

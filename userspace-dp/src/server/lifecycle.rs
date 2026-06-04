@@ -95,6 +95,7 @@ pub(crate) fn run() -> Result<(), String> {
             neighbor_entries: 0,
             session_table_entries: 0,
             max_sessions: 0,
+            nat_reverse_key_collisions: 0,
             flow_cache_capacity: 0,
             neighbor_cache_capacity: 0,
             neighbor_generation: 0,

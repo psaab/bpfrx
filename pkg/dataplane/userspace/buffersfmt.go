@@ -14,6 +14,7 @@ const (
 	systemBufferLabelAFXDPTXRing            = "AF_XDP TX ring"
 	systemBufferLabelCoSQueueBytes          = "CoS queue bytes"
 	systemBufferLabelSessionTableEntries    = "Session table entries"
+	systemBufferLabelNatReverseKeyColl      = "NAT reverse-key collisions"
 	systemBufferLabelNeighborCacheEntries   = "Neighbor cache entries"
 	systemBufferLabelFlowCacheActiveFlows   = "Flow cache active flows"
 	systemBufferLabelFlowCacheEvictions     = "Flow cache collision evict"
@@ -455,6 +456,11 @@ func systemBufferCounterRows(status ProcessStatus, samples []systemBufferSample,
 	if status.MaxSessions == 0 {
 		appendCounter(systemBufferLabelSessionTableEntries, "aggregate", status.SessionTableEntries)
 	}
+	// #1760: NAT reverse-key 1:N collision displacement events. Counter
+	// only -- no capacity denominator -- so it renders in the Counters
+	// section, never the Utilization table. Zero is suppressed by
+	// appendCounter, which is the common (collision-free) case.
+	appendCounter(systemBufferLabelNatReverseKeyColl, "aggregate", status.NatReverseKeyCollisions)
 	if status.NeighborCacheCapacity == 0 {
 		appendCounter(systemBufferLabelNeighborCacheEntries, "dynamic", uint64(status.NeighborEntries))
 	}

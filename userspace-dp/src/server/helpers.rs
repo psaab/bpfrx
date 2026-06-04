@@ -51,6 +51,14 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
         .iter()
         .map(|w| w.session_table_entries as usize)
         .sum();
+    // #1760: aggregate the per-worker NAT reverse-key displacement
+    // counters into the top-level status for operator visibility.
+    state.status.nat_reverse_key_collisions = state
+        .status
+        .worker_runtime
+        .iter()
+        .map(|w| w.nat_reverse_key_collisions)
+        .sum();
     state.status.max_sessions = state
         .status
         .worker_runtime

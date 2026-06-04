@@ -68,6 +68,9 @@ pub(crate) struct WorkerRuntimeCounters {
     pub cos_queue_lease_acquire_v8_granted_bytes: u64,
     pub session_table_entries: u64,
     pub max_sessions: u64,
+    /// #1760: cumulative NAT reverse-key displacement events from this
+    /// worker's SessionTable (`SessionTable::nat_reverse_key_collisions`).
+    pub nat_reverse_key_collisions: u64,
 }
 
 /// 60 s rolling window. Sized to comfortably cover typical Prometheus
@@ -121,6 +124,10 @@ pub(crate) struct WorkerRuntimeAtomics {
     pub cos_queue_lease_acquire_v8_granted_bytes: AtomicU64,
     pub session_table_entries: AtomicU64,
     pub max_sessions: AtomicU64,
+    /// #1760: cumulative NAT reverse-key displacement events. Simple
+    /// Relaxed cumulative counter (like `session_table_entries`), NOT part
+    /// of the seqlock-published rolling-window tuple below.
+    pub nat_reverse_key_collisions: AtomicU64,
     /// Snapshot of the corresponding cumulative counter at the start of
     /// the current rolling window, plus the monotonic timestamp the
     /// snapshot was taken at. `publish()` rotates these whenever the
@@ -177,6 +184,7 @@ impl WorkerRuntimeAtomics {
             cos_queue_lease_acquire_v8_granted_bytes: AtomicU64::new(0),
             session_table_entries: AtomicU64::new(0),
             max_sessions: AtomicU64::new(0),
+            nat_reverse_key_collisions: AtomicU64::new(0),
             wall_ns_window_base: AtomicU64::new(0),
             active_ns_window_base: AtomicU64::new(0),
             thread_cpu_ns_window_base: AtomicU64::new(0),
@@ -215,6 +223,8 @@ impl WorkerRuntimeAtomics {
         self.max_sessions.store(c.max_sessions, Ordering::Relaxed);
         self.session_table_entries
             .store(c.session_table_entries, Ordering::Relaxed);
+        self.nat_reverse_key_collisions
+            .store(c.nat_reverse_key_collisions, Ordering::Relaxed);
 
         let base_at = self.window_base_at_ns.load(Ordering::Relaxed);
         if base_at == 0 {
@@ -283,6 +293,9 @@ impl WorkerRuntimeAtomics {
                 .load(Ordering::Relaxed),
             session_table_entries: self.session_table_entries.load(Ordering::Relaxed),
             max_sessions: self.max_sessions.load(Ordering::Relaxed),
+            nat_reverse_key_collisions: self
+                .nat_reverse_key_collisions
+                .load(Ordering::Relaxed),
         }
     }
 

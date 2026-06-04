@@ -58,13 +58,14 @@ func TestEmitWorkerRuntime_DeadGaugeReflectsDeadFlag(t *testing.T) {
 	got := collectFromEmitWorkerRuntime(t, c, status)
 
 	// Each worker emits 9 counters + 1 dead gauge + 1 last-60s gauge,
-	// 1 window-width gauge, 2 session-table gauges = 14 metrics +
+	// 1 window-width gauge, 2 session-table gauges +
+	// 1 NAT reverse-key collision counter (#1760) = 15 metrics +
 	// #1621 cold-path always-emitted metrics (4 per-worker scalars
-	// + clock_source gauge + snapshot_failed counter = 6) = 20.
+	// + clock_source gauge + snapshot_failed counter = 6) = 21.
 	// Per-slot/per-bucket metrics need non-empty Vec fields which
 	// these test fixtures don't populate, so they're zero here.
-	if len(got) != 3*20 {
-		t.Fatalf("emitWorkerRuntime: want %d metrics for 3 workers, got %d", 3*20, len(got))
+	if len(got) != 3*21 {
+		t.Fatalf("emitWorkerRuntime: want %d metrics for 3 workers, got %d", 3*21, len(got))
 	}
 
 	// Gather just the dead-gauge entries, keyed by worker_id label.
@@ -223,6 +224,7 @@ func newCollectorWithWorkerDescsOnly() *xpfCollector {
 		workerCoSQueueLeaseAcquireV8GrantedBytes: mk("xpf_userspace_worker_cos_queue_lease_acquire_v8_granted_bytes_total"),
 		workerSessionTableEntries:                mk("xpf_userspace_worker_session_table_entries"),
 		workerSessionTableCapacity:               mk("xpf_userspace_worker_session_table_capacity"),
+		workerNatReverseKeyCollisions:            mk("xpf_userspace_worker_session_nat_reverse_key_collisions_total"),
 		workerDead:                               mk("xpf_userspace_worker_dead"),
 		// #1621 cold-path descriptors.
 		workerColdPathBucket:              mkBucket("xpf_userspace_worker_cold_path_ns_bucket"),
@@ -285,6 +287,7 @@ func collectFromEmitWorkerRuntime(
 		c.workerCoSQueueLeaseAcquireV8GrantedBytes: {},
 		c.workerSessionTableEntries:                {},
 		c.workerSessionTableCapacity:               {},
+		c.workerNatReverseKeyCollisions:            {},
 		c.workerDead:                               {},
 		// #1621 cold-path descriptors.
 		c.workerColdPathBucket:              {},
@@ -636,6 +639,12 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 			nil,
 			nil,
 		),
+		userspaceNatReverseKeyCollisions: prometheus.NewDesc(
+			"xpf_userspace_session_nat_reverse_key_collisions_total",
+			"nat reverse-key collisions",
+			nil,
+			nil,
+		),
 		userspaceFlowCacheActiveFlows: prometheus.NewDesc(
 			"xpf_userspace_flow_cache_active_flows",
 			"flow-cache active flows",
@@ -687,12 +696,15 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	for m := range ch {
 		got = append(got, m)
 	}
-	if len(got) != 6 {
-		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 6 metrics, got %d", len(got))
+	if len(got) != 7 {
+		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 7 metrics, got %d", len(got))
 	}
 
 	assertGaugeClose(t, got, c.userspaceSessionTableEntries, nil, 77)
 	assertGaugeClose(t, got, c.userspaceSessionTableCapacity, nil, 100)
+	// #1760: collision counter emitted unconditionally (0 with no
+	// collisions configured in this fixture).
+	assertCounterClose(t, got, c.userspaceNatReverseKeyCollisions, nil, 0)
 	assertGaugeClose(t, got, c.userspaceFlowCacheActiveFlows, nil, 12)
 	assertGaugeClose(t, got, c.userspaceFlowCacheCapacity, nil, 20)
 	assertGaugeClose(t, got, c.bindingFlowCacheCapacity, map[string]string{

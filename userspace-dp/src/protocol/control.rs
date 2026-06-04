@@ -108,6 +108,15 @@ pub(crate) struct ProcessStatus {
     /// Aggregate capacity of the Rust-owned worker session tables.
     #[serde(rename = "max_sessions", default)]
     pub max_sessions: usize,
+    /// #1760: aggregate NAT reverse-key displacement events summed across
+    /// the per-worker session tables — the latent 1:N collision (#1758)
+    /// made observable. A near-precise upper bound on live collisions
+    /// (counts displacement *events*, not distinct flow-pairs). Additive
+    /// for mixed-version compatibility: older helpers omit it (defaults to
+    /// 0). A nonzero value triggers the structural-fix research; this
+    /// counter does NOT resolve #1760.
+    #[serde(rename = "nat_reverse_key_collisions", default)]
+    pub nat_reverse_key_collisions: u64,
     /// Aggregate per-binding flow-cache capacity across helper-published
     /// binding status rows. Zero means unavailable, not full.
     #[serde(rename = "flow_cache_capacity", default)]

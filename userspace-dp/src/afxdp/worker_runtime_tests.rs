@@ -20,6 +20,7 @@ fn snapshot_roundtrip() {
         cos_queue_lease_acquire_v8_granted_bytes: 123_456,
         session_table_entries: 77,
         max_sessions: 100,
+        nat_reverse_key_collisions: 4242,
     };
     atomics.publish(&c, 0);
     let s = atomics.snapshot();
@@ -40,6 +41,8 @@ fn snapshot_roundtrip() {
     );
     assert_eq!(s.session_table_entries, c.session_table_entries);
     assert_eq!(s.max_sessions, c.max_sessions);
+    // #1760: the displacement counter survives publish -> snapshot.
+    assert_eq!(s.nat_reverse_key_collisions, c.nat_reverse_key_collisions);
 }
 
 #[test]

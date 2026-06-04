@@ -417,6 +417,14 @@ func newCollector(srv *Server) *xpfCollector {
 			"Maximum session-table entries supported by this userspace worker.",
 			[]string{"worker_id"}, nil,
 		),
+		workerNatReverseKeyCollisions: prometheus.NewDesc(
+			"xpf_userspace_worker_session_nat_reverse_key_collisions_total",
+			"Cumulative NAT reverse-key (nat_reverse_index) 1:N collision "+
+				"displacement events on this userspace worker's session table "+
+				"(#1758 latent corruption made observable; near-precise upper "+
+				"bound on live collisions).",
+			[]string{"worker_id"}, nil,
+		),
 		userspaceSessionTableEntries: prometheus.NewDesc(
 			"xpf_userspace_session_table_entries",
 			"Aggregate live userspace session-table entries across workers.",
@@ -425,6 +433,15 @@ func newCollector(srv *Server) *xpfCollector {
 		userspaceSessionTableCapacity: prometheus.NewDesc(
 			"xpf_userspace_session_table_capacity",
 			"Aggregate userspace session-table capacity across workers.",
+			nil, nil,
+		),
+		userspaceNatReverseKeyCollisions: prometheus.NewDesc(
+			"xpf_userspace_session_nat_reverse_key_collisions_total",
+			"Aggregate NAT reverse-key (nat_reverse_index) 1:N collision "+
+				"displacement events across userspace workers (#1758 latent "+
+				"corruption made observable; near-precise upper bound on live "+
+				"collisions). A nonzero value warrants the structural-fix "+
+				"research.",
 			nil, nil,
 		),
 		userspaceFlowCacheActiveFlows: prometheus.NewDesc(
