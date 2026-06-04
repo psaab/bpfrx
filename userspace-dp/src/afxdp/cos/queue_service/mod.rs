@@ -30,8 +30,8 @@ use crate::xsk_ffi::xdp::XdpDesc;
 
 use super::{
     COS_MIN_BURST_BYTES, CoSQueueLeaseAcquireTelemetry, cos_item_len,
-    cos_queue_clear_orphan_snapshot_after_drop, cos_queue_front, cos_queue_is_empty,
-    cos_queue_peek_min_bucket, cos_queue_pop_known_bucket, cos_queue_push_front,
+    cos_queue_clear_orphan_snapshot_after_drop, cos_queue_front, cos_queue_front_with_cap,
+    cos_queue_is_empty, cos_queue_peek_min_bucket, cos_queue_pop_known_bucket, cos_queue_push_front,
     cos_queue_v_min_consume_suspension, cos_queue_v_min_continue, cos_refill_ns_until,
     maybe_top_up_cos_queue_lease, publish_committed_queue_vtime, refill_cos_tokens,
 };
