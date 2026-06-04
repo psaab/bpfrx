@@ -91,10 +91,22 @@ fn item_identity(item: &CoSPendingTxItem) -> (Option<u16>, u64) {
 struct FfSnapshot {
     queue_vtime: u64,
     active_flow_buckets: u16,
+    active_flow_buckets_peak: u16,
     rr_order: Vec<u16>,
     bucket_head_finish: Vec<(u16, u64)>,
     bucket_tail_finish: Vec<(u16, u64)>,
     bucket_item_lens: Vec<(u16, Vec<u64>)>,
+    // #1763 Codex review: the per-bucket accounting + selection-input
+    // arrays MUST also match. `observed_bps` is a selection INPUT (the
+    // cap-aware eligibility key), and `bytes`/`tx_bytes`/`pending_bytes`/
+    // `last_tx_ns` are mutated by the shared pop accounting body — a
+    // divergence here would be a real fairness or accounting regression
+    // even if the dequeue order matched. Captured per active bucket.
+    bucket_observed_bps: Vec<(u16, u64)>,
+    bucket_bytes: Vec<(u16, u64)>,
+    bucket_tx_bytes: Vec<(u16, u64)>,
+    bucket_last_tx_ns: Vec<(u16, u64)>,
+    bucket_pending_bytes: Vec<(u16, u32)>,
     snapshot_stack: Vec<crate::afxdp::types::CoSQueuePopSnapshot>,
     queued_bytes: u64,
     local_item_count: u32,
@@ -103,11 +115,17 @@ struct FfSnapshot {
 fn snapshot_ff(queue: &CoSQueueRuntime) -> FfSnapshot {
     let ff = test_flow_fair_state(queue);
     let rr_order: Vec<u16> = ff.flow_rr_buckets.iter().collect();
-    // For every active bucket record the head/tail finish and the item
-    // lengths in FIFO order, keyed by bucket id (ring order).
+    // For every active bucket record the head/tail finish, item lengths
+    // (FIFO order), and the per-bucket accounting + selection-input
+    // arrays, keyed by bucket id (ring order).
     let mut bucket_head_finish = Vec::new();
     let mut bucket_tail_finish = Vec::new();
     let mut bucket_item_lens = Vec::new();
+    let mut bucket_observed_bps = Vec::new();
+    let mut bucket_bytes = Vec::new();
+    let mut bucket_tx_bytes = Vec::new();
+    let mut bucket_last_tx_ns = Vec::new();
+    let mut bucket_pending_bytes = Vec::new();
     for b in rr_order.iter().copied() {
         let bi = usize::from(b);
         bucket_head_finish.push((b, ff.flow_bucket_head_finish_bytes[bi]));
@@ -117,14 +135,25 @@ fn snapshot_ff(queue: &CoSQueueRuntime) -> FfSnapshot {
             .map(cos_item_len)
             .collect();
         bucket_item_lens.push((b, lens));
+        bucket_observed_bps.push((b, ff.flow_bucket_observed_bps[bi]));
+        bucket_bytes.push((b, ff.flow_bucket_bytes[bi]));
+        bucket_tx_bytes.push((b, ff.flow_bucket_tx_bytes[bi]));
+        bucket_last_tx_ns.push((b, ff.flow_bucket_last_tx_ns[bi]));
+        bucket_pending_bytes.push((b, ff.flow_bucket_pending_bytes[bi]));
     }
     FfSnapshot {
         queue_vtime: ff.queue_vtime,
         active_flow_buckets: ff.active_flow_buckets,
+        active_flow_buckets_peak: ff.active_flow_buckets_peak,
         rr_order,
         bucket_head_finish,
         bucket_tail_finish,
         bucket_item_lens,
+        bucket_observed_bps,
+        bucket_bytes,
+        bucket_tx_bytes,
+        bucket_last_tx_ns,
+        bucket_pending_bytes,
         snapshot_stack: ff.pop_snapshot_stack.clone(),
         queued_bytes: queue.hot.queued_bytes,
         local_item_count: queue.hot.local_item_count,
@@ -479,6 +508,89 @@ fn diff_randomized_sequences() {
             }
         }
         run_diff(&steps, &format!("randomized seed={seed}"));
+    }
+}
+
+/// #1763 Codex review — INDEPENDENT no-cap-vs-two-pass oracle. The
+/// scripted/randomized diff tests above route BOTH the reference and the
+/// fused popper through `cos_queue_min_finish_bucket`, so they prove
+/// peek-vs-pop equivalence but NOT that the no-cap fast path (Lever B)
+/// equals the ORIGINAL eligible/fallback two-pass at `target_bps ==
+/// u64::MAX`. This test closes that gap with a self-contained reference:
+/// it builds randomized active-ring states (varied head-finish + nonzero
+/// observed_bps) and asserts `cos_queue_min_finish_bucket(ff, u64::MAX)`
+/// (which dispatches to `cos_queue_min_finish_bucket_no_cap`) selects the
+/// IDENTICAL bucket as a hand-rolled replay of the pre-#1763 two-pass
+/// loop evaluated at `target_bps == u64::MAX`. Because every bucket is
+/// eligible at u64::MAX, the two-pass collapses to "lowest head-finish,
+/// first-wins on strict <" — exactly what the no-cap path must produce.
+#[test]
+fn no_cap_fast_path_equals_two_pass_at_max() {
+    use crate::afxdp::tx::test_support::test_flow_fair_state_mut;
+
+    // Reference: replay the ORIGINAL eligible/fallback two-pass loop
+    // (verbatim semantics from the pre-#1763 cos_queue_min_finish_bucket)
+    // at target_bps == u64::MAX. NOT routed through the new dispatch.
+    fn two_pass_ref_at_max(ff: &crate::afxdp::types::FlowFairState) -> Option<u16> {
+        let target_bps = u64::MAX;
+        let mut eligible: Option<u16> = None;
+        let mut eligible_finish = u64::MAX;
+        let mut fallback: Option<u16> = None;
+        let mut fallback_finish = u64::MAX;
+        for bucket in ff.flow_rr_buckets.iter() {
+            let b = usize::from(bucket);
+            let finish = ff.flow_bucket_head_finish_bytes[b];
+            if finish < fallback_finish {
+                fallback_finish = finish;
+                fallback = Some(bucket);
+            }
+            let observed = ff.flow_bucket_observed_bps[b];
+            if observed <= target_bps && finish < eligible_finish {
+                eligible_finish = finish;
+                eligible = Some(bucket);
+            }
+        }
+        eligible.or(fallback)
+    }
+
+    let mut rng = Rng(0xC0FF_EE12_3456_789A);
+    for _iter in 0..2000 {
+        let mut queue = make_flow_fair_queue();
+        let ff = test_flow_fair_state_mut(&mut queue);
+        // Populate a random set of active buckets with varied head-finish
+        // and observed_bps directly (bypassing enqueue so we can hit
+        // equal-finish ties and large observed values exhaustively).
+        let n = 1 + rng.below(20) as usize; // up to 20 active buckets
+        for _ in 0..n {
+            let bucket = (1 + rng.below(4000)) as u16; // avoid bucket 0 sentinel-ish
+            let bi = usize::from(bucket);
+            // Skip duplicates (ring invariant: no dup bucket ids).
+            if ff.flow_bucket_head_finish_bytes[bi] != 0 {
+                continue;
+            }
+            // Head finish drawn from a small set to force frequent ties.
+            let finish = 1 + rng.below(6) * 500;
+            ff.flow_bucket_head_finish_bytes[bi] = finish;
+            ff.flow_bucket_tail_finish_bytes[bi] = finish;
+            // Observed bps: mix of 0, small, and near-u64::MAX values to
+            // confirm the no-cap path ignores observed entirely.
+            ff.flow_bucket_observed_bps[bi] = match rng.below(4) {
+                0 => 0,
+                1 => rng.below(1_000_000_000),
+                2 => u64::MAX - 1,
+                _ => u64::MAX,
+            };
+            ff.flow_rr_buckets.push_back(bucket);
+        }
+        let want = two_pass_ref_at_max(ff);
+        let got = cos_queue_min_finish_bucket(ff, u64::MAX);
+        assert_eq!(
+            got, want,
+            "no-cap fast path diverged from two-pass@u64::MAX: ring={:?}",
+            ff.flow_rr_buckets.iter().collect::<Vec<_>>()
+        );
+        // Also confirm the no_cap specialization directly matches.
+        assert_eq!(cos_queue_min_finish_bucket_no_cap(ff), want);
     }
 }
 
