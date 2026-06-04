@@ -6,6 +6,12 @@ use super::*;
 // is the non-batched variant used when the caller has already committed
 // to dropping the item. `pop_front_inner` is the shared implementation.
 
+/// #1763: production callers now fuse select+pop via
+/// `cos_queue_peek_min_bucket` + `cos_queue_pop_known_bucket`, so this
+/// scan-then-pop wrapper is retained as the canonical single-pop API
+/// for tests (it is also the double-scan REFERENCE oracle the
+/// fused-vs-reference differential test drives, fused_diff_tests.rs).
+#[cfg_attr(not(test), allow(dead_code))]
 #[inline]
 pub(in crate::afxdp) fn cos_queue_pop_front(
     queue: &mut CoSQueueRuntime,
@@ -44,6 +50,12 @@ fn cos_queue_pop_front_inner(
 /// no-cap default (existing behavior). Drain loops compute the
 /// per-bucket fair-share target and pass it here so over-cap
 /// buckets are deferred in favor of cooler ones.
+///
+/// #1763: production drain loops now fuse select+pop via
+/// `cos_queue_peek_min_bucket` + `cos_queue_pop_known_bucket`; this
+/// scan-then-pop cap-aware wrapper is retained as the reference oracle
+/// for the differential test and for direct single-pop test use.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(in crate::afxdp) fn cos_queue_pop_front_with_cap(
     queue: &mut CoSQueueRuntime,
     target_bps: u64,
@@ -56,29 +68,112 @@ fn cos_queue_pop_front_inner_with_cap(
     push_snapshot: bool,
     target_bps: u64,
 ) -> Option<CoSPendingTxItem> {
+    if !queue.flow_fair() {
+        return cos_queue_pop_known_bucket_inner(queue, MIN_FINISH_BUCKET_FIFO, push_snapshot);
+    }
+    // Invariant: `flow_fair() == true` ↔ `flow_fair_state.is_some()`.
+    // Set together at every promotion / demotion site (admission.rs:508,
+    // tx/test_support.rs enable_/disable_test_flow_fair). Silently
+    // returning None here would make the queue look empty and stall
+    // service while masking a structural bug.
+    let ff = queue
+        .flow_fair_state
+        .as_ref()
+        .expect("cos_queue_pop_front_inner_with_cap: flow_fair queue without flow_fair_state");
+    // #785 Phase 3 — MQFQ: pop from the bucket whose head
+    // packet has the smallest virtual-finish-time, not DRR
+    // rotation order. The active set (`flow_rr_buckets`) is
+    // still maintained on 0↔>0 transitions so the min-scan
+    // only iterates the currently-active buckets (typically
+    // 2-16), not all 4096.
+    //
+    // #1229 v7: scan now skips buckets whose EWMA-observed bps
+    // exceeds `target_bps`, falling back to the lowest-finish
+    // bucket if all are over-cap (work-conserving).
+    let bucket_u16 = cos_queue_min_finish_bucket(ff, target_bps)?;
+    cos_queue_pop_known_bucket_inner(queue, bucket_u16, push_snapshot)
+}
+
+/// #1763 Lever A — pop from a bucket already selected by
+/// `cos_queue_peek_min_bucket` (or, internally, by the min-finish scan
+/// in `cos_queue_pop_front_inner_with_cap`). Carries out the SAME
+/// post-selection bookkeeping the inline path always did — snapshot
+/// push, served-finish vtime advance, head-finish re-anchor, active-set
+/// vacate, accounting — with NO re-scan.
+///
+/// Fairness-neutrality contract: the caller MUST NOT mutate the queue
+/// between the `cos_queue_peek_min_bucket` that produced `bucket_u16`
+/// and this call. Under that invariant `bucket_u16` is still the
+/// active-front winner, so this pops the byte-identical item the
+/// double-scan would have. A `debug_assert` re-runs the scan in dev/
+/// test builds and verifies the known bucket matches; release builds
+/// trust the no-mutation invariant and skip the second scan entirely.
+///
+/// `MIN_FINISH_BUCKET_FIFO` selects the non-flow-fair hot-deque path.
+#[inline]
+pub(in crate::afxdp) fn cos_queue_pop_known_bucket(
+    queue: &mut CoSQueueRuntime,
+    bucket_u16: u16,
+    target_bps: u64,
+) -> Option<CoSPendingTxItem> {
+    debug_assert!(
+        cos_queue_pop_known_bucket_matches(queue, bucket_u16, target_bps),
+        "cos_queue_pop_known_bucket: bucket {bucket_u16} is not the current \
+         min-finish active-front winner — the queue was mutated between \
+         peek and pop, violating the fused select+pop no-mutation invariant",
+    );
+    cos_queue_pop_known_bucket_inner(queue, bucket_u16, true)
+}
+
+/// #1763 — dev/test guard for `cos_queue_pop_known_bucket`. Re-runs the
+/// min-finish scan and confirms `bucket_u16` is what it would have
+/// chosen. FIFO queues are trivially consistent (the sentinel is not a
+/// real bucket and the hot deque is popped directly).
+#[cfg(debug_assertions)]
+fn cos_queue_pop_known_bucket_matches(
+    queue: &CoSQueueRuntime,
+    bucket_u16: u16,
+    target_bps: u64,
+) -> bool {
+    if !queue.flow_fair() {
+        return bucket_u16 == MIN_FINISH_BUCKET_FIFO;
+    }
+    let Some(ff) = queue.flow_fair_state.as_ref() else {
+        return false;
+    };
+    cos_queue_min_finish_bucket(ff, target_bps) == Some(bucket_u16)
+}
+
+#[cfg(not(debug_assertions))]
+#[inline(always)]
+fn cos_queue_pop_known_bucket_matches(
+    _queue: &CoSQueueRuntime,
+    _bucket_u16: u16,
+    _target_bps: u64,
+) -> bool {
+    true
+}
+
+/// #1763 — shared post-selection pop body. `bucket_u16` is the
+/// already-selected MQFQ bucket (or `MIN_FINISH_BUCKET_FIFO` for the
+/// non-flow-fair hot-deque path).
+fn cos_queue_pop_known_bucket_inner(
+    queue: &mut CoSQueueRuntime,
+    bucket_u16: u16,
+    push_snapshot: bool,
+) -> Option<CoSPendingTxItem> {
     let item = if !queue.flow_fair() {
+        debug_assert_eq!(
+            bucket_u16, MIN_FINISH_BUCKET_FIFO,
+            "cos_queue_pop_known_bucket_inner: FIFO queue must use the FIFO sentinel bucket",
+        );
         queue.hot.items.pop_front()?
     } else {
         // Invariant: `flow_fair() == true` ↔ `flow_fair_state.is_some()`.
-        // Set together at every promotion / demotion site (admission.rs:508,
-        // tx/test_support.rs enable_/disable_test_flow_fair). Silently
-        // returning None here would make the queue look empty and stall
-        // service while masking a structural bug.
         let ff = queue
             .flow_fair_state
             .as_mut()
-            .expect("cos_queue_pop_front_inner: flow_fair queue without flow_fair_state");
-        // #785 Phase 3 — MQFQ: pop from the bucket whose head
-        // packet has the smallest virtual-finish-time, not DRR
-        // rotation order. The active set (`flow_rr_buckets`) is
-        // still maintained on 0↔>0 transitions so the min-scan
-        // only iterates the currently-active buckets (typically
-        // 2-16), not all 4096.
-        //
-        // #1229 v7: scan now skips buckets whose EWMA-observed bps
-        // exceeds `target_bps`, falling back to the lowest-finish
-        // bucket if all are over-cap (work-conserving).
-        let bucket_u16 = cos_queue_min_finish_bucket(ff, target_bps)?;
+            .expect("cos_queue_pop_known_bucket_inner: flow_fair queue without flow_fair_state");
         let bucket = usize::from(bucket_u16);
         if push_snapshot {
             // #785 Phase 3 — Codex round-3 HIGH + NEW-1: snapshot

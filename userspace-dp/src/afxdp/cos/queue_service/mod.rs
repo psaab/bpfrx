@@ -31,7 +31,7 @@ use crate::xsk_ffi::xdp::XdpDesc;
 use super::{
     COS_MIN_BURST_BYTES, CoSQueueLeaseAcquireTelemetry, cos_item_len,
     cos_queue_clear_orphan_snapshot_after_drop, cos_queue_front, cos_queue_front_with_cap,
-    cos_queue_is_empty, cos_queue_pop_front, cos_queue_pop_front_with_cap, cos_queue_push_front,
+    cos_queue_is_empty, cos_queue_peek_min_bucket, cos_queue_pop_known_bucket, cos_queue_push_front,
     cos_queue_v_min_consume_suspension, cos_queue_v_min_continue, cos_refill_ns_until,
     maybe_top_up_cos_queue_lease, publish_committed_queue_vtime, refill_cos_tokens,
 };
@@ -1602,7 +1602,12 @@ fn build_cos_batch_from_queue(
             let mut remaining_secondary = secondary_budget;
             let mut batch_bytes = 0u64;
             while items.len() < TX_BATCH_SIZE {
-                let Some(front) = cos_queue_front(queue) else {
+                // #1763 Lever A — fused select+pop. Peek returns the
+                // min-finish bucket id; if we commit to popping, reuse
+                // that exact bucket (no re-scan). No queue mutation
+                // occurs between peek and the matching pop, so the
+                // selected bucket is byte-identical to a re-scan.
+                let Some((bucket, front)) = cos_queue_peek_min_bucket(queue, u64::MAX) else {
                     break;
                 };
                 let len = cos_item_len(front);
@@ -1614,7 +1619,7 @@ fn build_cos_batch_from_queue(
                 }
                 remaining_root = remaining_root.saturating_sub(len);
                 remaining_secondary = remaining_secondary.saturating_sub(len);
-                match cos_queue_pop_front(queue) {
+                match cos_queue_pop_known_bucket(queue, bucket, u64::MAX) {
                     Some(CoSPendingTxItem::Local(req)) => {
                         batch_bytes = batch_bytes.saturating_add(len);
                         items.push_back(req);
@@ -1643,7 +1648,9 @@ fn build_cos_batch_from_queue(
             let mut remaining_secondary = secondary_budget;
             let mut batch_bytes = 0u64;
             while items.len() < TX_BATCH_SIZE {
-                let Some(front) = cos_queue_front(queue) else {
+                // #1763 Lever A — fused select+pop (Prepared arm). See
+                // the Local arm above for the no-mutation invariant.
+                let Some((bucket, front)) = cos_queue_peek_min_bucket(queue, u64::MAX) else {
                     break;
                 };
                 let len = cos_item_len(front);
@@ -1655,7 +1662,7 @@ fn build_cos_batch_from_queue(
                 }
                 remaining_root = remaining_root.saturating_sub(len);
                 remaining_secondary = remaining_secondary.saturating_sub(len);
-                match cos_queue_pop_front(queue) {
+                match cos_queue_pop_known_bucket(queue, bucket, u64::MAX) {
                     Some(CoSPendingTxItem::Prepared(req)) => {
                         batch_bytes = batch_bytes.saturating_add(len);
                         items.push_back(req);

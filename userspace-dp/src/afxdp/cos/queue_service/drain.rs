@@ -206,7 +206,15 @@ pub(in crate::afxdp) fn drain_exact_local_items_to_scratch_flow_fair(
         // #1229 v7: cap-aware front/pop. target_bps was sampled
         // once at drain-batch start; same value used for every
         // pop in the batch so the eligible-set is stable.
-        let Some(front) = cos_queue_front_with_cap(queue, target_bps) else {
+        //
+        // #1763 Lever A — fused select+pop. Peek returns the cap-aware
+        // min-finish bucket id; the matching pop reuses it with no
+        // re-scan. The queue is NOT mutated between peek and pop (the
+        // budget break below abandons WITHOUT popping → 1 scan, same as
+        // before; the mirror-reserve abandon pops the same `bucket`),
+        // so the selected bucket is byte-identical to the prior
+        // double-scan.
+        let Some((bucket, front)) = cos_queue_peek_min_bucket(queue, target_bps) else {
             break;
         };
         let len = match front {
@@ -221,7 +229,7 @@ pub(in crate::afxdp) fn drain_exact_local_items_to_scratch_flow_fair(
         {
             if scratch_local_tx.is_empty() {
                 let Some(CoSPendingTxItem::Local(_req)) =
-                    cos_queue_pop_front_with_cap(queue, target_bps)
+                    cos_queue_pop_known_bucket(queue, bucket, target_bps)
                 else {
                     break;
                 };
@@ -231,7 +239,7 @@ pub(in crate::afxdp) fn drain_exact_local_items_to_scratch_flow_fair(
             break;
         }
         let Some(CoSPendingTxItem::Local(mut req)) =
-            cos_queue_pop_front_with_cap(queue, target_bps)
+            cos_queue_pop_known_bucket(queue, bucket, target_bps)
         else {
             break;
         };
@@ -458,7 +466,10 @@ pub(in crate::afxdp) fn drain_exact_prepared_items_to_scratch_flow_fair(
         if !suspended && !cos_queue_v_min_continue(queue, v_min_pop_count) {
             break;
         }
-        let Some(front) = cos_queue_front_with_cap(queue, target_bps) else {
+        // #1763 Lever A — fused select+pop (Prepared cap-aware arm).
+        // Budget break abandons without popping (1 scan); commit reuses
+        // `bucket` (no re-scan). See the Local arm for the invariant.
+        let Some((bucket, front)) = cos_queue_peek_min_bucket(queue, target_bps) else {
             break;
         };
         let len = match front {
@@ -469,7 +480,7 @@ pub(in crate::afxdp) fn drain_exact_prepared_items_to_scratch_flow_fair(
             break;
         }
         let Some(CoSPendingTxItem::Prepared(mut req)) =
-            cos_queue_pop_front_with_cap(queue, target_bps)
+            cos_queue_pop_known_bucket(queue, bucket, target_bps)
         else {
             break;
         };
