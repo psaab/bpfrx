@@ -184,10 +184,15 @@ pub(super) fn bring_up_workers(
         let counters_clone = counters.clone();
         // Retain the join handle so stop_inner can join the resolver and
         // enforce no-mutation-after-stop (the bare stop re-check is a
-        // check-then-act race; joining is the real guard). On spawn
-        // failure the resolver is simply absent (workers see `None` and
-        // skip on-demand resolution — no availability regression).
-        let resolver_join = spawn_supervised_aux("neigh-resolver", move || {
+        // check-then-act race; joining is the real guard). Only install
+        // the resolver handle when the thread actually spawned: on spawn
+        // failure leave `resolver`/`resolver_stop`/`resolver_join` as
+        // `None` so the NEXT reconcile retries (the `is_none()` guard
+        // above stays true) and workers see `None` and skip on-demand
+        // resolution — they never enqueue into a permanently-dead resolver
+        // (Copilot). The dst still fast-fails normally; no availability
+        // regression.
+        match spawn_supervised_aux("neigh-resolver", move || {
             neighbor_resolver_loop(
                 rx,
                 dynamic_neighbors,
@@ -195,15 +200,23 @@ pub(super) fn bring_up_workers(
                 counters_clone,
                 resolver_stop_clone,
             )
-        })
-        .ok();
-        coord.neighbors.resolver = Some(Arc::new(NeighborResolver::new(
-            tx,
-            counters,
-            neighbor_generation_handle,
-        )));
-        coord.neighbors.resolver_stop = Some(resolver_stop);
-        coord.neighbors.resolver_join = resolver_join;
+        }) {
+            Ok(join) => {
+                coord.neighbors.resolver = Some(Arc::new(NeighborResolver::new(
+                    tx,
+                    counters,
+                    neighbor_generation_handle,
+                )));
+                coord.neighbors.resolver_stop = Some(resolver_stop);
+                coord.neighbors.resolver_join = Some(join);
+            }
+            Err(err) => {
+                eprintln!(
+                    "xpf-userspace-dp: neighbor resolver thread spawn failed: {err}; \
+                     on-demand resolution disabled this reconcile (will retry)"
+                );
+            }
+        }
     }
     for (worker_id, binding_plans) in workers {
         let plan_count = binding_plans.len();

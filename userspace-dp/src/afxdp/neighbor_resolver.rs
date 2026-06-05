@@ -512,6 +512,10 @@ pub(super) fn neighbor_resolver_loop(
     let fd = open_resolver_socket();
     if fd < 0 {
         eprintln!("xpf-userspace-dp: neighbor resolver: netlink socket open failed; exiting");
+        // Keep the gauge at its steady state for a dead resolver so it
+        // does not stick non-zero if a worker enqueued before the socket
+        // open failed (Copilot).
+        counters.queue_depth.store(0, Ordering::Relaxed);
         return;
     }
     let mut last_resolved: FastMap<(i32, IpAddr), u64> = FastMap::default();
@@ -621,6 +625,11 @@ pub(super) fn neighbor_resolver_loop(
         }
     }
     unsafe { libc::close(fd) };
+    // Reset the depth gauge on exit: any items still in the channel are
+    // dropped when `rx` is dropped and will never be dequeued/decremented,
+    // so the gauge would otherwise stay stuck non-zero while the resolver
+    // is dead (Copilot). Steady state for a stopped resolver is 0.
+    counters.queue_depth.store(0, Ordering::Relaxed);
     eprintln!("xpf-userspace-dp: neighbor resolver: stopped");
 }
 
