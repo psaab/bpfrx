@@ -558,15 +558,13 @@ pub(super) fn neighbor_resolver_loop(
             Err(_) => GetOutcome::Unusable,
         };
         // Re-check stop AFTER the (up to 200 ms) GET, before any mutation
-        // of the shared neighbor map. The aux thread is detached
-        // (spawn_supervised_aux drops the JoinHandle) and stop_inner does
-        // not join, so without this a resolver blocked in the GET recv
-        // during a stop/reconcile could insert/remove on dynamic_neighbors
-        // after a fresh resolver has spawned (Codex High). Bail before any
-        // side effect. The insert path is additionally epoch-guarded
-        // (stop_inner does not reset the generation, but a reconcile's
-        // monitor restart re-stores it), but the remove/probe paths are
-        // not, so the stop re-check is the general guard.
+        // of the shared neighbor map. This is a fast early-out: the
+        // authoritative no-mutation-after-stop guarantee comes from
+        // Coordinator::stop_inner JOINING this thread (it retains the
+        // JoinHandle in NeighborManager.resolver_join), so once stop_inner
+        // returns this thread is gone and cannot mutate dynamic_neighbors
+        // after a reconcile spawns a fresh resolver. Bailing here just
+        // avoids one last wasted mutation in the common stop case.
         if stop.load(Ordering::Relaxed) {
             break;
         }
