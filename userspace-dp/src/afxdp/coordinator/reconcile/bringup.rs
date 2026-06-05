@@ -182,6 +182,13 @@ pub(super) fn bring_up_workers(
         let neighbor_generation_handle = neighbor_generation.clone();
         let counters = coord.neighbors.resolver_counters.clone();
         let counters_clone = counters.clone();
+        // #1772: latency telemetry shared into the resolver thread + the
+        // worker-facing handle. `get_rtt_hist` is resolver-thread-only;
+        // the dwell/drop/depth counters ride the worker-facing handle.
+        let get_rtt_hist = coord.neighbors.resolver_get_rtt_hist.clone();
+        let pending_dwell_hist = coord.neighbors.pending_dwell_hist.clone();
+        let pending_timeout_drops = coord.neighbors.pending_timeout_drops.clone();
+        let pending_max_depth = coord.neighbors.pending_max_depth.clone();
         // Retain the join handle so stop_inner can join the resolver and
         // enforce no-mutation-after-stop (the bare stop re-check is a
         // check-then-act race; joining is the real guard). Only install
@@ -198,6 +205,7 @@ pub(super) fn bring_up_workers(
                 dynamic_neighbors,
                 neighbor_generation,
                 counters_clone,
+                get_rtt_hist,
                 resolver_stop_clone,
             )
         }) {
@@ -206,6 +214,9 @@ pub(super) fn bring_up_workers(
                     tx,
                     counters,
                     neighbor_generation_handle,
+                    pending_dwell_hist,
+                    pending_timeout_drops,
+                    pending_max_depth,
                 )));
                 coord.neighbors.resolver_stop = Some(resolver_stop);
                 coord.neighbors.resolver_join = Some(join);
@@ -264,9 +275,8 @@ pub(super) fn bring_up_workers(
         let shared_cos_queue_leases = coord.cos.queue_leases.clone();
         let shared_cos_queue_vtime_floors = coord.cos.queue_vtime_floors.clone();
         let shared_mirror_targets = coord.mirror_targets.clone();
-        let runtime_atomics = std::sync::Arc::new(
-            crate::afxdp::worker_runtime::WorkerRuntimeAtomics::new(),
-        );
+        let runtime_atomics =
+            std::sync::Arc::new(crate::afxdp::worker_runtime::WorkerRuntimeAtomics::new());
         let runtime_atomics_clone = runtime_atomics.clone();
         // #1621: sibling per-worker WorkerColdPathAtomics, allocated
         // alongside the runtime_atomics so the publish + snapshot
@@ -274,9 +284,8 @@ pub(super) fn bring_up_workers(
         // cold_window_gen). Worker thread writes via
         // publish_from_local() each ~1s tick; coordinator status path
         // reads via snapshot() at each /metrics scrape.
-        let cold_path_atomics = std::sync::Arc::new(
-            crate::afxdp::cold_path_hist::WorkerColdPathAtomics::new(),
-        );
+        let cold_path_atomics =
+            std::sync::Arc::new(crate::afxdp::cold_path_hist::WorkerColdPathAtomics::new());
         let cold_path_atomics_clone = cold_path_atomics.clone();
         // #925 Phase 1: per-worker panic slot, keyed by worker_id.
         // Paired with `coord.worker_panics.remove(&worker_id)` on
@@ -284,11 +293,8 @@ pub(super) fn bring_up_workers(
         // a helper without re-validating the panic-payload contract.
         let panic_slot = Arc::new(Mutex::new(None::<String>));
         coord.worker_panics.insert(worker_id, panic_slot.clone());
-        let join = spawn_supervised_worker(
-            worker_id,
-            runtime_atomics.clone(),
-            panic_slot,
-            move || {
+        let join =
+            spawn_supervised_worker(worker_id, runtime_atomics.clone(), panic_slot, move || {
                 worker_loop(
                     worker_id,
                     binding_plans,
@@ -328,8 +334,7 @@ pub(super) fn bring_up_workers(
                     runtime_atomics_clone,
                     cold_path_atomics_clone,
                 );
-            },
-        );
+            });
         match join {
             Ok(join) => {
                 eprintln!(
@@ -408,7 +413,13 @@ pub(super) fn bring_up_workers(
         let warm_generation = coord.neighbors.warm_generation.clone();
         let rg_runtime = coord.ha.rg_runtime.clone();
         spawn_supervised_aux("neigh-warmer", move || {
-            neighbor_warmer_loop(rx, last_probed, warm_generation, rg_runtime, warm_stop_clone)
+            neighbor_warmer_loop(
+                rx,
+                last_probed,
+                warm_generation,
+                rg_runtime,
+                warm_stop_clone,
+            )
         })
         .ok();
         coord.neighbors.warm_queue = Some(tx);

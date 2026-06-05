@@ -637,6 +637,20 @@ type ProcessStatus struct {
 	NeighborResolverProbeOnStaleTotal uint64 `json:"neighbor_resolver_probe_on_stale_total,omitempty"`
 	NeighborResolverGetFailuresTotal  uint64 `json:"neighbor_resolver_get_failures_total,omitempty"`
 	NeighborResolverEpochRejectsTotal uint64 `json:"neighbor_resolver_epoch_rejects_total,omitempty"`
+	// #1772: neighbor/ARP resolution LATENCY telemetry. Complements the
+	// #1769 count-only resolver telemetry above with TIMING so the
+	// intermittent slow-new-connection symptom is visible. The bucket
+	// slices are NON-cumulative per-bucket sample counts on a 16-bucket
+	// pow2-ns ladder (bucket i upper bound 2^(16+i) ns; bucket 15 = +Inf;
+	// the 3 s blackout class lands in bucket 15).
+	NeighborPendingDwellBuckets      []uint64 `json:"neighbor_pending_dwell_buckets,omitempty"`
+	NeighborPendingDwellSumNs        uint64   `json:"neighbor_pending_dwell_sum_ns,omitempty"`
+	NeighborPendingDwellCount        uint64   `json:"neighbor_pending_dwell_count,omitempty"`
+	NeighborResolverGetRttBuckets    []uint64 `json:"neighbor_resolver_get_rtt_buckets,omitempty"`
+	NeighborResolverGetRttSumNs      uint64   `json:"neighbor_resolver_get_rtt_sum_ns,omitempty"`
+	NeighborResolverGetRttCount      uint64   `json:"neighbor_resolver_get_rtt_count,omitempty"`
+	NeighborPendingTimeoutDropsTotal uint64   `json:"neighbor_pending_timeout_drops_total,omitempty"`
+	NeighborPendingMaxDepth          uint64   `json:"neighbor_pending_max_depth,omitempty"`
 }
 
 // MarshalJSON intentionally uses a value receiver so both ProcessStatus values

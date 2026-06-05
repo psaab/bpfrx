@@ -72,6 +72,22 @@ pub(crate) struct NeighborManager {
     /// Shared resolver counters (queue depth gauge + GET/probe/epoch
     /// telemetry), surfaced to Prometheus.
     pub(crate) resolver_counters: Arc<super::super::neighbor_resolver::ResolverCounters>,
+    // #1772: neighbor/ARP resolution LATENCY histograms (observability-
+    // only). Shared aggregate (one set of atomics across all workers +
+    // the resolver thread); see neighbor_latency.rs for the design.
+    /// pending_neigh dwell-time histogram: `now_ns - pkt.queued_ns` when
+    /// a buffered packet is finally resolved + dispatched in
+    /// `retry_pending_neigh`. THE key #1772 metric.
+    pub(crate) pending_dwell_hist: Arc<super::super::neighbor_latency::NeighborLatencyHist>,
+    /// Resolver single-key RTM_GETNEIGH round-trip-time histogram
+    /// (request sent → reply read), measured on the resolver thread.
+    pub(crate) resolver_get_rtt_hist: Arc<super::super::neighbor_latency::NeighborLatencyHist>,
+    /// pending_neigh packets dropped after exceeding PENDING_NEIGH_TIMEOUT
+    /// (never resolved within the window). Monotonic counter.
+    pub(crate) pending_timeout_drops: Arc<AtomicU64>,
+    /// High-water mark of `binding.pending_neigh.len()` observed at any
+    /// retry-sweep entry across all bindings (gauge).
+    pub(crate) pending_max_depth: Arc<AtomicU64>,
     /// Stop flag for the resolver worker thread.
     pub(crate) resolver_stop: Option<Arc<AtomicBool>>,
     /// Join handle for the resolver worker thread. Retained (unlike the
@@ -103,6 +119,14 @@ impl NeighborManager {
             resolver_counters: Arc::new(
                 super::super::neighbor_resolver::ResolverCounters::default(),
             ),
+            pending_dwell_hist: Arc::new(
+                super::super::neighbor_latency::NeighborLatencyHist::default(),
+            ),
+            resolver_get_rtt_hist: Arc::new(
+                super::super::neighbor_latency::NeighborLatencyHist::default(),
+            ),
+            pending_timeout_drops: Arc::new(AtomicU64::new(0)),
+            pending_max_depth: Arc::new(AtomicU64::new(0)),
             resolver_stop: None,
             resolver_join: None,
         }

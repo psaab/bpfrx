@@ -156,6 +156,15 @@ pub(crate) struct NeighborResolver {
     /// resolver thread can detect a concurrent monitor event (epoch
     /// guard).
     neighbor_generation: Arc<AtomicU64>,
+    // #1772: latency telemetry carried on the worker-facing handle so
+    // `retry_pending_neigh` can record dwell + the timeout-drop / max-
+    // depth counters without growing its already-wide parameter list.
+    /// pending_neigh dwell-time histogram (shared aggregate).
+    pub(crate) pending_dwell_hist: Arc<super::neighbor_latency::NeighborLatencyHist>,
+    /// pending_neigh packets dropped after PENDING_NEIGH_TIMEOUT.
+    pub(crate) pending_timeout_drops: Arc<AtomicU64>,
+    /// High-water mark of `pending_neigh.len()` at retry-sweep entry.
+    pub(crate) pending_max_depth: Arc<AtomicU64>,
 }
 
 impl NeighborResolver {
@@ -163,11 +172,49 @@ impl NeighborResolver {
         tx: SyncSender<ResolveItem>,
         counters: Arc<ResolverCounters>,
         neighbor_generation: Arc<AtomicU64>,
+        pending_dwell_hist: Arc<super::neighbor_latency::NeighborLatencyHist>,
+        pending_timeout_drops: Arc<AtomicU64>,
+        pending_max_depth: Arc<AtomicU64>,
     ) -> Self {
         Self {
             tx,
             counters,
             neighbor_generation,
+            pending_dwell_hist,
+            pending_timeout_drops,
+            pending_max_depth,
+        }
+    }
+
+    /// #1772: record a pending-neigh dwell observation (rare; off the
+    /// per-packet fast path).
+    #[inline]
+    pub(crate) fn record_pending_dwell(&self, dwell_ns: u64) {
+        self.pending_dwell_hist.record(dwell_ns);
+    }
+
+    /// #1772: count a pending-neigh timeout-drop.
+    #[inline]
+    pub(crate) fn record_pending_timeout_drop(&self) {
+        self.pending_timeout_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// #1772: update the pending-neigh queue-depth high-water mark with a
+    /// monotonic max. Cheap relaxed CAS loop; only loops under a true new
+    /// maximum, which is rare.
+    #[inline]
+    pub(crate) fn observe_pending_depth(&self, depth: u64) {
+        let mut cur = self.pending_max_depth.load(Ordering::Relaxed);
+        while depth > cur {
+            match self.pending_max_depth.compare_exchange_weak(
+                cur,
+                depth,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
         }
     }
 
@@ -537,6 +584,9 @@ pub(super) fn neighbor_resolver_loop(
     dynamic_neighbors: Arc<ShardedNeighborMap>,
     neighbor_generation: Arc<AtomicU64>,
     counters: Arc<ResolverCounters>,
+    // #1772: single-key RTM_GETNEIGH round-trip-time histogram (request
+    // sent → reply read), recorded on this resolver thread.
+    get_rtt_hist: Arc<super::neighbor_latency::NeighborLatencyHist>,
     stop: Arc<AtomicBool>,
 ) {
     let fd = open_resolver_socket();
@@ -587,10 +637,21 @@ pub(super) fn neighbor_resolver_loop(
         let epoch_before = item.epoch.min(neighbor_generation.load(Ordering::Acquire));
         counters.get_attempts.fetch_add(1, Ordering::Relaxed);
         seq = seq.wrapping_add(1).max(1);
+        // #1772: measure the GETNEIGH round-trip (request sent → reply
+        // read) with the monotonic clock. Recorded only when the send
+        // succeeded (a send-failure RTT would just be the syscall error
+        // latency, not a kernel round-trip). saturating_sub on a
+        // monotonic clock cannot underflow.
+        let get_start_ns = monotonic_nanos();
         let outcome = match send_get_neigh(fd, item.ifindex, item.hop, seq) {
-            Ok(()) => read_get_reply(fd, item.ifindex, item.hop, seq),
+            Ok(()) => {
+                let reply = read_get_reply(fd, item.ifindex, item.hop, seq);
+                let rtt_ns = monotonic_nanos().saturating_sub(get_start_ns);
+                get_rtt_hist.record(rtt_ns);
+                reply
+            }
             // Send failure is a transient local error, not an authoritative
-            // kernel verdict — probe, do not revoke.
+            // kernel verdict — probe, do not revoke. No RTT recorded.
             Err(_) => GetOutcome::NoReply,
         };
         // Re-check stop AFTER the (up to 200 ms) GET, before any mutation
@@ -719,7 +780,10 @@ mod tests {
     fn classify_failed_incomplete_are_failed_others_no_reply() {
         // Kernel authoritatively dead → Failed (revoke).
         assert_eq!(classify_nud(NUD_FAILED, Some(mac())), GetOutcome::Failed);
-        assert_eq!(classify_nud(NUD_INCOMPLETE, Some(mac())), GetOutcome::Failed);
+        assert_eq!(
+            classify_nud(NUD_INCOMPLETE, Some(mac())),
+            GetOutcome::Failed
+        );
         assert_eq!(classify_nud(NUD_FAILED, None), GetOutcome::Failed);
         // REACHABLE/STALE but no lladdr → not an authoritative FAILED, so
         // NoReply (probe, do NOT revoke a possibly-good entry — Copilot).
@@ -798,7 +862,14 @@ mod tests {
         // count an enqueue_drop and NOT block.
         let (tx, _rx) = mpsc::sync_channel::<ResolveItem>(1);
         let counters = Arc::new(ResolverCounters::default());
-        let resolver = NeighborResolver::new(tx, counters.clone(), Arc::new(AtomicU64::new(0)));
+        let resolver = NeighborResolver::new(
+            tx,
+            counters.clone(),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(super::super::neighbor_latency::NeighborLatencyHist::default()),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
         let hop = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200));
         resolver.enqueue(14, hop, "ge-0-0-2.80".to_string());
         resolver.enqueue(14, hop, "ge-0-0-2.80".to_string());
@@ -814,7 +885,14 @@ mod tests {
         let (tx, rx) = mpsc::sync_channel::<ResolveItem>(1);
         let counters = Arc::new(ResolverCounters::default());
         let epoch_gen = Arc::new(AtomicU64::new(7));
-        let resolver = NeighborResolver::new(tx, counters, epoch_gen.clone());
+        let resolver = NeighborResolver::new(
+            tx,
+            counters,
+            epoch_gen.clone(),
+            Arc::new(super::super::neighbor_latency::NeighborLatencyHist::default()),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
         epoch_gen.store(42, Ordering::Release);
         resolver.enqueue(
             14,
@@ -829,7 +907,14 @@ mod tests {
     fn enqueue_disconnected_counts_disconnected() {
         let (tx, rx) = mpsc::sync_channel::<ResolveItem>(1);
         let counters = Arc::new(ResolverCounters::default());
-        let resolver = NeighborResolver::new(tx, counters.clone(), Arc::new(AtomicU64::new(0)));
+        let resolver = NeighborResolver::new(
+            tx,
+            counters.clone(),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(super::super::neighbor_latency::NeighborLatencyHist::default()),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
         drop(rx);
         resolver.enqueue(
             14,
@@ -917,9 +1002,16 @@ mod tests {
         map.remove(&key);
         // The late confirmed insert must be rejected by the in-lock gate.
         let stale = mac();
-        let inserted =
-            map.insert_confirmed_if_unchanged(key, NeighborEntry { mac: stale }, &epoch_gen, epoch_before);
-        assert!(!inserted, "stale insert under advanced epoch must be rejected");
+        let inserted = map.insert_confirmed_if_unchanged(
+            key,
+            NeighborEntry { mac: stale },
+            &epoch_gen,
+            epoch_before,
+        );
+        assert!(
+            !inserted,
+            "stale insert under advanced epoch must be rejected"
+        );
         assert!(
             map.get(&key).is_none(),
             "the removed key must NOT be resurrected by a late stale GET",

@@ -99,6 +99,72 @@ func (c *xpfCollector) emitNeighborWarmCounters(ch chan<- prometheus.Metric, sta
 		prometheus.CounterValue,
 		float64(status.NeighborResolverEpochRejectsTotal),
 	)
+	// #1772: neighbor/ARP resolution LATENCY telemetry.
+	c.emitNeighborLatencyHistograms(ch, status)
+}
+
+// neighLatencyBucketCount mirrors the Rust NEIGH_LATENCY_BUCKETS (16):
+// 15 finite pow2-ns buckets + 1 +Inf saturate.
+const neighLatencyBucketCount = 16
+
+// neighLatencyBucketUpperSeconds returns the inclusive upper bound (in
+// SECONDS, for the Prometheus `le` label) of finite bucket i, mirroring
+// the Rust `neigh_latency_bucket_upper_ns`: bucket i upper bound is
+// 2^(16+i) ns. The final bucket (15) is +Inf and is NOT emitted as an
+// explicit `le` boundary — prometheus.MustNewConstHistogram appends the
+// implicit +Inf bucket from the total count.
+func neighLatencyBucketUpperSeconds(i int) float64 {
+	return float64(uint64(1)<<(16+uint(i))) / 1e9
+}
+
+// neighLatencyCumulativeBuckets converts the dataplane's NON-cumulative
+// per-bucket sample counts into the cumulative `le`→count map Prometheus
+// histograms require. Defensive against a short/absent slice (a peer on
+// an older protocol that does not send the buckets yields an empty map +
+// the count/sum we do have).
+func neighLatencyCumulativeBuckets(buckets []uint64) map[float64]uint64 {
+	out := make(map[float64]uint64, neighLatencyBucketCount-1)
+	var cum uint64
+	// Only the 15 finite buckets get an explicit `le`; the 16th (+Inf)
+	// is implicit in the histogram's total count.
+	for i := 0; i < neighLatencyBucketCount-1; i++ {
+		if i < len(buckets) {
+			cum += buckets[i]
+		}
+		out[neighLatencyBucketUpperSeconds(i)] = cum
+	}
+	return out
+}
+
+// emitNeighborLatencyHistograms exposes the #1772 neighbor/ARP
+// resolution LATENCY metrics: the pending-buffer dwell and resolver
+// GETNEIGH RTT histograms, plus the pending timeout-drop counter and the
+// pending queue-depth high-water gauge. The histograms localize where an
+// intermittent slow new connection spends its time (pending dwell vs
+// kernel GETNEIGH RTT).
+func (c *xpfCollector) emitNeighborLatencyHistograms(ch chan<- prometheus.Metric, status dpuserspace.ProcessStatus) {
+	ch <- prometheus.MustNewConstHistogram(
+		c.neighborPendingDwellSeconds,
+		status.NeighborPendingDwellCount,
+		float64(status.NeighborPendingDwellSumNs)/1e9,
+		neighLatencyCumulativeBuckets(status.NeighborPendingDwellBuckets),
+	)
+	ch <- prometheus.MustNewConstHistogram(
+		c.neighborResolverGetRttSeconds,
+		status.NeighborResolverGetRttCount,
+		float64(status.NeighborResolverGetRttSumNs)/1e9,
+		neighLatencyCumulativeBuckets(status.NeighborResolverGetRttBuckets),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.neighborPendingTimeoutDropsTotal,
+		prometheus.CounterValue,
+		float64(status.NeighborPendingTimeoutDropsTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.neighborPendingMaxDepth,
+		prometheus.GaugeValue,
+		float64(status.NeighborPendingMaxDepth),
+	)
 }
 
 func (c *xpfCollector) emitThreeColorPolicerCounters(ch chan<- prometheus.Metric, status dpuserspace.ProcessStatus) {

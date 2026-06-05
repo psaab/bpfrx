@@ -228,6 +228,11 @@ type xpfCollector struct {
 	neighborResolverProbeOnStaleTotal *prometheus.Desc
 	neighborResolverGetFailuresTotal  *prometheus.Desc
 	neighborResolverEpochRejectsTotal *prometheus.Desc
+	// #1772: neighbor/ARP resolution LATENCY histograms + counters.
+	neighborPendingDwellSeconds      *prometheus.Desc
+	neighborResolverGetRttSeconds    *prometheus.Desc
+	neighborPendingTimeoutDropsTotal *prometheus.Desc
+	neighborPendingMaxDepth          *prometheus.Desc
 }
 
 func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
@@ -386,6 +391,10 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.neighborResolverProbeOnStaleTotal
 	ch <- c.neighborResolverGetFailuresTotal
 	ch <- c.neighborResolverEpochRejectsTotal
+	ch <- c.neighborPendingDwellSeconds
+	ch <- c.neighborResolverGetRttSeconds
+	ch <- c.neighborPendingTimeoutDropsTotal
+	ch <- c.neighborPendingMaxDepth
 }
 
 func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
