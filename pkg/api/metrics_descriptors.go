@@ -832,5 +832,28 @@ func newCollector(srv *Server) *xpfCollector {
 			"Confirmed on-demand inserts skipped because the global neighbor epoch advanced between enqueue and the GET reply (epoch guard rejected a potentially-raced stale insert) (#1769).",
 			nil, nil,
 		),
+		// #1772: neighbor/ARP resolution LATENCY metrics. The two
+		// histograms localize where an intermittent slow new connection
+		// spends its time: pending-buffer dwell vs resolver GETNEIGH RTT.
+		neighborPendingDwellSeconds: prometheus.NewDesc(
+			"xpf_userspace_neighbor_pending_dwell_seconds",
+			"Histogram of how long a packet sat in the pending-neighbor buffer before its neighbor resolved and it was dispatched (now-queued at the retry-sweep success path). The 3 s blackout class from #1769 lands in the +Inf tail (#1772).",
+			nil, nil,
+		),
+		neighborResolverGetRttSeconds: prometheus.NewDesc(
+			"xpf_userspace_neighbor_resolver_get_rtt_seconds",
+			"Histogram of the on-demand resolver single-key RTM_GETNEIGH round-trip time (request sent to reply read) on the resolver thread (#1772).",
+			nil, nil,
+		),
+		neighborPendingTimeoutDropsTotal: prometheus.NewDesc(
+			"xpf_userspace_neighbor_pending_timeout_drops_total",
+			"Pending-neighbor packets dropped after exceeding PENDING_NEIGH_TIMEOUT without resolving (never reached a usable neighbor within the window) (#1772).",
+			nil, nil,
+		),
+		neighborPendingMaxDepth: prometheus.NewDesc(
+			"xpf_userspace_neighbor_pending_max_depth",
+			"High-water mark of the per-binding pending-neighbor queue depth observed at any retry-sweep entry (gauge) (#1772).",
+			nil, nil,
+		),
 	}
 }

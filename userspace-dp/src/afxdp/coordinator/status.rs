@@ -63,6 +63,20 @@ impl super::Coordinator {
         }
     }
 
+    /// #1772: neighbor/ARP resolution LATENCY telemetry. Returns the
+    /// pending-dwell + resolver GETNEIGH-RTT histogram snapshots plus the
+    /// pending-neigh timeout-drop count and queue-depth high-water mark.
+    /// Complements the #1769 count-only `neighbor_resolver_counters` with
+    /// timing so the intermittent slow-new-connection symptom is visible.
+    pub fn neighbor_latency_telemetry(&self) -> NeighborLatencyTelemetry {
+        NeighborLatencyTelemetry {
+            pending_dwell: self.neighbors.pending_dwell_hist.snapshot(),
+            resolver_get_rtt: self.neighbors.resolver_get_rtt_hist.snapshot(),
+            pending_timeout_drops: self.neighbors.pending_timeout_drops.load(Ordering::Relaxed),
+            pending_max_depth: self.neighbors.pending_max_depth.load(Ordering::Relaxed),
+        }
+    }
+
     pub fn recent_exceptions(&self) -> Vec<ExceptionStatus> {
         self.recent_exceptions
             .lock()
@@ -324,8 +338,7 @@ impl super::Coordinator {
                 // lag), making the operator's starvation-alert dashboard
                 // one cycle late.
                 let cold_opt = handle.cold_path_atomics.snapshot();
-                let cold_snapshot_failed =
-                    handle.cold_path_atomics.snapshot_failed_count();
+                let cold_snapshot_failed = handle.cold_path_atomics.snapshot_failed_count();
                 let has_data = cold_opt
                     .as_ref()
                     .map(|c| {
@@ -354,9 +367,7 @@ impl super::Coordinator {
                         if cold.samples[slot] == 0 {
                             continue;
                         }
-                        let Some((from, to)) =
-                            slot_map.inverse.get(slot).copied().flatten()
-                        else {
+                        let Some((from, to)) = slot_map.inverse.get(slot).copied().flatten() else {
                             // Sampled into a slot with no live mapping
                             // (config rotated mid-window). Skip — the
                             // next publish after the worker's zero-out
@@ -375,9 +386,7 @@ impl super::Coordinator {
                         // (from_zone, to_zone).
                         let expected_key =
                             crate::afxdp::cold_path_hist::zone_pair_packed_key(from, to);
-                        if cold.first_key[slot] != 0
-                            && cold.first_key[slot] != expected_key
-                        {
+                        if cold.first_key[slot] != 0 && cold.first_key[slot] != expected_key {
                             continue;
                         }
                         active_slot_ids.push(slot as u32);
@@ -439,8 +448,7 @@ impl super::Coordinator {
                     // (clock_source.as_str() returns "" for Unset
                     // which String::is_empty skip will also omit).
                     cold_path_sample_phase: cold.sample_phase,
-                    cold_path_wrapper_underflow_count: cold
-                        .wrapper_underflow_count,
+                    cold_path_wrapper_underflow_count: cold.wrapper_underflow_count,
                     cold_path_ns_per_tsc_q32: cold.ns_per_tsc_q32,
                     cold_path_wrapper_ns_baseline: cold.wrapper_ns_baseline,
                     cold_path_clock_source: cold.clock_source.as_str().to_string(),

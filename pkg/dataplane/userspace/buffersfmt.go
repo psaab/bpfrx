@@ -10,34 +10,36 @@ const (
 	systemBufferUtilizationHeading = "Userspace Buffer Utilization:"
 	systemBufferCountersHeading    = "Userspace Status Counters:"
 
-	systemBufferLabelAFXDPUMEMFrames        = "AF_XDP UMEM frames"
-	systemBufferLabelAFXDPTXRing            = "AF_XDP TX ring"
-	systemBufferLabelCoSQueueBytes          = "CoS queue bytes"
-	systemBufferLabelSessionTableEntries    = "Session table entries"
-	systemBufferLabelNatReverseKeyColl      = "NAT reverse-key collisions"
-	systemBufferLabelNeighborCacheEntries   = "Neighbor cache entries"
-	systemBufferLabelFlowCacheActiveFlows   = "Flow cache active flows"
-	systemBufferLabelFlowCacheEvictions     = "Flow cache collision evict"
-	systemBufferLabelPendingFillFrames      = "Pending fill frames"
-	systemBufferLabelSpareFillFrames        = "Spare fill frames"
-	systemBufferLabelPendingTXPrepared      = "Pending TX prepared"
-	systemBufferLabelPendingTXLocal         = "Pending TX local"
-	systemBufferLabelTXRingFullEvents       = "TX ring full events"
-	systemBufferLabelSendtoENOBUFS          = "sendto ENOBUFS"
-	systemBufferLabelBoundPendingOverflow   = "Bound pending overflow"
-	systemBufferLabelCoSQueueOverflow       = "CoS queue overflow"
-	systemBufferLabelRXFillRingEmptyDescs   = "RX fill-ring empty descs"
-	systemBufferLabelRedirectInboxOverflow  = "Redirect inbox overflow"
-	systemBufferLabelPendingTXLocalOver     = "Pending TX local overflow"
-	systemBufferLabelTXSubmitErrorDrops     = "TX submit error drops"
-	systemBufferLabelSYNCookieChallenges    = "SYN-cookie challenges"
-	systemBufferLabelSYNCookieSecretUnavail = "SYN-cookie secret unavailable"
-	systemBufferLabelSYNCookieSynAckSent    = "SYN-cookie SYN-ACK sent"
-	systemBufferLabelSYNCookieAckRstSent    = "SYN-cookie ACK RST sent"
-	systemBufferLabelSYNCookieBudgetDrops   = "SYN-cookie budget drops"
-	systemBufferLabelSYNCookieAckValid      = "SYN-cookie ACK valid"
-	systemBufferLabelSYNCookieAckInvalid    = "SYN-cookie ACK invalid"
-	systemBufferLabelSYNCookieBypass        = "SYN-cookie bypass"
+	systemBufferLabelAFXDPUMEMFrames         = "AF_XDP UMEM frames"
+	systemBufferLabelAFXDPTXRing             = "AF_XDP TX ring"
+	systemBufferLabelCoSQueueBytes           = "CoS queue bytes"
+	systemBufferLabelSessionTableEntries     = "Session table entries"
+	systemBufferLabelNatReverseKeyColl       = "NAT reverse-key collisions"
+	systemBufferLabelNeighborCacheEntries    = "Neighbor cache entries"
+	systemBufferLabelNeighborPendingMaxDepth = "Pending-neighbor max depth"
+	systemBufferLabelNeighborPendingTimeouts = "Pending-neighbor timeout drops"
+	systemBufferLabelFlowCacheActiveFlows    = "Flow cache active flows"
+	systemBufferLabelFlowCacheEvictions      = "Flow cache collision evict"
+	systemBufferLabelPendingFillFrames       = "Pending fill frames"
+	systemBufferLabelSpareFillFrames         = "Spare fill frames"
+	systemBufferLabelPendingTXPrepared       = "Pending TX prepared"
+	systemBufferLabelPendingTXLocal          = "Pending TX local"
+	systemBufferLabelTXRingFullEvents        = "TX ring full events"
+	systemBufferLabelSendtoENOBUFS           = "sendto ENOBUFS"
+	systemBufferLabelBoundPendingOverflow    = "Bound pending overflow"
+	systemBufferLabelCoSQueueOverflow        = "CoS queue overflow"
+	systemBufferLabelRXFillRingEmptyDescs    = "RX fill-ring empty descs"
+	systemBufferLabelRedirectInboxOverflow   = "Redirect inbox overflow"
+	systemBufferLabelPendingTXLocalOver      = "Pending TX local overflow"
+	systemBufferLabelTXSubmitErrorDrops      = "TX submit error drops"
+	systemBufferLabelSYNCookieChallenges     = "SYN-cookie challenges"
+	systemBufferLabelSYNCookieSecretUnavail  = "SYN-cookie secret unavailable"
+	systemBufferLabelSYNCookieSynAckSent     = "SYN-cookie SYN-ACK sent"
+	systemBufferLabelSYNCookieAckRstSent     = "SYN-cookie ACK RST sent"
+	systemBufferLabelSYNCookieBudgetDrops    = "SYN-cookie budget drops"
+	systemBufferLabelSYNCookieAckValid       = "SYN-cookie ACK valid"
+	systemBufferLabelSYNCookieAckInvalid     = "SYN-cookie ACK invalid"
+	systemBufferLabelSYNCookieBypass         = "SYN-cookie bypass"
 )
 
 type systemBufferSample struct {
@@ -464,6 +466,13 @@ func systemBufferCounterRows(status ProcessStatus, samples []systemBufferSample,
 	if status.NeighborCacheCapacity == 0 {
 		appendCounter(systemBufferLabelNeighborCacheEntries, "dynamic", uint64(status.NeighborEntries))
 	}
+	// #1772: pending-neighbor queue-depth high-water + timeout-drops.
+	// The max-depth high-water localizes pending-buffer pressure during
+	// the intermittent slow-new-connection symptom; timeout-drops count
+	// dsts that never resolved within PENDING_NEIGH_TIMEOUT. Both render
+	// in the Counters section (zero suppressed by appendCounter).
+	appendCounter(systemBufferLabelNeighborPendingMaxDepth, "aggregate", status.NeighborPendingMaxDepth)
+	appendCounter(systemBufferLabelNeighborPendingTimeouts, "aggregate", status.NeighborPendingTimeoutDropsTotal)
 	if _, flowCap, _ := systemBufferFlowCacheAggregate(status, samples); flowCap == 0 {
 		appendCounter(systemBufferLabelFlowCacheActiveFlows, "active window", activeFlowCount)
 	}

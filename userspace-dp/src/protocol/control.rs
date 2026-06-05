@@ -17,9 +17,7 @@ use super::resolution::{FlowWorkerStatus, PacketResolution};
 use super::security::{
     FirewallFilterTermCounterStatus, PolicyRuleCounterStatus, ThreeColorPolicerStatus,
 };
-use super::snapshot::{
-    ConfigSnapshot, FabricSnapshot, NeighborSnapshot, UserspaceCapabilities,
-};
+use super::snapshot::{ConfigSnapshot, FabricSnapshot, NeighborSnapshot, UserspaceCapabilities};
 
 pub(crate) const CONFIG_SNAPSHOT_PROTOCOL_VERSION: i32 = 3;
 pub(crate) const INJECT_PACKET_TUPLE_PROTOCOL_VERSION: i32 = 1;
@@ -181,6 +179,32 @@ pub(crate) struct ProcessStatus {
     pub neighbor_resolver_get_failures_total: u64,
     #[serde(rename = "neighbor_resolver_epoch_rejects_total", default)]
     pub neighbor_resolver_epoch_rejects_total: u64,
+    /// #1772: neighbor/ARP resolution LATENCY telemetry. Complements the
+    /// #1769 count-only resolver telemetry above with TIMING so the
+    /// operator's intermittent slow-new-connection symptom is visible.
+    /// Histogram buckets are NON-cumulative per-bucket sample counts on a
+    /// 16-bucket pow2-ns ladder (bucket `i` upper bound `2^(16+i)` ns;
+    /// bucket 15 = `+Inf`; the 3 s blackout class lands in bucket 15).
+    /// Additive / defaulted for backward compat.
+    /// pending_neigh dwell histogram (`now_ns - queued_ns` at resolve).
+    #[serde(rename = "neighbor_pending_dwell_buckets", default)]
+    pub neighbor_pending_dwell_buckets: Vec<u64>,
+    #[serde(rename = "neighbor_pending_dwell_sum_ns", default)]
+    pub neighbor_pending_dwell_sum_ns: u64,
+    #[serde(rename = "neighbor_pending_dwell_count", default)]
+    pub neighbor_pending_dwell_count: u64,
+    /// Resolver single-key RTM_GETNEIGH round-trip-time histogram.
+    #[serde(rename = "neighbor_resolver_get_rtt_buckets", default)]
+    pub neighbor_resolver_get_rtt_buckets: Vec<u64>,
+    #[serde(rename = "neighbor_resolver_get_rtt_sum_ns", default)]
+    pub neighbor_resolver_get_rtt_sum_ns: u64,
+    #[serde(rename = "neighbor_resolver_get_rtt_count", default)]
+    pub neighbor_resolver_get_rtt_count: u64,
+    /// pending_neigh timeout-drops + queue-depth high-water mark.
+    #[serde(rename = "neighbor_pending_timeout_drops_total", default)]
+    pub neighbor_pending_timeout_drops_total: u64,
+    #[serde(rename = "neighbor_pending_max_depth", default)]
+    pub neighbor_pending_max_depth: u64,
     /// #802: focused per-binding ring-pressure view. Projected from the
     /// same `BindingLiveState` atomics that back `Self::bindings` — a
     /// compact snapshot of the counters an operator looks at first when
@@ -457,4 +481,3 @@ pub(crate) struct SessionExportRequest {
     #[serde(default)]
     pub max: u32,
 }
-

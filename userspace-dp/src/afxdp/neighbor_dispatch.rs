@@ -44,6 +44,7 @@ fn probe_due(elapsed_ns: u64, attempts: u8) -> bool {
         .is_some_and(|&target| elapsed_ns >= target)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn retry_pending_neigh(
     binding: &mut BindingWorker,
     left: &mut [BindingWorker],
@@ -53,12 +54,24 @@ pub(super) fn retry_pending_neigh(
     mirror_targets: &MirrorTargetMap,
     forwarding: &ForwardingState,
     dynamic_neighbors: &Arc<ShardedNeighborMap>,
+    // #1772: optional latency-telemetry handle. `None` when the resolver
+    // thread failed to spawn (telemetry simply not recorded; no
+    // forwarding-behavior change). Recording fires only on the rare
+    // retry-sweep events (timeout drop, successful resolve dispatch), all
+    // off the per-packet forwarded fast path.
+    neighbor_resolver: Option<&Arc<NeighborResolver>>,
     now_ns: u64,
     area: &MmapArea,
     shared_recycles: &mut Vec<(u32, u64)>,
 ) {
     if binding.pending_neigh.is_empty() {
         return;
+    }
+    // #1772: observe the pending-neigh queue depth at sweep entry for the
+    // high-water gauge (after the empty-queue early-out so an idle binding
+    // never touches the atomic).
+    if let Some(resolver) = neighbor_resolver {
+        resolver.observe_pending_depth(binding.pending_neigh.len() as u64);
     }
     // GEMINI-NEXT.md Section 3 cold start: in-place pop_front/push_back
     // rotation. The previous version did `binding.pending_neigh.remove(i)`
@@ -124,6 +137,10 @@ pub(super) fn retry_pending_neigh(
                     now_ns,
                 );
             }
+            // #1772: count the never-resolved timeout drop.
+            if let Some(resolver) = neighbor_resolver {
+                resolver.record_pending_timeout_drop();
+            }
             binding.tx_pipeline.pending_fill_frames.push_back(pkt.addr);
             continue;
         }
@@ -178,6 +195,16 @@ pub(super) fn retry_pending_neigh(
             binding.pending_neigh.push_back(pkt);
             continue;
         };
+        // #1772: the neighbor is now usable — record the pending-neigh
+        // dwell (`now_ns - queued_ns`). This is THE key metric: how long
+        // the buffered packet waited for its neighbor to resolve. Both
+        // timestamps come from the same CLOCK_MONOTONIC source so the
+        // saturating_sub cannot underflow. Recorded at the resolved point
+        // (not after the subsequent rare cos/slice/target early-outs) so
+        // it measures resolution latency rather than dispatch success.
+        if let Some(resolver) = neighbor_resolver {
+            resolver.record_pending_dwell(now_ns.saturating_sub(pkt.queued_ns));
+        }
         let mut decision = pkt.decision;
         decision.resolution.neighbor_mac = Some(neighbor_mac);
         decision.resolution.disposition = ForwardingDisposition::ForwardCandidate;
@@ -477,6 +504,7 @@ mod mirror_tests {
             &mirror_targets,
             &forwarding,
             &dynamic_neighbors,
+            None,
             1,
             unsafe { &*area },
             &mut shared_recycles,
@@ -578,6 +606,7 @@ mod mirror_tests {
             &mirror_targets,
             &forwarding,
             &dynamic_neighbors,
+            None,
             now_ns,
             unsafe { &*area },
             &mut shared_recycles,
@@ -597,6 +626,206 @@ mod mirror_tests {
                 now_ns,
             ),
             "timed-out dst must be negatively cached",
+        );
+    }
+
+    /// #1772: build a worker-facing `NeighborResolver` handle wired to a
+    /// fresh latency-telemetry set, so a test can pass it into
+    /// `retry_pending_neigh` and read back the recorded dwell / drop /
+    /// depth. The channel `rx` is returned so the producer end is not
+    /// dropped (which would mark every enqueue Disconnected).
+    fn resolver_with_latency() -> (
+        Arc<NeighborResolver>,
+        std::sync::mpsc::Receiver<crate::afxdp::neighbor_resolver::ResolveItem>,
+        Arc<crate::afxdp::neighbor_latency::NeighborLatencyHist>,
+        Arc<AtomicU64>,
+        Arc<AtomicU64>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<crate::afxdp::neighbor_resolver::ResolveItem>(
+            crate::afxdp::neighbor_resolver::RESOLVER_QUEUE_DEPTH,
+        );
+        let dwell = Arc::new(crate::afxdp::neighbor_latency::NeighborLatencyHist::default());
+        let drops = Arc::new(AtomicU64::new(0));
+        let depth = Arc::new(AtomicU64::new(0));
+        let resolver = Arc::new(NeighborResolver::new(
+            tx,
+            Arc::new(crate::afxdp::neighbor_resolver::ResolverCounters::default()),
+            Arc::new(AtomicU64::new(0)),
+            dwell.clone(),
+            drops.clone(),
+            depth.clone(),
+        ));
+        (resolver, rx, dwell, drops, depth)
+    }
+
+    /// #1772 acceptance: a buffered packet with a known `queued_ns` that
+    /// resolves at a later `now_ns` records its dwell into the histogram
+    /// (correct bucket + count) AND the max-depth high-water gauge is set.
+    #[test]
+    fn resolved_pending_neighbor_records_dwell_and_depth() {
+        let mut bindings = vec![
+            BindingWorker::new_for_mirror_test(0, 0, 11, 0),
+            BindingWorker::new_for_mirror_test(1, 0, 22, 0),
+        ];
+        let original_frame = build_ipv4_test_packet(0);
+        unsafe {
+            bindings[0]
+                .umem
+                .area()
+                .slice_mut_unchecked(0, original_frame.len())
+        }
+        .expect("ingress frame")
+        .copy_from_slice(&original_frame);
+
+        let next_hop = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200));
+        let meta = pending_neighbor_meta(original_frame.len());
+        // Buffered at queued_ns = 1_000_000 ns; resolves at a now_ns that
+        // gives a 500 ms dwell — well under the 2 s PENDING_NEIGH_TIMEOUT
+        // so the packet DISPATCHES (and records its dwell) rather than
+        // timing out. The 3 s → tail-bucket mapping is covered by the
+        // neighbor_latency unit tests; here we verify the record fires on
+        // the real dispatch path with the correct sum + bucket.
+        let queued_ns = 1_000_000u64;
+        let dwell_ns = 500_000_000u64; // 500 ms
+        bindings[0].pending_neigh.push_back(PendingNeighPacket {
+            addr: 0,
+            desc: XdpDesc {
+                addr: 0,
+                len: original_frame.len() as u32,
+                options: 0,
+            },
+            meta,
+            decision: resolved_neighbor_decision(next_hop),
+            flow_key: Some(test_session_key(12345, 443)),
+            queued_ns,
+            probe_attempts: 0,
+        });
+
+        let mut forwarding = ForwardingState::default();
+        // Neighbor IS resolved now → the retry sweep dispatches it and
+        // records the dwell.
+        forwarding.neighbors.insert(
+            (80, next_hop),
+            NeighborEntry {
+                mac: [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            },
+        );
+
+        let lookup = WorkerBindingLookup::from_bindings(&bindings);
+        let mirror_targets = MirrorTargetMap::default();
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+        let mut shared_recycles = Vec::new();
+        let (resolver, _rx, dwell, _drops, depth) = resolver_with_latency();
+        let area = bindings[0].umem.area() as *const MmapArea;
+        let (left, rest) = bindings.split_at_mut(0);
+        let (binding, right) = rest.split_first_mut().expect("ingress binding");
+
+        let now_ns = queued_ns + dwell_ns;
+        retry_pending_neigh(
+            binding,
+            left,
+            0,
+            right,
+            &lookup,
+            &mirror_targets,
+            &forwarding,
+            &dynamic_neighbors,
+            Some(&resolver),
+            now_ns,
+            unsafe { &*area },
+            &mut shared_recycles,
+        );
+
+        assert!(bindings[0].pending_neigh.is_empty(), "packet must dispatch");
+        let snap = dwell.snapshot();
+        assert_eq!(snap.count, 1, "exactly one dwell sample recorded");
+        assert_eq!(snap.sum_ns, dwell_ns, "sum is the recorded dwell");
+        let expect_bucket = crate::afxdp::neighbor_latency::neigh_latency_bucket_index(dwell_ns);
+        assert_eq!(
+            snap.buckets[expect_bucket], 1,
+            "500 ms dwell recorded into its pow2-ns bucket",
+        );
+        assert_eq!(
+            depth.load(Ordering::Relaxed),
+            1,
+            "max-depth high-water must reflect the 1 queued packet",
+        );
+    }
+
+    /// #1772: a never-resolving packet that crosses the timeout records a
+    /// timeout-drop and records NO dwell sample.
+    #[test]
+    fn timed_out_pending_neighbor_records_timeout_drop_not_dwell() {
+        let mut bindings = vec![
+            BindingWorker::new_for_mirror_test(0, 0, 11, 0),
+            BindingWorker::new_for_mirror_test(1, 0, 22, 0),
+        ];
+        let original_frame = build_ipv4_test_packet(0);
+        unsafe {
+            bindings[0]
+                .umem
+                .area()
+                .slice_mut_unchecked(0, original_frame.len())
+        }
+        .expect("ingress frame")
+        .copy_from_slice(&original_frame);
+
+        let next_hop = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 138));
+        let meta = pending_neighbor_meta(original_frame.len());
+        bindings[0].pending_neigh.push_back(PendingNeighPacket {
+            addr: 0,
+            desc: XdpDesc {
+                addr: 0,
+                len: original_frame.len() as u32,
+                options: 0,
+            },
+            meta,
+            decision: resolved_neighbor_decision(next_hop),
+            flow_key: Some(test_session_key(12345, 443)),
+            queued_ns: 0,
+            probe_attempts: PROBE_SCHEDULE_NS.len() as u8,
+        });
+
+        // No neighbor anywhere → never resolves → timeout drop.
+        let forwarding = ForwardingState::default();
+        let lookup = WorkerBindingLookup::from_bindings(&bindings);
+        let mirror_targets = MirrorTargetMap::default();
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+        let mut shared_recycles = Vec::new();
+        let (resolver, _rx, dwell, drops, _depth) = resolver_with_latency();
+        let area = bindings[0].umem.area() as *const MmapArea;
+        let (left, rest) = bindings.split_at_mut(0);
+        let (binding, right) = rest.split_first_mut().expect("ingress binding");
+
+        let now_ns = PENDING_NEIGH_TIMEOUT_NS + 1;
+        retry_pending_neigh(
+            binding,
+            left,
+            0,
+            right,
+            &lookup,
+            &mirror_targets,
+            &forwarding,
+            &dynamic_neighbors,
+            Some(&resolver),
+            now_ns,
+            unsafe { &*area },
+            &mut shared_recycles,
+        );
+
+        assert!(
+            bindings[0].pending_neigh.is_empty(),
+            "timed-out pkt dropped"
+        );
+        assert_eq!(
+            drops.load(Ordering::Relaxed),
+            1,
+            "one timeout-drop must be counted",
+        );
+        assert_eq!(
+            dwell.snapshot().count,
+            0,
+            "a timed-out (never-resolved) packet must NOT record a dwell sample",
         );
     }
 }

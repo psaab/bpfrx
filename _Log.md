@@ -4608,3 +4608,18 @@ top.
   pkg/api/metrics_descriptors.go, pkg/api/metrics_userspace.go,
   pkg/api/metrics_descriptor_coverage_test.go,
   docs/userspace-cold-start-resolution.md.
+
+- **Timestamp**: 2026-06-05
+  **Action**: #1772 — add neighbor/ARP resolution LATENCY histograms
+  (pending-neigh dwell, resolver GETNEIGH RTT) + pending timeout-drops /
+  max-depth counters. Cheap fixed-bucket shared-aggregate histograms
+  (16-bucket pow2-ns; 3s blackout lands in +Inf tail). Off the
+  forwarded-packet fast path (retry sweep + resolver thread only).
+  Plumbed Rust→protocol→Go Prometheus + `show system buffers`.
+  **File(s)**: userspace-dp/src/afxdp/neighbor_latency.rs (new),
+  neighbor_resolver.rs, neighbor_dispatch.rs, coordinator/neighbor_manager.rs,
+  coordinator/status.rs, coordinator/reconcile/bringup.rs, worker/lifecycle.rs,
+  afxdp/mod.rs, src/protocol/control.rs, src/server/{helpers,lifecycle}.rs,
+  tests/fixtures/protocol_wire_v1.json, pkg/dataplane/userspace/{protocol,buffersfmt}.go,
+  pkg/api/{metrics,metrics_descriptors,metrics_userspace}.go,
+  docs/userspace-cold-start-resolution.md, docs/pr/1772-neighbor-latency-metrics/plan.md.

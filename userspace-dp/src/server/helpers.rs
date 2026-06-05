@@ -49,6 +49,17 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     state.status.neighbor_resolver_probe_on_stale_total = r.probe_on_stale;
     state.status.neighbor_resolver_get_failures_total = r.get_failures;
     state.status.neighbor_resolver_epoch_rejects_total = r.epoch_rejects;
+    // #1772: neighbor/ARP resolution LATENCY telemetry (pending-dwell +
+    // resolver GETNEIGH-RTT histograms + timeout-drop / max-depth).
+    let lat = state.afxdp.neighbor_latency_telemetry();
+    state.status.neighbor_pending_dwell_buckets = lat.pending_dwell.buckets.to_vec();
+    state.status.neighbor_pending_dwell_sum_ns = lat.pending_dwell.sum_ns;
+    state.status.neighbor_pending_dwell_count = lat.pending_dwell.count;
+    state.status.neighbor_resolver_get_rtt_buckets = lat.resolver_get_rtt.buckets.to_vec();
+    state.status.neighbor_resolver_get_rtt_sum_ns = lat.resolver_get_rtt.sum_ns;
+    state.status.neighbor_resolver_get_rtt_count = lat.resolver_get_rtt.count;
+    state.status.neighbor_pending_timeout_drops_total = lat.pending_timeout_drops;
+    state.status.neighbor_pending_max_depth = lat.pending_max_depth;
     state.status.route_entries = state.snapshot.as_ref().map(|s| s.routes.len()).unwrap_or(0);
     state.status.fabrics = state
         .snapshot

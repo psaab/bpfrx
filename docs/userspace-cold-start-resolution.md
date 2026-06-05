@@ -306,6 +306,36 @@ rejects, enqueue drops, disconnected. Before #1769 the only neighbor
 metrics were the two `neighbor_warm_*` counters, so the stuck state was
 invisible.
 
+**Latency observability (#1772 — `neighbor_*_seconds` histograms +
+counters):** #1769 added COUNT metrics but no TIMING, so the operator's
+*intermittent* slow-new-connection symptom stayed invisible (warm + cold
+connects measured ~4 ms with resolver counters at 0). #1772 adds cheap,
+fixed-bucket, shared-aggregate latency histograms:
+
+- `xpf_userspace_neighbor_pending_dwell_seconds` — how long a buffered
+  packet sat in the `pending_neigh` queue before its neighbor resolved
+  and it was dispatched (`now_ns - pkt.queued_ns` at the
+  `retry_pending_neigh` success path). THE key metric.
+- `xpf_userspace_neighbor_resolver_get_rtt_seconds` — resolver single-key
+  RTM_GETNEIGH round-trip (request sent → reply read) on the resolver
+  thread.
+- `xpf_userspace_neighbor_pending_timeout_drops_total` — pending packets
+  dropped after `PENDING_NEIGH_TIMEOUT` without resolving.
+- `xpf_userspace_neighbor_pending_max_depth` — high-water mark of the
+  pending-neigh queue depth (also surfaced in `show system buffers`).
+
+Bucket layout: 16-bucket pow2-ns ladder (bucket `i` upper bound
+`2^(16+i)` ns; bucket 15 = `+Inf`). The 3 s blackout class from #1769
+lands in the multi-second `+Inf` tail. Cost is near-zero — these fire
+only on the rare neighbor-miss/retry sweep and the single resolver
+thread, never on the forwarded-packet fast path; the dwell reuses the
+existing monotonic `queued_ns` timestamp (one sub + one bucket
+`fetch_add`). The probe→revalidate latency (#1772 metric 4) is a known
+gap: the probe fires on the resolver/retry thread but the REACHABLE
+confirmation arrives asynchronously on the netlink MONITOR thread with no
+per-key request/reply correlation, so it is not cleanly measurable
+in-process without net-new shared monitor↔resolver state.
+
 **Deferred to a follow-up (plan §10a):** the full per-key resolver state
 machine — per-key pending bound, per-key (not global) epoch, backoff that
 coalesces all pressure into one in-flight GET, and a throttled

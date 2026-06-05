@@ -10,7 +10,8 @@ use crate::nat::{
 use crate::nat64::{Nat64ReverseInfo, Nat64State};
 use crate::nptv6::Nptv6State;
 use crate::policy::{
-    PolicyAction, PolicyCounterStore, PolicyState, evaluate_policy, parse_policy_state_with_counters,
+    PolicyAction, PolicyCounterStore, PolicyState, evaluate_policy,
+    parse_policy_state_with_counters,
 };
 use crate::prefix::{PrefixV4, PrefixV6};
 use crate::screen::{ScreenProfile, ScreenState, ScreenVerdict, extract_screen_info};
@@ -62,6 +63,10 @@ mod bind;
 mod bpf_map;
 #[path = "checksum.rs"]
 mod checksum;
+#[path = "ethernet.rs"]
+mod ethernet;
+#[path = "event_emit.rs"]
+mod event_emit;
 #[path = "flow_cache.rs"]
 mod flow_cache;
 #[path = "forwarding/mod.rs"]
@@ -69,8 +74,6 @@ mod forwarding;
 mod forwarding_build;
 #[path = "frame/mod.rs"]
 mod frame;
-#[path = "mpsc_inbox.rs"]
-mod mpsc_inbox;
 #[path = "gre.rs"]
 mod gre;
 #[path = "ha.rs"]
@@ -78,12 +81,10 @@ mod ha;
 #[path = "icmp.rs"]
 mod icmp;
 mod icmp_embed;
-#[path = "ethernet.rs"]
-mod ethernet;
-#[path = "event_emit.rs"]
-mod event_emit;
 #[path = "mirror.rs"]
 mod mirror;
+#[path = "mpsc_inbox.rs"]
+mod mpsc_inbox;
 #[path = "neighbor.rs"]
 mod neighbor;
 #[path = "parser.rs"]
@@ -94,9 +95,9 @@ mod rst;
 mod sharded_neighbor;
 // session_glue is a directory module (afxdp/session_glue/{mod.rs, tests.rs}),
 // so the explicit `#[path]` is unnecessary — auto-resolution finds mod.rs.
-mod session_glue;
 #[path = "cos/mod.rs"]
 mod cos;
+mod session_glue;
 #[path = "shared_ops.rs"]
 mod shared_ops;
 #[path = "shared_umem.rs"]
@@ -150,7 +151,6 @@ use self::flow_cache::*;
 use self::forwarding::*;
 use self::forwarding_build::*;
 use self::frame::*;
-use self::tx::dispatch::*;
 use self::gre::{encapsulate_native_gre_frame, try_native_gre_decap_from_frame};
 use self::icmp::{FABRIC_INGRESS_FLAG, build_local_time_exceeded_request, is_icmp_error};
 #[cfg(test)]
@@ -167,16 +167,17 @@ use self::icmp_embed::{
     finalize_embedded_icmp_resolution, try_embedded_icmp_nat_match,
 };
 use self::mirror::*;
+use self::mpsc_inbox::MpscInbox;
 use self::neighbor::*;
 pub use self::neighbor::{neighbor_state_usable_str, parse_mac_str};
 pub(crate) use self::rst::remove_kernel_rst_suppression;
-use self::sharded_neighbor::ShardedNeighborMap;
 use self::rst::*;
 use self::session_glue::*;
+use self::sharded_neighbor::ShardedNeighborMap;
 use self::shared_ops::*;
 use self::shared_umem::*;
 use self::tunnel::*;
-use self::mpsc_inbox::MpscInbox;
+use self::tx::dispatch::*;
 use self::tx::*;
 use self::types::*;
 pub(crate) use self::types::{ForwardingDisposition, ForwardingResolution, NeighborEntry};
@@ -607,9 +608,15 @@ use neg_neigh::{neg_neigh_gate, neg_neigh_record};
 // (epoch-guarded) or probes to force kernel revalidation on a stale one.
 mod neighbor_resolver;
 use neighbor_resolver::{
-    neighbor_resolver_loop, NeighborResolver, NeighborResolverCounters, ResolveItem,
-    RESOLVER_ENQUEUE_THROTTLE_NS,
+    NeighborResolver, NeighborResolverCounters, RESOLVER_ENQUEUE_THROTTLE_NS, ResolveItem,
+    neighbor_resolver_loop,
 };
+
+// #1772: neighbor/ARP resolution LATENCY histograms (observability-only).
+// Cheap fixed-bucket aggregate histograms for pending-dwell + resolver
+// GETNEIGH RTT, plus timeout-drop / max-depth counters.
+mod neighbor_latency;
+use neighbor_latency::NeighborLatencyTelemetry;
 
 // Issue 67.2: neighbor-dispatch helpers extracted into
 // afxdp/neighbor_dispatch.rs.
@@ -639,12 +646,13 @@ use disposition::update_last_resolution;
 // Issue 67.4: forward-request builders extracted into
 // afxdp/forward_request.rs.
 mod forward_request;
-use forward_request::{build_live_forward_request_from_frame, should_install_local_reverse_session};
+use forward_request::{
+    build_live_forward_request_from_frame, should_install_local_reverse_session,
+};
 // `build_live_forward_request` is only referenced by tests in
 // afxdp/frame/tests.rs; gate its import behind cfg(test).
 #[cfg(test)]
 use forward_request::build_live_forward_request;
-
 
 #[derive(Clone, Copy, Debug, Default)]
 struct PendingForwardHints {
@@ -652,12 +660,10 @@ struct PendingForwardHints {
     target_binding_index: Option<usize>,
 }
 
-
 // Superseded by inline logic in build_live_forward_request() that reads ports
 // from the live UMEM area before .to_vec() copy (fixes #199).  Retained for
 // its unit test and potential future use.
 #[allow(dead_code)]
-
 
 fn binding_by_index_mut<'a>(
     left: &'a mut [BindingWorker],
