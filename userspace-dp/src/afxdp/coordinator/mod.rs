@@ -214,13 +214,21 @@ impl Coordinator {
             warm_stop.store(true, Ordering::Relaxed);
         }
         self.neighbors.warm_queue = None;
-        // #1769: stop the on-demand resolver and drop the handle so the
-        // worker recv side disconnects and exits cleanly (500ms recv
-        // timeout bounds the join latency).
+        // #1769: stop the on-demand resolver. Signal stop, drop the
+        // producer handle so the recv side disconnects promptly, then
+        // JOIN the worker before returning. Joining (not just signalling)
+        // is what enforces no-mutation-after-stop: a detached resolver
+        // blocked in its GET could otherwise insert/remove on
+        // dynamic_neighbors after a subsequent reconcile spawned a fresh
+        // resolver. Join latency is bounded by the 500ms recv timeout +
+        // the 200ms GET timeout, well under TimeoutStopSec.
         if let Some(resolver_stop) = self.neighbors.resolver_stop.take() {
             resolver_stop.store(true, Ordering::Relaxed);
         }
         self.neighbors.resolver = None;
+        if let Some(join) = self.neighbors.resolver_join.take() {
+            let _ = join.join();
+        }
         for handle in self.tunnel_sources.values_mut() {
             handle.stop.store(true, Ordering::Relaxed);
         }

@@ -74,6 +74,14 @@ pub(crate) struct NeighborManager {
     pub(crate) resolver_counters: Arc<super::super::neighbor_resolver::ResolverCounters>,
     /// Stop flag for the resolver worker thread.
     pub(crate) resolver_stop: Option<Arc<AtomicBool>>,
+    /// Join handle for the resolver worker thread. Retained (unlike the
+    /// monitor/warmer, whose mutations are authoritative) so `stop_inner`
+    /// can JOIN it after signalling stop — this enforces the no-mutation-
+    /// after-stop invariant the bare stop re-check cannot (a detached
+    /// resolver could otherwise mutate `dynamic_neighbors` after a
+    /// reconcile spawned a fresh one). Join latency is bounded by the
+    /// 500ms recv timeout + the 200ms GET timeout.
+    pub(crate) resolver_join: Option<std::thread::JoinHandle<()>>,
 }
 
 impl NeighborManager {
@@ -96,6 +104,7 @@ impl NeighborManager {
                 super::super::neighbor_resolver::ResolverCounters::default(),
             ),
             resolver_stop: None,
+            resolver_join: None,
         }
     }
 }

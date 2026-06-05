@@ -182,7 +182,12 @@ pub(super) fn bring_up_workers(
         let neighbor_generation_handle = neighbor_generation.clone();
         let counters = coord.neighbors.resolver_counters.clone();
         let counters_clone = counters.clone();
-        spawn_supervised_aux("neigh-resolver", move || {
+        // Retain the join handle so stop_inner can join the resolver and
+        // enforce no-mutation-after-stop (the bare stop re-check is a
+        // check-then-act race; joining is the real guard). On spawn
+        // failure the resolver is simply absent (workers see `None` and
+        // skip on-demand resolution — no availability regression).
+        let resolver_join = spawn_supervised_aux("neigh-resolver", move || {
             neighbor_resolver_loop(
                 rx,
                 dynamic_neighbors,
@@ -198,6 +203,7 @@ pub(super) fn bring_up_workers(
             neighbor_generation_handle,
         )));
         coord.neighbors.resolver_stop = Some(resolver_stop);
+        coord.neighbors.resolver_join = resolver_join;
     }
     for (worker_id, binding_plans) in workers {
         let plan_count = binding_plans.len();
