@@ -35,7 +35,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicI64, AtomicU8, AtomicU32, AtomicU64, Ordering,
+};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -598,6 +600,15 @@ use session_delta::{flush_session_deltas, purge_queued_flows_for_closed_deltas};
 // #1651 B3: dead-host negative neighbor cache helpers.
 mod neg_neigh;
 use neg_neigh::{neg_neigh_gate, neg_neigh_record};
+
+// #1769: shared, per-key, rate-limited on-demand neighbor resolver. On a
+// negative-cache fast-fail the worker enqueues the dst here; the resolver
+// thread issues a single-key RTM_GETNEIGH, caches a confirmed lladdr
+// (epoch-guarded) or probes to force kernel revalidation on a stale one.
+mod neighbor_resolver;
+use neighbor_resolver::{
+    neighbor_resolver_loop, NeighborResolver, NeighborResolverCounters, ResolveItem,
+};
 
 // Issue 67.2: neighbor-dispatch helpers extracted into
 // afxdp/neighbor_dispatch.rs.

@@ -579,6 +579,7 @@ mod tests {
             forwarding: &forwarding,
             ha_state: &ha_state,
             dynamic_neighbors: &dynamic_neighbors,
+            neighbor_resolver: None,
             shared_sessions: &shared_sessions,
             shared_nat_sessions: &shared_nat_sessions,
             shared_forward_wire_sessions: &shared_forward_wire_sessions,

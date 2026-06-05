@@ -214,6 +214,13 @@ impl Coordinator {
             warm_stop.store(true, Ordering::Relaxed);
         }
         self.neighbors.warm_queue = None;
+        // #1769: stop the on-demand resolver and drop the handle so the
+        // worker recv side disconnects and exits cleanly (500ms recv
+        // timeout bounds the join latency).
+        if let Some(resolver_stop) = self.neighbors.resolver_stop.take() {
+            resolver_stop.store(true, Ordering::Relaxed);
+        }
+        self.neighbors.resolver = None;
         for handle in self.tunnel_sources.values_mut() {
             handle.stop.store(true, Ordering::Relaxed);
         }

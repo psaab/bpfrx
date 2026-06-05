@@ -158,6 +158,29 @@ pub(crate) struct ProcessStatus {
     pub neighbor_warm_drops_total: u64,
     #[serde(rename = "neighbor_warm_disconnected_total", default)]
     pub neighbor_warm_disconnected_total: u64,
+    /// #1769: on-demand neighbor-resolver telemetry. The resolver runs
+    /// when a `MissingNeighbor` negative-cache fast-fail nudges a wedged
+    /// dst: it issues a single-key RTM_GETNEIGH and either caches a
+    /// confirmed lladdr (epoch-guarded) or probes to force kernel
+    /// revalidation on a stale one. These are the operator-visible signal
+    /// for the #1769 stuck-state (queue depth is a gauge; the rest are
+    /// monotonic counters). Additive / defaulted for backward compat.
+    #[serde(rename = "neighbor_resolver_queue_depth", default)]
+    pub neighbor_resolver_queue_depth: u64,
+    #[serde(rename = "neighbor_resolver_enqueue_drops_total", default)]
+    pub neighbor_resolver_enqueue_drops_total: u64,
+    #[serde(rename = "neighbor_resolver_disconnected_total", default)]
+    pub neighbor_resolver_disconnected_total: u64,
+    #[serde(rename = "neighbor_resolver_get_attempts_total", default)]
+    pub neighbor_resolver_get_attempts_total: u64,
+    #[serde(rename = "neighbor_resolver_get_resolved_total", default)]
+    pub neighbor_resolver_get_resolved_total: u64,
+    #[serde(rename = "neighbor_resolver_probe_on_stale_total", default)]
+    pub neighbor_resolver_probe_on_stale_total: u64,
+    #[serde(rename = "neighbor_resolver_get_failures_total", default)]
+    pub neighbor_resolver_get_failures_total: u64,
+    #[serde(rename = "neighbor_resolver_epoch_rejects_total", default)]
+    pub neighbor_resolver_epoch_rejects_total: u64,
     /// #802: focused per-binding ring-pressure view. Projected from the
     /// same `BindingLiveState` atomics that back `Self::bindings` — a
     /// compact snapshot of the counters an operator looks at first when

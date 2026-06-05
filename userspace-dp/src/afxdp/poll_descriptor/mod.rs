@@ -2052,6 +2052,40 @@ pub(super) fn poll_binding_process_descriptor(
                                     );
                                     if fast_fail {
                                         telemetry.dbg.neg_neigh_fast_fail += 1;
+                                        // #1769: the negative gate suppresses
+                                        // the probe + buffer below, so a dst
+                                        // that lost its dynamic entry (transient
+                                        // FAILED/DELNEIGH or a dropped good
+                                        // RTM_NEWNEIGH) would blackhole for the
+                                        // full 3s TTL with nothing nudging it
+                                        // back. Route it through the shared
+                                        // resolver: a single-key RTM_GETNEIGH
+                                        // off the hot path caches a confirmed
+                                        // REACHABLE/PERMANENT lladdr (epoch-
+                                        // guarded) or probes to force kernel
+                                        // revalidation on a DELAY/STALE one.
+                                        // Per-key rate-limited in the resolver
+                                        // thread, so a SYN storm fires at most
+                                        // one GET/probe per key per window. The
+                                        // hot path only pays a non-blocking
+                                        // try_send here (not per-packet — this
+                                        // arm fires only on the negative fast-
+                                        // fail).
+                                        if let Some(resolver) =
+                                            worker_ctx.neighbor_resolver
+                                        {
+                                            if let Some(name) = worker_ctx
+                                                .forwarding
+                                                .ifindex_to_name
+                                                .get(&neg_key.0)
+                                            {
+                                                resolver.enqueue(
+                                                    neg_key.0,
+                                                    neg_key.1,
+                                                    name.clone(),
+                                                );
+                                            }
+                                        }
                                         // Fresh RX descriptor → recycle via
                                         // scratch_recycle + continue, matching
                                         // the source-NAT-failure discard

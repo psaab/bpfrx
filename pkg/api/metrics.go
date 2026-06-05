@@ -218,6 +218,16 @@ type xpfCollector struct {
 	// operator-visible signal for the warmer in production builds.
 	neighborWarmDropsTotal        *prometheus.Desc
 	neighborWarmDisconnectedTotal *prometheus.Desc
+	// #1769: on-demand neighbor-resolver telemetry — the operator-visible
+	// signal for the MissingNeighbor stuck-state.
+	neighborResolverQueueDepth        *prometheus.Desc
+	neighborResolverEnqueueDropsTotal *prometheus.Desc
+	neighborResolverDisconnectedTotal *prometheus.Desc
+	neighborResolverGetAttemptsTotal  *prometheus.Desc
+	neighborResolverGetResolvedTotal  *prometheus.Desc
+	neighborResolverProbeOnStaleTotal *prometheus.Desc
+	neighborResolverGetFailuresTotal  *prometheus.Desc
+	neighborResolverEpochRejectsTotal *prometheus.Desc
 }
 
 func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
@@ -368,6 +378,14 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.fairnessEqualFlowWorkerSuppressedBPS
 	ch <- c.neighborWarmDropsTotal
 	ch <- c.neighborWarmDisconnectedTotal
+	ch <- c.neighborResolverQueueDepth
+	ch <- c.neighborResolverEnqueueDropsTotal
+	ch <- c.neighborResolverDisconnectedTotal
+	ch <- c.neighborResolverGetAttemptsTotal
+	ch <- c.neighborResolverGetResolvedTotal
+	ch <- c.neighborResolverProbeOnStaleTotal
+	ch <- c.neighborResolverGetFailuresTotal
+	ch <- c.neighborResolverEpochRejectsTotal
 }
 
 func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {

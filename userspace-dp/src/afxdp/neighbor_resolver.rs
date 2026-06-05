@@ -1,0 +1,953 @@
+//! #1769 immediate stuck-state fix: shared, per-key, rate-limited
+//! on-demand neighbor resolver.
+//!
+//! ## The bug this closes
+//!
+//! The `MissingNeighbor` negative-cache gate
+//! (`poll_descriptor/mod.rs`) fast-fails new SYNs to a dst whose
+//! `(egress_ifindex, next_hop)` is negatively cached, BEFORE the ARP
+//! probe and BEFORE the `pending_neigh` buffer. Once `dynamic_neighbors`
+//! loses a directly-connected target (a transient FAILED/DELNEIGH, or a
+//! dropped good RTM_NEWNEIGH — the monitor swallows `recv()<=0` and only
+//! full-dumps at startup) and the 3 s negative entry arms, that dst is
+//! never re-probed or re-buffered. The kernel's valid DELAY/STALE
+//! lladdr is unusable because the hot path refuses an on-demand kernel
+//! read (`forwarding/mod.rs::lookup_neighbor_entry`). Result: repeated
+//! 3 s connect blackouts until the kernel independently re-validates and
+//! emits a fresh RTM_NEWNEIGH.
+//!
+//! ## What this does (converged plan §9)
+//!
+//! On a negative-cache fast-fail the worker enqueues the dst into ONE
+//! shared resolver (the `neg_neigh_cache` is per-binding across 6 WAN
+//! workers, so a per-binding GET would be 6× rtnl — this routes every
+//! worker's misses through a single thread). The resolver:
+//!
+//! 1. Rate-limits per `(ifindex, hop)` key — coalesces a SYN storm down
+//!    to one in-flight GET/probe per key per window (no probe storm).
+//! 2. Issues a single-key `RTM_GETNEIGH` (`NLM_F_REQUEST` + `NDA_DST`,
+//!    NO dump flags) — a direct lookup, NOT the RTNL-mutex dump path.
+//! 3. Caches the lladdr into `dynamic_neighbors` ONLY if the GET returns
+//!    `REACHABLE`/`PERMANENT` AND the global neighbor epoch has not
+//!    advanced since the request was issued (epoch guard — defeats the
+//!    out-of-order race where a concurrent monitor FAILED/DELNEIGH
+//!    removal would otherwise be clobbered by our late stale insert).
+//! 4. On `STALE`/`DELAY`/`PROBE` with an lladdr (the LIVE #1769 wedge
+//!    state) it does NOT cache the unconfirmed MAC — it fires
+//!    `trigger_kernel_arp_probe` to force kernel revalidation and lets
+//!    the resulting confirmed multicast RTM_NEWNEIGH populate the map.
+//! 5. On `FAILED`/`INCOMPLETE` (or no reply) it caches nothing and
+//!    revokes any existing dynamic entry — immediate-revocation firewall
+//!    posture (AGY F3); recovery comes from the probe + the next
+//!    CONFIRMED event, never from forwarding-grace.
+//!
+//! The hot path only pays a non-blocking `try_send` on the negative
+//! fast-fail (not per-packet) plus a depth bump; all netlink I/O is off
+//! the worker thread on a persistent, reused socket.
+
+use super::*;
+
+/// One on-demand resolve request. `epoch` is the global
+/// `neighbor_generation` snapshot captured at enqueue; the resolver
+/// re-reads it after the GET and only caches a confirmed lladdr if it is
+/// unchanged (epoch guard).
+#[derive(Clone, Debug)]
+pub(crate) struct ResolveItem {
+    pub(in crate::afxdp) ifindex: i32,
+    pub(in crate::afxdp) hop: IpAddr,
+    pub(in crate::afxdp) iface_name: String,
+    pub(in crate::afxdp) epoch: u64,
+}
+
+/// Bounded resolver queue depth. The resolver coalesces per-key so the
+/// queue holds at most a handful of distinct unresolved next-hops in
+/// practice; a wide cap absorbs a multi-worker storm burst without
+/// dropping enqueues. On overflow the new item is dropped and
+/// `enqueue_drops` is incremented (the dst still fast-fails — no
+/// availability regression, just no on-demand nudge this round).
+pub(in crate::afxdp) const RESOLVER_QUEUE_DEPTH: usize = 4096;
+
+/// Per-key rate-limit window: skip re-resolving the same `(ifindex,
+/// hop)` within this window. Bounds rtnl GET traffic and probe storms
+/// for a dst under sustained SYN retransmit. 1 s is well under the 3 s
+/// negative-cache TTL so a genuinely recovering host is re-probed within
+/// one negative window, but a dead-host storm fires at most one GET/s.
+pub(in crate::afxdp) const RESOLVER_PER_KEY_RATE_LIMIT_NS: u64 = 1_000_000_000;
+
+/// `last_resolved_at` GC cadence + max entry age (mirrors the warmer's
+/// GC). Prunes keys not seen within `RESOLVER_GC_MAX_AGE_NS` every
+/// `RESOLVER_GC_INTERVAL_NS` so the per-key map cannot grow unbounded
+/// under a wide scan.
+pub(in crate::afxdp) const RESOLVER_GC_INTERVAL_NS: u64 = 60_000_000_000;
+pub(in crate::afxdp) const RESOLVER_GC_MAX_AGE_NS: u64 = 300_000_000_000;
+
+/// Short receive timeout for the single-key GET reply (ms). The kernel
+/// answers a unicast RTM_GETNEIGH essentially immediately; this only
+/// bounds the wait if the reply is lost so the resolver thread stays
+/// responsive to the stop flag and the next queued item.
+const RESOLVER_RECV_TIMEOUT_MS: i64 = 200;
+
+/// Shared resolver counters. All `AtomicU64` (monotonic counters) except
+/// `queue_depth` which is a live `AtomicI64` gauge (enqueue +1, dequeue
+/// -1). Surfaced to Prometheus via the coordinator status path.
+#[derive(Default)]
+pub(crate) struct ResolverCounters {
+    /// Live count of items queued but not yet processed (gauge).
+    pub(crate) queue_depth: AtomicI64,
+    /// Items dropped because the bounded queue was full (transient).
+    pub(crate) enqueue_drops: AtomicU64,
+    /// Items dropped because the resolver worker died (fatal — on-demand
+    /// resolution disabled until daemon restart).
+    pub(crate) disconnected: AtomicU64,
+    /// Single-key RTM_GETNEIGH requests actually issued (after the
+    /// per-key rate-limit coalesces a storm).
+    pub(crate) get_attempts: AtomicU64,
+    /// GET replies that confirmed REACHABLE/PERMANENT and were cached
+    /// into `dynamic_neighbors` (epoch guard passed).
+    pub(crate) get_resolved: AtomicU64,
+    /// GET replies in STALE/DELAY/PROBE that triggered a revalidation
+    /// probe instead of caching the unconfirmed MAC.
+    pub(crate) probe_on_stale: AtomicU64,
+    /// GET attempts that returned no usable reply (timeout, FAILED,
+    /// INCOMPLETE, parse error, or recv error).
+    pub(crate) get_failures: AtomicU64,
+    /// Confirmed inserts skipped because the global neighbor epoch
+    /// advanced between enqueue and the GET reply (epoch guard rejected
+    /// a potentially-raced stale insert).
+    pub(crate) epoch_rejects: AtomicU64,
+}
+
+/// Plain snapshot of [`ResolverCounters`] for the status path (all
+/// `u64`, queue depth clamped to >= 0). Carried out to `server/helpers`
+/// → `protocol/control` → the Go Prometheus collector.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct NeighborResolverCounters {
+    pub(crate) queue_depth: u64,
+    pub(crate) enqueue_drops: u64,
+    pub(crate) disconnected: u64,
+    pub(crate) get_attempts: u64,
+    pub(crate) get_resolved: u64,
+    pub(crate) probe_on_stale: u64,
+    pub(crate) get_failures: u64,
+    pub(crate) epoch_rejects: u64,
+}
+
+/// Handle held by the coordinator and cloned (as the producer + counter
+/// `Arc`s) into each worker. The worker only ever calls [`Self::enqueue`]
+/// on the negative fast-fail; all netlink I/O runs on the resolver thread.
+pub(crate) struct NeighborResolver {
+    /// Producer into the resolver thread's bounded queue.
+    tx: SyncSender<ResolveItem>,
+    pub(crate) counters: Arc<ResolverCounters>,
+    /// Global neighbor epoch, snapshotted into each enqueued item so the
+    /// resolver thread can detect a concurrent monitor event (epoch
+    /// guard).
+    neighbor_generation: Arc<AtomicU64>,
+}
+
+impl NeighborResolver {
+    pub(crate) fn new(
+        tx: SyncSender<ResolveItem>,
+        counters: Arc<ResolverCounters>,
+        neighbor_generation: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            tx,
+            counters,
+            neighbor_generation,
+        }
+    }
+
+    /// Non-blocking enqueue from the worker hot path for `(ifindex, hop)`
+    /// on egress interface `iface_name`. Snapshots the neighbor epoch so
+    /// the resolver can guard against a concurrent monitor removal.
+    /// Increments the depth gauge on success; on a full queue increments
+    /// `enqueue_drops` (the dst still fast-fails this round, so
+    /// availability is not affected — it just misses one on-demand
+    /// nudge); on a dead worker increments `disconnected`. Never blocks.
+    pub(crate) fn enqueue(&self, ifindex: i32, hop: IpAddr, iface_name: String) {
+        let item = ResolveItem {
+            ifindex,
+            hop,
+            iface_name,
+            epoch: self.neighbor_generation.load(Ordering::Acquire),
+        };
+        match self.tx.try_send(item) {
+            Ok(()) => {
+                self.counters.queue_depth.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.counters.enqueue_drops.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.counters.disconnected.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Open a persistent NETLINK_ROUTE socket for single-key GETNEIGH
+/// queries with a short receive timeout. Reused across every query (no
+/// per-query open/close — AGY F4). Returns -1 on failure.
+fn open_resolver_socket() -> c_int {
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            libc::NETLINK_ROUTE,
+        )
+    };
+    if fd < 0 {
+        return -1;
+    }
+    let mut sa: libc::sockaddr_nl = unsafe { core::mem::zeroed() };
+    sa.nl_family = libc::AF_NETLINK as u16;
+    // No group subscription: this socket only issues unicast GET
+    // requests and reads their direct replies. It does NOT join
+    // RTMGRP_NEIGH (that is the monitor's job).
+    let rc = unsafe {
+        libc::bind(
+            fd,
+            &sa as *const libc::sockaddr_nl as *const libc::sockaddr,
+            core::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        unsafe { libc::close(fd) };
+        return -1;
+    }
+    let tv = libc::timeval {
+        tv_sec: 0,
+        tv_usec: (RESOLVER_RECV_TIMEOUT_MS * 1000) as libc::suseconds_t,
+    };
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            &tv as *const libc::timeval as *const libc::c_void,
+            core::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
+    }
+    fd
+}
+
+/// Send a single-key `RTM_GETNEIGH` for `(ifindex, target)`. This is a
+/// direct unicast lookup (`NLM_F_REQUEST` only + `NDA_DST` + ifindex in
+/// the ndmsg) — explicitly NOT the dump path
+/// (`NLM_F_ROOT|NLM_F_MATCH`), so it does not take the RTNL dump mutex
+/// and cannot starve the Go coordinator's netlink ops (AGY F2).
+fn send_get_neigh(fd: c_int, ifindex: i32, target: IpAddr, seq: u32) -> io::Result<()> {
+    const RTM_GETNEIGH: u16 = 30;
+    const NLM_F_REQUEST: u16 = 0x1;
+    const NDA_DST: u16 = 1;
+    let (family, ip_bytes): (u8, Vec<u8>) = match target {
+        IpAddr::V4(v4) => (libc::AF_INET as u8, v4.octets().to_vec()),
+        IpAddr::V6(v6) => (libc::AF_INET6 as u8, v6.octets().to_vec()),
+    };
+    let ip_attr_len = 4 + ip_bytes.len();
+    let ip_attr_padded = (ip_attr_len + 3) & !3;
+    // ndmsg: family(1)+pad1(1)+pad2(2)+ifindex(4)+state(2)+flags(1)+type(1) = 12
+    let ndmsg_len = 12usize;
+    let total_len = 16 + ndmsg_len + ip_attr_padded;
+    let mut buf = vec![0u8; total_len];
+    buf[0..4].copy_from_slice(&(total_len as u32).to_ne_bytes());
+    buf[4..6].copy_from_slice(&RTM_GETNEIGH.to_ne_bytes());
+    buf[6..8].copy_from_slice(&NLM_F_REQUEST.to_ne_bytes());
+    buf[8..12].copy_from_slice(&seq.to_ne_bytes());
+    buf[12..16].copy_from_slice(&0u32.to_ne_bytes());
+    // ndmsg
+    buf[16] = family;
+    buf[20..24].copy_from_slice(&ifindex.to_ne_bytes());
+    // NDA_DST attribute
+    let off = 16 + ndmsg_len;
+    buf[off..off + 2].copy_from_slice(&(ip_attr_len as u16).to_ne_bytes());
+    buf[off + 2..off + 4].copy_from_slice(&NDA_DST.to_ne_bytes());
+    buf[off + 4..off + 4 + ip_bytes.len()].copy_from_slice(&ip_bytes);
+    let mut sa: libc::sockaddr_nl = unsafe { core::mem::zeroed() };
+    sa.nl_family = libc::AF_NETLINK as u16;
+    let rc = unsafe {
+        libc::sendto(
+            fd,
+            buf.as_ptr() as *const libc::c_void,
+            buf.len(),
+            0,
+            &sa as *const libc::sockaddr_nl as *const libc::sockaddr,
+            core::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Outcome of parsing the GET reply for a key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::afxdp) enum GetOutcome {
+    /// Kernel confirmed REACHABLE/PERMANENT with this lladdr — safe to
+    /// cache under the epoch guard.
+    Confirmed([u8; 6]),
+    /// Kernel has a candidate lladdr but it is STALE/DELAY/PROBE — do
+    /// NOT cache; fire a revalidation probe.
+    Unconfirmed,
+    /// FAILED/INCOMPLETE, no entry, or an unparseable/empty reply — do
+    /// not cache; revoke any existing dynamic entry.
+    Unusable,
+}
+
+/// Classify a single NUD state + optional lladdr into a [`GetOutcome`].
+/// Pure helper — unit-tested in isolation. REACHABLE/PERMANENT with a
+/// MAC is the only confirmed-cache outcome.
+pub(in crate::afxdp) fn classify_nud(state: u16, mac: Option<[u8; 6]>) -> GetOutcome {
+    const NUD_REACHABLE: u16 = 0x02;
+    const NUD_STALE: u16 = 0x04;
+    const NUD_DELAY: u16 = 0x08;
+    const NUD_PROBE: u16 = 0x10;
+    const NUD_PERMANENT: u16 = 0x80;
+    match mac {
+        Some(mac) if (state & (NUD_REACHABLE | NUD_PERMANENT)) != 0 => GetOutcome::Confirmed(mac),
+        Some(_) if (state & (NUD_STALE | NUD_DELAY | NUD_PROBE)) != 0 => GetOutcome::Unconfirmed,
+        _ => GetOutcome::Unusable,
+    }
+}
+
+/// Read and parse the kernel's reply to our single-key GETNEIGH. Walks
+/// netlink messages matching `seq`, finds the RTM_NEWNEIGH (28) for our
+/// key, and returns the classified outcome. NLMSG_ERROR / NLMSG_DONE /
+/// no-match / recv error all map to `Unusable`.
+fn read_get_reply(fd: c_int, want_ifindex: i32, want_ip: IpAddr, seq: u32) -> GetOutcome {
+    const NLMSG_ERROR: u16 = 2;
+    const NLMSG_DONE: u16 = 3;
+    let mut buf = vec![0u8; 8192];
+    // The kernel answers a unicast GET with a single message in
+    // practice; loop a bounded number of recvs to skip any interleaved
+    // unrelated frame and to tolerate one short read.
+    for _ in 0..4 {
+        let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+        if n <= 0 {
+            return GetOutcome::Unusable;
+        }
+        let mut offset = 0usize;
+        while offset + 16 <= n as usize {
+            let nlmsg_len = u32::from_ne_bytes([
+                buf[offset],
+                buf[offset + 1],
+                buf[offset + 2],
+                buf[offset + 3],
+            ]) as usize;
+            let nlmsg_type = u16::from_ne_bytes([buf[offset + 4], buf[offset + 5]]);
+            let nlmsg_seq = u32::from_ne_bytes([
+                buf[offset + 8],
+                buf[offset + 9],
+                buf[offset + 10],
+                buf[offset + 11],
+            ]);
+            if nlmsg_len < 16 || offset + nlmsg_len > n as usize {
+                break;
+            }
+            if nlmsg_seq == seq {
+                match nlmsg_type {
+                    NLMSG_ERROR => return GetOutcome::Unusable,
+                    NLMSG_DONE => return GetOutcome::Unusable,
+                    28 => {
+                        if let Some(outcome) = parse_get_reply_body(
+                            &buf[offset + 16..offset + nlmsg_len],
+                            want_ifindex,
+                            want_ip,
+                        ) {
+                            return outcome;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            offset += (nlmsg_len + 3) & !3;
+        }
+    }
+    GetOutcome::Unusable
+}
+
+/// Parse one RTM_NEWNEIGH body, confirm it matches the requested
+/// `(ifindex, ip)`, and classify its NUD state. Returns `None` if the
+/// body does not match our key (so the caller keeps scanning).
+pub(in crate::afxdp) fn parse_get_reply_body(
+    body: &[u8],
+    want_ifindex: i32,
+    want_ip: IpAddr,
+) -> Option<GetOutcome> {
+    if body.len() < 12 {
+        return None;
+    }
+    let family = body[0];
+    let ifindex = i32::from_ne_bytes([body[4], body[5], body[6], body[7]]);
+    let state = u16::from_ne_bytes([body[8], body[9]]);
+    let mut attr_off = 12usize;
+    let mut ip: Option<IpAddr> = None;
+    let mut mac: Option<[u8; 6]> = None;
+    while attr_off + 4 <= body.len() {
+        let attr_len = u16::from_ne_bytes([body[attr_off], body[attr_off + 1]]) as usize;
+        let attr_type = u16::from_ne_bytes([body[attr_off + 2], body[attr_off + 3]]);
+        if attr_len < 4 || attr_off + attr_len > body.len() {
+            break;
+        }
+        let payload = &body[attr_off + 4..attr_off + attr_len];
+        match attr_type {
+            1 => {
+                if family == libc::AF_INET as u8 && payload.len() >= 4 {
+                    ip = Some(IpAddr::V4(Ipv4Addr::new(
+                        payload[0], payload[1], payload[2], payload[3],
+                    )));
+                } else if family == libc::AF_INET6 as u8 && payload.len() >= 16 {
+                    let mut bytes = [0u8; 16];
+                    bytes.copy_from_slice(&payload[..16]);
+                    ip = Some(IpAddr::V6(Ipv6Addr::from(bytes)));
+                }
+            }
+            2 => {
+                if payload.len() >= 6 {
+                    mac = Some([
+                        payload[0], payload[1], payload[2], payload[3], payload[4], payload[5],
+                    ]);
+                }
+            }
+            _ => {}
+        }
+        attr_off += (attr_len + 3) & !3;
+    }
+    // Only accept a reply for the exact key we asked about.
+    if ifindex != want_ifindex || ip != Some(want_ip) {
+        return None;
+    }
+    Some(classify_nud(state, mac))
+}
+
+/// What the resolver should do with a GET outcome, given the epoch
+/// guard. Pure decision so the race + outcome→action mapping is
+/// deterministically testable without a socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::afxdp) enum ResolveAction {
+    /// REACHABLE/PERMANENT + epoch unchanged → cache this MAC.
+    Cache([u8; 6]),
+    /// Confirmed lladdr but the epoch advanced since enqueue → a monitor
+    /// event raced in; back off rather than clobber the authoritative
+    /// removal (AGY F1).
+    EpochReject,
+    /// STALE/DELAY/PROBE lladdr → probe to force kernel revalidation; do
+    /// not cache the unconfirmed MAC.
+    ProbeOnStale,
+    /// FAILED/INCOMPLETE/no-reply → revoke any stale entry + probe.
+    RevokeAndProbe,
+}
+
+/// Map a GET outcome + the before/after neighbor epoch to a
+/// [`ResolveAction`]. The epoch guard applies ONLY to the
+/// confirmed-cache path: a concurrent monitor event (which bumps the
+/// epoch) means a FAILED/DELNEIGH may have just removed the key, so a
+/// late confirmed insert could resurrect a stale MAC — reject it. Probe
+/// and revoke paths are epoch-independent (they never write a MAC).
+pub(in crate::afxdp) fn decide_action(
+    outcome: GetOutcome,
+    epoch_before: u64,
+    epoch_after: u64,
+) -> ResolveAction {
+    match outcome {
+        GetOutcome::Confirmed(mac) => {
+            if epoch_after == epoch_before {
+                ResolveAction::Cache(mac)
+            } else {
+                ResolveAction::EpochReject
+            }
+        }
+        GetOutcome::Unconfirmed => ResolveAction::ProbeOnStale,
+        GetOutcome::Unusable => ResolveAction::RevokeAndProbe,
+    }
+}
+
+/// Per-key rate-limit admission. Returns true if a GET/probe may fire
+/// for `key` at `now_ns` (and records the timestamp); false if the key
+/// was resolved within `RESOLVER_PER_KEY_RATE_LIMIT_NS` (coalesce — no
+/// probe storm). Pure helper over the caller's `last_resolved` map.
+pub(in crate::afxdp) fn rate_limit_admit(
+    last_resolved: &mut FastMap<(i32, IpAddr), u64>,
+    key: (i32, IpAddr),
+    now_ns: u64,
+) -> bool {
+    match last_resolved.get(&key) {
+        Some(&t) if now_ns.saturating_sub(t) < RESOLVER_PER_KEY_RATE_LIMIT_NS => false,
+        _ => {
+            last_resolved.insert(key, now_ns);
+            true
+        }
+    }
+}
+
+/// The long-lived resolver worker loop. Spawned once at coordinator
+/// bring-up. Holds one persistent netlink socket. For each dequeued
+/// item it rate-limits per key, issues a single-key GET, and either
+/// caches a confirmed lladdr (epoch-guarded), probes on an unconfirmed
+/// lladdr, or revokes on an unusable reply.
+pub(super) fn neighbor_resolver_loop(
+    rx: Receiver<ResolveItem>,
+    dynamic_neighbors: Arc<ShardedNeighborMap>,
+    neighbor_generation: Arc<AtomicU64>,
+    counters: Arc<ResolverCounters>,
+    stop: Arc<AtomicBool>,
+) {
+    let fd = open_resolver_socket();
+    if fd < 0 {
+        eprintln!("xpf-userspace-dp: neighbor resolver: netlink socket open failed; exiting");
+        return;
+    }
+    let mut last_resolved: FastMap<(i32, IpAddr), u64> = FastMap::default();
+    let mut seq: u32 = 1;
+    let mut last_gc_ns = monotonic_nanos();
+    while !stop.load(Ordering::Relaxed) {
+        // GC the per-key rate-limit map at the top of every iteration so
+        // the prune is not bypassed under continuous load.
+        let now = monotonic_nanos();
+        if now.saturating_sub(last_gc_ns) >= RESOLVER_GC_INTERVAL_NS {
+            last_resolved.retain(|_k, &mut t| now.saturating_sub(t) < RESOLVER_GC_MAX_AGE_NS);
+            last_gc_ns = now;
+        }
+        let item = match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            Ok(item) => item,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                eprintln!("xpf-userspace-dp: neighbor resolver: channel disconnected; exiting");
+                break;
+            }
+        };
+        // Dequeued — drop the live depth gauge regardless of whether we
+        // act on the item (rate-limit skip still consumed a queue slot).
+        counters.queue_depth.fetch_sub(1, Ordering::Relaxed);
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let key = (item.ifindex, item.hop);
+        // Per-key rate-limit: coalesce a SYN storm to one GET/probe per
+        // window per key (no probe storm).
+        let now = monotonic_nanos();
+        if !rate_limit_admit(&mut last_resolved, key, now) {
+            continue;
+        }
+        // Snapshot epoch BEFORE the GET so a concurrent monitor event
+        // that lands during the GET is detected by the post-GET re-read.
+        // Prefer the item's enqueue-time epoch (older of the two) so the
+        // guard is strictly conservative.
+        let epoch_before = item.epoch.min(neighbor_generation.load(Ordering::Acquire));
+        counters.get_attempts.fetch_add(1, Ordering::Relaxed);
+        seq = seq.wrapping_add(1).max(1);
+        let outcome = match send_get_neigh(fd, item.ifindex, item.hop, seq) {
+            Ok(()) => read_get_reply(fd, item.ifindex, item.hop, seq),
+            Err(_) => GetOutcome::Unusable,
+        };
+        // Re-read the epoch AFTER the GET; decide_action applies the
+        // guard only on the confirmed-cache path (AGY F1).
+        let epoch_after = neighbor_generation.load(Ordering::Acquire);
+        match decide_action(outcome, epoch_before, epoch_after) {
+            ResolveAction::Cache(mac) => {
+                dynamic_neighbors.insert((item.ifindex, item.hop), NeighborEntry { mac });
+                counters.get_resolved.fetch_add(1, Ordering::Relaxed);
+            }
+            ResolveAction::EpochReject => {
+                // A concurrent FAILED/DELNEIGH (which removes the key and
+                // bumps the epoch) raced our GET reply. Back off rather
+                // than clobber the monitor's authoritative removal with a
+                // potentially-stale insert.
+                counters.epoch_rejects.fetch_add(1, Ordering::Relaxed);
+            }
+            ResolveAction::ProbeOnStale => {
+                // The LIVE #1769 wedge state: kernel has a DELAY/STALE
+                // lladdr we must not forward to blindly. Force kernel
+                // revalidation; the confirmed multicast RTM_NEWNEIGH then
+                // populates the map via the monitor.
+                trigger_kernel_arp_probe(&item.iface_name, item.hop);
+                counters.probe_on_stale.fetch_add(1, Ordering::Relaxed);
+            }
+            ResolveAction::RevokeAndProbe => {
+                // FAILED/INCOMPLETE/no-entry/timeout: cache nothing.
+                // Immediate revocation of any stale dynamic entry keeps
+                // the firewall posture correct (AGY F3); recovery comes
+                // from a probe + the next confirmed event. Also fire a
+                // probe so a genuinely-down-then-up host gets nudged.
+                dynamic_neighbors.remove(&(item.ifindex, item.hop));
+                trigger_kernel_arp_probe(&item.iface_name, item.hop);
+                counters.get_failures.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    unsafe { libc::close(fd) };
+    eprintln!("xpf-userspace-dp: neighbor resolver: stopped");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    const NUD_INCOMPLETE: u16 = 0x01;
+    const NUD_REACHABLE: u16 = 0x02;
+    const NUD_STALE: u16 = 0x04;
+    const NUD_DELAY: u16 = 0x08;
+    const NUD_PROBE: u16 = 0x10;
+    const NUD_FAILED: u16 = 0x20;
+    const NUD_PERMANENT: u16 = 0x80;
+
+    fn mac() -> [u8; 6] {
+        [0xea, 0xde, 0x15, 0xf5, 0x66, 0x70]
+    }
+
+    #[test]
+    fn classify_reachable_and_permanent_are_confirmed() {
+        assert_eq!(
+            classify_nud(NUD_REACHABLE, Some(mac())),
+            GetOutcome::Confirmed(mac())
+        );
+        assert_eq!(
+            classify_nud(NUD_PERMANENT, Some(mac())),
+            GetOutcome::Confirmed(mac())
+        );
+    }
+
+    #[test]
+    fn classify_stale_delay_probe_are_unconfirmed_with_mac() {
+        // This is the LIVE #1769 bug state: kernel HAS the lladdr in
+        // DELAY/STALE but we must probe, not cache.
+        for st in [NUD_STALE, NUD_DELAY, NUD_PROBE] {
+            assert_eq!(
+                classify_nud(st, Some(mac())),
+                GetOutcome::Unconfirmed,
+                "state {st:#x} with a MAC must be Unconfirmed (probe, do not cache)",
+            );
+        }
+    }
+
+    #[test]
+    fn classify_failed_incomplete_or_no_mac_are_unusable() {
+        assert_eq!(classify_nud(NUD_FAILED, Some(mac())), GetOutcome::Unusable);
+        assert_eq!(
+            classify_nud(NUD_INCOMPLETE, Some(mac())),
+            GetOutcome::Unusable
+        );
+        // REACHABLE but no lladdr → cannot forward → Unusable.
+        assert_eq!(classify_nud(NUD_REACHABLE, None), GetOutcome::Unusable);
+        // STALE but no lladdr → Unusable.
+        assert_eq!(classify_nud(NUD_STALE, None), GetOutcome::Unusable);
+    }
+
+    /// Build a synthetic RTM_NEWNEIGH body (the bytes after the 16-byte
+    /// nlmsghdr) for `(ifindex, ip)` with `state` and an optional MAC, so
+    /// the parser + classifier can be tested without a real socket.
+    fn neigh_body(ifindex: i32, ip: IpAddr, state: u16, mac: Option<[u8; 6]>) -> Vec<u8> {
+        let (family, ip_bytes): (u8, Vec<u8>) = match ip {
+            IpAddr::V4(v4) => (libc::AF_INET as u8, v4.octets().to_vec()),
+            IpAddr::V6(v6) => (libc::AF_INET6 as u8, v6.octets().to_vec()),
+        };
+        let mut body = vec![0u8; 12];
+        body[0] = family;
+        body[4..8].copy_from_slice(&ifindex.to_ne_bytes());
+        body[8..10].copy_from_slice(&state.to_ne_bytes());
+        // NDA_DST
+        let ip_attr_len = 4 + ip_bytes.len();
+        body.extend_from_slice(&(ip_attr_len as u16).to_ne_bytes());
+        body.extend_from_slice(&1u16.to_ne_bytes());
+        body.extend_from_slice(&ip_bytes);
+        while body.len() % 4 != 0 {
+            body.push(0);
+        }
+        if let Some(m) = mac {
+            body.extend_from_slice(&10u16.to_ne_bytes());
+            body.extend_from_slice(&2u16.to_ne_bytes());
+            body.extend_from_slice(&m);
+            while body.len() % 4 != 0 {
+                body.push(0);
+            }
+        }
+        body
+    }
+
+    #[test]
+    fn parse_get_reply_matches_key_and_classifies() {
+        let ip = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200));
+        let body = neigh_body(14, ip, NUD_DELAY, Some(mac()));
+        // Correct key → Unconfirmed (DELAY+MAC).
+        assert_eq!(
+            parse_get_reply_body(&body, 14, ip),
+            Some(GetOutcome::Unconfirmed)
+        );
+        // Wrong ifindex → no match (keep scanning).
+        assert_eq!(parse_get_reply_body(&body, 99, ip), None);
+        // Wrong IP → no match.
+        let other = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 201));
+        assert_eq!(parse_get_reply_body(&body, 14, other), None);
+    }
+
+    #[test]
+    fn parse_get_reply_reachable_is_confirmed() {
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 61, 5));
+        let body = neigh_body(8, ip, NUD_REACHABLE, Some(mac()));
+        assert_eq!(
+            parse_get_reply_body(&body, 8, ip),
+            Some(GetOutcome::Confirmed(mac()))
+        );
+    }
+
+    #[test]
+    fn resolver_counters_default_zero() {
+        let c = ResolverCounters::default();
+        assert_eq!(c.queue_depth.load(Ordering::Relaxed), 0);
+        assert_eq!(c.enqueue_drops.load(Ordering::Relaxed), 0);
+        assert_eq!(c.get_attempts.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn enqueue_full_queue_counts_drop_not_block() {
+        // Depth-1 queue: the second enqueue (without a consumer) must
+        // count an enqueue_drop and NOT block.
+        let (tx, _rx) = mpsc::sync_channel::<ResolveItem>(1);
+        let counters = Arc::new(ResolverCounters::default());
+        let resolver = NeighborResolver::new(tx, counters.clone(), Arc::new(AtomicU64::new(0)));
+        let hop = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200));
+        resolver.enqueue(14, hop, "ge-0-0-2.80".to_string());
+        resolver.enqueue(14, hop, "ge-0-0-2.80".to_string());
+        assert_eq!(counters.queue_depth.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.enqueue_drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn enqueue_snapshots_current_epoch() {
+        // The enqueued item must carry the global neighbor epoch at
+        // enqueue time so the resolver's epoch guard can detect a later
+        // monitor event.
+        let (tx, rx) = mpsc::sync_channel::<ResolveItem>(1);
+        let counters = Arc::new(ResolverCounters::default());
+        let epoch_gen = Arc::new(AtomicU64::new(7));
+        let resolver = NeighborResolver::new(tx, counters, epoch_gen.clone());
+        epoch_gen.store(42, Ordering::Release);
+        resolver.enqueue(
+            14,
+            IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            "ge-0-0-2.80".to_string(),
+        );
+        let item = rx.try_recv().expect("item enqueued");
+        assert_eq!(item.epoch, 42, "enqueue must snapshot the current epoch");
+    }
+
+    #[test]
+    fn enqueue_disconnected_counts_disconnected() {
+        let (tx, rx) = mpsc::sync_channel::<ResolveItem>(1);
+        let counters = Arc::new(ResolverCounters::default());
+        let resolver = NeighborResolver::new(tx, counters.clone(), Arc::new(AtomicU64::new(0)));
+        drop(rx);
+        resolver.enqueue(
+            14,
+            IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            "ge-0-0-2.80".to_string(),
+        );
+        assert_eq!(counters.disconnected.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.queue_depth.load(Ordering::Relaxed), 0);
+    }
+
+    // ---- decide_action: outcome → action mapping + epoch guard ----
+
+    #[test]
+    fn decide_confirmed_same_epoch_caches() {
+        assert_eq!(
+            decide_action(GetOutcome::Confirmed(mac()), 5, 5),
+            ResolveAction::Cache(mac()),
+        );
+    }
+
+    /// AGY F1 out-of-order race: a confirmed GET reply that arrives after
+    /// a concurrent monitor event (epoch advanced) must NOT be cached —
+    /// it could resurrect a MAC the monitor just removed via DELNEIGH.
+    #[test]
+    fn decide_confirmed_advanced_epoch_rejects() {
+        assert_eq!(
+            decide_action(GetOutcome::Confirmed(mac()), 5, 6),
+            ResolveAction::EpochReject,
+            "a confirmed insert racing a newer monitor event must be rejected",
+        );
+    }
+
+    #[test]
+    fn decide_unconfirmed_probes_regardless_of_epoch() {
+        // DELAY/STALE → probe, epoch-independent (never writes a MAC).
+        assert_eq!(
+            decide_action(GetOutcome::Unconfirmed, 5, 5),
+            ResolveAction::ProbeOnStale,
+        );
+        assert_eq!(
+            decide_action(GetOutcome::Unconfirmed, 5, 9),
+            ResolveAction::ProbeOnStale,
+        );
+    }
+
+    #[test]
+    fn decide_unusable_revokes_regardless_of_epoch() {
+        assert_eq!(
+            decide_action(GetOutcome::Unusable, 5, 5),
+            ResolveAction::RevokeAndProbe,
+        );
+    }
+
+    /// The epoch-guard race end-to-end on the real ShardedNeighborMap: a
+    /// newer good entry is present; a late confirmed GET reply (issued
+    /// under an older epoch) must NOT overwrite it once the epoch has
+    /// advanced. Applying the rejected action leaves the newer entry
+    /// intact.
+    #[test]
+    fn epoch_guard_does_not_overwrite_newer_good_entry() {
+        let map = ShardedNeighborMap::new();
+        let key = (14, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)));
+        let newer = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        // Monitor installed a NEWER good entry (and bumped the epoch).
+        map.insert(key, NeighborEntry { mac: newer });
+        // A late confirmed GET reply derived from a STALE-era read tries
+        // to write a DIFFERENT (older) MAC, but it was issued under an
+        // older epoch (epoch_before=5) and the epoch has since advanced
+        // (epoch_after=6).
+        let action = decide_action(GetOutcome::Confirmed(mac()), 5, 6);
+        assert_eq!(action, ResolveAction::EpochReject);
+        // Apply only the non-rejected actions; EpochReject is a no-op on
+        // the map. The newer entry must survive.
+        if let ResolveAction::Cache(m) = action {
+            map.insert(key, NeighborEntry { mac: m });
+        }
+        assert_eq!(
+            map.get(&key).map(|e| e.mac),
+            Some(newer),
+            "epoch-rejected stale insert must not overwrite the newer good MAC",
+        );
+    }
+
+    // ---- rate_limit_admit: no probe storm ----
+
+    #[test]
+    fn rate_limit_admits_first_then_coalesces_within_window() {
+        let mut last: FastMap<(i32, IpAddr), u64> = FastMap::default();
+        let key = (14, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)));
+        // First miss at t=0 → admit (one GET fires).
+        assert!(rate_limit_admit(&mut last, key, 0));
+        // 50 storm misses within the 1s window → all coalesced (no GET).
+        for t in (1..=50).map(|i| i * 10_000_000u64) {
+            assert!(
+                !rate_limit_admit(&mut last, key, t),
+                "within-window repeat must be coalesced (no probe storm)",
+            );
+        }
+        // After the window lapses → admit again (one fresh GET).
+        assert!(rate_limit_admit(
+            &mut last,
+            key,
+            RESOLVER_PER_KEY_RATE_LIMIT_NS + 1
+        ));
+    }
+
+    #[test]
+    fn rate_limit_is_per_key() {
+        let mut last: FastMap<(i32, IpAddr), u64> = FastMap::default();
+        let k1 = (14, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)));
+        let k2 = (14, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 201)));
+        assert!(rate_limit_admit(&mut last, k1, 0));
+        // A different key in the same instant is independently admitted.
+        assert!(rate_limit_admit(&mut last, k2, 0));
+        // ...but the first key is still coalesced.
+        assert!(!rate_limit_admit(&mut last, k1, 1));
+    }
+
+    // ---- differential repro: the #1769 stuck state is now resolvable ----
+
+    /// Reconstructs the stuck state and proves the fix resolves it.
+    ///
+    /// 1. The dst's `(egress_ifindex, next_hop)` is negatively cached
+    ///    (the `retry_pending_neigh` timeout armed a 3 s entry) AND its
+    ///    dynamic entry is gone (transient FAILED/DELNEIGH or a dropped
+    ///    good RTM_NEWNEIGH). With the OLD code the negative gate would
+    ///    fast-fail every new SYN with nothing nudging resolution → 3 s
+    ///    blackout cycles.
+    /// 2. The gate still fast-fails (dead-host storm defense preserved),
+    ///    but now routes the dst through the resolver.
+    /// 3. The resolver's single-key GET returns the kernel's CONFIRMED
+    ///    lladdr (REACHABLE); under an unchanged epoch the action caches
+    ///    it into `dynamic_neighbors`.
+    /// 4. The next SYN's resolved-wins check now finds the dynamic entry,
+    ///    so `neg_neigh_gate` evicts the negative entry and proceeds —
+    ///    the flow forwards instead of blackholing.
+    #[test]
+    fn stuck_state_is_resolved_via_get_instead_of_blackholing() {
+        use crate::afxdp::neg_neigh::{NegNeighCache, neg_neigh_gate, neg_neigh_record};
+
+        let egress_ifindex = 14i32;
+        let next_hop = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200));
+        let key = (egress_ifindex, next_hop);
+
+        // Per-binding negative cache + the shared dynamic map.
+        let mut neg = NegNeighCache::default();
+        let dynamic = ShardedNeighborMap::new();
+
+        // (1) Arm the stuck state: negative entry recorded at t=1s, no
+        //     dynamic entry for the dst.
+        neg_neigh_record(&mut neg, key, 1_000_000_000);
+        assert!(
+            dynamic.get(&key).is_none(),
+            "precondition: dst has no dynamic entry"
+        );
+
+        // (2) A new SYN at t=1.5s: the gate fast-fails (still within the
+        //     3 s TTL, still unresolved). is_resolved checks the dynamic
+        //     map (the production closure also checks static neighbors).
+        let resolved_check = |dynamic: &ShardedNeighborMap| dynamic.get(&key).is_some();
+        assert!(
+            neg_neigh_gate(&mut neg, &key, 1_500_000_000, || resolved_check(&dynamic)),
+            "stuck dst must still fast-fail (dead-host storm defense preserved)",
+        );
+
+        // (3) The resolver's single-key GET returns the kernel's
+        //     CONFIRMED lladdr (the kernel HAD it the whole time — the
+        //     dataplane just lacked it). Epoch unchanged → cache it. This
+        //     is exactly what neighbor_resolver_loop does on a
+        //     GetOutcome::Confirmed.
+        let kernel_mac = mac();
+        let action = decide_action(GetOutcome::Confirmed(kernel_mac), 0, 0);
+        assert_eq!(action, ResolveAction::Cache(kernel_mac));
+        if let ResolveAction::Cache(m) = action {
+            dynamic.insert(key, NeighborEntry { mac: m });
+        }
+
+        // (4) The NEXT SYN at t=1.6s: resolved-wins now finds the dynamic
+        //     entry, so the gate evicts the negative entry and PROCEEDS
+        //     (returns false) — the flow forwards instead of blackholing
+        //     for the rest of the 3 s window.
+        assert!(
+            !neg_neigh_gate(&mut neg, &key, 1_600_000_000, || resolved_check(&dynamic)),
+            "after the resolver cached the kernel lladdr, a new flow must \
+             resolve and proceed (NOT blackhole for 3s)",
+        );
+        // The negative entry was evicted by resolved-wins.
+        assert!(
+            !neg_neigh_gate(&mut neg, &key, 1_700_000_000, || resolved_check(&dynamic)),
+            "the negative entry must be gone after resolution",
+        );
+    }
+
+    /// The DELAY/STALE variant of the wedge: the kernel has the lladdr
+    /// but only in DELAY (the EXACT live #1769 signature). The resolver
+    /// must NOT cache the unconfirmed MAC; it probes to force kernel
+    /// revalidation. The dst stays unresolved until the confirmed
+    /// RTM_NEWNEIGH arrives — never forwarding to an unconfirmed MAC.
+    #[test]
+    fn delay_state_probes_does_not_cache_unconfirmed_mac() {
+        let dynamic = ShardedNeighborMap::new();
+        let key = (14, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)));
+        // GET reply says DELAY+MAC → Unconfirmed → ProbeOnStale.
+        let action = decide_action(GetOutcome::Unconfirmed, 0, 0);
+        assert_eq!(action, ResolveAction::ProbeOnStale);
+        // The resolver fires a probe but writes nothing to the map.
+        assert!(
+            dynamic.get(&key).is_none(),
+            "DELAY/STALE lladdr must NOT be cached (forward only on confirmed)",
+        );
+    }
+}

@@ -43,6 +43,26 @@ impl super::Coordinator {
         )
     }
 
+    /// #1769: on-demand neighbor-resolver telemetry. Returns the live
+    /// queue-depth gauge (clamped to >= 0) plus the monotonic GET/probe/
+    /// epoch counters. Exposes the previously-invisible stuck-state
+    /// surface: pending depth, GET attempts/resolutions/failures,
+    /// probe-on-stale rate, epoch-guard rejects, and enqueue
+    /// drops/disconnects.
+    pub fn neighbor_resolver_counters(&self) -> NeighborResolverCounters {
+        let c = &self.neighbors.resolver_counters;
+        NeighborResolverCounters {
+            queue_depth: c.queue_depth.load(Ordering::Relaxed).max(0) as u64,
+            enqueue_drops: c.enqueue_drops.load(Ordering::Relaxed),
+            disconnected: c.disconnected.load(Ordering::Relaxed),
+            get_attempts: c.get_attempts.load(Ordering::Relaxed),
+            get_resolved: c.get_resolved.load(Ordering::Relaxed),
+            probe_on_stale: c.probe_on_stale.load(Ordering::Relaxed),
+            get_failures: c.get_failures.load(Ordering::Relaxed),
+            epoch_rejects: c.epoch_rejects.load(Ordering::Relaxed),
+        }
+    }
+
     pub fn recent_exceptions(&self) -> Vec<ExceptionStatus> {
         self.recent_exceptions
             .lock()

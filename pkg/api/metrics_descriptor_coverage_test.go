@@ -10,8 +10,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 
-	"github.com/psaab/xpf/pkg/conntrack"
 	"github.com/psaab/xpf/pkg/configstore"
+	"github.com/psaab/xpf/pkg/conntrack"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/dhcp"
@@ -160,16 +160,16 @@ func populatedCoverageStatus() dpuserspace.ProcessStatus {
 		WaterfillMinEpochsPerWorker: 2, // not MaxUint64 → gauge emits
 		Queues: []dpuserspace.CoSQueueStatus{
 			{
-				QueueID:                                    4,
-				OwnerWorkerID:                              &ownerID,
-				Exact:                                      true,
-				DrainLatencyHist:                           drainHist,
-				DrainInvocations:                           9,
-				RedirectAcquireHist:                        redirectHist,
-				OwnerPPS:                                   100,
-				PeerPPS:                                    50,
-				DrainGuaranteeSentBytes:                    1000,
-				DrainSurplusSentBytes:                      200,
+				QueueID:                 4,
+				OwnerWorkerID:           &ownerID,
+				Exact:                   true,
+				DrainLatencyHist:        drainHist,
+				DrainInvocations:        9,
+				RedirectAcquireHist:     redirectHist,
+				OwnerPPS:                100,
+				PeerPPS:                 50,
+				DrainGuaranteeSentBytes: 1000,
+				DrainSurplusSentBytes:   200,
 				DrainNonExactSentBytesWhileExactBacklogged: 10,
 				WaterfillPhase1Admissions:                  3,
 				WaterfillPhase2Admissions:                  2,
@@ -272,10 +272,18 @@ func populatedCoverageStatus() dpuserspace.ProcessStatus {
 			PolicyDenyDrops: 1, ScreenDropDrops: 4, FilterLogDrops: 9,
 			UnknownFrameDrops: 3,
 		},
-		EventStreamSent:               101,
-		EventStreamDropped:            7,
-		NeighborWarmDropsTotal:        2,
-		NeighborWarmDisconnectedTotal: 0,
+		EventStreamSent:                   101,
+		EventStreamDropped:                7,
+		NeighborWarmDropsTotal:            2,
+		NeighborWarmDisconnectedTotal:     0,
+		NeighborResolverQueueDepth:        3,
+		NeighborResolverEnqueueDropsTotal: 1,
+		NeighborResolverGetAttemptsTotal:  5,
+		NeighborResolverGetResolvedTotal:  4,
+		NeighborResolverProbeOnStaleTotal: 2,
+		NeighborResolverGetFailuresTotal:  1,
+		NeighborResolverEpochRejectsTotal: 0,
+		NeighborResolverDisconnectedTotal: 0,
 	}
 }
 
@@ -362,14 +370,14 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 	// a single desc) also fails this canary.
 	names := gatheredNames(mfs)
 	want := []string{
-		"xpf_packets_total",         // collectGlobalCounters
-		"xpf_zone_packets_total",    // collectZoneCounters
-		"xpf_policy_hits_total",     // collectPolicyCounters
-		"xpf_filter_hits_total",     // collectFilterCounters
-		"xpf_nat_pool_total_ports",  // collectNATPoolMetrics
-		"xpf_sessions_active",       // collectSessionGauges
-		"xpf_daemon_uptime_seconds", // collectSystemMetrics
-		"xpf_userspace_worker_dead", // emitWorkerRuntime
+		"xpf_packets_total",                               // collectGlobalCounters
+		"xpf_zone_packets_total",                          // collectZoneCounters
+		"xpf_policy_hits_total",                           // collectPolicyCounters
+		"xpf_filter_hits_total",                           // collectFilterCounters
+		"xpf_nat_pool_total_ports",                        // collectNATPoolMetrics
+		"xpf_sessions_active",                             // collectSessionGauges
+		"xpf_daemon_uptime_seconds",                       // collectSystemMetrics
+		"xpf_userspace_worker_dead",                       // emitWorkerRuntime
 		"xpf_userspace_worker_cold_path_samples_v3_total", // cold-path v3
 		"xpf_cos_drain_invocations_total",                 // CoS owner profile
 		"xpf_userspace_three_color_policer_drops_total",   // three-color policer

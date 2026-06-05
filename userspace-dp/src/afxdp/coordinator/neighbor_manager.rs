@@ -63,6 +63,17 @@ pub(crate) struct NeighborManager {
     pub(crate) warm_disconnected: Arc<AtomicU64>,
     /// Once-only operator-visible log gate for the disconnect transition.
     pub(crate) warned_disconnect: Arc<AtomicBool>,
+    // #1769: shared on-demand neighbor resolver.
+    /// Resolver handle (producer + counters) cloned into each worker so
+    /// the negative-cache fast-fail can enqueue an on-demand GET/probe.
+    /// `None` until the resolver thread is spawned at coordinator
+    /// bring-up.
+    pub(crate) resolver: Option<Arc<super::super::neighbor_resolver::NeighborResolver>>,
+    /// Shared resolver counters (queue depth gauge + GET/probe/epoch
+    /// telemetry), surfaced to Prometheus.
+    pub(crate) resolver_counters: Arc<super::super::neighbor_resolver::ResolverCounters>,
+    /// Stop flag for the resolver worker thread.
+    pub(crate) resolver_stop: Option<Arc<AtomicBool>>,
 }
 
 impl NeighborManager {
@@ -80,6 +91,11 @@ impl NeighborManager {
             warm_drops: Arc::new(AtomicU64::new(0)),
             warm_disconnected: Arc::new(AtomicU64::new(0)),
             warned_disconnect: Arc::new(AtomicBool::new(false)),
+            resolver: None,
+            resolver_counters: Arc::new(
+                super::super::neighbor_resolver::ResolverCounters::default(),
+            ),
+            resolver_stop: None,
         }
     }
 }
