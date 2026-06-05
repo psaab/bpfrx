@@ -154,20 +154,28 @@ if n < 0 {
         // Increment counter
         // Check throttle (e.g., at most once per 5s)
         // If allowed: trigger re-dump for both families
-        // Also enqueue targeted GETs for hot keys (from recent pending_neigh)
+        // Also signal hot-key targeted GETs (see below)
         continue;
     }
-    // ... existing error handling
+    if matches!(
+        err.raw_os_error(),
+        Some(libc::EAGAIN) | Some(libc::EWOULDBLOCK)
+    ) {
+        // SO_RCVTIMEO steady-state timeout; never fall through to parsing.
+        continue;
+    }
+    // Other recv() errors: log/debug-count as needed, then continue.
+    continue;
 }
 if n == 0 {
-    // EOF on netlink shouldn't happen, but treat as error
+    // EOF on netlink shouldn't happen, but treat as error and continue.
     continue;
 }
 ```
 
 **Throttle:** Use `AtomicU64` timestamp for last re-dump, check `now - last > 5_000_000_000` (5s) before dumping. This prevents RTNL contention (AGY F2).
 
-**Hot keys:** The resolver already tracks recent keys via `last_resolved` map. On ENOBUFS, iterate hot keys and enqueue targeted GETs.
+**Hot keys:** `last_resolved` is currently resolver-thread local, so the monitor cannot directly iterate it. #1771 therefore needs an explicit monitor→resolver signal path (for example a small shared hot-key set or dedicated control channel) if ENOBUFS recovery should trigger targeted single-key GETs for recently active keys.
 
 ### 2.6 Prometheus Counters
 
@@ -218,9 +226,10 @@ if n == 0 {
 
 ### Phase 4: ENOBUFS Handling
 - [ ] Add ENOBUFS detection in `neigh_monitor_thread`
+- [ ] Preserve the existing `recv() <= 0 { continue; }` safety on timeout/error paths (`EAGAIN`/`EWOULDBLOCK` must never fall through to parsing)
 - [ ] Add throttle mechanism (5s window)
 - [ ] Implement throttled family re-dump
-- [ ] Add targeted single-key GET for hot keys on ENOBUFS
+- [ ] Add monitor→resolver signaling for hot-key targeted GETs on ENOBUFS (or explicitly defer targeted GETs if re-dump alone is sufficient)
 
 ### Phase 5: Prometheus Metrics
 - [ ] Extend Rust counters

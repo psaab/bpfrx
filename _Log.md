@@ -1,5 +1,17 @@
 # Action Log
 
+## 2026-06-05 — #1771 research plan review follow-up
+- **Timestamp**: 2026-06-05 UTC
+- **Action**: Addressed Copilot review findings in the #1771 per-key
+  neighbor-resolver research plan. Clarified the ENOBUFS recv-loop
+  pseudocode so `EAGAIN`/`EWOULDBLOCK` and other `recv() < 0` paths
+  always `continue` instead of falling through to message parsing, and
+  corrected the hot-key ENOBUFS recovery section to require an explicit
+  monitor→resolver signal/shared hot-key path before targeted single-key
+  GETs can be triggered. Updated Phase 4 checklist items to capture both
+  constraints.
+- **File(s)**: `docs/research/1771-per-key-resolver/plan.md`, `_Log.md`
+
 ## 2026-05-29 — #1641 NAT64 reverse-path Ethernet padding fix
 - **Timestamp**: 2026-05-29 UTC
 - **Action**: Fixed `translate_v4_to_v6` in the userspace-dp NAT64
