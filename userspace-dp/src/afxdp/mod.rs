@@ -599,6 +599,10 @@ use session_delta::{flush_session_deltas, purge_queued_flows_for_closed_deltas};
 mod neg_neigh;
 use neg_neigh::{neg_neigh_gate, neg_neigh_record};
 
+// #1771: per-key neighbor resolver state machine.
+mod neighbor_resolver;
+use neighbor_resolver::{NeighborResolver, ResolveAction};
+
 // Issue 67.2: neighbor-dispatch helpers extracted into
 // afxdp/neighbor_dispatch.rs.
 mod neighbor_dispatch;
