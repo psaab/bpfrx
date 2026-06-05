@@ -36,10 +36,13 @@
 //!    state) it does NOT cache the unconfirmed MAC — it fires
 //!    `trigger_kernel_arp_probe` to force kernel revalidation and lets
 //!    the resulting confirmed multicast RTM_NEWNEIGH populate the map.
-//! 5. On `FAILED`/`INCOMPLETE` (or no reply) it caches nothing and
+//! 5. On an AUTHORITATIVE `FAILED`/`INCOMPLETE` it caches nothing and
 //!    revokes any existing dynamic entry — immediate-revocation firewall
 //!    posture (AGY F3); recovery comes from the probe + the next
-//!    CONFIRMED event, never from forwarding-grace.
+//!    CONFIRMED event, never from forwarding-grace. On a NON-authoritative
+//!    no-reply (GET timeout / error / no match) it probes ONLY and does
+//!    NOT revoke — a transient GET loss must not evict a still-good entry
+//!    the monitor may have just (re)populated.
 //!
 //! The hot path only pays a non-blocking `try_send` on the negative
 //! fast-fail (not per-packet) plus a depth bump; all netlink I/O is off
@@ -306,31 +309,48 @@ pub(in crate::afxdp) enum GetOutcome {
     /// Kernel has a candidate lladdr but it is STALE/DELAY/PROBE — do
     /// NOT cache; fire a revalidation probe.
     Unconfirmed,
-    /// FAILED/INCOMPLETE, no entry, or an unparseable/empty reply — do
-    /// not cache; revoke any existing dynamic entry.
-    Unusable,
+    /// The kernel AUTHORITATIVELY reports the neighbor unusable
+    /// (NUD_FAILED / NUD_INCOMPLETE) — revoke any existing dynamic entry
+    /// (immediate-revocation firewall posture) and probe.
+    Failed,
+    /// No authoritative answer: GET timed out, recv error, NLMSG_ERROR,
+    /// NLMSG_DONE, or no matching reply. Do NOT revoke — a transient GET
+    /// loss must not evict a still-good entry the monitor may have just
+    /// (re)populated (Copilot). Probe only.
+    NoReply,
 }
 
 /// Classify a single NUD state + optional lladdr into a [`GetOutcome`].
 /// Pure helper — unit-tested in isolation. REACHABLE/PERMANENT with a
-/// MAC is the only confirmed-cache outcome.
+/// MAC is the only confirmed-cache outcome; FAILED/INCOMPLETE is the only
+/// authoritative-revoke outcome; everything else is NoReply (probe, no
+/// revoke).
 pub(in crate::afxdp) fn classify_nud(state: u16, mac: Option<[u8; 6]>) -> GetOutcome {
+    const NUD_INCOMPLETE: u16 = 0x01;
     const NUD_REACHABLE: u16 = 0x02;
     const NUD_STALE: u16 = 0x04;
     const NUD_DELAY: u16 = 0x08;
     const NUD_PROBE: u16 = 0x10;
+    const NUD_FAILED: u16 = 0x20;
     const NUD_PERMANENT: u16 = 0x80;
     match mac {
         Some(mac) if (state & (NUD_REACHABLE | NUD_PERMANENT)) != 0 => GetOutcome::Confirmed(mac),
         Some(_) if (state & (NUD_STALE | NUD_DELAY | NUD_PROBE)) != 0 => GetOutcome::Unconfirmed,
-        _ => GetOutcome::Unusable,
+        // Kernel authoritatively says the neighbor is dead → revoke.
+        _ if (state & (NUD_FAILED | NUD_INCOMPLETE)) != 0 => GetOutcome::Failed,
+        // A reply with no usable lladdr and not an explicit FAILED state
+        // (e.g. REACHABLE-without-lladdr, which should not happen) — treat
+        // as no authoritative answer rather than revoking a good entry.
+        _ => GetOutcome::NoReply,
     }
 }
 
 /// Read and parse the kernel's reply to our single-key GETNEIGH. Walks
 /// netlink messages matching `seq`, finds the RTM_NEWNEIGH (28) for our
 /// key, and returns the classified outcome. NLMSG_ERROR / NLMSG_DONE /
-/// no-match / recv error all map to `Unusable`.
+/// no-match / recv error all map to `NoReply` (probe, do NOT revoke — a
+/// transient GET loss must not evict a still-good entry); only an
+/// explicit kernel FAILED/INCOMPLETE in the parsed body returns `Failed`.
 fn read_get_reply(fd: c_int, want_ifindex: i32, want_ip: IpAddr, seq: u32) -> GetOutcome {
     const NLMSG_ERROR: u16 = 2;
     const NLMSG_DONE: u16 = 3;
@@ -341,7 +361,7 @@ fn read_get_reply(fd: c_int, want_ifindex: i32, want_ip: IpAddr, seq: u32) -> Ge
     for _ in 0..4 {
         let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
         if n <= 0 {
-            return GetOutcome::Unusable;
+            return GetOutcome::NoReply;
         }
         let mut offset = 0usize;
         while offset + 16 <= n as usize {
@@ -363,8 +383,10 @@ fn read_get_reply(fd: c_int, want_ifindex: i32, want_ip: IpAddr, seq: u32) -> Ge
             }
             if nlmsg_seq == seq {
                 match nlmsg_type {
-                    NLMSG_ERROR => return GetOutcome::Unusable,
-                    NLMSG_DONE => return GetOutcome::Unusable,
+                    // ENOENT et al.: ambiguous, do not revoke a possibly
+                    // good entry — probe only.
+                    NLMSG_ERROR => return GetOutcome::NoReply,
+                    NLMSG_DONE => return GetOutcome::NoReply,
                     28 => {
                         if let Some(outcome) = parse_get_reply_body(
                             &buf[offset + 16..offset + nlmsg_len],
@@ -380,7 +402,9 @@ fn read_get_reply(fd: c_int, want_ifindex: i32, want_ip: IpAddr, seq: u32) -> Ge
             offset += (nlmsg_len + 3) & !3;
         }
     }
-    GetOutcome::Unusable
+    // No matching reply within the bounded recv attempts → no authoritative
+    // answer; probe, do not revoke.
+    GetOutcome::NoReply
 }
 
 /// Parse one RTM_NEWNEIGH body, confirm it matches the requested
@@ -451,8 +475,13 @@ pub(in crate::afxdp) enum ResolveAction {
     /// STALE/DELAY/PROBE lladdr → probe to force kernel revalidation; do
     /// not cache the unconfirmed MAC.
     ProbeOnStale,
-    /// FAILED/INCOMPLETE/no-reply → revoke any stale entry + probe.
+    /// Kernel AUTHORITATIVELY reports FAILED/INCOMPLETE → revoke any stale
+    /// entry + probe (immediate-revocation firewall posture).
     RevokeAndProbe,
+    /// No authoritative answer (GET timeout / error / no match) → probe
+    /// only. Must NOT revoke: a transient GET loss could otherwise evict a
+    /// still-good entry the monitor just (re)populated (Copilot).
+    ProbeOnly,
 }
 
 /// Map a GET outcome + the before/after neighbor epoch to a
@@ -475,7 +504,8 @@ pub(in crate::afxdp) fn decide_action(
             }
         }
         GetOutcome::Unconfirmed => ResolveAction::ProbeOnStale,
-        GetOutcome::Unusable => ResolveAction::RevokeAndProbe,
+        GetOutcome::Failed => ResolveAction::RevokeAndProbe,
+        GetOutcome::NoReply => ResolveAction::ProbeOnly,
     }
 }
 
@@ -559,7 +589,9 @@ pub(super) fn neighbor_resolver_loop(
         seq = seq.wrapping_add(1).max(1);
         let outcome = match send_get_neigh(fd, item.ifindex, item.hop, seq) {
             Ok(()) => read_get_reply(fd, item.ifindex, item.hop, seq),
-            Err(_) => GetOutcome::Unusable,
+            // Send failure is a transient local error, not an authoritative
+            // kernel verdict — probe, do not revoke.
+            Err(_) => GetOutcome::NoReply,
         };
         // Re-check stop AFTER the (up to 200 ms) GET, before any mutation
         // of the shared neighbor map. This is a fast early-out: the
@@ -613,12 +645,20 @@ pub(super) fn neighbor_resolver_loop(
                 counters.probe_on_stale.fetch_add(1, Ordering::Relaxed);
             }
             ResolveAction::RevokeAndProbe => {
-                // FAILED/INCOMPLETE/no-entry/timeout: cache nothing.
-                // Immediate revocation of any stale dynamic entry keeps
-                // the firewall posture correct (AGY F3); recovery comes
-                // from a probe + the next confirmed event. Also fire a
-                // probe so a genuinely-down-then-up host gets nudged.
+                // Kernel AUTHORITATIVELY reports FAILED/INCOMPLETE: cache
+                // nothing and revoke any stale dynamic entry — immediate-
+                // revocation firewall posture (AGY F3); recovery comes from
+                // a probe + the next confirmed event. Also fire a probe so
+                // a genuinely-down-then-up host gets nudged.
                 dynamic_neighbors.remove(&(item.ifindex, item.hop));
+                trigger_kernel_arp_probe(&item.iface_name, item.hop);
+                counters.get_failures.fetch_add(1, Ordering::Relaxed);
+            }
+            ResolveAction::ProbeOnly => {
+                // No authoritative answer (GET timeout / error / no match).
+                // Do NOT revoke — a transient GET loss must not evict a
+                // still-good entry the monitor may have just (re)populated
+                // (Copilot). Just probe to nudge resolution.
                 trigger_kernel_arp_probe(&item.iface_name, item.hop);
                 counters.get_failures.fetch_add(1, Ordering::Relaxed);
             }
@@ -676,16 +716,15 @@ mod tests {
     }
 
     #[test]
-    fn classify_failed_incomplete_or_no_mac_are_unusable() {
-        assert_eq!(classify_nud(NUD_FAILED, Some(mac())), GetOutcome::Unusable);
-        assert_eq!(
-            classify_nud(NUD_INCOMPLETE, Some(mac())),
-            GetOutcome::Unusable
-        );
-        // REACHABLE but no lladdr → cannot forward → Unusable.
-        assert_eq!(classify_nud(NUD_REACHABLE, None), GetOutcome::Unusable);
-        // STALE but no lladdr → Unusable.
-        assert_eq!(classify_nud(NUD_STALE, None), GetOutcome::Unusable);
+    fn classify_failed_incomplete_are_failed_others_no_reply() {
+        // Kernel authoritatively dead → Failed (revoke).
+        assert_eq!(classify_nud(NUD_FAILED, Some(mac())), GetOutcome::Failed);
+        assert_eq!(classify_nud(NUD_INCOMPLETE, Some(mac())), GetOutcome::Failed);
+        assert_eq!(classify_nud(NUD_FAILED, None), GetOutcome::Failed);
+        // REACHABLE/STALE but no lladdr → not an authoritative FAILED, so
+        // NoReply (probe, do NOT revoke a possibly-good entry — Copilot).
+        assert_eq!(classify_nud(NUD_REACHABLE, None), GetOutcome::NoReply);
+        assert_eq!(classify_nud(NUD_STALE, None), GetOutcome::NoReply);
     }
 
     /// Build a synthetic RTM_NEWNEIGH body (the bytes after the 16-byte
@@ -837,10 +876,21 @@ mod tests {
     }
 
     #[test]
-    fn decide_unusable_revokes_regardless_of_epoch() {
+    fn decide_failed_revokes_but_no_reply_only_probes() {
+        // Authoritative kernel FAILED → revoke + probe.
         assert_eq!(
-            decide_action(GetOutcome::Unusable, 5, 5),
+            decide_action(GetOutcome::Failed, 5, 5),
             ResolveAction::RevokeAndProbe,
+        );
+        // No authoritative answer → probe ONLY, never revoke (a transient
+        // GET loss must not evict a still-good entry — Copilot).
+        assert_eq!(
+            decide_action(GetOutcome::NoReply, 5, 5),
+            ResolveAction::ProbeOnly,
+        );
+        assert_eq!(
+            decide_action(GetOutcome::NoReply, 5, 9),
+            ResolveAction::ProbeOnly,
         );
     }
 

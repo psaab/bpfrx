@@ -229,6 +229,14 @@ impl Coordinator {
         if let Some(join) = self.neighbors.resolver_join.take() {
             let _ = join.join();
         }
+        // Note: the resolver is joined here BEFORE workers.stop_and_clear
+        // below, so a worker still running during teardown could observe
+        // the resolver thread gone and `try_send` into a consumer-dropped
+        // channel. That is harmless: enqueue is non-blocking and a failed
+        // send is counted as enqueue_drops/disconnected, never blocks the
+        // worker, and the resolver thread is provably gone so no stale
+        // mutation can occur. The next reconcile spawns a fresh resolver
+        // and re-installs the handle on every worker.
         for handle in self.tunnel_sources.values_mut() {
             handle.stop.store(true, Ordering::Relaxed);
         }
