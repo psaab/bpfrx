@@ -99,6 +99,39 @@ impl ShardedNeighborMap {
         self.lock_shard(shard_idx(key)).remove(key);
     }
 
+    /// #1769: race-safe confirmed insert for the on-demand resolver.
+    ///
+    /// Locks the key's shard and, **while holding the lock**, re-reads
+    /// `generation`. If it still equals `expected_generation` (no monitor
+    /// event has begun since the resolver snapshotted the epoch before
+    /// its GET), inserts `key → val` and returns `true`. Otherwise makes
+    /// no change and returns `false`.
+    ///
+    /// This is the AGY-F1 / Codex epoch-guard fix: the monitor bumps the
+    /// generation **before** it mutates the map (bump-first ordering in
+    /// `neigh_monitor_thread`), so any concurrent RTM_{NEW,DEL}NEIGH that
+    /// could invalidate the GET-derived MAC is observable as a generation
+    /// advance *under this same shard lock*. The previous lock-free
+    /// load-then-insert could resurrect a stale MAC when a monitor
+    /// removal landed between the post-GET load and the insert (and
+    /// missed entirely when a DELNEIGH for an already-absent key did not
+    /// bump at all). Reading the generation inside the lock plus
+    /// bump-first closes both.
+    pub(crate) fn insert_confirmed_if_unchanged(
+        &self,
+        key: (i32, IpAddr),
+        val: NeighborEntry,
+        generation: &std::sync::atomic::AtomicU64,
+        expected_generation: u64,
+    ) -> bool {
+        let mut shard = self.lock_shard(shard_idx(&key));
+        if generation.load(std::sync::atomic::Ordering::Acquire) != expected_generation {
+            return false;
+        }
+        shard.insert(key, val);
+        true
+    }
+
     /// Insert `key → val` and return whether the cache changed.
     /// Returns `false` if the key already existed with the same MAC.
     /// Mirrors `neighbor::update_dynamic_neighbor` semantics.

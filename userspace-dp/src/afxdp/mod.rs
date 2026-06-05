@@ -608,6 +608,7 @@ use neg_neigh::{neg_neigh_gate, neg_neigh_record};
 mod neighbor_resolver;
 use neighbor_resolver::{
     neighbor_resolver_loop, NeighborResolver, NeighborResolverCounters, ResolveItem,
+    RESOLVER_ENQUEUE_THROTTLE_NS,
 };
 
 // Issue 67.2: neighbor-dispatch helpers extracted into

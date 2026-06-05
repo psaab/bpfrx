@@ -133,6 +133,16 @@ pub(crate) struct BindingWorker {
     /// touched only by the owning worker thread, no cross-core sync. Lazy
     /// allocation (grows on first dead-host drop), like `pending_neigh`.
     pub(crate) neg_neigh_cache: super::neg_neigh::NegNeighCache,
+    /// #1769: per-binding throttle for on-demand resolver enqueues. Keyed
+    /// by `(egress_ifindex, next_hop)` → last-enqueue `now_ns`. On a
+    /// negative-cache fast-fail the worker only clones the egress iface
+    /// name and `try_send`s into the shared resolver if this key has not
+    /// been enqueued within `RESOLVER_ENQUEUE_THROTTLE_NS`. Without it a
+    /// dead-host SYN storm would `String::clone()` the iface name per
+    /// fast-failed packet (Gemini hot-path-alloc finding) even though the
+    /// resolver coalesces them anyway. Touched only by the owning worker
+    /// thread — no cross-core sync, lazy allocation like `neg_neigh_cache`.
+    pub(crate) resolver_enqueue_throttle: super::types::FastMap<(i32, std::net::IpAddr), u64>,
     /// #959 Phase 5: 4 BPF map FDs extracted into `WorkerBpfMaps`.
     /// Field semantics unchanged; access via `binding.bpf_maps.X_fd`.
     pub(crate) bpf_maps: WorkerBpfMaps,
@@ -417,6 +427,7 @@ impl BindingWorker {
             pending_neigh: VecDeque::new(),
             // #1651 B3: lazy-grow (empty until first dead-host drop).
             neg_neigh_cache: super::neg_neigh::NegNeighCache::default(),
+            resolver_enqueue_throttle: super::types::FastMap::default(),
             bpf_maps: WorkerBpfMaps {
                 heartbeat_map_fd,
                 session_map_fd,
@@ -552,6 +563,7 @@ impl BindingWorker {
             pending_neigh: VecDeque::new(),
             // #1651 B3: lazy-grow (empty until first dead-host drop).
             neg_neigh_cache: super::neg_neigh::NegNeighCache::default(),
+            resolver_enqueue_throttle: super::types::FastMap::default(),
             bpf_maps: WorkerBpfMaps {
                 heartbeat_map_fd: -1,
                 session_map_fd: -1,
@@ -668,6 +680,7 @@ impl BindingWorker {
             pending_neigh: VecDeque::new(),
             // #1651 B3: lazy-grow (empty until first dead-host drop).
             neg_neigh_cache: super::neg_neigh::NegNeighCache::default(),
+            resolver_enqueue_throttle: super::types::FastMap::default(),
             bpf_maps: WorkerBpfMaps {
                 heartbeat_map_fd: -1,
                 session_map_fd: -1,

@@ -81,6 +81,16 @@ pub(in crate::afxdp) const RESOLVER_PER_KEY_RATE_LIMIT_NS: u64 = 1_000_000_000;
 pub(in crate::afxdp) const RESOLVER_GC_INTERVAL_NS: u64 = 60_000_000_000;
 pub(in crate::afxdp) const RESOLVER_GC_MAX_AGE_NS: u64 = 300_000_000_000;
 
+/// Per-binding worker-side enqueue throttle: skip cloning the egress
+/// iface name + `try_send`ing the same `(ifindex, hop)` into the shared
+/// resolver more than once per this window on the negative fast-fail.
+/// The resolver coalesces per-key at 1 s anyway; this just keeps a
+/// dead-host SYN storm from `String::clone()`-ing per fast-failed packet
+/// (the hot-path-allocation concern). 100 ms is far below the resolver's
+/// 1 s per-key window and the 3 s negative-cache TTL, so a genuinely
+/// recovering host is still nudged promptly.
+pub(in crate::afxdp) const RESOLVER_ENQUEUE_THROTTLE_NS: u64 = 100_000_000;
+
 /// Short receive timeout for the single-key GET reply (ms). The kernel
 /// answers a unicast RTM_GETNEIGH essentially immediately; this only
 /// bounds the wait if the reply is lost so the resolver thread stays
@@ -172,14 +182,19 @@ impl NeighborResolver {
             iface_name,
             epoch: self.neighbor_generation.load(Ordering::Acquire),
         };
+        // Increment the depth gauge BEFORE the send so the consumer's
+        // post-dequeue decrement can never observe a not-yet-incremented
+        // gauge and drive it transiently negative (the gauge-drift
+        // finding). On send failure, undo the increment.
+        self.counters.queue_depth.fetch_add(1, Ordering::Relaxed);
         match self.tx.try_send(item) {
-            Ok(()) => {
-                self.counters.queue_depth.fetch_add(1, Ordering::Relaxed);
-            }
+            Ok(()) => {}
             Err(mpsc::TrySendError::Full(_)) => {
+                self.counters.queue_depth.fetch_sub(1, Ordering::Relaxed);
                 self.counters.enqueue_drops.fetch_add(1, Ordering::Relaxed);
             }
             Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.counters.queue_depth.fetch_sub(1, Ordering::Relaxed);
                 self.counters.disconnected.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -542,19 +557,49 @@ pub(super) fn neighbor_resolver_loop(
             Ok(()) => read_get_reply(fd, item.ifindex, item.hop, seq),
             Err(_) => GetOutcome::Unusable,
         };
-        // Re-read the epoch AFTER the GET; decide_action applies the
-        // guard only on the confirmed-cache path (AGY F1).
+        // Re-check stop AFTER the (up to 200 ms) GET, before any mutation
+        // of the shared neighbor map. The aux thread is detached
+        // (spawn_supervised_aux drops the JoinHandle) and stop_inner does
+        // not join, so without this a resolver blocked in the GET recv
+        // during a stop/reconcile could insert/remove on dynamic_neighbors
+        // after a fresh resolver has spawned (Codex High). Bail before any
+        // side effect. The insert path is additionally epoch-guarded
+        // (stop_inner does not reset the generation, but a reconcile's
+        // monitor restart re-stores it), but the remove/probe paths are
+        // not, so the stop re-check is the general guard.
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        // Re-read the epoch AFTER the GET for a cheap fast-path reject
+        // (avoids taking the shard lock when a monitor event has already
+        // clearly raced in). The AUTHORITATIVE guard is the in-lock epoch
+        // re-check inside insert_confirmed_if_unchanged below — paired
+        // with the monitor's bump-first ordering, that closes the race
+        // even when a removal lands between this load and the insert (the
+        // Codex/AGY F1 counterexample).
         let epoch_after = neighbor_generation.load(Ordering::Acquire);
         match decide_action(outcome, epoch_before, epoch_after) {
             ResolveAction::Cache(mac) => {
-                dynamic_neighbors.insert((item.ifindex, item.hop), NeighborEntry { mac });
-                counters.get_resolved.fetch_add(1, Ordering::Relaxed);
+                // Race-safe insert: the shard lock serializes against the
+                // monitor's bump-first mutation of this same key, and the
+                // generation is re-read INSIDE the lock against the
+                // pre-GET snapshot. A late stale MAC can no longer
+                // resurrect a key the monitor removed.
+                if dynamic_neighbors.insert_confirmed_if_unchanged(
+                    (item.ifindex, item.hop),
+                    NeighborEntry { mac },
+                    &neighbor_generation,
+                    epoch_before,
+                ) {
+                    counters.get_resolved.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    counters.epoch_rejects.fetch_add(1, Ordering::Relaxed);
+                }
             }
             ResolveAction::EpochReject => {
-                // A concurrent FAILED/DELNEIGH (which removes the key and
-                // bumps the epoch) raced our GET reply. Back off rather
-                // than clobber the monitor's authoritative removal with a
-                // potentially-stale insert.
+                // Fast-path reject: the epoch already advanced before we
+                // even attempted the locked insert. Back off rather than
+                // clobber the monitor's authoritative removal.
                 counters.epoch_rejects.fetch_add(1, Ordering::Relaxed);
             }
             ResolveAction::ProbeOnStale => {
@@ -790,6 +835,53 @@ mod tests {
             decide_action(GetOutcome::Unusable, 5, 5),
             ResolveAction::RevokeAndProbe,
         );
+    }
+
+    /// AUTHORITATIVE in-lock epoch gate (the Codex F1 fix). Reconstructs
+    /// the exact counterexample Codex raised: a confirmed GET reply whose
+    /// pre-GET epoch snapshot is stale because a monitor event (which
+    /// bumps the generation under bump-first ordering) has since landed.
+    /// `insert_confirmed_if_unchanged` must reject the insert even though
+    /// the lock-free `decide_action(epoch_before, epoch_after)` fast-path
+    /// would have been bypassed (simulating the bump landing AFTER the
+    /// post-GET `epoch_after` load but the in-lock re-read catching it).
+    #[test]
+    fn in_lock_epoch_gate_rejects_stale_insert() {
+        let map = ShardedNeighborMap::new();
+        let epoch_gen = AtomicU64::new(5);
+        let key = (14, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)));
+        // Resolver snapshotted epoch_before = 5 before its GET.
+        let epoch_before = 5u64;
+        // A monitor DELNEIGH batch lands: bump-first advances the gen,
+        // then it removes the key (here: key already absent — the exact
+        // case the old `if changed` post-bump MISSED, but bump-first now
+        // always advances).
+        epoch_gen.fetch_add(1, Ordering::Release); // now 6
+        map.remove(&key);
+        // The late confirmed insert must be rejected by the in-lock gate.
+        let stale = mac();
+        let inserted =
+            map.insert_confirmed_if_unchanged(key, NeighborEntry { mac: stale }, &epoch_gen, epoch_before);
+        assert!(!inserted, "stale insert under advanced epoch must be rejected");
+        assert!(
+            map.get(&key).is_none(),
+            "the removed key must NOT be resurrected by a late stale GET",
+        );
+    }
+
+    /// The happy path of the in-lock gate: no monitor event raced in
+    /// (generation unchanged since the snapshot), so the confirmed insert
+    /// is applied.
+    #[test]
+    fn in_lock_epoch_gate_accepts_unchanged() {
+        let map = ShardedNeighborMap::new();
+        let epoch_gen = AtomicU64::new(5);
+        let key = (14, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)));
+        let m = mac();
+        let inserted =
+            map.insert_confirmed_if_unchanged(key, NeighborEntry { mac: m }, &epoch_gen, 5);
+        assert!(inserted, "unchanged-epoch confirmed insert must apply");
+        assert_eq!(map.get(&key).map(|e| e.mac), Some(m));
     }
 
     /// The epoch-guard race end-to-end on the real ShardedNeighborMap: a

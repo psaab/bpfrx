@@ -630,8 +630,19 @@ pub(super) fn neigh_monitor_thread(
         if n <= 0 {
             continue;
         }
+        // #1769 epoch-guard ordering: bump the generation with `Release`
+        // BEFORE mutating dynamic_neighbors. The socket is bound to
+        // RTMGRP_NEIGH only, so every recv carries neighbor events; a
+        // bump-first per batch guarantees the on-demand resolver's in-lock
+        // `Acquire` read (`insert_confirmed_if_unchanged`) observes the
+        // advance if ANY mutation in this batch could invalidate its
+        // GET-derived MAC — including a DELNEIGH for an already-absent key
+        // (which the old `if changed` post-bump missed entirely). The
+        // resolver's worst case is a conservative reject, never a stale
+        // insert. `store(1)` on dump completion stays the startup
+        // sentinel; here we always advance.
+        neighbor_generation.fetch_add(1, Ordering::Release);
         let mut offset = 0usize;
-        let mut changed = false;
         while offset + 16 <= n as usize {
             let nlmsg_len = u32::from_ne_bytes([
                 buf[offset],
@@ -644,16 +655,13 @@ pub(super) fn neigh_monitor_thread(
                 break;
             }
             if nlmsg_type == 28 || nlmsg_type == 29 {
-                changed |= parse_neighbor_msg(
+                parse_neighbor_msg(
                     nlmsg_type,
                     &buf[offset + 16..offset + nlmsg_len],
                     &dynamic_neighbors,
                 );
             }
             offset += (nlmsg_len + 3) & !3; // align to 4
-        }
-        if changed {
-            neighbor_generation.fetch_add(1, Ordering::Relaxed);
         }
     }
     unsafe { libc::close(fd) };

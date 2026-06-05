@@ -2074,16 +2074,59 @@ pub(super) fn poll_binding_process_descriptor(
                                         if let Some(resolver) =
                                             worker_ctx.neighbor_resolver
                                         {
-                                            if let Some(name) = worker_ctx
-                                                .forwarding
-                                                .ifindex_to_name
-                                                .get(&neg_key.0)
-                                            {
-                                                resolver.enqueue(
-                                                    neg_key.0,
-                                                    neg_key.1,
-                                                    name.clone(),
-                                                );
+                                            // Per-binding throttle: only
+                                            // clone the iface name +
+                                            // try_send once per key per
+                                            // RESOLVER_ENQUEUE_THROTTLE_NS
+                                            // so a dead-host SYN storm does
+                                            // NOT allocate per fast-failed
+                                            // packet (the resolver coalesces
+                                            // per-key anyway). The cheap
+                                            // (i32, IpAddr) map check runs
+                                            // before any clone.
+                                            let throttled = matches!(
+                                                binding
+                                                    .resolver_enqueue_throttle
+                                                    .get(&neg_key),
+                                                Some(&t) if now_ns.saturating_sub(t)
+                                                    < RESOLVER_ENQUEUE_THROTTLE_NS
+                                            );
+                                            if !throttled {
+                                                if let Some(name) = worker_ctx
+                                                    .forwarding
+                                                    .ifindex_to_name
+                                                    .get(&neg_key.0)
+                                                {
+                                                    resolver.enqueue(
+                                                        neg_key.0,
+                                                        neg_key.1,
+                                                        name.clone(),
+                                                    );
+                                                    // Bound the throttle
+                                                    // map like the negative
+                                                    // cache: a /24 scan
+                                                    // touches <=254 keys, so
+                                                    // clear wholesale past
+                                                    // the cap (best-effort —
+                                                    // losing throttle for a
+                                                    // few keys only risks one
+                                                    // extra clone).
+                                                    if binding
+                                                        .resolver_enqueue_throttle
+                                                        .len()
+                                                        >= MAX_NEG_NEIGH_CACHE
+                                                        && !binding
+                                                            .resolver_enqueue_throttle
+                                                            .contains_key(&neg_key)
+                                                    {
+                                                        binding
+                                                            .resolver_enqueue_throttle
+                                                            .clear();
+                                                    }
+                                                    binding
+                                                        .resolver_enqueue_throttle
+                                                        .insert(neg_key, now_ns);
+                                                }
                                             }
                                         }
                                         // Fresh RX descriptor → recycle via
