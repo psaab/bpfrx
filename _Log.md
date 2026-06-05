@@ -4574,3 +4574,37 @@ top.
     Kept the zero-cost shim fix regardless (flag-gate => non-WG path pays only a
     flags bit-test; xdp delta vs master +89 inlined insns -> +34 cold-helper insns,
     none executed on non-WG path).
+
+## 2026-06-04 — #1769 neighbor-resolver immediate stuck-state fix
+
+- **Timestamp**: 2026-06-04
+- **Action**: Implement converged plan §9 — shared per-key rate-limited
+  on-demand neighbor resolver (single-key RTM_GETNEIGH + epoch-guarded
+  cache REACHABLE/PERMANENT-only + probe-on-DELAY/STALE + immediate
+  revoke on FAILED). Wired resolver thread into coordinator bring-up,
+  worker hot-path enqueue on the MissingNeighbor negative-cache
+  fast-fail, and a full Prometheus counter set (queue depth, GET
+  attempts/resolved/failures, probe-on-stale, epoch rejects, enqueue
+  drops, disconnected). Added differential repro + epoch-guard race +
+  DELAY-probe + rate-limit tests. Regenerated protocol_wire_v1.json
+  (additive). §10a full redesign deferred to a follow-up issue.
+- **File(s)**: userspace-dp/src/afxdp/neighbor_resolver.rs (new),
+  userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/coordinator/neighbor_manager.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/afxdp/types/runtime.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/worker/lifecycle.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/afxdp/poll_stages.rs,
+  userspace-dp/src/afxdp/tests.rs,
+  userspace-dp/src/protocol/control.rs,
+  userspace-dp/src/server/helpers.rs,
+  userspace-dp/src/server/lifecycle.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  pkg/dataplane/userspace/protocol.go, pkg/api/metrics.go,
+  pkg/api/metrics_descriptors.go, pkg/api/metrics_userspace.go,
+  pkg/api/metrics_descriptor_coverage_test.go,
+  docs/userspace-cold-start-resolution.md.

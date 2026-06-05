@@ -36,6 +36,19 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     let (warm_drops, warm_disconnected) = state.afxdp.neighbor_warm_counters();
     state.status.neighbor_warm_drops_total = warm_drops;
     state.status.neighbor_warm_disconnected_total = warm_disconnected;
+    // #1769: on-demand neighbor-resolver telemetry. Previously the only
+    // neighbor metrics were the two warm counters; this surfaces the
+    // stuck-state surface (pending depth, GET attempts/resolutions/
+    // failures, probe-on-stale, epoch rejects, enqueue drops).
+    let r = state.afxdp.neighbor_resolver_counters();
+    state.status.neighbor_resolver_queue_depth = r.queue_depth;
+    state.status.neighbor_resolver_enqueue_drops_total = r.enqueue_drops;
+    state.status.neighbor_resolver_disconnected_total = r.disconnected;
+    state.status.neighbor_resolver_get_attempts_total = r.get_attempts;
+    state.status.neighbor_resolver_get_resolved_total = r.get_resolved;
+    state.status.neighbor_resolver_probe_on_stale_total = r.probe_on_stale;
+    state.status.neighbor_resolver_get_failures_total = r.get_failures;
+    state.status.neighbor_resolver_epoch_rejects_total = r.epoch_rejects;
     state.status.route_entries = state.snapshot.as_ref().map(|s| s.routes.len()).unwrap_or(0);
     state.status.fabrics = state
         .snapshot

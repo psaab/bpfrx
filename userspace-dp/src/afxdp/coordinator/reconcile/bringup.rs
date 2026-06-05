@@ -165,6 +165,59 @@ pub(super) fn bring_up_workers(
             worker_command_queues.len()
         );
     }
+    // #1769: spawn the shared on-demand neighbor resolver BEFORE the
+    // worker spawn loop so every worker captures a clone of the resolver
+    // handle. Guarded like the monitor/warmer so a re-reconcile reuses
+    // the existing thread. The resolver issues single-key RTM_GETNEIGH +
+    // probe-on-stale off the hot path when a worker's negative-cache
+    // fast-fail nudges a wedged dst.
+    if coord.neighbors.resolver.is_none() {
+        let (tx, rx) = mpsc::sync_channel::<ResolveItem>(
+            super::super::neighbor_resolver::RESOLVER_QUEUE_DEPTH,
+        );
+        let resolver_stop = Arc::new(AtomicBool::new(false));
+        let resolver_stop_clone = resolver_stop.clone();
+        let dynamic_neighbors = coord.neighbors.dynamic.clone();
+        let neighbor_generation = coord.neighbors.generation.clone();
+        let neighbor_generation_handle = neighbor_generation.clone();
+        let counters = coord.neighbors.resolver_counters.clone();
+        let counters_clone = counters.clone();
+        // Retain the join handle so stop_inner can join the resolver and
+        // enforce no-mutation-after-stop (the bare stop re-check is a
+        // check-then-act race; joining is the real guard). Only install
+        // the resolver handle when the thread actually spawned: on spawn
+        // failure leave `resolver`/`resolver_stop`/`resolver_join` as
+        // `None` so the NEXT reconcile retries (the `is_none()` guard
+        // above stays true) and workers see `None` and skip on-demand
+        // resolution — they never enqueue into a permanently-dead resolver
+        // (Copilot). The dst still fast-fails normally; no availability
+        // regression.
+        match spawn_supervised_aux("neigh-resolver", move || {
+            neighbor_resolver_loop(
+                rx,
+                dynamic_neighbors,
+                neighbor_generation,
+                counters_clone,
+                resolver_stop_clone,
+            )
+        }) {
+            Ok(join) => {
+                coord.neighbors.resolver = Some(Arc::new(NeighborResolver::new(
+                    tx,
+                    counters,
+                    neighbor_generation_handle,
+                )));
+                coord.neighbors.resolver_stop = Some(resolver_stop);
+                coord.neighbors.resolver_join = Some(join);
+            }
+            Err(err) => {
+                eprintln!(
+                    "xpf-userspace-dp: neighbor resolver thread spawn failed: {err}; \
+                     on-demand resolution disabled this reconcile (will retry)"
+                );
+            }
+        }
+    }
     for (worker_id, binding_plans) in workers {
         let plan_count = binding_plans.len();
         let stop = Arc::new(AtomicBool::new(false));
@@ -198,6 +251,7 @@ pub(super) fn bring_up_workers(
         let worker_commands_by_id = worker_command_queues.clone();
         let ha_state = coord.ha.rg_runtime.clone();
         let dynamic_neighbors = coord.neighbors.dynamic.clone();
+        let neighbor_resolver = coord.neighbors.resolver.clone();
         let worker_poll_mode = coord.poll_mode;
         let shared_fabrics = coord.ha.fabrics.clone();
         let rg_epochs = coord.rg_epochs.clone();
@@ -242,6 +296,7 @@ pub(super) fn bring_up_workers(
                     shared_forwarding,
                     ha_state,
                     dynamic_neighbors,
+                    neighbor_resolver,
                     shared_sessions,
                     shared_nat_sessions,
                     shared_forward_wire_sessions,

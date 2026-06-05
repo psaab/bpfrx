@@ -790,5 +790,47 @@ func newCollector(srv *Server) *xpfCollector {
 			"Proactive neighbor-warm requests dropped because the warmer worker thread died; warming is disabled until daemon restart (#1636).",
 			nil, nil,
 		),
+		// #1769: on-demand neighbor-resolver telemetry — operator-visible
+		// signal for the MissingNeighbor negative-cache stuck-state.
+		neighborResolverQueueDepth: prometheus.NewDesc(
+			"xpf_userspace_neighbor_resolver_queue_depth",
+			"On-demand neighbor-resolver queue depth: dsts queued for a single-key RTM_GETNEIGH after a MissingNeighbor negative-cache fast-fail but not yet processed (gauge) (#1769).",
+			nil, nil,
+		),
+		neighborResolverEnqueueDropsTotal: prometheus.NewDesc(
+			"xpf_userspace_neighbor_resolver_enqueue_drops_total",
+			"On-demand neighbor-resolver enqueue attempts dropped because the bounded queue was full (transient; the dst still fast-fails this round) (#1769).",
+			nil, nil,
+		),
+		neighborResolverDisconnectedTotal: prometheus.NewDesc(
+			"xpf_userspace_neighbor_resolver_disconnected_total",
+			"On-demand neighbor-resolver enqueue attempts dropped because the resolver worker thread died; on-demand resolution is disabled until daemon restart (#1769).",
+			nil, nil,
+		),
+		neighborResolverGetAttemptsTotal: prometheus.NewDesc(
+			"xpf_userspace_neighbor_resolver_get_attempts_total",
+			"Single-key RTM_GETNEIGH requests issued by the on-demand resolver (after the per-key rate-limit coalesces a SYN storm) (#1769).",
+			nil, nil,
+		),
+		neighborResolverGetResolvedTotal: prometheus.NewDesc(
+			"xpf_userspace_neighbor_resolver_get_resolved_total",
+			"On-demand RTM_GETNEIGH replies confirmed REACHABLE/PERMANENT and cached into the dynamic neighbor map (epoch guard passed) (#1769).",
+			nil, nil,
+		),
+		neighborResolverProbeOnStaleTotal: prometheus.NewDesc(
+			"xpf_userspace_neighbor_resolver_probe_on_stale_total",
+			"On-demand RTM_GETNEIGH replies in STALE/DELAY/PROBE that triggered a revalidation probe instead of caching the unconfirmed MAC (the live #1769 wedge state) (#1769).",
+			nil, nil,
+		),
+		neighborResolverGetFailuresTotal: prometheus.NewDesc(
+			"xpf_userspace_neighbor_resolver_get_failures_total",
+			"On-demand RTM_GETNEIGH attempts with no usable reply (timeout, FAILED, INCOMPLETE, no entry, or recv/parse error) (#1769).",
+			nil, nil,
+		),
+		neighborResolverEpochRejectsTotal: prometheus.NewDesc(
+			"xpf_userspace_neighbor_resolver_epoch_rejects_total",
+			"Confirmed on-demand inserts skipped because the global neighbor epoch advanced between enqueue and the GET reply (epoch guard rejected a potentially-raced stale insert) (#1769).",
+			nil, nil,
+		),
 	}
 }

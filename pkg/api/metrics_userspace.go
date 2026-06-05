@@ -58,6 +58,47 @@ func (c *xpfCollector) emitNeighborWarmCounters(ch chan<- prometheus.Metric, sta
 		prometheus.CounterValue,
 		float64(status.NeighborWarmDisconnectedTotal),
 	)
+	// #1769: on-demand neighbor-resolver telemetry.
+	ch <- prometheus.MustNewConstMetric(
+		c.neighborResolverQueueDepth,
+		prometheus.GaugeValue,
+		float64(status.NeighborResolverQueueDepth),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.neighborResolverEnqueueDropsTotal,
+		prometheus.CounterValue,
+		float64(status.NeighborResolverEnqueueDropsTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.neighborResolverDisconnectedTotal,
+		prometheus.CounterValue,
+		float64(status.NeighborResolverDisconnectedTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.neighborResolverGetAttemptsTotal,
+		prometheus.CounterValue,
+		float64(status.NeighborResolverGetAttemptsTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.neighborResolverGetResolvedTotal,
+		prometheus.CounterValue,
+		float64(status.NeighborResolverGetResolvedTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.neighborResolverProbeOnStaleTotal,
+		prometheus.CounterValue,
+		float64(status.NeighborResolverProbeOnStaleTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.neighborResolverGetFailuresTotal,
+		prometheus.CounterValue,
+		float64(status.NeighborResolverGetFailuresTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.neighborResolverEpochRejectsTotal,
+		prometheus.CounterValue,
+		float64(status.NeighborResolverEpochRejectsTotal),
+	)
 }
 
 func (c *xpfCollector) emitThreeColorPolicerCounters(ch chan<- prometheus.Metric, status dpuserspace.ProcessStatus) {

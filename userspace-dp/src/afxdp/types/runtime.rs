@@ -323,6 +323,13 @@ pub(in crate::afxdp) struct WorkerContext<'a> {
     pub(in crate::afxdp) forwarding: &'a ForwardingState,
     pub(in crate::afxdp) ha_state: &'a BTreeMap<i32, HAGroupRuntime>,
     pub(in crate::afxdp) dynamic_neighbors: &'a Arc<super::sharded_neighbor::ShardedNeighborMap>,
+    /// #1769: shared on-demand neighbor resolver. `Some` in production
+    /// (spawned at coordinator bring-up); `None` in unit tests that do
+    /// not exercise the resolver path. The `MissingNeighbor`
+    /// negative-cache fast-fail enqueues the dst here so a single-key
+    /// RTM_GETNEIGH/probe runs off the hot path.
+    pub(in crate::afxdp) neighbor_resolver:
+        Option<&'a Arc<super::neighbor_resolver::NeighborResolver>>,
     pub(in crate::afxdp) shared_sessions: &'a Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     pub(in crate::afxdp) shared_nat_sessions:
         &'a Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,

@@ -624,6 +624,19 @@ type ProcessStatus struct {
 	// warmer worker thread died (fatal — warming disabled until restart).
 	NeighborWarmDropsTotal        uint64 `json:"neighbor_warm_drops_total,omitempty"`
 	NeighborWarmDisconnectedTotal uint64 `json:"neighbor_warm_disconnected_total,omitempty"`
+	// #1769: on-demand neighbor-resolver telemetry. The resolver fires
+	// when a MissingNeighbor negative-cache fast-fail nudges a wedged dst
+	// (single-key RTM_GETNEIGH + epoch-guarded cache or probe-on-stale).
+	// QueueDepth is a live gauge; the rest are monotonic counters. These
+	// are the operator-visible signal for the #1769 stuck-state.
+	NeighborResolverQueueDepth        uint64 `json:"neighbor_resolver_queue_depth,omitempty"`
+	NeighborResolverEnqueueDropsTotal uint64 `json:"neighbor_resolver_enqueue_drops_total,omitempty"`
+	NeighborResolverDisconnectedTotal uint64 `json:"neighbor_resolver_disconnected_total,omitempty"`
+	NeighborResolverGetAttemptsTotal  uint64 `json:"neighbor_resolver_get_attempts_total,omitempty"`
+	NeighborResolverGetResolvedTotal  uint64 `json:"neighbor_resolver_get_resolved_total,omitempty"`
+	NeighborResolverProbeOnStaleTotal uint64 `json:"neighbor_resolver_probe_on_stale_total,omitempty"`
+	NeighborResolverGetFailuresTotal  uint64 `json:"neighbor_resolver_get_failures_total,omitempty"`
+	NeighborResolverEpochRejectsTotal uint64 `json:"neighbor_resolver_epoch_rejects_total,omitempty"`
 }
 
 // MarshalJSON intentionally uses a value receiver so both ProcessStatus values

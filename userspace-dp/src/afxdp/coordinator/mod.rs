@@ -214,6 +214,29 @@ impl Coordinator {
             warm_stop.store(true, Ordering::Relaxed);
         }
         self.neighbors.warm_queue = None;
+        // #1769: stop the on-demand resolver. Signal stop, drop the
+        // producer handle so the recv side disconnects promptly, then
+        // JOIN the worker before returning. Joining (not just signalling)
+        // is what enforces no-mutation-after-stop: a detached resolver
+        // blocked in its GET could otherwise insert/remove on
+        // dynamic_neighbors after a subsequent reconcile spawned a fresh
+        // resolver. Join latency is bounded by the 500ms recv timeout +
+        // the 200ms GET timeout, well under TimeoutStopSec.
+        if let Some(resolver_stop) = self.neighbors.resolver_stop.take() {
+            resolver_stop.store(true, Ordering::Relaxed);
+        }
+        self.neighbors.resolver = None;
+        if let Some(join) = self.neighbors.resolver_join.take() {
+            let _ = join.join();
+        }
+        // Note: the resolver is joined here BEFORE workers.stop_and_clear
+        // below, so a worker still running during teardown could observe
+        // the resolver thread gone and `try_send` into a consumer-dropped
+        // channel. That is harmless: enqueue is non-blocking and a failed
+        // send is counted as enqueue_drops/disconnected, never blocks the
+        // worker, and the resolver thread is provably gone so no stale
+        // mutation can occur. The next reconcile spawns a fresh resolver
+        // and re-installs the handle on every worker.
         for handle in self.tunnel_sources.values_mut() {
             handle.stop.store(true, Ordering::Relaxed);
         }

@@ -248,3 +248,67 @@ by #1636 (see accuracy note at the top of this file).
 5. **Create sessions on MissingNeighbor** — without the forward session,
    the reverse direction (SYN-ACK) can't find the NAT match and gets
    policy-denied. The session must exist before the SYN-ACK arrives.
+
+## #1769 — Negative-cache stuck state + on-demand resolver (immediate fix)
+
+The #1651 dead-host negative cache (`afxdp/neg_neigh.rs`) fast-fails a
+SYN to a negatively-cached `(egress_ifindex, next_hop)` **before** the
+ARP probe and the `pending_neigh` buffer
+(`poll_descriptor/mod.rs` MissingNeighbor arm). That is correct for a
+genuinely dead host, but it produced a stuck state for a
+directly-connected, **outbound-only** target (e.g. the smoke iperf3 dst
+`172.16.80.200` on `ge-0-0-2.80`):
+
+- `dynamic_neighbors` lost the entry — a transient kernel
+  FAILED/INCOMPLETE/DELNEIGH during revalidation removes it
+  (`neighbor.rs::parse_neighbor_msg`), or a good RTM_NEWNEIGH was
+  dropped (the monitor swallows `recv()<=0` and the full dump is
+  startup-only).
+- The 3 s negative entry was armed, so every new SYN fast-failed with
+  **nothing** re-probing or re-buffering the dst. The kernel's valid
+  DELAY/STALE lladdr was unusable because the hot path refuses an
+  on-demand kernel read (`forwarding/mod.rs::lookup_neighbor_entry`).
+- Result: repeated 3 s connect blackouts until the kernel independently
+  re-validated and emitted a fresh RTM_NEWNEIGH.
+
+**Fix (`afxdp/neighbor_resolver.rs`):** on a negative-cache fast-fail the
+worker enqueues the dst into ONE **shared, per-key, rate-limited**
+resolver (the `neg_neigh_cache` is per-binding × 6 WAN workers, so a
+per-binding GET would be 6× rtnl). The resolver thread holds a persistent
+netlink socket and, off the hot path:
+
+1. **rate-limits per `(ifindex, hop)`** (1 s window) so a SYN storm fires
+   at most one GET/probe per key — no probe storm;
+2. issues a **single-key `RTM_GETNEIGH`** (`NLM_F_REQUEST` + `NDA_DST`,
+   no dump flags — NOT the RTNL-mutex dump path);
+3. caches the lladdr into `dynamic_neighbors` **only if REACHABLE /
+   PERMANENT** AND the global neighbor epoch
+   (`neighbors.generation`) has not advanced since enqueue — the
+   **epoch guard** that defeats the out-of-order race where a concurrent
+   monitor FAILED/DELNEIGH removal would be clobbered by a late stale
+   insert;
+4. on **STALE / DELAY / PROBE** (the live wedge signature) does NOT cache
+   the unconfirmed MAC — it fires `trigger_kernel_arp_probe` to force
+   kernel revalidation and lets the resulting confirmed multicast
+   RTM_NEWNEIGH populate the map;
+5. on **FAILED / INCOMPLETE / no-reply** caches nothing and revokes any
+   stale dynamic entry (immediate-revocation firewall posture) plus a
+   probe.
+
+This preserves the #1651 dead-host storm defense (packets still
+fast-fail; no `pending_neigh` slot consumed) and never forwards to an
+unconfirmed MAC. The hot path only pays a non-blocking `try_send` on the
+negative fast-fail (not per-packet).
+
+**Observability (`neighbor_resolver_*` Prometheus series):** queue depth
+(gauge), GET attempts / resolved / failures, probe-on-stale, epoch
+rejects, enqueue drops, disconnected. Before #1769 the only neighbor
+metrics were the two `neighbor_warm_*` counters, so the stuck state was
+invisible.
+
+**Deferred to a follow-up (plan §10a):** the full per-key resolver state
+machine — per-key pending bound, per-key (not global) epoch, backoff that
+coalesces all pressure into one in-flight GET, and a throttled
+ENOBUFS-triggered family re-dump for the silent netlink-desync (D4). The
+immediate fix above closes the live wedge; it does not yet add the
+ENOBUFS re-dump.
