@@ -73,37 +73,9 @@ pub(super) fn retry_pending_neigh(
     if let Some(resolver) = neighbor_resolver {
         resolver.observe_pending_depth(binding.pending_neigh.len() as u64);
     }
-    // GEMINI-NEXT.md Section 3 cold start: in-place pop_front/push_back
-    // rotation. The previous version did `binding.pending_neigh.remove(i)`
-    // inside a while-i-loop, which is O(n) per removal — scaled O(n²) in
-    // the queue depth. With MAX_PENDING_NEIGH bumped to 4096 (was 64), the
-    // quadratic cost becomes a real fairness hazard during connection
-    // bursts; even at the 64-cap it was wasteful relative to the cap.
-    //
-    // We pop exactly the snapshotted-len items off the front and either
-    // (a) drop the packet (recycle frame), (b) push it back on the SAME
-    // VecDeque (FIFO order preserved for retained items), or (c) dispatch
-    // it. Items pushed back go to the tail and are NOT re-visited in this
-    // sweep because we iterate exactly `pending_len` times. Reusing the
-    // existing backing buffer avoids per-sweep alloc/free churn that the
-    // earlier `mem::take` + `reserve` draft would have introduced.
-    let pending_len = binding.pending_neigh.len();
     let ingress_slot = binding.slot;
     let ingress_ifindex = binding.ifindex;
     let ingress_queue = binding.queue_id;
-    // Per-sweep dedup of probe re-fires by `(egress_ifindex, next_hop)`.
-    // Without this, N packets queued for the same unresolved neighbor
-    // would each re-fire `trigger_kernel_arp_probe()` at the same
-    // schedule slot — N redundant socket opens + N kernel ARP/NDP
-    // entries. The kernel coalesces solicits, but we still pay the
-    // syscall + alloc per call. Mirrors the dedup at the initial-probe
-    // site in poll_descriptor.rs (which uses `pending_neigh.iter().any`).
-    //
-    // BTreeSet is used because IpAddr is Ord and we expect the set to
-    // be small (handful of neighbors at most during cold start) — the
-    // log-N insert dominates over hash setup for tiny N.
-    let mut probed_this_sweep: std::collections::BTreeSet<(i32, IpAddr)> =
-        std::collections::BTreeSet::new();
     // #1636 option D: the drop timeout is computed per snapshot from the
     // kernel retrans_time_ms sysctls (800ms when fast-retrans is
     // confirmed, else 2000ms). `0` means a snapshot that predates the
@@ -114,29 +86,36 @@ pub(super) fn retry_pending_neigh(
     } else {
         PENDING_NEIGH_TIMEOUT_NS
     };
-    for _ in 0..pending_len {
-        let pkt = binding
-            .pending_neigh
-            .pop_front()
-            .expect("pending_neigh shrank during retry sweep");
+    // #1771 §2.2: pending_neigh is keyed by (egress_ifindex, next_hop) with
+    // ONE representative packet per hop, so the per-sweep probe-dedup
+    // BTreeSet is gone (each hop fires at most one probe naturally) and the
+    // old O(n²) pop_front/push_back rotation is replaced by a key sweep.
+    // Snapshot the keys (Copy; bounded by distinct unresolved next-hops, not
+    // packet count — tiny on this cold path) so the map is not borrowed while
+    // the resolved-dispatch tail needs `&mut binding`.
+    let keys: Vec<(i32, IpAddr)> = binding.pending_neigh.keys().copied().collect();
+    for key in keys {
+        // Peek queued_ns / probe_attempts without holding a borrow across
+        // the dispatch tail.
+        let (queued_ns, probe_attempts) = match binding.pending_neigh.get(&key) {
+            Some(p) => (p.queued_ns, p.probe_attempts),
+            None => continue,
+        };
         // Timeout: recycle frame and drop.
-        if now_ns.saturating_sub(pkt.queued_ns) > pending_neigh_timeout_ns {
+        if now_ns.saturating_sub(queued_ns) > pending_neigh_timeout_ns {
             // #1651 B3: this dst timed out after best-effort ARP/NDP probes
             // and never resolved — negatively cache (egress_ifindex,
             // next_hop) so subsequent cold packets fast-fail at the
             // MissingNeighbor buffer site instead of re-buffering for
             // another full PENDING_NEIGH_TIMEOUT. The timeout (not the probe
             // count) is the signal: the dst never landed in the neighbor
-            // maps within the window. Same lookup key the fast-fail gate
-            // uses (egress_ifindex is the logical/VLAN ifindex at both
-            // sites).
-            if let Some(hop) = pkt.decision.resolution.next_hop {
-                neg_neigh_record(
-                    &mut binding.neg_neigh_cache,
-                    (pkt.decision.resolution.egress_ifindex, hop),
-                    now_ns,
-                );
-            }
+            // maps within the window. The map key IS (egress_ifindex,
+            // next_hop) — the same lookup key the fast-fail gate uses.
+            let pkt = binding
+                .pending_neigh
+                .remove(&key)
+                .expect("key from this map");
+            neg_neigh_record(&mut binding.neg_neigh_cache, key, now_ns);
             // #1772: count the never-resolved timeout drop.
             if let Some(resolver) = neighbor_resolver {
                 resolver.record_pending_timeout_drop();
@@ -146,53 +125,28 @@ pub(super) fn retry_pending_neigh(
         }
         // Check if neighbor MAC is now available, mirroring the lookup
         // order from lookup_neighbor_entry(): static/permanent neighbors
-        // first, then dynamic_neighbors.
-        let mac = if let Some(hop) = pkt.decision.resolution.next_hop {
-            let neigh_key = (pkt.decision.resolution.egress_ifindex, hop);
-            forwarding
-                .neighbors
-                .get(&neigh_key)
-                .map(|e| e.mac)
-                .or_else(|| dynamic_neighbors.get(&neigh_key).map(|e| e.mac))
-        } else {
-            None
-        };
+        // first, then dynamic_neighbors. The map key IS the neighbor key.
+        let mac = forwarding
+            .neighbors
+            .get(&key)
+            .map(|e| e.mac)
+            .or_else(|| dynamic_neighbors.get(&key).map(|e| e.mac));
         let Some(neighbor_mac) = mac else {
-            // Still pending — re-fire ARP/NDP probe if the next slot
-            // in the exponential schedule is due (GEMINI-NEXT.md
-            // Section 3 cold-start). Each retry advances
-            // probe_attempts so each schedule entry fires at most
-            // once per packet. Per-sweep dedup keyed on
-            // (egress_ifindex, next_hop) prevents probe-storm when
-            // many packets share the same unresolved neighbor.
-            let mut pkt = pkt;
-            if probe_due(now_ns.saturating_sub(pkt.queued_ns), pkt.probe_attempts) {
-                if let Some(hop) = pkt.decision.resolution.next_hop {
-                    let key = (pkt.decision.resolution.egress_ifindex, hop);
-                    if probed_this_sweep.contains(&key) {
-                        // Another pkt for this (egress, hop) already
-                        // fired the probe this sweep. Advance this
-                        // pkt's schedule so it doesn't busy-loop on
-                        // the same slot next sweep.
-                        pkt.probe_attempts = pkt.probe_attempts.saturating_add(1);
-                    } else if let Some(name) = forwarding.ifindex_to_name.get(&key.0) {
-                        // First pkt for this (egress, hop) AND iface
-                        // resolves → fire the probe, mark the slot
-                        // consumed for the rest of this sweep, and
-                        // advance this pkt's schedule.
-                        trigger_kernel_arp_probe(name, hop);
-                        probed_this_sweep.insert(key);
-                        pkt.probe_attempts = pkt.probe_attempts.saturating_add(1);
+            // Still pending — re-fire the ARP/NDP probe if the next slot in
+            // the exponential schedule is due (GEMINI-NEXT.md Section 3
+            // cold-start). One entry per (egress_ifindex, next_hop) means at
+            // most one probe per hop per sweep with no extra dedup. Advance
+            // probe_attempts in place so each schedule slot fires once.
+            if probe_due(now_ns.saturating_sub(queued_ns), probe_attempts) {
+                if let Some(name) = forwarding.ifindex_to_name.get(&key.0) {
+                    trigger_kernel_arp_probe(name, key.1);
+                    if let Some(p) = binding.pending_neigh.get_mut(&key) {
+                        p.probe_attempts = p.probe_attempts.saturating_add(1);
                     }
-                    // else: not yet probed AND iface lookup miss → no
-                    // probe fires, key NOT inserted, probe_attempts
-                    // NOT advanced. Subsequent same-key pkts will
-                    // also fall here, and the whole batch retries
-                    // this slot next sweep.
                 }
-                // else: no next_hop → cannot probe; do not advance.
+                // else: iface lookup miss → no probe fires, probe_attempts
+                // NOT advanced; the key retries this slot next sweep.
             }
-            binding.pending_neigh.push_back(pkt);
             continue;
         };
         // #1772: the neighbor is now usable — record the pending-neigh
@@ -203,8 +157,14 @@ pub(super) fn retry_pending_neigh(
         // (not after the subsequent rare cos/slice/target early-outs) so
         // it measures resolution latency rather than dispatch success.
         if let Some(resolver) = neighbor_resolver {
-            resolver.record_pending_dwell(now_ns.saturating_sub(pkt.queued_ns));
+            resolver.record_pending_dwell(now_ns.saturating_sub(queued_ns));
         }
+        // Own the packet (removes it from the map) so the dispatch tail can
+        // borrow `&mut binding` freely.
+        let pkt = binding
+            .pending_neigh
+            .remove(&key)
+            .expect("key from this map");
         let mut decision = pkt.decision;
         decision.resolution.neighbor_mac = Some(neighbor_mac);
         decision.resolution.disposition = ForwardingDisposition::ForwardCandidate;
@@ -410,6 +370,26 @@ mod mirror_tests {
     use crate::afxdp::tx::test_support::{build_ipv4_test_packet, test_session_key};
     use std::sync::atomic::Ordering;
 
+    /// #1771 §2.2: `pending_neigh` is keyed by `(egress_ifindex, next_hop)`.
+    /// Test helper that buffers one packet under its derived key, preserving
+    /// the old `push_back`-one-packet ergonomics for the retry-sweep tests.
+    ///
+    /// NOTE: this is single-entry seeding — it `insert`s (last-write-wins),
+    /// NOT the production admission keep-oldest+recycle-duplicate semantics
+    /// (poll_descriptor). Every test here seeds one packet per distinct key,
+    /// so the distinction never bites; do not reuse this to model duplicate
+    /// admission.
+    fn push_pending(b: &mut BindingWorker, pkt: PendingNeighPacket) {
+        let key = (
+            pkt.decision.resolution.egress_ifindex,
+            pkt.decision
+                .resolution
+                .next_hop
+                .expect("test pending pkt has a next_hop"),
+        );
+        b.pending_neigh.insert(key, pkt);
+    }
+
     fn resolved_neighbor_decision(next_hop: IpAddr) -> SessionDecision {
         SessionDecision {
             resolution: ForwardingResolution {
@@ -458,7 +438,7 @@ mod mirror_tests {
 
         let next_hop = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
         let meta = pending_neighbor_meta(original_frame.len());
-        bindings[0].pending_neigh.push_back(PendingNeighPacket {
+        push_pending(&mut bindings[0], PendingNeighPacket {
             addr: 0,
             desc: XdpDesc {
                 addr: 0,
@@ -568,7 +548,7 @@ mod mirror_tests {
 
         let next_hop = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 137));
         let meta = pending_neighbor_meta(original_frame.len());
-        bindings[0].pending_neigh.push_back(PendingNeighPacket {
+        push_pending(&mut bindings[0], PendingNeighPacket {
             addr: 0,
             desc: XdpDesc {
                 addr: 0,
@@ -687,7 +667,7 @@ mod mirror_tests {
         // the real dispatch path with the correct sum + bucket.
         let queued_ns = 1_000_000u64;
         let dwell_ns = 500_000_000u64; // 500 ms
-        bindings[0].pending_neigh.push_back(PendingNeighPacket {
+        push_pending(&mut bindings[0], PendingNeighPacket {
             addr: 0,
             desc: XdpDesc {
                 addr: 0,
@@ -772,7 +752,7 @@ mod mirror_tests {
 
         let next_hop = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 138));
         let meta = pending_neighbor_meta(original_frame.len());
-        bindings[0].pending_neigh.push_back(PendingNeighPacket {
+        push_pending(&mut bindings[0], PendingNeighPacket {
             addr: 0,
             desc: XdpDesc {
                 addr: 0,
@@ -910,82 +890,15 @@ mod cold_start_probe_schedule_tests {
         );
     }
 
-    /// Pure-function model of the per-sweep dedup logic in
-    /// `retry_pending_neigh`'s still-pending branch. Mirrors the
-    /// real code path closely enough to test burst-coalescing
-    /// behavior — including the ifindex-miss path — without spinning
-    /// up a full `BindingWorker`.
-    ///
-    /// Returns (probes_fired, attempts_advanced).
-    fn simulate_sweep_for_neighbor(
-        packets_for_same_neigh: u32,
-        slot_idx: u8,
-        iface_resolves: bool,
-    ) -> (u32, u32) {
-        let mut probed: std::collections::BTreeSet<(i32, std::net::IpAddr)> =
-            std::collections::BTreeSet::new();
-        let mut probes_fired = 0u32;
-        let mut attempts_advanced = 0u32;
-        let key: (i32, std::net::IpAddr) = (
-            42,
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
-        );
-        let elapsed = PROBE_SCHEDULE_NS[slot_idx as usize];
-        for _ in 0..packets_for_same_neigh {
-            if probe_due(elapsed, slot_idx) {
-                if probed.contains(&key) {
-                    // Slot consumed by an earlier pkt this sweep.
-                    attempts_advanced += 1;
-                } else if iface_resolves {
-                    // First pkt + iface resolves → fire + mark + advance.
-                    probes_fired += 1;
-                    probed.insert(key);
-                    attempts_advanced += 1;
-                }
-                // else: iface miss + not yet probed → drop through,
-                // no probe, no insert, no advance.
-            }
-        }
-        (probes_fired, attempts_advanced)
-    }
-
-    #[test]
-    fn dedup_emits_one_probe_per_neighbor_per_slot() {
-        // 50 packets queued for the same (egress_ifindex, next_hop)
-        // must produce exactly ONE probe per schedule slot. All 50
-        // pkts still advance their probe_attempts so they don't
-        // re-trigger the same slot next sweep.
-        let (fired, advanced) = simulate_sweep_for_neighbor(50, 0, true);
-        assert_eq!(
-            fired, 1,
-            "expected 1 probe for 50 same-neighbor packets, got {fired}",
-        );
-        assert_eq!(advanced, 50, "all 50 pkts must advance probe_attempts");
-    }
-
-    #[test]
-    fn dedup_holds_across_all_schedule_slots() {
-        // Same dedup property for every slot, not just slot 0.
-        for slot in 0..(PROBE_SCHEDULE_NS.len() as u8) {
-            let (fired, _) = simulate_sweep_for_neighbor(8, slot, true);
-            assert_eq!(fired, 1, "slot {slot}: expected 1 probe, got {fired}",);
-        }
-    }
-
-    #[test]
-    fn iface_miss_does_not_burn_slot_for_any_packet() {
-        // When ifindex_to_name lookup fails (e.g. iface flapped),
-        // NONE of the queued packets should consume their schedule
-        // slot — every pkt must stay at the same probe_attempts so
-        // the next sweep can re-try once the iface is back. Earlier
-        // bug: first pkt inserted into dedup set then bailed,
-        // causing later pkts to think the slot was consumed by a
-        // probe that never fired.
-        let (fired, advanced) = simulate_sweep_for_neighbor(50, 0, false);
-        assert_eq!(fired, 0, "no probes when iface lookup fails");
-        assert_eq!(
-            advanced, 0,
-            "no pkt should advance probe_attempts on iface miss",
-        );
-    }
+    // #1771 §2.2: the former `simulate_sweep_for_neighbor` helper and its
+    // `dedup_emits_one_probe_*` / `iface_miss_*` tests modeled the OLD
+    // per-sweep BTreeSet probe-dedup over many packets sharing one
+    // `(egress_ifindex, next_hop)`. That dedup no longer exists: the keyed
+    // `pending_neigh` map holds exactly ONE entry per hop, so "one probe per
+    // neighbor per slot" is now a structural invariant rather than a
+    // runtime-deduped property. The probe schedule itself stays covered by
+    // the `PROBE_SCHEDULE_NS` / `probe_due` bound tests above, and the live
+    // sweep (incl. the iface-miss no-advance branch) by the
+    // `retry_pending_*` dispatch tests in `mirror_tests`. Removed rather than
+    // left asserting impossible multi-packet-same-key state (Codex r2).
 }

@@ -625,9 +625,60 @@ pub(super) fn neigh_monitor_thread(
     }
     eprintln!("neigh_monitor: listening for kernel neighbor events");
     let mut buf = vec![0u8; 8192];
+    // #1771 §2.5: throttle state for the ENOBUFS-triggered upsert re-dump.
+    let mut last_redump_ns: u64 = 0;
+    let mut redump_seq: u32 = 1000;
     while !stop.load(Ordering::Relaxed) {
         let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
-        if n <= 0 {
+        if n < 0 {
+            // #1771 §2.5: distinguish ENOBUFS (the kernel dropped neighbor
+            // multicast notifications on rcvbuf overflow — the silent
+            // desync this fixes) from the benign SO_RCVTIMEO timeout.
+            match io::Error::last_os_error().raw_os_error() {
+                Some(libc::ENOBUFS) => {
+                    // Lost RTM_{NEW,DEL}NEIGH leave dynamic_neighbors
+                    // desynced (a dropped good NEWNEIGH blackholes a dst
+                    // until its next per-key event). Recover with a THROTTLED
+                    // family re-dump whose GETNEIGH replies flow through the
+                    // same parse path below: RTM_NEWNEIGH → insert, and a
+                    // kernel-reported NUD_FAILED/INCOMPLETE → the existing
+                    // #1769 immediate-revocation (correct — a dead neighbor
+                    // SHOULD be removed). Crucially this is NOT a
+                    // replacement/reconciling dump: it NEVER deletes an entry
+                    // merely because it is ABSENT from the dump, so the
+                    // RX-learned + manager-populated entries that also feed
+                    // dynamic_neighbors survive (the Codex r2 "no absent-key
+                    // eviction" requirement). The 5s throttle bounds RTNL
+                    // contention if ENOBUFS recurs (AGY F2). The single-key
+                    // on-demand GET path is NOT this dump path.
+                    let now = monotonic_nanos();
+                    if now.saturating_sub(last_redump_ns) > 5_000_000_000 {
+                        last_redump_ns = now;
+                        redump_seq = redump_seq.wrapping_add(1);
+                        let v4 = request_neighbor_dump(fd, libc::AF_INET as u8, redump_seq);
+                        redump_seq = redump_seq.wrapping_add(1);
+                        let v6 = request_neighbor_dump(fd, libc::AF_INET6 as u8, redump_seq);
+                        match (&v4, &v6) {
+                            (Ok(_), Ok(_)) => eprintln!(
+                                "neigh_monitor: ENOBUFS — throttled re-dump (v4+v6) issued"
+                            ),
+                            _ => eprintln!(
+                                "neigh_monitor: ENOBUFS — re-dump request failed (v4={v4:?} v6={v6:?})"
+                            ),
+                        }
+                    }
+                }
+                // SO_RCVTIMEO periodic stop-check timeout — normal, not an
+                // error. (EAGAIN == EWOULDBLOCK on Linux; the catch-all below
+                // covers the alias without an unreachable-pattern warning.)
+                Some(libc::EAGAIN) => {}
+                // Any other recv error: skip this read and keep listening.
+                _ => {}
+            }
+            continue;
+        }
+        if n == 0 {
+            // EOF on a netlink socket shouldn't happen; treat as a skip.
             continue;
         }
         // #1769 epoch-guard ordering: bump the generation with `Release`

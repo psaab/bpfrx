@@ -2174,11 +2174,14 @@ pub(super) fn poll_binding_process_descriptor(
                                 if let Some(next_hop) = decision.resolution.next_hop {
                                     // Only spawn ping if we don't already have a
                                     // pending probe for this (ifindex, hop).
-                                    let already_probing = binding.pending_neigh.iter().any(|p| {
-                                        p.decision.resolution.egress_ifindex
-                                            == decision.resolution.egress_ifindex
-                                            && p.decision.resolution.next_hop == Some(next_hop)
-                                    });
+                                    // #1771 §2.2: pending_neigh is keyed by
+                                    // (egress_ifindex, next_hop), so the
+                                    // "already probing this hop" dedup is a
+                                    // direct contains_key (was an O(n) iter scan).
+                                    let already_probing = binding.pending_neigh.contains_key(&(
+                                        decision.resolution.egress_ifindex,
+                                        next_hop,
+                                    ));
                                     if !already_probing {
                                         let iface_name = worker_ctx.forwarding
                                             .ifindex_to_name
@@ -2415,24 +2418,43 @@ pub(super) fn poll_binding_process_descriptor(
                                 // kernel ARP resolution via XDP_PASS breaks VLAN demux
                                 // in zero-copy mode (mlx5). The ICMP probe + netlink
                                 // monitor + buffer-retry path bypasses this issue.
-                                if binding.pending_neigh.len() < MAX_PENDING_NEIGH {
-                                    let pending_flow_key = flow
-                                        .as_ref()
-                                        .map(|flow| flow.forward_key.clone())
-                                        .or_else(|| {
-                                            parse_session_flow_from_meta(meta)
-                                                .map(|flow| flow.forward_key)
-                                        });
-                                    binding.pending_neigh.push_back(PendingNeighPacket {
-                                        addr: desc.addr,
-                                        desc,
-                                        meta,
-                                        decision: pending_decision,
-                                        flow_key: pending_flow_key,
-                                        queued_ns: now_ns,
-                                        probe_attempts: 0,
-                                    });
-                                    recycle_now = false;
+                                // #1771 §2.2: buffer one representative packet
+                                // per (egress_ifindex, next_hop). Keep the
+                                // OLDEST (it drives the probe/dwell clock):
+                                // a duplicate for an already-buffered hop is
+                                // dropped+recycled (recycle_now stays true),
+                                // pinning ≤1 UMEM frame per unresolved hop.
+                                // A packet with no next_hop cannot be keyed or
+                                // resolved (the retry sweep needs next_hop to
+                                // look up a MAC), so it is not buffered —
+                                // recycled instead of held until timeout.
+                                if let Some(hop) = pending_decision.resolution.next_hop {
+                                    let pending_key =
+                                        (pending_decision.resolution.egress_ifindex, hop);
+                                    if !binding.pending_neigh.contains_key(&pending_key)
+                                        && binding.pending_neigh.len() < MAX_PENDING_NEIGH
+                                    {
+                                        let pending_flow_key = flow
+                                            .as_ref()
+                                            .map(|flow| flow.forward_key.clone())
+                                            .or_else(|| {
+                                                parse_session_flow_from_meta(meta)
+                                                    .map(|flow| flow.forward_key)
+                                            });
+                                        binding.pending_neigh.insert(
+                                            pending_key,
+                                            PendingNeighPacket {
+                                                addr: desc.addr,
+                                                desc,
+                                                meta,
+                                                decision: pending_decision,
+                                                flow_key: pending_flow_key,
+                                                queued_ns: now_ns,
+                                                probe_attempts: 0,
+                                            },
+                                        );
+                                        recycle_now = false;
+                                    }
                                 }
                                 if cfg!(feature = "debug-log") {
                                     if telemetry.dbg.missing_neigh <= 3 {
