@@ -123,7 +123,18 @@ pub(crate) struct BindingWorker {
     pub(crate) scratch: WorkerScratch,
     /// Packets waiting for neighbor resolution. The UMEM frame is held
     /// (not recycled) until the neighbor resolves or the entry times out.
-    pub(crate) pending_neigh: VecDeque<PendingNeighPacket>,
+    ///
+    /// #1771 §2.2: keyed by `(egress_ifindex, next_hop)` — **one
+    /// representative packet per unresolved next-hop**, not a FIFO of every
+    /// admitted packet. Admission keeps the OLDEST packet for a key (it
+    /// drives the probe/dwell clock) and drops+recycles duplicates, so a
+    /// SYN flood to one dead host pins ≤1 UMEM frame for that host instead
+    /// of up to `MAX_PENDING_NEIGH`. The cap now bounds distinct unresolved
+    /// next-hops per worker (not total packets). Same key shape as
+    /// `neg_neigh_cache` / `resolver_enqueue_throttle`. Worker-owned, no
+    /// cross-core sync; lazy allocation.
+    pub(crate) pending_neigh:
+        super::types::FastMap<(i32, std::net::IpAddr), PendingNeighPacket>,
     /// #1651 B3: dead-host negative neighbor cache. Key
     /// `(egress_ifindex, next_hop)`; value = insertion `now_ns`. A dst is
     /// recorded when it times out in `pending_neigh` without resolving;
@@ -424,7 +435,7 @@ impl BindingWorker {
             // up front would burn ~576 KB per binding at startup even when
             // idle. Start at 0 capacity and let VecDeque grow on push as
             // packets actually queue up.
-            pending_neigh: VecDeque::new(),
+            pending_neigh: super::types::FastMap::default(),
             // #1651 B3: lazy-grow (empty until first dead-host drop).
             neg_neigh_cache: super::neg_neigh::NegNeighCache::default(),
             resolver_enqueue_throttle: super::types::FastMap::default(),
@@ -560,7 +571,7 @@ impl BindingWorker {
                 scratch_cross_binding_tx: Vec::with_capacity(RX_BATCH_SIZE as usize),
                 scratch_rst_teardowns: Vec::with_capacity(16),
             },
-            pending_neigh: VecDeque::new(),
+            pending_neigh: super::types::FastMap::default(),
             // #1651 B3: lazy-grow (empty until first dead-host drop).
             neg_neigh_cache: super::neg_neigh::NegNeighCache::default(),
             resolver_enqueue_throttle: super::types::FastMap::default(),
@@ -677,7 +688,7 @@ impl BindingWorker {
                 scratch_cross_binding_tx: Vec::with_capacity(RX_BATCH_SIZE as usize),
                 scratch_rst_teardowns: Vec::with_capacity(16),
             },
-            pending_neigh: VecDeque::new(),
+            pending_neigh: super::types::FastMap::default(),
             // #1651 B3: lazy-grow (empty until first dead-host drop).
             neg_neigh_cache: super::neg_neigh::NegNeighCache::default(),
             resolver_enqueue_throttle: super::types::FastMap::default(),
