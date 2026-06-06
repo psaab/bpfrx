@@ -73,20 +73,6 @@ pub(super) fn retry_pending_neigh(
     if let Some(resolver) = neighbor_resolver {
         resolver.observe_pending_depth(binding.pending_neigh.len() as u64);
     }
-    // GEMINI-NEXT.md Section 3 cold start: in-place pop_front/push_back
-    // rotation. The previous version did `binding.pending_neigh.remove(i)`
-    // inside a while-i-loop, which is O(n) per removal — scaled O(n²) in
-    // the queue depth. With MAX_PENDING_NEIGH bumped to 4096 (was 64), the
-    // quadratic cost becomes a real fairness hazard during connection
-    // bursts; even at the 64-cap it was wasteful relative to the cap.
-    //
-    // We pop exactly the snapshotted-len items off the front and either
-    // (a) drop the packet (recycle frame), (b) push it back on the SAME
-    // VecDeque (FIFO order preserved for retained items), or (c) dispatch
-    // it. Items pushed back go to the tail and are NOT re-visited in this
-    // sweep because we iterate exactly `pending_len` times. Reusing the
-    // existing backing buffer avoids per-sweep alloc/free churn that the
-    // earlier `mem::take` + `reserve` draft would have introduced.
     let ingress_slot = binding.slot;
     let ingress_ifindex = binding.ifindex;
     let ingress_queue = binding.queue_id;
@@ -387,6 +373,12 @@ mod mirror_tests {
     /// #1771 §2.2: `pending_neigh` is keyed by `(egress_ifindex, next_hop)`.
     /// Test helper that buffers one packet under its derived key, preserving
     /// the old `push_back`-one-packet ergonomics for the retry-sweep tests.
+    ///
+    /// NOTE: this is single-entry seeding — it `insert`s (last-write-wins),
+    /// NOT the production admission keep-oldest+recycle-duplicate semantics
+    /// (poll_descriptor). Every test here seeds one packet per distinct key,
+    /// so the distinction never bites; do not reuse this to model duplicate
+    /// admission.
     fn push_pending(b: &mut BindingWorker, pkt: PendingNeighPacket) {
         let key = (
             pkt.decision.resolution.egress_ifindex,
@@ -898,82 +890,15 @@ mod cold_start_probe_schedule_tests {
         );
     }
 
-    /// Pure-function model of the per-sweep dedup logic in
-    /// `retry_pending_neigh`'s still-pending branch. Mirrors the
-    /// real code path closely enough to test burst-coalescing
-    /// behavior — including the ifindex-miss path — without spinning
-    /// up a full `BindingWorker`.
-    ///
-    /// Returns (probes_fired, attempts_advanced).
-    fn simulate_sweep_for_neighbor(
-        packets_for_same_neigh: u32,
-        slot_idx: u8,
-        iface_resolves: bool,
-    ) -> (u32, u32) {
-        let mut probed: std::collections::BTreeSet<(i32, std::net::IpAddr)> =
-            std::collections::BTreeSet::new();
-        let mut probes_fired = 0u32;
-        let mut attempts_advanced = 0u32;
-        let key: (i32, std::net::IpAddr) = (
-            42,
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
-        );
-        let elapsed = PROBE_SCHEDULE_NS[slot_idx as usize];
-        for _ in 0..packets_for_same_neigh {
-            if probe_due(elapsed, slot_idx) {
-                if probed.contains(&key) {
-                    // Slot consumed by an earlier pkt this sweep.
-                    attempts_advanced += 1;
-                } else if iface_resolves {
-                    // First pkt + iface resolves → fire + mark + advance.
-                    probes_fired += 1;
-                    probed.insert(key);
-                    attempts_advanced += 1;
-                }
-                // else: iface miss + not yet probed → drop through,
-                // no probe, no insert, no advance.
-            }
-        }
-        (probes_fired, attempts_advanced)
-    }
-
-    #[test]
-    fn dedup_emits_one_probe_per_neighbor_per_slot() {
-        // 50 packets queued for the same (egress_ifindex, next_hop)
-        // must produce exactly ONE probe per schedule slot. All 50
-        // pkts still advance their probe_attempts so they don't
-        // re-trigger the same slot next sweep.
-        let (fired, advanced) = simulate_sweep_for_neighbor(50, 0, true);
-        assert_eq!(
-            fired, 1,
-            "expected 1 probe for 50 same-neighbor packets, got {fired}",
-        );
-        assert_eq!(advanced, 50, "all 50 pkts must advance probe_attempts");
-    }
-
-    #[test]
-    fn dedup_holds_across_all_schedule_slots() {
-        // Same dedup property for every slot, not just slot 0.
-        for slot in 0..(PROBE_SCHEDULE_NS.len() as u8) {
-            let (fired, _) = simulate_sweep_for_neighbor(8, slot, true);
-            assert_eq!(fired, 1, "slot {slot}: expected 1 probe, got {fired}",);
-        }
-    }
-
-    #[test]
-    fn iface_miss_does_not_burn_slot_for_any_packet() {
-        // When ifindex_to_name lookup fails (e.g. iface flapped),
-        // NONE of the queued packets should consume their schedule
-        // slot — every pkt must stay at the same probe_attempts so
-        // the next sweep can re-try once the iface is back. Earlier
-        // bug: first pkt inserted into dedup set then bailed,
-        // causing later pkts to think the slot was consumed by a
-        // probe that never fired.
-        let (fired, advanced) = simulate_sweep_for_neighbor(50, 0, false);
-        assert_eq!(fired, 0, "no probes when iface lookup fails");
-        assert_eq!(
-            advanced, 0,
-            "no pkt should advance probe_attempts on iface miss",
-        );
-    }
+    // #1771 §2.2: the former `simulate_sweep_for_neighbor` helper and its
+    // `dedup_emits_one_probe_*` / `iface_miss_*` tests modeled the OLD
+    // per-sweep BTreeSet probe-dedup over many packets sharing one
+    // `(egress_ifindex, next_hop)`. That dedup no longer exists: the keyed
+    // `pending_neigh` map holds exactly ONE entry per hop, so "one probe per
+    // neighbor per slot" is now a structural invariant rather than a
+    // runtime-deduped property. The probe schedule itself stays covered by
+    // the `PROBE_SCHEDULE_NS` / `probe_due` bound tests above, and the live
+    // sweep (incl. the iface-miss no-advance branch) by the
+    // `retry_pending_*` dispatch tests in `mirror_tests`. Removed rather than
+    // left asserting impossible multi-packet-same-key state (Codex r2).
 }

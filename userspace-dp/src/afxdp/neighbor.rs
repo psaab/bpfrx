@@ -638,26 +638,34 @@ pub(super) fn neigh_monitor_thread(
                 Some(libc::ENOBUFS) => {
                     // Lost RTM_{NEW,DEL}NEIGH leave dynamic_neighbors
                     // desynced (a dropped good NEWNEIGH blackholes a dst
-                    // until its next per-key event). Recover with a
-                    // THROTTLED, UPSERT-ONLY family re-dump: the GETNEIGH
-                    // dump replies are RTM_NEWNEIGH messages that the same
-                    // parse path below upserts — re-learning missing entries
-                    // with NO eviction. dynamic_neighbors is also RX-learned
-                    // + manager-populated, so a kernel dump must never delete
-                    // non-kernel entries (Codex r2-1); upsert does not. The
-                    // 5s throttle bounds RTNL contention if ENOBUFS recurs
-                    // (AGY F2). The single-key on-demand GET path is NOT this
-                    // dump path.
+                    // until its next per-key event). Recover with a THROTTLED
+                    // family re-dump whose GETNEIGH replies flow through the
+                    // same parse path below: RTM_NEWNEIGH → insert, and a
+                    // kernel-reported NUD_FAILED/INCOMPLETE → the existing
+                    // #1769 immediate-revocation (correct — a dead neighbor
+                    // SHOULD be removed). Crucially this is NOT a
+                    // replacement/reconciling dump: it NEVER deletes an entry
+                    // merely because it is ABSENT from the dump, so the
+                    // RX-learned + manager-populated entries that also feed
+                    // dynamic_neighbors survive (the Codex r2 "no absent-key
+                    // eviction" requirement). The 5s throttle bounds RTNL
+                    // contention if ENOBUFS recurs (AGY F2). The single-key
+                    // on-demand GET path is NOT this dump path.
                     let now = monotonic_nanos();
                     if now.saturating_sub(last_redump_ns) > 5_000_000_000 {
                         last_redump_ns = now;
                         redump_seq = redump_seq.wrapping_add(1);
-                        let _ = request_neighbor_dump(fd, libc::AF_INET as u8, redump_seq);
+                        let v4 = request_neighbor_dump(fd, libc::AF_INET as u8, redump_seq);
                         redump_seq = redump_seq.wrapping_add(1);
-                        let _ = request_neighbor_dump(fd, libc::AF_INET6 as u8, redump_seq);
-                        eprintln!(
-                            "neigh_monitor: ENOBUFS — throttled upsert re-dump (v4+v6) issued"
-                        );
+                        let v6 = request_neighbor_dump(fd, libc::AF_INET6 as u8, redump_seq);
+                        match (&v4, &v6) {
+                            (Ok(_), Ok(_)) => eprintln!(
+                                "neigh_monitor: ENOBUFS — throttled re-dump (v4+v6) issued"
+                            ),
+                            _ => eprintln!(
+                                "neigh_monitor: ENOBUFS — re-dump request failed (v4={v4:?} v6={v6:?})"
+                            ),
+                        }
                     }
                 }
                 // SO_RCVTIMEO periodic stop-check timeout — normal, not an
