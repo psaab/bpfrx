@@ -4635,3 +4635,7 @@ top.
   tests/fixtures/protocol_wire_v1.json, pkg/dataplane/userspace/{protocol,buffersfmt}.go,
   pkg/api/{metrics,metrics_descriptors,metrics_userspace}.go,
   docs/userspace-cold-start-resolution.md, docs/pr/1772-neighbor-latency-metrics/plan.md.
+
+- **Timestamp**: 2026-06-06
+  **Action**: #1771 plan v2 — address round-1's 8 convergent PLAN-NEEDS-MAJOR findings (co-located per-key epoch dissolves separate-map race/lock-order; UMEM-wording fix; two-clock backoff; replacement ENOBUFS re-dump; Path B measurement-gated §2.1; named differential/property/churn tests)
+  **File(s)**: docs/research/1771-per-key-resolver/plan.md, reviewer-ids.md
