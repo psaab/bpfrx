@@ -16,3 +16,6 @@
 - AGY r2: adversarial-review-mq20hlfv-21p9yx — PLAN-NEEDS-MAJOR → Path B highly recommended
 - Claude SMR r2: claude-smr-plan-r2.md — PLAN-NEEDS-MINOR
 - v3 folds: §2.5 upsert-only (kernel-ownership fix), §2.3 correction, §2.1 global-monotonic-epoch + reject-on-absent + age-discard + incremental GC + API audit, test seams
+- Codex r3: task-mq21criq-e26xuy
+- AGY r3: adversarial-review-mq21crt9-nwiust
+- Claude SMR r3: claude-smr-plan-r3.md (PLAN-READY Phases 1-3; §2.1 gated)
