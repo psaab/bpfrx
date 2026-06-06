@@ -3,11 +3,12 @@
 Research and implementation plan for the full §10a redesign, building on
 top of the #1769 threaded resolver already in master.
 
-**Status:** DRAFT v3 — round-2 3-way review converged on **Path B**
-(Codex PLAN-NEEDS-MAJOR, AGY PLAN-NEEDS-MAJOR→Path B, Claude SMR
-NEEDS-MINOR). v3 locks Path B as the plan, simplifies §2.5 to upsert-only
-(removes the kernel-ownership defect), corrects §2.3, and hardens the
-gated §2.1. See §0.1. Pending round-3 review of Phases 1–3.
+**Status:** v3.1 — **round-3: Phases 1–3 PLAN-READY** (Codex
+PLAN-NEEDS-MINOR doc-scrub-only, AGY PLAN-READY, Claude SMR PLAN-READY).
+§2.1/Phase-4 stays **gated**; round-3 refined its absent-slot rule (allow
+confirm when `epoch_before==0`, reject otherwise — a blanket reject broke
+new-key resolution, Codex 1 / AGY 2). v3.1 applies the round-3 doc scrubs
+(upsert-only headings) + the §2.1 fix. Phases 1–3 are the shippable scope.
 **Branch:** `research/1771-per-key-resolver`
 **Issue:** #1771
 **Follows:** #1769 (merged), #1770 (merged), #1772 (merged), #1773 (merged)
@@ -48,7 +49,7 @@ correctness fix. v3 makes that the plan. Round-2 findings and disposition:
 | **§2.5 wrongly treats `dynamic_neighbors` as kernel-owned** — it is also RX-learned (`neighbor_dispatch.rs:315`) and manager-populated (`coordinator/mod.rs:151`); a replacement/evicting dump deletes valid non-kernel entries (Codex 1). | **§2.5 simplified to UPSERT-ONLY re-dump.** The documented D4 desync (#1771 body) is a *lost RTM_NEWNEIGH* = a **missing** good entry — re-adding what the kernel currently has fixes it with no eviction. Stale-entry eviction (lost-DELNEIGH) is **deferred** (needs per-slot source-tagging) — its own scope. This also dissolves the §2.5 TOCTOU (Claude SMR) and the `with_all_shards` I/O-under-lock risk (AGY E): upsert uses the normal per-key sharded insert with bump-first ordering, no all-shard lock. |
 | **§2.3 "two clocks never drive the same syscall" is FALSE** — the resolver itself calls `trigger_kernel_arp_probe()` on stale/failed/no-reply (`neighbor_resolver.rs:700`) (Codex 4). | §2.3 corrected below: both paths can drive kernel probes; extending resolver backoff *intentionally reduces* aggregate kernel-probe cadence for permanently-dead keys. Due-key state must retain `iface_name` (Codex 4). |
 | **No existing GC sweep on the neighbor map** (my "existing `with_all_shards` sweep" was fictional) and `with_all_shards` is stop-the-world (AGY C). | §2.1 (gated) now specifies an **incremental, one-shard-at-a-time** tombstone GC — never `with_all_shards`. |
-| **§2.1 tombstone-GC stale-MAC resurrection** — queue depth 4096 × 200 ms recv = up to 13.6 min GET latency vs 60 s TTL; a GC'd tombstone lets `epoch_before==0` match a fresh absent slot (AGY B; Claude SMR MAJOR; Codex 5 "GC must not erase a tombstone that can still invalidate"). | §2.1 (gated) folds **both** fixes: (a) epochs drawn from a **process-global monotonic counter** (never reused post-GC) + **reject confirmed-insert on an absent slot**; (b) `ResolveItem` carries `enqueued_ns` and the resolver **discards an item older than `TTL − 2 s`** before issuing the confirm. Either alone closes it; both = belt-and-suspenders. |
+| **§2.1 tombstone-GC stale-MAC resurrection** — queue depth 4096 × 200 ms recv = up to 13.6 min GET latency vs 60 s TTL; a GC'd tombstone lets `epoch_before==0` match a fresh absent slot (AGY B; Claude SMR MAJOR; Codex 5 "GC must not erase a tombstone that can still invalidate"). | §2.1 (gated) folds **both** fixes: (a) epochs from a **process-global monotonic counter** (never reused post-GC) + confirmed-insert on an absent slot allowed ONLY when `epoch_before==0` (else reject — a blanket reject broke new-key resolution, refined round-3); (b) `ResolveItem` carries `enqueued_ns` and the resolver **discards an item older than `TTL − 2 s`** before issuing the confirm. Either alone closes it; both = belt-and-suspenders. |
 | **§2.1 value-type surgery under-specified across APIs** — `get/contains_key/len/is_empty/with_all_shards/total_len` all assume "present ⇒ live"; tombstones must be invisible (Codex 2). | §2.1 (gated) adds an explicit API-audit checklist: every accessor filters `entry.is_some()`; status counts, manager replace, Go-facing status, and tests must not see tombstones. |
 | **§2.3 due-key scan starves under load** — only firing in the `recv_timeout` Timeout arm misses wakeups during continuous traffic (AGY D). | §2.3 corrected: the due-key check runs on **every loop iteration** gated by a monotonic `now − last_check ≥ 500 ms`, not only on the timeout arm. |
 | **Tests not convincingly runnable** — no proptest dep, no injectable recv/dump seam, failover script has no churn option (Codex 7). | §6 updated: add a hand-rolled differential harness (no new dep) OR add `proptest` dev-dep; introduce an injectable `recv`/`dump` seam trait for ENOBUFS tests; add a `--neigh-churn` option to `userspace-ha-failover-validation.sh`. |
@@ -174,14 +175,24 @@ is GC'd at 60 s, and the late confirmed insert sees an absent slot with
    `slot.epoch = GLOBAL_NEIGH_EPOCH.fetch_add(1, Release)`. A snapshot of
    value `N` can never equal any *future* slot's epoch, so GC-then-recreate
    cannot collide with an old snapshot.
-2. **Confirmed-insert REJECTS on an absent slot** — drop the "create if
-   absent with `epoch = epoch_before`" branch entirely for the confirm
-   path. You cannot prove a MAC unchanged against a slot that no longer
-   exists. (An absent slot at confirm time ⇒ the key was never seen, or was
-   GC'd ⇒ re-resolve, don't trust the snapshot.)
+2. **Confirmed-insert on an absent slot is allowed ONLY when
+   `epoch_before == 0`** (round-3 Codex 1 + AGY 2 correction). v3's first
+   draft said "reject on absent" outright — but that **breaks legitimate
+   new-key resolution**: a brand-new never-slotted next-hop snapshots
+   `epoch_before = 0`, the GET succeeds, and a blanket absent-reject would
+   loop "re-resolve" forever (the key is never inserted). The correct rule:
+   absent slot + `epoch_before == 0` ⇒ **insert** (creating the slot);
+   absent slot + `epoch_before != 0` ⇒ **reject** (the slot existed and was
+   GC'd/removed since the snapshot — don't trust it). This is safe because
+   of (3): an item older than `TTL − 2 s` is discarded, so it is
+   *mathematically impossible* for a slot to be created → tombstoned → GC'd
+   within a single in-flight request's lifetime (GC TTL 60 s ≫ GET timeout
+   200 ms). So an `epoch_before == 0` confirm on an absent slot can only be
+   a genuine first-resolution, never a resurrection.
 3. **`ResolveItem` carries `enqueued_ns`**; the resolver discards an item
-   older than `TOMBSTONE_TTL_NS − 2 s` before issuing the confirm (AGY B
-   mitigation). Belt-and-suspenders with (1)/(2).
+   older than `AGE_DISCARD_LIMIT_NS` (= `TOMBSTONE_TTL_NS − 2 s`,
+   programmatically derived from `TOMBSTONE_TTL_NS` to prevent drift — AGY
+   r3 minor) before issuing the confirm. This is what makes rule (2) safe.
 4. **Tombstone GC is incremental** — one shard at a time on a timer (reuse
    the `last_resolved` 5 min GC cadence), **never `with_all_shards`** (AGY
    C). Reap `entry.is_none() && now - last_change_ns > TOMBSTONE_TTL_NS`
@@ -306,7 +317,7 @@ If that invariant already holds on master unchanged, §2.4 reduces to a
 docs note in `docs/userspace-dataplane-architecture.md` + the regression
 test, and ships no runtime change.
 
-### 2.5 ENOBUFS Detection + Throttled Replacement Re-dump
+### 2.5 ENOBUFS Detection + Throttled Upsert-Only Re-dump
 
 **Current:** `neigh_monitor_thread` swallows `recv() <= 0`. No ENOBUFS
 detection; full dump only at startup.
@@ -429,7 +440,7 @@ epoch on master.
 - [ ] Update metric help text (`pending_max_depth` now = distinct next-hops)
 - [ ] Tests incl. SYN-flood-to-dead-host = 1 slot; #1772 dwell assertions intact
 
-### Phase 2: ENOBUFS Replacement Re-dump (§2.5)
+### Phase 2: ENOBUFS Upsert-Only Re-dump (§2.5)
 - [ ] ENOBUFS/EAGAIN/EOF match in `neigh_monitor_thread`
 - [ ] Throttled (5 s) **upsert-only** family re-dump via per-key sharded
       insert (bump-first) — NOT `with_all_shards`, no eviction
@@ -518,3 +529,13 @@ last and gates it; Phases 1–3 are independent and don't touch epoch state.
       symptom). v4 + v6.
 - [ ] `cargo test`, `make test` pass.
 - [ ] No regression on `userspace-perf-compare.sh`.
+
+## 0.2 Round-3 disposition (v3.1)
+
+Round-3 (Codex r3 + AGY r3 + Claude SMR r3) **converged: Phases 1–3 PLAN-READY.** v3.1 applies the only round-3 asks:
+- Doc scrubs: §2.5 + Phase-2 headings now say **Upsert-Only** (stale "Replacement" wording removed).
+- §2.1 (gated): the absent-slot confirm rule is refined — **allow when `epoch_before==0`** (genuine first resolution), reject otherwise. A blanket reject would loop new-key resolution forever (Codex r3-1, AGY r3-2); safe because the `AGE_DISCARD_LIMIT_NS = TOMBSTONE_TTL_NS − 2s` discard makes create→tombstone→GC within one in-flight request impossible.
+- §2.3 due-key wake implemented as a **bounded scheduler**, not an unbounded synchronous GET sweep (Codex r3).
+- `AGE_DISCARD_LIMIT_NS` derived programmatically from `TOMBSTONE_TTL_NS` (AGY r3 minor).
+
+Reviewer verdicts at convergence — Phases 1–3: Codex PLAN-NEEDS-MINOR (doc-scrub only, now applied) · AGY **PLAN-READY** · Claude SMR **PLAN-READY**. §2.1/Phase-4: gated; PLAN-READY-IF-MEASURED with the refined spec.

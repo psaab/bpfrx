@@ -19,3 +19,7 @@
 - Codex r3: task-mq21criq-e26xuy
 - AGY r3: adversarial-review-mq21crt9-nwiust
 - Claude SMR r3: claude-smr-plan-r3.md (PLAN-READY Phases 1-3; §2.1 gated)
+- Codex r3: task-mq21criq-e26xuy — Phase 1-3 NEEDS-MINOR (doc scrub); §2.1 NEEDS-MAJOR-when-built (reject-on-absent)
+- AGY r3: adversarial-review-mq21crt9-nwiust — Phase 1-3 PLAN-READY; §2.1 NEEDS-MINOR (absent-slot fix)
+- Claude SMR r3: PLAN-READY Phase 1-3
+- v3.1 @ converge: doc scrubs + §2.1 epoch_before==0 absent-allow + bounded due-key scheduler
