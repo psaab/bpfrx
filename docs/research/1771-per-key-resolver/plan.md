@@ -3,9 +3,11 @@
 Research and implementation plan for the full §10a redesign, building on
 top of the #1769 threaded resolver already in master.
 
-**Status:** DRAFT v2 — round-1 3-way review (Codex + AGY + Claude SMR) all
-returned PLAN-NEEDS-MAJOR (8 convergent findings); this revision addresses
-them. Pending round-2 adversarial review.
+**Status:** DRAFT v3 — round-2 3-way review converged on **Path B**
+(Codex PLAN-NEEDS-MAJOR, AGY PLAN-NEEDS-MAJOR→Path B, Claude SMR
+NEEDS-MINOR). v3 locks Path B as the plan, simplifies §2.5 to upsert-only
+(removes the kernel-ownership defect), corrects §2.3, and hardens the
+gated §2.1. See §0.1. Pending round-3 review of Phases 1–3.
 **Branch:** `research/1771-per-key-resolver`
 **Issue:** #1771
 **Follows:** #1769 (merged), #1770 (merged), #1772 (merged), #1773 (merged)
@@ -31,6 +33,31 @@ reviewers. The eight convergent findings and their v2 disposition:
 §2.4 ("Negative is a state") was flagged (Claude F6) as a conceptual rename
 with no acceptance criterion; v2 gives it a concrete behavioral criterion
 or demotes it to docs (§2.4).
+
+---
+
+## 0.1 Round-2 disposition (v3 changes)
+
+All three reviewers converged on **Path B**: ship §2.2 (pending bound),
+§2.5 (ENOBUFS re-dump), §2.6 (counters) now; **gate §2.1 on the measured
+`epoch_rejects` rate** and treat it as a risky optimization, not a
+correctness fix. v3 makes that the plan. Round-2 findings and disposition:
+
+| r2 finding (reviewer) | v3 disposition |
+|---|---|
+| **§2.5 wrongly treats `dynamic_neighbors` as kernel-owned** — it is also RX-learned (`neighbor_dispatch.rs:315`) and manager-populated (`coordinator/mod.rs:151`); a replacement/evicting dump deletes valid non-kernel entries (Codex 1). | **§2.5 simplified to UPSERT-ONLY re-dump.** The documented D4 desync (#1771 body) is a *lost RTM_NEWNEIGH* = a **missing** good entry — re-adding what the kernel currently has fixes it with no eviction. Stale-entry eviction (lost-DELNEIGH) is **deferred** (needs per-slot source-tagging) — its own scope. This also dissolves the §2.5 TOCTOU (Claude SMR) and the `with_all_shards` I/O-under-lock risk (AGY E): upsert uses the normal per-key sharded insert with bump-first ordering, no all-shard lock. |
+| **§2.3 "two clocks never drive the same syscall" is FALSE** — the resolver itself calls `trigger_kernel_arp_probe()` on stale/failed/no-reply (`neighbor_resolver.rs:700`) (Codex 4). | §2.3 corrected below: both paths can drive kernel probes; extending resolver backoff *intentionally reduces* aggregate kernel-probe cadence for permanently-dead keys. Due-key state must retain `iface_name` (Codex 4). |
+| **No existing GC sweep on the neighbor map** (my "existing `with_all_shards` sweep" was fictional) and `with_all_shards` is stop-the-world (AGY C). | §2.1 (gated) now specifies an **incremental, one-shard-at-a-time** tombstone GC — never `with_all_shards`. |
+| **§2.1 tombstone-GC stale-MAC resurrection** — queue depth 4096 × 200 ms recv = up to 13.6 min GET latency vs 60 s TTL; a GC'd tombstone lets `epoch_before==0` match a fresh absent slot (AGY B; Claude SMR MAJOR; Codex 5 "GC must not erase a tombstone that can still invalidate"). | §2.1 (gated) folds **both** fixes: (a) epochs drawn from a **process-global monotonic counter** (never reused post-GC) + **reject confirmed-insert on an absent slot**; (b) `ResolveItem` carries `enqueued_ns` and the resolver **discards an item older than `TTL − 2 s`** before issuing the confirm. Either alone closes it; both = belt-and-suspenders. |
+| **§2.1 value-type surgery under-specified across APIs** — `get/contains_key/len/is_empty/with_all_shards/total_len` all assume "present ⇒ live"; tombstones must be invisible (Codex 2). | §2.1 (gated) adds an explicit API-audit checklist: every accessor filters `entry.is_some()`; status counts, manager replace, Go-facing status, and tests must not see tombstones. |
+| **§2.3 due-key scan starves under load** — only firing in the `recv_timeout` Timeout arm misses wakeups during continuous traffic (AGY D). | §2.3 corrected: the due-key check runs on **every loop iteration** gated by a monotonic `now − last_check ≥ 500 ms`, not only on the timeout arm. |
+| **Tests not convincingly runnable** — no proptest dep, no injectable recv/dump seam, failover script has no churn option (Codex 7). | §6 updated: add a hand-rolled differential harness (no new dep) OR add `proptest` dev-dep; introduce an injectable `recv`/`dump` seam trait for ENOBUFS tests; add a `--neigh-churn` option to `userspace-ha-failover-validation.sh`. |
+| **§2.1 closes the round-1 absent-key race** with tombstones retained; GET timeout is 200 ms not ~1 s (Codex 5). | Confirmed; §2.1 states the invariant precisely (TTL > max send-to-confirm latency; GC must not erase a still-invalidating tombstone — satisfied by the global-monotonic-epoch + age-discard). |
+| §2.2 UMEM claim verified correct (Codex 6, AGY). | No change. |
+
+**Net:** Phases 1–3 (§2.2/§2.5-upsert/§2.6/§2.4) are the shippable plan and
+are now PLAN-READY-candidate. §2.1 (Phase 4) stays **gated on
+`epoch_rejects`** and, if built, must satisfy the hardened spec below.
 
 ---
 
@@ -131,13 +158,42 @@ shard lock:**
   section — structurally identical to today's global guard, just reading a
   per-slot field instead of the global atomic.
 
-**Cardinality bound (finding #3):** tombstones (`entry: None`) are reaped
-by the existing `with_all_shards` GC sweep once
-`now - last_change_ns > TOMBSTONE_TTL_NS` (proposed 60 s — long enough to
-outlive any in-flight GET, short enough to bound churn/scan growth). A
-reaped tombstone's epoch resets to absent; correctness still holds because
-a GET cannot be in flight 60 s (it is bounded by the resolver GET timeout
-of ~1 s).
+**Cardinality bound + GC-resurrection fix (v3 — supersedes v2; round-2
+AGY B/C, Codex 5, Claude SMR MAJOR).** v2 reaped tombstones via "the
+existing `with_all_shards` GC sweep" — but (AGY C) **there is no existing
+GC sweep on the neighbor map**, and `with_all_shards` is stop-the-world (it
+locks all 64 shards → dataplane latency spike). And (AGY B / Claude SMR) a
+per-key epoch that *resets to 0* on GC can resurrect a stale MAC: a GET
+delayed in the resolver queue (depth 4096 × 200 ms recv → up to ~13.6 min
+worst case) snapshots `epoch_before = 0`, the slot becomes a tombstone then
+is GC'd at 60 s, and the late confirmed insert sees an absent slot with
+`0 == 0` → inserts the stale MAC. v3 closes both:
+
+1. **Epochs are drawn from a process-global monotonic `AtomicU64`**, not a
+   per-key `0,1,2…`. Every bump (NEWNEIGH/DELNEIGH) does
+   `slot.epoch = GLOBAL_NEIGH_EPOCH.fetch_add(1, Release)`. A snapshot of
+   value `N` can never equal any *future* slot's epoch, so GC-then-recreate
+   cannot collide with an old snapshot.
+2. **Confirmed-insert REJECTS on an absent slot** — drop the "create if
+   absent with `epoch = epoch_before`" branch entirely for the confirm
+   path. You cannot prove a MAC unchanged against a slot that no longer
+   exists. (An absent slot at confirm time ⇒ the key was never seen, or was
+   GC'd ⇒ re-resolve, don't trust the snapshot.)
+3. **`ResolveItem` carries `enqueued_ns`**; the resolver discards an item
+   older than `TOMBSTONE_TTL_NS − 2 s` before issuing the confirm (AGY B
+   mitigation). Belt-and-suspenders with (1)/(2).
+4. **Tombstone GC is incremental** — one shard at a time on a timer (reuse
+   the `last_resolved` 5 min GC cadence), **never `with_all_shards`** (AGY
+   C). Reap `entry.is_none() && now - last_change_ns > TOMBSTONE_TTL_NS`
+   (60 s). With (1)/(2) the TTL is now only a *cardinality* device, not a
+   correctness device — safe at any value.
+
+**API-audit checklist (Codex 2).** Changing the shard value to
+`NeighborSlot` means every accessor must treat `entry: None` as absent:
+`get` (return `None` for tombstone), `contains_key`, `len`, `is_empty`,
+`with_all_shards`/`BulkShardGuard::total_len`, the coordinator/Go-facing
+status counts, manager `replace`, and all existing tests. Each is listed as
+a Phase-4 sub-task; a tombstone must be invisible to forwarding and status.
 
 **No new lock and no lock-ordering rule** (finding #4 dissolved): the
 epoch shares the `dynamic_neighbors` shard mutex it is stored in.
@@ -211,18 +267,25 @@ struct KeyBackoff { last_get_ns: u64, get_attempts: u8 }
 // get_attempts uses saturating_add (finding #6 — no u8 overflow/probe storm).
 ```
 
-The two clocks never drive the same syscall, so there is no
-"min-of-two-schedules" interaction. §2.3's only change is replacing the
-resolver's flat 1 s window with the saturating exponential above. **Negative
-keys keep getting GETs on this backoff** (that is the §2.4 property).
+**Correction (v3, Codex 4):** the two clocks are NOT disjoint — the
+resolver *also* calls `trigger_kernel_arp_probe()` on stale/failed/no-reply
+(`neighbor_resolver.rs:700`). Extending the resolver GET backoff therefore
+*does* change a key's aggregate kernel-probe cadence — but **in the desired
+direction**: a permanently-dead key gets fewer GETs and fewer
+resolver-driven kernel probes as the backoff widens (1→2→4→8 s), which is
+the §2.4 goal. The dispatch-side per-packet `PROBE_SCHEDULE_NS` (kernel
+solicitation for *buffered* packets) is unchanged. §2.3's only change is
+replacing the resolver's flat 1 s window with the saturating exponential.
+**Negative keys keep getting GETs on this backoff** (§2.4 property).
 
-**Waking due Negative keys with no new packets (finding #6):** the
-resolver thread already blocks on `recv_timeout(500 ms)`; v2 specifies
-that on each 500 ms wakeup it also scans `last_resolved` for keys whose
-`last_get_ns + schedule(get_attempts)` is due and re-issues their GET.
-500 ms is finer than the ≥1 s backoff floor, so no due key waits more than
-one tick past its deadline. (Scan cost = distinct tracked keys, GC'd at
-the existing `last_resolved` 5 min TTL.)
+**Waking due Negative keys (finding #6 + AGY D):** the due-key check must
+run on **every loop iteration**, gated by a monotonic
+`now − last_check ≥ 500 ms` — NOT only inside the `recv_timeout` Timeout
+arm. Under continuous traffic `recv_timeout` returns `Ok(item)` immediately
+and the Timeout arm never fires, so a timeout-arm-only scan starves
+negative-key re-probing (AGY D). The due-key state must also retain
+`iface_name` (current `last_resolved` stores only key→timestamp) so the
+re-issued GET can be addressed.
 
 ### 2.4 Negative Policy — concrete criterion (finding #8/F6)
 
@@ -249,7 +312,8 @@ test, and ships no runtime change.
 detection; full dump only at startup.
 
 **Target:** detect ENOBUFS, count it, and trigger a **throttled
-replacement-style family re-dump**.
+upsert-only family re-dump** (v3 — was "replacement-style" in v2; see the
+upsert-only rationale below).
 
 ```rust
 let n = libc::recv(...);
@@ -264,13 +328,29 @@ if n < 0 {
 if n == 0 { continue; } // EOF shouldn't happen on netlink
 ```
 
-**Replacement semantics (finding #7).** A plain upsert dump cannot evict a
-neighbor whose DELNEIGH was lost in the ENOBUFS overflow. The re-dump must
-**reconcile**: snapshot the current dump into a set, then under
-`with_all_shards` remove any `dynamic_neighbors` key **not** present in the
-fresh dump (and not a still-valid tombstone), and upsert the rest — each
-removal bumping that slot's per-key epoch (§2.1) so in-flight GETs are
-invalidated. This is the only way a lost DELNEIGH self-heals.
+**Upsert-only semantics (v3 — supersedes the v2 "replacement" design).**
+Round-2 (Codex 1) established that `dynamic_neighbors` is **not
+kernel-owned**: it is also populated by RX-side learning
+(`neighbor_dispatch.rs:315`) and manager snapshots (`coordinator/mod.rs:151`).
+An evicting/replacement dump that removes every key absent from the fresh
+kernel dump would delete valid dataplane-learned and manager entries.
+
+The defect #1771 actually targets (D4) is a **lost RTM_NEWNEIGH** — a
+*missing* good entry — so the re-dump only needs to **re-add what the
+kernel currently has**. v3 therefore specifies an **upsert-only** family
+re-dump: walk the fresh dump, `dynamic_neighbors.insert_if_changed(K, …)`
+per entry using the **normal per-key sharded insert** (bump-first epoch
+ordering), **no `with_all_shards`, no eviction**. This fixes the documented
+desync, avoids the kernel-ownership bug, dissolves the TOCTOU (Claude SMR
+§2.5) and the I/O-under-all-shards-lock latency spike (AGY E), and needs no
+per-slot source tag.
+
+**Stale-entry eviction (lost-DELNEIGH self-heal) is OUT OF SCOPE for
+§2.5** and deferred to a follow-up that first adds per-slot source-tagging
+(`{Monitor, RxLearned, Manager}`) so only Monitor-sourced entries can be
+reconciled away. Lost-DELNEIGH is rarer than lost-NEWNEIGH and the per-key
+revocation path (FAILED/DELNEIGH on the next real event) still covers the
+common case.
 
 **Throttle:** `AtomicU64` last-redump timestamp, gate at 5 s
 (`now - last > 5_000_000_000`) to avoid the RTNL contention AGY F2 raised.
@@ -279,13 +359,10 @@ The single-key GET path is explicitly **not** the dump path.
 **Targeted hot-key GETs — bounded or dropped (finding #7).** The monitor
 cannot see worker-private `pending_neigh` or resolver-private
 `last_resolved`. Two options, plan recommends the simpler:
-- **Recommended:** drop targeted GETs entirely on ENOBUFS. The throttled
-  replacement re-dump already repopulates `dynamic_neighbors`; per-key
-  GETs after it are redundant.
-- **If retained:** add a bounded SPSC channel monitor→resolver carrying at
-  most `ENOBUFS_HOTKEY_CAP` (e.g. 32) recently-active keys; the resolver
-  drains it and issues GETs subject to the §2.3 backoff. The cap prevents
-  the unbounded fan-out under the very overflow it handles.
+- **Chosen (v3):** drop targeted GETs entirely on ENOBUFS. The throttled
+  upsert-only re-dump already repopulates `dynamic_neighbors`; per-key GETs
+  after it are redundant, and dropping them avoids the monitor→resolver
+  thread-boundary plumbing (AGY E agrees this is structurally sound).
 
 ### 2.6 Prometheus Counters
 
@@ -301,8 +378,9 @@ plus the latency histograms (`pending_dwell`, `get_rtt`) and
 - `resolver_get_backoff_attempts` (histogram or counter — backoff depth)
 - `netlink_enobufs_total` (counter)
 - `netlink_redumps_total` (counter)
-- `netlink_redump_evictions_total` (counter — stale entries reconciled
-  away; proves the replacement semantics fire)
+- `netlink_redump_upserts_total` (counter — entries re-added by an
+  upsert-only re-dump; proves the re-dump repopulated missing keys).
+  (v2's `redump_evictions_total` is dropped — no eviction in v3.)
 
 **Wiring path (unchanged from v1):** `ResolverCounters` →
 `NeighborResolverCounters` snapshot → `server/helpers.rs` status →
@@ -323,7 +401,7 @@ completeness; highest risk concentrated in the §2.1 co-located-epoch map
 
 **Path B — Value-first, measurement-gated (RECOMMENDED).**
 1. Ship §2.2 (per-key pending bound — clear SYN-flood frame-pinning win),
-   §2.5 (ENOBUFS replacement re-dump — closes the D4 silent-desync gap),
+   §2.5 (ENOBUFS upsert-only re-dump — closes the D4 lost-NEWNEIGH gap),
    §2.6 counters, and §2.4 (test/doc only). These need **no** change to
    the epoch machinery and carry the lowest risk.
 2. **Gate §2.1 on data:** read `epoch_rejects` / `get_attempts` from the
@@ -353,10 +431,12 @@ epoch on master.
 
 ### Phase 2: ENOBUFS Replacement Re-dump (§2.5)
 - [ ] ENOBUFS/EAGAIN/EOF match in `neigh_monitor_thread`
-- [ ] Throttled (5 s) **reconciling** family re-dump under `with_all_shards`
-- [ ] `netlink_enobufs_total`/`redumps_total`/`redump_evictions_total`
-- [ ] Synthetic ENOBUFS injection test proving a lost DELNEIGH is evicted
-- [ ] (Recommended) no targeted GETs; if retained, bounded SPSC channel
+- [ ] Throttled (5 s) **upsert-only** family re-dump via per-key sharded
+      insert (bump-first) — NOT `with_all_shards`, no eviction
+- [ ] `netlink_enobufs_total`/`redumps_total`/`redump_upserts_total`
+- [ ] Synthetic ENOBUFS injection test (injectable recv/dump seam) proving a
+      lost RTM_NEWNEIGH is re-learned by the re-dump
+- [ ] No targeted GETs (re-dump repopulates); stale-entry eviction deferred
 
 ### Phase 3: Counters + Negative invariant (§2.6, §2.4)
 - [ ] New gauges/counters wired Rust→Go; metrics test
@@ -417,9 +497,9 @@ last and gates it; Phases 1–3 are independent and don't touch epoch state.
 - [ ] **Phase 1:** SYN flood to one dead next-hop pins ≤ 1 pending slot
       (test); #1772 dwell/depth/timeout metrics unchanged in meaning where
       noted, values asserted; cargo test green.
-- [ ] **Phase 2:** synthetic ENOBUFS injection followed by a lost-DELNEIGH
-      scenario evicts the stale `dynamic_neighbors` entry within one
-      throttled re-dump (`redump_evictions_total` increments); EAGAIN
+- [ ] **Phase 2:** synthetic ENOBUFS injection followed by a lost-NEWNEIGH
+      scenario re-learns the missing `dynamic_neighbors` entry within one
+      throttled upsert re-dump (`redump_upserts_total` increments); EAGAIN
       steady-state path unaffected.
 - [ ] **Phase 3:** all new counters export and scrape; Invariant N1 holds
       (negative key keeps issuing GETs; ≤1 buffered packet/key).
