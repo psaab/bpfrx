@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -8,17 +9,20 @@ import (
 )
 
 // #1780 Path A: the periodic neighbor-maintenance loop must survive a phase
-// whose netlink/probe syscall wedges. These tests pin the three guarantees the
-// fix rests on:
+// whose netlink/probe syscall wedges. These tests pin the guarantees the fix
+// rests on:
 //
 //   1. runGuardedNeighborPhase NEVER blocks its caller — the phase body runs in
 //      a goroutine, so a hung phase cannot freeze the for-select loop.
 //   2. While a phase is in flight the guard SKIPS relaunch (no overlapping
 //      pass, no per-tick goroutine/socket leak), and relaunches once the prior
 //      pass returns.
-//   3. NeighborPeriodicPhaseAges advances for a stalled phase (its last-success
-//      timestamp stops updating) while a healthy phase stays near zero — the
-//      observable watchdog signal.
+//   3. End-to-end, neighborPeriodicLoop keeps firing the clean ticker while a
+//      resolve phase is wedged — the real no-freeze property, not just the
+//      helper in isolation (Codex #1781 r1).
+//   4. NeighborPeriodicPhaseAges advances for a stalled phase, reports nothing
+//      until the loop has started, and omits the HA-only warm phase when not
+//      clustered (Codex #1781 r1).
 
 // waitFor polls cond until true or the deadline elapses; fatals on timeout.
 func waitFor(t *testing.T, d time.Duration, what string, cond func() bool) {
@@ -99,19 +103,74 @@ func TestRunGuardedNeighborPhaseDoesNotBlockCaller(t *testing.T) {
 	}
 }
 
+// TestNeighborPeriodicLoopKeepsTickingWhilePhaseWedged drives the real loop
+// core with fast intervals and a resolve phase that wedges forever (via the
+// real guard), and asserts the clean ticker keeps firing — the end-to-end
+// no-freeze property a stuck phase must not break.
+func TestNeighborPeriodicLoopKeepsTickingWhilePhaseWedged(t *testing.T) {
+	d := &Daemon{startTime: time.Now()}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var cleanCount atomic.Int64
+	var resolveStarted atomic.Bool
+	release := make(chan struct{})
+
+	// resolveTick dispatches a phase that wedges forever (models a stuck
+	// netlink syscall) through the real guarded-goroutine helper.
+	resolveTick := func() {
+		d.runGuardedNeighborPhase(&d.resolveNeighborsInFlight, &d.resolveLastSuccessNanos, func() {
+			resolveStarted.Store(true)
+			<-release
+		})
+	}
+	cleanTick := func() { cleanCount.Add(1) }
+
+	go d.neighborPeriodicLoop(ctx, 5*time.Millisecond, 8*time.Millisecond, cleanTick, resolveTick)
+
+	// Even though the resolve phase wedges on its first fire, the clean ticker
+	// must keep firing: the loop is not frozen.
+	waitFor(t, 2*time.Second, "clean ticks to accumulate while resolve is wedged", func() bool {
+		return cleanCount.Load() >= 5
+	})
+	if !resolveStarted.Load() {
+		t.Fatal("resolve phase never started")
+	}
+	// The wedged resolve phase stayed in flight — no relaunch, no panic, and
+	// crucially the loop kept servicing the clean ticker.
+	if !d.resolveNeighborsInFlight.Load() {
+		t.Fatal("expected the wedged resolve phase to remain in-flight")
+	}
+
+	cancel()
+	close(release)
+}
+
 func TestNeighborPeriodicPhaseAgesReflectsStall(t *testing.T) {
 	// startTime in the past so a never-run phase reports a non-trivial age.
 	d := &Daemon{startTime: time.Now().Add(-30 * time.Second)}
 
+	// Before the loop starts, the accessor reports nothing — a daemon that
+	// never starts the loop must not surface forever-climbing false "wedges".
+	if ages := d.NeighborPeriodicPhaseAges(); ages != nil {
+		t.Fatalf("expected nil phase ages before loop start, got %v", ages)
+	}
+
+	d.neighborPeriodicLoopStarted.Store(true)
+
 	// All phases never-run: each reports ~age-since-start (~30s), proving a
-	// phase that never completes still flags rather than reading zero.
+	// phase that never completes still flags rather than reading zero. warm is
+	// omitted because d.cluster == nil (HA-only phase).
 	ages := d.NeighborPeriodicPhaseAges()
-	for _, phase := range []string{"resolve", "force_probe", "clean_failed", "warm"} {
+	for _, phase := range []string{"resolve", "force_probe", "clean_failed"} {
 		if a, ok := ages[phase]; !ok {
 			t.Fatalf("phase %q missing from age map", phase)
 		} else if a < 25 {
 			t.Fatalf("never-run phase %q reported age %.1fs; want ~30s since start", phase, a)
 		}
+	}
+	if _, ok := ages["warm"]; ok {
+		t.Fatal("warm phase reported on a non-clustered daemon; it is HA-only")
 	}
 
 	// Mark resolve just-completed; its age drops near zero while the others

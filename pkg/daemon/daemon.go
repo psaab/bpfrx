@@ -123,6 +123,12 @@ type Daemon struct {
 	forceProbeLastSuccessNanos  atomic.Int64
 	cleanFailedLastSuccessNanos atomic.Int64
 	warmLastSuccessNanos        atomic.Int64
+	// neighborPeriodicLoopStarted gates the phase-age gauge: it is set
+	// once runPeriodicNeighborResolution actually starts (the loop only
+	// runs when the dataplane is enabled with active config). Without it,
+	// a daemon that never starts the loop would report every phase as a
+	// forever-climbing "wedged" age — a false positive (Codex #1781 r1).
+	neighborPeriodicLoopStarted atomic.Bool
 	hbSuppressStart             atomic.Int64 // UnixNano of first heartbeat suppression; 0 = inactive
 	syncPrimeRetryGen           atomic.Uint64
 	syncReadyTimerGen           atomic.Uint64
