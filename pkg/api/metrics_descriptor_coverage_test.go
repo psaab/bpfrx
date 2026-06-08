@@ -310,6 +310,17 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 		store:     store,
 		gc:        gc,
 		startTime: time.Now(),
+		// #1780: wire a non-nil neighbor-phase age source so the
+		// neighbor_periodic_last_success_age_seconds family emits and the
+		// canary covers its descriptor declaration.
+		neighborPhaseAgeFn: func() map[string]float64 {
+			return map[string]float64{
+				"resolve":      1.0,
+				"force_probe":  2.0,
+				"clean_failed": 3.0,
+				"warm":         4.0,
+			}
+		},
 	}
 	// dhcp.New opens a netlink handle, which a restricted sandbox may
 	// refuse ("operation not permitted"). The DHCP family is one of many;
@@ -377,6 +388,7 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 		"xpf_nat_pool_total_ports",                        // collectNATPoolMetrics
 		"xpf_sessions_active",                             // collectSessionGauges
 		"xpf_daemon_uptime_seconds",                       // collectSystemMetrics
+		"xpf_daemon_neighbor_periodic_last_success_age_seconds", // #1780 neighbor watchdog
 		"xpf_userspace_worker_dead",                       // emitWorkerRuntime
 		"xpf_userspace_worker_cold_path_samples_v3_total", // cold-path v3
 		"xpf_cos_drain_invocations_total",                 // CoS owner profile

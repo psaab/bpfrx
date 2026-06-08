@@ -804,6 +804,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 					LastErrorUnixSec: h.LastErrorUnixSec,
 				}
 			},
+			// #1780 Path A: expose the per-phase age of the Go periodic
+			// neighbor-maintenance loop so a wedged guarded goroutine
+			// (stuck netlink/probe syscall) is observable as a climbing
+			// gauge before it manifests as the cold-connect hang.
+			NeighborPhaseAgeFn: d.NeighborPeriodicPhaseAges,
 		}
 		// Resolve interface bindings from web-management config
 		if cfg := d.store.ActiveConfig(); cfg != nil && cfg.System.Services != nil &&

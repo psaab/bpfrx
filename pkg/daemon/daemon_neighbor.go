@@ -349,7 +349,29 @@ func (d *Daemon) cleanFailedNeighbors() int {
 //     without activation-time warmup.
 //
 // Runs once immediately at start to avoid a blind spot.
-// Fetches fresh active config on each tick so config changes take effect.
+// NeighborPeriodicPhaseAges returns, per periodic-neighbor-maintenance phase,
+// the seconds since that phase last completed successfully — the #1780 Path A
+// stall diagnostic. A phase frozen by a hung netlink/probe syscall shows a
+// growing age while the healthy phases stay near 0; a phase that has never
+// completed reports its age since daemon start so a never-running phase still
+// flags. Surfaced as the xpf_daemon_neighbor_periodic_last_success_age_seconds
+// {phase} gauge.
+func (d *Daemon) NeighborPeriodicPhaseAges() map[string]float64 {
+	now := time.Now()
+	age := func(lastNanos int64) float64 {
+		if lastNanos == 0 {
+			return now.Sub(d.startTime).Seconds()
+		}
+		return now.Sub(time.Unix(0, lastNanos)).Seconds()
+	}
+	return map[string]float64{
+		"resolve":      age(d.resolveLastSuccessNanos.Load()),
+		"force_probe":  age(d.forceProbeLastSuccessNanos.Load()),
+		"clean_failed": age(d.cleanFailedLastSuccessNanos.Load()),
+		"warm":         age(d.warmLastSuccessNanos.Load()),
+	}
+}
+
 // runGuardedNeighborPhase runs one periodic neighbor-maintenance phase in a
 // guarded goroutine so a hung netlink/probe syscall in that phase can NEVER
 // freeze the runPeriodicNeighborResolution for-select loop (#1780 Path A: a

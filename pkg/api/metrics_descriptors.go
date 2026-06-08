@@ -232,6 +232,14 @@ func newCollector(srv *Server) *xpfCollector {
 			"Daemon resident set size in bytes.",
 			nil, nil,
 		),
+		neighborPeriodicAge: prometheus.NewDesc(
+			"xpf_daemon_neighbor_periodic_last_success_age_seconds",
+			"Seconds since each Go periodic neighbor-maintenance phase "+
+				"last completed. A monotonically climbing value means that "+
+				"phase's guarded goroutine is wedged on a stuck netlink/probe "+
+				"syscall (#1780).",
+			[]string{"phase"}, nil,
+		),
 
 		// #709: owner-profile telemetry. Labels:
 		//   ifindex:      interface ifindex as string
