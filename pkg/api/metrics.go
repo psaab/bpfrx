@@ -78,6 +78,9 @@ type xpfCollector struct {
 	daemonUptime *prometheus.Desc
 	daemonMemRSS *prometheus.Desc
 
+	// #1780: per-phase age of the Go periodic neighbor-maintenance loop.
+	neighborPeriodicAge *prometheus.Desc
+
 	// #709: CoS owner-profile telemetry (userspace dataplane only).
 	// Cardinality estimate per plan §5: num_queues (≤ 64) × num_interfaces
 	// (≤ 8) × DRAIN_HIST_BUCKETS (16) = ≤ 8192 series for each of the
@@ -280,6 +283,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.sysMemAvail
 	ch <- c.daemonUptime
 	ch <- c.daemonMemRSS
+	ch <- c.neighborPeriodicAge
 	ch <- c.cosDrainLatencyBucket
 	ch <- c.cosDrainInvocationsTotal
 	ch <- c.cosRedirectAcquireBucket

@@ -67,6 +67,14 @@ type Config struct {
 	// instead of reading "status: ok" alongside a one-shot WARN in the
 	// journal. Optional; if nil, /health keeps the pre-#758 behaviour.
 	CompileHealthFn func() CompileHealthSnapshot
+	// NeighborPhaseAgeFn surfaces the age (seconds) since each Go
+	// periodic neighbor-maintenance phase last completed (#1780 Path A).
+	// Keys: resolve/force_probe/clean_failed/warm. A monotonically
+	// climbing age for any phase means that phase's guarded goroutine
+	// is wedged (a stuck netlink/probe syscall), which is the signature
+	// of the idle/overnight cold-connect hang. Optional; if nil, the
+	// neighbor_periodic_last_success_age_seconds gauge is not emitted.
+	NeighborPhaseAgeFn func() map[string]float64
 }
 
 // Server is the HTTP API server.
@@ -82,10 +90,11 @@ type Server struct {
 	ipsec       *ipsec.Manager
 	dhcp        *dhcp.Manager
 	vrrpMgr           *vrrp.Manager
-	commitFn          func(ctx context.Context, comment string) (*config.Config, error)
-	commitConfirmedFn func(ctx context.Context, minutes int) (*config.Config, error)
-	compileHealthFn   func() CompileHealthSnapshot
-	startTime         time.Time
+	commitFn           func(ctx context.Context, comment string) (*config.Config, error)
+	commitConfirmedFn  func(ctx context.Context, minutes int) (*config.Config, error)
+	compileHealthFn    func() CompileHealthSnapshot
+	neighborPhaseAgeFn func() map[string]float64
+	startTime          time.Time
 }
 
 // NewServer creates a new API server.
@@ -100,10 +109,11 @@ func NewServer(cfg Config) *Server {
 		ipsec:     cfg.IPsec,
 		dhcp:      cfg.DHCP,
 		vrrpMgr:           cfg.VRRPMgr,
-		commitFn:          cfg.CommitFn,
-		commitConfirmedFn: cfg.CommitConfirmedFn,
-		compileHealthFn:   cfg.CompileHealthFn,
-		startTime:         time.Now(),
+		commitFn:           cfg.CommitFn,
+		commitConfirmedFn:  cfg.CommitConfirmedFn,
+		compileHealthFn:    cfg.CompileHealthFn,
+		neighborPhaseAgeFn: cfg.NeighborPhaseAgeFn,
+		startTime:          time.Now(),
 	}
 
 	mux := http.NewServeMux()

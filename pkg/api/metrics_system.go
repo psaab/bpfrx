@@ -35,6 +35,17 @@ func (c *xpfCollector) collectSystemMetrics(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(c.daemonUptime, prometheus.GaugeValue,
 		time.Since(c.srv.startTime).Seconds())
 
+	// #1780: per-phase age of the Go periodic neighbor-maintenance loop.
+	// A monotonically climbing age for any phase is the watchdog signal
+	// that the phase's guarded goroutine is wedged on a stuck
+	// netlink/probe syscall (the idle/overnight cold-connect hang).
+	if c.srv.neighborPhaseAgeFn != nil {
+		for phase, age := range c.srv.neighborPhaseAgeFn() {
+			ch <- prometheus.MustNewConstMetric(c.neighborPeriodicAge,
+				prometheus.GaugeValue, age, phase)
+		}
+	}
+
 	// Daemon RSS from /proc/self/statm (field 1 = RSS in pages)
 	if data, err := os.ReadFile("/proc/self/statm"); err == nil {
 		fields := strings.Fields(string(data))

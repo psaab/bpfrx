@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/psaab/xpf/pkg/cluster"
@@ -141,8 +142,18 @@ func (d *Daemon) collectNeighborProbeTargets(cfg *config.Config) []neighborProbe
 		}
 	}
 
-	// 1. Static route next-hops
-	allStaticRoutes := append(cfg.RoutingOptions.StaticRoutes, cfg.RoutingOptions.Inet6StaticRoutes...)
+	// 1. Static route next-hops.
+	// Build the combined list in a fresh slice — appending Inet6StaticRoutes
+	// onto cfg.RoutingOptions.StaticRoutes directly would write into that
+	// slice's backing array when it has spare capacity (cap > len), mutating
+	// the shared active-config object. resolveNeighbors runs concurrently with
+	// VRRP-transition and config-apply callers (and, post-#1780, in a guarded
+	// goroutine), so that in-place append is a data race on shared config
+	// (AGY #1781 r1). A pre-sized copy avoids touching the config's arrays.
+	allStaticRoutes := make([]*config.StaticRoute, 0,
+		len(cfg.RoutingOptions.StaticRoutes)+len(cfg.RoutingOptions.Inet6StaticRoutes))
+	allStaticRoutes = append(allStaticRoutes, cfg.RoutingOptions.StaticRoutes...)
+	allStaticRoutes = append(allStaticRoutes, cfg.RoutingOptions.Inet6StaticRoutes...)
 	for _, sr := range allStaticRoutes {
 		if sr.Discard {
 			continue
@@ -159,7 +170,13 @@ func (d *Daemon) collectNeighborProbeTargets(cfg *config.Config) []neighborProbe
 		}
 	}
 	for _, ri := range cfg.RoutingInstances {
-		for _, sr := range append(ri.StaticRoutes, ri.Inet6StaticRoutes...) {
+		// Same copy-safety as above: never append onto the config's own
+		// StaticRoutes backing array (AGY #1781 r1).
+		riStaticRoutes := make([]*config.StaticRoute, 0,
+			len(ri.StaticRoutes)+len(ri.Inet6StaticRoutes))
+		riStaticRoutes = append(riStaticRoutes, ri.StaticRoutes...)
+		riStaticRoutes = append(riStaticRoutes, ri.Inet6StaticRoutes...)
+		for _, sr := range riStaticRoutes {
 			if sr.Discard {
 				continue
 			}
@@ -347,25 +364,152 @@ func (d *Daemon) cleanFailedNeighbors() int {
 //     session-derived neighbor cache entries so standby forwarding stays ready
 //     without activation-time warmup.
 //
-// Runs once immediately at start to avoid a blind spot.
-// Fetches fresh active config on each tick so config changes take effect.
-func (d *Daemon) runPeriodicNeighborResolution(ctx context.Context) {
-	// Immediate first run — don't wait for first tick.
-	// resolveNeighbors handles cold-start configured targets;
-	// forceProbeNeighbors handles stale snapshot keys (only
-	// useful once a snapshot exists, which it doesn't yet at
-	// startup). On the first 15s tick once snapshot is warm,
-	// both run with non-overlapping target sets.
-	if cfg := d.store.ActiveConfig(); cfg != nil {
-		d.resolveNeighbors(cfg)
-		d.maintainClusterNeighborReadiness()
+// NeighborPeriodicPhaseAges returns, per periodic-neighbor-maintenance phase,
+// the seconds since that phase last completed successfully — the #1780 Path A
+// stall diagnostic. A phase frozen by a hung netlink/probe syscall shows a
+// growing age while the healthy phases stay near 0; a phase that has never
+// completed reports its age since the loop started so a never-running phase
+// still flags. Surfaced as the
+// xpf_daemon_neighbor_periodic_last_success_age_seconds{phase} gauge.
+//
+// To avoid false positives (Codex #1781 r1), it reports nothing until the
+// periodic loop has actually started (the loop only runs when the dataplane
+// is enabled with active config), and it omits the "warm" phase on a
+// standalone firewall, since warmNeighborCache only runs under HA
+// (maintainClusterNeighborReadiness no-ops when d.cluster == nil and so never
+// updates warmLastSuccessNanos).
+func (d *Daemon) NeighborPeriodicPhaseAges() map[string]float64 {
+	if !d.neighborPeriodicLoopStarted.Load() {
+		return nil
 	}
-	d.cleanFailedNeighbors()
+	now := time.Now()
+	// Clamp to >= 0: ages are wall-clock subtractions, so a backward clock
+	// step (NTP/RTC adjustment) could otherwise emit a negative age, which is
+	// nonsensical for a watchdog gauge (Copilot #1781 r2; mirrors the
+	// clock-step floor in shouldScheduleStandbyNeighborRefresh).
+	age := func(lastNanos int64) float64 {
+		var sec float64
+		if lastNanos == 0 {
+			sec = now.Sub(d.startTime).Seconds()
+		} else {
+			sec = now.Sub(time.Unix(0, lastNanos)).Seconds()
+		}
+		if sec < 0 {
+			sec = 0
+		}
+		return sec
+	}
+	ages := map[string]float64{
+		"resolve":      age(d.resolveLastSuccessNanos.Load()),
+		"force_probe":  age(d.forceProbeLastSuccessNanos.Load()),
+		"clean_failed": age(d.cleanFailedLastSuccessNanos.Load()),
+	}
+	// The warm phase only exists under HA; reporting it standalone would be a
+	// forever-climbing false "wedge".
+	if d.cluster != nil {
+		ages["warm"] = age(d.warmLastSuccessNanos.Load())
+	}
+	return ages
+}
+
+// runGuardedNeighborPhase runs one periodic neighbor-maintenance phase in a
+// guarded goroutine so a hung netlink/probe syscall in that phase can NEVER
+// freeze the runPeriodicNeighborResolution for-select loop (#1780 Path A: a
+// blocking synchronous handler was observed wedging the whole loop ~17.5h,
+// aging out data-path next-hops and causing cold-connect hangs). If a prior
+// pass is still in flight, the tick is skipped rather than launching an
+// overlapping pass — a stuck netlink syscall cannot be cancelled, so a second
+// goroutine would only leak another socket; skipping caps the leak at one
+// goroutine per phase, and the stalled phase becomes observable via its
+// growing last-success-age gauge while every OTHER phase keeps running. On
+// normal completion the phase records its success timestamp; a transient hang
+// self-heals because the next tick relaunches once the prior pass returns.
+func (d *Daemon) runGuardedNeighborPhase(inFlight *atomic.Bool, lastSuccess *atomic.Int64, fn func()) {
+	if !inFlight.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer func() {
+			lastSuccess.Store(time.Now().UnixNano())
+			inFlight.Store(false)
+		}()
+		fn()
+	}()
+}
+
+func (d *Daemon) runPeriodicNeighborResolution(ctx context.Context) {
+	// Mark the loop live so NeighborPeriodicPhaseAges reports phase ages only
+	// once supervision is actually running (avoids the never-started false
+	// positive — Codex #1781 r1).
+	d.neighborPeriodicLoopStarted.Store(true)
+
+	// #1780 Path A: each phase runs via runGuardedNeighborPhase (a guarded
+	// goroutine) so one hung netlink/probe phase cannot freeze this loop.
+	// WHAT each phase does is unchanged — only HOW it is supervised.
+	resolvePass := func() {
+		if cfg := d.store.ActiveConfig(); cfg != nil {
+			d.resolveNeighbors(cfg)
+		}
+	}
+	// #1197: force-probe ALL monitored neighbors (including STALE/DELAY/PROBE)
+	// so the kernel re-validates entries resolveNeighbors would skip. Replies
+	// update kernel ARP → RTM_NEWNEIGH → listener regenerates snapshot.
+	forceProbePass := func() {
+		if cfg := d.store.ActiveConfig(); cfg != nil {
+			d.forceProbeNeighbors(cfg)
+		}
+	}
+	// cleanFailedNeighbors returns a count; discard it for the void phase fn.
+	cleanPass := func() { d.cleanFailedNeighbors() }
+	// maintainClusterNeighborReadiness self-gates on d.cluster, but the prior
+	// (pre-#1780) loop only invoked it when ActiveConfig() != nil; preserve
+	// that gate exactly so this change stays HOW-only, not WHAT (Claude SMR
+	// #1781 r1). It is called inline rather than via runGuardedNeighborPhase
+	// because its only synchronous work is a nil check + a CAS — the heavy
+	// session-walk warmNeighborCache already runs in its own goroutine guarded
+	// by neighborWarmupInFlight, so maintain cannot freeze this loop.
+	maintainPass := func() {
+		if cfg := d.store.ActiveConfig(); cfg != nil {
+			d.maintainClusterNeighborReadiness()
+		}
+	}
+
+	// resolveTick is the 15s pass: resolve + force-probe (both guarded) +
+	// maintain. cleanTick is the 5s pass: clean (guarded).
+	resolveTick := func() {
+		d.runGuardedNeighborPhase(&d.resolveNeighborsInFlight, &d.resolveLastSuccessNanos, resolvePass)
+		d.runGuardedNeighborPhase(&d.forceProbeInFlight, &d.forceProbeLastSuccessNanos, forceProbePass)
+		maintainPass()
+	}
+	cleanTick := func() {
+		d.runGuardedNeighborPhase(&d.cleanFailedInFlight, &d.cleanFailedLastSuccessNanos, cleanPass)
+	}
+
+	// Immediate first run — don't wait for first tick. force-probe is
+	// intentionally skipped here (it needs a snapshot that doesn't exist yet
+	// at startup; it joins on the first 15s tick with a non-overlapping set),
+	// so the immediate pass is resolve + maintain + clean, matching the
+	// pre-#1780 startup sequence exactly.
+	d.runGuardedNeighborPhase(&d.resolveNeighborsInFlight, &d.resolveLastSuccessNanos, resolvePass)
+	maintainPass()
+	cleanTick()
 
 	const (
 		cleanInterval   = 5 * time.Second
 		resolveInterval = 15 * time.Second
 	)
+	d.neighborPeriodicLoop(ctx, cleanInterval, resolveInterval, cleanTick, resolveTick)
+}
+
+// neighborPeriodicLoop is the supervised for-select core of
+// runPeriodicNeighborResolution, split out so a unit test can drive it with
+// fast intervals and synthetic phase closures and prove the no-freeze
+// invariant end-to-end: a wedged resolveTick phase must not stop cleanTick
+// from firing (Codex #1781 r1). The loop itself never blocks — each tick
+// callback is expected to dispatch its work via runGuardedNeighborPhase (a
+// guarded goroutine) or be O(1) — so the select keeps servicing both tickers
+// regardless of any single phase hanging.
+func (d *Daemon) neighborPeriodicLoop(ctx context.Context, cleanInterval, resolveInterval time.Duration, cleanTick, resolveTick func()) {
 	cleanTicker := time.NewTicker(cleanInterval)
 	resolveTicker := time.NewTicker(resolveInterval)
 	defer cleanTicker.Stop()
@@ -375,18 +519,9 @@ func (d *Daemon) runPeriodicNeighborResolution(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-cleanTicker.C:
-			d.cleanFailedNeighbors()
+			cleanTick()
 		case <-resolveTicker.C:
-			if cfg := d.store.ActiveConfig(); cfg != nil {
-				d.resolveNeighbors(cfg)
-				// #1197: force-probe ALL monitored neighbors
-				// (including STALE/DELAY/PROBE) so kernel
-				// re-validates entries that resolveNeighbors
-				// would skip. Replies update kernel ARP →
-				// RTM_NEWNEIGH → listener regenerates snapshot.
-				d.forceProbeNeighbors(cfg)
-				d.maintainClusterNeighborReadiness()
-			}
+			resolveTick()
 		}
 	}
 }
@@ -409,7 +544,10 @@ func (d *Daemon) maintainClusterNeighborReadiness() {
 		return
 	}
 	go func() {
-		defer d.neighborWarmupInFlight.Store(false)
+		defer func() {
+			d.warmLastSuccessNanos.Store(time.Now().UnixNano())
+			d.neighborWarmupInFlight.Store(false)
+		}()
 		d.warmNeighborCache()
 	}()
 }
