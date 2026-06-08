@@ -184,4 +184,11 @@ func TestNeighborPeriodicPhaseAgesReflectsStall(t *testing.T) {
 	if ages["force_probe"] < 25 {
 		t.Fatalf("stalled force_probe phase reported age %.1fs; want ~30s", ages["force_probe"])
 	}
+
+	// A last-success timestamp in the future (models a backward clock step)
+	// must clamp to 0, not report a negative age (Copilot #1781 r2).
+	d.cleanFailedLastSuccessNanos.Store(time.Now().Add(10 * time.Second).UnixNano())
+	if got := d.NeighborPeriodicPhaseAges()["clean_failed"]; got < 0 {
+		t.Fatalf("backward-clock-step age not clamped: got %.3fs, want >= 0", got)
+	}
 }

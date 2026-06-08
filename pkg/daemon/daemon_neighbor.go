@@ -383,11 +383,21 @@ func (d *Daemon) NeighborPeriodicPhaseAges() map[string]float64 {
 		return nil
 	}
 	now := time.Now()
+	// Clamp to >= 0: ages are wall-clock subtractions, so a backward clock
+	// step (NTP/RTC adjustment) could otherwise emit a negative age, which is
+	// nonsensical for a watchdog gauge (Copilot #1781 r2; mirrors the
+	// clock-step floor in shouldScheduleStandbyNeighborRefresh).
 	age := func(lastNanos int64) float64 {
+		var sec float64
 		if lastNanos == 0 {
-			return now.Sub(d.startTime).Seconds()
+			sec = now.Sub(d.startTime).Seconds()
+		} else {
+			sec = now.Sub(time.Unix(0, lastNanos)).Seconds()
 		}
-		return now.Sub(time.Unix(0, lastNanos)).Seconds()
+		if sec < 0 {
+			sec = 0
+		}
+		return sec
 	}
 	ages := map[string]float64{
 		"resolve":      age(d.resolveLastSuccessNanos.Load()),
