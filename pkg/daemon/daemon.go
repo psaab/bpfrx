@@ -64,15 +64,15 @@ const nodeIDFile = "/etc/xpf/node-id"
 
 // Daemon is the main xpf daemon.
 type Daemon struct {
-	opts                       Options
-	store                      *configstore.Store
-	dp                         dataplane.RuntimeDataPlane
-	networkd                   *networkd.Manager
-	routing                    *routing.Manager
-	frr                        *frr.Manager
-	ipsec                      *ipsec.Manager
-	ra                         *ra.Manager
-	dhcp                       *dhcp.Manager
+	opts     Options
+	store    *configstore.Store
+	dp       dataplane.RuntimeDataPlane
+	networkd *networkd.Manager
+	routing  *routing.Manager
+	frr      *frr.Manager
+	ipsec    *ipsec.Manager
+	ra       *ra.Manager
+	dhcp     *dhcp.Manager
 	// dnsBootDone gates the #1715 DNS boot policy. It is false during the
 	// single boot-time applyConfig (which runs before DHCP clients start,
 	// so the lease set is empty) and set true immediately after. While
@@ -106,22 +106,39 @@ type Daemon struct {
 	syncPeerConnected          atomic.Bool
 	lastStandbyNeighborRefresh atomic.Int64
 	neighborWarmupInFlight     atomic.Bool
-	hbSuppressStart            atomic.Int64 // UnixNano of first heartbeat suppression; 0 = inactive
-	syncPrimeRetryGen          atomic.Uint64
-	syncReadyTimerGen          atomic.Uint64
-	syncReadyTimerMu           sync.Mutex
-	syncReadyTimer             *time.Timer
-	syncReadyTimeout           time.Duration
-	slogHandler                *logging.SyslogSlogHandler
-	traceWriter                *logging.TraceWriter
-	eventBuf                   *logging.EventBuffer
-	eventReader                *logging.EventReader
-	eventEngine                *eventengine.Engine
-	aggregator                 *logging.SessionAggregator
-	aggCancel                  context.CancelFunc
-	vrrpMgr                    *vrrp.Manager
-	gc                         *conntrack.GC
-	startTime                  time.Time // daemon start time; used to suppress stale config sync
+	// #1780 Path A: per-phase supervision of runPeriodicNeighborResolution.
+	// Each periodic phase runs in a guarded goroutine so a hung netlink/probe
+	// syscall in one phase can never freeze the for-select loop (the observed
+	// 17.5h stall). In-flight bools skip a phase while a prior pass is still
+	// running (no overlap / netlink-socket leak — a stuck syscall can't be
+	// cancelled, so we leak at most one goroutine per phase, never a growing
+	// pile). The last-success UnixNano feeds the
+	// neighbor_periodic_last_success_age_seconds{phase} gauge so a stalled
+	// phase is observable. neighborWarmupInFlight (above) already follows this
+	// pattern for warmNeighborCache.
+	resolveNeighborsInFlight    atomic.Bool
+	forceProbeInFlight          atomic.Bool
+	cleanFailedInFlight         atomic.Bool
+	resolveLastSuccessNanos     atomic.Int64
+	forceProbeLastSuccessNanos  atomic.Int64
+	cleanFailedLastSuccessNanos atomic.Int64
+	warmLastSuccessNanos        atomic.Int64
+	hbSuppressStart             atomic.Int64 // UnixNano of first heartbeat suppression; 0 = inactive
+	syncPrimeRetryGen           atomic.Uint64
+	syncReadyTimerGen           atomic.Uint64
+	syncReadyTimerMu            sync.Mutex
+	syncReadyTimer              *time.Timer
+	syncReadyTimeout            time.Duration
+	slogHandler                 *logging.SyslogSlogHandler
+	traceWriter                 *logging.TraceWriter
+	eventBuf                    *logging.EventBuffer
+	eventReader                 *logging.EventReader
+	eventEngine                 *eventengine.Engine
+	aggregator                  *logging.SessionAggregator
+	aggCancel                   context.CancelFunc
+	vrrpMgr                     *vrrp.Manager
+	gc                          *conntrack.GC
+	startTime                   time.Time // daemon start time; used to suppress stale config sync
 
 	// #846: applySem (capacity 1) serializes applyConfig + the
 	// commit→apply pair across all entry points (HTTP/gRPC commits,
