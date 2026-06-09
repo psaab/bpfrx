@@ -19,8 +19,11 @@ func (d *Daemon) applyLo0Filter(cfg *config.Config) {
 	filterV4 := cfg.System.Lo0FilterInputV4
 	filterV6 := cfg.System.Lo0FilterInputV6
 	if filterV4 == "" && filterV6 == "" {
-		// No lo0 filter configured — clean up any stale nftables rules
-		_ = exec.Command("nft", "delete", "table", "inet", "xpf_lo0").Run()
+		// No lo0 filter configured — clean up any stale nftables rules.
+		// The error stays discarded: delete fails normally when the
+		// table doesn't exist (the common case). Timeout-bounded so a
+		// wedged nft cannot stall the apply path (#1794).
+		_, _ = runCommandTimeout("nft", "delete", "table", "inet", "xpf_lo0")
 		return
 	}
 

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -348,9 +347,11 @@ func networkctlReload() error {
 	return nil
 }
 
-// execCommand runs a command and returns combined output.
+// execCommand runs a command under the shared 15s apply-path timeout
+// (#1794) and returns combined output. networkctlReload runs while
+// applySem is held; an unbounded `networkctl reload` (dbus stall) would
+// otherwise wedge every commit.
 func execCommand(name string, args ...string) (string, error) {
-	cmd := exec.Command(name, args...)
-	out, err := cmd.CombinedOutput()
+	out, err := runCommandTimeout(name, args...)
 	return string(out), err
 }

@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -567,7 +566,7 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 			// rx-vlan-offload) during the link down/up cycle that
 			// programRethMAC requires. Without this, XDP cannot see
 			// VLAN tags in the packet data and drops VLAN traffic.
-			if out, err := exec.Command("ethtool", "-K", linuxName, "rxvlan", "off").CombinedOutput(); err != nil {
+			if out, err := runCommandTimeout("ethtool", "-K", linuxName, "rxvlan", "off"); err != nil {
 				slog.Warn("failed to re-disable rxvlan after RETH MAC",
 					"interface", linuxName, "err", err, "output", strings.TrimSpace(string(out)))
 			} else {
