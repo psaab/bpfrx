@@ -269,8 +269,8 @@ func (m *Manager) generateKea4Config(cfg *config.DHCPServerConfig) error {
 				"type": "memfile",
 				"name": "/var/lib/kea/kea-leases4.csv",
 			},
-			"valid-lifetime":   86400,
-			"subnet4":          subnets,
+			"valid-lifetime": 86400,
+			"subnet4":        subnets,
 		},
 	}
 

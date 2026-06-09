@@ -87,6 +87,9 @@ func (realExecutor) SystemctlReload(ctx context.Context) error {
 // Mirrors the historical reload() fallback (frr.go:1068-1069 pre-split).
 func (realExecutor) VtyshLoad(ctx context.Context, conf string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "vtysh", "-f", conf)
+	// WaitDelay caps the post-SIGKILL pipe-drain window (apply-reachable
+	// via the FRR reload fallback).
+	cmd.WaitDelay = 5 * time.Second
 	return cmd.CombinedOutput()
 }
 

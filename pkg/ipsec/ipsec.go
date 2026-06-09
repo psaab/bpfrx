@@ -643,6 +643,9 @@ func (m *Manager) GetSAStatus() ([]SAStatus, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), swanctlTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "swanctl", "--list-sas")
+	// Buffer-backed Stdout/Stderr are pipe-fed by the runtime, so the
+	// post-SIGKILL drain window applies here too.
+	cmd.WaitDelay = 5 * time.Second
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
