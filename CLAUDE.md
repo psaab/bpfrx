@@ -3,8 +3,8 @@
 > Dataplane notice (#1373, complete): the eBPF dataplane retirement is done.
 > The Rust AF_XDP userspace dataplane is the only runtime forwarding path.
 > The legacy BPF source was deleted in #1476; explicit `system dataplane-type
-> ebpf` is hard-rejected at commit (`ErrEBPFDataplaneRetired`) and at runtime
-> (`ErrEBPFBackendRetired`, `pkg/dataplane/dataplane.go`).
+> ebpf` is hard-rejected at commit (`ErrEBPFDataplaneRetired`, `pkg/config`
+> compiler) and at runtime (`ErrEBPFBackendRetired`, `pkg/dataplane/dataplane.go`).
 
 ## Working Style
 - Think before acting. Read existing files before writing code.

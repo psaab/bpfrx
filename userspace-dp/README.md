@@ -2,9 +2,10 @@
 
 > #1373 status (complete): the eBPF dataplane retirement is done. This Rust
 > AF_XDP dataplane is the only runtime forwarding path. The legacy BPF source
-> (`bpf/xdp/*.c`, `bpf/tc/*.c`) was deleted in #1476, and `pkg/dataplane`
-> hard-rejects the eBPF backend at commit (`ErrEBPFDataplaneRetired`) and
-> runtime (`ErrEBPFBackendRetired`).
+> (`bpf/xdp/*.c`, `bpf/tc/*.c`) was deleted in #1476; the eBPF backend is
+> hard-rejected at commit by the config compiler (`ErrEBPFDataplaneRetired`,
+> `pkg/config`) and at runtime by the dataplane factory
+> (`ErrEBPFBackendRetired`, `pkg/dataplane`).
 
 Standalone Rust AF_XDP dataplane that mirrors the BPF pipeline
 (screen → zone → conntrack → policy → NAT → forward) but in userspace.
@@ -15,7 +16,8 @@ This crate is the only runtime dataplane backend: an empty / omitted
 `system dataplane-type` resolves to userspace in
 `pkg/dataplane.EffectiveType`. Operators can still pin the selection
 explicitly with `set system dataplane-type userspace`. The legacy eBPF
-backend is retired (#1373/#1476) and hard-rejected by `pkg/dataplane`;
+backend is retired (#1373/#1476) and hard-rejected (commit: `pkg/config`
+compiler; runtime: `pkg/dataplane` factory);
 the DPDK backend is retired under #1525.
 
 ## Crate entry
