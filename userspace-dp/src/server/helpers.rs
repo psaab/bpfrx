@@ -46,10 +46,13 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     // The per-key dynamic_neighbors dump is a high-cardinality
     // (ifindex,ip)-labelled debug surface used only by the #1782 cold-start
     // capture. Gate it behind XPF_DEBUG_NEIGHBOR_KEYS so it is OFF by default:
-    // unset -> empty field -> no Prometheus series AND no all-shard lock on the
-    // status path. The operator launches the daemon with the env set for the
-    // overnight capture only (review consensus: Codex + AGY + Claude SMR all
-    // asked for this to be gated, not permanent on /metrics).
+    // unset -> empty field -> no Prometheus series AND no additional
+    // dynamic_neighbor_keys() all-shard traversal here. (The scalar
+    // neighbor_entries count above still takes the pre-existing len() shard
+    // path regardless — this gate only removes the new per-key dump's
+    // traversal + cardinality.) The operator launches the daemon with the env
+    // set for the overnight capture only (review consensus: Codex + AGY +
+    // Claude SMR all asked for this to be gated, not permanent on /metrics).
     state.status.dynamic_neighbor_keys = if std::env::var_os("XPF_DEBUG_NEIGHBOR_KEYS").is_some() {
         state
             .afxdp

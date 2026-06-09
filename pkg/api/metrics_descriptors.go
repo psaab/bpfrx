@@ -811,7 +811,7 @@ func newCollector(srv *Server) *xpfCollector {
 		),
 		dynamicNeighborPresent: prometheus.NewDesc(
 			"xpf_userspace_dynamic_neighbor_present",
-			"Per-key presence gauge (always 1) dumped from the helper userspace dynamic_neighbors mirror so the cold-start capture harness can grep the pre-connect t0' next-hop membership (the H2 absence fingerprint) (#1782).",
+			"Per-key presence gauge (always 1) dumped from the helper userspace dynamic_neighbors mirror so the cold-start capture harness can grep the pre-connect t0' next-hop membership (the H2 absence fingerprint) (#1782). DEBUG-ONLY: gated behind the helper's XPF_DEBUG_NEIGHBOR_KEYS env var and absent by default — an absent metric family means the dump is disabled, NOT that dynamic_neighbors is empty.",
 			[]string{"ifindex", "ip"}, nil,
 		),
 		// #1769: on-demand neighbor-resolver telemetry — operator-visible

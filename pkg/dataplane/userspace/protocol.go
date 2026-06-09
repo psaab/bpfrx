@@ -632,8 +632,11 @@ type ProcessStatus struct {
 	// DynamicNeighborKeys is a debug dump of every key in the helper's
 	// dynamic_neighbors mirror ("ifindex ip"), surfaced as the per-key
 	// xpf_userspace_dynamic_neighbor_present gauge so the capture harness
-	// can confirm the t0' next-hop miss (the H2 fingerprint). All are
-	// omitempty for wire-compat with older helpers.
+	// can confirm the t0' next-hop miss (the H2 fingerprint). It is gated
+	// behind the helper's XPF_DEBUG_NEIGHBOR_KEYS env var and is empty by
+	// default — an empty slice (and an absent gauge family) does NOT mean
+	// the mirror is empty, only that the debug dump was not enabled. All
+	// are omitempty for wire-compat with older helpers.
 	NegNeighFastFailTotal           uint64   `json:"neg_neigh_fast_fail_total,omitempty"`
 	PendingNeighDuplicateDropsTotal uint64   `json:"pending_neigh_duplicate_drops_total,omitempty"`
 	DynamicNeighborKeys             []string `json:"dynamic_neighbor_keys,omitempty"`

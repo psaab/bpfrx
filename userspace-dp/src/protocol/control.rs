@@ -171,7 +171,10 @@ pub(crate) struct ProcessStatus {
     /// `"ifindex ip"` strings. The capture harness greps this at the
     /// pre-connect t0' sample to confirm the data-path next-hop is ABSENT
     /// (the H2 fingerprint). Empty (and omitted) on dataplanes that don't
-    /// publish or when the mirror is empty.
+    /// publish, when the mirror is empty, OR — by default — because the dump
+    /// is gated behind the `XPF_DEBUG_NEIGHBOR_KEYS` env var (off unless the
+    /// helper is launched with it set for a capture). An empty field
+    /// therefore does NOT imply the mirror is empty.
     #[serde(
         rename = "dynamic_neighbor_keys",
         default,
