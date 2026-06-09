@@ -794,8 +794,17 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 
 	// 3b. Apply next-table policy routing rules (ip rule)
 	if d.routing != nil {
-		// Collect all static routes from main + per-rib
-		allRoutes := append(cfg.RoutingOptions.StaticRoutes, cfg.RoutingOptions.Inet6StaticRoutes...)
+		// Collect all static routes from main + per-rib. Build the combined
+		// list in a fresh slice — appending Inet6StaticRoutes onto
+		// cfg.RoutingOptions.StaticRoutes directly would write into that
+		// slice's backing array when it has spare capacity (cap > len),
+		// mutating the shared active-config object other goroutines read
+		// concurrently (same hazard fixed in collectNeighborProbeTargets,
+		// fbd159e55 / #1781 r1).
+		allRoutes := make([]*config.StaticRoute, 0,
+			len(cfg.RoutingOptions.StaticRoutes)+len(cfg.RoutingOptions.Inet6StaticRoutes))
+		allRoutes = append(allRoutes, cfg.RoutingOptions.StaticRoutes...)
+		allRoutes = append(allRoutes, cfg.RoutingOptions.Inet6StaticRoutes...)
 		if err := d.routing.ApplyNextTableRules(allRoutes, cfg.RoutingInstances); err != nil {
 			slog.Warn("failed to apply next-table rules", "err", err)
 		}
