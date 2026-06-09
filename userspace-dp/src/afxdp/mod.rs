@@ -330,18 +330,23 @@ const XDP_OPTIONS: c_int = 8;
 const XDP_OPTIONS_ZEROCOPY: u32 = 1;
 
 const PENDING_NEIGH_TIMEOUT_NS: u64 = 2_000_000_000; // 2 seconds
-// GEMINI-NEXT.md Section 3 cold start: admission cap bumped 64 → 4096 so a
-// per-binding burst of new connections during the ARP/NDP probe window
-// doesn't drop frames. PendingNeighPacket is 264 B on x86_64 (XdpDesc +
-// UserspaceDpMeta + SessionDecision + flow key + queued_ns + probe_attempts),
-// so worst-case per binding when the queue is fully populated is ~1.0 MiB.
-// To avoid paying that ~1.0 MiB up front per binding × N bindings, the
-// underlying VecDeque is now constructed with `VecDeque::new()` (zero
-// capacity) at worker init — see worker/mod.rs.
-// The buffer grows on push only when traffic actually queues up, and the
-// 4096 admission check in poll_descriptor.rs enforces the upper bound.
-// This unblocks parallel-connect storms during cluster failback while
-// keeping idle-binding RSS near zero.
+// #1771 §2.2: `pending_neigh` is a FastMap keyed by `(egress_ifindex,
+// next_hop)` holding ONE representative packet per unresolved next-hop —
+// not a packet FIFO. Admission keeps the OLDEST packet for a key (it
+// drives the probe/dwell clock); later packets to the same hop are
+// dropped + recycled and counted via `pending_neigh_duplicate_drops`
+// (the #1782 H5 sibling-drop signal). This cap therefore bounds DISTINCT
+// unresolved next-hops per binding, and pins at most one UMEM frame per
+// hop — a SYN flood to one dead host holds 1 entry, not 4096.
+// PendingNeighPacket is 264 B on x86_64 (XdpDesc + UserspaceDpMeta +
+// SessionDecision + flow key + queued_ns + probe_attempts), so the
+// worst case is ~1.0 MiB per binding — but reaching it now requires
+// 4096 *distinct* unresolved hops (a scan-shaped workload), not a
+// connect burst. The map is lazily allocated (`FastMap::default()` at
+// worker init — see worker/mod.rs), keeping idle-binding RSS near zero.
+// History: pre-#1771 this was a per-packet VecDeque whose cap was bumped
+// 64 → 4096 (GEMINI-NEXT.md Section 3) so failback connect storms didn't
+// drop frames; post-#1771 sibling drops are by design and counted.
 const MAX_PENDING_NEIGH: usize = 4096;
 
 // #1651 B3: dead-host negative neighbor cache (per binding). When a
