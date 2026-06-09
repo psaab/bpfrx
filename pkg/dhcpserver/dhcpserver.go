@@ -29,7 +29,10 @@ const systemctlTimeout = 15 * time.Second
 func runSystemctl(args ...string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), systemctlTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "systemctl", args...).CombinedOutput()
+	cmd := exec.CommandContext(ctx, "systemctl", args...)
+	// WaitDelay caps the post-SIGKILL pipe-drain window.
+	cmd.WaitDelay = 5 * time.Second
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("systemctl %s: %w: %s",
 			strings.Join(args, " "), err, strings.TrimSpace(string(out)))

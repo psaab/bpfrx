@@ -257,8 +257,11 @@ func (t *tunnelManager) Apply(tunnels []*config.TunnelConfig) error {
 			// called inline (not deferred) because this runs in the
 			// per-tunnel loop.
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			out, err := exec.CommandContext(ctx, "ip", "link", "set", tc.Name,
-				"type", "ip6gre", "encaplimit", "none").CombinedOutput()
+			ipCmd := exec.CommandContext(ctx, "ip", "link", "set", tc.Name,
+				"type", "ip6gre", "encaplimit", "none")
+			// WaitDelay caps the post-SIGKILL pipe-drain window.
+			ipCmd.WaitDelay = 5 * time.Second
+			out, err := ipCmd.CombinedOutput()
 			cancel()
 			if err != nil {
 				slog.Warn("failed to set tunnel encaplimit",

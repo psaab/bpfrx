@@ -65,6 +65,8 @@ func (realExecutor) Vtysh(command string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), vtyshTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "vtysh", "-c", command)
+	// WaitDelay caps the post-SIGKILL pipe-drain window.
+	cmd.WaitDelay = 5 * time.Second
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

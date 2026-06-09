@@ -31,7 +31,11 @@ const swanctlTimeout = 15 * time.Second
 func runSwanctl(args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), swanctlTimeout)
 	defer cancel()
-	return exec.CommandContext(ctx, "swanctl", args...).CombinedOutput()
+	cmd := exec.CommandContext(ctx, "swanctl", args...)
+	// WaitDelay caps the post-SIGKILL pipe-drain window (a charon child
+	// inheriting the pipe could otherwise hold CombinedOutput open).
+	cmd.WaitDelay = 5 * time.Second
+	return cmd.CombinedOutput()
 }
 
 const (
