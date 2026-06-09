@@ -452,6 +452,18 @@ func newCollector(srv *Server) *xpfCollector {
 				"research.",
 			nil, nil,
 		),
+		userspaceSessionPublishErrors: prometheus.NewDesc(
+			"xpf_userspace_session_publish_errors_total",
+			"Failed USERSPACE_SESSIONS BPF-map publishes across all helper "+
+				"paths (worker poll, HA upsert, session-glue, post-reconcile "+
+				"replay, activation/reverse prewarm). A failed publish means "+
+				"the XDP shim never learns the session key and takes the "+
+				"NO_SESSION degraded path (drop in STRICT mode); a rising "+
+				"value attributes shim no-session fallbacks to publish "+
+				"failures (session map at capacity, stale fd after "+
+				"reconcile) (#1789).",
+			nil, nil,
+		),
 		userspaceFlowCacheActiveFlows: prometheus.NewDesc(
 			"xpf_userspace_flow_cache_active_flows",
 			"Aggregate active userspace flow-cache entries across bindings.",

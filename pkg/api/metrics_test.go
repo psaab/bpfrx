@@ -645,6 +645,12 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 			nil,
 			nil,
 		),
+		userspaceSessionPublishErrors: prometheus.NewDesc(
+			"xpf_userspace_session_publish_errors_total",
+			"session publish errors",
+			nil,
+			nil,
+		),
 		userspaceFlowCacheActiveFlows: prometheus.NewDesc(
 			"xpf_userspace_flow_cache_active_flows",
 			"flow-cache active flows",
@@ -667,6 +673,8 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	status := dpuserspace.ProcessStatus{
 		SessionTableEntries: 77,
 		MaxSessions:         100,
+		// #1789: publish-error counter emitted unconditionally.
+		SessionPublishErrorsTotal: 6,
 		Bindings: []dpuserspace.BindingStatus{
 			{
 				Slot:              0,
@@ -696,8 +704,8 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	for m := range ch {
 		got = append(got, m)
 	}
-	if len(got) != 7 {
-		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 7 metrics, got %d", len(got))
+	if len(got) != 8 {
+		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 8 metrics, got %d", len(got))
 	}
 
 	assertGaugeClose(t, got, c.userspaceSessionTableEntries, nil, 77)
@@ -705,6 +713,8 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// #1760: collision counter emitted unconditionally (0 with no
 	// collisions configured in this fixture).
 	assertCounterClose(t, got, c.userspaceNatReverseKeyCollisions, nil, 0)
+	// #1789: publish-error counter emitted unconditionally.
+	assertCounterClose(t, got, c.userspaceSessionPublishErrors, nil, 6)
 	assertGaugeClose(t, got, c.userspaceFlowCacheActiveFlows, nil, 12)
 	assertGaugeClose(t, got, c.userspaceFlowCacheCapacity, nil, 20)
 	assertGaugeClose(t, got, c.bindingFlowCacheCapacity, map[string]string{

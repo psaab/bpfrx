@@ -640,6 +640,16 @@ type ProcessStatus struct {
 	NegNeighFastFailTotal           uint64   `json:"neg_neigh_fast_fail_total,omitempty"`
 	PendingNeighDuplicateDropsTotal uint64   `json:"pending_neigh_duplicate_drops_total,omitempty"`
 	DynamicNeighborKeys             []string `json:"dynamic_neighbor_keys,omitempty"`
+	// #1789: total failed USERSPACE_SESSIONS BPF-map publishes (per-binding
+	// worker-poll sites summed with the shared no-binding sites: HA upsert,
+	// session-glue worker publish, post-reconcile replay, activation/reverse
+	// prewarm). A failed publish means the XDP shim never learns the session
+	// key and takes the NO_SESSION degraded path (drop in STRICT mode), so a
+	// rising value is the cause-side signal for rising shim no-session
+	// fallbacks (session map at capacity, stale fd after reconcile). Surfaced
+	// as xpf_userspace_session_publish_errors_total. Omitempty for wire
+	// compat with older helpers.
+	SessionPublishErrorsTotal uint64 `json:"session_publish_errors_total,omitempty"`
 	// #1769: on-demand neighbor-resolver telemetry. The resolver fires
 	// when a MissingNeighbor negative-cache fast-fail nudges a wedged dst
 	// (single-key RTM_GETNEIGH + epoch-guarded cache or probe-on-stale).

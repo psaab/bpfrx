@@ -760,6 +760,7 @@
     "recent_session_deltas": [],
     "ring_entries": 0,
     "route_entries": 0,
+    "session_publish_errors_total": 0,
     "session_table_entries": 0,
     "slow_path": {
       "active": false,

@@ -308,6 +308,15 @@ func (c *xpfCollector) emitUserspaceDynamicBufferMetrics(ch chan<- prometheus.Me
 		float64(status.NatReverseKeyCollisions),
 	)
 
+	// #1789: failed USERSPACE_SESSIONS BPF-map publishes. Also emitted
+	// unconditionally so a 0 is a real "no publish failures" signal
+	// rather than an absent series.
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceSessionPublishErrors,
+		prometheus.CounterValue,
+		float64(status.SessionPublishErrorsTotal),
+	)
+
 	var activeFlows, flowCapacity uint64
 	for _, b := range status.Bindings {
 		activeFlows += uint64(b.ActiveFlowCount)
