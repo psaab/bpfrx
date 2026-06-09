@@ -50,7 +50,8 @@
 #   SIBLINGS    parallel sibling streams (default 4 — exercises H5)
 #   NEXTHOP_V4  next-hop to grep for     (default = TARGET_V4, directly connected)
 #   NEXTHOP_V6  next-hop to grep for     (default = TARGET_V6, directly connected)
-#   DP_IFACE    data-path egress iface   (default ge-0-0-2 — reth0.80 WAN side)
+#   DP_IFACE    data-path egress iface   (default per-node: ge-0-0-2 on fw0,
+#               ge-7-0-2 on fw1 — reth0.80 WAN side, FPC 0 vs 7)
 #   METRICS_URL daemon Prometheus URL    (default http://127.0.0.1:8080/metrics)
 #   IDLE_SECONDS pre-connect idle wait   (default 0)
 #   ART         artifact dir             (default /tmp/cold-stall-<ts>)
@@ -65,7 +66,14 @@ PORT="${PORT:-5201}"
 SIBLINGS="${SIBLINGS:-4}"
 NEXTHOP_V4="${NEXTHOP_V4:-$TARGET_V4}"
 NEXTHOP_V6="${NEXTHOP_V6:-$TARGET_V6}"
-DP_IFACE="${DP_IFACE:-ge-0-0-2}"
+# The WAN-side VF name is per-node (ge-{FPC}-0-2, FPC 0 vs 7 — see
+# pkg/daemon/linksetup.go + docs/ha-cluster-userspace.conf), so derive the
+# default from the target node instead of hardcoding node 0's name (#1786).
+# An explicit DP_IFACE env override still wins.
+case "$FW" in
+  *fw1) DP_IFACE="${DP_IFACE:-ge-7-0-2}" ;;
+  *)    DP_IFACE="${DP_IFACE:-ge-0-0-2}" ;;
+esac
 METRICS_URL="${METRICS_URL:-http://127.0.0.1:8080/metrics}"
 IDLE_SECONDS="${IDLE_SECONDS:-0}"
 ART="${ART:-/tmp/cold-stall-$(date +%s)}"
@@ -268,6 +276,17 @@ reduce_deltas() {
 }
 
 trap 'stop_syn_tcpdump; stop_neigh_monitor' EXIT
+
+# Fail fast if DP_IFACE does not exist on the target node. Every
+# per-interface evidence channel below (neigh sysctls, the SYN-exchange
+# tcpdump, the ifindex-keyed membership check) tolerates errors with
+# `|| true`, so a wrong interface name would otherwise produce a quietly
+# hollow artifact — unacceptable for a one-shot overnight capture (#1786).
+# Placed AFTER the EXIT trap so a wrong-iface --connect resume cleanly
+# stops the overnight monitor (finalizing its log) instead of orphaning
+# it, and BEFORE the monitor/sysctl/tcpdump arming below.
+fw "ip link show $DP_IFACE" >/dev/null 2>&1 \
+  || { echo "ERROR: DP_IFACE $DP_IFACE not present on $FW" >&2; exit 2; }
 
 # Arm the monitor + capture sysctls first (item 4 / item 6). In --connect mode
 # resuming an overnight --monitor-only run, REUSE the existing monitor log —
