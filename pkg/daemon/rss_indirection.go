@@ -71,7 +71,11 @@ type rssExecutor interface {
 type realRSSExecutor struct{}
 
 func (realRSSExecutor) runEthtool(args ...string) ([]byte, error) {
-	return exec.Command("ethtool", args...).CombinedOutput()
+	// Timeout-bounded (#1794/#1800 U3, AGY r2): reapplyRSSIndirection runs
+	// on the config-apply path (daemon_apply.go) under applySem, so a
+	// wedged ethtool (mlx5 indirection-table ioctl stall) would hang every
+	// commit. Error-wrapping contract of this executor seam is unchanged.
+	return runCommandTimeout("ethtool", args...)
 }
 
 func (realRSSExecutor) readDriver(iface string) string {
