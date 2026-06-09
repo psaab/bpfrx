@@ -287,16 +287,22 @@ func disableMaskResolved() error {
 	//     as a second resolver owner; nothing to disable/mask. Treating it
 	//     as success avoids a spurious "second owner" warning on every
 	//     reconcile on minimal installs that lack the resolved package.
-	out, _ := exec.CommandContext(ctx, "systemctl", "is-enabled", "systemd-resolved.service").CombinedOutput()
+	isEnabledCmd := exec.CommandContext(ctx, "systemctl", "is-enabled", "systemd-resolved.service")
+	isEnabledCmd.WaitDelay = 5 * time.Second // post-SIGKILL pipe-drain cap (#1794)
+	out, _ := isEnabledCmd.CombinedOutput()
 	switch strings.TrimSpace(string(out)) {
 	case "masked", "not-found":
 		return nil
 	}
 
-	if out, err := exec.CommandContext(ctx, "systemctl", "disable", "--now", "systemd-resolved.service").CombinedOutput(); err != nil {
+	disableCmd := exec.CommandContext(ctx, "systemctl", "disable", "--now", "systemd-resolved.service")
+	disableCmd.WaitDelay = 5 * time.Second
+	if out, err := disableCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("disable --now systemd-resolved: %w (%s)", err, string(out))
 	}
-	if out, err := exec.CommandContext(ctx, "systemctl", "mask", "systemd-resolved.service").CombinedOutput(); err != nil {
+	maskCmd := exec.CommandContext(ctx, "systemctl", "mask", "systemd-resolved.service")
+	maskCmd.WaitDelay = 5 * time.Second
+	if out, err := maskCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("mask systemd-resolved: %w (%s)", err, string(out))
 	}
 	return nil

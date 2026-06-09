@@ -60,6 +60,8 @@ func (d *Daemon) applyLo0Filter(cfg *config.Config) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "nft", "-f", "-")
+	// WaitDelay caps the post-SIGKILL pipe-drain window (#1794).
+	cmd.WaitDelay = 5 * time.Second
 	cmd.Stdin = strings.NewReader("flush ruleset inet xpf_lo0\n" + nftConf)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		slog.Warn("failed to apply lo0 filter", "err", err, "output", string(out))

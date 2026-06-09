@@ -312,7 +312,9 @@ func reloadChronyRuntime(sourcesChanged, thresholdChanged bool) {
 	defer cancel()
 
 	if sourcesChanged {
-		if out, err := exec.CommandContext(ctx, "chronyc", "reload", "sources").CombinedOutput(); err != nil {
+		chronyCmd := exec.CommandContext(ctx, "chronyc", "reload", "sources")
+		chronyCmd.WaitDelay = 5 * time.Second // post-SIGKILL pipe-drain cap (#1794)
+		if out, err := chronyCmd.CombinedOutput(); err != nil {
 			slog.Warn("failed to reload chrony sources", "err", err, "output", string(out))
 		}
 	}
@@ -328,7 +330,9 @@ func reloadChronyRuntime(sourcesChanged, thresholdChanged bool) {
 		{"systemctl", "restart", "chronyd"},
 	}
 	for _, cmd := range commands {
-		if out, err := exec.CommandContext(ctx, cmd[0], cmd[1:]...).CombinedOutput(); err == nil {
+		reloadCmd := exec.CommandContext(ctx, cmd[0], cmd[1:]...)
+		reloadCmd.WaitDelay = 5 * time.Second
+		if out, err := reloadCmd.CombinedOutput(); err == nil {
 			return
 		} else {
 			slog.Debug("chrony config reload attempt failed", "cmd", strings.Join(cmd, " "), "err", err, "output", string(out))
