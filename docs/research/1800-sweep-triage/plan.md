@@ -1,6 +1,6 @@
 # #1800 — Adversarial sweep #1784–#1799: triage + remediation plan
 
-**Status:** DRAFT v2.1 — folds r2 (Codex PLAN-NEEDS-MINOR: all §11 questions answered + PrivateRGElection window correction; AGY r2 re-raised already-folded r1 items — see reviewer-ids.md; SMR r2 PLAN-READY). Pending r3 confirmation.
+**Status:** CONVERGED PLAN-READY v2.2 — r3: Codex PLAN-READY (folds verified faithful) + SMR PLAN-READY + AGY PLAN-NEEDS-MINOR whose verified-new items are folded below (its two wall-clock claims on `startedAt`/transfer-windows were verified FALSE — direct `time.Time` comparisons retain Go's monotonic reading; recorded as audited-safe in §5.6). Awaiting `/engineer` per-unit.
 
 ## 1. Issue framing
 
@@ -122,6 +122,19 @@ surfaced a second defect (AGY):
   fire-and-forget, `sync_conn.go:572`). Keep the in-memory apply, flip a
   `configPersistDegraded` health flag (/health 503 + Prometheus + journal
   ERROR) and retry persistence with backoff.
+- **Nested `CommitConfirmed` overwrites the rollback target (store.go:879-880): NEW
+  defect (AGY r3, verified)** — a second `CommitConfirmed` while a prior one is
+  still pending cancels the first timer and sets `confirmPrevTree =
+  s.active.Clone()` — which IS the unconfirmed Commit-1 tree. If Commit 2 then
+  times out, the system "rolls back" to the equally-unconfirmed Commit 1 and
+  stays there forever (its timer is gone). Fix in U6: when `confirmTimer !=
+  nil`, preserve the ORIGINAL `confirmPrevTree` (the last confirmed config)
+  instead of overwriting it.
+- **SyncApply Option-B retry discipline (AGY r3):** the persistence retry loop
+  must re-read the CURRENT `s.active` under `s.mu` at each attempt (never a
+  captured stale tree) and must be a singleton (no concurrent retry goroutines
+  racing on disk writes) — otherwise rapid successive syncs can persist
+  out-of-order state.
 - **`performAutoRollback` (store.go:964): NEW defect, same family** — its
   `WriteActive` is also warn-only; a persist failure during auto-rollback
   reverts memory but leaves the unconfirmed candidate on disk → reboot loads
@@ -170,7 +183,12 @@ restart must not kill leases, `pkg/dhcp/README.md:31`), and per-client
    restart that client.
 2. Registry hygiene: deregister on ALL terminal run-goroutine exits (defer),
    not just in `Renew`; fix `StopAll` to clear entries.
-3. Stop semantics (open question resolved → lean): stop renewing + remove the
+3. **No-restart-on-lease-change invariant (AGY r3):** DHCP lease changes
+   invoke callbacks that re-enter `applyConfig` (`daemon_dhcp.go:44`), so the
+   reconcile diff MUST key strictly on config identity (iface, family,
+   options) and never on lease/address state — otherwise lease change →
+   callback → reconcile → client restart → lease change is an infinite loop.
+4. Stop semantics (open question resolved → lean): stop renewing + remove the
    address; do NOT send protocol RELEASE (matches interface-deconfiguration
    behavior elsewhere; r2 may override).
 
@@ -220,6 +238,19 @@ Design (Option A refined):
   and the 5×100 ms window IS the failover-detection budget. Default stays
   5×100 ms; widening (e.g. 5×200 ms) is offered only as an explicit,
   operator-opted, documented failover-latency trade — never silently.
+- **Hazard-class demarcation (r3, important for the implementer):** the
+  wall-clock bug class is ONLY where timestamps round-trip through
+  `UnixNano`→`time.Unix(0,n)` (which strips Go's monotonic reading) or wire
+  serialization. Direct in-process `time.Time` values retain the monotonic
+  clock, and `Since`/`Before` use it when present — so `r.startedAt`
+  (heartbeat.go:373) and the manual-transfer grace/hold windows
+  (failover.go:323/359, compared at :845-863) were AUDITED SAFE in r3 (AGY
+  claimed them; verification showed both sides are direct `time.Time`). Do
+  not churn those. `sync_bulk.go:223` (`PendingBulkAck` age) IS in the
+  stripped class but already clamps `age < 0`; migrate for consistency only.
+- **Implementation tip (AGY r3):** storing `time.Time` values directly in an
+  `atomic.Value` preserves the embedded monotonic reading — often simpler
+  than a hand-rolled monotonic-ns accessor for the `lastSeen` migration.
 - Validation: `make test-failover` + live clock-step repro (`date -s +5sec`
   on one node, then both) + heartbeat-restart repro + pause/resume.
 
@@ -242,8 +273,11 @@ unneeded invariant with the justification inlined in the comment); AGY notes
 keeping the existing bulk write on the change path (Option A shape) preserves
 the invariant at zero extra cost since change is rare. Either is acceptable —
 the steady-state cost is identical (zero writes, zero allocs, no bulk lock);
-the implementer picks one and documents it. Pair-consuming-reader absence
-must be re-verified at implementation time.
+the implementer picks one and documents it (AGY r3 adds a point FOR B: per-key
+inserts remove `with_all_shards`/`BulkShardGuard` from RX processing entirely —
+workers then never hold more than one shard lock, eliminating the lock-ordering
+class by construction). Pair-consuming-reader absence must be re-verified at
+implementation time.
 
 ## 6. Public API preservation
 
@@ -295,7 +329,7 @@ cluster; the U5a harness becomes a permanent regression suite.
 - #1782 PR-2 (separate; U2/#1786 unblocks its capture).
 - The `1635-wip` local working-tree state.
 
-## 11. Open questions for adversarial review (r2)
+## 11. Open questions — RESOLVED in r2/r3 (retained for the record)
 
 1. U6 split semantics: does anyone see a hole in A-for-operator /
    B-for-SyncApply / B-for-auto-rollback / not-arm-for-CommitConfirmed?
