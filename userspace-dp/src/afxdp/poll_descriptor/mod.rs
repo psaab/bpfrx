@@ -2419,12 +2419,22 @@ pub(super) fn poll_binding_process_descriptor(
                                             &worker_ctx.shared_owner_rg_indexes,
                                             &entry,
                                         );
-                                        let _ = publish_session_map_entry_for_session(
+                                        // #1789: count a failed publish
+                                        // (shim misses the key -> NO_SESSION
+                                        // degraded path for the seeded flow).
+                                        if publish_session_map_entry_for_session(
                                             binding.bpf_maps.session_map_fd,
                                             &flow.forward_key,
                                             pending_decision,
                                             &entry.metadata,
-                                        );
+                                        )
+                                        .is_err()
+                                        {
+                                            binding
+                                                .live
+                                                .session_publish_errors
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
                                         publish_bpf_conntrack_entry(
                                             conntrack_v4_fd,
                                             conntrack_v6_fd,
