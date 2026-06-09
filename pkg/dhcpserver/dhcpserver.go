@@ -2,15 +2,43 @@
 package dhcpserver
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/psaab/xpf/pkg/config"
 )
+
+// systemctlTimeout bounds every systemctl shell-out. Apply/Clear run on
+// the config-apply path under applyConfigLocked's applySem
+// (daemon_apply.go d.dhcpServer.Apply), so a hung systemctl (dbus
+// stall, wedged Kea stop job) would otherwise block every commit
+// indefinitely. Mirrors the 15s FRR reload precedent
+// (pkg/frr/manager.go reloadTimeout). #1794/#1800.
+const systemctlTimeout = 15 * time.Second
+
+// runSystemctl runs `systemctl <args...>` under systemctlTimeout. On
+// failure the returned error includes the captured output, so callers
+// that previously logged a bare exit status now surface the systemd
+// diagnostic too.
+func runSystemctl(args ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), systemctlTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "systemctl", args...)
+	// WaitDelay caps the post-SIGKILL pipe-drain window.
+	cmd.WaitDelay = 5 * time.Second
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("systemctl %s: %w: %s",
+			strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
 
 const (
 	kea4Config = "/etc/kea/kea-dhcp4.conf"
@@ -241,8 +269,8 @@ func (m *Manager) generateKea4Config(cfg *config.DHCPServerConfig) error {
 				"type": "memfile",
 				"name": "/var/lib/kea/kea-leases4.csv",
 			},
-			"valid-lifetime":   86400,
-			"subnet4":          subnets,
+			"valid-lifetime": 86400,
+			"subnet4":        subnets,
 		},
 	}
 
@@ -259,15 +287,14 @@ func (m *Manager) generateKea4Config(cfg *config.DHCPServerConfig) error {
 }
 
 func stopService(name string) {
-	cmd := exec.Command("systemctl", "stop", name)
-	if err := cmd.Run(); err != nil {
+	// Debug, not Warn: stop fails normally when the unit isn't running.
+	if err := runSystemctl("stop", name); err != nil {
 		slog.Debug("service stop failed", "service", name, "err", err)
 	}
 }
 
 func (m *Manager) restartKea4() error {
-	cmd := exec.Command("systemctl", "restart", kea4Svc)
-	return cmd.Run()
+	return runSystemctl("restart", kea4Svc)
 }
 
 func (m *Manager) generateKea6Config(cfg *config.DHCPServerConfig) error {
@@ -360,6 +387,5 @@ func (m *Manager) generateKea6Config(cfg *config.DHCPServerConfig) error {
 }
 
 func (m *Manager) restartKea6() error {
-	cmd := exec.Command("systemctl", "restart", kea6Svc)
-	return cmd.Run()
+	return runSystemctl("restart", kea6Svc)
 }

@@ -3,6 +3,7 @@ package ipsec
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -10,9 +11,32 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/psaab/xpf/pkg/config"
 )
+
+// swanctlTimeout bounds every swanctl shell-out. reload() runs on the
+// config-apply path under applyConfigLocked's applySem (daemon_apply.go
+// d.ipsec.Apply), so a hung swanctl (wedged charon, stuck vici socket)
+// would otherwise block every commit indefinitely. The operator-RPC
+// sites (--terminate / --initiate / --list-sas) hang the gRPC/CLI show
+// and request paths the same way. Mirrors the 15s FRR reload precedent
+// (pkg/frr/manager.go reloadTimeout). #1794/#1800.
+const swanctlTimeout = 15 * time.Second
+
+// runSwanctl runs `swanctl <args...>` under swanctlTimeout and returns
+// CombinedOutput, preserving the historical error-message shape at the
+// call sites.
+func runSwanctl(args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), swanctlTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "swanctl", args...)
+	// WaitDelay caps the post-SIGKILL pipe-drain window (a charon child
+	// inheriting the pipe could otherwise hold CombinedOutput open).
+	cmd.WaitDelay = 5 * time.Second
+	return cmd.CombinedOutput()
+}
 
 const (
 	// DefaultSwanctlDir is where swanctl reads conf.d snippets.
@@ -540,8 +564,7 @@ func dhGroupBits(group int) int {
 }
 
 func (m *Manager) reload() error {
-	cmd := exec.Command("swanctl", "--load-all")
-	output, err := cmd.CombinedOutput()
+	output, err := runSwanctl("--load-all")
 	if err != nil {
 		return fmt.Errorf("swanctl --load-all: %w: %s", err, string(output))
 	}
@@ -579,8 +602,7 @@ func (m *Manager) TerminateAllSAs() (int, error) {
 			continue
 		}
 		seen[ikeName] = true
-		cmd := exec.Command("swanctl", "--terminate", "--ike", ikeName)
-		if out, err := cmd.CombinedOutput(); err != nil {
+		if out, err := runSwanctl("--terminate", "--ike", ikeName); err != nil {
 			slog.Warn("swanctl terminate failed", "ike", ikeName, "err", err, "output", string(out))
 		} else {
 			count++
@@ -608,8 +630,7 @@ func (m *Manager) ActiveConnectionNames() ([]string, error) {
 
 // InitiateConnection initiates a single IPsec connection by name.
 func (m *Manager) InitiateConnection(name string) error {
-	cmd := exec.Command("swanctl", "--initiate", "--child", name)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, err := runSwanctl("--initiate", "--child", name); err != nil {
 		return fmt.Errorf("swanctl --initiate %s: %w: %s", name, err, string(out))
 	}
 	return nil
@@ -617,7 +638,14 @@ func (m *Manager) InitiateConnection(name string) error {
 
 // GetSAStatus queries strongSwan for active SAs.
 func (m *Manager) GetSAStatus() ([]SAStatus, error) {
-	cmd := exec.Command("swanctl", "--list-sas")
+	// Inline ctx (not runSwanctl): the parser needs stdout alone, and the
+	// historical error message carries stderr alone.
+	ctx, cancel := context.WithTimeout(context.Background(), swanctlTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "swanctl", "--list-sas")
+	// Buffer-backed Stdout/Stderr are pipe-fed by the runtime, so the
+	// post-SIGKILL drain window applies here too.
+	cmd.WaitDelay = 5 * time.Second
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

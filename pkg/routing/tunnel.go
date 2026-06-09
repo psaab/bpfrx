@@ -251,8 +251,19 @@ func (t *tunnelManager) Apply(tunnels []*config.TunnelConfig) error {
 		// Destination Options extension header.  Many transit networks
 		// drop IPv6 packets with extension headers (RFC 7872).
 		if isIPv6 && (tc.Mode == "gre" || tc.Mode == "") {
-			if out, err := exec.Command("ip", "link", "set", tc.Name,
-				"type", "ip6gre", "encaplimit", "none").CombinedOutput(); err != nil {
+			// Timeout-bounded (#1794/#1800): Apply runs under
+			// applyConfigLocked's applySem (daemon_apply.go ApplyTunnels),
+			// so a wedged `ip` would block every commit. cancel() is
+			// called inline (not deferred) because this runs in the
+			// per-tunnel loop.
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			ipCmd := exec.CommandContext(ctx, "ip", "link", "set", tc.Name,
+				"type", "ip6gre", "encaplimit", "none")
+			// WaitDelay caps the post-SIGKILL pipe-drain window.
+			ipCmd.WaitDelay = 5 * time.Second
+			out, err := ipCmd.CombinedOutput()
+			cancel()
+			if err != nil {
 				slog.Warn("failed to set tunnel encaplimit",
 					"name", tc.Name, "err", err, "output", string(out))
 			}

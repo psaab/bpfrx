@@ -2,6 +2,7 @@ package dataplane
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"log/slog"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/psaab/xpf/pkg/appid"
@@ -19,6 +21,20 @@ import (
 	"github.com/psaab/xpf/pkg/networkd"
 	"github.com/vishvananda/netlink"
 )
+
+// runEthtool runs `ethtool <args...>` bounded by a 15s timeout. Every
+// caller in this file executes during dp.ApplyConfig under the daemon's
+// applySem, so an unbounded ethtool wedged in NIC driver/firmware ioctls
+// (offload toggles, ring resizes, RSS key writes on mlx5) would hang every
+// commit and HA config sync (#1794/#1800 U3, AGY r2). WaitDelay caps the
+// post-SIGKILL pipe-drain window.
+func runEthtool(args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "ethtool", args...)
+	cmd.WaitDelay = 5 * time.Second
+	return cmd.CombinedOutput()
+}
 
 // CompileResult holds the result of a config compilation for reference.
 type CompileResult struct {
@@ -1321,7 +1337,7 @@ func (r *CompileResult) ensureRxVlanOff(iface string) {
 		return
 	}
 	// Check current state via ethtool -k.
-	out, err := exec.Command("ethtool", "-k", iface).CombinedOutput()
+	out, err := runEthtool("-k", iface)
 	if err == nil {
 		for _, line := range strings.Split(string(out), "\n") {
 			if strings.HasPrefix(strings.TrimSpace(line), "rx-vlan-offload:") {
@@ -1334,7 +1350,7 @@ func (r *CompileResult) ensureRxVlanOff(iface string) {
 		}
 	}
 	// Not off yet — disable it.
-	if out, err := exec.Command("ethtool", "-K", iface, "rxvlan", "off").CombinedOutput(); err != nil {
+	if out, err := runEthtool("-K", iface, "rxvlan", "off"); err != nil {
 		slog.Warn("failed to disable rxvlan offload (VLAN parsing may fail)",
 			"interface", iface, "err", err, "output", strings.TrimSpace(string(out)))
 	} else {
@@ -1364,7 +1380,7 @@ func (r *CompileResult) applyEthtool(ifaceName string, ifCfg *config.InterfaceCo
 	if duplex != "" {
 		args = append(args, "duplex", duplex)
 	}
-	if out, err := exec.Command("ethtool", args...).CombinedOutput(); err != nil {
+	if out, err := runEthtool(args...); err != nil {
 		slog.Warn("failed to apply ethtool settings",
 			"name", ifaceName, "speed", ifCfg.Speed, "duplex", ifCfg.Duplex,
 			"err", fmt.Sprintf("%v: %s", err, strings.TrimSpace(string(out))))
@@ -1439,7 +1455,7 @@ func (r *CompileResult) tuneInterfaceBuffers(link netlink.Link) {
 	}
 
 	// Increase ring buffers via ethtool -G. Query current/max first.
-	out, err := exec.Command("ethtool", "-g", name).CombinedOutput()
+	out, err := runEthtool("-g", name)
 	if err != nil {
 		r.ethtoolApplied["buffers:"+name] = true
 		return
@@ -1447,10 +1463,10 @@ func (r *CompileResult) tuneInterfaceBuffers(link netlink.Link) {
 
 	maxTX, curTX := parseRingParams(string(out))
 	if maxTX > 0 && curTX < maxTX {
-		if out, err := exec.Command("ethtool", "-G", name,
+		if out, err := runEthtool("-G", name,
 			"tx", strconv.Itoa(maxTX),
 			"rx", strconv.Itoa(maxTX),
-		).CombinedOutput(); err != nil {
+		); err != nil {
 			slog.Debug("failed to increase ring buffers",
 				"interface", name, "err", fmt.Sprintf("%v: %s", err, strings.TrimSpace(string(out))))
 		} else {
@@ -1499,7 +1515,7 @@ func configureRSSHashKey(name string) {
 	key := "6d:5a:56:da:25:5b:0e:c2:41:67:25:3d:43:a3:8f:b0:" +
 		"d0:ca:2b:cb:ae:7b:30:b4:77:cb:2d:a3:80:30:f2:0c:" +
 		"8c:da:5b:6a:25:30:17:9a"
-	out, err := exec.Command("ethtool", "-X", name, "hkey", key).CombinedOutput()
+	out, err := runEthtool("-X", name, "hkey", key)
 	if err != nil {
 		slog.Debug("failed to set RSS hash key",
 			"interface", name, "err", fmt.Sprintf("%v: %s", err, strings.TrimSpace(string(out))))

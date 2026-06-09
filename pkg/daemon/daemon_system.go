@@ -312,7 +312,9 @@ func reloadChronyRuntime(sourcesChanged, thresholdChanged bool) {
 	defer cancel()
 
 	if sourcesChanged {
-		if out, err := exec.CommandContext(ctx, "chronyc", "reload", "sources").CombinedOutput(); err != nil {
+		chronyCmd := exec.CommandContext(ctx, "chronyc", "reload", "sources")
+		chronyCmd.WaitDelay = 5 * time.Second // post-SIGKILL pipe-drain cap (#1794)
+		if out, err := chronyCmd.CombinedOutput(); err != nil {
 			slog.Warn("failed to reload chrony sources", "err", err, "output", string(out))
 		}
 	}
@@ -328,7 +330,9 @@ func reloadChronyRuntime(sourcesChanged, thresholdChanged bool) {
 		{"systemctl", "restart", "chronyd"},
 	}
 	for _, cmd := range commands {
-		if out, err := exec.CommandContext(ctx, cmd[0], cmd[1:]...).CombinedOutput(); err == nil {
+		reloadCmd := exec.CommandContext(ctx, cmd[0], cmd[1:]...)
+		reloadCmd.WaitDelay = 5 * time.Second
+		if out, err := reloadCmd.CombinedOutput(); err == nil {
 			return
 		} else {
 			slog.Debug("chrony config reload attempt failed", "cmd", strings.Join(cmd, " "), "err", err, "output", string(out))
@@ -638,8 +642,12 @@ func (d *Daemon) applySyslogFiles(cfg *config.Config) {
 	}
 
 	if changed {
-		exec.Command("systemctl", "restart", "rsyslog").Run()
-		slog.Info("rsyslog file configs applied", "files", len(desired))
+		if out, err := runCommandTimeout("systemctl", "restart", "rsyslog"); err != nil {
+			slog.Error("failed to restart rsyslog",
+				"err", err, "output", strings.TrimSpace(string(out)))
+		} else {
+			slog.Info("rsyslog file configs applied", "files", len(desired))
+		}
 	}
 }
 
@@ -655,8 +663,10 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) {
 			continue // never create/modify root via config
 		}
 
-		// Check if user already exists
-		_, err := exec.Command("id", user.Name).CombinedOutput()
+		// Check if user already exists. A non-zero exit means "user
+		// doesn't exist"; a timeout also lands here, in which case the
+		// useradd below fails with "already exists" and is logged.
+		_, err := runCommandTimeout("id", user.Name)
 		if err != nil {
 			// User doesn't exist — create it
 			args := []string{"-m", "-s", "/bin/bash"}
@@ -664,7 +674,7 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) {
 				args = append(args, "-u", fmt.Sprintf("%d", user.UID))
 			}
 			args = append(args, user.Name)
-			if out, err := exec.Command("useradd", args...).CombinedOutput(); err != nil {
+			if out, err := runCommandTimeout("useradd", args...); err != nil {
 				slog.Warn("failed to create user",
 					"user", user.Name, "err", err, "output", string(out))
 				continue
@@ -701,7 +711,11 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) {
 					continue
 				}
 				// Fix ownership
-				exec.Command("chown", "-R", user.Name+":"+user.Name, sshDir).Run()
+				if out, err := runCommandTimeout("chown", "-R", user.Name+":"+user.Name, sshDir); err != nil {
+					slog.Warn("failed to chown ssh dir",
+						"user", user.Name, "dir", sshDir,
+						"err", err, "output", strings.TrimSpace(string(out)))
+				}
 				slog.Info("SSH keys updated", "user", user.Name, "keys", len(user.SSHKeys))
 			}
 		}
@@ -748,7 +762,11 @@ func (d *Daemon) applySSHConfig(cfg *config.Config) {
 	}
 
 	// Reload sshd to pick up changes
-	exec.Command("systemctl", "reload", "sshd").Run()
+	if out, err := runCommandTimeout("systemctl", "reload", "sshd"); err != nil {
+		slog.Error("failed to reload sshd",
+			"err", err, "output", strings.TrimSpace(string(out)))
+		return
+	}
 	slog.Info("SSH config applied", "permit_root_login", permitRoot)
 }
 
@@ -762,9 +780,8 @@ func (d *Daemon) applyRootAuth(cfg *config.Config) {
 	// Set root password from encrypted-password (crypt(3) hash)
 	if ra.EncryptedPassword != "" {
 		// Use chpasswd -e to set pre-hashed password
-		cmd := exec.Command("chpasswd", "-e")
-		cmd.Stdin = strings.NewReader("root:" + ra.EncryptedPassword + "\n")
-		if out, err := cmd.CombinedOutput(); err != nil {
+		stdin := strings.NewReader("root:" + ra.EncryptedPassword + "\n")
+		if out, err := runCommandStdinTimeout(stdin, "chpasswd", "-e"); err != nil {
 			slog.Warn("failed to set root password", "err", err, "output", string(out))
 		} else {
 			slog.Info("root encrypted-password applied")
