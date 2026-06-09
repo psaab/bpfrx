@@ -32,6 +32,59 @@ impl super::Coordinator {
             .sum()
     }
 
+    /// #1782: sum of per-binding `neg_neigh_fast_fail` across every
+    /// `BindingLiveState`. Mirrors `cos_no_owner_binding_drops_total`:
+    /// the increment lands on whichever binding owns the worker that
+    /// fast-failed, and summing across all live states gives the
+    /// cluster-wide total. Surfaced as
+    /// `xpf_userspace_neg_neigh_fast_fail_total`.
+    pub fn neg_neigh_fast_fail_total(&self) -> u64 {
+        self.workers
+            .live
+            .values()
+            .map(|live| live.neg_neigh_fast_fail.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// #1782: sum of per-binding `pending_neigh_duplicate_drops` across
+    /// every `BindingLiveState`. Counts ONLY the H5 sibling drops where
+    /// the `(egress_ifindex, next_hop)` key was already pending — not
+    /// the capacity-drop case. Surfaced as
+    /// `xpf_userspace_pending_neigh_duplicate_drops_total`.
+    pub fn pending_neigh_duplicate_drops_total(&self) -> u64 {
+        self.workers
+            .live
+            .values()
+            .map(|live| live.pending_neigh_duplicate_drops.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// #1782: debug dump of every key currently present in the userspace
+    /// `dynamic_neighbors` mirror, as `(ifindex, ip)` pairs. The
+    /// cold-start capture harness reads this at the pre-connect t0'
+    /// sample to confirm whether the data-path next-hop is ABSENT from
+    /// the mirror (the H2 fingerprint) while the kernel still shows it
+    /// DELAY/STALE-usable. `NeighborEntry` carries only the MAC, not the
+    /// kernel NUD state, so the harness pairs this membership check with
+    /// `ip neigh` for the NUD state. Locks all shards once (same cost as
+    /// `len()`); capped at `MAX` rows so a pathological table cannot bloat
+    /// the status message. Debug/diagnostic surface only.
+    pub fn dynamic_neighbor_keys(&self) -> Vec<(i32, std::net::IpAddr)> {
+        const MAX: usize = 4096;
+        self.neighbors.dynamic.with_all_shards(|bulk| {
+            let mut out: Vec<(i32, std::net::IpAddr)> = Vec::new();
+            for shard in bulk.each_shard_ref() {
+                for (key, _entry) in shard.iter() {
+                    if out.len() >= MAX {
+                        return out;
+                    }
+                    out.push(*key);
+                }
+            }
+            out
+        })
+    }
+
     /// #1636 option C: proactive-neighbor-warm telemetry. `warm_drops`
     /// is incremented when the bounded warmer queue is full (transient);
     /// `warm_disconnected` when the warmer worker died (fatal). Both are

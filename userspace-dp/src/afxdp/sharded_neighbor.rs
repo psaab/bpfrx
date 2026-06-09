@@ -234,6 +234,16 @@ impl<'a> BulkShardGuard<'a> {
         self.guards.iter_mut().map(|g| &mut **g)
     }
 
+    /// #1782: iterate every shard's underlying map immutably. Used by
+    /// `Coordinator::dynamic_neighbor_keys` to dump the present key set
+    /// for the cold-start capture harness without needing mutable
+    /// access.
+    pub(crate) fn each_shard_ref(
+        &self,
+    ) -> impl Iterator<Item = &FastMap<(i32, IpAddr), NeighborEntry>> {
+        self.guards.iter().map(|g| &**g)
+    }
+
     /// Sum of `len()` across all shards.
     pub(crate) fn total_len(&self) -> usize {
         self.guards.iter().map(|g| g.len()).sum()
