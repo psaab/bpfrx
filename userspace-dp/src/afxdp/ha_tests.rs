@@ -227,26 +227,28 @@ fn test_forwarding_state_split_rgs() -> ForwardingState {
     forwarding
 }
 
+fn test_worker_handle(commands: Arc<Mutex<VecDeque<WorkerCommand>>>) -> WorkerHandle {
+    WorkerHandle {
+        stop: Arc::new(AtomicBool::new(false)),
+        heartbeat: Arc::new(AtomicU64::new(0)),
+        commands,
+        session_export_ack: Arc::new(AtomicU64::new(0)),
+        cos_status: Arc::new(ArcSwap::from_pointee(Vec::new())),
+        runtime_atomics: Arc::new(super::worker_runtime::WorkerRuntimeAtomics::new()),
+        cold_path_atomics: Arc::new(super::cold_path_hist::WorkerColdPathAtomics::new()),
+        join: None,
+    }
+}
+
 #[test]
 fn update_ha_state_prewarms_split_rg_reverse_sessions_on_activation() {
     let mut coordinator = Coordinator::new();
     coordinator.forwarding = test_forwarding_state_split_rgs();
     let worker_commands = Arc::new(Mutex::new(VecDeque::new()));
-    coordinator.workers.handles.insert(
-        0,
-        WorkerHandle {
-            stop: Arc::new(AtomicBool::new(false)),
-            heartbeat: Arc::new(AtomicU64::new(0)),
-            commands: worker_commands.clone(),
-            session_export_ack: Arc::new(AtomicU64::new(0)),
-            cos_status: Arc::new(ArcSwap::from_pointee(Vec::new())),
-            runtime_atomics: Arc::new(super::worker_runtime::WorkerRuntimeAtomics::new()),
-            cold_path_atomics: Arc::new(
-                super::cold_path_hist::WorkerColdPathAtomics::new(),
-            ),
-            join: None,
-        },
-    );
+    coordinator
+        .workers
+        .handles
+        .insert(0, test_worker_handle(worker_commands.clone()));
 
     let entry = SyncedSessionEntry {
         key: test_key(),
@@ -327,4 +329,128 @@ fn update_ha_state_prewarms_split_rg_reverse_sessions_on_activation() {
         WorkerCommand::UpsertSynced(session)
             if session.metadata.is_reverse && session.metadata.owner_rg_id == 2
     )));
+}
+
+#[test]
+fn update_ha_state_demotion_recovers_from_poisoned_worker_command_mutex() {
+    // #1790 regression: update_ha_state publishes the new HA state via
+    // rg_runtime.store BEFORE propagating demotion side effects. The
+    // demote loop used to `?`-return on a poisoned worker command mutex,
+    // so a retry diffed against the already-stored state (empty
+    // demoted_rgs) and the demotion was permanently lost — partial
+    // worker delivery, no demote_shared_owner_rgs, no epoch bump.
+    // Poison one of three worker command mutexes and assert the SAME
+    // call still completes ALL propagation and returns Ok.
+    let mut coordinator = Coordinator::new();
+    coordinator.forwarding = test_forwarding_state_with_fabric();
+    let worker_queues: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = (0..3u32)
+        .map(|_| Arc::new(Mutex::new(VecDeque::new())))
+        .collect();
+    for (worker_id, queue) in worker_queues.iter().enumerate() {
+        coordinator
+            .workers
+            .handles
+            .insert(worker_id as u32, test_worker_handle(queue.clone()));
+    }
+
+    // Locally-owned (non-peer-synced) shared session in RG 1. The
+    // demotion must flip its origin to a peer-synced one via
+    // demote_shared_owner_rgs.
+    let entry = SyncedSessionEntry {
+        key: test_key(),
+        decision: test_decision(),
+        metadata: test_metadata(),
+        origin: SessionOrigin::ForwardFlow,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    };
+    publish_shared_session(
+        &coordinator.sessions.synced,
+        &coordinator.sessions.nat,
+        &coordinator.sessions.forward_wire,
+        &coordinator.sessions.owner_rg_indexes,
+        &entry,
+    );
+
+    // Previous state: RG 1 locally owned (active).
+    coordinator
+        .update_ha_state(&[HAGroupStatus {
+            rg_id: 1,
+            active: true,
+            ..HAGroupStatus::default()
+        }])
+        .expect("seed active HA state");
+    for queue in &worker_queues {
+        queue.lock().expect("commands").clear();
+    }
+
+    // Poison one worker's command mutex deterministically: a thread
+    // panics while holding the lock, and join() observes the panic, so
+    // the mutex is poisoned before update_ha_state runs.
+    let to_poison = worker_queues[1].clone();
+    let poisoner = std::thread::spawn(move || {
+        let _guard = to_poison.lock().expect("lock before poisoning");
+        panic!("poison worker command mutex");
+    })
+    .join();
+    assert!(poisoner.is_err(), "poisoning thread must panic");
+    assert!(
+        worker_queues[1].lock().is_err(),
+        "worker 1 command mutex must be poisoned"
+    );
+
+    let epoch_before = coordinator.rg_epochs[1].load(Ordering::Acquire);
+
+    // New state: RG 1 demoted. Must return Ok (no early return) and
+    // apply every side effect despite the poisoned mutex.
+    coordinator
+        .update_ha_state(&[HAGroupStatus {
+            rg_id: 1,
+            active: false,
+            ..HAGroupStatus::default()
+        }])
+        .expect("update_ha_state must recover from poisoned worker mutex");
+
+    // ALL workers — the poisoned one included (recovered via
+    // into_inner) — received both demote commands.
+    for (worker_id, queue) in worker_queues.iter().enumerate() {
+        let pending = queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            pending.iter().any(|command| matches!(
+                command,
+                WorkerCommand::DemoteOwnerRGS { owner_rgs } if owner_rgs == &vec![1]
+            )),
+            "worker {worker_id} missing DemoteOwnerRGS for RG 1"
+        );
+        assert!(
+            pending
+                .iter()
+                .any(|command| matches!(command, WorkerCommand::VacateAllSharedExactSlots)),
+            "worker {worker_id} missing VacateAllSharedExactSlots"
+        );
+    }
+
+    // demote_shared_owner_rgs ran: the locally-owned RG 1 entry was
+    // marked peer-synced.
+    let demoted = coordinator
+        .sessions
+        .synced
+        .lock()
+        .expect("shared sessions")
+        .get(&entry.key)
+        .cloned()
+        .expect("shared entry survives demotion");
+    assert!(
+        demoted.origin.is_peer_synced(),
+        "demotion must mark the shared entry peer-synced"
+    );
+
+    // The demoted RG's flow-cache epoch was bumped exactly once.
+    assert_eq!(
+        coordinator.rg_epochs[1].load(Ordering::Acquire),
+        epoch_before + 1,
+        "rg_epochs[1] must be bumped by the demotion"
+    );
 }

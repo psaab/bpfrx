@@ -39,12 +39,25 @@ impl super::Coordinator {
         self.ha.rg_runtime.store(Arc::new(state));
         if !demoted_rgs.is_empty() {
             for handle in self.workers.handles.values() {
-                let mut pending = handle.commands.lock().map_err(|_| {
-                    format!(
-                        "failed to enqueue DemoteOwnerRGS for demoted RGs {:?}: worker command queue lock poisoned",
-                        demoted_rgs
-                    )
-                })?;
+                // #1790: recover from a poisoned worker command mutex instead
+                // of early-returning. The new HA state was already published
+                // via rg_runtime.store above, so an Err here would make a
+                // retry diff against the demoted state (empty demoted_rgs)
+                // and permanently skip the remaining workers' demote
+                // commands, demote_shared_owner_rgs, and the rg_epochs
+                // bumps. A VecDeque<WorkerCommand> has no invariant a panic
+                // can corrupt; same poison policy as handle_activated_rgs
+                // below and ShardedNeighborMap::lock_shard.
+                let mut pending = match handle.commands.lock() {
+                    Ok(pending) => pending,
+                    Err(poisoned) => {
+                        eprintln!(
+                            "xpf-ha: worker command queue lock poisoned while enqueueing DemoteOwnerRGS for demoted RGs {:?}; recovering inner queue",
+                            demoted_rgs
+                        );
+                        poisoned.into_inner()
+                    }
+                };
                 pending.push_back(WorkerCommand::DemoteOwnerRGS {
                     owner_rgs: demoted_rgs.clone(),
                 });
