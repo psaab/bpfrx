@@ -34,5 +34,11 @@ func runCommandStdinTimeout(stdin io.Reader, name string, args ...string) ([]byt
 	if stdin != nil {
 		cmd.Stdin = stdin
 	}
+	// WaitDelay caps the post-SIGKILL pipe-drain window. Without it,
+	// CombinedOutput blocks until all write-end holders (e.g. PAM exec
+	// helpers spawned by useradd) close their copies of the pipe — which
+	// may be long after the main process is killed. 5s is generous for
+	// simple admin commands; the hard ceiling becomes 15s+5s=20s per site.
+	cmd.WaitDelay = 5 * time.Second
 	return cmd.CombinedOutput()
 }

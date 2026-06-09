@@ -4623,3 +4623,10 @@ top.
   tests/fixtures/protocol_wire_v1.json, pkg/dataplane/userspace/{protocol,buffersfmt}.go,
   pkg/api/{metrics,metrics_descriptors,metrics_userspace}.go,
   docs/userspace-cold-start-resolution.md, docs/pr/1772-neighbor-latency-metrics/plan.md.
+
+- **Timestamp**: 2026-06-09
+  **Action**: #1794 review — add cmd.WaitDelay = 5s to runCommandStdinTimeout
+  in pkg/daemon/exec_timeout.go. Bounds CombinedOutput() post-SIGKILL pipe-drain
+  window so orphaned grandchildren (PAM exec helpers from useradd) cannot hold
+  the timeout open indefinitely. Hard ceiling is now 15s+5s=20s per site.
+  **File(s)**: pkg/daemon/exec_timeout.go
