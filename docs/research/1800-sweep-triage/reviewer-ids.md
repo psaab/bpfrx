@@ -17,3 +17,14 @@ Plan: docs/research/1800-sweep-triage/plan.md, branch research/1800-sweep-triage
 - Codex: `task-mq77o1nn-edtbnt`
 - AGY: `adversarial-review-mq77o1xw-5gryre`
 - Claude SMR: claude-smr-plan-r2.md — **PLAN-READY**
+
+## Round 2 outcome
+- Codex `task-mq77o1nn-edtbnt`: **PLAN-NEEDS-MINOR** — PrivateRGElection default-on means heartbeat owns promotion (window widening = explicit trade only; coordinated restart suppression REQUIRED); CommitConfirmed ordering invariant; U8 option-identity diff; Q3 tree-level FormatSet sanity; Q4 sanitize-with-warning; Q5 no pair reader → U11 DEFER.
+- AGY `adversarial-review-mq77o1xw-5gryre`: returned **PLAN-NEEDS-MAJOR** but all four "critical gaps" verifiably re-raise r1 items already present in the v2 text (citations point at main checkout, not the worktree) — treated as STALE per the verify-reviewer-claims rule; useful nuance (U11 A-shape preference) recorded in §5.7. r3 re-anchored with quote requirements.
+- Claude SMR: **PLAN-READY**.
+- Codex r2 folded into v2.1 `ff86057ae`.
+
+## Round 3 (plan v2.1 `ff86057ae`)
+- Codex: `task-mq77zu6y-5crxzh` (fold-fidelity confirmation)
+- AGY: `adversarial-review-mq77zugr-1hwb7z` (re-anchored to worktree file with quote requirement)
+- Claude SMR: claude-smr-plan-r3.md — **PLAN-READY**
