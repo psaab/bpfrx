@@ -1,6 +1,6 @@
 # #1800 — Adversarial sweep #1784–#1799: triage + remediation plan
 
-**Status:** DRAFT v2 — folds r1 (Codex PLAN-NEEDS-MAJOR + AGY PLAN-NEEDS-MAJOR + Claude SMR PLAN-NEEDS-MINOR). Pending r2.
+**Status:** DRAFT v2.1 — folds r2 (Codex PLAN-NEEDS-MINOR: all §11 questions answered + PrivateRGElection window correction; AGY r2 re-raised already-folded r1 items — see reviewer-ids.md; SMR r2 PLAN-READY). Pending r3 confirmation.
 
 ## 1. Issue framing
 
@@ -36,7 +36,7 @@ no-peer-grace false failover (§5.6, AGY).
 | 8 | **U7 free-text injection** | #1798 (+renderer audit) | M | `/engineer` per §5.3 (commit-time-only validation + render-side belt + migration) | Go tests incl. Load()-with-bad-persisted-config boot test |
 | 9 | **U6 commit persistence** | #1799 (+auto-rollback hole) | M | `/engineer` per §5.2 split semantics | Go tests + restart test + HA sync divergence test |
 | 10 | **U8 DHCP lifecycle** | #1793 | M | `/engineer` per §5.4 (reconcile; KEEP the Background root invariant) | Go tests + standalone-VM DHCP test |
-| 11 | **U11 learn-path perf** | #1787 | M | `/engineer` per §5.7 **Option B**; **defer-eligible** | cargo tests + cluster smoke + perf comparison |
+| 11 | **U11 learn-path perf** | #1787 | M | **DEFERRED until U1–U10 done** (Codex r2); settled sketch in §5.7 | cargo tests + cluster smoke + perf comparison |
 
 **Sequencing rationale (r1):** mechanical units (1-4) first — U2 contains
 #1786 which must land before the next #1782 overnight capture. U9→U10
@@ -83,10 +83,12 @@ fixtures), for each: parse hierarchical → render via `tree.FormatSet()` →
 re-parse the flat-set lines via `ParseSetCommand`+`SetPath` → compile BOTH
 trees → diff the typed `config.Config`. Any mismatch = latent dual-AST bug.
 Add targeted vrrp-group + dhcp-relay fixtures; mark known-broken cases with an
-`ExpectedFail bool` until U5b lands (workable in Go per AGY). One open caveat
-for r2: `FormatSet()` output fidelity must itself be validated (if FormatSet
-has its own bugs, the harness chases phantoms — include a FormatSet
-round-trip sanity check in U5a).
+`ExpectedFail bool` until U5b lands (workable in Go per AGY). **FormatSet
+fidelity DECIDED (Codex r2):** no separate preliminary PR needed, but the
+embedded sanity check must be tree-level: hierarchical parse → `FormatSet()`
+→ `ParseSetCommand`/`SetPath` → compare canonical `FormatSet()` of both
+trees BEFORE running the compiler diff — so a FormatSet bug surfaces as a
+tree mismatch, not a phantom compiler finding.
 
 **U5b (fix PR):** add `vrrp-group` (schema.go:419 region) and `dhcp-relay`
 (schema.go:1201) to setSchema so SetPath structures them; make
@@ -106,7 +108,14 @@ surfaced a second defect (AGY):
   divergence argument does not apply to a refused local commit (the config is
   applied nowhere). Codex concurs A is sane here.
 - **`CommitConfirmed`: Option A + do not arm** — on persist failure the
-  confirm timer must NOT be armed and confirm state NOT set (Codex).
+  confirm timer must NOT be armed and confirm state NOT set (Codex r1).
+  **Ordering invariant (Codex r2):** do not cancel/overwrite an existing
+  pending confirm timer/state until the NEW confirmed commit has durably
+  persisted — today the code cancels (`store.go:872`) and saves confirm
+  state (`:878`) BEFORE WriteActive (`:894`). Implementation order: write
+  candidate to active storage first → mutate history/active/confirm state →
+  journal + saveRollbackFiles. Codex verified this order breaks neither the
+  journal nor rollback-file bookkeeping.
 - **HA `SyncApply` (store.go:238): Option B** — failing the secondary's apply
   on its local disk trouble would silently diverge the cluster (primary
   already running the new config, never notified — sync is one-way
@@ -135,7 +144,9 @@ commit-synchronize is two-phase; ours is async one-way — AGY).
 2. **Render-side belt:** strip/escape newlines at every file-template
    interpolation regardless of validation.
 3. **Migration:** already-persisted bad values must not make the next
-   unrelated commit fail mysteriously (Codex) — on Load, sanitize-with-warning
+   unrelated commit fail mysteriously (Codex). **DECIDED (Codex r2 Q4):
+   sanitize-with-warning** — refuse/quarantine risks boot failure or
+   mysterious unrelated-commit failure. On Load, sanitize-with-warning
    so the in-memory candidate is clean; document in the release note.
 4. **Audit scope (Codex):** beyond networkd descriptions — FRR
    `policy_render.go:260` (BGP/policy strings), FRR passwords/auth keys,
@@ -152,7 +163,11 @@ restart must not kill leases, `pkg/dhcp/README.md:31`), and per-client
 1. Reconcile-on-apply: `applyConfigLocked` diffs desired-vs-running clients —
    start new (lazily creating the manager; drop the startup-only `needsDHCP`
    gate at `daemon_dhcp.go:17`), explicitly cancel removed ones via the
-   existing per-client cancel.
+   existing per-client cancel. **The diff key must include option identity,
+   not just `(iface, family)`** (Codex r2): `Start()` no-ops on an existing
+   key while e.g. DHCPv6 `stateless` is captured at goroutine start
+   (`dhcp.go:196`, `:675`) — a same-interface option change must
+   restart that client.
 2. Registry hygiene: deregister on ALL terminal run-goroutine exits (defer),
    not just in `Renew`; fix `StopAll` to clear entries.
 3. Stop semantics (open question resolved → lean): stop renewing + remove the
@@ -191,34 +206,44 @@ Design (Option A refined):
   (sync.go:489-526); VRRP GARP dampening (`instance.go:1080-1082` — clamp so
   a backward step cannot suppress failover GARPs). All move to monotonic or
   clamp.
-- **NEW in-scope defect (AGY): `RestartHeartbeat` no-peer-grace** — when the
-  local node restarts its heartbeat sockets, the peer has no grace period; a
-  restart taking >500 ms fires a false peer-failover. Fix direction: widen
-  the default window AND/OR a coordinated suppress (the existing
-  hbSuppress machinery) around restarts; r2 adjudicates which.
-- **Default-window question:** widening 5×100 ms is now an explicit U10
-  sub-decision (it interacts with the documented ~60 ms failover budget —
-  the window governs *detection*, not VRRP failover speed; widening to e.g.
-  5×200 ms slows split-brain-side detection but VRRP masterDown remains the
-  fast path. r2 sanity-checks this framing).
+- **NEW in-scope defect (AGY r1): `RestartHeartbeat` no-peer-grace** — when
+  the local node restarts its heartbeat sockets (bind retries at 1 s
+  intervals, up to ~5 s), the peer has no grace period; a restart taking
+  >500 ms fires a false peer-failover. **DECIDED (Codex r2): coordinated
+  restart suppression is REQUIRED** (reuse the hbSuppress machinery around
+  restarts) — widening alone cannot close it, since a 1 s retry cadence
+  races any plausible window.
+- **Default-window DECIDED (Codex r2):** the v2 framing "VRRP owns fast
+  failover" was WRONG for the default path — `PrivateRGElection` is compiled
+  on by default (`compiler_system.go:937`) and suppresses RETH VRRP
+  (`daemon_ha_vip.go:92`), so **heartbeat detection itself owns promotion**
+  and the 5×100 ms window IS the failover-detection budget. Default stays
+  5×100 ms; widening (e.g. 5×200 ms) is offered only as an explicit,
+  operator-opted, documented failover-latency trade — never silently.
 - Validation: `make test-failover` + live clock-step repro (`date -s +5sec`
   on one node, then both) + heartbeat-restart repro + pause/resume.
 
-### 5.7 U11 — learn_dynamic_neighbor (#1787) — v2 per r1
+### 5.7 U11 — learn_dynamic_neighbor (#1787) — v2.1: DEFERRED, design settled
 
-**Recommendation changed to Option B** (both reviewers): per-key
-`insert_if_changed` (single-shard) for each of the ≤2 keys independently,
-fixed `[i32; 2]`+len instead of `vec!`. Justification now verified, not
-assumed: NO reader correlates the (physical, logical-VLAN) pair in one
-decision — forwarding resolves exactly one key per packet
-(`forwarding/mod.rs:1529`), and fabric link resolution tries overlay then
-parent sequentially (`forwarding/mod.rs:300`), so the #949 pair-atomicity
-guarantee is stronger than any consumer needs. The bulk path and its comment
-are removed/rewritten with this justification inline. Option A (read-then-
-bulk) is recorded as the fallback if r2 finds a pair-consuming reader.
-Steady state becomes ≤2 single-shard `insert_if_changed` no-ops with zero
-allocations. **Defer-eligible** stands: if the operator prefers, park with
-`perf` label after U1-U10.
+**Disposition (Codex r2): DEFER until U1–U10 are done** unless current perf
+pressure demands otherwise. Both reviewers independently hunted for a
+pair-consuming reader of the (physical, logical-VLAN) dynamic-neighbor keys —
+including tests and debug dumps — and found NONE: forwarding resolves exactly
+one key per packet (`forwarding/mod.rs:1529`), fabric link resolution tries
+overlay then parent sequentially (`forwarding/mod.rs:300`), so the #949
+pair-atomicity guarantee is stronger than any consumer needs.
+
+Settled implementation sketch for when it runs (common ground of both r2
+reviews): replace `vec!` with fixed `[i32; 2]`+len (zero allocs), and add a
+**steady-state equality bypass** — read the ≤2 keys via per-key single-shard
+locks; if all already map to `src_mac`, return without writing. On actual
+change (rare): Codex prefers per-key `insert_if_changed` (Option B, drops the
+unneeded invariant with the justification inlined in the comment); AGY notes
+keeping the existing bulk write on the change path (Option A shape) preserves
+the invariant at zero extra cost since change is rare. Either is acceptable —
+the steady-state cost is identical (zero writes, zero allocs, no bulk lock);
+the implementer picks one and documents it. Pair-consuming-reader absence
+must be re-verified at implementation time.
 
 ## 6. Public API preservation
 
