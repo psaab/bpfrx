@@ -14,6 +14,6 @@ Plan: docs/research/1800-sweep-triage/plan.md, branch research/1800-sweep-triage
 - All folded into v2 `48d1a023c`.
 
 ## Round 2 (plan v2 `48d1a023c`)
-- Codex: task-(r2, see below)
-- AGY: adversarial-review-(r2, see below)
+- Codex: `task-mq77o1nn-edtbnt`
+- AGY: `adversarial-review-mq77o1xw-5gryre`
 - Claude SMR: claude-smr-plan-r2.md — **PLAN-READY**
