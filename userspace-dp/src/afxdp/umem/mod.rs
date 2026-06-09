@@ -449,6 +449,26 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// race during config reload or helper restart. Subset of
     /// `tx_errors`.
     pub(super) no_owner_binding_drops: AtomicU64,
+    /// #1782: per-binding count of neg-neigh-cache fast-fails. Promotes
+    /// the debug-only `dbg.neg_neigh_fast_fail` counter into a real
+    /// atomic surfaced via `Coordinator::neg_neigh_fast_fail_total()`
+    /// (Prometheus `xpf_userspace_neg_neigh_fast_fail_total`). Capture
+    /// instrumentation only: the increment is one Relaxed fetch_add on
+    /// the existing fast-fail discard path, no new hot-path work. Lets
+    /// the cold-start capture separate H1 (neg lockout) from H5 (sibling
+    /// pending-drop) per worker.
+    pub(super) neg_neigh_fast_fail: AtomicU64,
+    /// #1782: per-binding count of `pending_neigh` sibling drops caused
+    /// SPECIFICALLY by the key already being pending (`contains_key`
+    /// true) — NOT the co-located `len >= MAX_PENDING_NEIGH` capacity
+    /// drop. The first MissingNeighbor packet for a `(egress_ifindex,
+    /// next_hop)` is buffered and drives the kernel probe; later
+    /// same-key siblings in the same idle window are recycled here. This
+    /// counter measures the H5 sibling-drop volume so it is separable
+    /// from H1 and from RSS fan-out. Surfaced via
+    /// `Coordinator::pending_neigh_duplicate_drops_total()` (Prometheus
+    /// `xpf_userspace_pending_neigh_duplicate_drops_total`).
+    pub(super) pending_neigh_duplicate_drops: AtomicU64,
     /// #709 / #746: owner-written telemetry, cacheline-isolated.
     /// `drain_latency_hist` buckets sum to `drain_invocations` (pinned
     /// in unit tests); `drain_noop_invocations` is a subset counter
@@ -683,6 +703,8 @@ impl BindingLiveState {
             mirror_drops_queue_full_same_worker: AtomicU64::new(0),
             mirror_drops_queue_full_cross_worker: AtomicU64::new(0),
             no_owner_binding_drops: AtomicU64::new(0),
+            neg_neigh_fast_fail: AtomicU64::new(0),
+            pending_neigh_duplicate_drops: AtomicU64::new(0),
             // #709 / #746: owner-profile telemetry, split by writer
             // into two cacheline-isolated groups. Histograms are zero-
             // init fixed-cap arrays; sum of buckets == drain_invocations

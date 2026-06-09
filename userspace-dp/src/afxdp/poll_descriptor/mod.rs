@@ -2052,6 +2052,16 @@ pub(super) fn poll_binding_process_descriptor(
                                     );
                                     if fast_fail {
                                         telemetry.dbg.neg_neigh_fast_fail += 1;
+                                        // #1782: promote the debug counter to a
+                                        // real per-binding atomic so the
+                                        // cold-start capture can read it from
+                                        // Prometheus. Single Relaxed fetch_add
+                                        // on the existing discard path — no new
+                                        // hot-path work, no behavior change.
+                                        binding
+                                            .live
+                                            .neg_neigh_fast_fail
+                                            .fetch_add(1, Ordering::Relaxed);
                                         // #1769: the negative gate suppresses
                                         // the probe + buffer below, so a dst
                                         // that lost its dynamic entry (transient
@@ -2431,9 +2441,24 @@ pub(super) fn poll_binding_process_descriptor(
                                 if let Some(hop) = pending_decision.resolution.next_hop {
                                     let pending_key =
                                         (pending_decision.resolution.egress_ifindex, hop);
-                                    if !binding.pending_neigh.contains_key(&pending_key)
-                                        && binding.pending_neigh.len() < MAX_PENDING_NEIGH
-                                    {
+                                    // #1782: split the buffer-admission test so
+                                    // the capture can tell WHY a sibling was not
+                                    // buffered. The `contains_key` branch is the
+                                    // H5 sibling drop (key already pending — the
+                                    // first packet drove the kernel probe); the
+                                    // capacity branch (`len >= MAX_PENDING_NEIGH`)
+                                    // is a distinct condition, counted nowhere
+                                    // here. Behavior is unchanged: an insert
+                                    // happens iff the key is absent AND there is
+                                    // room, exactly as the prior combined
+                                    // condition; otherwise `recycle_now` stays
+                                    // true and the frame is recycled.
+                                    if binding.pending_neigh.contains_key(&pending_key) {
+                                        binding
+                                            .live
+                                            .pending_neigh_duplicate_drops
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    } else if binding.pending_neigh.len() < MAX_PENDING_NEIGH {
                                         let pending_flow_key = flow
                                             .as_ref()
                                             .map(|flow| flow.forward_key.clone())

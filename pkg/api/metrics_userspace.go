@@ -3,6 +3,7 @@ package api
 import (
 	"math"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -40,6 +41,44 @@ func (c *xpfCollector) collectUserspaceStatus(ch chan<- prometheus.Metric, dp ap
 	c.emitFairnessRSSGauges(ch, status)
 	c.emitFairnessThroughputGauges(ch, status)
 	c.emitNeighborWarmCounters(ch, status)
+	c.emitNeighborColdStartCapture(ch, status)
+}
+
+// emitNeighborColdStartCapture exposes the #1782 cold-start capture
+// instrumentation: the per-worker-summed neg-neigh fast-fail counter
+// (H1 amplifier), the pending_neigh key-already-pending duplicate-drop
+// counter (H5 sibling drop), and a per-key presence gauge dumped from
+// the helper's dynamic_neighbors mirror so the capture harness can grep
+// the pre-connect t0' next-hop membership (the H2 absence fingerprint).
+// All three are read straight off the single per-scrape ProcessStatus;
+// no extra control-socket round trip.
+func (c *xpfCollector) emitNeighborColdStartCapture(ch chan<- prometheus.Metric, status dpuserspace.ProcessStatus) {
+	ch <- prometheus.MustNewConstMetric(
+		c.negNeighFastFailTotal,
+		prometheus.CounterValue,
+		float64(status.NegNeighFastFailTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.pendingNeighDuplicateDropsTotal,
+		prometheus.CounterValue,
+		float64(status.PendingNeighDuplicateDropsTotal),
+	)
+	for _, key := range status.DynamicNeighborKeys {
+		// Each key is rendered "ifindex ip" by the helper. Split on the
+		// single space into the two gauge labels; skip a malformed entry
+		// rather than emit a partial-label series.
+		ifindex, ip, ok := strings.Cut(key, " ")
+		if !ok || ifindex == "" || ip == "" {
+			continue
+		}
+		ch <- prometheus.MustNewConstMetric(
+			c.dynamicNeighborPresent,
+			prometheus.GaugeValue,
+			1,
+			ifindex,
+			ip,
+		)
+	}
 }
 
 // emitNeighborWarmCounters exposes the #1636 proactive-neighbor-warm

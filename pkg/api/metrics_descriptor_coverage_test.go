@@ -272,10 +272,16 @@ func populatedCoverageStatus() dpuserspace.ProcessStatus {
 			PolicyDenyDrops: 1, ScreenDropDrops: 4, FilterLogDrops: 9,
 			UnknownFrameDrops: 3,
 		},
-		EventStreamSent:                   101,
-		EventStreamDropped:                7,
-		NeighborWarmDropsTotal:            2,
-		NeighborWarmDisconnectedTotal:     0,
+		EventStreamSent:               101,
+		EventStreamDropped:            7,
+		NeighborWarmDropsTotal:        2,
+		NeighborWarmDisconnectedTotal: 0,
+		// #1782 cold-start capture instrumentation: drive all three new
+		// families (two counters always emit; the presence gauge emits
+		// one series per dynamic_neighbors key).
+		NegNeighFastFailTotal:             3,
+		PendingNeighDuplicateDropsTotal:   4,
+		DynamicNeighborKeys:               []string{"7 10.0.61.1", "9 172.16.80.200"},
 		NeighborResolverQueueDepth:        3,
 		NeighborResolverEnqueueDropsTotal: 1,
 		NeighborResolverGetAttemptsTotal:  5,
@@ -381,20 +387,23 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 	// a single desc) also fails this canary.
 	names := gatheredNames(mfs)
 	want := []string{
-		"xpf_packets_total",                               // collectGlobalCounters
-		"xpf_zone_packets_total",                          // collectZoneCounters
-		"xpf_policy_hits_total",                           // collectPolicyCounters
-		"xpf_filter_hits_total",                           // collectFilterCounters
-		"xpf_nat_pool_total_ports",                        // collectNATPoolMetrics
-		"xpf_sessions_active",                             // collectSessionGauges
-		"xpf_daemon_uptime_seconds",                       // collectSystemMetrics
+		"xpf_packets_total",                                     // collectGlobalCounters
+		"xpf_zone_packets_total",                                // collectZoneCounters
+		"xpf_policy_hits_total",                                 // collectPolicyCounters
+		"xpf_filter_hits_total",                                 // collectFilterCounters
+		"xpf_nat_pool_total_ports",                              // collectNATPoolMetrics
+		"xpf_sessions_active",                                   // collectSessionGauges
+		"xpf_daemon_uptime_seconds",                             // collectSystemMetrics
 		"xpf_daemon_neighbor_periodic_last_success_age_seconds", // #1780 neighbor watchdog
-		"xpf_userspace_worker_dead",                       // emitWorkerRuntime
-		"xpf_userspace_worker_cold_path_samples_v3_total", // cold-path v3
-		"xpf_cos_drain_invocations_total",                 // CoS owner profile
-		"xpf_userspace_three_color_policer_drops_total",   // three-color policer
-		"xpf_userspace_source_nat_pool_live_flows",        // userspace SNAT pool
-		"xpf_userspace_neighbor_warm_drops_total",         // neighbor-warm
+		"xpf_userspace_worker_dead",                             // emitWorkerRuntime
+		"xpf_userspace_worker_cold_path_samples_v3_total",       // cold-path v3
+		"xpf_cos_drain_invocations_total",                       // CoS owner profile
+		"xpf_userspace_three_color_policer_drops_total",         // three-color policer
+		"xpf_userspace_source_nat_pool_live_flows",              // userspace SNAT pool
+		"xpf_userspace_neighbor_warm_drops_total",               // neighbor-warm
+		"xpf_userspace_neg_neigh_fast_fail_total",               // #1782 cold-start H1
+		"xpf_userspace_pending_neigh_duplicate_drops_total",     // #1782 cold-start H5
+		"xpf_userspace_dynamic_neighbor_present",                // #1782 cold-start H2 dump
 	}
 	if ifaceResolvable {
 		want = append(want, "xpf_interface_packets_total") // collectInterfaceCounters (lo)

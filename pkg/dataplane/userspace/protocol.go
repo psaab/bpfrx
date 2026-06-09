@@ -624,6 +624,22 @@ type ProcessStatus struct {
 	// warmer worker thread died (fatal — warming disabled until restart).
 	NeighborWarmDropsTotal        uint64 `json:"neighbor_warm_drops_total,omitempty"`
 	NeighborWarmDisconnectedTotal uint64 `json:"neighbor_warm_disconnected_total,omitempty"`
+	// #1782 cold-start capture instrumentation. NegNeighFastFailTotal is
+	// the per-binding-summed count of neg-neigh-cache fast-fails (the H1
+	// amplifier signal); PendingNeighDuplicateDropsTotal is the count of
+	// pending_neigh sibling drops where the (egress_ifindex, next_hop)
+	// key was already pending (the H5 sibling-drop signal).
+	// DynamicNeighborKeys is a debug dump of every key in the helper's
+	// dynamic_neighbors mirror ("ifindex ip"), surfaced as the per-key
+	// xpf_userspace_dynamic_neighbor_present gauge so the capture harness
+	// can confirm the t0' next-hop miss (the H2 fingerprint). It is gated
+	// behind the helper's XPF_DEBUG_NEIGHBOR_KEYS env var and is empty by
+	// default — an empty slice (and an absent gauge family) does NOT mean
+	// the mirror is empty, only that the debug dump was not enabled. All
+	// are omitempty for wire-compat with older helpers.
+	NegNeighFastFailTotal           uint64   `json:"neg_neigh_fast_fail_total,omitempty"`
+	PendingNeighDuplicateDropsTotal uint64   `json:"pending_neigh_duplicate_drops_total,omitempty"`
+	DynamicNeighborKeys             []string `json:"dynamic_neighbor_keys,omitempty"`
 	// #1769: on-demand neighbor-resolver telemetry. The resolver fires
 	// when a MissingNeighbor negative-cache fast-fail nudges a wedged dst
 	// (single-key RTM_GETNEIGH + epoch-guarded cache or probe-on-stale).
