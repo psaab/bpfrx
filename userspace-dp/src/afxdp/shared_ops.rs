@@ -266,6 +266,9 @@ pub(super) fn republish_bpf_session_entries_for_owner_rgs(
             published += 1;
         } else {
             errors += 1;
+            // #1789: feed the activation-republish failures into the same
+            // always-on total as every other USERSPACE_SESSIONS publish site.
+            SESSION_PUBLISH_ERRORS_SHARED.fetch_add(1, Ordering::Relaxed);
         }
     }
     if errors > 0 {

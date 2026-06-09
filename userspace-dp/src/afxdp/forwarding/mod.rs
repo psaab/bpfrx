@@ -1103,8 +1103,14 @@ pub(super) fn install_helper_local_session_on_miss(
         protocol,
         tcp_flags,
     };
-    let _ =
-        publish_session_map_entry_for_session(session_map_fd, key, decision, &local_entry.metadata);
+    // #1789: count a failed helper-local session publish (same
+    // shim-missing-key consequence as every other publish site).
+    if publish_session_map_entry_for_session(session_map_fd, key, decision, &local_entry.metadata)
+        .is_err()
+    {
+        crate::afxdp::bpf_map::SESSION_PUBLISH_ERRORS_SHARED
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     true
 }
 
