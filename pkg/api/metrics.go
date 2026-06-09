@@ -136,6 +136,9 @@ type xpfCollector struct {
 	userspaceSessionTableEntries             *prometheus.Desc
 	userspaceSessionTableCapacity            *prometheus.Desc
 	userspaceNatReverseKeyCollisions         *prometheus.Desc
+	// #1789: total failed USERSPACE_SESSIONS BPF-map publishes — the
+	// cause-side signal for rising XDP-shim NO_SESSION fallbacks.
+	userspaceSessionPublishErrors            *prometheus.Desc
 	userspaceFlowCacheActiveFlows            *prometheus.Desc
 	userspaceFlowCacheCapacity               *prometheus.Desc
 	// #1379: daemon-side userspace event-stream transport counters.
@@ -331,6 +334,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.userspaceSessionTableEntries
 	ch <- c.userspaceSessionTableCapacity
 	ch <- c.userspaceNatReverseKeyCollisions
+	ch <- c.userspaceSessionPublishErrors
 	ch <- c.userspaceFlowCacheActiveFlows
 	ch <- c.userspaceFlowCacheCapacity
 	ch <- c.userspaceEventStreamFramesTotal

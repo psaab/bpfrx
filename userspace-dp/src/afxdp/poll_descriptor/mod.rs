@@ -467,12 +467,24 @@ pub(super) fn poll_binding_process_descriptor(
                                         meta.protocol,
                                         meta.tcp_flags,
                                     ) {
-                                        let _ = publish_live_session_entry(
+                                        // #1789: a failed publish leaves the
+                                        // shim without this key (NO_SESSION
+                                        // degraded path). Count it; one
+                                        // Relaxed fetch_add on the rare error
+                                        // branch only.
+                                        if publish_live_session_entry(
                                             binding.bpf_maps.session_map_fd,
                                             &flow.forward_key,
                                             NatDecision::default(),
                                             true,
-                                        );
+                                        )
+                                        .is_err()
+                                        {
+                                            binding
+                                                .live
+                                                .session_publish_errors
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
                                     }
                                     binding.scratch.scratch_forwards.push(request);
                                     continue;
@@ -1244,12 +1256,23 @@ pub(super) fn poll_binding_process_descriptor(
                                                 protocol: meta.protocol,
                                                 tcp_flags: meta.tcp_flags,
                                             };
-                                            let _ = publish_live_session_entry(
+                                            // #1789: count failed publishes so
+                                            // map-at-capacity / stale-fd
+                                            // failures are visible in release
+                                            // builds (was `let _ =`).
+                                            if publish_live_session_entry(
                                                 binding.bpf_maps.session_map_fd,
                                                 &flow.forward_key,
                                                 decision.nat,
                                                 false,
-                                            );
+                                            )
+                                            .is_err()
+                                            {
+                                                binding
+                                                    .live
+                                                    .session_publish_errors
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                            }
                                             publish_shared_session(
                                                 worker_ctx.shared_sessions,
                                                 worker_ctx.shared_nat_sessions,
@@ -1385,10 +1408,21 @@ pub(super) fn poll_binding_process_descriptor(
                                                 meta.tcp_flags,
                                             )
                                         {
-                                            let _ = publish_live_session_key(
+                                            // #1789: count failed reverse-key
+                                            // publishes (was `let _ =`; the
+                                            // debug-only verify below re-reads
+                                            // the map and cannot see the Err).
+                                            if publish_live_session_key(
                                                 binding.bpf_maps.session_map_fd,
                                                 &reverse_key,
-                                            );
+                                            )
+                                            .is_err()
+                                            {
+                                                binding
+                                                    .live
+                                                    .session_publish_errors
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                            }
                                             // Verify session keys and log creations (debug-only: BPF syscalls)
                                             if cfg!(feature = "debug-log") {
                                                 if verify_session_key_in_bpf(
@@ -2385,12 +2419,22 @@ pub(super) fn poll_binding_process_descriptor(
                                             &worker_ctx.shared_owner_rg_indexes,
                                             &entry,
                                         );
-                                        let _ = publish_session_map_entry_for_session(
+                                        // #1789: count a failed publish
+                                        // (shim misses the key -> NO_SESSION
+                                        // degraded path for the seeded flow).
+                                        if publish_session_map_entry_for_session(
                                             binding.bpf_maps.session_map_fd,
                                             &flow.forward_key,
                                             pending_decision,
                                             &entry.metadata,
-                                        );
+                                        )
+                                        .is_err()
+                                        {
+                                            binding
+                                                .live
+                                                .session_publish_errors
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
                                         publish_bpf_conntrack_entry(
                                             conntrack_v4_fd,
                                             conntrack_v6_fd,

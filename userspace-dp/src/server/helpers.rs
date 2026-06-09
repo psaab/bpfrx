@@ -43,6 +43,10 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     state.status.neg_neigh_fast_fail_total = state.afxdp.neg_neigh_fast_fail_total();
     state.status.pending_neigh_duplicate_drops_total =
         state.afxdp.pending_neigh_duplicate_drops_total();
+    // #1789: total failed USERSPACE_SESSIONS BPF-map publishes
+    // (per-binding worker-poll sites + shared no-binding sites). The
+    // cause-side signal for rising XDP-shim NO_SESSION fallbacks.
+    state.status.session_publish_errors_total = state.afxdp.session_publish_errors_total();
     // The per-key dynamic_neighbors dump is a high-cardinality
     // (ifindex,ip)-labelled debug surface used only by the #1782 cold-start
     // capture. Gate it behind XPF_DEBUG_NEIGHBOR_KEYS so it is OFF by default:

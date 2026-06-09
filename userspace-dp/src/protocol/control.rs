@@ -166,6 +166,16 @@ pub(crate) struct ProcessStatus {
     pub neg_neigh_fast_fail_total: u64,
     #[serde(rename = "pending_neigh_duplicate_drops_total", default)]
     pub pending_neigh_duplicate_drops_total: u64,
+    /// #1789: total failed USERSPACE_SESSIONS BPF-map publishes
+    /// (per-binding worker-poll sites summed with the shared no-binding
+    /// sites: HA upsert, session-glue worker publish, post-reconcile
+    /// replay, activation/reverse prewarm). Always-on cause-side signal
+    /// for rising XDP-shim NO_SESSION degraded-path fallbacks (session
+    /// map at capacity, stale fd after reconcile). Surfaced as the
+    /// Prometheus counter `xpf_userspace_session_publish_errors_total`.
+    /// Additive / defaulted for backward compatibility.
+    #[serde(rename = "session_publish_errors_total", default)]
+    pub session_publish_errors_total: u64,
     /// #1782 cold-start capture instrumentation. Debug dump of every key
     /// present in the userspace `dynamic_neighbors` mirror, rendered as
     /// `"ifindex ip"` strings. The capture harness greps this at the

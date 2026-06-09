@@ -59,6 +59,26 @@ impl super::Coordinator {
             .sum()
     }
 
+    /// #1789: total failed USERSPACE_SESSIONS BPF-map publishes. Sum of
+    /// the per-binding `session_publish_errors` atomics (worker poll
+    /// sites, mirroring `neg_neigh_fast_fail_total`) plus the shared
+    /// `SESSION_PUBLISH_ERRORS_SHARED` static (HA upsert, session-glue
+    /// worker publish, post-reconcile replay, activation/reverse prewarm
+    /// — sites with no binding context). A nonzero value is the
+    /// cause-side signal for rising XDP-shim NO_SESSION degraded-path
+    /// fallbacks (session map at capacity, stale/invalid fd after
+    /// reconcile). Surfaced as
+    /// `xpf_userspace_session_publish_errors_total`.
+    pub fn session_publish_errors_total(&self) -> u64 {
+        let per_binding: u64 = self
+            .workers
+            .live
+            .values()
+            .map(|live| live.session_publish_errors.load(Ordering::Relaxed))
+            .sum();
+        per_binding.saturating_add(SESSION_PUBLISH_ERRORS_SHARED.load(Ordering::Relaxed))
+    }
+
     /// #1782: debug dump of every key currently present in the userspace
     /// `dynamic_neighbors` mirror, as `(ifindex, ip)` pairs. The
     /// cold-start capture harness reads this at the pre-connect t0'

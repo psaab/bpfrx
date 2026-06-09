@@ -107,6 +107,7 @@ pub(crate) fn run() -> Result<(), String> {
             neighbor_warm_disconnected_total: 0,
             neg_neigh_fast_fail_total: 0,
             pending_neigh_duplicate_drops_total: 0,
+            session_publish_errors_total: 0,
             dynamic_neighbor_keys: Vec::new(),
             neighbor_resolver_queue_depth: 0,
             neighbor_resolver_enqueue_drops_total: 0,

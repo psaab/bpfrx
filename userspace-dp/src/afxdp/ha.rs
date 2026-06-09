@@ -279,12 +279,19 @@ impl super::Coordinator {
             now_secs,
         ) && let Some(session_map_fd) = self.bpf_maps.session_map_fd.as_ref()
         {
-            let _ = publish_live_session_entry(
+            // #1789: a failed HA-upsert publish silently loses synced
+            // state (the shim takes the NO_SESSION degraded path). No
+            // binding context here, so bump the shared counter.
+            if publish_live_session_entry(
                 session_map_fd.fd,
                 &entry.key,
                 entry.decision.nat,
                 entry.metadata.is_reverse,
-            );
+            )
+            .is_err()
+            {
+                SESSION_PUBLISH_ERRORS_SHARED.fetch_add(1, Ordering::Relaxed);
+            }
         }
         refresh_reverse_prewarm_owner_rg_indexes(
             &self.sessions.owner_rg_indexes.reverse_prewarm_sessions,
@@ -307,12 +314,18 @@ impl super::Coordinator {
                 now_secs,
             ) && let Some(session_map_fd) = self.bpf_maps.session_map_fd.as_ref()
             {
-                let _ = publish_live_session_entry(
+                // #1789: same accounting for the synthesized reverse
+                // entry (was `let _ =`).
+                if publish_live_session_entry(
                     session_map_fd.fd,
                     &reverse.key,
                     reverse.decision.nat,
                     true,
-                );
+                )
+                .is_err()
+                {
+                    SESSION_PUBLISH_ERRORS_SHARED.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         for handle in self.workers.handles.values() {

@@ -367,12 +367,19 @@ impl Coordinator {
         }
         let worker_queues = worker_command_queues.values().cloned().collect::<Vec<_>>();
         for entry in entries {
-            let _ = publish_live_session_entry(
+            // #1789: a failed replay publish silently loses an arbitrary
+            // prefix of synced state after reconcile (was `let _ =`). No
+            // binding context here — shared counter.
+            if publish_live_session_entry(
                 session_map_fd,
                 &entry.key,
                 entry.decision.nat,
                 entry.metadata.is_reverse,
-            );
+            )
+            .is_err()
+            {
+                SESSION_PUBLISH_ERRORS_SHARED.fetch_add(1, Ordering::Relaxed);
+            }
             replicate_session_upsert(&worker_queues, entry);
         }
         entries.len()

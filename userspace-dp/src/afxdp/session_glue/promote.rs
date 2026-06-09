@@ -105,7 +105,14 @@ pub(in crate::afxdp::session_glue) fn maybe_promote_synced_session(
         protocol,
         tcp_flags,
     }) {
-        let _ = publish_session_map_entry_for_session(session_map_fd, key, decision, &promoted);
+        // #1789: count a failed shared-promote publish (shim would miss the
+        // key -> NO_SESSION degraded path for the promoted flow).
+        if publish_session_map_entry_for_session(session_map_fd, key, decision, &promoted)
+            .is_err()
+        {
+            crate::afxdp::bpf_map::SESSION_PUBLISH_ERRORS_SHARED
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let promoted_entry = SyncedSessionEntry {
             key: key.clone(),
             decision,

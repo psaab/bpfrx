@@ -282,6 +282,8 @@ func populatedCoverageStatus() dpuserspace.ProcessStatus {
 		NegNeighFastFailTotal:             3,
 		PendingNeighDuplicateDropsTotal:   4,
 		DynamicNeighborKeys:               []string{"7 10.0.61.1", "9 172.16.80.200"},
+		// #1789: failed USERSPACE_SESSIONS publish counter (always emits).
+		SessionPublishErrorsTotal: 5,
 		NeighborResolverQueueDepth:        3,
 		NeighborResolverEnqueueDropsTotal: 1,
 		NeighborResolverGetAttemptsTotal:  5,
@@ -404,6 +406,7 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 		"xpf_userspace_neg_neigh_fast_fail_total",               // #1782 cold-start H1
 		"xpf_userspace_pending_neigh_duplicate_drops_total",     // #1782 cold-start H5
 		"xpf_userspace_dynamic_neighbor_present",                // #1782 cold-start H2 dump
+		"xpf_userspace_session_publish_errors_total",            // #1789 publish failures
 	}
 	if ifaceResolvable {
 		want = append(want, "xpf_interface_packets_total") // collectInterfaceCounters (lo)

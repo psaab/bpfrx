@@ -866,6 +866,17 @@ pub(super) fn dump_bpf_session_entries(map_fd: c_int, max_entries: u32) {
 
 pub(super) static SESSION_PUBLISH_VERIFY_OK: AtomicU64 = AtomicU64::new(0);
 pub(super) static SESSION_PUBLISH_VERIFY_FAIL: AtomicU64 = AtomicU64::new(0);
+/// #1789: failed USERSPACE_SESSIONS BPF-map publishes from call sites
+/// that have no per-binding context (HA `upsert_synced_session`,
+/// session-glue worker publishes, post-reconcile `replay_synced_sessions`,
+/// activation/reverse prewarm). Always-on (NOT debug-gated, unlike the
+/// VERIFY counters above which only move under `debug-log`): a swallowed
+/// publish `Err` means the XDP shim never learns the key and the flow
+/// takes the NO_SESSION degraded path. Per-binding worker poll sites use
+/// `BindingLiveState::session_publish_errors` instead; the two are summed
+/// by `Coordinator::session_publish_errors_total()` and surfaced as
+/// `xpf_userspace_session_publish_errors_total`.
+pub(super) static SESSION_PUBLISH_ERRORS_SHARED: AtomicU64 = AtomicU64::new(0);
 pub(super) static SESSION_CREATIONS_LOGGED: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "debug-log")]
 pub(super) static ICMPV6_EMBED_LOGGED: AtomicU32 = AtomicU32::new(0);
