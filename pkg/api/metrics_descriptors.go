@@ -798,6 +798,22 @@ func newCollector(srv *Server) *xpfCollector {
 			"Proactive neighbor-warm requests dropped because the warmer worker thread died; warming is disabled until daemon restart (#1636).",
 			nil, nil,
 		),
+		// #1782 cold-start capture instrumentation.
+		negNeighFastFailTotal: prometheus.NewDesc(
+			"xpf_userspace_neg_neigh_fast_fail_total",
+			"Packets fast-failed by the per-worker neighbor negative cache after a pending_neigh timeout armed the 3s lockout (cold-start H1 amplifier signal) (#1782).",
+			nil, nil,
+		),
+		pendingNeighDuplicateDropsTotal: prometheus.NewDesc(
+			"xpf_userspace_pending_neigh_duplicate_drops_total",
+			"MissingNeighbor sibling packets recycled because the (egress_ifindex, next_hop) key was already pending in pending_neigh (cold-start H5 sibling-drop signal; excludes the MAX_PENDING_NEIGH capacity-drop case) (#1782).",
+			nil, nil,
+		),
+		dynamicNeighborPresent: prometheus.NewDesc(
+			"xpf_userspace_dynamic_neighbor_present",
+			"Per-key presence gauge (always 1) dumped from the helper userspace dynamic_neighbors mirror so the cold-start capture harness can grep the pre-connect t0' next-hop membership (the H2 absence fingerprint) (#1782).",
+			[]string{"ifindex", "ip"}, nil,
+		),
 		// #1769: on-demand neighbor-resolver telemetry — operator-visible
 		// signal for the MissingNeighbor negative-cache stuck-state.
 		neighborResolverQueueDepth: prometheus.NewDesc(

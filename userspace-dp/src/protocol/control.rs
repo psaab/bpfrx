@@ -156,6 +156,28 @@ pub(crate) struct ProcessStatus {
     pub neighbor_warm_drops_total: u64,
     #[serde(rename = "neighbor_warm_disconnected_total", default)]
     pub neighbor_warm_disconnected_total: u64,
+    /// #1782 cold-start capture instrumentation. Per-binding-summed
+    /// count of neg-neigh-cache fast-fails (H1 amplifier signal) and of
+    /// `pending_neigh` sibling drops where the `(egress_ifindex,
+    /// next_hop)` key was already pending (H5 sibling-drop signal). Both
+    /// are surfaced as Prometheus counters by the Go collector. Additive
+    /// / defaulted for backward compatibility with older daemons.
+    #[serde(rename = "neg_neigh_fast_fail_total", default)]
+    pub neg_neigh_fast_fail_total: u64,
+    #[serde(rename = "pending_neigh_duplicate_drops_total", default)]
+    pub pending_neigh_duplicate_drops_total: u64,
+    /// #1782 cold-start capture instrumentation. Debug dump of every key
+    /// present in the userspace `dynamic_neighbors` mirror, rendered as
+    /// `"ifindex ip"` strings. The capture harness greps this at the
+    /// pre-connect t0' sample to confirm the data-path next-hop is ABSENT
+    /// (the H2 fingerprint). Empty (and omitted) on dataplanes that don't
+    /// publish or when the mirror is empty.
+    #[serde(
+        rename = "dynamic_neighbor_keys",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub dynamic_neighbor_keys: Vec<String>,
     /// #1769: on-demand neighbor-resolver telemetry. The resolver runs
     /// when a `MissingNeighbor` negative-cache fast-fail nudges a wedged
     /// dst: it issues a single-key RTM_GETNEIGH and either caches a

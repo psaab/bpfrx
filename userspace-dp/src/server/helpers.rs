@@ -36,6 +36,19 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     let (warm_drops, warm_disconnected) = state.afxdp.neighbor_warm_counters();
     state.status.neighbor_warm_drops_total = warm_drops;
     state.status.neighbor_warm_disconnected_total = warm_disconnected;
+    // #1782 cold-start capture instrumentation: per-binding-summed
+    // neg-neigh fast-fail (H1) and pending_neigh duplicate-drop (H5)
+    // counters, plus a debug dump of the dynamic_neighbors key set so the
+    // capture harness can confirm the t0' next-hop miss (H2).
+    state.status.neg_neigh_fast_fail_total = state.afxdp.neg_neigh_fast_fail_total();
+    state.status.pending_neigh_duplicate_drops_total =
+        state.afxdp.pending_neigh_duplicate_drops_total();
+    state.status.dynamic_neighbor_keys = state
+        .afxdp
+        .dynamic_neighbor_keys()
+        .into_iter()
+        .map(|(ifindex, ip)| format!("{ifindex} {ip}"))
+        .collect();
     // #1769: on-demand neighbor-resolver telemetry. Previously the only
     // neighbor metrics were the two warm counters; this surfaces the
     // stuck-state surface (pending depth, GET attempts/resolutions/

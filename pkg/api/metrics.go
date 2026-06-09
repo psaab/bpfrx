@@ -221,6 +221,14 @@ type xpfCollector struct {
 	// operator-visible signal for the warmer in production builds.
 	neighborWarmDropsTotal        *prometheus.Desc
 	neighborWarmDisconnectedTotal *prometheus.Desc
+	// #1782 cold-start capture instrumentation. negNeighFastFailTotal is
+	// the H1 amplifier signal; pendingNeighDuplicateDropsTotal is the H5
+	// sibling-drop signal; dynamicNeighborPresent is a per-key presence
+	// gauge dumped from the helper's dynamic_neighbors mirror so the
+	// capture harness can grep the t0' next-hop membership (H2).
+	negNeighFastFailTotal           *prometheus.Desc
+	pendingNeighDuplicateDropsTotal *prometheus.Desc
+	dynamicNeighborPresent          *prometheus.Desc
 	// #1769: on-demand neighbor-resolver telemetry — the operator-visible
 	// signal for the MissingNeighbor stuck-state.
 	neighborResolverQueueDepth        *prometheus.Desc
@@ -387,6 +395,9 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.fairnessEqualFlowWorkerSuppressedBPS
 	ch <- c.neighborWarmDropsTotal
 	ch <- c.neighborWarmDisconnectedTotal
+	ch <- c.negNeighFastFailTotal
+	ch <- c.pendingNeighDuplicateDropsTotal
+	ch <- c.dynamicNeighborPresent
 	ch <- c.neighborResolverQueueDepth
 	ch <- c.neighborResolverEnqueueDropsTotal
 	ch <- c.neighborResolverDisconnectedTotal
