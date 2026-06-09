@@ -28,3 +28,9 @@ Plan: docs/research/1800-sweep-triage/plan.md, branch research/1800-sweep-triage
 - Codex: `task-mq77zu6y-5crxzh` (fold-fidelity confirmation)
 - AGY: `adversarial-review-mq77zugr-1hwb7z` (re-anchored to worktree file with quote requirement)
 - Claude SMR: claude-smr-plan-r3.md — **PLAN-READY**
+
+## Round 3 outcome — CONVERGED PLAN-READY (v2.2 `57a5f8989`)
+- Codex `task-mq77zu6y-5crxzh`: **PLAN-READY** — "Findings: none. The v2.1 folds are faithful." (one editorial nit, folded)
+- AGY `adversarial-review-mq77zugr-1hwb7z`: **PLAN-NEEDS-MINOR** — engaged with the worktree text this round. Verified-new items ALL folded into v2.2: nested-CommitConfirmed rollback-target defect (store.go:879-880, REAL), SyncApply retry discipline, U8 lease-loop invariant, U11 Option-B lock-ordering point, atomic.Value tip. Its two additional wall-clock claims (startedAt heartbeat.go:373; transfer windows failover.go:845-863) were verified FALSE — direct time.Time comparisons retain Go's monotonic reading — recorded as audited-safe in §5.6.
+- Claude SMR: **PLAN-READY** (claude-smr-plan-r3.md).
+- Convergence basis: Codex READY + SMR READY + AGY MINOR-conditions-closed (every verified item folded; false claims documented with code evidence).
