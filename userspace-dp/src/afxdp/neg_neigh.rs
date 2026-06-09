@@ -6,10 +6,17 @@
 //! fast-fail (recycle) at the buffer site instead of each consuming a
 //! `pending_neigh` slot for the full timeout window.
 //!
-//! This is the AGY-r1 HIGH starvation defense from the reopened-#1651
-//! research: a dead-host SYN storm can otherwise saturate the bounded
-//! `pending_neigh` queue (cap `MAX_PENDING_NEIGH`, 800 ms hold each) and
-//! starve LIVE cold connects at the full-queue gate.
+//! Historical motivation (AGY-r1 HIGH, reopened-#1651 research, when
+//! `pending_neigh` was still a per-packet FIFO): a dead-host SYN storm
+//! could saturate the bounded queue (cap `MAX_PENDING_NEIGH`) and starve
+//! LIVE cold connects at the full-queue gate. Post-#1771 §2.2 the map
+//! holds ONE representative packet per `(egress_ifindex, next_hop)`, so
+//! a single dead host pins ≤1 entry; the residual threat this cache
+//! defends against is a multi-hop scan exhausting the distinct-hop cap.
+//! The pending hold per hop is dynamic — `pending_neigh_timeout_ns`
+//! (800 ms with confirmed kernel fast-retrans, else 2000 ms; fallback
+//! `PENDING_NEIGH_TIMEOUT_NS` = 2 s) per `neighbor_dispatch.rs` — not a
+//! fixed 800 ms each.
 //!
 //! ## Invalidation
 //! - **RTM_NEWNEIGH (host recovered):** lazy resolved-neighbor-wins. The

@@ -1,10 +1,10 @@
 # xpf - Junos-Style Firewall With AF_XDP Userspace Dataplane
 
-> Deprecation notice (#1373): the Rust AF_XDP userspace dataplane is now the
-> primary/default target for dataplane development, validation, and omitted
-> runtime configuration. The legacy eBPF dataplane remains in-tree for explicit
-> compatibility and regression coverage during the staged retirement. Later
-> phases own source, loader, build, and CLI removals.
+> Dataplane notice (#1373, complete): the eBPF dataplane retirement is done.
+> The Rust AF_XDP userspace dataplane is the only runtime forwarding path.
+> The legacy BPF source was deleted in #1476; explicit `system dataplane-type
+> ebpf` is hard-rejected at commit (`ErrEBPFDataplaneRetired`, `pkg/config`
+> compiler) and at runtime (`ErrEBPFBackendRetired`, `pkg/dataplane/dataplane.go`).
 
 ## Working Style
 - Think before acting. Read existing files before writing code.
@@ -46,9 +46,10 @@ gotchas that repeatedly bite (deploy wipes CoS, iperf3 target, etc.).
 ## What This Is
 A Junos-style firewall that clones Juniper vSRX capabilities using native
 Junos configuration syntax. The primary dataplane target is the Rust AF_XDP
-userspace helper (`userspace-dp`) driven by the Go control plane. The original
-XDP/TC eBPF dataplane remains as the legacy compatibility and regression path
-while #1373 retirement blockers are being closed.
+userspace helper (`userspace-dp`) driven by the Go control plane. The eBPF
+dataplane retirement (#1373) is complete: the legacy XDP/TC source was deleted
+in #1476 and the eBPF backend is hard-rejected at commit and runtime — the
+userspace helper is the only runtime forwarding path.
 
 ## Quick Start
 ```bash
@@ -56,7 +57,7 @@ make generate        # Build retained Rust AF_XDP shim (post-#1476)
 make build           # Build xpfd daemon
 make build-ctl       # Build remote CLI client
 make build-userspace-dp # Build the primary Rust AF_XDP dataplane helper
-make test            # Run Go tests (640+ tests across 20 packages)
+make test            # Run Go tests
 ```
 
 ## Test Environment (Incus VM)
@@ -238,7 +239,7 @@ in git history; `git log -- bpf/xdp/ bpf/tc/` walks the deleted source.
 - **Failback timing**: ~130ms (daemon startup + dataplane load + sync hold release)
 - **VRRP advertisement**: RETH instances default 30ms; `AdvertiseInterval` is milliseconds internally, centiseconds on wire per RFC 5798
 - **Async GARP**: `becomeMaster()` runs GARP in a goroutine — first pair <1ms, remaining at 50ms intervals in background. Critical path: addVIPs → sendAdvert → emitEvent (sync), then go sendGARP() (async)
-- **Fabric forwarding**: `try_fabric_redirect()` in xdp_zone redirects to fabric peer when `bpf_fib_lookup` fails for synced sessions — prevents TCP death on VRRP failback
+- **Fabric forwarding**: the userspace dataplane redirects packets for peer-owned synced sessions over the fabric link — `resolve_fabric_redirect()` / `ingress_is_fabric()` in `userspace-dp/src/afxdp/forwarding/mod.rs` (see `docs/fabric-cross-chassis-fwd.md`) — prevents TCP death on VRRP failback. The pre-#1476 eBPF mechanism (`try_fabric_redirect()` in xdp_zone) is historical
 - **RETH virtual MAC**: per-node `02:bf:72:CC:RR:NN`; `programRethMAC()` does link DOWN→set MAC→link UP
 - **VIP reconciliation**: `ReconcileVIPs()` re-adds VRRP VIPs after `programRethMAC` link DOWN/UP (which removes all kernel addresses)
 - **Sync hold**: VRRP starts with `preempt=false`; released after bulk session sync (or 10s timeout); `preemptNowCh` triggers instant preemption
@@ -288,13 +289,17 @@ Test containers:
 
 **HA cluster on `loss:xpf-userspace-fw0/fw1`** — different topology from
 the standalone VM above. Do NOT extrapolate the standalone PCI map to
-the loss userspace cluster; the WAN interface there is `ge-0-0-2`, not
-`ge-0-0-3`, and `ge-0-0-0` is the fabric IPVLAN parent (not WAN). The
+the loss userspace cluster; the WAN interface there is `ge-0-0-2` (node 0
+name — node 1 uses FPC 7, i.e. `ge-7-0-2`), not `ge-0-0-3`, and
+`ge-0-0-0` is the fabric IPVLAN parent (not WAN). The
 per-cluster wiring is canonical in `docs/ha-cluster-userspace.conf` +
 `test/incus/loss-userspace-cluster.env`. Summary:
 
 ```
 loss:xpf-userspace-fw{0,1} — node-id 0 / 1, /etc/xpf/node-id present:
+  NOTE: ge-* names below are node 0; node 1 substitutes FPC 7
+  (ge-7-0-1 / ge-7-0-2) per pkg/daemon/linksetup.go (fpc=7 for node 1)
+  and docs/ha-cluster-userspace.conf (node1: ge-7/0/1, ge-7/0/2).
   Virtio (PCI bus 05-07, lower bus → lower vSRX name):
     enp5s0  → fxp0       DHCP                          — mgmt zone (SSH + ping)
     enp6s0  → em0        10.99.{0..12}.{1,2}           — cluster control plane / heartbeat
@@ -307,7 +312,7 @@ loss:xpf-userspace-fw{0,1} — node-id 0 / 1, /etc/xpf/node-id present:
 
 Smoke iperf3 target: 172.16.80.200 / 2001:559:8585:80::200 (on reth0.80
 WAN path, AF_XDP zero-copy fast path). Per-class iperf3 servers live on
-ports 5201-5211 matching `test/incus/cos-iperf-config.set`. Do NOT use
+ports 5200-5211 matching `test/incus/cos-iperf-config.set`. Do NOT use
 172.16.100.x — that reaches a different `loss:` uplink path capped at
 ~9-10 Gb/s and was the misdiagnosed "cluster ceiling" in #1578.
 ```
