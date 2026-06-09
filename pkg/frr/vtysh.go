@@ -20,7 +20,17 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"time"
 )
+
+// vtyshTimeout bounds every `vtysh -c` shell-out. Vtysh backs the
+// show/clear operational paths (status_parse.go, ExecVtysh via
+// gRPC/CLI), not the apply path — but a wedged vtysh (zebra hung, FRR
+// mid-restart) would hang those gRPC/CLI handlers indefinitely, the
+// same hang class #1794 bounded elsewhere. Same 15s budget as
+// reloadTimeout (manager.go), which already covers SystemctlReload /
+// VtyshLoad via caller-supplied contexts. #1794/#1800.
+const vtyshTimeout = 15 * time.Second
 
 // frrExecutor is the package-private indirection that all vtysh and
 // systemctl shell-outs route through. Production code uses realExecutor;
@@ -47,10 +57,14 @@ type frrExecutor interface {
 // accessor on Manager.
 type realExecutor struct{}
 
-// Vtysh runs `vtysh -c <command>` and returns stdout. Bytes-identical to
-// the historical vtyshCmd free function (frr.go:1597-1605 pre-split).
+// Vtysh runs `vtysh -c <command>` under vtyshTimeout and returns
+// stdout. Output/error shape is identical to the historical vtyshCmd
+// free function (frr.go:1597-1605 pre-split); the timeout bound was
+// added in #1800 (U3).
 func (realExecutor) Vtysh(command string) (string, error) {
-	cmd := exec.Command("vtysh", "-c", command)
+	ctx, cancel := context.WithTimeout(context.Background(), vtyshTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "vtysh", "-c", command)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

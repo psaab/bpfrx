@@ -3,13 +3,30 @@
 package networkd
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
+
+// networkctlTimeout bounds every networkctl shell-out. Apply runs on
+// the config-apply path under applyConfigLocked's applySem
+// (daemon_apply.go d.networkd.Apply), so a hung networkctl (dbus stall,
+// wedged systemd-networkd) would otherwise block every commit
+// indefinitely. Mirrors the 15s FRR reload precedent
+// (pkg/frr/manager.go reloadTimeout). #1794/#1800.
+const networkctlTimeout = 15 * time.Second
+
+// runNetworkctl runs `networkctl <args...>` under networkctlTimeout.
+func runNetworkctl(args ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), networkctlTimeout)
+	defer cancel()
+	return exec.CommandContext(ctx, "networkctl", args...).Run()
+}
 
 const (
 	// DefaultNetworkDir is the systemd-networkd configuration directory.
@@ -165,7 +182,7 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 
 	if changed {
 		slog.Info("networkd config updated, reloading", "interfaces", len(interfaces))
-		if err := exec.Command("networkctl", "reload").Run(); err != nil {
+		if err := runNetworkctl("reload"); err != nil {
 			return fmt.Errorf("networkctl reload: %w", err)
 		}
 		// Dynamically created interfaces (bonds, VLANs) may not get their
@@ -181,7 +198,12 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 		}
 		if len(reconf) > 0 {
 			args := append([]string{"reconfigure"}, reconf...)
-			_ = exec.Command("networkctl", args...).Run()
+			// Best-effort (reload above already applied the files), but
+			// the failure is no longer silent.
+			if err := runNetworkctl(args...); err != nil {
+				slog.Warn("networkctl reconfigure failed",
+					"interfaces", len(reconf), "err", err)
+			}
 		}
 		restoreSlowPathRPFilter()
 	}
@@ -219,7 +241,7 @@ func (m *Manager) Clear() error {
 		}
 	}
 
-	if err := exec.Command("networkctl", "reload").Run(); err != nil {
+	if err := runNetworkctl("reload"); err != nil {
 		return fmt.Errorf("networkctl reload: %w", err)
 	}
 	restoreSlowPathRPFilter()
