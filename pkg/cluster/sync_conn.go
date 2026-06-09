@@ -452,7 +452,9 @@ func (s *SessionSync) syncSweep() int {
 		}
 	}
 	if count > 0 {
-		slog.Info("cluster sync: sweep synced sessions", "count", count)
+		// Debug, not Info: this fires on every 1s sweep tick under steady
+		// session churn (CLAUDE.md: never slog.Info per poll tick).
+		slog.Debug("cluster sync: sweep synced sessions", "count", count)
 	}
 	return count
 }
