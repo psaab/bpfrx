@@ -82,6 +82,9 @@ mkdir -p "$ART"
 echo "#1782 cold-stall capture: fw=$FW host=$HOST mode=$MODE art=$ART"
 echo "  target v4=$TARGET_V4 v6=$TARGET_V6 port=$PORT siblings=$SIBLINGS"
 echo "  next-hop v4=$NEXTHOP_V4 v6=$NEXTHOP_V6 dp_iface=$DP_IFACE"
+echo "  NOTE: the dynamic_neighbors membership dump (H2 fingerprint) is gated"
+echo "  behind XPF_DEBUG_NEIGHBOR_KEYS — the daemon under capture MUST be"
+echo "  launched with that env set, or the membership check reads empty."
 
 # fw-side command wrapper (per CLAUDE.md / existing scripts).
 fw() { sg incus-admin -c "incus exec $FW -- $*"; }
@@ -104,15 +107,22 @@ sample() {
 
   # Keyed dynamic_neighbors membership (the H2 fingerprint). PR-1 dumps
   # every present key as xpf_userspace_dynamic_neighbor_present{ifindex,ip}.
+  # Match BOTH labels: the key is (ifindex, ip), so grepping ip alone could
+  # false-PRESENT if the same IP exists on another interface (Codex r1).
+  # DPIDX is the kernel ifindex of the data-path egress; cache it once.
+  if [ -z "${DPIDX:-}" ]; then
+    DPIDX=$(fw "cat /sys/class/net/$DP_IFACE/ifindex" 2>/dev/null | tr -d '[:space:]')
+  fi
   grep 'xpf_userspace_dynamic_neighbor_present' "$dir/metrics.prom" \
     > "$dir/dynamic_neighbor_keys.txt" 2>/dev/null || true
   {
-    echo "# dynamic_neighbors membership for next-hops at $label"
+    echo "# dynamic_neighbors membership for next-hops at $label (ifindex=$DPIDX iface=$DP_IFACE)"
     for nh in "$NEXTHOP_V4" "$NEXTHOP_V6"; do
-      if grep -Fq "ip=\"$nh\"" "$dir/dynamic_neighbor_keys.txt" 2>/dev/null; then
-        echo "PRESENT  $nh"
+      if [ -n "$DPIDX" ] && grep -F "ip=\"$nh\"" "$dir/dynamic_neighbor_keys.txt" 2>/dev/null \
+           | grep -Fq "ifindex=\"$DPIDX\""; then
+        echo "PRESENT  $nh   (ifindex $DPIDX)"
       else
-        echo "ABSENT   $nh   <-- H2 candidate (cross-check ip neigh NUD)"
+        echo "ABSENT   $nh   (ifindex $DPIDX)  <-- H2 candidate (cross-check ip neigh NUD)"
       fi
     done
   } | tee "$dir/membership.txt" | sed 's/^/    /'
@@ -195,16 +205,24 @@ cold_connect() {
   local cdir="$ART/connect_$tag"
   mkdir -p "$cdir"
 
+  # Siblings exercise the H5 one-representative-pending drop: parallel cold
+  # flows to the SAME next-hop. They must NOT all hit one iperf3 server (it is
+  # single-connection -> "server busy" rejections that mask the resolver/RTO
+  # timing, Codex+AGY r1). Each sibling targets a DISTINCT per-class port
+  # (PORT+i, i.e. 5202..), all reaching the same target IP -> same
+  # (egress_ifindex, next_hop) neighbor key, so the sibling-drop path is
+  # exercised without server-busy collisions.
   local sib_pids=()
   for i in $(seq 1 "$SIBLINGS"); do
     (
-      local start end rc
+      local start end rc sport
+      sport=$((PORT + i))
       start=$(date +%s.%N)
       rc=0
-      cl "iperf3 -c $target $fam -t 3 -p $PORT --connect-timeout 5000 --json" \
+      cl "iperf3 -c $target $fam -t 3 -p $sport --connect-timeout 5000 --json" \
         > "$cdir/sibling_$i.json" 2>"$cdir/sibling_$i.err" || rc=$?
       end=$(date +%s.%N)
-      echo "sibling $i rc=$rc wall=$(awk "BEGIN{printf \"%.3f\", $end-$start}")s" \
+      echo "sibling $i port=$sport rc=$rc wall=$(awk -v s="$start" -v e="$end" 'BEGIN{printf "%.3f", e-s}')s" \
         >> "$cdir/wall_times.txt"
     ) &
     sib_pids+=($!)
@@ -217,7 +235,7 @@ cold_connect() {
     cl "iperf3 -c $target $fam -t 3 -p $PORT --connect-timeout 5000 --json" \
       > "$cdir/primary.json" 2>"$cdir/primary.err" || rc=$?
     end=$(date +%s.%N)
-    echo "primary rc=$rc wall=$(awk "BEGIN{printf \"%.3f\", $end-$start}")s" \
+    echo "primary port=$PORT rc=$rc wall=$(awk -v s="$start" -v e="$end" 'BEGIN{printf "%.3f", e-s}')s" \
       | tee -a "$cdir/wall_times.txt"
   }
 
@@ -243,7 +261,7 @@ reduce_deltas() {
       b=$(awk -v k="$m" '$1==k{print $2; exit}' "$before" 2>/dev/null)
       a=$(awk -v k="$m" '$1==k{print $2; exit}' "$after"  2>/dev/null)
       b=${b:-0}; a=${a:-0}
-      d=$(awk "BEGIN{printf \"%.3f\", ($a)-($b)}")
+      d=$(awk -v a="${a:-0}" -v b="${b:-0}" 'BEGIN{printf "%.3f", a-b}')
       printf "%-78s %14s %14s %14s\n" "$m" "$b" "$a" "$d"
     done
   } | tee "$ART/counter_deltas.txt"
@@ -251,8 +269,17 @@ reduce_deltas() {
 
 trap 'stop_syn_tcpdump; stop_neigh_monitor' EXIT
 
-# Always arm the monitor + capture sysctls first (item 4 / item 6).
-start_neigh_monitor
+# Arm the monitor + capture sysctls first (item 4 / item 6). In --connect mode
+# resuming an overnight --monitor-only run, REUSE the existing monitor log —
+# never re-run start_neigh_monitor, which would truncate ('>') the overnight
+# ip_monitor_neigh.log and destroy the DELNEIGH/GC evidence (the H2 root cause).
+# The EXIT trap still stops the overnight monitor PID to finalize the log.
+if [ "$MODE" = "connect" ] && [ -f "$ART/ip_monitor_neigh.log" ]; then
+  echo "[$(ts)] --connect: reusing existing overnight ip_monitor_neigh.log (not truncating)" \
+    | tee -a "$ART/timeline.log"
+else
+  start_neigh_monitor
+fi
 capture_sysctls
 
 if [ "$MODE" = "monitor-only" ]; then

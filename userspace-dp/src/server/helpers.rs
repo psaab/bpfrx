@@ -43,12 +43,23 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     state.status.neg_neigh_fast_fail_total = state.afxdp.neg_neigh_fast_fail_total();
     state.status.pending_neigh_duplicate_drops_total =
         state.afxdp.pending_neigh_duplicate_drops_total();
-    state.status.dynamic_neighbor_keys = state
-        .afxdp
-        .dynamic_neighbor_keys()
-        .into_iter()
-        .map(|(ifindex, ip)| format!("{ifindex} {ip}"))
-        .collect();
+    // The per-key dynamic_neighbors dump is a high-cardinality
+    // (ifindex,ip)-labelled debug surface used only by the #1782 cold-start
+    // capture. Gate it behind XPF_DEBUG_NEIGHBOR_KEYS so it is OFF by default:
+    // unset -> empty field -> no Prometheus series AND no all-shard lock on the
+    // status path. The operator launches the daemon with the env set for the
+    // overnight capture only (review consensus: Codex + AGY + Claude SMR all
+    // asked for this to be gated, not permanent on /metrics).
+    state.status.dynamic_neighbor_keys = if std::env::var_os("XPF_DEBUG_NEIGHBOR_KEYS").is_some() {
+        state
+            .afxdp
+            .dynamic_neighbor_keys()
+            .into_iter()
+            .map(|(ifindex, ip)| format!("{ifindex} {ip}"))
+            .collect()
+    } else {
+        Vec::new()
+    };
     // #1769: on-demand neighbor-resolver telemetry. Previously the only
     // neighbor metrics were the two warm counters; this surfaces the
     // stuck-state surface (pending depth, GET attempts/resolutions/
