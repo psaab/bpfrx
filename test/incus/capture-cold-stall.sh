@@ -101,14 +101,6 @@ cl() { sg incus-admin -c "incus exec $HOST -- $*"; }
 
 ts() { date -u +%Y-%m-%dT%H:%M:%S.%3NZ; }
 
-# Fail fast if DP_IFACE does not exist on the target node. Every
-# per-interface evidence channel below (neigh sysctls, the SYN-exchange
-# tcpdump, the ifindex-keyed membership check) tolerates errors with
-# `|| true`, so a wrong interface name would otherwise produce a quietly
-# hollow artifact — unacceptable for a one-shot overnight capture (#1786).
-fw "ip link show $DP_IFACE" >/dev/null 2>&1 \
-  || { echo "ERROR: DP_IFACE $DP_IFACE not present on $FW" >&2; exit 2; }
-
 # A reusable point-in-time sample of the cold-path state on the firewall.
 #   $1 = label (t0prime, t0, t1). Records keyed dynamic_neighbors
 # membership (item 3 / H2), `ip neigh` NUD/lladdr (item 2), and a full
@@ -284,6 +276,17 @@ reduce_deltas() {
 }
 
 trap 'stop_syn_tcpdump; stop_neigh_monitor' EXIT
+
+# Fail fast if DP_IFACE does not exist on the target node. Every
+# per-interface evidence channel below (neigh sysctls, the SYN-exchange
+# tcpdump, the ifindex-keyed membership check) tolerates errors with
+# `|| true`, so a wrong interface name would otherwise produce a quietly
+# hollow artifact — unacceptable for a one-shot overnight capture (#1786).
+# Placed AFTER the EXIT trap so a wrong-iface --connect resume cleanly
+# stops the overnight monitor (finalizing its log) instead of orphaning
+# it, and BEFORE the monitor/sysctl/tcpdump arming below.
+fw "ip link show $DP_IFACE" >/dev/null 2>&1 \
+  || { echo "ERROR: DP_IFACE $DP_IFACE not present on $FW" >&2; exit 2; }
 
 # Arm the monitor + capture sysctls first (item 4 / item 6). In --connect mode
 # resuming an overnight --monitor-only run, REUSE the existing monitor log —
