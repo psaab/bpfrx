@@ -469,6 +469,21 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// `Coordinator::pending_neigh_duplicate_drops_total()` (Prometheus
     /// `xpf_userspace_pending_neigh_duplicate_drops_total`).
     pub(super) pending_neigh_duplicate_drops: AtomicU64,
+    /// #1789: per-binding count of failed USERSPACE_SESSIONS BPF-map
+    /// publishes (`publish_live_session_entry` /
+    /// `publish_live_session_key` returning `Err`) on the worker poll
+    /// paths that previously discarded the result with `let _ =`. A
+    /// failed publish means the XDP shim never learns the session key
+    /// and takes the NO_SESSION degraded path (drop in STRICT mode), so
+    /// this is the cause-side signal for rising shim no-session
+    /// fallbacks (map at capacity, stale fd after reconcile). One
+    /// Relaxed fetch_add on the existing (rare) error branch — no new
+    /// hot-path work. Call sites without a binding context (HA upsert,
+    /// session-glue worker publish, replay, prewarm) bump the shared
+    /// `SESSION_PUBLISH_ERRORS_SHARED` static instead; both are summed
+    /// by `Coordinator::session_publish_errors_total()` (Prometheus
+    /// `xpf_userspace_session_publish_errors_total`).
+    pub(super) session_publish_errors: AtomicU64,
     /// #709 / #746: owner-written telemetry, cacheline-isolated.
     /// `drain_latency_hist` buckets sum to `drain_invocations` (pinned
     /// in unit tests); `drain_noop_invocations` is a subset counter
@@ -705,6 +720,7 @@ impl BindingLiveState {
             no_owner_binding_drops: AtomicU64::new(0),
             neg_neigh_fast_fail: AtomicU64::new(0),
             pending_neigh_duplicate_drops: AtomicU64::new(0),
+            session_publish_errors: AtomicU64::new(0),
             // #709 / #746: owner-profile telemetry, split by writer
             // into two cacheline-isolated groups. Histograms are zero-
             // init fixed-cap arrays; sum of buckets == drain_invocations

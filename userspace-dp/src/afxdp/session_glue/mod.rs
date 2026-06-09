@@ -254,12 +254,18 @@ pub(super) fn republish_local_delivery_sessions_for_lo0_filter(
             return;
         }
         if session_map_fd >= 0 {
-            let _ = publish_live_session_entry(
+            // #1789: count failed lo0-filter republishes (was `let _ =`).
+            // No binding context in this glue path — shared counter.
+            if publish_live_session_entry(
                 session_map_fd,
                 key,
                 decision.nat,
                 metadata.is_reverse,
-            );
+            )
+            .is_err()
+            {
+                SESSION_PUBLISH_ERRORS_SHARED.fetch_add(1, Ordering::Relaxed);
+            }
         }
         republished += 1;
     });
@@ -340,10 +346,20 @@ pub(in crate::afxdp::session_glue) fn publish_worker_session_map_entry(
         // filters. Keep the packet visible to the helper while lo0
         // filtering is configured; the session-hit path enforces the
         // current lo0 terms before reinjection.
-        let _ = publish_live_session_entry(session_map_fd, key, decision.nat, metadata.is_reverse);
+        //
+        // #1789: count failed publishes (was `let _ =`). No binding
+        // context in this glue path — shared counter.
+        if publish_live_session_entry(session_map_fd, key, decision.nat, metadata.is_reverse)
+            .is_err()
+        {
+            SESSION_PUBLISH_ERRORS_SHARED.fetch_add(1, Ordering::Relaxed);
+        }
         return;
     }
-    let _ = if force_live_redirect_for_worker_synced_entry(
+    // #1789: capture the previously-discarded publish result. Only the
+    // publish outcome is counted; `delete_live_session_entry` below is a
+    // removal, not a publish, and keeps its existing semantics.
+    let publish_result = if force_live_redirect_for_worker_synced_entry(
         decision,
         metadata,
         origin,
@@ -362,6 +378,9 @@ pub(in crate::afxdp::session_glue) fn publish_worker_session_map_entry(
             origin,
         )
     };
+    if publish_result.is_err() {
+        SESSION_PUBLISH_ERRORS_SHARED.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 pub(super) fn delete_terminal_filtered_session(

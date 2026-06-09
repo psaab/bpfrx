@@ -168,6 +168,13 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
             .is_err()
         {
             fwd_publish_errors += 1;
+            // #1789: fold the activation-prewarm forward publish failures
+            // into the global publish-error total. Semantically identical
+            // to every other counted site (a USERSPACE_SESSIONS publish
+            // that returned Err); the local fwd_publish_errors count is
+            // kept only for the existing one-shot eprintln below, so this
+            // is one increment per failure, not a double count.
+            SESSION_PUBLISH_ERRORS_SHARED.fetch_add(1, Ordering::Relaxed);
         }
         for commands in worker_commands {
             if let Ok(mut pending) = commands.lock() {
@@ -191,12 +198,19 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
             &reverse,
         );
         if publish_session_map {
-            let _ = publish_session_map_entry_for_session(
+            // #1789: the reverse-prewarm publish in the same activation
+            // path was still swallowed with `let _ =`; count it like the
+            // forward loop above.
+            if publish_session_map_entry_for_session(
                 session_map_fd,
                 &reverse.key,
                 reverse.decision,
                 &reverse.metadata,
-            );
+            )
+            .is_err()
+            {
+                SESSION_PUBLISH_ERRORS_SHARED.fetch_add(1, Ordering::Relaxed);
+            }
         }
         for commands in worker_commands {
             if let Ok(mut pending) = commands.lock() {
@@ -599,7 +613,13 @@ pub(super) fn install_reverse_session_from_forward_match(
         protocol,
         tcp_flags,
     ) {
-        let _ = publish_live_session_entry(session_map_fd, reverse_key, reverse.decision.nat, true);
+        // #1789: count failed reverse-install publishes (was `let _ =`).
+        // No binding context in this shared-ops path — shared counter.
+        if publish_live_session_entry(session_map_fd, reverse_key, reverse.decision.nat, true)
+            .is_err()
+        {
+            SESSION_PUBLISH_ERRORS_SHARED.fetch_add(1, Ordering::Relaxed);
+        }
         let reverse_entry = SyncedSessionEntry {
             key: reverse_key.clone(),
             decision: reverse.decision,
