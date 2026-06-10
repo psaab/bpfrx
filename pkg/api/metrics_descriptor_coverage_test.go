@@ -182,6 +182,10 @@ func populatedCoverageStatus() dpuserspace.ProcessStatus {
 				EqualFlowSuppressedGrantBytes:              64,
 				EqualFlowStaleOrTagMismatchEvents:          0,
 				EqualFlowFailOpenReason:                    "",
+				// #1829 Phase 1: dequeue-time sojourn gauges.
+				SojournEwmaNS:        2500000,
+				SojournPeakNS:        9000000,
+				SojournWindowedMinNS: 1750000,
 			},
 		},
 	}
@@ -431,6 +435,10 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 		// #1831: per-binding V_min fairness-throttle counters (#941/#943)
 		"xpf_userspace_binding_v_min_throttles_total",
 		"xpf_userspace_binding_v_min_throttle_hard_cap_overrides_total",
+		// #1829 Phase 1: dequeue-time sojourn gauges
+		"xpf_userspace_cos_sojourn_ewma_ns",
+		"xpf_userspace_cos_sojourn_peak_ns",
+		"xpf_userspace_cos_sojourn_windowed_min_ns",
 	}
 	if ifaceResolvable {
 		want = append(want, "xpf_interface_packets_total") // collectInterfaceCounters (lo)

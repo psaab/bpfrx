@@ -284,7 +284,7 @@ fn build_worker_cos_statuses_aggregates_runtime_by_interface_and_queue() {
     second.insert(80, make_root(2048, false, true, 77, counters_b));
 
     let statuses =
-        build_worker_cos_statuses_from_maps([(&first, None), (&second, None)], &forwarding);
+        build_worker_cos_statuses_from_maps([(&first, None), (&second, None)], &forwarding, 0);
     assert_eq!(statuses.len(), 1);
     let iface = &statuses[0];
     assert_eq!(iface.interface_name, "reth0.80");
@@ -498,7 +498,7 @@ fn build_worker_cos_statuses_sums_owner_profile_without_breaking_hist_invariant(
     let statuses = build_worker_cos_statuses_from_maps(
         [(&first, Some(&live_a)), (&second, Some(&live_b))],
         &forwarding,
-    );
+    0, );
     let queue = &statuses[0].queues[0];
 
     // #751: drain_latency_hist + drain_invocations come from
@@ -799,7 +799,7 @@ fn build_worker_cos_statuses_owner_profile_only_surfaces_on_unambiguous_owner_lo
             .store(9, Ordering::Relaxed);
     }
 
-    let statuses = build_worker_cos_statuses_from_maps([(&cos_map, Some(&live))], &forwarding);
+    let statuses = build_worker_cos_statuses_from_maps([(&cos_map, Some(&live))], &forwarding, 0);
     let queues = &statuses[0].queues;
     let q0 = queues.iter().find(|q| q.queue_id == 0).unwrap();
     let q4 = queues.iter().find(|q| q.queue_id == 4).unwrap();
@@ -1026,7 +1026,7 @@ fn build_worker_cos_statuses_owner_profile_stays_zero_for_ambiguous_multi_exact_
     let mut cos_map = FastMap::default();
     cos_map.insert(80, root);
 
-    let statuses = build_worker_cos_statuses_from_maps([(&cos_map, Some(&live))], &forwarding);
+    let statuses = build_worker_cos_statuses_from_maps([(&cos_map, Some(&live))], &forwarding, 0);
     for queue in &statuses[0].queues {
         assert_eq!(
             queue.drain_invocations, 0,
@@ -1188,7 +1188,7 @@ fn build_worker_cos_statuses_owner_profile_stays_zero_for_ambiguous_multi_interf
     cos_map.insert(80, make_runtime());
     cos_map.insert(81, make_runtime());
 
-    let statuses = build_worker_cos_statuses_from_maps([(&cos_map, Some(&live))], &forwarding);
+    let statuses = build_worker_cos_statuses_from_maps([(&cos_map, Some(&live))], &forwarding, 0);
     assert_eq!(statuses.len(), 2, "both interfaces should appear in output");
     for iface in &statuses {
         for queue in &iface.queues {
@@ -1457,7 +1457,7 @@ fn build_worker_cos_statuses_surfaces_distinct_per_queue_drain_telemetry() {
     let mut cos_map = FastMap::default();
     cos_map.insert(80, root);
 
-    let statuses = build_worker_cos_statuses_from_maps([(&cos_map, Some(&live))], &forwarding);
+    let statuses = build_worker_cos_statuses_from_maps([(&cos_map, Some(&live))], &forwarding, 0);
     let queues = &statuses[0].queues;
     let q4 = queues.iter().find(|q| q.queue_id == 4).unwrap();
     let q6 = queues.iter().find(|q| q.queue_id == 6).unwrap();
@@ -2472,7 +2472,7 @@ fn active_flow_buckets_peak_is_max_not_sum_across_workers() {
     second.insert(80, make_root(11));
 
     let statuses =
-        build_worker_cos_statuses_from_maps([(&first, None), (&second, None)], &forwarding);
+        build_worker_cos_statuses_from_maps([(&first, None), (&second, None)], &forwarding, 0);
     assert_eq!(statuses.len(), 1);
     let iface = &statuses[0];
     assert_eq!(iface.queues.len(), 1);
@@ -2535,7 +2535,7 @@ fn build_worker_cos_statuses_min_epochs_is_per_binding_not_sum() {
 
     // Both bindings belong to the SAME worker snapshot call.
     let statuses =
-        build_worker_cos_statuses_from_maps([(&map_a, None), (&map_b, None)], &forwarding);
+        build_worker_cos_statuses_from_maps([(&map_a, None), (&map_b, None)], &forwarding, 0);
     assert_eq!(statuses.len(), 1);
     let iface = &statuses[0];
     assert_eq!(
@@ -2553,10 +2553,87 @@ fn build_worker_cos_statuses_min_epochs_is_per_binding_not_sum() {
     // no items pushed → no backlog
     let mut map_idle = FastMap::default();
     map_idle.insert(80, root_idle);
-    let idle_statuses = build_worker_cos_statuses_from_maps([(&map_idle, None)], &forwarding);
+    let idle_statuses = build_worker_cos_statuses_from_maps([(&map_idle, None)], &forwarding, 0);
     assert_eq!(
         idle_statuses[0].waterfill_min_epochs_per_worker,
         u64::MAX,
         "a worker with no active-backlog binding reports the MAX 'no candidate' sentinel"
+    );
+}
+
+// #1829 Phase 1: worker-instance sojourn aggregation pin. Two queue
+// instances of the same (ifindex, queue_id) on one worker snapshot
+// MAX-merge their sojourn trio (worst instance), and the windowed-min
+// export is evaluated against the SNAPSHOT pass's now_ns — an
+// instance whose last pop is >= 2 windows old contributes 0, not its
+// frozen last-busy reading.
+#[test]
+fn build_worker_cos_statuses_max_merges_sojourn_with_staleness() {
+    use crate::afxdp::types::COS_SOJOURN_WINDOW_NS;
+
+    let mut forwarding = ForwardingState::default();
+    forwarding
+        .ifindex_to_config_name
+        .insert(80, "reth0.80".to_string());
+
+    let exact_queue = || CoSQueueConfig {
+        queue_id: 4,
+        forwarding_class: "iperf-a".into(),
+        priority: 5,
+        transmit_rate_bytes: 125_000_000,
+        guarantee_enabled: true,
+        exact: true,
+        surplus_sharing: false,
+        equal_flow_enforcement: false,
+        surplus_weight: 1,
+        buffer_bytes: 4_000_000,
+        dscp_rewrite: None,
+        codel_target_ns: 0,
+    };
+
+    let base = 100 * COS_SOJOURN_WINDOW_NS;
+    // Instance A: fresh standing queue — 4 ms min, 6 ms peak.
+    let mut root_a = test_cos_runtime_with_queues(25_000_000_000 / 8, vec![exact_queue()]);
+    root_a.queues[0].telemetry.sojourn.record(base - 6_000_000, base);
+    root_a.queues[0].telemetry.sojourn.record(base - 4_000_000, base);
+    let mut map_a = FastMap::default();
+    map_a.insert(80, root_a);
+    // Instance B: larger readings, but recorded >= 2 windows before
+    // the snapshot — its windowed min must read 0 (stale), while its
+    // lifetime peak still MAX-merges.
+    let stale = base - 3 * COS_SOJOURN_WINDOW_NS;
+    let mut root_b = test_cos_runtime_with_queues(25_000_000_000 / 8, vec![exact_queue()]);
+    root_b.queues[0].telemetry.sojourn.record(stale - 9_000_000, stale);
+    let mut map_b = FastMap::default();
+    map_b.insert(80, root_b);
+
+    let statuses =
+        build_worker_cos_statuses_from_maps([(&map_a, None), (&map_b, None)], &forwarding, base);
+    assert_eq!(statuses.len(), 1);
+    let q = &statuses[0].queues[0];
+    assert_eq!(
+        q.sojourn_windowed_min_ns, 4_000_000,
+        "fresh instance's windowed min wins; the stale instance reads 0",
+    );
+    assert_eq!(
+        q.sojourn_peak_ns, 9_000_000,
+        "lifetime peak MAX-merges regardless of freshness",
+    );
+    assert!(q.sojourn_ewma_ns > 0);
+
+    // Snapshot taken >= 2 windows after BOTH instances' last pops:
+    // the gate metric reads 0 across the row.
+    let late = base + 2 * COS_SOJOURN_WINDOW_NS;
+    let map_a = {
+        let mut root = test_cos_runtime_with_queues(25_000_000_000 / 8, vec![exact_queue()]);
+        root.queues[0].telemetry.sojourn.record(base - 4_000_000, base);
+        let mut map = FastMap::default();
+        map.insert(80, root);
+        map
+    };
+    let statuses = build_worker_cos_statuses_from_maps([(&map_a, None)], &forwarding, late);
+    assert_eq!(
+        statuses[0].queues[0].sojourn_windowed_min_ns, 0,
+        "a queue idle for >= 2 windows must not report a standing queue",
     );
 }

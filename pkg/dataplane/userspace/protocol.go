@@ -909,6 +909,20 @@ type CoSQueueStatus struct {
 	WaterfillPhase1Admissions uint64 `json:"waterfill_phase1_admissions,omitempty"`
 	WaterfillPhase2Admissions uint64 `json:"waterfill_phase2_admissions,omitempty"`
 	WaterfillEligibleVisits   uint64 `json:"waterfill_eligible_visits,omitempty"`
+	// #1829 Phase 1: dequeue-time sojourn telemetry. JSON tags MUST
+	// match the Rust serde rename(...) in protocol/cos.rs exactly.
+	// All three are MAX-merged across worker instances and across
+	// workers (worst instance — see the AGGREGATION contract on the
+	// Rust CoSQueueStatus). SojournWindowedMinNS is the #1829 gate
+	// metric: the minimum sojourn over the last 1-2 100 ms windows
+	// (CoDel's standing-queue estimator); it reads 0 when the queue
+	// has not popped for >= 2 windows at snapshot time. SojournPeakNS
+	// is the lifetime maximum; SojournEwmaNS is a shift-add EWMA
+	// (alpha = 1/8) over pops — both supporting context only (biased
+	// high by scheduler service gaps).
+	SojournEwmaNS        uint64 `json:"sojourn_ewma_ns,omitempty"`
+	SojournPeakNS        uint64 `json:"sojourn_peak_ns,omitempty"`
+	SojournWindowedMinNS uint64 `json:"sojourn_windowed_min_ns,omitempty"`
 	// #1642: post_drain_backup_cos_drops / _cos_drop_bytes were on this
 	// struct, but the Rust helper serializes them on BindingStatus
 	// (protocol/binding.rs), a different JSON nesting level. The Rust

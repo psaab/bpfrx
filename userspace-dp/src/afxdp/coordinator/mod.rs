@@ -1225,6 +1225,17 @@ pub(super) fn aggregate_cos_statuses_across_workers(
                 q.waterfill_eligible_visits = q
                     .waterfill_eligible_visits
                     .saturating_add(queue.waterfill_eligible_visits);
+                // #1829 Phase 1: sojourn telemetry MAX-merges across
+                // workers (worst instance), matching the worker-side
+                // MAX in queue_row.rs — see the AGGREGATION contract
+                // on `protocol::CoSQueueStatus`. Summing delays is
+                // meaningless; the gate metric is "does ANY instance
+                // sustain a standing queue".
+                q.sojourn_ewma_ns = q.sojourn_ewma_ns.max(queue.sojourn_ewma_ns);
+                q.sojourn_peak_ns = q.sojourn_peak_ns.max(queue.sojourn_peak_ns);
+                q.sojourn_windowed_min_ns = q
+                    .sojourn_windowed_min_ns
+                    .max(queue.sojourn_windowed_min_ns);
                 // #709: cross-worker aggregation for owner-profile
                 // counters is sum, not max. Histograms and invocation
                 // counters must stay coherent after aggregation;

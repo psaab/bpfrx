@@ -51,6 +51,7 @@ pub(super) fn accumulate_queue_row(
     status: &mut crate::protocol::CoSQueueStatus,
     queue: &CoSQueueRuntime,
     queue_config: Option<&CoSQueueConfig>,
+    now_ns: u64,
 ) {
     if let Some(config) = queue_config {
         if status.forwarding_class.is_empty() {
@@ -255,4 +256,18 @@ pub(super) fn accumulate_queue_row(
     status.waterfill_eligible_visits = status
         .waterfill_eligible_visits
         .saturating_add(queue.telemetry.waterfill_counters.eligible_visits);
+    // #1829 Phase 1: sojourn telemetry, MAX-merged across worker
+    // instances (NOT summed — each instance measures its own queue
+    // runtime's delay; the row reports the worst instance, matching
+    // the gate semantics documented on `protocol::CoSQueueStatus`).
+    // The windowed-min export is evaluated against the snapshot
+    // pass's `now_ns` so a queue that stopped popping >= 2 windows
+    // ago reads 0 here rather than freezing its last busy reading.
+    // Same single-writer/same-thread read contract as the waterfill
+    // counters above.
+    status.sojourn_ewma_ns = status.sojourn_ewma_ns.max(queue.telemetry.sojourn.ewma_ns);
+    status.sojourn_peak_ns = status.sojourn_peak_ns.max(queue.telemetry.sojourn.peak_ns);
+    status.sojourn_windowed_min_ns = status
+        .sojourn_windowed_min_ns
+        .max(queue.telemetry.sojourn.windowed_min_export(now_ns));
 }

@@ -1822,3 +1822,53 @@ fn aggregate_cos_waterfill_min_max_sentinel_when_no_candidate() {
     );
     assert_eq!(aggregated[0].waterfill_epochs, 777);
 }
+
+// #1829 Phase 1: cross-worker sojourn aggregation pin. The sojourn
+// trio MAX-merges across workers (worst instance) — summing delays
+// would be meaningless and a `..Default::default()` fall-through
+// would silently zero the gate metric at exactly this layer (the
+// same failure shape as the #710 drop-counter regression above).
+#[test]
+fn aggregate_cos_statuses_max_merges_sojourn_across_worker_snapshots() {
+    use crate::protocol::{CoSInterfaceStatus, CoSQueueStatus};
+
+    let worker_a = vec![CoSInterfaceStatus {
+        ifindex: 80,
+        interface_name: "reth0.80".into(),
+        worker_instances: 1,
+        queues: vec![CoSQueueStatus {
+            queue_id: 4,
+            worker_instances: 1,
+            sojourn_ewma_ns: 2_000_000,
+            sojourn_peak_ns: 9_000_000,
+            sojourn_windowed_min_ns: 1_500_000,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }];
+    let worker_b = vec![CoSInterfaceStatus {
+        ifindex: 80,
+        interface_name: "reth0.80".into(),
+        worker_instances: 1,
+        queues: vec![CoSQueueStatus {
+            queue_id: 4,
+            worker_instances: 1,
+            sojourn_ewma_ns: 4_000_000,
+            sojourn_peak_ns: 6_000_000,
+            sojourn_windowed_min_ns: 5_500_000,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }];
+    let owner_by_queue = BTreeMap::new();
+    let aggregated = aggregate_cos_statuses_across_workers(&[worker_a, worker_b], &owner_by_queue);
+
+    assert_eq!(aggregated.len(), 1);
+    let q = &aggregated[0].queues[0];
+    assert_eq!(q.sojourn_ewma_ns, 4_000_000, "EWMA must MAX-merge");
+    assert_eq!(q.sojourn_peak_ns, 9_000_000, "peak must MAX-merge");
+    assert_eq!(
+        q.sojourn_windowed_min_ns, 5_500_000,
+        "windowed min (the gate metric) must MAX-merge across workers",
+    );
+}

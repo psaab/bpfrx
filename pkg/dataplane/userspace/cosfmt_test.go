@@ -1022,3 +1022,70 @@ func TestFormatCoSInterfaceSummaryRendersZeroAdmissionCounters(t *testing.T) {
 		t.Fatalf("missing %q in output (zero-valued drops must still render):\n%s", want, out)
 	}
 }
+
+// #1829 Phase 1: the per-queue Sojourn line renders under the Drops
+// row once the queue has recorded a sample (peak > 0), and stays
+// absent on queues that never popped — idle queues must not gain a
+// noise line. win_min is the standing-queue gate metric.
+func TestFormatCoSInterfaceSummaryRendersSojournLine(t *testing.T) {
+	owner := uint32(1)
+	status := &ProcessStatus{
+		CoSInterfaces: []CoSInterfaceStatus{
+			{
+				InterfaceName:   "reth0.80",
+				OwnerWorkerID:   &owner,
+				WorkerInstances: 1,
+				Queues: []CoSQueueStatus{
+					{
+						QueueID:              4,
+						OwnerWorkerID:        &owner,
+						ForwardingClass:      "bandwidth-10mb",
+						Priority:             5,
+						Exact:                true,
+						TransmitRateBytes:    1_250_000,
+						BufferBytes:          32 * 1024,
+						SojournEwmaNS:        2_500_000,
+						SojournPeakNS:        9_000_000,
+						SojournWindowedMinNS: 1_750_000,
+					},
+				},
+			},
+		},
+	}
+	out := FormatCoSInterfaceSummary(testCoSConfig(), status, "reth0.80")
+	want := "Sojourn: win_min=1.8ms  ewma=2.5ms  peak=9.0ms"
+	if !strings.Contains(out, want) {
+		t.Fatalf("missing %q in output:\n%s", want, out)
+	}
+
+	// A queue that never recorded a sample (peak == 0) must not
+	// render the line at all.
+	status.CoSInterfaces[0].Queues[0].SojournEwmaNS = 0
+	status.CoSInterfaces[0].Queues[0].SojournPeakNS = 0
+	status.CoSInterfaces[0].Queues[0].SojournWindowedMinNS = 0
+	out = FormatCoSInterfaceSummary(testCoSConfig(), status, "reth0.80")
+	if strings.Contains(out, "Sojourn:") {
+		t.Fatalf("idle queue must not render a Sojourn line:\n%s", out)
+	}
+}
+
+// #1829: formatSojournNS unit pin — ns/µs/ms scaling boundaries.
+func TestFormatSojournNS(t *testing.T) {
+	cases := []struct {
+		ns   uint64
+		want string
+	}{
+		{0, "0"},
+		{999, "999ns"},
+		{1_000, "1.0us"},
+		{850_000, "850.0us"},
+		{1_000_000, "1.0ms"},
+		{9_000_000, "9.0ms"},
+		{123_456_789, "123.5ms"},
+	}
+	for _, c := range cases {
+		if got := formatSojournNS(c.ns); got != c.want {
+			t.Fatalf("formatSojournNS(%d) = %q, want %q", c.ns, got, c.want)
+		}
+	}
+}
