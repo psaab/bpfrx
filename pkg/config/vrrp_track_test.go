@@ -480,3 +480,31 @@ func TestVRRPTrackInterface_CostRangeValidation(t *testing.T) {
 		}
 	}
 }
+
+// TestVRRPTrackInterface_DuplicateCostChildValidated pins the Codex
+// confirm-round finding on PR #1821: a duplicate priority-cost child
+// where only the SECOND is invalid must still strict-reject (FindChild
+// validated only the first occurrence).
+func TestVRRPTrackInterface_DuplicateCostChildValidated(t *testing.T) {
+	tree := parseHier(t, `interfaces {
+    reth1 {
+        unit 0 {
+            family inet {
+                address 10.0.61.1/24 {
+                    vrrp-group 1 {
+                        virtual-address 10.0.61.3;
+                        priority 200;
+                        track-interface ge-0/0/2 {
+                            priority-cost 20;
+                            priority-cost -50;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}`)
+	if _, err := CompileConfig(tree); err == nil {
+		t.Fatal("strict compile should reject the invalid duplicate priority-cost child")
+	}
+}

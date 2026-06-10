@@ -865,16 +865,23 @@ func checkVRRPGroupTrackShape(vg *Node, nodePath string, lenient bool) ([]string
 		}
 		return nil
 	}
+	// Validate EVERY occurrence, not just the first (Codex confirm
+	// round on PR #1821): a duplicate invalid child after a valid one
+	// must not bypass the strict reject.
 	for _, tr := range tracks {
-		if pc := tr.FindChild("priority-cost"); pc != nil && len(pc.Keys) > 1 {
-			if err := costCheck(pc.Keys[1], "priority-cost"); err != nil {
-				return nil, err
+		for _, pc := range tr.FindChildren("priority-cost") {
+			if len(pc.Keys) > 1 {
+				if err := costCheck(pc.Keys[1], "priority-cost"); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
-	if tpc := vg.FindChild("track-priority-cost"); tpc != nil && len(tpc.Keys) > 1 {
-		if err := costCheck(tpc.Keys[1], "track-priority-cost"); err != nil {
-			return nil, err
+	for _, tpc := range vg.FindChildren("track-priority-cost") {
+		if len(tpc.Keys) > 1 {
+			if err := costCheck(tpc.Keys[1], "track-priority-cost"); err != nil {
+				return nil, err
+			}
 		}
 	}
 	for i, k := range vg.Keys {
