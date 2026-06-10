@@ -575,12 +575,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.startClusterComms(ctx)
 	}
 
-	// Start DHCP clients for interfaces configured with dhcp/dhcpv6.
-	// This must happen after BPF load + config compile so HOST_INBOUND_DHCP
-	// flags are active before DHCP packets start flowing.
+	// Reconcile DHCP clients for interfaces configured with dhcp/dhcpv6.
+	// The startup applyConfig above already reconciled them (#1793), so
+	// this is normally a no-op; it is kept as a safety net to preserve
+	// the documented ordering guarantee: clients run only after BPF load
+	// + config compile, so HOST_INBOUND_DHCP flags are active before
+	// DHCP packets start flowing.
 	if !d.opts.NoDataplane {
 		if cfg := d.store.ActiveConfig(); cfg != nil {
-			d.startDHCPClients(ctx, cfg)
+			d.reconcileDHCPClients(cfg)
 		}
 	}
 
