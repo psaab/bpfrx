@@ -4786,3 +4786,7 @@ top.
 - **Timestamp**: 2026-06-10
   **Action**: "#1819 commit 2 — api sibling alignment: pingHandler 30s → pingExecTimeout(count) (same formula copy in pkg/api/exec_timeout.go, cross-referenced), tracerouteHandler 60s → shared diagTracerouteTimeout constant; mirror table tests, README sentence"
   **File(s)**: pkg/api/exec_timeout.go, pkg/api/exec_timeout_test.go, pkg/api/system.go, pkg/api/README.md
+
+- **Timestamp**: 2026-06-10
+  **Action**: "#1831 commit 1 — export the per-binding V_min throttle counters (#941/#943, already on the BindingStatus wire since protocol.go:1197-1198; verified Rust serializes them in protocol/binding.rs — no Rust change) to Prometheus following the #1771-§2.6/#1807 pattern: two NewDesc with {binding_slot,queue_id,worker_id,iface} labels + Describe + emitBindingVMinThrottleCounters per-binding loop (emits 0s, counters CounterValue); descriptor-coverage canary fixture+want-list extended; emit-level label/value/type pin test incl. zero-binding; fairness-regimes.md metric catalog entries"
+  **File(s)**: pkg/api/metrics.go, pkg/api/metrics_descriptors.go, pkg/api/metrics_userspace.go, pkg/api/metrics_descriptor_coverage_test.go, pkg/api/metrics_test.go, docs/fairness-regimes.md
