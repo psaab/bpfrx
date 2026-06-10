@@ -69,7 +69,10 @@ under the daemon's errgroup. Nothing else imports this package.
   Output/CombinedOutput variants live in the pkg/grpcapi sibling copy).
   Power actions take `context.Background()` — client disconnect must
   not cancel a confirmed reboot — and keep ignoring errors. The
-  ping/traceroute handlers keep their own 30s/60s request-ctx bounds
-  but set `WaitDelay` so an inherited pipe cannot block past the kill.
+  ping/traceroute handlers keep their own request-ctx bounds but set
+  `WaitDelay` so an inherited pipe cannot block past the kill; their
+  budgets are request-sized (#1819) via `pingExecTimeout` (count × 1s +
+  15s slack, 30s floor) and `diagTracerouteTimeout` (60s), capped at the
+  150s `diagExecCeiling` and mirrored in `pkg/grpcapi/exec_timeout.go`.
   Do not add raw `exec.Command` calls in handlers: a wedged binary pins
   the handler goroutine and its HTTP connection.

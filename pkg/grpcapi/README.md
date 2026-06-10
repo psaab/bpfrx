@@ -73,3 +73,9 @@ contract.
   must not cancel a confirmed reboot); everything else derives from the
   request ctx. Request-controlled `tail -n N` is additionally clamped
   via `clampTailLines` — a time bound alone does not cap response bytes.
+  The streaming Ping/Traceroute diags size their budget from the request
+  instead of the 15s constant (#1819): `pingExecTimeout` (count × 1s +
+  15s slack, 30s floor) and `diagTracerouteTimeout` (60s, aligned with
+  the HTTP path), both capped at the 150s `diagExecCeiling`; the same
+  formulas live in `pkg/api/exec_timeout.go` for the REST siblings, and
+  `streamDiagCmd` kills the child promptly when a stream send fails.

@@ -35,6 +35,7 @@ func (c *xpfCollector) collectUserspaceStatus(ch chan<- prometheus.Metric, dp ap
 	c.emitUserspaceEventStream(ch, status)
 	c.emitBindingActiveFlowCount(ch, status)
 	c.emitBindingTXCompletionTelemetry(ch, status)
+	c.emitBindingVMinThrottleCounters(ch, status)
 	c.emitCoSActiveFlowCount(ch, status)
 	c.emitThreeColorPolicerCounters(ch, status)
 	c.emitUserspaceSourceNATPoolMetrics(ch, status)
@@ -137,6 +138,40 @@ func (c *xpfCollector) emitNeighborWarmCounters(ch chan<- prometheus.Metric, sta
 		c.neighborResolverEpochRejectsTotal,
 		prometheus.CounterValue,
 		float64(status.NeighborResolverEpochRejectsTotal),
+	)
+	// #1771 §2.6: backoff-retry GETs, the §2.5 ENOBUFS/re-dump
+	// self-heal counters, and the pending/negative key gauges. All
+	// emitted unconditionally so a 0 is a real signal (no ENOBUFS, no
+	// parked packets) rather than an absent series.
+	ch <- prometheus.MustNewConstMetric(
+		c.neighborResolverGetBackoffAttemptsTotal,
+		prometheus.CounterValue,
+		float64(status.NeighborResolverGetBackoffAttemptsTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.neighborNetlinkEnobufsTotal,
+		prometheus.CounterValue,
+		float64(status.NeighborNetlinkEnobufsTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.neighborNetlinkRedumpsTotal,
+		prometheus.CounterValue,
+		float64(status.NeighborNetlinkRedumpsTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.neighborNetlinkRedumpUpsertsTotal,
+		prometheus.CounterValue,
+		float64(status.NeighborNetlinkRedumpUpsertsTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.neighborPendingKeys,
+		prometheus.GaugeValue,
+		float64(status.NeighborPendingKeys),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.negNeighKeys,
+		prometheus.GaugeValue,
+		float64(status.NegNeighKeys),
 	)
 	// #1772: neighbor/ARP resolution LATENCY telemetry.
 	c.emitNeighborLatencyHistograms(ch, status)
@@ -403,6 +438,32 @@ func (c *xpfCollector) emitBindingTXCompletionTelemetry(ch chan<- prometheus.Met
 			c.bindingTXCompletionRingAvailableMax,
 			prometheus.GaugeValue,
 			float64(b.TXCompletionRingAvailableMax),
+			slot, queueID, workerID, b.Interface,
+		)
+	}
+}
+
+// #1831 (follow-up to #1766): emit the per-binding V_min
+// fairness-throttle counters (#941 work item D / #943). Both have been
+// on the BindingStatus wire since #941/#943 (flushed from per-queue
+// scratch fields at the helper's ~65ms debug tick) but were never
+// exported. Emitted unconditionally per binding so a 0 is a real
+// "brake never fired" signal rather than an absent series.
+func (c *xpfCollector) emitBindingVMinThrottleCounters(ch chan<- prometheus.Metric, status dpuserspace.ProcessStatus) {
+	for _, b := range status.Bindings {
+		slot := strconv.FormatUint(uint64(b.Slot), 10)
+		queueID := strconv.FormatUint(uint64(b.QueueID), 10)
+		workerID := strconv.FormatUint(uint64(b.WorkerID), 10)
+		ch <- prometheus.MustNewConstMetric(
+			c.bindingVMinThrottles,
+			prometheus.CounterValue,
+			float64(b.VMinThrottles),
+			slot, queueID, workerID, b.Interface,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			c.bindingVMinThrottleHardCapOverrides,
+			prometheus.CounterValue,
+			float64(b.VMinThrottleHardCapOverrides),
 			slot, queueID, workerID, b.Interface,
 		)
 	}

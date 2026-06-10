@@ -620,6 +620,19 @@ than re-running. The accompanying fixture at
 `test/incus/cos-iperf-config.set` covers both `family inet` and
 `family inet6` classifier state.
 
+Opt-in injectors layered onto the selected fixture: the
+`--surplus-sharing` flag (#915) and `COS_EQUAL_FLOW=1` (#1831,
+follow-up to #1766/#1745) each append one presence-only scheduler
+flag line — `surplus-sharing` or `equal-flow-enforcement` (#1304)
+respectively — per transmit-rate-exact scheduler. They are mutually
+exclusive (the compiler rejects a scheduler carrying both). Default
+invocations apply the fixture unchanged; equal-flow enforcement stays
+default-OFF unless `COS_EQUAL_FLOW=1` is exported:
+
+```bash
+COS_EQUAL_FLOW=1 ./test/incus/apply-cos-config.sh loss:xpf-userspace-fw0
+```
+
 See also the "CoS deploy preserves config" bullet in
 [`engineering-style.md`](engineering-style.md#project-specific-reminders).
 

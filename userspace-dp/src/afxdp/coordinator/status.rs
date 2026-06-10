@@ -59,6 +59,33 @@ impl super::Coordinator {
             .sum()
     }
 
+    /// #1771 §2.6: distinct unresolved `(egress_ifindex, next_hop)` keys
+    /// currently buffered across every binding's `pending_neigh` map
+    /// (gauge). Each per-binding value is a `len()` snapshot published
+    /// by the owning worker at its ~65ms debug-state tick; the sum is
+    /// the cluster-wide count of next-hops with a packet parked waiting
+    /// for neighbor resolution. Surfaced as
+    /// `xpf_userspace_neighbor_pending_keys`.
+    pub fn neighbor_pending_keys_total(&self) -> u64 {
+        self.workers
+            .live
+            .values()
+            .map(|live| live.pending_neigh_keys.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// #1771 §2.6: keys currently held across every binding's negative
+    /// neighbor cache (gauge; lazy-TTL upper bound — see the
+    /// `BindingLiveState::neg_neigh_keys` doc). Surfaced as
+    /// `xpf_userspace_neg_neigh_keys`.
+    pub fn neg_neigh_keys_total(&self) -> u64 {
+        self.workers
+            .live
+            .values()
+            .map(|live| live.neg_neigh_keys.load(Ordering::Relaxed))
+            .sum()
+    }
+
     /// #1789: total failed USERSPACE_SESSIONS BPF-map publishes. Sum of
     /// the per-binding `session_publish_errors` atomics (worker poll
     /// sites, mirroring `neg_neigh_fast_fail_total`) plus the shared
@@ -147,6 +174,12 @@ impl super::Coordinator {
             probe_on_stale: c.probe_on_stale.load(Ordering::Relaxed),
             get_failures: c.get_failures.load(Ordering::Relaxed),
             epoch_rejects: c.epoch_rejects.load(Ordering::Relaxed),
+            // #1771 §2.6: backoff-retry GETs + the monitor thread's
+            // ENOBUFS / upsert-only re-dump telemetry (§2.5 mechanism).
+            get_backoff_attempts: c.get_backoff_attempts.load(Ordering::Relaxed),
+            netlink_enobufs: c.netlink_enobufs.load(Ordering::Relaxed),
+            netlink_redumps: c.netlink_redumps.load(Ordering::Relaxed),
+            netlink_redump_upserts: c.netlink_redump_upserts.load(Ordering::Relaxed),
         }
     }
 

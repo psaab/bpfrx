@@ -294,13 +294,38 @@ pub(super) fn remove_dynamic_neighbor(
     dynamic_neighbors.remove_if_present(&(ifindex, ip))
 }
 
+/// Map mutation performed by [`parse_neighbor_msg`] for one netlink
+/// neighbor message. Split from the former plain `bool` (#1771 §2.6) so
+/// the monitor loop can count re-dump UPSERTS (`Upserted`) for
+/// `netlink_redump_upserts` without conflating them with the
+/// FAILED/INCOMPLETE/DELNEIGH removal path (which also "changes" the map
+/// but re-adds nothing).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum NeighborMsgEffect {
+    /// No map mutation (unparseable body, no IP/MAC, or a redundant
+    /// update/removal that left the map unchanged).
+    None,
+    /// A usable RTM_NEWNEIGH inserted or updated the entry.
+    Upserted,
+    /// An RTM_DELNEIGH, or an RTM_NEWNEIGH in FAILED/INCOMPLETE,
+    /// removed a present entry.
+    Removed,
+}
+
 pub(super) fn parse_neighbor_msg(
     nlmsg_type: u16,
     body: &[u8],
     dynamic_neighbors: &Arc<ShardedNeighborMap>,
-) -> bool {
+) -> NeighborMsgEffect {
+    fn removal(removed: bool) -> NeighborMsgEffect {
+        if removed {
+            NeighborMsgEffect::Removed
+        } else {
+            NeighborMsgEffect::None
+        }
+    }
     if body.len() < 12 {
-        return false;
+        return NeighborMsgEffect::None;
     }
     let family = body[0];
     let ifindex = i32::from_ne_bytes([body[4], body[5], body[6], body[7]]);
@@ -339,7 +364,7 @@ pub(super) fn parse_neighbor_msg(
         attr_off += (attr_len + 3) & !3;
     }
     let Some(ip) = ip else {
-        return false;
+        return NeighborMsgEffect::None;
     };
     match nlmsg_type {
         28 => {
@@ -349,15 +374,19 @@ pub(super) fn parse_neighbor_msg(
             const NUD_INCOMPLETE: u16 = 0x01;
             const NUD_FAILED: u16 = 0x20;
             if (state & (NUD_INCOMPLETE | NUD_FAILED)) != 0 {
-                return remove_dynamic_neighbor(dynamic_neighbors, ifindex, ip);
+                return removal(remove_dynamic_neighbor(dynamic_neighbors, ifindex, ip));
             }
             let Some(mac) = mac else {
-                return false;
+                return NeighborMsgEffect::None;
             };
-            update_dynamic_neighbor(dynamic_neighbors, ifindex, ip, NeighborEntry { mac })
+            if update_dynamic_neighbor(dynamic_neighbors, ifindex, ip, NeighborEntry { mac }) {
+                NeighborMsgEffect::Upserted
+            } else {
+                NeighborMsgEffect::None
+            }
         }
-        29 => remove_dynamic_neighbor(dynamic_neighbors, ifindex, ip),
-        _ => false,
+        29 => removal(remove_dynamic_neighbor(dynamic_neighbors, ifindex, ip)),
+        _ => NeighborMsgEffect::None,
     }
 }
 
@@ -391,12 +420,15 @@ pub(super) fn request_neighbor_dump(fd: c_int, family: u8, seq: u32) -> io::Resu
     Ok(())
 }
 
+/// Netlink control message types shared by the initial dump and the
+/// steady-state monitor loop (re-dump completion detection, #1771 §2.6).
+const NLMSG_DONE: u16 = 3;
+const NLMSG_ERROR: u16 = 2;
+
 pub(super) fn initial_neighbor_dump(
     fd: c_int,
     dynamic_neighbors: &Arc<ShardedNeighborMap>,
 ) -> io::Result<u64> {
-    const NLMSG_DONE: u16 = 3;
-    const NLMSG_ERROR: u16 = 2;
     let mut next_seq = 1u32;
     let mut changed = false;
     let mut buf = vec![0u8; 8192];
@@ -447,7 +479,7 @@ pub(super) fn initial_neighbor_dump(
                             nlmsg_type,
                             &buf[offset + 16..offset + nlmsg_len],
                             dynamic_neighbors,
-                        );
+                        ) != NeighborMsgEffect::None;
                     }
                     _ => {}
                 }
@@ -563,6 +595,11 @@ pub(super) fn neigh_monitor_thread(
     stop: Arc<AtomicBool>,
     dynamic_neighbors: Arc<ShardedNeighborMap>,
     neighbor_generation: Arc<AtomicU64>,
+    // #1771 §2.6: ENOBUFS/re-dump telemetry. Counted here on the monitor
+    // thread but carried on the shared resolver-counter block so it
+    // rides the existing status wire path (netlink_enobufs,
+    // netlink_redumps, netlink_redump_upserts).
+    counters: Arc<super::neighbor_resolver::ResolverCounters>,
 ) {
     // Create NETLINK_ROUTE socket and subscribe to neighbor events
     let fd = unsafe {
@@ -628,6 +665,12 @@ pub(super) fn neigh_monitor_thread(
     // #1771 §2.5: throttle state for the ENOBUFS-triggered upsert re-dump.
     let mut last_redump_ns: u64 = 0;
     let mut redump_seq: u32 = 1000;
+    // #1771 §2.6: nlmsg_seq values of the in-flight v4/v6 re-dump
+    // requests (0 = none). Dump replies are unicast on this same fd and
+    // carry the request seq, while multicast RTM_{NEW,DEL}NEIGH events
+    // carry seq 0 — so a seq match identifies a re-dump reply and lets
+    // the parse loop below count `netlink_redump_upserts` precisely.
+    let mut redump_pending: [u32; 2] = [0, 0];
     while !stop.load(Ordering::Relaxed) {
         let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
         if n < 0 {
@@ -636,6 +679,10 @@ pub(super) fn neigh_monitor_thread(
             // desync this fixes) from the benign SO_RCVTIMEO timeout.
             match io::Error::last_os_error().raw_os_error() {
                 Some(libc::ENOBUFS) => {
+                    // #1771 §2.6: every ENOBUFS recv is a kernel-reported
+                    // notification loss — count it even when the re-dump
+                    // below is throttled away.
+                    counters.netlink_enobufs.fetch_add(1, Ordering::Relaxed);
                     // Lost RTM_{NEW,DEL}NEIGH leave dynamic_neighbors
                     // desynced (a dropped good NEWNEIGH blackholes a dst
                     // until its next per-key event). Recover with a THROTTLED
@@ -655,9 +702,23 @@ pub(super) fn neigh_monitor_thread(
                     if now.saturating_sub(last_redump_ns) > 5_000_000_000 {
                         last_redump_ns = now;
                         redump_seq = redump_seq.wrapping_add(1);
-                        let v4 = request_neighbor_dump(fd, libc::AF_INET as u8, redump_seq);
+                        let seq_v4 = redump_seq;
+                        let v4 = request_neighbor_dump(fd, libc::AF_INET as u8, seq_v4);
                         redump_seq = redump_seq.wrapping_add(1);
-                        let v6 = request_neighbor_dump(fd, libc::AF_INET6 as u8, redump_seq);
+                        let seq_v6 = redump_seq;
+                        let v6 = request_neighbor_dump(fd, libc::AF_INET6 as u8, seq_v6);
+                        // #1771 §2.6: a re-dump counts as ISSUED when at
+                        // least one family request was sent; the pending
+                        // seqs let the parse loop attribute the unicast
+                        // dump replies to this re-dump for the upsert
+                        // counter. A failed family keeps seq 0 (no match).
+                        redump_pending = [
+                            if v4.is_ok() { seq_v4 } else { 0 },
+                            if v6.is_ok() { seq_v6 } else { 0 },
+                        ];
+                        if v4.is_ok() || v6.is_ok() {
+                            counters.netlink_redumps.fetch_add(1, Ordering::Relaxed);
+                        }
                         match (&v4, &v6) {
                             (Ok(_), Ok(_)) => eprintln!(
                                 "neigh_monitor: ENOBUFS — throttled re-dump (v4+v6) issued"
@@ -705,12 +766,40 @@ pub(super) fn neigh_monitor_thread(
             if nlmsg_len < 16 || offset + nlmsg_len > n as usize {
                 break;
             }
+            // #1771 §2.6: nlmsg_seq (header bytes 8..12) attributes a
+            // message to an in-flight re-dump (multicast events carry 0).
+            let nlmsg_seq = u32::from_ne_bytes([
+                buf[offset + 8],
+                buf[offset + 9],
+                buf[offset + 10],
+                buf[offset + 11],
+            ]);
+            let from_redump =
+                nlmsg_seq != 0 && (nlmsg_seq == redump_pending[0] || nlmsg_seq == redump_pending[1]);
             if nlmsg_type == 28 || nlmsg_type == 29 {
-                parse_neighbor_msg(
+                let effect = parse_neighbor_msg(
                     nlmsg_type,
                     &buf[offset + 16..offset + nlmsg_len],
                     &dynamic_neighbors,
                 );
+                // Count only genuine re-adds from a re-dump reply: an
+                // RTM_NEWNEIGH whose insert CHANGED the map. Removals
+                // (FAILED/INCOMPLETE) and no-op updates do not prove a
+                // lost-NEWNEIGH was healed.
+                if from_redump && effect == NeighborMsgEffect::Upserted {
+                    counters
+                        .netlink_redump_upserts
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            } else if nlmsg_type == NLMSG_DONE && from_redump {
+                // Re-dump for this family completed — retire its seq so a
+                // stale slot can never match a future message.
+                if nlmsg_seq == redump_pending[0] {
+                    redump_pending[0] = 0;
+                }
+                if nlmsg_seq == redump_pending[1] {
+                    redump_pending[1] = 0;
+                }
             }
             offset += (nlmsg_len + 3) & !3; // align to 4
         }

@@ -9,10 +9,7 @@ use std::net::IpAddr;
 
 use super::syncookie::SynCookieChallenge;
 
-pub(super) const PROTO_TCP: u8 = 6;
-pub(super) const PROTO_UDP: u8 = 17;
-pub(super) const PROTO_ICMP: u8 = 1;
-pub(super) const PROTO_ICMPV6: u8 = 58;
+pub(super) use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
 
 // TCP flag bits (matching BPF layout: FIN=0x01, SYN=0x02, RST=0x04, PSH=0x08, ACK=0x10, URG=0x20)
 pub(super) const TCP_FIN: u8 = 0x01;

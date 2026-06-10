@@ -14,8 +14,8 @@ pub(super) fn uses_kernel_local_session_map_entry(
 pub(super) fn diagnose_raw_ring_state(
     sock_fd: c_int,
 ) -> Option<(u32, u32, u32, u32, u32, u32, u32, u32)> {
-    // SOL_XDP = 283, XDP_MMAP_OFFSETS = 1
-    const SOL_XDP: i32 = 283;
+    // SOL_XDP (283) comes from afxdp/mod.rs via `use super::*` —
+    // #1826 deduplicated the former local copy.
     const XDP_MMAP_OFFSETS: i32 = 1;
     const XDP_PGOFF_RX_RING: i64 = 0;
     const XDP_PGOFF_TX_RING: i64 = 0x80000000;
@@ -884,7 +884,14 @@ pub(super) static ICMPV6_EMBED_LOGGED: AtomicU32 = AtomicU32::new(0);
 // The pinned map path keeps the historical "fallback" spelling for
 // mixed-version shim compatibility. Operator-facing names use
 // degraded-path terminology.
+//
+// #1776: the only production reader (the per-second degraded-path
+// dump in worker/loop_body/debug_report.rs) is debug-log-gated, so
+// these items are cfg-gated to match (REASON_NAMES is also asserted
+// by unit tests, hence `any(test, ...)`).
+#[cfg(feature = "debug-log")]
 pub(super) const DEGRADED_PATH_STATS_PIN_PATH: &str = "/sys/fs/bpf/xpf/userspace_fallback_stats";
+#[cfg(any(test, feature = "debug-log"))]
 pub(super) const DEGRADED_PATH_REASON_NAMES: &[&str] = &[
     "ctrl_disabled",            // 0
     "parse_fail",               // 1
@@ -904,6 +911,7 @@ pub(super) const DEGRADED_PATH_REASON_NAMES: &[&str] = &[
     "transit_drop",             // 15
 ];
 
+#[cfg(feature = "debug-log")]
 pub(super) fn read_degraded_path_stats() -> Option<Vec<(String, u64)>> {
     let fd = OwnedFd::open_bpf_map(DEGRADED_PATH_STATS_PIN_PATH).ok()?;
     let mut result = Vec::new();

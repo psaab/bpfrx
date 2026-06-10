@@ -128,7 +128,9 @@ func (s *Server) pingHandler(w http.ResponseWriter, r *http.Request) {
 	cmd = append(cmd, "ping")
 	cmd = append(cmd, args...)
 
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	// Request-sized budget (#1819): count × 1s + slack, 30s floor,
+	// 150s ceiling — see pingExecTimeout in exec_timeout.go.
+	ctx, cancel := context.WithTimeout(r.Context(), pingExecTimeout(count))
 	defer cancel()
 	c := exec.CommandContext(ctx, cmd[0], cmd[1:]...)
 	// U3 parity (#1805): cap the post-kill pipe-drain window so a child
@@ -170,7 +172,9 @@ func (s *Server) tracerouteHandler(w http.ResponseWriter, r *http.Request) {
 	cmd = append(cmd, "traceroute")
 	cmd = append(cmd, args...)
 
-	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	// Shared diag budget (#1819): same 60s as the gRPC Traceroute path
+	// — see diagTracerouteTimeout in exec_timeout.go.
+	ctx, cancel := context.WithTimeout(r.Context(), diagTracerouteTimeout)
 	defer cancel()
 	c := exec.CommandContext(ctx, cmd[0], cmd[1:]...)
 	// U3 parity (#1805): cap the post-kill pipe-drain window so a child

@@ -360,11 +360,27 @@ fn try_increment_below(counter: &AtomicU64, limit: u64) -> bool {
     }
 }
 
+/// #1826 (#1663 finding 1.11): release-visible invariant-violation counter
+/// for the queue-budget underflow guard in `decrement_if_positive`. The
+/// `debug_assert!` below is compiled out in release builds, so without
+/// this the violation (saturate-at-0 + continue) is invisible in
+/// production. Local-only diagnostic — intentionally NOT plumbed into the
+/// wire status protocol; read via the first-hit stderr line.
+static DATAPLANE_EVENT_BUDGET_UNDERFLOWS: AtomicU64 = AtomicU64::new(0);
+
 fn decrement_if_positive(counter: &AtomicU64) {
     let mut current = counter.load(Ordering::Relaxed);
     loop {
         if current == 0 {
             debug_assert!(false, "dataplane event queue budget underflow");
+            // Cold path: never taken unless the accounting invariant is
+            // already broken. First hit logs once to journald (stderr).
+            if DATAPLANE_EVENT_BUDGET_UNDERFLOWS.fetch_add(1, Ordering::Relaxed) == 0 {
+                eprintln!(
+                    "xpf-userspace-dp: invariant violation: dataplane event \
+                     queue budget underflow (local counter only)"
+                );
+            }
             return;
         }
         match counter.compare_exchange_weak(
