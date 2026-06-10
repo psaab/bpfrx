@@ -356,6 +356,8 @@
     "equal_flow_target_per_flow_bps": 0,
     "exact": false,
     "flow_fair": false,
+    "flow_fair_buckets_occupied": 0,
+    "flow_fair_flows_active": 0,
     "forwarding_class": "",
     "guarantee_enabled": false,
     "next_wakeup_tick": 0,

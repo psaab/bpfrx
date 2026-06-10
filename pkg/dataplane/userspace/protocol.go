@@ -877,14 +877,26 @@ type CoSQueueStatus struct {
 	// bucketed (see Rust `bucket_index_for_ns`): index 0 is < 1 µs,
 	// index N >= 1 is [2^(N+9), 2^(N+10)) ns, index 15 saturates at
 	// >= 2^24 ns (~16 ms).
-	ActiveFlowBucketsPeak uint64   `json:"active_flow_buckets_peak,omitempty"`
-	FlowFair              bool     `json:"flow_fair,omitempty"`
-	DrainLatencyHist      []uint64 `json:"drain_latency_hist,omitempty"`
-	DrainInvocations      uint64   `json:"drain_invocations,omitempty"`
-	DrainNoopInvocations  uint64   `json:"drain_noop_invocations,omitempty"`
-	RedirectAcquireHist   []uint64 `json:"redirect_acquire_hist,omitempty"`
-	OwnerPPS              uint64   `json:"owner_pps,omitempty"`
-	PeerPPS               uint64   `json:"peer_pps,omitempty"`
+	ActiveFlowBucketsPeak uint64 `json:"active_flow_buckets_peak,omitempty"`
+	FlowFair              bool   `json:"flow_fair,omitempty"`
+	// #1830 (g): bucket-vs-flow occupancy telemetry. JSON tags MUST
+	// match the Rust serde rename(...) in protocol/cos.rs exactly.
+	// FlowFairBucketsOccupied is the instantaneous occupied
+	// (backlogged) SFQ bucket count summed across workers;
+	// FlowFairFlowsActive is the flow-cache active-window (~650 ms)
+	// distinct-flow count mapped to this queue, summed across workers.
+	// The flows/buckets ratio distinguishes hash-collision unfairness
+	// (ratio persistently > 1 while continuously backlogged) from
+	// demand unfairness — see the INTERPRETATION contract on the Rust
+	// CoSQueueStatus.
+	FlowFairBucketsOccupied uint64   `json:"flow_fair_buckets_occupied,omitempty"`
+	FlowFairFlowsActive     uint64   `json:"flow_fair_flows_active,omitempty"`
+	DrainLatencyHist        []uint64 `json:"drain_latency_hist,omitempty"`
+	DrainInvocations        uint64   `json:"drain_invocations,omitempty"`
+	DrainNoopInvocations    uint64   `json:"drain_noop_invocations,omitempty"`
+	RedirectAcquireHist     []uint64 `json:"redirect_acquire_hist,omitempty"`
+	OwnerPPS                uint64   `json:"owner_pps,omitempty"`
+	PeerPPS                 uint64   `json:"peer_pps,omitempty"`
 	// #760 overshoot-hunt instrumentation. DrainSentBytes /
 	// DrainParkRootTokens / DrainParkQueueTokens are queue-scoped.
 	// PostDrainBackupBytes is binding-scoped (same row as

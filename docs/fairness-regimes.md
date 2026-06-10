@@ -795,6 +795,21 @@ For production observability, xpf MUST export:
   gauges: per-worker breakdown of the same hypothetical cap. These are
   intended to answer "which worker would we slow, by how much?" without
   depending on whether an opt-in enforcement mode is configured.
+- **`xpf_userspace_cos_flow_fair_buckets_occupied{ifindex=..., queue_id=...}`**
+  and **`xpf_userspace_cos_flow_fair_flows_active{ifindex=..., queue_id=...}`**
+  gauges (#1830 (g)): bucket-vs-flow occupancy for distinguishing SFQ
+  hash-collision unfairness from demand unfairness. `buckets_occupied`
+  is the instantaneous count of backlogged flow-fair SFQ buckets summed
+  across workers; `flows_active` is the flow-cache active-window
+  (~650 ms) distinct-flow count mapped to the queue, summed across
+  workers (it equals `sum by (ifindex, queue_id)` of
+  `xpf_userspace_cos_active_flow_count`). The ratio is meaningful only
+  while the queue is CONTINUOUSLY backlogged (sustained `iperf3 -P N`):
+  there, `buckets_occupied` persistently below the known concurrent
+  flow fan-in (equivalently `flows_active / buckets_occupied`
+  persistently above 1) indicates hash collisions shrinking per-flow
+  shares. On idle or bursty queues `flows_active` naturally exceeds
+  `buckets_occupied` — demand variance, not collision evidence.
 
 When `class-of-service schedulers <name> equal-flow-enforcement` is
 enabled on a positive exact-rate scheduler without `surplus-sharing`, the

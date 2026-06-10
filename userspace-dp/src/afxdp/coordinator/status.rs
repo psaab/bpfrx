@@ -236,6 +236,20 @@ impl super::Coordinator {
             aggregate_cos_statuses_across_workers(&snapshots, &self.cos_owner_worker_by_queue);
         let queue_leases = self.cos.queue_leases.load();
         overlay_shared_cos_queue_lease_statuses(&mut statuses, queue_leases.as_ref());
+        // #1830 (g): overlay the flow-cache active-flow counts onto the
+        // queue rows so each row carries BOTH halves of the
+        // collision-vs-demand ratio (flow_fair_flows_active alongside
+        // the worker-snapshot-summed flow_fair_buckets_occupied). Same
+        // per-binding source as `cos_active_flow_counts`, re-keyed per
+        // (ifindex, queue_id) by summing across workers.
+        let mut flow_counts = BTreeMap::<(i32, u8), u64>::new();
+        for live in self.workers.live.values() {
+            for row in live.cos_active_flow_counts_snapshot() {
+                let count = flow_counts.entry((row.ifindex, row.queue_id)).or_insert(0);
+                *count = count.saturating_add(u64::from(row.active_flow_count));
+            }
+        }
+        overlay_cos_flow_fair_flow_counts(&mut statuses, &flow_counts);
         statuses
     }
 
@@ -598,6 +612,24 @@ impl super::Coordinator {
     }
 }
 
+/// #1830 (g): write the per-(ifindex, queue) flow-cache active-flow sums
+/// onto the aggregated queue status rows. A queue with no flow-cache
+/// rows keeps the serde default 0 (idle / not flow-classified), so
+/// older consumers and idle queues are indistinguishable from the
+/// pre-#1830 wire — the field is purely additive.
+fn overlay_cos_flow_fair_flow_counts(
+    statuses: &mut [crate::protocol::CoSInterfaceStatus],
+    flow_counts: &BTreeMap<(i32, u8), u64>,
+) {
+    for iface in statuses {
+        for queue in &mut iface.queues {
+            if let Some(count) = flow_counts.get(&(iface.ifindex, queue.queue_id)) {
+                queue.flow_fair_flows_active = *count;
+            }
+        }
+    }
+}
+
 fn overlay_shared_cos_queue_lease_statuses(
     statuses: &mut [crate::protocol::CoSInterfaceStatus],
     queue_leases: &BTreeMap<(i32, u8), Arc<SharedCoSQueueLease>>,
@@ -677,5 +709,44 @@ mod tests {
         assert!(queue.equal_flow_enforcement);
         assert_eq!(queue.equal_flow_fail_open_reason, "disabled");
         assert_eq!(queue.equal_flow_stale_or_tag_mismatch_events, 0);
+    }
+
+    /// #1830 (g): the flow-count overlay writes only matching
+    /// (ifindex, queue) rows and leaves non-matching rows at the serde
+    /// default 0 (idle / no flow-cache rows), never touching
+    /// flow_fair_buckets_occupied (the worker-snapshot half).
+    #[test]
+    fn flow_fair_flow_count_overlay_targets_matching_queue_rows() {
+        let mut statuses = vec![CoSInterfaceStatus {
+            ifindex: 80,
+            queues: vec![
+                CoSQueueStatus {
+                    queue_id: 4,
+                    flow_fair_buckets_occupied: 6,
+                    ..Default::default()
+                },
+                CoSQueueStatus {
+                    queue_id: 5,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }];
+        // Sums across workers were pre-aggregated by the caller.
+        let flow_counts = BTreeMap::from([((80, 4u8), 12u64), ((81, 4u8), 99u64)]);
+
+        overlay_cos_flow_fair_flow_counts(&mut statuses, &flow_counts);
+
+        let q4 = &statuses[0].queues[0];
+        assert_eq!(q4.flow_fair_flows_active, 12);
+        assert_eq!(
+            q4.flow_fair_buckets_occupied, 6,
+            "overlay must not disturb the worker-snapshot bucket half"
+        );
+        let q5 = &statuses[0].queues[1];
+        assert_eq!(
+            q5.flow_fair_flows_active, 0,
+            "queue with no flow-cache rows stays at the serde default"
+        );
     }
 }

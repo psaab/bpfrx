@@ -182,6 +182,9 @@ func populatedCoverageStatus() dpuserspace.ProcessStatus {
 				EqualFlowSuppressedGrantBytes:              64,
 				EqualFlowStaleOrTagMismatchEvents:          0,
 				EqualFlowFailOpenReason:                    "",
+				// #1830 (g): bucket-vs-flow occupancy gauges.
+				FlowFairBucketsOccupied: 6,
+				FlowFairFlowsActive:     8,
 			},
 		},
 	}
@@ -428,6 +431,9 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 		"xpf_userspace_neighbor_netlink_redump_upserts_total",
 		"xpf_userspace_neighbor_pending_keys",
 		"xpf_userspace_neg_neigh_keys",
+		// #1830 (g): bucket-vs-flow occupancy gauges
+		"xpf_userspace_cos_flow_fair_buckets_occupied",
+		"xpf_userspace_cos_flow_fair_flows_active",
 		// #1831: per-binding V_min fairness-throttle counters (#941/#943)
 		"xpf_userspace_binding_v_min_throttles_total",
 		"xpf_userspace_binding_v_min_throttle_hard_cap_overrides_total",

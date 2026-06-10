@@ -966,6 +966,77 @@ func TestEmitCoSDrainPhaseTelemetry_EmitsNonExactExactBacklogCounter(t *testing.
 	}
 }
 
+// #1830 (g): emitCoSFlowFairOccupancy must surface the bucket-vs-flow
+// occupancy pair for EVERY queue row (no flow-fair gating — a 0 is a
+// real idle signal), with GAUGE typing and (ifindex, queue_id) labels.
+func TestEmitCoSFlowFairOccupancy_LabelsValuesAndGaugeType(t *testing.T) {
+	c := &xpfCollector{
+		cosFlowFairBucketsOccupied: prometheus.NewDesc(
+			"xpf_userspace_cos_flow_fair_buckets_occupied",
+			"test desc",
+			[]string{"ifindex", "queue_id"}, nil,
+		),
+		cosFlowFairFlowsActive: prometheus.NewDesc(
+			"xpf_userspace_cos_flow_fair_flows_active",
+			"test desc",
+			[]string{"ifindex", "queue_id"}, nil,
+		),
+	}
+	status := dpuserspace.ProcessStatus{
+		CoSInterfaces: []dpuserspace.CoSInterfaceStatus{{
+			Ifindex: 80,
+			Queues: []dpuserspace.CoSQueueStatus{
+				{
+					QueueID:                 4,
+					FlowFairBucketsOccupied: 9,
+					FlowFairFlowsActive:     12,
+				},
+				// Idle / non-flow-fair queue: both gauges must still
+				// emit, as zeros.
+				{QueueID: 5},
+			},
+		}},
+	}
+
+	ch := make(chan prometheus.Metric)
+	go func() {
+		c.emitCoSFlowFairOccupancy(ch, status)
+		close(ch)
+	}()
+	type series struct {
+		desc    *prometheus.Desc
+		queueID string
+	}
+	values := map[series]float64{}
+	for m := range ch {
+		var pb dto.Metric
+		if err := m.Write(&pb); err != nil {
+			t.Fatalf("metric.Write: %v", err)
+		}
+		labels := map[string]string{}
+		for _, lp := range pb.GetLabel() {
+			labels[lp.GetName()] = lp.GetValue()
+		}
+		if labels["ifindex"] != "80" {
+			t.Fatalf("wrong flow-fair occupancy labels: %v", labels)
+		}
+		if pb.Gauge == nil {
+			t.Fatalf("flow-fair occupancy metric %s must be a gauge: %+v", m.Desc(), &pb)
+		}
+		values[series{m.Desc(), labels["queue_id"]}] = pb.Gauge.GetValue()
+	}
+
+	want := map[series]float64{
+		{c.cosFlowFairBucketsOccupied, "4"}: 9,
+		{c.cosFlowFairFlowsActive, "4"}:     12,
+		{c.cosFlowFairBucketsOccupied, "5"}: 0,
+		{c.cosFlowFairFlowsActive, "5"}:     0,
+	}
+	if !reflect.DeepEqual(values, want) {
+		t.Fatalf("flow-fair occupancy metric values: got %+v, want %+v", values, want)
+	}
+}
+
 // #1628: emitCoSWaterfillTelemetry must surface the per-queue admission/
 // visit counters and the per-interface epochs/breaks/min-epochs metrics
 // with the right labels and metric types.
