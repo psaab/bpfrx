@@ -8,6 +8,9 @@
 // `learn_dynamic_neighbor*` are called from the RX descriptor
 // path when an inbound ARP/NDP advert resolves a previously
 // missing neighbor — they upsert into the dynamic neighbor map.
+// #1787: the upsert is cheap-first — 1-2 single-shard reads elide
+// the write entirely when every key already maps to src_mac, so
+// the 64-shard bulk lock is only taken for genuine changes.
 //
 // `build_missing_neighbor_session_metadata` constructs the
 // SessionMetadata stub used while the neighbor is unresolved
@@ -320,6 +323,17 @@ pub(super) fn learn_dynamic_neighbor_from_packet(
     *last_learned_neighbor = Some(learned);
 }
 
+/// #1787: pure decision helper for the cheap-first RX learn pre-check.
+/// `current` holds the pre-read MAC (or `None` on miss) for each
+/// candidate key; a bulk write is needed iff ANY entry is missing or
+/// differs from `src_mac`. Factored out so the elision decision is
+/// unit-testable directly — an elided write and an idempotent
+/// overwrite leave identical map contents (RX learn bumps no
+/// generation), so map-state comparison alone cannot prove elision.
+pub(super) fn pair_write_needed(current: &[Option<[u8; 6]>], src_mac: [u8; 6]) -> bool {
+    current.iter().any(|mac| *mac != Some(src_mac))
+}
+
 pub(super) fn learn_dynamic_neighbor(
     forwarding: &ForwardingState,
     dynamic_neighbors: &Arc<ShardedNeighborMap>,
@@ -328,21 +342,58 @@ pub(super) fn learn_dynamic_neighbor(
     src_ip: IpAddr,
     src_mac: [u8; 6],
 ) {
-    let mut ifindexes = vec![ingress_ifindex];
+    // #1787: stack array, no per-packet heap alloc. At most 2 keys:
+    // the physical ingress ifindex plus the resolved logical (VLAN
+    // sub-) ifindex when it differs. keys[1] stays an unused
+    // placeholder when n == 1.
+    let mut keys: [(i32, IpAddr); 2] = [(ingress_ifindex, src_ip), (0, src_ip)];
+    let mut n = 1usize;
     if let Some(logical_ifindex) =
         resolve_ingress_logical_ifindex(forwarding, ingress_ifindex, ingress_vlan_id)
     {
         if logical_ifindex > 0 && logical_ifindex != ingress_ifindex {
-            ifindexes.push(logical_ifindex);
+            keys[1] = (logical_ifindex, src_ip);
+            n = 2;
         }
+    }
+    // #1787 cheap-first pre-check: 1-2 single-shard reads replace the
+    // unconditional 64-shard bulk acquisition in the steady state
+    // (every key already maps to src_mac → return with no write, no
+    // bulk lock, no alloc).
+    //
+    // Linearization semantics: a no-op learn linearizes at this
+    // pre-check read. A concurrent remove (netlink FAILED/delete,
+    // resolver authoritative-FAILED revoke, manager replace/bulk
+    // remove) that lands AFTER the read wins — the elided write does
+    // not re-create the entry — and the next packet from this source
+    // that REACHES this function pre-check-misses and re-learns via
+    // the bulk path below.
+    //
+    // Dedup window: the caller sets the per-binding
+    // last_learned_neighbor dedup after this returns (including after
+    // an elided no-op), so identical follow-up packets may not reach
+    // this function until the dedup key changes. That dedup-delayed
+    // re-learn is PRE-EXISTING behavior — a write also set the dedup,
+    // so a remove landing after the write was equally suppressed.
+    // Recovery comes from the same paths as before: a second source
+    // key evicting the 1-entry dedup, the ARP/NDP learn stage
+    // (poll_stages.rs), and the #1769 resolver probe on forwarding
+    // miss.
+    let mut current: [Option<[u8; 6]>; 2] = [None, None];
+    for (slot, key) in current.iter_mut().zip(keys[..n].iter()) {
+        *slot = dynamic_neighbors.get(key).map(|entry| entry.mac);
+    }
+    if !pair_write_needed(&current[..n], src_mac) {
+        return;
     }
     // #949: multi-ifindex insert atomically vs readers — both
     // ingress_ifindex and the resolved logical (VLAN sub-) ifindex
     // get the same MAC under one bulk acquisition so a reader sees
-    // either both or neither, never a stale half.
+    // either both or neither, never a stale half. Genuine changes
+    // (first sighting, MAC flip, removed key) keep this exact path.
     dynamic_neighbors.with_all_shards(|bulk| {
-        for ifindex in ifindexes {
-            bulk.insert((ifindex, src_ip), NeighborEntry { mac: src_mac });
+        for key in &keys[..n] {
+            bulk.insert(*key, NeighborEntry { mac: src_mac });
         }
     });
 }
@@ -901,4 +952,51 @@ mod cold_start_probe_schedule_tests {
     // sweep (incl. the iface-miss no-advance branch) by the
     // `retry_pending_*` dispatch tests in `mirror_tests`. Removed rather than
     // left asserting impossible multi-packet-same-key state (Codex r2).
+}
+
+#[cfg(test)]
+mod learn_precheck_tests {
+    use super::pair_write_needed;
+
+    const MAC: [u8; 6] = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+    const OTHER: [u8; 6] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+
+    #[test]
+    fn single_key_current_needs_no_write() {
+        assert!(!pair_write_needed(&[Some(MAC)], MAC));
+    }
+
+    #[test]
+    fn single_key_miss_needs_write() {
+        assert!(pair_write_needed(&[None], MAC));
+    }
+
+    #[test]
+    fn single_key_stale_needs_write() {
+        assert!(pair_write_needed(&[Some(OTHER)], MAC));
+    }
+
+    #[test]
+    fn pair_matrix_any_miss_or_stale_needs_write() {
+        // Full 3x3 matrix over {current, stale, miss} per slot: a
+        // write is needed unless BOTH slots already carry src_mac.
+        let states: [Option<[u8; 6]>; 3] = [Some(MAC), Some(OTHER), None];
+        for a in states {
+            for b in states {
+                let expected = !(a == Some(MAC) && b == Some(MAC));
+                assert_eq!(
+                    pair_write_needed(&[a, b], MAC),
+                    expected,
+                    "slots {a:?}/{b:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_slice_needs_no_write() {
+        // Degenerate: learn_dynamic_neighbor always passes n >= 1.
+        // Pinned so the `any`-over-slice semantics stay explicit.
+        assert!(!pair_write_needed(&[], MAC));
+    }
 }
