@@ -109,8 +109,15 @@ fn concurrent_recovery_processes_each_command_exactly_once() {
     ));
     poison(&m);
 
-    let drain = |queue: Arc<Mutex<VecDeque<WorkerCommand>>>| {
+    // Start barrier so both threads genuinely contend on the poisoned
+    // mutex (Codex review on PR #1822: without it one thread can drain
+    // everything before the other starts, proving only the final
+    // no-loss/no-dup property, not contention-time behavior).
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let drain = |queue: Arc<Mutex<VecDeque<WorkerCommand>>>,
+                 barrier: Arc<std::sync::Barrier>| {
         std::thread::spawn(move || {
+            barrier.wait();
             let mut seen = Vec::new();
             loop {
                 let mut guard = lock_recover(&queue);
@@ -118,15 +125,23 @@ fn concurrent_recovery_processes_each_command_exactly_once() {
                     Some(command) => seen.push(export_sequence(&command)),
                     None => break,
                 }
+                // Drop the guard each iteration (end of scope) so the
+                // peer thread can interleave.
             }
             seen
         })
     };
-    let a = drain(m.clone());
-    let b = drain(m.clone());
+    let a = drain(m.clone(), barrier.clone());
+    let b = drain(m.clone(), barrier);
     let seen_a = a.join().expect("drain thread a");
     let seen_b = b.join().expect("drain thread b");
 
+    assert!(
+        !seen_a.is_empty() && !seen_b.is_empty(),
+        "both threads must process some commands ({} / {}) — the race must be real",
+        seen_a.len(),
+        seen_b.len()
+    );
     let mut all = seen_a;
     all.extend(seen_b);
     all.sort_unstable();
