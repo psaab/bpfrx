@@ -407,3 +407,76 @@ func TestVRRPTrackInterface_FormatSetRoundTrip(t *testing.T) {
 			vg.TrackInterface, vg.TrackPriorityDelta)
 	}
 }
+
+// TestVRRPTrackInterface_KeysPackedDuplicateStrictReject pins the
+// Codex finding on PR #1821: the compact hierarchical leaf packs
+// duplicate track-interface statements into the vrrp-group node's own
+// Keys, bypassing a child-node-only count. Strict commit must reject;
+// lenient must first-wins.
+func TestVRRPTrackInterface_KeysPackedDuplicateStrictReject(t *testing.T) {
+	const text = `interfaces {
+    reth1 {
+        unit 0 {
+            family inet {
+                address 10.0.61.1/24 {
+                    vrrp-group 1 virtual-address 10.0.61.3 track-interface ge-0/0/2 track-interface ge-0/0/3;
+                }
+            }
+        }
+    }
+}`
+	if _, err := CompileConfig(parseHier(t, text)); err == nil {
+		t.Fatal("strict compile should reject Keys-packed duplicate track-interface")
+	}
+	cfg, err := CompileConfigLenient(parseHier(t, text))
+	if err != nil {
+		t.Fatalf("lenient compile: %v", err)
+	}
+	vg := trackTestVRRPGroup(t, cfg)
+	if vg.TrackInterface != "ge-0/0/2" {
+		t.Fatalf("lenient first-wins: TrackInterface = %q, want ge-0/0/2", vg.TrackInterface)
+	}
+	if !hasWarningContaining(cfg.Warnings, "track-interface statements") {
+		t.Fatalf("missing duplicate warning: %v", cfg.Warnings)
+	}
+}
+
+// TestVRRPTrackInterface_CostRangeValidation pins the second Codex
+// finding on PR #1821: priority-cost outside 1..254 (notably NEGATIVE,
+// which would RAISE priority on link-down) must be rejected on strict
+// commit and neutralized (cost 0 + warning) on lenient load.
+func TestVRRPTrackInterface_CostRangeValidation(t *testing.T) {
+	for _, val := range []string{"-50", "0", "255", "9999"} {
+		text := `interfaces {
+    reth1 {
+        unit 0 {
+            family inet {
+                address 10.0.61.1/24 {
+                    vrrp-group 1 {
+                        virtual-address 10.0.61.3;
+                        priority 200;
+                        track-interface ge-0/0/2 {
+                            priority-cost ` + val + `;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}`
+		if _, err := CompileConfig(parseHier(t, text)); err == nil {
+			t.Fatalf("strict compile should reject priority-cost %s", val)
+		}
+		cfg, err := CompileConfigLenient(parseHier(t, text))
+		if err != nil {
+			t.Fatalf("lenient compile (%s): %v", val, err)
+		}
+		vg := trackTestVRRPGroup(t, cfg)
+		if vg.TrackPriorityDelta != 0 {
+			t.Fatalf("lenient cost %s: TrackPriorityDelta = %d, want 0 (neutralized)", val, vg.TrackPriorityDelta)
+		}
+		if !hasWarningContaining(cfg.Warnings, "out of range") {
+			t.Fatalf("lenient cost %s: missing out-of-range warning (warnings: %v)", val, cfg.Warnings)
+		}
+	}
+}

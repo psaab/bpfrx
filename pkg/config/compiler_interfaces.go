@@ -400,12 +400,20 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 									case "track-interface":
 										if i+1 < len(keys) {
 											i++
-											vg.TrackInterface = keys[i]
+											// First-wins (#1814): duplicates in
+											// the Keys-packed spelling are
+											// rejected/warned by the AST
+											// pre-walk; keep the first here so
+											// lenient semantics are consistent
+											// with the child-node prune.
+											if vg.TrackInterface == "" {
+												vg.TrackInterface = keys[i]
+											}
 										}
 									case "track-priority-cost":
 										if i+1 < len(keys) {
 											i++
-											vg.TrackPriorityDelta, _ = strconv.Atoi(keys[i])
+											vg.TrackPriorityDelta, _ = parseTrackCost(keys[i])
 										}
 									}
 								}
@@ -473,7 +481,7 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 										// `track-interface <if> { priority-cost <n>; }`.
 										if pc := prop.FindChild("priority-cost"); pc != nil {
 											if v := nodeVal(pc); v != "" {
-												if n, err := strconv.Atoi(v); err == nil {
+												if n, ok := parseTrackCost(v); ok {
 													nestedTrackCost = n
 													nestedTrackCostSet = true
 												}
@@ -481,7 +489,7 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 										}
 									case "track-priority-cost":
 										if v := nodeVal(prop); v != "" {
-											if n, err := strconv.Atoi(v); err == nil {
+											if n, ok := parseTrackCost(v); ok {
 												siblingTrackCost = n
 												siblingTrackCostSet = true
 											}
@@ -774,11 +782,47 @@ func validateVRRPTrackInterfaceAST(nodes []*Node, prefix string, lenient bool) (
 	return warnings, nil
 }
 
+// parseTrackCost parses a priority-cost value, returning 0 (tracking
+// has no effect) for anything outside the schema's 1..254 range — a
+// negative cost would RAISE priority on link-down (Codex review on PR
+// #1821). The AST pre-walk rejects out-of-range values on strict
+// commits and warns on lenient loads; this keeps the lenient compile
+// consistent with that warning.
+func parseTrackCost(v string) (int, bool) {
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 || n > 254 {
+		return 0, false
+	}
+	return n, true
+}
+
 // checkVRRPGroupTrackShape applies the #1814 track-interface shape
 // checks to a single vrrp-group node. See validateVRRPTrackInterfaceAST.
 func checkVRRPGroupTrackShape(vg *Node, nodePath string, lenient bool) ([]string, error) {
 	var warnings []string
+	// Keys-packed compact spelling (Codex review on PR #1821): a
+	// hierarchical leaf like `vrrp-group 1 track-interface ge-0/0/1
+	// track-interface ge-0/0/2;` packs duplicates into the node's own
+	// Keys, bypassing the child-node count below. Count those too; the
+	// compiler's keys walk is first-wins, so lenient semantics match.
+	keysPacked := 0
+	for _, k := range vg.Keys {
+		if k == "track-interface" {
+			keysPacked++
+		}
+	}
 	tracks := vg.FindChildren("track-interface")
+	if total := keysPacked + len(tracks); total > 1 {
+		if !lenient {
+			return nil, fmt.Errorf("%s: %d track-interface statements; only one tracked interface is supported per vrrp-group", nodePath, total)
+		}
+		if keysPacked > 0 {
+			// Child-node duplicates are warned by the prune below; the
+			// Keys-packed spelling needs its own warning (the compiler
+			// keys walk is first-wins).
+			warnings = append(warnings, fmt.Sprintf("%s: %d track-interface statements; keeping the first and ignoring the rest (#1814)", nodePath, total))
+		}
+	}
 	if len(tracks) > 1 {
 		if !lenient {
 			return nil, fmt.Errorf("%s: %d track-interface statements; only one tracked interface is supported per vrrp-group", nodePath, len(tracks))
@@ -804,6 +848,41 @@ func checkVRRPGroupTrackShape(vg *Node, nodePath string, lenient bool) ([]string
 	}
 	if vg.FindChild("priority-cost") != nil {
 		warnings = append(warnings, fmt.Sprintf("%s: priority-cost is only valid nested under track-interface; this statement has no effect", nodePath))
+	}
+	// Range-validate every cost spelling (Codex review on PR #1821):
+	// the schema advertises <1..254> but nothing enforced it, and a
+	// negative cost would RAISE priority on link-down. Strict commit
+	// rejects; lenient load warns (the compiler clamp keeps runtime
+	// safe either way via getPriority's [1,254] clamp, but a raised
+	// priority is a semantic inversion worth refusing).
+	costCheck := func(val, spelling string) error {
+		n, err := strconv.Atoi(val)
+		if err != nil || n < 1 || n > 254 {
+			if !lenient {
+				return fmt.Errorf("%s: %s %q out of range; must be 1..254", nodePath, spelling, val)
+			}
+			warnings = append(warnings, fmt.Sprintf("%s: %s %q out of range (1..254); ignoring tracking cost", nodePath, spelling, val))
+		}
+		return nil
+	}
+	for _, tr := range tracks {
+		if pc := tr.FindChild("priority-cost"); pc != nil && len(pc.Keys) > 1 {
+			if err := costCheck(pc.Keys[1], "priority-cost"); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if tpc := vg.FindChild("track-priority-cost"); tpc != nil && len(tpc.Keys) > 1 {
+		if err := costCheck(tpc.Keys[1], "track-priority-cost"); err != nil {
+			return nil, err
+		}
+	}
+	for i, k := range vg.Keys {
+		if (k == "track-priority-cost" || k == "priority-cost") && i+1 < len(vg.Keys) {
+			if err := costCheck(vg.Keys[i+1], k); err != nil {
+				return nil, err
+			}
+		}
 	}
 	return warnings, nil
 }
