@@ -465,8 +465,13 @@ func validateIPMonitoringStrict(cfg *Config) error {
 //     RA-discovered link-locals and the snapshot RouteSnapshot has no
 //     device field — v6 support is a wire-protocol follow-up);
 //   - a unit without `family inet dhcp` is rejected (the route tracks
-//     a DHCP-learned gateway by definition; tunnel/loopback units can
-//     never carry unit.DHCP, so no extra type rejection is needed).
+//     a DHCP-learned gateway by definition);
+//   - tunnel and loopback interfaces are rejected explicitly (Codex
+//     PR #1851 review): the interface compiler sets unit.DHCP from
+//     the AST without an interface-class guard, so `family inet dhcp`
+//     on a gr-/ip-/st0/lo0/fti unit DOES compile — a DHCP client on a
+//     tunnel/loopback can never acquire a lease, so accepting it here
+//     would only manufacture a permanently-unresolvable route.
 func resolveIPMonitoringInterfaceNextHop(cfg *Config, polName string, pr *PreferredRoute, dst *net.IPNet) (string, error) {
 	val := pr.NextHop
 	if cfg.Interfaces.Interfaces[val] != nil {
@@ -498,6 +503,13 @@ func resolveIPMonitoringInterfaceNextHop(cfg *Config, polName string, pr *Prefer
 	if unit == nil {
 		return "", fmt.Errorf("services ip-monitoring policy %q route %s: next-hop %q: interface %s has no unit %d",
 			polName, pr.Destination, val, ifdName, unitNum)
+	}
+	if ifc.Tunnel != nil || unit.Tunnel != nil ||
+		strings.HasPrefix(ifdName, "lo") || strings.HasPrefix(ifdName, "st") ||
+		strings.HasPrefix(ifdName, "gr-") || strings.HasPrefix(ifdName, "ip-") ||
+		strings.HasPrefix(ifdName, "fti") {
+		return "", fmt.Errorf("services ip-monitoring policy %q route %s: next-hop %q names a tunnel or loopback interface; a DHCP-tracked next-hop requires a broadcast interface unit",
+			polName, pr.Destination, val)
 	}
 	if !unit.DHCP {
 		return "", fmt.Errorf("services ip-monitoring policy %q route %s: interface-typed next-hop requires family inet dhcp on %s unit %d",

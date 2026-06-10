@@ -376,6 +376,29 @@ func TestIPMonitoringInterfaceNextHopValidation(t *testing.T) {
 				"set interfaces fxp0 unit 0 family inet dhcp"),
 			wantErr: "management interface",
 		},
+		{
+			// Codex PR #1851 review (Low): the interface compiler sets
+			// unit.DHCP without an interface-class guard, so `family
+			// inet dhcp` on a loopback unit DOES compile — the
+			// validator must reject it by class, not rely on the
+			// DHCP-flag check.
+			name: "loopback interface rejected",
+			lines: append(policy("0.0.0.0/0", "lo0.0"),
+				"set interfaces lo0 unit 0 family inet dhcp"),
+			wantErr: "tunnel or loopback interface",
+		},
+		{
+			name: "gre tunnel interface rejected",
+			lines: append(policy("0.0.0.0/0", "gr-0/0/0.0"),
+				"set interfaces gr-0/0/0 unit 0 family inet dhcp"),
+			wantErr: "tunnel or loopback interface",
+		},
+		{
+			name: "ipsec st0 interface rejected",
+			lines: append(policy("0.0.0.0/0", "st0.0"),
+				"set interfaces st0 unit 0 family inet dhcp"),
+			wantErr: "tunnel or loopback interface",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
