@@ -56,6 +56,18 @@ use filter::{
 // code-motion at the IR level (modulo what rustc's inliner picks
 // up; the explicit hint matches other hot-path extractions in
 // this repo).
+//
+// `area` raw-pointer contract (#1826, applies to every
+// `unsafe { &*area }` reborrow in this function): the caller
+// (worker/lifecycle.rs `process_binding_rx`) casts `area` from a
+// `&MmapArea` borrowed out of `binding.umem`'s `Rc<WorkerUmemInner>`
+// allocation. The pointee outlives this call — nothing on the poll
+// path drops or replaces `binding.umem`, and the only
+// `&mut WorkerUmemInner` escape hatch (`WorkerUmem::umem_mut` via
+// `Rc::get_mut`) runs solely at bind time, never while a worker is
+// polling — so each shared reborrow is valid and cannot alias a
+// mutable reference. The raw pointer only decouples the immutable
+// UMEM-area borrow from the `&mut BindingWorker` borrow.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn poll_binding_process_descriptor(
     binding: &mut BindingWorker,
@@ -81,12 +93,16 @@ pub(super) fn poll_binding_process_descriptor(
         while let Some(desc) = received.read() {
             record_rx_descriptor_telemetry(desc, area, telemetry, worker_ctx);
             let mut recycle_now = true;
+            // SAFETY: per the `area` contract in this function's header
+            // comment — pointee outlives the call, never aliased mutably.
             if let Some(meta) = try_parse_metadata(unsafe { &*area }, desc) {
                 telemetry.counters.metadata_packets += 1;
                 let disposition = classify_metadata(meta, validation);
                 if disposition == PacketDisposition::Valid {
                     telemetry.counters.validated_packets += 1;
                     telemetry.counters.validated_bytes += desc.len as u64;
+                    // SAFETY: per the `area` contract in this function's
+                    // header comment.
                     let Some(raw_frame) =
                         unsafe { &*area }.slice(desc.addr as usize, desc.len as usize)
                     else {
@@ -119,6 +135,8 @@ pub(super) fn poll_binding_process_descriptor(
                     // the source MAC is the outer host's, not the
                     // GRE tunnel egress).
                     let flow = stage_parse_flow_and_learn(
+                        // SAFETY: per the `area` contract in this
+                        // function's header comment.
                         unsafe { &*area },
                         desc,
                         packet_frame,
@@ -851,6 +869,8 @@ pub(super) fn poll_binding_process_descriptor(
                                 let icmpv6_trace = meta.protocol == PROTO_ICMPV6
                                     && ICMPV6_EMBED_LOGGED.fetch_add(1, Ordering::Relaxed) < 32;
                                 if let Some(icmp_match) = try_embedded_icmp_nat_match(
+                                    // SAFETY: per the `area` contract in
+                                    // this function's header comment.
                                     unsafe { &*area },
                                     desc,
                                     meta,
@@ -1585,6 +1605,8 @@ pub(super) fn poll_binding_process_descriptor(
                             worker_ctx.ha_state,
                             now_secs,
                             resolve_forwarding(
+                                // SAFETY: per the `area` contract in this
+                                // function's header comment.
                                 unsafe { &*area },
                                 desc,
                                 meta,
@@ -2016,6 +2038,8 @@ pub(super) fn poll_binding_process_descriptor(
                                     &binding.live,
                                     worker_ctx.slow_path.as_deref(),
                                     worker_ctx.local_tunnel_deliveries,
+                                    // SAFETY: per the `area` contract in
+                                    // this function's header comment.
                                     unsafe { &*area },
                                     desc,
                                     meta,
@@ -2487,42 +2511,52 @@ pub(super) fn poll_binding_process_descriptor(
                                         (pending_decision.resolution.egress_ifindex, hop);
                                     // #1782: split the buffer-admission test so
                                     // the capture can tell WHY a sibling was not
-                                    // buffered. The `contains_key` branch is the
+                                    // buffered. The DuplicateDrop branch is the
                                     // H5 sibling drop (key already pending — the
                                     // first packet drove the kernel probe); the
-                                    // capacity branch (`len >= MAX_PENDING_NEIGH`)
-                                    // is a distinct condition, counted nowhere
-                                    // here. Behavior is unchanged: an insert
-                                    // happens iff the key is absent AND there is
-                                    // room, exactly as the prior combined
-                                    // condition; otherwise `recycle_now` stays
-                                    // true and the frame is recycled.
-                                    if binding.pending_neigh.contains_key(&pending_key) {
-                                        binding
-                                            .live
-                                            .pending_neigh_duplicate_drops
-                                            .fetch_add(1, Ordering::Relaxed);
-                                    } else if binding.pending_neigh.len() < MAX_PENDING_NEIGH {
-                                        let pending_flow_key = flow
-                                            .as_ref()
-                                            .map(|flow| flow.forward_key.clone())
-                                            .or_else(|| {
-                                                parse_session_flow_from_meta(meta)
-                                                    .map(|flow| flow.forward_key)
-                                            });
-                                        binding.pending_neigh.insert(
-                                            pending_key,
-                                            PendingNeighPacket {
-                                                addr: desc.addr,
-                                                desc,
-                                                meta,
-                                                decision: pending_decision,
-                                                flow_key: pending_flow_key,
-                                                queued_ns: now_ns,
-                                                probe_attempts: 0,
-                                            },
-                                        );
-                                        recycle_now = false;
+                                    // CapacityDrop branch is a distinct
+                                    // condition, counted nowhere here. #1771
+                                    // §2.4: the decision is the pure
+                                    // `pending_neigh_admission` helper so
+                                    // invariant N1's "at most one buffered
+                                    // packet per key" half is unit-tested;
+                                    // behavior is unchanged — an insert happens
+                                    // iff the key is absent AND there is room,
+                                    // otherwise `recycle_now` stays true and
+                                    // the frame is recycled.
+                                    match pending_neigh_admission(
+                                        binding.pending_neigh.contains_key(&pending_key),
+                                        binding.pending_neigh.len(),
+                                    ) {
+                                        PendingNeighAdmission::DuplicateDrop => {
+                                            binding
+                                                .live
+                                                .pending_neigh_duplicate_drops
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        PendingNeighAdmission::Buffer => {
+                                            let pending_flow_key = flow
+                                                .as_ref()
+                                                .map(|flow| flow.forward_key.clone())
+                                                .or_else(|| {
+                                                    parse_session_flow_from_meta(meta)
+                                                        .map(|flow| flow.forward_key)
+                                                });
+                                            binding.pending_neigh.insert(
+                                                pending_key,
+                                                PendingNeighPacket {
+                                                    addr: desc.addr,
+                                                    desc,
+                                                    meta,
+                                                    decision: pending_decision,
+                                                    flow_key: pending_flow_key,
+                                                    queued_ns: now_ns,
+                                                    probe_attempts: 0,
+                                                },
+                                            );
+                                            recycle_now = false;
+                                        }
+                                        PendingNeighAdmission::CapacityDrop => {}
                                     }
                                 }
                                 if cfg!(feature = "debug-log") {

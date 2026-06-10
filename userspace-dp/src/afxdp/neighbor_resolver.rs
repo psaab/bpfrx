@@ -77,6 +77,14 @@ pub(in crate::afxdp) const RESOLVER_QUEUE_DEPTH: usize = 4096;
 /// one negative window, but a dead-host storm fires at most one GET/s.
 pub(in crate::afxdp) const RESOLVER_PER_KEY_RATE_LIMIT_NS: u64 = 1_000_000_000;
 
+// #1771 §2.4 invariant N1 prerequisite, pinned at compile time: at least
+// one per-key backoff window must elapse INSIDE the worker-side negative
+// cache TTL. If the rate-limit window ever grew past the TTL, no GET
+// could fire while a key is negatively cached and the resolver could not
+// un-wedge a fast-failing dst (the exact #1769 blackout this thread
+// exists to prevent).
+const _: () = assert!(NEG_NEIGH_TTL_NS > RESOLVER_PER_KEY_RATE_LIMIT_NS);
+
 /// `last_resolved_at` GC cadence + max entry age (mirrors the warmer's
 /// GC). Prunes keys not seen within `RESOLVER_GC_MAX_AGE_NS` every
 /// `RESOLVER_GC_INTERVAL_NS` so the per-key map cannot grow unbounded
@@ -128,6 +136,29 @@ pub(crate) struct ResolverCounters {
     /// advanced between enqueue and the GET reply (epoch guard rejected
     /// a potentially-raced stale insert).
     pub(crate) epoch_rejects: AtomicU64,
+    /// #1771 §2.6: subset of `get_attempts` that were backoff RETRIES —
+    /// a GET admitted for a key the resolver had already attempted
+    /// within its per-key memory (`last_resolved`, GC'd after
+    /// `RESOLVER_GC_MAX_AGE_NS`). A rising rate means the same next-hops
+    /// keep failing to resolve and the resolver is cycling its
+    /// once-per-`RESOLVER_PER_KEY_RATE_LIMIT_NS` backoff on them.
+    pub(crate) get_backoff_attempts: AtomicU64,
+    /// #1771 §2.5/§2.6: ENOBUFS receives on the neighbor-monitor netlink
+    /// socket — the kernel dropped RTM_{NEW,DEL}NEIGH multicast
+    /// notifications on rcvbuf overflow (the lost-NEWNEIGH desync class
+    /// the throttled re-dump self-heals). Counted on the MONITOR thread;
+    /// lives here so it rides the existing ResolverCounters →
+    /// NeighborResolverCounters → status wire path.
+    pub(crate) netlink_enobufs: AtomicU64,
+    /// #1771 §2.5/§2.6: throttle-admitted upsert-only family re-dumps
+    /// actually issued after an ENOBUFS (at least one of the v4/v6
+    /// RTM_GETNEIGH dump requests was sent successfully).
+    pub(crate) netlink_redumps: AtomicU64,
+    /// #1771 §2.5/§2.6: dynamic-neighbor entries (re)added by an
+    /// upsert-only re-dump reply — RTM_NEWNEIGH dump replies (matched by
+    /// nlmsg_seq) whose insert CHANGED the map. Nonzero proves a re-dump
+    /// repopulated keys the dropped multicast events had desynced.
+    pub(crate) netlink_redump_upserts: AtomicU64,
 }
 
 /// Plain snapshot of [`ResolverCounters`] for the status path (all
@@ -143,6 +174,10 @@ pub(crate) struct NeighborResolverCounters {
     pub(crate) probe_on_stale: u64,
     pub(crate) get_failures: u64,
     pub(crate) epoch_rejects: u64,
+    pub(crate) get_backoff_attempts: u64,
+    pub(crate) netlink_enobufs: u64,
+    pub(crate) netlink_redumps: u64,
+    pub(crate) netlink_redump_upserts: u64,
 }
 
 /// Handle held by the coordinator and cloned (as the producer + counter
@@ -556,20 +591,42 @@ pub(in crate::afxdp) fn decide_action(
     }
 }
 
-/// Per-key rate-limit admission. Returns true if a GET/probe may fire
-/// for `key` at `now_ns` (and records the timestamp); false if the key
-/// was resolved within `RESOLVER_PER_KEY_RATE_LIMIT_NS` (coalesce — no
-/// probe storm). Pure helper over the caller's `last_resolved` map.
-pub(in crate::afxdp) fn rate_limit_admit(
+/// Outcome of the per-key rate-limit decision. Split (#1771 §2.6) so
+/// the resolver loop can count backoff RETRIES (`AdmitRetry`) for the
+/// `resolver_get_backoff_attempts` counter without changing the
+/// admit/coalesce behavior of the original boolean helper.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::afxdp) enum RateLimitDecision {
+    /// First attempt for this key within the resolver's per-key memory
+    /// (no `last_resolved` entry) → admit one GET.
+    AdmitFirst,
+    /// The key was attempted before and the
+    /// `RESOLVER_PER_KEY_RATE_LIMIT_NS` window has lapsed → admit one
+    /// GET; this is a backoff retry for a still-recurring key.
+    AdmitRetry,
+    /// Within the window → coalesce (no GET, no probe storm).
+    Coalesce,
+}
+
+/// Per-key rate-limit decision. Admitting (`AdmitFirst`/`AdmitRetry`)
+/// records `now_ns` for the key; `Coalesce` leaves the map untouched.
+/// Pure helper over the caller's `last_resolved` map.
+pub(in crate::afxdp) fn rate_limit_decide(
     last_resolved: &mut FastMap<(i32, IpAddr), u64>,
     key: (i32, IpAddr),
     now_ns: u64,
-) -> bool {
+) -> RateLimitDecision {
     match last_resolved.get(&key) {
-        Some(&t) if now_ns.saturating_sub(t) < RESOLVER_PER_KEY_RATE_LIMIT_NS => false,
-        _ => {
+        Some(&t) if now_ns.saturating_sub(t) < RESOLVER_PER_KEY_RATE_LIMIT_NS => {
+            RateLimitDecision::Coalesce
+        }
+        Some(_) => {
             last_resolved.insert(key, now_ns);
-            true
+            RateLimitDecision::AdmitRetry
+        }
+        None => {
+            last_resolved.insert(key, now_ns);
+            RateLimitDecision::AdmitFirst
         }
     }
 }
@@ -627,8 +684,17 @@ pub(super) fn neighbor_resolver_loop(
         // Per-key rate-limit: coalesce a SYN storm to one GET/probe per
         // window per key (no probe storm).
         let now = monotonic_nanos();
-        if !rate_limit_admit(&mut last_resolved, key, now) {
-            continue;
+        match rate_limit_decide(&mut last_resolved, key, now) {
+            RateLimitDecision::Coalesce => continue,
+            RateLimitDecision::AdmitFirst => {}
+            RateLimitDecision::AdmitRetry => {
+                // #1771 §2.6: a re-admitted key after the per-key window
+                // — the backoff-retry depth signal. Invariant N1 (§2.4):
+                // these retries keep firing even while the worker-side
+                // negative cache is fast-failing duplicate packets for
+                // the same key.
+                counters.get_backoff_attempts.fetch_add(1, Ordering::Relaxed);
+            }
         }
         // Snapshot epoch BEFORE the GET so a concurrent monitor event
         // that lands during the GET is detected by the post-GET re-read.
@@ -1063,27 +1129,66 @@ mod tests {
         );
     }
 
-    // ---- rate_limit_admit: no probe storm ----
+    // ---- rate_limit_decide: no probe storm ----
 
     #[test]
     fn rate_limit_admits_first_then_coalesces_within_window() {
         let mut last: FastMap<(i32, IpAddr), u64> = FastMap::default();
         let key = (14, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)));
         // First miss at t=0 → admit (one GET fires).
-        assert!(rate_limit_admit(&mut last, key, 0));
+        assert_eq!(
+            rate_limit_decide(&mut last, key, 0),
+            RateLimitDecision::AdmitFirst
+        );
         // 50 storm misses within the 1s window → all coalesced (no GET).
         for t in (1..=50).map(|i| i * 10_000_000u64) {
-            assert!(
-                !rate_limit_admit(&mut last, key, t),
+            assert_eq!(
+                rate_limit_decide(&mut last, key, t),
+                RateLimitDecision::Coalesce,
                 "within-window repeat must be coalesced (no probe storm)",
             );
         }
-        // After the window lapses → admit again (one fresh GET).
-        assert!(rate_limit_admit(
-            &mut last,
-            key,
-            RESOLVER_PER_KEY_RATE_LIMIT_NS + 1
-        ));
+        // After the window lapses → admit again (one fresh GET), now as
+        // a backoff RETRY for the still-unresolved key.
+        assert_eq!(
+            rate_limit_decide(&mut last, key, RESOLVER_PER_KEY_RATE_LIMIT_NS + 1),
+            RateLimitDecision::AdmitRetry
+        );
+    }
+
+    /// #1771 §2.6: the decision split must classify the SAME admissions
+    /// the boolean helper grants — first attempt vs backoff retry — so
+    /// `resolver_get_backoff_attempts` counts exactly the re-admitted
+    /// keys (subset of `get_attempts`).
+    #[test]
+    fn rate_limit_decide_classifies_first_retry_coalesce() {
+        let mut last: FastMap<(i32, IpAddr), u64> = FastMap::default();
+        let key = (14, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)));
+        // First attempt for an unseen key.
+        assert_eq!(
+            rate_limit_decide(&mut last, key, 0),
+            RateLimitDecision::AdmitFirst
+        );
+        // Within the window → coalesced, and the recorded timestamp is
+        // NOT refreshed (the retry clock keeps running from t=0).
+        assert_eq!(
+            rate_limit_decide(&mut last, key, 10),
+            RateLimitDecision::Coalesce
+        );
+        assert_eq!(last.get(&key), Some(&0));
+        // Past the window → a backoff RETRY (counted), timestamp moves.
+        let t_retry = RESOLVER_PER_KEY_RATE_LIMIT_NS + 1;
+        assert_eq!(
+            rate_limit_decide(&mut last, key, t_retry),
+            RateLimitDecision::AdmitRetry
+        );
+        assert_eq!(last.get(&key), Some(&t_retry));
+        // A different key is still a FIRST attempt.
+        let other = (14, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 201)));
+        assert_eq!(
+            rate_limit_decide(&mut last, other, t_retry),
+            RateLimitDecision::AdmitFirst
+        );
     }
 
     #[test]
@@ -1091,11 +1196,20 @@ mod tests {
         let mut last: FastMap<(i32, IpAddr), u64> = FastMap::default();
         let k1 = (14, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)));
         let k2 = (14, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 201)));
-        assert!(rate_limit_admit(&mut last, k1, 0));
+        assert_eq!(
+            rate_limit_decide(&mut last, k1, 0),
+            RateLimitDecision::AdmitFirst
+        );
         // A different key in the same instant is independently admitted.
-        assert!(rate_limit_admit(&mut last, k2, 0));
+        assert_eq!(
+            rate_limit_decide(&mut last, k2, 0),
+            RateLimitDecision::AdmitFirst
+        );
         // ...but the first key is still coalesced.
-        assert!(!rate_limit_admit(&mut last, k1, 1));
+        assert_eq!(
+            rate_limit_decide(&mut last, k1, 1),
+            RateLimitDecision::Coalesce
+        );
     }
 
     // ---- differential repro: the #1769 stuck state is now resolvable ----
@@ -1190,5 +1304,161 @@ mod tests {
             dynamic.get(&key).is_none(),
             "DELAY/STALE lladdr must NOT be cached (forward only on confirmed)",
         );
+    }
+
+    // ---- §2.4 invariant N1: negative cache does not stop resolution ----
+
+    /// Invariant N1 (#1771 §2.4): while a key is negatively cached
+    /// (`neg_neigh_gate` true), the resolver continues to issue
+    /// GET/backoff probes for that key; only *duplicate buffered packets*
+    /// are dropped, not resolution.
+    ///
+    /// Both halves are pinned, the resolution half against the REAL
+    /// resolver thread (live `neighbor_resolver_loop` on a real netlink
+    /// socket — no socket seam exists, and a mock would not prove the
+    /// loop fires):
+    /// - resolution half: the key is enqueued twice across the per-key
+    ///   backoff window; `get_attempts` increments BOTH times (the second
+    ///   counted as a backoff retry) while `neg_neigh_gate` fast-fails
+    ///   packets for the key the whole time. The window-vs-TTL overlap
+    ///   this depends on is also pinned at compile time
+    ///   (`NEG_NEIGH_TTL_NS > RESOLVER_PER_KEY_RATE_LIMIT_NS`).
+    /// - buffering half: the production admission decision
+    ///   (`pending_neigh_admission`, the exact helper `poll_descriptor`
+    ///   calls) admits ONE buffered packet per key and drops siblings.
+    ///
+    /// The key targets a nonexistent ifindex so the kernel answers the
+    /// GET promptly (no entry → NoReply → probe-only) and the ARP-probe
+    /// helper no-ops without CAP_NET_RAW — the asserted effect is the
+    /// counter movement, mirroring `warmer_tests`.
+    #[test]
+    fn invariant_n1_negative_cache_does_not_stop_resolution() {
+        use crate::afxdp::neg_neigh::{NegNeighCache, neg_neigh_gate, neg_neigh_record};
+        use crate::afxdp::neighbor_dispatch::{PendingNeighAdmission, pending_neigh_admission};
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        // Codex review on PR #1833: the resolver thread exits silently
+        // when its netlink socket cannot be opened (sandboxes deny
+        // AF_NETLINK), which would turn this test into a timeout
+        // failure. Probe availability and skip gracefully — the
+        // invariant itself is environment-independent; only this
+        // live-thread harness needs the socket.
+        let probe_fd = open_resolver_socket();
+        if probe_fd < 0 {
+            eprintln!(
+                "skipping invariant_n1: AF_NETLINK/NETLINK_ROUTE unavailable in this environment"
+            );
+            return;
+        }
+        unsafe { libc::close(probe_fd) };
+
+        fn wait_for<F: Fn() -> bool>(pred: F) -> bool {
+            for _ in 0..400 {
+                if pred() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            false
+        }
+
+        let ifindex = 999i32;
+        let hop = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 77));
+        let key = (ifindex, hop);
+
+        // Arm the negative cache for K with REAL monotonic time (the
+        // resolver thread runs on the same clock).
+        let mut neg = NegNeighCache::default();
+        neg_neigh_record(&mut neg, key, monotonic_nanos());
+        assert!(
+            neg_neigh_gate(&mut neg, &key, monotonic_nanos(), || false),
+            "precondition: K negatively cached → duplicate packets fast-fail",
+        );
+
+        // Buffering half: pending_neigh admits AT MOST ONE packet for K.
+        assert_eq!(
+            pending_neigh_admission(false, 0),
+            PendingNeighAdmission::Buffer,
+            "the first packet for K is buffered (the per-key representative)",
+        );
+        assert_eq!(
+            pending_neigh_admission(true, 1),
+            PendingNeighAdmission::DuplicateDrop,
+            "a sibling for the already-pending K is dropped, not buffered",
+        );
+
+        // Resolution half: live resolver thread on a real netlink socket.
+        let (tx, rx) = mpsc::sync_channel::<ResolveItem>(8);
+        let counters = Arc::new(ResolverCounters::default());
+        let dynamic = Arc::new(ShardedNeighborMap::new());
+        let generation = Arc::new(AtomicU64::new(1));
+        let get_rtt_hist =
+            Arc::new(super::super::neighbor_latency::NeighborLatencyHist::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let (d, g, c, h, s) = (
+                dynamic.clone(),
+                generation.clone(),
+                counters.clone(),
+                get_rtt_hist.clone(),
+                stop.clone(),
+            );
+            std::thread::spawn(move || neighbor_resolver_loop(rx, d, g, c, h, s))
+        };
+        let resolver = NeighborResolver::new(
+            tx,
+            counters.clone(),
+            generation,
+            Arc::new(super::super::neighbor_latency::NeighborLatencyHist::default()),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
+
+        // First fast-fail routes K through the resolver: one GET fires
+        // WHILE K is negatively cached.
+        resolver.enqueue(ifindex, hop, "xpf-n1-nodev".to_string());
+        assert!(
+            wait_for(|| counters.get_attempts.load(Ordering::Relaxed) == 1),
+            "first GET must fire while K is negatively cached",
+        );
+
+        // Advance the backoff clock past the per-key window. Refresh the
+        // negative entry first so a slow scheduler cannot expire the 3 s
+        // TTL under the test (production re-records on every timeout
+        // drop, so a refresh is semantics-preserving); then verify the
+        // gate is STILL fast-failing when the retry GET is admitted.
+        neg_neigh_record(&mut neg, key, monotonic_nanos());
+        std::thread::sleep(Duration::from_nanos(RESOLVER_PER_KEY_RATE_LIMIT_NS + 100_000_000));
+        assert!(
+            neg_neigh_gate(&mut neg, &key, monotonic_nanos(), || dynamic
+                .get(&key)
+                .is_some()),
+            "K must still be negatively cached when the backoff GET fires",
+        );
+        resolver.enqueue(ifindex, hop, "xpf-n1-nodev".to_string());
+        assert!(
+            wait_for(|| counters.get_attempts.load(Ordering::Relaxed) == 2),
+            "the backoff GET must fire for the still-negatively-cached K",
+        );
+        assert_eq!(
+            counters.get_backoff_attempts.load(Ordering::Relaxed),
+            1,
+            "the second GET is a counted backoff RETRY (§2.6 counter ties to N1)",
+        );
+        // Resolution continued the whole time the gate was dropping
+        // duplicates — the invariant. (The dst is genuinely unresolvable
+        // here, so the gate stays armed.)
+        assert!(
+            neg_neigh_gate(&mut neg, &key, monotonic_nanos(), || dynamic
+                .get(&key)
+                .is_some()),
+            "K still negatively cached after both GETs — duplicates were \
+             dropped, resolution was not",
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        drop(resolver); // drops the producer → recv disconnects promptly
+        handle.join().expect("resolver join");
     }
 }

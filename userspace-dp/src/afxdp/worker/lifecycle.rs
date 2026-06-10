@@ -54,6 +54,17 @@ pub(super) fn poll_binding(
     let Some((binding, right)) = rest.split_first_mut() else {
         return false;
     };
+    // Raw-pointer contract for every `unsafe { &*area }` reborrow on the
+    // poll path (here and in poll_descriptor): `area` is cast from a
+    // `&MmapArea` borrowed out of `binding.umem` (an `Rc<WorkerUmemInner>`
+    // allocation). The pointee outlives the whole poll call — nothing on
+    // the poll path drops or replaces `binding.umem`, and the only
+    // `&mut WorkerUmemInner` escape hatch (`WorkerUmem::umem_mut` via
+    // `Rc::get_mut`) is exercised solely at bind time (bind.rs), never
+    // while a worker is polling — so the shared reborrows can never alias
+    // a mutable reference. The raw pointer exists only to decouple the
+    // immutable UMEM-area borrow from the `&mut BindingWorker` borrows
+    // taken by the same calls.
     let area = binding.umem.area() as *const MmapArea;
     maybe_touch_heartbeat(binding, now_ns);
     let tx_work = drain_pending_tx(
@@ -144,6 +155,10 @@ pub(super) fn poll_binding(
                 dynamic_neighbors,
                 neighbor_resolver,
                 now_ns,
+                // SAFETY: fresh round-trip through the same `&MmapArea`
+                // borrow `area` was created from; see the `area` contract
+                // at the top of this function — the pointee outlives the
+                // call and is never aliased mutably on the poll path.
                 unsafe { &*(binding.umem.area() as *const MmapArea) },
                 shared_recycles,
             );
@@ -307,6 +322,9 @@ pub(super) fn poll_binding(
         dynamic_neighbors,
         neighbor_resolver,
         now_ns,
+        // SAFETY: see the `area` contract at the top of this function —
+        // the pointee outlives the call and is never aliased mutably on
+        // the poll path.
         unsafe { &*area },
         shared_recycles,
     );

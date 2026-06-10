@@ -199,6 +199,14 @@ type xpfCollector struct {
 	bindingTXCompletions                *prometheus.Desc
 	bindingTXCompletionRingAvailable    *prometheus.Desc
 	bindingTXCompletionRingAvailableMax *prometheus.Desc
+	// #1831 (follow-up to #1766): per-binding V_min fairness-throttle
+	// counters (#941 work item D / #943). Already on the wire in
+	// BindingStatus; these export them to Prometheus. v_min_throttles
+	// is "fairness brake fired"; hard-cap overrides is "brake too
+	// tight, escape hatch rescued throughput" — the ratio is the
+	// LAG_THRESHOLD diagnostic.
+	bindingVMinThrottles                *prometheus.Desc
+	bindingVMinThrottleHardCapOverrides *prometheus.Desc
 	// #1248: class-specific active flow distribution by egress CoS
 	// queue. This is the production/mixed-workload {a_i} source.
 	cosActiveFlowCount *prometheus.Desc
@@ -256,6 +264,14 @@ type xpfCollector struct {
 	neighborResolverGetRttSeconds    *prometheus.Desc
 	neighborPendingTimeoutDropsTotal *prometheus.Desc
 	neighborPendingMaxDepth          *prometheus.Desc
+	// #1771 §2.6: resolver backoff-retry counter, §2.5 ENOBUFS/re-dump
+	// counters, and the pending-keys / negative-keys gauges.
+	neighborResolverGetBackoffAttemptsTotal *prometheus.Desc
+	neighborNetlinkEnobufsTotal             *prometheus.Desc
+	neighborNetlinkRedumpsTotal             *prometheus.Desc
+	neighborNetlinkRedumpUpsertsTotal       *prometheus.Desc
+	neighborPendingKeys                     *prometheus.Desc
+	negNeighKeys                            *prometheus.Desc
 }
 
 func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
@@ -384,6 +400,8 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.bindingTXCompletions
 	ch <- c.bindingTXCompletionRingAvailable
 	ch <- c.bindingTXCompletionRingAvailableMax
+	ch <- c.bindingVMinThrottles
+	ch <- c.bindingVMinThrottleHardCapOverrides
 	ch <- c.cosActiveFlowCount
 	ch <- c.fairnessCstruct
 	ch <- c.fairnessActiveWorkers
@@ -425,6 +443,12 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.neighborResolverGetRttSeconds
 	ch <- c.neighborPendingTimeoutDropsTotal
 	ch <- c.neighborPendingMaxDepth
+	ch <- c.neighborResolverGetBackoffAttemptsTotal
+	ch <- c.neighborNetlinkEnobufsTotal
+	ch <- c.neighborNetlinkRedumpsTotal
+	ch <- c.neighborNetlinkRedumpUpsertsTotal
+	ch <- c.neighborPendingKeys
+	ch <- c.negNeighKeys
 }
 
 func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {

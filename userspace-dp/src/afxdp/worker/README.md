@@ -8,9 +8,16 @@ binding per tick.
 
 `worker_loop` was extracted out of `worker/mod.rs` into `loop_body/`
 in #1326 Phase 1 (PR #1569) when `worker/mod.rs` crossed the 2000-LOC
-modularity gate. The fn body sits in `loop_body/mod.rs` today; the
-per-tick sub-stage decomposition (`setup.rs` / `tick.rs` /
-`poll_drive.rs` / `debug_report.rs`) is queued as follow-up PRs.
+modularity gate. #1776 (Phase 2, narrowed v3.1 scope) carved the two
+cold extractions out of the fn: `loop_body/setup.rs` (one-shot setup,
+returns the loop's initial `WorkerLoopSetup` state) and
+`loop_body/debug_report.rs` (the cfg(debug-log) verbose report /
+stall dump + `DbgCounters`, feature-gated at the `mod` declaration so
+release builds compile none of it). All per-tick logic — including
+the hot `poll_binding` sweep, the ArcSwap config refresh, command
+drain, and the always-on binding diagnostics + `BindingLiveState`
+publish — stays inline in `loop_body/mod.rs` by design (no call
+boundary added to the per-tick path; Codex r1-4).
 
 `BindingWorker` was decomposed into sub-structs in #959 (Phases 1–11).
 Each phase extracted one cluster of fields into a dedicated
@@ -22,7 +29,9 @@ each cluster has a clear ownership boundary.
 | File | Purpose |
 |------|---------|
 | `mod.rs` | `BindingWorker` struct + shared-binding helpers + `pub(crate) use loop_body::worker_loop` re-export. |
-| `loop_body/mod.rs` | `worker_loop` body (extracted in #1326 Phase 1). Per-tick orchestrator; calls `pin_current_thread` (defined in `afxdp/neighbor.rs`) at startup. The sub-stage carve into `setup.rs` / `tick.rs` / `poll_drive.rs` / `debug_report.rs` is a follow-up. |
+| `loop_body/mod.rs` | `worker_loop` body (extracted in #1326 Phase 1; decomposed in #1776). Per-tick orchestrator — all per-tick logic stays inline here. |
+| `loop_body/setup.rs` | #1776 — one-shot cold setup (`worker_loop_setup`): thread pin via `pin_current_thread` (defined in `afxdp/neighbor.rs`), TSC calibration, binding construction, BPF-map-FD cache; returns `WorkerLoopSetup`. |
+| `loop_body/debug_report.rs` | #1776 — cfg(debug-log)-only `DbgCounters` + per-second verbose report (`emit_periodic_report`) + stall dump (`check_and_dump_stall`). Compiled out of release builds. |
 | `lifecycle.rs` | `poll_binding` — the per-poll RX/TX orchestrator. The "central function" extracted in Issue 73 step 2. |
 | `cos.rs` | Per-worker CoS runtime helpers + shared-exact threshold (the empirical sustained per-worker exact throughput ceiling — see comment block in the file for the evidence basis). |
 | `cos_state.rs` | `WorkerCos` (#959 Phase 3) — per-binding CoS-engine state. |

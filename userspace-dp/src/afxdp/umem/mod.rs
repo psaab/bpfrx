@@ -469,6 +469,24 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// `Coordinator::pending_neigh_duplicate_drops_total()` (Prometheus
     /// `xpf_userspace_pending_neigh_duplicate_drops_total`).
     pub(super) pending_neigh_duplicate_drops: AtomicU64,
+    /// #1771 §2.6: distinct unresolved `(egress_ifindex, next_hop)` keys
+    /// currently buffered in this binding's `pending_neigh` map (gauge —
+    /// post-#1779 §2.2 the map holds at most ONE representative packet
+    /// per key, so `len()` == distinct pending next-hops). Published
+    /// from the owning worker's ~65ms debug-state tick
+    /// (`publish_binding_debug_state`), summed across bindings by
+    /// `Coordinator::neighbor_pending_keys_total()` (Prometheus
+    /// `xpf_userspace_neighbor_pending_keys`).
+    pub(super) pending_neigh_keys: AtomicU64,
+    /// #1771 §2.6: keys currently held in this binding's negative
+    /// neighbor cache (gauge). Lazy-TTL caveat: `neg_neigh_active`
+    /// evicts expired entries only on access, so an idle expired key
+    /// stays counted until its next packet (or a cap-overflow clear) —
+    /// the gauge is an upper bound on ACTIVE negative entries. Same
+    /// publish cadence/path as `pending_neigh_keys`; summed by
+    /// `Coordinator::neg_neigh_keys_total()` (Prometheus
+    /// `xpf_userspace_neg_neigh_keys`).
+    pub(super) neg_neigh_keys: AtomicU64,
     /// #1789: per-binding count of failed USERSPACE_SESSIONS BPF-map
     /// publishes (`publish_live_session_entry` /
     /// `publish_live_session_key` returning `Err`) on the worker poll
@@ -720,6 +738,8 @@ impl BindingLiveState {
             no_owner_binding_drops: AtomicU64::new(0),
             neg_neigh_fast_fail: AtomicU64::new(0),
             pending_neigh_duplicate_drops: AtomicU64::new(0),
+            pending_neigh_keys: AtomicU64::new(0),
+            neg_neigh_keys: AtomicU64::new(0),
             session_publish_errors: AtomicU64::new(0),
             // #709 / #746: owner-profile telemetry, split by writer
             // into two cacheline-isolated groups. Histograms are zero-

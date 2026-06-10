@@ -193,6 +193,37 @@ RX from AF_XDP ring (up to 256 frames per batch, 4 batches per poll)
       └─ Cross binding: copy into target binding UMEM on the common path
 ```
 
+#### Neighbor Resolution — the negative cache does not stop resolution (N1)
+
+A `MissingNeighbor` packet buffers ONE representative per
+`(egress_ifindex, next_hop)` in the per-binding `pending_neigh` map
+(#1771 §2.2; same-key siblings are recycled — `pending_neigh_admission`
+in `neighbor_dispatch.rs`). A hop that never resolves within the pending
+timeout is negatively cached for 3 s (`neg_neigh.rs`), and subsequent
+cold packets to it fast-fail at the buffer site.
+
+**Invariant N1 (#1771 §2.4):** while a key is negatively cached, the
+shared on-demand resolver (`neighbor_resolver.rs`, #1769) continues to
+issue rate-limited single-key RTM_GETNEIGH probes for it — the negative
+cache drops *duplicate buffered packets*, never *resolution*. Every
+fast-fail enqueues the key to the resolver; the per-key backoff window
+(1 s) is strictly shorter than the negative TTL (3 s, pinned by a
+compile-time assert), so at least one backoff GET fires inside every
+negative window and a recovered host is re-learned instead of
+blackholing in 3 s cycles. Pinned by
+`invariant_n1_negative_cache_does_not_stop_resolution` (live resolver
+thread) plus the admission unit tests.
+
+Observability (#1771 §2.6, all in the status JSON → Prometheus):
+`neighbor_resolver_get_backoff_attempts_total` (backoff retries — N1's
+"resolution continued" signal), `neighbor_pending_keys` /
+`neg_neigh_keys` (current distinct parked / negatively-cached keys,
+summed per binding at the ~65 ms debug tick), and the §2.5 monitor
+self-heal counters `neighbor_netlink_enobufs_total` /
+`neighbor_netlink_redumps_total` / `neighbor_netlink_redump_upserts_total`
+(lost-multicast detection → throttled upsert-only re-dump → entries
+actually re-added).
+
 #### AF_XDP Ring Management
 
 Each binding manages four rings:

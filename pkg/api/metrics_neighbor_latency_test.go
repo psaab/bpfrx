@@ -3,6 +3,10 @@ package api
 import (
 	"math"
 	"testing"
+
+	"github.com/prometheus/client_golang/prometheus"
+
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
 // #1772: pin the Go-side bucket conversion that turns the dataplane's
@@ -94,4 +98,74 @@ func TestNeighLatencyCumulativeBucketsShortSlice(t *testing.T) {
 			t.Errorf("short slice %v: top cumulative %d, want %d", raw, top, total)
 		}
 	}
+}
+
+// #1771 §2.6: value + type pin for the Phase-3 neighbor metrics emitted
+// by emitNeighborWarmCounters — the backoff-retry counter, the §2.5
+// ENOBUFS/re-dump counters (CounterValue), and the pending/negative key
+// gauges (GaugeValue). assertCounterClose/assertGaugeClose check the
+// concrete dto type, so a Counter↔Gauge mixup here fails the test.
+func TestEmitNeighborPhase3CountersAndGauges(t *testing.T) {
+	newDesc := func(name string) *prometheus.Desc {
+		return prometheus.NewDesc(name, name, nil, nil)
+	}
+	c := &xpfCollector{
+		neighborWarmDropsTotal:        newDesc("xpf_userspace_neighbor_warm_drops_total"),
+		neighborWarmDisconnectedTotal: newDesc("xpf_userspace_neighbor_warm_disconnected_total"),
+		neighborResolverQueueDepth:    newDesc("xpf_userspace_neighbor_resolver_queue_depth"),
+		neighborResolverEnqueueDropsTotal: newDesc(
+			"xpf_userspace_neighbor_resolver_enqueue_drops_total"),
+		neighborResolverDisconnectedTotal: newDesc(
+			"xpf_userspace_neighbor_resolver_disconnected_total"),
+		neighborResolverGetAttemptsTotal: newDesc(
+			"xpf_userspace_neighbor_resolver_get_attempts_total"),
+		neighborResolverGetResolvedTotal: newDesc(
+			"xpf_userspace_neighbor_resolver_get_resolved_total"),
+		neighborResolverProbeOnStaleTotal: newDesc(
+			"xpf_userspace_neighbor_resolver_probe_on_stale_total"),
+		neighborResolverGetFailuresTotal: newDesc(
+			"xpf_userspace_neighbor_resolver_get_failures_total"),
+		neighborResolverEpochRejectsTotal: newDesc(
+			"xpf_userspace_neighbor_resolver_epoch_rejects_total"),
+		neighborResolverGetBackoffAttemptsTotal: newDesc(
+			"xpf_userspace_neighbor_resolver_get_backoff_attempts_total"),
+		neighborNetlinkEnobufsTotal: newDesc(
+			"xpf_userspace_neighbor_netlink_enobufs_total"),
+		neighborNetlinkRedumpsTotal: newDesc(
+			"xpf_userspace_neighbor_netlink_redumps_total"),
+		neighborNetlinkRedumpUpsertsTotal: newDesc(
+			"xpf_userspace_neighbor_netlink_redump_upserts_total"),
+		neighborPendingKeys: newDesc("xpf_userspace_neighbor_pending_keys"),
+		negNeighKeys:        newDesc("xpf_userspace_neg_neigh_keys"),
+		neighborPendingDwellSeconds: newDesc(
+			"xpf_userspace_neighbor_pending_dwell_seconds"),
+		neighborResolverGetRttSeconds: newDesc(
+			"xpf_userspace_neighbor_resolver_get_rtt_seconds"),
+		neighborPendingTimeoutDropsTotal: newDesc(
+			"xpf_userspace_neighbor_pending_timeout_drops_total"),
+		neighborPendingMaxDepth: newDesc("xpf_userspace_neighbor_pending_max_depth"),
+	}
+	status := dpuserspace.ProcessStatus{
+		NeighborResolverGetBackoffAttemptsTotal: 9,
+		NeighborNetlinkEnobufsTotal:             4,
+		NeighborNetlinkRedumpsTotal:             2,
+		NeighborNetlinkRedumpUpsertsTotal:       13,
+		NeighborPendingKeys:                     3,
+		NegNeighKeys:                            1,
+	}
+
+	ch := make(chan prometheus.Metric, 64)
+	c.emitNeighborWarmCounters(ch, status)
+	close(ch)
+	var got []prometheus.Metric
+	for m := range ch {
+		got = append(got, m)
+	}
+
+	assertCounterClose(t, got, c.neighborResolverGetBackoffAttemptsTotal, nil, 9)
+	assertCounterClose(t, got, c.neighborNetlinkEnobufsTotal, nil, 4)
+	assertCounterClose(t, got, c.neighborNetlinkRedumpsTotal, nil, 2)
+	assertCounterClose(t, got, c.neighborNetlinkRedumpUpsertsTotal, nil, 13)
+	assertGaugeClose(t, got, c.neighborPendingKeys, nil, 3)
+	assertGaugeClose(t, got, c.negNeighKeys, nil, 1)
 }
