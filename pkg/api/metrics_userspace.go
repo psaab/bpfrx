@@ -1207,24 +1207,6 @@ func (c *xpfCollector) emitCoSFlowFairOccupancy(ch chan<- prometheus.Metric, sta
 		for _, queue := range iface.Queues {
 			queueLabel := strconv.Itoa(queue.QueueID)
 			ch <- prometheus.MustNewConstMetric(
-				c.cosSojournEwmaNS,
-				prometheus.GaugeValue,
-				float64(queue.SojournEwmaNS),
-				ifindexLabel, queueLabel,
-			)
-			ch <- prometheus.MustNewConstMetric(
-				c.cosSojournPeakNS,
-				prometheus.GaugeValue,
-				float64(queue.SojournPeakNS),
-				ifindexLabel, queueLabel,
-			)
-			ch <- prometheus.MustNewConstMetric(
-				c.cosSojournWindowedMinNS,
-				prometheus.GaugeValue,
-				float64(queue.SojournWindowedMinNS),
-				ifindexLabel, queueLabel,
-			)
-			ch <- prometheus.MustNewConstMetric(
 				c.cosFlowFairBucketsOccupied,
 				prometheus.GaugeValue,
 				float64(queue.FlowFairBucketsOccupied),
