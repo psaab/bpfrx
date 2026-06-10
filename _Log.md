@@ -4663,3 +4663,7 @@ top.
 - **Timestamp**: 2026-06-09
   **Action**: U10 (#1792) monotonic HA liveness — 4 commits on engineer/1800-u10-liveness
   **File(s)**: pkg/cluster/{heartbeat,heartbeat_manager,hooks,manager,sync,sync_conn,sync_protocol,sync_test,heartbeat_liveness_test}.go, pkg/daemon/{daemon,daemon_ha_sync,daemon_ha_sync_test}.go, pkg/vrrp/{instance,instance_garp_test}.go, docs/bug-heartbeat-vrf-rebind-split-brain.md
+
+- **Timestamp**: 2026-06-09
+  **Action**: #1798 U7 layer 1+2 — strict commit-path control-char validation (compileOpts.sanitizeFreeTextControlChars gate in compileExpanded) + lenient sanitize-with-warning; Store.Load/SyncApply tree scrub via config.SanitizeTreeControlChars
+  **File(s)**: pkg/config/freetext.go (new), pkg/config/compiler.go, pkg/configstore/store.go
