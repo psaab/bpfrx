@@ -223,6 +223,7 @@ func TestReconcileLeaseChangeDoesNotRestart(t *testing.T) {
 func TestTerminalExitDeregistersAndAllowsRestart(t *testing.T) {
 	fr := newFakeRunner(true) // exits immediately = terminal failure
 	m := NewManagerForTesting(fr.run)
+	m.SetDHCPv4Options("ge-0-0-3", &DHCPv4Options{})
 
 	m.Start(context.Background(), "ge-0-0-3", AFInet)
 	waitForRunning(t, m, 0) // terminal exit must clear the registry
@@ -380,4 +381,36 @@ func TestReconcilePrunesOptionStateForDeregisteredClients(t *testing.T) {
 	if got := fr.startCount("fxp0", AFInet); got != 1 {
 		t.Fatalf("v4 starts = %d, want 1 (no resurrection)", got)
 	}
+}
+
+// TestStartRefusesUnconfiguredClient pins the invariant that closes
+// the round-5 TOCTOU from the Codex review on PR #1815: the
+// desired-set membership check is inside Start's registration lock,
+// so Start refuses to register a client for a key with no option
+// state. Renew relies on this — its own membership view can go stale
+// between the done-wait and the Start call, but Start's cannot.
+func TestStartRefusesUnconfiguredClient(t *testing.T) {
+	fr := newFakeRunner(false)
+	m := NewManagerForTesting(fr.run)
+
+	if m.Start(context.Background(), "fxp0", AFInet) {
+		t.Fatal("Start should refuse a v4 client with no option state")
+	}
+	if m.Start(context.Background(), "fxp0", AFInet6) {
+		t.Fatal("Start should refuse a v6 client with no option state")
+	}
+	if h := m.RunningClientHandlesForTesting(); len(h) != 0 {
+		t.Fatalf("registry should be empty, got %v", h)
+	}
+	if got := fr.startCount("fxp0", AFInet); got != 0 {
+		t.Fatalf("runner invoked %d times, want 0", got)
+	}
+
+	// With option state installed, the same Start succeeds.
+	m.SetDHCPv4Options("fxp0", &DHCPv4Options{})
+	if !m.Start(context.Background(), "fxp0", AFInet) {
+		t.Fatal("Start should run a configured client")
+	}
+	waitForRunning(t, m, 1)
+	m.StopAll()
 }

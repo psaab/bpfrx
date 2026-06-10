@@ -200,13 +200,35 @@ func (m *Manager) DelegatedPrefixesForRA() []PDRAMapping {
 }
 
 // Start begins a DHCP client for the given interface and address family.
-func (m *Manager) Start(ctx context.Context, ifaceName string, af AddressFamily) {
+// Start reports whether a client for the key is registered when it
+// returns: true if this call started one or one was already running,
+// false if the key has no option state (the desired-config signal —
+// SetDHCPv*Options/Reconcile install it, Reconcile prunes it for
+// removed clients). The membership check lives INSIDE the registration
+// lock so check-and-register is atomic: a Renew racing a removal
+// Reconcile cannot observe membership, lose the lock, and register a
+// client for a key the Reconcile just deconfigured (Codex review on
+// PR #1815, round 5).
+func (m *Manager) Start(ctx context.Context, ifaceName string, af AddressFamily) bool {
 	key := clientKey{iface: ifaceName, family: af}
 
 	m.mu.Lock()
 	if _, exists := m.clients[key]; exists {
 		m.mu.Unlock()
-		return
+		return true
+	}
+	desired := false
+	switch af {
+	case AFInet:
+		_, desired = m.v4opts[ifaceName]
+	case AFInet6:
+		_, desired = m.v6opts[ifaceName]
+	}
+	if !desired {
+		m.mu.Unlock()
+		slog.Info("DHCP: start refused; no option state for client",
+			"interface", ifaceName, "family", af)
+		return false
 	}
 
 	// Use an independent context so DHCP clients are decoupled from the
@@ -246,6 +268,7 @@ func (m *Manager) Start(ctx context.Context, ifaceName string, af AddressFamily)
 			m.runDHCPv6(cctx, ifaceName)
 		}
 	}()
+	return true
 }
 
 // finishClient runs in the client goroutine's defer on every exit path.
@@ -306,34 +329,19 @@ func (m *Manager) Renew(ifaceName string) error {
 		dc.cancel()
 		<-dc.done
 
-		// Re-check config membership before restarting: Renew is
-		// reachable from gRPC outside applySem, so a concurrent
-		// Reconcile may have removed this client from config after we
-		// captured dc above. Reconcile prunes the option-state map
-		// entries for ALL undesired keys under m.mu — including keys
-		// whose client already deregistered via finishClient — so
-		// membership here is exactly the desired-set signal in every
-		// interleaving. Restarting unconditionally would resurrect a
-		// client the operator just deconfigured (Codex review on PR
-		// #1815, rounds 3-4).
-		m.mu.Lock()
-		stillDesired := false
-		switch af {
-		case AFInet:
-			_, stillDesired = m.v4opts[ifaceName]
-		case AFInet6:
-			_, stillDesired = m.v6opts[ifaceName]
-		}
-		m.mu.Unlock()
-		if !stillDesired {
+		// Restart. Renew is reachable from gRPC outside applySem, so a
+		// concurrent Reconcile may have removed this client from
+		// config after we captured dc above; Start performs the
+		// desired-set membership check atomically with registration
+		// (under m.mu) and refuses to resurrect a deconfigured client
+		// — a check here would go stale before Start takes the lock
+		// (Codex review on PR #1815, rounds 3-5).
+		if !m.Start(context.Background(), ifaceName, af) {
 			slog.Info("DHCP: renew skipped restart; client removed from config",
 				"interface", ifaceName, "family", af)
 			continue
 		}
 		renewed = true
-
-		// Restart
-		m.Start(context.Background(), ifaceName, af)
 		slog.Info("DHCP client renewed", "interface", ifaceName, "family", af)
 	}
 	if !renewed {
