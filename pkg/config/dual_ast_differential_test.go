@@ -47,6 +47,13 @@ type dualASTCase struct {
 	// requires such a case to fail; when U5b fixes it, the marker must
 	// be flipped to false in the same change.
 	expectedFail bool
+	// failureClass pins WHICH failure class an expectedFail case must
+	// produce (a substring of the failure string, e.g. "compiler
+	// dual-AST" or "round-trip infidelity (content)"). A different
+	// class — a panic, parser error, or new round-trip regression —
+	// fails the suite instead of hiding behind the marker (AGY r1 on
+	// PR #1811).
+	failureClass string
 	// reason names the tracking issue / one-line diagnosis for an
 	// expectedFail case.
 	reason string
@@ -104,6 +111,7 @@ var dualASTCases = []dualASTCase{
     }
 }`,
 		expectedFail: true,
+		failureClass: "compiler dual-AST",
 		reason: "#1796: compileVRRPGroup reads only node.Children; flat-set " +
 			"encodes each property in Keys, so virtual-address/priority/... are dropped",
 	},
@@ -288,6 +296,7 @@ var dualASTCases = []dualASTCase{
     }
 }`,
 		expectedFail: true,
+		failureClass: "compiler dual-AST",
 		reason: "compileNATSource pool address block form double-appends: nodeVal() " +
 			"falls back to Children[0].Name() AND the explicit Children loop appends " +
 			"again, so hierarchical compiles Addresses=[x x] vs flat-set [x]",
@@ -435,6 +444,7 @@ system {
     dataplane-type userspace;
 }`,
 		expectedFail: true,
+		failureClass: "compiler dual-AST",
 		reason: "reverse dual-AST gap: compileClassOfService reads only the braced " +
 			"loss-priority container shape; the inline hierarchical leaf " +
 			"(Keys-encoded) is silently dropped, while the flat-set replay is " +
@@ -565,6 +575,7 @@ system {
     }
 }`,
 		expectedFail: true,
+		failureClass: "round-trip infidelity (content)",
 		reason: "round-trip infidelity: setSchema models name-server as a " +
 			"single-value leaf (args:1, no multi), so SetPath REPLACES on the " +
 			"second `set system name-server <addr>` — last value wins, first lost",
@@ -639,6 +650,7 @@ services {
     }
 }`,
 		expectedFail: true,
+		failureClass: "compiler dual-AST",
 		reason: "#1797: dhcp-relay missing from setSchema (flat-set collapses to one " +
 			"leaf) and compileDHCPRelay reads only Children — relay compiles empty",
 	},
@@ -679,6 +691,12 @@ func TestDualASTDifferential(t *testing.T) {
 					t.Fatalf("expectedFail case %q PASSED — the dual-AST gap (%s) "+
 						"appears fixed; flip its expectedFail marker to false (U5b contract)",
 						tc.name, tc.reason)
+				}
+				if tc.failureClass != "" && !strings.Contains(failure, tc.failureClass) {
+					t.Fatalf("expectedFail case %q failed with the WRONG class — "+
+						"expected class %q, got:\n%s\nA different failure class "+
+						"means a NEW defect is hiding behind the marker (AGY r1).",
+						tc.name, tc.failureClass, failure)
 				}
 				t.Logf("expected dual-AST failure (tracked: %s):\n%s", tc.reason, failure)
 				return
@@ -739,13 +757,19 @@ func runDualASTCase(t *testing.T, tc dualASTCase) string {
 	hierSet := hierTree.FormatSet()
 	flatSet := flatTree.FormatSet()
 	if hierSet != flatSet {
-		class := "round-trip infidelity (content)"
 		if sortedLines(hierSet) == sortedLines(flatSet) {
-			class = "round-trip infidelity (ordering only)"
+			// Ordering-only differences are semantically equivalent set
+			// programs (SetPath merges repeated/split containers). Warn
+			// for visibility and continue to the compiler diff — the
+			// actual oracle. Failing here would false-fail legitimate
+			// fixtures (AGY r1 on PR #1811).
+			t.Logf("note: ordering-only FormatSet round-trip difference (tolerated)")
+		} else {
+			return fmt.Sprintf("round-trip infidelity (content) failure class: "+
+				"FormatSet of re-parsed flat tree differs from hierarchical tree\n"+
+				"--- hierarchical FormatSet ---\n%s"+
+				"--- flat-replay FormatSet ---\n%s", hierSet, flatSet)
 		}
-		return fmt.Sprintf("%s failure class: FormatSet of re-parsed flat tree "+
-			"differs from hierarchical tree\n--- hierarchical FormatSet ---\n%s"+
-			"--- flat-replay FormatSet ---\n%s", class, hierSet, flatSet)
 	}
 
 	// Step 5: compile both shapes with the same entry the existing
