@@ -4836,3 +4836,6 @@ top.
 - **Timestamp**: 2026-06-10 14:30
   - **Action**: PR-1b observability + docs — show services ip-monitoring status (cmdtree + local CLI + remote CLI + gRPC topic, shared ipmon.FormatStatus renderer), Prometheus xpf_ipmon_policy_failed/transitions_total/routes_applied (+ descriptor-coverage canary fixture), docs/multi-wan.md, pkg/ipmon/README.md, pkg/frr/README.md, pkg/daemon/README.md, CLAUDE.md feature line.
   - **File(s)**: pkg/cmdtree/tree.go, pkg/cli/{cli,cli_show_services}.go, cmd/cli/show.go, pkg/grpcapi/{server,server_show,server_show_security_text}.go, pkg/api/{server,metrics,metrics_descriptors,metrics_system,metrics_descriptor_coverage_test}.go, docs/multi-wan.md, pkg/ipmon/README.md, pkg/frr/README.md, pkg/daemon/README.md, CLAUDE.md
+- **Timestamp**: 2026-06-10
+  **Action**: #1844 research plan v1 drafted (DHCP-learned next-hops for ip-monitoring preferred routes; targets post-#1843 tree)
+  **File(s)**: docs/research/1844-dhcp-nexthop/plan.md
