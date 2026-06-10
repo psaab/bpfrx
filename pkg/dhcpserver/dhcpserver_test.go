@@ -338,3 +338,56 @@ func TestParseLeaseCSV_QuotedHostname(t *testing.T) {
 		t.Errorf("subnet_id shifted: got %q", leases[0].SubnetID)
 	}
 }
+
+// TestApplyStopsDeactivatingUnit pins the Codex finding on PR #1835:
+// a unit reported "deactivating" can have a queued start behind it, so
+// the reconcile must treat it as active-for-stop (unitIsActive returns
+// true for it; here the seam simulates that directly).
+func TestApplyStopsDeactivatingUnit(t *testing.T) {
+	dir := t.TempDir()
+	var stopped []string
+	m := NewManagerForTesting(
+		dir+"/kea4.conf", dir+"/kea6.conf",
+		func(args ...string) error {
+			if len(args) > 0 && args[0] == "stop" {
+				stopped = append(stopped, args[len(args)-1])
+			}
+			return nil
+		},
+		func(unit string) bool { return true },
+	)
+	if err := m.Apply(nil); err != nil {
+		t.Fatalf("Apply(nil): %v", err)
+	}
+	if len(stopped) != 2 {
+		t.Fatalf("stopped = %v, want both kea units", stopped)
+	}
+}
+
+// TestGenerateKea6RejectsMultiInterfaceGroup pins the second Codex
+// finding on PR #1835: Kea v6 subnet selection cannot fall back to
+// address matching (clients use link-local sources), so a
+// multi-interface v6 group must be rejected loudly rather than
+// silently losing its subnet6 interface selector.
+func TestGenerateKea6RejectsMultiInterfaceGroup(t *testing.T) {
+	dir := t.TempDir()
+	m := NewManagerForTesting(
+		dir+"/kea4.conf", dir+"/kea6.conf",
+		func(...string) error { return nil },
+		func(string) bool { return false },
+	)
+	cfg := &config.DHCPServerConfig{
+		DHCPv6LocalServer: &config.DHCPLocalServerConfig{},
+	}
+	cfg.DHCPv6LocalServer.Groups = map[string]*config.DHCPServerGroup{"lan": {
+		Name:       "lan",
+		Interfaces: []string{"ge-0/0/1", "ge-0/0/2"},
+		Pools: []*config.DHCPPool{{
+			Subnet: "2001:db8::/64", RangeLow: "2001:db8::100", RangeHigh: "2001:db8::200",
+		}},
+	}}
+	err := m.Apply(cfg)
+	if err == nil || !strings.Contains(err.Error(), "single interface selector") {
+		t.Fatalf("want multi-interface v6 rejection, got %v", err)
+	}
+}

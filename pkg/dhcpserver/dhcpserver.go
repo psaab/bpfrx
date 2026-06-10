@@ -57,7 +57,13 @@ func unitIsActive(unit string) bool {
 	cmd.WaitDelay = 5 * time.Second
 	out, _ := cmd.Output()
 	switch strings.TrimSpace(string(out)) {
-	case "active", "activating", "reloading":
+	case "active", "activating", "reloading", "deactivating":
+		// "deactivating" counts as active-for-stop (Codex review on PR
+		// #1835): a previous daemon or external restart job can be
+		// mid-stop with a queued start behind it — skipping the stop
+		// here would let that queued start resurrect Kea after this
+		// commit removed its config. An extra stop on a unit that was
+		// going down anyway is harmless.
 		return true
 	}
 	return false
@@ -376,6 +382,15 @@ func (m *Manager) generateKea6Config(cfg *config.DHCPServerConfig) error {
 				sub.Pools = append(sub.Pools, keaPool{
 					Pool: fmt.Sprintf("%s - %s", pool.RangeLow, pool.RangeHigh),
 				})
+			}
+			// Kea v6 subnet selection cannot fall back to address
+			// matching the way v4 can (clients talk from link-local
+			// source addresses), so subnet6 REQUIRES the interface
+			// selector — silently omitting it for a multi-interface
+			// group would orphan the subnet (Codex review on PR
+			// #1835). Reject loudly; the operator splits the group.
+			if len(group.Interfaces) > 1 {
+				return fmt.Errorf("DHCPv6 group spanning interfaces %v: Kea subnet6 requires a single interface selector — split the group per interface", group.Interfaces)
 			}
 			sub.Interface = subnetInterface(group)
 			if len(pool.DNSServers) > 0 {
