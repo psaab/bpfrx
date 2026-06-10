@@ -49,8 +49,8 @@ func TestApplyFullPreferredRoutes(t *testing.T) {
 	got := string(data)
 
 	wants := []string{
-		"ip route 0.0.0.0/0 172.16.80.1 1\n",            // master v4 distance 1
-		"ipv6 route ::/0 2001:db8:80::1 1\n",            // master v6 distance 1
+		"ip route 0.0.0.0/0 172.16.80.1 1\n",             // master v4 distance 1
+		"ipv6 route ::/0 2001:db8:80::1 1\n",             // master v6 distance 1
 		"ip route 0.0.0.0/0 172.16.80.1 1 vrf vrf-ISP-B", // per-VRF distance 1
 	}
 	for _, want := range wants {
