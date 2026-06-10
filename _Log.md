@@ -1,5 +1,34 @@
 # Action Log
 
+## 2026-06-10 — #1824 proptest harness for frame parse/NAT/TSO
+- **Timestamp**: 2026-06-10 UTC
+- **Action**: Implemented the #1824 in-tree proptest harness per the
+  CONVERGED plan (docs/research/1824-fuzz-harness/plan.md, Option A).
+  New `frame/prop_tests/` directory module (strategies, full-recompute
+  checksum oracle, S1 parse properties P-I1..P-I5, S2 NAT properties
+  P-N1..P-N4 with descriptor-vs-generic differential, S4 TSO
+  properties P-T1..P-T4), `cfg(all(test, not(miri)))`, proptest as a
+  dev-dependency only (release binary verified byte-neutral to the
+  dep; loadable sections bit-identical overall). Filed and pinned the
+  three plan §10-D production divergences BEFORE landing the tests:
+  #1838 (generic v6 NAT path assumes L4 at offset 40), #1839 (v6
+  0x0000→0xFFFF canonicalization scope mismatch), #1840
+  (family-ungated UDP zero-checksum skip) — generators exclude those
+  domains, deterministic pins assert current behavior. Mutation
+  spot-check proved both oracles bite (0xFEFF TTL-term drop caught by
+  P-N3; ihl<20 floor drop caught by P-I2/P-I3); llvm-cov shows the v6
+  ext-header walk arms 43/51/44/59 all executed under the harness.
+  Committed proptest-regressions corpus (incl. the mutation-killing
+  seeds and the shrunk input for the harness-composition fix in
+  apply_nat_family). Evidence:
+  docs/pr/1824-proptest-harness/validation.md.
+- **File(s)**: userspace-dp/Cargo.toml, userspace-dp/Cargo.lock,
+  userspace-dp/src/afxdp/frame/mod.rs,
+  userspace-dp/src/afxdp/frame/prop_tests/{mod,strategies,oracle,inspect,rewrite,segment}.rs,
+  userspace-dp/proptest-regressions/afxdp/frame/prop_tests/{inspect,rewrite}.txt,
+  userspace-dp/src/afxdp/frame/README.md,
+  docs/pr/1824-proptest-harness/validation.md, _Log.md
+
 ## 2026-05-29 — #1641 NAT64 reverse-path Ethernet padding fix
 - **Timestamp**: 2026-05-29 UTC
 - **Action**: Fixed `translate_v4_to_v6` in the userspace-dp NAT64
@@ -4758,6 +4787,60 @@ top.
   **Action**: "#1805 commit 2 — api bounded request-path exec: new exec_timeout.go (runTimeout only — sole raw sites are power actions; Output variants live in grpcapi sibling), converted system.go reboot/halt to runTimeout(context.Background()), WaitDelay=5s U3-parity on ping/traceroute handlers, tests, README gotcha"
   **File(s)**: pkg/api/exec_timeout.go, pkg/api/exec_timeout_test.go, pkg/api/system.go, pkg/api/README.md
 
+- **Timestamp**: 2026-06-10 09:55
+  **Action**: #1778 commit 1 — Kea manager authoritative systemd reconcile +
+  fail-closed Apply; replaced process-local running4/running6 booleans with
+  `systemctl is-active` queries; added test seams (pkg/dhcp convention) and
+  manager-level regression tests; README contract update.
+  **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/test_seams.go,
+  pkg/dhcpserver/dhcpserver_test.go, pkg/dhcpserver/README.md
+
+- **Timestamp**: 2026-06-10 09:57
+  **Action**: #1778 commit 2 — daemon apply path calls dhcpServer.Apply
+  unconditionally in standalone mode (stale-Kea/stanza-removal reconcile),
+  reconciles cluster no-config case, and surfaces standalone Kea failures
+  through the commit via deferred dhcpServerErr (boot path stays lenient).
+  **File(s)**: pkg/daemon/daemon_apply.go
+
+- **Timestamp**: 2026-06-10 10:00
+  **Action**: #1778 commit 3 — secondaries: multi-interface group subnet
+  binding (omit per-subnet binding, address-based selection) + lease CSV
+  parsing via encoding/csv; tests + README gotchas.
+  **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/dhcpserver_test.go,
+  pkg/dhcpserver/README.md
+
+- **Timestamp**: 2026-06-10 (AGY fold) F1
+  **Action**: #1835 AGY F1 — warn at generate time when two v4 groups
+  share/overlap subnets and an involved group emits no per-subnet interface
+  selector (ambiguous Kea selection); warn seam + tests.
+  **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/test_seams.go,
+  pkg/dhcpserver/dhcpserver_test.go
+
+- **Timestamp**: 2026-06-10 (AGY fold) F2
+  **Action**: #1835 AGY F2 — Manager.ApplyAsync (1-slot latest-wins mailbox +
+  singleton worker) so VRRP transitions never block on 15s systemctl; converted
+  all four daemon_ha.go Kea call sites (incl. Clear→ApplyAsync(nil)); tests for
+  never-blocks, latest-wins coalescing, single worker; README.
+  **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/dhcpserver_test.go,
+  pkg/dhcpserver/README.md, pkg/daemon/daemon_ha.go
+
+- **Timestamp**: 2026-06-10 (AGY fold) F3
+  **Action**: #1835 AGY F3 — ApplyClusterCommit: cluster-mode commits always
+  regenerate Kea configs (master-RG filtered) and restart only active units,
+  fail-closed via dhcpServerErr; daemon_apply cluster branch converted; tests
+  + README.
+  **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/dhcpserver_test.go,
+  pkg/dhcpserver/README.md, pkg/daemon/daemon_apply.go
+
+- **Timestamp**: 2026-06-10 (Codex confirm fold) F2 redesign
+  **Action**: #1835 — replaced the channel drain-loop mailbox (ABA hole 1) with
+  gen-ordered supersession: applyGen at call entry for ALL appliers, mu-guarded
+  pendingAsync slot (overwrite only by higher gen) + cap-1 notify channel,
+  lastAppliedGen skip in shared apply body (hole 2: queued async vs sync
+  commit); Clear delegates to Apply(nil); new gen-deterministic tests, all
+  under -race; README updated.
+  **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/dhcpserver_test.go,
+  pkg/dhcpserver/README.md
 - **Timestamp**: 2026-06-10
   **Action**: "#1777 — DHCP client commits successful T1/T2 renewals instead of discarding them: new shared commitLease path (commit.go: renewalTimers, leaseContentChanged, delegatedPrefixesChanged, commitLease) used by acquisition + T1 renew + T2 rebind for both families; run loops restructured with an inner renewal loop that returns to the T1 wait on success and falls back to re-acquisition only on dual failure; onAddressChange fires only on lease-content change; applyAddress nil-netlink guard for test-constructed Managers; table tests in commit_test.go; README renewal-semantics section"
   **File(s)**: pkg/dhcp/commit.go, pkg/dhcp/commit_test.go, pkg/dhcp/dhcp.go, pkg/dhcp/README.md
@@ -4790,6 +4873,16 @@ top.
   **File(s)**: pkg/api/exec_timeout.go, pkg/api/exec_timeout_test.go, pkg/api/system.go, pkg/api/README.md
 
 - **Timestamp**: 2026-06-10
+  **Action**: "#1830 (e) — remove 32-worker rotation scratch cap: V8RotationScratch heap scratch (Mutex, sized to true worker count at lease construction; uncontended by seqlock-winner construction; zero alloc at rotation) replaces fixed [_;32] stack arrays in maybe_rotate_epoch_v8; drop active_outside_scratch + its UnsampledActiveWorker fail-open; retire the Go #1733 commit gate (MaxEqualFlowWorkers, validateEqualFlowWorkerCapStrict, lenientEqualFlowWorkerCap, configstore warnEqualFlowWorkerCap) + rewrite both gate test files as retirement pins; new Rust >32-worker regression tests; docs/cos-traffic-shaping.md updated"
+  **File(s)**: userspace-dp/src/afxdp/types/shared_cos_lease/{mod.rs,rotate_epoch_v8.rs,publish_equal_flow_epoch_v8.rs,shared_cos_lease_tests.rs}, pkg/config/{compiler.go,compiler_equal_flow_worker_cap_test.go}, pkg/configstore/{store.go,equal_flow_worker_cap.go (deleted),equal_flow_worker_cap_test.go}, pkg/cli/cli_show_interfaces.go, pkg/grpcapi/server_show_interfaces.go, docs/cos-traffic-shaping.md
+
+- **Timestamp**: 2026-06-10
+  **Action**: "#1830 (g) — bucket-vs-flow occupancy telemetry: CoSQueueStatus gains wire-additive flow_fair_buckets_occupied (SUM of instantaneous occupied SFQ buckets across worker instances + workers; queue_row.rs + coordinator/mod.rs) and flow_fair_flows_active (flow-cache active-window flows per (ifindex,queue), summed across workers; new overlay_cos_flow_fair_flow_counts in coordinator/status.rs). Fixture regen (2 keys) + Rust roundtrip/key-absent pin + Go mirror pin; Go protocol.go fields; pkg/api gauges xpf_userspace_cos_flow_fair_{buckets_occupied,flows_active} + emitter + emit-level test + descriptor-coverage canary entries; docs/fairness-regimes.md metric docs with collision-vs-demand interpretation contract"
+  **File(s)**: userspace-dp/src/protocol/{cos.rs,tests.rs}, userspace-dp/tests/fixtures/protocol_wire_v1.json, userspace-dp/src/afxdp/worker/cos/queue_row.rs, userspace-dp/src/afxdp/coordinator/{mod.rs,status.rs}, pkg/dataplane/userspace/{protocol.go,protocol_test.go}, pkg/api/{metrics.go,metrics_descriptors.go,metrics_userspace.go,metrics_test.go,metrics_descriptor_coverage_test.go}, docs/fairness-regimes.md
+
+- **Timestamp**: 2026-06-10
+  **Action**: "#1830 follow-up (Codex blocker on PR #1841) — sparse worker-id lease sizing: new WorkerManager.last_planned_worker_slots (max planned worker id + 1, derived by new planned_worker_slots() helper in reconcile/bringup.rs) feeds build_shared_cos_queue_leases_reusing_existing + build_shared_cos_queue_vtime_floors_reusing_existing instead of last_planned_workers (the COUNT, kept for status/stage-label consumers); 3 new coordinator tests (sparse derivation, 41-slot lease acquire_v8(40) in-range + matches_config_v8 keying, no-false-reuse on slot change + floor sizing); docs/cos-traffic-shaping.md wording updated"
+  **File(s)**: userspace-dp/src/afxdp/coordinator/{worker_manager.rs,mod.rs,reconcile/bringup.rs,tests.rs}, docs/cos-traffic-shaping.md
   **Action**: "#1826 cleanup batch (residue from #1663 close-out), 8 commits on engineer/1826-cleanup: (1) consolidate 8x-duplicated PROTO_* constants into new src/ip_proto.rs (pure refactor, pub(super) use re-exports preserve sibling references); (2) dedupe local SOL_XDP in bpf_map/diagnose_raw_ring_state against the canonical afxdp/mod.rs const (reached via use super::*); (3) SAFETY comments for the #1663-1.3 unsafe sites — canonical `area` raw-pointer contract at process_binding_rx + poll_binding_process_descriptor header, per-site references, test-site justifications in neighbor_dispatch, clock_gettime FFI note; (4) release-visible invariant-violation counters (static AtomicU64 + first-hit eprintln, local-only, NOT wire-plumbed) at the 2 release-invisible debug_assert sites (producer decrement_if_positive underflow, shared_cos_lease worker_grant_bump overflow); (5) drop stale dead_code allows on DataplaneEventKind enum+impl (now fully consumed by producer.rs); wg/mod.rs module-wide allow re-verified still load-bearing (16 dead-code warnings without it) and annotated. Gates: release warnings: base 139 → head 138 (2 stale allows removed exposed 2 test-pinned consts → targeted re-allows; 1 PROTO_GRE allow retired via central import); full cargo test --release 1779/0 (one known-flaky failure each at base [tx_latency_hist skew] and head [worker_queue concurrent_recovery], both pass on rerun/isolation, both in untouched modules); 5x flake loop on touched-module filters 847 passed x5, 0 failed"
   **File(s)**: userspace-dp/src/ip_proto.rs (new), userspace-dp/src/main.rs, userspace-dp/src/{session/mod.rs,filter/mod.rs,policy.rs,nat64.rs,nat/destination.rs,screen/packet.rs}, userspace-dp/src/afxdp/{mod.rs,flow_cache_tests.rs,bpf_map/mod.rs,neighbor_dispatch.rs,wg/mod.rs}, userspace-dp/src/afxdp/worker/{lifecycle.rs,mod.rs}, userspace-dp/src/afxdp/poll_descriptor/mod.rs, userspace-dp/src/afxdp/types/shared_cos_lease/mod.rs, userspace-dp/src/event_stream/{codec.rs,producer.rs}
   **Action**: "#1831 commit 1 — export the per-binding V_min throttle counters (#941/#943, already on the BindingStatus wire since protocol.go:1197-1198; verified Rust serializes them in protocol/binding.rs — no Rust change) to Prometheus following the #1771-§2.6/#1807 pattern: two NewDesc with {binding_slot,queue_id,worker_id,iface} labels + Describe + emitBindingVMinThrottleCounters per-binding loop (emits 0s, counters CounterValue); descriptor-coverage canary fixture+want-list extended; emit-level label/value/type pin test incl. zero-binding; fairness-regimes.md metric catalog entries"

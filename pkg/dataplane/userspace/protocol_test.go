@@ -1537,6 +1537,14 @@ func TestCoSQueueStatusSojournRoundTrip(t *testing.T) {
 		SojournEwmaNS:        2500000,
 		SojournPeakNS:        9000000,
 		SojournWindowedMinNS: 1750000,
+// #1830 (g): wire pin for the bucket-vs-flow occupancy fields on
+// CoSQueueStatus. Mirrors the Rust
+// cos_queue_status_flow_fair_occupancy_roundtrip_1830 test — a rename
+// on either side fails a test instead of silently decoding zero.
+func TestCoSQueueStatusFlowFairOccupancyRoundTrip(t *testing.T) {
+	in := CoSQueueStatus{
+		FlowFairBucketsOccupied: 9,
+		FlowFairFlowsActive:     12,
 	}
 	raw, err := json.Marshal(&in)
 	if err != nil {
@@ -1550,6 +1558,8 @@ func TestCoSQueueStatusSojournRoundTrip(t *testing.T) {
 		"sojourn_ewma_ns",
 		"sojourn_peak_ns",
 		"sojourn_windowed_min_ns",
+		"flow_fair_buckets_occupied",
+		"flow_fair_flows_active",
 	} {
 		if _, ok := obj[key]; !ok {
 			t.Fatalf("wire key %q missing from CoSQueueStatus JSON: %s", key, string(raw))
@@ -1565,11 +1575,18 @@ func TestCoSQueueStatusSojournRoundTrip(t *testing.T) {
 	}
 
 	// Pre-#1829 helper payload (keys absent) must decode to zero.
+	if back.FlowFairBucketsOccupied != 9 || back.FlowFairFlowsActive != 12 {
+		t.Fatalf("round-trip mismatch: got %+v, want %+v", back, in)
+	}
+
+	// Pre-#1830 helper payload (keys absent) must decode to zero.
 	var legacy CoSQueueStatus
 	if err := json.Unmarshal([]byte(`{}`), &legacy); err != nil {
 		t.Fatalf("unmarshal legacy CoSQueueStatus: %v", err)
 	}
 	if legacy.SojournEwmaNS != 0 || legacy.SojournPeakNS != 0 || legacy.SojournWindowedMinNS != 0 {
 		t.Fatalf("legacy decode must zero-default #1829 fields: %+v", legacy)
+	if legacy.FlowFairBucketsOccupied != 0 || legacy.FlowFairFlowsActive != 0 {
+		t.Fatalf("legacy decode must zero-default #1830 fields: %+v", legacy)
 	}
 }

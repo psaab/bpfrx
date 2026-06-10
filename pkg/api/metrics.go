@@ -128,6 +128,10 @@ type xpfCollector struct {
 	cosSojournEwmaNS        *prometheus.Desc
 	cosSojournPeakNS        *prometheus.Desc
 	cosSojournWindowedMinNS *prometheus.Desc
+	// #1830 (g): bucket-vs-flow occupancy gauges for flow-fair CoS
+	// queues (collision-vs-demand unfairness diagnosis).
+	cosFlowFairBucketsOccupied *prometheus.Desc
+	cosFlowFairFlowsActive     *prometheus.Desc
 	// #869: per-worker busy/idle runtime counters.
 	workerWallSecs                           *prometheus.Desc
 	workerActiveSecs                         *prometheus.Desc
@@ -351,6 +355,8 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.cosSojournEwmaNS
 	ch <- c.cosSojournPeakNS
 	ch <- c.cosSojournWindowedMinNS
+	ch <- c.cosFlowFairBucketsOccupied
+	ch <- c.cosFlowFairFlowsActive
 	ch <- c.workerWallSecs
 	ch <- c.workerActiveSecs
 	ch <- c.workerIdleSpinSecs

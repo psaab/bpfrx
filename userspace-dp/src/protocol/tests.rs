@@ -1057,6 +1057,17 @@ fn cos_queue_status_sojourn_roundtrip_1829() {
         sojourn_ewma_ns: 2_500_000,
         sojourn_peak_ns: 9_000_000,
         sojourn_windowed_min_ns: 1_750_000,
+// #1830 (g): round-trip + backward-compat pin for the bucket-vs-flow
+// occupancy telemetry. The wire keys feed
+// pkg/dataplane/userspace/protocol.go and the Prometheus gauges
+// `xpf_userspace_cos_flow_fair_buckets_occupied` /
+// `xpf_userspace_cos_flow_fair_flows_active` — a rename on either side
+// must fail a test instead of silently decoding zero.
+#[test]
+fn cos_queue_status_flow_fair_occupancy_roundtrip_1830() {
+    let status = CoSQueueStatus {
+        flow_fair_buckets_occupied: 9,
+        flow_fair_flows_active: 12,
         ..Default::default()
     };
     let value: serde_json::Value =
@@ -1077,6 +1088,16 @@ fn cos_queue_status_sojourn_roundtrip_1829() {
         "sojourn_peak_ns",
         "sojourn_windowed_min_ns",
     ] {
+    assert_eq!(value["flow_fair_buckets_occupied"], 9u64);
+    assert_eq!(value["flow_fair_flows_active"], 12u64);
+    let back: CoSQueueStatus = serde_json::from_value(value).expect("deserialize CoSQueueStatus");
+    assert_eq!(back.flow_fair_buckets_occupied, 9);
+    assert_eq!(back.flow_fair_flows_active, 12);
+
+    // Pre-#1830 payload (keys absent) must decode with zero defaults.
+    let mut legacy_value = serde_json::to_value(CoSQueueStatus::default())
+        .expect("serialize default CoSQueueStatus");
+    for key in ["flow_fair_buckets_occupied", "flow_fair_flows_active"] {
         legacy_value
             .as_object_mut()
             .expect("CoSQueueStatus serializes to an object")
@@ -1088,6 +1109,9 @@ fn cos_queue_status_sojourn_roundtrip_1829() {
     assert_eq!(legacy.sojourn_ewma_ns, 0);
     assert_eq!(legacy.sojourn_peak_ns, 0);
     assert_eq!(legacy.sojourn_windowed_min_ns, 0);
+        serde_json::from_value(legacy_value).expect("pre-#1830 payload decodes");
+    assert_eq!(legacy.flow_fair_buckets_occupied, 0);
+    assert_eq!(legacy.flow_fair_flows_active, 0);
 }
 
 #[test]

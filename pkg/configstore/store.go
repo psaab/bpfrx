@@ -141,14 +141,12 @@ func (s *Store) Load() error {
 			"path", p, "issue", "#1798")
 	}
 
-	// #1733: tolerate (warn, don't reject) an already-persisted
-	// workers>32 + equal-flow-enforcement config on local boot so an
-	// upgraded node does not blackout-boot. See compileTreeLenient.
+	// Tolerant compile: an already-persisted config must boot through
+	// (see compileTreeLenient for the validator downgrades).
 	compiled, err := s.compileTreeLenient(tree)
 	if err != nil {
 		return fmt.Errorf("compile config: %w", err)
 	}
-	warnEqualFlowWorkerCap(compiled, LoadCaller)
 
 	s.active = tree
 	s.compiled = compiled
@@ -310,30 +308,25 @@ func (s *Store) compileTree(tree *config.ConfigTree) (*config.Config, error) {
 	return config.CompileConfig(tree)
 }
 
-// compileTreeLenient is compileTree with the #1733 equal-flow worker-cap
-// validator downgraded to a warning. It is used ONLY by the passive
-// load (Store.Load) and HA peer-sync (Store.SyncApply) ingress paths, NOT
-// by any operator-driven candidate commit / commit-check path.
+// compileTreeLenient is compileTree with the tolerant-path validator
+// downgrades enabled (config.CompileConfigLenient /
+// CompileConfigForNodeLenient: #1798 control-char sanitize, lenient
+// VRRP track duplicates). It is used ONLY by the passive load
+// (Store.Load) and HA peer-sync (Store.SyncApply) ingress paths, NOT by
+// any operator-driven candidate commit / commit-check path.
 //
 // Rationale: Store.Load and Store.SyncApply compile a config the operator
 // did NOT just author — a persisted active config on local boot, or a
-// config pushed from a possibly-un-upgraded cluster primary. After the
-// commit-time worker-cap gate (#1733) lands, a strict reject here would
-// (a) fail Store.Load on an upgraded node carrying a legacy
-// workers>32 + equal-flow config, leaving the daemon with no active
-// config (operational blackout), and (b) fail Store.SyncApply on an
-// upgraded standby receiving such a config from an un-upgraded primary,
-// alarm-looping HA config sync. The dataplane already silently fail-opens
-// equal-flow above MaxEqualFlowWorkers, so tolerating the config with a
-// loud warning preserves the exact running behavior while surfacing the
-// condition; the operator's next strict candidate commit rejects it.
+// config pushed from a possibly-un-upgraded cluster primary. A strict
+// reject here would (a) fail Store.Load on an upgraded node carrying a
+// legacy config, leaving the daemon with no active config (operational
+// blackout), and (b) fail Store.SyncApply on an upgraded standby
+// receiving such a config from an un-upgraded primary, alarm-looping HA
+// config sync. The operator's next strict candidate commit rejects it.
 //
-// This mirrors the rewriteRetiredDataplaneType tolerance bridge (which
-// runs just before compile on these same two paths) but uses validator
-// leniency rather than AST mutation, so the effective worker count is
-// computed by the real compiler (post-group-expansion, per-node) and the
-// warning fires on EXACTLY the configs the strict reject would — no
-// false-positive on a config whose effective per-node workers are <= cap.
+// (The original #1733 equal-flow worker-cap downgrade that motivated
+// this split was retired in #1830 (e) — the dataplane no longer caps
+// equal-flow-enforcement at 32 workers.)
 func (s *Store) compileTreeLenient(tree *config.ConfigTree) (*config.Config, error) {
 	if err := s.schemaValidateExpandedTree(tree); err != nil {
 		return nil, err
@@ -405,14 +398,13 @@ func (s *Store) SyncApply(content string, chassisPreserve func(*config.ConfigTre
 			"path", p, "issue", "#1798")
 	}
 
-	// #1733: tolerate (warn, don't reject) a workers>32 + equal-flow
-	// config peer-synced from a possibly-un-upgraded primary so HA config
-	// sync does not alarm-loop. See compileTreeLenient.
+	// Tolerant compile: a config peer-synced from a possibly-un-upgraded
+	// primary must not alarm-loop HA sync (see compileTreeLenient for
+	// the validator downgrades).
 	compiled, err := s.compileTreeLenient(tree)
 	if err != nil {
 		return nil, fmt.Errorf("sync config compile error: %w", err)
 	}
-	warnEqualFlowWorkerCap(compiled, SyncCaller)
 
 	// Push current active to history.
 	s.history.Push(&HistoryEntry{

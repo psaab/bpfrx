@@ -385,6 +385,33 @@ pub(crate) struct CoSQueueStatus {
     pub sojourn_peak_ns: u64,
     #[serde(rename = "sojourn_windowed_min_ns", default)]
     pub sojourn_windowed_min_ns: u64,
+    // #1830 (g): bucket-vs-flow occupancy telemetry, distinguishing SFQ
+    // hash-collision unfairness from demand unfairness on flow-fair
+    // queues. JSON tags MUST match the Go mirror
+    // (pkg/dataplane/userspace/protocol.go) byte-for-byte.
+    //
+    // `flow_fair_buckets_occupied` is the INSTANTANEOUS count of
+    // occupied (backlogged) SFQ flow buckets, summed across worker
+    // instances for this (ifindex, queue_id) — each worker's
+    // FlowFairState owns disjoint buckets, so the sum never
+    // double-counts. `flow_fair_flows_active` is the flow-cache
+    // active-window (~650 ms) count of distinct flows mapped to this
+    // queue, summed across workers (same source as
+    // `cos_active_flow_counts`, re-keyed per queue).
+    //
+    // INTERPRETATION contract: the ratio flows_active /
+    // buckets_occupied is meaningful only while the queue is
+    // CONTINUOUSLY backlogged (e.g. sustained iperf3 -P N): then every
+    // active flow keeps a bucket occupied, and a ratio persistently > 1
+    // (or buckets_occupied < the known flow fan-in) indicates hash
+    // collisions shrinking SFQ shares. On an idle or bursty queue,
+    // flows_active naturally exceeds buckets_occupied (a window-active
+    // flow with nothing queued right now occupies no bucket) — that is
+    // demand variance, not collision evidence.
+    #[serde(rename = "flow_fair_buckets_occupied", default)]
+    pub flow_fair_buckets_occupied: u64,
+    #[serde(rename = "flow_fair_flows_active", default)]
+    pub flow_fair_flows_active: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]

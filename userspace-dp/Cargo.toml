@@ -51,6 +51,12 @@ cc = "1.2"
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+# #1824: in-tree property-test harness (src/afxdp/frame/prop_tests/).
+# Dev-only — never links into the release binary. The `fork`/`timeout`
+# features (process-forking test isolation) are deliberately dropped;
+# `std` provides the proptest-regressions/ file persistence that is the
+# regression-pinning mechanism (committed corpus, replayed first).
+proptest = { version = "1", default-features = false, features = ["std"] }
 
 # #825: microbench for the TX kick-latency instrumentation. Gated on
 # p99 per-call overhead ≤ 60 ns per plan §7 / §3.10 R1.
