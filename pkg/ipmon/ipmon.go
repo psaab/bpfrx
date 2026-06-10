@@ -61,8 +61,24 @@ type PolicyStatus struct {
 	HoldDownSecs      int
 	PendingRecoveryAt time.Time // non-zero while a recovery hold-down is running
 	Routes            []config.RouteOverlayEntry
-	Transitions       uint64
+	// UnresolvedRoutes lists destination prefixes of this policy whose
+	// interface-typed next-hop candidate was skipped at overlay
+	// computation (no DHCP lease / no gateway, #1844). Populated only
+	// while the policy is FAILED; sorted. Feeds the
+	// xpf_ipmon_unresolved_next_hops gauge and `show services
+	// ip-monitoring status`.
+	UnresolvedRoutes []string
+	Transitions      uint64
 }
+
+// NextHopResolver resolves an interface-typed preferred-route next-hop
+// — the Linux DHCP lease key from PreferredRoute.NextHopInterface — to
+// its current DHCP-learned gateway (#1844). ok=false means the
+// candidate is skipped (no lease, or lease without a gateway). Called
+// under Engine.mu during overlay computation; the implementation may
+// take its own lock (dhcp.Manager.mu) but must NEVER call back into
+// the engine — the lock order Engine.mu → dhcp.mu is one-way.
+type NextHopResolver func(leaseIface string) (gw string, ok bool)
 
 type policyState struct {
 	cfg               *config.IPMonitoringPolicy
@@ -87,10 +103,15 @@ type Engine struct {
 	dirtySince    time.Time // zero = clean
 	lastActuation time.Time
 
-	actuate  func() // daemon route-overlay actuator; called WITHOUT mu held
-	now      func() time.Time
-	debounce time.Duration
-	throttle time.Duration
+	actuate func() // daemon route-overlay actuator; called WITHOUT mu held
+	// resolveNextHop resolves interface-typed next-hops at overlay
+	// computation (#1844). Set once via SetNextHopResolver before
+	// Start; nil ⇒ interface-typed candidates always skip (defensive —
+	// the daemon always wires it).
+	resolveNextHop NextHopResolver
+	now            func() time.Time
+	debounce       time.Duration
+	throttle       time.Duration
 
 	kick chan struct{}
 	stop chan struct{}
@@ -113,6 +134,50 @@ func New(actuate func()) *Engine {
 		kick:           make(chan struct{}, 1),
 		stop:           make(chan struct{}),
 		done:           make(chan struct{}),
+	}
+}
+
+// SetNextHopResolver injects the interface-typed next-hop resolver
+// (#1844). Must be called before Start() — the field is read by the
+// run-loop goroutine without further synchronization.
+func (e *Engine) SetNextHopResolver(r NextHopResolver) {
+	e.resolveNextHop = r
+}
+
+// NotifyNextHopChange is the DHCP gateway-change trigger (#1844): it
+// marks the overlay dirty and kicks the run loop when any currently
+// FAILED policy has an interface-typed preferred route, entering the
+// same dirty-bit → debounce → throttle → routes-only-actuator queue
+// as probe transitions (no second actuation path). Cheap —
+// O(policies×routes) under mu, no resolution. Bounded-blocking, not
+// non-blocking: it may wait on Engine.mu held across an overlay build
+// (which calls the resolver into dhcp.mu); the caller (the dhcp
+// gateway hook) never holds dhcp.mu, so the one-way lock order stays
+// acyclic.
+func (e *Engine) NotifyNextHopChange() {
+	e.mu.Lock()
+	relevant := false
+	for _, st := range e.policies {
+		if !st.failed {
+			continue
+		}
+		for _, pr := range st.cfg.PreferredRoutes {
+			if pr != nil && pr.NextHopInterface != "" {
+				relevant = true
+				break
+			}
+		}
+		if relevant {
+			break
+		}
+	}
+	if relevant {
+		e.markDirtyLocked(true)
+	}
+	e.mu.Unlock()
+	if relevant {
+		slog.Debug("ip-monitoring: DHCP gateway change marked overlay dirty")
+		e.kickLoop()
 	}
 }
 
@@ -229,8 +294,22 @@ func (e *Engine) ActiveOverlay() []config.RouteOverlayEntry {
 }
 
 func (e *Engine) activeOverlayLocked() []config.RouteOverlayEntry {
+	overlay, _ := e.computeOverlayLocked()
+	return overlay
+}
+
+// computeOverlayLocked is the pure overlay computation: winner
+// resolution per (routing-instance, canonical prefix) across FAILED
+// policies, with interface-typed next-hops resolved through the
+// injected resolver BEFORE the winner comparison (#1844 plan §4.2 —
+// an unresolvable winner must let a resolvable losing candidate win;
+// resolving after selection gets that wrong by construction). The
+// second return value maps policy name → sorted destination prefixes
+// whose interface-typed candidate was skipped (no lease/gateway, or
+// nil resolver); nil when nothing was skipped.
+func (e *Engine) computeOverlayLocked() ([]config.RouteOverlayEntry, map[string][]string) {
 	if !e.publishEnabled {
-		return nil
+		return nil, nil
 	}
 	type candidate struct {
 		metric int
@@ -238,6 +317,7 @@ func (e *Engine) activeOverlayLocked() []config.RouteOverlayEntry {
 		entry  config.RouteOverlayEntry
 	}
 	best := make(map[string]candidate)
+	var unresolved map[string][]string
 	for name, st := range e.policies {
 		if !st.failed {
 			continue
@@ -247,16 +327,34 @@ func (e *Engine) activeOverlayLocked() []config.RouteOverlayEntry {
 			if dest == "" {
 				continue // commit validation prevents this
 			}
+			nextHop := pr.NextHop
+			if pr.NextHopInterface != "" {
+				gw, ok := "", false
+				if e.resolveNextHop != nil {
+					gw, ok = e.resolveNextHop(pr.NextHopInterface)
+				}
+				if !ok {
+					// Skip BEFORE the best[key] comparison so a
+					// resolvable losing candidate can win the prefix.
+					if unresolved == nil {
+						unresolved = make(map[string][]string)
+					}
+					unresolved[name] = append(unresolved[name], dest)
+					continue
+				}
+				nextHop = gw
+			}
 			key := pr.RoutingInstance + "|" + dest
 			cand := candidate{
 				metric: pr.PreferredMetric,
 				policy: name,
 				entry: config.RouteOverlayEntry{
-					RoutingInstance: pr.RoutingInstance,
-					Destination:     dest,
-					NextHop:         pr.NextHop,
-					Metric:          pr.PreferredMetric,
-					Policy:          name,
+					RoutingInstance:  pr.RoutingInstance,
+					Destination:      dest,
+					NextHop:          nextHop,
+					NextHopInterface: pr.NextHopInterface,
+					Metric:           pr.PreferredMetric,
+					Policy:           name,
 				},
 			}
 			ex, ok := best[key]
@@ -266,8 +364,11 @@ func (e *Engine) activeOverlayLocked() []config.RouteOverlayEntry {
 			}
 		}
 	}
+	for _, dests := range unresolved {
+		sort.Strings(dests)
+	}
 	if len(best) == 0 {
-		return nil
+		return nil, unresolved
 	}
 	out := make([]config.RouteOverlayEntry, 0, len(best))
 	for _, c := range best {
@@ -279,7 +380,7 @@ func (e *Engine) activeOverlayLocked() []config.RouteOverlayEntry {
 		}
 		return out[i].Destination < out[j].Destination
 	})
-	return out
+	return out, unresolved
 }
 
 // Status returns the per-policy view, with each policy's currently
@@ -288,7 +389,7 @@ func (e *Engine) Status() []PolicyStatus {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	overlay := e.activeOverlayLocked()
+	overlay, unresolved := e.computeOverlayLocked()
 	byPolicy := make(map[string][]config.RouteOverlayEntry)
 	for _, entry := range overlay {
 		byPolicy[entry.Policy] = append(byPolicy[entry.Policy], entry)
@@ -311,6 +412,7 @@ func (e *Engine) Status() []PolicyStatus {
 			HoldDownSecs:      st.cfg.HoldDownSecs,
 			PendingRecoveryAt: st.pendingRecoveryAt,
 			Routes:            byPolicy[name],
+			UnresolvedRoutes:  unresolved[name],
 			Transitions:       st.transitions,
 		}
 		for test, failed := range e.failedTests[st.cfg.MatchRPMProbe] {
@@ -530,11 +632,26 @@ func FilterOverlayForConfig(overlay []config.RouteOverlayEntry, ipmCfg *config.I
 			if pr == nil {
 				continue
 			}
-			if pr.RoutingInstance == entry.RoutingInstance &&
-				canonicalCIDR(pr.Destination) == entry.Destination &&
-				pr.NextHop == entry.NextHop &&
-				pr.PreferredMetric == entry.Metric {
-				backed = true
+			if pr.RoutingInstance != entry.RoutingInstance ||
+				canonicalCIDR(pr.Destination) != entry.Destination ||
+				pr.PreferredMetric != entry.Metric {
+				continue
+			}
+			// Next-hop spec match: literal entries compare the IP;
+			// interface-typed entries (#1844) compare the lease key —
+			// the entry's NextHop is the RESOLVED gateway (runtime
+			// state) and never equals the config spec. A commit that
+			// re-targets the route to a different interface (or flips
+			// interface↔literal) therefore drops the old entry, the
+			// #1843 HIGH-1 contract; a same-spec commit keeps the
+			// last-resolved gateway riding the commit's own publish
+			// and the engine's next actuation converges it.
+			if pr.NextHopInterface != "" {
+				backed = pr.NextHopInterface == entry.NextHopInterface
+			} else {
+				backed = entry.NextHopInterface == "" && pr.NextHop == entry.NextHop
+			}
+			if backed {
 				break
 			}
 		}
