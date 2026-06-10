@@ -4757,6 +4757,15 @@ top.
 - **Timestamp**: 2026-06-10
   **Action**: "#1805 commit 2 — api bounded request-path exec: new exec_timeout.go (runTimeout only — sole raw sites are power actions; Output variants live in grpcapi sibling), converted system.go reboot/halt to runTimeout(context.Background()), WaitDelay=5s U3-parity on ping/traceroute handlers, tests, README gotcha"
   **File(s)**: pkg/api/exec_timeout.go, pkg/api/exec_timeout_test.go, pkg/api/system.go, pkg/api/README.md
+- **Timestamp**: 2026-06-10
+  **Action**: "#1776 commit 1 — extract one-shot worker_loop setup into loop_body/setup.rs (pure code motion, v3.1 narrowed plan): thread pin, TSC calibration, ArcSwap load_fulls, binding construction, CoS fast-interface wiring, interrupt pollfds, BPF-map-FD cache, initial cos_status publish, set_tid; returns WorkerLoopSetup destructured into same-named locals — loop body textually unchanged; only delta = 11 `let mut`→`let` (mut moved to destructure site)"
+  **File(s)**: userspace-dp/src/afxdp/worker/loop_body/setup.rs (new), userspace-dp/src/afxdp/worker/loop_body/mod.rs
+- **Timestamp**: 2026-06-10
+  **Action**: "#1776 commit 2 — extract cfg(debug-log) report + stall dump into loop_body/debug_report.rs (module cfg-gated at declaration, release-DCE'd): DbgCounters (44 per-interval fields, single-line default() reset) + accumulate() + emit_periodic_report() + check_and_dump_stall(); AGY CORRECTNESS-1 guard upheld — dbg_last_report_ns + stall_prev_fwd/stall_reported stay plain persistent locals, prev_rx/prev_fwd become scoped pre-reset snapshots; always-on binding_summary build + BindingLiveState publish loop stay inline (Codex r2-3 partition); residue: degraded-path items in bpf_map/mod.rs cfg-gated to match their only (now-gated) callers"
+  **File(s)**: userspace-dp/src/afxdp/worker/loop_body/debug_report.rs (new), userspace-dp/src/afxdp/worker/loop_body/mod.rs, userspace-dp/src/afxdp/bpf_map/mod.rs
+- **Timestamp**: 2026-06-10
+  **Action**: "#1776 commit 3 — module docs: loop_body/mod.rs header (Phase 2 scope + per-tick-stays-inline rationale), worker/README.md Files table rows for setup.rs/debug_report.rs"
+  **File(s)**: userspace-dp/src/afxdp/worker/loop_body/mod.rs, userspace-dp/src/afxdp/worker/README.md, _Log.md
 
 - **Timestamp**: 2026-06-10
   **Action**: "#1819 commit 1 — grpcapi request-sized diag-stream budgets: streamDiagCmd gains a timeout param (ceiling-clamped via clampDiagTimeout, 150s) + inner WithCancel so a sendFn failure kills the child promptly instead of burning the remaining budget; Ping sizes via pingExecTimeout (count×1s + 15s slack, 30s floor), Traceroute via diagTracerouteTimeout (60s, aligned with HTTP); formula constants + helpers in exec_timeout.go, table tests + prompt-kill/streaming tests, README sentence"
