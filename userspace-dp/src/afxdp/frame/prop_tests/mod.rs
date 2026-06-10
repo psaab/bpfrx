@@ -30,17 +30,19 @@
 //! Soak knob: `PROPTEST_CASES=100000 cargo test --release prop_` for
 //! operator-driven deep runs; never wired into any gate.
 //!
-//! Known production divergences excluded from the property domains and
-//! pinned by deterministic examples instead (tests must land green; we
-//! don't commit xfail):
-//!   - #1838 (D3): generic v6 NAT path assumes L4 at fixed offset 40 —
-//!     NAT-applying generators emit IPv6 WITHOUT extension headers.
-//!   - #1839 (D1): v6 0x0000→0xFFFF L4-checksum canonicalization scope
-//!     mismatch (descriptor: all protocols; generic: UDP/ICMPv6 only)
-//!     — byte comparisons exclude L4 checksum bytes; validity oracle
-//!     accepts both one's-complement zero encodings.
-//!   - #1840 (D2): family-ungated UDP zero-checksum skip on port
-//!     rewrite — valid-packet generators never emit v6 UDP checksum 0.
+//! The #1838/#1839/#1840 defect trio is FIXED; the domain gates that
+//! encoded the defects are lifted:
+//!   - #1838: NAT-applying and segmentation generators emit IPv6 WITH
+//!     extension-header chains (the ext-aware offset is threaded
+//!     through both rewrite paths via `v6_rel_l4_offset`).
+//!   - #1839: the P-N3 descriptor-vs-generic differential asserts FULL
+//!     byte equality (empty mask). P-N1's apply+undo round trip still
+//!     masks checksum bytes — it restores the value class, not the
+//!     one's-complement zero representation.
+//!   - #1840: valid-packet generators still never emit v6 UDP checksum
+//!     0x0000 — that encoding is malformed per RFC 8200 §8.1 (outside
+//!     the VALID domain); the deterministic pins in `rewrite.rs` cover
+//!     the malformed encoding on both paths.
 
 use super::*;
 use proptest::prelude::*;
