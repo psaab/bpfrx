@@ -174,7 +174,7 @@ func TestPeerRecentlyActive(t *testing.T) {
 		t.Fatal("expected false without peer activity")
 	}
 
-	s.lastPeerRxUnix.Store(time.Now().Add(-500 * time.Millisecond).UnixNano())
+	s.lastPeerRxMono.Store(MonotonicNanos() - (500 * time.Millisecond).Nanoseconds())
 	if !s.PeerRecentlyActive(time.Second) {
 		t.Fatal("expected recent peer activity to be reported")
 	}
@@ -195,12 +195,12 @@ func TestPeerHealthyRequiresRecentInboundAfterHeartbeatAckCapability(t *testing.
 	}
 
 	s.peerHeartbeatAckEver.Store(true)
-	s.lastPeerRxUnix.Store(time.Now().UnixNano())
+	s.lastPeerRxMono.Store(MonotonicNanos())
 	if !s.PeerHealthy() {
 		t.Fatal("expected recent peer activity to be healthy")
 	}
 
-	s.lastPeerRxUnix.Store(time.Now().Add(-2 * syncPeerSilenceTimeout).UnixNano())
+	s.lastPeerRxMono.Store(MonotonicNanos() - (2 * syncPeerSilenceTimeout).Nanoseconds())
 	if s.PeerHealthy() {
 		t.Fatal("expected stale peer activity to be unhealthy")
 	}

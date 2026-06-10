@@ -4660,3 +4660,6 @@ top.
   **File(s)**: pkg/config/{schema.go, compiler_interfaces.go,
   compiler_services.go, compiler_nat.go, compiler_class_of_service.go,
   dual_ast_differential_test.go}, _Log.md
+- **Timestamp**: 2026-06-09
+  **Action**: U10 (#1792) monotonic HA liveness — 4 commits on engineer/1800-u10-liveness
+  **File(s)**: pkg/cluster/{heartbeat,heartbeat_manager,hooks,manager,sync,sync_conn,sync_protocol,sync_test,heartbeat_liveness_test}.go, pkg/daemon/{daemon,daemon_ha_sync,daemon_ha_sync_test}.go, pkg/vrrp/{instance,instance_garp_test}.go, docs/bug-heartbeat-vrf-rebind-split-brain.md

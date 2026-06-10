@@ -72,3 +72,14 @@ func (m *Manager) SetPeerTimeoutGuard(fn func() (bool, string)) {
 	defer m.mu.Unlock()
 	m.peerTimeoutGuardFn = fn
 }
+
+// SetHeartbeatRestartNotifyFunc sets the callback invoked around the
+// RestartHeartbeat socket teardown/rebind window. The daemon wires it to
+// SessionSync.SendLivenessKeepalive so the peer's heartbeat-timeout
+// suppression guard keeps observing fresh sync traffic while this node's
+// UDP heartbeats are silent during the restart (#1792).
+func (m *Manager) SetHeartbeatRestartNotifyFunc(fn func()) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.hbRestartNotifyFn = fn
+}
