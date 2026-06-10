@@ -27,7 +27,16 @@ cmdtree. `setSchema` drives **four** things off one tree:
    (`<rate>`) + example values (`CompleteSetPathWithValues`,
    `schema_complete.go`).
 4. **Commit-check validation** — the typed-leaf gate
-   (`SchemaValidate` + the generic walker in `schema_walk.go`).
+   (`SchemaValidate` + the generic walker in `schema_walk.go`). Strict
+   ONLY on the operator-driven commit / commit-check path
+   (`configstore.compileTree`); the tolerant `Store.Load` /
+   `Store.SyncApply` ingress (`compileTreeLenient`) downgrades a
+   violation to a `slog.Warn` so an already-persisted or peer-synced
+   config carrying a value that was typed (or range-tightened) later
+   cannot blackout-boot a node or alarm-loop HA config sync. Boot
+   safety is non-negotiable: when you tighten a range, any legacy value
+   the compiler accepted MUST still load (`TestLoad_ToleratesStored*`
+   in `pkg/configstore`).
 
 Because completion (3) and validation (4) read the SAME node, they cannot
 drift — typing a leaf fixes both `set ... ?` help and `commit check`
@@ -58,6 +67,17 @@ Edit the leaf's `schemaNode` in `setSchema` (`pkg/config/schema.go`). Set:
 
 Rules:
 
+- **Range policy: runtime first, Junos second.** The binding bound is
+  what the xpf runtime actually consumes — the narrowest binary encoding
+  (e.g. `cluster-id` is one byte of the RETH virtual MAC;
+  `reth-advertise-interval` must encode into the 12-bit VRRPv3
+  centisecond field) or an explicit runtime clamp/ignore. Check the
+  Junos vSRX range second and call out deliberate divergences in the
+  annotation comment: xpf's own defaults sit OUTSIDE the Junos ranges
+  for several chassis knobs (heartbeat-interval default 100 ms vs Junos
+  1000..2000), and the killed #1319 Phase-3a plan copied Junos ranges
+  blindly — it would have rejected deployed configs. Cite the source
+  file:line for every bound next to the annotation.
 - **Fields only, do not add a `children` map just to type a leaf.** SetPath's
   grouping keys on `children == nil` (`ast_edit.go:196`); flipping a leaf to
   a container changes flat-set grouping for existing configs. The
@@ -97,13 +117,31 @@ Rules:
 
 ## Rollout (#1319)
 
-- **PR 1 (this work):** moved `ValueType` to `pkg/config`; added the typed
-  fields to `schemaNode`; wired typed-value `?` completion into
+- **PR 1 (merged, #1682):** moved `ValueType` to `pkg/config`; added the
+  typed fields to `schemaNode`; wired typed-value `?` completion into
   `CompleteSetPathWithValues`; replaced the schedulers-only hand-rolled
   walker + class-of-service early-return with the generic
   `config.SchemaValidate` walker; re-homed the schedulers typed leaves onto
-  `setSchema`; retired the cmdtree config-mode overlay.
-- **PR 2..N:** type one subsystem's leaves per PR (chassis cluster,
-  interfaces address CIDR, firewall filter terms, system/services numeric
-  knobs) with Junos-vSRX-correct ranges + a fixture proving the silent-
-  coerce gap on master. No walker/infra changes after PR 1.
+  `setSchema`; retired the cmdtree config-mode overlay. 3 typed leaves
+  (schedulers transmit-rate / priority / buffer-size).
+- **PR 2 (this work, chassis cluster):** downgraded the gate to a warning
+  on the tolerant Load/SyncApply paths (boot safety — PR 1 had wired it
+  strict there too); typed 13 chassis-cluster leaves (cluster-id, node,
+  reth-count, heartbeat-interval/-threshold, reth-advertise-interval,
+  takeover-hold-time, peer-fencing, RG node priority,
+  gratuitous-arp-count, ip-monitoring global-weight / global-threshold /
+  target weight) with runtime-derived, source-cited ranges. Deliberately
+  NOT typed, with reasons in the `schema.go` comments: the
+  `redundancy-group <id>` / RG-scoped `node <id>` instance-name slots
+  (the walker's compiler-faithful contract consumes identity tokens
+  without validation — typing them needs a new walker feature),
+  `interface-monitor <if> weight <n>` (tokens pack inline into a
+  `children==nil` leaf; typing the weight needs a children map, which
+  would flip SetPath grouping), `control-ports` (not compiled), and the
+  address/interface string leaves (IP value types arrive with the
+  interfaces PR). Known residual: the hierarchical packed one-liner
+  `node 0 priority <v>;` bypasses the gate (identity-token rule) even
+  though `compileChassis` reads its inline tokens — pinned by
+  `TestSchemaValidate_ChassisCluster_PackedOneLinerBypassesGate`.
+- **PR 3..N:** interfaces address CIDR, firewall filter terms,
+  system/services numeric knobs — same recipe, no walker/infra changes.
