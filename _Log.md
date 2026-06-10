@@ -4903,3 +4903,11 @@ top.
 - **Timestamp**: 2026-06-10
   **Action**: "#1829 Phase 1 commit 3 — operator docs: 'Reading the sojourn telemetry (#1829 Phase 1)' section in cos-validation-notes.md (gate-metric semantics, win_min-above-target = standing-queue evidence, 0 = no-standing-queue/stale-zeroing, MAX-merge caveat, §6.1d gate procedure incl. PLAN-KILL branch); fairness-regimes.md production-metric catalog entry for the windowed-min gauge + companions"
   **File(s)**: docs/cos-validation-notes.md, docs/fairness-regimes.md, _Log.md
+
+- **Timestamp**: 2026-06-10
+  **Action**: "#1829 PR #1846 Codex MAJOR fold — double-sampling fix: sojourn recording moved from the four pop/scratch-build sites (build_cos_batch_from_queue Local/Prepared arms; drain_exact_{local,prepared}_items_to_scratch_flow_fair scratch-commits) to the COMMITTED-PREFIX settle points: settle_exact_{local,prepared}_scratch_submission_flow_fair committed branches (rollback push_front branch never samples) + unconditional enq_sidecar [u64; TX_BATCH_SIZE] in submit_local/submit_prepared recording sidecar[..packets] after transmit settles (retry suffix restored with original enqueue_ns is sampled only on the attempt that ships it). now_ns threading reverted on build_cos_batch_from_queue + both drains (settle/submit already hold pass now_ns — no clock reads, #1734); #1763 peek/pop contract untouched. Tests reworked: batch-build/drain record-NOTHING pins, partial-insert once-only differential-replay tests (local + prepared settle, EWMA equality proves exactly-once), end-to-end submit_local test via drain_shaped_tx, zero-stamp guard re-driven through settle. Wire/type/operator docs re-anchored to committed-prefix wording"
+  **File(s)**: userspace-dp/src/afxdp/cos/queue_service/{mod.rs,drain.rs,service.rs,submit_local.rs,submit_prepared.rs,tests.rs}, userspace-dp/src/afxdp/cos/queue_ops/{tests.rs,v_min_tests.rs}, userspace-dp/src/afxdp/types/cos.rs, userspace-dp/src/protocol/cos.rs, docs/cos-validation-notes.md
+
+- **Timestamp**: 2026-06-10
+  **Action**: "#1829 PR #1846 Codex LOW fold — remove the duplicated 'Pre-#1829 helper payload' legacy-assert block left in TestCoSQueueStatusFlowFairOccupancyRoundTrip by the merge repair (the test's own #1830 legacy check at the tail is the real one)"
+  **File(s)**: pkg/dataplane/userspace/protocol_test.go, _Log.md

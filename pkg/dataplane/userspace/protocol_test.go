@@ -1608,11 +1608,6 @@ func TestCoSQueueStatusFlowFairOccupancyRoundTrip(t *testing.T) {
 		t.Fatalf("round-trip mismatch: got %+v, want %+v", back, in)
 	}
 
-	// Pre-#1829 helper payload (keys absent) must decode to zero.
-	if back.FlowFairBucketsOccupied != 9 || back.FlowFairFlowsActive != 12 {
-		t.Fatalf("round-trip mismatch: got %+v, want %+v", back, in)
-	}
-
 	// Pre-#1830 helper payload (keys absent) must decode to zero.
 	var legacy CoSQueueStatus
 	if err := json.Unmarshal([]byte(`{}`), &legacy); err != nil {
