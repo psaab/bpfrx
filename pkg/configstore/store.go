@@ -294,12 +294,14 @@ func (s *Store) SetNodeID(id int) {
 // BEFORE compile, but against the same apply-groups-expanded view the
 // compiler consumes. Running on the raw candidate tree would let invalid
 // typed leaves inside `groups { ... }` bypass the gate while still reaching
-// the compiler after expansion. We still validate at commit/load time rather
+// the compiler after expansion. We still validate at commit time rather
 // than at `set` time so the candidate-edit flow stays permissive —
 // operators can stage half-typed values without each `set` line being
 // rejected — and `commit check` is the one place that fails loud on garbage
-// like `transmit-rate asd`. cfg is nil at this point because we haven't
-// compiled yet; the schedulers validators don't need it.
+// like `transmit-rate asd`. The tolerant Load/SyncApply ingress goes through
+// compileTreeLenient below, which downgrades the same gate to a warning
+// (#1319 PR 2 boot safety). cfg is nil at this point because we haven't
+// compiled yet; the typed-leaf validators shipped so far don't need it.
 func (s *Store) compileTree(tree *config.ConfigTree) (*config.Config, error) {
 	if err := s.schemaValidateExpandedTree(tree); err != nil {
 		return nil, err
@@ -335,8 +337,21 @@ func (s *Store) compileTree(tree *config.ConfigTree) (*config.Config, error) {
 // warning fires on EXACTLY the configs the strict reject would — no
 // false-positive on a config whose effective per-node workers are <= cap.
 func (s *Store) compileTreeLenient(tree *config.ConfigTree) (*config.Config, error) {
+	// #1319 PR 2: the typed-leaf SchemaValidate gate is STRICT only on the
+	// operator-driven commit / commit-check path (compileTree). Here — the
+	// tolerant Store.Load / Store.SyncApply ingress for configs the
+	// operator did NOT just author — a violation downgrades to a warning.
+	// A persisted config written by an older binary (pre-gate, or before a
+	// leaf's range was typed/tightened) may carry values the current gate
+	// rejects; hard-failing would blackout-boot the node (Load) or
+	// alarm-loop HA config sync (SyncApply), even though the compiler
+	// accepted the value when it was committed and still compiles it the
+	// same way today. This is the same doctrine as the #1733/#1798/#1814
+	// lenient compile gates (see freetext.go); the operator's next strict
+	// commit rejects the stale value loudly.
 	if err := s.schemaValidateExpandedTree(tree); err != nil {
-		return nil, err
+		slog.Warn("typed-leaf schema violation in tolerated config; continuing (a strict commit would reject this)",
+			"err", err, "issue", "#1319")
 	}
 	if s.nodeID >= 0 {
 		return config.CompileConfigForNodeLenient(tree, s.nodeID)
