@@ -661,9 +661,15 @@ fn advance_cos_timer_wheel_returns_ticks_advanced() {
     );
 }
 
-// #1782 Step-2 (i) test 1: lag exactly EQUAL to the wheel horizon is
-// in-horizon — it takes the existing per-tick loop unchanged (the snap
-// gate is strictly `>`), and a due park is woken exactly as before.
+// #1782 Step-2 (i) test 1: lag exactly EQUAL to the wheel horizon
+// with a parked queue takes the existing per-tick loop and wakes the
+// due park exactly as before. NOTE (Codex r1 Low): because this test
+// parks a queue, it exercises the parked-refusal path, NOT the `>`
+// vs `>=` gate boundary — with no parked queue, snap and loop are
+// state-indistinguishable at exactly-horizon lag (both empty every
+// slot and land on the same tick; AGY r1 confirmed `>=` would also
+// be correct), so the strict gate is a conservative choice that has
+// no observable pin.
 #[test]
 fn timer_wheel_at_horizon_lag_takes_per_tick_loop_and_wakes_due_park() {
     let mut root = test_cos_interface_runtime(0);

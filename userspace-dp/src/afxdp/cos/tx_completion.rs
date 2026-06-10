@@ -288,20 +288,27 @@ pub(in crate::afxdp) fn advance_cos_timer_wheel(
 /// effects, touching no queue state, so it is behavior-identical by
 /// construction.
 ///
-/// Boundedness of the `false` fallback (plan AGY r2 F1 fold): a
-/// parked queue implies its wake tick was set within the wheel
-/// horizon of the THEN-current tick, and a parked queue is backlogged,
-/// which keeps the owner worker's shaped-drain priming active
-/// (`cos_root_can_service_after_prime` reports it serviceable once
-/// the wake tick is due) — so the wheel keeps advancing every poll
-/// pass and a pathological multi-minute lag cannot coexist with a
-/// populated wheel in production. The fallback still handles that
-/// state correctly (the O(lag) loop is unchanged) if it ever arises;
-/// no debug assertion is placed here because (1) the fallback test
-/// deliberately constructs the parked+huge-lag state to prove it, and
-/// (2) park wake ticks are not statically bounded by the horizon for
-/// very low configured rates (pre-existing slot-wrap behavior), so an
-/// assert could fire on legitimate configs.
+/// Scope of the `false` fallback (Codex PR #1854 r1 — the original
+/// "naturally bounded" claim was FALSE and is retracted): park wake
+/// ticks are NOT statically bounded by the wheel horizon. The wake
+/// tick is `now + deficit/rate` with an uncapped refill time
+/// (`queue_service/mod.rs` park site, `token_bucket.rs` refill), and
+/// the config accepts rates as low as 1 B/s (`transmit-rate 8`),
+/// where a 1500-byte head parks ~30,000,000 ticks (~25 min) out. A
+/// worker that goes fully idle while such a queue is parked CAN
+/// therefore re-enter the O(lag) per-tick loop on its next drain —
+/// the snap deliberately does not cover that state, because re-arming
+/// parked entries against the snapped tick requires the absolute
+/// wake-tick bookkeeping of plan option (b), reviewed as
+/// not-worth-the-risk for a pathological-config-only residual. What
+/// the snap DOES cover is the proven production mechanism (#1782
+/// Step-1 evidence): a fully idle worker has no backlog, hence no
+/// parked queue, and snaps in O(slots). For ordinary configured rates
+/// a parked queue's wake is near-term and the owner's drain priming
+/// (`cos_root_can_service_after_prime`) keeps the wheel advancing, so
+/// the fallback loop stays short in practice. No debug assertion: the
+/// parked+huge-lag state is legitimate (low-rate configs), and the
+/// fallback test constructs it deliberately.
 ///
 /// Cold-path-only: reached only when lag > ~3.28 s, i.e. the first
 /// shaped drain after idle. `Vec::clear` frees nothing (capacity
