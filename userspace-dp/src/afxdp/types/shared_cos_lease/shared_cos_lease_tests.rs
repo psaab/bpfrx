@@ -610,6 +610,79 @@ fn equal_flow_intentionally_leaves_class_capacity_unused() {
     );
 }
 
+/// #1830 (e): regression pin for the removed 32-worker scratch cap.
+/// Pre-#1830 the rotation captured per-worker swap results in fixed
+/// `[_; 32]` stack arrays; any ACTIVE worker with id >= 32 fell into
+/// `active_outside_scratch` and forced an `UnsampledActiveWorker`
+/// fail-open EVERY rotation, so equal-flow could never enforce on
+/// >32-worker hosts (release builds: the only guard was a stripped
+/// debug_assert). With the heap scratch sized to the true worker-array
+/// length, a worker id far above 32 participates normally and the
+/// lease reaches enforcement.
+#[test]
+fn equal_flow_enforces_beyond_legacy_32_worker_scratch_cap() {
+    let lease = SharedCoSQueueLease::new_v8_with_rate_mode(
+        50_000_000,
+        256 * 1024,
+        8,
+        39, // 40 worker slots — beyond the old MAX_WORKERS_SCRATCH = 32
+        V8RateMode::EqualFlowSuppress,
+    );
+    lease.rehydrate_worker_active_count(0, 4);
+    lease.rehydrate_worker_active_count(35, 1);
+
+    let _ = lease.acquire_v8(0, EPOCH_DURATION_NS, 8_000);
+    let _ = lease.acquire_v8(35, EPOCH_DURATION_NS, 1_800);
+    assert!(!lease.v8_equal_flow_enforced());
+
+    let _ = lease.acquire_v8(0, 2 * EPOCH_DURATION_NS, 8_000);
+    let _ = lease.acquire_v8(35, 2 * EPOCH_DURATION_NS, 1_800);
+    assert!(!lease.v8_equal_flow_enforced());
+    assert_ne!(
+        lease.v8_equal_flow_fail_open_reason(),
+        V8EqualFlowFailOpenReason::UnsampledActiveWorker,
+        "active worker id 35 must be captured by the rotation scratch, \
+         not blamed as an unsampled outside-scratch worker"
+    );
+
+    let _ = lease.acquire_v8(35, 3 * EPOCH_DURATION_NS, 1);
+    assert!(
+        lease.v8_equal_flow_enforced(),
+        "equal-flow must reach enforcement with an active worker id > 32"
+    );
+    assert_eq!(lease.v8_equal_flow_target_per_flow(), 1_800);
+    assert_eq!(lease.v8_equal_flow_worker_cap(), 7_200);
+}
+
+/// #1830 (e): default-mode (CstructDefault) sibling of the >32-worker
+/// pin — rotation and per-worker fair-share publication must cover the
+/// full worker-id range, not just the first 32 slots.
+#[test]
+fn default_mode_rotation_covers_beyond_32_worker_ids() {
+    let lease = SharedCoSQueueLease::new_v8(50_000_000, 256 * 1024, 8, 47);
+    lease.rehydrate_worker_active_count(40, 3);
+    lease.rehydrate_worker_active_count(2, 1);
+
+    let g40 = lease.acquire_v8(40, EPOCH_DURATION_NS, 6_000);
+    let g2 = lease.acquire_v8(2, EPOCH_DURATION_NS, 2_000);
+    assert_eq!(g40, 6_000);
+    assert_eq!(g2, 2_000);
+
+    let v8 = lease.v8.as_ref().expect("v8 lease");
+    let share40 = v8.worker_fair_share[40].load(Ordering::Acquire);
+    let share2 = v8.worker_fair_share[2].load(Ordering::Acquire);
+    assert!(
+        share40 > 0 && share2 > 0,
+        "fair shares must be published for worker ids above the old cap"
+    );
+    assert_eq!(
+        share40,
+        3 * share2,
+        "flow-proportional shares must use the true per-worker counts"
+    );
+    assert_eq!(lease.v8_equal_flow_fail_open_count(), 0);
+}
+
 #[test]
 fn equal_flow_bypass_cannot_exceed_cap() {
     let lease = new_equal_flow_lease();

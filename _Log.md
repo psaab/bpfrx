@@ -4786,3 +4786,7 @@ top.
 - **Timestamp**: 2026-06-10
   **Action**: "#1819 commit 2 — api sibling alignment: pingHandler 30s → pingExecTimeout(count) (same formula copy in pkg/api/exec_timeout.go, cross-referenced), tracerouteHandler 60s → shared diagTracerouteTimeout constant; mirror table tests, README sentence"
   **File(s)**: pkg/api/exec_timeout.go, pkg/api/exec_timeout_test.go, pkg/api/system.go, pkg/api/README.md
+
+- **Timestamp**: 2026-06-10
+  **Action**: "#1830 (e) — remove 32-worker rotation scratch cap: V8RotationScratch heap scratch (Mutex, sized to true worker count at lease construction; uncontended by seqlock-winner construction; zero alloc at rotation) replaces fixed [_;32] stack arrays in maybe_rotate_epoch_v8; drop active_outside_scratch + its UnsampledActiveWorker fail-open; retire the Go #1733 commit gate (MaxEqualFlowWorkers, validateEqualFlowWorkerCapStrict, lenientEqualFlowWorkerCap, configstore warnEqualFlowWorkerCap) + rewrite both gate test files as retirement pins; new Rust >32-worker regression tests; docs/cos-traffic-shaping.md updated"
+  **File(s)**: userspace-dp/src/afxdp/types/shared_cos_lease/{mod.rs,rotate_epoch_v8.rs,publish_equal_flow_epoch_v8.rs,shared_cos_lease_tests.rs}, pkg/config/{compiler.go,compiler_equal_flow_worker_cap_test.go}, pkg/configstore/{store.go,equal_flow_worker_cap.go (deleted),equal_flow_worker_cap_test.go}, pkg/cli/cli_show_interfaces.go, pkg/grpcapi/server_show_interfaces.go, docs/cos-traffic-shaping.md

@@ -9,9 +9,10 @@
 // `#[inline]` is added as a hint; the function is a hot
 // conditional branch of the per-tick rotation.
 //
-// The 9-parameter signature is intentionally preserved verbatim
-// from master. Folding into a context struct is tracked as a
-// follow-up.
+// #1830 (e) dropped the `active_outside_scratch` parameter (the
+// rotation scratch is now heap-sized to the full worker array, so no
+// worker can sit outside it). Folding the remaining parameters into a
+// context struct is still tracked as a follow-up.
 
 use super::*;
 use std::sync::atomic::Ordering;
@@ -21,17 +22,16 @@ pub(super) fn publish_equal_flow_epoch_v8(
     v8: &V8State,
     new_tag: u32,
     n_workers: usize,
-    active_outside_scratch: bool,
     active_by_worker: &[bool],
     sampled_active_flows_by_worker: &[u32],
     demanded_by_worker: &[bool],
     prev_grants: &[u32],
 ) {
-    if active_outside_scratch {
-        v8.equal_flow
-            .fail_open(new_tag, V8EqualFlowFailOpenReason::UnsampledActiveWorker);
-        return;
-    }
+    // #1830 (e): the former `active_outside_scratch` parameter (and its
+    // unconditional `UnsampledActiveWorker` fail-open) is gone — the
+    // rotation scratch is now heap-sized to the lease's full worker
+    // array at construction, so every worker is inside the scratch by
+    // construction and >32-worker hosts no longer fail open every epoch.
 
     // #1745: derive the equal-flow sample set from the acquire-time
     // sticky-max active-flow samples, NOT the rotation-instant
