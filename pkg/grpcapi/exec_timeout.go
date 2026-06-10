@@ -62,6 +62,62 @@ func runTimeout(ctx context.Context, name string, args ...string) error {
 	return cmd.Run()
 }
 
+// Diag-stream budgets (#1819). Ping/Traceroute stream child output and
+// legitimately run longer than requestExecTimeout, so they size their
+// bound from the request instead of sharing the 15s constant. The same
+// formulas live in pkg/api/exec_timeout.go for the HTTP REST siblings
+// (not importable either way without an import cycle / a layering
+// inversion); keep the two copies in sync.
+
+// diagPingPacketInterval is the per-packet budget for ping: the
+// handlers do not pass -i, so ping sends one packet per second
+// (iputils default). If an interval knob is ever added to the request,
+// this constant must become a parameter of pingExecTimeout.
+const diagPingPacketInterval = 1 * time.Second
+
+// diagExecSlack absorbs exec/VRF setup, DNS resolution, and the final
+// per-packet reply timeout so a fully-successful run never grazes the
+// deadline.
+const diagExecSlack = 15 * time.Second
+
+// diagPingFloor is the previous hardcoded streamDiagCmd bound. The
+// #1819 right-sizing must not tighten any existing budget, so small
+// counts keep at least the 30s they had.
+const diagPingFloor = 30 * time.Second
+
+// diagExecCeiling caps every request-sized diag budget. The Count
+// clamp (≤100 → 115s) keeps well under it today; the ceiling is
+// defense-in-depth so a future clamp change cannot let one request pin
+// a handler goroutine for minutes.
+const diagExecCeiling = 150 * time.Second
+
+// diagTracerouteTimeout bounds gRPC and HTTP traceroute. Neither
+// request carries max_ttl, so this is a constant rather than a
+// formula; 60s matches the pre-#1819 HTTP bound (the gRPC path was
+// 30s — this aligns it without tightening the HTTP side).
+const diagTracerouteTimeout = 60 * time.Second
+
+// pingExecTimeout sizes the ping budget from the (already clamped)
+// packet count: count × 1s/packet + slack, floored at the previous 30s
+// bound and capped at the diag ceiling.
+func pingExecTimeout(count int) time.Duration {
+	d := time.Duration(count)*diagPingPacketInterval + diagExecSlack
+	if d < diagPingFloor {
+		d = diagPingFloor
+	}
+	return clampDiagTimeout(d)
+}
+
+// clampDiagTimeout enforces diagExecCeiling on any diag-stream budget;
+// streamDiagCmd applies it to whatever the caller passes so no future
+// formula can exceed the ceiling.
+func clampDiagTimeout(d time.Duration) time.Duration {
+	if d > diagExecCeiling {
+		return diagExecCeiling
+	}
+	return d
+}
+
 // clampTailLines bounds the request-controlled `tail -n N` line count to
 // [1, maxTailLines]. The time bound alone is insufficient here: N is
 // attacker/operator-controlled and a huge N against a large log file

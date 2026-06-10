@@ -4766,3 +4766,11 @@ top.
 - **Timestamp**: 2026-06-10
   **Action**: "#1776 commit 3 — module docs: loop_body/mod.rs header (Phase 2 scope + per-tick-stays-inline rationale), worker/README.md Files table rows for setup.rs/debug_report.rs"
   **File(s)**: userspace-dp/src/afxdp/worker/loop_body/mod.rs, userspace-dp/src/afxdp/worker/README.md, _Log.md
+
+- **Timestamp**: 2026-06-10
+  **Action**: "#1819 commit 1 — grpcapi request-sized diag-stream budgets: streamDiagCmd gains a timeout param (ceiling-clamped via clampDiagTimeout, 150s) + inner WithCancel so a sendFn failure kills the child promptly instead of burning the remaining budget; Ping sizes via pingExecTimeout (count×1s + 15s slack, 30s floor), Traceroute via diagTracerouteTimeout (60s, aligned with HTTP); formula constants + helpers in exec_timeout.go, table tests + prompt-kill/streaming tests, README sentence"
+  **File(s)**: pkg/grpcapi/exec_timeout.go, pkg/grpcapi/exec_timeout_test.go, pkg/grpcapi/server_diag.go, pkg/grpcapi/server_diag_stream_test.go, pkg/grpcapi/README.md
+
+- **Timestamp**: 2026-06-10
+  **Action**: "#1819 commit 2 — api sibling alignment: pingHandler 30s → pingExecTimeout(count) (same formula copy in pkg/api/exec_timeout.go, cross-referenced), tracerouteHandler 60s → shared diagTracerouteTimeout constant; mirror table tests, README sentence"
+  **File(s)**: pkg/api/exec_timeout.go, pkg/api/exec_timeout_test.go, pkg/api/system.go, pkg/api/README.md
