@@ -43,7 +43,12 @@ const RT_FLOW_AF_INET6: u8 = 10;
 const RT_FLOW_EVENT_POLICY_DENY: u8 = 3;
 const RT_FLOW_EVENT_SCREEN_DROP: u8 = 4;
 const RT_FLOW_EVENT_FILTER_LOG: u8 = 6;
+// DENY/PERMIT are wire-format documentation pinned by codec_tests;
+// like REJECT below they have no non-test reader (#1826: exposed when
+// the stale module-level allow was removed).
+#[allow(dead_code)]
 const RT_FLOW_ACTION_DENY: u8 = 0;
+#[allow(dead_code)]
 const RT_FLOW_ACTION_PERMIT: u8 = 1;
 #[allow(dead_code)]
 const RT_FLOW_ACTION_REJECT: u8 = 2;
