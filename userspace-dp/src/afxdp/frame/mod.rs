@@ -905,6 +905,11 @@ pub(super) fn apply_nat_ipv6(
 // parameter's `ChecksumFamily` is `pub(in crate::afxdp::frame)` and
 // every caller lives in this file (apply_nat_ipv4/ipv6), so the fn
 // follows the type.
+// #[inline(always)] is a structural guarantee, not a perf tweak: both
+// callers pass `family` as a compile-time constant, so inlining folds
+// the v6-only §5.5 branch out of the v4 NAT path entirely (Codex
+// PR #1853 review — the v4 hot path must not pay for the v6 rule).
+#[inline(always)]
 pub(in crate::afxdp::frame) fn apply_nat_port_rewrite(
     packet: &mut [u8],
     l4_offset: usize,
@@ -978,6 +983,10 @@ pub(in crate::afxdp::frame) fn apply_nat_port_rewrite(
 /// one-source-of-truth uniformity).
 // Visibility narrowed from pub(super) in #1840 (same rationale as
 // apply_nat_port_rewrite — callers are all in frame/).
+// #[inline(always)]: same structural constant-family fold as
+// apply_nat_port_rewrite (the RFC 768 skip predicate becomes a
+// compile-time constant per call site).
+#[inline(always)]
 pub(in crate::afxdp::frame) fn adjust_l4_checksum_port(
     packet: &mut [u8],
     l4_offset: usize,
