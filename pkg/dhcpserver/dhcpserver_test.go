@@ -391,3 +391,77 @@ func TestGenerateKea6RejectsMultiInterfaceGroup(t *testing.T) {
 		t.Fatalf("want multi-interface v6 rejection, got %v", err)
 	}
 }
+
+// TestWarnAmbiguousSubnetSelection pins #1835 F1: two groups whose
+// pools share/overlap a subnet while at least one involved group emits
+// no per-subnet interface selector (multi-interface group) must fire a
+// warning at generate time — Kea's subnet selection is ambiguous. It
+// must stay a warning, not an error (pre-existing accepted configs).
+func TestWarnAmbiguousSubnetSelection(t *testing.T) {
+	mkCfg := func(subnetA, subnetB string, ifacesA, ifacesB []string) *config.DHCPServerConfig {
+		return &config.DHCPServerConfig{
+			DHCPLocalServer: &config.DHCPLocalServerConfig{
+				Groups: map[string]*config.DHCPServerGroup{
+					"ga": {Name: "ga", Interfaces: ifacesA,
+						Pools: []*config.DHCPPool{{Subnet: subnetA,
+							RangeLow: "10.0.1.100", RangeHigh: "10.0.1.200"}}},
+					"gb": {Name: "gb", Interfaces: ifacesB,
+						Pools: []*config.DHCPPool{{Subnet: subnetB,
+							RangeLow: "10.0.1.100", RangeHigh: "10.0.1.200"}}},
+				},
+			},
+		}
+	}
+
+	run := func(t *testing.T, cfg *config.DHCPServerConfig) []string {
+		t.Helper()
+		m, _ := testManager(t, map[string]bool{}, "")
+		var warned []string
+		m.SetWarnForTesting(func(msg string, args ...any) {
+			s := msg
+			for _, a := range args {
+				s += fmt.Sprintf(" %v", a)
+			}
+			warned = append(warned, s)
+		})
+		if err := m.Apply(cfg); err != nil {
+			t.Fatalf("Apply must not error on ambiguous subnets: %v", err)
+		}
+		return warned
+	}
+
+	t.Run("same subnet, one multi-interface group warns", func(t *testing.T) {
+		warned := run(t, mkCfg("10.0.1.0/24", "10.0.1.0/24",
+			[]string{"ge-0-0-0", "ge-0-0-1"}, []string{"ge-0-0-2"}))
+		if len(warned) != 1 {
+			t.Fatalf("want 1 warning, got %d: %v", len(warned), warned)
+		}
+		if !strings.Contains(warned[0], "ga") || !strings.Contains(warned[0], "gb") {
+			t.Errorf("warning should name both groups: %q", warned[0])
+		}
+	})
+
+	t.Run("overlapping subnets warn too", func(t *testing.T) {
+		warned := run(t, mkCfg("10.0.0.0/16", "10.0.1.0/24",
+			[]string{"ge-0-0-0", "ge-0-0-1"}, []string{"ge-0-0-2"}))
+		if len(warned) != 1 {
+			t.Fatalf("want 1 warning for overlapping prefixes, got %d: %v", len(warned), warned)
+		}
+	})
+
+	t.Run("disjoint subnets do not warn", func(t *testing.T) {
+		warned := run(t, mkCfg("10.0.1.0/24", "10.0.2.0/24",
+			[]string{"ge-0-0-0", "ge-0-0-1"}, []string{"ge-0-0-2"}))
+		if len(warned) != 0 {
+			t.Errorf("unexpected warning: %v", warned)
+		}
+	})
+
+	t.Run("both groups with selectors do not warn", func(t *testing.T) {
+		warned := run(t, mkCfg("10.0.1.0/24", "10.0.1.0/24",
+			[]string{"ge-0-0-0"}, []string{"ge-0-0-2"}))
+		if len(warned) != 0 {
+			t.Errorf("unexpected warning when both subnets carry selectors: %v", warned)
+		}
+	})
+}

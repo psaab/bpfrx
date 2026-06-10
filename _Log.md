@@ -4779,3 +4779,10 @@ top.
   parsing via encoding/csv; tests + README gotchas.
   **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/dhcpserver_test.go,
   pkg/dhcpserver/README.md
+
+- **Timestamp**: 2026-06-10 (AGY fold) F1
+  **Action**: #1835 AGY F1 — warn at generate time when two v4 groups
+  share/overlap subnets and an involved group emits no per-subnet interface
+  selector (ambiguous Kea selection); warn seam + tests.
+  **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/test_seams.go,
+  pkg/dhcpserver/dhcpserver_test.go

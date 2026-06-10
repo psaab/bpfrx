@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -92,6 +93,7 @@ type Manager struct {
 	// the package-level implementations from New().
 	runSystemctl func(args ...string) error
 	unitActive   func(unit string) bool
+	warn         func(msg string, args ...any)
 }
 
 // New creates a new DHCP server manager.
@@ -101,6 +103,7 @@ func New() *Manager {
 		confPath6:    kea6Config,
 		runSystemctl: runSystemctl,
 		unitActive:   unitIsActive,
+		warn:         slog.Warn,
 	}
 }
 
@@ -275,6 +278,49 @@ func subnetInterface(group *config.DHCPServerGroup) string {
 	return ""
 }
 
+// warnAmbiguousV4SubnetSelection warns when two DIFFERENT groups render
+// the same or overlapping v4 subnets while at least one of the involved
+// groups emits no per-subnet interface selector (multi-interface groups,
+// see subnetInterface). Kea's subnet selection is then ambiguous: a
+// DISCOVER arriving on a shared interface can match either subnet, so
+// which pool answers is undefined. This stays a WARNING, not an error —
+// such configs were accepted before #1778 and must keep committing.
+func (m *Manager) warnAmbiguousV4SubnetSelection(srv *config.DHCPLocalServerConfig) {
+	type subnetRef struct {
+		group    string
+		subnet   string
+		prefix   netip.Prefix
+		selector bool // group emits a per-subnet interface selector
+	}
+	var refs []subnetRef
+	for name, group := range srv.Groups {
+		sel := subnetInterface(group) != ""
+		for _, pool := range group.Pools {
+			p, err := netip.ParsePrefix(pool.Subnet)
+			if err != nil {
+				continue // Kea rejects the malformed subnet itself
+			}
+			refs = append(refs, subnetRef{
+				group: name, subnet: pool.Subnet,
+				prefix: p.Masked(), selector: sel,
+			})
+		}
+	}
+	for i := 0; i < len(refs); i++ {
+		for j := i + 1; j < len(refs); j++ {
+			a, b := refs[i], refs[j]
+			if a.group == b.group || (a.selector && b.selector) {
+				continue
+			}
+			if a.prefix.Overlaps(b.prefix) {
+				m.warn("ambiguous Kea subnet selection: overlapping subnets across groups without per-subnet interface selectors",
+					"group_a", a.group, "subnet_a", a.subnet,
+					"group_b", b.group, "subnet_b", b.subnet)
+			}
+		}
+	}
+}
+
 func (m *Manager) generateKea4Config(cfg *config.DHCPServerConfig) error {
 	type keaPool struct {
 		Pool string `json:"pool"`
@@ -291,6 +337,8 @@ func (m *Manager) generateKea4Config(cfg *config.DHCPServerConfig) error {
 		OptionData    []keaOpt  `json:"option-data,omitempty"`
 		ValidLifetime int       `json:"valid-lifetime,omitempty"`
 	}
+
+	m.warnAmbiguousV4SubnetSelection(cfg.DHCPLocalServer)
 
 	var subnets []keaSubnet4
 	subnetID := 1

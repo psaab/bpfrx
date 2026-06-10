@@ -1,5 +1,7 @@
 package dhcpserver
 
+import "log/slog"
+
 // Test-only helpers for pkg/dhcpserver.Manager, following the
 // pkg/dhcp/test_seams.go convention: they live in the production
 // package so tests (here and in other packages) can build managers
@@ -25,5 +27,13 @@ func NewManagerForTesting(
 		confPath6:    confPath6,
 		runSystemctl: runSystemctl,
 		unitActive:   unitActive,
+		warn:         slog.Warn,
 	}
+}
+
+// SetWarnForTesting replaces the manager's warning sink (default
+// slog.Warn) so tests can assert that generate-time configuration
+// warnings — e.g. ambiguous Kea subnet selection (#1835 F1) — fire.
+func (m *Manager) SetWarnForTesting(fn func(msg string, args ...any)) {
+	m.warn = fn
 }
