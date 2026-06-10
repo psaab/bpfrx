@@ -273,3 +273,64 @@ func TestReconcileEmptyStopsEverything(t *testing.T) {
 		t.Fatalf("clients still running after empty reconcile: %v", h)
 	}
 }
+
+// TestRenewDoesNotResurrectRemovedClient pins the Renew-vs-Reconcile
+// removal race (Codex review on PR #1815): Renew is reachable from
+// gRPC outside applySem, so it can capture a client pointer, cancel
+// it, and block on done while a concurrent Reconcile removes the key
+// from config. Renew must then NOT restart the client — restarting
+// would resurrect a client the operator just deconfigured.
+//
+// Interleaving is made deterministic by a run func that signals when
+// cancellation reached it and then holds the client "running" (done
+// not yet closed) until released, freezing Renew inside its wait
+// window while Reconcile([]) deletes the option state.
+func TestRenewDoesNotResurrectRemovedClient(t *testing.T) {
+	fr := newFakeRunner(false)
+	cancelled := make(chan struct{})
+	release := make(chan struct{})
+	m := NewManagerForTesting(func(ctx context.Context, iface string, af AddressFamily) {
+		fr.run(ctx, iface, af) // records the start, returns on ctx.Done()
+		close(cancelled)
+		<-release // hold done open so Renew stays in its wait window
+	})
+
+	m.Reconcile([]ClientSpec{{Iface: "fxp0", Family: AFInet}})
+	waitForRunning(t, m, 1)
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- m.Renew("fxp0") }()
+
+	// Renew has captured dc and cancelled it; it is now blocked on
+	// dc.done, which stays open until release closes.
+	<-cancelled
+
+	// Concurrent removal: Reconcile deletes the option state under
+	// m.mu synchronously in its first section, then blocks on the
+	// same done channel in its stop loop.
+	recDone := make(chan struct{})
+	go func() { m.Reconcile(nil); close(recDone) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for m.HasOptionStateForTesting("fxp0", AFInet) {
+		if time.Now().After(deadline) {
+			t.Fatal("Reconcile(nil) never removed option state")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	close(release)
+	<-recDone
+	if err := <-errCh; err == nil {
+		t.Fatal("Renew should report failure when the client was removed from config mid-renew")
+	}
+
+	// The client must NOT have been restarted: exactly the original
+	// start, and an empty registry.
+	if got := fr.startCount("fxp0", AFInet); got != 1 {
+		t.Fatalf("starts = %d, want 1 (no resurrection)", got)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if h := m.RunningClientHandlesForTesting(); len(h) != 0 {
+		t.Fatalf("running clients = %v, want none", h)
+	}
+}

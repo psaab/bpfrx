@@ -305,6 +305,29 @@ func (m *Manager) Renew(ifaceName string) error {
 		// done guarantees finishClient has completed before restart.
 		dc.cancel()
 		<-dc.done
+
+		// Re-check config membership before restarting: Renew is
+		// reachable from gRPC outside applySem, so a concurrent
+		// Reconcile may have removed this client from config after we
+		// captured dc above. Reconcile deletes the option-state map
+		// entry under m.mu before stopping the client, so membership
+		// here is the desired-set signal — restarting unconditionally
+		// would resurrect a client the operator just deconfigured
+		// (Codex review on PR #1815).
+		m.mu.Lock()
+		stillDesired := false
+		switch af {
+		case AFInet:
+			_, stillDesired = m.v4opts[ifaceName]
+		case AFInet6:
+			_, stillDesired = m.v6opts[ifaceName]
+		}
+		m.mu.Unlock()
+		if !stillDesired {
+			slog.Info("DHCP: renew skipped restart; client removed from config",
+				"interface", ifaceName, "family", af)
+			continue
+		}
 		renewed = true
 
 		// Restart

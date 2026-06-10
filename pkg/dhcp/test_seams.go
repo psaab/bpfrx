@@ -53,3 +53,18 @@ func (m *Manager) RunningClientHandlesForTesting() map[string]any {
 	}
 	return out
 }
+
+// HasOptionStateForTesting reports desired-set membership for a client
+// key (the option-state map entry Reconcile installs for desired
+// clients and deletes for removed ones). Tests use it to observe the
+// Renew-vs-Reconcile removal window deterministically.
+func (m *Manager) HasOptionStateForTesting(ifaceName string, af AddressFamily) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if af == AFInet {
+		_, ok := m.v4opts[ifaceName]
+		return ok
+	}
+	_, ok := m.v6opts[ifaceName]
+	return ok
+}
