@@ -1,7 +1,6 @@
 # #1787 — learn_dynamic_neighbor cheap-first rework (per-packet 64-shard bulk lock + heap allocs)
 
-Status: DRAFT v3 — r2 dedup-interaction fold, pending round-3 confirm
-
+Status: CONVERGED PLAN-READY (Codex + AGY + Claude SMR)
 ## Issue framing
 
 `learn_dynamic_neighbor` runs per validated RX packet (stage 7/8, before the
