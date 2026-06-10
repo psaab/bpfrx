@@ -94,7 +94,7 @@ func (s *Server) Ping(req *pb.PingRequest, stream grpc.ServerStreamingServer[pb.
 	cmd = append(cmd, "ping")
 	cmd = append(cmd, args...)
 
-	return streamDiagCmd(stream.Context(), cmd, func(line string) error {
+	return streamDiagCmd(stream.Context(), pingExecTimeout(count), cmd, func(line string) error {
 		return stream.Send(&pb.PingResponse{Output: line})
 	})
 }
@@ -120,14 +120,23 @@ func (s *Server) Traceroute(req *pb.TracerouteRequest, stream grpc.ServerStreami
 	cmd = append(cmd, "traceroute")
 	cmd = append(cmd, args...)
 
-	return streamDiagCmd(stream.Context(), cmd, func(line string) error {
+	return streamDiagCmd(stream.Context(), diagTracerouteTimeout, cmd, func(line string) error {
 		return stream.Send(&pb.TracerouteResponse{Output: line})
 	})
 }
 
-// streamDiagCmd runs a command and streams each line of combined output via sendFn.
-func streamDiagCmd(ctx context.Context, cmd []string, sendFn func(string) error) error {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+// streamDiagCmd runs a command and streams each line of combined output
+// via sendFn. timeout is request-sized by the caller (#1819, see the
+// diag-stream budget block in exec_timeout.go); it is always capped at
+// diagExecCeiling so a pathological request cannot pin the handler.
+func streamDiagCmd(ctx context.Context, timeout time.Duration, cmd []string, sendFn func(string) error) error {
+	ctx, cancelTimeout := context.WithTimeout(ctx, clampDiagTimeout(timeout))
+	defer cancelTimeout()
+	// Cancelable layer for the send-failure path: when sendFn fails the
+	// scanner goroutine stops reading the pipe, so without an explicit
+	// cancel the child would block on writes until the deadline killed
+	// it — cancel here makes CommandContext kill it promptly (#1819).
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	c := exec.CommandContext(ctx, cmd[0], cmd[1:]...)
 	// U3 parity (#1805): cap the post-kill pipe-drain window so a child
@@ -149,6 +158,10 @@ func streamDiagCmd(ctx context.Context, cmd []string, sendFn func(string) error)
 	go func() {
 		for scanner.Scan() {
 			if err := sendFn(scanner.Text()); err != nil {
+				// Nobody reads the pipe after this point — kill the
+				// child now instead of letting it block on writes for
+				// the rest of the budget.
+				cancel()
 				scanDone <- err
 				return
 			}
