@@ -16,8 +16,11 @@
 #
 # Pinned smoke assertions (full runnable snippet in docs/cos-wan-sqm.md
 # "Validation recipe"):
-#   (a) iperf3 -P 2 to 172.16.80.200 holds ~3 Gbit/s aggregate;
-#   (b) after the 2-flow run, at least one
+#   (a) iperf3 -P 8 to 172.16.80.200 holds ~3 Gbit/s aggregate
+#       (-P 8 not -P 2: promotion needs two flows on the SAME worker
+#       queue; 8 flows over the WAN VF's 6 RSS queues pigeonhole one
+#       worker into >=2 — see the doc's validation recipe);
+#   (b) during/right after the run, at least one
 #       xpf_userspace_cos_active_flow_count sample is > 1
 #       (curl -s http://127.0.0.1:8080/metrics |
 #        grep '^xpf_userspace_cos_active_flow_count' | awk '$2 > 1'

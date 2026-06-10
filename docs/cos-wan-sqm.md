@@ -263,15 +263,23 @@ EOF
 incus exec loss:xpf-userspace-fw0 -- /usr/local/sbin/cli -c \
     "show class-of-service interface"
 
-# 3. Two-flow run through the shaped WAN path.
-iperf3 -c 172.16.80.200 -P 2 -t 20
+# 3. Multi-flow run through the shaped WAN path. -P 8, not -P 2: lazy
+#    promotion needs two distinct flows on the SAME worker queue, and
+#    the cluster's WAN VF spreads flows across 6 RSS queues — with
+#    only 2 flows they land on the same worker ~1/6 of the time
+#    (observed live: 2 flows -> two workers each reporting
+#    active_flow_count 1, assertion (b) empty). 8 flows over 6 queues
+#    pigeonhole at least one worker into >=2 flows, making (b)
+#    deterministic.
+iperf3 -c 172.16.80.200 -P 8 -t 20
 
 # 4. Pinned assertions.
 #    (a) Shape held: iperf3 aggregate ~= the fixture's shaping-rate
 #        (3g fixture rate => ~2.8-3.0 Gbit/s SUM; line rate ~23 Gbit/s
 #        would mean the shaper is NOT live).
 #    (b) MQFQ promotion engaged: at least one active_flow_count sample
-#        on the shaped queue is > 1 after the 2-flow run.
+#        on the shaped queue is > 1. Sample WHILE step 3 runs (or
+#        immediately after) — the gauge decays as flows go idle.
 incus exec loss:xpf-userspace-fw0 -- \
     curl -s http://127.0.0.1:8080/metrics | \
     grep '^xpf_userspace_cos_active_flow_count' | awk '$2 > 1'
