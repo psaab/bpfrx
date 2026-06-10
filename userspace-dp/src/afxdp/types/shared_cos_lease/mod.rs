@@ -1768,6 +1768,14 @@ fn record_equal_flow_active_sample(pg: &PackedEpochGrant, my_tag: u32, active_fl
     }
 }
 
+/// #1826 (#1663 finding 1.11): release-visible invariant-violation counter
+/// for the grant-overflow guard in `worker_grant_bump`. The
+/// `debug_assert!` there is compiled out in release builds, so without
+/// this the violation (refuse-the-grant + continue) is invisible in
+/// production. Local-only diagnostic — intentionally NOT plumbed into the
+/// wire status protocol; read via the first-hit stderr line.
+static WORKER_GRANT_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
+
 /// #1229 Phase 6 v8: tag-checked CAS-based bump of a per-worker grant
 /// slot. Returns `false` if tag mismatched (rotation occurred);
 /// caller treats that as "abandon this grant", since rotation already
@@ -1786,6 +1794,15 @@ fn worker_grant_bump(pg: &PackedEpochGrant, my_tag: u32, take: u32) -> bool {
                 "worker_grants overflow: tag={} curr={} take={}",
                 curr_tag, curr_granted, take
             );
+            // Cold path: never taken unless grant accounting is already
+            // broken. First hit logs once to journald (stderr).
+            if WORKER_GRANT_OVERFLOWS.fetch_add(1, Ordering::Relaxed) == 0 {
+                eprintln!(
+                    "xpf-userspace-dp: invariant violation: worker_grants \
+                     overflow tag={curr_tag} curr={curr_granted} take={take} \
+                     (local counter only)"
+                );
+            }
             return false;
         };
         let new = PackedEpochGrant::pack(curr_tag, new_granted);

@@ -5,8 +5,7 @@ use crate::DestinationNATRuleSnapshot;
 use rustc_hash::FxHashMap;
 use std::net::IpAddr;
 
-pub(super) const PROTO_TCP: u8 = 6;
-pub(super) const PROTO_UDP: u8 = 17;
+pub(super) use crate::ip_proto::{PROTO_TCP, PROTO_UDP};
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct DnatKey {

@@ -512,6 +512,10 @@ mod mirror_tests {
             BindingWorker::new_for_mirror_test(2, 0, 33, 0),
         ];
         let original_frame = build_ipv4_test_packet(0);
+        // SAFETY: single-threaded test over a UMEM created just above; no
+        // other borrow into [0, len) exists and the mutable slice is
+        // consumed by the immediate copy_from_slice before anything else
+        // touches the area.
         unsafe {
             bindings[0]
                 .umem
@@ -571,6 +575,11 @@ mod mirror_tests {
             &dynamic_neighbors,
             None,
             1,
+            // SAFETY: `area` was cast from `&MmapArea` borrowed out of
+            // bindings[0].umem just above; the Rc-backed allocation lives
+            // past this call, the split_at_mut borrows cover disjoint
+            // binding state (not the umem area), and the test is
+            // single-threaded.
             unsafe { &*area },
             &mut shared_recycles,
         );
@@ -622,6 +631,10 @@ mod mirror_tests {
             BindingWorker::new_for_mirror_test(1, 0, 22, 0),
         ];
         let original_frame = build_ipv4_test_packet(0);
+        // SAFETY: single-threaded test over a UMEM created just above; no
+        // other borrow into [0, len) exists and the mutable slice is
+        // consumed by the immediate copy_from_slice before anything else
+        // touches the area.
         unsafe {
             bindings[0]
                 .umem
@@ -673,6 +686,11 @@ mod mirror_tests {
             &dynamic_neighbors,
             None,
             now_ns,
+            // SAFETY: `area` was cast from `&MmapArea` borrowed out of
+            // bindings[0].umem just above; the Rc-backed allocation lives
+            // past this call, the split_at_mut borrows cover disjoint
+            // binding state (not the umem area), and the test is
+            // single-threaded.
             unsafe { &*area },
             &mut shared_recycles,
         );
@@ -733,6 +751,10 @@ mod mirror_tests {
             BindingWorker::new_for_mirror_test(1, 0, 22, 0),
         ];
         let original_frame = build_ipv4_test_packet(0);
+        // SAFETY: single-threaded test over a UMEM created just above; no
+        // other borrow into [0, len) exists and the mutable slice is
+        // consumed by the immediate copy_from_slice before anything else
+        // touches the area.
         unsafe {
             bindings[0]
                 .umem
@@ -797,6 +819,11 @@ mod mirror_tests {
             &dynamic_neighbors,
             Some(&resolver),
             now_ns,
+            // SAFETY: `area` was cast from `&MmapArea` borrowed out of
+            // bindings[0].umem just above; the Rc-backed allocation lives
+            // past this call, the split_at_mut borrows cover disjoint
+            // binding state (not the umem area), and the test is
+            // single-threaded.
             unsafe { &*area },
             &mut shared_recycles,
         );
@@ -826,6 +853,10 @@ mod mirror_tests {
             BindingWorker::new_for_mirror_test(1, 0, 22, 0),
         ];
         let original_frame = build_ipv4_test_packet(0);
+        // SAFETY: single-threaded test over a UMEM created just above; no
+        // other borrow into [0, len) exists and the mutable slice is
+        // consumed by the immediate copy_from_slice before anything else
+        // touches the area.
         unsafe {
             bindings[0]
                 .umem
@@ -874,6 +905,11 @@ mod mirror_tests {
             &dynamic_neighbors,
             Some(&resolver),
             now_ns,
+            // SAFETY: `area` was cast from `&MmapArea` borrowed out of
+            // bindings[0].umem just above; the Rc-backed allocation lives
+            // past this call, the split_at_mut borrows cover disjoint
+            // binding state (not the umem area), and the test is
+            // single-threaded.
             unsafe { &*area },
             &mut shared_recycles,
         );

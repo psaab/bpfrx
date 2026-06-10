@@ -9,8 +9,7 @@ use crate::{FirewallFilterSnapshot, FirewallTermSnapshot, InterfaceSnapshot};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::AtomicU32;
 
-const PROTO_TCP: u8 = 6;
-const PROTO_UDP: u8 = 17;
+use crate::ip_proto::{PROTO_TCP, PROTO_UDP};
 
 fn make_key() -> crate::session::SessionKey {
     crate::session::SessionKey {

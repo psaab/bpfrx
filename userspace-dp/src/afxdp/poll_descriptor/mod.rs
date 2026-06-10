@@ -56,6 +56,18 @@ use filter::{
 // code-motion at the IR level (modulo what rustc's inliner picks
 // up; the explicit hint matches other hot-path extractions in
 // this repo).
+//
+// `area` raw-pointer contract (#1826, applies to every
+// `unsafe { &*area }` reborrow in this function): the caller
+// (worker/lifecycle.rs `process_binding_rx`) casts `area` from a
+// `&MmapArea` borrowed out of `binding.umem`'s `Rc<WorkerUmemInner>`
+// allocation. The pointee outlives this call — nothing on the poll
+// path drops or replaces `binding.umem`, and the only
+// `&mut WorkerUmemInner` escape hatch (`WorkerUmem::umem_mut` via
+// `Rc::get_mut`) runs solely at bind time, never while a worker is
+// polling — so each shared reborrow is valid and cannot alias a
+// mutable reference. The raw pointer only decouples the immutable
+// UMEM-area borrow from the `&mut BindingWorker` borrow.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn poll_binding_process_descriptor(
     binding: &mut BindingWorker,
@@ -81,12 +93,16 @@ pub(super) fn poll_binding_process_descriptor(
         while let Some(desc) = received.read() {
             record_rx_descriptor_telemetry(desc, area, telemetry, worker_ctx);
             let mut recycle_now = true;
+            // SAFETY: per the `area` contract in this function's header
+            // comment — pointee outlives the call, never aliased mutably.
             if let Some(meta) = try_parse_metadata(unsafe { &*area }, desc) {
                 telemetry.counters.metadata_packets += 1;
                 let disposition = classify_metadata(meta, validation);
                 if disposition == PacketDisposition::Valid {
                     telemetry.counters.validated_packets += 1;
                     telemetry.counters.validated_bytes += desc.len as u64;
+                    // SAFETY: per the `area` contract in this function's
+                    // header comment.
                     let Some(raw_frame) =
                         unsafe { &*area }.slice(desc.addr as usize, desc.len as usize)
                     else {
@@ -119,6 +135,8 @@ pub(super) fn poll_binding_process_descriptor(
                     // the source MAC is the outer host's, not the
                     // GRE tunnel egress).
                     let flow = stage_parse_flow_and_learn(
+                        // SAFETY: per the `area` contract in this
+                        // function's header comment.
                         unsafe { &*area },
                         desc,
                         packet_frame,
@@ -851,6 +869,8 @@ pub(super) fn poll_binding_process_descriptor(
                                 let icmpv6_trace = meta.protocol == PROTO_ICMPV6
                                     && ICMPV6_EMBED_LOGGED.fetch_add(1, Ordering::Relaxed) < 32;
                                 if let Some(icmp_match) = try_embedded_icmp_nat_match(
+                                    // SAFETY: per the `area` contract in
+                                    // this function's header comment.
                                     unsafe { &*area },
                                     desc,
                                     meta,
@@ -1585,6 +1605,8 @@ pub(super) fn poll_binding_process_descriptor(
                             worker_ctx.ha_state,
                             now_secs,
                             resolve_forwarding(
+                                // SAFETY: per the `area` contract in this
+                                // function's header comment.
                                 unsafe { &*area },
                                 desc,
                                 meta,
@@ -2016,6 +2038,8 @@ pub(super) fn poll_binding_process_descriptor(
                                     &binding.live,
                                     worker_ctx.slow_path.as_deref(),
                                     worker_ctx.local_tunnel_deliveries,
+                                    // SAFETY: per the `area` contract in
+                                    // this function's header comment.
                                     unsafe { &*area },
                                     desc,
                                     meta,
