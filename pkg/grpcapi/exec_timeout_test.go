@@ -80,3 +80,40 @@ func TestClampTailLines(t *testing.T) {
 		}
 	}
 }
+
+// TestWaitDelayBoundsInheritedPipeDrain pins the WaitDelay half of the
+// contract (Codex review on PR #1818): killing the direct child is not
+// enough — a grandchild that inherited the output pipe keeps
+// CombinedOutput blocked until every write end closes. `sleep 30 &`
+// backgrounds such a grandchild; after the 200ms parent deadline kills
+// the shell, only cmd.WaitDelay (5s) closes the pipes. Without the
+// WaitDelay assignment this test runs ~30s and fails the bound below;
+// with it, ~5.2s.
+func TestWaitDelayBoundsInheritedPipeDrain(t *testing.T) {
+	parent, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := combinedOutputTimeout(parent, "sh", "-c", "sleep 30 & exec sleep 30")
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("want error for killed command, got nil")
+	}
+	if elapsed >= 15*time.Second {
+		t.Fatalf("pipe drain took %v — WaitDelay did not bound the grandchild-held pipe", elapsed)
+	}
+}
+
+// TestOutputTimeoutKillsHungCommand covers the kill path for the
+// stdout-only variant (previously only the fidelity path was tested).
+func TestOutputTimeoutKillsHungCommand(t *testing.T) {
+	parent, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := outputTimeout(parent, "sleep", "30")
+	if err == nil {
+		t.Fatal("want error for killed command, got nil")
+	}
+	if elapsed := time.Since(start); elapsed >= 10*time.Second {
+		t.Fatalf("kill took %v, want prompt", elapsed)
+	}
+}
