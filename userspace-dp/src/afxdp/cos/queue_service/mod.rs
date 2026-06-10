@@ -146,6 +146,13 @@ fn record_cos_queue_lease_acquire(
         .cos
         .cos_queue_lease_acquire_v8_granted_bytes
         .wrapping_add(telemetry.v8_granted_bytes);
+    // #1782 Step-1 (ii): flush the selector-attributed per-cause
+    // under-grant counts into the worker-local accumulator published
+    // at the ~1s runtime tick.
+    binding
+        .cos
+        .cos_queue_lease_undergrants
+        .add_assign(&telemetry.v8_undergrants);
 }
 
 #[inline]
@@ -693,6 +700,12 @@ fn select_exact_cos_guarantee_queue_with_lease_telemetry(
                 .owner_profile
                 .drain_park_queue_tokens
                 .fetch_add(1, Ordering::Relaxed);
+            // #1782 Step-1 (ii): the plan r2-F1 selector-site
+            // comparison — post-top-up tokens still below head_len —
+            // attributed to the v8 shortfall cause this pass's
+            // `maybe_top_up_cos_queue_lease` reported (`None` causes,
+            // e.g. legacy lease or full grant, are not counted).
+            lease_telemetry.count_v8_undergrant(top_up.v8_shortfall_cause);
             // #915: surplus-sharing exact queues stay runnable when
             // queue.hot.tokens runs out — do NOT park. This lets the
             // queue fall through to `select_cos_surplus_batch` on
@@ -991,6 +1004,9 @@ fn select_exact_cos_guarantee_queue_waterfill(
                 .owner_profile
                 .drain_park_queue_tokens
                 .fetch_add(1, Ordering::Relaxed);
+            // #1782 Step-1 (ii): waterfill selector-site under-grant
+            // attribution — same contract as the legacy RR site above.
+            lease_telemetry.count_v8_undergrant(top_up.v8_shortfall_cause);
             if queue.config.surplus_sharing {
                 continue;
             }
