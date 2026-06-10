@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"path/filepath"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dhcp"
@@ -26,11 +25,10 @@ func buildDHCPClientSpecs(cfg *config.Config) []dhcp.ClientSpec {
 			if unit == nil || (!unit.DHCP && !unit.DHCPv6) {
 				continue
 			}
-			// Use VLAN sub-interface name when unit has a VLAN ID
-			dhcpIface := config.LinuxIfName(ifName)
-			if unit.VlanID > 0 {
-				dhcpIface = fmt.Sprintf("%s.%d", dhcpIface, unit.VlanID)
-			}
+			// Shared lease-key derivation (#1844): the same helper the
+			// ip-monitoring compiler uses for interface-typed next-hops,
+			// so the two derivations can never drift.
+			dhcpIface := config.DHCPLeaseIfName(ifName, unit)
 			if unit.DHCP {
 				spec := dhcp.ClientSpec{Iface: dhcpIface, Family: dhcp.AFInet}
 				if unit.DHCPOptions != nil {
@@ -102,28 +100,43 @@ func (d *Daemon) onDHCPAddressChange() {
 // + remove the leased address; no protocol RELEASE), and option changes
 // restart the affected client. Called from applyConfigLocked on every
 // apply, so commit-time enable/disable behaves like Junos instead of
-// boot-time-only. The DHCP manager is created lazily on first need —
-// a startup config without DHCP no longer disables DHCP for the life
-// of the process.
+// boot-time-only. The DHCP manager is created eagerly in Run (#1844,
+// AGY plan r2-1) — d.dhcp is write-once at boot, so there is no
+// lazy-create branch here and no pointer race against the bare reads
+// in the ipmon resolver and the CLI/gRPC handlers.
 func (d *Daemon) reconcileDHCPClients(cfg *config.Config) {
-	if d.opts.NoDataplane {
+	if d.opts.NoDataplane || d.dhcp == nil {
 		return
 	}
 	specs := buildDHCPClientSpecs(cfg)
-	if len(specs) == 0 && d.dhcp == nil {
-		return // nothing desired, nothing running
-	}
-	if d.dhcp == nil {
-		// State dir for DUID persistence — same directory as config file
-		stateDir := filepath.Dir(d.opts.ConfigFile)
-		dm, err := dhcp.New(stateDir, d.onDHCPAddressChange, nil)
-		if err != nil {
-			slog.Warn("failed to create DHCP manager", "err", err)
-			return
-		}
-		d.dhcp = dm
+	if len(specs) == 0 {
+		// Reconcile(nil) stops any running clients; with none running
+		// it is a no-op.
+		d.dhcp.Reconcile(nil)
+		return
 	}
 	d.dhcp.Reconcile(specs)
+}
+
+// resolveDHCPNextHop is the ipmon NextHopResolver (#1844): it maps an
+// interface-typed preferred-route lease key
+// (PreferredRoute.NextHopInterface, derived via config.DHCPLeaseIfName)
+// to the unit's current DHCPv4-learned gateway. ok=false — no DHCP
+// manager (NoDataplane), no lease yet, or a lease without a router
+// option — makes the engine skip the candidate BEFORE winner
+// selection. Called under Engine.mu; LeaseFor takes dhcp.Manager.mu
+// briefly (the one-way Engine.mu → dhcp.mu lock order) and never calls
+// back into the engine.
+func (d *Daemon) resolveDHCPNextHop(leaseIface string) (string, bool) {
+	dm := d.dhcp // write-once at boot (Run), safe to read bare
+	if dm == nil {
+		return "", false
+	}
+	lease := dm.LeaseFor(leaseIface, dhcp.AFInet)
+	if lease == nil || !lease.Gateway.IsValid() || lease.Gateway.IsUnspecified() {
+		return "", false
+	}
+	return lease.Gateway.String(), true
 }
 
 func (d *Daemon) dhcpLeaseChangeRequiresRecompile(cfg *config.Config) bool {
@@ -147,11 +160,7 @@ func (d *Daemon) dhcpLeaseChangeRequiresRecompile(cfg *config.Config) bool {
 			if unit == nil || (!unit.DHCP && !unit.DHCPv6) {
 				continue
 			}
-			dhcpIface := config.LinuxIfName(ifName)
-			if unit.VlanID > 0 {
-				dhcpIface = fmt.Sprintf("%s.%d", dhcpIface, unit.VlanID)
-			}
-			if !d.mgmtVRFInterfaces[dhcpIface] {
+			if !d.mgmtVRFInterfaces[config.DHCPLeaseIfName(ifName, unit)] {
 				return true
 			}
 		}
