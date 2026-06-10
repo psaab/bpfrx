@@ -21,9 +21,12 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// Address family for the L4 checksum-offset / zero-checksum helpers.
 /// Only ever passed as a compile-time-literal at the call sites, so the
-/// `#[inline(always)]` helpers fold the match to a constant.
+/// `#[inline(always)]` helpers fold the match to a constant. Visible to
+/// the rest of `frame/` (#1839/#1840): the descriptor v6 arm
+/// (`rewrite/ipv6.rs`) and the port-rewrite path (`frame/mod.rs`)
+/// route their zero-checksum decisions through the same predicates.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ChecksumFamily {
+pub(in crate::afxdp::frame) enum ChecksumFamily {
     V4,
     V6,
 }
@@ -73,16 +76,22 @@ fn l4_udp_checksum_optional(protocol: u8) -> bool {
 }
 
 /// Whether a freshly-computed L4 checksum of 0x0000 must be canonicalized
-/// to 0xFFFF on the INCREMENTAL-ADJUST sites. IPv4: UDP only. IPv6: UDP and
-/// ICMPv6 (RFC 2460 §8.1 / RFC 8200 forbid a transmitted 0x0000 for both,
-/// since 0x0000 has the "no checksum" meaning for IPv4 UDP).
+/// to 0xFFFF. IPv4: UDP only. IPv6: UDP and ICMPv6 (RFC 2460 §8.1 /
+/// RFC 8200 forbid a transmitted 0x0000 for both, since 0x0000 has the
+/// "no checksum" meaning for IPv4 UDP).
 ///
-/// SCOPE: this describes the incremental `adjust_l4_checksum_*` sites ONLY.
-/// It deliberately does NOT describe `recompute_l4_checksum_ipv6`, whose
-/// ICMPv6 arm writes the raw sum without canonicalizing 0 → 0xFFFF — a
-/// pre-existing asymmetry this module preserves and does not unify here.
+/// SCOPE (#1839): this is the single source of truth for the
+/// computed-zero rule across the incremental `adjust_l4_checksum_*`
+/// sites, the descriptor fast path (`rewrite/ipv6.rs`), the port
+/// adjust (`adjust_l4_checksum_port`), and — by matching arithmetic —
+/// `recompute_l4_checksum_ipv6` (UDP and ICMPv6 arms canonicalize; TCP
+/// does not: a computed TCP 0x0000 is valid on the wire and matches v4
+/// TCP behavior).
 #[inline(always)]
-fn adjust_zero_checksum_illegal(protocol: u8, family: ChecksumFamily) -> bool {
+pub(in crate::afxdp::frame) fn adjust_zero_checksum_illegal(
+    protocol: u8,
+    family: ChecksumFamily,
+) -> bool {
     match family {
         ChecksumFamily::V4 => protocol == PROTO_UDP,
         ChecksumFamily::V6 => matches!(protocol, PROTO_UDP | PROTO_ICMPV6),
@@ -577,6 +586,11 @@ pub(in crate::afxdp) fn recompute_l4_checksum_ipv6(
                 .get_mut(rel_l4 + 2..rel_l4 + 4)?
                 .copy_from_slice(&[0, 0]);
             let sum = checksum16_ipv6(src, dst, PROTO_ICMPV6, packet.get(rel_l4..)?);
+            // #1839: canonicalize computed 0x0000 → 0xFFFF, completing
+            // the single coherent v6 matrix with the incremental
+            // adjusters (`adjust_zero_checksum_illegal` includes
+            // ICMPv6 for V6).
+            let sum = if sum == 0 { 0xffff } else { sum };
             packet
                 .get_mut(rel_l4 + 2..rel_l4 + 4)?
                 .copy_from_slice(&sum.to_be_bytes());
@@ -866,6 +880,48 @@ mod l4_offset_helper_tests {
             u16::from_be_bytes([p[42], p[43]]),
             0xffff,
             "ICMPv6 computed-zero must canonicalize to 0xffff"
+        );
+    }
+
+    #[test]
+    fn recompute_ipv6_icmpv6_computed_zero_canonicalizes_to_ffff() {
+        // #1839 rider: recompute_l4_checksum_ipv6's ICMPv6 arm
+        // canonicalizes a computed 0x0000 to 0xFFFF, completing the
+        // v6 matrix with the incremental adjusters. Two-pass balancing:
+        // stored C1 = !fold(S), so a balancing word of C1 makes
+        // fold(S + C1) = 0xFFFF → raw computed checksum 0.
+        let mut p = vec![0u8; 48];
+        p[0] = 0x60;
+        p[4..6].copy_from_slice(&8u16.to_be_bytes()); // payload len
+        p[6] = PROTO_ICMPV6;
+        p[7] = 64;
+        // src/dst stay all-zero; ICMPv6 echo header at 40..48 with the
+        // balancing word in the last two bytes.
+        p[40] = 128;
+        assert_eq!(recompute_l4_checksum_ipv6(&mut p, 40, PROTO_ICMPV6), Some(()));
+        let c1 = u16::from_be_bytes([p[42], p[43]]);
+        p[46..48].copy_from_slice(&c1.to_be_bytes());
+        assert_eq!(recompute_l4_checksum_ipv6(&mut p, 40, PROTO_ICMPV6), Some(()));
+        // Raw sum is genuinely zero (receiver-style verify with the
+        // field zeroed)…
+        let mut zeroed = p[40..].to_vec();
+        zeroed[2] = 0;
+        zeroed[3] = 0;
+        assert_eq!(
+            checksum16_ipv6(
+                Ipv6Addr::UNSPECIFIED,
+                Ipv6Addr::UNSPECIFIED,
+                PROTO_ICMPV6,
+                &zeroed
+            ),
+            0,
+            "balancing word must force the raw computed checksum to zero"
+        );
+        // …and the stored field is the canonical 0xFFFF encoding.
+        assert_eq!(
+            u16::from_be_bytes([p[42], p[43]]),
+            0xffff,
+            "ICMPv6 recompute must canonicalize computed-zero to 0xFFFF"
         );
     }
 

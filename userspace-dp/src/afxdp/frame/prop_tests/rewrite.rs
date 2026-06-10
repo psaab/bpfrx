@@ -492,15 +492,16 @@ fn pin_packet_v6_with_zero_csum(protocol: u8) -> ValidPacket {
     pkt
 }
 
-/// (e) #1839 (D1) pin: descriptor path canonicalizes a computed
-/// 0x0000 L4 checksum to 0xFFFF for ALL v6 protocols
-/// (rewrite/ipv6.rs:96-98); the generic path does so only for
-/// UDP/ICMPv6 (checksum.rs:85-90). Same input + same (no-op-
-/// equivalent) port rewrite → 0x0000 from generic, 0xFFFF from
-/// descriptor. Both encodings are valid one's-complement zero — this
-/// is exactly why P-N3 masks checksum bytes. Flip when #1839 is fixed.
+/// (e) #1839 (D1) FIXED pin: the descriptor path's computed-zero
+/// canonicalization is scoped to the shared predicate
+/// (`adjust_zero_checksum_illegal` — UDP/ICMPv6 for v6), matching the
+/// generic adjusters. A v6 TCP checksum that computes to 0x0000 keeps
+/// the 0x0000 encoding on BOTH paths (valid on the wire — RFC 8200
+/// §8.1 mandates the substitution for UDP only), and the two outputs
+/// are byte-identical end to end. (Flipped from the #1824 defect pin
+/// asserting the all-protocol descriptor canonicalization.)
 #[test]
-fn pin_1839_v6_tcp_zero_encoding_divergence() {
+fn pin_1839_v6_tcp_zero_encoding_parity() {
     let pkt = pin_packet_v6_with_zero_csum(PROTO_TCP);
     let csum_rel = pkt.rel_l4 + 16;
     // Sanity: the crafted packet is genuinely valid with stored 0x0000.
@@ -509,9 +510,9 @@ fn pin_1839_v6_tcp_zero_encoding_divergence() {
     )
     .is_ok());
 
-    // Same-port "rewrite": generic short-circuits (old == new port,
-    // frame/mod.rs:871) and leaves 0x0000; the descriptor applies its
-    // ≡0 delta (0xFFFF) and canonicalizes the resulting 0 to 0xFFFF.
+    // Same-port "rewrite": generic short-circuits (old == new port)
+    // and leaves 0x0000; the descriptor applies its ≡0 delta (0xFFFF),
+    // computes 0, and now KEEPS the 0x0000 encoding for TCP.
     let nat = NatDecision {
         rewrite_src_port: Some(pkt.src_port),
         ..NatDecision::default()
@@ -541,16 +542,49 @@ fn pin_1839_v6_tcp_zero_encoding_divergence() {
     let out_d = area.slice(d.offset as usize, d.len as usize).unwrap();
     assert_eq!(
         u16::from_be_bytes([out_d[14 + csum_rel], out_d[14 + csum_rel + 1]]),
-        0xffff,
-        "DEFECT #1839: descriptor canonicalizes v6 TCP 0x0000 → 0xFFFF"
+        0x0000,
+        "#1839 fixed: descriptor keeps the 0x0000 encoding for v6 TCP"
     );
 
-    // Both encodings verify — the divergence is representation-only.
+    // Full-frame byte equality — the divergence is gone.
+    assert_eq!(out_g, out_d, "#1839 fixed: outputs byte-identical");
     for out in [out_g, out_d] {
         assert!(
             oracle_packet_valid(&out[14..], AF6, PROTO_TCP, pkt.rel_l4, false).is_ok()
         );
     }
+}
+
+/// #1839 descriptor-scope matrix (deterministic): a v6 UDP checksum
+/// that computes to 0x0000 via the descriptor's ≡0 delta IS
+/// canonicalized to 0xFFFF (RFC 8200 §8.1) — the predicate scoping
+/// removed TCP from the canonicalization, not UDP.
+#[test]
+fn descriptor_v6_udp_computed_zero_canonicalizes() {
+    let pkt = pin_packet_v6_with_zero_csum(PROTO_UDP);
+    // NOTE: stored 0x0000 with a genuinely-zero sum. For UDP this
+    // stored encoding is the malformed RFC 8200 case; the descriptor's
+    // delta application turns it into the canonical 0xFFFF.
+    let csum_rel = pkt.rel_l4 + 6;
+    let nat = NatDecision {
+        rewrite_src_port: Some(pkt.src_port),
+        ..NatDecision::default()
+    };
+    let desc = XdpDesc {
+        addr: DIFF_ADDR as u64,
+        len: pkt.frame.len() as u32,
+        options: 0,
+    };
+    let area = area_with_frame(&pkt.frame);
+    let rd = make_descriptor(&pkt, nat, 0);
+    let d = apply_rewrite_descriptor(&area, desc, pkt.meta, &rd, None)
+        .expect("descriptor succeeds");
+    let out_d = area.slice(d.offset as usize, d.len as usize).unwrap();
+    assert_eq!(
+        u16::from_be_bytes([out_d[14 + csum_rel], out_d[14 + csum_rel + 1]]),
+        0xffff,
+        "v6 UDP computed-zero must canonicalize to 0xFFFF on the descriptor path"
+    );
 }
 
 /// (f) #1840 (D2) pin: `adjust_l4_checksum_port` (frame/mod.rs:905-907)
