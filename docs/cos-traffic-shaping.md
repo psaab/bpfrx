@@ -2,6 +2,11 @@
 
 Userspace-only implementation in the Rust AF_XDP forwarding plane.
 
+> Looking for the WAN smart-queueing (SQM) operator recipe — the
+> one-knob `shaping-rate` setup that buys CAKE-class shaping + per-flow
+> fairness on an uplink? See [`docs/cos-wan-sqm.md`](cos-wan-sqm.md)
+> (#1828). This file is the engine design doc.
+
 ## Scope and Non-Goals
 
 **This is:**
