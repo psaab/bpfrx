@@ -353,6 +353,67 @@ without reading them is how we ship dormant code.
   `xpf_userspace_cos_drain_nonexact_sent_bytes_while_exact_backlogged_total{...}`.
   Expected cardinality per the plan: ≤ 8192 series per histogram.
 
+## Reading the sojourn telemetry (#1829 Phase 1)
+
+Every shaped queue now measures per-packet **sojourn** — the time an
+item spends in the CoS queue, `now_ns - enqueue_ns`, stamped at the
+admission choke point (`enqueue_cos_item`) and sampled at the fused
+#1763 pop-commit points. This is the measurement-first half of the
+FQ-CoDel plan: Phase 2 (the CoDel control law on `codel-target`) is
+**gated on this telemetry's live evidence** and does not exist yet —
+setting `codel-target` today still changes nothing.
+
+Three per-queue values, on the wire (`CoSQueueStatus`), the CLI, and
+Prometheus:
+
+| Field | Prometheus gauge | Meaning |
+|---|---|---|
+| `sojourn_windowed_min_ns` | `xpf_userspace_cos_sojourn_windowed_min_ns` | **The gate metric.** Minimum sojourn over the last 1-2 100 ms windows (two-bucket flip-flop) — CoDel's standing-queue estimator. |
+| `sojourn_ewma_ns` | `xpf_userspace_cos_sojourn_ewma_ns` | Shift-add EWMA (α=1/8) over pops. Supporting context only. |
+| `sojourn_peak_ns` | `xpf_userspace_cos_sojourn_peak_ns` | Lifetime max (same contract as `active_flow_buckets_peak`). |
+
+```
+show class-of-service interface reth0.80
+    Queue 4 ...
+           Drops: flow_share=0  buffer=0  ecn_marked=312
+           Sojourn: win_min=1.8ms  ewma=2.5ms  peak=9.0ms
+```
+
+How to read it:
+
+- **`win_min` persistently above `codel-target` (default candidate
+  5 ms) for ≥ one 100 ms window = standing-queue evidence** — the
+  §6.1d gate criterion (a) for proceeding with Phase 2. A transient
+  burst inflates `ewma`/`peak` but NOT `win_min`; only a queue that
+  never drains below the value for a whole window moves the minimum.
+- **`win_min` = 0 means "no standing queue"**, in one of two ways: no
+  pops in the last ~2 windows at snapshot time (the export is
+  evaluated against the snapshot pass's `now_ns`, so a stale reading
+  cannot outlive the backlog that produced it), or items popping with
+  ~zero queueing delay. Either way: no CoDel case on this queue.
+- `ewma`/`peak` are **biased high by scheduler service gaps** (a
+  single 10 ms gap between visits inflates both while the true
+  standing queue is zero) — that is exactly why the windowed minimum
+  is the gate metric (plan AGY r2 F2). Use them only to size the
+  distribution, never as standing-queue evidence.
+- Aggregation is **MAX-merge** at both layers (worker instances →
+  worker row; workers → coordinator row): the row reports the
+  worst-instance value, which is what a per-worker Phase-2 CoDel
+  would act on. It is NOT an average across the interface.
+- The CLI line appears only after the queue has recorded at least one
+  sample (`peak > 0`); idle queues stay clean. The Prometheus gauges
+  emit unconditionally (a `win_min` 0 on a busy queue is the gate
+  evidence's strongest negative result and must be visible).
+
+Phase-1 gate procedure (plan §6.1d): re-run the #1359 100E100M
+surplus-sharing matrix and the per-class sweep with this telemetry
+deployed, capture `win_min` per queue per regime concurrently with
+the mouse-latency probes, and proceed to Phase 2 only if (a) some
+shaped queue sustains `win_min` above target for ≥ one interval in a
+regime we care about AND (b) those excursions correlate in time with
+the failing p99.9 probe cells. If (a) fails everywhere, Phase 2 is
+PLAN-KILLED and #1829 closes with this telemetry as the deliverable.
+
 ## Reading the waterfill trace counters (#1628)
 
 For interfaces in `oversubscription-policy guarantee-rate` mode the
