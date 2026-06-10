@@ -462,6 +462,7 @@ pub(in crate::afxdp) fn enqueue_local_into_cos(
                     prepared_req.cos_queue_id,
                     item_len,
                     CoSPendingTxItem::Prepared(prepared_req),
+                    now_ns,
                     shared_recycles.as_deref_mut(),
                 ) {
                     Ok(()) => return Ok(()),
@@ -481,6 +482,7 @@ pub(in crate::afxdp) fn enqueue_local_into_cos(
                             req.cos_queue_id,
                             item_len,
                             CoSPendingTxItem::Local(req),
+                            now_ns,
                             shared_recycles.as_deref_mut(),
                         ) {
                             Ok(()) => Ok(()),
@@ -519,6 +521,7 @@ pub(in crate::afxdp) fn enqueue_local_into_cos(
                     req.cos_queue_id,
                     item_len,
                     CoSPendingTxItem::Local(req),
+                    now_ns,
                     shared_recycles.as_deref_mut(),
                 ) {
                     Ok(()) => Ok(()),
@@ -537,6 +540,7 @@ pub(in crate::afxdp) fn enqueue_local_into_cos(
         req.cos_queue_id,
         item_len,
         CoSPendingTxItem::Local(req),
+        now_ns,
         shared_recycles.as_deref_mut(),
     ) {
         Ok(()) => Ok(()),
@@ -592,6 +596,7 @@ pub(super) fn enqueue_prepared_into_cos(
             req.cos_queue_id,
             item_len,
             CoSPendingTxItem::Prepared(req),
+            now_ns,
             shared_recycles.as_deref_mut(),
         ) {
             Ok(()) => return Ok(()),
@@ -615,6 +620,7 @@ pub(super) fn enqueue_prepared_into_cos(
         local_req.cos_queue_id,
         item_len,
         CoSPendingTxItem::Local(local_req),
+        now_ns,
         shared_recycles.as_deref_mut(),
     ) {
         Ok(()) => {
@@ -812,8 +818,21 @@ fn enqueue_cos_item(
     requested_queue: Option<u8>,
     item_len: u64,
     mut item: CoSPendingTxItem,
+    now_ns: u64,
     mut shared_recycles: Option<&mut Vec<(u32, u64)>>,
 ) -> Result<(), CoSPendingTxItem> {
+    // #1829 Phase 1: stamp the CoS enqueue timestamp at the single
+    // admission choke point. Every item entering a CoS queue passes
+    // through here exactly once per admission attempt; promote
+    // migrations and pop->push_front rollbacks re-insert via
+    // `cos_queue_push_back`/`cos_queue_push_front` directly and
+    // therefore keep the ORIGINAL stamp (correct for sojourn). One
+    // u64 store from the already-threaded pass `now_ns` -- no clock
+    // syscall (#1734).
+    match &mut item {
+        CoSPendingTxItem::Local(req) => req.enqueue_ns = now_ns,
+        CoSPendingTxItem::Prepared(req) => req.enqueue_ns = now_ns,
+    }
     let mut root_became_nonempty = false;
     let mut accepted_exact = false;
     let (accepted, queue_id, recycle) = {

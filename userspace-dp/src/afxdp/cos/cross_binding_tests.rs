@@ -22,6 +22,7 @@ fn test_prepared_mirror_request(offset: u64, len: u32) -> PreparedTxRequest {
         cos_queue_id: Some(4),
         dscp_rewrite: None,
         mirror_clone: true,
+        enqueue_ns: 0,
     }
 }
 
@@ -47,6 +48,7 @@ fn redirect_local_cos_request_to_owner_pushes_worker_command() {
         cos_queue_id: Some(4),
         dscp_rewrite: None,
         mirror_clone: false,
+        enqueue_ns: 0,
     };
 
     let redirected =
@@ -86,6 +88,7 @@ fn redirect_local_cos_request_to_owner_uses_interface_default_queue_owner_when_u
         cos_queue_id: None,
         dscp_rewrite: None,
         mirror_clone: false,
+        enqueue_ns: 0,
     };
 
     let redirected =
@@ -118,6 +121,7 @@ fn redirect_local_cos_request_to_owner_rejects_explicit_queue_miss() {
         cos_queue_id: Some(4),
         dscp_rewrite: None,
         mirror_clone: false,
+        enqueue_ns: 0,
     };
 
     let redirected =
@@ -162,6 +166,7 @@ fn redirect_local_cos_request_to_owner_keeps_exact_queue_on_eligible_worker() {
         cos_queue_id: Some(4),
         dscp_rewrite: None,
         mirror_clone: false,
+        enqueue_ns: 0,
     };
 
     let redirected =
@@ -375,6 +380,7 @@ fn redirect_local_cos_request_to_owner_binding_pushes_owner_live_queue() {
         cos_queue_id: Some(4),
         dscp_rewrite: None,
         mirror_clone: false,
+        enqueue_ns: 0,
     };
 
     let redirected =
@@ -467,6 +473,7 @@ fn redirect_local_cos_request_to_owner_uses_owner_live_queue_when_available() {
         cos_queue_id: Some(4),
         dscp_rewrite: None,
         mirror_clone: false,
+        enqueue_ns: 0,
     };
 
     let redirected =
@@ -515,6 +522,7 @@ fn redirect_local_cos_request_to_owner_redirects_low_rate_exact_queue() {
         cos_queue_id: Some(4),
         dscp_rewrite: None,
         mirror_clone: false,
+        enqueue_ns: 0,
     };
 
     let redirected =
@@ -566,6 +574,7 @@ fn redirect_local_exact_cos_request_to_owner_binding_pushes_owner_live_queue() {
         cos_queue_id: Some(4),
         dscp_rewrite: None,
         mirror_clone: false,
+        enqueue_ns: 0,
     };
 
     let redirected =

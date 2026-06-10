@@ -149,6 +149,7 @@ pub(in crate::afxdp) fn drain_exact_local_items_to_scratch_flow_fair(
     root_budget: u64,
     secondary_budget: u64,
     queue_dscp_rewrite: Option<u8>,
+    now_ns: u64,
 ) -> ExactCoSScratchBuild {
     // #785 Phase 3 — Codex round-3 NEW-2 / Rust reviewer LOW:
     // clear the pop-snapshot stack at batch start. The bound
@@ -292,6 +293,11 @@ pub(in crate::afxdp) fn drain_exact_local_items_to_scratch_flow_fair(
             };
         };
         frame.copy_from_slice(&req.bytes);
+        // #1829 Phase 1: sojourn sample at the dequeue commit (the
+        // item is now bound to a TX frame). The no-free-frame
+        // push_front rollback above never reaches here, so a rolled-
+        // back item is sampled only when it is finally committed.
+        queue.telemetry.sojourn.record(req.enqueue_ns, now_ns);
         scratch_local_tx.push((offset, req));
     }
 
@@ -416,6 +422,7 @@ pub(in crate::afxdp) fn drain_exact_prepared_items_to_scratch_flow_fair(
     root_budget: u64,
     secondary_budget: u64,
     queue_dscp_rewrite: Option<u8>,
+    now_ns: u64,
 ) -> ExactCoSScratchBuild {
     // #785 Phase 3 — Codex round-3 NEW-2 / Rust reviewer LOW:
     // clear the pop-snapshot stack at batch start. See the
@@ -543,6 +550,9 @@ pub(in crate::afxdp) fn drain_exact_prepared_items_to_scratch_flow_fair(
                 dropped_bytes: len,
             };
         }
+        // #1829 Phase 1: sojourn sample at the dequeue commit (see
+        // the Local flow-fair drain above).
+        queue.telemetry.sojourn.record(req.enqueue_ns, now_ns);
         scratch_prepared_tx.push(req);
     }
 

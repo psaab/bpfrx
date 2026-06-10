@@ -63,6 +63,7 @@ fn cos_queue_rejects_prepared_once_local_items_enter_queue() {
             cos_queue_id: Some(5),
             dscp_rewrite: None,
             mirror_clone: false,
+            enqueue_ns: 0,
         }),
     );
     cos_queue_push_back(
@@ -77,6 +78,7 @@ fn cos_queue_rejects_prepared_once_local_items_enter_queue() {
             cos_queue_id: Some(5),
             dscp_rewrite: None,
             mirror_clone: false,
+            enqueue_ns: 0,
         }),
     );
 
@@ -116,6 +118,7 @@ fn exact_local_fifo_boundary_survives_partial_commit() {
             cos_queue_id: Some(5),
             dscp_rewrite: None,
             mirror_clone: false,
+            enqueue_ns: 0,
         }));
     root.queues[0]
         .hot
@@ -130,6 +133,7 @@ fn exact_local_fifo_boundary_survives_partial_commit() {
             cos_queue_id: Some(5),
             dscp_rewrite: None,
             mirror_clone: false,
+            enqueue_ns: 0,
         }));
     root.queues[0]
         .hot
@@ -146,6 +150,7 @@ fn exact_local_fifo_boundary_survives_partial_commit() {
             cos_queue_id: Some(5),
             dscp_rewrite: None,
             mirror_clone: false,
+            enqueue_ns: 0,
         }));
 
     let mut free_tx_frames = VecDeque::from([64, 128, 192]);
@@ -239,6 +244,7 @@ fn drain_exact_prepared_items_to_scratch_recycles_dropped_prepared_frame() {
             cos_queue_id: Some(5),
             dscp_rewrite: None,
             mirror_clone: false,
+            enqueue_ns: 0,
         }));
 
     let mut scratch_prepared_tx = Vec::new();
@@ -315,6 +321,7 @@ fn exact_prepared_fifo_boundary_survives_partial_commit() {
             cos_queue_id: Some(5),
             dscp_rewrite: None,
             mirror_clone: false,
+            enqueue_ns: 0,
         }));
     root.queues[0]
         .hot
@@ -331,6 +338,7 @@ fn exact_prepared_fifo_boundary_survives_partial_commit() {
             cos_queue_id: Some(5),
             dscp_rewrite: None,
             mirror_clone: false,
+            enqueue_ns: 0,
         }));
     root.queues[0]
         .hot
@@ -345,6 +353,7 @@ fn exact_prepared_fifo_boundary_survives_partial_commit() {
             cos_queue_id: Some(5),
             dscp_rewrite: None,
             mirror_clone: false,
+            enqueue_ns: 0,
         }));
 
     let mut scratch_prepared_tx = Vec::new();
@@ -441,6 +450,7 @@ fn cos_queue_push_and_pop_track_flow_bucket_bytes() {
         cos_queue_id: Some(4),
         dscp_rewrite: None,
         mirror_clone: false,
+        enqueue_ns: 0,
     };
     let req_b = TxRequest {
         bytes: vec![0; 1500],
@@ -452,6 +462,7 @@ fn cos_queue_push_and_pop_track_flow_bucket_bytes() {
         cos_queue_id: Some(4),
         dscp_rewrite: None,
         mirror_clone: false,
+        enqueue_ns: 0,
     };
     let bucket_a = cos_flow_bucket_index(
         test_flow_fair_state(queue).flow_hash_seed,
@@ -974,6 +985,7 @@ fn cos_exact_drain_throughput_micro_bench() {
                     cos_queue_id: Some(5),
                     dscp_rewrite: None,
                     mirror_clone: false,
+                    enqueue_ns: 0,
                 }));
             queue.hot.queued_bytes += packet.len() as u64;
         }
@@ -1174,6 +1186,7 @@ fn bench_pop_commit_settle_publish() {
                 cos_queue_id: Some(0),
                 dscp_rewrite: None,
                 mirror_clone: false,
+                enqueue_ns: 0,
             };
             let _ = req.bytes.len();
             cos_queue_push_back(queue, CoSPendingTxItem::Local(req));
@@ -1193,6 +1206,7 @@ fn bench_pop_commit_settle_publish() {
             u64::MAX,
             u64::MAX,
             None,
+            0,
         );
         let inserted = scratch.len();
         settle_exact_local_scratch_submission_flow_fair(
@@ -1222,6 +1236,7 @@ fn bench_pop_commit_settle_publish() {
             u64::MAX,
             u64::MAX,
             None,
+            0,
         );
         let inserted = scratch.len();
         settle_exact_local_scratch_submission_flow_fair(

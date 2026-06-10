@@ -465,6 +465,7 @@ fn vmin_demote_no_drain_all_leak() {
         expected_addr_family: libc::AF_INET as u8,
         expected_protocol: PROTO_TCP,
         egress_ifindex: 80,
+        enqueue_ns: 0,
     };
     cos_queue_push_back(queue, CoSPendingTxItem::Prepared(prep));
 
@@ -756,6 +757,7 @@ fn vmin_suspension_not_decremented_on_empty_tx_frames() {
         u64::MAX,
         u64::MAX,
         None,
+        0,
     );
     assert_eq!(
         queue.v_min.v_min_suspended_remaining, initial,
@@ -889,6 +891,7 @@ fn vmin_prepared_flow_fair_throttle_and_suspension() {
         u64::MAX,
         u64::MAX,
         None,
+        0,
     );
     assert!(
         scratch.is_empty(),
@@ -911,6 +914,7 @@ fn vmin_prepared_flow_fair_throttle_and_suspension() {
         u64::MAX,
         u64::MAX,
         None,
+        0,
     );
     assert_eq!(
         queue.v_min.v_min_suspended_remaining, 4,
@@ -967,6 +971,7 @@ fn vmin_prepared_no_suspension_burn_when_head_is_local() {
         u64::MAX,
         u64::MAX,
         None,
+        0,
     );
     assert_eq!(
         queue.v_min.v_min_suspended_remaining, initial,
@@ -1027,6 +1032,7 @@ fn vmin_prepared_drain_arms_hard_cap_after_repeated_throttle() {
             u64::MAX,
             u64::MAX,
             None,
+        0,
         );
         assert!(
             scratch.is_empty(),
@@ -1060,6 +1066,7 @@ fn vmin_prepared_drain_arms_hard_cap_after_repeated_throttle() {
         u64::MAX,
         u64::MAX,
         None,
+        0,
     );
     assert!(
         !scratch.is_empty(),
@@ -1129,6 +1136,7 @@ fn vmin_prepared_drain_unblocks_when_peer_slot_vacates() {
         u64::MAX,
         u64::MAX,
         None,
+        0,
     );
     assert!(
         scratch.is_empty(),
@@ -1153,6 +1161,7 @@ fn vmin_prepared_drain_unblocks_when_peer_slot_vacates() {
         u64::MAX,
         u64::MAX,
         None,
+        0,
     );
     assert!(
         !scratch2.is_empty(),
@@ -1227,6 +1236,7 @@ fn vmin_local_hard_cap_suspension_carries_into_prepared_drain() {
         u64::MAX,
         u64::MAX,
         None,
+        0,
     );
     assert!(
         !scratch.is_empty(),

@@ -267,6 +267,7 @@ pub(super) fn segment_forwarded_tcp_frames_into_prepared(
             cos_queue_id,
             dscp_rewrite,
             mirror_clone: false,
+            enqueue_ns: 0,
         });
         total_bytes += frame_len as u64;
         max_frame = max_frame.max(frame_len as u32);

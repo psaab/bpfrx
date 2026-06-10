@@ -1479,6 +1479,7 @@ fn drain_exact_local_fifo_items_to_scratch_keeps_queue_until_commit() {
             cos_queue_id: Some(5),
             dscp_rewrite: None,
             mirror_clone: false,
+            enqueue_ns: 0,
         }));
     root.queues[0]
         .hot
@@ -1493,6 +1494,7 @@ fn drain_exact_local_fifo_items_to_scratch_keeps_queue_until_commit() {
             cos_queue_id: Some(5),
             dscp_rewrite: None,
             mirror_clone: false,
+            enqueue_ns: 0,
         }));
     root.queues[0]
         .hot
@@ -1509,6 +1511,7 @@ fn drain_exact_local_fifo_items_to_scratch_keeps_queue_until_commit() {
             cos_queue_id: Some(5),
             dscp_rewrite: None,
             mirror_clone: false,
+            enqueue_ns: 0,
         }));
 
     let mut free_tx_frames = VecDeque::from([64, 128, 192]);
@@ -1571,6 +1574,7 @@ fn drain_exact_local_fifo_drops_mirror_clone_before_tx_reserve() {
             cos_queue_id: Some(5),
             dscp_rewrite: None,
             mirror_clone: true,
+            enqueue_ns: 0,
         }),
     );
     let mut free_tx_frames = (0..MIRROR_TX_FRAME_RESERVE as u64)
@@ -1631,6 +1635,7 @@ fn release_exact_local_scratch_frames_preserves_queue_after_failed_submit() {
             cos_queue_id: Some(5),
             dscp_rewrite: None,
             mirror_clone: false,
+            enqueue_ns: 0,
         }));
     root.queues[0]
         .hot
@@ -1645,6 +1650,7 @@ fn release_exact_local_scratch_frames_preserves_queue_after_failed_submit() {
             cos_queue_id: Some(5),
             dscp_rewrite: None,
             mirror_clone: false,
+            enqueue_ns: 0,
         }));
     let mut free_tx_frames = VecDeque::from([64, 128]);
     let mut scratch_local_tx = Vec::new();
@@ -1706,6 +1712,7 @@ fn settle_exact_local_fifo_submission_pops_only_committed_prefix() {
             cos_queue_id: Some(5),
             dscp_rewrite: None,
             mirror_clone: false,
+            enqueue_ns: 0,
         }));
     root.queues[0]
         .hot
@@ -1720,6 +1727,7 @@ fn settle_exact_local_fifo_submission_pops_only_committed_prefix() {
             cos_queue_id: Some(5),
             dscp_rewrite: None,
             mirror_clone: false,
+            enqueue_ns: 0,
         }));
     root.queues[0]
         .hot
@@ -1734,6 +1742,7 @@ fn settle_exact_local_fifo_submission_pops_only_committed_prefix() {
             cos_queue_id: Some(5),
             dscp_rewrite: None,
             mirror_clone: false,
+            enqueue_ns: 0,
         }));
     let mut free_tx_frames = VecDeque::new();
     let mut scratch_local_tx = vec![
@@ -1815,6 +1824,7 @@ fn release_exact_prepared_scratch_preserves_queue_after_failed_submit() {
             cos_queue_id: Some(5),
             dscp_rewrite: None,
             mirror_clone: false,
+            enqueue_ns: 0,
         }));
     let frame = unsafe { area.slice_mut_unchecked(64, 4) }.expect("frame");
     frame.copy_from_slice(&[1, 2, 3, 4]);
@@ -1879,6 +1889,7 @@ fn settle_exact_prepared_fifo_submission_pops_only_committed_prefix() {
             cos_queue_id: Some(5),
             dscp_rewrite: None,
             mirror_clone: false,
+            enqueue_ns: 0,
         }));
     root.queues[0]
         .hot
@@ -1895,6 +1906,7 @@ fn settle_exact_prepared_fifo_submission_pops_only_committed_prefix() {
             cos_queue_id: Some(5),
             dscp_rewrite: None,
             mirror_clone: false,
+            enqueue_ns: 0,
         }));
     root.queues[0]
         .hot
@@ -1911,6 +1923,7 @@ fn settle_exact_prepared_fifo_submission_pops_only_committed_prefix() {
             cos_queue_id: Some(5),
             dscp_rewrite: None,
             mirror_clone: false,
+            enqueue_ns: 0,
         }));
     let mut scratch_prepared_tx = vec![
         ExactPreparedScratchTxRequest { offset: 64, len: 1 },
@@ -1975,6 +1988,7 @@ fn assign_local_dscp_rewrite_preserves_existing_filter_rewrite() {
             cos_queue_id: Some(0),
             dscp_rewrite: None,
             mirror_clone: false,
+            enqueue_ns: 0,
         },
         TxRequest {
             bytes: vec![0; 64],
@@ -1986,6 +2000,7 @@ fn assign_local_dscp_rewrite_preserves_existing_filter_rewrite() {
             cos_queue_id: Some(0),
             dscp_rewrite: Some(0),
             mirror_clone: false,
+            enqueue_ns: 0,
         },
     ]);
 
@@ -2080,6 +2095,7 @@ fn restore_cos_local_items_marks_queue_runnable_after_retry() {
             drop_counters: CoSQueueDropCounters::default(),
             waterfill_counters: CoSQueueWaterfillCounters::default(),
             owner_profile: CoSQueueOwnerProfile::new(),
+            sojourn: crate::afxdp::types::CoSQueueSojourn::default(),
         },
         queue_lease_v8: None,
     };
@@ -2093,6 +2109,7 @@ fn restore_cos_local_items_marks_queue_runnable_after_retry() {
         cos_queue_id: Some(5),
         dscp_rewrite: None,
         mirror_clone: false,
+        enqueue_ns: 0,
     }]);
 
     let retry_bytes = restore_cos_local_items_inner(&mut queue, retry);
@@ -2148,6 +2165,7 @@ fn restore_cos_prepared_items_marks_queue_runnable_after_retry() {
             drop_counters: CoSQueueDropCounters::default(),
             waterfill_counters: CoSQueueWaterfillCounters::default(),
             owner_profile: CoSQueueOwnerProfile::new(),
+            sojourn: crate::afxdp::types::CoSQueueSojourn::default(),
         },
         queue_lease_v8: None,
     };
@@ -2163,6 +2181,7 @@ fn restore_cos_prepared_items_marks_queue_runnable_after_retry() {
         cos_queue_id: Some(5),
         dscp_rewrite: None,
         mirror_clone: false,
+        enqueue_ns: 0,
     }]);
 
     let retry_bytes = restore_cos_prepared_items_inner(&mut queue, retry);
@@ -3022,5 +3041,195 @@ fn waterfill_exact_fit_honor_does_not_livelock_phase1() {
         q0_admits <= 2,
         "q0 must not be re-honored on every bare-exhausted refill (got \
          {q0_admits} Phase-1 admits in 8 same-tick calls)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #1829 Phase 1: sojourn telemetry at the fused #1763 dequeue-commit
+// boundary. These pin (a) the FIFO batch-build arm and the flow-fair
+// drain arms record `now_ns - enqueue_ns` into
+// `queue.telemetry.sojourn` exactly at pop commit, and (b) the
+// `enqueue_ns == 0` legacy guard records NOTHING at the queue level
+// (plan invariant 10).
+// ---------------------------------------------------------------------------
+
+/// Stamp the Local item's `enqueue_ns` (test items default to 0).
+fn stamp_cos_item(mut item: CoSPendingTxItem, enqueue_ns: u64) -> CoSPendingTxItem {
+    match &mut item {
+        CoSPendingTxItem::Local(req) => req.enqueue_ns = enqueue_ns,
+        CoSPendingTxItem::Prepared(req) => req.enqueue_ns = enqueue_ns,
+    }
+    item
+}
+
+#[test]
+fn sojourn_recorded_at_fifo_surplus_batch_pop_commit() {
+    use crate::afxdp::types::COS_SOJOURN_WINDOW_NS;
+    let now_ns = 10 * COS_SOJOURN_WINDOW_NS;
+    let mut root = test_cos_runtime_with_exact(false);
+    root.tokens = 1500;
+    root.queues[0].hot.last_refill_ns = now_ns;
+    root.queues[0].hot.tokens = 0;
+    root.queues[0]
+        .hot
+        .items
+        .push_back(stamp_cos_item(test_cos_item(1500), now_ns - 5_000_000));
+    root.queues[0].hot.queued_bytes = 1500;
+    root.queues[0].hot.runnable = true;
+    root.nonempty_queues = 1;
+    root.runnable_queues = 1;
+
+    let batch = select_cos_surplus_batch(&mut root, now_ns);
+    assert!(batch.is_some(), "surplus batch must build");
+
+    let sojourn = &root.queues[0].telemetry.sojourn;
+    assert_eq!(sojourn.peak_ns, 5_000_000);
+    assert_eq!(sojourn.windowed_min_export(now_ns), 5_000_000);
+    assert!(sojourn.ewma_ns > 0);
+}
+
+#[test]
+fn sojourn_recorded_at_flow_fair_local_drain_commit() {
+    use crate::afxdp::types::COS_SOJOURN_WINDOW_NS;
+    let now_ns = 10 * COS_SOJOURN_WINDOW_NS;
+    let area = MmapArea::new(65536).expect("mmap");
+    let mut root = test_cos_runtime_with_queues(
+        10_000_000_000 / 8,
+        vec![CoSQueueConfig {
+            queue_id: 4,
+            forwarding_class: "iperf-a".into(),
+            priority: 5,
+            transmit_rate_bytes: 10_000_000_000 / 8,
+            guarantee_enabled: true,
+            exact: true,
+            surplus_sharing: false,
+            equal_flow_enforcement: false,
+            surplus_weight: 1,
+            buffer_bytes: COS_MIN_BURST_BYTES,
+            dscp_rewrite: None,
+            codel_target_ns: 0,
+        }],
+    );
+    let fast_path = vec![test_queue_fast_path_for_promotion(false)];
+    apply_cos_queue_flow_fair_promotion(&mut root, &fast_path, 0);
+    assert!(root.queues[0].flow_fair());
+    // Two flows with distinct stamps: the windowed min must be the
+    // SMALLER sojourn, the peak the larger.
+    cos_queue_push_back(
+        &mut root.queues[0],
+        stamp_cos_item(test_flow_cos_item(5201, 512), now_ns - 7_000_000),
+    );
+    cos_queue_push_back(
+        &mut root.queues[0],
+        stamp_cos_item(test_flow_cos_item(5202, 512), now_ns - 3_000_000),
+    );
+    root.queues[0].hot.queued_bytes = 1024;
+
+    let mut free_tx_frames = VecDeque::from([0u64, 4096]);
+    let mut scratch_local_tx = Vec::new();
+    let build = drain_exact_local_items_to_scratch_flow_fair(
+        &mut root.queues[0],
+        &mut free_tx_frames,
+        &mut scratch_local_tx,
+        &area,
+        u64::MAX,
+        u64::MAX,
+        None,
+        now_ns,
+    );
+    assert!(matches!(build, ExactCoSScratchBuild::Ready));
+    assert_eq!(scratch_local_tx.len(), 2);
+
+    let sojourn = &root.queues[0].telemetry.sojourn;
+    assert_eq!(sojourn.peak_ns, 7_000_000);
+    assert_eq!(sojourn.windowed_min_export(now_ns), 3_000_000);
+    // Snapshot taken ≥ 2 windows later must report a zero windowed
+    // min (no fresh standing-queue evidence), while peak persists.
+    assert_eq!(
+        sojourn.windowed_min_export(now_ns + 2 * COS_SOJOURN_WINDOW_NS),
+        0
+    );
+}
+
+#[test]
+fn sojourn_recorded_at_flow_fair_prepared_drain_commit() {
+    use crate::afxdp::types::COS_SOJOURN_WINDOW_NS;
+    let now_ns = 10 * COS_SOJOURN_WINDOW_NS;
+    let area = MmapArea::new(65536).expect("mmap");
+    let mut root = test_cos_runtime_with_queues(
+        10_000_000_000 / 8,
+        vec![CoSQueueConfig {
+            queue_id: 4,
+            forwarding_class: "iperf-a".into(),
+            priority: 5,
+            transmit_rate_bytes: 10_000_000_000 / 8,
+            guarantee_enabled: true,
+            exact: true,
+            surplus_sharing: false,
+            equal_flow_enforcement: false,
+            surplus_weight: 1,
+            buffer_bytes: COS_MIN_BURST_BYTES,
+            dscp_rewrite: None,
+            codel_target_ns: 0,
+        }],
+    );
+    let fast_path = vec![test_queue_fast_path_for_promotion(false)];
+    apply_cos_queue_flow_fair_promotion(&mut root, &fast_path, 0);
+    cos_queue_push_back(
+        &mut root.queues[0],
+        stamp_cos_item(
+            test_flow_prepared_cos_item(5201, 512, 4096),
+            now_ns - 4_000_000,
+        ),
+    );
+    root.queues[0].hot.queued_bytes = 512;
+
+    let mut free_tx_frames = VecDeque::new();
+    let mut pending_fill_frames = VecDeque::new();
+    let mut shared_recycles = Vec::new();
+    let mut scratch_prepared_tx = Vec::new();
+    let build = drain_exact_prepared_items_to_scratch_flow_fair(
+        &mut root.queues[0],
+        &mut scratch_prepared_tx,
+        &area,
+        &mut free_tx_frames,
+        &mut pending_fill_frames,
+        0,
+        &mut shared_recycles,
+        u64::MAX,
+        u64::MAX,
+        None,
+        now_ns,
+    );
+    assert!(matches!(build, ExactCoSScratchBuild::Ready));
+    assert_eq!(scratch_prepared_tx.len(), 1);
+
+    let sojourn = &root.queues[0].telemetry.sojourn;
+    assert_eq!(sojourn.peak_ns, 4_000_000);
+    assert_eq!(sojourn.windowed_min_export(now_ns), 4_000_000);
+}
+
+#[test]
+fn sojourn_zero_stamp_items_record_nothing_at_drain() {
+    use crate::afxdp::types::CoSQueueSojourn;
+    let now_ns = 1_000_000_000;
+    let mut root = test_cos_runtime_with_exact(false);
+    root.tokens = 1500;
+    root.queues[0].hot.last_refill_ns = now_ns;
+    root.queues[0].hot.tokens = 0;
+    // test_cos_item leaves enqueue_ns at 0 (the pre-#1829 / non-CoS
+    // construction default) — the drain must record NOTHING.
+    root.queues[0].hot.items.push_back(test_cos_item(1500));
+    root.queues[0].hot.queued_bytes = 1500;
+    root.queues[0].hot.runnable = true;
+    root.nonempty_queues = 1;
+    root.runnable_queues = 1;
+
+    let batch = select_cos_surplus_batch(&mut root, now_ns);
+    assert!(batch.is_some(), "surplus batch must build");
+    assert_eq!(
+        root.queues[0].telemetry.sojourn,
+        CoSQueueSojourn::default(),
+        "enqueue_ns == 0 must be treated as no-data, never a sample",
     );
 }

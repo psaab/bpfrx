@@ -1104,6 +1104,126 @@ pub(in crate::afxdp) struct CoSQueueTelemetry {
     // on BindingLiveState was specifically for owner/peer split;
     // here both are owner-side so no separate pad is needed.
     pub(in crate::afxdp) owner_profile: CoSQueueOwnerProfile,
+    // #1829 Phase 1: per-queue dequeue-time sojourn telemetry. Plain
+    // u64 fields, single-writer (owner worker, at the fused #1763
+    // peek+pop commit sites), read by `build_worker_cos_statuses` ON
+    // THE SAME WORKER THREAD before publishing via ArcSwap — same
+    // no-atomics reasoning as `waterfill_counters` above.
+    pub(in crate::afxdp) sojourn: CoSQueueSojourn,
+}
+
+/// #1829 Phase 1: windowed sojourn measurement window. 100 ms matches
+/// the standard CoDel interval (RFC 8289) so the Phase-1 gate evidence
+/// ("does any queue sustain standing sojourn above target for ≥ one
+/// interval?") is measured on exactly the timescale the Phase-2
+/// control law would act on.
+pub(in crate::afxdp) const COS_SOJOURN_WINDOW_NS: u64 = 100_000_000;
+
+/// #1829 Phase 1: per-queue dequeue-time sojourn telemetry state.
+///
+/// All updates are O(1), allocation-free, and use the pass-level
+/// `now_ns` (no clock syscalls on the hot path — #1734 kill
+/// rationale). The windowed MINIMUM is the Phase-2 gate metric (AGY
+/// r2 F2 on the #1829 plan): EWMA and peak are biased high by
+/// transient scheduler service gaps (a single 10 ms gap inflates them
+/// while the true standing queue is zero); only a minimum that stays
+/// elevated across a whole window is evidence of a standing queue.
+///
+/// Window bookkeeping is the classic two-bucket flip-flop: a running
+/// minimum for the current 100 ms window plus the previous completed
+/// window's minimum. Flips happen lazily at pop time off the pass
+/// `now_ns`; an idle gap of ≥ 2 windows discards both buckets (the
+/// data is stale), and the snapshot-side export
+/// (`windowed_min_export`) additionally reports 0 once the queue has
+/// gone ≥ 2 windows without a pop, so a stale standing-queue reading
+/// can never outlive the backlog that produced it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::afxdp) struct CoSQueueSojourn {
+    /// Shift-add EWMA (α = 1/8) of per-pop sojourn, ns. Truncating
+    /// integer arithmetic: converges to within 8 ns of the true mean,
+    /// warm-up from 0 over ~8 pops. Supporting context only — NOT the
+    /// gate metric (biased high by service gaps).
+    pub(in crate::afxdp) ewma_ns: u64,
+    /// Lifetime maximum per-pop sojourn, ns. Same lifetime contract
+    /// as `active_flow_buckets_peak`.
+    pub(in crate::afxdp) peak_ns: u64,
+    /// Running minimum of the CURRENT window. `u64::MAX` = no pops
+    /// recorded in this window yet.
+    pub(in crate::afxdp) win_cur_min_ns: u64,
+    /// Minimum of the PREVIOUS completed window. `u64::MAX` = none.
+    pub(in crate::afxdp) win_prev_min_ns: u64,
+    /// Pass-`now_ns` at which the current window started. 0 = never
+    /// recorded.
+    pub(in crate::afxdp) win_flip_ns: u64,
+}
+
+impl Default for CoSQueueSojourn {
+    fn default() -> Self {
+        Self {
+            ewma_ns: 0,
+            peak_ns: 0,
+            win_cur_min_ns: u64::MAX,
+            win_prev_min_ns: u64::MAX,
+            win_flip_ns: 0,
+        }
+    }
+}
+
+impl CoSQueueSojourn {
+    /// Record one dequeue-commit sojourn sample. Called at the fused
+    /// #1763 peek+pop commit sites with the popped item's
+    /// `enqueue_ns` and the drain pass's `now_ns`.
+    ///
+    /// `enqueue_ns == 0` means "never CoS-stamped" (direct-TX
+    /// constructions, pre-upgrade items) and is skipped entirely —
+    /// plan invariant 10: a zero timestamp must never turn into a
+    /// huge bogus sojourn. Cost on the common path: one compare, one
+    /// subtract, two shifts/adds, two compares.
+    #[inline]
+    pub(in crate::afxdp) fn record(&mut self, enqueue_ns: u64, now_ns: u64) {
+        if enqueue_ns == 0 {
+            return;
+        }
+        let sojourn = now_ns.saturating_sub(enqueue_ns);
+        self.ewma_ns = self.ewma_ns - (self.ewma_ns >> 3) + (sojourn >> 3);
+        if sojourn > self.peak_ns {
+            self.peak_ns = sojourn;
+        }
+        let since_flip = now_ns.saturating_sub(self.win_flip_ns);
+        if since_flip >= COS_SOJOURN_WINDOW_NS {
+            // Lazy flip. If we idled for ≥ 2 windows the current
+            // bucket's data is older than one full window — discard
+            // rather than promote (stale minima must not survive an
+            // idle gap).
+            self.win_prev_min_ns = if since_flip >= 2 * COS_SOJOURN_WINDOW_NS {
+                u64::MAX
+            } else {
+                self.win_cur_min_ns
+            };
+            self.win_cur_min_ns = u64::MAX;
+            self.win_flip_ns = now_ns;
+        }
+        if sojourn < self.win_cur_min_ns {
+            self.win_cur_min_ns = sojourn;
+        }
+    }
+
+    /// Snapshot-side export of the windowed minimum: the smallest
+    /// sojourn observed over the last 1-2 windows (current running
+    /// bucket + previous completed bucket), or 0 when there is no
+    /// fresh data (never recorded, or last pop ≥ 2 windows before the
+    /// snapshot's `now_ns`). Runs on the worker thread at snapshot
+    /// cadence (~1/s), not on the per-pop hot path.
+    #[inline]
+    pub(in crate::afxdp) fn windowed_min_export(&self, now_ns: u64) -> u64 {
+        if self.win_flip_ns == 0
+            || now_ns.saturating_sub(self.win_flip_ns) >= 2 * COS_SOJOURN_WINDOW_NS
+        {
+            return 0;
+        }
+        let min = self.win_prev_min_ns.min(self.win_cur_min_ns);
+        if min == u64::MAX { 0 } else { min }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1389,3 +1509,7 @@ mod flow_fair_state_tests {
         // miri this proves every collection field is a valid drop target.
     }
 }
+
+#[cfg(test)]
+#[path = "cos_sojourn_tests.rs"]
+mod cos_sojourn_tests;

@@ -561,6 +561,7 @@ pub(in crate::afxdp) fn select_cos_guarantee_batch_with_fast_path(
             root.tokens,
             guarantee_budget,
             CoSServicePhase::Guarantee,
+            now_ns,
         ) {
             return Some(batch);
         }
@@ -1277,6 +1278,7 @@ pub(in crate::afxdp) fn select_nonexact_cos_guarantee_batch(
             root.tokens,
             guarantee_budget,
             CoSServicePhase::Guarantee,
+            now_ns,
         ) {
             return Some(batch);
         }
@@ -1373,6 +1375,7 @@ fn select_cos_surplus_batch_filtered(
                 root.tokens,
                 secondary_budget,
                 CoSServicePhase::Surplus,
+                now_ns,
             ) {
                 return Some(batch);
             }
@@ -1593,6 +1596,7 @@ fn build_cos_batch_from_queue(
     root_budget: u64,
     secondary_budget: u64,
     phase: CoSServicePhase,
+    now_ns: u64,
 ) -> Option<CoSBatch> {
     let head = cos_queue_front(queue)?;
     match head {
@@ -1621,6 +1625,12 @@ fn build_cos_batch_from_queue(
                 remaining_secondary = remaining_secondary.saturating_sub(len);
                 match cos_queue_pop_known_bucket(queue, bucket, u64::MAX) {
                     Some(CoSPendingTxItem::Local(req)) => {
+                        // #1829 Phase 1: sojourn sample at the dequeue
+                        // commit (pass now_ns; enqueue_ns==0 is skipped
+                        // inside record()). State write AFTER the pop,
+                        // so the #1763 peek-to-pop window stays
+                        // read-only.
+                        queue.telemetry.sojourn.record(req.enqueue_ns, now_ns);
                         batch_bytes = batch_bytes.saturating_add(len);
                         items.push_back(req);
                     }
@@ -1664,6 +1674,9 @@ fn build_cos_batch_from_queue(
                 remaining_secondary = remaining_secondary.saturating_sub(len);
                 match cos_queue_pop_known_bucket(queue, bucket, u64::MAX) {
                     Some(CoSPendingTxItem::Prepared(req)) => {
+                        // #1829 Phase 1: sojourn sample at the dequeue
+                        // commit (see the Local arm above).
+                        queue.telemetry.sojourn.record(req.enqueue_ns, now_ns);
                         batch_bytes = batch_bytes.saturating_add(len);
                         items.push_back(req);
                     }
