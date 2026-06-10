@@ -251,6 +251,29 @@ pub(crate) struct ProcessStatus {
     pub neighbor_pending_timeout_drops_total: u64,
     #[serde(rename = "neighbor_pending_max_depth", default)]
     pub neighbor_pending_max_depth: u64,
+    /// #1771 §2.6: per-key resolver + §2.5 ENOBUFS-re-dump telemetry.
+    /// `get_backoff_attempts` is the subset of resolver GET attempts
+    /// that were backoff RETRIES (key re-admitted after the per-key
+    /// rate-limit window). The `netlink_*` counters instrument the
+    /// monitor thread's lost-notification self-heal: ENOBUFS receives,
+    /// throttled upsert-only re-dumps issued, and dynamic-neighbor
+    /// entries actually (re)added by re-dump replies. The two gauges are
+    /// per-binding sums published at the ~65ms debug tick: distinct
+    /// unresolved next-hop keys buffered in pending_neigh, and keys held
+    /// in the negative caches (lazy-TTL upper bound). All additive /
+    /// defaulted for backward compatibility.
+    #[serde(rename = "neighbor_resolver_get_backoff_attempts_total", default)]
+    pub neighbor_resolver_get_backoff_attempts_total: u64,
+    #[serde(rename = "neighbor_netlink_enobufs_total", default)]
+    pub neighbor_netlink_enobufs_total: u64,
+    #[serde(rename = "neighbor_netlink_redumps_total", default)]
+    pub neighbor_netlink_redumps_total: u64,
+    #[serde(rename = "neighbor_netlink_redump_upserts_total", default)]
+    pub neighbor_netlink_redump_upserts_total: u64,
+    #[serde(rename = "neighbor_pending_keys", default)]
+    pub neighbor_pending_keys: u64,
+    #[serde(rename = "neg_neigh_keys", default)]
+    pub neg_neigh_keys: u64,
     /// #802: focused per-binding ring-pressure view. Projected from the
     /// same `BindingLiveState` atomics that back `Self::bindings` — a
     /// compact snapshot of the counters an operator looks at first when

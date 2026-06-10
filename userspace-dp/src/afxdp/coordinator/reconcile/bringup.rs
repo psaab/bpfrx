@@ -392,11 +392,19 @@ pub(super) fn bring_up_workers(
         let stop_clone = stop.clone();
         let dynamic_neighbors = coord.neighbors.dynamic.clone();
         let neighbor_generation = coord.neighbors.generation.clone();
+        // #1771 §2.6: ENOBUFS/re-dump telemetry rides the shared
+        // resolver-counter block (same status wire path).
+        let monitor_counters = coord.neighbors.resolver_counters.clone();
         // #925-A: wrap aux thread in catch_unwind so a panic in the
         // netlink path doesn't kill the daemon. No respawn — see
         // spawn_supervised_aux doc for operator-visible degradation.
         spawn_supervised_aux("neigh-monitor", move || {
-            neigh_monitor_thread(stop_clone, dynamic_neighbors, neighbor_generation)
+            neigh_monitor_thread(
+                stop_clone,
+                dynamic_neighbors,
+                neighbor_generation,
+                monitor_counters,
+            )
         })
         .ok();
         coord.neighbors.monitor_stop = Some(stop);

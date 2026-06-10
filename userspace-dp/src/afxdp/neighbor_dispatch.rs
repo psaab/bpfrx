@@ -47,6 +47,40 @@ fn probe_due(elapsed_ns: u64, attempts: u8) -> bool {
         .is_some_and(|&target| elapsed_ns >= target)
 }
 
+/// #1771 §2.2/§2.4: the pure `pending_neigh` buffer-admission decision
+/// used at the `MissingNeighbor` handler in `poll_descriptor`. Extracted
+/// (behavior-identical) so invariant N1's second half — "`pending_neigh`
+/// admits at most ONE packet per `(egress_ifindex, next_hop)`" — is a
+/// tested decision rather than an inline branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PendingNeighAdmission {
+    /// Key absent and below cap → buffer this packet (it becomes the
+    /// per-key representative driving the probe/dwell clock).
+    Buffer,
+    /// Key already pending → duplicate sibling: drop + recycle now
+    /// (keep-OLDEST; the buffered representative is never replaced, so
+    /// each unresolved hop pins at most one UMEM frame).
+    DuplicateDrop,
+    /// New key but the map is at `MAX_PENDING_NEIGH` distinct hops →
+    /// capacity drop (counted nowhere per the #1782 split; the
+    /// duplicate counter must not conflate this case).
+    CapacityDrop,
+}
+
+/// Pure admission decision over the two map facts the caller reads
+/// (`contains_key`, `len`). `#[inline]` — compiles to the identical
+/// branch pair the inline code had.
+#[inline]
+pub(super) fn pending_neigh_admission(already_pending: bool, len: usize) -> PendingNeighAdmission {
+    if already_pending {
+        PendingNeighAdmission::DuplicateDrop
+    } else if len < MAX_PENDING_NEIGH {
+        PendingNeighAdmission::Buffer
+    } else {
+        PendingNeighAdmission::CapacityDrop
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn retry_pending_neigh(
     binding: &mut BindingWorker,
@@ -998,5 +1032,49 @@ mod learn_precheck_tests {
         // Degenerate: learn_dynamic_neighbor always passes n >= 1.
         // Pinned so the `any`-over-slice semantics stay explicit.
         assert!(!pair_write_needed(&[], MAC));
+    }
+}
+
+#[cfg(test)]
+mod pending_admission_tests {
+    use super::{PendingNeighAdmission, pending_neigh_admission};
+    use crate::afxdp::MAX_PENDING_NEIGH;
+
+    /// Invariant N1's buffering half (#1771 §2.4): exactly one buffered
+    /// packet per `(egress_ifindex, next_hop)` — the first packet
+    /// buffers, every same-key sibling is a DuplicateDrop regardless of
+    /// how much room remains.
+    #[test]
+    fn first_packet_buffers_siblings_duplicate_drop() {
+        assert_eq!(pending_neigh_admission(false, 0), PendingNeighAdmission::Buffer);
+        assert_eq!(
+            pending_neigh_admission(true, 1),
+            PendingNeighAdmission::DuplicateDrop
+        );
+        // Duplicate wins even with plenty of room…
+        assert_eq!(
+            pending_neigh_admission(true, 10),
+            PendingNeighAdmission::DuplicateDrop
+        );
+        // …and even at the cap (the duplicate counter must not be
+        // conflated with the capacity case — #1782 split).
+        assert_eq!(
+            pending_neigh_admission(true, MAX_PENDING_NEIGH),
+            PendingNeighAdmission::DuplicateDrop
+        );
+    }
+
+    /// The cap applies only to NEW keys: the last slot below the cap
+    /// buffers, at the cap a new key is a CapacityDrop.
+    #[test]
+    fn new_key_capacity_boundary() {
+        assert_eq!(
+            pending_neigh_admission(false, MAX_PENDING_NEIGH - 1),
+            PendingNeighAdmission::Buffer
+        );
+        assert_eq!(
+            pending_neigh_admission(false, MAX_PENDING_NEIGH),
+            PendingNeighAdmission::CapacityDrop
+        );
     }
 }

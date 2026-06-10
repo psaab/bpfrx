@@ -138,6 +138,40 @@ func (c *xpfCollector) emitNeighborWarmCounters(ch chan<- prometheus.Metric, sta
 		prometheus.CounterValue,
 		float64(status.NeighborResolverEpochRejectsTotal),
 	)
+	// #1771 §2.6: backoff-retry GETs, the §2.5 ENOBUFS/re-dump
+	// self-heal counters, and the pending/negative key gauges. All
+	// emitted unconditionally so a 0 is a real signal (no ENOBUFS, no
+	// parked packets) rather than an absent series.
+	ch <- prometheus.MustNewConstMetric(
+		c.neighborResolverGetBackoffAttemptsTotal,
+		prometheus.CounterValue,
+		float64(status.NeighborResolverGetBackoffAttemptsTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.neighborNetlinkEnobufsTotal,
+		prometheus.CounterValue,
+		float64(status.NeighborNetlinkEnobufsTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.neighborNetlinkRedumpsTotal,
+		prometheus.CounterValue,
+		float64(status.NeighborNetlinkRedumpsTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.neighborNetlinkRedumpUpsertsTotal,
+		prometheus.CounterValue,
+		float64(status.NeighborNetlinkRedumpUpsertsTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.neighborPendingKeys,
+		prometheus.GaugeValue,
+		float64(status.NeighborPendingKeys),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.negNeighKeys,
+		prometheus.GaugeValue,
+		float64(status.NegNeighKeys),
+	)
 	// #1772: neighbor/ARP resolution LATENCY telemetry.
 	c.emitNeighborLatencyHistograms(ch, status)
 }

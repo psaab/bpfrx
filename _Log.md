@@ -4757,6 +4757,18 @@ top.
 - **Timestamp**: 2026-06-10
   **Action**: "#1805 commit 2 — api bounded request-path exec: new exec_timeout.go (runTimeout only — sole raw sites are power actions; Output variants live in grpcapi sibling), converted system.go reboot/halt to runTimeout(context.Background()), WaitDelay=5s U3-parity on ping/traceroute handlers, tests, README gotcha"
   **File(s)**: pkg/api/exec_timeout.go, pkg/api/exec_timeout_test.go, pkg/api/system.go, pkg/api/README.md
+
+- **Timestamp**: 2026-06-10
+  **Action**: "#1771 Phase-3 commit 1 — §2.6 counter sources: ResolverCounters gains get_backoff_attempts (rate_limit_decide AdmitRetry split, rate_limit_admit folded in) + netlink_enobufs/netlink_redumps/netlink_redump_upserts on the monitor thread (parse_neighbor_msg bool→NeighborMsgEffect so re-dump-reply upserts are counted by nlmsg_seq match, not conflated with FAILED removals); BindingLiveState pending_neigh_keys/neg_neigh_keys gauges published at the ~65ms debug tick; Coordinator accessors neighbor_pending_keys_total/neg_neigh_keys_total + extended NeighborResolverCounters snapshot"
+  **File(s)**: userspace-dp/src/afxdp/{neighbor_resolver.rs,neighbor.rs,umem/mod.rs,umem/debug_state.rs,coordinator/status.rs,coordinator/reconcile/bringup.rs}
+
+- **Timestamp**: 2026-06-10
+  **Action**: "#1771 Phase-3 commit 2 — wire the six §2.6 metrics end to end (U4/#1807 pattern): control.rs additive serde-defaulted fields + helpers.rs status copy + lifecycle zero-init; wire fixture regen (XPF_PROTOCOL_WIRE_REGEN=1, 6 keys); Rust + Go round-trip/key-absent pins; protocol.go decode; Prometheus descs+Describe+emit (counters CounterValue, key gauges GaugeValue); descriptor-coverage canary + emit-level type/value test"
+  **File(s)**: userspace-dp/src/{protocol/control.rs,protocol/tests.rs,server/helpers.rs,server/lifecycle.rs}, userspace-dp/tests/fixtures/protocol_wire_v1.json, pkg/dataplane/userspace/{protocol.go,protocol_test.go}, pkg/api/{metrics.go,metrics_descriptors.go,metrics_userspace.go,metrics_descriptor_coverage_test.go,metrics_neighbor_latency_test.go}
+
+- **Timestamp**: 2026-06-10
+  **Action**: "#1771 Phase-3 commit 3 — §2.4 invariant N1: compile-time pin NEG_NEIGH_TTL_NS > RESOLVER_PER_KEY_RATE_LIMIT_NS; threaded invariant_n1 test drives the REAL neighbor_resolver_loop (negatively-cached key gets GET + counted backoff retry across the window while neg_neigh_gate keeps fast-failing); pending_neigh admission extracted to pure pending_neigh_admission helper (behavior-identical, used by poll_descriptor) + unit tests; architecture doc gains the 'negative cache does not stop resolution' section"
+  **File(s)**: userspace-dp/src/afxdp/{neighbor_resolver.rs,neighbor_dispatch.rs,poll_descriptor/mod.rs,mod.rs}, docs/userspace-dataplane-architecture.md
 - **Timestamp**: 2026-06-10
   **Action**: "#1776 commit 1 — extract one-shot worker_loop setup into loop_body/setup.rs (pure code motion, v3.1 narrowed plan): thread pin, TSC calibration, ArcSwap load_fulls, binding construction, CoS fast-interface wiring, interrupt pollfds, BPF-map-FD cache, initial cos_status publish, set_tid; returns WorkerLoopSetup destructured into same-named locals — loop body textually unchanged; only delta = 11 `let mut`→`let` (mut moved to destructure site)"
   **File(s)**: userspace-dp/src/afxdp/worker/loop_body/setup.rs (new), userspace-dp/src/afxdp/worker/loop_body/mod.rs
