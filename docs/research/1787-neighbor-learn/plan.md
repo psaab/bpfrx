@@ -1,6 +1,6 @@
 # #1787 — learn_dynamic_neighbor cheap-first rework (per-packet 64-shard bulk lock + heap allocs)
 
-Status: DRAFT v2 — round-1 findings folded (Codex PLAN-NEEDS-MAJOR ×3 findings; AGY consumer-audit clean), pending round-2 confirm
+Status: DRAFT v3 — r2 dedup-interaction fold, pending round-3 confirm
 
 ## Issue framing
 
@@ -95,11 +95,22 @@ Two distinct interleavings (round-1 Codex finding folded):
    the read wins.** This is correct for every production remove path:
    netlink FAILED/delete (neighbor.rs:351), resolver authoritative-FAILED
    revoke (neighbor_resolver.rs:708), and manager replace/bulk-remove
-   (coordinator/mod.rs:177, :671) all intend the entry GONE; the very next
-   RX packet from that source pre-check-misses and re-learns via the bulk
-   path — one packet of extra resolution latency versus today, in exchange
-   for removes not being raced back in by stale traffic. Document this at
-   the call site.
+   (coordinator/mod.rs:177, :671) all intend the entry GONE. Recovery
+   (r2 fold — the "next packet" claim was too strong): the next packet
+   from that source THAT REACHES learn_dynamic_neighbor pre-check-misses
+   and re-learns via the bulk path. A packet suppressed by the
+   per-binding `last_learned_neighbor` dedup (set at
+   neighbor_dispatch.rs:320 after this call, including after an elided
+   no-op) does not reach it — but this dedup-delayed re-learn window is
+   PRE-EXISTING, not introduced: today a write also sets the dedup, so a
+   remove landing after the write is equally suppressed from re-learn by
+   identical packets until the dedup key changes/evicts. The elision
+   merely makes the interleaved-source case behave like the
+   single-source case always has. Recovery for dedup-suppressed sources
+   comes from the same paths as today: any second source key on the
+   binding evicting the 1-entry dedup, the ARP/NDP learn stage
+   (poll_stages.rs:80, :103), and the #1769 resolver probe on
+   forwarding miss. Document both halves at the call site.
 
 The #949 "both or neither" invariant is **scoped to this function's pair
 write only** (v1 overstated it): the ARP/NDP learn stage inserts the
