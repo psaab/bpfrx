@@ -256,7 +256,7 @@ in git history; `git log -- bpf/xdp/ bpf/tc/` walks the deleted source.
 - **NAT**: SNAT (interface + pool, address-persistent), DNAT (with hit counters), static 1:1, NAT64
 - **IPv4 + IPv6**: Dual-stack, DHCPv4/v6 clients, Router Advertisements
 - **Screen/IDS**: 11 checks (land, syn-flood, ping-death, teardrop, rate-limiting), SYN cookie flood protection (XDP-generated SYN-ACK cookies with source validation)
-- **Routing**: FRR integration (static, OSPF, BGP, IS-IS, RIP), VRFs, GRE tunnels, export/redistribute, ECMP multipath, next-table + rib-group inter-VRF route leaking, route filtering by protocol/CIDR
+- **Routing**: FRR integration (static, OSPF, BGP, IS-IS, RIP), VRFs, GRE tunnels, export/redistribute, ECMP multipath, next-table + rib-group inter-VRF route leaking, route filtering by protocol/CIDR, probe-driven WAN failover (`services ip-monitoring` preferred-route injection, #1827)
 - **VLANs**: 802.1Q tagging, trunk ports
 - **IPsec**: strongSwan config generation, IKE proposals, gateway compilation, XFRM interfaces
 - **Observability**: Syslog (facility/severity/category filtering, structured RT_FLOW format, TCP/TLS transport, event mode local file), NetFlow v9 (1-in-N sampling), Prometheus, RPM probes, dynamic feeds, SNMP (ifTable MIB), dataplane buffer utilization (`show system buffers`), session aggregation reporting

@@ -75,3 +75,19 @@ Any interface not declared in the active config is brought down and given
   runtime HA controller under one daemon-owned deadline. Controller
   implementations may have their own RPC deadlines, but daemon shutdown does
   not wait past the outer deadline for those calls to return.
+
+## RPM + ip-monitoring wiring (#1827)
+
+- `daemon_rpm.go` — config-hash-gated RPM probe lifecycle
+  (`reconcileRPM`, applyConfigLocked step 17b): probes + probe-pin
+  rules re-apply only when the rendered RPM stanza (or RETH map, or
+  the HA gating filter result) changed, so unrelated commits never
+  wipe probe state. Also owns the §4.4 HA gating scope
+  (`filterRPMForHAGating`).
+- `daemon_ipmon.go` — `assembleFRRConfig` (the SOLE `frr.FullConfig`
+  constructor, shared by the full apply path and the routes-only
+  actuator) + `actuateRouteOverlay` (FRR re-render → snapshot publish
+  via `PublishRouteOverlaySnapshot` → `BumpFIBGeneration` ONLY after
+  publish success, under `applySem`). The ip-monitoring engine lives
+  in `pkg/ipmon`; RG transitions re-evaluate gating via
+  `reconcileIPMonGating` from `reconcileRGState`.

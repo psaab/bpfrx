@@ -32,6 +32,7 @@ import (
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/feeds"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
+	"github.com/psaab/xpf/pkg/ipmon"
 	"github.com/psaab/xpf/pkg/rpm"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -117,6 +118,17 @@ func (s *Server) showTunnels(buf *strings.Builder) {
 		}
 		buf.WriteString("\n")
 	}
+}
+
+// showServicesIPMonitoringStatus renders live `services
+// ip-monitoring` policy status via the shared pkg/ipmon formatter
+// (#1827) so gRPC and local CLI output stay byte-identical.
+func (s *Server) showServicesIPMonitoringStatus(buf *strings.Builder) {
+	if s.ipmonStatusFn == nil {
+		buf.WriteString("IP monitoring engine not running\n")
+		return
+	}
+	ipmon.FormatStatus(buf, s.ipmonStatusFn())
 }
 
 // showRPM renders RPM probe results, falling back to configured-probe

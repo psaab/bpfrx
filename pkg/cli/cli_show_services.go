@@ -11,6 +11,7 @@ import (
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/dhcp"
 	"github.com/psaab/xpf/pkg/dhcpserver"
+	"github.com/psaab/xpf/pkg/ipmon"
 	"github.com/psaab/xpf/pkg/rpm"
 )
 
@@ -42,6 +43,20 @@ func (c *CLI) handleShowServices(args []string) error {
 			return c.showRPMProbeResults()
 		}
 		return c.showRPMProbeResults()
+	case "ip-monitoring":
+		// #1827: cmdtree leaf is `ip-monitoring status`; reject other
+		// targets so typos surface as usage errors. Distinct from
+		// `show chassis cluster ip-monitoring status` (RG weights).
+		rest := args[1:]
+		if len(rest) == 0 {
+			cmdtree.PrintTreeHelp("show services ip-monitoring:",
+				operationalTree, "show", "services", "ip-monitoring")
+			return nil
+		}
+		if rest[0] != "status" {
+			return fmt.Errorf("unknown ip-monitoring target: %s (expected `status`)", rest[0])
+		}
+		return c.showIPMonitoringStatus()
 	case "application-identification":
 		// #653: surface what xpf AppID actually does today vs the
 		// vSRX application-identification feature. Honest contract,
@@ -211,6 +226,20 @@ func (c *CLI) showRPMProbeResults() error {
 			fmt.Println()
 		}
 	}
+	return nil
+}
+
+// showIPMonitoringStatus renders live ip-monitoring policy status via
+// the shared pkg/ipmon formatter (#1827) so local CLI and gRPC output
+// stay byte-identical.
+func (c *CLI) showIPMonitoringStatus() error {
+	if c.ipmonStatusFn == nil {
+		fmt.Println("IP monitoring engine not running")
+		return nil
+	}
+	var buf strings.Builder
+	ipmon.FormatStatus(&buf, c.ipmonStatusFn())
+	fmt.Print(buf.String())
 	return nil
 }
 

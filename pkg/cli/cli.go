@@ -22,6 +22,7 @@ import (
 	"github.com/psaab/xpf/pkg/feeds"
 	"github.com/psaab/xpf/pkg/frr"
 	"github.com/psaab/xpf/pkg/fwdstatus"
+	"github.com/psaab/xpf/pkg/ipmon"
 	"github.com/psaab/xpf/pkg/ipsec"
 	"github.com/psaab/xpf/pkg/lldp"
 	"github.com/psaab/xpf/pkg/logging"
@@ -44,6 +45,7 @@ type CLI struct {
 	dhcpRelay       *dhcprelay.Manager
 	cluster         *cluster.Manager
 	rpmResultsFn    func() []*rpm.ProbeResult
+	ipmonStatusFn   func() []ipmon.PolicyStatus
 	feedsFn         func() map[string]feeds.FeedInfo
 	lldpNeighborsFn func() []*lldp.Neighbor
 	hostname        string
@@ -141,6 +143,12 @@ func (c *CLI) SetForwardingSampler(s *fwdstatus.Sampler) {
 // SetRPMResultsFn sets a callback for retrieving live RPM probe results.
 func (c *CLI) SetRPMResultsFn(fn func() []*rpm.ProbeResult) {
 	c.rpmResultsFn = fn
+}
+
+// SetIPMonStatusFn sets a callback for retrieving live ip-monitoring
+// policy status (#1827).
+func (c *CLI) SetIPMonStatusFn(fn func() []ipmon.PolicyStatus) {
+	c.ipmonStatusFn = fn
 }
 
 // SetFeedsFn sets a callback for retrieving live dynamic address feed status.
@@ -415,4 +423,3 @@ func (c *CLI) operationalPrompt() string {
 func (c *CLI) configPrompt() string {
 	return fmt.Sprintf("%s%s@%s# ", c.clusterPrefix(), c.username, c.hostname)
 }
-

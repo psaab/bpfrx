@@ -17,7 +17,7 @@ no filename prefixes):
 | File | Owns |
 |---|---|
 | `manager.go` | `Manager` struct + lifecycle (`New`, `Apply`, `ApplyFull`, `Clear`, `writeManagedSection`, `reload`), top-level types (`InstanceConfig`, `DHCPRoute`, `FullConfig`), package constants, and the zero-value-safe `executor()` accessor. |
-| `config_render.go` | Non-protocol config rendering: `generateInterfaceSettings`, `generateStaticRoute`, named `ApplyFull` extractors (`renderGenerateRoutes`, `renderDHCPDefaults`, `renderBackupRouter`, `renderClusterModeDefaults`), and `resolveECMP` (which has a documented side effect: mutates `fc.ConsistentHash`). |
+| `config_render.go` | Non-protocol config rendering: `generateInterfaceSettings`, `generateStaticRoute`, named `ApplyFull` extractors (`renderGenerateRoutes`, `renderDHCPDefaults`, `renderBackupRouter`, `renderPreferredRoutes` — the #1827 ip-monitoring overlay as distance-1 statics, emission step 7 — `renderClusterModeDefaults`), and `resolveECMP` (which has a documented side effect: mutates `fc.ConsistentHash`). |
 | `policy_render.go` | **Protocols + policy rendering** (despite the filename — `generateProtocols` for OSPF/OSPFv3/BGP/RIP/ISIS, `generatePolicyOptions` for prefix-lists/route-maps/communities, `resolveRedistribute`, BFD profile dedup). OSPFv2 area membership is rendered per-interface as `ip ospf area <id>` under `interface <name>` (matching the OSPFv3 idiom), never as a global `network <prefix> area` statement — see #1712. |
 | `vtysh.go` | `frrExecutor` interface (Vtysh / SystemctlReload / VtyshLoad), `realExecutor` (production exec.Command implementation), `ExecVtysh`, and all raw-output Get* shells (`GetBFDPeers`, `GetRouteMapList`, `GetISIS*Detail`/`Database`/`Routes`, `GetOSPF*Detail`/`Database`/`Interface`/`Routes`, `GetBGPNeighbor*`). |
 | `status_parse.go` | Parsed Get* methods + their public types (`RIPRouteEntry`, `ISISAdjacency`, `OSPFNeighbor`, `BGPPeerSummary`, `BGPRoute`, `FRRRouteDetail`, `FRRNextHop`) + `parseRouteJSON`, `FormatRouteDetail`. |
@@ -37,6 +37,13 @@ no filename prefixes):
 ## Callers
 
 `pkg/daemon` (lifecycle), `pkg/grpcapi` (show commands).
+
+`FullConfig.PreferredRoutes` (#1827) carries the ip-monitoring
+effective-route overlay; the daemon's `assembleFRRConfig` is the sole
+`FullConfig` constructor for both the full apply path and the
+routes-only actuator, so an operator commit can never wipe an active
+failover route. The `ApplyFull` emission-order contract comment lists
+the overlay as step 7.
 
 ## Dependencies
 

@@ -23,6 +23,7 @@ import (
 	"github.com/psaab/xpf/pkg/conntrack"
 	"github.com/psaab/xpf/pkg/dhcp"
 	"github.com/psaab/xpf/pkg/frr"
+	"github.com/psaab/xpf/pkg/ipmon"
 	"github.com/psaab/xpf/pkg/ipsec"
 	"github.com/psaab/xpf/pkg/logging"
 	"github.com/psaab/xpf/pkg/routing"
@@ -42,8 +43,8 @@ type CompileHealthSnapshot struct {
 // Config configures the API server.
 type Config struct {
 	Addr      string
-	HTTPSAddr string // HTTPS listen address (empty = no HTTPS)
-	TLS       bool   // enable HTTPS with auto-generated certificate
+	HTTPSAddr string      // HTTPS listen address (empty = no HTTPS)
+	TLS       bool        // enable HTTPS with auto-generated certificate
 	Auth      *AuthConfig // nil = no authentication
 	Store     *configstore.Store
 	DP        apiRuntimeDataPlane
@@ -53,7 +54,7 @@ type Config struct {
 	FRR       *frr.Manager
 	IPsec     *ipsec.Manager
 	DHCP      *dhcp.Manager
-	VRRPMgr *vrrp.Manager // native VRRP manager
+	VRRPMgr   *vrrp.Manager // native VRRP manager
 	// #846: atomic commit+apply callbacks. The daemon holds its
 	// apply semaphore across configstore.Commit and applyConfig, so
 	// two concurrent committers can't interleave their commit→apply
@@ -84,46 +85,52 @@ type Config struct {
 	// of the idle/overnight cold-connect hang. Optional; if nil, the
 	// neighbor_periodic_last_success_age_seconds gauge is not emitted.
 	NeighborPhaseAgeFn func() map[string]float64
+	// IPMonStatusFn surfaces services ip-monitoring policy state for
+	// the xpf_ipmon_* metrics (#1827). Optional; if nil, the family is
+	// omitted.
+	IPMonStatusFn func() []ipmon.PolicyStatus
 }
 
 // Server is the HTTP API server.
 type Server struct {
-	httpServer  *http.Server
-	httpsServer *http.Server
-	store       *configstore.Store
-	dp          apiRuntimeDataPlane
-	eventBuf    *logging.EventBuffer
-	gc          *conntrack.GC
-	routing     *routing.Manager
-	frr         *frr.Manager
-	ipsec       *ipsec.Manager
-	dhcp        *dhcp.Manager
-	vrrpMgr           *vrrp.Manager
+	httpServer              *http.Server
+	httpsServer             *http.Server
+	store                   *configstore.Store
+	dp                      apiRuntimeDataPlane
+	eventBuf                *logging.EventBuffer
+	gc                      *conntrack.GC
+	routing                 *routing.Manager
+	frr                     *frr.Manager
+	ipsec                   *ipsec.Manager
+	dhcp                    *dhcp.Manager
+	vrrpMgr                 *vrrp.Manager
 	commitFn                func(ctx context.Context, comment string) (*config.Config, error)
 	commitConfirmedFn       func(ctx context.Context, minutes int) (*config.Config, error)
 	compileHealthFn         func() CompileHealthSnapshot
 	configPersistDegradedFn func() bool
 	neighborPhaseAgeFn      func() map[string]float64
+	ipmonStatusFn           func() []ipmon.PolicyStatus
 	startTime               time.Time
 }
 
 // NewServer creates a new API server.
 func NewServer(cfg Config) *Server {
 	s := &Server{
-		store:     cfg.Store,
-		dp:        cfg.DP,
-		eventBuf:  cfg.EventBuf,
-		gc:        cfg.GC,
-		routing:   cfg.Routing,
-		frr:       cfg.FRR,
-		ipsec:     cfg.IPsec,
-		dhcp:      cfg.DHCP,
-		vrrpMgr:           cfg.VRRPMgr,
+		store:                   cfg.Store,
+		dp:                      cfg.DP,
+		eventBuf:                cfg.EventBuf,
+		gc:                      cfg.GC,
+		routing:                 cfg.Routing,
+		frr:                     cfg.FRR,
+		ipsec:                   cfg.IPsec,
+		dhcp:                    cfg.DHCP,
+		vrrpMgr:                 cfg.VRRPMgr,
 		commitFn:                cfg.CommitFn,
 		commitConfirmedFn:       cfg.CommitConfirmedFn,
 		compileHealthFn:         cfg.CompileHealthFn,
 		configPersistDegradedFn: cfg.ConfigPersistDegradedFn,
 		neighborPhaseAgeFn:      cfg.NeighborPhaseAgeFn,
+		ipmonStatusFn:           cfg.IPMonStatusFn,
 		startTime:               time.Now(),
 	}
 

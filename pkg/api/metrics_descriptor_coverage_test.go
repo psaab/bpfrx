@@ -10,11 +10,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 
+	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/conntrack"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/dhcp"
+	"github.com/psaab/xpf/pkg/ipmon"
 )
 
 // #1726: whole-collector Prometheus descriptor-coverage canary.
@@ -342,6 +344,20 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 				"warm":         4.0,
 			}
 		},
+		// #1827: wire a non-nil ip-monitoring status source so the
+		// xpf_ipmon_* family emits and the canary covers its
+		// descriptor declarations.
+		ipmonStatusFn: func() []ipmon.PolicyStatus {
+			return []ipmon.PolicyStatus{{
+				Name:        "wan-failover",
+				Probe:       "WAN",
+				Failed:      true,
+				Transitions: 3,
+				Routes: []config.RouteOverlayEntry{
+					{Destination: "0.0.0.0/0", NextHop: "172.16.80.1", Policy: "wan-failover"},
+				},
+			}}
+		},
 	}
 	// dhcp.New opens a netlink handle, which a restricted sandbox may
 	// refuse ("operation not permitted"). The DHCP family is one of many;
@@ -410,6 +426,7 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 		"xpf_sessions_active",                                        // collectSessionGauges
 		"xpf_daemon_uptime_seconds",                                  // collectSystemMetrics
 		"xpf_daemon_neighbor_periodic_last_success_age_seconds",      // #1780 neighbor watchdog
+		"xpf_ipmon_policy_failed",                                    // #1827 ip-monitoring
 		"xpf_userspace_worker_dead",                                  // emitWorkerRuntime
 		"xpf_userspace_worker_cold_path_samples_v3_total",            // cold-path v3
 		"xpf_cos_drain_invocations_total",                            // CoS owner profile

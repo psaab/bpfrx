@@ -248,6 +248,25 @@ func newCollector(srv *Server) *xpfCollector {
 				"when config persistence is healthy.",
 			nil, nil,
 		),
+		ipmonPolicyFailed: prometheus.NewDesc(
+			"xpf_ipmon_policy_failed",
+			"1 while the services ip-monitoring policy is in FAIL state "+
+				"(preferred routes injected); 0 while passing (#1827).",
+			[]string{"policy"}, nil,
+		),
+		ipmonPolicyTransitions: prometheus.NewDesc(
+			"xpf_ipmon_policy_transitions_total",
+			"Total FAIL/recover state transitions of the services "+
+				"ip-monitoring policy (#1827). A steadily climbing value "+
+				"indicates a flapping uplink; consider a non-zero hold-down.",
+			[]string{"policy"}, nil,
+		),
+		ipmonRoutesApplied: prometheus.NewDesc(
+			"xpf_ipmon_routes_applied",
+			"Number of ip-monitoring preferred routes currently applied "+
+				"(after winner resolution, #1827).",
+			nil, nil,
+		),
 
 		// #709: owner-profile telemetry. Labels:
 		//   ifindex:      interface ifindex as string

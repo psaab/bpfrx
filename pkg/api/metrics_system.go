@@ -46,6 +46,24 @@ func (c *xpfCollector) collectSystemMetrics(ch chan<- prometheus.Metric) {
 		}
 	}
 
+	// #1827: services ip-monitoring policy state.
+	if c.srv.ipmonStatusFn != nil {
+		routesApplied := 0
+		for _, ps := range c.srv.ipmonStatusFn() {
+			failed := 0.0
+			if ps.Failed {
+				failed = 1.0
+			}
+			ch <- prometheus.MustNewConstMetric(c.ipmonPolicyFailed,
+				prometheus.GaugeValue, failed, ps.Name)
+			ch <- prometheus.MustNewConstMetric(c.ipmonPolicyTransitions,
+				prometheus.CounterValue, float64(ps.Transitions), ps.Name)
+			routesApplied += len(ps.Routes)
+		}
+		ch <- prometheus.MustNewConstMetric(c.ipmonRoutesApplied,
+			prometheus.GaugeValue, float64(routesApplied))
+	}
+
 	// Daemon RSS from /proc/self/statm (field 1 = RSS in pages)
 	if data, err := os.ReadFile("/proc/self/statm"); err == nil {
 		fields := strings.Fields(string(data))

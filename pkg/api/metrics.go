@@ -86,6 +86,11 @@ type xpfCollector struct {
 	// yet succeeded (restart would load a stale config).
 	configPersistDegraded *prometheus.Desc
 
+	// #1827: services ip-monitoring observability.
+	ipmonPolicyFailed      *prometheus.Desc
+	ipmonPolicyTransitions *prometheus.Desc
+	ipmonRoutesApplied     *prometheus.Desc
+
 	// #709: CoS owner-profile telemetry (userspace dataplane only).
 	// Cardinality estimate per plan §5: num_queues (≤ 64) × num_interfaces
 	// (≤ 8) × DRAIN_HIST_BUCKETS (16) = ≤ 8192 series for each of the
@@ -321,6 +326,9 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.daemonMemRSS
 	ch <- c.neighborPeriodicAge
 	ch <- c.configPersistDegraded
+	ch <- c.ipmonPolicyFailed
+	ch <- c.ipmonPolicyTransitions
+	ch <- c.ipmonRoutesApplied
 	ch <- c.cosDrainLatencyBucket
 	ch <- c.cosDrainInvocationsTotal
 	ch <- c.cosRedirectAcquireBucket
