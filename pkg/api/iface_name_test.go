@@ -167,7 +167,7 @@ func TestWriteInterfacesDetail_DHCPLeasePath(t *testing.T) {
 	// regression that keys LeaseFor by the raw ifName would print
 	// the decoy address; the correct DHCPLeaseKey-routed handler
 	// prints the correct one.
-	dm, err := dhcp.New(t.TempDir(), nil)
+	dm, err := dhcp.New(t.TempDir(), nil, nil)
 	if err != nil {
 		t.Fatalf("dhcp.New: %v", err)
 	}

@@ -378,7 +378,7 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 	// When the manager is available we wire it (Leases() is empty) and
 	// assert its sentinel; otherwise we skip just that family.
 	dhcpWired := false
-	if dhcpMgr, err := dhcp.New(t.TempDir(), nil); err == nil {
+	if dhcpMgr, err := dhcp.New(t.TempDir(), nil, nil); err == nil {
 		defer dhcpMgr.Close()
 		srv.dhcp = dhcpMgr
 		dhcpWired = true

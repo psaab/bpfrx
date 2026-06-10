@@ -116,7 +116,7 @@ func (d *Daemon) reconcileDHCPClients(cfg *config.Config) {
 	if d.dhcp == nil {
 		// State dir for DUID persistence — same directory as config file
 		stateDir := filepath.Dir(d.opts.ConfigFile)
-		dm, err := dhcp.New(stateDir, d.onDHCPAddressChange)
+		dm, err := dhcp.New(stateDir, d.onDHCPAddressChange, nil)
 		if err != nil {
 			slog.Warn("failed to create DHCP manager", "err", err)
 			return
