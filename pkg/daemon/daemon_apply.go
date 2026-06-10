@@ -880,6 +880,16 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 		}
 	}
 
+	// 7b. Reconcile DHCP clients (#1793): start clients for units that
+	// gained dhcp/dhcpv6 in this commit, stop clients for units that
+	// lost it, restart clients whose options changed. The diff keys on
+	// config identity only (interface, family, options) — never lease
+	// state — so the DHCP lease-change callback re-entering applyConfig
+	// (onDHCPAddressChange) cannot restart clients in a loop. Runs after
+	// the dataplane compile (step 2) so HOST_INBOUND_DHCP flags are
+	// active before a newly started client puts DHCP packets on the wire.
+	d.reconcileDHCPClients(cfg)
+
 	// 8. Apply VRRP config — merge user VRRP + RETH VRRP instances
 	vrrpInstances := vrrp.CollectInstances(cfg)
 	if d.cluster != nil {

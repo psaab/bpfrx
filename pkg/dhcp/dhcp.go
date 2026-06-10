@@ -50,6 +50,12 @@ type clientKey struct {
 type dhcpClient struct {
 	cancel context.CancelFunc
 	done   chan struct{}
+	// fingerprint is the client's config identity (options/DUID type)
+	// captured at Start time. Reconcile compares it against the
+	// fingerprint of the newly committed config to decide whether the
+	// client must be restarted. It NEVER includes lease or address
+	// state — see Reconcile.
+	fingerprint string
 }
 
 // DHCPv4Options holds client behavior options for DHCPv4.
@@ -97,6 +103,11 @@ type Manager struct {
 	nlHandle        *netlink.Handle
 	recompileTimer  *time.Timer
 	stateDir        string
+
+	// runClientForTest replaces the per-family run goroutine body in
+	// tests so reconcile/registry behavior can be exercised without
+	// real DHCP traffic. nil in production.
+	runClientForTest func(ctx context.Context, ifaceName string, af AddressFamily)
 }
 
 // New creates a DHCP manager. stateDir is where DUID files are persisted.
@@ -189,30 +200,67 @@ func (m *Manager) DelegatedPrefixesForRA() []PDRAMapping {
 }
 
 // Start begins a DHCP client for the given interface and address family.
-func (m *Manager) Start(ctx context.Context, ifaceName string, af AddressFamily) {
+// Start reports whether a client for the key is registered when it
+// returns: true if this call started one or one was already running,
+// false if the key has no option state (the desired-config signal —
+// SetDHCPv*Options/Reconcile install it, Reconcile prunes it for
+// removed clients). The membership check lives INSIDE the registration
+// lock so check-and-register is atomic: a Renew racing a removal
+// Reconcile cannot observe membership, lose the lock, and register a
+// client for a key the Reconcile just deconfigured (Codex review on
+// PR #1815, round 5).
+func (m *Manager) Start(ctx context.Context, ifaceName string, af AddressFamily) bool {
 	key := clientKey{iface: ifaceName, family: af}
 
 	m.mu.Lock()
 	if _, exists := m.clients[key]; exists {
 		m.mu.Unlock()
-		return
+		return true
+	}
+	desired := false
+	switch af {
+	case AFInet:
+		_, desired = m.v4opts[ifaceName]
+	case AFInet6:
+		_, desired = m.v6opts[ifaceName]
+	}
+	if !desired {
+		m.mu.Unlock()
+		slog.Info("DHCP: start refused; no option state for client",
+			"interface", ifaceName, "family", af)
+		return false
 	}
 
 	// Use an independent context so DHCP clients are decoupled from the
-	// daemon lifecycle. Only explicit StopAll() triggers lease release and
-	// address removal. During graceful restart (SIGTERM), the process exits
-	// without calling StopAll(), so addresses stay on interfaces for the
-	// next daemon to reuse.
+	// daemon lifecycle. Only an explicit stop (Reconcile removal, Renew,
+	// StopAll) cancels a client. During graceful restart (SIGTERM), the
+	// process exits without calling StopAll(), so addresses stay on
+	// interfaces for the next daemon to reuse.
 	cctx, cancel := context.WithCancel(context.Background())
 	dc := &dhcpClient{
-		cancel: cancel,
-		done:   make(chan struct{}),
+		cancel:      cancel,
+		done:        make(chan struct{}),
+		fingerprint: m.configFingerprintLocked(key),
 	}
 	m.clients[key] = dc
+	runFn := m.runClientForTest
 	m.mu.Unlock()
 
+	slog.Info("DHCP: starting client", "interface", ifaceName, "family", af)
+
 	go func() {
+		// Defer order matters: finishClient (deregister + lease/address
+		// cleanup) runs BEFORE close(done), so anyone waiting on done
+		// observes a clean registry. The deregistration covers ALL
+		// terminal exits (#1793) — cancellation, DHCPv4 max
+		// retransmissions, DHCPv6 link-local abort — not just Renew,
+		// so a future Start for this key is never a permanent no-op.
 		defer close(dc.done)
+		defer m.finishClient(key, dc)
+		if runFn != nil {
+			runFn(cctx, ifaceName, af)
+			return
+		}
 		switch af {
 		case AFInet:
 			m.runDHCPv4(cctx, ifaceName)
@@ -220,6 +268,39 @@ func (m *Manager) Start(ctx context.Context, ifaceName string, af AddressFamily)
 			m.runDHCPv6(cctx, ifaceName)
 		}
 	}()
+	return true
+}
+
+// finishClient runs in the client goroutine's defer on every exit path.
+// It deregisters the registry entry (only if it still maps to this exact
+// client — Renew deletes/re-adds entries, so a pointer compare guards
+// against clobbering a successor) and cleans up any lease record and
+// interface address the run loop left behind (some cancellation
+// interleavings exit the run loop without hitting its own ctx.Done
+// cleanup branches).
+func (m *Manager) finishClient(key clientKey, dc *dhcpClient) {
+	m.mu.Lock()
+	cur, ok := m.clients[key]
+	if !ok || cur != dc {
+		// A successor client already replaced (or removed) this key.
+		// Its lease / delegated-PD records belong to the successor —
+		// a delayed defer from the OLD client must not delete them
+		// (AGY review on PR #1815: unguarded cleanup let a slow old
+		// defer clobber the new client's lease).
+		m.mu.Unlock()
+		return
+	}
+	delete(m.clients, key)
+	lease := m.leases[key]
+	delete(m.leases, key)
+	if key.family == AFInet6 {
+		delete(m.delegatedPDs, key.iface)
+	}
+	m.mu.Unlock()
+
+	if lease != nil && lease.Address.IsValid() {
+		m.removeAddress(key.iface, lease)
+	}
 }
 
 // Renew restarts the DHCP client for the specified interface and address
@@ -232,22 +313,35 @@ func (m *Manager) Renew(ifaceName string) error {
 		key := clientKey{iface: ifaceName, family: af}
 		m.mu.Lock()
 		dc, exists := m.clients[key]
-		if exists {
-			delete(m.clients, key)
-		}
 		m.mu.Unlock()
 
 		if !exists {
 			continue
 		}
 
-		// Stop existing client
+		// Stop the existing client. Do NOT pre-delete the registry
+		// entry: finishClient owns deregistration and the lease /
+		// delegated-PD / address cleanup, and its pointer guard
+		// early-returns when the entry is already gone — a pre-delete
+		// here would skip that cleanup entirely when cancellation
+		// lands mid-exchange (Codex review on PR #1815). Waiting on
+		// done guarantees finishClient has completed before restart.
 		dc.cancel()
 		<-dc.done
-		renewed = true
 
-		// Restart
-		m.Start(context.Background(), ifaceName, af)
+		// Restart. Renew is reachable from gRPC outside applySem, so a
+		// concurrent Reconcile may have removed this client from
+		// config after we captured dc above; Start performs the
+		// desired-set membership check atomically with registration
+		// (under m.mu) and refuses to resurrect a deconfigured client
+		// — a check here would go stale before Start takes the lock
+		// (Codex review on PR #1815, rounds 3-5).
+		if !m.Start(context.Background(), ifaceName, af) {
+			slog.Info("DHCP: renew skipped restart; client removed from config",
+				"interface", ifaceName, "family", af)
+			continue
+		}
+		renewed = true
 		slog.Info("DHCP client renewed", "interface", ifaceName, "family", af)
 	}
 	if !renewed {
@@ -256,7 +350,10 @@ func (m *Manager) Renew(ifaceName string) error {
 	return nil
 }
 
-// StopAll stops all running DHCP clients and releases leases.
+// StopAll stops all running DHCP clients and releases leases. Registry
+// entries are cleared by each client's finishClient defer, which runs
+// before its done channel closes, so the registry is empty when StopAll
+// returns.
 func (m *Manager) StopAll() {
 	m.mu.Lock()
 	clients := make(map[clientKey]*dhcpClient, len(m.clients))
@@ -811,8 +908,8 @@ func (m *Manager) runDHCPv6(ctx context.Context, ifaceName string) {
 
 // dhcpv6Result holds results from a DHCPv6 exchange including both IA_NA and IA_PD.
 type dhcpv6Result struct {
-	lease      *Lease
-	prefixes   []DelegatedPrefix
+	lease    *Lease
+	prefixes []DelegatedPrefix
 }
 
 // doDHCPv6 performs a single DHCPv6 solicit/request exchange.
@@ -971,7 +1068,7 @@ func (m *Manager) doDHCPv6(ctx context.Context, ifaceName string) (*dhcpv6Result
 
 	// DHCPv6 doesn't provide a default router — discover it from the
 	// kernel's IPv6 neighbor table (entries learned via Router Advertisements).
-	if gw := m.discoverIPv6Router(ifaceName); gw.IsValid() {
+	if gw := m.discoverIPv6Router(ctx, ifaceName); gw.IsValid() {
 		lease.Gateway = gw
 	}
 
@@ -1063,7 +1160,7 @@ func extractDelegatedPrefixes(msg *dhcpv6.Message, ifaceName string, now time.Ti
 // given interface by inspecting the kernel neighbor table for entries with
 // the NTF_ROUTER flag (learned from Router Advertisements).
 // Retries a few times since RAs may not have been processed yet.
-func (m *Manager) discoverIPv6Router(ifaceName string) netip.Addr {
+func (m *Manager) discoverIPv6Router(ctx context.Context, ifaceName string) netip.Addr {
 	link, err := m.nlHandle.LinkByName(ifaceName)
 	if err != nil {
 		return netip.Addr{}
@@ -1071,7 +1168,15 @@ func (m *Manager) discoverIPv6Router(ifaceName string) netip.Addr {
 
 	for attempt := 0; attempt < 10; attempt++ {
 		if attempt > 0 {
-			time.Sleep(time.Second)
+			// Context-aware: Reconcile cancels clients and waits on
+			// done while applyConfigLocked holds applySem — a blind
+			// 10x1s sleep here wedged every commit for up to 10s
+			// (AGY review on PR #1815).
+			select {
+			case <-ctx.Done():
+				return netip.Addr{}
+			case <-time.After(time.Second):
+			}
 		}
 
 		neighbors, err := m.nlHandle.NeighList(link.Attrs().Index, netlink.FAMILY_V6)
@@ -1151,6 +1256,9 @@ func (m *Manager) applyAddress(ifaceName string, lease *Lease) error {
 
 // removeAddress removes the DHCP address and default route from the interface.
 func (m *Manager) removeAddress(ifaceName string, lease *Lease) {
+	if m.nlHandle == nil {
+		return // test-constructed Manager without netlink
+	}
 	link, err := m.nlHandle.LinkByName(ifaceName)
 	if err != nil {
 		return
