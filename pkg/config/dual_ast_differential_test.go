@@ -648,10 +648,9 @@ services {
         }
     }
 }`,
-		expectedFail: true,
-		failureClass: "compiler dual-AST",
-		reason: "#1797: dhcp-relay missing from setSchema (flat-set collapses to one " +
-			"leaf) and compileDHCPRelay reads only Children — relay compiles empty",
+		// Fixed in U5b (#1797): dhcp-relay subtree added to setSchema and
+		// compileDHCPRelay also reads inline Keys-encoded properties.
+		expectedFail: false,
 	},
 	{
 		name: "protocols-ospf-bgp",

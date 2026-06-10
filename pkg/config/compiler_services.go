@@ -590,17 +590,46 @@ func compileDHCPRelay(node *Node, fo *ForwardingOptionsConfig) error {
 	}
 
 	for _, sgInst := range namedInstances(node.FindChildren("server-group")) {
-		sg := &DHCPRelayServerGroup{Name: sgInst.name}
+		sg := relay.ServerGroups[sgInst.name]
+		if sg == nil {
+			sg = &DHCPRelayServerGroup{Name: sgInst.name}
+			relay.ServerGroups[sg.Name] = sg
+		}
+		// Inline keys (#1797 dual-AST): "server-group sg1 10.1.1.1;" packs
+		// the server addresses into Keys[2:].
+		for i := 2; i < len(sgInst.node.Keys); i++ {
+			sg.Servers = append(sg.Servers, sgInst.node.Keys[i])
+		}
 		for _, child := range sgInst.node.Children {
 			if len(child.Keys) >= 1 {
 				sg.Servers = append(sg.Servers, child.Keys[0])
 			}
 		}
-		relay.ServerGroups[sg.Name] = sg
 	}
 
 	for _, gInst := range namedInstances(node.FindChildren("group")) {
-		g := &DHCPRelayGroup{Name: gInst.name}
+		g := relay.Groups[gInst.name]
+		if g == nil {
+			g = &DHCPRelayGroup{Name: gInst.name}
+			relay.Groups[g.Name] = g
+		}
+		// Inline keys (#1797 dual-AST): "group lan interface ge-0/0/0.0;"
+		// packs the properties into Keys[2:].
+		keys := gInst.node.Keys
+		for i := 2; i < len(keys); i++ {
+			switch keys[i] {
+			case "interface":
+				if i+1 < len(keys) {
+					i++
+					g.Interfaces = append(g.Interfaces, keys[i])
+				}
+			case "active-server-group":
+				if i+1 < len(keys) {
+					i++
+					g.ActiveServerGroup = keys[i]
+				}
+			}
+		}
 		for _, prop := range gInst.node.Children {
 			switch prop.Name() {
 			case "interface":
@@ -611,7 +640,6 @@ func compileDHCPRelay(node *Node, fo *ForwardingOptionsConfig) error {
 				g.ActiveServerGroup = nodeVal(prop)
 			}
 		}
-		relay.Groups[g.Name] = g
 	}
 
 	fo.DHCPRelay = relay

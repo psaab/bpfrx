@@ -1242,6 +1242,16 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				"output": {children: nil},
 			}},
 		}},
+		"dhcp-relay": {desc: "DHCP relay", children: map[string]*schemaNode{
+			// server-group is a named container whose children are the
+			// free-form server address leaves (same modeling as the
+			// sampling flow-server node above).
+			"server-group": {desc: "DHCP server group", args: 1, placeholder: "<name>", children: nil},
+			"group": {desc: "DHCP relay group", args: 1, placeholder: "<name>", children: map[string]*schemaNode{
+				"active-server-group": {desc: "Active server group", args: 1, placeholder: "<server-group>", children: nil},
+				"interface":           {desc: "Interface to relay on", args: 1, multi: true, placeholder: "<interface>", children: nil},
+			}},
+		}},
 	}},
 	"bridge-domains": {wildcard: &schemaNode{desc: "Bridge domain name", children: map[string]*schemaNode{
 		"vlan-id-list":      {args: 1, multi: true, desc: "VLAN IDs in this bridge domain", children: nil},
