@@ -18,6 +18,7 @@ type fakeOverlayDP struct {
 	calls                      []string
 	publishErr                 error
 	publishSkipped             bool // simulate the duplicate-skip (published=false)
+	bumpErr                    error
 	lastOverlay                []config.RouteOverlayEntry
 }
 
@@ -30,9 +31,9 @@ func (f *fakeOverlayDP) PublishRouteOverlaySnapshot(cfg *config.Config, overlay 
 	return !f.publishSkipped, nil
 }
 
-func (f *fakeOverlayDP) BumpFIBGeneration() uint32 {
+func (f *fakeOverlayDP) BumpFIBGeneration() (uint32, error) {
 	f.calls = append(f.calls, "bump")
-	return 1
+	return 1, f.bumpErr
 }
 
 func failedIPMonEngine(t *testing.T) *ipmon.Engine {
@@ -252,5 +253,78 @@ func TestActuatorSkipsBumpOnDuplicatePublish(t *testing.T) {
 
 	if len(dp.calls) != 1 || dp.calls[0] != "publish" {
 		t.Fatalf("calls = %v, want [publish] only (no bump on duplicate-skip)", dp.calls)
+	}
+}
+
+// TestActuatorRetriesUnconfirmedBump (#1844 plan §4.3, Codex r2-1):
+// publish succeeds (content hash advances) but the bump_fib_generation
+// control message fails. A later duplicate actuation is hash-skipped
+// (published=false) — without the pendingFIBBump retry the bump would
+// never happen and cached flow routes would stay pinned to the
+// pre-failover paths. The retry must fire exactly until confirmed.
+func TestActuatorRetriesUnconfirmedBump(t *testing.T) {
+	dp := &fakeOverlayDP{bumpErr: errors.New("control socket timeout")}
+	d := &Daemon{
+		applySem: semaphore.NewWeighted(1),
+		dp:       dp,
+		ipmon:    failedIPMonEngine(t),
+	}
+
+	// Actuation 1: publish OK, bump fails → pending.
+	d.actuateRouteOverlayLocked(&config.Config{})
+	if len(dp.calls) != 2 || dp.calls[1] != "bump" {
+		t.Fatalf("calls = %v, want [publish bump]", dp.calls)
+	}
+	if !d.pendingFIBBump {
+		t.Fatal("pendingFIBBump not set after bump failure")
+	}
+
+	// Actuation 2: duplicate publish (hash-skip) + bump still failing →
+	// the bump IS retried and stays pending.
+	dp.publishSkipped = true
+	d.actuateRouteOverlayLocked(&config.Config{})
+	if len(dp.calls) != 4 || dp.calls[3] != "bump" {
+		t.Fatalf("calls = %v, want retried bump on duplicate publish", dp.calls)
+	}
+	if !d.pendingFIBBump {
+		t.Fatal("pendingFIBBump cleared while bump still failing")
+	}
+
+	// Actuation 3: bump recovers → retried once more, then confirmed.
+	dp.bumpErr = nil
+	d.actuateRouteOverlayLocked(&config.Config{})
+	if len(dp.calls) != 6 || dp.calls[5] != "bump" {
+		t.Fatalf("calls = %v, want final retry bump", dp.calls)
+	}
+	if d.pendingFIBBump {
+		t.Fatal("pendingFIBBump not cleared after confirmed bump")
+	}
+
+	// Actuation 4: duplicate publish with NO pending bump → no bump
+	// (the plan's named no-churn test).
+	d.actuateRouteOverlayLocked(&config.Config{})
+	if len(dp.calls) != 7 || dp.calls[6] != "publish" {
+		t.Fatalf("calls = %v, want trailing [publish] only", dp.calls)
+	}
+}
+
+// TestActuatorPublishFailureKeepsPendingBump: a failed publish must
+// neither bump nor clear a pending retry — the helper's route state is
+// unknown, and the earlier unconfirmed invalidation still owes a bump.
+func TestActuatorPublishFailureKeepsPendingBump(t *testing.T) {
+	dp := &fakeOverlayDP{publishErr: errors.New("socket down")}
+	d := &Daemon{
+		applySem:       semaphore.NewWeighted(1),
+		dp:             dp,
+		ipmon:          failedIPMonEngine(t),
+		pendingFIBBump: true,
+	}
+	d.actuateRouteOverlayLocked(&config.Config{})
+
+	if len(dp.calls) != 1 || dp.calls[0] != "publish" {
+		t.Fatalf("calls = %v, want [publish] only", dp.calls)
+	}
+	if !d.pendingFIBBump {
+		t.Fatal("pendingFIBBump lost across a failed publish")
 	}
 }

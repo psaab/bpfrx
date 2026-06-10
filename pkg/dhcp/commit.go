@@ -124,6 +124,15 @@ func (m *Manager) commitLease(key clientKey, lease, prev *Lease, prefixes, prevP
 	}
 	m.mu.Unlock()
 
+	// #1844: gateway-change hook for ip-monitoring interface-typed
+	// next-hops. Strictly narrower than leaseContentChanged —
+	// address/DNS-only deltas do not fire. Fired outside m.mu (see
+	// fireGatewayChange) and undebounced: the consumer is the ipmon
+	// engine's dirty-bit + debounce/throttle queue, which absorbs it.
+	if prev == nil || prev.Gateway != lease.Gateway {
+		m.fireGatewayChange()
+	}
+
 	if prev == nil || leaseContentChanged(prev, lease) ||
 		(len(prefixes) > 0 && delegatedPrefixesChanged(prevPDs, prefixes)) {
 		m.scheduleRecompile()

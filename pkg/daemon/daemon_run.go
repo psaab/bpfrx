@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -24,6 +25,7 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	"github.com/psaab/xpf/pkg/dhcp"
 	"github.com/psaab/xpf/pkg/dhcprelay"
 	"github.com/psaab/xpf/pkg/dhcpserver"
 	"github.com/psaab/xpf/pkg/eventengine"
@@ -243,6 +245,36 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// debounce/throttle loop; the RPM transition hook is its sensor.
 	d.ipmon = ipmon.New(d.actuateRouteOverlay)
 	d.rpm.SetTransitionCallback(d.ipmon.HandleTransition)
+
+	// Create the DHCP manager eagerly, beside the ipmon engine (#1844
+	// plan §4.3, AGY r2-1/r2-2): d.dhcp is write-once at boot and
+	// read-only thereafter — the engine's run-loop goroutine (via the
+	// next-hop resolver) and the CLI/gRPC handlers read the pointer
+	// bare, so the previous lazy-create-under-applySem was a Go data
+	// race (and the first apply would have built the overlay against a
+	// nil resolver target). A dhcp.New failure is FATAL: it means
+	// netlink.NewHandle failed, and the daemon cannot manage interfaces
+	// without netlink anyway — a silent nil d.dhcp would strand the
+	// process DHCP-less for its lifetime with no retry path (SMR plan
+	// r3). The gateway-change hook nil-guards d.ipmon so construction
+	// order can never regress silently.
+	if !d.opts.NoDataplane {
+		// State dir for DUID persistence — same directory as config file.
+		dm, err := dhcp.New(filepath.Dir(d.opts.ConfigFile), d.onDHCPAddressChange, func() {
+			if e := d.ipmon; e != nil {
+				e.NotifyNextHopChange()
+			}
+		})
+		if err != nil {
+			return fmt.Errorf("create DHCP manager: %w", err)
+		}
+		d.dhcp = dm
+	}
+
+	// Resolver injection MUST precede Start(): the run-loop goroutine
+	// reads the resolver field without further synchronization, and the
+	// goroutine-creation happens-before edge also publishes d.dhcp.
+	d.ipmon.SetNextHopResolver(d.resolveDHCPNextHop)
 	d.ipmon.Start()
 
 	// Initialize cluster manager if configured (heartbeat/sync started after applyConfig).

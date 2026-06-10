@@ -43,6 +43,13 @@ func FormatStatus(w io.Writer, statuses []PolicyStatus) {
 				fmt.Fprintf(w, "    %-17s %-17s %-16s %s\n", inst, r.Destination, r.NextHop, "APPLIED")
 			}
 		}
+		// #1844: interface-typed routes whose DHCP gateway is currently
+		// unknown (no lease) are skipped from the overlay — surface
+		// them so the operator sees WHY a failed policy applied
+		// nothing.
+		for _, dest := range ps.UnresolvedRoutes {
+			fmt.Fprintf(w, "    %-17s next-hop unresolved (no DHCP gateway) — skipped\n", dest)
+		}
 		if !ps.Since.IsZero() {
 			fmt.Fprintf(w, "  Last state change: %s\n", ps.Since.Format("2006-01-02 15:04:05"))
 		}

@@ -28,6 +28,14 @@ func (m *Manager) SeedLeaseForTesting(ifaceName string, af AddressFamily, lease 
 // netlink access. runClient should block on ctx.Done() to model a
 // long-running client, or return early to model a terminal exit.
 func NewManagerForTesting(runClient func(ctx context.Context, ifaceName string, af AddressFamily)) *Manager {
+	return NewManagerForTestingWithHooks(runClient, nil)
+}
+
+// NewManagerForTestingWithHooks is NewManagerForTesting with the
+// gateway-change hook wired (#1844). A constructor variant — not a
+// setter — so the production immutability of onGatewayChange holds in
+// tests too.
+func NewManagerForTestingWithHooks(runClient func(ctx context.Context, ifaceName string, af AddressFamily), onGatewayChange func()) *Manager {
 	return &Manager{
 		clients:          make(map[clientKey]*dhcpClient),
 		leases:           make(map[clientKey]*Lease),
@@ -37,6 +45,7 @@ func NewManagerForTesting(runClient func(ctx context.Context, ifaceName string, 
 		v4opts:           make(map[string]*DHCPv4Options),
 		v6opts:           make(map[string]*DHCPv6Options),
 		runClientForTest: runClient,
+		onGatewayChange:  onGatewayChange,
 	}
 }
 

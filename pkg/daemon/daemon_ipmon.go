@@ -44,7 +44,13 @@ type routeOverlayPublisher interface {
 	// does not bump the FIB generation for a no-op (Codex PR #1843
 	// MED).
 	PublishRouteOverlaySnapshot(cfg *config.Config, overlay []config.RouteOverlayEntry, schedulerState map[string]bool) (bool, error)
-	BumpFIBGeneration() uint32
+	// BumpFIBGeneration reports whether the helper-side invalidation
+	// was confirmed (#1844 plan §4.3, Codex r2-1): a non-nil error
+	// feeds the actuator's pendingFIBBump retry — without it, a
+	// publish-success/bump-failure ordering followed by a duplicate
+	// (hash-skipped) actuation would strand cached flow routes on the
+	// pre-failover paths forever.
+	BumpFIBGeneration() (uint32, error)
 }
 
 // ipmonActiveOverlay returns the engine's current effective-route
@@ -210,21 +216,37 @@ func (d *Daemon) actuateRouteOverlayLocked(cfg *config.Config) {
 	}
 	published, err := pub.PublishRouteOverlaySnapshot(cfg, overlay, schedulerState)
 	if err != nil {
+		// pendingFIBBump deliberately unchanged: a pending retry from
+		// an earlier bump failure stays pending across a failed
+		// publish.
 		slog.Warn("ip-monitoring: route overlay snapshot publish failed — NOT bumping FIB generation",
 			"err", err)
 		return
 	}
-	if !published {
+	if !published && !d.pendingFIBBump {
 		// Duplicate-skip (content unchanged) or helperless caching:
-		// the dataplane routes did not move, so do not churn
-		// established-flow route caches with a FIB-generation bump
-		// (Codex PR #1843 MED).
+		// the dataplane routes did not move and the previous bump was
+		// confirmed, so do not churn established-flow route caches
+		// with a FIB-generation bump (Codex PR #1843 MED).
 		return
 	}
 
-	// 3. Only after a REAL apply_snapshot success: invalidate cached
-	// flow routes so established flows re-resolve onto the new routes.
-	pub.BumpFIBGeneration()
+	// 3. Only after a REAL apply_snapshot success (or with an
+	// unconfirmed bump pending from an earlier actuation, #1844 Codex
+	// r2-1): invalidate cached flow routes so established flows
+	// re-resolve onto the new routes. pendingFIBBump is mutated only
+	// here, under d.applySem — no extra locking.
+	if _, err := pub.BumpFIBGeneration(); err != nil {
+		d.pendingFIBBump = true
+		slog.Warn("ip-monitoring: FIB generation bump unconfirmed — will retry on next actuation",
+			"err", err)
+		return
+	}
+	d.pendingFIBBump = false
+	if !published {
+		slog.Info("ip-monitoring: retried FIB generation bump after earlier failure")
+		return
+	}
 	slog.Info("ip-monitoring route overlay actuated", "overlay_routes", len(overlay))
 }
 

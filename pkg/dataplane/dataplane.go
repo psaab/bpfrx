@@ -383,7 +383,11 @@ type DataPlane interface {
 	ClearNATRuleCounters() error
 
 	// FIB
-	BumpFIBGeneration() uint32
+	// BumpFIBGeneration invalidates cached per-session FIB entries.
+	// #1844: returns the bump error so callers with retry semantics
+	// (the ip-monitoring routes-only actuator's pendingFIBBump) can
+	// see a failed bump; fire-and-forget callers may ignore it.
+	BumpFIBGeneration() (uint32, error)
 	// StartFIBSync is a no-op on every in-tree backend: eBPF resolves
 	// FIB queries via bpf_fib_lookup in-kernel and the userspace
 	// AF_XDP runtime wraps the eBPF no-op through the legacy

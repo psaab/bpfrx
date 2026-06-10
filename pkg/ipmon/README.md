@@ -52,6 +52,40 @@ the config baseline — while the state machine keeps tracking
 underneath. Primary-only probing/publication scope is computed in
 `pkg/daemon` (`filterRPMForHAGating`, `ipmonPublishAllowed`).
 
+## DHCP-tracked next-hops (#1844)
+
+An interface-typed preferred route (`next-hop ge-0/0/3.0`, compiled to
+`PreferredRoute.NextHopInterface` — the Linux DHCP lease key) is
+resolved to the unit's DHCP-learned gateway **inside the engine,
+before winner selection**, via the injected `NextHopResolver`: an
+unresolvable winner (no lease) is skipped so a resolvable losing
+candidate can win the prefix — resolving after selection would get
+this wrong by construction. Resolved entries carry the gateway in
+`RouteOverlayEntry.NextHop` (plus the lease key in
+`NextHopInterface`), so FRR render and the snapshot builder are
+unchanged. Skipped candidates surface as
+`PolicyStatus.UnresolvedRoutes` (shown by `FormatStatus` and exported
+as `xpf_ipmon_unresolved_next_hops`).
+
+`NotifyNextHopChange` is the DHCP gateway-change trigger (wired to
+`dhcp.New`'s `onGatewayChange` hook): it marks the overlay dirty only
+when a currently FAILED policy has an interface-typed route, and
+enters the SAME dirty→debounce→throttle queue as probe transitions —
+no second actuation path, no full apply.
+
+**Lock order (one-way, load-bearing):** `Engine.mu → dhcp.Manager.mu`.
+The resolver (called under `Engine.mu`) takes `dhcp.mu` via
+`LeaseFor`; `pkg/dhcp` fires the hook strictly OUTSIDE `dhcp.mu`, so
+the hook's bounded blocking on `Engine.mu` can never deadlock. The
+resolver must never call back into the engine.
+
+Withdrawal: a removed lease record (client stopped, unit
+deconfigured) fires the hook → resolver returns `!ok` → next actuation
+withdraws the route. A failed re-acquisition keeps the last-known
+gateway (record persists until replaced) — deliberate parity with the
+FRR DHCP default route; see the RFC 2131 coupling rule in
+`pkg/dhcp/README.md`.
+
 ## Entry points
 
 - `Engine`, `New(actuate func())`, `Start/Stop` — `ipmon.go`.
@@ -59,14 +93,16 @@ underneath. Primary-only probing/publication scope is computed in
   state for surviving (name, probe) pairs.
 - `HandleTransition(rpm.Transition)` — the sensor input (wired to
   `rpm.Manager.SetTransitionCallback`).
+- `SetNextHopResolver(NextHopResolver)` (before `Start`) and
+  `NotifyNextHopChange()` — the #1844 DHCP next-hop seam (above).
 - `ActiveOverlay() []config.RouteOverlayEntry`.
 - `Status() []PolicyStatus`, `FormatStatus` (`display.go`) — shared by
   the local CLI and gRPC `show services ip-monitoring status`.
 
 ## Callers
 
-`pkg/daemon` (engine lifecycle + actuator), `pkg/cli`, `pkg/grpcapi`,
-`pkg/api` (metrics).
+`pkg/daemon` (engine lifecycle + actuator + next-hop resolver),
+`pkg/cli`, `pkg/grpcapi`, `pkg/api` (metrics).
 
 ## Dependencies
 
