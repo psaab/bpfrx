@@ -687,6 +687,24 @@ type ProcessStatus struct {
 	NeighborResolverGetRttCount      uint64   `json:"neighbor_resolver_get_rtt_count,omitempty"`
 	NeighborPendingTimeoutDropsTotal uint64   `json:"neighbor_pending_timeout_drops_total,omitempty"`
 	NeighborPendingMaxDepth          uint64   `json:"neighbor_pending_max_depth,omitempty"`
+	// #1771 §2.6: per-key resolver + §2.5 ENOBUFS-re-dump telemetry.
+	// GetBackoffAttempts is the subset of resolver GET attempts that were
+	// backoff RETRIES (key re-admitted after the per-key rate-limit
+	// window) — invariant N1 (§2.4): these keep firing while a key is
+	// negatively cached. The Netlink* counters instrument the monitor
+	// thread's lost-notification self-heal: ENOBUFS receives, throttled
+	// upsert-only re-dumps issued, and entries actually (re)added by
+	// re-dump replies. PendingKeys / NegNeighKeys are gauges summed over
+	// the per-binding ~65ms debug-tick snapshots: distinct unresolved
+	// next-hop keys buffered in pending_neigh, and keys held in the
+	// negative caches (lazy-TTL upper bound). All decode to 0 for older
+	// helpers (keys absent).
+	NeighborResolverGetBackoffAttemptsTotal uint64 `json:"neighbor_resolver_get_backoff_attempts_total,omitempty"`
+	NeighborNetlinkEnobufsTotal             uint64 `json:"neighbor_netlink_enobufs_total,omitempty"`
+	NeighborNetlinkRedumpsTotal             uint64 `json:"neighbor_netlink_redumps_total,omitempty"`
+	NeighborNetlinkRedumpUpsertsTotal       uint64 `json:"neighbor_netlink_redump_upserts_total,omitempty"`
+	NeighborPendingKeys                     uint64 `json:"neighbor_pending_keys,omitempty"`
+	NegNeighKeys                            uint64 `json:"neg_neigh_keys,omitempty"`
 }
 
 // MarshalJSON intentionally uses a value receiver so both ProcessStatus values

@@ -256,6 +256,14 @@ type xpfCollector struct {
 	neighborResolverGetRttSeconds    *prometheus.Desc
 	neighborPendingTimeoutDropsTotal *prometheus.Desc
 	neighborPendingMaxDepth          *prometheus.Desc
+	// #1771 §2.6: resolver backoff-retry counter, §2.5 ENOBUFS/re-dump
+	// counters, and the pending-keys / negative-keys gauges.
+	neighborResolverGetBackoffAttemptsTotal *prometheus.Desc
+	neighborNetlinkEnobufsTotal             *prometheus.Desc
+	neighborNetlinkRedumpsTotal             *prometheus.Desc
+	neighborNetlinkRedumpUpsertsTotal       *prometheus.Desc
+	neighborPendingKeys                     *prometheus.Desc
+	negNeighKeys                            *prometheus.Desc
 }
 
 func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
@@ -425,6 +433,12 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.neighborResolverGetRttSeconds
 	ch <- c.neighborPendingTimeoutDropsTotal
 	ch <- c.neighborPendingMaxDepth
+	ch <- c.neighborResolverGetBackoffAttemptsTotal
+	ch <- c.neighborNetlinkEnobufsTotal
+	ch <- c.neighborNetlinkRedumpsTotal
+	ch <- c.neighborNetlinkRedumpUpsertsTotal
+	ch <- c.neighborPendingKeys
+	ch <- c.negNeighKeys
 }
 
 func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {

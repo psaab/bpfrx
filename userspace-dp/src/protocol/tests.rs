@@ -72,6 +72,65 @@ fn process_status_buffer_capacity_fields_roundtrip() {
     assert_eq!(back.worker_runtime[0].max_sessions, 100);
 }
 
+// #1771 §2.6: round-trip + backward-compat pin for the resolver
+// backoff-retry counter, the §2.5 ENOBUFS/re-dump counters, and the
+// pending-keys / negative-keys gauges. The wire keys feed
+// pkg/dataplane/userspace/protocol.go and the Prometheus families
+// `xpf_userspace_neighbor_resolver_get_backoff_attempts_total`,
+// `xpf_userspace_neighbor_netlink_{enobufs,redumps,redump_upserts}_total`,
+// `xpf_userspace_neighbor_pending_keys`, `xpf_userspace_neg_neigh_keys`.
+#[test]
+fn process_status_neighbor_phase3_counters_roundtrip() {
+    let status = ProcessStatus {
+        neighbor_resolver_get_backoff_attempts_total: 7,
+        neighbor_netlink_enobufs_total: 3,
+        neighbor_netlink_redumps_total: 2,
+        neighbor_netlink_redump_upserts_total: 11,
+        neighbor_pending_keys: 4,
+        neg_neigh_keys: 5,
+        ..Default::default()
+    };
+    let value: serde_json::Value =
+        serde_json::to_value(&status).expect("serialize ProcessStatus to Value");
+    let keys = [
+        ("neighbor_resolver_get_backoff_attempts_total", 7u64),
+        ("neighbor_netlink_enobufs_total", 3),
+        ("neighbor_netlink_redumps_total", 2),
+        ("neighbor_netlink_redump_upserts_total", 11),
+        ("neighbor_pending_keys", 4),
+        ("neg_neigh_keys", 5),
+    ];
+    for (key, want) in keys {
+        assert_eq!(value[key], want, "wire key {key}");
+    }
+    let back: ProcessStatus = serde_json::from_value(value).expect("deserialize ProcessStatus");
+    assert_eq!(back.neighbor_resolver_get_backoff_attempts_total, 7);
+    assert_eq!(back.neighbor_netlink_enobufs_total, 3);
+    assert_eq!(back.neighbor_netlink_redumps_total, 2);
+    assert_eq!(back.neighbor_netlink_redump_upserts_total, 11);
+    assert_eq!(back.neighbor_pending_keys, 4);
+    assert_eq!(back.neg_neigh_keys, 5);
+
+    // Pre-Phase-3 payload (keys absent) must decode with zero defaults.
+    let mut legacy_value =
+        serde_json::to_value(ProcessStatus::default()).expect("serialize default ProcessStatus");
+    for (key, _) in keys {
+        legacy_value
+            .as_object_mut()
+            .expect("ProcessStatus serializes to an object")
+            .remove(key)
+            .unwrap_or_else(|| panic!("new key {key} present before strip"));
+    }
+    let legacy: ProcessStatus =
+        serde_json::from_value(legacy_value).expect("pre-Phase-3 payload decodes");
+    assert_eq!(legacy.neighbor_resolver_get_backoff_attempts_total, 0);
+    assert_eq!(legacy.neighbor_netlink_enobufs_total, 0);
+    assert_eq!(legacy.neighbor_netlink_redumps_total, 0);
+    assert_eq!(legacy.neighbor_netlink_redump_upserts_total, 0);
+    assert_eq!(legacy.neighbor_pending_keys, 0);
+    assert_eq!(legacy.neg_neigh_keys, 0);
+}
+
 // #1807: round-trip + backward-compat pin for the worker-command-queue
 // poison-recovery counter. The wire key feeds
 // pkg/dataplane/userspace/protocol.go and the Prometheus counter
