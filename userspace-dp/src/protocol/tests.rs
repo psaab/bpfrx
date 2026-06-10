@@ -1057,17 +1057,6 @@ fn cos_queue_status_sojourn_roundtrip_1829() {
         sojourn_ewma_ns: 2_500_000,
         sojourn_peak_ns: 9_000_000,
         sojourn_windowed_min_ns: 1_750_000,
-// #1830 (g): round-trip + backward-compat pin for the bucket-vs-flow
-// occupancy telemetry. The wire keys feed
-// pkg/dataplane/userspace/protocol.go and the Prometheus gauges
-// `xpf_userspace_cos_flow_fair_buckets_occupied` /
-// `xpf_userspace_cos_flow_fair_flows_active` — a rename on either side
-// must fail a test instead of silently decoding zero.
-#[test]
-fn cos_queue_status_flow_fair_occupancy_roundtrip_1830() {
-    let status = CoSQueueStatus {
-        flow_fair_buckets_occupied: 9,
-        flow_fair_flows_active: 12,
         ..Default::default()
     };
     let value: serde_json::Value =
@@ -1088,6 +1077,34 @@ fn cos_queue_status_flow_fair_occupancy_roundtrip_1830() {
         "sojourn_peak_ns",
         "sojourn_windowed_min_ns",
     ] {
+        legacy_value
+            .as_object_mut()
+            .expect("CoSQueueStatus serializes to an object")
+            .remove(key)
+            .unwrap_or_else(|| panic!("new key {key} present before strip"));
+    }
+    let legacy: CoSQueueStatus =
+        serde_json::from_value(legacy_value).expect("pre-#1829 payload decodes");
+    assert_eq!(legacy.sojourn_ewma_ns, 0);
+    assert_eq!(legacy.sojourn_peak_ns, 0);
+    assert_eq!(legacy.sojourn_windowed_min_ns, 0);
+}
+
+// #1830 (g): round-trip + backward-compat pin for the bucket-vs-flow
+// occupancy telemetry. The wire keys feed
+// pkg/dataplane/userspace/protocol.go and the Prometheus gauges
+// `xpf_userspace_cos_flow_fair_buckets_occupied` /
+// `xpf_userspace_cos_flow_fair_flows_active` — a rename on either side
+// must fail a test instead of silently decoding zero.
+#[test]
+fn cos_queue_status_flow_fair_occupancy_roundtrip_1830() {
+    let status = CoSQueueStatus {
+        flow_fair_buckets_occupied: 9,
+        flow_fair_flows_active: 12,
+        ..Default::default()
+    };
+    let value: serde_json::Value =
+        serde_json::to_value(&status).expect("serialize CoSQueueStatus");
     assert_eq!(value["flow_fair_buckets_occupied"], 9u64);
     assert_eq!(value["flow_fair_flows_active"], 12u64);
     let back: CoSQueueStatus = serde_json::from_value(value).expect("deserialize CoSQueueStatus");
@@ -1105,10 +1122,6 @@ fn cos_queue_status_flow_fair_occupancy_roundtrip_1830() {
             .unwrap_or_else(|| panic!("new key {key} present before strip"));
     }
     let legacy: CoSQueueStatus =
-        serde_json::from_value(legacy_value).expect("pre-#1829 payload decodes");
-    assert_eq!(legacy.sojourn_ewma_ns, 0);
-    assert_eq!(legacy.sojourn_peak_ns, 0);
-    assert_eq!(legacy.sojourn_windowed_min_ns, 0);
         serde_json::from_value(legacy_value).expect("pre-#1830 payload decodes");
     assert_eq!(legacy.flow_fair_buckets_occupied, 0);
     assert_eq!(legacy.flow_fair_flows_active, 0);
