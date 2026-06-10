@@ -1,6 +1,8 @@
 # #1844 ip-monitoring: DHCP-learned-uplink support for preferred-route next-hops
 
-**Status:** DRAFT v2 — folds all round-1 findings (Claude SMR + Codex +
+**Status:** DRAFT v2.1 — (v2.1: SMR r2 publish-contract early-return clarification folded into §4.3)
+
+v2 — folds all round-1 findings (Claude SMR + Codex +
 AGY, all PLAN-NEEDS-REVISION, docs beside this file). Headline folds:
 (1) lease-delete hook fire site corrected to `finishClient` (the real
 cleanup owner — SMR-1/Codex-1/AGY-1 convergent, Codex with a verified
@@ -333,8 +335,17 @@ returns `(published bool, err error)`; the actuator bumps FIB
 generation **only when `published`**. This preserves the load-bearing
 publish-before-bump ordering (a skipped publish means the helper
 already has these exact routes — no re-resolution needed) and turns
-the duplicate-actuation cost into a no-op. Named test: duplicate
-overlay publish ⇒ no `bump_fib_generation` message.
+the duplicate-actuation cost into a no-op. Safety in all orderings
+(SMR r2 verification): `lastSnapshotHash` is updated only AFTER a
+successful `apply_snapshot` (`manager.go:863-866`), so a failed
+publish never poisons the duplicate-skip; and `published=false` also
+covers the pre-existing nil-without-publish early returns (no
+published snapshot yet / helper proc absent) — correct, because with
+no helper snapshot there are no cached flow routes to invalidate and
+the next full apply carries the overlay with its own invalidation.
+Implementers must NOT map those early returns to `published=true`.
+Named test: duplicate overlay publish ⇒ no `bump_fib_generation`
+message.
 
 **Blocking honesty (Codex r1-3, reworded from v1):** the hook is NOT
 "never blocking" — `NotifyNextHopChange` takes `Engine.mu`, which

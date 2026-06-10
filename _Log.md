@@ -4842,3 +4842,6 @@ top.
 - **Timestamp**: 2026-06-10
   **Action**: #1844 plan v2 — folded round-1 findings (finishClient fire site, constructor-arg hook, publish/bump contract, spelling normalization, mgmt rejection); saved r1 review docs
   **File(s)**: docs/research/1844-dhcp-nexthop/{plan.md,claude-smr-plan-r1.md,codex-plan-r1.md,agy-plan-r1.md,reviewer-ids.md}
+- **Timestamp**: 2026-06-10
+  **Action**: #1844 SMR r2 PLAN-READY + publish-contract clarification folded into plan (v2.1)
+  **File(s)**: docs/research/1844-dhcp-nexthop/{plan.md,claude-smr-plan-r2.md}
