@@ -2487,42 +2487,52 @@ pub(super) fn poll_binding_process_descriptor(
                                         (pending_decision.resolution.egress_ifindex, hop);
                                     // #1782: split the buffer-admission test so
                                     // the capture can tell WHY a sibling was not
-                                    // buffered. The `contains_key` branch is the
+                                    // buffered. The DuplicateDrop branch is the
                                     // H5 sibling drop (key already pending — the
                                     // first packet drove the kernel probe); the
-                                    // capacity branch (`len >= MAX_PENDING_NEIGH`)
-                                    // is a distinct condition, counted nowhere
-                                    // here. Behavior is unchanged: an insert
-                                    // happens iff the key is absent AND there is
-                                    // room, exactly as the prior combined
-                                    // condition; otherwise `recycle_now` stays
-                                    // true and the frame is recycled.
-                                    if binding.pending_neigh.contains_key(&pending_key) {
-                                        binding
-                                            .live
-                                            .pending_neigh_duplicate_drops
-                                            .fetch_add(1, Ordering::Relaxed);
-                                    } else if binding.pending_neigh.len() < MAX_PENDING_NEIGH {
-                                        let pending_flow_key = flow
-                                            .as_ref()
-                                            .map(|flow| flow.forward_key.clone())
-                                            .or_else(|| {
-                                                parse_session_flow_from_meta(meta)
-                                                    .map(|flow| flow.forward_key)
-                                            });
-                                        binding.pending_neigh.insert(
-                                            pending_key,
-                                            PendingNeighPacket {
-                                                addr: desc.addr,
-                                                desc,
-                                                meta,
-                                                decision: pending_decision,
-                                                flow_key: pending_flow_key,
-                                                queued_ns: now_ns,
-                                                probe_attempts: 0,
-                                            },
-                                        );
-                                        recycle_now = false;
+                                    // CapacityDrop branch is a distinct
+                                    // condition, counted nowhere here. #1771
+                                    // §2.4: the decision is the pure
+                                    // `pending_neigh_admission` helper so
+                                    // invariant N1's "at most one buffered
+                                    // packet per key" half is unit-tested;
+                                    // behavior is unchanged — an insert happens
+                                    // iff the key is absent AND there is room,
+                                    // otherwise `recycle_now` stays true and
+                                    // the frame is recycled.
+                                    match pending_neigh_admission(
+                                        binding.pending_neigh.contains_key(&pending_key),
+                                        binding.pending_neigh.len(),
+                                    ) {
+                                        PendingNeighAdmission::DuplicateDrop => {
+                                            binding
+                                                .live
+                                                .pending_neigh_duplicate_drops
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        PendingNeighAdmission::Buffer => {
+                                            let pending_flow_key = flow
+                                                .as_ref()
+                                                .map(|flow| flow.forward_key.clone())
+                                                .or_else(|| {
+                                                    parse_session_flow_from_meta(meta)
+                                                        .map(|flow| flow.forward_key)
+                                                });
+                                            binding.pending_neigh.insert(
+                                                pending_key,
+                                                PendingNeighPacket {
+                                                    addr: desc.addr,
+                                                    desc,
+                                                    meta,
+                                                    decision: pending_decision,
+                                                    flow_key: pending_flow_key,
+                                                    queued_ns: now_ns,
+                                                    probe_attempts: 0,
+                                                },
+                                            );
+                                            recycle_now = false;
+                                        }
+                                        PendingNeighAdmission::CapacityDrop => {}
                                     }
                                 }
                                 if cfg!(feature = "debug-log") {

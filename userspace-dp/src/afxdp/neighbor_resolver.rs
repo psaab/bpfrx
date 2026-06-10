@@ -77,6 +77,14 @@ pub(in crate::afxdp) const RESOLVER_QUEUE_DEPTH: usize = 4096;
 /// one negative window, but a dead-host storm fires at most one GET/s.
 pub(in crate::afxdp) const RESOLVER_PER_KEY_RATE_LIMIT_NS: u64 = 1_000_000_000;
 
+// #1771 §2.4 invariant N1 prerequisite, pinned at compile time: at least
+// one per-key backoff window must elapse INSIDE the worker-side negative
+// cache TTL. If the rate-limit window ever grew past the TTL, no GET
+// could fire while a key is negatively cached and the resolver could not
+// un-wedge a fast-failing dst (the exact #1769 blackout this thread
+// exists to prevent).
+const _: () = assert!(NEG_NEIGH_TTL_NS > RESOLVER_PER_KEY_RATE_LIMIT_NS);
+
 /// `last_resolved_at` GC cadence + max entry age (mirrors the warmer's
 /// GC). Prunes keys not seen within `RESOLVER_GC_MAX_AGE_NS` every
 /// `RESOLVER_GC_INTERVAL_NS` so the per-key map cannot grow unbounded
@@ -1296,5 +1304,146 @@ mod tests {
             dynamic.get(&key).is_none(),
             "DELAY/STALE lladdr must NOT be cached (forward only on confirmed)",
         );
+    }
+
+    // ---- §2.4 invariant N1: negative cache does not stop resolution ----
+
+    /// Invariant N1 (#1771 §2.4): while a key is negatively cached
+    /// (`neg_neigh_gate` true), the resolver continues to issue
+    /// GET/backoff probes for that key; only *duplicate buffered packets*
+    /// are dropped, not resolution.
+    ///
+    /// Both halves are pinned, the resolution half against the REAL
+    /// resolver thread (live `neighbor_resolver_loop` on a real netlink
+    /// socket — no socket seam exists, and a mock would not prove the
+    /// loop fires):
+    /// - resolution half: the key is enqueued twice across the per-key
+    ///   backoff window; `get_attempts` increments BOTH times (the second
+    ///   counted as a backoff retry) while `neg_neigh_gate` fast-fails
+    ///   packets for the key the whole time. The window-vs-TTL overlap
+    ///   this depends on is also pinned at compile time
+    ///   (`NEG_NEIGH_TTL_NS > RESOLVER_PER_KEY_RATE_LIMIT_NS`).
+    /// - buffering half: the production admission decision
+    ///   (`pending_neigh_admission`, the exact helper `poll_descriptor`
+    ///   calls) admits ONE buffered packet per key and drops siblings.
+    ///
+    /// The key targets a nonexistent ifindex so the kernel answers the
+    /// GET promptly (no entry → NoReply → probe-only) and the ARP-probe
+    /// helper no-ops without CAP_NET_RAW — the asserted effect is the
+    /// counter movement, mirroring `warmer_tests`.
+    #[test]
+    fn invariant_n1_negative_cache_does_not_stop_resolution() {
+        use crate::afxdp::neg_neigh::{NegNeighCache, neg_neigh_gate, neg_neigh_record};
+        use crate::afxdp::neighbor_dispatch::{PendingNeighAdmission, pending_neigh_admission};
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        fn wait_for<F: Fn() -> bool>(pred: F) -> bool {
+            for _ in 0..400 {
+                if pred() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            false
+        }
+
+        let ifindex = 999i32;
+        let hop = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 77));
+        let key = (ifindex, hop);
+
+        // Arm the negative cache for K with REAL monotonic time (the
+        // resolver thread runs on the same clock).
+        let mut neg = NegNeighCache::default();
+        neg_neigh_record(&mut neg, key, monotonic_nanos());
+        assert!(
+            neg_neigh_gate(&mut neg, &key, monotonic_nanos(), || false),
+            "precondition: K negatively cached → duplicate packets fast-fail",
+        );
+
+        // Buffering half: pending_neigh admits AT MOST ONE packet for K.
+        assert_eq!(
+            pending_neigh_admission(false, 0),
+            PendingNeighAdmission::Buffer,
+            "the first packet for K is buffered (the per-key representative)",
+        );
+        assert_eq!(
+            pending_neigh_admission(true, 1),
+            PendingNeighAdmission::DuplicateDrop,
+            "a sibling for the already-pending K is dropped, not buffered",
+        );
+
+        // Resolution half: live resolver thread on a real netlink socket.
+        let (tx, rx) = mpsc::sync_channel::<ResolveItem>(8);
+        let counters = Arc::new(ResolverCounters::default());
+        let dynamic = Arc::new(ShardedNeighborMap::new());
+        let generation = Arc::new(AtomicU64::new(1));
+        let get_rtt_hist =
+            Arc::new(super::super::neighbor_latency::NeighborLatencyHist::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let (d, g, c, h, s) = (
+                dynamic.clone(),
+                generation.clone(),
+                counters.clone(),
+                get_rtt_hist.clone(),
+                stop.clone(),
+            );
+            std::thread::spawn(move || neighbor_resolver_loop(rx, d, g, c, h, s))
+        };
+        let resolver = NeighborResolver::new(
+            tx,
+            counters.clone(),
+            generation,
+            Arc::new(super::super::neighbor_latency::NeighborLatencyHist::default()),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
+
+        // First fast-fail routes K through the resolver: one GET fires
+        // WHILE K is negatively cached.
+        resolver.enqueue(ifindex, hop, "xpf-n1-nodev".to_string());
+        assert!(
+            wait_for(|| counters.get_attempts.load(Ordering::Relaxed) == 1),
+            "first GET must fire while K is negatively cached",
+        );
+
+        // Advance the backoff clock past the per-key window. Refresh the
+        // negative entry first so a slow scheduler cannot expire the 3 s
+        // TTL under the test (production re-records on every timeout
+        // drop, so a refresh is semantics-preserving); then verify the
+        // gate is STILL fast-failing when the retry GET is admitted.
+        neg_neigh_record(&mut neg, key, monotonic_nanos());
+        std::thread::sleep(Duration::from_nanos(RESOLVER_PER_KEY_RATE_LIMIT_NS + 100_000_000));
+        assert!(
+            neg_neigh_gate(&mut neg, &key, monotonic_nanos(), || dynamic
+                .get(&key)
+                .is_some()),
+            "K must still be negatively cached when the backoff GET fires",
+        );
+        resolver.enqueue(ifindex, hop, "xpf-n1-nodev".to_string());
+        assert!(
+            wait_for(|| counters.get_attempts.load(Ordering::Relaxed) == 2),
+            "the backoff GET must fire for the still-negatively-cached K",
+        );
+        assert_eq!(
+            counters.get_backoff_attempts.load(Ordering::Relaxed),
+            1,
+            "the second GET is a counted backoff RETRY (§2.6 counter ties to N1)",
+        );
+        // Resolution continued the whole time the gate was dropping
+        // duplicates — the invariant. (The dst is genuinely unresolvable
+        // here, so the gate stays armed.)
+        assert!(
+            neg_neigh_gate(&mut neg, &key, monotonic_nanos(), || dynamic
+                .get(&key)
+                .is_some()),
+            "K still negatively cached after both GETs — duplicates were \
+             dropped, resolution was not",
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        drop(resolver); // drops the producer → recv disconnects promptly
+        handle.join().expect("resolver join");
     }
 }

@@ -4765,3 +4765,7 @@ top.
 - **Timestamp**: 2026-06-10
   **Action**: "#1771 Phase-3 commit 2 — wire the six §2.6 metrics end to end (U4/#1807 pattern): control.rs additive serde-defaulted fields + helpers.rs status copy + lifecycle zero-init; wire fixture regen (XPF_PROTOCOL_WIRE_REGEN=1, 6 keys); Rust + Go round-trip/key-absent pins; protocol.go decode; Prometheus descs+Describe+emit (counters CounterValue, key gauges GaugeValue); descriptor-coverage canary + emit-level type/value test"
   **File(s)**: userspace-dp/src/{protocol/control.rs,protocol/tests.rs,server/helpers.rs,server/lifecycle.rs}, userspace-dp/tests/fixtures/protocol_wire_v1.json, pkg/dataplane/userspace/{protocol.go,protocol_test.go}, pkg/api/{metrics.go,metrics_descriptors.go,metrics_userspace.go,metrics_descriptor_coverage_test.go,metrics_neighbor_latency_test.go}
+
+- **Timestamp**: 2026-06-10
+  **Action**: "#1771 Phase-3 commit 3 — §2.4 invariant N1: compile-time pin NEG_NEIGH_TTL_NS > RESOLVER_PER_KEY_RATE_LIMIT_NS; threaded invariant_n1 test drives the REAL neighbor_resolver_loop (negatively-cached key gets GET + counted backoff retry across the window while neg_neigh_gate keeps fast-failing); pending_neigh admission extracted to pure pending_neigh_admission helper (behavior-identical, used by poll_descriptor) + unit tests; architecture doc gains the 'negative cache does not stop resolution' section"
+  **File(s)**: userspace-dp/src/afxdp/{neighbor_resolver.rs,neighbor_dispatch.rs,poll_descriptor/mod.rs,mod.rs}, docs/userspace-dataplane-architecture.md
