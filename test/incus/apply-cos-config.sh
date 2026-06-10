@@ -6,7 +6,15 @@
 #   ./test/incus/apply-cos-config.sh loss:xpf-userspace-fw0
 #   ./test/incus/apply-cos-config.sh --symmetric loss:xpf-userspace-fw0
 #   ./test/incus/apply-cos-config.sh --surplus-sharing loss:xpf-userspace-fw0
+#   COS_EQUAL_FLOW=1 ./test/incus/apply-cos-config.sh loss:xpf-userspace-fw0
 #   ./test/incus/apply-cos-config.sh                     # defaults to xpf-userspace-fw0
+#
+# COS_EQUAL_FLOW=1 (#1831, follow-up to #1766/#1745) opts every
+# transmit-rate-exact scheduler in the selected fixture into
+# `equal-flow-enforcement` (#1304) by appending the set lines to the
+# candidate — same injection pattern as --surplus-sharing. Default
+# (unset/0) leaves the fixture untouched. Mutually exclusive with
+# --surplus-sharing: the compiler rejects a scheduler with both knobs.
 #
 # Only the RG0 primary needs the config applied — it replicates to the
 # secondary via config sync. Run against the primary.
@@ -55,6 +63,19 @@ if [[ "$SAME_CLASS" -eq 1 && "$SYMMETRIC" -eq 1 ]]; then
 	exit 2
 fi
 
+# #1831: opt-in equal-flow-enforcement injector. Env var (not a flag)
+# so harness callers can layer it onto any fixture selection without
+# touching positional args. Normalized to 0/1; anything other than
+# literal "1" means off.
+COS_EQUAL_FLOW="${COS_EQUAL_FLOW:-0}"
+if [[ "$COS_EQUAL_FLOW" != "1" ]]; then
+	COS_EQUAL_FLOW=0
+fi
+if [[ "$COS_EQUAL_FLOW" -eq 1 && "$SURPLUS_SHARING" -eq 1 ]]; then
+	echo "error: COS_EQUAL_FLOW=1 and --surplus-sharing are mutually exclusive (the compiler rejects a scheduler with both equal-flow-enforcement and surplus-sharing)" >&2
+	exit 2
+fi
+
 TARGET="${1:-loss:xpf-userspace-fw0}"
 # Copilot D.2: shift past TARGET and reject extra positional
 # arguments so a typo or duplicated argument fails loudly
@@ -97,6 +118,29 @@ if [[ "$SURPLUS_SHARING" -eq 1 ]]; then
 		END {
 			for (sched in exact) {
 				printf "set class-of-service schedulers %s surplus-sharing\n", sched
+			}
+		}
+	' "$SETS_TMP" | sort >> "$SETS_TMP"
+fi
+# #1831: equal-flow-enforcement injection mirrors the surplus-sharing
+# injector above — one presence-only flag line per transmit-rate-exact
+# scheduler (#1304 scopes the knob to positive transmit-rate exact
+# schedulers, which is every `transmit-rate ... exact` line in these
+# fixtures). The atomic commit-check phase below still validates the
+# combined candidate, so an unsupported combination fails before
+# anything live changes.
+if [[ "$COS_EQUAL_FLOW" -eq 1 ]]; then
+	awk '
+		$1 == "set" &&
+		$2 == "class-of-service" &&
+		$3 == "schedulers" &&
+		$5 == "transmit-rate" &&
+		$NF == "exact" {
+			exact[$4] = 1
+		}
+		END {
+			for (sched in exact) {
+				printf "set class-of-service schedulers %s equal-flow-enforcement\n", sched
 			}
 		}
 	' "$SETS_TMP" | sort >> "$SETS_TMP"
