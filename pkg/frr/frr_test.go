@@ -2588,3 +2588,34 @@ func TestPerInstanceInet6StaticRoutes(t *testing.T) {
 		t.Errorf("expected per-VRF IPv6 static route, got:\n%s", got)
 	}
 }
+
+// #1798 belt test: BGP free-text values (neighbor description,
+// password) and IGP auth keys must not inject extra frr.conf lines
+// even if commit-time validation were bypassed.
+func TestGenerateProtocols_NewlineFreeTextDoesNotInject(t *testing.T) {
+	m := New()
+	bgp := &config.BGPConfig{
+		LocalAS: 65000,
+		Neighbors: []*config.BGPNeighbor{
+			{
+				Address:      "10.0.0.1",
+				PeerAS:       65001,
+				Description:  "peer\nno router bgp 65000",
+				AuthPassword: "pw\nagentx",
+			},
+		},
+	}
+	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, nil)
+	for _, line := range strings.Split(got, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "no router bgp 65000" || trimmed == "agentx" {
+			t.Fatalf("injected frr.conf line leaked:\n%s", got)
+		}
+	}
+	if !strings.Contains(got, " neighbor 10.0.0.1 description peer no router bgp 65000\n") {
+		t.Errorf("sanitized description missing:\n%s", got)
+	}
+	if !strings.Contains(got, " neighbor 10.0.0.1 password pw agentx\n") {
+		t.Errorf("sanitized password missing:\n%s", got)
+	}
+}

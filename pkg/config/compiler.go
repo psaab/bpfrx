@@ -58,6 +58,20 @@ type compileOpts struct {
 	// / commit-check stay strict (lenient stays false there) so new
 	// operator edits hard-reject loudly.
 	lenientEqualFlowWorkerCap bool
+
+	// sanitizeFreeTextControlChars (#1798) downgrades the control-
+	// character gate from a hard compile error to sanitize-in-place
+	// plus a cfg.Warnings entry. The strict commit / commit-check path
+	// rejects any value or annotation containing ASCII control
+	// characters — the lexer maps "\n" inside a quoted string to a
+	// real newline, which injects arbitrary directives into generated
+	// networkd/FRR/strongSwan files. The tolerant load / peer-sync /
+	// peer-display paths must instead scrub the value and keep going
+	// so an already-persisted bad config cannot blackout-boot a node
+	// or alarm-loop HA config sync. This check deliberately does NOT
+	// live in SchemaValidate, which also runs on the lenient paths.
+	// See freetext.go for the full three-layer design.
+	sanitizeFreeTextControlChars bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -77,7 +91,10 @@ func CompileConfig(tree *ConfigTree) (*Config, error) {
 // hard-reject. The node-aware sibling CompileConfigForNodeLenient covers
 // the cluster paths (Store.SyncApply, peer-interface display).
 func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
-	return compileConfigWithOpts(tree, compileOpts{lenientEqualFlowWorkerCap: true})
+	return compileConfigWithOpts(tree, compileOpts{
+		lenientEqualFlowWorkerCap:    true,
+		sanitizeFreeTextControlChars: true,
+	})
 }
 
 func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) {
@@ -126,7 +143,10 @@ func CompileConfigForNode(tree *ConfigTree, nodeID int) (*Config, error) {
 // (cli_show_interfaces.go, server_show_interfaces.go). MUST NOT be used on
 // the candidate-commit path — see CompileConfigLenient.
 func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) {
-	return compileConfigForNodeWithOpts(tree, nodeID, compileOpts{lenientEqualFlowWorkerCap: true})
+	return compileConfigForNodeWithOpts(tree, nodeID, compileOpts{
+		lenientEqualFlowWorkerCap:    true,
+		sanitizeFreeTextControlChars: true,
+	})
 }
 
 func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts) (*Config, error) {
@@ -143,6 +163,22 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 // compileExpanded compiles an already-expanded (groups resolved) ConfigTree
 // into a typed Config. Shared by CompileConfig and CompileConfigForNode.
 func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
+	// #1798 free-text control-character gate. Strict (commit /
+	// commit-check): hard-reject. Lenient (load / peer-sync / peer
+	// display): scrub in place on this already-cloned tree and warn.
+	// Runs on the group-expanded tree so values inherited via
+	// apply-groups are covered, and BEFORE section compilation so the
+	// lenient path's typed Config is built from the scrubbed values.
+	var ctrlCharWarnings []string
+	if opts.sanitizeFreeTextControlChars {
+		for _, p := range sanitizeNodesControlChars(tree.Children, "") {
+			ctrlCharWarnings = append(ctrlCharWarnings, fmt.Sprintf(
+				"sanitized control characters in configuration value at %q (#1798)", p))
+		}
+	} else if err := validateNodesControlChars(tree.Children, ""); err != nil {
+		return nil, err
+	}
+
 	cfg := &Config{
 		Security: SecurityConfig{
 			Zones:  make(map[string]*ZoneConfig),
@@ -164,6 +200,7 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 			Interfaces:        make(map[string]*CoSInterface),
 		},
 	}
+	cfg.Warnings = append(cfg.Warnings, ctrlCharWarnings...)
 
 	for _, node := range tree.Children {
 		switch node.Name() {

@@ -25,6 +25,34 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 )
 
+// sanitizeFRRValue strips ASCII control characters — the C0 set
+// (0x00-0x1F, including newline) and DEL (0x7F), each replaced by a
+// space — from a free-text config value (description, auth key,
+// password) before it is interpolated into a generated frr.conf line.
+// Render-side belt for #1798: a BGP neighbor description or auth key
+// containing an embedded newline must not be able to inject extra
+// frr.conf commands even if the commit-time validation layer were
+// bypassed.
+func sanitizeFRRValue(s string) string {
+	clean := true
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] == 0x7f {
+			clean = false
+			break
+		}
+	}
+	if clean {
+		return s
+	}
+	b := []byte(s)
+	for i := range b {
+		if b[i] < 0x20 || b[i] == 0x7f {
+			b[i] = ' '
+		}
+	}
+	return string(b)
+}
+
 // knownRedistProtocols are the FRR redistribute protocol keywords.
 var knownRedistProtocols = map[string]bool{
 	"connected": true, "static": true, "ospf": true, "bgp": true,
@@ -170,10 +198,10 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 					if keyID == 0 {
 						keyID = 1
 					}
-					fmt.Fprintf(&b, " ip ospf message-digest-key %d md5 %s\n", keyID, iface.AuthKey)
+					fmt.Fprintf(&b, " ip ospf message-digest-key %d md5 %s\n", keyID, sanitizeFRRValue(iface.AuthKey))
 				} else if iface.AuthType == "simple" {
 					b.WriteString(" ip ospf authentication\n")
-					fmt.Fprintf(&b, " ip ospf authentication-key %s\n", iface.AuthKey)
+					fmt.Fprintf(&b, " ip ospf authentication-key %s\n", sanitizeFRRValue(iface.AuthKey))
 				}
 				if iface.BFD {
 					if iface.BFDInterval > 0 || iface.BFDMultiplier > 0 {
@@ -259,13 +287,13 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 		for _, n := range bgp.Neighbors {
 			fmt.Fprintf(&b, " neighbor %s remote-as %d\n", n.Address, n.PeerAS)
 			if n.Description != "" {
-				fmt.Fprintf(&b, " neighbor %s description %s\n", n.Address, n.Description)
+				fmt.Fprintf(&b, " neighbor %s description %s\n", n.Address, sanitizeFRRValue(n.Description))
 			}
 			if n.MultihopTTL > 0 {
 				fmt.Fprintf(&b, " neighbor %s ebgp-multihop %d\n", n.Address, n.MultihopTTL)
 			}
 			if n.AuthPassword != "" {
-				fmt.Fprintf(&b, " neighbor %s password %s\n", n.Address, n.AuthPassword)
+				fmt.Fprintf(&b, " neighbor %s password %s\n", n.Address, sanitizeFRRValue(n.AuthPassword))
 			}
 			if n.BFD {
 				fmt.Fprintf(&b, " neighbor %s bfd\n", n.Address)
@@ -361,7 +389,7 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				} else {
 					b.WriteString(" ip rip authentication mode text\n")
 				}
-				fmt.Fprintf(&b, " ip rip authentication string %s\n", rip.AuthKey)
+				fmt.Fprintf(&b, " ip rip authentication string %s\n", sanitizeFRRValue(rip.AuthKey))
 				b.WriteString("exit\n!\n")
 			}
 		}
@@ -395,11 +423,11 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 		}
 		if isis.AuthKey != "" {
 			if isis.AuthType == "md5" {
-				fmt.Fprintf(&b, " area-password md5 %s\n", isis.AuthKey)
-				fmt.Fprintf(&b, " domain-password md5 %s\n", isis.AuthKey)
+				fmt.Fprintf(&b, " area-password md5 %s\n", sanitizeFRRValue(isis.AuthKey))
+				fmt.Fprintf(&b, " domain-password md5 %s\n", sanitizeFRRValue(isis.AuthKey))
 			} else {
-				fmt.Fprintf(&b, " area-password clear %s\n", isis.AuthKey)
-				fmt.Fprintf(&b, " domain-password clear %s\n", isis.AuthKey)
+				fmt.Fprintf(&b, " area-password clear %s\n", sanitizeFRRValue(isis.AuthKey))
+				fmt.Fprintf(&b, " domain-password clear %s\n", sanitizeFRRValue(isis.AuthKey))
 			}
 		}
 		b.WriteString("exit\n!\n")
@@ -414,9 +442,9 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 			}
 			if iface.AuthKey != "" {
 				if iface.AuthType == "md5" {
-					fmt.Fprintf(&b, " isis password md5 %s\n", iface.AuthKey)
+					fmt.Fprintf(&b, " isis password md5 %s\n", sanitizeFRRValue(iface.AuthKey))
 				} else {
-					fmt.Fprintf(&b, " isis password clear %s\n", iface.AuthKey)
+					fmt.Fprintf(&b, " isis password clear %s\n", sanitizeFRRValue(iface.AuthKey))
 				}
 			}
 			b.WriteString("exit\n!\n")

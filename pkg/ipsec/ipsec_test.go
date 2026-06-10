@@ -912,3 +912,30 @@ func TestPrepareConfig_ExternalInterfaceLocalAddress(t *testing.T) {
 		t.Fatalf("resolved local-address = %q, want 198.51.100.1", prepared.Gateways["gw"].LocalAddress)
 	}
 }
+
+// #1798 belt test: a pre-shared key (or identity) carrying an embedded
+// newline must not inject extra swanctl.conf sections/keys even if
+// commit-time validation were bypassed.
+func TestGenerateConfig_NewlineSecretDoesNotInject(t *testing.T) {
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
+	cfg := &config.IPsecConfig{
+		VPNs: map[string]*config.IPsecVPN{
+			"site-a": {
+				LocalAddr:     "10.0.1.1",
+				Gateway:       "10.0.2.1",
+				PSK:           "secret\ninclude /etc/evil.conf",
+				BindInterface: "st0.0",
+			},
+		},
+		Proposals: map[string]*config.IPsecProposal{},
+	}
+	got := m.generateConfig(cfg)
+	for _, line := range strings.Split(got, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "include ") {
+			t.Fatalf("injected swanctl directive leaked:\n%s", got)
+		}
+	}
+	if !strings.Contains(got, `secret = "secret include /etc/evil.conf"`) {
+		t.Errorf("sanitized secret missing:\n%s", got)
+	}
+}
