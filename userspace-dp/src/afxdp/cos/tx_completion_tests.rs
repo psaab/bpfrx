@@ -757,11 +757,13 @@ fn timer_wheel_over_horizon_snap_clears_stale_entries_and_reports_true_lag() {
 
 // #1782 Step-2 (i) test 3: a parked queue + over-horizon lag refuses
 // the snap and falls back to the existing O(lag) loop, which wakes
-// the due park correctly. (In production this state cannot arise — a
-// parked queue is backlogged, which keeps the owner's shaped-drain
-// priming active so the wheel never lags far — but the fallback must
-// stay correct if it ever does; see
-// `snap_cos_timer_wheel_over_horizon`.)
+// the due park correctly. This state is LEGITIMATE in production
+// (Codex PR #1854 r1): park wake ticks are uncapped `deficit/rate`
+// refill times, so pathologically low configured rates (the schema
+// accepts 1 B/s) can park a queue far beyond the wheel horizon while
+// the worker idles — the accepted residual documented at
+// `snap_cos_timer_wheel_over_horizon`. This test pins that the
+// fallback stays correct when it arises.
 #[test]
 fn timer_wheel_over_horizon_parked_queue_falls_back_to_per_tick_loop() {
     let mut root = test_cos_interface_runtime(0);
