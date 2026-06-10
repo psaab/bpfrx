@@ -406,6 +406,26 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	if err := validatePolicySchedulerReferencesStrict(cfg); err != nil {
 		strictErrs = append(strictErrs, err)
 	}
+	if err := validateRPMProbePinsStrict(cfg); err != nil {
+		strictErrs = append(strictErrs, err)
+	}
+	if err := validateIPMonitoringStrict(cfg); err != nil {
+		strictErrs = append(strictErrs, err)
+	}
+	if err := validateEqualFlowWorkerCapStrict(cfg); err != nil {
+		// #1733: on the tolerant load/peer-sync path this unsupported
+		// combination is downgraded to a loud warning instead of a hard
+		// reject, so a node upgraded past the gate still boots an
+		// already-persisted config and HA sync does not alarm-loop. The
+		// dataplane already silently fail-opens equal-flow above the cap,
+		// so keeping the config as-is preserves running behavior. The
+		// operator's next candidate commit (strict) hard-rejects.
+		if opts.lenientEqualFlowWorkerCap {
+			cfg.Warnings = append(cfg.Warnings, err.Error())
+		} else {
+			strictErrs = append(strictErrs, err)
+		}
+	}
 	// #1830 (e): the #1733 equal-flow worker-cap validator
 	// (validateEqualFlowWorkerCapStrict / MaxEqualFlowWorkers) is retired.
 	// The v8 lease rotation now sizes its per-worker scratch from the true

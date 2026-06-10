@@ -1358,19 +1358,43 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"probe-limit": {args: 1, desc: "Default maximum consecutive failed probes before stopping a test cycle", children: nil},
 			"probe": {args: 1, desc: "RPM probe name", children: map[string]*schemaNode{
 				"test": {args: 1, desc: "RPM test name", children: map[string]*schemaNode{
-					"probe-type":       {args: 1, desc: "Probe type: icmp-ping, tcp-ping, or http-get", children: nil},
-					"target":           {desc: "Target IP, hostname, or URL", wildcard: &schemaNode{placeholder: "<target>", desc: "Target IP, hostname, or URL"}, children: map[string]*schemaNode{"url": {args: 1, desc: "HTTP target URL", children: nil}}},
-					"source-address":   {args: 1, desc: "Source address for the probe", children: nil},
-					"routing-instance": {args: 1, desc: "Routing instance / VRF for the probe", children: nil},
-					"probe-interval":   {args: 1, desc: "Seconds between probes within a test", children: nil},
-					"probe-count":      {args: 1, desc: "Number of probes per test cycle", children: nil},
-					"test-interval":    {args: 1, desc: "Seconds between test cycles", children: nil},
+					"probe-type":            {args: 1, desc: "Probe type: icmp-ping, tcp-ping, or http-get", children: nil},
+					"target":                {desc: "Target IP, hostname, or URL", wildcard: &schemaNode{placeholder: "<target>", desc: "Target IP, hostname, or URL"}, children: map[string]*schemaNode{"url": {args: 1, desc: "HTTP target URL", children: nil}, "address": {args: 1, desc: "Target IP address (canonical Junos form)", children: nil}}},
+					"source-address":        {args: 1, desc: "Source address for the probe", children: nil},
+					"routing-instance":      {args: 1, desc: "Routing instance / VRF for the probe", children: nil},
+					"destination-interface": {args: 1, desc: "Egress interface to pin the probe to", children: nil},
+					"next-hop":              {args: 1, desc: "Next-hop IP to pin the probe via (reserved probe routing table)", children: nil},
+					"probe-interval":        {args: 1, desc: "Seconds between probes within a test", children: nil},
+					"probe-count":           {args: 1, desc: "Number of probes per test cycle", children: nil},
+					"test-interval":         {args: 1, desc: "Seconds between test cycles", children: nil},
 					"thresholds": {desc: "Failure thresholds for the test", children: map[string]*schemaNode{
 						"successive-loss": {args: 1, desc: "Consecutive losses before marking the test failed", children: nil},
 					}},
 					"probe-limit":      {args: 1, desc: "Maximum consecutive failed probes before stopping the current test cycle", children: nil},
 					"destination-port": {args: 1, desc: "Destination TCP port for tcp-ping probes", children: nil},
 				}},
+			}},
+		}},
+		"ip-monitoring": {desc: "IP monitoring: probe-driven preferred-route failover", children: map[string]*schemaNode{
+			"policy": {args: 1, desc: "IP monitoring policy name", placeholder: "<policy-name>", children: map[string]*schemaNode{
+				"match": {desc: "Match conditions", children: map[string]*schemaNode{
+					"rpm-probe": {args: 1, desc: "RPM probe whose test failures trigger this policy", placeholder: "<probe-name>", children: nil},
+				}},
+				"then": {desc: "Actions while the matched probe is FAILED", children: map[string]*schemaNode{
+					"preferred-route": {desc: "Preferred routes injected at route preference 1", children: map[string]*schemaNode{
+						"route": {args: 1, desc: "Destination prefix to inject", placeholder: "<prefix>", children: map[string]*schemaNode{
+							"next-hop":         {args: 1, desc: "Next-hop IP for the injected route", children: nil},
+							"preferred-metric": {args: 1, desc: "Metric among injected routes for the same prefix (tie-break)", children: nil},
+						}},
+						"routing-instance": {args: 1, desc: "Inject into a routing instance", placeholder: "<instance>", children: map[string]*schemaNode{
+							"route": {args: 1, desc: "Destination prefix to inject", placeholder: "<prefix>", children: map[string]*schemaNode{
+								"next-hop":         {args: 1, desc: "Next-hop IP for the injected route", children: nil},
+								"preferred-metric": {args: 1, desc: "Metric among injected routes for the same prefix (tie-break)", children: nil},
+							}},
+						}},
+					}},
+				}},
+				"hold-down": {args: 1, desc: "Seconds to damp recovery before withdrawing routes (0 = immediate, Junos parity)", children: nil},
 			}},
 		}},
 		"flow-monitoring": {children: map[string]*schemaNode{

@@ -13,6 +13,7 @@
 //   - nextTableManager,
 //     ribGroupManager,
 //     pbrManager       (rules.go)      — policy-routing ip-rule reconcilers
+//   - probePinManager  (probe_pin.go)  — RPM probe next-hop pin reconciler (#1827)
 //   - bondManager      (bond.go)       — bond device lifecycle
 //   - rethManager      (reth.go)       — stale RETH bond cleanup
 //   - monitorManager   (monitor.go)    — interface-monitor HA signal
@@ -43,6 +44,7 @@ type Manager struct {
 	nextTbl  *nextTableManager
 	ribGroup *ribGroupManager
 	pbr      *pbrManager
+	probePin *probePinManager
 	bond     *bondManager
 	reth     *rethManager
 	monitor  *monitorManager
@@ -64,6 +66,7 @@ func New() (*Manager, error) {
 	m.nextTbl = &nextTableManager{ops: h}
 	m.ribGroup = &ribGroupManager{ops: h}
 	m.pbr = &pbrManager{ops: h}
+	m.probePin = &probePinManager{ops: h}
 	m.bond = &bondManager{ops: h}
 	m.reth = &rethManager{ops: h} // Clear is live (LinkList/LinkDel)
 	m.monitor = &monitorManager{ops: h, monitorStatus: make(map[int][]InterfaceMonitorStatus)}
@@ -176,6 +179,17 @@ func (m *Manager) ApplyRibGroupRules(ribGroups map[string]*config.RibGroup, inst
 
 // ApplyPBRRules creates ip rules implementing policy-based routing.
 func (m *Manager) ApplyPBRRules(rules []PBRRule) error { return m.pbr.Apply(rules) }
+
+// --- RPM probe pin domain (#1827) ---
+
+// ApplyProbePins clears the probe-pin band and programs one fwmark rule
+// plus one pinned host route per RPM next-hop pin.
+func (m *Manager) ApplyProbePins(pins []ProbePin) error { return m.probePin.Apply(pins) }
+
+// ClearProbePins removes all probe pin rules and flushes the reserved
+// probe tables. Run at daemon startup so a crashed daemon never leaks
+// stale pins.
+func (m *Manager) ClearProbePins() error { return m.probePin.clear() }
 
 // --- Bond domain ---
 

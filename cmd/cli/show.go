@@ -291,6 +291,17 @@ func (c *ctl) handleShowServices(args []string) error {
 	switch args[0] {
 	case "rpm":
 		return c.showText("rpm")
+	case "ip-monitoring":
+		// #1827: only `ip-monitoring status` is valid per cmdtree.
+		rest := args[1:]
+		if len(rest) == 0 {
+			printRemoteTreeHelp("show services ip-monitoring:", "show", "services", "ip-monitoring")
+			return nil
+		}
+		if rest[0] != "status" {
+			return fmt.Errorf("unknown ip-monitoring target: %s (expected `status`)", rest[0])
+		}
+		return c.showText("services-ip-monitoring-status")
 	case "application-identification":
 		// #653: surface what xpf AppID actually does today. Per
 		// cmdtree the only valid leaf is `application-identification

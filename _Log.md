@@ -4903,6 +4903,51 @@ top.
   **Action**: "#1831 commit 2 — apply-cos-config.sh opt-in equal-flow injector: COS_EQUAL_FLOW=1 env var appends `set class-of-service schedulers <name> equal-flow-enforcement` (knob spelling per schema.go:880 / compiler_equal_flow_worker_cap_test.go) for every transmit-rate-exact scheduler in the selected fixture, mirroring the --surplus-sharing awk injector; fail-fast exit 2 on COS_EQUAL_FLOW=1 + --surplus-sharing (compiler rejects both knobs on one scheduler, compiler.go:573); default behavior unchanged; usage header + cos-validation-notes.md injector paragraph"
   **File(s)**: test/incus/apply-cos-config.sh, docs/cos-validation-notes.md
 
+## 2026-06-10 — #1827 PR-1 (PR-1a + PR-1b) multi-WAN ip-monitoring
+
+- **Timestamp**: 2026-06-10 12:00
+  - **Action**: Read binding spec docs/research/1827-multiwan/plan.md @ 883cdb7f1 in full; surveyed pkg/rpm, pkg/routing, pkg/config, pkg/daemon, pkg/frr, pkg/dataplane/userspace seams. Verified early: PublishRouteOverlaySnapshot reuses the existing apply_snapshot control message + unchanged RouteSnapshot schema (UpdatePolicyScheduleState precedent at manager.go:688) — zero Rust, zero wire changes.
+  - **File(s)**: none (survey)
+
+- **Timestamp**: 2026-06-10 12:30
+  - **Action**: PR-1a config surface — RPMTest.DestinationInterface/NextHop fields, probe-pin band constants (ProbeTableBase 7000/count 50, fwmark 0x1000, rule prio 50), `target address` canonical form, schema leaves, validateRPMTest next-hop checks, validateRPMProbePinsStrict (cap + RI table collision) wired into strict accumulator.
+  - **File(s)**: pkg/config/types_system.go, pkg/config/compiler_services.go, pkg/config/schema.go, pkg/config/compiler.go
+
+- **Timestamp**: 2026-06-10 12:45
+  - **Action**: PR-1a pin plumbing — new probePinManager (fwmark rules band 50-99, pinned onlink host routes in tables 7000-7049, clear pass), BuildProbePins deterministic assignment, ResolveProbeInterface; facade ApplyProbePins/ClearProbePins.
+  - **File(s)**: pkg/routing/probe_pin.go, pkg/routing/routing.go
+
+- **Timestamp**: 2026-06-10 13:00
+  - **Action**: PR-1a real ICMP echo prober (raw socket via injectable icmpListenFunc seam, id/seq/peer matching, 3s timeout, v4+v6), probeDialer with SO_BINDTODEVICE (destination-interface > vrf fallback) + SO_MARK for all probe types, Transition hook (SetTransitionCallback), SetRethMap, marks from BuildProbePins.
+  - **File(s)**: pkg/rpm/icmp.go, pkg/rpm/rpm.go
+
+- **Timestamp**: 2026-06-10 13:15
+  - **Action**: PR-1a daemon wiring — config-hash-gated reconcileRPM (step 17b of applyConfigLocked), eager rpm.New(), startup ClearProbePins leak-clear, removed one-shot RPM start block.
+  - **File(s)**: pkg/daemon/daemon_rpm.go, pkg/daemon/daemon.go, pkg/daemon/daemon_run.go, pkg/daemon/daemon_apply.go
+
+- **Timestamp**: 2026-06-10 13:30
+  - **Action**: PR-1a tests (pin assignment/same-target-two-uplinks/cap/band-cleanup-on-restart; prober seam pass/v6/timeout/foreign-reply/sockopts; transition hook; flat-set+hierarchical parse; validation rejections; reconcileRPM hash gating) + README updates (pkg/rpm, pkg/routing). All green.
+  - **File(s)**: pkg/routing/probe_pin_test.go, pkg/rpm/icmp_test.go, pkg/config/parser_rpm_pin_test.go, pkg/daemon/daemon_rpm_test.go, pkg/rpm/README.md, pkg/routing/README.md
+
+- **Timestamp**: 2026-06-10 13:50
+  - **Action**: PR-1b config surface — IPMonitoringConfig/Policy/PreferredRoute + RouteOverlayEntry types, compileIPMonitoring (dual AST, line-merge), setSchema stanza, validateIPMonitoringStrict (probe-exists, ≥1 route, family match, RI exists + forwarding-type rejection). Tests: flat-set + hierarchical + 8 rejection cases.
+  - **File(s)**: pkg/config/types_system.go, pkg/config/compiler_services.go, pkg/config/compiler.go, pkg/config/schema.go, pkg/config/parser_ipmonitoring_test.go
+
+- **Timestamp**: 2026-06-10 14:10
+  - **Action**: PR-1b engine + actuator + overlay consumers — pkg/ipmon engine (FAIL/recover FSM, hold-down, winner resolution, debounce 1s + throttle 3s coalescing, publish gating); FRR PreferredRoutes distance-1 render (emission step 7, renumbered contract); buildRouteSnapshots overlay param (whole-entry replacement); Manager.SetRouteOverlay + PublishRouteOverlaySnapshot (apply_snapshot reuse, duplicate-skip, no Compile); daemon assembleFRRConfig extraction (sole FullConfig constructor), actuateRouteOverlay (publish-before-bump), reconcileIPMon, §4.4 HA gating (filterRPMForHAGating, reconcileIPMonGating on RG transitions). Tests across pkg/ipmon, pkg/frr, pkg/dataplane/userspace, pkg/daemon.
+  - **File(s)**: pkg/ipmon/{ipmon,display,ipmon_test}.go, pkg/frr/{manager,config_render,preferred_routes_test}.go, pkg/dataplane/userspace/{routes,builder,manager,legacy_dataplane,route_overlay_test,manager_test}.go, pkg/daemon/{daemon_ipmon,daemon_ipmon_test,daemon_rpm,daemon_apply,daemon_run,daemon,daemon_ha}.go
+
+- **Timestamp**: 2026-06-10 14:30
+  - **Action**: PR-1b observability + docs — show services ip-monitoring status (cmdtree + local CLI + remote CLI + gRPC topic, shared ipmon.FormatStatus renderer), Prometheus xpf_ipmon_policy_failed/transitions_total/routes_applied (+ descriptor-coverage canary fixture), docs/multi-wan.md, pkg/ipmon/README.md, pkg/frr/README.md, pkg/daemon/README.md, CLAUDE.md feature line.
+  - **File(s)**: pkg/cmdtree/tree.go, pkg/cli/{cli,cli_show_services}.go, cmd/cli/show.go, pkg/grpcapi/{server,server_show,server_show_security_text}.go, pkg/api/{server,metrics,metrics_descriptors,metrics_system,metrics_descriptor_coverage_test}.go, docs/multi-wan.md, pkg/ipmon/README.md, pkg/frr/README.md, pkg/daemon/README.md, CLAUDE.md
+
+- **Timestamp**: 2026-06-10 16:00
+  - **Action**: AGY review fold-in (PR #1843, PASS w/ 2 findings). F1: deleted uncalled legacy frr.Apply/ApplyWithInstances partial FullConfig constructors (overlay-wipe bypass) + AST guard test enforcing assembleFRRConfig as sole production constructor (allowlist: assembler + documented pkg/cli/apply.go standalone fallback; negative-checked). F2: ErrProbeSetup classification — raw-socket open/marshal failures hold probe state (no counters/status/events/Transition, rate-limited Warn) so ip-monitoring never actuates routes off a capability regression; timeout/echo failures unchanged.
+  - **File(s)**: pkg/frr/manager.go, pkg/frr/README.md, pkg/daemon/frr_fullconfig_guard_test.go, pkg/rpm/icmp.go, pkg/rpm/rpm.go, pkg/rpm/icmp_test.go, pkg/rpm/README.md, docs/multi-wan.md
+
+- **Timestamp**: 2026-06-10 18:00
+  - **Action**: Codex review fold-in (PR #1843, MERGE-NEEDS 2 HIGH + 1 MED). HIGH-1: commit-riding overlay filtered against incoming config (ipmon.FilterOverlayForConfig + daemon commitOverlayForConfig; one filtered view for step 1.95 snapshot cache AND step 3 FRR render). HIGH-2: probeDialer control/socket-option failures (SO_BINDTODEVICE/SO_MARK) wrapped as ErrProbeSetup → tcp-ping/http-get hold state like icmp-ping; genuine refused/timeout stay path signals. MED: Engine.Apply dirty only on effective-overlay change (no spurious frr-reload per commit); PublishRouteOverlaySnapshot returns published bool, actuator bumps FIB gen only on real publish. Doc: lowest-data-RG publication-gate coarseness noted in docs/multi-wan.md.
+  - **File(s)**: pkg/ipmon/{ipmon,ipmon_test}.go, pkg/daemon/{daemon_ipmon,daemon_ipmon_test,daemon_apply}.go, pkg/rpm/{rpm,icmp,icmp_test}.go, pkg/rpm/README.md, pkg/dataplane/userspace/{manager,legacy_dataplane,route_overlay_test}.go, pkg/ipmon/README.md, docs/multi-wan.md
 - **Timestamp**: 2026-06-10
   **Action**: "#1829 Phase 1 commit 1 — enqueue_ns carrier + per-queue sojourn telemetry (plan §6.1a-1c, Option A unanimous): TxRequest/PreparedTxRequest gain enqueue_ns u64 (88→96 B each, CoSPendingTxItem 96→104 B; preserved across into_prepared/to_local conversions and pop→push_front rollbacks; ~94 construction sites init 0 = no-data per invariant 10); enqueue_cos_item (single CoS admission choke point) gains now_ns and stamps every admitted item (one u64 store, pass-level timestamp, no clock syscalls per #1734); new CoSQueueSojourn on CoSQueueTelemetry (ewma_ns α=1/8 shift-add, peak_ns lifetime max, two-bucket 100 ms flip-flop windowed MIN with ≥2-window stale discard + export-side staleness zeroing — the windowed min is the Phase-2 gate metric per AGY r2 F2); samples recorded at the four fused #1763 pop-COMMIT points (build_cos_batch_from_queue Local/Prepared, drain_exact_{local,prepared}_items_to_scratch_flow_fair scratch-commit) with now_ns threaded one level down; state writes strictly after pop so the #1763 peek-to-pop read-only invariant holds; unit tests pin zero-guard/EWMA/peak/flip/stale/skew + drain-level recording at all arms + admission stamp"
   **File(s)**: userspace-dp/src/afxdp/types/tx.rs, userspace-dp/src/afxdp/types/cos.rs, userspace-dp/src/afxdp/types/cos_sojourn_tests.rs (new), userspace-dp/src/afxdp/tx/cos_classify.rs, userspace-dp/src/afxdp/cos/queue_service/{mod.rs,drain.rs,service.rs}, userspace-dp/src/afxdp/cos/builders.rs, + ~25 construction-site files (mostly tests)

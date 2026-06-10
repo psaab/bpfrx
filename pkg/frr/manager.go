@@ -147,25 +147,27 @@ type FullConfig struct {
 	// zone-encoded fabric redirect for new connections.  The real default
 	// route (AD 5 or 200) always takes priority when present.
 	ClusterMode bool
+
+	// PreferredRoutes is the ip-monitoring effective-route overlay
+	// (#1827 PR-1b): winner-resolved injected routes rendered as
+	// DISTANCE-1 statics (Static/1 — beats static AD 5 and DHCP AD
+	// 200; that is what makes them "preferred"). Runtime state from
+	// pkg/ipmon, supplied by the daemon's assembleFRRConfig for BOTH
+	// the full apply path and the routes-only actuator, so an
+	// unrelated operator commit can never wipe an active failover
+	// route.
+	PreferredRoutes []config.RouteOverlayEntry
 }
 
-// Apply generates an FRR config from OSPF/BGP settings and reloads FRR.
-func (m *Manager) Apply(ospf *config.OSPFConfig, bgp *config.BGPConfig) error {
-	return m.ApplyFull(&FullConfig{
-		OSPF: ospf,
-		BGP:  bgp,
-	})
-}
-
-// ApplyWithInstances generates an FRR config with optional per-VRF routing
-// instances and reloads FRR.
-func (m *Manager) ApplyWithInstances(ospf *config.OSPFConfig, bgp *config.BGPConfig, instances []InstanceConfig) error {
-	return m.ApplyFull(&FullConfig{
-		OSPF:      ospf,
-		BGP:       bgp,
-		Instances: instances,
-	})
-}
+// NOTE (#1827, AGY review on PR #1843 F1): the legacy Apply(ospf, bgp)
+// and ApplyWithInstances(...) convenience constructors were DELETED
+// here. They built a partial FullConfig inline, bypassing the daemon's
+// assembleFRRConfig — the sole production FullConfig constructor — so
+// any caller reaching them would have wiped an active ip-monitoring
+// failover overlay (PreferredRoutes) from the managed section. They
+// had zero callers (production or test) at removal time. New callers
+// must go through the daemon's assembleFRRConfig; pkg/daemon's
+// TestFRRFullConfigConstructedOnlyByAssembler guard enforces this.
 
 // ApplyFull generates the complete FRR config including static routes,
 // DHCP-learned defaults, per-VRF routes, and dynamic protocols, then
@@ -181,18 +183,20 @@ func (m *Manager) ApplyWithInstances(ospf *config.OSPFConfig, bgp *config.BGPCon
 //  4. DHCP-learned defaults (admin distance 200)
 //  5. backup-router (admin distance 250)
 //  6. cluster-mode blackhole defaults (admin distance 250)
-//  7. per-VRF static routes
-//  8. policy-options (prefix-lists, route-maps, communities)
-//  9. interface settings (bandwidth, point-to-point)
-//  10. global dynamic protocols (OSPF/OSPFv3/BGP/RIP/ISIS)
-//  11. per-VRF dynamic protocols
+//  7. ip-monitoring preferred routes (admin distance 1, #1827)
+//  8. per-VRF static routes
+//  9. policy-options (prefix-lists, route-maps, communities)
+//  10. interface settings (bandwidth, point-to-point)
+//  11. global dynamic protocols (OSPF/OSPFv3/BGP/RIP/ISIS)
+//  12. per-VRF dynamic protocols
 func (m *Manager) ApplyFull(fc *FullConfig) error {
 	if fc == nil {
 		return m.Clear()
 	}
 
 	hasContent := fc.OSPF != nil || fc.OSPFv3 != nil || fc.BGP != nil || fc.RIP != nil || fc.ISIS != nil ||
-		len(fc.StaticRoutes) > 0 || len(fc.Inet6StaticRoutes) > 0 || len(fc.GenerateRoutes) > 0 || len(fc.DHCPRoutes) > 0 || fc.BackupRouter != "" || fc.ClusterMode
+		len(fc.StaticRoutes) > 0 || len(fc.Inet6StaticRoutes) > 0 || len(fc.GenerateRoutes) > 0 || len(fc.DHCPRoutes) > 0 || fc.BackupRouter != "" || fc.ClusterMode ||
+		len(fc.PreferredRoutes) > 0
 	for _, inst := range fc.Instances {
 		if inst.OSPF != nil || inst.OSPFv3 != nil || inst.BGP != nil || inst.RIP != nil || inst.ISIS != nil || len(inst.StaticRoutes) > 0 || len(inst.Inet6StaticRoutes) > 0 {
 			hasContent = true
@@ -235,7 +239,10 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 	// 6. Cluster mode: blackhole default route as fallback for fabric redirect.
 	renderClusterModeDefaults(&b, fc)
 
-	// 7. Per-VRF static routes
+	// 7. ip-monitoring preferred routes (admin distance 1, #1827).
+	m.renderPreferredRoutes(&b, fc)
+
+	// 8. Per-VRF static routes
 	for _, inst := range fc.Instances {
 		if len(inst.StaticRoutes) > 0 || len(inst.Inet6StaticRoutes) > 0 {
 			for _, sr := range inst.StaticRoutes {
@@ -248,7 +255,7 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 		}
 	}
 
-	// 8. Policy options: prefix-lists and route-maps
+	// 9. Policy options: prefix-lists and route-maps
 	if fc.PolicyOptions != nil {
 		b.WriteString(m.generatePolicyOptions(fc.PolicyOptions))
 	}
@@ -257,15 +264,15 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 	// as a side effect when the policy uses "load-balance consistent-hash".
 	ecmpMaxPaths := resolveECMP(fc)
 
-	// 9. Interface-level settings (bandwidth, point-to-point)
+	// 10. Interface-level settings (bandwidth, point-to-point)
 	b.WriteString(m.generateInterfaceSettings(fc))
 
-	// 10. Global dynamic protocols
+	// 11. Global dynamic protocols
 	if fc.OSPF != nil || fc.OSPFv3 != nil || fc.BGP != nil || fc.RIP != nil || fc.ISIS != nil {
 		b.WriteString(m.generateProtocols(fc.OSPF, fc.OSPFv3, fc.BGP, fc.RIP, fc.ISIS, "", ecmpMaxPaths, fc.PolicyOptions))
 	}
 
-	// 11. Per-VRF dynamic protocols
+	// 12. Per-VRF dynamic protocols
 	for _, inst := range fc.Instances {
 		if inst.OSPF != nil || inst.OSPFv3 != nil || inst.BGP != nil || inst.RIP != nil || inst.ISIS != nil {
 			b.WriteString(m.generateProtocols(inst.OSPF, inst.OSPFv3, inst.BGP, inst.RIP, inst.ISIS, inst.VRFName, ecmpMaxPaths, fc.PolicyOptions))

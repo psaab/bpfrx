@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 )
@@ -46,6 +47,66 @@ func validateRPMTest(probeName string, test *RPMTest) error {
 	}
 	if test.DestPort > 65535 {
 		return fmt.Errorf("services rpm probe %q test %q destination-port: must be 1-65535", probeName, test.Name)
+	}
+	if test.NextHop != "" {
+		nh := net.ParseIP(test.NextHop)
+		if nh == nil {
+			return fmt.Errorf("services rpm probe %q test %q next-hop: invalid IP address %q",
+				probeName, test.Name, test.NextHop)
+		}
+		// The pinned host route is installed with an explicit `dev` +
+		// `onlink`, so the egress interface must be named (#1827 §4.2.4).
+		if test.DestinationInterface == "" {
+			return fmt.Errorf("services rpm probe %q test %q: next-hop requires destination-interface "+
+				"(the probe pin route needs an explicit egress device)", probeName, test.Name)
+		}
+		// The pin installs <target>/32 (or /128) via <next-hop>, so the
+		// target must be an IP literal of the same address family.
+		target := net.ParseIP(test.Target)
+		if target == nil {
+			return fmt.Errorf("services rpm probe %q test %q: next-hop pinning requires an IP-literal target (got %q)",
+				probeName, test.Name, test.Target)
+		}
+		if (target.To4() == nil) != (nh.To4() == nil) {
+			return fmt.Errorf("services rpm probe %q test %q: next-hop %q address family does not match target %q",
+				probeName, test.Name, test.NextHop, test.Target)
+		}
+	}
+	return nil
+}
+
+// validateRPMProbePinsStrict enforces the probe-pin band invariants
+// (#1827 PR-1a): at most ProbeTableCount next-hop-pinned tests (one
+// reserved kernel table each), and no routing-instance table ID may
+// collide with the reserved probe table range 7000-7049.
+func validateRPMProbePinsStrict(cfg *Config) error {
+	pinned := 0
+	if cfg.Services.RPM != nil {
+		for _, probe := range cfg.Services.RPM.Probes {
+			if probe == nil {
+				continue
+			}
+			for _, test := range probe.Tests {
+				if test != nil && test.NextHop != "" {
+					pinned++
+				}
+			}
+		}
+	}
+	if pinned > ProbeTableCount {
+		return fmt.Errorf("services rpm: %d tests configure next-hop pinning, exceeding the reserved probe table band (%d tables %d-%d)",
+			pinned, ProbeTableCount, ProbeTableBase, ProbeTableBase+ProbeTableCount-1)
+	}
+	if pinned > 0 {
+		for _, ri := range cfg.RoutingInstances {
+			if ri == nil {
+				continue
+			}
+			if ri.TableID >= ProbeTableBase && ri.TableID < ProbeTableBase+ProbeTableCount {
+				return fmt.Errorf("routing-instance %q table ID %d collides with the reserved RPM probe table range %d-%d",
+					ri.Name, ri.TableID, ProbeTableBase, ProbeTableBase+ProbeTableCount-1)
+			}
+		}
 	}
 	return nil
 }
@@ -188,8 +249,184 @@ func compileServices(node *Node, svc *ServicesConfig) error {
 			return err
 		}
 	}
+	if ipmNode := node.FindChild("ip-monitoring"); ipmNode != nil {
+		if err := compileIPMonitoring(ipmNode, svc); err != nil {
+			return err
+		}
+	}
 	if node.FindChild("application-identification") != nil {
 		svc.ApplicationIdentification = true
+	}
+	return nil
+}
+
+// compileIPMonitoring parses `services ip-monitoring` (#1827 PR-1b).
+// Both AST shapes are handled: hierarchical blocks and flat-set replay.
+// Two set lines for the same (routing-instance, route) merge into one
+// PreferredRoute (next-hop + preferred-metric arrive on separate lines).
+func compileIPMonitoring(node *Node, svc *ServicesConfig) error {
+	cfg := &IPMonitoringConfig{Policies: make(map[string]*IPMonitoringPolicy)}
+
+	for _, polInst := range namedInstances(node.FindChildren("policy")) {
+		pol := &IPMonitoringPolicy{Name: polInst.name}
+		routes := make(map[string]*PreferredRoute)
+		var order []string
+
+		for _, prop := range polInst.node.Children {
+			switch prop.Name() {
+			case "match":
+				// `match { rpm-probe X; }` or inline `match rpm-probe X;`
+				if len(prop.Keys) >= 3 && prop.Keys[1] == "rpm-probe" {
+					pol.MatchRPMProbe = prop.Keys[2]
+				}
+				if c := prop.FindChild("rpm-probe"); c != nil {
+					if v := nodeVal(c); v != "" {
+						pol.MatchRPMProbe = v
+					}
+				}
+			case "then":
+				for _, prNode := range prop.FindChildren("preferred-route") {
+					if err := compilePreferredRoutes(prNode, "", pol.Name, routes, &order); err != nil {
+						return err
+					}
+					for _, riInst := range namedInstances(prNode.FindChildren("routing-instance")) {
+						if err := compilePreferredRoutes(riInst.node, riInst.name, pol.Name, routes, &order); err != nil {
+							return err
+						}
+					}
+				}
+			case "hold-down":
+				if v := nodeVal(prop); v != "" {
+					n, err := strconv.Atoi(v)
+					if err != nil || n < 0 {
+						return fmt.Errorf("services ip-monitoring policy %q hold-down: invalid value %q", pol.Name, v)
+					}
+					pol.HoldDownSecs = n
+				}
+			}
+		}
+
+		for _, key := range order {
+			pol.PreferredRoutes = append(pol.PreferredRoutes, routes[key])
+		}
+		cfg.Policies[pol.Name] = pol
+	}
+
+	svc.IPMonitoring = cfg
+	return nil
+}
+
+// compilePreferredRoutes collects `route <cidr> { next-hop X;
+// preferred-metric N; }` children of a preferred-route (or its
+// routing-instance sub-block), merging repeated lines for the same
+// destination.
+func compilePreferredRoutes(node *Node, ri, polName string, routes map[string]*PreferredRoute, order *[]string) error {
+	for _, rInst := range namedInstances(node.FindChildren("route")) {
+		key := ri + "|" + rInst.name
+		r := routes[key]
+		if r == nil {
+			r = &PreferredRoute{RoutingInstance: ri, Destination: rInst.name}
+			routes[key] = r
+			*order = append(*order, key)
+		}
+		setMetric := func(v string) error {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 0 {
+				return fmt.Errorf("services ip-monitoring policy %q route %s preferred-metric: invalid value %q",
+					polName, r.Destination, v)
+			}
+			r.PreferredMetric = n
+			return nil
+		}
+		// Inline keys: `route 0.0.0.0/0 next-hop 1.2.3.4;`
+		keys := rInst.node.Keys
+		for i := 2; i+1 < len(keys); i += 2 {
+			switch keys[i] {
+			case "next-hop":
+				r.NextHop = keys[i+1]
+			case "preferred-metric":
+				if err := setMetric(keys[i+1]); err != nil {
+					return err
+				}
+			}
+		}
+		// Child-node shape (hierarchical blocks + flat-set replay).
+		for _, p := range rInst.node.Children {
+			switch p.Name() {
+			case "next-hop":
+				if v := nodeVal(p); v != "" {
+					r.NextHop = v
+				}
+			case "preferred-metric":
+				if v := nodeVal(p); v != "" {
+					if err := setMetric(v); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// validateIPMonitoringStrict enforces the #1827 PR-1b commit checks:
+// the matched probe exists, every policy has at least one
+// preferred-route, destinations/next-hops are family-consistent, and
+// referenced routing instances exist AND are not instance-type
+// forwarding (the FBF composition is PR-2 — the known FRR-vs-dataplane
+// divergence for forwarding instances must be unreachable from PR-1).
+func validateIPMonitoringStrict(cfg *Config) error {
+	ipm := cfg.Services.IPMonitoring
+	if ipm == nil {
+		return nil
+	}
+	instances := make(map[string]*RoutingInstanceConfig)
+	for _, ri := range cfg.RoutingInstances {
+		if ri != nil {
+			instances[ri.Name] = ri
+		}
+	}
+	for name, pol := range ipm.Policies {
+		if pol == nil {
+			continue
+		}
+		if pol.MatchRPMProbe == "" {
+			return fmt.Errorf("services ip-monitoring policy %q: match rpm-probe is required", name)
+		}
+		if cfg.Services.RPM == nil || cfg.Services.RPM.Probes[pol.MatchRPMProbe] == nil {
+			return fmt.Errorf("services ip-monitoring policy %q: match rpm-probe %q does not reference a configured services rpm probe",
+				name, pol.MatchRPMProbe)
+		}
+		if len(pol.PreferredRoutes) == 0 {
+			return fmt.Errorf("services ip-monitoring policy %q: at least one then preferred-route route is required", name)
+		}
+		for _, pr := range pol.PreferredRoutes {
+			_, dst, err := net.ParseCIDR(pr.Destination)
+			if err != nil {
+				return fmt.Errorf("services ip-monitoring policy %q route %q: invalid destination prefix",
+					name, pr.Destination)
+			}
+			nh := net.ParseIP(pr.NextHop)
+			if nh == nil {
+				return fmt.Errorf("services ip-monitoring policy %q route %s: next-hop %q is not a valid IP address",
+					name, pr.Destination, pr.NextHop)
+			}
+			if (dst.IP.To4() == nil) != (nh.To4() == nil) {
+				return fmt.Errorf("services ip-monitoring policy %q route %s: next-hop %q address family does not match destination",
+					name, pr.Destination, pr.NextHop)
+			}
+			if pr.RoutingInstance != "" {
+				ri, ok := instances[pr.RoutingInstance]
+				if !ok {
+					return fmt.Errorf("services ip-monitoring policy %q route %s: routing-instance %q does not exist",
+						name, pr.Destination, pr.RoutingInstance)
+				}
+				if ri.InstanceType == "forwarding" {
+					return fmt.Errorf("services ip-monitoring policy %q route %s: preferred-route routing-instance %q has instance-type forwarding, which is not supported yet (filter-based forwarding composition is #1827 PR-2)",
+						name, pr.Destination, pr.RoutingInstance)
+				}
+			}
+		}
 	}
 	return nil
 }
@@ -222,11 +459,16 @@ func compileRPM(node *Node, svc *ServicesConfig) error {
 				case "probe-type":
 					test.ProbeType = nodeVal(prop)
 				case "target":
-					// Handle both "target 1.1.1.1;" and "target url http://1.1.1.1;"
-					if len(prop.Keys) >= 3 && prop.Keys[1] == "url" {
+					// Handle "target 1.1.1.1;", the canonical Junos form
+					// "target address 1.1.1.1;" (#1827), and
+					// "target url http://1.1.1.1;" — in both inline-keys
+					// and child-node AST shapes.
+					if len(prop.Keys) >= 3 && (prop.Keys[1] == "url" || prop.Keys[1] == "address") {
 						test.Target = prop.Keys[2]
 					} else if urlChild := prop.FindChild("url"); urlChild != nil {
 						test.Target = nodeVal(urlChild)
+					} else if addrChild := prop.FindChild("address"); addrChild != nil {
+						test.Target = nodeVal(addrChild)
 					} else {
 						test.Target = nodeVal(prop)
 					}
@@ -234,6 +476,10 @@ func compileRPM(node *Node, svc *ServicesConfig) error {
 					test.SourceAddress = nodeVal(prop)
 				case "routing-instance":
 					test.RoutingInstance = nodeVal(prop)
+				case "destination-interface":
+					test.DestinationInterface = nodeVal(prop)
+				case "next-hop":
+					test.NextHop = nodeVal(prop)
 				case "probe-interval":
 					if v := nodeVal(prop); v != "" {
 						n, err := parseRPMPositiveInt(probe.Name, test.Name, "probe-interval", v)

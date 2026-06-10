@@ -434,6 +434,9 @@ var OperationalTree = map[string]*Node{
 			"rpm": {Desc: "Show RPM probe results", Children: map[string]*Node{
 				"probe-results": {Desc: "Show RPM probe results"},
 			}},
+			"ip-monitoring": {Desc: "Show IP monitoring policy status", Children: map[string]*Node{
+				"status": {Desc: "Show IP monitoring policy status"},
+			}},
 			"application-identification": {Desc: "Show application-identification (AppID) status", Children: map[string]*Node{
 				"status": {Desc: "Show AppID engine status and supported contract"},
 			}},

@@ -185,6 +185,11 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 		// #1043 Phase 12: case body extracted to server_show_security_text.go
 		s.showRPM(&buf)
 
+	case "services-ip-monitoring-status":
+		// #1827: services ip-monitoring policy status (distinct from
+		// chassis-cluster-ip-monitoring-status, the RG-weight feature).
+		s.showServicesIPMonitoringStatus(&buf)
+
 	case "application-identification-status":
 		// #653: surface what xpf AppID actually does today vs the
 		// vSRX `services application-identification` feature.

@@ -11,10 +11,10 @@ import (
 )
 
 func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation uint64, fibGeneration uint32) *ConfigSnapshot {
-	return buildSnapshotWithSchedulerState(cfg, ucfg, generation, fibGeneration, nil)
+	return buildSnapshotWithSchedulerState(cfg, ucfg, generation, fibGeneration, nil, nil)
 }
 
-func buildSnapshotWithSchedulerState(cfg *config.Config, ucfg config.UserspaceConfig, generation uint64, fibGeneration uint32, activeState map[string]bool) *ConfigSnapshot {
+func buildSnapshotWithSchedulerState(cfg *config.Config, ucfg config.UserspaceConfig, generation uint64, fibGeneration uint32, activeState map[string]bool, routeOverlay []config.RouteOverlayEntry) *ConfigSnapshot {
 	if cfg == nil {
 		return &ConfigSnapshot{
 			Version:       ProtocolVersion,
@@ -41,7 +41,7 @@ func buildSnapshotWithSchedulerState(cfg *config.Config, ucfg config.UserspaceCo
 		Fabrics:            buildFabricSnapshots(cfg),
 		TunnelEndpoints:    buildTunnelEndpointSnapshots(cfg, interfaces),
 		Neighbors:          buildNeighborSnapshots(cfg),
-		Routes:             buildRouteSnapshots(cfg, interfaces),
+		Routes:             buildRouteSnapshots(cfg, interfaces, routeOverlay),
 		Flow:               buildFlowSnapshot(cfg),
 		DefaultPolicy:      policyActionString(cfg.Security.DefaultPolicy),
 		Policies:           buildPolicySnapshotsWithSchedulerState(cfg, activeState),
