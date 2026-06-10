@@ -149,12 +149,18 @@ type xpfCollector struct {
 	workerIdleLoops                          *prometheus.Desc
 	workerCoSQueueLeaseAcquireV8Calls        *prometheus.Desc
 	workerCoSQueueLeaseAcquireV8GrantedBytes *prometheus.Desc
-	workerSessionTableEntries                *prometheus.Desc
-	workerSessionTableCapacity               *prometheus.Desc
-	workerNatReverseKeyCollisions            *prometheus.Desc
-	userspaceSessionTableEntries             *prometheus.Desc
-	userspaceSessionTableCapacity            *prometheus.Desc
-	userspaceNatReverseKeyCollisions         *prometheus.Desc
+	// #1782 Step-1 cold-start CoS instruments: per-worker timer-wheel
+	// tick-advance sum + single-call high-water max (mechanism (i)) and
+	// the per-cause v8 queue-lease under-grant family (mechanism (ii)).
+	workerCoSWheelTicksAdvancedTotal *prometheus.Desc
+	workerCoSWheelTicksAdvancedMax   *prometheus.Desc
+	workerCoSQueueLeaseUndergrant    *prometheus.Desc
+	workerSessionTableEntries        *prometheus.Desc
+	workerSessionTableCapacity       *prometheus.Desc
+	workerNatReverseKeyCollisions    *prometheus.Desc
+	userspaceSessionTableEntries     *prometheus.Desc
+	userspaceSessionTableCapacity    *prometheus.Desc
+	userspaceNatReverseKeyCollisions *prometheus.Desc
 	// #1789: total failed USERSPACE_SESSIONS BPF-map publishes — the
 	// cause-side signal for rising XDP-shim NO_SESSION fallbacks.
 	userspaceSessionPublishErrors *prometheus.Desc
@@ -376,6 +382,9 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.workerIdleLoops
 	ch <- c.workerCoSQueueLeaseAcquireV8Calls
 	ch <- c.workerCoSQueueLeaseAcquireV8GrantedBytes
+	ch <- c.workerCoSWheelTicksAdvancedTotal
+	ch <- c.workerCoSWheelTicksAdvancedMax
+	ch <- c.workerCoSQueueLeaseUndergrant
 	ch <- c.workerSessionTableEntries
 	ch <- c.workerSessionTableCapacity
 	ch <- c.workerNatReverseKeyCollisions

@@ -34,9 +34,18 @@ func TestEmitWorkerRuntime_DeadGaugeReflectsDeadFlag(t *testing.T) {
 			{
 				WorkerID: 0, CoSQueueLeaseAcquireV8Calls: 7,
 				CoSQueueLeaseAcquireV8GrantedBytes: 4096,
-				SessionTableEntries:                17,
-				MaxSessions:                        100,
-				Dead:                               false,
+				// #1782 Step-1 cold-start CoS instruments.
+				CoSWheelTicksAdvancedTotal:            12_000_000,
+				CoSWheelTicksAdvancedMax:              11_000_000,
+				CoSQueueLeaseUndergrantSeqlockGiveUp:  1,
+				CoSQueueLeaseUndergrantCapZero:        2,
+				CoSQueueLeaseUndergrantEpochRotated:   3,
+				CoSQueueLeaseUndergrantShareExhausted: 4,
+				CoSQueueLeaseUndergrantClassCap:       5,
+				CoSQueueLeaseUndergrantOutstandingCap: 6,
+				SessionTableEntries:                   17,
+				MaxSessions:                           100,
+				Dead:                                  false,
 			},
 			{
 				WorkerID: 1, CoSQueueLeaseAcquireV8Calls: 11,
@@ -61,11 +70,13 @@ func TestEmitWorkerRuntime_DeadGaugeReflectsDeadFlag(t *testing.T) {
 	// 1 window-width gauge, 2 session-table gauges +
 	// 1 NAT reverse-key collision counter (#1760) = 15 metrics +
 	// #1621 cold-path always-emitted metrics (4 per-worker scalars
-	// + clock_source gauge + snapshot_failed counter = 6) = 21.
+	// + clock_source gauge + snapshot_failed counter = 6) = 21 +
+	// #1782 Step-1 cold-start CoS instruments (wheel sum counter +
+	// wheel max gauge + 6 per-cause under-grant counters = 8) = 29.
 	// Per-slot/per-bucket metrics need non-empty Vec fields which
 	// these test fixtures don't populate, so they're zero here.
-	if len(got) != 3*21 {
-		t.Fatalf("emitWorkerRuntime: want %d metrics for 3 workers, got %d", 3*21, len(got))
+	if len(got) != 3*29 {
+		t.Fatalf("emitWorkerRuntime: want %d metrics for 3 workers, got %d", 3*29, len(got))
 	}
 
 	// Gather just the dead-gauge entries, keyed by worker_id label.
@@ -126,6 +137,64 @@ func TestEmitWorkerRuntime_DeadGaugeReflectsDeadFlag(t *testing.T) {
 	for wid, want := range map[string]float64{"0": 4096, "1": 0, "2": 8192} {
 		if got := leaseBytesByWorker[wid]; got != want {
 			t.Errorf("xpf_userspace_worker_cos_queue_lease_acquire_v8_granted_bytes_total{worker_id=%q} = %v, want %v", wid, got, want)
+		}
+	}
+	// #1782 Step-1: wheel tick-advance sum (counter) + single-call max
+	// (gauge) per worker; zero for workers that never primed a CoS root.
+	wheelTotalByWorker := metricValuesByWorker(t, got, c.workerCoSWheelTicksAdvancedTotal, true)
+	for wid, want := range map[string]float64{"0": 12_000_000, "1": 0, "2": 0} {
+		if got := wheelTotalByWorker[wid]; got != want {
+			t.Errorf("xpf_userspace_worker_cos_wheel_ticks_advanced_total{worker_id=%q} = %v, want %v", wid, got, want)
+		}
+	}
+	wheelMaxByWorker := metricValuesByWorker(t, got, c.workerCoSWheelTicksAdvancedMax, false)
+	for wid, want := range map[string]float64{"0": 11_000_000, "1": 0, "2": 0} {
+		if got := wheelMaxByWorker[wid]; got != want {
+			t.Errorf("xpf_userspace_worker_cos_wheel_ticks_advanced_max{worker_id=%q} = %v, want %v", wid, got, want)
+		}
+	}
+	// #1782 Step-1: per-cause under-grant family — all six causes emit
+	// for every worker (zero baseline included), keyed (worker, cause).
+	undergrant := make(map[string]map[string]float64)
+	for _, m := range got {
+		if m.Desc() != c.workerCoSQueueLeaseUndergrant {
+			continue
+		}
+		var pb dto.Metric
+		if err := m.Write(&pb); err != nil {
+			t.Fatalf("metric.Write: %v", err)
+		}
+		if pb.Counter == nil {
+			t.Fatalf("undergrant family must be a Counter: %+v", &pb)
+		}
+		var workerID, cause string
+		for _, lp := range pb.GetLabel() {
+			switch lp.GetName() {
+			case "worker_id":
+				workerID = lp.GetValue()
+			case "cause":
+				cause = lp.GetValue()
+			}
+		}
+		if workerID == "" || cause == "" {
+			t.Fatalf("undergrant emission missing worker_id/cause label: %+v", &pb)
+		}
+		if undergrant[workerID] == nil {
+			undergrant[workerID] = make(map[string]float64)
+		}
+		undergrant[workerID][cause] = pb.Counter.GetValue()
+	}
+	for wid, byCause := range undergrant {
+		if len(byCause) != 6 {
+			t.Errorf("worker %s: want 6 under-grant cause series, got %d (%v)", wid, len(byCause), byCause)
+		}
+	}
+	for cause, want := range map[string]float64{
+		"seqlock_give_up": 1, "cap_zero": 2, "epoch_rotated": 3,
+		"share_exhausted": 4, "class_cap": 5, "outstanding_cap": 6,
+	} {
+		if got := undergrant["0"][cause]; got != want {
+			t.Errorf("xpf_userspace_worker_cos_queue_lease_undergrant_total{worker_id=\"0\",cause=%q} = %v, want %v", cause, got, want)
 		}
 	}
 	entriesByWorker := metricValuesByWorker(t, got, c.workerSessionTableEntries, false)
@@ -197,6 +266,11 @@ func newCollectorWithWorkerDescsOnly() *xpfCollector {
 		return prometheus.NewDesc(name, name,
 			[]string{"worker_id", "source"}, nil)
 	}
+	// #1782 Step-1: per-cause under-grant family.
+	mkCause := func(name string) *prometheus.Desc {
+		return prometheus.NewDesc(name, name,
+			[]string{"worker_id", "cause"}, nil)
+	}
 	// #1635 v3 per-zone-pair descriptors.
 	mkZonePair := func(name string) *prometheus.Desc {
 		return prometheus.NewDesc(name, name,
@@ -222,10 +296,14 @@ func newCollectorWithWorkerDescsOnly() *xpfCollector {
 		workerIdleLoops:                          mk("xpf_userspace_worker_idle_loops_total"),
 		workerCoSQueueLeaseAcquireV8Calls:        mk("xpf_userspace_worker_cos_queue_lease_acquire_v8_calls_total"),
 		workerCoSQueueLeaseAcquireV8GrantedBytes: mk("xpf_userspace_worker_cos_queue_lease_acquire_v8_granted_bytes_total"),
-		workerSessionTableEntries:                mk("xpf_userspace_worker_session_table_entries"),
-		workerSessionTableCapacity:               mk("xpf_userspace_worker_session_table_capacity"),
-		workerNatReverseKeyCollisions:            mk("xpf_userspace_worker_session_nat_reverse_key_collisions_total"),
-		workerDead:                               mk("xpf_userspace_worker_dead"),
+		// #1782 Step-1 cold-start CoS instruments.
+		workerCoSWheelTicksAdvancedTotal: mk("xpf_userspace_worker_cos_wheel_ticks_advanced_total"),
+		workerCoSWheelTicksAdvancedMax:   mk("xpf_userspace_worker_cos_wheel_ticks_advanced_max"),
+		workerCoSQueueLeaseUndergrant:    mkCause("xpf_userspace_worker_cos_queue_lease_undergrant_total"),
+		workerSessionTableEntries:        mk("xpf_userspace_worker_session_table_entries"),
+		workerSessionTableCapacity:       mk("xpf_userspace_worker_session_table_capacity"),
+		workerNatReverseKeyCollisions:    mk("xpf_userspace_worker_session_nat_reverse_key_collisions_total"),
+		workerDead:                       mk("xpf_userspace_worker_dead"),
 		// #1621 cold-path descriptors.
 		workerColdPathBucket:              mkBucket("xpf_userspace_worker_cold_path_ns_bucket"),
 		workerColdPathSamples:             mkSlot("xpf_userspace_worker_cold_path_samples_total"),
@@ -285,10 +363,14 @@ func collectFromEmitWorkerRuntime(
 		c.workerIdleLoops:                          {},
 		c.workerCoSQueueLeaseAcquireV8Calls:        {},
 		c.workerCoSQueueLeaseAcquireV8GrantedBytes: {},
-		c.workerSessionTableEntries:                {},
-		c.workerSessionTableCapacity:               {},
-		c.workerNatReverseKeyCollisions:            {},
-		c.workerDead:                               {},
+		// #1782 Step-1 cold-start CoS instruments.
+		c.workerCoSWheelTicksAdvancedTotal: {},
+		c.workerCoSWheelTicksAdvancedMax:   {},
+		c.workerCoSQueueLeaseUndergrant:    {},
+		c.workerSessionTableEntries:        {},
+		c.workerSessionTableCapacity:       {},
+		c.workerNatReverseKeyCollisions:    {},
+		c.workerDead:                       {},
 		// #1621 cold-path descriptors.
 		c.workerColdPathBucket:              {},
 		c.workerColdPathSamples:             {},

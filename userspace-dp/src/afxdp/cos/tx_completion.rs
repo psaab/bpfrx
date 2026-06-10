@@ -213,9 +213,18 @@ pub(in crate::afxdp) fn normalize_cos_queue_state(queue: &mut CoSQueueRuntime) {
     mark_cos_queue_runnable(queue);
 }
 
+/// Advance the interface timer wheel to `now_ns`, one 50 µs tick per
+/// loop iteration. Returns the number of ticks advanced by THIS call
+/// (`now_tick - current_tick` at entry) — the #1782 Step-1 §4(i)
+/// catch-up instrument. The return value is computed once before the
+/// loop (O(1), no extra clock reads); the loop itself is unchanged.
 #[inline]
-pub(in crate::afxdp) fn advance_cos_timer_wheel(root: &mut CoSInterfaceRuntime, now_ns: u64) {
+pub(in crate::afxdp) fn advance_cos_timer_wheel(
+    root: &mut CoSInterfaceRuntime,
+    now_ns: u64,
+) -> u64 {
     let now_tick = cos_tick_for_ns(now_ns);
+    let ticks_advanced = now_tick.saturating_sub(root.timer_wheel.current_tick);
     while root.timer_wheel.current_tick < now_tick {
         root.timer_wheel.current_tick = root.timer_wheel.current_tick.saturating_add(1);
         if root.timer_wheel.current_tick % COS_TIMER_WHEEL_L0_SLOTS as u64 == 0 {
@@ -223,6 +232,7 @@ pub(in crate::afxdp) fn advance_cos_timer_wheel(root: &mut CoSInterfaceRuntime, 
         }
         wake_due_cos_timer_slot(root);
     }
+    ticks_advanced
 }
 
 fn cascade_cos_timer_wheel_level1(root: &mut CoSInterfaceRuntime) {
@@ -311,12 +321,29 @@ pub(in crate::afxdp) fn prime_cos_root_for_service(
         .cos_fast_interfaces
         .get(&root_ifindex)
         .and_then(|iface_fast| iface_fast.shared_root_lease.clone());
-    let Some(root) = binding.cos.cos_interfaces.get_mut(&root_ifindex) else {
-        return false;
-    };
-    advance_cos_timer_wheel(root, now_ns);
-    if let Some(shared_root_lease) = shared_root_lease.as_ref() {
-        maybe_top_up_cos_root_lease(root, shared_root_lease, now_ns);
+    let ticks_advanced;
+    {
+        let Some(root) = binding.cos.cos_interfaces.get_mut(&root_ifindex) else {
+            return false;
+        };
+        ticks_advanced = advance_cos_timer_wheel(root, now_ns);
+        if let Some(shared_root_lease) = shared_root_lease.as_ref() {
+            maybe_top_up_cos_root_lease(root, shared_root_lease, now_ns);
+        }
+    }
+    // #1782 Step-1 (§5.2 mechanism (i)): accumulate the wheel
+    // catch-up in worker-local plain u64s on `WorkerCos` (NOT on the
+    // CoSInterfaceRuntime, which is rebuilt on config apply and would
+    // reset the published counter). Flushed to the per-worker atomics
+    // at the existing ~1s publish tick. O(1) per prime call.
+    if ticks_advanced > 0 {
+        binding.cos.cos_wheel_ticks_advanced_total = binding
+            .cos
+            .cos_wheel_ticks_advanced_total
+            .wrapping_add(ticks_advanced);
+        if ticks_advanced > binding.cos.cos_wheel_ticks_advanced_max {
+            binding.cos.cos_wheel_ticks_advanced_max = ticks_advanced;
+        }
     }
     true
 }

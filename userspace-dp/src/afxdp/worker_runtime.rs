@@ -53,6 +53,43 @@ pub(crate) enum WorkerRuntimeState {
     IdleBlock,
 }
 
+/// #1782 Step-1 (§5.2 mechanism (ii)): per-cause v8 queue-lease
+/// under-grant counters. A slot is bumped at the CoS guarantee
+/// selector sites when, AFTER `maybe_top_up_cos_queue_lease`, the
+/// queue still cannot send its head (`queue.hot.tokens < head_len`)
+/// — attributed to the `AcquireV8ShortfallCause` the lease reported.
+/// `None`-cause under-grants (legacy lease / no lease / transparent
+/// queue / fully-granted acquire) are NOT counted here; they remain
+/// visible in the pre-existing `drain_park_queue_tokens` counter,
+/// of which these are a v8-attributed subset.
+///
+/// Plain u64s — accumulated worker-locally (zero atomics on the hot
+/// path) and flushed to `WorkerRuntimeAtomics` at the existing ~1s
+/// publish tick.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CoSQueueLeaseUndergrantCounters {
+    pub seqlock_give_up: u64,
+    pub cap_zero: u64,
+    pub epoch_rotated: u64,
+    pub share_exhausted: u64,
+    pub class_cap: u64,
+    pub outstanding_cap: u64,
+}
+
+impl CoSQueueLeaseUndergrantCounters {
+    /// Element-wise wrapping accumulate (telemetry merge at the
+    /// drain-pass flush and the per-binding publish-tick sum).
+    #[inline]
+    pub(crate) fn add_assign(&mut self, other: &Self) {
+        self.seqlock_give_up = self.seqlock_give_up.wrapping_add(other.seqlock_give_up);
+        self.cap_zero = self.cap_zero.wrapping_add(other.cap_zero);
+        self.epoch_rotated = self.epoch_rotated.wrapping_add(other.epoch_rotated);
+        self.share_exhausted = self.share_exhausted.wrapping_add(other.share_exhausted);
+        self.class_cap = self.class_cap.wrapping_add(other.class_cap);
+        self.outstanding_cap = self.outstanding_cap.wrapping_add(other.outstanding_cap);
+    }
+}
+
 /// Per-worker cumulative counters, owned exclusively by the worker
 /// thread.  No atomics here — the worker only contends with itself.
 #[derive(Clone, Copy, Debug, Default)]
@@ -66,6 +103,18 @@ pub(crate) struct WorkerRuntimeCounters {
     pub idle_loops: u64,
     pub cos_queue_lease_acquire_v8_calls: u64,
     pub cos_queue_lease_acquire_v8_granted_bytes: u64,
+    /// #1782 Step-1 (§5.2 mechanism (i)): cumulative CoS timer-wheel
+    /// ticks advanced by `advance_cos_timer_wheel` across this
+    /// worker's bindings, and the largest single-call advance ever
+    /// observed (a monotonic high-water mark, not a windowed max).
+    /// One cold drain catching up a multi-minute idle lag shows up as
+    /// a single multi-million-tick `max` sample, which pins the §4(i)
+    /// O(lag) catch-up mechanism conclusively.
+    pub cos_wheel_ticks_advanced_total: u64,
+    pub cos_wheel_ticks_advanced_max: u64,
+    /// #1782 Step-1 (§5.2 mechanism (ii)): per-cause v8 queue-lease
+    /// under-grant attribution. See `CoSQueueLeaseUndergrantCounters`.
+    pub cos_queue_lease_undergrant: CoSQueueLeaseUndergrantCounters,
     pub session_table_entries: u64,
     pub max_sessions: u64,
     /// #1760: cumulative NAT reverse-key displacement events from this
@@ -122,6 +171,19 @@ pub(crate) struct WorkerRuntimeAtomics {
     pub idle_loops: AtomicU64,
     pub cos_queue_lease_acquire_v8_calls: AtomicU64,
     pub cos_queue_lease_acquire_v8_granted_bytes: AtomicU64,
+    /// #1782 Step-1 (i): timer-wheel tick-advance sum + single-call
+    /// high-water max. Simple Relaxed cumulative slots (like
+    /// `cos_queue_lease_acquire_v8_calls`); NOT part of the seqlock
+    /// rolling-window tuple.
+    pub cos_wheel_ticks_advanced_total: AtomicU64,
+    pub cos_wheel_ticks_advanced_max: AtomicU64,
+    /// #1782 Step-1 (ii): per-cause v8 queue-lease under-grant slots.
+    pub cos_queue_lease_undergrant_seqlock_give_up: AtomicU64,
+    pub cos_queue_lease_undergrant_cap_zero: AtomicU64,
+    pub cos_queue_lease_undergrant_epoch_rotated: AtomicU64,
+    pub cos_queue_lease_undergrant_share_exhausted: AtomicU64,
+    pub cos_queue_lease_undergrant_class_cap: AtomicU64,
+    pub cos_queue_lease_undergrant_outstanding_cap: AtomicU64,
     pub session_table_entries: AtomicU64,
     pub max_sessions: AtomicU64,
     /// #1760: cumulative NAT reverse-key displacement events. Simple
@@ -182,6 +244,14 @@ impl WorkerRuntimeAtomics {
             idle_loops: AtomicU64::new(0),
             cos_queue_lease_acquire_v8_calls: AtomicU64::new(0),
             cos_queue_lease_acquire_v8_granted_bytes: AtomicU64::new(0),
+            cos_wheel_ticks_advanced_total: AtomicU64::new(0),
+            cos_wheel_ticks_advanced_max: AtomicU64::new(0),
+            cos_queue_lease_undergrant_seqlock_give_up: AtomicU64::new(0),
+            cos_queue_lease_undergrant_cap_zero: AtomicU64::new(0),
+            cos_queue_lease_undergrant_epoch_rotated: AtomicU64::new(0),
+            cos_queue_lease_undergrant_share_exhausted: AtomicU64::new(0),
+            cos_queue_lease_undergrant_class_cap: AtomicU64::new(0),
+            cos_queue_lease_undergrant_outstanding_cap: AtomicU64::new(0),
             session_table_entries: AtomicU64::new(0),
             max_sessions: AtomicU64::new(0),
             nat_reverse_key_collisions: AtomicU64::new(0),
@@ -218,6 +288,25 @@ impl WorkerRuntimeAtomics {
             c.cos_queue_lease_acquire_v8_granted_bytes,
             Ordering::Relaxed,
         );
+        // #1782 Step-1 publish: simple Relaxed stores on the existing
+        // ~1s cadence, same tolerance as the other cumulative slots.
+        self.cos_wheel_ticks_advanced_total
+            .store(c.cos_wheel_ticks_advanced_total, Ordering::Relaxed);
+        self.cos_wheel_ticks_advanced_max
+            .store(c.cos_wheel_ticks_advanced_max, Ordering::Relaxed);
+        let ug = &c.cos_queue_lease_undergrant;
+        self.cos_queue_lease_undergrant_seqlock_give_up
+            .store(ug.seqlock_give_up, Ordering::Relaxed);
+        self.cos_queue_lease_undergrant_cap_zero
+            .store(ug.cap_zero, Ordering::Relaxed);
+        self.cos_queue_lease_undergrant_epoch_rotated
+            .store(ug.epoch_rotated, Ordering::Relaxed);
+        self.cos_queue_lease_undergrant_share_exhausted
+            .store(ug.share_exhausted, Ordering::Relaxed);
+        self.cos_queue_lease_undergrant_class_cap
+            .store(ug.class_cap, Ordering::Relaxed);
+        self.cos_queue_lease_undergrant_outstanding_cap
+            .store(ug.outstanding_cap, Ordering::Relaxed);
         // Publish denominator before numerator so a torn multi-worker read can
         // under-report briefly, but cannot show entries without capacity.
         self.max_sessions.store(c.max_sessions, Ordering::Relaxed);
@@ -291,6 +380,32 @@ impl WorkerRuntimeAtomics {
             cos_queue_lease_acquire_v8_granted_bytes: self
                 .cos_queue_lease_acquire_v8_granted_bytes
                 .load(Ordering::Relaxed),
+            cos_wheel_ticks_advanced_total: self
+                .cos_wheel_ticks_advanced_total
+                .load(Ordering::Relaxed),
+            cos_wheel_ticks_advanced_max: self
+                .cos_wheel_ticks_advanced_max
+                .load(Ordering::Relaxed),
+            cos_queue_lease_undergrant: CoSQueueLeaseUndergrantCounters {
+                seqlock_give_up: self
+                    .cos_queue_lease_undergrant_seqlock_give_up
+                    .load(Ordering::Relaxed),
+                cap_zero: self
+                    .cos_queue_lease_undergrant_cap_zero
+                    .load(Ordering::Relaxed),
+                epoch_rotated: self
+                    .cos_queue_lease_undergrant_epoch_rotated
+                    .load(Ordering::Relaxed),
+                share_exhausted: self
+                    .cos_queue_lease_undergrant_share_exhausted
+                    .load(Ordering::Relaxed),
+                class_cap: self
+                    .cos_queue_lease_undergrant_class_cap
+                    .load(Ordering::Relaxed),
+                outstanding_cap: self
+                    .cos_queue_lease_undergrant_outstanding_cap
+                    .load(Ordering::Relaxed),
+            },
             session_table_entries: self.session_table_entries.load(Ordering::Relaxed),
             max_sessions: self.max_sessions.load(Ordering::Relaxed),
             nat_reverse_key_collisions: self

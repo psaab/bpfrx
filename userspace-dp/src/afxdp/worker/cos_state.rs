@@ -35,4 +35,16 @@ pub(crate) struct WorkerCos {
     pub(crate) cos_queue_lease_acquire_v8_calls: u64,
     /// #1240: cumulative bytes granted by v8 queue-lease acquire calls.
     pub(crate) cos_queue_lease_acquire_v8_granted_bytes: u64,
+    /// #1782 Step-1 (§5.2 mechanism (i)): cumulative CoS timer-wheel
+    /// ticks advanced by `advance_cos_timer_wheel` while priming this
+    /// binding's CoS roots, plus the largest single-call advance ever
+    /// observed (monotonic high-water mark). Kept on `WorkerCos` (not
+    /// `CoSInterfaceRuntime`) so a config-apply runtime rebuild does
+    /// not reset the published counters.
+    pub(crate) cos_wheel_ticks_advanced_total: u64,
+    pub(crate) cos_wheel_ticks_advanced_max: u64,
+    /// #1782 Step-1 (§5.2 mechanism (ii)): per-cause v8 queue-lease
+    /// under-grant attribution flushed from the guarantee-selector
+    /// telemetry (`record_cos_queue_lease_acquire`).
+    pub(crate) cos_queue_lease_undergrants: CoSQueueLeaseUndergrantCounters,
 }
