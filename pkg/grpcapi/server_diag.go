@@ -160,8 +160,15 @@ func streamDiagCmd(ctx context.Context, timeout time.Duration, cmd []string, sen
 			if err := sendFn(scanner.Text()); err != nil {
 				// Nobody reads the pipe after this point — kill the
 				// child now instead of letting it block on writes for
-				// the rest of the budget.
+				// the rest of the budget, AND close the read end:
+				// exec.Cmd's internal copy goroutine may already be
+				// blocked in pw.Write on a burst the scanner never
+				// consumed, and WaitDelay only closes the exec-owned
+				// OS pipes, not this io.Pipe — pr.Close makes that
+				// blocked write return ErrClosedPipe so c.Wait can
+				// finish (Codex review on PR #1823).
 				cancel()
+				pr.Close()
 				scanDone <- err
 				return
 			}

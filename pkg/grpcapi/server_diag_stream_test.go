@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -66,5 +67,28 @@ func TestClampDiagTimeout(t *testing.T) {
 		if got := clampDiagTimeout(c.in); got != c.want {
 			t.Errorf("clampDiagTimeout(%v) = %v, want %v", c.in, got, c.want)
 		}
+	}
+}
+
+// TestStreamDiagCmdUnblocksBurstingChildOnSendError pins the Codex
+// finding on PR #1823: a child that bursts output faster than the
+// scanner consumes it leaves exec.Cmd's internal copy goroutine
+// blocked in pw.Write when sendFn fails; cancel() alone kills the
+// child but Wait still waits on that goroutine (WaitDelay closes the
+// exec-owned OS pipes, not our io.Pipe). pr.Close() on the error path
+// is what unblocks it. Without that close this test runs ~the full
+// WaitDelay or hangs; with it, it returns immediately.
+func TestStreamDiagCmdUnblocksBurstingChildOnSendError(t *testing.T) {
+	start := time.Now()
+	err := streamDiagCmd(context.Background(), 30*time.Second,
+		[]string{"sh", "-c", "yes burst"}, func(string) error {
+			return fmt.Errorf("stream gone")
+		})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("want the sendFn error returned")
+	}
+	if elapsed >= 4*time.Second {
+		t.Fatalf("took %v — the blocked copy goroutine was not unblocked promptly", elapsed)
 	}
 }
