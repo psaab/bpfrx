@@ -441,9 +441,13 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 	// the engine BEFORE the full snapshot build (#1827, AGY r2-2): an
 	// operator commit while a policy is FAILED must rebuild routes
 	// with the active overlay instead of wiping the injected failover
-	// route until the next engine tick.
+	// route until the next engine tick. The overlay is filtered
+	// against the INCOMING config (Codex PR #1843 HIGH-1) so a commit
+	// that removes or edits a policy never republishes the stale
+	// entries; the same filtered view feeds the FRR render in step 3.
+	commitOverlay := d.commitOverlayForConfig(cfg)
 	if setter, ok := d.dp.(routeOverlaySetter); ok {
-		setter.SetRouteOverlay(d.ipmonActiveOverlay())
+		setter.SetRouteOverlay(commitOverlay)
 	}
 
 	// 2. Apply dataplane config through the runtime config sink.
@@ -731,10 +735,12 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 	// 3. Apply all routes + dynamic protocols via FRR.
 	// assembleFRRConfig is the SOLE frr.FullConfig constructor, shared
 	// with the ip-monitoring routes-only actuator (#1827) — the full
-	// apply consumes the same active overlay, so an operator commit
-	// while a policy is FAILED preserves the injected failover route.
+	// apply consumes the same (config-filtered) overlay computed in
+	// step 1.95, so an operator commit while a policy is FAILED
+	// preserves a still-valid injected failover route and drops
+	// removed/edited entries on the commit itself.
 	if d.frr != nil {
-		d.applyFRRConfig(d.assembleFRRConfig(cfg, d.ipmonActiveOverlay()))
+		d.applyFRRConfig(d.assembleFRRConfig(cfg, commitOverlay))
 	}
 
 	// 3b. Apply next-table policy routing rules (ip rule)

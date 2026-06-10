@@ -488,3 +488,50 @@ func canonicalCIDR(s string) string {
 	}
 	return n.String()
 }
+
+// FilterOverlayForConfig drops overlay entries that an INCOMING config
+// no longer backs: entries whose owning policy was removed, or whose
+// preferred-route spec (routing-instance, prefix, next-hop, metric)
+// was edited (Codex review on PR #1843, HIGH-1). The full apply path
+// caches the engine's overlay BEFORE reconcileIPMon installs the new
+// policy set, so without this filter a commit that removes or edits a
+// policy would republish the STALE overlay to both consumers (FRR +
+// snapshot) until the delayed actuator caught up. Only still-valid
+// entries ride the commit's own publish; the post-commit
+// reconcile+actuation re-injects under the new spec if the probes
+// still report FAILED.
+func FilterOverlayForConfig(overlay []config.RouteOverlayEntry, ipmCfg *config.IPMonitoringConfig) []config.RouteOverlayEntry {
+	if len(overlay) == 0 {
+		return nil
+	}
+	if ipmCfg == nil || len(ipmCfg.Policies) == 0 {
+		return nil
+	}
+	out := make([]config.RouteOverlayEntry, 0, len(overlay))
+	for _, entry := range overlay {
+		pol := ipmCfg.Policies[entry.Policy]
+		if pol == nil {
+			continue
+		}
+		backed := false
+		for _, pr := range pol.PreferredRoutes {
+			if pr == nil {
+				continue
+			}
+			if pr.RoutingInstance == entry.RoutingInstance &&
+				canonicalCIDR(pr.Destination) == entry.Destination &&
+				pr.NextHop == entry.NextHop &&
+				pr.PreferredMetric == entry.Metric {
+				backed = true
+				break
+			}
+		}
+		if backed {
+			out = append(out, entry)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}

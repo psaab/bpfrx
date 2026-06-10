@@ -159,3 +159,46 @@ func TestRPMHAGatingFilter(t *testing.T) {
 		t.Fatalf("lowestDataRG = %d, want 1", got)
 	}
 }
+
+// TestCommitOverlayForConfigFiltersStaleEntries (Codex PR #1843
+// HIGH-1): the overlay riding an operator commit's own publish is
+// filtered against the INCOMING config — removed policies and edited
+// preferred-route specs drop out; unrelated commits preserve it.
+func TestCommitOverlayForConfigFiltersStaleEntries(t *testing.T) {
+	d := &Daemon{ipmon: failedIPMonEngine(t)}
+
+	// Unrelated commit: same policy spec in the incoming config.
+	same := &config.Config{}
+	same.Services.IPMonitoring = &config.IPMonitoringConfig{Policies: map[string]*config.IPMonitoringPolicy{
+		"wan-failover": {
+			Name:          "wan-failover",
+			MatchRPMProbe: "WAN",
+			PreferredRoutes: []*config.PreferredRoute{
+				{Destination: "0.0.0.0/0", NextHop: "172.16.80.1"},
+			},
+		},
+	}}
+	if got := d.commitOverlayForConfig(same); len(got) != 1 || got[0].NextHop != "172.16.80.1" {
+		t.Fatalf("unrelated commit lost the active overlay: %+v", got)
+	}
+
+	// Commit removes the policy → nothing rides the commit.
+	if got := d.commitOverlayForConfig(&config.Config{}); got != nil {
+		t.Fatalf("removed policy still riding the commit publish: %+v", got)
+	}
+
+	// Commit edits the next-hop → the old hop must not ride.
+	edited := &config.Config{}
+	edited.Services.IPMonitoring = &config.IPMonitoringConfig{Policies: map[string]*config.IPMonitoringPolicy{
+		"wan-failover": {
+			Name:          "wan-failover",
+			MatchRPMProbe: "WAN",
+			PreferredRoutes: []*config.PreferredRoute{
+				{Destination: "0.0.0.0/0", NextHop: "172.16.80.2"},
+			},
+		},
+	}}
+	if got := d.commitOverlayForConfig(edited); got != nil {
+		t.Fatalf("stale next-hop riding the commit publish: %+v", got)
+	}
+}

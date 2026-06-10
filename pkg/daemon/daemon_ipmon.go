@@ -27,6 +27,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/frr"
+	"github.com/psaab/xpf/pkg/ipmon"
 	"github.com/psaab/xpf/pkg/rpm"
 )
 
@@ -49,6 +50,22 @@ func (d *Daemon) ipmonActiveOverlay() []config.RouteOverlayEntry {
 		return nil
 	}
 	return d.ipmon.ActiveOverlay()
+}
+
+// commitOverlayForConfig returns the overlay that may ride an
+// operator commit's OWN publish: the engine's active overlay filtered
+// against the INCOMING config (Codex PR #1843 HIGH-1). The full apply
+// caches the overlay before reconcileIPMon installs the new policy
+// set, so entries whose policy was removed or whose preferred-route
+// spec was edited must be dropped here — otherwise the commit would
+// republish the stale overlay to FRR and the snapshot until the
+// delayed actuator caught up. Unrelated commits (policy spec
+// unchanged) keep the active overlay intact (AGY r2-2).
+func (d *Daemon) commitOverlayForConfig(cfg *config.Config) []config.RouteOverlayEntry {
+	if cfg == nil {
+		return nil
+	}
+	return ipmon.FilterOverlayForConfig(d.ipmonActiveOverlay(), cfg.Services.IPMonitoring)
 }
 
 // assembleFRRConfig builds the complete frr.FullConfig for the given

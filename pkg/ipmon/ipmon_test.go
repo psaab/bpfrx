@@ -325,3 +325,61 @@ func TestApplyPreservesFailedStateAcrossCommit(t *testing.T) {
 		t.Fatalf("overlay = %+v after policy removal", got)
 	}
 }
+
+// TestFilterOverlayForConfig is the Codex PR #1843 HIGH-1 regression
+// test: a commit that removes a policy or edits its preferred-route
+// spec must not republish the stale overlay entries on the commit's
+// own publish; an unrelated commit preserves the overlay.
+func TestFilterOverlayForConfig(t *testing.T) {
+	e, _ := newTestEngine(nil)
+	e.Apply(testPolicyConfig(), passResults())
+	e.HandleTransition(transition("WAN", "wan-a", "fail", passResults()))
+	overlay := e.ActiveOverlay()
+	if len(overlay) != 2 {
+		t.Fatalf("setup: overlay = %+v", overlay)
+	}
+
+	// Unrelated commit: identical policy spec → preserved verbatim.
+	kept := FilterOverlayForConfig(overlay, testPolicyConfig())
+	if len(kept) != 2 {
+		t.Fatalf("unrelated commit dropped overlay entries: %+v", kept)
+	}
+
+	// Commit removes the policy → overlay entries absent.
+	if got := FilterOverlayForConfig(overlay, &config.IPMonitoringConfig{}); got != nil {
+		t.Fatalf("removed policy still riding the commit: %+v", got)
+	}
+	if got := FilterOverlayForConfig(overlay, nil); got != nil {
+		t.Fatalf("nil ip-monitoring config still riding the commit: %+v", got)
+	}
+
+	// Commit edits the master route's next-hop → the OLD hop is
+	// dropped; the untouched ISP-B entry survives.
+	edited := testPolicyConfig()
+	edited.Policies["wan-failover"].PreferredRoutes[0].NextHop = "172.16.80.99"
+	kept = FilterOverlayForConfig(overlay, edited)
+	if len(kept) != 1 || kept[0].RoutingInstance != "ISP-B" {
+		t.Fatalf("edited next-hop: kept = %+v, want only the ISP-B entry", kept)
+	}
+	for _, entry := range kept {
+		if entry.NextHop == "172.16.80.1" && entry.RoutingInstance == "" {
+			t.Fatalf("stale master next-hop survived the edit: %+v", kept)
+		}
+	}
+
+	// Commit edits the preferred-metric → spec changed → dropped.
+	edited = testPolicyConfig()
+	edited.Policies["wan-failover"].PreferredRoutes[0].PreferredMetric = 99
+	kept = FilterOverlayForConfig(overlay, edited)
+	if len(kept) != 1 || kept[0].RoutingInstance != "ISP-B" {
+		t.Fatalf("edited metric: kept = %+v, want only the ISP-B entry", kept)
+	}
+
+	// Non-canonical but equivalent prefix spelling still matches.
+	equiv := testPolicyConfig()
+	equiv.Policies["wan-failover"].PreferredRoutes[0].Destination = "0.0.0.0/0"
+	kept = FilterOverlayForConfig(overlay, equiv)
+	if len(kept) != 2 {
+		t.Fatalf("canonical-equivalent prefix dropped: %+v", kept)
+	}
+}
