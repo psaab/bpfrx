@@ -18,9 +18,11 @@ import (
 //     hard-rejects any tree value or annotation containing an ASCII
 //     control character, so a new operator edit fails loudly at commit
 //     time. This check deliberately does NOT live in SchemaValidate:
-//     SchemaValidate also runs on the lenient boot/peer-sync paths and
-//     a strict reject there would make a box with a bad persisted
-//     config fail to boot.
+//     the lenient boot/peer-sync paths need the value scrubbed IN
+//     PLACE, which the read-only schema walk cannot do. (Since #1319
+//     PR 2, SchemaValidate violations are themselves downgraded to a
+//     warning on those tolerant paths — configstore.compileTreeLenient
+//     — so a bad persisted typed leaf cannot fail boot either.)
 //
 //   - The LENIENT compile path (CompileConfigLenient /
 //     CompileConfigForNodeLenient — Store.Load, Store.SyncApply, and

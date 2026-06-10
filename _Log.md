@@ -4787,6 +4787,17 @@ top.
   **Action**: "#1805 commit 2 — api bounded request-path exec: new exec_timeout.go (runTimeout only — sole raw sites are power actions; Output variants live in grpcapi sibling), converted system.go reboot/halt to runTimeout(context.Background()), WaitDelay=5s U3-parity on ping/traceroute handlers, tests, README gotcha"
   **File(s)**: pkg/api/exec_timeout.go, pkg/api/exec_timeout_test.go, pkg/api/system.go, pkg/api/README.md
 
+- **Timestamp**: 2026-06-10
+  **Action**: "#1319 PR 2 commit 1 — boot safety: downgrade the typed-leaf SchemaValidate gate to slog.Warn on the tolerant Load/SyncApply paths (compileTreeLenient); strict commit/commit-check unchanged. Verified empirically PR 1 wired the gate strict on lenient load (stored `transmit-rate asd` failed boot). Updated the stale SchemaValidate rationale comments + lenient tests"
+  **File(s)**: pkg/configstore/store.go, pkg/configstore/typed_leaf_lenient_test.go, pkg/config/compiler.go, pkg/config/freetext.go
+
+- **Timestamp**: 2026-06-10
+  **Action**: "#1319 PR 2 commit 2 — typed the 13 chassis-cluster leaves in setSchema (cluster-id 0..255 MAC-byte, node 0..1, reth-count 1..128, heartbeat-interval 10..10000ms xpf-divergent, heartbeat-threshold 1..255 xpf-divergent, reth-advertise-interval 10..40950ms VRRPv3-12-bit-derived, takeover-hold-time 0..3600000ms, peer-fencing enum{disable-rg}, RG node priority 1..254 VRRP-uint8, gratuitous-arp-count 1..16, ip-monitoring global-weight/global-threshold/target-weight 0..255); fields-only, all ranges source-cited inline. Per-leaf validation matrix + hierarchical + deployed-shape + packed-one-liner-bypass pin + compile-as-written tests; CLI+gRPC completion boundary tests; chassis lenient-boot + strict-commit e2e tests"
+  **File(s)**: pkg/config/schema.go, pkg/config/schema_validate_chassis_test.go, pkg/configstore/typed_leaf_lenient_test.go, pkg/cli/completion_typed_leaf_test.go, pkg/grpcapi/completion_typed_leaf_test.go
+
+- **Timestamp**: 2026-06-10
+  **Action**: "#1319 PR 2 commit 3 — docs: config-schema.md (strict-vs-tolerant gate semantics, runtime-first range policy, PR-2 rollout status incl. not-typed deviations + packed-one-liner residual), pkg/config README SchemaValidate lenient note"
+  **File(s)**: docs/config-schema.md, pkg/config/README.md, _Log.md
 - **Timestamp**: 2026-06-10 09:55
   **Action**: #1778 commit 1 — Kea manager authoritative systemd reconcile +
   fail-closed Apply; replaced process-local running4/running6 booleans with
@@ -4891,3 +4902,7 @@ top.
 - **Timestamp**: 2026-06-10
   **Action**: "#1831 commit 2 — apply-cos-config.sh opt-in equal-flow injector: COS_EQUAL_FLOW=1 env var appends `set class-of-service schedulers <name> equal-flow-enforcement` (knob spelling per schema.go:880 / compiler_equal_flow_worker_cap_test.go) for every transmit-rate-exact scheduler in the selected fixture, mirroring the --surplus-sharing awk injector; fail-fast exit 2 on COS_EQUAL_FLOW=1 + --surplus-sharing (compiler rejects both knobs on one scheduler, compiler.go:573); default behavior unchanged; usage header + cos-validation-notes.md injector paragraph"
   **File(s)**: test/incus/apply-cos-config.sh, docs/cos-validation-notes.md
+
+- **Timestamp**: 2026-06-10
+  **Action**: "#1319 PR 2 review fold-in (Codex MERGE-NEEDS on PR #1845) — HIGH-1: removed all schema-only caps per runtime-truth doctrine (heartbeat-interval 10..10000 → 1..MaxDurationMillis; heartbeat-threshold 1..255 → min-only ≥1; takeover-hold-time ≤3600000 → 0..MaxDurationMillis; gratuitous-arp-count ≤16 → min-only ≥1); new ValidateIntegerMin + MaxDurationMillis (Duration-conversion overflow ceiling) in schema_validators.go. HIGH-2: reth-advertise-interval max 40950 → 40959 (40951..40959 still encode to 4095 cs; 40960 is the first 12-bit alias). LOW: completion tests now assert placeholder description CONTENT (range text) via candDesc/pairDesc helpers, not just names. Matrix boundaries updated; lenient-load probe switched heartbeat-interval 99999 (now valid) → cluster-id 999; TestValidateIntegerMin added; docs range-policy bullet gains the no-schema-only-caps rule"
+  **File(s)**: pkg/config/schema.go, pkg/config/schema_validators.go, pkg/config/schema_validate_chassis_test.go, pkg/configstore/typed_leaf_lenient_test.go, pkg/cli/completion_typed_leaf_test.go, pkg/grpcapi/completion_typed_leaf_test.go, docs/config-schema.md, _Log.md
