@@ -252,8 +252,15 @@ operator-discoverable choice. Presence-enables with defaults
   both-sides grep per standing rule).
 - `forwarding_build/cos.rs`: the synthetic default queue takes
   `codel_target_ns` (and interval) from the unit instead of the hardcoded 0
-  at `cos.rs:406-410`. **That is the entire engine-side delta** — everything
-  downstream is #1829 Phase 2's machinery, untouched.
+  at `cos.rs:406-410`.
+- **Honest engine-delta accounting for `codel-interval`:** target is pure
+  plumbing into an existing field, but the interval today is spec'd in
+  #1829 §6.2b as a hardcoded 100 ms const passed to
+  `cos_codel_check(target_ns, interval_ns, ...)` ("Phase 3 knob if
+  needed"). Deliverable 2 therefore adds a per-queue
+  `codel_interval_ns` runtime config field (defaulting to the const) and
+  threads it into that existing parameter — a small but real runtime-struct
+  + wire delta beyond pure transport. The control law itself is untouched.
 - No named objects are synthesized; `show configuration` shows exactly what
   the operator typed; rollback/diff/inheritance semantics are untouched.
 
@@ -328,8 +335,11 @@ showed.
 
 - **Deliverable 1:** doc builds/links; the one validation smoke run on the
   loss userspace cluster (§6, one smoke-runner slot, serialized per standing
-  rule): shape held, fairness CoV in band, ECN counters, clean restore after
-  delete. Run artifacts referenced from the cookbook.
+  rule): shape held, fairness CoV in band, ECN counters, **MQFQ lazy
+  promotion pinned explicitly** (per-queue active-flow/bucket telemetry,
+  e.g. `xpf_userspace_cos_active_flow_count` > 1 on the synthetic queue
+  during `-P 12` — Q5), clean restore after delete. Run artifacts
+  referenced from the cookbook.
 - **Deliverable 2 (at its PR):** Go config tests — hierarchical + flat-set
   compile parity, FormatSet round-trip, all three commit-check errors,
   defaults (presence-only → 5 ms/100 ms); wire fixture regen + key-absent
