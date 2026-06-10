@@ -1,8 +1,9 @@
 # #1782 v2 — Residual cold-start stall: re-research against current master
 
-**Status:** DRAFT v2 — folds r1 (Codex PLAN-NEEDS-MAJOR ×5 — all
-verified and folded; AGY PLAN-PROCEED-minor ×4 — F2/F4 strengthen
-mechanism (i) and answer Q3; Claude SMR folded pre-r1). Re-verification
+**Status:** CONVERGED v2.1 — r1: Codex PLAN-NEEDS-MAJOR ×5 + AGY
+PLAN-PROCEED-minor ×4 + Claude SMR (all folded). r2 on v2
+(`1e0df851c`): Codex **PLAN-NEEDS-MINOR** (2 tightening notes, folded
+below), AGY **PLAN-READY** (2 advisory notes, folded below). Re-verification
 of the prior converged plan
 (`7c8e9d015`, branch `research/1782-cold-start-stall-residual`) against
 current master (`d30cfab84`) plus a 10-reproduction live induction
@@ -315,13 +316,24 @@ vs §4(ii)):**
   a per-call `now_tick - current_tick` max/sum (2 atomics). A cold
   rep showing a single multi-million-tick advance proves (i)
   conclusively, and its wall cost is directly computable.
-- (ii)-counters (per Codex F2: measure `grant < head_len`, not just
-  `grant == 0`): per-cause under-grant counters in `acquire_v8`
-  (seqlock-give-up `:1207-1209`, `cap==0` `:1210-1212`,
-  share-exhausted `:1256-1258`, class-cap `:1264-1266`,
-  outstanding-cap `:1289-1297`), the per-worker
-  `active_flow_buckets` value at acquire time, the root-lease
-  analogues, and a queued→first-sent dwell histogram per queue.
+- (ii)-counters (per Codex r1 F2: measure `grant < head_len`, not
+  just `grant == 0`): per-cause under-grant attribution from
+  `acquire_v8` (seqlock-give-up `:1207-1209`, `cap==0`
+  `:1210-1212`, share-exhausted `:1256-1258`, class-cap
+  `:1264-1266`, outstanding-cap `:1289-1297`), the per-worker
+  `active_flow_buckets` at acquire time, the root-lease analogues,
+  and a queued→first-sent dwell histogram per queue. Plumbing note
+  (Codex r2 F1): `acquire_v8` receives only `requested`, not
+  `head_len` (`shared_cos_lease/mod.rs:1180-1185`) — return/plumb a
+  cause enum from `acquire_v8` and do the `post-top-up
+  queue.hot.tokens < head_len` comparison at the selector sites
+  (`queue_service/mod.rs:632-643`, `:936-947`), or pass the
+  threshold down explicitly.
+- Wire-contract note (AGY r2 F2): `DRAIN_HIST_BUCKETS = 16` is a
+  const-asserted wire contract (`umem/mod.rs:174`); prefer NEW
+  Step-1 counters/histograms over reshaping the existing
+  drain-latency bucket layout (which would ripple through
+  protocol.rs + Prometheus labels + dashboards).
 - Raise the `drain_latency`/kick histogram top bucket past 33.5 ms
   so the stall stops clipping (§5.3).
 One cold rep with these live names the mechanism.
@@ -342,13 +354,26 @@ One cold rep with these live names the mechanism.
   new tick. Behavior-identical in-horizon; removes the O(idle)
   wall.
 - If (ii): the draft "re-initialize the queue's lease/bank state"
-  is UNSAFE as written (Codex F4): the lease is a SHARED Arc across
-  workers (`worker/cos/mod.rs:~198`) whose v8 per-worker state is
-  rehydrated additively (`types/shared_cos_lease/mod.rs:~1439`); a
-  local idle detector must not blindly reset shared state without
-  proving all peer workers idle. If Step 1 lands on (ii), the fix
-  design needs its own review round scoped to per-queue-local state
+  is UNSAFE as written (Codex r1 F4): the lease is a SHARED Arc
+  across workers (`worker/cos/mod.rs:~198`) whose v8 per-worker
+  state is rehydrated additively
+  (`types/shared_cos_lease/mod.rs:~1439`); a local idle detector
+  must not blindly reset shared state without proving all peer
+  workers idle. If Step 1 lands on (ii), the fix design needs its
+  own review round scoped to per-queue-local state
   (`queue.hot.tokens` bank) or an all-peers-idle proof.
+- Completeness guard (Codex r2 F2): mechanism (ii) cannot explain
+  the BE-queue stalls (§4 BE note), so even if Step 1 confirms (ii)
+  for exact queues, an (ii)-only fix is NOT a complete #1782 fix
+  unless Step 1 also shows BE flows no longer stall — the wheel
+  path stays in scope until the BE reproduction is accounted for.
+- Boundedness note (AGY r2 F1): Step-2(i) option (a)'s
+  all-unparked check falls back to the O(lag) loop when some queue
+  IS parked — that fallback is naturally bounded because a parked
+  queue implies recent activity on this worker (its wake tick was
+  set within the wheel horizon of the then-current tick), so the
+  pathological multi-minute lag and a populated wheel cannot
+  coexist.
 Either way the change is cold-path-only and must re-run the
 #1628/#1630 fairness gates + the per-class CoS smoke (deploy wipes
 CoS — re-apply first) to prove steady-state shaping is untouched.
