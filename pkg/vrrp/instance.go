@@ -55,6 +55,7 @@ type vrrpInstance struct {
 	cfg              Instance
 	desiredPreempt   bool // configured preempt value (may differ from cfg.Preempt during sync hold)
 	forcePreemptOnce bool // one-shot preempt override from ForceRGMaster (auto-cleared after use)
+	trackDown        bool // tracked interface (cfg.TrackInterface) is down (#1814); guarded by mu
 	state            VRRPState
 	iface            *net.Interface
 	eventCh          chan<- VRRPEvent
@@ -194,11 +195,14 @@ func (vi *vrrpInstance) key() string {
 	return fmt.Sprintf("VI_%s_%d", vi.cfg.Interface, vi.cfg.GroupID)
 }
 
-// updateConfig updates priority and preempt in-place without restarting.
+// updateConfig updates priority, preempt, and interface-tracking config
+// in-place without restarting.
 func (vi *vrrpInstance) updateConfig(cfg Instance) {
 	vi.mu.Lock()
 	vi.cfg.Priority = cfg.Priority
 	vi.cfg.Preempt = cfg.Preempt
+	vi.cfg.TrackInterface = cfg.TrackInterface
+	vi.cfg.TrackPriorityCost = cfg.TrackPriorityCost
 	vi.desiredPreempt = cfg.Preempt
 	vi.mu.Unlock()
 }
@@ -245,10 +249,67 @@ func (vi *vrrpInstance) triggerResign() {
 	}
 }
 
+// getPriority returns the effective advertised priority (#1814).
+//   - cfg.Priority 0 is the resignation sentinel (ResignRG / shutdown
+//     burst) and passes through UNCHANGED — the tracking clamp must
+//     never apply to it.
+//   - cfg.Priority 255 is the IP address owner: tracking is ignored
+//     (an owner stepping down while still holding the address invites
+//     duplicate-IP conflicts; the compiler warns at commit).
+//   - Otherwise, while the tracked interface is down, TrackPriorityCost
+//     is subtracted and the result clamped to [1, 254] so tracking can
+//     never fabricate the priority-0 resignation sentinel.
+//
+// The no-track path returns cfg.Priority unchanged. Called from the
+// advert path and masterDownInterval computation — keep it lock-cheap.
 func (vi *vrrpInstance) getPriority() int {
 	vi.mu.RLock()
 	defer vi.mu.RUnlock()
-	return vi.cfg.Priority
+	p := vi.cfg.Priority
+	if p == 0 || p == 255 {
+		return p
+	}
+	if vi.trackDown && vi.cfg.TrackInterface != "" {
+		p -= vi.cfg.TrackPriorityCost
+		if p < 1 {
+			p = 1
+		} else if p > 254 {
+			p = 254
+		}
+	}
+	return p
+}
+
+// setTrackDown records the tracked interface's link state. Logs only on
+// transition — never per-event.
+//
+// The state machine needs no kick. A MASTER keeps advertising at the
+// new (lower) effective priority via getPriority(); a preempt-enabled
+// backup hearing that LOWER advert IGNORES it and lets its masterDown
+// timer expire (handleBackupRx tail — instance.go:737 at plan time:
+// "If preempt is true and incoming priority < ours, ignore — let timer
+// expire"). So takeover after a tracked-link demotion lands in
+// ~masterDownInterval (3×advert+skew: ≈97ms at 30ms adverts, ≈3.3s at
+// 1s adverts) — RFC 5798 behavior, no forced abdication.
+func (vi *vrrpInstance) setTrackDown(down bool) {
+	vi.mu.Lock()
+	changed := vi.trackDown != down
+	vi.trackDown = down
+	trackIface := vi.cfg.TrackInterface
+	vi.mu.Unlock()
+	if changed && trackIface != "" {
+		slog.Info("vrrp: tracked interface state change",
+			"key", vi.key(), "track_interface", trackIface,
+			"down", down, "effective_priority", vi.getPriority())
+	}
+}
+
+// trackedInterface returns the tracked Linux interface name, or "" when
+// tracking is not configured.
+func (vi *vrrpInstance) trackedInterface() string {
+	vi.mu.RLock()
+	defer vi.mu.RUnlock()
+	return vi.cfg.TrackInterface
 }
 
 func (vi *vrrpInstance) getPreempt() bool {

@@ -72,6 +72,18 @@ type compileOpts struct {
 	// live in SchemaValidate, which also runs on the lenient paths.
 	// See freetext.go for the full three-layer design.
 	sanitizeFreeTextControlChars bool
+
+	// lenientVRRPTrackDuplicates (#1814) downgrades the duplicate
+	// `track-interface` gate (more than one track-interface statement
+	// inside a single vrrp-group) from a hard compile error to a
+	// cfg.Warnings entry with deterministic first-wins pruning of the
+	// extras. Set ONLY on the tolerant load / peer-sync paths
+	// (CompileConfigLenient / CompileConfigForNodeLenient) so an
+	// already-persisted or peer-synced config still boots; candidate
+	// commit / commit-check stay strict and hard-reject new operator
+	// edits. Like the other lenient gates, this check deliberately does
+	// NOT live in SchemaValidate (which runs on the lenient paths too).
+	lenientVRRPTrackDuplicates bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -94,6 +106,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 	return compileConfigWithOpts(tree, compileOpts{
 		lenientEqualFlowWorkerCap:    true,
 		sanitizeFreeTextControlChars: true,
+		lenientVRRPTrackDuplicates:   true,
 	})
 }
 
@@ -146,6 +159,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 	return compileConfigForNodeWithOpts(tree, nodeID, compileOpts{
 		lenientEqualFlowWorkerCap:    true,
 		sanitizeFreeTextControlChars: true,
+		lenientVRRPTrackDuplicates:   true,
 	})
 }
 
@@ -179,6 +193,20 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 
+	// #1814 VRRP track-interface AST pre-walk. Runs on the group-expanded
+	// tree (so apply-groups-inherited statements are covered) and BEFORE
+	// section compilation so the lenient path's first-wins pruning is
+	// what the compiler actually sees. Strict (commit / commit-check):
+	// duplicate track-interface inside one vrrp-group hard-rejects.
+	// Lenient (load / peer-sync): prune to the first + warn. Shape-only
+	// warnings (nested+sibling both present, orphan priority-cost) come
+	// from here too — the typed config cannot distinguish them
+	// post-compile.
+	trackWarnings, err := validateVRRPTrackInterfaceAST(tree.Children, "", opts.lenientVRRPTrackDuplicates)
+	if err != nil {
+		return nil, err
+	}
+
 	cfg := &Config{
 		Security: SecurityConfig{
 			Zones:  make(map[string]*ZoneConfig),
@@ -201,6 +229,7 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		},
 	}
 	cfg.Warnings = append(cfg.Warnings, ctrlCharWarnings...)
+	cfg.Warnings = append(cfg.Warnings, trackWarnings...)
 
 	for _, node := range tree.Children {
 		switch node.Name() {
@@ -404,6 +433,13 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 			cfg.Warnings = append(cfg.Warnings, w)
 		}
 	}
+
+	// #1814 typed-config track warnings (both strict and lenient paths):
+	// track-interface without any priority-cost (no effect),
+	// track-priority-cost without track-interface (no effect), and
+	// tracking on an address-owner group (priority 255) where the
+	// runtime ignores tracking.
+	cfg.Warnings = append(cfg.Warnings, vrrpTrackConfigWarnings(cfg)...)
 
 	// #1539: the structural invariant `cfg.System.DPDKDataplane = nil`
 	// was added on master (PR #1553) as a runtime safeguard against

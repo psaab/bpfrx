@@ -160,6 +160,30 @@ var dualASTCases = []dualASTCase{
 		expectedFail: false,
 	},
 	{
+		// Nested Junos `track-interface <if> { priority-cost <n>; }`
+		// block (#1814) — the standard Junos shape; priority-cost must
+		// compile identically from both AST shapes.
+		name: "interfaces-vrrp-group-track-interface-nested",
+		hier: `interfaces {
+    reth1 {
+        unit 0 {
+            family inet {
+                address 10.0.61.1/24 {
+                    vrrp-group 1 {
+                        virtual-address 10.0.61.3;
+                        priority 200;
+                        track-interface ge-0/0/1 {
+                            priority-cost 20;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}`,
+		expectedFail: false,
+	},
+	{
 		name: "security-zones-address-book",
 		hier: `security {
     zones {

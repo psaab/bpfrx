@@ -44,7 +44,12 @@ func CollectInstances(cfg *config.Config) []*Instance {
 					VirtualAddresses:  vg.VirtualAddresses,
 					AuthType:          vg.AuthType,
 					AuthKey:           vg.AuthKey,
-					TrackInterface:    vg.TrackInterface,
+					// TrackInterface arrives as a Junos name
+					// (ge-0/0/1); normalize to the Linux name
+					// (ge-0-0-1) so netlink lookups and link-watcher
+					// event matching work (#1814 — the RETH path
+					// below normalizes the same way).
+					TrackInterface:    config.LinuxIfName(vg.TrackInterface),
 					TrackPriorityCost: vg.TrackPriorityDelta,
 				}
 				if inst.AdvertiseInterval == 0 {

@@ -4705,6 +4705,31 @@ top.
   metrics_persist_degraded_test.go (new), README.md}, pkg/daemon/daemon_run.go
 
 - **Timestamp**: 2026-06-10
+  **Action**: #1814 — parse nested vrrp-group `track-interface <if> {
+  priority-cost <n>; }` (schema child + compiler child walk reading
+  Keys[1] + nested-wins-over-legacy-sibling order-independent apply),
+  strict duplicate-track-interface reject / lenient first-wins+warning
+  via new compileOpts.lenientVRRPTrackDuplicates (set only in
+  CompileConfigLenient/CompileConfigForNodeLenient), AST pre-walk +
+  typed-config warnings (missing cost, orphan cost, owner-255), tests +
+  dual-AST differential fixture.
+  **File(s)**: pkg/config/{schema.go, compiler.go, compiler_interfaces.go,
+  vrrp_track_test.go (new), dual_ast_differential_test.go}
+
+- **Timestamp**: 2026-06-10
+  **Action**: #1814 — make VRRP interface tracking actually work:
+  vrrpInstance.trackDown under vi.mu, getPriority() effective priority
+  (priority-0 resignation passthrough, owner-255 exemption, subtract
+  TrackPriorityCost clamped [1,254] when tracked link down),
+  setTrackDown transition-only logging + takeover-latency note,
+  singleton Manager link watcher (netlink.LinkSubscribe, done-channel
+  cancel from Stop(), 1s poll fallback, per-event re-read of tracked
+  mapping, LinkByName seeding), UpdateInstances compares + in-place
+  updates track fields, CollectInstances normalizes TrackInterface via
+  config.LinuxIfName. Unit tests via injectable linkState/subscribeLinks
+  seams (no real netlink).
+  **File(s)**: pkg/vrrp/{vrrp.go, instance.go, manager.go,
+  track_test.go (new), README.md}, CLAUDE.md
   **Action**: #1787 Stage 1 — cheap-first RX learn: stack key array + `pair_write_needed` pure helper + per-key get() pre-check before the #949 bulk insert; linearization + dedup-window semantics documented at the call site; `learn_precheck_tests` unit matrix appended
   **File(s)**: userspace-dp/src/afxdp/neighbor_dispatch.rs
 - **Timestamp**: 2026-06-10

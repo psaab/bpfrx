@@ -430,7 +430,9 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 							"advertise-interval":  {desc: "Advertisement interval", args: 1, placeholder: "<seconds>", children: nil},
 							"authentication-type": {desc: "Authentication type", args: 1, placeholder: "<type>", children: nil},
 							"authentication-key":  {desc: "Authentication key", args: 1, placeholder: "<key>", children: nil},
-							"track-interface":     {desc: "Interface to track", args: 1, placeholder: "<interface>", children: nil},
+							"track-interface": {desc: "Interface to track", args: 1, placeholder: "<interface>", children: map[string]*schemaNode{
+								"priority-cost": {desc: "Priority cost subtracted while the tracked interface is down", args: 1, placeholder: "<1..254>", children: nil},
+							}},
 							"track-priority-cost": {desc: "Priority cost when tracked interface fails", args: 1, placeholder: "<cost>", children: nil},
 						}},
 					}},
