@@ -110,10 +110,9 @@ var dualASTCases = []dualASTCase{
         }
     }
 }`,
-		expectedFail: true,
-		failureClass: "compiler dual-AST",
-		reason: "#1796: compileVRRPGroup reads only node.Children; flat-set " +
-			"encodes each property in Keys, so virtual-address/priority/... are dropped",
+		// Fixed in U5b (#1796): vrrp-group subtree added to setSchema and
+		// the compiler now reads properties from both Children and Keys[2:].
+		expectedFail: false,
 	},
 	{
 		name: "security-zones-address-book",

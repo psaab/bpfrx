@@ -422,6 +422,17 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					"address": {desc: "IPv4 address", args: 1, placeholder: "<address>", children: map[string]*schemaNode{
 						"primary":   {desc: "Primary address", children: nil},
 						"preferred": {desc: "Preferred address", children: nil},
+						"vrrp-group": {desc: "VRRP group", args: 1, placeholder: "<group-id>", children: map[string]*schemaNode{
+							"virtual-address":     {desc: "Virtual IP address", args: 1, multi: true, placeholder: "<address>", children: nil},
+							"priority":            {desc: "VRRP priority", args: 1, placeholder: "<1..255>", children: nil},
+							"preempt":             {desc: "Allow preemption", children: nil},
+							"accept-data":         {desc: "Accept packets sent to the virtual address", children: nil},
+							"advertise-interval":  {desc: "Advertisement interval", args: 1, placeholder: "<seconds>", children: nil},
+							"authentication-type": {desc: "Authentication type", args: 1, placeholder: "<type>", children: nil},
+							"authentication-key":  {desc: "Authentication key", args: 1, placeholder: "<key>", children: nil},
+							"track-interface":     {desc: "Interface to track", args: 1, placeholder: "<interface>", children: nil},
+							"track-priority-cost": {desc: "Priority cost when tracked interface fails", args: 1, placeholder: "<cost>", children: nil},
+						}},
 					}},
 					"dhcp": {desc: "DHCP client", children: map[string]*schemaNode{
 						"lease-time":              {desc: "Lease time", args: 1, placeholder: "<seconds>", children: nil},
