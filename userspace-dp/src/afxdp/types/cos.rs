@@ -1105,8 +1105,9 @@ pub(in crate::afxdp) struct CoSQueueTelemetry {
     // here both are owner-side so no separate pad is needed.
     pub(in crate::afxdp) owner_profile: CoSQueueOwnerProfile,
     // #1829 Phase 1: per-queue dequeue-time sojourn telemetry. Plain
-    // u64 fields, single-writer (owner worker, at the fused #1763
-    // peek+pop commit sites), read by `build_worker_cos_statuses` ON
+    // u64 fields, single-writer (owner worker, at the committed-prefix
+    // TX settle sites — see `CoSQueueSojourn::record` for why NOT at
+    // pop time), read by `build_worker_cos_statuses` ON
     // THE SAME WORKER THREAD before publishing via ArcSwap — same
     // no-atomics reasoning as `waterfill_counters` above.
     pub(in crate::afxdp) sojourn: CoSQueueSojourn,
@@ -1170,9 +1171,15 @@ impl Default for CoSQueueSojourn {
 }
 
 impl CoSQueueSojourn {
-    /// Record one dequeue-commit sojourn sample. Called at the fused
-    /// #1763 peek+pop commit sites with the popped item's
-    /// `enqueue_ns` and the drain pass's `now_ns`.
+    /// Record one sojourn sample for a packet whose TX insert has
+    /// been settled as COMMITTED. Called at the accepted-prefix
+    /// settle sites (exact flow-fair settle fns; submit_local /
+    /// submit_prepared enq sidecars) with the item's `enqueue_ns`
+    /// and the drain pass's `now_ns` — NEVER at pop/scratch-build
+    /// time, because partial/zero TX inserts push the retry suffix
+    /// back with its original stamp and pop-time sampling would
+    /// count a rolled-back item once per attempt (Codex review on
+    /// PR #1846).
     ///
     /// `enqueue_ns == 0` means "never CoS-stamped" (direct-TX
     /// constructions, pre-upgrade items) and is skipped entirely —

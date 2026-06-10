@@ -561,7 +561,6 @@ pub(in crate::afxdp) fn select_cos_guarantee_batch_with_fast_path(
             root.tokens,
             guarantee_budget,
             CoSServicePhase::Guarantee,
-            now_ns,
         ) {
             return Some(batch);
         }
@@ -1278,7 +1277,6 @@ pub(in crate::afxdp) fn select_nonexact_cos_guarantee_batch(
             root.tokens,
             guarantee_budget,
             CoSServicePhase::Guarantee,
-            now_ns,
         ) {
             return Some(batch);
         }
@@ -1375,7 +1373,6 @@ fn select_cos_surplus_batch_filtered(
                 root.tokens,
                 secondary_budget,
                 CoSServicePhase::Surplus,
-                now_ns,
             ) {
                 return Some(batch);
             }
@@ -1495,6 +1492,16 @@ pub(in crate::afxdp) fn settle_exact_local_scratch_submission_flow_fair(
                 let bucket = cos_flow_bucket_index(flow_hash_seed, req.flow_key.as_ref()) as u16;
                 account_flow_bucket_tx(ff, bucket, bytes, now_ns);
             }
+            // #1829 Phase 1 (Codex review on PR #1846): sojourn is
+            // sampled HERE, at the committed-prefix settle — never at
+            // pop/scratch-build time. The rollback branch above
+            // push_fronts the suffix WITH its original enqueue_ns, so
+            // sampling at pop would count a rolled-back item once per
+            // attempt; sampling only the committed prefix counts each
+            // packet exactly once, on the attempt that ships it. Same
+            // pass-level now_ns the bucket accounting uses (no clock
+            // reads, #1734).
+            queue.telemetry.sojourn.record(req.enqueue_ns, now_ns);
             sent_packets += 1;
             sent_bytes += bytes;
         }
@@ -1562,6 +1569,9 @@ fn settle_exact_prepared_scratch_submission_flow_fair(
                 let bucket = cos_flow_bucket_index(flow_hash_seed, req.flow_key.as_ref()) as u16;
                 account_flow_bucket_tx(ff, bucket, bytes, now_ns);
             }
+            // #1829 Phase 1 (Codex review on PR #1846): committed-
+            // prefix-only sojourn sample — see the Local settle above.
+            queue.telemetry.sojourn.record(req.enqueue_ns, now_ns);
             remember_prepared_recycle(in_flight_prepared_recycles, &req);
             sent_packets += 1;
             sent_bytes += bytes;
@@ -1596,7 +1606,6 @@ fn build_cos_batch_from_queue(
     root_budget: u64,
     secondary_budget: u64,
     phase: CoSServicePhase,
-    now_ns: u64,
 ) -> Option<CoSBatch> {
     let head = cos_queue_front(queue)?;
     match head {
@@ -1625,12 +1634,6 @@ fn build_cos_batch_from_queue(
                 remaining_secondary = remaining_secondary.saturating_sub(len);
                 match cos_queue_pop_known_bucket(queue, bucket, u64::MAX) {
                     Some(CoSPendingTxItem::Local(req)) => {
-                        // #1829 Phase 1: sojourn sample at the dequeue
-                        // commit (pass now_ns; enqueue_ns==0 is skipped
-                        // inside record()). State write AFTER the pop,
-                        // so the #1763 peek-to-pop window stays
-                        // read-only.
-                        queue.telemetry.sojourn.record(req.enqueue_ns, now_ns);
                         batch_bytes = batch_bytes.saturating_add(len);
                         items.push_back(req);
                     }
@@ -1674,9 +1677,6 @@ fn build_cos_batch_from_queue(
                 remaining_secondary = remaining_secondary.saturating_sub(len);
                 match cos_queue_pop_known_bucket(queue, bucket, u64::MAX) {
                     Some(CoSPendingTxItem::Prepared(req)) => {
-                        // #1829 Phase 1: sojourn sample at the dequeue
-                        // commit (see the Local arm above).
-                        queue.telemetry.sojourn.record(req.enqueue_ns, now_ns);
                         batch_bytes = batch_bytes.saturating_add(len);
                         items.push_back(req);
                     }

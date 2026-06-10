@@ -1206,7 +1206,6 @@ fn bench_pop_commit_settle_publish() {
             u64::MAX,
             u64::MAX,
             None,
-            0,
         );
         let inserted = scratch.len();
         settle_exact_local_scratch_submission_flow_fair(
@@ -1236,7 +1235,6 @@ fn bench_pop_commit_settle_publish() {
             u64::MAX,
             u64::MAX,
             None,
-            0,
         );
         let inserted = scratch.len();
         settle_exact_local_scratch_submission_flow_fair(

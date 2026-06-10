@@ -231,7 +231,6 @@ fn service_exact_local_queue_direct_flow_fair(
             root_budget,
             secondary_budget,
             queue_dscp_rewrite,
-            now_ns,
         )
     };
     match build {
@@ -582,7 +581,6 @@ fn service_exact_prepared_queue_direct_flow_fair(
             root_budget,
             secondary_budget,
             queue_dscp_rewrite,
-            now_ns,
         )
     };
     match build {

@@ -356,8 +356,11 @@ pub(crate) struct CoSQueueStatus {
     pub waterfill_phase2_admissions: u64,
     #[serde(rename = "waterfill_eligible_visits", default)]
     pub waterfill_eligible_visits: u64,
-    // #1829 Phase 1: dequeue-time sojourn telemetry, sampled at the
-    // fused #1763 pop-commit points from `now_ns - item.enqueue_ns`.
+    // #1829 Phase 1: dequeue-time sojourn telemetry, sampled as
+    // `now_ns - item.enqueue_ns` at the COMMITTED-PREFIX settle points
+    // (after the TX insert accepts the item — Codex review on PR
+    // #1846: rolled-back retry items keep their original stamp and
+    // are sampled only on the attempt that ships them).
     // JSON tags MUST match the Go mirror
     // (pkg/dataplane/userspace/protocol.go) byte-for-byte.
     //

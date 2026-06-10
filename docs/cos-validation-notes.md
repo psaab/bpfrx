@@ -357,8 +357,10 @@ without reading them is how we ship dormant code.
 
 Every shaped queue now measures per-packet **sojourn** — the time an
 item spends in the CoS queue, `now_ns - enqueue_ns`, stamped at the
-admission choke point (`enqueue_cos_item`) and sampled at the fused
-#1763 pop-commit points. This is the measurement-first half of the
+admission choke point (`enqueue_cos_item`) and sampled at the
+committed-prefix TX settle points — a packet is sampled exactly once,
+on the attempt that actually ships it; partial/zero TX-insert
+rollbacks are never sampled. This is the measurement-first half of the
 FQ-CoDel plan: Phase 2 (the CoDel control law on `codel-target`) is
 **gated on this telemetry's live evidence** and does not exist yet —
 setting `codel-target` today still changes nothing.
