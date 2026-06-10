@@ -11,6 +11,11 @@
 
 use super::*;
 
+// #1776: the one-shot setup phase (thread pin, TSC calibration,
+// initial ArcSwap load_fulls, binding construction, BPF-map-FD
+// cache, initial cos_status publish) lives in loop_body/setup.rs.
+mod setup;
+
 pub(crate) fn worker_loop(
     worker_id: u32,
     binding_plans: Vec<BindingPlan>,
@@ -57,128 +62,47 @@ pub(crate) fn worker_loop(
     cold_path_atomics:
         Arc<crate::afxdp::cold_path_hist::WorkerColdPathAtomics>,
 ) {
-    pin_current_thread(worker_id);
-    // #1620: per-worker cold-path TSC calibration. Runs ONCE at
-    // worker_loop entry, AFTER pin_current_thread has pinned the
-    // worker to its core (so the Instant↔TSC ratio reflects this
-    // core's clock). The probe + calibrate together take ~10 ms
-    // (one-shot 10 ms sleep window + ~80 µs of back-to-back rdtscp
-    // pairs); workers calibrate concurrently across cores so the
-    // wall-clock startup overhead stays at ~10 ms total.
-    //
-    // Per plan v4 §4.6: probe_clock_source runs once; calibration is
-    // skipped (returning 0) when the clock source is not TSC, avoiding
-    // redundant /proc/cpuinfo + /sys probes inside the calibrators.
-    let cp_clock_source =
-        crate::afxdp::cold_path_hist::probe_clock_source();
-    let (cp_ns_per_tsc_q32, cp_wrapper_baseline) =
-        if cp_clock_source == crate::afxdp::cold_path_hist::ClockSource::Tsc {
-            let q32 =
-                crate::afxdp::cold_path_hist::calibrate_ns_per_tsc_q32();
-            let baseline =
-                crate::afxdp::cold_path_hist::calibrate_wrapper_baseline_ns(
-                    q32,
-                );
-            (q32, baseline)
-        } else {
-            (0, 0)
-        };
-    // Single-line startup log per worker (~6 lines total per daemon
-    // startup). Goes to journald via stderr per project logging rules.
-    eprintln!(
-        "xpf-cold-path: worker={} clock_source={} ns_per_tsc_q32={} wrapper_ns_baseline={}",
+    // #1776: one-shot setup moved verbatim to setup.rs. The returned
+    // WorkerLoopSetup is destructured into the same-named locals so
+    // the loop body below is textually unchanged.
+    let setup::WorkerLoopSetup {
+        ha_startup_grace_until_secs,
+        mut validation,
+        mut forwarding,
+        mut cos_owner_worker_by_queue,
+        mut cos_owner_live_by_queue,
+        mut cos_shared_root_leases,
+        mut cos_shared_exact_backlogs,
+        mut cos_shared_queue_leases,
+        mut cos_shared_queue_vtime_floors,
+        mut mirror_targets,
+        mut sessions,
+        mut screen_state,
+        mut bindings,
+        binding_lookup,
+        mut interrupt_poll_fds,
+        session_map_fd,
+        conntrack_v4_fd,
+        conntrack_v6_fd,
+        mut last_cos_status_ns,
+    } = setup::worker_loop_setup(
         worker_id,
-        cp_clock_source.as_str(),
-        cp_ns_per_tsc_q32,
-        cp_wrapper_baseline,
+        binding_plans,
+        &shared_validation,
+        &shared_forwarding,
+        &shared_cos_owner_worker_by_queue,
+        &shared_cos_owner_live_by_queue,
+        &shared_cos_root_leases,
+        &shared_cos_exact_backlogs,
+        &shared_cos_queue_leases,
+        &shared_cos_queue_vtime_floors,
+        &shared_mirror_targets,
+        poll_mode,
+        &cos_status,
+        &runtime_atomics,
+        &cold_path_atomics,
     );
     const COS_STATUS_INTERVAL_NS: u64 = 100_000_000;
-    let ha_startup_grace_until_secs =
-        (monotonic_nanos() / 1_000_000_000).saturating_add(TUNNEL_HA_STARTUP_GRACE_SECS);
-    let mut validation = **shared_validation.load();
-    let mut forwarding = shared_forwarding.load_full();
-    let mut cos_owner_worker_by_queue = shared_cos_owner_worker_by_queue.load_full();
-    let mut cos_owner_live_by_queue = shared_cos_owner_live_by_queue.load_full();
-    let mut cos_shared_root_leases = shared_cos_root_leases.load_full();
-    let mut cos_shared_exact_backlogs = shared_cos_exact_backlogs.load_full();
-    let mut cos_shared_queue_leases = shared_cos_queue_leases.load_full();
-    let mut cos_shared_queue_vtime_floors = shared_cos_queue_vtime_floors.load_full();
-    let mut mirror_targets = shared_mirror_targets.load_full();
-    let mut sessions = SessionTable::new();
-    let mut screen_state = ScreenState::new();
-    screen_state.update_profiles(forwarding.screen_profiles.clone());
-    screen_state.update_syn_cookie_master_key(forwarding.syn_cookie_master_key);
-    sessions.set_timeouts(forwarding.session_timeouts);
-    let mut bindings = Vec::with_capacity(binding_plans.len());
-    let (private_plans, shared_groups) = partition_binding_plans(binding_plans);
-    for plan in private_plans {
-        let live = plan.live.clone();
-        match create_private_binding_from_plan(plan) {
-            Ok(binding) => bindings.push(binding),
-            Err(err) => {
-                eprintln!("xpf-userspace-dp: private binding creation failed: {err}");
-                live.set_error(err.to_string());
-            }
-        }
-    }
-    for (group_key, plans) in shared_groups {
-        match create_shared_binding_group(&group_key, plans) {
-            Ok(mut group_bindings) => bindings.append(&mut group_bindings),
-            Err(err) => fallback_shared_group_to_private(err, &mut bindings),
-        }
-    }
-    bindings.sort_by_key(|binding| (binding.queue_id, binding.ifindex, binding.slot));
-    // #1620: install per-worker cold-path calibration into each
-    // binding's worker-local counters. The calibration values are
-    // shared across all bindings owned by this worker — they reflect
-    // the worker thread's pinned core, not the binding identity.
-    for binding in bindings.iter_mut() {
-        binding.cold_path.ns_per_tsc_q32 = cp_ns_per_tsc_q32;
-        binding.cold_path.wrapper_ns_baseline = cp_wrapper_baseline;
-        binding.cold_path.clock_source = cp_clock_source;
-    }
-    // #1621: install the same calibration into the sibling atomics
-    // so the first /metrics scrape sees q32 + clock_source even
-    // before the first publish-tick fires. install_calibration writes
-    // outside the cold_window_gen seqlock (calibration is set-once;
-    // readers always observe a consistent value).
-    cold_path_atomics.install_calibration(
-        cp_ns_per_tsc_q32,
-        cp_wrapper_baseline,
-        cp_clock_source,
-    );
-    let binding_lookup = WorkerBindingLookup::from_bindings(&bindings);
-    let cos_owner_live_by_tx_ifindex = build_worker_cos_owner_live_by_tx_ifindex(
-        bindings
-            .iter()
-            .map(|binding| (binding.ifindex, binding.live.clone())),
-    );
-    let cos_fast_interfaces = build_worker_cos_fast_interfaces(
-        forwarding.as_ref(),
-        worker_id,
-        &cos_owner_live_by_tx_ifindex,
-        cos_owner_worker_by_queue.as_ref(),
-        cos_owner_live_by_queue.as_ref(),
-        cos_shared_root_leases.as_ref(),
-        cos_shared_exact_backlogs.as_ref(),
-        cos_shared_queue_leases.as_ref(),
-        cos_shared_queue_vtime_floors.as_ref(),
-    );
-    for binding in bindings.iter_mut() {
-        binding.cos.cos_fast_interfaces = cos_fast_interfaces.clone();
-    }
-    let mut interrupt_poll_fds = if poll_mode == crate::PollMode::Interrupt {
-        bindings
-            .iter()
-            .map(|binding| libc::pollfd {
-                fd: binding.xsk.device.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            })
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
     let mut idle_iters = 0u32;
     let mut poll_start = 0usize;
     let mut shared_recycles = Vec::with_capacity((RX_BATCH_SIZE as usize).saturating_mul(2));
@@ -278,36 +202,17 @@ pub(crate) fn worker_loop(
     // Keeps `show security flow session` idle times accurate without
     // per-second syscall overhead per session.  See issue #333.
     const CT_REFRESH_INTERVAL_NS: u64 = 10_000_000_000;
-    // Cache BPF map FDs — they don't change during the worker's lifetime.
-    let session_map_fd = bindings
-        .first()
-        .map(|binding| binding.bpf_maps.session_map_fd)
-        .unwrap_or(-1);
-    let conntrack_v4_fd = bindings
-        .first()
-        .map(|binding| binding.bpf_maps.conntrack_v4_fd)
-        .unwrap_or(-1);
-    let conntrack_v6_fd = bindings
-        .first()
-        .map(|binding| binding.bpf_maps.conntrack_v6_fd)
-        .unwrap_or(-1);
     let mut last_ct_refresh_ns: u64 = 0;
-    cos_status.store(Arc::new(build_worker_cos_statuses(
-        &bindings,
-        forwarding.as_ref(),
-    )));
-    let mut last_cos_status_ns = monotonic_nanos();
     // #869: worker-runtime telemetry.  Local counters, published to
     // `runtime_atomics` on the ~1s cadence below.
     use crate::afxdp::worker_runtime::{
-        WorkerRuntimeCounters, WorkerRuntimeState, current_tid, sample_thread_cpu_ns,
+        WorkerRuntimeCounters, WorkerRuntimeState, sample_thread_cpu_ns,
     };
     let mut wr_counters = WorkerRuntimeCounters::default();
     let mut wr_state = WorkerRuntimeState::IdleBlock;
     let mut wr_last_loop_ns = monotonic_nanos();
     let mut wr_last_publish_ns = wr_last_loop_ns;
     const WR_PUBLISH_INTERVAL_NS: u64 = 1_000_000_000;
-    runtime_atomics.set_tid(current_tid());
     while !stop.load(Ordering::Relaxed) {
         let loop_now_ns = monotonic_nanos();
         // #869: attribute elapsed delta to the previous loop's state.
