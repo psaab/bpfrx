@@ -47,6 +47,36 @@ sync.
 - `types/` — shared structs: `BindingPlan`, `BindingStatus`,
   `WorkerRuntimeAtomics`, `SharedCoSQueueLease`, `BatchCounters`, …
 
+## Worker command-queue poison policy (#1790 → #1807)
+
+Coordinator↔worker commands flow through per-worker
+`Mutex<VecDeque<WorkerCommand>>` queues. A worker panic while holding
+the lock (contained by the #925 supervisor) poisons the mutex. The
+uniform policy lives in `worker_queue.rs` and is mandatory for every
+access — do NOT call `.lock()` / `.try_lock()` on these queues
+directly:
+
+- `lock_recover` / `try_lock_recover` recover a poisoned lock via
+  `into_inner`, **clear the poison** (restoring the fast unpoisoned
+  path), and bump the recovery counter surfaced as
+  `xpf_userspace_worker_command_queue_poison_recoveries_total`.
+- The recovered deque holds the **committed prefix** of every completed
+  push — a panic between the pushes of a multi-push section leaves
+  exactly the commands pushed before it. Commands are individually
+  self-contained, so consumers tolerate partial batches; discarding the
+  deque would lose acknowledged HA/session commands.
+- `try_lock_recover` keeps WouldBlock as a skip (`None`) — only the
+  Poisoned arm changes behavior.
+
+History: #1790 added recover-without-clear at the five coordinator
+ha.rs sites; #1807 extended recovery to every producer/consumer site
+(worker poll peek, `apply_worker_commands`, session replication,
+activation prewarm, tunnel install/drain-wait, cross-binding shaped-TX
+redirect) and retrofitted the coordinator sites onto the shared
+helpers. Before #1807 a single poisoned queue made the worker
+permanently deaf (poison read as "no commands") while producers
+silently dropped or, for the tunnel drain-wait, spun to timeout.
+
 ## Hot-path constants
 
 - `RX_BATCH_SIZE = 64`

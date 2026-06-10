@@ -4711,3 +4711,7 @@ top.
 - **Timestamp**: 2026-06-10
   **Action**: "#1807 commit 2 — wire the poison-recovery counter end to end (U4 SESSION_PUBLISH_ERRORS pattern): coordinator/status.rs accessor -> server/helpers.rs -> ProcessStatus worker_command_queue_poison_recoveries -> protocol.go -> pkg/api Prometheus counter xpf_userspace_worker_command_queue_poison_recoveries_total; wire fixture regen + Rust/Go round-trip + descriptor coverage tests"
   **File(s)**: userspace-dp/src/{afxdp/coordinator/status.rs,server/helpers.rs,server/lifecycle.rs,protocol/control.rs,protocol/tests.rs}, userspace-dp/tests/fixtures/protocol_wire_v1.json, pkg/dataplane/userspace/{protocol.go,protocol_test.go}, pkg/api/{metrics.go,metrics_descriptors.go,metrics_userspace.go,metrics_test.go,metrics_descriptor_coverage_test.go}
+
+- **Timestamp**: 2026-06-10
+  **Action**: "#1807 commit 3 — documented the worker command-queue poison policy (#1790 -> #1807, committed-prefix + clear_poison + counter) in the afxdp module README; no pre-existing doc covered the #1790 policy"
+  **File(s)**: userspace-dp/src/afxdp/README.md
