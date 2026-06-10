@@ -64,7 +64,6 @@ pub(crate) const FLAG_FABRIC_REDIRECT: u8 = 1 << 0;
 pub(crate) const FLAG_FABRIC_INGRESS: u8 = 1 << 1;
 pub(crate) const FLAG_IS_REVERSE: u8 = 1 << 2;
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DataplaneEventKind {
     PolicyDeny,
@@ -72,7 +71,6 @@ pub(crate) enum DataplaneEventKind {
     FilterLog,
 }
 
-#[allow(dead_code)]
 impl DataplaneEventKind {
     fn msg_type(self) -> u8 {
         match self {
