@@ -1093,9 +1093,17 @@ func (s *Store) performAutoRollback() {
 	prevCfg := s.confirmPrevCfg
 	s.confirmPrevCfg = nil
 
-	// Persist reverted config to disk
-	if err := s.db.WriteActive(s.active); err != nil {
-		slog.Warn("failed to save reverted config", "err", err)
+	// Persist reverted config to disk. Option B (#1799): the rollback
+	// ALWAYS proceeds in memory — reverting the running config is the
+	// safety property — but a persist failure here used to leave the
+	// UNCONFIRMED candidate on disk, so a reboot would load the config
+	// the operator never confirmed. The degraded flag + singleton
+	// retry make the failure visible (/health 503, gauge, journal
+	// ERROR) and heal the disk in the background.
+	if err := s.writeActive(s.active); err != nil {
+		s.noteActivePersistFailureLocked("auto_rollback", err)
+	} else {
+		s.persistDegraded = false
 	}
 
 	// Log to journal

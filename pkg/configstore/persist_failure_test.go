@@ -379,6 +379,73 @@ func TestSyncApply_PersistFailureRetryIsSingleton(t *testing.T) {
 	}
 }
 
+// TestAutoRollback_ProceedsAndFlagsOnPersistFailure: Option B (#1799)
+// for the confirm-timer expiry path — the in-memory rollback always
+// proceeds (reverting the running config is the safety property), a
+// persist failure sets the degraded flag, and the background retry
+// heals the disk so a reboot loads the ROLLED-BACK config, not the
+// unconfirmed candidate the failed write left behind.
+func TestAutoRollback_ProceedsAndFlagsOnPersistFailure(t *testing.T) {
+	s := newTestStore(t)
+	commitBaseline(t, s) // confirmed base: trust only
+	baseSet := s.ShowActiveSet()
+
+	s.SetPersistRetryBackoffForTesting(time.Millisecond, 4*time.Millisecond)
+
+	// Pending confirmed commit (persists fine; disk now holds the
+	// unconfirmed candidate).
+	if err := s.SetFromInput("security zones security-zone untrust interfaces eth1.0"); err != nil {
+		t.Fatalf("SetFromInput: %v", err)
+	}
+	if _, err := s.CommitConfirmed(1); err != nil {
+		t.Fatalf("CommitConfirmed: %v", err)
+	}
+
+	// Disk breaks before the timer fires.
+	var failing atomic.Bool
+	failing.Store(true)
+	s.SetWriteActiveForTesting(func(tree *config.ConfigTree) error {
+		if failing.Load() {
+			return errDiskFull
+		}
+		return s.db.WriteActive(tree)
+	})
+
+	s.performAutoRollback()
+
+	// The in-memory rollback proceeded.
+	if got := s.ShowActiveSet(); got != baseSet {
+		t.Errorf("rollback did not revert active in memory:\nwant: %s\ngot: %s", baseSet, got)
+	}
+	if s.IsConfirmPending() {
+		t.Error("confirm state should be cleared after auto-rollback")
+	}
+	if !s.ConfigPersistDegraded() {
+		t.Fatal("degraded flag must be set after failed rollback persist")
+	}
+
+	// Heal the disk: the retry must replace the unconfirmed candidate
+	// on disk with the rolled-back config.
+	failing.Store(false)
+	waitForCondition(t, "degraded flag to clear", func() bool {
+		return !s.ConfigPersistDegraded()
+	})
+	tree, err := s.db.ReadActive()
+	if err != nil {
+		t.Fatalf("ReadActive: %v", err)
+	}
+	if tree == nil {
+		t.Fatal("no active config on disk")
+	}
+	persisted := tree.FormatSet()
+	if strings.Contains(persisted, "untrust") {
+		t.Error("disk still holds the unconfirmed candidate after retry healed")
+	}
+	if persisted != baseSet {
+		t.Errorf("disk should hold the rolled-back config:\nwant: %s\ngot: %s", baseSet, persisted)
+	}
+}
+
 // TestCommit_SuccessClearsDegradedFlag: a successful Option-A commit
 // persists the newest active config, so the degraded state ends even
 // before the retry loop's next attempt.
