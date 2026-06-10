@@ -58,6 +58,13 @@ without DHCP no longer disables DHCP for the daemon's lifetime.
 
 ## Renewal semantics (#1777)
 
+> Wire note: T1/T2 attempts still run the full client exchange
+> (v4 force-discover DORA; v6 Information-Request/Rapid Solicit), not
+> unicast RFC RENEW/REBIND — the RFC citations below describe the
+> timer/fallback structure only. True unicast renew is a possible
+> follow-up (#1832 review note).
+
+
 Acquisition and renewal share one commit path, `commitLease`
 (`commit.go`): remove the old address if the server moved us, apply the
 new address, store the lease (and DHCPv6 delegated prefixes), and fire

@@ -11,8 +11,18 @@ import (
 // T2 rebind dead-assigned the result and `continue`d into a fresh full
 // DORA / Solicit, discarding the renewal. Both run loops now commit
 // every successful exchange through commitLease and return to the T1
-// wait; only renewal FAILURE (NAK/timeout at both T1 and T2, per RFC
-// 2131 §4.4.5 / RFC 8415 §18.2.4-5) falls back to re-acquisition.
+// wait; only failure at both T1 and T2 falls back to re-acquisition.
+//
+// Wire-behavior note (Codex review on PR #1832): the T1/T2 attempts
+// still use the client's full exchange on the wire (v4: nclient4
+// Discover/Offer/Request/Ack — force-discover; v6: Information-Request
+// or Rapid Solicit), NOT RFC-style unicast RENEW/REBIND messages, so a
+// different server can answer and the address-move path below handles
+// that. The RFC 2131 §4.4.5 / RFC 8415 §18.2.4-5 citations describe
+// the TIMER-AND-FALLBACK structure this loop implements (T1 → T2 →
+// re-acquire), not the wire messages. Switching to true unicast renew
+// (nclient4.Client.Renew) is a possible follow-up, deliberately out of
+// scope here.
 //
 // The run loops themselves are not unit-testable (doDHCPv4/doDHCPv6
 // open real AF_PACKET/UDP sockets via nclient4/nclient6, and the T1
