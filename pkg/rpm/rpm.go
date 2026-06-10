@@ -44,9 +44,22 @@ func probeDialer(timeout time.Duration, sourceAddr string, opts probeSockOpts) *
 				}
 			})
 			if err != nil {
-				return err
+				err = fmt.Errorf("%w: socket control: %v", ErrProbeSetup, err)
+			} else if cerr != nil {
+				// Socket-option failures (SO_BINDTODEVICE EPERM/ENODEV,
+				// SO_MARK EPERM) are environment/capability errors, not
+				// path health: mark them ErrProbeSetup so tcp-ping and
+				// http-get hold state exactly like icmp-ping (Codex PR
+				// #1843 HIGH-2). The sentinel survives the net.OpError /
+				// url.Error wrapping on the dial path, so the probe
+				// loop's errors.Is check catches it for all three probe
+				// types. Genuine dial outcomes (refused, timeout,
+				// unreachable) never pass through this callback and stay
+				// path signals — ambiguous dial errnos deliberately
+				// default to PATH (conservative for detection).
+				err = fmt.Errorf("%w: socket option: %v", ErrProbeSetup, cerr)
 			}
-			return cerr
+			return err
 		}
 	}
 	return d

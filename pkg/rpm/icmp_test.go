@@ -3,6 +3,7 @@ package rpm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -412,5 +413,49 @@ func TestProbeICMPSetupErrorClassified(t *testing.T) {
 	_, err = m.probeICMP(context.Background(), test, probeSockOpts{})
 	if err == nil || errors.Is(err, ErrProbeSetup) {
 		t.Fatalf("timeout must stay a genuine probe failure, got %v", err)
+	}
+}
+
+// TestTCPAndHTTPSetupErrorsClassified (Codex PR #1843 HIGH-2): socket
+// control/option failures on the tcp-ping and http-get dial path
+// (SO_BINDTODEVICE to a nonexistent device — EPERM without
+// CAP_NET_RAW, ENODEV with it; SO_MARK EPERM) classify as
+// ErrProbeSetup so the probe loop holds state; a genuine connection
+// refusal stays a path signal.
+func TestTCPAndHTTPSetupErrorsClassified(t *testing.T) {
+	// A listener we close immediately: dialing its port afterwards is
+	// a genuine REFUSED — a real path/host signal.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	m := New()
+	test := &config.RPMTest{Name: "t", Target: "127.0.0.1", DestPort: port}
+	setupOpts := probeSockOpts{BindDevice: "xpf-nonexistent0"}
+
+	// tcp-ping: bind-device failure → setup error.
+	_, err = m.probeTCP(context.Background(), test, setupOpts)
+	if !errors.Is(err, ErrProbeSetup) {
+		t.Fatalf("tcp-ping bind-device failure not ErrProbeSetup: %v", err)
+	}
+	// tcp-ping: genuine refusal without socket options → path signal.
+	_, err = m.probeTCP(context.Background(), test, probeSockOpts{})
+	if err == nil || errors.Is(err, ErrProbeSetup) {
+		t.Fatalf("tcp-ping refusal must stay a path signal, got %v", err)
+	}
+
+	// http-get: same classification through the transport/url.Error
+	// wrapping.
+	httpTest := &config.RPMTest{Name: "t", Target: fmt.Sprintf("http://127.0.0.1:%d/", port)}
+	_, err = m.probeHTTP(context.Background(), httpTest, setupOpts)
+	if !errors.Is(err, ErrProbeSetup) {
+		t.Fatalf("http-get bind-device failure not ErrProbeSetup: %v", err)
+	}
+	_, err = m.probeHTTP(context.Background(), httpTest, probeSockOpts{})
+	if err == nil || errors.Is(err, ErrProbeSetup) {
+		t.Fatalf("http-get refusal must stay a path signal, got %v", err)
 	}
 }

@@ -96,6 +96,13 @@ var echoIDCounter atomic.Uint32
 // failure surfaces via the rate-limited Warn log and the stalled
 // LastProbeAt/TotalSent in `show services rpm`, never via route
 // actuation. Send/receive/timeout errors stay genuine probe failures.
+//
+// Covers all three probe types: raw-socket open + marshal for
+// icmp-ping (here), and probeDialer socket-control failures
+// (SO_BINDTODEVICE / SO_MARK) for tcp-ping and http-get (Codex PR
+// #1843 HIGH-2). Genuine dial outcomes — refused, timeout,
+// unreachable — stay path signals; ambiguous dial errnos deliberately
+// default to PATH (conservative for detection).
 var ErrProbeSetup = errors.New("probe setup failed")
 
 // probeICMP sends one ICMP (or ICMPv6) echo request to the test target
