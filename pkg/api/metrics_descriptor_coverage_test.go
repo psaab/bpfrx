@@ -245,6 +245,9 @@ func populatedCoverageStatus() dpuserspace.ProcessStatus {
 				TXCompletions:                123,
 				TXCompletionRingAvailable:    10,
 				TXCompletionRingAvailableMax: 20,
+				// #1831: per-binding V_min throttle counters (always emit).
+				VMinThrottles:                51,
+				VMinThrottleHardCapOverrides: 2,
 			},
 		},
 		CoSActiveFlowCounts: []dpuserspace.CoSActiveFlowCountStatus{
@@ -294,6 +297,14 @@ func populatedCoverageStatus() dpuserspace.ProcessStatus {
 		NeighborResolverGetFailuresTotal:   1,
 		NeighborResolverEpochRejectsTotal:  0,
 		NeighborResolverDisconnectedTotal:  0,
+		// #1771 §2.6: resolver backoff + §2.5 ENOBUFS/re-dump counters
+		// and the pending/negative key gauges (all always emit).
+		NeighborResolverGetBackoffAttemptsTotal: 2,
+		NeighborNetlinkEnobufsTotal:             1,
+		NeighborNetlinkRedumpsTotal:             1,
+		NeighborNetlinkRedumpUpsertsTotal:       6,
+		NeighborPendingKeys:                     2,
+		NegNeighKeys:                            1,
 	}
 }
 
@@ -410,6 +421,16 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 		"xpf_userspace_dynamic_neighbor_present",                     // #1782 cold-start H2 dump
 		"xpf_userspace_session_publish_errors_total",                 // #1789 publish failures
 		"xpf_userspace_worker_command_queue_poison_recoveries_total", // #1807 poison recoveries
+		// #1771 §2.6 resolver backoff + §2.5 ENOBUFS/re-dump + key gauges
+		"xpf_userspace_neighbor_resolver_get_backoff_attempts_total",
+		"xpf_userspace_neighbor_netlink_enobufs_total",
+		"xpf_userspace_neighbor_netlink_redumps_total",
+		"xpf_userspace_neighbor_netlink_redump_upserts_total",
+		"xpf_userspace_neighbor_pending_keys",
+		"xpf_userspace_neg_neigh_keys",
+		// #1831: per-binding V_min fairness-throttle counters (#941/#943)
+		"xpf_userspace_binding_v_min_throttles_total",
+		"xpf_userspace_binding_v_min_throttle_hard_cap_overrides_total",
 	}
 	if ifaceResolvable {
 		want = append(want, "xpf_interface_packets_total") // collectInterfaceCounters (lo)

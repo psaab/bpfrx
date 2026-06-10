@@ -696,6 +696,30 @@ func newCollector(srv *Server) *xpfCollector {
 			"Maximum sampled AF_XDP TX completion-ring descriptors available in the last debug window (#1241).",
 			[]string{"binding_slot", "queue_id", "worker_id", "iface"}, nil,
 		),
+		// #1831 (follow-up to #1766): per-binding V_min fairness-throttle
+		// counters (#941 work item D / #943), already carried in
+		// BindingStatus on the wire but previously unexported.
+		bindingVMinThrottles: prometheus.NewDesc(
+			"xpf_userspace_binding_v_min_throttles_total",
+			"V_min fairness-brake throttle decisions on this binding's "+
+				"shared-exact CoS queues: a drain batch early-broke because the "+
+				"queue's virtual time ran more than LAG_THRESHOLD ahead of the "+
+				"slowest participating peer worker's V_min (#917/#943). Non-zero "+
+				"under load confirms the cross-worker brake is engaged; the "+
+				"hard-cap-overrides / throttles ratio is the diagnostic for "+
+				"LAG_THRESHOLD tuned too tight.",
+			[]string{"binding_slot", "queue_id", "worker_id", "iface"}, nil,
+		),
+		bindingVMinThrottleHardCapOverrides: prometheus.NewDesc(
+			"xpf_userspace_binding_v_min_throttle_hard_cap_overrides_total",
+			"V_MIN_CONSECUTIVE_SKIP_HARD_CAP escape-hatch activations on this "+
+				"binding: after that many back-to-back V_min throttle decisions "+
+				"the drain force-continues and arms suspension — 'brake too "+
+				"tight, escape hatch rescued throughput' (#941 work item D). "+
+				"Counted distinctly from (not a subset of) "+
+				"xpf_userspace_binding_v_min_throttles_total.",
+			[]string{"binding_slot", "queue_id", "worker_id", "iface"}, nil,
+		),
 		cosActiveFlowCount: prometheus.NewDesc(
 			"xpf_userspace_cos_active_flow_count",
 			"Distinct active flows observed for this egress CoS queue on this worker "+
@@ -910,6 +934,37 @@ func newCollector(srv *Server) *xpfCollector {
 		neighborPendingMaxDepth: prometheus.NewDesc(
 			"xpf_userspace_neighbor_pending_max_depth",
 			"High-water mark of the per-binding pending-neighbor queue depth observed at any retry-sweep entry (gauge) (#1772).",
+			nil, nil,
+		),
+		// #1771 §2.6: resolver backoff + §2.5 ENOBUFS/re-dump telemetry.
+		neighborResolverGetBackoffAttemptsTotal: prometheus.NewDesc(
+			"xpf_userspace_neighbor_resolver_get_backoff_attempts_total",
+			"On-demand resolver GET attempts that were backoff RETRIES: the key had already been attempted within the resolver's per-key memory and was re-admitted after the per-key rate-limit window. Subset of get_attempts; a rising rate means the same next-hops keep failing to resolve. Per invariant N1 (#1771 §2.4) these retries keep firing even while the key is negatively cached.",
+			nil, nil,
+		),
+		neighborNetlinkEnobufsTotal: prometheus.NewDesc(
+			"xpf_userspace_neighbor_netlink_enobufs_total",
+			"ENOBUFS receives on the neighbor-monitor netlink socket: the kernel dropped RTM_NEWNEIGH/DELNEIGH multicast notifications on rcvbuf overflow (the lost-notification desync class the throttled upsert-only re-dump self-heals) (#1771 §2.5).",
+			nil, nil,
+		),
+		neighborNetlinkRedumpsTotal: prometheus.NewDesc(
+			"xpf_userspace_neighbor_netlink_redumps_total",
+			"Throttled (5s) upsert-only neighbor-table re-dumps issued after an ENOBUFS (at least one of the v4/v6 dump requests was sent) (#1771 §2.5).",
+			nil, nil,
+		),
+		neighborNetlinkRedumpUpsertsTotal: prometheus.NewDesc(
+			"xpf_userspace_neighbor_netlink_redump_upserts_total",
+			"Dynamic-neighbor entries (re)added by an upsert-only re-dump reply — RTM_NEWNEIGH dump replies whose insert changed the map. Nonzero proves a re-dump repopulated keys that lost multicast events had desynced (#1771 §2.5).",
+			nil, nil,
+		),
+		neighborPendingKeys: prometheus.NewDesc(
+			"xpf_userspace_neighbor_pending_keys",
+			"Distinct unresolved (egress_ifindex, next_hop) keys currently holding a buffered packet in the per-binding pending_neigh maps, summed across bindings (gauge; refreshed at the ~65ms per-binding debug tick) (#1771 §2.6).",
+			nil, nil,
+		),
+		negNeighKeys: prometheus.NewDesc(
+			"xpf_userspace_neg_neigh_keys",
+			"Keys currently held in the per-binding negative neighbor caches, summed across bindings (gauge; lazy-TTL upper bound — an expired entry stays counted until its next access) (#1771 §2.6).",
 			nil, nil,
 		),
 	}

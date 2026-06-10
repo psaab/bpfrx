@@ -1463,3 +1463,67 @@ func TestProcessStatusWorkerCommandQueuePoisonRecoveriesRoundTrip(t *testing.T) 
 			legacy.WorkerCommandQueuePoisonRecoveries)
 	}
 }
+
+// #1771 §2.6: wire pin for the resolver backoff-retry counter, the §2.5
+// ENOBUFS/re-dump counters, and the pending-keys / negative-keys gauges.
+// The Rust helper serializes these via serde renames in
+// userspace-dp/src/protocol/control.rs; a key rename on either side
+// silently decodes as zero, so pin every tag here and verify the
+// pre-Phase-3 (keys absent) payload defaults to zero.
+func TestProcessStatusNeighborPhase3CountersRoundTrip(t *testing.T) {
+	in := ProcessStatus{
+		NeighborResolverGetBackoffAttemptsTotal: 7,
+		NeighborNetlinkEnobufsTotal:             3,
+		NeighborNetlinkRedumpsTotal:             2,
+		NeighborNetlinkRedumpUpsertsTotal:       11,
+		NeighborPendingKeys:                     4,
+		NegNeighKeys:                            5,
+	}
+	raw, err := json.Marshal(&in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("unmarshal obj: %v", err)
+	}
+	for _, key := range []string{
+		"neighbor_resolver_get_backoff_attempts_total",
+		"neighbor_netlink_enobufs_total",
+		"neighbor_netlink_redumps_total",
+		"neighbor_netlink_redump_upserts_total",
+		"neighbor_pending_keys",
+		"neg_neigh_keys",
+	} {
+		if _, ok := obj[key]; !ok {
+			t.Fatalf("wire key %q missing from ProcessStatus JSON: %s", key, string(raw))
+		}
+	}
+
+	var back ProcessStatus
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatalf("unmarshal ProcessStatus: %v", err)
+	}
+	if back.NeighborResolverGetBackoffAttemptsTotal != in.NeighborResolverGetBackoffAttemptsTotal ||
+		back.NeighborNetlinkEnobufsTotal != in.NeighborNetlinkEnobufsTotal ||
+		back.NeighborNetlinkRedumpsTotal != in.NeighborNetlinkRedumpsTotal ||
+		back.NeighborNetlinkRedumpUpsertsTotal != in.NeighborNetlinkRedumpUpsertsTotal ||
+		back.NeighborPendingKeys != in.NeighborPendingKeys ||
+		back.NegNeighKeys != in.NegNeighKeys {
+		t.Fatalf("round-trip mismatch: got %+v, want %+v", back, in)
+	}
+
+	// Pre-Phase-3 helper payload (keys absent) must decode to zero.
+	var legacy ProcessStatus
+	if err := json.Unmarshal([]byte(`{}`), &legacy); err != nil {
+		t.Fatalf("unmarshal legacy ProcessStatus: %v", err)
+	}
+	if legacy.NeighborResolverGetBackoffAttemptsTotal != 0 ||
+		legacy.NeighborNetlinkEnobufsTotal != 0 ||
+		legacy.NeighborNetlinkRedumpsTotal != 0 ||
+		legacy.NeighborNetlinkRedumpUpsertsTotal != 0 ||
+		legacy.NeighborPendingKeys != 0 ||
+		legacy.NegNeighKeys != 0 {
+		t.Fatalf("legacy decode must zero-default Phase-3 fields: %+v", legacy)
+	}
+}

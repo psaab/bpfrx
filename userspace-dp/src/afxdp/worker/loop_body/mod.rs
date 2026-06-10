@@ -1,15 +1,37 @@
 // #1326 — extracted from worker/mod.rs (pure code motion).
 // The `worker_loop` per-tick orchestrator was previously a ~1278 LOC
-// function in worker/mod.rs (L995-L2273). It is moved here verbatim
-// as the first phase of the #1326 refactor; subsequent phases will
-// carve named tick sub-fns out of this file (setup/tick/poll_drive/
-// debug_report) per plan v4.0 (docs/pr/1326-worker-loop-extract/plan.md).
+// function in worker/mod.rs (L995-L2273), moved here verbatim as the
+// first phase of the #1326 refactor.
+//
+// #1776 (Phase 2, narrowed v3.1 scope) carved out the two cold
+// extractions: the one-shot setup phase (setup.rs) and the
+// cfg(debug-log) verbose report / stall dump (debug_report.rs).
+// Everything per-tick — telemetry publish, ArcSwap config refresh,
+// HA load, command drain, the hot `poll_binding` sweep, heartbeat,
+// the always-on binding diagnostics + BindingLiveState publish, and
+// idle regulation — deliberately stays INLINE in this file: the
+// round-1 plan review (Codex r1-4) established that an
+// #[inline(never)] call boundary in front of the per-tick
+// `load_arc_if_changed` path risks regressing the 10K-100K ticks/s
+// loop, so no call was added to the per-tick path.
 //
 // `use super::*;` brings every type, helper, and sibling-submodule
 // item from worker/mod.rs into scope — the same pattern lifecycle.rs
 // and cos.rs use. Pure relocation — no production logic touched.
 
 use super::*;
+
+// #1776: the one-shot setup phase (thread pin, TSC calibration,
+// initial ArcSwap load_fulls, binding construction, BPF-map-FD
+// cache, initial cos_status publish) lives in loop_body/setup.rs.
+mod setup;
+
+// #1776: the cfg(debug-log) verbose per-second report + stall dump +
+// per-interval DbgCounters live in loop_body/debug_report.rs. The
+// module is feature-gated at the declaration so release builds
+// compile none of it.
+#[cfg(feature = "debug-log")]
+mod debug_report;
 
 pub(crate) fn worker_loop(
     worker_id: u32,
@@ -57,257 +79,81 @@ pub(crate) fn worker_loop(
     cold_path_atomics:
         Arc<crate::afxdp::cold_path_hist::WorkerColdPathAtomics>,
 ) {
-    pin_current_thread(worker_id);
-    // #1620: per-worker cold-path TSC calibration. Runs ONCE at
-    // worker_loop entry, AFTER pin_current_thread has pinned the
-    // worker to its core (so the Instant↔TSC ratio reflects this
-    // core's clock). The probe + calibrate together take ~10 ms
-    // (one-shot 10 ms sleep window + ~80 µs of back-to-back rdtscp
-    // pairs); workers calibrate concurrently across cores so the
-    // wall-clock startup overhead stays at ~10 ms total.
-    //
-    // Per plan v4 §4.6: probe_clock_source runs once; calibration is
-    // skipped (returning 0) when the clock source is not TSC, avoiding
-    // redundant /proc/cpuinfo + /sys probes inside the calibrators.
-    let cp_clock_source =
-        crate::afxdp::cold_path_hist::probe_clock_source();
-    let (cp_ns_per_tsc_q32, cp_wrapper_baseline) =
-        if cp_clock_source == crate::afxdp::cold_path_hist::ClockSource::Tsc {
-            let q32 =
-                crate::afxdp::cold_path_hist::calibrate_ns_per_tsc_q32();
-            let baseline =
-                crate::afxdp::cold_path_hist::calibrate_wrapper_baseline_ns(
-                    q32,
-                );
-            (q32, baseline)
-        } else {
-            (0, 0)
-        };
-    // Single-line startup log per worker (~6 lines total per daemon
-    // startup). Goes to journald via stderr per project logging rules.
-    eprintln!(
-        "xpf-cold-path: worker={} clock_source={} ns_per_tsc_q32={} wrapper_ns_baseline={}",
+    // #1776: one-shot setup moved verbatim to setup.rs. The returned
+    // WorkerLoopSetup is destructured into the same-named locals so
+    // the loop body below is textually unchanged.
+    let setup::WorkerLoopSetup {
+        ha_startup_grace_until_secs,
+        mut validation,
+        mut forwarding,
+        mut cos_owner_worker_by_queue,
+        mut cos_owner_live_by_queue,
+        mut cos_shared_root_leases,
+        mut cos_shared_exact_backlogs,
+        mut cos_shared_queue_leases,
+        mut cos_shared_queue_vtime_floors,
+        mut mirror_targets,
+        mut sessions,
+        mut screen_state,
+        mut bindings,
+        binding_lookup,
+        mut interrupt_poll_fds,
+        session_map_fd,
+        conntrack_v4_fd,
+        conntrack_v6_fd,
+        mut last_cos_status_ns,
+    } = setup::worker_loop_setup(
         worker_id,
-        cp_clock_source.as_str(),
-        cp_ns_per_tsc_q32,
-        cp_wrapper_baseline,
+        binding_plans,
+        &shared_validation,
+        &shared_forwarding,
+        &shared_cos_owner_worker_by_queue,
+        &shared_cos_owner_live_by_queue,
+        &shared_cos_root_leases,
+        &shared_cos_exact_backlogs,
+        &shared_cos_queue_leases,
+        &shared_cos_queue_vtime_floors,
+        &shared_mirror_targets,
+        poll_mode,
+        &cos_status,
+        &runtime_atomics,
+        &cold_path_atomics,
     );
     const COS_STATUS_INTERVAL_NS: u64 = 100_000_000;
-    let ha_startup_grace_until_secs =
-        (monotonic_nanos() / 1_000_000_000).saturating_add(TUNNEL_HA_STARTUP_GRACE_SECS);
-    let mut validation = **shared_validation.load();
-    let mut forwarding = shared_forwarding.load_full();
-    let mut cos_owner_worker_by_queue = shared_cos_owner_worker_by_queue.load_full();
-    let mut cos_owner_live_by_queue = shared_cos_owner_live_by_queue.load_full();
-    let mut cos_shared_root_leases = shared_cos_root_leases.load_full();
-    let mut cos_shared_exact_backlogs = shared_cos_exact_backlogs.load_full();
-    let mut cos_shared_queue_leases = shared_cos_queue_leases.load_full();
-    let mut cos_shared_queue_vtime_floors = shared_cos_queue_vtime_floors.load_full();
-    let mut mirror_targets = shared_mirror_targets.load_full();
-    let mut sessions = SessionTable::new();
-    let mut screen_state = ScreenState::new();
-    screen_state.update_profiles(forwarding.screen_profiles.clone());
-    screen_state.update_syn_cookie_master_key(forwarding.syn_cookie_master_key);
-    sessions.set_timeouts(forwarding.session_timeouts);
-    let mut bindings = Vec::with_capacity(binding_plans.len());
-    let (private_plans, shared_groups) = partition_binding_plans(binding_plans);
-    for plan in private_plans {
-        let live = plan.live.clone();
-        match create_private_binding_from_plan(plan) {
-            Ok(binding) => bindings.push(binding),
-            Err(err) => {
-                eprintln!("xpf-userspace-dp: private binding creation failed: {err}");
-                live.set_error(err.to_string());
-            }
-        }
-    }
-    for (group_key, plans) in shared_groups {
-        match create_shared_binding_group(&group_key, plans) {
-            Ok(mut group_bindings) => bindings.append(&mut group_bindings),
-            Err(err) => fallback_shared_group_to_private(err, &mut bindings),
-        }
-    }
-    bindings.sort_by_key(|binding| (binding.queue_id, binding.ifindex, binding.slot));
-    // #1620: install per-worker cold-path calibration into each
-    // binding's worker-local counters. The calibration values are
-    // shared across all bindings owned by this worker — they reflect
-    // the worker thread's pinned core, not the binding identity.
-    for binding in bindings.iter_mut() {
-        binding.cold_path.ns_per_tsc_q32 = cp_ns_per_tsc_q32;
-        binding.cold_path.wrapper_ns_baseline = cp_wrapper_baseline;
-        binding.cold_path.clock_source = cp_clock_source;
-    }
-    // #1621: install the same calibration into the sibling atomics
-    // so the first /metrics scrape sees q32 + clock_source even
-    // before the first publish-tick fires. install_calibration writes
-    // outside the cold_window_gen seqlock (calibration is set-once;
-    // readers always observe a consistent value).
-    cold_path_atomics.install_calibration(
-        cp_ns_per_tsc_q32,
-        cp_wrapper_baseline,
-        cp_clock_source,
-    );
-    let binding_lookup = WorkerBindingLookup::from_bindings(&bindings);
-    let cos_owner_live_by_tx_ifindex = build_worker_cos_owner_live_by_tx_ifindex(
-        bindings
-            .iter()
-            .map(|binding| (binding.ifindex, binding.live.clone())),
-    );
-    let cos_fast_interfaces = build_worker_cos_fast_interfaces(
-        forwarding.as_ref(),
-        worker_id,
-        &cos_owner_live_by_tx_ifindex,
-        cos_owner_worker_by_queue.as_ref(),
-        cos_owner_live_by_queue.as_ref(),
-        cos_shared_root_leases.as_ref(),
-        cos_shared_exact_backlogs.as_ref(),
-        cos_shared_queue_leases.as_ref(),
-        cos_shared_queue_vtime_floors.as_ref(),
-    );
-    for binding in bindings.iter_mut() {
-        binding.cos.cos_fast_interfaces = cos_fast_interfaces.clone();
-    }
-    let mut interrupt_poll_fds = if poll_mode == crate::PollMode::Interrupt {
-        bindings
-            .iter()
-            .map(|binding| libc::pollfd {
-                fd: binding.xsk.device.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            })
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
     let mut idle_iters = 0u32;
     let mut poll_start = 0usize;
     let mut shared_recycles = Vec::with_capacity((RX_BATCH_SIZE as usize).saturating_mul(2));
     // Debug: periodic summary counters
     let mut dbg_last_report_ns = monotonic_nanos();
-    let mut dbg_rx_total = 0u64;
+    // #1776: the per-interval cfg(debug-log) dbg_* counters are
+    // consolidated into debug_report::DbgCounters (single-line
+    // default() reset each report tick). dbg_last_report_ns above and
+    // the stall baselines below are PERSISTENT debug state that
+    // survives across report intervals — deliberately NOT DbgCounters
+    // fields, so the interval reset cannot wipe them (plan v3.1 AGY
+    // CORRECTNESS-1).
     #[cfg(feature = "debug-log")]
-    let mut dbg_tx_total = 0u64;
-    let mut dbg_forward_total = 0u64;
+    let mut dbg = debug_report::DbgCounters::default();
     #[cfg(feature = "debug-log")]
-    let mut dbg_local_total = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_session_hit = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_session_miss = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_session_create = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_no_route = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_missing_neigh = 0u64;
-    // #1651 B3: dead-host negative-cache fast-fail count.
-    #[cfg(feature = "debug-log")]
-    let mut dbg_neg_neigh_fast_fail = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_policy_deny = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_ha_inactive = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_no_egress_binding = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_build_fail = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_tx_err = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_metadata_err = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_disposition_other = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_enqueue_ok = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_enqueue_inplace = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_enqueue_direct = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_enqueue_copy = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_rx_from_trust = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_rx_from_wan = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_fwd_trust_to_wan = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_fwd_wan_to_trust = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_nat_snat = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_nat_dnat = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_nat_none = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_frame_build_none = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_rx_tcp_rst = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_tx_tcp_rst = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_rx_tcp_fin = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_rx_tcp_synack = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_rx_tcp_zero_window = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_fwd_tcp_fin = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_fwd_tcp_rst = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_fwd_tcp_zero_window = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_rx_bytes_total = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_tx_bytes_total = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_rx_oversized = 0u64;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_rx_max_frame = 0u32;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_tx_max_frame = 0u32;
-    #[cfg(feature = "debug-log")]
-    let mut dbg_seg_needed_but_none = 0u64;
-    let mut prev_rx_total = 0u64;
-    let mut prev_fwd_total = 0u64;
     let mut stall_prev_fwd = 0u64;
+    #[cfg(feature = "debug-log")]
     let mut stall_reported = false;
     const DBG_REPORT_INTERVAL_NS: u64 = 1_000_000_000; // 1 second
     // Throttle for BPF conntrack last_seen refresh (~10s).
     // Keeps `show security flow session` idle times accurate without
     // per-second syscall overhead per session.  See issue #333.
     const CT_REFRESH_INTERVAL_NS: u64 = 10_000_000_000;
-    // Cache BPF map FDs — they don't change during the worker's lifetime.
-    let session_map_fd = bindings
-        .first()
-        .map(|binding| binding.bpf_maps.session_map_fd)
-        .unwrap_or(-1);
-    let conntrack_v4_fd = bindings
-        .first()
-        .map(|binding| binding.bpf_maps.conntrack_v4_fd)
-        .unwrap_or(-1);
-    let conntrack_v6_fd = bindings
-        .first()
-        .map(|binding| binding.bpf_maps.conntrack_v6_fd)
-        .unwrap_or(-1);
     let mut last_ct_refresh_ns: u64 = 0;
-    cos_status.store(Arc::new(build_worker_cos_statuses(
-        &bindings,
-        forwarding.as_ref(),
-    )));
-    let mut last_cos_status_ns = monotonic_nanos();
     // #869: worker-runtime telemetry.  Local counters, published to
     // `runtime_atomics` on the ~1s cadence below.
     use crate::afxdp::worker_runtime::{
-        WorkerRuntimeCounters, WorkerRuntimeState, current_tid, sample_thread_cpu_ns,
+        WorkerRuntimeCounters, WorkerRuntimeState, sample_thread_cpu_ns,
     };
     let mut wr_counters = WorkerRuntimeCounters::default();
     let mut wr_state = WorkerRuntimeState::IdleBlock;
     let mut wr_last_loop_ns = monotonic_nanos();
     let mut wr_last_publish_ns = wr_last_loop_ns;
     const WR_PUBLISH_INTERVAL_NS: u64 = 1_000_000_000;
-    runtime_atomics.set_tid(current_tid());
     while !stop.load(Ordering::Relaxed) {
         let loop_now_ns = monotonic_nanos();
         // #869: attribute elapsed delta to the previous loop's state.
@@ -777,66 +623,9 @@ pub(crate) fn worker_loop(
             }
         }
         crate::filter::flush_recorded_filter_counters();
-        dbg_rx_total += dbg_poll.rx;
         #[cfg(feature = "debug-log")]
         {
-            dbg_tx_total += dbg_poll.tx;
-        }
-        dbg_forward_total += dbg_poll.forward;
-        #[cfg(feature = "debug-log")]
-        {
-            dbg_local_total += dbg_poll.local;
-            dbg_session_hit += dbg_poll.session_hit;
-            dbg_session_miss += dbg_poll.session_miss;
-            dbg_session_create += dbg_poll.session_create;
-            dbg_no_route += dbg_poll.no_route;
-            dbg_missing_neigh += dbg_poll.missing_neigh;
-            dbg_neg_neigh_fast_fail += dbg_poll.neg_neigh_fast_fail;
-            dbg_policy_deny += dbg_poll.policy_deny;
-            dbg_ha_inactive += dbg_poll.ha_inactive;
-            dbg_no_egress_binding += dbg_poll.no_egress_binding;
-            dbg_build_fail += dbg_poll.build_fail;
-            dbg_tx_err += dbg_poll.tx_err;
-            dbg_metadata_err += dbg_poll.metadata_err;
-        }
-        #[cfg(feature = "debug-log")]
-        {
-            dbg_disposition_other += dbg_poll.disposition_other;
-            dbg_enqueue_ok += dbg_poll.enqueue_ok;
-            dbg_enqueue_inplace += dbg_poll.enqueue_inplace;
-            dbg_enqueue_direct += dbg_poll.enqueue_direct;
-            dbg_enqueue_copy += dbg_poll.enqueue_copy;
-            dbg_rx_from_trust += dbg_poll.rx_from_trust;
-            dbg_rx_from_wan += dbg_poll.rx_from_wan;
-            dbg_fwd_trust_to_wan += dbg_poll.fwd_trust_to_wan;
-            dbg_fwd_wan_to_trust += dbg_poll.fwd_wan_to_trust;
-            dbg_nat_snat += dbg_poll.nat_applied_snat;
-            dbg_nat_dnat += dbg_poll.nat_applied_dnat;
-            dbg_nat_none += dbg_poll.nat_applied_none;
-            dbg_frame_build_none += dbg_poll.frame_build_none;
-        }
-        #[cfg(feature = "debug-log")]
-        {
-            dbg_rx_tcp_rst += dbg_poll.rx_tcp_rst;
-            dbg_rx_tcp_fin += dbg_poll.rx_tcp_fin;
-            dbg_rx_tcp_synack += dbg_poll.rx_tcp_synack;
-            dbg_rx_tcp_zero_window += dbg_poll.rx_tcp_zero_window;
-            dbg_fwd_tcp_fin += dbg_poll.fwd_tcp_fin;
-            dbg_fwd_tcp_rst += dbg_poll.fwd_tcp_rst;
-            dbg_fwd_tcp_zero_window += dbg_poll.fwd_tcp_zero_window;
-        }
-        #[cfg(feature = "debug-log")]
-        {
-            dbg_rx_bytes_total += dbg_poll.rx_bytes_total;
-            dbg_tx_bytes_total += dbg_poll.tx_bytes_total;
-            dbg_rx_oversized += dbg_poll.rx_oversized;
-            if dbg_poll.rx_max_frame > dbg_rx_max_frame {
-                dbg_rx_max_frame = dbg_poll.rx_max_frame;
-            }
-            if dbg_poll.tx_max_frame > dbg_tx_max_frame {
-                dbg_tx_max_frame = dbg_poll.tx_max_frame;
-            }
-            dbg_seg_needed_but_none += dbg_poll.seg_needed_but_none;
+            dbg.accumulate(&dbg_poll);
         }
         if !bindings.is_empty() {
             poll_start = (poll_start + 1) % bindings.len();
@@ -913,7 +702,6 @@ pub(crate) fn worker_loop(
             let elapsed = loop_now_ns.saturating_sub(dbg_last_report_ns);
             if elapsed >= DBG_REPORT_INTERVAL_NS {
                 #[cfg(feature = "debug-log")]
-                let secs = elapsed as f64 / 1_000_000_000.0;
                 let session_count = sessions.len();
                 let mut binding_summary = String::new();
                 for (i, b) in bindings.iter().enumerate() {
@@ -960,7 +748,7 @@ pub(crate) fn worker_loop(
                     // TX pipeline debug counters
                     #[cfg(feature = "debug-log")]
                     {
-                        dbg_tx_tcp_rst += b.telemetry.dbg_tx_tcp_rst;
+                        dbg.tx_tcp_rst += b.telemetry.dbg_tx_tcp_rst;
                     }
                     let _ = write!(
                         binding_summary,
@@ -1040,266 +828,49 @@ pub(crate) fn worker_loop(
                     }
                     binding_summary.push(']');
                 }
+                // #1776: the cfg(debug-log) verbose per-second report —
+                // the giant DBG summary eprintln + degraded-path dump —
+                // lives in debug_report.rs. Release builds skip it, as
+                // before (the eprintln was already cfg-gated; the
+                // always-on binding_summary build above is unchanged).
                 #[cfg(feature = "debug-log")]
-                eprintln!(
-                    "DBG w{}: {:.1}s rx={} tx={} fwd={} local={} sess_hit={} sess_miss={} sess_create={} \
-                     no_route={} miss_neigh={} neg_ff={} pol_deny={} ha_inact={} no_egress={} build_fail={} \
-                     tx_err={} meta_err={} other={} enq_ok={} enq_ip={} enq_dir={} enq_cp={} sessions={} \
-                     DIR:trust_rx={}/wan_rx={}/t2w={}/w2t={} NAT:snat={}/dnat={}/none={}/bld_none={} RST:rx={}/tx={} \
-                     SIZE:rx_avg={}/rx_max={}/tx_avg={}/tx_max={}/rx_over={}/seg_miss={} \
-                     TCP_RX:fin={}/synack={}/zwin={} TCP_FWD:fin={}/rst={}/zwin={} \
-                     CSUM:verified={}/bad_ip={}/bad_l4={} \
-                     SESS_BPF:verify_ok={}/verify_fail={}/bpf_entries={} bindings:{}",
+                debug_report::emit_periodic_report(
                     worker_id,
-                    secs,
-                    dbg_rx_total,
-                    dbg_tx_total,
-                    dbg_forward_total,
-                    dbg_local_total,
-                    dbg_session_hit,
-                    dbg_session_miss,
-                    dbg_session_create,
-                    dbg_no_route,
-                    dbg_missing_neigh,
-                    dbg_neg_neigh_fast_fail,
-                    dbg_policy_deny,
-                    dbg_ha_inactive,
-                    dbg_no_egress_binding,
-                    dbg_build_fail,
-                    dbg_tx_err,
-                    dbg_metadata_err,
-                    dbg_disposition_other,
-                    dbg_enqueue_ok,
-                    dbg_enqueue_inplace,
-                    dbg_enqueue_direct,
-                    dbg_enqueue_copy,
+                    elapsed,
+                    &dbg,
                     session_count,
-                    dbg_rx_from_trust,
-                    dbg_rx_from_wan,
-                    dbg_fwd_trust_to_wan,
-                    dbg_fwd_wan_to_trust,
-                    dbg_nat_snat,
-                    dbg_nat_dnat,
-                    dbg_nat_none,
-                    dbg_frame_build_none,
-                    dbg_rx_tcp_rst,
-                    dbg_tx_tcp_rst,
-                    if dbg_rx_total > 0 {
-                        dbg_rx_bytes_total / dbg_rx_total
-                    } else {
-                        0
-                    },
-                    dbg_rx_max_frame,
-                    if dbg_enqueue_ok > 0 {
-                        dbg_tx_bytes_total / dbg_enqueue_ok
-                    } else {
-                        0
-                    },
-                    dbg_tx_max_frame,
-                    dbg_rx_oversized,
-                    dbg_seg_needed_but_none,
-                    dbg_rx_tcp_fin,
-                    dbg_rx_tcp_synack,
-                    dbg_rx_tcp_zero_window,
-                    dbg_fwd_tcp_fin,
-                    dbg_fwd_tcp_rst,
-                    dbg_fwd_tcp_zero_window,
-                    CSUM_VERIFIED_TOTAL.swap(0, Ordering::Relaxed),
-                    CSUM_BAD_IP_TOTAL.swap(0, Ordering::Relaxed),
-                    CSUM_BAD_L4_TOTAL.swap(0, Ordering::Relaxed),
-                    SESSION_PUBLISH_VERIFY_OK.swap(0, Ordering::Relaxed),
-                    SESSION_PUBLISH_VERIFY_FAIL.swap(0, Ordering::Relaxed),
-                    if let Some(b) = bindings.first() {
-                        count_bpf_session_entries(b.bpf_maps.session_map_fd)
-                    } else {
-                        0
-                    },
-                    binding_summary,
+                    &bindings,
+                    &binding_summary,
                 );
-                // Non-debug builds: no per-second stats dump (use debug-log feature for verbose output).
-                // Print retained-shim degraded-path stats — tells us WHY
-                // packets stop being redirected to XSK.
-                if cfg!(feature = "debug-log") {
-                    if let Some(stats) = read_degraded_path_stats() {
-                        if !stats.is_empty() {
-                            let s: Vec<String> =
-                                stats.iter().map(|(n, v)| format!("{n}={v}")).collect();
-                            eprintln!("DBG w{}: XDP_DEGRADED: {}", worker_id, s.join(" "));
-                        }
-                    }
-                }
                 // Save prev counters BEFORE reset for stall detection below
-                if cfg!(feature = "debug-log") {
-                    prev_rx_total = dbg_rx_total;
-                    prev_fwd_total = dbg_forward_total;
-                }
+                #[cfg(feature = "debug-log")]
+                let (prev_rx_total, prev_fwd_total) = (dbg.rx_total, dbg.forward_total);
                 dbg_last_report_ns = loop_now_ns;
-                dbg_rx_total = 0;
+                // #1776 (plan v3.1 AGY CORRECTNESS-1 guard): DbgCounters
+                // holds ONLY per-interval counters, so this single-line
+                // reset must NOT touch the persistent debug state —
+                // dbg_last_report_ns (re-armed above) and the cross-
+                // interval stall baselines stall_prev_fwd /
+                // stall_reported, which live in plain locals; the
+                // same-interval prev_rx_total / prev_fwd_total snapshot
+                // was taken from `dbg` above, BEFORE this reset.
                 #[cfg(feature = "debug-log")]
                 {
-                    dbg_tx_total = 0;
-                }
-                dbg_forward_total = 0;
-                #[cfg(feature = "debug-log")]
-                {
-                    dbg_local_total = 0;
-                    dbg_session_hit = 0;
-                    dbg_session_miss = 0;
-                    dbg_session_create = 0;
-                    dbg_no_route = 0;
-                    dbg_missing_neigh = 0;
-                    dbg_neg_neigh_fast_fail = 0;
-                    dbg_policy_deny = 0;
-                    dbg_ha_inactive = 0;
-                    dbg_no_egress_binding = 0;
-                    dbg_build_fail = 0;
-                    dbg_tx_err = 0;
-                    dbg_metadata_err = 0;
-                }
-                #[cfg(feature = "debug-log")]
-                {
-                    dbg_disposition_other = 0;
-                    dbg_enqueue_ok = 0;
-                    dbg_enqueue_inplace = 0;
-                    dbg_enqueue_direct = 0;
-                    dbg_enqueue_copy = 0;
-                    dbg_rx_from_trust = 0;
-                    dbg_rx_from_wan = 0;
-                    dbg_fwd_trust_to_wan = 0;
-                    dbg_fwd_wan_to_trust = 0;
-                }
-                #[cfg(feature = "debug-log")]
-                {
-                    dbg_rx_bytes_total = 0;
-                    dbg_tx_bytes_total = 0;
-                    dbg_rx_oversized = 0;
-                    dbg_rx_max_frame = 0;
-                    dbg_tx_max_frame = 0;
-                    dbg_seg_needed_but_none = 0;
+                    dbg = debug_report::DbgCounters::default();
                 }
                 // Stall detection: stall_prev_fwd is PREVIOUS interval's fwd count,
                 // prev_fwd_total is THIS interval's fwd count (saved before reset).
-                if cfg!(feature = "debug-log") {
-                    if stall_prev_fwd > 10 && prev_fwd_total == 0 && !stall_reported {
-                        stall_reported = true;
-                        eprintln!(
-                            "DBG STALL_DETECTED: w{} two_ago_fwd={} this_interval_fwd={} this_interval_rx={} sessions={}",
-                            worker_id, stall_prev_fwd, prev_fwd_total, prev_rx_total, session_count
-                        );
-                        // Dump comprehensive per-binding state at stall moment
-                        for (si, sb) in bindings.iter().enumerate() {
-                            use std::fmt::Write;
-                            let fill_p = sb.xsk.device.pending();
-                            let rx_a = sb.xsk.rx.available_relaxed();
-                            let ifl = sb.tx_pipeline.in_flight_prepared_recycles.len() as u32;
-                            let ptxp = sb.tx_pipeline.pending_tx_prepared.len() as u32;
-                            let ptxl = sb.tx_pipeline.pending_tx_local.len() as u32;
-                            let total = sb.tx_pipeline.pending_fill_frames.len() as u32
-                                + fill_p
-                                + rx_a
-                                + sb.tx_pipeline.free_tx_frames.len() as u32
-                                + sb.tx_pipeline.outstanding_tx
-                                + ifl
-                                + sb.scratch.scratch_recycle.len() as u32
-                                + ptxp;
-                            let raw = diagnose_raw_ring_state(sb.xsk.rx.as_raw_fd());
-                            let mut stall_line = format!(
-                                "DBG STALL_BINDING[{}]: if={} q={} pfill={} fring={} rxring={} free_tx={} otx={} ifl={} ptxp={} ptxl={} total={}/{}",
-                                si,
-                                sb.ifindex,
-                                sb.queue_id,
-                                sb.tx_pipeline.pending_fill_frames.len(),
-                                fill_p,
-                                rx_a,
-                                sb.tx_pipeline.free_tx_frames.len(),
-                                sb.tx_pipeline.outstanding_tx,
-                                ifl,
-                                ptxp,
-                                ptxl,
-                                total,
-                                sb.umem.total_frames(),
-                            );
-                            if let Some((rxp, rxc, frp, frc, txp, txc, crp, crc)) = raw {
-                                let _ = write!(
-                                    stall_line,
-                                    " RAW:rxP={rxp}/rxC={rxc}/frP={frp}/frC={frc}/txP={txp}/txC={txc}/crP={crp}/crC={crc}"
-                                );
-                            }
-                            if let Ok(Some(stats)) = sb.xsk.device.statistics_v2().map(Some) {
-                                let _ = write!(
-                                    stall_line,
-                                    " xsk:drop={}/rfull={}/fempty={}/tempty={}",
-                                    stats.rx_dropped,
-                                    stats.rx_ring_full,
-                                    stats.rx_fill_ring_empty_descs,
-                                    stats.tx_ring_empty_descs
-                                );
-                            }
-                            eprintln!("{stall_line}");
-                        }
-                        // Dump all session keys for this worker
-                        let mut sess_dump = String::new();
-                        let mut count = 0;
-                        sessions.iter_with_origin(|key, decision, metadata, origin| {
-                            if count < 20 {
-                                use std::fmt::Write;
-                                let _ = write!(
-                                    sess_dump,
-                                    "\n  SESS: {}:{} -> {}:{} proto={} nat=({:?},{:?}) is_rev={} origin={}",
-                                    key.src_ip,
-                                    key.src_port,
-                                    key.dst_ip,
-                                    key.dst_port,
-                                    key.protocol,
-                                    decision.nat.rewrite_src,
-                                    decision.nat.rewrite_dst,
-                                    metadata.is_reverse,
-                                    origin.as_str(),
-                                );
-                                count += 1;
-                            }
-                        });
-                        if !sess_dump.is_empty() {
-                            eprintln!("DBG STALL_SESSIONS:{sess_dump}");
-                        }
-                        // Dump degraded-path stats at stall time.
-                        if let Some(stats) = read_degraded_path_stats() {
-                            if !stats.is_empty() {
-                                let s: Vec<String> =
-                                    stats.iter().map(|(n, v)| format!("{n}={v}")).collect();
-                                eprintln!("DBG STALL_DEGRADED: {}", s.join(" "));
-                            }
-                        }
-                        // Also dump BPF session count
-                        if let Some(b) = bindings.first() {
-                            eprintln!(
-                                "DBG STALL_BPF_SESSIONS: entries={}",
-                                count_bpf_session_entries(b.bpf_maps.session_map_fd)
-                            );
-                        }
-                    } else if prev_fwd_total > 0 {
-                        stall_reported = false;
-                    }
-                    stall_prev_fwd = prev_fwd_total;
-                }
                 #[cfg(feature = "debug-log")]
-                {
-                    dbg_nat_snat = 0;
-                    dbg_nat_dnat = 0;
-                    dbg_nat_none = 0;
-                    dbg_frame_build_none = 0;
-                }
-                #[cfg(feature = "debug-log")]
-                {
-                    dbg_rx_tcp_rst = 0;
-                    dbg_tx_tcp_rst = 0;
-                    dbg_rx_tcp_fin = 0;
-                    dbg_rx_tcp_synack = 0;
-                    dbg_rx_tcp_zero_window = 0;
-                    dbg_fwd_tcp_fin = 0;
-                    dbg_fwd_tcp_rst = 0;
-                    dbg_fwd_tcp_zero_window = 0;
-                }
+                debug_report::check_and_dump_stall(
+                    worker_id,
+                    prev_rx_total,
+                    prev_fwd_total,
+                    &mut stall_prev_fwd,
+                    &mut stall_reported,
+                    session_count,
+                    &bindings,
+                    &sessions,
+                );
                 for b in bindings.iter_mut() {
                     // #802: publish ring-pressure counters into BindingLiveState
                     // BEFORE resetting the worker-local window. The worker-local

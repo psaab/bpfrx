@@ -85,6 +85,16 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     state.status.neighbor_resolver_probe_on_stale_total = r.probe_on_stale;
     state.status.neighbor_resolver_get_failures_total = r.get_failures;
     state.status.neighbor_resolver_epoch_rejects_total = r.epoch_rejects;
+    // #1771 §2.6: backoff-retry GETs + the monitor thread's ENOBUFS /
+    // upsert-only re-dump telemetry (§2.5 mechanism, previously blind).
+    state.status.neighbor_resolver_get_backoff_attempts_total = r.get_backoff_attempts;
+    state.status.neighbor_netlink_enobufs_total = r.netlink_enobufs;
+    state.status.neighbor_netlink_redumps_total = r.netlink_redumps;
+    state.status.neighbor_netlink_redump_upserts_total = r.netlink_redump_upserts;
+    // #1771 §2.6: per-binding-summed gauges — distinct unresolved
+    // next-hop keys in pending_neigh + keys in the negative caches.
+    state.status.neighbor_pending_keys = state.afxdp.neighbor_pending_keys_total();
+    state.status.neg_neigh_keys = state.afxdp.neg_neigh_keys_total();
     // #1772: neighbor/ARP resolution LATENCY telemetry (pending-dwell +
     // resolver GETNEIGH-RTT histograms + timeout-drop / max-depth).
     let lat = state.afxdp.neighbor_latency_telemetry();
