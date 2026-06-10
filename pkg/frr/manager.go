@@ -178,23 +178,15 @@ type FullConfig struct {
 	PreferredRoutes []config.RouteOverlayEntry
 }
 
-// Apply generates an FRR config from OSPF/BGP settings and reloads FRR.
-func (m *Manager) Apply(ospf *config.OSPFConfig, bgp *config.BGPConfig) error {
-	return m.ApplyFull(&FullConfig{
-		OSPF: ospf,
-		BGP:  bgp,
-	})
-}
-
-// ApplyWithInstances generates an FRR config with optional per-VRF routing
-// instances and reloads FRR.
-func (m *Manager) ApplyWithInstances(ospf *config.OSPFConfig, bgp *config.BGPConfig, instances []InstanceConfig) error {
-	return m.ApplyFull(&FullConfig{
-		OSPF:      ospf,
-		BGP:       bgp,
-		Instances: instances,
-	})
-}
+// NOTE (#1827, AGY review on PR #1843 F1): the legacy Apply(ospf, bgp)
+// and ApplyWithInstances(...) convenience constructors were DELETED
+// here. They built a partial FullConfig inline, bypassing the daemon's
+// assembleFRRConfig — the sole production FullConfig constructor — so
+// any caller reaching them would have wiped an active ip-monitoring
+// failover overlay (PreferredRoutes) from the managed section. They
+// had zero callers (production or test) at removal time. New callers
+// must go through the daemon's assembleFRRConfig; pkg/daemon's
+// TestFRRFullConfigConstructedOnlyByAssembler guard enforces this.
 
 // ApplyFull generates the complete FRR config including static routes,
 // DHCP-learned defaults, per-VRF routes, and dynamic protocols, then

@@ -325,3 +325,113 @@ func TestApplyPreservesFailedStateAcrossCommit(t *testing.T) {
 		t.Fatalf("overlay = %+v after policy removal", got)
 	}
 }
+
+// TestFilterOverlayForConfig is the Codex PR #1843 HIGH-1 regression
+// test: a commit that removes a policy or edits its preferred-route
+// spec must not republish the stale overlay entries on the commit's
+// own publish; an unrelated commit preserves the overlay.
+func TestFilterOverlayForConfig(t *testing.T) {
+	e, _ := newTestEngine(nil)
+	e.Apply(testPolicyConfig(), passResults())
+	e.HandleTransition(transition("WAN", "wan-a", "fail", passResults()))
+	overlay := e.ActiveOverlay()
+	if len(overlay) != 2 {
+		t.Fatalf("setup: overlay = %+v", overlay)
+	}
+
+	// Unrelated commit: identical policy spec → preserved verbatim.
+	kept := FilterOverlayForConfig(overlay, testPolicyConfig())
+	if len(kept) != 2 {
+		t.Fatalf("unrelated commit dropped overlay entries: %+v", kept)
+	}
+
+	// Commit removes the policy → overlay entries absent.
+	if got := FilterOverlayForConfig(overlay, &config.IPMonitoringConfig{}); got != nil {
+		t.Fatalf("removed policy still riding the commit: %+v", got)
+	}
+	if got := FilterOverlayForConfig(overlay, nil); got != nil {
+		t.Fatalf("nil ip-monitoring config still riding the commit: %+v", got)
+	}
+
+	// Commit edits the master route's next-hop → the OLD hop is
+	// dropped; the untouched ISP-B entry survives.
+	edited := testPolicyConfig()
+	edited.Policies["wan-failover"].PreferredRoutes[0].NextHop = "172.16.80.99"
+	kept = FilterOverlayForConfig(overlay, edited)
+	if len(kept) != 1 || kept[0].RoutingInstance != "ISP-B" {
+		t.Fatalf("edited next-hop: kept = %+v, want only the ISP-B entry", kept)
+	}
+	for _, entry := range kept {
+		if entry.NextHop == "172.16.80.1" && entry.RoutingInstance == "" {
+			t.Fatalf("stale master next-hop survived the edit: %+v", kept)
+		}
+	}
+
+	// Commit edits the preferred-metric → spec changed → dropped.
+	edited = testPolicyConfig()
+	edited.Policies["wan-failover"].PreferredRoutes[0].PreferredMetric = 99
+	kept = FilterOverlayForConfig(overlay, edited)
+	if len(kept) != 1 || kept[0].RoutingInstance != "ISP-B" {
+		t.Fatalf("edited metric: kept = %+v, want only the ISP-B entry", kept)
+	}
+
+	// Non-canonical but equivalent prefix spelling still matches.
+	equiv := testPolicyConfig()
+	equiv.Policies["wan-failover"].PreferredRoutes[0].Destination = "0.0.0.0/0"
+	kept = FilterOverlayForConfig(overlay, equiv)
+	if len(kept) != 2 {
+		t.Fatalf("canonical-equivalent prefix dropped: %+v", kept)
+	}
+}
+
+// TestApplyWithoutOverlayChangeDoesNotActuate (Codex PR #1843 MED):
+// a commit with zero policies — or any commit that leaves the
+// effective overlay unchanged — must not schedule a routes-only
+// actuation (one spurious frr-reload per commit otherwise).
+func TestApplyWithoutOverlayChangeDoesNotActuate(t *testing.T) {
+	var actuations atomic.Int32
+	e := New(func() { actuations.Add(1) })
+	e.debounce = 5 * time.Millisecond
+	e.throttle = 5 * time.Millisecond
+	e.Start()
+	defer e.Stop()
+
+	// No-policy commits: nothing to actuate.
+	e.Apply(&config.IPMonitoringConfig{}, nil)
+	e.Apply(nil, nil)
+	// Policies present but all passing (overlay nil before and after).
+	e.Apply(testPolicyConfig(), passResults())
+	e.Apply(testPolicyConfig(), passResults())
+	time.Sleep(60 * time.Millisecond)
+	if got := actuations.Load(); got != 0 {
+		t.Fatalf("actuations = %d after overlay-neutral commits, want 0", got)
+	}
+
+	// A real failure still actuates...
+	e.HandleTransition(transition("WAN", "wan-a", "fail", passResults()))
+	time.Sleep(60 * time.Millisecond)
+	if got := actuations.Load(); got == 0 {
+		t.Fatal("real failure did not actuate")
+	}
+
+	// ...and an unrelated re-Apply with the overlay active (same
+	// spec, still-failing results) stays quiet.
+	before := actuations.Load()
+	results := passResults()
+	results[0].LastStatus = "fail"
+	e.Apply(testPolicyConfig(), results)
+	time.Sleep(60 * time.Millisecond)
+	if got := actuations.Load(); got != before {
+		t.Fatalf("unrelated commit actuated: %d -> %d", before, got)
+	}
+
+	// A spec edit while FAILED changes the overlay → actuates (the
+	// HIGH-1 re-injection path).
+	edited := testPolicyConfig()
+	edited.Policies["wan-failover"].PreferredRoutes[0].NextHop = "172.16.80.99"
+	e.Apply(edited, results)
+	time.Sleep(60 * time.Millisecond)
+	if got := actuations.Load(); got == before {
+		t.Fatal("overlay-changing spec edit did not actuate")
+	}
+}

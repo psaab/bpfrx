@@ -918,11 +918,13 @@ func (d *Daemon) applyRethServicesForRG(rgID int) {
 	if d.dhcpServer != nil && (cfg.System.DHCPServer.DHCPLocalServer != nil || cfg.System.DHCPServer.DHCPv6LocalServer != nil) {
 		dhcpCfg := d.filterDHCPConfigForMasterRGs(cfg)
 		if dhcpCfg != nil {
-			if err := d.dhcpServer.Apply(dhcpCfg); err != nil {
-				slog.Warn("vrrp: failed to apply DHCP server on MASTER", "rg", rgID, "err", err)
-			} else {
-				slog.Info("vrrp: DHCP server started (MASTER)", "rg", rgID)
-			}
+			// ApplyAsync (#1835 F2): Kea reconcile shells out to
+			// systemctl with a 15s bound; running it inline would
+			// block this VRRP event loop. Latest-wins coalescing in
+			// the manager keeps final state correct; failures are
+			// logged by the worker with this reason.
+			d.dhcpServer.ApplyAsync(dhcpCfg, fmt.Sprintf("vrrp MASTER rg%d", rgID))
+			slog.Info("vrrp: DHCP server apply enqueued (MASTER)", "rg", rgID)
 		}
 	}
 }
@@ -963,19 +965,19 @@ func (d *Daemon) clearRethServicesForRG(rgID int) {
 		}
 	}
 	if d.dhcpServer != nil {
+		// ApplyAsync on both branches (#1835 F2): keeps this VRRP
+		// event loop off the 15s-bounded systemctl path AND funnels
+		// every Kea desired state through the same latest-wins
+		// mailbox, preserving ordering with the MASTER-side applies.
+		// ApplyAsync(nil) is the authoritative clear (Apply(nil)).
 		if anyOtherMaster {
-			// Reapply DHCP with only the remaining master RGs' interfaces.
-			dhcpCfg := d.filterDHCPConfigForMasterRGs(cfg)
-			if dhcpCfg != nil {
-				if err := d.dhcpServer.Apply(dhcpCfg); err != nil {
-					slog.Warn("vrrp: failed to reapply DHCP after RG BACKUP", "rg", rgID, "err", err)
-				}
-			} else {
-				d.dhcpServer.Clear()
-			}
+			// Reapply DHCP with only the remaining master RGs'
+			// interfaces (nil when none match → clear).
+			d.dhcpServer.ApplyAsync(d.filterDHCPConfigForMasterRGs(cfg),
+				fmt.Sprintf("vrrp BACKUP rg%d (other RG still MASTER)", rgID))
 		} else {
-			d.dhcpServer.Clear()
-			slog.Info("vrrp: DHCP server stopped (BACKUP)", "rg", rgID)
+			d.dhcpServer.ApplyAsync(nil, fmt.Sprintf("vrrp BACKUP rg%d", rgID))
+			slog.Info("vrrp: DHCP server stop enqueued (BACKUP)", "rg", rgID)
 		}
 	}
 }
@@ -1060,11 +1062,9 @@ func (d *Daemon) applyRethServices() {
 	if d.dhcpServer != nil && (cfg.System.DHCPServer.DHCPLocalServer != nil || cfg.System.DHCPServer.DHCPv6LocalServer != nil) {
 		dhcpCfg := cfg.System.DHCPServer
 		resolveDHCPRethInterfaces(&dhcpCfg, cfg)
-		if err := d.dhcpServer.Apply(&dhcpCfg); err != nil {
-			slog.Warn("vrrp: failed to apply DHCP server on MASTER", "err", err)
-		} else {
-			slog.Info("vrrp: DHCP server started (MASTER)")
-		}
+		// ApplyAsync (#1835 F2): see applyRethServicesForRG.
+		d.dhcpServer.ApplyAsync(&dhcpCfg, "vrrp MASTER (legacy all-RG)")
+		slog.Info("vrrp: DHCP server apply enqueued (MASTER)")
 	}
 }
 
@@ -1082,8 +1082,10 @@ func (d *Daemon) clearRethServices() {
 		}
 	}
 	if d.dhcpServer != nil {
-		d.dhcpServer.Clear()
-		slog.Info("vrrp: DHCP server stopped (BACKUP)")
+		// ApplyAsync(nil) == authoritative clear (#1835 F2): see
+		// clearRethServicesForRG.
+		d.dhcpServer.ApplyAsync(nil, "vrrp BACKUP (legacy all-RG)")
+		slog.Info("vrrp: DHCP server stop enqueued (BACKUP)")
 	}
 }
 

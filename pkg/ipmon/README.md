@@ -29,7 +29,12 @@ overlay, so kernel and dataplane agree by construction:
 Coalesced: dirty bit + bounded debounce (1 s) + minimum
 inter-actuation throttle (3 s); at most one actuation in flight (the
 single run-loop goroutine); the actuator snapshots the overlay at run
-time (last-writer-wins). A sustained per-cycle flapper with hold-down 0
+time (last-writer-wins). `Apply` marks dirty only when the effective
+overlay actually changed (Codex PR #1843 MED) — overlay-neutral
+commits never schedule a routes-only FRR reload, and the actuator
+bumps the FIB generation only when `PublishRouteOverlaySnapshot`
+reports a REAL publish (duplicate-skips do not churn established-flow
+route caches). A sustained per-cycle flapper with hold-down 0
 produces at most one frr-reload + one snapshot push per throttle window
 — bounded and observable via `xpf_ipmon_policy_transitions_total`.
 

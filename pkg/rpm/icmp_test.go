@@ -2,6 +2,8 @@ package rpm
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"sync"
@@ -307,5 +309,153 @@ func TestTransitionCallbackFires(t *testing.T) {
 	mu.Unlock()
 	if len(got) != 2 || got[1].Status != "pass" {
 		t.Fatalf("transitions = %+v, want fail then pass", got)
+	}
+}
+
+// TestSetupErrorHoldsStateAndFiresNoTransition is the AGY PR #1843 F2
+// regression test: a raw-socket open failure (capability/permission —
+// an ENVIRONMENT error, not path health) must hold the test's current
+// state completely. No SuccFail counting, no status change, no events,
+// no Transition callback — so ip-monitoring can never inject/withdraw
+// preferred routes off a capability regression. A real timeout on the
+// same test still fails as today (contrast leg).
+func TestSetupErrorHoldsStateAndFiresNoTransition(t *testing.T) {
+	m := New()
+	var mu sync.Mutex
+	var transitions []Transition
+	var events []Event
+	m.SetTransitionCallback(func(tr Transition) {
+		mu.Lock()
+		transitions = append(transitions, tr)
+		mu.Unlock()
+	})
+	m.SetEventCallback(func(ev Event) {
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	})
+
+	key := "WAN/t"
+	m.results[key] = &ProbeResult{ProbeName: "WAN", TestName: "t", LastStatus: "pass"}
+	test := &config.RPMTest{Name: "t", Target: "192.0.2.1", ThresholdSuccessive: 2}
+
+	// Socket open fails (simulates CAP_NET_RAW dropped / EPERM).
+	m.icmpListen = func(network, laddr string, opts probeSockOpts) (net.PacketConn, error) {
+		return nil, &net.OpError{Op: "listen", Err: timeoutError{}}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	// Three full cycles, each over the threshold's worth of probes —
+	// would be FAILED many times over if setup errors counted.
+	for i := 0; i < 3; i++ {
+		m.runSingleTest(ctx, "WAN", test, key, 3, time.Millisecond, 2)
+	}
+
+	m.mu.RLock()
+	r := *m.results[key]
+	m.mu.RUnlock()
+	if r.LastStatus != "pass" {
+		t.Fatalf("LastStatus = %q after setup errors, want held at pass", r.LastStatus)
+	}
+	if r.SuccFail != 0 {
+		t.Fatalf("SuccFail = %d after setup errors, want 0 (no failure counting)", r.SuccFail)
+	}
+	if r.TotalSent != 0 {
+		t.Fatalf("TotalSent = %d, want 0 (nothing reached the wire)", r.TotalSent)
+	}
+	mu.Lock()
+	gotTransitions, gotEvents := len(transitions), len(events)
+	mu.Unlock()
+	if gotTransitions != 0 {
+		t.Fatalf("transitions = %+v, want none for setup errors", transitions)
+	}
+	if gotEvents != 0 {
+		t.Fatalf("events = %+v, want none for setup errors", events)
+	}
+
+	// Contrast: the socket opens but the echo genuinely times out —
+	// the test FAILS as today and the transition fires.
+	m.icmpListen = func(network, laddr string, opts probeSockOpts) (net.PacketConn, error) {
+		return &fakeICMPConn{replies: make(chan fakeReply, 1), failFast: true}, nil
+	}
+	m.runSingleTest(ctx, "WAN", test, key, 2, time.Millisecond, 2)
+
+	m.mu.RLock()
+	r = *m.results[key]
+	m.mu.RUnlock()
+	if r.LastStatus != "fail" {
+		t.Fatalf("LastStatus = %q after real timeouts, want fail", r.LastStatus)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(transitions) != 1 || transitions[0].Status != "fail" {
+		t.Fatalf("transitions = %+v, want one fail transition from the real timeout", transitions)
+	}
+}
+
+// TestProbeICMPSetupErrorClassified pins the error classification:
+// socket-open failures are ErrProbeSetup; timeout failures are not.
+func TestProbeICMPSetupErrorClassified(t *testing.T) {
+	m := New()
+	m.icmpListen = func(network, laddr string, opts probeSockOpts) (net.PacketConn, error) {
+		return nil, &net.OpError{Op: "listen", Err: timeoutError{}}
+	}
+	test := &config.RPMTest{Name: "t", Target: "192.0.2.1"}
+	_, err := m.probeICMP(context.Background(), test, probeSockOpts{})
+	if !errors.Is(err, ErrProbeSetup) {
+		t.Fatalf("socket-open failure not classified as ErrProbeSetup: %v", err)
+	}
+
+	m.icmpListen = func(network, laddr string, opts probeSockOpts) (net.PacketConn, error) {
+		return &fakeICMPConn{replies: make(chan fakeReply, 1), failFast: true}, nil
+	}
+	_, err = m.probeICMP(context.Background(), test, probeSockOpts{})
+	if err == nil || errors.Is(err, ErrProbeSetup) {
+		t.Fatalf("timeout must stay a genuine probe failure, got %v", err)
+	}
+}
+
+// TestTCPAndHTTPSetupErrorsClassified (Codex PR #1843 HIGH-2): socket
+// control/option failures on the tcp-ping and http-get dial path
+// (SO_BINDTODEVICE to a nonexistent device — EPERM without
+// CAP_NET_RAW, ENODEV with it; SO_MARK EPERM) classify as
+// ErrProbeSetup so the probe loop holds state; a genuine connection
+// refusal stays a path signal.
+func TestTCPAndHTTPSetupErrorsClassified(t *testing.T) {
+	// A listener we close immediately: dialing its port afterwards is
+	// a genuine REFUSED — a real path/host signal.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	m := New()
+	test := &config.RPMTest{Name: "t", Target: "127.0.0.1", DestPort: port}
+	setupOpts := probeSockOpts{BindDevice: "xpf-nonexistent0"}
+
+	// tcp-ping: bind-device failure → setup error.
+	_, err = m.probeTCP(context.Background(), test, setupOpts)
+	if !errors.Is(err, ErrProbeSetup) {
+		t.Fatalf("tcp-ping bind-device failure not ErrProbeSetup: %v", err)
+	}
+	// tcp-ping: genuine refusal without socket options → path signal.
+	_, err = m.probeTCP(context.Background(), test, probeSockOpts{})
+	if err == nil || errors.Is(err, ErrProbeSetup) {
+		t.Fatalf("tcp-ping refusal must stay a path signal, got %v", err)
+	}
+
+	// http-get: same classification through the transport/url.Error
+	// wrapping.
+	httpTest := &config.RPMTest{Name: "t", Target: fmt.Sprintf("http://127.0.0.1:%d/", port)}
+	_, err = m.probeHTTP(context.Background(), httpTest, setupOpts)
+	if !errors.Is(err, ErrProbeSetup) {
+		t.Fatalf("http-get bind-device failure not ErrProbeSetup: %v", err)
+	}
+	_, err = m.probeHTTP(context.Background(), httpTest, probeSockOpts{})
+	if err == nil || errors.Is(err, ErrProbeSetup) {
+		t.Fatalf("http-get refusal must stay a path signal, got %v", err)
 	}
 }

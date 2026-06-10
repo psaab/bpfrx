@@ -30,6 +30,8 @@ func (c *xpfCollector) collectUserspaceStatus(ch chan<- prometheus.Metric, dp ap
 	c.emitCoSDrainPhaseTelemetry(ch, status)
 	c.emitCoSWaterfillTelemetry(ch, status)
 	c.emitCoSEqualFlowEnforcement(ch, status)
+	c.emitCoSSojourn(ch, status)
+	c.emitCoSFlowFairOccupancy(ch, status)
 	c.emitWorkerRuntime(ch, status)
 	c.emitUserspaceDynamicBufferMetrics(ch, status)
 	c.emitUserspaceEventStream(ch, status)
@@ -1151,6 +1153,69 @@ func (c *xpfCollector) emitCoSWaterfillTelemetry(ch chan<- prometheus.Metric, st
 				c.cosWaterfillEligibleVisits,
 				prometheus.CounterValue,
 				float64(queue.WaterfillEligibleVisits),
+				ifindexLabel, queueLabel,
+			)
+		}
+	}
+}
+
+// #1829 Phase 1: dequeue-time sojourn gauges, emitted unconditionally
+// for every queue row (cardinality = interfaces x queues): a windowed
+// min of 0 is a real "no standing queue in the last ~2 windows"
+// signal — gating on non-zero would make the gate evidence's
+// strongest negative result (queues never stand) invisible. All three
+// are MAX-merged across worker instances and workers upstream (worst
+// instance); see the AGGREGATION contract on the Rust CoSQueueStatus.
+func (c *xpfCollector) emitCoSSojourn(ch chan<- prometheus.Metric, status dpuserspace.ProcessStatus) {
+	for _, iface := range status.CoSInterfaces {
+		ifindexLabel := strconv.Itoa(iface.Ifindex)
+		for _, queue := range iface.Queues {
+			queueLabel := strconv.Itoa(queue.QueueID)
+			ch <- prometheus.MustNewConstMetric(
+				c.cosSojournEwmaNS,
+				prometheus.GaugeValue,
+				float64(queue.SojournEwmaNS),
+				ifindexLabel, queueLabel,
+			)
+			ch <- prometheus.MustNewConstMetric(
+				c.cosSojournPeakNS,
+				prometheus.GaugeValue,
+				float64(queue.SojournPeakNS),
+				ifindexLabel, queueLabel,
+			)
+			ch <- prometheus.MustNewConstMetric(
+				c.cosSojournWindowedMinNS,
+				prometheus.GaugeValue,
+				float64(queue.SojournWindowedMinNS),
+				ifindexLabel, queueLabel,
+			)
+		}
+	}
+}
+
+// #1830 (g): bucket-vs-flow occupancy gauges for collision-vs-demand
+// unfairness diagnosis. Emitted unconditionally for every queue row
+// (cardinality = interfaces x queues): a 0 is a real "idle / no
+// flow-fair backlog" signal, and gating on FlowFair would hide the
+// buckets==0 vs flows>0 idle shape the ratio caveat documents.
+// FlowFairFlowsActive equals the sum over workers of the existing
+// per-worker xpf_userspace_cos_active_flow_count (#1248), pre-aggregated
+// to exactly match the buckets gauge's (ifindex, queue_id) grain.
+func (c *xpfCollector) emitCoSFlowFairOccupancy(ch chan<- prometheus.Metric, status dpuserspace.ProcessStatus) {
+	for _, iface := range status.CoSInterfaces {
+		ifindexLabel := strconv.Itoa(iface.Ifindex)
+		for _, queue := range iface.Queues {
+			queueLabel := strconv.Itoa(queue.QueueID)
+			ch <- prometheus.MustNewConstMetric(
+				c.cosFlowFairBucketsOccupied,
+				prometheus.GaugeValue,
+				float64(queue.FlowFairBucketsOccupied),
+				ifindexLabel, queueLabel,
+			)
+			ch <- prometheus.MustNewConstMetric(
+				c.cosFlowFairFlowsActive,
+				prometheus.GaugeValue,
+				float64(queue.FlowFairFlowsActive),
 				ifindexLabel, queueLabel,
 			)
 		}

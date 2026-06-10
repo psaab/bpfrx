@@ -18,6 +18,9 @@
 //     no new allocation beyond what the inline block did pre-#1349).
 //   * #784 `active_flow_buckets_peak` (MAX across worker instances,
 //     not sum — see comment in original).
+//   * #1830 (g) `flow_fair_buckets_occupied` (SUM across worker
+//     instances — disjoint per-worker buckets, see comment at the
+//     accumulation site).
 //   * #784 `flow_fair` propagation.
 //   * #710 / #718 drop-counter aggregation (`admission_flow_share_drops`,
 //     `admission_buffer_drops`, `admission_ecn_marked`,
@@ -51,6 +54,7 @@ pub(super) fn accumulate_queue_row(
     status: &mut crate::protocol::CoSQueueStatus,
     queue: &CoSQueueRuntime,
     queue_config: Option<&CoSQueueConfig>,
+    now_ns: u64,
 ) {
     if let Some(config) = queue_config {
         if status.forwarding_class.is_empty() {
@@ -105,6 +109,20 @@ pub(super) fn accumulate_queue_row(
     if peak > status.active_flow_buckets_peak {
         status.active_flow_buckets_peak = peak;
     }
+    // #1830 (g): SUM the CURRENT occupied-bucket count across worker
+    // instances (unlike the peak above, which is MAX). Each worker's
+    // FlowFairState owns disjoint buckets for its own queue runtime, so
+    // summing never double-counts a bucket; the sum is the
+    // interface-queue-wide count of backlogged SFQ buckets at snapshot
+    // time. Pairs with `flow_fair_flows_active` (coordinator overlay)
+    // for the collision-vs-demand ratio — see the INTERPRETATION
+    // contract on `protocol::CoSQueueStatus`.
+    status.flow_fair_buckets_occupied = status.flow_fair_buckets_occupied.saturating_add(
+        queue
+            .flow_fair_state
+            .as_ref()
+            .map_or(0, |ff| u64::from(ff.active_flow_buckets)),
+    );
     // #784: surface flow_fair so we can detect queues that were
     // expected to run SFQ but aren't.
     if queue.flow_fair() {
@@ -255,4 +273,18 @@ pub(super) fn accumulate_queue_row(
     status.waterfill_eligible_visits = status
         .waterfill_eligible_visits
         .saturating_add(queue.telemetry.waterfill_counters.eligible_visits);
+    // #1829 Phase 1: sojourn telemetry, MAX-merged across worker
+    // instances (NOT summed — each instance measures its own queue
+    // runtime's delay; the row reports the worst instance, matching
+    // the gate semantics documented on `protocol::CoSQueueStatus`).
+    // The windowed-min export is evaluated against the snapshot
+    // pass's `now_ns` so a queue that stopped popping >= 2 windows
+    // ago reads 0 here rather than freezing its last busy reading.
+    // Same single-writer/same-thread read contract as the waterfill
+    // counters above.
+    status.sojourn_ewma_ns = status.sojourn_ewma_ns.max(queue.telemetry.sojourn.ewma_ns);
+    status.sojourn_peak_ns = status.sojourn_peak_ns.max(queue.telemetry.sojourn.peak_ns);
+    status.sojourn_windowed_min_ns = status
+        .sojourn_windowed_min_ns
+        .max(queue.telemetry.sojourn.windowed_min_export(now_ns));
 }

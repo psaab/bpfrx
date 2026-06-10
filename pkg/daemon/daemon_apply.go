@@ -441,9 +441,13 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 	// the engine BEFORE the full snapshot build (#1827, AGY r2-2): an
 	// operator commit while a policy is FAILED must rebuild routes
 	// with the active overlay instead of wiping the injected failover
-	// route until the next engine tick.
+	// route until the next engine tick. The overlay is filtered
+	// against the INCOMING config (Codex PR #1843 HIGH-1) so a commit
+	// that removes or edits a policy never republishes the stale
+	// entries; the same filtered view feeds the FRR render in step 3.
+	commitOverlay := d.commitOverlayForConfig(cfg)
 	if setter, ok := d.dp.(routeOverlaySetter); ok {
-		setter.SetRouteOverlay(d.ipmonActiveOverlay())
+		setter.SetRouteOverlay(commitOverlay)
 	}
 
 	// 2. Apply dataplane config through the runtime config sink.
@@ -731,10 +735,12 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 	// 3. Apply all routes + dynamic protocols via FRR.
 	// assembleFRRConfig is the SOLE frr.FullConfig constructor, shared
 	// with the ip-monitoring routes-only actuator (#1827) — the full
-	// apply consumes the same active overlay, so an operator commit
-	// while a policy is FAILED preserves the injected failover route.
+	// apply consumes the same (config-filtered) overlay computed in
+	// step 1.95, so an operator commit while a policy is FAILED
+	// preserves a still-valid injected failover route and drops
+	// removed/edited entries on the commit itself.
 	if d.frr != nil {
-		d.applyFRRConfig(d.assembleFRRConfig(cfg, d.ipmonActiveOverlay()))
+		d.applyFRRConfig(d.assembleFRRConfig(cfg, commitOverlay))
 	}
 
 	// 3b. Apply next-table policy routing rules (ip rule)
@@ -816,13 +822,52 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 		}
 	}
 
-	// 7. Apply DHCP server config (Kea DHCPv4 + DHCPv6)
-	// In cluster mode, deferred to VRRP MASTER transition.
-	if !isCluster && d.dhcpServer != nil && (cfg.System.DHCPServer.DHCPLocalServer != nil || cfg.System.DHCPServer.DHCPv6LocalServer != nil) {
-		// Resolve RETH interface names for Kea (needs real Linux names)
-		resolveDHCPRethInterfaces(&cfg.System.DHCPServer, cfg)
-		if err := d.dhcpServer.Apply(&cfg.System.DHCPServer); err != nil {
-			slog.Warn("failed to apply DHCP server config", "err", err)
+	// 7. Reconcile DHCP server (Kea DHCPv4 + DHCPv6) against actual
+	// systemd unit state (#1778).
+	//
+	// Standalone: Apply runs UNCONDITIONALLY — removing the
+	// dhcp-server stanza (or restarting xpfd over a stale Kea left by
+	// a previous daemon) stops the units; the pre-#1778 nil-config
+	// gate skipped Apply entirely and leaked the old server.
+	//
+	// Cluster (#1835 F3): VRRP MASTER/BACKUP transitions own
+	// start/stop (applyRethServicesForRG / clearRethServicesForRG via
+	// ApplyAsync), but a config COMMIT must still reach the running
+	// Kea — pre-F3 a dhcp-server change was invisible until the next
+	// VRRP transition. Every commit regenerates the config files,
+	// filtered to the RGs this node is currently MASTER for (the same
+	// shape the VRRP path writes; nil when none match → authoritative
+	// clear-if-active), and restarts only units that are currently
+	// active (active == this node is serving). Inactive units pick up
+	// the fresh config at the next VRRP MASTER transition.
+	//
+	// Fail-closed on commit (#1778/#1835 F3): restart/stop failures
+	// are recorded into dhcpServerErr and returned at the tail of this
+	// function, so commitAndApply surfaces them to the operator while
+	// the remaining reconcile steps still run. The boot path stays
+	// lenient: Run() reaches this via applyConfig(), which only logs
+	// the returned error — an unavailable Kea binary cannot brick
+	// daemon boot.
+	var dhcpServerErr error
+	if d.dhcpServer != nil {
+		if !isCluster {
+			// Resolve RETH interface names for Kea (needs real Linux names)
+			resolveDHCPRethInterfaces(&cfg.System.DHCPServer, cfg)
+			if err := d.dhcpServer.Apply(&cfg.System.DHCPServer); err != nil {
+				slog.Warn("failed to apply DHCP server config", "err", err)
+				dhcpServerErr = fmt.Errorf("apply DHCP server config: %w", err)
+			}
+		} else {
+			var dhcpCfg *config.DHCPServerConfig
+			if cfg.System.DHCPServer.DHCPLocalServer != nil || cfg.System.DHCPServer.DHCPv6LocalServer != nil {
+				// filterDHCPConfigForMasterRGs copies the config and
+				// resolves RETH interface names internally.
+				dhcpCfg = d.filterDHCPConfigForMasterRGs(cfg)
+			}
+			if err := d.dhcpServer.ApplyClusterCommit(dhcpCfg); err != nil {
+				slog.Warn("failed to reconcile DHCP server (cluster commit)", "err", err)
+				dhcpServerErr = fmt.Errorf("apply DHCP server config: %w", err)
+			}
 		}
 	}
 
@@ -1018,7 +1063,9 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 		d.applyStep0Tunables(userspaceDP, claimHostTunables, governor, netdevBudget,
 			coalesceExplicit, coalesceEnable, coalesceRX, coalesceTX, rssAllowed)
 	}
-	return nil
+	// #1778: deferred DHCP-server failure — every reconcile step above
+	// has run; surface the Kea restart/stop failure through the commit.
+	return dhcpServerErr
 }
 
 func compileErrorMustAbortApply(err error) bool {

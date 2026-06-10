@@ -1,8 +1,15 @@
 // Issue #1329 / PR #1588: maybe_rotate_epoch_v8 extracted from
-// shared_cos_lease/mod.rs as a pure code-motion split. The function
-// body is byte-identical to the pre-split form (see PR #1588 for the
-// move diff); atomic memory orderings, branch structure, and
-// stack-scratch arrays are preserved exactly.
+// shared_cos_lease/mod.rs as a pure code-motion split, preserving
+// atomic memory orderings and branch structure.
+//
+// #1830 (e): the former fixed `[_; 32]` stack-scratch arrays
+// (MAX_WORKERS_SCRATCH) are replaced by the lease's pre-allocated
+// `V8RotationScratch` (sized to the true worker-array length at
+// construction). >32-worker hosts previously fell into the
+// `active_outside_scratch` path and equal-flow failed open every
+// epoch; now every worker is captured. The scratch lock is
+// uncontended by construction (only the seqlock rotation winner
+// reaches it) and the rotation path performs no heap allocation.
 //
 // Visibility widens from inherent-private to `pub(super)` so the
 // rotation tick path in `mod.rs` continues to find it. `#[inline]`
@@ -67,19 +74,33 @@ impl SharedCoSQueueLease {
         let prev_granted = prev_granted_u32 as u64;
         let prev_cap = v8.epoch.epoch_total_grant_cap.load(Ordering::Acquire);
 
-        // #1231 v5.5 stack scratch for per-worker swap captures.
-        const MAX_WORKERS_SCRATCH: usize = 32;
-        let n_workers = v8.worker_grants.len().min(MAX_WORKERS_SCRATCH);
-        debug_assert!(v8.worker_grants.len() <= MAX_WORKERS_SCRATCH);
-        let mut signaled_by_worker = [false; MAX_WORKERS_SCRATCH];
-        let mut demanded_by_worker = [false; MAX_WORKERS_SCRATCH];
-        let mut prev_grants = [0u32; MAX_WORKERS_SCRATCH];
-        let mut active_by_worker = [false; MAX_WORKERS_SCRATCH];
-        let mut active_outside_scratch = false;
+        // #1830 (e): heap scratch for per-worker swap captures, sized
+        // to the lease's true worker-array length at construction
+        // (replaces the former fixed `[_; 32]` stack arrays, which
+        // forced an every-epoch equal-flow fail-open on >32-worker
+        // hosts). We are the unique rotation winner here (EVEN→ODD CAS
+        // above), so the lock is uncontended by construction; no heap
+        // allocation happens on this path. Every slot in
+        // `0..n_workers` is unconditionally overwritten below before
+        // it is read, so no state leaks across rotations.
+        let n_workers = v8.worker_grants.len();
+        let mut scratch = match v8.rotation_scratch.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let scratch = &mut *scratch;
+        debug_assert_eq!(scratch.active_by_worker.len(), n_workers);
+        debug_assert_eq!(v8.worker_starvation_events.len(), n_workers);
+        debug_assert_eq!(v8.worker_demand_events.len(), n_workers);
+        debug_assert_eq!(v8.worker_active_flow_buckets.len(), n_workers);
+        let signaled_by_worker = &mut scratch.signaled_by_worker;
+        let demanded_by_worker = &mut scratch.demanded_by_worker;
+        let prev_grants = &mut scratch.prev_grants;
+        let active_by_worker = &mut scratch.active_by_worker;
 
         // STEP 2: swap event slots, track per-worker signal/demand flags.
         let mut any_active_worker_signaled = false;
-        for id in 0..v8.worker_starvation_events.len() {
+        for id in 0..n_workers {
             let old_starvation = v8.worker_starvation_events[id]
                 .0
                 .swap(new_packed_zero, Ordering::AcqRel);
@@ -94,28 +115,18 @@ impl SharedCoSQueueLease {
                 .get(id)
                 .map(|c| c.load(Ordering::Relaxed))
                 .unwrap_or(0);
-            if id < n_workers {
-                active_by_worker[id] = active > 0;
-                demanded_by_worker[id] = old_demand_count > 0;
-                if active > 0 && old_starvation_count > 0 {
-                    signaled_by_worker[id] = true;
-                    any_active_worker_signaled = true;
-                }
-            } else if active > 0 {
-                active_outside_scratch = true;
-                if old_starvation_count > 0 {
-                    any_active_worker_signaled = true;
-                }
-            }
+            active_by_worker[id] = active > 0;
+            demanded_by_worker[id] = old_demand_count > 0;
+            let signaled = active > 0 && old_starvation_count > 0;
+            signaled_by_worker[id] = signaled;
+            any_active_worker_signaled |= signaled;
         }
 
         // STEP 3: swap worker_grants, capture prev_grant for peer-util.
         for (id, grant) in v8.worker_grants.iter().enumerate() {
             let old = grant.0.swap(new_packed_zero, Ordering::AcqRel);
-            if id < n_workers {
-                let (_, prev) = PackedEpochGrant::unpack(old);
-                prev_grants[id] = prev;
-            }
+            let (_, prev) = PackedEpochGrant::unpack(old);
+            prev_grants[id] = prev;
         }
 
         if v8.rate_mode == V8RateMode::EqualFlowSuppress {
@@ -128,25 +139,27 @@ impl SharedCoSQueueLease {
             // written this epoch swaps out with the prior tag and is
             // correctly excluded as 0.
             let just_ended_tag = (seq >> 1) as u32;
-            let mut sampled_active_flows_by_worker = [0u32; MAX_WORKERS_SCRATCH];
-            for id in 0..v8.worker_equal_flow_active_samples.len() {
+            let sampled_active_flows_by_worker = &mut scratch.sampled_active_flows_by_worker;
+            debug_assert_eq!(v8.worker_equal_flow_active_samples.len(), n_workers);
+            for id in 0..n_workers {
                 let old_sample = v8.worker_equal_flow_active_samples[id]
                     .0
                     .swap(new_packed_zero, Ordering::AcqRel);
                 let (old_tag, old_count) = PackedEpochGrant::unpack(old_sample);
-                if id < n_workers && old_tag == just_ended_tag {
-                    sampled_active_flows_by_worker[id] = old_count;
-                }
+                sampled_active_flows_by_worker[id] = if old_tag == just_ended_tag {
+                    old_count
+                } else {
+                    0
+                };
             }
             publish_equal_flow_epoch_v8(
                 v8,
                 new_tag,
                 n_workers,
-                active_outside_scratch,
-                &active_by_worker,
-                &sampled_active_flows_by_worker,
-                &demanded_by_worker,
-                &prev_grants,
+                active_by_worker,
+                sampled_active_flows_by_worker,
+                demanded_by_worker,
+                prev_grants,
             );
         } else {
             v8.equal_flow.disable_for_epoch(new_tag);

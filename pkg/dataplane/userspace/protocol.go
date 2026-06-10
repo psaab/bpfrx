@@ -877,14 +877,26 @@ type CoSQueueStatus struct {
 	// bucketed (see Rust `bucket_index_for_ns`): index 0 is < 1 µs,
 	// index N >= 1 is [2^(N+9), 2^(N+10)) ns, index 15 saturates at
 	// >= 2^24 ns (~16 ms).
-	ActiveFlowBucketsPeak uint64   `json:"active_flow_buckets_peak,omitempty"`
-	FlowFair              bool     `json:"flow_fair,omitempty"`
-	DrainLatencyHist      []uint64 `json:"drain_latency_hist,omitempty"`
-	DrainInvocations      uint64   `json:"drain_invocations,omitempty"`
-	DrainNoopInvocations  uint64   `json:"drain_noop_invocations,omitempty"`
-	RedirectAcquireHist   []uint64 `json:"redirect_acquire_hist,omitempty"`
-	OwnerPPS              uint64   `json:"owner_pps,omitempty"`
-	PeerPPS               uint64   `json:"peer_pps,omitempty"`
+	ActiveFlowBucketsPeak uint64 `json:"active_flow_buckets_peak,omitempty"`
+	FlowFair              bool   `json:"flow_fair,omitempty"`
+	// #1830 (g): bucket-vs-flow occupancy telemetry. JSON tags MUST
+	// match the Rust serde rename(...) in protocol/cos.rs exactly.
+	// FlowFairBucketsOccupied is the instantaneous occupied
+	// (backlogged) SFQ bucket count summed across workers;
+	// FlowFairFlowsActive is the flow-cache active-window (~650 ms)
+	// distinct-flow count mapped to this queue, summed across workers.
+	// The flows/buckets ratio distinguishes hash-collision unfairness
+	// (ratio persistently > 1 while continuously backlogged) from
+	// demand unfairness — see the INTERPRETATION contract on the Rust
+	// CoSQueueStatus.
+	FlowFairBucketsOccupied uint64   `json:"flow_fair_buckets_occupied,omitempty"`
+	FlowFairFlowsActive     uint64   `json:"flow_fair_flows_active,omitempty"`
+	DrainLatencyHist        []uint64 `json:"drain_latency_hist,omitempty"`
+	DrainInvocations        uint64   `json:"drain_invocations,omitempty"`
+	DrainNoopInvocations    uint64   `json:"drain_noop_invocations,omitempty"`
+	RedirectAcquireHist     []uint64 `json:"redirect_acquire_hist,omitempty"`
+	OwnerPPS                uint64   `json:"owner_pps,omitempty"`
+	PeerPPS                 uint64   `json:"peer_pps,omitempty"`
 	// #760 overshoot-hunt instrumentation. DrainSentBytes /
 	// DrainParkRootTokens / DrainParkQueueTokens are queue-scoped.
 	// PostDrainBackupBytes is binding-scoped (same row as
@@ -909,6 +921,20 @@ type CoSQueueStatus struct {
 	WaterfillPhase1Admissions uint64 `json:"waterfill_phase1_admissions,omitempty"`
 	WaterfillPhase2Admissions uint64 `json:"waterfill_phase2_admissions,omitempty"`
 	WaterfillEligibleVisits   uint64 `json:"waterfill_eligible_visits,omitempty"`
+	// #1829 Phase 1: dequeue-time sojourn telemetry. JSON tags MUST
+	// match the Rust serde rename(...) in protocol/cos.rs exactly.
+	// All three are MAX-merged across worker instances and across
+	// workers (worst instance — see the AGGREGATION contract on the
+	// Rust CoSQueueStatus). SojournWindowedMinNS is the #1829 gate
+	// metric: the minimum sojourn over the last 1-2 100 ms windows
+	// (CoDel's standing-queue estimator); it reads 0 when the queue
+	// has not popped for >= 2 windows at snapshot time. SojournPeakNS
+	// is the lifetime maximum; SojournEwmaNS is a shift-add EWMA
+	// (alpha = 1/8) over pops — both supporting context only (biased
+	// high by scheduler service gaps).
+	SojournEwmaNS        uint64 `json:"sojourn_ewma_ns,omitempty"`
+	SojournPeakNS        uint64 `json:"sojourn_peak_ns,omitempty"`
+	SojournWindowedMinNS uint64 `json:"sojourn_windowed_min_ns,omitempty"`
 	// #1642: post_drain_backup_cos_drops / _cos_drop_bytes were on this
 	// struct, but the Rust helper serializes them on BindingStatus
 	// (protocol/binding.rs), a different JSON nesting level. The Rust

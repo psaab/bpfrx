@@ -100,6 +100,15 @@ pub(super) fn bring_up_workers(
     let planned_bindings: usize = workers.values().map(|group| group.len()).sum();
     coord.workers.last_planned_workers = workers.len();
     coord.workers.last_planned_bindings = planned_bindings;
+    // #1830 follow-up (Codex review on PR #1841): record the SIZING
+    // value for per-worker-id-indexed structures separately from the
+    // count. Worker ids can be sparse here — the binding loop above
+    // skips unregistered/invalid bindings, so a surviving high-id
+    // worker can outlive every lower id (reachable via the runtime
+    // binding/queue unregister handlers). Sizing the v8 lease arrays /
+    // rotation scratch / V_min floors from workers.len() would put
+    // that worker out of range (acquire_v8 returns 0 + debug-panics).
+    coord.workers.last_planned_worker_slots = planned_worker_slots(&workers);
     coord.last_reconcile_stage = format!(
         "planned:workers={}:bindings={}:live={}",
         coord.workers.last_planned_workers(),
@@ -435,4 +444,21 @@ pub(super) fn bring_up_workers(
     }
     coord.spawn_local_tunnel_sources();
     coord.spawn_wg_control_threads();
+}
+
+/// #1830 follow-up (Codex review on PR #1841): array length needed to
+/// index every planned worker id — `max(worker_id) + 1`, 0 when no
+/// workers are planned. NOT the worker count: ids can be sparse after
+/// partial binding unregister (the bring-up loop skips
+/// unregistered/invalid bindings), and the v8 lease contract
+/// (`SharedCoSQueueLease::new_v8`) requires the TRUE max id so its
+/// per-worker arrays and rotation scratch cover every live worker.
+/// Generic over the map value so the sparse-id derivation is unit
+/// testable without constructing `BindingPlan`s.
+pub(in crate::afxdp) fn planned_worker_slots<V>(workers: &BTreeMap<u32, V>) -> usize {
+    workers
+        .keys()
+        .next_back()
+        .map(|&id| id as usize + 1)
+        .unwrap_or(0)
 }

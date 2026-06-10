@@ -3825,6 +3825,7 @@ fn apply_worker_commands_dispatch_order_pin_with_demote_dedup() {
         cos_queue_id: None,
         dscp_rewrite: None,
         mirror_clone: false,
+        enqueue_ns: 0,
     };
 
     {

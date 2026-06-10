@@ -27,6 +27,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/frr"
+	"github.com/psaab/xpf/pkg/ipmon"
 	"github.com/psaab/xpf/pkg/rpm"
 )
 
@@ -38,7 +39,11 @@ type routeOverlaySetter interface {
 // routeOverlayPublisher is the routes-only partial republish surface
 // of the userspace dataplane manager (#1827 Codex r2-2).
 type routeOverlayPublisher interface {
-	PublishRouteOverlaySnapshot(cfg *config.Config, overlay []config.RouteOverlayEntry, schedulerState map[string]bool) error
+	// PublishRouteOverlaySnapshot returns whether a snapshot was
+	// actually published; duplicate-skips return false so the caller
+	// does not bump the FIB generation for a no-op (Codex PR #1843
+	// MED).
+	PublishRouteOverlaySnapshot(cfg *config.Config, overlay []config.RouteOverlayEntry, schedulerState map[string]bool) (bool, error)
 	BumpFIBGeneration() uint32
 }
 
@@ -49,6 +54,22 @@ func (d *Daemon) ipmonActiveOverlay() []config.RouteOverlayEntry {
 		return nil
 	}
 	return d.ipmon.ActiveOverlay()
+}
+
+// commitOverlayForConfig returns the overlay that may ride an
+// operator commit's OWN publish: the engine's active overlay filtered
+// against the INCOMING config (Codex PR #1843 HIGH-1). The full apply
+// caches the overlay before reconcileIPMon installs the new policy
+// set, so entries whose policy was removed or whose preferred-route
+// spec was edited must be dropped here — otherwise the commit would
+// republish the stale overlay to FRR and the snapshot until the
+// delayed actuator caught up. Unrelated commits (policy spec
+// unchanged) keep the active overlay intact (AGY r2-2).
+func (d *Daemon) commitOverlayForConfig(cfg *config.Config) []config.RouteOverlayEntry {
+	if cfg == nil {
+		return nil
+	}
+	return ipmon.FilterOverlayForConfig(d.ipmonActiveOverlay(), cfg.Services.IPMonitoring)
 }
 
 // assembleFRRConfig builds the complete frr.FullConfig for the given
@@ -187,14 +208,22 @@ func (d *Daemon) actuateRouteOverlayLocked(cfg *config.Config) {
 	if d.scheduler != nil {
 		schedulerState = d.scheduler.ActiveState()
 	}
-	if err := pub.PublishRouteOverlaySnapshot(cfg, overlay, schedulerState); err != nil {
+	published, err := pub.PublishRouteOverlaySnapshot(cfg, overlay, schedulerState)
+	if err != nil {
 		slog.Warn("ip-monitoring: route overlay snapshot publish failed — NOT bumping FIB generation",
 			"err", err)
 		return
 	}
+	if !published {
+		// Duplicate-skip (content unchanged) or helperless caching:
+		// the dataplane routes did not move, so do not churn
+		// established-flow route caches with a FIB-generation bump
+		// (Codex PR #1843 MED).
+		return
+	}
 
-	// 3. Only after apply_snapshot success: invalidate cached flow
-	// routes so established flows re-resolve onto the new routes.
+	// 3. Only after a REAL apply_snapshot success: invalidate cached
+	// flow routes so established flows re-resolve onto the new routes.
 	pub.BumpFIBGeneration()
 	slog.Info("ip-monitoring route overlay actuated", "overlay_routes", len(overlay))
 }

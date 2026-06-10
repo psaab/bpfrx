@@ -345,6 +345,7 @@ impl Coordinator {
         self.validation = ValidationState::default();
         self.workers.last_planned_workers = 0;
         self.workers.last_planned_bindings = 0;
+        self.workers.last_planned_worker_slots = 0;
         self.last_reconcile_stage = "stopped".to_string();
     }
 
@@ -1002,16 +1003,22 @@ impl Coordinator {
             current_leases.as_ref(),
         );
         let current_exact_backlogs = self.cos.exact_backlogs.load();
-        // #917: V_min coordination Arcs sized by worker count.
-        // workers.last_planned_workers is set in apply_planned_workers
-        // before this reconcile fires; defaults to 0 at first
-        // boot which produces zero-slot floors (the reconcile
-        // re-fires once workers are planned).
-        // #1229 Phase 6 v8: lease construction also needs num_workers
-        // for max_worker_id sizing of per-worker arrays. Hoisted
-        // ahead of the queue_leases build site.
+        // #917: V_min coordination Arcs sized so every planned worker
+        // id is indexable. #1830 follow-up (Codex review on PR #1841):
+        // this is last_planned_worker_slots (max planned worker id +
+        // 1), NOT last_planned_workers (the COUNT) — worker ids can be
+        // sparse after partial binding unregister, and a surviving
+        // high-id worker must stay in range of the v8 lease per-worker
+        // arrays (acquire_v8 out-of-range returns 0 + debug-panics)
+        // and the V_min floor slots. Set in bring_up_workers before
+        // this reconcile path fires; defaults to 0 at first boot which
+        // produces zero-slot floors (the reconcile re-fires once
+        // workers are planned).
+        // #1229 Phase 6 v8: lease construction also needs this for
+        // max_worker_id sizing of per-worker arrays. Hoisted ahead of
+        // the queue_leases build site.
         let current_queue_vtime_floors = self.cos.queue_vtime_floors.load();
-        let num_workers = self.workers.last_planned_workers().max(1);
+        let worker_slots = self.workers.last_planned_worker_slots().max(1);
         let current_queue_leases = self.cos.queue_leases.load();
         let max_binding_slot = self
             .workers
@@ -1028,12 +1035,12 @@ impl Coordinator {
         let next_queue_leases = build_shared_cos_queue_leases_reusing_existing(
             &self.forwarding,
             &active_shards_by_egress_ifindex,
-            num_workers,
+            worker_slots,
             current_queue_leases.as_ref(),
         );
         let next_queue_vtime_floors = build_shared_cos_queue_vtime_floors_reusing_existing(
             &self.forwarding,
-            num_workers,
+            worker_slots,
             current_queue_vtime_floors.as_ref(),
         );
         if owner_changed {
@@ -1173,6 +1180,12 @@ pub(super) fn aggregate_cos_statuses_across_workers(
                 if queue.active_flow_buckets_peak > q.active_flow_buckets_peak {
                     q.active_flow_buckets_peak = queue.active_flow_buckets_peak;
                 }
+                // #1830 (g): current occupied-bucket count SUMS across
+                // workers (disjoint per-worker FlowFairState buckets),
+                // matching the worker-side sum in queue_row.rs.
+                q.flow_fair_buckets_occupied = q
+                    .flow_fair_buckets_occupied
+                    .saturating_add(queue.flow_fair_buckets_occupied);
                 q.transmit_rate_bytes = q.transmit_rate_bytes.max(queue.transmit_rate_bytes);
                 q.buffer_bytes = q.buffer_bytes.saturating_add(queue.buffer_bytes);
                 q.worker_instances = q.worker_instances.saturating_add(queue.worker_instances);
@@ -1225,6 +1238,17 @@ pub(super) fn aggregate_cos_statuses_across_workers(
                 q.waterfill_eligible_visits = q
                     .waterfill_eligible_visits
                     .saturating_add(queue.waterfill_eligible_visits);
+                // #1829 Phase 1: sojourn telemetry MAX-merges across
+                // workers (worst instance), matching the worker-side
+                // MAX in queue_row.rs — see the AGGREGATION contract
+                // on `protocol::CoSQueueStatus`. Summing delays is
+                // meaningless; the gate metric is "does ANY instance
+                // sustain a standing queue".
+                q.sojourn_ewma_ns = q.sojourn_ewma_ns.max(queue.sojourn_ewma_ns);
+                q.sojourn_peak_ns = q.sojourn_peak_ns.max(queue.sojourn_peak_ns);
+                q.sojourn_windowed_min_ns = q
+                    .sojourn_windowed_min_ns
+                    .max(queue.sojourn_windowed_min_ns);
                 // #709: cross-worker aggregation for owner-profile
                 // counters is sum, not max. Histograms and invocation
                 // counters must stay coherent after aggregation;
@@ -1522,16 +1546,19 @@ fn build_shared_cos_exact_backlogs_reusing_existing(
 fn build_shared_cos_queue_leases_reusing_existing(
     forwarding: &ForwardingState,
     active_shards_by_egress_ifindex: &BTreeMap<i32, usize>,
-    num_workers: usize,
+    worker_slots: usize,
     existing: &BTreeMap<(i32, u8), Arc<SharedCoSQueueLease>>,
 ) -> BTreeMap<(i32, u8), Arc<SharedCoSQueueLease>> {
-    // #1229 Phase 6 v8: max_worker_id = num_workers - 1 under the
-    // current topology where worker IDs are dense from 0 to N-1.
-    // If sparse worker IDs are ever introduced, this needs to flip
-    // to true `max(worker_id)` over the worker map. last_planned_workers
-    // is the same source V_min floors size against
+    // #1229 Phase 6 v8 / #1830 follow-up (Codex review on PR #1841):
+    // `worker_slots` is `max(planned worker_id) + 1` from
+    // `planned_worker_slots` (reconcile/bringup.rs), NOT the worker
+    // COUNT — worker ids can be sparse after partial binding
+    // unregister, and the lease contract (`new_v8` doc) requires the
+    // TRUE max id so per-worker arrays + rotation scratch cover every
+    // live worker. `last_planned_worker_slots` is the same source the
+    // V_min floors size against
     // (build_shared_cos_queue_vtime_floors_reusing_existing).
-    let max_worker_id = num_workers.saturating_sub(1);
+    let max_worker_id = worker_slots.saturating_sub(1);
     let mut out = BTreeMap::new();
     for (&ifindex, iface) in &forwarding.cos.interfaces {
         let active_shards = active_shards_by_egress_ifindex
@@ -1606,15 +1633,17 @@ fn shared_cos_exact_backlogs_match(
 /// coordination Arcs. Mirror of
 /// `build_shared_cos_queue_leases_reusing_existing` — same
 /// keying ((ifindex, queue_id)), same Arc-reuse discipline.
-/// Each queue's `SharedCoSQueueVtimeFloor` is sized by the
-/// configured worker count; if the worker count changes we
-/// reallocate (slot count is fixed for the Arc's lifetime).
+/// Each queue's `SharedCoSQueueVtimeFloor` is sized by
+/// `worker_slots` (#1830 follow-up: max planned worker id + 1, NOT
+/// the worker count — slots are indexed by worker id and ids can be
+/// sparse); if the slot requirement changes we reallocate (slot
+/// count is fixed for the Arc's lifetime).
 fn build_shared_cos_queue_vtime_floors_reusing_existing(
     forwarding: &ForwardingState,
-    num_workers: usize,
+    worker_slots: usize,
     existing: &BTreeMap<(i32, u8), Arc<SharedCoSQueueVtimeFloor>>,
 ) -> BTreeMap<(i32, u8), Arc<SharedCoSQueueVtimeFloor>> {
-    let num_workers = num_workers.max(1);
+    let num_workers = worker_slots.max(1);
     let mut out = BTreeMap::new();
     for (&ifindex, iface) in &forwarding.cos.interfaces {
         for queue in &iface.queues {

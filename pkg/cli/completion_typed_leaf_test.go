@@ -2,6 +2,7 @@ package cli
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/configstore"
@@ -127,5 +128,94 @@ func TestCompleteConfig_TransmitRate_PartialFiltersExamples(t *testing.T) {
 	}
 	if hasCand(cands, "256k") {
 		t.Fatalf("256k should not match partial \"1\", got %v", candNames(cands))
+	}
+}
+
+// --- #1319 PR 2: chassis-cluster typed leaves at the live CLI boundary ---
+
+// candDesc returns the description of the candidate with the given name
+// ("" if absent) so tests can assert the range text actually reaches the
+// operator, not just the candidate name.
+func candDesc(cands []completionCandidate, name string) string {
+	for _, c := range cands {
+		if c.name == name {
+			return c.desc
+		}
+	}
+	return ""
+}
+
+// `set chassis cluster heartbeat-interval ?` surfaces the <integer>
+// placeholder (with the range in its description) and the examples.
+func TestCompleteConfig_HeartbeatInterval_ShowsIntegerPlaceholderAndExamples(t *testing.T) {
+	c := newTypedLeafCLI(t)
+	cands := c.completeConfigWithDesc(
+		[]string{"set", "chassis", "cluster", "heartbeat-interval"},
+		"",
+	)
+	if !hasCand(cands, "<integer>") {
+		t.Fatalf("expected <integer> placeholder at value slot, got %v", candNames(cands))
+	}
+	// The range text must reach the operator via the placeholder's
+	// description (Codex LOW, PR #1845: assert content, not just names).
+	if desc := candDesc(cands, "<integer>"); !strings.Contains(desc, ">= 1") ||
+		!strings.Contains(desc, "milliseconds") {
+		t.Fatalf("placeholder description should carry the range, got %q", desc)
+	}
+	for _, ex := range []string{"100", "200", "1000"} {
+		if !hasCand(cands, ex) {
+			t.Fatalf("expected heartbeat-interval example %q, got %v", ex, candNames(cands))
+		}
+	}
+}
+
+// peer-fencing is an enum leaf: its sole accepted value is surfaced.
+func TestCompleteConfig_PeerFencing_ShowsEnumValue(t *testing.T) {
+	c := newTypedLeafCLI(t)
+	cands := c.completeConfigWithDesc(
+		[]string{"set", "chassis", "cluster", "peer-fencing"},
+		"",
+	)
+	if !hasCand(cands, "disable-rg") {
+		t.Fatalf("expected enum value disable-rg, got %v", candNames(cands))
+	}
+}
+
+// Deep path: the typed priority leaf under redundancy-group <id> node <id>
+// still reaches the value slot through two instance-name args.
+func TestCompleteConfig_RGNodePriority_ShowsExamples(t *testing.T) {
+	c := newTypedLeafCLI(t)
+	cands := c.completeConfigWithDesc(
+		[]string{"set", "chassis", "cluster", "redundancy-group", "1", "node", "0", "priority"},
+		"",
+	)
+	if !hasCand(cands, "<integer>") {
+		t.Fatalf("expected <integer> placeholder, got %v", candNames(cands))
+	}
+	if desc := candDesc(cands, "<integer>"); !strings.Contains(desc, "1..254") {
+		t.Fatalf("priority placeholder description should carry the 1..254 range, got %q", desc)
+	}
+	for _, ex := range []string{"100", "200", "254"} {
+		if !hasCand(cands, ex) {
+			t.Fatalf("expected priority example %q, got %v", ex, candNames(cands))
+		}
+	}
+}
+
+// Prefix-partial filtering applies to chassis examples too.
+func TestCompleteConfig_RethAdvertiseInterval_PartialFiltersExamples(t *testing.T) {
+	c := newTypedLeafCLI(t)
+	cands := c.completeConfigWithDesc(
+		[]string{"set", "chassis", "cluster", "reth-advertise-interval"},
+		"3",
+	)
+	if !hasCand(cands, "30") {
+		t.Fatalf("expected 30 for partial \"3\", got %v", candNames(cands))
+	}
+	if hasCand(cands, "<integer>") {
+		t.Fatalf("placeholder should be filtered out by partial \"3\", got %v", candNames(cands))
+	}
+	if hasCand(cands, "100") {
+		t.Fatalf("100 should not match partial \"3\", got %v", candNames(cands))
 	}
 }

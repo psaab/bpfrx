@@ -41,6 +41,12 @@ set services rpm probe WAN test wan-a thresholds successive-loss 3
   and a `destination-interface`.
 - Probe config re-applies on commit, gated on the rendered RPM stanza
   hash — unrelated commits never reset probe state.
+- **Environment errors never move routes**: a probe-socket setup
+  failure (e.g. CAP_NET_RAW lost) holds the test's last state and logs
+  a rate-limited warning instead of marking the test FAILED, so a
+  capability regression cannot inject/withdraw preferred routes
+  fleet-wide. Only genuine on-the-wire failures (timeout, unreachable)
+  drive ip-monitoring.
 
 ## Failover policy (PR-1b)
 
@@ -178,8 +184,13 @@ referenced by an ip-monitoring policy or (b) bound via
 are gated — they run only on the node that is primary for the data RG
 (uplink addresses are VRRP VIPs; a standby probe would fail
 structurally). All other RPM probes keep run-everywhere behavior.
-Overlay publication follows the same gate; the overlay is runtime
-state and never syncs — on takeover the new primary publishes the
+Overlay publication follows the same gate. Known v1 coarseness: the
+publication gate keys on primaryship of the LOWEST data RG only — in
+a multi-data-RG cluster with split primaryship, per-policy/per-RETH
+publication gating is not yet differentiated (probe gating IS
+per-probe). Overlay publication gating refinement rides the later
+program PRs if a split-RG deployment materializes. The overlay is
+runtime state and never syncs — on takeover the new primary publishes the
 config baseline, runs a fresh probe cycle, and re-derives the overlay
 from fresh results (at most one fast probe cycle of config-default
 routing, and only on double fault).

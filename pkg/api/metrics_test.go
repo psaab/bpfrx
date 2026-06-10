@@ -966,6 +966,77 @@ func TestEmitCoSDrainPhaseTelemetry_EmitsNonExactExactBacklogCounter(t *testing.
 	}
 }
 
+// #1830 (g): emitCoSFlowFairOccupancy must surface the bucket-vs-flow
+// occupancy pair for EVERY queue row (no flow-fair gating — a 0 is a
+// real idle signal), with GAUGE typing and (ifindex, queue_id) labels.
+func TestEmitCoSFlowFairOccupancy_LabelsValuesAndGaugeType(t *testing.T) {
+	c := &xpfCollector{
+		cosFlowFairBucketsOccupied: prometheus.NewDesc(
+			"xpf_userspace_cos_flow_fair_buckets_occupied",
+			"test desc",
+			[]string{"ifindex", "queue_id"}, nil,
+		),
+		cosFlowFairFlowsActive: prometheus.NewDesc(
+			"xpf_userspace_cos_flow_fair_flows_active",
+			"test desc",
+			[]string{"ifindex", "queue_id"}, nil,
+		),
+	}
+	status := dpuserspace.ProcessStatus{
+		CoSInterfaces: []dpuserspace.CoSInterfaceStatus{{
+			Ifindex: 80,
+			Queues: []dpuserspace.CoSQueueStatus{
+				{
+					QueueID:                 4,
+					FlowFairBucketsOccupied: 9,
+					FlowFairFlowsActive:     12,
+				},
+				// Idle / non-flow-fair queue: both gauges must still
+				// emit, as zeros.
+				{QueueID: 5},
+			},
+		}},
+	}
+
+	ch := make(chan prometheus.Metric)
+	go func() {
+		c.emitCoSFlowFairOccupancy(ch, status)
+		close(ch)
+	}()
+	type series struct {
+		desc    *prometheus.Desc
+		queueID string
+	}
+	values := map[series]float64{}
+	for m := range ch {
+		var pb dto.Metric
+		if err := m.Write(&pb); err != nil {
+			t.Fatalf("metric.Write: %v", err)
+		}
+		labels := map[string]string{}
+		for _, lp := range pb.GetLabel() {
+			labels[lp.GetName()] = lp.GetValue()
+		}
+		if labels["ifindex"] != "80" {
+			t.Fatalf("wrong flow-fair occupancy labels: %v", labels)
+		}
+		if pb.Gauge == nil {
+			t.Fatalf("flow-fair occupancy metric %s must be a gauge: %+v", m.Desc(), &pb)
+		}
+		values[series{m.Desc(), labels["queue_id"]}] = pb.Gauge.GetValue()
+	}
+
+	want := map[series]float64{
+		{c.cosFlowFairBucketsOccupied, "4"}: 9,
+		{c.cosFlowFairFlowsActive, "4"}:     12,
+		{c.cosFlowFairBucketsOccupied, "5"}: 0,
+		{c.cosFlowFairFlowsActive, "5"}:     0,
+	}
+	if !reflect.DeepEqual(values, want) {
+		t.Fatalf("flow-fair occupancy metric values: got %+v, want %+v", values, want)
+	}
+}
+
 // #1628: emitCoSWaterfillTelemetry must surface the per-queue admission/
 // visit counters and the per-interface epochs/breaks/min-epochs metrics
 // with the right labels and metric types.
@@ -1744,4 +1815,84 @@ func metricHasLabels(pb *dto.Metric, want map[string]string) bool {
 		}
 	}
 	return true
+}
+
+// #1829 Phase 1: emitCoSSojourn must surface the sojourn trio for
+// EVERY queue row (no gating — a windowed-min 0 is a real "no
+// standing queue" signal, the gate evidence's strongest negative
+// result), with GAUGE typing and (ifindex, queue_id) labels.
+func TestEmitCoSSojourn_LabelsValuesAndGaugeType(t *testing.T) {
+	c := &xpfCollector{
+		cosSojournEwmaNS: prometheus.NewDesc(
+			"xpf_userspace_cos_sojourn_ewma_ns",
+			"test desc",
+			[]string{"ifindex", "queue_id"}, nil,
+		),
+		cosSojournPeakNS: prometheus.NewDesc(
+			"xpf_userspace_cos_sojourn_peak_ns",
+			"test desc",
+			[]string{"ifindex", "queue_id"}, nil,
+		),
+		cosSojournWindowedMinNS: prometheus.NewDesc(
+			"xpf_userspace_cos_sojourn_windowed_min_ns",
+			"test desc",
+			[]string{"ifindex", "queue_id"}, nil,
+		),
+	}
+	status := dpuserspace.ProcessStatus{
+		CoSInterfaces: []dpuserspace.CoSInterfaceStatus{{
+			Ifindex: 80,
+			Queues: []dpuserspace.CoSQueueStatus{
+				{
+					QueueID:              4,
+					SojournEwmaNS:        2500000,
+					SojournPeakNS:        9000000,
+					SojournWindowedMinNS: 1750000,
+				},
+				// Idle queue: all three gauges must still emit, as
+				// zeros (windowed-min 0 = no standing queue).
+				{QueueID: 5},
+			},
+		}},
+	}
+
+	ch := make(chan prometheus.Metric)
+	go func() {
+		c.emitCoSSojourn(ch, status)
+		close(ch)
+	}()
+	type series struct {
+		desc    *prometheus.Desc
+		queueID string
+	}
+	values := map[series]float64{}
+	for m := range ch {
+		var pb dto.Metric
+		if err := m.Write(&pb); err != nil {
+			t.Fatalf("metric.Write: %v", err)
+		}
+		labels := map[string]string{}
+		for _, lp := range pb.GetLabel() {
+			labels[lp.GetName()] = lp.GetValue()
+		}
+		if labels["ifindex"] != "80" {
+			t.Fatalf("wrong sojourn labels: %v", labels)
+		}
+		if pb.Gauge == nil {
+			t.Fatalf("sojourn metric %s must be a gauge: %+v", m.Desc(), &pb)
+		}
+		values[series{m.Desc(), labels["queue_id"]}] = pb.Gauge.GetValue()
+	}
+
+	want := map[series]float64{
+		{c.cosSojournEwmaNS, "4"}:        2500000,
+		{c.cosSojournPeakNS, "4"}:        9000000,
+		{c.cosSojournWindowedMinNS, "4"}: 1750000,
+		{c.cosSojournEwmaNS, "5"}:        0,
+		{c.cosSojournPeakNS, "5"}:        0,
+		{c.cosSojournWindowedMinNS, "5"}: 0,
+	}
+	if !reflect.DeepEqual(values, want) {
+		t.Fatalf("sojourn metric values: got %+v, want %+v", values, want)
+	}
 }

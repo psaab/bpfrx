@@ -17,13 +17,17 @@ type fakeOverlayDP struct {
 	dataplane.RuntimeDataPlane // nil embed: only the overlay surface is used
 	calls                      []string
 	publishErr                 error
+	publishSkipped             bool // simulate the duplicate-skip (published=false)
 	lastOverlay                []config.RouteOverlayEntry
 }
 
-func (f *fakeOverlayDP) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []config.RouteOverlayEntry, schedulerState map[string]bool) error {
+func (f *fakeOverlayDP) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []config.RouteOverlayEntry, schedulerState map[string]bool) (bool, error) {
 	f.calls = append(f.calls, "publish")
 	f.lastOverlay = overlay
-	return f.publishErr
+	if f.publishErr != nil {
+		return false, f.publishErr
+	}
+	return !f.publishSkipped, nil
 }
 
 func (f *fakeOverlayDP) BumpFIBGeneration() uint32 {
@@ -186,5 +190,67 @@ func TestRPMHAGatingFilter(t *testing.T) {
 	}
 	if got := lowestDataRG(cfg); got != 1 {
 		t.Fatalf("lowestDataRG = %d, want 1", got)
+	}
+}
+
+// TestCommitOverlayForConfigFiltersStaleEntries (Codex PR #1843
+// HIGH-1): the overlay riding an operator commit's own publish is
+// filtered against the INCOMING config — removed policies and edited
+// preferred-route specs drop out; unrelated commits preserve it.
+func TestCommitOverlayForConfigFiltersStaleEntries(t *testing.T) {
+	d := &Daemon{ipmon: failedIPMonEngine(t)}
+
+	// Unrelated commit: same policy spec in the incoming config.
+	same := &config.Config{}
+	same.Services.IPMonitoring = &config.IPMonitoringConfig{Policies: map[string]*config.IPMonitoringPolicy{
+		"wan-failover": {
+			Name:          "wan-failover",
+			MatchRPMProbe: "WAN",
+			PreferredRoutes: []*config.PreferredRoute{
+				{Destination: "0.0.0.0/0", NextHop: "172.16.80.1"},
+			},
+		},
+	}}
+	if got := d.commitOverlayForConfig(same); len(got) != 1 || got[0].NextHop != "172.16.80.1" {
+		t.Fatalf("unrelated commit lost the active overlay: %+v", got)
+	}
+
+	// Commit removes the policy → nothing rides the commit.
+	if got := d.commitOverlayForConfig(&config.Config{}); got != nil {
+		t.Fatalf("removed policy still riding the commit publish: %+v", got)
+	}
+
+	// Commit edits the next-hop → the old hop must not ride.
+	edited := &config.Config{}
+	edited.Services.IPMonitoring = &config.IPMonitoringConfig{Policies: map[string]*config.IPMonitoringPolicy{
+		"wan-failover": {
+			Name:          "wan-failover",
+			MatchRPMProbe: "WAN",
+			PreferredRoutes: []*config.PreferredRoute{
+				{Destination: "0.0.0.0/0", NextHop: "172.16.80.2"},
+			},
+		},
+	}}
+	if got := d.commitOverlayForConfig(edited); got != nil {
+		t.Fatalf("stale next-hop riding the commit publish: %+v", got)
+	}
+}
+
+// TestActuatorSkipsBumpOnDuplicatePublish (Codex PR #1843 MED): when
+// the snapshot publish is a duplicate-skip (content unchanged,
+// published=false), the actuator must NOT bump the FIB generation —
+// the dataplane routes did not move, so invalidating established-flow
+// route caches would be pure churn.
+func TestActuatorSkipsBumpOnDuplicatePublish(t *testing.T) {
+	dp := &fakeOverlayDP{publishSkipped: true}
+	d := &Daemon{
+		applySem: semaphore.NewWeighted(1),
+		dp:       dp,
+		ipmon:    failedIPMonEngine(t),
+	}
+	d.actuateRouteOverlayLocked(&config.Config{})
+
+	if len(dp.calls) != 1 || dp.calls[0] != "publish" {
+		t.Fatalf("calls = %v, want [publish] only (no bump on duplicate-skip)", dp.calls)
 	}
 }

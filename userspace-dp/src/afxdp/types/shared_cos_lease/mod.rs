@@ -1,5 +1,6 @@
 use super::*;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Mutex;
 
 // #1035 P4: shared CoS lease + MQFQ V_min coordination types extracted
 // from types.rs. Implements the cross-worker virtual-time floor
@@ -440,6 +441,48 @@ struct V8State {
     /// swapper.
     worker_equal_flow_active_samples: Box<[PackedEpochGrant]>,
     equal_flow: V8EqualFlowSuppressState,
+    /// #1830 (e): pre-allocated rotation scratch, sized to
+    /// `max_worker_id + 1` at lease construction. Replaces the former
+    /// fixed `[_; 32]` stack arrays in `maybe_rotate_epoch_v8`, which
+    /// silently degraded hosts with >32 workers (workers past the cap
+    /// were lumped into `active_outside_scratch` and forced an
+    /// equal-flow fail-open every epoch).
+    ///
+    /// Concurrency: only the rotation WINNER (the unique thread whose
+    /// EVEN→ODD CAS on `epoch_seq` succeeds for a cycle) touches this,
+    /// so the `Mutex` is uncontended by construction — `lock()` costs
+    /// one uncontended CAS, at most once per `EPOCH_DURATION_NS`
+    /// (200 µs) per lease. The Mutex exists to express that exclusivity
+    /// in safe Rust, not to arbitrate real contention. No heap
+    /// allocation ever happens at rotation time; the boxes are built
+    /// once in `new_v8_with_rate_mode` (cold: lease build/rebuild on
+    /// config commit or HA transition).
+    rotation_scratch: Mutex<V8RotationScratch>,
+}
+
+/// #1830 (e): per-rotation scratch capturing the just-ended epoch's
+/// per-worker swap results. Every slot is unconditionally overwritten
+/// by the rotation winner before being read (see `maybe_rotate_epoch_v8`
+/// STEP 2/3 and the EqualFlowSuppress sample swap), so no cross-rotation
+/// state leaks through it.
+struct V8RotationScratch {
+    signaled_by_worker: Box<[bool]>,
+    demanded_by_worker: Box<[bool]>,
+    active_by_worker: Box<[bool]>,
+    prev_grants: Box<[u32]>,
+    sampled_active_flows_by_worker: Box<[u32]>,
+}
+
+impl V8RotationScratch {
+    fn new(len: usize) -> Self {
+        Self {
+            signaled_by_worker: vec![false; len].into_boxed_slice(),
+            demanded_by_worker: vec![false; len].into_boxed_slice(),
+            active_by_worker: vec![false; len].into_boxed_slice(),
+            prev_grants: vec![0u32; len].into_boxed_slice(),
+            sampled_active_flows_by_worker: vec![0u32; len].into_boxed_slice(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1112,6 +1155,7 @@ impl SharedCoSQueueLease {
                 worker_demand_events,
                 worker_equal_flow_active_samples,
                 equal_flow: V8EqualFlowSuppressState::new(),
+                rotation_scratch: Mutex::new(V8RotationScratch::new(len)),
             }),
         }
     }

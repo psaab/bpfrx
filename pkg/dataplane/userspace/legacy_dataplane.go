@@ -209,11 +209,12 @@ func (a *LegacyDataPlaneAdapter) SetRouteOverlay(overlay []config.RouteOverlayEn
 }
 
 // PublishRouteOverlaySnapshot forwards the routes-only partial
-// republish (#1827).
-func (a *LegacyDataPlaneAdapter) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []config.RouteOverlayEntry, schedulerState map[string]bool) error {
+// republish (#1827). Returns whether a snapshot was actually
+// published (duplicate-skips and helperless caching return false).
+func (a *LegacyDataPlaneAdapter) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []config.RouteOverlayEntry, schedulerState map[string]bool) (bool, error) {
 	m, err := a.managerOrErr()
 	if err != nil {
-		return err
+		return false, err
 	}
 	return m.PublishRouteOverlaySnapshot(cfg, overlay, schedulerState)
 }
