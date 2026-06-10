@@ -1,6 +1,6 @@
 # #1844 ip-monitoring: DHCP-learned-uplink support for preferred-route next-hops
 
-**Status:** DRAFT v2.2 — (v2.2: Codex r2 folds — pending-FIB-bump retry on bump failure after a successful publish, §4.3/§7; §3 survey lease-lifecycle row corrected to finishClient. v2.1: SMR r2 publish-contract early-return clarification folded into §4.3)
+**Status:** DRAFT v2.3 — (v2.3: AGY r2 folds — eager DHCP-manager creation in Run beside d.ipmon, d.dhcp write-once pointer, lazy-create branch removed, §4.3/§4.6/§7. v2.2: Codex r2 folds — pending-FIB-bump retry, §3 survey lease-lifecycle row corrected to finishClient. v2.1: SMR r2 publish-contract early-return clarification, §4.3)
 
 v2 — folds all round-1 findings (Claude SMR + Codex +
 AGY, all PLAN-NEEDS-REVISION, docs beside this file). Headline folds:
@@ -290,20 +290,35 @@ SMR-1/Codex-1/AGY-1):
    finishClient is pre-existing); the unconditional fire is absorbed
    by the engine gate. v1's `removeLeaseAndNotify` helper is dropped.
 
-Daemon wiring: `d.ipmon` is constructed before the first applyConfig
-(`daemon_run.go:244`, by design comment), and the DHCP manager is
-created lazily inside an apply (`daemon_dhcp.go:119`), so ordering is
-safe today — but the hook is wired as a **nil-guarded closure**, not a
-method value, so it stays safe under future reordering (SMR r1-2):
+Daemon wiring — **eager DHCP-manager creation (AGY r2-1/r2-2,
+folded):** the DHCP manager is today created lazily inside an apply
+(`daemon_dhcp.go:119`, under `applySem`). With the resolver reading
+`d.dhcp` from the engine goroutine (and CLI/gRPC handlers already
+reading it bare), a lazy write to the pointer is a Go data race, and
+on the very first apply the overlay would be built with a nil
+resolver target. Fix: create the manager **eagerly in `Run`**, right
+beside `d.ipmon` (`daemon_run.go:238-246`) and gated on
+`!d.opts.NoDataplane` — exactly the precedent of `d.rpm`, which was
+made eager "so the pointer is stable" (comment at
+`daemon_run.go:236`). `d.dhcp` becomes write-once-at-boot/read-only
+thereafter; `reconcileDHCPClients` drops its lazy-create branch
+(keeping the NoDataplane guard and the `len(specs)==0` fast path —
+`Reconcile(nil)` no-ops). The first-apply hazard is then structural
+rather than timing-dependent. (Honest note on its practical reach:
+on a fresh daemon no policy can be FAILED before probes run, so the
+first-apply overlay is empty anyway — the race fix is the real
+driver; the ordering fix rides along.) The hook stays a nil-guarded
+closure so construction order can never regress silently (SMR r1-2):
 
 ```go
-dm, err := dhcp.New(stateDir, d.onDHCPAddressChange, func() {
+// daemon_run.go, beside d.ipmon creation:
+d.dhcp, err = dhcp.New(stateDir, d.onDHCPAddressChange, func() {
     if e := d.ipmon; e != nil {
         e.NotifyNextHopChange()
     }
 })
 ...
-d.ipmon.SetNextHopResolver(d.resolveDHCPNextHop) // LeaseFor(key, AFInet).Gateway; nil-checks d.dhcp
+d.ipmon.SetNextHopResolver(d.resolveDHCPNextHop) // LeaseFor(key, AFInet).Gateway; nil-checks d.dhcp (NoDataplane)
 ```
 
 Engine entry point:
@@ -469,10 +484,11 @@ shared lease-key helper, schema desc), `pkg/ipmon` (resolver type +
 SetNextHopResolver + NotifyNextHopChange + skip-unresolvable in
 activeOverlayLocked + PolicyStatus.UnresolvedRoutes), `pkg/dhcp`
 (`New` third argument + two fire sites: commitLease, finishClient),
-`pkg/daemon` (resolveDHCPNextHop, closure wiring,
+`pkg/daemon` (eager DHCP-manager creation in `Run` replacing the
+lazy-create branch, resolveDHCPNextHop, closure wiring,
 buildDHCPClientSpecs switches to shared helper, single-capture
 hardening in applyConfigLocked, `routeOverlayPublisher` interface +
-actuator bump-on-published-only), `pkg/dataplane/userspace`
+actuator bump-on-published-only + pendingFIBBump), `pkg/dataplane/userspace`
 (`PublishRouteOverlaySnapshot` returns `(published bool, err error)` —
 manager + legacy adapter; Go-only, snapshot wire format untouched),
 `pkg/api` (one gauge), docs (`docs/multi-wan.md`, `pkg/ipmon/README.md`,
@@ -486,7 +502,7 @@ Single PR, gated on **PR #1843 merged** (this plan reads the tree as it
 lands there). No sub-staging: the feature is one coherent seam
 (config → resolver → trigger), and each piece is independently
 unit-tested. PLAN-KILL tripwire during implementation: if wiring the
-hook through the lazy DHCP-manager creation or the lock-order contract
+hook through the DHCP-manager lifecycle or the lock-order contract
 turns out to require restructuring `pkg/dhcp`'s callback model (rather
 than adding one optional hook), stop and re-plan — that would signal
 the notification belongs at the daemon layer (wrapping
@@ -535,6 +551,8 @@ the notification belongs at the daemon layer (wrapping
    The hook is bounded-blocking, not non-blocking (Codex r1-3): it may
    wait on `Engine.mu` held across an overlay build; acyclic by the
    fire-outside-`dhcp.mu` rule; `-race` contention test required.
+   `d.dhcp` is write-once at boot (AGY r2-1): the eager creation in
+   `Run` is the ONLY assignment; no code path may re-create or nil it.
 4. **Reconcile keys on config identity only** (#1793) — no new
    fingerprint inputs.
 5. **commitLease single-commit-path** (#1777) — the hook is added

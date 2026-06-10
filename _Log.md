@@ -4848,3 +4848,6 @@ top.
 - **Timestamp**: 2026-06-10
   **Action**: #1844 plan v2.2 — Codex r2 folds (pending-FIB-bump retry; survey lease-lifecycle row corrected)
   **File(s)**: docs/research/1844-dhcp-nexthop/{plan.md,codex-plan-r2.md}
+- **Timestamp**: 2026-06-10
+  **Action**: #1844 plan v2.3 — AGY r2 folds (eager d.dhcp creation, write-once pointer)
+  **File(s)**: docs/research/1844-dhcp-nexthop/{plan.md,agy-plan-r2.md}
