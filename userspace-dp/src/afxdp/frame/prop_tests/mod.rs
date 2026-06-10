@@ -45,6 +45,7 @@
 use super::*;
 use proptest::prelude::*;
 
+mod inspect;
 mod oracle;
 mod strategies;
 
