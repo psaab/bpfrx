@@ -1236,6 +1236,9 @@ func (m *Manager) waitForLinkLocal(ctx context.Context, ifaceName string, timeou
 // applyAddress sets the DHCP-obtained address on the interface via netlink,
 // and installs a default route via the gateway if provided.
 func (m *Manager) applyAddress(ifaceName string, lease *Lease) error {
+	if m.nlHandle == nil {
+		return nil // test-constructed Manager without netlink
+	}
 	link, err := m.nlHandle.LinkByName(ifaceName)
 	if err != nil {
 		return fmt.Errorf("link lookup %s: %w", ifaceName, err)
