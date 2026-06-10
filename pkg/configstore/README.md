@@ -51,10 +51,23 @@ per-path:
   rename atomic, the old active survives on disk — a restart after a
   failed commit serves the previous config and the operator saw an
   error, never a silent revert.
+- **Crash window (persist-then-promote ambiguity).** Because the disk
+  write happens first, a crash after `WriteActive` succeeds but before
+  the in-memory promotion completes means a restart loads the NEW tree
+  even though the commit never reported success (no history/journal
+  entry, and for `CommitConfirmed` no armed rollback timer). This is
+  the deliberate trade: the old ordering's failure mode was a commit
+  that REPORTED success and silently reverted on restart. A
+  disconnected operator should treat an unanswered commit as
+  ambiguous — same as Junos — and inspect `show configuration` after
+  reconnecting.
 - **`CommitConfirmed` ordering.** Confirm state is only touched after
   the persist succeeds: on failure the rollback timer is NOT armed and
   an existing pending confirm (timer + rollback target) is left fully
-  intact. Nested confirmed commits (a second `CommitConfirmed` while
+  intact. A generation token guards the rollback callback: a timer
+  that already fired but lost the lock race to a nested re-arm or an
+  explicit confirmation no-ops instead of reverting the newer commit.
+  Nested confirmed commits (a second `CommitConfirmed` while
   one is pending) PRESERVE `confirmPrevTree` — the rollback target
   stays the last truly CONFIRMED config, not the unconfirmed
   commit-1 tree.

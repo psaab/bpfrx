@@ -50,7 +50,15 @@ type Store struct {
 	persistRetryInitialBackoff time.Duration
 	persistRetryMaxBackoff     time.Duration
 
-	// Commit confirmed state
+	// Commit confirmed state. confirmGen is a generation token
+	// guarding the auto-rollback callback against staleness: a timer
+	// that has already fired and is blocked on s.mu when a nested
+	// CommitConfirmed (or ConfirmCommit) supersedes it must become a
+	// no-op — time.Timer.Stop() cannot un-fire a callback that has
+	// started (Codex review on PR #1817). Every arm/confirm bumps the
+	// generation; the callback carries the value at arm time and
+	// performAutoRollback rejects mismatches.
+	confirmGen        uint64
 	confirmTimer      *time.Timer
 	confirmPrevTree   *config.ConfigTree   // active tree before confirmed commit
 	confirmPrevCfg    *config.Config       // compiled config before confirmed commit
@@ -1038,9 +1046,13 @@ func (s *Store) CommitConfirmed(minutes int) (*config.Config, error) {
 
 	s.saveRollbackFiles()
 
-	// Start auto-rollback timer
+	// Start auto-rollback timer. The closure captures the generation
+	// at arm time; a stale callback from a superseded timer no-ops in
+	// performAutoRollback.
+	s.confirmGen++
+	gen := s.confirmGen
 	s.confirmTimer = time.AfterFunc(time.Duration(minutes)*time.Minute, func() {
-		s.performAutoRollback()
+		s.performAutoRollback(gen)
 	})
 
 	slog.Info("commit confirmed started", "timeout_minutes", minutes)
@@ -1057,6 +1069,7 @@ func (s *Store) ConfirmCommit() error {
 	}
 
 	s.confirmTimer.Stop()
+	s.confirmGen++ // invalidate a callback that already fired and is blocked on s.mu
 	s.confirmTimer = nil
 	s.confirmPrevTree = nil
 	s.confirmPrevCfg = nil
@@ -1072,10 +1085,20 @@ func (s *Store) IsConfirmPending() bool {
 	return s.confirmTimer != nil
 }
 
-// performAutoRollback reverts the active config to the saved pre-confirmed state.
-func (s *Store) performAutoRollback() {
+// performAutoRollback reverts the active config to the saved
+// pre-confirmed state. gen must be the confirmGen captured when the
+// calling timer was armed: a mismatch means this callback was
+// superseded (nested CommitConfirmed re-armed, or ConfirmCommit
+// confirmed) after it fired but before it acquired s.mu, and rolling
+// back would revert a NEWER commit to an older tree (Codex review on
+// PR #1817).
+func (s *Store) performAutoRollback(gen uint64) {
 	s.mu.Lock()
 
+	if gen != s.confirmGen {
+		s.mu.Unlock()
+		return
+	}
 	if s.confirmPrevTree == nil {
 		s.mu.Unlock()
 		return

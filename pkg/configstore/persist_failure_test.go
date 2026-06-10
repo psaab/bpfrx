@@ -251,7 +251,7 @@ func TestNestedCommitConfirmed_PreservesLastConfirmedTree(t *testing.T) {
 
 	// Drive the timer expiry directly: the rollback must land on the
 	// last confirmed config, not on the unconfirmed commit-1 tree.
-	s.performAutoRollback()
+	s.performAutoRollback(s.confirmGen)
 	got := s.ShowActiveSet()
 	if got != baseSet {
 		t.Errorf("auto-rollback landed on the wrong config:\nwant: %s\ngot: %s", baseSet, got)
@@ -411,7 +411,7 @@ func TestAutoRollback_ProceedsAndFlagsOnPersistFailure(t *testing.T) {
 		return s.db.WriteActive(tree)
 	})
 
-	s.performAutoRollback()
+	s.performAutoRollback(s.confirmGen)
 
 	// The in-memory rollback proceeded.
 	if got := s.ShowActiveSet(); got != baseSet {
@@ -475,5 +475,57 @@ func TestCommit_SuccessClearsDegradedFlag(t *testing.T) {
 	}
 	if s.ConfigPersistDegraded() {
 		t.Error("successful commit persisted the current config; degraded flag must clear")
+	}
+}
+
+// TestStaleConfirmTimerCallbackIsNoOp pins the generation guard from
+// the Codex review on PR #1817: time.Timer.Stop() cannot un-fire a
+// callback that has already started and is blocked on s.mu. A stale
+// callback whose generation was superseded — by a nested
+// CommitConfirmed re-arm or by ConfirmCommit — must no-op instead of
+// rolling a NEWER commit back to an older tree.
+func TestStaleConfirmTimerCallbackIsNoOp(t *testing.T) {
+	dir := t.TempDir()
+	s := New(filepath.Join(dir, "config"))
+	commitBaseline(t, s)
+
+	// Commit 1 confirmed: arms timer generation g1.
+	if err := s.SetFromInput("security zones security-zone confirm1 interfaces eth1.0"); err != nil {
+		t.Fatalf("SetFromInput: %v", err)
+	}
+	if _, err := s.CommitConfirmed(10); err != nil {
+		t.Fatalf("CommitConfirmed 1: %v", err)
+	}
+	g1 := s.confirmGen
+
+	// Nested commit 2 confirmed: supersedes g1 with g2.
+	if err := s.SetFromInput("security zones security-zone confirm2 interfaces eth2.0"); err != nil {
+		t.Fatalf("SetFromInput: %v", err)
+	}
+	if _, err := s.CommitConfirmed(10); err != nil {
+		t.Fatalf("CommitConfirmed 2: %v", err)
+	}
+
+	// Model commit 1's timer callback having fired pre-supersede and
+	// only now acquiring the lock: it must not roll anything back.
+	s.performAutoRollback(g1)
+	cfg := s.ActiveConfig()
+	if _, ok := cfg.Security.Zones["confirm2"]; !ok {
+		t.Fatal("stale callback rolled back the newer nested confirmed commit")
+	}
+	if !s.IsConfirmPending() {
+		t.Fatal("stale callback cleared the newer commit's confirm state")
+	}
+
+	// Same for a confirmed (ConfirmCommit) window: stale callback
+	// after explicit confirmation must no-op.
+	g2 := s.confirmGen
+	if err := s.ConfirmCommit(); err != nil {
+		t.Fatalf("ConfirmCommit: %v", err)
+	}
+	s.performAutoRollback(g2)
+	cfg = s.ActiveConfig()
+	if _, ok := cfg.Security.Zones["confirm2"]; !ok {
+		t.Fatal("stale callback rolled back an explicitly confirmed commit")
 	}
 }
