@@ -1,0 +1,161 @@
+package daemon
+
+import (
+	"errors"
+	"testing"
+
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/ipmon"
+	"github.com/psaab/xpf/pkg/rpm"
+	"golang.org/x/sync/semaphore"
+)
+
+// fakeOverlayDP records the actuator's call order against the
+// routes-only publish surface.
+type fakeOverlayDP struct {
+	dataplane.RuntimeDataPlane // nil embed: only the overlay surface is used
+	calls                      []string
+	publishErr                 error
+	lastOverlay                []config.RouteOverlayEntry
+}
+
+func (f *fakeOverlayDP) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []config.RouteOverlayEntry, schedulerState map[string]bool) error {
+	f.calls = append(f.calls, "publish")
+	f.lastOverlay = overlay
+	return f.publishErr
+}
+
+func (f *fakeOverlayDP) BumpFIBGeneration() uint32 {
+	f.calls = append(f.calls, "bump")
+	return 1
+}
+
+func failedIPMonEngine(t *testing.T) *ipmon.Engine {
+	t.Helper()
+	e := ipmon.New(nil)
+	e.Apply(&config.IPMonitoringConfig{Policies: map[string]*config.IPMonitoringPolicy{
+		"wan-failover": {
+			Name:          "wan-failover",
+			MatchRPMProbe: "WAN",
+			PreferredRoutes: []*config.PreferredRoute{
+				{Destination: "0.0.0.0/0", NextHop: "172.16.80.1"},
+			},
+		},
+	}}, nil)
+	e.HandleTransition(rpm.Transition{
+		ProbeName: "WAN", TestName: "t", Status: "fail",
+		Results: []*rpm.ProbeResult{{ProbeName: "WAN", TestName: "t", LastStatus: "fail"}},
+	})
+	if len(e.ActiveOverlay()) == 0 {
+		t.Fatal("engine setup: no overlay after failure")
+	}
+	return e
+}
+
+// TestActuatorPublishesBeforeFIBBump enforces the load-bearing
+// ordering (AGY r2-1): BumpFIBGeneration runs ONLY after a successful
+// snapshot publish — bumping first would re-resolve established flows
+// against the OLD routes and the later snapshot would not
+// re-invalidate them.
+func TestActuatorPublishesBeforeFIBBump(t *testing.T) {
+	dp := &fakeOverlayDP{}
+	d := &Daemon{
+		applySem: semaphore.NewWeighted(1),
+		dp:       dp,
+		ipmon:    failedIPMonEngine(t),
+	}
+	d.actuateRouteOverlayLocked(&config.Config{})
+
+	if len(dp.calls) != 2 || dp.calls[0] != "publish" || dp.calls[1] != "bump" {
+		t.Fatalf("calls = %v, want [publish bump]", dp.calls)
+	}
+	if len(dp.lastOverlay) != 1 || dp.lastOverlay[0].NextHop != "172.16.80.1" {
+		t.Fatalf("published overlay = %+v", dp.lastOverlay)
+	}
+}
+
+// TestActuatorSkipsBumpOnPublishFailure: a failed publish must NOT
+// bump — the helper does not have the new routes yet.
+func TestActuatorSkipsBumpOnPublishFailure(t *testing.T) {
+	dp := &fakeOverlayDP{publishErr: errors.New("socket down")}
+	d := &Daemon{
+		applySem: semaphore.NewWeighted(1),
+		dp:       dp,
+		ipmon:    failedIPMonEngine(t),
+	}
+	d.actuateRouteOverlayLocked(&config.Config{})
+
+	for _, c := range dp.calls {
+		if c == "bump" {
+			t.Fatalf("calls = %v: FIB generation bumped after failed publish", dp.calls)
+		}
+	}
+}
+
+// TestAssembleFRRConfigCarriesOverlay: the shared constructor injects
+// the active overlay as PreferredRoutes, so BOTH the full apply path
+// and the actuator render the failover route — the AGY r2-2
+// commit-while-failover-active scenario at the FRR consumer.
+func TestAssembleFRRConfigCarriesOverlay(t *testing.T) {
+	d := &Daemon{ipmon: failedIPMonEngine(t)}
+	cfg := &config.Config{}
+	cfg.RoutingOptions.StaticRoutes = []*config.StaticRoute{
+		{Destination: "0.0.0.0/0", NextHops: []config.NextHopEntry{{Address: "172.16.50.1"}}},
+	}
+
+	fc := d.assembleFRRConfig(cfg, d.ipmonActiveOverlay())
+	if len(fc.PreferredRoutes) != 1 || fc.PreferredRoutes[0].NextHop != "172.16.80.1" {
+		t.Fatalf("PreferredRoutes = %+v, want active overlay", fc.PreferredRoutes)
+	}
+	// The config baseline stays present (the overlay shadows it at
+	// distance 1; it does not REPLACE config statics in FRR).
+	if len(fc.StaticRoutes) != 1 {
+		t.Fatalf("StaticRoutes = %+v", fc.StaticRoutes)
+	}
+
+	// Standby gating: a gated engine yields a baseline render.
+	d.ipmon.SetPublishEnabled(false)
+	fc = d.assembleFRRConfig(cfg, d.ipmonActiveOverlay())
+	if len(fc.PreferredRoutes) != 0 {
+		t.Fatalf("PreferredRoutes = %+v on standby, want none", fc.PreferredRoutes)
+	}
+}
+
+// TestRPMHAGatingFilter exercises the §4.4 gating scope: only
+// policy-referenced or RETH-bound probes are gated, and only while the
+// node is secondary for the relevant RG.
+func TestRPMHAGatingFilter(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Services.RPM = &config.RPMConfig{Probes: map[string]*config.RPMProbe{
+		"WAN": {Name: "WAN", Tests: map[string]*config.RPMTest{
+			"t": {Name: "t", Target: "1.1.1.1", DestinationInterface: "reth0.50"},
+		}},
+		"plain": {Name: "plain", Tests: map[string]*config.RPMTest{
+			"t": {Name: "t", Target: "8.8.8.8"},
+		}},
+	}}
+	cfg.Services.IPMonitoring = &config.IPMonitoringConfig{Policies: map[string]*config.IPMonitoringPolicy{
+		"p": {Name: "p", MatchRPMProbe: "WAN"},
+	}}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"reth0": {Name: "reth0", RedundancyGroup: 1},
+	}
+	cfg.Chassis.Cluster = &config.ClusterConfig{
+		RedundancyGroups: []*config.RedundancyGroup{{ID: 0}, {ID: 1}},
+	}
+
+	gated := rpmProbeGatingRGs(cfg)
+	if len(gated) != 1 {
+		t.Fatalf("gated = %+v, want only WAN (policy-referenced + RETH-bound)", gated)
+	}
+	if rg, ok := gated["WAN"]; !ok || rg != 1 {
+		t.Fatalf("gated[WAN] = %d/%v, want RG 1 from the bound RETH", rg, ok)
+	}
+	if _, ok := gated["plain"]; ok {
+		t.Fatal("plain probe must keep run-everywhere behavior")
+	}
+	if got := lowestDataRG(cfg); got != 1 {
+		t.Fatalf("lowestDataRG = %d, want 1", got)
+	}
+}

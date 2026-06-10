@@ -28,6 +28,7 @@ import (
 	"github.com/psaab/xpf/pkg/flowexport"
 	"github.com/psaab/xpf/pkg/frr"
 	"github.com/psaab/xpf/pkg/grpcapi"
+	"github.com/psaab/xpf/pkg/ipmon"
 	"github.com/psaab/xpf/pkg/ipsec"
 	"github.com/psaab/xpf/pkg/lldp"
 	"github.com/psaab/xpf/pkg/logging"
@@ -88,6 +89,7 @@ type Daemon struct {
 	rpm                        *rpm.Manager
 	rpmMu                      sync.Mutex // serializes reconcileRPM callers (#1827)
 	activeRPMHash              [32]byte   // config-hash gate for RPM re-apply (#1827)
+	ipmon                      *ipmon.Engine
 	flowExporter               *flowexport.Exporter
 	flowCancel                 context.CancelFunc
 	flowWg                     sync.WaitGroup

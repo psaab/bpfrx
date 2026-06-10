@@ -13,6 +13,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"log/slog"
+	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/routing"
@@ -37,13 +38,150 @@ func rpmConfigHash(rpmCfg *config.RPMConfig, rethMap map[string]string) [32]byte
 	return sha256.Sum256(data)
 }
 
-// effectiveRPMConfig returns the RPM config that should actually run on
-// this node.
+// effectiveRPMConfig returns the RPM config that should actually run
+// on this node: in cluster mode the §4.4 ip-monitoring gating scope
+// removes gated probes while the node is not primary for their data
+// RG; everything else (and all standalone probes) keeps today's
+// run-everywhere behavior.
 func (d *Daemon) effectiveRPMConfig(cfg *config.Config) *config.RPMConfig {
 	if cfg == nil {
 		return nil
 	}
-	return cfg.Services.RPM
+	return d.filterRPMForHAGating(cfg)
+}
+
+// filterRPMForHAGating implements the §4.4 primary-only gating scope
+// (#1827 PR-1b). Gating applies ONLY to probes that are (a) referenced
+// by a `services ip-monitoring` policy, or (b) bound via
+// destination-interface / source-address to a VIP-owned (RETH)
+// interface — uplink addresses are VRRP-owned VIPs, so a standby probe
+// would fail structurally, not informatively. All other probes are
+// untouched. Within the gated scope, a probe runs only on the node
+// that is primary for the probe's redundancy group.
+func (d *Daemon) filterRPMForHAGating(cfg *config.Config) *config.RPMConfig {
+	rpmCfg := cfg.Services.RPM
+	if rpmCfg == nil || d.cluster == nil || cfg.Chassis.Cluster == nil {
+		return rpmCfg
+	}
+
+	gatedRG := rpmProbeGatingRGs(cfg)
+	if len(gatedRG) == 0 {
+		return rpmCfg
+	}
+
+	filtered := &config.RPMConfig{Probes: make(map[string]*config.RPMProbe, len(rpmCfg.Probes))}
+	dropped := 0
+	for name, probe := range rpmCfg.Probes {
+		if rgID, gated := gatedRG[name]; gated && !d.cluster.IsLocalPrimary(rgID) {
+			dropped++
+			continue
+		}
+		filtered.Probes[name] = probe
+	}
+	if dropped > 0 {
+		slog.Info("RPM probes gated off while secondary", "gated", dropped)
+	}
+	return filtered
+}
+
+// rpmProbeGatingRGs returns the probes inside the §4.4 gating scope,
+// mapped to the redundancy group whose primaryship gates them: the RG
+// of a bound RETH interface when one exists, otherwise the lowest
+// configured data RG.
+func rpmProbeGatingRGs(cfg *config.Config) map[string]int {
+	rpmCfg := cfg.Services.RPM
+	if rpmCfg == nil {
+		return nil
+	}
+
+	// Probes referenced by ip-monitoring policies.
+	referenced := make(map[string]bool)
+	if cfg.Services.IPMonitoring != nil {
+		for _, pol := range cfg.Services.IPMonitoring.Policies {
+			if pol != nil && pol.MatchRPMProbe != "" {
+				referenced[pol.MatchRPMProbe] = true
+			}
+		}
+	}
+
+	// RETH interface → RG, plus RETH unit VIP addresses for
+	// source-address matching.
+	rethRG := make(map[string]int)
+	rethVIPs := make(map[string]int)
+	for name, ifc := range cfg.Interfaces.Interfaces {
+		if ifc == nil || ifc.RedundancyGroup <= 0 || !strings.HasPrefix(name, "reth") {
+			continue
+		}
+		rethRG[name] = ifc.RedundancyGroup
+		for _, unit := range ifc.Units {
+			if unit == nil {
+				continue
+			}
+			for _, addr := range unit.Addresses {
+				ip := addr
+				if i := strings.IndexByte(ip, '/'); i >= 0 {
+					ip = ip[:i]
+				}
+				rethVIPs[ip] = ifc.RedundancyGroup
+			}
+		}
+	}
+
+	defaultRG := lowestDataRG(cfg)
+
+	gated := make(map[string]int)
+	for probeName, probe := range rpmCfg.Probes {
+		if probe == nil {
+			continue
+		}
+		rgID, inScope := defaultRG, false
+		if referenced[probeName] {
+			inScope = true
+		}
+		for _, test := range probe.Tests {
+			if test == nil {
+				continue
+			}
+			if test.DestinationInterface != "" {
+				base := test.DestinationInterface
+				if i := strings.IndexByte(base, '.'); i >= 0 {
+					base = base[:i]
+				}
+				if rg, ok := rethRG[base]; ok {
+					inScope, rgID = true, rg
+				}
+			}
+			if test.SourceAddress != "" {
+				if rg, ok := rethVIPs[test.SourceAddress]; ok {
+					inScope, rgID = true, rg
+				}
+			}
+		}
+		if inScope {
+			gated[probeName] = rgID
+		}
+	}
+	return gated
+}
+
+// lowestDataRG returns the lowest configured redundancy group ID >= 1
+// (the data RG), falling back to 0 when only RG 0 exists.
+func lowestDataRG(cfg *config.Config) int {
+	rg := -1
+	if cfg.Chassis.Cluster != nil {
+		for _, g := range cfg.Chassis.Cluster.RedundancyGroups {
+			if g == nil || g.ID < 1 {
+				continue
+			}
+			if rg == -1 || g.ID < rg {
+				rg = g.ID
+			}
+		}
+	}
+	if rg == -1 {
+		return 0
+	}
+	return rg
 }
 
 // reconcileRPM applies the RPM probe set when (and only when) the

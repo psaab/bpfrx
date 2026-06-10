@@ -31,6 +31,7 @@ import (
 	"github.com/psaab/xpf/pkg/frr"
 	"github.com/psaab/xpf/pkg/fwdstatus"
 	"github.com/psaab/xpf/pkg/grpcapi"
+	"github.com/psaab/xpf/pkg/ipmon"
 	"github.com/psaab/xpf/pkg/ipsec"
 	"github.com/psaab/xpf/pkg/lldp"
 	"github.com/psaab/xpf/pkg/logging"
@@ -235,6 +236,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// CLI/gRPC results closures and so applyConfig's hash-gated
 	// reconcileRPM (#1827) can start probes from the very first apply.
 	d.rpm = rpm.New()
+
+	// Create the ip-monitoring engine (#1827 PR-1b) before the first
+	// applyConfig so reconcileIPMon can install committed policies.
+	// The engine drives the routes-only actuator through its own
+	// debounce/throttle loop; the RPM transition hook is its sensor.
+	d.ipmon = ipmon.New(d.actuateRouteOverlay)
+	d.rpm.SetTransitionCallback(d.ipmon.HandleTransition)
+	d.ipmon.Start()
 
 	// Initialize cluster manager if configured (heartbeat/sync started after applyConfig).
 	if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.Cluster != nil {
@@ -825,6 +834,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// (stuck netlink/probe syscall) is observable as a climbing
 			// gauge before it manifests as the cold-connect hang.
 			NeighborPhaseAgeFn: d.NeighborPeriodicPhaseAges,
+			// #1827: ip-monitoring policy state for the xpf_ipmon_*
+			// metric family.
+			IPMonStatusFn: func() []ipmon.PolicyStatus {
+				if d.ipmon != nil {
+					return d.ipmon.Status()
+				}
+				return nil
+			},
 			// #1799: surface configstore persist-degraded state so
 			// /health returns 503 (and xpf_daemon_config_persist_degraded
 			// reads 1) while the running active config is not durable on
@@ -913,6 +930,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 			RPMResultsFn: func() []*rpm.ProbeResult {
 				if d.rpm != nil {
 					return d.rpm.Results()
+				}
+				return nil
+			},
+			IPMonStatusFn: func() []ipmon.PolicyStatus {
+				if d.ipmon != nil {
+					return d.ipmon.Status()
 				}
 				return nil
 			},
@@ -1024,6 +1047,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}
 			return nil
 		})
+		shell.SetIPMonStatusFn(func() []ipmon.PolicyStatus {
+			if d.ipmon != nil {
+				return d.ipmon.Status()
+			}
+			return nil
+		})
 		shell.SetFeedsFn(func() map[string]feeds.FeedInfo {
 			if d.feeds != nil {
 				return d.feeds.AllFeeds()
@@ -1120,6 +1149,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Clean up RPM probes.
 	if d.rpm != nil {
 		d.rpm.StopAll()
+	}
+
+	// Stop the ip-monitoring engine (after RPM so no transitions
+	// arrive during teardown).
+	if d.ipmon != nil {
+		d.ipmon.Stop()
 	}
 
 	// Clean up LLDP.
