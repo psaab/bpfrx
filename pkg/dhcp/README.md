@@ -9,7 +9,8 @@ restarts so the same client identifier returns to the same lease.
 - `Manager` — `dhcp.go`.
 - `New(stateDir string, onAddressChange func()) (*Manager, error)` —
   `dhcp.go`. The `onAddressChange` callback fires (debounced 2 s)
-  when any client's lease changes.
+  when any client's lease **content** changes — address, gateway, DNS,
+  or delegated prefixes; not on a content-identical renewal (#1777).
 - `Lease` — `dhcp.go`. Result of one DHCP negotiation.
 - `DelegatedPrefix` — `dhcp.go`. From DHCPv6 PD.
 - `ClientSpec` — `reconcile.go`. One desired client derived from
@@ -54,6 +55,46 @@ without DHCP no longer disables DHCP for the daemon's lifetime.
   cancellation, DHCPv4 max-retransmissions, DHCPv6 link-local abort —
   so a dead client can never permanently block a future `Start` for
   the same key.
+
+## Renewal semantics (#1777)
+
+> Wire note: T1/T2 attempts still run the full client exchange
+> (v4 force-discover DORA; v6 Information-Request/Rapid Solicit), not
+> unicast RFC RENEW/REBIND — the RFC citations below describe the
+> timer/fallback structure only. True unicast renew is a possible
+> follow-up (#1832 review note).
+
+
+Acquisition and renewal share one commit path, `commitLease`
+(`commit.go`): remove the old address if the server moved us, apply the
+new address, store the lease (and DHCPv6 delegated prefixes), and fire
+the debounced `onAddressChange` callback when content changed.
+
+- **Successful T1 renew / T2 rebind is committed**, and the run loop
+  returns to the T1 wait with timers recomputed from the renewed
+  lease. Pre-#1777 the renewal result was dead-assigned and the loop
+  re-entered a full DORA / Solicit, discarding the renewal (changed
+  DNS, delegated prefixes) and doubling the DHCP traffic.
+- **Only renewal failure re-acquires**: a NAK/timeout at T1 falls
+  through to the T2 rebind; a second failure (or a failure to apply
+  the renewed address) falls back to full re-acquisition — RFC 2131
+  §4.4.5 / RFC 8415 §18.2.4-5 behavior. A transient renew failure
+  retains the old lease and address until then (`docs/dns-ownership.md`).
+- **Address moves are re-acquisition-equivalent**: if a renewal returns
+  a different address, the old one is removed and the new one applied
+  via the same netlink mechanisms the fresh-acquisition path uses.
+- **Content-unchanged renewals are silent**: the callback re-enters the
+  daemon's `applyConfig` (full recompile) and thus `Reconcile`; firing
+  it on every T1 interval would recompile the dataplane periodically
+  for nothing. `Reconcile` keys on config identity (never lease state),
+  so a fire is never a restart-loop hazard — only recompile churn.
+  An IA_PD reply with no prefixes retains previously delegated prefixes
+  (and does not count as a change).
+- The run loops are not unit-testable (real sockets via
+  nclient4/nclient6; the T1 wait has an uninjectable 30 s clamp), so
+  the decision logic is concentrated in `commitLease` /
+  `renewalTimers` / `leaseContentChanged` / `delegatedPrefixesChanged`
+  and pinned by `commit_test.go`.
 
 ## Callers
 

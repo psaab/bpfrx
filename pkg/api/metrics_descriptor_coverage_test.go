@@ -245,6 +245,9 @@ func populatedCoverageStatus() dpuserspace.ProcessStatus {
 				TXCompletions:                123,
 				TXCompletionRingAvailable:    10,
 				TXCompletionRingAvailableMax: 20,
+				// #1831: per-binding V_min throttle counters (always emit).
+				VMinThrottles:                51,
+				VMinThrottleHardCapOverrides: 2,
 			},
 		},
 		CoSActiveFlowCounts: []dpuserspace.CoSActiveFlowCountStatus{
@@ -425,6 +428,9 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 		"xpf_userspace_neighbor_netlink_redump_upserts_total",
 		"xpf_userspace_neighbor_pending_keys",
 		"xpf_userspace_neg_neigh_keys",
+		// #1831: per-binding V_min fairness-throttle counters (#941/#943)
+		"xpf_userspace_binding_v_min_throttles_total",
+		"xpf_userspace_binding_v_min_throttle_hard_cap_overrides_total",
 	}
 	if ifaceResolvable {
 		want = append(want, "xpf_interface_packets_total") // collectInterfaceCounters (lo)
