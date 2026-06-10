@@ -49,6 +49,7 @@ func (c *xpfCollector) collectSystemMetrics(ch chan<- prometheus.Metric) {
 	// #1827: services ip-monitoring policy state.
 	if c.srv.ipmonStatusFn != nil {
 		routesApplied := 0
+		unresolved := 0
 		for _, ps := range c.srv.ipmonStatusFn() {
 			failed := 0.0
 			if ps.Failed {
@@ -59,9 +60,15 @@ func (c *xpfCollector) collectSystemMetrics(ch chan<- prometheus.Metric) {
 			ch <- prometheus.MustNewConstMetric(c.ipmonPolicyTransitions,
 				prometheus.CounterValue, float64(ps.Transitions), ps.Name)
 			routesApplied += len(ps.Routes)
+			// #1844: Status() recomputes the overlay (including the
+			// resolver skips), so the gauge is current on every scrape
+			// without requiring an actuation.
+			unresolved += len(ps.UnresolvedRoutes)
 		}
 		ch <- prometheus.MustNewConstMetric(c.ipmonRoutesApplied,
 			prometheus.GaugeValue, float64(routesApplied))
+		ch <- prometheus.MustNewConstMetric(c.ipmonUnresolvedNextHops,
+			prometheus.GaugeValue, float64(unresolved))
 	}
 
 	// Daemon RSS from /proc/self/statm (field 1 = RSS in pages)

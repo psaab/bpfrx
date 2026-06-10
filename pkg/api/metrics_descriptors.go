@@ -267,6 +267,16 @@ func newCollector(srv *Server) *xpfCollector {
 				"(after winner resolution, #1827).",
 			nil, nil,
 		),
+		ipmonUnresolvedNextHops: prometheus.NewDesc(
+			"xpf_ipmon_unresolved_next_hops",
+			"Number of ip-monitoring interface-typed preferred routes of "+
+				"FAILED policies currently skipped from the overlay "+
+				"because the tracked interface unit has no DHCP-learned "+
+				"gateway (#1844). Non-zero during a failover means the "+
+				"backup uplink's lease is missing and the failover route "+
+				"is NOT injected.",
+			nil, nil,
+		),
 
 		// #709: owner-profile telemetry. Labels:
 		//   ifindex:      interface ifindex as string

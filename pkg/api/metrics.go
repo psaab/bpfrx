@@ -86,10 +86,14 @@ type xpfCollector struct {
 	// yet succeeded (restart would load a stale config).
 	configPersistDegraded *prometheus.Desc
 
-	// #1827: services ip-monitoring observability.
-	ipmonPolicyFailed      *prometheus.Desc
-	ipmonPolicyTransitions *prometheus.Desc
-	ipmonRoutesApplied     *prometheus.Desc
+	// #1827: services ip-monitoring observability. #1844 adds the
+	// unresolved interface-typed next-hop gauge (preferred routes of
+	// FAILED policies skipped from the overlay for lack of a
+	// DHCP-learned gateway).
+	ipmonPolicyFailed       *prometheus.Desc
+	ipmonPolicyTransitions  *prometheus.Desc
+	ipmonRoutesApplied      *prometheus.Desc
+	ipmonUnresolvedNextHops *prometheus.Desc
 
 	// #709: CoS owner-profile telemetry (userspace dataplane only).
 	// Cardinality estimate per plan §5: num_queues (≤ 64) × num_interfaces
@@ -344,6 +348,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.ipmonPolicyFailed
 	ch <- c.ipmonPolicyTransitions
 	ch <- c.ipmonRoutesApplied
+	ch <- c.ipmonUnresolvedNextHops
 	ch <- c.cosDrainLatencyBucket
 	ch <- c.cosDrainInvocationsTotal
 	ch <- c.cosRedirectAcquireBucket
