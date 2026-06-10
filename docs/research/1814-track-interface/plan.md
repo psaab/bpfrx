@@ -1,7 +1,7 @@
 # #1814 — VRRP track-interface: nested priority-cost block + make tracking actually work
 
-Status: DRAFT v2 — REFRAMED after round-1 (Codex PLAN-KILL on v1's false
-premise; AGY design review constructive). Pending round-2 confirm.
+Status: DRAFT v3 — AGY r2 conditions folded (owner exemption, takeover
+latency, watcher lifecycle). Pending Codex round-2 confirm.
 
 ## Round-1 verdicts and the reframe
 
@@ -41,27 +41,39 @@ Two defects, one feature surface:
 - `getPriority()` returns the **effective** priority:
   `p := vi.cfg.Priority; if vi.trackDown && vi.cfg.TrackInterface != "" {
   p -= vi.cfg.TrackPriorityCost }`, clamped to [1, 254] (0 is the
-  release/shutdown sentinel and must never result from tracking; 255 is
-  owner). Default cost when the nested/flat form omits it: Junos default
+  release/shutdown sentinel — instance.go:380-384 sends the priority-0
+  resignation burst on stop — and must never result from tracking).
+  **Owner exemption (AGY r2): when `cfg.Priority == 255` (IP address
+  owner), tracking is NOT applied** — an owner stepping down while still
+  holding the address invites duplicate-IP conflicts; skip with a
+  one-time warning at compile/commit instead. Default cost when the nested/flat form omits it: Junos default
   is priority-cost required? Junos allows 1-254, no default — if the
   operator gives track-interface without priority-cost, treat cost as 0
   and surface a commit WARNING ("track-interface without priority-cost
   has no effect") so the no-op is visible, not silent.
 - Link-state source: the Manager runs ONE `netlink.LinkSubscribe`
-  goroutine (the package already imports vishvananda/netlink for VIP
-  management, instance.go:19) started lazily when ≥1 instance has a
-  TrackInterface; it maintains ifname → operstate and calls
-  `vi.setTrackDown(down)` on transitions for instances tracking that
-  ifname. Initial state seeded by `netlink.LinkByName` at instance
-  start/update. Subscribe-failure fallback: log + 1s poll ticker
-  (bounded; only while tracked instances exist).
+  goroutine (the package already imports vishvananda/netlink,
+  instance.go:19) started lazily when ≥1 instance has a TrackInterface;
+  it maintains ifname → operstate and calls `vi.setTrackDown(down)` on
+  transitions for instances tracking that ifname. Initial state seeded
+  by `netlink.LinkByName` at instance start/update. Subscribe-failure
+  fallback: log + 1s poll ticker (only while tracked instances exist).
+  **Lifecycle (AGY r2): strictly a SINGLETON** — guard with a
+  watcherRunning flag under the manager mutex so UpdateInstances churn
+  never spawns a second goroutine; follow the daemon's established
+  cancellation pattern (pkg/daemon/daemon_flow.go:430-432: ctx.Done →
+  close(done) → return) with the done channel closed from Manager.Stop;
+  the watcher re-reads the tracked-ifname set from the manager under
+  lock on each event rather than capturing it.
 - `setTrackDown` recomputes effective priority; if it CHANGED: log
   (slog.Info, transition-only), and let the existing state machine act —
-  master with lowered priority keeps advertising the lower value and a
-  higher-priority backup preempts per protocol (no forced abdication
-  needed; preempt=true peers take over; document that with preempt=false
-  peers, takeover waits for masterDown like real VRRP). The
-  advert-on-next-tick is sufficient (30ms-1s intervals).
+  master with lowered priority keeps advertising the lower value.
+  **Takeover latency (AGY r2, instance.go:737-738):** a preempt=true
+  backup hearing a LOWER-priority advert IGNORES it and lets its
+  masterDown timer expire — so takeover after a tracked-link demotion
+  lands in ~masterDownInterval (3×advert+skew, ≈97ms at 30ms adverts /
+  ≈3.3s at 1s adverts), not on the next advert. Document this expected
+  latency; it matches RFC 5798 behavior and needs no forced abdication.
 - `UpdateInstances` comparison (manager.go:194) includes TrackInterface +
   TrackPriorityCost so config changes propagate (track-field-only changes
   update cfg in place rather than full instance restart if the existing
