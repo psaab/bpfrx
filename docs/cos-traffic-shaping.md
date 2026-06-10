@@ -895,10 +895,13 @@ Notes for this specific test:
 - **`equal-flow-enforcement` is supported at any worker count** (#1830 (e)).
   The former 32-worker cap (`MAX_WORKERS_SCRATCH` stack scratch in the v8
   lease rotation) is removed: `rotate_epoch_v8.rs` now captures per-worker
-  swap state in a heap scratch sized to the true worker count at lease
-  construction (one cold allocation per lease build/rebuild; no allocation
-  at rotation time), so an active worker beyond index 31 no longer forces
-  an `unsampled_active_worker` fail-open every epoch. The matching #1733
+  swap state in a heap scratch sized at lease construction to cover the
+  HIGHEST planned worker id (`last_planned_worker_slots` = max planned id
+  + 1, not the worker count — ids can be sparse after partial binding
+  unregister, per the Codex review on PR #1841; one cold allocation per
+  lease build/rebuild; no allocation at rotation time), so an active
+  worker beyond index 31 no longer forces an `unsampled_active_worker`
+  fail-open every epoch. The matching #1733
   commit-time hard-reject of `workers > 32` + `equal-flow-enforcement`
   (and its lenient load/peer-sync warning downgrade) is retired with it.
   The `unsampled_active_worker` fail-open reason still exists for its
