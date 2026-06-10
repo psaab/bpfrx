@@ -47,6 +47,7 @@ use proptest::prelude::*;
 
 mod inspect;
 mod oracle;
+mod rewrite;
 mod strategies;
 
 /// Explicit per-property config (plan §5.4): fixed case counts, fresh
