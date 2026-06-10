@@ -795,6 +795,21 @@ For production observability, xpf MUST export:
   gauges: per-worker breakdown of the same hypothetical cap. These are
   intended to answer "which worker would we slow, by how much?" without
   depending on whether an opt-in enforcement mode is configured.
+- **`xpf_userspace_cos_flow_fair_buckets_occupied{ifindex=..., queue_id=...}`**
+  and **`xpf_userspace_cos_flow_fair_flows_active{ifindex=..., queue_id=...}`**
+  gauges (#1830 (g)): bucket-vs-flow occupancy for distinguishing SFQ
+  hash-collision unfairness from demand unfairness. `buckets_occupied`
+  is the instantaneous count of backlogged flow-fair SFQ buckets summed
+  across workers; `flows_active` is the flow-cache active-window
+  (~650 ms) distinct-flow count mapped to the queue, summed across
+  workers (it equals `sum by (ifindex, queue_id)` of
+  `xpf_userspace_cos_active_flow_count`). The ratio is meaningful only
+  while the queue is CONTINUOUSLY backlogged (sustained `iperf3 -P N`):
+  there, `buckets_occupied` persistently below the known concurrent
+  flow fan-in (equivalently `flows_active / buckets_occupied`
+  persistently above 1) indicates hash collisions shrinking per-flow
+  shares. On idle or bursty queues `flows_active` naturally exceeds
+  `buckets_occupied` — demand variance, not collision evidence.
 
 When `class-of-service schedulers <name> equal-flow-enforcement` is
 enabled on a positive exact-rate scheduler without `surplus-sharing`, the
@@ -876,6 +891,16 @@ the sweep exit `2`; they do not produce a false-green fairness verdict.
   Counted distinctly from (not a subset of) the throttle counter; the
   overrides/throttles ratio is the diagnostic for LAG_THRESHOLD tuned
   too tight.
+- **`xpf_userspace_cos_sojourn_windowed_min_ns{ifindex=..., queue_id=...}`**
+  gauge (#1829 Phase 1): minimum per-packet queue sojourn over the
+  last 1-2 100 ms windows, MAX-merged across workers (worst
+  instance). CoDel's standing-queue estimator and the #1829 Phase-2
+  gate metric — a value persistently above `codel-target` is
+  standing-queue evidence; 0 means no pops in the last ~2 windows.
+  Companion gauges `xpf_userspace_cos_sojourn_ewma_ns` and
+  `xpf_userspace_cos_sojourn_peak_ns` are supporting context only
+  (both biased high by scheduler service gaps). See "Reading the
+  sojourn telemetry" in `cos-validation-notes.md`.
 
 Operators tracking this contract in production monitor the gap
 `(observed_cov - cstruct)` and the starved-flow counter. A

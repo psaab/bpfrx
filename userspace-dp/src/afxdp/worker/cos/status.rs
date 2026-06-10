@@ -11,6 +11,7 @@ use super::*;
 pub(in crate::afxdp::worker) fn build_worker_cos_statuses(
     bindings: &[BindingWorker],
     forwarding: &ForwardingState,
+    now_ns: u64,
 ) -> Vec<crate::protocol::CoSInterfaceStatus> {
     // #709: pair each cos_map with its owner-binding's live state so
     // the per-queue telemetry fields (drain_latency_hist, owner_pps,
@@ -21,12 +22,14 @@ pub(in crate::afxdp::worker) fn build_worker_cos_statuses(
             .iter()
             .map(|binding| (&binding.cos.cos_interfaces, Some(binding.live.as_ref()))),
         forwarding,
+        now_ns,
     )
 }
 
 pub(in crate::afxdp::worker) fn build_worker_cos_statuses_from_maps<'a, I>(
     cos_maps: I,
     forwarding: &ForwardingState,
+    now_ns: u64,
 ) -> Vec<crate::protocol::CoSInterfaceStatus>
 where
     I: IntoIterator<
@@ -62,7 +65,7 @@ where
                         .iter()
                         .find(|config| config.queue_id == queue.queue_id())
                 });
-                queue_row::accumulate_queue_row(status, queue, queue_config);
+                queue_row::accumulate_queue_row(status, queue, queue_config, now_ns);
                 // #709 / #748 / #751: the *binding-scoped* fields
                 // (redirect_acquire_hist, owner_pps, peer_pps,
                 // drain_noop_invocations) are surfaced only on the

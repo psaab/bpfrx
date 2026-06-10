@@ -54,6 +54,25 @@ pub(super) fn submit_local(
     } else {
         0
     };
+    // #1829 Phase 1 (Codex review on PR #1846): enqueue_ns sidecar,
+    // filled UNCONDITIONALLY (FIFO unpromoted queues measure sojourn
+    // too) in submit order. transmit_batch consumes the successful
+    // prefix in-place and the retry suffix is push_fronted back WITH
+    // its original enqueue_ns, so sampling at pop/batch-build time
+    // would count a rolled-back item once per attempt. Recording only
+    // sidecar[..packets] after the TX insert settles counts each
+    // packet exactly once, on the attempt that ships it. 512 B stack,
+    // one u64 store per item, no allocation. Shares the mirror_clone
+    // prefix-attribution caveat documented on the #1229 sidecar above.
+    let mut enq_sidecar = [0u64; TX_BATCH_SIZE];
+    let enq_len = {
+        let mut n = 0usize;
+        for req in items.iter().take(TX_BATCH_SIZE) {
+            enq_sidecar[n] = req.enqueue_ns;
+            n += 1;
+        }
+        n
+    };
     match transmit_batch(binding, &mut items, now_ns, shared_recycles) {
         Ok((packets, bytes)) => {
             apply_cos_send_result(
@@ -77,6 +96,21 @@ pub(super) fn submit_local(
                 {
                     for &(bucket, bytes) in &sidecar[..packets as usize] {
                         account_flow_bucket_tx(ff, bucket, bytes, now_ns);
+                    }
+                }
+            }
+            // #1829: committed-prefix-only sojourn samples (see the
+            // enq_sidecar comment above). Same pass now_ns as the
+            // bucket accounting; record() skips enqueue_ns == 0.
+            if packets > 0 {
+                if let Some(queue) = binding
+                    .cos
+                    .cos_interfaces
+                    .get_mut(&root_ifindex)
+                    .and_then(|root| root.queues.get_mut(queue_idx))
+                {
+                    for &enqueue_ns in &enq_sidecar[..(packets as usize).min(enq_len)] {
+                        queue.telemetry.sojourn.record(enqueue_ns, now_ns);
                     }
                 }
             }

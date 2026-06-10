@@ -825,6 +825,156 @@ fn build_shared_cos_queue_leases_rebuilds_when_equal_flow_mode_toggles() {
     assert!(new.v8_equal_flow_active());
 }
 
+/// #1830 follow-up (Codex review on PR #1841): shared fixture for the
+/// sparse-worker-id sizing pins below — one exact 50 MB/s queue on
+/// ifindex 80 / queue 4, mirroring the fixtures of the reuse/rebuild
+/// tests above.
+fn exact_queue_forwarding_fixture() -> ForwardingState {
+    let mut forwarding = ForwardingState::default();
+    forwarding.cos.interfaces.insert(
+        80,
+        CoSInterfaceConfig {
+            shaping_rate_bytes: 100_000_000,
+            burst_bytes: 256 * 1024,
+            default_queue: 0,
+            dscp_classifier: String::new(),
+            ieee8021_classifier: String::new(),
+            dscp_queue_by_dscp: [u8::MAX; 64],
+            ieee8021_queue_by_pcp: [u8::MAX; 8],
+            queue_by_forwarding_class: FastMap::default(),
+            queues: vec![CoSQueueConfig {
+                queue_id: 4,
+                forwarding_class: "iperf-b".into(),
+                priority: 5,
+                transmit_rate_bytes: 50_000_000,
+                guarantee_enabled: true,
+                exact: true,
+                surplus_sharing: false,
+                equal_flow_enforcement: false,
+                surplus_weight: 1,
+                buffer_bytes: 128 * 1024,
+                dscp_rewrite: None,
+                codel_target_ns: 0,
+            }],
+            oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+            oversubscription_guarantee_fraction: 0.0,
+            priority_low_min_share_bytes: 0,
+        },
+    );
+    forwarding
+}
+
+/// #1830 follow-up (Codex review on PR #1841): `planned_worker_slots`
+/// must derive the per-worker-id array length from the MAX planned
+/// worker id, not the worker COUNT — ids are sparse when the bindings
+/// carrying the low ids were unregistered.
+#[test]
+fn planned_worker_slots_uses_max_id_not_count() {
+    let empty: BTreeMap<u32, ()> = BTreeMap::new();
+    assert_eq!(reconcile::bringup::planned_worker_slots(&empty), 0);
+
+    let dense = BTreeMap::from([(0u32, ()), (1, ()), (2, ())]);
+    assert_eq!(reconcile::bringup::planned_worker_slots(&dense), 3);
+
+    // Sparse: two workers survive, but the highest id is 40 — the
+    // sizing value must be 41, NOT the count (2).
+    let sparse = BTreeMap::from([(3u32, ()), (40, ())]);
+    assert_eq!(reconcile::bringup::planned_worker_slots(&sparse), 41);
+}
+
+/// #1830 follow-up (Codex review on PR #1841): a lease built for a
+/// sparse topology whose only high worker id is 40 must size its
+/// per-worker arrays to 41 slots — acquire_v8(40) is in range and
+/// granted, and matches_config_v8 keys on the true max id.
+#[test]
+fn build_shared_cos_queue_leases_sizes_for_sparse_high_worker_id() {
+    let forwarding = exact_queue_forwarding_fixture();
+    let active_shards_by_egress_ifindex = BTreeMap::from([(80, 2usize)]);
+
+    // worker_slots = 41 as planned_worker_slots derives for a sparse
+    // workers map whose highest id is 40 (count would be far lower).
+    let leases = build_shared_cos_queue_leases_reusing_existing(
+        &forwarding,
+        &active_shards_by_egress_ifindex,
+        41,
+        &BTreeMap::new(),
+    );
+    let lease = leases.get(&(80, 4)).expect("queue lease");
+
+    let burst_bytes = (128 * 1024u64).max(64 * 1500);
+    assert!(
+        lease.matches_config_v8(50_000_000, burst_bytes, 2, 40, V8RateMode::CstructDefault),
+        "lease must be sized for max_worker_id 40 (41 per-worker slots)"
+    );
+    assert!(
+        !lease.matches_config_v8(50_000_000, burst_bytes, 2, 1, V8RateMode::CstructDefault),
+        "a 41-slot lease must not match a 2-slot topology"
+    );
+
+    // Worker id 40 (above the pre-fix count-derived sizing) acquires
+    // through the lease end to end: in range, nonzero grant, rotation
+    // publishes its fair share.
+    lease.rehydrate_worker_active_count(40, 1);
+    let granted = lease.acquire_v8(40, 1_000_000, 4096);
+    assert_eq!(
+        granted, 4096,
+        "worker id 40 must be in range of the lease arrays and granted"
+    );
+}
+
+/// #1830 follow-up (Codex review on PR #1841): a worker-slot change
+/// with an otherwise identical queue topology must REBUILD the lease
+/// (no false reuse) — matches_config_v8 keys on max_worker_id, so a
+/// topology whose max id changed never reuses the old sizing even
+/// when the worker COUNT is unchanged.
+#[test]
+fn build_shared_cos_queue_leases_rebuilds_when_worker_slots_change() {
+    let forwarding = exact_queue_forwarding_fixture();
+    let active_shards_by_egress_ifindex = BTreeMap::from([(80, 2usize)]);
+
+    let existing = build_shared_cos_queue_leases_reusing_existing(
+        &forwarding,
+        &active_shards_by_egress_ifindex,
+        2,
+        &BTreeMap::new(),
+    );
+    let rebuilt = build_shared_cos_queue_leases_reusing_existing(
+        &forwarding,
+        &active_shards_by_egress_ifindex,
+        41,
+        &existing,
+    );
+
+    let old = existing.get(&(80, 4)).expect("existing queue lease");
+    let new = rebuilt.get(&(80, 4)).expect("rebuilt queue lease");
+    assert!(
+        !Arc::ptr_eq(old, new),
+        "worker-slot change must rebuild the lease Arc, not reuse the old sizing"
+    );
+
+    // And the V_min floors honor the same sizing source. The floor
+    // builder additionally gates on COS_SHARED_EXACT_MIN_RATE_BYTES
+    // (2.5 Gbps), so raise the queue rate above that gate first.
+    let mut high_rate_forwarding = exact_queue_forwarding_fixture();
+    high_rate_forwarding
+        .cos
+        .interfaces
+        .get_mut(&80)
+        .expect("iface")
+        .queues[0]
+        .transmit_rate_bytes = 500_000_000;
+    let floors = build_shared_cos_queue_vtime_floors_reusing_existing(
+        &high_rate_forwarding,
+        41,
+        &BTreeMap::new(),
+    );
+    assert_eq!(
+        floors.get(&(80, 4)).expect("vtime floor").slots.len(),
+        41,
+        "V_min floor slots must cover the highest planned worker id"
+    );
+}
+
 #[test]
 fn refresh_cos_owner_worker_map_from_binding_statuses_keeps_shared_arcs_when_unchanged() {
     let mut coordinator = Coordinator::new();
@@ -1821,4 +1971,54 @@ fn aggregate_cos_waterfill_min_max_sentinel_when_no_candidate() {
         "no candidate (all MAX) → aggregated MIN stays the MAX sentinel, NOT 0"
     );
     assert_eq!(aggregated[0].waterfill_epochs, 777);
+}
+
+// #1829 Phase 1: cross-worker sojourn aggregation pin. The sojourn
+// trio MAX-merges across workers (worst instance) — summing delays
+// would be meaningless and a `..Default::default()` fall-through
+// would silently zero the gate metric at exactly this layer (the
+// same failure shape as the #710 drop-counter regression above).
+#[test]
+fn aggregate_cos_statuses_max_merges_sojourn_across_worker_snapshots() {
+    use crate::protocol::{CoSInterfaceStatus, CoSQueueStatus};
+
+    let worker_a = vec![CoSInterfaceStatus {
+        ifindex: 80,
+        interface_name: "reth0.80".into(),
+        worker_instances: 1,
+        queues: vec![CoSQueueStatus {
+            queue_id: 4,
+            worker_instances: 1,
+            sojourn_ewma_ns: 2_000_000,
+            sojourn_peak_ns: 9_000_000,
+            sojourn_windowed_min_ns: 1_500_000,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }];
+    let worker_b = vec![CoSInterfaceStatus {
+        ifindex: 80,
+        interface_name: "reth0.80".into(),
+        worker_instances: 1,
+        queues: vec![CoSQueueStatus {
+            queue_id: 4,
+            worker_instances: 1,
+            sojourn_ewma_ns: 4_000_000,
+            sojourn_peak_ns: 6_000_000,
+            sojourn_windowed_min_ns: 5_500_000,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }];
+    let owner_by_queue = BTreeMap::new();
+    let aggregated = aggregate_cos_statuses_across_workers(&[worker_a, worker_b], &owner_by_queue);
+
+    assert_eq!(aggregated.len(), 1);
+    let q = &aggregated[0].queues[0];
+    assert_eq!(q.sojourn_ewma_ns, 4_000_000, "EWMA must MAX-merge");
+    assert_eq!(q.sojourn_peak_ns, 9_000_000, "peak must MAX-merge");
+    assert_eq!(
+        q.sojourn_windowed_min_ns, 5_500_000,
+        "windowed min (the gate metric) must MAX-merge across workers",
+    );
 }

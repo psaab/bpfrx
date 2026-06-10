@@ -1301,3 +1301,11 @@ pub(super) fn verify_built_frame_checksums(frame: &[u8]) -> (bool, bool) {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+// #1824: proptest property harness (parse no-panic/bounds, NAT
+// round-trip + descriptor-vs-generic differential, TSO reassembly).
+// `not(miri)` because proptest case loops are intractable under the
+// targeted `cargo +nightly miri test --bin` passes (#1755 lesson);
+// the deterministic example tests keep miri coverage of the same fns.
+#[cfg(all(test, not(miri)))]
+mod prop_tests;

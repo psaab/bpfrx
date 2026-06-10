@@ -239,6 +239,7 @@ impl super::Coordinator {
                             cos_queue_id: cos.queue_id,
                             dscp_rewrite: cos.dscp_rewrite,
                             mirror_clone: false,
+                            enqueue_ns: 0,
                         })?;
                     }
                 } else {

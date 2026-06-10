@@ -205,11 +205,12 @@ pub(super) fn worker_loop_setup(
         .first()
         .map(|binding| binding.bpf_maps.conntrack_v6_fd)
         .unwrap_or(-1);
+    let last_cos_status_ns = monotonic_nanos();
     cos_status.store(Arc::new(build_worker_cos_statuses(
         &bindings,
         forwarding.as_ref(),
+        last_cos_status_ns,
     )));
-    let last_cos_status_ns = monotonic_nanos();
     runtime_atomics.set_tid(current_tid());
     WorkerLoopSetup {
         ha_startup_grace_until_secs,

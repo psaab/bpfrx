@@ -222,6 +222,7 @@ fn enqueue_mirror_clone_to_binding(
             cos_queue_id,
             dscp_rewrite: None,
             mirror_clone: true,
+            enqueue_ns: 0,
         });
     MirrorCloneResult::Enqueued
 }
@@ -313,6 +314,7 @@ pub(in crate::afxdp) fn enqueue_admitted_mirror_clone_to_live(
         cos_queue_id,
         dscp_rewrite: None,
         mirror_clone: true,
+        enqueue_ns: 0,
     };
     admission
         .enqueue_owned(req)
@@ -448,6 +450,7 @@ mod tests {
             cos_queue_id: None,
             dscp_rewrite: None,
             mirror_clone: false,
+            enqueue_ns: 0,
         }
     }
 
@@ -1309,6 +1312,7 @@ mod tests {
             cos_queue_id: None,
             dscp_rewrite: None,
             mirror_clone: true,
+            enqueue_ns: 0,
         }]);
         let mut shared_recycles = Vec::new();
 
@@ -1356,6 +1360,7 @@ mod tests {
                     cos_queue_id: None,
                     dscp_rewrite: None,
                     mirror_clone: true,
+                    enqueue_ns: 0,
                 });
         }
         let lookup = WorkerBindingLookup::from_bindings(&bindings);
