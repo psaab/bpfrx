@@ -294,11 +294,10 @@ var dualASTCases = []dualASTCase{
         }
     }
 }`,
-		expectedFail: true,
-		failureClass: "compiler dual-AST",
-		reason: "compileNATSource pool address block form double-appends: nodeVal() " +
-			"falls back to Children[0].Name() AND the explicit Children loop appends " +
-			"again, so hierarchical compiles Addresses=[x x] vs flat-set [x]",
+		// Fixed in U5b (#1808): the inline-value path reads prop.Keys[1]
+		// directly instead of nodeVal's Children[0] fallback, so the block
+		// form is appended only by the children walk.
+		expectedFail: false,
 	},
 	{
 		name: "security-screen",
