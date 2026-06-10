@@ -25,7 +25,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 /// the rest of `frame/` (#1839/#1840): the descriptor v6 arm
 /// (`rewrite/ipv6.rs`) and the port-rewrite path (`frame/mod.rs`)
 /// route their zero-checksum decisions through the same predicates.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::afxdp::frame) enum ChecksumFamily {
     V4,
     V6,
@@ -62,17 +62,36 @@ fn l4_checksum_field_delta_v6(protocol: u8) -> Option<usize> {
     }
 }
 
-/// Whether a received IPv4 UDP datagram carries an OPTIONAL checksum that
-/// may legitimately be 0x0000 (RFC 768 — the checksum is optional for IPv4
-/// UDP and 0x0000 means "no checksum was computed"). The incremental-adjust
-/// path must NOT fabricate a checksum for such a packet, so it skips.
+/// Whether a received UDP datagram carries an OPTIONAL checksum that
+/// may legitimately be 0x0000 (RFC 768 — the checksum is optional for
+/// IPv4 UDP and 0x0000 means "no checksum was computed"). The
+/// incremental-adjust path must NOT fabricate a checksum for such a
+/// packet, so it skips. The skip is IPv4-only (#1840): RFC 8200 §8.1
+/// makes the UDP checksum mandatory for IPv6, so a v6 UDP 0x0000 is
+/// malformed input and the adjusters update it like any other value.
 ///
 /// This is a DISTINCT concept from `adjust_zero_checksum_illegal` (which
 /// canonicalizes a freshly-computed 0x0000 to 0xFFFF). It is intentionally
 /// kept as its own predicate so the two RFC concepts are not conflated.
 #[inline(always)]
-fn l4_udp_checksum_optional(protocol: u8) -> bool {
-    protocol == PROTO_UDP
+pub(in crate::afxdp::frame) fn l4_udp_checksum_optional(
+    protocol: u8,
+    family: ChecksumFamily,
+) -> bool {
+    family == ChecksumFamily::V4 && protocol == PROTO_UDP
+}
+
+/// Map the metadata `addr_family` byte onto a `ChecksumFamily`. `None`
+/// for any other family — callers treat that as "nothing to adjust"
+/// (unreachable in practice: `frame_l4_offset` already fails other
+/// families before any port work happens).
+#[inline(always)]
+pub(in crate::afxdp::frame) fn checksum_family_of(addr_family: u8) -> Option<ChecksumFamily> {
+    match addr_family as i32 {
+        libc::AF_INET => Some(ChecksumFamily::V4),
+        libc::AF_INET6 => Some(ChecksumFamily::V6),
+        _ => None,
+    }
 }
 
 /// Whether a freshly-computed L4 checksum of 0x0000 must be canonicalized
@@ -425,7 +444,7 @@ pub(in crate::afxdp) fn adjust_l4_checksum_ipv4_words(
         *packet.get(checksum_offset)?,
         *packet.get(checksum_offset + 1)?,
     ]);
-    if l4_udp_checksum_optional(protocol) && current == 0 {
+    if l4_udp_checksum_optional(protocol, ChecksumFamily::V4) && current == 0 {
         return Some(());
     }
     let updated = checksum16_adjust(current, old_words, new_words);
@@ -729,11 +748,31 @@ mod l4_offset_helper_tests {
     }
 
     #[test]
-    fn udp_checksum_optional_is_udp_only() {
-        assert!(l4_udp_checksum_optional(PROTO_UDP));
-        assert!(!l4_udp_checksum_optional(PROTO_TCP));
-        assert!(!l4_udp_checksum_optional(PROTO_ICMPV6));
-        assert!(!l4_udp_checksum_optional(PROTO_ICMP));
+    fn udp_checksum_optional_is_v4_udp_only() {
+        // #1840 family table: the RFC 768 "no checksum" skip exists
+        // for IPv4 UDP ONLY. RFC 8200 §8.1 makes the checksum
+        // mandatory for IPv6 UDP, so no v6 protocol may skip.
+        assert!(l4_udp_checksum_optional(PROTO_UDP, ChecksumFamily::V4));
+        assert!(!l4_udp_checksum_optional(PROTO_TCP, ChecksumFamily::V4));
+        assert!(!l4_udp_checksum_optional(PROTO_ICMPV6, ChecksumFamily::V4));
+        assert!(!l4_udp_checksum_optional(PROTO_ICMP, ChecksumFamily::V4));
+        assert!(!l4_udp_checksum_optional(PROTO_UDP, ChecksumFamily::V6));
+        assert!(!l4_udp_checksum_optional(PROTO_TCP, ChecksumFamily::V6));
+        assert!(!l4_udp_checksum_optional(PROTO_ICMPV6, ChecksumFamily::V6));
+    }
+
+    #[test]
+    fn checksum_family_of_maps_af_constants() {
+        assert_eq!(
+            checksum_family_of(libc::AF_INET as u8),
+            Some(ChecksumFamily::V4)
+        );
+        assert_eq!(
+            checksum_family_of(libc::AF_INET6 as u8),
+            Some(ChecksumFamily::V6)
+        );
+        assert_eq!(checksum_family_of(0), None);
+        assert_eq!(checksum_family_of(255), None);
     }
 
     #[test]

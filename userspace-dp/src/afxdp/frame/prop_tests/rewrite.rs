@@ -587,15 +587,45 @@ fn descriptor_v6_udp_computed_zero_canonicalizes() {
     );
 }
 
-/// (f) #1840 (D2) pin: `adjust_l4_checksum_port` (frame/mod.rs:905-907)
-/// skips the checksum update for UDP `current == 0` WITHOUT checking
-/// the address family. A (malformed) v6 UDP datagram with checksum
-/// 0x0000 keeps it through a generic port rewrite, while the
-/// descriptor path applies its delta. Only reachable on malformed
-/// input — the valid-packet generators never emit v6 UDP zero. Flip
-/// when #1840 is fixed.
+/// Run the full generic in-place rewrite and the descriptor fast path
+/// over the same frame + NAT decision; return the two output frames
+/// (asserting both succeed and the result structs agree).
+fn run_both_paths(pkt: &ValidPacket, nat: NatDecision) -> (Vec<u8>, Vec<u8>) {
+    let desc = XdpDesc {
+        addr: DIFF_ADDR as u64,
+        len: pkt.frame.len() as u32,
+        options: 0,
+    };
+    let area_g = area_with_frame(&pkt.frame);
+    let decision = make_decision(pkt, nat, 0);
+    let g = rewrite_forwarded_frame_in_place(&area_g, desc, pkt.meta, &decision, false, None)
+        .expect("generic in-place rewrite succeeds");
+    let area_d = area_with_frame(&pkt.frame);
+    let rd = make_descriptor(pkt, nat, 0);
+    let d = apply_rewrite_descriptor(&area_d, desc, pkt.meta, &rd, None)
+        .expect("descriptor rewrite succeeds");
+    assert_eq!(g, d, "InPlaceRewriteResult must agree");
+    (
+        area_g
+            .slice(g.offset as usize, g.len as usize)
+            .unwrap()
+            .to_vec(),
+        area_d
+            .slice(d.offset as usize, d.len as usize)
+            .unwrap()
+            .to_vec(),
+    )
+}
+
+/// (f) #1840 (D2) FIXED pin: the RFC 768 zero-checksum skip in
+/// `adjust_l4_checksum_port` is family-gated (`l4_udp_checksum_optional`
+/// — IPv4 UDP only). A (malformed per RFC 8200 §8.1) v6 UDP datagram
+/// with stored 0x0000 gets its checksum adjusted through a generic
+/// port rewrite, byte-identical to the descriptor path's delta
+/// application. (Flipped from the #1824 defect pin asserting the
+/// ungated skip.)
 #[test]
-fn pin_1840_v6_udp_zero_skip_not_family_gated() {
+fn pin_1840_v6_udp_zero_skip_family_gated() {
     let mut pkt = pin_packet(true, PROTO_UDP, 64, Vec::new());
     let csum_off = pkt.l4() + 6;
     // Force the malformed v6-UDP-zero encoding.
@@ -605,7 +635,7 @@ fn pin_1840_v6_udp_zero_skip_not_family_gated() {
         ..NatDecision::default()
     };
 
-    // Generic path: port rewritten, checksum skip leaves 0x0000.
+    // Generic path: port rewritten AND checksum adjusted from 0.
     let mut packet = pkt.l3_packet();
     assert!(apply_nat_ipv6(&mut packet, pkt.rel_l4, PROTO_UDP, nat).is_some());
     assert_eq!(
@@ -613,26 +643,113 @@ fn pin_1840_v6_udp_zero_skip_not_family_gated() {
         pkt.src_port.wrapping_add(1),
         "generic path rewrites the port"
     );
-    assert_eq!(
+    assert_ne!(
         u16::from_be_bytes([packet[40 + 6], packet[40 + 7]]),
         0x0000,
-        "DEFECT #1840: v6 UDP zero-checksum takes the IPv4-only RFC 768 skip"
+        "#1840 fixed: malformed v6 UDP stored-0 is adjusted, not skipped"
     );
 
-    // Descriptor path applies the delta to the same input.
-    let area = area_with_frame(&pkt.frame);
-    let desc = XdpDesc {
-        addr: DIFF_ADDR as u64,
-        len: pkt.frame.len() as u32,
-        options: 0,
-    };
-    let rd = make_descriptor(&pkt, nat, 0);
-    let d = apply_rewrite_descriptor(&area, desc, pkt.meta, &rd, None)
-        .expect("descriptor succeeds");
-    let out = area.slice(d.offset as usize, d.len as usize).unwrap();
-    assert_ne!(
-        u16::from_be_bytes([out[14 + 40 + 6], out[14 + 40 + 7]]),
-        0x0000,
-        "descriptor path adjusts the checksum where the generic path skipped"
+    // Full-path parity: generic output byte-identical to descriptor.
+    let (out_g, out_d) = run_both_paths(&pkt, nat);
+    assert_eq!(
+        out_g, out_d,
+        "#1840 fixed: both paths agree byte-for-byte on the malformed v6 UDP input"
     );
+}
+
+/// #1840 family-gate regression guard (v4 counterpart): the RFC 768
+/// "no checksum" encoding on IPv4 UDP keeps the skip — stored 0x0000
+/// stays 0x0000 through a port rewrite on BOTH paths, byte-identical.
+#[test]
+fn pin_1840_v4_udp_zero_skip_preserved() {
+    let pkt = pin_packet(false, PROTO_UDP, 64, Vec::new());
+    let mut pkt = pkt;
+    let csum_off = pkt.l4() + 6;
+    pkt.frame[csum_off..csum_off + 2].copy_from_slice(&[0, 0]);
+    pkt.udp_zero_csum = true;
+    let nat = NatDecision {
+        rewrite_src_port: Some(pkt.src_port.wrapping_add(1)),
+        ..NatDecision::default()
+    };
+
+    let mut packet = pkt.l3_packet();
+    assert!(apply_nat_ipv4(&mut packet, PROTO_UDP, nat).is_some());
+    assert_eq!(
+        u16::from_be_bytes([packet[pkt.rel_l4], packet[pkt.rel_l4 + 1]]),
+        pkt.src_port.wrapping_add(1),
+        "v4 port still rewritten"
+    );
+    assert_eq!(
+        u16::from_be_bytes([packet[pkt.rel_l4 + 6], packet[pkt.rel_l4 + 7]]),
+        0x0000,
+        "v4 UDP 'no checksum' encoding preserved through the rewrite"
+    );
+
+    let (out_g, out_d) = run_both_paths(&pkt, nat);
+    let out_csum = 14 + pkt.rel_l4 + 6;
+    assert_eq!(
+        u16::from_be_bytes([out_d[out_csum], out_d[out_csum + 1]]),
+        0x0000,
+        "descriptor keeps the v4 RFC 768 skip too"
+    );
+    assert_eq!(out_g, out_d, "v4 zero-skip parity is byte-exact");
+}
+
+/// #1840 §5.5 same-port residual pin: malformed v6 UDP stored-0 ×
+/// IDENTITY port rewrite. The generic short-circuit (old == new) never
+/// calls the adjuster, but the no-op-port parity rule writes the
+/// canonical 0xFFFF — matching the descriptor's ≡0-delta application.
+/// The v4 counterpart stays 0x0000 on both paths (RFC 768 skip).
+#[test]
+fn pin_same_port_v6_udp_zero_parity_rule() {
+    // v6: both paths emit 0xFFFF.
+    let mut pkt = pin_packet(true, PROTO_UDP, 64, Vec::new());
+    let csum_off = pkt.l4() + 6;
+    pkt.frame[csum_off..csum_off + 2].copy_from_slice(&[0, 0]);
+    let nat = NatDecision {
+        rewrite_src_port: Some(pkt.src_port), // identity
+        ..NatDecision::default()
+    };
+    let mut packet = pkt.l3_packet();
+    assert!(apply_nat_ipv6(&mut packet, pkt.rel_l4, PROTO_UDP, nat).is_some());
+    assert_eq!(
+        u16::from_be_bytes([packet[40 + 6], packet[40 + 7]]),
+        0xffff,
+        "§5.5 rule: identity port-NAT on stored-0 v6 UDP canonicalizes to 0xFFFF"
+    );
+    let (out_g, out_d) = run_both_paths(&pkt, nat);
+    let out_csum = 14 + pkt.rel_l4 + 6;
+    assert_eq!(
+        u16::from_be_bytes([out_g[out_csum], out_g[out_csum + 1]]),
+        0xffff
+    );
+    assert_eq!(
+        u16::from_be_bytes([out_d[out_csum], out_d[out_csum + 1]]),
+        0xffff
+    );
+    assert_eq!(out_g, out_d, "identity-port v6 UDP stored-0 parity");
+
+    // v4 counterpart: stays 0x0000 on both paths.
+    let mut pkt = pin_packet(false, PROTO_UDP, 64, Vec::new());
+    let csum_off = pkt.l4() + 6;
+    pkt.frame[csum_off..csum_off + 2].copy_from_slice(&[0, 0]);
+    pkt.udp_zero_csum = true;
+    let nat = NatDecision {
+        rewrite_src_port: Some(pkt.src_port), // identity
+        ..NatDecision::default()
+    };
+    let mut packet = pkt.l3_packet();
+    assert!(apply_nat_ipv4(&mut packet, PROTO_UDP, nat).is_some());
+    assert_eq!(
+        u16::from_be_bytes([packet[pkt.rel_l4 + 6], packet[pkt.rel_l4 + 7]]),
+        0x0000,
+        "v4 identity port-NAT keeps the RFC 768 'no checksum' encoding"
+    );
+    let (out_g, out_d) = run_both_paths(&pkt, nat);
+    let out_csum = 14 + pkt.rel_l4 + 6;
+    assert_eq!(
+        u16::from_be_bytes([out_g[out_csum], out_g[out_csum + 1]]),
+        0x0000
+    );
+    assert_eq!(out_g, out_d, "identity-port v4 UDP stored-0 parity");
 }

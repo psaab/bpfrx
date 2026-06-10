@@ -5276,3 +5276,49 @@ fn apply_dscp_rewrite_to_ipv6_frame_updates_traffic_class() {
     assert_eq!(new_tc >> 2, 46);
     assert_eq!(new_tc & 0x03, old_tc & 0x03);
 }
+
+/// #1840: adjust_l4_checksum_port family pair — the RFC 768 stored-0
+/// skip fires for IPv4 UDP only; the same stored-0 v6 UDP input gets
+/// adjusted. Deterministic example (miri-coverable twin of the
+/// prop_tests pins).
+#[test]
+fn adjust_l4_checksum_port_v4_skip_v6_no_skip() {
+    // 8-byte UDP header at offset 0; checksum bytes at 6..8 = 0.
+    let base = [0x12u8, 0x34, 0x56, 0x78, 0x00, 0x08, 0x00, 0x00];
+
+    // v4: stored 0 => skip (bytes unchanged).
+    let mut p = base;
+    assert_eq!(
+        adjust_l4_checksum_port(&mut p, 0, PROTO_UDP, ChecksumFamily::V4, 0x1234, 0x4321),
+        Some(())
+    );
+    assert_eq!(p, base, "v4 UDP stored-0 must keep the RFC 768 skip");
+
+    // v6: stored 0 => adjusted like any other value.
+    let mut p = base;
+    assert_eq!(
+        adjust_l4_checksum_port(&mut p, 0, PROTO_UDP, ChecksumFamily::V6, 0x1234, 0x4321),
+        Some(())
+    );
+    let updated = u16::from_be_bytes([p[6], p[7]]);
+    assert_eq!(
+        updated,
+        checksum16_adjust(0, &[0x1234], &[0x4321]),
+        "v6 UDP stored-0 must be incrementally adjusted (#1840)"
+    );
+    assert_ne!(updated, 0, "adjusted value is non-zero for this delta");
+
+    // Non-zero stored checksum adjusts identically on both families.
+    let mut p4 = base;
+    p4[6..8].copy_from_slice(&0xBEEFu16.to_be_bytes());
+    let mut p6 = p4;
+    assert_eq!(
+        adjust_l4_checksum_port(&mut p4, 0, PROTO_UDP, ChecksumFamily::V4, 0x1234, 0x4321),
+        Some(())
+    );
+    assert_eq!(
+        adjust_l4_checksum_port(&mut p6, 0, PROTO_UDP, ChecksumFamily::V6, 0x1234, 0x4321),
+        Some(())
+    );
+    assert_eq!(p4, p6, "non-zero stored checksum: families behave identically");
+}
