@@ -126,10 +126,7 @@ const ICMPV6_ECHO_REQUEST: u8 = 128;
 const ICMPV6_ECHO_REPLY: u8 = 129;
 const ICMP_ECHO_REQUEST: u8 = 8;
 const ICMP_ECHO_REPLY: u8 = 0;
-const PROTO_TCP: u8 = 6;
-const PROTO_UDP: u8 = 17;
-const PROTO_ICMP: u8 = 1;
-const PROTO_ICMPV6: u8 = 58;
+use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
 
 /// Translate an IPv6 packet to IPv4 (forward direction: client→server).
 ///

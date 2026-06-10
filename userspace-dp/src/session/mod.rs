@@ -93,10 +93,7 @@ impl SessionTimeouts {
     }
 }
 const MAX_SESSION_DELTAS: usize = 4096;
-const PROTO_TCP: u8 = 6;
-const PROTO_UDP: u8 = 17;
-const PROTO_ICMP: u8 = 1;
-const PROTO_ICMPV6: u8 = 58;
+use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
 const TCP_FIN: u8 = 0x01;
 const TCP_RST: u8 = 0x04;
 

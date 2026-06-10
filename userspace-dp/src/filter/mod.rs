@@ -22,13 +22,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-const PROTO_TCP: u8 = 6;
-const PROTO_UDP: u8 = 17;
-const PROTO_ICMP: u8 = 1;
-const PROTO_ICMPV6: u8 = 58;
-const PROTO_GRE: u8 = 47;
-const PROTO_OSPF: u8 = 89;
-const PROTO_IPIP: u8 = 4;
+use crate::ip_proto::{
+    PROTO_GRE, PROTO_ICMP, PROTO_ICMPV6, PROTO_IPIP, PROTO_OSPF, PROTO_TCP, PROTO_UDP,
+};
 
 /// Result of evaluating a filter term.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
