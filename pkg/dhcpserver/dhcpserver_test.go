@@ -1,6 +1,7 @@
 package dhcpserver
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -161,6 +162,67 @@ func TestIsRunningQueriesSystemd(t *testing.T) {
 	}
 }
 
+// Multi-interface groups: the per-subnet interface binding (which Kea
+// limits to ONE interface) is omitted so address-based subnet
+// selection serves every interface; single-interface groups keep the
+// explicit binding. interfaces-config always lists all interfaces.
+func TestGroupBindingAllInterfaces(t *testing.T) {
+	type subnet struct {
+		Subnet    string `json:"subnet"`
+		Interface string `json:"interface"`
+	}
+	type dhcp4 struct {
+		InterfacesConfig struct {
+			Interfaces []string `json:"interfaces"`
+		} `json:"interfaces-config"`
+		Subnet4 []subnet `json:"subnet4"`
+	}
+
+	readConf := func(t *testing.T, m *Manager) dhcp4 {
+		t.Helper()
+		data, err := os.ReadFile(m.confPath4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out struct {
+			Dhcp4 dhcp4 `json:"Dhcp4"`
+		}
+		if err := json.Unmarshal(data, &out); err != nil {
+			t.Fatal(err)
+		}
+		return out.Dhcp4
+	}
+
+	t.Run("multi-interface group omits subnet binding", func(t *testing.T) {
+		m, _ := testManager(t, map[string]bool{}, "")
+		if err := m.Apply(v4Config("ge-0-0-0", "ge-0-0-1")); err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		conf := readConf(t, m)
+		if got := conf.InterfacesConfig.Interfaces; len(got) != 2 {
+			t.Errorf("interfaces-config should list all group interfaces, got %v", got)
+		}
+		if len(conf.Subnet4) != 1 {
+			t.Fatalf("want 1 subnet, got %d", len(conf.Subnet4))
+		}
+		if conf.Subnet4[0].Interface != "" {
+			t.Errorf("multi-interface group must not bind subnet to %q (silent first-interface drop)",
+				conf.Subnet4[0].Interface)
+		}
+	})
+
+	t.Run("single-interface group binds explicitly", func(t *testing.T) {
+		m, _ := testManager(t, map[string]bool{}, "")
+		if err := m.Apply(v4Config("ge-0-0-0")); err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		conf := readConf(t, m)
+		if len(conf.Subnet4) != 1 || conf.Subnet4[0].Interface != "ge-0-0-0" {
+			t.Errorf("single-interface group should bind subnet, got %+v", conf.Subnet4)
+		}
+	})
+}
+
 // Apply must report a generate failure (unwritable config dir) for
 // the broken family without masking it.
 func TestApplyGenerateFailureFailsApply(t *testing.T) {
@@ -247,5 +309,32 @@ func TestParseLeaseCSV_Empty(t *testing.T) {
 	}
 	if len(leases) != 0 {
 		t.Errorf("expected no leases, got %d", len(leases))
+	}
+}
+
+// Quoted fields containing commas must not shift columns (#1778:
+// encoding/csv instead of strings.Split).
+func TestParseLeaseCSV_QuotedHostname(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "kea-leases4.csv")
+	csvData := `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,fqdn_fwd,fqdn_rev,hostname,state,user_context,pool_id
+10.0.1.100,aa:bb:cc:dd:ee:01,,86400,1707868800,1,0,0,"host, with comma",0,,0
+`
+	if err := os.WriteFile(path, []byte(csvData), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	leases, err := parseLeaseCSV(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leases) != 1 {
+		t.Fatalf("got %d leases, want 1", len(leases))
+	}
+	if leases[0].Hostname != "host, with comma" {
+		t.Errorf("hostname: got %q", leases[0].Hostname)
+	}
+	if leases[0].SubnetID != "1" {
+		t.Errorf("subnet_id shifted: got %q", leases[0].SubnetID)
 	}
 }

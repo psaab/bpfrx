@@ -3,6 +3,7 @@ package dhcpserver
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -198,31 +199,34 @@ func (m *Manager) GetLeases6() ([]Lease, error) {
 }
 
 func parseLeaseCSV(path string) ([]Lease, error) {
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	if len(lines) < 2 {
+	defer f.Close()
+
+	r := csv.NewReader(f)
+	r.FieldsPerRecord = -1 // memfile rows can vary across Kea versions
+	r.Comment = '#'
+	records, err := r.ReadAll()
+	if err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	if len(records) < 2 {
 		return nil, nil
 	}
 
 	// Parse CSV header to find column indices
-	header := strings.Split(lines[0], ",")
 	cols := make(map[string]int)
-	for i, h := range header {
+	for i, h := range records[0] {
 		cols[h] = i
 	}
 
 	var leases []Lease
-	for _, line := range lines[1:] {
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		fields := strings.Split(line, ",")
+	for _, fields := range records[1:] {
 		l := Lease{}
 		if idx, ok := cols["address"]; ok && idx < len(fields) {
 			l.Address = fields[idx]
@@ -247,6 +251,22 @@ func parseLeaseCSV(path string) ([]Lease, error) {
 		}
 	}
 	return leases, nil
+}
+
+// subnetInterface returns the per-subnet interface binding for a
+// group. Kea allows at most ONE interface per subnet; for a
+// single-interface group binding it explicitly is the most robust
+// selection. For multi-interface groups the binding is omitted so Kea
+// falls back to address-based subnet selection (matching the address
+// of the receiving interface against the subnet prefix) — the
+// pre-#1778 renderer silently bound only the first interface,
+// breaking the others. All group interfaces are always listed in
+// interfaces-config, so Kea listens on every one either way.
+func subnetInterface(group *config.DHCPServerGroup) string {
+	if len(group.Interfaces) == 1 {
+		return group.Interfaces[0]
+	}
+	return ""
 }
 
 func (m *Manager) generateKea4Config(cfg *config.DHCPServerConfig) error {
@@ -280,9 +300,7 @@ func (m *Manager) generateKea4Config(cfg *config.DHCPServerConfig) error {
 					Pool: fmt.Sprintf("%s - %s", pool.RangeLow, pool.RangeHigh),
 				})
 			}
-			if len(group.Interfaces) > 0 {
-				sub.Interface = group.Interfaces[0]
-			}
+			sub.Interface = subnetInterface(group)
 			if pool.Router != "" {
 				sub.OptionData = append(sub.OptionData, keaOpt{
 					Name: "routers", Data: pool.Router,
@@ -359,9 +377,7 @@ func (m *Manager) generateKea6Config(cfg *config.DHCPServerConfig) error {
 					Pool: fmt.Sprintf("%s - %s", pool.RangeLow, pool.RangeHigh),
 				})
 			}
-			if len(group.Interfaces) > 0 {
-				sub.Interface = group.Interfaces[0]
-			}
+			sub.Interface = subnetInterface(group)
 			if len(pool.DNSServers) > 0 {
 				sub.OptionData = append(sub.OptionData, keaOpt{
 					Name: "dns-servers", Data: strings.Join(pool.DNSServers, ", "),

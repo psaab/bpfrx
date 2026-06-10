@@ -4772,3 +4772,10 @@ top.
   reconciles cluster no-config case, and surfaces standalone Kea failures
   through the commit via deferred dhcpServerErr (boot path stays lenient).
   **File(s)**: pkg/daemon/daemon_apply.go
+
+- **Timestamp**: 2026-06-10 10:00
+  **Action**: #1778 commit 3 — secondaries: multi-interface group subnet
+  binding (omit per-subnet binding, address-based selection) + lease CSV
+  parsing via encoding/csv; tests + README gotchas.
+  **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/dhcpserver_test.go,
+  pkg/dhcpserver/README.md

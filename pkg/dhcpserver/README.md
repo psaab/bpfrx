@@ -61,4 +61,11 @@ Manages Kea DHCPv4/v6 server config and lifecycle. Generates
 - Lease queries read Kea's CSV lease backends directly:
   `/var/lib/kea/kea-leases4.csv` and `kea-leases6.csv`. No control
   channel / socket call. Missing files yield an empty list, not an
-  error.
+  error. Parsing uses `encoding/csv` (#1778) so quoted fields with
+  embedded commas don't shift columns.
+- Per-subnet interface binding (#1778): Kea allows at most ONE
+  interface per subnet. Single-interface groups bind explicitly;
+  multi-interface groups omit the binding so Kea uses address-based
+  subnet selection (the pre-#1778 renderer silently bound only the
+  first interface). All group interfaces are always listed in
+  `interfaces-config`.
