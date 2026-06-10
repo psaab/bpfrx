@@ -1,9 +1,19 @@
 // #1326 — extracted from worker/mod.rs (pure code motion).
 // The `worker_loop` per-tick orchestrator was previously a ~1278 LOC
-// function in worker/mod.rs (L995-L2273). It is moved here verbatim
-// as the first phase of the #1326 refactor; subsequent phases will
-// carve named tick sub-fns out of this file (setup/tick/poll_drive/
-// debug_report) per plan v4.0 (docs/pr/1326-worker-loop-extract/plan.md).
+// function in worker/mod.rs (L995-L2273), moved here verbatim as the
+// first phase of the #1326 refactor.
+//
+// #1776 (Phase 2, narrowed v3.1 scope) carved out the two cold
+// extractions: the one-shot setup phase (setup.rs) and the
+// cfg(debug-log) verbose report / stall dump (debug_report.rs).
+// Everything per-tick — telemetry publish, ArcSwap config refresh,
+// HA load, command drain, the hot `poll_binding` sweep, heartbeat,
+// the always-on binding diagnostics + BindingLiveState publish, and
+// idle regulation — deliberately stays INLINE in this file: the
+// round-1 plan review (Codex r1-4) established that an
+// #[inline(never)] call boundary in front of the per-tick
+// `load_arc_if_changed` path risks regressing the 10K-100K ticks/s
+// loop, so no call was added to the per-tick path.
 //
 // `use super::*;` brings every type, helper, and sibling-submodule
 // item from worker/mod.rs into scope — the same pattern lifecycle.rs
