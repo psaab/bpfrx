@@ -2,7 +2,21 @@
 
 ## 1. Status
 
-**DRAFT v1 — pending adversarial plan review.**
+**v2 — CONVERGED (3-way PLAN-READY family, all round-1 findings folded).**
+
+Round-1 verdicts on v1.1 @ `87ba54b79`: Claude SMR
+**PLAN-READY-WITH-FINDINGS** (2 findings, both folded pre-dispatch,
+`claude-smr-plan-r1.md`); Codex **PLAN-READY-WITH-FINDINGS** (1 HIGH,
+2 MED, 1 LOW, `codex-plan-r1.md`); AGY **PLAN-READY-WITH-FINDINGS**
+(3 minor + 1 info, `agy-plan-r1.md`). No design point contested; all
+seven §12 open questions answered convergently (resolutions recorded in
+§12). v2 folds: the single-flow-starts-FIFO nuance on the one-liner claim
+(Codex 1 HIGH), the download-direction fan-out caveat (Codex 2), the
+unfrozen CoDel profile defaults (Codex 3 = AGY 4 — source comments at
+`pkg/config/types_cos.go:90-96` / `protocol/cos.rs:113-117` recommend
+≥1.5× post-shaper RTT and warn 5 ms collides with cluster RTT), the
+engine-invariant wording fix (Codex 4), and the post-group-expansion
+commit-check requirement (AGY 3 — `apply-groups` bypass).
 
 Research-only. No production code on this branch. Base: master `2ab3220f0`.
 
@@ -55,13 +69,13 @@ only `cos_shaping_rate_bytes_per_sec > 0`,
 | CAKE property | xpf today | Evidence |
 |---|---|---|
 | (a) Bandwidth shaping | **EXISTS** — root token-bucket shaper per interface unit: `class-of-service interfaces <if> unit <u> shaping-rate <bw> [burst-size <b>]` | `pkg/config/schema.go:896-898`, `compiler_class_of_service.go:305-315`, root-node responsibilities `docs/cos-traffic-shaping.md:99-107` |
-| (b) Per-flow fairness (the "fq" half) | **EXISTS, zero-config** — MQFQ per-flow buckets on ALL shaped queues post-#1735 (PR #1740): eager promotion on exact, lazy promotion on non-exact (incl. the synthetic default queue) via the hash-free front-key probe | `queue_ops/push.rs:43`; flow key = 5-tuple `SessionKey` hashed into 4096 buckets, `cos/flow_hash.rs:111-151` |
+| (b) Per-flow fairness (the "fq" half) | **EXISTS, zero-config under contention** — MQFQ per-flow buckets on ALL shaped queues post-#1735 (PR #1740): eager promotion on exact, lazy promotion on non-exact (incl. the synthetic default queue) via the hash-free front-key probe. **Nuance (Codex r1 #1):** a non-exact queue starts FIFO and promotes only when a SECOND distinct flow arrives; until then the per-flow share caps, the 5 ms flow-fair clamp, and the per-flow ECN arm are not active (single-flow gets aggregate admission ECN only — which is the correct signal for one flow) | `queue_ops/push.rs:19-24,43-56`; eligibility `cos/admission.rs:509-515`; `!flow_fair()` arms `admission.rs:222-224,346-352`; flow key = 5-tuple `SessionKey` hashed into 4096 buckets, `cos/flow_hash.rs:111-151` |
 | (c) AQM | **PARTIAL** — admission-path AQM is shipped: BDP-aware per-flow share caps (`admission.rs:124`), 5 ms flow-fair aggregate delay clamp (`admission.rs:218`, `:44`), depth-threshold ECN CE marking (`admission.rs:276`). Dequeue-time sojourn CoDel = **#1829 Phase 2, evidence-gated** (Phase 1 sojourn telemetry = PR #1846, in review). `codel-target` exists as a per-scheduler knob in the compiler (`compiler_class_of_service.go:254-261`) but is **write-only** in the engine and **absent from `setSchema`** (verified: zero `codel` matches in `pkg/config/schema.go`) — a completion/validation gap owned by #1829 Phase 2 | as cited; #1829 plan §3, §6 |
 | (d) DiffServ tiers | **EXISTS, multi-line** — forwarding-classes + DSCP/802.1p classifiers + per-class schedulers (`transmit-rate`, `priority`, `surplus-sharing`) + scheduler-maps | `schema.go:812-905`; worked example `docs/cos-traffic-shaping.md:759-764` |
 | (d) Per-host isolation (triple-isolate) | **ABSENT** — flow keying is the 5-tuple only; no src-host/dst-host keying mode | `cos/flow_hash.rs:111-134` |
 | (d) Ack-filter | **ABSENT** — no ACK thinning anywhere in the TX path | (no engine surface) |
 | (d) Overhead compensation (`overhead`/`atm`) | **ABSENT** — shaping/scheduling account **payload bytes**, not wire bytes + framing | `docs/cos-traffic-shaping.md:521-526` |
-| Download (ingress) shaping | **EXISTS, structurally better than tc** — SQM's ifb redirect hack is unnecessary: forwarded "download" traffic egresses the LAN-side AF_XDP interface, so `shaping-rate` on the LAN unit shapes the download direction natively | architecture: egress-only shaper, `docs/cos-traffic-shaping.md:5-15`; same synthetic-queue mechanics |
+| Download (ingress) shaping | **EXISTS per egress interface** — SQM's ifb redirect hack is unnecessary: forwarded "download" traffic egresses the LAN-side AF_XDP interface, so `shaping-rate` on the LAN unit shapes the download direction natively. **Caveat (Codex r1 #2):** the shaper is per-egress-interface (`docs/cos-traffic-shaping.md:7-15,99-103`); there is no single global download budget spanning multiple LAN/VLAN egresses — each needs its own rate, and an aggregate-root shaper would be a future engine feature, not claimed here | same synthetic-queue mechanics per egress unit |
 
 Two deliberate non-mappings:
 
@@ -192,11 +206,17 @@ Question Q3). Contents, fully specified:
    ```
    set class-of-service interfaces reth0 unit 80 shaping-rate 450m
    ```
-   What it buys: root shaping at 450 Mbit (keeps the CPE buffer empty),
-   automatic per-flow MQFQ fairness, admission ECN + 5 ms delay clamp.
+   What it buys, phrased honestly (Codex r1 #1): root shaping at 450 Mbit
+   (keeps the CPE buffer empty) always; per-flow MQFQ fairness, the 5 ms
+   flow-fair delay clamp, and per-flow ECN engage automatically as soon as
+   a second distinct flow contends (lazy promotion); a single-flow queue
+   stays FIFO with aggregate admission ECN — the correct signal for one
+   flow.
 3. **Download (LAN egress) one-liner:** `shaping-rate` on the LAN-side unit
-   (e.g. `reth1 unit 0`), with the caveat that multiple LAN egress interfaces
-   each get an independent shaper (same per-interface semantics as CAKE).
+   (e.g. `reth1 unit 0`), with the caveat that shaping is per egress
+   interface: multiple LAN/VLAN egresses each need their own rate and do
+   NOT share one download budget (Codex r1 #2; same per-interface
+   semantics as CAKE).
 4. **Rate selection guidance:** 85-95% of contracted rate; remind that the
    shaper is average-rate with bounded burst (`burst-size` default
    `max(rate/100, 64*MTU)`, `docs/cos-traffic-shaping.md:772-773`).
@@ -237,8 +257,20 @@ Junos has no native analogue (its AQM surface is RED `drop-profiles`; CoDel
 is foreign vocabulary regardless of spelling), and the tree already carries
 xpf-only CoS keywords (`surplus-sharing`, `equal-flow-enforcement`,
 `codel-target`), so the issue-title vocabulary `smart-queueing` is the most
-operator-discoverable choice. Presence-enables with defaults
-(target 5 ms, interval 100 ms); children override.
+operator-discoverable choice. Presence-enables; children override.
+
+**Defaults are NOT frozen by this plan (Codex r1 #3 = AGY r1 #4).** The
+in-tree guidance already contradicts the RFC-8290 5 ms baseline for this
+deployment: `pkg/config/types_cos.go:90-96` recommends
+"≥ 1.5× post-shaper RTT (~5-7 ms on the loss userspace cluster, so
+7.5-10 ms)" and warns 5 ms "collides with RTT and may oscillate";
+`protocol/cos.rs:113-117` carries the same contract. The presence-only
+profile defaults therefore **inherit whatever scheduler-level defaults
+#1829 Phase 2 validates on live evidence** — this plan pins only the
+shape of the surface (presence + two override children) and the cookbook
+guidance: target ≥ 1.5× post-shaper RTT, interval ≥ max(100 ms, ~baseline
+WAN RTT) (high-RTT WANs need a scaled interval or CoDel reacts
+prematurely — AGY r1 #4).
 
 **Semantics — typed-config plumbing, NOT AST macro expansion:**
 
@@ -264,7 +296,11 @@ operator-discoverable choice. Presence-enables with defaults
 - No named objects are synthesized; `show configuration` shows exactly what
   the operator typed; rollback/diff/inheritance semantics are untouched.
 
-**Commit-check rules (all in `SchemaValidate`/compile checks):**
+**Commit-check rules (all in `SchemaValidate`/compile checks, and all
+evaluated on the POST-group-expansion AST — AGY r1 #3: a `scheduler-map`
+inherited via `apply-groups` must collide with a directly-configured
+`smart-queueing` exactly as a direct one would; a pre-expansion check is
+bypassable):**
 
 1. `smart-queueing` without `shaping-rate > 0` on the same unit → commit
    error ("smart-queueing requires shaping-rate on the unit"). Without
@@ -314,9 +350,12 @@ showed.
 4. **Default-off** — absent `smart-queueing` ⇒ synthetic queue
    `codel_target_ns == 0` ⇒ bit-identical behavior to today (single enable
    gate, same predicate discipline as #1829 §6.2b).
-5. **No engine hot-path deltas in this issue** — Deliverable 2 must not touch
-   admission, MQFQ, or the fused-pop path; if a diff strays there it belongs
-   to #1829 and the PR is mis-scoped.
+5. **No admission/MQFQ/fused-pop changes in this issue (Codex r1 #4
+   wording)** — the ONLY engine-path change Deliverable 2 may make is the
+   CoDel interval source (per-queue `codel_interval_ns` field threaded into
+   `cos_codel_check`'s existing `interval_ns` parameter, replacing the
+   #1829 const); any diff touching admission policy, MQFQ ordering, or the
+   fused peek/pop machinery belongs to #1829 and the PR is mis-scoped.
 6. **Smoke environment** — deploy wipes CoS; re-apply before measuring; WAN
    path is reth0.80 → 172.16.80.200 (never 172.16.100.x).
 7. **`setSchema` is the config-mode SSOT (#1319)** — completion + validation
@@ -341,8 +380,11 @@ showed.
   during `-P 12` — Q5), clean restore after delete. Run artifacts
   referenced from the cookbook.
 - **Deliverable 2 (at its PR):** Go config tests — hierarchical + flat-set
-  compile parity, FormatSet round-trip, all three commit-check errors,
-  defaults (presence-only → 5 ms/100 ms); wire fixture regen + key-absent
+  compile parity, FormatSet round-trip, all three commit-check errors
+  **including the apply-groups bypass case** (`smart-queueing` direct +
+  `scheduler-map` inherited via `apply-groups` → must error post-expansion,
+  AGY r1 #3), defaults (presence-only → the Phase-2-validated scheduler
+  defaults); wire fixture regen + key-absent
   pins both sides; cargo test for the build plumb (synthetic queue receives
   unit codel params; absent ⇒ 0); full suites (30 Go packages, 1000+ cargo
   tests, `make audit-check`); smoke = per-class CoS sweep 5201-5211 with the
@@ -365,6 +407,25 @@ showed.
   substrate; not proposed.
 
 ## 12. Open questions for adversarial review
+
+> **Round-1 resolutions (Codex + AGY + Claude SMR, convergent):**
+> Q1 → reject-don't-merge confirmed unanimously (filler semantics =
+> silent behavior change when a map is added later; with a scheduler-map
+> the synthetic queue does not exist, `forwarding_build/cos.rs:263-320`
+> vs `:389-409`); plus AGY r1 #3 — the check runs post-group-expansion.
+> Q2 → `smart-queueing` unit-level sibling confirmed (child-of-
+> `shaping-rate` rejected by both: nesting CoDel children under a
+> value-bearing leaf is grammatically uglier; unit-level aligns with
+> `scheduler-map`). Q3 → new `docs/cos-wan-sqm.md` confirmed. Q4 → keep
+> #1828 open as the config-surface tracker; Deliverable 2 dies if #1829
+> Phase 2 dies. Q5 → affirmative, REQUIRED:
+> `xpf_userspace_cos_active_flow_count > 1` pinned in the validation leg
+> (folded in v1.1). Q6 → file overhead compensation as a separate issue
+> at close-out (correctness for low-rate framed links, dead weight for
+> the loss cluster). Q7 → defaults NOT frozen here; inherit the #1829
+> Phase-2-validated values, cookbook carries the ≥1.5×-RTT /
+> interval≥max(100 ms, baseline-RTT) guidance (Codex r1 #3, AGY r1 #4;
+> in-tree contract `types_cos.go:90-96`).
 
 1. **Q1 (interaction rule):** is reject-don't-merge for
    `smart-queueing` + `scheduler-map` right, or should the leaf act as a
