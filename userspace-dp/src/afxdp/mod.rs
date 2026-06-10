@@ -634,11 +634,12 @@ use neighbor_dispatch::{
     build_missing_neighbor_session_metadata, learn_dynamic_neighbor_from_packet,
     retry_pending_neigh,
 };
-// `learn_dynamic_neighbor` is only referenced by tests in
-// afxdp/forwarding/tests.rs and afxdp/tests.rs; gate its import behind
-// cfg(test) so non-test builds don't trip `unused_imports`.
+// `learn_dynamic_neighbor` / `pair_write_needed` are only referenced
+// by tests in afxdp/forwarding/tests.rs and afxdp/tests.rs; gate the
+// imports behind cfg(test) so non-test builds don't trip
+// `unused_imports`.
 #[cfg(test)]
-use neighbor_dispatch::learn_dynamic_neighbor;
+use neighbor_dispatch::{learn_dynamic_neighbor, pair_write_needed};
 
 // Issue 67.3: disposition / telemetry recording extracted into
 // afxdp/disposition.rs.

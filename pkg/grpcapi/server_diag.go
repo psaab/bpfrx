@@ -130,6 +130,9 @@ func streamDiagCmd(ctx context.Context, cmd []string, sendFn func(string) error)
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	c := exec.CommandContext(ctx, cmd[0], cmd[1:]...)
+	// U3 parity (#1805): cap the post-kill pipe-drain window so a child
+	// that inherited the output pipe cannot block Wait past the ctx kill.
+	c.WaitDelay = requestExecWaitDelay
 
 	// Merge stdout and stderr into a single pipe.
 	pr, pw := io.Pipe()
@@ -563,7 +566,9 @@ func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) 
 		slog.Warn("system reboot requested via gRPC")
 		go func() {
 			time.Sleep(1 * time.Second)
-			exec.Command("systemctl", "reboot").Run()
+			// context.Background(): a confirmed power action must not be
+			// cancelled by client disconnect. Errors ignored as before.
+			runTimeout(context.Background(), "systemctl", "reboot")
 		}()
 		return &pb.SystemActionResponse{Message: "System going down for reboot NOW!"}, nil
 
@@ -571,7 +576,9 @@ func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) 
 		slog.Warn("system halt requested via gRPC")
 		go func() {
 			time.Sleep(1 * time.Second)
-			exec.Command("systemctl", "halt").Run()
+			// context.Background(): a confirmed power action must not be
+			// cancelled by client disconnect. Errors ignored as before.
+			runTimeout(context.Background(), "systemctl", "halt")
 		}()
 		return &pb.SystemActionResponse{Message: "System halting NOW!"}, nil
 
@@ -579,7 +586,9 @@ func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) 
 		slog.Warn("system power-off requested via gRPC")
 		go func() {
 			time.Sleep(1 * time.Second)
-			exec.Command("systemctl", "poweroff").Run()
+			// context.Background(): a confirmed power action must not be
+			// cancelled by client disconnect. Errors ignored as before.
+			runTimeout(context.Background(), "systemctl", "poweroff")
 		}()
 		return &pb.SystemActionResponse{Message: "System powering off NOW!"}, nil
 
@@ -613,7 +622,7 @@ func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) 
 		return &pb.SystemActionResponse{Message: fmt.Sprintf("Configuration lock cleared (was held by %s)", holder)}, nil
 
 	case "clear-arp":
-		out, err := exec.Command("ip", "-4", "neigh", "flush", "all").CombinedOutput()
+		out, err := combinedOutputTimeout(ctx, "ip", "-4", "neigh", "flush", "all")
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "flush ARP: %s", strings.TrimSpace(string(out)))
 		}
@@ -625,7 +634,7 @@ func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) 
 		}, nil
 
 	case "clear-ipv6-neighbors":
-		out, err := exec.Command("ip", "-6", "neigh", "flush", "all").CombinedOutput()
+		out, err := combinedOutputTimeout(ctx, "ip", "-6", "neigh", "flush", "all")
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "flush IPv6 neighbors: %s", strings.TrimSpace(string(out)))
 		}

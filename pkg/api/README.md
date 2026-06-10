@@ -61,3 +61,15 @@ under the daemon's errgroup. Nothing else imports this package.
   design.
 - `CompileHealthFn` may be `nil` when the daemon is in `-no-dataplane`
   mode. All readyz code paths null-check it.
+- Request-path external commands must be time-bounded (#1805): the
+  deferred reboot/halt power actions go through `runTimeout` in
+  `exec_timeout.go` (15s timeout + 5s WaitDelay, mirroring the
+  apply-path contract in `pkg/daemon/exec_timeout.go`, #1794 — not
+  importable here because pkg/daemon imports this package; the
+  Output/CombinedOutput variants live in the pkg/grpcapi sibling copy).
+  Power actions take `context.Background()` — client disconnect must
+  not cancel a confirmed reboot — and keep ignoring errors. The
+  ping/traceroute handlers keep their own 30s/60s request-ctx bounds
+  but set `WaitDelay` so an inherited pipe cannot block past the kill.
+  Do not add raw `exec.Command` calls in handlers: a wedged binary pins
+  the handler goroutine and its HTTP connection.
