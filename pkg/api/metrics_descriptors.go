@@ -367,6 +367,19 @@ func newCollector(srv *Server) *xpfCollector {
 			"1 for the current bounded fail-open reason on an opt-in shared v8 equal-flow queue; absent for queues without equal-flow enforcement (#1304).",
 			[]string{"ifindex", "queue_id", "reason"}, nil,
 		),
+		// #1830 (g): bucket-vs-flow occupancy gauges. The ratio
+		// flows_active / buckets_occupied is meaningful only while the
+		// queue is continuously backlogged; see the wire-field docs.
+		cosFlowFairBucketsOccupied: prometheus.NewDesc(
+			"xpf_userspace_cos_flow_fair_buckets_occupied",
+			"Currently occupied (backlogged) SFQ flow-fair buckets on this CoS queue, summed across workers; 0 on idle or non-flow-fair queues. Compare against xpf_userspace_cos_flow_fair_flows_active under sustained backlog: fewer occupied buckets than known concurrent flows indicates SFQ hash collisions shrinking per-flow shares (#1830).",
+			[]string{"ifindex", "queue_id"}, nil,
+		),
+		cosFlowFairFlowsActive: prometheus.NewDesc(
+			"xpf_userspace_cos_flow_fair_flows_active",
+			"Flow-cache active-window (~650 ms) distinct flows mapped to this CoS queue, summed across workers. Numerator of the collision ratio against xpf_userspace_cos_flow_fair_buckets_occupied; on idle/bursty queues it naturally exceeds occupied buckets (demand variance, not collision evidence) (#1830).",
+			[]string{"ifindex", "queue_id"}, nil,
+		),
 		// #869: per-worker busy/idle runtime counters.
 		workerWallSecs: prometheus.NewDesc(
 			"xpf_userspace_worker_wall_seconds_total",

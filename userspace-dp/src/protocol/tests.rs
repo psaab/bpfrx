@@ -1045,6 +1045,43 @@ fn cos_queue_status_starvation_counters_wire_keys_1642() {
     assert_eq!(value["tx_ring_full_submit_stalls"], 33u64);
 }
 
+// #1830 (g): round-trip + backward-compat pin for the bucket-vs-flow
+// occupancy telemetry. The wire keys feed
+// pkg/dataplane/userspace/protocol.go and the Prometheus gauges
+// `xpf_userspace_cos_flow_fair_buckets_occupied` /
+// `xpf_userspace_cos_flow_fair_flows_active` — a rename on either side
+// must fail a test instead of silently decoding zero.
+#[test]
+fn cos_queue_status_flow_fair_occupancy_roundtrip_1830() {
+    let status = CoSQueueStatus {
+        flow_fair_buckets_occupied: 9,
+        flow_fair_flows_active: 12,
+        ..Default::default()
+    };
+    let value: serde_json::Value =
+        serde_json::to_value(&status).expect("serialize CoSQueueStatus");
+    assert_eq!(value["flow_fair_buckets_occupied"], 9u64);
+    assert_eq!(value["flow_fair_flows_active"], 12u64);
+    let back: CoSQueueStatus = serde_json::from_value(value).expect("deserialize CoSQueueStatus");
+    assert_eq!(back.flow_fair_buckets_occupied, 9);
+    assert_eq!(back.flow_fair_flows_active, 12);
+
+    // Pre-#1830 payload (keys absent) must decode with zero defaults.
+    let mut legacy_value = serde_json::to_value(CoSQueueStatus::default())
+        .expect("serialize default CoSQueueStatus");
+    for key in ["flow_fair_buckets_occupied", "flow_fair_flows_active"] {
+        legacy_value
+            .as_object_mut()
+            .expect("CoSQueueStatus serializes to an object")
+            .remove(key)
+            .unwrap_or_else(|| panic!("new key {key} present before strip"));
+    }
+    let legacy: CoSQueueStatus =
+        serde_json::from_value(legacy_value).expect("pre-#1830 payload decodes");
+    assert_eq!(legacy.flow_fair_buckets_occupied, 0);
+    assert_eq!(legacy.flow_fair_flows_active, 0);
+}
+
 #[test]
 fn binding_status_post_drain_backup_cos_drops_wire_keys_1642() {
     let status = BindingStatus {

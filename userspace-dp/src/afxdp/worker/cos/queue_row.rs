@@ -18,6 +18,9 @@
 //     no new allocation beyond what the inline block did pre-#1349).
 //   * #784 `active_flow_buckets_peak` (MAX across worker instances,
 //     not sum — see comment in original).
+//   * #1830 (g) `flow_fair_buckets_occupied` (SUM across worker
+//     instances — disjoint per-worker buckets, see comment at the
+//     accumulation site).
 //   * #784 `flow_fair` propagation.
 //   * #710 / #718 drop-counter aggregation (`admission_flow_share_drops`,
 //     `admission_buffer_drops`, `admission_ecn_marked`,
@@ -105,6 +108,20 @@ pub(super) fn accumulate_queue_row(
     if peak > status.active_flow_buckets_peak {
         status.active_flow_buckets_peak = peak;
     }
+    // #1830 (g): SUM the CURRENT occupied-bucket count across worker
+    // instances (unlike the peak above, which is MAX). Each worker's
+    // FlowFairState owns disjoint buckets for its own queue runtime, so
+    // summing never double-counts a bucket; the sum is the
+    // interface-queue-wide count of backlogged SFQ buckets at snapshot
+    // time. Pairs with `flow_fair_flows_active` (coordinator overlay)
+    // for the collision-vs-demand ratio — see the INTERPRETATION
+    // contract on `protocol::CoSQueueStatus`.
+    status.flow_fair_buckets_occupied = status.flow_fair_buckets_occupied.saturating_add(
+        queue
+            .flow_fair_state
+            .as_ref()
+            .map_or(0, |ff| u64::from(ff.active_flow_buckets)),
+    );
     // #784: surface flow_fair so we can detect queues that were
     // expected to run SFQ but aren't.
     if queue.flow_fair() {

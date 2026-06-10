@@ -1173,6 +1173,12 @@ pub(super) fn aggregate_cos_statuses_across_workers(
                 if queue.active_flow_buckets_peak > q.active_flow_buckets_peak {
                     q.active_flow_buckets_peak = queue.active_flow_buckets_peak;
                 }
+                // #1830 (g): current occupied-bucket count SUMS across
+                // workers (disjoint per-worker FlowFairState buckets),
+                // matching the worker-side sum in queue_row.rs.
+                q.flow_fair_buckets_occupied = q
+                    .flow_fair_buckets_occupied
+                    .saturating_add(queue.flow_fair_buckets_occupied);
                 q.transmit_rate_bytes = q.transmit_rate_bytes.max(queue.transmit_rate_bytes);
                 q.buffer_bytes = q.buffer_bytes.saturating_add(queue.buffer_bytes);
                 q.worker_instances = q.worker_instances.saturating_add(queue.worker_instances);
