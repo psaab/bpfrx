@@ -767,6 +767,30 @@ func (c *xpfCollector) emitWorkerRuntime(ch chan<- prometheus.Metric, status dpu
 			prometheus.CounterValue, float64(w.CoSQueueLeaseAcquireV8Calls), label)
 		ch <- prometheus.MustNewConstMetric(c.workerCoSQueueLeaseAcquireV8GrantedBytes,
 			prometheus.CounterValue, float64(w.CoSQueueLeaseAcquireV8GrantedBytes), label)
+		// #1782 Step-1 cold-start CoS instruments. The wheel counters are
+		// emitted unconditionally (always-present series keep rate() and
+		// absence-alerts honest); the max is a monotonic high-water mark,
+		// hence a gauge. The under-grant family emits all six causes per
+		// worker so a cause appearing for the first time has a zero
+		// baseline sample to rate() against.
+		ch <- prometheus.MustNewConstMetric(c.workerCoSWheelTicksAdvancedTotal,
+			prometheus.CounterValue, float64(w.CoSWheelTicksAdvancedTotal), label)
+		ch <- prometheus.MustNewConstMetric(c.workerCoSWheelTicksAdvancedMax,
+			prometheus.GaugeValue, float64(w.CoSWheelTicksAdvancedMax), label)
+		for _, uc := range []struct {
+			cause string
+			value uint64
+		}{
+			{"seqlock_give_up", w.CoSQueueLeaseUndergrantSeqlockGiveUp},
+			{"cap_zero", w.CoSQueueLeaseUndergrantCapZero},
+			{"epoch_rotated", w.CoSQueueLeaseUndergrantEpochRotated},
+			{"share_exhausted", w.CoSQueueLeaseUndergrantShareExhausted},
+			{"class_cap", w.CoSQueueLeaseUndergrantClassCap},
+			{"outstanding_cap", w.CoSQueueLeaseUndergrantOutstandingCap},
+		} {
+			ch <- prometheus.MustNewConstMetric(c.workerCoSQueueLeaseUndergrant,
+				prometheus.CounterValue, float64(uc.value), label, uc.cause)
+		}
 		ch <- prometheus.MustNewConstMetric(c.workerSessionTableEntries,
 			prometheus.GaugeValue, float64(w.SessionTableEntries), label)
 		ch <- prometheus.MustNewConstMetric(c.workerSessionTableCapacity,

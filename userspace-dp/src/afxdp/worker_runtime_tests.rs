@@ -18,6 +18,16 @@ fn snapshot_roundtrip() {
         idle_loops: 1_234,
         cos_queue_lease_acquire_v8_calls: 55,
         cos_queue_lease_acquire_v8_granted_bytes: 123_456,
+        cos_wheel_ticks_advanced_total: 9_000_000,
+        cos_wheel_ticks_advanced_max: 8_000_000,
+        cos_queue_lease_undergrant: CoSQueueLeaseUndergrantCounters {
+            seqlock_give_up: 1,
+            cap_zero: 2,
+            epoch_rotated: 3,
+            share_exhausted: 4,
+            class_cap: 5,
+            outstanding_cap: 6,
+        },
         session_table_entries: 77,
         max_sessions: 100,
         nat_reverse_key_collisions: 4242,
@@ -39,6 +49,11 @@ fn snapshot_roundtrip() {
         s.cos_queue_lease_acquire_v8_granted_bytes,
         c.cos_queue_lease_acquire_v8_granted_bytes
     );
+    // #1782 Step-1: wheel + per-cause under-grant slots survive the
+    // publish -> snapshot round trip.
+    assert_eq!(s.cos_wheel_ticks_advanced_total, c.cos_wheel_ticks_advanced_total);
+    assert_eq!(s.cos_wheel_ticks_advanced_max, c.cos_wheel_ticks_advanced_max);
+    assert_eq!(s.cos_queue_lease_undergrant, c.cos_queue_lease_undergrant);
     assert_eq!(s.session_table_entries, c.session_table_entries);
     assert_eq!(s.max_sessions, c.max_sessions);
     // #1760: the displacement counter survives publish -> snapshot.

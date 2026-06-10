@@ -629,6 +629,38 @@ fn timer_wheel_wakes_short_parked_queue() {
     assert_eq!(root.runnable_queues, 1);
 }
 
+// #1782 Step-1 (i): the advance return value is the per-call tick
+// catch-up instrument — `now_tick - current_tick` at entry, the exact
+// iteration count of the O(lag) loop.
+#[test]
+fn advance_cos_timer_wheel_returns_ticks_advanced() {
+    let mut root = test_cos_interface_runtime(0);
+    assert_eq!(
+        advance_cos_timer_wheel(&mut root, 7 * COS_TIMER_WHEEL_TICK_NS),
+        7,
+        "fresh wheel at tick 0 advanced to tick 7"
+    );
+    assert_eq!(
+        advance_cos_timer_wheel(&mut root, 7 * COS_TIMER_WHEEL_TICK_NS),
+        0,
+        "no-op re-advance to the same tick"
+    );
+    assert_eq!(
+        advance_cos_timer_wheel(&mut root, 3 * COS_TIMER_WHEEL_TICK_NS),
+        0,
+        "now earlier than current_tick saturates to 0"
+    );
+    // Sub-tick now_ns truncates down: tick 7 + 49999 ns is still tick 7.
+    assert_eq!(
+        advance_cos_timer_wheel(&mut root, 7 * COS_TIMER_WHEEL_TICK_NS + 49_999),
+        0
+    );
+    assert_eq!(
+        advance_cos_timer_wheel(&mut root, 9 * COS_TIMER_WHEEL_TICK_NS),
+        2
+    );
+}
+
 #[test]
 fn timer_wheel_cascades_long_parked_queue() {
     let mut root = test_cos_interface_runtime(0);

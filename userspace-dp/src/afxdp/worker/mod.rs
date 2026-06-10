@@ -1,5 +1,10 @@
 use super::*;
 
+// #1782 Step-1: per-cause v8 queue-lease under-grant counter block,
+// shared between WorkerCos (worker-local accumulation) and the
+// per-worker runtime publish path.
+use super::worker_runtime::CoSQueueLeaseUndergrantCounters;
+
 // Issue 73 step 2: per-poll BindingWorker lifecycle (the central
 // `poll_binding` orchestrator) lives in worker/lifecycle.rs.
 mod lifecycle;
@@ -415,6 +420,9 @@ impl BindingWorker {
                 cos_nonempty_interfaces: 0,
                 cos_queue_lease_acquire_v8_calls: 0,
                 cos_queue_lease_acquire_v8_granted_bytes: 0,
+                cos_wheel_ticks_advanced_total: 0,
+                cos_wheel_ticks_advanced_max: 0,
+                cos_queue_lease_undergrants: CoSQueueLeaseUndergrantCounters::default(),
             },
             scratch: WorkerScratch {
                 scratch_recycle: Vec::with_capacity(RX_BATCH_SIZE as usize),
@@ -559,6 +567,9 @@ impl BindingWorker {
                 cos_nonempty_interfaces,
                 cos_queue_lease_acquire_v8_calls: 0,
                 cos_queue_lease_acquire_v8_granted_bytes: 0,
+                cos_wheel_ticks_advanced_total: 0,
+                cos_wheel_ticks_advanced_max: 0,
+                cos_queue_lease_undergrants: CoSQueueLeaseUndergrantCounters::default(),
             },
             scratch: WorkerScratch {
                 scratch_recycle: Vec::with_capacity(RX_BATCH_SIZE as usize),
@@ -676,6 +687,9 @@ impl BindingWorker {
                 cos_nonempty_interfaces: 0,
                 cos_queue_lease_acquire_v8_calls: 0,
                 cos_queue_lease_acquire_v8_granted_bytes: 0,
+                cos_wheel_ticks_advanced_total: 0,
+                cos_wheel_ticks_advanced_max: 0,
+                cos_queue_lease_undergrants: CoSQueueLeaseUndergrantCounters::default(),
             },
             scratch: WorkerScratch {
                 scratch_recycle: Vec::with_capacity(RX_BATCH_SIZE as usize),
@@ -1053,13 +1067,25 @@ fn refresh_worker_cos_queue_lease_runtime_counters(
 ) {
     let mut calls = 0u64;
     let mut granted_bytes = 0u64;
+    // #1782 Step-1: wheel catch-up sum/max + per-cause under-grant
+    // attribution, summed (max'ed) across this worker's bindings on
+    // the same ~1s publish cadence as the existing lease counters.
+    let mut wheel_total = 0u64;
+    let mut wheel_max = 0u64;
+    let mut undergrant = CoSQueueLeaseUndergrantCounters::default();
     for binding in bindings {
         calls = calls.wrapping_add(binding.cos.cos_queue_lease_acquire_v8_calls);
         granted_bytes =
             granted_bytes.wrapping_add(binding.cos.cos_queue_lease_acquire_v8_granted_bytes);
+        wheel_total = wheel_total.wrapping_add(binding.cos.cos_wheel_ticks_advanced_total);
+        wheel_max = wheel_max.max(binding.cos.cos_wheel_ticks_advanced_max);
+        undergrant.add_assign(&binding.cos.cos_queue_lease_undergrants);
     }
     counters.cos_queue_lease_acquire_v8_calls = calls;
     counters.cos_queue_lease_acquire_v8_granted_bytes = granted_bytes;
+    counters.cos_wheel_ticks_advanced_total = wheel_total;
+    counters.cos_wheel_ticks_advanced_max = wheel_max;
+    counters.cos_queue_lease_undergrant = undergrant;
 }
 
 fn apply_worker_shaped_tx_requests(
