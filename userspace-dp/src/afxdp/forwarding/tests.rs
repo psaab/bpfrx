@@ -2124,6 +2124,118 @@ fn learned_vlan_ingress_neighbor_maps_to_logical_ifindex() {
     );
 }
 
+// #1787: end-state assertions for the cheap-first learn rework. The
+// elision decision itself is covered by the pure-helper matrix in
+// neighbor_dispatch::learn_precheck_tests (map contents cannot
+// distinguish an elided write from an idempotent overwrite).
+
+const LEARN_MAC_A: [u8; 6] = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+const LEARN_MAC_B: [u8; 6] = [0x66, 0x55, 0x44, 0x33, 0x22, 0x11];
+
+#[test]
+fn learn_dynamic_neighbor_first_learn_inserts_single_key_without_vlan() {
+    let state = build_forwarding_state(&nat_snapshot());
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+    let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100));
+    // reth1.0 has no parent: (24, 0) resolves to logical 24 ==
+    // ingress, so exactly one key is written.
+    learn_dynamic_neighbor(&state, &dynamic_neighbors, 24, 0, ip, LEARN_MAC_A);
+    assert_eq!(
+        dynamic_neighbors.get(&(24, ip)).map(|e| e.mac),
+        Some(LEARN_MAC_A)
+    );
+    // The unused stack-array placeholder key (0, ip) must never leak
+    // into the map.
+    assert!(dynamic_neighbors.get(&(0, ip)).is_none());
+    assert_eq!(dynamic_neighbors.len(), 1);
+}
+
+#[test]
+fn learn_dynamic_neighbor_vlan_first_learn_inserts_both_keys() {
+    let state = build_forwarding_state(&nat_snapshot());
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+    let ip = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200));
+    // (11, vlan 80) resolves to logical sub-interface 12: the #949
+    // pair — physical 11 AND logical 12 — is written together.
+    learn_dynamic_neighbor(&state, &dynamic_neighbors, 11, 80, ip, LEARN_MAC_A);
+    assert_eq!(
+        dynamic_neighbors.get(&(11, ip)).map(|e| e.mac),
+        Some(LEARN_MAC_A)
+    );
+    assert_eq!(
+        dynamic_neighbors.get(&(12, ip)).map(|e| e.mac),
+        Some(LEARN_MAC_A)
+    );
+    assert_eq!(dynamic_neighbors.len(), 2);
+}
+
+#[test]
+fn learn_dynamic_neighbor_same_mac_relearn_is_noop_precheck() {
+    let state = build_forwarding_state(&nat_snapshot());
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+    let ip = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200));
+    learn_dynamic_neighbor(&state, &dynamic_neighbors, 11, 80, ip, LEARN_MAC_A);
+    // After the first learn, the pre-check decision for the same MAC
+    // must be "no write needed" — this is the steady-state elision.
+    let current = [
+        dynamic_neighbors.get(&(11, ip)).map(|e| e.mac),
+        dynamic_neighbors.get(&(12, ip)).map(|e| e.mac),
+    ];
+    assert!(!pair_write_needed(&current, LEARN_MAC_A));
+    // A second identical learn leaves contents unchanged.
+    learn_dynamic_neighbor(&state, &dynamic_neighbors, 11, 80, ip, LEARN_MAC_A);
+    assert_eq!(
+        dynamic_neighbors.get(&(11, ip)).map(|e| e.mac),
+        Some(LEARN_MAC_A)
+    );
+    assert_eq!(
+        dynamic_neighbors.get(&(12, ip)).map(|e| e.mac),
+        Some(LEARN_MAC_A)
+    );
+    assert_eq!(dynamic_neighbors.len(), 2);
+}
+
+#[test]
+fn learn_dynamic_neighbor_mac_flip_updates_both_keys() {
+    let state = build_forwarding_state(&nat_snapshot());
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+    let ip = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200));
+    learn_dynamic_neighbor(&state, &dynamic_neighbors, 11, 80, ip, LEARN_MAC_A);
+    learn_dynamic_neighbor(&state, &dynamic_neighbors, 11, 80, ip, LEARN_MAC_B);
+    assert_eq!(
+        dynamic_neighbors.get(&(11, ip)).map(|e| e.mac),
+        Some(LEARN_MAC_B)
+    );
+    assert_eq!(
+        dynamic_neighbors.get(&(12, ip)).map(|e| e.mac),
+        Some(LEARN_MAC_B)
+    );
+    assert_eq!(dynamic_neighbors.len(), 2);
+}
+
+#[test]
+fn learn_dynamic_neighbor_relearns_removed_key() {
+    let state = build_forwarding_state(&nat_snapshot());
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+    let ip = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200));
+    learn_dynamic_neighbor(&state, &dynamic_neighbors, 11, 80, ip, LEARN_MAC_A);
+    // A remove (netlink delete / resolver revoke / manager replace)
+    // takes one half of the pair out. The next learn that reaches
+    // this function pre-check-misses and restores BOTH keys via the
+    // bulk path.
+    dynamic_neighbors.remove(&(12, ip));
+    assert!(dynamic_neighbors.get(&(12, ip)).is_none());
+    learn_dynamic_neighbor(&state, &dynamic_neighbors, 11, 80, ip, LEARN_MAC_A);
+    assert_eq!(
+        dynamic_neighbors.get(&(11, ip)).map(|e| e.mac),
+        Some(LEARN_MAC_A)
+    );
+    assert_eq!(
+        dynamic_neighbors.get(&(12, ip)).map(|e| e.mac),
+        Some(LEARN_MAC_A)
+    );
+}
+
 #[test]
 fn forwarding_resolution_rejects_next_table_loop() {
     let state = build_forwarding_state(&forwarding_snapshot_with_next_table_loop());

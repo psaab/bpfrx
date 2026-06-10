@@ -4703,3 +4703,16 @@ top.
   persist_failure_test.go (new), README.md}, pkg/api/{server.go, health.go,
   health_test.go, metrics.go, metrics_descriptors.go,
   metrics_persist_degraded_test.go (new), README.md}, pkg/daemon/daemon_run.go
+
+- **Timestamp**: 2026-06-10
+  **Action**: #1787 Stage 1 — cheap-first RX learn: stack key array + `pair_write_needed` pure helper + per-key get() pre-check before the #949 bulk insert; linearization + dedup-window semantics documented at the call site; `learn_precheck_tests` unit matrix appended
+  **File(s)**: userspace-dp/src/afxdp/neighbor_dispatch.rs
+- **Timestamp**: 2026-06-10
+  **Action**: #1787 — export `pair_write_needed` under cfg(test) alongside `learn_dynamic_neighbor`
+  **File(s)**: userspace-dp/src/afxdp/mod.rs
+- **Timestamp**: 2026-06-10
+  **Action**: #1787 — integration tests: single-key first-learn (placeholder key never written), vlan pair first-learn, same-MAC no-op pre-check, MAC flip updates both keys, removed-key re-learn
+  **File(s)**: userspace-dp/src/afxdp/forwarding/tests.rs
+- **Timestamp**: 2026-06-10
+  **Action**: #1787 — module header note: learn upsert is cheap-first (write elided when all keys current)
+  **File(s)**: userspace-dp/src/afxdp/neighbor_dispatch.rs
