@@ -1338,6 +1338,21 @@ mod tests {
         use std::sync::atomic::AtomicBool;
         use std::time::Duration;
 
+        // Codex review on PR #1833: the resolver thread exits silently
+        // when its netlink socket cannot be opened (sandboxes deny
+        // AF_NETLINK), which would turn this test into a timeout
+        // failure. Probe availability and skip gracefully — the
+        // invariant itself is environment-independent; only this
+        // live-thread harness needs the socket.
+        let probe_fd = open_resolver_socket();
+        if probe_fd < 0 {
+            eprintln!(
+                "skipping invariant_n1: AF_NETLINK/NETLINK_ROUTE unavailable in this environment"
+            );
+            return;
+        }
+        unsafe { libc::close(probe_fd) };
+
         fn wait_for<F: Fn() -> bool>(pred: F) -> bool {
             for _ in 0..400 {
                 if pred() {
