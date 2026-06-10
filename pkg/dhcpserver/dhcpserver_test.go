@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/psaab/xpf/pkg/config"
 )
@@ -464,4 +465,98 @@ func TestWarnAmbiguousSubnetSelection(t *testing.T) {
 			t.Errorf("unexpected warning when both subnets carry selectors: %v", warned)
 		}
 	})
+}
+
+// asyncTestManager builds a Manager whose fake systemctl reports which
+// v4 config was on disk when each restart ran (the worker writes the
+// config before restarting, so this observes exactly which desired
+// state the worker applied), and blocks until released.
+func asyncTestManager(t *testing.T) (m *Manager, applied chan string, release chan struct{}) {
+	t.Helper()
+	dir := t.TempDir()
+	applied = make(chan string, 16)
+	release = make(chan struct{}, 16)
+	m = NewManagerForTesting(
+		filepath.Join(dir, "kea-dhcp4.conf"),
+		filepath.Join(dir, "kea-dhcp6.conf"),
+		nil, // set below; needs m for confPath4
+		func(unit string) bool { return false },
+	)
+	m.runSystemctl = func(args ...string) error {
+		data, _ := os.ReadFile(m.confPath4)
+		applied <- string(data)
+		<-release
+		return nil
+	}
+	return m, applied, release
+}
+
+// TestApplyAsyncNeverBlocks pins #1835 F2: the VRRP event loop must
+// never wait behind a (15s-bounded) systemctl — ApplyAsync returns
+// immediately even while the worker is stuck inside a shell-out.
+func TestApplyAsyncNeverBlocks(t *testing.T) {
+	m, applied, release := asyncTestManager(t)
+	defer close(release)
+
+	m.ApplyAsync(v4Config("ge-0-0-0"), "test")
+	<-applied // worker is now blocked inside the fake systemctl
+
+	done := make(chan struct{})
+	go func() {
+		m.ApplyAsync(v4Config("ge-0-0-1"), "test")
+		m.ApplyAsync(nil, "test")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ApplyAsync blocked while the worker held systemctl")
+	}
+}
+
+// TestApplyAsyncLatestWins pins the mailbox coalescing contract: with
+// the worker busy, enqueueing B then C must apply only C — B is
+// discarded, and the LAST desired state is the last one applied.
+// Correct because Apply is an idempotent reconcile to desired state.
+func TestApplyAsyncLatestWins(t *testing.T) {
+	m, applied, release := asyncTestManager(t)
+
+	m.ApplyAsync(v4Config("iface-A"), "a")
+	gotA := <-applied // worker is executing A and blocked
+	if !strings.Contains(gotA, "iface-A") {
+		t.Fatalf("first apply should be A, got %q", gotA)
+	}
+
+	// Worker still blocked: B fills the slot, C overwrites B.
+	m.ApplyAsync(v4Config("iface-B"), "b")
+	m.ApplyAsync(v4Config("iface-C"), "c")
+
+	release <- struct{}{} // finish A; worker picks up the slot
+	gotNext := <-applied
+	if !strings.Contains(gotNext, "iface-C") {
+		t.Fatalf("expected latest state C applied next, got %q", gotNext)
+	}
+	release <- struct{}{} // finish C
+
+	// B must have been coalesced away — no further applies.
+	select {
+	case extra := <-applied:
+		t.Fatalf("unexpected extra apply (B not coalesced): %q", extra)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestApplyAsyncSingleWorker pins the singleton contract: repeated
+// ApplyAsync bursts start exactly one worker goroutine.
+func TestApplyAsyncSingleWorker(t *testing.T) {
+	m, _ := testManager(t, map[string]bool{}, "")
+	for burst := 0; burst < 2; burst++ {
+		for i := 0; i < 25; i++ {
+			m.ApplyAsync(nil, "burst")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := m.asyncWorkerStarts.Load(); n != 1 {
+		t.Fatalf("worker goroutine starts = %d, want 1", n)
+	}
 }

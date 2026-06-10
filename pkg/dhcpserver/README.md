@@ -18,6 +18,15 @@ Manages Kea DHCPv4/v6 server config and lifecycle. Generates
   unit that left the config) are returned, so a commit surfaces
   "DHCP server failed" instead of silently succeeding with no
   service.
+- `ApplyAsync(cfg, reason)` — `dhcpserver.go`. Enqueues an `Apply` to
+  a single lazily started worker via a 1-slot latest-wins mailbox and
+  returns immediately (#1835 F2). Used by the VRRP transition
+  callbacks in `pkg/daemon` so the event loop never waits behind a
+  15s-bounded systemctl. Coalescing is correct because `Apply` is an
+  idempotent reconcile to desired state: intermediate states may be
+  skipped but the last enqueued state is always applied last.
+  `cfg == nil` is the authoritative clear. Errors are logged with
+  `reason`; the commit path keeps synchronous `Apply` (fail-closed).
 - `Clear()` — `dhcpserver.go`. Stops both Kea units if systemd
   reports them active and removes config files. Void signature for
   the VRRP-transition callers (`pkg/daemon` HA path); stop failures

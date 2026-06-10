@@ -4786,3 +4786,11 @@ top.
   selector (ambiguous Kea selection); warn seam + tests.
   **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/test_seams.go,
   pkg/dhcpserver/dhcpserver_test.go
+
+- **Timestamp**: 2026-06-10 (AGY fold) F2
+  **Action**: #1835 AGY F2 — Manager.ApplyAsync (1-slot latest-wins mailbox +
+  singleton worker) so VRRP transitions never block on 15s systemctl; converted
+  all four daemon_ha.go Kea call sites (incl. Clear→ApplyAsync(nil)); tests for
+  never-blocks, latest-wins coalescing, single worker; README.
+  **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/dhcpserver_test.go,
+  pkg/dhcpserver/README.md, pkg/daemon/daemon_ha.go

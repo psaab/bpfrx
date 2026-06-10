@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -94,6 +95,22 @@ type Manager struct {
 	runSystemctl func(args ...string) error
 	unitActive   func(unit string) bool
 	warn         func(msg string, args ...any)
+
+	// ApplyAsync mailbox (#1835 F2): 1-slot latest-wins channel
+	// consumed by a single lazily started worker goroutine, so VRRP
+	// transition callbacks never block behind a 15s systemctl.
+	asyncOnce sync.Once
+	asyncCh   chan asyncApplyReq
+	// asyncWorkerStarts counts worker goroutine launches; tests assert
+	// the sync.Once keeps it at 1 across ApplyAsync bursts.
+	asyncWorkerStarts atomic.Int32
+}
+
+// asyncApplyReq is one desired DHCP-server state for the ApplyAsync
+// worker. reason is logging context only (which VRRP transition asked).
+type asyncApplyReq struct {
+	cfg    *config.DHCPServerConfig
+	reason string
 }
 
 // New creates a new DHCP server manager.
@@ -148,6 +165,57 @@ func (m *Manager) Apply(cfg *config.DHCPServerConfig) error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// ApplyAsync enqueues an authoritative Apply for cfg and returns
+// immediately (#1835 F2). The VRRP event loop calls the Kea manager on
+// MASTER/BACKUP transitions; running Apply inline there would hold the
+// loop for up to 15s per systemctl shell-out. Instead, desired states
+// go through a 1-slot latest-wins mailbox drained by a single worker
+// goroutine (started lazily, once per Manager).
+//
+// Latest-wins coalescing is correct because Apply is an idempotent
+// reconcile to the desired state: when transitions arrive faster than
+// systemctl completes, intermediate states may be skipped, but the
+// LAST enqueued state is always the last one applied — final state
+// matches the final transition. Pass cfg == nil for an authoritative
+// clear (same semantics as Apply(nil)). Errors are logged by the
+// worker with the supplied reason; callers that need fail-closed
+// errors (the commit path) use the synchronous Apply instead.
+func (m *Manager) ApplyAsync(cfg *config.DHCPServerConfig, reason string) {
+	m.asyncOnce.Do(func() {
+		m.asyncCh = make(chan asyncApplyReq, 1)
+		m.asyncWorkerStarts.Add(1)
+		go m.applyAsyncWorker()
+	})
+	req := asyncApplyReq{cfg: cfg, reason: reason}
+	for {
+		select {
+		case m.asyncCh <- req:
+			return
+		default:
+		}
+		// Slot full: discard the stale desired state and retry. The
+		// loop (rather than a single drain-then-send) makes the
+		// enqueue race-safe against concurrent producers.
+		select {
+		case <-m.asyncCh:
+		default:
+		}
+	}
+}
+
+// applyAsyncWorker is the singleton consumer for ApplyAsync. It runs
+// for the daemon's lifetime (the mailbox is never closed); each
+// iteration applies the latest desired state under the normal m.mu
+// serialization with synchronous Apply callers.
+func (m *Manager) applyAsyncWorker() {
+	for req := range m.asyncCh {
+		if err := m.Apply(req.cfg); err != nil {
+			slog.Warn("async DHCP server apply failed",
+				"reason", req.reason, "err", err)
+		}
+	}
 }
 
 // clearFamilyLocked stops one Kea unit if systemd reports it active
