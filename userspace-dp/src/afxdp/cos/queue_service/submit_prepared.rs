@@ -43,6 +43,18 @@ pub(super) fn submit_prepared(
     } else {
         0
     };
+    // #1829 Phase 1 (Codex review on PR #1846): unconditional
+    // enqueue_ns sidecar for committed-prefix-only sojourn sampling —
+    // see the matching comment in submit_local.rs.
+    let mut enq_sidecar = [0u64; TX_BATCH_SIZE];
+    let enq_len = {
+        let mut n = 0usize;
+        for req in items.iter().take(TX_BATCH_SIZE) {
+            enq_sidecar[n] = req.enqueue_ns;
+            n += 1;
+        }
+        n
+    };
     match transmit_prepared_queue(binding, &mut items, now_ns, shared_recycles) {
         Ok((packets, bytes)) => {
             apply_cos_prepared_result(
@@ -64,6 +76,20 @@ pub(super) fn submit_prepared(
                 {
                     for &(bucket, bytes) in &sidecar[..packets as usize] {
                         account_flow_bucket_tx(ff, bucket, bytes, now_ns);
+                    }
+                }
+            }
+            // #1829: committed-prefix-only sojourn samples — see the
+            // matching block in submit_local.rs.
+            if packets > 0 {
+                if let Some(queue) = binding
+                    .cos
+                    .cos_interfaces
+                    .get_mut(&root_ifindex)
+                    .and_then(|root| root.queues.get_mut(queue_idx))
+                {
+                    for &enqueue_ns in &enq_sidecar[..(packets as usize).min(enq_len)] {
+                        queue.telemetry.sojourn.record(enqueue_ns, now_ns);
                     }
                 }
             }

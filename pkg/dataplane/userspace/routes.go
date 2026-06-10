@@ -11,7 +11,12 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
-func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot) []RouteSnapshot {
+// buildRouteSnapshots derives the helper FIB from config statics,
+// connected prefixes, and ip-rule leak rules, then applies the
+// ip-monitoring route overlay (#1827 PR-1b): each overlay entry
+// REPLACES the entire (table, family, prefix) entry set — never merges
+// next-hops — so an ECMP half-override is impossible by construction.
+func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot, overlay []config.RouteOverlayEntry) []RouteSnapshot {
 	if cfg == nil {
 		return nil
 	}
@@ -133,6 +138,8 @@ func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot) []R
 		}
 	}
 
+	out = applyRouteOverlay(out, overlay)
+
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Table != out[j].Table {
 			return out[i].Table < out[j].Table
@@ -143,6 +150,69 @@ func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot) []R
 		return out[i].Destination < out[j].Destination
 	})
 	return out
+}
+
+// applyRouteOverlay folds the winner-resolved ip-monitoring overlay
+// into the route set: for each entry, every existing snapshot for the
+// same (table, family, canonical prefix) is REMOVED (whole-entry
+// replacement, including all ECMP next-hops) and the single overlay
+// route is appended.
+func applyRouteOverlay(routes []RouteSnapshot, overlay []config.RouteOverlayEntry) []RouteSnapshot {
+	if len(overlay) == 0 {
+		return routes
+	}
+	type key struct{ table, family, dest string }
+	replaced := make(map[key]RouteSnapshot, len(overlay))
+	for _, entry := range overlay {
+		table, family := overlayTableFamily(entry)
+		dest := canonicalRoutePrefix(entry.Destination)
+		if dest == "" {
+			continue
+		}
+		replaced[key{table, family, dest}] = RouteSnapshot{
+			Table:       table,
+			Family:      family,
+			Destination: dest,
+			NextHops:    []string{entry.NextHop},
+		}
+	}
+	out := make([]RouteSnapshot, 0, len(routes)+len(replaced))
+	for _, snap := range routes {
+		k := key{snap.Table, snap.Family, canonicalRoutePrefix(snap.Destination)}
+		if _, gone := replaced[k]; gone {
+			continue
+		}
+		out = append(out, snap)
+	}
+	for _, snap := range replaced {
+		out = append(out, snap)
+	}
+	return out
+}
+
+// overlayTableFamily maps an overlay entry to its snapshot table and
+// family names ("<ri>.inet.0" / "inet6.0" etc.).
+func overlayTableFamily(entry config.RouteOverlayEntry) (string, string) {
+	family := "inet"
+	table := "inet.0"
+	if strings.Contains(entry.Destination, ":") {
+		family = "inet6"
+		table = "inet6.0"
+	}
+	if entry.RoutingInstance != "" {
+		table = entry.RoutingInstance + "." + table
+	}
+	return table, family
+}
+
+// canonicalRoutePrefix mask-normalizes a CIDR for overlay matching;
+// returns "" for unparseable strings (left untouched).
+func canonicalRoutePrefix(s string) string {
+	_, n, err := net.ParseCIDR(s)
+	if err != nil || n == nil {
+		return s
+	}
+	return n.String()
 }
 
 func buildInterfaceRouteTables(cfg *config.Config) (map[string]string, map[string]string) {

@@ -918,6 +918,16 @@ the sweep exit `2`; they do not produce a false-green fairness verdict.
   Counted distinctly from (not a subset of) the throttle counter; the
   overrides/throttles ratio is the diagnostic for LAG_THRESHOLD tuned
   too tight.
+- **`xpf_userspace_cos_sojourn_windowed_min_ns{ifindex=..., queue_id=...}`**
+  gauge (#1829 Phase 1): minimum per-packet queue sojourn over the
+  last 1-2 100 ms windows, MAX-merged across workers (worst
+  instance). CoDel's standing-queue estimator and the #1829 Phase-2
+  gate metric — a value persistently above `codel-target` is
+  standing-queue evidence; 0 means no pops in the last ~2 windows.
+  Companion gauges `xpf_userspace_cos_sojourn_ewma_ns` and
+  `xpf_userspace_cos_sojourn_peak_ns` are supporting context only
+  (both biased high by scheduler service gaps). See "Reading the
+  sojourn telemetry" in `cos-validation-notes.md`.
 
 Operators tracking this contract in production monitor the gap
 `(observed_cov - cstruct)` and the starved-flow counter. A

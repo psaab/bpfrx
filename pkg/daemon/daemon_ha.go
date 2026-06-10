@@ -557,6 +557,11 @@ func (d *Daemon) reconcileRGState() {
 		}
 	}
 
+	// anyRGChanged collects per-RG transitions so the #1827
+	// ip-monitoring HA gating (primary-only probes + overlay
+	// publication) re-evaluates exactly once per reconcile pass.
+	anyRGChanged := false
+
 	for _, rgID := range rgIDs {
 		clusterPri := d.cluster.IsLocalPrimary(rgID)
 		vrrp := rgVRRP[rgID] // may be nil if no VRRP instances for this RG
@@ -666,6 +671,7 @@ func (d *Daemon) reconcileRGState() {
 			} else {
 				d.clearRethServicesForRG(rgID)
 			}
+			anyRGChanged = true
 		}
 		// Stable link-local: ensure correct on EVERY reconcile tick.
 		// The kernel preserves NODAD addresses across daemon restarts,
@@ -711,6 +717,13 @@ func (d *Daemon) reconcileRGState() {
 				}
 			}
 		}
+	}
+
+	// #1827 §4.4: on any RG transition, re-evaluate ip-monitoring HA
+	// gating — gated probes run (and the overlay publishes) only on
+	// the data-RG primary; the standby reverts to the config baseline.
+	if anyRGChanged {
+		d.reconcileIPMonGating()
 	}
 }
 

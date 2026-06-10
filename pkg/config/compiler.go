@@ -60,7 +60,10 @@ type compileOpts struct {
 	// peer-display paths must instead scrub the value and keep going
 	// so an already-persisted bad config cannot blackout-boot a node
 	// or alarm-loop HA config sync. This check deliberately does NOT
-	// live in SchemaValidate, which also runs on the lenient paths.
+	// live in SchemaValidate: the tolerant paths need the value scrubbed
+	// in place, which the read-only schema walk cannot do (and since
+	// #1319 PR 2 SchemaValidate violations are themselves downgraded to
+	// warnings on the tolerant paths — see configstore.compileTreeLenient).
 	// See freetext.go for the full three-layer design.
 	sanitizeFreeTextControlChars bool
 
@@ -73,7 +76,9 @@ type compileOpts struct {
 	// already-persisted or peer-synced config still boots; candidate
 	// commit / commit-check stay strict and hard-reject new operator
 	// edits. Like the other lenient gates, this check deliberately does
-	// NOT live in SchemaValidate (which runs on the lenient paths too).
+	// NOT live in SchemaValidate: pruning the duplicates is an AST-level
+	// compile decision the read-only schema walk cannot make (and since
+	// #1319 PR 2 SchemaValidate violations only warn on tolerant paths).
 	lenientVRRPTrackDuplicates bool
 }
 
@@ -399,6 +404,12 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		strictErrs = append(strictErrs, err)
 	}
 	if err := validatePolicySchedulerReferencesStrict(cfg); err != nil {
+		strictErrs = append(strictErrs, err)
+	}
+	if err := validateRPMProbePinsStrict(cfg); err != nil {
+		strictErrs = append(strictErrs, err)
+	}
+	if err := validateIPMonitoringStrict(cfg); err != nil {
 		strictErrs = append(strictErrs, err)
 	}
 	// #1830 (e): the #1733 equal-flow worker-cap validator

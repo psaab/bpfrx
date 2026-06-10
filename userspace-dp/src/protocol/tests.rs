@@ -1112,6 +1112,51 @@ fn cos_queue_status_starvation_counters_wire_keys_1642() {
     assert_eq!(value["tx_ring_full_submit_stalls"], 33u64);
 }
 
+// #1829 Phase 1: round-trip + backward-compat pin for the sojourn
+// telemetry trio. The wire keys feed
+// pkg/dataplane/userspace/protocol.go and the Prometheus gauges
+// `xpf_userspace_cos_sojourn_{ewma,peak,windowed_min}_ns` — a rename
+// on either side must fail a test instead of silently decoding zero.
+// `sojourn_windowed_min_ns` is the #1829 Phase-2 gate metric.
+#[test]
+fn cos_queue_status_sojourn_roundtrip_1829() {
+    let status = CoSQueueStatus {
+        sojourn_ewma_ns: 2_500_000,
+        sojourn_peak_ns: 9_000_000,
+        sojourn_windowed_min_ns: 1_750_000,
+        ..Default::default()
+    };
+    let value: serde_json::Value =
+        serde_json::to_value(&status).expect("serialize CoSQueueStatus");
+    assert_eq!(value["sojourn_ewma_ns"], 2_500_000u64);
+    assert_eq!(value["sojourn_peak_ns"], 9_000_000u64);
+    assert_eq!(value["sojourn_windowed_min_ns"], 1_750_000u64);
+    let back: CoSQueueStatus = serde_json::from_value(value).expect("deserialize CoSQueueStatus");
+    assert_eq!(back.sojourn_ewma_ns, 2_500_000);
+    assert_eq!(back.sojourn_peak_ns, 9_000_000);
+    assert_eq!(back.sojourn_windowed_min_ns, 1_750_000);
+
+    // Pre-#1829 payload (keys absent) must decode with zero defaults.
+    let mut legacy_value = serde_json::to_value(CoSQueueStatus::default())
+        .expect("serialize default CoSQueueStatus");
+    for key in [
+        "sojourn_ewma_ns",
+        "sojourn_peak_ns",
+        "sojourn_windowed_min_ns",
+    ] {
+        legacy_value
+            .as_object_mut()
+            .expect("CoSQueueStatus serializes to an object")
+            .remove(key)
+            .unwrap_or_else(|| panic!("new key {key} present before strip"));
+    }
+    let legacy: CoSQueueStatus =
+        serde_json::from_value(legacy_value).expect("pre-#1829 payload decodes");
+    assert_eq!(legacy.sojourn_ewma_ns, 0);
+    assert_eq!(legacy.sojourn_peak_ns, 0);
+    assert_eq!(legacy.sojourn_windowed_min_ns, 0);
+}
+
 // #1830 (g): round-trip + backward-compat pin for the bucket-vs-flow
 // occupancy telemetry. The wire keys feed
 // pkg/dataplane/userspace/protocol.go and the Prometheus gauges

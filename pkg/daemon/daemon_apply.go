@@ -19,7 +19,6 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
-	"github.com/psaab/xpf/pkg/frr"
 	"github.com/psaab/xpf/pkg/ipsec"
 	"github.com/psaab/xpf/pkg/routing"
 	"github.com/psaab/xpf/pkg/vrrp"
@@ -438,6 +437,19 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 	policySchedulerActiveState := d.policySchedulerActiveStateForApplyLocked(cfg, policySchedulerApplyTime)
 	d.seedPolicySchedulerActiveStateLocked(policySchedulerActiveState)
 
+	// 1.95. Refresh the dataplane's ip-monitoring overlay cache from
+	// the engine BEFORE the full snapshot build (#1827, AGY r2-2): an
+	// operator commit while a policy is FAILED must rebuild routes
+	// with the active overlay instead of wiping the injected failover
+	// route until the next engine tick. The overlay is filtered
+	// against the INCOMING config (Codex PR #1843 HIGH-1) so a commit
+	// that removes or edits a policy never republishes the stale
+	// entries; the same filtered view feeds the FRR render in step 3.
+	commitOverlay := d.commitOverlayForConfig(cfg)
+	if setter, ok := d.dp.(routeOverlaySetter); ok {
+		setter.SetRouteOverlay(commitOverlay)
+	}
+
 	// 2. Apply dataplane config through the runtime config sink.
 	var applyResult *dataplane.ApplyResult
 	if d.dp != nil {
@@ -720,75 +732,15 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 		}
 	}
 
-	// 3. Apply all routes + dynamic protocols via FRR
+	// 3. Apply all routes + dynamic protocols via FRR.
+	// assembleFRRConfig is the SOLE frr.FullConfig constructor, shared
+	// with the ip-monitoring routes-only actuator (#1827) — the full
+	// apply consumes the same (config-filtered) overlay computed in
+	// step 1.95, so an operator commit while a policy is FAILED
+	// preserves a still-valid injected failover route and drops
+	// removed/edited entries on the commit itself.
 	if d.frr != nil {
-		// Collect interface bandwidths and point-to-point flags for FRR.
-		ifaceBandwidths := make(map[string]uint64)
-		ifaceP2P := make(map[string]bool)
-		for name, ifc := range cfg.Interfaces.Interfaces {
-			linuxName := config.LinuxIfName(name)
-			if ifc.Bandwidth > 0 {
-				ifaceBandwidths[linuxName] = ifc.Bandwidth
-			}
-			for _, unit := range ifc.Units {
-				if unit.PointToPoint {
-					ifaceP2P[linuxName] = true
-				}
-			}
-		}
-
-		fc := &frr.FullConfig{
-			OSPF:                  cfg.Protocols.OSPF,
-			OSPFv3:                cfg.Protocols.OSPFv3,
-			BGP:                   cfg.Protocols.BGP,
-			RIP:                   cfg.Protocols.RIP,
-			ISIS:                  cfg.Protocols.ISIS,
-			StaticRoutes:          cfg.RoutingOptions.StaticRoutes,
-			Inet6StaticRoutes:     cfg.RoutingOptions.Inet6StaticRoutes,
-			GenerateRoutes:        cfg.RoutingOptions.GenerateRoutes,
-			DHCPRoutes:            d.collectDHCPRoutes(),
-			PolicyOptions:         &cfg.PolicyOptions,
-			ForwardingTableExport: cfg.RoutingOptions.ForwardingTableExport,
-			BackupRouter:          cfg.System.BackupRouter,
-			BackupRouterDst:       cfg.System.BackupRouterDst,
-			InterfaceBandwidths:   ifaceBandwidths,
-			InterfacePointToPoint: ifaceP2P,
-			RethMap:               cfg.RethToPhysical(),
-			IPv6NextHopInterfaces: inferIPv6StaticNextHopInterfaces(cfg),
-			ClusterMode:           d.cluster != nil,
-		}
-		for _, ri := range cfg.RoutingInstances {
-			vrfName := "vrf-" + ri.Name
-			if ri.InstanceType == "forwarding" {
-				vrfName = "" // forwarding instances use the default table
-			}
-			fc.Instances = append(fc.Instances, frr.InstanceConfig{
-				VRFName:           vrfName,
-				OSPF:              ri.OSPF,
-				OSPFv3:            ri.OSPFv3,
-				BGP:               ri.BGP,
-				RIP:               ri.RIP,
-				ISIS:              ri.ISIS,
-				StaticRoutes:      ri.StaticRoutes,
-				Inet6StaticRoutes: ri.Inet6StaticRoutes,
-			})
-		}
-		if err := d.frr.ApplyFull(fc); err != nil {
-			slog.Warn("failed to apply FRR config", "err", err)
-		}
-
-		// Set L4 ECMP hash when consistent-hash is configured.
-		if fc.ConsistentHash {
-			path := "/proc/sys/net/ipv4/fib_multipath_hash_policy"
-			current, _ := os.ReadFile(path)
-			if strings.TrimSpace(string(current)) != "1" {
-				if err := os.WriteFile(path, []byte("1\n"), 0644); err != nil {
-					slog.Warn("failed to set fib_multipath_hash_policy", "err", err)
-				} else {
-					slog.Info("enabled L4 ECMP hashing (consistent-hash)")
-				}
-			}
-		}
+		d.applyFRRConfig(d.assembleFRRConfig(cfg, commitOverlay))
 	}
 
 	// 3b. Apply next-table policy routing rules (ip rule)
@@ -1007,6 +959,17 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 	if d.eventEngine != nil {
 		d.eventEngine.Apply(cfg.EventOptions)
 	}
+
+	// 17b. Reconcile RPM probes (#1827 PR-1a). Config-hash-gated: the
+	// probe set (and the probe next-hop pin rules) is re-applied only
+	// when the rendered RPM stanza actually changed, so unrelated
+	// commits never wipe probe state.
+	d.reconcileRPM(cfg)
+
+	// 17c. Reconcile the ip-monitoring engine (#1827 PR-1b): install
+	// the committed policy set (preserving FAIL state across unrelated
+	// commits) and seed it with current probe results.
+	d.reconcileIPMon(cfg)
 
 	// 18. Update chassis cluster interface monitors
 	if d.routing != nil && cfg.Chassis.Cluster != nil &&

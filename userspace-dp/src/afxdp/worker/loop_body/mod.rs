@@ -634,6 +634,7 @@ pub(crate) fn worker_loop(
             cos_status.store(Arc::new(build_worker_cos_statuses(
                 &bindings,
                 forwarding.as_ref(),
+                loop_now_ns,
             )));
             last_cos_status_ns = loop_now_ns;
         }
@@ -1028,6 +1029,7 @@ pub(crate) fn worker_loop(
     cos_status.store(Arc::new(build_worker_cos_statuses(
         &bindings,
         forwarding.as_ref(),
+        monotonic_nanos(),
     )));
     heartbeat.store(monotonic_nanos(), Ordering::Relaxed);
 }

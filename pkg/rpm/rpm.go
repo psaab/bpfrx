@@ -3,6 +3,7 @@ package rpm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -13,23 +14,51 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/routing"
 	"golang.org/x/sys/unix"
 )
 
-// vrfDialer returns a net.Dialer bound to a VRF device via SO_BINDTODEVICE.
-// The VRF device name is "vrf-" + routing instance name.
-func vrfDialer(timeout time.Duration, sourceAddr string, vrfDevice string) *net.Dialer {
+// probeDialer returns a net.Dialer carrying the per-test socket options:
+// optional source address, SO_BINDTODEVICE (destination-interface, or
+// the "vrf-"+instance VRF device fallback), and SO_MARK for
+// next-hop-pinned tests (#1827).
+func probeDialer(timeout time.Duration, sourceAddr string, opts probeSockOpts) *net.Dialer {
 	d := &net.Dialer{Timeout: timeout}
 	if sourceAddr != "" {
 		d.LocalAddr = &net.TCPAddr{IP: net.ParseIP(sourceAddr)}
 	}
-	if vrfDevice != "" {
+	if opts.BindDevice != "" || opts.Mark != 0 {
 		d.Control = func(network, address string, c syscall.RawConn) error {
-			var err error
-			c.Control(func(fd uintptr) {
-				err = unix.SetsockoptString(int(fd), syscall.SOL_SOCKET,
-					syscall.SO_BINDTODEVICE, vrfDevice)
+			var cerr error
+			err := c.Control(func(fd uintptr) {
+				if opts.BindDevice != "" {
+					cerr = unix.SetsockoptString(int(fd), syscall.SOL_SOCKET,
+						syscall.SO_BINDTODEVICE, opts.BindDevice)
+					if cerr != nil {
+						return
+					}
+				}
+				if opts.Mark != 0 {
+					cerr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET,
+						unix.SO_MARK, int(opts.Mark))
+				}
 			})
+			if err != nil {
+				err = fmt.Errorf("%w: socket control: %v", ErrProbeSetup, err)
+			} else if cerr != nil {
+				// Socket-option failures (SO_BINDTODEVICE EPERM/ENODEV,
+				// SO_MARK EPERM) are environment/capability errors, not
+				// path health: mark them ErrProbeSetup so tcp-ping and
+				// http-get hold state exactly like icmp-ping (Codex PR
+				// #1843 HIGH-2). The sentinel survives the net.OpError /
+				// url.Error wrapping on the dial path, so the probe
+				// loop's errors.Is check catches it for all three probe
+				// types. Genuine dial outcomes (refused, timeout,
+				// unreachable) never pass through this callback and stay
+				// path signals — ambiguous dial errnos deliberately
+				// default to PATH (conservative for detection).
+				err = fmt.Errorf("%w: socket option: %v", ErrProbeSetup, cerr)
+			}
 			return err
 		}
 	}
@@ -72,13 +101,42 @@ type Event struct {
 // EventCallback is called when RPM probes generate events.
 type EventCallback func(Event)
 
+// Transition reports a per-test pass/fail status transition together
+// with a current-state snapshot of all probe results (#1827 PR-1a §4.2
+// item 6). It is the sensor input for the ip-monitoring engine; the
+// coarser Event/EventCallback surface stays intact for eventengine.
+type Transition struct {
+	ProbeName string
+	TestName  string
+	Status    string // new status: "pass" or "fail"
+	Results   []*ProbeResult
+}
+
+// TransitionCallback is called on per-test status transitions.
+type TransitionCallback func(Transition)
+
 // Manager runs RPM probes and tracks their results.
 type Manager struct {
-	mu      sync.RWMutex
-	results map[string]*ProbeResult // key: "probe/test"
-	cancel  context.CancelFunc
-	wg      sync.WaitGroup
-	onEvent EventCallback
+	mu           sync.RWMutex
+	results      map[string]*ProbeResult // key: "probe/test"
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
+	onEvent      EventCallback
+	onTransition TransitionCallback
+
+	// rethMap translates Junos RETH names to physical members for
+	// destination-interface resolution (set by the daemon in cluster
+	// mode before Apply).
+	rethMap map[string]string
+
+	// marks maps "probe/test" to the probe fwmark for next-hop-pinned
+	// tests, derived in Apply from the same deterministic assignment
+	// pkg/routing programs (routing.BuildProbePins).
+	marks map[string]uint32
+
+	// icmpListen is the injectable raw-socket seam for the ICMP echo
+	// prober. nil = realICMPListen.
+	icmpListen icmpListenFunc
 }
 
 // SetEventCallback registers a callback for RPM events.
@@ -88,12 +146,42 @@ func (m *Manager) SetEventCallback(fn EventCallback) {
 	m.onEvent = fn
 }
 
+// SetTransitionCallback registers a callback for per-test pass/fail
+// status transitions.
+func (m *Manager) SetTransitionCallback(fn TransitionCallback) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onTransition = fn
+}
+
+// SetRethMap supplies the RETH → physical member translation used when
+// resolving destination-interface names. Call before Apply.
+func (m *Manager) SetRethMap(rethMap map[string]string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rethMap = rethMap
+}
+
 func (m *Manager) fireEvent(name, owner, testName string) {
 	m.mu.RLock()
 	fn := m.onEvent
 	m.mu.RUnlock()
 	if fn != nil {
 		fn(Event{Name: name, TestOwner: owner, TestName: testName})
+	}
+}
+
+func (m *Manager) fireTransition(owner, testName, status string) {
+	m.mu.RLock()
+	fn := m.onTransition
+	m.mu.RUnlock()
+	if fn != nil {
+		fn(Transition{
+			ProbeName: owner,
+			TestName:  testName,
+			Status:    status,
+			Results:   m.Results(),
+		})
 	}
 }
 
@@ -111,6 +199,16 @@ func (m *Manager) Apply(ctx context.Context, cfg *config.RPMConfig) {
 	if cfg == nil || len(cfg.Probes) == 0 {
 		return
 	}
+
+	// Derive the per-test fwmark assignment from the SAME deterministic
+	// function pkg/routing uses to program the pin rules, so socket
+	// SO_MARK and kernel fwmark rule can never disagree (#1827).
+	m.mu.Lock()
+	m.marks = make(map[string]uint32)
+	for _, pin := range routing.BuildProbePins(cfg, m.rethMap) {
+		m.marks[pin.TestKey] = pin.Mark
+	}
+	m.mu.Unlock()
 
 	probeCtx, cancel := context.WithCancel(ctx)
 	m.cancel = cancel
@@ -199,6 +297,7 @@ func (m *Manager) runProbeLoop(ctx context.Context, probe *config.RPMProbe, test
 func (m *Manager) runSingleTest(ctx context.Context, probeName string, test *config.RPMTest, key string, probeCount int, probeInterval time.Duration, threshold int) {
 	var successes, failures int
 	probeLimit := test.ProbeLimit // 0 = unlimited
+	setupWarned := false
 
 	for i := 0; i < probeCount; i++ {
 		if i > 0 {
@@ -209,7 +308,24 @@ func (m *Manager) runSingleTest(ctx context.Context, probeName string, test *con
 			}
 		}
 
-		rtt, err := m.executeProbe(ctx, test)
+		rtt, err := m.executeProbe(ctx, test, key)
+
+		// ErrProbeSetup = environment/capability failure (raw socket
+		// open denied, marshal): the probe never reached the wire, so
+		// it carries NO path-health signal. Hold the test's current
+		// state completely — no counters, no status change, no
+		// events, no Transition — so ip-monitoring can never actuate
+		// routes off a capability regression (AGY PR #1843 F2). Log
+		// loudly but rate-limited (once per test cycle, i.e. at most
+		// once per test-interval).
+		if errors.Is(err, ErrProbeSetup) {
+			if !setupWarned {
+				setupWarned = true
+				slog.Warn("RPM probe setup failed — holding test state (environment error, not path health)",
+					"probe", probeName, "test", test.Name, "err", err)
+			}
+			continue
+		}
 
 		m.mu.Lock()
 		r := m.results[key]
@@ -234,6 +350,7 @@ func (m *Manager) runSingleTest(ctx context.Context, probeName string, test *con
 			// Fire test-level failure on transition
 			if r.SuccFail == threshold && prevStatus != "fail" {
 				m.fireEvent("ping_test_failed", probeName, test.Name)
+				m.fireTransition(probeName, test.Name, "fail")
 			}
 			if hitLimit {
 				break
@@ -269,6 +386,9 @@ func (m *Manager) runSingleTest(ctx context.Context, probeName string, test *con
 			r.SuccFail = 0
 			r.LastStatus = "pass"
 			m.mu.Unlock()
+			if prevStatus != "pass" {
+				m.fireTransition(probeName, test.Name, "pass")
+			}
 		}
 	}
 
@@ -278,44 +398,41 @@ func (m *Manager) runSingleTest(ctx context.Context, probeName string, test *con
 	}
 }
 
-func (m *Manager) executeProbe(ctx context.Context, test *config.RPMTest) (time.Duration, error) {
+// probeOpts derives the per-test socket options: destination-interface
+// (resolved through the RETH map) takes precedence over the
+// routing-instance VRF device for SO_BINDTODEVICE; next-hop-pinned
+// tests carry their probe fwmark for SO_MARK.
+func (m *Manager) probeOpts(test *config.RPMTest, key string) probeSockOpts {
+	m.mu.RLock()
+	mark := m.marks[key]
+	rethMap := m.rethMap
+	m.mu.RUnlock()
+
+	bindDev := routing.ResolveProbeInterface(test.DestinationInterface, rethMap)
+	if bindDev == "" {
+		bindDev = vrfDeviceName(test.RoutingInstance)
+	}
+	return probeSockOpts{BindDevice: bindDev, Mark: mark}
+}
+
+func (m *Manager) executeProbe(ctx context.Context, test *config.RPMTest, key string) (time.Duration, error) {
+	opts := m.probeOpts(test, key)
 	switch test.EffectiveProbeType() {
 	case "icmp-ping":
-		return m.probeICMP(ctx, test)
+		return m.probeICMP(ctx, test, opts)
 	case "tcp-ping":
-		return m.probeTCP(ctx, test)
+		return m.probeTCP(ctx, test, opts)
 	case "http-get":
-		return m.probeHTTP(ctx, test)
+		return m.probeHTTP(ctx, test, opts)
 	default:
-		return m.probeICMP(ctx, test)
+		return m.probeICMP(ctx, test, opts)
 	}
 }
 
-func (m *Manager) probeICMP(ctx context.Context, test *config.RPMTest) (time.Duration, error) {
-	// Use TCP dial to port 7 (echo) as a simple reachability check.
-	// Full ICMP requires raw sockets (CAP_NET_RAW); TCP connect is a
-	// reasonable proxy that works without elevated privileges.
-	target := test.Target
-	start := time.Now()
-	dialer := vrfDialer(3*time.Second, test.SourceAddress, vrfDeviceName(test.RoutingInstance))
-	conn, err := dialer.DialContext(ctx, "ip4:icmp", target)
-	if err != nil {
-		// Fallback: try UDP dial which succeeds if host is reachable
-		conn2, err2 := dialer.DialContext(ctx, "udp4", net.JoinHostPort(target, "33434"))
-		if err2 != nil {
-			return 0, fmt.Errorf("probe failed: %w", err)
-		}
-		conn2.Close()
-		return time.Since(start), nil
-	}
-	conn.Close()
-	return time.Since(start), nil
-}
-
-func (m *Manager) probeTCP(ctx context.Context, test *config.RPMTest) (time.Duration, error) {
+func (m *Manager) probeTCP(ctx context.Context, test *config.RPMTest, opts probeSockOpts) (time.Duration, error) {
 	port := test.EffectiveDestinationPort()
 	addr := net.JoinHostPort(test.Target, fmt.Sprintf("%d", port))
-	dialer := vrfDialer(5*time.Second, test.SourceAddress, vrfDeviceName(test.RoutingInstance))
+	dialer := probeDialer(5*time.Second, test.SourceAddress, opts)
 
 	start := time.Now()
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
@@ -327,7 +444,7 @@ func (m *Manager) probeTCP(ctx context.Context, test *config.RPMTest) (time.Dura
 	return rtt, nil
 }
 
-func (m *Manager) probeHTTP(ctx context.Context, test *config.RPMTest) (time.Duration, error) {
+func (m *Manager) probeHTTP(ctx context.Context, test *config.RPMTest, opts probeSockOpts) (time.Duration, error) {
 	target := test.Target
 	if target == "" {
 		return 0, fmt.Errorf("no target specified")
@@ -338,7 +455,7 @@ func (m *Manager) probeHTTP(ctx context.Context, test *config.RPMTest) (time.Dur
 		url = "http://" + target
 	}
 
-	dialer := vrfDialer(10*time.Second, test.SourceAddress, vrfDeviceName(test.RoutingInstance))
+	dialer := probeDialer(10*time.Second, test.SourceAddress, opts)
 	transport := &http.Transport{
 		DialContext: dialer.DialContext,
 	}

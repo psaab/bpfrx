@@ -82,6 +82,7 @@ pub(super) fn enqueue_syn_cookie_reply(
         cos_queue_id: None,
         dscp_rewrite: None,
         mirror_clone: false,
+        enqueue_ns: 0,
     });
     counters.touched = true;
     sent_counter(counters);
@@ -103,6 +104,7 @@ mod tests {
             cos_queue_id: None,
             dscp_rewrite: None,
             mirror_clone: false,
+            enqueue_ns: 0,
         }
     }
 

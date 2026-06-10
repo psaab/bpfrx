@@ -324,6 +324,7 @@ pub(super) fn stage_flow_cache_hit(
                         cos_queue_id: cached_queue_id,
                         dscp_rewrite: cached_dscp_rewrite,
                         mirror_clone: false,
+                        enqueue_ns: 0,
                     });
                     tx_counters.pending_in_place_tx_packets += 1;
                     tx_counters.record_in_place_l2_rewrite(rewrite_result.l2_rewrite);

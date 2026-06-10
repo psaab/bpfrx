@@ -75,6 +75,13 @@ type cosQueueView struct {
 	waterfillPhase1Admissions uint64
 	waterfillPhase2Admissions uint64
 	waterfillEligibleVisits   uint64
+	// #1829 Phase 1: dequeue-time sojourn telemetry (queue-scoped,
+	// MAX-merged across workers). Rendered only once the queue has
+	// recorded at least one sample (peak > 0) so idle queues stay
+	// clean. windowedMin is the standing-queue gate metric.
+	sojournEwmaNS        uint64
+	sojournPeakNS        uint64
+	sojournWindowedMinNS uint64
 }
 
 func FormatCoSInterfaceSummary(cfg *config.Config, status *ProcessStatus, selector string) string {
@@ -241,6 +248,19 @@ func FormatCoSInterfaceSummary(cfg *config.Config, status *ProcessStatus, select
 				queue.admissionBufferDrops,
 				queue.admissionEcnMarked,
 			)
+			// #1829 Phase 1: dequeue-time sojourn line, shown once
+			// the queue has recorded at least one sample. win_min is
+			// the windowed (100 ms two-bucket) MINIMUM — the
+			// standing-queue gate metric; 0 means "no standing queue
+			// in the last ~2 windows". ewma/peak are supporting
+			// context (biased high by scheduler service gaps).
+			if queue.sojournPeakNS > 0 {
+				fmt.Fprintf(&b, "           Sojourn: win_min=%s  ewma=%s  peak=%s\n",
+					formatSojournNS(queue.sojournWindowedMinNS),
+					formatSojournNS(queue.sojournEwmaNS),
+					formatSojournNS(queue.sojournPeakNS),
+				)
+			}
 			// #915: surplus-sharing visibility. Rendered only on exact
 			// queues so non-exact queues (which already participate in
 			// surplus by default) stay clean. Operators debugging an
@@ -677,6 +697,10 @@ func buildCoSQueueViews(cfg *config.Config, view cosInterfaceView) []cosQueueVie
 			qv.equalFlowSuppressedGrantBytes = runtimeQueue.EqualFlowSuppressedGrantBytes
 			qv.equalFlowFailOpenReason = runtimeQueue.EqualFlowFailOpenReason
 			// #1628 copy-through; rendered only when non-zero.
+			// #1829 copy-through; rendered only when peak > 0.
+			qv.sojournEwmaNS = runtimeQueue.SojournEwmaNS
+			qv.sojournPeakNS = runtimeQueue.SojournPeakNS
+			qv.sojournWindowedMinNS = runtimeQueue.SojournWindowedMinNS
 			qv.waterfillPhase1Admissions = runtimeQueue.WaterfillPhase1Admissions
 			qv.waterfillPhase2Admissions = runtimeQueue.WaterfillPhase2Admissions
 			qv.waterfillEligibleVisits = runtimeQueue.WaterfillEligibleVisits
@@ -787,6 +811,22 @@ func formatWakeTick(tick uint64) string {
 		return "-"
 	}
 	return fmt.Sprintf("%d", tick)
+}
+
+// formatSojournNS renders a nanosecond sojourn reading at operator
+// scale: sub-microsecond values in ns, sub-millisecond in µs, else
+// ms with one decimal (#1829).
+func formatSojournNS(ns uint64) string {
+	switch {
+	case ns == 0:
+		return "0"
+	case ns < 1_000:
+		return fmt.Sprintf("%dns", ns)
+	case ns < 1_000_000:
+		return fmt.Sprintf("%.1fus", float64(ns)/1_000)
+	default:
+		return fmt.Sprintf("%.1fms", float64(ns)/1_000_000)
+	}
 }
 
 func emptyDash(value string) string {

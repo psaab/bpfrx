@@ -28,6 +28,7 @@ which makes each domain unit-testable with a fake (see `rules_test.go`'s
 | `tunnel.go` | `tunnelManager` | GRE/IPIP tunnels + keepalive goroutines; own `mu` |
 | `xfrm.go` | `xfrmManager` | XFRM/IPsec interface lifecycle; own `mu` |
 | `rules.go` | `nextTableManager` / `ribGroupManager` / `pbrManager` | policy-routing ip-rule reconcilers (`ruleOps`, stateless) |
+| `probe_pin.go` | `probePinManager` | RPM probe next-hop pin reconciler (#1827): fwmark rules in band 50-99 + pinned host routes in reserved tables 7000-7049 (`probePinOps`, stateless) |
 | `bond.go` | `bondManager` | bond device lifecycle; own `mu` |
 | `reth.go` | `rethManager` | stale `reth*` bond cleanup |
 | `monitor.go` | `monitorManager` | interface-monitor HA signal; own `mu` |
@@ -60,6 +61,12 @@ delegate to the owning domain. Exported types:
 
 ## ip-rule priorities
 
+- `50–99`: RPM probe next-hop pins (`fwmark <mark> lookup <table>`,
+  #1827). Constants live in `pkg/config` (`ProbeRulePriorityBase`,
+  `ProbeTableBase` 7000-7049, `ProbeFwmarkBase` 0x1000) because
+  `pkg/config` commit validation, this package, and `pkg/rpm` all
+  consume them. Cleared on daemon startup (`ClearProbePins`) so a
+  crashed daemon never leaks pins.
 - `100–199`: next-table inter-VRF leaking (static routes with
   `next-table` directive). `nextTableRulePriority` in `rules.go`.
 - `31000–31999`: PBR (firewall-filter `routing-instance` action).

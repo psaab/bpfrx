@@ -234,6 +234,31 @@ func renderBackupRouter(b *strings.Builder, fc *FullConfig) {
 	b.WriteString("!\n")
 }
 
+// renderPreferredRoutes emits the ip-monitoring effective-route overlay
+// (#1827 PR-1b) as DISTANCE-1 statics — Static/1 on SRX — into the
+// master table or the entry's routing-instance VRF. The overlay is
+// already winner-resolved (one entry per (instance, prefix), pkg/ipmon
+// §4.1), so emission is mechanical. Reuses generateStaticRoute so RETH
+// name translation behaves exactly like configured statics.
+func (m *Manager) renderPreferredRoutes(b *strings.Builder, fc *FullConfig) {
+	if len(fc.PreferredRoutes) == 0 {
+		return
+	}
+	for _, entry := range fc.PreferredRoutes {
+		vrfName := ""
+		if entry.RoutingInstance != "" {
+			vrfName = "vrf-" + entry.RoutingInstance
+		}
+		sr := &config.StaticRoute{
+			Destination: entry.Destination,
+			Preference:  1,
+			NextHops:    []config.NextHopEntry{{Address: entry.NextHop}},
+		}
+		b.WriteString(m.generateStaticRoute(sr, vrfName, fc.RethMap, fc.IPv6NextHopInterfaces))
+	}
+	b.WriteString("!\n")
+}
+
 // renderClusterModeDefaults emits cluster-mode blackhole default routes
 // (admin distance 250) for both address families. When the WAN VIP moves to
 // the peer and FRR withdraws the real default, this blackhole makes

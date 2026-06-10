@@ -2107,7 +2107,7 @@ func TestBuildRouteSnapshotsNormalizesFamilyFromDestination(t *testing.T) {
 			},
 		},
 	}
-	routes := buildRouteSnapshots(cfg, nil)
+	routes := buildRouteSnapshots(cfg, nil, nil)
 	if len(routes) != 2 {
 		t.Fatalf("len(routes) = %d, want 2", len(routes))
 	}
@@ -2129,7 +2129,7 @@ func TestBuildRouteSnapshotsIncludesConnectedPrefixes(t *testing.T) {
 				{Family: "inet6", Address: "fe80::1/64", Scope: int(netlink.SCOPE_LINK)},
 			},
 		},
-	})
+	}, nil)
 	if len(routes) != 2 {
 		t.Fatalf("len(routes) = %d, want 2", len(routes))
 	}

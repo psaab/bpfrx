@@ -555,6 +555,7 @@ fn normalize_cos_queue_state_repairs_nonempty_unparked_queue_to_runnable() {
             drop_counters: CoSQueueDropCounters::default(),
             waterfill_counters: CoSQueueWaterfillCounters::default(),
             owner_profile: CoSQueueOwnerProfile::new(),
+            sojourn: crate::afxdp::types::CoSQueueSojourn::default(),
         },
         queue_lease_v8: None,
     };

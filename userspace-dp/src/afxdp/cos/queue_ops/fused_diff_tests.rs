@@ -74,6 +74,7 @@ fn flow_item(src_port: u16, len: usize) -> CoSPendingTxItem {
         cos_queue_id: Some(4),
         dscp_rewrite: None,
         mirror_clone: false,
+        enqueue_ns: 0,
     })
 }
 

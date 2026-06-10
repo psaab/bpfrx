@@ -248,6 +248,25 @@ func newCollector(srv *Server) *xpfCollector {
 				"when config persistence is healthy.",
 			nil, nil,
 		),
+		ipmonPolicyFailed: prometheus.NewDesc(
+			"xpf_ipmon_policy_failed",
+			"1 while the services ip-monitoring policy is in FAIL state "+
+				"(preferred routes injected); 0 while passing (#1827).",
+			[]string{"policy"}, nil,
+		),
+		ipmonPolicyTransitions: prometheus.NewDesc(
+			"xpf_ipmon_policy_transitions_total",
+			"Total FAIL/recover state transitions of the services "+
+				"ip-monitoring policy (#1827). A steadily climbing value "+
+				"indicates a flapping uplink; consider a non-zero hold-down.",
+			[]string{"policy"}, nil,
+		),
+		ipmonRoutesApplied: prometheus.NewDesc(
+			"xpf_ipmon_routes_applied",
+			"Number of ip-monitoring preferred routes currently applied "+
+				"(after winner resolution, #1827).",
+			nil, nil,
+		),
 
 		// #709: owner-profile telemetry. Labels:
 		//   ifindex:      interface ifindex as string
@@ -366,6 +385,25 @@ func newCollector(srv *Server) *xpfCollector {
 			"xpf_userspace_cos_equal_flow_fail_open",
 			"1 for the current bounded fail-open reason on an opt-in shared v8 equal-flow queue; absent for queues without equal-flow enforcement (#1304).",
 			[]string{"ifindex", "queue_id", "reason"}, nil,
+		),
+		// #1829 Phase 1: dequeue-time sojourn gauges, MAX-merged
+		// across worker instances and across workers (worst
+		// instance). The windowed-min gauge is the #1829 Phase-2
+		// gate metric.
+		cosSojournEwmaNS: prometheus.NewDesc(
+			"xpf_userspace_cos_sojourn_ewma_ns",
+			"Shift-add EWMA (alpha=1/8) of per-packet queue sojourn measured at dequeue on this CoS queue, ns, MAX-merged across workers. Supporting context only — biased high by scheduler service gaps; gate standing-queue decisions on xpf_userspace_cos_sojourn_windowed_min_ns instead (#1829).",
+			[]string{"ifindex", "queue_id"}, nil,
+		),
+		cosSojournPeakNS: prometheus.NewDesc(
+			"xpf_userspace_cos_sojourn_peak_ns",
+			"Lifetime maximum per-packet queue sojourn measured at dequeue on this CoS queue, ns, MAX-merged across workers (#1829).",
+			[]string{"ifindex", "queue_id"}, nil,
+		),
+		cosSojournWindowedMinNS: prometheus.NewDesc(
+			"xpf_userspace_cos_sojourn_windowed_min_ns",
+			"Minimum per-packet queue sojourn over the last 1-2 100 ms windows on this CoS queue, ns, MAX-merged across workers (worst instance). CoDel's standing-queue estimator and the #1829 Phase-2 gate metric: a value persistently above codel-target is standing-queue evidence; 0 means no pops in the last ~2 windows (no standing queue).",
+			[]string{"ifindex", "queue_id"}, nil,
 		),
 		// #1830 (g): bucket-vs-flow occupancy gauges. The ratio
 		// flows_active / buckets_occupied is meaningful only while the

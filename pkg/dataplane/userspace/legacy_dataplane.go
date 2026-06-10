@@ -199,6 +199,26 @@ func (a *LegacyDataPlaneAdapter) SetPolicySchedulerActiveState(activeState map[s
 	m.SetPolicySchedulerActiveState(activeState)
 }
 
+// SetRouteOverlay forwards the ip-monitoring overlay cache (#1827).
+func (a *LegacyDataPlaneAdapter) SetRouteOverlay(overlay []config.RouteOverlayEntry) {
+	m, err := a.managerOrErr()
+	if err != nil {
+		return
+	}
+	m.SetRouteOverlay(overlay)
+}
+
+// PublishRouteOverlaySnapshot forwards the routes-only partial
+// republish (#1827). Returns whether a snapshot was actually
+// published (duplicate-skips and helperless caching return false).
+func (a *LegacyDataPlaneAdapter) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []config.RouteOverlayEntry, schedulerState map[string]bool) (bool, error) {
+	m, err := a.managerOrErr()
+	if err != nil {
+		return false, err
+	}
+	return m.PublishRouteOverlaySnapshot(cfg, overlay, schedulerState)
+}
+
 func (a *LegacyDataPlaneAdapter) BumpFIBGeneration() uint32 {
 	m, err := a.managerOrErr()
 	if err != nil {
@@ -525,4 +545,3 @@ func (a *LegacyDataPlaneAdapter) IterateSessionsV6From(cursor *dataplane.Session
 	}
 	return ErrCursorIterationUnsupported
 }
-

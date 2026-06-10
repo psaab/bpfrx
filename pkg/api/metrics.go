@@ -86,6 +86,11 @@ type xpfCollector struct {
 	// yet succeeded (restart would load a stale config).
 	configPersistDegraded *prometheus.Desc
 
+	// #1827: services ip-monitoring observability.
+	ipmonPolicyFailed      *prometheus.Desc
+	ipmonPolicyTransitions *prometheus.Desc
+	ipmonRoutesApplied     *prometheus.Desc
+
 	// #709: CoS owner-profile telemetry (userspace dataplane only).
 	// Cardinality estimate per plan §5: num_queues (≤ 64) × num_interfaces
 	// (≤ 8) × DRAIN_HIST_BUCKETS (16) = ≤ 8192 series for each of the
@@ -123,6 +128,11 @@ type xpfCollector struct {
 	cosEqualFlowSuppressedGrantBytes     *prometheus.Desc
 	cosEqualFlowStaleOrTagMismatchEvents *prometheus.Desc
 	cosEqualFlowFailOpen                 *prometheus.Desc
+	// #1829 Phase 1: dequeue-time sojourn gauges. The windowed-min
+	// gauge is the Phase-2 gate metric (standing-queue estimator).
+	cosSojournEwmaNS        *prometheus.Desc
+	cosSojournPeakNS        *prometheus.Desc
+	cosSojournWindowedMinNS *prometheus.Desc
 	// #1830 (g): bucket-vs-flow occupancy gauges for flow-fair CoS
 	// queues (collision-vs-demand unfairness diagnosis).
 	cosFlowFairBucketsOccupied *prometheus.Desc
@@ -331,6 +341,9 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.daemonMemRSS
 	ch <- c.neighborPeriodicAge
 	ch <- c.configPersistDegraded
+	ch <- c.ipmonPolicyFailed
+	ch <- c.ipmonPolicyTransitions
+	ch <- c.ipmonRoutesApplied
 	ch <- c.cosDrainLatencyBucket
 	ch <- c.cosDrainInvocationsTotal
 	ch <- c.cosRedirectAcquireBucket
@@ -353,6 +366,9 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.cosEqualFlowSuppressedGrantBytes
 	ch <- c.cosEqualFlowStaleOrTagMismatchEvents
 	ch <- c.cosEqualFlowFailOpen
+	ch <- c.cosSojournEwmaNS
+	ch <- c.cosSojournPeakNS
+	ch <- c.cosSojournWindowedMinNS
 	ch <- c.cosFlowFairBucketsOccupied
 	ch <- c.cosFlowFairFlowsActive
 	ch <- c.workerWallSecs

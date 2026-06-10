@@ -22,6 +22,16 @@ pub(in crate::afxdp) struct TxRequest {
     pub(in crate::afxdp) cos_queue_id: Option<u8>,
     pub(in crate::afxdp) dscp_rewrite: Option<u8>,
     pub(in crate::afxdp) mirror_clone: bool,
+    /// #1829 Phase 1: CoS enqueue timestamp (pass-level `now_ns`),
+    /// stamped ONCE at the single CoS admission choke point
+    /// (`enqueue_cos_item`). 0 means "never CoS-enqueued" (direct TX
+    /// paths, test constructors, pre-upgrade items) and the sojourn
+    /// recorder treats 0 as "no data" — a zero timestamp can never
+    /// produce a bogus huge sojourn. Preserved across
+    /// `into_prepared_request` / `to_local_request` conversions and
+    /// across pop→push_front rollbacks, so retried items keep their
+    /// ORIGINAL enqueue time (correct for sojourn measurement).
+    pub(in crate::afxdp) enqueue_ns: u64,
 }
 
 impl TxRequest {
@@ -43,6 +53,7 @@ impl TxRequest {
             cos_queue_id: self.cos_queue_id,
             dscp_rewrite: self.dscp_rewrite,
             mirror_clone: self.mirror_clone,
+            enqueue_ns: self.enqueue_ns,
         }
     }
 }
@@ -91,6 +102,10 @@ pub(in crate::afxdp) struct PreparedTxRequest {
     pub(in crate::afxdp) cos_queue_id: Option<u8>,
     pub(in crate::afxdp) dscp_rewrite: Option<u8>,
     pub(in crate::afxdp) mirror_clone: bool,
+    /// #1829 Phase 1: CoS enqueue timestamp. Same contract as
+    /// `TxRequest::enqueue_ns` (0 = never CoS-enqueued / no data);
+    /// see the field doc there.
+    pub(in crate::afxdp) enqueue_ns: u64,
 }
 
 impl PreparedTxRequest {
@@ -106,6 +121,7 @@ impl PreparedTxRequest {
             cos_queue_id: self.cos_queue_id,
             dscp_rewrite: self.dscp_rewrite,
             mirror_clone: self.mirror_clone,
+            enqueue_ns: self.enqueue_ns,
         }
     }
 }
@@ -182,3 +198,4 @@ pub(in crate::afxdp) struct LocalTunnelTxPlan {
     pub(in crate::afxdp) session_entry: SyncedSessionEntry,
     pub(in crate::afxdp) reverse_session_entry: Option<SyncedSessionEntry>,
 }
+

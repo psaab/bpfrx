@@ -10,11 +10,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 
+	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/conntrack"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/dhcp"
+	"github.com/psaab/xpf/pkg/ipmon"
 )
 
 // #1726: whole-collector Prometheus descriptor-coverage canary.
@@ -182,6 +184,10 @@ func populatedCoverageStatus() dpuserspace.ProcessStatus {
 				EqualFlowSuppressedGrantBytes:              64,
 				EqualFlowStaleOrTagMismatchEvents:          0,
 				EqualFlowFailOpenReason:                    "",
+				// #1829 Phase 1: dequeue-time sojourn gauges.
+				SojournEwmaNS:        2500000,
+				SojournPeakNS:        9000000,
+				SojournWindowedMinNS: 1750000,
 				// #1830 (g): bucket-vs-flow occupancy gauges.
 				FlowFairBucketsOccupied: 6,
 				FlowFairFlowsActive:     8,
@@ -351,6 +357,20 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 				"warm":         4.0,
 			}
 		},
+		// #1827: wire a non-nil ip-monitoring status source so the
+		// xpf_ipmon_* family emits and the canary covers its
+		// descriptor declarations.
+		ipmonStatusFn: func() []ipmon.PolicyStatus {
+			return []ipmon.PolicyStatus{{
+				Name:        "wan-failover",
+				Probe:       "WAN",
+				Failed:      true,
+				Transitions: 3,
+				Routes: []config.RouteOverlayEntry{
+					{Destination: "0.0.0.0/0", NextHop: "172.16.80.1", Policy: "wan-failover"},
+				},
+			}}
+		},
 	}
 	// dhcp.New opens a netlink handle, which a restricted sandbox may
 	// refuse ("operation not permitted"). The DHCP family is one of many;
@@ -419,6 +439,7 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 		"xpf_sessions_active",                                        // collectSessionGauges
 		"xpf_daemon_uptime_seconds",                                  // collectSystemMetrics
 		"xpf_daemon_neighbor_periodic_last_success_age_seconds",      // #1780 neighbor watchdog
+		"xpf_ipmon_policy_failed",                                    // #1827 ip-monitoring
 		"xpf_userspace_worker_dead",                                  // emitWorkerRuntime
 		"xpf_userspace_worker_cold_path_samples_v3_total",            // cold-path v3
 		"xpf_cos_drain_invocations_total",                            // CoS owner profile
@@ -446,6 +467,10 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 		// #1831: per-binding V_min fairness-throttle counters (#941/#943)
 		"xpf_userspace_binding_v_min_throttles_total",
 		"xpf_userspace_binding_v_min_throttle_hard_cap_overrides_total",
+		// #1829 Phase 1: dequeue-time sojourn gauges
+		"xpf_userspace_cos_sojourn_ewma_ns",
+		"xpf_userspace_cos_sojourn_peak_ns",
+		"xpf_userspace_cos_sojourn_windowed_min_ns",
 	}
 	if ifaceResolvable {
 		want = append(want, "xpf_interface_packets_total") // collectInterfaceCounters (lo)
