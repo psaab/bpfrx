@@ -4765,3 +4765,10 @@ top.
   manager-level regression tests; README contract update.
   **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/test_seams.go,
   pkg/dhcpserver/dhcpserver_test.go, pkg/dhcpserver/README.md
+
+- **Timestamp**: 2026-06-10 09:57
+  **Action**: #1778 commit 2 — daemon apply path calls dhcpServer.Apply
+  unconditionally in standalone mode (stale-Kea/stanza-removal reconcile),
+  reconciles cluster no-config case, and surfaces standalone Kea failures
+  through the commit via deferred dhcpServerErr (boot path stays lenient).
+  **File(s)**: pkg/daemon/daemon_apply.go

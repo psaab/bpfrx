@@ -870,13 +870,43 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 		}
 	}
 
-	// 7. Apply DHCP server config (Kea DHCPv4 + DHCPv6)
-	// In cluster mode, deferred to VRRP MASTER transition.
-	if !isCluster && d.dhcpServer != nil && (cfg.System.DHCPServer.DHCPLocalServer != nil || cfg.System.DHCPServer.DHCPv6LocalServer != nil) {
-		// Resolve RETH interface names for Kea (needs real Linux names)
-		resolveDHCPRethInterfaces(&cfg.System.DHCPServer, cfg)
-		if err := d.dhcpServer.Apply(&cfg.System.DHCPServer); err != nil {
-			slog.Warn("failed to apply DHCP server config", "err", err)
+	// 7. Reconcile DHCP server (Kea DHCPv4 + DHCPv6) against actual
+	// systemd unit state (#1778).
+	//
+	// Standalone: Apply runs UNCONDITIONALLY — removing the
+	// dhcp-server stanza (or restarting xpfd over a stale Kea left by
+	// a previous daemon) stops the units; the pre-#1778 nil-config
+	// gate skipped Apply entirely and leaked the old server.
+	//
+	// Cluster: start/stop while DHCP config is present is owned by the
+	// VRRP MASTER/BACKUP transitions (applyRethServicesForRG /
+	// clearRethServicesForRG), so it is NOT applied here — but when
+	// the config has no DHCP server at all, no VRRP path would ever
+	// stop a stale Kea, so that case is reconciled here (warn-only:
+	// failing the commit/peer-sync over stale-unit cleanup in cluster
+	// mode would diverge node configs).
+	//
+	// Fail-closed on commit (#1778): standalone restart/stop failures
+	// are recorded into dhcpServerErr and returned at the tail of this
+	// function, so commitAndApply surfaces them to the operator while
+	// the remaining reconcile steps still run. The boot path stays
+	// lenient: Run() reaches this via applyConfig(), which only logs
+	// the returned error — an unavailable Kea binary cannot brick
+	// daemon boot.
+	var dhcpServerErr error
+	if d.dhcpServer != nil {
+		hasDHCPCfg := cfg.System.DHCPServer.DHCPLocalServer != nil || cfg.System.DHCPServer.DHCPv6LocalServer != nil
+		if !isCluster {
+			// Resolve RETH interface names for Kea (needs real Linux names)
+			resolveDHCPRethInterfaces(&cfg.System.DHCPServer, cfg)
+			if err := d.dhcpServer.Apply(&cfg.System.DHCPServer); err != nil {
+				slog.Warn("failed to apply DHCP server config", "err", err)
+				dhcpServerErr = fmt.Errorf("apply DHCP server config: %w", err)
+			}
+		} else if !hasDHCPCfg {
+			if err := d.dhcpServer.Apply(nil); err != nil {
+				slog.Warn("failed to reconcile stale DHCP server (cluster, no config)", "err", err)
+			}
 		}
 	}
 
@@ -1061,7 +1091,9 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 		d.applyStep0Tunables(userspaceDP, claimHostTunables, governor, netdevBudget,
 			coalesceExplicit, coalesceEnable, coalesceRX, coalesceTX, rssAllowed)
 	}
-	return nil
+	// #1778: deferred DHCP-server failure — every reconcile step above
+	// has run; surface the Kea restart/stop failure through the commit.
+	return dhcpServerErr
 }
 
 func compileErrorMustAbortApply(err error) bool {
