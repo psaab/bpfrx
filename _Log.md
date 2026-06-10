@@ -4851,3 +4851,6 @@ top.
 - **Timestamp**: 2026-06-10
   **Action**: #1844 plan v2.3 — AGY r2 folds (eager d.dhcp creation, write-once pointer)
   **File(s)**: docs/research/1844-dhcp-nexthop/{plan.md,agy-plan-r2.md}
+- **Timestamp**: 2026-06-10
+  **Action**: #1844 SMR r3 PLAN-READY (fatal-boot semantics for eager dhcp.New folded); Codex r3 PLAN-READY doc saved + §4.6 wording nit folded
+  **File(s)**: docs/research/1844-dhcp-nexthop/{plan.md,claude-smr-plan-r3.md,codex-plan-r3.md}

@@ -307,8 +307,14 @@ thereafter; `reconcileDHCPClients` drops its lazy-create branch
 rather than timing-dependent. (Honest note on its practical reach:
 on a fresh daemon no policy can be FAILED before probes run, so the
 first-apply overlay is empty anyway — the race fix is the real
-driver; the ordering fix rides along.) The hook stays a nil-guarded
-closure so construction order can never regress silently (SMR r1-2):
+driver; the ordering fix rides along.) **Boot-failure semantics (SMR
+r3):** the lazy path retried `dhcp.New` on every apply; eager-once
+must not silently strand the process DHCP-less on a one-shot
+`netlink.NewHandle()` failure — an eager `dhcp.New` error at boot is
+a FATAL startup error (the daemon cannot manage interfaces without
+netlink anyway), preserving the write-once invariant with no retry
+path. The hook stays a nil-guarded closure so construction order can
+never regress silently (SMR r1-2):
 
 ```go
 // daemon_run.go, beside d.ipmon creation:
@@ -488,7 +494,7 @@ activeOverlayLocked + PolicyStatus.UnresolvedRoutes), `pkg/dhcp`
 lazy-create branch, resolveDHCPNextHop, closure wiring,
 buildDHCPClientSpecs switches to shared helper, single-capture
 hardening in applyConfigLocked, `routeOverlayPublisher` interface +
-actuator bump-on-published-only + pendingFIBBump), `pkg/dataplane/userspace`
+actuator bump-on-published-or-pending via pendingFIBBump), `pkg/dataplane/userspace`
 (`PublishRouteOverlaySnapshot` returns `(published bool, err error)` —
 manager + legacy adapter; Go-only, snapshot wire format untouched),
 `pkg/api` (one gauge), docs (`docs/multi-wan.md`, `pkg/ipmon/README.md`,
