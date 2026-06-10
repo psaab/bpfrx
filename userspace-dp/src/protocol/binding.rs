@@ -46,6 +46,37 @@ pub struct WorkerRuntimeStatus {
     /// #1240: cumulative bytes granted by v8 queue-lease acquire calls.
     #[serde(rename = "cos_queue_lease_acquire_v8_granted_bytes", default)]
     pub cos_queue_lease_acquire_v8_granted_bytes: u64,
+    /// #1782 Step-1 (§5.2 mechanism (i)): cumulative CoS timer-wheel
+    /// ticks advanced by `advance_cos_timer_wheel` across this
+    /// worker's bindings. Pairs with `cos_wheel_ticks_advanced_max`,
+    /// the largest single-call advance ever observed (a monotonic
+    /// high-water mark) — one cold drain catching up a multi-minute
+    /// per-worker idle lag appears as a single multi-million-tick max
+    /// sample. `default` so an older daemon that predates the counter
+    /// decodes as 0.
+    #[serde(rename = "cos_wheel_ticks_advanced_total", default)]
+    pub cos_wheel_ticks_advanced_total: u64,
+    #[serde(rename = "cos_wheel_ticks_advanced_max", default)]
+    pub cos_wheel_ticks_advanced_max: u64,
+    /// #1782 Step-1 (§5.2 mechanism (ii)): per-cause v8 queue-lease
+    /// under-grant attribution. Counted at the CoS exact-guarantee
+    /// selector sites when the post-top-up `queue.hot.tokens <
+    /// head_len` comparison shows the queue still cannot service its
+    /// head, attributed to the `AcquireV8ShortfallCause` the lease
+    /// reported. A v8-attributed subset of `drain_park_queue_tokens`.
+    /// All `default` for mixed-version back-compat.
+    #[serde(rename = "cos_queue_lease_undergrant_seqlock_give_up", default)]
+    pub cos_queue_lease_undergrant_seqlock_give_up: u64,
+    #[serde(rename = "cos_queue_lease_undergrant_cap_zero", default)]
+    pub cos_queue_lease_undergrant_cap_zero: u64,
+    #[serde(rename = "cos_queue_lease_undergrant_epoch_rotated", default)]
+    pub cos_queue_lease_undergrant_epoch_rotated: u64,
+    #[serde(rename = "cos_queue_lease_undergrant_share_exhausted", default)]
+    pub cos_queue_lease_undergrant_share_exhausted: u64,
+    #[serde(rename = "cos_queue_lease_undergrant_class_cap", default)]
+    pub cos_queue_lease_undergrant_class_cap: u64,
+    #[serde(rename = "cos_queue_lease_undergrant_outstanding_cap", default)]
+    pub cos_queue_lease_undergrant_outstanding_cap: u64,
     /// Current entries in this worker's Rust-owned SessionTable.
     #[serde(rename = "session_table_entries", default)]
     pub session_table_entries: u64,

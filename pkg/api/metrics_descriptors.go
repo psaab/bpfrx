@@ -436,6 +436,22 @@ func newCollector(srv *Server) *xpfCollector {
 			"Bytes granted by v8 CoS queue-lease acquire calls for this worker (#1240).",
 			[]string{"worker_id"}, nil,
 		),
+		// #1782 Step-1 cold-start CoS instruments.
+		workerCoSWheelTicksAdvancedTotal: prometheus.NewDesc(
+			"xpf_userspace_worker_cos_wheel_ticks_advanced_total",
+			"Cumulative CoS timer-wheel ticks (50us each) advanced by advance_cos_timer_wheel across this worker's bindings — the O(lag) cold-start catch-up cost, mechanism (i) of the #1782 Step-1 disambiguation.",
+			[]string{"worker_id"}, nil,
+		),
+		workerCoSWheelTicksAdvancedMax: prometheus.NewDesc(
+			"xpf_userspace_worker_cos_wheel_ticks_advanced_max",
+			"Largest single-call CoS timer-wheel tick advance ever observed on this worker (monotonic high-water mark, never resets). A multi-million-tick value after a cold reproduction pins the #1782 §4(i) wheel catch-up mechanism.",
+			[]string{"worker_id"}, nil,
+		),
+		workerCoSQueueLeaseUndergrant: prometheus.NewDesc(
+			"xpf_userspace_worker_cos_queue_lease_undergrant_total",
+			"CoS exact-guarantee selector visits where the post-top-up queue tokens still could not cover the head frame, attributed to the v8 acquire shortfall cause (#1782 Step-1 mechanism (ii)); a v8-attributed subset of drain_park_queue_tokens.",
+			[]string{"worker_id", "cause"}, nil,
+		),
 		workerSessionTableEntries: prometheus.NewDesc(
 			"xpf_userspace_worker_session_table_entries",
 			"Live session-table entries published by this userspace worker.",

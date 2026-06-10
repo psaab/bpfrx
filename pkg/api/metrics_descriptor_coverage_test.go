@@ -213,19 +213,25 @@ func populatedCoverageStatus() dpuserspace.ProcessStatus {
 		CoSInterfaces:       []dpuserspace.CoSInterfaceStatus{cosIface},
 		WorkerRuntime: []dpuserspace.WorkerRuntimeStatus{
 			{
-				WorkerID:                       0,
-				WallNS:                         1e9,
-				ActiveNS:                       5e8,
-				ColdPathLayoutVersion:          3,
-				ColdPathActiveSlotIDs:          []uint32{0},
-				ColdPathActiveZoneFrom:         []uint32{1},
-				ColdPathActiveZoneTo:           []uint32{2},
-				ColdPathActiveSamples:          []uint64{3},
-				ColdPathActiveSumNS:            []uint64{300},
-				ColdPathActiveBuckets:          [][]uint64{v3Buckets},
-				ColdPathActiveBuilderCollision: []bool{false},
-				ColdPathOverflowActive:         true,
-				ColdPathClockSource:            "tsc",
+				WorkerID: 0,
+				WallNS:   1e9,
+				ActiveNS: 5e8,
+				// #1782 Step-1 cold-start CoS instruments: drive both
+				// wheel counters and one under-grant cause so the new
+				// families emit through the pedantic-Gather canary.
+				CoSWheelTicksAdvancedTotal:            12_000_000,
+				CoSWheelTicksAdvancedMax:              11_000_000,
+				CoSQueueLeaseUndergrantShareExhausted: 4,
+				ColdPathLayoutVersion:                 3,
+				ColdPathActiveSlotIDs:                 []uint32{0},
+				ColdPathActiveZoneFrom:                []uint32{1},
+				ColdPathActiveZoneTo:                  []uint32{2},
+				ColdPathActiveSamples:                 []uint64{3},
+				ColdPathActiveSumNS:                   []uint64{300},
+				ColdPathActiveBuckets:                 [][]uint64{v3Buckets},
+				ColdPathActiveBuilderCollision:        []bool{false},
+				ColdPathOverflowActive:                true,
+				ColdPathClockSource:                   "tsc",
 			},
 			{WorkerID: 1, ColdPathLayoutVersion: 99}, // unknown-version path
 			{
@@ -420,6 +426,9 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 		"xpf_userspace_source_nat_pool_live_flows",                   // userspace SNAT pool
 		"xpf_userspace_neighbor_warm_drops_total",                    // neighbor-warm
 		"xpf_userspace_neg_neigh_fast_fail_total",                    // #1782 cold-start H1
+		"xpf_userspace_worker_cos_wheel_ticks_advanced_total",        // #1782 Step-1 (i) wheel sum
+		"xpf_userspace_worker_cos_wheel_ticks_advanced_max",          // #1782 Step-1 (i) wheel max
+		"xpf_userspace_worker_cos_queue_lease_undergrant_total",      // #1782 Step-1 (ii) per-cause
 		"xpf_userspace_pending_neigh_duplicate_drops_total",          // #1782 cold-start H5
 		"xpf_userspace_dynamic_neighbor_present",                     // #1782 cold-start H2 dump
 		"xpf_userspace_session_publish_errors_total",                 // #1789 publish failures

@@ -274,6 +274,73 @@ fn worker_runtime_status_cold_path_fields_roundtrip_populated() {
     assert_eq!(back.cold_path_snapshot_failed, 2);
 }
 
+// #1782 Step-1: round-trip + backward-compat (key-absent) pin for the
+// cold-start CoS instruments on WorkerRuntimeStatus. The wire keys feed
+// pkg/dataplane/userspace/protocol.go and the Prometheus families
+// xpf_userspace_worker_cos_wheel_ticks_advanced_{total,max} and
+// xpf_userspace_worker_cos_queue_lease_undergrant_total{cause}.
+#[test]
+fn worker_runtime_status_cos_coldstart_counters_roundtrip() {
+    let status = WorkerRuntimeStatus {
+        cos_wheel_ticks_advanced_total: 1_000_001,
+        cos_wheel_ticks_advanced_max: 999_999,
+        cos_queue_lease_undergrant_seqlock_give_up: 1,
+        cos_queue_lease_undergrant_cap_zero: 2,
+        cos_queue_lease_undergrant_epoch_rotated: 3,
+        cos_queue_lease_undergrant_share_exhausted: 4,
+        cos_queue_lease_undergrant_class_cap: 5,
+        cos_queue_lease_undergrant_outstanding_cap: 6,
+        ..Default::default()
+    };
+    let value: serde_json::Value =
+        serde_json::to_value(&status).expect("serialize WorkerRuntimeStatus to Value");
+    let keys = [
+        ("cos_wheel_ticks_advanced_total", 1_000_001u64),
+        ("cos_wheel_ticks_advanced_max", 999_999),
+        ("cos_queue_lease_undergrant_seqlock_give_up", 1),
+        ("cos_queue_lease_undergrant_cap_zero", 2),
+        ("cos_queue_lease_undergrant_epoch_rotated", 3),
+        ("cos_queue_lease_undergrant_share_exhausted", 4),
+        ("cos_queue_lease_undergrant_class_cap", 5),
+        ("cos_queue_lease_undergrant_outstanding_cap", 6),
+    ];
+    for (key, want) in keys {
+        assert_eq!(value[key], want, "wire key {key}");
+    }
+    let back: WorkerRuntimeStatus =
+        serde_json::from_value(value).expect("deserialize WorkerRuntimeStatus");
+    assert_eq!(back.cos_wheel_ticks_advanced_total, 1_000_001);
+    assert_eq!(back.cos_wheel_ticks_advanced_max, 999_999);
+    assert_eq!(back.cos_queue_lease_undergrant_seqlock_give_up, 1);
+    assert_eq!(back.cos_queue_lease_undergrant_cap_zero, 2);
+    assert_eq!(back.cos_queue_lease_undergrant_epoch_rotated, 3);
+    assert_eq!(back.cos_queue_lease_undergrant_share_exhausted, 4);
+    assert_eq!(back.cos_queue_lease_undergrant_class_cap, 5);
+    assert_eq!(back.cos_queue_lease_undergrant_outstanding_cap, 6);
+
+    // Pre-#1782-Step-1 payload (keys absent) must decode with zero
+    // defaults — the mixed-version back-compat contract.
+    let mut legacy_value = serde_json::to_value(WorkerRuntimeStatus::default())
+        .expect("serialize default WorkerRuntimeStatus");
+    for (key, _) in keys {
+        legacy_value
+            .as_object_mut()
+            .expect("WorkerRuntimeStatus serializes to an object")
+            .remove(key)
+            .unwrap_or_else(|| panic!("new key {key} present before strip"));
+    }
+    let legacy: WorkerRuntimeStatus =
+        serde_json::from_value(legacy_value).expect("pre-Step-1 payload decodes");
+    assert_eq!(legacy.cos_wheel_ticks_advanced_total, 0);
+    assert_eq!(legacy.cos_wheel_ticks_advanced_max, 0);
+    assert_eq!(legacy.cos_queue_lease_undergrant_seqlock_give_up, 0);
+    assert_eq!(legacy.cos_queue_lease_undergrant_cap_zero, 0);
+    assert_eq!(legacy.cos_queue_lease_undergrant_epoch_rotated, 0);
+    assert_eq!(legacy.cos_queue_lease_undergrant_share_exhausted, 0);
+    assert_eq!(legacy.cos_queue_lease_undergrant_class_cap, 0);
+    assert_eq!(legacy.cos_queue_lease_undergrant_outstanding_cap, 0);
+}
+
 #[test]
 fn source_nat_persistent_fields_roundtrip() {
     let rule = SourceNATRuleSnapshot {

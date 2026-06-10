@@ -967,8 +967,30 @@ type WorkerRuntimeStatus struct {
 	// TX throughput to diagnose token-acquisition imbalance.
 	CoSQueueLeaseAcquireV8Calls        uint64 `json:"cos_queue_lease_acquire_v8_calls,omitempty"`
 	CoSQueueLeaseAcquireV8GrantedBytes uint64 `json:"cos_queue_lease_acquire_v8_granted_bytes,omitempty"`
-	SessionTableEntries                uint64 `json:"session_table_entries,omitempty"`
-	MaxSessions                        uint64 `json:"max_sessions,omitempty"`
+	// #1782 Step-1 (plan §5.2 mechanism (i)): cumulative CoS timer-wheel
+	// ticks advanced by advance_cos_timer_wheel across this worker's
+	// bindings, plus the largest single-call advance ever observed (a
+	// monotonic high-water mark). One cold drain catching up a
+	// multi-minute per-worker idle lag appears as a single
+	// multi-million-tick max sample. omitempty for mixed-version
+	// back-compat with pre-Step-1 helpers.
+	CoSWheelTicksAdvancedTotal uint64 `json:"cos_wheel_ticks_advanced_total,omitempty"`
+	CoSWheelTicksAdvancedMax   uint64 `json:"cos_wheel_ticks_advanced_max,omitempty"`
+	// #1782 Step-1 (plan §5.2 mechanism (ii)): per-cause v8 queue-lease
+	// under-grant attribution, counted at the CoS exact-guarantee
+	// selector sites when the post-top-up queue tokens still cannot
+	// cover the head frame. A v8-attributed subset of the per-queue
+	// drain_park_queue_tokens counter. Surfaced as the single
+	// xpf_userspace_worker_cos_queue_lease_undergrant_total family with
+	// a cause label.
+	CoSQueueLeaseUndergrantSeqlockGiveUp  uint64 `json:"cos_queue_lease_undergrant_seqlock_give_up,omitempty"`
+	CoSQueueLeaseUndergrantCapZero        uint64 `json:"cos_queue_lease_undergrant_cap_zero,omitempty"`
+	CoSQueueLeaseUndergrantEpochRotated   uint64 `json:"cos_queue_lease_undergrant_epoch_rotated,omitempty"`
+	CoSQueueLeaseUndergrantShareExhausted uint64 `json:"cos_queue_lease_undergrant_share_exhausted,omitempty"`
+	CoSQueueLeaseUndergrantClassCap       uint64 `json:"cos_queue_lease_undergrant_class_cap,omitempty"`
+	CoSQueueLeaseUndergrantOutstandingCap uint64 `json:"cos_queue_lease_undergrant_outstanding_cap,omitempty"`
+	SessionTableEntries                   uint64 `json:"session_table_entries,omitempty"`
+	MaxSessions                           uint64 `json:"max_sessions,omitempty"`
 	// #1760: cumulative NAT reverse-key displacement events on this
 	// worker's SessionTable nat_reverse_index (#1758). omitempty for
 	// mixed-version back-compat.
