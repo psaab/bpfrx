@@ -105,3 +105,67 @@ func TestHealthHandler_NoCompileFnKeepsLegacyBehaviour(t *testing.T) {
 		t.Errorf("status = %d, want 200 (legacy)", rr.Code)
 	}
 }
+
+// TestHealthHandler_DegradedWhenConfigPersistFails pins #1799: while
+// the configstore reports persist-degraded (the running active config
+// failed to write to disk and the background retry has not yet
+// succeeded), /health must return 503 with status="degraded" so an
+// operator probe surfaces that a restart would load a stale config.
+func TestHealthHandler_DegradedWhenConfigPersistFails(t *testing.T) {
+	s := &Server{
+		configPersistDegradedFn: func() bool { return true },
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/health", nil)
+	s.healthHandler(rr, req)
+
+	if rr.Code != 503 {
+		t.Errorf("status = %d, want 503", rr.Code)
+	}
+	var resp Response
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.Success {
+		t.Error("success must be false for degraded health")
+	}
+	data, ok := resp.Data.(map[string]any)
+	if !ok {
+		t.Fatalf("data = %T, want map", resp.Data)
+	}
+	if st, _ := data["status"].(string); st != "degraded" {
+		t.Errorf("status = %q, want \"degraded\"", st)
+	}
+	if degraded, _ := data["config_persist_degraded"].(bool); !degraded {
+		t.Error("config_persist_degraded should be true")
+	}
+}
+
+// TestHealthHandler_OKWhenConfigPersistHealthy pins the complementary
+// half: with the fn wired and reporting healthy, /health stays 200/ok
+// and the field stays visible for observability.
+func TestHealthHandler_OKWhenConfigPersistHealthy(t *testing.T) {
+	s := &Server{
+		configPersistDegradedFn: func() bool { return false },
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/health", nil)
+	s.healthHandler(rr, req)
+
+	if rr.Code != 200 {
+		t.Errorf("status = %d, want 200", rr.Code)
+	}
+	var resp Response
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	data, _ := resp.Data.(map[string]any)
+	if st, _ := data["status"].(string); st != "ok" {
+		t.Errorf("status = %q, want \"ok\"", st)
+	}
+	if degraded, ok := data["config_persist_degraded"].(bool); !ok || degraded {
+		t.Errorf("config_persist_degraded = %v, want false-and-present", data["config_persist_degraded"])
+	}
+}

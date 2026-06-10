@@ -36,6 +36,20 @@ type Store struct {
 	// SetWriteActiveForTesting; never assigned on production paths.
 	writeActiveFn func(*config.ConfigTree) error
 
+	// #1799 Option B (degrade-not-fail) state for the persist paths
+	// that must proceed in memory even when the disk write fails
+	// (SyncApply HA convergence, performAutoRollback safety revert).
+	// persistDegraded is surfaced via ConfigPersistDegraded() to the
+	// /health 503 check and the xpf_daemon_config_persist_degraded
+	// gauge. persistRetryActive is the singleton guard for the
+	// background retry goroutine (exactly one loop at a time). The
+	// backoff fields are test seams; zero means the production
+	// defaults (1s initial, doubling to a 60s cap).
+	persistDegraded            bool
+	persistRetryActive         bool
+	persistRetryInitialBackoff time.Duration
+	persistRetryMaxBackoff     time.Duration
+
 	// Commit confirmed state
 	confirmTimer      *time.Timer
 	confirmPrevTree   *config.ConfigTree   // active tree before confirmed commit
@@ -151,6 +165,94 @@ func (s *Store) writeActive(tree *config.ConfigTree) error {
 		return s.writeActiveFn(tree)
 	}
 	return s.db.WriteActive(tree)
+}
+
+// ConfigPersistDegraded reports whether the running active config
+// failed to persist to disk on an Option-B path (SyncApply /
+// performAutoRollback) and the background retry has not yet succeeded
+// (#1799). While true, a daemon restart would load a STALE config;
+// /health returns 503 and xpf_daemon_config_persist_degraded reads 1.
+func (s *Store) ConfigPersistDegraded() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.persistDegraded
+}
+
+// noteActivePersistFailureLocked records a WriteActive failure on an
+// Option-B path (#1799): the in-memory apply already happened (HA
+// convergence / auto-rollback safety win over disk trouble), so the
+// failure must become visible and self-healing instead of fatal.
+// Flips the degraded flag, writes a journal ERROR entry, and starts
+// the singleton retry goroutine. Must be called with s.mu held
+// (write lock).
+func (s *Store) noteActivePersistFailureLocked(action string, err error) {
+	slog.Error("active config persist failed — running config is not durable; restart would load stale config",
+		"action", action, "err", err, "issue", "#1799")
+	s.persistDegraded = true
+	s.journal.Log(&JournalEntry{
+		Timestamp: time.Now(),
+		Action:    "persist_error",
+		Detail:    fmt.Sprintf("%s: write active config failed: %v", action, err),
+	})
+	if s.persistRetryActive {
+		return
+	}
+	s.persistRetryActive = true
+	initial := s.persistRetryInitialBackoff
+	if initial <= 0 {
+		initial = time.Second
+	}
+	maxBackoff := s.persistRetryMaxBackoff
+	if maxBackoff <= 0 {
+		maxBackoff = 60 * time.Second
+	}
+	go s.persistRetryLoop(initial, maxBackoff)
+}
+
+// persistRetryLoop retries persisting the CURRENT active config with
+// doubling backoff until a write succeeds or the degraded flag is
+// cleared by a successful write on another path (#1799). Each attempt
+// re-reads s.active under s.mu and writes while holding the lock —
+// never a stale captured tree — so rapid successive syncs cannot
+// persist out-of-order state (the commit paths themselves write under
+// s.mu, so lock-held writes are the existing serialization).
+//
+// Shutdown safety: the Store has no close signal, and none is needed.
+// This is a plain goroutine outside any WaitGroup — it sleeps between
+// attempts and holds s.mu only for the duration of one atomic
+// temp-file write, so it cannot block daemon shutdown; process exit
+// simply abandons it.
+func (s *Store) persistRetryLoop(backoff, maxBackoff time.Duration) {
+	for {
+		time.Sleep(backoff)
+		s.mu.Lock()
+		if !s.persistDegraded {
+			// A successful write on a commit/sync path already
+			// persisted the current active config.
+			s.persistRetryActive = false
+			s.mu.Unlock()
+			return
+		}
+		err := s.writeActive(s.active)
+		if err == nil {
+			s.persistDegraded = false
+			s.persistRetryActive = false
+			s.journal.Log(&JournalEntry{
+				Timestamp: time.Now(),
+				Action:    "persist_recovered",
+				Detail:    "active config persisted after earlier write failure",
+			})
+			s.mu.Unlock()
+			slog.Info("active config persisted after earlier write failure", "issue", "#1799")
+			return
+		}
+		s.mu.Unlock()
+		slog.Warn("active config persist retry failed", "err", err, "retry_in", backoff*2)
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
 }
 
 // SetClusterReadOnly toggles cluster read-only mode. When enabled, config
@@ -319,8 +421,18 @@ func (s *Store) SyncApply(content string, chassisPreserve func(*config.ConfigTre
 		s.candidate = s.active.Clone()
 	}
 
-	if err := s.db.WriteActive(s.active); err != nil {
-		slog.Warn("failed to save synced config", "err", err)
+	// #1799 Option B (degrade-not-fail): the in-memory apply above
+	// MUST stand even if the disk write fails — failing the
+	// secondary's apply on local disk trouble would silently diverge
+	// the cluster (sync is one-way fire-and-forget; the primary is
+	// already running the new config and is never notified). The
+	// failure becomes visible (degraded flag → /health 503 +
+	// Prometheus gauge + journal ERROR) and self-healing (singleton
+	// background retry with backoff).
+	if err := s.writeActive(s.active); err != nil {
+		s.noteActivePersistFailureLocked("config_sync", err)
+	} else {
+		s.persistDegraded = false
 	}
 
 	s.journal.Log(&JournalEntry{
@@ -802,6 +914,7 @@ func (s *Store) CommitWithDescription(description string) (*config.Config, error
 	if err := s.writeActive(s.candidate); err != nil {
 		return nil, fmt.Errorf("commit failed: persist active config: %w", err)
 	}
+	s.persistDegraded = false // disk now holds the current config
 
 	// Push current active to history with description
 	s.history.Push(&HistoryEntry{
@@ -891,6 +1004,7 @@ func (s *Store) CommitConfirmed(minutes int) (*config.Config, error) {
 	if err := s.writeActive(s.candidate); err != nil {
 		return nil, fmt.Errorf("commit confirmed failed: persist active config: %w", err)
 	}
+	s.persistDegraded = false // disk now holds the current config
 
 	if s.confirmTimer != nil {
 		// Nested confirmed commit: cancel the pending timer but keep

@@ -12,7 +12,9 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/psaab/xpf/pkg/config"
 )
@@ -256,5 +258,155 @@ func TestNestedCommitConfirmed_PreservesLastConfirmedTree(t *testing.T) {
 	}
 	if strings.Contains(got, "untrust") || strings.Contains(got, "dmz") {
 		t.Error("auto-rollback must drop both unconfirmed commits")
+	}
+}
+
+const syncContent = "security {\n" +
+	"    zones {\n" +
+	"        security-zone synced {\n" +
+	"            interfaces {\n" +
+	"                eth3.0;\n" +
+	"            }\n" +
+	"        }\n" +
+	"    }\n" +
+	"}\n"
+
+// waitForCondition polls fn until it returns true or the deadline expires.
+func waitForCondition(t *testing.T, what string, fn func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if fn() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// TestSyncApply_DegradesNotFails: Option B (#1799) — the HA config-sync
+// receive path must still apply in memory on persist failure (cluster
+// convergence wins), flip the degraded flag, and self-heal via the
+// background retry, which clears the flag and lands the config on disk.
+func TestSyncApply_DegradesNotFails(t *testing.T) {
+	s := newTestStore(t)
+	commitBaseline(t, s)
+	s.ExitConfigure()
+
+	s.SetPersistRetryBackoffForTesting(time.Millisecond, 4*time.Millisecond)
+
+	var failing atomic.Bool
+	failing.Store(true)
+	s.SetWriteActiveForTesting(func(tree *config.ConfigTree) error {
+		if failing.Load() {
+			return errDiskFull
+		}
+		return s.db.WriteActive(tree)
+	})
+
+	compiled, err := s.SyncApply(syncContent, nil)
+	if err != nil {
+		t.Fatalf("SyncApply must not fail on persist failure (Option B): %v", err)
+	}
+	if compiled == nil {
+		t.Fatal("SyncApply returned nil compiled config")
+	}
+	// In-memory apply succeeded.
+	if _, ok := compiled.Security.Zones["synced"]; !ok {
+		t.Error("synced zone missing from compiled config")
+	}
+	if !strings.Contains(s.ShowActiveSet(), "synced") {
+		t.Error("synced config not promoted to active despite Option B")
+	}
+	if !s.ConfigPersistDegraded() {
+		t.Fatal("degraded flag must be set after a failed sync persist")
+	}
+
+	// Heal the disk; the retry loop must clear the flag and persist
+	// the CURRENT active config.
+	failing.Store(false)
+	waitForCondition(t, "degraded flag to clear", func() bool {
+		return !s.ConfigPersistDegraded()
+	})
+	tree, err := s.db.ReadActive()
+	if err != nil {
+		t.Fatalf("ReadActive: %v", err)
+	}
+	if tree == nil || !strings.Contains(tree.FormatSet(), "synced") {
+		t.Error("retry loop did not persist the synced config to disk")
+	}
+}
+
+// TestSyncApply_PersistFailureRetryIsSingleton: repeated Option-B
+// failures must not spawn concurrent retry goroutines racing on disk
+// writes — the singleton guard keeps exactly one loop.
+func TestSyncApply_PersistFailureRetryIsSingleton(t *testing.T) {
+	s := newTestStore(t)
+	commitBaseline(t, s)
+	s.ExitConfigure()
+
+	// Long backoff so the first loop is still alive across both failures.
+	s.SetPersistRetryBackoffForTesting(time.Hour, time.Hour)
+
+	var writes atomic.Int32
+	s.SetWriteActiveForTesting(func(*config.ConfigTree) error {
+		writes.Add(1)
+		return errDiskFull
+	})
+
+	if _, err := s.SyncApply(syncContent, nil); err != nil {
+		t.Fatalf("SyncApply 1: %v", err)
+	}
+	if _, err := s.SyncApply(syncContent, nil); err != nil {
+		t.Fatalf("SyncApply 2: %v", err)
+	}
+
+	s.mu.RLock()
+	active := s.persistRetryActive
+	degraded := s.persistDegraded
+	s.mu.RUnlock()
+	if !active {
+		t.Error("retry goroutine should be active")
+	}
+	if !degraded {
+		t.Error("degraded flag should be set")
+	}
+	// Only the two SyncApply writes happened — the hour-long backoff
+	// means no retry write yet, and a duplicate goroutine would have
+	// been observable as state churn in the assertions above.
+	if got := writes.Load(); got != 2 {
+		t.Errorf("unexpected write count %d, want 2 (sync attempts only)", got)
+	}
+}
+
+// TestCommit_SuccessClearsDegradedFlag: a successful Option-A commit
+// persists the newest active config, so the degraded state ends even
+// before the retry loop's next attempt.
+func TestCommit_SuccessClearsDegradedFlag(t *testing.T) {
+	s := newTestStore(t)
+	commitBaseline(t, s)
+	s.ExitConfigure()
+
+	s.SetPersistRetryBackoffForTesting(time.Hour, time.Hour)
+	s.SetWriteActiveForTesting(failingWriteActive)
+	if _, err := s.SyncApply(syncContent, nil); err != nil {
+		t.Fatalf("SyncApply: %v", err)
+	}
+	if !s.ConfigPersistDegraded() {
+		t.Fatal("degraded flag must be set")
+	}
+
+	s.SetWriteActiveForTesting(nil)
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	if err := s.SetFromInput("security zones security-zone trust2 interfaces eth4.0"); err != nil {
+		t.Fatalf("SetFromInput: %v", err)
+	}
+	if _, err := s.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if s.ConfigPersistDegraded() {
+		t.Error("successful commit persisted the current config; degraded flag must clear")
 	}
 }

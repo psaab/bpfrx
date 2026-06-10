@@ -67,6 +67,15 @@ type Config struct {
 	// instead of reading "status: ok" alongside a one-shot WARN in the
 	// journal. Optional; if nil, /health keeps the pre-#758 behaviour.
 	CompileHealthFn func() CompileHealthSnapshot
+	// ConfigPersistDegradedFn surfaces the configstore's persist-degraded
+	// state via /health and the xpf_daemon_config_persist_degraded gauge
+	// (#1799, mirrors the CompileHealthFn pattern). Returning true means
+	// the RUNNING active config failed to persist to disk (HA SyncApply
+	// or commit-confirmed auto-rollback hit a write error) and the
+	// background retry has not yet succeeded — a daemon restart would
+	// load a stale config. /health returns 503 while degraded. Optional;
+	// if nil, the check and gauge are omitted.
+	ConfigPersistDegradedFn func() bool
 	// NeighborPhaseAgeFn surfaces the age (seconds) since each Go
 	// periodic neighbor-maintenance phase last completed (#1780 Path A).
 	// Keys: resolve/force_probe/clean_failed/warm. A monotonically
@@ -90,11 +99,12 @@ type Server struct {
 	ipsec       *ipsec.Manager
 	dhcp        *dhcp.Manager
 	vrrpMgr           *vrrp.Manager
-	commitFn           func(ctx context.Context, comment string) (*config.Config, error)
-	commitConfirmedFn  func(ctx context.Context, minutes int) (*config.Config, error)
-	compileHealthFn    func() CompileHealthSnapshot
-	neighborPhaseAgeFn func() map[string]float64
-	startTime          time.Time
+	commitFn                func(ctx context.Context, comment string) (*config.Config, error)
+	commitConfirmedFn       func(ctx context.Context, minutes int) (*config.Config, error)
+	compileHealthFn         func() CompileHealthSnapshot
+	configPersistDegradedFn func() bool
+	neighborPhaseAgeFn      func() map[string]float64
+	startTime               time.Time
 }
 
 // NewServer creates a new API server.
@@ -109,11 +119,12 @@ func NewServer(cfg Config) *Server {
 		ipsec:     cfg.IPsec,
 		dhcp:      cfg.DHCP,
 		vrrpMgr:           cfg.VRRPMgr,
-		commitFn:           cfg.CommitFn,
-		commitConfirmedFn:  cfg.CommitConfirmedFn,
-		compileHealthFn:    cfg.CompileHealthFn,
-		neighborPhaseAgeFn: cfg.NeighborPhaseAgeFn,
-		startTime:          time.Now(),
+		commitFn:                cfg.CommitFn,
+		commitConfirmedFn:       cfg.CommitConfirmedFn,
+		compileHealthFn:         cfg.CompileHealthFn,
+		configPersistDegradedFn: cfg.ConfigPersistDegradedFn,
+		neighborPhaseAgeFn:      cfg.NeighborPhaseAgeFn,
+		startTime:               time.Now(),
 	}
 
 	mux := http.NewServeMux()

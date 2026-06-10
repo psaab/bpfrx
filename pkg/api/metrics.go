@@ -81,6 +81,11 @@ type xpfCollector struct {
 	// #1780: per-phase age of the Go periodic neighbor-maintenance loop.
 	neighborPeriodicAge *prometheus.Desc
 
+	// #1799: 0/1 gauge — 1 while the running active config failed to
+	// persist to disk and the configstore's background retry has not
+	// yet succeeded (restart would load a stale config).
+	configPersistDegraded *prometheus.Desc
+
 	// #709: CoS owner-profile telemetry (userspace dataplane only).
 	// Cardinality estimate per plan §5: num_queues (≤ 64) × num_interfaces
 	// (≤ 8) × DRAIN_HIST_BUCKETS (16) = ≤ 8192 series for each of the
@@ -295,6 +300,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.daemonUptime
 	ch <- c.daemonMemRSS
 	ch <- c.neighborPeriodicAge
+	ch <- c.configPersistDegraded
 	ch <- c.cosDrainLatencyBucket
 	ch <- c.cosDrainInvocationsTotal
 	ch <- c.cosRedirectAcquireBucket
@@ -417,6 +423,18 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
+	// #1799: config-persist health is a control-plane signal — emit it
+	// BEFORE the dataplane gate below so the degraded state stays
+	// visible even when the dataplane is not loaded.
+	if c.srv.configPersistDegradedFn != nil {
+		v := 0.0
+		if c.srv.configPersistDegradedFn() {
+			v = 1
+		}
+		ch <- prometheus.MustNewConstMetric(c.configPersistDegraded,
+			prometheus.GaugeValue, v)
+	}
+
 	dp := c.srv.dp
 	if dp == nil || !dp.IsLoaded() {
 		return
