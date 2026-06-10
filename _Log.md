@@ -4630,3 +4630,14 @@ top.
   window so orphaned grandchildren (PAM exec helpers from useradd) cannot hold
   the timeout open indefinitely. Hard ceiling is now 15s+5s=20s per site.
   **File(s)**: pkg/daemon/exec_timeout.go
+
+- **Timestamp**: 2026-06-09
+  **Action**: #1790 (U9 of #1800 plan) — update_ha_state demotion block now
+  recovers a poisoned worker command mutex via poisoned.into_inner() +
+  eprintln (pattern from handle_activated_rgs, ha.rs:109-118) instead of
+  `?`-returning Err after rg_runtime.store already published the new state
+  (which made the missed demotion permanent on retry). Added regression test
+  poisoning 1 of 3 worker command mutexes and asserting all workers receive
+  DemoteOwnerRGS + VacateAllSharedExactSlots, shared-session demotion runs,
+  rg_epochs bumped, Ok returned. Extracted test_worker_handle() helper.
+  **File(s)**: userspace-dp/src/afxdp/ha.rs, userspace-dp/src/afxdp/ha_tests.rs
