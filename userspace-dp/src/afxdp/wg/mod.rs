@@ -25,6 +25,11 @@
 // the integration PR will exercise most of it and the remaining
 // dead symbols (e.g. cookie-message helpers) can be allow-listed
 // individually.
+//
+// Re-verified under #1826: removing this allow still surfaces 16
+// dead-code warnings (engine surface remains partially unwired even
+// after the coordinator/wg_control.rs integration), so the
+// module-wide allow stays for now.
 #![allow(dead_code)] // Most of this module is not yet wired into the hot path.
 
 pub(crate) mod allowed_ips;

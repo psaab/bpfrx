@@ -9,6 +9,7 @@ mod event_stream;
 mod fairness;
 mod filter;
 mod flowexport;
+mod ip_proto;
 mod nat;
 mod nat64;
 mod nptv6;
