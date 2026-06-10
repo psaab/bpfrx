@@ -4641,3 +4641,6 @@ top.
   DemoteOwnerRGS + VacateAllSharedExactSlots, shared-session demotion runs,
   rg_epochs bumped, Ok returned. Extracted test_worker_handle() helper.
   **File(s)**: userspace-dp/src/afxdp/ha.rs, userspace-dp/src/afxdp/ha_tests.rs
+- **Timestamp**: 2026-06-09
+  **Action**: U10 (#1792) monotonic HA liveness — 4 commits on engineer/1800-u10-liveness
+  **File(s)**: pkg/cluster/{heartbeat,heartbeat_manager,hooks,manager,sync,sync_conn,sync_protocol,sync_test,heartbeat_liveness_test}.go, pkg/daemon/{daemon,daemon_ha_sync,daemon_ha_sync_test}.go, pkg/vrrp/{instance,instance_garp_test}.go, docs/bug-heartbeat-vrf-rebind-split-brain.md
