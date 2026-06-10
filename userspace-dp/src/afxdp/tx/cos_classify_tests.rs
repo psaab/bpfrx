@@ -79,6 +79,7 @@ fn enqueue_exact_queue_publishes_shared_backlog_slot() {
             Some(4),
             512,
             test_flow_cos_item(5201, 512),
+            0,
             None,
         )
         .is_ok()
@@ -116,6 +117,7 @@ fn clone_prepared_request_for_cos_returns_local_copy_with_metadata() {
         cos_queue_id: Some(4),
         dscp_rewrite: Some(46),
         mirror_clone: true,
+        enqueue_ns: 0,
     };
 
     let local = clone_prepared_request_for_cos(&area, &req).expect("local copy");
@@ -152,6 +154,7 @@ fn clone_prepared_request_for_cos_rejects_out_of_range_offset() {
         cos_queue_id: Some(4),
         dscp_rewrite: None,
         mirror_clone: false,
+        enqueue_ns: 0,
     };
 
     assert!(clone_prepared_request_for_cos(&area, &req).is_none());
@@ -174,6 +177,7 @@ fn prepare_local_request_for_cos_preserves_mirror_tx_frame_reserve() {
         cos_queue_id: Some(5),
         dscp_rewrite: None,
         mirror_clone: true,
+        enqueue_ns: 0,
     };
 
     let req = match prepare_local_request_for_cos(&area, &mut free_tx_frames, req) {
@@ -206,6 +210,7 @@ fn prepare_local_request_for_cos_materializes_prepared_frame() {
         cos_queue_id: Some(5),
         dscp_rewrite: Some(46),
         mirror_clone: false,
+        enqueue_ns: 0,
     };
 
     let prepared =
@@ -236,6 +241,7 @@ fn prepare_local_request_for_cos_falls_back_when_no_free_tx_frame_exists() {
         cos_queue_id: Some(5),
         dscp_rewrite: None,
         mirror_clone: false,
+        enqueue_ns: 0,
     };
 
     let req = match prepare_local_request_for_cos(&area, &mut free_tx_frames, req) {
@@ -281,6 +287,7 @@ fn cos_queue_accepts_prepared_when_queue_is_prepared_only() {
             cos_queue_id: Some(5),
             dscp_rewrite: None,
             mirror_clone: false,
+            enqueue_ns: 0,
         }));
 
     assert!(cos_queue_accepts_prepared(&root, Some(5)));
@@ -328,6 +335,7 @@ fn demote_prepared_cos_queue_to_local_recycles_frames_and_blocks_prepared_append
             cos_queue_id: Some(5),
             dscp_rewrite: None,
             mirror_clone: false,
+            enqueue_ns: 0,
         }));
     root.queues[0]
         .hot
@@ -344,6 +352,7 @@ fn demote_prepared_cos_queue_to_local_recycles_frames_and_blocks_prepared_append
             cos_queue_id: Some(5),
             dscp_rewrite: None,
             mirror_clone: false,
+            enqueue_ns: 0,
         }));
 
     let mut free_tx_frames = VecDeque::from([512]);
@@ -440,6 +449,7 @@ fn demote_prepared_cos_queue_to_local_preserves_mqfq_frontier() {
             cos_queue_id: Some(4),
             dscp_rewrite: None,
             mirror_clone: false,
+            enqueue_ns: 0,
         }),
     );
     cos_queue_push_back(
@@ -456,6 +466,7 @@ fn demote_prepared_cos_queue_to_local_preserves_mqfq_frontier() {
             cos_queue_id: Some(4),
             dscp_rewrite: None,
             mirror_clone: false,
+            enqueue_ns: 0,
         }),
     );
 
@@ -579,6 +590,7 @@ fn demote_prepared_cos_queue_to_local_skips_non_exact_queue() {
             cos_queue_id: Some(5),
             dscp_rewrite: None,
             mirror_clone: false,
+            enqueue_ns: 0,
         }));
 
     let mut free_tx_frames = VecDeque::new();
@@ -2345,4 +2357,65 @@ fn resolve_cos_tx_selection_preserves_output_filter_dscp_rewrite_without_forward
 
     assert_eq!(selection.queue_id, Some(7));
     assert_eq!(selection.dscp_rewrite, Some(46));
+}
+
+// #1829 Phase 1: `enqueue_cos_item` is the single CoS admission choke
+// point and must stamp `enqueue_ns` from the threaded pass `now_ns` on
+// every admitted item — the dequeue-side sojourn recorder depends on
+// it (an unstamped item is silently skipped, see plan invariant 10).
+#[test]
+fn enqueue_cos_item_stamps_enqueue_ns_at_admission() {
+    let root = test_cos_runtime_with_queues(
+        25_000_000_000 / 8,
+        vec![CoSQueueConfig {
+            queue_id: 4,
+            forwarding_class: "iperf-a".into(),
+            priority: 5,
+            transmit_rate_bytes: 125_000_000,
+            guarantee_enabled: true,
+            exact: true,
+            surplus_sharing: false,
+            equal_flow_enforcement: false,
+            surplus_weight: 1,
+            buffer_bytes: 4_000_000,
+            dscp_rewrite: None,
+            codel_target_ns: 0,
+        }],
+    );
+    let fast_interfaces = test_cos_fast_interfaces(
+        42,
+        42,
+        4,
+        vec![(4, test_queue_fast_path(false, 0, None, None))],
+        None,
+        None,
+    );
+    let fast_path = fast_interfaces.get(&42).expect("test fast path").clone();
+    let mut binding = BindingWorker::new_for_cos_drain_test(0, 0, 42, root, fast_path);
+
+    let now_ns = 777_000_000u64;
+    assert!(
+        enqueue_cos_item(
+            &mut binding,
+            42,
+            Some(4),
+            512,
+            test_flow_cos_item(5201, 512),
+            now_ns,
+            None,
+        )
+        .is_ok()
+    );
+
+    let queue = &binding
+        .cos
+        .cos_interfaces
+        .get(&42)
+        .expect("cos interface")
+        .queues[0];
+    match crate::afxdp::cos::queue_ops::cos_queue_front(queue) {
+        Some(CoSPendingTxItem::Local(req)) => assert_eq!(req.enqueue_ns, now_ns),
+        Some(CoSPendingTxItem::Prepared(req)) => assert_eq!(req.enqueue_ns, now_ns),
+        None => panic!("admitted item must be at the queue front"),
+    }
 }

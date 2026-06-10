@@ -1492,6 +1492,16 @@ pub(in crate::afxdp) fn settle_exact_local_scratch_submission_flow_fair(
                 let bucket = cos_flow_bucket_index(flow_hash_seed, req.flow_key.as_ref()) as u16;
                 account_flow_bucket_tx(ff, bucket, bytes, now_ns);
             }
+            // #1829 Phase 1 (Codex review on PR #1846): sojourn is
+            // sampled HERE, at the committed-prefix settle — never at
+            // pop/scratch-build time. The rollback branch above
+            // push_fronts the suffix WITH its original enqueue_ns, so
+            // sampling at pop would count a rolled-back item once per
+            // attempt; sampling only the committed prefix counts each
+            // packet exactly once, on the attempt that ships it. Same
+            // pass-level now_ns the bucket accounting uses (no clock
+            // reads, #1734).
+            queue.telemetry.sojourn.record(req.enqueue_ns, now_ns);
             sent_packets += 1;
             sent_bytes += bytes;
         }
@@ -1559,6 +1569,9 @@ fn settle_exact_prepared_scratch_submission_flow_fair(
                 let bucket = cos_flow_bucket_index(flow_hash_seed, req.flow_key.as_ref()) as u16;
                 account_flow_bucket_tx(ff, bucket, bytes, now_ns);
             }
+            // #1829 Phase 1 (Codex review on PR #1846): committed-
+            // prefix-only sojourn sample — see the Local settle above.
+            queue.telemetry.sojourn.record(req.enqueue_ns, now_ns);
             remember_prepared_recycle(in_flight_prepared_recycles, &req);
             sent_packets += 1;
             sent_bytes += bytes;

@@ -465,6 +465,7 @@ fn vmin_demote_no_drain_all_leak() {
         expected_addr_family: libc::AF_INET as u8,
         expected_protocol: PROTO_TCP,
         egress_ifindex: 80,
+        enqueue_ns: 0,
     };
     cos_queue_push_back(queue, CoSPendingTxItem::Prepared(prep));
 

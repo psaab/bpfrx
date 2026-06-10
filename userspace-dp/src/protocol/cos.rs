@@ -356,6 +356,38 @@ pub(crate) struct CoSQueueStatus {
     pub waterfill_phase2_admissions: u64,
     #[serde(rename = "waterfill_eligible_visits", default)]
     pub waterfill_eligible_visits: u64,
+    // #1829 Phase 1: dequeue-time sojourn telemetry, sampled as
+    // `now_ns - item.enqueue_ns` at the COMMITTED-PREFIX settle points
+    // (after the TX insert accepts the item — Codex review on PR
+    // #1846: rolled-back retry items keep their original stamp and
+    // are sampled only on the attempt that ships them).
+    // JSON tags MUST match the Go mirror
+    // (pkg/dataplane/userspace/protocol.go) byte-for-byte.
+    //
+    // AGGREGATION contract: all three fields are MAX-merged — across
+    // worker instances (worker/cos/queue_row.rs) and across workers
+    // (coordinator/mod.rs). Each worker instance measures its OWN
+    // queue runtime's delay; the row therefore reports the
+    // worst-instance value, which is the right gate semantics (a
+    // Phase-2 per-worker CoDel would act on exactly that instance).
+    //
+    // `sojourn_windowed_min_ns` is the #1829 GATE METRIC (plan §6.1d
+    // via AGY r2 F2): the minimum sojourn over the last 1-2 100 ms
+    // windows, i.e. CoDel's standing-queue estimator. A value
+    // persistently above codel-target is standing-queue evidence;
+    // EWMA/peak are supporting context only (both biased high by
+    // transient scheduler service gaps). It reads 0 when the queue
+    // has not popped for >= 2 windows at snapshot time, so a stale
+    // reading cannot outlive the backlog that produced it.
+    // `sojourn_peak_ns` is the lifetime maximum (same contract as
+    // `active_flow_buckets_peak`); `sojourn_ewma_ns` is a shift-add
+    // EWMA (alpha = 1/8) over pops.
+    #[serde(rename = "sojourn_ewma_ns", default)]
+    pub sojourn_ewma_ns: u64,
+    #[serde(rename = "sojourn_peak_ns", default)]
+    pub sojourn_peak_ns: u64,
+    #[serde(rename = "sojourn_windowed_min_ns", default)]
+    pub sojourn_windowed_min_ns: u64,
     // #1830 (g): bucket-vs-flow occupancy telemetry, distinguishing SFQ
     // hash-collision unfairness from demand unfairness on flow-fair
     // queues. JSON tags MUST match the Go mirror
