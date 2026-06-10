@@ -4758,6 +4758,60 @@ top.
   **Action**: "#1805 commit 2 — api bounded request-path exec: new exec_timeout.go (runTimeout only — sole raw sites are power actions; Output variants live in grpcapi sibling), converted system.go reboot/halt to runTimeout(context.Background()), WaitDelay=5s U3-parity on ping/traceroute handlers, tests, README gotcha"
   **File(s)**: pkg/api/exec_timeout.go, pkg/api/exec_timeout_test.go, pkg/api/system.go, pkg/api/README.md
 
+- **Timestamp**: 2026-06-10 09:55
+  **Action**: #1778 commit 1 — Kea manager authoritative systemd reconcile +
+  fail-closed Apply; replaced process-local running4/running6 booleans with
+  `systemctl is-active` queries; added test seams (pkg/dhcp convention) and
+  manager-level regression tests; README contract update.
+  **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/test_seams.go,
+  pkg/dhcpserver/dhcpserver_test.go, pkg/dhcpserver/README.md
+
+- **Timestamp**: 2026-06-10 09:57
+  **Action**: #1778 commit 2 — daemon apply path calls dhcpServer.Apply
+  unconditionally in standalone mode (stale-Kea/stanza-removal reconcile),
+  reconciles cluster no-config case, and surfaces standalone Kea failures
+  through the commit via deferred dhcpServerErr (boot path stays lenient).
+  **File(s)**: pkg/daemon/daemon_apply.go
+
+- **Timestamp**: 2026-06-10 10:00
+  **Action**: #1778 commit 3 — secondaries: multi-interface group subnet
+  binding (omit per-subnet binding, address-based selection) + lease CSV
+  parsing via encoding/csv; tests + README gotchas.
+  **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/dhcpserver_test.go,
+  pkg/dhcpserver/README.md
+
+- **Timestamp**: 2026-06-10 (AGY fold) F1
+  **Action**: #1835 AGY F1 — warn at generate time when two v4 groups
+  share/overlap subnets and an involved group emits no per-subnet interface
+  selector (ambiguous Kea selection); warn seam + tests.
+  **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/test_seams.go,
+  pkg/dhcpserver/dhcpserver_test.go
+
+- **Timestamp**: 2026-06-10 (AGY fold) F2
+  **Action**: #1835 AGY F2 — Manager.ApplyAsync (1-slot latest-wins mailbox +
+  singleton worker) so VRRP transitions never block on 15s systemctl; converted
+  all four daemon_ha.go Kea call sites (incl. Clear→ApplyAsync(nil)); tests for
+  never-blocks, latest-wins coalescing, single worker; README.
+  **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/dhcpserver_test.go,
+  pkg/dhcpserver/README.md, pkg/daemon/daemon_ha.go
+
+- **Timestamp**: 2026-06-10 (AGY fold) F3
+  **Action**: #1835 AGY F3 — ApplyClusterCommit: cluster-mode commits always
+  regenerate Kea configs (master-RG filtered) and restart only active units,
+  fail-closed via dhcpServerErr; daemon_apply cluster branch converted; tests
+  + README.
+  **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/dhcpserver_test.go,
+  pkg/dhcpserver/README.md, pkg/daemon/daemon_apply.go
+
+- **Timestamp**: 2026-06-10 (Codex confirm fold) F2 redesign
+  **Action**: #1835 — replaced the channel drain-loop mailbox (ABA hole 1) with
+  gen-ordered supersession: applyGen at call entry for ALL appliers, mu-guarded
+  pendingAsync slot (overwrite only by higher gen) + cap-1 notify channel,
+  lastAppliedGen skip in shared apply body (hole 2: queued async vs sync
+  commit); Clear delegates to Apply(nil); new gen-deterministic tests, all
+  under -race; README updated.
+  **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/dhcpserver_test.go,
+  pkg/dhcpserver/README.md
 - **Timestamp**: 2026-06-10
   **Action**: "#1777 — DHCP client commits successful T1/T2 renewals instead of discarding them: new shared commitLease path (commit.go: renewalTimers, leaseContentChanged, delegatedPrefixesChanged, commitLease) used by acquisition + T1 renew + T2 rebind for both families; run loops restructured with an inner renewal loop that returns to the T1 wait on success and falls back to re-acquisition only on dual failure; onAddressChange fires only on lease-content change; applyAddress nil-netlink guard for test-constructed Managers; table tests in commit_test.go; README renewal-semantics section"
   **File(s)**: pkg/dhcp/commit.go, pkg/dhcp/commit_test.go, pkg/dhcp/dhcp.go, pkg/dhcp/README.md
