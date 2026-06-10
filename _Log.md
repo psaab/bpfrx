@@ -4757,3 +4757,7 @@ top.
 - **Timestamp**: 2026-06-10
   **Action**: "#1805 commit 2 — api bounded request-path exec: new exec_timeout.go (runTimeout only — sole raw sites are power actions; Output variants live in grpcapi sibling), converted system.go reboot/halt to runTimeout(context.Background()), WaitDelay=5s U3-parity on ping/traceroute handlers, tests, README gotcha"
   **File(s)**: pkg/api/exec_timeout.go, pkg/api/exec_timeout_test.go, pkg/api/system.go, pkg/api/README.md
+
+- **Timestamp**: 2026-06-10
+  **Action**: "#1771 Phase-3 commit 1 — §2.6 counter sources: ResolverCounters gains get_backoff_attempts (rate_limit_decide AdmitRetry split, rate_limit_admit folded in) + netlink_enobufs/netlink_redumps/netlink_redump_upserts on the monitor thread (parse_neighbor_msg bool→NeighborMsgEffect so re-dump-reply upserts are counted by nlmsg_seq match, not conflated with FAILED removals); BindingLiveState pending_neigh_keys/neg_neigh_keys gauges published at the ~65ms debug tick; Coordinator accessors neighbor_pending_keys_total/neg_neigh_keys_total + extended NeighborResolverCounters snapshot"
+  **File(s)**: userspace-dp/src/afxdp/{neighbor_resolver.rs,neighbor.rs,umem/mod.rs,umem/debug_state.rs,coordinator/status.rs,coordinator/reconcile/bringup.rs}

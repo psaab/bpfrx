@@ -66,6 +66,20 @@ pub(in crate::afxdp) fn update_binding_idle_debug_state(binding: &mut BindingWor
 }
 
 fn publish_binding_debug_state(binding: &mut BindingWorker) {
+    // #1771 §2.6: gauge snapshots of the per-binding neighbor maps.
+    // `pending_neigh` is keyed per (egress_ifindex, next_hop) since
+    // #1779 §2.2, so len() == distinct unresolved next-hops. The
+    // negative-cache len carries the lazy-TTL caveat documented on
+    // `BindingLiveState::neg_neigh_keys`. Two Relaxed stores at the
+    // existing ~65ms publish cadence — no per-packet work.
+    binding
+        .live
+        .pending_neigh_keys
+        .store(binding.pending_neigh.len() as u64, Ordering::Relaxed);
+    binding
+        .live
+        .neg_neigh_keys
+        .store(binding.neg_neigh_cache.len() as u64, Ordering::Relaxed);
     if binding.tx_counters.pending_direct_tx_packets != 0 {
         binding.live.direct_tx_packets.fetch_add(
             binding.tx_counters.pending_direct_tx_packets,
