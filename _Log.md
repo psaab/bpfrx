@@ -4759,6 +4759,8 @@ top.
   **File(s)**: pkg/api/exec_timeout.go, pkg/api/exec_timeout_test.go, pkg/api/system.go, pkg/api/README.md
 
 - **Timestamp**: 2026-06-10
+  **Action**: "#1777 — DHCP client commits successful T1/T2 renewals instead of discarding them: new shared commitLease path (commit.go: renewalTimers, leaseContentChanged, delegatedPrefixesChanged, commitLease) used by acquisition + T1 renew + T2 rebind for both families; run loops restructured with an inner renewal loop that returns to the T1 wait on success and falls back to re-acquisition only on dual failure; onAddressChange fires only on lease-content change; applyAddress nil-netlink guard for test-constructed Managers; table tests in commit_test.go; README renewal-semantics section"
+  **File(s)**: pkg/dhcp/commit.go, pkg/dhcp/commit_test.go, pkg/dhcp/dhcp.go, pkg/dhcp/README.md
   **Action**: "#1771 Phase-3 commit 1 — §2.6 counter sources: ResolverCounters gains get_backoff_attempts (rate_limit_decide AdmitRetry split, rate_limit_admit folded in) + netlink_enobufs/netlink_redumps/netlink_redump_upserts on the monitor thread (parse_neighbor_msg bool→NeighborMsgEffect so re-dump-reply upserts are counted by nlmsg_seq match, not conflated with FAILED removals); BindingLiveState pending_neigh_keys/neg_neigh_keys gauges published at the ~65ms debug tick; Coordinator accessors neighbor_pending_keys_total/neg_neigh_keys_total + extended NeighborResolverCounters snapshot"
   **File(s)**: userspace-dp/src/afxdp/{neighbor_resolver.rs,neighbor.rs,umem/mod.rs,umem/debug_state.rs,coordinator/status.rs,coordinator/reconcile/bringup.rs}
 
