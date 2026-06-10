@@ -384,6 +384,8 @@ func newCollector(srv *Server) *xpfCollector {
 		cosSojournWindowedMinNS: prometheus.NewDesc(
 			"xpf_userspace_cos_sojourn_windowed_min_ns",
 			"Minimum per-packet queue sojourn over the last 1-2 100 ms windows on this CoS queue, ns, MAX-merged across workers (worst instance). CoDel's standing-queue estimator and the #1829 Phase-2 gate metric: a value persistently above codel-target is standing-queue evidence; 0 means no pops in the last ~2 windows (no standing queue).",
+			[]string{"ifindex", "queue_id"}, nil,
+		),
 		// #1830 (g): bucket-vs-flow occupancy gauges. The ratio
 		// flows_active / buckets_occupied is meaningful only while the
 		// queue is continuously backlogged; see the wire-field docs.

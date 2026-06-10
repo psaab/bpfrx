@@ -1167,6 +1167,32 @@ func (c *xpfCollector) emitCoSWaterfillTelemetry(ch chan<- prometheus.Metric, st
 // are MAX-merged across worker instances and workers upstream (worst
 // instance); see the AGGREGATION contract on the Rust CoSQueueStatus.
 func (c *xpfCollector) emitCoSSojourn(ch chan<- prometheus.Metric, status dpuserspace.ProcessStatus) {
+	for _, iface := range status.CoSInterfaces {
+		ifindexLabel := strconv.Itoa(iface.Ifindex)
+		for _, queue := range iface.Queues {
+			queueLabel := strconv.Itoa(queue.QueueID)
+			ch <- prometheus.MustNewConstMetric(
+				c.cosSojournEwmaNS,
+				prometheus.GaugeValue,
+				float64(queue.SojournEwmaNS),
+				ifindexLabel, queueLabel,
+			)
+			ch <- prometheus.MustNewConstMetric(
+				c.cosSojournPeakNS,
+				prometheus.GaugeValue,
+				float64(queue.SojournPeakNS),
+				ifindexLabel, queueLabel,
+			)
+			ch <- prometheus.MustNewConstMetric(
+				c.cosSojournWindowedMinNS,
+				prometheus.GaugeValue,
+				float64(queue.SojournWindowedMinNS),
+				ifindexLabel, queueLabel,
+			)
+		}
+	}
+}
+
 // #1830 (g): bucket-vs-flow occupancy gauges for collision-vs-demand
 // unfairness diagnosis. Emitted unconditionally for every queue row
 // (cardinality = interfaces x queues): a 0 is a real "idle / no
@@ -1196,6 +1222,9 @@ func (c *xpfCollector) emitCoSFlowFairOccupancy(ch chan<- prometheus.Metric, sta
 				c.cosSojournWindowedMinNS,
 				prometheus.GaugeValue,
 				float64(queue.SojournWindowedMinNS),
+				ifindexLabel, queueLabel,
+			)
+			ch <- prometheus.MustNewConstMetric(
 				c.cosFlowFairBucketsOccupied,
 				prometheus.GaugeValue,
 				float64(queue.FlowFairBucketsOccupied),
