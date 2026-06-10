@@ -86,6 +86,8 @@ type Daemon struct {
 	dhcpServer                 *dhcpserver.Manager
 	feeds                      *feeds.Manager
 	rpm                        *rpm.Manager
+	rpmMu                      sync.Mutex // serializes reconcileRPM callers (#1827)
+	activeRPMHash              [32]byte   // config-hash gate for RPM re-apply (#1827)
 	flowExporter               *flowexport.Exporter
 	flowCancel                 context.CancelFunc
 	flowWg                     sync.WaitGroup

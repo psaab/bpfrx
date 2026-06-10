@@ -217,6 +217,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 			slog.Warn("failed to create routing manager", "err", err)
 		} else {
 			d.routing = rm
+			// #1827: flush the reserved probe-pin band (ip rules 50-99 +
+			// tables 7000-7049) before anything else runs, so a crashed
+			// daemon never leaks stale probe pins across restarts.
+			if err := d.routing.ClearProbePins(); err != nil {
+				slog.Warn("failed to clear stale probe pins", "err", err)
+			}
 		}
 		d.frr = frr.New()
 		d.ipsec = ipsec.New()
@@ -224,6 +230,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.networkd = networkd.New()
 		d.dhcpServer = dhcpserver.New()
 	}
+
+	// Create the RPM manager eagerly so the pointer is stable for the
+	// CLI/gRPC results closures and so applyConfig's hash-gated
+	// reconcileRPM (#1827) can start probes from the very first apply.
+	d.rpm = rpm.New()
 
 	// Initialize cluster manager if configured (heartbeat/sync started after applyConfig).
 	if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.Cluster != nil {
@@ -598,10 +609,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.feeds.Apply(ctx, &cfg.Security.DynamicAddress)
 	}
 
-	// Start RPM probes if configured.
-	if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Services.RPM != nil && len(cfg.Services.RPM.Probes) > 0 {
-		d.rpm = rpm.New()
-		d.rpm.Apply(ctx, cfg.Services.RPM)
+	// RPM probes are started by the hash-gated reconcileRPM step inside
+	// the startup applyConfig above (#1827); this safety net covers the
+	// no-dataplane path where the startup apply may have run before
+	// d.daemonCtx-dependent wiring settled.
+	if cfg := d.store.ActiveConfig(); cfg != nil {
+		d.reconcileRPM(cfg)
 	}
 
 	// Start LLDP if configured.

@@ -313,19 +313,47 @@ const (
 	DefaultRPMTCPDestinationPort   = 80
 )
 
+// Probe pin plumbing constants (#1827 PR-1a). Each RPM test with a
+// `next-hop` pin gets a deterministic per-test fwmark + kernel routing
+// table + ip-rule priority, assigned in sorted probe/test order. The
+// reserved probe table range 7000-7049 is clear of the Linux reserved
+// tables (0/253/254/255), the daemon's management VRF table (999), and
+// the routing-instance auto-assignment that grows upward from 100
+// (compileRoutingInstances). The ip-rule priority band 50-99 sits below
+// the next-table (100-199), PBR (31000+), and rib-group (33000+) clear
+// windows in pkg/routing/rules.go. pkg/routing's probe-pin reconciler
+// and pkg/rpm's SO_MARK assignment both consume these constants so the
+// rule/table/mark assignment cannot drift between the two sides.
+const (
+	// ProbeTableBase is the first kernel routing table reserved for
+	// RPM probe next-hop pins.
+	ProbeTableBase = 7000
+	// ProbeTableCount caps the number of next-hop-pinned RPM tests
+	// (commit error past the cap).
+	ProbeTableCount = 50
+	// ProbeFwmarkBase is the first fwmark value used for probe pins
+	// (mark = ProbeFwmarkBase + index).
+	ProbeFwmarkBase = 0x1000
+	// ProbeRulePriorityBase is the first ip-rule priority of the
+	// probe-pin band (50-99).
+	ProbeRulePriorityBase = 50
+)
+
 // RPMTest defines a test within an RPM probe.
 type RPMTest struct {
-	Name                string
-	ProbeType           string // "http-get", "icmp-ping", "tcp-ping"
-	Target              string // target IP or hostname
-	SourceAddress       string
-	RoutingInstance     string
-	ProbeInterval       int // seconds (0 = default 5)
-	ProbeCount          int // number of probes per test (0 = default 1)
-	TestInterval        int // seconds (0 = default 60)
-	ThresholdSuccessive int // successive failures before probe-fail (0 = default 3)
-	ProbeLimit          int // max consecutive failed probes before stopping the current test cycle (0 = unlimited)
-	DestPort            int // for tcp-ping
+	Name                 string
+	ProbeType            string // "http-get", "icmp-ping", "tcp-ping"
+	Target               string // target IP or hostname
+	SourceAddress        string
+	RoutingInstance      string
+	DestinationInterface string // egress interface pin (SO_BINDTODEVICE), Junos unit name
+	NextHop              string // next-hop IP pin via reserved fwmark probe table (#1827)
+	ProbeInterval        int    // seconds (0 = default 5)
+	ProbeCount           int    // number of probes per test (0 = default 1)
+	TestInterval         int    // seconds (0 = default 60)
+	ThresholdSuccessive  int    // successive failures before probe-fail (0 = default 3)
+	ProbeLimit           int    // max consecutive failed probes before stopping the current test cycle (0 = unlimited)
+	DestPort             int    // for tcp-ping
 }
 
 func (t *RPMTest) EffectiveProbeType() string {

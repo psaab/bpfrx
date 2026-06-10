@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 )
@@ -46,6 +47,66 @@ func validateRPMTest(probeName string, test *RPMTest) error {
 	}
 	if test.DestPort > 65535 {
 		return fmt.Errorf("services rpm probe %q test %q destination-port: must be 1-65535", probeName, test.Name)
+	}
+	if test.NextHop != "" {
+		nh := net.ParseIP(test.NextHop)
+		if nh == nil {
+			return fmt.Errorf("services rpm probe %q test %q next-hop: invalid IP address %q",
+				probeName, test.Name, test.NextHop)
+		}
+		// The pinned host route is installed with an explicit `dev` +
+		// `onlink`, so the egress interface must be named (#1827 §4.2.4).
+		if test.DestinationInterface == "" {
+			return fmt.Errorf("services rpm probe %q test %q: next-hop requires destination-interface "+
+				"(the probe pin route needs an explicit egress device)", probeName, test.Name)
+		}
+		// The pin installs <target>/32 (or /128) via <next-hop>, so the
+		// target must be an IP literal of the same address family.
+		target := net.ParseIP(test.Target)
+		if target == nil {
+			return fmt.Errorf("services rpm probe %q test %q: next-hop pinning requires an IP-literal target (got %q)",
+				probeName, test.Name, test.Target)
+		}
+		if (target.To4() == nil) != (nh.To4() == nil) {
+			return fmt.Errorf("services rpm probe %q test %q: next-hop %q address family does not match target %q",
+				probeName, test.Name, test.NextHop, test.Target)
+		}
+	}
+	return nil
+}
+
+// validateRPMProbePinsStrict enforces the probe-pin band invariants
+// (#1827 PR-1a): at most ProbeTableCount next-hop-pinned tests (one
+// reserved kernel table each), and no routing-instance table ID may
+// collide with the reserved probe table range 7000-7049.
+func validateRPMProbePinsStrict(cfg *Config) error {
+	pinned := 0
+	if cfg.Services.RPM != nil {
+		for _, probe := range cfg.Services.RPM.Probes {
+			if probe == nil {
+				continue
+			}
+			for _, test := range probe.Tests {
+				if test != nil && test.NextHop != "" {
+					pinned++
+				}
+			}
+		}
+	}
+	if pinned > ProbeTableCount {
+		return fmt.Errorf("services rpm: %d tests configure next-hop pinning, exceeding the reserved probe table band (%d tables %d-%d)",
+			pinned, ProbeTableCount, ProbeTableBase, ProbeTableBase+ProbeTableCount-1)
+	}
+	if pinned > 0 {
+		for _, ri := range cfg.RoutingInstances {
+			if ri == nil {
+				continue
+			}
+			if ri.TableID >= ProbeTableBase && ri.TableID < ProbeTableBase+ProbeTableCount {
+				return fmt.Errorf("routing-instance %q table ID %d collides with the reserved RPM probe table range %d-%d",
+					ri.Name, ri.TableID, ProbeTableBase, ProbeTableBase+ProbeTableCount-1)
+			}
+		}
 	}
 	return nil
 }
@@ -222,11 +283,16 @@ func compileRPM(node *Node, svc *ServicesConfig) error {
 				case "probe-type":
 					test.ProbeType = nodeVal(prop)
 				case "target":
-					// Handle both "target 1.1.1.1;" and "target url http://1.1.1.1;"
-					if len(prop.Keys) >= 3 && prop.Keys[1] == "url" {
+					// Handle "target 1.1.1.1;", the canonical Junos form
+					// "target address 1.1.1.1;" (#1827), and
+					// "target url http://1.1.1.1;" — in both inline-keys
+					// and child-node AST shapes.
+					if len(prop.Keys) >= 3 && (prop.Keys[1] == "url" || prop.Keys[1] == "address") {
 						test.Target = prop.Keys[2]
 					} else if urlChild := prop.FindChild("url"); urlChild != nil {
 						test.Target = nodeVal(urlChild)
+					} else if addrChild := prop.FindChild("address"); addrChild != nil {
+						test.Target = nodeVal(addrChild)
 					} else {
 						test.Target = nodeVal(prop)
 					}
@@ -234,6 +300,10 @@ func compileRPM(node *Node, svc *ServicesConfig) error {
 					test.SourceAddress = nodeVal(prop)
 				case "routing-instance":
 					test.RoutingInstance = nodeVal(prop)
+				case "destination-interface":
+					test.DestinationInterface = nodeVal(prop)
+				case "next-hop":
+					test.NextHop = nodeVal(prop)
 				case "probe-interval":
 					if v := nodeVal(prop); v != "" {
 						n, err := parseRPMPositiveInt(probe.Name, test.Name, "probe-interval", v)

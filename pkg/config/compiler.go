@@ -411,6 +411,9 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	if err := validatePolicySchedulerReferencesStrict(cfg); err != nil {
 		strictErrs = append(strictErrs, err)
 	}
+	if err := validateRPMProbePinsStrict(cfg); err != nil {
+		strictErrs = append(strictErrs, err)
+	}
 	if err := validateEqualFlowWorkerCapStrict(cfg); err != nil {
 		// #1733: on the tolerant load/peer-sync path this unsupported
 		// combination is downgraded to a loud warning instead of a hard

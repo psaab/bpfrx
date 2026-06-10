@@ -969,6 +969,12 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 		d.eventEngine.Apply(cfg.EventOptions)
 	}
 
+	// 17b. Reconcile RPM probes (#1827 PR-1a). Config-hash-gated: the
+	// probe set (and the probe next-hop pin rules) is re-applied only
+	// when the rendered RPM stanza actually changed, so unrelated
+	// commits never wipe probe state.
+	d.reconcileRPM(cfg)
+
 	// 18. Update chassis cluster interface monitors
 	if d.routing != nil && cfg.Chassis.Cluster != nil &&
 		len(cfg.Chassis.Cluster.RedundancyGroups) > 0 {
