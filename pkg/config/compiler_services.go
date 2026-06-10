@@ -377,6 +377,16 @@ func compilePreferredRoutes(node *Node, ri, polName string, routes map[string]*P
 // forwarding instances now render into their dedicated kernel table
 // (FRR `table <id>`), matching the dataplane's `<ri>.inet.0`, so the
 // FRR-vs-dataplane divergence that motivated the fence is fixed.
+//
+// #1844: a next-hop value that is not an IP literal may instead name a
+// DHCP-enabled interface unit (`next-hop ge-0/0/3.0`) — the injected
+// route then tracks that unit's DHCP-learned gateway. This function
+// also DERIVES the typed-model split for that form (it runs on every
+// compile path, strict and lenient alike, so the derivation is present
+// after boot Load as well as commit): on success
+// PreferredRoute.NextHopInterface is set to the shared DHCPLeaseIfName
+// lease key and NextHop is cleared (mutually exclusive). Idempotent:
+// an already-derived route is left untouched.
 func validateIPMonitoringStrict(cfg *Config) error {
 	ipm := cfg.Services.IPMonitoring
 	if ipm == nil {
@@ -408,14 +418,22 @@ func validateIPMonitoringStrict(cfg *Config) error {
 				return fmt.Errorf("services ip-monitoring policy %q route %q: invalid destination prefix",
 					name, pr.Destination)
 			}
-			nh := net.ParseIP(pr.NextHop)
-			if nh == nil {
-				return fmt.Errorf("services ip-monitoring policy %q route %s: next-hop %q is not a valid IP address",
-					name, pr.Destination, pr.NextHop)
-			}
-			if (dst.IP.To4() == nil) != (nh.To4() == nil) {
-				return fmt.Errorf("services ip-monitoring policy %q route %s: next-hop %q address family does not match destination",
-					name, pr.Destination, pr.NextHop)
+			switch {
+			case pr.NextHopInterface != "":
+				// Already derived (idempotent re-validation).
+			case net.ParseIP(pr.NextHop) != nil:
+				nh := net.ParseIP(pr.NextHop)
+				if (dst.IP.To4() == nil) != (nh.To4() == nil) {
+					return fmt.Errorf("services ip-monitoring policy %q route %s: next-hop %q address family does not match destination",
+						name, pr.Destination, pr.NextHop)
+				}
+			default:
+				leaseIface, err := resolveIPMonitoringInterfaceNextHop(cfg, name, pr, dst)
+				if err != nil {
+					return err
+				}
+				pr.NextHopInterface = leaseIface
+				pr.NextHop = ""
 			}
 			if pr.RoutingInstance != "" {
 				if _, ok := instances[pr.RoutingInstance]; !ok {
@@ -426,6 +444,66 @@ func validateIPMonitoringStrict(cfg *Config) error {
 		}
 	}
 	return nil
+}
+
+// resolveIPMonitoringInterfaceNextHop classifies a non-IP-literal
+// preferred-route next-hop value as a DHCP interface unit reference
+// (#1844 plan §4.1) and returns the Linux lease key the runtime
+// resolver will look up. The accepted form is `<ifd>.<unit-number>`
+// where <ifd> is EXACTLY an interface name as configured under
+// `interfaces` (Junos form, e.g. ge-0/0/3 — the dashed Linux form is
+// not accepted) and <unit-number> is a configured unit of it with
+// `family inet dhcp`. Restrictions (each with a distinct error):
+//
+//   - a bare ifd without `.unit` is rejected;
+//   - management interfaces (fxp*/em*/fab* — the name classes the
+//     daemon binds to the mgmt VRF) are rejected: collectDHCPRoutes
+//     deliberately excludes mgmt leases from FRR, and an overlay route
+//     through the mgmt gateway would leak management routing into the
+//     default table;
+//   - inet6 destinations are rejected (v4-only: DHCPv6 gateways are
+//     RA-discovered link-locals and the snapshot RouteSnapshot has no
+//     device field — v6 support is a wire-protocol follow-up);
+//   - a unit without `family inet dhcp` is rejected (the route tracks
+//     a DHCP-learned gateway by definition; tunnel/loopback units can
+//     never carry unit.DHCP, so no extra type rejection is needed).
+func resolveIPMonitoringInterfaceNextHop(cfg *Config, polName string, pr *PreferredRoute, dst *net.IPNet) (string, error) {
+	val := pr.NextHop
+	if cfg.Interfaces.Interfaces[val] != nil {
+		return "", fmt.Errorf("services ip-monitoring policy %q route %s: interface-typed next-hop requires <ifd>.<unit> (got bare interface %q)",
+			polName, pr.Destination, val)
+	}
+	idx := strings.LastIndex(val, ".")
+	if idx <= 0 || idx == len(val)-1 {
+		return "", fmt.Errorf("services ip-monitoring policy %q route %s: next-hop %q is not a valid IP address or DHCP interface unit",
+			polName, pr.Destination, val)
+	}
+	ifdName, unitStr := val[:idx], val[idx+1:]
+	unitNum, err := strconv.Atoi(unitStr)
+	ifc := cfg.Interfaces.Interfaces[ifdName]
+	if err != nil || unitNum < 0 || ifc == nil {
+		return "", fmt.Errorf("services ip-monitoring policy %q route %s: next-hop %q is not a valid IP address or DHCP interface unit (interface units use the configured Junos name, e.g. ge-0/0/3.0)",
+			polName, pr.Destination, val)
+	}
+	if strings.HasPrefix(ifdName, "fxp") || strings.HasPrefix(ifdName, "em") ||
+		strings.HasPrefix(ifdName, "fab") {
+		return "", fmt.Errorf("services ip-monitoring policy %q route %s: next-hop %q names a management interface; management leases cannot back an ip-monitoring preferred route",
+			polName, pr.Destination, val)
+	}
+	if dst.IP.To4() == nil {
+		return "", fmt.Errorf("services ip-monitoring policy %q route %s: interface-typed next-hop %q is inet-only (DHCPv6 gateways are RA-derived link-locals; inet6 support is a follow-up)",
+			polName, pr.Destination, val)
+	}
+	unit := ifc.Units[unitNum]
+	if unit == nil {
+		return "", fmt.Errorf("services ip-monitoring policy %q route %s: next-hop %q: interface %s has no unit %d",
+			polName, pr.Destination, val, ifdName, unitNum)
+	}
+	if !unit.DHCP {
+		return "", fmt.Errorf("services ip-monitoring policy %q route %s: interface-typed next-hop requires family inet dhcp on %s unit %d",
+			polName, pr.Destination, ifdName, unitNum)
+	}
+	return DHCPLeaseIfName(ifdName, unit), nil
 }
 
 func compileRPM(node *Node, svc *ServicesConfig) error {

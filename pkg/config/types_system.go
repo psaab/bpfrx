@@ -316,7 +316,18 @@ type IPMonitoringPolicy struct {
 type PreferredRoute struct {
 	RoutingInstance string // "" = master; may target instance-type forwarding (FBF, #1827 PR-2)
 	Destination     string // CIDR
-	NextHop         string
+	// NextHop is the literal next-hop IP; "" when the configured
+	// next-hop is interface-typed (#1844). Mutually exclusive with
+	// NextHopInterface.
+	NextHop string
+	// NextHopInterface is the resolved Linux DHCP lease key
+	// (DHCPLeaseIfName: LinuxIfName + optional ".<vlan-id>") when the
+	// configured next-hop names a DHCP-enabled interface unit
+	// (`next-hop ge-0/0/3.0`, #1844). The route then tracks that
+	// unit's DHCP-learned gateway at actuation time. Compile-time
+	// derived; config identity only, never lease state. Mutually
+	// exclusive with NextHop.
+	NextHopInterface string
 	// PreferredMetric is a metric AMONG injected routes for the same
 	// prefix (the tie-break when two policies in FAIL both inject the
 	// same destination — lowest wins, then lexicographic policy name).
@@ -335,8 +346,16 @@ type RouteOverlayEntry struct {
 	RoutingInstance string // "" = master table
 	Destination     string // CIDR
 	NextHop         string
-	Metric          int    // winning preferred-metric (informational downstream)
-	Policy          string // owning policy name (logging/show)
+	// NextHopInterface records the DHCP lease key the NextHop was
+	// resolved from when the owning PreferredRoute is interface-typed
+	// (#1844); "" for literal next-hops. FRR/snapshot consumers read
+	// NextHop only — this field exists so FilterOverlayForConfig can
+	// match an interface-typed entry against the incoming config (the
+	// resolved gateway is runtime state and never equals the config
+	// spec).
+	NextHopInterface string
+	Metric           int    // winning preferred-metric (informational downstream)
+	Policy           string // owning policy name (logging/show)
 }
 
 // RPMConfig holds RPM (Real-time Performance Monitoring) configuration.

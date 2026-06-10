@@ -197,3 +197,230 @@ func TestIPMonitoringValidation(t *testing.T) {
 		})
 	}
 }
+
+// --- #1844: interface-typed (DHCP-tracked) next-hops ---
+
+// dhcpUplinkLines returns interface set lines for the DHCP uplink units
+// the interface-typed next-hop tests reference: unit 0 untagged, unit
+// 50 tagged vlan-id 50, unit 1 tagged vlan-id 80 (the unit-number ≠
+// vlan-id bridging case), and unit 2 static (no dhcp).
+func dhcpUplinkLines() []string {
+	return []string{
+		"set interfaces ge-0/0/3 unit 0 family inet dhcp",
+		"set interfaces ge-0/0/3 unit 50 vlan-id 50",
+		"set interfaces ge-0/0/3 unit 50 family inet dhcp",
+		"set interfaces ge-0/0/3 unit 1 vlan-id 80",
+		"set interfaces ge-0/0/3 unit 1 family inet dhcp",
+		"set interfaces ge-0/0/3 unit 2 family inet address 192.0.2.1/24",
+	}
+}
+
+// TestIPMonitoringInterfaceNextHopFlatSet: the §4.1 example — an
+// interface-typed next-hop compiles to NextHopInterface (the Linux
+// DHCP lease key) with NextHop cleared, in flat set syntax.
+func TestIPMonitoringInterfaceNextHopFlatSet(t *testing.T) {
+	lines := append(rpmProbeLines(), dhcpUplinkLines()...)
+	lines = append(lines,
+		"set services ip-monitoring policy wan-failover match rpm-probe WAN",
+		"set services ip-monitoring policy wan-failover then preferred-route route 0.0.0.0/0 next-hop ge-0/0/3.0",
+	)
+	tree := buildTree(t, lines)
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+	pol := cfg.Services.IPMonitoring.Policies["wan-failover"]
+	if pol == nil || len(pol.PreferredRoutes) != 1 {
+		t.Fatalf("policy = %+v", pol)
+	}
+	pr := pol.PreferredRoutes[0]
+	if pr.NextHopInterface != "ge-0-0-3" {
+		t.Fatalf("NextHopInterface = %q, want ge-0-0-3", pr.NextHopInterface)
+	}
+	if pr.NextHop != "" {
+		t.Fatalf("NextHop = %q, want empty (mutually exclusive with NextHopInterface)", pr.NextHop)
+	}
+}
+
+// TestIPMonitoringInterfaceNextHopHierarchical covers the same form in
+// hierarchical block syntax (dual-AST gotcha, #1796/#1797 class).
+func TestIPMonitoringInterfaceNextHopHierarchical(t *testing.T) {
+	input := `interfaces {
+    ge-0/0/3 {
+        unit 0 {
+            family inet {
+                dhcp;
+            }
+        }
+    }
+}
+services {
+    rpm {
+        probe WAN {
+            test wan-a {
+                target address 1.1.1.1;
+            }
+        }
+    }
+    ip-monitoring {
+        policy wan-failover {
+            match {
+                rpm-probe WAN;
+            }
+            then {
+                preferred-route {
+                    route 0.0.0.0/0 {
+                        next-hop ge-0/0/3.0;
+                    }
+                }
+            }
+        }
+    }
+}
+`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+	pr := cfg.Services.IPMonitoring.Policies["wan-failover"].PreferredRoutes[0]
+	if pr.NextHopInterface != "ge-0-0-3" || pr.NextHop != "" {
+		t.Fatalf("route = %+v, want NextHopInterface=ge-0-0-3 NextHop=\"\"", pr)
+	}
+}
+
+// TestIPMonitoringInterfaceNextHopLeaseKeyDerivation pins the
+// unit-number → vlan-id lease-key bridging (§4.1 check 5): the
+// operator writes the UNIT number; the lease key suffix is the unit's
+// VLAN ID (the DHCP client binds to the VLAN subinterface).
+func TestIPMonitoringInterfaceNextHopLeaseKeyDerivation(t *testing.T) {
+	cases := []struct {
+		nextHop string
+		wantKey string
+	}{
+		{"ge-0/0/3.0", "ge-0-0-3"},     // untagged unit: no suffix
+		{"ge-0/0/3.50", "ge-0-0-3.50"}, // unit 50 vlan-id 50 (coinciding)
+		{"ge-0/0/3.1", "ge-0-0-3.80"},  // unit 1 vlan-id 80 (bridged)
+	}
+	for _, tc := range cases {
+		t.Run(tc.nextHop, func(t *testing.T) {
+			lines := append(rpmProbeLines(), dhcpUplinkLines()...)
+			lines = append(lines,
+				"set services ip-monitoring policy p match rpm-probe WAN",
+				"set services ip-monitoring policy p then preferred-route route 0.0.0.0/0 next-hop "+tc.nextHop,
+			)
+			cfg, err := CompileConfig(buildTree(t, lines))
+			if err != nil {
+				t.Fatalf("compile error: %v", err)
+			}
+			pr := cfg.Services.IPMonitoring.Policies["p"].PreferredRoutes[0]
+			if pr.NextHopInterface != tc.wantKey {
+				t.Fatalf("NextHopInterface = %q, want %q", pr.NextHopInterface, tc.wantKey)
+			}
+		})
+	}
+}
+
+// TestIPMonitoringInterfaceNextHopValidation covers the §4.1 commit
+// rejections for the interface-typed form.
+func TestIPMonitoringInterfaceNextHopValidation(t *testing.T) {
+	policy := func(route, nextHop string) []string {
+		lines := append(rpmProbeLines(), dhcpUplinkLines()...)
+		return append(lines,
+			"set services ip-monitoring policy p match rpm-probe WAN",
+			"set services ip-monitoring policy p then preferred-route route "+route+" next-hop "+nextHop,
+		)
+	}
+	cases := []struct {
+		name    string
+		lines   []string
+		wantErr string
+	}{
+		{
+			name:    "bare ifd rejected",
+			lines:   policy("0.0.0.0/0", "ge-0/0/3"),
+			wantErr: "interface-typed next-hop requires <ifd>.<unit>",
+		},
+		{
+			name:    "unknown interface rejected",
+			lines:   policy("0.0.0.0/0", "ge-9/9/9.0"),
+			wantErr: "is not a valid IP address or DHCP interface unit",
+		},
+		{
+			name:    "dashed linux form rejected",
+			lines:   policy("0.0.0.0/0", "ge-0-0-3.0"),
+			wantErr: "is not a valid IP address or DHCP interface unit",
+		},
+		{
+			name:    "unknown unit rejected",
+			lines:   policy("0.0.0.0/0", "ge-0/0/3.7"),
+			wantErr: "has no unit 7",
+		},
+		{
+			name:    "non-DHCP unit rejected",
+			lines:   policy("0.0.0.0/0", "ge-0/0/3.2"),
+			wantErr: "requires family inet dhcp",
+		},
+		{
+			name:    "inet6 destination rejected",
+			lines:   policy("::/0", "ge-0/0/3.0"),
+			wantErr: "inet-only",
+		},
+		{
+			name: "management interface rejected",
+			lines: append(policy("0.0.0.0/0", "fxp0.0"),
+				"set interfaces fxp0 unit 0 family inet dhcp"),
+			wantErr: "management interface",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := CompileConfig(buildTree(t, tc.lines))
+			if err == nil {
+				t.Fatalf("CompileConfig succeeded, want error containing %q", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("err = %v, want substring %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestIPMonitoringInterfaceNextHopIdempotent: re-running the strict
+// validator on an already-derived config must be a no-op (the derived
+// NextHopInterface short-circuits; NextHop stays cleared).
+func TestIPMonitoringInterfaceNextHopIdempotent(t *testing.T) {
+	lines := append(rpmProbeLines(), dhcpUplinkLines()...)
+	lines = append(lines,
+		"set services ip-monitoring policy p match rpm-probe WAN",
+		"set services ip-monitoring policy p then preferred-route route 0.0.0.0/0 next-hop ge-0/0/3.50",
+	)
+	cfg, err := CompileConfig(buildTree(t, lines))
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+	if err := validateIPMonitoringStrict(cfg); err != nil {
+		t.Fatalf("re-validation error: %v", err)
+	}
+	pr := cfg.Services.IPMonitoring.Policies["p"].PreferredRoutes[0]
+	if pr.NextHopInterface != "ge-0-0-3.50" || pr.NextHop != "" {
+		t.Fatalf("route after re-validation = %+v", pr)
+	}
+}
+
+// TestDHCPLeaseIfName pins the shared helper directly.
+func TestDHCPLeaseIfName(t *testing.T) {
+	if got := DHCPLeaseIfName("ge-0/0/3", &InterfaceUnit{Number: 0}); got != "ge-0-0-3" {
+		t.Fatalf("untagged = %q", got)
+	}
+	if got := DHCPLeaseIfName("ge-0/0/3", &InterfaceUnit{Number: 1, VlanID: 80}); got != "ge-0-0-3.80" {
+		t.Fatalf("tagged = %q", got)
+	}
+	if got := DHCPLeaseIfName("reth0", nil); got != "reth0" {
+		t.Fatalf("nil unit = %q", got)
+	}
+}
