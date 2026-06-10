@@ -1,6 +1,6 @@
 # #1787 — learn_dynamic_neighbor cheap-first rework (per-packet 64-shard bulk lock + heap allocs)
 
-Status: DRAFT v1 — pending adversarial plan review
+Status: DRAFT v2 — round-1 findings folded (Codex PLAN-NEEDS-MAJOR ×3 findings; AGY consumer-audit clean), pending round-2 confirm
 
 ## Issue framing
 
@@ -34,7 +34,7 @@ churn, PLAN-KILL is an acceptable verdict.
 - `insert_if_changed` (sharded_neighbor.rs:138) exists, unused on this path.
 - Per-binding bounded FastMap pattern precedent: `neg_neigh_cache`,
   `resolver_enqueue_throttle` (#1769/#1771).
-- #1769 resolver epoch/generation machinery (`insert_confirmed_if_generation`)
+- #1769 resolver epoch/generation machinery (`insert_confirmed_if_unchanged` (sharded_neighbor.rs:120))
   is adjacent but UNTOUCHED — this plan changes only the RX-learn path.
 
 ## Concrete design
@@ -80,18 +80,38 @@ measurement shows the get() pre-check is still hot.
 
 ### TOCTOU analysis (the hard part)
 
-The pre-check (read locks) and the bulk write are not atomic. Interleaving:
-worker A pre-checks key K (stale → miss), worker B writes K with the same
-MAC, A then bulk-writes the same value — harmless idempotent overwrite.
-A reader between A's pre-check and A's bulk write can still observe the
-OLD pair state — identical to today (the write simply hadn't happened yet).
-The #949 invariant ("both or neither") is preserved because all writes to
-the pair still go through `with_all_shards`. A torn read of a HALF-updated
-pair remains impossible. The only semantic change: a no-op overwrite is
-skipped; readers that previously saw a refreshed-but-identical entry see an
-identical entry. NeighborEntry has no generation/timestamp today (verify:
-sharded_neighbor.rs struct field is `mac` only) so skipping the write is
-observationally equivalent.
+Two distinct interleavings (round-1 Codex finding folded):
+
+1. Miss-then-write (analyzed in v1): worker A pre-checks key K (stale →
+   miss), worker B writes K with the same MAC, A then bulk-writes the same
+   value — harmless idempotent overwrite. Readers between A's pre-check
+   and bulk write see the OLD pair state, identical to today.
+
+2. **Current-then-removed (the v1 gap): linearization semantics.** If the
+   pre-check sees the current MAC and a concurrent remover then deletes
+   the key, the elided write does NOT re-create it (today's unconditional
+   write would have). New semantics, stated explicitly: **a no-op RX learn
+   linearizes at the successful pre-check read — a remove that lands after
+   the read wins.** This is correct for every production remove path:
+   netlink FAILED/delete (neighbor.rs:351), resolver authoritative-FAILED
+   revoke (neighbor_resolver.rs:708), and manager replace/bulk-remove
+   (coordinator/mod.rs:177, :671) all intend the entry GONE; the very next
+   RX packet from that source pre-check-misses and re-learns via the bulk
+   path — one packet of extra resolution latency versus today, in exchange
+   for removes not being raced back in by stale traffic. Document this at
+   the call site.
+
+The #949 "both or neither" invariant is **scoped to this function's pair
+write only** (v1 overstated it): the ARP/NDP learn stage inserts the
+single ingress key via per-key insert (poll_stages.rs:80, :103), so pair
+atomicity was never a global map property. All pair writes from
+`learn_dynamic_neighbor` still go through `with_all_shards`; a torn read
+of THIS pair remains impossible. NeighborEntry is `{ mac }` only
+(types/forwarding.rs:143 — v1 cited the wrong file), no
+generation/timestamp, so eliding an identical write is observationally
+equivalent for all consumers (AGY audited all get() sites: forwarding
+lookup, pending-retry sweep, fabric peer resolution, status count — none
+depend on write side effects).
 
 ## Public API preservation
 
@@ -121,11 +141,14 @@ changes.
 
 ## Test plan
 
-- cargo unit tests: steady-state elision (insert once, re-learn same MAC →
-  map generation/contents unchanged, e.g. by counting with a probe map or
-  asserting no change via get-before/after), change path (MAC flip updates
-  BOTH keys), vlan logical-ifindex pair coverage, multicast/zero-MAC guards
-  untouched.
+- cargo unit tests (round-1 fold: contents-comparison cannot prove
+  elision and RX learn does not bump `neighbors.generation`): factor the
+  decision into a pure helper, e.g.
+  `fn pair_write_needed(current: [Option<[u8;6]>; 2], n: usize, mac: [u8;6]) -> bool`,
+  unit-tested directly (all-current → false; any-miss/any-stale → true).
+  Integration tests assert end-state map contents for: change path (MAC
+  flip updates BOTH keys), first-learn, vlan logical-ifindex pair,
+  removed-key re-learn on next packet, multicast/zero-MAC guards.
 - cargo test --release full suite; 5x flake on the touched module's tests.
 - Go suite untouched (no Go changes).
 - Smoke: standard Pass A v4/v6 push+rev + P12R (regression guard) on the
@@ -149,10 +172,9 @@ changes.
 1. Is the TOCTOU analysis sound — is there any reader that depends on the
    no-op overwrite happening (e.g. as a liveness/refresh signal)? Grep for
    consumers of insert side effects.
-2. Does any path rely on RX-learn REPLACING a resolver-revoked entry with
-   the same MAC (i.e., the no-op write actually re-creating a REMOVED key)?
-   If key was removed, get() misses → bulk path runs → still correct. Verify
-   remove paths.
+2. RESOLVED round 1 (Codex): remove-after-pre-check is the real race —
+   answered by the linearization semantics above (removes win; next packet
+   re-learns). Remove-before-pre-check misses → bulk path → correct.
 3. Should the pre-check use `get()` twice (two shard locks) or a new
    `get_pair()` that locks ≤2 shards once? Is double-get acceptable?
 4. Is Stage 1 alone enough to close the issue, with Stages 2-3 explicitly
