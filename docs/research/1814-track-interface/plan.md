@@ -1,7 +1,6 @@
 # #1814 — VRRP track-interface: nested priority-cost block + make tracking actually work
 
-Status: DRAFT v4 — Codex r2 prescriptions folded (LinuxIfName
-normalization, strict-reject duplicates via compileOpts, priority-0
+Status: CONVERGED PLAN-READY (Codex + AGY + Claude SMR)
 passthrough, order-independent nested-wins). Pending final confirm.
 
 ## Round-1 verdicts and the reframe
