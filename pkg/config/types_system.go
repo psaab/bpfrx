@@ -314,7 +314,7 @@ type IPMonitoringPolicy struct {
 
 // PreferredRoute is one injected route of an ip-monitoring policy.
 type PreferredRoute struct {
-	RoutingInstance string // "" = master; instance-type forwarding REJECTED in PR-1b
+	RoutingInstance string // "" = master; may target instance-type forwarding (FBF, #1827 PR-2)
 	Destination     string // CIDR
 	NextHop         string
 	// PreferredMetric is a metric AMONG injected routes for the same
