@@ -4667,3 +4667,7 @@ top.
 - **Timestamp**: 2026-06-09
   **Action**: #1798 U7 layer 1+2 — strict commit-path control-char validation (compileOpts.sanitizeFreeTextControlChars gate in compileExpanded) + lenient sanitize-with-warning; Store.Load/SyncApply tree scrub via config.SanitizeTreeControlChars
   **File(s)**: pkg/config/freetext.go (new), pkg/config/compiler.go, pkg/configstore/store.go
+
+- **Timestamp**: 2026-06-09
+  **Action**: #1798 U7 layer 3 — render-side control-char sanitizers at every free-text file interpolation (networkd units, frr.conf, swanctl.conf) + audit of Kea/linksetup/ast_format (deliberately left, reasons in commit msg)
+  **File(s)**: pkg/networkd/networkd.go, pkg/frr/policy_render.go, pkg/ipsec/ipsec.go
