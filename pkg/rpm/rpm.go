@@ -3,6 +3,7 @@ package rpm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -283,6 +284,7 @@ func (m *Manager) runProbeLoop(ctx context.Context, probe *config.RPMProbe, test
 func (m *Manager) runSingleTest(ctx context.Context, probeName string, test *config.RPMTest, key string, probeCount int, probeInterval time.Duration, threshold int) {
 	var successes, failures int
 	probeLimit := test.ProbeLimit // 0 = unlimited
+	setupWarned := false
 
 	for i := 0; i < probeCount; i++ {
 		if i > 0 {
@@ -294,6 +296,23 @@ func (m *Manager) runSingleTest(ctx context.Context, probeName string, test *con
 		}
 
 		rtt, err := m.executeProbe(ctx, test, key)
+
+		// ErrProbeSetup = environment/capability failure (raw socket
+		// open denied, marshal): the probe never reached the wire, so
+		// it carries NO path-health signal. Hold the test's current
+		// state completely — no counters, no status change, no
+		// events, no Transition — so ip-monitoring can never actuate
+		// routes off a capability regression (AGY PR #1843 F2). Log
+		// loudly but rate-limited (once per test cycle, i.e. at most
+		// once per test-interval).
+		if errors.Is(err, ErrProbeSetup) {
+			if !setupWarned {
+				setupWarned = true
+				slog.Warn("RPM probe setup failed — holding test state (environment error, not path health)",
+					"probe", probeName, "test", test.Name, "err", err)
+			}
+			continue
+		}
 
 		m.mu.Lock()
 		r := m.results[key]

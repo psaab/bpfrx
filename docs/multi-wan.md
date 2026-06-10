@@ -40,6 +40,12 @@ set services rpm probe WAN test wan-a thresholds successive-loss 3
   and a `destination-interface`.
 - Probe config re-applies on commit, gated on the rendered RPM stanza
   hash — unrelated commits never reset probe state.
+- **Environment errors never move routes**: a probe-socket setup
+  failure (e.g. CAP_NET_RAW lost) holds the test's last state and logs
+  a rate-limited warning instead of marking the test FAILED, so a
+  capability regression cannot inject/withdraw preferred routes
+  fleet-wide. Only genuine on-the-wire failures (timeout, unreachable)
+  drive ip-monitoring.
 
 ## Failover policy (PR-1b)
 

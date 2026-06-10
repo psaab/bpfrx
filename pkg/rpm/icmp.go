@@ -14,6 +14,7 @@ package rpm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -85,6 +86,18 @@ func realICMPListen(network, laddr string, opts probeSockOpts) (net.PacketConn, 
 // on the same raw socket family never cross-match replies.
 var echoIDCounter atomic.Uint32
 
+// ErrProbeSetup marks ENVIRONMENT/capability failures — the probe
+// never reached the wire (raw socket open denied, e.g. CAP_NET_RAW
+// dropped; message marshal). These are NOT path-health signals: the
+// probe loop holds the test's current state (no SuccFail counting, no
+// status change, no events, no Transition callback), so ip-monitoring
+// can never inject or withdraw preferred routes off a capability
+// regression (AGY review on PR #1843, finding F2). A sustained setup
+// failure surfaces via the rate-limited Warn log and the stalled
+// LastProbeAt/TotalSent in `show services rpm`, never via route
+// actuation. Send/receive/timeout errors stay genuine probe failures.
+var ErrProbeSetup = errors.New("probe setup failed")
+
 // probeICMP sends one ICMP (or ICMPv6) echo request to the test target
 // and waits for the matching reply. Returns the measured RTT.
 func (m *Manager) probeICMP(ctx context.Context, test *config.RPMTest, opts probeSockOpts) (time.Duration, error) {
@@ -109,7 +122,10 @@ func (m *Manager) probeICMP(ctx context.Context, test *config.RPMTest, opts prob
 	}
 	conn, err := listen(network, test.SourceAddress, opts)
 	if err != nil {
-		return 0, fmt.Errorf("icmp socket: %w", err)
+		// Capability/environment failure — the echo never reached the
+		// wire. Marked ErrProbeSetup so the probe loop holds state
+		// instead of transitioning to FAILED (AGY PR #1843 F2).
+		return 0, fmt.Errorf("%w: icmp socket: %v", ErrProbeSetup, err)
 	}
 	defer conn.Close()
 
@@ -124,7 +140,7 @@ func (m *Manager) probeICMP(ctx context.Context, test *config.RPMTest, opts prob
 	// fills the checksum on raw IPPROTO_ICMPV6 sockets.
 	wire, err := msg.Marshal(nil)
 	if err != nil {
-		return 0, fmt.Errorf("icmp marshal: %w", err)
+		return 0, fmt.Errorf("%w: icmp marshal: %v", ErrProbeSetup, err)
 	}
 
 	start := time.Now()

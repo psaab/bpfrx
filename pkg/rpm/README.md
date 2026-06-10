@@ -39,6 +39,12 @@ pins probes to devices/next-hops via `SO_BINDTODEVICE` / `SO_MARK`.
   the wire (raw-IP dial + UDP connect fallback — a route-existence
   check), so icmp-ping tests that "always passed" can now fail and can
   now trigger event-options policies. Release-noted behavior change.
+- **Setup errors hold state** (AGY PR #1843 F2): a raw-socket open
+  failure (capability/permission) is `ErrProbeSetup` — the probe loop
+  holds the test's current state (no counters, no status change, no
+  events, no Transition), logs a rate-limited Warn, and ip-monitoring
+  never actuates routes off an environment error. Send/receive/timeout
+  errors stay genuine path failures.
 - The raw-socket seam is injectable (`icmpListenFunc` in `icmp.go`) so
   prober logic is unit-testable without privileges.
 - `destination-interface` takes precedence over the routing-instance
