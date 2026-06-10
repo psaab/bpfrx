@@ -594,7 +594,12 @@ pub(crate) fn worker_loop(
         let ha_runtime = ha_state.load();
         // Only apply commands when pending — avoids lock overhead on
         // every loop iteration in the common (empty-queue) case.
-        let has_commands = commands.try_lock().map(|q| !q.is_empty()).unwrap_or(false);
+        // #1807: a poisoned mutex is recovered (and the poison cleared)
+        // instead of reading as "no commands" — that turned one worker
+        // panic into permanent deafness to coordinator commands.
+        let has_commands = crate::afxdp::worker_queue::try_lock_recover(&commands)
+            .map(|q| !q.is_empty())
+            .unwrap_or(false);
         let command_results = if has_commands {
             apply_worker_commands(
                 &commands,

@@ -319,7 +319,12 @@ pub(super) fn maybe_enqueue_local_tunnel_session(
         );
     }
     for pending in worker_commands {
-        if let Ok(mut pending) = pending.lock() {
+        // #1807: recover-and-push — `if let Ok` silently DROPPED the
+        // local-tunnel UpsertLocal pair for a poisoned worker queue. A
+        // panic between the forward and reverse pushes leaves the
+        // committed prefix (forward only); commands are self-contained.
+        {
+            let mut pending = worker_queue::lock_recover(pending);
             pending.push_back(WorkerCommand::UpsertLocal(entry.clone()));
             if let Some(reverse) = &plan.reverse_session_entry {
                 pending.push_back(WorkerCommand::UpsertLocal(reverse.clone()));
@@ -349,12 +354,12 @@ pub(super) fn wait_for_local_tunnel_session_install(
     deadline_ns: u64,
 ) {
     while monotonic_nanos() < deadline_ns {
-        let all_drained = worker_commands.iter().all(|pending| {
-            pending
-                .lock()
-                .map(|pending| pending.is_empty())
-                .unwrap_or(false)
-        });
+        // #1807: a recovered (previously poisoned) guard is read as a
+        // normal queue — poison used to read as "not drained" and spun
+        // this wait until its deadline.
+        let all_drained = worker_commands
+            .iter()
+            .all(|pending| worker_queue::lock_recover(pending).is_empty());
         if all_drained {
             break;
         }

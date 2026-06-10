@@ -133,11 +133,12 @@ pub(in crate::afxdp) fn redirect_local_cos_request_to_owner(
     let Some(commands) = worker_commands_by_id.get(&owner_worker_id) else {
         return Err(req);
     };
-    if let Ok(mut pending) = commands.lock() {
-        pending.push_back(WorkerCommand::EnqueueShapedLocal(req));
-        return Ok(());
-    }
-    Err(req)
+    // #1807: recover-and-push (same blocking-lock disposition as before)
+    // — poison used to read as enqueue failure, losing the cross-worker
+    // shaped-TX request.
+    let mut pending = crate::afxdp::worker_queue::lock_recover(commands);
+    pending.push_back(WorkerCommand::EnqueueShapedLocal(req));
+    Ok(())
 }
 #[cfg(test)]
 #[inline]

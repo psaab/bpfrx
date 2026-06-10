@@ -39,25 +39,15 @@ impl super::Coordinator {
         self.ha.rg_runtime.store(Arc::new(state));
         if !demoted_rgs.is_empty() {
             for handle in self.workers.handles.values() {
-                // #1790: recover from a poisoned worker command mutex instead
-                // of early-returning. The new HA state was already published
-                // via rg_runtime.store above, so an Err here would make a
-                // retry diff against the demoted state (empty demoted_rgs)
-                // and permanently skip the remaining workers' demote
-                // commands, demote_shared_owner_rgs, and the rg_epochs
-                // bumps. A VecDeque<WorkerCommand> has no invariant a panic
-                // can corrupt; same poison policy as handle_activated_rgs
-                // below and ShardedNeighborMap::lock_shard.
-                let mut pending = match handle.commands.lock() {
-                    Ok(pending) => pending,
-                    Err(poisoned) => {
-                        eprintln!(
-                            "xpf-ha: worker command queue lock poisoned while enqueueing DemoteOwnerRGS for demoted RGs {:?}; recovering inner queue",
-                            demoted_rgs
-                        );
-                        poisoned.into_inner()
-                    }
-                };
+                // #1790/#1807: recover from a poisoned worker command mutex
+                // instead of early-returning. The new HA state was already
+                // published via rg_runtime.store above, so an Err here would
+                // make a retry diff against the demoted state (empty
+                // demoted_rgs) and permanently skip the remaining workers'
+                // demote commands, demote_shared_owner_rgs, and the
+                // rg_epochs bumps. lock_recover applies the uniform
+                // committed-prefix + clear_poison policy (worker_queue.rs).
+                let mut pending = worker_queue::lock_recover(&handle.commands);
                 pending.push_back(WorkerCommand::DemoteOwnerRGS {
                     owner_rgs: demoted_rgs.clone(),
                 });
@@ -119,16 +109,8 @@ impl super::Coordinator {
             .map(|handle| handle.commands.clone())
             .collect::<Vec<_>>();
         for commands in &worker_commands {
-            let mut pending = match commands.lock() {
-                Ok(pending) => pending,
-                Err(poisoned) => {
-                    eprintln!(
-                        "xpf-ha: worker command queue lock poisoned while refreshing activated RGs {:?}; recovering inner queue",
-                        activated_rgs
-                    );
-                    poisoned.into_inner()
-                }
-            };
+            // #1790/#1807: uniform poison recovery (worker_queue.rs).
+            let mut pending = worker_queue::lock_recover(commands);
             pending.push_back(WorkerCommand::RefreshOwnerRGS {
                 owner_rgs: activated_rgs.to_vec(),
             });
@@ -190,19 +172,11 @@ impl super::Coordinator {
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
         for handle in self.workers.handles.values() {
-            // #1790: recover, don't early-return — one dead worker's
+            // #1790/#1807: recover, don't early-return — one dead worker's
             // poisoned queue must not block session export for every
             // HEALTHY worker (the export-ack timeout handles dead workers
             // at the caller). Same policy as update_ha_state above.
-            let mut pending = match handle.commands.lock() {
-                Ok(pending) => pending,
-                Err(poisoned) => {
-                    eprintln!(
-                        "xpf-ha: worker command queue lock poisoned while enqueueing ExportOwnerRGSessions; recovering inner queue"
-                    );
-                    poisoned.into_inner()
-                }
-            };
+            let mut pending = worker_queue::lock_recover(&handle.commands);
             pending.push_back(WorkerCommand::ExportOwnerRGSessions {
                 sequence,
                 owner_rgs: owner_rgs.to_vec(),
@@ -351,17 +325,12 @@ impl super::Coordinator {
             }
         }
         for handle in self.workers.handles.values() {
-            // #1790: recover-and-push instead of silently skipping a
+            // #1790/#1807: recover-and-push instead of silently skipping a
             // poisoned queue (same policy as update_ha_state).
-            let mut pending = match handle.commands.lock() {
-                Ok(pending) => pending,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            {
-                pending.push_back(WorkerCommand::UpsertSynced(entry.clone()));
-                if let Some(reverse) = &reverse_entry {
-                    pending.push_back(WorkerCommand::UpsertSynced(reverse.clone()));
-                }
+            let mut pending = worker_queue::lock_recover(&handle.commands);
+            pending.push_back(WorkerCommand::UpsertSynced(entry.clone()));
+            if let Some(reverse) = &reverse_entry {
+                pending.push_back(WorkerCommand::UpsertSynced(reverse.clone()));
             }
         }
     }
@@ -413,17 +382,12 @@ impl super::Coordinator {
             );
         }
         for handle in self.workers.handles.values() {
-            // #1790: recover-and-push instead of silently skipping a
+            // #1790/#1807: recover-and-push instead of silently skipping a
             // poisoned queue (same policy as update_ha_state).
-            let mut pending = match handle.commands.lock() {
-                Ok(pending) => pending,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            {
-                pending.push_back(WorkerCommand::DeleteSynced(key.clone()));
-                if let Some(reverse_key) = &reverse_key {
-                    pending.push_back(WorkerCommand::DeleteSynced(reverse_key.clone()));
-                }
+            let mut pending = worker_queue::lock_recover(&handle.commands);
+            pending.push_back(WorkerCommand::DeleteSynced(key.clone()));
+            if let Some(reverse_key) = &reverse_key {
+                pending.push_back(WorkerCommand::DeleteSynced(reverse_key.clone()));
             }
         }
     }

@@ -4703,3 +4703,7 @@ top.
   persist_failure_test.go (new), README.md}, pkg/api/{server.go, health.go,
   health_test.go, metrics.go, metrics_descriptors.go,
   metrics_persist_degraded_test.go (new), README.md}, pkg/daemon/daemon_run.go
+
+- **Timestamp**: 2026-06-10
+  **Action**: "#1807 commit 1 — worker_queue.rs lock_recover/try_lock_recover poison-recovery helpers; converted all 14 production Mutex<VecDeque<WorkerCommand>> sites (incl. five #1790 ha.rs retrofits); rewrote the contradictory 'unrecoverable' comment in tx/drain; helper unit tests + session_glue poison regression tests"
+  **File(s)**: userspace-dp/src/afxdp/{worker_queue.rs,worker_queue_tests.rs,mod.rs,ha.rs,shared_ops.rs,tunnel.rs,cos/cross_binding.rs,tx/drain/mod.rs,worker/loop_body/mod.rs,session_glue/mod.rs,session_glue/tests.rs}
