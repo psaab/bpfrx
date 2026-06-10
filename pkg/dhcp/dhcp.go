@@ -560,10 +560,13 @@ func (m *Manager) LeaseFor(ifaceName string, af AddressFamily) *Lease {
 // and which clobbered the other family's servers with no merge — is
 // removed.
 
-// runDHCPv4 runs the DHCPv4 DORA cycle with retries and renewal.
-// Note: our client always performs a full DORA (Discover→Offer→Request→Ack)
-// on every cycle, including renewal. This is effectively force-discover
-// behavior, so the ForceDiscover option requires no special handling.
+// runDHCPv4 runs the DHCPv4 acquisition and renewal cycle. Each
+// exchange is a full DORA (Discover→Offer→Request→Ack) — effectively
+// force-discover behavior, so the ForceDiscover option requires no
+// special handling. A successful T1 renew or T2 rebind commits the
+// renewed lease via commitLease and returns to the T1 wait (#1777);
+// only when both attempts fail (or the renewed lease cannot be
+// applied) does the loop fall back to a fresh acquisition.
 func (m *Manager) runDHCPv4(ctx context.Context, ifaceName string) {
 	key := clientKey{iface: ifaceName, family: AFInet}
 
@@ -582,6 +585,11 @@ func (m *Manager) runDHCPv4(ctx context.Context, ifaceName string) {
 
 	backoff := baseBackoff
 	attempt := 0
+
+	// committed is the lease currently applied to the interface (nil
+	// until the first successful acquisition). commitLease compares
+	// against it to detect address moves and content changes.
+	var committed *Lease
 
 	for {
 		if ctx.Err() != nil {
@@ -616,18 +624,12 @@ func (m *Manager) runDHCPv4(ctx context.Context, ifaceName string) {
 		backoff = baseBackoff // reset on success
 		attempt = 0
 
-		// Apply address
-		if err := m.applyAddress(ifaceName, lease); err != nil {
+		if err := m.commitLease(key, lease, committed, nil, nil); err != nil {
 			slog.Warn("DHCPv4: failed to apply address",
 				"interface", ifaceName, "err", err)
 			continue
 		}
-
-		m.mu.Lock()
-		m.leases[key] = lease
-		m.mu.Unlock()
-
-		m.scheduleRecompile()
+		committed = lease
 
 		slog.Info("DHCPv4: lease obtained",
 			"interface", ifaceName,
@@ -635,56 +637,69 @@ func (m *Manager) runDHCPv4(ctx context.Context, ifaceName string) {
 			"gateway", lease.Gateway,
 			"lease_time", lease.LeaseTime)
 
-		// Wait for T1 (50% of lease time) for renewal
-		t1 := lease.LeaseTime / 2
-		if t1 < 30*time.Second {
-			t1 = 30 * time.Second
-		}
+		// Renewal cycle: stay in this loop while T1 renews / T2 rebinds
+		// keep succeeding; break out only to re-acquire from scratch.
+		for {
+			t1, t2Remaining := renewalTimers(committed.LeaseTime)
 
-		select {
-		case <-time.After(t1):
-			slog.Info("DHCPv4: T1 expired, renewing", "interface", ifaceName)
-		case <-ctx.Done():
-			m.removeAddress(ifaceName, lease)
-			m.mu.Lock()
-			delete(m.leases, key)
-			m.mu.Unlock()
-			return
-		}
+			// Wait for T1 (50% of lease time) for renewal
+			select {
+			case <-time.After(t1):
+				slog.Info("DHCPv4: T1 expired, renewing", "interface", ifaceName)
+			case <-ctx.Done():
+				m.removeAddress(ifaceName, committed)
+				m.mu.Lock()
+				delete(m.leases, key)
+				m.mu.Unlock()
+				return
+			}
 
-		// T1 renewal attempt
-		lease2, err := m.doDHCPv4(ctx, ifaceName)
-		if err == nil {
-			lease = lease2
-			continue // apply new lease at top of loop
-		}
-		slog.Warn("DHCPv4: T1 renewal failed, waiting for T2",
-			"interface", ifaceName, "err", err)
+			// T1 renewal attempt
+			renewed, rerr := m.doDHCPv4(ctx, ifaceName)
+			if rerr == nil {
+				if cerr := m.commitLease(key, renewed, committed, nil, nil); cerr != nil {
+					slog.Warn("DHCPv4: failed to apply renewed lease, re-acquiring",
+						"interface", ifaceName, "err", cerr)
+					break
+				}
+				committed = renewed
+				slog.Info("DHCPv4: lease renewed",
+					"interface", ifaceName, "address", renewed.Address,
+					"lease_time", renewed.LeaseTime)
+				continue
+			}
+			slog.Warn("DHCPv4: T1 renewal failed, waiting for T2",
+				"interface", ifaceName, "err", rerr)
 
-		// Wait for T2 (87.5% of lease) — remaining time after T1
-		t2remaining := lease.LeaseTime*7/8 - lease.LeaseTime/2
-		if t2remaining < time.Second {
-			t2remaining = time.Second
-		}
-		select {
-		case <-time.After(t2remaining):
-		case <-ctx.Done():
-			m.removeAddress(ifaceName, lease)
-			m.mu.Lock()
-			delete(m.leases, key)
-			m.mu.Unlock()
-			return
-		}
+			// Wait for T2 (87.5% of lease) — remaining time after T1
+			select {
+			case <-time.After(t2Remaining):
+			case <-ctx.Done():
+				m.removeAddress(ifaceName, committed)
+				m.mu.Lock()
+				delete(m.leases, key)
+				m.mu.Unlock()
+				return
+			}
 
-		// T2 rebind attempt
-		lease2, err = m.doDHCPv4(ctx, ifaceName)
-		if err == nil {
-			lease = lease2
-			continue
+			// T2 rebind attempt
+			renewed, rerr = m.doDHCPv4(ctx, ifaceName)
+			if rerr == nil {
+				if cerr := m.commitLease(key, renewed, committed, nil, nil); cerr != nil {
+					slog.Warn("DHCPv4: failed to apply rebound lease, re-acquiring",
+						"interface", ifaceName, "err", cerr)
+					break
+				}
+				committed = renewed
+				slog.Info("DHCPv4: lease rebound",
+					"interface", ifaceName, "address", renewed.Address,
+					"lease_time", renewed.LeaseTime)
+				continue
+			}
+			slog.Warn("DHCPv4: T2 rebind failed, lease will expire, re-acquiring",
+				"interface", ifaceName, "err", rerr)
+			break // fall back to a fresh DORA
 		}
-		slog.Warn("DHCPv4: T2 rebind failed, lease will expire",
-			"interface", ifaceName, "err", err)
-		// Let the loop restart with a fresh DORA
 	}
 }
 
@@ -764,7 +779,11 @@ func (m *Manager) doDHCPv4(ctx context.Context, ifaceName string) (*Lease, error
 	return lease, nil
 }
 
-// runDHCPv6 runs the DHCPv6 solicit/request cycle with retries and renewal.
+// runDHCPv6 runs the DHCPv6 solicit/request cycle with retries and
+// renewal. A successful T1 renew or T2 rebind commits the renewed
+// lease (and any delegated prefixes) via commitLease and returns to
+// the T1 wait (#1777); only when both attempts fail does the loop fall
+// back to a fresh solicit / information-request.
 func (m *Manager) runDHCPv6(ctx context.Context, ifaceName string) {
 	key := clientKey{iface: ifaceName, family: AFInet6}
 	backoff := time.Second
@@ -781,6 +800,15 @@ func (m *Manager) runDHCPv6(ctx context.Context, ifaceName string) {
 			"interface", ifaceName, "err", err)
 		return
 	}
+
+	// committed / committedPDs track the lease and delegated prefixes
+	// currently applied (nil/empty until the first success). In
+	// stateless mode the lease never carries an address, so commitLease
+	// skips the address apply/remove paths via Address.IsValid().
+	var (
+		committed    *Lease
+		committedPDs []DelegatedPrefix
+	)
 
 	for {
 		if ctx.Err() != nil {
@@ -810,99 +838,112 @@ func (m *Manager) runDHCPv6(ctx context.Context, ifaceName string) {
 		}
 
 		backoff = time.Second
-		lease := result.lease
 
-		if !stateless && lease.Address.IsValid() {
-			if err := m.applyAddress(ifaceName, lease); err != nil {
-				slog.Warn("DHCPv6: failed to apply address",
-					"interface", ifaceName, "err", err)
-				continue
-			}
+		// #1715: DNS install is not done here. lease.DNS is stored by
+		// commitLease and the daemon's reconcileDNS reads it from
+		// Leases(); the debounced onAddressChange callback (fired by
+		// commitLease when lease content changed) drives the reconcile.
+		if err := m.commitLease(key, result.lease, committed, result.prefixes, committedPDs); err != nil {
+			slog.Warn("DHCPv6: failed to apply address",
+				"interface", ifaceName, "err", err)
+			continue
 		}
-
-		// #1715: DNS install is no longer done here. lease.DNS is stored
-		// below and the daemon's reconcileDNS reads it from Leases();
-		// the debounced scheduleRecompile() (further down) fires the
-		// onAddressChange callback that drives the reconcile.
-
-		m.mu.Lock()
-		m.leases[key] = lease
+		committed = result.lease
 		if len(result.prefixes) > 0 {
-			m.delegatedPDs[ifaceName] = result.prefixes
+			committedPDs = result.prefixes
 		}
-		m.mu.Unlock()
-
-		m.scheduleRecompile()
 
 		if stateless {
 			slog.Info("DHCPv6: stateless options obtained",
 				"interface", ifaceName,
-				"dns", lease.DNS)
+				"dns", committed.DNS)
 		} else {
 			slog.Info("DHCPv6: lease obtained",
 				"interface", ifaceName,
-				"address", lease.Address,
+				"address", committed.Address,
 				"delegated_prefixes", len(result.prefixes),
-				"lease_time", lease.LeaseTime)
+				"lease_time", committed.LeaseTime)
 		}
 
-		// Wait for T1
-		t1 := lease.LeaseTime / 2
-		if t1 < 30*time.Second {
-			t1 = 30 * time.Second
-		}
+		// Renewal cycle: stay in this loop while T1 renews / T2 rebinds
+		// keep succeeding; break out only to re-acquire from scratch.
+		for {
+			t1, t2Remaining := renewalTimers(committed.LeaseTime)
 
-		select {
-		case <-time.After(t1):
-			slog.Info("DHCPv6: T1 expired, renewing", "interface", ifaceName)
-		case <-ctx.Done():
-			if !stateless && lease.Address.IsValid() {
-				m.removeAddress(ifaceName, lease)
+			// Wait for T1
+			select {
+			case <-time.After(t1):
+				slog.Info("DHCPv6: T1 expired, renewing", "interface", ifaceName)
+			case <-ctx.Done():
+				if committed.Address.IsValid() {
+					m.removeAddress(ifaceName, committed)
+				}
+				m.mu.Lock()
+				delete(m.leases, key)
+				delete(m.delegatedPDs, ifaceName)
+				m.mu.Unlock()
+				return
 			}
-			m.mu.Lock()
-			delete(m.leases, key)
-			delete(m.delegatedPDs, ifaceName)
-			m.mu.Unlock()
-			return
-		}
 
-		// T1 renewal attempt
-		result2, err := m.doDHCPv6(ctx, ifaceName)
-		if err == nil {
-			result = result2
-			lease = result.lease
-			continue // apply at top of loop
-		}
-		slog.Warn("DHCPv6: T1 renewal failed, waiting for T2",
-			"interface", ifaceName, "err", err)
-
-		// Wait for T2 (87.5% of lease) — remaining time after T1
-		t2remaining := lease.LeaseTime*7/8 - lease.LeaseTime/2
-		if t2remaining < time.Second {
-			t2remaining = time.Second
-		}
-		select {
-		case <-time.After(t2remaining):
-		case <-ctx.Done():
-			if !stateless && lease.Address.IsValid() {
-				m.removeAddress(ifaceName, lease)
+			// T1 renewal attempt
+			renewed, rerr := m.doDHCPv6(ctx, ifaceName)
+			if rerr == nil {
+				if cerr := m.commitLease(key, renewed.lease, committed, renewed.prefixes, committedPDs); cerr != nil {
+					slog.Warn("DHCPv6: failed to apply renewed lease, re-acquiring",
+						"interface", ifaceName, "err", cerr)
+					break
+				}
+				committed = renewed.lease
+				if len(renewed.prefixes) > 0 {
+					committedPDs = renewed.prefixes
+				}
+				slog.Info("DHCPv6: lease renewed",
+					"interface", ifaceName,
+					"address", committed.Address,
+					"delegated_prefixes", len(renewed.prefixes),
+					"lease_time", committed.LeaseTime)
+				continue
 			}
-			m.mu.Lock()
-			delete(m.leases, key)
-			delete(m.delegatedPDs, ifaceName)
-			m.mu.Unlock()
-			return
-		}
+			slog.Warn("DHCPv6: T1 renewal failed, waiting for T2",
+				"interface", ifaceName, "err", rerr)
 
-		// T2 rebind attempt
-		result2, err = m.doDHCPv6(ctx, ifaceName)
-		if err == nil {
-			result = result2
-			lease = result.lease
-			continue
+			// Wait for T2 (87.5% of lease) — remaining time after T1
+			select {
+			case <-time.After(t2Remaining):
+			case <-ctx.Done():
+				if committed.Address.IsValid() {
+					m.removeAddress(ifaceName, committed)
+				}
+				m.mu.Lock()
+				delete(m.leases, key)
+				delete(m.delegatedPDs, ifaceName)
+				m.mu.Unlock()
+				return
+			}
+
+			// T2 rebind attempt
+			renewed, rerr = m.doDHCPv6(ctx, ifaceName)
+			if rerr == nil {
+				if cerr := m.commitLease(key, renewed.lease, committed, renewed.prefixes, committedPDs); cerr != nil {
+					slog.Warn("DHCPv6: failed to apply rebound lease, re-acquiring",
+						"interface", ifaceName, "err", cerr)
+					break
+				}
+				committed = renewed.lease
+				if len(renewed.prefixes) > 0 {
+					committedPDs = renewed.prefixes
+				}
+				slog.Info("DHCPv6: lease rebound",
+					"interface", ifaceName,
+					"address", committed.Address,
+					"delegated_prefixes", len(renewed.prefixes),
+					"lease_time", committed.LeaseTime)
+				continue
+			}
+			slog.Warn("DHCPv6: T2 rebind failed, lease will expire, re-acquiring",
+				"interface", ifaceName, "err", rerr)
+			break // fall back to a fresh solicit
 		}
-		slog.Warn("DHCPv6: T2 rebind failed, lease will expire",
-			"interface", ifaceName, "err", err)
 	}
 }
 
