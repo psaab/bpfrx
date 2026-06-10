@@ -385,6 +385,10 @@ mod coordinator;
 mod tests;
 #[path = "worker/mod.rs"]
 mod worker;
+// #1807: shared poison-recovery helpers (lock_recover /
+// try_lock_recover) for every Mutex<VecDeque<WorkerCommand>> access.
+#[path = "worker_queue.rs"]
+mod worker_queue;
 #[path = "worker_runtime.rs"]
 mod worker_runtime;
 pub use self::coordinator::Coordinator;

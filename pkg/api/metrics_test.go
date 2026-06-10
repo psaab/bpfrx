@@ -651,6 +651,12 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 			nil,
 			nil,
 		),
+		userspaceWorkerCommandQueuePoisonRecoveries: prometheus.NewDesc(
+			"xpf_userspace_worker_command_queue_poison_recoveries_total",
+			"worker command-queue poison recoveries",
+			nil,
+			nil,
+		),
 		userspaceFlowCacheActiveFlows: prometheus.NewDesc(
 			"xpf_userspace_flow_cache_active_flows",
 			"flow-cache active flows",
@@ -675,6 +681,8 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 		MaxSessions:         100,
 		// #1789: publish-error counter emitted unconditionally.
 		SessionPublishErrorsTotal: 6,
+		// #1807: poison-recovery counter emitted unconditionally.
+		WorkerCommandQueuePoisonRecoveries: 2,
 		Bindings: []dpuserspace.BindingStatus{
 			{
 				Slot:              0,
@@ -704,8 +712,8 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	for m := range ch {
 		got = append(got, m)
 	}
-	if len(got) != 8 {
-		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 8 metrics, got %d", len(got))
+	if len(got) != 9 {
+		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 9 metrics, got %d", len(got))
 	}
 
 	assertGaugeClose(t, got, c.userspaceSessionTableEntries, nil, 77)
@@ -715,6 +723,8 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	assertCounterClose(t, got, c.userspaceNatReverseKeyCollisions, nil, 0)
 	// #1789: publish-error counter emitted unconditionally.
 	assertCounterClose(t, got, c.userspaceSessionPublishErrors, nil, 6)
+	// #1807: poison-recovery counter emitted unconditionally.
+	assertCounterClose(t, got, c.userspaceWorkerCommandQueuePoisonRecoveries, nil, 2)
 	assertGaugeClose(t, got, c.userspaceFlowCacheActiveFlows, nil, 12)
 	assertGaugeClose(t, got, c.userspaceFlowCacheCapacity, nil, 20)
 	assertGaugeClose(t, got, c.bindingFlowCacheCapacity, map[string]string{

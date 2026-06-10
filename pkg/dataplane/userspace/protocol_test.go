@@ -1421,3 +1421,45 @@ func TestProcessStatusEventStreamFieldsParity1642(t *testing.T) {
 		}
 	}
 }
+
+// #1807: wire pin for the worker-command-queue poison-recovery counter.
+// The Rust helper serializes ProcessStatus.worker_command_queue_poison_recoveries
+// (serde rename in userspace-dp/src/protocol/control.rs); a key rename on
+// either side silently decodes as zero, so pin the tag here and verify
+// the pre-#1807 (key absent) payload defaults to zero.
+func TestProcessStatusWorkerCommandQueuePoisonRecoveriesRoundTrip(t *testing.T) {
+	in := ProcessStatus{
+		WorkerCommandQueuePoisonRecoveries: 3,
+	}
+	raw, err := json.Marshal(&in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("unmarshal obj: %v", err)
+	}
+	if _, ok := obj["worker_command_queue_poison_recoveries"]; !ok {
+		t.Fatalf("wire key %q missing from ProcessStatus JSON: %s",
+			"worker_command_queue_poison_recoveries", string(raw))
+	}
+
+	var back ProcessStatus
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatalf("unmarshal ProcessStatus: %v", err)
+	}
+	if back.WorkerCommandQueuePoisonRecoveries != in.WorkerCommandQueuePoisonRecoveries {
+		t.Fatalf("WorkerCommandQueuePoisonRecoveries: got %d, want %d",
+			back.WorkerCommandQueuePoisonRecoveries, in.WorkerCommandQueuePoisonRecoveries)
+	}
+
+	// Pre-#1807 helper payload (key absent) must decode to zero.
+	var legacy ProcessStatus
+	if err := json.Unmarshal([]byte(`{}`), &legacy); err != nil {
+		t.Fatalf("unmarshal legacy ProcessStatus: %v", err)
+	}
+	if legacy.WorkerCommandQueuePoisonRecoveries != 0 {
+		t.Fatalf("legacy WorkerCommandQueuePoisonRecoveries: got %d, want 0",
+			legacy.WorkerCommandQueuePoisonRecoveries)
+	}
+}

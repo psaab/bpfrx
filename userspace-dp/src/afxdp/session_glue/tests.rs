@@ -3928,3 +3928,120 @@ fn apply_worker_commands_dispatch_order_pin_with_demote_dedup() {
         "DemoteOwnerRGS first-occurrence order must be preserved"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #1807: worker-side command-queue poison recovery. A panic that poisons
+// a worker command mutex must not make the consumer permanently deaf
+// (apply_worker_commands) nor make producers silently drop replicas
+// (replicate_session_upsert/delete). Poison shape mirrors the #1790
+// ha_tests regression: a thread panics while holding the lock.
+// ---------------------------------------------------------------------------
+
+fn poison_command_queue(queue: &Arc<Mutex<VecDeque<WorkerCommand>>>) {
+    let to_poison = queue.clone();
+    let poisoner = std::thread::spawn(move || {
+        let _guard = to_poison.lock().expect("lock before poisoning");
+        panic!("poison worker command mutex");
+    })
+    .join();
+    assert!(poisoner.is_err(), "poisoning thread must panic");
+    assert!(queue.is_poisoned(), "queue mutex must be poisoned");
+}
+
+fn test_synced_entry() -> SyncedSessionEntry {
+    SyncedSessionEntry {
+        key: test_key(),
+        decision: test_decision(),
+        metadata: test_metadata(),
+        origin: SessionOrigin::SyncImport,
+        protocol: PROTO_TCP,
+        tcp_flags: TCP_FLAG_ACK,
+    }
+}
+
+#[test]
+fn apply_worker_commands_recovers_poisoned_queue_and_processes_commands() {
+    let commands = Arc::new(Mutex::new(VecDeque::new()));
+    commands
+        .lock()
+        .expect("commands lock")
+        .push_back(WorkerCommand::ExportOwnerRGSessions {
+            sequence: 21,
+            owner_rgs: vec![1],
+        });
+    poison_command_queue(&commands);
+
+    let mut sessions = SessionTable::new();
+    let forwarding = test_forwarding_state_with_fabric();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+    let mut ha_state = BTreeMap::new();
+    ha_state.insert(1, active_ha_runtime(monotonic_nanos() / 1_000_000_000));
+    let results = apply_worker_commands(
+        &commands,
+        &mut sessions,
+        -1,
+        -1,
+        -1,
+        &forwarding,
+        &ha_state,
+        &dynamic_neighbors,
+    );
+
+    // The queued command was processed (NOT the empty "deaf" result the
+    // pre-#1807 Err arm returned).
+    assert_eq!(
+        results.exported_sequences,
+        vec![21],
+        "poisoned queue must be recovered and its commands processed"
+    );
+    // clear_poison: the queue is drained and a plain lock() works again.
+    assert!(!commands.is_poisoned(), "poison must be cleared");
+    let pending = commands.lock().expect("plain lock after recovery");
+    assert!(pending.is_empty(), "recovered queue must be drained");
+}
+
+#[test]
+fn replicate_session_upsert_delivers_to_poisoned_queue() {
+    let queues: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = (0..2)
+        .map(|_| Arc::new(Mutex::new(VecDeque::new())))
+        .collect();
+    poison_command_queue(&queues[1]);
+
+    let entry = test_synced_entry();
+    replicate_session_upsert(&queues, &entry);
+
+    for (worker_id, queue) in queues.iter().enumerate() {
+        let pending = queue.lock().expect("queue unpoisoned after replicate");
+        assert!(
+            pending
+                .iter()
+                .any(|command| matches!(command, WorkerCommand::UpsertSynced(replica)
+                    if replica.key == entry.key)),
+            "worker {worker_id} missing UpsertSynced replica"
+        );
+    }
+    assert!(!queues[1].is_poisoned(), "poison must be cleared");
+}
+
+#[test]
+fn replicate_session_delete_delivers_to_poisoned_queue() {
+    let queues: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = (0..2)
+        .map(|_| Arc::new(Mutex::new(VecDeque::new())))
+        .collect();
+    poison_command_queue(&queues[0]);
+
+    let key = test_key();
+    replicate_session_delete(&queues, &key);
+
+    for (worker_id, queue) in queues.iter().enumerate() {
+        let pending = queue.lock().expect("queue unpoisoned after replicate");
+        assert!(
+            pending
+                .iter()
+                .any(|command| matches!(command, WorkerCommand::DeleteSynced(deleted)
+                    if deleted == &key)),
+            "worker {worker_id} missing DeleteSynced"
+        );
+    }
+    assert!(!queues[0].is_poisoned(), "poison must be cleared");
+}

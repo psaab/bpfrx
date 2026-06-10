@@ -72,6 +72,37 @@ fn process_status_buffer_capacity_fields_roundtrip() {
     assert_eq!(back.worker_runtime[0].max_sessions, 100);
 }
 
+// #1807: round-trip + backward-compat pin for the worker-command-queue
+// poison-recovery counter. The wire key feeds
+// pkg/dataplane/userspace/protocol.go and the Prometheus counter
+// `xpf_userspace_worker_command_queue_poison_recoveries_total`.
+#[test]
+fn process_status_worker_command_queue_poison_recoveries_roundtrip() {
+    let status = ProcessStatus {
+        worker_command_queue_poison_recoveries: 3,
+        ..Default::default()
+    };
+    let value: serde_json::Value =
+        serde_json::to_value(&status).expect("serialize ProcessStatus to Value");
+    assert_eq!(value["worker_command_queue_poison_recoveries"], 3);
+    let back: ProcessStatus = serde_json::from_value(value).expect("deserialize ProcessStatus");
+    assert_eq!(back.worker_command_queue_poison_recoveries, 3);
+
+    // Pre-#1807 payload (key absent) must decode with a zero default.
+    // ProcessStatus has required fields, so build the legacy document by
+    // stripping the new key from a serialized Default instance.
+    let mut legacy_value =
+        serde_json::to_value(ProcessStatus::default()).expect("serialize default ProcessStatus");
+    legacy_value
+        .as_object_mut()
+        .expect("ProcessStatus serializes to an object")
+        .remove("worker_command_queue_poison_recoveries")
+        .expect("new key present before strip");
+    let legacy: ProcessStatus =
+        serde_json::from_value(legacy_value).expect("pre-#1807 payload decodes");
+    assert_eq!(legacy.worker_command_queue_poison_recoveries, 0);
+}
+
 // #1621 plan v2 + Copilot code-r1 C4: round-trip the new cold-path
 // histogram fields through serde to confirm:
 //   1. Default (zero / empty) WorkerRuntimeStatus omits every

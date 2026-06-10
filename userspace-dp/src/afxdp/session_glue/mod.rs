@@ -469,8 +469,12 @@ pub(super) fn apply_worker_commands(
     // Hot path: try_lock avoids blocking on the mutex when another thread
     // holds it (rare) and avoids the cost of lock+unlock on empty queues
     // when there's nothing to do (common case during steady-state forwarding).
-    let pending = match commands.try_lock() {
-        Ok(mut pending) => {
+    // #1807: a poisoned mutex is recovered (committed-prefix + clear_poison
+    // policy, worker_queue.rs) and the recovered deque is processed as
+    // normal — treating poison as absence-of-work made the worker
+    // permanently deaf to coordinator commands.
+    let pending = match worker_queue::try_lock_recover(commands) {
+        Some(mut pending) => {
             if pending.is_empty() {
                 return WorkerCommandResults {
                     cancelled_keys: Vec::new(),
@@ -481,7 +485,7 @@ pub(super) fn apply_worker_commands(
             }
             core::mem::take(&mut *pending)
         }
-        Err(_) => {
+        None => {
             return WorkerCommandResults {
                 cancelled_keys: Vec::new(),
                 exported_sequences: Vec::new(),
@@ -595,9 +599,10 @@ pub(super) fn replicate_session_upsert(
 ) {
     let replica = synced_replica_entry(entry);
     for commands in worker_commands {
-        if let Ok(mut pending) = commands.lock() {
-            pending.push_back(WorkerCommand::UpsertSynced(replica.clone()));
-        }
+        // #1807: recover-and-push — `if let Ok` silently DROPPED the
+        // UpsertSynced replica for a poisoned worker queue.
+        let mut pending = worker_queue::lock_recover(commands);
+        pending.push_back(WorkerCommand::UpsertSynced(replica.clone()));
     }
 }
 
@@ -606,9 +611,10 @@ pub(super) fn replicate_session_delete(
     key: &SessionKey,
 ) {
     for commands in worker_commands {
-        if let Ok(mut pending) = commands.lock() {
-            pending.push_back(WorkerCommand::DeleteSynced(key.clone()));
-        }
+        // #1807: recover-and-push — `if let Ok` silently DROPPED the
+        // DeleteSynced replica for a poisoned worker queue.
+        let mut pending = worker_queue::lock_recover(commands);
+        pending.push_back(WorkerCommand::DeleteSynced(key.clone()));
     }
 }
 

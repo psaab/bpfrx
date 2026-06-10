@@ -176,6 +176,17 @@ pub(crate) struct ProcessStatus {
     /// Additive / defaulted for backward compatibility.
     #[serde(rename = "session_publish_errors_total", default)]
     pub session_publish_errors_total: u64,
+    /// #1807: total worker-command-queue poison recoveries (a thread
+    /// panicked while holding a `Mutex<VecDeque<WorkerCommand>>`; the
+    /// committed queue was recovered via into_inner and the poison
+    /// cleared — uniform policy in afxdp/worker_queue.rs, extends
+    /// #1790). Nonzero means a worker panic happened and the command
+    /// queues kept flowing instead of going permanently deaf. Surfaced
+    /// as the Prometheus counter
+    /// `xpf_userspace_worker_command_queue_poison_recoveries_total`.
+    /// Additive / defaulted for backward compatibility.
+    #[serde(rename = "worker_command_queue_poison_recoveries", default)]
+    pub worker_command_queue_poison_recoveries: u64,
     /// #1782 cold-start capture instrumentation. Debug dump of every key
     /// present in the userspace `dynamic_neighbors` mirror, rendered as
     /// `"ifindex ip"` strings. The capture harness greps this at the

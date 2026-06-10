@@ -177,9 +177,10 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
             SESSION_PUBLISH_ERRORS_SHARED.fetch_add(1, Ordering::Relaxed);
         }
         for commands in worker_commands {
-            if let Ok(mut pending) = commands.lock() {
-                pending.push_back(WorkerCommand::UpsertSynced(forward.clone()));
-            }
+            // #1807: recover-and-push — `if let Ok` silently DROPPED the
+            // activation-prewarm UpsertSynced for a poisoned worker queue.
+            let mut pending = worker_queue::lock_recover(commands);
+            pending.push_back(WorkerCommand::UpsertSynced(forward.clone()));
         }
     }
     if fwd_publish_errors > 0 {
@@ -213,9 +214,10 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
             }
         }
         for commands in worker_commands {
-            if let Ok(mut pending) = commands.lock() {
-                pending.push_back(WorkerCommand::UpsertSynced(reverse.clone()));
-            }
+            // #1807: recover-and-push — `if let Ok` silently DROPPED the
+            // reverse-prewarm UpsertSynced for a poisoned worker queue.
+            let mut pending = worker_queue::lock_recover(commands);
+            pending.push_back(WorkerCommand::UpsertSynced(reverse.clone()));
         }
     }
 }

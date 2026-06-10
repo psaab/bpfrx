@@ -4705,6 +4705,16 @@ top.
   metrics_persist_degraded_test.go (new), README.md}, pkg/daemon/daemon_run.go
 
 - **Timestamp**: 2026-06-10
+  **Action**: "#1807 commit 1 — worker_queue.rs lock_recover/try_lock_recover poison-recovery helpers; converted all 14 production Mutex<VecDeque<WorkerCommand>> sites (incl. five #1790 ha.rs retrofits); rewrote the contradictory 'unrecoverable' comment in tx/drain; helper unit tests + session_glue poison regression tests"
+  **File(s)**: userspace-dp/src/afxdp/{worker_queue.rs,worker_queue_tests.rs,mod.rs,ha.rs,shared_ops.rs,tunnel.rs,cos/cross_binding.rs,tx/drain/mod.rs,worker/loop_body/mod.rs,session_glue/mod.rs,session_glue/tests.rs}
+
+- **Timestamp**: 2026-06-10
+  **Action**: "#1807 commit 2 — wire the poison-recovery counter end to end (U4 SESSION_PUBLISH_ERRORS pattern): coordinator/status.rs accessor -> server/helpers.rs -> ProcessStatus worker_command_queue_poison_recoveries -> protocol.go -> pkg/api Prometheus counter xpf_userspace_worker_command_queue_poison_recoveries_total; wire fixture regen + Rust/Go round-trip + descriptor coverage tests"
+  **File(s)**: userspace-dp/src/{afxdp/coordinator/status.rs,server/helpers.rs,server/lifecycle.rs,protocol/control.rs,protocol/tests.rs}, userspace-dp/tests/fixtures/protocol_wire_v1.json, pkg/dataplane/userspace/{protocol.go,protocol_test.go}, pkg/api/{metrics.go,metrics_descriptors.go,metrics_userspace.go,metrics_test.go,metrics_descriptor_coverage_test.go}
+
+- **Timestamp**: 2026-06-10
+  **Action**: "#1807 commit 3 — documented the worker command-queue poison policy (#1790 -> #1807, committed-prefix + clear_poison + counter) in the afxdp module README; no pre-existing doc covered the #1790 policy"
+  **File(s)**: userspace-dp/src/afxdp/README.md
   **Action**: #1814 — parse nested vrrp-group `track-interface <if> {
   priority-cost <n>; }` (schema child + compiler child walk reading
   Keys[1] + nested-wins-over-legacy-sibling order-independent apply),
