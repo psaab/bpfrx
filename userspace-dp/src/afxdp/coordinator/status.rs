@@ -545,6 +545,24 @@ impl super::Coordinator {
                     cos_queue_lease_acquire_v8_calls: s.cos_queue_lease_acquire_v8_calls,
                     cos_queue_lease_acquire_v8_granted_bytes: s
                         .cos_queue_lease_acquire_v8_granted_bytes,
+                    // #1782 Step-1: wheel catch-up + per-cause v8
+                    // under-grant attribution.
+                    cos_wheel_ticks_advanced_total: s.cos_wheel_ticks_advanced_total,
+                    cos_wheel_ticks_advanced_max: s.cos_wheel_ticks_advanced_max,
+                    cos_queue_lease_undergrant_seqlock_give_up: s
+                        .cos_queue_lease_undergrant
+                        .seqlock_give_up,
+                    cos_queue_lease_undergrant_cap_zero: s.cos_queue_lease_undergrant.cap_zero,
+                    cos_queue_lease_undergrant_epoch_rotated: s
+                        .cos_queue_lease_undergrant
+                        .epoch_rotated,
+                    cos_queue_lease_undergrant_share_exhausted: s
+                        .cos_queue_lease_undergrant
+                        .share_exhausted,
+                    cos_queue_lease_undergrant_class_cap: s.cos_queue_lease_undergrant.class_cap,
+                    cos_queue_lease_undergrant_outstanding_cap: s
+                        .cos_queue_lease_undergrant
+                        .outstanding_cap,
                     session_table_entries: s.session_table_entries,
                     max_sessions: s.max_sessions,
                     nat_reverse_key_collisions: s.nat_reverse_key_collisions,

@@ -497,6 +497,39 @@ pub(in crate::afxdp) enum V8RateMode {
     EqualFlowSuppress,
 }
 
+/// #1782 Step-1 (§5.2 mechanism (ii) disambiguation): the bound that
+/// ended an `acquire_v8` call short of its request. `None` means the
+/// request was fully granted (or no shortfall attribution applies —
+/// `requested == 0` / legacy-lease / out-of-range debug paths).
+/// `EpochRotated` is additive beyond the plan's five named causes: a
+/// tag-checked break caused by a concurrent epoch rotation is a
+/// transient, not a capacity bound, and folding it into
+/// `ShareExhausted`/`ClassCap` would corrupt the per-cause attribution
+/// the Step-1 counters exist to provide.
+///
+/// Consumed by the selector sites in `cos/queue_service/mod.rs`: the
+/// cause is only COUNTED when the post-top-up `queue.hot.tokens <
+/// head_len` comparison shows the queue could not service its head
+/// (plan r2 F1 — `acquire_v8` itself never sees `head_len`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::afxdp) enum AcquireV8ShortfallCause {
+    /// Fully granted, or no v8 shortfall attribution applies.
+    #[default]
+    None,
+    /// `snapshot_epoch_v8` gave up after `MAX_SEQ_SPINS`.
+    SeqlockGiveUp,
+    /// Stable epoch snapshot returned `cap == 0`.
+    CapZero,
+    /// Tag-checked read/CAS observed a concurrent epoch rotation.
+    EpochRotated,
+    /// This worker's fair share (`my_effective_share`) is consumed.
+    ShareExhausted,
+    /// The class-wide epoch cap (`cap`) is consumed.
+    ClassCap,
+    /// `try_bump_outstanding` hit `max_total_leased`.
+    OutstandingCap,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::afxdp) enum V8EqualFlowFailOpenReason {
     None = 0,
@@ -1227,12 +1260,26 @@ impl SharedCoSQueueLease {
         now_ns: u64,
         requested: u64,
     ) -> u64 {
+        self.acquire_v8_with_cause(worker_id, now_ns, requested).0
+    }
+
+    /// #1782 Step-1: `acquire_v8` plus the shortfall cause that ended
+    /// the call short of `requested` (`AcquireV8ShortfallCause::None`
+    /// when fully granted). The cause is tracked at the existing break
+    /// sites — no extra atomics, no extra loop work — so the hot path
+    /// cost is a couple of register writes.
+    pub(in crate::afxdp) fn acquire_v8_with_cause(
+        &self,
+        worker_id: usize,
+        now_ns: u64,
+        requested: u64,
+    ) -> (u64, AcquireV8ShortfallCause) {
         let Some(v8) = self.v8.as_ref() else {
             debug_assert!(false, "acquire_v8 called on legacy lease");
-            return 0;
+            return (0, AcquireV8ShortfallCause::None);
         };
         if requested == 0 {
-            return 0;
+            return (0, AcquireV8ShortfallCause::None);
         }
         if v8.worker_grants.get(worker_id).is_none() {
             debug_assert!(
@@ -1241,7 +1288,7 @@ impl SharedCoSQueueLease {
                 worker_id,
                 v8.worker_grants.len()
             );
-            return 0;
+            return (0, AcquireV8ShortfallCause::None);
         }
 
         // Phase 1: maybe rotate.
@@ -1249,11 +1296,16 @@ impl SharedCoSQueueLease {
 
         // Phase 2: seqlock snapshot of stable epoch state.
         let Some((cap, my_share, grace, my_tag)) = self.snapshot_epoch_v8(worker_id) else {
-            return 0; // gave up after MAX_SEQ_SPINS
+            // gave up after MAX_SEQ_SPINS
+            return (0, AcquireV8ShortfallCause::SeqlockGiveUp);
         };
         if cap == 0 {
-            return 0;
+            return (0, AcquireV8ShortfallCause::CapZero);
         }
+        // #1782 Step-1: last limiting bound observed at a break site.
+        // Overwritten as the call progresses; only reported when the
+        // call ends with `still_needed > 0`.
+        let mut shortfall = AcquireV8ShortfallCause::None;
 
         let active_flows = v8
             .worker_active_flow_buckets
@@ -1295,17 +1347,21 @@ impl SharedCoSQueueLease {
             let my_curr = my_pg.0.load(Ordering::Acquire);
             let (my_curr_tag, my_consumed) = PackedEpochGrant::unpack(my_curr);
             if my_curr_tag != my_tag {
+                shortfall = AcquireV8ShortfallCause::EpochRotated;
                 break; // rotation happened; abandon primary
             }
             if (my_consumed as u64) >= my_effective_share {
+                shortfall = AcquireV8ShortfallCause::ShareExhausted;
                 break; // primary share exhausted
             }
             let class_curr = v8.epoch.packed_granted.0.load(Ordering::Acquire);
             let (class_tag, class_granted) = PackedEpochGrant::unpack(class_curr);
             if class_tag != my_tag {
+                shortfall = AcquireV8ShortfallCause::EpochRotated;
                 break;
             }
             if (class_granted as u64) >= cap {
+                shortfall = AcquireV8ShortfallCause::ClassCap;
                 break;
             }
             let class_room = cap - class_granted as u64;
@@ -1337,6 +1393,7 @@ impl SharedCoSQueueLease {
                     take as u32,
                     &v8.epoch.rollback_retry_exceeded,
                 );
+                shortfall = AcquireV8ShortfallCause::OutstandingCap;
                 break; // outstanding cap reached for this epoch
             }
             // Step C: bump my worker grant. If tag mismatched (rotation
@@ -1415,9 +1472,11 @@ impl SharedCoSQueueLease {
                 let class_curr = v8.epoch.packed_granted.0.load(Ordering::Acquire);
                 let (class_tag, class_granted) = PackedEpochGrant::unpack(class_curr);
                 if class_tag != my_tag {
+                    shortfall = AcquireV8ShortfallCause::EpochRotated;
                     break;
                 }
                 if (class_granted as u64) >= cap {
+                    shortfall = AcquireV8ShortfallCause::ClassCap;
                     break;
                 }
                 let class_room = cap - class_granted as u64;
@@ -1447,6 +1506,7 @@ impl SharedCoSQueueLease {
                         take as u32,
                         &v8.epoch.rollback_retry_exceeded,
                     );
+                    shortfall = AcquireV8ShortfallCause::OutstandingCap;
                     break;
                 }
                 let _ = worker_grant_bump(&v8.worker_grants[worker_id], my_tag, take as u32);
@@ -1460,7 +1520,15 @@ impl SharedCoSQueueLease {
             }
         }
 
-        total_granted
+        // #1782 Step-1: report the last limiting bound only when the
+        // call actually ended short. A fully-granted call may have
+        // touched a break site on an earlier loop iteration via the
+        // `still_needed == 0` exit and must report `None`.
+        if still_needed == 0 {
+            (total_granted, AcquireV8ShortfallCause::None)
+        } else {
+            (total_granted, shortfall)
+        }
     }
 
     /// #1229 Phase 6 v8: returns the per-worker active-flow-bucket

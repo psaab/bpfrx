@@ -180,6 +180,97 @@ fn v8_acquire_returns_zero_on_zero_request() {
     assert_eq!(granted, 0, "zero request → zero grant");
 }
 
+// #1782 Step-1 (ii): `acquire_v8_with_cause` shortfall attribution
+// pins. The cause enum feeds the per-worker
+// `cos_queue_lease_undergrant_*` wire counters, so the mapping from
+// exhaustion path to reported cause is a contract.
+
+#[test]
+fn v8_acquire_with_cause_full_grant_reports_none() {
+    let lease = SharedCoSQueueLease::new_v8(12_500_000, 64 * 1024, 1, 0);
+    lease.rehydrate_worker_active_count(0, 1);
+    // Request well below the per-epoch cap (~2500 bytes at 12.5 MB/s
+    // x 200 us) so the primary path grants in full.
+    let (granted, cause) = lease.acquire_v8_with_cause(0, EPOCH_DURATION_NS, 100);
+    assert_eq!(granted, 100, "small request must be granted in full");
+    assert_eq!(
+        cause,
+        AcquireV8ShortfallCause::None,
+        "fully-granted acquire must report no shortfall cause"
+    );
+}
+
+#[test]
+fn v8_acquire_with_cause_no_active_flows_reports_share_exhausted() {
+    // No rehydration -> my_fair_share == 0 for every worker (see
+    // v8_acquire_zero_when_no_active_flows). The zero-grant exits via
+    // the `my_consumed >= my_effective_share` primary break, so the
+    // attributed cause is ShareExhausted.
+    let lease = SharedCoSQueueLease::new_v8(10_000_000, 64 * 1024, 2, 1);
+    let (granted, cause) = lease.acquire_v8_with_cause(0, 1_000_000, 4_096);
+    assert_eq!(granted, 0, "no active flows -> no grants");
+    assert_eq!(
+        cause,
+        AcquireV8ShortfallCause::ShareExhausted,
+        "zero fair share must be attributed to ShareExhausted"
+    );
+}
+
+#[test]
+fn v8_acquire_with_cause_over_request_reports_capacity_bound() {
+    let lease = SharedCoSQueueLease::new_v8(12_500_000, 64 * 1024, 1, 0);
+    lease.rehydrate_worker_active_count(0, 1);
+    // Request far above the per-epoch cap. The grant ends short on a
+    // capacity bound; which one (share, class cap, or outstanding
+    // credit) depends on the lease config interplay, but it must be a
+    // real capacity cause, never None and never a transient.
+    let (granted, cause) = lease.acquire_v8_with_cause(0, EPOCH_DURATION_NS, 1_000_000);
+    assert!(granted > 0, "active single-flow worker should get a grant");
+    assert!(granted < 1_000_000, "grant must be short of the request");
+    assert!(
+        matches!(
+            cause,
+            AcquireV8ShortfallCause::ShareExhausted
+                | AcquireV8ShortfallCause::ClassCap
+                | AcquireV8ShortfallCause::OutstandingCap
+        ),
+        "under-grant must be attributed to a capacity bound, got {cause:?}"
+    );
+}
+
+#[test]
+fn v8_acquire_with_cause_zero_request_reports_none() {
+    let lease = SharedCoSQueueLease::new_v8(10_000_000, 64 * 1024, 2, 1);
+    lease.rehydrate_worker_active_count(0, 1);
+    let (granted, cause) = lease.acquire_v8_with_cause(0, 1_000_000, 0);
+    assert_eq!(granted, 0);
+    assert_eq!(
+        cause,
+        AcquireV8ShortfallCause::None,
+        "requested == 0 carries no shortfall attribution"
+    );
+}
+
+#[test]
+fn v8_acquire_wrapper_matches_with_cause_grant() {
+    // The legacy-signature wrapper must stay byte-identical in grant
+    // behavior to the cause-reporting variant (serial calls on two
+    // identically-configured leases).
+    let lease_a = SharedCoSQueueLease::new_v8(12_500_000, 64 * 1024, 1, 0);
+    let lease_b = SharedCoSQueueLease::new_v8(12_500_000, 64 * 1024, 1, 0);
+    lease_a.rehydrate_worker_active_count(0, 1);
+    lease_b.rehydrate_worker_active_count(0, 1);
+    for (now, req) in [
+        (EPOCH_DURATION_NS, 1_000u64),
+        (EPOCH_DURATION_NS, 10_000),
+        (2 * EPOCH_DURATION_NS, 4_096),
+    ] {
+        let g_wrap = lease_a.acquire_v8(0, now, req);
+        let (g_cause, _) = lease_b.acquire_v8_with_cause(0, now, req);
+        assert_eq!(g_wrap, g_cause, "wrapper grant diverged at ({now}, {req})");
+    }
+}
+
 #[test]
 fn v8_rehydrate_then_acquire_grants_proportional_share() {
     // 100 Mbps = 12.5 MB/s. EPOCH_DURATION_NS = 200µs → cap = 2500

@@ -14,9 +14,11 @@ use std::sync::Arc;
 
 use crate::afxdp::{tx_frame_capacity, COS_EXACT_QUEUE_LEASE_BANK_BYTES};
 use crate::afxdp::types::{
-    CoSInterfaceRuntime, CoSQueueRuntime, SharedCoSQueueLease, SharedCoSRootLease,
+    AcquireV8ShortfallCause, CoSInterfaceRuntime, CoSQueueRuntime, SharedCoSQueueLease,
+    SharedCoSRootLease,
 };
 use crate::afxdp::worker::BindingWorker;
+use crate::afxdp::worker_runtime::CoSQueueLeaseUndergrantCounters;
 
 /// Universal floor for both root and per-queue burst-byte caps
 /// (64 × default MTU = 96 KB). Sized so a single max-len frame can
@@ -32,6 +34,19 @@ pub(in crate::afxdp) const COS_MIN_BURST_BYTES: u64 = 64 * 1500;
 pub(in crate::afxdp) struct CoSQueueLeaseAcquireTelemetry {
     pub(in crate::afxdp) v8_calls: u64,
     pub(in crate::afxdp) v8_granted_bytes: u64,
+    /// #1782 Step-1 (ii): shortfall cause reported by the most recent
+    /// v8 acquire observed through this telemetry value. On a per-call
+    /// `maybe_top_up_cos_queue_lease` return this is exactly that
+    /// call's cause (`None` when no v8 acquire ran or it granted in
+    /// full); on an accumulated value `add_assign` keeps the latest
+    /// non-`None` cause as a diagnostic. The selector sites read the
+    /// PER-CALL value before merging, so accumulation semantics never
+    /// drive counting.
+    pub(in crate::afxdp) v8_shortfall_cause: AcquireV8ShortfallCause,
+    /// #1782 Step-1 (ii): per-cause under-grant counts recorded by the
+    /// selector sites via `count_v8_undergrant` (only when the
+    /// post-top-up `queue.hot.tokens < head_len` comparison fails).
+    pub(in crate::afxdp) v8_undergrants: CoSQueueLeaseUndergrantCounters,
 }
 
 impl CoSQueueLeaseAcquireTelemetry {
@@ -41,12 +56,49 @@ impl CoSQueueLeaseAcquireTelemetry {
         self.v8_granted_bytes = self
             .v8_granted_bytes
             .wrapping_add(other.v8_granted_bytes);
+        if other.v8_shortfall_cause != AcquireV8ShortfallCause::None {
+            self.v8_shortfall_cause = other.v8_shortfall_cause;
+        }
+        self.v8_undergrants.add_assign(&other.v8_undergrants);
     }
 
     #[inline]
-    fn record_v8_grant(&mut self, granted: u64) {
+    fn record_v8_grant(&mut self, granted: u64, cause: AcquireV8ShortfallCause) {
         self.v8_calls = self.v8_calls.wrapping_add(1);
         self.v8_granted_bytes = self.v8_granted_bytes.wrapping_add(granted);
+        self.v8_shortfall_cause = cause;
+    }
+
+    /// #1782 Step-1 (ii): attribute one under-grant observation
+    /// (`queue.hot.tokens < head_len` after a top-up) to the given v8
+    /// shortfall cause. `None` is deliberately NOT counted — those
+    /// under-grants are ordinary token pacing (legacy lease, no lease,
+    /// or a fully-granted acquire still below `head_len` watermarks)
+    /// already visible via `drain_park_queue_tokens`.
+    #[inline]
+    pub(in crate::afxdp) fn count_v8_undergrant(&mut self, cause: AcquireV8ShortfallCause) {
+        let c = &mut self.v8_undergrants;
+        match cause {
+            AcquireV8ShortfallCause::None => {}
+            AcquireV8ShortfallCause::SeqlockGiveUp => {
+                c.seqlock_give_up = c.seqlock_give_up.wrapping_add(1);
+            }
+            AcquireV8ShortfallCause::CapZero => {
+                c.cap_zero = c.cap_zero.wrapping_add(1);
+            }
+            AcquireV8ShortfallCause::EpochRotated => {
+                c.epoch_rotated = c.epoch_rotated.wrapping_add(1);
+            }
+            AcquireV8ShortfallCause::ShareExhausted => {
+                c.share_exhausted = c.share_exhausted.wrapping_add(1);
+            }
+            AcquireV8ShortfallCause::ClassCap => {
+                c.class_cap = c.class_cap.wrapping_add(1);
+            }
+            AcquireV8ShortfallCause::OutstandingCap => {
+                c.outstanding_cap = c.outstanding_cap.wrapping_add(1);
+            }
+        }
     }
 }
 
@@ -98,9 +150,9 @@ fn acquire_via_lease(
 ) -> (u64, CoSQueueLeaseAcquireTelemetry) {
     if lease.is_v8() {
         let worker_id = queue.v_min.worker_id as usize;
-        let granted = lease.acquire_v8(worker_id, now_ns, requested);
+        let (granted, cause) = lease.acquire_v8_with_cause(worker_id, now_ns, requested);
         let mut telemetry = CoSQueueLeaseAcquireTelemetry::default();
-        telemetry.record_v8_grant(granted);
+        telemetry.record_v8_grant(granted, cause);
         (granted, telemetry)
     } else {
         (

@@ -1208,6 +1208,91 @@ fn apply_promotion_pairs_queues_with_their_fast_path_entries() {
     );
 }
 
+// #1782 Step-1: end-to-end pin for BOTH cold-start instruments through
+// drain_shaped_tx — (ii) the selector-site per-cause v8 under-grant
+// attribution (post-top-up `queue.hot.tokens < head_len`, plan r2 F1)
+// and (i) the timer-wheel tick-advance sum/max accumulated on
+// `WorkerCos` by `prime_cos_root_for_service`.
+#[test]
+fn drain_counts_v8_undergrant_cause_and_wheel_ticks() {
+    let mut root = test_cos_runtime_with_queues(
+        100_000_000 / 8,
+        vec![CoSQueueConfig {
+            queue_id: 4,
+            forwarding_class: "iperf-a".into(),
+            priority: 5,
+            transmit_rate_bytes: 100_000_000 / 8,
+            guarantee_enabled: true,
+            exact: true,
+            surplus_sharing: false,
+            equal_flow_enforcement: false,
+            surplus_weight: 1,
+            buffer_bytes: COS_MIN_BURST_BYTES,
+            dscp_rewrite: None,
+            codel_target_ns: 0,
+        }],
+    );
+    root.tokens = 100_000;
+    root.nonempty_queues = 1;
+    root.runnable_queues = 1;
+    root.queues[0].hot.tokens = 0;
+    root.queues[0].hot.runnable = true;
+    root.queues[0].v_min.worker_id = 0;
+    cos_queue_push_back(&mut root.queues[0], test_flow_cos_item(10_000, 1500));
+
+    // v8 lease with ZERO active flows anywhere: the lazy lease install
+    // rehydrates from this queue's (absent) flow-fair state, so
+    // acquire_v8 grants nothing and reports ShareExhausted (pinned by
+    // v8_acquire_with_cause_no_active_flows_reports_share_exhausted).
+    let lease = Arc::new(SharedCoSQueueLease::new_v8(
+        100_000_000 / 8,
+        256 * 1024,
+        1,
+        0,
+    ));
+
+    let fast_interfaces = test_cos_fast_interfaces(
+        42,
+        42,
+        4,
+        vec![(4, test_queue_fast_path(true, 0, None, Some(lease.clone())))],
+        None,
+        None,
+    );
+    let fast_path = fast_interfaces.get(&42).expect("test fast path").clone();
+    let mut binding = BindingWorker::new_for_cos_drain_test(0, 0, 42, root, fast_path);
+    let mut shared_recycles = Vec::new();
+
+    let now_ns = 3 * TEST_EPOCH_DURATION_NS;
+    let drained = drain_shaped_tx(&mut binding, now_ns, &mut shared_recycles);
+    assert!(
+        drained.is_none(),
+        "token-starved exact queue must not drain"
+    );
+
+    // (ii): exactly one under-grant, attributed to ShareExhausted.
+    let ug = binding.cos.cos_queue_lease_undergrants;
+    assert!(
+        ug.share_exhausted >= 1,
+        "selector site must attribute the starvation to ShareExhausted, got {ug:?}"
+    );
+    assert_eq!(ug.seqlock_give_up, 0, "no seqlock give-up here: {ug:?}");
+    assert_eq!(ug.cap_zero, 0, "no cap-zero here: {ug:?}");
+    assert_eq!(ug.epoch_rotated, 0, "no rotation race here: {ug:?}");
+
+    // (i): the single prime call advanced the wheel from tick 0 to
+    // cos_tick(now_ns); sum and single-call high-water mark agree.
+    let expected_ticks = now_ns / 50_000; // COS_TIMER_WHEEL_TICK_NS
+    assert_eq!(
+        binding.cos.cos_wheel_ticks_advanced_total, expected_ticks,
+        "wheel tick sum"
+    );
+    assert_eq!(
+        binding.cos.cos_wheel_ticks_advanced_max, expected_ticks,
+        "wheel tick single-call max"
+    );
+}
+
 #[test]
 fn equal_flow_cap_reaches_drain_shaped_tx_entry_path() {
     let mut root = test_cos_runtime_with_queues(

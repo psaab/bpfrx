@@ -1,0 +1,53 @@
+# #1827 PR-2 — two-upstream FBF lab fixture (loss userspace cluster).
+#
+# Layers a second, distinguishable upstream onto the baseline cluster
+# config (docs/ha-cluster-userspace.conf):
+#
+#   ISP-A (baseline) : reth0.50, gw 172.16.50.1 — the existing master
+#                      default route. NOT defined here.
+#   ISP-B (this file): reth0.80, gw 172.16.80.1 / 2001:559:8585:80::1 —
+#                      an `instance-type forwarding` FBF instance.
+#
+# Composition under test (plan §5 PR-2 row):
+#   1. forwarding instance with its own statics → rendered by FRR into
+#      the instance's kernel table (`table <id>`, divergence fix) and
+#      by the dataplane under `ISP-B.inet.0` / `ISP-B.inet6.0`;
+#   2. FBF steering filter on the LAN ingress: DSCP af31 traffic is
+#      steered into ISP-B with a per-policy hit counter (`then count`);
+#      everything else takes the normal master-table path (ISP-A);
+#   3. ip-monitoring preferred-route INTO the FBF instance (the PR-1b
+#      commit-rejection lifted in PR-2): while the ISP-B gateway probe
+#      is FAILED, ISP-B.inet.0's default is repointed at the ISP-A
+#      gateway at distance 1, so steered traffic falls back instead of
+#      blackholing.
+#
+# Applied/removed atomically by test/incus/test-fbf-steering.sh.
+# The ISP-B v4 gateway is sed-replaced by the harness when
+# FBF_ISP_B_GW4 is set (for runs where 172.16.80.1 is not a router).
+
+# --- 1. ISP-B forwarding instance (second upstream) ---
+set routing-instances ISP-B instance-type forwarding
+set routing-instances ISP-B routing-options static route 0.0.0.0/0 next-hop 172.16.80.1
+set routing-instances ISP-B routing-options rib ISP-B.inet6.0 static route ::/0 next-hop 2001:559:8585:80::1
+
+# --- 2. FBF steering filter: DSCP af31 -> ISP-B, counted ---
+set firewall family inet filter fbf-steer term to-isp-b from dscp af31
+set firewall family inet filter fbf-steer term to-isp-b then count fbf-isp-b
+set firewall family inet filter fbf-steer term to-isp-b then routing-instance ISP-B
+set firewall family inet filter fbf-steer term default then accept
+set firewall family inet6 filter fbf-steer6 term to-isp-b from traffic-class af31
+set firewall family inet6 filter fbf-steer6 term to-isp-b then count fbf-isp-b6
+set firewall family inet6 filter fbf-steer6 term to-isp-b then routing-instance ISP-B
+set firewall family inet6 filter fbf-steer6 term default then accept
+set interfaces reth1 unit 0 family inet filter input fbf-steer
+set interfaces reth1 unit 0 family inet6 filter input fbf-steer6
+
+# --- 3. Probe ISP-B's gateway; on FAIL repoint the FBF instance at ISP-A ---
+set services rpm probe FBF-ISP-B test gw probe-type icmp-ping
+set services rpm probe FBF-ISP-B test gw target address 172.16.80.1
+set services rpm probe FBF-ISP-B test gw destination-interface reth0.80
+set services rpm probe FBF-ISP-B test gw probe-interval 2
+set services rpm probe FBF-ISP-B test gw thresholds successive-loss 3
+set services ip-monitoring policy fbf-fallback match rpm-probe FBF-ISP-B
+set services ip-monitoring policy fbf-fallback then preferred-route routing-instance ISP-B route 0.0.0.0/0 next-hop 172.16.50.1
+set services ip-monitoring policy fbf-fallback hold-down 5

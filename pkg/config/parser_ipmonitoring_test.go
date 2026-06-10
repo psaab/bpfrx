@@ -175,15 +175,6 @@ func TestIPMonitoringValidation(t *testing.T) {
 			wantErr: `routing-instance "GHOST" does not exist`,
 		},
 		{
-			name: "forwarding instance-type rejected",
-			lines: append(rpmProbeLines(),
-				"set routing-instances FBF instance-type forwarding",
-				"set services ip-monitoring policy p match rpm-probe WAN",
-				"set services ip-monitoring policy p then preferred-route routing-instance FBF route 0.0.0.0/0 next-hop 10.0.0.1",
-			),
-			wantErr: "instance-type forwarding, which is not supported yet",
-		},
-		{
 			name: "negative hold-down rejected",
 			lines: append(rpmProbeLines(),
 				"set services ip-monitoring policy p match rpm-probe WAN",
