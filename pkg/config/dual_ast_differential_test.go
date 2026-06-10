@@ -115,6 +115,51 @@ var dualASTCases = []dualASTCase{
 		expectedFail: false,
 	},
 	{
+		// Junos multi-value bracketed list spelling: every address in
+		// `virtual-address [ a b ];` must survive both AST shapes
+		// (AGY review on PR #1813 — nodeVal kept only the first).
+		name: "interfaces-vrrp-group-bracketed-virtual-address",
+		hier: `interfaces {
+    reth1 {
+        unit 0 {
+            family inet {
+                address 10.0.61.1/24 {
+                    vrrp-group 1 {
+                        virtual-address [ 10.0.61.3 10.0.61.4 ];
+                        priority 200;
+                    }
+                }
+            }
+        }
+    }
+}`,
+		expectedFail: false,
+	},
+	{
+		// Braced block spelling: `virtual-address { a; b; }` holds one
+		// child per address (AGY review on PR #1813 — nodeVal's
+		// Children[0] fallback dropped all but the first).
+		name: "interfaces-vrrp-group-virtual-address-block",
+		hier: `interfaces {
+    reth1 {
+        unit 0 {
+            family inet {
+                address 10.0.61.1/24 {
+                    vrrp-group 1 {
+                        virtual-address {
+                            10.0.61.3;
+                            10.0.61.4;
+                        }
+                        priority 200;
+                    }
+                }
+            }
+        }
+    }
+}`,
+		expectedFail: false,
+	},
+	{
 		name: "security-zones-address-book",
 		hier: `security {
     zones {
@@ -644,6 +689,30 @@ services {
 }`,
 		// Fixed in U5b (#1797): dhcp-relay subtree added to setSchema and
 		// compileDHCPRelay also reads inline Keys-encoded properties.
+		expectedFail: false,
+	},
+	{
+		// Braced block spelling: `interface { a; b; }` holds one child
+		// per interface (AGY review on PR #1813 — nodeVal's Children[0]
+		// fallback compiled 1 interface hierarchically vs 2 flat, a real
+		// dual-AST divergence).
+		name: "forwarding-options-dhcp-relay-interface-block",
+		hier: `forwarding-options {
+    dhcp-relay {
+        server-group {
+            sg1 {
+                10.1.1.1;
+            }
+        }
+        group lan {
+            active-server-group sg1;
+            interface {
+                ge-0/0/0.0;
+                ge-0/0/1.0;
+            }
+        }
+    }
+}`,
 		expectedFail: false,
 	},
 	{

@@ -6,6 +6,21 @@ import (
 	"strings"
 )
 
+// vrrpGroupPropertyKeywords are the property keywords recognized inside
+// a vrrp-group block. Used to delimit multi-value runs (virtual-address)
+// when properties are packed into a single node's Keys (#1813).
+var vrrpGroupPropertyKeywords = map[string]bool{
+	"virtual-address":     true,
+	"priority":            true,
+	"preempt":             true,
+	"accept-data":         true,
+	"advertise-interval":  true,
+	"authentication-type": true,
+	"authentication-key":  true,
+	"track-interface":     true,
+	"track-priority-cost": true,
+}
+
 func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 	for _, child := range node.Children {
 		if child.IsLeaf {
@@ -347,7 +362,13 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 								for i := 2; i < len(keys); i++ {
 									switch keys[i] {
 									case "virtual-address":
-										if i+1 < len(keys) {
+										// Multi-value (#1813): consume every
+										// following token up to the next
+										// recognized property keyword —
+										// `vrrp-group 1 virtual-address
+										// [ a b ];` packs all addresses
+										// inline.
+										for i+1 < len(keys) && !vrrpGroupPropertyKeywords[keys[i+1]] {
 											i++
 											vg.VirtualAddresses = append(vg.VirtualAddresses, keys[i])
 										}
@@ -392,8 +413,21 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 								for _, prop := range vrrpInst.node.Children {
 									switch prop.Name() {
 									case "virtual-address":
-										if v := nodeVal(prop); v != "" {
-											vg.VirtualAddresses = append(vg.VirtualAddresses, v)
+										// Multi-value spellings (#1813):
+										// bracketed `virtual-address [ a b ];`
+										// packs all addresses into Keys[1:]
+										// (flat-set replay may carry trailing
+										// values as children); braced block
+										// `virtual-address { a; b; }` holds
+										// one child per address. nodeVal kept
+										// only the first of each.
+										for _, k := range prop.Keys[1:] {
+											vg.VirtualAddresses = append(vg.VirtualAddresses, k)
+										}
+										for _, child := range prop.Children {
+											if v := child.Name(); v != "" {
+												vg.VirtualAddresses = append(vg.VirtualAddresses, v)
+											}
 										}
 									case "priority":
 										if v := nodeVal(prop); v != "" {

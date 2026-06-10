@@ -600,10 +600,10 @@ func compileDHCPRelay(node *Node, fo *ForwardingOptionsConfig) error {
 		for i := 2; i < len(sgInst.node.Keys); i++ {
 			sg.Servers = append(sg.Servers, sgInst.node.Keys[i])
 		}
+		// Block form: every child is a server address; a child line may
+		// itself carry several addresses in its Keys (#1813).
 		for _, child := range sgInst.node.Children {
-			if len(child.Keys) >= 1 {
-				sg.Servers = append(sg.Servers, child.Keys[0])
-			}
+			sg.Servers = append(sg.Servers, child.Keys...)
 		}
 	}
 
@@ -619,7 +619,12 @@ func compileDHCPRelay(node *Node, fo *ForwardingOptionsConfig) error {
 		for i := 2; i < len(keys); i++ {
 			switch keys[i] {
 			case "interface":
-				if i+1 < len(keys) {
+				// Multi-value (#1813): consume every following token up
+				// to the next recognized property keyword —
+				// `group lan interface [ a b ];` packs all interfaces
+				// inline.
+				for i+1 < len(keys) && keys[i+1] != "interface" &&
+					keys[i+1] != "active-server-group" {
 					i++
 					g.Interfaces = append(g.Interfaces, keys[i])
 				}
@@ -633,8 +638,19 @@ func compileDHCPRelay(node *Node, fo *ForwardingOptionsConfig) error {
 		for _, prop := range gInst.node.Children {
 			switch prop.Name() {
 			case "interface":
-				if v := nodeVal(prop); v != "" {
-					g.Interfaces = append(g.Interfaces, v)
+				// Multi-value spellings (#1813): bracketed
+				// `interface [ a b ];` packs all interfaces into
+				// Keys[1:] (flat-set replay may carry trailing values
+				// as children); braced block `interface { a; b; }`
+				// holds one child per interface. nodeVal kept only the
+				// first of each.
+				for _, k := range prop.Keys[1:] {
+					g.Interfaces = append(g.Interfaces, k)
+				}
+				for _, child := range prop.Children {
+					if v := child.Name(); v != "" {
+						g.Interfaces = append(g.Interfaces, v)
+					}
 				}
 			case "active-server-group":
 				g.ActiveServerGroup = nodeVal(prop)
