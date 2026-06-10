@@ -190,10 +190,19 @@ impl super::Coordinator {
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
         for handle in self.workers.handles.values() {
-            let mut pending = handle
-                .commands
-                .lock()
-                .map_err(|_| "worker command queue poisoned".to_string())?;
+            // #1790: recover, don't early-return — one dead worker's
+            // poisoned queue must not block session export for every
+            // HEALTHY worker (the export-ack timeout handles dead workers
+            // at the caller). Same policy as update_ha_state above.
+            let mut pending = match handle.commands.lock() {
+                Ok(pending) => pending,
+                Err(poisoned) => {
+                    eprintln!(
+                        "xpf-ha: worker command queue lock poisoned while enqueueing ExportOwnerRGSessions; recovering inner queue"
+                    );
+                    poisoned.into_inner()
+                }
+            };
             pending.push_back(WorkerCommand::ExportOwnerRGSessions {
                 sequence,
                 owner_rgs: owner_rgs.to_vec(),
@@ -342,7 +351,13 @@ impl super::Coordinator {
             }
         }
         for handle in self.workers.handles.values() {
-            if let Ok(mut pending) = handle.commands.lock() {
+            // #1790: recover-and-push instead of silently skipping a
+            // poisoned queue (same policy as update_ha_state).
+            let mut pending = match handle.commands.lock() {
+                Ok(pending) => pending,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            {
                 pending.push_back(WorkerCommand::UpsertSynced(entry.clone()));
                 if let Some(reverse) = &reverse_entry {
                     pending.push_back(WorkerCommand::UpsertSynced(reverse.clone()));
@@ -398,7 +413,13 @@ impl super::Coordinator {
             );
         }
         for handle in self.workers.handles.values() {
-            if let Ok(mut pending) = handle.commands.lock() {
+            // #1790: recover-and-push instead of silently skipping a
+            // poisoned queue (same policy as update_ha_state).
+            let mut pending = match handle.commands.lock() {
+                Ok(pending) => pending,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            {
                 pending.push_back(WorkerCommand::DeleteSynced(key.clone()));
                 if let Some(reverse_key) = &reverse_key {
                     pending.push_back(WorkerCommand::DeleteSynced(reverse_key.clone()));
