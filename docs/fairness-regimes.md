@@ -860,6 +860,33 @@ the sweep exit `2`; they do not produce a false-green fairness verdict.
   per-worker grant rate with per-worker TX byte rate and active-flow
   distribution to separate lease acquisition imbalance from TCP/NIC
   effects.
+- **`xpf_userspace_worker_cos_wheel_ticks_advanced_total{worker_id=...}`**
+  counter (#1782 Step-1, mechanism (i)): cumulative CoS timer-wheel
+  ticks (50 µs each) advanced by `advance_cos_timer_wheel` across the
+  worker's bindings. The wheel catches up one tick per loop iteration,
+  so the first shaped drain after a per-worker idle period pays
+  `lag / 50 µs` iterations inside a single `drain_shaped_tx` call —
+  the §4(i) cold-start candidate. `rate()` is uninteresting at steady
+  state (≈ 20k ticks/s per active root); the cold-start signal is a
+  step in the total coincident with a connect stall.
+- **`xpf_userspace_worker_cos_wheel_ticks_advanced_max{worker_id=...}`**
+  gauge (#1782 Step-1, mechanism (i)): largest single-call wheel
+  advance ever observed on the worker (monotonic high-water mark,
+  never resets). One cold reproduction landing a multi-million-tick
+  max pins the O(lag) catch-up conclusively, and its wall cost is
+  directly computable from the per-tick loop cost.
+- **`xpf_userspace_worker_cos_queue_lease_undergrant_total{worker_id=..., cause=...}`**
+  counter (#1782 Step-1, mechanism (ii)): CoS exact-guarantee selector
+  visits where, AFTER `maybe_top_up_cos_queue_lease`, the queue's
+  tokens still could not cover the head frame
+  (`queue.hot.tokens < head_len`, the plan r2-F1 comparison),
+  attributed to the `acquire_v8` shortfall cause. Causes:
+  `seqlock_give_up`, `cap_zero`, `epoch_rotated`, `share_exhausted`,
+  `class_cap`, `outstanding_cap`. A v8-attributed subset of the
+  per-queue `drain_park_queue_tokens` counter; under-grants with no v8
+  attribution (legacy lease, no lease, fully-granted acquire below the
+  head watermark) are deliberately not counted. All six cause series
+  emit per worker so first occurrences have a zero baseline.
 - **`xpf_userspace_binding_tx_completions_total{binding_slot=..., queue_id=..., worker_id=..., iface=...}`**
   counter: cumulative AF_XDP TX completions reaped by each binding's
   owner worker. Use `rate()` during fairness runs to detect per-RX-queue
