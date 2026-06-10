@@ -31,6 +31,11 @@ type Store struct {
 	db      *DB
 	journal *Journal
 
+	// writeActiveFn is a test seam for active-config persistence
+	// (#1799). nil (production) means s.db.WriteActive. Set via
+	// SetWriteActiveForTesting; never assigned on production paths.
+	writeActiveFn func(*config.ConfigTree) error
+
 	// Commit confirmed state
 	confirmTimer      *time.Timer
 	confirmPrevTree   *config.ConfigTree   // active tree before confirmed commit
@@ -134,7 +139,18 @@ func (s *Store) Save() error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	return s.db.WriteActive(s.active)
+	return s.writeActive(s.active)
+}
+
+// writeActive persists tree as the on-disk active configuration.
+// Routes through the writeActiveFn test seam when set (#1799);
+// otherwise uses the DB's temp-file + rename atomic write. Caller
+// must hold s.mu (read or write lock).
+func (s *Store) writeActive(tree *config.ConfigTree) error {
+	if s.writeActiveFn != nil {
+		return s.writeActiveFn(tree)
+	}
+	return s.db.WriteActive(tree)
 }
 
 // SetClusterReadOnly toggles cluster read-only mode. When enabled, config
@@ -749,64 +765,24 @@ func (s *Store) CommitCheck() (*config.Config, error) {
 
 // Commit validates, compiles, and applies the candidate configuration.
 // Returns the compiled config for the caller to apply to the dataplane.
+// Identical to CommitWithDescription with an empty description (the two
+// were verbatim duplicates before #1799 unified them).
 func (s *Store) Commit() (*config.Config, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.candidate == nil {
-		return nil, fmt.Errorf("not in configuration mode")
-	}
-
-	compiled, err := s.compileTree(s.candidate)
-	if err != nil {
-		return nil, fmt.Errorf("commit check failed: %w", err)
-	}
-
-	// Push current active to history
-	s.history.Push(&HistoryEntry{
-		Config:    s.active.Clone(),
-		Timestamp: time.Now(),
-	})
-
-	// Promote candidate to active
-	s.active = s.candidate
-	s.candidate = s.active.Clone()
-	s.compiled = compiled
-	s.dirty = false
-
-	// Persist to disk
-	if err := s.db.WriteActive(s.active); err != nil {
-		// Non-fatal: log but don't fail the commit
-		slog.Warn("failed to save config", "err", err)
-	}
-
-	// Log to journal
-	s.journal.Log(&JournalEntry{
-		Timestamp: time.Now(),
-		Action:    "commit",
-		After:     compiled,
-	})
-
-	s.saveRollbackFiles()
-
-	// Auto-archive if configured
-	if s.archiveDir != "" {
-		max := s.archiveMax
-		if max <= 0 {
-			max = 10
-		}
-		go func() {
-			if err := s.ArchiveConfig(s.archiveDir, max); err != nil {
-				slog.Warn("auto-archive failed", "err", err)
-			}
-		}()
-	}
-
-	return compiled, nil
+	return s.CommitWithDescription("")
 }
 
 // CommitWithDescription validates, compiles, and applies the candidate configuration
 // with an optional comment/description attached to the history and journal entries.
+//
+// Persistence contract (#1799, Option A — persist-before-promote): the
+// candidate tree is written to the on-disk active config BEFORE any
+// in-memory promotion. WriteActive is temp-file + rename atomic
+// (db.go), so a persist failure leaves the previous active config
+// intact on disk; the commit then fails with the candidate left
+// intact and NOTHING mutated — no active/candidate/compiled/dirty
+// change, no history push, no journal entry, no rollback-file save.
+// A commit that reports success can therefore never silently revert
+// to the previous config on daemon restart.
 func (s *Store) CommitWithDescription(description string) (*config.Config, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -818,6 +794,13 @@ func (s *Store) CommitWithDescription(description string) (*config.Config, error
 	compiled, err := s.compileTree(s.candidate)
 	if err != nil {
 		return nil, fmt.Errorf("commit check failed: %w", err)
+	}
+
+	// #1799 Option A: persist BEFORE promote. On failure the old
+	// active stays on disk and in memory; the operator sees the
+	// error and the candidate is still there to retry.
+	if err := s.writeActive(s.candidate); err != nil {
+		return nil, fmt.Errorf("commit failed: persist active config: %w", err)
 	}
 
 	// Push current active to history with description
@@ -832,11 +815,6 @@ func (s *Store) CommitWithDescription(description string) (*config.Config, error
 	s.candidate = s.active.Clone()
 	s.compiled = compiled
 	s.dirty = false
-
-	// Persist to disk
-	if err := s.db.WriteActive(s.active); err != nil {
-		slog.Warn("failed to save config", "err", err)
-	}
 
 	// Log to journal with description
 	s.journal.Log(&JournalEntry{
