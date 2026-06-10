@@ -265,11 +265,6 @@ pub(in crate::afxdp) fn ipv4_words(ip: Ipv4Addr) -> [u16; 2] {
     ]
 }
 
-#[allow(dead_code)]
-pub(in crate::afxdp) fn ipv6_words(ip: Ipv6Addr) -> [u16; 8] {
-    ipv6_words_from_octets(ip.octets())
-}
-
 pub(in crate::afxdp) fn ipv6_words_from_octets(octets: [u8; 16]) -> [u16; 8] {
     [
         u16::from_be_bytes([octets[0], octets[1]]),
@@ -365,34 +360,13 @@ pub(in crate::afxdp) fn adjust_l4_checksum_ipv4(
     Some(())
 }
 
-#[allow(dead_code)]
-pub(in crate::afxdp) fn adjust_l4_checksum_ipv6(
-    packet: &mut [u8],
-    protocol: u8,
-    old_src: Ipv6Addr,
-    new_src: Ipv6Addr,
-    old_dst: Ipv6Addr,
-    new_dst: Ipv6Addr,
-) -> Option<()> {
-    let delta = match l4_checksum_field_delta_v6(protocol) {
-        Some(d) => d,
-        None => return Some(()),
-    };
-    let checksum_offset = 40usize.checked_add(delta)?;
-    let current = u16::from_be_bytes([
-        *packet.get(checksum_offset)?,
-        *packet.get(checksum_offset + 1)?,
-    ]);
-    let mut updated = checksum16_adjust(current, &ipv6_words(old_src), &ipv6_words(new_src));
-    updated = checksum16_adjust(updated, &ipv6_words(old_dst), &ipv6_words(new_dst));
-    if adjust_zero_checksum_illegal(protocol, ChecksumFamily::V6) && updated == 0 {
-        updated = 0xffff;
-    }
-    packet
-        .get_mut(checksum_offset..checksum_offset + 2)?
-        .copy_from_slice(&updated.to_be_bytes());
-    Some(())
-}
+// The IPv6 dead trio (`adjust_l4_checksum_ipv6`, `_src`, `_dst`) was
+// deleted in #1838: all were `#[allow(dead_code)]` with zero non-test
+// callers, and threading the ext-aware `rel_l4` offset through helpers
+// nobody calls would have been pure noise. `ipv6_words` went with them
+// (its only remaining caller was the deleted trio). The live v6
+// adjusters are `adjust_l4_checksum_ipv6_words` and
+// `adjust_l4_checksum_ipv6_addr_bytes` below.
 
 pub(in crate::afxdp) fn adjust_l4_checksum_ipv4_src(
     packet: &mut [u8],
@@ -457,28 +431,13 @@ pub(in crate::afxdp) fn adjust_l4_checksum_ipv4_words(
     Some(())
 }
 
-#[allow(dead_code)]
-pub(in crate::afxdp) fn adjust_l4_checksum_ipv6_src(
-    packet: &mut [u8],
-    protocol: u8,
-    old_src: Ipv6Addr,
-    new_src: Ipv6Addr,
-) -> Option<()> {
-    adjust_l4_checksum_ipv6_words(packet, protocol, &ipv6_words(old_src), &ipv6_words(new_src))
-}
-
-#[allow(dead_code)]
-pub(in crate::afxdp) fn adjust_l4_checksum_ipv6_dst(
-    packet: &mut [u8],
-    protocol: u8,
-    old_dst: Ipv6Addr,
-    new_dst: Ipv6Addr,
-) -> Option<()> {
-    adjust_l4_checksum_ipv6_words(packet, protocol, &ipv6_words(old_dst), &ipv6_words(new_dst))
-}
-
+/// Incremental v6 L4 checksum adjust for a word-list delta. `rel_l4`
+/// is the L4 offset relative to the IPv6 header start (40 for the
+/// ext-free common case; the caller's ext-aware walk result otherwise
+/// — #1838). The checksum field sits at `rel_l4 + {16,6,2}`.
 pub(in crate::afxdp) fn adjust_l4_checksum_ipv6_words(
     packet: &mut [u8],
+    rel_l4: usize,
     protocol: u8,
     old_words: &[u16],
     new_words: &[u16],
@@ -487,7 +446,7 @@ pub(in crate::afxdp) fn adjust_l4_checksum_ipv6_words(
         Some(d) => d,
         None => return Some(()),
     };
-    let checksum_offset = 40usize.checked_add(delta)?;
+    let checksum_offset = rel_l4.checked_add(delta)?;
     let current = u16::from_be_bytes([
         *packet.get(checksum_offset)?,
         *packet.get(checksum_offset + 1)?,
@@ -505,6 +464,7 @@ pub(in crate::afxdp) fn adjust_l4_checksum_ipv6_words(
 #[inline(always)]
 pub(super) fn adjust_l4_checksum_ipv6_addr_bytes(
     packet: &mut [u8],
+    rel_l4: usize,
     protocol: u8,
     old_addr: &[u8; 16],
     new_addr: &[u8; 16],
@@ -513,8 +473,9 @@ pub(super) fn adjust_l4_checksum_ipv6_addr_bytes(
         Some(d) => d,
         None => return Some(()),
     };
-    // 40 + {16,6,2} reproduces the previous absolute constants 56/46/42.
-    let checksum_offset = 40usize.checked_add(delta)?;
+    // rel_l4 + {16,6,2}; with rel_l4 == 40 (no ext headers) this
+    // reproduces the previous absolute constants 56/46/42 (#1838).
+    let checksum_offset = rel_l4.checked_add(delta)?;
     let current = u16::from_be_bytes([
         *packet.get(checksum_offset)?,
         *packet.get(checksum_offset + 1)?,
@@ -567,8 +528,19 @@ pub(in crate::afxdp) fn recompute_l4_checksum_ipv4(
     Some(())
 }
 
-pub(in crate::afxdp) fn recompute_l4_checksum_ipv6(packet: &mut [u8], protocol: u8) -> Option<()> {
-    let payload = packet.get(40..)?;
+/// Full L4 checksum recompute for an IPv6 packet. `rel_l4` is the L4
+/// offset relative to the IPv6 header start (40 when no extension
+/// headers; the caller's ext-aware walk result otherwise — #1838).
+/// The pseudo-header upper-layer length is `packet.len() - rel_l4`
+/// and the Next Header value is `protocol` (the final L4 protocol) —
+/// exactly what RFC 8200 §8.1 prescribes when extension headers are
+/// present.
+pub(in crate::afxdp) fn recompute_l4_checksum_ipv6(
+    packet: &mut [u8],
+    rel_l4: usize,
+    protocol: u8,
+) -> Option<()> {
+    let payload = packet.get(rel_l4..)?;
     let src = Ipv6Addr::from(<[u8; 16]>::try_from(packet.get(8..24)?).ok()?);
     let dst = Ipv6Addr::from(<[u8; 16]>::try_from(packet.get(24..40)?).ok()?);
     match protocol {
@@ -576,31 +548,37 @@ pub(in crate::afxdp) fn recompute_l4_checksum_ipv6(packet: &mut [u8], protocol: 
             if payload.len() < 20 {
                 return None;
             }
-            packet.get_mut(40 + 16..40 + 18)?.copy_from_slice(&[0, 0]);
-            let sum = checksum16_ipv6(src, dst, PROTO_TCP, packet.get(40..)?);
             packet
-                .get_mut(40 + 16..40 + 18)?
+                .get_mut(rel_l4 + 16..rel_l4 + 18)?
+                .copy_from_slice(&[0, 0]);
+            let sum = checksum16_ipv6(src, dst, PROTO_TCP, packet.get(rel_l4..)?);
+            packet
+                .get_mut(rel_l4 + 16..rel_l4 + 18)?
                 .copy_from_slice(&sum.to_be_bytes());
         }
         PROTO_UDP => {
             if payload.len() < 8 {
                 return None;
             }
-            packet.get_mut(40 + 6..40 + 8)?.copy_from_slice(&[0, 0]);
-            let sum = checksum16_ipv6(src, dst, PROTO_UDP, packet.get(40..)?);
+            packet
+                .get_mut(rel_l4 + 6..rel_l4 + 8)?
+                .copy_from_slice(&[0, 0]);
+            let sum = checksum16_ipv6(src, dst, PROTO_UDP, packet.get(rel_l4..)?);
             let sum = if sum == 0 { 0xffff } else { sum };
             packet
-                .get_mut(40 + 6..40 + 8)?
+                .get_mut(rel_l4 + 6..rel_l4 + 8)?
                 .copy_from_slice(&sum.to_be_bytes());
         }
         PROTO_ICMPV6 => {
             if payload.len() < 4 {
                 return None;
             }
-            packet.get_mut(40 + 2..40 + 4)?.copy_from_slice(&[0, 0]);
-            let sum = checksum16_ipv6(src, dst, PROTO_ICMPV6, packet.get(40..)?);
             packet
-                .get_mut(40 + 2..40 + 4)?
+                .get_mut(rel_l4 + 2..rel_l4 + 4)?
+                .copy_from_slice(&[0, 0]);
+            let sum = checksum16_ipv6(src, dst, PROTO_ICMPV6, packet.get(rel_l4..)?);
+            packet
+                .get_mut(rel_l4 + 2..rel_l4 + 4)?
                 .copy_from_slice(&sum.to_be_bytes());
         }
         _ => {}
@@ -880,8 +858,8 @@ mod l4_offset_helper_tests {
         // ICMPv6 checksum field is at 40 + 2 = 42. Start it at 0.
         p[42] = 0;
         p[43] = 0;
-        let same = ipv6_words(Ipv6Addr::LOCALHOST);
-        let r = adjust_l4_checksum_ipv6_words(&mut p, PROTO_ICMPV6, &same, &same);
+        let same = ipv6_words_from_octets(Ipv6Addr::LOCALHOST.octets());
+        let r = adjust_l4_checksum_ipv6_words(&mut p, 40, PROTO_ICMPV6, &same, &same);
         assert_eq!(r, Some(()));
         // current=0, identity adjust -> 0, canonicalized -> 0xffff.
         assert_eq!(

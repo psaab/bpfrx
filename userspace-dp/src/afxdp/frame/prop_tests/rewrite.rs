@@ -48,7 +48,7 @@ fn apply_nat_family(packet: &mut [u8], pkt: &ValidPacket, nat: NatDecision) -> O
         apply_nat_ipv4(packet, pkt.protocol, nat)?;
         adjust_ipv4_header_checksum(&mut packet[..pkt.rel_l4], old_src, old_dst, ttl)
     } else {
-        apply_nat_ipv6(packet, pkt.protocol, nat)
+        apply_nat_ipv6(packet, pkt.rel_l4, pkt.protocol, nat)
     }
 }
 
@@ -395,17 +395,17 @@ fn pin_descriptor_nat64_nptv6_decline_frame_untouched() {
     }
 }
 
-/// (d) #1838 (D3) pin: the GENERIC v6 NAT path hardcodes L4 at offset
-/// 40 (frame/mod.rs:840-841 port rewrite; checksum adjusters at
-/// frame/checksum.rs:490/516-517). On a valid IPv6 packet with a
-/// hop-by-hop extension header and a dst-port rewrite it writes the
-/// "port" into the extension header and the "checksum adjust" into
-/// TCP header bytes, leaving the real port untouched. The descriptor
-/// path parses the real offset (rewrite/ipv6.rs:35-41) and gets it
-/// right. THIS TEST PINS A DEFECT — when #1838 is fixed, flip these
-/// assertions and re-admit ext-header packets to the NAT generators.
+/// (d) #1838 (D3) FIXED pin: the generic v6 NAT path threads the
+/// caller's ext-aware L4 offset (shared `v6_rel_l4_offset` helper, the
+/// same precedence rule the descriptor path uses). On a valid IPv6
+/// packet with a hop-by-hop extension header and a dst-port rewrite
+/// the REAL TCP port is rewritten at the parsed offset, the extension
+/// header bytes stay byte-identical, the checksum adjust lands at
+/// `rel_l4 + 16`, and the generic in-place output is byte-identical
+/// to the descriptor output. (This flipped the original #1824 defect
+/// pin that asserted the fixed-40 corruption.)
 #[test]
-fn pin_1838_generic_v6_nat_ext_header_corruption() {
+fn pin_1838_generic_v6_nat_ext_header_rewrites_real_l4() {
     let pkt = pin_packet(true, PROTO_TCP, 64, vec![ExtHdr::HopByHop(0)]);
     assert_eq!(pkt.rel_l4, 48, "one hop-by-hop header → L4 at 48");
     let nat = NatDecision {
@@ -413,46 +413,58 @@ fn pin_1838_generic_v6_nat_ext_header_corruption() {
         ..NatDecision::default()
     };
 
-    // Generic path (apply_nat_ipv6 is what both the in-place rewrite
-    // and the copy builder call).
+    // Generic path (apply_nat_ipv6 is what the in-place rewrite, the
+    // copy builder, the segmentation arm, and the slow path call).
     let original = pkt.l3_packet();
     let mut packet = original.clone();
-    assert!(apply_nat_ipv6(&mut packet, PROTO_TCP, nat).is_some());
+    assert!(apply_nat_ipv6(&mut packet, pkt.rel_l4, PROTO_TCP, nat).is_some());
     assert_eq!(
-        &packet[48 + 2..48 + 4],
-        &original[48 + 2..48 + 4],
-        "DEFECT #1838: real TCP dst port is NOT rewritten"
+        u16::from_be_bytes([packet[48 + 2], packet[48 + 3]]),
+        0x3333,
+        "#1838 fixed: real TCP dst port rewritten at the parsed offset"
     );
     assert_eq!(
-        u16::from_be_bytes([packet[42], packet[43]]),
-        0x3333,
-        "DEFECT #1838: 'port' write lands inside the hop-by-hop header (offset 42)"
+        &packet[40..48],
+        &original[40..48],
+        "#1838 fixed: hop-by-hop extension header bytes untouched"
     );
     assert_ne!(
-        &packet[56..58],
-        &original[56..58],
-        "DEFECT #1838: 'checksum adjust' at 40+16 mutates TCP header bytes (ack field)"
+        &packet[48 + 16..48 + 18],
+        &original[48 + 16..48 + 18],
+        "#1838 fixed: checksum adjust lands at rel_l4 + 16"
     );
+    let verdict = oracle_packet_valid(&packet, AF6, PROTO_TCP, pkt.rel_l4, false);
+    assert!(verdict.is_ok(), "post-NAT packet valid: {:?}", verdict);
 
-    // Descriptor path on the same input handles the ext header
-    // correctly: real port rewritten, ext header intact.
-    let area = area_with_frame(&pkt.frame);
+    // Generic in-place vs descriptor on the same input: byte-identical
+    // output frames (the offset-source parity is structural now).
     let desc = XdpDesc {
         addr: DIFF_ADDR as u64,
         len: pkt.frame.len() as u32,
         options: 0,
     };
+    let area_g = area_with_frame(&pkt.frame);
+    let decision = make_decision(&pkt, nat, 0);
+    let g = rewrite_forwarded_frame_in_place(&area_g, desc, pkt.meta, &decision, false, None)
+        .expect("generic in-place rewrite succeeds");
+    let area_d = area_with_frame(&pkt.frame);
     let rd = make_descriptor(&pkt, nat, 0);
-    let res = apply_rewrite_descriptor(&area, desc, pkt.meta, &rd, None)
+    let d = apply_rewrite_descriptor(&area_d, desc, pkt.meta, &rd, None)
         .expect("descriptor path succeeds");
-    let out = area.slice(res.offset as usize, res.len as usize).unwrap();
+    assert_eq!(g, d, "InPlaceRewriteResult must agree");
+    let out_g = area_g.slice(g.offset as usize, g.len as usize).unwrap();
+    let out_d = area_d.slice(d.offset as usize, d.len as usize).unwrap();
     assert_eq!(
-        u16::from_be_bytes([out[14 + 48 + 2], out[14 + 48 + 3]]),
+        out_g, out_d,
+        "#1838 fixed: generic and descriptor outputs byte-identical on ext-headered input"
+    );
+    assert_eq!(
+        u16::from_be_bytes([out_d[14 + 48 + 2], out_d[14 + 48 + 3]]),
         0x3333,
         "descriptor path rewrites the REAL dst port"
     );
     assert_eq!(
-        &out[14 + 40..14 + 48],
+        &out_d[14 + 40..14 + 48],
         &pkt.frame[14 + 40..14 + 48],
         "descriptor path leaves the hop-by-hop header intact"
     );
@@ -561,7 +573,7 @@ fn pin_1840_v6_udp_zero_skip_not_family_gated() {
 
     // Generic path: port rewritten, checksum skip leaves 0x0000.
     let mut packet = pkt.l3_packet();
-    assert!(apply_nat_ipv6(&mut packet, PROTO_UDP, nat).is_some());
+    assert!(apply_nat_ipv6(&mut packet, pkt.rel_l4, PROTO_UDP, nat).is_some());
     assert_eq!(
         u16::from_be_bytes([packet[40], packet[41]]),
         pkt.src_port.wrapping_add(1),

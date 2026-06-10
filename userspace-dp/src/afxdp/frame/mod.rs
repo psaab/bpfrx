@@ -31,10 +31,9 @@ use byte_writes::{
 use checksum::adjust_l4_checksum_ipv6_addr_bytes;
 pub(in crate::afxdp) use checksum::{
     adjust_ipv4_header_checksum, adjust_l4_checksum_ipv4, adjust_l4_checksum_ipv4_dst,
-    adjust_l4_checksum_ipv4_src, adjust_l4_checksum_ipv4_words, adjust_l4_checksum_ipv6,
-    adjust_l4_checksum_ipv6_dst, adjust_l4_checksum_ipv6_src, adjust_l4_checksum_ipv6_words,
+    adjust_l4_checksum_ipv4_src, adjust_l4_checksum_ipv4_words, adjust_l4_checksum_ipv6_words,
     checksum16, checksum16_add_bytes, checksum16_adjust, checksum16_finish, checksum16_ipv4,
-    checksum16_ipv6, ipv4_words, ipv6_words, ipv6_words_from_octets, ipv6_words_from_slice,
+    checksum16_ipv6, ipv4_words, ipv6_words_from_octets, ipv6_words_from_slice,
     recompute_l4_checksum_ipv4, recompute_l4_checksum_ipv6,
 };
 
@@ -93,8 +92,32 @@ pub(in crate::afxdp) use build::build_forwarded_frame_into_from_frame;
 mod rewrite;
 pub(in crate::afxdp) use rewrite::apply_rewrite_descriptor;
 
-
-
+/// IPv6 L4 offset relative to the L3 header: trust the metadata when it
+/// is plausible (`meta_rel >= 40` and `l4 > l3`), else walk the
+/// extension-header chain. SINGLE source of offset truth for both
+/// rewrite paths (#1838) — the descriptor fast path
+/// (`rewrite/ipv6.rs`), the generic in-place rewrite
+/// (`rewrite_apply_v6`), the copy builder (`build/ipv6.rs`), the
+/// slow-path NAT extract, and the ICMPv6-error NAT reversal builder
+/// (`icmp_embed/builders.rs`) all derive the offset here, so the
+/// meta-led precedence rule cannot drift between paths.
+///
+/// `packet` is the L3-relative slice; `l3_offset`/`l4_offset` are the
+/// frame-relative metadata scalars (only their difference is used).
+#[inline(always)]
+pub(in crate::afxdp) fn v6_rel_l4_offset(
+    packet: &[u8],
+    l3_offset: u16,
+    l4_offset: u16,
+    addr_family: u8,
+) -> Option<usize> {
+    let meta_rel = l4_offset.wrapping_sub(l3_offset) as usize;
+    if meta_rel >= 40 && l4_offset > l3_offset {
+        Some(meta_rel)
+    } else {
+        packet_rel_l4_offset(packet, addr_family)
+    }
+}
 
 
 
@@ -547,16 +570,16 @@ fn rewrite_apply_v6(
     if !skip_ttl && packet[ip_start + 7] <= 1 {
         return None;
     }
-    let meta_rel = meta.l4_offset.wrapping_sub(meta.l3_offset) as usize;
-    let rel_l4 = if meta_rel >= 40 && meta.l4_offset > meta.l3_offset {
-        meta_rel
-    } else {
-        packet_rel_l4_offset(&packet[ip_start..], meta.addr_family)?
-    };
+    let rel_l4 = v6_rel_l4_offset(
+        &packet[ip_start..],
+        meta.l3_offset,
+        meta.l4_offset,
+        meta.addr_family,
+    )?;
     let repaired_ports =
         restore_l4_tuple_from_meta(&mut packet[ip_start..], meta, rel_l4).unwrap_or(false);
     if apply_nat {
-        apply_nat_ipv6(&mut packet[ip_start..], meta.protocol, decision.nat)?;
+        apply_nat_ipv6(&mut packet[ip_start..], rel_l4, meta.protocol, decision.nat)?;
     }
     if !skip_ttl {
         packet[ip_start + 7] -= 1;
@@ -564,7 +587,7 @@ fn rewrite_apply_v6(
     let enforced = enforce_expected_ports(packet, meta.addr_family, meta.protocol, expected_ports)
         .unwrap_or(false);
     if repaired_ports && !enforced {
-        recompute_l4_checksum_ipv6(&mut packet[ip_start..], meta.protocol)?;
+        recompute_l4_checksum_ipv6(&mut packet[ip_start..], rel_l4, meta.protocol)?;
     }
     Some(())
 }
@@ -762,7 +785,20 @@ pub(super) fn apply_nat_ipv4(packet: &mut [u8], protocol: u8, nat: NatDecision) 
     Some(())
 }
 
-pub(super) fn apply_nat_ipv6(packet: &mut [u8], protocol: u8, nat: NatDecision) -> Option<()> {
+/// Apply a NAT decision to an IPv6 packet (L3-relative slice).
+/// `rel_l4` is the caller-supplied ext-aware L4 offset (#1838) —
+/// derived via `v6_rel_l4_offset` (or structurally, e.g. the
+/// segmentation copy where the copied IP header length IS the parsed
+/// offset). It mirrors `apply_nat_ipv4`'s IHL, which is derived
+/// internally for v4 because the IHL lives in the header itself; the
+/// v6 offset requires the extension-chain walk, so the caller
+/// supplies it.
+pub(super) fn apply_nat_ipv6(
+    packet: &mut [u8],
+    rel_l4: usize,
+    protocol: u8,
+    nat: NatDecision,
+) -> Option<()> {
     if nat == NatDecision::default() {
         return Some(());
     }
@@ -791,14 +827,26 @@ pub(super) fn apply_nat_ipv6(packet: &mut [u8], protocol: u8, nat: NatDecision) 
         let old_src: [u8; 16] = packet.get(8..24)?.try_into().ok()?;
         write_ipv6_src(packet, 0, new_src);
         if !skip_l4_csum {
-            adjust_l4_checksum_ipv6_addr_bytes(packet, protocol, &old_src, &new_src.octets())?;
+            adjust_l4_checksum_ipv6_addr_bytes(
+                packet,
+                rel_l4,
+                protocol,
+                &old_src,
+                &new_src.octets(),
+            )?;
         }
     } else if new_dst.is_some() && new_src.is_none() {
         let new_dst = new_dst?;
         let old_dst: [u8; 16] = packet.get(24..40)?.try_into().ok()?;
         write_ipv6_dst(packet, 0, new_dst);
         if !skip_l4_csum {
-            adjust_l4_checksum_ipv6_addr_bytes(packet, protocol, &old_dst, &new_dst.octets())?;
+            adjust_l4_checksum_ipv6_addr_bytes(
+                packet,
+                rel_l4,
+                protocol,
+                &old_dst,
+                &new_dst.octets(),
+            )?;
         }
     } else if new_src.is_some() || new_dst.is_some() {
         let old_src_words = ipv6_words_from_slice(packet.get(8..24)?)?;
@@ -820,12 +868,14 @@ pub(super) fn apply_nat_ipv6(packet: &mut [u8], protocol: u8, nat: NatDecision) 
                 PROTO_TCP | PROTO_UDP | PROTO_ICMPV6 => {
                     adjust_l4_checksum_ipv6_words(
                         packet,
+                        rel_l4,
                         protocol,
                         &old_src_words,
                         &new_src_words,
                     )?;
                     adjust_l4_checksum_ipv6_words(
                         packet,
+                        rel_l4,
                         protocol,
                         &old_dst_words,
                         &new_dst_words,
@@ -837,8 +887,10 @@ pub(super) fn apply_nat_ipv6(packet: &mut [u8], protocol: u8, nat: NatDecision) 
     }
 
     // --- L4 port rewriting (after IP rewriting) ---
-    // IPv6 header is always 40 bytes (no IHL).
-    apply_nat_port_rewrite(packet, 40, protocol, nat)?;
+    // At the caller-supplied ext-aware L4 offset (#1838) — the fixed
+    // 40 here used to land port writes inside the first extension
+    // header of any ext-headered packet.
+    apply_nat_port_rewrite(packet, rel_l4, protocol, nat)?;
 
     Some(())
 }

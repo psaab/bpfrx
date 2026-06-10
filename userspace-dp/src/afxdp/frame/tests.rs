@@ -1171,7 +1171,7 @@ fn syn_cookie_ack_rst_builder_uses_received_ack_as_rst_seq() {
     frame.extend_from_slice(&0x1111_2222u32.to_be_bytes());
     frame.extend_from_slice(&0x3333_4444u32.to_be_bytes());
     frame.extend_from_slice(&[0x50, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00]);
-    recompute_l4_checksum_ipv6(&mut frame[14..], PROTO_TCP).expect("tcp sum");
+    recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
 
     let out = build_syn_cookie_ack_rst_frame(&frame).expect("syn-cookie rst");
 
@@ -1295,7 +1295,7 @@ fn extract_l3_packet_with_nat_rewrites_reverse_snat_reply_v6() {
         0x00, 0x40, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a',
         b't', b'e', b's', b't',
     ]);
-    recompute_l4_checksum_ipv6(&mut frame[18..], PROTO_TCP).expect("tcp sum");
+    recompute_l4_checksum_ipv6(&mut frame[18..], 40, PROTO_TCP).expect("tcp sum");
 
     let meta = UserspaceDpMeta {
         magic: USERSPACE_META_MAGIC,
@@ -1787,7 +1787,7 @@ fn enforce_expected_ports_repairs_ipv6_tcp_ports_and_checksum() {
         0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
         0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
     ]);
-    recompute_l4_checksum_ipv6(&mut frame[18..], PROTO_TCP).expect("initial checksum");
+    recompute_l4_checksum_ipv6(&mut frame[18..], 40, PROTO_TCP).expect("initial checksum");
     assert!(tcp_checksum_ok_ipv6(&frame[18..]));
 
     let repaired = enforce_expected_ports(
@@ -1866,7 +1866,7 @@ fn rewrite_forwarded_frame_in_place_keeps_ipv6_tcp_ports_after_vlan_snat() {
         0x00, 0x00, 0x00, 0x00, // checksum/urgent
         b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
     ]);
-    recompute_l4_checksum_ipv6(&mut frame[14..], PROTO_TCP).expect("tcp sum");
+    recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
     assert!(tcp_checksum_ok_ipv6(&frame[14..]));
 
     let mut area = MmapArea::new(4096).expect("mmap");
@@ -1950,7 +1950,7 @@ fn build_forwarded_frame_into_keeps_ipv6_tcp_ports_after_vlan_snat() {
         0x00, 0x00, 0x00, 0x00, // checksum/urgent
         b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
     ]);
-    recompute_l4_checksum_ipv6(&mut frame[14..], PROTO_TCP).expect("tcp sum");
+    recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
     assert!(tcp_checksum_ok_ipv6(&frame[14..]));
 
     let mut area = MmapArea::new(4096).expect("mmap");
@@ -2039,7 +2039,7 @@ fn build_forwarded_frame_into_ignores_ipv6_tcp_metadata_port_mismatch() {
         0x00, 0x00, 0x00, 0x00, // checksum/urgent
         b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
     ]);
-    recompute_l4_checksum_ipv6(&mut frame[14..], PROTO_TCP).expect("tcp sum");
+    recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
 
     let mut area = MmapArea::new(4096).expect("mmap");
     area.slice_mut(0, frame.len())
@@ -2118,7 +2118,7 @@ fn build_live_forward_request_prefers_session_flow_ports_over_frame() {
         0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
         0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
     ]);
-    recompute_l4_checksum_ipv6(&mut frame[14..], PROTO_TCP).expect("tcp sum");
+    recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
 
     let mut area = MmapArea::new(4096).expect("mmap");
     area.slice_mut(0, frame.len())
@@ -2235,7 +2235,7 @@ fn build_live_forward_request_uses_live_frame_ports_when_no_session_flow() {
         0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
         0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
     ]);
-    recompute_l4_checksum_ipv6(&mut frame[14..], PROTO_TCP).expect("tcp sum");
+    recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
 
     let mut area = MmapArea::new(4096).expect("mmap");
     area.slice_mut(0, frame.len())
@@ -3004,7 +3004,7 @@ fn build_forwarded_frame_into_keeps_ipv6_ports_when_frame_and_metadata_disagree(
         0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
         0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
     ]);
-    recompute_l4_checksum_ipv6(&mut frame[14..], PROTO_TCP).expect("tcp sum");
+    recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
 
     let mut area = MmapArea::new(4096).expect("mmap");
     area.slice_mut(0, frame.len())
@@ -3082,7 +3082,7 @@ fn build_forwarded_frame_into_prefers_expected_ipv6_ports_over_wrong_live_ports(
         0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
         0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
     ]);
-    recompute_l4_checksum_ipv6(&mut frame[14..], PROTO_TCP).expect("tcp sum");
+    recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
 
     let mut area = MmapArea::new(4096).expect("mmap");
     area.slice_mut(0, frame.len())
@@ -3161,7 +3161,7 @@ fn build_forwarded_frame_into_repairs_wrong_ipv6_frame_ports_from_expected_tuple
         0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
         0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
     ]);
-    recompute_l4_checksum_ipv6(&mut frame[14..], PROTO_TCP).expect("tcp sum");
+    recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
 
     let mut area = MmapArea::new(4096).expect("mmap");
     area.slice_mut(0, frame.len())
@@ -3344,7 +3344,7 @@ fn segment_forwarded_tcp_frames_splits_ipv6_snat_payload_by_mtu() {
         0x00, 0x00, 0x00, 0x00, // checksum/urgent
     ]);
     frame.extend((0..tcp_payload_len).map(|i| (i & 0xff) as u8));
-    recompute_l4_checksum_ipv6(&mut frame[14..], PROTO_TCP).expect("tcp sum");
+    recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
 
     let mut area = MmapArea::new(8192).expect("mmap");
     area.slice_mut(0, frame.len())
@@ -3462,7 +3462,7 @@ fn segment_forwarded_tcp_frames_repairs_ipv6_tcp_ports_when_metadata_disagrees()
         0x00, 0x00,
     ]);
     frame.extend((0..tcp_payload_len).map(|i| (i & 0xff) as u8));
-    recompute_l4_checksum_ipv6(&mut frame[14..], PROTO_TCP).expect("tcp sum");
+    recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
 
     let mut area = MmapArea::new(8192).expect("mmap");
     area.slice_mut(0, frame.len())
@@ -3566,7 +3566,7 @@ fn segment_forwarded_tcp_frames_prefers_expected_ipv6_ports_over_wrong_live_port
         0x00, 0x00,
     ]);
     frame.extend((0..tcp_payload_len).map(|i| (i & 0xff) as u8));
-    recompute_l4_checksum_ipv6(&mut frame[14..], PROTO_TCP).expect("tcp sum");
+    recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
 
     let mut area = MmapArea::new(8192).expect("mmap");
     area.slice_mut(0, frame.len())
@@ -3671,7 +3671,7 @@ fn segment_forwarded_tcp_frames_repairs_wrong_ipv6_frame_ports_from_expected_tup
         0x00, 0x00,
     ]);
     frame.extend((0..tcp_payload_len).map(|i| (i & 0xff) as u8));
-    recompute_l4_checksum_ipv6(&mut frame[14..], PROTO_TCP).expect("tcp sum");
+    recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
 
     let mut area = MmapArea::new(8192).expect("mmap");
     area.slice_mut(0, frame.len())
@@ -3766,7 +3766,7 @@ fn authoritative_forward_ports_prefers_flow_tuple_when_frame_ports_mismatch() {
         0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
         0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
     ]);
-    recompute_l4_checksum_ipv6(&mut frame[14..], PROTO_TCP).expect("tcp sum");
+    recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
 
     let meta = UserspaceDpMeta {
         magic: USERSPACE_META_MAGIC,
@@ -3878,7 +3878,7 @@ fn authoritative_forward_ports_falls_back_to_live_frame_ports_when_metadata_miss
     frame.extend_from_slice(&dst_port.to_be_bytes());
     frame.extend_from_slice(&[0x00, 0x14, 0x00, 0x00]);
     frame.extend_from_slice(b"userspace-udp");
-    recompute_l4_checksum_ipv6(&mut frame[14..], PROTO_UDP).expect("udp sum");
+    recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_UDP).expect("udp sum");
 
     let meta = UserspaceDpMeta {
         magic: USERSPACE_META_MAGIC,
@@ -3921,7 +3921,7 @@ fn parse_session_flow_prefers_metadata_tuple_when_frame_ports_mismatch() {
         0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
         0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
     ]);
-    recompute_l4_checksum_ipv6(&mut frame[14..], PROTO_TCP).expect("tcp sum");
+    recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
 
     let mut area = MmapArea::new(4096).expect("mmap");
     area.slice_mut(0, frame.len())
@@ -4579,7 +4579,7 @@ fn rewrite_forwarded_frame_in_place_skips_ttl_when_fabric_ingress_flag_set() {
             recompute_l4_checksum_ipv4(&mut frame[14..], 20, PROTO_TCP, false)
                 .expect("v4 tcp sum");
         } else {
-            recompute_l4_checksum_ipv6(&mut frame[14..], PROTO_TCP).expect("v6 tcp sum");
+            recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("v6 tcp sum");
         }
         let pre_ttl = frame[14 + ttl_rel_offset];
 
@@ -5052,7 +5052,7 @@ fn apply_descriptor_ipv6_no_nat_hop_limit() {
     frame.extend_from_slice(&0u32.to_be_bytes()); // ack
     frame.extend_from_slice(&[0x50, 0x10, 0x20, 0x00]); // data_off=5, ACK, win=8192
     frame.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // checksum + urgent
-    recompute_l4_checksum_ipv6(&mut frame[14..], PROTO_TCP).expect("tcp6 sum");
+    recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp6 sum");
 
     let flow = SessionFlow {
         forward_key: SessionKey {

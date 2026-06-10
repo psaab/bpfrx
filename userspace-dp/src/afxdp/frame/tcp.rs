@@ -476,7 +476,7 @@ fn build_syn_cookie_tcp_reply_v6(
         flags,
         advertised_mss,
     )?;
-    recompute_l4_checksum_ipv6(ip_out, PROTO_TCP)?;
+    recompute_l4_checksum_ipv6(ip_out, 40, PROTO_TCP)?;
     Some(out)
 }
 

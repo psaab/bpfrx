@@ -8,7 +8,7 @@
 use super::super::byte_writes::{
     write_ipv6_dst, write_ipv6_src, write_l4_dst_port, write_l4_src_port,
 };
-use super::super::packet_rel_l4_offset;
+use super::super::v6_rel_l4_offset;
 use crate::afxdp::{
     RewriteDescriptor, UserspaceDpMeta, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP,
 };
@@ -32,13 +32,10 @@ pub(in crate::afxdp::frame) fn apply_rewrite_descriptor_ipv6(
         return None; // Hop limit expired
     }
 
-    // L4 offset from metadata or by parsing extension headers.
-    let meta_rel = meta.l4_offset.wrapping_sub(meta.l3_offset) as usize;
-    let rel_l4 = if meta_rel >= 40 && meta.l4_offset > meta.l3_offset {
-        meta_rel
-    } else {
-        packet_rel_l4_offset(&packet[ip..], meta.addr_family)?
-    };
+    // L4 offset from metadata or by parsing extension headers — the
+    // shared `v6_rel_l4_offset` helper (#1838) keeps this precedence
+    // rule structurally identical to the generic path's.
+    let rel_l4 = v6_rel_l4_offset(&packet[ip..], meta.l3_offset, meta.l4_offset, meta.addr_family)?;
     let l4 = ip + rel_l4;
 
     // Port validation (DMA race guard).
