@@ -19,9 +19,9 @@
 package grpcapi
 
 import (
+	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -239,8 +239,10 @@ func (s *Server) showSystemServices(buf *strings.Builder) {
 	}
 }
 
-// showNTP renders configured NTP servers and chronyc/ntpq tracking.
-func (s *Server) showNTP(buf *strings.Builder) {
+// showNTP renders configured NTP servers and chronyc/ntpq tracking. The
+// handler ctx is plumbed in (#1805) so the NTP execs are bounded by the
+// request lifetime in addition to the per-exec timeout.
+func (s *Server) showNTP(ctx context.Context, buf *strings.Builder) {
 	cfg := s.store.ActiveConfig()
 	if cfg == nil {
 		fmt.Fprintln(buf, "No active configuration")
@@ -257,14 +259,21 @@ func (s *Server) showNTP(buf *strings.Builder) {
 	if cfg.System.NTPThreshold > 0 && cfg.System.NTPThresholdAction != "" {
 		fmt.Fprintf(buf, "  Threshold: %d seconds (%s)\n", cfg.System.NTPThreshold, cfg.System.NTPThresholdAction)
 	}
-	if out, err := exec.Command("chronyc", "tracking").CombinedOutput(); err == nil {
+	// Fallback chain: chronyc tracking → (success) chronyc sources;
+	// else ntpq; else timedatectl. Each exec carries its own 15s+5s
+	// bound, so the worst case for this handler is the timeouts
+	// stacking across the chain: 3×20s = 60s if every fallback wedges
+	// (40s on the chronyc success path). That is deliberate — each
+	// step only runs because the previous binary failed, and the
+	// request ctx still cancels the whole chain on client disconnect.
+	if out, err := combinedOutputTimeout(ctx, "chronyc", "tracking"); err == nil {
 		writeChronyTracking(buf, string(out))
-		if src, err := exec.Command("chronyc", "-n", "sources").CombinedOutput(); err == nil {
+		if src, err := combinedOutputTimeout(ctx, "chronyc", "-n", "sources"); err == nil {
 			fmt.Fprintf(buf, "\nNTP sources:\n%s", string(src))
 		}
-	} else if out, err := exec.Command("ntpq", "-pn").CombinedOutput(); err == nil {
+	} else if out, err := combinedOutputTimeout(ctx, "ntpq", "-pn"); err == nil {
 		fmt.Fprintf(buf, "\nNTP peers:\n%s\n", string(out))
-	} else if out, err := exec.Command("timedatectl", "show", "--property=NTPSynchronized", "--value").CombinedOutput(); err == nil {
+	} else if out, err := combinedOutputTimeout(ctx, "timedatectl", "show", "--property=NTPSynchronized", "--value"); err == nil {
 		fmt.Fprintf(buf, "\nNTP synchronized: %s\n", strings.TrimSpace(string(out)))
 	}
 }

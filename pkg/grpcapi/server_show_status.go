@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -102,7 +101,7 @@ func (s *Server) GetGlobalStats(_ context.Context, _ *pb.GetGlobalStatsRequest) 
 	}, nil
 }
 
-func (s *Server) GetSystemInfo(_ context.Context, req *pb.GetSystemInfoRequest) (*pb.GetSystemInfoResponse, error) {
+func (s *Server) GetSystemInfo(ctx context.Context, req *pb.GetSystemInfoRequest) (*pb.GetSystemInfoResponse, error) {
 	var buf strings.Builder
 
 	switch req.Type {
@@ -166,16 +165,14 @@ func (s *Server) GetSystemInfo(_ context.Context, req *pb.GetSystemInfoRequest) 
 		}
 
 	case "processes":
-		cmd := exec.Command("ps", "aux", "--sort=-rss")
-		out, err := cmd.Output()
+		out, err := outputTimeout(ctx, "ps", "aux", "--sort=-rss")
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "running ps: %v", err)
 		}
 		buf.Write(out)
 
 	case "storage":
-		cmd := exec.Command("df", "-h")
-		out, err := cmd.Output()
+		out, err := outputTimeout(ctx, "df", "-h")
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "running df: %v", err)
 		}
@@ -220,16 +217,14 @@ func (s *Server) GetSystemInfo(_ context.Context, req *pb.GetSystemInfoRequest) 
 		}
 
 	case "boot-messages":
-		cmd := exec.Command("journalctl", "--boot", "-n", "100", "--no-pager")
-		out, err := cmd.Output()
+		out, err := outputTimeout(ctx, "journalctl", "--boot", "-n", "100", "--no-pager")
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "running journalctl: %v", err)
 		}
 		buf.Write(out)
 
 	case "connections":
-		cmd := exec.Command("ss", "-tnp")
-		out, err := cmd.Output()
+		out, err := outputTimeout(ctx, "ss", "-tnp")
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "running ss: %v", err)
 		}

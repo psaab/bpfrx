@@ -4730,3 +4730,20 @@ top.
   seams (no real netlink).
   **File(s)**: pkg/vrrp/{vrrp.go, instance.go, manager.go,
   track_test.go (new), README.md}, CLAUDE.md
+  **Action**: #1787 Stage 1 — cheap-first RX learn: stack key array + `pair_write_needed` pure helper + per-key get() pre-check before the #949 bulk insert; linearization + dedup-window semantics documented at the call site; `learn_precheck_tests` unit matrix appended
+  **File(s)**: userspace-dp/src/afxdp/neighbor_dispatch.rs
+- **Timestamp**: 2026-06-10
+  **Action**: #1787 — export `pair_write_needed` under cfg(test) alongside `learn_dynamic_neighbor`
+  **File(s)**: userspace-dp/src/afxdp/mod.rs
+- **Timestamp**: 2026-06-10
+  **Action**: #1787 — integration tests: single-key first-learn (placeholder key never written), vlan pair first-learn, same-MAC no-op pre-check, MAC flip updates both keys, removed-key re-learn
+  **File(s)**: userspace-dp/src/afxdp/forwarding/tests.rs
+- **Timestamp**: 2026-06-10
+  **Action**: #1787 — module header note: learn upsert is cheap-first (write elided when all keys current)
+  **File(s)**: userspace-dp/src/afxdp/neighbor_dispatch.rs
+  **Action**: "#1805 commit 1 — grpcapi bounded request-path exec: new exec_timeout.go (outputTimeout/combinedOutputTimeout/runTimeout, 15s+5s WaitDelay, clampTailLines), converted 13 raw exec sites (server_show_status.go ×4 Output, server_show_system.go ×4 NTP chain w/ ctx plumb, server_show.go ×2 incl tail clamp, server_diag.go ×3 power + ×2 neigh flush), WaitDelay parity on streamDiagCmd, tests, README gotcha"
+  **File(s)**: pkg/grpcapi/exec_timeout.go, pkg/grpcapi/exec_timeout_test.go, pkg/grpcapi/server_show_status.go, pkg/grpcapi/server_show_system.go, pkg/grpcapi/server_show.go, pkg/grpcapi/server_diag.go, pkg/grpcapi/README.md
+
+- **Timestamp**: 2026-06-10
+  **Action**: "#1805 commit 2 — api bounded request-path exec: new exec_timeout.go (runTimeout only — sole raw sites are power actions; Output variants live in grpcapi sibling), converted system.go reboot/halt to runTimeout(context.Background()), WaitDelay=5s U3-parity on ping/traceroute handlers, tests, README gotcha"
+  **File(s)**: pkg/api/exec_timeout.go, pkg/api/exec_timeout_test.go, pkg/api/system.go, pkg/api/README.md
