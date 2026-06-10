@@ -33,7 +33,7 @@ fairness, AQM, and sane defaults. The xpf mapping:
 |---|---|---|
 | Bandwidth shaping | **shipped** | `class-of-service interfaces <if> unit <u> shaping-rate <bw>` — root token-bucket shaper per interface unit |
 | Per-flow fairness ("fq") | **shipped, zero-config under contention** | MQFQ per-flow buckets on all shaped queues (#1735); the bare-shaping default queue promotes lazily when a second distinct flow contends (see nuance below) |
-| AQM | **partial** | admission-path AQM is shipped: BDP-aware per-flow share caps, a 5 ms flow-fair aggregate delay clamp, and depth-threshold ECN CE marking. Dequeue-time sojourn CoDel is #1829 Phase 2 (evidence-gated, not yet shipped) |
+| AQM | **partial** | admission-path AQM is shipped: per-flow share caps, a 5 ms flow-fair aggregate delay clamp, and depth-threshold ECN CE marking. Which cap/ECN arm applies is regime-dependent (see "phrased honestly" below): the BDP-aware cap and per-flow ECN arm engage on different queue regimes, not both everywhere. Dequeue-time sojourn CoDel is #1829 Phase 2 (evidence-gated, not yet shipped) |
 | DiffServ tiers | **shipped, multi-line** | forwarding-classes + classifiers + schedulers + scheduler-maps (see the DiffServ variant below) |
 | Per-host isolation (`triple-isolate`) | **absent** | flow keying is the 5-tuple only; not planned |
 | Ack-filter | **absent** | no ACK thinning anywhere in the TX path; not planned |
@@ -65,10 +65,17 @@ Engine anchors, for the skeptical:
   `userspace-dp/src/afxdp/cos/queue_ops/push.rs` (lazy MQFQ promotion,
   #1735); eligibility is set for every admitted queue in
   `userspace-dp/src/afxdp/cos/admission.rs` (`flow_fair_eligible`).
-- **Admission AQM**: `cos_queue_flow_share_limit` (BDP-aware per-flow
-  share cap), `COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS` (5 ms flow-fair
-  aggregate delay clamp), and `apply_cos_admission_ecn_policy`
-  (depth-threshold ECN CE marking), all in
+- **Admission AQM**: `cos_queue_flow_share_limit` (per-flow share
+  cap — BDP-aware `max(fair_share×2, bdp_floor)` only on queues in
+  the shared-exact service regime, #914; other flow-fair queues get
+  the rate-unaware fair-share cap), `COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS`
+  (5 ms flow-fair aggregate delay clamp), and
+  `apply_cos_admission_ecn_policy` (depth-threshold ECN CE marking —
+  the per-flow arm fires only on flow-fair queues *outside* the
+  shared-exact regime; shared-exact and legacy queues use the
+  aggregate arm, deliberately: MQFQ already deprioritizes throttled
+  flows' drain position, and per-flow marking on top would
+  double-signal the same flow), all in
   `userspace-dp/src/afxdp/cos/admission.rs`.
 
 ### What it buys — phrased honestly
@@ -79,9 +86,20 @@ Engine anchors, for the skeptical:
   move and it is unconditional.
 - **As soon as a second distinct flow contends**: per-flow MQFQ
   fairness (work-conserving DRR-class scheduling over 4096 flow
-  buckets keyed by the 5-tuple), the BDP-aware per-flow share caps,
-  the 5 ms flow-fair delay clamp, and per-flow ECN marking all engage
-  automatically via lazy promotion.
+  buckets keyed by the 5-tuple), a per-flow share cap, and the 5 ms
+  flow-fair delay clamp engage automatically via lazy promotion.
+  Which *flavor* of cap and ECN you get depends on the queue's
+  service regime, and the two upgrades do not coincide:
+  - Queues serviced through the **shared multi-worker exact path**
+    (typically higher shaping rates that exceed what one worker
+    drains alone — the 3g LAN-side example below lands here) get the
+    **BDP-aware** share cap (#914) but **aggregate** ECN marking.
+  - Queues outside that regime (lower rates a single worker can
+    service — the 450m/900m WAN examples here) get the rate-unaware
+    fair-share cap but **per-flow** ECN marking.
+  Both regimes have a functioning cap + ECN signal; neither has both
+  premium variants at once. This is intentional engine behavior, not
+  a configuration knob.
 - **Single-flow nuance**: a bare-shaped queue **starts as a FIFO** and
   promotes to per-flow MQFQ only when a SECOND distinct flow arrives
   (the hash-free front-key probe in `push.rs`). Until then the
