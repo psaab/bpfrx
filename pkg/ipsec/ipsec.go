@@ -112,7 +112,7 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, error) {
 	b.WriteString("connections {\n")
 	for _, name := range sortedVPNNames(ipsecCfg.VPNs) {
 		vpn := ipsecCfg.VPNs[name]
-		fmt.Fprintf(&b, "  %s {\n", name)
+		fmt.Fprintf(&b, "  %s {\n", sanitizeSwanctlValue(name))
 
 		// Resolve gateway reference
 		remoteAddr := vpn.Gateway
@@ -181,10 +181,10 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, error) {
 		b.WriteString("    local {\n")
 		fmt.Fprintf(&b, "      auth = %s\n", authMethod)
 		if gw != nil && gw.LocalCertificate != "" {
-			fmt.Fprintf(&b, "      certs = %s\n", gw.LocalCertificate)
+			fmt.Fprintf(&b, "      certs = %s\n", sanitizeSwanctlValue(gw.LocalCertificate))
 		}
 		if gw != nil && gw.LocalIDValue != "" {
-			fmt.Fprintf(&b, "      id = %s\n", formatIdentity(gw.LocalIDType, gw.LocalIDValue))
+			fmt.Fprintf(&b, "      id = %s\n", sanitizeSwanctlValue(formatIdentity(gw.LocalIDType, gw.LocalIDValue)))
 		}
 		b.WriteString("    }\n")
 
@@ -192,7 +192,7 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, error) {
 		b.WriteString("    remote {\n")
 		fmt.Fprintf(&b, "      auth = %s\n", authMethod)
 		if gw != nil && gw.RemoteIDValue != "" {
-			fmt.Fprintf(&b, "      id = %s\n", formatIdentity(gw.RemoteIDType, gw.RemoteIDValue))
+			fmt.Fprintf(&b, "      id = %s\n", sanitizeSwanctlValue(formatIdentity(gw.RemoteIDType, gw.RemoteIDValue)))
 		}
 		b.WriteString("    }\n")
 
@@ -214,7 +214,7 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, error) {
 
 		fmt.Fprintf(&b, "    children {\n")
 		for _, child := range effectiveTrafficSelectors(name, vpn) {
-			fmt.Fprintf(&b, "      %s {\n", child.Name)
+			fmt.Fprintf(&b, "      %s {\n", sanitizeSwanctlValue(child.Name))
 			if child.LocalTS != "" {
 				fmt.Fprintf(&b, "        local_ts = %s\n", child.LocalTS)
 			}
@@ -267,8 +267,8 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, error) {
 			if err != nil {
 				return "", fmt.Errorf("vpn %s: %w", name, err)
 			}
-			fmt.Fprintf(&b, "  ike-%s {\n", name)
-			fmt.Fprintf(&b, "    secret = \"%s\"\n", decoded)
+			fmt.Fprintf(&b, "  ike-%s {\n", sanitizeSwanctlValue(name))
+			fmt.Fprintf(&b, "    secret = \"%s\"\n", sanitizeSwanctlValue(decoded))
 			fmt.Fprintf(&b, "  }\n")
 		}
 	}
@@ -438,7 +438,36 @@ func hasIKEChain(cfg *config.IPsecConfig, ikePolicyName string) bool {
 	return ok
 }
 
+// sanitizeSwanctlValue strips ASCII control characters — the C0 set
+// (0x00-0x1F, including newline) and DEL (0x7F), each replaced by a
+// space — from a free-text config value (connection name, IKE
+// identity, certificate name, pre-shared key) before it is
+// interpolated into a generated swanctl.conf line. Render-side belt
+// for #1798: an embedded newline must not be able to inject extra
+// swanctl sections/keys even if the commit-time validation layer were
+// bypassed.
+func sanitizeSwanctlValue(s string) string {
+	clean := true
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] == 0x7f {
+			clean = false
+			break
+		}
+	}
+	if clean {
+		return s
+	}
+	b := []byte(s)
+	for i := range b {
+		if b[i] < 0x20 || b[i] == 0x7f {
+			b[i] = ' '
+		}
+	}
+	return string(b)
+}
+
 // formatIdentity formats an IKE identity for strongSwan.
+
 func formatIdentity(idType, idValue string) string {
 	switch idType {
 	case "hostname", "fqdn":

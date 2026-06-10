@@ -6,6 +6,21 @@ import (
 	"strings"
 )
 
+// vrrpGroupPropertyKeywords are the property keywords recognized inside
+// a vrrp-group block. Used to delimit multi-value runs (virtual-address)
+// when properties are packed into a single node's Keys (#1813).
+var vrrpGroupPropertyKeywords = map[string]bool{
+	"virtual-address":     true,
+	"priority":            true,
+	"preempt":             true,
+	"accept-data":         true,
+	"advertise-interval":  true,
+	"authentication-type": true,
+	"authentication-key":  true,
+	"track-interface":     true,
+	"track-priority-cost": true,
+}
+
 func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 	for _, child := range node.Children {
 		if child.IsLeaf {
@@ -317,21 +332,102 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 							if addrInst.node.FindChild("preferred") != nil {
 								unit.PreferredAddress = addrInst.name
 							}
-							// Parse VRRP groups under address
+							// Parse VRRP groups under address. Handles both AST
+							// shapes (#1796): properties as child nodes
+							// (hierarchical blocks + schema-structured flat-set)
+							// AND properties packed into the instance node's
+							// Keys[2:] (legacy flat-set leaves, one leaf per
+							// `set ... vrrp-group <id> <prop> <value>` line —
+							// merged into one group instead of last-leaf-wins).
 							for _, vrrpInst := range namedInstances(addrInst.node.FindChildren("vrrp-group")) {
 								groupID, err := strconv.Atoi(vrrpInst.name)
 								if err != nil {
 									continue
 								}
-								vg := &VRRPGroup{
-									ID:       groupID,
-									Priority: 100, // default
+								if unit.VRRPGroups == nil {
+									unit.VRRPGroups = make(map[string]*VRRPGroup)
 								}
+								key := fmt.Sprintf("%s_grp%d", addrInst.name, groupID)
+								vg := unit.VRRPGroups[key]
+								if vg == nil {
+									vg = &VRRPGroup{
+										ID:       groupID,
+										Priority: 100, // default
+									}
+									unit.VRRPGroups[key] = vg
+								}
+								// Keys-encoded properties (flat-set leaf shape):
+								// Keys = ["vrrp-group", "<id>", prop, value, ...].
+								keys := vrrpInst.node.Keys
+								for i := 2; i < len(keys); i++ {
+									switch keys[i] {
+									case "virtual-address":
+										// Multi-value (#1813): consume every
+										// following token up to the next
+										// recognized property keyword —
+										// `vrrp-group 1 virtual-address
+										// [ a b ];` packs all addresses
+										// inline.
+										for i+1 < len(keys) && !vrrpGroupPropertyKeywords[keys[i+1]] {
+											i++
+											vg.VirtualAddresses = append(vg.VirtualAddresses, keys[i])
+										}
+									case "priority":
+										if i+1 < len(keys) {
+											i++
+											vg.Priority, _ = strconv.Atoi(keys[i])
+										}
+									case "preempt":
+										vg.Preempt = true
+									case "accept-data":
+										vg.AcceptData = true
+									case "advertise-interval":
+										if i+1 < len(keys) {
+											i++
+											vg.AdvertiseInterval, _ = strconv.Atoi(keys[i])
+										}
+									case "authentication-type":
+										if i+1 < len(keys) {
+											i++
+											vg.AuthType = keys[i]
+										}
+									case "authentication-key":
+										if i+1 < len(keys) {
+											i++
+											vg.AuthKey = keys[i]
+										}
+									case "track-interface":
+										if i+1 < len(keys) {
+											i++
+											vg.TrackInterface = keys[i]
+										}
+									case "track-priority-cost":
+										if i+1 < len(keys) {
+											i++
+											vg.TrackPriorityDelta, _ = strconv.Atoi(keys[i])
+										}
+									}
+								}
+								// Child-node properties (hierarchical blocks and
+								// schema-structured flat-set containers).
 								for _, prop := range vrrpInst.node.Children {
 									switch prop.Name() {
 									case "virtual-address":
-										if v := nodeVal(prop); v != "" {
-											vg.VirtualAddresses = append(vg.VirtualAddresses, v)
+										// Multi-value spellings (#1813):
+										// bracketed `virtual-address [ a b ];`
+										// packs all addresses into Keys[1:]
+										// (flat-set replay may carry trailing
+										// values as children); braced block
+										// `virtual-address { a; b; }` holds
+										// one child per address. nodeVal kept
+										// only the first of each.
+										for _, k := range prop.Keys[1:] {
+											vg.VirtualAddresses = append(vg.VirtualAddresses, k)
+										}
+										for _, child := range prop.Children {
+											if v := child.Name(); v != "" {
+												vg.VirtualAddresses = append(vg.VirtualAddresses, v)
+											}
 										}
 									case "priority":
 										if v := nodeVal(prop); v != "" {
@@ -357,11 +453,6 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 										}
 									}
 								}
-								if unit.VRRPGroups == nil {
-									unit.VRRPGroups = make(map[string]*VRRPGroup)
-								}
-								key := fmt.Sprintf("%s_grp%d", addrInst.name, groupID)
-								unit.VRRPGroups[key] = vg
 							}
 						}
 						if dhcpNode := afNode.FindChild("dhcp"); dhcpNode != nil {

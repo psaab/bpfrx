@@ -4641,6 +4641,25 @@ top.
   DemoteOwnerRGS + VacateAllSharedExactSlots, shared-session demotion runs,
   rg_epochs bumped, Ok returned. Extracted test_worker_handle() helper.
   **File(s)**: userspace-dp/src/afxdp/ha.rs, userspace-dp/src/afxdp/ha_tests.rs
+
+- **Timestamp**: 2026-06-09
+  **Action**: #1800 U5b — fixed the 5 dual-AST expectedFail harness cases,
+  one logical commit each, flipping each marker to expectedFail:false.
+  #1796 vrrp-group: setSchema subtree under interfaces unit family inet
+  address + compileVRRPGroup block reads Keys[2:]-packed properties and
+  merges repeated instances. #1797 dhcp-relay: setSchema subtree under
+  forwarding-options (server-group named container, group with
+  active-server-group + multi interface) + compileDHCPRelay inline-keys
+  dual-shape and instance merge. #1808 SNAT pool address block: inline
+  branch reads prop.Keys[1] directly instead of nodeVal's Children[0]
+  fallback (no more double-append; nodeVal contract untouched).
+  #1809 CoS classifier: collectCoSDSCPCodePoints/collectCoS8021CodePoints
+  also scan the loss-priority node's own Keys for the inline
+  "code-points" leaf spelling. #1810: system name-server marked
+  multi:true so SetPath appends instead of replacing.
+  **File(s)**: pkg/config/{schema.go, compiler_interfaces.go,
+  compiler_services.go, compiler_nat.go, compiler_class_of_service.go,
+  dual_ast_differential_test.go}, _Log.md
 - **Timestamp**: 2026-06-09
   **Action**: U10 (#1792) monotonic HA liveness — 4 commits on engineer/1800-u10-liveness
   **File(s)**: pkg/cluster/{heartbeat,heartbeat_manager,hooks,manager,sync,sync_conn,sync_protocol,sync_test,heartbeat_liveness_test}.go, pkg/daemon/{daemon,daemon_ha_sync,daemon_ha_sync_test}.go, pkg/vrrp/{instance,instance_garp_test}.go, docs/bug-heartbeat-vrf-rebind-split-brain.md
@@ -4659,3 +4678,13 @@ top.
   clear; daemon-level spec building + commit enable/disable lifecycle +
   lease-change-no-restart. README reconcile-lifecycle section added.
   **File(s)**: pkg/dhcp/{dhcp,reconcile,test_seams,reconcile_test}.go, pkg/dhcp/README.md, pkg/daemon/{daemon_dhcp,daemon_apply,daemon_run,dhcp_reconcile_test}.go
+  **Action**: #1798 U7 layer 1+2 — strict commit-path control-char validation (compileOpts.sanitizeFreeTextControlChars gate in compileExpanded) + lenient sanitize-with-warning; Store.Load/SyncApply tree scrub via config.SanitizeTreeControlChars
+  **File(s)**: pkg/config/freetext.go (new), pkg/config/compiler.go, pkg/configstore/store.go
+
+- **Timestamp**: 2026-06-09
+  **Action**: #1798 U7 layer 3 — render-side control-char sanitizers at every free-text file interpolation (networkd units, frr.conf, swanctl.conf) + audit of Kea/linksetup/ast_format (deliberately left, reasons in commit msg)
+  **File(s)**: pkg/networkd/networkd.go, pkg/frr/policy_render.go, pkg/ipsec/ipsec.go
+
+- **Timestamp**: 2026-06-09
+  **Action**: #1798 U7 gate tests — strict reject (flat-set + hierarchical + annotation), lenient sanitize+warn, Load boots on persisted bad config + next commit succeeds, SyncApply tolerance, renderer belt tests (networkd/frr/ipsec)
+  **File(s)**: pkg/config/freetext_test.go (new), pkg/configstore/freetext_store_test.go (new), pkg/networkd/networkd_test.go, pkg/frr/frr_test.go, pkg/ipsec/ipsec_test.go

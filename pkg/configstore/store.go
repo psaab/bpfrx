@@ -102,6 +102,18 @@ func (s *Store) Load() error {
 	// up so the operator can fix the config from CLI.
 	rewriteRetiredDataplaneType(tree, LoadCaller)
 
+	// #1798 migration: a persisted free-text value carrying control
+	// characters (e.g. a "lan\nDHCP=ipv4" description committed before
+	// the strict commit-time gate landed) must neither fail boot now
+	// nor make the operator's next unrelated commit fail mysteriously.
+	// Scrub the tree in place with a warning — this tree becomes the
+	// active config (and the candidate clones from it), so the next
+	// strict commit sees only clean values.
+	for _, p := range config.SanitizeTreeControlChars(tree) {
+		slog.Warn("sanitized control characters in persisted config value",
+			"path", p, "issue", "#1798")
+	}
+
 	// #1733: tolerate (warn, don't reject) an already-persisted
 	// workers>32 + equal-flow-enforcement config on local boot so an
 	// upgraded node does not blackout-boot. See compileTreeLenient.
@@ -256,6 +268,16 @@ func (s *Store) SyncApply(content string, chassisPreserve func(*config.ConfigTre
 	// retired leaf so the standby boots through cleanly while the
 	// operator updates the primary.
 	rewriteRetiredDataplaneType(tree, SyncCaller)
+
+	// #1798 migration: same tolerance as Load — a peer-synced config
+	// from a possibly-un-upgraded primary may carry control characters
+	// in free-text values. Scrub the tree in place with a warning so
+	// HA config sync does not alarm-loop and the standby's stored tree
+	// stays clean for any later strict commit.
+	for _, p := range config.SanitizeTreeControlChars(tree) {
+		slog.Warn("sanitized control characters in peer-synced config value",
+			"path", p, "issue", "#1798")
+	}
 
 	// #1733: tolerate (warn, don't reject) a workers>32 + equal-flow
 	// config peer-synced from a possibly-un-upgraded primary so HA config

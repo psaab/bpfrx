@@ -285,6 +285,34 @@ func (m *Manager) findExternallyManaged() map[string]bool {
 	return FindExternallyManaged(m.networkDir)
 }
 
+// sanitizeUnitValue strips ASCII control characters — the C0 set
+// (0x00-0x1F, including newline) and DEL (0x7F), each replaced by a
+// space — from a free-text config value before it is interpolated into
+// a generated systemd unit line. Render-side belt for #1798: a
+// description like "lan\nDHCP=ipv4" must not be able to inject extra
+// directives into a .network/.netdev/.link unit even if the
+// commit-time validation layer were bypassed (e.g. an old persisted
+// value reaching the renderer ahead of the load-time sanitizer).
+func sanitizeUnitValue(s string) string {
+	clean := true
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] == 0x7f {
+			clean = false
+			break
+		}
+	}
+	if clean {
+		return s
+	}
+	b := []byte(s)
+	for i := range b {
+		if b[i] < 0x20 || b[i] == 0x7f {
+			b[i] = ' '
+		}
+	}
+	return string(b)
+}
+
 func (m *Manager) generateNetdev(ifc InterfaceConfig) string {
 	var b strings.Builder
 	b.WriteString("# Managed by xpfd — do not edit\n")
@@ -292,7 +320,7 @@ func (m *Manager) generateNetdev(ifc InterfaceConfig) string {
 	fmt.Fprintf(&b, "Name=%s\n", ifc.Name)
 	b.WriteString("Kind=bond\n")
 	if ifc.Description != "" {
-		fmt.Fprintf(&b, "Description=%s\n", ifc.Description)
+		fmt.Fprintf(&b, "Description=%s\n", sanitizeUnitValue(ifc.Description))
 	}
 	if ifc.MTU > 0 {
 		fmt.Fprintf(&b, "MTUBytes=%d\n", ifc.MTU)
@@ -328,7 +356,7 @@ func (m *Manager) generateBridgeNetdev(ifc InterfaceConfig) string {
 	fmt.Fprintf(&b, "Name=%s\n", ifc.Name)
 	b.WriteString("Kind=bridge\n")
 	if ifc.Description != "" {
-		fmt.Fprintf(&b, "Description=%s\n", ifc.Description)
+		fmt.Fprintf(&b, "Description=%s\n", sanitizeUnitValue(ifc.Description))
 	}
 	if ifc.MTU > 0 {
 		fmt.Fprintf(&b, "MTUBytes=%d\n", ifc.MTU)
@@ -359,7 +387,7 @@ func (m *Manager) generateLink(ifc InterfaceConfig) string {
 		fmt.Fprintf(&b, "Duplex=%s\n", ifc.Duplex)
 	}
 	if ifc.Description != "" {
-		fmt.Fprintf(&b, "Description=%s\n", ifc.Description)
+		fmt.Fprintf(&b, "Description=%s\n", sanitizeUnitValue(ifc.Description))
 	}
 	return b.String()
 }

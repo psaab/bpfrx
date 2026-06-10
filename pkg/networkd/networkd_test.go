@@ -594,3 +594,38 @@ func TestApply_BridgeExpectedFiles(t *testing.T) {
 		t.Error("missing bridge member .network file")
 	}
 }
+
+// #1798 belt test: a description carrying an embedded newline must not
+// inject extra directives into any generated unit, even if commit-time
+// validation were bypassed.
+func TestGenerateUnits_NewlineDescriptionDoesNotInject(t *testing.T) {
+	m := New()
+	desc := "lan\nDHCP=ipv4"
+
+	cases := map[string]string{
+		"netdev": m.generateNetdev(InterfaceConfig{Name: "reth0", Description: desc}),
+		"bridge": m.generateBridgeNetdev(InterfaceConfig{Name: "br0", Description: desc}),
+		"link": m.generateLink(InterfaceConfig{
+			Name: "trust0", MACAddress: "52:54:00:aa:bb:cc", Description: desc,
+		}),
+	}
+	for name, got := range cases {
+		for _, line := range strings.Split(got, "\n") {
+			if strings.TrimSpace(line) == "DHCP=ipv4" {
+				t.Errorf("%s: injected directive leaked into unit:\n%s", name, got)
+			}
+		}
+		if !strings.Contains(got, "Description=lan DHCP=ipv4\n") {
+			t.Errorf("%s: sanitized description missing:\n%s", name, got)
+		}
+	}
+}
+
+func TestSanitizeUnitValue(t *testing.T) {
+	if got := sanitizeUnitValue("plain"); got != "plain" {
+		t.Errorf("clean value altered: %q", got)
+	}
+	if got := sanitizeUnitValue("a\nb\rc\x7f"); got != "a b c " {
+		t.Errorf("control chars not stripped: %q", got)
+	}
+}

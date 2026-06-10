@@ -110,10 +110,54 @@ var dualASTCases = []dualASTCase{
         }
     }
 }`,
-		expectedFail: true,
-		failureClass: "compiler dual-AST",
-		reason: "#1796: compileVRRPGroup reads only node.Children; flat-set " +
-			"encodes each property in Keys, so virtual-address/priority/... are dropped",
+		// Fixed in U5b (#1796): vrrp-group subtree added to setSchema and
+		// the compiler now reads properties from both Children and Keys[2:].
+		expectedFail: false,
+	},
+	{
+		// Junos multi-value bracketed list spelling: every address in
+		// `virtual-address [ a b ];` must survive both AST shapes
+		// (AGY review on PR #1813 — nodeVal kept only the first).
+		name: "interfaces-vrrp-group-bracketed-virtual-address",
+		hier: `interfaces {
+    reth1 {
+        unit 0 {
+            family inet {
+                address 10.0.61.1/24 {
+                    vrrp-group 1 {
+                        virtual-address [ 10.0.61.3 10.0.61.4 ];
+                        priority 200;
+                    }
+                }
+            }
+        }
+    }
+}`,
+		expectedFail: false,
+	},
+	{
+		// Braced block spelling: `virtual-address { a; b; }` holds one
+		// child per address (AGY review on PR #1813 — nodeVal's
+		// Children[0] fallback dropped all but the first).
+		name: "interfaces-vrrp-group-virtual-address-block",
+		hier: `interfaces {
+    reth1 {
+        unit 0 {
+            family inet {
+                address 10.0.61.1/24 {
+                    vrrp-group 1 {
+                        virtual-address {
+                            10.0.61.3;
+                            10.0.61.4;
+                        }
+                        priority 200;
+                    }
+                }
+            }
+        }
+    }
+}`,
+		expectedFail: false,
 	},
 	{
 		name: "security-zones-address-book",
@@ -295,11 +339,10 @@ var dualASTCases = []dualASTCase{
         }
     }
 }`,
-		expectedFail: true,
-		failureClass: "compiler dual-AST",
-		reason: "compileNATSource pool address block form double-appends: nodeVal() " +
-			"falls back to Children[0].Name() AND the explicit Children loop appends " +
-			"again, so hierarchical compiles Addresses=[x x] vs flat-set [x]",
+		// Fixed in U5b (#1808): the inline-value path reads prop.Keys[1]
+		// directly instead of nodeVal's Children[0] fallback, so the block
+		// form is appended only by the children walk.
+		expectedFail: false,
 	},
 	{
 		name: "security-screen",
@@ -443,12 +486,9 @@ system {
 system {
     dataplane-type userspace;
 }`,
-		expectedFail: true,
-		failureClass: "compiler dual-AST",
-		reason: "reverse dual-AST gap: compileClassOfService reads only the braced " +
-			"loss-priority container shape; the inline hierarchical leaf " +
-			"(Keys-encoded) is silently dropped, while the flat-set replay is " +
-			"structured by setSchema and compiles — hierarchical loses the classifier",
+		// Fixed in U5b (#1809): the classifier code-point collectors also
+		// scan the loss-priority node's own Keys for the inline leaf form.
+		expectedFail: false,
 	},
 	{
 		name: "firewall-filters",
@@ -574,11 +614,9 @@ system {
         2001:4860:4860::8888;
     }
 }`,
-		expectedFail: true,
-		failureClass: "round-trip infidelity (content)",
-		reason: "round-trip infidelity: setSchema models name-server as a " +
-			"single-value leaf (args:1, no multi), so SetPath REPLACES on the " +
-			"second `set system name-server <addr>` — last value wins, first lost",
+		// Fixed in U5b (#1810): name-server is multi in setSchema, so
+		// SetPath appends distinct values instead of replacing.
+		expectedFail: false,
 	},
 	{
 		name: "chassis-cluster",
@@ -649,10 +687,33 @@ services {
         }
     }
 }`,
-		expectedFail: true,
-		failureClass: "compiler dual-AST",
-		reason: "#1797: dhcp-relay missing from setSchema (flat-set collapses to one " +
-			"leaf) and compileDHCPRelay reads only Children — relay compiles empty",
+		// Fixed in U5b (#1797): dhcp-relay subtree added to setSchema and
+		// compileDHCPRelay also reads inline Keys-encoded properties.
+		expectedFail: false,
+	},
+	{
+		// Braced block spelling: `interface { a; b; }` holds one child
+		// per interface (AGY review on PR #1813 — nodeVal's Children[0]
+		// fallback compiled 1 interface hierarchically vs 2 flat, a real
+		// dual-AST divergence).
+		name: "forwarding-options-dhcp-relay-interface-block",
+		hier: `forwarding-options {
+    dhcp-relay {
+        server-group {
+            sg1 {
+                10.1.1.1;
+            }
+        }
+        group lan {
+            active-server-group sg1;
+            interface {
+                ge-0/0/0.0;
+                ge-0/0/1.0;
+            }
+        }
+    }
+}`,
+		expectedFail: false,
 	},
 	{
 		name: "protocols-ospf-bgp",
