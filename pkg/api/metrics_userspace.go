@@ -317,6 +317,15 @@ func (c *xpfCollector) emitUserspaceDynamicBufferMetrics(ch chan<- prometheus.Me
 		float64(status.SessionPublishErrorsTotal),
 	)
 
+	// #1807: worker-command-queue poison recoveries. Also emitted
+	// unconditionally so a 0 is a real "no worker panics" signal rather
+	// than an absent series.
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceWorkerCommandQueuePoisonRecoveries,
+		prometheus.CounterValue,
+		float64(status.WorkerCommandQueuePoisonRecoveries),
+	)
+
 	var activeFlows, flowCapacity uint64
 	for _, b := range status.Bindings {
 		activeFlows += uint64(b.ActiveFlowCount)

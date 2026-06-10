@@ -472,6 +472,19 @@ func newCollector(srv *Server) *xpfCollector {
 				"reconcile) (#1789).",
 			nil, nil,
 		),
+		userspaceWorkerCommandQueuePoisonRecoveries: prometheus.NewDesc(
+			"xpf_userspace_worker_command_queue_poison_recoveries_total",
+			"Worker command-queue mutex poison recoveries across all "+
+				"helper producer/consumer sites (worker poll, HA enqueues, "+
+				"session replication, activation prewarm, tunnel install, "+
+				"cross-binding shaped-TX redirect). A poisoned mutex means "+
+				"a worker thread panicked while holding the lock; recovery "+
+				"keeps the committed queue and clears the poison so the "+
+				"queues keep flowing instead of going permanently deaf. "+
+				"A nonzero value indicates a contained worker panic "+
+				"occurred (#1807, extends #1790).",
+			nil, nil,
+		),
 		userspaceFlowCacheActiveFlows: prometheus.NewDesc(
 			"xpf_userspace_flow_cache_active_flows",
 			"Aggregate active userspace flow-cache entries across bindings.",

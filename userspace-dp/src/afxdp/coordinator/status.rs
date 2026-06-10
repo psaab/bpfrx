@@ -79,6 +79,20 @@ impl super::Coordinator {
         per_binding.saturating_add(SESSION_PUBLISH_ERRORS_SHARED.load(Ordering::Relaxed))
     }
 
+    /// #1807: total worker-command-queue poison recoveries across every
+    /// producer/consumer site (worker poll peek + apply, HA enqueues,
+    /// session replication, activation prewarm, tunnel install/drain-wait,
+    /// cross-binding shaped-TX redirect). Each recovery means a thread
+    /// panicked while holding a command-queue mutex and the committed
+    /// queue was recovered + the poison cleared (worker_queue.rs policy,
+    /// extends #1790). Surfaced as
+    /// `xpf_userspace_worker_command_queue_poison_recoveries_total`; a
+    /// nonzero value says a worker panic happened (see #925 supervisor)
+    /// and the queues kept flowing.
+    pub fn worker_command_queue_poison_recoveries_total(&self) -> u64 {
+        crate::afxdp::worker_queue::WORKER_COMMAND_QUEUE_POISON_RECOVERIES.load(Ordering::Relaxed)
+    }
+
     /// #1782: debug dump of every key currently present in the userspace
     /// `dynamic_neighbors` mirror, as `(ifindex, ip)` pairs. The
     /// cold-start capture harness reads this at the pre-connect t0'

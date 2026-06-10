@@ -650,6 +650,16 @@ type ProcessStatus struct {
 	// as xpf_userspace_session_publish_errors_total. Omitempty for wire
 	// compat with older helpers.
 	SessionPublishErrorsTotal uint64 `json:"session_publish_errors_total,omitempty"`
+	// #1807: total worker-command-queue poison recoveries (a helper
+	// thread panicked while holding a worker command mutex; the
+	// committed queue was recovered and the poison cleared — uniform
+	// policy in afxdp/worker_queue.rs, extends #1790). Nonzero means a
+	// worker panic happened and the command queues kept flowing instead
+	// of going permanently deaf. Surfaced as
+	// xpf_userspace_worker_command_queue_poison_recoveries_total.
+	// Omitempty-free on the Rust side (always serialized); plain decode
+	// here defaults to 0 for older helpers.
+	WorkerCommandQueuePoisonRecoveries uint64 `json:"worker_command_queue_poison_recoveries,omitempty"`
 	// #1769: on-demand neighbor-resolver telemetry. The resolver fires
 	// when a MissingNeighbor negative-cache fast-fail nudges a wedged dst
 	// (single-key RTM_GETNEIGH + epoch-guarded cache or probe-on-stale).

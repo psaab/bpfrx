@@ -47,6 +47,11 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     // (per-binding worker-poll sites + shared no-binding sites). The
     // cause-side signal for rising XDP-shim NO_SESSION fallbacks.
     state.status.session_publish_errors_total = state.afxdp.session_publish_errors_total();
+    // #1807: worker-command-queue poison recoveries (committed-prefix +
+    // clear_poison policy in afxdp/worker_queue.rs). Nonzero = a worker
+    // panic poisoned a command queue and it was recovered.
+    state.status.worker_command_queue_poison_recoveries =
+        state.afxdp.worker_command_queue_poison_recoveries_total();
     // The per-key dynamic_neighbors dump is a high-cardinality
     // (ifindex,ip)-labelled debug surface used only by the #1782 cold-start
     // capture. Gate it behind XPF_DEBUG_NEIGHBOR_KEYS so it is OFF by default:

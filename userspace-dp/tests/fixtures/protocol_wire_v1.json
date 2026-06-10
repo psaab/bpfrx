@@ -780,6 +780,7 @@
     "started_at": "1970-01-01T00:00:00Z",
     "state_file": "",
     "three_color_policer_counters": [],
+    "worker_command_queue_poison_recoveries": 0,
     "worker_heartbeats": [],
     "worker_runtime": [],
     "workers": 0

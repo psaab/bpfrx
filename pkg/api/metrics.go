@@ -143,9 +143,13 @@ type xpfCollector struct {
 	userspaceNatReverseKeyCollisions         *prometheus.Desc
 	// #1789: total failed USERSPACE_SESSIONS BPF-map publishes — the
 	// cause-side signal for rising XDP-shim NO_SESSION fallbacks.
-	userspaceSessionPublishErrors            *prometheus.Desc
-	userspaceFlowCacheActiveFlows            *prometheus.Desc
-	userspaceFlowCacheCapacity               *prometheus.Desc
+	userspaceSessionPublishErrors *prometheus.Desc
+	// #1807: worker-command-queue poison recoveries — nonzero means a
+	// helper worker panic poisoned a command queue and it was recovered
+	// (committed-prefix + clear_poison policy) instead of going deaf.
+	userspaceWorkerCommandQueuePoisonRecoveries *prometheus.Desc
+	userspaceFlowCacheActiveFlows               *prometheus.Desc
+	userspaceFlowCacheCapacity                  *prometheus.Desc
 	// #1379: daemon-side userspace event-stream transport counters.
 	userspaceEventStreamFramesTotal          *prometheus.Desc
 	userspaceEventStreamProducerFramesTotal  *prometheus.Desc
@@ -341,6 +345,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.userspaceSessionTableCapacity
 	ch <- c.userspaceNatReverseKeyCollisions
 	ch <- c.userspaceSessionPublishErrors
+	ch <- c.userspaceWorkerCommandQueuePoisonRecoveries
 	ch <- c.userspaceFlowCacheActiveFlows
 	ch <- c.userspaceFlowCacheCapacity
 	ch <- c.userspaceEventStreamFramesTotal
