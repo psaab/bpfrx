@@ -6,8 +6,10 @@ current master (`d30cfab84`) plus a 10-reproduction live induction
 campaign on the loss userspace cluster (2026-06-10). The prior plan's
 neighbor causal chain is real but **was never engaged by the
 operator-shaped stall**; the stall reproduces on demand and is pinned
-to the **CoS exact-queue token/lease cold-start after idle** (§4). The
-PR-2 neighbor fix (Option B first-miss reuse) is recommended for
+to a **cold-start inside the first shaped CoS drain call after idle**
+(two candidate sub-mechanisms, §4: timer-wheel O(lag) catch-up vs v8
+lease zero-grant ladder — one cheap counter disambiguates). The PR-2
+neighbor fix (Option B first-miss reuse) is recommended for
 **PLAN-KILL as the #1782 fix**; a new, CoS-scoped PR-2 is specified
 instead (§5).
 
@@ -172,41 +174,36 @@ All 5 flows queue behind the exact queue's owner worker
 (`service_exact_guarantee_queue_direct_with_info`,
 `cos/queue_service/mod.rs:630-739`) and release together.
 
-### 3.6 Rep H — in-window system-wide perf
+### 3.6 Rep H — in-window system-wide perf (negatives, with a caveat)
 
-With a validated clock mapping, the 12 s `-a` capture (cycles
-2 kHz/cpu + sched_switch) covers the 111 ms stall: **no worker CPU
-burst** (the on-paper O(idle) suspect `advance_cos_timer_wheel`,
-`tx_completion.rs:217-226`, does not appear in any stall-window
-sample), **no worker sched gap >15 ms** (rules out vCPU steal for
-the stall window; the owner worker sat in its normal 1 ms
-`poll()` loop), CPUs ~half idle. Two environmental observations
-worth follow-ups: (a) workers burn their idle cycles in
+With a measured clock mapping (fw epoch↔mono offset stable; client→fw
+skew 51.2 s, residual uncertainty ±1-2 s), the 12 s `-a` capture
+(cycles 2 kHz/cpu + sched_switch) brackets the 111 ms stall: in the
+mapped window there is **no worker CPU burst** (the O(lag) suspect
+`advance_cos_timer_wheel`, `tx_completion.rs:217-226`, appears in no
+sample), **no worker sched gap >15 ms** (no vCPU-steal hole; workers
+sat in their normal 1 ms `poll()` loops), CPUs ~half idle. CAVEAT:
+these negatives inherit the ±1-2 s window uncertainty; the
+counter-based evidence (§3.5/§3.7) does not. Two environmental
+observations worth follow-ups: (a) workers burn idle cycles in
 `FlowCache::active_flow_debug_entries` (~5% of all dp CPU,
 continuous, stall-independent); (b) the host carries chronic vCPU
-steal (cumulative ~8000 s; `/proc/stat` steal ticks observed
-incrementing outside stall windows).
+steal (cumulative ~8000 s across the VM's lifetime).
 
-### 3.7 Rep I — park-cycle anatomy (the pinned mechanism)
+### 3.7 Rep I — park-cycle telemetry
 
 Control-socket CoS queue telemetry across a 105 ms stall (queue 1):
 `queue_token_starvation_parks` **+14**, `drain_invocations` +11,
-`root_token_starvation_parks` +0, drain-latency buckets +1 top-bucket
-+ small entries. The stall is **~14 QueueTokenStarvation park/wake
-cycles ≈ 7.5 ms apiece** — the queue repeatedly woke, attempted a
-v8 lease top-up (`maybe_top_up_cos_queue_lease`,
-`token_bucket.rs:154-249` → `acquire_v8`,
-`types/shared_cos_lease/mod.rs:1180+`), failed to accumulate
-`head_len` worth of tokens, and re-parked
-(`cos/queue_service/mod.rs:988-1009` waterfill site /
-`:686-721` direct site; park = `park_cos_queue`,
-`tx_completion.rs:79-101`). 7.5 ms ≈ `COS_MIN_BURST_BYTES`
-(96 000 B, `token_bucket.rs:25`) at the 12.5 MB/s class rate —
-suggesting the effective wait per cycle is a bank/lease quantum at
-the class rate, not the parked `head_len` estimate
-(`estimate_cos_queue_wakeup_tick` is passed `head_len` at every
-park site — the µs-scale estimate is NOT what paces the observed
-cycles).
+`root_token_starvation_parks` +0, drain-latency +1 top-bucket + a
+few small entries. Park sites: `cos/queue_service/mod.rs:988-1009`
+(waterfill) / `:686-721` (direct); park = `park_cos_queue`
+(`tx_completion.rs:79-101`); top-up = `maybe_top_up_cos_queue_lease`
+(`token_bucket.rs:154-249`) → `acquire_v8`
+(`types/shared_cos_lease/mod.rs:1180+`). Caveat: the deltas span the
+connect AND the subsequent (shaped) handshake/RST exchange, so some
+or all of the +14 parks may be ordinary 100m-shaper pacing of the
+post-release bytes rather than the stall itself — disambiguation
+needs the §5.2 Step-1 counters.
 
 ### 3.8 What was NOT re-run
 
@@ -223,32 +220,49 @@ neighbor cold-start.**
 
 Chain (all current master refs):
 1. During data-path idle no drains run (`should_enter_shaped_drain`
-   gate), so per-(worker, root-iface) CoS state — v8 shared-lease
-   epoch state (`types/shared_cos_lease/`), `queue.hot.tokens`,
-   timer wheel — receives no maintenance.
+   gate / `cos_root_can_service_after_prime`,
+   `tx_completion.rs:280-297`), so per-(worker, root-iface) CoS
+   state — the timer wheel `current_tick`, v8 shared-lease epoch
+   state (`types/shared_cos_lease/`), `queue.hot.tokens` — receives
+   no maintenance and accrues LAG = time since that worker's last
+   drain.
 2. First flows after idle classify into a CoS queue
    (`tx/cos_classify.rs`); exact-queue traffic funnels to the
    queue's owner worker.
-3. The first drain finds `queue.hot.tokens < head_len` and the v8
-   lease grants ~0 per attempt for ~10-15 cycles spanning
-   50-1000 ms (observed 53 ms@60 s idle → 100-170 ms@7-13 min →
-   ~1 s@hours; exact functional form unresolved — §7 Q2), each
-   cycle ending in a `QueueTokenStarvation` re-park.
-4. Every flow behind that owner/queue waits the full ladder; all
-   release together when the lease finally grants ⇒ "multiple flows
-   hang for a few seconds, then full speed" (operator symptom, with
-   overnight idle scaling the ladder into seconds).
-5. TCP keeps the SYNs alive (they are buffered in the CoS queue,
-   not dropped), so there are no retransmits in the minutes regime;
-   in the overnight/multi-second regime client RTOs (1 s, 2 s)
-   overlay the recovery, matching the operator's "hanging or not
-   performing for a few seconds".
+3. The first `drain_shaped_tx` on a lagged worker takes
+   ~50-1000 ms wall (one invocation lands in the clipped ≥33.5 ms
+   histogram bucket in EVERY reproduction) via one or both of two
+   candidate sub-mechanisms inside the call:
+   - **(i) timer-wheel catch-up:** `prime_cos_root_for_service`
+     (`tx_completion.rs:303-322`) → `advance_cos_timer_wheel`
+     (`:217-226`) advances `current_tick` ONE 50 µs tick per loop
+     iteration; lag/50 µs iterations at ~5-10 ns each predicts
+     7-13 min lag → 60-190 ms and hours → ~1-2 s — quantitatively
+     matching the observations (the per-WORKER lag, not global
+     idle, also explains the 53 ms 60 s-control and the rep C
+     fast/slow split). Argued against only by the rep-H in-window
+     no-CPU-burst negative, which carries ±1-2 s mapping
+     uncertainty (§3.6).
+   - **(ii) v8 lease cold-start ladder:** `queue.hot.tokens <
+     head_len` with `acquire_v8` granting ~0 per attempt across
+     repeated `QueueTokenStarvation` park/wake cycles (rep I +14
+     parks — but see the §3.7 caveat). Candidate starving bounds:
+     epoch/`cap`/`my_share` staleness recovering via
+     `maybe_rotate_epoch_v8`; the outstanding-credit ledger
+     (`try_bump_outstanding` vs `max_total_leased`); per-worker
+     `active_flow_buckets` rehydration.
+4. Every flow behind that owner/queue waits out the same call; all
+   release together ⇒ "multiple flows hang, then full speed"
+   (operator symptom; overnight lag scales it to seconds).
+5. The SYNs are buffered (CoS queue / pending TX), not dropped —
+   no retransmits in the minutes regime; in the overnight regime
+   client SYN-RTOs (1 s, 2 s) overlay recovery, matching the
+   operator's report.
 
 Supporting differentials: warm ping on a different queue/worker does
 not help (rep B); same-port flows split fast/slow by worker (rep C);
-one ≥33.5 ms drain invocation per event (reps D/F/G/H/I);
-+14 queue-token parks per event (rep I); zero neighbor-counter
-movement (all reps).
+one ≥33.5 ms drain invocation per event (reps D/F/G/H/I); zero
+neighbor-counter movement (all reps).
 
 **Where the prior plan's H-chain stands:** H5 (one-representative
 pending drop) remains real-but-rare (needs a genuine
@@ -272,31 +286,36 @@ do not implement under #1782.
 
 ### 5.2 The CoS cold-start fix (new PR-2 scope)
 
-**Step 1 — line-level pin (small, instrumented):** add three cheap
-counters/timestamps around the v8 lease zero-grant path
-(`acquire_v8` grant=0 with `requested>0` per cause: seqlock-give-up
-`:1207-1209`, `cap==0` `:1210-1212`, share-exhausted `:1256-1258`,
-class-cap `:1264-1266`, outstanding-cap `:1289-1297`) + a
-park-cycle dwell histogram (queued→first-sent per queue). One cold
-rep then names the exact starving bound. The candidates, in order
-of suspicion: (a) epoch/`cap`/`my_share` state staled by idle and
-only recovering via `maybe_rotate_epoch_v8` ladder; (b) the
-outstanding-credit ledger (`try_bump_outstanding` vs
-`max_total_leased`) left near-cap at idle-entry (banked-but-unspent
-tokens from the last active period never returned); (c) per-worker
-`active_flow_buckets`/share rehydration after idle.
+**Step 1 — line-level pin (small, instrumented, disambiguates §4(i)
+vs §4(ii)):**
+- (i)-counter: ticks advanced per `advance_cos_timer_wheel` call —
+  a per-call `now_tick - current_tick` max/sum (2 atomics). A cold
+  rep showing a single multi-million-tick advance proves (i)
+  conclusively, and its wall cost is directly computable.
+- (ii)-counters: `acquire_v8` grant==0-with-requested>0 per cause
+  (seqlock-give-up `:1207-1209`, `cap==0` `:1210-1212`,
+  share-exhausted `:1256-1258`, class-cap `:1264-1266`,
+  outstanding-cap `:1289-1297`), plus the root-lease analogues
+  (§7 Q3), plus a queued→first-sent dwell histogram per queue.
+- Raise the `drain_latency`/kick histogram top bucket past 33.5 ms
+  so the stall stops clipping (§5.3).
+One cold rep with these live names the mechanism.
 
-**Step 2 — the fix (shape, finalized after step 1):** on first
-service after an idle gap ≥ some threshold (e.g. epoch_start older
-than N epochs), re-initialize the queue's lease/bank state to the
-same state a freshly-built queue gets (`builders.rs` initial state:
-full burst bank, fresh epoch) instead of replaying the starvation
-ladder. This is a cold-path-only change (gated on the idle gap),
-preserves the configured exact rate in steady state (Gate-4 hard cap
-is enforced by per-epoch grant + tx_completion debit, not by the
-cold bank), and cannot re-open #1630/#1743 fairness work — but the
-PR MUST re-run the #1628/#1630 fairness gates and the cos-class
-smoke to prove it.
+**Step 2 — the fix (shape per mechanism, finalized after step 1):**
+- If (i): make the wheel catch-up O(slots), not O(lag): when
+  `now_tick - current_tick` exceeds the full wheel horizon, wake
+  every parked queue whose tick is due (during idle the wheel is
+  empty — queues are unparked/empty by `normalize_cos_queue_state`)
+  and SNAP `current_tick = now_tick` in O(1) instead of looping
+  per-tick (`tx_completion.rs:217-226`). Behavior-identical for
+  the in-horizon case; removes the O(idle) wall entirely.
+- If (ii): on first service after an idle gap ≥ N epochs,
+  re-initialize the queue's lease/bank state to the freshly-built
+  state (`builders.rs`: full burst bank, fresh epoch) instead of
+  replaying the starvation ladder.
+Either way the change is cold-path-only and must re-run the
+#1628/#1630 fairness gates + the per-class CoS smoke (deploy wipes
+CoS — re-apply first) to prove steady-state shaping is untouched.
 
 **Acceptance for PR-2:** cold-connect wall time after ≥13 min idle
 ≤ 20 ms (vs 100-170 ms today) for all classes incl. BE; no change
@@ -338,8 +357,9 @@ re-test shows no multi-second multi-flow lag.
 
 ## 7. Open questions (for adversarial review)
 
-1. **Q1:** Which exact bound in `acquire_v8` starves the cold queue
-   (§5.2 step 1 candidates a/b/c)? Counter evidence pending.
+1. **Q1:** Which §4 sub-mechanism is it — (i) wheel catch-up or
+   (ii) lease ladder (and if (ii), which `acquire_v8` bound)? The
+   Step-1 tick-advance counter settles (i) in one rep.
 2. **Q2:** What sets the stall duration's idle-scaling
    (53 ms@60 s → ~1 s@hours)? The ~7.5 ms/cycle × ~14 cycles
    anatomy was measured at one idle depth only; the cycle count
