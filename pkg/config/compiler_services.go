@@ -369,12 +369,14 @@ func compilePreferredRoutes(node *Node, ri, polName string, routes map[string]*P
 	return nil
 }
 
-// validateIPMonitoringStrict enforces the #1827 PR-1b commit checks:
+// validateIPMonitoringStrict enforces the #1827 commit checks:
 // the matched probe exists, every policy has at least one
 // preferred-route, destinations/next-hops are family-consistent, and
-// referenced routing instances exist AND are not instance-type
-// forwarding (the FBF composition is PR-2 — the known FRR-vs-dataplane
-// divergence for forwarding instances must be unreachable from PR-1).
+// referenced routing instances exist. PR-1b additionally rejected
+// `instance-type forwarding` targets; PR-2 lifted that rejection —
+// forwarding instances now render into their dedicated kernel table
+// (FRR `table <id>`), matching the dataplane's `<ri>.inet.0`, so the
+// FRR-vs-dataplane divergence that motivated the fence is fixed.
 func validateIPMonitoringStrict(cfg *Config) error {
 	ipm := cfg.Services.IPMonitoring
 	if ipm == nil {
@@ -416,13 +418,8 @@ func validateIPMonitoringStrict(cfg *Config) error {
 					name, pr.Destination, pr.NextHop)
 			}
 			if pr.RoutingInstance != "" {
-				ri, ok := instances[pr.RoutingInstance]
-				if !ok {
+				if _, ok := instances[pr.RoutingInstance]; !ok {
 					return fmt.Errorf("services ip-monitoring policy %q route %s: routing-instance %q does not exist",
-						name, pr.Destination, pr.RoutingInstance)
-				}
-				if ri.InstanceType == "forwarding" {
-					return fmt.Errorf("services ip-monitoring policy %q route %s: preferred-route routing-instance %q has instance-type forwarding, which is not supported yet (filter-based forwarding composition is #1827 PR-2)",
 						name, pr.Destination, pr.RoutingInstance)
 				}
 			}

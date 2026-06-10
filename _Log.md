@@ -4952,6 +4952,17 @@ top.
   - **Action**: PR-1b observability + docs — show services ip-monitoring status (cmdtree + local CLI + remote CLI + gRPC topic, shared ipmon.FormatStatus renderer), Prometheus xpf_ipmon_policy_failed/transitions_total/routes_applied (+ descriptor-coverage canary fixture), docs/multi-wan.md, pkg/ipmon/README.md, pkg/frr/README.md, pkg/daemon/README.md, CLAUDE.md feature line.
   - **File(s)**: pkg/cmdtree/tree.go, pkg/cli/{cli,cli_show_services}.go, cmd/cli/show.go, pkg/grpcapi/{server,server_show,server_show_security_text}.go, pkg/api/{server,metrics,metrics_descriptors,metrics_system,metrics_descriptor_coverage_test}.go, docs/multi-wan.md, pkg/ipmon/README.md, pkg/frr/README.md, pkg/daemon/README.md, CLAUDE.md
 
+- **Timestamp**: 2026-06-10 16:30
+  - **Action**: #1827 PR-2 divergence fix — frr.InstanceConfig gains Name/TableID; generateStaticRouteInTable renders forwarding-instance statics with `table <id>` (default-VRF) instead of leaking into the default table; renderPreferredRoutes resolves forwarding targets to table rendering; daemon assembleFRRConfig + pkg/cli apply set Name/TableID for instance-type forwarding. Goldens in fbf_table_render_test.go + TestAssembleFRRConfigForwardingInstanceTable.
+  - **File(s)**: pkg/frr/{manager,config_render,fbf_table_render_test}.go, pkg/daemon/{daemon_ipmon,daemon_ipmon_test}.go, pkg/cli/apply.go
+
+- **Timestamp**: 2026-06-10 16:45
+  - **Action**: #1827 PR-2 lift PR-1b forwarding-type commit-rejection from validateIPMonitoringStrict (instance-existence check kept); FBF composition compile tests in both AST shapes (parser_fbf_test.go) replace the rejection case; dataplane snapshot-shape pins (fbf_snapshot_test.go: forwarding statics in <ri>.inet.0, steering term carries routing-instance + count, overlay whole-entry replacement into forwarding instance).
+  - **File(s)**: pkg/config/{compiler_services,types_system,parser_ipmonitoring_test,parser_fbf_test}.go, pkg/dataplane/userspace/fbf_snapshot_test.go
+
+- **Timestamp**: 2026-06-10 17:00
+  - **Action**: #1827 PR-2 two-upstream lab — fbf-two-upstream-config.set fixture (ISP-B forwarding instance on reth0.80, DSCP-af31 steering filter with per-policy counter, ip-monitoring fbf-fallback into the FBF instance), test-fbf-steering.sh harness (atomic apply, PBR-band table discovery, kernel-table + main-table-pollution asserts, counter-delta steering check, rollback restore), fixture-compile CI test, docs/multi-wan.md PR-2 section + README updates.
+  - **File(s)**: test/incus/fbf-two-upstream-config.set, test/incus/test-fbf-steering.sh, pkg/config/fbf_fixture_test.go, docs/multi-wan.md, pkg/frr/README.md
 - **Timestamp**: 2026-06-10 16:00
   - **Action**: AGY review fold-in (PR #1843, PASS w/ 2 findings). F1: deleted uncalled legacy frr.Apply/ApplyWithInstances partial FullConfig constructors (overlay-wipe bypass) + AST guard test enforcing assembleFRRConfig as sole production constructor (allowlist: assembler + documented pkg/cli/apply.go standalone fallback; negative-checked). F2: ErrProbeSetup classification — raw-socket open/marshal failures hold probe state (no counters/status/events/Transition, rate-limited Warn) so ip-monitoring never actuates routes off a capability regression; timeout/echo failures unchanged.
   - **File(s)**: pkg/frr/manager.go, pkg/frr/README.md, pkg/daemon/frr_fullconfig_guard_test.go, pkg/rpm/icmp.go, pkg/rpm/rpm.go, pkg/rpm/icmp_test.go, pkg/rpm/README.md, docs/multi-wan.md

@@ -132,8 +132,19 @@ func (c *CLI) applyToDataplane(cfg *config.Config) error {
 			}
 		}
 		for _, ri := range cfg.RoutingInstances {
+			// Mirror daemon assembleFRRConfig (#1827 PR-2): forwarding
+			// instances have no VRF device — render their statics into
+			// the instance's dedicated kernel table.
+			vrfName := "vrf-" + ri.Name
+			tableID := 0
+			if ri.InstanceType == "forwarding" {
+				vrfName = ""
+				tableID = ri.TableID
+			}
 			fc.Instances = append(fc.Instances, frr.InstanceConfig{
-				VRFName:      "vrf-" + ri.Name,
+				Name:         ri.Name,
+				VRFName:      vrfName,
+				TableID:      tableID,
 				OSPF:         ri.OSPF,
 				OSPFv3:       ri.OSPFv3,
 				BGP:          ri.BGP,
