@@ -569,11 +569,9 @@ system {
         2001:4860:4860::8888;
     }
 }`,
-		expectedFail: true,
-		failureClass: "round-trip infidelity (content)",
-		reason: "round-trip infidelity: setSchema models name-server as a " +
-			"single-value leaf (args:1, no multi), so SetPath REPLACES on the " +
-			"second `set system name-server <addr>` — last value wins, first lost",
+		// Fixed in U5b (#1810): name-server is multi in setSchema, so
+		// SetPath appends distinct values instead of replacing.
+		expectedFail: false,
 	},
 	{
 		name: "chassis-cluster",

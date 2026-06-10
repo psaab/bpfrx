@@ -1043,7 +1043,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		"domain-search": {desc: "Domain search list", args: 1, multi: true, placeholder: "<domain>", children: nil},
 		"time-zone":     {desc: "System time zone", args: 1, placeholder: "<timezone>", children: nil},
 		"no-redirects":  {desc: "Disable ICMP redirects", children: nil},
-		"name-server":   {desc: "DNS name server", args: 1, placeholder: "<address>", children: nil},
+		"name-server":   {desc: "DNS name server", args: 1, multi: true, placeholder: "<address>", children: nil},
 		"backup-router": {desc: "Backup router", args: 1, placeholder: "<address>", children: map[string]*schemaNode{
 			"destination": {desc: "Destination network", args: 1, placeholder: "<network>", children: nil},
 		}},
