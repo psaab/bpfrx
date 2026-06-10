@@ -114,20 +114,56 @@ func (m *Manager) StopHeartbeat() {
 // DHCP-triggered recompile) which invalidates the existing UDP sockets.
 // Retries up to 5 times with 1s delay if the bind fails (address may briefly
 // disappear during VRF rebind). Returns false if heartbeat was not running.
+//
+// The restart window (worst case ~5s of bind retries) is longer than the
+// peer's default timeout (5 x 100ms), so two protections wrap it (#1792):
+//
+//   - Peer side: hbRestartNotifyFn fires before teardown and after each
+//     failed bind retry. The daemon wires it to
+//     SessionSync.SendLivenessKeepalive, which refreshes the peer's
+//     LastPeerReceiveAge — the signal its heartbeat-timeout suppression
+//     guard (shouldSuppressPeerHeartbeatTimeout, 2s recency window) checks
+//     before fencing/electing. Suppression on the peer is bounded by its
+//     existing 5s continuous-suppression cap and self-clearing (it derives
+//     purely from message recency — no sticky state), so a node that dies
+//     mid-restart still fails over.
+//
+//   - Local side: lastSeen carries over to the replacement receiver (same
+//     CLOCK_MONOTONIC domain, same process) so a peer that dies while our
+//     sockets are down is still detected once the post-restart 30s startup
+//     grace expires. Without the seed the new receiver starts at
+//     lastSeen=0, whose timeout path only invokes handlePeerNeverSeen — a
+//     no-op once peerEverSeen is set — and a peer death during the restart
+//     window would never be detected.
 func (m *Manager) RestartHeartbeat() bool {
 	m.mu.RLock()
 	running := m.hbSender != nil || m.hbReceiver != nil
 	localAddr := m.hbLocalAddr
 	peerAddr := m.hbPeerAddr
 	vrfDevice := m.hbVRFDevice
+	notify := m.hbRestartNotifyFn
+	receiver := m.hbReceiver
 	m.mu.RUnlock()
 
 	if !running || localAddr == "" {
 		return false
 	}
 
+	// Preserve the old receiver's last-seen heartbeat timestamp
+	// (CLOCK_MONOTONIC nanos — comparable across an in-process restart).
+	var lastSeenSeed int64
+	if receiver != nil {
+		lastSeenSeed = receiver.lastSeen.Load()
+	}
+
 	slog.Info("cluster: restarting heartbeat after VRF rebind",
 		"local", localAddr, "peer", peerAddr, "vrf", vrfDevice)
+
+	// Freshen the peer's sync-recency suppression guard before our UDP
+	// heartbeats go silent.
+	if notify != nil {
+		notify()
+	}
 
 	m.StopHeartbeat()
 
@@ -135,8 +171,23 @@ func (m *Manager) RestartHeartbeat() bool {
 		if err := m.StartHeartbeat(localAddr, peerAddr, vrfDevice); err != nil {
 			slog.Warn("cluster: heartbeat restart bind failed, retrying",
 				"err", err, "attempt", i+1)
+			// Keep the peer's suppression guard fed (2s recency window)
+			// through each 1s retry interval.
+			if notify != nil {
+				notify()
+			}
 			time.Sleep(1 * time.Second)
 			continue
+		}
+		// Seed the replacement receiver with the pre-restart timestamp
+		// unless it has already seen a live heartbeat.
+		if lastSeenSeed != 0 {
+			m.mu.RLock()
+			newReceiver := m.hbReceiver
+			m.mu.RUnlock()
+			if newReceiver != nil {
+				newReceiver.lastSeen.CompareAndSwap(0, lastSeenSeed)
+			}
 		}
 		return true
 	}

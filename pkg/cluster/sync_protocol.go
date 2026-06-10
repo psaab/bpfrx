@@ -17,6 +17,21 @@ func monotonicSeconds() uint64 {
 	return uint64(ts.Sec)
 }
 
+// MonotonicNanos returns the monotonic clock (CLOCK_MONOTONIC) in
+// nanoseconds. Liveness timestamps must be stored and compared in this
+// domain instead of time.Now().UnixNano(): round-tripping wall-clock
+// nanos through time.Unix(0, n) strips Go's monotonic reading, so every
+// age computed from the stored value moves with wall-clock steps (NTP
+// makestep, manual date -s, VM pause/resume) — a forward step larger
+// than the heartbeat timeout falsely declares the peer lost (#1792).
+// Exported because pkg/daemon's heartbeat suppression guard lives in
+// the same liveness domain.
+func MonotonicNanos() int64 {
+	var ts unix.Timespec
+	_ = unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts)
+	return ts.Nano()
+}
+
 // rebaseTimestamp adjusts a peer timestamp to the local monotonic clock domain.
 func rebaseTimestamp(peerTS uint64, offset int64) uint64 {
 	v := int64(peerTS) + offset

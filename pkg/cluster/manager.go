@@ -179,6 +179,13 @@ type Manager struct {
 	// session-sync traffic on the control link).
 	peerTimeoutGuardFn func() (suppress bool, reason string)
 
+	// hbRestartNotifyFn is invoked around RestartHeartbeat's socket
+	// teardown/rebind window (once before teardown, once after each failed
+	// bind retry). The daemon wires it to SessionSync.SendLivenessKeepalive
+	// so the peer's heartbeat-timeout suppression guard keeps seeing fresh
+	// sync traffic while our UDP heartbeats are silent (#1792).
+	hbRestartNotifyFn func()
+
 	// preManualFailoverFn runs before the local node resigns an RG.
 	// The daemon uses this to pre-stage userspace continuity before
 	// weight/state changes let the peer take over.

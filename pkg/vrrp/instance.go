@@ -92,7 +92,7 @@ type vrrpInstance struct {
 	suppressGARP  atomic.Bool   // when true, becomeMaster() skips GARP/NA
 	garpEpoch     atomic.Uint64 // incremented on each becomeMaster() transition
 	lastGARPEpoch atomic.Uint64 // epoch of last completed sendGARP()
-	lastGARPTime  atomic.Int64  // Unix nanos of last GARP send (dampening)
+	lastGARPTime  atomic.Int64  // Unix nanos of last GARP send (dampening; see garpDampened)
 
 	// onEventDrop is called when an event is dropped due to a full eventCh.
 	// Set by the manager to trigger immediate reconciliation.
@@ -1059,6 +1059,24 @@ func (vi *vrrpInstance) removeVIPs() {
 	}
 }
 
+// minGARPInterval is the minimum spacing between GARP bursts (dampening).
+const minGARPInterval = 500 * time.Millisecond
+
+// garpDampened reports whether a GARP burst should be suppressed given the
+// wall-clock UnixNano of the previous burst and of now. A negative elapsed
+// (backward wall-clock step — time.Unix(0, last) carries no monotonic
+// reading) is treated as send-allowed: dampening for the step duration would
+// suppress failover GARP bursts and blackhole traffic right after becoming
+// MASTER (#1792). The storage stays wall-clock; the clamp alone closes the
+// hazard, and an extra GARP burst after a forward step is harmless.
+func garpDampened(lastNanos, nowNanos int64) bool {
+	if lastNanos <= 0 {
+		return false
+	}
+	elapsed := time.Duration(nowNanos - lastNanos)
+	return elapsed >= 0 && elapsed < minGARPInterval
+}
+
 // sendGARP sends gratuitous ARP (IPv4) and unsolicited NA (IPv6) for all VIPs.
 // Uses burst mode: one immediate pair then background follow-ups at 50ms intervals.
 // After each IPv4 GARP burst, also sends a standard ARP probe to the subnet's
@@ -1076,13 +1094,11 @@ func (vi *vrrpInstance) sendGARP() {
 	}
 	// Dampening: minimum 500ms between GARP bursts to avoid storms
 	// during rapid VRRP flaps.
-	const minGARPInterval = 500 * time.Millisecond
-	if last := vi.lastGARPTime.Load(); last > 0 {
-		if time.Since(time.Unix(0, last)) < minGARPInterval {
-			slog.Debug("vrrp: GARP dampened (too soon)",
-				"key", vi.key(), "elapsed", time.Since(time.Unix(0, last)))
-			return
-		}
+	now := time.Now().UnixNano()
+	if last := vi.lastGARPTime.Load(); garpDampened(last, now) {
+		slog.Debug("vrrp: GARP dampened (too soon)",
+			"key", vi.key(), "elapsed", time.Duration(now-last))
+		return
 	}
 	count := vi.cfg.GARPCount
 	if count <= 0 {

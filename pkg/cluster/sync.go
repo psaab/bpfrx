@@ -216,7 +216,7 @@ type SessionSync struct {
 	deleteJournalMu            sync.Mutex
 	deleteJournal              [][]byte
 	deleteJournalCap           int
-	lastPeerRxUnix             atomic.Int64
+	lastPeerRxMono             atomic.Int64 // CLOCK_MONOTONIC nanos of last inbound sync msg (#1792)
 	peerHeartbeatAckEver       atomic.Bool
 	readDeadline               time.Duration
 	peerSilenceLimit           time.Duration
@@ -485,13 +485,22 @@ func (s *SessionSync) ActiveFabric() int {
 }
 
 // LastPeerReceiveAge reports how long it has been since the last inbound sync
-// message was received from the peer.
+// message was received from the peer. The age is computed in the
+// CLOCK_MONOTONIC domain (#1792): the previous time.Unix(0, last) round-trip
+// stripped Go's monotonic reading, so a forward wall-clock step aged the
+// peer past maxPeerSyncSilence at exactly the moment the heartbeat-timeout
+// suppression guard needed it. Negative ages (impossible on a correct
+// monotonic clock) clamp to 0.
 func (s *SessionSync) LastPeerReceiveAge() (time.Duration, bool) {
-	last := s.lastPeerRxUnix.Load()
+	last := s.lastPeerRxMono.Load()
 	if last == 0 {
 		return 0, false
 	}
-	return time.Since(time.Unix(0, last)), true
+	age := time.Duration(MonotonicNanos() - last)
+	if age < 0 {
+		age = 0
+	}
+	return age, true
 }
 func (s *SessionSync) readDeadlineDuration() time.Duration {
 	if s.readDeadline > 0 {

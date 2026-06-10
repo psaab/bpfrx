@@ -184,7 +184,7 @@ func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, co
 		activeAfter = 1
 	}
 	s.stats.Connected.Store(true)
-	s.lastPeerRxUnix.Store(time.Now().UnixNano())
+	s.lastPeerRxMono.Store(MonotonicNanos())
 	s.mu.Unlock()
 	becameActive := activeAfter == fabricIdx
 	slog.Info("cluster sync: handling new connection", "fabric", fabricIdx, "remote", connRemoteAddrString(conn), "was_disconnected", wasDisconnected, "active_before", activeBefore, "active_after", activeAfter, "became_active", becameActive, "had_conn0", hadConn0, "had_conn1", hadConn1)
@@ -583,6 +583,32 @@ func (s *SessionSync) QueueConfig(configText string) {
 	slog.Info("cluster sync: config sent to peer", "size", len(payload))
 }
 
+// SendLivenessKeepalive writes a sync-level heartbeat to the active peer
+// connection so the peer's last-receive timestamp (lastPeerRxMono, read by
+// LastPeerReceiveAge) is refreshed immediately. Used around the local
+// heartbeat-socket restart window (Manager.RestartHeartbeat): while our UDP
+// heartbeat sockets are torn down and rebound, the peer's only evidence that
+// this node is still alive is sync traffic — and the sync-level heartbeat is
+// normally emitted only on the 10s read-timeout cadence, far coarser than
+// the 2s recency window of the peer's heartbeat-timeout suppression guard
+// (shouldSuppressPeerHeartbeatTimeout). Best-effort: a no-op when no peer
+// connection exists; a write error follows the standard sender pattern and
+// triggers reconnect via handleDisconnect.
+func (s *SessionSync) SendLivenessKeepalive() {
+	conn := s.getActiveConn()
+	if conn == nil {
+		return
+	}
+	s.writeMu.Lock()
+	err := writeMsg(conn, syncMsgHeartbeat, nil)
+	s.writeMu.Unlock()
+	if err != nil {
+		slog.Debug("cluster sync: liveness keepalive send error", "err", err)
+		s.stats.Errors.Add(1)
+		s.handleDisconnect(conn)
+	}
+}
+
 // sendClockSync exchanges the local monotonic clock over the sync channel.
 func (s *SessionSync) sendClockSync(conn net.Conn) {
 	var buf [8]byte
@@ -745,7 +771,7 @@ func (s *SessionSync) receiveLoop(ctx context.Context, conn net.Conn) {
 			}
 		}
 		missedHeartbeats = 0
-		s.lastPeerRxUnix.Store(time.Now().UnixNano())
+		s.lastPeerRxMono.Store(MonotonicNanos())
 		s.handleMessage(conn, hdr.Type, payload)
 	}
 }

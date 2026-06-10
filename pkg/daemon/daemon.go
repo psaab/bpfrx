@@ -129,7 +129,7 @@ type Daemon struct {
 	// a daemon that never starts the loop would report every phase as a
 	// forever-climbing "wedged" age — a false positive (Codex #1781 r1).
 	neighborPeriodicLoopStarted atomic.Bool
-	hbSuppressStart             atomic.Int64 // UnixNano of first heartbeat suppression; 0 = inactive
+	hbSuppressStart             atomic.Int64 // CLOCK_MONOTONIC nanos of first heartbeat suppression; 0 = inactive (#1792)
 	syncPrimeRetryGen           atomic.Uint64
 	syncReadyTimerGen           atomic.Uint64
 	syncReadyTimerMu            sync.Mutex

@@ -306,7 +306,7 @@ type heartbeatReceiver struct {
 	interval   time.Duration
 	stopCh     chan struct{}
 	wg         sync.WaitGroup
-	lastSeen   atomic.Int64 // unix nano of last heartbeat
+	lastSeen   atomic.Int64 // CLOCK_MONOTONIC nanos of last heartbeat (MonotonicNanos)
 	received   atomic.Uint64
 	recvErrors atomic.Uint64
 	startedAt  time.Time // when receiver started (for initial peer-lost detection)
@@ -423,7 +423,9 @@ func (r *heartbeatReceiver) readLoop() {
 		}
 
 		r.received.Add(1)
-		r.lastSeen.Store(time.Now().UnixNano())
+		// Store CLOCK_MONOTONIC, not wall clock: the timeout comparison
+		// must be immune to wall-clock steps (#1792).
+		r.lastSeen.Store(MonotonicNanos())
 		r.mgr.handlePeerHeartbeat(pkt)
 	}
 }
@@ -450,21 +452,36 @@ func (r *heartbeatReceiver) timeoutLoop() {
 				}
 				continue
 			}
-			last := time.Unix(0, lastNano)
 			// During the first 30 seconds after startup, suppress
 			// peer-lost entirely. The config apply phase (VRF binding,
 			// FRR reload, fabric creation, RETH MAC) can disrupt the
 			// UDP receive path on the control link for 10-15+ seconds.
 			// Without this grace, the recovering node sees one peer
 			// heartbeat then declares peer lost — creating split-brain.
+			// (r.startedAt is a direct time.Time, so time.Since uses
+			// its embedded monotonic reading — already step-safe.)
 			if time.Since(r.startedAt) < 30*time.Second {
 				continue
 			}
-			if time.Since(last) > timeout {
+			// Compare in the CLOCK_MONOTONIC domain. The previous
+			// time.Unix(0, lastNano) round-trip produced a Time with
+			// no monotonic reading, making time.Since pure wall-clock
+			// — a forward step > timeout fired a false peer-lost on
+			// a healthy cluster (#1792).
+			if heartbeatStale(lastNano, MonotonicNanos(), timeout) {
 				r.mgr.handlePeerTimeout()
 			}
 		}
 	}
+}
+
+// heartbeatStale reports whether the last peer heartbeat is older than
+// timeout. Both timestamps are CLOCK_MONOTONIC nanoseconds (MonotonicNanos),
+// so the decision is immune to wall-clock steps. A nowMono earlier than
+// lastSeenMono (cannot happen on a correct monotonic clock, but cheap to
+// tolerate) yields a negative age and reports not-stale.
+func heartbeatStale(lastSeenMono, nowMono int64, timeout time.Duration) bool {
+	return time.Duration(nowMono-lastSeenMono) > timeout
 }
 
 func (r *heartbeatReceiver) stop() {
