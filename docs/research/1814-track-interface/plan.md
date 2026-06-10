@@ -1,133 +1,178 @@
-# #1814 — vrrp-group track-interface nested priority-cost block
+# #1814 — VRRP track-interface: nested priority-cost block + make tracking actually work
 
-Status: DRAFT v1 — pending adversarial plan review
+Status: DRAFT v2 — REFRAMED after round-1 (Codex PLAN-KILL on v1's false
+premise; AGY design review constructive). Pending round-2 confirm.
 
-## Issue framing
+## Round-1 verdicts and the reframe
 
-Junos models VRRP interface tracking as a container:
-`track-interface ge-0/0/1 { priority-cost 20; }` (and the flat-set
-equivalent `set ... vrrp-group 1 track-interface ge-0/0/1 priority-cost 20`).
-xpf's setSchema (schema.go:433-434) models `track-interface` and
-`track-priority-cost` as flat SIBLING leaves, so the nested form is ignored
-by BOTH AST shapes — consistent-empty, invisible to the U5a differential
-harness (which only catches shape divergence). Found by AGY on PR #1813;
-follow-up to #1796.
+Codex KILLED v1 on a decisive fact: `TrackInterface`/`TrackPriorityCost`
+are parsed and copied into pkg/vrrp's InstanceConfig (vrrp.go:23-24,
+:47-48) **but the runtime never uses them** — `UpdateInstances` ignores
+them in its change comparison (manager.go:194) and advertised priority is
+always static `cfg.Priority` (instance.go:248-252 getPriority,
+instance.go:391). v1's "single-track runtime unchanged" invariant was
+false in the worst way: parsing MORE config would still do NOTHING.
 
-## Current state (verified, master f96290a98)
+Per the project's Junos-parity rule (don't drop Junos-compat features —
+fix the implementation to match Junos semantics), v2 implements the
+minimal single-track runtime AND the nested config form. Both reviewers'
+parser findings are folded: flat-set `set ... track-interface ge-0/0/1
+priority-cost 20` produces a `track-interface` node with a CHILD
+`priority-cost` node (SetPath descends on schema match, ast_edit.go:270;
+confirmed independently by both reviewers) — there is no Keys-packed
+spelling to handle once the schema knows the child.
 
-- schema.go:433-434: `track-interface {args:1}`, `track-priority-cost
-  {args:1}` — both leaf, no children.
-- compiler_interfaces.go:399-409 (Keys-packed flat walk) + :448-452
-  (child-node walk): both read the two flat spellings into
-  `vg.TrackInterface string` + `vg.TrackPriorityDelta int`.
-- vrrpGroupPropertyKeywords (compiler_interfaces.go:20-21) lists both — the
-  U5b greedy-consume logic treats them as value-bearing keywords.
-- pkg/vrrp/vrrp.go:23-24,47-48: consumes single TrackInterface +
-  TrackPriorityCost. Runtime tracking logic exists for ONE interface.
+## Issue framing (v2)
 
-## Design options
+Two defects, one feature surface:
+1. The nested `track-interface <if> { priority-cost <n>; }` block — the
+   standard Junos shape — silently loses `priority-cost` in both AST
+   shapes (the child walk reads the interface via nodeVal,
+   compiler_interfaces.go:448, and drops the child).
+2. Even the values that DO parse are dead: VRRP tracking is a no-op
+   end-to-end. An operator who configures tracking believes a link
+   failure will demote the VRRP master; it will not.
 
-**Option 1 (recommended): model the nested block, keep single-track
-runtime.**
-- schema.go: `track-interface` becomes `{args:1, placeholder:"<interface>",
-  children: {"priority-cost": {args:1}}}`. Keep `track-priority-cost` flat
-  sibling for back-compat (existing configs).
-- Compiler: in the child-node walk, `track-interface` node may carry
-  Keys[1]=iface plus either (a) a child `priority-cost` node (hierarchical
-  or flat-set replay) or (b) nothing (legacy spelling). Read both. In the
-  Keys-packed walk, after consuming `track-interface <iface>`, peek for
-  `priority-cost <n>` continuation (flat-set
-  `... track-interface ge-0/0/1 priority-cost 20` packs into the same
-  node's Keys — verify with ParseSetCommand, the U5b lesson; add
-  "priority-cost" to the property-keyword handling so greedy consume
-  doesn't swallow it as a virtual-address).
-- Multiple `track-interface` blocks: detect and surface a commit-check
-  WARNING "only one tracked interface supported; using <first|last>"
-  (pick FIRST + warn — deterministic), rather than silent last-wins.
-- Junos compat note: real Junos syntax is
-  `track { interface <name> { priority-cost <n>; } }` under vrrp-group;
-  vSRX also accepts the flatter `track-interface` form xpf already chose.
-  This plan extends xpf's EXISTING spelling; adding the full `track {}`
-  container is listed as out of scope (separate issue if wanted).
+## Concrete design
 
-**Option 2: full multi-track list.** `[]VRRPTrackInterface{Iface,
-PriorityCost}` through config types, compiler, pkg/vrrp runtime (priority
-recomputation summing costs of down tracked links), HA event wiring.
-Substantially larger blast radius (vrrp state machine), not justified by
-the filed defect. Documented as future work.
+### A. Runtime: single-interface tracking (pkg/vrrp)
+
+- `vrrpInstance` gains `trackDown bool` (guarded by the existing vi.mu).
+- `getPriority()` returns the **effective** priority:
+  `p := vi.cfg.Priority; if vi.trackDown && vi.cfg.TrackInterface != "" {
+  p -= vi.cfg.TrackPriorityCost }`, clamped to [1, 254] (0 is the
+  release/shutdown sentinel and must never result from tracking; 255 is
+  owner). Default cost when the nested/flat form omits it: Junos default
+  is priority-cost required? Junos allows 1-254, no default — if the
+  operator gives track-interface without priority-cost, treat cost as 0
+  and surface a commit WARNING ("track-interface without priority-cost
+  has no effect") so the no-op is visible, not silent.
+- Link-state source: the Manager runs ONE `netlink.LinkSubscribe`
+  goroutine (the package already imports vishvananda/netlink for VIP
+  management, instance.go:19) started lazily when ≥1 instance has a
+  TrackInterface; it maintains ifname → operstate and calls
+  `vi.setTrackDown(down)` on transitions for instances tracking that
+  ifname. Initial state seeded by `netlink.LinkByName` at instance
+  start/update. Subscribe-failure fallback: log + 1s poll ticker
+  (bounded; only while tracked instances exist).
+- `setTrackDown` recomputes effective priority; if it CHANGED: log
+  (slog.Info, transition-only), and let the existing state machine act —
+  master with lowered priority keeps advertising the lower value and a
+  higher-priority backup preempts per protocol (no forced abdication
+  needed; preempt=true peers take over; document that with preempt=false
+  peers, takeover waits for masterDown like real VRRP). The
+  advert-on-next-tick is sufficient (30ms-1s intervals).
+- `UpdateInstances` comparison (manager.go:194) includes TrackInterface +
+  TrackPriorityCost so config changes propagate (track-field-only changes
+  update cfg in place rather than full instance restart if the existing
+  compare/update structure distinguishes; otherwise restart-on-change is
+  acceptable and simpler — implementer follows the existing pattern).
+- HA note: RETH VRRP instances are suppressed under PrivateRGElection
+  (daemon_ha_vip.go) — tracking applies to standalone VRRP instances;
+  no chassis-cluster interaction. State it in docs.
+
+### B. Config: nested block parse (pkg/config)
+
+- schema.go vrrp-group subtree: `track-interface` gets
+  `children: {"priority-cost": {args:1, placeholder:"<1..254>"}}`
+  (args stays 1 for the interface name). `track-priority-cost` flat
+  sibling stays (back-compat) — when BOTH are present, nested wins +
+  warning.
+- compiler_interfaces.go child walk: `track-interface` node →
+  `vg.TrackInterface = prop.Keys[1]` (guard len), then child
+  `priority-cost` → `vg.TrackPriorityDelta`. The legacy Keys-packed
+  flat-sibling walk (:399-409) unchanged.
+- Multiple `track-interface` nodes: **first-wins + warning** via
+  `cfg.Warnings` (AGY: compileInterfaces takes only InterfacesConfig and
+  cannot append warnings — so the warning is collected by an AST-level
+  pre-walk in compileExpanded (compiler.go) where Config IS in scope,
+  same place U7 put tree-level checks; Codex preferred strict-reject —
+  v2 chooses warning-first because a strict reject needs the
+  strict/lenient split plumbed into a section compiler and the
+  operational risk of first-wins-with-visible-warning is low; round-2
+  may overrule).
+- `priority-cost` without `track-interface`, and track-interface without
+  cost: warnings (see A).
+- FormatSet: with the schema child added, `FormatSet` renders the nested
+  child recursively (ast_format.go:192 per Codex) — round-trip covered
+  by harness fixture.
+
+### C. Tests
+
+- pkg/config: hierarchical nested block; flat-set nested via
+  ParseSetCommand+SetPath (asserting the CHILD shape lands and compiles);
+  legacy flat sibling spellings; both-present precedence; multiple
+  track-interface first-wins + warning; missing-cost warning.
+- U5a differential harness fixture for the nested form (closes the
+  consistent-empty blind spot).
+- pkg/vrrp unit tests: getPriority clamp matrix (cost>priority → 1;
+  normal subtract; no-track unchanged); setTrackDown transition triggers
+  effective-priority change; UpdateInstances reacts to track-field
+  change. Link-subscribe goroutine tested via the poll fallback seam or
+  an injectable link-state source (follow existing pkg/vrrp test
+  patterns — it has instance tests).
+- Live gate (cluster): commit a track-interface config on fw0
+  (standalone-style VRRP instance if the cluster config allows, else the
+  local regression VM), `show vrrp` reflects effective priority; flap
+  the tracked link (`ip link set down` on a non-critical iface) →
+  priority drops in adverts; restore → recovers.
+- make test-failover (VRRP-adjacent change — mandatory per CLAUDE.md).
 
 ## Honest scope/value framing
 
-Option 1 is a config-surface completeness fix: the nested form currently
-parses to NOTHING (track silently disabled — a real operational footgun:
-operator believes tracking is armed). Small compiler + schema change, one
-harness fixture. PLAN-KILL acceptable if reviewers conclude the nested
-spelling shouldn't be accepted at all (reject-at-commit instead) — but
-silent-ignore is the one indefensible state.
+This grew from a parse fix to a small feature completion (~150 lines
+runtime + ~100 config + tests) because shipping the parse fix alone would
+deepen the silent-no-op trap. If round-2 reviewers judge the runtime
+half too large for this issue, the fallback is NOT parse-only — it is
+parse + **commit-check warning "interface tracking is not implemented"**
+until a runtime issue ships; silent no-op is the one indefensible state.
+PLAN-KILL acceptable only with a better alternative for the silence.
 
 ## Public API preservation
 
-Config struct unchanged (Option 1 reuses TrackInterface/
-TrackPriorityDelta). setSchema additions are additive (existing spellings
-still valid). No wire/protocol changes.
+Config struct unchanged (TrackInterface/TrackPriorityDelta reused).
+pkg/vrrp adds internal state only; InstanceConfig unchanged. setSchema
+additive. No wire changes.
 
 ## Hidden invariants
 
-- Dual-AST: hierarchical `track-interface ge-0/0/1 { priority-cost 20; }`
-  → Node{Keys:["track-interface","ge-0/0/1"], Children:[{Keys:["priority-cost","20"]}]};
-  flat-set replay may pack `Keys:["track-interface","ge-0/0/1","priority-cost","20"]`
-  OR nest a child — compiler must read BOTH (test with
-  ParseSetCommand+SetPath, never NewParser, per CLAUDE.md).
-- U5b greedy virtual-address consume (vrrpGroupPropertyKeywords): adding
-  `priority-cost` as a recognized continuation must not break
-  virtual-address multi-value parsing — fixture both orders.
-- SchemaValidate (typed-leaf walk) runs on both strict and lenient paths —
-  schema change must not reject existing flat spellings (additive children
-  only).
-- Harness (U5a dual_ast_differential_test.go): add fixtures for nested
-  form; expect IDENTICAL compile both shapes (this closes the
-  consistent-empty blind spot for this leaf).
+- SchemaValidate must keep accepting all spellings on lenient paths (the
+  new warnings come from the compiler pre-walk, NEVER SchemaValidate —
+  store.go:337 calls it on Load/SyncApply; U7 lesson).
+- getPriority is called from the advert path and masterDownInterval
+  computation (instance.go:287) — keep it lock-cheap (RLock as today).
+- Priority 0 reserved (release); 255 owner semantics — clamp [1,254].
+- VIP add/remove on master transitions unchanged.
 
 ## Risk assessment
 
-| Class | Level |
-|---|---|
-| Behavioral regression | LOW (additive parse; existing spellings covered by U5b tests) |
-| Performance | NONE (commit path) |
-| Architectural mismatch | LOW |
-
-## Test plan
-
-- pkg/config unit tests: hierarchical nested block, flat-set nested
-  (ParseSetCommand+SetPath), legacy flat sibling spellings, multiple
-  track-interface warning, priority-cost-without-track-interface case.
-- Differential harness fixture(s).
-- Schema completion test (CompleteSetPathWithValues offers priority-cost
-  under track-interface) if the schema test file has precedent.
-- go build + go test ./pkg/config/ ./pkg/vrrp/ ./pkg/cli/.
-- Smoke: config-apply on cluster (vrrp config touched in cos fixture?
-  verify a track-interface config commits + `show vrrp` reflects it);
-  failover gate (VRRP-adjacent — cheap insurance, the cluster smoke
-  includes it anyway per campaign convention).
+| Class | Level | Notes |
+|---|---|---|
+| Behavioral regression | MED | getPriority is load-bearing in the state machine; clamp + no-track fast path keep default behavior identical |
+| Lifetime/borrow | N/A (Go) | |
+| Performance | LOW | one subscribe goroutine; per-advert int math |
+| Architectural mismatch | LOW | matches kernel-state-watch patterns elsewhere in the daemon |
 
 ## Out of scope
 
-- Option 2 multi-track runtime.
-- Full Junos `track { interface ... }` container spelling (file follow-up
-  if reviewers want it).
-- vrrp.go runtime changes (none needed for Option 1).
+- Multi-track list (Option 2) — follow-up issue if wanted.
+- Full Junos `track { interface <n> { ... } }` container spelling and
+  route-tracking — follow-up.
+- RETH/chassis-cluster tracking interplay (suppressed instances).
 
-## Open questions for adversarial review
+## Open questions for adversarial review (round 2)
 
-1. First-wins+warn vs last-wins+warn vs reject for multiple
-   track-interface blocks?
-2. Should the legacy `track-priority-cost` sibling leaf be deprecated
-   (warn) once the nested form exists, or kept silently forever?
-3. Flat-set packing: does `set ... track-interface ge-0/0/1 priority-cost
-   20` actually pack Keys as assumed? Reviewer should verify with the
-   parser (ParseSetCommand) before approving the compiler design.
-4. Is commit-check WARNING the right surface for multi-track (vs
-   SchemaValidate error)? SchemaValidate runs on lenient/boot path — must
-   NOT hard-fail there (U7 lesson).
-5. Does pkg/cli `show configuration` re-rendering (FormatSet) round-trip
-   the nested form correctly once schema knows the child?
+1. Warning-first vs strict-reject for multiple track-interface — v2
+   chooses warning+first-wins; overrule with a concrete plumbing
+   proposal if reject is required.
+2. Is letting protocol preemption handle the demotion sufficient, or
+   must a master that loses effective-priority superiority abdicate
+   immediately (send priority-0)? Real VRRP: it keeps advertising at the
+   lower priority; higher-priority preempt-enabled backup takes over.
+   Confirm against pkg/vrrp's receive path (does a backup with higher
+   priority + preempt=true preempt on hearing a LOWER-priority advert?).
+3. LinkSubscribe vs poll: any precedent in the daemon for netlink
+   subscriptions that this should reuse instead of a pkg/vrrp-local one?
+4. getPriority clamp interaction with masterDownInterval skew math
+   (instance.go:287) — any issue advertising a changed priority
+   mid-master-tenure?
