@@ -2,15 +2,23 @@
 //!
 //! P-N1 round-trip identity on non-checksum bytes, P-N2 validity
 //! oracle at every hop, P-N3 descriptor-vs-generic differential
-//! (success cases, `expected_ports = None`, checksum bytes masked),
-//! P-N3b decline/divergence pins as deterministic examples, P-N4
-//! payload immutability.
+//! (success cases, `expected_ports = None`, FULL byte equality —
+//! unmasked since the #1838/#1839/#1840 trio fix), P-N3b
+//! decline/divergence pins as deterministic examples, P-N4 payload
+//! immutability.
 //!
-//! Domain restrictions (documented production divergences, NOT
-//! property violations — each pinned below):
-//!   - #1838 (D3): NAT-applying inputs are v6-ext-free.
-//!   - #1839 (D1): byte comparisons exclude L4 checksum bytes.
-//!   - #1840 (D2): generators never emit v6 UDP zero checksums.
+//! Domain notes (post-trio):
+//!   - #1838 fixed: NAT-applying generators emit v6 ext-header chains
+//!     (the offset is threaded through both paths).
+//!   - #1839 fixed: P-N3 asserts full byte equality with an EMPTY
+//!     mask. P-N1 (apply + undo round trip) still masks checksum
+//!     bytes — apply/undo restores the VALUE class, but the
+//!     one's-complement zero has two encodings and the round trip is
+//!     not representation-stable by design.
+//!   - #1840 fixed: valid-packet generators still never emit v6 UDP
+//!     zero checksums (malformed per RFC 8200 §8.1 — outside the
+//!     valid domain); the malformed encoding is covered by the
+//!     deterministic pins below.
 
 use super::oracle::{checksum_byte_ranges, first_diff_outside, oracle_packet_valid};
 use super::strategies::{
@@ -192,14 +200,15 @@ proptest! {
     #![proptest_config(super::cfg(128))]
 
     /// P-N3: the generic in-place rewrite and the descriptor fast path
-    /// produce byte-identical output frames except the checksum fields
-    /// (#1839 / RFC 1624 zero-encoding — both must still be VALID by
-    /// the oracle), for the success domain: TCP/UDP, TTL ≥ 2, v6
-    /// ext-free, v6 UDP checksum nonzero, `expected_ports = None`
-    /// (the two paths check expected ports at different pipeline
-    /// points — descriptor pre-NAT as a DMA-race guard, generic
-    /// post-NAT via `enforce_expected_ports` — so port-mismatch inputs
-    /// are not differential-comparable).
+    /// produce FULLY byte-identical output frames (mask EMPTY since the
+    /// #1838/#1839/#1840 trio — plan §9.3 / Q7), for the success
+    /// domain: TCP/UDP, TTL ≥ 2 (v6 ext chains included), v6 UDP
+    /// checksum nonzero, `expected_ports = None` (the two paths check
+    /// expected ports at different pipeline points — descriptor
+    /// pre-NAT as a DMA-race guard, generic post-NAT via
+    /// `enforce_expected_ports` — so port-mismatch inputs are not
+    /// differential-comparable). Both outputs must also be VALID by
+    /// the oracle.
     #[test]
     fn descriptor_generic_differential(
         (pkt, nat) in arb_packet_with_nat(),
@@ -233,15 +242,12 @@ proptest! {
             .expect("descriptor output slice");
 
         let out_l3 = if tx_vlan > 0 { 18usize } else { 14usize };
-        let excluded: Vec<_> =
-            checksum_byte_ranges(pkt.addr_family, pkt.protocol, pkt.rel_l4)
-                .into_iter()
-                .map(|r| (r.start + out_l3)..(r.end + out_l3))
-                .collect();
-        let diff = first_diff_outside(out_a, out_b, &excluded);
+        // EMPTY exclusion mask: any byte difference — checksum fields
+        // included — is a path divergence (#1839/#1840 fixed).
+        let diff = first_diff_outside(out_a, out_b, &[]);
         prop_assert!(
             diff.is_none(),
-            "paths diverged outside checksum bytes at output offset {:?}",
+            "paths diverged at output offset {:?}",
             diff,
         );
 
@@ -752,4 +758,78 @@ fn pin_same_port_v6_udp_zero_parity_rule() {
         0x0000
     );
     assert_eq!(out_g, out_d, "identity-port v4 UDP stored-0 parity");
+}
+
+/// #1838 per-ext-kind placement (deterministic): for every extension
+/// header kind the inspect walk understands, a port rewrite + src
+/// address rewrite through `apply_nat_ipv6` lands the port at the
+/// parsed offset, leaves the ext-chain bytes byte-identical, and
+/// yields an oracle-valid packet (checksum adjusted at the real
+/// offset).
+#[test]
+fn ext_kind_nat_rewrite_placement() {
+    let new_src: Ipv6Addr = "2001:db8:aaaa::5".parse().unwrap();
+    for ext in [
+        ExtHdr::HopByHop(1),
+        ExtHdr::Routing(0),
+        ExtHdr::DestOpts(2),
+        ExtHdr::Ah(1),
+        ExtHdr::Fragment, // atomic (offset 0) by construction
+    ] {
+        for proto in [PROTO_TCP, PROTO_UDP] {
+            let pkt = pin_packet(true, proto, 64, vec![ext]);
+            let rel_l4 = pkt.rel_l4;
+            assert_eq!(rel_l4, 40 + ext.encoded_len(), "ground truth offset");
+            let nat = NatDecision {
+                rewrite_src: Some(IpAddr::V6(new_src)),
+                rewrite_dst_port: Some(0x4444),
+                ..NatDecision::default()
+            };
+            let original = pkt.l3_packet();
+            let mut packet = original.clone();
+            assert!(
+                apply_nat_ipv6(&mut packet, rel_l4, proto, nat).is_some(),
+                "apply_nat_ipv6 succeeds ({ext:?}/{proto})"
+            );
+            assert_eq!(
+                u16::from_be_bytes([packet[rel_l4 + 2], packet[rel_l4 + 3]]),
+                0x4444,
+                "dst port at parsed offset ({ext:?}/{proto})"
+            );
+            assert_eq!(
+                &packet[40..rel_l4],
+                &original[40..rel_l4],
+                "ext chain untouched ({ext:?}/{proto})"
+            );
+            let verdict = oracle_packet_valid(&packet, AF6, proto, rel_l4, false);
+            assert!(
+                verdict.is_ok(),
+                "post-NAT oracle valid ({ext:?}/{proto}): {verdict:?}"
+            );
+        }
+    }
+}
+
+/// #1838: `recompute_l4_checksum_ipv6` with an ext chain produces an
+/// oracle-valid packet — the L4 segment, the checksum field, and the
+/// pseudo-header upper-layer length (`len - rel_l4`, RFC 8200 §8.1)
+/// all derive from the threaded offset.
+#[test]
+fn recompute_v6_with_ext_chain_oracle_valid() {
+    for proto in [PROTO_TCP, PROTO_UDP] {
+        let pkt = pin_packet(
+            true,
+            proto,
+            64,
+            vec![ExtHdr::HopByHop(0), ExtHdr::DestOpts(1)],
+        );
+        let rel_l4 = pkt.rel_l4;
+        let mut packet = pkt.l3_packet();
+        // Corrupt the stored checksum, then recompute at the real offset.
+        let csum_off = rel_l4 + if proto == PROTO_TCP { 16 } else { 6 };
+        packet[csum_off..csum_off + 2].copy_from_slice(&0xDEADu16.to_be_bytes());
+        assert!(recompute_l4_checksum_ipv6(&mut packet, rel_l4, proto).is_some());
+        let verdict = oracle_packet_valid(&packet, AF6, proto, rel_l4, false);
+        assert!(verdict.is_ok(), "recompute oracle valid ({proto}): {verdict:?}");
+    }
 }
