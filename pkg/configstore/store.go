@@ -852,6 +852,23 @@ func (s *Store) SetCentralRollbackHandler(fn func(*config.Config)) {
 // CommitConfirmed validates, compiles, and applies the candidate with an
 // automatic rollback timer. If minutes is 0, defaults to 10.
 // If a bare "commit" is not issued within the timeout, the config auto-reverts.
+//
+// Persistence contract (#1799, Option A + confirm-state ordering): the
+// candidate is persisted BEFORE any in-memory promotion AND before any
+// confirm state is touched. On persist failure nothing changes: no
+// promotion, no timer armed, and an EXISTING pending confirm (its
+// timer and rollback target) is left fully intact — the prior ordering
+// cancelled the pending timer and overwrote the rollback target before
+// the write, so a persist failure could strand a pending confirmed
+// commit with no auto-rollback.
+//
+// Nested confirmed commits (a second CommitConfirmed while one is
+// still pending) PRESERVE the existing confirmPrevTree/confirmPrevCfg:
+// the rollback target must stay the last truly CONFIRMED config.
+// Overwriting it with s.active (the unconfirmed commit-1 tree, as the
+// code did before #1799) meant a commit-2 timeout "rolled back" to the
+// equally-unconfirmed commit 1 and stayed there forever, because
+// commit 1's own timer had been cancelled.
 func (s *Store) CommitConfirmed(minutes int) (*config.Config, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -869,15 +886,22 @@ func (s *Store) CommitConfirmed(minutes int) (*config.Config, error) {
 		minutes = 10
 	}
 
-	// Cancel any existing pending confirmation
-	if s.confirmTimer != nil {
-		s.confirmTimer.Stop()
-		s.confirmTimer = nil
+	// #1799 Option A: persist BEFORE promoting and BEFORE touching
+	// any confirm state (see contract above).
+	if err := s.writeActive(s.candidate); err != nil {
+		return nil, fmt.Errorf("commit confirmed failed: persist active config: %w", err)
 	}
 
-	// Save current active state for potential rollback
-	s.confirmPrevTree = s.active.Clone()
-	s.confirmPrevCfg = s.compiled
+	if s.confirmTimer != nil {
+		// Nested confirmed commit: cancel the pending timer but keep
+		// the original rollback target (last confirmed config).
+		s.confirmTimer.Stop()
+		s.confirmTimer = nil
+	} else {
+		// Save current active state for potential rollback.
+		s.confirmPrevTree = s.active.Clone()
+		s.confirmPrevCfg = s.compiled
+	}
 
 	// Push current active to history
 	s.history.Push(&HistoryEntry{
@@ -890,11 +914,6 @@ func (s *Store) CommitConfirmed(minutes int) (*config.Config, error) {
 	s.candidate = s.active.Clone()
 	s.compiled = compiled
 	s.dirty = false
-
-	// Persist to disk
-	if err := s.db.WriteActive(s.active); err != nil {
-		slog.Warn("failed to save config", "err", err)
-	}
 
 	// Log to journal
 	s.journal.Log(&JournalEntry{

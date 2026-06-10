@@ -139,3 +139,122 @@ func TestRestart_AfterFailedOperatorPersistLoadsPreviousConfig(t *testing.T) {
 		t.Error("restart loaded the failed (never-committed) config")
 	}
 }
+
+// TestCommitConfirmed_NotArmedOnPersistFailure: a persist failure must
+// not arm the confirm timer or set any confirm state (#1799).
+func TestCommitConfirmed_NotArmedOnPersistFailure(t *testing.T) {
+	s := newTestStore(t)
+	commitBaseline(t, s)
+
+	if err := s.SetFromInput("security zones security-zone untrust interfaces eth1.0"); err != nil {
+		t.Fatalf("SetFromInput: %v", err)
+	}
+	s.SetWriteActiveForTesting(failingWriteActive)
+
+	if _, err := s.CommitConfirmed(1); err == nil {
+		t.Fatal("expected CommitConfirmed to fail on persist failure")
+	}
+	if s.IsConfirmPending() {
+		t.Error("confirm timer must not be armed after a failed persist")
+	}
+	if s.confirmPrevTree != nil || s.confirmPrevCfg != nil {
+		t.Error("confirm state must not be set after a failed persist")
+	}
+	if !s.IsDirty() {
+		t.Error("candidate should remain dirty after failed commit confirmed")
+	}
+	if strings.Contains(s.ShowActiveSet(), "untrust") {
+		t.Error("active must not be promoted after failed commit confirmed")
+	}
+}
+
+// TestCommitConfirmed_PersistFailurePreservesExistingConfirmState: when
+// a confirmed commit is already pending, a SECOND CommitConfirmed whose
+// persist fails must leave the existing timer and rollback target
+// untouched — the pending commit-1 must still auto-roll-back to the
+// last confirmed config if never confirmed (#1799 ordering invariant).
+func TestCommitConfirmed_PersistFailurePreservesExistingConfirmState(t *testing.T) {
+	s := newTestStore(t)
+	commitBaseline(t, s) // last confirmed config: trust only
+	baseSet := s.ShowActiveSet()
+
+	// Pending confirmed commit 1 (succeeds).
+	if err := s.SetFromInput("security zones security-zone untrust interfaces eth1.0"); err != nil {
+		t.Fatalf("SetFromInput: %v", err)
+	}
+	if _, err := s.CommitConfirmed(1); err != nil {
+		t.Fatalf("CommitConfirmed 1: %v", err)
+	}
+	if !s.IsConfirmPending() {
+		t.Fatal("commit 1 should be pending")
+	}
+	prevTreeBefore := s.confirmPrevTree.FormatSet()
+	timerBefore := s.confirmTimer
+
+	// Commit 2 fails to persist.
+	if err := s.SetFromInput("security zones security-zone dmz interfaces eth2.0"); err != nil {
+		t.Fatalf("SetFromInput: %v", err)
+	}
+	s.SetWriteActiveForTesting(failingWriteActive)
+	if _, err := s.CommitConfirmed(1); err == nil {
+		t.Fatal("expected CommitConfirmed 2 to fail on persist failure")
+	}
+
+	if !s.IsConfirmPending() {
+		t.Error("pending commit-1 confirm state must survive a failed commit 2")
+	}
+	if s.confirmTimer != timerBefore {
+		t.Error("commit-1 timer must not be cancelled/replaced by a failed commit 2")
+	}
+	if got := s.confirmPrevTree.FormatSet(); got != prevTreeBefore {
+		t.Errorf("rollback target changed on failed commit 2:\nbefore: %s\nafter: %s", prevTreeBefore, got)
+	}
+	if got := prevTreeBefore; got != baseSet {
+		t.Errorf("rollback target should be the last confirmed config:\nwant: %s\ngot: %s", baseSet, got)
+	}
+	if strings.Contains(s.ShowActiveSet(), "dmz") {
+		t.Error("active must not include the failed commit-2 edit")
+	}
+}
+
+// TestNestedCommitConfirmed_PreservesLastConfirmedTree pins the nested
+// CommitConfirmed defect (#1799 / plan §5.2): a second CommitConfirmed
+// while one is pending must keep the LAST CONFIRMED config as the
+// rollback target — not the unconfirmed commit-1 tree — so a commit-2
+// timeout reverts to a config the operator actually confirmed.
+func TestNestedCommitConfirmed_PreservesLastConfirmedTree(t *testing.T) {
+	s := newTestStore(t)
+	commitBaseline(t, s) // last confirmed config: trust only
+	baseSet := s.ShowActiveSet()
+
+	// Pending confirmed commit 1 (never confirmed).
+	if err := s.SetFromInput("security zones security-zone untrust interfaces eth1.0"); err != nil {
+		t.Fatalf("SetFromInput: %v", err)
+	}
+	if _, err := s.CommitConfirmed(1); err != nil {
+		t.Fatalf("CommitConfirmed 1: %v", err)
+	}
+
+	// Nested confirmed commit 2 (also never confirmed).
+	if err := s.SetFromInput("security zones security-zone dmz interfaces eth2.0"); err != nil {
+		t.Fatalf("SetFromInput: %v", err)
+	}
+	if _, err := s.CommitConfirmed(1); err != nil {
+		t.Fatalf("CommitConfirmed 2: %v", err)
+	}
+
+	if got := s.confirmPrevTree.FormatSet(); got != baseSet {
+		t.Errorf("nested commit overwrote the rollback target:\nwant last confirmed: %s\ngot: %s", baseSet, got)
+	}
+
+	// Drive the timer expiry directly: the rollback must land on the
+	// last confirmed config, not on the unconfirmed commit-1 tree.
+	s.performAutoRollback()
+	got := s.ShowActiveSet()
+	if got != baseSet {
+		t.Errorf("auto-rollback landed on the wrong config:\nwant: %s\ngot: %s", baseSet, got)
+	}
+	if strings.Contains(got, "untrust") || strings.Contains(got, "dmz") {
+		t.Error("auto-rollback must drop both unconfirmed commits")
+	}
+}
