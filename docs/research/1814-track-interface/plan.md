@@ -1,7 +1,8 @@
 # #1814 — VRRP track-interface: nested priority-cost block + make tracking actually work
 
-Status: DRAFT v3 — AGY r2 conditions folded (owner exemption, takeover
-latency, watcher lifecycle). Pending Codex round-2 confirm.
+Status: DRAFT v4 — Codex r2 prescriptions folded (LinuxIfName
+normalization, strict-reject duplicates via compileOpts, priority-0
+passthrough, order-independent nested-wins). Pending final confirm.
 
 ## Round-1 verdicts and the reframe
 
@@ -46,7 +47,16 @@ Two defects, one feature surface:
   **Owner exemption (AGY r2): when `cfg.Priority == 255` (IP address
   owner), tracking is NOT applied** — an owner stepping down while still
   holding the address invites duplicate-IP conflicts; skip with a
-  one-time warning at compile/commit instead. Default cost when the nested/flat form omits it: Junos default
+  one-time warning at compile/commit instead. **Priority-0 passthrough
+  (Codex r2): `cfg.Priority == 0` returns 0 unchanged** — the clamp
+  applies ONLY to tracking-derived effective priorities, never to the
+  resignation sentinel path.
+  **Name normalization (Codex r2): `TrackInterface` must be normalized
+  from the Junos name to the Linux name via `config.LinuxIfName`
+  (pkg/config/types.go:12) before any netlink lookup** — CollectInstances
+  copies raw Junos names today (vrrp.go:38) and the RETH path already
+  normalizes (vrrp.go:123); without this, `track-interface ge-0/0/1`
+  never matches kernel `ge-0-0-1`. Default cost when the nested/flat form omits it: Junos default
   is priority-cost required? Junos allows 1-254, no default — if the
   operator gives track-interface without priority-cost, treat cost as 0
   and surface a commit WARNING ("track-interface without priority-cost
@@ -94,15 +104,19 @@ Two defects, one feature surface:
   `vg.TrackInterface = prop.Keys[1]` (guard len), then child
   `priority-cost` → `vg.TrackPriorityDelta`. The legacy Keys-packed
   flat-sibling walk (:399-409) unchanged.
-- Multiple `track-interface` nodes: **first-wins + warning** via
-  `cfg.Warnings` (AGY: compileInterfaces takes only InterfacesConfig and
-  cannot append warnings — so the warning is collected by an AST-level
-  pre-walk in compileExpanded (compiler.go) where Config IS in scope,
-  same place U7 put tree-level checks; Codex preferred strict-reject —
-  v2 chooses warning-first because a strict reject needs the
-  strict/lenient split plumbed into a section compiler and the
-  operational risk of first-wins-with-visible-warning is low; round-2
-  may overrule).
+- Multiple `track-interface` nodes (DECIDED r2, Codex plumbing):
+  **strict commit REJECTS duplicates; lenient load/sync warns +
+  deterministic first-wins.** Mechanism: a compileOpts boolean (set only
+  in CompileConfigLenient / CompileConfigForNodeLenient — the existing
+  U7 pattern) consulted by an AST pre-walk in compileExpanded after
+  group expansion; strict path returns an error for >1 track-interface
+  in a group, lenient path appends cfg.Warnings and first-wins. No
+  compileInterfaces signature churn.
+- **Order-independent nested-wins (Codex r2):** the child loop
+  (compiler_interfaces.go:413) is source-order based — compute the
+  legacy flat-sibling values and the nested-block values separately and
+  apply nested LAST, so "nested wins over sibling" holds regardless of
+  node order.
 - `priority-cost` without `track-interface`, and track-interface without
   cost: warnings (see A).
 - FormatSet: with the schema child added, `FormatSet` renders the nested
