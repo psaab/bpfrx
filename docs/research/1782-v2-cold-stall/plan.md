@@ -1,6 +1,9 @@
 # #1782 v2 — Residual cold-start stall: re-research against current master
 
-**Status:** DRAFT v1 — re-verification of the prior converged plan
+**Status:** DRAFT v2 — folds r1 (Codex PLAN-NEEDS-MAJOR ×5 — all
+verified and folded; AGY PLAN-PROCEED-minor ×4 — F2/F4 strengthen
+mechanism (i) and answer Q3; Claude SMR folded pre-r1). Re-verification
+of the prior converged plan
 (`7c8e9d015`, branch `research/1782-cold-start-stall-residual`) against
 current master (`d30cfab84`) plus a 10-reproduction live induction
 campaign on the loss userspace cluster (2026-06-10). The prior plan's
@@ -167,12 +170,20 @@ funnel to one worker; BE/non-exact stall per-RX-worker.
 
 Each reproduction increments
 `xpf_cos_drain_latency_ns_bucket{queue_id="1",bucket_hi_ns="33554432"}`
-by exactly **+1** (the top/clipping bucket of the 16×(1024·2^k)
-histogram — one `drain_shaped_tx` invocation ≥33.5 ms, recorded at
-`tx/drain/phase_shaped.rs:44-72`), with `drain_invocations` +8..11.
-All 5 flows queue behind the exact queue's owner worker
-(`service_exact_guarantee_queue_direct_with_info`,
-`cos/queue_service/mod.rs:630-739`) and release together.
+by exactly **+1** — the SATURATING top bucket: any single successful
+`drain_shaped_tx` invocation ≥ 2^24 ns ≈ **16.8 ms** lands there
+(`umem/mod.rs:158-165` bucket layout; recorded at
+`tx/drain/phase_shaped.rs:44-72`; the Prometheus `bucket_hi_ns`
+label is the nominal 2^25 upper bound, but the bucket clips) — with
+`drain_invocations` +8..11. Precisely stated (Codex r1 F5): this
+proves one drain call exceeded ~16.8 ms per event, correlated 5/5
+with the stall; it does NOT by itself prove the whole connect wall
+was inside that one call. Queue 1 (100 Mb/s) is BELOW
+`COS_SHARED_EXACT_MIN_RATE_BYTES`, so its requests funnel to a single
+owner worker (`worker/cos/mod.rs:98-107`, `tx/dispatch/cos.rs:40-55`
+— low-rate queues funnel; HIGH-rate queues, exact or not, are
+sharded — Codex r1 F3: "exact ⇒ owner-local" is NOT the invariant,
+low-rate is), and all 5 flows release together.
 
 ### 3.6 Rep H — in-window system-wide perf (negatives, with a caveat)
 
@@ -229,9 +240,9 @@ Chain (all current master refs):
 2. First flows after idle classify into a CoS queue
    (`tx/cos_classify.rs`); exact-queue traffic funnels to the
    queue's owner worker.
-3. The first `drain_shaped_tx` on a lagged worker takes
-   ~50-1000 ms wall (one invocation lands in the clipped ≥33.5 ms
-   histogram bucket in EVERY reproduction) via one or both of two
+3. The first `drain_shaped_tx` on a lagged worker is implicated in
+   EVERY reproduction (one invocation lands in the saturating
+   ≥16.8 ms histogram bucket each time) via one or both of two
    candidate sub-mechanisms inside the call:
    - **(i) timer-wheel catch-up:** `prime_cos_root_for_service`
      (`tx_completion.rs:303-322`) → `advance_cos_timer_wheel`
@@ -243,14 +254,26 @@ Chain (all current master refs):
      fast/slow split). Argued against only by the rep-H in-window
      no-CPU-burst negative, which carries ±1-2 s mapping
      uncertainty (§3.6).
-   - **(ii) v8 lease cold-start ladder:** `queue.hot.tokens <
-     head_len` with `acquire_v8` granting ~0 per attempt across
-     repeated `QueueTokenStarvation` park/wake cycles (rep I +14
-     parks — but see the §3.7 caveat). Candidate starving bounds:
-     epoch/`cap`/`my_share` staleness recovering via
-     `maybe_rotate_epoch_v8`; the outstanding-credit ledger
-     (`try_bump_outstanding` vs `max_total_leased`); per-worker
-     `active_flow_buckets` rehydration.
+   - **(ii) v8 lease cold-start ladder (DOWNGRADED in r1 —
+     secondary):** `queue.hot.tokens < head_len` with `acquire_v8`
+     under-granting across repeated `QueueTokenStarvation` park/wake
+     cycles (rep I +14 parks — see the §3.7 caveat). Two r1 findings
+     weaken it: cold-resume epoch rotation grants ONE epoch rather
+     than zero (`types/shared_cos_lease/rotate_epoch_v8.rs:283` —
+     Codex F2), and the idle-transition release path returns root +
+     queue leases when `new_nonempty` hits 0
+     (`tx_completion.rs:~612 release_cos_root_lease` + companion
+     `release_unused` — AGY F4), so no outstanding-credit leak
+     across idle. (ii) survives only as "under-grant smaller than
+     head_len / rehydration ramp", which Step 1 measures as
+     `grant < head_len` per cause, not `grant == 0`.
+   - **BE-queue coverage (answers Q3, AGY F2):** a BE enqueue marks
+     the queue runnable (`root.runnable_queues > 0`), so
+     `cos_root_can_service_after_prime` (`tx_completion.rs:280-297`)
+     passes and `prime_cos_root_for_service` runs the SAME
+     `advance_cos_timer_wheel` catch-up on that worker — mechanism
+     (i) covers the rep C best-effort stalls with no extra
+     assumptions; (ii) never could (BE queue tokens are transparent).
 4. Every flow behind that owner/queue waits out the same call; all
    release together ⇒ "multiple flows hang, then full speed"
    (operator symptom; overnight lag scales it to seconds).
@@ -261,8 +284,8 @@ Chain (all current master refs):
 
 Supporting differentials: warm ping on a different queue/worker does
 not help (rep B); same-port flows split fast/slow by worker (rep C);
-one ≥33.5 ms drain invocation per event (reps D/F/G/H/I); zero
-neighbor-counter movement (all reps).
+one ≥16.8 ms (clipped) drain invocation per event (reps D/F/G/H/I);
+zero neighbor-counter movement (all reps).
 
 **Where the prior plan's H-chain stands:** H5 (one-representative
 pending drop) remains real-but-rare (needs a genuine
@@ -292,27 +315,40 @@ vs §4(ii)):**
   a per-call `now_tick - current_tick` max/sum (2 atomics). A cold
   rep showing a single multi-million-tick advance proves (i)
   conclusively, and its wall cost is directly computable.
-- (ii)-counters: `acquire_v8` grant==0-with-requested>0 per cause
+- (ii)-counters (per Codex F2: measure `grant < head_len`, not just
+  `grant == 0`): per-cause under-grant counters in `acquire_v8`
   (seqlock-give-up `:1207-1209`, `cap==0` `:1210-1212`,
   share-exhausted `:1256-1258`, class-cap `:1264-1266`,
-  outstanding-cap `:1289-1297`), plus the root-lease analogues
-  (§7 Q3), plus a queued→first-sent dwell histogram per queue.
+  outstanding-cap `:1289-1297`), the per-worker
+  `active_flow_buckets` value at acquire time, the root-lease
+  analogues, and a queued→first-sent dwell histogram per queue.
 - Raise the `drain_latency`/kick histogram top bucket past 33.5 ms
   so the stall stops clipping (§5.3).
 One cold rep with these live names the mechanism.
 
 **Step 2 — the fix (shape per mechanism, finalized after step 1):**
-- If (i): make the wheel catch-up O(slots), not O(lag): when
-  `now_tick - current_tick` exceeds the full wheel horizon, wake
-  every parked queue whose tick is due (during idle the wheel is
-  empty — queues are unparked/empty by `normalize_cos_queue_state`)
-  and SNAP `current_tick = now_tick` in O(1) instead of looping
-  per-tick (`tx_completion.rs:217-226`). Behavior-identical for
-  the in-horizon case; removes the O(idle) wall entirely.
-- If (ii): on first service after an idle gap ≥ N epochs,
-  re-initialize the queue's lease/bank state to the freshly-built
-  state (`builders.rs`: full burst bank, fresh epoch) instead of
-  replaying the starvation ladder.
+- If (i): make the wheel catch-up O(slots), not O(lag), when
+  `now_tick - current_tick` exceeds the wheel horizon — but the
+  "wheel is empty at idle" shortcut is FALSE (Codex F1 + AGY F1):
+  `park_cos_queue` pushes indices into `level0/level1`
+  (`tx_completion.rs:96-100`) and `normalize_cos_queue_state`
+  clears only queue flags, never the slot vectors
+  (`tx_completion.rs:197-214`); stale entries are filtered lazily
+  by the `parked/wheel_level/wheel_slot` checks
+  (`tx_completion.rs:237`, `:256`). The snap must therefore either
+  (a) verify `root.queues.iter().all(|q| !q.hot.parked)` and clear
+  every slot vector before snapping, or (b) drain all slots once,
+  waking due queues and re-arming future-parked ones against the
+  new tick. Behavior-identical in-horizon; removes the O(idle)
+  wall.
+- If (ii): the draft "re-initialize the queue's lease/bank state"
+  is UNSAFE as written (Codex F4): the lease is a SHARED Arc across
+  workers (`worker/cos/mod.rs:~198`) whose v8 per-worker state is
+  rehydrated additively (`types/shared_cos_lease/mod.rs:~1439`); a
+  local idle detector must not blindly reset shared state without
+  proving all peer workers idle. If Step 1 lands on (ii), the fix
+  design needs its own review round scoped to per-queue-local state
+  (`queue.hot.tokens` bank) or an all-peers-idle proof.
 Either way the change is cold-path-only and must re-run the
 #1628/#1630 fairness gates + the per-class CoS smoke (deploy wipes
 CoS — re-apply first) to prove steady-state shaping is untouched.
@@ -361,17 +397,18 @@ re-test shows no multi-second multi-flow lag.
    (ii) lease ladder (and if (ii), which `acquire_v8` bound)? The
    Step-1 tick-advance counter settles (i) in one rep.
 2. **Q2:** What sets the stall duration's idle-scaling
-   (53 ms@60 s → ~1 s@hours)? The ~7.5 ms/cycle × ~14 cycles
-   anatomy was measured at one idle depth only; the cycle count
-   and/or period must grow with idle. Step-1 histograms answer this.
-3. **Q3:** Does the same ladder explain the BE-queue stalls in rep C
-   (BE is non-exact; its tokens are transparent when
-   `transmit_rate_bytes==0` — `token_bucket.rs:167-171` — so why did
-   5200-BE stall 127 ms)? Root-lease bank (`maybe_top_up_cos_root_lease`,
-   `token_bucket.rs:54-87`, root shaping 25 Gb/s is non-transparent
-   here) is the candidate; Step-1 must add the root-lease counters
-   too. (`root_token_starvation_parks` stayed 0 in rep I — but rep I
-   only ran :5201 flows.)
+   (53 ms@60 s → ~1 s@hours)? Under (i) the wall is per-WORKER lag
+   (time since that worker's last drain), not global idle — which
+   already de-noises the 60 s point — and AGY F3 notes
+   DVFS/vCPU-frequency ramp adds wall-time noise on the virtualized
+   host that the Step-1 tick-advance counter bypasses (it counts raw
+   ticks, not wall). Step-1 histograms settle the functional form.
+3. **Q3 [ANSWERED r1, AGY F2]:** BE stalls are covered by mechanism
+   (i): a BE enqueue makes the root serviceable
+   (`runnable_queues > 0` → `cos_root_can_service_after_prime`
+   true, `tx_completion.rs:287`) and the prime runs the same
+   O(lag) wheel catch-up. Step-1 root-lease counters stay in scope
+   as corroboration.
 4. **Q4:** Is the overnight multi-second regime the SAME mechanism
    (bigger ladder) or compounded with a second one (e.g. client RTO
    interleaving, or the chronic host steal)? The operator's overnight
