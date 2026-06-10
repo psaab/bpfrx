@@ -61,3 +61,15 @@ contract.
 - Server-streaming RPCs (Ping, Traceroute, MonitorPacketDrop,
   MonitorInterface) must drain on client disconnect; cancel the context
   to free buffered output.
+- Request-path external commands (ps, df, ss, journalctl, chronyc,
+  ntpq, timedatectl, tail, ip neigh flush, systemctl power actions)
+  must go through the bounded helpers in `exec_timeout.go` (#1805):
+  `outputTimeout` / `combinedOutputTimeout` / `runTimeout` (15s timeout
+  + 5s WaitDelay, mirroring the apply-path contract in
+  `pkg/daemon/exec_timeout.go`, #1794 — not importable here because
+  pkg/daemon imports this package). Do not add raw `exec.Command` calls
+  in handlers: a wedged binary pins the handler goroutine and its gRPC
+  stream. Power actions take `context.Background()` (client disconnect
+  must not cancel a confirmed reboot); everything else derives from the
+  request ctx. Request-controlled `tail -n N` is additionally clamped
+  via `clampTailLines` — a time bound alone does not cap response bytes.
