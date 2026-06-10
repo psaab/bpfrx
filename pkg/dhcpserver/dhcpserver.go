@@ -96,19 +96,47 @@ type Manager struct {
 	unitActive   func(unit string) bool
 	warn         func(msg string, args ...any)
 
-	// ApplyAsync mailbox (#1835 F2): 1-slot latest-wins channel
-	// consumed by a single lazily started worker goroutine, so VRRP
-	// transition callbacks never block behind a 15s systemctl.
-	asyncOnce sync.Once
-	asyncCh   chan asyncApplyReq
+	// Generation-ordered supersession (#1835 F2 redesign after the
+	// Codex confirm on PR #1835 head dcd98cf8e). EVERY applier — sync
+	// Apply, sync ApplyClusterCommit, and ApplyAsync — allocates a
+	// monotonic generation at CALL ENTRY from applyGen. The shared
+	// apply body skips any request whose gen is <= lastAppliedGen
+	// (a newer desired state already won), so a queued async request
+	// can never be applied over a later synchronous commit and vice
+	// versa: allocation order == arrival order, and the final state
+	// is always the newest caller's.
+	applyGen atomic.Uint64
+	// lastAppliedGen is the generation of the newest desired state
+	// whose apply body ran (guarded by mu). Set even when the apply
+	// errored: the newest state was ATTEMPTED, and replaying an older
+	// state over a failed newer one would regress desired state.
+	lastAppliedGen uint64
+	// staleApplySkips counts apply bodies skipped as superseded
+	// (observable by tests; useful telemetry if exported later).
+	staleApplySkips atomic.Uint64
+
+	// ApplyAsync mailbox (#1835 F2): a mutex-guarded 1-slot pending
+	// pointer plus a cap-1 wake channel, consumed by a single lazily
+	// started worker goroutine, so VRRP transition callbacks never
+	// block behind a 15s systemctl. (The first design used a cap-1
+	// data channel with a send-after-drain retry loop; Codex showed
+	// that loop is ABA-racy — an old producer could drain a newer
+	// producer's request and land its older one. The pending slot is
+	// overwritten only by a higher gen, so it is monotonic.)
+	asyncOnce    sync.Once
+	asyncMu      sync.Mutex
+	pendingAsync *asyncApplyReq
+	asyncNotify  chan struct{}
 	// asyncWorkerStarts counts worker goroutine launches; tests assert
 	// the sync.Once keeps it at 1 across ApplyAsync bursts.
 	asyncWorkerStarts atomic.Int32
 }
 
 // asyncApplyReq is one desired DHCP-server state for the ApplyAsync
-// worker. reason is logging context only (which VRRP transition asked).
+// worker. gen orders it against every other applier (sync and async);
+// reason is logging context only (which VRRP transition asked).
 type asyncApplyReq struct {
+	gen    uint64
 	cfg    *config.DHCPServerConfig
 	reason string
 }
@@ -134,9 +162,11 @@ func New() *Manager {
 // Fail-closed (#1778): a restart failure (or a failure to stop an
 // active unit that is no longer in config) is returned to the caller
 // so a config commit surfaces the failure instead of reporting
-// success while no DHCP service is running.
+// success while no DHCP service is running. A nil return can also
+// mean the request was superseded by a newer applier (gen ordering);
+// being superseded is not a failure — the newer desired state won.
 func (m *Manager) Apply(cfg *config.DHCPServerConfig) error {
-	return m.apply(cfg, true)
+	return m.apply(m.applyGen.Add(1), cfg, true)
 }
 
 // ApplyClusterCommit reconciles for a cluster-mode config commit
@@ -151,16 +181,31 @@ func (m *Manager) Apply(cfg *config.DHCPServerConfig) error {
 // Fail-closed like Apply: generate/restart/stop failures are returned
 // so the commit surfaces them.
 func (m *Manager) ApplyClusterCommit(cfg *config.DHCPServerConfig) error {
-	return m.apply(cfg, false)
+	return m.apply(m.applyGen.Add(1), cfg, false)
 }
 
-// apply is the shared reconcile body. restartInactive selects whether
-// a configured family's unit is restarted unconditionally (standalone
-// / VRRP-MASTER semantics) or only when already active (cluster
-// commit semantics, see ApplyClusterCommit).
-func (m *Manager) apply(cfg *config.DHCPServerConfig, restartInactive bool) error {
+// apply is the shared reconcile body for every applier (sync Apply,
+// sync ApplyClusterCommit, async worker). gen is the caller's
+// generation, allocated at call entry; a request older than the
+// newest applied desired state is skipped (superseded — Codex hole 2
+// on PR #1835: without this, a queued async request could be applied
+// OVER a later synchronous commit's fresh config). restartInactive
+// selects whether a configured family's unit is restarted
+// unconditionally (standalone / VRRP-MASTER semantics) or only when
+// already active (cluster commit semantics, see ApplyClusterCommit).
+func (m *Manager) apply(gen uint64, cfg *config.DHCPServerConfig, restartInactive bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	if gen <= m.lastAppliedGen {
+		// A newer desired state has already been applied (or
+		// attempted). Skipping is correct, not an error: the caller's
+		// state was superseded before it reached the reconcile body.
+		m.staleApplySkips.Add(1)
+		slog.Debug("skipping superseded DHCP server apply",
+			"gen", gen, "last_applied_gen", m.lastAppliedGen)
+		return nil
+	}
 
 	var errs []error
 
@@ -191,6 +236,7 @@ func (m *Manager) apply(cfg *config.DHCPServerConfig, restartInactive bool) erro
 		errs = append(errs, err)
 	}
 
+	m.lastAppliedGen = gen
 	return errors.Join(errs...)
 }
 
@@ -204,43 +250,67 @@ func (m *Manager) apply(cfg *config.DHCPServerConfig, restartInactive bool) erro
 // Latest-wins coalescing is correct because Apply is an idempotent
 // reconcile to the desired state: when transitions arrive faster than
 // systemctl completes, intermediate states may be skipped, but the
-// LAST enqueued state is always the last one applied — final state
-// matches the final transition. Pass cfg == nil for an authoritative
+// newest desired state always wins — the mailbox slot is monotonic in
+// gen, and the shared apply body skips any request superseded by a
+// newer applier (sync OR async). Pass cfg == nil for an authoritative
 // clear (same semantics as Apply(nil)). Errors are logged by the
 // worker with the supplied reason; callers that need fail-closed
 // errors (the commit path) use the synchronous Apply instead.
 func (m *Manager) ApplyAsync(cfg *config.DHCPServerConfig, reason string) {
+	m.enqueueAsync(&asyncApplyReq{
+		gen:    m.applyGen.Add(1),
+		cfg:    cfg,
+		reason: reason,
+	})
+}
+
+// enqueueAsync installs req in the pending slot iff it is the newest
+// async request seen, then wakes the singleton worker. Split from
+// ApplyAsync so tests can inject a request whose gen was allocated
+// earlier (modeling a producer preempted between call entry and
+// enqueue — the interleaving behind Codex hole 1).
+//
+// The gen guard on the overwrite (not unconditional) closes the
+// async-vs-async ABA residue: two producers can allocate gens in one
+// order and reach this mutex in the other; an unconditional overwrite
+// would let the older gen replace the newer one, and with the newer
+// gen never applied the lastAppliedGen check could not save it.
+func (m *Manager) enqueueAsync(req *asyncApplyReq) {
 	m.asyncOnce.Do(func() {
-		m.asyncCh = make(chan asyncApplyReq, 1)
+		m.asyncNotify = make(chan struct{}, 1)
 		m.asyncWorkerStarts.Add(1)
 		go m.applyAsyncWorker()
 	})
-	req := asyncApplyReq{cfg: cfg, reason: reason}
-	for {
-		select {
-		case m.asyncCh <- req:
-			return
-		default:
-		}
-		// Slot full: discard the stale desired state and retry. The
-		// loop (rather than a single drain-then-send) makes the
-		// enqueue race-safe against concurrent producers.
-		select {
-		case <-m.asyncCh:
-		default:
-		}
+	m.asyncMu.Lock()
+	if m.pendingAsync == nil || req.gen > m.pendingAsync.gen {
+		m.pendingAsync = req
+	}
+	m.asyncMu.Unlock()
+	// Non-blocking wake: a token already in flight covers this set
+	// too (the worker re-reads pendingAsync after every wake).
+	select {
+	case m.asyncNotify <- struct{}{}:
+	default:
 	}
 }
 
 // applyAsyncWorker is the singleton consumer for ApplyAsync. It runs
-// for the daemon's lifetime (the mailbox is never closed); each
-// iteration applies the latest desired state under the normal m.mu
-// serialization with synchronous Apply callers.
+// for the daemon's lifetime (the wake channel is never closed); each
+// wake takes the pending desired state (leaving the slot empty) and
+// runs the shared gen-checked apply body under the normal m.mu
+// serialization with synchronous appliers.
 func (m *Manager) applyAsyncWorker() {
-	for req := range m.asyncCh {
-		if err := m.Apply(req.cfg); err != nil {
+	for range m.asyncNotify {
+		m.asyncMu.Lock()
+		req := m.pendingAsync
+		m.pendingAsync = nil
+		m.asyncMu.Unlock()
+		if req == nil {
+			continue
+		}
+		if err := m.apply(req.gen, req.cfg, true); err != nil {
 			slog.Warn("async DHCP server apply failed",
-				"reason", req.reason, "err", err)
+				"reason", req.reason, "gen", req.gen, "err", err)
 		}
 	}
 }
@@ -267,10 +337,11 @@ func (m *Manager) clearFamilyLocked(svc, confPath string) error {
 // cannot fail a state transition, so Clear keeps a void signature.
 // Commit-path callers use Apply(nil) instead, which returns errors.
 func (m *Manager) Clear() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	_ = m.clearFamilyLocked(kea4Svc, m.confPath4)
-	_ = m.clearFamilyLocked(kea6Svc, m.confPath6)
+	// Delegate to Apply(nil) so a Clear participates in the same
+	// generation ordering as every other applier (#1835 F2 redesign)
+	// instead of silently bypassing supersession. Errors are already
+	// logged at Warn by clearFamilyLocked.
+	_ = m.Apply(nil)
 }
 
 // IsRunning returns true if any Kea server unit is active per systemd

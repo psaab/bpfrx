@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -610,4 +611,158 @@ func TestApplyClusterCommit(t *testing.T) {
 			t.Errorf("active unit must stop when config removed, got %v", *calls)
 		}
 	})
+}
+
+// waitForCondition polls cond until true or fails the test. Used for
+// observing the async worker's gen-checked outcomes (skip counters,
+// lastAppliedGen) without timing assumptions on the assertion itself.
+func waitForCondition(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// TestSyncSupersedesQueuedAsync pins Codex hole 2 on PR #1835: a
+// queued async request must NOT be applied over a newer synchronous
+// ApplyClusterCommit. Choreographed deterministically via gens: the
+// async producer allocates its gen at call entry, then "stalls" before
+// reaching the mailbox (the worst-case interleaving), the sync commit
+// lands with a higher gen, and the stale async — delivered through the
+// real mailbox + worker — must be skipped by the shared apply body.
+func TestSyncSupersedesQueuedAsync(t *testing.T) {
+	m, calls := testManager(t, map[string]bool{kea4Svc: true}, "")
+
+	// Async producer at call entry: gen allocated, enqueue delayed.
+	oldGen := m.applyGen.Add(1)
+	oldReq := &asyncApplyReq{gen: oldGen, cfg: v4Config("iface-OLD"), reason: "stale-vrrp"}
+
+	// Sync cluster commit with a newer gen applies (unit active →
+	// regenerates config and restarts).
+	if err := m.ApplyClusterCommit(v4Config("iface-NEW")); err != nil {
+		t.Fatalf("ApplyClusterCommit: %v", err)
+	}
+
+	// The stalled producer finally lands its stale request.
+	m.enqueueAsync(oldReq)
+	waitForCondition(t, "stale async skip", func() bool {
+		return m.staleApplySkips.Load() == 1
+	})
+
+	data, err := os.ReadFile(m.confPath4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "iface-NEW") || strings.Contains(string(data), "iface-OLD") {
+		t.Errorf("stale async overwrote the sync commit's config: %s", data)
+	}
+	restarts := 0
+	for _, c := range *calls {
+		if c == "restart "+kea4Svc {
+			restarts++
+		}
+	}
+	if restarts != 1 {
+		t.Errorf("apply count: want exactly the sync commit's restart, got %d (%v)", restarts, *calls)
+	}
+}
+
+// TestAsyncSupersedesOlderSync pins the other direction of the gen
+// ordering: an async request allocated AFTER a sync apply lands over
+// it (final state = async's), while a sync applier holding a stale gen
+// skips and returns nil — being superseded is not a failure.
+func TestAsyncSupersedesOlderSync(t *testing.T) {
+	m, calls := testManager(t, map[string]bool{}, "")
+
+	if err := m.Apply(v4Config("iface-SYNC")); err != nil { // gen 1
+		t.Fatalf("Apply: %v", err)
+	}
+	m.ApplyAsync(v4Config("iface-ASYNC"), "newer") // gen 2 > 1 → applies
+	waitForCondition(t, "async apply over older sync", func() bool {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return m.lastAppliedGen == 2
+	})
+	data, _ := os.ReadFile(m.confPath4)
+	if !strings.Contains(string(data), "iface-ASYNC") {
+		t.Errorf("newer async must win, config: %s", data)
+	}
+	if got := len(*calls); got != 2 {
+		t.Errorf("want 2 restarts (sync + newer async), got %d: %v", got, *calls)
+	}
+
+	// Inverse stale case: a sync applier whose gen lost the race to a
+	// newer applier must skip, returning nil with no systemctl calls.
+	if err := m.apply(1, v4Config("iface-STALE"), true); err != nil {
+		t.Fatalf("superseded sync apply must return nil, got %v", err)
+	}
+	if m.staleApplySkips.Load() != 1 {
+		t.Errorf("stale sync apply not skipped (skips=%d)", m.staleApplySkips.Load())
+	}
+	data, _ = os.ReadFile(m.confPath4)
+	if strings.Contains(string(data), "iface-STALE") {
+		t.Errorf("stale sync apply regenerated config: %s", data)
+	}
+	if got := len(*calls); got != 2 {
+		t.Errorf("stale sync apply issued systemctl calls: %v", *calls)
+	}
+}
+
+// TestApplyAsyncConcurrentProducersHighestGenWins pins Codex hole 1 on
+// PR #1835 (ABA in the old send-after-drain loop): with the worker
+// blocked, 10 concurrent producers race the mailbox; the pending slot
+// must end up holding exactly the highest allocated gen (asserted via
+// gens, not timing), and after release exactly that state is applied.
+func TestApplyAsyncConcurrentProducersHighestGenWins(t *testing.T) {
+	m, applied, release := asyncTestManager(t)
+
+	m.ApplyAsync(v4Config("iface-prime"), "prime") // gen 1
+	<-applied                                      // worker blocked in prime's restart
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			m.ApplyAsync(v4Config(fmt.Sprintf("iface-%d", i)), "racer")
+		}(i)
+	}
+	wg.Wait()
+
+	// All producers returned: the slot must hold the highest gen.
+	m.asyncMu.Lock()
+	pend := m.pendingAsync
+	m.asyncMu.Unlock()
+	if pend == nil {
+		t.Fatal("no pending request after concurrent producers")
+	}
+	if want := m.applyGen.Load(); pend.gen != want {
+		t.Fatalf("pending gen = %d, want highest allocated %d (ABA: an older producer overwrote a newer request)", pend.gen, want)
+	}
+	winner := pend.cfg.DHCPLocalServer.Groups["g0"].Interfaces[0]
+
+	release <- struct{}{} // finish prime
+	got := <-applied      // exactly one coalesced apply
+	if !strings.Contains(got, winner) {
+		t.Fatalf("applied %q, want highest-gen state %q", got, winner)
+	}
+	release <- struct{}{}
+
+	select {
+	case extra := <-applied:
+		t.Fatalf("unexpected extra apply: %q", extra)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	m.mu.Lock()
+	last := m.lastAppliedGen
+	m.mu.Unlock()
+	if last != pend.gen {
+		t.Fatalf("lastAppliedGen = %d, want %d", last, pend.gen)
+	}
 }

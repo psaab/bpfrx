@@ -4802,3 +4802,13 @@ top.
   + README.
   **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/dhcpserver_test.go,
   pkg/dhcpserver/README.md, pkg/daemon/daemon_apply.go
+
+- **Timestamp**: 2026-06-10 (Codex confirm fold) F2 redesign
+  **Action**: #1835 — replaced the channel drain-loop mailbox (ABA hole 1) with
+  gen-ordered supersession: applyGen at call entry for ALL appliers, mu-guarded
+  pendingAsync slot (overwrite only by higher gen) + cap-1 notify channel,
+  lastAppliedGen skip in shared apply body (hole 2: queued async vs sync
+  commit); Clear delegates to Apply(nil); new gen-deterministic tests, all
+  under -race; README updated.
+  **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/dhcpserver_test.go,
+  pkg/dhcpserver/README.md

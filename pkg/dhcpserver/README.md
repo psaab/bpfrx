@@ -22,11 +22,18 @@ Manages Kea DHCPv4/v6 server config and lifecycle. Generates
   a single lazily started worker via a 1-slot latest-wins mailbox and
   returns immediately (#1835 F2). Used by the VRRP transition
   callbacks in `pkg/daemon` so the event loop never waits behind a
-  15s-bounded systemctl. Coalescing is correct because `Apply` is an
-  idempotent reconcile to desired state: intermediate states may be
-  skipped but the last enqueued state is always applied last.
-  `cfg == nil` is the authoritative clear. Errors are logged with
-  `reason`; the commit path keeps synchronous `Apply` (fail-closed).
+  15s-bounded systemctl. Every applier — sync `Apply`,
+  `ApplyClusterCommit`, and `ApplyAsync` — allocates a monotonic
+  generation at call entry; the shared apply body skips requests
+  superseded by a newer generation, so a queued async request is
+  never applied over a later synchronous commit, and the mailbox slot
+  is only overwritten by a higher generation (no ABA between racing
+  producers). Coalescing is correct because `Apply` is an idempotent
+  reconcile to desired state: intermediate states may be skipped but
+  the newest desired state always wins. `cfg == nil` is the
+  authoritative clear. Errors are logged with `reason`; the commit
+  path keeps synchronous `Apply` (fail-closed; a superseded sync
+  applier returns nil — being outraced is not a failure).
 - `ApplyClusterCommit(cfg) error` — `dhcpserver.go`. Cluster-commit
   reconcile (#1835 F3): always regenerates configs for configured
   families but restarts only units that are currently active; clears
