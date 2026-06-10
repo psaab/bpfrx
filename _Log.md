@@ -1,5 +1,34 @@
 # Action Log
 
+## 2026-06-10 — #1824 proptest harness for frame parse/NAT/TSO
+- **Timestamp**: 2026-06-10 UTC
+- **Action**: Implemented the #1824 in-tree proptest harness per the
+  CONVERGED plan (docs/research/1824-fuzz-harness/plan.md, Option A).
+  New `frame/prop_tests/` directory module (strategies, full-recompute
+  checksum oracle, S1 parse properties P-I1..P-I5, S2 NAT properties
+  P-N1..P-N4 with descriptor-vs-generic differential, S4 TSO
+  properties P-T1..P-T4), `cfg(all(test, not(miri)))`, proptest as a
+  dev-dependency only (release binary verified byte-neutral to the
+  dep; loadable sections bit-identical overall). Filed and pinned the
+  three plan §10-D production divergences BEFORE landing the tests:
+  #1838 (generic v6 NAT path assumes L4 at offset 40), #1839 (v6
+  0x0000→0xFFFF canonicalization scope mismatch), #1840
+  (family-ungated UDP zero-checksum skip) — generators exclude those
+  domains, deterministic pins assert current behavior. Mutation
+  spot-check proved both oracles bite (0xFEFF TTL-term drop caught by
+  P-N3; ihl<20 floor drop caught by P-I2/P-I3); llvm-cov shows the v6
+  ext-header walk arms 43/51/44/59 all executed under the harness.
+  Committed proptest-regressions corpus (incl. the mutation-killing
+  seeds and the shrunk input for the harness-composition fix in
+  apply_nat_family). Evidence:
+  docs/pr/1824-proptest-harness/validation.md.
+- **File(s)**: userspace-dp/Cargo.toml, userspace-dp/Cargo.lock,
+  userspace-dp/src/afxdp/frame/mod.rs,
+  userspace-dp/src/afxdp/frame/prop_tests/{mod,strategies,oracle,inspect,rewrite,segment}.rs,
+  userspace-dp/proptest-regressions/afxdp/frame/prop_tests/{inspect,rewrite}.txt,
+  userspace-dp/src/afxdp/frame/README.md,
+  docs/pr/1824-proptest-harness/validation.md, _Log.md
+
 ## 2026-05-29 — #1641 NAT64 reverse-path Ethernet padding fix
 - **Timestamp**: 2026-05-29 UTC
 - **Action**: Fixed `translate_v4_to_v6` in the userspace-dp NAT64
