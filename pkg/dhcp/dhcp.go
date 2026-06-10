@@ -290,16 +290,19 @@ func (m *Manager) Renew(ifaceName string) error {
 		key := clientKey{iface: ifaceName, family: af}
 		m.mu.Lock()
 		dc, exists := m.clients[key]
-		if exists {
-			delete(m.clients, key)
-		}
 		m.mu.Unlock()
 
 		if !exists {
 			continue
 		}
 
-		// Stop existing client
+		// Stop the existing client. Do NOT pre-delete the registry
+		// entry: finishClient owns deregistration and the lease /
+		// delegated-PD / address cleanup, and its pointer guard
+		// early-returns when the entry is already gone — a pre-delete
+		// here would skip that cleanup entirely when cancellation
+		// lands mid-exchange (Codex review on PR #1815). Waiting on
+		// done guarantees finishClient has completed before restart.
 		dc.cancel()
 		<-dc.done
 		renewed = true
