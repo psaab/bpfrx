@@ -4644,3 +4644,18 @@ top.
 - **Timestamp**: 2026-06-09
   **Action**: U10 (#1792) monotonic HA liveness — 4 commits on engineer/1800-u10-liveness
   **File(s)**: pkg/cluster/{heartbeat,heartbeat_manager,hooks,manager,sync,sync_conn,sync_protocol,sync_test,heartbeat_liveness_test}.go, pkg/daemon/{daemon,daemon_ha_sync,daemon_ha_sync_test}.go, pkg/vrrp/{instance,instance_garp_test}.go, docs/bug-heartbeat-vrf-rebind-split-brain.md
+
+- **Timestamp**: 2026-06-09
+  **Action**: U8 (#1793 of #1800 plan) — DHCP client lifecycle reconcile-on-apply.
+  pkg/dhcp: per-client config-identity fingerprint + Manager.Reconcile
+  (start new / stop removed / restart option-changed; diff keys NEVER on
+  lease state), finishClient defer deregisters on ALL terminal run-goroutine
+  exits and removes residual lease+address; StopAll registry now self-clears.
+  pkg/daemon: buildDHCPClientSpecs + reconcileDHCPClients (lazy manager,
+  needsDHCP startup-only gate dropped) wired into applyConfigLocked step 7b
+  next to the Kea block; startup call is now a redundant safety net.
+  Tests: reconcile add/remove/option-change-restart/DUID-change-restart/
+  lease-change-no-restart, terminal-exit deregister + restartable, StopAll
+  clear; daemon-level spec building + commit enable/disable lifecycle +
+  lease-change-no-restart. README reconcile-lifecycle section added.
+  **File(s)**: pkg/dhcp/{dhcp,reconcile,test_seams,reconcile_test}.go, pkg/dhcp/README.md, pkg/daemon/{daemon_dhcp,daemon_apply,daemon_run,dhcp_reconcile_test}.go
