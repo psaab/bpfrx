@@ -50,6 +50,12 @@ type clientKey struct {
 type dhcpClient struct {
 	cancel context.CancelFunc
 	done   chan struct{}
+	// fingerprint is the client's config identity (options/DUID type)
+	// captured at Start time. Reconcile compares it against the
+	// fingerprint of the newly committed config to decide whether the
+	// client must be restarted. It NEVER includes lease or address
+	// state — see Reconcile.
+	fingerprint string
 }
 
 // DHCPv4Options holds client behavior options for DHCPv4.
@@ -97,6 +103,11 @@ type Manager struct {
 	nlHandle        *netlink.Handle
 	recompileTimer  *time.Timer
 	stateDir        string
+
+	// runClientForTest replaces the per-family run goroutine body in
+	// tests so reconcile/registry behavior can be exercised without
+	// real DHCP traffic. nil in production.
+	runClientForTest func(ctx context.Context, ifaceName string, af AddressFamily)
 }
 
 // New creates a DHCP manager. stateDir is where DUID files are persisted.
@@ -199,20 +210,35 @@ func (m *Manager) Start(ctx context.Context, ifaceName string, af AddressFamily)
 	}
 
 	// Use an independent context so DHCP clients are decoupled from the
-	// daemon lifecycle. Only explicit StopAll() triggers lease release and
-	// address removal. During graceful restart (SIGTERM), the process exits
-	// without calling StopAll(), so addresses stay on interfaces for the
-	// next daemon to reuse.
+	// daemon lifecycle. Only an explicit stop (Reconcile removal, Renew,
+	// StopAll) cancels a client. During graceful restart (SIGTERM), the
+	// process exits without calling StopAll(), so addresses stay on
+	// interfaces for the next daemon to reuse.
 	cctx, cancel := context.WithCancel(context.Background())
 	dc := &dhcpClient{
-		cancel: cancel,
-		done:   make(chan struct{}),
+		cancel:      cancel,
+		done:        make(chan struct{}),
+		fingerprint: m.configFingerprintLocked(key),
 	}
 	m.clients[key] = dc
+	runFn := m.runClientForTest
 	m.mu.Unlock()
 
+	slog.Info("DHCP: starting client", "interface", ifaceName, "family", af)
+
 	go func() {
+		// Defer order matters: finishClient (deregister + lease/address
+		// cleanup) runs BEFORE close(done), so anyone waiting on done
+		// observes a clean registry. The deregistration covers ALL
+		// terminal exits (#1793) — cancellation, DHCPv4 max
+		// retransmissions, DHCPv6 link-local abort — not just Renew,
+		// so a future Start for this key is never a permanent no-op.
 		defer close(dc.done)
+		defer m.finishClient(key, dc)
+		if runFn != nil {
+			runFn(cctx, ifaceName, af)
+			return
+		}
 		switch af {
 		case AFInet:
 			m.runDHCPv4(cctx, ifaceName)
@@ -220,6 +246,30 @@ func (m *Manager) Start(ctx context.Context, ifaceName string, af AddressFamily)
 			m.runDHCPv6(cctx, ifaceName)
 		}
 	}()
+}
+
+// finishClient runs in the client goroutine's defer on every exit path.
+// It deregisters the registry entry (only if it still maps to this exact
+// client — Renew deletes/re-adds entries, so a pointer compare guards
+// against clobbering a successor) and cleans up any lease record and
+// interface address the run loop left behind (some cancellation
+// interleavings exit the run loop without hitting its own ctx.Done
+// cleanup branches).
+func (m *Manager) finishClient(key clientKey, dc *dhcpClient) {
+	m.mu.Lock()
+	if cur, ok := m.clients[key]; ok && cur == dc {
+		delete(m.clients, key)
+	}
+	lease := m.leases[key]
+	delete(m.leases, key)
+	if key.family == AFInet6 {
+		delete(m.delegatedPDs, key.iface)
+	}
+	m.mu.Unlock()
+
+	if lease != nil && lease.Address.IsValid() {
+		m.removeAddress(key.iface, lease)
+	}
 }
 
 // Renew restarts the DHCP client for the specified interface and address
@@ -256,7 +306,10 @@ func (m *Manager) Renew(ifaceName string) error {
 	return nil
 }
 
-// StopAll stops all running DHCP clients and releases leases.
+// StopAll stops all running DHCP clients and releases leases. Registry
+// entries are cleared by each client's finishClient defer, which runs
+// before its done channel closes, so the registry is empty when StopAll
+// returns.
 func (m *Manager) StopAll() {
 	m.mu.Lock()
 	clients := make(map[clientKey]*dhcpClient, len(m.clients))
@@ -811,8 +864,8 @@ func (m *Manager) runDHCPv6(ctx context.Context, ifaceName string) {
 
 // dhcpv6Result holds results from a DHCPv6 exchange including both IA_NA and IA_PD.
 type dhcpv6Result struct {
-	lease      *Lease
-	prefixes   []DelegatedPrefix
+	lease    *Lease
+	prefixes []DelegatedPrefix
 }
 
 // doDHCPv6 performs a single DHCPv6 solicit/request exchange.
@@ -1151,6 +1204,9 @@ func (m *Manager) applyAddress(ifaceName string, lease *Lease) error {
 
 // removeAddress removes the DHCP address and default route from the interface.
 func (m *Manager) removeAddress(ifaceName string, lease *Lease) {
+	if m.nlHandle == nil {
+		return // test-constructed Manager without netlink
+	}
 	link, err := m.nlHandle.LinkByName(ifaceName)
 	if err != nil {
 		return
