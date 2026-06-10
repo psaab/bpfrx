@@ -4671,3 +4671,7 @@ top.
 - **Timestamp**: 2026-06-09
   **Action**: #1798 U7 layer 3 — render-side control-char sanitizers at every free-text file interpolation (networkd units, frr.conf, swanctl.conf) + audit of Kea/linksetup/ast_format (deliberately left, reasons in commit msg)
   **File(s)**: pkg/networkd/networkd.go, pkg/frr/policy_render.go, pkg/ipsec/ipsec.go
+
+- **Timestamp**: 2026-06-09
+  **Action**: #1798 U7 gate tests — strict reject (flat-set + hierarchical + annotation), lenient sanitize+warn, Load boots on persisted bad config + next commit succeeds, SyncApply tolerance, renderer belt tests (networkd/frr/ipsec)
+  **File(s)**: pkg/config/freetext_test.go (new), pkg/configstore/freetext_store_test.go (new), pkg/networkd/networkd_test.go, pkg/frr/frr_test.go, pkg/ipsec/ipsec_test.go
