@@ -796,14 +796,16 @@ func (m *Manager) SetRouteOverlay(overlay []config.RouteOverlayEntry) {
 // (duplicate-publish skip) and reported as success.
 //
 // Ordering contract (AGY r2-1): the caller (the daemon's routes-only
-// actuator) must call BumpFIBGeneration ONLY after this returns nil —
-// bumping before the helper has the new routes would re-resolve flows
-// against the OLD routes and the later snapshot would not
-// re-invalidate them.
+// actuator) must call BumpFIBGeneration ONLY after this returns
+// published=true with a nil error — bumping before the helper has the
+// new routes would re-resolve flows against the OLD routes and the
+// later snapshot would not re-invalidate them; bumping after a
+// duplicate-skip would churn established-flow route caches for
+// nothing (Codex PR #1843 MED).
 //
 // schedulerState refreshes the policy snapshots in the same publish
 // when non-nil; nil keeps the manager's current scheduler view.
-func (m *Manager) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []config.RouteOverlayEntry, schedulerState map[string]bool) error {
+func (m *Manager) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []config.RouteOverlayEntry, schedulerState map[string]bool) (published bool, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -814,17 +816,17 @@ func (m *Manager) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []conf
 
 	if cfg == nil {
 		if m.lastSnapshot == nil {
-			return nil
+			return false, nil
 		}
 		cfg = m.lastSnapshot.Config
 	}
 	if cfg == nil || m.lastSnapshot == nil {
 		// No published snapshot yet: the overlay is cached and the
 		// next full apply will carry it.
-		return nil
+		return false, nil
 	}
 	if m.proc == nil || m.proc.Process == nil {
-		return nil
+		return false, nil
 	}
 
 	if err := m.ensureRequiredSnapshotProtocolLocked(cfg); err != nil {
@@ -832,7 +834,7 @@ func (m *Manager) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []conf
 			slog.Warn("userspace: failed to disarm helper after refusing overlay publish",
 				"protocol_err", err, "err", disarmErr)
 		}
-		return fmt.Errorf("refusing route overlay publish to incompatible helper: %w", err)
+		return false, fmt.Errorf("refusing route overlay publish to incompatible helper: %w", err)
 	}
 
 	next := *m.lastSnapshot
@@ -848,14 +850,14 @@ func (m *Manager) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []conf
 	// round-trip. The content hash excludes Generation/FIBGeneration.
 	if h, ok := snapshotContentHash(&next); ok && h == m.lastSnapshotHash {
 		slog.Debug("userspace: route overlay publish skipped (content unchanged)")
-		return nil
+		return false, nil
 	}
 
 	publishSnap := next
 	publishSnap.Neighbors = filterPublishableNeighbors(next.Neighbors)
 	var status ProcessStatus
 	if err := m.requestLocked(ControlRequest{Type: "apply_snapshot", Snapshot: &publishSnap}, &status); err != nil {
-		return fmt.Errorf("publish route overlay snapshot: %w", err)
+		return false, fmt.Errorf("publish route overlay snapshot: %w", err)
 	}
 	m.generation = nextGeneration
 	m.lastSnapshot = &next
@@ -871,7 +873,7 @@ func (m *Manager) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []conf
 	}
 	slog.Info("userspace: route overlay snapshot published",
 		"generation", next.Generation, "overlay_routes", len(m.routeOverlay))
-	return nil
+	return true, nil
 }
 
 func (m *Manager) syncInterfaceAttachments(result *dataplane.CompileResult, snapshot *ConfigSnapshot) {

@@ -17,13 +17,17 @@ type fakeOverlayDP struct {
 	dataplane.RuntimeDataPlane // nil embed: only the overlay surface is used
 	calls                      []string
 	publishErr                 error
+	publishSkipped             bool // simulate the duplicate-skip (published=false)
 	lastOverlay                []config.RouteOverlayEntry
 }
 
-func (f *fakeOverlayDP) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []config.RouteOverlayEntry, schedulerState map[string]bool) error {
+func (f *fakeOverlayDP) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []config.RouteOverlayEntry, schedulerState map[string]bool) (bool, error) {
 	f.calls = append(f.calls, "publish")
 	f.lastOverlay = overlay
-	return f.publishErr
+	if f.publishErr != nil {
+		return false, f.publishErr
+	}
+	return !f.publishSkipped, nil
 }
 
 func (f *fakeOverlayDP) BumpFIBGeneration() uint32 {
@@ -200,5 +204,24 @@ func TestCommitOverlayForConfigFiltersStaleEntries(t *testing.T) {
 	}}
 	if got := d.commitOverlayForConfig(edited); got != nil {
 		t.Fatalf("stale next-hop riding the commit publish: %+v", got)
+	}
+}
+
+// TestActuatorSkipsBumpOnDuplicatePublish (Codex PR #1843 MED): when
+// the snapshot publish is a duplicate-skip (content unchanged,
+// published=false), the actuator must NOT bump the FIB generation —
+// the dataplane routes did not move, so invalidating established-flow
+// route caches would be pure churn.
+func TestActuatorSkipsBumpOnDuplicatePublish(t *testing.T) {
+	dp := &fakeOverlayDP{publishSkipped: true}
+	d := &Daemon{
+		applySem: semaphore.NewWeighted(1),
+		dp:       dp,
+		ipmon:    failedIPMonEngine(t),
+	}
+	d.actuateRouteOverlayLocked(&config.Config{})
+
+	if len(dp.calls) != 1 || dp.calls[0] != "publish" {
+		t.Fatalf("calls = %v, want [publish] only (no bump on duplicate-skip)", dp.calls)
 	}
 }

@@ -101,8 +101,13 @@ referenced by an ip-monitoring policy or (b) bound via
 are gated — they run only on the node that is primary for the data RG
 (uplink addresses are VRRP VIPs; a standby probe would fail
 structurally). All other RPM probes keep run-everywhere behavior.
-Overlay publication follows the same gate; the overlay is runtime
-state and never syncs — on takeover the new primary publishes the
+Overlay publication follows the same gate. Known v1 coarseness: the
+publication gate keys on primaryship of the LOWEST data RG only — in
+a multi-data-RG cluster with split primaryship, per-policy/per-RETH
+publication gating is not yet differentiated (probe gating IS
+per-probe). Overlay publication gating refinement rides the later
+program PRs if a split-RG deployment materializes. The overlay is
+runtime state and never syncs — on takeover the new primary publishes the
 config baseline, runs a fresh probe cycle, and re-derives the overlay
 from fresh results (at most one fast probe cycle of config-default
 routing, and only on double fault).

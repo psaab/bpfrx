@@ -383,3 +383,55 @@ func TestFilterOverlayForConfig(t *testing.T) {
 		t.Fatalf("canonical-equivalent prefix dropped: %+v", kept)
 	}
 }
+
+// TestApplyWithoutOverlayChangeDoesNotActuate (Codex PR #1843 MED):
+// a commit with zero policies — or any commit that leaves the
+// effective overlay unchanged — must not schedule a routes-only
+// actuation (one spurious frr-reload per commit otherwise).
+func TestApplyWithoutOverlayChangeDoesNotActuate(t *testing.T) {
+	var actuations atomic.Int32
+	e := New(func() { actuations.Add(1) })
+	e.debounce = 5 * time.Millisecond
+	e.throttle = 5 * time.Millisecond
+	e.Start()
+	defer e.Stop()
+
+	// No-policy commits: nothing to actuate.
+	e.Apply(&config.IPMonitoringConfig{}, nil)
+	e.Apply(nil, nil)
+	// Policies present but all passing (overlay nil before and after).
+	e.Apply(testPolicyConfig(), passResults())
+	e.Apply(testPolicyConfig(), passResults())
+	time.Sleep(60 * time.Millisecond)
+	if got := actuations.Load(); got != 0 {
+		t.Fatalf("actuations = %d after overlay-neutral commits, want 0", got)
+	}
+
+	// A real failure still actuates...
+	e.HandleTransition(transition("WAN", "wan-a", "fail", passResults()))
+	time.Sleep(60 * time.Millisecond)
+	if got := actuations.Load(); got == 0 {
+		t.Fatal("real failure did not actuate")
+	}
+
+	// ...and an unrelated re-Apply with the overlay active (same
+	// spec, still-failing results) stays quiet.
+	before := actuations.Load()
+	results := passResults()
+	results[0].LastStatus = "fail"
+	e.Apply(testPolicyConfig(), results)
+	time.Sleep(60 * time.Millisecond)
+	if got := actuations.Load(); got != before {
+		t.Fatalf("unrelated commit actuated: %d -> %d", before, got)
+	}
+
+	// A spec edit while FAILED changes the overlay → actuates (the
+	// HIGH-1 re-injection path).
+	edited := testPolicyConfig()
+	edited.Policies["wan-failover"].PreferredRoutes[0].NextHop = "172.16.80.99"
+	e.Apply(edited, results)
+	time.Sleep(60 * time.Millisecond)
+	if got := actuations.Load(); got == before {
+		t.Fatal("overlay-changing spec edit did not actuate")
+	}
+}

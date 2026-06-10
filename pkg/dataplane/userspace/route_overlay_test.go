@@ -182,8 +182,12 @@ func TestPublishRouteOverlaySnapshot(t *testing.T) {
 	overlay := []config.RouteOverlayEntry{
 		{Destination: "0.0.0.0/0", NextHop: "172.16.80.1", Policy: "wan-failover"},
 	}
-	if err := m.PublishRouteOverlaySnapshot(cfg, overlay, nil); err != nil {
+	published, err := m.PublishRouteOverlaySnapshot(cfg, overlay, nil)
+	if err != nil {
 		t.Fatalf("PublishRouteOverlaySnapshot: %v", err)
+	}
+	if !published {
+		t.Fatal("first publish reported published=false")
 	}
 
 	var req ControlRequest
@@ -212,9 +216,15 @@ func TestPublishRouteOverlaySnapshot(t *testing.T) {
 		t.Fatalf("published snapshot missing overlay route: %+v", req.Snapshot.Routes)
 	}
 
-	// Duplicate publish (same overlay, same content) is skipped.
-	if err := m.PublishRouteOverlaySnapshot(cfg, overlay, nil); err != nil {
+	// Duplicate publish (same overlay, same content) is skipped and
+	// reports published=false so the actuator does not bump the FIB
+	// generation (Codex PR #1843 MED).
+	published, err = m.PublishRouteOverlaySnapshot(cfg, overlay, nil)
+	if err != nil {
 		t.Fatalf("duplicate PublishRouteOverlaySnapshot: %v", err)
+	}
+	if published {
+		t.Fatal("duplicate publish reported published=true")
 	}
 	select {
 	case extra := <-reqCh:
@@ -226,8 +236,12 @@ func TestPublishRouteOverlaySnapshot(t *testing.T) {
 	overlay2 := []config.RouteOverlayEntry{
 		{Destination: "0.0.0.0/0", NextHop: "172.16.80.2", Policy: "wan-failover"},
 	}
-	if err := m.PublishRouteOverlaySnapshot(cfg, overlay2, nil); err != nil {
+	published, err = m.PublishRouteOverlaySnapshot(cfg, overlay2, nil)
+	if err != nil {
 		t.Fatalf("PublishRouteOverlaySnapshot(overlay2): %v", err)
+	}
+	if !published {
+		t.Fatal("changed overlay reported published=false")
 	}
 	select {
 	case req = <-reqCh:
@@ -259,8 +273,12 @@ func TestPublishRouteOverlaySnapshotWithoutHelper(t *testing.T) {
 	overlay := []config.RouteOverlayEntry{
 		{Destination: "0.0.0.0/0", NextHop: "172.16.80.1", Policy: "p"},
 	}
-	if err := m.PublishRouteOverlaySnapshot(nil, overlay, nil); err != nil {
+	published, err := m.PublishRouteOverlaySnapshot(nil, overlay, nil)
+	if err != nil {
 		t.Fatalf("PublishRouteOverlaySnapshot without helper: %v", err)
+	}
+	if published {
+		t.Fatal("helperless caching reported published=true")
 	}
 	got := m.routeOverlaySnapshot()
 	if len(got) != 1 || got[0].NextHop != "172.16.80.1" {

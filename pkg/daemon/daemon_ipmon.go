@@ -39,7 +39,11 @@ type routeOverlaySetter interface {
 // routeOverlayPublisher is the routes-only partial republish surface
 // of the userspace dataplane manager (#1827 Codex r2-2).
 type routeOverlayPublisher interface {
-	PublishRouteOverlaySnapshot(cfg *config.Config, overlay []config.RouteOverlayEntry, schedulerState map[string]bool) error
+	// PublishRouteOverlaySnapshot returns whether a snapshot was
+	// actually published; duplicate-skips return false so the caller
+	// does not bump the FIB generation for a no-op (Codex PR #1843
+	// MED).
+	PublishRouteOverlaySnapshot(cfg *config.Config, overlay []config.RouteOverlayEntry, schedulerState map[string]bool) (bool, error)
 	BumpFIBGeneration() uint32
 }
 
@@ -194,14 +198,22 @@ func (d *Daemon) actuateRouteOverlayLocked(cfg *config.Config) {
 	if d.scheduler != nil {
 		schedulerState = d.scheduler.ActiveState()
 	}
-	if err := pub.PublishRouteOverlaySnapshot(cfg, overlay, schedulerState); err != nil {
+	published, err := pub.PublishRouteOverlaySnapshot(cfg, overlay, schedulerState)
+	if err != nil {
 		slog.Warn("ip-monitoring: route overlay snapshot publish failed — NOT bumping FIB generation",
 			"err", err)
 		return
 	}
+	if !published {
+		// Duplicate-skip (content unchanged) or helperless caching:
+		// the dataplane routes did not move, so do not churn
+		// established-flow route caches with a FIB-generation bump
+		// (Codex PR #1843 MED).
+		return
+	}
 
-	// 3. Only after apply_snapshot success: invalidate cached flow
-	// routes so established flows re-resolve onto the new routes.
+	// 3. Only after a REAL apply_snapshot success: invalidate cached
+	// flow routes so established flows re-resolve onto the new routes.
 	pub.BumpFIBGeneration()
 	slog.Info("ip-monitoring route overlay actuated", "overlay_routes", len(overlay))
 }

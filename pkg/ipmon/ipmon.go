@@ -33,6 +33,7 @@ package ipmon
 import (
 	"log/slog"
 	"net"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -137,6 +138,11 @@ func (e *Engine) Stop() {
 // config change.
 func (e *Engine) Apply(cfg *config.IPMonitoringConfig, results []*rpm.ProbeResult) {
 	e.mu.Lock()
+	// Codex PR #1843 MED: actuate only when the overlay-relevant
+	// state actually changed. Compare the effective overlay before
+	// and after the policy swap — a no-op commit (or any commit with
+	// zero policies) must not schedule a routes-only FRR reload.
+	overlayBefore := e.activeOverlayLocked()
 	next := make(map[string]*policyState)
 	if cfg != nil {
 		for name, pol := range cfg.Policies {
@@ -155,12 +161,18 @@ func (e *Engine) Apply(cfg *config.IPMonitoringConfig, results []*rpm.ProbeResul
 	}
 	e.policies = next
 	e.seedResultsLocked(results)
-	e.evaluateLocked(e.now())
-	// A config change always re-actuates: the overlay view may have
-	// changed even without a policy state flip (routes edited).
-	e.markDirtyLocked(true)
+	changed := e.evaluateLocked(e.now())
+	if !changed && !slices.Equal(overlayBefore, e.activeOverlayLocked()) {
+		// Policy spec edited/removed while contributing to the
+		// overlay (the HIGH-1 re-injection path), or a survivor's
+		// winner changed — re-actuate.
+		changed = true
+	}
+	e.markDirtyLocked(changed)
 	e.mu.Unlock()
-	e.kickLoop()
+	if changed {
+		e.kickLoop()
+	}
 }
 
 // HandleTransition is the rpm.TransitionCallback sensor input.
