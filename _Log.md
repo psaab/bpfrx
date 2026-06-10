@@ -4854,3 +4854,6 @@ top.
 - **Timestamp**: 2026-06-10
   **Action**: #1844 SMR r3 PLAN-READY (fatal-boot semantics for eager dhcp.New folded); Codex r3 PLAN-READY doc saved + §4.6 wording nit folded
   **File(s)**: docs/research/1844-dhcp-nexthop/{plan.md,claude-smr-plan-r3.md,codex-plan-r3.md}
+- **Timestamp**: 2026-06-10
+  **Action**: #1844 CONVERGED PLAN-READY 3-way (Codex r4, AGY r3, SMR r3); footer + ledger finalized
+  **File(s)**: docs/research/1844-dhcp-nexthop/{plan.md,agy-plan-r3.md,codex-plan-r4.md,reviewer-ids.md}

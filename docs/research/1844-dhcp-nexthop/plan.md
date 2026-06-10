@@ -730,5 +730,18 @@ proves):**
 (`codex-plan-r1.md`, task-mq8jm9hz-g87plf, 3 findings), AGY
 PLAN-NEEDS-REVISION (`agy-plan-r1.md`,
 adversarial-review-mq8jmtlt-vq5w6c, 4 findings). No architectural
-objection from any reviewer; every finding folded into v2 (see Status
-header). Reviewer IDs in `reviewer-ids.md`.*
+objection from any reviewer; every finding folded into v2.*
+
+*Round-2 verdicts: Claude SMR PLAN-READY (`claude-smr-plan-r2.md`),
+Codex PLAN-NEEDS-REVISION (`codex-plan-r2.md`, task-mq8l6s4h-rdekdo —
+pending-FIB-bump retry High, folded in v2.2), AGY PLAN-NEEDS-REVISION
+(`agy-plan-r2.md`, adversarial-review-mq8l6y5w-ec8wvt — lazy d.dhcp
+race + first-apply ordering, folded in v2.3).*
+
+*Convergence: Codex PLAN-READY (`codex-plan-r3.md` on v2.2 +
+`codex-plan-r4.md`, task-mq8lk47y-pu6x81, on the v2.3 delta), AGY
+PLAN-READY (`agy-plan-r3.md`, adversarial-review-mq8les5i-irgbbn, on
+v2.3), Claude SMR PLAN-READY (`claude-smr-plan-r3.md`, with the
+fatal-boot-failure semantics folded). **PLAN-READY — three-way
+converged.** Reviewer IDs in `reviewer-ids.md`. Implementation gated
+on PR #1843 merging; `/engineer 1844` starts from this doc.*
