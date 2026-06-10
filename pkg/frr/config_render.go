@@ -83,6 +83,20 @@ func (m *Manager) generateInterfaceSettings(fc *FullConfig) string {
 // Multiple next-hops produce one line each (FRR creates ECMP).
 // Routes with NextTable are handled via ip rule (policy routing), not FRR.
 func (m *Manager) generateStaticRoute(sr *config.StaticRoute, vrfName string, rethMap map[string]string, ipv6NextHopInterfaces map[string]map[string]string) string {
+	return m.generateStaticRouteInTable(sr, vrfName, 0, rethMap, ipv6NextHopInterfaces)
+}
+
+// generateStaticRouteInTable is generateStaticRoute with an optional
+// kernel routing-table override (#1827 PR-2). tableID > 0 emits a
+// trailing "table <id>" so the route is installed into that kernel
+// table instead of the default one — this is how `instance-type
+// forwarding` routing instances render: no VRF device exists, but
+// their routes belong in the instance's dedicated table (the same
+// table the FBF/PBR `ip rule`s point at and the same table the
+// userspace dataplane files under `<ri>.inet.0`). vrfName and tableID
+// are mutually exclusive: FRR only accepts `table` on default-VRF
+// statics, and forwarding instances always render with vrfName == "".
+func (m *Manager) generateStaticRouteInTable(sr *config.StaticRoute, vrfName string, tableID int, rethMap map[string]string, ipv6NextHopInterfaces map[string]map[string]string) string {
 	if sr.NextTable != "" {
 		return "" // handled via ip rule in routing package
 	}
@@ -95,6 +109,8 @@ func (m *Manager) generateStaticRoute(sr *config.StaticRoute, vrfName string, re
 	vrfPart := ""
 	if vrfName != "" {
 		vrfPart = " vrf " + vrfName
+	} else if tableID > 0 {
+		vrfPart = fmt.Sprintf(" table %d", tableID)
 	}
 
 	// Discard or no next-hops: single Null0 line.
@@ -236,25 +252,40 @@ func renderBackupRouter(b *strings.Builder, fc *FullConfig) {
 
 // renderPreferredRoutes emits the ip-monitoring effective-route overlay
 // (#1827 PR-1b) as DISTANCE-1 statics — Static/1 on SRX — into the
-// master table or the entry's routing-instance VRF. The overlay is
-// already winner-resolved (one entry per (instance, prefix), pkg/ipmon
-// §4.1), so emission is mechanical. Reuses generateStaticRoute so RETH
-// name translation behaves exactly like configured statics.
+// master table, the entry's routing-instance VRF, or (for
+// `instance-type forwarding` instances, #1827 PR-2) the instance's
+// dedicated kernel table. The overlay is already winner-resolved (one
+// entry per (instance, prefix), pkg/ipmon §4.1), so emission is
+// mechanical. Reuses generateStaticRouteInTable so RETH name
+// translation behaves exactly like configured statics.
 func (m *Manager) renderPreferredRoutes(b *strings.Builder, fc *FullConfig) {
 	if len(fc.PreferredRoutes) == 0 {
 		return
 	}
 	for _, entry := range fc.PreferredRoutes {
 		vrfName := ""
+		tableID := 0
 		if entry.RoutingInstance != "" {
 			vrfName = "vrf-" + entry.RoutingInstance
+			for i := range fc.Instances {
+				if fc.Instances[i].Name != entry.RoutingInstance {
+					continue
+				}
+				// Forwarding instances carry no VRF device: render
+				// into their kernel table in the default VRF instead.
+				vrfName = fc.Instances[i].VRFName
+				if vrfName == "" {
+					tableID = fc.Instances[i].TableID
+				}
+				break
+			}
 		}
 		sr := &config.StaticRoute{
 			Destination: entry.Destination,
 			Preference:  1,
 			NextHops:    []config.NextHopEntry{{Address: entry.NextHop}},
 		}
-		b.WriteString(m.generateStaticRoute(sr, vrfName, fc.RethMap, fc.IPv6NextHopInterfaces))
+		b.WriteString(m.generateStaticRouteInTable(sr, vrfName, tableID, fc.RethMap, fc.IPv6NextHopInterfaces))
 	}
 	b.WriteString("!\n")
 }

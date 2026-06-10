@@ -97,11 +97,21 @@ func (d *Daemon) assembleFRRConfig(cfg *config.Config, overlay []config.RouteOve
 	}
 	for _, ri := range cfg.RoutingInstances {
 		vrfName := "vrf-" + ri.Name
+		tableID := 0
 		if ri.InstanceType == "forwarding" {
-			vrfName = "" // forwarding instances use the default table
+			// Forwarding instances have no VRF device; their statics
+			// render into the instance's dedicated kernel table so the
+			// kernel agrees with the FBF/PBR ip rules AND the userspace
+			// dataplane's `<ri>.inet.0` snapshot table (#1827 PR-2
+			// divergence fix — previously these leaked into the default
+			// table).
+			vrfName = ""
+			tableID = ri.TableID
 		}
 		fc.Instances = append(fc.Instances, frr.InstanceConfig{
+			Name:              ri.Name,
 			VRFName:           vrfName,
+			TableID:           tableID,
 			OSPF:              ri.OSPF,
 			OSPFv3:            ri.OSPFv3,
 			BGP:               ri.BGP,

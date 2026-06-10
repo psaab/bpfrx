@@ -72,8 +72,27 @@ func (m *Manager) executor() frrExecutor {
 }
 
 // InstanceConfig pairs routing config with a VRF name for per-instance generation.
+//
+// Two rendering modes (#1827 PR-2):
+//   - VRFName != "": a `virtual-router` instance backed by a kernel VRF
+//     device — statics render with a trailing `vrf <name>`.
+//   - VRFName == "" with TableID > 0: an `instance-type forwarding`
+//     instance — no VRF device exists; statics render with a trailing
+//     `table <id>` so the kernel table matches the FBF/PBR `ip rule`
+//     target and the userspace dataplane's `<ri>.inet.0` snapshot table
+//     (the FRR-vs-dataplane divergence fixed in #1827 PR-2).
 type InstanceConfig struct {
-	VRFName           string
+	// Name is the routing-instance name (without the "vrf-" prefix),
+	// used by renderPreferredRoutes to resolve an overlay entry's
+	// target instance. May be empty on legacy callers; lookup misses
+	// fall back to the historical "vrf-<name>" rendering.
+	Name string
+	// VRFName is the kernel VRF device name ("vrf-<name>"), or "" for
+	// forwarding instances (and, historically, the master table).
+	VRFName string
+	// TableID is the instance's kernel routing table; only consumed
+	// when VRFName == "" (forwarding instances).
+	TableID           int
 	OSPF              *config.OSPFConfig
 	OSPFv3            *config.OSPFv3Config
 	BGP               *config.BGPConfig
@@ -250,14 +269,16 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 	// 7. ip-monitoring preferred routes (admin distance 1, #1827).
 	m.renderPreferredRoutes(&b, fc)
 
-	// 8. Per-VRF static routes
+	// 8. Per-VRF static routes. Forwarding instances (VRFName == "",
+	// TableID > 0) render into their dedicated kernel table instead of
+	// the default one (#1827 PR-2 divergence fix).
 	for _, inst := range fc.Instances {
 		if len(inst.StaticRoutes) > 0 || len(inst.Inet6StaticRoutes) > 0 {
 			for _, sr := range inst.StaticRoutes {
-				b.WriteString(m.generateStaticRoute(sr, inst.VRFName, fc.RethMap, fc.IPv6NextHopInterfaces))
+				b.WriteString(m.generateStaticRouteInTable(sr, inst.VRFName, inst.TableID, fc.RethMap, fc.IPv6NextHopInterfaces))
 			}
 			for _, sr := range inst.Inet6StaticRoutes {
-				b.WriteString(m.generateStaticRoute(sr, inst.VRFName, fc.RethMap, fc.IPv6NextHopInterfaces))
+				b.WriteString(m.generateStaticRouteInTable(sr, inst.VRFName, inst.TableID, fc.RethMap, fc.IPv6NextHopInterfaces))
 			}
 			b.WriteString("!\n")
 		}

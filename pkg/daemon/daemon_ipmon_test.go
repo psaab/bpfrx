@@ -122,6 +122,35 @@ func TestAssembleFRRConfigCarriesOverlay(t *testing.T) {
 	}
 }
 
+// TestAssembleFRRConfigForwardingInstanceTable (#1827 PR-2): forwarding
+// instances map to InstanceConfig{VRFName: "", TableID: <kernel table>}
+// so FRR renders their statics with `table <id>` instead of polluting
+// the default table; virtual-router instances keep the VRF rendering.
+func TestAssembleFRRConfigForwardingInstanceTable(t *testing.T) {
+	d := &Daemon{}
+	cfg := &config.Config{}
+	cfg.RoutingInstances = []*config.RoutingInstanceConfig{
+		{Name: "ISP-B", InstanceType: "forwarding", TableID: 100,
+			StaticRoutes: []*config.StaticRoute{
+				{Destination: "0.0.0.0/0", NextHops: []config.NextHopEntry{{Address: "172.16.80.1"}}},
+			}},
+		{Name: "BLUE", InstanceType: "virtual-router", TableID: 101},
+	}
+
+	fc := d.assembleFRRConfig(cfg, nil)
+	if len(fc.Instances) != 2 {
+		t.Fatalf("Instances = %+v, want 2", fc.Instances)
+	}
+	fwd := fc.Instances[0]
+	if fwd.Name != "ISP-B" || fwd.VRFName != "" || fwd.TableID != 100 {
+		t.Fatalf("forwarding instance = %+v, want Name=ISP-B VRFName=\"\" TableID=100", fwd)
+	}
+	vr := fc.Instances[1]
+	if vr.Name != "BLUE" || vr.VRFName != "vrf-BLUE" || vr.TableID != 0 {
+		t.Fatalf("virtual-router instance = %+v, want Name=BLUE VRFName=vrf-BLUE TableID=0", vr)
+	}
+}
+
 // TestRPMHAGatingFilter exercises the §4.4 gating scope: only
 // policy-referenced or RETH-bound probes are gated, and only while the
 // node is secondary for the relevant RG.
