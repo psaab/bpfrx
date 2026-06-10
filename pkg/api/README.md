@@ -16,6 +16,13 @@ liveness/readiness. Prometheus metrics endpoint. SSE event streams.
 - `GET /health` — liveness/readiness. `CompileHealthFn` (#758) lets the
   daemon downgrade `/health` to 503 when a recent compile failed
   silently; without the callback it defaults to 200.
+  `ConfigPersistDegradedFn` (#1799, same injection pattern) downgrades
+  `/health` to 503 while the running active config failed to persist to
+  disk (HA config-sync or commit-confirmed auto-rollback hit a write
+  error and the configstore's background retry has not yet succeeded —
+  a restart would load a stale config). The same state is exported as
+  the `xpf_daemon_config_persist_degraded` 0/1 gauge, emitted even when
+  the dataplane is not loaded.
 - `GET /metrics` — Prometheus exposition.
 - `GET /api/v1/...` — REST mirrors of the gRPC API: sessions, routes,
   NAT, DHCP, IPsec, VRRP, OSPF, BGP, etc.
