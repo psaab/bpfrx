@@ -52,32 +52,39 @@ var chassisLeafMatrix = []chassisLeafCase{
 		reject:   []string{"0", "129", "asd", ""},
 	},
 	{
+		// Runtime accepts any >0 ms; ceiling is the Duration-conversion
+		// overflow point (config.MaxDurationMillis = 9223372036854).
 		name:     "heartbeat-interval",
 		leaf:     "heartbeat-interval",
 		template: "set chassis cluster heartbeat-interval %s",
-		accept:   []string{"10", "100", "200", "1000", "10000"},
-		reject:   []string{"0", "9", "10001", "-1", "200ms", "asd", ""},
+		accept:   []string{"1", "100", "200", "1000", "10000", "99999", "9223372036854"},
+		reject:   []string{"0", "-1", "9223372036855", "200ms", "asd", ""},
 	},
 	{
+		// Min-only: runtime honors any count >0 (no wire encoding).
 		name:     "heartbeat-threshold",
 		leaf:     "heartbeat-threshold",
 		template: "set chassis cluster heartbeat-threshold %s",
-		accept:   []string{"1", "3", "5", "8", "255"},
-		reject:   []string{"0", "256", "asd", ""},
+		accept:   []string{"1", "3", "5", "8", "255", "256", "100000"},
+		reject:   []string{"0", "-1", "asd", ""},
 	},
 	{
+		// 40959 is the last ms value encoding to the 12-bit max 4095 cs;
+		// 40960 is the first that aliases to 0 (Codex HIGH-2, PR #1845).
 		name:     "reth-advertise-interval",
 		leaf:     "reth-advertise-interval",
 		template: "set chassis cluster reth-advertise-interval %s",
-		accept:   []string{"10", "30", "100", "40950"},
-		reject:   []string{"0", "9", "40951", "asd", ""},
+		accept:   []string{"10", "30", "100", "40950", "40951", "40959"},
+		reject:   []string{"0", "9", "40960", "asd", ""},
 	},
 	{
+		// Runtime accepts any positive duration; ceiling is the
+		// Duration-conversion overflow point.
 		name:     "takeover-hold-time",
 		leaf:     "takeover-hold-time",
 		template: "set chassis cluster takeover-hold-time %s",
-		accept:   []string{"0", "5000", "3600000"},
-		reject:   []string{"-1", "3600001", "asd", ""},
+		accept:   []string{"0", "5000", "3600000", "3600001", "9223372036854"},
+		reject:   []string{"-1", "9223372036855", "asd", ""},
 	},
 	{
 		name:     "peer-fencing",
@@ -94,11 +101,13 @@ var chassisLeafMatrix = []chassisLeafCase{
 		reject:   []string{"0", "255", "-5", "asd", ""},
 	},
 	{
+		// Min-only: the runtime uses any configured count >0 verbatim as
+		// the burst length (Junos caps at 16; xpf does not).
 		name:     "gratuitous-arp-count",
 		leaf:     "gratuitous-arp-count",
 		template: "set chassis cluster redundancy-group 1 gratuitous-arp-count %s",
-		accept:   []string{"1", "3", "8", "16"},
-		reject:   []string{"0", "17", "asd", ""},
+		accept:   []string{"1", "3", "8", "16", "17", "1000"},
+		reject:   []string{"0", "-1", "asd", ""},
 	},
 	{
 		name:     "ip-monitoring global-weight",
@@ -263,5 +272,21 @@ func TestSchemaValidate_ChassisCluster_AcceptedValuesCompileAsWritten(t *testing
 	}
 	if len(cc.RedundancyGroups) != 1 || cc.RedundancyGroups[0].NodePriorities[0] != 200 {
 		t.Fatalf("compiled RG priorities diverge: %+v", cc.RedundancyGroups)
+	}
+}
+
+// Unit coverage for the min-only validator introduced for the
+// no-upper-bound leaves (Codex review, PR #1845).
+func TestValidateIntegerMin(t *testing.T) {
+	v := config.ValidateIntegerMin(1)
+	for _, ok := range []string{"1", "17", "1000", "9223372036854775807"} {
+		if err := v(ok, nil); err != nil {
+			t.Errorf("ValidateIntegerMin(1)(%q): unexpected error: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"0", "-1", "asd", "", "9223372036854775808"} {
+		if err := v(bad, nil); err == nil {
+			t.Errorf("ValidateIntegerMin(1)(%q): expected error, got nil", bad)
+		}
 	}
 }

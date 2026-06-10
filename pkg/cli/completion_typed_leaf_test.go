@@ -2,6 +2,7 @@ package cli
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/configstore"
@@ -132,6 +133,18 @@ func TestCompleteConfig_TransmitRate_PartialFiltersExamples(t *testing.T) {
 
 // --- #1319 PR 2: chassis-cluster typed leaves at the live CLI boundary ---
 
+// candDesc returns the description of the candidate with the given name
+// ("" if absent) so tests can assert the range text actually reaches the
+// operator, not just the candidate name.
+func candDesc(cands []completionCandidate, name string) string {
+	for _, c := range cands {
+		if c.name == name {
+			return c.desc
+		}
+	}
+	return ""
+}
+
 // `set chassis cluster heartbeat-interval ?` surfaces the <integer>
 // placeholder (with the range in its description) and the examples.
 func TestCompleteConfig_HeartbeatInterval_ShowsIntegerPlaceholderAndExamples(t *testing.T) {
@@ -142,6 +155,12 @@ func TestCompleteConfig_HeartbeatInterval_ShowsIntegerPlaceholderAndExamples(t *
 	)
 	if !hasCand(cands, "<integer>") {
 		t.Fatalf("expected <integer> placeholder at value slot, got %v", candNames(cands))
+	}
+	// The range text must reach the operator via the placeholder's
+	// description (Codex LOW, PR #1845: assert content, not just names).
+	if desc := candDesc(cands, "<integer>"); !strings.Contains(desc, ">= 1") ||
+		!strings.Contains(desc, "milliseconds") {
+		t.Fatalf("placeholder description should carry the range, got %q", desc)
 	}
 	for _, ex := range []string{"100", "200", "1000"} {
 		if !hasCand(cands, ex) {
@@ -172,6 +191,9 @@ func TestCompleteConfig_RGNodePriority_ShowsExamples(t *testing.T) {
 	)
 	if !hasCand(cands, "<integer>") {
 		t.Fatalf("expected <integer> placeholder, got %v", candNames(cands))
+	}
+	if desc := candDesc(cands, "<integer>"); !strings.Contains(desc, "1..254") {
+		t.Fatalf("priority placeholder description should carry the 1..254 range, got %q", desc)
 	}
 	for _, ex := range []string{"100", "200", "254"} {
 		if !hasCand(cands, ex) {

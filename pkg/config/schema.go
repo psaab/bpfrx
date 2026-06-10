@@ -818,33 +818,35 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			// xpf default is 100 ms (cluster.DefaultHeartbeatInterval,
 			// pkg/cluster/heartbeat.go:38) and deployed clusters run 200 ms
 			// (docs/ha-cluster-userspace.conf:66) — the Junos floor would
-			// reject xpf's own default scale. Runtime honors any value > 0
-			// (group_state.go:55); 0 is rejected here because the runtime
-			// silently substitutes the default for it (the silent-coerce
-			// trap this gate exists to close). Floor 10 ms: sub-10ms
-			// heartbeats flood the control link without improving the
-			// ~500 ms private-RG promotion window. Ceiling 10 s: with
-			// threshold 255 that is already a 42-minute detection time.
+			// reject xpf's own default scale. Runtime truth: any value > 0
+			// is honored (group_state.go:55); 0 is rejected here because
+			// the runtime silently substitutes the default for it (the
+			// silent-coerce trap this gate exists to close). Upper bound is
+			// the only genuine runtime ceiling — MaxDurationMillis, above
+			// which the time.Duration(ms)*time.Millisecond conversion
+			// (group_state.go:56) overflows negative and the heartbeat
+			// sender ticker panics. No schema-only cap (Codex, PR #1845).
 			"heartbeat-interval": {
 				args:          1,
 				valueType:     ValueInteger,
-				valueDesc:     "Heartbeat send interval in milliseconds (10..10000; xpf default 100, Junos allows 1000..2000)",
+				valueDesc:     "Heartbeat send interval in milliseconds (>= 1; xpf default 100, Junos allows 1000..2000)",
 				valueExamples: []string{"100", "200", "1000"},
-				validator:     ValidateInteger(10, 10000),
+				validator:     ValidateInteger(1, MaxDurationMillis),
 				children:      nil,
 			},
 			// Missed-heartbeat count before the peer is declared lost.
 			// xpf-DIVERGENT from Junos (3..8): xpf's default is 5
-			// (cluster.DefaultHeartbeatThreshold, heartbeat.go:41) but the
-			// runtime honors any value > 0 (group_state.go:58); 1..255
-			// keeps a byte-scale sanity cap. 0 rejected (silently means
-			// default at runtime).
+			// (cluster.DefaultHeartbeatThreshold, heartbeat.go:41) and the
+			// runtime honors any value > 0 (group_state.go:58) — a plain
+			// int counter, never wire-encoded. Min-only per runtime truth
+			// (Codex, PR #1845; the earlier 255 cap was schema-only). 0
+			// rejected (silently means default at runtime).
 			"heartbeat-threshold": {
 				args:          1,
 				valueType:     ValueInteger,
-				valueDesc:     "Missed heartbeats before peer is declared lost (1..255; xpf default 5, Junos allows 3..8)",
+				valueDesc:     "Missed heartbeats before peer is declared lost (>= 1; xpf default 5, Junos allows 3..8)",
 				valueExamples: []string{"3", "5", "8"},
-				validator:     ValidateInteger(1, 255),
+				validator:     ValidateIntegerMin(1),
 				children:      nil,
 			},
 			"control-link-recovery": {children: nil},
@@ -869,14 +871,17 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			// the ms value is integer-divided to centiseconds
 			// (pkg/vrrp/instance.go:915), so <10 ms encodes as Max Advert
 			// Int 0 on the wire; the wire field is 12 bits (RFC 5798,
-			// packet.go:48-49 masks with 0x0FFF), so >40950 ms silently
-			// aliases. 10..40950 is exactly the encodable range.
+			// packet.go:48-49 masks with 0x0FFF), so the last value that
+			// still encodes to the max 4095 cs is 40959 (40959/10 = 4095)
+			// and 40960 is the first that aliases (4096 & 0x0FFF = 0).
+			// 10..40959 is exactly the encodable range; non-multiples of
+			// 10 floor to the same centisecond the runtime sends.
 			"reth-advertise-interval": {
 				args:          1,
 				valueType:     ValueInteger,
-				valueDesc:     "RETH VRRP advertisement interval in milliseconds (10..40950; default 30)",
+				valueDesc:     "RETH VRRP advertisement interval in milliseconds (10..40959; default 30)",
 				valueExamples: []string{"30", "100"},
-				validator:     ValidateInteger(10, 40950),
+				validator:     ValidateInteger(10, 40959),
 				children:      nil,
 			},
 			"hitless-restart": {children: nil},
@@ -894,14 +899,17 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			// Milliseconds, xpf extension. 0 = immediate takeover once
 			// ready (cluster.DefaultTakeoverHoldTime, manager.go:243);
 			// negative is warned-and-ignored at runtime (group_state.go:70)
-			// and rejected here. Ceiling 1 h is a sanity cap — the runtime
-			// accepts any positive duration.
+			// and rejected here. Runtime truth: any positive duration is
+			// honored (group_state.go:74), so the only ceiling is
+			// MaxDurationMillis — the time.Duration(ms)*time.Millisecond
+			// overflow point (group_state.go:75). The earlier 1 h cap was
+			// schema-only and removed (Codex, PR #1845).
 			"takeover-hold-time": {
 				args:          1,
 				valueType:     ValueInteger,
-				valueDesc:     "Extra delay before takeover in milliseconds (0..3600000; 0 = immediate)",
+				valueDesc:     "Extra delay before takeover in milliseconds (>= 0; 0 = immediate)",
 				valueExamples: []string{"0", "5000"},
-				validator:     ValidateInteger(0, 3600000),
+				validator:     ValidateInteger(0, MaxDurationMillis),
 				children:      nil,
 			},
 			"no-reth-vrrp":           {children: nil},
@@ -925,15 +933,21 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 						children:      nil,
 					},
 				}},
-				// Junos vSRX: 1..16. Runtime honors any value > 0, else
-				// default 3 (pkg/daemon/daemon_ha_vip.go:475,
-				// pkg/vrrp/vrrp.go:94). Deployed: 8.
+				// Runtime truth: any configured count > 0 is used verbatim
+				// as the GARP/NA burst length (pkg/vrrp/instance.go GARP
+				// loop, pkg/cluster/garp.go SendGratuitousARPBurst — both
+				// only special-case <= 0 to the default), read via
+				// daemon_ha_vip.go:475 and vrrp.go:94. Min-only per the
+				// no-schema-only-caps doctrine (Codex, PR #1845) — Junos
+				// caps at 16, but enforcing that here would reject configs
+				// the runtime executes fine; a sanity cap belongs in the
+				// runtime first. Deployed: 8.
 				"gratuitous-arp-count": {
 					args:          1,
 					valueType:     ValueInteger,
-					valueDesc:     "Gratuitous ARP/NA burst count on failover (1..16; default 3)",
+					valueDesc:     "Gratuitous ARP/NA burst count on failover (>= 1; default 3, Junos allows 1..16)",
 					valueExamples: []string{"3", "8", "16"},
-					validator:     ValidateInteger(1, 16),
+					validator:     ValidateIntegerMin(1),
 					children:      nil,
 				},
 				"preempt": {children: nil},

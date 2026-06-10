@@ -76,8 +76,13 @@ Rules:
   annotation comment: xpf's own defaults sit OUTSIDE the Junos ranges
   for several chassis knobs (heartbeat-interval default 100 ms vs Junos
   1000..2000), and the killed #1319 Phase-3a plan copied Junos ranges
-  blindly — it would have rejected deployed configs. Cite the source
-  file:line for every bound next to the annotation.
+  blindly — it would have rejected deployed configs. **No schema-only
+  caps** (Codex review, PR #1845): if the runtime accepts any value, use
+  min-only semantics (`ValidateIntegerMin`) or the runtime-derived
+  ceiling (`MaxDurationMillis` for millisecond knobs that convert to
+  `time.Duration`); a sanity cap must be enforced in the runtime FIRST,
+  never in the schema alone. Cite the source file:line for every bound
+  next to the annotation.
 - **Fields only, do not add a `children` map just to type a leaf.** SetPath's
   grouping keys on `children == nil` (`ast_edit.go:196`); flipping a leaf to
   a container changes flat-set grouping for existing configs. The

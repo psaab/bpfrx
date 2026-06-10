@@ -1,6 +1,9 @@
 package grpcapi
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // #1319 PR 1 — frontend-boundary tests for typed-leaf value completion on
 // the gRPC completer (completeConfigPairs), which serves the remote `cli`
@@ -71,6 +74,18 @@ func TestCompleteConfigPairs_BufferSize_ShowsExamples(t *testing.T) {
 
 // --- #1319 PR 2: chassis-cluster typed leaves on the gRPC completer ---
 
+// pairDesc returns the description of the pair with the given name (""
+// if absent) so tests can assert the range text actually reaches the
+// remote operator, not just the candidate name.
+func pairDesc(pairs []completionPair, name string) string {
+	for _, p := range pairs {
+		if p.name == name {
+			return p.desc
+		}
+	}
+	return ""
+}
+
 func TestCompleteConfigPairs_HeartbeatInterval_ShowsIntegerPlaceholderAndExamples(t *testing.T) {
 	s := &Server{}
 	pairs := s.completeConfigPairs(
@@ -79,6 +94,12 @@ func TestCompleteConfigPairs_HeartbeatInterval_ShowsIntegerPlaceholderAndExample
 	)
 	if !hasPairName(pairs, "<integer>") {
 		t.Fatalf("expected <integer> placeholder at value slot, got %#v", pairs)
+	}
+	// The range text must reach the operator via the placeholder's
+	// description (Codex LOW, PR #1845: assert content, not just names).
+	if desc := pairDesc(pairs, "<integer>"); !strings.Contains(desc, ">= 1") ||
+		!strings.Contains(desc, "milliseconds") {
+		t.Fatalf("placeholder description should carry the range, got %q", desc)
 	}
 	for _, ex := range []string{"100", "200", "1000"} {
 		if !hasPairName(pairs, ex) {
@@ -93,6 +114,9 @@ func TestCompleteConfigPairs_RGNodePriority_ShowsExamples(t *testing.T) {
 		[]string{"set", "chassis", "cluster", "redundancy-group", "1", "node", "0", "priority"},
 		"",
 	)
+	if desc := pairDesc(pairs, "<integer>"); !strings.Contains(desc, "1..254") {
+		t.Fatalf("priority placeholder description should carry the 1..254 range, got %q", desc)
+	}
 	for _, ex := range []string{"100", "200", "254"} {
 		if !hasPairName(pairs, ex) {
 			t.Fatalf("expected priority example %q, got %#v", ex, pairs)

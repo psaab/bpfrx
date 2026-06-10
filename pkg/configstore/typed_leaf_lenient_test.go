@@ -92,23 +92,25 @@ func TestSyncApply_ToleratesTypedLeafViolation(t *testing.T) {
 // (legal when persisted; the range was typed later) must not fail boot.
 // The compiler keeps accepting it verbatim, so running behavior is
 // preserved; the warning surfaces the condition and the next strict
-// commit rejects it.
+// commit rejects it. cluster-id 999 is the probe value: it violates the
+// runtime-derived 0..255 bound (one byte of the RETH virtual MAC) but
+// strconv.Atoi in compileChassis accepts it.
 func TestLoad_ToleratesStoredOutOfRangeChassisLeaf(t *testing.T) {
 	cfgPath := filepath.Join(t.TempDir(), "config")
 	writeStoredConfig(t, cfgPath,
-		"set chassis cluster cluster-id 1",
-		"set chassis cluster heartbeat-interval 99999")
+		"set chassis cluster cluster-id 999",
+		"set chassis cluster heartbeat-interval 200")
 
 	s := New(cfgPath)
 	if err := s.Load(); err != nil {
-		t.Fatalf("Load() must tolerate stored out-of-range heartbeat-interval, got: %v", err)
+		t.Fatalf("Load() must tolerate stored out-of-range cluster-id, got: %v", err)
 	}
 	active := s.ActiveConfig()
 	if active == nil {
 		t.Fatal("ActiveConfig() is nil after tolerated Load")
 	}
 	// Verbatim compile — running behavior preserved, no silent rewrite.
-	if active.Chassis.Cluster == nil || active.Chassis.Cluster.HeartbeatInterval != 99999 {
+	if active.Chassis.Cluster == nil || active.Chassis.Cluster.ClusterID != 999 {
 		t.Fatalf("stored out-of-range value must compile verbatim, got %+v", active.Chassis.Cluster)
 	}
 
@@ -120,8 +122,8 @@ func TestLoad_ToleratesStoredOutOfRangeChassisLeaf(t *testing.T) {
 	if err == nil {
 		t.Fatal("CommitCheck must reject the out-of-range stored value, got nil")
 	}
-	if !strings.Contains(err.Error(), "heartbeat-interval") {
-		t.Fatalf("CommitCheck error should reference heartbeat-interval: %v", err)
+	if !strings.Contains(err.Error(), "cluster-id") {
+		t.Fatalf("CommitCheck error should reference cluster-id: %v", err)
 	}
 }
 
