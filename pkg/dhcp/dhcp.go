@@ -100,6 +100,17 @@ type Manager struct {
 	v4opts          map[string]*DHCPv4Options    // interface name -> DHCPv4 options
 	v6opts          map[string]*DHCPv6Options    // interface name -> DHCPv6 options
 	onAddressChange func()
+	// onGatewayChange fires whenever the gateway-relevant lease state
+	// of any interface changes (#1844): a lease committed with a
+	// new/changed gateway, a first lease acquired, or a lease record
+	// removed on client termination. Immutable after New (a setter on
+	// a live manager would be a data race — client goroutines read
+	// this outside m.mu) and ALWAYS fired outside m.mu, so the
+	// consumer (the ipmon engine's NotifyNextHopChange, whose resolver
+	// calls back into LeaseFor under Engine.mu → dhcp.mu) can never
+	// deadlock against us. Bounded-blocking: the hook may wait on
+	// Engine.mu held across an overlay build.
+	onGatewayChange func()
 	nlHandle        *netlink.Handle
 	recompileTimer  *time.Timer
 	stateDir        string
@@ -112,8 +123,11 @@ type Manager struct {
 
 // New creates a DHCP manager. stateDir is where DUID files are persisted.
 // The onAddressChange callback is called (debounced by 2 seconds) when a
-// lease changes an interface address.
-func New(stateDir string, onAddressChange func()) (*Manager, error) {
+// lease changes an interface address. The onGatewayChange callback (#1844,
+// may be nil) fires — undebounced, outside m.mu — whenever gateway-relevant
+// lease state changes: first lease, gateway delta on commit, or lease
+// record removal on client termination; see the Manager field doc.
+func New(stateDir string, onAddressChange, onGatewayChange func()) (*Manager, error) {
 	nlh, err := netlink.NewHandle()
 	if err != nil {
 		return nil, fmt.Errorf("netlink handle: %w", err)
@@ -127,9 +141,20 @@ func New(stateDir string, onAddressChange func()) (*Manager, error) {
 		v4opts:          make(map[string]*DHCPv4Options),
 		v6opts:          make(map[string]*DHCPv6Options),
 		onAddressChange: onAddressChange,
+		onGatewayChange: onGatewayChange,
 		nlHandle:        nlh,
 		stateDir:        stateDir,
 	}, nil
+}
+
+// fireGatewayChange invokes the optional gateway-change hook. Callers
+// must NOT hold m.mu (the hook's consumer takes Engine.mu and its
+// resolver re-enters LeaseFor — firing under m.mu would invert the
+// one-way Engine.mu → dhcp.mu lock order).
+func (m *Manager) fireGatewayChange() {
+	if m.onGatewayChange != nil {
+		m.onGatewayChange()
+	}
 }
 
 // SetDUIDType configures the DUID type for an interface's DHCPv6 client.
@@ -278,6 +303,18 @@ func (m *Manager) Start(ctx context.Context, ifaceName string, af AddressFamily)
 // interface address the run loop left behind (some cancellation
 // interleavings exit the run loop without hitting its own ctx.Done
 // cleanup branches).
+//
+// #1844: this is the lease-record removal owner — it covers the
+// terminal exits the run-loop ctx.Done branches never see (cancel
+// mid-exchange, DHCPv4 max-retransmission, DHCPv6 link-local abort) —
+// so the gateway-change hook fires here unconditionally on the real
+// cleanup path. Firing only from the run-loop inline delete sites
+// would leave a stale gateway in the ip-monitoring overlay after such
+// an exit (a silent blackhole). The successor-guard early return does
+// NOT fire (this call changed no lease state). If lease expiry is ever
+// implemented per RFC 2131 §4.4.5, the record removal must keep
+// routing through a hook-firing path so the overlay withdraws in
+// lock-step with the address.
 func (m *Manager) finishClient(key clientKey, dc *dhcpClient) {
 	m.mu.Lock()
 	cur, ok := m.clients[key]
@@ -301,6 +338,7 @@ func (m *Manager) finishClient(key clientKey, dc *dhcpClient) {
 	if lease != nil && lease.Address.IsValid() {
 		m.removeAddress(key.iface, lease)
 	}
+	m.fireGatewayChange()
 }
 
 // Renew restarts the DHCP client for the specified interface and address

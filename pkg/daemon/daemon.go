@@ -83,13 +83,20 @@ type Daemon struct {
 	// `name-server` / expiring the last lease clears the file). Written
 	// once after the boot apply and read only under applySem in
 	// reconcileDNSLocked.
-	dnsBootDone                bool
-	dhcpServer                 *dhcpserver.Manager
-	feeds                      *feeds.Manager
-	rpm                        *rpm.Manager
-	rpmMu                      sync.Mutex // serializes reconcileRPM callers (#1827)
-	activeRPMHash              [32]byte   // config-hash gate for RPM re-apply (#1827)
-	ipmon                      *ipmon.Engine
+	dnsBootDone   bool
+	dhcpServer    *dhcpserver.Manager
+	feeds         *feeds.Manager
+	rpm           *rpm.Manager
+	rpmMu         sync.Mutex // serializes reconcileRPM callers (#1827)
+	activeRPMHash [32]byte   // config-hash gate for RPM re-apply (#1827)
+	ipmon         *ipmon.Engine
+	// pendingFIBBump records an UNCONFIRMED FIB-generation bump after a
+	// successful route-overlay publish (#1844, Codex plan r2-1): the
+	// bump_fib_generation control message failed, so the next actuation
+	// must retry the bump even when its publish is a duplicate-skip —
+	// otherwise cached flow routes stay pinned to pre-failover paths.
+	// Mutated only in actuateRouteOverlayLocked under applySem.
+	pendingFIBBump             bool
 	flowExporter               *flowexport.Exporter
 	flowCancel                 context.CancelFunc
 	flowWg                     sync.WaitGroup

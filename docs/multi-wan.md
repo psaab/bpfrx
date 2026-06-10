@@ -197,11 +197,35 @@ routing, and only on double fault).
 
 ## v1 limitations
 
-- **Static uplink next-hops required.** The dataplane FIB is
-  config-derived and carries no DHCP-learned routes, so a
-  DHCP-addressed WAN cannot carry fast-path transit without a static
-  default; ip-monitoring next-hops are explicit by design. DHCP-uplink
-  support is a follow-up (filed alongside PR-1b per the plan).
+- **DHCP-tracked next-hops (#1844, shipped).** A preferred-route
+  next-hop may name a DHCP interface unit instead of a literal IP:
+
+  ```
+  set services ip-monitoring policy wan-failover then preferred-route route 0.0.0.0/0 next-hop ge-0/0/3.0
+  ```
+
+  The named unit must be configured with `family inet dhcp` (Junos
+  configured name, `<ifd>.<unit>`; v4 destinations only; management
+  interfaces rejected). The injected route then tracks the unit's
+  DHCP-learned gateway: the ipmon engine resolves it at every overlay
+  computation, and lease events (first lease, gateway change on
+  renewal, lease-record removal) re-actuate through the routes-only
+  actuator. While the unit has no lease/gateway, the candidate is
+  skipped BEFORE winner selection — a resolvable losing candidate for
+  the same prefix wins instead — and surfaces in `show services
+  ip-monitoring status` plus the `xpf_ipmon_unresolved_next_hops`
+  gauge. During a DHCP re-acquisition window (T2 rebind failed, fresh
+  DORA in progress) the last-known gateway is kept — deliberate parity
+  with the AD-200 FRR DHCP default route in the same window. A manual
+  `request dhcp client renew` removes the lease record first, so an
+  active failover route is withdrawn and re-injected once the new
+  lease lands.
+- **DHCP uplink as PRIMARY fast-path uplink still needs a static
+  default.** The dataplane FIB baseline is config-derived and carries
+  no DHCP-learned routes; #1844 makes a DHCP uplink usable as the
+  *failover target* (the overlay carries the resolved next-hop into
+  both FRR and the snapshot), not as the primary fast-path uplink
+  without a static default.
 - Failover actuation is a differential frr-reload + one snapshot push
   per debounce window; detection time (probe interval × threshold)
   dominates end-to-end failover latency.

@@ -7,10 +7,19 @@ restarts so the same client identifier returns to the same lease.
 ## Entry points
 
 - `Manager` — `dhcp.go`.
-- `New(stateDir string, onAddressChange func()) (*Manager, error)` —
-  `dhcp.go`. The `onAddressChange` callback fires (debounced 2 s)
+- `New(stateDir string, onAddressChange, onGatewayChange func()) (*Manager, error)`
+  — `dhcp.go`. The `onAddressChange` callback fires (debounced 2 s)
   when any client's lease **content** changes — address, gateway, DNS,
   or delegated prefixes; not on a content-identical renewal (#1777).
+  The `onGatewayChange` callback (#1844, nil-able) fires —
+  undebounced, always outside `m.mu` — on gateway-relevant lease
+  state changes only: first lease committed, gateway delta on a
+  commit (strictly narrower than `onAddressChange`), or lease-record
+  removal in `finishClient` (every terminal client exit). It is an
+  immutable constructor argument, never a setter — client goroutines
+  read it outside `m.mu`, so mutation on a live manager would be a
+  data race. Consumer: the ip-monitoring engine's
+  `NotifyNextHopChange` (interface-typed preferred-route next-hops).
 - `Lease` — `dhcp.go`. Result of one DHCP negotiation.
 - `DelegatedPrefix` — `dhcp.go`. From DHCPv6 PD.
 - `ClientSpec` — `reconcile.go`. One desired client derived from
@@ -122,3 +131,13 @@ External only: `github.com/insomniacslk/dhcp`, `github.com/vishvananda/netlink`.
   address reconciliation on DHCP-marked interfaces.
 - DHCP-learned default routes go into FRR with admin distance 200 — lower
   priority than static routes, so a configured static default wins.
+- **Lease records are NOT expired by the clock.** During a failed
+  re-acquisition (T2 rebind failed, fresh DORA in progress) the lease
+  record and the kernel address intentionally persist until replaced
+  — consumers (FRR DHCP routes, ip-monitoring resolved next-hops)
+  keep the last-known gateway. This deliberately diverges from RFC
+  2131 §4.4.5 (an expired lease should stop being used). **Coupling
+  rule (#1844):** if expiry is ever implemented, the lease-record
+  removal MUST route through a path that fires `onGatewayChange`
+  (`finishClient` already does), so the ip-monitoring overlay
+  withdraws its resolved next-hop in lock-step with the address.

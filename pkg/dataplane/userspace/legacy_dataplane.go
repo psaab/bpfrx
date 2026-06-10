@@ -219,10 +219,10 @@ func (a *LegacyDataPlaneAdapter) PublishRouteOverlaySnapshot(cfg *config.Config,
 	return m.PublishRouteOverlaySnapshot(cfg, overlay, schedulerState)
 }
 
-func (a *LegacyDataPlaneAdapter) BumpFIBGeneration() uint32 {
+func (a *LegacyDataPlaneAdapter) BumpFIBGeneration() (uint32, error) {
 	m, err := a.managerOrErr()
 	if err != nil {
-		return 0
+		return 0, err
 	}
 	return m.BumpFIBGeneration()
 }

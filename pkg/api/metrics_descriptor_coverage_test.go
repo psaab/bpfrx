@@ -369,6 +369,9 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 				Routes: []config.RouteOverlayEntry{
 					{Destination: "0.0.0.0/0", NextHop: "172.16.80.1", Policy: "wan-failover"},
 				},
+				// #1844: a skipped interface-typed route, so the
+				// unresolved-next-hops gauge emits a non-zero value.
+				UnresolvedRoutes: []string{"10.0.0.0/8"},
 			}}
 		},
 	}
@@ -378,7 +381,7 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 	// When the manager is available we wire it (Leases() is empty) and
 	// assert its sentinel; otherwise we skip just that family.
 	dhcpWired := false
-	if dhcpMgr, err := dhcp.New(t.TempDir(), nil); err == nil {
+	if dhcpMgr, err := dhcp.New(t.TempDir(), nil, nil); err == nil {
 		defer dhcpMgr.Close()
 		srv.dhcp = dhcpMgr
 		dhcpWired = true

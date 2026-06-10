@@ -75,11 +75,11 @@ func (m *Manager) NotifyLinkCycle() {} // no-op: eBPF programs survive link cycl
 
 func (m *Manager) SyncFabricState() {} // no-op: eBPF uses fabric_fwd BPF map directly
 
-func (m *Manager) BumpFIBGeneration() uint32 {
+func (m *Manager) BumpFIBGeneration() (uint32, error) {
 	zm, ok := m.maps["fib_gen_map"]
 	if !ok {
 		slog.Warn("fib_gen_map not found, cannot bump FIB generation")
-		return 0
+		return 0, fmt.Errorf("fib_gen_map not found")
 	}
 	var key uint32
 	var gen uint32
@@ -89,8 +89,8 @@ func (m *Manager) BumpFIBGeneration() uint32 {
 	gen++
 	if err := zm.Update(key, gen, ebpf.UpdateAny); err != nil {
 		slog.Warn("failed to bump FIB generation", "err", err)
-		return gen - 1
+		return gen - 1, fmt.Errorf("bump fib generation: %w", err)
 	}
 	slog.Info("bumped FIB generation counter", "generation", gen)
-	return gen
+	return gen, nil
 }

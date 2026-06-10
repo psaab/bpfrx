@@ -1044,17 +1044,28 @@ func (m *Manager) bumpGeneration() uint64 {
 // changed since the last publish, an incremental neighbor update is sent first.
 // This avoids the full buildSnapshot() + apply_snapshot round-trip that was the
 // primary source of control socket contention during route convergence.
-func (m *Manager) BumpFIBGeneration() uint32 {
-	newGen := m.bpfShim.BumpFIBGeneration()
+//
+// Error contract (#1844): a non-nil error means the helper-side
+// invalidation is NOT confirmed (shim map bump or the
+// bump_fib_generation control message failed) — callers with retry
+// semantics (the ip-monitoring actuator's pendingFIBBump) must retry.
+// The helperless / no-snapshot early returns are SUCCESS (nil): with
+// no published snapshot there are no cached flow routes to invalidate,
+// and the next full apply carries its own invalidation. A failed
+// incremental NEIGHBOR update is deliberately NOT an error — it has
+// its own retry semantics (the cached neighbor view is only advanced
+// on success, so the next bump re-diffs and re-sends).
+func (m *Manager) BumpFIBGeneration() (uint32, error) {
+	newGen, shimErr := m.bpfShim.BumpFIBGeneration()
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if m.lastSnapshot == nil || m.lastSnapshot.Config == nil {
-		return newGen
+		return newGen, nil
 	}
 	if m.proc == nil || m.proc.Process == nil {
-		return newGen
+		return newGen, nil
 	}
 
 	// Update the cached snapshot's FIB generation without rebuilding.
@@ -1100,8 +1111,9 @@ func (m *Manager) BumpFIBGeneration() uint32 {
 		},
 	}, &status); err != nil {
 		slog.Warn("userspace: failed to bump FIB generation", "err", err)
+		return newGen, fmt.Errorf("bump fib generation: %w", err)
 	}
-	return newGen
+	return newGen, shimErr
 }
 
 // neighborIndexKey is the (ifindex, ip-string) key for the

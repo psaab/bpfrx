@@ -13,6 +13,22 @@ func LinuxIfName(name string) string {
 	return strings.ReplaceAll(name, "/", "-")
 }
 
+// DHCPLeaseIfName returns the Linux interface name under which the
+// DHCP manager keys the lease for the given configured interface unit:
+// LinuxIfName(ifName), plus a ".<vlan-id>" suffix when the unit is
+// 802.1Q tagged. Note the suffix is the unit's VLAN ID, NOT its unit
+// number — the two coincide by convention but are distinct concepts,
+// bridged only here. Shared by the daemon's buildDHCPClientSpecs and
+// the ip-monitoring interface-typed next-hop compiler (#1844) so the
+// two derivations can never drift.
+func DHCPLeaseIfName(ifName string, unit *InterfaceUnit) string {
+	base := LinuxIfName(ifName)
+	if unit != nil && unit.VlanID > 0 {
+		return fmt.Sprintf("%s.%d", base, unit.VlanID)
+	}
+	return base
+}
+
 // InterfaceSlot extracts the FPC slot number from a Junos interface name.
 // "ge-0/0/7" → 0, "ge-7/0/7" → 7, "xe-3/1/2" → 3.
 // Returns -1 if the name doesn't match the <type>-N/N/N pattern.

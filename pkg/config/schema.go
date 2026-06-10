@@ -1383,12 +1383,12 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				"then": {desc: "Actions while the matched probe is FAILED", children: map[string]*schemaNode{
 					"preferred-route": {desc: "Preferred routes injected at route preference 1", children: map[string]*schemaNode{
 						"route": {args: 1, desc: "Destination prefix to inject", placeholder: "<prefix>", children: map[string]*schemaNode{
-							"next-hop":         {args: 1, desc: "Next-hop IP for the injected route", children: nil},
+							"next-hop":         {args: 1, desc: "Next-hop IP for the injected route, or a DHCP interface unit (<ifd>.<unit>) to track its learned gateway", children: nil},
 							"preferred-metric": {args: 1, desc: "Metric among injected routes for the same prefix (tie-break)", children: nil},
 						}},
 						"routing-instance": {args: 1, desc: "Inject into a routing instance", placeholder: "<instance>", children: map[string]*schemaNode{
 							"route": {args: 1, desc: "Destination prefix to inject", placeholder: "<prefix>", children: map[string]*schemaNode{
-								"next-hop":         {args: 1, desc: "Next-hop IP for the injected route", children: nil},
+								"next-hop":         {args: 1, desc: "Next-hop IP for the injected route, or a DHCP interface unit (<ifd>.<unit>) to track its learned gateway", children: nil},
 								"preferred-metric": {args: 1, desc: "Metric among injected routes for the same prefix (tie-break)", children: nil},
 							}},
 						}},
