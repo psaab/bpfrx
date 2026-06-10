@@ -2,7 +2,15 @@
 
 ## 1. Status
 
-**v2 — CONVERGED (3-way PLAN-READY family, all round-1 findings folded).**
+**v3 — CONVERGED (3-way PLAN-READY family, all findings folded).**
+
+Round-2 verdicts on v2 @ `8ac561e05`: Claude SMR **PLAN-READY**
+(`claude-smr-plan-r2.md`); Codex **PLAN-READY-WITH-FINDINGS** — all four
+r1 findings verified RESOLVED, 1 new LOW (the §12 ledger overclaimed Q7
+convergence; wording fixed in v3, see the §12 adoption note)
+(`codex-plan-r2.md`); AGY **PLAN-READY** — all r1 findings verified
+RESOLVED, fold wording checked against source, zero new findings
+(`agy-plan-r2.md`). No design point remains contested.
 
 Round-1 verdicts on v1.1 @ `87ba54b79`: Claude SMR
 **PLAN-READY-WITH-FINDINGS** (2 findings, both folded pre-dispatch,
@@ -408,7 +416,8 @@ showed.
 
 ## 12. Open questions for adversarial review
 
-> **Round-1 resolutions (Codex + AGY + Claude SMR, convergent):**
+> **Round-1 resolutions (as adopted in v2; convergent except where
+> noted):**
 > Q1 → reject-don't-merge confirmed unanimously (filler semantics =
 > silent behavior change when a map is added later; with a scheduler-map
 > the synthetic queue does not exist, `forwarding_build/cos.rs:263-320`
@@ -424,8 +433,13 @@ showed.
 > at close-out (correctness for low-rate framed links, dead weight for
 > the loss cluster). Q7 → defaults NOT frozen here; inherit the #1829
 > Phase-2-validated values, cookbook carries the ≥1.5×-RTT /
-> interval≥max(100 ms, baseline-RTT) guidance (Codex r1 #3, AGY r1 #4;
-> in-tree contract `types_cos.go:90-96`).
+> interval≥max(100 ms, baseline-RTT) guidance (in-tree contract
+> `types_cos.go:90-96`). **Adoption note (Codex r2 LOW):** this adopts
+> Codex r1 #3's unfreeze position; AGY's recorded r1 Q7 answer had
+> proposed keeping 5 ms/100 ms with cookbook warnings
+> (`agy-plan-r1.md:65`). AGY r2 verified the adopted unfrozen
+> resolution as RESOLVED, so the outcome is converged even though the
+> round-1 answers differed.
 
 1. **Q1 (interaction rule):** is reject-don't-merge for
    `smart-queueing` + `scheduler-map` right, or should the leaf act as a
