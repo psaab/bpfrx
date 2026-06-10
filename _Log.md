@@ -4839,3 +4839,6 @@ top.
 - **Timestamp**: 2026-06-10
   **Action**: #1844 research plan v1 drafted (DHCP-learned next-hops for ip-monitoring preferred routes; targets post-#1843 tree)
   **File(s)**: docs/research/1844-dhcp-nexthop/plan.md
+- **Timestamp**: 2026-06-10
+  **Action**: #1844 plan v2 — folded round-1 findings (finishClient fire site, constructor-arg hook, publish/bump contract, spelling normalization, mgmt rejection); saved r1 review docs
+  **File(s)**: docs/research/1844-dhcp-nexthop/{plan.md,claude-smr-plan-r1.md,codex-plan-r1.md,agy-plan-r1.md,reviewer-ids.md}

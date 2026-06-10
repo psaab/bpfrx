@@ -1,6 +1,18 @@
 # #1844 ip-monitoring: DHCP-learned-uplink support for preferred-route next-hops
 
-**Status:** DRAFT v1 — research round 1
+**Status:** DRAFT v2 — folds all round-1 findings (Claude SMR + Codex +
+AGY, all PLAN-NEEDS-REVISION, docs beside this file). Headline folds:
+(1) lease-delete hook fire site corrected to `finishClient` (the real
+cleanup owner — SMR-1/Codex-1/AGY-1 convergent, Codex with a verified
+cancel-mid-exchange counterexample); (2) hook becomes an immutable
+`dhcp.New` constructor argument (AGY-2 setter data race); (3)
+`PublishRouteOverlaySnapshot` return contract distinguishes
+published-vs-skipped so a same-content actuation no longer bumps FIB
+generation (Codex-2); (4) spelling/normalization + mgmt-interface
+rejection pinned down (SMR-3/SMR-4); (5) helper type fixed to
+`*InterfaceUnit` (AGY-3); plus the Low/doc folds (Renew transient,
+RFC 2131 note, PolicyStatus.UnresolvedRoutes, gauge purity,
+bounded-blocking wording).
 
 **Base:** this plan targets the post-#1843 tree. It is written and
 verified against `origin/engineer/1827-ipmon-pr1` @ `d18071d5c` (the
@@ -135,9 +147,18 @@ type PreferredRoute struct {
 `validateIPMonitoringStrict`):
 
 1. Value parses as IP → literal path, all existing checks unchanged.
-2. Otherwise it must parse as `<ifd>.<unit>` where the unit exists in
-   `cfg.Interfaces` — else the existing "not a valid IP address" error
-   is extended to "…not a valid IP address or DHCP interface unit".
+   (Degenerate corner, accepted: an interface hypothetically named so
+   that `<ifd>.<unit>` forms a dotted-quad would parse as the IP
+   literal — no such names exist in the vSRX naming scheme; AGY r1
+   ratified this as a non-issue.)
+2. Otherwise the value must split (at the LAST `.`) into
+   `<ifd>.<unit-number>` where `<ifd>` is **exactly an interface name
+   as configured under `interfaces`** (Junos form, e.g. `ge-0/0/3`) and
+   `<unit-number>` is a configured unit of it. Normalization rules
+   (SMR r1-3): the dashed Linux form is NOT accepted; a bare ifd
+   without `.unit` gets a distinct error ("interface-typed next-hop
+   requires <ifd>.<unit>"); anything else falls to "not a valid IP
+   address or DHCP interface unit".
 3. The destination family must be **inet** (v4). `inet6` destinations
    with an interface-typed next-hop are commit-rejected with a pointer
    to the follow-up (§4.5 rationale: DHCPv6 gateways are RA-derived
@@ -146,14 +167,26 @@ type PreferredRoute struct {
 4. The named unit must have `family inet dhcp` (`unit.DHCP`) — the
    route tracks a DHCP gateway by definition; a static-addressed unit
    is rejected ("interface-typed next-hop requires family inet dhcp on
-   <unit>").
+   <unit>"). No extra tunnel/loopback rejection needed: such units
+   cannot have `unit.DHCP` (Codex r1 Q1, SMR r1 Q1 concur).
 5. The lease key stored in `NextHopInterface` is derived by a **shared
    helper** extracted from `buildDHCPClientSpecs`'s inline logic —
-   `config.DHCPLeaseIfName(ifName string, unit *UnitConfig) string`
-   (LinuxIfName + vlan suffix) — used by BOTH the spec builder and the
-   compiler so the two derivations can never drift. (The helper lives
-   in `pkg/config` because the compiler cannot import `pkg/daemon`;
-   `buildDHCPClientSpecs` switches to it in the same commit.)
+   `config.DHCPLeaseIfName(ifName string, unit *InterfaceUnit) string`
+   (`LinuxIfName(ifName)` + `".<VlanID>"` when `unit.VlanID > 0`;
+   type per AGY r1-3) — used by BOTH the spec builder and the compiler
+   so the two derivations can never drift. (The helper lives in
+   `pkg/config` because the compiler cannot import `pkg/daemon`;
+   `buildDHCPClientSpecs` switches to it in the same commit.) Note the
+   operator writes the **unit number**; the lease-key suffix is the
+   unit's **vlan-id** — distinct concepts, bridged only inside the
+   helper (SMR r1-3c). The v1 example holds because that unit's
+   vlan-id is 50.
+6. Interface-typed next-hops naming **management interfaces**
+   (`fxp*`, `em*`, `fab*` — the same name classes the daemon binds to
+   the mgmt VRF) are commit-rejected (SMR r1-4): `collectDHCPRoutes`
+   deliberately excludes mgmt-VRF leases from FRR
+   (`daemon_flow.go:31-33`); an overlay route resolved through the
+   mgmt gateway would leak management routing into the default table.
 
 Schema: no structural change; the `next-hop` desc string gains "…or
 DHCP interface unit". `docs/multi-wan.md` limitation paragraph is
@@ -207,52 +240,69 @@ the new hook in §4.3 fires outside the lock, mirroring how
 **Display:** `PolicyStatus.Routes` carries resolved entries, so `show
 services ip-monitoring status` shows the live gateway. An
 interface-typed route that is currently unresolvable does not appear in
-`Routes`; `display.go` adds an "unresolved (no DHCP lease)" annotation
-per policy by diffing `cfg`-declared routes against resolved ones (kept
-cosmetic; not a state-machine input). New gauge
-`xpf_ipmon_unresolved_next_hops` (count of skipped candidates at last
-overlay computation) for alerting.
+`Routes`; `PolicyStatus` gains `UnresolvedRoutes []string` (destination
+prefixes whose candidate was skipped), populated in `Status()`, so
+`display.go` stays dumb (SMR r1-6). New gauge
+`xpf_ipmon_unresolved_next_hops`: the skip count is a **return value**
+of the overlay computation (keeping `activeOverlayLocked` pure, SMR
+r1-7), refreshed by any caller — `Status()`/`RoutesApplied()` included
+— so a metrics scrape never needs an actuation to be current.
 
 ### 4.3 The re-resolution trigger — narrow hook, NOT applyConfig
 
 The #1844 body names the #1777 commit-lease path as the hook; the
 #1827 plan's hard rule is that route actuation must ride the
 routes-only actuator, never a full apply. Both are satisfied with one
-optional callback on `dhcp.Manager`:
+optional callback on `dhcp.Manager`, passed as an **immutable
+constructor argument** (AGY r1-2: a `SetGatewayChangeHook` setter on a
+live manager is a data race — client goroutines read the hook pointer
+outside `m.mu`; the constructor argument matches how `onAddressChange`
+is already wired at `dhcp.go:116`):
 
 ```go
-// SetGatewayChangeHook registers a callback fired whenever the
-// gateway-relevant lease state of any interface changes: lease
-// committed with a new/changed gateway, first lease acquired, or
-// lease record removed (client stopped). Fired outside m.mu.
-func (m *Manager) SetGatewayChangeHook(hook func())
+// onGatewayChange (third dhcp.New argument; may be nil) is fired
+// whenever the gateway-relevant lease state of any interface
+// changes: lease committed with a new/changed gateway, first lease
+// acquired, or lease record removed (client terminated). Always
+// fired outside m.mu.
+func New(stateDir string, onAddressChange, onGatewayChange func()) (*Manager, error)
 ```
 
-Fire sites (all already exist as state-mutation points):
+Fire sites — exactly **two** (corrected in v2; r1 convergent finding
+SMR-1/Codex-1/AGY-1):
 
 1. `commitLease` — after the store + before returning, when
    `prev == nil || prev.Gateway != lease.Gateway` (strictly narrower
    than `leaseContentChanged`; address/DNS-only changes do not fire).
-2. The lease-delete paths — the `ctx.Done()` branches of `runDHCPv4` /
-   `runDHCPv6` that `delete(m.leases, key)` (this is also the Reconcile
-   stop path: Reconcile cancels the client context, and the run loop's
-   own goroutine performs the delete). One helper
-   `removeLeaseAndNotify(key)` replaces the four inline delete sites so
-   a future fifth site cannot forget the hook.
+2. `finishClient` (`dhcp.go:274-305`) — fired unconditionally after
+   `m.mu.Unlock()`. This is the REAL lease-cleanup owner: it runs in
+   the client goroutine's defer on **every** terminal exit, including
+   the paths the run-loop `ctx.Done()` branches never see —
+   cancellation mid-exchange (Codex r1's verified counterexample:
+   T2 fails → fresh DORA in `doDHCPv4` → cancel → loop returns via the
+   error path, only `finishClient` deletes the lease), DHCPv4
+   max-retransmission exit, DHCPv6 link-local abort. Firing only from
+   inline run-loop delete sites (the v1 design) would leave a stale
+   gateway in the overlay after such an exit — a silent blackhole.
+   The run-loop inline deletes stay untouched (their redundancy with
+   finishClient is pre-existing); the unconditional fire is absorbed
+   by the engine gate. v1's `removeLeaseAndNotify` helper is dropped.
 
-Daemon wiring (`daemon_run.go`, next to the existing
-`ipmon.New(d.actuateRouteOverlay)` at line 244):
+Daemon wiring: `d.ipmon` is constructed before the first applyConfig
+(`daemon_run.go:244`, by design comment), and the DHCP manager is
+created lazily inside an apply (`daemon_dhcp.go:119`), so ordering is
+safe today — but the hook is wired as a **nil-guarded closure**, not a
+method value, so it stays safe under future reordering (SMR r1-2):
 
 ```go
-d.ipmon.SetNextHopResolver(d.resolveDHCPNextHop) // LeaseFor(iface, AFInet).Gateway
-d.dhcp.SetGatewayChangeHook(d.ipmon.NotifyNextHopChange) // at dhcp.New time, daemon_dhcp.go:119
+dm, err := dhcp.New(stateDir, d.onDHCPAddressChange, func() {
+    if e := d.ipmon; e != nil {
+        e.NotifyNextHopChange()
+    }
+})
+...
+d.ipmon.SetNextHopResolver(d.resolveDHCPNextHop) // LeaseFor(key, AFInet).Gateway; nil-checks d.dhcp
 ```
-
-(The DHCP manager is created lazily in `reconcileDHCPClients`; the hook
-is registered immediately after `dhcp.New` there, and `d.ipmon` is
-constructed earlier in `Run`, so ordering is safe. `d.resolveDHCPNextHop`
-nil-checks `d.dhcp` — resolver calls can arrive before any DHCP client
-exists.)
 
 Engine entry point:
 
@@ -267,10 +317,33 @@ The gate ("any FAILED policy with an interface-typed route") bounds
 actuations: lease churn on a box with no ip-monitoring DHCP routes, or
 with all policies healthy, never actuates. When it does fire, the
 normal debounce (1 s) + throttle (3 s) coalesce it with any concurrent
-probe-driven transitions, and `PublishRouteOverlaySnapshot`'s
-content-hash skip plus `frr-reload.py`'s diffing make a same-gateway
-re-actuation cheap. The hook itself never blocks: it takes `Engine.mu`
-briefly and pokes the non-blocking `kick` channel.
+probe-driven transitions, and `frr-reload.py`'s diffing makes the FRR
+side of a same-gateway re-actuation cheap.
+
+**Publish/bump contract fix (Codex r1-2, folded):** v1 claimed the
+snapshot side of a same-content actuation was also cheap via
+`PublishRouteOverlaySnapshot`'s content-hash skip — but the skip
+returns `nil` (`manager.go:846`) and `actuateRouteOverlayLocked`
+unconditionally calls `BumpFIBGeneration()` after any nil publish
+(`daemon_ipmon.go:180-188`), so a same-content actuation still
+invalidates every cached flow route and emits a control message. Fix
+shipped WITH this PR: `PublishRouteOverlaySnapshot` (manager + legacy
+adapter + the `routeOverlayPublisher` interface in `daemon_ipmon.go`)
+returns `(published bool, err error)`; the actuator bumps FIB
+generation **only when `published`**. This preserves the load-bearing
+publish-before-bump ordering (a skipped publish means the helper
+already has these exact routes — no re-resolution needed) and turns
+the duplicate-actuation cost into a no-op. Named test: duplicate
+overlay publish ⇒ no `bump_fib_generation` message.
+
+**Blocking honesty (Codex r1-3, reworded from v1):** the hook is NOT
+"never blocking" — `NotifyNextHopChange` takes `Engine.mu`, which
+`ActiveOverlay()`/`Status()` hold for a whole overlay build (including
+resolver calls into `dhcp.mu`). It is **bounded** blocking with no
+deadlock: the hook's caller never holds `dhcp.mu` (both fire sites are
+post-unlock), so the `Engine.mu → dhcp.mu` order stays acyclic. A
+`-race` contention test drives concurrent `Status()` + gateway hooks +
+`commitLease`.
 
 **What still happens in parallel (pre-existing, unchanged):** a gateway
 change is lease *content* change, so `commitLease` also fires the
@@ -338,7 +411,20 @@ so either order converges to the same result.
   at expiry — the engine's `nextWakeLocked` could carry it) is listed
   as an open question (§12 Q2), NOT silently included: it adds timer
   machinery for a window in which the box-wide behavior (address +
-  DHCP default route) is already "keep last known".
+  DHCP default route) is already "keep last known". All three r1
+  reviewers ratified keep-last-known; AGY r1-4 adds the honest caveat
+  that retaining an expired lease violates RFC 2131 §4.4.5 box-wide —
+  **coupling rule, documented in `pkg/dhcp/README.md`:** if `pkg/dhcp`
+  is ever fixed to expire addresses per the RFC, that change must
+  route the lease-record removal through a path that fires the
+  gateway-change hook (`finishClient` already does), so the overlay
+  withdraws in lock-step with the address.
+- **Manual renew transient (SMR r1-5):** `request dhcp client renew`
+  → `Renew` cancels the client → `finishClient` removes lease AND
+  address → fresh DORA. While a policy is FAILED, this produces a
+  withdraw-then-reinject pair if re-acquisition outlasts the debounce.
+  Correct (the uplink address itself is gone during the window) but
+  operator-visible; documented in `docs/multi-wan.md`.
 - **v6 exclusion:** DHCPv6 `Lease.Gateway` is an RA-discovered
   link-local (`discoverIPv6Router`); FRR statics need the interface for
   link-local next-hops (`DHCPRoute.Interface` exists for exactly this)
@@ -355,14 +441,18 @@ so either order converges to the same result.
 `pkg/config` (compiler_services parse+validate, types_system field,
 shared lease-key helper, schema desc), `pkg/ipmon` (resolver type +
 SetNextHopResolver + NotifyNextHopChange + skip-unresolvable in
-activeOverlayLocked + display annotation), `pkg/dhcp`
-(SetGatewayChangeHook + fire sites + removeLeaseAndNotify helper),
-`pkg/daemon` (resolveDHCPNextHop, hook wiring, buildDHCPClientSpecs
-switches to shared helper, single-capture hardening in
-applyConfigLocked), `pkg/api` (one gauge), docs (`docs/multi-wan.md`,
-`pkg/ipmon/README.md`, `pkg/dhcp/README.md`). **Zero Rust. Zero wire
-protocol. Zero hot path. No new goroutines** (the hook rides existing
-run-loop/timer contexts; the engine loop is unchanged).
+activeOverlayLocked + PolicyStatus.UnresolvedRoutes), `pkg/dhcp`
+(`New` third argument + two fire sites: commitLease, finishClient),
+`pkg/daemon` (resolveDHCPNextHop, closure wiring,
+buildDHCPClientSpecs switches to shared helper, single-capture
+hardening in applyConfigLocked, `routeOverlayPublisher` interface +
+actuator bump-on-published-only), `pkg/dataplane/userspace`
+(`PublishRouteOverlaySnapshot` returns `(published bool, err error)` —
+manager + legacy adapter; Go-only, snapshot wire format untouched),
+`pkg/api` (one gauge), docs (`docs/multi-wan.md`, `pkg/ipmon/README.md`,
+`pkg/dhcp/README.md`). **Zero Rust. Zero wire protocol. Zero hot
+path. No new goroutines** (the hook rides existing run-loop/timer
+contexts; the engine loop is unchanged).
 
 ## 5. Staging
 
@@ -381,13 +471,19 @@ the notification belongs at the daemon layer (wrapping
 - Config back-compat: literal-IP next-hops parse and validate exactly
   as today; the new form is additive. No schema node changes ⇒ no
   completion-behavior change (value slot already free-form).
-- `pkg/dhcp` exported surface: one new optional setter; existing
-  callers (daemon) unaffected; `ClientSpec`/fingerprints untouched —
-  the #1793 config-identity rule is preserved (NextHopInterface lives
-  in `PreferredRoute`, which never feeds Reconcile).
+- `pkg/dhcp` exported surface: `New` gains a third (nil-able)
+  parameter — a deliberate signature change (single in-tree caller at
+  `daemon_dhcp.go:119` + tests), chosen over a setter to make the hook
+  immutable (AGY r1-2); `ClientSpec`/fingerprints untouched — the
+  #1793 config-identity rule is preserved (NextHopInterface lives in
+  `PreferredRoute`, which never feeds Reconcile).
 - `pkg/ipmon` exported surface: `SetNextHopResolver`,
-  `NotifyNextHopChange`, `NextHopResolver` type. `New` signature
-  unchanged.
+  `NotifyNextHopChange`, `NextHopResolver` type,
+  `PolicyStatus.UnresolvedRoutes`. `New` signature unchanged.
+- `PublishRouteOverlaySnapshot` return type changes to
+  `(published bool, err error)` on the userspace Manager, the legacy
+  adapter, and the `routeOverlayPublisher` interface (Codex r1-2) —
+  in-tree consumers only.
 - `RouteOverlayEntry`, FRR `FullConfig`, `RouteSnapshot`: unchanged.
 - HA/config-sync: `NextHopInterface` is config (syncs normally); the
   resolved gateway is runtime state inside the overlay (never syncs) —
@@ -402,10 +498,16 @@ the notification belongs at the daemon layer (wrapping
 1. **No actuation outside the engine loop** — the hook only marks
    dirty + kicks; `actuateRouteOverlay` remains the engine's single
    actuation callsite, under `applySem`.
-2. **Publish-before-bump ordering** — untouched
-   (`actuateRouteOverlayLocked` body unchanged).
+2. **Publish-before-bump ordering** — preserved, with one refinement:
+   the bump now fires only on `published == true` (a skipped publish
+   means the helper already holds these exact routes, so skipping the
+   bump cannot strand a flow on stale routes — Codex r1-2 worked
+   trace).
 3. **One-way lock order** `Engine.mu → dhcp.Manager.mu`; the dhcp hook
    fires outside `dhcp.mu`; the resolver never calls back into ipmon.
+   The hook is bounded-blocking, not non-blocking (Codex r1-3): it may
+   wait on `Engine.mu` held across an overlay build; acyclic by the
+   fire-outside-`dhcp.mu` rule; `-race` contention test required.
 4. **Reconcile keys on config identity only** (#1793) — no new
    fingerprint inputs.
 5. **commitLease single-commit-path** (#1777) — the hook is added
@@ -455,12 +557,16 @@ the notification belongs at the daemon layer (wrapping
   transition); (5) nil-resolver defensive skip.
 - dhcp: `commitLease` hook firing matrix — first lease fires, renewal
   with same gateway does NOT fire, gateway change fires, address-only
-  change does NOT fire; delete-site helper fires on client stop (via
-  `runClientForTest` seam); hook fired outside `m.mu` (deadlock test:
-  hook calls `LeaseFor`).
+  change does NOT fire; `finishClient` fires on EVERY terminal exit —
+  including Codex r1-1's cancel-mid-exchange counterexample and the
+  max-retransmission exit (via `runClientForTest` seam); hook fired
+  outside `m.mu` (deadlock test: hook calls `LeaseFor`); `-race`
+  contention test driving concurrent `Status()` + hooks + commits.
 - Daemon: `resolveDHCPNextHop` nil-dhcp safety; single-capture apply
   hardening (one `ipmonActiveOverlay` read per apply — assert via a
-  counting fake); actuator ordering test unchanged (re-run).
+  counting fake); actuator ordering test extended: duplicate overlay
+  publish (content-hash skip) ⇒ NO `BumpFIBGeneration`; changed
+  publish ⇒ bump strictly after publish success (Codex r1-2).
 - `make test` full suite green.
 
 **Smoke (loss userspace cluster + standalone VM, honest about what each
@@ -517,10 +623,11 @@ proves):**
 
 **Fork 2 — where the lease-change notification enters:**
 
-- **Path A (RECOMMENDED): `pkg/dhcp` hook → engine** (§4.3). Fires on
-  exactly the state that matters (gateway delta + lease delete), at the
-  single commit path (#1777), independent of the daemon's full-apply
-  debounce; the engine's gate keeps it quiet.
+- **Path A (RECOMMENDED): `pkg/dhcp` constructor-arg hook → engine**
+  (§4.3, revised per AGY r1-2). Fires on exactly the state that
+  matters (gateway delta at commitLease + terminal cleanup at
+  finishClient), independent of the daemon's full-apply debounce; the
+  engine's gate keeps it quiet.
 - **Path B: daemon-level — piggyback `onDHCPAddressChange`** (call
   `NotifyNextHopChange` next to `applyConfig`). Less new API, but:
   inherits the 2 s content-change debounce (fires on DNS/address-only
@@ -546,33 +653,31 @@ proves):**
   loser) and scatters resolution across the accessor wrapper. Rejected
   on the correctness corner alone.
 
-## 12. Open questions for adversarial review (round 1)
+## 12. Open questions — RESOLVED in round 1
 
-1. **Spelling ratification (Fork 1):** does `next-hop <ifd>.<unit>`
-   carry hidden parse ambiguity anywhere (interface names that parse as
-   IPs do not exist, but reviewers should hunt counter-examples —
-   e.g. weird unit syntax, RETH names, `st0.0`-style tunnels)? Should
-   tunnel/non-Ethernet units be explicitly rejected beyond the
-   `unit.DHCP` check (which already excludes them)?
-2. **Lease-expiry withdrawal:** keep last-known gateway through the
-   re-acquisition window (recommended, parity with the FRR DHCP
-   default) — or withdraw at `Obtained+LeaseTime` expiry via an engine
-   wake? Concrete operator scenario where parity is wrong is the bar
-   for adding the timer machinery.
-3. **Gate sufficiency (§4.3):** "any FAILED policy with interface-typed
-   route" can produce a same-content actuation (gateway unchanged but
-   lease re-committed after client restart). Acceptable (content-hash +
-   frr-reload diff make it cheap, bounded by throttle), or should the
-   engine cache the last-resolved gateway per key and compare?
-4. **v4-only cut:** any reviewer sees near-term demand for v6
-   interface-typed next-hops strong enough to justify pulling the
-   wire-protocol device-field work forward?
-5. **Hook shape:** is a single aggregate `func()` hook (re-resolve
-   everything) right, or should it carry the affected lease key? The
-   aggregate is simpler and the resolver re-reads everything anyway;
-   per-key adds payload with no consumer.
+1. **Spelling:** ratified by all three. No parse ambiguity (no valid
+   interface name parses as an IP; AGY's degenerate dotted-quad-name
+   corner accepted as a non-issue); no tunnel rejection beyond
+   `unit.DHCP` (Codex, SMR concur). Normalization pinned in §4.1
+   check 2 (SMR r1-3).
+2. **Lease-expiry withdrawal:** keep-last-known ratified by all three;
+   no expiry timers in this PR (Codex explicit). RFC 2131 coupling
+   rule documented instead (AGY r1-4, §4.5).
+3. **Gate sufficiency:** sufficient ONLY with the publish/bump
+   contract fix (Codex r1-2, folded into §4.3); with it, a duplicate
+   actuation is a no-op end-to-end. Per-key resolved-gateway caching
+   rejected as premature by all three.
+4. **v4-only:** ratified by all three with independent verification of
+   the `RouteSnapshot`-device-field wire constraint.
+5. **Hook shape:** aggregate `func()` ratified (Codex: contingent on
+   the Q3 fix, which is folded).
 
 ---
 
-*Round-1 verdicts: pending (Claude SMR + Codex + AGY docs beside this
-file). Reviewer task IDs in `reviewer-ids.md`.*
+*Round-1 verdicts: Claude SMR PLAN-NEEDS-REVISION
+(`claude-smr-plan-r1.md`, 7 findings), Codex PLAN-NEEDS-REVISION
+(`codex-plan-r1.md`, task-mq8jm9hz-g87plf, 3 findings), AGY
+PLAN-NEEDS-REVISION (`agy-plan-r1.md`,
+adversarial-review-mq8jmtlt-vq5w6c, 4 findings). No architectural
+objection from any reviewer; every finding folded into v2 (see Status
+header). Reviewer IDs in `reviewer-ids.md`.*
