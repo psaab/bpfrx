@@ -184,7 +184,7 @@ func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, co
 		activeAfter = 1
 	}
 	s.stats.Connected.Store(true)
-	s.lastPeerRxUnix.Store(time.Now().UnixNano())
+	s.lastPeerRxMono.Store(MonotonicNanos())
 	s.mu.Unlock()
 	becameActive := activeAfter == fabricIdx
 	slog.Info("cluster sync: handling new connection", "fabric", fabricIdx, "remote", connRemoteAddrString(conn), "was_disconnected", wasDisconnected, "active_before", activeBefore, "active_after", activeAfter, "became_active", becameActive, "had_conn0", hadConn0, "had_conn1", hadConn1)
@@ -745,7 +745,7 @@ func (s *SessionSync) receiveLoop(ctx context.Context, conn net.Conn) {
 			}
 		}
 		missedHeartbeats = 0
-		s.lastPeerRxUnix.Store(time.Now().UnixNano())
+		s.lastPeerRxMono.Store(MonotonicNanos())
 		s.handleMessage(conn, hdr.Type, payload)
 	}
 }

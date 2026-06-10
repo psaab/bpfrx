@@ -145,18 +145,32 @@ func (d *Daemon) shouldSuppressPeerHeartbeatTimeout() (bool, string) {
 	// of seconds while heartbeats have already stopped. After 5s of
 	// continuous suppression, stop suppressing so the heartbeat timeout
 	// can fire and trigger failover.
+	//
+	// The window is measured in CLOCK_MONOTONIC nanos (#1792): with
+	// wall-clock UnixNano a backward step left suppression stuck on
+	// (blocking failover for the step duration) and a forward step cut
+	// it short.
 	const maxSuppressDuration = 5 * time.Second
-	now := time.Now().UnixNano()
+	now := cluster.MonotonicNanos()
 	start := d.hbSuppressStart.Load()
 	if start == 0 {
 		d.hbSuppressStart.Store(now)
 		start = now
 	}
-	if time.Duration(now-start) > maxSuppressDuration {
+	if hbSuppressCapExceeded(start, now, maxSuppressDuration) {
 		return false, ""
 	}
 
 	return true, fmt.Sprintf("session sync connected with recent peer traffic age=%s", age.Truncate(10*time.Millisecond))
+}
+
+// hbSuppressCapExceeded reports whether continuous heartbeat-timeout
+// suppression that began at startMono has lasted longer than cap by nowMono.
+// Both timestamps are CLOCK_MONOTONIC nanos (cluster.MonotonicNanos), so the
+// cap is immune to wall-clock steps (#1792). Split out so tests can inject
+// timestamps and exercise step scenarios directly.
+func hbSuppressCapExceeded(startMono, nowMono int64, capDur time.Duration) bool {
+	return time.Duration(nowMono-startMono) > capDur
 }
 
 func syncPrimeProgressObserved(current, baseline cluster.SyncStatsSnapshot) bool {
