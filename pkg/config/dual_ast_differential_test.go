@@ -441,12 +441,9 @@ system {
 system {
     dataplane-type userspace;
 }`,
-		expectedFail: true,
-		failureClass: "compiler dual-AST",
-		reason: "reverse dual-AST gap: compileClassOfService reads only the braced " +
-			"loss-priority container shape; the inline hierarchical leaf " +
-			"(Keys-encoded) is silently dropped, while the flat-set replay is " +
-			"structured by setSchema and compiles — hierarchical loses the classifier",
+		// Fixed in U5b (#1809): the classifier code-point collectors also
+		// scan the loss-priority node's own Keys for the inline leaf form.
+		expectedFail: false,
 	},
 	{
 		name: "firewall-filters",

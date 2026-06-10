@@ -513,15 +513,29 @@ func parseCoSTransmitRate(node *Node) (uint64, bool) {
 func collectCoSDSCPCodePoints(node *Node) []uint8 {
 	var values []uint8
 	seen := make(map[uint8]struct{})
+	add := func(raw string) {
+		for _, value := range expandCoSCodePointToken(raw) {
+			if _, ok := seen[value]; ok {
+				continue
+			}
+			seen[value] = struct{}{}
+			values = append(values, value)
+		}
+	}
 	for _, child := range node.FindChildren("code-points") {
 		for _, raw := range child.Keys[1:] {
-			for _, value := range expandCoSCodePointToken(raw) {
-				if _, ok := seen[value]; ok {
-					continue
-				}
-				seen[value] = struct{}{}
-				values = append(values, value)
+			add(raw)
+		}
+	}
+	// Inline leaf spelling (#1809): "loss-priority low code-points ef;"
+	// packs the code points into the loss-priority node's own Keys after
+	// the "code-points" token (bracketed lists arrive bracket-stripped).
+	for i := 2; i < len(node.Keys); i++ {
+		if node.Keys[i] == "code-points" {
+			for _, raw := range node.Keys[i+1:] {
+				add(raw)
 			}
+			break
 		}
 	}
 	return values
@@ -530,22 +544,36 @@ func collectCoSDSCPCodePoints(node *Node) []uint8 {
 func collectCoS8021CodePoints(node *Node) []uint8 {
 	var values []uint8
 	seen := make(map[uint8]struct{})
+	add := func(raw string) {
+		raw = strings.TrimSpace(strings.ToLower(raw))
+		if raw == "" {
+			return
+		}
+		v, err := strconv.Atoi(raw)
+		if err != nil || v < 0 || v > 7 {
+			return
+		}
+		value := uint8(v)
+		if _, ok := seen[value]; ok {
+			return
+		}
+		seen[value] = struct{}{}
+		values = append(values, value)
+	}
 	for _, child := range node.FindChildren("code-points") {
 		for _, raw := range child.Keys[1:] {
-			raw = strings.TrimSpace(strings.ToLower(raw))
-			if raw == "" {
-				continue
+			add(raw)
+		}
+	}
+	// Inline leaf spelling (#1809): "loss-priority low code-points 3;"
+	// packs the code points into the loss-priority node's own Keys after
+	// the "code-points" token.
+	for i := 2; i < len(node.Keys); i++ {
+		if node.Keys[i] == "code-points" {
+			for _, raw := range node.Keys[i+1:] {
+				add(raw)
 			}
-			v, err := strconv.Atoi(raw)
-			if err != nil || v < 0 || v > 7 {
-				continue
-			}
-			value := uint8(v)
-			if _, ok := seen[value]; ok {
-				continue
-			}
-			seen[value] = struct{}{}
-			values = append(values, value)
+			break
 		}
 	}
 	return values
