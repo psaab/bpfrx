@@ -878,15 +878,18 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 	// a previous daemon) stops the units; the pre-#1778 nil-config
 	// gate skipped Apply entirely and leaked the old server.
 	//
-	// Cluster: start/stop while DHCP config is present is owned by the
-	// VRRP MASTER/BACKUP transitions (applyRethServicesForRG /
-	// clearRethServicesForRG), so it is NOT applied here — but when
-	// the config has no DHCP server at all, no VRRP path would ever
-	// stop a stale Kea, so that case is reconciled here (warn-only:
-	// failing the commit/peer-sync over stale-unit cleanup in cluster
-	// mode would diverge node configs).
+	// Cluster (#1835 F3): VRRP MASTER/BACKUP transitions own
+	// start/stop (applyRethServicesForRG / clearRethServicesForRG via
+	// ApplyAsync), but a config COMMIT must still reach the running
+	// Kea — pre-F3 a dhcp-server change was invisible until the next
+	// VRRP transition. Every commit regenerates the config files,
+	// filtered to the RGs this node is currently MASTER for (the same
+	// shape the VRRP path writes; nil when none match → authoritative
+	// clear-if-active), and restarts only units that are currently
+	// active (active == this node is serving). Inactive units pick up
+	// the fresh config at the next VRRP MASTER transition.
 	//
-	// Fail-closed on commit (#1778): standalone restart/stop failures
+	// Fail-closed on commit (#1778/#1835 F3): restart/stop failures
 	// are recorded into dhcpServerErr and returned at the tail of this
 	// function, so commitAndApply surfaces them to the operator while
 	// the remaining reconcile steps still run. The boot path stays
@@ -895,7 +898,6 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 	// daemon boot.
 	var dhcpServerErr error
 	if d.dhcpServer != nil {
-		hasDHCPCfg := cfg.System.DHCPServer.DHCPLocalServer != nil || cfg.System.DHCPServer.DHCPv6LocalServer != nil
 		if !isCluster {
 			// Resolve RETH interface names for Kea (needs real Linux names)
 			resolveDHCPRethInterfaces(&cfg.System.DHCPServer, cfg)
@@ -903,9 +905,16 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 				slog.Warn("failed to apply DHCP server config", "err", err)
 				dhcpServerErr = fmt.Errorf("apply DHCP server config: %w", err)
 			}
-		} else if !hasDHCPCfg {
-			if err := d.dhcpServer.Apply(nil); err != nil {
-				slog.Warn("failed to reconcile stale DHCP server (cluster, no config)", "err", err)
+		} else {
+			var dhcpCfg *config.DHCPServerConfig
+			if cfg.System.DHCPServer.DHCPLocalServer != nil || cfg.System.DHCPServer.DHCPv6LocalServer != nil {
+				// filterDHCPConfigForMasterRGs copies the config and
+				// resolves RETH interface names internally.
+				dhcpCfg = d.filterDHCPConfigForMasterRGs(cfg)
+			}
+			if err := d.dhcpServer.ApplyClusterCommit(dhcpCfg); err != nil {
+				slog.Warn("failed to reconcile DHCP server (cluster commit)", "err", err)
+				dhcpServerErr = fmt.Errorf("apply DHCP server config: %w", err)
 			}
 		}
 	}

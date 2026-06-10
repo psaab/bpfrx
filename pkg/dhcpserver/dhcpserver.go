@@ -136,6 +136,29 @@ func New() *Manager {
 // so a config commit surfaces the failure instead of reporting
 // success while no DHCP service is running.
 func (m *Manager) Apply(cfg *config.DHCPServerConfig) error {
+	return m.apply(cfg, true)
+}
+
+// ApplyClusterCommit reconciles for a cluster-mode config commit
+// (#1835 F3). Configured families ALWAYS get a freshly generated
+// config file — so a dhcp-server config change is not lost until the
+// next VRRP transition — but the unit is restarted only when systemd
+// reports it active: an active unit means this node is currently
+// serving (VRRP MASTER for the relevant RGs), so the change must
+// reach the running Kea now. Inactive units stay stopped with the
+// fresh config on disk; the next VRRP MASTER transition's Apply
+// starts them. Unconfigured families are cleared exactly as in Apply.
+// Fail-closed like Apply: generate/restart/stop failures are returned
+// so the commit surfaces them.
+func (m *Manager) ApplyClusterCommit(cfg *config.DHCPServerConfig) error {
+	return m.apply(cfg, false)
+}
+
+// apply is the shared reconcile body. restartInactive selects whether
+// a configured family's unit is restarted unconditionally (standalone
+// / VRRP-MASTER semantics) or only when already active (cluster
+// commit semantics, see ApplyClusterCommit).
+func (m *Manager) apply(cfg *config.DHCPServerConfig, restartInactive bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -147,8 +170,10 @@ func (m *Manager) Apply(cfg *config.DHCPServerConfig) error {
 	if want4 {
 		if err := m.generateKea4Config(cfg); err != nil {
 			errs = append(errs, fmt.Errorf("generate kea4 config: %w", err))
-		} else if err := m.runSystemctl("restart", kea4Svc); err != nil {
-			errs = append(errs, fmt.Errorf("restart %s: %w", kea4Svc, err))
+		} else if restartInactive || m.unitActive(kea4Svc) {
+			if err := m.runSystemctl("restart", kea4Svc); err != nil {
+				errs = append(errs, fmt.Errorf("restart %s: %w", kea4Svc, err))
+			}
 		}
 	} else if err := m.clearFamilyLocked(kea4Svc, m.confPath4); err != nil {
 		errs = append(errs, err)
@@ -157,8 +182,10 @@ func (m *Manager) Apply(cfg *config.DHCPServerConfig) error {
 	if want6 {
 		if err := m.generateKea6Config(cfg); err != nil {
 			errs = append(errs, fmt.Errorf("generate kea6 config: %w", err))
-		} else if err := m.runSystemctl("restart", kea6Svc); err != nil {
-			errs = append(errs, fmt.Errorf("restart %s: %w", kea6Svc, err))
+		} else if restartInactive || m.unitActive(kea6Svc) {
+			if err := m.runSystemctl("restart", kea6Svc); err != nil {
+				errs = append(errs, fmt.Errorf("restart %s: %w", kea6Svc, err))
+			}
 		}
 	} else if err := m.clearFamilyLocked(kea6Svc, m.confPath6); err != nil {
 		errs = append(errs, err)

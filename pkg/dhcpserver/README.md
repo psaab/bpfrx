@@ -27,6 +27,10 @@ Manages Kea DHCPv4/v6 server config and lifecycle. Generates
   skipped but the last enqueued state is always applied last.
   `cfg == nil` is the authoritative clear. Errors are logged with
   `reason`; the commit path keeps synchronous `Apply` (fail-closed).
+- `ApplyClusterCommit(cfg) error` — `dhcpserver.go`. Cluster-commit
+  reconcile (#1835 F3): always regenerates configs for configured
+  families but restarts only units that are currently active; clears
+  unconfigured families like `Apply`. Fail-closed.
 - `Clear()` — `dhcpserver.go`. Stops both Kea units if systemd
   reports them active and removes config files. Void signature for
   the VRRP-transition callers (`pkg/daemon` HA path); stop failures
@@ -64,9 +68,11 @@ Manages Kea DHCPv4/v6 server config and lifecycle. Generates
   unconditionally on every config apply and surfaces its error
   through the commit (fail-closed); the boot path logs the error and
   continues, so an unavailable Kea binary cannot brick daemon boot.
-  In cluster mode start/stop with DHCP config present is owned by
-  the VRRP MASTER/BACKUP transitions; the apply path only reconciles
-  the no-DHCP-config case (stale-unit cleanup, warn-only).
+  In cluster mode the commit path calls `ApplyClusterCommit`
+  (#1835 F3) with the master-RG-filtered config: configs are always
+  regenerated, but units restart only if currently active (this node
+  is serving) — also fail-closed. VRRP MASTER/BACKUP transitions own
+  start/stop via `ApplyAsync`.
 - Lease queries read Kea's CSV lease backends directly:
   `/var/lib/kea/kea-leases4.csv` and `kea-leases6.csv`. No control
   channel / socket call. Missing files yield an empty list, not an

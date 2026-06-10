@@ -4794,3 +4794,11 @@ top.
   never-blocks, latest-wins coalescing, single worker; README.
   **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/dhcpserver_test.go,
   pkg/dhcpserver/README.md, pkg/daemon/daemon_ha.go
+
+- **Timestamp**: 2026-06-10 (AGY fold) F3
+  **Action**: #1835 AGY F3 — ApplyClusterCommit: cluster-mode commits always
+  regenerate Kea configs (master-RG filtered) and restart only active units,
+  fail-closed via dhcpServerErr; daemon_apply cluster branch converted; tests
+  + README.
+  **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/dhcpserver_test.go,
+  pkg/dhcpserver/README.md, pkg/daemon/daemon_apply.go

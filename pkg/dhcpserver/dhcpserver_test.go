@@ -560,3 +560,54 @@ func TestApplyAsyncSingleWorker(t *testing.T) {
 		t.Fatalf("worker goroutine starts = %d, want 1", n)
 	}
 }
+
+// TestApplyClusterCommit pins #1835 F3: a cluster-mode commit must
+// always regenerate the Kea config and restart ONLY units that are
+// currently active (active == this node is serving as VRRP MASTER);
+// inactive units get the fresh config on disk for the next MASTER
+// transition, with no restart.
+func TestApplyClusterCommit(t *testing.T) {
+	t.Run("active unit restarted with rewritten config", func(t *testing.T) {
+		m, calls := testManager(t, map[string]bool{kea4Svc: true}, "")
+		if err := m.ApplyClusterCommit(v4Config("ge-0-0-0")); err != nil {
+			t.Fatalf("ApplyClusterCommit: %v", err)
+		}
+		if _, err := os.Stat(m.confPath4); err != nil {
+			t.Errorf("config not regenerated: %v", err)
+		}
+		if !calledWith(*calls, "restart "+kea4Svc) {
+			t.Errorf("active unit must restart on cluster commit, got %v", *calls)
+		}
+	})
+
+	t.Run("inactive unit gets config only, no restart", func(t *testing.T) {
+		m, calls := testManager(t, map[string]bool{}, "")
+		if err := m.ApplyClusterCommit(v4Config("ge-0-0-0")); err != nil {
+			t.Fatalf("ApplyClusterCommit: %v", err)
+		}
+		if _, err := os.Stat(m.confPath4); err != nil {
+			t.Errorf("config not regenerated: %v", err)
+		}
+		if len(*calls) != 0 {
+			t.Errorf("inactive unit must not restart on cluster commit, got %v", *calls)
+		}
+	})
+
+	t.Run("restart failure on active unit fails the commit", func(t *testing.T) {
+		m, _ := testManager(t, map[string]bool{kea4Svc: true}, "restart "+kea4Svc)
+		err := m.ApplyClusterCommit(v4Config("ge-0-0-0"))
+		if err == nil || !strings.Contains(err.Error(), kea4Svc) {
+			t.Fatalf("want fail-closed restart error naming the unit, got %v", err)
+		}
+	})
+
+	t.Run("nil config clears active units", func(t *testing.T) {
+		m, calls := testManager(t, map[string]bool{kea4Svc: true}, "")
+		if err := m.ApplyClusterCommit(nil); err != nil {
+			t.Fatalf("ApplyClusterCommit(nil): %v", err)
+		}
+		if !calledWith(*calls, "stop "+kea4Svc) {
+			t.Errorf("active unit must stop when config removed, got %v", *calls)
+		}
+	})
+}
