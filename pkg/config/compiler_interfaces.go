@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -410,6 +411,20 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 								}
 								// Child-node properties (hierarchical blocks and
 								// schema-structured flat-set containers).
+								// Track-interface values are gathered and applied
+								// AFTER the loop so the nested
+								// `track-interface <if> { priority-cost <n>; }`
+								// form wins over the legacy flat sibling
+								// `track-priority-cost <n>` regardless of node
+								// order (#1814 — the loop is source-order based).
+								var (
+									trackIface          string
+									trackIfaceSet       bool
+									nestedTrackCost     int
+									nestedTrackCostSet  bool
+									siblingTrackCost    int
+									siblingTrackCostSet bool
+								)
 								for _, prop := range vrrpInst.node.Children {
 									switch prop.Name() {
 									case "virtual-address":
@@ -446,12 +461,43 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 									case "authentication-key":
 										vg.AuthKey = nodeVal(prop)
 									case "track-interface":
-										vg.TrackInterface = nodeVal(prop)
+										// The interface name lives in Keys[1]
+										// (NOT nodeVal — its Children[0]
+										// fallback would misread the nested
+										// priority-cost child as the name).
+										if len(prop.Keys) >= 2 {
+											trackIface = prop.Keys[1]
+											trackIfaceSet = true
+										}
+										// Nested form (#1814): standard Junos
+										// `track-interface <if> { priority-cost <n>; }`.
+										if pc := prop.FindChild("priority-cost"); pc != nil {
+											if v := nodeVal(pc); v != "" {
+												if n, err := strconv.Atoi(v); err == nil {
+													nestedTrackCost = n
+													nestedTrackCostSet = true
+												}
+											}
+										}
 									case "track-priority-cost":
 										if v := nodeVal(prop); v != "" {
-											vg.TrackPriorityDelta, _ = strconv.Atoi(v)
+											if n, err := strconv.Atoi(v); err == nil {
+												siblingTrackCost = n
+												siblingTrackCostSet = true
+											}
 										}
 									}
+								}
+								if trackIfaceSet {
+									vg.TrackInterface = trackIface
+								}
+								if siblingTrackCostSet {
+									vg.TrackPriorityDelta = siblingTrackCost
+								}
+								if nestedTrackCostSet {
+									// Nested wins over the legacy sibling,
+									// independent of node order.
+									vg.TrackPriorityDelta = nestedTrackCost
 								}
 							}
 						}
@@ -687,4 +733,127 @@ func parseMSSValue(node *Node) int {
 		}
 	}
 	return 0
+}
+
+// validateVRRPTrackInterfaceAST walks the (group-expanded) AST and
+// enforces the single-track-interface invariant per vrrp-group (#1814).
+//
+// Strict path (commit / commit-check, lenient=false): more than one
+// track-interface statement inside a single vrrp-group is a hard
+// compile error — single-interface tracking is what the runtime
+// implements, and silently last-winsing the extras would hide it.
+//
+// Lenient path (load / peer-sync, lenient=true): the extra
+// track-interface children are pruned IN PLACE (the tree is already a
+// clone — same contract as sanitizeNodesControlChars) so the compiler
+// deterministically sees only the FIRST, and a warning is returned.
+//
+// Shape-only warnings emitted on BOTH paths (the typed config cannot
+// distinguish these post-compile):
+//   - nested `priority-cost` AND legacy sibling `track-priority-cost`
+//     both present (nested wins);
+//   - an orphan `priority-cost` child directly under the vrrp-group
+//     (only valid nested under track-interface).
+func validateVRRPTrackInterfaceAST(nodes []*Node, prefix string, lenient bool) ([]string, error) {
+	var warnings []string
+	for _, n := range nodes {
+		nodePath := joinNodePath(prefix, n.Keys)
+		if n.Name() == "vrrp-group" {
+			w, err := checkVRRPGroupTrackShape(n, nodePath, lenient)
+			warnings = append(warnings, w...)
+			if err != nil {
+				return nil, err
+			}
+		}
+		w, err := validateVRRPTrackInterfaceAST(n.Children, nodePath, lenient)
+		warnings = append(warnings, w...)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return warnings, nil
+}
+
+// checkVRRPGroupTrackShape applies the #1814 track-interface shape
+// checks to a single vrrp-group node. See validateVRRPTrackInterfaceAST.
+func checkVRRPGroupTrackShape(vg *Node, nodePath string, lenient bool) ([]string, error) {
+	var warnings []string
+	tracks := vg.FindChildren("track-interface")
+	if len(tracks) > 1 {
+		if !lenient {
+			return nil, fmt.Errorf("%s: %d track-interface statements; only one tracked interface is supported per vrrp-group", nodePath, len(tracks))
+		}
+		// First-wins: prune every track-interface child after the first.
+		kept := false
+		pruned := vg.Children[:0]
+		for _, c := range vg.Children {
+			if c.Name() == "track-interface" {
+				if kept {
+					continue
+				}
+				kept = true
+			}
+			pruned = append(pruned, c)
+		}
+		vg.Children = pruned
+		warnings = append(warnings, fmt.Sprintf("%s: %d track-interface statements; keeping the first (%s) and ignoring the rest (#1814)", nodePath, len(tracks), nodeVal(tracks[0])))
+		tracks = tracks[:1]
+	}
+	if len(tracks) == 1 && tracks[0].FindChild("priority-cost") != nil && vg.FindChild("track-priority-cost") != nil {
+		warnings = append(warnings, fmt.Sprintf("%s: both nested track-interface priority-cost and legacy track-priority-cost are configured; the nested priority-cost wins", nodePath))
+	}
+	if vg.FindChild("priority-cost") != nil {
+		warnings = append(warnings, fmt.Sprintf("%s: priority-cost is only valid nested under track-interface; this statement has no effect", nodePath))
+	}
+	return warnings, nil
+}
+
+// vrrpTrackConfigWarnings derives operator-visible interface-tracking
+// warnings from the compiled typed config (#1814). Emitted on both the
+// strict and lenient paths so a tracking misconfiguration is never a
+// silent no-op:
+//   - track-interface without any priority-cost (nested or legacy
+//     sibling) has no effect;
+//   - track-priority-cost without track-interface has no effect;
+//   - priority 255 marks the address owner — the runtime ignores
+//     tracking there (an owner stepping down while still holding the
+//     address invites duplicate-IP conflicts).
+//
+// Iteration is sorted at every level so warning order is deterministic.
+func vrrpTrackConfigWarnings(cfg *Config) []string {
+	var warnings []string
+	ifNames := make([]string, 0, len(cfg.Interfaces.Interfaces))
+	for name := range cfg.Interfaces.Interfaces {
+		ifNames = append(ifNames, name)
+	}
+	sort.Strings(ifNames)
+	for _, ifName := range ifNames {
+		ifc := cfg.Interfaces.Interfaces[ifName]
+		unitNums := make([]int, 0, len(ifc.Units))
+		for n := range ifc.Units {
+			unitNums = append(unitNums, n)
+		}
+		sort.Ints(unitNums)
+		for _, un := range unitNums {
+			unit := ifc.Units[un]
+			groupKeys := make([]string, 0, len(unit.VRRPGroups))
+			for k := range unit.VRRPGroups {
+				groupKeys = append(groupKeys, k)
+			}
+			sort.Strings(groupKeys)
+			for _, gk := range groupKeys {
+				vg := unit.VRRPGroups[gk]
+				loc := fmt.Sprintf("interfaces %s unit %d vrrp-group %d", ifName, un, vg.ID)
+				switch {
+				case vg.TrackInterface != "" && vg.TrackPriorityDelta == 0:
+					warnings = append(warnings, fmt.Sprintf("%s: track-interface %s without priority-cost has no effect", loc, vg.TrackInterface))
+				case vg.TrackInterface == "" && vg.TrackPriorityDelta != 0:
+					warnings = append(warnings, fmt.Sprintf("%s: track-priority-cost without track-interface has no effect", loc))
+				case vg.TrackInterface != "" && vg.Priority == 255:
+					warnings = append(warnings, fmt.Sprintf("%s: interface tracking is ignored for the address owner (priority 255)", loc))
+				}
+			}
+		}
+	}
+	return warnings
 }
