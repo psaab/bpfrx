@@ -4845,3 +4845,6 @@ top.
 - **Timestamp**: 2026-06-10
   **Action**: #1844 SMR r2 PLAN-READY + publish-contract clarification folded into plan (v2.1)
   **File(s)**: docs/research/1844-dhcp-nexthop/{plan.md,claude-smr-plan-r2.md}
+- **Timestamp**: 2026-06-10
+  **Action**: #1844 plan v2.2 — Codex r2 folds (pending-FIB-bump retry; survey lease-lifecycle row corrected)
+  **File(s)**: docs/research/1844-dhcp-nexthop/{plan.md,codex-plan-r2.md}

@@ -1,6 +1,6 @@
 # #1844 ip-monitoring: DHCP-learned-uplink support for preferred-route next-hops
 
-**Status:** DRAFT v2.1 — (v2.1: SMR r2 publish-contract early-return clarification folded into §4.3)
+**Status:** DRAFT v2.2 — (v2.2: Codex r2 folds — pending-FIB-bump retry on bump failure after a successful publish, §4.3/§7; §3 survey lease-lifecycle row corrected to finishClient. v2.1: SMR r2 publish-contract early-return clarification folded into §4.3)
 
 v2 — folds all round-1 findings (Claude SMR + Codex +
 AGY, all PLAN-NEEDS-REVISION, docs beside this file). Headline folds:
@@ -89,7 +89,7 @@ route already does on this box.
 | Commit checks | next-hop must be a literal IP, family-matched to destination; forwarding-type RI rejected | `pkg/config/compiler_services.go:378-427` |
 | DHCP lease model | `Lease{Interface, Family, Address, Gateway netip.Addr, …}` keyed by `clientKey{iface(Linux name), family}`; `LeaseFor(iface, af)` returns a copy under `m.mu` | `pkg/dhcp/dhcp.go:34-47, 540-550` |
 | #1777 commit path | `commitLease` is the single commit path (initial + T1 + T2); fires debounced (2 s) `onAddressChange` only on content change — **Gateway is content** (`leaseContentChanged`, `commit.go:56-60`) | `pkg/dhcp/commit.go:110-132` |
-| Lease lifecycle | Lease record deleted ONLY on client stop (`ctx.Done` branches of both run loops; Reconcile stop = cancel→same path). On T2-rebind failure the loop falls back to fresh DORA but the **stale lease record + address remain** until replaced | `pkg/dhcp/dhcp.go:570-700` |
+| Lease lifecycle | Terminal cleanup owner is **`finishClient`** — a defer on every client-goroutine exit (cancel mid-exchange, max-retransmission, v6 link-local abort included) that deletes the lease record + removes the address; the run-loop `ctx.Done` inline deletes are redundant/pre-existing. On T2-rebind failure the loop falls back to fresh DORA but the **stale lease record + address remain** until replaced (corrected in v2.2 per Codex r2-2) | `pkg/dhcp/dhcp.go:251, 274-305, 570-700` |
 | Lease→FRR precedent | `collectDHCPRoutes` maps `Leases()`→`frr.DHCPRoute{Gateway, Interface, IsIPv6}` (AD 200); keeps rendering the stale gateway during re-acquisition; v6 gateways are RA-discovered link-locals and need the Interface field | `pkg/daemon/daemon_flow.go:23-44`, `pkg/frr/manager.go:86-91` |
 | onAddressChange → daemon | `onDHCPAddressChange` re-enters **full `applyConfig`** when a dataplane-relevant DHCP interface exists (`dhcpLeaseChangeRequiresRecompile`) | `pkg/daemon/daemon_dhcp.go:72-98, 130-160` |
 | Lease key derivation | `buildDHCPClientSpecs`: `config.LinuxIfName(ifName)` + `".<vlan>"` when `unit.VlanID > 0` — the canonical config→lease-key mapping | `pkg/daemon/daemon_dhcp.go:19-36` |
@@ -344,8 +344,23 @@ published snapshot yet / helper proc absent) — correct, because with
 no helper snapshot there are no cached flow routes to invalidate and
 the next full apply carries the overlay with its own invalidation.
 Implementers must NOT map those early returns to `published=true`.
-Named test: duplicate overlay publish ⇒ no `bump_fib_generation`
-message.
+
+**Pending-bump retry (Codex r2-1, folded):** one ordering is NOT
+covered by published-only bumping alone — publish succeeds (hash
+advances), then the `bump_fib_generation` control message FAILS
+(`BumpFIBGeneration` logs-and-suppresses today, returning only
+`uint32` — `manager.go:1092`); a later same-content actuation would be
+hash-skipped and the bump never retried, stranding cached flow routes
+on the pre-failover paths. Fix: (a) the `routeOverlayPublisher`
+interface's bump method gains error visibility
+(`BumpFIBGeneration() (uint32, error)` on the manager + legacy
+adapter; existing callers may ignore the error); (b) the actuator
+keeps a `pendingFIBBump` flag (mutated only under `applySem`, so no
+new locking): bump when `published || pendingFIBBump`; set the flag
+on bump failure, clear it on confirmed success. Named tests:
+duplicate overlay publish with prior confirmed bump ⇒ no
+`bump_fib_generation` message; publish-success + bump-failure
+followed by a duplicate actuation ⇒ bump IS retried.
 
 **Blocking honesty (Codex r1-3, reworded from v1):** the hook is NOT
 "never blocking" — `NotifyNextHopChange` takes `Engine.mu`, which
@@ -509,11 +524,12 @@ the notification belongs at the daemon layer (wrapping
 1. **No actuation outside the engine loop** — the hook only marks
    dirty + kicks; `actuateRouteOverlay` remains the engine's single
    actuation callsite, under `applySem`.
-2. **Publish-before-bump ordering** — preserved, with one refinement:
-   the bump now fires only on `published == true` (a skipped publish
-   means the helper already holds these exact routes, so skipping the
-   bump cannot strand a flow on stale routes — Codex r1-2 worked
-   trace).
+2. **Publish-before-bump ordering** — preserved, with two refinements:
+   the bump fires on `published == true` OR `pendingFIBBump` (a
+   skipped publish whose prior bump was CONFIRMED means the helper
+   already holds these exact routes and invalidation already happened;
+   an unconfirmed bump is retried on the next actuation — Codex r1-2
+   + r2-1 worked traces).
 3. **One-way lock order** `Engine.mu → dhcp.Manager.mu`; the dhcp hook
    fires outside `dhcp.mu`; the resolver never calls back into ipmon.
    The hook is bounded-blocking, not non-blocking (Codex r1-3): it may
