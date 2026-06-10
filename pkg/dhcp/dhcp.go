@@ -257,9 +257,17 @@ func (m *Manager) Start(ctx context.Context, ifaceName string, af AddressFamily)
 // cleanup branches).
 func (m *Manager) finishClient(key clientKey, dc *dhcpClient) {
 	m.mu.Lock()
-	if cur, ok := m.clients[key]; ok && cur == dc {
-		delete(m.clients, key)
+	cur, ok := m.clients[key]
+	if !ok || cur != dc {
+		// A successor client already replaced (or removed) this key.
+		// Its lease / delegated-PD records belong to the successor —
+		// a delayed defer from the OLD client must not delete them
+		// (AGY review on PR #1815: unguarded cleanup let a slow old
+		// defer clobber the new client's lease).
+		m.mu.Unlock()
+		return
 	}
+	delete(m.clients, key)
 	lease := m.leases[key]
 	delete(m.leases, key)
 	if key.family == AFInet6 {
@@ -1024,7 +1032,7 @@ func (m *Manager) doDHCPv6(ctx context.Context, ifaceName string) (*dhcpv6Result
 
 	// DHCPv6 doesn't provide a default router — discover it from the
 	// kernel's IPv6 neighbor table (entries learned via Router Advertisements).
-	if gw := m.discoverIPv6Router(ifaceName); gw.IsValid() {
+	if gw := m.discoverIPv6Router(ctx, ifaceName); gw.IsValid() {
 		lease.Gateway = gw
 	}
 
@@ -1116,7 +1124,7 @@ func extractDelegatedPrefixes(msg *dhcpv6.Message, ifaceName string, now time.Ti
 // given interface by inspecting the kernel neighbor table for entries with
 // the NTF_ROUTER flag (learned from Router Advertisements).
 // Retries a few times since RAs may not have been processed yet.
-func (m *Manager) discoverIPv6Router(ifaceName string) netip.Addr {
+func (m *Manager) discoverIPv6Router(ctx context.Context, ifaceName string) netip.Addr {
 	link, err := m.nlHandle.LinkByName(ifaceName)
 	if err != nil {
 		return netip.Addr{}
@@ -1124,7 +1132,15 @@ func (m *Manager) discoverIPv6Router(ifaceName string) netip.Addr {
 
 	for attempt := 0; attempt < 10; attempt++ {
 		if attempt > 0 {
-			time.Sleep(time.Second)
+			// Context-aware: Reconcile cancels clients and waits on
+			// done while applyConfigLocked holds applySem — a blind
+			// 10x1s sleep here wedged every commit for up to 10s
+			// (AGY review on PR #1815).
+			select {
+			case <-ctx.Done():
+				return netip.Addr{}
+			case <-time.After(time.Second):
+			}
 		}
 
 		neighbors, err := m.nlHandle.NeighList(link.Attrs().Index, netlink.FAMILY_V6)
