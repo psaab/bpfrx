@@ -70,7 +70,11 @@ cluster-scoped.
   event budget drops are reported as queue-full drops. Accepted
   telemetry holds that budget while retained for replay, releasing it
   only when an ACK trims the frame or the helper definitively drops it
-  during replay eviction, enqueue failure, or shutdown.
+  during replay eviction, enqueue failure, or shutdown. Budget release
+  saturates at zero; an underflow (accounting invariant broken) bumps a
+  local-only diagnostic counter and logs one stderr line on first hit
+  (#1826 — release builds compile out the debug_assert, the counter is
+  intentionally not wire-plumbed).
 - The Go daemon must know every helper→daemon frame type that carries a
   sequence number. For RT_FLOW-style dataplane telemetry, the daemon
   decodes valid frames through the same RT_FLOW adapter used for ringbuf

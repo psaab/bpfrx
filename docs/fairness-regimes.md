@@ -877,6 +877,20 @@ the sweep exit `2`; they do not produce a false-green fairness verdict.
   from pure RSS/flow-placement skew. Like the current-value gauge, this
   is reset after each publish and should be interpreted alongside the
   per-binding completion rate.
+- **`xpf_userspace_binding_v_min_throttles_total{binding_slot=..., queue_id=..., worker_id=..., iface=...}`**
+  counter (#1831, follow-up to #1766): V_min fairness-brake throttle
+  decisions on the binding's shared-exact CoS queues — a drain batch
+  early-broke because the queue's virtual time ran more than
+  LAG_THRESHOLD ahead of the slowest participating peer worker's V_min
+  (#917/#943). Non-zero under load confirms the cross-worker brake is
+  engaged.
+- **`xpf_userspace_binding_v_min_throttle_hard_cap_overrides_total{binding_slot=..., queue_id=..., worker_id=..., iface=...}`**
+  counter (#1831): V_MIN_CONSECUTIVE_SKIP_HARD_CAP escape-hatch
+  activations — after that many back-to-back throttle decisions the
+  drain force-continues and arms suspension (#941 work item D).
+  Counted distinctly from (not a subset of) the throttle counter; the
+  overrides/throttles ratio is the diagnostic for LAG_THRESHOLD tuned
+  too tight.
 
 Operators tracking this contract in production monitor the gap
 `(observed_cov - cstruct)` and the starved-flow counter. A

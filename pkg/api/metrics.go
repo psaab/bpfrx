@@ -203,6 +203,14 @@ type xpfCollector struct {
 	bindingTXCompletions                *prometheus.Desc
 	bindingTXCompletionRingAvailable    *prometheus.Desc
 	bindingTXCompletionRingAvailableMax *prometheus.Desc
+	// #1831 (follow-up to #1766): per-binding V_min fairness-throttle
+	// counters (#941 work item D / #943). Already on the wire in
+	// BindingStatus; these export them to Prometheus. v_min_throttles
+	// is "fairness brake fired"; hard-cap overrides is "brake too
+	// tight, escape hatch rescued throughput" — the ratio is the
+	// LAG_THRESHOLD diagnostic.
+	bindingVMinThrottles                *prometheus.Desc
+	bindingVMinThrottleHardCapOverrides *prometheus.Desc
 	// #1248: class-specific active flow distribution by egress CoS
 	// queue. This is the production/mixed-workload {a_i} source.
 	cosActiveFlowCount *prometheus.Desc
@@ -398,6 +406,8 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.bindingTXCompletions
 	ch <- c.bindingTXCompletionRingAvailable
 	ch <- c.bindingTXCompletionRingAvailableMax
+	ch <- c.bindingVMinThrottles
+	ch <- c.bindingVMinThrottleHardCapOverrides
 	ch <- c.cosActiveFlowCount
 	ch <- c.fairnessCstruct
 	ch <- c.fairnessActiveWorkers

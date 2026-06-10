@@ -313,13 +313,7 @@ const DEFAULT_SLOW_PATH_TUN: &str = "xpf-usp0";
 const LOCAL_TUNNEL_DELIVERY_QUEUE_DEPTH: usize = 4096;
 const HA_WATCHDOG_STALE_AFTER_SECS: u64 = 10;
 const FABRIC_ZONE_MAC_MAGIC: u8 = 0xfe;
-const PROTO_TCP: u8 = 6;
-const PROTO_UDP: u8 = 17;
-const PROTO_ICMP: u8 = 1;
-const PROTO_ICMPV6: u8 = 58;
-#[allow(dead_code)]
-const PROTO_GRE: u8 = 47;
-const PROTO_ESP: u8 = 50;
+use crate::ip_proto::{PROTO_ESP, PROTO_GRE, PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
 const TCP_FLAG_FIN: u8 = 0x01;
 const TCP_FLAG_RST: u8 = 0x04;
 const TCP_FLAG_PSH: u8 = 0x08;

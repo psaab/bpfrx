@@ -1303,6 +1303,77 @@ func TestEmitBindingTXCompletionTelemetry_LabelsAndValues(t *testing.T) {
 	assertGaugeClose(t, got, c.bindingTXCompletionRingAvailableMax, labels, 29)
 }
 
+// #1831: value + type pin for the per-binding V_min fairness-throttle
+// counters (#941 work item D / #943) emitted by
+// emitBindingVMinThrottleCounters. assertCounterClose checks the
+// concrete dto type, so a Counter→Gauge mixup here fails the test.
+// Both series must emit even at 0 (second binding) so "brake never
+// fired" is a real 0 rather than an absent series.
+func TestEmitBindingVMinThrottleCounters_LabelsAndValues(t *testing.T) {
+	bindingLabels := []string{"binding_slot", "queue_id", "worker_id", "iface"}
+	c := &xpfCollector{
+		bindingVMinThrottles: prometheus.NewDesc(
+			"xpf_userspace_binding_v_min_throttles_total",
+			"test desc", bindingLabels, nil,
+		),
+		bindingVMinThrottleHardCapOverrides: prometheus.NewDesc(
+			"xpf_userspace_binding_v_min_throttle_hard_cap_overrides_total",
+			"test desc", bindingLabels, nil,
+		),
+	}
+
+	status := dpuserspace.ProcessStatus{
+		Bindings: []dpuserspace.BindingStatus{
+			{
+				Slot:                         2,
+				QueueID:                      5,
+				WorkerID:                     7,
+				Interface:                    "ge-0-0-1",
+				VMinThrottles:                67,
+				VMinThrottleHardCapOverrides: 59,
+			},
+			{
+				Slot:      3,
+				QueueID:   0,
+				WorkerID:  1,
+				Interface: "ge-0-0-2",
+				// zero counters must still emit
+			},
+		},
+	}
+
+	ch := make(chan prometheus.Metric)
+	go func() {
+		c.emitBindingVMinThrottleCounters(ch, status)
+		close(ch)
+	}()
+	var got []prometheus.Metric
+	for m := range ch {
+		got = append(got, m)
+	}
+	if len(got) != 4 {
+		t.Fatalf("emitBindingVMinThrottleCounters: want 4 metrics (2 bindings x 2 counters), got %d", len(got))
+	}
+
+	labels := map[string]string{
+		"binding_slot": "2",
+		"queue_id":     "5",
+		"worker_id":    "7",
+		"iface":        "ge-0-0-1",
+	}
+	assertCounterClose(t, got, c.bindingVMinThrottles, labels, 67)
+	assertCounterClose(t, got, c.bindingVMinThrottleHardCapOverrides, labels, 59)
+
+	zeroLabels := map[string]string{
+		"binding_slot": "3",
+		"queue_id":     "0",
+		"worker_id":    "1",
+		"iface":        "ge-0-0-2",
+	}
+	assertCounterClose(t, got, c.bindingVMinThrottles, zeroLabels, 0)
+	assertCounterClose(t, got, c.bindingVMinThrottleHardCapOverrides, zeroLabels, 0)
+}
+
 func TestEmitCoSActiveFlowCount_LabelsAndValue(t *testing.T) {
 	c := &xpfCollector{
 		cosActiveFlowCount: prometheus.NewDesc(

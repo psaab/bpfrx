@@ -14,8 +14,8 @@ pub(super) fn uses_kernel_local_session_map_entry(
 pub(super) fn diagnose_raw_ring_state(
     sock_fd: c_int,
 ) -> Option<(u32, u32, u32, u32, u32, u32, u32, u32)> {
-    // SOL_XDP = 283, XDP_MMAP_OFFSETS = 1
-    const SOL_XDP: i32 = 283;
+    // SOL_XDP (283) comes from afxdp/mod.rs via `use super::*` —
+    // #1826 deduplicated the former local copy.
     const XDP_MMAP_OFFSETS: i32 = 1;
     const XDP_PGOFF_RX_RING: i64 = 0;
     const XDP_PGOFF_TX_RING: i64 = 0x80000000;
