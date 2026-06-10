@@ -1,0 +1,36 @@
+# WAN-SQM cookbook validation fixture (#1828 Option C).
+#
+# The docs/cos-wan-sqm.md one-knob recipe: a BARE shaping-rate on the
+# loss-userspace-cluster WAN unit (reth0 unit 80 -> the reth0.80 /
+# 172.16.80.0/24 smoke path). No forwarding-classes, schedulers, or
+# scheduler-maps on purpose — admission into CoS and the synthetic
+# default best-effort queue come from the shaping-rate alone
+# (contributes_usable_cos_state gate + synthetic queue_id 0 in
+# userspace-dp/src/afxdp/forwarding_build/cos.rs), and per-flow MQFQ
+# engages via lazy promotion when a second distinct flow contends
+# (maybe_promote_best_effort in cos/queue_ops/push.rs, #1735).
+#
+# Rate: 3g (not the cookbook's 450m WAN example) so shaped vs unshaped
+# is unambiguous against the ~23 Gbit/s lab line rate while the run
+# stays quick. The mechanics under test are rate-independent.
+#
+# Pinned smoke assertions (full runnable snippet in docs/cos-wan-sqm.md
+# "Validation recipe"):
+#   (a) iperf3 -P 2 to 172.16.80.200 holds ~3 Gbit/s aggregate;
+#   (b) after the 2-flow run, at least one
+#       xpf_userspace_cos_active_flow_count sample is > 1
+#       (curl -s http://127.0.0.1:8080/metrics |
+#        grep '^xpf_userspace_cos_active_flow_count' | awk '$2 > 1'
+#        is non-empty) = MQFQ lazy promotion engaged;
+#   (c) delete class-of-service + commit restores unshaped line rate.
+#
+# Compile guard: pkg/config/sqm_cookbook_fixture_test.go parses the
+# `set` lines below on the production flat-set path and pins the
+# compiled shaping rate, no scheduler-map, and no compile warnings.
+#
+# The delete line keeps the fixture idempotent when loaded as one
+# atomic candidate (same convention as cos-iperf-config.set; scripts
+# that inject their own delete list strip non-`set` lines).
+delete class-of-service
+
+set class-of-service interfaces reth0 unit 80 shaping-rate 3g
