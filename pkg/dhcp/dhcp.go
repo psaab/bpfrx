@@ -309,11 +309,13 @@ func (m *Manager) Renew(ifaceName string) error {
 		// Re-check config membership before restarting: Renew is
 		// reachable from gRPC outside applySem, so a concurrent
 		// Reconcile may have removed this client from config after we
-		// captured dc above. Reconcile deletes the option-state map
-		// entry under m.mu before stopping the client, so membership
-		// here is the desired-set signal — restarting unconditionally
-		// would resurrect a client the operator just deconfigured
-		// (Codex review on PR #1815).
+		// captured dc above. Reconcile prunes the option-state map
+		// entries for ALL undesired keys under m.mu — including keys
+		// whose client already deregistered via finishClient — so
+		// membership here is exactly the desired-set signal in every
+		// interleaving. Restarting unconditionally would resurrect a
+		// client the operator just deconfigured (Codex review on PR
+		// #1815, rounds 3-4).
 		m.mu.Lock()
 		stillDesired := false
 		switch af {

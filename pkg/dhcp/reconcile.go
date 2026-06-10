@@ -100,18 +100,28 @@ func (m *Manager) Reconcile(specs []ClientSpec) {
 	for key, dc := range m.clients {
 		if _, ok := desired[key]; !ok {
 			stops = append(stops, stopEntry{key, dc, "removed from config"})
-			// Drop option state for fully removed clients.
-			switch key.family {
-			case AFInet:
-				delete(m.v4opts, key.iface)
-			case AFInet6:
-				delete(m.v6opts, key.iface)
-				delete(m.duidTypes, key.iface)
-			}
 			continue
 		}
 		if dc.fingerprint != m.configFingerprintLocked(key) {
 			stops = append(stops, stopEntry{key, dc, "client options changed"})
+		}
+	}
+	// Prune option state for every key absent from desired, regardless
+	// of whether a client is currently registered. Renew's membership
+	// guard treats these maps as the desired-config signal, and a
+	// renewing client may already be deregistered (cancel +
+	// finishClient) by the time this Reconcile runs — pruning only for
+	// registered clients would leave a stale entry that lets Renew
+	// resurrect the removed client (Codex review on PR #1815, round 4).
+	for iface := range m.v4opts {
+		if _, ok := desired[clientKey{iface: iface, family: AFInet}]; !ok {
+			delete(m.v4opts, iface)
+		}
+	}
+	for iface := range m.v6opts {
+		if _, ok := desired[clientKey{iface: iface, family: AFInet6}]; !ok {
+			delete(m.v6opts, iface)
+			delete(m.duidTypes, iface)
 		}
 	}
 	m.mu.Unlock()

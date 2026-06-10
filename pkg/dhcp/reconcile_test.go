@@ -334,3 +334,50 @@ func TestRenewDoesNotResurrectRemovedClient(t *testing.T) {
 		t.Fatalf("running clients = %v, want none", h)
 	}
 }
+
+// TestReconcilePrunesOptionStateForDeregisteredClients pins the
+// round-4 interleaving from the Codex review on PR #1815: by the time
+// a removal Reconcile runs, the renewing client may already be
+// deregistered (Renew cancelled it and finishClient deleted the
+// registry entry), so the registered-clients loop never visits the
+// key. Reconcile must still prune the option-state entry — Renew's
+// membership guard reads it as the desired-config signal, and a stale
+// entry would let Renew resurrect the removed client.
+func TestReconcilePrunesOptionStateForDeregisteredClients(t *testing.T) {
+	fr := newFakeRunner(false)
+	m := NewManagerForTesting(fr.run)
+
+	m.Reconcile([]ClientSpec{
+		{Iface: "fxp0", Family: AFInet},
+		{Iface: "fxp0", Family: AFInet6, V6: &DHCPv6Options{Stateless: true}},
+	})
+	waitForRunning(t, m, 2)
+
+	// Deregister both clients without a Reconcile (models the
+	// mid-Renew window where finishClient already ran): cancel and
+	// wait for done via StopAll, which leaves option state behind.
+	m.StopAll()
+	waitForRunning(t, m, 0)
+	if !m.HasOptionStateForTesting("fxp0", AFInet) ||
+		!m.HasOptionStateForTesting("fxp0", AFInet6) {
+		t.Fatal("precondition: option state should survive StopAll")
+	}
+
+	// Removal Reconcile with no registered clients must still prune.
+	m.Reconcile(nil)
+	if m.HasOptionStateForTesting("fxp0", AFInet) {
+		t.Fatal("v4 option state not pruned for deregistered client")
+	}
+	if m.HasOptionStateForTesting("fxp0", AFInet6) {
+		t.Fatal("v6 option state not pruned for deregistered client")
+	}
+
+	// And the Renew guard therefore cannot restart: no client, no
+	// membership — Renew reports an error and starts nothing.
+	if err := m.Renew("fxp0"); err == nil {
+		t.Fatal("Renew should fail after removal")
+	}
+	if got := fr.startCount("fxp0", AFInet); got != 1 {
+		t.Fatalf("v4 starts = %d, want 1 (no resurrection)", got)
+	}
+}
