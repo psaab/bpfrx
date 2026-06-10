@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Schema validators used by #1319 SchemaValidate. Each returns nil for
@@ -108,6 +109,39 @@ func parsePercentWithSuffixStrict(raw string) (float64, error) {
 		return 0, fmt.Errorf("percent out of range (0,100] (got %s); note: 0%% is not supported -- omit buffer-size to use the default burst", orig)
 	}
 	return v, nil
+}
+
+// MaxDurationMillis is the largest millisecond count that survives the
+// runtime's `time.Duration(ms) * time.Millisecond` conversion without
+// int64 overflow (math.MaxInt64 / 1e6 = 9223372036854). Above this, a
+// configured millisecond knob converts to a negative Duration — e.g. the
+// cluster heartbeat sender ticker panics on a non-positive interval. Used
+// as the honest runtime-derived upper bound for millisecond typed leaves
+// whose runtime otherwise accepts any positive value (#1319 PR 2; Codex
+// review on PR #1845: no schema-only caps).
+const MaxDurationMillis = int64(math.MaxInt64) / int64(time.Millisecond)
+
+// ValidateIntegerMin returns a closure that accepts any bare integer
+// >= min — the "no upper bound" spelling for typed leaves whose runtime
+// consumes the full integer range. The representational maximum is
+// implied by strconv.ParseInt's 64-bit limit (larger inputs fail as
+// "not an integer"). Preferred over ValidateInteger(min, math.MaxInt64)
+// so the operator error reads "must be at least N" instead of quoting a
+// 19-digit range bound.
+func ValidateIntegerMin(min int64) LeafValidator {
+	return func(raw string, _ *Config) error {
+		if strings.TrimSpace(raw) == "" {
+			return fmt.Errorf("missing value (expected integer)")
+		}
+		v, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return fmt.Errorf("not an integer: %q", raw)
+		}
+		if v < min {
+			return fmt.Errorf("integer must be at least %d (got %d)", min, v)
+		}
+		return nil
+	}
 }
 
 // validateInteger returns a closure that accepts a bare integer in

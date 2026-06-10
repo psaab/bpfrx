@@ -50,7 +50,12 @@ nothing internal.
   Called by `pkg/configstore.compileTree` on the apply-groups-expanded
   clone BEFORE compile, so garbage like `transmit-rate asd` fails loud at
   `commit check` even when it arrives through `groups { ... }`. (Re-homed
-  from `pkg/cmdtree.SchemaValidate` in #1319 PR 1.)
+  from `pkg/cmdtree.SchemaValidate` in #1319 PR 1.) The gate is strict
+  ONLY on the commit/commit-check path: the tolerant `Store.Load` /
+  `Store.SyncApply` ingress (`compileTreeLenient`) downgrades a violation
+  to a warning so a stored or peer-synced config carrying a value typed
+  or range-tightened after it was persisted cannot blackout-boot a node
+  or alarm-loop HA config sync (#1319 PR 2 boot safety).
 - `Validate*` functions — `schema_validators.go`. Stateless string
   validators (`ValidateRate`, `ValidateByteSize`,
   `ValidateByteSizeOrPercent`,
