@@ -8,7 +8,8 @@
 use super::super::byte_writes::{
     write_ipv6_dst, write_ipv6_src, write_l4_dst_port, write_l4_src_port,
 };
-use super::super::packet_rel_l4_offset;
+use super::super::checksum::{adjust_zero_checksum_illegal, ChecksumFamily};
+use super::super::v6_rel_l4_offset;
 use crate::afxdp::{
     RewriteDescriptor, UserspaceDpMeta, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP,
 };
@@ -32,13 +33,10 @@ pub(in crate::afxdp::frame) fn apply_rewrite_descriptor_ipv6(
         return None; // Hop limit expired
     }
 
-    // L4 offset from metadata or by parsing extension headers.
-    let meta_rel = meta.l4_offset.wrapping_sub(meta.l3_offset) as usize;
-    let rel_l4 = if meta_rel >= 40 && meta.l4_offset > meta.l3_offset {
-        meta_rel
-    } else {
-        packet_rel_l4_offset(&packet[ip..], meta.addr_family)?
-    };
+    // L4 offset from metadata or by parsing extension headers — the
+    // shared `v6_rel_l4_offset` helper (#1838) keeps this precedence
+    // rule structurally identical to the generic path's.
+    let rel_l4 = v6_rel_l4_offset(&packet[ip..], meta.l3_offset, meta.l4_offset, meta.addr_family)?;
     let l4 = ip + rel_l4;
 
     // Port validation (DMA race guard).
@@ -94,8 +92,17 @@ pub(in crate::afxdp::frame) fn apply_rewrite_descriptor_ipv6(
                 l4sum = (l4sum & 0xffff) + (l4sum >> 16);
             }
             let new_l4 = !(l4sum as u16);
-            // IPv6 UDP must have non-zero checksum; use 0xFFFF for all.
-            let final_csum = if new_l4 == 0 { 0xFFFFu16 } else { new_l4 };
+            // #1839: computed-zero canonicalization scoped to the
+            // shared predicate (UDP + ICMPv6 for v6 — RFC 8200 §8.1
+            // mandates the 0 → 0xFFFF substitution for UDP only; a
+            // computed TCP 0x0000 is valid on the wire and now matches
+            // both the generic adjusters and v4 TCP behavior).
+            let final_csum =
+                if new_l4 == 0 && adjust_zero_checksum_illegal(meta.protocol, ChecksumFamily::V6) {
+                    0xFFFFu16
+                } else {
+                    new_l4
+                };
             packet[l4_csum_off..l4_csum_off + 2].copy_from_slice(&final_csum.to_be_bytes());
         }
     }

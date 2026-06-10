@@ -10,7 +10,7 @@ inspect or rewrite a packet sitting in a UMEM frame.
 |------|---------|
 | `mod.rs` | Re-export hub + cross-module helpers (`apply_dscp_rewrite_to_frame`, `decode_frame_summary`, `frame_has_tcp_rst`, etc.). |
 | `byte_writes.rs` | In-place IP and L4 port rewrites (`write_ipv4_dst`, `write_ipv4_src`, `write_ipv6_dst`, `write_ipv6_src`, `write_l4_dst_port`, `write_l4_src_port`). |
-| `checksum.rs` | IPv4 header + L4 checksum incremental adjust + recompute. Owns the `checksum16_*` family. |
+| `checksum.rs` | IPv4 header + L4 checksum incremental adjust + recompute. Owns the `checksum16_*` family, the `ChecksumFamily` enum, and the two zero-checksum predicates (`l4_udp_checksum_optional` — RFC 768 received-0 skip, IPv4 UDP only (#1840); `adjust_zero_checksum_illegal` — computed-0 → 0xFFFF canonicalization, v4 UDP / v6 UDP+ICMPv6 (#1839)). The v6 adjusters/recompute take a caller-supplied `rel_l4` (ext-aware offset, #1838). |
 | `inspect.rs` | Read-only parsers / matchers used by screen, policy, conntrack hot paths. |
 | `tcp.rs` | TCP-specific inspection + mutation kernels (#989) — flags, MSS clamp, header munging. |
 | `tcp_segmentation.rs` | TCP segmentation kernels for forwarded over-MSS frames; re-exported from `mod.rs`. The `#[cold]` annotation is on the TX-side wrapper in `tx/tcp_segmentation.rs` that calls into these kernels, not on the kernels themselves. |
@@ -39,6 +39,27 @@ inspect or rewrite a packet sitting in a UMEM frame.
   case where the previous checksum is unknown (e.g. NAT64 from
   scratch in generic XDP — the BPF-side handling of this case is
   documented in `bpf/headers/` and the `xdp_nat64.c` source).
+- **IPv6 L4 offset is caller-threaded (#1838)**: `apply_nat_ipv6`,
+  the v6 checksum adjusters, and `recompute_l4_checksum_ipv6` take a
+  `rel_l4` parameter instead of assuming the fixed 40-byte base
+  header. The single source of offset truth is `v6_rel_l4_offset` in
+  `mod.rs` (meta-led when `meta_rel >= 40 && l4 > l3`, else the
+  extension-chain walk) — shared by the descriptor fast path, the
+  generic in-place rewrite, the copy builder, the slow path, and the
+  ICMPv6-error NAT reversal builder, so the offset precedence rule
+  cannot drift between paths. Every adjuster call within one
+  `apply_nat_ipv6` invocation uses the SAME threaded `rel_l4` as the
+  byte writes it balances — never re-derive mid-function.
+- **Zero-checksum rules are predicate-routed (#1839/#1840)**: the
+  RFC 768 received-0 skip (`l4_udp_checksum_optional`) is IPv4-UDP
+  only; the computed-0 → 0xFFFF canonicalization
+  (`adjust_zero_checksum_illegal`) covers v4 UDP and v6 UDP+ICMPv6
+  (NOT TCP — a computed TCP 0x0000 is wire-valid in both families).
+  Both rewrite paths route through the same predicates;
+  `apply_nat_port_rewrite` additionally applies the no-op-port parity
+  rule (v6 UDP stored 0x0000 + any port-NAT decision → 0xFFFF, even
+  when the port value is identical) so the descriptor's ≡0-delta
+  behavior matches byte-for-byte.
 
 ## Property tests (`prop_tests/`, #1824)
 
@@ -55,21 +76,24 @@ In-tree proptest harness (plan:
   checksum validity oracle (`prop_tests/oracle.rs` — NOT the
   v4-TCP-only `verify_built_frame_checksums`); randomized
   descriptor-vs-generic differential proving the flow-cache fast
-  path's byte-equivalence claim (checksum fields excluded — see
-  below); payload immutability.
+  path's byte-equivalence claim with FULL byte equality (empty
+  exclusion mask since the #1838/#1839/#1840 trio fix); payload
+  immutability.
 - **S4 TSO splitter** (`prop_tests/segment.rs`): reassembly identity,
   per-segment wellformedness (seq arithmetic incl. u32 wrap, PSH
-  handling, length fields, oracle checksums, segment count), NAT
+  handling, length fields incl. the ext-chain bytes in the v6
+  payload-length field, oracle checksums, segment count), NAT
   composition.
 
-Domain restrictions encode documented production divergences (each
-pinned by a deterministic example test in `prop_tests/rewrite.rs`,
-NOT hidden): #1838 (generic v6 NAT path assumes L4 at fixed offset
-40 — NAT generators are v6-ext-free), #1839 (0x0000/0xFFFF L4
-zero-checksum canonicalization scope mismatch — byte comparisons
-mask checksum fields; the oracle accepts both encodings), #1840
-(family-ungated UDP zero-checksum skip — generators never emit v6
-UDP zero checksums). Flip the pins when those issues are fixed.
+The #1838/#1839/#1840 defect trio is fixed and the domain gates that
+encoded it are lifted: NAT-applying and segmentation generators emit
+v6 extension-header chains, and the differential runs unmasked. The
+former defect pins are flipped to positive regression pins
+(`pin_1838_*_rewrites_real_l4`, `pin_1839_*_parity`,
+`pin_1840_*_family_gated` + the v4-skip counterpart and the
+same-port stored-zero parity pin). Valid-packet generators still
+never emit v6 UDP 0x0000 checksums — malformed per RFC 8200 §8.1 —
+so that encoding lives only in the deterministic pins.
 
 Conventions:
 

@@ -285,7 +285,12 @@ pub(in crate::afxdp) fn extract_l3_packet_with_nat(
     let mut packet = extract_l3_packet_from_frame(frame, meta)?;
     match meta.addr_family as i32 {
         libc::AF_INET => apply_nat_ipv4(&mut packet, meta.protocol, nat)?,
-        libc::AF_INET6 => apply_nat_ipv6(&mut packet, meta.protocol, nat)?,
+        libc::AF_INET6 => {
+            // Ext-aware L4 offset via the shared helper (#1838).
+            let rel_l4 =
+                v6_rel_l4_offset(&packet, meta.l3_offset, meta.l4_offset, meta.addr_family)?;
+            apply_nat_ipv6(&mut packet, rel_l4, meta.protocol, nat)?
+        }
         _ => return None,
     }
     Some(packet)

@@ -221,14 +221,20 @@ pub(super) fn segment_forwarded_tcp_frames_into_prepared(
                 libc::AF_INET6 => {
                     {
                         let packet = frame_out.get_mut(eth_len..)?;
+                        // v6 payload length = ext bytes + TCP header +
+                        // chunk; `ip_header_len` is the ext-aware parsed
+                        // L4 offset and each segment copies the full IP
+                        // header incl. the ext chain (#1838). Identical
+                        // to the old arithmetic when ip_header_len == 40.
+                        let v6_payload_len = (ip_header_len - 40) + tcp_header_len + chunk_len;
                         packet
                             .get_mut(4..6)?
-                            .copy_from_slice(&((tcp_header_len + chunk_len) as u16).to_be_bytes());
+                            .copy_from_slice(&(v6_payload_len as u16).to_be_bytes());
                         if (meta.meta_flags & 0x80) == 0 && packet[7] <= 1 {
                             return None;
                         }
                         if apply_nat {
-                            apply_nat_ipv6(packet, meta.protocol, decision.nat)?;
+                            apply_nat_ipv6(packet, ip_header_len, meta.protocol, decision.nat)?;
                         }
                         if (meta.meta_flags & 0x80) == 0 {
                             packet[7] -= 1;
@@ -241,7 +247,7 @@ pub(super) fn segment_forwarded_tcp_frames_into_prepared(
                         enforced_ports,
                     )?;
                     let packet = frame_out.get_mut(eth_len..)?;
-                    recompute_l4_checksum_ipv6(packet, meta.protocol)?;
+                    recompute_l4_checksum_ipv6(packet, ip_header_len, meta.protocol)?;
                 }
                 _ => return None,
             }

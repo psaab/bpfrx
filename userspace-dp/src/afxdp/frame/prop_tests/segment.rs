@@ -7,9 +7,11 @@
 //! P-T1 no-panic, P-T2 reassembly identity, P-T3 per-segment
 //! wellformedness (bounds, seq arithmetic incl. u32 wrap, PSH
 //! handling, IP length fields, P-N2 oracle checksums, segment count),
-//! P-T4 NAT composition. v6 inputs are ext-header-free — the splitter
-//! calls `apply_nat_ipv6` / `recompute_l4_checksum_ipv6`, both of
-//! which assume L4 at offset 40 (#1838).
+//! P-T4 NAT composition. v6 inputs include ext-header chains
+//! (re-admitted when #1838 was fixed): each segment copies the full
+//! IP header incl. the ext chain, the payload-length field counts the
+//! ext bytes, and `apply_nat_ipv6` / `recompute_l4_checksum_ipv6`
+//! receive the threaded ext-aware offset.
 //!
 //! The UMEM-coupled twin (`tx/tcp_segmentation.rs::…_into_prepared`)
 //! is out of scope (needs a BindingWorker/tx_pipeline harness) — plan
@@ -85,7 +87,7 @@ fn check_segments(
     want: &ExpectedTuple,
 ) -> Result<(), TestCaseError> {
     let eth_out = if tx_vlan > 0 { 18usize } else { 14usize };
-    let ip_hdr = pkt.rel_l4; // v4: IHL preserved; v6: 40 (ext-free)
+    let ip_hdr = pkt.rel_l4; // v4: IHL preserved; v6: 40 + ext chain
     let tcp_hdr = pkt.l4_header_len;
     let seg_max = mtu - ip_hdr - tcp_hdr;
     let data_len = pkt.payload_len;
@@ -129,7 +131,9 @@ fn check_segments(
             );
         } else {
             let plen = usize::from(u16::from_be_bytes([packet[4], packet[5]]));
-            prop_assert_eq!(plen, tcp_hdr + chunk, "v6 payload_len");
+            // #1838 §5.3: the payload-length field counts the copied
+            // ext-chain bytes (ip_hdr - 40) plus TCP header + chunk.
+            prop_assert_eq!(plen, (ip_hdr - 40) + tcp_hdr + chunk, "v6 payload_len");
             prop_assert_eq!(packet[7], orig_ttl - 1, "v6 hop limit decremented once");
             prop_assert_eq!(
                 (
@@ -270,6 +274,64 @@ proptest! {
                 &pkt.frame, pkt.meta, &decision, &forwarding, false, None,
             ),
             None
+        );
+    }
+}
+
+/// #1838 §5.3 deterministic pin: an ext-headered oversized v6 TCP
+/// frame segments into oracle-valid segments whose payload-length
+/// fields count the copied ext-chain bytes, under a dst-port NAT.
+#[test]
+fn pin_segmentation_v6_ext_chain_segments_valid() {
+    use super::strategies::{build_valid_frame, ExtHdr, PacketSpec};
+    let mtu = 1280usize;
+    let spec = PacketSpec {
+        v6: true,
+        src4: 0,
+        dst4: 0,
+        src6: [0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x66],
+        dst6: [0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xc8],
+        protocol: PROTO_TCP,
+        src_port: 0x1111,
+        dst_port: 0x2222,
+        vlan_id: 0,
+        ttl: 64,
+        ihl: 20,
+        ext: vec![ExtHdr::HopByHop(0), ExtHdr::DestOpts(0)],
+        payload_len: 3000,
+        payload_seed: 7,
+        udp_zero_csum: false,
+        tcp_flags: 0x18,
+        tcp_opt_len: 0,
+        seq: 1000,
+    };
+    let pkt = build_valid_frame(&spec);
+    assert_eq!(pkt.rel_l4, 56, "two 8-byte ext headers → L4 at 56");
+
+    let nat = NatDecision {
+        rewrite_dst_port: Some(0x3333),
+        ..NatDecision::default()
+    };
+    let forwarding = seg_fixture(mtu, 0);
+    let decision = seg_decision(pkt.dst_ip, 0, nat);
+    let want = expected_tuple(&pkt, nat);
+    let segs = segment_forwarded_tcp_frames_from_frame(
+        &pkt.frame,
+        pkt.meta,
+        &decision,
+        &forwarding,
+        false,
+        Some((want.src_port, want.dst_port)),
+    )
+    .expect("ext-headered oversized v6 TCP must segment");
+    assert!(segs.len() > 1, "splitter engaged");
+    check_segments(&segs, &pkt, mtu, 0, &want).expect("per-segment invariants hold");
+    // Spot-check the ext chain is carried verbatim in every segment.
+    for seg in &segs {
+        assert_eq!(
+            &seg[14 + 40..14 + 56],
+            &pkt.frame[14 + 40..14 + 56],
+            "segment carries the original ext chain"
         );
     }
 }

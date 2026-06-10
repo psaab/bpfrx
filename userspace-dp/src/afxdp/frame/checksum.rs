@@ -21,9 +21,12 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// Address family for the L4 checksum-offset / zero-checksum helpers.
 /// Only ever passed as a compile-time-literal at the call sites, so the
-/// `#[inline(always)]` helpers fold the match to a constant.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ChecksumFamily {
+/// `#[inline(always)]` helpers fold the match to a constant. Visible to
+/// the rest of `frame/` (#1839/#1840): the descriptor v6 arm
+/// (`rewrite/ipv6.rs`) and the port-rewrite path (`frame/mod.rs`)
+/// route their zero-checksum decisions through the same predicates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::afxdp::frame) enum ChecksumFamily {
     V4,
     V6,
 }
@@ -59,30 +62,55 @@ fn l4_checksum_field_delta_v6(protocol: u8) -> Option<usize> {
     }
 }
 
-/// Whether a received IPv4 UDP datagram carries an OPTIONAL checksum that
-/// may legitimately be 0x0000 (RFC 768 — the checksum is optional for IPv4
-/// UDP and 0x0000 means "no checksum was computed"). The incremental-adjust
-/// path must NOT fabricate a checksum for such a packet, so it skips.
+/// Whether a received UDP datagram carries an OPTIONAL checksum that
+/// may legitimately be 0x0000 (RFC 768 — the checksum is optional for
+/// IPv4 UDP and 0x0000 means "no checksum was computed"). The
+/// incremental-adjust path must NOT fabricate a checksum for such a
+/// packet, so it skips. The skip is IPv4-only (#1840): RFC 8200 §8.1
+/// makes the UDP checksum mandatory for IPv6, so a v6 UDP 0x0000 is
+/// malformed input and the adjusters update it like any other value.
 ///
 /// This is a DISTINCT concept from `adjust_zero_checksum_illegal` (which
 /// canonicalizes a freshly-computed 0x0000 to 0xFFFF). It is intentionally
 /// kept as its own predicate so the two RFC concepts are not conflated.
 #[inline(always)]
-fn l4_udp_checksum_optional(protocol: u8) -> bool {
-    protocol == PROTO_UDP
+pub(in crate::afxdp::frame) fn l4_udp_checksum_optional(
+    protocol: u8,
+    family: ChecksumFamily,
+) -> bool {
+    family == ChecksumFamily::V4 && protocol == PROTO_UDP
+}
+
+/// Map the metadata `addr_family` byte onto a `ChecksumFamily`. `None`
+/// for any other family — callers treat that as "nothing to adjust"
+/// (unreachable in practice: `frame_l4_offset` already fails other
+/// families before any port work happens).
+#[inline(always)]
+pub(in crate::afxdp::frame) fn checksum_family_of(addr_family: u8) -> Option<ChecksumFamily> {
+    match addr_family as i32 {
+        libc::AF_INET => Some(ChecksumFamily::V4),
+        libc::AF_INET6 => Some(ChecksumFamily::V6),
+        _ => None,
+    }
 }
 
 /// Whether a freshly-computed L4 checksum of 0x0000 must be canonicalized
-/// to 0xFFFF on the INCREMENTAL-ADJUST sites. IPv4: UDP only. IPv6: UDP and
-/// ICMPv6 (RFC 2460 §8.1 / RFC 8200 forbid a transmitted 0x0000 for both,
-/// since 0x0000 has the "no checksum" meaning for IPv4 UDP).
+/// to 0xFFFF. IPv4: UDP only. IPv6: UDP and ICMPv6 (RFC 2460 §8.1 /
+/// RFC 8200 forbid a transmitted 0x0000 for both, since 0x0000 has the
+/// "no checksum" meaning for IPv4 UDP).
 ///
-/// SCOPE: this describes the incremental `adjust_l4_checksum_*` sites ONLY.
-/// It deliberately does NOT describe `recompute_l4_checksum_ipv6`, whose
-/// ICMPv6 arm writes the raw sum without canonicalizing 0 → 0xFFFF — a
-/// pre-existing asymmetry this module preserves and does not unify here.
+/// SCOPE (#1839): this is the single source of truth for the
+/// computed-zero rule across the incremental `adjust_l4_checksum_*`
+/// sites, the descriptor fast path (`rewrite/ipv6.rs`), the port
+/// adjust (`adjust_l4_checksum_port`), and — by matching arithmetic —
+/// `recompute_l4_checksum_ipv6` (UDP and ICMPv6 arms canonicalize; TCP
+/// does not: a computed TCP 0x0000 is valid on the wire and matches v4
+/// TCP behavior).
 #[inline(always)]
-fn adjust_zero_checksum_illegal(protocol: u8, family: ChecksumFamily) -> bool {
+pub(in crate::afxdp::frame) fn adjust_zero_checksum_illegal(
+    protocol: u8,
+    family: ChecksumFamily,
+) -> bool {
     match family {
         ChecksumFamily::V4 => protocol == PROTO_UDP,
         ChecksumFamily::V6 => matches!(protocol, PROTO_UDP | PROTO_ICMPV6),
@@ -265,11 +293,6 @@ pub(in crate::afxdp) fn ipv4_words(ip: Ipv4Addr) -> [u16; 2] {
     ]
 }
 
-#[allow(dead_code)]
-pub(in crate::afxdp) fn ipv6_words(ip: Ipv6Addr) -> [u16; 8] {
-    ipv6_words_from_octets(ip.octets())
-}
-
 pub(in crate::afxdp) fn ipv6_words_from_octets(octets: [u8; 16]) -> [u16; 8] {
     [
         u16::from_be_bytes([octets[0], octets[1]]),
@@ -365,34 +388,13 @@ pub(in crate::afxdp) fn adjust_l4_checksum_ipv4(
     Some(())
 }
 
-#[allow(dead_code)]
-pub(in crate::afxdp) fn adjust_l4_checksum_ipv6(
-    packet: &mut [u8],
-    protocol: u8,
-    old_src: Ipv6Addr,
-    new_src: Ipv6Addr,
-    old_dst: Ipv6Addr,
-    new_dst: Ipv6Addr,
-) -> Option<()> {
-    let delta = match l4_checksum_field_delta_v6(protocol) {
-        Some(d) => d,
-        None => return Some(()),
-    };
-    let checksum_offset = 40usize.checked_add(delta)?;
-    let current = u16::from_be_bytes([
-        *packet.get(checksum_offset)?,
-        *packet.get(checksum_offset + 1)?,
-    ]);
-    let mut updated = checksum16_adjust(current, &ipv6_words(old_src), &ipv6_words(new_src));
-    updated = checksum16_adjust(updated, &ipv6_words(old_dst), &ipv6_words(new_dst));
-    if adjust_zero_checksum_illegal(protocol, ChecksumFamily::V6) && updated == 0 {
-        updated = 0xffff;
-    }
-    packet
-        .get_mut(checksum_offset..checksum_offset + 2)?
-        .copy_from_slice(&updated.to_be_bytes());
-    Some(())
-}
+// The IPv6 dead trio (`adjust_l4_checksum_ipv6`, `_src`, `_dst`) was
+// deleted in #1838: all were `#[allow(dead_code)]` with zero non-test
+// callers, and threading the ext-aware `rel_l4` offset through helpers
+// nobody calls would have been pure noise. `ipv6_words` went with them
+// (its only remaining caller was the deleted trio). The live v6
+// adjusters are `adjust_l4_checksum_ipv6_words` and
+// `adjust_l4_checksum_ipv6_addr_bytes` below.
 
 pub(in crate::afxdp) fn adjust_l4_checksum_ipv4_src(
     packet: &mut [u8],
@@ -442,7 +444,7 @@ pub(in crate::afxdp) fn adjust_l4_checksum_ipv4_words(
         *packet.get(checksum_offset)?,
         *packet.get(checksum_offset + 1)?,
     ]);
-    if l4_udp_checksum_optional(protocol) && current == 0 {
+    if l4_udp_checksum_optional(protocol, ChecksumFamily::V4) && current == 0 {
         return Some(());
     }
     let updated = checksum16_adjust(current, old_words, new_words);
@@ -457,28 +459,13 @@ pub(in crate::afxdp) fn adjust_l4_checksum_ipv4_words(
     Some(())
 }
 
-#[allow(dead_code)]
-pub(in crate::afxdp) fn adjust_l4_checksum_ipv6_src(
-    packet: &mut [u8],
-    protocol: u8,
-    old_src: Ipv6Addr,
-    new_src: Ipv6Addr,
-) -> Option<()> {
-    adjust_l4_checksum_ipv6_words(packet, protocol, &ipv6_words(old_src), &ipv6_words(new_src))
-}
-
-#[allow(dead_code)]
-pub(in crate::afxdp) fn adjust_l4_checksum_ipv6_dst(
-    packet: &mut [u8],
-    protocol: u8,
-    old_dst: Ipv6Addr,
-    new_dst: Ipv6Addr,
-) -> Option<()> {
-    adjust_l4_checksum_ipv6_words(packet, protocol, &ipv6_words(old_dst), &ipv6_words(new_dst))
-}
-
+/// Incremental v6 L4 checksum adjust for a word-list delta. `rel_l4`
+/// is the L4 offset relative to the IPv6 header start (40 for the
+/// ext-free common case; the caller's ext-aware walk result otherwise
+/// — #1838). The checksum field sits at `rel_l4 + {16,6,2}`.
 pub(in crate::afxdp) fn adjust_l4_checksum_ipv6_words(
     packet: &mut [u8],
+    rel_l4: usize,
     protocol: u8,
     old_words: &[u16],
     new_words: &[u16],
@@ -487,7 +474,7 @@ pub(in crate::afxdp) fn adjust_l4_checksum_ipv6_words(
         Some(d) => d,
         None => return Some(()),
     };
-    let checksum_offset = 40usize.checked_add(delta)?;
+    let checksum_offset = rel_l4.checked_add(delta)?;
     let current = u16::from_be_bytes([
         *packet.get(checksum_offset)?,
         *packet.get(checksum_offset + 1)?,
@@ -505,6 +492,7 @@ pub(in crate::afxdp) fn adjust_l4_checksum_ipv6_words(
 #[inline(always)]
 pub(super) fn adjust_l4_checksum_ipv6_addr_bytes(
     packet: &mut [u8],
+    rel_l4: usize,
     protocol: u8,
     old_addr: &[u8; 16],
     new_addr: &[u8; 16],
@@ -513,8 +501,9 @@ pub(super) fn adjust_l4_checksum_ipv6_addr_bytes(
         Some(d) => d,
         None => return Some(()),
     };
-    // 40 + {16,6,2} reproduces the previous absolute constants 56/46/42.
-    let checksum_offset = 40usize.checked_add(delta)?;
+    // rel_l4 + {16,6,2}; with rel_l4 == 40 (no ext headers) this
+    // reproduces the previous absolute constants 56/46/42 (#1838).
+    let checksum_offset = rel_l4.checked_add(delta)?;
     let current = u16::from_be_bytes([
         *packet.get(checksum_offset)?,
         *packet.get(checksum_offset + 1)?,
@@ -567,8 +556,19 @@ pub(in crate::afxdp) fn recompute_l4_checksum_ipv4(
     Some(())
 }
 
-pub(in crate::afxdp) fn recompute_l4_checksum_ipv6(packet: &mut [u8], protocol: u8) -> Option<()> {
-    let payload = packet.get(40..)?;
+/// Full L4 checksum recompute for an IPv6 packet. `rel_l4` is the L4
+/// offset relative to the IPv6 header start (40 when no extension
+/// headers; the caller's ext-aware walk result otherwise — #1838).
+/// The pseudo-header upper-layer length is `packet.len() - rel_l4`
+/// and the Next Header value is `protocol` (the final L4 protocol) —
+/// exactly what RFC 8200 §8.1 prescribes when extension headers are
+/// present.
+pub(in crate::afxdp) fn recompute_l4_checksum_ipv6(
+    packet: &mut [u8],
+    rel_l4: usize,
+    protocol: u8,
+) -> Option<()> {
+    let payload = packet.get(rel_l4..)?;
     let src = Ipv6Addr::from(<[u8; 16]>::try_from(packet.get(8..24)?).ok()?);
     let dst = Ipv6Addr::from(<[u8; 16]>::try_from(packet.get(24..40)?).ok()?);
     match protocol {
@@ -576,31 +576,42 @@ pub(in crate::afxdp) fn recompute_l4_checksum_ipv6(packet: &mut [u8], protocol: 
             if payload.len() < 20 {
                 return None;
             }
-            packet.get_mut(40 + 16..40 + 18)?.copy_from_slice(&[0, 0]);
-            let sum = checksum16_ipv6(src, dst, PROTO_TCP, packet.get(40..)?);
             packet
-                .get_mut(40 + 16..40 + 18)?
+                .get_mut(rel_l4 + 16..rel_l4 + 18)?
+                .copy_from_slice(&[0, 0]);
+            let sum = checksum16_ipv6(src, dst, PROTO_TCP, packet.get(rel_l4..)?);
+            packet
+                .get_mut(rel_l4 + 16..rel_l4 + 18)?
                 .copy_from_slice(&sum.to_be_bytes());
         }
         PROTO_UDP => {
             if payload.len() < 8 {
                 return None;
             }
-            packet.get_mut(40 + 6..40 + 8)?.copy_from_slice(&[0, 0]);
-            let sum = checksum16_ipv6(src, dst, PROTO_UDP, packet.get(40..)?);
+            packet
+                .get_mut(rel_l4 + 6..rel_l4 + 8)?
+                .copy_from_slice(&[0, 0]);
+            let sum = checksum16_ipv6(src, dst, PROTO_UDP, packet.get(rel_l4..)?);
             let sum = if sum == 0 { 0xffff } else { sum };
             packet
-                .get_mut(40 + 6..40 + 8)?
+                .get_mut(rel_l4 + 6..rel_l4 + 8)?
                 .copy_from_slice(&sum.to_be_bytes());
         }
         PROTO_ICMPV6 => {
             if payload.len() < 4 {
                 return None;
             }
-            packet.get_mut(40 + 2..40 + 4)?.copy_from_slice(&[0, 0]);
-            let sum = checksum16_ipv6(src, dst, PROTO_ICMPV6, packet.get(40..)?);
             packet
-                .get_mut(40 + 2..40 + 4)?
+                .get_mut(rel_l4 + 2..rel_l4 + 4)?
+                .copy_from_slice(&[0, 0]);
+            let sum = checksum16_ipv6(src, dst, PROTO_ICMPV6, packet.get(rel_l4..)?);
+            // #1839: canonicalize computed 0x0000 → 0xFFFF, completing
+            // the single coherent v6 matrix with the incremental
+            // adjusters (`adjust_zero_checksum_illegal` includes
+            // ICMPv6 for V6).
+            let sum = if sum == 0 { 0xffff } else { sum };
+            packet
+                .get_mut(rel_l4 + 2..rel_l4 + 4)?
                 .copy_from_slice(&sum.to_be_bytes());
         }
         _ => {}
@@ -737,11 +748,31 @@ mod l4_offset_helper_tests {
     }
 
     #[test]
-    fn udp_checksum_optional_is_udp_only() {
-        assert!(l4_udp_checksum_optional(PROTO_UDP));
-        assert!(!l4_udp_checksum_optional(PROTO_TCP));
-        assert!(!l4_udp_checksum_optional(PROTO_ICMPV6));
-        assert!(!l4_udp_checksum_optional(PROTO_ICMP));
+    fn udp_checksum_optional_is_v4_udp_only() {
+        // #1840 family table: the RFC 768 "no checksum" skip exists
+        // for IPv4 UDP ONLY. RFC 8200 §8.1 makes the checksum
+        // mandatory for IPv6 UDP, so no v6 protocol may skip.
+        assert!(l4_udp_checksum_optional(PROTO_UDP, ChecksumFamily::V4));
+        assert!(!l4_udp_checksum_optional(PROTO_TCP, ChecksumFamily::V4));
+        assert!(!l4_udp_checksum_optional(PROTO_ICMPV6, ChecksumFamily::V4));
+        assert!(!l4_udp_checksum_optional(PROTO_ICMP, ChecksumFamily::V4));
+        assert!(!l4_udp_checksum_optional(PROTO_UDP, ChecksumFamily::V6));
+        assert!(!l4_udp_checksum_optional(PROTO_TCP, ChecksumFamily::V6));
+        assert!(!l4_udp_checksum_optional(PROTO_ICMPV6, ChecksumFamily::V6));
+    }
+
+    #[test]
+    fn checksum_family_of_maps_af_constants() {
+        assert_eq!(
+            checksum_family_of(libc::AF_INET as u8),
+            Some(ChecksumFamily::V4)
+        );
+        assert_eq!(
+            checksum_family_of(libc::AF_INET6 as u8),
+            Some(ChecksumFamily::V6)
+        );
+        assert_eq!(checksum_family_of(0), None);
+        assert_eq!(checksum_family_of(255), None);
     }
 
     #[test]
@@ -880,14 +911,56 @@ mod l4_offset_helper_tests {
         // ICMPv6 checksum field is at 40 + 2 = 42. Start it at 0.
         p[42] = 0;
         p[43] = 0;
-        let same = ipv6_words(Ipv6Addr::LOCALHOST);
-        let r = adjust_l4_checksum_ipv6_words(&mut p, PROTO_ICMPV6, &same, &same);
+        let same = ipv6_words_from_octets(Ipv6Addr::LOCALHOST.octets());
+        let r = adjust_l4_checksum_ipv6_words(&mut p, 40, PROTO_ICMPV6, &same, &same);
         assert_eq!(r, Some(()));
         // current=0, identity adjust -> 0, canonicalized -> 0xffff.
         assert_eq!(
             u16::from_be_bytes([p[42], p[43]]),
             0xffff,
             "ICMPv6 computed-zero must canonicalize to 0xffff"
+        );
+    }
+
+    #[test]
+    fn recompute_ipv6_icmpv6_computed_zero_canonicalizes_to_ffff() {
+        // #1839 rider: recompute_l4_checksum_ipv6's ICMPv6 arm
+        // canonicalizes a computed 0x0000 to 0xFFFF, completing the
+        // v6 matrix with the incremental adjusters. Two-pass balancing:
+        // stored C1 = !fold(S), so a balancing word of C1 makes
+        // fold(S + C1) = 0xFFFF → raw computed checksum 0.
+        let mut p = vec![0u8; 48];
+        p[0] = 0x60;
+        p[4..6].copy_from_slice(&8u16.to_be_bytes()); // payload len
+        p[6] = PROTO_ICMPV6;
+        p[7] = 64;
+        // src/dst stay all-zero; ICMPv6 echo header at 40..48 with the
+        // balancing word in the last two bytes.
+        p[40] = 128;
+        assert_eq!(recompute_l4_checksum_ipv6(&mut p, 40, PROTO_ICMPV6), Some(()));
+        let c1 = u16::from_be_bytes([p[42], p[43]]);
+        p[46..48].copy_from_slice(&c1.to_be_bytes());
+        assert_eq!(recompute_l4_checksum_ipv6(&mut p, 40, PROTO_ICMPV6), Some(()));
+        // Raw sum is genuinely zero (receiver-style verify with the
+        // field zeroed)…
+        let mut zeroed = p[40..].to_vec();
+        zeroed[2] = 0;
+        zeroed[3] = 0;
+        assert_eq!(
+            checksum16_ipv6(
+                Ipv6Addr::UNSPECIFIED,
+                Ipv6Addr::UNSPECIFIED,
+                PROTO_ICMPV6,
+                &zeroed
+            ),
+            0,
+            "balancing word must force the raw computed checksum to zero"
+        );
+        // …and the stored field is the canonical 0xFFFF encoding.
+        assert_eq!(
+            u16::from_be_bytes([p[42], p[43]]),
+            0xffff,
+            "ICMPv6 recompute must canonicalize computed-zero to 0xFFFF"
         );
     }
 

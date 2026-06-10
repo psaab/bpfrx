@@ -142,23 +142,21 @@ pub(super) fn oracle_packet_valid(
     }
 }
 
-/// Byte ranges (relative to the L3 start) that the two rewrite paths
-/// legitimately encode differently — the checksum fields. Everything
-/// else must be byte-identical (#1824 plan P-N1/P-N3 mask; Codex r2 Q2
-/// resolution: one shared, auditable mask helper).
+/// Byte ranges (relative to the L3 start) where a rewrite may
+/// legitimately change the encoding without changing the value — the
+/// checksum fields. Used by P-N1's apply+undo round trip, which
+/// restores the checksum VALUE class but is not
+/// representation-stable for one's-complement zero.
 ///
 /// - v4: IP header checksum (10..12) + L4 checksum.
 /// - v6: L4 checksum only (no IP header checksum).
 ///
-/// The L4 checksum exclusion is forced by two review-discovered
-/// production divergences: #1839 (descriptor canonicalizes computed
-/// 0x0000→0xFFFF for ALL v6 protocols; generic only for UDP/ICMPv6)
-/// and #1840 (generic UDP zero-skip is not family-gated). The v4 IP
-/// header exclusion is the RFC 1624 zero-representation ambiguity:
-/// both paths are incremental but fold differently (descriptor:
-/// single-pass `!old + delta + 0xFEFF`; generic: three chained
-/// `checksum16_adjust` refolds) — end-around-carry totals ≡ 0
-/// (mod 0xFFFF) can surface as 0x0000 in one and 0xFFFF in the other.
+/// NOT used by P-N3 anymore: since the #1838/#1839/#1840 trio fix the
+/// descriptor and generic paths agree byte-for-byte (the computed-zero
+/// canonicalization is predicate-scoped on both, the RFC 768 skip is
+/// family-gated on both, and the §5.5 no-op-port rule closes the
+/// stored-zero identity corner), so the differential runs with an
+/// EMPTY mask.
 pub(super) fn checksum_byte_ranges(
     addr_family: u8,
     protocol: u8,

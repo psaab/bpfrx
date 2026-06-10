@@ -2190,6 +2190,317 @@ fn icmpv6_te_nat_reversal_v6_rewrites_outer_dst_and_embedded_src() {
     );
 }
 
+/// Flexible ICMPv6 Time Exceeded fixture for the #1838 §5.7 builder
+/// tests: optional outer hop-by-hop ext header (8 bytes between the
+/// outer IPv6 header and the ICMPv6 header), optional fragment header
+/// in the EMBEDDED quoted packet (with caller-controlled raw
+/// offset/flags bytes), and optional trailing bytes inside the ICMPv6
+/// checksum coverage (used to force a computed-zero checksum).
+#[allow(clippy::too_many_arguments)]
+fn build_icmpv6_te_frame_ext(
+    router_ip: Ipv6Addr,
+    snat_ip: Ipv6Addr,
+    server_ip: Ipv6Addr,
+    snat_port: u16,
+    server_port: u16,
+    outer_hbh: bool,
+    embedded_frag_off_flags: Option<u16>,
+    trailing: &[u8],
+) -> Vec<u8> {
+    let mut frame = Vec::new();
+    write_eth_header(
+        &mut frame,
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+        0,
+        0x86dd,
+    );
+
+    // Embedded IPv6 (+ optional fragment header) + 8 bytes of TCP.
+    let mut embedded = Vec::new();
+    embedded.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]);
+    let frag_len = if embedded_frag_off_flags.is_some() { 8 } else { 0 };
+    let emb_payload_len = (frag_len + 8) as u16;
+    embedded.extend_from_slice(&emb_payload_len.to_be_bytes());
+    embedded.push(if embedded_frag_off_flags.is_some() {
+        44 // fragment header
+    } else {
+        PROTO_TCP
+    });
+    embedded.push(64);
+    embedded.extend_from_slice(&snat_ip.octets());
+    embedded.extend_from_slice(&server_ip.octets());
+    if let Some(off_flags) = embedded_frag_off_flags {
+        embedded.push(PROTO_TCP); // next header after the fragment hdr
+        embedded.push(0); // reserved
+        embedded.extend_from_slice(&off_flags.to_be_bytes());
+        embedded.extend_from_slice(&[0, 0, 0, 1]); // identification
+    }
+    embedded.extend_from_slice(&snat_port.to_be_bytes());
+    embedded.extend_from_slice(&server_port.to_be_bytes());
+    embedded.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+
+    // ICMPv6 Time Exceeded + embedded + trailing.
+    let mut icmp6 = Vec::new();
+    icmp6.extend_from_slice(&[3, 0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    icmp6.extend_from_slice(&embedded);
+    icmp6.extend_from_slice(trailing);
+
+    // Outer IPv6 header (+ optional hop-by-hop).
+    let hbh_len = if outer_hbh { 8usize } else { 0 };
+    let payload_len = (hbh_len + icmp6.len()) as u16;
+    frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]);
+    frame.extend_from_slice(&payload_len.to_be_bytes());
+    frame.push(if outer_hbh { 0 } else { PROTO_ICMPV6 });
+    frame.push(64);
+    frame.extend_from_slice(&router_ip.octets());
+    frame.extend_from_slice(&snat_ip.octets());
+    if outer_hbh {
+        // Hop-by-hop: next = ICMPv6, hdr-ext-len 0 → 8 bytes total.
+        frame.extend_from_slice(&[PROTO_ICMPV6, 0, 1, 4, 0, 0, 0, 0]);
+    }
+
+    icmp6[2..4].copy_from_slice(&[0, 0]);
+    let csum = checksum16_ipv6(router_ip, snat_ip, PROTO_ICMPV6, &icmp6);
+    let csum = if csum == 0 { 0xffff } else { csum };
+    icmp6[2..4].copy_from_slice(&csum.to_be_bytes());
+
+    frame.extend_from_slice(&icmp6);
+    frame
+}
+
+fn icmpv6_te_match_fixture(
+    snat_ip: Ipv6Addr,
+    client_ip: Ipv6Addr,
+    snat_port: u16,
+    client_port: u16,
+) -> EmbeddedIcmpMatch {
+    EmbeddedIcmpMatch {
+        nat: NatDecision {
+            rewrite_src: Some(IpAddr::V6(snat_ip)),
+            rewrite_src_port: Some(snat_port),
+            ..NatDecision::default()
+        },
+        original_src: IpAddr::V6(client_ip),
+        original_src_port: client_port,
+        embedded_proto: PROTO_TCP,
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 5,
+            tx_ifindex: 5,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V6(client_ip)),
+            neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
+            tx_vlan_id: 0,
+        },
+        metadata: SessionMetadata {
+            ingress_zone: TEST_UNTRUST_ZONE_ID,
+            egress_zone: TEST_TRUST_ZONE_ID,
+            owner_rg_id: 0,
+            fabric_ingress: false,
+            is_reverse: false,
+            nat64_reverse: None,
+        },
+    }
+}
+
+fn icmpv6_te_meta(l4_offset: u16) -> UserspaceDpMeta {
+    UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        l4_offset,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_ICMPV6,
+        ..UserspaceDpMeta::default()
+    }
+}
+
+/// #1838 §5.7: an ICMPv6 error whose OUTER packet carries an extension
+/// header. The NAT match is ext-aware (reads the ICMP type at
+/// meta.l4_offset), so this input matched — and the old fixed-40
+/// builder then wrote the embedded un-NAT and the checksum recompute
+/// inside the outer hop-by-hop header. With the shared offset helper
+/// the un-NAT lands at the real offsets and the output verifies.
+#[test]
+fn icmpv6_te_nat_reversal_outer_ext_header_lands_at_real_offsets() {
+    let router_ip: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let snat_ip: Ipv6Addr = "2001:db8:1::100".parse().unwrap();
+    let client_ip: Ipv6Addr = "fd00::102".parse().unwrap();
+    let server_ip: Ipv6Addr = "2001:db8:2::1".parse().unwrap();
+    let snat_port: u16 = 40000;
+    let client_port: u16 = 12345;
+
+    let frame = build_icmpv6_te_frame_ext(
+        router_ip, snat_ip, server_ip, snat_port, 80, true, None, &[],
+    );
+    // Outer L4 (ICMPv6) at eth(14) + IPv6(40) + hop-by-hop(8) = 62.
+    let meta = icmpv6_te_meta(62);
+    let icmp_match = icmpv6_te_match_fixture(snat_ip, client_ip, snat_port, client_port);
+
+    let result = build_nat_reversed_icmp_error_v6(&frame, meta, &icmp_match)
+        .expect("should build NAT-reversed ICMPv6 frame for outer-ext error");
+
+    // Outer dst rewritten to the original client.
+    let outer_dst = Ipv6Addr::from(<[u8; 16]>::try_from(&result[38..54]).unwrap());
+    assert_eq!(outer_dst, client_ip);
+    // Hop-by-hop bytes untouched (the old fixed-40 builder scribbled
+    // the embedded src into them).
+    assert_eq!(
+        &result[54..62],
+        &frame[54..62],
+        "outer extension header must not be modified"
+    );
+    // Embedded IPv6 src is the original client at the REAL offset:
+    // eth(14) + outer(40) + hbh(8) + icmp6(8) = 70.
+    let emb_ip_start = 70;
+    let emb_src =
+        Ipv6Addr::from(<[u8; 16]>::try_from(&result[emb_ip_start + 8..emb_ip_start + 24]).unwrap());
+    assert_eq!(emb_src, client_ip, "embedded src restored at real offset");
+    // Embedded TCP src port restored.
+    let emb_l4 = emb_ip_start + 40;
+    assert_eq!(
+        u16::from_be_bytes([result[emb_l4], result[emb_l4 + 1]]),
+        client_port,
+        "embedded src port restored at real offset"
+    );
+    // ICMPv6 checksum recomputed with the CORRECT coverage (from the
+    // real icmp_offset 48, upper-layer length = len - 48): receiver
+    // verification over the stored checksum folds to zero.
+    let outer_src = Ipv6Addr::from(<[u8; 16]>::try_from(&result[22..38]).unwrap());
+    assert_eq!(
+        checksum16_ipv6(outer_src, outer_dst, PROTO_ICMPV6, &result[62..]),
+        0,
+        "ICMPv6 checksum must verify with ext-aware coverage"
+    );
+}
+
+/// #1838 §5.7 (Codex r2): a quoted NON-FIRST fragment has no L4
+/// header — the builder must not write "ports" into its payload
+/// bytes. A quoted FIRST/atomic fragment does carry the L4 header
+/// after the fragment header — the restore must land there.
+#[test]
+fn icmpv6_te_nat_reversal_embedded_fragment_handling() {
+    let router_ip: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let snat_ip: Ipv6Addr = "2001:db8:1::100".parse().unwrap();
+    let client_ip: Ipv6Addr = "fd00::102".parse().unwrap();
+    let server_ip: Ipv6Addr = "2001:db8:2::1".parse().unwrap();
+    let snat_port: u16 = 40000;
+    let client_port: u16 = 12345;
+    let emb_ip_start = 62; // eth(14) + outer(40) + icmp6(8)
+
+    // Non-first fragment (offset bits nonzero): embedded address is
+    // still restored (offset-independent), but the fragment header and
+    // the quoted payload bytes after it are byte-identical to input —
+    // no port write lands in payload.
+    let frame = build_icmpv6_te_frame_ext(
+        router_ip,
+        snat_ip,
+        server_ip,
+        snat_port,
+        80,
+        false,
+        Some(0x0008), // fragment offset 1, M=0
+        &[],
+    );
+    let meta = icmpv6_te_meta(54);
+    let icmp_match = icmpv6_te_match_fixture(snat_ip, client_ip, snat_port, client_port);
+    let result = build_nat_reversed_icmp_error_v6(&frame, meta, &icmp_match)
+        .expect("builder still produces the error frame");
+    let emb_src =
+        Ipv6Addr::from(<[u8; 16]>::try_from(&result[emb_ip_start + 8..emb_ip_start + 24]).unwrap());
+    assert_eq!(emb_src, client_ip, "address restore is offset-independent");
+    assert_eq!(
+        &result[emb_ip_start + 40..],
+        &frame[emb_ip_start + 40..],
+        "non-first fragment: fragment header + payload bytes untouched"
+    );
+
+    // First/atomic fragment (offset 0): the L4 header follows the
+    // fragment header — the port restore lands at emb_ip + 48.
+    let frame = build_icmpv6_te_frame_ext(
+        router_ip,
+        snat_ip,
+        server_ip,
+        snat_port,
+        80,
+        false,
+        Some(0x0001), // offset 0, M=1 (first fragment)
+        &[],
+    );
+    let result = build_nat_reversed_icmp_error_v6(&frame, meta, &icmp_match)
+        .expect("builder produces the error frame");
+    let emb_l4 = emb_ip_start + 48;
+    assert_eq!(
+        u16::from_be_bytes([result[emb_l4], result[emb_l4 + 1]]),
+        client_port,
+        "first/atomic fragment: port restored after the fragment header"
+    );
+}
+
+/// #1838 §5.7 (Codex r2 medium 2): the builder's final ICMPv6 checksum
+/// recompute canonicalizes a computed 0x0000 to 0xFFFF — representation
+/// assertion on the STORED field (a verify-style oracle accepts both
+/// encodings of one's-complement zero and cannot see this).
+#[test]
+fn icmpv6_te_nat_reversal_computed_zero_checksum_stored_as_ffff() {
+    let router_ip: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let snat_ip: Ipv6Addr = "2001:db8:1::100".parse().unwrap();
+    let client_ip: Ipv6Addr = "fd00::102".parse().unwrap();
+    let server_ip: Ipv6Addr = "2001:db8:2::1".parse().unwrap();
+    let snat_port: u16 = 40000;
+    let client_port: u16 = 12345;
+    let icmp6_start = 54; // eth(14) + outer IPv6(40)
+
+    // Pass 1: zero balancing word → read the stored checksum C1.
+    // stored C1 = !fold(S) where S is the coverage sum with the
+    // checksum field zeroed; setting the balancer to C1 makes
+    // fold(S + C1) = 0xFFFF, i.e. a raw computed checksum of 0.
+    let meta = icmpv6_te_meta(54);
+    let icmp_match = icmpv6_te_match_fixture(snat_ip, client_ip, snat_port, client_port);
+    let frame = build_icmpv6_te_frame_ext(
+        router_ip, snat_ip, server_ip, snat_port, 80, false, None, &[0, 0],
+    );
+    let pass1 =
+        build_nat_reversed_icmp_error_v6(&frame, meta, &icmp_match).expect("pass 1 builds");
+    let c1 = u16::from_be_bytes([pass1[icmp6_start + 2], pass1[icmp6_start + 3]]);
+
+    // Pass 2: balancer = C1 forces the recomputed sum to zero.
+    let frame = build_icmpv6_te_frame_ext(
+        router_ip,
+        snat_ip,
+        server_ip,
+        snat_port,
+        80,
+        false,
+        None,
+        &c1.to_be_bytes(),
+    );
+    let result =
+        build_nat_reversed_icmp_error_v6(&frame, meta, &icmp_match).expect("pass 2 builds");
+
+    // Prove the raw recompute over the output is genuinely zero…
+    let outer_src = Ipv6Addr::from(<[u8; 16]>::try_from(&result[22..38]).unwrap());
+    let outer_dst = Ipv6Addr::from(<[u8; 16]>::try_from(&result[38..54]).unwrap());
+    let mut icmp6_zeroed = result[icmp6_start..].to_vec();
+    icmp6_zeroed[2] = 0;
+    icmp6_zeroed[3] = 0;
+    assert_eq!(
+        checksum16_ipv6(outer_src, outer_dst, PROTO_ICMPV6, &icmp6_zeroed),
+        0,
+        "balancing word must force the raw computed checksum to zero"
+    );
+    // …and the STORED field is the canonical 0xFFFF encoding.
+    assert_eq!(
+        u16::from_be_bytes([result[icmp6_start + 2], result[icmp6_start + 3]]),
+        0xffff,
+        "computed-zero ICMPv6 checksum must be stored as 0xFFFF"
+    );
+}
+
 #[test]
 fn icmpv6_te_nptv6_reverse_lookup_restores_internal_client() {
     let router_ip: Ipv6Addr = "2001:db8::1".parse().unwrap();

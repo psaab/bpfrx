@@ -281,14 +281,26 @@ pub(in crate::afxdp) fn segment_forwarded_tcp_frames_from_frame(
             libc::AF_INET6 => {
                 {
                     let packet = frame_out.get_mut(eth_len..)?;
+                    // v6 payload length = ext-header bytes + TCP header
+                    // + chunk. Each segment carries the FULL copied IP
+                    // header including the extension chain
+                    // (`ip_header_len` is the parsed ext-aware L4
+                    // offset), so omitting `ip_header_len - 40` here
+                    // under-stated the length for every ext-headered
+                    // segment (#1838). Bit-identical for the no-ext
+                    // case (ip_header_len == 40).
+                    let v6_payload_len = (ip_header_len - 40) + tcp_header_len + chunk_len;
                     packet
                         .get_mut(4..6)?
-                        .copy_from_slice(&((tcp_header_len + chunk_len) as u16).to_be_bytes());
+                        .copy_from_slice(&(v6_payload_len as u16).to_be_bytes());
                     if (meta.meta_flags & 0x80) == 0 && packet[7] <= 1 {
                         return None;
                     }
                     if apply_nat {
-                        apply_nat_ipv6(packet, meta.protocol, decision.nat)?;
+                        // `ip_header_len` IS the ext-aware rel_l4: it is
+                        // `frame_l4_offset - l3` and the segment copies
+                        // the full IP header incl. the ext chain.
+                        apply_nat_ipv6(packet, ip_header_len, meta.protocol, decision.nat)?;
                     }
                     if (meta.meta_flags & 0x80) == 0 {
                         packet[7] -= 1;
@@ -301,7 +313,7 @@ pub(in crate::afxdp) fn segment_forwarded_tcp_frames_from_frame(
                     enforced_ports,
                 )?;
                 let packet = frame_out.get_mut(eth_len..)?;
-                recompute_l4_checksum_ipv6(packet, meta.protocol)?;
+                recompute_l4_checksum_ipv6(packet, ip_header_len, meta.protocol)?;
             }
             _ => return None,
         }

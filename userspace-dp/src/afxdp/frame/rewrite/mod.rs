@@ -30,7 +30,11 @@ use crate::afxdp::{MmapArea, RewriteDescriptor, UserspaceDpMeta, XdpDesc};
 /// a UMEM-resident packet. Mirrors the byte-level rewrite semantics of
 /// the generic in-place rewrite (`rewrite_forwarded_frame_in_place`)
 /// but uses the descriptor's precomputed checksum deltas instead of
-/// recomputing the L4 checksum from scratch.
+/// recomputing the L4 checksum from scratch. Since the
+/// #1838/#1839/#1840 trio fix this mirroring is BYTE-EXACT on the
+/// shared success domain and is permanently guarded by the unmasked
+/// descriptor-vs-generic differential in `frame/prop_tests/rewrite.rs`
+/// (P-N3, empty exclusion mask).
 ///
 /// **Returns** `Some(InPlaceRewriteResult)` on success, `None` when the
 /// frame fails any validation (TTL expired, header too short, port

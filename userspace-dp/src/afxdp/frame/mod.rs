@@ -28,13 +28,15 @@ use byte_writes::{
 // `checksum.rs` (only the SNAT/DNAT rewrites here call it) and is
 // pulled in via a non-pub `use` to avoid a glob re-export at a
 // wider visibility than its own.
-use checksum::adjust_l4_checksum_ipv6_addr_bytes;
+use checksum::{
+    adjust_l4_checksum_ipv6_addr_bytes, adjust_zero_checksum_illegal, checksum_family_of,
+    l4_udp_checksum_optional, ChecksumFamily,
+};
 pub(in crate::afxdp) use checksum::{
     adjust_ipv4_header_checksum, adjust_l4_checksum_ipv4, adjust_l4_checksum_ipv4_dst,
-    adjust_l4_checksum_ipv4_src, adjust_l4_checksum_ipv4_words, adjust_l4_checksum_ipv6,
-    adjust_l4_checksum_ipv6_dst, adjust_l4_checksum_ipv6_src, adjust_l4_checksum_ipv6_words,
+    adjust_l4_checksum_ipv4_src, adjust_l4_checksum_ipv4_words, adjust_l4_checksum_ipv6_words,
     checksum16, checksum16_add_bytes, checksum16_adjust, checksum16_finish, checksum16_ipv4,
-    checksum16_ipv6, ipv4_words, ipv6_words, ipv6_words_from_octets, ipv6_words_from_slice,
+    checksum16_ipv6, ipv4_words, ipv6_words_from_octets, ipv6_words_from_slice,
     recompute_l4_checksum_ipv4, recompute_l4_checksum_ipv6,
 };
 
@@ -93,8 +95,32 @@ pub(in crate::afxdp) use build::build_forwarded_frame_into_from_frame;
 mod rewrite;
 pub(in crate::afxdp) use rewrite::apply_rewrite_descriptor;
 
-
-
+/// IPv6 L4 offset relative to the L3 header: trust the metadata when it
+/// is plausible (`meta_rel >= 40` and `l4 > l3`), else walk the
+/// extension-header chain. SINGLE source of offset truth for both
+/// rewrite paths (#1838) — the descriptor fast path
+/// (`rewrite/ipv6.rs`), the generic in-place rewrite
+/// (`rewrite_apply_v6`), the copy builder (`build/ipv6.rs`), the
+/// slow-path NAT extract, and the ICMPv6-error NAT reversal builder
+/// (`icmp_embed/builders.rs`) all derive the offset here, so the
+/// meta-led precedence rule cannot drift between paths.
+///
+/// `packet` is the L3-relative slice; `l3_offset`/`l4_offset` are the
+/// frame-relative metadata scalars (only their difference is used).
+#[inline(always)]
+pub(in crate::afxdp) fn v6_rel_l4_offset(
+    packet: &[u8],
+    l3_offset: u16,
+    l4_offset: u16,
+    addr_family: u8,
+) -> Option<usize> {
+    let meta_rel = l4_offset.wrapping_sub(l3_offset) as usize;
+    if meta_rel >= 40 && l4_offset > l3_offset {
+        Some(meta_rel)
+    } else {
+        packet_rel_l4_offset(packet, addr_family)
+    }
+}
 
 
 
@@ -547,16 +573,16 @@ fn rewrite_apply_v6(
     if !skip_ttl && packet[ip_start + 7] <= 1 {
         return None;
     }
-    let meta_rel = meta.l4_offset.wrapping_sub(meta.l3_offset) as usize;
-    let rel_l4 = if meta_rel >= 40 && meta.l4_offset > meta.l3_offset {
-        meta_rel
-    } else {
-        packet_rel_l4_offset(&packet[ip_start..], meta.addr_family)?
-    };
+    let rel_l4 = v6_rel_l4_offset(
+        &packet[ip_start..],
+        meta.l3_offset,
+        meta.l4_offset,
+        meta.addr_family,
+    )?;
     let repaired_ports =
         restore_l4_tuple_from_meta(&mut packet[ip_start..], meta, rel_l4).unwrap_or(false);
     if apply_nat {
-        apply_nat_ipv6(&mut packet[ip_start..], meta.protocol, decision.nat)?;
+        apply_nat_ipv6(&mut packet[ip_start..], rel_l4, meta.protocol, decision.nat)?;
     }
     if !skip_ttl {
         packet[ip_start + 7] -= 1;
@@ -564,7 +590,7 @@ fn rewrite_apply_v6(
     let enforced = enforce_expected_ports(packet, meta.addr_family, meta.protocol, expected_ports)
         .unwrap_or(false);
     if repaired_ports && !enforced {
-        recompute_l4_checksum_ipv6(&mut packet[ip_start..], meta.protocol)?;
+        recompute_l4_checksum_ipv6(&mut packet[ip_start..], rel_l4, meta.protocol)?;
     }
     Some(())
 }
@@ -757,12 +783,25 @@ pub(super) fn apply_nat_ipv4(packet: &mut [u8], protocol: u8, nat: NatDecision) 
     }
 
     // --- L4 port rewriting (after IP rewriting) ---
-    apply_nat_port_rewrite(packet, ihl, protocol, nat)?;
+    apply_nat_port_rewrite(packet, ihl, protocol, ChecksumFamily::V4, nat)?;
 
     Some(())
 }
 
-pub(super) fn apply_nat_ipv6(packet: &mut [u8], protocol: u8, nat: NatDecision) -> Option<()> {
+/// Apply a NAT decision to an IPv6 packet (L3-relative slice).
+/// `rel_l4` is the caller-supplied ext-aware L4 offset (#1838) —
+/// derived via `v6_rel_l4_offset` (or structurally, e.g. the
+/// segmentation copy where the copied IP header length IS the parsed
+/// offset). It mirrors `apply_nat_ipv4`'s IHL, which is derived
+/// internally for v4 because the IHL lives in the header itself; the
+/// v6 offset requires the extension-chain walk, so the caller
+/// supplies it.
+pub(super) fn apply_nat_ipv6(
+    packet: &mut [u8],
+    rel_l4: usize,
+    protocol: u8,
+    nat: NatDecision,
+) -> Option<()> {
     if nat == NatDecision::default() {
         return Some(());
     }
@@ -791,14 +830,26 @@ pub(super) fn apply_nat_ipv6(packet: &mut [u8], protocol: u8, nat: NatDecision) 
         let old_src: [u8; 16] = packet.get(8..24)?.try_into().ok()?;
         write_ipv6_src(packet, 0, new_src);
         if !skip_l4_csum {
-            adjust_l4_checksum_ipv6_addr_bytes(packet, protocol, &old_src, &new_src.octets())?;
+            adjust_l4_checksum_ipv6_addr_bytes(
+                packet,
+                rel_l4,
+                protocol,
+                &old_src,
+                &new_src.octets(),
+            )?;
         }
     } else if new_dst.is_some() && new_src.is_none() {
         let new_dst = new_dst?;
         let old_dst: [u8; 16] = packet.get(24..40)?.try_into().ok()?;
         write_ipv6_dst(packet, 0, new_dst);
         if !skip_l4_csum {
-            adjust_l4_checksum_ipv6_addr_bytes(packet, protocol, &old_dst, &new_dst.octets())?;
+            adjust_l4_checksum_ipv6_addr_bytes(
+                packet,
+                rel_l4,
+                protocol,
+                &old_dst,
+                &new_dst.octets(),
+            )?;
         }
     } else if new_src.is_some() || new_dst.is_some() {
         let old_src_words = ipv6_words_from_slice(packet.get(8..24)?)?;
@@ -820,12 +871,14 @@ pub(super) fn apply_nat_ipv6(packet: &mut [u8], protocol: u8, nat: NatDecision) 
                 PROTO_TCP | PROTO_UDP | PROTO_ICMPV6 => {
                     adjust_l4_checksum_ipv6_words(
                         packet,
+                        rel_l4,
                         protocol,
                         &old_src_words,
                         &new_src_words,
                     )?;
                     adjust_l4_checksum_ipv6_words(
                         packet,
+                        rel_l4,
                         protocol,
                         &old_dst_words,
                         &new_dst_words,
@@ -837,8 +890,10 @@ pub(super) fn apply_nat_ipv6(packet: &mut [u8], protocol: u8, nat: NatDecision) 
     }
 
     // --- L4 port rewriting (after IP rewriting) ---
-    // IPv6 header is always 40 bytes (no IHL).
-    apply_nat_port_rewrite(packet, 40, protocol, nat)?;
+    // At the caller-supplied ext-aware L4 offset (#1838) — the fixed
+    // 40 here used to land port writes inside the first extension
+    // header of any ext-headered packet.
+    apply_nat_port_rewrite(packet, rel_l4, protocol, ChecksumFamily::V6, nat)?;
 
     Some(())
 }
@@ -846,10 +901,20 @@ pub(super) fn apply_nat_ipv6(packet: &mut [u8], protocol: u8, nat: NatDecision) 
 /// Rewrite L4 source/destination ports and incrementally update the L4 checksum.
 /// Port rewriting MUST happen AFTER IP address rewriting to avoid double-counting
 /// in the checksum. Skips ICMP (no ports).
-pub(super) fn apply_nat_port_rewrite(
+// Visibility narrowed from pub(super) in #1840: the `family`
+// parameter's `ChecksumFamily` is `pub(in crate::afxdp::frame)` and
+// every caller lives in this file (apply_nat_ipv4/ipv6), so the fn
+// follows the type.
+// #[inline(always)] is a structural guarantee, not a perf tweak: both
+// callers pass `family` as a compile-time constant, so inlining folds
+// the v6-only §5.5 branch out of the v4 NAT path entirely (Codex
+// PR #1853 review — the v4 hot path must not pay for the v6 rule).
+#[inline(always)]
+pub(in crate::afxdp::frame) fn apply_nat_port_rewrite(
     packet: &mut [u8],
     l4_offset: usize,
     protocol: u8,
+    family: ChecksumFamily,
     nat: NatDecision,
 ) -> Option<()> {
     if !matches!(protocol, PROTO_TCP | PROTO_UDP) {
@@ -869,7 +934,7 @@ pub(super) fn apply_nat_port_rewrite(
         let old_port = u16::from_be_bytes([packet[port_offset], packet[port_offset + 1]]);
         if old_port != new_src_port {
             write_l4_src_port(packet, l4_offset, new_src_port);
-            adjust_l4_checksum_port(packet, l4_offset, protocol, old_port, new_src_port)?;
+            adjust_l4_checksum_port(packet, l4_offset, protocol, family, old_port, new_src_port)?;
         }
     }
 
@@ -878,7 +943,29 @@ pub(super) fn apply_nat_port_rewrite(
         let old_port = u16::from_be_bytes([packet[port_offset], packet[port_offset + 1]]);
         if old_port != new_dst_port {
             write_l4_dst_port(packet, l4_offset, new_dst_port);
-            adjust_l4_checksum_port(packet, l4_offset, protocol, old_port, new_dst_port)?;
+            adjust_l4_checksum_port(packet, l4_offset, protocol, family, old_port, new_dst_port)?;
+        }
+    }
+
+    // #1840 §5.5 no-op-port parity rule: v6 UDP with a port-NAT
+    // decision present (even value-identity) mirrors the descriptor's
+    // ≡0-delta application, which canonicalizes a stored 0x0000 to
+    // 0xFFFF. If an old != new adjust already ran above, the stored
+    // value is no longer literal 0x0000 (the adjusters canonicalize
+    // their own computed zeros), so this only fires on the
+    // short-circuited identity case. v4 UDP stored-0 keeps the
+    // RFC 768 skip.
+    if family == ChecksumFamily::V6
+        && protocol == PROTO_UDP
+        && (nat.rewrite_src_port.is_some() || nat.rewrite_dst_port.is_some())
+    {
+        let csum_off = l4_offset.checked_add(6)?;
+        if let Some(stored) = packet.get(csum_off..csum_off + 2)
+            && stored == [0, 0]
+        {
+            packet
+                .get_mut(csum_off..csum_off + 2)?
+                .copy_from_slice(&0xFFFFu16.to_be_bytes());
         }
     }
 
@@ -886,10 +973,25 @@ pub(super) fn apply_nat_port_rewrite(
 }
 
 /// Incremental L4 checksum update for a single 16-bit port change.
-pub(super) fn adjust_l4_checksum_port(
+/// `family` gates the two zero-checksum rules through the shared
+/// predicates (#1840): the RFC 768 received-0 skip is IPv4-UDP-only
+/// (a v6 UDP 0x0000 is malformed per RFC 8200 §8.1 and gets adjusted
+/// like any other value), and the computed-0 canonicalization follows
+/// `adjust_zero_checksum_illegal` (UDP both families; ICMPv6 has no
+/// ports so only UDP is reachable here — identical output to the old
+/// unconditional UDP match, routed through the predicate for
+/// one-source-of-truth uniformity).
+// Visibility narrowed from pub(super) in #1840 (same rationale as
+// apply_nat_port_rewrite — callers are all in frame/).
+// #[inline(always)]: same structural constant-family fold as
+// apply_nat_port_rewrite (the RFC 768 skip predicate becomes a
+// compile-time constant per call site).
+#[inline(always)]
+pub(in crate::afxdp::frame) fn adjust_l4_checksum_port(
     packet: &mut [u8],
     l4_offset: usize,
     protocol: u8,
+    family: ChecksumFamily,
     old_port: u16,
     new_port: u16,
 ) -> Option<()> {
@@ -902,12 +1004,11 @@ pub(super) fn adjust_l4_checksum_port(
         *packet.get(checksum_offset)?,
         *packet.get(checksum_offset + 1)?,
     ]);
-    // Skip UDP IPv4 checksum update when checksum is 0 (optional for IPv4 UDP)
-    if matches!(protocol, PROTO_UDP) && current == 0 {
+    if l4_udp_checksum_optional(protocol, family) && current == 0 {
         return Some(());
     }
     let mut updated = checksum16_adjust(current, &[old_port], &[new_port]);
-    if matches!(protocol, PROTO_UDP) && updated == 0 {
+    if adjust_zero_checksum_illegal(protocol, family) && updated == 0 {
         updated = 0xffff;
     }
     packet
@@ -928,6 +1029,12 @@ pub(super) fn enforce_expected_ports(
     if !matches!(protocol, PROTO_TCP | PROTO_UDP) {
         return Some(false);
     }
+    // #1840: family for the zero-checksum predicates. None (other
+    // family) => nothing to enforce — unreachable in practice because
+    // frame_l4_offset below already fails other families.
+    let Some(family) = checksum_family_of(addr_family) else {
+        return Some(false);
+    };
     let l3 = frame_l3_offset(frame)?;
     let l4 = frame_l4_offset(frame, addr_family)?;
     let ports = frame.get(l4..l4 + 4)?;
@@ -944,11 +1051,11 @@ pub(super) fn enforce_expected_ports(
     // guard is redundant-but-correct.
     if current_src != expected_src {
         write_l4_src_port(packet, rel_l4, expected_src);
-        adjust_l4_checksum_port(packet, rel_l4, protocol, current_src, expected_src)?;
+        adjust_l4_checksum_port(packet, rel_l4, protocol, family, current_src, expected_src)?;
     }
     if current_dst != expected_dst {
         write_l4_dst_port(packet, rel_l4, expected_dst);
-        adjust_l4_checksum_port(packet, rel_l4, protocol, current_dst, expected_dst)?;
+        adjust_l4_checksum_port(packet, rel_l4, protocol, family, current_dst, expected_dst)?;
     }
     Some(true)
 }
@@ -960,7 +1067,7 @@ pub(super) fn enforce_expected_ports_at(
     frame: &mut [u8],
     l3: usize,
     l4: usize,
-    _addr_family: u8,
+    addr_family: u8,
     protocol: u8,
     expected_ports: Option<(u16, u16)>,
 ) -> Option<bool> {
@@ -970,6 +1077,11 @@ pub(super) fn enforce_expected_ports_at(
     if !matches!(protocol, PROTO_TCP | PROTO_UDP) {
         return Some(false);
     }
+    // #1840: the previously-unused addr_family parameter now selects
+    // the zero-checksum predicate family.
+    let Some(family) = checksum_family_of(addr_family) else {
+        return Some(false);
+    };
     let ports = frame.get(l4..l4 + 4)?;
     let current_src = u16::from_be_bytes([ports[0], ports[1]]);
     let current_dst = u16::from_be_bytes([ports[2], ports[3]]);
@@ -984,11 +1096,11 @@ pub(super) fn enforce_expected_ports_at(
     // guard is redundant-but-correct.
     if current_src != expected_src {
         write_l4_src_port(packet, rel_l4, expected_src);
-        adjust_l4_checksum_port(packet, rel_l4, protocol, current_src, expected_src)?;
+        adjust_l4_checksum_port(packet, rel_l4, protocol, family, current_src, expected_src)?;
     }
     if current_dst != expected_dst {
         write_l4_dst_port(packet, rel_l4, expected_dst);
-        adjust_l4_checksum_port(packet, rel_l4, protocol, current_dst, expected_dst)?;
+        adjust_l4_checksum_port(packet, rel_l4, protocol, family, current_dst, expected_dst)?;
     }
     Some(true)
 }

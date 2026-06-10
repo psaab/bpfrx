@@ -1,3 +1,4 @@
+use super::parse::parse_embedded_v6_l4;
 use super::*;
 
 /// Rewrite an IPv4 ICMP error packet so it appears to originate from
@@ -167,16 +168,28 @@ pub(in crate::afxdp::icmp_embed) fn build_nat_reversed_icmp_error_v6(
 
     pkt.get_mut(24..40)?.copy_from_slice(&original_client_bytes);
 
-    let icmp_offset = 40;
-    let emb_ip_offset = icmp_offset + 8;
+    // Outer ICMPv6 offset: ext-aware via the shared #1838 helper (the
+    // outer NAT match in icmp_embed/mod.rs reads the ICMP type at
+    // meta.l4_offset, so an outer-ext error MATCHES — a fixed 40 here
+    // then corrupted it by writing the embedded un-NAT and the
+    // checksum recompute inside the outer extension chain).
+    let icmp_offset = v6_rel_l4_offset(pkt, meta.l3_offset, meta.l4_offset, meta.addr_family)?;
+    let emb_ip_offset = icmp_offset.checked_add(8)?;
     if pkt.len() < emb_ip_offset + 40 {
         return None;
     }
     pkt.get_mut(emb_ip_offset + 8..emb_ip_offset + 24)?
         .copy_from_slice(&original_client_bytes);
 
-    let emb_l4_offset = emb_ip_offset + 40;
-    if icmp_match.nat.rewrite_src_port.is_some() || icmp_match.nat.rewrite_src.is_some() {
+    // Embedded L4 offset: fragment-aware walk over the quoted packet
+    // (plan §5.7). None — e.g. a quoted non-first fragment, which has
+    // no L4 header — skips the embedded port/ident restore exactly
+    // like today's non-matching protocols do.
+    let emb_l4 = parse_embedded_v6_l4(pkt.get(emb_ip_offset..)?);
+    if (icmp_match.nat.rewrite_src_port.is_some() || icmp_match.nat.rewrite_src.is_some())
+        && let Some((emb_rel_l4, _)) = emb_l4
+    {
+        let emb_l4_offset = emb_ip_offset.checked_add(emb_rel_l4)?;
         let emb_proto = icmp_match.embedded_proto;
         if matches!(emb_proto, PROTO_TCP | PROTO_UDP) && pkt.len() >= emb_l4_offset + 2 {
             pkt.get_mut(emb_l4_offset..emb_l4_offset + 2)?
@@ -204,7 +217,13 @@ pub(in crate::afxdp::icmp_embed) fn build_nat_reversed_icmp_error_v6(
     let src_v6 = Ipv6Addr::from(<[u8; 16]>::try_from(pkt.get(8..24)?).ok()?);
     let dst_v6 = Ipv6Addr::from(<[u8; 16]>::try_from(pkt.get(24..40)?).ok()?);
     let icmp6_data = pkt.get(icmp_offset..)?;
+    // With an ext-aware icmp_offset the recompute coverage (upper-layer
+    // length = len - icmp_offset, Next Header = ICMPv6) is correct per
+    // RFC 8200 §8.1. Canonicalize a computed 0x0000 to 0xFFFF — the v6
+    // ICMPv6 rule the incremental adjusters and
+    // recompute_l4_checksum_ipv6 follow (plan §5.7 / Codex r2).
     let icmp6_csum = checksum16_ipv6(src_v6, dst_v6, PROTO_ICMPV6, icmp6_data);
+    let icmp6_csum = if icmp6_csum == 0 { 0xffff } else { icmp6_csum };
     pkt.get_mut(icmp_offset + 2..icmp_offset + 4)?
         .copy_from_slice(&icmp6_csum.to_be_bytes());
 

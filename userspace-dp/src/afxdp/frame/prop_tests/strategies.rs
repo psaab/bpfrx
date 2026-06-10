@@ -12,10 +12,12 @@
 //!     fragment(44) coverage, chains longer than the 6-iteration walk
 //!     bound, and a mangling layer for truncation/oversize cases.
 //!
-//! NAT-applying properties only ever see ext-free v6 packets (#1838)
-//! and never see v6 UDP zero checksums (#1840) — those domains are
-//! production divergences pinned by deterministic examples in
-//! `rewrite.rs`, not property violations.
+//! NAT-applying properties see ext-headered v6 packets too (#1838
+//! fixed — the generators were widened when the fixed-40 defect was
+//! closed). Valid-packet generators still never emit v6 UDP zero
+//! checksums: that encoding is malformed on the wire (RFC 8200 §8.1),
+//! so it stays outside the VALID domain and is covered by the
+//! deterministic #1840 pins in `rewrite.rs` instead.
 
 use super::*;
 
@@ -587,25 +589,29 @@ pub(super) fn arb_parse_packet(max_ext: usize) -> impl Strategy<Value = ValidPac
 }
 
 /// Valid packets for NAT-applying properties (P-N1..P-N4, P-T4 inputs):
-/// TCP/UDP only, v6 strictly ext-header-free (#1838), v6 UDP checksum
-/// never zero (#1840 — builder guarantees), TTL ≥ 2.
+/// TCP/UDP only, TTL ≥ 2, v6 with ext-header chains up to 4 headers
+/// (re-admitted when #1838 was fixed — the chain stays within the
+/// 6-iteration walk bound), v6 UDP checksum never zero (malformed per
+/// RFC 8200 §8.1 — covered by the deterministic #1840 pins instead).
 pub(super) fn arb_nat_packet() -> impl Strategy<Value = ValidPacket> {
     (
         arb_tuple_parts(256),
         any::<bool>(),
         prop_oneof![Just(PROTO_TCP), Just(PROTO_UDP)],
         arb_ihl(),
+        arb_ext_chain(4),
         any::<bool>(),
         any::<u32>(),
     )
-        .prop_map(|(parts, v6, protocol, ihl, udp_zero, seq)| {
+        .prop_map(|(parts, v6, protocol, ihl, ext, udp_zero, seq)| {
             let udp_zero_csum = udp_zero && !v6 && protocol == PROTO_UDP;
+            let ext = if v6 { ext } else { Vec::new() };
             let spec = spec_from_parts(
                 parts,
                 v6,
                 protocol,
                 ihl,
-                Vec::new(),
+                ext,
                 udp_zero_csum,
                 0x18, // PSH|ACK
                 0,
@@ -686,9 +692,10 @@ pub(super) fn arb_mangled_ext_frame() -> impl Strategy<Value = Vec<u8>> {
 
 /// Oversized TCP packets for the S4 segmentation properties: payload
 /// strictly larger than the MTU (1×..4×), TCP options 0..=40 bytes,
-/// v4 IHL 20..=60, v6 ext-free (the splitter's v6 arm calls
-/// `apply_nat_ipv6` / `recompute_l4_checksum_ipv6`, both 40-assuming —
-/// #1838). Returns (packet, mtu).
+/// v4 IHL 20..=60, v6 ext chains up to 3 headers (re-admitted when
+/// #1838 was fixed — each segment copies the full IP header incl. the
+/// ext chain and the payload-length field counts it). Returns
+/// (packet, mtu).
 pub(super) fn arb_seg_packet() -> impl Strategy<Value = (ValidPacket, usize)> {
     (
         (
@@ -702,6 +709,7 @@ pub(super) fn arb_seg_packet() -> impl Strategy<Value = (ValidPacket, usize)> {
         2u8..=255,
         any::<bool>(),
         arb_ihl(),
+        arb_ext_chain(3),
         (0usize..=10).prop_map(|w| w * 4),
         1280usize..=9216,
         (1usize..=3, 1usize..4096, any::<u64>()),
@@ -723,6 +731,7 @@ pub(super) fn arb_seg_packet() -> impl Strategy<Value = (ValidPacket, usize)> {
                 ttl,
                 v6,
                 ihl,
+                ext,
                 tcp_opt_len,
                 mtu,
                 (mult, extra, payload_seed),
@@ -746,7 +755,7 @@ pub(super) fn arb_seg_packet() -> impl Strategy<Value = (ValidPacket, usize)> {
                     vlan_id,
                     ttl,
                     ihl,
-                    ext: Vec::new(),
+                    ext: if v6 { ext } else { Vec::new() },
                     payload_len,
                     payload_seed,
                     udp_zero_csum: false,
