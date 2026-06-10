@@ -680,6 +680,12 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			d.cluster.SetLocalTransferCommitReadyHook(d.waitLocalFailoverCommitReady)
 			d.cluster.SetTransferReadinessFunc(d.userspaceTransferReadiness)
 			d.cluster.SetPeerTimeoutGuard(d.shouldSuppressPeerHeartbeatTimeout)
+			// #1792: while our heartbeat sockets restart (VRF rebind),
+			// keep the peer's suppression guard fed with fresh sync
+			// traffic so a >500ms restart does not fire a false
+			// peer-timeout/fence on the peer. Bounded by the peer's
+			// 5s continuous-suppression cap.
+			d.cluster.SetHeartbeatRestartNotifyFunc(d.sessionSync.SendLivenessKeepalive)
 
 			// Wire peer fencing: on heartbeat timeout, cluster sends
 			// fence via sync; on receive, disable all local RGs.

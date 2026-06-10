@@ -61,6 +61,44 @@ VRFs.
 Power cycle test: node0 crashed, node1 took primary. node0 recovered as
 secondary. No split-brain. Heartbeat survived two consecutive VRF rebinds.
 
+### Addendum (#1792, 2026-06): restart-window liveness hardening
+
+`RestartHeartbeat()` itself opened two liveness gaps that were closed as
+part of the #1800 §5.6 monotonic-liveness unit:
+
+1. **Peer side — no grace during our restart.** The bind-retry loop can
+   keep our UDP heartbeats silent for up to ~5 s, but the peer's
+   detection window is 5 × 100 ms. `RestartHeartbeat` now invokes a
+   notify hook (wired by the daemon to
+   `SessionSync.SendLivenessKeepalive`) before teardown and after each
+   failed bind retry. The keepalive refreshes the peer's
+   `LastPeerReceiveAge`, which its heartbeat-timeout suppression guard
+   (`shouldSuppressPeerHeartbeatTimeout`, 2 s recency window, 5 s
+   continuous-suppression cap) consults before electing/fencing. The
+   suppression is bounded and self-clearing, so a node that truly dies
+   mid-restart still fails over. **Residual gap:** if the sync TCP
+   connection is also down or silent for >2 s during a >500 ms restart,
+   the peer still declares peer-lost — indistinguishable from real node
+   death without a heartbeat wire-protocol change (out of scope). The
+   default 5 × 100 ms window is intentionally unchanged: with
+   `private-rg-election` compiled on by default, heartbeat detection
+   owns promotion latency.
+
+2. **Local side — peer death during restart was never detected.** The
+   replacement receiver started with `lastSeen=0`, whose timeout path
+   only invokes `handlePeerNeverSeen` (a no-op once `peerEverSeen` is
+   set). `RestartHeartbeat` now seeds the new receiver's `lastSeen`
+   from the old receiver (CLOCK_MONOTONIC nanos — comparable across an
+   in-process restart), so a peer that dies while our sockets are down
+   is detected once the post-restart 30 s startup grace expires. The
+   grace itself re-arms automatically: `StartHeartbeat` constructs a
+   fresh receiver and `start()` resets `startedAt`.
+
+All heartbeat/sync liveness timestamps were also moved off wall-clock
+`UnixNano` round-trips to `CLOCK_MONOTONIC` (`cluster.MonotonicNanos`)
+so NTP steps / VM pause-resume can no longer fire false peer-loss
+(#1792).
+
 ---
 
 ## Bug 2: XSK Rebind EBUSY After RETH MAC Programming — FIXED
