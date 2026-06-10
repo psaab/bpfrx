@@ -87,3 +87,62 @@ func TestSyncApply_ToleratesTypedLeafViolation(t *testing.T) {
 		t.Fatal("SyncApply returned nil config on tolerated violation")
 	}
 }
+
+// #1319 PR 2 — an OUT-OF-RANGE chassis-cluster value in a stored config
+// (legal when persisted; the range was typed later) must not fail boot.
+// The compiler keeps accepting it verbatim, so running behavior is
+// preserved; the warning surfaces the condition and the next strict
+// commit rejects it.
+func TestLoad_ToleratesStoredOutOfRangeChassisLeaf(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config")
+	writeStoredConfig(t, cfgPath,
+		"set chassis cluster cluster-id 1",
+		"set chassis cluster heartbeat-interval 99999")
+
+	s := New(cfgPath)
+	if err := s.Load(); err != nil {
+		t.Fatalf("Load() must tolerate stored out-of-range heartbeat-interval, got: %v", err)
+	}
+	active := s.ActiveConfig()
+	if active == nil {
+		t.Fatal("ActiveConfig() is nil after tolerated Load")
+	}
+	// Verbatim compile — running behavior preserved, no silent rewrite.
+	if active.Chassis.Cluster == nil || active.Chassis.Cluster.HeartbeatInterval != 99999 {
+		t.Fatalf("stored out-of-range value must compile verbatim, got %+v", active.Chassis.Cluster)
+	}
+
+	// The next STRICT operator commit rejects the stale value.
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	_, err := s.CommitCheck()
+	if err == nil {
+		t.Fatal("CommitCheck must reject the out-of-range stored value, got nil")
+	}
+	if !strings.Contains(err.Error(), "heartbeat-interval") {
+		t.Fatalf("CommitCheck error should reference heartbeat-interval: %v", err)
+	}
+}
+
+// Strict-path e2e for a chassis typed leaf: CommitCheck and Commit reject
+// an out-of-range value entered by the operator.
+func TestCommitCheck_RejectsOutOfRangeChassisLeaf(t *testing.T) {
+	s := New(filepath.Join(t.TempDir(), "config"))
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	if err := s.SetFromInput("chassis cluster redundancy-group 1 node 0 priority 255"); err != nil {
+		t.Fatalf("SetFromInput: %v", err)
+	}
+	_, err := s.CommitCheck()
+	if err == nil {
+		t.Fatal("expected CommitCheck to reject priority 255 (VRRP owner-reserved), got nil")
+	}
+	if !strings.Contains(err.Error(), "priority") {
+		t.Fatalf("CommitCheck error should reference priority: %v", err)
+	}
+	if _, err := s.Commit(); err == nil {
+		t.Fatal("expected Commit to reject priority 255, got nil")
+	}
+}

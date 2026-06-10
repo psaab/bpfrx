@@ -68,3 +68,34 @@ func TestCompleteConfigPairs_BufferSize_ShowsExamples(t *testing.T) {
 		}
 	}
 }
+
+// --- #1319 PR 2: chassis-cluster typed leaves on the gRPC completer ---
+
+func TestCompleteConfigPairs_HeartbeatInterval_ShowsIntegerPlaceholderAndExamples(t *testing.T) {
+	s := &Server{}
+	pairs := s.completeConfigPairs(
+		[]string{"set", "chassis", "cluster", "heartbeat-interval"},
+		"",
+	)
+	if !hasPairName(pairs, "<integer>") {
+		t.Fatalf("expected <integer> placeholder at value slot, got %#v", pairs)
+	}
+	for _, ex := range []string{"100", "200", "1000"} {
+		if !hasPairName(pairs, ex) {
+			t.Fatalf("expected heartbeat-interval example %q, got %#v", ex, pairs)
+		}
+	}
+}
+
+func TestCompleteConfigPairs_RGNodePriority_ShowsExamples(t *testing.T) {
+	s := &Server{}
+	pairs := s.completeConfigPairs(
+		[]string{"set", "chassis", "cluster", "redundancy-group", "1", "node", "0", "priority"},
+		"",
+	)
+	for _, ex := range []string{"100", "200", "254"} {
+		if !hasPairName(pairs, ex) {
+			t.Fatalf("expected priority example %q, got %#v", ex, pairs)
+		}
+	}
+}

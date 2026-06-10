@@ -764,18 +764,99 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		}},
 	}},
 	"chassis": {children: map[string]*schemaNode{
+		// #1319 PR 2 typed leaves (chassis cluster subsystem). Fields-only
+		// annotations — no children/args/multi changes, so SetPath flat-set
+		// grouping is untouched (TestSetPathGrouping_Golden). Range policy:
+		// the binding bound is what the xpf runtime actually consumes
+		// (narrowest binary encoding / explicit clamp), checked against
+		// Junos vSRX ranges second; deliberate Junos divergences are called
+		// out per leaf because xpf's own defaults sit OUTSIDE the Junos
+		// ranges for several knobs (the killed Phase-3a plan copied Junos
+		// ranges blindly and would have rejected deployed configs).
+		// Instance-name slots (`redundancy-group <id>`, the RG-scoped
+		// `node <id>`) are NOT value slots — the walker's compiler-faithful
+		// contract consumes identity tokens without validation; typing them
+		// needs a new walker feature (deferred, see docs/config-schema.md).
 		"cluster": {children: map[string]*schemaNode{
-			"cluster-id":            {args: 1, children: nil},
-			"node":                  {args: 1, children: nil},
-			"reth-count":            {args: 1, children: nil},
-			"heartbeat-interval":    {args: 1, children: nil},
-			"heartbeat-threshold":   {args: 1, children: nil},
+			// One byte in the RETH virtual MAC 02:bf:72:CC:RR:NN
+			// (cluster.RethMAC, pkg/cluster/reth.go:113) and in the stable
+			// link-local (reth.go:124) — 256+ would silently alias MACs.
+			// Heartbeat wire is uint16 (heartbeat.go:128), so the MAC byte
+			// is the narrowest consumer. Junos vSRX: 0..255 (0 = disabled).
+			// Deployed: 22 (docs/ha-cluster-userspace.conf:64).
+			"cluster-id": {
+				args:          1,
+				valueType:     ValueInteger,
+				valueDesc:     "Cluster identifier (0..255; one byte of the RETH virtual MAC)",
+				valueExamples: []string{"1"},
+				validator:     ValidateInteger(0, 255),
+				children:      nil,
+			},
+			// xpf clusters are strictly two-node: heartbeat NodeID is uint8
+			// but every owner/peer decision (SlotToNodeID FPC mapping,
+			// election peer model) assumes 0|1. Junos vSRX: node 0..1.
+			"node": {
+				args:          1,
+				valueType:     ValueInteger,
+				valueDesc:     "Node identifier (0..1)",
+				valueExamples: []string{"0", "1"},
+				validator:     ValidateInteger(0, 1),
+				children:      nil,
+			},
+			// Junos vSRX reth-count range 1..128. Compiled verbatim
+			// (compiler_system.go) and consumed for display (`show chassis
+			// cluster information`, pkg/cli/cli_show_cluster.go:182).
+			"reth-count": {
+				args:          1,
+				valueType:     ValueInteger,
+				valueDesc:     "Number of RETH interfaces (1..128)",
+				valueExamples: []string{"2"},
+				validator:     ValidateInteger(1, 128),
+				children:      nil,
+			},
+			// Milliseconds. xpf-DIVERGENT from Junos (1000..2000 ms): the
+			// xpf default is 100 ms (cluster.DefaultHeartbeatInterval,
+			// pkg/cluster/heartbeat.go:38) and deployed clusters run 200 ms
+			// (docs/ha-cluster-userspace.conf:66) — the Junos floor would
+			// reject xpf's own default scale. Runtime honors any value > 0
+			// (group_state.go:55); 0 is rejected here because the runtime
+			// silently substitutes the default for it (the silent-coerce
+			// trap this gate exists to close). Floor 10 ms: sub-10ms
+			// heartbeats flood the control link without improving the
+			// ~500 ms private-RG promotion window. Ceiling 10 s: with
+			// threshold 255 that is already a 42-minute detection time.
+			"heartbeat-interval": {
+				args:          1,
+				valueType:     ValueInteger,
+				valueDesc:     "Heartbeat send interval in milliseconds (10..10000; xpf default 100, Junos allows 1000..2000)",
+				valueExamples: []string{"100", "200", "1000"},
+				validator:     ValidateInteger(10, 10000),
+				children:      nil,
+			},
+			// Missed-heartbeat count before the peer is declared lost.
+			// xpf-DIVERGENT from Junos (3..8): xpf's default is 5
+			// (cluster.DefaultHeartbeatThreshold, heartbeat.go:41) but the
+			// runtime honors any value > 0 (group_state.go:58); 1..255
+			// keeps a byte-scale sanity cap. 0 rejected (silently means
+			// default at runtime).
+			"heartbeat-threshold": {
+				args:          1,
+				valueType:     ValueInteger,
+				valueDesc:     "Missed heartbeats before peer is declared lost (1..255; xpf default 5, Junos allows 3..8)",
+				valueExamples: []string{"3", "5", "8"},
+				validator:     ValidateInteger(1, 255),
+				children:      nil,
+			},
 			"control-link-recovery": {children: nil},
+			// control-ports fpc/port: NOT typed — compileChassis never
+			// reads control-ports (compiled-leaf-only invariant).
 			"control-ports": {children: map[string]*schemaNode{
 				"fpc": {args: 1, children: map[string]*schemaNode{
 					"port": {args: 1, children: nil},
 				}},
 			}},
+			// Interface / address leaves stay untyped until the interfaces
+			// subsystem PR introduces the IP/identifier value types.
 			"control-interface":             {args: 1, children: nil},
 			"peer-address":                  {args: 1, children: nil},
 			"fabric-interface":              {args: 1, children: nil},
@@ -783,26 +864,121 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"configuration-synchronize":     {children: nil},
 			"nat-state-synchronization":     {children: nil},
 			"ipsec-session-synchronization": {children: nil},
-			"reth-advertise-interval":       {args: 1, children: nil},
-			"hitless-restart":               {children: nil},
-			"peer-fencing":                  {args: 1, children: nil},
-			"takeover-hold-time":            {args: 1, children: nil},
-			"no-reth-vrrp":                  {children: nil},
-			"private-rg-election":           {children: nil},
-			"no-private-rg-election":        {children: nil},
+			// Milliseconds, xpf extension (default 30, pkg/vrrp/vrrp.go).
+			// Both bounds are runtime-derived from the VRRPv3 encoding:
+			// the ms value is integer-divided to centiseconds
+			// (pkg/vrrp/instance.go:915), so <10 ms encodes as Max Advert
+			// Int 0 on the wire; the wire field is 12 bits (RFC 5798,
+			// packet.go:48-49 masks with 0x0FFF), so >40950 ms silently
+			// aliases. 10..40950 is exactly the encodable range.
+			"reth-advertise-interval": {
+				args:          1,
+				valueType:     ValueInteger,
+				valueDesc:     "RETH VRRP advertisement interval in milliseconds (10..40950; default 30)",
+				valueExamples: []string{"30", "100"},
+				validator:     ValidateInteger(10, 40950),
+				children:      nil,
+			},
+			"hitless-restart": {children: nil},
+			// xpf extension. Only "disable-rg" is acted on by the runtime
+			// (pkg/cluster/heartbeat_manager.go:362, failover.go:166); any
+			// other string compiled silently no-ops — the enum closes that.
+			"peer-fencing": {
+				args:          1,
+				valueType:     ValueEnumOf,
+				valueDesc:     "Fencing action on heartbeat timeout (disable-rg)",
+				valueExamples: []string{"disable-rg"},
+				validator:     ValidateEnum([]string{"disable-rg"}),
+				children:      nil,
+			},
+			// Milliseconds, xpf extension. 0 = immediate takeover once
+			// ready (cluster.DefaultTakeoverHoldTime, manager.go:243);
+			// negative is warned-and-ignored at runtime (group_state.go:70)
+			// and rejected here. Ceiling 1 h is a sanity cap — the runtime
+			// accepts any positive duration.
+			"takeover-hold-time": {
+				args:          1,
+				valueType:     ValueInteger,
+				valueDesc:     "Extra delay before takeover in milliseconds (0..3600000; 0 = immediate)",
+				valueExamples: []string{"0", "5000"},
+				validator:     ValidateInteger(0, 3600000),
+				children:      nil,
+			},
+			"no-reth-vrrp":           {children: nil},
+			"private-rg-election":    {children: nil},
+			"no-private-rg-election": {children: nil},
 			"redundancy-group": {args: 1, children: map[string]*schemaNode{
 				"node": {args: 1, children: map[string]*schemaNode{
-					"priority": {args: 1, children: nil},
+					// Junos vSRX: 1..254. Runtime-binding: the priority
+					// feeds VRRP and is truncated to uint8 on the wire
+					// (pkg/vrrp/instance.go:918); 255 is the RFC 5798
+					// IP-owner reserved value (instance.go:256) and 0 is
+					// treated as unset (vrrp.go pri==0 → default 100) —
+					// both excluded. Heartbeat carries uint16 but VRRP is
+					// the narrow consumer. Deployed: 200/100.
+					"priority": {
+						args:          1,
+						valueType:     ValueInteger,
+						valueDesc:     "Node priority for primary election (1..254; higher wins)",
+						valueExamples: []string{"100", "200", "254"},
+						validator:     ValidateInteger(1, 254),
+						children:      nil,
+					},
 				}},
-				"gratuitous-arp-count": {args: 1, children: nil},
-				"preempt":              {children: nil},
-				"interface-monitor":    {children: nil},
+				// Junos vSRX: 1..16. Runtime honors any value > 0, else
+				// default 3 (pkg/daemon/daemon_ha_vip.go:475,
+				// pkg/vrrp/vrrp.go:94). Deployed: 8.
+				"gratuitous-arp-count": {
+					args:          1,
+					valueType:     ValueInteger,
+					valueDesc:     "Gratuitous ARP/NA burst count on failover (1..16; default 3)",
+					valueExamples: []string{"3", "8", "16"},
+					validator:     ValidateInteger(1, 16),
+					children:      nil,
+				},
+				"preempt": {children: nil},
+				// interface-monitor weight is NOT typed in PR 2: the
+				// `<ifname> weight <n>` tokens pack inline into one leaf
+				// (children==nil here); typing the weight would require a
+				// children/wildcard map, which flips SetPath's
+				// replace-vs-container grouping — forbidden by the
+				// fields-only rule. Deferred (docs/config-schema.md).
+				"interface-monitor": {children: nil},
 				"ip-monitoring": {children: map[string]*schemaNode{
-					"global-weight":    {args: 1, children: nil},
-					"global-threshold": {args: 1, children: nil},
+					// Junos vSRX: 0..255. Weight subtracted from the RG
+					// weight, which starts at 255 (group_state.go:29,
+					// SetMonitorWeight election.go:324); heartbeat monitor
+					// entries carry weight as uint8.
+					"global-weight": {
+						args:          1,
+						valueType:     ValueInteger,
+						valueDesc:     "Default weight deducted when a monitored IP fails (0..255)",
+						valueExamples: []string{"255"},
+						validator:     ValidateInteger(0, 255),
+						children:      nil,
+					},
+					// Junos vSRX: 0..255. Compiled verbatim
+					// (compiler_system.go IPMonitoring.GlobalThreshold).
+					"global-threshold": {
+						args:          1,
+						valueType:     ValueInteger,
+						valueDesc:     "Cumulative failure weight that triggers failover (0..255)",
+						valueExamples: []string{"100"},
+						validator:     ValidateInteger(0, 255),
+						children:      nil,
+					},
 					"family": {compoundKey: true, children: map[string]*schemaNode{
 						"inet": {wildcard: &schemaNode{children: map[string]*schemaNode{
-							"weight": {args: 1, children: nil},
+							// Junos vSRX: 0..255. 0 = inherit global-weight
+							// (pkg/cluster/monitor.go pollIPMonitors).
+							"weight": {
+								args:          1,
+								valueType:     ValueInteger,
+								valueDesc:     "Weight deducted when this IP fails (0..255; 0 = use global-weight)",
+								valueExamples: []string{"100", "255"},
+								validator:     ValidateInteger(0, 255),
+								children:      nil,
+							},
 						}}},
 					}},
 				}},

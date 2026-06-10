@@ -129,3 +129,71 @@ func TestCompleteConfig_TransmitRate_PartialFiltersExamples(t *testing.T) {
 		t.Fatalf("256k should not match partial \"1\", got %v", candNames(cands))
 	}
 }
+
+// --- #1319 PR 2: chassis-cluster typed leaves at the live CLI boundary ---
+
+// `set chassis cluster heartbeat-interval ?` surfaces the <integer>
+// placeholder (with the range in its description) and the examples.
+func TestCompleteConfig_HeartbeatInterval_ShowsIntegerPlaceholderAndExamples(t *testing.T) {
+	c := newTypedLeafCLI(t)
+	cands := c.completeConfigWithDesc(
+		[]string{"set", "chassis", "cluster", "heartbeat-interval"},
+		"",
+	)
+	if !hasCand(cands, "<integer>") {
+		t.Fatalf("expected <integer> placeholder at value slot, got %v", candNames(cands))
+	}
+	for _, ex := range []string{"100", "200", "1000"} {
+		if !hasCand(cands, ex) {
+			t.Fatalf("expected heartbeat-interval example %q, got %v", ex, candNames(cands))
+		}
+	}
+}
+
+// peer-fencing is an enum leaf: its sole accepted value is surfaced.
+func TestCompleteConfig_PeerFencing_ShowsEnumValue(t *testing.T) {
+	c := newTypedLeafCLI(t)
+	cands := c.completeConfigWithDesc(
+		[]string{"set", "chassis", "cluster", "peer-fencing"},
+		"",
+	)
+	if !hasCand(cands, "disable-rg") {
+		t.Fatalf("expected enum value disable-rg, got %v", candNames(cands))
+	}
+}
+
+// Deep path: the typed priority leaf under redundancy-group <id> node <id>
+// still reaches the value slot through two instance-name args.
+func TestCompleteConfig_RGNodePriority_ShowsExamples(t *testing.T) {
+	c := newTypedLeafCLI(t)
+	cands := c.completeConfigWithDesc(
+		[]string{"set", "chassis", "cluster", "redundancy-group", "1", "node", "0", "priority"},
+		"",
+	)
+	if !hasCand(cands, "<integer>") {
+		t.Fatalf("expected <integer> placeholder, got %v", candNames(cands))
+	}
+	for _, ex := range []string{"100", "200", "254"} {
+		if !hasCand(cands, ex) {
+			t.Fatalf("expected priority example %q, got %v", ex, candNames(cands))
+		}
+	}
+}
+
+// Prefix-partial filtering applies to chassis examples too.
+func TestCompleteConfig_RethAdvertiseInterval_PartialFiltersExamples(t *testing.T) {
+	c := newTypedLeafCLI(t)
+	cands := c.completeConfigWithDesc(
+		[]string{"set", "chassis", "cluster", "reth-advertise-interval"},
+		"3",
+	)
+	if !hasCand(cands, "30") {
+		t.Fatalf("expected 30 for partial \"3\", got %v", candNames(cands))
+	}
+	if hasCand(cands, "<integer>") {
+		t.Fatalf("placeholder should be filtered out by partial \"3\", got %v", candNames(cands))
+	}
+	if hasCand(cands, "100") {
+		t.Fatalf("100 should not match partial \"3\", got %v", candNames(cands))
+	}
+}
