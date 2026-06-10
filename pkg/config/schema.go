@@ -422,6 +422,17 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					"address": {desc: "IPv4 address", args: 1, placeholder: "<address>", children: map[string]*schemaNode{
 						"primary":   {desc: "Primary address", children: nil},
 						"preferred": {desc: "Preferred address", children: nil},
+						"vrrp-group": {desc: "VRRP group", args: 1, placeholder: "<group-id>", children: map[string]*schemaNode{
+							"virtual-address":     {desc: "Virtual IP address", args: 1, multi: true, placeholder: "<address>", children: nil},
+							"priority":            {desc: "VRRP priority", args: 1, placeholder: "<1..255>", children: nil},
+							"preempt":             {desc: "Allow preemption", children: nil},
+							"accept-data":         {desc: "Accept packets sent to the virtual address", children: nil},
+							"advertise-interval":  {desc: "Advertisement interval", args: 1, placeholder: "<seconds>", children: nil},
+							"authentication-type": {desc: "Authentication type", args: 1, placeholder: "<type>", children: nil},
+							"authentication-key":  {desc: "Authentication key", args: 1, placeholder: "<key>", children: nil},
+							"track-interface":     {desc: "Interface to track", args: 1, placeholder: "<interface>", children: nil},
+							"track-priority-cost": {desc: "Priority cost when tracked interface fails", args: 1, placeholder: "<cost>", children: nil},
+						}},
 					}},
 					"dhcp": {desc: "DHCP client", children: map[string]*schemaNode{
 						"lease-time":              {desc: "Lease time", args: 1, placeholder: "<seconds>", children: nil},
@@ -1032,7 +1043,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		"domain-search": {desc: "Domain search list", args: 1, multi: true, placeholder: "<domain>", children: nil},
 		"time-zone":     {desc: "System time zone", args: 1, placeholder: "<timezone>", children: nil},
 		"no-redirects":  {desc: "Disable ICMP redirects", children: nil},
-		"name-server":   {desc: "DNS name server", args: 1, placeholder: "<address>", children: nil},
+		"name-server":   {desc: "DNS name server", args: 1, multi: true, placeholder: "<address>", children: nil},
 		"backup-router": {desc: "Backup router", args: 1, placeholder: "<address>", children: map[string]*schemaNode{
 			"destination": {desc: "Destination network", args: 1, placeholder: "<network>", children: nil},
 		}},
@@ -1229,6 +1240,16 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					"ingress": {children: nil},
 				}},
 				"output": {children: nil},
+			}},
+		}},
+		"dhcp-relay": {desc: "DHCP relay", children: map[string]*schemaNode{
+			// server-group is a named container whose children are the
+			// free-form server address leaves (same modeling as the
+			// sampling flow-server node above).
+			"server-group": {desc: "DHCP server group", args: 1, placeholder: "<name>", children: nil},
+			"group": {desc: "DHCP relay group", args: 1, placeholder: "<name>", children: map[string]*schemaNode{
+				"active-server-group": {desc: "Active server group", args: 1, placeholder: "<server-group>", children: nil},
+				"interface":           {desc: "Interface to relay on", args: 1, multi: true, placeholder: "<interface>", children: nil},
 			}},
 		}},
 	}},

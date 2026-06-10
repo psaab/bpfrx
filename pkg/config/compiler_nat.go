@@ -210,8 +210,12 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 						return fmt.Errorf("pool %q address range: %w", pool.Name, err)
 					}
 					pool.Addresses = append(pool.Addresses, expanded...)
-				} else if v := nodeVal(prop); v != "" {
-					pool.Addresses = append(pool.Addresses, v)
+				} else if len(prop.Keys) >= 2 && prop.Keys[1] != "" {
+					// Inline value form ("address <prefix>;" / flat set).
+					// Deliberately NOT nodeVal: its Children[0] fallback
+					// would double-append the block form, whose children
+					// are walked below (#1808).
+					pool.Addresses = append(pool.Addresses, prop.Keys[1])
 				}
 				// Also handle children for hierarchical syntax
 				for _, addrChild := range prop.Children {
