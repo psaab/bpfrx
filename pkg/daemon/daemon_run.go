@@ -812,6 +812,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// (stuck netlink/probe syscall) is observable as a climbing
 			// gauge before it manifests as the cold-connect hang.
 			NeighborPhaseAgeFn: d.NeighborPeriodicPhaseAges,
+			// #1799: surface configstore persist-degraded state so
+			// /health returns 503 (and xpf_daemon_config_persist_degraded
+			// reads 1) while the running active config is not durable on
+			// disk (failed HA sync / auto-rollback persist, retry pending).
+			ConfigPersistDegradedFn: d.store.ConfigPersistDegraded,
 		}
 		// Resolve interface bindings from web-management config
 		if cfg := d.store.ActiveConfig(); cfg != nil && cfg.System.Services != nil &&

@@ -31,7 +31,34 @@ type Store struct {
 	db      *DB
 	journal *Journal
 
-	// Commit confirmed state
+	// writeActiveFn is a test seam for active-config persistence
+	// (#1799). nil (production) means s.db.WriteActive. Set via
+	// SetWriteActiveForTesting; never assigned on production paths.
+	writeActiveFn func(*config.ConfigTree) error
+
+	// #1799 Option B (degrade-not-fail) state for the persist paths
+	// that must proceed in memory even when the disk write fails
+	// (SyncApply HA convergence, performAutoRollback safety revert).
+	// persistDegraded is surfaced via ConfigPersistDegraded() to the
+	// /health 503 check and the xpf_daemon_config_persist_degraded
+	// gauge. persistRetryActive is the singleton guard for the
+	// background retry goroutine (exactly one loop at a time). The
+	// backoff fields are test seams; zero means the production
+	// defaults (1s initial, doubling to a 60s cap).
+	persistDegraded            bool
+	persistRetryActive         bool
+	persistRetryInitialBackoff time.Duration
+	persistRetryMaxBackoff     time.Duration
+
+	// Commit confirmed state. confirmGen is a generation token
+	// guarding the auto-rollback callback against staleness: a timer
+	// that has already fired and is blocked on s.mu when a nested
+	// CommitConfirmed (or ConfirmCommit) supersedes it must become a
+	// no-op — time.Timer.Stop() cannot un-fire a callback that has
+	// started (Codex review on PR #1817). Every arm/confirm bumps the
+	// generation; the callback carries the value at arm time and
+	// performAutoRollback rejects mismatches.
+	confirmGen        uint64
 	confirmTimer      *time.Timer
 	confirmPrevTree   *config.ConfigTree   // active tree before confirmed commit
 	confirmPrevCfg    *config.Config       // compiled config before confirmed commit
@@ -134,7 +161,106 @@ func (s *Store) Save() error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	return s.db.WriteActive(s.active)
+	return s.writeActive(s.active)
+}
+
+// writeActive persists tree as the on-disk active configuration.
+// Routes through the writeActiveFn test seam when set (#1799);
+// otherwise uses the DB's temp-file + rename atomic write. Caller
+// must hold s.mu (read or write lock).
+func (s *Store) writeActive(tree *config.ConfigTree) error {
+	if s.writeActiveFn != nil {
+		return s.writeActiveFn(tree)
+	}
+	return s.db.WriteActive(tree)
+}
+
+// ConfigPersistDegraded reports whether the running active config
+// failed to persist to disk on an Option-B path (SyncApply /
+// performAutoRollback) and the background retry has not yet succeeded
+// (#1799). While true, a daemon restart would load a STALE config;
+// /health returns 503 and xpf_daemon_config_persist_degraded reads 1.
+func (s *Store) ConfigPersistDegraded() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.persistDegraded
+}
+
+// noteActivePersistFailureLocked records a WriteActive failure on an
+// Option-B path (#1799): the in-memory apply already happened (HA
+// convergence / auto-rollback safety win over disk trouble), so the
+// failure must become visible and self-healing instead of fatal.
+// Flips the degraded flag, writes a journal ERROR entry, and starts
+// the singleton retry goroutine. Must be called with s.mu held
+// (write lock).
+func (s *Store) noteActivePersistFailureLocked(action string, err error) {
+	slog.Error("active config persist failed — running config is not durable; restart would load stale config",
+		"action", action, "err", err, "issue", "#1799")
+	s.persistDegraded = true
+	s.journal.Log(&JournalEntry{
+		Timestamp: time.Now(),
+		Action:    "persist_error",
+		Detail:    fmt.Sprintf("%s: write active config failed: %v", action, err),
+	})
+	if s.persistRetryActive {
+		return
+	}
+	s.persistRetryActive = true
+	initial := s.persistRetryInitialBackoff
+	if initial <= 0 {
+		initial = time.Second
+	}
+	maxBackoff := s.persistRetryMaxBackoff
+	if maxBackoff <= 0 {
+		maxBackoff = 60 * time.Second
+	}
+	go s.persistRetryLoop(initial, maxBackoff)
+}
+
+// persistRetryLoop retries persisting the CURRENT active config with
+// doubling backoff until a write succeeds or the degraded flag is
+// cleared by a successful write on another path (#1799). Each attempt
+// re-reads s.active under s.mu and writes while holding the lock —
+// never a stale captured tree — so rapid successive syncs cannot
+// persist out-of-order state (the commit paths themselves write under
+// s.mu, so lock-held writes are the existing serialization).
+//
+// Shutdown safety: the Store has no close signal, and none is needed.
+// This is a plain goroutine outside any WaitGroup — it sleeps between
+// attempts and holds s.mu only for the duration of one atomic
+// temp-file write, so it cannot block daemon shutdown; process exit
+// simply abandons it.
+func (s *Store) persistRetryLoop(backoff, maxBackoff time.Duration) {
+	for {
+		time.Sleep(backoff)
+		s.mu.Lock()
+		if !s.persistDegraded {
+			// A successful write on a commit/sync path already
+			// persisted the current active config.
+			s.persistRetryActive = false
+			s.mu.Unlock()
+			return
+		}
+		err := s.writeActive(s.active)
+		if err == nil {
+			s.persistDegraded = false
+			s.persistRetryActive = false
+			s.journal.Log(&JournalEntry{
+				Timestamp: time.Now(),
+				Action:    "persist_recovered",
+				Detail:    "active config persisted after earlier write failure",
+			})
+			s.mu.Unlock()
+			slog.Info("active config persisted after earlier write failure", "issue", "#1799")
+			return
+		}
+		s.mu.Unlock()
+		slog.Warn("active config persist retry failed", "err", err, "retry_in", backoff*2)
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
 }
 
 // SetClusterReadOnly toggles cluster read-only mode. When enabled, config
@@ -303,8 +429,18 @@ func (s *Store) SyncApply(content string, chassisPreserve func(*config.ConfigTre
 		s.candidate = s.active.Clone()
 	}
 
-	if err := s.db.WriteActive(s.active); err != nil {
-		slog.Warn("failed to save synced config", "err", err)
+	// #1799 Option B (degrade-not-fail): the in-memory apply above
+	// MUST stand even if the disk write fails — failing the
+	// secondary's apply on local disk trouble would silently diverge
+	// the cluster (sync is one-way fire-and-forget; the primary is
+	// already running the new config and is never notified). The
+	// failure becomes visible (degraded flag → /health 503 +
+	// Prometheus gauge + journal ERROR) and self-healing (singleton
+	// background retry with backoff).
+	if err := s.writeActive(s.active); err != nil {
+		s.noteActivePersistFailureLocked("config_sync", err)
+	} else {
+		s.persistDegraded = false
 	}
 
 	s.journal.Log(&JournalEntry{
@@ -749,64 +885,24 @@ func (s *Store) CommitCheck() (*config.Config, error) {
 
 // Commit validates, compiles, and applies the candidate configuration.
 // Returns the compiled config for the caller to apply to the dataplane.
+// Identical to CommitWithDescription with an empty description (the two
+// were verbatim duplicates before #1799 unified them).
 func (s *Store) Commit() (*config.Config, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.candidate == nil {
-		return nil, fmt.Errorf("not in configuration mode")
-	}
-
-	compiled, err := s.compileTree(s.candidate)
-	if err != nil {
-		return nil, fmt.Errorf("commit check failed: %w", err)
-	}
-
-	// Push current active to history
-	s.history.Push(&HistoryEntry{
-		Config:    s.active.Clone(),
-		Timestamp: time.Now(),
-	})
-
-	// Promote candidate to active
-	s.active = s.candidate
-	s.candidate = s.active.Clone()
-	s.compiled = compiled
-	s.dirty = false
-
-	// Persist to disk
-	if err := s.db.WriteActive(s.active); err != nil {
-		// Non-fatal: log but don't fail the commit
-		slog.Warn("failed to save config", "err", err)
-	}
-
-	// Log to journal
-	s.journal.Log(&JournalEntry{
-		Timestamp: time.Now(),
-		Action:    "commit",
-		After:     compiled,
-	})
-
-	s.saveRollbackFiles()
-
-	// Auto-archive if configured
-	if s.archiveDir != "" {
-		max := s.archiveMax
-		if max <= 0 {
-			max = 10
-		}
-		go func() {
-			if err := s.ArchiveConfig(s.archiveDir, max); err != nil {
-				slog.Warn("auto-archive failed", "err", err)
-			}
-		}()
-	}
-
-	return compiled, nil
+	return s.CommitWithDescription("")
 }
 
 // CommitWithDescription validates, compiles, and applies the candidate configuration
 // with an optional comment/description attached to the history and journal entries.
+//
+// Persistence contract (#1799, Option A — persist-before-promote): the
+// candidate tree is written to the on-disk active config BEFORE any
+// in-memory promotion. WriteActive is temp-file + rename atomic
+// (db.go), so a persist failure leaves the previous active config
+// intact on disk; the commit then fails with the candidate left
+// intact and NOTHING mutated — no active/candidate/compiled/dirty
+// change, no history push, no journal entry, no rollback-file save.
+// A commit that reports success can therefore never silently revert
+// to the previous config on daemon restart.
 func (s *Store) CommitWithDescription(description string) (*config.Config, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -820,6 +916,14 @@ func (s *Store) CommitWithDescription(description string) (*config.Config, error
 		return nil, fmt.Errorf("commit check failed: %w", err)
 	}
 
+	// #1799 Option A: persist BEFORE promote. On failure the old
+	// active stays on disk and in memory; the operator sees the
+	// error and the candidate is still there to retry.
+	if err := s.writeActive(s.candidate); err != nil {
+		return nil, fmt.Errorf("commit failed: persist active config: %w", err)
+	}
+	s.persistDegraded = false // disk now holds the current config
+
 	// Push current active to history with description
 	s.history.Push(&HistoryEntry{
 		Config:    s.active.Clone(),
@@ -832,11 +936,6 @@ func (s *Store) CommitWithDescription(description string) (*config.Config, error
 	s.candidate = s.active.Clone()
 	s.compiled = compiled
 	s.dirty = false
-
-	// Persist to disk
-	if err := s.db.WriteActive(s.active); err != nil {
-		slog.Warn("failed to save config", "err", err)
-	}
 
 	// Log to journal with description
 	s.journal.Log(&JournalEntry{
@@ -874,6 +973,23 @@ func (s *Store) SetCentralRollbackHandler(fn func(*config.Config)) {
 // CommitConfirmed validates, compiles, and applies the candidate with an
 // automatic rollback timer. If minutes is 0, defaults to 10.
 // If a bare "commit" is not issued within the timeout, the config auto-reverts.
+//
+// Persistence contract (#1799, Option A + confirm-state ordering): the
+// candidate is persisted BEFORE any in-memory promotion AND before any
+// confirm state is touched. On persist failure nothing changes: no
+// promotion, no timer armed, and an EXISTING pending confirm (its
+// timer and rollback target) is left fully intact — the prior ordering
+// cancelled the pending timer and overwrote the rollback target before
+// the write, so a persist failure could strand a pending confirmed
+// commit with no auto-rollback.
+//
+// Nested confirmed commits (a second CommitConfirmed while one is
+// still pending) PRESERVE the existing confirmPrevTree/confirmPrevCfg:
+// the rollback target must stay the last truly CONFIRMED config.
+// Overwriting it with s.active (the unconfirmed commit-1 tree, as the
+// code did before #1799) meant a commit-2 timeout "rolled back" to the
+// equally-unconfirmed commit 1 and stayed there forever, because
+// commit 1's own timer had been cancelled.
 func (s *Store) CommitConfirmed(minutes int) (*config.Config, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -891,15 +1007,23 @@ func (s *Store) CommitConfirmed(minutes int) (*config.Config, error) {
 		minutes = 10
 	}
 
-	// Cancel any existing pending confirmation
+	// #1799 Option A: persist BEFORE promoting and BEFORE touching
+	// any confirm state (see contract above).
+	if err := s.writeActive(s.candidate); err != nil {
+		return nil, fmt.Errorf("commit confirmed failed: persist active config: %w", err)
+	}
+	s.persistDegraded = false // disk now holds the current config
+
 	if s.confirmTimer != nil {
+		// Nested confirmed commit: cancel the pending timer but keep
+		// the original rollback target (last confirmed config).
 		s.confirmTimer.Stop()
 		s.confirmTimer = nil
+	} else {
+		// Save current active state for potential rollback.
+		s.confirmPrevTree = s.active.Clone()
+		s.confirmPrevCfg = s.compiled
 	}
-
-	// Save current active state for potential rollback
-	s.confirmPrevTree = s.active.Clone()
-	s.confirmPrevCfg = s.compiled
 
 	// Push current active to history
 	s.history.Push(&HistoryEntry{
@@ -913,11 +1037,6 @@ func (s *Store) CommitConfirmed(minutes int) (*config.Config, error) {
 	s.compiled = compiled
 	s.dirty = false
 
-	// Persist to disk
-	if err := s.db.WriteActive(s.active); err != nil {
-		slog.Warn("failed to save config", "err", err)
-	}
-
 	// Log to journal
 	s.journal.Log(&JournalEntry{
 		Timestamp: time.Now(),
@@ -927,9 +1046,13 @@ func (s *Store) CommitConfirmed(minutes int) (*config.Config, error) {
 
 	s.saveRollbackFiles()
 
-	// Start auto-rollback timer
+	// Start auto-rollback timer. The closure captures the generation
+	// at arm time; a stale callback from a superseded timer no-ops in
+	// performAutoRollback.
+	s.confirmGen++
+	gen := s.confirmGen
 	s.confirmTimer = time.AfterFunc(time.Duration(minutes)*time.Minute, func() {
-		s.performAutoRollback()
+		s.performAutoRollback(gen)
 	})
 
 	slog.Info("commit confirmed started", "timeout_minutes", minutes)
@@ -946,6 +1069,7 @@ func (s *Store) ConfirmCommit() error {
 	}
 
 	s.confirmTimer.Stop()
+	s.confirmGen++ // invalidate a callback that already fired and is blocked on s.mu
 	s.confirmTimer = nil
 	s.confirmPrevTree = nil
 	s.confirmPrevCfg = nil
@@ -961,10 +1085,20 @@ func (s *Store) IsConfirmPending() bool {
 	return s.confirmTimer != nil
 }
 
-// performAutoRollback reverts the active config to the saved pre-confirmed state.
-func (s *Store) performAutoRollback() {
+// performAutoRollback reverts the active config to the saved
+// pre-confirmed state. gen must be the confirmGen captured when the
+// calling timer was armed: a mismatch means this callback was
+// superseded (nested CommitConfirmed re-armed, or ConfirmCommit
+// confirmed) after it fired but before it acquired s.mu, and rolling
+// back would revert a NEWER commit to an older tree (Codex review on
+// PR #1817).
+func (s *Store) performAutoRollback(gen uint64) {
 	s.mu.Lock()
 
+	if gen != s.confirmGen {
+		s.mu.Unlock()
+		return
+	}
 	if s.confirmPrevTree == nil {
 		s.mu.Unlock()
 		return
@@ -982,9 +1116,17 @@ func (s *Store) performAutoRollback() {
 	prevCfg := s.confirmPrevCfg
 	s.confirmPrevCfg = nil
 
-	// Persist reverted config to disk
-	if err := s.db.WriteActive(s.active); err != nil {
-		slog.Warn("failed to save reverted config", "err", err)
+	// Persist reverted config to disk. Option B (#1799): the rollback
+	// ALWAYS proceeds in memory — reverting the running config is the
+	// safety property — but a persist failure here used to leave the
+	// UNCONFIRMED candidate on disk, so a reboot would load the config
+	// the operator never confirmed. The degraded flag + singleton
+	// retry make the failure visible (/health 503, gauge, journal
+	// ERROR) and heal the disk in the background.
+	if err := s.writeActive(s.active); err != nil {
+		s.noteActivePersistFailureLocked("auto_rollback", err)
+	} else {
+		s.persistDegraded = false
 	}
 
 	// Log to journal

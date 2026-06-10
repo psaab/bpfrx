@@ -240,6 +240,14 @@ func newCollector(srv *Server) *xpfCollector {
 				"syscall (#1780).",
 			[]string{"phase"}, nil,
 		),
+		configPersistDegraded: prometheus.NewDesc(
+			"xpf_daemon_config_persist_degraded",
+			"1 while the running active configuration failed to persist "+
+				"to disk and the background retry has not yet succeeded "+
+				"(a daemon restart would load a stale config, #1799); 0 "+
+				"when config persistence is healthy.",
+			nil, nil,
+		),
 
 		// #709: owner-profile telemetry. Labels:
 		//   ifindex:      interface ifindex as string
