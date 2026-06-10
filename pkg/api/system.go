@@ -130,7 +130,11 @@ func (s *Server) pingHandler(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, cmd[0], cmd[1:]...).CombinedOutput()
+	c := exec.CommandContext(ctx, cmd[0], cmd[1:]...)
+	// U3 parity (#1805): cap the post-kill pipe-drain window so a child
+	// that inherited the output pipe cannot block Wait past the ctx kill.
+	c.WaitDelay = requestExecWaitDelay
+	out, err := c.CombinedOutput()
 	output := string(out)
 	if err != nil {
 		output += "\n" + err.Error()
@@ -168,7 +172,11 @@ func (s *Server) tracerouteHandler(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, cmd[0], cmd[1:]...).CombinedOutput()
+	c := exec.CommandContext(ctx, cmd[0], cmd[1:]...)
+	// U3 parity (#1805): cap the post-kill pipe-drain window so a child
+	// that inherited the output pipe cannot block Wait past the ctx kill.
+	c.WaitDelay = requestExecWaitDelay
+	out, err := c.CombinedOutput()
 	output := string(out)
 	if err != nil {
 		output += "\n" + err.Error()
@@ -258,14 +266,18 @@ func (s *Server) systemActionHandler(w http.ResponseWriter, r *http.Request) {
 	case "reboot":
 		go func() {
 			time.Sleep(1 * time.Second)
-			exec.Command("systemctl", "reboot").Run()
+			// context.Background(): a confirmed power action must not be
+			// cancelled by client disconnect. Errors ignored as before.
+			runTimeout(context.Background(), "systemctl", "reboot")
 		}()
 		writeOK(w, map[string]string{"message": "System going down for reboot NOW!"})
 
 	case "halt":
 		go func() {
 			time.Sleep(1 * time.Second)
-			exec.Command("systemctl", "halt").Run()
+			// context.Background(): a confirmed power action must not be
+			// cancelled by client disconnect. Errors ignored as before.
+			runTimeout(context.Background(), "systemctl", "halt")
 		}()
 		writeOK(w, map[string]string{"message": "System halting NOW!"})
 

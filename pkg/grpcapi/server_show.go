@@ -2,7 +2,6 @@ package grpcapi
 
 import (
 	"context"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -336,7 +335,7 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 
 	case "ntp":
 		// #1043 Phase 7: case body extracted to server_show_system.go
-		s.showNTP(&buf)
+		s.showNTP(ctx, &buf)
 
 	case "system-syslog":
 		// #1043 Phase 7: case body extracted to server_show_system.go
@@ -387,7 +386,7 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 		s.showScreen(cfg, &buf)
 
 	case "log":
-		out, err := exec.Command("journalctl", "-u", "xpfd", "-n", "50", "--no-pager").CombinedOutput()
+		out, err := combinedOutputTimeout(ctx, "journalctl", "-u", "xpfd", "-n", "50", "--no-pager")
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "journalctl: %v", err)
 		}
@@ -435,14 +434,18 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 		} else if strings.HasPrefix(req.Topic, "log:") {
 			parts := strings.SplitN(req.Topic, ":", 3)
 			filename := filepath.Base(parts[1]) // sanitize path
-			n := "50"
+			n := 50
 			if len(parts) >= 3 {
-				if _, err := strconv.Atoi(parts[2]); err == nil {
-					n = parts[2]
+				if v, err := strconv.Atoi(parts[2]); err == nil {
+					n = v
 				}
 			}
+			// The line count is request-controlled; clamp it because
+			// the 15s exec bound does not limit how many bytes a fast
+			// tail of a huge N can return (see clampTailLines).
+			n = clampTailLines(n)
 			logPath := filepath.Join("/var/log", filename)
-			out, err := exec.Command("tail", "-n", n, logPath).CombinedOutput()
+			out, err := combinedOutputTimeout(ctx, "tail", "-n", strconv.Itoa(n), logPath)
 			if err != nil {
 				return nil, status.Errorf(codes.Internal, "read %s: %v", logPath, err)
 			}

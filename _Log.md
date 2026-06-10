@@ -4703,3 +4703,11 @@ top.
   persist_failure_test.go (new), README.md}, pkg/api/{server.go, health.go,
   health_test.go, metrics.go, metrics_descriptors.go,
   metrics_persist_degraded_test.go (new), README.md}, pkg/daemon/daemon_run.go
+
+- **Timestamp**: 2026-06-10
+  **Action**: "#1805 commit 1 — grpcapi bounded request-path exec: new exec_timeout.go (outputTimeout/combinedOutputTimeout/runTimeout, 15s+5s WaitDelay, clampTailLines), converted 13 raw exec sites (server_show_status.go ×4 Output, server_show_system.go ×4 NTP chain w/ ctx plumb, server_show.go ×2 incl tail clamp, server_diag.go ×3 power + ×2 neigh flush), WaitDelay parity on streamDiagCmd, tests, README gotcha"
+  **File(s)**: pkg/grpcapi/exec_timeout.go, pkg/grpcapi/exec_timeout_test.go, pkg/grpcapi/server_show_status.go, pkg/grpcapi/server_show_system.go, pkg/grpcapi/server_show.go, pkg/grpcapi/server_diag.go, pkg/grpcapi/README.md
+
+- **Timestamp**: 2026-06-10
+  **Action**: "#1805 commit 2 — api bounded request-path exec: new exec_timeout.go (runTimeout only — sole raw sites are power actions; Output variants live in grpcapi sibling), converted system.go reboot/halt to runTimeout(context.Background()), WaitDelay=5s U3-parity on ping/traceroute handlers, tests, README gotcha"
+  **File(s)**: pkg/api/exec_timeout.go, pkg/api/exec_timeout_test.go, pkg/api/system.go, pkg/api/README.md
