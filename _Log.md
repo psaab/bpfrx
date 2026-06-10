@@ -4757,3 +4757,11 @@ top.
 - **Timestamp**: 2026-06-10
   **Action**: "#1805 commit 2 — api bounded request-path exec: new exec_timeout.go (runTimeout only — sole raw sites are power actions; Output variants live in grpcapi sibling), converted system.go reboot/halt to runTimeout(context.Background()), WaitDelay=5s U3-parity on ping/traceroute handlers, tests, README gotcha"
   **File(s)**: pkg/api/exec_timeout.go, pkg/api/exec_timeout_test.go, pkg/api/system.go, pkg/api/README.md
+
+- **Timestamp**: 2026-06-10 09:55
+  **Action**: #1778 commit 1 — Kea manager authoritative systemd reconcile +
+  fail-closed Apply; replaced process-local running4/running6 booleans with
+  `systemctl is-active` queries; added test seams (pkg/dhcp convention) and
+  manager-level regression tests; README contract update.
+  **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/test_seams.go,
+  pkg/dhcpserver/dhcpserver_test.go, pkg/dhcpserver/README.md

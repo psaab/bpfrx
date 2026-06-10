@@ -4,11 +4,14 @@ package dhcpserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -40,6 +43,25 @@ func runSystemctl(args ...string) error {
 	return nil
 }
 
+// unitIsActive reports whether a systemd unit is active (or on its way
+// up) by querying `systemctl is-active`. A non-zero exit means "not
+// active" — the state string is on stdout either way, so exit status
+// is not treated as a query failure. If systemctl cannot run at all
+// the output is empty and the unit is reported inactive (there is
+// nothing useful to stop in that case anyway).
+func unitIsActive(unit string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), systemctlTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "systemctl", "is-active", unit)
+	cmd.WaitDelay = 5 * time.Second
+	out, _ := cmd.Output()
+	switch strings.TrimSpace(string(out)) {
+	case "active", "activating", "reloading":
+		return true
+	}
+	return false
+}
+
 const (
 	kea4Config = "/etc/kea/kea-dhcp4.conf"
 	kea6Config = "/etc/kea/kea-dhcp6.conf"
@@ -48,75 +70,111 @@ const (
 )
 
 // Manager manages Kea DHCP server processes.
+//
+// The manager is authoritative over the kea-dhcp{4,6}-server units
+// (#1778): it reconciles against the ACTUAL systemd unit state
+// (`systemctl is-active`) rather than process-local booleans, so a
+// stale Kea left running by a previous xpfd instance is stopped when
+// the current config has no matching dhcp-server stanza.
 type Manager struct {
-	running4 bool
-	running6 bool
+	mu        sync.Mutex
+	confPath4 string
+	confPath6 string
+
+	// Seams for tests (see test_seams.go). Production instances get
+	// the package-level implementations from New().
+	runSystemctl func(args ...string) error
+	unitActive   func(unit string) bool
 }
 
 // New creates a new DHCP server manager.
 func New() *Manager {
-	return &Manager{}
+	return &Manager{
+		confPath4:    kea4Config,
+		confPath6:    kea6Config,
+		runSystemctl: runSystemctl,
+		unitActive:   unitIsActive,
+	}
 }
 
-// Apply generates Kea config from the xpf DHCP server config and restarts Kea.
+// Apply reconciles the Kea DHCP servers with the xpf DHCP server
+// config. For each address family that is configured it regenerates
+// the Kea config and restarts the unit; for each family that is NOT
+// configured (including cfg == nil) it stops the unit if systemd
+// reports it active — regardless of whether this process started it —
+// and removes the generated config file.
+//
+// Fail-closed (#1778): a restart failure (or a failure to stop an
+// active unit that is no longer in config) is returned to the caller
+// so a config commit surfaces the failure instead of reporting
+// success while no DHCP service is running.
 func (m *Manager) Apply(cfg *config.DHCPServerConfig) error {
-	if cfg == nil {
-		m.Clear()
-		return nil
-	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	// DHCPv4
-	if cfg.DHCPLocalServer != nil && len(cfg.DHCPLocalServer.Groups) > 0 {
+	var errs []error
+
+	want4 := cfg != nil && cfg.DHCPLocalServer != nil && len(cfg.DHCPLocalServer.Groups) > 0
+	want6 := cfg != nil && cfg.DHCPv6LocalServer != nil && len(cfg.DHCPv6LocalServer.Groups) > 0
+
+	if want4 {
 		if err := m.generateKea4Config(cfg); err != nil {
-			return fmt.Errorf("generate kea4 config: %w", err)
+			errs = append(errs, fmt.Errorf("generate kea4 config: %w", err))
+		} else if err := m.runSystemctl("restart", kea4Svc); err != nil {
+			errs = append(errs, fmt.Errorf("restart %s: %w", kea4Svc, err))
 		}
-		if err := m.restartKea4(); err != nil {
-			slog.Warn("failed to restart kea-dhcp4", "err", err)
-		} else {
-			m.running4 = true
-		}
-	} else if m.running4 {
-		stopService(kea4Svc)
-		m.running4 = false
-		os.Remove(kea4Config)
+	} else if err := m.clearFamilyLocked(kea4Svc, m.confPath4); err != nil {
+		errs = append(errs, err)
 	}
 
-	// DHCPv6
-	if cfg.DHCPv6LocalServer != nil && len(cfg.DHCPv6LocalServer.Groups) > 0 {
+	if want6 {
 		if err := m.generateKea6Config(cfg); err != nil {
-			return fmt.Errorf("generate kea6 config: %w", err)
+			errs = append(errs, fmt.Errorf("generate kea6 config: %w", err))
+		} else if err := m.runSystemctl("restart", kea6Svc); err != nil {
+			errs = append(errs, fmt.Errorf("restart %s: %w", kea6Svc, err))
 		}
-		if err := m.restartKea6(); err != nil {
-			slog.Warn("failed to restart kea-dhcp6", "err", err)
+	} else if err := m.clearFamilyLocked(kea6Svc, m.confPath6); err != nil {
+		errs = append(errs, err)
+	}
+
+	return errors.Join(errs...)
+}
+
+// clearFamilyLocked stops one Kea unit if systemd reports it active
+// and removes its generated config file. Caller must hold m.mu.
+func (m *Manager) clearFamilyLocked(svc, confPath string) error {
+	var err error
+	if m.unitActive(svc) {
+		if e := m.runSystemctl("stop", svc); e != nil {
+			err = fmt.Errorf("stop %s: %w", svc, e)
+			slog.Warn("failed to stop Kea unit", "service", svc, "err", e)
 		} else {
-			m.running6 = true
+			slog.Info("stopped Kea unit not in current config", "service", svc)
 		}
-	} else if m.running6 {
-		stopService(kea6Svc)
-		m.running6 = false
-		os.Remove(kea6Config)
 	}
-
-	return nil
+	os.Remove(confPath)
+	return err
 }
 
-// Clear stops Kea and removes generated configs.
+// Clear stops both Kea units (if systemd reports them active) and
+// removes the generated configs. Stop failures are logged at Warn by
+// clearFamilyLocked; callers on the VRRP transition path (daemon_ha)
+// cannot fail a state transition, so Clear keeps a void signature.
+// Commit-path callers use Apply(nil) instead, which returns errors.
 func (m *Manager) Clear() {
-	if m.running4 {
-		stopService(kea4Svc)
-		m.running4 = false
-	}
-	if m.running6 {
-		stopService(kea6Svc)
-		m.running6 = false
-	}
-	os.Remove(kea4Config)
-	os.Remove(kea6Config)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_ = m.clearFamilyLocked(kea4Svc, m.confPath4)
+	_ = m.clearFamilyLocked(kea6Svc, m.confPath6)
 }
 
-// IsRunning returns true if any Kea server is running.
+// IsRunning returns true if any Kea server unit is active per systemd
+// (authoritative — survives xpfd restarts, unlike the pre-#1778
+// process-local booleans).
 func (m *Manager) IsRunning() bool {
-	return m.running4 || m.running6
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.unitActive(kea4Svc) || m.unitActive(kea6Svc)
 }
 
 // Lease represents a DHCP lease from Kea's lease database.
@@ -231,15 +289,8 @@ func (m *Manager) generateKea4Config(cfg *config.DHCPServerConfig) error {
 				})
 			}
 			if len(pool.DNSServers) > 0 {
-				dnsStr := ""
-				for i, d := range pool.DNSServers {
-					if i > 0 {
-						dnsStr += ", "
-					}
-					dnsStr += d
-				}
 				sub.OptionData = append(sub.OptionData, keaOpt{
-					Name: "domain-name-servers", Data: dnsStr,
+					Name: "domain-name-servers", Data: strings.Join(pool.DNSServers, ", "),
 				})
 			}
 			if pool.Domain != "" {
@@ -274,27 +325,7 @@ func (m *Manager) generateKea4Config(cfg *config.DHCPServerConfig) error {
 		},
 	}
 
-	data, err := json.MarshalIndent(keaCfg, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	if err := os.MkdirAll("/etc/kea", 0755); err != nil {
-		return fmt.Errorf("create /etc/kea: %w", err)
-	}
-
-	return os.WriteFile(kea4Config, data, 0644)
-}
-
-func stopService(name string) {
-	// Debug, not Warn: stop fails normally when the unit isn't running.
-	if err := runSystemctl("stop", name); err != nil {
-		slog.Debug("service stop failed", "service", name, "err", err)
-	}
-}
-
-func (m *Manager) restartKea4() error {
-	return runSystemctl("restart", kea4Svc)
+	return m.writeKeaConfig(m.confPath4, keaCfg)
 }
 
 func (m *Manager) generateKea6Config(cfg *config.DHCPServerConfig) error {
@@ -332,15 +363,8 @@ func (m *Manager) generateKea6Config(cfg *config.DHCPServerConfig) error {
 				sub.Interface = group.Interfaces[0]
 			}
 			if len(pool.DNSServers) > 0 {
-				dnsStr := ""
-				for i, d := range pool.DNSServers {
-					if i > 0 {
-						dnsStr += ", "
-					}
-					dnsStr += d
-				}
 				sub.OptionData = append(sub.OptionData, keaOpt{
-					Name: "dns-servers", Data: dnsStr,
+					Name: "dns-servers", Data: strings.Join(pool.DNSServers, ", "),
 				})
 			}
 			if pool.Domain != "" {
@@ -374,18 +398,17 @@ func (m *Manager) generateKea6Config(cfg *config.DHCPServerConfig) error {
 		},
 	}
 
+	return m.writeKeaConfig(m.confPath6, keaCfg)
+}
+
+func (m *Manager) writeKeaConfig(path string, keaCfg map[string]any) error {
 	data, err := json.MarshalIndent(keaCfg, "", "  ")
 	if err != nil {
 		return err
 	}
-
-	if err := os.MkdirAll("/etc/kea", 0755); err != nil {
-		return fmt.Errorf("create /etc/kea: %w", err)
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("create %s: %w", dir, err)
 	}
-
-	return os.WriteFile(kea6Config, data, 0644)
-}
-
-func (m *Manager) restartKea6() error {
-	return runSystemctl("restart", kea6Svc)
+	return os.WriteFile(path, data, 0644)
 }
