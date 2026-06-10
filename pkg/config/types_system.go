@@ -290,7 +290,53 @@ type LoginUser struct {
 type ServicesConfig struct {
 	FlowMonitoring            *FlowMonitoringConfig
 	RPM                       *RPMConfig
-	ApplicationIdentification bool // DPI-based application detection
+	IPMonitoring              *IPMonitoringConfig // services ip-monitoring (#1827 PR-1b)
+	ApplicationIdentification bool                // DPI-based application detection
+}
+
+// IPMonitoringConfig holds `services ip-monitoring` policies (#1827
+// PR-1b): probe-driven preferred-route injection, Junos parity.
+type IPMonitoringConfig struct {
+	Policies map[string]*IPMonitoringPolicy
+}
+
+// IPMonitoringPolicy matches one RPM probe and injects its preferred
+// routes (at route preference 1, Static/1 on SRX) while ANY test of the
+// matched probe is FAILED; on recovery they are withdrawn.
+type IPMonitoringPolicy struct {
+	Name            string
+	MatchRPMProbe   string
+	PreferredRoutes []*PreferredRoute
+	// HoldDownSecs damps recovery flaps (extension beyond Junos;
+	// 0 = Junos parity: withdraw immediately on recovery).
+	HoldDownSecs int
+}
+
+// PreferredRoute is one injected route of an ip-monitoring policy.
+type PreferredRoute struct {
+	RoutingInstance string // "" = master; instance-type forwarding REJECTED in PR-1b
+	Destination     string // CIDR
+	NextHop         string
+	// PreferredMetric is a metric AMONG injected routes for the same
+	// prefix (the tie-break when two policies in FAIL both inject the
+	// same destination — lowest wins, then lexicographic policy name).
+	// It is NOT the route preference: the injected route always has
+	// preference 1.
+	PreferredMetric int
+}
+
+// RouteOverlayEntry is one winner-resolved effective route of the
+// ip-monitoring overlay (#1827 PR-1b §4.3): the single decision point
+// consumed by BOTH the FRR managed-section render (distance-1 static)
+// and the userspace dataplane snapshot builder (whole-entry replacement
+// of the (table, family, prefix) route set). Runtime state, never
+// config: it does not participate in config sync.
+type RouteOverlayEntry struct {
+	RoutingInstance string // "" = master table
+	Destination     string // CIDR
+	NextHop         string
+	Metric          int    // winning preferred-metric (informational downstream)
+	Policy          string // owning policy name (logging/show)
 }
 
 // RPMConfig holds RPM (Real-time Performance Monitoring) configuration.

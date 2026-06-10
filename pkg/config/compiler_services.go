@@ -249,8 +249,184 @@ func compileServices(node *Node, svc *ServicesConfig) error {
 			return err
 		}
 	}
+	if ipmNode := node.FindChild("ip-monitoring"); ipmNode != nil {
+		if err := compileIPMonitoring(ipmNode, svc); err != nil {
+			return err
+		}
+	}
 	if node.FindChild("application-identification") != nil {
 		svc.ApplicationIdentification = true
+	}
+	return nil
+}
+
+// compileIPMonitoring parses `services ip-monitoring` (#1827 PR-1b).
+// Both AST shapes are handled: hierarchical blocks and flat-set replay.
+// Two set lines for the same (routing-instance, route) merge into one
+// PreferredRoute (next-hop + preferred-metric arrive on separate lines).
+func compileIPMonitoring(node *Node, svc *ServicesConfig) error {
+	cfg := &IPMonitoringConfig{Policies: make(map[string]*IPMonitoringPolicy)}
+
+	for _, polInst := range namedInstances(node.FindChildren("policy")) {
+		pol := &IPMonitoringPolicy{Name: polInst.name}
+		routes := make(map[string]*PreferredRoute)
+		var order []string
+
+		for _, prop := range polInst.node.Children {
+			switch prop.Name() {
+			case "match":
+				// `match { rpm-probe X; }` or inline `match rpm-probe X;`
+				if len(prop.Keys) >= 3 && prop.Keys[1] == "rpm-probe" {
+					pol.MatchRPMProbe = prop.Keys[2]
+				}
+				if c := prop.FindChild("rpm-probe"); c != nil {
+					if v := nodeVal(c); v != "" {
+						pol.MatchRPMProbe = v
+					}
+				}
+			case "then":
+				for _, prNode := range prop.FindChildren("preferred-route") {
+					if err := compilePreferredRoutes(prNode, "", pol.Name, routes, &order); err != nil {
+						return err
+					}
+					for _, riInst := range namedInstances(prNode.FindChildren("routing-instance")) {
+						if err := compilePreferredRoutes(riInst.node, riInst.name, pol.Name, routes, &order); err != nil {
+							return err
+						}
+					}
+				}
+			case "hold-down":
+				if v := nodeVal(prop); v != "" {
+					n, err := strconv.Atoi(v)
+					if err != nil || n < 0 {
+						return fmt.Errorf("services ip-monitoring policy %q hold-down: invalid value %q", pol.Name, v)
+					}
+					pol.HoldDownSecs = n
+				}
+			}
+		}
+
+		for _, key := range order {
+			pol.PreferredRoutes = append(pol.PreferredRoutes, routes[key])
+		}
+		cfg.Policies[pol.Name] = pol
+	}
+
+	svc.IPMonitoring = cfg
+	return nil
+}
+
+// compilePreferredRoutes collects `route <cidr> { next-hop X;
+// preferred-metric N; }` children of a preferred-route (or its
+// routing-instance sub-block), merging repeated lines for the same
+// destination.
+func compilePreferredRoutes(node *Node, ri, polName string, routes map[string]*PreferredRoute, order *[]string) error {
+	for _, rInst := range namedInstances(node.FindChildren("route")) {
+		key := ri + "|" + rInst.name
+		r := routes[key]
+		if r == nil {
+			r = &PreferredRoute{RoutingInstance: ri, Destination: rInst.name}
+			routes[key] = r
+			*order = append(*order, key)
+		}
+		setMetric := func(v string) error {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 0 {
+				return fmt.Errorf("services ip-monitoring policy %q route %s preferred-metric: invalid value %q",
+					polName, r.Destination, v)
+			}
+			r.PreferredMetric = n
+			return nil
+		}
+		// Inline keys: `route 0.0.0.0/0 next-hop 1.2.3.4;`
+		keys := rInst.node.Keys
+		for i := 2; i+1 < len(keys); i += 2 {
+			switch keys[i] {
+			case "next-hop":
+				r.NextHop = keys[i+1]
+			case "preferred-metric":
+				if err := setMetric(keys[i+1]); err != nil {
+					return err
+				}
+			}
+		}
+		// Child-node shape (hierarchical blocks + flat-set replay).
+		for _, p := range rInst.node.Children {
+			switch p.Name() {
+			case "next-hop":
+				if v := nodeVal(p); v != "" {
+					r.NextHop = v
+				}
+			case "preferred-metric":
+				if v := nodeVal(p); v != "" {
+					if err := setMetric(v); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// validateIPMonitoringStrict enforces the #1827 PR-1b commit checks:
+// the matched probe exists, every policy has at least one
+// preferred-route, destinations/next-hops are family-consistent, and
+// referenced routing instances exist AND are not instance-type
+// forwarding (the FBF composition is PR-2 — the known FRR-vs-dataplane
+// divergence for forwarding instances must be unreachable from PR-1).
+func validateIPMonitoringStrict(cfg *Config) error {
+	ipm := cfg.Services.IPMonitoring
+	if ipm == nil {
+		return nil
+	}
+	instances := make(map[string]*RoutingInstanceConfig)
+	for _, ri := range cfg.RoutingInstances {
+		if ri != nil {
+			instances[ri.Name] = ri
+		}
+	}
+	for name, pol := range ipm.Policies {
+		if pol == nil {
+			continue
+		}
+		if pol.MatchRPMProbe == "" {
+			return fmt.Errorf("services ip-monitoring policy %q: match rpm-probe is required", name)
+		}
+		if cfg.Services.RPM == nil || cfg.Services.RPM.Probes[pol.MatchRPMProbe] == nil {
+			return fmt.Errorf("services ip-monitoring policy %q: match rpm-probe %q does not reference a configured services rpm probe",
+				name, pol.MatchRPMProbe)
+		}
+		if len(pol.PreferredRoutes) == 0 {
+			return fmt.Errorf("services ip-monitoring policy %q: at least one then preferred-route route is required", name)
+		}
+		for _, pr := range pol.PreferredRoutes {
+			_, dst, err := net.ParseCIDR(pr.Destination)
+			if err != nil {
+				return fmt.Errorf("services ip-monitoring policy %q route %q: invalid destination prefix",
+					name, pr.Destination)
+			}
+			nh := net.ParseIP(pr.NextHop)
+			if nh == nil {
+				return fmt.Errorf("services ip-monitoring policy %q route %s: next-hop %q is not a valid IP address",
+					name, pr.Destination, pr.NextHop)
+			}
+			if (dst.IP.To4() == nil) != (nh.To4() == nil) {
+				return fmt.Errorf("services ip-monitoring policy %q route %s: next-hop %q address family does not match destination",
+					name, pr.Destination, pr.NextHop)
+			}
+			if pr.RoutingInstance != "" {
+				ri, ok := instances[pr.RoutingInstance]
+				if !ok {
+					return fmt.Errorf("services ip-monitoring policy %q route %s: routing-instance %q does not exist",
+						name, pr.Destination, pr.RoutingInstance)
+				}
+				if ri.InstanceType == "forwarding" {
+					return fmt.Errorf("services ip-monitoring policy %q route %s: preferred-route routing-instance %q has instance-type forwarding, which is not supported yet (filter-based forwarding composition is #1827 PR-2)",
+						name, pr.Destination, pr.RoutingInstance)
+				}
+			}
+		}
 	}
 	return nil
 }
