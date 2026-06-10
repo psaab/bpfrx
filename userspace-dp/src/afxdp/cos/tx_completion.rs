@@ -107,6 +107,20 @@ pub(in crate::afxdp) fn park_cos_queue(
 pub(in crate::afxdp) const COS_TIMER_WHEEL_TICK_NS: u64 = 50_000;
 const COS_TIMER_WHEEL_L0_HORIZON_TICKS: u64 = COS_TIMER_WHEEL_L0_SLOTS as u64;
 
+/// #1782 Step-2 (§5.2 mechanism (i)): total wheel horizon in ticks.
+/// Level 0 indexes `wake_tick % L0_SLOTS` (256 ticks); level 1 indexes
+/// `(wake_tick / L0_SLOTS) % L1_SLOTS`, so the combined wheel
+/// distinguishes wake ticks up to `L0_SLOTS * L1_SLOTS` = 65,536 ticks
+/// (~3.28 s at 50 µs/tick) ahead of `current_tick` before slot
+/// indexing wraps. A catch-up lag beyond this guarantees the per-tick
+/// loop would visit every L0 slot (>= 256 full L0 revolutions) and
+/// cascade every L1 slot (>= 256 cascades at consecutive
+/// `current_tick / L0_SLOTS` values), i.e. it would drain the entire
+/// wheel — which is what makes the over-horizon snap in
+/// `advance_cos_timer_wheel` provably behavior-identical.
+pub(in crate::afxdp) const COS_TIMER_WHEEL_TOTAL_HORIZON_TICKS: u64 =
+    (COS_TIMER_WHEEL_L0_SLOTS * COS_TIMER_WHEEL_L1_SLOTS) as u64;
+
 // ============================================================================
 // Timer-wheel cluster
 // ============================================================================
@@ -217,7 +231,20 @@ pub(in crate::afxdp) fn normalize_cos_queue_state(queue: &mut CoSQueueRuntime) {
 /// loop iteration. Returns the number of ticks advanced by THIS call
 /// (`now_tick - current_tick` at entry) — the #1782 Step-1 §4(i)
 /// catch-up instrument. The return value is computed once before the
-/// loop (O(1), no extra clock reads); the loop itself is unchanged.
+/// loop (O(1), no extra clock reads) and reports the TRUE lag even
+/// when the #1782 Step-2 over-horizon snap below short-circuits the
+/// loop, so `cos_wheel_ticks_advanced_total/_max` keep recording the
+/// snapped amount (Step-1's 2.2M-tick cold-start signal stays
+/// visible; only its wall cost is gone).
+///
+/// #1782 Step-2 (§5.2 mechanism (i)): when the lag exceeds the full
+/// wheel horizon — the first shaped drain after a long per-worker
+/// idle period — the per-tick loop is pure O(lag) catch-up (~111 s of
+/// 50 µs ticks replayed for one cold connect in the Step-1 evidence).
+/// `snap_cos_timer_wheel_over_horizon` replaces it with an O(slots)
+/// snap when no queue is parked. In-horizon lag
+/// (`<= COS_TIMER_WHEEL_TOTAL_HORIZON_TICKS`) always takes the
+/// existing per-tick loop unchanged.
 #[inline]
 pub(in crate::afxdp) fn advance_cos_timer_wheel(
     root: &mut CoSInterfaceRuntime,
@@ -225,6 +252,11 @@ pub(in crate::afxdp) fn advance_cos_timer_wheel(
 ) -> u64 {
     let now_tick = cos_tick_for_ns(now_ns);
     let ticks_advanced = now_tick.saturating_sub(root.timer_wheel.current_tick);
+    if ticks_advanced > COS_TIMER_WHEEL_TOTAL_HORIZON_TICKS
+        && snap_cos_timer_wheel_over_horizon(root, now_tick)
+    {
+        return ticks_advanced;
+    }
     while root.timer_wheel.current_tick < now_tick {
         root.timer_wheel.current_tick = root.timer_wheel.current_tick.saturating_add(1);
         if root.timer_wheel.current_tick % COS_TIMER_WHEEL_L0_SLOTS as u64 == 0 {
@@ -233,6 +265,60 @@ pub(in crate::afxdp) fn advance_cos_timer_wheel(
         wake_due_cos_timer_slot(root);
     }
     ticks_advanced
+}
+
+/// #1782 Step-2 (§5.2 mechanism (i)): O(slots) wheel catch-up for an
+/// over-horizon lag. Returns `true` if the wheel was snapped to
+/// `now_tick` (caller skips the per-tick loop), `false` to fall back
+/// to the existing O(lag) loop.
+///
+/// Correctness (plan Codex F1 + AGY F1 fold): the "wheel is empty at
+/// idle" shortcut is FALSE — `park_cos_queue` pushes queue indices
+/// into `level0`/`level1` and `normalize_cos_queue_state` clears only
+/// queue flags, never the slot vectors; stale entries are filtered
+/// lazily by the `parked`/`wheel_level`/`wheel_slot` checks in
+/// `wake_due_cos_timer_slot` / `cascade_cos_timer_wheel_level1`. So
+/// the snap (option (a)) first verifies NO queue is parked: with no
+/// parked queue, EVERY wheel entry is stale (`!parked` fails the lazy
+/// filter), so the per-tick loop's only effects over an over-horizon
+/// lag are (1) emptying every slot vector — the loop visits all L0
+/// slots and cascades all L1 slots, see
+/// `COS_TIMER_WHEEL_TOTAL_HORIZON_TICKS` — and (2) setting
+/// `current_tick = now_tick`. The snap performs exactly those two
+/// effects, touching no queue state, so it is behavior-identical by
+/// construction.
+///
+/// Boundedness of the `false` fallback (plan AGY r2 F1 fold): a
+/// parked queue implies its wake tick was set within the wheel
+/// horizon of the THEN-current tick, and a parked queue is backlogged,
+/// which keeps the owner worker's shaped-drain priming active
+/// (`cos_root_can_service_after_prime` reports it serviceable once
+/// the wake tick is due) — so the wheel keeps advancing every poll
+/// pass and a pathological multi-minute lag cannot coexist with a
+/// populated wheel in production. The fallback still handles that
+/// state correctly (the O(lag) loop is unchanged) if it ever arises;
+/// no debug assertion is placed here because (1) the fallback test
+/// deliberately constructs the parked+huge-lag state to prove it, and
+/// (2) park wake ticks are not statically bounded by the horizon for
+/// very low configured rates (pre-existing slot-wrap behavior), so an
+/// assert could fire on legitimate configs.
+///
+/// Cold-path-only: reached only when lag > ~3.28 s, i.e. the first
+/// shaped drain after idle. `Vec::clear` frees nothing (capacity
+/// retained) — no allocation either way.
+#[cold]
+fn snap_cos_timer_wheel_over_horizon(root: &mut CoSInterfaceRuntime, now_tick: u64) -> bool {
+    if root.queues.iter().any(|queue| queue.hot.parked) {
+        return false;
+    }
+    for slot in root.timer_wheel.level0.iter_mut() {
+        slot.clear();
+    }
+    for slot in root.timer_wheel.level1.iter_mut() {
+        slot.clear();
+    }
+    root.timer_wheel.current_tick = now_tick;
+    true
 }
 
 fn cascade_cos_timer_wheel_level1(root: &mut CoSInterfaceRuntime) {
