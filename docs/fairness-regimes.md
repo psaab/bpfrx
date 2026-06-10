@@ -863,18 +863,24 @@ the sweep exit `2`; they do not produce a false-green fairness verdict.
 - **`xpf_userspace_worker_cos_wheel_ticks_advanced_total{worker_id=...}`**
   counter (#1782 Step-1, mechanism (i)): cumulative CoS timer-wheel
   ticks (50 µs each) advanced by `advance_cos_timer_wheel` across the
-  worker's bindings. The wheel catches up one tick per loop iteration,
-  so the first shaped drain after a per-worker idle period pays
-  `lag / 50 µs` iterations inside a single `drain_shaped_tx` call —
-  the §4(i) cold-start candidate. `rate()` is uninteresting at steady
-  state (≈ 20k ticks/s per active root); the cold-start signal is a
-  step in the total coincident with a connect stall.
+  worker's bindings. The wheel catches up one tick per loop iteration
+  while the lag is within the wheel horizon (65,536 ticks, ~3.28 s);
+  since #1782 Step-2 an over-horizon lag with no parked queue is
+  snapped in O(slots) instead of replaying `lag / 50 µs` iterations
+  inside a single `drain_shaped_tx` call (the confirmed §4(i)
+  cold-start mechanism). The counter still records the TRUE lag on the
+  snap path. `rate()` is uninteresting at steady state (≈ 20k ticks/s
+  per active root); the cold-start signal is a step in the total
+  coincident with the first post-idle drain.
 - **`xpf_userspace_worker_cos_wheel_ticks_advanced_max{worker_id=...}`**
   gauge (#1782 Step-1, mechanism (i)): largest single-call wheel
   advance ever observed on the worker (monotonic high-water mark,
   never resets). One cold reproduction landing a multi-million-tick
-  max pins the O(lag) catch-up conclusively, and its wall cost is
-  directly computable from the per-tick loop cost.
+  max pins the O(lag) catch-up conclusively (the Step-1 evidence:
+  2,226,212 ticks in one call after ~111 s idle). Since #1782 Step-2 a
+  multi-million-tick max no longer implies a multi-million-iteration
+  loop — over-horizon advances are snapped in O(slots) while the
+  counter keeps reporting the true lag.
 - **`xpf_userspace_worker_cos_queue_lease_undergrant_total{worker_id=..., cause=...}`**
   counter (#1782 Step-1, mechanism (ii)): CoS exact-guarantee selector
   visits where, AFTER `maybe_top_up_cos_queue_lease`, the queue's
