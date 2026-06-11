@@ -130,6 +130,11 @@ func (c *ctl) handleClearSecurity(args []string) error {
 		}
 		req := &pb.ClearSessionsRequest{}
 		for i := 2; i < len(args); i++ {
+			// Valueless flags first — they may legally be the last token.
+			if args[i] == "nat-only" || args[i] == "nat" {
+				req.NatOnly = true
+				continue
+			}
 			if i+1 >= len(args) {
 				break
 			}
@@ -159,6 +164,12 @@ func (c *ctl) handleClearSecurity(args []string) error {
 			case "application":
 				i++
 				req.Application = args[i]
+			case "interface":
+				i++
+				req.Interface = args[i]
+			case "source-nat-pool":
+				i++
+				req.SourceNatPool = args[i]
 			}
 		}
 		resp, err := c.client.ClearSessions(c.ctx(), req)
