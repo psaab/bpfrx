@@ -361,6 +361,11 @@ func newCollector(srv *Server) *xpfCollector {
 			"1 when this exact CoS queue's shared v8 lease is configured for opt-in equal-flow suppression (#1304).",
 			[]string{"ifindex", "queue_id"}, nil,
 		),
+		cosEqualFlowTargetPolicy: prometheus.NewDesc(
+			"xpf_userspace_cos_equal_flow_target_policy",
+			"Info metric (always 1): the equal-flow target policy active on this exact CoS queue's shared v8 lease — policy label is one of slowest | mean | ideal-share (#1746). Sibling of the existing equal-flow gauges; series identity of those gauges is unchanged.",
+			[]string{"ifindex", "queue_id", "policy"}, nil,
+		),
 		cosEqualFlowEnforced: prometheus.NewDesc(
 			"xpf_userspace_cos_equal_flow_enforced",
 			"1 when this exact CoS queue's current shared v8 lease epoch is actively applying equal-flow suppression; 0 when configured but failed open (#1304).",
@@ -514,8 +519,10 @@ func newCollector(srv *Server) *xpfCollector {
 			"xpf_userspace_worker_session_nat_reverse_key_collisions_total",
 			"Cumulative NAT reverse-key (nat_reverse_index) 1:N collision "+
 				"displacement events on this userspace worker's session table "+
-				"(#1758 latent corruption made observable; near-precise upper "+
-				"bound on live collisions).",
+				"(#1758/#1760 latent corruption made observable). Event count, "+
+				"not a census: standing collisions after a winner's expiry and "+
+				"never-replicated MissingNeighborSeed collisions are not "+
+				"counted here — see the shared displacements counter.",
 			[]string{"worker_id"}, nil,
 		),
 		userspaceSessionTableEntries: prometheus.NewDesc(
@@ -531,10 +538,25 @@ func newCollector(srv *Server) *xpfCollector {
 		userspaceNatReverseKeyCollisions: prometheus.NewDesc(
 			"xpf_userspace_session_nat_reverse_key_collisions_total",
 			"Aggregate NAT reverse-key (nat_reverse_index) 1:N collision "+
-				"displacement events across userspace workers (#1758 latent "+
-				"corruption made observable; near-precise upper bound on live "+
-				"collisions). A nonzero value warrants the structural-fix "+
-				"research.",
+				"displacement events across userspace workers (#1758/#1760 "+
+				"latent corruption made observable). Event count, not a "+
+				"census (replica fanout over-counts; standing and seed-path "+
+				"collisions under-count — pair with the shared displacements "+
+				"counter). >=1 means at least one real collision occurred "+
+				"and is the structural-fix revisit trigger.",
+			nil, nil,
+		),
+		userspaceNatReverseKeySharedDisplacements: prometheus.NewDesc(
+			"xpf_userspace_session_nat_reverse_key_shared_displacements_total",
+			"Shared-map NAT reverse-key displacement events: a "+
+				"publish_shared_session insert displaced a DIFFERENT forward "+
+				"session's entry at the same reverse key (#1760 latent 1:N "+
+				"reverse-path corruption). The shared map is the choke point "+
+				"all transit forward NAT sessions pass through (including "+
+				"MissingNeighborSeed installs invisible to the per-worker "+
+				"counter). Event count, not a pair census: >=1 means at "+
+				"least one real collision occurred; standing collisions "+
+				"against an already-unindexed session are not counted.",
 			nil, nil,
 		),
 		userspaceSessionPublishErrors: prometheus.NewDesc(

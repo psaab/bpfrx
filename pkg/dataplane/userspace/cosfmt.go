@@ -70,6 +70,9 @@ type cosQueueView struct {
 	equalFlowCapHitEvents         uint64
 	equalFlowSuppressedGrantBytes uint64
 	equalFlowFailOpenReason       string
+	// #1746: active equal-flow target policy label; "" renders as the
+	// byte-unchanged default "slowest".
+	equalFlowTargetPolicy string
 	// #1628 per-class waterfill trace counters (queue-scoped). Rendered
 	// in the per-queue detail block only when non-zero.
 	waterfillPhase1Admissions uint64
@@ -270,10 +273,15 @@ func FormatCoSInterfaceSummary(cfg *config.Config, status *ProcessStatus, select
 				fmt.Fprintf(&b, "           Surplus sharing: %s\n",
 					yesNo(queue.surplusSharing))
 				if queue.equalFlowEnforcement {
+					policy := queue.equalFlowTargetPolicy
+					if policy == "" {
+						policy = "slowest"
+					}
 					fmt.Fprintf(
 						&b,
-						"           Equal-flow:     enforced=%s  target=%s  max_worker_cap=%s  cap_hits=%d  suppressed_bytes=%d  fail_open=%s\n",
+						"           Equal-flow:     enforced=%s  policy=%s  target=%s  max_worker_cap=%s  cap_hits=%d  suppressed_bytes=%d  fail_open=%s\n",
 						yesNo(queue.equalFlowEnforced),
+						policy,
 						formatBitsPerSecond(queue.equalFlowTargetPerFlowBPS),
 						formatCoSBytes(queue.equalFlowMaxWorkerCapBytes),
 						queue.equalFlowCapHitEvents,
@@ -622,6 +630,7 @@ func buildCoSQueueViews(cfg *config.Config, view cosInterfaceView) []cosQueueVie
 					qv.guaranteeEnabled = sched.TransmitRateBytes > 0
 					qv.surplusSharing = sched.SurplusSharing
 					qv.equalFlowEnforcement = sched.EqualFlowEnforcement
+					qv.equalFlowTargetPolicy = sched.EqualFlowTargetPolicy
 					qv.transmitRate = sched.TransmitRateBytes
 					if sched.BufferSizeBytes > 0 {
 						qv.bufferBytes = sched.BufferSizeBytes
@@ -696,6 +705,9 @@ func buildCoSQueueViews(cfg *config.Config, view cosInterfaceView) []cosQueueVie
 			qv.equalFlowCapHitEvents = runtimeQueue.EqualFlowCapHitEvents
 			qv.equalFlowSuppressedGrantBytes = runtimeQueue.EqualFlowSuppressedGrantBytes
 			qv.equalFlowFailOpenReason = runtimeQueue.EqualFlowFailOpenReason
+			if runtimeQueue.EqualFlowTargetPolicy != "" {
+				qv.equalFlowTargetPolicy = runtimeQueue.EqualFlowTargetPolicy
+			}
 			// #1628 copy-through; rendered only when non-zero.
 			// #1829 copy-through; rendered only when peak > 0.
 			qv.sojournEwmaNS = runtimeQueue.SojournEwmaNS

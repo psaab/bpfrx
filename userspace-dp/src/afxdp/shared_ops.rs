@@ -1,4 +1,121 @@
 use super::*;
+use std::sync::atomic::AtomicU64;
+
+/// #1760 W3': cumulative count of shared-map NAT reverse-key displacement
+/// events — a `publish_shared_session` insert into `shared_nat_sessions`
+/// (reverse-wire or reverse-canonical slot) displaced an entry whose
+/// FORWARD key differs from the one being published. Two distinct forward
+/// NAT sessions mapping onto one reply tuple K is the #1758/#1760 latent
+/// 1:N collision. This is the single choke point every transit forward
+/// NAT session passes through — normal installs, `MissingNeighborSeed`
+/// installs (which are NOT replicated to sibling workers and therefore
+/// invisible to the per-worker `nat_reverse_key_collisions` counter),
+/// promotes, HA sync imports, and tunnel-local installs — so zero here is
+/// a much stronger "no collision while this process was up" signal than
+/// the per-worker counter alone. Same-session republish (promote, RG
+/// migration, HA re-sync) displaces an entry with the SAME forward key
+/// and is not counted; nor is the entry's own canonical/wire alias.
+/// Event count, not a pair census: a standing collision against a live
+/// session whose K was already removed (post-winner-expiry) is not
+/// observable at this choke point — see
+/// docs/research/1760-reverse-key-v2/plan.md §2.3. Surfaced as
+/// `xpf_userspace_session_nat_reverse_key_shared_displacements_total`.
+pub(crate) static NAT_REVERSE_KEY_SHARED_DISPLACEMENTS: AtomicU64 = AtomicU64::new(0);
+
+/// #1760 W3' detection helper: count a shared-map displacement when the
+/// displaced entry belongs to a DIFFERENT forward session. Shared by the
+/// reverse-wire and reverse-canonical insert sites in
+/// `publish_shared_session`.
+///
+/// Alias exclusion (Codex code-r1 F1): HA session sync deliberately
+/// publishes a fabric-redirect session TWICE — canonical forward key plus
+/// a NAT-translated forward-WIRE alias key carrying the same value
+/// (`pkg/daemon/daemon_ha_userspace.go` `userspaceForwardWireAliasFromDeltaV4`,
+/// queued under `delta.FabricRedirect && !delta.FabricIngress`). Both
+/// forms derive the same reverse key K, so on a standby the pair would
+/// displace each other at K every sync sweep — a same-logical-session
+/// republish, not a 1:N collision. `forward_wire_key` is idempotent
+/// (rewrites replace src/dst with the rewrite targets), so the alias
+/// relation is exactly "one key is the other's forward-wire form".
+/// Genuine colliding sessions keep counting: their CANONICAL keys are
+/// not each other's wire forms (each wire form is the shared external
+/// tuple, not the peer's internal tuple), and NAT-vs-different-NAT or
+/// NAT-vs-no-NAT pairs whose keys ARE wire-related still count because
+/// the alias test also requires an identical NatDecision (the HA alias
+/// carries the same session value as its canonical form).
+/// Known accepted under-count:
+/// on a standby, a genuine collision involving a wire-FORM synced entry
+/// is excluded by this test — the session's OWNER node still counts the
+/// canonical-vs-canonical displacement in its own shared map.
+#[inline]
+fn record_shared_nat_displacement(
+    displaced: Option<&SyncedSessionEntry>,
+    entry: &SyncedSessionEntry,
+) {
+    let Some(existing) = displaced else {
+        return;
+    };
+    if existing.key == entry.key {
+        return;
+    }
+    // Wire-alias relation: same logical session under its translated key.
+    // Three conditions, ALL required (each one alone is insufficient):
+    // - NAT equality: the HA alias is queued with the SAME session value
+    //   as its canonical form, so its NatDecision is identical. Keeps
+    //   genuine NAT-vs-different-NAT (and NAT-vs-no-NAT direct)
+    //   collisions counted even though their keys are wire-related
+    //   (Codex code-r2: DNAT client->VIP=>backend vs direct
+    //   client->backend is a REAL collision).
+    // - Wire-related keys (forward_wire_key is idempotent).
+    // - At least one side has a SYNC-DERIVED origin (peer-synced OR
+    //   `SharedPromote`): the wire-alias only ever enters via HA session
+    //   sync (`userspaceForwardWireAliasFromDeltaV4`) and, at failover,
+    //   may be locally PROMOTED to `SharedPromote`
+    //   (`maybe_promote_synced_session` republishes promoted hits —
+    //   Codex code-r4). Neither origin is ever assigned to a session
+    //   created by local packets, so the owner-side genuine corner stays
+    //   counted where a LOCAL flow's source already equals the SNAT
+    //   external address (identical NAT, wire-related keys, two real
+    //   sessions — Codex code-r3). Accepted residual (documented above):
+    //   such a pathological ext-IP-sourced local flow colliding with a
+    //   sync-derived wire-form entry is excluded.
+    let sync_derived = |origin: SessionOrigin| {
+        origin.is_peer_synced() || matches!(origin, SessionOrigin::SharedPromote)
+    };
+    if existing.decision.nat == entry.decision.nat
+        && (sync_derived(existing.origin) || sync_derived(entry.origin))
+        && (existing.key == forward_wire_key(&entry.key, entry.decision.nat)
+            || entry.key == forward_wire_key(&existing.key, existing.decision.nat))
+    {
+        return;
+    }
+    NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// #1760 W1: last-warn timestamp for the journald reverse-key-collision
+/// warn. Process-global so the ≤1 line/min bound holds regardless of
+/// worker count (AGY r1 F4).
+static NAT_REVERSE_KEY_WARN_LAST_NS: AtomicU64 = AtomicU64::new(0);
+
+/// #1760 W1: minimum interval between journald collision warns.
+const NAT_REVERSE_KEY_WARN_INTERVAL_NS: u64 = 60_000_000_000;
+
+/// #1760 W1: claim the process-global collision-warn slot. Returns true
+/// when the caller won and may emit the warn; false when inside the 60s
+/// window or another worker won the race. Same load → window-check → CAS
+/// shape as the coordinator warm-sweep throttle
+/// (`coordinator/mod.rs` `last_warm_sweep_ns`): a lost CAS means another
+/// thread claimed this slot concurrently, which is exactly the
+/// "already warned" outcome we want.
+pub(crate) fn try_claim_nat_reverse_key_warn(now_ns: u64) -> bool {
+    let last = NAT_REVERSE_KEY_WARN_LAST_NS.load(Ordering::Acquire);
+    if now_ns.saturating_sub(last) < NAT_REVERSE_KEY_WARN_INTERVAL_NS {
+        return false;
+    }
+    NAT_REVERSE_KEY_WARN_LAST_NS
+        .compare_exchange(last, now_ns, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
 
 pub(super) fn demote_shared_owner_rgs(
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
@@ -667,9 +784,9 @@ pub(super) fn publish_shared_session(
         && let Ok(mut sessions) = shared_nat_sessions.lock()
     {
         let reverse_wire = reverse_session_key(&entry.key, entry.decision.nat);
-        let previous_owner_rg = sessions
-            .insert(reverse_wire.clone(), entry.clone())
-            .map(|existing| existing.metadata.owner_rg_id);
+        let displaced = sessions.insert(reverse_wire.clone(), entry.clone());
+        record_shared_nat_displacement(displaced.as_ref(), entry);
+        let previous_owner_rg = displaced.map(|existing| existing.metadata.owner_rg_id);
         update_owner_rg_index(
             &shared_owner_rg_indexes.nat_sessions,
             &reverse_wire,
@@ -678,9 +795,9 @@ pub(super) fn publish_shared_session(
         );
         let reverse_canonical = reverse_canonical_key(&entry.key, entry.decision.nat);
         if reverse_canonical != reverse_wire {
-            let previous_owner_rg = sessions
-                .insert(reverse_canonical.clone(), entry.clone())
-                .map(|existing| existing.metadata.owner_rg_id);
+            let displaced = sessions.insert(reverse_canonical.clone(), entry.clone());
+            record_shared_nat_displacement(displaced.as_ref(), entry);
+            let previous_owner_rg = displaced.map(|existing| existing.metadata.owner_rg_id);
             update_owner_rg_index(
                 &shared_owner_rg_indexes.nat_sessions,
                 &reverse_canonical,

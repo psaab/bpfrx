@@ -568,6 +568,17 @@ func validateClassOfServiceStrict(cos *ClassOfServiceConfig) error {
 				"class-of-service scheduler %q equal-flow-enforcement cannot be combined with surplus-sharing",
 				sched.Name)
 		}
+		// #1746: the schema enum validator catches bad values on the
+		// set path; re-check here so externally-assembled configs
+		// cannot smuggle an unknown policy to the dataplane (which
+		// would silently parse it as "slowest").
+		switch sched.EqualFlowTargetPolicy {
+		case "", "slowest", "mean", "ideal-share":
+		default:
+			return fmt.Errorf(
+				"class-of-service scheduler %q equal-flow-target-policy %q is not one of slowest | mean | ideal-share",
+				sched.Name, sched.EqualFlowTargetPolicy)
+		}
 		// Both buffer-size forms set simultaneously is ambiguous. The compiler
 		// always clears the unused field (see compiler_class_of_service.go
 		// buffer-size case), so this can only arise in constructed or
@@ -1071,6 +1082,28 @@ func ValidateConfig(cfg *Config) []string {
 					"class-of-service scheduler %q surplus-sharing is meaningful only with transmit-rate exact; ignored",
 					sched.Name))
 				sched.SurplusSharing = false
+			}
+			// #1746: warn-not-strip. A policy without enforcement is a
+			// harmless no-op (the dataplane gates it on
+			// equal-flow-enforcement), but the operator should know it
+			// is inert.
+			if sched.EqualFlowTargetPolicy != "" && !sched.EqualFlowEnforcement {
+				warnings = append(warnings, fmt.Sprintf(
+					"class-of-service scheduler %q equal-flow-target-policy %q has no effect without equal-flow-enforcement",
+					sched.Name, sched.EqualFlowTargetPolicy))
+			}
+			// #1746: non-work-conserving cost warning. Clipping fast
+			// flows frees capacity that CANNOT reach slow flows on
+			// other workers, so these policies trade aggregate
+			// throughput for per-flow evenness (see
+			// docs/cos-traffic-shaping.md).
+			if sched.EqualFlowEnforcement {
+				switch sched.EqualFlowTargetPolicy {
+				case "slowest", "mean":
+					warnings = append(warnings, fmt.Sprintf(
+						"class-of-service scheduler %q equal-flow-target-policy %s is non-work-conserving: it clips fast flows and reduces aggregate class throughput; it cannot lift slow flows",
+						sched.Name, sched.EqualFlowTargetPolicy))
+				}
 			}
 		}
 		for _, schedMap := range cos.SchedulerMaps {

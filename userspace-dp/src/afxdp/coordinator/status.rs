@@ -106,6 +106,21 @@ impl super::Coordinator {
         per_binding.saturating_add(SESSION_PUBLISH_ERRORS_SHARED.load(Ordering::Relaxed))
     }
 
+    /// #1760 W3': shared-map NAT reverse-key displacement events — a
+    /// `publish_shared_session` insert into `shared_nat_sessions`
+    /// displaced a DIFFERENT forward session's entry at the same reverse
+    /// key. The shared map is the single choke point every transit
+    /// forward NAT session passes through (including
+    /// `MissingNeighborSeed` installs, which never replicate to sibling
+    /// workers and are invisible to the per-worker
+    /// `nat_reverse_key_collisions` counter), so this is the
+    /// authoritative collision watch. Event count, not a pair census
+    /// (docs/research/1760-reverse-key-v2/plan.md §2.3). Surfaced as
+    /// `xpf_userspace_session_nat_reverse_key_shared_displacements_total`.
+    pub fn nat_reverse_key_shared_displacements_total(&self) -> u64 {
+        crate::afxdp::shared_ops::NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed)
+    }
+
     /// #1807: total worker-command-queue poison recoveries across every
     /// producer/consumer site (worker poll peek + apply, HA enqueues,
     /// session replication, activation prewarm, tunnel install/drain-wait,
@@ -671,6 +686,9 @@ fn overlay_shared_cos_queue_lease_statuses(
                 lease.v8_equal_flow_stale_or_tag_mismatch_events();
             queue.equal_flow_fail_open_reason =
                 lease.v8_equal_flow_fail_open_reason_label().to_string();
+            // #1746: surface which target policy the lease enforces.
+            queue.equal_flow_target_policy =
+                lease.v8_equal_flow_target_policy_label().to_string();
         }
     }
 }
@@ -728,6 +746,38 @@ mod tests {
         assert!(queue.equal_flow_enforcement);
         assert_eq!(queue.equal_flow_fail_open_reason, "disabled");
         assert_eq!(queue.equal_flow_stale_or_tag_mismatch_events, 0);
+        // #1746: default-policy lease surfaces the "slowest" label.
+        assert_eq!(queue.equal_flow_target_policy, "slowest");
+    }
+
+    /// #1746: a Mean-policy lease surfaces "mean" on the status row,
+    /// and non-equal-flow leases leave the field empty (wire
+    /// byte-identical for non-equal-flow queues).
+    #[test]
+    fn equal_flow_overlay_populates_target_policy_label() {
+        let mut statuses = vec![CoSInterfaceStatus {
+            ifindex: 80,
+            queues: vec![CoSQueueStatus {
+                queue_id: 4,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        let lease = Arc::new(SharedCoSQueueLease::new_v8_with_rate_mode_and_policy(
+            50_000_000,
+            256 * 1024,
+            8,
+            1,
+            V8RateMode::EqualFlowSuppress,
+            crate::afxdp::types::EqualFlowTargetPolicy::Mean,
+        ));
+        let leases = BTreeMap::from([((80, 4), lease)]);
+
+        overlay_shared_cos_queue_lease_statuses(&mut statuses, &leases);
+
+        let queue = &statuses[0].queues[0];
+        assert!(queue.equal_flow_enforcement);
+        assert_eq!(queue.equal_flow_target_policy, "mean");
     }
 
     /// #1830 (g): the flow-count overlay writes only matching

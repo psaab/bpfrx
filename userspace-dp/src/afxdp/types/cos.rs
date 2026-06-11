@@ -73,6 +73,59 @@ pub(in crate::afxdp) struct CoSDSCPRewriteRuleConfig {
     pub(in crate::afxdp) dscp_by_forwarding_class: FastMap<String, u8>,
 }
 
+/// #1746: operator-selectable equal-flow target policy. Decides the
+/// reduction applied over the sampled per-worker
+/// `(prev_grant, active_flows)` pairs when
+/// `publish_equal_flow_epoch_v8` computes the per-flow target. Only
+/// meaningful when `equal_flow_enforcement` is on (the lease is in
+/// `V8RateMode::EqualFlowSuppress`); the default `Slowest` preserves
+/// the pre-#1746 `candidate_target.min(per_flow)` math byte-for-byte,
+/// so unset configs and the named `slowest` value never diverge.
+///
+/// NONE of these policies can lift slow flows: the published cap is
+/// one-directional (`my_share.min(cap)` in `acquire_v8`), and the
+/// capacity freed by clipping a fast worker cannot reach a starved
+/// worker on a different queue/CPU. Work-conserving cross-worker
+/// rebalance is #1748, not this knob.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::afxdp) enum EqualFlowTargetPolicy {
+    /// Clip every flow to the SLOWEST sampled achieved per-flow rate
+    /// (`min` over the sampled set). Pre-#1746 behavior and the
+    /// byte-unchanged default; the empty wire string decodes here.
+    /// Maximum evenness, maximum aggregate cost (non-work-conserving).
+    #[default]
+    Slowest,
+    /// Clip toward the aggregate-weighted mean achieved per-flow rate
+    /// (`Σ prev_grants / Σ active_flows` over the sampled set). Clips
+    /// only the lucky outliers; keeps more aggregate than `Slowest`.
+    Mean,
+    /// Literal nominal equal share (`scheduler_rate /
+    /// total_active_flows`). Documented no-op in capacity-limited
+    /// regimes — every flow already runs below the nominal share, so
+    /// the cap never binds (#1745 live A/B).
+    IdealShare,
+}
+
+impl EqualFlowTargetPolicy {
+    /// Parse the wire string from `CoSSchedulerSnapshot`. Unknown or
+    /// empty values map to the byte-unchanged default `Slowest`.
+    pub(in crate::afxdp) fn parse(value: &str) -> Self {
+        match value {
+            "mean" => Self::Mean,
+            "ideal-share" => Self::IdealShare,
+            _ => Self::Slowest,
+        }
+    }
+
+    pub(in crate::afxdp) fn as_str(self) -> &'static str {
+        match self {
+            Self::Slowest => "slowest",
+            Self::Mean => "mean",
+            Self::IdealShare => "ideal-share",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::afxdp) struct CoSQueueConfig {
     pub(in crate::afxdp) queue_id: u8,
@@ -97,6 +150,11 @@ pub(in crate::afxdp) struct CoSQueueConfig {
     /// exact queues. The coordinator turns this into
     /// `V8RateMode::EqualFlowSuppress` for shared v8 leases.
     pub(in crate::afxdp) equal_flow_enforcement: bool,
+    /// #1746: target policy applied by the equal-flow publisher. Only
+    /// meaningful when `equal_flow_enforcement == true`;
+    /// forwarding_build gates it identically, so non-equal-flow
+    /// queues always carry the default `Slowest`.
+    pub(in crate::afxdp) equal_flow_target_policy: EqualFlowTargetPolicy,
     pub(in crate::afxdp) surplus_weight: u32,
     pub(in crate::afxdp) buffer_bytes: u64,
     pub(in crate::afxdp) dscp_rewrite: Option<u8>,

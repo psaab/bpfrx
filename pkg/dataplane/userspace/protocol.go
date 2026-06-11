@@ -233,6 +233,11 @@ type CoSSchedulerSnapshot struct {
 	// queue-lease equal-flow suppression on positive transmit-rate
 	// exact queues.
 	EqualFlowEnforcement bool `json:"equal_flow_enforcement,omitempty"`
+	// EqualFlowTargetPolicy (#1746) selects the equal-flow per-flow
+	// target reduction: "slowest" | "mean" | "ideal-share". omitempty
+	// keeps the wire byte-identical for unset configs ("" == the
+	// byte-unchanged "slowest" default on the Rust side).
+	EqualFlowTargetPolicy string `json:"equal_flow_target_policy,omitempty"`
 	// #1614 A3: per-queue CoDel target in nanoseconds. WIRE
 	// SURFACE ONLY in PR #1618 — the dequeue-time sojourn check
 	// is deferred to a focused follow-up. 0 disables CoDel for
@@ -650,6 +655,18 @@ type ProcessStatus struct {
 	// as xpf_userspace_session_publish_errors_total. Omitempty for wire
 	// compat with older helpers.
 	SessionPublishErrorsTotal uint64 `json:"session_publish_errors_total,omitempty"`
+	// #1760 W3': shared-map NAT reverse-key displacement events — a
+	// publish_shared_session insert into shared_nat_sessions displaced a
+	// DIFFERENT forward session's entry at the same reverse key (two live
+	// forward NAT sessions mapping onto one reply tuple — the #1758/#1760
+	// latent 1:N collision). The shared map is the single choke point all
+	// transit forward NAT sessions pass through, including
+	// MissingNeighborSeed installs the per-worker
+	// nat_reverse_key_collisions counter cannot see. Event count, not a
+	// pair census. Surfaced as
+	// xpf_userspace_session_nat_reverse_key_shared_displacements_total.
+	// Omitempty for wire compat with older helpers.
+	NatReverseKeySharedDisplacementsTotal uint64 `json:"nat_reverse_key_shared_displacements_total,omitempty"`
 	// #1807: total worker-command-queue poison recoveries (a helper
 	// thread panicked while holding a worker command mutex; the
 	// committed queue was recovered and the poison cleared — uniform
@@ -866,6 +883,10 @@ type CoSQueueStatus struct {
 	EqualFlowSuppressedGrantBytes     uint64 `json:"equal_flow_suppressed_grant_bytes,omitempty"`
 	EqualFlowStaleOrTagMismatchEvents uint64 `json:"equal_flow_stale_or_tag_mismatch_events,omitempty"`
 	EqualFlowFailOpenReason           string `json:"equal_flow_fail_open_reason,omitempty"`
+	// EqualFlowTargetPolicy (#1746): active target-policy label
+	// ("slowest" | "mean" | "ideal-share"); populated only for
+	// equal-flow leases, empty otherwise.
+	EqualFlowTargetPolicy string `json:"equal_flow_target_policy,omitempty"`
 	// #709 / #751: owner-profile telemetry. Populated only when an
 	// exact queue can inherit a binding-scoped owner profile
 	// unambiguously; zero for shared_exact, non-exact, and ambiguous

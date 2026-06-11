@@ -354,6 +354,15 @@ func (c *xpfCollector) emitUserspaceDynamicBufferMetrics(ch chan<- prometheus.Me
 		float64(status.SessionPublishErrorsTotal),
 	)
 
+	// #1760 W3': shared-map NAT reverse-key displacement events. Emitted
+	// unconditionally so a 0 is a real "no collisions" signal rather
+	// than an absent series.
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceNatReverseKeySharedDisplacements,
+		prometheus.CounterValue,
+		float64(status.NatReverseKeySharedDisplacementsTotal),
+	)
+
 	// #1807: worker-command-queue poison recoveries. Also emitted
 	// unconditionally so a 0 is a real "no worker panics" signal rather
 	// than an absent series.
@@ -1264,6 +1273,19 @@ func (c *xpfCollector) emitCoSEqualFlowEnforcement(ch chan<- prometheus.Metric, 
 				1,
 				ifindexLabel, queueLabel,
 			)
+			// #1746: sibling info metric naming the active target
+			// policy. The Rust status overlay always populates the
+			// label for equal-flow leases; guard anyway so a
+			// mixed-version helper (older Rust, empty label) emits no
+			// empty-label series.
+			if queue.EqualFlowTargetPolicy != "" {
+				ch <- prometheus.MustNewConstMetric(
+					c.cosEqualFlowTargetPolicy,
+					prometheus.GaugeValue,
+					1,
+					ifindexLabel, queueLabel, queue.EqualFlowTargetPolicy,
+				)
+			}
 			ch <- prometheus.MustNewConstMetric(
 				c.cosEqualFlowEnforced,
 				prometheus.GaugeValue,

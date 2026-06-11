@@ -152,6 +152,7 @@ fn build_cos_state_translates_scheduler_map_entries() {
                     buffer_size_percent: 0.0,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                    equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
                 },
                 CoSSchedulerSnapshot {
@@ -163,6 +164,7 @@ fn build_cos_state_translates_scheduler_map_entries() {
                     buffer_size_percent: 0.0,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                    equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
                 },
             ],
@@ -234,6 +236,7 @@ fn build_cos_state_resolves_percent_buffer_size_from_interface_burst_pool() {
                 buffer_size_percent: 10.0,
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
+                equal_flow_target_policy: String::new(),
             codel_target_ns: 0,
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -289,6 +292,7 @@ fn build_cos_state_prefers_legacy_byte_buffer_when_both_fields_present() {
                 buffer_size_percent: 10.0,
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
+                equal_flow_target_policy: String::new(),
             codel_target_ns: 0,
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -353,6 +357,7 @@ fn build_cos_state_propagates_surplus_sharing_from_snapshot() {
                     buffer_size_percent: 0.0,
                     surplus_sharing: true, // opt-in
                     equal_flow_enforcement: false,
+                    equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
                 },
                 CoSSchedulerSnapshot {
@@ -364,6 +369,7 @@ fn build_cos_state_propagates_surplus_sharing_from_snapshot() {
                     buffer_size_percent: 0.0,
                     surplus_sharing: false, // explicit hard-cap
                     equal_flow_enforcement: false,
+                    equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
                 },
             ],
@@ -404,6 +410,111 @@ fn build_cos_state_propagates_surplus_sharing_from_snapshot() {
     // Sanity: both still exact (so the strip-on-non-exact rule wouldn't have
     // fired even if it had been at this layer).
     assert!(q4.exact && q5.exact);
+}
+
+#[test]
+fn build_cos_state_propagates_equal_flow_target_policy_gated_on_enforcement() {
+    // #1746: the policy string reaches CoSQueueConfig only when the
+    // scheduler is actually equal-flow-enforcing; otherwise the queue
+    // carries the byte-unchanged default `Slowest`. Unknown strings
+    // also parse to `Slowest`.
+    let make_sched = |name: &str, enforcement: bool, policy: &str| CoSSchedulerSnapshot {
+        name: name.into(),
+        transmit_rate_bytes: 1_000_000_000 / 8,
+        transmit_rate_exact: true,
+        priority: "low".into(),
+        buffer_size_bytes: 128 * 1024,
+        buffer_size_percent: 0.0,
+        surplus_sharing: false,
+        equal_flow_enforcement: enforcement,
+        equal_flow_target_policy: policy.into(),
+        codel_target_ns: 0,
+    };
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            ifindex: 42,
+            cos_shaping_rate_bytes_per_sec: 10_000_000,
+            cos_shaping_burst_bytes: 256_000,
+            cos_scheduler_map: "wan-map".into(),
+            ..Default::default()
+        }],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![
+                CoSForwardingClassSnapshot {
+                    name: "fc-mean".into(),
+                    queue: 4,
+                },
+                CoSForwardingClassSnapshot {
+                    name: "fc-ungated".into(),
+                    queue: 5,
+                },
+                CoSForwardingClassSnapshot {
+                    name: "fc-ideal".into(),
+                    queue: 6,
+                },
+                CoSForwardingClassSnapshot {
+                    name: "fc-unknown".into(),
+                    queue: 7,
+                },
+            ],
+            schedulers: vec![
+                make_sched("s-mean", true, "mean"),
+                // Policy set but enforcement absent: must stay Slowest.
+                make_sched("s-ungated", false, "mean"),
+                make_sched("s-ideal", true, "ideal-share"),
+                // Unknown value: parse falls back to Slowest.
+                make_sched("s-unknown", true, "bogus-policy"),
+            ],
+            scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                name: "wan-map".into(),
+                entries: vec![
+                    CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: "fc-mean".into(),
+                        scheduler: "s-mean".into(),
+                    },
+                    CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: "fc-ungated".into(),
+                        scheduler: "s-ungated".into(),
+                    },
+                    CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: "fc-ideal".into(),
+                        scheduler: "s-ideal".into(),
+                    },
+                    CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: "fc-unknown".into(),
+                        scheduler: "s-unknown".into(),
+                    },
+                ],
+            }],
+            dscp_classifiers: vec![],
+            ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![],
+        }),
+        ..Default::default()
+    };
+
+    let state = build_cos_state(&snapshot);
+    let iface = state.interfaces.get(&42).expect("missing CoS interface");
+    let policy_of = |queue_id: u8| {
+        iface
+            .queues
+            .iter()
+            .find(|q| q.queue_id == queue_id)
+            .unwrap_or_else(|| panic!("queue {queue_id} present"))
+            .equal_flow_target_policy
+    };
+    assert_eq!(policy_of(4), EqualFlowTargetPolicy::Mean);
+    assert_eq!(
+        policy_of(5),
+        EqualFlowTargetPolicy::Slowest,
+        "policy without equal-flow-enforcement must stay at the default"
+    );
+    assert_eq!(policy_of(6), EqualFlowTargetPolicy::IdealShare);
+    assert_eq!(
+        policy_of(7),
+        EqualFlowTargetPolicy::Slowest,
+        "unknown policy strings must parse to the byte-unchanged default"
+    );
 }
 
 #[test]
@@ -464,6 +575,7 @@ fn build_cos_state_derives_exact_queue_default_burst_from_queue_rate() {
                 buffer_size_percent: 0.0,
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
+                equal_flow_target_policy: String::new(),
             codel_target_ns: 0,
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -525,6 +637,7 @@ fn build_cos_state_uses_effective_transmit_rate_for_surplus_weight() {
                 buffer_size_percent: 0.0,
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
+                equal_flow_target_policy: String::new(),
             codel_target_ns: 0,
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -575,6 +688,7 @@ fn build_cos_state_marks_no_rate_scheduler_map_queue_residual_only() {
                 buffer_size_percent: 0.0,
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
+                equal_flow_target_policy: String::new(),
             codel_target_ns: 0,
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -663,6 +777,7 @@ fn build_cos_state_binds_dscp_classifier_to_usable_interface_queue_ids() {
                     buffer_size_percent: 0.0,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                    equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
                 },
                 CoSSchedulerSnapshot {
@@ -674,6 +789,7 @@ fn build_cos_state_binds_dscp_classifier_to_usable_interface_queue_ids() {
                     buffer_size_percent: 0.0,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                    equal_flow_target_policy: String::new(),
                 codel_target_ns: 0,
                 },
             ],
@@ -1067,6 +1183,7 @@ fn build_cos_state_zero_shaping_rate_queue_inherits_transparent() {
                 buffer_size_percent: 0.0,
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
+                equal_flow_target_policy: String::new(),
             codel_target_ns: 0,
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -1125,6 +1242,7 @@ fn build_cos_state_no_rate_exact_surplus_equal_flow_is_residual_only() {
                 buffer_size_percent: 0.0,
                 surplus_sharing: true,
                 equal_flow_enforcement: true,
+                equal_flow_target_policy: String::new(),
             codel_target_ns: 0,
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {

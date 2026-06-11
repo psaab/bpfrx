@@ -367,7 +367,16 @@ Any fairness measurement run MUST report:
    "active" as a flow-cache entry touched within the active-flow
    recency window, currently 10 debug epochs (about 650 ms), so `{a_i}`
    is an operational proxy for worker/RSS placement rather than a
-   throughput-derived ≥1% cutoff.
+   throughput-derived ≥1% cutoff. Since #1741 this definition holds
+   with no wrap exception: the per-scan clamp sentinel-clears stamps
+   that leave the window, so dead flows can no longer "ghost" back
+   into the count when the u16 epoch counter wraps (~65535 ticks).
+   The remaining caveats are (a) the window is elastic — the hot-path
+   epoch tick is call-count-based, so its wall-clock length shrinks
+   under load — and (b) flows whose packets arrive slower than the
+   window (e.g. heavily shaped streams) legitimately drop out of
+   `{a_i}` between packets. Consumers (#1746) get a trustworthy
+   "recently-seen flows" gauge, not a session count.
 5. **Computed `Cstruct`**: the structural CoV ceiling for the
    observed `{aᵢ}`.
 6. **Saturation determination**: which regime the run is in (per
@@ -822,6 +831,19 @@ failed open with a bounded reason. Acquire-side stale/tag mismatches
 are exported as a separate monotonic counter, not by rewriting the
 current epoch reason, so a stale worker cannot clobber the
 rotation-published payload.
+
+The per-flow target the publisher enforces is policy-selectable
+(#1746): `equal-flow-target-policy (slowest | mean | ideal-share)` on
+the scheduler, defaulting to the byte-unchanged clip-to-slowest `min`
+reduction. `mean` clips toward the aggregate-weighted mean achieved
+per-flow rate; `ideal-share` is the literal nominal share (a documented
+no-op in capacity-limited regimes). The active policy is exported as
+the sibling info metric
+`xpf_userspace_cos_equal_flow_target_policy{ifindex,queue_id,policy}`
+(a new series — the existing `xpf_userspace_cos_equal_flow_*` gauges
+keep their series identity). No policy can lift slow-worker flows; see
+`docs/cos-traffic-shaping.md` for the modeled aggregate-vs-CoV
+tradeoff table and #1748 for the work-conserving rebalance track.
 
 The all-class CoS sweep harness captures this estimator as first-class
 run evidence. For each class, `fairness-cos-class-sweep.sh` starts a

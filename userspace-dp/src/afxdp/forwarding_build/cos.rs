@@ -297,6 +297,21 @@ pub(super) fn build_cos_iface_config(
                             && sched.equal_flow_enforcement
                     })
                     .unwrap_or(false),
+                // #1746: policy is gated identically to
+                // equal_flow_enforcement — a policy on a scheduler that
+                // is not (or cannot be) equal-flow-enforcing stays at
+                // the byte-unchanged default `Slowest`. Unknown / empty
+                // wire strings also parse to `Slowest`.
+                equal_flow_target_policy: scheduler
+                    .filter(|sched| {
+                        guarantee_enabled
+                            && sched.transmit_rate_exact
+                            && sched.equal_flow_enforcement
+                    })
+                    .map(|sched| {
+                        EqualFlowTargetPolicy::parse(&sched.equal_flow_target_policy)
+                    })
+                    .unwrap_or_default(),
                 surplus_weight: cos_surplus_weight(
                     transmit_rate_bytes.max(1),
                     iface.cos_shaping_rate_bytes_per_sec,
@@ -396,6 +411,7 @@ pub(super) fn build_cos_iface_config(
             exact: false,
             surplus_sharing: false,
             equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::default(),
             surplus_weight: 1,
             buffer_bytes: burst_bytes,
             dscp_rewrite: dscp_rewrite_rule

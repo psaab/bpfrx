@@ -125,6 +125,7 @@ type xpfCollector struct {
 	// shared v8 CoS queue leases. Kept separate from the
 	// measurement-only xpf_fairness_equal_flow_* estimator gauges.
 	cosEqualFlowEnforcementEnabled       *prometheus.Desc
+	cosEqualFlowTargetPolicy             *prometheus.Desc
 	cosEqualFlowEnforced                 *prometheus.Desc
 	cosEqualFlowTargetPerFlowBPS         *prometheus.Desc
 	cosEqualFlowMaxWorkerCapBytes        *prometheus.Desc
@@ -168,6 +169,11 @@ type xpfCollector struct {
 	// #1789: total failed USERSPACE_SESSIONS BPF-map publishes — the
 	// cause-side signal for rising XDP-shim NO_SESSION fallbacks.
 	userspaceSessionPublishErrors *prometheus.Desc
+
+	// #1760 W3': shared-map NAT reverse-key displacement events (the
+	// authoritative collision watch; covers seed installs the per-worker
+	// counter cannot see).
+	userspaceNatReverseKeySharedDisplacements *prometheus.Desc
 	// #1807: worker-command-queue poison recoveries — nonzero means a
 	// helper worker panic poisoned a command queue and it was recovered
 	// (committed-prefix + clear_poison policy) instead of going deaf.
@@ -364,6 +370,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.cosWaterfillPhase1BudgetBreaks
 	ch <- c.cosWaterfillMinEpochsPerWorker
 	ch <- c.cosEqualFlowEnforcementEnabled
+	ch <- c.cosEqualFlowTargetPolicy
 	ch <- c.cosEqualFlowEnforced
 	ch <- c.cosEqualFlowTargetPerFlowBPS
 	ch <- c.cosEqualFlowMaxWorkerCapBytes
@@ -397,6 +404,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.userspaceSessionTableCapacity
 	ch <- c.userspaceNatReverseKeyCollisions
 	ch <- c.userspaceSessionPublishErrors
+	ch <- c.userspaceNatReverseKeySharedDisplacements
 	ch <- c.userspaceWorkerCommandQueuePoisonRecoveries
 	ch <- c.userspaceFlowCacheActiveFlows
 	ch <- c.userspaceFlowCacheCapacity

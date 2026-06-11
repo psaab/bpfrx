@@ -162,6 +162,35 @@ fn process_status_worker_command_queue_poison_recoveries_roundtrip() {
     assert_eq!(legacy.worker_command_queue_poison_recoveries, 0);
 }
 
+// #1760 W3': round-trip + backward-compat pin for the shared-map NAT
+// reverse-key displacement counter. The wire key feeds
+// pkg/dataplane/userspace/protocol.go and the Prometheus counter
+// `xpf_userspace_session_nat_reverse_key_shared_displacements_total`.
+#[test]
+fn process_status_nat_reverse_key_shared_displacements_roundtrip() {
+    let status = ProcessStatus {
+        nat_reverse_key_shared_displacements_total: 7,
+        ..Default::default()
+    };
+    let value: serde_json::Value =
+        serde_json::to_value(&status).expect("serialize ProcessStatus to Value");
+    assert_eq!(value["nat_reverse_key_shared_displacements_total"], 7);
+    let back: ProcessStatus = serde_json::from_value(value).expect("deserialize ProcessStatus");
+    assert_eq!(back.nat_reverse_key_shared_displacements_total, 7);
+
+    // Pre-#1760-W3' payload (key absent) must decode with a zero default.
+    let mut legacy_value =
+        serde_json::to_value(ProcessStatus::default()).expect("serialize default ProcessStatus");
+    legacy_value
+        .as_object_mut()
+        .expect("ProcessStatus serializes to an object")
+        .remove("nat_reverse_key_shared_displacements_total")
+        .expect("new key present before strip");
+    let legacy: ProcessStatus =
+        serde_json::from_value(legacy_value).expect("pre-#1760-W3' payload decodes");
+    assert_eq!(legacy.nat_reverse_key_shared_displacements_total, 0);
+}
+
 // #1621 plan v2 + Copilot code-r1 C4: round-trip the new cold-path
 // histogram fields through serde to confirm:
 //   1. Default (zero / empty) WorkerRuntimeStatus omits every
@@ -850,6 +879,7 @@ fn cos_scheduler_snapshot_surplus_sharing_round_trip_true() {
         buffer_size_percent: 0.0,
         surplus_sharing: true,
         equal_flow_enforcement: false,
+        equal_flow_target_policy: String::new(),
     codel_target_ns: 0,
     };
     let json = serde_json::to_string(&snap).expect("serialize");
@@ -868,11 +898,40 @@ fn cos_scheduler_snapshot_equal_flow_enforcement_round_trip_true() {
         buffer_size_percent: 0.0,
         surplus_sharing: false,
         equal_flow_enforcement: true,
+        equal_flow_target_policy: String::new(),
     codel_target_ns: 0,
     };
     let json = serde_json::to_string(&snap).expect("serialize");
     let back: CoSSchedulerSnapshot = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(back.equal_flow_enforcement, true);
+}
+
+#[test]
+fn cos_scheduler_snapshot_equal_flow_target_policy_round_trip() {
+    // #1746: policy string survives the wire; absent field (older
+    // snapshots / unset configs) decodes to the empty default, and an
+    // unset policy serializes WITHOUT the field on the Go side
+    // (omitempty) — the Rust serde default keeps decode compatible.
+    let snap = CoSSchedulerSnapshot {
+        name: "iperf-a".into(),
+        transmit_rate_bytes: 125_000_000,
+        transmit_rate_exact: true,
+        priority: "low".into(),
+        buffer_size_bytes: 65_536,
+        buffer_size_percent: 0.0,
+        surplus_sharing: false,
+        equal_flow_enforcement: true,
+        equal_flow_target_policy: "mean".into(),
+        codel_target_ns: 0,
+    };
+    let json = serde_json::to_string(&snap).expect("serialize");
+    let back: CoSSchedulerSnapshot = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back.equal_flow_target_policy, "mean");
+
+    // Older snapshot without the field decodes to the default "".
+    let legacy = r#"{"name":"iperf-a","transmit_rate_bytes":125000000,"transmit_rate_exact":true,"equal_flow_enforcement":true}"#;
+    let back: CoSSchedulerSnapshot = serde_json::from_str(legacy).expect("legacy deserialize");
+    assert_eq!(back.equal_flow_target_policy, "");
 }
 
 #[test]
@@ -886,6 +945,7 @@ fn cos_scheduler_snapshot_buffer_size_percent_round_trip() {
         buffer_size_percent: 10.0,
         surplus_sharing: false,
         equal_flow_enforcement: false,
+        equal_flow_target_policy: String::new(),
     codel_target_ns: 0,
     };
     let json = serde_json::to_string(&snap).expect("serialize");

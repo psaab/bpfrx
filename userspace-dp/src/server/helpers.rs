@@ -47,6 +47,11 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     // (per-binding worker-poll sites + shared no-binding sites). The
     // cause-side signal for rising XDP-shim NO_SESSION fallbacks.
     state.status.session_publish_errors_total = state.afxdp.session_publish_errors_total();
+    // #1760 W3': shared-map NAT reverse-key displacement events — the
+    // authoritative collision watch (covers MissingNeighborSeed installs
+    // the per-worker counter cannot see).
+    state.status.nat_reverse_key_shared_displacements_total =
+        state.afxdp.nat_reverse_key_shared_displacements_total();
     // #1807: worker-command-queue poison recoveries (committed-prefix +
     // clear_poison policy in afxdp/worker_queue.rs). Nonzero = a worker
     // panic poisoned a command queue and it was recovered.

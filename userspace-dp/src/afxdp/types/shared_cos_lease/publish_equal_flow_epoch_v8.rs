@@ -17,6 +17,18 @@
 use super::*;
 use std::sync::atomic::Ordering;
 
+// #1746: the `candidate_target` reduction is policy-driven
+// (`v8.equal_flow_target_policy`). `Slowest` (the default) keeps the
+// pre-#1746 `candidate_target.min(per_flow)` math byte-for-byte; `Mean`
+// and `IdealShare` choose a different statistic over the SAME sampled
+// `(prev_grants[id], active_flows[id])` pairs. The fail-open guards,
+// EWMA smoothing, valid-streak gate, and `max_worker_cap` telemetry are
+// identical for all three policies. `nominal_epoch_bytes` is the TRUE
+// byte budget the current rotation grants (`new_cap` = rate x elapsed
+// + carry draw — lag-recovered, Codex r1 F1), threaded from the
+// rotation because this helper only sees `V8State`, not the lease
+// config; it is read by the `IdealShare` policy only, so the nominal
+// share scales with the same budget the cap consumer is gated by.
 #[inline]
 pub(super) fn publish_equal_flow_epoch_v8(
     v8: &V8State,
@@ -26,6 +38,7 @@ pub(super) fn publish_equal_flow_epoch_v8(
     sampled_active_flows_by_worker: &[u32],
     demanded_by_worker: &[bool],
     prev_grants: &[u32],
+    nominal_epoch_bytes: u64,
 ) {
     // #1830 (e): the former `active_outside_scratch` parameter (and its
     // unconditional `UnsampledActiveWorker` fail-open) is gone — the
@@ -88,6 +101,11 @@ pub(super) fn publish_equal_flow_epoch_v8(
 
     let mut candidate_target = u64::MAX;
     let mut max_worker_cap = 0u64;
+    // #1746 `Mean` policy accumulators over the sampled set. Two
+    // saturating adds per sampled worker per rotation (≥200 µs cadence,
+    // EqualFlowSuppress mode only) — not a hot path.
+    let mut sum_sampled_grants = 0u64;
+    let mut sum_sampled_flows = 0u64;
 
     for id in 0..n_workers {
         if !active_by_worker[id] {
@@ -127,7 +145,44 @@ pub(super) fn publish_equal_flow_epoch_v8(
             return;
         }
         candidate_target = candidate_target.min(per_flow);
+        sum_sampled_grants = sum_sampled_grants.saturating_add(prev_grants[id] as u64);
+        sum_sampled_flows = sum_sampled_flows.saturating_add(active_flows);
     }
+
+    // #1746: policy-driven reduction. The loop above ran identically for
+    // all three policies (same fail-open guards, same `min` fold, same
+    // sums); only the candidate selected here differs.
+    //   - Slowest (default): the `min` fold — byte-identical to the
+    //     pre-#1746 behavior.
+    //   - Mean: aggregate-weighted mean achieved per-flow rate over the
+    //     sampled set. `sum_sampled_flows > 0` is guaranteed here: the
+    //     `sampled_workers >= 2` gate passed, and every sampled worker
+    //     contributed `active_flows > 0`.
+    //   - IdealShare: the literal nominal share. A zero quotient (e.g.
+    //     huge flow count) falls into the ZeroTarget fail-open below.
+    let candidate_target = match v8.equal_flow_target_policy {
+        EqualFlowTargetPolicy::Slowest => candidate_target,
+        EqualFlowTargetPolicy::Mean => {
+            if sum_sampled_flows == 0 {
+                0
+            } else {
+                sum_sampled_grants / sum_sampled_flows
+            }
+        }
+        EqualFlowTargetPolicy::IdealShare => {
+            // Total active flows across ALL workers (not just the
+            // sampled set): the nominal share divides the class rate
+            // among every active flow, mirroring the rotation's
+            // `total_flows` fair-share denominator.
+            let total_flows: u64 = v8
+                .worker_active_flow_buckets
+                .iter()
+                .map(|c| c.load(Ordering::Relaxed) as u64)
+                .sum::<u64>()
+                .max(1);
+            nominal_epoch_bytes / total_flows
+        }
+    };
 
     if candidate_target == u64::MAX || candidate_target == 0 {
         v8.equal_flow

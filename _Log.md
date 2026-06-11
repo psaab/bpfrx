@@ -5102,3 +5102,35 @@ top.
 - **Timestamp**: 2026-06-11 (cont.)
   - **Action**: #1736 live bring-up found + fixed two S2a datapath bugs (v4-mapped learned-endpoint MTU-guard inflation; EINVAL on v4 sendto over the dual-stack socket via wg_send_to), filed #1865 (WG telemetry) + #1866 (removal leaks control thread/port), hardened harness (node0-primary wait, fresh keys, leak restart fallback, 90s handshake budget), runbook updated with live shared-cluster hazards.
   - **File(s)**: userspace-dp/src/afxdp/coordinator/wg_control.rs, test/incus/wg-interop.{sh,env}, docs/wg-interop-runbook.md
+- **Timestamp**: 2026-06-10
+  **Action**: "#1760 W-lite watch repair (PR #1862): W3' shared-map reverse-key displacement counter (4-round Codex-hardened alias-exclusion predicate), W1 durable journald warn (process-global CAS throttle), W2 live-fire harness, W4 wart issue #1861; quad-review converged (Codex r5 + AGY final + SMR MERGE-READY; Copilot quota-blocked 4x -> 3-of-4)"
+  **File(s)**: userspace-dp/src/afxdp/{shared_ops.rs,worker/loop_body/mod.rs,coordinator/status.rs,session_glue/tests.rs}, userspace-dp/src/{protocol/control.rs,protocol/tests.rs,server/helpers.rs,server/lifecycle.rs}, userspace-dp/tests/fixtures/protocol_wire_v1.json, pkg/dataplane/userspace/{protocol.go,buffersfmt.go}, pkg/api/{metrics.go,metrics_descriptors.go,metrics_userspace.go,metrics_test.go,metrics_descriptor_coverage_test.go}, test/incus/reverse-key-collision-probe.sh, docs/pr/1760-reverse-key-watch/
+- **Timestamp**: 2026-06-10 ~23:10 PDT
+  **Action**: #1741 fix — sentinel-clear out-of-window flow-cache activity
+  stamps in the debug-cadence scan so u16 epoch-wrap can no longer
+  resurrect dead flows into the active-flow telemetry ("ghost
+  over-count"); 4 pinned regression tests; fairness-regimes gauge
+  contract note.
+  **File(s)**: userspace-dp/src/afxdp/flow_cache.rs,
+  userspace-dp/src/afxdp/flow_cache_tests.rs, docs/fairness-regimes.md
+
+- **Timestamp**: 2026-06-11
+  **Action**: /engineer #1746 — equal-flow target-policy knob (slowest | mean |
+    ideal-share) implemented per the converged research plan (Path A). PR #1867
+    head e94a89b1f. F1 ship-gate measured live (PASS in the high-CoV regime:
+    52% rel CoV reduction at ~0 aggregate cost; supplementary v6/reverse/node-0
+    matrix honest-mixed: near-floor baselines worsen — regime guidance added to
+    docs). Codex r1 NEEDS-CHANGES (ideal-share lag-budget unit bug -> fixed with
+    new_cap numerator + lagged test; matrix; docs contract) -> r2 MERGE-READY;
+    AGY r1+r2 MERGE-READY; Claude SMR r1+r2 MERGE-READY (worked mean-policy
+    join/leave limit-cycle trace, empirically confirmed by near-floor cells).
+    Copilot 3x quota-failed (documented) -> 3-of-4. Cluster restored to default
+    fixture (equal-flow off); PR binary deployed on both nodes.
+  **File(s)**: userspace-dp/src/{afxdp/types/cos.rs, afxdp/types/shared_cos_lease/*,
+    afxdp/forwarding_build/cos.rs, afxdp/coordinator/{mod,status}.rs,
+    protocol/cos.rs, protocol/tests.rs, + test literals}, pkg/config/{schema.go,
+    types_cos.go, compiler*.go, compiler_equal_flow_target_policy_test.go},
+    pkg/dataplane/userspace/{protocol.go, cos.go, cosfmt.go, manager_test.go,
+    cosfmt_test.go}, pkg/api/metrics*.go, test/incus/apply-cos-config.sh,
+    docs/{cos-traffic-shaping.md, fairness-regimes.md, config-schema.md,
+    pr/1746-equal-flow-target-policy/*, refactoring-audit-current.txt}
