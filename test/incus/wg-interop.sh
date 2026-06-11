@@ -712,9 +712,20 @@ test_p5() {
 # P6 — restart recovery + restart runbook.
 test_p6() {
     log "P6: restore initiator config, restart xpfd, runbook flush"
+    # ORDER MATTERS (root cause of the deterministic P6-pre dead-air,
+    # 2026-06-11): the identity-changed commit spawns a fresh engine
+    # that fires its initial handshake within ~1 s. Flushing the peer
+    # AFTER the commit raced that: the fresh engine completed msg1/msg2
+    # against the about-to-die wgref, marked the session CONFIRMED, the
+    # flush then wiped the peer's state — and xpf holds a
+    # confirmed-but-dead session it never re-initiates from (no
+    # REJECT/retry timers until S5), so the wait's pings encap into a
+    # black hole (the flushed peer's transfer stays 0/0: undecryptable
+    # records are dropped pre-accounting). Flush the peer FIRST — the
+    # same order every other phase already uses — so the fresh engine's
+    # first handshake lands on the live peer state.
+    peer_wg_setup ""  # fresh peer state BEFORE the commit (see above)
     xpf_wg_commit 1   # endpoint back (initiator role — the TAI64N-relevant case)
-    sleep 3
-    peer_wg_setup ""  # fresh peer state for a clean baseline handshake
     wait_handshake_data_driven "${WG_HANDSHAKE_TIMEOUT_S}" "P6-pre" || fail "P6: pre-restart handshake failed"
     # Negative control: restart WITHOUT flushing the peer. TAI64N is
     # wall-clock-derived, so acceptance is the EXPECTED outcome with a
