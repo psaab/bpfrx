@@ -4373,3 +4373,252 @@ fn nat_reverse_key_warn_throttle_claims_once_per_window() {
         "claim at the window boundary must win"
     );
 }
+
+// ── #1870: UpsertLocal joins the uncapped sync-family install ────────
+//
+// Deterministic at-cap pins for the local-tunnel prewarm pair. The
+// coordinator publishes the forward + synthesized-reverse pair to the
+// shared maps unconditionally and fans `WorkerCommand::UpsertLocal` ×2
+// out to every worker; routing the apply side through the CAPPED
+// install let max_sessions silently refuse the worker-table copy while
+// the shared maps kept both entries. These pins run in debug AND
+// release profiles (#1855 contract) and use `assert!` on outcomes —
+// the production arm's `debug_assert!`s compile out in release.
+
+/// Mirror the producer's pair shape (`build_local_origin_tunnel_tx_request`
+/// + `synthesized_synced_reverse_entry`): SyncImport origin, default NAT
+/// (no rewrites — so no forward-wire alias exists), forward + reverse.
+fn local_tunnel_pair() -> (SyncedSessionEntry, SyncedSessionEntry) {
+    let forwarding = test_forwarding_state();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+    let forward = SyncedSessionEntry {
+        key: test_key(),
+        decision: test_decision(),
+        metadata: test_metadata(),
+        origin: SessionOrigin::SyncImport,
+        protocol: PROTO_TCP,
+        tcp_flags: TCP_FLAG_ACK,
+    };
+    let reverse = synthesized_synced_reverse_entry(
+        &forwarding,
+        &BTreeMap::new(),
+        &dynamic_neighbors,
+        &forward,
+        1,
+    )
+    .expect("reverse companion");
+    (forward, reverse)
+}
+
+/// Shrink the cap and fill the table with `fill` distinct local entries
+/// whose keys cannot collide with the local-tunnel pair (filler src
+/// ports start at 40000; the pair uses 55068/5201).
+fn rig_capped_table(cap: usize, fill: usize) -> SessionTable {
+    let mut sessions = SessionTable::new();
+    sessions.set_max_sessions_for_test(cap);
+    for i in 0..fill {
+        let key = SessionKey {
+            src_port: 40_000 + i as u16,
+            ..test_key()
+        };
+        assert!(sessions.install_with_protocol(
+            key,
+            test_decision(),
+            test_metadata(),
+            1_000_000,
+            PROTO_TCP,
+            TCP_FLAG_ACK,
+        ));
+    }
+    assert_eq!(sessions.len(), fill);
+    // Discard the fillers' open deltas so later assertions on the delta
+    // ring observe only the behavior under test.
+    let _ = sessions.drain_deltas(usize::MAX);
+    sessions
+}
+
+fn apply_upsert_local_pair(
+    sessions: &mut SessionTable,
+    forward: &SyncedSessionEntry,
+    reverse: &SyncedSessionEntry,
+) -> WorkerCommandResults {
+    let commands = Arc::new(Mutex::new(VecDeque::new()));
+    {
+        let mut pending = commands.lock().expect("commands lock");
+        pending.push_back(WorkerCommand::UpsertLocal(forward.clone()));
+        pending.push_back(WorkerCommand::UpsertLocal(reverse.clone()));
+    }
+    let forwarding = test_forwarding_state();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+    apply_worker_commands(
+        &commands,
+        sessions,
+        -1,
+        -1,
+        -1,
+        &forwarding,
+        &BTreeMap::new(),
+        &dynamic_neighbors,
+    )
+}
+
+/// §2.2 interleaving through the fixed arm: a table AT max_sessions
+/// admits the full pair (uncapped sync-family semantics) and no
+/// refusal counter moves. Pre-#1870 both installs were silently
+/// refused (create_drops += 2) while the shared maps held the pair.
+#[test]
+fn upsert_local_pair_installs_at_cap() {
+    let cap = 4;
+    let mut sessions = rig_capped_table(cap, cap);
+    let (forward, reverse) = local_tunnel_pair();
+
+    apply_upsert_local_pair(&mut sessions, &forward, &reverse);
+
+    // Exact forward-key lookups — NOT find_forward_wire_match: with
+    // default NAT, wire_key == key and the forward-wire index never
+    // holds these entries (index_forward_nat_key only inserts when
+    // they differ).
+    let (_, _, fwd_origin) = sessions
+        .entry_with_origin(&forward.key)
+        .expect("forward entry installed at cap");
+    assert_eq!(fwd_origin, SessionOrigin::SyncImport);
+    let (_, rev_metadata, rev_origin) = sessions
+        .entry_with_origin(&reverse.key)
+        .expect("reverse entry installed at cap");
+    assert_eq!(rev_origin, SessionOrigin::SyncImport);
+    assert!(rev_metadata.is_reverse);
+    assert_eq!(sessions.len(), cap + 2, "pair admitted past the cap");
+    assert_eq!(sessions.create_drops(), 0, "no longer counted as drops");
+    assert_eq!(sessions.admission_refused(), 0);
+    assert_eq!(sessions.install_partial(), 0);
+    // SyncImport installs must not enqueue HA deltas.
+    assert!(sessions.drain_deltas(usize::MAX).is_empty());
+}
+
+/// Producer fan-out pin (Codex #1870 plan r2): worker tables are
+/// independent — one at cap, one below — and both must converge to
+/// holding the full pair after the same fan-out.
+#[test]
+fn upsert_local_fanout_diverged_workers_converge() {
+    let (forward, reverse) = local_tunnel_pair();
+    let mut at_cap = rig_capped_table(2, 2);
+    let mut below_cap = rig_capped_table(8, 2);
+
+    for sessions in [&mut at_cap, &mut below_cap] {
+        apply_upsert_local_pair(sessions, &forward, &reverse);
+        assert!(sessions.entry_with_origin(&forward.key).is_some());
+        assert!(sessions.entry_with_origin(&reverse.key).is_some());
+        assert_eq!(sessions.create_drops(), 0);
+    }
+    assert_eq!(at_cap.len(), 4);
+    assert_eq!(below_cap.len(), 4);
+}
+
+/// Exactly one free slot: pre-#1870 the forward install succeeded and
+/// the reverse was refused (partial pair — worker held forward only
+/// while the shared maps held both). The fixed arm admits both.
+#[test]
+fn upsert_local_pair_no_partial_at_cap_minus_one() {
+    let cap = 4;
+    let mut sessions = rig_capped_table(cap, cap - 1);
+    let (forward, reverse) = local_tunnel_pair();
+
+    apply_upsert_local_pair(&mut sessions, &forward, &reverse);
+
+    assert!(sessions.entry_with_origin(&forward.key).is_some());
+    assert!(
+        sessions.entry_with_origin(&reverse.key).is_some(),
+        "reverse half must not be dropped when only one slot is free"
+    );
+    assert_eq!(sessions.len(), cap + 1);
+    assert_eq!(sessions.create_drops(), 0);
+}
+
+/// Below cap, `allow_replace_local=true` preserves the pre-#1870
+/// replace semantics of the capped install (which clobbered any
+/// same-key entry below cap). Guards against a future "tidy-up" to
+/// `allow_replace_local=false` or a revert to the capped install.
+#[test]
+fn upsert_local_below_cap_replaces_existing_local_entry() {
+    let mut sessions = SessionTable::new();
+    let (forward, reverse) = local_tunnel_pair();
+    assert!(sessions.install_with_protocol(
+        forward.key.clone(),
+        test_decision(),
+        test_metadata(),
+        1_000_000,
+        PROTO_TCP,
+        TCP_FLAG_ACK,
+    ));
+    let _ = sessions.drain_deltas(usize::MAX);
+
+    apply_upsert_local_pair(&mut sessions, &forward, &reverse);
+
+    let (_, _, origin) = sessions
+        .entry_with_origin(&forward.key)
+        .expect("replaced entry");
+    assert_eq!(
+        origin,
+        SessionOrigin::SyncImport,
+        "local same-key entry must be replaced by the tunnel decision"
+    );
+    assert_eq!(sessions.len(), 2, "replace + reverse install");
+    assert_eq!(sessions.create_drops(), 0);
+}
+
+/// At cap, same-key replacement is a deliberate #1870 semantic change:
+/// the old capped install refused BEFORE reaching remove_entry, so a
+/// stale same-key local entry could never be replaced at cap (and a
+/// local hit shadows the shared scope, blocking reactive
+/// materialization until expiry). The new arm replaces it without
+/// growing the table.
+#[test]
+fn upsert_local_at_cap_replaces_existing_local_entry_without_growth() {
+    let cap = 4;
+    let mut sessions = rig_capped_table(cap, cap - 1);
+    let (forward, reverse) = local_tunnel_pair();
+    assert!(sessions.install_with_protocol(
+        forward.key.clone(),
+        test_decision(),
+        test_metadata(),
+        1_000_000,
+        PROTO_TCP,
+        TCP_FLAG_ACK,
+    ));
+    assert_eq!(sessions.len(), cap, "table rigged to cap incl. stale key");
+    let _ = sessions.drain_deltas(usize::MAX);
+
+    apply_upsert_local_pair(&mut sessions, &forward, &reverse);
+
+    let (_, _, origin) = sessions
+        .entry_with_origin(&forward.key)
+        .expect("replaced entry at cap");
+    assert_eq!(origin, SessionOrigin::SyncImport);
+    assert_eq!(
+        sessions.len(),
+        cap + 1,
+        "same-key replace must not grow; only the reverse adds a slot"
+    );
+    assert_eq!(sessions.create_drops(), 0);
+}
+
+/// Pins the expected (permanent, by-origin) bulk-export behavior:
+/// local-tunnel entries carry SyncImport and are skipped by
+/// export_forward_sessions_for_owner_rgs at ANY occupancy — their
+/// exclusion is origin design, not a cap artifact (Codex #1870 plan
+/// r1 finding 3; refuted v1's "at-cap bulk-export gap" claim).
+#[test]
+fn upsert_local_entries_stay_out_of_owner_rg_bulk_export() {
+    let mut sessions = SessionTable::new();
+    let (forward, reverse) = local_tunnel_pair();
+    apply_upsert_local_pair(&mut sessions, &forward, &reverse);
+    assert!(sessions.entry_with_origin(&forward.key).is_some());
+    assert!(sessions.drain_deltas(usize::MAX).is_empty());
+
+    export_forward_sessions_for_owner_rgs(&mut sessions, &[1]);
+
+    assert!(
+        sessions.drain_deltas(usize::MAX).is_empty(),
+        "peer-synced-origin local-tunnel entries must not bulk-export"
+    );
+}

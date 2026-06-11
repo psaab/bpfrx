@@ -2599,3 +2599,57 @@ fn admission_refused_and_install_partial_counters_accumulate() {
     assert_eq!(table.admission_refused(), 2);
     assert_eq!(table.install_partial(), 1);
 }
+
+// ── #1870: sync-family upsert infallibility at max_sessions ─────────
+//
+// The UpsertLocal arm (session_glue) relies on
+// `upsert_synced_with_origin(_, allow_replace_local=true)` having no
+// failure mode: no cap check, and the only `false` exit (the
+// local-clobber guard) is bypassed. Pin both at-cap shapes in a
+// release-effective `assert!` (the arm's own debug_assert!s compile
+// out — #1855 contract).
+#[test]
+fn upsert_synced_allow_replace_is_infallible_at_cap() {
+    let mut table = SessionTable::new();
+    table.set_max_sessions_for_test(1);
+    let key = key_v4();
+    let now = 1_000_000_000u64;
+    assert!(table.install_with_protocol(key.clone(), decision(), metadata(), now, PROTO_TCP, 0x10));
+    assert_eq!(table.len(), 1, "table at cap");
+
+    // Same-key replace at cap: succeeds without growth.
+    assert!(
+        table.upsert_synced(
+            key.clone(),
+            decision(),
+            metadata(),
+            now + 1,
+            PROTO_TCP,
+            0x10,
+            true,
+        ),
+        "same-key upsert at cap must succeed"
+    );
+    assert_eq!(table.len(), 1);
+
+    // New-key insert at cap: the sync family is uncapped by design
+    // (#1861 row I11) — succeeds and grows past max_sessions.
+    let second = SessionKey {
+        src_port: key.src_port.wrapping_add(1),
+        ..key
+    };
+    assert!(
+        table.upsert_synced(
+            second.clone(),
+            decision(),
+            metadata(),
+            now + 2,
+            PROTO_TCP,
+            0x10,
+            true,
+        ),
+        "new-key upsert at cap must succeed (uncapped sync family)"
+    );
+    assert_eq!(table.len(), 2, "table exceeds max_sessions by design");
+    assert_eq!(table.create_drops(), 0, "no install-path drop counted");
+}
