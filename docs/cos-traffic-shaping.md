@@ -932,9 +932,17 @@ Notes for this specific test:
   existing configs are unaffected. `mean` clips toward
   `sum(prev_grants) / sum(active_flows)` over the sampled set — it trims only
   the lucky fast outliers and keeps more aggregate than `slowest`.
-  `ideal-share` is the literal `scheduler_rate / total_active_flows` nominal
-  share; in capacity-limited regimes every flow already runs below it, so it
-  clips nothing (a documented no-op kept for nominal-share semantics).
+  `ideal-share` is the nominal equal share: the rotation's true byte budget
+  (rate x elapsed, lag-recovered) divided by the live total active-flow
+  count. The static capacity-limited model predicts it clips nothing (every
+  flow already runs below the nominal share); LIVE, the per-epoch sampled
+  flow count and EWMA dynamics can make it intermittently bind, so treat it
+  as "nominal-share semantics with occasional top-band trimming", not a
+  strict no-op — the #1746 F1 measurement
+  (`docs/pr/1746-equal-flow-target-policy/f1-measurement.md`) recorded
+  cap-hit activity and OFF-to-ON CoV movement comparable to the clipping
+  policies. Like all equal-flow enforcement it is bounded by the
+  low-demand-worker fail-open governor.
   Modeled tradeoff on the observed loss-cluster banding (10 distinct flow
   rates `[0.87x4, 1.29x3, 1.63x2, 1.81x1]` Gb/s, baseline 12.42 G aggregate
   / 27.7 % per-flow CoV — #1746 plan section 4):

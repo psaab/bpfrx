@@ -129,6 +129,94 @@ impl SharedCoSQueueLease {
             prev_grants[id] = prev;
         }
 
+        // #1746 (Codex r1 F1): the carry/elapsed/new_cap computation moved
+        // ABOVE the equal-flow publish (pure reordering inside the same
+        // single-writer ODD seqlock section — identical values, identical
+        // stores) so the IdealShare policy can divide the TRUE per-rotation
+        // budget (`new_cap` = rate x elapsed + carry, lag-recovered) instead
+        // of a fixed one-EPOCH nominal that over-throttled lagged classes.
+        // #1630 (cause-1): bounded rotation credit carry. The cap this
+        // rotation grants is `rate × elapsed + carry_draw`, where:
+        //   * `elapsed` is the wall-clock lag bounded by `K × EPOCH`
+        //     (`MAX_ROTATION_LAG_EPOCHS`) — recovers the rate credit the
+        //     old `.min(EPOCH)` clamp discarded for a low-rate class that
+        //     is only visited intermittently;
+        //   * `carry_draw` releases a bounded slice of the banked deficit
+        //     accrued when a single lag exceeded `K × EPOCH`.
+        //
+        // Three regimes (DECOUPLED stall cutoff so a legitimate heavy-tail
+        // visit lag is never penalised as a stall):
+        //   1. lag ≤ K          — normal recovery: grant raw lag, drain a
+        //                         bounded carry slice.
+        //   2. K < lag ≤ STALL  — bank-residual: grant the K-epoch ceiling
+        //                         now, bank `rate × (lag − K×EPOCH)` into
+        //                         carry (clamped) for the next visit.
+        //   3. lag > STALL or
+        //      start == 0       — cold-resume: grant exactly one epoch and
+        //                         DROP carry. Bounds the post-stall /
+        //                         post-failback burst to `rate × EPOCH` and
+        //                         prevents carry leaking across an HA
+        //                         demote→promote gap on a reused lease.
+        //
+        // `epoch_carry_bytes` is rotation-private (single-writer, inside
+        // the seqlock ODD section); the Acquire/Release on it are redundant
+        // with the surrounding CAS fence but self-documenting. See the
+        // struct doc-comment for the enforced reader-private invariant.
+        let rate_bytes = self.config.rate_bytes as u128;
+        let carry_max = ((rate_bytes
+            * CARRY_MAX_EPOCHS as u128
+            * EPOCH_DURATION_NS as u128)
+            / 1_000_000_000u128) as u64;
+        let carry_drain_max = ((rate_bytes
+            * CARRY_DRAIN_MAX_EPOCHS as u128
+            * EPOCH_DURATION_NS as u128)
+            / 1_000_000_000u128) as u64;
+
+        // Regime boundaries are compared on EXACT wall-clock nanoseconds,
+        // NOT a floored epoch count: a floored `lag = raw / EPOCH` would
+        // admit a regime-1 lag of up to `(K+1)×EPOCH − 1ns` (floors to K),
+        // so the regime-1 base grant could reach almost `(K+1)×rate×EPOCH`
+        // and, with a full carry drain, breach the `(2K−1)×rate×EPOCH`
+        // per-rotation bound by one epoch; and a raw lag of
+        // `STALL×EPOCH + 1ns` (floors to STALL) would skip the regime-3
+        // cold-resume and bank instead of dropping stale carry across an
+        // HA gap. Comparing raw nanoseconds against the exact `K×EPOCH`
+        // and `STALL×EPOCH` thresholds closes both boundary holes.
+        let raw_elapsed_ns = now_ns.saturating_sub(start);
+        let k_window_ns = EPOCH_DURATION_NS * MAX_ROTATION_LAG_EPOCHS;
+        let stall_window_ns = EPOCH_DURATION_NS * STALL_THRESHOLD_EPOCHS;
+
+        let (elapsed_ns, carry_draw) = if start == 0 || raw_elapsed_ns > stall_window_ns {
+            // REGIME 3 — cold-resume. One epoch, drop any stale carry.
+            v8.epoch.epoch_carry_bytes.store(0, Ordering::Release);
+            (EPOCH_DURATION_NS, 0u64)
+        } else if raw_elapsed_ns > k_window_ns {
+            // REGIME 2 — bank residual beyond the K-epoch ceiling. Grant
+            // exactly `K×EPOCH` now; bank `rate × (raw − K×EPOCH)`.
+            let overshoot_ns = (raw_elapsed_ns - k_window_ns) as u128;
+            let new_owed = ((rate_bytes * overshoot_ns) / 1_000_000_000u128) as u64;
+            let prev_carry = v8.epoch.epoch_carry_bytes.load(Ordering::Acquire);
+            let carry = prev_carry.saturating_add(new_owed).min(carry_max);
+            v8.epoch.epoch_carry_bytes.store(carry, Ordering::Release);
+            (k_window_ns, 0u64)
+        } else {
+            // REGIME 1 — normal recovery. `raw_elapsed_ns ≤ K×EPOCH` here
+            // (regime 2 caught anything above), so the base grant is
+            // bounded by `K×rate×EPOCH`; the carry drain adds at most
+            // `(K−1)×rate×EPOCH`, keeping the per-rotation grant ≤
+            // `(2K−1)×rate×EPOCH`.
+            let prev_carry = v8.epoch.epoch_carry_bytes.load(Ordering::Acquire);
+            let draw = prev_carry.min(carry_drain_max);
+            v8.epoch
+                .epoch_carry_bytes
+                .store(prev_carry - draw, Ordering::Release);
+            (raw_elapsed_ns, draw)
+        };
+
+        let base_cap =
+            ((self.config.rate_bytes as u128) * (elapsed_ns as u128) / 1_000_000_000u128) as u64;
+        let new_cap = base_cap.saturating_add(carry_draw).min(u32::MAX as u64);
+
         if v8.rate_mode == V8RateMode::EqualFlowSuppress {
             // #1745: swap the acquire-time active-flow sample slots and
             // capture the just-ended epoch's sticky-max per worker. This
@@ -152,12 +240,12 @@ impl SharedCoSQueueLease {
                     0
                 };
             }
-            // #1746: steady-state per-epoch byte budget for the
-            // IdealShare policy (`rate × EPOCH`). Computed here because
-            // the publisher only sees `V8State`, not `self.config`.
-            let nominal_epoch_bytes = ((self.config.rate_bytes as u128
-                * EPOCH_DURATION_NS as u128)
-                / 1_000_000_000u128) as u64;
+            // #1746: the IdealShare nominal numerator is the TRUE budget
+            // this rotation grants (`new_cap` = rate x elapsed + carry,
+            // computed above), NOT a fixed `rate x EPOCH` — under rotation
+            // lag the cap consumer (`target x active_flows` vs this
+            // window's grants) and the class budget scale together, so a
+            // lagged class keeps its lag-recovered credit (Codex r1 F1).
             publish_equal_flow_epoch_v8(
                 v8,
                 new_tag,
@@ -166,7 +254,7 @@ impl SharedCoSQueueLease {
                 sampled_active_flows_by_worker,
                 demanded_by_worker,
                 prev_grants,
-                nominal_epoch_bytes,
+                new_cap,
             );
         } else {
             v8.equal_flow.disable_for_epoch(new_tag);
@@ -249,87 +337,6 @@ impl SharedCoSQueueLease {
             .map(|c| c.load(Ordering::Relaxed) as u64)
             .sum::<u64>()
             .max(1);
-        // #1630 (cause-1): bounded rotation credit carry. The cap this
-        // rotation grants is `rate × elapsed + carry_draw`, where:
-        //   * `elapsed` is the wall-clock lag bounded by `K × EPOCH`
-        //     (`MAX_ROTATION_LAG_EPOCHS`) — recovers the rate credit the
-        //     old `.min(EPOCH)` clamp discarded for a low-rate class that
-        //     is only visited intermittently;
-        //   * `carry_draw` releases a bounded slice of the banked deficit
-        //     accrued when a single lag exceeded `K × EPOCH`.
-        //
-        // Three regimes (DECOUPLED stall cutoff so a legitimate heavy-tail
-        // visit lag is never penalised as a stall):
-        //   1. lag ≤ K          — normal recovery: grant raw lag, drain a
-        //                         bounded carry slice.
-        //   2. K < lag ≤ STALL  — bank-residual: grant the K-epoch ceiling
-        //                         now, bank `rate × (lag − K×EPOCH)` into
-        //                         carry (clamped) for the next visit.
-        //   3. lag > STALL or
-        //      start == 0       — cold-resume: grant exactly one epoch and
-        //                         DROP carry. Bounds the post-stall /
-        //                         post-failback burst to `rate × EPOCH` and
-        //                         prevents carry leaking across an HA
-        //                         demote→promote gap on a reused lease.
-        //
-        // `epoch_carry_bytes` is rotation-private (single-writer, inside
-        // the seqlock ODD section); the Acquire/Release on it are redundant
-        // with the surrounding CAS fence but self-documenting. See the
-        // struct doc-comment for the enforced reader-private invariant.
-        let rate_bytes = self.config.rate_bytes as u128;
-        let carry_max = ((rate_bytes
-            * CARRY_MAX_EPOCHS as u128
-            * EPOCH_DURATION_NS as u128)
-            / 1_000_000_000u128) as u64;
-        let carry_drain_max = ((rate_bytes
-            * CARRY_DRAIN_MAX_EPOCHS as u128
-            * EPOCH_DURATION_NS as u128)
-            / 1_000_000_000u128) as u64;
-
-        // Regime boundaries are compared on EXACT wall-clock nanoseconds,
-        // NOT a floored epoch count: a floored `lag = raw / EPOCH` would
-        // admit a regime-1 lag of up to `(K+1)×EPOCH − 1ns` (floors to K),
-        // so the regime-1 base grant could reach almost `(K+1)×rate×EPOCH`
-        // and, with a full carry drain, breach the `(2K−1)×rate×EPOCH`
-        // per-rotation bound by one epoch; and a raw lag of
-        // `STALL×EPOCH + 1ns` (floors to STALL) would skip the regime-3
-        // cold-resume and bank instead of dropping stale carry across an
-        // HA gap. Comparing raw nanoseconds against the exact `K×EPOCH`
-        // and `STALL×EPOCH` thresholds closes both boundary holes.
-        let raw_elapsed_ns = now_ns.saturating_sub(start);
-        let k_window_ns = EPOCH_DURATION_NS * MAX_ROTATION_LAG_EPOCHS;
-        let stall_window_ns = EPOCH_DURATION_NS * STALL_THRESHOLD_EPOCHS;
-
-        let (elapsed_ns, carry_draw) = if start == 0 || raw_elapsed_ns > stall_window_ns {
-            // REGIME 3 — cold-resume. One epoch, drop any stale carry.
-            v8.epoch.epoch_carry_bytes.store(0, Ordering::Release);
-            (EPOCH_DURATION_NS, 0u64)
-        } else if raw_elapsed_ns > k_window_ns {
-            // REGIME 2 — bank residual beyond the K-epoch ceiling. Grant
-            // exactly `K×EPOCH` now; bank `rate × (raw − K×EPOCH)`.
-            let overshoot_ns = (raw_elapsed_ns - k_window_ns) as u128;
-            let new_owed = ((rate_bytes * overshoot_ns) / 1_000_000_000u128) as u64;
-            let prev_carry = v8.epoch.epoch_carry_bytes.load(Ordering::Acquire);
-            let carry = prev_carry.saturating_add(new_owed).min(carry_max);
-            v8.epoch.epoch_carry_bytes.store(carry, Ordering::Release);
-            (k_window_ns, 0u64)
-        } else {
-            // REGIME 1 — normal recovery. `raw_elapsed_ns ≤ K×EPOCH` here
-            // (regime 2 caught anything above), so the base grant is
-            // bounded by `K×rate×EPOCH`; the carry drain adds at most
-            // `(K−1)×rate×EPOCH`, keeping the per-rotation grant ≤
-            // `(2K−1)×rate×EPOCH`.
-            let prev_carry = v8.epoch.epoch_carry_bytes.load(Ordering::Acquire);
-            let draw = prev_carry.min(carry_drain_max);
-            v8.epoch
-                .epoch_carry_bytes
-                .store(prev_carry - draw, Ordering::Release);
-            (raw_elapsed_ns, draw)
-        };
-
-        let base_cap =
-            ((self.config.rate_bytes as u128) * (elapsed_ns as u128) / 1_000_000_000u128) as u64;
-        let new_cap = base_cap.saturating_add(carry_draw).min(u32::MAX as u64);
         // #1643: payload store downgraded to Relaxed — the single Release
         // on `epoch_seq` below is the sole publish the fenced-Acquire reader
         // synchronizes-with (matching the cold_path_hist reference writer).

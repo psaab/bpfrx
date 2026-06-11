@@ -737,6 +737,36 @@ fn equal_flow_ideal_share_policy_targets_nominal_share() {
 }
 
 #[test]
+fn equal_flow_ideal_share_numerator_scales_with_lagged_rotation_budget() {
+    // Codex r1 F1 on PR #1867: the IdealShare nominal numerator must be
+    // the TRUE per-rotation budget (rate x elapsed + carry), not a fixed
+    // one-EPOCH nominal — otherwise a lagged rotation (new_cap = K x
+    // rate x EPOCH) would keep a 1x target and clip away the v8
+    // lag-recovery credit. With a 3-epoch rotation lag the budget is
+    // 30_000 B, so the candidate is 30_000 / 5 = 6000 and the EWMA over
+    // the prior 2000 gives (3 x 2000 + 6000) / 4 = 3000.
+    let lease = new_equal_flow_lease_with_policy(EqualFlowTargetPolicy::IdealShare);
+    lease.rehydrate_worker_active_count(0, 4);
+    lease.rehydrate_worker_active_count(1, 1);
+
+    let _ = lease.acquire_v8(0, EPOCH_DURATION_NS, 8_000);
+    let _ = lease.acquire_v8(1, EPOCH_DURATION_NS, 1_800);
+    assert!(!lease.v8_equal_flow_enforced());
+
+    let _ = lease.acquire_v8(0, 2 * EPOCH_DURATION_NS, 8_000);
+    let _ = lease.acquire_v8(1, 2 * EPOCH_DURATION_NS, 1_800);
+    assert!(!lease.v8_equal_flow_enforced());
+
+    // 3-epoch lag (raw_elapsed = 3 x EPOCH <= K = 8): regime-1 recovery
+    // grants the raw lag, so new_cap = 30_000 and the published target
+    // scales with it instead of staying at the fixed-EPOCH 2000.
+    let _ = lease.acquire_v8(1, 5 * EPOCH_DURATION_NS, 1);
+    assert!(lease.v8_equal_flow_enforced());
+    assert_eq!(lease.v8_equal_flow_target_per_flow(), 3_000);
+    assert_eq!(lease.v8_equal_flow_worker_cap(), 12_000);
+}
+
+#[test]
 fn matches_config_v8_distinguishes_equal_flow_target_policy() {
     // #1746 F3: a live policy change must rebuild the lease; a stale
     // lease must not be reused across a policy edit.

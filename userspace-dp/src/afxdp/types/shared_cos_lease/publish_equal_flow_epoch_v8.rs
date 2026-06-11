@@ -23,11 +23,12 @@ use std::sync::atomic::Ordering;
 // and `IdealShare` choose a different statistic over the SAME sampled
 // `(prev_grants[id], active_flows[id])` pairs. The fail-open guards,
 // EWMA smoothing, valid-streak gate, and `max_worker_cap` telemetry are
-// identical for all three policies. `nominal_epoch_bytes` is the
-// lease's steady-state per-epoch byte budget
-// (`rate_bytes × EPOCH_DURATION_NS / 1e9`), threaded from the rotation
-// because this helper only sees `V8State`, not the lease config; it is
-// read by the `IdealShare` policy only.
+// identical for all three policies. `nominal_epoch_bytes` is the TRUE
+// byte budget the current rotation grants (`new_cap` = rate x elapsed
+// + carry draw — lag-recovered, Codex r1 F1), threaded from the
+// rotation because this helper only sees `V8State`, not the lease
+// config; it is read by the `IdealShare` policy only, so the nominal
+// share scales with the same budget the cap consumer is gated by.
 #[inline]
 pub(super) fn publish_equal_flow_epoch_v8(
     v8: &V8State,
