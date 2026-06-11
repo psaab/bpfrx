@@ -9,3 +9,9 @@
 
 ## Code review rounds (PR #1871 @ e1f17f5ee3e5)
 (filled per round)
+
+## Code review round 1 (head 816460efe939 / SMR at e1f17f5+)
+- Codex: task-mq9fd3w1-7tfzk6 — MERGE-READY (worked traces verified; one gofmt alignment note, fixed in follow-up commit)
+- AGY: adversarial-review-mq9fdkfv-fepikc — MERGE-READY (all 7 priority targets verified, zero findings)
+- Claude SMR: docs/pr/1861-install-txn/claude-smr-code-r1.md — MERGE-READY (worked traces 1+2)
+- Copilot: quota-limited twice on first request; retry 1 posted (documented per feedback_copilot_quota policy)

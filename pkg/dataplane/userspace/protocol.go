@@ -582,10 +582,10 @@ type ProcessStatus struct {
 	SessionInstallAdmissionRefused uint64      `json:"session_install_admission_refused,omitempty"`
 	SessionInstallPartial          uint64      `json:"session_install_partial,omitempty"`
 	FlowCacheCapacity              uint64      `json:"flow_cache_capacity,omitempty"`
-	NeighborCacheCapacity   uint64      `json:"neighbor_cache_capacity,omitempty"`
-	NeighborGeneration      uint64      `json:"neighbor_generation,omitempty"`
-	RouteEntries            int         `json:"route_entries,omitempty"`
-	WorkerHeartbeats        []time.Time `json:"worker_heartbeats,omitempty"`
+	NeighborCacheCapacity          uint64      `json:"neighbor_cache_capacity,omitempty"`
+	NeighborGeneration             uint64      `json:"neighbor_generation,omitempty"`
+	RouteEntries                   int         `json:"route_entries,omitempty"`
+	WorkerHeartbeats               []time.Time `json:"worker_heartbeats,omitempty"`
 	// #869: per-worker busy/idle runtime telemetry.
 	WorkerRuntime []WorkerRuntimeStatus `json:"worker_runtime,omitempty"`
 	HAGroups      []HAGroupStatus       `json:"ha_groups,omitempty"`
