@@ -5094,3 +5094,12 @@ top.
 - **Timestamp**: 2026-06-10
   **Action**: "#1855 PR #1858 review round complete — Codex r1 NEEDS-CHANGES (1 MEDIUM: session README still said the timer-wheel sweep runs 'by the coordinator', inconsistent with the corrected per-worker ownership) fixed in 71f845fe5 (wheel.rs bullet -> each worker sweeps its own table from its poll loop via expire_stale_entries; GC section -> single-threaded per-worker); Codex r2 MERGE-READY (docs-only confirmed, zero coordinator matches remain); AGY MERGE-READY (5 verified findings incl. per-arm panic trace + both-profile runs); Claude SMR MERGE-READY (worked trace in docs/pr/1855-inplace-contract/claude-smr-review.md); Copilot quota-blocked 3 documented attempts -> 3-of-4. Named tests re-spot-checked green on final head in both profiles (14/14 each)"
   **File(s)**: userspace-dp/src/session/README.md, docs/pr/1855-inplace-contract/{claude-smr-review.md,reviewer-ids.md}, _Log.md
+
+- **Timestamp**: 2026-06-10 ~23:10 PDT
+  **Action**: #1741 fix — sentinel-clear out-of-window flow-cache activity
+  stamps in the debug-cadence scan so u16 epoch-wrap can no longer
+  resurrect dead flows into the active-flow telemetry ("ghost
+  over-count"); 4 pinned regression tests; fairness-regimes gauge
+  contract note.
+  **File(s)**: userspace-dp/src/afxdp/flow_cache.rs,
+  userspace-dp/src/afxdp/flow_cache_tests.rs, docs/fairness-regimes.md
