@@ -170,6 +170,17 @@ func (c *CLI) handleClearSecurity(args []string) error {
 }
 
 func (c *CLI) clearFilteredSessions(f sessionFilter) error {
+	// Operator-input errors must fail the command: an unresolvable
+	// zone or pool name would otherwise leave its predicate inert and
+	// silently widen (or void) the clear.
+	if err := f.validate(); err != nil {
+		return err
+	}
+	// Interface matching needs the zone/egress interface maps; the
+	// show path builds them inline, the clear path must do it too —
+	// without this an interface-filtered clear matches nothing.
+	f.populateIfaceMaps(c)
+
 	v4Deleted := 0
 	v6Deleted := 0
 
@@ -271,30 +282,46 @@ func (c *CLI) clearPeerSessions(f *sessionFilter) {
 	defer conn.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	req := &pb.ClearSessionsRequest{}
-	if f != nil {
-		if f.srcNet != nil {
-			req.SourcePrefix = f.srcNet.String()
-		}
-		if f.dstNet != nil {
-			req.DestinationPrefix = f.dstNet.String()
-		}
-		if f.proto != 0 {
-			switch f.proto {
-			case 6:
-				req.Protocol = "tcp"
-			case 17:
-				req.Protocol = "udp"
-			case 1:
-				req.Protocol = "icmp"
-			}
-		}
-		req.SourcePort = uint32(f.srcPort)
-		req.DestinationPort = uint32(f.dstPort)
-		req.Application = f.appName
-	}
+	req := buildPeerClearRequest(f)
 	ctx = metadata.AppendToOutgoingContext(ctx, "x-peer-forwarded", "1")
 	_, _ = pb.NewBpfrxServiceClient(conn).ClearSessions(ctx, req)
+}
+
+// buildPeerClearRequest translates a local session filter into the
+// peer-forwarded ClearSessionsRequest. EVERY filter dimension must be
+// carried: a dropped filter does not merely widen the peer clear — a
+// request with no filters at all is interpreted by the peer as
+// clear-all (historically `clear security flow session interface X`
+// forwarded an empty request and wiped the peer's session table).
+func buildPeerClearRequest(f *sessionFilter) *pb.ClearSessionsRequest {
+	req := &pb.ClearSessionsRequest{}
+	if f == nil {
+		return req
+	}
+	if f.srcNet != nil {
+		req.SourcePrefix = f.srcNet.String()
+	}
+	if f.dstNet != nil {
+		req.DestinationPrefix = f.dstNet.String()
+	}
+	if f.proto != 0 {
+		switch f.proto {
+		case 6:
+			req.Protocol = "tcp"
+		case 17:
+			req.Protocol = "udp"
+		case 1:
+			req.Protocol = "icmp"
+		}
+	}
+	req.SourcePort = uint32(f.srcPort)
+	req.DestinationPort = uint32(f.dstPort)
+	req.Application = f.appName
+	req.Zone = f.zoneName
+	req.Interface = f.iface
+	req.NatOnly = f.natOnly
+	req.SourceNatPool = f.snatPool
+	return req
 }
 
 func (c *CLI) handleClearFirewall(args []string) error {

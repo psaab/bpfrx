@@ -189,6 +189,9 @@ func (c *CLI) showFlowSession(args []string) error {
 	}
 
 	f := c.parseSessionFilter(args)
+	if err := f.validate(); err != nil {
+		return err
+	}
 
 	// Top-talkers mode: collect, sort, display top 20
 	if f.sortBy == "bytes" || f.sortBy == "packets" {

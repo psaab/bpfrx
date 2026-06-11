@@ -6,6 +6,7 @@ package cli
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net"
 	"strconv"
@@ -21,11 +22,12 @@ import (
 // sessionFilter holds parsed filter criteria for session display.
 type sessionFilter struct {
 	zoneID   uint16 // 0 = any
+	zoneName string // zone filter as typed (for peer forwarding)
 	proto    uint8  // 0 = any
 	srcNet   *net.IPNet
 	dstNet   *net.IPNet
-	srcPort  uint16         // 0 = any
-	dstPort  uint16         // 0 = any
+	srcPort  uint16         // 0 = any (host byte order; keys are network order)
+	dstPort  uint16         // 0 = any (host byte order; keys are network order)
 	natOnly  bool           // show only NAT sessions
 	iface    string         // ingress/egress interface name filter
 	summary  bool           // only show count
@@ -35,7 +37,16 @@ type sessionFilter struct {
 	cfg      *config.Config // for application resolution
 	appNames map[uint16]string
 
-	// Populated by showFlowSession before iteration for interface matching.
+	// source-nat-pool filter (#1827 PR-3): match sessions whose
+	// TRANSLATED source address was allocated from the named pool —
+	// the operator handle for sessions pinned to a failed uplink's
+	// SNAT binding after an ip-monitoring transition.
+	snatPool     string       // pool name ("" = off)
+	snatPoolNets []*net.IPNet // resolved pool address set
+	snatPoolOK   bool         // pool name resolved to a configured source pool
+
+	// Populated by populateIfaceMaps (show + clear paths) for
+	// interface matching.
 	zoneIfaces      map[uint16]string          // zone ID → first interface name
 	egressIfacesMap map[sessionIfaceKey]string // {ifindex,vlanID} → interface name
 }
@@ -52,6 +63,7 @@ func (c *CLI) parseSessionFilter(args []string) sessionFilter {
 		case "zone":
 			if i+1 < len(args) {
 				i++
+				f.zoneName = args[i]
 				if cr != nil {
 					f.zoneID = cr.ZoneIDs[args[i]]
 				}
@@ -123,6 +135,14 @@ func (c *CLI) parseSessionFilter(args []string) sessionFilter {
 				i++
 				f.iface = args[i]
 			}
+		case "source-nat-pool":
+			if i+1 < len(args) {
+				i++
+				f.snatPool = args[i]
+				if f.cfg != nil {
+					f.snatPoolNets, f.snatPoolOK = config.SourceNATPoolNets(&f.cfg.Security.NAT, f.snatPool)
+				}
+			}
 		case "application":
 			if i+1 < len(args) {
 				i++
@@ -162,14 +182,21 @@ func (f *sessionFilter) matchesV4(key dataplane.SessionKey, val dataplane.Sessio
 	if f.dstNet != nil && !f.dstNet.Contains(net.IP(key.DstIP[:])) {
 		return false
 	}
-	if f.srcPort != 0 && key.SrcPort != f.srcPort {
+	// Key ports are network byte order; filter ports are host order.
+	if f.srcPort != 0 && ntohs(key.SrcPort) != f.srcPort {
 		return false
 	}
-	if f.dstPort != 0 && key.DstPort != f.dstPort {
+	if f.dstPort != 0 && ntohs(key.DstPort) != f.dstPort {
 		return false
 	}
 	if f.natOnly && val.Flags&(dataplane.SessFlagSNAT|dataplane.SessFlagDNAT) == 0 {
 		return false
+	}
+	if f.snatPool != "" {
+		if val.Flags&dataplane.SessFlagSNAT == 0 ||
+			!config.IPInNets(uint32ToIP(val.NATSrcIP), f.snatPoolNets) {
+			return false
+		}
 	}
 	if f.appName != "" {
 		if !appid.SessionMatches(f.appName, f.appNames, f.cfg,
@@ -200,14 +227,21 @@ func (f *sessionFilter) matchesV6(key dataplane.SessionKeyV6, val dataplane.Sess
 	if f.dstNet != nil && !f.dstNet.Contains(net.IP(key.DstIP[:])) {
 		return false
 	}
-	if f.srcPort != 0 && key.SrcPort != f.srcPort {
+	// Key ports are network byte order; filter ports are host order.
+	if f.srcPort != 0 && ntohs(key.SrcPort) != f.srcPort {
 		return false
 	}
-	if f.dstPort != 0 && key.DstPort != f.dstPort {
+	if f.dstPort != 0 && ntohs(key.DstPort) != f.dstPort {
 		return false
 	}
 	if f.natOnly && val.Flags&(dataplane.SessFlagSNAT|dataplane.SessFlagDNAT) == 0 {
 		return false
+	}
+	if f.snatPool != "" {
+		if val.Flags&dataplane.SessFlagSNAT == 0 ||
+			!config.IPInNets(net.IP(val.NATSrcIP[:]), f.snatPoolNets) {
+			return false
+		}
 	}
 	if f.appName != "" {
 		if !appid.SessionMatches(f.appName, f.appNames, f.cfg,
@@ -219,8 +253,40 @@ func (f *sessionFilter) matchesV6(key dataplane.SessionKeyV6, val dataplane.Sess
 }
 
 func (f *sessionFilter) hasFilter() bool {
-	return f.zoneID != 0 || f.proto != 0 || f.srcNet != nil || f.dstNet != nil ||
-		f.srcPort != 0 || f.dstPort != 0 || f.natOnly || f.iface != "" || f.appName != ""
+	return f.zoneID != 0 || f.zoneName != "" || f.proto != 0 || f.srcNet != nil || f.dstNet != nil ||
+		f.srcPort != 0 || f.dstPort != 0 || f.natOnly || f.iface != "" || f.appName != "" ||
+		f.snatPool != ""
+}
+
+// validate reports operator-input errors that must fail the command
+// rather than silently match nothing — or, on the clear path, fall
+// through to an unfiltered clear-all.
+func (f *sessionFilter) validate() error {
+	if f.snatPool != "" && !f.snatPoolOK {
+		return fmt.Errorf("source NAT pool %q not found", f.snatPool)
+	}
+	if f.zoneName != "" && f.zoneID == 0 {
+		return fmt.Errorf("zone %q not found", f.zoneName)
+	}
+	return nil
+}
+
+// populateIfaceMaps fills the zone→interface and {ifindex,vlan}→name
+// maps that interface matching in matchesV4/V6 depends on. The show
+// path builds these inline (it also needs zone/policy display maps);
+// the clear path MUST call this before matching — historically it did
+// not, so an interface-filtered clear matched nothing (#1827 PR-3).
+func (f *sessionFilter) populateIfaceMaps(c *CLI) {
+	zoneIfaces := make(map[uint16]string)
+	if cr := c.applyResult(); cr != nil && f.cfg != nil {
+		for zoneName, zone := range f.cfg.Security.Zones {
+			if zid, ok := cr.ZoneIDs[zoneName]; ok && len(zone.Interfaces) > 0 {
+				zoneIfaces[zid] = zone.Interfaces[0]
+			}
+		}
+	}
+	f.zoneIfaces = zoneIfaces
+	f.egressIfacesMap = buildSessionEgressIfaces(f.cfg)
 }
 
 // ifaceMatches checks whether ifName matches the filter's interface name.
@@ -256,6 +322,11 @@ func (c *CLI) fetchPeerSessions(f sessionFilter) *pb.GetSessionsResponse {
 	defer cancel()
 
 	req := &pb.GetSessionsRequest{Limit: 10000}
+	if f.zoneID != 0 {
+		// Zone IDs are config-compile-derived and config is synced
+		// across the cluster, so the peer resolves the same ID.
+		req.Zone = uint32(f.zoneID)
+	}
 	if f.proto != 0 {
 		req.Protocol = strings.ToUpper(protoNameFromNum(f.proto))
 	}
@@ -279,6 +350,9 @@ func (c *CLI) fetchPeerSessions(f sessionFilter) *pb.GetSessionsResponse {
 	}
 	if f.iface != "" {
 		req.InterfaceFilter = f.iface
+	}
+	if f.snatPool != "" {
+		req.SourceNatPool = f.snatPool
 	}
 
 	resp, err := client.GetSessions(ctx, req)
