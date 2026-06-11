@@ -78,16 +78,27 @@ func VerifyUserspaceShimObject(path string) error {
 // others); the hash-map shrink is applied to a copy afterwards, just
 // before the load.
 func verifyUserspaceShimSpecOnly(spec *ebpf.CollectionSpec) error {
+	return verifyUserspaceShimSpecWithShrink(spec, true)
+}
+
+// verifyUserspaceShimSpecWithShrink exists so the root-gated
+// shrink-equivalence test can prove that the MaxEntries shrink does
+// not change the verifier verdict (PASS object passes both ways, the
+// preserved #1864 REJECT object rejects both ways). Production
+// callers always shrink.
+func verifyUserspaceShimSpecWithShrink(spec *ebpf.CollectionSpec, shrink bool) error {
 	if err := validateUserspaceShimSpec(spec); err != nil {
 		return fmt.Errorf("spec validation (production-load viability): %w", err)
 	}
 
 	vspec := spec.Copy()
-	for _, ms := range vspec.Maps {
-		switch ms.Type {
-		case ebpf.Hash, ebpf.PerCPUHash, ebpf.LRUHash, ebpf.LRUCPUHash:
-			if ms.MaxEntries > verifyShrinkHashMaxEntries {
-				ms.MaxEntries = verifyShrinkHashMaxEntries
+	if shrink {
+		for _, ms := range vspec.Maps {
+			switch ms.Type {
+			case ebpf.Hash, ebpf.PerCPUHash, ebpf.LRUHash, ebpf.LRUCPUHash:
+				if ms.MaxEntries > verifyShrinkHashMaxEntries {
+					ms.MaxEntries = verifyShrinkHashMaxEntries
+				}
 			}
 		}
 	}

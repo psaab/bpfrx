@@ -42,12 +42,20 @@ fail() {
 # --- Toolchain pin (single source of truth: rust-toolchain.toml) ---
 TOOLCHAIN_TOML="${CRATE_DIR}/rust-toolchain.toml"
 [[ -f "${TOOLCHAIN_TOML}" ]] || fail "missing ${TOOLCHAIN_TOML} (toolchain pin SSOT)"
-# Tolerant of quote style, spacing, and trailing comments; strict
-# format check afterwards so a garbled parse can never fall back to an
+# Tolerant of quote style, spacing, and trailing comments; scoped to
+# the [toolchain] table; requires EXACTLY ONE channel key; strict
+# format check afterwards. A garbled, missing, duplicated, or
+# wrong-table parse fails loudly and can never fall back to an
 # unpinned toolchain.
-PINNED_TOOLCHAIN="$(awk -F= '/^[[:space:]]*channel[[:space:]]*=/ {
-	v=$2; sub(/#.*/, "", v); gsub(/[[:space:]"'"'"']/, "", v); print v; exit
-}' "${TOOLCHAIN_TOML}")"
+CHANNEL_LINES="$(awk '
+	/^[[:space:]]*\[/ { in_tc = ($0 ~ /^[[:space:]]*\[toolchain\][[:space:]]*$/) }
+	in_tc && /^[[:space:]]*channel[[:space:]]*=/ {
+		v=$0; sub(/^[^=]*=/, "", v); sub(/#.*/, "", v)
+		gsub(/[[:space:]"'"'"']/, "", v); print v
+	}' "${TOOLCHAIN_TOML}")"
+[[ "$(wc -l <<<"${CHANNEL_LINES}")" -eq 1 && -n "${CHANNEL_LINES}" ]] || \
+	fail "expected exactly one 'channel' key in the [toolchain] table of ${TOOLCHAIN_TOML}; got: '${CHANNEL_LINES}'"
+PINNED_TOOLCHAIN="${CHANNEL_LINES}"
 [[ "${PINNED_TOOLCHAIN}" =~ ^nightly-[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || \
 	fail "could not parse a nightly-YYYY-MM-DD channel pin from ${TOOLCHAIN_TOML} (got '${PINNED_TOOLCHAIN}')"
 

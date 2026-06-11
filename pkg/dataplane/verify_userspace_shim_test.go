@@ -5,6 +5,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
 )
 
@@ -24,6 +25,53 @@ func TestVerifyEmbeddedUserspaceShim(t *testing.T) {
 			t.Fatalf("embedded shim object REJECTED by kernel verifier (#1864 failure mode):\n%v", err)
 		}
 		t.Fatalf("verify-only load failed: %v", err)
+	}
+}
+
+// TestVerifyUserspaceShimShrinkEquivalence proves the hash-map
+// MaxEntries shrink is verifier-neutral on this kernel: the embedded
+// PASS object passes both unmodified and shrunk, and the preserved
+// #1864 incident REJECT object (testdata, never embedded) rejects
+// both ways. This is the gate behind making the shrunk C2 pre-flight
+// authoritative while production loads full map geometry. Root-only
+// and slow (~20-40s: the unmodified loads create the full 10M-entry
+// dnat_table and the REJECT walks ~1M insns twice).
+func TestVerifyUserspaceShimShrinkEquivalence(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow verifier walks; skipped in -short")
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("requires root/CAP_BPF for BPF_PROG_LOAD")
+	}
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Skipf("RemoveMemlock: %v", err)
+	}
+
+	load := func(t *testing.T, path string) *ebpf.CollectionSpec {
+		t.Helper()
+		spec, err := ebpf.LoadCollectionSpec(path)
+		if err != nil {
+			t.Fatalf("load spec %s: %v", path, err)
+		}
+		return spec
+	}
+
+	goodSpec, err := loadRustUserspaceXDP()
+	if err != nil {
+		t.Fatalf("load embedded spec: %v", err)
+	}
+	for _, shrink := range []bool{false, true} {
+		if err := verifyUserspaceShimSpecWithShrink(goodSpec.Copy(), shrink); err != nil {
+			t.Fatalf("embedded PASS object failed with shrink=%v: %v", shrink, err)
+		}
+	}
+
+	badSpec := load(t, "testdata/userspace_xdp_bpfel_1864_reject.o")
+	for _, shrink := range []bool{false, true} {
+		err := verifyUserspaceShimSpecWithShrink(badSpec.Copy(), shrink)
+		if !errors.Is(err, ErrUserspaceShimVerifierReject) {
+			t.Fatalf("incident REJECT object with shrink=%v: want verifier reject, got %v", shrink, err)
+		}
 	}
 }
 
