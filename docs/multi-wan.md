@@ -1,12 +1,22 @@
 # Multi-WAN failover (services rpm + services ip-monitoring)
 
-Status: PR-1 + PR-2 + PR-3 of the #1827 multi-WAN program (plan:
-`docs/research/1827-multiwan/plan.md`). PR-1 delivers probe-driven
-route failover with Junos syntax; PR-2 adds per-policy uplink
-selection (FBF composition); PR-3 defines the NAT interplay
+Status: the #1827 multi-WAN program is COMPLETE at PR-1 + PR-2 + PR-3
+(plan: `docs/research/1827-multiwan/plan.md`). PR-1 delivers
+probe-driven route failover with Junos syntax; PR-2 adds per-policy
+uplink selection (FBF composition); PR-3 defines the NAT interplay
 (per-uplink SNAT pools via existing matchers + session-transition
-semantics, mini-plan: `docs/pr/1827-pr3-nat/plan.md`). Health-gated
-load-sharing is a later PR (§5 of the plan).
+semantics, mini-plan: `docs/pr/1827-pr3-nat/plan.md`). The PR-4
+weights/load-share stage was KILLED by its own research-gate criteria
+(audit of record: `docs/research/1827-pr4-loadshare/plan.md` on the
+`research/1827-pr4-loadshare` branch): the userspace dataplane has no
+ECMP next-hop selection to weight — the FIB flattens multi-next-hop
+routes to the first entry at build time — so any per-flow load-share
+(weighted or equal-cost) would be a new Rust hot-path program with new
+cross-node hash-symmetry invariants, unjustified at 2 uplinks given
+the FBF steering recipe below. Equal-cost or weighted per-flow
+load-balance parity remains unimplemented; if demand materializes it
+is its own issue with its own value case — it is not a multi-WAN
+failover deliverable.
 
 xpf models multi-WAN the way real SRX does — as the composition of
 existing subsystems, not an invented `services multi-wan` tree:
