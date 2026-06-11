@@ -1617,3 +1617,60 @@ func TestCoSQueueStatusFlowFairOccupancyRoundTrip(t *testing.T) {
 		t.Fatalf("legacy decode must zero-default #1830 fields: %+v", legacy)
 	}
 }
+
+// TestCoSQueueStatusLeaseClaimFlowWire pins the #1863 Step-0 per-worker
+// v8 lease claim-flow wire contract on the Go side: tag byte-equality
+// with the Rust serde renames in protocol/cos.rs, slice round-trip,
+// and omitempty for legacy/non-v8 rows (empty slices encode to absent
+// keys — byte-identical pre-#1863 wire).
+func TestCoSQueueStatusLeaseClaimFlowWire(t *testing.T) {
+	in := CoSQueueStatus{
+		QueueID:                     4,
+		LeaseV8WorkerRequestedBytes: []uint64{100, 0, 250},
+		LeaseV8WorkerGrantedBytes:   []uint64{90, 0, 200},
+	}
+	raw, err := json.Marshal(&in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("unmarshal obj: %v", err)
+	}
+	for _, key := range []string{
+		"lease_v8_worker_requested_bytes",
+		"lease_v8_worker_granted_bytes",
+	} {
+		if _, ok := obj[key]; !ok {
+			t.Fatalf("wire key %q missing from CoSQueueStatus JSON: %s", key, string(raw))
+		}
+	}
+	var back CoSQueueStatus
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatalf("unmarshal CoSQueueStatus: %v", err)
+	}
+	if len(back.LeaseV8WorkerRequestedBytes) != 3 || back.LeaseV8WorkerRequestedBytes[2] != 250 {
+		t.Fatalf("LeaseV8WorkerRequestedBytes round-trip: got %v", back.LeaseV8WorkerRequestedBytes)
+	}
+	if len(back.LeaseV8WorkerGrantedBytes) != 3 || back.LeaseV8WorkerGrantedBytes[0] != 90 {
+		t.Fatalf("LeaseV8WorkerGrantedBytes round-trip: got %v", back.LeaseV8WorkerGrantedBytes)
+	}
+
+	// Legacy row: empty slices must be omitted entirely.
+	legacyRaw, err := json.Marshal(&CoSQueueStatus{QueueID: 4})
+	if err != nil {
+		t.Fatalf("marshal legacy: %v", err)
+	}
+	var legacyObj map[string]json.RawMessage
+	if err := json.Unmarshal(legacyRaw, &legacyObj); err != nil {
+		t.Fatalf("unmarshal legacy obj: %v", err)
+	}
+	for _, key := range []string{
+		"lease_v8_worker_requested_bytes",
+		"lease_v8_worker_granted_bytes",
+	} {
+		if _, ok := legacyObj[key]; ok {
+			t.Fatalf("wire key %q must be omitted for legacy rows: %s", key, string(legacyRaw))
+		}
+	}
+}

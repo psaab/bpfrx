@@ -2031,3 +2031,73 @@ fn v8_unclaimed_carry_redeals_flow_proportionally_across_workers() {
         "epoch 2 re-deals the banked 5,000 flow-proportionally"
     );
 }
+
+#[test]
+fn v8_regime2_banks_lag_owed_plus_unclaimed_and_draws_nothing() {
+    // Regime 2 (K < lag <= STALL): grant exactly the K-epoch ceiling,
+    // draw 0, bank rate x (lag - K x EPOCH) PLUS the just-ended
+    // epoch's unclaimed remainder.
+    let lease = SharedCoSQueueLease::new_v8(CARRY_TEST_RATE, 64 * 1024, 2, 0);
+    lease.rehydrate_worker_active_count(0, 1);
+    // First rotation (regime 3): cap 2,500; claim 500 -> 2,000 unclaimed.
+    let (g1, _) = lease.acquire_v8_with_cause(0, EPOCH_DURATION_NS, 500);
+    assert_eq!(g1, 500);
+    // Next acquire 10 epochs later: lag 10 > K=8 -> regime 2.
+    // cap = 8 x 2,500 = 20,000 (draw 0); carry banks the 2-epoch
+    // overshoot (5,000) + unclaimed 2,000 = 7,000.
+    let (g2, _) = lease.acquire_v8_with_cause(0, 11 * EPOCH_DURATION_NS, 50_000);
+    assert_eq!(g2, 20_000, "regime 2 grants the K-epoch ceiling, no draw");
+    // One epoch later (regime 1, fully-claimed prior epoch): cap =
+    // base 2,500 + draw min(7,000, drain_max 17,500) = 9,500.
+    let (g3, _) = lease.acquire_v8_with_cause(0, 12 * EPOCH_DURATION_NS, 50_000);
+    assert_eq!(
+        g3, 9_500,
+        "the banked lag-owed + unclaimed budget drains on the next visit"
+    );
+}
+
+#[test]
+fn v8_concurrent_acquires_and_rotations_respect_the_budget_bound() {
+    // 4 worker threads hammer acquire_v8 with monotonically advancing
+    // per-thread clocks spanning ~100 epochs, racing rotations against
+    // grants. Invariant under ANY interleaving: total granted bytes
+    // never exceed rate x span + the bounded carry/burst slack
+    // (carry_max = 8 epochs, plus the K-epoch first-window grant).
+    use std::sync::Arc as StdArc;
+    let lease = StdArc::new(SharedCoSQueueLease::new_v8(CARRY_TEST_RATE, 64 * 1024, 4, 3));
+    for w in 0..4 {
+        lease.rehydrate_worker_active_count(w, 1);
+    }
+    const STEPS: u64 = 400;
+    let total: StdArc<std::sync::atomic::AtomicU64> =
+        StdArc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut handles = Vec::new();
+    for w in 0..4usize {
+        let lease = StdArc::clone(&lease);
+        let total = StdArc::clone(&total);
+        handles.push(std::thread::spawn(move || {
+            for i in 1..=STEPS {
+                // Interleaved per-thread clocks: ~4 acquires per epoch
+                // across the threads, with skew.
+                let now = i * (EPOCH_DURATION_NS / 4) + (w as u64) * 17_000;
+                let g = lease.acquire_v8(w, now, 4_096);
+                total.fetch_add(g, std::sync::atomic::Ordering::Relaxed);
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    // Span ~= STEPS/4 epochs = 100 epochs -> rate budget 250,000 B.
+    // Slack: carry_max (8 epochs = 20,000) + the K-epoch ceiling on
+    // any single rotation (covered by carry_max accounting) + one
+    // epoch of pre-span grant.
+    let span_epochs = STEPS / 4 + 1;
+    let bound = (span_epochs + 8 + 1) * 2_500;
+    let granted = total.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        granted <= bound,
+        "concurrent grants {granted} exceed the hard budget bound {bound}"
+    );
+    assert!(granted > 0, "some grants must land");
+}

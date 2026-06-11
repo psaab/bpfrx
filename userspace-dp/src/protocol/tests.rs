@@ -1290,3 +1290,46 @@ fn process_status_event_stream_fields_wire_keys_1642() {
     assert_eq!(value["event_stream_seq"], 4242u64);
     assert_eq!(value["event_stream_acked"], 4200u64);
 }
+
+// #1863 Step-0: round-trip + omitempty pin for the per-worker v8
+// lease claim-flow vectors. The wire keys feed
+// pkg/dataplane/userspace/protocol.go and the Prometheus counters
+// `xpf_userspace_cos_lease_v8_{requested,granted}_bytes_total` — a
+// rename or skip-semantics change on either side must fail here
+// instead of silently decoding empty.
+#[test]
+fn cos_queue_status_lease_claim_flow_roundtrip_1863() {
+    let status = CoSQueueStatus {
+        lease_v8_worker_requested_bytes: vec![100, 0, 250],
+        lease_v8_worker_granted_bytes: vec![90, 0, 200],
+        ..Default::default()
+    };
+    let value: serde_json::Value =
+        serde_json::to_value(&status).expect("serialize CoSQueueStatus");
+    assert_eq!(
+        value["lease_v8_worker_requested_bytes"],
+        serde_json::json!([100, 0, 250])
+    );
+    assert_eq!(
+        value["lease_v8_worker_granted_bytes"],
+        serde_json::json!([90, 0, 200])
+    );
+    let back: CoSQueueStatus = serde_json::from_value(value).expect("deserialize CoSQueueStatus");
+    assert_eq!(back.lease_v8_worker_requested_bytes, vec![100, 0, 250]);
+    assert_eq!(back.lease_v8_worker_granted_bytes, vec![90, 0, 200]);
+
+    // Legacy/non-v8 rows: empty vectors must be OMITTED from the wire
+    // (byte-identical pre-#1863 encoding) and absent keys must decode
+    // to empty defaults.
+    let default_value = serde_json::to_value(CoSQueueStatus::default())
+        .expect("serialize default CoSQueueStatus");
+    let obj = default_value
+        .as_object()
+        .expect("CoSQueueStatus serializes to an object");
+    assert!(!obj.contains_key("lease_v8_worker_requested_bytes"));
+    assert!(!obj.contains_key("lease_v8_worker_granted_bytes"));
+    let back: CoSQueueStatus =
+        serde_json::from_value(default_value).expect("deserialize legacy CoSQueueStatus");
+    assert!(back.lease_v8_worker_requested_bytes.is_empty());
+    assert!(back.lease_v8_worker_granted_bytes.is_empty());
+}

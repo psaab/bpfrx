@@ -925,7 +925,13 @@ the sweep exit `2`; they do not produce a false-green fairness verdict.
   share-bounded while asking (share/demand mismatch), while a worker
   with near-zero requested despite class backlog never sampled its
   share at all (claim-sampling loss). Empty/absent for legacy
-  (non-v8) leases. Never reset at lease-epoch rotation.
+  (non-v8) leases. Never reset at lease-epoch rotation — but they ARE
+  reset when the lease itself is rebuilt (config commit changing the
+  lease identity, HA transitions): the counters live on the lease
+  Arc, like every other lease-held counter
+  (`equal_flow_cap_hit_events` etc.). Prometheus `rate()`/`increase()`
+  handle the reset; raw before/after delta analyses must not span a
+  lease rebuild.
 - **`xpf_userspace_cos_admission_flow_share_drops_total`** /
   **`..._buffer_drops_total`** / **`..._ecn_marked_total`**
   `{ifindex=..., queue_id=...}` counters (#1863 Step-0): the
