@@ -681,8 +681,11 @@ deploy_vm() {
 			# single-CPU Cpus_allowed_list values (unpinned control
 			# threads report full ranges and are not workers) and
 			# return the complement vs online CPUs.
+			# pidof, not pgrep -x: the process name is 16 chars,
+			# past the 15-char comm truncation pgrep -x matches on.
 			local pid used t v
-			pid=$(pgrep -x xpf-userspace-dp | head -1) || return 1
+			pid=$(pidof -s xpf-userspace-dp 2>/dev/null)
+			[ -n "$pid" ] || return 1
 			used=""
 			for t in /proc/"$pid"/task/*/status; do
 				[ -r "$t" ] || continue
