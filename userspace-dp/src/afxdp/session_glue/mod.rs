@@ -1009,12 +1009,13 @@ pub(super) fn resolve_flow_session_decision(
             metadata,
             origin: hit_origin,
             created: false,
+            install_failed: false,
         });
     }
 
     let forward_match =
         lookup_forward_nat_across_scopes(sessions, shared_nat_sessions, &flow.forward_key)?;
-    let resolved = install_reverse_session_from_forward_match(
+    let (resolved, reverse_installed) = install_reverse_session_from_forward_match(
         sessions,
         session_map_fd,
         shared_sessions,
@@ -1083,7 +1084,15 @@ pub(super) fn resolve_flow_session_decision(
         decision,
         metadata,
         origin: SessionOrigin::ReverseFlow,
-        created: true,
+        // #1861 §5.4 + AGY r1 F1: `created` reports the ACTUAL install
+        // outcome (was unconditionally true — session_creates over-counted
+        // at cap and publish_bpf_conntrack_entry fired for a session that
+        // does not exist locally). `install_failed` keeps the failed-repair
+        // reply out of the flow cache so the repair re-fires per packet
+        // and succeeds on the first packet after the table drops below
+        // max_sessions.
+        created: reverse_installed,
+        install_failed: !reverse_installed,
     })
 }
 
