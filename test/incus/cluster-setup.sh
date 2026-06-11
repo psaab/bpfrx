@@ -30,22 +30,50 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
+# #1875: shared-cluster lock protocol (marker validation + owner
+# reporting). Mutating verbs serialize through with-cluster.sh — see
+# require_cluster_cell below and the protocol header in cluster-lock.sh.
+# shellcheck source=cluster-lock.sh
+source "${SCRIPT_DIR}/cluster-lock.sh"
+
 # Source env file for custom deployments (remote, SR-IOV config, etc.)
 if [[ -n "${BPFRX_CLUSTER_ENV:-}" && -f "$BPFRX_CLUSTER_ENV" ]]; then
 	# shellcheck disable=SC1090
 	source "$BPFRX_CLUSTER_ENV"
 fi
 
-# Re-exec under incus-admin group if needed (preserve BPFRX_CLUSTER_ENV)
+# Re-exec under incus-admin group if needed. Forward ALL BPFRX_*/XPF_*
+# scalar vars, not just BPFRX_CLUSTER_ENV: sg's env preservation is
+# not guaranteed on every platform, and losing XPF_CLUSTER_LOCK_HELD
+# here would deadlock a deploy running inside a with-cluster.sh cell
+# (#1875 plan A3 / SMR r2 S1).
 if ! incus list &>/dev/null 2>&1; then
 	if getent group incus-admin &>/dev/null && id -nG | grep -qw incus-admin; then
 		local_env=""
-		if [[ -n "${BPFRX_CLUSTER_ENV:-}" ]]; then
-			local_env="BPFRX_CLUSTER_ENV=$(printf '%q' "$BPFRX_CLUSTER_ENV") "
-		fi
+		for _v in "${!BPFRX_@}" "${!XPF_@}"; do
+			local_env+="${_v}=$(printf '%q' "${!_v}") "
+		done
 		exec sg incus-admin -c "${local_env}$(printf '%q ' "$0" "$@")"
 	fi
 fi
+
+# #1875: serialize a mutating verb against other agents. Either we are
+# already inside a valid lock cell (marker from a live ancestor holder
+# — return immediately and run lock-free), or we re-exec this whole
+# invocation through with-cluster.sh, which blocks with a named-holder
+# report until the cluster is ours and re-runs us with the marker set.
+# The re-exec'd child runs with the lock fd closed, so killing the
+# verb's process tree releases the lock instantly. ORIG_ARGS preserves
+# the exact argv for the re-exec ("$SCRIPT_DIR/cluster-setup.sh", not
+# "$0", to dodge PATH/symlink oddities — Codex r2).
+ORIG_ARGS=("$@")
+require_cluster_cell() { # require_cluster_cell <purpose words...>
+	if xpf_cluster_lock_held; then
+		return 0
+	fi
+	exec "${SCRIPT_DIR}/with-cluster.sh" "cluster-setup $*" \
+		-- "${SCRIPT_DIR}/cluster-setup.sh" "${ORIG_ARGS[@]}"
+}
 
 # ── Defaults (local cluster values if no env file) ───────────────────
 
@@ -580,24 +608,48 @@ cmd_destroy() {
 cmd_deploy() {
 	local target="${1:-all}"
 
-	if [[ -n "${SRIOV_LAN_PARENT:-}" ]]; then
-		suppress_host_parent_ipv6_ra "$SRIOV_LAN_PARENT"
+	case "$target" in
+		0|1|all) ;;
+		*) die "Usage: $0 deploy [0|1|all]" ;;
+	esac
+
+	# #1875: build OUTSIDE the lock — it is multi-minute and purely
+	# local, and holding the shared-cluster lock across it would
+	# starve other agents for no reason. The locked re-invocation
+	# below skips the rebuild via XPF_CLUSTER_SKIP_BUILD.
+	if [[ -z "${XPF_CLUSTER_SKIP_BUILD:-}" ]]; then
+		info "Building xpfd and cli..."
+		make -C "$PROJECT_ROOT" build build-ctl
+		if [[ -x "$HOME/.cargo/bin/cargo" || -n "$(command -v cargo 2>/dev/null)" ]]; then
+			info "Building xpf-userspace-dp helper..."
+			make -C "$PROJECT_ROOT" build-userspace-dp
+		else
+			warn "Rust toolchain not found; skipping xpf-userspace-dp build"
+		fi
 	fi
 
-	info "Building xpfd and cli..."
-	make -C "$PROJECT_ROOT" build build-ctl
-	if [[ -x "$HOME/.cargo/bin/cargo" || -n "$(command -v cargo 2>/dev/null)" ]]; then
-		info "Building xpf-userspace-dp helper..."
-		make -C "$PROJECT_ROOT" build-userspace-dp
-	else
-		warn "Rust toolchain not found; skipping xpf-userspace-dp build"
+	# #1875: everything past this point mutates shared state —
+	# including the host-parent IPv6-RA suppression (sysctl + addr +
+	# route flush on the shared SR-IOV parent, Codex r2 F1) — and runs
+	# under the cluster lock. Concurrent agents queue here with a
+	# visible named-holder report instead of clobbering each other's
+	# validation runs mid-phase (the #1875 incident).
+	if ! xpf_cluster_lock_held; then
+		_branch=$(git -C "$PROJECT_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')
+		exec "${SCRIPT_DIR}/with-cluster.sh" \
+			"cluster-setup deploy ${target} (${_branch})" \
+			-- env XPF_CLUSTER_SKIP_BUILD=1 \
+			"${SCRIPT_DIR}/cluster-setup.sh" deploy "$target"
+	fi
+
+	if [[ -n "${SRIOV_LAN_PARENT:-}" ]]; then
+		suppress_host_parent_ipv6_ra "$SRIOV_LAN_PARENT"
 	fi
 
 	case "$target" in
 		0)   deploy_vm 0 ;;
 		1)   deploy_vm 1 ;;
 		all) deploy_rolling ;;
-		*)   die "Usage: $0 deploy [0|1|all]" ;;
 	esac
 }
 
@@ -902,17 +954,23 @@ usage() {
 	exit 1
 }
 
+# #1875: mutating verbs serialize via require_cluster_cell (init
+# creates/deletes networks+profiles; create/destroy launch/remove
+# instances; start/stop/restart flip the daemon and VRRP mastership).
+# deploy locks itself inside cmd_deploy (the build stays outside the
+# lock). Read-only verbs (ssh/status/logs/journal) stay lock-free —
+# ssh is interactive and must never hold the cluster lock.
 case "${1:-}" in
-	init)       cmd_init ;;
-	create)     cmd_create ;;
-	destroy)    cmd_destroy ;;
+	init)       require_cluster_cell init; cmd_init ;;
+	create)     require_cluster_cell create; cmd_create ;;
+	destroy)    require_cluster_cell destroy; cmd_destroy ;;
 	deploy)     cmd_deploy "${2:-all}" ;;
 	ssh)        cmd_ssh "${2:-}" ;;
 	status)     cmd_status ;;
 	logs)       cmd_logs "${2:-}" ;;
 	journal)    cmd_journal "${2:-}" ;;
-	start)      cmd_start "${2:-all}" ;;
-	stop)       cmd_stop "${2:-all}" ;;
-	restart)    cmd_restart "${2:-all}" ;;
+	start)      require_cluster_cell start "${2:-all}"; cmd_start "${2:-all}" ;;
+	stop)       require_cluster_cell stop "${2:-all}"; cmd_stop "${2:-all}" ;;
+	restart)    require_cluster_cell restart "${2:-all}"; cmd_restart "${2:-all}" ;;
 	*)          usage ;;
 esac
