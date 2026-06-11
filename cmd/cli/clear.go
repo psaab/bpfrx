@@ -135,8 +135,12 @@ func (c *ctl) handleClearSecurity(args []string) error {
 				req.NatOnly = true
 				continue
 			}
+			// Every remaining filter keyword takes a value. A keyword
+			// without one (or an unknown token) MUST error: silently
+			// dropping it can leave the request empty, and the server
+			// interprets an empty ClearSessionsRequest as clear-all.
 			if i+1 >= len(args) {
-				break
+				return fmt.Errorf("missing value for %q", args[i])
 			}
 			switch args[i] {
 			case "source-prefix":
@@ -153,14 +157,18 @@ func (c *ctl) handleClearSecurity(args []string) error {
 				req.Zone = args[i]
 			case "source-port":
 				i++
-				if v, err := strconv.Atoi(args[i]); err == nil {
-					req.SourcePort = uint32(v)
+				v, err := strconv.Atoi(args[i])
+				if err != nil || v <= 0 || v > 65535 {
+					return fmt.Errorf("invalid source-port %q", args[i])
 				}
+				req.SourcePort = uint32(v)
 			case "destination-port":
 				i++
-				if v, err := strconv.Atoi(args[i]); err == nil {
-					req.DestinationPort = uint32(v)
+				v, err := strconv.Atoi(args[i])
+				if err != nil || v <= 0 || v > 65535 {
+					return fmt.Errorf("invalid destination-port %q", args[i])
 				}
+				req.DestinationPort = uint32(v)
 			case "application":
 				i++
 				req.Application = args[i]
@@ -170,6 +178,8 @@ func (c *ctl) handleClearSecurity(args []string) error {
 			case "source-nat-pool":
 				i++
 				req.SourceNatPool = args[i]
+			default:
+				return fmt.Errorf("unknown session filter %q", args[i])
 			}
 		}
 		resp, err := c.client.ClearSessions(c.ctx(), req)
