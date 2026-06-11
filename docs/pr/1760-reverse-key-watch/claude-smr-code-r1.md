@@ -49,3 +49,26 @@ in this pass).
   the watch trigger remains valid (alias churn requires fabric-redirect
   sessions, which the lab smoke does not exercise at steady state).
   Recorded for the issue.
+
+---
+
+# SMR final addendum (tree @ c8de0cc267a6)
+
+**Verdict: MERGE-READY.**
+
+The displacement predicate went through three Codex-driven refinements
+(r1 alias exclusion → r2 NAT-equality → r3 origin gate → r4 sync-derived
+origin gate). I independently traced all four coverage shapes through the
+final predicate before accepting:
+alias churn (SyncImport) excluded; promote churn (SharedPromote, both
+orders) excluded; DNAT-vs-direct genuine counted; local ext-IP owner
+corner counted. The two accepted residual under-counts (sync-derived
+wire-FORM entries on a standby; pathological ext-IP-sourced local flow vs
+sync-derived wire-form entry) are documented in the helper docs and
+covered by owner-side counting. Behavior neutrality re-verified after
+each round (counter/log/test-only diffs). Gates at head: release build
+clean, full Rust suite 1942/0, Go clean.
+
+Copilot: 4 documented quota-blocked attempts → 3-of-4 fallback
+(Codex task-mq94hky1-wpanh3 MERGE-READY, AGY
+adversarial-review-mq94nusk-ha5g1h MERGE-READY, Claude SMR MERGE-READY).
