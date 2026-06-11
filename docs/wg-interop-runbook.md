@@ -103,7 +103,7 @@ that fw1 has neither a `wg0` netdev nor a `:51820` bind, and fails hard
 | xpf never initiates time-based rekey; on an xpf-initiated session the tunnel recovers via the peer's expiry-driven re-handshake at REJECT_AFTER_TIME (~180 s) with a small bounded gap | REKEY/REJECT timers unimplemented | S5 |
 | brief egress drop right after a peer-initiated rekey | stricter-than-spec unconfirmed-responder TX gate (`engine.rs` try_encap; no `peer.previous` TX fallback) — ms-scale vs kernel wg | file if >1 s measured |
 | keys are hex in xpf config, base64 in `wg` | minimal S2a grammar | S6 (#1434) |
-| no `wg show`-equivalent / WG counters on the xpf side | telemetry not wired into status/Prometheus | S6 follow-up issue |
+| ~~no `wg show`-equivalent / WG counters on the xpf side~~ | RESOLVED by #1865: `show security wireguard [detail]` + `xpf_userspace_wg_*` Prometheus family + `wg_tunnels` status rows | done (#1865) |
 | cookie (type 3) messages dropped | cookie/MAC2 consume unimplemented | S7 |
 | PSK must be absent/zero on the peer | PSK plumbing unimplemented | S4 |
 | WG tunnel removed from config leaks the wgN TUN until `ip link del`/restart | S2a persistent-TUN tradeoff | S6; harness teardown deletes it |
@@ -153,10 +153,24 @@ that fw1 has neither a `wg0` netdev nor a `:51820` bind, and fails hard
 
 ## Failure triage
 
+0. **Start with the local counters (#1865)** — `show security
+   wireguard detail` on fw0 (or the `xpf_userspace_wg_*` Prometheus
+   family) is now the PRIMARY oracle; the peer-side `wg show` and
+   tcpdump steps below are cross-checks, not first resort:
+   - initiations created ↑ + `handshake-send` I/O errors ↑ +
+     completions flat = the silent-send class (the #1736 EINVAL bug).
+   - `mac1-mismatch` ↑ = key mismatch (wrong/garbled peer key).
+   - handshakes complete but transmit drops `mtu-exceeded` ↑ = the
+     pad-aware MTU guard (the #1736 v4-mapped blackhole class).
+   - transmit drops `unconfirmed-session` ↑ = transient responder
+     key-confirmation window (expected blip at rekey, not a fault).
+   - receive drops `allowed-ips-violation` ↑ = inner-source gate
+     (triage step 3).
 1. P1 no handshake: tcpdump UDP 51820 on the peer — msg1 arriving?
    If NOTHING leaves fw0, strace the `xpf-wg-control-` thread for
    `sendto` errors (the dual-stack v4-mapped send bug fixed in this PR
-   showed exactly one silent EINVAL per initiator tick).
+   showed exactly one silent EINVAL per initiator tick — now also
+   visible without strace as `hs_send_errors` per triage step 0).
    xpf side: `journalctl -u xpfd | grep -i wg`, check the wg0 TUN exists
    and `:51820` is bound on fw0; check the peer's `wg show wgref` for
    key mismatch (hex↔base64 conversion).

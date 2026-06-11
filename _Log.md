@@ -5161,3 +5161,7 @@ top.
 - **Timestamp**: 2026-06-11
   **Action**: #1865 engineer — commit 5: show security wireguard [detail] (cmdtree node, shared FormatWireguardStatus formatter, local CLI + gRPC + remote CLI wiring, tests)
   **File(s)**: pkg/cmdtree/tree.go, pkg/dataplane/userspace/{wgfmt.go,wgfmt_test.go}, pkg/cli/{cli_show_security_dispatch.go,cli_show_security_wireguard.go}, pkg/grpcapi/{server_show.go,server_show_security_text.go,server_show_security_wireguard_test.go}, cmd/cli/show.go
+
+- **Timestamp**: 2026-06-11
+  **Action**: #1865 engineer — commit 6: docs — runbook triage step 0 (local counters as primary oracle), resolved-limitation row, interop assert note
+  **File(s)**: docs/wg-interop-runbook.md, docs/wireguard-interop.md
