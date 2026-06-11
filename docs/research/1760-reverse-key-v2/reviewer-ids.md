@@ -15,3 +15,9 @@
 - Codex: `task-mq923td0-p9fu4m` (PLAN-NEEDS-MINOR — single scoped-wording finding) — codex-plan-r3.md
 - AGY: `adversarial-review-mq923k3r-44j692` (PLAN-READY) — agy-plan-r3.md
 - Claude SMR: claude-smr-plan-r3.md
+- Codex v4 confirmation: `task-mq92cre3-67e0k5` (PLAN-READY)
+
+## Convergence
+PLAN-READY @ 97612480ee22 — Codex PLAN-READY, AGY PLAN-READY, Claude SMR
+PLAN-READY. Recommendation: W-lite (W1+W2+W3'+W4) conditional on
+deployment posture; stage-2 structural fix stays shelved.
