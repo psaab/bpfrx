@@ -673,6 +673,14 @@ fn overlay_shared_cos_queue_lease_statuses(
             let Some(lease) = queue_leases.get(&(iface.ifindex, queue.queue_id)) else {
                 continue;
             };
+            // #1863 Step-0: per-worker claim-flow counters for every v8
+            // lease — BEFORE the equal-flow gate below (these are not
+            // equal-flow state; they attribute the honored-realization
+            // gap per docs/research/1863-realization-gap/plan.md §5).
+            if let Some((requested, granted)) = lease.v8_worker_claim_flow() {
+                queue.lease_v8_worker_requested_bytes = requested;
+                queue.lease_v8_worker_granted_bytes = granted;
+            }
             if !lease.v8_equal_flow_active() {
                 continue;
             }
@@ -719,6 +727,33 @@ mod tests {
         let queue = &statuses[0].queues[0];
         assert!(!queue.equal_flow_enforcement);
         assert!(queue.equal_flow_fail_open_reason.is_empty());
+    }
+
+    #[test]
+    fn claim_flow_overlay_populates_every_v8_lease() {
+        // #1863 Step-0: the per-worker claim-flow vectors are populated
+        // for ANY v8 lease — including non-equal-flow ones the
+        // equal-flow gate below skips.
+        let mut statuses = vec![CoSInterfaceStatus {
+            ifindex: 80,
+            queues: vec![CoSQueueStatus {
+                queue_id: 4,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        let lease = Arc::new(SharedCoSQueueLease::new_v8(50_000_000, 256 * 1024, 8, 1));
+        lease.rehydrate_worker_active_count(0, 1);
+        let granted = lease.acquire_v8(0, 200_000, 512);
+        assert!(granted > 0, "test premise: the ask grants");
+        let leases = BTreeMap::from([((80, 4), lease)]);
+
+        overlay_shared_cos_queue_lease_statuses(&mut statuses, &leases);
+
+        let queue = &statuses[0].queues[0];
+        assert_eq!(queue.lease_v8_worker_requested_bytes, vec![512, 0]);
+        assert_eq!(queue.lease_v8_worker_granted_bytes[0], granted);
+        assert!(!queue.equal_flow_enforcement, "equal-flow gate untouched");
     }
 
     #[test]

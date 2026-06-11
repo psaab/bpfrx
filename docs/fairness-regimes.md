@@ -915,6 +915,24 @@ the sweep exit `2`; they do not produce a false-green fairness verdict.
   attribution (legacy lease, no lease, fully-granted acquire below the
   head watermark) are deliberately not counted. All six cause series
   emit per worker so first occurrences have a zero baseline.
+- **`xpf_userspace_cos_lease_v8_requested_bytes_total{ifindex=..., queue_id=..., worker_id=...}`**
+  / **`..._granted_bytes_total`** counters (#1863 Step-0): cumulative
+  bytes each worker ASKED of (every `acquire_v8` call with
+  `requested > 0`, granted or not) and was GRANTED by a CoS queue's
+  shared v8 lease. The pair is the honored-realization-gap attribution
+  instrument (docs/research/1863-realization-gap/plan.md section 5): on
+  an undergranting class, a worker with requested >> granted was
+  share-bounded while asking (share/demand mismatch), while a worker
+  with near-zero requested despite class backlog never sampled its
+  share at all (claim-sampling loss). Empty/absent for legacy
+  (non-v8) leases. Never reset at lease-epoch rotation.
+- **`xpf_userspace_cos_admission_flow_share_drops_total`** /
+  **`..._buffer_drops_total`** / **`..._ecn_marked_total`**
+  `{ifindex=..., queue_id=...}` counters (#1863 Step-0): the
+  pre-existing per-queue admission-path counters (#710/#718, wire +
+  CLI only until now) surfaced to Prometheus so shaped-pipeline drop
+  sites are attributable in measurement cells (the #1863 udp3g
+  drop-site question).
 - **`xpf_userspace_binding_tx_completions_total{binding_slot=..., queue_id=..., worker_id=..., iface=...}`**
   counter: cumulative AF_XDP TX completions reaped by each binding's
   owner worker. Use `rate()` during fairness runs to detect per-RX-queue

@@ -121,6 +121,16 @@ type xpfCollector struct {
 	cosWaterfillEpochs             *prometheus.Desc
 	cosWaterfillPhase1BudgetBreaks *prometheus.Desc
 	cosWaterfillMinEpochsPerWorker *prometheus.Desc
+	// #1863 Step-0: per-(queue, worker) v8 lease claim-flow counters
+	// (requested vs granted bytes) + per-queue admission-path drop
+	// counters. The claim-flow pair attributes the honored-realization
+	// gap between share/demand mismatch and claim-sampling loss per the
+	// registered decision rule (docs/research/1863-realization-gap).
+	cosLeaseV8RequestedBytes   *prometheus.Desc
+	cosLeaseV8GrantedBytes     *prometheus.Desc
+	cosAdmissionFlowShareDrops *prometheus.Desc
+	cosAdmissionBufferDrops    *prometheus.Desc
+	cosAdmissionEcnMarked      *prometheus.Desc
 	// #1304: Rust-owned opt-in equal-flow enforcement telemetry for
 	// shared v8 CoS queue leases. Kept separate from the
 	// measurement-only xpf_fairness_equal_flow_* estimator gauges.
@@ -369,6 +379,11 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.cosWaterfillEpochs
 	ch <- c.cosWaterfillPhase1BudgetBreaks
 	ch <- c.cosWaterfillMinEpochsPerWorker
+	ch <- c.cosLeaseV8RequestedBytes
+	ch <- c.cosLeaseV8GrantedBytes
+	ch <- c.cosAdmissionFlowShareDrops
+	ch <- c.cosAdmissionBufferDrops
+	ch <- c.cosAdmissionEcnMarked
 	ch <- c.cosEqualFlowEnforcementEnabled
 	ch <- c.cosEqualFlowTargetPolicy
 	ch <- c.cosEqualFlowEnforced

@@ -1863,3 +1863,58 @@ fn v8_carry_field_is_reader_private() {
         offenders
     );
 }
+
+// #1863 Step-0: per-worker cumulative claim-flow counters
+// (requested/granted). The attribution contract: requested counts
+// EVERY ask with requested > 0 (granted or not); granted counts the
+// call's total_granted; neither resets at rotation; legacy leases
+// report None.
+
+#[test]
+fn v8_claim_flow_counts_requested_and_granted() {
+    let lease = SharedCoSQueueLease::new_v8(12_500_000, 64 * 1024, 1, 1);
+    lease.rehydrate_worker_active_count(0, 1);
+    let (granted, _) = lease.acquire_v8_with_cause(0, EPOCH_DURATION_NS, 100);
+    assert_eq!(granted, 100);
+    let (requested, granted_flow) = lease
+        .v8_worker_claim_flow()
+        .expect("v8 lease must report claim flow");
+    assert_eq!(requested.len(), 2, "len = max_worker_id + 1");
+    assert_eq!(requested[0], 100, "worker 0 asked 100 bytes");
+    assert_eq!(granted_flow[0], 100, "worker 0 was granted 100 bytes");
+    assert_eq!(requested[1], 0, "worker 1 never asked");
+    assert_eq!(granted_flow[1], 0);
+}
+
+#[test]
+fn v8_claim_flow_counts_denied_asks() {
+    // No rehydration → zero active flows → my_fair_share 0 → 0 grant,
+    // but the ASK must still be counted (the sampling-loss
+    // discriminator needs "did this worker ask at all").
+    let lease = SharedCoSQueueLease::new_v8(10_000_000, 64 * 1024, 2, 1);
+    let granted = lease.acquire_v8(0, 1_000_000, 4_096);
+    assert_eq!(granted, 0);
+    let (requested, granted_flow) = lease.v8_worker_claim_flow().expect("v8 lease");
+    assert_eq!(requested[0], 4_096, "denied ask still counted");
+    assert_eq!(granted_flow[0], 0, "nothing granted");
+}
+
+#[test]
+fn v8_claim_flow_accumulates_across_rotations() {
+    let lease = SharedCoSQueueLease::new_v8(12_500_000, 64 * 1024, 1, 0);
+    lease.rehydrate_worker_active_count(0, 1);
+    let (g1, _) = lease.acquire_v8_with_cause(0, EPOCH_DURATION_NS, 100);
+    // Second acquire two epochs later forces a rotation in between;
+    // the cumulative counters must NOT reset.
+    let (g2, _) = lease.acquire_v8_with_cause(0, 3 * EPOCH_DURATION_NS, 100);
+    assert_eq!((g1, g2), (100, 100));
+    let (requested, granted_flow) = lease.v8_worker_claim_flow().expect("v8 lease");
+    assert_eq!(requested[0], 200, "asks accumulate across rotations");
+    assert_eq!(granted_flow[0], 200, "grants accumulate across rotations");
+}
+
+#[test]
+fn legacy_lease_reports_no_claim_flow() {
+    let lease = SharedCoSQueueLease::new(10_000_000, 64 * 1024, 2);
+    assert!(lease.v8_worker_claim_flow().is_none());
+}

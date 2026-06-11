@@ -305,6 +305,26 @@ pub(crate) struct CoSQueueStatus {
         skip_serializing_if = "String::is_empty"
     )]
     pub equal_flow_target_policy: String,
+    /// #1863 Step-0: per-worker cumulative v8 queue-lease claim flow
+    /// for this queue's shared lease — requested bytes (every
+    /// `acquire_v8` ask, granted or not) and granted bytes, indexed by
+    /// worker id. Populated by the coordinator status overlay from the
+    /// lease registry; empty for legacy/non-v8 leases so the wire is
+    /// byte-identical pre-#1863 for them. The Go mirror is
+    /// `pkg/dataplane/userspace/protocol.go` (tags must match
+    /// byte-for-byte).
+    #[serde(
+        rename = "lease_v8_worker_requested_bytes",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub lease_v8_worker_requested_bytes: Vec<u64>,
+    #[serde(
+        rename = "lease_v8_worker_granted_bytes",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub lease_v8_worker_granted_bytes: Vec<u64>,
     // #709 / #751: owner-profile telemetry for exact queues with an
     // unambiguous single owner-local binding snapshot. These fields are
     // populated only when exactly one owner-local exact queue can

@@ -29,6 +29,7 @@ func (c *xpfCollector) collectUserspaceStatus(ch chan<- prometheus.Metric, dp ap
 	c.emitCoSOwnerProfile(ch, status)
 	c.emitCoSDrainPhaseTelemetry(ch, status)
 	c.emitCoSWaterfillTelemetry(ch, status)
+	c.emitCoSLeaseClaimFlow(ch, status)
 	c.emitCoSEqualFlowEnforcement(ch, status)
 	c.emitCoSSojourn(ch, status)
 	c.emitCoSFlowFairOccupancy(ch, status)
@@ -1186,6 +1187,56 @@ func (c *xpfCollector) emitCoSWaterfillTelemetry(ch chan<- prometheus.Metric, st
 				c.cosWaterfillEligibleVisits,
 				prometheus.CounterValue,
 				float64(queue.WaterfillEligibleVisits),
+				ifindexLabel, queueLabel,
+			)
+		}
+	}
+}
+
+// #1863 Step-0: per-(queue, worker) v8 lease claim-flow counters +
+// per-queue admission-path counters. The claim-flow pair is emitted
+// only for queues whose status row carries the per-worker vectors
+// (v8 leases; legacy/non-v8 rows have empty slices), so cardinality is
+// bounded by exact-queue count x worker count. Admission counters are
+// emitted per queue row unconditionally (they already exist on the
+// wire; this surfaces them to Prometheus for drop-site attribution).
+func (c *xpfCollector) emitCoSLeaseClaimFlow(ch chan<- prometheus.Metric, status dpuserspace.ProcessStatus) {
+	for _, iface := range status.CoSInterfaces {
+		ifindexLabel := strconv.Itoa(iface.Ifindex)
+		for _, queue := range iface.Queues {
+			queueLabel := strconv.Itoa(queue.QueueID)
+			for workerID, requested := range queue.LeaseV8WorkerRequestedBytes {
+				ch <- prometheus.MustNewConstMetric(
+					c.cosLeaseV8RequestedBytes,
+					prometheus.CounterValue,
+					float64(requested),
+					ifindexLabel, queueLabel, strconv.Itoa(workerID),
+				)
+			}
+			for workerID, granted := range queue.LeaseV8WorkerGrantedBytes {
+				ch <- prometheus.MustNewConstMetric(
+					c.cosLeaseV8GrantedBytes,
+					prometheus.CounterValue,
+					float64(granted),
+					ifindexLabel, queueLabel, strconv.Itoa(workerID),
+				)
+			}
+			ch <- prometheus.MustNewConstMetric(
+				c.cosAdmissionFlowShareDrops,
+				prometheus.CounterValue,
+				float64(queue.AdmissionFlowShareDrops),
+				ifindexLabel, queueLabel,
+			)
+			ch <- prometheus.MustNewConstMetric(
+				c.cosAdmissionBufferDrops,
+				prometheus.CounterValue,
+				float64(queue.AdmissionBufferDrops),
+				ifindexLabel, queueLabel,
+			)
+			ch <- prometheus.MustNewConstMetric(
+				c.cosAdmissionEcnMarked,
+				prometheus.CounterValue,
+				float64(queue.AdmissionEcnMarked),
 				ifindexLabel, queueLabel,
 			)
 		}

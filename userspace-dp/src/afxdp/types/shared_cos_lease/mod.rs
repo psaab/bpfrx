@@ -446,6 +446,21 @@ struct V8State {
     /// (only worker `id` writes its slot); rotation winner is the sole
     /// swapper.
     worker_equal_flow_active_samples: Box<[PackedEpochGrant]>,
+    /// #1863 Step-0: per-worker CUMULATIVE acquire-flow counters —
+    /// requested bytes (every `acquire_v8` call with `requested > 0`,
+    /// counted whether or not the call grants) and granted bytes
+    /// (`total_granted` at call exit). Unlike the per-epoch arrays
+    /// above these are NEVER reset at rotation: they are monotonic
+    /// counters whose deltas attribute the honored-realization gap
+    /// between share/demand mismatch (workers asking beyond their
+    /// share) and claim-sampling loss (workers not asking at all) —
+    /// the registered Path-A Step-0 decision rule in
+    /// `docs/research/1863-realization-gap/plan.md` §5. Single
+    /// relaxed fetch_add per acquire on the caller's own slot
+    /// (same single-writer-per-slot contention profile as
+    /// `worker_grants`). Length = max_worker_id + 1.
+    worker_requested_bytes: Box<[AtomicU64]>,
+    worker_granted_bytes: Box<[AtomicU64]>,
     equal_flow: V8EqualFlowSuppressState,
     /// #1830 (e): pre-allocated rotation scratch, sized to
     /// `max_worker_id + 1` at lease construction. Replaces the former
@@ -1199,6 +1214,15 @@ impl SharedCoSQueueLease {
             .map(|_| PackedEpochGrant::new())
             .collect::<Vec<_>>()
             .into_boxed_slice();
+        // #1863 Step-0: cumulative per-worker requested/granted flow.
+        let worker_requested_bytes = (0..len)
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let worker_granted_bytes = (0..len)
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Self {
             config,
             state: SharedCoSLeaseState {
@@ -1215,6 +1239,8 @@ impl SharedCoSQueueLease {
                 worker_starvation_events,
                 worker_demand_events,
                 worker_equal_flow_active_samples,
+                worker_requested_bytes,
+                worker_granted_bytes,
                 equal_flow: V8EqualFlowSuppressState::new(),
                 rotation_scratch: Mutex::new(V8RotationScratch::new(len)),
             }),
@@ -1323,6 +1349,12 @@ impl SharedCoSQueueLease {
             );
             return (0, AcquireV8ShortfallCause::None);
         }
+        // #1863 Step-0: count the ask unconditionally (even calls that
+        // end 0-granted on SeqlockGiveUp / CapZero / rotation) — the
+        // attribution math needs "did this worker ask at all" as the
+        // sampling-loss discriminator. Own-slot relaxed add; no
+        // cross-worker contention.
+        v8.worker_requested_bytes[worker_id].fetch_add(requested, Ordering::Relaxed);
 
         // Phase 1: maybe rotate.
         self.maybe_rotate_epoch_v8(now_ns);
@@ -1553,6 +1585,12 @@ impl SharedCoSQueueLease {
             }
         }
 
+        // #1863 Step-0: count the grant side of the ask. Paired with
+        // the `worker_requested_bytes` bump at entry.
+        if total_granted > 0 {
+            v8.worker_granted_bytes[worker_id].fetch_add(total_granted, Ordering::Relaxed);
+        }
+
         // #1782 Step-1: report the last limiting bound only when the
         // call actually ended short. A fully-granted call may have
         // touched a break site on an earlier loop iteration via the
@@ -1562,6 +1600,25 @@ impl SharedCoSQueueLease {
         } else {
             (total_granted, shortfall)
         }
+    }
+
+    /// #1863 Step-0: per-worker cumulative (requested, granted) byte
+    /// counters for this lease, or `None` on a legacy (non-v8) lease.
+    /// Read by the coordinator status overlay — relaxed loads; the
+    /// counters are monotonic and independently meaningful per slot.
+    pub(in crate::afxdp) fn v8_worker_claim_flow(&self) -> Option<(Vec<u64>, Vec<u64>)> {
+        let v8 = self.v8.as_ref()?;
+        let requested = v8
+            .worker_requested_bytes
+            .iter()
+            .map(|a| a.load(Ordering::Relaxed))
+            .collect();
+        let granted = v8
+            .worker_granted_bytes
+            .iter()
+            .map(|a| a.load(Ordering::Relaxed))
+            .collect();
+        Some((requested, granted))
     }
 
     /// #1229 Phase 6 v8: returns the per-worker active-flow-bucket

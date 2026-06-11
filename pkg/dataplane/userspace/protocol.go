@@ -887,6 +887,13 @@ type CoSQueueStatus struct {
 	// ("slowest" | "mean" | "ideal-share"); populated only for
 	// equal-flow leases, empty otherwise.
 	EqualFlowTargetPolicy string `json:"equal_flow_target_policy,omitempty"`
+	// #1863 Step-0: per-worker cumulative v8 queue-lease claim flow —
+	// requested bytes (every acquire_v8 ask, granted or not) and
+	// granted bytes, indexed by worker id. Empty for legacy/non-v8
+	// leases. JSON tags MUST match the Rust serde rename(...) in
+	// protocol/cos.rs byte-for-byte.
+	LeaseV8WorkerRequestedBytes []uint64 `json:"lease_v8_worker_requested_bytes,omitempty"`
+	LeaseV8WorkerGrantedBytes   []uint64 `json:"lease_v8_worker_granted_bytes,omitempty"`
 	// #709 / #751: owner-profile telemetry. Populated only when an
 	// exact queue can inherit a binding-scoped owner profile
 	// unambiguously; zero for shared_exact, non-exact, and ambiguous
