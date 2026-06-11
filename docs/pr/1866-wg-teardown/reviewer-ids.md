@@ -24,3 +24,14 @@
 - Codex: session 019eb666-4821-7522-9ebe-b10515bf063c — PLAN-READY
 - AGY: adversarial-review-mq9eknq4-fyl6au — PLAN-READY
 - Claude SMR: docs/research/1866-wg-teardown/claude-smr-plan-r5.md — PLAN-READY
+
+## PR #1872 code review rounds
+### Round 1 (target: 5f3a63d5bac6)
+- Codex: session 019eb697-ca51-7cc1-a515-20f238f1c3f0 — NEEDS-CHANGES (F1 disarmed same-plan spawn gate; F2 empty-linux_name coherence — uncommitted-fix catch)
+- AGY: adversarial-review-mq9frcd8-4hhmq5 — MERGE-READY (6 findings, F1 = same uncommitted-fix catch)
+- Claude SMR: docs/pr/1866-wg-teardown/claude-smr-code-r1.md — MERGE-READY (traces; missed the head/worktree divergence — caught by Codex+AGY)
+- Copilot: attempt 1 quota-limited (documented); retry 2 posted
+### Round 2 (target: 9f36e88b86b4)
+- Codex: dispatched (codex-1872-r2)
+- AGY: adversarial-review-mq9h0jfr-m01dbb
+- Claude SMR: docs/pr/1866-wg-teardown/claude-smr-code-r2.md — MERGE-READY
