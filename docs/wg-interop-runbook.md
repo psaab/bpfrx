@@ -45,9 +45,18 @@ WG outer transport: UDP 51820 over the VLAN-3667 LAN. Inner subnets:
 ```
 
 Evidence lands in `/tmp/wg-interop-<timestamp>/` (override with
-`WG_EVIDENCE_DIR`). Every cluster command runs under
+`WG_EVIDENCE_DIR`). Standalone, every cluster command runs under
 `flock /tmp/xpf-cluster.lock sg incus-admin`; long traffic runs detached
-inside the instances so the lock is never held across a phase.
+inside the instances so the lock is never held across a phase. Inside a
+`test/incus/with-cluster.sh` lock cell (#1875) the per-command flock is
+skipped — the cell already owns the cluster for the whole run. Do NOT
+wrap this script in a raw outer `flock /tmp/xpf-cluster.lock` — that
+deadlocks; use `with-cluster.sh`:
+
+```
+./test/incus/with-cluster.sh "1736 wg-interop" -- \
+    env WG_PEER_TYPE=container ./test/incus/wg-interop.sh all
+```
 
 Phase order is `P0 P1 P2 P4a P3 P4b P5 P6 P7` (P4a needs the
 xpf-initiated session from P1; P4b needs the kernel-initiated session
