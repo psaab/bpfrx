@@ -447,6 +447,31 @@ On timer-wheel advance:
 The important point is that the wheel schedules **reservation retries**, not
 packet transmit timestamps.
 
+Wheel advance is one 50 µs tick per loop iteration. After a long
+per-worker idle period the first shaped drain would otherwise replay
+the entire idle lag tick-by-tick — the #1782 cold-start stall (one
+cold connect after ~111 s of idle was measured replaying 2,226,212
+ticks in a single `advance_cos_timer_wheel` call). Since #1782 Step-2,
+a catch-up lag that exceeds the full wheel horizon
+(`COS_TIMER_WHEEL_L0_SLOTS * COS_TIMER_WHEEL_L1_SLOTS` = 65,536 ticks,
+~3.28 s) snaps the wheel in O(slots): if no queue is parked, every
+wheel entry is stale (entries are filtered lazily by the
+`parked`/`wheel_level`/`wheel_slot` checks), so clearing all slot
+vectors and setting `current_tick = now_tick` is exactly the per-tick
+loop's end state. If any queue IS parked the snap is refused and the
+per-tick loop runs unchanged. That fallback is NOT statically bounded:
+park wake ticks come from an uncapped `deficit/rate` refill time, and
+pathologically low configured rates (the schema accepts 1 B/s) can
+park a queue tens of minutes out — a worker idling in that state
+still pays the O(lag) loop on its next drain. This residual is
+accepted deliberately: covering it needs absolute wake-tick re-arming
+(plan option (b)), and the proven production cold-start mechanism — a
+fully idle worker — has no backlog, hence no parked queue, and always
+takes the O(slots) snap. In-horizon lag always takes the per-tick
+loop unchanged. The `cos_wheel_ticks_advanced_total/_max` worker counters
+(#1847) keep reporting the true lag on the snap path, so the
+cold-start signal remains visible; only its O(lag) wall cost is gone.
+
 Re-arm on dequeue must stay O(1). Each reservation runtime record stores its
 current wheel location, and each wheel slot holds a linked list of parked
 reservations. Re-arming a reservation is therefore an unlink from the old slot

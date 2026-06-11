@@ -108,8 +108,13 @@ pub(crate) struct WorkerRuntimeCounters {
     /// worker's bindings, and the largest single-call advance ever
     /// observed (a monotonic high-water mark, not a windowed max).
     /// One cold drain catching up a multi-minute idle lag shows up as
-    /// a single multi-million-tick `max` sample, which pins the §4(i)
-    /// O(lag) catch-up mechanism conclusively.
+    /// a single multi-million-tick `max` sample, which pinned the
+    /// §4(i) O(lag) catch-up mechanism conclusively (2,226,212 ticks
+    /// in one call). #1782 Step-2: over-horizon advances are now
+    /// snapped in O(slots) (`snap_cos_timer_wheel_over_horizon`), but
+    /// both counters keep recording the TRUE lag (`now_tick -
+    /// current_tick` at entry) on the snap path — a large `max` no
+    /// longer implies an O(lag) wall cost.
     pub cos_wheel_ticks_advanced_total: u64,
     pub cos_wheel_ticks_advanced_max: u64,
     /// #1782 Step-1 (§5.2 mechanism (ii)): per-cause v8 queue-lease

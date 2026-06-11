@@ -661,6 +661,134 @@ fn advance_cos_timer_wheel_returns_ticks_advanced() {
     );
 }
 
+// #1782 Step-2 (i) test 1: lag exactly EQUAL to the wheel horizon
+// with a parked queue takes the existing per-tick loop and wakes the
+// due park exactly as before. NOTE (Codex r1 Low): because this test
+// parks a queue, it exercises the parked-refusal path, NOT the `>`
+// vs `>=` gate boundary — with no parked queue, snap and loop are
+// state-indistinguishable at exactly-horizon lag (both empty every
+// slot and land on the same tick; AGY r1 confirmed `>=` would also
+// be correct), so the strict gate is a conservative choice that has
+// no observable pin.
+#[test]
+fn timer_wheel_at_horizon_lag_takes_per_tick_loop_and_wakes_due_park() {
+    let mut root = test_cos_interface_runtime(0);
+    root.queues[0].hot.items.push_back(test_cos_item(1500));
+    root.queues[0].hot.queued_bytes = 1500;
+    root.queues[0].hot.runnable = true;
+    root.nonempty_queues = 1;
+    root.runnable_queues = 1;
+    park_cos_queue(&mut root, 0, 5);
+
+    let lag_ticks = COS_TIMER_WHEEL_TOTAL_HORIZON_TICKS;
+    assert_eq!(
+        advance_cos_timer_wheel(&mut root, lag_ticks * COS_TIMER_WHEEL_TICK_NS),
+        lag_ticks,
+        "in-horizon tick accounting unchanged"
+    );
+    assert_eq!(root.timer_wheel.current_tick, lag_ticks);
+    assert!(!root.queues[0].hot.parked);
+    assert!(root.queues[0].hot.runnable);
+    assert_eq!(root.runnable_queues, 1);
+    assert!(root.timer_wheel.level0.iter().all(|slot| slot.is_empty()));
+    assert!(root.timer_wheel.level1.iter().all(|slot| slot.is_empty()));
+}
+
+// #1782 Step-2 (i) test 2: an over-horizon catch-up with NO parked
+// queue snaps O(slots) instead of replaying one loop iteration per
+// 50 µs tick of idle lag. End state must be exactly the per-tick
+// loop's: every slot vector empty (including STALE entries — the
+// plan's Codex F1/AGY F1 hazard: park then wake leaves the index in
+// the slot vector), `current_tick == now_tick`, queue state
+// untouched, and the return value reporting the TRUE lag so the
+// Step-1 `cos_wheel_ticks_advanced_total/_max` counters keep the
+// cold-start signal visible.
+#[test]
+fn timer_wheel_over_horizon_snap_clears_stale_entries_and_reports_true_lag() {
+    let mut root = test_cos_interface_runtime(0);
+    root.queues[0].hot.items.push_back(test_cos_item(1500));
+    root.queues[0].hot.queued_bytes = 1500;
+    root.nonempty_queues = 1;
+
+    // Leave one STALE entry at each wheel level: park (pushes the
+    // index into the slot vector), then wake directly (clears the
+    // queue flags but never the slot vectors).
+    park_cos_queue(&mut root, 0, 5); // level 0, slot 5
+    mark_cos_queue_runnable(&mut root.queues[0]);
+    park_cos_queue(&mut root, 0, COS_TIMER_WHEEL_L0_SLOTS as u64 + 10); // level 1
+    mark_cos_queue_runnable(&mut root.queues[0]);
+    root.runnable_queues = 1;
+    assert!(root.timer_wheel.level0.iter().any(|slot| !slot.is_empty()));
+    assert!(root.timer_wheel.level1.iter().any(|slot| !slot.is_empty()));
+
+    // The Step-1 evidence regime: ~111 s of 50 µs-tick lag replayed in
+    // ONE advance call (2,226,212 ticks observed on worker 1).
+    let lag_ticks = 2_226_212u64;
+    assert!(lag_ticks > COS_TIMER_WHEEL_TOTAL_HORIZON_TICKS);
+    assert_eq!(
+        advance_cos_timer_wheel(&mut root, lag_ticks * COS_TIMER_WHEEL_TICK_NS),
+        lag_ticks,
+        "snap must report the TRUE lag, not zero the Step-1 signal"
+    );
+    assert_eq!(root.timer_wheel.current_tick, lag_ticks);
+    assert!(root.timer_wheel.level0.iter().all(|slot| slot.is_empty()));
+    assert!(root.timer_wheel.level1.iter().all(|slot| slot.is_empty()));
+    // The snap touches no queue state.
+    assert!(root.queues[0].hot.runnable);
+    assert!(!root.queues[0].hot.parked);
+    assert_eq!(root.runnable_queues, 1);
+    // Re-advance to the same instant stays a 0-tick no-op.
+    assert_eq!(
+        advance_cos_timer_wheel(&mut root, lag_ticks * COS_TIMER_WHEEL_TICK_NS),
+        0
+    );
+
+    // The wheel stays consistent AFTER a snap: a fresh park against
+    // the new current_tick wakes at its due tick, not early/late.
+    park_cos_queue(&mut root, 0, lag_ticks + 5);
+    assert!(root.queues[0].hot.parked);
+    advance_cos_timer_wheel(&mut root, (lag_ticks + 4) * COS_TIMER_WHEEL_TICK_NS);
+    assert!(root.queues[0].hot.parked, "must not fire early after snap");
+    advance_cos_timer_wheel(&mut root, (lag_ticks + 5) * COS_TIMER_WHEEL_TICK_NS);
+    assert!(!root.queues[0].hot.parked);
+    assert!(root.queues[0].hot.runnable);
+    assert_eq!(root.runnable_queues, 1);
+}
+
+// #1782 Step-2 (i) test 3: a parked queue + over-horizon lag refuses
+// the snap and falls back to the existing O(lag) loop, which wakes
+// the due park correctly. This state is LEGITIMATE in production
+// (Codex PR #1854 r1): park wake ticks are uncapped `deficit/rate`
+// refill times, so pathologically low configured rates (the schema
+// accepts 1 B/s) can park a queue far beyond the wheel horizon while
+// the worker idles — the accepted residual documented at
+// `snap_cos_timer_wheel_over_horizon`. This test pins that the
+// fallback stays correct when it arises.
+#[test]
+fn timer_wheel_over_horizon_parked_queue_falls_back_to_per_tick_loop() {
+    let mut root = test_cos_interface_runtime(0);
+    root.queues[0].hot.items.push_back(test_cos_item(1500));
+    root.queues[0].hot.queued_bytes = 1500;
+    root.queues[0].hot.runnable = true;
+    root.nonempty_queues = 1;
+    root.runnable_queues = 1;
+    park_cos_queue(&mut root, 0, 5);
+
+    let lag_ticks = COS_TIMER_WHEEL_TOTAL_HORIZON_TICKS + 1_000;
+    assert_eq!(
+        advance_cos_timer_wheel(&mut root, lag_ticks * COS_TIMER_WHEEL_TICK_NS),
+        lag_ticks,
+        "fallback path tick accounting unchanged"
+    );
+    assert_eq!(root.timer_wheel.current_tick, lag_ticks);
+    // The due park was woken by the loop, not dropped by a snap.
+    assert!(!root.queues[0].hot.parked);
+    assert!(root.queues[0].hot.runnable);
+    assert_eq!(root.runnable_queues, 1);
+    assert!(root.timer_wheel.level0.iter().all(|slot| slot.is_empty()));
+    assert!(root.timer_wheel.level1.iter().all(|slot| slot.is_empty()));
+}
+
 #[test]
 fn timer_wheel_cascades_long_parked_queue() {
     let mut root = test_cos_interface_runtime(0);
