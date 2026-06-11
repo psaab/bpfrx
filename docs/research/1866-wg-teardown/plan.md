@@ -2,18 +2,30 @@
 
 ## 1. Status
 
-DRAFT v3 — round-2 findings folded. Round-2 verdicts on v2: Codex
-(task-mq9d5sfx via session 019eb646-e229-7b81-956e-d10d9436d2e5)
-PLAN-NEEDS-CHANGES; Claude SMR r2 PLAN-NEEDS-CHANGES; AGY
-(adversarial-review-mq9d6wn8-lc0otc) PLAN-READY. Codex and Claude SMR
-INDEPENDENTLY converged on the same Major: v2's periodic sweep could
-respawn the thread Change 2b had just pruned (stale `self.forwarding`
-desired set during a defer window). v3 fix: **the periodic sweep is
-tombstone-only** — it never creates entries for ids absent from the map;
-entry creation happens exclusively at apply-time where forwarding and
-snapshot are coherent. Plus Codex's tombstone-struct precision
-(engine_ptr outside the Option) and the don't-over-prune nuance for
-Change 2b gates. Pending round-3 confirmation review.
+DRAFT v4 — round-3 findings folded. Round-3 verdicts on v3: AGY
+(adversarial-review-mq9dmbjv-y7mk05) PLAN-READY (re-derived the F7
+sequence and confirmed the v3 fix); Claude SMR r3 PLAN-READY; Codex
+(session 019eb656-4bd7-7063-850b-c29b80e8abf3) PLAN-NEEDS-CHANGES with
+ONE residual counterexample: **same-id identity change under a defer
+window with an existing tombstone** — S0 reconciles id 1 identity A,
+thread dies (tombstone); S1 is NOT-same-plan + defer_workers and still
+has hydratable id 1 but identity B; Change 2b keeps the row
+(hydratable), `self.forwarding` still holds engine A; after backoff the
+tombstone-only sweep would respawn identity A although the latest
+accepted snapshot says B. v4 fix: **snapshot-coherent respawn** — the
+sweep takes the latest STORED snapshot and respawns a tombstone only if
+that snapshot's row for the id is identity-identical to the forwarding
+endpoint it would spawn against (§5 Change 2); regression test 6c added.
+Codex r3: "Nothing else blocks PLAN-READY from my pass." Pending
+round-4 confirmation.
+
+Round-3 fold summary:
+- Snapshot-coherent tombstone respawn (Codex r3 blocking finding) → §5
+  Change 2 + §7 invariant + §9 test 6c.
+
+Round-2 fold summary (v3): Codex and Claude SMR independently converged
+on the sweep-resurrection Major (fixed by the tombstone-only sweep);
+engine_ptr moved outside the Option; Change-2b no-over-prune nuance.
 
 Round-2 fold summary:
 - Tombstone-only periodic respawn (Codex r2 Major / SMR r2 F7) → §5
@@ -234,24 +246,39 @@ per-FIB-bump).
 
 ### Change 2 (fixes D2) — periodic self-heal, tombstone-only and correctly gated (Option 2)
 
-`Coordinator::reconcile_wg_control_liveness(&mut self)` = the finished
-sweep (pass 1) + a **TOMBSTONE-ONLY respawn**: it retries (backoff-gated,
+`Coordinator::reconcile_wg_control_liveness(&mut self, latest_snapshot:
+Option<&ConfigSnapshot>)` = the finished sweep (pass 1) + a
+**TOMBSTONE-ONLY, SNAPSHOT-COHERENT respawn**: it retries (backoff-gated,
 ≤1 spawn per invocation) ONLY entries that already EXIST in the map as
-tombstones, spawning against the current `forwarding.wg_engines` Arc. It
-**never creates entries for ids absent from the map** (Codex r2 Major /
-SMR r2 F7): entry creation for new/changed endpoints belongs exclusively
-to apply-time `spawn_wg_control_threads`, where the desired set and
-`self.forwarding` are coherent by construction. This is what makes
-Change 2b final until the next apply — without it, the sweep would
-recompute a desired set from the STALE `self.forwarding` during a defer
-window and resurrect the thread Change 2b just pruned. The stale prune
-also stays apply-time-only (desired-set changes only arrive with
-snapshots). Call site is the SERVER layer, NOT inside `refresh_bindings`:
+tombstones, and only when BOTH hold (Codex r3 blocking finding):
+
+1. `forwarding.wg_engines`/`tunnel_endpoints` still carry the id, AND
+2. the latest STORED snapshot (`state.snapshot`, passed in by the
+   server) contains a hydratable WG row for that id whose identity tuple
+   (listen_port, decoded local privkey, decoded peer pubkey,
+   allowed-ips, endpoint, keepalive) is IDENTICAL to the forwarding
+   endpoint it would spawn against. `None`/missing/identity-mismatched
+   row ⇒ skip silently (the tombstone stays; the deferred/next apply
+   reconciles it coherently). The comparison decodes two 32-byte hex
+   keys only when an eligible tombstone exists — rare, off hot path.
+
+This closes the defer-window identity-change counterexample (S0 spawns
+identity A, thread dies → tombstone; S1 NOT-same-plan + defer_workers
+re-keys id 1 to identity B; `self.forwarding` still holds A; an
+unguarded sweep would respawn A against a snapshot that says B), and is
+defense-in-depth for the whole §4c "stale forwarding vs stored snapshot"
+class. The sweep **never creates entries for ids absent from the map**
+(Codex r2 Major / SMR r2 F7): entry creation for new/changed endpoints
+belongs exclusively to apply-time `spawn_wg_control_threads`, where the
+desired set and `self.forwarding` are coherent by construction. This is
+what makes Change 2b final until the next apply. The stale prune also
+stays apply-time-only (desired-set changes only arrive with snapshots).
+Call site is the SERVER layer, NOT inside `refresh_bindings`:
 
 ```rust
 // server/helpers.rs refresh_status():
 if should_run_afxdp(&state.status) {
-    state.afxdp.reconcile_wg_control_liveness();
+    state.afxdp.reconcile_wg_control_liveness(state.snapshot.as_ref());
 }
 ```
 
@@ -349,6 +376,11 @@ a clean slate is correct there).
   apply path already legitimated (existing tombstones); it never
   creates entries from `self.forwarding`'s desired set — that set can be
   STALE during a defer window (Codex r2 / SMR r2 F7).
+- **Snapshot-coherent respawn**: a tombstone respawn additionally
+  requires the latest stored snapshot's row for the id to be
+  identity-identical to the forwarding endpoint being spawned — the
+  sweep must never start a thread the latest accepted snapshot does not
+  describe (Codex r3).
 - **wgN TUN ownership**: helper never deletes the TUN (Go owns it; AGY
   Hazard B reload stability). Unchanged.
 - **Engine Arc reuse / TAI64N**: respawn binds the CURRENT engine Arc from
@@ -401,6 +433,12 @@ session):
    with the endpoint), invoke `reconcile_wg_control_liveness` repeatedly
    → NO entry recreated, NO bind attempt, port stays released until the
    next apply.
+6c. **No stale-identity respawn under defer (Codex r3 regression)**:
+   id 1 identity A reconciled, thread dead → tombstone; store a
+   defer_workers snapshot that re-keys id 1 to identity B WITHOUT
+   reconciling forwarding; invoke the sweep past backoff with that
+   snapshot → NO respawn (identity mismatch). After a real
+   refresh/reconcile with the B snapshot, identity B spawns coherently.
 7. Existing wg/coordinator suites green; reconcile_peers_snapshot and
    worker_queue concurrent_recovery are known ledger flakes —
    standalone-prove before attributing; `install_session_serializes`
@@ -448,7 +486,7 @@ preferred; loss cluster only under
   remains a hard error per attempt — durable 3s backoff retries it
   indefinitely; all three reviewers endorsed no give-up cap).
 
-## 11. Open questions for adversarial review (round 3 — confirmation pass; each may still justify PLAN-KILL)
+## 11. Open questions for adversarial review (round 4 — confirmation pass; each may still justify PLAN-KILL)
 
 Round-2 dispositions: Q1 resolved by the tombstone-only sweep (Codex r2
 required it; AGY found no latency/reentrancy hazard); Q2 accepted by all
@@ -458,15 +496,22 @@ gates-exactly with the no-over-prune nuance; Q5 endorsed 3s/no-cap by all
 three; Q6 confirmed (socket_is_v6 threads through the spawned closure
 unchanged).
 
-Round-3 confirmation questions:
+Round-3 dispositions: AGY + Claude SMR PLAN-READY on v3; Codex's
+residual same-id-identity-change-under-defer counterexample is closed in
+v4 by the snapshot-coherent respawn condition (§5 Change 2) + test 6c.
 
-1. **F7 fix completeness**: with the tombstone-only sweep, is there ANY
-   remaining sequence (defer windows, stop/rebind handlers, rapid
-   add/remove/add) where a thread is created against a desired set that
-   does not reflect the latest applied snapshot?
-2. **Tombstone identity semantics**: pass-2 removes a tombstone whose
-   recorded `engine_ptr` differs from the current engine (identity
-   changed), resetting its backoff so the fresh identity spawns
-   immediately. Any abuse path (e.g. identity-flapping config) where
-   this defeats the backoff in a way that matters?
+Round-4 confirmation questions:
+
+1. **Snapshot-coherence condition**: is the identity comparison
+   (snapshot row vs forwarding endpoint, both available under the same
+   guard) sound and complete — any field omitted whose divergence would
+   matter, or any case where `state.snapshot` is not actually the
+   latest-accepted snapshot when the sweep runs?
+2. **Remaining incoherent-spawn sequence**: with tombstone-only +
+   snapshot-coherent respawn, can anyone still construct a sequence
+   (defer windows, stop/rebind, rapid add/remove/add, helper restart
+   with persisted state) where a thread runs an identity the latest
+   accepted snapshot does not describe — beyond the pre-existing,
+   bounded "live thread keeps old identity until deferred bring-up"
+   behavior that master already has?
 3. **Anything else** that blocks PLAN-READY?
