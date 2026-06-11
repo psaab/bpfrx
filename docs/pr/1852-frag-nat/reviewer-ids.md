@@ -15,14 +15,22 @@ AGY (result: .../gemini-abiswas97-gemini/state/jobs/<id>.result.md):
 
 Claude SMR: research branch docs/research/1852-frag-nat/claude-smr-plan-r{1,2,3}.md
 
-## Implementation review — this PR
+## Implementation review — this PR (#1857)
 
 Codex (flock /tmp/xpf-codex.lock):
-- (pending)
+- r1 task-mq8ybiw9-1v4b2q — CHANGES-REQUESTED (H1 raw_frame after GRE decap; H2 forced tunnel L4 recompute ignores fragment gate)
+- r2 task-mq8yszdq-gnhoq4 — MERGE-READY (both High findings resolved; no remaining blocking finding)
 
 AGY:
-- (pending)
+- r1 adversarial-review-mq8ybrtd-79dsvh — confirmed the packet_frame (GRE-decap) fix; sound
+- r2 adversarial-review-mq8yszot-7d8yg8 — MERGE-READY ("changes are sound"); debug-run failures (concurrent_recovery, inplace_*) are known-flaky, out of scope
 
-Copilot: (pending — @copilot on PR)
+Copilot: INFRA-BLOCKED — "unable to review … quota limit" (both review attempts). Documented per the Copilot-infra-blocked exception; gate met by Codex + AGY + Claude SMR.
 
-Claude SMR: docs/pr/1852-frag-nat/claude-smr-impl-r<N>.md
+Claude SMR: docs/pr/1852-frag-nat/claude-smr-impl-r1.md — MERGE-READY
+
+## Convergence
+
+MERGE-READY at head 27bfda1e5 — Codex r2 + AGY r2 + Claude SMR r1 all
+MERGE-READY; Copilot quota-blocked (documented). NOT merged — parent runs
+serialized cluster smoke before merge.
