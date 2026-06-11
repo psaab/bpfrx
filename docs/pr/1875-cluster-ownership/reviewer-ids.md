@@ -19,3 +19,13 @@
   F1/F2 caught edges SMR missed)
 - Copilot: request 1 quota-limited (PR review states it verbatim);
   re-requested at b24f28a3fc44 (retry 2 of 3)
+
+## Code phase round 2 (delta over fix commit b24f28a3fc44)
+- Codex code r2: session 019eb8d7-6d05-75f0-82c0-b18aa6d9c635 — MERGE-READY
+  (caller audit clean; probed env--/timeout normalization independently)
+- AGY code r2: adversarial-review-mqa32wuk-fcmnfa — MERGE-READY
+  (re-ran the selftest itself: ALL 10 CASES PASS)
+- Claude SMR code r2: claude-smr-code-r2.md — MERGE-READY
+- Copilot: quota-limited on ALL THREE documented retries (review
+  comments on the PR state it verbatim, timestamps 2026-06-11) →
+  3-of-4 exception per feedback_codex_infra_must_retry applies.

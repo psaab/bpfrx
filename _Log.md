@@ -5141,3 +5141,7 @@ top.
 - **Timestamp**: 2026-06-11
   **Action**: "#1736 P6-flush second choreography trap fixed — the unconditional runbook flush after a SUCCESSFUL P6-noflush recovery (the expected sane-clock branch) wiped the peer under a live confirmed session, manufacturing the same S5 confirmed-but-dead blackhole the P6-pre fix removed (engine has no rekey/retry timers until S5, wg/peer.rs TODO; a confirmed engine never re-initiates). The runbook flush now runs only when the no-flush recovery fails (replay-guard/clock-step case), matching the runbook's own wording; pass message records which branch ran. Runbook updated: flush is conditional, plus an explicit do-NOT-flush-under-live-session warning"
   **File(s)**: test/incus/wg-interop.sh, docs/wg-interop-runbook.md
+
+- **Timestamp**: 2026-06-11 ~15:45 PT
+  **Action**: #1875 /research (PLAN-READY 3-of-3, branch research/1875-cluster-ownership) + /engineer → PR #1878 (cluster lock cells: cluster-lock.sh, with-cluster.sh, self-locking cluster-setup/apply-cos verbs, marker-aware wg-interop inc(), 10-case selftest, docs protocol). Live guarded deploy + CoS re-apply + iperf3 validated on loss cluster. Quad review: Codex+AGY+SMR MERGE-READY, Copilot 3x quota-limited.
+  **File(s)**: test/incus/{cluster-lock.sh,with-cluster.sh,with-cluster-selftest.sh,cluster-setup.sh,apply-cos-config.sh,wg-interop.sh,reverse-key-collision-probe.sh}, docs/engineering-style.md, CLAUDE.md, docs/wg-interop-runbook.md, docs/pr/1875-cluster-ownership/
