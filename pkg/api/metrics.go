@@ -163,9 +163,16 @@ type xpfCollector struct {
 	workerSessionTableEntries        *prometheus.Desc
 	workerSessionTableCapacity       *prometheus.Desc
 	workerNatReverseKeyCollisions    *prometheus.Desc
-	userspaceSessionTableEntries     *prometheus.Desc
-	userspaceSessionTableCapacity    *prometheus.Desc
-	userspaceNatReverseKeyCollisions *prometheus.Desc
+	// #1861: install-refusal trio (per-worker + aggregate).
+	workerSessionCreateDrops                *prometheus.Desc
+	workerSessionInstallAdmissionRefused    *prometheus.Desc
+	workerSessionInstallPartial             *prometheus.Desc
+	userspaceSessionCreateDrops             *prometheus.Desc
+	userspaceSessionInstallAdmissionRefused *prometheus.Desc
+	userspaceSessionInstallPartial          *prometheus.Desc
+	userspaceSessionTableEntries            *prometheus.Desc
+	userspaceSessionTableCapacity           *prometheus.Desc
+	userspaceNatReverseKeyCollisions        *prometheus.Desc
 	// #1789: total failed USERSPACE_SESSIONS BPF-map publishes — the
 	// cause-side signal for rising XDP-shim NO_SESSION fallbacks.
 	userspaceSessionPublishErrors *prometheus.Desc
@@ -400,6 +407,12 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.workerSessionTableEntries
 	ch <- c.workerSessionTableCapacity
 	ch <- c.workerNatReverseKeyCollisions
+	ch <- c.workerSessionCreateDrops
+	ch <- c.workerSessionInstallAdmissionRefused
+	ch <- c.workerSessionInstallPartial
+	ch <- c.userspaceSessionCreateDrops
+	ch <- c.userspaceSessionInstallAdmissionRefused
+	ch <- c.userspaceSessionInstallPartial
 	ch <- c.userspaceSessionTableEntries
 	ch <- c.userspaceSessionTableCapacity
 	ch <- c.userspaceNatReverseKeyCollisions

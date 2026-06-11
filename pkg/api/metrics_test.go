@@ -72,11 +72,13 @@ func TestEmitWorkerRuntime_DeadGaugeReflectsDeadFlag(t *testing.T) {
 	// #1621 cold-path always-emitted metrics (4 per-worker scalars
 	// + clock_source gauge + snapshot_failed counter = 6) = 21 +
 	// #1782 Step-1 cold-start CoS instruments (wheel sum counter +
-	// wheel max gauge + 6 per-cause under-grant counters = 8) = 29.
+	// wheel max gauge + 6 per-cause under-grant counters = 8) = 29 +
+	// #1861 install-refusal trio (create drops + admission refused +
+	// install partial counters) = 32.
 	// Per-slot/per-bucket metrics need non-empty Vec fields which
 	// these test fixtures don't populate, so they're zero here.
-	if len(got) != 3*29 {
-		t.Fatalf("emitWorkerRuntime: want %d metrics for 3 workers, got %d", 3*29, len(got))
+	if len(got) != 3*32 {
+		t.Fatalf("emitWorkerRuntime: want %d metrics for 3 workers, got %d", 3*32, len(got))
 	}
 
 	// Gather just the dead-gauge entries, keyed by worker_id label.
@@ -303,7 +305,11 @@ func newCollectorWithWorkerDescsOnly() *xpfCollector {
 		workerSessionTableEntries:        mk("xpf_userspace_worker_session_table_entries"),
 		workerSessionTableCapacity:       mk("xpf_userspace_worker_session_table_capacity"),
 		workerNatReverseKeyCollisions:    mk("xpf_userspace_worker_session_nat_reverse_key_collisions_total"),
-		workerDead:                       mk("xpf_userspace_worker_dead"),
+		// #1861 install-refusal trio.
+		workerSessionCreateDrops:             mk("xpf_userspace_worker_session_create_drops_total"),
+		workerSessionInstallAdmissionRefused: mk("xpf_userspace_worker_session_install_admission_refused_total"),
+		workerSessionInstallPartial:          mk("xpf_userspace_worker_session_install_partial_total"),
+		workerDead:                           mk("xpf_userspace_worker_dead"),
 		// #1621 cold-path descriptors.
 		workerColdPathBucket:              mkBucket("xpf_userspace_worker_cold_path_ns_bucket"),
 		workerColdPathSamples:             mkSlot("xpf_userspace_worker_cold_path_samples_total"),
@@ -370,7 +376,11 @@ func collectFromEmitWorkerRuntime(
 		c.workerSessionTableEntries:        {},
 		c.workerSessionTableCapacity:       {},
 		c.workerNatReverseKeyCollisions:    {},
-		c.workerDead:                       {},
+		// #1861 install-refusal trio.
+		c.workerSessionCreateDrops:             {},
+		c.workerSessionInstallAdmissionRefused: {},
+		c.workerSessionInstallPartial:          {},
+		c.workerDead:                           {},
 		// #1621 cold-path descriptors.
 		c.workerColdPathBucket:              {},
 		c.workerColdPathSamples:             {},
@@ -733,6 +743,25 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 			nil,
 			nil,
 		),
+		// #1861 install-refusal trio.
+		userspaceSessionCreateDrops: prometheus.NewDesc(
+			"xpf_userspace_session_create_drops_total",
+			"session create drops",
+			nil,
+			nil,
+		),
+		userspaceSessionInstallAdmissionRefused: prometheus.NewDesc(
+			"xpf_userspace_session_install_admission_refused_total",
+			"session install admission refusals",
+			nil,
+			nil,
+		),
+		userspaceSessionInstallPartial: prometheus.NewDesc(
+			"xpf_userspace_session_install_partial_total",
+			"session install partials",
+			nil,
+			nil,
+		),
 		userspaceNatReverseKeySharedDisplacements: prometheus.NewDesc(
 			"xpf_userspace_session_nat_reverse_key_shared_displacements_total",
 			"shared-map nat reverse-key displacements",
@@ -773,6 +802,10 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 		NatReverseKeySharedDisplacementsTotal: 4,
 		// #1807: poison-recovery counter emitted unconditionally.
 		WorkerCommandQueuePoisonRecoveries: 2,
+		// #1861: install-refusal trio emitted unconditionally.
+		SessionCreateDrops:             9,
+		SessionInstallAdmissionRefused: 8,
+		SessionInstallPartial:          1,
 		Bindings: []dpuserspace.BindingStatus{
 			{
 				Slot:              0,
@@ -802,8 +835,9 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	for m := range ch {
 		got = append(got, m)
 	}
-	if len(got) != 10 {
-		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 10 metrics, got %d", len(got))
+	// 10 pre-#1861 metrics + the #1861 install-refusal trio = 13.
+	if len(got) != 13 {
+		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 13 metrics, got %d", len(got))
 	}
 
 	assertGaugeClose(t, got, c.userspaceSessionTableEntries, nil, 77)
@@ -817,6 +851,10 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	assertCounterClose(t, got, c.userspaceNatReverseKeySharedDisplacements, nil, 4)
 	// #1807: poison-recovery counter emitted unconditionally.
 	assertCounterClose(t, got, c.userspaceWorkerCommandQueuePoisonRecoveries, nil, 2)
+	// #1861: install-refusal trio emitted unconditionally.
+	assertCounterClose(t, got, c.userspaceSessionCreateDrops, nil, 9)
+	assertCounterClose(t, got, c.userspaceSessionInstallAdmissionRefused, nil, 8)
+	assertCounterClose(t, got, c.userspaceSessionInstallPartial, nil, 1)
 	assertGaugeClose(t, got, c.userspaceFlowCacheActiveFlows, nil, 12)
 	assertGaugeClose(t, got, c.userspaceFlowCacheCapacity, nil, 20)
 	assertGaugeClose(t, got, c.bindingFlowCacheCapacity, map[string]string{

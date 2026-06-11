@@ -90,6 +90,19 @@ pub struct WorkerRuntimeStatus {
     /// `default` so an older daemon that predates this counter emits 0.
     #[serde(rename = "nat_reverse_key_collisions", default)]
     pub nat_reverse_key_collisions: u64,
+    /// #1861: cumulative at-cap install refusals from this worker's
+    /// SessionTable (`create_drops` — previously write-only). `default`
+    /// for wire-additive compatibility with older daemons.
+    #[serde(rename = "session_create_drops", default)]
+    pub session_create_drops: u64,
+    /// #1861: cumulative pair-admission preflight refusals (one per
+    /// refused flow) on this worker's new-flow install path.
+    #[serde(rename = "session_install_admission_refused", default)]
+    pub session_install_admission_refused: u64,
+    /// #1861: post-preflight partial-install residuals. Expected 0
+    /// forever; nonzero means the preflight/install pairing has a bug.
+    #[serde(rename = "session_install_partial", default)]
+    pub session_install_partial: u64,
     /// #925: true if the worker_loop thread panicked and the supervisor
     /// caught it. Set once on first panic; never cleared in Phase 1.
     /// Operators see DEAD in `cli show chassis forwarding` and must
