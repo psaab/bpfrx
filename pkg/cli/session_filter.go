@@ -37,6 +37,14 @@ type sessionFilter struct {
 	cfg      *config.Config // for application resolution
 	appNames map[uint16]string
 
+	// parseErr records an operator-input error detected while
+	// parsing filter tokens (unknown protocol, missing value,
+	// unparseable prefix/port). It MUST fail the command via
+	// validate(): a silently-dropped token leaves its predicate
+	// inert, and on the clear path an all-tokens-dropped filter
+	// makes hasFilter() false — i.e. clear-ALL.
+	parseErr error
+
 	// source-nat-pool filter (#1827 PR-3): match sessions whose
 	// TRANSLATED source address was allocated from the named pool —
 	// the operator handle for sessions pinned to a failed uplink's
@@ -58,20 +66,30 @@ func (c *CLI) parseSessionFilter(args []string) sessionFilter {
 	if cr != nil {
 		f.appNames = cr.AppNames
 	}
+	// takeValue consumes the value token for a valued keyword. A
+	// trailing keyword without a value is a parse error — historically
+	// it was silently skipped, leaving the filter empty, which on the
+	// clear path means clear-ALL.
+	takeValue := func(i *int, kw string) (string, bool) {
+		if *i+1 >= len(args) {
+			f.setParseErr(fmt.Errorf("missing value for %q", kw))
+			return "", false
+		}
+		*i++
+		return args[*i], true
+	}
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "zone":
-			if i+1 < len(args) {
-				i++
-				f.zoneName = args[i]
+			if v, ok := takeValue(&i, "zone"); ok {
+				f.zoneName = v
 				if cr != nil {
-					f.zoneID = cr.ZoneIDs[args[i]]
+					f.zoneID = cr.ZoneIDs[v]
 				}
 			}
 		case "protocol":
-			if i+1 < len(args) {
-				i++
-				switch strings.ToLower(args[i]) {
+			if v, ok := takeValue(&i, "protocol"); ok {
+				switch strings.ToLower(v) {
 				case "tcp":
 					f.proto = 6
 				case "udp":
@@ -80,86 +98,103 @@ func (c *CLI) parseSessionFilter(args []string) sessionFilter {
 					f.proto = 1
 				case "icmpv6":
 					f.proto = dataplane.ProtoICMPv6
+				default:
+					// Numeric IP protocol (Junos accepts numbers);
+					// anything else must error, not silently drop
+					// the predicate.
+					if n, err := strconv.Atoi(v); err == nil && n > 0 && n < 256 {
+						f.proto = uint8(n)
+					} else {
+						f.setParseErr(fmt.Errorf("unknown protocol %q", v))
+					}
 				}
 			}
 		case "source-prefix":
-			if i+1 < len(args) {
-				i++
-				cidr := args[i]
-				if !strings.Contains(cidr, "/") {
-					if strings.Contains(cidr, ":") {
-						cidr += "/128"
+			if v, ok := takeValue(&i, "source-prefix"); ok {
+				if !strings.Contains(v, "/") {
+					if strings.Contains(v, ":") {
+						v += "/128"
 					} else {
-						cidr += "/32"
+						v += "/32"
 					}
 				}
-				_, ipNet, err := net.ParseCIDR(cidr)
-				if err == nil {
+				_, ipNet, err := net.ParseCIDR(v)
+				if err != nil {
+					f.setParseErr(fmt.Errorf("invalid source-prefix %q", v))
+				} else {
 					f.srcNet = ipNet
 				}
 			}
 		case "destination-prefix":
-			if i+1 < len(args) {
-				i++
-				cidr := args[i]
-				if !strings.Contains(cidr, "/") {
-					if strings.Contains(cidr, ":") {
-						cidr += "/128"
+			if v, ok := takeValue(&i, "destination-prefix"); ok {
+				if !strings.Contains(v, "/") {
+					if strings.Contains(v, ":") {
+						v += "/128"
 					} else {
-						cidr += "/32"
+						v += "/32"
 					}
 				}
-				_, ipNet, err := net.ParseCIDR(cidr)
-				if err == nil {
+				_, ipNet, err := net.ParseCIDR(v)
+				if err != nil {
+					f.setParseErr(fmt.Errorf("invalid destination-prefix %q", v))
+				} else {
 					f.dstNet = ipNet
 				}
 			}
 		case "source-port":
-			if i+1 < len(args) {
-				i++
-				if v, err := strconv.Atoi(args[i]); err == nil {
-					f.srcPort = uint16(v)
+			if v, ok := takeValue(&i, "source-port"); ok {
+				if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 65535 {
+					f.srcPort = uint16(n)
+				} else {
+					f.setParseErr(fmt.Errorf("invalid source-port %q", v))
 				}
 			}
 		case "destination-port":
-			if i+1 < len(args) {
-				i++
-				if v, err := strconv.Atoi(args[i]); err == nil {
-					f.dstPort = uint16(v)
+			if v, ok := takeValue(&i, "destination-port"); ok {
+				if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 65535 {
+					f.dstPort = uint16(n)
+				} else {
+					f.setParseErr(fmt.Errorf("invalid destination-port %q", v))
 				}
 			}
 		case "nat", "nat-only":
 			f.natOnly = true
 		case "interface":
-			if i+1 < len(args) {
-				i++
-				f.iface = args[i]
+			if v, ok := takeValue(&i, "interface"); ok {
+				f.iface = v
 			}
 		case "source-nat-pool":
-			if i+1 < len(args) {
-				i++
-				f.snatPool = args[i]
+			if v, ok := takeValue(&i, "source-nat-pool"); ok {
+				f.snatPool = v
 				if f.cfg != nil {
 					f.snatPoolNets, f.snatPoolOK = config.SourceNATPoolNets(&f.cfg.Security.NAT, f.snatPool)
 				}
 			}
 		case "application":
-			if i+1 < len(args) {
-				i++
-				f.appName = args[i]
+			if v, ok := takeValue(&i, "application"); ok {
+				f.appName = v
 			}
 		case "summary":
 			f.summary = true
 		case "brief":
 			f.brief = true
 		case "sort-by":
-			if i+1 < len(args) {
-				i++
-				f.sortBy = args[i] // "bytes" or "packets"
+			if v, ok := takeValue(&i, "sort-by"); ok {
+				f.sortBy = v // "bytes" or "packets"
 			}
+		default:
+			f.setParseErr(fmt.Errorf("unknown session filter %q", args[i]))
 		}
 	}
 	return f
+}
+
+// setParseErr records the first parse error (the first is the most
+// useful to show the operator).
+func (f *sessionFilter) setParseErr(err error) {
+	if f.parseErr == nil {
+		f.parseErr = err
+	}
 }
 
 func (f *sessionFilter) matchesV4(key dataplane.SessionKey, val dataplane.SessionValue) bool {
@@ -253,15 +288,18 @@ func (f *sessionFilter) matchesV6(key dataplane.SessionKeyV6, val dataplane.Sess
 }
 
 func (f *sessionFilter) hasFilter() bool {
-	return f.zoneID != 0 || f.zoneName != "" || f.proto != 0 || f.srcNet != nil || f.dstNet != nil ||
-		f.srcPort != 0 || f.dstPort != 0 || f.natOnly || f.iface != "" || f.appName != "" ||
-		f.snatPool != ""
+	return f.parseErr != nil || f.zoneID != 0 || f.zoneName != "" || f.proto != 0 ||
+		f.srcNet != nil || f.dstNet != nil || f.srcPort != 0 || f.dstPort != 0 ||
+		f.natOnly || f.iface != "" || f.appName != "" || f.snatPool != ""
 }
 
 // validate reports operator-input errors that must fail the command
 // rather than silently match nothing — or, on the clear path, fall
 // through to an unfiltered clear-all.
 func (f *sessionFilter) validate() error {
+	if f.parseErr != nil {
+		return f.parseErr
+	}
 	if f.snatPool != "" && !f.snatPoolOK {
 		return fmt.Errorf("source NAT pool %q not found", f.snatPool)
 	}

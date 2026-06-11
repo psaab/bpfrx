@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -312,6 +313,15 @@ func buildPeerClearRequest(f *sessionFilter) *pb.ClearSessionsRequest {
 			req.Protocol = "udp"
 		case 1:
 			req.Protocol = "icmp"
+		case dataplane.ProtoICMPv6:
+			req.Protocol = "icmpv6"
+		default:
+			// Numeric protocols forward as numbers; the server matcher
+			// accepts numeric protocol strings. NEVER leave Protocol
+			// empty when f.proto is set — a protocol-only filter would
+			// forward an empty request = peer clear-all (the icmpv6
+			// case did exactly that before #1827 PR-3 r1).
+			req.Protocol = strconv.Itoa(int(f.proto))
 		}
 	}
 	req.SourcePort = uint32(f.srcPort)

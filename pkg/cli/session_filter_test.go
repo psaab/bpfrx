@@ -6,8 +6,10 @@ package cli
 import (
 	"encoding/binary"
 	"net"
+	"path/filepath"
 	"testing"
 
+	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/dataplane"
 )
 
@@ -160,5 +162,63 @@ func TestBuildPeerClearRequestCarriesAllFilters(t *testing.T) {
 		if !fl.hasFilter() {
 			t.Errorf("hasFilter() = false for %+v — would clear-all", fl)
 		}
+	}
+}
+
+// Protocol filters must forward to the peer for EVERY parseable
+// protocol — icmpv6 (and numeric protocols) used to fall through the
+// tcp/udp/icmp switch and forward an empty request = peer clear-all
+// (Codex r1 Critical / AGY r1 Finding 1).
+func TestBuildPeerClearRequestProtocolCoverage(t *testing.T) {
+	for _, tc := range []struct {
+		proto uint8
+		want  string
+	}{
+		{6, "tcp"},
+		{17, "udp"},
+		{1, "icmp"},
+		{dataplane.ProtoICMPv6, "icmpv6"},
+		{47, "47"}, // numeric forward for named-but-unswitched protocols
+		{89, "89"},
+	} {
+		req := buildPeerClearRequest(&sessionFilter{proto: tc.proto})
+		if req.Protocol != tc.want {
+			t.Errorf("proto %d forwarded as %q, want %q", tc.proto, req.Protocol, tc.want)
+		}
+	}
+}
+
+// Parse errors must surface through hasFilter (so the clear path
+// cannot fall through to ClearAllSessions) and validate (so the
+// command fails). Historically `clear security flow session protocol
+// ospf` (unknown name) or `... source-nat-pool` (missing value)
+// produced an EMPTY filter and cleared the whole table (AGY r1
+// Finding 2 / Codex r1 High).
+func TestSessionFilterParseErrors(t *testing.T) {
+	c := &CLI{store: configstore.New(filepath.Join(t.TempDir(), "xpf.conf"))}
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"unknown protocol", []string{"protocol", "ospfx"}},
+		{"missing value", []string{"source-nat-pool"}},
+		{"trailing interface", []string{"interface"}},
+		{"bad port", []string{"destination-port", "70000"}},
+		{"bad prefix", []string{"source-prefix", "10.0.0.300"}},
+		{"unknown token", []string{"interfaces", "ge-0-0-2"}},
+	} {
+		f := c.parseSessionFilter(tc.args)
+		if !f.hasFilter() {
+			t.Errorf("%s: hasFilter() = false — would clear-all", tc.name)
+		}
+		if err := f.validate(); err == nil {
+			t.Errorf("%s: validate() = nil, want error", tc.name)
+		}
+	}
+
+	// Numeric protocols are accepted (Junos accepts numbers).
+	f := c.parseSessionFilter([]string{"protocol", "47"})
+	if f.parseErr != nil || f.proto != 47 {
+		t.Errorf("numeric protocol: parseErr=%v proto=%d, want nil/47", f.parseErr, f.proto)
 	}
 }
