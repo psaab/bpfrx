@@ -130,6 +130,28 @@ gen_keys() {
     log "keys ready (xpf pub ${XPF_PUB_B64})"
 }
 
+# Wait until node0 is RG0 primary. The WG outer endpoint is the LAN VIP
+# and the wg0 stanza is node0-scoped, so a post-deploy/post-restart
+# window where fw1 still holds RG0 mastership black-holes the peer's
+# handshake responses (the peer ARPs 10.0.61.1 to fw1's virtual MAC,
+# which has no WG engine). Seen live: the first full run committed P1
+# ~90 s after a rolling deploy and timed out for exactly this reason.
+wait_node0_primary() { # wait_node0_primary <deadline_s>
+    local t
+    for t in $(seq 1 "$1"); do
+        if inc exec "${FW0}" -- /usr/local/sbin/cli <<'EOF' 2>/dev/null | grep -A2 "Redundancy group: 0" | grep -qE '^node0 .*primary'
+show chassis cluster status
+quit
+EOF
+        then
+            log "node0 is RG0 primary (t=${t}s)"
+            return 0
+        fi
+        sleep 5
+    done
+    return 1
+}
+
 # ---------------------------------------------------------------------------
 # P0 — preflight.
 preflight() {
@@ -137,6 +159,7 @@ preflight() {
     inc info "${FW0}" >/dev/null || fail "cannot reach ${FW0}"
     ish "${FW0}" 'systemctl is-active xpfd' | grep -q active || fail "xpfd not active on fw0"
     ish "${FW1}" 'systemctl is-active xpfd' | grep -q active || fail "xpfd not active on fw1"
+    wait_node0_primary 36 || fail "node0 not RG0 primary within 180s — WG VIP would black-hole"
     # No stale wg0 on either node, no foreign claim on the listen port.
     for n in "${FW0}" "${FW1}"; do
         if ish "$n" 'ip link show wg0 >/dev/null 2>&1'; then
@@ -165,31 +188,50 @@ preflight() {
 }
 
 # ---------------------------------------------------------------------------
-# Provision the Debian-13 VM peer (idempotent).
+# Provision the Debian-13 peer (idempotent). WG_PEER_TYPE=vm is the
+# issue-literal default; WG_PEER_TYPE=container is the plan §4 fallback
+# for VM-infra failures (kernel WireGuard is netns-aware, so the
+# protocol/crypto stack is still the reference kernel implementation —
+# it runs in the loss HOST kernel instead of a dedicated guest kernel).
+# 2026-06-11 validation run used the container fallback: freshly
+# created VMs from images:debian/{13,12} never bring up the incus-agent
+# on the loss host (incus 6.21; pre-existing fw VMs unaffected), so VM
+# exec is impossible there — recorded in the PR evidence.
 provision() {
-    log "provision: ${PEER}"
+    log "provision: ${PEER} (type=${WG_PEER_TYPE})"
     if inc info "${PEER}" >/dev/null 2>&1; then
         log "peer exists — reusing"
     else
-        inc init images:debian/13 "${PEER}" --vm -c limits.cpu=2 -c limits.memory=2GiB
+        if [ "${WG_PEER_TYPE}" = vm ]; then
+            inc init images:debian/13 "${PEER}" --vm -c limits.cpu=2 -c limits.memory=2GiB
+        else
+            inc init images:debian/13 "${PEER}"
+        fi
         # eth0 (default profile) = incusbr0 mgmt. Add the data VF NIC.
         inc config device add "${PEER}" eth1 nic nictype=sriov \
             parent="${WG_PEER_DATA_PARENT}" vlan="${WG_PEER_DATA_VLAN}"
         inc start "${PEER}"
     fi
-    # Wait for the agent.
+    # Wait for exec (containers: immediate; VMs: agent bring-up).
     for _ in $(seq 1 60); do
         if ish "${PEER}" true 2>/dev/null; then break; fi
         sleep 5
     done
-    ish "${PEER}" true || fail "peer agent not reachable"
-    # Static config on the data NIC (match by MAC from incus config).
-    local mac
-    mac=$(inc config get "${PEER}" volatile.eth1.hwaddr)
-    [ -n "$mac" ] || fail "cannot determine peer data NIC MAC"
+    ish "${PEER}" true || fail "peer not exec-reachable (VM agent dead? try WG_PEER_TYPE=container)"
+    # Static config on the data NIC. Containers keep the device name
+    # (eth1); VMs enumerate by PCI, so match by the incus-assigned MAC.
+    local match
+    if [ "${WG_PEER_TYPE}" = vm ]; then
+        local mac
+        mac=$(inc config get "${PEER}" volatile.eth1.hwaddr)
+        [ -n "$mac" ] || fail "cannot determine peer data NIC MAC"
+        match="MACAddress=${mac}"
+    else
+        match="Name=eth1"
+    fi
     ish "${PEER}" "cat > /etc/systemd/network/20-wgdata.network <<EOF
 [Match]
-MACAddress=${mac}
+${match}
 [Network]
 Address=${WG_PEER_LAN4}
 Address=${WG_PEER_LAN6}
@@ -263,6 +305,7 @@ configure_p1() {
     log "P1: keys + peer (responder) + xpf commit (initiator, node0-scoped)"
     gen_keys
     peer_wg_setup ""   # peer responder: no endpoint — must learn from xpf msg1
+    wait_node0_primary 36 || fail "P1: node0 not RG0 primary — VIP would black-hole the handshake"
     xpf_wg_commit 1
     sleep 3
     # Secondary suppression asserts (plan §4).
@@ -430,6 +473,7 @@ test_p6() {
     ish "${FW0}" 'systemctl restart xpfd'
     sleep 15
     ish "${FW0}" 'systemctl is-active xpfd' | grep -q active || fail "P6: xpfd failed to restart"
+    wait_node0_primary 36 || fail "P6: node0 did not regain RG0 mastership after restart"
     local pre post
     pre=$(ish "${PEER}" "wg show ${WG_KERNEL_IFACE} latest-handshakes | awk '{print \$2}'")
     if wait_handshake $((WG_RESTART_RECOVER_S * 2)) "P6-noflush"; then

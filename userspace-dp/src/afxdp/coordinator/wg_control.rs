@@ -175,7 +175,7 @@ pub(super) fn wg_control_loop(
                         &recent_exceptions,
                     );
                     if authenticated {
-                        effective_endpoint = Some(from);
+                        effective_endpoint = Some(canonicalize_endpoint(from));
                     }
                 }
                 Ok(_) => break,
@@ -343,6 +343,27 @@ fn bind_dual_stack_v6(port: u16) -> io::Result<UdpSocket> {
     Ok(sock)
 }
 
+/// Canonicalize a learned peer endpoint: the dual-stack `[::]` socket
+/// reports IPv4 peers as V4-MAPPED IPv6 (`::ffff:a.b.c.d`), and a
+/// mapped address answers `is_ipv6() == true`, which made the exact
+/// pad-aware encap MTU guard charge the 40-byte IPv6 outer overhead
+/// for what is really a 20-byte IPv4 outer. Found live in #1736 S2b:
+/// after the first authenticated inbound replaced the configured v4
+/// endpoint with its mapped form, every inner packet in the
+/// (pad-aware) 1409..=1425 window was silently dropped by the guard —
+/// pings passed, but full-MSS forward TCP moved ZERO bytes (the
+/// kernel-wg peer's iperf3 stalled at cwnd 1.34 KB) while reverse
+/// traffic was fine. Unmap to the canonical V4 form so overhead math,
+/// logs, and configured-endpoint comparisons all see the real family.
+fn canonicalize_endpoint(addr: SocketAddr) -> SocketAddr {
+    if let SocketAddr::V6(v6) = addr {
+        if let Some(v4) = v6.ip().to_ipv4_mapped() {
+            return SocketAddr::new(std::net::IpAddr::V4(v4), v6.port());
+        }
+    }
+    addr
+}
+
 /// Build + send a fresh initiation toward the peer endpoint. A send
 /// error is surfaced as an exception (the next tick retries); a missing
 /// session keeps the timer armed.
@@ -491,5 +512,49 @@ fn encap_and_send(
         Err(_e) => {
             debug_log!("WG[{}]: encap drop reason={:?}", tunnel_name, _e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    /// #1736 S2b regression: a v4-mapped learned endpoint must unmap to
+    /// canonical V4 so the encap MTU guard charges IPv4 outer overhead.
+    #[test]
+    fn canonicalize_endpoint_unmaps_v4_mapped() {
+        let mapped: SocketAddr = "[::ffff:10.0.61.103]:51820".parse().unwrap();
+        let got = canonicalize_endpoint(mapped);
+        assert_eq!(
+            got,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 103)), 51820)
+        );
+        assert!(!got.is_ipv6());
+    }
+
+    /// Native v6 and native v4 endpoints pass through untouched.
+    #[test]
+    fn canonicalize_endpoint_passthrough() {
+        let v6: SocketAddr = "[2001:db8::1]:51820".parse().unwrap();
+        assert_eq!(canonicalize_endpoint(v6), v6);
+        let v4: SocketAddr = "192.0.2.1:51820".parse().unwrap();
+        assert_eq!(canonicalize_endpoint(v4), v4);
+        // A non-mapped v6 with an embedded v4-looking tail stays v6.
+        let nat64: SocketAddr =
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0x0a00, 0x3d67)), 51820);
+        assert_eq!(canonicalize_endpoint(nat64), nat64);
+    }
+
+    /// The guard math this protects: at the v4/v6 boundary the same
+    /// padded inner either fits (v4 outer) or exceeds (v6 outer) the
+    /// 1500 outer MTU — the live-blackhole window.
+    #[test]
+    fn encapped_size_v4_vs_v6_window() {
+        // inner 1409 pads to 1424: v4 outer = 1484 (fits), v6 = 1504 (drops).
+        assert!(wg_encapped_size(1409, false) <= WG_OUTER_MTU);
+        assert!(wg_encapped_size(1409, true) > WG_OUTER_MTU);
+        // inner 1408 fits either way (the pre-fix observable cutoff).
+        assert!(wg_encapped_size(1408, true) <= WG_OUTER_MTU);
     }
 }
