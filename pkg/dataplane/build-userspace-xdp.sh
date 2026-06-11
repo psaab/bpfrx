@@ -138,9 +138,11 @@ case "${VERIFY_RC}" in
 	fail "cannot run the BPF verifier gate (need root or passwordless sudo).
   The candidate object was built at:
     ${CANDIDATE}
-  The tracked ${OUT_FILE} was NOT updated. Re-run with sudo available, or verify+install manually:
-    sudo \$(${GO_BIN} env GOPATH)/... # build cmd/shimverify, run it on the candidate, then:
-    install -m 0644 ${CANDIDATE} ${OUT_FILE}" ;;
+  The tracked ${OUT_FILE} was NOT updated. Re-run this script with sudo
+  available, or verify+install manually (verification is REQUIRED — do
+  not skip the first command):
+    ${GO_BIN} -C ${REPO_ROOT} build -o /tmp/xpf-shimverify ./cmd/shimverify
+    sudo /tmp/xpf-shimverify ${CANDIDATE} && install -m 0644 ${CANDIDATE} ${OUT_FILE}" ;;
 3)
 	fail "kernel verifier REJECTED the candidate object — the tracked ${OUT_FILE} was NOT updated.
   This is the #1864 failure mode (toolchain codegen drift). Do not commit or deploy.
