@@ -1,6 +1,12 @@
 # #1861 — Transactional session install (forward+reverse partial-failure interleavings)
 
-**Status:** DRAFT v3 — round-1 verdicts: Codex PLAN-NEEDS-MAJOR
+**Status:** v4 — CONVERGED (round-2 verdicts: Codex PLAN-NEEDS-MINOR with
+a single doc-completeness finding folded in below (`task-mq9djuwh-gr13wk`,
+residual-arm `install_failed` line copied from SMR r2 into §5.2 + §12
+pin), AGY PLAN-READY (`adversarial-review-mq9dje05-cxqbly`), Claude SMR
+PLAN-READY (r2 doc)). Recommended path: **A** (pair preflight +
+drop-on-refusal + §5.4 repair ride-along).
+Round-1 verdicts: Codex PLAN-NEEDS-MAJOR
 (`task-mq9d341w-jxx35f`), AGY PLAN-NEEDS-MINOR
 (`adversarial-review-mq9apsuk-83bel6`), Claude SMR PLAN-NEEDS-MINOR.
 v2 folded: SMR F1 (I2 severity scoped to pool-mode SNAT; interface-mode
@@ -286,7 +292,11 @@ The reverse install keeps its existing condition but **adds the
 `forward_installed` gate** (kills latent I3) and the same
 debug_assert+count residual arm (forward stays committed in release if the
 impossible happens — the repair path I5 services replies; counted as
-`session_install_partial_total`).
+`session_install_partial_total`). **The reverse residual arm must ALSO set
+the §5.4 `install_failed` cache-suppression flag** (Codex r2: without it,
+the tolerate-in-release path would continue into the common cache insert
+at `mod.rs:1995-2016` and cache a partially-installed flow's decision;
+pinned in §12).
 
 ### 5.3 MissingNeighborSeed path (`mod.rs` ~2448)
 
@@ -509,6 +519,9 @@ MANDATORY before merge (project rule; stated in the issue).
   - I7/I8: behavior preserved at cap (forwarded / locally delivered).
   - I14: NAT64 v6→v4 SYN at cap ⇒ dropped, no session entries, no
     flow-cache entry (Codex C2 pin).
+  - Residual arms: `install_failed` flag set on the release-tolerate
+    reverse-residual path ⇒ no flow-cache entry (Codex r2 pin; rigged via
+    the same flag-propagation unit surface as the §5.4 repair pin).
   - Wire: counter key-absent pins both sides (Rust fixture + protocol.go).
 - Smoke on loss userspace cluster (parent-serialized) + **mandatory
   `make test-failover`** (install path + HA-adjacent).
