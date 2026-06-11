@@ -554,18 +554,56 @@ pub(super) fn apply_worker_commands(
                 );
             }
             WorkerCommand::UpsertLocal(entry) => {
-                // Trivial variant — kept inline (#1346 plan v2 §4.1):
-                // lifting a 3-line delegate to its own sibling file is
-                // negative value.
-                sessions.install_with_protocol_with_origin(
-                    entry.key,
-                    entry.decision,
-                    entry.metadata,
-                    entry.origin,
-                    now_ns,
-                    entry.protocol,
-                    entry.tcp_flags,
+                // Kept inline (#1346 plan v2 §4.1): lifting a short
+                // delegate to its own sibling file is negative value.
+                //
+                // #1870: local-tunnel pair entries are coordinator-
+                // authoritative replicas of state ALREADY published to
+                // the shared maps (the tunnel.rs publish precedes the
+                // enqueue). Routing them through the capped
+                // install_with_protocol_with_origin let max_sessions
+                // refuse the worker-table copy while the reactive
+                // shared-hit materialization
+                // (materialize_shared_session_hit) reinstalls the
+                // reverse entry uncapped on the next reply packet — a
+                // futile cap that only polluted create_drops and
+                // delayed/voided the prewarm. Use the uncapped
+                // sync-family install these SyncImport-origin entries
+                // belong to. allow_replace_local=true preserves the
+                // pre-#1870 replace semantics (the capped install
+                // clobbered any same-key entry below cap); the data is
+                // locally generated — the producer only runs when the
+                // tunnel resolution is ForwardCandidate
+                // (build_local_origin_tunnel_tx_request) — so the
+                // "don't let peer data clobber local sessions" guard
+                // does not apply.
+                debug_assert!(
+                    entry.origin.is_peer_synced(),
+                    "UpsertLocal entries must carry a sync-family origin; a \
+                     local origin would have pushed an HA delta on the old \
+                     install path"
                 );
+                let installed = sessions.upsert_synced_with_origin(
+                    SessionInstall {
+                        key: entry.key,
+                        decision: entry.decision,
+                        metadata: entry.metadata,
+                        origin: entry.origin,
+                        now_ns,
+                        protocol: entry.protocol,
+                        tcp_flags: entry.tcp_flags,
+                    },
+                    /* allow_replace_local = */ true,
+                );
+                // The only false exit is the local-clobber guard, which
+                // allow_replace_local=true bypasses — infallible by
+                // construction (#1855 contract: assert in debug, inert
+                // in release).
+                debug_assert!(
+                    installed,
+                    "upsert_synced_with_origin(_, true) is infallible"
+                );
+                let _ = installed;
             }
             WorkerCommand::DeleteSynced(key) => {
                 commands::handle_delete_synced(sessions, session_map_fd, key, now_ns);
