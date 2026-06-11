@@ -22,4 +22,4 @@ adversarial-review-mq9bmafk-47842g r2).
 | Codex | task-mq9e7t9v-d1c6r2 (session 019eb65d-474d-7f11-84e9-708f6539bc36) | MERGE-READY, findings: none (both r1 findings re-verified closed; pidof fix independently reproduced) |
 | AGY | adversarial-review-mq9e262p-w7n8e1 | MERGE-READY @ 8089ad089 (delta re-verified, root-gated tests re-run under sudo) |
 | Claude SMR | re-attestation appended to claude-smr-code-r1.md | MERGE-READY @ 8089ad089 |
-| Copilot | see retries above | quota-limited; 3-of-4 documented path per feedback_codex_infra_must_retry if retry 3 also fails |
+| Copilot | 3 documented requests via gh pr edit --add-reviewer Copilot | quota-limited 3x (10:48Z, 10:51Z, 11:21Z) — 3-of-4 path per feedback_codex_infra_must_retry: Codex + AGY + Claude SMR all MERGE-READY |
