@@ -114,8 +114,14 @@ pub(crate) struct CoSSchedulerSnapshot {
     /// "ideal-share"). Empty (the default for older snapshots and
     /// unset configs) decodes to the byte-unchanged `Slowest` math in
     /// forwarding_build. Only meaningful when `equal_flow_enforcement`
-    /// is set.
-    #[serde(rename = "equal_flow_target_policy", default)]
+    /// is set. skip_serializing_if mirrors the Go omitempty so the
+    /// unset-config wire stays byte-identical in BOTH directions
+    /// (pinned by `wire_invariant_default_specimens`).
+    #[serde(
+        rename = "equal_flow_target_policy",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
     pub equal_flow_target_policy: String,
     /// #1614 A3: per-queue CoDel target in nanoseconds. 0 disables
     /// CoDel for the queue (current default). WIRE SURFACE ONLY in
