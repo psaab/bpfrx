@@ -2,7 +2,12 @@
 
 ## 1. Status
 
-DRAFT v3 — revised after round-2 adversarial review (Claude SMR r2 +
+PLAN-READY v3 — converged round 3: Claude SMR PLAN-READY + Codex
+PLAN-READY (`task-mqa4cu0t-nhlc2g`) + AGY PLAN-READY
+(`adversarial-review-mqa4ce8t-mz62do`). Awaiting manual approval via
+`/engineer 1879`.
+
+v3 was produced after round-2 adversarial review (Claude SMR r2 +
 Codex `task-mqa42upr-3bwhh1` + AGY `adversarial-review-mqa42d7b-7umru1`,
 all PLAN-NEEDS-REVISION on v2's new mechanisms). v3 changes: the
 lifeline record is keyed by PCI address (not interface name — AGY r2

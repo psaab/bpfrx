@@ -5145,3 +5145,7 @@ top.
 - **Timestamp**: 2026-06-11 ~15:45 PT
   **Action**: #1875 /research (PLAN-READY 3-of-3, branch research/1875-cluster-ownership) + /engineer → PR #1878 (cluster lock cells: cluster-lock.sh, with-cluster.sh, self-locking cluster-setup/apply-cos verbs, marker-aware wg-interop inc(), 10-case selftest, docs protocol). Live guarded deploy + CoS re-apply + iperf3 validated on loss cluster. Quad review: Codex+AGY+SMR MERGE-READY, Copilot 3x quota-limited.
   **File(s)**: test/incus/{cluster-lock.sh,with-cluster.sh,with-cluster-selftest.sh,cluster-setup.sh,apply-cos-config.sh,wg-interop.sh,reverse-key-collision-probe.sh}, docs/engineering-style.md, CLAUDE.md, docs/wg-interop-runbook.md, docs/pr/1875-cluster-ownership/
+
+- **Timestamp**: 2026-06-11
+  **Action**: /research #1879 install-simplification — plan v1→v3, 3 review rounds (Codex+AGY+Claude SMR), converged PLAN-READY at round 3; research branch only, no production code
+  **File(s)**: docs/research/1879-install-simplify/{plan.md,claude-smr-plan-r1..3.md,codex-plan-r1..3.md,agy-plan-r1..3.md,reviewer-ids.md}

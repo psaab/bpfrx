@@ -12,3 +12,8 @@
 - AGY: adversarial-review-mqa42d7b-7umru1 — PLAN-NEEDS-REVISION (2: PCI-keyed lifeline; rollback persistence keeps bootstrap predicate)
 - Codex: task-mqa42upr-3bwhh1 — PLAN-NEEDS-REVISION (3: applySem-owned rollback transaction; enterBootstrapMode cleanup sequence; dependency matrix completeness); session 019eb8f4-1a88-7fa3-8966-4a3bf45a1ae7
 - Claude SMR: claude-smr-plan-r2.md — PLAN-NEEDS-REVISION minor (N1 renames-persist wording, N2 reconcile-to-empty semantics, N3 OQ-7 note)
+
+## Round 3 (plan v3 @ 67e4753f3) — CONVERGED
+- AGY: adversarial-review-mqa4ce8t-mz62do — PLAN-READY
+- Codex: task-mqa4cu0t-nhlc2g — PLAN-READY (session 019eb8fb-3409-7283-b261-e13c67561b8b)
+- Claude SMR: claude-smr-plan-r3.md — PLAN-READY
