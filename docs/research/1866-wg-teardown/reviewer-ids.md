@@ -19,3 +19,8 @@
 - Codex: session 019eb65f-9c7e-7cf2-a3dd-682ddb73357b — PLAN-NEEDS-CHANGES (residual: coherence tuple omits TUN attachment; exposes pre-existing D5 rename gap; "no other blocker")
 - AGY: adversarial-review-mq9e5iw5-ei11nc — PLAN-READY
 - Claude SMR: docs/research/1866-wg-teardown/claude-smr-plan-r4.md — PLAN-READY
+
+## Plan round 5 (target: plan.md v5 @ 3b7aeaabf) — CONVERGED
+- Codex: session 019eb666-4821-7522-9ebe-b10515bf063c — PLAN-READY
+- AGY: adversarial-review-mq9eknq4-fyl6au — PLAN-READY
+- Claude SMR: docs/research/1866-wg-teardown/claude-smr-plan-r5.md — PLAN-READY

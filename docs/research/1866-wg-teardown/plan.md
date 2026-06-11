@@ -2,7 +2,14 @@
 
 ## 1. Status
 
-DRAFT v5 — round-4 findings folded. Round-4 verdicts on v4: AGY
+**PLAN-READY (CONVERGED) — v5.** Round-5 verdicts on v5 @ 3b7aeaabf:
+Codex (session 019eb666-4821-7522-9ebe-b10515bf063c) PLAN-READY; AGY
+(adversarial-review-mq9eknq4-fyl6au) PLAN-READY; Claude SMR r5
+PLAN-READY. Five hostile rounds; the v5 design (tombstone-backed,
+snapshot-coherent, attachment-aware lifecycle + defer-branch prune +
+dual-boundary logging) is the converged plan of record.
+
+History: v5 — round-4 findings folded. Round-4 verdicts on v4: AGY
 (adversarial-review-mq9e5iw5-ei11nc) PLAN-READY; Claude SMR r4
 PLAN-READY; Codex (session 019eb65f-9c7e-7cf2-a3dd-682ddb73357b)
 PLAN-NEEDS-CHANGES with one residual: the coherent-respawn tuple covered
