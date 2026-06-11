@@ -1906,3 +1906,170 @@ fn count_active_flows_entry_at_epoch_max_not_confused_with_sentinel() {
     cache.tick_advance_epoch(); // skips 0 → 1
     assert_eq!(cache.count_active_flows(), 1, "entry at epoch MAX must be active after 1-tick advance");
 }
+
+// ----------------------------------------------------------------
+// (#1741) u16 epoch-wrap ghost resurrection — the production scan
+// must sentinel-clear out-of-window stamps so dead entries can never
+// re-enter the active window at the 65535-tick wrap. These four tests
+// pin the bug shape found in the research round (deterministic repro:
+// pre-fix, a dead entry resurrected for exactly ACTIVE_WINDOW_EPOCHS
+// ticks per cycle, first at tick 65519).
+// ----------------------------------------------------------------
+
+fn issue_1741_stamp_and_lookup() -> (FlowCache, crate::session::SessionKey, FlowCacheLookup) {
+    let cache = FlowCache::new();
+    let key = make_key();
+    let lookup = FlowCacheLookup {
+        ingress_ifindex: 7,
+        config_generation: 5,
+        fib_generation: 3,
+    };
+    (cache, key, lookup)
+}
+
+fn issue_1741_stamp() -> FlowCacheStamp {
+    FlowCacheStamp {
+        config_generation: 5,
+        fib_generation: 3,
+        owner_rg_id: 1,
+        owner_rg_epoch: 0,
+        owner_rg_lease_until: 0,
+    }
+}
+
+/// Single stamped entry, then idle across the full u16 wrap with the
+/// production scan running every tick (as it does at the single
+/// production call site). Pre-fix this resurrected 10 times starting
+/// at tick 65519; post-fix the count must stay 0 forever.
+#[test]
+fn issue_1741_epoch_wrap_dead_entry_never_resurrects() {
+    let rg_epochs = default_rg_epochs();
+    let (mut cache, key, lookup) = issue_1741_stamp_and_lookup();
+    cache.insert(make_entry(key.clone(), issue_1741_stamp(), 1));
+    assert!(cache.lookup(&key, lookup, 0, &rg_epochs).is_some());
+    // Flow dies; entry persists (no FIN/GC eviction of cache entries).
+    let mut resurrections = 0u32;
+    for tick in 0..70_000u32 {
+        cache.tick_advance_epoch();
+        let (active, _, _, _) = cache.active_flow_debug_entries(8);
+        // The entry legitimately stays active for the remainder of the
+        // window right after its last hit; only count post-window hits.
+        if tick >= u32::from(ACTIVE_WINDOW_EPOCHS) && active != 0 {
+            resurrections += 1;
+        }
+    }
+    assert_eq!(
+        resurrections, 0,
+        "dead entry re-entered the active window across the u16 wrap"
+    );
+}
+
+/// Production clean client-initiated close choreography (iperf3 shape):
+/// data ACKs stamp; the FIN takes the slow path and re-INSERTS the
+/// entry (sentinel-cleared); the final pure ACK fast-path hit re-stamps
+/// nonzero. The closed flow must then never count again across the
+/// wrap. Pre-fix: 10 resurrections per cycle.
+#[test]
+fn issue_1741_clean_close_choreography_never_ghosts() {
+    let rg_epochs = default_rg_epochs();
+    let (mut cache, key, lookup) = issue_1741_stamp_and_lookup();
+    // Established: insert + data-ACK hits.
+    cache.insert(make_entry(key.clone(), issue_1741_stamp(), 1));
+    assert!(cache.lookup(&key, lookup, 0, &rg_epochs).is_some());
+    cache.tick_advance_epoch();
+    assert!(cache.lookup(&key, lookup, 0, &rg_epochs).is_some());
+    // Client FIN: slow-path re-insert replaces the entry with the
+    // last_used_epoch = 0 sentinel (dedup-on-insert path).
+    cache.insert(make_entry(key.clone(), issue_1741_stamp(), 1));
+    assert_eq!(
+        cache.count_active_flows(),
+        0,
+        "FIN re-insert must sentinel-clear the stamp"
+    );
+    // Final client ACK (pure ACK, packet_eligible): fast-path hit
+    // re-stamps nonzero.
+    assert!(cache.lookup(&key, lookup, 0, &rg_epochs).is_some());
+    assert_eq!(cache.count_active_flows(), 1, "final ACK re-stamps");
+    // Fully closed; idle across the wrap with the production scan.
+    let mut resurrections = 0u32;
+    for tick in 0..70_000u32 {
+        cache.tick_advance_epoch();
+        let (active, _, _, _) = cache.active_flow_debug_entries(8);
+        if tick >= u32::from(ACTIVE_WINDOW_EPOCHS) && active != 0 {
+            resurrections += 1;
+        }
+    }
+    assert_eq!(
+        resurrections, 0,
+        "clean-closed (FIN + final ACK) flow resurrected across the wrap"
+    );
+}
+
+/// Window boundary: age ACTIVE_WINDOW_EPOCHS - 1 is counted and NOT
+/// clamped; age ACTIVE_WINDOW_EPOCHS is uncounted AND sentinel-cleared
+/// by the same scan.
+#[test]
+fn issue_1741_window_boundary_counts_age_9_clamps_age_10() {
+    let rg_epochs = default_rg_epochs();
+    let (mut cache, key, lookup) = issue_1741_stamp_and_lookup();
+    cache.insert(make_entry(key.clone(), issue_1741_stamp(), 1));
+    assert!(cache.lookup(&key, lookup, 0, &rg_epochs).is_some());
+    let stamped_epoch = cache.current_epoch;
+    // Advance to age = ACTIVE_WINDOW_EPOCHS - 1: still counted, stamp intact.
+    for _ in 0..(ACTIVE_WINDOW_EPOCHS - 1) {
+        cache.tick_advance_epoch();
+        let (active, _, _, _) = cache.active_flow_debug_entries(8);
+        assert_eq!(active, 1, "in-window entry must stay counted");
+    }
+    let stamp_after_window = cache
+        .entries
+        .iter()
+        .flatten()
+        .map(|entry| entry.last_used_epoch)
+        .next()
+        .expect("entry present");
+    assert_eq!(
+        stamp_after_window, stamped_epoch,
+        "in-window stamp must not be clamped"
+    );
+    // One more tick: age = ACTIVE_WINDOW_EPOCHS -> uncounted + cleared.
+    cache.tick_advance_epoch();
+    let (active, _, _, _) = cache.active_flow_debug_entries(8);
+    assert_eq!(active, 0, "age == window must be uncounted");
+    let stamp_after_expiry = cache
+        .entries
+        .iter()
+        .flatten()
+        .map(|entry| entry.last_used_epoch)
+        .next()
+        .expect("entry still cached (clamp must not evict)");
+    assert_eq!(stamp_after_expiry, 0, "expired stamp must be sentinel-cleared");
+}
+
+/// A clamped entry is not evicted: a later fast-path hit re-stamps it,
+/// it counts as active again, and its accumulated observed_bytes
+/// telemetry is preserved across the clamp.
+#[test]
+fn issue_1741_clamped_entry_recoverable_by_hit() {
+    let rg_epochs = default_rg_epochs();
+    let (mut cache, key, lookup) = issue_1741_stamp_and_lookup();
+    cache.insert(make_entry(key.clone(), issue_1741_stamp(), 1));
+    assert!(cache
+        .lookup_counted(&key, lookup, 0, &rg_epochs, 1500)
+        .is_some());
+    // Age out + clamp.
+    for _ in 0..(ACTIVE_WINDOW_EPOCHS + 2) {
+        cache.tick_advance_epoch();
+        let _ = cache.active_flow_debug_entries(8);
+    }
+    let (active, _, _, _) = cache.active_flow_debug_entries(8);
+    assert_eq!(active, 0);
+    // Returning flow: hit re-stamps; counted again; bytes preserved.
+    let hit = cache
+        .lookup_counted(&key, lookup, 0, &rg_epochs, 900)
+        .expect("clamped entry must still be a cache hit");
+    assert_eq!(hit.observed_bytes, 2400, "observed_bytes preserved across clamp");
+    let (active, rows, _, _) = cache.active_flow_debug_entries(8);
+    assert_eq!(active, 1, "re-hit entry counts as active again");
+    assert_eq!(rows.len(), 1);
+}
