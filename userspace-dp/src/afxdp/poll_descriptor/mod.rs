@@ -1106,9 +1106,9 @@ pub(super) fn poll_binding_process_descriptor(
                                     // frame at the L3 offset.
                                     let snat_non_first_fragment = {
                                         let l3 = meta.l3_offset as usize;
-                                        l3 <= raw_frame.len()
+                                        l3 <= packet_frame.len()
                                             && is_non_first_fragment(
-                                                &raw_frame[l3..],
+                                                &packet_frame[l3..],
                                                 meta.addr_family,
                                             )
                                     };
@@ -2368,9 +2368,9 @@ pub(super) fn poll_binding_process_descriptor(
                                         // for a non-first fragment (no L4 ports).
                                         let snat_non_first_fragment = {
                                             let l3 = meta.l3_offset as usize;
-                                            l3 <= raw_frame.len()
+                                            l3 <= packet_frame.len()
                                                 && is_non_first_fragment(
-                                                    &raw_frame[l3..],
+                                                    &packet_frame[l3..],
                                                     meta.addr_family,
                                                 )
                                         };
