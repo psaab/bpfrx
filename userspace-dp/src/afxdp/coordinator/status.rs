@@ -106,6 +106,21 @@ impl super::Coordinator {
         per_binding.saturating_add(SESSION_PUBLISH_ERRORS_SHARED.load(Ordering::Relaxed))
     }
 
+    /// #1760 W3': shared-map NAT reverse-key displacement events — a
+    /// `publish_shared_session` insert into `shared_nat_sessions`
+    /// displaced a DIFFERENT forward session's entry at the same reverse
+    /// key. The shared map is the single choke point every transit
+    /// forward NAT session passes through (including
+    /// `MissingNeighborSeed` installs, which never replicate to sibling
+    /// workers and are invisible to the per-worker
+    /// `nat_reverse_key_collisions` counter), so this is the
+    /// authoritative collision watch. Event count, not a pair census
+    /// (docs/research/1760-reverse-key-v2/plan.md §2.3). Surfaced as
+    /// `xpf_userspace_session_nat_reverse_key_shared_displacements_total`.
+    pub fn nat_reverse_key_shared_displacements_total(&self) -> u64 {
+        crate::afxdp::shared_ops::NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed)
+    }
+
     /// #1807: total worker-command-queue poison recoveries across every
     /// producer/consumer site (worker poll peek + apply, HA enqueues,
     /// session replication, activation prewarm, tunnel install/drain-wait,

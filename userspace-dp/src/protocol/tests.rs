@@ -162,6 +162,35 @@ fn process_status_worker_command_queue_poison_recoveries_roundtrip() {
     assert_eq!(legacy.worker_command_queue_poison_recoveries, 0);
 }
 
+// #1760 W3': round-trip + backward-compat pin for the shared-map NAT
+// reverse-key displacement counter. The wire key feeds
+// pkg/dataplane/userspace/protocol.go and the Prometheus counter
+// `xpf_userspace_session_nat_reverse_key_shared_displacements_total`.
+#[test]
+fn process_status_nat_reverse_key_shared_displacements_roundtrip() {
+    let status = ProcessStatus {
+        nat_reverse_key_shared_displacements_total: 7,
+        ..Default::default()
+    };
+    let value: serde_json::Value =
+        serde_json::to_value(&status).expect("serialize ProcessStatus to Value");
+    assert_eq!(value["nat_reverse_key_shared_displacements_total"], 7);
+    let back: ProcessStatus = serde_json::from_value(value).expect("deserialize ProcessStatus");
+    assert_eq!(back.nat_reverse_key_shared_displacements_total, 7);
+
+    // Pre-#1760-W3' payload (key absent) must decode with a zero default.
+    let mut legacy_value =
+        serde_json::to_value(ProcessStatus::default()).expect("serialize default ProcessStatus");
+    legacy_value
+        .as_object_mut()
+        .expect("ProcessStatus serializes to an object")
+        .remove("nat_reverse_key_shared_displacements_total")
+        .expect("new key present before strip");
+    let legacy: ProcessStatus =
+        serde_json::from_value(legacy_value).expect("pre-#1760-W3' payload decodes");
+    assert_eq!(legacy.nat_reverse_key_shared_displacements_total, 0);
+}
+
 // #1621 plan v2 + Copilot code-r1 C4: round-trip the new cold-path
 // histogram fields through serde to confirm:
 //   1. Default (zero / empty) WorkerRuntimeStatus omits every

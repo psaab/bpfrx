@@ -655,6 +655,18 @@ type ProcessStatus struct {
 	// as xpf_userspace_session_publish_errors_total. Omitempty for wire
 	// compat with older helpers.
 	SessionPublishErrorsTotal uint64 `json:"session_publish_errors_total,omitempty"`
+	// #1760 W3': shared-map NAT reverse-key displacement events — a
+	// publish_shared_session insert into shared_nat_sessions displaced a
+	// DIFFERENT forward session's entry at the same reverse key (two live
+	// forward NAT sessions mapping onto one reply tuple — the #1758/#1760
+	// latent 1:N collision). The shared map is the single choke point all
+	// transit forward NAT sessions pass through, including
+	// MissingNeighborSeed installs the per-worker
+	// nat_reverse_key_collisions counter cannot see. Event count, not a
+	// pair census. Surfaced as
+	// xpf_userspace_session_nat_reverse_key_shared_displacements_total.
+	// Omitempty for wire compat with older helpers.
+	NatReverseKeySharedDisplacementsTotal uint64 `json:"nat_reverse_key_shared_displacements_total,omitempty"`
 	// #1807: total worker-command-queue poison recoveries (a helper
 	// thread panicked while holding a worker command mutex; the
 	// committed queue was recovered and the poison cleared — uniform

@@ -153,6 +153,15 @@ pub(crate) fn worker_loop(
     let mut wr_state = WorkerRuntimeState::IdleBlock;
     let mut wr_last_loop_ns = monotonic_nanos();
     let mut wr_last_publish_ns = wr_last_loop_ns;
+    // #1760 W1: previous-snapshot values for the durable journald
+    // collision warn. Compared on the ~1s publish cadence below — zero
+    // per-packet work, one u64 compare per publish while the counters
+    // stay 0. The shared-displacement value is process-global, so every
+    // worker tracks its own prev and the process-global CAS throttle in
+    // shared_ops bounds emission to <=1 line/min regardless of how many
+    // workers observe the same increment.
+    let mut wr_prev_nat_collisions: u64 = 0;
+    let mut wr_prev_shared_displacements: u64 = 0;
     const WR_PUBLISH_INTERVAL_NS: u64 = 1_000_000_000;
     while !stop.load(Ordering::Relaxed) {
         let loop_now_ns = monotonic_nanos();
@@ -186,6 +195,42 @@ pub(crate) fn worker_loop(
                 wr_counters.max_sessions = sessions.max_sessions() as u64;
                 wr_counters.nat_reverse_key_collisions =
                     sessions.nat_reverse_key_collisions();
+                // #1760 W1: durable artifact for the reverse-key-collision
+                // watch. The in-process counters reset on every restart
+                // and the lab has no long-term Prometheus store, so a
+                // collision that happened before a redeploy would be
+                // unobservable without a journald line. Rate-limited by
+                // the process-global 60s CAS throttle; honest-semantics
+                // text per docs/research/1760-reverse-key-v2/plan.md §2.3.
+                let shared_displacements =
+                    crate::afxdp::shared_ops::NAT_REVERSE_KEY_SHARED_DISPLACEMENTS
+                        .load(Ordering::Relaxed);
+                if wr_counters.nat_reverse_key_collisions > wr_prev_nat_collisions
+                    || shared_displacements > wr_prev_shared_displacements
+                {
+                    // Only consume the pending increment when the warn was
+                    // actually emitted: a throttled increment keeps the
+                    // prevs unchanged and retries on later publish ticks,
+                    // so a burst inside one 60s window (or during the
+                    // first window after start, when the CAS slot is
+                    // still warming) still produces its journald line
+                    // instead of being silently swallowed.
+                    if crate::afxdp::shared_ops::try_claim_nat_reverse_key_warn(loop_now_ns) {
+                        eprintln!(
+                            "xpf-dp: NAT reverse-key collision detected (worker={} \
+                             local_total={} shared_total={}) — #1760 latent 1:N \
+                             reverse-path corruption; counts are displacement \
+                             events (>=1 means a real collision occurred; not a \
+                             pair census — standing collisions against an \
+                             already-unindexed session are not counted)",
+                            worker_id,
+                            wr_counters.nat_reverse_key_collisions,
+                            shared_displacements,
+                        );
+                        wr_prev_nat_collisions = wr_counters.nat_reverse_key_collisions;
+                        wr_prev_shared_displacements = shared_displacements;
+                    }
+                }
                 runtime_atomics.publish(&wr_counters, loop_now_ns);
                 // #1621: alongside the runtime publish, merge each
                 // binding's cold-path worker-local counters into a

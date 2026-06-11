@@ -176,6 +176,19 @@ pub(crate) struct ProcessStatus {
     /// Additive / defaulted for backward compatibility.
     #[serde(rename = "session_publish_errors_total", default)]
     pub session_publish_errors_total: u64,
+    /// #1760 W3': shared-map NAT reverse-key displacement events — a
+    /// `publish_shared_session` insert into `shared_nat_sessions`
+    /// displaced a DIFFERENT forward session's entry at the same reverse
+    /// key (two live forward NAT sessions mapping onto one reply tuple —
+    /// the #1758/#1760 latent 1:N collision). The shared map is the
+    /// single choke point all transit forward NAT sessions pass through,
+    /// including `MissingNeighborSeed` installs the per-worker
+    /// `nat_reverse_key_collisions` counter cannot see. Event count, not
+    /// a pair census. Surfaced as the Prometheus counter
+    /// `xpf_userspace_session_nat_reverse_key_shared_displacements_total`.
+    /// Additive / defaulted for backward compatibility.
+    #[serde(rename = "nat_reverse_key_shared_displacements_total", default)]
+    pub nat_reverse_key_shared_displacements_total: u64,
     /// #1807: total worker-command-queue poison recoveries (a thread
     /// panicked while holding a `Mutex<VecDeque<WorkerCommand>>`; the
     /// committed queue was recovered via into_inner and the poison
