@@ -25,7 +25,17 @@
 #       first and both flows start back-to-back, exercising the
 #       MissingNeighborSeed path where ONLY the W3' shared-map counter can
 #       see the collision (per-worker counter is structurally blind:
-#       seeds are not replicated).
+#       seeds are not replicated). Seed-purity is timing-dependent (kernel
+#       ARP on the local segment can resolve between the two SYNs, sending
+#       flow 2 down the normal install path) — the cold assertion is
+#       therefore on the SHARED counter advancing, which holds for both
+#       the seed and the normal install shape.
+#
+# Each invocation constructs its own preconditions: the source port is a
+# per-run random pick verified session-free on the active node, so the
+# variants can run back-to-back in any order (a fixed reused port made
+# the second run's connects ride the first run's still-live sessions —
+# session hits install nothing and can never displace).
 #
 # DELIBERATELY NOT PART OF SMOKE: this test corrupts the two probe flows
 # by design (mis-delivered or dropped replies are the expected observable
@@ -52,7 +62,14 @@ PROBE_IP2="${PROBE_IP2:-10.0.61.177}"
 # cluster operation. Override TARGET/TPORT for other listeners.
 TARGET="${TARGET:-172.16.80.200}"
 TPORT="${TPORT:-5201}"
-SRC_PORT="${SRC_PORT:-46161}"
+# Probe source port. Default is a per-invocation random pick verified
+# session-free below — a FIXED port made back-to-back variant runs ride
+# the previous run's still-live sessions (TCP timeouts >> run spacing):
+# the connects became session HITS, no install executed, and no
+# displacement could fire anywhere (the original cold-after-warm FAIL).
+# Each variant invocation must construct its own colliding pair from
+# scratch. Override only for a single isolated run.
+SRC_PORT="${SRC_PORT:-}"
 
 inc() { incus exec "$REMOTE:$1" -- bash -lc "$2"; }
 
@@ -86,9 +103,20 @@ if ! inc "$ACTIVE" "cli -c 'show configuration security nat source' 2>/dev/null"
 fi
 
 echo "-- preflight 2: probe address + baseline counters"
-inc "$LAN_HOST" "ip addr add $PROBE_IP2/24 dev eth1 2>/dev/null || true"
+# LAN-side device on the client container is NOT a stable name across
+# container images (observed eth0 on loss:cluster-userspace-host while
+# this script originally assumed eth1) — derive it from the first
+# global-scope v4 interface instead of hardcoding.
+LAN_DEV="$(inc "$LAN_HOST" "ip -4 -o addr show scope global" \
+    | awk '{print $2; exit}')"
+if [ -z "$LAN_DEV" ]; then
+    echo "FAIL: could not derive LAN-side device on $LAN_HOST"
+    exit 1
+fi
+echo "LAN device: $LAN_DEV"
+inc "$LAN_HOST" "ip addr add $PROBE_IP2/24 dev $LAN_DEV 2>/dev/null || true"
 cleanup() {
-    inc "$LAN_HOST" "ip addr del $PROBE_IP2/24 dev eth1 2>/dev/null || true"
+    inc "$LAN_HOST" "ip addr del $PROBE_IP2/24 dev $LAN_DEV 2>/dev/null || true"
 }
 trap cleanup EXIT
 
@@ -116,9 +144,39 @@ finally:
     s.close()
 '
 
-PROBE_IP1="$(inc "$LAN_HOST" "ip -4 -o addr show dev eth1 scope global" \
+PROBE_IP1="$(inc "$LAN_HOST" "ip -4 -o addr show dev $LAN_DEV scope global" \
     | awk '{print $4}' | cut -d/ -f1 | grep -v "^${PROBE_IP2}\$" | head -1)"
-echo "probe source IPs: $PROBE_IP1 + $PROBE_IP2 (src port $SRC_PORT)"
+
+# Pick (or verify) a source port with NO live session on the active node.
+# A port carrying a still-live session from a previous run turns the
+# probe connects into session hits — nothing installs, nothing displaces,
+# and the run reports a false negative (the original cold-after-warm
+# failure mode). The Junos-style session display renders ports as
+# ".../<port>", so grep for "/$port" with the word boundary.
+pick_port() {
+    local attempt port sessions
+    for attempt in 1 2 3 4 5; do
+        if [ -n "$SRC_PORT" ]; then
+            port="$SRC_PORT"
+        else
+            port=$((40000 + RANDOM % 20000))
+        fi
+        sessions="$(inc "$ACTIVE" "cli -c 'show security flow session destination-port $TPORT' 2>/dev/null" || true)"
+        if ! printf '%s' "$sessions" | grep -Eq "/$port( |\$)"; then
+            echo "$port"
+            return 0
+        fi
+        if [ -n "$SRC_PORT" ]; then
+            echo "FAIL: overridden SRC_PORT=$SRC_PORT already has a live session on $ACTIVE — wait it out or pick another" >&2
+            return 1
+        fi
+        echo "note: port $port busy with a live session; re-picking (attempt $attempt)" >&2
+    done
+    echo "FAIL: could not find a session-free source port in 5 attempts" >&2
+    return 1
+}
+SRC_PORT="$(pick_port)"
+echo "probe source IPs: $PROBE_IP1 + $PROBE_IP2 (src port $SRC_PORT, verified session-free)"
 
 if [ "$VARIANT" = "cold" ]; then
     echo "-- cold preflight: prove target reachability (ephemeral source port,"
