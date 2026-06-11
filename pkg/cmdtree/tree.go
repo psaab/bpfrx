@@ -366,6 +366,16 @@ var OperationalTree = map[string]*Node{
 						return names
 					}},
 					"nat-only": {Desc: "Show only sessions with NAT translation"},
+					"source-nat-pool": {Desc: "Filter sessions by source NAT pool", DynamicFn: func(cfg *config.Config) []string {
+						if cfg == nil || cfg.Security.NAT.SourcePools == nil {
+							return nil
+						}
+						names := make([]string, 0, len(cfg.Security.NAT.SourcePools))
+						for name := range cfg.Security.NAT.SourcePools {
+							names = append(names, name)
+						}
+						return names
+					}},
 					"sort-by": {Desc: "Sort sessions for top-talkers", Children: map[string]*Node{
 						"bytes":   {Desc: "Sort by total bytes (descending)"},
 						"packets": {Desc: "Sort by total packets (descending)"},
@@ -695,6 +705,16 @@ var OperationalTree = map[string]*Node{
 					}},
 					"application": {Desc: "Filter sessions by application name"},
 					"nat-only":    {Desc: "Clear only sessions with NAT translation"},
+					"source-nat-pool": {Desc: "Clear sessions translated by a source NAT pool", DynamicFn: func(cfg *config.Config) []string {
+						if cfg == nil || cfg.Security.NAT.SourcePools == nil {
+							return nil
+						}
+						names := make([]string, 0, len(cfg.Security.NAT.SourcePools))
+						for name := range cfg.Security.NAT.SourcePools {
+							names = append(names, name)
+						}
+						return names
+					}},
 				}},
 			}},
 			"counters": {Desc: "Clear all security counters"},

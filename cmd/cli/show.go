@@ -563,7 +563,7 @@ func (c *ctl) showFlowSession(args []string) error {
 					req.DestinationPort = uint32(v)
 				}
 			}
-		case "nat":
+		case "nat", "nat-only":
 			req.NatOnly = true
 		case "limit":
 			if i+1 < len(args) {
@@ -584,6 +584,12 @@ func (c *ctl) showFlowSession(args []string) error {
 		case "interface":
 			if i+1 < len(args) {
 				i++
+				req.InterfaceFilter = args[i]
+			}
+		case "source-nat-pool":
+			if i+1 < len(args) {
+				i++
+				req.SourceNatPool = args[i]
 			}
 		case "sort-by":
 			if i+1 < len(args) {

@@ -30,6 +30,34 @@
 - **Validation**: cargo build --release clean; full cargo test 1910
   passed / 1 flaky (wg reconcile_peers, passes 5/5 standalone) / 2
   ignored; go test ./... all ok.
+## 2026-06-10 — #1827 PR-3: NAT interplay (per-uplink SNAT + session-transition semantics)
+- **Timestamp**: 2026-06-10 UTC
+- **Action**: PR-3 of the #1827 multi-WAN program. Mini-plan +
+  semantics review at docs/pr/1827-pr3-nat/plan.md (adjudicated in the
+  PR's quad-review): per-uplink SNAT pools need NO new matcher (to-zone
+  derives from the resolved egress ifindex; verified by new Rust
+  per_uplink_* tests + Go snapshot test); session invalidation on
+  uplink transition is the Junos 23.4R1 `source-nat-pool` show/clear
+  session filter (translated source within the named pool's address
+  set), NOT an automatic clear. Repaired the filtered-clear path the
+  runbook rides on: peer-forwarded clears no longer drop
+  zone/interface/nat-only filters (an empty forwarded request meant
+  peer clear-ALL), interface-filtered local clears now populate the
+  iface maps (previously matched nothing), port filters now ntohs
+  network-order key ports, gRPC ClearSessions rebuilt on the shared
+  show matcher, unknown zone/pool names are errors, and pkg/cli
+  uint32ToIP decodes NativeEndian (BigEndian reversed NAT addresses in
+  local-CLI display). Filed #1855 for pre-existing master cargo-test
+  failures (session inplace debug_assert contract conflict).
+- **File(s)**: docs/pr/1827-pr3-nat/plan.md, proto/xpf/v1/xpf.proto,
+  pkg/grpcapi/xpfv1/*, pkg/config/natpool{,_test}.go,
+  pkg/grpcapi/server_sessions.go, pkg/grpcapi/session_filter_test.go,
+  pkg/cli/{session_filter,cli_clear,cli_show_flow,proto}.go,
+  pkg/cli/session_filter_test.go, cmd/cli/{show,clear}.go,
+  pkg/cmdtree/tree.go, userspace-dp/src/nat/tests.rs,
+  pkg/dataplane/userspace/nat_per_uplink_test.go, docs/multi-wan.md,
+  pkg/{cli,grpcapi}/README.md
+
 
 ## 2026-06-10 — #1824 proptest harness for frame parse/NAT/TSO
 - **Timestamp**: 2026-06-10 UTC
@@ -5058,3 +5086,11 @@ top.
 - **Timestamp**: 2026-06-10
   **Action**: "#1782 Step-2 (plan §5.2 mechanism (i), option (a)) — O(slots) timer-wheel snap for over-horizon cold-start catch-up: advance_cos_timer_wheel gains a #[cold] snap_cos_timer_wheel_over_horizon path taken only when lag > COS_TIMER_WHEEL_TOTAL_HORIZON_TICKS (65,536 ticks ~3.28s) AND no queue is parked (all wheel entries provably stale → clear all slot vectors + current_tick = now_tick is byte-identical to the per-tick loop end state); parked queue ⇒ fallback to the unchanged O(lag) loop (fallback NOT statically bounded (claim retracted per Codex r1: uncapped deficit/rate park ticks, 1 B/s schema floor); residual accepted — idle worker has no parked queue). Step-1 counters keep recording TRUE lag on the snap path. Tests: at-horizon boundary takes the loop and wakes due park; over-horizon snap clears stale L0+L1 entries, reports 2,226,212-tick true lag, post-snap re-park wakes exactly on time; parked+huge-lag fallback correct. Validation: cargo build --release clean in touched files; full Rust suite 1926 passed / 0 failed; go test ./... green; snap test 5×green standalone"
   **File(s)**: userspace-dp/src/afxdp/cos/{tx_completion.rs,tx_completion_tests.rs}, userspace-dp/src/afxdp/worker_runtime.rs, docs/{cos-traffic-shaping.md,fairness-regimes.md}, _Log.md
+
+- **Timestamp**: 2026-06-10
+  **Action**: "#1855 corrupted-key_to_handle contract (Path H per converged plan on research/1855-inplace-contract) — debug cargo test red on master fixed by ratifying the existing hybrid contract (remove_entry #964 precedent: debug=assert loudly, release=tolerate+return false) and cfg-gating the contradicting #1752 Path E tests: inplace_{stale,vacant}_handle_returns_false_no_panic become cfg(not(debug_assertions)) release-contract tests (stale test additionally covers refresh_for_ha_transition, AGY r1), and four new cfg(debug_assertions)+should_panic variants document each guard arm (update_session x2, refresh_for_ha_transition x2) via shared rig helpers rig_{stale,vacant}_handle_table. Guard-arm doc comments in mod.rs; session README gains a Corruption-contract section and the stale 'owned by the coordinator / shared locks' wording corrected to per-worker by-value ownership (Codex r1). No production code change, no counters. Validation: cargo test (debug) full suite 1856/0 green (was 2 failed); cargo test --release full 1855/0 green (worker_queue concurrent_recovery flake fired once under load, standalone-green, ledger-known); release named tests 5x each green; debug should_panic variants 5x each green (20/20); go test ./... green"
+  **File(s)**: userspace-dp/src/session/{tests.rs,mod.rs,README.md}, docs/research/1855-inplace-contract/{plan.md,claude-smr-review.md,reviewer-ids.md}, _Log.md
+
+- **Timestamp**: 2026-06-10
+  **Action**: "#1855 PR #1858 review round complete — Codex r1 NEEDS-CHANGES (1 MEDIUM: session README still said the timer-wheel sweep runs 'by the coordinator', inconsistent with the corrected per-worker ownership) fixed in 71f845fe5 (wheel.rs bullet -> each worker sweeps its own table from its poll loop via expire_stale_entries; GC section -> single-threaded per-worker); Codex r2 MERGE-READY (docs-only confirmed, zero coordinator matches remain); AGY MERGE-READY (5 verified findings incl. per-arm panic trace + both-profile runs); Claude SMR MERGE-READY (worked trace in docs/pr/1855-inplace-contract/claude-smr-review.md); Copilot quota-blocked 3 documented attempts -> 3-of-4. Named tests re-spot-checked green on final head in both profiles (14/14 each)"
+  **File(s)**: userspace-dp/src/session/README.md, docs/pr/1855-inplace-contract/{claude-smr-review.md,reviewer-ids.md}, _Log.md

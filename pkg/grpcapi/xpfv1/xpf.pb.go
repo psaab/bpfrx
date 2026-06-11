@@ -2292,8 +2292,9 @@ type GetSessionsRequest struct {
 	// page_token is an opaque string returned in the previous response's
 	// next_page_token.  When set, iteration resumes after that key.
 	PageToken     string `protobuf:"bytes,13,opt,name=page_token,json=pageToken,proto3" json:"page_token,omitempty"`
-	PageSize      int32  `protobuf:"varint,14,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"` // max entries per page; 0 = use limit/offset path
-	NoEnrich      bool   `protobuf:"varint,15,opt,name=no_enrich,json=noEnrich,proto3" json:"no_enrich,omitempty"` // skip reverse-entry merge & app name resolution
+	PageSize      int32  `protobuf:"varint,14,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"`                 // max entries per page; 0 = use limit/offset path
+	NoEnrich      bool   `protobuf:"varint,15,opt,name=no_enrich,json=noEnrich,proto3" json:"no_enrich,omitempty"`                 // skip reverse-entry merge & app name resolution
+	SourceNatPool string `protobuf:"bytes,16,opt,name=source_nat_pool,json=sourceNatPool,proto3" json:"source_nat_pool,omitempty"` // filter by source NAT pool name (translated source in pool)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2431,6 +2432,13 @@ func (x *GetSessionsRequest) GetNoEnrich() bool {
 		return x.NoEnrich
 	}
 	return false
+}
+
+func (x *GetSessionsRequest) GetSourceNatPool() string {
+	if x != nil {
+		return x.SourceNatPool
+	}
+	return ""
 }
 
 type GetSessionsResponse struct {
@@ -5278,6 +5286,9 @@ type ClearSessionsRequest struct {
 	SourcePort        uint32                 `protobuf:"varint,5,opt,name=source_port,json=sourcePort,proto3" json:"source_port,omitempty"`                     // optional
 	DestinationPort   uint32                 `protobuf:"varint,6,opt,name=destination_port,json=destinationPort,proto3" json:"destination_port,omitempty"`      // optional
 	Application       string                 `protobuf:"bytes,7,opt,name=application,proto3" json:"application,omitempty"`                                      // optional: application name filter
+	Interface         string                 `protobuf:"bytes,8,opt,name=interface,proto3" json:"interface,omitempty"`                                          // optional: ingress/egress interface name filter
+	NatOnly           bool                   `protobuf:"varint,9,opt,name=nat_only,json=natOnly,proto3" json:"nat_only,omitempty"`                              // optional: only sessions with NAT translation
+	SourceNatPool     string                 `protobuf:"bytes,10,opt,name=source_nat_pool,json=sourceNatPool,proto3" json:"source_nat_pool,omitempty"`          // optional: source NAT pool name (translated source in pool)
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -5357,6 +5368,27 @@ func (x *ClearSessionsRequest) GetDestinationPort() uint32 {
 func (x *ClearSessionsRequest) GetApplication() string {
 	if x != nil {
 		return x.Application
+	}
+	return ""
+}
+
+func (x *ClearSessionsRequest) GetInterface() string {
+	if x != nil {
+		return x.Interface
+	}
+	return ""
+}
+
+func (x *ClearSessionsRequest) GetNatOnly() bool {
+	if x != nil {
+		return x.NatOnly
+	}
+	return false
+}
+
+func (x *ClearSessionsRequest) GetSourceNatPool() string {
+	if x != nil {
+		return x.SourceNatPool
 	}
 	return ""
 }
@@ -7054,7 +7086,7 @@ const file_xpf_proto_rawDesc = "" +
 	"hitPackets\x12\x1b\n" +
 	"\thit_bytes\x18\t \x01(\x04R\bhitBytes\x12 \n" +
 	"\vdescription\x18\n" +
-	" \x01(\tR\vdescription\"\xf6\x03\n" +
+	" \x01(\tR\vdescription\"\x9e\x04\n" +
 	"\x12GetSessionsRequest\x12\x14\n" +
 	"\x05limit\x18\x01 \x01(\x05R\x05limit\x12\x16\n" +
 	"\x06offset\x18\x02 \x01(\x05R\x06offset\x12\x12\n" +
@@ -7073,7 +7105,8 @@ const file_xpf_proto_rawDesc = "" +
 	"\n" +
 	"page_token\x18\r \x01(\tR\tpageToken\x12\x1b\n" +
 	"\tpage_size\x18\x0e \x01(\x05R\bpageSize\x12\x1b\n" +
-	"\tno_enrich\x18\x0f \x01(\bR\bnoEnrich\"\xfd\x01\n" +
+	"\tno_enrich\x18\x0f \x01(\bR\bnoEnrich\x12&\n" +
+	"\x0fsource_nat_pool\x18\x10 \x01(\tR\rsourceNatPool\"\xfd\x01\n" +
 	"\x13GetSessionsResponse\x12\x14\n" +
 	"\x05total\x18\x01 \x01(\x05R\x05total\x12\x14\n" +
 	"\x05limit\x18\x02 \x01(\x05R\x05limit\x12\x16\n" +
@@ -7286,7 +7319,7 @@ const file_xpf_proto_rawDesc = "" +
 	"\x06source\x18\x02 \x01(\tR\x06source\x12)\n" +
 	"\x10routing_instance\x18\x03 \x01(\tR\x0froutingInstance\",\n" +
 	"\x12TracerouteResponse\x12\x16\n" +
-	"\x06output\x18\x01 \x01(\tR\x06output\"\x88\x02\n" +
+	"\x06output\x18\x01 \x01(\tR\x06output\"\xe9\x02\n" +
 	"\x14ClearSessionsRequest\x12#\n" +
 	"\rsource_prefix\x18\x01 \x01(\tR\fsourcePrefix\x12-\n" +
 	"\x12destination_prefix\x18\x02 \x01(\tR\x11destinationPrefix\x12\x1a\n" +
@@ -7295,7 +7328,11 @@ const file_xpf_proto_rawDesc = "" +
 	"\vsource_port\x18\x05 \x01(\rR\n" +
 	"sourcePort\x12)\n" +
 	"\x10destination_port\x18\x06 \x01(\rR\x0fdestinationPort\x12 \n" +
-	"\vapplication\x18\a \x01(\tR\vapplication\"]\n" +
+	"\vapplication\x18\a \x01(\tR\vapplication\x12\x1c\n" +
+	"\tinterface\x18\b \x01(\tR\tinterface\x12\x19\n" +
+	"\bnat_only\x18\t \x01(\bR\anatOnly\x12&\n" +
+	"\x0fsource_nat_pool\x18\n" +
+	" \x01(\tR\rsourceNatPool\"]\n" +
 	"\x15ClearSessionsResponse\x12!\n" +
 	"\fipv4_cleared\x18\x01 \x01(\x05R\vipv4Cleared\x12!\n" +
 	"\fipv6_cleared\x18\x02 \x01(\x05R\vipv6Cleared\"\x16\n" +

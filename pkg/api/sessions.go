@@ -243,9 +243,14 @@ func ntohs(v uint16) uint16 {
 	return binary.NativeEndian.Uint16(b[:])
 }
 
+// uint32ToIP converts a dataplane IPv4 field to net.IP. Session-map
+// values hold IP bytes in network order read as a NATIVE-endian u32
+// (the Rust helper publishes u32::from_ne_bytes(octets)); BigEndian
+// here reversed NAT addresses in the REST session view on
+// little-endian hosts (#1827 PR-3 r1, AGY finding).
 func uint32ToIP(v uint32) net.IP {
 	ip := make(net.IP, 4)
-	binary.BigEndian.PutUint32(ip, v)
+	binary.NativeEndian.PutUint32(ip, v)
 	return ip
 }
 

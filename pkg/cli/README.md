@@ -39,3 +39,13 @@ both the daemon-local CLI (xpfd in TTY mode) and the remote CLI
   when the daemon hookups are absent (test/standalone).
 - `fwdSampler` (forwarding CPU stats) can be `nil` — every show handler
   null-checks it.
+- Session filters (`session_filter.go`) serve BOTH show and clear. The
+  clear path must call `validate()` (unknown zone/pool names are
+  command errors — an inert filter degrades into clear-nothing or, via
+  `hasFilter()`, clear-ALL) and `populateIfaceMaps()` (interface
+  matching needs the zone/egress maps; only show built them before
+  #1827 PR-3). Peer-forwarded clears go through
+  `buildPeerClearRequest` — every filter dimension must be carried,
+  because an empty `ClearSessionsRequest` means clear-all to the peer.
+  Key ports are network byte order (`ntohs` before comparing) and
+  dataplane IPv4 NAT fields decode with NativeEndian (`uint32ToIP`).

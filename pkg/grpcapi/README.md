@@ -58,6 +58,15 @@ contract.
   uses; concurrent operator commits serialize via that semaphore (#846).
 - Tab completion (`Complete` RPC) and `?` help come from `pkg/cmdtree` —
   add commands there once and they show up in every CLI surface.
+- Session show and clear share ONE matcher: `ClearSessions` builds the
+  same `sessionFilter` (`buildSessionFilter` + `matchV4/matchV6`) the
+  `GetSessions` path uses (#1827 PR-3). Do not add a filter dimension
+  to one path only — and remember key ports are network byte order
+  (`ntohs` before comparing) and unresolvable zone/pool names must
+  fail the RPC, not silently widen/void the clear. The
+  `source-nat-pool` filter matches the TRANSLATED source
+  (`SessFlagSNAT` + `NATSrcIP` in the pool's address set via
+  `config.SourceNATPoolNets`).
 - Server-streaming RPCs (Ping, Traceroute, MonitorPacketDrop,
   MonitorInterface) must drain on client disconnect; cancel the context
   to free buffered output.
