@@ -41,6 +41,37 @@ pub(in crate::afxdp) struct LocalTunnelSourceHandle {
     pub(in crate::afxdp) join: Option<JoinHandle<()>>,
 }
 
+/// #1866: lifecycle entry for one WG control thread, keyed by
+/// tunnel_endpoint_id in `Coordinator::wg_control_threads`.
+///
+/// An entry whose `handle` is `None` is a TOMBSTONE: the thread exited
+/// (bind/TUN failure, panic, clean stop) but the entry is retained so
+/// the respawn backoff (`last_spawn_attempt_ns`) and the recorded
+/// identity/attachment survive until the endpoint actually leaves the
+/// desired set. Entries are removed ONLY by the apply-time stale prune
+/// (endpoint removed / engine identity changed / attachment changed),
+/// the defer-branch snapshot prune, and `stop_inner` — never by the
+/// finished sweep.
+pub(crate) struct WgControlEntry {
+    /// Live (or finished-but-unswept) thread handle. `None` = tombstone.
+    pub(in crate::afxdp) handle: Option<LocalTunnelSourceHandle>,
+    /// Address of the `Arc<WgEngine>` the thread was last spawned with.
+    /// Kept outside `handle` so tombstones retain identity: the
+    /// apply-time stale prune detects identity changes on tombstones
+    /// too (removal deliberately resets the backoff — a fresh identity
+    /// deserves an immediate attempt).
+    pub(in crate::afxdp) engine_ptr: usize,
+    /// TUN attachment captured at spawn (#1866 D5): logical ifindex +
+    /// resolved tunnel name. Attachment drift is a stale condition —
+    /// engine-Arc identity alone misses an interface rename with an
+    /// unchanged WG crypto identity.
+    pub(in crate::afxdp) spawned_ifindex: i32,
+    pub(in crate::afxdp) spawned_tunnel_name: String,
+    /// Stamped at EVERY spawn attempt (success or failure), before the
+    /// outcome is known. Tombstone-respawn backoff keys off this.
+    pub(in crate::afxdp) last_spawn_attempt_ns: u64,
+}
+
 #[derive(Clone)]
 pub(in crate::afxdp) struct BindingPlan {
     pub(in crate::afxdp) status: BindingStatus,

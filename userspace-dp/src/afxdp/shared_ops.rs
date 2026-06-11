@@ -493,6 +493,14 @@ pub(super) struct ResolvedFlowSessionDecision {
     pub(super) metadata: SessionMetadata,
     pub(super) origin: SessionOrigin,
     pub(super) created: bool,
+    /// #1861 §5.4: true when a session install was ATTEMPTED for this
+    /// decision and refused (max_sessions) — distinct from "no install
+    /// required" (hit paths, DNS fast-path), which stays false. The
+    /// flow-cache population gate keys off this so a sessionless
+    /// decision is never cached (caching it would suppress the
+    /// per-packet reply repair until cache invalidation; Codex #1861
+    /// r1 C1).
+    pub(super) install_failed: bool,
 }
 
 // Fabric-ingress SNAT-only forward entries are standby-side wire placeholders
@@ -717,7 +725,7 @@ pub(super) fn install_reverse_session_from_forward_match(
     ha_startup_grace_until_secs: u64,
     protocol: u8,
     tcp_flags: u8,
-) -> SessionLookup {
+) -> (SessionLookup, bool) {
     let reverse = build_reverse_session_from_forward_match(
         forwarding,
         ha_state,
@@ -726,7 +734,13 @@ pub(super) fn install_reverse_session_from_forward_match(
         now_secs,
         ha_startup_grace_until_secs,
     );
-    if sessions.install_with_protocol_with_origin(
+    // #1861 §5.4: the synthesized decision is returned EVEN when the
+    // install fails (max_sessions) so the reply keeps forwarding — but
+    // the caller must know the outcome: `created` telemetry and the
+    // flow-cache eligibility gate both key off it. Caching a decision
+    // with no backing session would suppress this repair until cache
+    // invalidation (Codex #1861 r1 C1).
+    let installed = sessions.install_with_protocol_with_origin(
         reverse_key.clone(),
         reverse.decision,
         reverse.metadata.clone(),
@@ -734,7 +748,8 @@ pub(super) fn install_reverse_session_from_forward_match(
         now_ns,
         protocol,
         tcp_flags,
-    ) {
+    );
+    if installed {
         // #1789: count failed reverse-install publishes (was `let _ =`).
         // No binding context in this shared-ops path — shared counter.
         if publish_live_session_entry(session_map_fd, reverse_key, reverse.decision.nat, true)
@@ -759,7 +774,7 @@ pub(super) fn install_reverse_session_from_forward_match(
         );
         replicate_session_upsert(peer_worker_commands, &reverse_entry);
     }
-    reverse
+    (reverse, installed)
 }
 
 pub(super) fn publish_shared_session(

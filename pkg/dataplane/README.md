@@ -39,6 +39,73 @@ consumers. CoS queue status includes queue-scoped drain-phase counters so
 operators can separate guarantee bytes, surplus bytes, and non-exact bytes
 sent while exact queues were still backlogged.
 
+## Shim artifact: pinned toolchain + verifier gates (#1864)
+
+`userspace_xdp_bpfel.o` (the retained Rust AF_XDP shim, built from
+`userspace-xdp/`) is **git-tracked and embedded into xpfd via
+go:embed** — it is the deployable artifact. `make build` never needs
+`make generate`; only regenerate when `userspace-xdp/` source changes.
+
+Why this is guarded: on 2026-06-10 a `make generate` with a drifted
+Rust nightly produced an object that exceeded the kernel verifier's
+1M processed-insn cap (`BPF program is too large. Processed 1000001
+insn`) and put BOTH HA cluster nodes into config-only mode. The
+upstream rustc/LLVM change in (nightly-2026-05-23, nightly-2026-05-27]
+altered `u64::saturating_sub` lowering in a way that defeats verifier
+state pruning; a year-old nightly fails differently — the safe
+toolchain set is an interval, so the build pins the toolchain AND
+verifies every candidate empirically.
+
+Guard layers (`build-userspace-xdp.sh`):
+
+1. **Toolchain pin** — `userspace-xdp/rust-toolchain.toml` is the
+   single source of truth (`channel = "nightly-YYYY-MM-DD"` +
+   rust-src). The script parses it strictly (exactly one channel key
+   in `[toolchain]`, format-validated) and refuses to build with a
+   missing toolchain, printing the exact `rustup toolchain install`
+   line. bpf-linker is version-pinned too (it embeds its own LLVM);
+   the script version-checks the exact PATH-resolved binary cargo
+   executes.
+2. **Verify-then-install** — the cargo output is loaded through the
+   real kernel verifier (`cmd/shimverify`: anonymous maps, no pins,
+   no attach, plus the same `validateUserspaceShimSpec` checks the
+   daemon runs) BEFORE the tracked `.o` is touched. REJECT or missing
+   privileges (root / passwordless sudo) ⇒ tracked object untouched,
+   nonzero exit, actionable message. There is no unverified-install
+   path. `RUST_BPF_TOOLCHAIN=...` overrides the pin for bisects, but
+   installing an unpinned object additionally requires
+   `XPF_SHIM_ALLOW_UNPINNED_INSTALL=1`.
+3. **Deploy pre-flight** — `xpfd verify-dataplane` runs the same
+   verify-only load against the object embedded in the invoked
+   binary (exit 0 PASS / 3 verifier REJECT / 1 other).
+   `test/incus/cluster-setup.sh deploy_vm()` pushes the new binary to
+   a temp path and runs this BEFORE stopping the old daemon — a
+   REJECT refuses the deploy with the old dataplane still forwarding.
+4. **Tests** — root-gated `TestVerifyEmbeddedUserspaceShim` catches a
+   bad tracked artifact in privileged `make test`;
+   `TestVerifyUserspaceShimShrinkEquivalence` proves the verify-only
+   hash-map MaxEntries shrink (memory hygiene for live-node
+   pre-flights) never changes the verifier verdict, using the
+   preserved incident object in `testdata/`.
+
+**Recovery runbook** (symptom: `load Rust xdp_userspace collection:
+... BPF program is too large. Processed 1000001 insn`, daemon in
+config-only mode):
+
+```
+git checkout -- pkg/dataplane/userspace_xdp_bpfel.o
+make build
+# redeploy; do NOT run make generate until the toolchain matches the pin
+```
+
+**Pin-bump procedure**: edit `userspace-xdp/rust-toolchain.toml` (and
+`PINNED_BPF_LINKER_VERSION` in `build-userspace-xdp.sh` if bumping the
+linker), run `make generate` (the verifier gate must PASS), commit the
+regenerated `.o` together with the pin change, and require a clean
+`git diff --exit-code pkg/dataplane/userspace_xdp_bpfel.o` after a
+pinned re-run (builds are bit-for-bit reproducible for a given pin)
+plus a cluster smoke before merge.
+
 ## Entry points
 
 - `DataPlane` — `dataplane.go`. Legacy BPF-shaped interface kept for the

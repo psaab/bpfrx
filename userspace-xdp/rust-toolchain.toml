@@ -1,0 +1,22 @@
+# #1864: PINNED BPF codegen toolchain — single source of truth.
+#
+# pkg/dataplane/build-userspace-xdp.sh parses `channel` below and
+# refuses to build the shim object with anything else (override:
+# RUST_BPF_TOOLCHAIN, install-gated by XPF_SHIM_ALLOW_UNPINNED_INSTALL).
+#
+# WHY PINNED: the upstream rustc/LLVM change between nightly-2026-05-23
+# and nightly-2026-05-27 altered u64::saturating_sub lowering in a way
+# that defeats BPF verifier state pruning; the rebuilt shim exceeded
+# the 1M processed-insn verifier cap and took both HA cluster
+# dataplanes down on 2026-06-10. The safe toolchain set is an interval
+# (year-old nightlies fail differently, on variable-offset packet
+# pointers) — only the verifier gate in build-userspace-xdp.sh defines
+# membership.
+#
+# BUMP PROCEDURE: change `channel`, run `make generate` (the verifier
+# gate must PASS), commit the regenerated userspace_xdp_bpfel.o
+# together with this file, and let the PR reproducibility gate
+# (pinned regenerate + clean `git diff`) plus a cluster smoke confirm.
+[toolchain]
+channel = "nightly-2026-05-23"
+components = ["rust-src"]

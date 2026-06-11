@@ -65,6 +65,41 @@ and `update_session` is the per-packet refresh path (an unthrottled log
 would flood under a real bug). Decision record:
 `docs/research/1855-inplace-contract/plan.md`.
 
+## Admission / transaction boundary (#1861)
+
+`install_with_protocol_with_origin` refuses an install when
+`len() >= max_sessions` (131,072 per worker table) — the ONLY install
+failure mode. The new-flow path in `poll_descriptor` installs a
+forward+reverse pair, and pre-#1861 the two halves were independent:
+at cap, a refused forward still forwarded (and flow-cached) the trigger
+packet on a rolled-back SNAT decision, and a refused reverse left a
+one-sided forward session.
+
+The transaction boundary is a preflight: `can_admit(needed)` checks
+capacity for the whole install group BEFORE the first install. Because
+the table is single-writer (`&mut`, worker thread; GC and worker
+commands run between poll phases, never mid-descriptor), a passing
+preflight makes the subsequent installs infallible — no reservation or
+rollback machinery is needed. `can_admit` is deliberately conservative:
+it charges a full slot per entry even when the key already exists,
+matching the install's own cap check (which also refuses replacements
+at cap), so the preflight can never pass where the install would fail.
+On refusal the caller drops the trigger packet (Junos parity), rolls
+back the SNAT allocation, and counts via `note_admission_refused`.
+
+Counters (all plain worker-owned u64s like `create_drops`, exported
+since #1861 via the worker-runtime status path as
+`xpf_userspace[_worker]_session_*_total`):
+
+- `create_drops` — at-cap refusals from the install itself (repair,
+  seed, fabric-return, LocalMiss, UpsertLocal replica sites);
+- `admission_refused` — preflight refusals (one per refused flow);
+- `install_partial` — post-preflight residuals, expected 0 forever
+  (the call sites pair the count with `debug_assert!` per the #1855
+  contract above).
+
+Decision record: `docs/research/1861-install-txn/plan.md`.
+
 ## Why a slab + integer handles
 
 Pre-#964 the table was `HashMap<Key, Arc<SessionEntry>>`. Reverse-NAT

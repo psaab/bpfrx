@@ -6,7 +6,7 @@
 
 use super::super::helpers::{
     reconcile_status_bindings, refresh_status, replan_queues,
-    same_plan_apply_needs_binding_reconcile, snapshot_binding_plan_key,
+    same_plan_apply_needs_binding_reconcile, should_run_afxdp, snapshot_binding_plan_key,
 };
 use super::super::ServerState;
 use crate::{ConfigSnapshot, ControlResponse, CONFIG_SNAPSHOT_PROTOCOL_VERSION};
@@ -92,13 +92,35 @@ pub(super) fn apply(
             guard.snapshot = Some(snapshot);
             reconcile_status_bindings(guard);
         } else {
-            guard.afxdp.refresh_runtime_snapshot(&snapshot);
+            // #1866 (PR-review Codex r1 F1 + r2): refresh_runtime_snapshot
+            // reconciles WG control threads for the running case
+            // (Copilot C1, #1432) — but a DISARMED helper must not
+            // spawn/bind them even transiently (the control loop binds
+            // and may emit a handshake initiation before its first
+            // stop check). The disarmed variant refreshes the same
+            // forwarding/validation state with the WG spawn pass
+            // replaced by a stop, mirroring reconcile_status_bindings.
+            if should_run_afxdp(&guard.status) {
+                guard.afxdp.refresh_runtime_snapshot(&snapshot);
+            } else {
+                guard.afxdp.refresh_runtime_snapshot_disarmed(&snapshot);
+            }
             guard.snapshot = Some(snapshot);
         }
         refresh_status(guard);
         *persist_state = true;
     } else {
         let defer_workers = snapshot.defer_workers;
+        if defer_workers {
+            // #1866 Change 2b (D4): the defer branch stores the snapshot
+            // WITHOUT reconciling, leaving the coordinator's forwarding
+            // (and so its WG desired set) stale until the deferred
+            // bring-up. A WG endpoint REMOVED by this apply must still
+            // release its control thread + UDP port NOW — narrow
+            // prune-only reconcile against the new snapshot (no spawn,
+            // no forwarding mutation).
+            guard.afxdp.prune_wg_control_threads_for_snapshot(&snapshot);
+        }
         guard.snapshot = Some(snapshot);
         let replanned = replan_queues(
             guard.snapshot.as_ref(),

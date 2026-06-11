@@ -550,6 +550,32 @@ func newCollector(srv *Server) *xpfCollector {
 				"counted here — see the shared displacements counter.",
 			[]string{"worker_id"}, nil,
 		),
+		workerSessionCreateDrops: prometheus.NewDesc(
+			"xpf_userspace_worker_session_create_drops_total",
+			"Cumulative session installs refused at the max_sessions cap on "+
+				"this userspace worker's session table (#1861 — previously "+
+				"counted internally but never exported). Covers every "+
+				"install site (new-flow, reply repair, seed, fabric-return, "+
+				"LocalMiss helper, UpsertLocal replicas).",
+			[]string{"worker_id"}, nil,
+		),
+		workerSessionInstallAdmissionRefused: prometheus.NewDesc(
+			"xpf_userspace_worker_session_install_admission_refused_total",
+			"Cumulative new flows refused (trigger packet dropped, Junos "+
+				"parity) by the #1861 forward+reverse pair-admission "+
+				"preflight at/near max_sessions on this userspace worker. "+
+				"One increment per refused flow, not per missing slot.",
+			[]string{"worker_id"}, nil,
+		),
+		workerSessionInstallPartial: prometheus.NewDesc(
+			"xpf_userspace_worker_session_install_partial_total",
+			"Post-preflight partial session installs on this userspace "+
+				"worker (#1861 release residual arms). Expected to stay 0 "+
+				"forever; nonzero means the preflight/install pairing has a "+
+				"bug and the dataplane degraded a flow instead of "+
+				"half-committing it.",
+			[]string{"worker_id"}, nil,
+		),
 		userspaceSessionTableEntries: prometheus.NewDesc(
 			"xpf_userspace_session_table_entries",
 			"Aggregate live userspace session-table entries across workers.",
@@ -582,6 +608,26 @@ func newCollector(srv *Server) *xpfCollector {
 				"counter). Event count, not a pair census: >=1 means at "+
 				"least one real collision occurred; standing collisions "+
 				"against an already-unindexed session are not counted.",
+			nil, nil,
+		),
+		userspaceSessionCreateDrops: prometheus.NewDesc(
+			"xpf_userspace_session_create_drops_total",
+			"Aggregate session installs refused at the max_sessions cap "+
+				"across userspace workers (#1861).",
+			nil, nil,
+		),
+		userspaceSessionInstallAdmissionRefused: prometheus.NewDesc(
+			"xpf_userspace_session_install_admission_refused_total",
+			"Aggregate new flows refused (trigger packet dropped, Junos "+
+				"parity) by the #1861 forward+reverse pair-admission "+
+				"preflight at/near max_sessions, across userspace workers.",
+			nil, nil,
+		),
+		userspaceSessionInstallPartial: prometheus.NewDesc(
+			"xpf_userspace_session_install_partial_total",
+			"Aggregate post-preflight partial session installs across "+
+				"userspace workers (#1861 release residual arms; expected 0 "+
+				"forever — nonzero means a preflight/install pairing bug).",
 			nil, nil,
 		),
 		userspaceSessionPublishErrors: prometheus.NewDesc(

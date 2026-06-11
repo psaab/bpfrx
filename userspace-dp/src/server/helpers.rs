@@ -15,6 +15,17 @@ use std::io::{self, Write};
 
 pub(crate) fn refresh_status(state: &mut ServerState) {
     state.afxdp.refresh_bindings(&mut state.status.bindings);
+    // #1866 Change 2: WG control-thread self-heal. Tombstone-only +
+    // snapshot-coherent (see Coordinator::reconcile_wg_control_liveness)
+    // and gated on should_run_afxdp so a disarmed/stopped helper never
+    // re-binds WG ports (the stop-gate — Claude SMR r1 F1). Runs on
+    // every non-suppressed control response; the per-id 3s backoff and
+    // the ≤1-spawn-per-invocation bound keep the cadence trivial.
+    if should_run_afxdp(&state.status) {
+        state
+            .afxdp
+            .reconcile_wg_control_liveness(state.snapshot.as_ref());
+    }
     let writer_status = state.state_writer.status();
     state.status.io_uring_active = writer_status.active;
     state.status.io_uring_mode = writer_status.mode;
@@ -133,6 +144,25 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
         .worker_runtime
         .iter()
         .map(|w| w.nat_reverse_key_collisions)
+        .sum();
+    // #1861: aggregate the per-worker install-refusal trio.
+    state.status.session_create_drops = state
+        .status
+        .worker_runtime
+        .iter()
+        .map(|w| w.session_create_drops)
+        .sum();
+    state.status.session_install_admission_refused = state
+        .status
+        .worker_runtime
+        .iter()
+        .map(|w| w.session_install_admission_refused)
+        .sum();
+    state.status.session_install_partial = state
+        .status
+        .worker_runtime
+        .iter()
+        .map(|w| w.session_install_partial)
         .sum();
     state.status.max_sessions = state
         .status

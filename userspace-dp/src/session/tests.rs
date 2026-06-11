@@ -2495,3 +2495,107 @@ fn nat_reverse_key_collision_counter_zero_without_collision() {
         "non-colliding flows must leave the collision counter at 0",
     );
 }
+
+// ── #1861: pair-admission preflight (can_admit) + refusal counters ────
+//
+// The transactional-install fix relies on `can_admit(needed)` being a
+// sound preflight for the forward+reverse install pair: a passing
+// preflight on the single-threaded table must make the subsequent
+// `needed` installs infallible within the same descriptor iteration.
+
+fn key_with_port(port: u16) -> SessionKey {
+    SessionKey {
+        src_port: port,
+        ..key_v4()
+    }
+}
+
+#[test]
+fn can_admit_boundary_matches_install_cap() {
+    let mut table = SessionTable::new();
+    table.set_max_sessions_for_test(4);
+    let now = 1_000_000_000u64;
+    for port in 0..2u16 {
+        assert!(table.install_with_protocol(
+            key_with_port(10_000 + port),
+            decision(),
+            metadata(),
+            now,
+            PROTO_TCP,
+            0x02,
+        ));
+    }
+    // len == 2, cap == 4: a forward+reverse pair (2 slots) fits exactly.
+    assert!(table.can_admit(2));
+    assert!(table.install_with_protocol(
+        key_with_port(10_002),
+        decision(),
+        metadata(),
+        now,
+        PROTO_TCP,
+        0x02,
+    ));
+    // len == 3, cap == 4: a pair no longer fits, a single still does.
+    assert!(!table.can_admit(2), "cap-1 must refuse a 2-slot pair");
+    assert!(table.can_admit(1));
+    assert!(table.install_with_protocol(
+        key_with_port(10_003),
+        decision(),
+        metadata(),
+        now,
+        PROTO_TCP,
+        0x02,
+    ));
+    // len == cap: nothing fits, and the raw install agrees (this is the
+    // post-preflight infallibility contract: can_admit(n)==true ⇒ the
+    // next n installs return true).
+    assert!(!table.can_admit(1));
+    assert!(!table.install_with_protocol(
+        key_with_port(10_004),
+        decision(),
+        metadata(),
+        now,
+        PROTO_TCP,
+        0x02,
+    ));
+    assert_eq!(table.create_drops(), 1, "at-cap install must count a create drop");
+    // can_admit(0) is the tracking-not-required case — always true.
+    assert!(table.can_admit(0));
+}
+
+#[test]
+fn can_admit_is_conservative_for_replacements() {
+    // Matches install_with_protocol_with_origin's own cap check, which
+    // refuses replacements at cap even though they would not grow the
+    // table. Crediting replacements in the preflight would break the
+    // infallibility contract (preflight passes, install fails).
+    let mut table = SessionTable::new();
+    table.set_max_sessions_for_test(1);
+    let now = 1_000_000_000u64;
+    let key = key_with_port(20_000);
+    assert!(table.install_with_protocol(
+        key.clone(),
+        decision(),
+        metadata(),
+        now,
+        PROTO_TCP,
+        0x02,
+    ));
+    assert!(!table.can_admit(1));
+    assert!(
+        !table.install_with_protocol(key, decision(), metadata(), now, PROTO_TCP, 0x02),
+        "raw install also refuses the replacement at cap — preflight matches"
+    );
+}
+
+#[test]
+fn admission_refused_and_install_partial_counters_accumulate() {
+    let mut table = SessionTable::new();
+    assert_eq!(table.admission_refused(), 0);
+    assert_eq!(table.install_partial(), 0);
+    table.note_admission_refused();
+    table.note_admission_refused();
+    table.note_install_partial();
+    assert_eq!(table.admission_refused(), 2);
+    assert_eq!(table.install_partial(), 1);
+}

@@ -115,6 +115,22 @@ pub(crate) struct ProcessStatus {
     /// counter does NOT resolve #1760.
     #[serde(rename = "nat_reverse_key_collisions", default)]
     pub nat_reverse_key_collisions: u64,
+    /// #1861: aggregate at-cap install refusals summed across the
+    /// per-worker session tables (`SessionTable::create_drops` — was
+    /// write-only/invisible before #1861). Additive: older helpers omit
+    /// it (defaults to 0).
+    #[serde(rename = "session_create_drops", default)]
+    pub session_create_drops: u64,
+    /// #1861: aggregate pair-admission preflight refusals (one per
+    /// refused flow) — the new-flow transaction boundary dropping a
+    /// trigger packet at/near max_sessions. Additive.
+    #[serde(rename = "session_install_admission_refused", default)]
+    pub session_install_admission_refused: u64,
+    /// #1861: aggregate post-preflight partial-install residuals.
+    /// Expected 0 forever; nonzero means the preflight/install pairing
+    /// has a bug. Additive.
+    #[serde(rename = "session_install_partial", default)]
+    pub session_install_partial: u64,
     /// Aggregate per-binding flow-cache capacity across helper-published
     /// binding status rows. Zero means unavailable, not full.
     #[serde(rename = "flow_cache_capacity", default)]

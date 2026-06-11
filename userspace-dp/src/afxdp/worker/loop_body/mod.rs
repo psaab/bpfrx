@@ -195,6 +195,12 @@ pub(crate) fn worker_loop(
                 wr_counters.max_sessions = sessions.max_sessions() as u64;
                 wr_counters.nat_reverse_key_collisions =
                     sessions.nat_reverse_key_collisions();
+                // #1861: install-refusal trio from the worker's
+                // SessionTable (create_drops was write-only before).
+                wr_counters.session_create_drops = sessions.create_drops();
+                wr_counters.session_install_admission_refused =
+                    sessions.admission_refused();
+                wr_counters.session_install_partial = sessions.install_partial();
                 // #1760 W1: durable artifact for the reverse-key-collision
                 // watch. The in-process counters reset on every restart
                 // and the lab has no long-term Prometheus store, so a

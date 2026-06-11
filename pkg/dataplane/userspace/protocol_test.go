@@ -1674,3 +1674,105 @@ func TestCoSQueueStatusLeaseClaimFlowWire(t *testing.T) {
 		}
 	}
 }
+
+// #1861: wire pin for the install-refusal trio (transactional session
+// install). The Rust helper serializes ProcessStatus.session_create_drops /
+// session_install_admission_refused / session_install_partial plus the
+// per-worker WorkerRuntimeStatus copies (serde renames in
+// userspace-dp/src/protocol/control.rs and protocol/binding.rs); a key
+// rename on either side silently decodes as zero, so pin the tags here
+// and verify the pre-#1861 (key absent) payloads default to zero.
+func TestProcessStatusInstallRefusalTrioRoundTrip(t *testing.T) {
+	in := ProcessStatus{
+		SessionCreateDrops:             7,
+		SessionInstallAdmissionRefused: 5,
+		SessionInstallPartial:          1,
+	}
+	raw, err := json.Marshal(&in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("unmarshal obj: %v", err)
+	}
+	for _, key := range []string{
+		"session_create_drops",
+		"session_install_admission_refused",
+		"session_install_partial",
+	} {
+		if _, ok := obj[key]; !ok {
+			t.Fatalf("wire key %q missing from ProcessStatus JSON: %s", key, string(raw))
+		}
+	}
+
+	var back ProcessStatus
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatalf("unmarshal ProcessStatus: %v", err)
+	}
+	if back.SessionCreateDrops != in.SessionCreateDrops ||
+		back.SessionInstallAdmissionRefused != in.SessionInstallAdmissionRefused ||
+		back.SessionInstallPartial != in.SessionInstallPartial {
+		t.Fatalf("round trip mismatch: got (%d,%d,%d), want (%d,%d,%d)",
+			back.SessionCreateDrops, back.SessionInstallAdmissionRefused,
+			back.SessionInstallPartial, in.SessionCreateDrops,
+			in.SessionInstallAdmissionRefused, in.SessionInstallPartial)
+	}
+
+	// Pre-#1861 helper payload (keys absent) must decode to zero.
+	var legacy ProcessStatus
+	if err := json.Unmarshal([]byte(`{}`), &legacy); err != nil {
+		t.Fatalf("unmarshal legacy ProcessStatus: %v", err)
+	}
+	if legacy.SessionCreateDrops != 0 ||
+		legacy.SessionInstallAdmissionRefused != 0 ||
+		legacy.SessionInstallPartial != 0 {
+		t.Fatalf("legacy trio: got (%d,%d,%d), want zeros",
+			legacy.SessionCreateDrops, legacy.SessionInstallAdmissionRefused,
+			legacy.SessionInstallPartial)
+	}
+}
+
+// #1861: same pin for the per-worker WorkerRuntimeStatus copies.
+func TestWorkerRuntimeStatusInstallRefusalTrioRoundTrip(t *testing.T) {
+	in := WorkerRuntimeStatus{
+		SessionCreateDrops:             3,
+		SessionInstallAdmissionRefused: 2,
+		SessionInstallPartial:          1,
+	}
+	raw, err := json.Marshal(&in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("unmarshal obj: %v", err)
+	}
+	for _, key := range []string{
+		"session_create_drops",
+		"session_install_admission_refused",
+		"session_install_partial",
+	} {
+		if _, ok := obj[key]; !ok {
+			t.Fatalf("wire key %q missing from WorkerRuntimeStatus JSON: %s", key, string(raw))
+		}
+	}
+	var back WorkerRuntimeStatus
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatalf("unmarshal WorkerRuntimeStatus: %v", err)
+	}
+	if back.SessionCreateDrops != 3 || back.SessionInstallAdmissionRefused != 2 ||
+		back.SessionInstallPartial != 1 {
+		t.Fatalf("round trip mismatch: got (%d,%d,%d)",
+			back.SessionCreateDrops, back.SessionInstallAdmissionRefused,
+			back.SessionInstallPartial)
+	}
+	var legacy WorkerRuntimeStatus
+	if err := json.Unmarshal([]byte(`{}`), &legacy); err != nil {
+		t.Fatalf("unmarshal legacy WorkerRuntimeStatus: %v", err)
+	}
+	if legacy.SessionCreateDrops != 0 || legacy.SessionInstallAdmissionRefused != 0 ||
+		legacy.SessionInstallPartial != 0 {
+		t.Fatalf("legacy WorkerRuntimeStatus trio nonzero")
+	}
+}

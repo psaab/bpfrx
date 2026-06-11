@@ -125,6 +125,17 @@ pub(crate) struct WorkerRuntimeCounters {
     /// #1760: cumulative NAT reverse-key displacement events from this
     /// worker's SessionTable (`SessionTable::nat_reverse_key_collisions`).
     pub nat_reverse_key_collisions: u64,
+    /// #1861: cumulative at-cap install refusals from this worker's
+    /// SessionTable (`SessionTable::create_drops` — previously
+    /// write-only/invisible).
+    pub session_create_drops: u64,
+    /// #1861: cumulative pair-admission preflight refusals (one per
+    /// refused flow) from `SessionTable::admission_refused`.
+    pub session_install_admission_refused: u64,
+    /// #1861: cumulative post-preflight partial-install residuals from
+    /// `SessionTable::install_partial`. Expected 0 forever; nonzero
+    /// means the preflight/install pairing has a bug.
+    pub session_install_partial: u64,
 }
 
 /// 60 s rolling window. Sized to comfortably cover typical Prometheus
@@ -195,6 +206,10 @@ pub(crate) struct WorkerRuntimeAtomics {
     /// Relaxed cumulative counter (like `session_table_entries`), NOT part
     /// of the seqlock-published rolling-window tuple below.
     pub nat_reverse_key_collisions: AtomicU64,
+    /// #1861: install-refusal trio (same Relaxed cumulative pattern).
+    pub session_create_drops: AtomicU64,
+    pub session_install_admission_refused: AtomicU64,
+    pub session_install_partial: AtomicU64,
     /// Snapshot of the corresponding cumulative counter at the start of
     /// the current rolling window, plus the monotonic timestamp the
     /// snapshot was taken at. `publish()` rotates these whenever the
@@ -260,6 +275,9 @@ impl WorkerRuntimeAtomics {
             session_table_entries: AtomicU64::new(0),
             max_sessions: AtomicU64::new(0),
             nat_reverse_key_collisions: AtomicU64::new(0),
+            session_create_drops: AtomicU64::new(0),
+            session_install_admission_refused: AtomicU64::new(0),
+            session_install_partial: AtomicU64::new(0),
             wall_ns_window_base: AtomicU64::new(0),
             active_ns_window_base: AtomicU64::new(0),
             thread_cpu_ns_window_base: AtomicU64::new(0),
@@ -319,6 +337,13 @@ impl WorkerRuntimeAtomics {
             .store(c.session_table_entries, Ordering::Relaxed);
         self.nat_reverse_key_collisions
             .store(c.nat_reverse_key_collisions, Ordering::Relaxed);
+        // #1861: install-refusal trio, same Relaxed cumulative cadence.
+        self.session_create_drops
+            .store(c.session_create_drops, Ordering::Relaxed);
+        self.session_install_admission_refused
+            .store(c.session_install_admission_refused, Ordering::Relaxed);
+        self.session_install_partial
+            .store(c.session_install_partial, Ordering::Relaxed);
 
         let base_at = self.window_base_at_ns.load(Ordering::Relaxed);
         if base_at == 0 {
@@ -416,6 +441,11 @@ impl WorkerRuntimeAtomics {
             nat_reverse_key_collisions: self
                 .nat_reverse_key_collisions
                 .load(Ordering::Relaxed),
+            session_create_drops: self.session_create_drops.load(Ordering::Relaxed),
+            session_install_admission_refused: self
+                .session_install_admission_refused
+                .load(Ordering::Relaxed),
+            session_install_partial: self.session_install_partial.load(Ordering::Relaxed),
         }
     }
 

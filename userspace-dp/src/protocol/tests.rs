@@ -191,6 +191,82 @@ fn process_status_nat_reverse_key_shared_displacements_roundtrip() {
     assert_eq!(legacy.nat_reverse_key_shared_displacements_total, 0);
 }
 
+// #1861: round-trip + backward-compat pin for the install-refusal trio
+// (transactional session install). The wire keys feed
+// pkg/dataplane/userspace/protocol.go and the Prometheus counters
+// `xpf_userspace_session_create_drops_total` /
+// `xpf_userspace_session_install_admission_refused_total` /
+// `xpf_userspace_session_install_partial_total` (+ per-worker copies).
+#[test]
+fn install_refusal_trio_roundtrip_and_key_absent_defaults() {
+    let status = ProcessStatus {
+        session_create_drops: 7,
+        session_install_admission_refused: 5,
+        session_install_partial: 1,
+        ..Default::default()
+    };
+    let value: serde_json::Value =
+        serde_json::to_value(&status).expect("serialize ProcessStatus to Value");
+    assert_eq!(value["session_create_drops"], 7);
+    assert_eq!(value["session_install_admission_refused"], 5);
+    assert_eq!(value["session_install_partial"], 1);
+    let back: ProcessStatus = serde_json::from_value(value).expect("deserialize ProcessStatus");
+    assert_eq!(back.session_create_drops, 7);
+    assert_eq!(back.session_install_admission_refused, 5);
+    assert_eq!(back.session_install_partial, 1);
+
+    // Pre-#1861 payload (keys absent) must decode with zero defaults.
+    let mut legacy_value =
+        serde_json::to_value(ProcessStatus::default()).expect("serialize default ProcessStatus");
+    let obj = legacy_value
+        .as_object_mut()
+        .expect("ProcessStatus serializes to an object");
+    for key in [
+        "session_create_drops",
+        "session_install_admission_refused",
+        "session_install_partial",
+    ] {
+        obj.remove(key).expect("new key present before strip");
+    }
+    let legacy: ProcessStatus =
+        serde_json::from_value(legacy_value).expect("pre-#1861 payload decodes");
+    assert_eq!(legacy.session_create_drops, 0);
+    assert_eq!(legacy.session_install_admission_refused, 0);
+    assert_eq!(legacy.session_install_partial, 0);
+
+    // Same contract for the per-worker WorkerRuntimeStatus copies.
+    let worker = WorkerRuntimeStatus {
+        session_create_drops: 3,
+        session_install_admission_refused: 2,
+        session_install_partial: 1,
+        ..Default::default()
+    };
+    let value = serde_json::to_value(&worker).expect("serialize WorkerRuntimeStatus to Value");
+    assert_eq!(value["session_create_drops"], 3);
+    let back: WorkerRuntimeStatus =
+        serde_json::from_value(value).expect("deserialize WorkerRuntimeStatus");
+    assert_eq!(back.session_create_drops, 3);
+    assert_eq!(back.session_install_admission_refused, 2);
+    assert_eq!(back.session_install_partial, 1);
+    let mut legacy_value = serde_json::to_value(WorkerRuntimeStatus::default())
+        .expect("serialize default WorkerRuntimeStatus");
+    let obj = legacy_value
+        .as_object_mut()
+        .expect("WorkerRuntimeStatus serializes to an object");
+    for key in [
+        "session_create_drops",
+        "session_install_admission_refused",
+        "session_install_partial",
+    ] {
+        obj.remove(key).expect("new key present before strip");
+    }
+    let legacy: WorkerRuntimeStatus =
+        serde_json::from_value(legacy_value).expect("pre-#1861 worker payload decodes");
+    assert_eq!(legacy.session_create_drops, 0);
+    assert_eq!(legacy.session_install_admission_refused, 0);
+    assert_eq!(legacy.session_install_partial, 0);
+}
+
 // #1621 plan v2 + Copilot code-r1 C4: round-trip the new cold-path
 // histogram fields through serde to confirm:
 //   1. Default (zero / empty) WorkerRuntimeStatus omits every
