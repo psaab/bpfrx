@@ -1223,6 +1223,7 @@ fn apply_nat_ipv4_recomputes_tcp_checksum() {
             rewrite_dst: None,
             ..NatDecision::default()
         },
+        false,
     )
     .expect("apply nat");
 
@@ -1795,6 +1796,7 @@ fn enforce_expected_ports_repairs_ipv6_tcp_ports_and_checksum() {
         libc::AF_INET6 as u8,
         PROTO_TCP,
         Some((54688, 5201)),
+        false,
     )
     .expect("repair");
     assert!(repaired);
@@ -1836,6 +1838,7 @@ fn enforce_expected_ports_repairs_ipv4_tcp_ports_and_checksum() {
         libc::AF_INET as u8,
         PROTO_TCP,
         Some((54688, 5201)),
+        false,
     )
     .expect("repair");
     assert!(repaired);

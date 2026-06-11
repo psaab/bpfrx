@@ -32,7 +32,16 @@ pub(in crate::afxdp::icmp_embed) struct EmbeddedV6Header {
 }
 
 /// Parse the embedded IPv4 header starting at `embedded_ip_start`.
-/// Returns None on truncated frame or malformed IHL.
+/// Returns None on truncated frame, malformed IHL, or when the QUOTED
+/// packet is a non-first fragment.
+///
+/// #1852: a quoted non-first fragment (IPv4 fragment-offset field, low
+/// 13 bits of bytes 6-7, non-zero) has no L4 header — reading "ports" at
+/// `ihl` would interpret payload bytes as ports and could enable a false
+/// embedded-session match. This is the IPv4 twin of the #1853
+/// fragment-aware `parse_embedded_v6_l4` guard (it was deferred to this
+/// follow-up). First/atomic fragments (offset 0) carry the real L4
+/// header and parse normally.
 pub(in crate::afxdp::icmp_embed) fn parse_embedded_v4(
     frame: &[u8],
     embedded_ip_start: usize,
@@ -42,6 +51,12 @@ pub(in crate::afxdp::icmp_embed) fn parse_embedded_v4(
     }
     let ihl = ((frame[embedded_ip_start] & 0x0F) as usize) * 4;
     if ihl < 20 || frame.len() < embedded_ip_start + ihl + 4 {
+        return None;
+    }
+    // #1852: refuse a quoted non-first fragment (no L4 header to read).
+    let frag_off =
+        u16::from_be_bytes([frame[embedded_ip_start + 6], frame[embedded_ip_start + 7]]);
+    if (frag_off & 0x1FFF) != 0 {
         return None;
     }
     let proto = frame[embedded_ip_start + 9];

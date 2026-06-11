@@ -190,7 +190,10 @@ pub(in crate::afxdp) fn segment_forwarded_tcp_frames_from_frame(
                         return None;
                     }
                     if apply_nat {
-                        apply_nat_ipv4(packet, meta.protocol, decision.nat)?;
+                        // #1852: non_first_fragment=false — the segmentation
+                        // admission gate (forwarded_tcp_may_need_segmentation)
+                        // never admits a non-first fragment.
+                        apply_nat_ipv4(packet, meta.protocol, decision.nat, false)?;
                     }
                     if (meta.meta_flags & 0x80) == 0 {
                         packet[8] -= 1;
@@ -201,6 +204,7 @@ pub(in crate::afxdp) fn segment_forwarded_tcp_frames_from_frame(
                     meta.addr_family,
                     meta.protocol,
                     enforced_ports,
+                    false,
                 )?;
                 let packet = frame_out.get_mut(eth_len..)?;
                 // IP header checksum: full recompute (only 20 bytes, fast).
@@ -300,7 +304,8 @@ pub(in crate::afxdp) fn segment_forwarded_tcp_frames_from_frame(
                         // `ip_header_len` IS the ext-aware rel_l4: it is
                         // `frame_l4_offset - l3` and the segment copies
                         // the full IP header incl. the ext chain.
-                        apply_nat_ipv6(packet, ip_header_len, meta.protocol, decision.nat)?;
+                        // #1852: non_first_fragment=false (admission gate).
+                        apply_nat_ipv6(packet, ip_header_len, meta.protocol, decision.nat, false)?;
                     }
                     if (meta.meta_flags & 0x80) == 0 {
                         packet[7] -= 1;
@@ -311,6 +316,7 @@ pub(in crate::afxdp) fn segment_forwarded_tcp_frames_from_frame(
                     meta.addr_family,
                     meta.protocol,
                     enforced_ports,
+                    false,
                 )?;
                 let packet = frame_out.get_mut(eth_len..)?;
                 recompute_l4_checksum_ipv6(packet, ip_header_len, meta.protocol)?;

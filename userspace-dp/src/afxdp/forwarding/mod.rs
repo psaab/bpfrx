@@ -131,9 +131,18 @@ pub(super) fn match_source_nat_for_flow_result(
     egress_ifindex: i32,
     flow: &SessionFlow,
 ) -> SourceNatLookup {
-    match_source_nat_for_flow_result_at(forwarding, from_zone, to_zone, egress_ifindex, flow, 0)
+    match_source_nat_for_flow_result_at(
+        forwarding,
+        from_zone,
+        to_zone,
+        egress_ifindex,
+        flow,
+        0,
+        false,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn match_source_nat_for_flow_result_at(
     forwarding: &ForwardingState,
     from_zone: &str,
@@ -141,6 +150,8 @@ pub(super) fn match_source_nat_for_flow_result_at(
     egress_ifindex: i32,
     flow: &SessionFlow,
     now_ns: u64,
+    // #1852: gate pool-mode SNAT allocation for non-first fragments.
+    non_first_fragment: bool,
 ) -> SourceNatLookup {
     let Some(egress) = forwarding.egress.get(&egress_ifindex) else {
         return SourceNatLookup::NoMatch;
@@ -157,6 +168,7 @@ pub(super) fn match_source_nat_for_flow_result_at(
         egress.primary_v4,
         egress.primary_v6,
         now_ns,
+        non_first_fragment,
     )
 }
 

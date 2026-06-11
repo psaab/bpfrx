@@ -946,6 +946,7 @@ fn tuple_snat_lookup_from_src(
         None,
         None,
         now_ns,
+        false,
     )
 }
 
@@ -1245,6 +1246,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_rules() {
         None,
         None,
         1,
+        false,
     );
     assert!(matches!(first, SourceNatLookup::Matched(_)));
 
@@ -1260,6 +1262,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_rules() {
         None,
         None,
         2,
+        false,
     );
     assert_eq!(
         second,
@@ -1318,6 +1321,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_persistence_modes() {
         None,
         None,
         1,
+        false,
     );
     assert!(matches!(first, SourceNatLookup::Matched(_)));
 
@@ -1333,6 +1337,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_persistence_modes() {
         None,
         None,
         2,
+        false,
     );
     assert_eq!(
         second,
@@ -2426,6 +2431,7 @@ fn pool_snat_address_persistent_userspace_v1_selects_pool_addresses() {
             None,
             None,
             0,
+            false,
         ));
 
         assert_eq!(decision.rewrite_src, Some(want_src.parse().unwrap()));

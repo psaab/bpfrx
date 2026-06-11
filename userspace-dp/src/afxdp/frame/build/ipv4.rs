@@ -8,7 +8,7 @@
 use super::super::tcp::clamp_tcp_mss_frame;
 use super::super::{
     adjust_ipv4_header_checksum, apply_nat_ipv4, enforce_expected_ports_at,
-    recompute_l4_checksum_ipv4, restore_l4_tuple_from_meta,
+    ipv4_is_non_first_fragment, recompute_l4_checksum_ipv4, restore_l4_tuple_from_meta,
 };
 use crate::afxdp::{ForwardPacketMeta, SessionDecision};
 use std::net::Ipv4Addr;
@@ -50,10 +50,18 @@ pub(in crate::afxdp::frame) fn build_forwarded_frame_into_ipv4(
     let old_ttl = out[ip_start + 8];
     // IHL already computed above — use directly instead of re-parsing.
     let rel_l4 = ihl;
+    // #1852: non-first-fragment predicate, computed once and threaded.
+    let non_first_fragment = ipv4_is_non_first_fragment(&out[ip_start..]);
     let repaired_ports =
-        restore_l4_tuple_from_meta(&mut out[ip_start..], meta, rel_l4).unwrap_or(false);
+        restore_l4_tuple_from_meta(&mut out[ip_start..], meta, rel_l4, non_first_fragment)
+            .unwrap_or(false);
     if apply_nat {
-        apply_nat_ipv4(&mut out[ip_start..], meta.protocol, decision.nat)?;
+        apply_nat_ipv4(
+            &mut out[ip_start..],
+            meta.protocol,
+            decision.nat,
+            non_first_fragment,
+        )?;
     }
     let skip_ttl = (meta.meta_flags & 0x80) != 0;
     if !skip_ttl {
@@ -66,6 +74,7 @@ pub(in crate::afxdp::frame) fn build_forwarded_frame_into_ipv4(
         meta.addr_family,
         meta.protocol,
         enforced_ports,
+        non_first_fragment,
     )
     .unwrap_or(false);
     adjust_ipv4_header_checksum(

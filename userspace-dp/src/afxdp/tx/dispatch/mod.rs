@@ -1052,7 +1052,20 @@ fn forwarded_tcp_may_need_segmentation(
     let Some(l3) = l3 else {
         return false;
     };
-    l3 < frame.len() && frame.len().saturating_sub(l3) > mtu
+    if l3 >= frame.len() {
+        return false;
+    }
+    // #1852: a non-first IP fragment has no TCP header at the post-IP
+    // offset — never segment it. `meta.protocol == PROTO_TCP` is true for
+    // a non-first fragment of a TCP datagram (the shim reads the protocol
+    // from the IP header / v6 fragment next-header), so without this gate
+    // a large non-first fragment would enter the segmentation builders,
+    // which parse payload bytes as a TCP header and run NAT/checksum at
+    // the fake offset. Route it to the normal forwarding path instead.
+    if is_non_first_fragment(&frame[l3..], meta.addr_family) {
+        return false;
+    }
+    frame.len().saturating_sub(l3) > mtu
 }
 
 #[cfg(test)]

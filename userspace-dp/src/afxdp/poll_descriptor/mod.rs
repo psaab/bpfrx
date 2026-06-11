@@ -1099,6 +1099,19 @@ pub(super) fn poll_binding_process_descriptor(
                                     // NAT64: cross-family translation takes
                                     // priority over same-family SNAT.
                                     let mut source_nat_release_key = None;
+                                    // #1852: gate pool-mode SNAT allocation
+                                    // for a non-first fragment (no L4 ports —
+                                    // allocating leaks a pool port + corrupts
+                                    // payload). Computed from the ingress
+                                    // frame at the L3 offset.
+                                    let snat_non_first_fragment = {
+                                        let l3 = meta.l3_offset as usize;
+                                        l3 <= raw_frame.len()
+                                            && is_non_first_fragment(
+                                                &raw_frame[l3..],
+                                                meta.addr_family,
+                                            )
+                                    };
                                     let nat64_info = if let Some((
                                         _,
                                         dst_v4,
@@ -1150,6 +1163,7 @@ pub(super) fn poll_binding_process_descriptor(
                                                     decision.resolution.egress_ifindex,
                                                     &nat_match_flow,
                                                     now_ns,
+                                                    snat_non_first_fragment,
                                                 )
                                             }) {
                                                 Ok(snat_decision) => {
@@ -1180,6 +1194,7 @@ pub(super) fn poll_binding_process_descriptor(
                                                 decision.resolution.egress_ifindex,
                                                 &nat_match_flow,
                                                 now_ns,
+                                                snat_non_first_fragment,
                                             ) {
                                                 Ok(snat_decision) => {
                                                     decision.nat = decision.nat.merge(snat_decision);
@@ -2349,6 +2364,16 @@ pub(super) fn poll_binding_process_descriptor(
                                         let nat_match_flow = flow.with_destination(
                                             pending_decision.nat.rewrite_dst.unwrap_or(flow.dst_ip),
                                         );
+                                        // #1852: gate pool-mode SNAT allocation
+                                        // for a non-first fragment (no L4 ports).
+                                        let snat_non_first_fragment = {
+                                            let l3 = meta.l3_offset as usize;
+                                            l3 <= raw_frame.len()
+                                                && is_non_first_fragment(
+                                                    &raw_frame[l3..],
+                                                    meta.addr_family,
+                                                )
+                                        };
                                         if pending_decision.nat.rewrite_dst.is_none() {
                                             match source_nat_decision_for_flow(
                                                 worker_ctx.forwarding,
@@ -2357,6 +2382,7 @@ pub(super) fn poll_binding_process_descriptor(
                                                 pending_decision.resolution.egress_ifindex,
                                                 &nat_match_flow,
                                                 now_ns,
+                                                snat_non_first_fragment,
                                             ) {
                                                 Ok(snat_decision) => {
                                                     pending_decision.nat = snat_decision;
@@ -2386,6 +2412,7 @@ pub(super) fn poll_binding_process_descriptor(
                                                 pending_decision.resolution.egress_ifindex,
                                                 &nat_match_flow,
                                                 now_ns,
+                                                snat_non_first_fragment,
                                             ) {
                                                 Ok(snat_decision) => {
                                                     pending_decision.nat =

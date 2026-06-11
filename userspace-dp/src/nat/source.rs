@@ -53,6 +53,12 @@ pub(crate) enum SourceNatFailureReason {
     InvalidPortRange,
     WrongAddressFamily,
     AllocatorExhausted,
+    /// #1852: a non-first IP fragment reached a port-translating
+    /// (pool-mode) source-NAT rule. It has no L4 ports — allocating a
+    /// mapping from its garbage payload "ports" would leak a pool port
+    /// per fragment and corrupt payload. Without datapath reassembly the
+    /// fragment cannot be correctly port-mapped, so it is dropped.
+    NonFirstFragment,
 }
 
 impl SourceNatFailureReason {
@@ -64,6 +70,7 @@ impl SourceNatFailureReason {
             Self::InvalidPortRange => "source_nat_pool_invalid_port_range",
             Self::WrongAddressFamily => "source_nat_pool_wrong_family",
             Self::AllocatorExhausted => "source_nat_pool_exhausted",
+            Self::NonFirstFragment => "source_nat_non_first_fragment",
         }
     }
 }
@@ -396,7 +403,7 @@ pub(crate) fn match_source_nat_result(
     egress_v6: Option<Ipv6Addr>,
 ) -> SourceNatLookup {
     match_source_nat_result_for_tuple(
-        rules, from_zone, to_zone, src_ip, dst_ip, 0, 0, 0, egress_v4, egress_v6, 0,
+        rules, from_zone, to_zone, src_ip, dst_ip, 0, 0, 0, egress_v4, egress_v6, 0, false,
     )
 }
 
@@ -413,6 +420,10 @@ pub(crate) fn match_source_nat_result_for_tuple(
     egress_v4: Option<Ipv4Addr>,
     egress_v6: Option<Ipv6Addr>,
     now_ns: u64,
+    // #1852: when true, gate port-translating (pool-mode) allocation —
+    // a non-first fragment has no L4 ports. Interface-mode (address-only)
+    // and `off`/static rules are unaffected.
+    non_first_fragment: bool,
 ) -> SourceNatLookup {
     let flow = SourceNatFlowKey {
         protocol,
@@ -445,6 +456,20 @@ pub(crate) fn match_source_nat_result_for_tuple(
             }
         } else {
             continue;
+        }
+        // #1852: pool-mode SNAT translates the L4 port. A non-first
+        // fragment carries no L4 header at the post-IP offset (its
+        // "ports" are payload), so allocating a mapping here would both
+        // leak a pool port per fragment and write the allocated port into
+        // payload bytes. Without datapath reassembly the fragment cannot
+        // be correctly port-mapped — drop it (the caller records the
+        // exception). Interface-mode SNAT (address-only) already returned
+        // above, so it and static NAT keep working on fragments.
+        if non_first_fragment {
+            return SourceNatLookup::Unavailable(SourceNatFailure::for_rule(
+                rule,
+                SourceNatFailureReason::NonFirstFragment,
+            ));
         }
         // Pool-mode SNAT: pick address by source-IP hash when
         // address-persistent is enabled, otherwise round-robin by family.
