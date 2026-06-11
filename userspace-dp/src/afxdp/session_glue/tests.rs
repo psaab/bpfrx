@@ -4206,7 +4206,9 @@ fn shared_nat_displacement_counter_counts_collisions_not_republishes() {
     // alias derives the same reverse key K as its canonical form and
     // MUST NOT count as a collision.
     let fresh_nat = Arc::new(Mutex::new(FastMap::default()));
-    let canonical = w3_forward_entry(110, 40_002, snat_ip);
+    let mut canonical = w3_forward_entry(110, 40_002, snat_ip);
+    // On the wire both canonical and alias arrive via HA sync.
+    canonical.origin = SessionOrigin::SyncImport;
     let mut alias = canonical.clone();
     alias.key = forward_wire_key(&canonical.key, canonical.decision.nat);
     assert_ne!(alias.key, canonical.key, "alias must be a distinct key");
@@ -4281,6 +4283,37 @@ fn shared_nat_displacement_counter_counts_collisions_not_republishes() {
     assert!(
         NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed) > before_dnat,
         "DNAT-vs-direct genuine collision must count despite wire-related keys"
+    );
+
+    // Codex code-r3 owner-side corner: a LOCAL flow whose source already
+    // equals the SNAT external address. Identical NatDecision and
+    // wire-related keys, but BOTH entries are locally originated — two
+    // real sessions, must count. (The alias exclusion requires at least
+    // one peer-synced side: the HA wire-alias never originates locally.)
+    let local_a = w3_forward_entry(121, 40_004, snat_ip); // 10.0.61.121
+    let mut local_b = local_a.clone();
+    local_b.key.src_ip = IpAddr::V4(snat_ip); // source IS the external IP
+    assert_eq!(
+        local_b.key,
+        forward_wire_key(&local_a.key, local_a.decision.nat),
+        "corner construction: B must be A's wire form"
+    );
+    assert_eq!(local_a.decision.nat, local_b.decision.nat);
+    assert!(!local_a.origin.is_peer_synced() && !local_b.origin.is_peer_synced());
+    let corner_map = Arc::new(Mutex::new(FastMap::default()));
+    let before_corner = NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed);
+    for entry in [&local_a, &local_b] {
+        publish_shared_session(
+            &shared_sessions,
+            &corner_map,
+            &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
+            entry,
+        );
+    }
+    assert!(
+        NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed) > before_corner,
+        "local same-NAT wire-related pair must count (owner-side corner)"
     );
 }
 
