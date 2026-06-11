@@ -698,7 +698,14 @@ deploy_vm() {
 				paste -sd, -
 		}
 		MASK=$(free_cpus 2>/dev/null || true)
-		if [ -n "$MASK" ]; then
+		# Probe the mask before trusting it: the complement is taken
+		# against `nproc --all` (configured CPUs), which can include
+		# offline CPUs — taskset then EINVALs and, because this exec
+		# chain treats any non-zero exit as a verifier REJECT, a bad
+		# mask would false-reject a good binary (observed live on
+		# fw1 during the #1864 deploy smoke). An unusable mask falls
+		# back to the un-pinned nice-only run.
+		if [ -n "$MASK" ] && taskset -c "$MASK" true 2>/dev/null; then
 			exec nice -n 19 taskset -c "$MASK" /tmp/xpfd.preflight verify-dataplane
 		fi
 		exec nice -n 19 /tmp/xpfd.preflight verify-dataplane
