@@ -850,6 +850,13 @@ impl SessionTable {
         // Stale-handle + primary-key guard (parity with remove_entry): never
         // index the slab raw — a stale key_to_handle could point at a vacant or
         // reused slot. On mismatch behave like remove_entry returning None.
+        //
+        // #1855 contract: a stale/vacant mapping is impossible-by-construction
+        // (single-writer `&mut self`, #964 eager cleanup), so debug builds
+        // assert loudly (logic-bug detector) while release builds tolerate and
+        // return false without touching the reused-slot session — the
+        // remove_entry #964 "release-mode safety net" precedent. See
+        // docs/research/1855-inplace-contract/plan.md.
         let Some(record) = self.entries.get(handle as usize) else {
             debug_assert!(
                 false,
@@ -1022,6 +1029,8 @@ impl SessionTable {
         let Some(&handle) = self.key_to_handle.get(key) else {
             return false;
         };
+        // #1855 contract (same as update_session's guards): impossible state
+        // by construction — debug asserts, release tolerates + returns false.
         let Some(record) = self.entries.get(handle as usize) else {
             debug_assert!(
                 false,

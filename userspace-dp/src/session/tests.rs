@@ -2108,8 +2108,25 @@ fn inplace_accept_reasserts_displaced_collision_like_reference() {
     assert_tables_equiv(&mut ip, &mut rf, &[key.clone()], &[collide], &[1, 2]);
 }
 
-#[test]
-fn inplace_stale_handle_returns_false_no_panic() {
+// ── #1855: corrupted key_to_handle contract ──────────────────────────
+//
+// A stale or vacant `key_to_handle` mapping is impossible-by-construction
+// (per-worker single-writer `&mut self`, #964 eager-cleanup invariant in
+// `remove_entry`); the rigs below reach it only via private-field access.
+// The contract — decided in docs/research/1855-inplace-contract/plan.md —
+// is the `remove_entry` #964 precedent:
+//   - debug builds: `debug_assert!` fires (loud logic-bug detector),
+//     documented by the `#[cfg(debug_assertions)]` `#[should_panic]`
+//     variants below;
+//   - release builds: tolerate + return false without touching the
+//     reused-slot session, documented by the
+//     `#[cfg(not(debug_assertions))]` `*_returns_false_no_panic` tests
+//     (exercised by `cargo test --release`).
+
+/// Rig: install `key` and `other`, then point `key`'s mapping at
+/// `other`'s slab slot — a stale mapping onto a REUSED slot, which the
+/// primary-key guard (`record.key != *key`) must catch.
+fn rig_stale_handle_table() -> (SessionTable, SessionKey, SessionKey) {
     let key = key_v4();
     let other = key_v6();
     let mut t = SessionTable::new();
@@ -2119,9 +2136,15 @@ fn inplace_stale_handle_returns_false_no_panic() {
     assert!(t.install_with_protocol_with_origin(
         other.clone(), decision(), metadata(), SessionOrigin::ForwardFlow, 1_000, other.protocol, 0,
     ));
-    // Point `key` at `other`'s handle => primary-key guard must reject.
     let other_handle = *t.key_to_handle.get(&other).expect("other handle");
     t.key_to_handle.insert(key.clone(), other_handle);
+    (t, key, other)
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn inplace_stale_handle_returns_false_no_panic() {
+    let (mut t, key, other) = rig_stale_handle_table();
     let req = SessionUpdate {
         key: &key,
         decision: decision(),
@@ -2131,10 +2154,40 @@ fn inplace_stale_handle_returns_false_no_panic() {
         protocol: PROTO_TCP,
         tcp_flags: 0,
     };
-    // Must not panic and must not mutate the unrelated `other` session.
+    // Release contract: must not panic and must not mutate the unrelated
+    // `other` session occupying the reused slot.
     let before = t.entry_by_key(&other).map(|e| e.last_seen_ns);
     assert!(!t.update_session(req, false));
     assert_eq!(t.entry_by_key(&other).map(|e| e.last_seen_ns), before);
+    // refresh_for_ha_transition shares the primary-key guard (#1855 AGY r1:
+    // symmetric release coverage).
+    assert!(!t.refresh_for_ha_transition(&key, decision(), metadata(), 2_000));
+    assert_eq!(t.entry_by_key(&other).map(|e| e.last_seen_ns), before);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "update_session: stale key_to_handle")]
+fn inplace_stale_handle_asserts_in_debug() {
+    let (mut t, key, _other) = rig_stale_handle_table();
+    let req = SessionUpdate {
+        key: &key,
+        decision: decision(),
+        metadata: metadata(),
+        origin: SessionOrigin::ForwardFlow,
+        now_ns: 2_000,
+        protocol: PROTO_TCP,
+        tcp_flags: 0,
+    };
+    let _ = t.update_session(req, false);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "refresh_for_ha_transition: stale key_to_handle")]
+fn ha_transition_stale_handle_asserts_in_debug() {
+    let (mut t, key, _other) = rig_stale_handle_table();
+    let _ = t.refresh_for_ha_transition(&key, decision(), metadata(), 2_000);
 }
 
 #[test]
@@ -2246,13 +2299,22 @@ fn inplace_ha_transition_matches_reference() {
     }
 }
 
-#[test]
-fn inplace_vacant_handle_returns_false_no_panic() {
-    // key_to_handle points at a slab slot that was never allocated -> the
-    // entries.get(handle) == None guard must return false without panicking.
+/// Rig: `key_to_handle` points at a slab slot that was never allocated —
+/// the `entries.get(handle) == None` guard arm. See the #1855 contract
+/// comment above `rig_stale_handle_table`.
+fn rig_vacant_handle_table() -> (SessionTable, SessionKey) {
     let key = key_v4();
     let mut t = SessionTable::new();
     t.key_to_handle.insert(key.clone(), 9999u32);
+    (t, key)
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn inplace_vacant_handle_returns_false_no_panic() {
+    // Release contract: the vacant-slot guard must return false without
+    // panicking (the debug_assert is compiled out).
+    let (mut t, key) = rig_vacant_handle_table();
     let req = SessionUpdate {
         key: &key,
         decision: decision(),
@@ -2265,6 +2327,31 @@ fn inplace_vacant_handle_returns_false_no_panic() {
     assert!(!t.update_session(req, false));
     // refresh_for_ha_transition shares the same guard.
     assert!(!t.refresh_for_ha_transition(&key, decision(), metadata(), 2_000));
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "update_session: key_to_handle had stale handle")]
+fn inplace_vacant_handle_asserts_in_debug() {
+    let (mut t, key) = rig_vacant_handle_table();
+    let req = SessionUpdate {
+        key: &key,
+        decision: decision(),
+        metadata: metadata(),
+        origin: SessionOrigin::ForwardFlow,
+        now_ns: 2_000,
+        protocol: PROTO_TCP,
+        tcp_flags: 0,
+    };
+    let _ = t.update_session(req, false);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "refresh_for_ha_transition: stale handle")]
+fn ha_transition_vacant_handle_asserts_in_debug() {
+    let (mut t, key) = rig_vacant_handle_table();
+    let _ = t.refresh_for_ha_transition(&key, decision(), metadata(), 2_000);
 }
 
 #[test]

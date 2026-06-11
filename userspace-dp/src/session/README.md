@@ -1,7 +1,11 @@
 # userspace-dp/src/session/
 
-Userspace session table and timer-wheel garbage collector. Owned by the
-coordinator; per-worker handles read and update under shared locks.
+Userspace session table and timer-wheel garbage collector. Each worker
+owns its `SessionTable` by value (`afxdp/worker/loop_body/setup.rs`); all
+mutation goes through `&mut self` on the worker thread — single-writer by
+construction. (The `Arc<Mutex<FastMap<...>>>` maps in `session_glue` /
+`tunnel.rs` are the separate synced-session side tables, not this
+structure.)
 
 ## Files
 
@@ -14,9 +18,10 @@ coordinator; per-worker handles read and update under shared locks.
   inbound packet matches an existing outbound flow").
 - `entry.rs` — `SessionEntry`: decision, metadata, origin, timestamps,
   expiry tick, wheel bucket.
-- `wheel.rs` — bucketed timer wheel (1 s per tick, 256 buckets). One
-  sweep per second by the coordinator; lazy-delete on lookup picks up
-  stragglers.
+- `wheel.rs` — bucketed timer wheel (1 s per tick, 256 buckets). Each
+  worker sweeps its own table once per second from its poll loop
+  (`expire_stale_entries` in `afxdp/worker/loop_body/mod.rs`);
+  lazy-delete on lookup picks up stragglers.
 - `tests.rs` — co-located unit tests.
 
 ## Timeouts
@@ -33,10 +38,32 @@ per-entry `expires_after_ns`.
 
 ## GC
 
-`SESSION_GC_INTERVAL_NS = 1_000_000_000` (1 s). Single-threaded sweep
-walks the wheel bucket for the current tick; stale entries get
+`SESSION_GC_INTERVAL_NS = 1_000_000_000` (1 s). Single-threaded per-worker
+sweep walks the wheel bucket for the current tick; stale entries get
 lazy-deleted on the next lookup if they slip past the sweep (e.g.
 because they were re-bucketed mid-sweep).
+
+## Corruption contract (#1855)
+
+A `key_to_handle` mapping that points at a vacant or reused slab slot is
+impossible-by-construction: installs pair the map insert with a freshly
+allocated slab handle, and every removal funnels through `remove_entry`'s
+#964 eager-cleanup (map remove first, all secondary indices value-guarded,
+`no_index_points_at` debug scan before the slot is freed). The guard arms
+in `update_session`, `refresh_for_ha_transition`, and `remove_entry`
+therefore follow one contract:
+
+- **debug builds**: `debug_assert!` fires — a loud logic-bug detector
+  (the `*_asserts_in_debug` tests in `tests.rs` document each arm);
+- **release builds**: tolerate and return `false`/`None` without touching
+  the session occupying the reused slot (the
+  `*_returns_false_no_panic` tests, compiled only under
+  `cfg(not(debug_assertions))`, run via `cargo test --release`).
+
+No counter/log on these arms: they are unreachable absent a logic bug,
+and `update_session` is the per-packet refresh path (an unthrottled log
+would flood under a real bug). Decision record:
+`docs/research/1855-inplace-contract/plan.md`.
 
 ## Why a slab + integer handles
 
