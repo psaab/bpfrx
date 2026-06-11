@@ -514,8 +514,10 @@ func newCollector(srv *Server) *xpfCollector {
 			"xpf_userspace_worker_session_nat_reverse_key_collisions_total",
 			"Cumulative NAT reverse-key (nat_reverse_index) 1:N collision "+
 				"displacement events on this userspace worker's session table "+
-				"(#1758 latent corruption made observable; near-precise upper "+
-				"bound on live collisions).",
+				"(#1758/#1760 latent corruption made observable). Event count, "+
+				"not a census: standing collisions after a winner's expiry and "+
+				"never-replicated MissingNeighborSeed collisions are not "+
+				"counted here — see the shared displacements counter.",
 			[]string{"worker_id"}, nil,
 		),
 		userspaceSessionTableEntries: prometheus.NewDesc(
@@ -531,10 +533,12 @@ func newCollector(srv *Server) *xpfCollector {
 		userspaceNatReverseKeyCollisions: prometheus.NewDesc(
 			"xpf_userspace_session_nat_reverse_key_collisions_total",
 			"Aggregate NAT reverse-key (nat_reverse_index) 1:N collision "+
-				"displacement events across userspace workers (#1758 latent "+
-				"corruption made observable; near-precise upper bound on live "+
-				"collisions). A nonzero value warrants the structural-fix "+
-				"research.",
+				"displacement events across userspace workers (#1758/#1760 "+
+				"latent corruption made observable). Event count, not a "+
+				"census (replica fanout over-counts; standing and seed-path "+
+				"collisions under-count — pair with the shared displacements "+
+				"counter). >=1 means at least one real collision occurred "+
+				"and is the structural-fix revisit trigger.",
 			nil, nil,
 		),
 		userspaceNatReverseKeySharedDisplacements: prometheus.NewDesc(

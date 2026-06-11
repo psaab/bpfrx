@@ -26,14 +26,41 @@ pub(crate) static NAT_REVERSE_KEY_SHARED_DISPLACEMENTS: AtomicU64 = AtomicU64::n
 /// displaced entry belongs to a DIFFERENT forward session. Shared by the
 /// reverse-wire and reverse-canonical insert sites in
 /// `publish_shared_session`.
+///
+/// Alias exclusion (Codex code-r1 F1): HA session sync deliberately
+/// publishes a fabric-redirect session TWICE — canonical forward key plus
+/// a NAT-translated forward-WIRE alias key carrying the same value
+/// (`pkg/daemon/daemon_ha_userspace.go` `userspaceForwardWireAliasFromDeltaV4`,
+/// queued under `delta.FabricRedirect && !delta.FabricIngress`). Both
+/// forms derive the same reverse key K, so on a standby the pair would
+/// displace each other at K every sync sweep — a same-logical-session
+/// republish, not a 1:N collision. `forward_wire_key` is idempotent
+/// (rewrites replace src/dst with the rewrite targets), so the alias
+/// relation is exactly "one key is the other's forward-wire form".
+/// Genuine colliding sessions keep counting: their CANONICAL keys are
+/// not each other's wire forms (each wire form is the shared external
+/// tuple, not the peer's internal tuple). Known accepted under-count:
+/// on a standby, a genuine collision involving a wire-FORM synced entry
+/// is excluded by this test — the session's OWNER node still counts the
+/// canonical-vs-canonical displacement in its own shared map.
 #[inline]
 fn record_shared_nat_displacement(
     displaced: Option<&SyncedSessionEntry>,
     entry: &SyncedSessionEntry,
 ) {
-    if matches!(displaced, Some(existing) if existing.key != entry.key) {
-        NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.fetch_add(1, Ordering::Relaxed);
+    let Some(existing) = displaced else {
+        return;
+    };
+    if existing.key == entry.key {
+        return;
     }
+    // Wire-alias relation: same logical session under its translated key.
+    if existing.key == forward_wire_key(&entry.key, entry.decision.nat)
+        || entry.key == forward_wire_key(&existing.key, existing.decision.nat)
+    {
+        return;
+    }
+    NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// #1760 W1: last-warn timestamp for the journald reverse-key-collision

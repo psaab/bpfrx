@@ -221,7 +221,8 @@ pub(crate) fn worker_loop(
                              local_total={} shared_total={}) — #1760 latent 1:N \
                              reverse-path corruption; counts are displacement \
                              events (>=1 means a real collision occurred; not a \
-                             pair census)",
+                             pair census — standing collisions against an \
+                             already-unindexed session are not counted)",
                             worker_id,
                             wr_counters.nat_reverse_key_collisions,
                             shared_displacements,

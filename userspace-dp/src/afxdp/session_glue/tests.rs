@@ -4169,21 +4169,16 @@ fn shared_nat_displacement_counter_counts_collisions_not_republishes() {
         NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed) > after_collision,
         "alternation must count again"
     );
-}
 
-#[test]
-fn shared_nat_displacement_counter_ignores_reverse_entries() {
-    use crate::afxdp::shared_ops::NAT_REVERSE_KEY_SHARED_DISPLACEMENTS;
-    use std::sync::atomic::Ordering;
+    // All remaining negatives live in THIS test (not separate #[test]s):
+    // the counter static is process-global and cargo runs tests in
+    // parallel, so equality assertions in a sibling test could observe
+    // this test's increments (Codex code-r1 F2).
+    let settled = NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed);
 
-    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
-    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
-    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
-    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
-
-    let mut reverse = w3_forward_entry(103, 40_001, Ipv4Addr::new(172, 16, 80, 8));
+    // Reverse entries never touch shared_nat_sessions.
+    let mut reverse = w3_forward_entry(103, 40_001, snat_ip);
     reverse.metadata.is_reverse = true;
-    let before = NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed);
     publish_shared_session(
         &shared_sessions,
         &shared_nat_sessions,
@@ -4200,10 +4195,43 @@ fn shared_nat_displacement_counter_ignores_reverse_entries() {
     );
     assert_eq!(
         NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed),
-        before,
+        settled,
         "reverse entries never touch shared_nat_sessions"
     );
+
+    // HA fabric-redirect wire-ALIAS republish (Codex code-r1 F1): the
+    // same logical session arrives a second time under its NAT-translated
+    // forward-wire key with the same value
+    // (daemon_ha_userspace.go userspaceForwardWireAliasFromDeltaV4). The
+    // alias derives the same reverse key K as its canonical form and
+    // MUST NOT count as a collision.
+    let fresh_nat = Arc::new(Mutex::new(FastMap::default()));
+    let canonical = w3_forward_entry(110, 40_002, snat_ip);
+    let mut alias = canonical.clone();
+    alias.key = forward_wire_key(&canonical.key, canonical.decision.nat);
+    assert_ne!(alias.key, canonical.key, "alias must be a distinct key");
+    assert_eq!(
+        reverse_session_key(&alias.key, alias.decision.nat),
+        reverse_session_key(&canonical.key, canonical.decision.nat),
+        "alias and canonical must derive the same reverse key K"
+    );
+    let before_alias = NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed);
+    for entry in [&canonical, &alias, &canonical] {
+        publish_shared_session(
+            &shared_sessions,
+            &fresh_nat,
+            &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
+            entry,
+        );
+    }
+    assert_eq!(
+        NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed),
+        before_alias,
+        "canonical<->wire-alias churn of one logical session must not count"
+    );
 }
+
 
 #[test]
 fn nat_reverse_key_warn_throttle_claims_once_per_window() {

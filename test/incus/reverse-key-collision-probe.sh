@@ -121,6 +121,14 @@ PROBE_IP1="$(inc "$LAN_HOST" "ip -4 -o addr show dev eth1 scope global" \
 echo "probe source IPs: $PROBE_IP1 + $PROBE_IP2 (src port $SRC_PORT)"
 
 if [ "$VARIANT" = "cold" ]; then
+    echo "-- cold preflight: prove target reachability (ephemeral source port,"
+    echo "   does not occupy the colliding K) before disturbing neighbor state"
+    if ! inc "$LAN_HOST" "timeout 5 bash -c 'exec 3<>/dev/tcp/$TARGET/$TPORT' && exec 3<&- 2>/dev/null; true"; then
+        echo "FAIL(cold preflight): $TARGET:$TPORT unreachable BEFORE the cold"
+        echo "  construction — a later non-firing counter would be a path/"
+        echo "  listener failure, not a watch defect. Fix the path first."
+        exit 1
+    fi
     echo "-- cold variant: flushing egress neighbor state on $ACTIVE"
     inc "$ACTIVE" "ip neigh flush dev \$(ip -4 route get $TARGET | awk '/dev/ {for(i=1;i<=NF;i++) if(\$i==\"dev\") print \$(i+1)}' | head -1) 2>/dev/null || true"
     echo "-- starting BOTH flows back-to-back (seed path)"
@@ -161,9 +169,6 @@ POST_LOCAL="$(metric_sum "$ACTIVE" "xpf_userspace_worker_session_nat_reverse_key
 POST_SHARED="$(metric_sum "$ACTIVE" "xpf_userspace_session_nat_reverse_key_shared_displacements_total")"
 echo "after: local=$POST_LOCAL shared=$POST_SHARED (baseline local=$BASE_LOCAL shared=$BASE_SHARED)"
 
-WARN_COUNT="$(inc "$ACTIVE" "journalctl -u xpfd --since '$JOURNAL_T0' 2>/dev/null | grep -c 'NAT reverse-key collision detected' || true")"
-echo "journald warn lines since start: $WARN_COUNT"
-
 FAIL=0
 if [ "$POST_LOCAL" -le "$BASE_LOCAL" ] && [ "$POST_SHARED" -le "$BASE_SHARED" ]; then
     echo "FAIL: neither collision counter advanced — the watch did not fire."
@@ -174,12 +179,24 @@ if [ "$VARIANT" = "cold" ] && [ "$POST_SHARED" -le "$BASE_SHARED" ]; then
     echo "  seed-path coverage claim is not holding."
     FAIL=1
 fi
-if [ "$WARN_COUNT" -eq 0 ]; then
-    echo "NOTE: no W1 journald warn yet — it is throttled to 1/min process-"
-    echo "  wide and suppressed during the first 60s of daemon uptime; check"
-    echo "  'journalctl -u xpfd | grep reverse-key' again shortly. Counting"
-    echo "  this as FAIL only if the counters also failed."
-    [ "$FAIL" -eq 1 ] && FAIL=1
+
+# W1 warn is part of the watch contract: poll up to 90s for it (the warn
+# is throttled to 1/min process-wide via a CAS whose pending-retry covers
+# the first-60s-of-uptime suppression). Only meaningful if a counter
+# advanced; FAIL if it never appears.
+WARN_COUNT=0
+if [ "$FAIL" -eq 0 ]; then
+    for _ in $(seq 1 18); do
+        WARN_COUNT="$(inc "$ACTIVE" "journalctl -u xpfd --since '$JOURNAL_T0' 2>/dev/null | grep -c 'NAT reverse-key collision detected' || true")"
+        [ "$WARN_COUNT" -gt 0 ] && break
+        sleep 5
+    done
+    echo "journald warn lines since start: $WARN_COUNT"
+    if [ "$WARN_COUNT" -eq 0 ]; then
+        echo "FAIL: counters advanced but the W1 journald warn never appeared"
+        echo "  within 90s — the durable artifact is not firing."
+        FAIL=1
+    fi
 fi
 if [ "$FAIL" -eq 0 ]; then
     echo "PASS: collision watch fired (local +$((POST_LOCAL - BASE_LOCAL)), shared +$((POST_SHARED - BASE_SHARED)), warns $WARN_COUNT)"
