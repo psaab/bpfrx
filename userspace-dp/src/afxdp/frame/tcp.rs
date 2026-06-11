@@ -198,6 +198,25 @@ pub(super) fn clamp_tcp_mss(packet: &mut [u8], max_mss: u16) -> bool {
         return false;
     }
     let version = packet[0] >> 4;
+    // #1852: a non-first fragment has no TCP header at the post-IP
+    // offset — never clamp it (the "TCP" bytes are payload). Gate the
+    // clamp itself here rather than making the shared offset helper
+    // fragment-aware: that helper is read by GRE decap / tunnel
+    // local-origin to FORWARD legitimately-fragmented inner packets, so
+    // it must keep returning the offset.
+    match version {
+        4 => {
+            if ipv4_is_non_first_fragment(packet) {
+                return false;
+            }
+        }
+        6 => {
+            if ipv6_is_non_first_fragment(packet) {
+                return false;
+            }
+        }
+        _ => return false,
+    }
     let (l4_offset, protocol) = match version {
         4 => {
             if packet.len() < 20 {
@@ -210,7 +229,15 @@ pub(super) fn clamp_tcp_mss(packet: &mut [u8], max_mss: u16) -> bool {
             if packet.len() < 40 {
                 return false;
             }
-            (40, packet[6])
+            // #1852: ext-aware L4 offset. The previous fixed
+            // `(40, packet[6])` silently no-opped on ext-headered v6
+            // SYNs (packet[6] was an ext-header type, so the
+            // `protocol != TCP` check below bailed). Walk the chain so
+            // the MSS clamp reaches the real TCP header.
+            match packet_rel_l4_offset_and_protocol(packet, libc::AF_INET6 as u8) {
+                Some((off, proto)) => (off, proto),
+                None => return false,
+            }
         }
         _ => return false,
     };

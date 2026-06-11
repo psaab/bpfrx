@@ -17,6 +17,7 @@ use super::*;
 
 #[cold]
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn source_nat_decision_for_flow(
     forwarding: &ForwardingState,
     from_zone: &str,
@@ -24,6 +25,10 @@ pub(super) fn source_nat_decision_for_flow(
     egress_ifindex: i32,
     flow: &SessionFlow,
     now_ns: u64,
+    // #1852: gate pool-mode SNAT allocation for non-first fragments. The
+    // static-NAT (address-only) match below is NOT gated — it rewrites
+    // the IP on every fragment, which is correct.
+    non_first_fragment: bool,
 ) -> Result<NatDecision, SourceNatFailure> {
     if let Some(decision) = forwarding.static_nat.match_snat(flow.src_ip, from_zone) {
         return Ok(decision);
@@ -35,6 +40,7 @@ pub(super) fn source_nat_decision_for_flow(
         egress_ifindex,
         flow,
         now_ns,
+        non_first_fragment,
     ) {
         SourceNatLookup::Matched(decision) => Ok(decision),
         SourceNatLookup::NoMatch => Ok(NatDecision::default()),

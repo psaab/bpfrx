@@ -48,6 +48,7 @@ pub(in crate::afxdp) use checksum::{
 // rest stay at `pub(super)` (afxdp-only callers in sibling files).
 pub(in crate::afxdp) use inspect::{
     authoritative_forward_ports, decode_frame_summary, forward_tuple_mismatch_reason,
+    ipv4_is_non_first_fragment, ipv6_is_non_first_fragment, is_non_first_fragment,
     parse_session_flow, try_parse_metadata,
 };
 pub(super) use inspect::{
@@ -535,10 +536,19 @@ fn rewrite_apply_v4(
     );
     let old_ttl = packet[ip_start + 8];
     let rel_l4 = ihl;
+    // #1852: compute the non-first-fragment predicate ONCE and thread it
+    // into the L4 leaves (skip port/checksum/enforce/ICMP-ident work).
+    let non_first_fragment = ipv4_is_non_first_fragment(&packet[ip_start..]);
     let repaired_ports =
-        restore_l4_tuple_from_meta(&mut packet[ip_start..], meta, rel_l4).unwrap_or(false);
+        restore_l4_tuple_from_meta(&mut packet[ip_start..], meta, rel_l4, non_first_fragment)
+            .unwrap_or(false);
     if apply_nat {
-        apply_nat_ipv4(&mut packet[ip_start..], meta.protocol, decision.nat)?;
+        apply_nat_ipv4(
+            &mut packet[ip_start..],
+            meta.protocol,
+            decision.nat,
+            non_first_fragment,
+        )?;
     }
     if !skip_ttl {
         packet[ip_start + 8] -= 1;
@@ -549,8 +559,14 @@ fn rewrite_apply_v4(
         old_dst,
         old_ttl,
     )?;
-    let enforced = enforce_expected_ports(packet, meta.addr_family, meta.protocol, expected_ports)
-        .unwrap_or(false);
+    let enforced = enforce_expected_ports(
+        packet,
+        meta.addr_family,
+        meta.protocol,
+        expected_ports,
+        non_first_fragment,
+    )
+    .unwrap_or(false);
     if repaired_ports && !enforced {
         recompute_l4_checksum_ipv4(&mut packet[ip_start..], ihl, meta.protocol, true)?;
     }
@@ -579,16 +595,32 @@ fn rewrite_apply_v6(
         meta.l4_offset,
         meta.addr_family,
     )?;
+    // #1852: non-first-fragment predicate (walks for the v6 fragment
+    // header), computed once and threaded into the L4 leaves.
+    let non_first_fragment = ipv6_is_non_first_fragment(&packet[ip_start..]);
     let repaired_ports =
-        restore_l4_tuple_from_meta(&mut packet[ip_start..], meta, rel_l4).unwrap_or(false);
+        restore_l4_tuple_from_meta(&mut packet[ip_start..], meta, rel_l4, non_first_fragment)
+            .unwrap_or(false);
     if apply_nat {
-        apply_nat_ipv6(&mut packet[ip_start..], rel_l4, meta.protocol, decision.nat)?;
+        apply_nat_ipv6(
+            &mut packet[ip_start..],
+            rel_l4,
+            meta.protocol,
+            decision.nat,
+            non_first_fragment,
+        )?;
     }
     if !skip_ttl {
         packet[ip_start + 7] -= 1;
     }
-    let enforced = enforce_expected_ports(packet, meta.addr_family, meta.protocol, expected_ports)
-        .unwrap_or(false);
+    let enforced = enforce_expected_ports(
+        packet,
+        meta.addr_family,
+        meta.protocol,
+        expected_ports,
+        non_first_fragment,
+    )
+    .unwrap_or(false);
     if repaired_ports && !enforced {
         recompute_l4_checksum_ipv6(&mut packet[ip_start..], rel_l4, meta.protocol)?;
     }
@@ -719,7 +751,18 @@ fn trim_l3_payload<'a>(raw_payload: &'a [u8], meta: impl Into<ForwardPacketMeta>
 }
 
 
-pub(super) fn apply_nat_ipv4(packet: &mut [u8], protocol: u8, nat: NatDecision) -> Option<()> {
+/// `non_first_fragment` (#1852): when true, the L4-offset bytes are
+/// PAYLOAD (a non-first fragment has no L4 header). The IP-address
+/// rewrite still runs (every fragment carries the IP header and must be
+/// rewritten consistently), but the L4-checksum adjustment for the
+/// address change and the port rewrite are SKIPPED — the L4 checksum
+/// lives only in the first fragment and is folded there.
+pub(super) fn apply_nat_ipv4(
+    packet: &mut [u8],
+    protocol: u8,
+    nat: NatDecision,
+    non_first_fragment: bool,
+) -> Option<()> {
     if nat == NatDecision::default() {
         return Some(());
     }
@@ -748,11 +791,15 @@ pub(super) fn apply_nat_ipv4(packet: &mut [u8], protocol: u8, nat: NatDecision) 
     if new_src.is_some() && new_dst.is_none() {
         let new_src = new_src?;
         write_ipv4_src(packet, 0, new_src);
-        adjust_l4_checksum_ipv4_src(packet, ihl, protocol, old_src, new_src)?;
+        if !non_first_fragment {
+            adjust_l4_checksum_ipv4_src(packet, ihl, protocol, old_src, new_src)?;
+        }
     } else if new_dst.is_some() && new_src.is_none() {
         let new_dst = new_dst?;
         write_ipv4_dst(packet, 0, new_dst);
-        adjust_l4_checksum_ipv4_dst(packet, ihl, protocol, old_dst, new_dst)?;
+        if !non_first_fragment {
+            adjust_l4_checksum_ipv4_dst(packet, ihl, protocol, old_dst, new_dst)?;
+        }
     } else if new_src.is_some() || new_dst.is_some() {
         if let Some(ip) = new_src {
             write_ipv4_src(packet, 0, ip);
@@ -762,28 +809,36 @@ pub(super) fn apply_nat_ipv4(packet: &mut [u8], protocol: u8, nat: NatDecision) 
         }
         let new_src = new_src.unwrap_or(old_src);
         let new_dst = new_dst.unwrap_or(old_dst);
-        match protocol {
-            PROTO_TCP => {
-                adjust_l4_checksum_ipv4(packet, ihl, protocol, old_src, new_src, old_dst, new_dst)?
-            }
-            PROTO_UDP => {
-                let checksum_offset = ihl.checked_add(6)?;
-                let keep_zero = packet
-                    .get(checksum_offset..checksum_offset + 2)
-                    .map(|bytes| bytes == [0, 0])
-                    .unwrap_or(false);
-                if !keep_zero {
-                    adjust_l4_checksum_ipv4(
-                        packet, ihl, protocol, old_src, new_src, old_dst, new_dst,
-                    )?;
+        // #1852: skip the L4-checksum adjust on a non-first fragment —
+        // its "L4 checksum" bytes are payload. The address-change delta
+        // is folded into the first fragment's L4 checksum.
+        if !non_first_fragment {
+            match protocol {
+                PROTO_TCP => adjust_l4_checksum_ipv4(
+                    packet, ihl, protocol, old_src, new_src, old_dst, new_dst,
+                )?,
+                PROTO_UDP => {
+                    let checksum_offset = ihl.checked_add(6)?;
+                    let keep_zero = packet
+                        .get(checksum_offset..checksum_offset + 2)
+                        .map(|bytes| bytes == [0, 0])
+                        .unwrap_or(false);
+                    if !keep_zero {
+                        adjust_l4_checksum_ipv4(
+                            packet, ihl, protocol, old_src, new_src, old_dst, new_dst,
+                        )?;
+                    }
                 }
+                _ => {}
             }
-            _ => {}
         }
     }
 
     // --- L4 port rewriting (after IP rewriting) ---
-    apply_nat_port_rewrite(packet, ihl, protocol, ChecksumFamily::V4, nat)?;
+    // #1852: skip on a non-first fragment — the port bytes are payload.
+    if !non_first_fragment {
+        apply_nat_port_rewrite(packet, ihl, protocol, ChecksumFamily::V4, nat)?;
+    }
 
     Some(())
 }
@@ -801,6 +856,7 @@ pub(super) fn apply_nat_ipv6(
     rel_l4: usize,
     protocol: u8,
     nat: NatDecision,
+    non_first_fragment: bool,
 ) -> Option<()> {
     if nat == NatDecision::default() {
         return Some(());
@@ -824,7 +880,10 @@ pub(super) fn apply_nat_ipv6(
     // NPTv6 (RFC 6296): prefix translation is checksum-neutral by design --
     // the adjustment word preserves the ones-complement sum of the full address.
     // Skip L4 checksum updates entirely for NPTv6 rewrites.
-    let skip_l4_csum = nat.nptv6;
+    // #1852: a non-first fragment has no L4 checksum at `rel_l4` (those
+    // bytes are payload), so skip the address-change L4-checksum adjust
+    // too. The IP address byte writes below still run.
+    let skip_l4_csum = nat.nptv6 || non_first_fragment;
     if new_src.is_some() && new_dst.is_none() {
         let new_src = new_src?;
         let old_src: [u8; 16] = packet.get(8..24)?.try_into().ok()?;
@@ -893,7 +952,10 @@ pub(super) fn apply_nat_ipv6(
     // At the caller-supplied ext-aware L4 offset (#1838) — the fixed
     // 40 here used to land port writes inside the first extension
     // header of any ext-headered packet.
-    apply_nat_port_rewrite(packet, rel_l4, protocol, ChecksumFamily::V6, nat)?;
+    // #1852: skip on a non-first fragment — the port bytes are payload.
+    if !non_first_fragment {
+        apply_nat_port_rewrite(packet, rel_l4, protocol, ChecksumFamily::V6, nat)?;
+    }
 
     Some(())
 }
@@ -1022,11 +1084,17 @@ pub(super) fn enforce_expected_ports(
     addr_family: u8,
     protocol: u8,
     expected_ports: Option<(u16, u16)>,
+    non_first_fragment: bool,
 ) -> Option<bool> {
     let Some((expected_src, expected_dst)) = expected_ports else {
         return Some(false);
     };
     if !matches!(protocol, PROTO_TCP | PROTO_UDP) {
+        return Some(false);
+    }
+    // #1852: a non-first fragment has no L4 ports at the post-IP offset —
+    // do not "enforce" payload bytes (and do not touch a fake checksum).
+    if non_first_fragment {
         return Some(false);
     }
     // #1840: family for the zero-checksum predicates. None (other
@@ -1070,11 +1138,16 @@ pub(super) fn enforce_expected_ports_at(
     addr_family: u8,
     protocol: u8,
     expected_ports: Option<(u16, u16)>,
+    non_first_fragment: bool,
 ) -> Option<bool> {
     let Some((expected_src, expected_dst)) = expected_ports else {
         return Some(false);
     };
     if !matches!(protocol, PROTO_TCP | PROTO_UDP) {
+        return Some(false);
+    }
+    // #1852: skip port enforcement on a non-first fragment (payload at l4).
+    if non_first_fragment {
         return Some(false);
     }
     // #1840: the previously-unused addr_family parameter now selects
@@ -1109,8 +1182,14 @@ pub(super) fn restore_l4_tuple_from_meta(
     packet: &mut [u8],
     meta: impl Into<ForwardPacketMeta>,
     rel_l4: usize,
+    non_first_fragment: bool,
 ) -> Option<bool> {
     let meta = meta.into();
+    // #1852: a non-first fragment has no L4 header — the ICMP "ident"
+    // bytes at rel_l4+4 are payload; do not restore into them.
+    if non_first_fragment {
+        return Some(false);
+    }
     match meta.protocol {
         PROTO_TCP | PROTO_UDP => Some(false),
         PROTO_ICMP | PROTO_ICMPV6 => {

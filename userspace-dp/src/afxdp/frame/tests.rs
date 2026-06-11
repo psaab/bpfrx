@@ -1223,6 +1223,7 @@ fn apply_nat_ipv4_recomputes_tcp_checksum() {
             rewrite_dst: None,
             ..NatDecision::default()
         },
+        false,
     )
     .expect("apply nat");
 
@@ -1795,6 +1796,7 @@ fn enforce_expected_ports_repairs_ipv6_tcp_ports_and_checksum() {
         libc::AF_INET6 as u8,
         PROTO_TCP,
         Some((54688, 5201)),
+        false,
     )
     .expect("repair");
     assert!(repaired);
@@ -1836,6 +1838,7 @@ fn enforce_expected_ports_repairs_ipv4_tcp_ports_and_checksum() {
         libc::AF_INET as u8,
         PROTO_TCP,
         Some((54688, 5201)),
+        false,
     )
     .expect("repair");
     assert!(repaired);
@@ -5321,4 +5324,251 @@ fn adjust_l4_checksum_port_v4_skip_v6_no_skip() {
         Some(())
     );
     assert_eq!(p4, p6, "non-zero stored checksum: families behave identically");
+}
+
+// ---------------------------------------------------------------------------
+// #1852 — non-first-fragment NAT rewrite gating + MSS-clamp ext-aware fix.
+// ---------------------------------------------------------------------------
+
+/// Build a minimal L3-relative IPv4 packet (no Ethernet). `frag_off` is
+/// the raw 16-bit IPv4 fragment-offset field (flags + offset). `payload`
+/// is appended after the 20-byte header (it stands in for the bytes a
+/// non-first fragment carries where an L4 header would be).
+fn frag_v4_packet(protocol: u8, frag_off: u16, payload: &[u8]) -> Vec<u8> {
+    let mut p = vec![0u8; 20];
+    p[0] = 0x45;
+    let total = (20 + payload.len()) as u16;
+    p[2..4].copy_from_slice(&total.to_be_bytes());
+    p[4..6].copy_from_slice(&0x1234u16.to_be_bytes()); // id
+    p[6..8].copy_from_slice(&frag_off.to_be_bytes());
+    p[8] = 64; // ttl
+    p[9] = protocol;
+    p[12..16].copy_from_slice(&[10, 0, 0, 1]); // src
+    p[16..20].copy_from_slice(&[10, 0, 0, 2]); // dst
+    p.extend_from_slice(payload);
+    p
+}
+
+/// Build a minimal L3-relative IPv6 packet with an optional fragment
+/// header (44) before the L4/payload. `frag_off` is the raw 16-bit
+/// fragment-header offset/flags field; pass None for no fragment header.
+fn frag_v6_packet(protocol: u8, frag_off: Option<u16>, payload: &[u8]) -> Vec<u8> {
+    let mut p = vec![0u8; 40];
+    p[0] = 0x60;
+    p[7] = 64; // hop limit
+    p[8..24].copy_from_slice(&[0x20; 16]); // src
+    p[24..40].copy_from_slice(&[0x30; 16]); // dst
+    match frag_off {
+        Some(off) => {
+            p[6] = 44; // next header = fragment
+            let mut frag = [0u8; 8];
+            frag[0] = protocol; // next header after fragment
+            frag[2..4].copy_from_slice(&off.to_be_bytes());
+            frag[4..8].copy_from_slice(&0xdead_beefu32.to_be_bytes()); // id
+            p.extend_from_slice(&frag);
+        }
+        None => p[6] = protocol,
+    }
+    let plen = (p.len() - 40 + payload.len()) as u16;
+    p[4..6].copy_from_slice(&plen.to_be_bytes());
+    p.extend_from_slice(payload);
+    p
+}
+
+#[test]
+fn ipv4_non_first_fragment_predicate_truth_table() {
+    // offset 0, MF=0 (atomic) and MF=1 (first) -> first/atomic, false.
+    assert!(!ipv4_is_non_first_fragment(&frag_v4_packet(PROTO_TCP, 0x0000, &[0; 8])));
+    assert!(!ipv4_is_non_first_fragment(&frag_v4_packet(PROTO_TCP, 0x2000, &[0; 8])));
+    // offset != 0 -> non-first (with and without MF).
+    assert!(ipv4_is_non_first_fragment(&frag_v4_packet(PROTO_TCP, 0x0001, &[0; 8])));
+    assert!(ipv4_is_non_first_fragment(&frag_v4_packet(PROTO_TCP, 0x2001, &[0; 8])));
+    // too-short slice -> false (length guards reject separately).
+    assert!(!ipv4_is_non_first_fragment(&[0x45, 0x00, 0x00]));
+}
+
+#[test]
+fn ipv6_non_first_fragment_predicate_truth_table() {
+    // No fragment header -> false.
+    assert!(!ipv6_is_non_first_fragment(&frag_v6_packet(PROTO_TCP, None, &[0; 8])));
+    // Fragment header, offset 0 (first/atomic) with MF=0 and MF=1 -> false.
+    assert!(!ipv6_is_non_first_fragment(&frag_v6_packet(PROTO_TCP, Some(0x0000), &[0; 8])));
+    assert!(!ipv6_is_non_first_fragment(&frag_v6_packet(PROTO_TCP, Some(0x0001), &[0; 8])));
+    // Fragment header, offset bits set -> non-first.
+    assert!(ipv6_is_non_first_fragment(&frag_v6_packet(PROTO_TCP, Some(0x0008), &[0; 8])));
+    assert!(ipv6_is_non_first_fragment(&frag_v6_packet(PROTO_TCP, Some(0xABC8), &[0; 8])));
+}
+
+#[test]
+fn apply_nat_ipv4_non_first_fragment_rewrites_ip_only() {
+    // Payload bytes occupy the post-IP offset where the buggy code would
+    // write the dst port + adjust an L4 checksum.
+    let payload = [0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44];
+    let mut frag = frag_v4_packet(PROTO_TCP, 0x0001, &payload);
+    let nat = NatDecision {
+        rewrite_dst: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9))),
+        rewrite_dst_port: Some(8080),
+        ..NatDecision::default()
+    };
+    assert_eq!(apply_nat_ipv4(&mut frag, PROTO_TCP, nat, true), Some(()));
+    // dst IP rewritten on the fragment ...
+    assert_eq!(&frag[16..20], &[192, 0, 2, 9]);
+    // ... but the payload (the fictitious L4 header) is byte-identical.
+    assert_eq!(&frag[20..], &payload);
+}
+
+#[test]
+fn apply_nat_ipv6_non_first_fragment_rewrites_ip_only() {
+    let payload = [0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44];
+    let mut frag = frag_v6_packet(PROTO_TCP, Some(0x0008), &payload);
+    let new_dst = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x99);
+    let nat = NatDecision {
+        rewrite_dst: Some(IpAddr::V6(new_dst)),
+        rewrite_dst_port: Some(8080),
+        ..NatDecision::default()
+    };
+    // rel_l4 = 48 (40 base + 8 fragment header).
+    assert_eq!(apply_nat_ipv6(&mut frag, 48, PROTO_TCP, nat, true), Some(()));
+    assert_eq!(&frag[24..40], &new_dst.octets());
+    assert_eq!(&frag[48..], &payload);
+}
+
+#[test]
+fn enforce_expected_ports_skips_non_first_fragment() {
+    // A non-first fragment's "ports" are payload; enforcement must no-op.
+    let payload = [0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0];
+    let mut frame = frag_v4_packet(PROTO_TCP, 0x0001, &payload);
+    let before = frame.clone();
+    let repaired = enforce_expected_ports(
+        &mut frame,
+        libc::AF_INET as u8,
+        PROTO_TCP,
+        Some((54688, 5201)),
+        true,
+    )
+    .expect("enforce");
+    assert!(!repaired);
+    assert_eq!(frame, before, "non-first fragment payload must be untouched");
+}
+
+#[test]
+fn clamp_tcp_mss_clamps_ext_headered_v6_syn() {
+    // hop-by-hop ext header (8 bytes, next=TCP) then a SYN with an MSS
+    // option of 1460. Before #1852 the fixed (40, packet[6]) read saw
+    // packet[6] == 0 (hop-by-hop) and bailed; now the clamp walks the
+    // chain and clamps to 1400.
+    let mut p = vec![0u8; 40];
+    p[0] = 0x60;
+    p[6] = 0; // next header = hop-by-hop
+    p[7] = 64;
+    // hop-by-hop: next=TCP(6), hdr ext len 0 (8 bytes total).
+    p.extend_from_slice(&[6, 0, 0, 0, 0, 0, 0, 0]);
+    // TCP header at offset 48: ports, seq, ack, data-offset=6 (24 bytes,
+    // 20 + 4 MSS option), SYN flag, window, csum, urg, MSS option.
+    let mut tcp = vec![0u8; 24];
+    tcp[12] = 6 << 4; // data offset 6 words = 24 bytes
+    tcp[13] = 0x02; // SYN
+    tcp[20] = 2; // MSS kind
+    tcp[21] = 4; // MSS len
+    tcp[22..24].copy_from_slice(&1460u16.to_be_bytes());
+    p.extend_from_slice(&tcp);
+    let plen = (p.len() - 40) as u16;
+    p[4..6].copy_from_slice(&plen.to_be_bytes());
+
+    assert!(super::tcp::clamp_tcp_mss(&mut p, 1400), "ext-headered v6 SYN must clamp");
+    let mss = u16::from_be_bytes([p[48 + 22], p[48 + 23]]);
+    assert_eq!(mss, 1400);
+}
+
+#[test]
+fn clamp_tcp_mss_skips_non_first_fragment() {
+    // A non-first v4 fragment whose payload happens to look like a SYN
+    // with an MSS option must NOT be clamped (the bytes are payload).
+    let mut tcp_like = vec![0u8; 24];
+    tcp_like[12] = 6 << 4;
+    tcp_like[13] = 0x02; // looks like SYN
+    tcp_like[20] = 2;
+    tcp_like[21] = 4;
+    tcp_like[22..24].copy_from_slice(&1460u16.to_be_bytes());
+    let before = tcp_like.clone();
+    let mut frag = frag_v4_packet(PROTO_TCP, 0x0001, &tcp_like);
+    assert!(!super::tcp::clamp_tcp_mss(&mut frag, 1400));
+    assert_eq!(&frag[20..], &before[..], "fragment payload untouched");
+}
+
+#[test]
+fn build_tunnel_egress_non_first_fragment_skips_forced_l4_recompute() {
+    // #1852 (Codex impl review): the copy builder's forced tunnel L4
+    // recompute (tunnel_endpoint_id != 0 -> force_tunnel_l4_recompute)
+    // must NOT run on a non-first fragment — it would write a checksum at
+    // ihl+16, which is payload, re-corrupting what the NAT/port gates
+    // protected. Build an eth + non-first IPv4 fragment + TCP-like
+    // payload and assert the payload is byte-identical after the build.
+    let mut out = Vec::new();
+    write_eth_header(
+        &mut out,
+        [0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5],
+        [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
+        0,
+        0x0800,
+    );
+    let ip_start = out.len(); // 14
+    // IPv4 header: non-first fragment (offset 1), ttl 64, proto TCP.
+    let payload = [0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+    let mut ip = vec![0u8; 20];
+    ip[0] = 0x45;
+    let total = (20 + payload.len()) as u16;
+    ip[2..4].copy_from_slice(&total.to_be_bytes());
+    ip[6..8].copy_from_slice(&0x0001u16.to_be_bytes()); // non-first
+    ip[8] = 64;
+    ip[9] = PROTO_TCP;
+    ip[12..16].copy_from_slice(&[10, 0, 0, 1]);
+    ip[16..20].copy_from_slice(&[10, 0, 0, 2]);
+    out.extend_from_slice(&ip);
+    out.extend_from_slice(&payload);
+    let before_payload = payload.to_vec();
+    let ingress = out.clone();
+
+    let meta: ForwardPacketMeta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: ip_start as u16,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        ..UserspaceDpMeta::default()
+    }
+    .into();
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 11,
+            tunnel_endpoint_id: 7, // tunnel egress -> force_tunnel_l4_recompute
+            next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))),
+            neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+            tx_vlan_id: 0,
+        },
+        nat: NatDecision::default(),
+    };
+
+    let mut egress = vec![0u8; ingress.len()];
+    let written = build_forwarded_frame_into_from_frame(
+        &mut egress,
+        &ingress,
+        meta,
+        &decision,
+        &ForwardingState::default(),
+        false,
+        None,
+    )
+    .expect("build");
+    let out_payload_start = 14 + 20; // eth + ihl
+    assert_eq!(
+        &egress[out_payload_start..written],
+        &before_payload[..],
+        "forced tunnel L4 recompute must not touch non-first fragment payload"
+    );
 }

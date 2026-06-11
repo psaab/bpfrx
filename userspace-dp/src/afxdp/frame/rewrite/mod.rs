@@ -21,8 +21,8 @@ use ipv4::apply_rewrite_descriptor_ipv4;
 use ipv6::apply_rewrite_descriptor_ipv6;
 
 use super::{
-    rewrite_prepare_eth_from_parts, verify_built_frame_checksums, InPlaceRewriteResult,
-    RewriteEthParams,
+    is_non_first_fragment, rewrite_prepare_eth_from_parts, verify_built_frame_checksums,
+    InPlaceRewriteResult, RewriteEthParams,
 };
 use crate::afxdp::{MmapArea, RewriteDescriptor, UserspaceDpMeta, XdpDesc};
 
@@ -74,6 +74,19 @@ pub(in crate::afxdp) fn apply_rewrite_descriptor(
     let ip = prep.ip_start;
     let skip_ttl = prep.skip_ttl;
     let apply_nat = prep.apply_nat;
+
+    // #1852: the descriptor fast path applies a precomputed L4-checksum
+    // delta (rd.l4_csum_delta) and inline port writes at the L4 offset,
+    // both of which would corrupt a non-first fragment's payload. Rather
+    // than re-derive the precomputed deltas for the IP-only case, fall
+    // back to the generic path (`rewrite_forwarded_frame_in_place` via
+    // the caller's `.or_else(...)`), which carries the leaf-level
+    // fragment gate. Returning None here preserves the #1838 P-N3
+    // descriptor-vs-generic byte parity (the generic path becomes the
+    // single source of truth for fragments).
+    if ip < packet.len() && is_non_first_fragment(&packet[ip..], meta.addr_family) {
+        return None;
+    }
 
     match rd.ether_type {
         0x0800 => apply_rewrite_descriptor_ipv4(

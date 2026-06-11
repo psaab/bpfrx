@@ -49,14 +49,19 @@ fn undo_of(nat: NatDecision, pkt: &ValidPacket) -> NatDecision {
 /// with the TTL decrement. The harness applies no TTL change, so
 /// passing the current TTL as `old_ttl` makes that term identity.
 fn apply_nat_family(packet: &mut [u8], pkt: &ValidPacket, nat: NatDecision) -> Option<()> {
+    // #1852: mirror the production orchestrators — compute the
+    // non-first-fragment predicate from the L3 packet and thread it into
+    // the NAT leaf. For the existing non-fragment generators this is
+    // always `false` (offset-0/atomic fragment headers only).
+    let non_first_fragment = is_non_first_fragment(packet, pkt.addr_family);
     if pkt.addr_family == AF4 {
         let old_src = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
         let old_dst = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
         let ttl = packet[8];
-        apply_nat_ipv4(packet, pkt.protocol, nat)?;
+        apply_nat_ipv4(packet, pkt.protocol, nat, non_first_fragment)?;
         adjust_ipv4_header_checksum(&mut packet[..pkt.rel_l4], old_src, old_dst, ttl)
     } else {
-        apply_nat_ipv6(packet, pkt.rel_l4, pkt.protocol, nat)
+        apply_nat_ipv6(packet, pkt.rel_l4, pkt.protocol, nat, non_first_fragment)
     }
 }
 
@@ -423,7 +428,7 @@ fn pin_1838_generic_v6_nat_ext_header_rewrites_real_l4() {
     // copy builder, the segmentation arm, and the slow path call).
     let original = pkt.l3_packet();
     let mut packet = original.clone();
-    assert!(apply_nat_ipv6(&mut packet, pkt.rel_l4, PROTO_TCP, nat).is_some());
+    assert!(apply_nat_ipv6(&mut packet, pkt.rel_l4, PROTO_TCP, nat, false).is_some());
     assert_eq!(
         u16::from_be_bytes([packet[48 + 2], packet[48 + 3]]),
         0x3333,
@@ -643,7 +648,7 @@ fn pin_1840_v6_udp_zero_skip_family_gated() {
 
     // Generic path: port rewritten AND checksum adjusted from 0.
     let mut packet = pkt.l3_packet();
-    assert!(apply_nat_ipv6(&mut packet, pkt.rel_l4, PROTO_UDP, nat).is_some());
+    assert!(apply_nat_ipv6(&mut packet, pkt.rel_l4, PROTO_UDP, nat, false).is_some());
     assert_eq!(
         u16::from_be_bytes([packet[40], packet[41]]),
         pkt.src_port.wrapping_add(1),
@@ -679,7 +684,7 @@ fn pin_1840_v4_udp_zero_skip_preserved() {
     };
 
     let mut packet = pkt.l3_packet();
-    assert!(apply_nat_ipv4(&mut packet, PROTO_UDP, nat).is_some());
+    assert!(apply_nat_ipv4(&mut packet, PROTO_UDP, nat, false).is_some());
     assert_eq!(
         u16::from_be_bytes([packet[pkt.rel_l4], packet[pkt.rel_l4 + 1]]),
         pkt.src_port.wrapping_add(1),
@@ -717,7 +722,7 @@ fn pin_same_port_v6_udp_zero_parity_rule() {
         ..NatDecision::default()
     };
     let mut packet = pkt.l3_packet();
-    assert!(apply_nat_ipv6(&mut packet, pkt.rel_l4, PROTO_UDP, nat).is_some());
+    assert!(apply_nat_ipv6(&mut packet, pkt.rel_l4, PROTO_UDP, nat, false).is_some());
     assert_eq!(
         u16::from_be_bytes([packet[40 + 6], packet[40 + 7]]),
         0xffff,
@@ -745,7 +750,7 @@ fn pin_same_port_v6_udp_zero_parity_rule() {
         ..NatDecision::default()
     };
     let mut packet = pkt.l3_packet();
-    assert!(apply_nat_ipv4(&mut packet, PROTO_UDP, nat).is_some());
+    assert!(apply_nat_ipv4(&mut packet, PROTO_UDP, nat, false).is_some());
     assert_eq!(
         u16::from_be_bytes([packet[pkt.rel_l4 + 6], packet[pkt.rel_l4 + 7]]),
         0x0000,
@@ -788,7 +793,7 @@ fn ext_kind_nat_rewrite_placement() {
             let original = pkt.l3_packet();
             let mut packet = original.clone();
             assert!(
-                apply_nat_ipv6(&mut packet, rel_l4, proto, nat).is_some(),
+                apply_nat_ipv6(&mut packet, rel_l4, proto, nat, false).is_some(),
                 "apply_nat_ipv6 succeeds ({ext:?}/{proto})"
             );
             assert_eq!(

@@ -199,6 +199,94 @@ pub(in crate::afxdp) fn packet_rel_l4_offset_and_protocol(
     }
 }
 
+/// #1852: is this L3-relative IPv4 packet a NON-first fragment?
+///
+/// A non-first fragment has a non-zero fragment offset (the low 13 bits
+/// of the `frag_off` field at IPv4 header bytes 6-7) and therefore has NO
+/// L4 header at the post-IP-header offset — its "L4" bytes are payload.
+/// First and atomic fragments (offset 0, MF=0 or 1) carry the real L4
+/// header and return `false`. A too-short slice returns `false` (the
+/// length guards in the rewrite leaves reject it separately).
+#[inline]
+pub(in crate::afxdp) fn ipv4_is_non_first_fragment(packet: &[u8]) -> bool {
+    packet.len() >= 8 && (u16::from_be_bytes([packet[6], packet[7]]) & 0x1FFF) != 0
+}
+
+/// #1852: is this L3-relative IPv6 packet a NON-first fragment?
+///
+/// Walks the extension-header chain (bounded, same 6-iteration limit as
+/// `packet_rel_l4_offset`) looking for a fragment header (44). Returns
+/// `true` iff a fragment header is present AND its fragment-offset bits
+/// (upper 13 bits of bytes 2-3, mask `0xFFF8`, RFC 8200 §4.5) are
+/// non-zero. First/atomic fragments (offset 0) and packets without a
+/// fragment header return `false`. Mirrors `screen/extract.rs` /
+/// `parse_embedded_v6_l4` fragment semantics. Read-only, no mutation;
+/// unlike the defect-2 fix this is a separate predicate so the shared
+/// `packet_rel_l4_offset_and_protocol` (read by GRE decap / tunnel
+/// local-origin to FORWARD fragments) stays unchanged.
+#[inline]
+pub(in crate::afxdp) fn ipv6_is_non_first_fragment(packet: &[u8]) -> bool {
+    if packet.len() < 40 {
+        return false;
+    }
+    let mut protocol = packet[6];
+    let mut offset = 40usize;
+    for _ in 0..6 {
+        match protocol {
+            0 | 43 | 60 => {
+                let Some(opt) = packet.get(offset..offset + 2) else {
+                    return false;
+                };
+                protocol = opt[0];
+                let Some(next) = offset.checked_add((usize::from(opt[1]) + 1) * 8) else {
+                    return false;
+                };
+                offset = next;
+                if packet.len() < offset {
+                    return false;
+                }
+            }
+            51 => {
+                let Some(opt) = packet.get(offset..offset + 2) else {
+                    return false;
+                };
+                protocol = opt[0];
+                let Some(next) = offset.checked_add((usize::from(opt[1]) + 2) * 4) else {
+                    return false;
+                };
+                offset = next;
+                if packet.len() < offset {
+                    return false;
+                }
+            }
+            44 => {
+                let Some(frag) = packet.get(offset..offset + 8) else {
+                    return false;
+                };
+                return (u16::from_be_bytes([frag[2], frag[3]]) & 0xFFF8) != 0;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// #1852: family-dispatched non-first-fragment predicate over the
+/// L3-relative packet slice. Computed ONCE per packet by the rewrite
+/// orchestrators and threaded into the NAT leaves so the L4 byte
+/// operations (port rewrite, L4-checksum adjust, port enforcement, ICMP
+/// ident restore) are skipped on non-first fragments while the IP
+/// address rewrite still runs (the IP header is present on every
+/// fragment; the L4 checksum lives only in the first fragment).
+#[inline]
+pub(in crate::afxdp) fn is_non_first_fragment(packet: &[u8], addr_family: u8) -> bool {
+    match addr_family as i32 {
+        libc::AF_INET => ipv4_is_non_first_fragment(packet),
+        libc::AF_INET6 => ipv6_is_non_first_fragment(packet),
+        _ => false,
+    }
+}
+
 pub(in crate::afxdp) fn metadata_tuple_complete(meta: UserspaceDpMeta, flow: &SessionFlow) -> bool {
     if flow.src_ip.is_unspecified() || flow.dst_ip.is_unspecified() {
         return false;

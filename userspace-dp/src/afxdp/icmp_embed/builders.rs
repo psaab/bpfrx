@@ -80,7 +80,19 @@ pub(in crate::afxdp::icmp_embed) fn build_nat_reversed_icmp_error_v4(
     }
 
     let emb_l4_offset = emb_ip_offset + emb_ihl;
-    if icmp_match.nat.rewrite_src_port.is_some() || icmp_match.nat.rewrite_src.is_some() {
+    // #1852: skip the embedded L4 port/ident restore when the QUOTED v4
+    // packet is a non-first fragment — `emb_l4_offset` then points at
+    // payload, not an L4 header. The embedded IP-address rewrite above
+    // (emb_ip_offset+12) is correct for every fragment and stays. This
+    // reads the embedded IPv4 fragment-offset field directly because the
+    // builder derives `emb_l4_offset` itself rather than via
+    // `parse_embedded_v4` (so it does not inherit that guard).
+    let emb_frag_off =
+        u16::from_be_bytes([pkt[emb_ip_offset + 6], pkt[emb_ip_offset + 7]]);
+    let emb_non_first_fragment = (emb_frag_off & 0x1FFF) != 0;
+    if !emb_non_first_fragment
+        && (icmp_match.nat.rewrite_src_port.is_some() || icmp_match.nat.rewrite_src.is_some())
+    {
         let emb_proto = icmp_match.embedded_proto;
         if matches!(emb_proto, PROTO_TCP | PROTO_UDP) && pkt.len() >= emb_l4_offset + 2 {
             pkt.get_mut(emb_l4_offset..emb_l4_offset + 2)?

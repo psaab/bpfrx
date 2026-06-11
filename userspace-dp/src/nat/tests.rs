@@ -1034,6 +1034,7 @@ fn tuple_snat_lookup_from_src(
         None,
         None,
         now_ns,
+        false,
     )
 }
 
@@ -1333,6 +1334,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_rules() {
         None,
         None,
         1,
+        false,
     );
     assert!(matches!(first, SourceNatLookup::Matched(_)));
 
@@ -1348,6 +1350,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_rules() {
         None,
         None,
         2,
+        false,
     );
     assert_eq!(
         second,
@@ -1406,6 +1409,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_persistence_modes() {
         None,
         None,
         1,
+        false,
     );
     assert!(matches!(first, SourceNatLookup::Matched(_)));
 
@@ -1421,6 +1425,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_persistence_modes() {
         None,
         None,
         2,
+        false,
     );
     assert_eq!(
         second,
@@ -2514,6 +2519,7 @@ fn pool_snat_address_persistent_userspace_v1_selects_pool_addresses() {
             None,
             None,
             0,
+            false,
         ));
 
         assert_eq!(decision.rewrite_src, Some(want_src.parse().unwrap()));
@@ -2742,4 +2748,65 @@ fn port_allocator_basic() {
     assert_eq!(mixed.address_index(src_v6, 2, 2, false), 2);
     assert_eq!(mixed.address_index(src_v4, 0, 2, false), 1);
     assert_eq!(mixed.address_index(src_v6, 2, 2, false), 3);
+}
+
+#[test]
+fn pool_snat_non_first_fragment_refused_no_allocation() {
+    // #1852: a non-first fragment that would match a pool-mode SNAT rule
+    // must be refused (Unavailable::NonFirstFragment) so no pool port is
+    // allocated and no port is written into payload. The matching
+    // first-fragment case (non_first_fragment=false) still allocates.
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "pool-snat".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "my-pool".to_string(),
+        pool_addresses: vec!["203.0.113.1/32".to_string()],
+        port_low: 1024,
+        port_high: 65535,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+
+    // Non-first fragment: refused without allocating.
+    let frag = match_source_nat_result_for_tuple(
+        &rules,
+        "lan",
+        "wan",
+        "10.0.1.100".parse().unwrap(),
+        "8.8.8.8".parse().unwrap(),
+        6,
+        10000,
+        53,
+        None,
+        None,
+        1,
+        true,
+    );
+    match frag {
+        SourceNatLookup::Unavailable(failure) => {
+            assert_eq!(failure.exception_reason(), "source_nat_non_first_fragment");
+        }
+        other => panic!("expected NonFirstFragment refusal, got {other:?}"),
+    }
+
+    // First/atomic fragment (non_first_fragment=false): still allocates.
+    let first = match_source_nat_result_for_tuple(
+        &rules,
+        "lan",
+        "wan",
+        "10.0.1.100".parse().unwrap(),
+        "8.8.8.8".parse().unwrap(),
+        6,
+        10000,
+        53,
+        None,
+        None,
+        1,
+        false,
+    );
+    assert!(
+        matches!(first, SourceNatLookup::Matched(d) if d.rewrite_src_port.is_some()),
+        "first fragment must still allocate a pool mapping"
+    );
 }

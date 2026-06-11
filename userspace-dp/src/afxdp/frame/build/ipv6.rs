@@ -7,8 +7,8 @@
 
 use super::super::tcp::clamp_tcp_mss_frame;
 use super::super::{
-    apply_nat_ipv6, enforce_expected_ports_at, recompute_l4_checksum_ipv6,
-    restore_l4_tuple_from_meta, v6_rel_l4_offset,
+    apply_nat_ipv6, enforce_expected_ports_at, ipv6_is_non_first_fragment,
+    recompute_l4_checksum_ipv6, restore_l4_tuple_from_meta, v6_rel_l4_offset,
 };
 use crate::afxdp::{ForwardPacketMeta, SessionDecision};
 
@@ -39,10 +39,19 @@ pub(in crate::afxdp::frame) fn build_forwarded_frame_into_ipv6(
         meta.l4_offset,
         meta.addr_family,
     )?;
+    // #1852: non-first-fragment predicate, computed once and threaded.
+    let non_first_fragment = ipv6_is_non_first_fragment(&out[ip_start..]);
     let repaired_ports =
-        restore_l4_tuple_from_meta(&mut out[ip_start..], meta, rel_l4).unwrap_or(false);
+        restore_l4_tuple_from_meta(&mut out[ip_start..], meta, rel_l4, non_first_fragment)
+            .unwrap_or(false);
     if apply_nat {
-        apply_nat_ipv6(&mut out[ip_start..], rel_l4, meta.protocol, decision.nat)?;
+        apply_nat_ipv6(
+            &mut out[ip_start..],
+            rel_l4,
+            meta.protocol,
+            decision.nat,
+            non_first_fragment,
+        )?;
     }
     if (meta.meta_flags & 0x80) == 0 {
         out[ip_start + 7] -= 1;
@@ -54,12 +63,17 @@ pub(in crate::afxdp::frame) fn build_forwarded_frame_into_ipv6(
         meta.addr_family,
         meta.protocol,
         enforced_ports,
+        non_first_fragment,
     )
     .unwrap_or(false);
     if tunnel_tcp_mss > 0 {
         let _ = clamp_tcp_mss_frame(out, ip_start, tunnel_tcp_mss);
     }
-    if force_tunnel_l4_recompute || (repaired_ports && !enforced) {
+    // #1852: skip the full L4 recompute on a non-first fragment — it
+    // writes the checksum at rel_l4+16/+6, which is payload here. The
+    // forced tunnel-egress recompute would otherwise re-corrupt the bytes
+    // the NAT/port gates above protected.
+    if !non_first_fragment && (force_tunnel_l4_recompute || (repaired_ports && !enforced)) {
         recompute_l4_checksum_ipv6(&mut out[ip_start..], rel_l4, meta.protocol)?;
     }
     Some(())
