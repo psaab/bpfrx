@@ -113,15 +113,15 @@ fn v8_new_v8_advertises_v8_mode() {
 fn v8_matches_config_v8_distinguishes_max_worker_id() {
     let lease = SharedCoSQueueLease::new_v8(10_000_000, 64 * 1024, 2, 5);
     assert!(
-        lease.matches_config_v8(10_000_000, 64 * 1024, 2, 5, V8RateMode::CstructDefault),
+        lease.matches_config_v8(10_000_000, 64 * 1024, 2, 5, V8RateMode::CstructDefault, EqualFlowTargetPolicy::Slowest),
         "same config matches"
     );
     assert!(
-        !lease.matches_config_v8(10_000_000, 64 * 1024, 2, 6, V8RateMode::CstructDefault),
+        !lease.matches_config_v8(10_000_000, 64 * 1024, 2, 6, V8RateMode::CstructDefault, EqualFlowTargetPolicy::Slowest),
         "max_worker_id change does NOT match (forces rebuild)"
     );
     assert!(
-        !lease.matches_config_v8(10_000_000, 64 * 1024, 2, 5, V8RateMode::EqualFlowSuppress),
+        !lease.matches_config_v8(10_000_000, 64 * 1024, 2, 5, V8RateMode::EqualFlowSuppress, EqualFlowTargetPolicy::Slowest),
         "rate-mode change does NOT match (forces rebuild)"
     );
     assert!(
@@ -135,7 +135,7 @@ fn v8_legacy_lease_matches_legacy_only() {
     let lease = SharedCoSQueueLease::new(10_000_000, 64 * 1024, 2);
     assert!(lease.matches_config(10_000_000, 64 * 1024, 2));
     assert!(
-        !lease.matches_config_v8(10_000_000, 64 * 1024, 2, 0, V8RateMode::CstructDefault),
+        !lease.matches_config_v8(10_000_000, 64 * 1024, 2, 0, V8RateMode::CstructDefault, EqualFlowTargetPolicy::Slowest),
         "legacy lease must NOT match matches_config_v8"
     );
 }
@@ -638,6 +638,24 @@ fn new_equal_flow_lease() -> SharedCoSQueueLease {
 }
 
 fn seed_two_valid_skewed_equal_flow_epochs(lease: &SharedCoSQueueLease) {
+    // Pre-#1746 expectations: clip-to-slowest target = min(8000/4,
+    // 1800/1) = 1800; cap = 1800 x 4 = 7200.
+    seed_two_valid_skewed_epochs_expecting(lease, 1_800, 7_200);
+}
+
+/// #1746: parameterized two-epoch skewed seeding shared by the per-
+/// policy tests. Worker 0 carries 4 flows and is granted 8000 B/epoch
+/// (2000 B/flow); worker 1 carries 1 flow granted 1800 B/epoch
+/// (1800 B/flow). The lease rate is 50 MB/s => nominal 10_000 B/epoch.
+/// Expected targets per policy over these samples:
+///   Slowest:    min(2000, 1800)            = 1800, cap 1800 x 4 = 7200
+///   Mean:       (8000 + 1800) / (4 + 1)    = 1960, cap 1960 x 4 = 7840
+///   IdealShare: 10_000 / (4 + 1)           = 2000, cap 2000 x 4 = 8000
+fn seed_two_valid_skewed_epochs_expecting(
+    lease: &SharedCoSQueueLease,
+    expected_target: u64,
+    expected_cap: u64,
+) {
     lease.rehydrate_worker_active_count(0, 4);
     lease.rehydrate_worker_active_count(1, 1);
 
@@ -651,8 +669,19 @@ fn seed_two_valid_skewed_equal_flow_epochs(lease: &SharedCoSQueueLease) {
 
     let _ = lease.acquire_v8(1, 3 * EPOCH_DURATION_NS, 1);
     assert!(lease.v8_equal_flow_enforced());
-    assert_eq!(lease.v8_equal_flow_target_per_flow(), 1_800);
-    assert_eq!(lease.v8_equal_flow_worker_cap(), 7_200);
+    assert_eq!(lease.v8_equal_flow_target_per_flow(), expected_target);
+    assert_eq!(lease.v8_equal_flow_worker_cap(), expected_cap);
+}
+
+fn new_equal_flow_lease_with_policy(policy: EqualFlowTargetPolicy) -> SharedCoSQueueLease {
+    SharedCoSQueueLease::new_v8_with_rate_mode_and_policy(
+        50_000_000,
+        256 * 1024,
+        8,
+        1,
+        V8RateMode::EqualFlowSuppress,
+        policy,
+    )
 }
 
 #[test]
@@ -667,6 +696,70 @@ fn equal_flow_default_new_v8_behavior_unchanged() {
     assert_eq!(g0, 8_000);
     assert_eq!(g1, 2_000);
     assert_eq!(lease.v8_equal_flow_fail_open_count(), 0);
+}
+
+// === #1746 equal-flow target-policy tests ===
+
+#[test]
+fn equal_flow_named_slowest_policy_is_byte_identical_to_default() {
+    // The named `slowest` value and the unset default must produce the
+    // same published target/cap over identical inputs (Q1/Q4 of the
+    // #1746 plan: no `"" vs named` divergence).
+    let named = new_equal_flow_lease_with_policy(EqualFlowTargetPolicy::Slowest);
+    seed_two_valid_skewed_epochs_expecting(&named, 1_800, 7_200);
+    assert_eq!(named.v8_equal_flow_target_policy_label(), "slowest");
+
+    let default = new_equal_flow_lease();
+    seed_two_valid_skewed_epochs_expecting(&default, 1_800, 7_200);
+    assert_eq!(default.v8_equal_flow_target_policy_label(), "slowest");
+}
+
+#[test]
+fn equal_flow_mean_policy_targets_aggregate_mean_per_flow() {
+    // Mean = sum(prev_grants) / sum(active_flows) over the sampled set:
+    // (8000 + 1800) / (4 + 1) = 1960 B/epoch. Higher than the slowest
+    // band (1800) but below the fastest per-flow rate (2000), so only
+    // the lucky outliers clip.
+    let lease = new_equal_flow_lease_with_policy(EqualFlowTargetPolicy::Mean);
+    seed_two_valid_skewed_epochs_expecting(&lease, 1_960, 7_840);
+    assert_eq!(lease.v8_equal_flow_target_policy_label(), "mean");
+}
+
+#[test]
+fn equal_flow_ideal_share_policy_targets_nominal_share() {
+    // IdealShare = nominal epoch budget / total active flows =
+    // 10_000 / 5 = 2000 B/epoch. Equal to the fastest per-flow rate
+    // here, i.e. the documented capacity-limited no-op: worker 0's cap
+    // (2000 x 4 = 8000) equals its fair share, so nothing clips.
+    let lease = new_equal_flow_lease_with_policy(EqualFlowTargetPolicy::IdealShare);
+    seed_two_valid_skewed_epochs_expecting(&lease, 2_000, 8_000);
+    assert_eq!(lease.v8_equal_flow_target_policy_label(), "ideal-share");
+}
+
+#[test]
+fn matches_config_v8_distinguishes_equal_flow_target_policy() {
+    // #1746 F3: a live policy change must rebuild the lease; a stale
+    // lease must not be reused across a policy edit.
+    let lease = new_equal_flow_lease_with_policy(EqualFlowTargetPolicy::Mean);
+    assert!(lease.matches_config_v8(
+        50_000_000,
+        256 * 1024,
+        8,
+        1,
+        V8RateMode::EqualFlowSuppress,
+        EqualFlowTargetPolicy::Mean,
+    ));
+    assert!(
+        !lease.matches_config_v8(
+            50_000_000,
+            256 * 1024,
+            8,
+            1,
+            V8RateMode::EqualFlowSuppress,
+            EqualFlowTargetPolicy::Slowest,
+        ),
+        "policy change must force a lease rebuild"
+    );
 }
 
 #[test]

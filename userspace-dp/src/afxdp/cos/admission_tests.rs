@@ -4,6 +4,7 @@
 // `#[path = "admission_tests.rs"]` from admission.rs.
 
 use super::*;
+use crate::afxdp::types::EqualFlowTargetPolicy;
 use crate::afxdp::PROTO_TCP;
 use crate::afxdp::cos::ecn::{ECN_CE, ECN_ECT_0, ECN_MASK, ECN_NOT_ECT};
 use crate::afxdp::tx::test_support::*;
@@ -29,6 +30,7 @@ fn flow_share_limit_shared_exact_scales_with_rate() {
             exact: true,
             surplus_sharing: false,
             equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
             surplus_weight: 1,
             buffer_bytes: 0,
             dscp_rewrite: None,
@@ -77,6 +79,7 @@ fn flow_share_limit_shared_exact_caps_at_aggregate_for_single_flow() {
             exact: true,
             surplus_sharing: false,
             equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
             surplus_weight: 1,
             buffer_bytes: 0,
             dscp_rewrite: None,
@@ -117,6 +120,7 @@ fn flow_share_limit_shared_exact_clamps_to_buffer_at_low_n() {
             exact: true,
             surplus_sharing: false,
             equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
             surplus_weight: 1,
             buffer_bytes: 0,
             dscp_rewrite: None,
@@ -162,6 +166,7 @@ fn flow_share_limit_shared_exact_protects_against_dominant_flow() {
             exact: true,
             surplus_sharing: false,
             equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
             surplus_weight: 1,
             buffer_bytes: 0,
             dscp_rewrite: None,
@@ -208,6 +213,7 @@ fn flow_share_limit_owner_local_exact_unchanged() {
             exact: true,
             surplus_sharing: false,
             equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
             surplus_weight: 1,
             buffer_bytes: 125_000,
             dscp_rewrite: None,
@@ -984,6 +990,7 @@ fn cos_flow_aware_buffer_limit_scales_with_prospective_active_flow_count() {
             exact: true,
             surplus_sharing: false,
             equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
             surplus_weight: 1,
             // Decimal KB to match the operator `buffer-size 125k`
             // config, not KiB — the admission-boundary math must
@@ -1047,6 +1054,7 @@ fn cos_flow_aware_buffer_limit_matches_share_limit_at_new_flow_boundary() {
             exact: true,
             surplus_sharing: false,
             equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
             surplus_weight: 1,
             // Decimal KB to match the operator `buffer-size 125k`
             // config, not KiB — the admission-boundary math must
@@ -1135,6 +1143,7 @@ fn cos_flow_aware_buffer_limit_respects_non_flow_fair_queues() {
             exact: true,
             surplus_sharing: false,
             equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
             surplus_weight: 1,
             buffer_bytes: 128 * 1024,
             dscp_rewrite: None,
@@ -1169,6 +1178,7 @@ fn cos_queue_flow_share_limit_never_drops_below_fast_retransmit_floor() {
             exact: true,
             surplus_sharing: false,
             equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
             surplus_weight: 1,
             // Decimal KB to match the operator `buffer-size 125k`
             // config, not KiB — the admission-boundary math must
@@ -1228,6 +1238,7 @@ fn cos_flow_aware_buffer_limit_clamps_high_flow_count_to_max_delay() {
             exact: true,
             surplus_sharing: false,
             equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
             surplus_weight: 1,
             // Decimal KB to match the operator `buffer-size 125k`
             // config, not KiB.
@@ -1294,6 +1305,7 @@ fn cos_flow_aware_buffer_limit_honours_operator_base_above_delay_cap() {
             exact: true,
             surplus_sharing: false,
             equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
             surplus_weight: 1,
             buffer_bytes: operator_base,
             dscp_rewrite: None,
@@ -1346,6 +1358,7 @@ fn cos_flow_aware_buffer_limit_honours_q4_fixture_override_above_delay_cap() {
             exact: true,
             surplus_sharing: false,
             equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
             surplus_weight: 1,
             buffer_bytes: operator_base,
             dscp_rewrite: None,
@@ -1395,6 +1408,7 @@ fn cos_flow_aware_buffer_limit_preserves_non_flow_fair_path_after_clamp() {
             exact: true,
             surplus_sharing: false,
             equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
             surplus_weight: 1,
             // Operator configured 10 MB — well above delay_cap.
             // If the clamp leaks into this path, the returned cap
@@ -1434,6 +1448,7 @@ fn cos_flow_aware_buffer_limit_delay_cap_scales_linearly_with_rate() {
                 exact: true,
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
+                equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
                 surplus_weight: 1,
                 // Small operator base so the delay cap dominates.
                 buffer_bytes: COS_MIN_BURST_BYTES,

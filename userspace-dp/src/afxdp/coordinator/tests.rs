@@ -203,6 +203,7 @@ fn build_cos_owner_worker_by_queue_prefers_lowest_worker_with_tx_binding() {
                 exact: false,
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
+                equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
                 surplus_weight: 1,
                 buffer_bytes: 64 * 1024,
                 dscp_rewrite: None,
@@ -263,6 +264,7 @@ fn build_cos_owner_worker_by_queue_spreads_queues_across_eligible_workers() {
                     exact: false,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                    equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
                     surplus_weight: 1,
                     buffer_bytes: 64 * 1024,
                     dscp_rewrite: None,
@@ -277,6 +279,7 @@ fn build_cos_owner_worker_by_queue_spreads_queues_across_eligible_workers() {
                     exact: false,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                    equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
                     surplus_weight: 1,
                     buffer_bytes: 64 * 1024,
                     dscp_rewrite: None,
@@ -291,6 +294,7 @@ fn build_cos_owner_worker_by_queue_spreads_queues_across_eligible_workers() {
                     exact: false,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                    equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
                     surplus_weight: 1,
                     buffer_bytes: 64 * 1024,
                     dscp_rewrite: None,
@@ -354,6 +358,7 @@ fn build_cos_owner_worker_by_queue_prefers_ready_workers_when_available() {
                     exact: false,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                    equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
                     surplus_weight: 1,
                     buffer_bytes: 64 * 1024,
                     dscp_rewrite: None,
@@ -368,6 +373,7 @@ fn build_cos_owner_worker_by_queue_prefers_ready_workers_when_available() {
                     exact: true,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                    equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
                     surplus_weight: 1,
                     buffer_bytes: 64 * 1024,
                     dscp_rewrite: None,
@@ -429,6 +435,7 @@ fn build_cos_owner_worker_by_queue_falls_back_when_no_ready_workers_exist() {
                 exact: false,
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
+                equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
                 surplus_weight: 1,
                 buffer_bytes: 64 * 1024,
                 dscp_rewrite: None,
@@ -595,6 +602,7 @@ fn build_shared_cos_root_leases_uses_active_workers_per_interface() {
                     exact: false,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                    equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
                     surplus_weight: 1,
                     buffer_bytes: 128 * 1024,
                     dscp_rewrite: None,
@@ -609,6 +617,7 @@ fn build_shared_cos_root_leases_uses_active_workers_per_interface() {
                     exact: false,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                    equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
                     surplus_weight: 1,
                     buffer_bytes: 128 * 1024,
                     dscp_rewrite: None,
@@ -682,6 +691,7 @@ fn build_shared_cos_root_leases_reuses_existing_matching_lease_arc() {
                 exact: false,
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
+                equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
                 surplus_weight: 1,
                 buffer_bytes: 128 * 1024,
                 dscp_rewrite: None,
@@ -730,6 +740,7 @@ fn build_shared_cos_queue_leases_reuses_existing_matching_lease_arc() {
                 exact: true,
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
+                equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
                 surplus_weight: 1,
                 buffer_bytes: 128 * 1024,
                 dscp_rewrite: None,
@@ -784,6 +795,7 @@ fn build_shared_cos_queue_leases_rebuilds_when_equal_flow_mode_toggles() {
                 exact: true,
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
+                equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
                 surplus_weight: 1,
                 buffer_bytes: 128 * 1024,
                 dscp_rewrite: None,
@@ -825,6 +837,89 @@ fn build_shared_cos_queue_leases_rebuilds_when_equal_flow_mode_toggles() {
     assert!(new.v8_equal_flow_active());
 }
 
+/// #1746 F3: a live `equal-flow-target-policy` edit (slowest -> mean)
+/// must rebuild the lease Arc — `matches_config_v8` includes the
+/// policy, so a stale lease cannot keep publishing with the old
+/// target math. Same-policy rebuild input must still reuse.
+#[test]
+fn build_shared_cos_queue_leases_rebuilds_when_equal_flow_target_policy_changes() {
+    let mut forwarding = ForwardingState::default();
+    forwarding.cos.interfaces.insert(
+        80,
+        CoSInterfaceConfig {
+            shaping_rate_bytes: 100_000_000,
+            burst_bytes: 256 * 1024,
+            default_queue: 0,
+            dscp_classifier: String::new(),
+            ieee8021_classifier: String::new(),
+            dscp_queue_by_dscp: [u8::MAX; 64],
+            ieee8021_queue_by_pcp: [u8::MAX; 8],
+            queue_by_forwarding_class: FastMap::default(),
+            queues: vec![CoSQueueConfig {
+                queue_id: 4,
+                forwarding_class: "iperf-b".into(),
+                priority: 5,
+                transmit_rate_bytes: 50_000_000,
+                guarantee_enabled: true,
+                exact: true,
+                surplus_sharing: false,
+                equal_flow_enforcement: true,
+                equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
+                surplus_weight: 1,
+                buffer_bytes: 128 * 1024,
+                dscp_rewrite: None,
+                codel_target_ns: 0,
+            }],
+            oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+            oversubscription_guarantee_fraction: 0.0,
+            priority_low_min_share_bytes: 0,
+        },
+    );
+    let active_shards_by_egress_ifindex = BTreeMap::from([(80, 2usize)]);
+
+    let existing = build_shared_cos_queue_leases_reusing_existing(
+        &forwarding,
+        &active_shards_by_egress_ifindex,
+        2,
+        &BTreeMap::new(),
+    );
+
+    // Same config -> reuse (no policy change).
+    let reused = build_shared_cos_queue_leases_reusing_existing(
+        &forwarding,
+        &active_shards_by_egress_ifindex,
+        2,
+        &existing,
+    );
+    assert!(Arc::ptr_eq(
+        existing.get(&(80, 4)).expect("existing queue lease"),
+        reused.get(&(80, 4)).expect("reused queue lease")
+    ));
+
+    // Policy edit -> rebuild.
+    forwarding
+        .cos
+        .interfaces
+        .get_mut(&80)
+        .expect("iface")
+        .queues[0]
+        .equal_flow_target_policy = EqualFlowTargetPolicy::Mean;
+    let rebuilt = build_shared_cos_queue_leases_reusing_existing(
+        &forwarding,
+        &active_shards_by_egress_ifindex,
+        2,
+        &existing,
+    );
+    let old = existing.get(&(80, 4)).expect("existing queue lease");
+    let new = rebuilt.get(&(80, 4)).expect("rebuilt queue lease");
+    assert!(
+        !Arc::ptr_eq(old, new),
+        "equal-flow target-policy change must rebuild the lease Arc"
+    );
+    assert!(new.v8_equal_flow_active());
+    assert_eq!(new.v8_equal_flow_target_policy_label(), "mean");
+}
+
 /// #1830 follow-up (Codex review on PR #1841): shared fixture for the
 /// sparse-worker-id sizing pins below — one exact 50 MB/s queue on
 /// ifindex 80 / queue 4, mirroring the fixtures of the reuse/rebuild
@@ -851,6 +946,7 @@ fn exact_queue_forwarding_fixture() -> ForwardingState {
                 exact: true,
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
+                equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
                 surplus_weight: 1,
                 buffer_bytes: 128 * 1024,
                 dscp_rewrite: None,
@@ -903,11 +999,11 @@ fn build_shared_cos_queue_leases_sizes_for_sparse_high_worker_id() {
 
     let burst_bytes = (128 * 1024u64).max(64 * 1500);
     assert!(
-        lease.matches_config_v8(50_000_000, burst_bytes, 2, 40, V8RateMode::CstructDefault),
+        lease.matches_config_v8(50_000_000, burst_bytes, 2, 40, V8RateMode::CstructDefault, EqualFlowTargetPolicy::Slowest),
         "lease must be sized for max_worker_id 40 (41 per-worker slots)"
     );
     assert!(
-        !lease.matches_config_v8(50_000_000, burst_bytes, 2, 1, V8RateMode::CstructDefault),
+        !lease.matches_config_v8(50_000_000, burst_bytes, 2, 1, V8RateMode::CstructDefault, EqualFlowTargetPolicy::Slowest),
         "a 41-slot lease must not match a 2-slot topology"
     );
 
@@ -999,6 +1095,7 @@ fn refresh_cos_owner_worker_map_from_binding_statuses_keeps_shared_arcs_when_unc
                     exact: false,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                    equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
                     surplus_weight: 1,
                     buffer_bytes: 128 * 1024,
                     dscp_rewrite: None,
@@ -1013,6 +1110,7 @@ fn refresh_cos_owner_worker_map_from_binding_statuses_keeps_shared_arcs_when_unc
                     exact: false,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                    equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
                     surplus_weight: 1,
                     buffer_bytes: 128 * 1024,
                     dscp_rewrite: None,

@@ -4,6 +4,7 @@
 // `#[path = "token_bucket_tests.rs"]` from token_bucket.rs.
 
 use super::*;
+use crate::afxdp::types::EqualFlowTargetPolicy;
 use crate::afxdp::tx::test_support::*;
 use crate::afxdp::types::{CoSQueueConfig, V8RateMode};
 
@@ -73,6 +74,7 @@ fn exact_queue_without_shared_lease_does_not_locally_refill() {
             exact: true,
             surplus_sharing: false,
             equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
             surplus_weight: 1,
             buffer_bytes: 125_000,
             dscp_rewrite: None,
@@ -128,6 +130,7 @@ fn maybe_top_up_cos_root_lease_unblocks_large_frame_exceeding_lease_bytes() {
             exact: false,
             surplus_sharing: false,
             equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
@@ -170,6 +173,7 @@ fn maybe_top_up_cos_queue_lease_unblocks_local_exact_queue_without_tokens() {
             exact: true,
             surplus_sharing: false,
             equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
@@ -224,6 +228,7 @@ fn maybe_top_up_cos_queue_lease_reports_v8_acquire_calls_and_grants() {
             exact: true,
             surplus_sharing: false,
             equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
@@ -263,6 +268,7 @@ fn maybe_top_up_cos_queue_lease_enforces_equal_flow_cap() {
             exact: true,
             surplus_sharing: false,
             equal_flow_enforcement: true,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
@@ -332,6 +338,7 @@ fn maybe_top_up_cos_root_lease_transparent_when_shaping_rate_zero() {
             exact: false,
             surplus_sharing: false,
             equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
@@ -372,6 +379,7 @@ fn maybe_top_up_cos_queue_lease_transparent_when_queue_rate_zero_exact_no_lease(
             exact: true, // <- precise old-code-failing branch
             surplus_sharing: false,
             equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
@@ -418,6 +426,7 @@ fn maybe_top_up_cos_queue_lease_transparent_non_exact_with_nonzero_last_refill()
             exact: false,
             surplus_sharing: false,
             equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
@@ -466,6 +475,7 @@ fn transparent_root_preserves_per_queue_exact_cap() {
             exact: true,
             surplus_sharing: false,
             equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,

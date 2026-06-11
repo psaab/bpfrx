@@ -152,6 +152,12 @@ impl SharedCoSQueueLease {
                     0
                 };
             }
+            // #1746: steady-state per-epoch byte budget for the
+            // IdealShare policy (`rate × EPOCH`). Computed here because
+            // the publisher only sees `V8State`, not `self.config`.
+            let nominal_epoch_bytes = ((self.config.rate_bytes as u128
+                * EPOCH_DURATION_NS as u128)
+                / 1_000_000_000u128) as u64;
             publish_equal_flow_epoch_v8(
                 v8,
                 new_tag,
@@ -160,6 +166,7 @@ impl SharedCoSQueueLease {
                 sampled_active_flows_by_worker,
                 demanded_by_worker,
                 prev_grants,
+                nominal_epoch_bytes,
             );
         } else {
             v8.equal_flow.disable_for_epoch(new_tag);

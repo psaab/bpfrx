@@ -4,6 +4,7 @@
 // `#[path = "builders_tests.rs"]` from builders.rs.
 
 use super::*;
+use crate::afxdp::types::EqualFlowTargetPolicy;
 use crate::afxdp::tx::test_support::*;
 use crate::afxdp::types::{CoSOversubscriptionPolicy, CoSQueueConfig, FastMap};
 
@@ -32,6 +33,7 @@ fn build_cos_interface_runtime_propagates_surplus_sharing() {
                     exact: true,
                     surplus_sharing: true,
                     equal_flow_enforcement: true,
+                    equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
                     surplus_weight: 1,
                     buffer_bytes: COS_MIN_BURST_BYTES,
                     dscp_rewrite: None,
@@ -46,6 +48,7 @@ fn build_cos_interface_runtime_propagates_surplus_sharing() {
                     exact: true,
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
+                    equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
                     surplus_weight: 1,
                     buffer_bytes: COS_MIN_BURST_BYTES,
                     dscp_rewrite: None,
@@ -101,6 +104,7 @@ fn build_cos_interface_runtime_starts_exact_queue_with_zero_local_tokens() {
                 exact: true,
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
+                equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
                 surplus_weight: 1,
                 buffer_bytes: 128 * 1024,
                 dscp_rewrite: None,
@@ -139,6 +143,7 @@ fn build_cos_interface_runtime_leaves_flow_hash_seed_zero_until_promotion() {
                 exact: true,
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
+                equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
                 surplus_weight: 1,
                 buffer_bytes: COS_MIN_BURST_BYTES,
                 dscp_rewrite: None,
@@ -153,6 +158,7 @@ fn build_cos_interface_runtime_leaves_flow_hash_seed_zero_until_promotion() {
                 exact: true,
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
+                equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
                 surplus_weight: 1,
                 buffer_bytes: COS_MIN_BURST_BYTES,
                 dscp_rewrite: None,
@@ -191,6 +197,7 @@ fn build_cos_interface_runtime_zero_shaping_rate_starts_with_full_root_tokens() 
                 exact: false,
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
+                equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
                 surplus_weight: 1,
                 buffer_bytes: 128 * 1024,
                 dscp_rewrite: None,
@@ -236,6 +243,7 @@ fn build_cos_interface_runtime_zero_queue_rate_starts_with_full_queue_tokens() {
                 exact: false,
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
+                equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
                 surplus_weight: 1,
                 buffer_bytes: 128 * 1024,
                 dscp_rewrite: None,
