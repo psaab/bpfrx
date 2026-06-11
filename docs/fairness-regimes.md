@@ -832,6 +832,19 @@ are exported as a separate monotonic counter, not by rewriting the
 current epoch reason, so a stale worker cannot clobber the
 rotation-published payload.
 
+The per-flow target the publisher enforces is policy-selectable
+(#1746): `equal-flow-target-policy (slowest | mean | ideal-share)` on
+the scheduler, defaulting to the byte-unchanged clip-to-slowest `min`
+reduction. `mean` clips toward the aggregate-weighted mean achieved
+per-flow rate; `ideal-share` is the literal nominal share (a documented
+no-op in capacity-limited regimes). The active policy is exported as
+the sibling info metric
+`xpf_userspace_cos_equal_flow_target_policy{ifindex,queue_id,policy}`
+(a new series — the existing `xpf_userspace_cos_equal_flow_*` gauges
+keep their series identity). No policy can lift slow-worker flows; see
+`docs/cos-traffic-shaping.md` for the modeled aggregate-vs-CoV
+tradeoff table and #1748 for the work-conserving rebalance track.
+
 The all-class CoS sweep harness captures this estimator as first-class
 run evidence. For each class, `fairness-cos-class-sweep.sh` starts a
 continuous Prometheus scrape before invoking the multi-sample wrapper
