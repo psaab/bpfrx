@@ -493,6 +493,7 @@ func (s *Server) fetchPeerSessions(ctx context.Context, req *pb.GetSessionsReque
 		NatOnly:           req.NatOnly,
 		Application:       req.Application,
 		InterfaceFilter:   req.InterfaceFilter,
+		SourceNatPool:     req.SourceNatPool,
 		// Do NOT forward PageToken to peer — tokens encode local BPF map
 		// keys and are meaningless on a different node's keyspace. Peer
 		// always returns its full (first-page) result set.
