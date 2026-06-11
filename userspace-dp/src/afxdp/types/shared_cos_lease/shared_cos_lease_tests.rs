@@ -2008,3 +2008,26 @@ fn v8_equal_flow_mode_never_banks_unclaimed_budget() {
         "equal-flow mode must not recycle unclaimed budget"
     );
 }
+
+#[test]
+fn v8_unclaimed_carry_redeals_flow_proportionally_across_workers() {
+    // Two workers, one flow each (5,000 B/epoch share at 50 MB/s →
+    // 10,000 B/epoch cap). Worker 1 misses epoch 1 entirely (sampling
+    // loss); its unclaimed share banks. Epoch 2's cap = 10,000 + 5,000
+    // and the share formula re-deals it 50/50 — BOTH workers' epoch-2
+    // shares are 7,500, preserving flow-proportional isolation (the
+    // carried budget is not first-come-first-served).
+    let lease = SharedCoSQueueLease::new_v8(50_000_000, 256 * 1024, 2, 1);
+    lease.rehydrate_worker_active_count(0, 1);
+    lease.rehydrate_worker_active_count(1, 1);
+    let g0_e1 = lease.acquire_v8(0, EPOCH_DURATION_NS, 50_000);
+    assert_eq!(g0_e1, 5_000, "epoch 1: worker 0 claims exactly its share");
+    // Worker 1 never acquires in epoch 1. Epoch 2:
+    let g0_e2 = lease.acquire_v8(0, 2 * EPOCH_DURATION_NS, 50_000);
+    let g1_e2 = lease.acquire_v8(1, 2 * EPOCH_DURATION_NS, 50_000);
+    assert_eq!(
+        (g0_e2, g1_e2),
+        (7_500, 7_500),
+        "epoch 2 re-deals the banked 5,000 flow-proportionally"
+    );
+}
