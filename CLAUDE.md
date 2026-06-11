@@ -53,8 +53,11 @@ userspace helper is the only runtime forwarding path.
 
 ## Quick Start
 ```bash
-make generate        # Build retained Rust AF_XDP shim (post-#1476)
-make build           # Build xpfd daemon
+make generate        # Rebuild retained Rust AF_XDP shim — ONLY needed when
+                     # userspace-xdp/ source changed; pinned toolchain +
+                     # kernel-verifier gate (#1864, see pkg/dataplane/README.md)
+make build           # Build xpfd daemon (uses the git-tracked shim .o — does
+                     # NOT require make generate)
 make build-ctl       # Build remote CLI client
 make build-userspace-dp # Build the primary Rust AF_XDP dataplane helper
 make test            # Run Go tests
