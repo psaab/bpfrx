@@ -92,16 +92,18 @@ pub(super) fn apply(
             guard.snapshot = Some(snapshot);
             reconcile_status_bindings(guard);
         } else {
-            guard.afxdp.refresh_runtime_snapshot(&snapshot);
-            // #1866 (PR-review Codex r1 F1): refresh_runtime_snapshot
+            // #1866 (PR-review Codex r1 F1 + r2): refresh_runtime_snapshot
             // reconciles WG control threads for the running case
             // (Copilot C1, #1432) — but a DISARMED helper must not
-            // hold WG listen ports. reconcile_status_bindings already
-            // stops everything when should_run_afxdp is false; mirror
-            // that here so a same-plan apply while disarmed cannot
-            // re-bind the ports the stop released.
-            if !should_run_afxdp(&guard.status) {
-                guard.afxdp.stop_all_wg_control_threads("disarmed");
+            // spawn/bind them even transiently (the control loop binds
+            // and may emit a handshake initiation before its first
+            // stop check). The disarmed variant refreshes the same
+            // forwarding/validation state with the WG spawn pass
+            // replaced by a stop, mirroring reconcile_status_bindings.
+            if should_run_afxdp(&guard.status) {
+                guard.afxdp.refresh_runtime_snapshot(&snapshot);
+            } else {
+                guard.afxdp.refresh_runtime_snapshot_disarmed(&snapshot);
             }
             guard.snapshot = Some(snapshot);
         }

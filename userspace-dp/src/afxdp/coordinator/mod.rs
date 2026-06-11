@@ -905,6 +905,26 @@ impl Coordinator {
     }
 
     pub fn refresh_runtime_snapshot(&mut self, snapshot: &crate::ConfigSnapshot) {
+        self.refresh_runtime_snapshot_inner(snapshot, true);
+    }
+
+    /// #1866 (PR-review Codex r2): runtime-snapshot refresh for a
+    /// DISARMED helper (`should_run_afxdp` false). Identical to
+    /// `refresh_runtime_snapshot` EXCEPT it never spawns WG control
+    /// threads — a disarmed helper must not transiently bind WG listen
+    /// ports or emit handshake initiations; instead any existing
+    /// entries are stopped (mirrors `reconcile_status_bindings →
+    /// stop()`). Forwarding/validation state still refreshes so a
+    /// later arming starts from current state.
+    pub fn refresh_runtime_snapshot_disarmed(&mut self, snapshot: &crate::ConfigSnapshot) {
+        self.refresh_runtime_snapshot_inner(snapshot, false);
+    }
+
+    fn refresh_runtime_snapshot_inner(
+        &mut self,
+        snapshot: &crate::ConfigSnapshot,
+        spawn_wg: bool,
+    ) {
         // #1606: preflight policy validation BEFORE any
         // side-effecting mutation (neighbor manager keys,
         // validation, policy_counters). If integrity errors fire,
@@ -1014,7 +1034,14 @@ impl Coordinator {
         // runtime-snapshot refresh, not just initial bring-up, so a
         // same-plan apply that adds/removes/changes a WG endpoint starts,
         // stops, or restarts the matching UDP/TUN control thread.
-        self.spawn_wg_control_threads();
+        // #1866 (Codex code-r2): NEVER on a disarmed helper — not even
+        // transiently (the control loop binds + may emit an initiation
+        // before its first stop check); stop anything present instead.
+        if spawn_wg {
+            self.spawn_wg_control_threads();
+        } else {
+            self.stop_all_wg_control_threads("disarmed");
+        }
         self.refresh_cos_owner_worker_map_from_identities();
         self.ha
             .fabrics

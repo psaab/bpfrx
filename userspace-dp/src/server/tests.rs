@@ -775,13 +775,18 @@ fn wg1866_disarmed_same_plan_apply_does_not_hold_wg_ports() {
     };
     // forwarding_armed defaults to false: disarmed throughout.
     let state = new_state(ProcessStatus::default());
+    // Pre-bind the WG port for the whole test: a disarmed helper must
+    // not even ATTEMPT a bind (Codex code-r2 — the transient
+    // spawn/bind would surface here as a wg_bind_listen_port
+    // exception), so this blocker must never be hit.
+    let _blocker = std::net::UdpSocket::bind(("::", port)).expect("pre-bind");
     // Apply 1: NOT-same-plan (no previous snapshot) — the disarmed
     // reconcile path stops everything.
     let mut first = req("apply_snapshot");
     first.snapshot = Some(wg_snapshot(1));
     let response = run_request(state.clone(), first);
     assert!(response.ok, "first apply: {}", response.error);
-    // Apply 2: same-plan — takes the refresh_runtime_snapshot leg.
+    // Apply 2: same-plan — takes the (disarmed) refresh leg.
     let mut second = req("apply_snapshot");
     second.snapshot = Some(wg_snapshot(2));
     let response = run_request(state.clone(), second);
@@ -791,11 +796,16 @@ fn wg1866_disarmed_same_plan_apply_does_not_hold_wg_ports() {
         guard.afxdp.wg_control_threads.is_empty(),
         "disarmed helper must hold no WG control entries after a same-plan apply"
     );
-    drop(guard);
-    let bind = std::net::UdpSocket::bind(("0.0.0.0", port));
-    assert!(
-        bind.is_ok(),
-        "disarmed helper must not hold the WG listen port: {:?}",
-        bind.err()
+    let exceptions = guard
+        .afxdp
+        .recent_exceptions
+        .lock()
+        .expect("exceptions")
+        .iter()
+        .filter(|e| e.reason.contains("wg_bind_listen_port"))
+        .count();
+    assert_eq!(
+        exceptions, 0,
+        "disarmed helper must not even attempt a WG bind (no transient spawn)"
     );
 }
