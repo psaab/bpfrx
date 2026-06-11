@@ -106,9 +106,30 @@ that fw1 has neither a `wg0` netdev nor a `:51820` bind, and fails hard
   packet; each fragment encaps independently and the peer reassembles
   after decap — deterministic success.
 
+## Shared-cluster hazards observed live (2026-06-11 validation)
+
+- **Concurrent agents commit on this cluster.** Any foreign commit that
+  does a config replace/rollback (CoS sweeps and similar loops commit
+  every ~75 s when active) WIPES the wg0 stanza mid-run: the dataplane
+  snapshot loses the endpoint, the coordinator stops the WG control
+  thread, and the tunnel dies at a random point in a phase — observed
+  as a P4a tail blackout that was NOT a WireGuard bug. Before a run,
+  check `/etc/xpf/.config.journal` on fw0 is quiet; if a phase dies
+  mid-run, re-check it before triaging the engine.
+- **First WG commit after a daemon start brings the engine up late**
+  (next binding-reconcile pass, not synchronously — the listen-port
+  shim flag makes that apply a plan change). The harness budgets 90 s
+  for P1/P3; a second identical commit is instant. Tracked with #1866.
+- **Config removal leaks the control thread + port** (#1866): the
+  harness preflight self-cleans the leaked TUN and P1 restarts xpfd if
+  the listen port is still pinned with no stanza present.
+
 ## Failure triage
 
 1. P1 no handshake: tcpdump UDP 51820 on the peer — msg1 arriving?
+   If NOTHING leaves fw0, strace the `xpf-wg-control-` thread for
+   `sendto` errors (the dual-stack v4-mapped send bug fixed in this PR
+   showed exactly one silent EINVAL per initiator tick).
    xpf side: `journalctl -u xpfd | grep -i wg`, check the wg0 TUN exists
    and `:51820` is bound on fw0; check the peer's `wg show wgref` for
    key mismatch (hex↔base64 conversion).

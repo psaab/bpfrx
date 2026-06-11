@@ -5098,3 +5098,7 @@ top.
 - **Timestamp**: 2026-06-11
   - **Action**: #1736 S2b — live kernel-WG interop: daemon collect-gate fix (WG tunnels have no GRE source and were dropped before applyWireguardTunLocked), interop harness + env, operator runbook, research plan carry.
   - **File(s)**: pkg/daemon/daemon_run.go, pkg/daemon/tunnel_anchor_test.go, test/incus/wg-interop.sh, test/incus/wg-interop.env, docs/wg-interop-runbook.md, docs/pr/1736-wg-interop/{plan.md,reviewer-ids.md}
+
+- **Timestamp**: 2026-06-11 (cont.)
+  - **Action**: #1736 live bring-up found + fixed two S2a datapath bugs (v4-mapped learned-endpoint MTU-guard inflation; EINVAL on v4 sendto over the dual-stack socket via wg_send_to), filed #1865 (WG telemetry) + #1866 (removal leaks control thread/port), hardened harness (node0-primary wait, fresh keys, leak restart fallback, 90s handshake budget), runbook updated with live shared-cluster hazards.
+  - **File(s)**: userspace-dp/src/afxdp/coordinator/wg_control.rs, test/incus/wg-interop.{sh,env}, docs/wg-interop-runbook.md
