@@ -397,6 +397,12 @@ impl SharedCoSEpochState {
 struct V8State {
     epoch: SharedCoSEpochState,
     rate_mode: V8RateMode,
+    /// #1746: equal-flow target policy. Read only by
+    /// `publish_equal_flow_epoch_v8` (once per rotation, in
+    /// EqualFlowSuppress mode only). `Slowest` is the byte-unchanged
+    /// default; a config policy change rebuilds the lease
+    /// (`matches_config_v8` includes it).
+    equal_flow_target_policy: EqualFlowTargetPolicy,
     /// Per-worker grants this epoch. Length = max_worker_id + 1.
     /// Each slot is packed (epoch_tag, worker_granted_this_epoch).
     /// Single-writer-per-slot: only worker `id` writes worker_grants[id].
@@ -1130,12 +1136,33 @@ impl SharedCoSQueueLease {
         )
     }
 
+    /// #1746: rate-mode constructor with the byte-unchanged default
+    /// equal-flow target policy (`Slowest`). Callers that thread an
+    /// operator-selected policy use `new_v8_with_rate_mode_and_policy`.
     pub(in crate::afxdp) fn new_v8_with_rate_mode(
         rate_bytes: u64,
         burst_bytes: u64,
         active_shards: usize,
         max_worker_id: usize,
         rate_mode: V8RateMode,
+    ) -> Self {
+        Self::new_v8_with_rate_mode_and_policy(
+            rate_bytes,
+            burst_bytes,
+            active_shards,
+            max_worker_id,
+            rate_mode,
+            EqualFlowTargetPolicy::Slowest,
+        )
+    }
+
+    pub(in crate::afxdp) fn new_v8_with_rate_mode_and_policy(
+        rate_bytes: u64,
+        burst_bytes: u64,
+        active_shards: usize,
+        max_worker_id: usize,
+        rate_mode: V8RateMode,
+        equal_flow_target_policy: EqualFlowTargetPolicy,
     ) -> Self {
         // #1630 (P1): queue leases bank an N-frame burst (bank_floor = true).
         let config =
@@ -1181,6 +1208,7 @@ impl SharedCoSQueueLease {
             v8: Some(V8State {
                 epoch: SharedCoSEpochState::new(),
                 rate_mode,
+                equal_flow_target_policy,
                 worker_grants,
                 worker_active_flow_buckets,
                 worker_fair_share,
@@ -1222,6 +1250,9 @@ impl SharedCoSQueueLease {
 
     /// #1229 Phase 6 v8: extended config match including per-worker
     /// array sizing. Lease must be rebuilt on `max_worker_id` change.
+    /// #1746: a live `equal-flow-target-policy` change must rebuild the
+    /// lease — otherwise a stale lease keeps publishing with the old
+    /// policy. The policy is part of the config identity here.
     pub(in crate::afxdp) fn matches_config_v8(
         &self,
         rate_bytes: u64,
@@ -1229,6 +1260,7 @@ impl SharedCoSQueueLease {
         active_shards: usize,
         max_worker_id: usize,
         rate_mode: V8RateMode,
+        equal_flow_target_policy: EqualFlowTargetPolicy,
     ) -> bool {
         let Some(v8) = self.v8.as_ref() else {
             return false;
@@ -1244,6 +1276,7 @@ impl SharedCoSQueueLease {
             )
             && v8.worker_grants.len() == max_worker_id + 1
             && v8.rate_mode == rate_mode
+            && v8.equal_flow_target_policy == equal_flow_target_policy
     }
 
     pub(in crate::afxdp) fn acquire(&self, now_ns: u64, requested: u64) -> u64 {
@@ -1691,6 +1724,16 @@ impl SharedCoSQueueLease {
 
     pub(in crate::afxdp) fn v8_equal_flow_fail_open_reason_label(&self) -> &'static str {
         self.v8_equal_flow_fail_open_reason().as_str()
+    }
+
+    /// #1746: label of the active equal-flow target policy ("slowest" /
+    /// "mean" / "ideal-share"). Meaningful only when the lease is in
+    /// EqualFlowSuppress mode; defaults to "slowest" otherwise.
+    pub(in crate::afxdp) fn v8_equal_flow_target_policy_label(&self) -> &'static str {
+        self.v8
+            .as_ref()
+            .map(|v| v.equal_flow_target_policy.as_str())
+            .unwrap_or(EqualFlowTargetPolicy::Slowest.as_str())
     }
 
     pub(in crate::afxdp) fn v8_equal_flow_fail_open_count(&self) -> u64 {

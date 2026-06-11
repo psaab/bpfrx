@@ -19,6 +19,7 @@
 // invariant over thousands of mixed ops.
 
 use super::*;
+use crate::afxdp::types::EqualFlowTargetPolicy;
 use crate::afxdp::cos::flow_hash::{cos_flow_bucket_index, cos_item_flow_key};
 use crate::afxdp::cos::queue_ops::{
     cos_queue_drain_all, cos_queue_front, cos_queue_front_with_cap, cos_queue_peek_min_bucket,
@@ -48,6 +49,7 @@ fn make_flow_fair_queue() -> CoSQueueRuntime {
             exact: true,
             surplus_sharing: false,
             equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
             surplus_weight: 1,
             buffer_bytes: 4 * 1024 * 1024,
             dscp_rewrite: None,

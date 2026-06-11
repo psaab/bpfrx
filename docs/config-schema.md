@@ -150,3 +150,9 @@ Rules:
   `TestSchemaValidate_ChassisCluster_PackedOneLinerBypassesGate`.
 - **PR 3..N:** interfaces address CIDR, firewall filter terms,
   system/services numeric knobs — same recipe, no walker/infra changes.
+- **#1746:** added the `class-of-service schedulers <s>
+  equal-flow-target-policy (slowest | mean | ideal-share)` typed enum
+  leaf (ValueEnumOf + `ValidateEnum`, same recipe as the scheduler
+  `priority` leaf): value-slot completion, flat-set commit-check
+  rejection of unknown values, plus a strict-compile re-check for
+  externally-assembled configs.

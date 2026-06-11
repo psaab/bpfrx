@@ -879,6 +879,7 @@ fn cos_scheduler_snapshot_surplus_sharing_round_trip_true() {
         buffer_size_percent: 0.0,
         surplus_sharing: true,
         equal_flow_enforcement: false,
+        equal_flow_target_policy: String::new(),
     codel_target_ns: 0,
     };
     let json = serde_json::to_string(&snap).expect("serialize");
@@ -897,11 +898,40 @@ fn cos_scheduler_snapshot_equal_flow_enforcement_round_trip_true() {
         buffer_size_percent: 0.0,
         surplus_sharing: false,
         equal_flow_enforcement: true,
+        equal_flow_target_policy: String::new(),
     codel_target_ns: 0,
     };
     let json = serde_json::to_string(&snap).expect("serialize");
     let back: CoSSchedulerSnapshot = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(back.equal_flow_enforcement, true);
+}
+
+#[test]
+fn cos_scheduler_snapshot_equal_flow_target_policy_round_trip() {
+    // #1746: policy string survives the wire; absent field (older
+    // snapshots / unset configs) decodes to the empty default, and an
+    // unset policy serializes WITHOUT the field on the Go side
+    // (omitempty) — the Rust serde default keeps decode compatible.
+    let snap = CoSSchedulerSnapshot {
+        name: "iperf-a".into(),
+        transmit_rate_bytes: 125_000_000,
+        transmit_rate_exact: true,
+        priority: "low".into(),
+        buffer_size_bytes: 65_536,
+        buffer_size_percent: 0.0,
+        surplus_sharing: false,
+        equal_flow_enforcement: true,
+        equal_flow_target_policy: "mean".into(),
+        codel_target_ns: 0,
+    };
+    let json = serde_json::to_string(&snap).expect("serialize");
+    let back: CoSSchedulerSnapshot = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back.equal_flow_target_policy, "mean");
+
+    // Older snapshot without the field decodes to the default "".
+    let legacy = r#"{"name":"iperf-a","transmit_rate_bytes":125000000,"transmit_rate_exact":true,"equal_flow_enforcement":true}"#;
+    let back: CoSSchedulerSnapshot = serde_json::from_str(legacy).expect("legacy deserialize");
+    assert_eq!(back.equal_flow_target_policy, "");
 }
 
 #[test]
@@ -915,6 +945,7 @@ fn cos_scheduler_snapshot_buffer_size_percent_round_trip() {
         buffer_size_percent: 10.0,
         surplus_sharing: false,
         equal_flow_enforcement: false,
+        equal_flow_target_policy: String::new(),
     codel_target_ns: 0,
     };
     let json = serde_json::to_string(&snap).expect("serialize");

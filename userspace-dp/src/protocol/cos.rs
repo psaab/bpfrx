@@ -110,6 +110,19 @@ pub(crate) struct CoSSchedulerSnapshot {
     /// equal-flow suppression.
     #[serde(rename = "equal_flow_enforcement", default)]
     pub equal_flow_enforcement: bool,
+    /// #1746: equal-flow target policy ("slowest" | "mean" |
+    /// "ideal-share"). Empty (the default for older snapshots and
+    /// unset configs) decodes to the byte-unchanged `Slowest` math in
+    /// forwarding_build. Only meaningful when `equal_flow_enforcement`
+    /// is set. skip_serializing_if mirrors the Go omitempty so the
+    /// unset-config wire stays byte-identical in BOTH directions
+    /// (pinned by `wire_invariant_default_specimens`).
+    #[serde(
+        rename = "equal_flow_target_policy",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub equal_flow_target_policy: String,
     /// #1614 A3: per-queue CoDel target in nanoseconds. 0 disables
     /// CoDel for the queue (current default). WIRE SURFACE ONLY in
     /// PR #1618 — the dequeue-time sojourn check is deferred to a
@@ -282,6 +295,16 @@ pub(crate) struct CoSQueueStatus {
         skip_serializing_if = "String::is_empty"
     )]
     pub equal_flow_fail_open_reason: String,
+    /// #1746: active equal-flow target policy label ("slowest" |
+    /// "mean" | "ideal-share"). Populated only for EqualFlowSuppress
+    /// leases (alongside `equal_flow_enforcement`); empty otherwise so
+    /// the wire stays byte-identical for non-equal-flow queues.
+    #[serde(
+        rename = "equal_flow_target_policy",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub equal_flow_target_policy: String,
     // #709 / #751: owner-profile telemetry for exact queues with an
     // unambiguous single owner-local binding snapshot. These fields are
     // populated only when exactly one owner-local exact queue can

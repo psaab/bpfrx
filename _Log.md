@@ -5106,3 +5106,24 @@ top.
   contract note.
   **File(s)**: userspace-dp/src/afxdp/flow_cache.rs,
   userspace-dp/src/afxdp/flow_cache_tests.rs, docs/fairness-regimes.md
+
+- **Timestamp**: 2026-06-11
+  **Action**: /engineer #1746 — equal-flow target-policy knob (slowest | mean |
+    ideal-share) implemented per the converged research plan (Path A). PR #1867
+    head e94a89b1f. F1 ship-gate measured live (PASS in the high-CoV regime:
+    52% rel CoV reduction at ~0 aggregate cost; supplementary v6/reverse/node-0
+    matrix honest-mixed: near-floor baselines worsen — regime guidance added to
+    docs). Codex r1 NEEDS-CHANGES (ideal-share lag-budget unit bug -> fixed with
+    new_cap numerator + lagged test; matrix; docs contract) -> r2 MERGE-READY;
+    AGY r1+r2 MERGE-READY; Claude SMR r1+r2 MERGE-READY (worked mean-policy
+    join/leave limit-cycle trace, empirically confirmed by near-floor cells).
+    Copilot 3x quota-failed (documented) -> 3-of-4. Cluster restored to default
+    fixture (equal-flow off); PR binary deployed on both nodes.
+  **File(s)**: userspace-dp/src/{afxdp/types/cos.rs, afxdp/types/shared_cos_lease/*,
+    afxdp/forwarding_build/cos.rs, afxdp/coordinator/{mod,status}.rs,
+    protocol/cos.rs, protocol/tests.rs, + test literals}, pkg/config/{schema.go,
+    types_cos.go, compiler*.go, compiler_equal_flow_target_policy_test.go},
+    pkg/dataplane/userspace/{protocol.go, cos.go, cosfmt.go, manager_test.go,
+    cosfmt_test.go}, pkg/api/metrics*.go, test/incus/apply-cos-config.sh,
+    docs/{cos-traffic-shaping.md, fairness-regimes.md, config-schema.md,
+    pr/1746-equal-flow-target-policy/*, refactoring-audit-current.txt}

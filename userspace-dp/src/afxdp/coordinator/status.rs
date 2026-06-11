@@ -686,6 +686,9 @@ fn overlay_shared_cos_queue_lease_statuses(
                 lease.v8_equal_flow_stale_or_tag_mismatch_events();
             queue.equal_flow_fail_open_reason =
                 lease.v8_equal_flow_fail_open_reason_label().to_string();
+            // #1746: surface which target policy the lease enforces.
+            queue.equal_flow_target_policy =
+                lease.v8_equal_flow_target_policy_label().to_string();
         }
     }
 }
@@ -743,6 +746,38 @@ mod tests {
         assert!(queue.equal_flow_enforcement);
         assert_eq!(queue.equal_flow_fail_open_reason, "disabled");
         assert_eq!(queue.equal_flow_stale_or_tag_mismatch_events, 0);
+        // #1746: default-policy lease surfaces the "slowest" label.
+        assert_eq!(queue.equal_flow_target_policy, "slowest");
+    }
+
+    /// #1746: a Mean-policy lease surfaces "mean" on the status row,
+    /// and non-equal-flow leases leave the field empty (wire
+    /// byte-identical for non-equal-flow queues).
+    #[test]
+    fn equal_flow_overlay_populates_target_policy_label() {
+        let mut statuses = vec![CoSInterfaceStatus {
+            ifindex: 80,
+            queues: vec![CoSQueueStatus {
+                queue_id: 4,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        let lease = Arc::new(SharedCoSQueueLease::new_v8_with_rate_mode_and_policy(
+            50_000_000,
+            256 * 1024,
+            8,
+            1,
+            V8RateMode::EqualFlowSuppress,
+            crate::afxdp::types::EqualFlowTargetPolicy::Mean,
+        ));
+        let leases = BTreeMap::from([((80, 4), lease)]);
+
+        overlay_shared_cos_queue_lease_statuses(&mut statuses, &leases);
+
+        let queue = &statuses[0].queues[0];
+        assert!(queue.equal_flow_enforcement);
+        assert_eq!(queue.equal_flow_target_policy, "mean");
     }
 
     /// #1830 (g): the flow-count overlay writes only matching

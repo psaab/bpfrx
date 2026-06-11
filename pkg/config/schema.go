@@ -1068,6 +1068,20 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			// presence-only flags — no value to validate.
 			"surplus-sharing":        {children: nil},
 			"equal-flow-enforcement": {children: nil},
+			// #1746: equal-flow target policy. Only meaningful with
+			// `equal-flow-enforcement`; unset == `slowest` (the
+			// byte-unchanged clip-to-slowest default). `mean` and
+			// `slowest` are non-work-conserving (commit warning).
+			"equal-flow-target-policy": {
+				args:          1,
+				valueType:     ValueEnumOf,
+				valueDesc:     "Equal-flow per-flow target policy (slowest | mean | ideal-share)",
+				valueExamples: []string{"slowest", "mean", "ideal-share"},
+				validator: ValidateEnum([]string{
+					"slowest", "mean", "ideal-share",
+				}),
+				children: nil,
+			},
 		}},
 		"scheduler-maps": {args: 1, multi: true, children: map[string]*schemaNode{
 			"forwarding-class": {args: 1, multi: true, children: map[string]*schemaNode{

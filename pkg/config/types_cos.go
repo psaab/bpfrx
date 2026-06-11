@@ -87,6 +87,17 @@ type CoSScheduler struct {
 	// SurplusSharing, whose surplus phase intentionally bypasses the
 	// per-queue lease cap.
 	EqualFlowEnforcement bool
+	// EqualFlowTargetPolicy (#1746) selects the per-flow target the
+	// equal-flow publisher enforces: "slowest" (clip to the slowest
+	// sampled per-flow rate — the byte-unchanged default; "" maps
+	// here), "mean" (clip toward the aggregate-weighted mean achieved
+	// per-flow rate), or "ideal-share" (literal scheduler_rate /
+	// total_active_flows nominal share; a documented no-op in
+	// capacity-limited regimes). Only meaningful with
+	// EqualFlowEnforcement; warned (not stripped) otherwise. NO policy
+	// lifts slow-worker flows — the cap is one-directional; the
+	// work-conserving fix is cross-worker rebalance (#1748).
+	EqualFlowTargetPolicy string
 	// CodelTargetNS (#1614 A3) is the per-queue CoDel sojourn-time
 	// AQM target in nanoseconds. 0 (default) disables CoDel for the
 	// queue. Recommended >= 1.5x post-shaper RTT (~5-7 ms on the

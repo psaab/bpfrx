@@ -233,6 +233,11 @@ type CoSSchedulerSnapshot struct {
 	// queue-lease equal-flow suppression on positive transmit-rate
 	// exact queues.
 	EqualFlowEnforcement bool `json:"equal_flow_enforcement,omitempty"`
+	// EqualFlowTargetPolicy (#1746) selects the equal-flow per-flow
+	// target reduction: "slowest" | "mean" | "ideal-share". omitempty
+	// keeps the wire byte-identical for unset configs ("" == the
+	// byte-unchanged "slowest" default on the Rust side).
+	EqualFlowTargetPolicy string `json:"equal_flow_target_policy,omitempty"`
 	// #1614 A3: per-queue CoDel target in nanoseconds. WIRE
 	// SURFACE ONLY in PR #1618 — the dequeue-time sojourn check
 	// is deferred to a focused follow-up. 0 disables CoDel for
@@ -878,6 +883,10 @@ type CoSQueueStatus struct {
 	EqualFlowSuppressedGrantBytes     uint64 `json:"equal_flow_suppressed_grant_bytes,omitempty"`
 	EqualFlowStaleOrTagMismatchEvents uint64 `json:"equal_flow_stale_or_tag_mismatch_events,omitempty"`
 	EqualFlowFailOpenReason           string `json:"equal_flow_fail_open_reason,omitempty"`
+	// EqualFlowTargetPolicy (#1746): active target-policy label
+	// ("slowest" | "mean" | "ideal-share"); populated only for
+	// equal-flow leases, empty otherwise.
+	EqualFlowTargetPolicy string `json:"equal_flow_target_policy,omitempty"`
 	// #709 / #751: owner-profile telemetry. Populated only when an
 	// exact queue can inherit a binding-scoped owner profile
 	// unambiguously; zero for shared_exact, non-exact, and ambiguous

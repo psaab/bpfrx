@@ -564,6 +564,9 @@ func TestFormatCoSInterfaceSummaryRendersEqualFlowEnforcementLine(t *testing.T) 
 	for _, want := range []string{
 		"Equal-flow:",
 		"enforced=no",
+		// #1746: empty runtime policy label renders as the
+		// byte-unchanged default "slowest".
+		"policy=slowest",
 		"target=8.00 Mb/s",
 		"max_worker_cap=7.03 KiB",
 		"cap_hits=3",
@@ -573,6 +576,37 @@ func TestFormatCoSInterfaceSummaryRendersEqualFlowEnforcementLine(t *testing.T) 
 		if !strings.Contains(out, want) {
 			t.Fatalf("missing %q in equal-flow output:\n%s", want, out)
 		}
+	}
+}
+
+// #1746: a runtime-reported target policy reaches the Equal-flow line.
+func TestFormatCoSInterfaceSummaryRendersEqualFlowTargetPolicy(t *testing.T) {
+	cfg := testCoSConfig()
+	cfg.ClassOfService.Schedulers["10mb"].EqualFlowEnforcement = true
+	owner := uint32(7)
+	status := &ProcessStatus{
+		CoSInterfaces: []CoSInterfaceStatus{{
+			InterfaceName:   "reth0.80",
+			OwnerWorkerID:   &owner,
+			WorkerInstances: 1,
+			Queues: []CoSQueueStatus{{
+				QueueID:               4,
+				OwnerWorkerID:         &owner,
+				ForwardingClass:       "bandwidth-10mb",
+				Priority:              1,
+				Exact:                 true,
+				EqualFlowEnforcement:  true,
+				EqualFlowEnforced:     true,
+				EqualFlowTargetPolicy: "mean",
+				TransmitRateBytes:     1_250_000,
+				BufferBytes:           32 * 1024,
+			}},
+		}},
+	}
+
+	out := FormatCoSInterfaceSummary(cfg, status, "reth0.80")
+	if !strings.Contains(out, "policy=mean") {
+		t.Fatalf("missing policy=mean in equal-flow output:\n%s", out)
 	}
 }
 

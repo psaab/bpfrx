@@ -1577,6 +1577,11 @@ fn build_shared_cos_queue_leases_reusing_existing(
             } else {
                 V8RateMode::CstructDefault
             };
+            // #1746: per-queue equal-flow target policy. forwarding_build
+            // gates it on equal_flow_enforcement, so CstructDefault
+            // queues always carry the default `Slowest` here and never
+            // force a spurious lease rebuild.
+            let equal_flow_target_policy = queue.equal_flow_target_policy;
             // #1229 Phase 6 v8: emit v8 leases for guarantee-phase
             // exact queues. Reuse existing lease only if v8 mode AND
             // max_worker_id/mode match (otherwise rebuild).
@@ -1587,6 +1592,7 @@ fn build_shared_cos_queue_leases_reusing_existing(
                     active_shards,
                     max_worker_id,
                     rate_mode,
+                    equal_flow_target_policy,
                 )
             }) {
                 out.insert(key, lease.clone());
@@ -1594,12 +1600,13 @@ fn build_shared_cos_queue_leases_reusing_existing(
             }
             out.insert(
                 key,
-                Arc::new(SharedCoSQueueLease::new_v8_with_rate_mode(
+                Arc::new(SharedCoSQueueLease::new_v8_with_rate_mode_and_policy(
                     queue.transmit_rate_bytes,
                     burst_bytes,
                     active_shards,
                     max_worker_id,
                     rate_mode,
+                    equal_flow_target_policy,
                 )),
             );
         }

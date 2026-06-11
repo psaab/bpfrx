@@ -758,6 +758,9 @@ The configuration remains Junos-inspired:
 - optional classifier bindings
 - optional `equal-flow-enforcement` on positive `transmit-rate exact`
   schedulers
+- optional `equal-flow-target-policy (slowest | mean | ideal-share)` on
+  equal-flow-enforcing schedulers (#1746; unset == `slowest`, the
+  byte-unchanged clip-to-slowest default)
 
 Internal mapping:
 
@@ -922,6 +925,54 @@ Notes for this specific test:
   throughput can drop substantially when one active worker is much slower than
   its peers. The suppressor fails open when an active worker looks merely quiet
   rather than demand-saturated.
+- `set class-of-service schedulers <name> equal-flow-target-policy
+  (slowest | mean | ideal-share)` (#1746) selects the per-flow target the
+  equal-flow publisher enforces. Unset is byte-identical to `slowest` (the
+  pre-#1746 `min` reduction over the sampled per-worker achieved rates), so
+  existing configs are unaffected. `mean` clips toward
+  `sum(prev_grants) / sum(active_flows)` over the sampled set — it trims only
+  the lucky fast outliers and keeps more aggregate than `slowest`.
+  `ideal-share` is the nominal equal share: the rotation's true byte budget
+  (rate x elapsed, lag-recovered) divided by the live total active-flow
+  count. The static capacity-limited model predicts it clips nothing (every
+  flow already runs below the nominal share); LIVE, the per-epoch sampled
+  flow count and EWMA dynamics can make it intermittently bind, so treat it
+  as "nominal-share semantics with occasional top-band trimming", not a
+  strict no-op — the #1746 F1 measurement
+  (`docs/pr/1746-equal-flow-target-policy/f1-measurement.md`) recorded
+  cap-hit activity and OFF-to-ON CoV movement comparable to the clipping
+  policies. Like all equal-flow enforcement it is bounded by the
+  low-demand-worker fail-open governor.
+  Modeled tradeoff on the observed loss-cluster banding (10 distinct flow
+  rates `[0.87x4, 1.29x3, 1.63x2, 1.81x1]` Gb/s, baseline 12.42 G aggregate
+  / 27.7 % per-flow CoV — #1746 plan section 4):
+
+  | policy | target | aggregate | per-flow CoV | lifts the 0.87 G floor? |
+  |---|---|---|---|---|
+  | `ideal-share` | 2.0 G | 12.42 G (no-op) | 27.7 % (no-op) | NO |
+  | `mean` | 1.242 G | 10.93 G (-12 %) | 16.7 % (-40 % relative) | NO |
+  | `slowest` (default) | 0.87 G | 8.70 G (-30 %) | ~0 % | NO |
+
+  Live A/B (#1746 F1 + supplementary matrix,
+  `docs/pr/1746-equal-flow-target-policy/f1-measurement.md`): the effect
+  of `mean` is **regime-dependent** — on high-CoV baseline draws (skewed
+  RSS placement, per-flow CoV well above the structural floor) it
+  delivered a 52 % relative CoV reduction at ~zero aggregate cost; on
+  draws already near the fairness floor (~10 % CoV) it ADDED ~5 CoV
+  points and cost 4-8 % aggregate, because there is nothing above the
+  mean to trim and the enforcement duty cycle perturbs balanced flows.
+  Enable `mean` only on classes that chronically exhibit high per-flow
+  CoV; do not enable it on classes already near the floor.
+
+  **No cap-based policy lifts the slowest band**: the cap is
+  one-directional (`my_share.min(cap)`), and capacity freed by clipping a
+  fast worker cannot reach a starved worker on a different queue/CPU.
+  Lifting the floor is work-conserving cross-worker rebalance — tracked as
+  #1748, not this knob. Selecting `slowest` or `mean` emits a
+  non-work-conserving commit warning; the active policy is visible in
+  `show class-of-service` (`policy=` on the Equal-flow line) and as the
+  info metric
+  `xpf_userspace_cos_equal_flow_target_policy{ifindex,queue_id,policy}`.
 - **`equal-flow-enforcement` is supported at any worker count** (#1830 (e)).
   The former 32-worker cap (`MAX_WORKERS_SCRATCH` stack scratch in the v8
   lease rotation) is removed: `rotate_epoch_v8.rs` now captures per-worker

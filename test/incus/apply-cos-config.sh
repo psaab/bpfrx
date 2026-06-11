@@ -7,6 +7,8 @@
 #   ./test/incus/apply-cos-config.sh --symmetric loss:xpf-userspace-fw0
 #   ./test/incus/apply-cos-config.sh --surplus-sharing loss:xpf-userspace-fw0
 #   COS_EQUAL_FLOW=1 ./test/incus/apply-cos-config.sh loss:xpf-userspace-fw0
+#   COS_EQUAL_FLOW=1 COS_EQUAL_FLOW_POLICY=mean \
+#       ./test/incus/apply-cos-config.sh loss:xpf-userspace-fw0
 #   ./test/incus/apply-cos-config.sh                     # defaults to xpf-userspace-fw0
 #
 # COS_EQUAL_FLOW=1 (#1831, follow-up to #1766/#1745) opts every
@@ -15,6 +17,12 @@
 # candidate — same injection pattern as --surplus-sharing. Default
 # (unset/0) leaves the fixture untouched. Mutually exclusive with
 # --surplus-sharing: the compiler rejects a scheduler with both knobs.
+#
+# COS_EQUAL_FLOW_POLICY=<slowest|mean|ideal-share> (#1746) additionally
+# sets `equal-flow-target-policy <value>` on every injected scheduler.
+# Requires COS_EQUAL_FLOW=1 (the policy is inert without enforcement).
+# Unset leaves the policy line out entirely — the byte-unchanged
+# `slowest` default.
 #
 # Only the RG0 primary needs the config applied — it replicates to the
 # secondary via config sync. Run against the primary.
@@ -75,6 +83,21 @@ if [[ "$COS_EQUAL_FLOW" -eq 1 && "$SURPLUS_SHARING" -eq 1 ]]; then
 	echo "error: COS_EQUAL_FLOW=1 and --surplus-sharing are mutually exclusive (the compiler rejects a scheduler with both equal-flow-enforcement and surplus-sharing)" >&2
 	exit 2
 fi
+# #1746: optional equal-flow target policy, layered on the enforcement
+# injector. Validated here so a typo fails fast instead of failing the
+# remote commit check.
+COS_EQUAL_FLOW_POLICY="${COS_EQUAL_FLOW_POLICY:-}"
+case "$COS_EQUAL_FLOW_POLICY" in
+	""|slowest|mean|ideal-share) ;;
+	*)
+		echo "error: COS_EQUAL_FLOW_POLICY must be one of slowest | mean | ideal-share (got '$COS_EQUAL_FLOW_POLICY')" >&2
+		exit 2
+		;;
+esac
+if [[ -n "$COS_EQUAL_FLOW_POLICY" && "$COS_EQUAL_FLOW" -ne 1 ]]; then
+	echo "error: COS_EQUAL_FLOW_POLICY requires COS_EQUAL_FLOW=1 (the policy has no effect without equal-flow-enforcement)" >&2
+	exit 2
+fi
 
 TARGET="${1:-loss:xpf-userspace-fw0}"
 # Copilot D.2: shift past TARGET and reject extra positional
@@ -130,7 +153,7 @@ fi
 # combined candidate, so an unsupported combination fails before
 # anything live changes.
 if [[ "$COS_EQUAL_FLOW" -eq 1 ]]; then
-	awk '
+	awk -v policy="$COS_EQUAL_FLOW_POLICY" '
 		$1 == "set" &&
 		$2 == "class-of-service" &&
 		$3 == "schedulers" &&
@@ -141,6 +164,10 @@ if [[ "$COS_EQUAL_FLOW" -eq 1 ]]; then
 		END {
 			for (sched in exact) {
 				printf "set class-of-service schedulers %s equal-flow-enforcement\n", sched
+				# #1746: optional target policy on the same schedulers.
+				if (policy != "") {
+					printf "set class-of-service schedulers %s equal-flow-target-policy %s\n", sched, policy
+				}
 			}
 		}
 	' "$SETS_TMP" | sort >> "$SETS_TMP"

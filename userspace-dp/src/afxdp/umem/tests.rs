@@ -4,6 +4,7 @@
 // `#[path = "tests.rs"]` from umem/mod.rs.
 
 use super::super::flow_cache::ACTIVE_WINDOW_EPOCHS;
+use crate::afxdp::types::EqualFlowTargetPolicy;
 use super::*;
 
 #[test]
@@ -1282,6 +1283,7 @@ fn flush_v_min_scratches_sums_and_zeros_per_queue_counters() {
                 exact: true,
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
+                equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
                 surplus_weight: 1,
                 buffer_bytes: 64 * 1024,
                 dscp_rewrite: None,
@@ -1296,6 +1298,7 @@ fn flush_v_min_scratches_sums_and_zeros_per_queue_counters() {
                 exact: true,
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
+                equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
                 surplus_weight: 1,
                 buffer_bytes: 64 * 1024,
                 dscp_rewrite: None,
@@ -1367,6 +1370,7 @@ fn flush_v_min_scratches_no_op_when_all_zero() {
             exact: true,
             surplus_sharing: false,
             equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
             surplus_weight: 1,
             buffer_bytes: 64 * 1024,
             dscp_rewrite: None,
@@ -1412,6 +1416,7 @@ fn active_flow_debug_test_queue_config(queue_id: u8) -> crate::afxdp::types::CoS
         exact: true,
         surplus_sharing: false,
         equal_flow_enforcement: false,
+        equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
         surplus_weight: 1,
         buffer_bytes: 64 * 1024,
         dscp_rewrite: None,
