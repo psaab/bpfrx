@@ -2413,3 +2413,33 @@ fn wg1866_apply_time_rename_restarts_thread_on_new_attachment() {
     );
     assert_eq!(entry.spawned_ifindex, 4243);
 }
+
+/// PR #1872 Codex code-r1 F2 regression: rows whose `linux_name` is
+/// empty resolve their forwarding label from the logical name
+/// (forwarding_build/interfaces.rs fallback) — the tombstone-respawn
+/// coherence check must apply the SAME fallback or self-heal never
+/// fires for such rows.
+#[test]
+fn wg1866_sweep_respawns_with_empty_linux_name_rows() {
+    let mut coordinator = Coordinator::new();
+    let port: u16 = 51880;
+    let mut snap = wg1866_snapshot(1, 4244, "wgt1866k", port, WG1866_PRIVKEY_A);
+    snap.interfaces[0].linux_name = String::new();
+    snap.tunnel_endpoints[0].linux_name = String::new();
+    coordinator.refresh_runtime_snapshot(&snap);
+    assert!(
+        wg1866_wait_tombstone(&mut coordinator, 1, 2_000),
+        "open_tun failure tombstones"
+    );
+    coordinator
+        .wg_control_threads
+        .get_mut(&1)
+        .expect("tombstone")
+        .last_spawn_attempt_ns = 0;
+    coordinator.reconcile_wg_control_liveness(Some(&snap));
+    let entry = coordinator.wg_control_threads.get(&1).expect("entry");
+    assert!(
+        entry.handle.is_some(),
+        "coherence check must accept the empty-linux_name fallback label and respawn"
+    );
+}

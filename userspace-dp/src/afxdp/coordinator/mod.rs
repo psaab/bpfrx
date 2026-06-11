@@ -822,9 +822,30 @@ impl Coordinator {
         let Some(identity) = hydrate_wg_identity(row) else {
             return false;
         };
+        // Attachment label mirrors forwarding_build/interfaces.rs:
+        // linux_name with a fallback to the logical name when empty.
+        let row_label = if row.linux_name.is_empty() {
+            row.interface.as_str()
+        } else {
+            row.linux_name.as_str()
+        };
         identity.matches_endpoint(endpoint)
             && row.ifindex == endpoint.logical_ifindex
-            && row.linux_name == *name
+            && row_label == name
+    }
+
+    /// #1866 (PR-review Codex r1 F1): stop + join + remove ALL WG
+    /// control-thread entries (live and tombstoned). Used by the
+    /// same-plan apply leg when the helper is disarmed
+    /// (`should_run_afxdp` false): `refresh_runtime_snapshot`
+    /// reconciles WG threads for the running case, but a disarmed
+    /// helper must not hold WG listen ports — mirror the
+    /// `reconcile_status_bindings → stop()` semantics.
+    pub(crate) fn stop_all_wg_control_threads(&mut self, reason: &str) {
+        let ids: Vec<u16> = self.wg_control_threads.keys().copied().collect();
+        for id in ids {
+            self.stop_remove_wg_control_entry(id, reason);
+        }
     }
 
     /// #1866 Change 2b (defect D4): removal propagation on the

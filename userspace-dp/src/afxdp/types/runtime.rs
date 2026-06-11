@@ -52,7 +52,7 @@ pub(in crate::afxdp) struct LocalTunnelSourceHandle {
 /// (endpoint removed / engine identity changed / attachment changed),
 /// the defer-branch snapshot prune, and `stop_inner` — never by the
 /// finished sweep.
-pub(in crate::afxdp) struct WgControlEntry {
+pub(crate) struct WgControlEntry {
     /// Live (or finished-but-unswept) thread handle. `None` = tombstone.
     pub(in crate::afxdp) handle: Option<LocalTunnelSourceHandle>,
     /// Address of the `Arc<WgEngine>` the thread was last spawned with.

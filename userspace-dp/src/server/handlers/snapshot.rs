@@ -6,7 +6,7 @@
 
 use super::super::helpers::{
     reconcile_status_bindings, refresh_status, replan_queues,
-    same_plan_apply_needs_binding_reconcile, snapshot_binding_plan_key,
+    same_plan_apply_needs_binding_reconcile, should_run_afxdp, snapshot_binding_plan_key,
 };
 use super::super::ServerState;
 use crate::{ConfigSnapshot, ControlResponse, CONFIG_SNAPSHOT_PROTOCOL_VERSION};
@@ -93,6 +93,16 @@ pub(super) fn apply(
             reconcile_status_bindings(guard);
         } else {
             guard.afxdp.refresh_runtime_snapshot(&snapshot);
+            // #1866 (PR-review Codex r1 F1): refresh_runtime_snapshot
+            // reconciles WG control threads for the running case
+            // (Copilot C1, #1432) — but a DISARMED helper must not
+            // hold WG listen ports. reconcile_status_bindings already
+            // stops everything when should_run_afxdp is false; mirror
+            // that here so a same-plan apply while disarmed cannot
+            // re-bind the ports the stop released.
+            if !should_run_afxdp(&guard.status) {
+                guard.afxdp.stop_all_wg_control_threads("disarmed");
+            }
             guard.snapshot = Some(snapshot);
         }
         refresh_status(guard);
