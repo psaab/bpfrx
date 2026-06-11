@@ -5149,3 +5149,7 @@ top.
 - **Timestamp**: 2026-06-11
   **Action**: #1865 research — folded round-1 reviews into plan v2 (keepalive counter, created-vs-sent rename, absolute handshake timestamp, hex pubkey, name fallback, runt exclusion, test tightening; AGY stale-TUN finding refuted)
   **File(s)**: docs/research/1865-wg-telemetry/{plan.md,codex-plan-r1.md,reviewer-ids.md}, _Log.md
+
+- **Timestamp**: 2026-06-11
+  **Action**: #1865 research — round-2 converged PLAN-READY (Codex + AGY + Claude SMR unanimous); plan v2-final with stamp-0 guard + pre-epoch cast note
+  **File(s)**: docs/research/1865-wg-telemetry/{plan.md,claude-smr-plan-r2.md,agy-plan-r2.md,codex-plan-r2.md,reviewer-ids.md}, _Log.md

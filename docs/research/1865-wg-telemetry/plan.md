@@ -1,9 +1,12 @@
 # #1865 — Operator-visible WireGuard telemetry (plan)
 
-Revision: v2 (round-1 reviews folded)
+Revision: v2-final (round-2 converged)
 Issue: #1865 (#1703 S6 adjacency; refs #1736 #1434 #1873)
 Branch: research/1865-wg-telemetry
-Status: awaiting round-2 review (Codex + AGY + Claude SMR)
+Status: **PLAN-READY** — round-2 unanimous (Codex PLAN-READY
+task-mqa0pcn3-347u73; AGY PLAN-READY adversarial-review-mqa0ovaw-q6zx2t,
+round-1 finding 1 formally withdrawn with proof; Claude SMR PLAN-READY
+claude-smr-plan-r2.md). Ship Path B per §4.
 
 Round-1 verdicts: Codex PLAN-NEEDS-MAJOR-REVISION (codex-plan-r1.md),
 AGY PLAN-NEEDS-MAJOR-REVISION (agy-plan-r1.md), Claude SMR
@@ -318,9 +321,19 @@ converted at status-snapshot time to `last_handshake_unix_secs` (u64
 wall-clock epoch seconds; **0 = never** — unambiguous without
 Option/pointer plumbing, since epoch 0 is not a reachable handshake
 time) via the existing `monotonic_timestamp_to_datetime` helper (the
-worker-heartbeat conversion, coordinator/status.rs:414-429). An NTP
-step skews the DISPLAYED wall time but fences nothing (#1792 lesson:
-the stored stamp stays monotonic).
+worker-heartbeat conversion, coordinator/status.rs:414-429). GUARD
+(SMR r2): the conversion runs ONLY when the stored stamp is nonzero —
+feeding stamp 0 through the helper would compute a boot-relative
+wall time (a valid-looking past date), silently breaking the
+0-as-never contract. `stamp == 0 → last_handshake_unix_secs = 0`,
+no conversion. Codex r2 note: when converting the resulting
+`DateTime<Utc>` to u64, do not blindly cast — a pre-epoch/failed
+conversion maps to 0 (never), not a wrapped huge value. An NTP step skews the DISPLAYED wall time but fences
+nothing (#1792 lesson: the stored stamp stays monotonic). Asymmetry
+note: responder-side "completion" stamps at msg2 creation +
+unconfirmed-session install — if the msg2 send fails the peer never
+completes; the `session_confirmed` gauge (not the completion stamp)
+is the liveness signal, documented in the CLI help.
 
 Snapshot coherence note (Codex r1): the status poll reads each atomic
 independently while the control thread increments — multi-counter
