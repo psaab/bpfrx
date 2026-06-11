@@ -56,9 +56,9 @@ from P3 — see plan §5.2).
 ## The restart runbook (TAI64N)
 
 xpf's TAI64N handshake-timestamp high-water survives only in-process
-until S6 adds disk persistence. **Whenever xpfd restarts during WG
-testing, flush the kernel peer's WG state** so its per-peer TAI64N
-high-water is cleared:
+until S6 adds disk persistence. **If the tunnel does not recover on
+its own after an xpfd restart, flush the kernel peer's WG state** so
+its per-peer TAI64N high-water is cleared:
 
 ```bash
 ip link del wgref
@@ -68,10 +68,19 @@ ip addr add 10.78.0.2/24 dev wgref && ip link set wgref up mtu 1420
 ```
 
 (The harness's `peer_wg_setup` is exactly this procedure; P6 exercises
-it.) Note: xpf's TAI64N is wall-clock-derived, so with a sane NTP clock a
-restart usually recovers WITHOUT the flush (post-restart timestamps are
-naturally higher). The flush guards the backwards-clock-step /
-same-whitened-tick edge — perform it unconditionally during tests.
+it when needed.) Note: xpf's TAI64N is wall-clock-derived, so with a
+sane NTP clock a restart usually recovers WITHOUT the flush
+(post-restart timestamps are naturally higher). The flush guards the
+backwards-clock-step / same-whitened-tick edge.
+
+**Do NOT flush the peer while xpf holds a live confirmed session.**
+The engine has no rekey/retry timers until S5 (`wg/peer.rs` TODO): a
+confirmed engine never re-initiates, so wiping the peer's state under
+a live session manufactures a confirmed-but-dead blackhole that only
+an identity-changing commit or an xpfd restart clears. This is also
+why the harness flushes the peer BEFORE (never after) each
+identity-changing xpf commit, and why P6 runs the runbook flush only
+when the no-flush recovery fails.
 
 ## Mandatory: node0 scoping of the WG stanza
 
