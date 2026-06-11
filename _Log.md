@@ -1,5 +1,36 @@
 # Action Log
 
+## 2026-06-10 — #1852 fragment-aware NAT + MSS-clamp v6 ext gap
+
+- **Action**: Implemented PLAN-READY v3.1 (Codex+AGY+SMR converged). Two
+  pre-existing defects deferred by the #1838/#1839/#1840 trio (#1853):
+  non-first-fragment L4 rewrite corruption (both families, all paths) and
+  the MSS-clamp v6 extension-header feature gap.
+- **Files**:
+  - `frame/inspect.rs` — new `ipv4_is_non_first_fragment` /
+    `ipv6_is_non_first_fragment` / `is_non_first_fragment` predicates.
+  - `frame/mod.rs`, `frame/build/{ipv4,ipv6}.rs`, `frame/rewrite/mod.rs`,
+    `frame/tcp_segmentation.rs`, `tx/tcp_segmentation.rs`,
+    `tx/dispatch/{mod,slow_path}.rs` — thread `non_first_fragment` into
+    the NAT leaves (IP rewrite on all fragments, skip L4 byte ops on
+    non-first); descriptor fall-back to generic; segmentation admission
+    no-segment gate.
+  - `nat/source.rs`, `afxdp/forwarding/mod.rs`,
+    `poll_descriptor/{nat_exception,mod}.rs`, `coordinator/status.rs` —
+    dynamic pool SNAT pre-allocation gate (drop + count via
+    `SourceNatFailureReason::NonFirstFragment`); static/interface SNAT
+    unaffected.
+  - `frame/tcp.rs` — `clamp_tcp_mss` self-gates fragments (both families)
+    + ext-aware v6 offset (closes defect 2); shared helper unchanged.
+  - `icmp_embed/{parse,builders}.rs` — embedded ICMPv4 quoted-fragment
+    guard mirroring #1853's v6 fix.
+  - Tests: `frame/tests.rs`, `icmp_embed/parse.rs`, `nat/tests.rs`,
+    `frame/prop_tests/rewrite.rs` (harness helper computes the predicate).
+  - Docs: `frame/README.md` invariants.
+- **Validation**: cargo build --release clean; full cargo test 1910
+  passed / 1 flaky (wg reconcile_peers, passes 5/5 standalone) / 2
+  ignored; go test ./... all ok.
+
 ## 2026-06-10 — #1824 proptest harness for frame parse/NAT/TSO
 - **Timestamp**: 2026-06-10 UTC
 - **Action**: Implemented the #1824 in-tree proptest harness per the

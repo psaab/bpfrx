@@ -323,3 +323,49 @@ mod embedded_v6_parse_tests {
         assert_eq!((hdr.src_port, hdr.dst_port), (0x1111, 0x2222));
     }
 }
+
+#[cfg(test)]
+mod embedded_v4_fragment_tests {
+    use super::*;
+
+    /// Build a minimal embedded IPv4 header (20-byte) + 8 L4 bytes.
+    /// `frag_off` is the raw IPv4 fragment-offset field.
+    fn embedded_v4(frag_off: u16, proto: u8) -> Vec<u8> {
+        let mut p = vec![0u8; 20];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&28u16.to_be_bytes());
+        p[6..8].copy_from_slice(&frag_off.to_be_bytes());
+        p[8] = 64;
+        p[9] = proto;
+        p[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        p[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        // 8 L4 bytes: TCP ports 0x1111 / 0x2222 + seq.
+        p.extend_from_slice(&[0x11, 0x11, 0x22, 0x22, 0, 0, 0, 1]);
+        p
+    }
+
+    #[test]
+    fn embedded_v4_first_or_atomic_fragment_parses() {
+        // offset 0 (atomic) and offset 0 + MF (first) both carry the L4
+        // header in the quoted bytes — parse succeeds.
+        for frag_off in [0x0000u16, 0x2000] {
+            let p = embedded_v4(frag_off, PROTO_TCP);
+            let hdr = parse_embedded_v4(&p, 0).expect("first/atomic fragment parses");
+            assert_eq!(hdr.proto, PROTO_TCP);
+            assert_eq!((hdr.src_port, hdr.dst_port), (0x1111, 0x2222));
+        }
+    }
+
+    #[test]
+    fn embedded_v4_non_first_fragment_refused() {
+        // offset bits set: the quoted "ports" are payload — #1852 guard
+        // (the IPv4 twin of #1853's parse_embedded_v6_l4) returns None.
+        for frag_off in [0x0001u16, 0x2001, 0x1FFF] {
+            let p = embedded_v4(frag_off, PROTO_TCP);
+            assert!(
+                parse_embedded_v4(&p, 0).is_none(),
+                "quoted non-first fragment (frag_off {frag_off:#06x}) must not parse"
+            );
+        }
+    }
+}

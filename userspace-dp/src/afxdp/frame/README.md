@@ -60,6 +60,29 @@ inspect or rewrite a packet sitting in a UMEM frame.
   rule (v6 UDP stored 0x0000 + any port-NAT decision → 0xFFFF, even
   when the port value is identical) so the descriptor's ≡0-delta
   behavior matches byte-for-byte.
+- **Non-first fragments skip all L4 byte ops (#1852)**: a non-first IP
+  fragment has no L4 header at the post-IP offset — those bytes are
+  payload. The orchestrators compute the predicate ONCE
+  (`is_non_first_fragment` / `ipv4_is_non_first_fragment` /
+  `ipv6_is_non_first_fragment` in `inspect.rs`) and thread a
+  `non_first_fragment: bool` into `apply_nat_ipv4`/`apply_nat_ipv6`,
+  `enforce_expected_ports`/`_at`, and `restore_l4_tuple_from_meta`. On a
+  non-first fragment the IP address is still rewritten (every fragment
+  carries the IP header and must stay consistent for reassembly), but the
+  L4-checksum adjust, port rewrite, port enforcement and ICMP ident
+  restore are SKIPPED — the address-change delta is folded into the first
+  fragment's L4 checksum, which covers the whole datagram and is correct.
+  The descriptor fast path returns `None` for non-first fragments so the
+  caller falls back to the generic path (preserving the #1838 P-N3
+  byte parity). The pre-rewrite dynamic pool SNAT allocation
+  (`nat/source.rs`) is gated separately — a non-first fragment that would
+  need a pool allocation is dropped (`SourceNatFailureReason::NonFirstFragment`)
+  rather than leaking a pool port; static / interface (address-only) SNAT
+  is unaffected. `clamp_tcp_mss` self-gates the fragment case (both
+  families) AND derives the v6 L4 offset via the ext-aware
+  `packet_rel_l4_offset_and_protocol` so MSS clamping reaches
+  ext-headered v6 SYNs (the shared helper is left unchanged — GRE decap
+  and tunnel local-origin read it to forward fragmented inner packets).
 
 ## Property tests (`prop_tests/`, #1824)
 
