@@ -131,7 +131,7 @@ gen_keys() { # gen_keys [force] — force regenerates (fresh WG identity)
         # high-water out of cross-run interactions.
         ish "${PEER}" 'rm -rf /tmp/wgkeys'
     fi
-    ish "${PEER}" 'umask 077; mkdir -p /tmp/wgkeys
+    ish "${PEER}" 'set -eu; umask 077; mkdir -p /tmp/wgkeys
         [ -s /tmp/wgkeys/peer.priv ] || wg genkey > /tmp/wgkeys/peer.priv
         [ -s /tmp/wgkeys/xpf.priv ]  || wg genkey > /tmp/wgkeys/xpf.priv
         wg pubkey < /tmp/wgkeys/peer.priv > /tmp/wgkeys/peer.pub
@@ -269,7 +269,8 @@ provision() {
     else
         match="Name=eth1"
     fi
-    ish "${PEER}" "cat > /etc/systemd/network/20-wgdata.network <<EOF
+    ish "${PEER}" "set -eu
+cat > /etc/systemd/network/20-wgdata.network <<EOF
 [Match]
 ${match}
 [Network]
@@ -294,7 +295,8 @@ peer_wg_setup() { # peer_wg_setup [endpoint_spec] [allowed_ips] [mtu]
     local ep="${1:-}" allowed="${2:-${WG_INNER4_CIDR},${WG_INNER6_CIDR}}" mtu="${3:-1420}"
     local epflag=""
     [ -n "$ep" ] && epflag="endpoint $ep persistent-keepalive ${WG_PEER_KEEPALIVE}"
-    ish "${PEER}" "ip link del ${WG_KERNEL_IFACE} 2>/dev/null || true
+    ish "${PEER}" "set -eu
+        ip link del ${WG_KERNEL_IFACE} 2>/dev/null || true
         ip link add ${WG_KERNEL_IFACE} type wireguard
         wg set ${WG_KERNEL_IFACE} private-key /tmp/wgkeys/peer.priv listen-port ${WG_LISTEN_PORT} \
             peer \$(cat /tmp/wgkeys/xpf.pub) allowed-ips ${allowed} ${epflag}
@@ -623,6 +625,11 @@ test_p7() {
 # limitation: removed-from-config WG TUNs persist), and the peer VM.
 teardown() {
     log "teardown"
+    # Config commits only apply on the RG0 primary; a teardown that
+    # silently fails leaves a poisoned cluster for the next run
+    # (AGY PR-review F2 — observed live as a "node is not primary"
+    # refusal reported as PASS).
+    wait_node0_primary 36 || fail "teardown: node0 not RG0 primary — cannot remove the stanza"
     fw0_cli > "${EVID}/teardown-commit.txt" 2>&1 <<EOF
 configure
 delete groups node0 interfaces wg0
@@ -631,7 +638,7 @@ exit
 quit
 EOF
     grep -qE "commit complete|path not found" "${EVID}/teardown-commit.txt" \
-        || warn "teardown commit output unexpected: $(cat "${EVID}/teardown-commit.txt")"
+        || fail "teardown commit failed: $(tail -3 "${EVID}/teardown-commit.txt")"
     ish "${FW0}" 'ip link del wg0 2>/dev/null; true'
     for n in "${FW0}" "${FW1}"; do
         if ish "$n" 'ip link show wg0 >/dev/null 2>&1'; then
