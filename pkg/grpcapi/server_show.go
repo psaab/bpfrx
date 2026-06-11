@@ -409,6 +409,13 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 	case "buffers-detail":
 		s.showBuffersDetail(cfg, &buf)
 
+	case "wireguard":
+		// #1865: WG tunnel telemetry (summary).
+		s.showWireguard(&buf, false)
+
+	case "wireguard-detail":
+		s.showWireguard(&buf, true)
+
 	case "bfd-peers":
 		if err := s.showBFDPeers(&buf); err != nil {
 			return nil, err

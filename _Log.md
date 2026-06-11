@@ -5157,3 +5157,7 @@ top.
 - **Timestamp**: 2026-06-11
   **Action**: #1865 engineer — commit 4: Prometheus xpf_userspace_wg_* family (12 descriptors, reason/role/direction/kind labels) + emitter + canary fixture row + series-set tests
   **File(s)**: pkg/api/{metrics.go,metrics_descriptors.go,metrics_userspace.go,metrics_descriptor_coverage_test.go,metrics_wireguard_test.go}
+
+- **Timestamp**: 2026-06-11
+  **Action**: #1865 engineer — commit 5: show security wireguard [detail] (cmdtree node, shared FormatWireguardStatus formatter, local CLI + gRPC + remote CLI wiring, tests)
+  **File(s)**: pkg/cmdtree/tree.go, pkg/dataplane/userspace/{wgfmt.go,wgfmt_test.go}, pkg/cli/{cli_show_security_dispatch.go,cli_show_security_wireguard.go}, pkg/grpcapi/{server_show.go,server_show_security_text.go,server_show_security_wireguard_test.go}, cmd/cli/show.go

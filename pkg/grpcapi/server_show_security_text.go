@@ -867,3 +867,25 @@ func writeRPMConfig(buf *strings.Builder, cfg *config.Config) {
 		}
 	}
 }
+
+// showWireguard renders `show security wireguard [detail]` for the
+// remote CLI from the userspace helper's per-tunnel telemetry rows
+// (#1865). Shared rendering with the local CLI via
+// dpuserspace.FormatWireguardStatus.
+func (s *Server) showWireguard(buf *strings.Builder, detail bool) {
+	if s.dp == nil {
+		buf.WriteString("Dataplane not loaded\n")
+		return
+	}
+	provider, ok := s.dp.(userspaceStatusProvider)
+	if !ok {
+		buf.WriteString("WireGuard telemetry requires the userspace dataplane\n")
+		return
+	}
+	status, err := provider.Status()
+	if err != nil {
+		fmt.Fprintf(buf, "WireGuard telemetry unavailable: %v\n", err)
+		return
+	}
+	buf.WriteString(dpuserspace.FormatWireguardStatus(status, detail, time.Now()))
+}
