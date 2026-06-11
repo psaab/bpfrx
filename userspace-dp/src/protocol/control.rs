@@ -311,6 +311,14 @@ pub(crate) struct ProcessStatus {
     /// it as a parallel field (rather than only embedded in
     /// `bindings[].*`) lets the daemon pull just the triage counters on
     /// its poll path without deserializing every field on `BindingStatus`.
+    /// #1865: per-WG-tunnel operator telemetry rows. Keyed by tunnel
+    /// NAME (`tunnel`) — `tunnel_endpoint_id` is informational only
+    /// because positional ids renumber across commits (#1873). Empty
+    /// (and omitted — `skip_serializing_if`) when no WG tunnel is
+    /// configured, so non-WG deployments stay wire-byte-identical to
+    /// pre-#1865. Additive / defaulted for mixed-version compat.
+    #[serde(rename = "wg_tunnels", default, skip_serializing_if = "Vec::is_empty")]
+    pub wg_tunnels: Vec<WgTunnelStatus>,
     #[serde(rename = "per_binding", default, skip_serializing_if = "Vec::is_empty")]
     pub per_binding: Vec<BindingCountersSnapshot>,
     /// #1249: low-frequency debug snapshot mapping active flow-cache
@@ -429,6 +437,124 @@ impl From<crate::slowpath::SlowPathStatus> for SlowPathStatus {
             write_errors: value.write_errors,
         }
     }
+}
+
+/// #1865: one WG tunnel's telemetry row inside `ProcessStatus`.
+/// Counter semantics, lifetime, and the reserved-reason list live in
+/// `afxdp/wg/counters.rs` (the single source of truth this mirrors);
+/// the Go mirror is `WgTunnelStatus` in
+/// `pkg/dataplane/userspace/protocol.go` — keep json tags identical
+/// on BOTH sides (feedback_wire_protocol_both_sides). All fields are
+/// serde-defaulted; rows are additive for mixed-version compat.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct WgTunnelStatus {
+    /// Tunnel interface name (e.g. "wg0") — the PRIMARY key and the
+    /// only Prometheus label. Falls back to `wg-endpoint-<id>` when
+    /// the ifindex has no resolved name (a row is never dropped).
+    #[serde(default)]
+    pub tunnel: String,
+    /// Positional endpoint id — informational cross-ref ONLY (#1873:
+    /// renumbers when tunnels are added/removed; never a join key).
+    #[serde(rename = "tunnel_endpoint_id", default)]
+    pub tunnel_endpoint_id: u16,
+    #[serde(rename = "listen_port", default)]
+    pub listen_port: u16,
+    /// Peer static public key, 64-char lowercase hex (the same
+    /// rendering as the config-side `wg_peer_pubkey_hex`). Public by
+    /// definition. NOTE: `wg show` renders base64; xpf surfaces are
+    /// uniformly hex.
+    #[serde(rename = "peer_pubkey_hex", default)]
+    pub peer_pubkey_hex: String,
+    /// Configured peer endpoint (empty for a responder-only peer).
+    /// The control thread's LEARNED endpoint is thread-local and not
+    /// surfaced in this revision.
+    #[serde(rename = "peer_endpoint", default)]
+    pub peer_endpoint: String,
+    /// Whether the peer currently holds a CONFIRMED (egress-usable)
+    /// transport session. The liveness signal — see
+    /// `last_handshake_unix_secs` for why completion alone is not.
+    #[serde(rename = "session_confirmed", default)]
+    pub session_confirmed: bool,
+    /// Wall-clock epoch seconds of the most recent handshake
+    /// completion (either role). 0 = never (epoch 0 is unreachable, so
+    /// the sentinel is unambiguous without Option plumbing). Converted
+    /// from the engine's monotonic stamp at snapshot time; an NTP step
+    /// skews the display, never the stored stamp.
+    #[serde(rename = "last_handshake_unix_secs", default)]
+    pub last_handshake_unix_secs: u64,
+    // --- handshake counters ---
+    #[serde(rename = "hs_initiations_created", default)]
+    pub hs_initiations_created: u64,
+    #[serde(rename = "hs_initiation_build_failures", default)]
+    pub hs_initiation_build_failures: u64,
+    #[serde(rename = "hs_responses_created", default)]
+    pub hs_responses_created: u64,
+    #[serde(rename = "hs_completions_initiator", default)]
+    pub hs_completions_initiator: u64,
+    #[serde(rename = "hs_rx_drops_mac1_mismatch", default)]
+    pub hs_rx_drops_mac1_mismatch: u64,
+    #[serde(rename = "hs_rx_drops_malformed", default)]
+    pub hs_rx_drops_malformed: u64,
+    #[serde(rename = "hs_rx_drops_crypto", default)]
+    pub hs_rx_drops_crypto: u64,
+    #[serde(rename = "hs_rx_drops_unknown_peer", default)]
+    pub hs_rx_drops_unknown_peer: u64,
+    #[serde(rename = "hs_rx_drops_stale_response", default)]
+    pub hs_rx_drops_stale_response: u64,
+    #[serde(rename = "hs_rx_drops_index_exhausted", default)]
+    pub hs_rx_drops_index_exhausted: u64,
+    #[serde(rename = "hs_rx_cookie_unsupported", default)]
+    pub hs_rx_cookie_unsupported: u64,
+    #[serde(rename = "rx_unknown_type", default)]
+    pub rx_unknown_type: u64,
+    #[serde(rename = "hs_send_errors", default)]
+    pub hs_send_errors: u64,
+    #[serde(rename = "hs_requests_armed", default)]
+    pub hs_requests_armed: u64,
+    // --- transport decap ---
+    #[serde(rename = "decap_packets", default)]
+    pub decap_packets: u64,
+    #[serde(rename = "decap_bytes", default)]
+    pub decap_bytes: u64,
+    #[serde(rename = "decap_keepalives", default)]
+    pub decap_keepalives: u64,
+    #[serde(rename = "decap_drops_malformed_header", default)]
+    pub decap_drops_malformed_header: u64,
+    #[serde(rename = "decap_drops_unknown_session", default)]
+    pub decap_drops_unknown_session: u64,
+    #[serde(rename = "decap_drops_counter_ceiling", default)]
+    pub decap_drops_counter_ceiling: u64,
+    #[serde(rename = "decap_drops_crypto", default)]
+    pub decap_drops_crypto: u64,
+    #[serde(rename = "decap_drops_replay", default)]
+    pub decap_drops_replay: u64,
+    #[serde(rename = "decap_drops_allowed_ips", default)]
+    pub decap_drops_allowed_ips: u64,
+    #[serde(rename = "decap_drops_malformed_inner", default)]
+    pub decap_drops_malformed_inner: u64,
+    #[serde(rename = "decap_drops_buffer", default)]
+    pub decap_drops_buffer: u64,
+    // --- transport encap ---
+    #[serde(rename = "encap_packets", default)]
+    pub encap_packets: u64,
+    #[serde(rename = "encap_bytes", default)]
+    pub encap_bytes: u64,
+    #[serde(rename = "encap_drops_no_session", default)]
+    pub encap_drops_no_session: u64,
+    #[serde(rename = "encap_drops_unconfirmed", default)]
+    pub encap_drops_unconfirmed: u64,
+    #[serde(rename = "encap_drops_rekey_required", default)]
+    pub encap_drops_rekey_required: u64,
+    #[serde(rename = "encap_drops_other", default)]
+    pub encap_drops_other: u64,
+    #[serde(rename = "encap_mtu_drops", default)]
+    pub encap_mtu_drops: u64,
+    #[serde(rename = "transport_send_errors", default)]
+    pub transport_send_errors: u64,
+    #[serde(rename = "tun_write_errors", default)]
+    pub tun_write_errors: u64,
+    #[serde(rename = "tun_rx_drops_no_endpoint", default)]
+    pub tun_rx_drops_no_endpoint: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

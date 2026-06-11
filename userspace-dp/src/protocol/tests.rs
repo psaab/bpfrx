@@ -1409,3 +1409,108 @@ fn cos_queue_status_lease_claim_flow_roundtrip_1863() {
     assert!(back.lease_v8_worker_requested_bytes.is_empty());
     assert!(back.lease_v8_worker_granted_bytes.is_empty());
 }
+
+// #1865: round-trip + backward-compat + EMPTY-INVARIANT pins for the
+// per-WG-tunnel telemetry rows. The wire keys feed
+// pkg/dataplane/userspace/protocol.go (WgTunnelStatus) and the
+// Prometheus family `xpf_userspace_wg_*`.
+#[test]
+fn process_status_wg_tunnels_roundtrip_and_compat() {
+    // POPULATED round-trip (Codex plan-r1 F5: the Default-based wire
+    // fixture cannot see skip-if-empty fields, so the populated pin is
+    // the guard for this family). Every field nonzero/nonempty.
+    let row = WgTunnelStatus {
+        tunnel: "wg0".to_string(),
+        tunnel_endpoint_id: 7,
+        listen_port: 51820,
+        peer_pubkey_hex: "ab".repeat(32),
+        peer_endpoint: "192.0.2.10:51820".to_string(),
+        session_confirmed: true,
+        last_handshake_unix_secs: 1_770_000_000,
+        hs_initiations_created: 1,
+        hs_initiation_build_failures: 2,
+        hs_responses_created: 3,
+        hs_completions_initiator: 4,
+        hs_rx_drops_mac1_mismatch: 5,
+        hs_rx_drops_malformed: 6,
+        hs_rx_drops_crypto: 7,
+        hs_rx_drops_unknown_peer: 8,
+        hs_rx_drops_stale_response: 9,
+        hs_rx_drops_index_exhausted: 10,
+        hs_rx_cookie_unsupported: 11,
+        rx_unknown_type: 12,
+        hs_send_errors: 13,
+        hs_requests_armed: 14,
+        decap_packets: 15,
+        decap_bytes: 16,
+        decap_keepalives: 17,
+        decap_drops_malformed_header: 18,
+        decap_drops_unknown_session: 19,
+        decap_drops_counter_ceiling: 20,
+        decap_drops_crypto: 21,
+        decap_drops_replay: 22,
+        decap_drops_allowed_ips: 23,
+        decap_drops_malformed_inner: 24,
+        decap_drops_buffer: 25,
+        encap_packets: 26,
+        encap_bytes: 27,
+        encap_drops_no_session: 28,
+        encap_drops_unconfirmed: 29,
+        encap_drops_rekey_required: 30,
+        encap_drops_other: 31,
+        encap_mtu_drops: 32,
+        transport_send_errors: 33,
+        tun_write_errors: 34,
+        tun_rx_drops_no_endpoint: 35,
+    };
+    let status = ProcessStatus {
+        wg_tunnels: vec![row],
+        ..Default::default()
+    };
+    let value: serde_json::Value =
+        serde_json::to_value(&status).expect("serialize ProcessStatus");
+    let wire_row = &value["wg_tunnels"][0];
+    assert_eq!(wire_row["tunnel"], "wg0");
+    assert_eq!(wire_row["tunnel_endpoint_id"], 7);
+    assert_eq!(wire_row["listen_port"], 51820);
+    assert_eq!(wire_row["peer_pubkey_hex"], "ab".repeat(32));
+    assert_eq!(wire_row["peer_endpoint"], "192.0.2.10:51820");
+    assert_eq!(wire_row["session_confirmed"], true);
+    assert_eq!(wire_row["last_handshake_unix_secs"], 1_770_000_000u64);
+    assert_eq!(wire_row["decap_keepalives"], 17);
+    assert_eq!(wire_row["encap_drops_unconfirmed"], 29);
+    assert_eq!(wire_row["encap_mtu_drops"], 32);
+    let back: ProcessStatus =
+        serde_json::from_value(value).expect("deserialize ProcessStatus");
+    assert_eq!(back.wg_tunnels.len(), 1);
+    let b = &back.wg_tunnels[0];
+    assert_eq!(b.tunnel, "wg0");
+    assert_eq!(b.hs_initiations_created, 1);
+    assert_eq!(b.decap_drops_buffer, 25);
+    assert_eq!(b.tun_rx_drops_no_endpoint, 35);
+
+    // EMPTY-INVARIANT: a ProcessStatus with no WG tunnels serializes
+    // with NO `wg_tunnels` key at all — non-WG deployments stay
+    // wire-byte-identical to pre-#1865 (plan §3.2).
+    let empty_value = serde_json::to_value(ProcessStatus::default())
+        .expect("serialize default ProcessStatus");
+    assert!(
+        empty_value.get("wg_tunnels").is_none(),
+        "empty wg_tunnels must be omitted from the wire entirely"
+    );
+
+    // Pre-#1865 payload (key absent) must decode with an empty vec.
+    let legacy: ProcessStatus =
+        serde_json::from_value(empty_value).expect("pre-#1865 payload decodes");
+    assert!(legacy.wg_tunnels.is_empty());
+
+    // A pre-#1865 ROW shape is impossible (the whole array is new),
+    // but a NEWER peer adding fields inside a row must not break us:
+    // unknown keys are ignored by serde's default behavior.
+    let future_row: WgTunnelStatus = serde_json::from_str(
+        r#"{"tunnel":"wg9","future_field_from_s6":42}"#,
+    )
+    .expect("row with unknown future key decodes");
+    assert_eq!(future_row.tunnel, "wg9");
+    assert_eq!(future_row.hs_send_errors, 0);
+}

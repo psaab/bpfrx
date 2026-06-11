@@ -136,6 +136,9 @@ pub(crate) fn run() -> Result<(), String> {
             neighbor_netlink_redump_upserts_total: 0,
             neighbor_pending_keys: 0,
             neg_neigh_keys: 0,
+            // #1865: WG telemetry rows arrive on the first
+            // refresh_status; empty start keeps the wire omitted.
+            wg_tunnels: Vec::new(),
             per_binding: Vec::new(),
             flow_worker_map: Vec::new(),
             flow_worker_map_truncated: false,

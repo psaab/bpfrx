@@ -5145,3 +5145,7 @@ top.
 - **Timestamp**: 2026-06-11
   **Action**: #1865 engineer — commit 1: per-engine WgCounters + engine/call-site increments + keepalive classification + 10 telemetry tests
   **File(s)**: userspace-dp/src/afxdp/wg/{counters.rs,mod.rs,engine.rs,handshake_session.rs,tests.rs}, userspace-dp/src/afxdp/coordinator/wg_control.rs, userspace-dp/src/afxdp/frame/wg.rs
+
+- **Timestamp**: 2026-06-11
+  **Action**: #1865 engineer — commit 2: wg_tunnels wire rows (WgTunnelStatus) + coordinator status accessor + helpers populate + wire pins
+  **File(s)**: userspace-dp/src/protocol/{control.rs,tests.rs}, userspace-dp/src/afxdp/coordinator/status.rs, userspace-dp/src/server/{helpers.rs,lifecycle.rs}

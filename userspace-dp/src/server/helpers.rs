@@ -120,6 +120,9 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     state.status.neighbor_resolver_get_rtt_buckets = lat.resolver_get_rtt.buckets.to_vec();
     state.status.neighbor_resolver_get_rtt_sum_ns = lat.resolver_get_rtt.sum_ns;
     state.status.neighbor_resolver_get_rtt_count = lat.resolver_get_rtt.count;
+    // #1865: per-WG-tunnel telemetry rows (empty — and omitted from
+    // the wire — when no WG tunnel is configured).
+    state.status.wg_tunnels = state.afxdp.wg_tunnel_statuses();
     state.status.neighbor_pending_timeout_drops_total = lat.pending_timeout_drops;
     state.status.neighbor_pending_max_depth = lat.pending_max_depth;
     state.status.route_entries = state.snapshot.as_ref().map(|s| s.routes.len()).unwrap_or(0);
