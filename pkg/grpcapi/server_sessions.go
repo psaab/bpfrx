@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -270,6 +271,20 @@ type sessionFilter struct {
 	hasFilters   bool // true if any filter narrows results
 }
 
+// protoFilterMatches matches a session protocol against an operator
+// filter string: case-insensitive protocol name (tcp/udp/icmp/icmpv6/
+// gre/esp/...) or a numeric IP protocol ("47" matches GRE sessions
+// even though protoName(47) renders "gre").
+func protoFilterMatches(p uint8, filter string) bool {
+	if strings.EqualFold(protoName(p), filter) {
+		return true
+	}
+	if n, err := strconv.Atoi(filter); err == nil {
+		return n == int(p)
+	}
+	return false
+}
+
 // validate reports operator-input errors that must fail the RPC rather
 // than silently match nothing (or, worse for clear paths, match
 // everything).
@@ -376,7 +391,7 @@ func (f *sessionFilter) matchV4(key dataplane.SessionKey, val dataplane.SessionV
 	if f.zoneFilter != 0 && val.IngressZone != f.zoneFilter && val.EgressZone != f.zoneFilter {
 		return false
 	}
-	if f.protoFilter != "" && !strings.EqualFold(protoName(key.Protocol), f.protoFilter) {
+	if f.protoFilter != "" && !protoFilterMatches(key.Protocol, f.protoFilter) {
 		return false
 	}
 	if f.srcNet != nil && !f.srcNet.Contains(net.IP(key.SrcIP[:])) {
@@ -421,7 +436,7 @@ func (f *sessionFilter) matchV6(key dataplane.SessionKeyV6, val dataplane.Sessio
 	if f.zoneFilter != 0 && val.IngressZone != f.zoneFilter && val.EgressZone != f.zoneFilter {
 		return false
 	}
-	if f.protoFilter != "" && !strings.EqualFold(protoName(key.Protocol), f.protoFilter) {
+	if f.protoFilter != "" && !protoFilterMatches(key.Protocol, f.protoFilter) {
 		return false
 	}
 	if f.srcNet != nil && !f.srcNet.Contains(net.IP(key.SrcIP[:])) {

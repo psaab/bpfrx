@@ -68,6 +68,31 @@ func TestServerSessionFilterSourceNATPool(t *testing.T) {
 	}
 }
 
+// Numeric protocol filters must match (protoName(47) renders "gre",
+// so a pure name comparison fails numeric operator input — AGY r1
+// Finding 4).
+func TestProtoFilterMatches(t *testing.T) {
+	for _, tc := range []struct {
+		p      uint8
+		filter string
+		want   bool
+	}{
+		{6, "tcp", true},
+		{6, "TCP", true},
+		{6, "udp", false},
+		{58, "icmpv6", true},
+		{47, "gre", true},
+		{47, "47", true},
+		{89, "89", true},
+		{89, "88", false},
+		{6, "6", true},
+	} {
+		if got := protoFilterMatches(tc.p, tc.filter); got != tc.want {
+			t.Errorf("protoFilterMatches(%d, %q) = %v, want %v", tc.p, tc.filter, got, tc.want)
+		}
+	}
+}
+
 func TestServerSessionFilterValidate(t *testing.T) {
 	ok := &sessionFilter{snatPool: "isp-a", snatPoolOK: true}
 	if err := ok.validate(); err != nil {
