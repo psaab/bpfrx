@@ -2,18 +2,27 @@
 
 ## 1. Status
 
-DRAFT v2 — revised after round-1 adversarial review (Claude SMR +
-Codex `task-mqa3m2si-vy8ixc` + AGY `adversarial-review-mqa3pb8r-0etig8`,
-all PLAN-NEEDS-REVISION). v2 addresses the union of required changes:
-the two verified commit-confirmed service-mode holes are now named
-M1b prerequisite fixes; bootstrap mode is specified as a concrete
-daemon mode with an exact gate predicate; the protected-mgmt
-designation is moved outside the rolled-back config; the
-verify-before-unpack wrapper is promoted to the primary HA upgrade
-command; the dependency matrix is grounded in the daemon's actual
-execs; Path C costing drops the qcow2-under-the-hood assumption and
-the "80%" claim; HA mixed-version policy + tests added; open
-questions expanded.
+DRAFT v3 — revised after round-2 adversarial review (Claude SMR r2 +
+Codex `task-mqa42upr-3bwhh1` + AGY `adversarial-review-mqa42d7b-7umru1`,
+all PLAN-NEEDS-REVISION on v2's new mechanisms). v3 changes: the
+lifeline record is keyed by PCI address (not interface name — AGY r2
+Critical, rename-survival); rollback-from-bootstrap persists the
+no-committed-config state so the predicate survives restarts (AGY r2
+High); auto-rollback is specified as a daemon-owned transaction
+holding `applySem` across store promotion AND apply (Codex r2-1,
+atomicity contract); entering bootstrap mode is an explicit cleanup
+sequence (`enterBootstrapMode`), not a plain empty-config apply
+(Codex r2-2 + SMR N2); dependency matrix extended with the
+auth/syslog/diagnostic execs (Codex r2-3); renames-persist semantics
+stated (SMR N1); OQ-7 gate-scope note (SMR N3).
+
+v2 (round-1 union): the two verified commit-confirmed service-mode
+holes became named M1b prerequisite fixes; bootstrap mode specified
+with an exact gate predicate; protected-mgmt designation moved
+outside the rolled-back config; verify-before-unpack promoted to
+primary HA upgrade command; dependency matrix grounded in actual
+execs; Path C costing corrected (no qcow2-under-the-hood, no "80%"
+claim); HA mixed-version policy + tests; open questions expanded.
 
 Research-only branch `research/1879-install-simplify`. No production
 code is touched by this plan document.
@@ -200,6 +209,11 @@ binary):
 | Kea units/files (`pkg/dhcpserver/dhcpserver.go:75`) | `kea-dhcp4-server`, `kea-dhcp6-server` | Recommends | DHCP-server feature unavailable |
 | `chronyc` + sources.d | `chrony` | Recommends | NTP management feature unavailable |
 | `ps` | `procps` (essential-adjacent) | — (present on any Debian) | diagnostics only |
+| `useradd`, `chpasswd` (login/root-auth config, `pkg/daemon/daemon_system.go:714,784`) | `passwd` (Essential: yes on Debian) | — (declared for completeness; no metadata needed) | system login config fails |
+| `id`, `chown`, `tail` | `coreutils` (Essential) | — | n/a |
+| `systemctl restart rsyslog` (syslog file destinations, `daemon_system.go:644`) | `rsyslog` | Recommends | syslog-to-file feature degraded (journal still captures) |
+| `scp` (flow-archival transfer, `daemon_flow.go:345`) | `openssh-client` | Recommends | archival transfer feature unavailable |
+| `ping`, `traceroute` (API/gRPC diagnostics, `pkg/api/system.go:126`, `pkg/grpcapi/server_diag.go:141`) | `iputils-ping`, `traceroute` | Recommends (ping), Suggests (traceroute) | operational diag RPCs degraded |
 
 Policy reasoning per Debian Policy §7.2 [report]: Depends = "will not
 operate at all / postinst needs it"; Recommends = "found together in
@@ -556,22 +570,42 @@ Design (TNSR protected-mgmt + Junos commit-confirmed, composed with
 the existing fxp0 bootstrap). Step 0 is prerequisite plumbing; steps
 1-4 are the mechanism.
 
-0. **Prerequisite fixes (the two round-1 holes, M1b items 1-2):**
-   - Register a daemon-side central rollback handler wired to
-     `d.applyConfig` (the full-reconcile path the embedded CLI
-     already prefers, pkg/cli/cli.go:284-288) unconditionally at
-     daemon startup — not only inside the interactive shell. The
-     interactive shell's registration becomes additive (its handler
-     prints to the operator's TTY; the daemon's handler does the
-     reconcile — ordering/dedup is an implementation detail flagged
-     for the /engineer phase).
-   - Redesign the `prevCfg == nil` case in `performAutoRollback`
-     (store.go:1151): when the pre-confirm state was "no committed
-     config", rollback must still reconcile — the rollback target is
-     a **synthesized bootstrap config** (empty tree + the protected
-     set semantics below), not a nil no-op. With these two fixes,
-     "commit confirmed" becomes a real safety net in service mode;
-     without them it is a placebo (round-1's central verdict).
+0. **Prerequisite fixes (the two round-1 holes, hardened per round
+   2 — M1b items 1-2):**
+   - **Auto-rollback becomes a daemon-owned, applySem-serialized
+     transaction** (Codex r2-1). A plain callback wired to
+     `d.applyConfig` is NOT sufficient: `performAutoRollback`
+     mutates `s.active`/`s.compiled` BEFORE invoking the callback
+     (store.go:1114→1146), and `d.applyConfig` only holds `applySem`
+     around the apply — a concurrent commit could interleave between
+     store promotion and rollback apply, leaving store=new-commit
+     while kernel=rollback, violating the repo's commit→apply
+     atomicity contract (pkg/daemon/apply_serialize_test.go,
+     pkg/configstore/README.md §serialization). M1b therefore gives
+     the daemon ownership of the whole rollback transaction: the
+     confirm timer fires into a daemon-registered executor that
+     acquires `d.applySem` FIRST, then performs store promotion +
+     reconcile apply inside the same critical section (exact
+     configstore hook shape — executor callback vs promote-deferral —
+     is an /engineer-phase decision; the plan-level requirement is
+     "promotion and apply are atomic under applySem", with a
+     serialization test alongside apply_serialize_test.go). The
+     interactive shell's existing handler reduces to TTY
+     notification.
+   - **The `prevCfg == nil` (first-commit) case rolls back to
+     bootstrap state via `enterBootstrapMode` (step 4a), not via a
+     normal apply of an empty tree** — and it **persists the
+     no-committed-config state** (AGY r2 finding 2): the rollback
+     must NOT write an empty *committed* tree to the configstore,
+     or a daemon restart after rollback would classify
+     committed-empty → NOT-bootstrap and perform a full takeover on
+     an empty config. Mechanism: the store distinguishes
+     "never-successfully-committed" from "operator committed empty"
+     (a committed-generation marker / absence of an active record —
+     /engineer picks the representation, constrained by the #1799
+     persist-failure semantics which must be preserved). With these
+     fixes, "commit confirmed" becomes a real safety net in service
+     mode; without them it is a placebo (round-1's central verdict).
 1. **Protected management interface designation** (TNSR model
    [report]). New config leaf `system management-interface <name>`
    (schema: `pkg/config/schema.go` setSchema; default `fxp0`). The
@@ -580,7 +614,13 @@ the existing fxp0 bootstrap). Step 0 is prerequisite plumbing; steps
    lifeline-recorded interface from first start (persisted at
    `/etc/xpf/lifeline-interface`, written by step 2) — with (b)/(c)
    effective even when the active config is empty, absent, or rolled
-   back. Enforcement lives in the networkd reconcile + unmanaged-
+   back. **The lifeline record is keyed by PCI bus address (+ MAC as
+   tiebreaker for non-PCI NICs), NOT by interface name** (AGY r2
+   Critical): a name-keyed record goes stale the moment the takeover
+   renames the device (e.g. recorded `eth1` becomes `em0`), silently
+   dropping it from the protected set exactly when rollback needs
+   it. Protected-set evaluation resolves the recorded PCI address to
+   the device's *current* name at reconcile time. Enforcement lives in the networkd reconcile + unmanaged-
    interface strip paths (compiler_iface.go:1128-1149 and the
    `.network` writer): a protected interface is never marked
    always-down, never address-stripped, never bound into the
@@ -592,8 +632,9 @@ the existing fxp0 bootstrap). Step 0 is prerequisite plumbing; steps
 2. **Lifeline preservation at first start.** When the
    no-committed-config predicate holds (below), before any rename:
    xpfd identifies the interface carrying the current IPv4/IPv6
-   default route (detection details OQ-5) and records it to
-   `/etc/xpf/lifeline-interface`. If that interface is the one that
+   default route (detection details OQ-5) and records its PCI bus
+   address + MAC to `/etc/xpf/lifeline-interface` (name-independent,
+   step 1). If that interface is the one that
    would become fxp0 (idx 0): snapshot its *current* addressing into
    the bootstrap `.network` — `Address=`/`Gateway=`/`DNS=` lines when
    static, plain DHCP when DHCP — so the rename's link cycle restores
@@ -623,25 +664,63 @@ the existing fxp0 bootstrap). Step 0 is prerequisite plumbing; steps
    every existing test/cluster deploy — zero behavior change); absent
    DB + `xpf.conf` import FAILURE → bootstrap + loud error (today:
    daemon runs with empty config and takes over interfaces anyway —
-   strictly worse); empty active DB (committed-but-empty tree) → NOT
-   bootstrap (an operator who committed empty meant it; the protected
-   set still shields mgmt); corrupt DB → bootstrap + loud error,
-   never takeover-on-garbage. The predicate is computed once at
-   startup and on rollback-to-bootstrap.
+   strictly worse); empty active DB where the empty tree was a real
+   operator commit → NOT bootstrap (they meant it; the protected set
+   still shields mgmt); never-successfully-committed (including the
+   post-rollback-from-first-commit state, which persists as
+   no-committed-config per step 0 — AGY r2 finding 2) → bootstrap;
+   corrupt DB → bootstrap + loud error, never takeover-on-garbage.
+   The committed-empty vs never-committed distinction requires the
+   step-0 committed-generation marker. The predicate is computed
+   once at startup and on rollback-to-bootstrap, and is stable
+   across daemon restarts (a restart after a timed-out first commit
+   stays in bootstrap mode).
 4. **First takeover gated by commit-confirmed** (Junos model; reuses
    `configstore.CommitConfirmed` after step-0 fixes). When the
    current mode is bootstrap, a plain `commit` of an interface-owning
    config is refused with guidance: `first commit on this system must
    be 'commit confirmed <minutes>' (interface takeover can cut off
    management; the system rolls back automatically unless
-   confirmed)`. On confirm-timeout, rollback target = synthesized
-   bootstrap config (step 0) → reconcile restores bootstrap state
-   with the lifeline `.network` intact (named test, §9). Escape
+   confirmed)`. On confirm-timeout, the daemon-owned rollback
+   transaction (step 0) executes `enterBootstrapMode` (4a). Escape
    hatch `commit no-confirm` for console installs; day-0-provisioned
    configs (image path C.1) bypass the gate by design — the
    predicate already resolves NOT-bootstrap before the first
    interactive session exists. Gate scope (interface-claiming commits
-   vs any first commit): OQ-7.
+   vs any first commit): OQ-7. Note the gate is precisely "first
+   commit on a fresh system", not "first takeover": an operator who
+   exits bootstrap via `commit no-confirm` of a trivial config gets
+   no gate on later interface-claiming commits — consistent with
+   Junos, where commit-confirmed is operator discipline after day 0
+   (SMR r2 N3).
+
+4a. **`enterBootstrapMode` — an explicit cleanup sequence, not a
+   plain apply of an empty tree** (Codex r2-2 + SMR r2 N2). A failed
+   first takeover leaves real state behind: xpf networkd files,
+   FRR managed-section content, VRRP instances, a running helper
+   with AF_XDP sockets, and renamed NICs. A normal
+   `applyConfig(empty)` is the wrong tool — the userspace apply path
+   ensures the helper process exists
+   (pkg/dataplane/userspace/manager.go:641), i.e. it would
+   *resurrect* the dataplane bootstrap mode promises not to run.
+   The sequence, in order: (1) remove xpf-written `.network`/`.link`
+   takeover files EXCEPT the lifeline `.network` and the `.link`
+   files (see renames-persist below), `networkctl reload`; (2) clear
+   the FRR managed section (pkg/frr ApplyFull clears on empty
+   content, manager.go:211) and remove VRRP instances
+   (pkg/vrrp/manager.go:207 removes undesired instances); (3) stop
+   the dataplane helper / detach AF_XDP (the inverse of startup
+   load; exact teardown call audited at /engineer time — any
+   subsystem that cannot shrink to zero gets its residue enumerated
+   and accepted explicitly); (4) re-assert bootstrap-mode
+   suppressions for the remainder of the daemon's lifetime.
+   **Renames persist deliberately**: kernel NIC names and `.link`
+   files are NOT reverted by rollback (reverting would link-cycle a
+   degraded box for cosmetic benefit); post-rollback bootstrap state
+   = renamed NICs + lifeline `.network` (matching the post-rename
+   name via the PCI-keyed record) + zero config-driven claims. T1's
+   assertions are therefore reachability- and claims-based, never
+   name-restoration-based (SMR r2 N1).
 5. **Composition with packaging**: the .deb/install.sh/image never
    decide takeover — they install + enable a daemon whose *own* gate
    is the predicate above. The safety property lives in exactly one
@@ -755,7 +834,7 @@ the existing fxp0 bootstrap). Step 0 is prerequisite plumbing; steps
 
 | Class | Level | Notes |
 |---|---|---|
-| Behavioral regression (existing deployments) | MED | M1b touches daemon startup, configstore rollback, and the unmanaged-interface strip path. Mitigations: the bootstrap predicate resolves NOT-bootstrap for every existing deployment (explicit case matrix, §5); the protected-set change is a strict safety widening; `make test-failover` gates the daemon changes; the five-case predicate gets unit tests. Residual: the daemon-side rollback handler is a new caller of `d.applyConfig` — reconcile-on-timeout paths need the same serialization as gRPC/HTTP commits (d.applySem) |
+| Behavioral regression (existing deployments) | MED | M1b touches daemon startup, configstore rollback, and the unmanaged-interface strip path. Mitigations: the bootstrap predicate resolves NOT-bootstrap for every existing deployment (explicit case matrix, §5); the protected-set change is a strict safety widening; `make test-failover` gates the daemon changes; the five-case predicate gets unit tests. The round-2 serialization hazard (store promotion vs concurrent commit) is addressed by design — the rollback transaction owns applySem across promotion + apply — and carries a dedicated test |
 | Lockout / safety regression | LOW (net improvement) | The plan's purpose; riskiest sub-items are the synthesized-bootstrap rollback target and the lifeline static-snapshot writer — both carry named must-pass tests |
 | Packaging correctness | MED | dpkg maintainer-script edge cases (half-configured recovery, purge vs remove, masked service, unattended-upgrades) — bounded by the manual test matrix; no CI to catch drift |
 | Image first-boot portability | MED | sealing, cloud-init network ownership, NIC enumeration on real hardware, console args; bounded by the spike-first M2 gate and the KVM/incus-only validation label |
@@ -769,10 +848,14 @@ the existing fxp0 bootstrap). Step 0 is prerequisite plumbing; steps
   writer (static snapshot vs DHCP pass-through), the
   default-route-not-idx-0 refusal, and the NOT-bootstrap fast path;
   five-case predicate test (absent DB±xpf.conf, failed import, empty
-  active, corrupt DB); configstore tests for the daemon-side rollback
-  handler registration and the synthesized-bootstrap `prevCfg==nil`
-  path (service-mode rollback test — no TTY); first-commit
-  confirm-gate test.
+  active vs never-committed, corrupt DB); configstore/daemon tests
+  for the daemon-owned rollback transaction: a
+  rollback-vs-concurrent-commit serialization test alongside
+  apply_serialize_test.go (store promotion + apply atomic under
+  applySem), the `prevCfg==nil` → enterBootstrapMode path
+  (service-mode, no TTY), restart-after-timed-out-first-commit stays
+  bootstrap (predicate stability), PCI-keyed lifeline resolution
+  across a rename; first-commit confirm-gate test.
 - **Named must-pass integration tests** (standalone incus VM):
   (T1) *rollback-restores-lifeline*: first `commit confirmed 1` with
   a deliberately broken config, do not confirm → after timeout,
