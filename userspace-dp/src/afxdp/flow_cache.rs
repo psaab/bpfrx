@@ -155,6 +155,12 @@ pub(super) struct FlowCacheEntry {
     /// minutes, far past any concern. Value 0 = "never touched" sentinel
     /// (epoch 0 is skipped by `tick_advance_epoch`); freshly inserted entries
     /// carry 0 until their first lookup hit.
+    ///
+    /// #1741: entries are NOT removed when a flow dies, so this stamp can
+    /// freeze at a nonzero value. The per-scan clamp in
+    /// `active_flow_debug_entries` sentinel-clears stamps that leave the
+    /// active window, so a wrapped `current_epoch` can never re-match a
+    /// dead flow ("ghost resurrection" over-count).
     pub(super) last_used_epoch: u16,
 }
 
@@ -450,6 +456,13 @@ impl FlowCache {
         active
     }
 
+    /// Age predicate for the test-only `count_active_flows` counter.
+    /// The production scan (`active_flow_debug_entries`) inlines the
+    /// same math so it can clamp under the `iter_mut` borrow.
+    /// NOTE (#1741): this helper does NOT clamp; the wrap-ghost
+    /// protection lives in `active_flow_debug_entries`, which
+    /// sentinel-clears out-of-window stamps on every scan.
+    #[cfg(test)]
     fn active_entry_age(&self, entry: &FlowCacheEntry) -> Option<u16> {
         // last_used_epoch == 0 marks "never touched"; skip.
         if entry.last_used_epoch == 0 {
@@ -462,8 +475,24 @@ impl FlowCache {
     /// #1249: return a bounded active-flow debug map from the same
     /// owner-only scan that backs `count_active_flows`. This runs on
     /// the worker's debug/status cadence, not in the packet path.
+    ///
+    /// #1741: the scan also SENTINEL-CLEARS (`last_used_epoch = 0`) every
+    /// entry whose age has left the `ACTIVE_WINDOW_EPOCHS` window. Both
+    /// stamps are u16 with a 65535-tick cycle, so without the clamp a
+    /// dead entry's frozen stamp re-enters the window for exactly
+    /// `ACTIVE_WINDOW_EPOCHS` ticks once per wrap ("ghost resurrection"),
+    /// intermittently inflating `cos_active_flow_count` and every derived
+    /// fairness gauge. The clamp is airtight because `tick_advance_epoch`
+    /// and this scan are co-located at the single production call site
+    /// (`umem/debug_state.rs::publish_binding_debug_state`, reached from
+    /// both the hot mask path and the #1294 idle wall-clock path): an
+    /// entry is cleared on the first scan after leaving the window and a
+    /// wrapped `current_epoch` can never re-match it. A clamped entry is
+    /// NOT evicted — a later lookup hit re-stamps it and it counts again.
+    /// Restored invariant: counted active ⇔ hit within the last
+    /// `ACTIVE_WINDOW_EPOCHS` ticks, with no wrap exception.
     pub(super) fn active_flow_debug_entries(
-        &self,
+        &mut self,
         limit: usize,
     ) -> (u32, Vec<FlowCacheDebugEntry>, Vec<CoSActiveFlowCount>, bool) {
         let limit = limit.min(FLOW_CACHE_SIZE);
@@ -471,13 +500,25 @@ impl FlowCache {
         let mut truncated = false;
         let mut rows = Vec::with_capacity(limit.min(64));
         let mut cos_counts = BTreeMap::<(i32, u8), u32>::new();
-        for slot in self.entries.iter() {
+        // Copy the epoch to a local: the age math must run inside the
+        // `iter_mut` borrow below, where `self.active_entry_age` (a
+        // `&self` method) is not callable.
+        let current_epoch = self.current_epoch;
+        for slot in self.entries.iter_mut() {
             let Some(entry) = slot else {
                 continue;
             };
-            let Some(age_epochs) = self.active_entry_age(entry) else {
+            if entry.last_used_epoch == 0 {
                 continue;
-            };
+            }
+            let age_epochs = current_epoch.wrapping_sub(entry.last_used_epoch);
+            if age_epochs >= ACTIVE_WINDOW_EPOCHS {
+                // #1741: out of the active window — sentinel-clear so the
+                // u16 wrap can never resurrect this stamp. Owner-only
+                // store on the debug cadence; not on the packet path.
+                entry.last_used_epoch = 0;
+                continue;
+            }
             active = active.saturating_add(1);
             if let Some(queue_id) = entry.descriptor.tx_selection.queue_id {
                 let key = (entry.descriptor.egress_ifindex, queue_id);
