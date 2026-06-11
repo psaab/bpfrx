@@ -83,10 +83,10 @@ pub(super) fn wg_encap_frame(
         .unwrap_or(1500);
     let wg_record_len = WG_DATA_HEADER_LEN + pad_to_16(inner_packet.len()) + POLY1305_TAG_LEN;
     if wg_encapped_size(inner_packet.len(), outer_v6) > outer_mtu {
-        // wg_mtu_drops would be incremented on a real counter store here;
-        // S2a surfaces this via the explicit drop (None) + the control
-        // thread's symmetric guard. Telemetry consolidation is on the
-        // engine in a follow-up.
+        // #1865: the promised "follow-up" counter store — same
+        // `encap_mtu_drops` counter as the control thread's symmetric
+        // guard (the plan's both-guards requirement).
+        crate::afxdp::wg::counters::WgCounters::bump(&engine.counters().encap_mtu_drops);
         return None;
     }
 

@@ -37,6 +37,7 @@
 //!     (frame/mod.rs).
 
 use super::*;
+use crate::afxdp::wg::counters::WgCounters;
 use crate::afxdp::wg::{POLY1305_TAG_LEN, WG_DATA_HEADER_LEN};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, UdpSocket};
@@ -246,7 +247,12 @@ pub(super) fn wg_control_loop(
             // stop/join during reconcile).
             for _ in 0..WG_RX_BURST {
                 match tun.read(&mut tun_buf) {
-                    Ok(len) if len > 0 => did_work = true,
+                    Ok(len) if len > 0 => {
+                        // #1865: inner packet drained + dropped — no
+                        // learned endpoint to send to yet.
+                        WgCounters::bump(&engine.counters().tun_rx_drops_no_endpoint);
+                        did_work = true;
+                    }
                     _ => break,
                 }
             }
@@ -424,9 +430,14 @@ fn drive_initiation(
     tunnel_name: &str,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
 ) {
+    // #1865: create_initiation Ok/Err accounting is engine-internal
+    // (hs_initiations_created / hs_initiation_build_failures); the
+    // send failure is OURS to count — created↑ + send_errors↑ +
+    // completions flat is the #1736 EINVAL fingerprint.
     if let Ok(_local_index) = engine.create_initiation(peer_pubkey, out) {
         let len = crate::afxdp::wg::WG_MSG_INIT_LEN;
         if let Err(e) = wg_send_to(socket, socket_is_v6, &out[..len], endpoint) {
+            WgCounters::bump(&engine.counters().hs_send_errors);
             record_local_tunnel_exception(
                 recent_exceptions,
                 tunnel_name,
@@ -463,7 +474,19 @@ fn dispatch_inbound(
             match engine.consume_initiation_create_response(datagram, response_buf) {
                 Ok((_peer_pubkey, _local_index)) => {
                     let len = crate::afxdp::wg::WG_MSG_RESPONSE_LEN;
-                    let _ = wg_send_to(socket, socket_is_v6, &response_buf[..len], from);
+                    // #1865: the response send error was silently
+                    // discarded (`let _ =`) — the responder mirror of
+                    // the #1736 initiator-EINVAL class. Count + record.
+                    if let Err(e) =
+                        wg_send_to(socket, socket_is_v6, &response_buf[..len], from)
+                    {
+                        WgCounters::bump(&engine.counters().hs_send_errors);
+                        record_local_tunnel_exception(
+                            recent_exceptions,
+                            tunnel_name,
+                            format!("wg_response_send:{from}:{e}"),
+                        );
+                    }
                     true
                 }
                 Err(_e) => {
@@ -482,6 +505,7 @@ fn dispatch_inbound(
         crate::afxdp::wg::WG_TYPE_COOKIE => {
             // Cookie/MAC2 reply handling is S7; drop for now. Not
             // authenticated for endpoint-learning purposes.
+            WgCounters::bump(&engine.counters().hs_rx_cookie_unsupported);
             debug_log!("WG[{}]: drop cookie (S7)", tunnel_name);
             false
         }
@@ -493,6 +517,7 @@ fn dispatch_inbound(
                     // engine — the AllowedIPs gate inside try_decap is
                     // S2a's inner-src control).
                     if let Err(e) = tun.write_all(&decap_buf[..outcome.len]) {
+                        WgCounters::bump(&engine.counters().tun_write_errors);
                         record_local_tunnel_exception(
                             recent_exceptions,
                             tunnel_name,
@@ -508,6 +533,11 @@ fn dispatch_inbound(
             }
         }
         _ => {
+            // #1865: type byte outside {1,2,3,4}. Zero-length
+            // datagrams never reach here (the recv loop's
+            // `Ok(_) => break` arm consumes them), so this counter is
+            // exactly "well-formed UDP, non-WG type byte".
+            WgCounters::bump(&engine.counters().rx_unknown_type);
             debug_log!("WG[{}]: drop unknown type {}", tunnel_name, wg_type);
             false
         }
@@ -536,6 +566,10 @@ fn encap_and_send(
     // TUN MTU (Go-side) is the first line; this is defense-in-depth for a
     // mis-set MTU or a jumbo inner read off the TUN.
     if wg_encapped_size(inner_ip.len(), endpoint.is_ipv6()) > WG_OUTER_MTU {
+        // #1865: the #1736 v4-mapped blackhole class — full-MSS inner
+        // packets silently vanishing here moved ZERO bytes of forward
+        // TCP while pings passed. Now release-visible.
+        WgCounters::bump(&engine.counters().encap_mtu_drops);
         debug_log!(
             "WG[{}]: drop oversize inner {} (encapped > {})",
             tunnel_name,
@@ -547,6 +581,7 @@ fn encap_and_send(
     match engine.try_encap(peer_pubkey, inner_ip, out) {
         Ok(outcome) => {
             if let Err(e) = wg_send_to(socket, socket_is_v6, &out[..outcome.len], endpoint) {
+                WgCounters::bump(&engine.counters().transport_send_errors);
                 record_local_tunnel_exception(
                     recent_exceptions,
                     tunnel_name,

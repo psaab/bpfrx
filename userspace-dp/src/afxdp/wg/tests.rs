@@ -2196,3 +2196,332 @@ fn wg_request_handshake_single_edge_under_concurrent_callers() {
     );
     assert!(engine.take_handshake_request(), "the winning edge is pending");
 }
+
+// ===================================================================
+// #1865: operator-visible telemetry counter tests. Each asserts the
+// EXACT counter that must move (and key neighbors that must NOT) for
+// the plan §6 scenarios, plus the keepalive classification regression.
+// ===================================================================
+mod telemetry_counters {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// Full framed handshake: created/completed counters both roles,
+    /// completion stamp set, and the responder confirmation flip via
+    /// the first inbound record.
+    #[test]
+    fn framed_handshake_moves_handshake_counters() {
+        let (init, resp, _init_pub, resp_pub) = framed_engine_pair();
+
+        let mut msg1 = [0u8; crate::afxdp::wg::WG_MSG_INIT_LEN];
+        init.create_initiation(&resp_pub, &mut msg1).unwrap();
+        let ic = init.counters();
+        assert_eq!(ic.hs_initiations_created.load(Ordering::Relaxed), 1);
+        assert_eq!(ic.hs_initiation_build_failures.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            ic.last_handshake_complete_ns.load(Ordering::Relaxed),
+            0,
+            "creation alone is NOT completion"
+        );
+
+        let mut msg2 = [0u8; crate::afxdp::wg::WG_MSG_RESPONSE_LEN];
+        resp.consume_initiation_create_response(&msg1, &mut msg2)
+            .unwrap();
+        let rc = resp.counters();
+        assert_eq!(rc.hs_responses_created.load(Ordering::Relaxed), 1);
+        assert!(
+            rc.last_handshake_complete_ns.load(Ordering::Relaxed) > 0,
+            "responder completion stamps the handshake time"
+        );
+
+        init.consume_response(&msg2).unwrap();
+        assert_eq!(ic.hs_completions_initiator.load(Ordering::Relaxed), 1);
+        assert!(ic.last_handshake_complete_ns.load(Ordering::Relaxed) > 0);
+
+        // Transport round-trip moves packet/byte counters symmetrically.
+        let inner = ipv4_packet(Ipv4Addr::new(10, 1, 1, 1), Ipv4Addr::new(10, 1, 1, 2));
+        let mut wire = [0u8; 2048];
+        let enc = init.try_encap(&resp_pub, &inner, &mut wire).unwrap();
+        let mut plain = [0u8; 2048];
+        resp.try_decap(&wire[..enc.len], &mut plain).unwrap();
+        assert_eq!(ic.encap_packets.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            ic.encap_bytes.load(Ordering::Relaxed),
+            inner.len() as u64,
+            "encap bytes are inner-IP (un-padded) bytes"
+        );
+        assert_eq!(rc.decap_packets.load(Ordering::Relaxed), 1);
+        assert_eq!(rc.decap_bytes.load(Ordering::Relaxed), inner.len() as u64);
+    }
+
+    /// The keepalive regression (Codex r1 F1 + SMR r1 F1): an
+    /// authenticated ZERO-length transport record counts as
+    /// `decap_keepalives` — NOT `decap_drops_malformed_inner` — while
+    /// the external contract (Err, replay window advanced) and the
+    /// confirmation side-effect are unchanged.
+    #[test]
+    fn zero_length_record_counts_keepalive_not_malformed_inner() {
+        let (init_engine, resp_engine, init_pub, resp_pub) = established_pair(
+            vec!["0.0.0.0/0".parse().unwrap()],
+            vec!["0.0.0.0/0".parse().unwrap()],
+        );
+        let mut wire = [0u8; 256];
+        let enc = init_engine.try_encap(&resp_pub, &[], &mut wire).unwrap();
+        // pad_to_16(0) == 0: header + tag only.
+        assert_eq!(
+            enc.len,
+            crate::afxdp::wg::WG_DATA_HEADER_LEN + crate::afxdp::wg::POLY1305_TAG_LEN
+        );
+        let mut plain = [0u8; 256];
+        let err = resp_engine
+            .try_decap(&wire[..enc.len], &mut plain)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            DecapError::MalformedInner,
+            "external error contract unchanged (keepalive still not deliverable)"
+        );
+        let rc = resp_engine.counters();
+        assert_eq!(rc.decap_keepalives.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            rc.decap_drops_malformed_inner.load(Ordering::Relaxed),
+            0,
+            "keepalives must NOT inflate the malformed-inner drop counter"
+        );
+        // Replay window advanced: replaying the identical record is a
+        // replay drop, not a second keepalive.
+        let err2 = resp_engine
+            .try_decap(&wire[..enc.len], &mut plain)
+            .unwrap_err();
+        assert!(matches!(
+            err2,
+            DecapError::ReplayDuplicate | DecapError::ReplayOutOfWindow
+        ));
+        assert_eq!(rc.decap_keepalives.load(Ordering::Relaxed), 1);
+        assert_eq!(rc.decap_drops_replay.load(Ordering::Relaxed), 1);
+        let _ = (init_pub, init_engine);
+    }
+
+    /// MAC1-corrupted initiation → hs_rx_drops_mac1_mismatch (the
+    /// wrong-key-peer live-validation case).
+    #[test]
+    fn mac1_mismatch_counts_on_responder() {
+        let (init, _resp, _init_pub, resp_pub) = framed_engine_pair();
+        let mut msg1 = [0u8; crate::afxdp::wg::WG_MSG_INIT_LEN];
+        init.create_initiation(&resp_pub, &mut msg1).unwrap();
+        // A responder with a DIFFERENT static key: mac1 keys on the
+        // recipient pubkey, so this is the wrong-key-peer shape.
+        let (other_priv, _) = keypair();
+        let (_, init2_pub) = keypair();
+        let other = WgEngine::new(WgEngineConfig {
+            local_private_key: other_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: init2_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+            }],
+        });
+        let mut msg2 = [0u8; crate::afxdp::wg::WG_MSG_RESPONSE_LEN];
+        let _ = other
+            .consume_initiation_create_response(&msg1, &mut msg2)
+            .unwrap_err();
+        assert_eq!(
+            other.counters().hs_rx_drops_mac1_mismatch.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(other.counters().hs_responses_created.load(Ordering::Relaxed), 0);
+    }
+
+    /// AllowedIPs-violating inner → decap_drops_allowed_ips.
+    #[test]
+    fn allowed_ips_violation_counts() {
+        let (init_engine, resp_engine, _init_pub, resp_pub) = established_pair(
+            vec!["0.0.0.0/0".parse().unwrap()],
+            // Responder only accepts 10.7.0.0/16 from the initiator.
+            vec!["10.7.0.0/16".parse().unwrap()],
+        );
+        let inner = ipv4_packet(Ipv4Addr::new(192, 168, 1, 1), Ipv4Addr::new(10, 7, 0, 2));
+        let mut wire = [0u8; 2048];
+        let enc = init_engine.try_encap(&resp_pub, &inner, &mut wire).unwrap();
+        let mut plain = [0u8; 2048];
+        let err = resp_engine
+            .try_decap(&wire[..enc.len], &mut plain)
+            .unwrap_err();
+        assert_eq!(err, DecapError::AllowedIpsViolation);
+        assert_eq!(
+            resp_engine
+                .counters()
+                .decap_drops_allowed_ips
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    /// Truncated (sub-tag) record → decap_drops_malformed_header
+    /// (ShortRecord folds into the malformed-header class).
+    #[test]
+    fn short_record_counts_malformed_header() {
+        let (init_engine, resp_engine, _init_pub, resp_pub) = established_pair(
+            vec!["0.0.0.0/0".parse().unwrap()],
+            vec!["0.0.0.0/0".parse().unwrap()],
+        );
+        let inner = ipv4_packet(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2));
+        let mut wire = [0u8; 2048];
+        let enc = init_engine.try_encap(&resp_pub, &inner, &mut wire).unwrap();
+        let mut plain = [0u8; 2048];
+        // Header intact, ciphertext truncated below the Poly1305 tag.
+        let truncated = &wire[..crate::afxdp::wg::WG_DATA_HEADER_LEN + 8];
+        let err = resp_engine.try_decap(truncated, &mut plain).unwrap_err();
+        assert_eq!(err, DecapError::ShortRecord);
+        assert_eq!(
+            resp_engine
+                .counters()
+                .decap_drops_malformed_header
+                .load(Ordering::Relaxed),
+            1
+        );
+        let _ = enc;
+    }
+
+    /// The unconfirmed-vs-no-session split (AGY r2 #1736): the
+    /// responder key-confirmation gate bumps `encap_drops_unconfirmed`
+    /// (NOT no_session) while still returning `NoSession`; an engine
+    /// with a peer but no session at all bumps `encap_drops_no_session`.
+    #[test]
+    fn encap_no_session_vs_unconfirmed_split() {
+        // Unconfirmed: drive the framed handshake so the responder
+        // holds a real (unconfirmed) session, then encap from it.
+        let (init, resp, init_pub, resp_pub) = framed_engine_pair();
+        let mut msg1 = [0u8; crate::afxdp::wg::WG_MSG_INIT_LEN];
+        init.create_initiation(&resp_pub, &mut msg1).unwrap();
+        let mut msg2 = [0u8; crate::afxdp::wg::WG_MSG_RESPONSE_LEN];
+        resp.consume_initiation_create_response(&msg1, &mut msg2)
+            .unwrap();
+        let inner = ipv4_packet(Ipv4Addr::new(10, 2, 2, 1), Ipv4Addr::new(10, 2, 2, 2));
+        let mut wire = [0u8; 2048];
+        let err = resp.try_encap(&init_pub, &inner, &mut wire).unwrap_err();
+        assert_eq!(err, EncapError::NoSession, "wire error contract unchanged");
+        let rc = resp.counters();
+        assert_eq!(rc.encap_drops_unconfirmed.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            rc.encap_drops_no_session.load(Ordering::Relaxed),
+            0,
+            "the unconfirmed gate must NOT masquerade as no-session"
+        );
+
+        // No session at all: fresh engine, configured peer, no handshake.
+        let (fresh, _resp2, _ip2, rp2) = framed_engine_pair();
+        let err2 = fresh.try_encap(&rp2, &inner, &mut wire).unwrap_err();
+        assert_eq!(err2, EncapError::NoSession);
+        assert_eq!(
+            fresh.counters().encap_drops_no_session.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            fresh.counters().encap_drops_unconfirmed.load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    /// create_initiation toward an unconfigured peer →
+    /// hs_initiation_build_failures (previously discarded by the
+    /// `if let Ok` at the drive_initiation call site).
+    #[test]
+    fn initiation_build_failure_counts() {
+        let (init, _resp, _init_pub, _resp_pub) = framed_engine_pair();
+        let (_, stranger_pub) = keypair();
+        let mut msg1 = [0u8; crate::afxdp::wg::WG_MSG_INIT_LEN];
+        let _ = init.create_initiation(&stranger_pub, &mut msg1).unwrap_err();
+        let ic = init.counters();
+        assert_eq!(ic.hs_initiation_build_failures.load(Ordering::Relaxed), 1);
+        assert_eq!(ic.hs_initiations_created.load(Ordering::Relaxed), 0);
+    }
+
+    /// request_handshake edge accounting: exactly the accepted edges
+    /// count (the rate-limited duplicates do not).
+    #[test]
+    fn handshake_request_edges_count_accepted_only() {
+        let (init, _resp, _init_pub, _resp_pub) = framed_engine_pair();
+        assert!(init.request_handshake(10));
+        assert!(!init.request_handshake(20), "inside the rate window");
+        assert_eq!(
+            init.counters().hs_requests_armed.load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    /// Counters survive an identity-UNCHANGED reconcile (same engine
+    /// object; reconcile_peers must not disturb telemetry).
+    #[test]
+    fn counters_survive_identity_unchanged_reconcile() {
+        let (init, _resp, _init_pub, resp_pub) = framed_engine_pair();
+        let mut msg1 = [0u8; crate::afxdp::wg::WG_MSG_INIT_LEN];
+        init.create_initiation(&resp_pub, &mut msg1).unwrap();
+        assert_eq!(init.counters().hs_initiations_created.load(Ordering::Relaxed), 1);
+        init.reconcile_peers(&[WgPeerConfig {
+            pubkey: resp_pub,
+            endpoint: None,
+            persistent_keepalive: 0,
+            allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+        }]);
+        assert_eq!(
+            init.counters().hs_initiations_created.load(Ordering::Relaxed),
+            1,
+            "reconcile with unchanged identity must not disturb counters"
+        );
+    }
+
+    /// Hex render of a pubkey matches the house wire convention
+    /// (lowercase, 64 chars; inverse of decode_wg_key_hex).
+    #[test]
+    fn encode_wg_key_hex_roundtrip_shape() {
+        let (_, pubkey) = keypair();
+        let hex = crate::afxdp::wg::encode_wg_key_hex(&pubkey);
+        assert_eq!(hex.len(), 64);
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        let mut nib = 0u8;
+        for (i, c) in hex.bytes().enumerate() {
+            let v = match c {
+                b'0'..=b'9' => c - b'0',
+                b'a'..=b'f' => c - b'a' + 10,
+                _ => unreachable!(),
+            };
+            if i % 2 == 0 {
+                nib = v << 4;
+            } else {
+                assert_eq!(pubkey[i / 2], nib | v);
+            }
+        }
+    }
+
+    /// Local copy of framed_handshake::engine_pair (that helper is
+    /// mod-private): two engines that know each other, 0.0.0.0/0.
+    fn framed_engine_pair() -> (WgEngine, WgEngine, [u8; 32], [u8; 32]) {
+        let (init_priv, init_pub) = keypair();
+        let (resp_priv, resp_pub) = keypair();
+        let any_v4: Vec<ipnet::IpNet> = vec!["0.0.0.0/0".parse().unwrap()];
+        let init = WgEngine::new(WgEngineConfig {
+            local_private_key: init_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: resp_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: any_v4.clone(),
+            }],
+        });
+        let resp = WgEngine::new(WgEngineConfig {
+            local_private_key: resp_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: init_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: any_v4,
+            }],
+        });
+        (init, resp, init_pub, resp_pub)
+    }
+}

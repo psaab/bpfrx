@@ -262,7 +262,7 @@ impl WgEngine {
     /// zeros). On any failure after reservation the reservation is released.
     /// Writes the 148-byte message at `out[0..148]` and returns the chosen
     /// sender_index.
-    pub(crate) fn create_initiation(
+    fn create_initiation_inner(
         &self,
         peer_pubkey: &[u8; WG_KEY_LEN],
         out: &mut [u8],
@@ -350,7 +350,7 @@ impl WgEngine {
     ///     symmetric state on a failed read, so we put the borrowed
     ///     `HandshakeState` back and keep waiting for a valid (or
     ///     retransmitted) response.
-    pub(crate) fn consume_response(&self, msg: &[u8]) -> Result<u32, HandshakeError> {
+    fn consume_response_inner(&self, msg: &[u8]) -> Result<u32, HandshakeError> {
         let parsed = handshake::parse_response(msg, &self.local_public_key)?;
         let local_index = parsed.receiver_index;
 
@@ -431,7 +431,7 @@ impl WgEngine {
     /// session. Writes the 92-byte response at `out[0..92]` and returns
     /// `(peer_pubkey, our_sender_index)` — pubkey first, matching the return
     /// expression below.
-    pub(crate) fn consume_initiation_create_response(
+    fn consume_initiation_create_response_inner(
         &self,
         msg: &[u8],
         out: &mut [u8],
@@ -534,6 +534,76 @@ impl WgEngine {
         Ok((peer_pubkey, local_index))
     }
 
+}
+
+// ===================================================================
+// #1865: telemetry-counting wrappers around the three slow-path
+// handshake entry points. The *_inner bodies above are unchanged; the
+// wrappers own the Result -> counter mapping so a call site can never
+// bypass accounting. Completion stamps use the wg-local
+// CLOCK_MONOTONIC reader (counters::monotonic_now_ns — same domain as
+// the coordinator's monotonic_nanos, which the status snapshot uses
+// for the wall-clock conversion).
+// ===================================================================
+impl WgEngine {
+    /// Build a framed WG type-1 initiation toward `peer_pubkey`.
+    /// Counted: Ok → `hs_initiations_created` ("created", NOT "sent" —
+    /// the UDP send happens at the call site and can fail; see
+    /// `hs_send_errors`); Err → `hs_initiation_build_failures` (all
+    /// variants folded; previously discarded entirely by the
+    /// `if let Ok` at the drive_initiation call site).
+    pub(crate) fn create_initiation(
+        &self,
+        peer_pubkey: &[u8; WG_KEY_LEN],
+        out: &mut [u8],
+    ) -> Result<u32, HandshakeError> {
+        let res = self.create_initiation_inner(peer_pubkey, out);
+        match &res {
+            Ok(_) => super::counters::WgCounters::bump(&self.counters.hs_initiations_created),
+            Err(_) => super::counters::WgCounters::bump(
+                &self.counters.hs_initiation_build_failures,
+            ),
+        }
+        res
+    }
+
+    /// Initiator path: consume a framed WG type-2 response. Counted:
+    /// Ok → `hs_completions_initiator` + completion stamp; Err →
+    /// per-reason `hs_rx_drops_*`.
+    pub(crate) fn consume_response(&self, msg: &[u8]) -> Result<u32, HandshakeError> {
+        match self.consume_response_inner(msg) {
+            Ok(idx) => {
+                super::counters::WgCounters::bump(&self.counters.hs_completions_initiator);
+                self.counters
+                    .record_handshake_complete(super::counters::monotonic_now_ns());
+                Ok(idx)
+            }
+            Err(e) => Err(self.counters.count_handshake_rx_err(e)),
+        }
+    }
+
+    /// Responder path: consume a framed WG type-1 initiation and build
+    /// the type-2 response. Counted: Ok → `hs_responses_created` +
+    /// completion stamp (this single increment site is ALSO the
+    /// responder-completion event — the Prometheus completions metric
+    /// emits it under role="responder"; the UDP response send and its
+    /// failure are the call site's `hs_send_errors`); Err →
+    /// per-reason `hs_rx_drops_*`.
+    pub(crate) fn consume_initiation_create_response(
+        &self,
+        msg: &[u8],
+        out: &mut [u8],
+    ) -> Result<([u8; WG_KEY_LEN], u32), HandshakeError> {
+        match self.consume_initiation_create_response_inner(msg, out) {
+            Ok(ok) => {
+                super::counters::WgCounters::bump(&self.counters.hs_responses_created);
+                self.counters
+                    .record_handshake_complete(super::counters::monotonic_now_ns());
+                Ok(ok)
+            }
+            Err(e) => Err(self.counters.count_handshake_rx_err(e)),
+        }
+    }
 }
 
 /// Allocate a non-zero pseudo-random u32 for a handshake index. WG indices
