@@ -117,6 +117,15 @@ addresses.
    `allow_cached_fast_path = false`) and fall back to the stored
    resolution only on NoRoute/MissingNeighbor — those DO re-resolve
    onto the injected route.
+6. Scope (r2 fold): the pinning in (3)-(4) applies to ordinary
+   **direct ForwardCandidate uplink sessions** — the case the
+   multi-WAN SNAT recipes produce. **Tunnel-backed sessions**
+   (`tunnel_endpoint_id != 0`) resolve the tunnel's outer path BEFORE
+   the cached fast path (`session_glue/mod.rs:90-103` →
+   `resolve_tunnel_forwarding_resolution`, `forwarding/mod.rs:1490`)
+   and fall back to the stored resolution only on
+   NoRoute/MissingNeighbor — so a tunnel whose outer route flips DOES
+   follow the injected route.
 
 This is Junos parity in substance: SRX likewise does not re-route or
 re-NAT established sessions on a route change by default; they age out

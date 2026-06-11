@@ -228,8 +228,11 @@ What happens to ESTABLISHED sessions when ip-monitoring fails over:
    immutable NAT binding. Their traffic keeps leaving the dead path
    and blackholes until the inactivity timeout or an operator clear.
    New flows resolve via the injected route and are correct
-   immediately. (Peer-synced sessions are the exception: they resolve
-   lookup-first and DO move onto the injected route.)
+   immediately. (Two exceptions DO move onto the injected route:
+   peer-synced sessions, which resolve lookup-first; and tunnel-backed
+   sessions, whose OUTER path re-resolves before the stored-resolution
+   fast path. The pinning above is the ordinary direct-uplink case the
+   SNAT recipes produce.)
 
 This is Junos parity in substance: SRX likewise does not re-route or
 re-NAT established sessions on a route change by default. Junos
