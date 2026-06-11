@@ -18,9 +18,10 @@ structure.)
   inbound packet matches an existing outbound flow").
 - `entry.rs` — `SessionEntry`: decision, metadata, origin, timestamps,
   expiry tick, wheel bucket.
-- `wheel.rs` — bucketed timer wheel (1 s per tick, 256 buckets). One
-  sweep per second by the coordinator; lazy-delete on lookup picks up
-  stragglers.
+- `wheel.rs` — bucketed timer wheel (1 s per tick, 256 buckets). Each
+  worker sweeps its own table once per second from its poll loop
+  (`expire_stale_entries` in `afxdp/worker/loop_body/mod.rs`);
+  lazy-delete on lookup picks up stragglers.
 - `tests.rs` — co-located unit tests.
 
 ## Timeouts
@@ -37,8 +38,8 @@ per-entry `expires_after_ns`.
 
 ## GC
 
-`SESSION_GC_INTERVAL_NS = 1_000_000_000` (1 s). Single-threaded sweep
-walks the wheel bucket for the current tick; stale entries get
+`SESSION_GC_INTERVAL_NS = 1_000_000_000` (1 s). Single-threaded per-worker
+sweep walks the wheel bucket for the current tick; stale entries get
 lazy-deleted on the next lookup if they slip past the sweep (e.g.
 because they were re-bucketed mid-sweep).
 
