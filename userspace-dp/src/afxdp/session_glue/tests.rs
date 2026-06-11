@@ -4046,3 +4046,186 @@ fn replicate_session_delete_delivers_to_poisoned_queue() {
     }
     assert!(!queues[0].is_poisoned(), "poison must be cleared");
 }
+
+// ---------------------------------------------------------------------------
+// #1760 W3': shared-map NAT reverse-key displacement counter
+// ---------------------------------------------------------------------------
+//
+// NOTE on the process-global static: NAT_REVERSE_KEY_SHARED_DISPLACEMENTS is
+// shared across the whole test binary. All assertions below are DELTA-based
+// around the specific publish calls, and only the tests in this block publish
+// colliding (distinct-forward-key, same-reverse-key) entries — every other
+// test in the binary publishes either unrelated keys or same-session
+// republishes, neither of which increments the counter. The positive and
+// negative cases are kept in ONE test to avoid cross-test ordering effects.
+
+fn w3_forward_entry(src_host: u8, src_port: u16, snat_ip: Ipv4Addr) -> SyncedSessionEntry {
+    // Interface-mode SNAT shape: rewrite_src set, NO source-port rewrite —
+    // the portless mode that makes the reverse key collide (#1760 §2.7).
+    SyncedSessionEntry {
+        key: SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, src_host)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            src_port,
+            dst_port: 443,
+        },
+        decision: SessionDecision {
+            resolution: test_resolution(),
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(snat_ip)),
+                rewrite_src_port: None,
+                ..NatDecision::default()
+            },
+        },
+        metadata: test_metadata(),
+        origin: SessionOrigin::ForwardFlow,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x02,
+    }
+}
+
+#[test]
+fn shared_nat_displacement_counter_counts_collisions_not_republishes() {
+    use crate::afxdp::shared_ops::NAT_REVERSE_KEY_SHARED_DISPLACEMENTS;
+    use std::sync::atomic::Ordering;
+
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let snat_ip = Ipv4Addr::new(172, 16, 80, 8);
+
+    // Two distinct internal hosts, SAME source port, same dst — the
+    // interface-SNAT collision: identical reverse wire key K.
+    let s1 = w3_forward_entry(101, 40_000, snat_ip);
+    let s2 = w3_forward_entry(102, 40_000, snat_ip);
+    assert_ne!(s1.key, s2.key, "distinct forward sessions");
+    assert_eq!(
+        reverse_session_key(&s1.key, s1.decision.nat),
+        reverse_session_key(&s2.key, s2.decision.nat),
+        "construction must produce a genuine reverse-key collision"
+    );
+
+    // Fresh publish: no displacement.
+    let before = NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed);
+    publish_shared_session(
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        &shared_owner_rg_indexes,
+        &s1,
+    );
+    assert_eq!(
+        NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed),
+        before,
+        "first publish must not count"
+    );
+
+    // Same-session republish (promote / RG migration / HA re-sync shape):
+    // displaced.key == entry.key -> no count.
+    publish_shared_session(
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        &shared_owner_rg_indexes,
+        &s1,
+    );
+    assert_eq!(
+        NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed),
+        before,
+        "same-session republish must not count"
+    );
+
+    // Colliding second session displaces s1 at K -> counts. The
+    // reverse-canonical slot for this NAT shape may coincide with the wire
+    // slot (single insert) or differ (second insert also displaces); accept
+    // either by asserting a positive, bounded delta.
+    publish_shared_session(
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        &shared_owner_rg_indexes,
+        &s2,
+    );
+    let after_collision = NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed);
+    let delta = after_collision - before;
+    assert!(
+        (1..=2).contains(&delta),
+        "colliding publish must count once per displaced slot (delta={delta})"
+    );
+
+    // s1 re-publishes (e.g. its worker re-installs): displaces s2 -> counts
+    // again. Alternations keep counting — event count, not pair census.
+    publish_shared_session(
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        &shared_owner_rg_indexes,
+        &s1,
+    );
+    assert!(
+        NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed) > after_collision,
+        "alternation must count again"
+    );
+}
+
+#[test]
+fn shared_nat_displacement_counter_ignores_reverse_entries() {
+    use crate::afxdp::shared_ops::NAT_REVERSE_KEY_SHARED_DISPLACEMENTS;
+    use std::sync::atomic::Ordering;
+
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+
+    let mut reverse = w3_forward_entry(103, 40_001, Ipv4Addr::new(172, 16, 80, 8));
+    reverse.metadata.is_reverse = true;
+    let before = NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed);
+    publish_shared_session(
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        &shared_owner_rg_indexes,
+        &reverse,
+    );
+    publish_shared_session(
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        &shared_owner_rg_indexes,
+        &reverse,
+    );
+    assert_eq!(
+        NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed),
+        before,
+        "reverse entries never touch shared_nat_sessions"
+    );
+}
+
+#[test]
+fn nat_reverse_key_warn_throttle_claims_once_per_window() {
+    use crate::afxdp::shared_ops::try_claim_nat_reverse_key_warn;
+
+    // The throttle static is process-global and never reset; derive a base
+    // far beyond any previously claimed slot so this test is self-contained.
+    let base: u64 = 365 * 24 * 3_600 * 1_000_000_000;
+    assert!(
+        try_claim_nat_reverse_key_warn(base),
+        "first claim past the window must win"
+    );
+    assert!(
+        !try_claim_nat_reverse_key_warn(base + 1_000_000_000),
+        "claim inside the 60s window must lose"
+    );
+    assert!(
+        !try_claim_nat_reverse_key_warn(base + 59_999_999_999),
+        "claim at window edge - 1ns must lose"
+    );
+    assert!(
+        try_claim_nat_reverse_key_warn(base + 60_000_000_000),
+        "claim at the window boundary must win"
+    );
+}

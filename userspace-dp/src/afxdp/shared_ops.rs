@@ -1,4 +1,65 @@
 use super::*;
+use std::sync::atomic::AtomicU64;
+
+/// #1760 W3': cumulative count of shared-map NAT reverse-key displacement
+/// events — a `publish_shared_session` insert into `shared_nat_sessions`
+/// (reverse-wire or reverse-canonical slot) displaced an entry whose
+/// FORWARD key differs from the one being published. Two distinct forward
+/// NAT sessions mapping onto one reply tuple K is the #1758/#1760 latent
+/// 1:N collision. This is the single choke point every transit forward
+/// NAT session passes through — normal installs, `MissingNeighborSeed`
+/// installs (which are NOT replicated to sibling workers and therefore
+/// invisible to the per-worker `nat_reverse_key_collisions` counter),
+/// promotes, HA sync imports, and tunnel-local installs — so zero here is
+/// a much stronger "no collision while this process was up" signal than
+/// the per-worker counter alone. Same-session republish (promote, RG
+/// migration, HA re-sync) displaces an entry with the SAME forward key
+/// and is not counted; nor is the entry's own canonical/wire alias.
+/// Event count, not a pair census: a standing collision against a live
+/// session whose K was already removed (post-winner-expiry) is not
+/// observable at this choke point — see
+/// docs/research/1760-reverse-key-v2/plan.md §2.3. Surfaced as
+/// `xpf_userspace_session_nat_reverse_key_shared_displacements_total`.
+pub(crate) static NAT_REVERSE_KEY_SHARED_DISPLACEMENTS: AtomicU64 = AtomicU64::new(0);
+
+/// #1760 W3' detection helper: count a shared-map displacement when the
+/// displaced entry belongs to a DIFFERENT forward session. Shared by the
+/// reverse-wire and reverse-canonical insert sites in
+/// `publish_shared_session`.
+#[inline]
+fn record_shared_nat_displacement(
+    displaced: Option<&SyncedSessionEntry>,
+    entry: &SyncedSessionEntry,
+) {
+    if matches!(displaced, Some(existing) if existing.key != entry.key) {
+        NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// #1760 W1: last-warn timestamp for the journald reverse-key-collision
+/// warn. Process-global so the ≤1 line/min bound holds regardless of
+/// worker count (AGY r1 F4).
+static NAT_REVERSE_KEY_WARN_LAST_NS: AtomicU64 = AtomicU64::new(0);
+
+/// #1760 W1: minimum interval between journald collision warns.
+const NAT_REVERSE_KEY_WARN_INTERVAL_NS: u64 = 60_000_000_000;
+
+/// #1760 W1: claim the process-global collision-warn slot. Returns true
+/// when the caller won and may emit the warn; false when inside the 60s
+/// window or another worker won the race. Same load → window-check → CAS
+/// shape as the coordinator warm-sweep throttle
+/// (`coordinator/mod.rs` `last_warm_sweep_ns`): a lost CAS means another
+/// thread claimed this slot concurrently, which is exactly the
+/// "already warned" outcome we want.
+pub(crate) fn try_claim_nat_reverse_key_warn(now_ns: u64) -> bool {
+    let last = NAT_REVERSE_KEY_WARN_LAST_NS.load(Ordering::Acquire);
+    if now_ns.saturating_sub(last) < NAT_REVERSE_KEY_WARN_INTERVAL_NS {
+        return false;
+    }
+    NAT_REVERSE_KEY_WARN_LAST_NS
+        .compare_exchange(last, now_ns, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
 
 pub(super) fn demote_shared_owner_rgs(
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
@@ -667,9 +728,9 @@ pub(super) fn publish_shared_session(
         && let Ok(mut sessions) = shared_nat_sessions.lock()
     {
         let reverse_wire = reverse_session_key(&entry.key, entry.decision.nat);
-        let previous_owner_rg = sessions
-            .insert(reverse_wire.clone(), entry.clone())
-            .map(|existing| existing.metadata.owner_rg_id);
+        let displaced = sessions.insert(reverse_wire.clone(), entry.clone());
+        record_shared_nat_displacement(displaced.as_ref(), entry);
+        let previous_owner_rg = displaced.map(|existing| existing.metadata.owner_rg_id);
         update_owner_rg_index(
             &shared_owner_rg_indexes.nat_sessions,
             &reverse_wire,
@@ -678,9 +739,9 @@ pub(super) fn publish_shared_session(
         );
         let reverse_canonical = reverse_canonical_key(&entry.key, entry.decision.nat);
         if reverse_canonical != reverse_wire {
-            let previous_owner_rg = sessions
-                .insert(reverse_canonical.clone(), entry.clone())
-                .map(|existing| existing.metadata.owner_rg_id);
+            let displaced = sessions.insert(reverse_canonical.clone(), entry.clone());
+            record_shared_nat_displacement(displaced.as_ref(), entry);
+            let previous_owner_rg = displaced.map(|existing| existing.metadata.owner_rg_id);
             update_owner_rg_index(
                 &shared_owner_rg_indexes.nat_sessions,
                 &reverse_canonical,

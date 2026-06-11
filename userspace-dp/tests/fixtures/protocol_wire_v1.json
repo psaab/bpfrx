@@ -735,6 +735,7 @@
     "last_snapshot_generation": 0,
     "max_sessions": 0,
     "nat_reverse_key_collisions": 0,
+    "nat_reverse_key_shared_displacements_total": 0,
     "neg_neigh_fast_fail_total": 0,
     "neg_neigh_keys": 0,
     "neighbor_cache_capacity": 0,
