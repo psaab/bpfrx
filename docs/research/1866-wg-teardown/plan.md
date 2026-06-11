@@ -2,10 +2,27 @@
 
 ## 1. Status
 
-DRAFT v2 — round-1 findings folded (Codex task-mq9cqldt-fmkk2t,
-AGY adversarial-review-mq9bdtem-nlsdwi, Claude SMR r1 — all three
-PLAN-NEEDS-CHANGES on v1; every required finding addressed below).
-Pending round-2 adversarial review.
+DRAFT v3 — round-2 findings folded. Round-2 verdicts on v2: Codex
+(task-mq9d5sfx via session 019eb646-e229-7b81-956e-d10d9436d2e5)
+PLAN-NEEDS-CHANGES; Claude SMR r2 PLAN-NEEDS-CHANGES; AGY
+(adversarial-review-mq9d6wn8-lc0otc) PLAN-READY. Codex and Claude SMR
+INDEPENDENTLY converged on the same Major: v2's periodic sweep could
+respawn the thread Change 2b had just pruned (stale `self.forwarding`
+desired set during a defer window). v3 fix: **the periodic sweep is
+tombstone-only** — it never creates entries for ids absent from the map;
+entry creation happens exclusively at apply-time where forwarding and
+snapshot are coherent. Plus Codex's tombstone-struct precision
+(engine_ptr outside the Option) and the don't-over-prune nuance for
+Change 2b gates. Pending round-3 confirmation review.
+
+Round-2 fold summary:
+- Tombstone-only periodic respawn (Codex r2 Major / SMR r2 F7) → §5
+  Change 2 redefined.
+- `engine_ptr` moved outside the `Option` so tombstones keep identity
+  for the apply-time stale prune (Codex r2 secondary) → §5 Change 1.
+- Change 2b gates: mirror the populate gates EXACTLY — do NOT prune on
+  unparsable `wg_endpoint` or individually-bad allowed-ips (hydration
+  keeps those rows) (Codex r2 Q4) → §5 Change 2b.
 
 Round-1 fold summary:
 - Tombstone backoff (Codex 1 / AGY 1 / SMR F4) → §5 Change 1 redesigned.
@@ -174,10 +191,17 @@ tombstone that preserves the backoff stamp (Codex 1 / AGY 1):
 
 ```rust
 struct WgControlEntry {
-    /// Live (or finished-but-unswept) thread + the engine Arc address it
-    /// was spawned against. None = tombstone: no thread, entry retained
-    /// for backoff continuity.
-    thread: Option<(LocalTunnelSourceHandle, usize)>,
+    /// Live (or finished-but-unswept) thread. None = tombstone: no
+    /// thread, entry retained for backoff continuity + identity.
+    handle: Option<LocalTunnelSourceHandle>,
+    /// Engine Arc address the entry was last spawned against. Kept
+    /// OUTSIDE the Option (Codex r2) so the apply-time stale prune can
+    /// detect identity changes on tombstones too (a changed identity
+    /// removes the tombstone, deliberately resetting its backoff — a
+    /// fresh identity deserves an immediate attempt). A tombstone
+    /// respawn re-reads the CURRENT engine Arc from
+    /// `forwarding.wg_engines` and re-records its ptr.
+    engine_ptr: usize,
     /// Stamped at EVERY spawn attempt (success or failure), before the
     /// outcome is known.
     last_spawn_attempt_ns: u64,
@@ -187,30 +211,42 @@ struct WgControlEntry {
 
 `spawn_wg_control_threads` (apply-time) becomes three passes, in order:
 
-1. **Finished sweep**: for entries whose `thread` is Some but
+1. **Finished sweep**: for entries whose `handle` is Some but
    `JoinHandle::is_finished()` (or join handle already taken) — join
-   (instant: thread done), set `thread = None`, keep the entry + stamp,
+   (instant: thread done), set `handle = None`, keep the entry + stamp,
    log per Change 3.
 2. **Stale prune** (existing semantics): entries whose id is absent from
    the desired set, or whose recorded engine ptr differs — stop+join the
    thread if live, then **remove the entry entirely** (tombstones for
    vanished endpoints are removed here too, so the map cannot grow
    unboundedly).
-3. **Spawn pass**: for desired endpoints whose entry is missing or a
-   tombstone — respect the backoff (`now - last_spawn_attempt_ns >= 3s`;
-   a missing entry has no backoff and spawns immediately), stamp, spawn
-   via the factored `spawn_one_wg_control_thread(&mut self, id)`.
+3. **Spawn pass** (apply-time only): for desired endpoints whose entry
+   is missing or a tombstone — respect the backoff
+   (`now - last_spawn_attempt_ns >= 3s`; a missing entry has no backoff
+   and spawns immediately), stamp, spawn via the factored
+   `spawn_one_wg_control_thread(&mut self, id)`. Missing-entry creation
+   exists ONLY here (see Change 2: the periodic sweep is
+   tombstone-only).
 
 Backoff applies to apply-time respawns as well (SMR F4: applies arrive in
 bursts during route churn; a persistently-failing bind must not attempt
 per-FIB-bump).
 
-### Change 2 (fixes D2) — periodic self-heal, correctly gated (Option 2)
+### Change 2 (fixes D2) — periodic self-heal, tombstone-only and correctly gated (Option 2)
 
-`Coordinator::reconcile_wg_control_liveness(&mut self)` = passes 1+3 of
-Change 1 (finished sweep + backoff-gated spawn; the stale prune stays
-apply-time-only because desired-set changes only arrive with snapshots).
-Call site is the SERVER layer, NOT inside `refresh_bindings`:
+`Coordinator::reconcile_wg_control_liveness(&mut self)` = the finished
+sweep (pass 1) + a **TOMBSTONE-ONLY respawn**: it retries (backoff-gated,
+≤1 spawn per invocation) ONLY entries that already EXIST in the map as
+tombstones, spawning against the current `forwarding.wg_engines` Arc. It
+**never creates entries for ids absent from the map** (Codex r2 Major /
+SMR r2 F7): entry creation for new/changed endpoints belongs exclusively
+to apply-time `spawn_wg_control_threads`, where the desired set and
+`self.forwarding` are coherent by construction. This is what makes
+Change 2b final until the next apply — without it, the sweep would
+recompute a desired set from the STALE `self.forwarding` during a defer
+window and resurrect the thread Change 2b just pruned. The stale prune
+also stays apply-time-only (desired-set changes only arrive with
+snapshots). Call site is the SERVER layer, NOT inside `refresh_bindings`:
 
 ```rust
 // server/helpers.rs refresh_status():
@@ -248,8 +284,12 @@ guard.afxdp.prune_wg_control_threads_for_snapshot(&snapshot);
 
 which stops+joins+removes entries whose endpoint id is absent from (or no
 longer a hydratable WG endpoint in) `snapshot.tunnel_endpoints` —
-mirroring the populate gates (mode == "wireguard", id != 0, ifindex > 0,
-listen_port != 0, decodable keys). It does NOT touch `self.forwarding`,
+mirroring the populate gates EXACTLY (mode == "wireguard", id != 0,
+ifindex > 0, listen_port != 0, decodable privkey/pubkey hex). It must NOT
+over-prune on rows hydration would keep: an unparsable `wg_endpoint`
+(hydrates to `None` — responder-only) or individually-bad allowed-ips
+CIDRs (skipped per-entry) do NOT disqualify the row (Codex r2 Q4). It
+does NOT touch `self.forwarding`,
 does NOT spawn (bring-up stays deferred — workers AND new WG threads wait
 for the real reconcile), and does NOT mutate any worker-visible state —
 so the reason defer_workers exists (no worker churn while RETH MAC is
@@ -305,6 +345,10 @@ a clean slate is correct there).
 - **Status-path latency**: the sweep is `is_finished()`-only (no
   syscalls); joins only on finished threads (instant); ≤1 spawn attempt
   per invocation, 3s-backoff-gated per id.
+- **Tombstone-only sweep**: the periodic sweep may only retry ids the
+  apply path already legitimated (existing tombstones); it never
+  creates entries from `self.forwarding`'s desired set — that set can be
+  STALE during a defer window (Codex r2 / SMR r2 F7).
 - **wgN TUN ownership**: helper never deletes the TUN (Go owns it; AGY
   Hazard B reload stability). Unchanged.
 - **Engine Arc reuse / TAI64N**: respawn binds the CURRENT engine Arc from
@@ -352,6 +396,11 @@ session):
    thread running, apply a defer_workers snapshot WITHOUT the endpoint →
    thread stopped+joined, port released, forwarding untouched, nothing
    spawned.
+6b. **No sweep resurrection after defer-prune (F7 regression)**: after
+   the Change-2b prune (entry removed, `self.forwarding` still stale
+   with the endpoint), invoke `reconcile_wg_control_liveness` repeatedly
+   → NO entry recreated, NO bind attempt, port stays released until the
+   next apply.
 7. Existing wg/coordinator suites green; reconcile_peers_snapshot and
    worker_queue concurrent_recovery are known ledger flakes —
    standalone-prove before attributing; `install_session_serializes`
@@ -399,27 +448,25 @@ preferred; loss cluster only under
   remains a hard error per attempt — durable 3s backoff retries it
   indefinitely; all three reviewers endorsed no give-up cap).
 
-## 11. Open questions for adversarial review (each may justify PLAN-KILL)
+## 11. Open questions for adversarial review (round 3 — confirmation pass; each may still justify PLAN-KILL)
 
-1. **Tick placement (round-2 check)**: with the stop-gate at
-   `refresh_status`, the per-response cadence bound (≤1 spawn/invocation,
-   3s/id backoff, `is_finished()`-only sweep), is any latency or
-   reentrancy hazard left on the control-socket thread?
-2. **Residual-unknown stance** (§4c): with D4 closed, the two stale
-   republisher suspects named, and transition logging at both boundaries,
-   is harden+instrument now sufficient, or does any reviewer still see a
-   concrete path the plan neither fixes nor would catch in one capture?
-3. **Tombstone lifecycle**: tombstones are removed when the endpoint
-   leaves the desired set (pass 2). Any leak/growth path left (e.g.
-   endpoint flapping in/out under backoff)?
-4. **Change 2b gates**: is mirroring the populate gates (mode/id/ifindex/
-   port/keys) in `prune_wg_control_threads_for_snapshot` the right
-   desired-set definition for the defer branch, or should it prune ONLY
-   on absent id (narrower) to avoid killing a thread for a transiently
-   malformed snapshot row?
-5. **Backoff constant**: 3s per id — too aggressive/lax for the
-   EADDRINUSE-against-kernel-wgX misconfiguration case (one exception
-   entry per 3s, forever)?
-6. **Sequencing vs #1868**: rebase plan confirmed against its
-   `(UdpSocket, bool)` bind signature + `wg_send_to`; anything else in
-   #1868's final form the factored spawn helper must preserve?
+Round-2 dispositions: Q1 resolved by the tombstone-only sweep (Codex r2
+required it; AGY found no latency/reentrancy hazard); Q2 accepted by all
+three; Q3 cleared (map bounded by configured endpoints; flap removal
+resets backoff — acceptable, not a leak); Q4 settled as mirror-populate-
+gates-exactly with the no-over-prune nuance; Q5 endorsed 3s/no-cap by all
+three; Q6 confirmed (socket_is_v6 threads through the spawned closure
+unchanged).
+
+Round-3 confirmation questions:
+
+1. **F7 fix completeness**: with the tombstone-only sweep, is there ANY
+   remaining sequence (defer windows, stop/rebind handlers, rapid
+   add/remove/add) where a thread is created against a desired set that
+   does not reflect the latest applied snapshot?
+2. **Tombstone identity semantics**: pass-2 removes a tombstone whose
+   recorded `engine_ptr` differs from the current engine (identity
+   changed), resetting its backoff so the fresh identity spawns
+   immediately. Any abuse path (e.g. identity-flapping config) where
+   this defeats the backoff in a way that matters?
+3. **Anything else** that blocks PLAN-READY?
