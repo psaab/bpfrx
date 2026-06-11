@@ -39,7 +39,11 @@ pub(crate) static NAT_REVERSE_KEY_SHARED_DISPLACEMENTS: AtomicU64 = AtomicU64::n
 /// relation is exactly "one key is the other's forward-wire form".
 /// Genuine colliding sessions keep counting: their CANONICAL keys are
 /// not each other's wire forms (each wire form is the shared external
-/// tuple, not the peer's internal tuple). Known accepted under-count:
+/// tuple, not the peer's internal tuple), and NAT-vs-different-NAT or
+/// NAT-vs-no-NAT pairs whose keys ARE wire-related still count because
+/// the alias test also requires an identical NatDecision (the HA alias
+/// carries the same session value as its canonical form).
+/// Known accepted under-count:
 /// on a standby, a genuine collision involving a wire-FORM synced entry
 /// is excluded by this test — the session's OWNER node still counts the
 /// canonical-vs-canonical displacement in its own shared map.
@@ -55,8 +59,15 @@ fn record_shared_nat_displacement(
         return;
     }
     // Wire-alias relation: same logical session under its translated key.
-    if existing.key == forward_wire_key(&entry.key, entry.decision.nat)
-        || entry.key == forward_wire_key(&existing.key, existing.decision.nat)
+    // The HA alias is queued with the SAME session value as its canonical
+    // form, so its NatDecision is identical — requiring NAT equality keeps
+    // genuine NAT-vs-different-NAT (and NAT-vs-no-NAT direct) collisions
+    // counted even though their keys are also wire-related (Codex code-r2:
+    // DNAT client->VIP rewritten to client->backend vs a direct no-NAT
+    // client->backend flow is a REAL collision and must count).
+    if existing.decision.nat == entry.decision.nat
+        && (existing.key == forward_wire_key(&entry.key, entry.decision.nat)
+            || entry.key == forward_wire_key(&existing.key, existing.decision.nat))
     {
         return;
     }

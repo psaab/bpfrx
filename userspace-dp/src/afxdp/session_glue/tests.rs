@@ -4230,6 +4230,58 @@ fn shared_nat_displacement_counter_counts_collisions_not_republishes() {
         before_alias,
         "canonical<->wire-alias churn of one logical session must not count"
     );
+
+    // Codex code-r2: DNAT-vs-direct is a GENUINE collision whose keys are
+    // wire-related — a DNAT flow client:p -> VIP:443 rewritten to
+    // backend:443, plus a direct no-NAT flow client:p -> backend:443.
+    // Both derive the same reverse key K; the alias exclusion must NOT
+    // swallow it (their NatDecisions differ).
+    let backend = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 90));
+    let client = IpAddr::V4(Ipv4Addr::new(10, 0, 61, 120));
+    let dnat = SyncedSessionEntry {
+        key: SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: client,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 91)), // VIP
+            src_port: 40_003,
+            dst_port: 443,
+        },
+        decision: SessionDecision {
+            resolution: test_resolution(),
+            nat: NatDecision {
+                rewrite_dst: Some(backend),
+                ..NatDecision::default()
+            },
+        },
+        metadata: test_metadata(),
+        origin: SessionOrigin::ForwardFlow,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x02,
+    };
+    let mut direct = dnat.clone();
+    direct.key.dst_ip = backend;
+    direct.decision.nat = NatDecision::default();
+    assert_eq!(
+        reverse_session_key(&dnat.key, dnat.decision.nat),
+        reverse_session_key(&direct.key, direct.decision.nat),
+        "DNAT and direct flows must derive the same reverse key K"
+    );
+    let dnat_map = Arc::new(Mutex::new(FastMap::default()));
+    let before_dnat = NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed);
+    for entry in [&dnat, &direct] {
+        publish_shared_session(
+            &shared_sessions,
+            &dnat_map,
+            &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
+            entry,
+        );
+    }
+    assert!(
+        NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed) > before_dnat,
+        "DNAT-vs-direct genuine collision must count despite wire-related keys"
+    );
 }
 
 
