@@ -5127,3 +5127,7 @@ top.
     cosfmt_test.go}, pkg/api/metrics*.go, test/incus/apply-cos-config.sh,
     docs/{cos-traffic-shaping.md, fairness-regimes.md, config-schema.md,
     pr/1746-equal-flow-target-policy/*, refactoring-audit-current.txt}
+
+- **Timestamp**: 2026-06-11T05:00Z
+  **Action**: "#1866 WG teardown lifecycle implemented per converged research plan v5 (docs/research/1866-wg-teardown/plan.md on research/1866-wg-teardown, 3-way PLAN-READY after 5 hostile rounds): WgControlEntry tombstones with durable 3s backoff + attachment recording; three-pass spawn_wg_control_threads (finished sweep / attachment-aware stale prune / backoff-gated spawn); tombstone-only snapshot-coherent self-heal from refresh_status under should_run_afxdp; defer-branch prune_wg_control_threads_for_snapshot (D4); shared hydrate_wg_identity; dual-boundary WG endpoint-set transition logging (Rust apply + Go publish at all four apply_snapshot sites); 8 Rust + 2 Go regression tests. Gates: cargo build --release clean; FULL cargo test --release 1963/0; debug wg 133/0; go test ./... 36 ok exit 0."
+  **File(s)**: userspace-dp/src/afxdp/coordinator/{mod.rs,tests.rs,wg_control.rs,reconcile/snapshot.rs}, userspace-dp/src/afxdp/forwarding_build/{mod.rs,tunnels.rs}, userspace-dp/src/afxdp/types/runtime.rs, userspace-dp/src/server/{helpers.rs,handlers/snapshot.rs}, pkg/dataplane/userspace/{tunnels.go,tunnels_test.go,manager.go,process.go}, docs/pr/1866-wg-teardown/
