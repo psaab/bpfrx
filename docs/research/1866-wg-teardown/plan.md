@@ -2,7 +2,31 @@
 
 ## 1. Status
 
-DRAFT v4 — round-3 findings folded. Round-3 verdicts on v3: AGY
+DRAFT v5 — round-4 findings folded. Round-4 verdicts on v4: AGY
+(adversarial-review-mq9e5iw5-ei11nc) PLAN-READY; Claude SMR r4
+PLAN-READY; Codex (session 019eb65f-9c7e-7cf2-a3dd-682ddb73357b)
+PLAN-NEEDS-CHANGES with one residual: the coherent-respawn tuple covered
+WG CRYPTO identity only and omitted the **TUN attachment**
+(interface/linux name + ifindex). Counterexample: rename `wg0`→`wg1`
+keeping id 1 and the same crypto identity, under a defer window with an
+existing tombstone — the sweep would respawn a thread attached to the
+STALE TUN name, and the later reconcile would NOT repair it because
+`wg_identity_unchanged` ignores ifindex/name (engine Arc reused ⇒ ptr
+match ⇒ thread kept). Codex's trace also exposes that the second half is
+a PRE-EXISTING master gap (recorded as new defect **D5**): the
+apply-time stale prune keys on engine ptr alone, so an interface rename
+with unchanged crypto identity leaves the LIVE thread attached to the
+old TUN even on the ordinary non-defer path. v5 fix: record the spawn
+ATTACHMENT (logical_ifindex + tunnel name) in the entry, include
+attachment in both the apply-time stale condition and the sweep's
+coherence tuple (§5 Changes 1+2); regression tests 6d/6e. Codex r4:
+"No other blocker found." Pending round-5 confirmation.
+
+Round-4 fold summary:
+- Attachment-aware stale prune + coherence tuple (Codex r4) → §4b D5,
+  §5 Changes 1+2, §9 tests 6d/6e.
+
+Earlier history: round-3 findings folded in v4. Round-3 verdicts on v3: AGY
 (adversarial-review-mq9dmbjv-y7mk05) PLAN-READY (re-derived the F7
 sequence and confirmed the v3 fix); Claude SMR r3 PLAN-READY; Codex
 (session 019eb656-4bd7-7063-850b-c29b80e8abf3) PLAN-NEEDS-CHANGES with
@@ -152,6 +176,16 @@ AGY in round 1 with quoted lines):
   produce no logs (bind/TUN failures go only to the bounded exception
   ring). This is why the live triage could only say the snapshot
   "appears to retain" the endpoint.
+- **D5 — attachment changes are invisible to the desired-set diff
+  (Codex r4; pre-existing on master).** The stale check in
+  `spawn_wg_control_threads` compares engine Arc pointers only, and
+  `wg_identity_unchanged` (forwarding_build/wg.rs:87) deliberately
+  ignores `logical_ifindex`/interface name — so renaming the tunnel
+  interface (same endpoint id, same crypto identity) reuses the engine
+  Arc AND keeps the live control thread attached to the OLD TUN name
+  (mod.rs:537 resolves the name at spawn time only). Traffic on the new
+  wgN TUN never reaches the thread. Fixed here because the same hole
+  would otherwise also defeat the new sweep's coherence check.
 - **D4 — defer-workers reconciliation gap (AGY 2).** On a NOT-same-plan
   apply with `defer_workers == true`, `handlers/snapshot.rs:109-115`
   stores the snapshot but skips `reconcile_status_bindings`, so the
@@ -214,6 +248,14 @@ struct WgControlEntry {
     /// respawn re-reads the CURRENT engine Arc from
     /// `forwarding.wg_engines` and re-records its ptr.
     engine_ptr: usize,
+    /// TUN attachment the thread was spawned with (Codex r4 / D5):
+    /// the logical ifindex + resolved tunnel name captured at spawn.
+    /// The apply-time stale condition is now
+    /// `engine ptr differs OR attachment differs` — an interface
+    /// rename with unchanged crypto identity stops+joins the old
+    /// thread and respawns attached to the new TUN.
+    spawned_ifindex: i32,
+    spawned_tunnel_name: String,
     /// Stamped at EVERY spawn attempt (success or failure), before the
     /// outcome is known.
     last_spawn_attempt_ns: u64,
@@ -227,11 +269,13 @@ struct WgControlEntry {
    `JoinHandle::is_finished()` (or join handle already taken) — join
    (instant: thread done), set `handle = None`, keep the entry + stamp,
    log per Change 3.
-2. **Stale prune** (existing semantics): entries whose id is absent from
-   the desired set, or whose recorded engine ptr differs — stop+join the
-   thread if live, then **remove the entry entirely** (tombstones for
-   vanished endpoints are removed here too, so the map cannot grow
-   unboundedly).
+2. **Stale prune** (extended semantics): entries whose id is absent from
+   the desired set, whose recorded engine ptr differs, **or whose
+   recorded attachment (`spawned_ifindex`/`spawned_tunnel_name`) differs
+   from the current forwarding endpoint's `logical_ifindex`/resolved
+   name (D5)** — stop+join the thread if live, then **remove the entry
+   entirely** (tombstones for vanished/changed endpoints are removed
+   here too, so the map cannot grow unboundedly).
 3. **Spawn pass** (apply-time only): for desired endpoints whose entry
    is missing or a tombstone — respect the backoff
    (`now - last_spawn_attempt_ns >= 3s`; a missing entry has no backoff
@@ -256,11 +300,18 @@ tombstones, and only when BOTH hold (Codex r3 blocking finding):
 2. the latest STORED snapshot (`state.snapshot`, passed in by the
    server) contains a hydratable WG row for that id whose identity tuple
    (listen_port, decoded local privkey, decoded peer pubkey,
-   allowed-ips, endpoint, keepalive) is IDENTICAL to the forwarding
-   endpoint it would spawn against. `None`/missing/identity-mismatched
+   allowed-ips, endpoint, keepalive) **AND attachment (interface /
+   linux_name / ifindex — Codex r4)** are IDENTICAL to the forwarding
+   endpoint + TUN name it would spawn against. `None`/missing/mismatched
    row ⇒ skip silently (the tombstone stays; the deferred/next apply
    reconciles it coherently). The comparison decodes two 32-byte hex
    keys only when an eligible tombstone exists — rare, off hot path.
+   Implementation note: factor a single
+   `hydrate_wg_identity(row) -> Option<WgIdentity>` helper shared by
+   `populate_tunnel_endpoints`/`populate_wg_engines` and this check, so
+   the sweep's notion of "identical identity" (including the
+   skip-invalid-allowed-ips and endpoint-parse semantics) can never
+   drift from the hydration path's.
 
 This closes the defer-window identity-change counterexample (S0 spawns
 identity A, thread dies → tombstone; S1 NOT-same-plan + defer_workers
@@ -439,6 +490,16 @@ session):
    reconciling forwarding; invoke the sweep past backoff with that
    snapshot → NO respawn (identity mismatch). After a real
    refresh/reconcile with the B snapshot, identity B spawns coherently.
+6d. **No stale-attachment respawn under defer (Codex r4 regression)**:
+   id 1, same crypto identity, tombstone present; store a defer_workers
+   snapshot renaming the interface (wg0→wg1, same id/identity) WITHOUT
+   reconciling forwarding; sweep past backoff → NO respawn (attachment
+   mismatch).
+6e. **Apply-time rename restarts the thread (D5 regression,
+   pre-existing master gap)**: live thread on wg0 (id 1, identity A);
+   refresh with a snapshot renaming to wg1 (same id, same identity) →
+   old thread stopped+joined, fresh thread spawned with the wg1
+   attachment (assert via the recorded `spawned_tunnel_name`).
 7. Existing wg/coordinator suites green; reconcile_peers_snapshot and
    worker_queue concurrent_recovery are known ledger flakes —
    standalone-prove before attributing; `install_session_serializes`
@@ -486,7 +547,7 @@ preferred; loss cluster only under
   remains a hard error per attempt — durable 3s backoff retries it
   indefinitely; all three reviewers endorsed no give-up cap).
 
-## 11. Open questions for adversarial review (round 4 — confirmation pass; each may still justify PLAN-KILL)
+## 11. Open questions for adversarial review (round 5 — confirmation pass; each may still justify PLAN-KILL)
 
 Round-2 dispositions: Q1 resolved by the tombstone-only sweep (Codex r2
 required it; AGY found no latency/reentrancy hazard); Q2 accepted by all
@@ -500,18 +561,21 @@ Round-3 dispositions: AGY + Claude SMR PLAN-READY on v3; Codex's
 residual same-id-identity-change-under-defer counterexample is closed in
 v4 by the snapshot-coherent respawn condition (§5 Change 2) + test 6c.
 
-Round-4 confirmation questions:
+Round-4 dispositions: AGY + Claude SMR PLAN-READY on v4; Codex r4's
+attachment omission is closed in v5 by recording the spawn attachment in
+the entry, extending the apply-time stale condition (also fixing the
+pre-existing D5 rename gap on master), and adding attachment to the
+sweep's coherence tuple; tests 6d/6e pin both.
 
-1. **Snapshot-coherence condition**: is the identity comparison
-   (snapshot row vs forwarding endpoint, both available under the same
-   guard) sound and complete — any field omitted whose divergence would
-   matter, or any case where `state.snapshot` is not actually the
-   latest-accepted snapshot when the sweep runs?
-2. **Remaining incoherent-spawn sequence**: with tombstone-only +
-   snapshot-coherent respawn, can anyone still construct a sequence
-   (defer windows, stop/rebind, rapid add/remove/add, helper restart
-   with persisted state) where a thread runs an identity the latest
-   accepted snapshot does not describe — beyond the pre-existing,
-   bounded "live thread keeps old identity until deferred bring-up"
-   behavior that master already has?
+Round-5 confirmation questions:
+
+1. **Attachment semantics**: the stale condition now keys on
+   (engine_ptr, spawned_ifindex, spawned_tunnel_name) and the coherence
+   tuple adds interface/linux_name/ifindex. Sound and complete — or is
+   there a remaining spawn-parameter (anything else captured by the
+   `wg_control_loop` closure: listen_port and peer endpoint are already
+   in the crypto-identity tuple) whose divergence escapes both checks?
+2. **Remaining incoherent-spawn sequence**: any sequence left where a
+   thread runs parameters the latest accepted snapshot does not
+   describe?
 3. **Anything else** that blocks PLAN-READY?

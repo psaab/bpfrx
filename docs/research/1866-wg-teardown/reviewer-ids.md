@@ -14,3 +14,8 @@
 - Codex: task-mq9dy08i-bgg0r2 (session 019eb656-4bd7-7063-850b-c29b80e8abf3) — PLAN-NEEDS-CHANGES (residual: same-id identity-change tombstone under defer window; "nothing else blocks PLAN-READY")
 - AGY: adversarial-review-mq9dmbjv-y7mk05 — PLAN-READY (re-derived F7, confirmed v3 fix)
 - Claude SMR: docs/research/1866-wg-teardown/claude-smr-plan-r3.md — PLAN-READY
+
+## Plan round 4 (target: plan.md v4 @ 677566943)
+- Codex: session 019eb65f-9c7e-7cf2-a3dd-682ddb73357b — PLAN-NEEDS-CHANGES (residual: coherence tuple omits TUN attachment; exposes pre-existing D5 rename gap; "no other blocker")
+- AGY: adversarial-review-mq9e5iw5-ei11nc — PLAN-READY
+- Claude SMR: docs/research/1866-wg-teardown/claude-smr-plan-r4.md — PLAN-READY
