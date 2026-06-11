@@ -344,6 +344,7 @@ func (m *Manager) syncSnapshotLocked() error {
 	// caches AFTER successful publish on the deferred-publish
 	// path too. Compile() defers when XSK is starting up; this
 	// is where the snapshot actually lands in userspace-dp.
+	m.logWgEndpointSetTransitionLocked(&publishSnap, "deferred-sync")
 	m.rebuildNeighborIndex()
 	m.rebuildMonitoredIfindexes()
 	m.publishedSnapshot = m.lastSnapshot.Generation

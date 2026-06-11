@@ -71,6 +71,24 @@ pub(crate) use engine::{
 };
 pub(crate) use scratch::WgWorkerScratch;
 
+/// Canonicalize a WG peer endpoint address: unmap a V4-MAPPED IPv6
+/// (`::ffff:a.b.c.d`) to its canonical V4 form so overhead math
+/// (v4 vs v6 outer), logging, and endpoint comparisons all see the
+/// LOGICAL family. Both the learned-endpoint path (dual-stack
+/// `recv_from` reports v4 peers mapped) and the configured-endpoint
+/// hydration (an operator may write the mapped literal) must call
+/// this; the wire-side mirror is `wg_control::wg_send_to`, which
+/// re-maps v4 targets iff the bound socket is AF_INET6 (#1736 S2b,
+/// Codex r1 finding 1).
+pub(crate) fn canonicalize_endpoint(addr: std::net::SocketAddr) -> std::net::SocketAddr {
+    if let std::net::SocketAddr::V6(v6) = addr {
+        if let Some(v4) = v6.ip().to_ipv4_mapped() {
+            return std::net::SocketAddr::new(std::net::IpAddr::V4(v4), v6.port());
+        }
+    }
+    addr
+}
+
 /// X25519 public/private key length (bytes).
 pub(crate) const WG_KEY_LEN: usize = 32;
 

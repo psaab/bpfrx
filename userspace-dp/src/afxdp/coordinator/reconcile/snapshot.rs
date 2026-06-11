@@ -50,6 +50,13 @@ pub(super) fn apply_snapshot(
         fib_generation: snapshot.fib_generation,
     };
     coord.policy_counters.reconcile_rules(&snapshot.policies);
+    // #1866 D3: WG endpoint-set transition log at the reconcile apply
+    // boundary (mirrors refresh_runtime_snapshot).
+    super::super::log_wg_endpoint_set_transition(
+        "reconcile",
+        &coord.forwarding,
+        &new_forwarding,
+    );
     coord.forwarding = new_forwarding;
     coord.shared_validation.store(Arc::new(coord.validation));
     coord

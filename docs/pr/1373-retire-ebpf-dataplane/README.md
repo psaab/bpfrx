@@ -250,6 +250,7 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
 
 | File | Current blocker |
 |---|---|
+| `cmd/shimverify/main.go` | #1864 build-time verifier gate: thin wrapper over `dataplane.VerifyUserspaceShimObject` (verify-only kernel-verifier load; no production load path). Deliberate, not retirement debt. |
 | `cmd/xpfd/main.go` | Backend selection, cleanup, and backend registration still cross the root package. |
 | `pkg/api/api.go` | Shared REST helpers still reference legacy dataplane counters and types (#1540 split entry: `apiRuntimeDataPlane` interface, `applyResult` adapter). |
 | `pkg/api/metrics.go` | Prometheus telemetry still reads legacy counters and metadata. |

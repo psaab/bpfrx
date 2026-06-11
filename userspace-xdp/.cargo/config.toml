@@ -2,7 +2,11 @@
 target = "bpfel-unknown-none"
 
 [target.bpfel-unknown-none]
-linker = "/home/ps/.cargo/bin/bpf-linker"
+# PATH-resolved (#1864): build-userspace-xdp.sh prepends ~/.cargo/bin
+# and version-checks this exact binary against its pin before building.
+# Do not hardcode an absolute path here — the script's check and the
+# binary cargo executes must be the same file.
+linker = "bpf-linker"
 
 [unstable]
 build-std = ["core"]

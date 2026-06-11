@@ -29,6 +29,7 @@ const (
 )
 
 var legacyDataplaneImportAllowlist = map[string]string{
+	"cmd/shimverify/main.go":                   "#1864 build-time verifier gate: thin wrapper over dataplane.VerifyUserspaceShimObject (verify-only, no production load path)",
 	"cmd/xpfd/main.go":                         "cleanup entry point (backend registration removed in #1527)",
 	"pkg/api/api.go":                           "shared REST helpers still reference legacy dataplane counters and types (#1540 split entry: apiRuntimeDataPlane interface, applyResult adapter)",
 	"pkg/api/metrics.go":                       "Prometheus telemetry still reads legacy counters and metadata",
