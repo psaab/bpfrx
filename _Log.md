@@ -5149,3 +5149,7 @@ top.
 - **Timestamp**: 2026-06-11
   **Action**: #1865 engineer — commit 2: wg_tunnels wire rows (WgTunnelStatus) + coordinator status accessor + helpers populate + wire pins
   **File(s)**: userspace-dp/src/protocol/{control.rs,tests.rs}, userspace-dp/src/afxdp/coordinator/status.rs, userspace-dp/src/server/{helpers.rs,lifecycle.rs}
+
+- **Timestamp**: 2026-06-11
+  **Action**: #1865 engineer — commit 3: Go WgTunnelStatus DTO mirror + cross-language wire pins (1..35 counter ladder)
+  **File(s)**: pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/wg_status_test.go
