@@ -13,3 +13,20 @@
 
 ## Code round 2 (head 65a84eecc — Codex F1+F2 folded)
 - pending
+
+## Code round 2 (head 832514fdc)
+- Codex: session 019eb8ee-30ea-7851-bd4c-e52d1c2a600d — NEEDS-CHANGES
+  (ONLY trailing whitespace in the copied round-1 review-record .md
+  files; both code folds verified correct; residual note: no direct
+  Rust unit test for the interface_label fallback — accepted as a
+  coverage gap, the fallback is exercised by compile + the live
+  name-resolution evidence) — codex-code-r2.md
+- AGY: adversarial-review-mqa3r7h5-ajp16u — MERGE-READY (deltas safe;
+  interface_label non-secret in Debug) — agy-code-r2.md
+- Claude SMR: re-attest MERGE-READY (delta audit: interface_label is
+  an interface-name string, Debug-safe; fallback tier ordering
+  ifindex_to_name first preserves today's primary path; wording pin
+  updated; whitespace fix is docs-only)
+
+## Code round 3 (whitespace fix)
+- pending Codex re-attest

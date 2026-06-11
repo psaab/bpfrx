@@ -48,13 +48,13 @@ poll 15: - task-mqa32z7a-vrz9qs | completed | rescue | Codex Task
 **Verdict: NEEDS-CHANGES**
 
 **Findings**
-1. **Plan-required tunnel name fallback is not implemented.**  
-   Plan requires `ifindex_to_name`, then snapshot row-label fallback `linux_name` else `interface`, then last resort `wg-endpoint-<id>`: [plan.md:202](/home/ps/git/bpfrx/.claude/worktrees/1865-engineer-wg/docs/pr/1865-wg-telemetry/plan.md:202).  
-   Implementation only does `ifindex_to_name` then `wg-endpoint-<id>`: [status.rs:664](/home/ps/git/bpfrx/.claude/worktrees/1865-engineer-wg/userspace-dp/src/afxdp/coordinator/status.rs:664). The endpoint type does not retain `interface`/`linux_name`: [forwarding.rs:166](/home/ps/git/bpfrx/.claude/worktrees/1865-engineer-wg/userspace-dp/src/afxdp/types/forwarding.rs:166), and tunnel build drops that row-label data: [tunnels.rs:72](/home/ps/git/bpfrx/.claude/worktrees/1865-engineer-wg/userspace-dp/src/afxdp/forwarding_build/tunnels.rs:72).  
+1. **Plan-required tunnel name fallback is not implemented.**
+   Plan requires `ifindex_to_name`, then snapshot row-label fallback `linux_name` else `interface`, then last resort `wg-endpoint-<id>`: [plan.md:202](/home/ps/git/bpfrx/.claude/worktrees/1865-engineer-wg/docs/pr/1865-wg-telemetry/plan.md:202).
+   Implementation only does `ifindex_to_name` then `wg-endpoint-<id>`: [status.rs:664](/home/ps/git/bpfrx/.claude/worktrees/1865-engineer-wg/userspace-dp/src/afxdp/coordinator/status.rs:664). The endpoint type does not retain `interface`/`linux_name`: [forwarding.rs:166](/home/ps/git/bpfrx/.claude/worktrees/1865-engineer-wg/userspace-dp/src/afxdp/types/forwarding.rs:166), and tunnel build drops that row-label data: [tunnels.rs:72](/home/ps/git/bpfrx/.claude/worktrees/1865-engineer-wg/userspace-dp/src/afxdp/forwarding_build/tunnels.rs:72).
    Result: broken bring-up cases can emit unstable `wg-endpoint-<id>` labels even when the snapshot had a stable logical interface name. That violates the converged keying invariant and weakens the #1873 mitigation.
 
-2. **CLI summary mislabels `hs_initiations_created` as sent.**  
-   The summary formatter prints `initiations sent` while passing `t.HsInitiationsCreated`: [wgfmt.go:48](/home/ps/git/bpfrx/.claude/worktrees/1865-engineer-wg/pkg/dataplane/userspace/wgfmt.go:48). The test pins the wrong wording: [wgfmt_test.go:45](/home/ps/git/bpfrx/.claude/worktrees/1865-engineer-wg/pkg/dataplane/userspace/wgfmt_test.go:45).  
+2. **CLI summary mislabels `hs_initiations_created` as sent.**
+   The summary formatter prints `initiations sent` while passing `t.HsInitiationsCreated`: [wgfmt.go:48](/home/ps/git/bpfrx/.claude/worktrees/1865-engineer-wg/pkg/dataplane/userspace/wgfmt.go:48). The test pins the wrong wording: [wgfmt_test.go:45](/home/ps/git/bpfrx/.claude/worktrees/1865-engineer-wg/pkg/dataplane/userspace/wgfmt_test.go:45).
    This is operator-visible and contradicts the plan’s distinction between “created” and send failures. Detail mode already uses “initiations created”, so summary should match.
 
 **What Checked Out**

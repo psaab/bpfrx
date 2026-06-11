@@ -125,7 +125,7 @@ Every single counter is accounted for, maps exactly to the design inventory, and
 The persistent keepalive check (`n == 0`) is correctly classified at [engine.rs:958-961](file:///home/ps/git/bpfrx/.claude/worktrees/1865-engineer-wg/userspace-dp/src/afxdp/wg/engine.rs#L958-L960):
 *   It sits **after** `session.mark_confirmed()` at [engine.rs:920](file:///home/ps/git/bpfrx/.claude/worktrees/1865-engineer-wg/userspace-dp/src/afxdp/wg/engine.rs#L920) and the replay window check `check_and_update` at [engine.rs:928](file:///home/ps/git/bpfrx/.claude/worktrees/1865-engineer-wg/userspace-dp/src/afxdp/wg/engine.rs#L928).
 *   It sits **before** AllowedIPs lookup and inner IP parsing at [engine.rs:983](file:///home/ps/git/bpfrx/.claude/worktrees/1865-engineer-wg/userspace-dp/src/afxdp/wg/engine.rs#L983).
-*   **Parity Proof:** Under both pre- and post-PR code, a zero-length transport record returns `Err(DecapError::MalformedInner)`. 
+*   **Parity Proof:** Under both pre- and post-PR code, a zero-length transport record returns `Err(DecapError::MalformedInner)`.
 *   **Out-Buffer Wipe Contract:** In the original code, the error resulted in taking the `Err(e)` branch of the inner closure, executing `out[..0].fill(0)` (a no-op since length is zero). The new code returns `Err(DecapError::MalformedInner)` immediately without calling `out[..0].fill(0)`, maintaining identical behavior with zero leakage risk.
 
 ---
