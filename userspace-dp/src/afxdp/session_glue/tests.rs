@@ -4315,6 +4315,37 @@ fn shared_nat_displacement_counter_counts_collisions_not_republishes() {
         NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed) > before_corner,
         "local same-NAT wire-related pair must count (owner-side corner)"
     );
+
+    // Codex code-r4: post-failover PROMOTE churn. At activation the new
+    // owner can promote both the canonical and its wire-alias to
+    // SharedPromote (not peer-synced) and republish each — identical
+    // NatDecision, wire-related keys, same logical session. Must not
+    // count, in either promote order.
+    let mut promoted_canonical = w3_forward_entry(130, 40_005, snat_ip);
+    promoted_canonical.origin = SessionOrigin::SharedPromote;
+    let mut promoted_alias = promoted_canonical.clone();
+    promoted_alias.key =
+        forward_wire_key(&promoted_canonical.key, promoted_canonical.decision.nat);
+    let promote_map = Arc::new(Mutex::new(FastMap::default()));
+    let before_promote = NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed);
+    for entry in [
+        &promoted_canonical, // canonical-then-alias
+        &promoted_alias,
+        &promoted_canonical, // alias-then-canonical
+    ] {
+        publish_shared_session(
+            &shared_sessions,
+            &promote_map,
+            &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
+            entry,
+        );
+    }
+    assert_eq!(
+        NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed),
+        before_promote,
+        "SharedPromote canonical<->alias churn must not count (either order)"
+    );
 }
 
 

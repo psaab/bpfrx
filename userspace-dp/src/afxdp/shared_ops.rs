@@ -67,14 +67,23 @@ fn record_shared_nat_displacement(
     //   (Codex code-r2: DNAT client->VIP=>backend vs direct
     //   client->backend is a REAL collision).
     // - Wire-related keys (forward_wire_key is idempotent).
-    // - At least one side is PEER-SYNCED: the wire-alias only ever
-    //   enters via HA session sync (`userspaceForwardWireAliasFromDeltaV4`)
-    //   — it never originates locally. Keeps the owner-side genuine
-    //   corner counted where a LOCAL flow's source already equals the
-    //   SNAT external address (identical NAT, wire-related keys, two
-    //   real sessions — Codex code-r3).
+    // - At least one side has a SYNC-DERIVED origin (peer-synced OR
+    //   `SharedPromote`): the wire-alias only ever enters via HA session
+    //   sync (`userspaceForwardWireAliasFromDeltaV4`) and, at failover,
+    //   may be locally PROMOTED to `SharedPromote`
+    //   (`maybe_promote_synced_session` republishes promoted hits —
+    //   Codex code-r4). Neither origin is ever assigned to a session
+    //   created by local packets, so the owner-side genuine corner stays
+    //   counted where a LOCAL flow's source already equals the SNAT
+    //   external address (identical NAT, wire-related keys, two real
+    //   sessions — Codex code-r3). Accepted residual (documented above):
+    //   such a pathological ext-IP-sourced local flow colliding with a
+    //   sync-derived wire-form entry is excluded.
+    let sync_derived = |origin: SessionOrigin| {
+        origin.is_peer_synced() || matches!(origin, SessionOrigin::SharedPromote)
+    };
     if existing.decision.nat == entry.decision.nat
-        && (existing.origin.is_peer_synced() || entry.origin.is_peer_synced())
+        && (sync_derived(existing.origin) || sync_derived(entry.origin))
         && (existing.key == forward_wire_key(&entry.key, entry.decision.nat)
             || entry.key == forward_wire_key(&existing.key, existing.decision.nat))
     {
