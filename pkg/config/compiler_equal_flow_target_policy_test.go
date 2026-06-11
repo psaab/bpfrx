@@ -52,6 +52,24 @@ func TestEqualFlowTargetPolicyCompileSetSyntax(t *testing.T) {
 	}
 }
 
+// Dual-AST discipline: the compiler must handle the hierarchical shape
+// (`equal-flow-target-policy mean;`) as well as the flat set form
+// covered above — same `nodeVal` path as the scheduler `priority` leaf.
+func TestEqualFlowTargetPolicyCompileHierarchical(t *testing.T) {
+	p := NewParser(`class-of-service { schedulers { ef { transmit-rate 1g exact; equal-flow-enforcement; equal-flow-target-policy mean; } } }`)
+	tree, errs := p.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+	if got := cfg.ClassOfService.Schedulers["ef"].EqualFlowTargetPolicy; got != "mean" {
+		t.Fatalf("hierarchical EqualFlowTargetPolicy = %q, want mean", got)
+	}
+}
+
 func TestEqualFlowTargetPolicyStrictRejectsUnknownValue(t *testing.T) {
 	// The schema enum validator catches bad values on the interactive
 	// set path; validateClassOfServiceStrict must also reject them so
