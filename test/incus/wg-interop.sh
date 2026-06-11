@@ -178,11 +178,22 @@ peer_arp_resolves_to_fw0() {
     [ -n "${fw0_mac}" ] && [ "${fw0_mac}" = "${peer_mac}" ]
 }
 
+# Config commits are only accepted on the RG0 primary, so mastership
+# needs BOTH the dataplane predicate (VIP + peer ARP) and RG0 config
+# primaryship (Codex delta-review F2 — VIP-RG and RG0 can sit on
+# different nodes).
+fw0_is_rg0_primary() {
+    inc exec "${FW0}" -- /usr/local/sbin/cli <<'EOF' 2>/dev/null | grep -A2 "Redundancy group: 0" | grep -qE '^node0 .*primary'
+show chassis cluster status
+quit
+EOF
+}
+
 ensure_wg_mastership() { # ensure_wg_mastership <label>
     local t
     for t in $(seq 1 12); do
-        if fw0_has_wg_vip && peer_arp_resolves_to_fw0; then
-            log "$1: WG VIP ${WG_XPF_OUTER4} on fw0 + peer ARP agrees (t=${t})"
+        if fw0_has_wg_vip && peer_arp_resolves_to_fw0 && fw0_is_rg0_primary; then
+            log "$1: WG VIP on fw0 + peer ARP agrees + RG0 primary (t=${t})"
             return 0
         fi
         sleep 2
@@ -206,11 +217,13 @@ EOF
     # Stale peer ARP can outlive a mastership change (the peer caches
     # the OLD master's MAC); flush so the recheck re-resolves.
     if inc info "${PEER}" >/dev/null 2>&1; then
-        ish "${PEER}" "ip neigh flush dev eth1 2>/dev/null || true"
+        # By ADDRESS, not dev: only containers keep the eth1 device
+        # name; VMs enumerate by PCI (Codex delta-review F3).
+        ish "${PEER}" "ip neigh flush to ${WG_XPF_OUTER4} 2>/dev/null || true"
     fi
     for t in $(seq 1 24); do
-        if fw0_has_wg_vip && peer_arp_resolves_to_fw0; then
-            log "$1: WG VIP + peer ARP restored after failback (t=${t})"
+        if fw0_has_wg_vip && peer_arp_resolves_to_fw0 && fw0_is_rg0_primary; then
+            log "$1: WG VIP + peer ARP + RG0 primaryship restored after failback (t=${t})"
             return 0
         fi
         sleep 2
@@ -225,17 +238,23 @@ EOF
 # wedge" that was really a stale binary). Compare the running
 # Software version's g<sha> suffix against this checkout's HEAD.
 check_build_identity() { # check_build_identity <label>
-    local want got
+    local want raw got
     want=$(git -C "${SCRIPT_DIR}/../.." rev-parse HEAD 2>/dev/null) || return 0
-    got=$(inc exec "${FW0}" -- /usr/local/sbin/cli <<'EOF' 2>/dev/null | sed -n 's/^Software version: .*-g\([0-9a-f]*\)$/\1/p'
+    raw=$(inc exec "${FW0}" -- /usr/local/sbin/cli <<'EOF' 2>/dev/null | grep '^Software version: ' | head -1
 show chassis cluster status
 quit
 EOF
     )
-    if [ -z "${got}" ]; then
+    if [ -z "${raw}" ]; then
         warn "$1: cannot read deployed software version (daemon mid-restart?)"
         return 1
     fi
+    # Accept an optional -dirty suffix (the build stamps git describe
+    # --dirty); a version line that EXISTS but cannot be parsed is
+    # fail-CLOSED — an unparseable foreign build must not slip past the
+    # exact guard this check was added for (Codex delta-review F1).
+    got=$(printf '%s\n' "${raw}" | sed -n 's/^Software version: .*-g\([0-9a-f]*\)\(-dirty\)\{0,1\}$/\1/p')
+    [ -n "${got}" ] || fail "$1: cannot parse deployed software version '${raw}' — refusing to run against an unidentifiable build"
     # The version suffix is an abbreviated sha; prefix-match against
     # the full HEAD sha so abbrev-length differences cannot bite.
     case "${want}" in

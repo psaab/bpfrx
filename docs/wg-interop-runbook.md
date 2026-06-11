@@ -158,8 +158,10 @@ that fw1 has neither a `wg0` netdev nor a `:51820` bind, and fails hard
    inner SOURCE against the peer's allowed-ips in the xpf config).
 4. P4a permanent blackout after ~180 s: file the S5 timer blocker with
    the capture (plan §7.2).
-5. Cluster unhealthy / VIP not on fw0: wait for preemption or
-   `request chassis cluster failover`; the WG outer endpoint follows RG0.
+5. Cluster unhealthy / VIP not on fw0: the WG outer VIP follows the
+   reth's OWN redundancy group (NOT RG0), and config commits need RG0
+   primaryship — fail back EVERY RG:
+   `request chassis cluster failover redundancy-group <id> node 0`.
 
 ## Teardown guarantees
 
