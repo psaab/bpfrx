@@ -90,8 +90,8 @@ pub(super) fn wg_control_loop(
     // v6 peers where the kernel allows it; fall back to v4 if the v6
     // bind fails. EADDRINUSE here means a host kernel wgX claims the port
     // (mutually exclusive with userspace-WG — surface a clear error).
-    let socket = match bind_wg_socket(listen_port) {
-        Ok(sock) => sock,
+    let (socket, socket_is_v6) = match bind_wg_socket(listen_port) {
+        Ok(pair) => pair,
         Err(err) => {
             record_local_tunnel_exception(
                 &recent_exceptions,
@@ -146,7 +146,10 @@ pub(super) fn wg_control_loop(
     // egress traffic.
     if let (Some(ep), Some(pk)) = (effective_endpoint, peer_pubkey) {
         last_initiate_ns = monotonic_nanos();
-        drive_initiation(&engine, &socket, &pk, ep, &mut encap_buf, &tunnel_name, &recent_exceptions);
+        drive_initiation(
+            &engine, &socket, socket_is_v6, &pk, ep, &mut encap_buf, &tunnel_name,
+            &recent_exceptions,
+        );
     }
 
     while !stop.load(Ordering::Relaxed) {
@@ -166,6 +169,7 @@ pub(super) fn wg_control_loop(
                     let authenticated = dispatch_inbound(
                         &engine,
                         &socket,
+                        socket_is_v6,
                         &mut tun,
                         &sock_buf[..len],
                         from,
@@ -200,6 +204,7 @@ pub(super) fn wg_control_loop(
                         encap_and_send(
                             &engine,
                             &socket,
+                            socket_is_v6,
                             &pk,
                             ep,
                             &tun_buf[..len],
@@ -251,7 +256,10 @@ pub(super) fn wg_control_loop(
             let allow_timer = peer_endpoint.is_some() && timer_due;
             if (requested || allow_timer) && !engine.peer_has_confirmed_session(&pk) {
                 last_initiate_ns = now;
-                drive_initiation(&engine, &socket, &pk, ep, &mut encap_buf, &tunnel_name, &recent_exceptions);
+                drive_initiation(
+                    &engine, &socket, socket_is_v6, &pk, ep, &mut encap_buf, &tunnel_name,
+                    &recent_exceptions,
+                );
                 did_work = true;
             }
         }
@@ -285,10 +293,12 @@ pub(super) fn wg_control_loop(
 /// with EINVAL — Codex r3 MAJOR), so the v6 socket is created with raw
 /// libc, the option is set, then bind() is called. On any v6 failure we
 /// fall back to a plain v4 bind so v4 peers (the common case) work.
-fn bind_wg_socket(port: u16) -> io::Result<UdpSocket> {
+/// Returns the socket plus whether it is the AF_INET6 dual-stack one
+/// (v4 send targets must then be v4-mapped — see `wg_send_to`).
+fn bind_wg_socket(port: u16) -> io::Result<(UdpSocket, bool)> {
     match bind_dual_stack_v6(port) {
-        Ok(sock) => Ok(sock),
-        Err(_) => UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port)),
+        Ok(sock) => Ok((sock, true)),
+        Err(_) => UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).map(|s| (s, false)),
     }
 }
 
@@ -364,12 +374,41 @@ fn canonicalize_endpoint(addr: SocketAddr) -> SocketAddr {
     addr
 }
 
+/// Send a WG datagram to `target`, mapping an IPv4 target to its
+/// V4-MAPPED IPv6 form when the local socket is the dual-stack
+/// AF_INET6 one. Linux REJECTS an `AF_INET` destination sockaddr on an
+/// AF_INET6 socket — found live in #1736 S2b as a silent
+/// `sendto = EINVAL` once per initiator tick (strace-proven): the
+/// configured v4 `wg_endpoint` could never be initiated to AT ALL on
+/// the dual-stack socket, while the logical/canonical V4 form is still
+/// what the MTU guard and endpoint-learning must see
+/// (`canonicalize_endpoint` above is the mirror direction). The
+/// fallback v4-bound socket sends to V4 targets natively (mapping only
+/// applies when `socket_is_v6`).
+fn wg_send_to(
+    socket: &UdpSocket,
+    socket_is_v6: bool,
+    buf: &[u8],
+    target: SocketAddr,
+) -> io::Result<usize> {
+    let wire_target = match target {
+        SocketAddr::V4(v4) if socket_is_v6 => SocketAddr::new(
+            std::net::IpAddr::V6(v4.ip().to_ipv6_mapped()),
+            v4.port(),
+        ),
+        other => other,
+    };
+    socket.send_to(buf, wire_target)
+}
+
 /// Build + send a fresh initiation toward the peer endpoint. A send
 /// error is surfaced as an exception (the next tick retries); a missing
 /// session keeps the timer armed.
+#[allow(clippy::too_many_arguments)]
 fn drive_initiation(
     engine: &crate::afxdp::wg::WgEngine,
     socket: &UdpSocket,
+    socket_is_v6: bool,
     peer_pubkey: &[u8; 32],
     endpoint: SocketAddr,
     out: &mut [u8],
@@ -378,7 +417,7 @@ fn drive_initiation(
 ) {
     if let Ok(_local_index) = engine.create_initiation(peer_pubkey, out) {
         let len = crate::afxdp::wg::WG_MSG_INIT_LEN;
-        if let Err(e) = socket.send_to(&out[..len], endpoint) {
+        if let Err(e) = wg_send_to(socket, socket_is_v6, &out[..len], endpoint) {
             record_local_tunnel_exception(
                 recent_exceptions,
                 tunnel_name,
@@ -398,6 +437,7 @@ fn drive_initiation(
 fn dispatch_inbound(
     engine: &crate::afxdp::wg::WgEngine,
     socket: &UdpSocket,
+    socket_is_v6: bool,
     tun: &mut std::fs::File,
     datagram: &[u8],
     from: SocketAddr,
@@ -414,7 +454,7 @@ fn dispatch_inbound(
             match engine.consume_initiation_create_response(datagram, response_buf) {
                 Ok((_peer_pubkey, _local_index)) => {
                     let len = crate::afxdp::wg::WG_MSG_RESPONSE_LEN;
-                    let _ = socket.send_to(&response_buf[..len], from);
+                    let _ = wg_send_to(socket, socket_is_v6, &response_buf[..len], from);
                     true
                 }
                 Err(_e) => {
@@ -473,6 +513,7 @@ fn dispatch_inbound(
 fn encap_and_send(
     engine: &crate::afxdp::wg::WgEngine,
     socket: &UdpSocket,
+    socket_is_v6: bool,
     peer_pubkey: &[u8; 32],
     endpoint: SocketAddr,
     inner_ip: &[u8],
@@ -496,7 +537,7 @@ fn encap_and_send(
     }
     match engine.try_encap(peer_pubkey, inner_ip, out) {
         Ok(outcome) => {
-            if let Err(e) = socket.send_to(&out[..outcome.len], endpoint) {
+            if let Err(e) = wg_send_to(socket, socket_is_v6, &out[..outcome.len], endpoint) {
                 record_local_tunnel_exception(
                     recent_exceptions,
                     tunnel_name,
@@ -544,6 +585,31 @@ mod tests {
         let nat64: SocketAddr =
             SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0x0a00, 0x3d67)), 51820);
         assert_eq!(canonicalize_endpoint(nat64), nat64);
+    }
+
+    /// #1736 S2b regression (strace-proven live): a v4 target on the
+    /// dual-stack AF_INET6 socket must be sent as its V4-MAPPED form —
+    /// Linux returns EINVAL for an AF_INET destination sockaddr on an
+    /// AF_INET6 socket, which silently killed every initiation toward
+    /// the configured v4 endpoint. Loopback round-trip proves the
+    /// mapped send actually lands.
+    #[test]
+    fn wg_send_to_maps_v4_target_on_v6_socket() {
+        let (rx, rx_is_v6) = bind_wg_socket(0).expect("bind rx");
+        assert!(rx_is_v6, "test host lacks dual-stack v6 sockets");
+        let rx_port = rx.local_addr().unwrap().port();
+        let (tx, tx_is_v6) = bind_wg_socket(0).expect("bind tx");
+        // The plain V4 loopback target — the failing live shape.
+        let target: SocketAddr = format!("127.0.0.1:{rx_port}").parse().unwrap();
+        wg_send_to(&tx, tx_is_v6, b"wg-test", target).expect("mapped v4 send must succeed");
+        rx.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut buf = [0u8; 16];
+        let (n, _) = rx.recv_from(&mut buf).expect("datagram must arrive");
+        assert_eq!(&buf[..n], b"wg-test");
+        // Direct unmapped send documents WHY the helper exists; accept
+        // either kernel behavior (EINVAL on Linux mainline) without
+        // asserting it so the test stays portable.
+        let _ = tx.send_to(b"raw", target);
     }
 
     /// The guard math this protects: at the v4/v6 boundary the same

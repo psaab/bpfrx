@@ -112,8 +112,16 @@ iperf_mbps() { # iperf_mbps <file>
 # (base64) and converted to hex for the xpf config (S6 owns base64).
 KEYDIR="${EVID}/keys"
 
-gen_keys() {
+gen_keys() { # gen_keys [force] — force regenerates (fresh WG identity)
     mkdir -p "${KEYDIR}"
+    if [ "${1:-}" = force ]; then
+        # Fresh keys per configure: an engine-IDENTITY change is the
+        # one teardown lever the coordinator reliably honors with
+        # stop+join (config REMOVAL leaks the thread + bound port —
+        # #1866), and fresh identities also keep the peer's TAI64N
+        # high-water out of cross-run interactions.
+        ish "${PEER}" 'rm -rf /tmp/wgkeys'
+    fi
     ish "${PEER}" 'umask 077; mkdir -p /tmp/wgkeys
         [ -s /tmp/wgkeys/peer.priv ] || wg genkey > /tmp/wgkeys/peer.priv
         [ -s /tmp/wgkeys/xpf.priv ]  || wg genkey > /tmp/wgkeys/xpf.priv
@@ -160,15 +168,38 @@ preflight() {
     ish "${FW0}" 'systemctl is-active xpfd' | grep -q active || fail "xpfd not active on fw0"
     ish "${FW1}" 'systemctl is-active xpfd' | grep -q active || fail "xpfd not active on fw1"
     wait_node0_primary 36 || fail "node0 not RG0 primary within 180s — WG VIP would black-hole"
-    # No stale wg0 on either node, no foreign claim on the listen port.
-    for n in "${FW0}" "${FW1}"; do
-        if ish "$n" 'ip link show wg0 >/dev/null 2>&1'; then
-            fail "stale wg0 netdev on $n — clean up before running"
-        fi
-        if ish "$n" "ss -uln | grep -q ':${WG_LISTEN_PORT} '"; then
-            fail "udp :${WG_LISTEN_PORT} already bound on $n"
-        fi
-    done
+    # Stale wg0 STANZA from a previous run: the config DB persists
+    # across deploys (deploy pushes xpf.conf but the daemon loads the
+    # DB first), so a prior run's stanza silently revives the engine at
+    # boot. Seen live: the revived engine handshook with the leftover
+    # peer BEFORE the harness flushed it, and the engine then held a
+    # confirmed session it never re-initiates from (S5 — no timers), so
+    # P1 timed out. Clean it with a real commit.
+    if inc exec "${FW0}" -- /usr/local/sbin/cli <<'EOF' 2>/dev/null | grep -q "tunnel"
+show configuration groups node0 interfaces wg0
+quit
+EOF
+    then
+        warn "stale wg0 stanza in active config — removing"
+        wg_stanza_delete
+    fi
+    # Stale wg0 NETDEV on fw0 is the documented S2a removal leak (the
+    # TUN outlives the stanza, pkg/routing/tunnel.go AGY M1 note +
+    # #1866) — self-clean it. On fw1 a wg0 netdev means the node0
+    # scoping failed at some point: hard fail.
+    if ish "${FW0}" 'ip link show wg0 >/dev/null 2>&1'; then
+        warn "stale wg0 netdev on fw0 (S2a removal leak) — deleting"
+        ish "${FW0}" 'ip link del wg0 2>/dev/null; true'
+    fi
+    if ish "${FW1}" 'ip link show wg0 >/dev/null 2>&1'; then
+        fail "wg0 netdev on fw1 — node0 scoping was violated; investigate before running"
+    fi
+    # A pinned listen port with no stanza is the leaked control thread
+    # (#1866); P1's restart fallback handles fw0. On fw1 it is a
+    # scoping violation: hard fail.
+    if ish "${FW1}" "ss -uln | grep -q ':${WG_LISTEN_PORT} '"; then
+        fail "udp :${WG_LISTEN_PORT} bound on fw1 — scoping violation"
+    fi
     # Free mlx1 VF headroom (informational — incus auto-assigns).
     inc query "/1.0/resources" 2>/dev/null \
         | sed -n 's/.*"current_vfs"[: ]*\([0-9]*\).*/vfs:\1/p' | head -2 >> "${SUMMARY}" || true
@@ -263,6 +294,25 @@ peer_wg_setup() { # peer_wg_setup [endpoint_spec] [allowed_ips] [mtu]
         ip link set ${WG_KERNEL_IFACE} mtu ${mtu} up"
 }
 
+# Delete the wg0 stanza in its OWN commit. A delete+set in one commit
+# nets out to "identity unchanged" when the values match a previous
+# run, and the S2a reload contract then reuses the live engine Arc —
+# keeping its confirmed session. A standalone delete-commit tears the
+# engine + control thread down so the following set-commit starts a
+# FRESH engine (deterministic initiator state for P1).
+wg_stanza_delete() {
+    fw0_cli > "${EVID}/wg-stanza-delete.txt" 2>&1 <<EOF
+configure
+delete groups node0 interfaces wg0
+commit
+exit
+quit
+EOF
+    grep -qE "commit complete" "${EVID}/wg-stanza-delete.txt" \
+        || warn "wg stanza delete commit: $(tail -2 "${EVID}/wg-stanza-delete.txt")"
+    sleep 2
+}
+
 # xpf config commit. with_endpoint=1 → initiator role (endpoint set).
 xpf_wg_commit() { # xpf_wg_commit <with_endpoint>
     local ep_line=""
@@ -303,9 +353,21 @@ wait_handshake() { # wait_handshake <deadline_s> <label>
 # P1 — configure + initiator handshake.
 configure_p1() {
     log "P1: keys + peer (responder) + xpf commit (initiator, node0-scoped)"
-    gen_keys
+    gen_keys force
     peer_wg_setup ""   # peer responder: no endpoint — must learn from xpf msg1
     wait_node0_primary 36 || fail "P1: node0 not RG0 primary — VIP would black-hole the handshake"
+    wg_stanza_delete   # remove any stale stanza (fresh-engine belt)
+    # S2a removal-leak workaround (#1866): a leaked control thread from
+    # a previous engine pins :51820 and would EADDRINUSE the fresh
+    # thread. If the port is still bound with no stanza in the config,
+    # restart xpfd for a deterministic clean slate.
+    if ish "${FW0}" "ss -uln | grep -q ':${WG_LISTEN_PORT} '"; then
+        warn "leaked WG control thread pins :${WG_LISTEN_PORT} (#1866) — restarting xpfd"
+        ish "${FW0}" 'systemctl restart xpfd'
+        sleep 15
+        ish "${FW0}" 'systemctl is-active xpfd' | grep -q active || fail "P1: xpfd restart failed"
+        wait_node0_primary 36 || fail "P1: node0 not primary after leak-recovery restart"
+    fi
     xpf_wg_commit 1
     sleep 3
     # Secondary suppression asserts (plan §4).
