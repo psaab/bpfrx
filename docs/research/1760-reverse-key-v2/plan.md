@@ -1,9 +1,10 @@
 # #1760 — NAT reverse-key 1:N collision, stage-2 revisit (post-eBPF-retirement)
 
-**Revision:** v3 (round 3 — integrates round-2 Codex PLAN-NEEDS-MAJOR + AGY
-PLAN-NEEDS-MAJOR; both r2 reviews refuted v2's "loser re-wins on refresh"
-defense and Codex found the MissingNeighborSeed coverage hole. §1.8 has the
-round-2 disposition; Path W is amended accordingly.)
+**Revision:** v4 (convergence — round-3 verdicts: Codex PLAN-NEEDS-MINOR
+(single scoped-wording finding, folded in below), AGY PLAN-READY, Claude
+SMR PLAN-READY. v4 scopes the watch claims to forward-NAT-vs-forward-NAT
+collisions and documents the LocalMiss primary-tuple-shadow as a separate
+open observation, per Codex r3.)
 **Date:** 2026-06-10
 **Branch:** `research/1760-reverse-key-v2`
 **Issue:** #1760 (stage-1 counter shipped #1762; stage-2 SHELVED 2026-06-06,
@@ -157,6 +158,25 @@ What the audit DID find:
   invisible; only a periodic live-pair audit sees that. Path W (§5) is
   built around exactly this coverage map.
 
+  **Scope (Codex r3):** everything above — and all of Path W — concerns
+  **forward-NAT-vs-forward-NAT** collisions (the #1760 domain). Codex r3
+  confirmed no other production *transit* forward-NAT creation path
+  bypasses `publish_shared_session` (normal `poll_descriptor:1311`, seed
+  `:2466`, promote `promote.rs:124`, HA sync `ha.rs:262`, tunnel
+  `tunnel.rs:306`). A separate, adjacent observation — NOT a #1760
+  collision and NOT closed by W3′ or W5 — is the **local-delivery
+  primary-tuple shadow**: `install_helper_local_session_on_miss`
+  (`forwarding/mod.rs:1069`, `SessionOrigin::LocalMiss`, LocalDelivery,
+  is_reverse=false, no shared publish, no replication) installs a session
+  whose PRIMARY key can equal the on-wire reply tuple of a transit SNAT
+  flow, and direct session lookup runs before NAT reverse lookup
+  (`session_glue/mod.rs:911` vs `:1015`). AGY r3 argues the tuples are
+  disjoint in practice (a transit reverse-wire K carries the backend/
+  remote as src, the local session the interface IP); Codex r3 keeps it
+  as a tuple-shadowing risk worth a one-line note. Recorded here as an
+  open observation for any future flow-ambiguity audit; out of scope for
+  this plan's watch.
+
 **Net: the watch detects the event if it happens while you are looking, but
 resets on every deploy and observes a lab that cannot generate the event
 (§2.2).** The revisit trigger "counter goes nonzero" is currently close to
@@ -307,10 +327,10 @@ the §2.3 coverage map (both r2 reviewers refuted v2's W):
   events; a standing collision against an already-unindexed session is
   not counted; ≥1 ⇒ at least one real collision occurred". Journald
   persists across daemon restarts — the durable artifact the watch lacks.
-- **W5 (optional) — incremental live-pair audit.** The one case no
-  displacement detector can see (§2.3 case b: S3 collides with a live
-  loser whose K was already removed) needs a *condition* check, not an
-  *event* check: an incremental sweep (bounded slots per maintenance
+- **W5 (optional) — incremental live-pair audit.** The one
+  forward-NAT-vs-forward-NAT case no displacement detector can see (§2.3
+  case b: S3 collides with a live loser whose K was already removed)
+  needs a *condition* check, not an *event* check: an incremental sweep (bounded slots per maintenance
   tick, single-writer, no locks) over the worker's own slab building K
   counts for live forward entries; count>1 → live-collision gauge +
   W1 warn. Replica fanout means each worker's table contains all

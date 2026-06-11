@@ -10,3 +10,8 @@
 - Codex: `task-mq91i26m-ke7g4c` (PLAN-NEEDS-MAJOR) — docs/research/1760-reverse-key-v2/codex-plan-r2.md
 - AGY: `adversarial-review-mq91hvda-u43zjb` (PLAN-NEEDS-MAJOR) — agy-plan-r2.md
 - Claude SMR: claude-smr-plan-r2.md (self-correcting PLAN-NEEDS-MAJOR on v2)
+
+## Round 3
+- Codex: `task-mq923td0-p9fu4m` (PLAN-NEEDS-MINOR — single scoped-wording finding) — codex-plan-r3.md
+- AGY: `adversarial-review-mq923k3r-44j692` (PLAN-READY) — agy-plan-r3.md
+- Claude SMR: claude-smr-plan-r3.md
