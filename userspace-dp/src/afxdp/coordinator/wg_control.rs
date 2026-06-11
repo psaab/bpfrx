@@ -366,12 +366,7 @@ fn bind_dual_stack_v6(port: u16) -> io::Result<UdpSocket> {
 /// traffic was fine. Unmap to the canonical V4 form so overhead math,
 /// logs, and configured-endpoint comparisons all see the real family.
 fn canonicalize_endpoint(addr: SocketAddr) -> SocketAddr {
-    if let SocketAddr::V6(v6) = addr {
-        if let Some(v4) = v6.ip().to_ipv4_mapped() {
-            return SocketAddr::new(std::net::IpAddr::V4(v4), v6.port());
-        }
-    }
-    addr
+    crate::afxdp::wg::canonicalize_endpoint(addr)
 }
 
 /// Send a WG datagram to `target`, mapping an IPv4 target to its
@@ -596,7 +591,12 @@ mod tests {
     #[test]
     fn wg_send_to_maps_v4_target_on_v6_socket() {
         let (rx, rx_is_v6) = bind_wg_socket(0).expect("bind rx");
-        assert!(rx_is_v6, "test host lacks dual-stack v6 sockets");
+        if !rx_is_v6 {
+            // Production supports the v4-fallback socket on hosts
+            // without dual-stack v6; the mapped-send regression is
+            // untestable there (covered by the v4 round-trip below).
+            return;
+        }
         let rx_port = rx.local_addr().unwrap().port();
         let (tx, tx_is_v6) = bind_wg_socket(0).expect("bind tx");
         // The plain V4 loopback target — the failing live shape.
@@ -610,6 +610,21 @@ mod tests {
         // either kernel behavior (EINVAL on Linux mainline) without
         // asserting it so the test stays portable.
         let _ = tx.send_to(b"raw", target);
+    }
+
+    /// The v4-fallback socket path: native v4 sends must pass through
+    /// wg_send_to UNMAPPED (socket_is_v6=false) and round-trip.
+    #[test]
+    fn wg_send_to_native_v4_socket_roundtrip() {
+        let rx = UdpSocket::bind("127.0.0.1:0").expect("bind v4 rx");
+        let rx_port = rx.local_addr().unwrap().port();
+        let tx = UdpSocket::bind("127.0.0.1:0").expect("bind v4 tx");
+        let target: SocketAddr = format!("127.0.0.1:{rx_port}").parse().unwrap();
+        wg_send_to(&tx, false, b"wg-v4", target).expect("native v4 send");
+        rx.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut buf = [0u8; 16];
+        let (n, _) = rx.recv_from(&mut buf).expect("datagram must arrive");
+        assert_eq!(&buf[..n], b"wg-v4");
     }
 
     /// The guard math this protects: at the v4/v6 boundary the same

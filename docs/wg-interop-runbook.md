@@ -3,7 +3,15 @@
 Operator guide for the live kernel-WireGuard interop harness
 `test/incus/wg-interop.sh`. The harness proves the S2a WireGuard datapath
 (#1432, PR #1739) against an independent reference peer — the Linux kernel
-WireGuard module in a Debian-13 VM on the shared loss userspace cluster.
+WireGuard implementation in a Debian-13 incus instance on the shared loss
+userspace cluster. `WG_PEER_TYPE=vm` (default) gives a fully independent
+guest kernel; `WG_PEER_TYPE=container` is the plan §4 fallback (kernel
+WireGuard is netns-aware, so the protocol/crypto stack is still the
+reference kernel implementation — it runs in the loss HOST kernel, a
+reduced but still independent-implementation claim). The 2026-06-11
+validation used the container fallback because freshly created incus VMs
+never bring up the agent on the loss host (images:debian/13 and /12;
+pre-existing fw VMs unaffected).
 
 Converged research plan: `docs/pr/1736-wg-interop/plan.md`
 (PLAN-READY 3-of-3: Codex + AGY + Claude SMR, 2 rounds).
@@ -14,7 +22,7 @@ Converged research plan: `docs/pr/1736-wg-interop/plan.md`
 loss:xpf-userspace-fw0 (node0, RG0 primary)
   ge-0-0-1 10.0.61.1/24 (LAN VIP, VLAN 3667)   <- WG outer endpoint
   wg0      10.78.0.1/24 + fd00:78::1/64        <- inner (persistent TUN)
-loss:xpf-wg-peer (Debian-13 VM, kernel WireGuard)
+loss:xpf-wg-peer (Debian-13 VM or container, kernel WireGuard)
   eth1 (mlx1 SR-IOV VF, VLAN 3667) 10.0.61.103/24 + 2001:559:8585:ef00::103
   eth0 (incusbr0) mgmt/apt
   wgref    10.78.0.2/24 + fd00:78::2/64        <- kernel wg device

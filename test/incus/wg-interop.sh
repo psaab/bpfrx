@@ -48,6 +48,12 @@ mkdir -p "${EVID}"
 SUMMARY="${EVID}/summary.txt"
 
 KEEP_PEER=0
+# Recovery-restart taint counter (Codex PR-review finding 2): the
+# wedged-apply / leaked-port xpfd restarts keep a run going for
+# triage, but a restart-recovered run must NOT be presented as clean
+# merge evidence — the boot-time reapply can mask a broken live
+# commit-apply path. Taints are surfaced at the end and `all` exits 2.
+TAINTS=0
 
 log()  { echo "[wg-interop $(date +%H:%M:%S)] $*" | tee -a "${SUMMARY}"; }
 pass() { log "PASS: $*"; }
@@ -101,7 +107,10 @@ ping_gap_stats() { # ping_gap_stats <file> <expected_count>
 iperf_mbps() { # iperf_mbps <file>
     awk '/receiver/ && (/SUM/ || !sum_seen) {
             for (i = 1; i <= NF; i++) if ($(i+1) ~ /bits\/sec/) { v = $i; u = $(i+1) }
-            if (u == "Gbits/sec") v *= 1000; if (u == "Kbits/sec") v /= 1000
+            if (u == "Gbits/sec") v *= 1000
+            else if (u == "Kbits/sec") v /= 1000
+            else if (u == "bits/sec") v /= 1000000
+            # Mbits/sec passes through unscaled.
             if (u ~ /bits\/sec/) out = v
             if (/SUM/) sum_seen = 1 }
         END { printf "%.0f\n", out+0 }' "$1"
@@ -362,7 +371,8 @@ configure_p1() {
     # thread. If the port is still bound with no stanza in the config,
     # restart xpfd for a deterministic clean slate.
     if ish "${FW0}" "ss -uln | grep -q ':${WG_LISTEN_PORT} '"; then
-        warn "leaked WG control thread pins :${WG_LISTEN_PORT} (#1866) — restarting xpfd"
+        TAINTS=$((TAINTS+1))
+        warn "EVIDENCE-TAINT: leaked WG control thread pins :${WG_LISTEN_PORT} (#1866) — restarting xpfd"
         ish "${FW0}" 'systemctl restart xpfd'
         sleep 15
         ish "${FW0}" 'systemctl is-active xpfd' | grep -q active || fail "P1: xpfd restart failed"
@@ -385,7 +395,8 @@ configure_p1() {
         # run the tunnel step (wedged apply — the #1794/#1800 class).
         # A daemon restart re-applies from the DB at boot, which is
         # deterministic; recover once rather than failing the run.
-        warn "P1: commit landed but wg0/:${WG_LISTEN_PORT} never appeared — restarting xpfd (wedged apply)"
+        TAINTS=$((TAINTS+1))
+        warn "EVIDENCE-TAINT: P1 commit landed but wg0/:${WG_LISTEN_PORT} never appeared — restarting xpfd (wedged apply)"
         ish "${FW0}" 'systemctl restart xpfd'
         sleep 20
         ish "${FW0}" 'systemctl is-active xpfd' | grep -q active || fail "P1: xpfd restart failed"
@@ -663,7 +674,11 @@ case "${CMD}" in
         preflight; provision; configure_p1
         test_p2; test_p4a; test_p3; test_p4b; test_p5; test_p6; test_p7
         trap - ERR
-        teardown ;;
+        teardown
+        if [ "${TAINTS}" -gt 0 ]; then
+            warn "${TAINTS} recovery restart(s) used — evidence TAINTED; rerun clean for merge evidence"
+            exit 2
+        fi ;;
     *) usage ;;
 esac
 
