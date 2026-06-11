@@ -1,0 +1,6 @@
+AB_DEPLOY2_OK
+BOTH_DP_UP
+Software version: userspace-forwarding-ok-20260402-bfb00432-1806-ge4556085a
+AB_COS2_OK
+Software version: userspace-forwarding-ok-20260402-bfb00432-1806-ge4556085a
+Software version: userspace-forwarding-ok-20260402-bfb00432-1806-ge4556085a
