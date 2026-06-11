@@ -863,6 +863,94 @@ fn pool_snat_multiple_addresses_round_robin() {
     );
 }
 
+// --- #1827 PR-3: per-uplink SNAT pool selection by to-zone ---
+//
+// Multi-WAN per-uplink pools need NO new matcher: the to-zone fed to
+// match_source_nat is derived from the RESOLVED egress interface of
+// each new flow (zone_pair_ids_for_flow_with_override in
+// poll_descriptor), so when ip-monitoring flips the preferred route
+// (or an FBF term steers into an uplink's routing-instance), the
+// to-zone follows the new egress interface and the other rule-set's
+// pool is chosen. These tests pin the matcher half of that contract:
+// two rules identical except to_zone select their own pools.
+
+fn per_uplink_pool_rules() -> Vec<SourceNatRule> {
+    parse_source_nat_rules(&[
+        SourceNATRuleSnapshot {
+            name: "snat-isp-a".to_string(),
+            from_zone: "trust".to_string(),
+            to_zone: "untrust-a".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "isp-a-pool".to_string(),
+            pool_addresses: vec!["203.0.113.10/32".to_string()],
+            port_low: 1024,
+            port_high: 65535,
+            ..SourceNATRuleSnapshot::default()
+        },
+        SourceNATRuleSnapshot {
+            name: "snat-isp-b".to_string(),
+            from_zone: "trust".to_string(),
+            to_zone: "untrust-b".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "isp-b-pool".to_string(),
+            pool_addresses: vec!["198.51.100.10/32".to_string()],
+            port_low: 1024,
+            port_high: 65535,
+            ..SourceNATRuleSnapshot::default()
+        },
+    ])
+}
+
+#[test]
+fn per_uplink_pool_selected_by_to_zone() {
+    let rules = per_uplink_pool_rules();
+    // Same flow, resolved egress in uplink A's zone -> pool A.
+    let d = match_source_nat(
+        &rules,
+        "trust",
+        "untrust-a",
+        "10.0.1.100".parse().unwrap(),
+        "8.8.8.8".parse().unwrap(),
+        None,
+        None,
+    )
+    .expect("uplink A rule should match");
+    assert_eq!(d.rewrite_src, Some("203.0.113.10".parse().unwrap()));
+
+    // Identical flow after a route flip: resolved egress now sits in
+    // uplink B's zone -> pool B, with no rule-set change.
+    let d = match_source_nat(
+        &rules,
+        "trust",
+        "untrust-b",
+        "10.0.1.100".parse().unwrap(),
+        "8.8.8.8".parse().unwrap(),
+        None,
+        None,
+    )
+    .expect("uplink B rule should match");
+    assert_eq!(d.rewrite_src, Some("198.51.100.10".parse().unwrap()));
+}
+
+#[test]
+fn per_uplink_pool_no_match_outside_uplink_zones() {
+    let rules = per_uplink_pool_rules();
+    // Egress resolving into a zone neither rule-set names must not
+    // borrow either uplink's pool.
+    assert_eq!(
+        match_source_nat(
+            &rules,
+            "trust",
+            "dmz",
+            "10.0.1.100".parse().unwrap(),
+            "10.0.30.101".parse().unwrap(),
+            None,
+            None,
+        ),
+        None
+    );
+}
+
 fn persistent_pool_rules(timeout_secs: i64, port_low: u16, port_high: u16) -> Vec<SourceNatRule> {
     persistent_pool_rules_with_options(
         timeout_secs,
