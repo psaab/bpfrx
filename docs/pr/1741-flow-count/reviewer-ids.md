@@ -11,5 +11,5 @@
 ## Implementation phase (this PR)
 - Copilot: (recorded on review)
 - Codex: (recorded on dispatch)
-- AGY: (recorded on dispatch)
+- AGY: adversarial-review-mq92irda-6cp7ob (MERGE-READY r1)
 - Claude SMR: docs/pr/1741-flow-count/claude-smr-impl-r1.md
