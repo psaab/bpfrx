@@ -1,0 +1,12 @@
+xpf_userspace_worker_cos_queue_lease_acquire_v8_calls_total{worker_id="0"} 0
+xpf_userspace_worker_cos_queue_lease_acquire_v8_calls_total{worker_id="1"} 0
+xpf_userspace_worker_cos_queue_lease_acquire_v8_calls_total{worker_id="2"} 0
+xpf_userspace_worker_cos_queue_lease_acquire_v8_calls_total{worker_id="3"} 0
+xpf_userspace_worker_cos_queue_lease_acquire_v8_calls_total{worker_id="4"} 0
+xpf_userspace_worker_cos_queue_lease_acquire_v8_calls_total{worker_id="5"} 0
+xpf_userspace_worker_cos_queue_lease_acquire_v8_granted_bytes_total{worker_id="0"} 0
+xpf_userspace_worker_cos_queue_lease_acquire_v8_granted_bytes_total{worker_id="1"} 0
+xpf_userspace_worker_cos_queue_lease_acquire_v8_granted_bytes_total{worker_id="2"} 0
+xpf_userspace_worker_cos_queue_lease_acquire_v8_granted_bytes_total{worker_id="3"} 0
+xpf_userspace_worker_cos_queue_lease_acquire_v8_granted_bytes_total{worker_id="4"} 0
+xpf_userspace_worker_cos_queue_lease_acquire_v8_granted_bytes_total{worker_id="5"} 0
