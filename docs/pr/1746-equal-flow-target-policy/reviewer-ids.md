@@ -11,3 +11,16 @@
   (MERGE-READY; worked trace of mean-policy join/leave dynamics; O1/O2
   observations; hierarchical-AST test added during review)
 - Copilot: requested via "@copilot review" comment on PR #1867
+
+## Round 2 (head bf7014bd5, post Codex-r1 fixes)
+- Codex r2: task-mq98vvoc-8l0kx8 — MERGE-READY (verified F1 reorder
+  neutrality, F2 disposition "sound enough to ship the opt-in mean
+  policy", F3 docs fix; SMR trace verified against code)
+- AGY r2: adversarial-review-mq98we8d-xmwp8q — MERGE-READY (reorder
+  neutrality verified all rate modes; default-OFF disposition judged
+  correct; SMR closed-loop trace verified)
+- Claude SMR r2: docs/pr/1746-equal-flow-target-policy/claude-smr-impl-r2.md
+  — MERGE-READY
+- Copilot: attempts 1-2 failed with quota-limit responses
+  (copilot-pull-request-reviewer[bot] COMMENTED "reached their quota
+  limit" twice); retry 3 requested via comment + re-request API.
