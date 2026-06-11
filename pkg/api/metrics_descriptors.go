@@ -326,6 +326,31 @@ func newCollector(srv *Server) *xpfCollector {
 			"Non-exact CoS queue bytes sent while at least one exact queue on the same shaped interface still had backlog; non-zero deltas indicate best-effort/uncapped service competing with exact demand (#1369).",
 			[]string{"ifindex", "queue_id"}, nil,
 		),
+		cosLeaseV8RequestedBytes: prometheus.NewDesc(
+			"xpf_userspace_cos_lease_v8_requested_bytes_total",
+			"Cumulative bytes this worker REQUESTED from this CoS queue's shared v8 lease (every acquire_v8 ask, granted or not). Compare with ..._granted_bytes_total: requested >> granted on a worker = share-bounded asks (mismatch); a worker with near-zero requested while the class undergrants = claim-sampling loss. Step-0 attribution instrument for the honored-realization gap (#1863).",
+			[]string{"ifindex", "queue_id", "worker_id"}, nil,
+		),
+		cosLeaseV8GrantedBytes: prometheus.NewDesc(
+			"xpf_userspace_cos_lease_v8_granted_bytes_total",
+			"Cumulative bytes this worker was GRANTED by this CoS queue's shared v8 lease. Per-class sum approximates the class's realized guarantee-phase throughput; see ..._requested_bytes_total for the attribution contract (#1863).",
+			[]string{"ifindex", "queue_id", "worker_id"}, nil,
+		),
+		cosAdmissionFlowShareDrops: prometheus.NewDesc(
+			"xpf_userspace_cos_admission_flow_share_drops_total",
+			"Packets dropped at CoS admission because the flow exceeded its per-flow buffer share (summed across worker instances by the Rust coordinator). Previously wire-only (#710/#718); exported for the #1863 supply-path drop-site attribution.",
+			[]string{"ifindex", "queue_id"}, nil,
+		),
+		cosAdmissionBufferDrops: prometheus.NewDesc(
+			"xpf_userspace_cos_admission_buffer_drops_total",
+			"Packets dropped at CoS admission because the queue's buffer limit was exceeded (summed across worker instances). Previously wire-only (#710/#718); exported for the #1863 supply-path drop-site attribution.",
+			[]string{"ifindex", "queue_id"}, nil,
+		),
+		cosAdmissionEcnMarked: prometheus.NewDesc(
+			"xpf_userspace_cos_admission_ecn_marked_total",
+			"Packets ECN-CE-marked at CoS admission instead of dropped (summed across worker instances). Previously wire-only; exported alongside the admission drop counters (#1863).",
+			[]string{"ifindex", "queue_id"}, nil,
+		),
 		cosWaterfillPhase1Admissions: prometheus.NewDesc(
 			"xpf_userspace_cos_waterfill_phase1_admissions_total",
 			"Times this CoS queue was admitted by the guarantee-rate waterfill Phase-1 (small-first honored) walk. Combine with phase2_admissions + queued_bytes + *_starvation_parks to diagnose Phase-2 lock-in (#1628).",

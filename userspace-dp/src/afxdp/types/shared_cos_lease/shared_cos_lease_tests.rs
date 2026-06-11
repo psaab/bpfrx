@@ -1863,3 +1863,241 @@ fn v8_carry_field_is_reader_private() {
         offenders
     );
 }
+
+// #1863 Step-0: per-worker cumulative claim-flow counters
+// (requested/granted). The attribution contract: requested counts
+// EVERY ask with requested > 0 (granted or not); granted counts the
+// call's total_granted; neither resets at rotation; legacy leases
+// report None.
+
+#[test]
+fn v8_claim_flow_counts_requested_and_granted() {
+    let lease = SharedCoSQueueLease::new_v8(12_500_000, 64 * 1024, 1, 1);
+    lease.rehydrate_worker_active_count(0, 1);
+    let (granted, _) = lease.acquire_v8_with_cause(0, EPOCH_DURATION_NS, 100);
+    assert_eq!(granted, 100);
+    let (requested, granted_flow) = lease
+        .v8_worker_claim_flow()
+        .expect("v8 lease must report claim flow");
+    assert_eq!(requested.len(), 2, "len = max_worker_id + 1");
+    assert_eq!(requested[0], 100, "worker 0 asked 100 bytes");
+    assert_eq!(granted_flow[0], 100, "worker 0 was granted 100 bytes");
+    assert_eq!(requested[1], 0, "worker 1 never asked");
+    assert_eq!(granted_flow[1], 0);
+}
+
+#[test]
+fn v8_claim_flow_counts_denied_asks() {
+    // No rehydration → zero active flows → my_fair_share 0 → 0 grant,
+    // but the ASK must still be counted (the sampling-loss
+    // discriminator needs "did this worker ask at all").
+    let lease = SharedCoSQueueLease::new_v8(10_000_000, 64 * 1024, 2, 1);
+    let granted = lease.acquire_v8(0, 1_000_000, 4_096);
+    assert_eq!(granted, 0);
+    let (requested, granted_flow) = lease.v8_worker_claim_flow().expect("v8 lease");
+    assert_eq!(requested[0], 4_096, "denied ask still counted");
+    assert_eq!(granted_flow[0], 0, "nothing granted");
+}
+
+#[test]
+fn v8_claim_flow_accumulates_across_rotations() {
+    let lease = SharedCoSQueueLease::new_v8(12_500_000, 64 * 1024, 1, 0);
+    lease.rehydrate_worker_active_count(0, 1);
+    let (g1, _) = lease.acquire_v8_with_cause(0, EPOCH_DURATION_NS, 100);
+    // Second acquire two epochs later forces a rotation in between;
+    // the cumulative counters must NOT reset.
+    let (g2, _) = lease.acquire_v8_with_cause(0, 3 * EPOCH_DURATION_NS, 100);
+    assert_eq!((g1, g2), (100, 100));
+    let (requested, granted_flow) = lease.v8_worker_claim_flow().expect("v8 lease");
+    assert_eq!(requested[0], 200, "asks accumulate across rotations");
+    assert_eq!(granted_flow[0], 200, "grants accumulate across rotations");
+}
+
+#[test]
+fn legacy_lease_reports_no_claim_flow() {
+    let lease = SharedCoSQueueLease::new(10_000_000, 64 * 1024, 2);
+    assert!(lease.v8_worker_claim_flow().is_none());
+}
+
+// #1863 Path A-ii: class-level unclaimed-budget carry at rotation.
+// Contract: an epoch's unclaimed class budget (prev_cap − prev_granted)
+// is banked into `epoch_carry_bytes` and drawn into the next rotation's
+// cap (flow-proportionally re-dealt by the share formula); a fully
+// claimed epoch banks nothing (byte-identical steady state); regime-3
+// cold-resume still drops carry; all existing bounds hold.
+
+// 12.5 MB/s → exactly 2,500 B per 200 µs epoch.
+const CARRY_TEST_RATE: u64 = 12_500_000;
+
+#[test]
+fn v8_unclaimed_budget_carries_into_next_epoch_cap() {
+    let lease = SharedCoSQueueLease::new_v8(CARRY_TEST_RATE, 64 * 1024, 2, 0);
+    lease.rehydrate_worker_active_count(0, 1);
+    // First rotation (start==0, regime 3): cap = one epoch = 2,500.
+    // Claim only 500 of it.
+    let (g1, _) = lease.acquire_v8_with_cause(0, EPOCH_DURATION_NS, 500);
+    assert_eq!(g1, 500);
+    // One epoch later: rotation banks the 2,000 unclaimed and draws it
+    // back — cap = base 2,500 + carry 2,000 = 4,500, all on worker 0's
+    // share (sole flow).
+    let (g2, _) = lease.acquire_v8_with_cause(0, 2 * EPOCH_DURATION_NS, 10_000);
+    assert_eq!(
+        g2, 4_500,
+        "unclaimed prior-epoch budget must be re-dealt, not evaporate"
+    );
+}
+
+#[test]
+fn v8_fully_claimed_epoch_banks_no_carry() {
+    let lease = SharedCoSQueueLease::new_v8(CARRY_TEST_RATE, 64 * 1024, 2, 0);
+    lease.rehydrate_worker_active_count(0, 1);
+    let (g1, _) = lease.acquire_v8_with_cause(0, EPOCH_DURATION_NS, 10_000);
+    assert_eq!(g1, 2_500, "full claim of the one-epoch cap");
+    // Healthy steady state: next epoch's cap is exactly the base —
+    // byte-identical to the pre-#1863 rotation.
+    let (g2, _) = lease.acquire_v8_with_cause(0, 2 * EPOCH_DURATION_NS, 10_000);
+    assert_eq!(g2, 2_500, "fully-claimed epoch must bank nothing");
+}
+
+#[test]
+fn v8_cold_resume_drops_unclaimed_carry() {
+    let lease = SharedCoSQueueLease::new_v8(CARRY_TEST_RATE, 64 * 1024, 2, 0);
+    lease.rehydrate_worker_active_count(0, 1);
+    let (g1, _) = lease.acquire_v8_with_cause(0, EPOCH_DURATION_NS, 500);
+    assert_eq!(g1, 500);
+    // Resume past the stall window (256 epochs): regime 3 grants one
+    // epoch and DROPS the banked remainder.
+    let stall_ns = EPOCH_DURATION_NS * 300;
+    let (g2, _) = lease.acquire_v8_with_cause(0, EPOCH_DURATION_NS + stall_ns, 10_000);
+    assert_eq!(g2, 2_500, "cold-resume must not burst stale unclaimed budget");
+}
+
+#[test]
+fn v8_unclaimed_carry_bounded_by_carry_max() {
+    let lease = SharedCoSQueueLease::new_v8(CARRY_TEST_RATE, 64 * 1024, 2, 0);
+    lease.rehydrate_worker_active_count(0, 1);
+    // 20 consecutive epochs claiming 1 byte each: unclaimed ~2,499/epoch
+    // accumulates but the bank is clamped at CARRY_MAX_EPOCHS (8) worth
+    // and each draw at CARRY_DRAIN_MAX_EPOCHS (7) worth.
+    for i in 1..=20u64 {
+        let _ = lease.acquire_v8_with_cause(0, i * EPOCH_DURATION_NS, 1);
+    }
+    let (g, _) = lease.acquire_v8_with_cause(0, 21 * EPOCH_DURATION_NS, 1_000_000);
+    let base = 2_500u64;
+    let drain_max = 7 * 2_500u64;
+    assert!(
+        g <= base + drain_max,
+        "carry draw must stay within the existing (base + drain_max) bound; got {g}"
+    );
+    assert!(g > base, "some banked budget must be drawn; got {g}");
+}
+
+#[test]
+fn v8_equal_flow_mode_never_banks_unclaimed_budget() {
+    // EqualFlowSuppress leases keep pre-#1863 evaporation semantics:
+    // an under-claimed (fail-open) epoch must NOT inflate the next cap.
+    let lease = new_equal_flow_lease_with_policy(EqualFlowTargetPolicy::Slowest);
+    lease.rehydrate_worker_active_count(0, 1);
+    let g1 = lease.acquire_v8(0, EPOCH_DURATION_NS, 500);
+    assert_eq!(g1, 500, "fail-open epoch grants proportionally");
+    // 50 MB/s -> 10,000 B/epoch. Without banking, the next epoch's cap
+    // is exactly the one-epoch base; with banking it would be 19,500.
+    let g2 = lease.acquire_v8(0, 2 * EPOCH_DURATION_NS, 50_000);
+    assert_eq!(
+        g2, 10_000,
+        "equal-flow mode must not recycle unclaimed budget"
+    );
+}
+
+#[test]
+fn v8_unclaimed_carry_redeals_flow_proportionally_across_workers() {
+    // Two workers, one flow each (5,000 B/epoch share at 50 MB/s →
+    // 10,000 B/epoch cap). Worker 1 misses epoch 1 entirely (sampling
+    // loss); its unclaimed share banks. Epoch 2's cap = 10,000 + 5,000
+    // and the share formula re-deals it 50/50 — BOTH workers' epoch-2
+    // shares are 7,500, preserving flow-proportional isolation (the
+    // carried budget is not first-come-first-served).
+    let lease = SharedCoSQueueLease::new_v8(50_000_000, 256 * 1024, 2, 1);
+    lease.rehydrate_worker_active_count(0, 1);
+    lease.rehydrate_worker_active_count(1, 1);
+    let g0_e1 = lease.acquire_v8(0, EPOCH_DURATION_NS, 50_000);
+    assert_eq!(g0_e1, 5_000, "epoch 1: worker 0 claims exactly its share");
+    // Worker 1 never acquires in epoch 1. Epoch 2:
+    let g0_e2 = lease.acquire_v8(0, 2 * EPOCH_DURATION_NS, 50_000);
+    let g1_e2 = lease.acquire_v8(1, 2 * EPOCH_DURATION_NS, 50_000);
+    assert_eq!(
+        (g0_e2, g1_e2),
+        (7_500, 7_500),
+        "epoch 2 re-deals the banked 5,000 flow-proportionally"
+    );
+}
+
+#[test]
+fn v8_regime2_banks_lag_owed_plus_unclaimed_and_draws_nothing() {
+    // Regime 2 (K < lag <= STALL): grant exactly the K-epoch ceiling,
+    // draw 0, bank rate x (lag - K x EPOCH) PLUS the just-ended
+    // epoch's unclaimed remainder.
+    let lease = SharedCoSQueueLease::new_v8(CARRY_TEST_RATE, 64 * 1024, 2, 0);
+    lease.rehydrate_worker_active_count(0, 1);
+    // First rotation (regime 3): cap 2,500; claim 500 -> 2,000 unclaimed.
+    let (g1, _) = lease.acquire_v8_with_cause(0, EPOCH_DURATION_NS, 500);
+    assert_eq!(g1, 500);
+    // Next acquire 10 epochs later: lag 10 > K=8 -> regime 2.
+    // cap = 8 x 2,500 = 20,000 (draw 0); carry banks the 2-epoch
+    // overshoot (5,000) + unclaimed 2,000 = 7,000.
+    let (g2, _) = lease.acquire_v8_with_cause(0, 11 * EPOCH_DURATION_NS, 50_000);
+    assert_eq!(g2, 20_000, "regime 2 grants the K-epoch ceiling, no draw");
+    // One epoch later (regime 1, fully-claimed prior epoch): cap =
+    // base 2,500 + draw min(7,000, drain_max 17,500) = 9,500.
+    let (g3, _) = lease.acquire_v8_with_cause(0, 12 * EPOCH_DURATION_NS, 50_000);
+    assert_eq!(
+        g3, 9_500,
+        "the banked lag-owed + unclaimed budget drains on the next visit"
+    );
+}
+
+#[test]
+fn v8_concurrent_acquires_and_rotations_respect_the_budget_bound() {
+    // 4 worker threads hammer acquire_v8 with monotonically advancing
+    // per-thread clocks spanning ~100 epochs, racing rotations against
+    // grants. Invariant under ANY interleaving: total granted bytes
+    // never exceed rate x span + the bounded carry/burst slack
+    // (carry_max = 8 epochs, plus the K-epoch first-window grant).
+    use std::sync::Arc as StdArc;
+    let lease = StdArc::new(SharedCoSQueueLease::new_v8(CARRY_TEST_RATE, 64 * 1024, 4, 3));
+    for w in 0..4 {
+        lease.rehydrate_worker_active_count(w, 1);
+    }
+    const STEPS: u64 = 400;
+    let total: StdArc<std::sync::atomic::AtomicU64> =
+        StdArc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut handles = Vec::new();
+    for w in 0..4usize {
+        let lease = StdArc::clone(&lease);
+        let total = StdArc::clone(&total);
+        handles.push(std::thread::spawn(move || {
+            for i in 1..=STEPS {
+                // Interleaved per-thread clocks: ~4 acquires per epoch
+                // across the threads, with skew.
+                let now = i * (EPOCH_DURATION_NS / 4) + (w as u64) * 17_000;
+                let g = lease.acquire_v8(w, now, 4_096);
+                total.fetch_add(g, std::sync::atomic::Ordering::Relaxed);
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    // Span ~= STEPS/4 epochs = 100 epochs -> rate budget 250,000 B.
+    // Slack: carry_max (8 epochs = 20,000) + the K-epoch ceiling on
+    // any single rotation (covered by carry_max accounting) + one
+    // epoch of pre-span grant.
+    let span_epochs = STEPS / 4 + 1;
+    let bound = (span_epochs + 8 + 1) * 2_500;
+    let granted = total.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        granted <= bound,
+        "concurrent grants {granted} exceed the hard budget bound {bound}"
+    );
+    assert!(granted > 0, "some grants must land");
+}
