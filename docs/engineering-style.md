@@ -368,6 +368,18 @@ they repeatedly bite:
 - **Use `cli`, not `xpfctl`.** The remote CLI binary is `cli`.
 - **Primary is fw0 on RG0 in the loss userspace cluster.** Apply config
   changes to the primary; sync takes care of the secondary.
+- **`make build` does NOT require `make generate` (#1864).** The
+  git-tracked `pkg/dataplane/userspace_xdp_bpfel.o` is the deployable
+  artifact; only regenerate it when `userspace-xdp/` source changes.
+  Regeneration requires the PINNED toolchain
+  (`userspace-xdp/rust-toolchain.toml` + the bpf-linker pin in
+  `pkg/dataplane/build-userspace-xdp.sh`) and passes a kernel-verifier
+  verify-then-install gate — an unpinned nightly once produced an
+  object that blew the 1M-insn verifier cap and took both cluster
+  dataplanes down. Never commit a regenerated `.o` unless the gate
+  PASSed and `git diff --exit-code pkg/dataplane/userspace_xdp_bpfel.o`
+  is clean after a pinned re-run. Recovery from a bad artifact:
+  `git checkout -- pkg/dataplane/userspace_xdp_bpfel.o && make build`.
 - **Before claiming a CoS admission-path PR moves a metric, read the
   counters.** `show class-of-service interface` surfaces `flow_share`,
   `buffer`, and `ecn_marked` drop counts per queue since #724. See

@@ -464,7 +464,14 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     };
     let timeout_ns = (timeout_ms as u64) * 1_000_000;
     let now_ns = unsafe { bpf_ktime_get_ns() };
-    if now_ns < *last_heartbeat || now_ns.saturating_sub(*last_heartbeat) > timeout_ns {
+    // #1864: spelled as a guarded wrapping_sub, not saturating_sub. The
+    // rustc/LLVM nightlies after 2026-05-23 lower saturating_sub into a
+    // materialized-boolean re-branch that defeats BPF verifier state
+    // pruning (the rebuilt object blew the 1M processed-insn cap and
+    // took both cluster dataplanes down). Semantics are identical: the
+    // short-circuit `<` clause handles the underflow case, and on the
+    // evaluated path now_ns >= *last_heartbeat makes wrapping_sub exact.
+    if now_ns < *last_heartbeat || now_ns.wrapping_sub(*last_heartbeat) > timeout_ns {
         record_trace(
             ctrl.flags,
             ingress_ifindex,
@@ -481,7 +488,10 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         return drop_degraded_transit(ctrl, USERSPACE_FALLBACK_REASON_HEARTBEAT_STALE);
     }
 
-    let packet_len = data_end.saturating_sub(data);
+    // #1864: explicit compare instead of saturating_sub (same verifier
+    // state-pruning hazard as the heartbeat check above; identical
+    // result for all inputs).
+    let packet_len = if data_end > data { data_end - data } else { 0 };
     // ESP still relies on the kernel XFRM path. Use cpumap_or_pass
     // directly. cpumap_or_pass delivers to the kernel stack reliably.
     if parsed.protocol == PROTO_ESP {
