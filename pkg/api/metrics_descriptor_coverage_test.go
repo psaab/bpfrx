@@ -302,6 +302,9 @@ func populatedCoverageStatus() dpuserspace.ProcessStatus {
 		DynamicNeighborKeys:             []string{"7 10.0.61.1", "9 172.16.80.200"},
 		// #1789: failed USERSPACE_SESSIONS publish counter (always emits).
 		SessionPublishErrorsTotal: 5,
+		// #1760 W3': shared-map reverse-key displacement counter (always
+		// emits).
+		NatReverseKeySharedDisplacementsTotal: 2,
 		// #1807: worker-command-queue poison recoveries (always emits).
 		WorkerCommandQueuePoisonRecoveries: 1,
 		NeighborResolverQueueDepth:         3,
@@ -456,6 +459,7 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 		"xpf_userspace_pending_neigh_duplicate_drops_total",          // #1782 cold-start H5
 		"xpf_userspace_dynamic_neighbor_present",                     // #1782 cold-start H2 dump
 		"xpf_userspace_session_publish_errors_total",                 // #1789 publish failures
+		"xpf_userspace_session_nat_reverse_key_shared_displacements_total", // #1760 W3' shared displacements
 		"xpf_userspace_worker_command_queue_poison_recoveries_total", // #1807 poison recoveries
 		// #1771 §2.6 resolver backoff + §2.5 ENOBUFS/re-dump + key gauges
 		"xpf_userspace_neighbor_resolver_get_backoff_attempts_total",

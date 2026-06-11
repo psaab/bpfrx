@@ -4046,3 +4046,330 @@ fn replicate_session_delete_delivers_to_poisoned_queue() {
     }
     assert!(!queues[0].is_poisoned(), "poison must be cleared");
 }
+
+// ---------------------------------------------------------------------------
+// #1760 W3': shared-map NAT reverse-key displacement counter
+// ---------------------------------------------------------------------------
+//
+// NOTE on the process-global static: NAT_REVERSE_KEY_SHARED_DISPLACEMENTS is
+// shared across the whole test binary. All assertions below are DELTA-based
+// around the specific publish calls, and only the tests in this block publish
+// colliding (distinct-forward-key, same-reverse-key) entries — every other
+// test in the binary publishes either unrelated keys or same-session
+// republishes, neither of which increments the counter. The positive and
+// negative cases are kept in ONE test to avoid cross-test ordering effects.
+
+fn w3_forward_entry(src_host: u8, src_port: u16, snat_ip: Ipv4Addr) -> SyncedSessionEntry {
+    // Interface-mode SNAT shape: rewrite_src set, NO source-port rewrite —
+    // the portless mode that makes the reverse key collide (#1760 §2.7).
+    SyncedSessionEntry {
+        key: SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, src_host)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            src_port,
+            dst_port: 443,
+        },
+        decision: SessionDecision {
+            resolution: test_resolution(),
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(snat_ip)),
+                rewrite_src_port: None,
+                ..NatDecision::default()
+            },
+        },
+        metadata: test_metadata(),
+        origin: SessionOrigin::ForwardFlow,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x02,
+    }
+}
+
+#[test]
+fn shared_nat_displacement_counter_counts_collisions_not_republishes() {
+    use crate::afxdp::shared_ops::NAT_REVERSE_KEY_SHARED_DISPLACEMENTS;
+    use std::sync::atomic::Ordering;
+
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let snat_ip = Ipv4Addr::new(172, 16, 80, 8);
+
+    // Two distinct internal hosts, SAME source port, same dst — the
+    // interface-SNAT collision: identical reverse wire key K.
+    let s1 = w3_forward_entry(101, 40_000, snat_ip);
+    let s2 = w3_forward_entry(102, 40_000, snat_ip);
+    assert_ne!(s1.key, s2.key, "distinct forward sessions");
+    assert_eq!(
+        reverse_session_key(&s1.key, s1.decision.nat),
+        reverse_session_key(&s2.key, s2.decision.nat),
+        "construction must produce a genuine reverse-key collision"
+    );
+
+    // Fresh publish: no displacement.
+    let before = NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed);
+    publish_shared_session(
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        &shared_owner_rg_indexes,
+        &s1,
+    );
+    assert_eq!(
+        NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed),
+        before,
+        "first publish must not count"
+    );
+
+    // Same-session republish (promote / RG migration / HA re-sync shape):
+    // displaced.key == entry.key -> no count.
+    publish_shared_session(
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        &shared_owner_rg_indexes,
+        &s1,
+    );
+    assert_eq!(
+        NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed),
+        before,
+        "same-session republish must not count"
+    );
+
+    // Colliding second session displaces s1 at K -> counts. The
+    // reverse-canonical slot for this NAT shape may coincide with the wire
+    // slot (single insert) or differ (second insert also displaces); accept
+    // either by asserting a positive, bounded delta.
+    publish_shared_session(
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        &shared_owner_rg_indexes,
+        &s2,
+    );
+    let after_collision = NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed);
+    let delta = after_collision - before;
+    assert!(
+        (1..=2).contains(&delta),
+        "colliding publish must count once per displaced slot (delta={delta})"
+    );
+
+    // s1 re-publishes (e.g. its worker re-installs): displaces s2 -> counts
+    // again. Alternations keep counting — event count, not pair census.
+    publish_shared_session(
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        &shared_owner_rg_indexes,
+        &s1,
+    );
+    assert!(
+        NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed) > after_collision,
+        "alternation must count again"
+    );
+
+    // All remaining negatives live in THIS test (not separate #[test]s):
+    // the counter static is process-global and cargo runs tests in
+    // parallel, so equality assertions in a sibling test could observe
+    // this test's increments (Codex code-r1 F2).
+    let settled = NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed);
+
+    // Reverse entries never touch shared_nat_sessions.
+    let mut reverse = w3_forward_entry(103, 40_001, snat_ip);
+    reverse.metadata.is_reverse = true;
+    publish_shared_session(
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        &shared_owner_rg_indexes,
+        &reverse,
+    );
+    publish_shared_session(
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        &shared_owner_rg_indexes,
+        &reverse,
+    );
+    assert_eq!(
+        NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed),
+        settled,
+        "reverse entries never touch shared_nat_sessions"
+    );
+
+    // HA fabric-redirect wire-ALIAS republish (Codex code-r1 F1): the
+    // same logical session arrives a second time under its NAT-translated
+    // forward-wire key with the same value
+    // (daemon_ha_userspace.go userspaceForwardWireAliasFromDeltaV4). The
+    // alias derives the same reverse key K as its canonical form and
+    // MUST NOT count as a collision.
+    let fresh_nat = Arc::new(Mutex::new(FastMap::default()));
+    let mut canonical = w3_forward_entry(110, 40_002, snat_ip);
+    // On the wire both canonical and alias arrive via HA sync.
+    canonical.origin = SessionOrigin::SyncImport;
+    let mut alias = canonical.clone();
+    alias.key = forward_wire_key(&canonical.key, canonical.decision.nat);
+    assert_ne!(alias.key, canonical.key, "alias must be a distinct key");
+    assert_eq!(
+        reverse_session_key(&alias.key, alias.decision.nat),
+        reverse_session_key(&canonical.key, canonical.decision.nat),
+        "alias and canonical must derive the same reverse key K"
+    );
+    let before_alias = NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed);
+    for entry in [&canonical, &alias, &canonical] {
+        publish_shared_session(
+            &shared_sessions,
+            &fresh_nat,
+            &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
+            entry,
+        );
+    }
+    assert_eq!(
+        NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed),
+        before_alias,
+        "canonical<->wire-alias churn of one logical session must not count"
+    );
+
+    // Codex code-r2: DNAT-vs-direct is a GENUINE collision whose keys are
+    // wire-related — a DNAT flow client:p -> VIP:443 rewritten to
+    // backend:443, plus a direct no-NAT flow client:p -> backend:443.
+    // Both derive the same reverse key K; the alias exclusion must NOT
+    // swallow it (their NatDecisions differ).
+    let backend = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 90));
+    let client = IpAddr::V4(Ipv4Addr::new(10, 0, 61, 120));
+    let dnat = SyncedSessionEntry {
+        key: SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: client,
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 91)), // VIP
+            src_port: 40_003,
+            dst_port: 443,
+        },
+        decision: SessionDecision {
+            resolution: test_resolution(),
+            nat: NatDecision {
+                rewrite_dst: Some(backend),
+                ..NatDecision::default()
+            },
+        },
+        metadata: test_metadata(),
+        origin: SessionOrigin::ForwardFlow,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x02,
+    };
+    let mut direct = dnat.clone();
+    direct.key.dst_ip = backend;
+    direct.decision.nat = NatDecision::default();
+    assert_eq!(
+        reverse_session_key(&dnat.key, dnat.decision.nat),
+        reverse_session_key(&direct.key, direct.decision.nat),
+        "DNAT and direct flows must derive the same reverse key K"
+    );
+    let dnat_map = Arc::new(Mutex::new(FastMap::default()));
+    let before_dnat = NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed);
+    for entry in [&dnat, &direct] {
+        publish_shared_session(
+            &shared_sessions,
+            &dnat_map,
+            &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
+            entry,
+        );
+    }
+    assert!(
+        NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed) > before_dnat,
+        "DNAT-vs-direct genuine collision must count despite wire-related keys"
+    );
+
+    // Codex code-r3 owner-side corner: a LOCAL flow whose source already
+    // equals the SNAT external address. Identical NatDecision and
+    // wire-related keys, but BOTH entries are locally originated — two
+    // real sessions, must count. (The alias exclusion requires at least
+    // one peer-synced side: the HA wire-alias never originates locally.)
+    let local_a = w3_forward_entry(121, 40_004, snat_ip); // 10.0.61.121
+    let mut local_b = local_a.clone();
+    local_b.key.src_ip = IpAddr::V4(snat_ip); // source IS the external IP
+    assert_eq!(
+        local_b.key,
+        forward_wire_key(&local_a.key, local_a.decision.nat),
+        "corner construction: B must be A's wire form"
+    );
+    assert_eq!(local_a.decision.nat, local_b.decision.nat);
+    assert!(!local_a.origin.is_peer_synced() && !local_b.origin.is_peer_synced());
+    let corner_map = Arc::new(Mutex::new(FastMap::default()));
+    let before_corner = NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed);
+    for entry in [&local_a, &local_b] {
+        publish_shared_session(
+            &shared_sessions,
+            &corner_map,
+            &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
+            entry,
+        );
+    }
+    assert!(
+        NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed) > before_corner,
+        "local same-NAT wire-related pair must count (owner-side corner)"
+    );
+
+    // Codex code-r4: post-failover PROMOTE churn. At activation the new
+    // owner can promote both the canonical and its wire-alias to
+    // SharedPromote (not peer-synced) and republish each — identical
+    // NatDecision, wire-related keys, same logical session. Must not
+    // count, in either promote order.
+    let mut promoted_canonical = w3_forward_entry(130, 40_005, snat_ip);
+    promoted_canonical.origin = SessionOrigin::SharedPromote;
+    let mut promoted_alias = promoted_canonical.clone();
+    promoted_alias.key =
+        forward_wire_key(&promoted_canonical.key, promoted_canonical.decision.nat);
+    let promote_map = Arc::new(Mutex::new(FastMap::default()));
+    let before_promote = NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed);
+    for entry in [
+        &promoted_canonical, // canonical-then-alias
+        &promoted_alias,
+        &promoted_canonical, // alias-then-canonical
+    ] {
+        publish_shared_session(
+            &shared_sessions,
+            &promote_map,
+            &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
+            entry,
+        );
+    }
+    assert_eq!(
+        NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed),
+        before_promote,
+        "SharedPromote canonical<->alias churn must not count (either order)"
+    );
+}
+
+
+#[test]
+fn nat_reverse_key_warn_throttle_claims_once_per_window() {
+    use crate::afxdp::shared_ops::try_claim_nat_reverse_key_warn;
+
+    // The throttle static is process-global and never reset; derive a base
+    // far beyond any previously claimed slot so this test is self-contained.
+    let base: u64 = 365 * 24 * 3_600 * 1_000_000_000;
+    assert!(
+        try_claim_nat_reverse_key_warn(base),
+        "first claim past the window must win"
+    );
+    assert!(
+        !try_claim_nat_reverse_key_warn(base + 1_000_000_000),
+        "claim inside the 60s window must lose"
+    );
+    assert!(
+        !try_claim_nat_reverse_key_warn(base + 59_999_999_999),
+        "claim at window edge - 1ns must lose"
+    );
+    assert!(
+        try_claim_nat_reverse_key_warn(base + 60_000_000_000),
+        "claim at the window boundary must win"
+    );
+}
