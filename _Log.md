@@ -5165,3 +5165,7 @@ top.
 - **Timestamp**: 2026-06-11
   **Action**: #1865 engineer — commit 6: docs — runbook triage step 0 (local counters as primary oracle), resolved-limitation row, interop assert note
   **File(s)**: docs/wg-interop-runbook.md, docs/wireguard-interop.md
+
+- **Timestamp**: 2026-06-11
+  **Action**: #1865 engineer — SMR code review r1 (MERGE-READY; worked traces A/B) + cosmetic keepalive-line dedup in detail view
+  **File(s)**: docs/pr/1865-wg-telemetry/claude-smr-code-r1.md, pkg/dataplane/userspace/wgfmt.go

@@ -50,7 +50,10 @@ func FormatWireguardStatus(status ProcessStatus, detail bool, now time.Time) str
 			t.HsInitiationsCreated, t.HsSendErrors)
 		fmt.Fprintf(&b, "  Transfer:           %d pkts / %d bytes received, %d pkts / %d bytes sent (inner IP)\n",
 			t.DecapPackets, t.DecapBytes, t.EncapPackets, t.EncapBytes)
-		if t.DecapKeepalives > 0 {
+		if !detail && t.DecapKeepalives > 0 {
+			// Detail view prints the unconditional keepalive line at
+			// the bottom; suppress the summary form there to avoid a
+			// duplicate row.
 			fmt.Fprintf(&b, "  Keepalives:         %d received\n", t.DecapKeepalives)
 		}
 		decapDrops := t.DecapDropsMalformedHeader + t.DecapDropsUnknownSession +
