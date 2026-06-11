@@ -4645,3 +4645,633 @@ fn syn_cookie_counters_hot_path_accumulate_in_batch() {
     assert_eq!(live.syn_cookie_ack_invalid.load(Ordering::Relaxed), 17);
     assert_eq!(live.syn_cookie_bypass.load(Ordering::Relaxed), 19);
 }
+
+// ── #1861: transactional forward+reverse install — interleaving pins ──
+//
+// Deterministic at-cap pins for every interleaving in
+// docs/research/1861-install-txn/plan.md §4 that the fix targets:
+// I1/I2 (refusal drops the trigger packet, rolls back SNAT, caches
+// nothing), I3 (reverse never attempted without forward), I4 boundary
+// (pair admitted at cap-2, refused at cap-1), I5 (failed reply repair
+// still forwards, is NOT flow-cached, and self-heals below cap), I6
+// (refused seed is recycled, not buffered), I14 (NAT64 refusal drops).
+
+fn txn_ha_state() -> BTreeMap<i32, HAGroupRuntime> {
+    let mut ha = BTreeMap::new();
+    for rg in [1, 2] {
+        ha.insert(
+            rg,
+            HAGroupRuntime {
+                active: true,
+                watchdog_timestamp: 123,
+                lease: HAGroupRuntime::active_lease_until(123, 123),
+            },
+        );
+    }
+    ha
+}
+
+fn build_txn_tcp_syn_frame_v4(
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    tcp_flags: u8,
+) -> Vec<u8> {
+    let mut frame = Vec::new();
+    write_eth_header(
+        &mut frame,
+        [0x02, 0xbf, 0x72, 0x01, 0x00, 0x01],
+        [0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5],
+        0,
+        0x0800,
+    );
+    let s = src.octets();
+    let d = dst.octets();
+    frame.extend_from_slice(&[
+        0x45, 0x00, 0x00, 0x28, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, s[0], s[1],
+        s[2], s[3], d[0], d[1], d[2], d[3],
+    ]);
+    let ip_sum = checksum16(&frame[14..34]);
+    frame[24] = (ip_sum >> 8) as u8;
+    frame[25] = ip_sum as u8;
+    frame.extend_from_slice(&src_port.to_be_bytes());
+    frame.extend_from_slice(&dst_port.to_be_bytes());
+    frame.extend_from_slice(&1u32.to_be_bytes());
+    frame.extend_from_slice(&0u32.to_be_bytes());
+    frame.extend_from_slice(&[0x50, tcp_flags, 0xfa, 0xf0, 0x00, 0x00, 0x00, 0x00]);
+    frame
+}
+
+fn txn_meta_v4(ingress_ifindex: u32, tcp_flags: u8, pkt_len: u16) -> UserspaceDpMeta {
+    UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex,
+        l3_offset: 14,
+        l4_offset: 34,
+        payload_offset: 54,
+        pkt_len,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        tcp_flags,
+        config_generation: 7,
+        fib_generation: 9,
+        ..UserspaceDpMeta::default()
+    }
+}
+
+/// Push one frame through `poll_binding_process_descriptor` against the
+/// given table/forwarding state. Owns the per-call shared-map and
+/// telemetry scaffolding; the caller keeps `binding` + `sessions` across
+/// calls so multi-phase pins can observe accumulated state.
+fn txn_run_descriptor(
+    binding: &mut BindingWorker,
+    sessions: &mut SessionTable,
+    forwarding: &ForwardingState,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+) -> (BatchCounters, DebugPollCounters) {
+    let meta_len = std::mem::size_of::<UserspaceDpMeta>();
+    let frame_offset = 128;
+    let meta_offset = frame_offset - meta_len;
+    let meta_bytes = unsafe {
+        std::slice::from_raw_parts((&meta as *const UserspaceDpMeta).cast::<u8>(), meta_len)
+    };
+    unsafe {
+        binding
+            .umem
+            .area()
+            .slice_mut_unchecked(meta_offset, meta_len)
+            .expect("meta slice")
+            .copy_from_slice(meta_bytes);
+        binding
+            .umem
+            .area()
+            .slice_mut_unchecked(frame_offset, frame.len())
+            .expect("frame slice")
+            .copy_from_slice(frame);
+    }
+    binding.xsk.rx.push_for_test(XdpDesc {
+        addr: frame_offset as u64,
+        len: frame.len() as u32,
+        options: 0,
+    });
+
+    let ident = binding.identity();
+    let binding_lookup = WorkerBindingLookup::from_bindings(std::slice::from_ref(binding));
+    let mirror_targets = MirrorTargetMap::default();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::default());
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let last_resolution = Arc::new(Mutex::new(None));
+    let peer_worker_commands = Vec::new();
+    let dnat_fds = DnatTableFds::default();
+    let rg_epochs = std::array::from_fn(|_| AtomicU32::new(0));
+    let worker_ctx = WorkerContext {
+        ident: &ident,
+        binding_lookup: &binding_lookup,
+        mirror_targets: &mirror_targets,
+        forwarding,
+        ha_state,
+        dynamic_neighbors: &dynamic_neighbors,
+        neighbor_resolver: None,
+        shared_sessions: &shared_sessions,
+        shared_nat_sessions: &shared_nat_sessions,
+        shared_forward_wire_sessions: &shared_forward_wire_sessions,
+        shared_owner_rg_indexes: &shared_owner_rg_indexes,
+        slow_path: None,
+        event_stream: None,
+        local_tunnel_deliveries: &local_tunnel_deliveries,
+        recent_exceptions: &recent_exceptions,
+        last_resolution: &last_resolution,
+        peer_worker_commands: &peer_worker_commands,
+        dnat_fds: &dnat_fds,
+        rg_epochs: &rg_epochs,
+        cold_path_sample_mask: 0xff,
+    };
+    let mut screen = ScreenState::new();
+    let mut batch = BatchCounters::default();
+    let mut dbg = DebugPollCounters::default();
+    let mut telemetry = TelemetryContext {
+        dbg: &mut dbg,
+        counters: &mut batch,
+    };
+    let area_ptr = binding.umem.area() as *const MmapArea;
+    poll_binding_process_descriptor(
+        binding,
+        0,
+        area_ptr,
+        1,
+        sessions,
+        &mut screen,
+        ValidationState {
+            snapshot_installed: true,
+            config_generation: 7,
+            fib_generation: 9,
+        },
+        123_000_000_000,
+        123,
+        0,
+        0,
+        -1,
+        -1,
+        &worker_ctx,
+        &mut telemetry,
+    );
+    (batch, dbg)
+}
+
+fn txn_flow_cache_entries(binding: &BindingWorker) -> usize {
+    binding.flow.flow_cache.entries.iter().flatten().count()
+}
+
+// I1/I2/I3: at cap, a NAT'd new flow is REFUSED — trigger packet dropped
+// (not forwarded), nothing installed (forward NOR reverse), nothing
+// flow-cached, refusal counted.
+#[test]
+fn txn_admission_refusal_at_cap_drops_and_leaks_nothing() {
+    let forwarding = build_forwarding_state(&nat_snapshot());
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+    sessions.set_max_sessions_for_test(0);
+
+    let frame = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(8, 8, 8, 8),
+        12345,
+        443,
+        TCP_FLAG_SYN,
+    );
+    let meta = txn_meta_v4(24, TCP_FLAG_SYN, (frame.len() - 14) as u16);
+    let (batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+
+    assert_eq!(
+        dbg.tx, 0,
+        "refused flow's trigger packet must NOT be forwarded"
+    );
+    assert!(
+        binding.scratch.scratch_recycle.contains(&128),
+        "refused flow's trigger frame must be recycled"
+    );
+    assert_eq!(sessions.len(), 0, "no forward or reverse entry may leak");
+    assert_eq!(sessions.admission_refused(), 1);
+    assert_eq!(sessions.install_partial(), 0);
+    assert_eq!(
+        txn_flow_cache_entries(&binding),
+        0,
+        "a refused flow's (rolled-back) NAT decision must never be cached"
+    );
+    assert_eq!(batch.session_creates, 0);
+}
+
+// I4 boundary: a forward+reverse pair is admitted while 2 slots remain
+// and refused at cap-1 (1 slot remaining). The admitted phase also pins
+// that a passing preflight makes both installs succeed.
+#[test]
+fn txn_pair_admitted_at_cap_minus_two_refused_at_cap_minus_one() {
+    let forwarding = build_forwarding_state(&nat_snapshot());
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+    sessions.set_max_sessions_for_test(2);
+
+    // Phase 1: len 0, cap 2 — exactly the pair fits.
+    let frame = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(8, 8, 8, 8),
+        12345,
+        443,
+        TCP_FLAG_SYN,
+    );
+    let meta = txn_meta_v4(24, TCP_FLAG_SYN, (frame.len() - 14) as u16);
+    let (_b1, d1) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+    assert_eq!(
+        sessions.len(),
+        2,
+        "forward + reverse must both install when the pair fits"
+    );
+    assert_eq!(d1.tx, 1, "admitted flow forwards its trigger packet");
+    assert_eq!(sessions.admission_refused(), 0);
+
+    // Phase 2: len 2, cap 3 — one free slot, a pair needs two: refuse.
+    sessions.set_max_sessions_for_test(3);
+    let frame2 = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(8, 8, 8, 8),
+        12346,
+        443,
+        TCP_FLAG_SYN,
+    );
+    let meta2 = txn_meta_v4(24, TCP_FLAG_SYN, (frame2.len() - 14) as u16);
+    let (_b2, d2) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame2,
+        meta2,
+    );
+    assert_eq!(
+        sessions.len(),
+        2,
+        "cap-1 must refuse the pair — no one-sided forward install"
+    );
+    assert_eq!(sessions.admission_refused(), 1);
+    assert_eq!(
+        d2.tx, 0,
+        "refused flow at cap-1 must not forward its trigger packet"
+    );
+    assert_eq!(sessions.install_partial(), 0);
+}
+
+// I2 (pool-mode): the refusal arm releases the pool-SNAT allocation AND
+// the flow cache stays empty — the pre-fix behavior cached the
+// rolled-back tuple, persisting an unreserved translated (ip,port) on
+// the wire (cross-flow aliasing, plan §2).
+#[test]
+fn txn_pool_snat_refusal_rolls_back_allocation_and_caches_nothing() {
+    let mut snapshot = nat_snapshot();
+    snapshot.source_nat_rules = vec![SourceNATRuleSnapshot {
+        name: "snat-pool".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "pool-a".to_string(),
+        pool_addresses: vec!["172.16.80.100".to_string()],
+        port_low: 20000,
+        port_high: 20999,
+        ..Default::default()
+    }];
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+    sessions.set_max_sessions_for_test(0);
+
+    let frame = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(8, 8, 8, 8),
+        12345,
+        443,
+        TCP_FLAG_SYN,
+    );
+    let meta = txn_meta_v4(24, TCP_FLAG_SYN, (frame.len() - 14) as u16);
+    let (_b, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+
+    assert_eq!(dbg.tx, 0, "refused pool-SNAT flow must not forward");
+    assert_eq!(sessions.len(), 0);
+    assert_eq!(sessions.admission_refused(), 1);
+    let pools = crate::nat::source_nat_pool_statuses(&forwarding.source_nat_rules);
+    assert_eq!(pools.len(), 1);
+    assert_eq!(
+        pools[0].live_flows, 0,
+        "refused flow's pool-SNAT allocation must be rolled back"
+    );
+    assert_eq!(
+        txn_flow_cache_entries(&binding),
+        0,
+        "the rolled-back pool tuple must NOT persist in the flow cache"
+    );
+}
+
+// I5: a reply whose reverse-session repair install fails at cap is still
+// forwarded but NOT flow-cached, so the repair re-fires per packet and
+// installs the reverse session on the first reply after capacity frees
+// (plan §5.4, Codex r1 C1). Also pins created==install outcome (AGY r1
+// F1): a failed repair must not count a session create.
+#[test]
+fn txn_failed_reply_repair_forwards_uncached_then_self_heals_below_cap() {
+    let mut snapshot = nat_snapshot();
+    // The repair resolves the reply toward the LAN host; give it a
+    // neighbor so the rebuilt reverse decision is a ForwardCandidate.
+    snapshot.neighbors.push(NeighborSnapshot {
+        interface: "ge-0-0-1".to_string(),
+        ifindex: 24,
+        family: "inet".to_string(),
+        ip: "10.0.61.102".to_string(),
+        mac: "0a:0b:0c:0d:0e:0f".to_string(),
+        state: "reachable".to_string(),
+        router: false,
+        link_local: false,
+    });
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 12, 0);
+    binding.interface = Arc::<str>::from("reth0.80");
+    let mut sessions = SessionTable::new();
+
+    // Forward session: 10.0.61.102:12345 -> 8.8.8.8:443, interface SNAT
+    // to 172.16.80.8 (no port rewrite). Installed below cap, then the
+    // table is pinned at cap so the repair's reverse install must fail.
+    let forward_key = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+        src_port: 12345,
+        dst_port: 443,
+    };
+    let forward_decision = SessionDecision {
+        resolution: lookup_forwarding_resolution(&forwarding, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+        nat: NatDecision {
+            rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+            ..NatDecision::default()
+        },
+    };
+    assert!(sessions.install_with_protocol_with_origin(
+        forward_key,
+        forward_decision,
+        SessionMetadata {
+            ingress_zone: TEST_LAN_ZONE_ID,
+            egress_zone: TEST_WAN_ZONE_ID,
+            owner_rg_id: 1,
+            fabric_ingress: false,
+            is_reverse: false,
+            nat64_reverse: None,
+        },
+        SessionOrigin::ForwardFlow,
+        122_000_000_000,
+        PROTO_TCP,
+        TCP_FLAG_SYN,
+    ));
+    sessions.set_max_sessions_for_test(1);
+
+    // Reply: 8.8.8.8:443 -> 172.16.80.8:12345 (pure ACK) from the WAN.
+    let reply = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(8, 8, 8, 8),
+        Ipv4Addr::new(172, 16, 80, 8),
+        443,
+        12345,
+        0x10,
+    );
+    let meta = txn_meta_v4(12, 0x10, (reply.len() - 14) as u16);
+    let (batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &reply,
+        meta,
+    );
+    assert_eq!(
+        dbg.tx, 1,
+        "reply must still forward when the repair install fails at cap"
+    );
+    assert_eq!(sessions.len(), 1, "repair install refused at cap");
+    assert_eq!(
+        batch.session_creates, 0,
+        "a failed repair install must not count a session create (created flag)"
+    );
+    assert_eq!(
+        txn_flow_cache_entries(&binding),
+        0,
+        "a failed repair's sessionless decision must NOT be flow-cached"
+    );
+
+    // Below cap, the next reply re-fires the repair and installs the
+    // reverse session — the self-heal property the cache gate restores.
+    sessions.set_max_sessions_for_test(16);
+    let meta2 = txn_meta_v4(12, 0x10, (reply.len() - 14) as u16);
+    let (batch2, dbg2) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &reply,
+        meta2,
+    );
+    assert_eq!(
+        sessions.len(),
+        2,
+        "below cap the repair must install the reverse session"
+    );
+    assert_eq!(batch2.session_creates, 1);
+    assert_eq!(dbg2.tx, 1, "self-healed reply forwards as well");
+}
+
+// I6: a MissingNeighborSeed install refused at cap must NOT buffer the
+// frame for neighbor-resolution replay (the replay would forward on the
+// rolled-back SNAT tuple with no session). Below cap the seed installs
+// and the frame buffers as before.
+#[test]
+fn txn_refused_seed_recycles_instead_of_buffering() {
+    let mut snapshot = nat_snapshot();
+    // Remove the gateway neighbor: 8.8.8.8 routes via 172.16.80.1 whose
+    // MAC is now unknown -> MissingNeighbor seed path.
+    snapshot.neighbors.clear();
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+    sessions.set_max_sessions_for_test(0);
+
+    let frame = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(8, 8, 8, 8),
+        12345,
+        443,
+        TCP_FLAG_SYN,
+    );
+    let meta = txn_meta_v4(24, TCP_FLAG_SYN, (frame.len() - 14) as u16);
+    txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+    assert_eq!(sessions.len(), 0, "seed install refused at cap");
+    assert!(
+        binding.pending_neigh.is_empty(),
+        "a refused seed's frame must be recycled, not buffered for replay"
+    );
+
+    // Below cap: the seed installs and the representative frame buffers.
+    sessions.set_max_sessions_for_test(16);
+    let meta2 = txn_meta_v4(24, TCP_FLAG_SYN, (frame.len() - 14) as u16);
+    txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta2,
+    );
+    assert_eq!(sessions.len(), 1, "seed installs below cap");
+    assert_eq!(
+        binding.pending_neigh.len(),
+        1,
+        "below cap the representative frame buffers as before"
+    );
+}
+
+fn build_txn_tcp_syn_frame_v6(src: Ipv6Addr, dst: Ipv6Addr, src_port: u16, dst_port: u16) -> Vec<u8> {
+    let mut frame = Vec::new();
+    write_eth_header(
+        &mut frame,
+        [0x02, 0xbf, 0x72, 0x01, 0x00, 0x01],
+        [0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5],
+        0,
+        0x86dd,
+    );
+    // IPv6 header: version 6, payload len 20 (TCP), next header TCP, hop 64.
+    frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00, 0x00, 0x14, PROTO_TCP, 64]);
+    frame.extend_from_slice(&src.octets());
+    frame.extend_from_slice(&dst.octets());
+    let tcp_start = frame.len();
+    frame.extend_from_slice(&src_port.to_be_bytes());
+    frame.extend_from_slice(&dst_port.to_be_bytes());
+    frame.extend_from_slice(&1u32.to_be_bytes());
+    frame.extend_from_slice(&0u32.to_be_bytes());
+    frame.extend_from_slice(&[0x50, TCP_FLAG_SYN, 0xfa, 0xf0, 0x00, 0x00, 0x00, 0x00]);
+    let csum = checksum16_ipv6(src, dst, PROTO_TCP, &frame[tcp_start..]);
+    frame[tcp_start + 16] = (csum >> 8) as u8;
+    frame[tcp_start + 17] = csum as u8;
+    frame
+}
+
+// I14: a NAT64 flow refused at cap is dropped like any other refused
+// flow — one translated packet must NOT leak out, nothing installs,
+// nothing caches (the NAT64 v4-source pick is a stateless round-robin
+// with no reservation, so there is nothing to roll back — plan §4 I14).
+#[test]
+fn txn_nat64_refusal_at_cap_drops_translated_packet() {
+    let mut snapshot = nat_snapshot();
+    snapshot.nat64_rules = vec![crate::protocol::NAT64RuleSnapshot {
+        name: "nat64".to_string(),
+        prefix: "64:ff9b::/96".to_string(),
+        pool_addresses: vec!["172.16.80.50".to_string()],
+    }];
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+    sessions.set_max_sessions_for_test(0);
+
+    let src: Ipv6Addr = "2001:559:8585:ef00::102".parse().expect("src v6");
+    let dst: Ipv6Addr = "64:ff9b::808:808".parse().expect("nat64 dst");
+    let frame = build_txn_tcp_syn_frame_v6(src, dst, 12345, 443);
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex: 24,
+        l3_offset: 14,
+        l4_offset: 54,
+        payload_offset: 74,
+        pkt_len: (frame.len() - 14) as u16,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_TCP,
+        tcp_flags: TCP_FLAG_SYN,
+        config_generation: 7,
+        fib_generation: 9,
+        ..UserspaceDpMeta::default()
+    };
+    let (batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+    assert_eq!(
+        dbg.tx, 0,
+        "a refused NAT64 flow must not forward its translated trigger packet"
+    );
+    assert_eq!(sessions.len(), 0);
+    assert_eq!(sessions.admission_refused(), 1);
+    assert_eq!(txn_flow_cache_entries(&binding), 0);
+    assert_eq!(batch.session_creates, 0);
+
+    // Below cap the same flow is admitted — sanity that the fixture
+    // actually exercises the NAT64 install path (forward + reverse).
+    sessions.set_max_sessions_for_test(16);
+    let meta2 = UserspaceDpMeta { ..meta };
+    let (batch2, dbg2) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta2,
+    );
+    assert_eq!(sessions.len(), 2, "NAT64 forward + reverse install below cap");
+    assert_eq!(batch2.session_creates, 2);
+    assert_eq!(dbg2.tx, 1);
+}

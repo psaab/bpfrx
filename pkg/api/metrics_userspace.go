@@ -345,6 +345,25 @@ func (c *xpfCollector) emitUserspaceDynamicBufferMetrics(ch chan<- prometheus.Me
 		float64(status.NatReverseKeyCollisions),
 	)
 
+	// #1861: install-refusal trio. Emitted unconditionally (cumulative
+	// CounterValue) so a 0 is a real "no refusals" signal rather than an
+	// absent series.
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceSessionCreateDrops,
+		prometheus.CounterValue,
+		float64(status.SessionCreateDrops),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceSessionInstallAdmissionRefused,
+		prometheus.CounterValue,
+		float64(status.SessionInstallAdmissionRefused),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceSessionInstallPartial,
+		prometheus.CounterValue,
+		float64(status.SessionInstallPartial),
+	)
+
 	// #1789: failed USERSPACE_SESSIONS BPF-map publishes. Also emitted
 	// unconditionally so a 0 is a real "no publish failures" signal
 	// rather than an absent series.
@@ -806,6 +825,13 @@ func (c *xpfCollector) emitWorkerRuntime(ch chan<- prometheus.Metric, status dpu
 			prometheus.GaugeValue, float64(w.MaxSessions), label)
 		ch <- prometheus.MustNewConstMetric(c.workerNatReverseKeyCollisions,
 			prometheus.CounterValue, float64(w.NatReverseKeyCollisions), label)
+		// #1861: per-worker install-refusal trio.
+		ch <- prometheus.MustNewConstMetric(c.workerSessionCreateDrops,
+			prometheus.CounterValue, float64(w.SessionCreateDrops), label)
+		ch <- prometheus.MustNewConstMetric(c.workerSessionInstallAdmissionRefused,
+			prometheus.CounterValue, float64(w.SessionInstallAdmissionRefused), label)
+		ch <- prometheus.MustNewConstMetric(c.workerSessionInstallPartial,
+			prometheus.CounterValue, float64(w.SessionInstallPartial), label)
 		var deadValue float64
 		if w.Dead {
 			deadValue = 1

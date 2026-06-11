@@ -145,6 +145,25 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
         .iter()
         .map(|w| w.nat_reverse_key_collisions)
         .sum();
+    // #1861: aggregate the per-worker install-refusal trio.
+    state.status.session_create_drops = state
+        .status
+        .worker_runtime
+        .iter()
+        .map(|w| w.session_create_drops)
+        .sum();
+    state.status.session_install_admission_refused = state
+        .status
+        .worker_runtime
+        .iter()
+        .map(|w| w.session_install_admission_refused)
+        .sum();
+    state.status.session_install_partial = state
+        .status
+        .worker_runtime
+        .iter()
+        .map(|w| w.session_install_partial)
+        .sum();
     state.status.max_sessions = state
         .status
         .worker_runtime

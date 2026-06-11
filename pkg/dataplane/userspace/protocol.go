@@ -571,12 +571,21 @@ type ProcessStatus struct {
 	// displacement events, not distinct flow-pairs). Nonzero triggers the
 	// structural-fix research; does NOT resolve #1760. omitempty for
 	// mixed Rust/Go daemon back-compat.
-	NatReverseKeyCollisions uint64      `json:"nat_reverse_key_collisions,omitempty"`
-	FlowCacheCapacity       uint64      `json:"flow_cache_capacity,omitempty"`
-	NeighborCacheCapacity   uint64      `json:"neighbor_cache_capacity,omitempty"`
-	NeighborGeneration      uint64      `json:"neighbor_generation,omitempty"`
-	RouteEntries            int         `json:"route_entries,omitempty"`
-	WorkerHeartbeats        []time.Time `json:"worker_heartbeats,omitempty"`
+	NatReverseKeyCollisions uint64 `json:"nat_reverse_key_collisions,omitempty"`
+	// #1861: aggregate at-cap install refusals (SessionTable create_drops,
+	// write-only/invisible before #1861), pair-admission preflight
+	// refusals (one per refused flow at the new-flow transaction
+	// boundary), and post-preflight partial-install residuals (expected
+	// 0 forever; nonzero = preflight/install pairing bug). omitempty for
+	// mixed Rust/Go daemon back-compat (older helpers omit the keys).
+	SessionCreateDrops             uint64      `json:"session_create_drops,omitempty"`
+	SessionInstallAdmissionRefused uint64      `json:"session_install_admission_refused,omitempty"`
+	SessionInstallPartial          uint64      `json:"session_install_partial,omitempty"`
+	FlowCacheCapacity              uint64      `json:"flow_cache_capacity,omitempty"`
+	NeighborCacheCapacity          uint64      `json:"neighbor_cache_capacity,omitempty"`
+	NeighborGeneration             uint64      `json:"neighbor_generation,omitempty"`
+	RouteEntries                   int         `json:"route_entries,omitempty"`
+	WorkerHeartbeats               []time.Time `json:"worker_heartbeats,omitempty"`
 	// #869: per-worker busy/idle runtime telemetry.
 	WorkerRuntime []WorkerRuntimeStatus `json:"worker_runtime,omitempty"`
 	HAGroups      []HAGroupStatus       `json:"ha_groups,omitempty"`
@@ -1030,6 +1039,11 @@ type WorkerRuntimeStatus struct {
 	// worker's SessionTable nat_reverse_index (#1758). omitempty for
 	// mixed-version back-compat.
 	NatReverseKeyCollisions uint64 `json:"nat_reverse_key_collisions,omitempty"`
+	// #1861: per-worker install-refusal trio (see the ProcessStatus
+	// aggregate fields for semantics). omitempty for back-compat.
+	SessionCreateDrops             uint64 `json:"session_create_drops,omitempty"`
+	SessionInstallAdmissionRefused uint64 `json:"session_install_admission_refused,omitempty"`
+	SessionInstallPartial          uint64 `json:"session_install_partial,omitempty"`
 	// #925 Phase 1+2 (catch+report+observe): Dead == true means the
 	// worker_loop panicked and the supervisor caught it. Set-only
 	// today — cleared only by daemon restart. Phase 2 surfaces this

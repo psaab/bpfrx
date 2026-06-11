@@ -152,6 +152,19 @@ pub(crate) struct SessionTable {
     epoch_counter: u64,
     expired: u64,
     create_drops: u64,
+    /// #1861 §5.1: pair-admission preflight refusals — one per REFUSED
+    /// FLOW (not per missing slot). Bumped by `note_admission_refused`
+    /// from the new-flow refusal arms when `can_admit` fails at/near
+    /// `max_sessions`. Worker-owned, single-threaded — plain u64, no
+    /// atomics (mirrors `create_drops`).
+    admission_refused: u64,
+    /// #1861 §5.2: impossible-by-construction release residuals — an
+    /// install that failed AFTER a passing `can_admit` preflight on the
+    /// same descriptor iteration. Expected to stay 0 forever; nonzero
+    /// means the preflight/install pairing has a bug (debug builds panic
+    /// via `debug_assert!` at the call sites instead, per the #1855
+    /// contract). Plain u64 like `create_drops`.
+    install_partial: u64,
     delta_drops: u64,
     delta_drained: u64,
     /// #1760: cumulative count of NAT reverse-key displacement events on
@@ -209,6 +222,8 @@ impl SessionTable {
             epoch_counter: 0,
             expired: 0,
             create_drops: 0,
+            admission_refused: 0,
+            install_partial: 0,
             delta_drops: 0,
             delta_drained: 0,
             nat_reverse_key_collisions: 0,
@@ -303,6 +318,59 @@ impl SessionTable {
     /// `ProcessStatus.nat_reverse_key_collisions` for operators.
     pub fn nat_reverse_key_collisions(&self) -> u64 {
         self.nat_reverse_key_collisions
+    }
+
+    /// #1861 §5.1: pre-flight admission for an install group of `needed`
+    /// new entries within ONE descriptor iteration. The table is
+    /// per-worker, single-threaded, and `&mut`-exclusive during packet
+    /// processing (GC and worker commands run between poll phases), so a
+    /// passing preflight guarantees the subsequent `needed` installs
+    /// cannot fail the `max_sessions` cap — the only install failure
+    /// mode. Conservative on purpose: charges a full slot per entry even
+    /// when the key already exists (a replacement would not grow the
+    /// table). That matches `install_with_protocol_with_origin`'s own cap
+    /// check, which also refuses replacements at cap; crediting
+    /// replacements here would let the preflight pass while the install
+    /// itself fails, violating the post-preflight infallibility contract.
+    #[inline]
+    pub fn can_admit(&self, needed: usize) -> bool {
+        self.len().saturating_add(needed) <= self.max_sessions
+    }
+
+    /// #1861 §5.1: counted preflight refusal (one per refused flow).
+    pub fn note_admission_refused(&mut self) {
+        self.admission_refused = self.admission_refused.saturating_add(1);
+    }
+
+    /// #1861: cumulative pair-admission preflight refusals.
+    pub fn admission_refused(&self) -> u64 {
+        self.admission_refused
+    }
+
+    /// #1861 §5.2: counted impossible-by-construction release residual —
+    /// an install failed after a passing preflight. Call sites pair this
+    /// with `debug_assert!(false, ...)` per the #1855 contract.
+    pub fn note_install_partial(&mut self) {
+        self.install_partial = self.install_partial.saturating_add(1);
+    }
+
+    /// #1861: cumulative post-preflight partial-install residuals.
+    pub fn install_partial(&self) -> u64 {
+        self.install_partial
+    }
+
+    /// #1861: cumulative at-cap install refusals from
+    /// `install_with_protocol_with_origin` (previously write-only —
+    /// at-cap drops were operator-invisible).
+    pub fn create_drops(&self) -> u64 {
+        self.create_drops
+    }
+
+    /// #1861 tests: shrink the cap so at-cap interleavings can be rigged
+    /// without inserting 131k entries.
+    #[cfg(test)]
+    pub(crate) fn set_max_sessions_for_test(&mut self, n: usize) {
+        self.max_sessions = n;
     }
 
     // ── #964 Step 1 internal helpers ─────────────────────────────
