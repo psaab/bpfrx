@@ -1,7 +1,9 @@
 # #1760 — NAT reverse-key 1:N collision, stage-2 revisit (post-eBPF-retirement)
 
-**Revision:** v2 (round 2 — integrates Codex r1 PLAN-NEEDS-MINOR, AGY r1
-PLAN-KILL, Claude SMR r1 PLAN-NEEDS-MINOR; disposition table in §1.7)
+**Revision:** v3 (round 3 — integrates round-2 Codex PLAN-NEEDS-MAJOR + AGY
+PLAN-NEEDS-MAJOR; both r2 reviews refuted v2's "loser re-wins on refresh"
+defense and Codex found the MissingNeighborSeed coverage hole. §1.8 has the
+round-2 disposition; Path W is amended accordingly.)
 **Date:** 2026-06-10
 **Branch:** `research/1760-reverse-key-v2`
 **Issue:** #1760 (stage-1 counter shipped #1762; stage-2 SHELVED 2026-06-06,
@@ -55,6 +57,23 @@ PLAN-KILL; **Claude SMR** PLAN-NEEDS-MINOR. Not converged; v2 dispositions:
 | W3 shared-map counter adds sync overhead for a redundant metric (AGY 5) | **Accepted — W3 dropped** from the recommendation (already redundant per §2.3). |
 | W-vs-K hinges on whether a multi-host/production deployment is anticipated; surface as explicit operator conditional (SMR F5) | **Accepted** — §5 recommendation restated as a conditional; AGY's K vote recorded there. |
 | W1 eprintln-on-worker-thread safety (SMR F4) | **Accepted** — §6 W1 notes the ≤1/min global bound and the existing `xpf-ha:` stderr precedent. |
+
+## 1.8 Round-2 disposition (v3 changes)
+
+Verdicts: **Codex r2** (`task-mq91i26m-ke7g4c`) PLAN-NEEDS-MAJOR ("amended W
+remains plausible; K only honest for lab-only posture; A1 still not
+justified"); **AGY r2** (`adversarial-review-mq91hvda-u43zjb`)
+PLAN-NEEDS-MAJOR. The two external reviewers independently converged on the
+same factual refutation of v2; all accepted findings are folded in here.
+
+| r2 finding (reviewer) | v3 disposition |
+|---|---|
+| **`MissingNeighborSeed` installs are never replicated** — `poll_descriptor/mod.rs:2447-2502` installs + shared-publishes + BPF-publishes with NO `replicate_session_upsert`; `MissingNeighborSeed` is not promotable (`entry.rs:85-87,105`) and emits no delta (`mod.rs:727`); the neighbor-resolution replay forwards buffered frames without touching sessions (`neighbor_dispatch.rs:205-266`). Two cold-neighbor colliding flows on different workers are NEVER counted by the per-worker #1762 counter — a realistic first-event miss (cold egress neighbor + two LAN hosts, the exact #1782-family idle scenario) (Codex r2 F1, High). | **Accepted — verified end-to-end** (no replication call in the block; no promotion site exists; replay path session-free). Consequence: the per-worker counter alone is NOT a sound watch. Path W amended (§5): the shared-publish displacement detector (v1's W3) is REVIVED as the *primary* event detector — `publish_shared_session` is the single choke point every forward NAT session passes through *including seeds* (`:2466`), so displacement there catches the seed case. |
+| **v2's "loser re-wins K on its next refresh" is false** — `refresh_local` is `#[cfg_attr(not(test), allow(dead_code))]` (test-only, `session/mod.rs:960`); ordinary traffic refreshes go through `lookup_with_origin`/`touch` which update timestamps/wheel only and never call `index_forward_nat_key_parts`; flow-cache hits `touch` every 64 hits. After winner expiry the loser NEVER re-asserts K: its reverse path is permanently dead, and a later S3 collision on K inserts `prev=None`, uncounted (Codex r2 F2 Medium + AGY r2 F1 High — independently converged). | **Accepted — v2's event-detector defense is RETRACTED.** §2.3 rewritten. The per-worker counter counts install/replica-time displacements only (still ≥1 for a normal-path pair: the second install's replica displaces the first in every sibling table). The post-winner-expiry standing collision (S3 vs unindexed live S1) is invisible to BOTH displacement detectors (K is also removed from the shared map on winner teardown) — only a live-pair AUDIT can see it. Path W gains an optional incremental audit (W5) and W-lite explicitly documents this blind window if W5 is not taken. AGY r1 F1's thrust was more right than v2 credited. |
+| W2 preflight no longer sufficient: warm-path-only validation deliberately avoids the seed path (Codex r2 F3, Medium) | **Accepted** — W2 gains a cold-neighbor variant (flush/age the egress neighbor, start both flows simultaneously from two source IPs, assert the SHARED detector fires even when the per-worker counter does not). |
+| W1 throttle precedent miscited: `bpf_map/mod.rs:867-880` are plain counters, not a CAS throttle (Codex r2 F4, Low) | **Fixed** — precedent is the warm-sweep CAS throttle `coordinator/mod.rs:760-775` (load → window check → `compare_exchange` claim). |
+| Failed-install wart has a second face: at `max_sessions-1` the FORWARD install succeeds and the REVERSE install fails (`mod.rs:690` cap check) with no forward rollback → permanent one-way blackhole; the v2-documented face (forward fails, reverse still installed) leaks half-open reverse entries (AGY r2 F2, Medium) | **Accepted** — both faces go into the W4 issue body. Still its own issue/PR (install-path behavior + failover gating). |
+| W1 warn/help text must state the watch's real semantics (AGY r2 Q2) | **Accepted** — text now: "counts install-time displacement events; a standing collision against an already-unindexed session is not counted (see plan §2.3); ≥1 ⇒ at least one real collision occurred". |
 
 ## 2. Fresh evidence (2026-06-10/11)
 
@@ -115,18 +134,28 @@ What the audit DID find:
   value reset by every restart, no long-term Prometheus store in the lab
   (§2.1). A collision that happened yesterday before a redeploy is
   unobservable today.
-- **Counter semantics are event-detection, not a census** (AGY r1 F1,
-  adjudicated §1.7): after the winner's value-guarded removal deletes K
-  (`session/mod.rs:1459-1467`), the index has no K entry until the live
-  loser's next session refresh re-asserts it (`update_session`
-  unconditionally re-asserts secondary ADDS, `session/mod.rs:928-940`); a
-  third colliding flow installing inside that window inserts `prev=None`
-  and is not counted. But the first S1/S2 displacement was already counted
-  at install, and every subsequent S1↔S2 alternation counts again — a
-  colliding pair that passes traffic produces ≥1 count. For a watch whose
-  trigger is "nonzero", that is sufficient; W1's warn text and the
-  Prometheus help string must say "≥1 ⇒ real collision occurred; value is
-  neither a pair count nor exhaustive".
+- **Counter semantics (corrected in v3 after both r2 reviewers refuted
+  v2's reading):** the counter fires ONLY at install/replica/promote-time
+  index inserts. Ordinary traffic never re-asserts indices
+  (`lookup_with_origin`/`touch` update timestamps/wheel only;
+  `refresh_local` is test-only, `session/mod.rs:960`). Consequences:
+  (a) a normal-path colliding pair IS counted at least once — the second
+  session's install or replica displaces the first in every sibling table;
+  (b) after the winner's value-guarded removal deletes K
+  (`session/mod.rs:1459-1467`), the live loser NEVER re-wins K — its
+  reverse path is permanently dead (this is the bug itself), and a later
+  S3 collision on the now-absent K inserts `prev=None`, uncounted;
+  (c) **`MissingNeighborSeed` installs are never replicated**
+  (`poll_descriptor/mod.rs:2447-2502`, no `replicate_session_upsert`; not
+  promotable, `entry.rs:85-87,105`), so two cold-neighbor colliding flows
+  on different workers are never counted at all — a realistic first-event
+  miss (Codex r2 F1).
+  A displacement-based detector is therefore sound only at the
+  **shared-publish choke point** (`publish_shared_session`,
+  `poll_descriptor:2466` — seeds publish too), and even there a standing
+  collision against an already-unindexed live session (case b) is
+  invisible; only a periodic live-pair audit sees that. Path W (§5) is
+  built around exactly this coverage map.
 
 **Net: the watch detects the event if it happens while you are looking, but
 resets on every deploy and observes a lab that cannot generate the event
@@ -251,53 +280,78 @@ currently a trigger that structurally cannot fire from this lab.
 
 ## 5. Path options
 
-### Path W — repair the watch, keep stage-2 shelved (RECOMMENDED)
+### Path W (v3-amended) — repair the watch, keep stage-2 shelved (RECOMMENDED, conditional)
 
-Small, dataplane-behavior-neutral, makes the shelve rationale sound:
+Observation-only, no dataplane behavior change. v3 restructures W around
+the §2.3 coverage map (both r2 reviewers refuted v2's W):
 
+- **W3′ — shared-publish displacement counter (PRIMARY detector,
+  revived).** In `publish_shared_session` (`shared_ops.rs:648-690`), the
+  `shared_nat_sessions.insert(...)` returns the displaced
+  `SyncedSessionEntry`; count when `displaced.key != entry.key`
+  (different forward session owning the same reverse key), excluding the
+  reverse-canonical alias of the same entry. This is the single choke
+  point ALL forward NAT sessions pass through — normal installs
+  (`poll_descriptor:1311`), `MissingNeighborSeed` installs (`:2466`),
+  and promotes — so it catches the Codex r2 F1 seed case the per-worker
+  counter misses. Process-global `AtomicU64`; wire-additive export per
+  the #1762 template. (v2 dropped this as "redundant" on the strength of
+  the replica-fanout argument; Codex r2 F1 broke that argument — AGY r1
+  F5's redundancy objection is superseded.)
 - **W1 — durable artifact.** Rate-limited `eprintln!` journald warn when
-  `nat_reverse_key_collisions` increments (detected at the existing
-  per-tick snapshot point in `loop_body/mod.rs:187`, NOT in the per-packet
-  index path — log-hygiene). Throttle is **process-global** (a `static
-  AtomicU64` last-warn timestamp + CAS, the existing pattern at
-  `bpf_map/mod.rs:867-880`), ≤1 line/min per process regardless of worker
-  count (AGY r1 F4). Journald persists across daemon restarts — this is
-  what makes the watch survive the per-deploy counter reset. This is the
-  core of Path W.
-- **W2 — live-fire validation of the watch.** A one-time (scripted,
-  rerunnable) harness exercise on the loss cluster that *forces* a real
-  collision through interface-SNAT — two source IPs (or netns) on the LAN
-  host, each binding the SAME source port to the same external dst:port —
-  and asserts the counter goes nonzero and the W1 warn appears. Per
-  `feedback_runnable_repro_before_measurement_claim`, the watch is only
-  trustworthy once it has been proven to fire end-to-end on live traffic
-  (the #1762 unit tests prove the table-level mechanism; nothing has ever
-  proven the deployed pipeline). This also empirically re-confirms §2.6's
-  blast radius on a live system, turning the corruption claim from
-  research-probe into observed behavior.
-- **W3 — DROPPED in v2** (was: optional shared-map displacement counter in
-  `publish_shared_session`). Redundant with local-replica detection
-  (§2.3) and adds sync + wire churn for a metric nobody triggers on
-  (AGY r1 F5). Recorded here so a future round doesn't re-derive it.
-- **W4 — file the failed-install wart issue** (§2.5) immediately as its
-  own tracked bug (AGY r1 F2): on `install_with_protocol_with_origin`
-  returning false, the packet path rolls back SNAT but still installs the
-  reverse session and forwards. Independent of #1760 semantics; fix in its
-  own PR (it touches install-path behavior and therefore failover gating,
-  which a watch-only PR must not absorb).
+  EITHER the per-worker counter (snapshot point `loop_body/mod.rs:187`)
+  or W3′ increments. Throttle is **process-global** via the warm-sweep
+  CAS pattern (`coordinator/mod.rs:760-775`: load → window check →
+  `compare_exchange` claim), ≤1 line/min per process. Warn + Prometheus
+  help text state the honest semantics: "counts install-time displacement
+  events; a standing collision against an already-unindexed session is
+  not counted; ≥1 ⇒ at least one real collision occurred". Journald
+  persists across daemon restarts — the durable artifact the watch lacks.
+- **W5 (optional) — incremental live-pair audit.** The one case no
+  displacement detector can see (§2.3 case b: S3 collides with a live
+  loser whose K was already removed) needs a *condition* check, not an
+  *event* check: an incremental sweep (bounded slots per maintenance
+  tick, single-writer, no locks) over the worker's own slab building K
+  counts for live forward entries; count>1 → live-collision gauge +
+  W1 warn. Replica fanout means each worker's table contains all
+  normal-path sessions; the seed-only corner is already covered by W3′
+  at install time. **W-lite = W1+W2+W3′+W4 without W5** is a legitimate
+  reduced ship that documents this blind window instead of closing it.
+- **W2 — live-fire validation (warm + cold variants).** Preflight: active
+  config portless interface-SNAT (verified live on fw0 this round) AND
+  flow-1 reverse path proven before flow 2 starts. Warm variant: two
+  source IPs on the LAN host, same bound source port, same dst:port →
+  per-worker counter and/or W3′ nonzero + W1 warn + observed corruption
+  shape recorded. Cold variant (Codex r2 F3): age/flush the egress
+  neighbor first, start both flows simultaneously → assert W3′ fires
+  even if the per-worker counter does not. NOT part of smoke (it
+  deliberately corrupts flows).
+- **W4 — file the failed-install wart issue** (§2.5) with BOTH faces:
+  (i) forward install fails → SNAT rolled back but reverse session still
+  installed + packet forwarded (half-open reverse leak); (ii) at
+  `max_sessions-1` the forward install succeeds and the REVERSE install
+  fails (`mod.rs:690` cap) with no forward rollback → permanent one-way
+  blackhole (AGY r2 F2). Independent of #1760 semantics; fixed in its own
+  PR (install-path behavior ⇒ failover gating a watch-only PR must not
+  absorb).
 - Issue disposition: stays open, keeps `plan-kill` on the structural fix;
   issue comment records the repaired watch; **new revisit trigger** =
-  collision counter nonzero OR W1 warn in any journal (now durable and
-  proven fireable) — or first real multi-host deployment behind
-  interface-SNAT, whichever first.
+  any collision counter/gauge nonzero OR W1 warn in any journal — or
+  first real multi-host deployment behind interface-SNAT, whichever
+  first.
 
-**Recommendation conditional (SMR r1 F5, AGY r1 verdict):** W is worth its
-(small) cost iff a multi-host or production deployment is plausibly in this
-product's future — W's durable warn is what would make that deployment's
-incidence visible. If the operator's posture is "lab-only, indefinitely",
-Path K (close as accepted-risk) dominates; AGY r1 voted exactly that
-(PLAN-KILL → close). This is an operator call the converged plan surfaces
-rather than buries.
+**Recommendation conditional (SMR r1 F5; both r2 reviewers concur):** W is
+worth its cost iff a multi-host or production deployment is plausibly in
+this product's future — in the lab the population cannot collide, so even
+a perfect watch reads 0 except under W2's synthetic fire. If the posture
+is "lab-only, indefinitely", Path K (close as accepted-risk) dominates
+(AGY r1 voted exactly that; Codex r2: "K is only honest for a lab-only
+operator posture"). If silent cross-flow misdelivery is unacceptable for a
+future deployment, A1-with-commit-order-inversion is the eventual fix and
+W's detectors are its prerequisite incidence instrument. This is an
+operator call the converged plan surfaces rather than buries; the default
+if W is chosen: **W-lite** (W1+W2+W3′+W4), W5 only if the operator wants
+the standing-collision window closed.
 
 ### Path A1 — steady-state install-time refusal (window = status quo)
 
@@ -362,42 +416,51 @@ revisit (leaving everything untouched) also remains on the table.
 
 ## 6. Concrete design (Path W, the recommended ship)
 
-1. **W1 warn**: at the existing once-per-tick counters snapshot
-   (`afxdp/worker/loop_body/mod.rs:187`, where
-   `sessions.nat_reverse_key_collisions()` is already read), keep the
-   previous value in the worker; on increase, attempt a **process-global**
-   60s throttle (`static AtomicU64` last-warn-ns + CAS, pattern at
-   `bpf_map/mod.rs:867-880`) and on winning emit
-   `eprintln!("xpf-dp: NAT reverse-key collision detected on worker {}:
-   total={} (#1760 latent 1:N reverse-path corruption; >=1 means a real
-   collision occurred — value is an event count, not a pair census)")`.
-   No per-packet work; zero cost while the counter is 0 (one u64 compare
-   per tick). eprintln→journald from a worker thread is the established
-   `xpf-ha:` stderr pattern and is bounded at ≤1 line/min process-wide.
-   Update the two Prometheus descriptor help strings with the same
-   event-count (not census) language (§2.3).
-2. **W2 harness**: `test/incus/reverse-key-collision-probe.sh` —
-   preflight asserts (i) active config has portless interface-SNAT on the
-   traversal path (`source-nat { interface; }` — verified live on fw0
-   this round, lan→wan v4+v6) and (ii) flow 1 established AND its reverse
-   path passes traffic before flow 2 starts (so a non-firing counter is
-   distinguishable from a routing/NAT-mode failure). Then: two source IPs
-   (or netns) on the LAN host, sockets bound to an identical source port
-   toward the same dst:port, asserts (a) counter nonzero on the active
-   node, (b) W1 journald warn present, (c) records the observed
-   wrong-flow behavior (mis-delivery or drop) for §2.6. Documented as
-   rerunnable; NOT part of smoke (it deliberately corrupts two flows).
-3. **W4 issue filing**: file the §2.5 failed-install wart as its own bug
-   (title, repro = `max_sessions` cap, blast radius = reverse session
-   installed + packet forwarded with rolled-back SNAT state) — done as
-   part of the disposition, fixed in its own PR.
-4. Tests: unit pin that the warn throttles (no log flood on a counter
-   burst) and that a counter increase with a lost CAS race does not
-   deadlock or double-warn.
-5. Issue comment updating the watch description + new revisit trigger.
+Default ship = **W-lite** (W1+W2+W3′+W4); W5 separately decidable.
 
-No per-packet cost; no dataplane behavior change; no HA semantics touched;
-no wire-format change (W3 dropped — the warn + existing counters suffice).
+1. **W3′ counter**: in `publish_shared_session`, capture the
+   `shared_nat_sessions.insert` returns for the reverse-wire and (when
+   distinct) reverse-canonical keys; if `displaced.key != entry.key`,
+   `NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.fetch_add(1)` (process-global
+   `static AtomicU64`). Same-session republish (same forward key) and the
+   self-alias case do not count. Export per the #1762 wire-additive
+   template: `ProcessStatus` field (serde default) → fixture regen →
+   `protocol.go` → `pkg/api` descriptor
+   `xpf_userspace_session_nat_reverse_key_shared_displacements_total` +
+   key-absent pins both sides + `show system buffers` row (suppressed
+   at 0).
+2. **W1 warn**: at the per-tick counters snapshot
+   (`afxdp/worker/loop_body/mod.rs:187`), compare previous per-worker
+   counter value AND the W3′ global; on any increase, claim a
+   **process-global 60s CAS throttle** (warm-sweep pattern,
+   `coordinator/mod.rs:760-775`) and emit one
+   `eprintln!("xpf-dp: NAT reverse-key collision detected (worker={} local_total={} shared_total={}) — #1760 ...")`
+   with the honest-semantics tail from §5. Zero per-packet work; ≤1
+   line/min process-wide; established `xpf-ha:` stderr precedent.
+   Prometheus help strings updated with the same language.
+3. **W2 harness**: `test/incus/reverse-key-collision-probe.sh` — preflight
+   (i) portless interface-SNAT active (verified live on fw0 this round,
+   lan→wan v4+v6), (ii) flow-1 reverse path proven before flow 2. Warm
+   variant + cold-neighbor variant per §5; asserts counters/warn and
+   records the observed corruption shape for §2.6. Rerunnable; NOT part
+   of smoke.
+4. **W4 issue filing**: file the §2.5 wart with both faces (forward-fail
+   half-open reverse leak; reverse-fail-at-cap one-way blackhole) —
+   done as part of the disposition, fixed in its own PR.
+5. **W5 (only if taken)**: incremental slab sweep on the worker
+   maintenance tick — cursor over slot ranges (bounded slots/tick), local
+   `FxHashMap<K,count>` across a full pass over live, non-reverse,
+   NAT-rewriting entries; count>1 → live-collision gauge + W1 warn. The
+   sweep must tolerate slab mutation between chunks (false negatives
+   across a pass boundary are acceptable for a watch; document).
+6. Tests: W3′ alias/republish negatives + displacement-positive; W1
+   throttle pins (no flood on burst; lost CAS race no double-warn);
+   protocol fixture round-trip with the new field absent (old-Go ↔
+   new-Rust); `go test ./...`.
+7. Issue comment updating the watch description + new revisit trigger.
+
+No per-packet cost; no dataplane behavior change; no HA semantics touched.
+One wire-additive field (W3′) — the #1762 template applies verbatim.
 
 ## 7. Public API / invariants preserved
 
@@ -411,9 +474,12 @@ no wire-format change (W3 dropped — the warn + existing counters suffice).
 
 | Risk | Path | Level | Note |
 |---|---|---|---|
-| Log flood from W1 warn | W | LOW | process-global 60s throttle; counter is 0 today; throttle unit-pinned |
+| Log flood from W1 warn | W | LOW | process-global 60s CAS throttle; counters are 0 today; throttle unit-pinned |
 | W2 harness leaves cluster state dirty | W | LOW | scripted teardown; flows time out; run under cluster flock |
-| Counter misread (event count, not census; replica fanout over-counts; post-removal window under-counts) | W | LOW | exact semantics in descriptor help + warn text (§2.3) |
+| W3′ mutex hold-time growth | W | LOW | one key compare under a mutex already held per install |
+| Standing-collision blind window (no W5) | W-lite | accepted | documented in §2.3/§5; W5 closes it if taken |
+| W5 sweep cost / poll-tick stall | W5 | MED | bounded slots/tick; single-writer no-lock; gate on measured tick budget |
+| Counter misread (event count, not census; fanout over-counts; §2.3 cases b/c under-count without W3′/W5) | W | LOW | exact semantics in descriptor help + warn text (§2.3) |
 | False refusal on stale synced incumbent | A1 | MED | bounded by GC+delete-sync latency; UDP worst case |
 | Cross-worker TOCTOU without commit-order inversion | A1 | HIGH | guard must check-and-reserve under shared lock before local/BPF commit (§5) |
 | Transition-window divergence unchanged | A1 | accepted | explicitly status quo, documented |
@@ -424,12 +490,12 @@ no wire-format change (W3 dropped — the warn + existing counters suffice).
 - `cargo test --release` full (awk-aggregated all "test result" lines);
   known flakes (wg `reconcile_peers_snapshot`, worker_queue
   `concurrent_recovery`) proven standalone before attribution.
-- W1 throttle unit tests (per §6.4). `go test ./...` for the descriptor
-  help-string updates.
-- **W2 live-fire on the loss cluster** (under the cluster flock):
-  preflight (SNAT mode + flow-1 reverse path) → forced collision →
-  counter nonzero + warn present + observed corruption shape recorded;
-  then teardown and confirm counter stable afterward.
+- W3′ + W1 unit tests (per §6.6); protocol fixture key-absent pins;
+  `go test ./...`.
+- **W2 live-fire on the loss cluster** (under the cluster flock): warm
+  variant (counters + warn + corruption shape) AND cold-neighbor variant
+  (W3′ fires when the per-worker counter cannot); teardown and confirm
+  counters stable afterward.
 - Smoke A+B on loss userspace cluster (counters stay 0 under normal
   traffic — no false positives at line rate); failover NOT mandatory for W
   (no session-install or HA semantics change — observation only).
@@ -446,31 +512,38 @@ no wire-format change (W3 dropped — the warn + existing counters suffice).
 - Adding an `established` bit / flow-cache TCP-state hook (§2.4) — only
   relevant to an A1 refinement nobody is shipping this round.
 
-## 11. Open questions for adversarial review (round 2)
+## 11. Open questions for adversarial review (round 3)
 
-Round-1 questions 1, 2 and 6 were answered (replica-fanout coverage
-confirmed by both reviewers; shim-bypass confirmed dead by both; math
-correction folded in). Round-2 questions:
+Settled in rounds 1-2 (do not re-litigate without new evidence): shim
+never bypasses userspace for transit; replica fanout covers normal-path
+installs but NOT seeds (Codex r2 F1, verified); ordinary traffic never
+re-asserts indices — v2's "loser re-wins" is retracted (Codex r2 F2 + AGY
+r2 F1); A1 requires commit-order inversion; the failed-install wart has
+two faces (W4). Round-3 questions:
 
-1. Does the §1.7/§2.3 adjudication of AGY r1 F1 hold — is "event detector,
-   ≥1 count per colliding pair that passes traffic" the correct reading of
-   the alternation + re-assert behavior (`session/mod.rs:928-940`,
-   `:1399-1405`), and is event-detection sufficient for the watch's
-   purpose? AGY: if you maintain that the corner (loser permanently silent
-   after winner removal + third flow collides in the absent-K window)
-   breaks the watch, provide the concrete traffic pattern in which the
-   FIRST displacement was also never counted.
-2. Is W1's process-global CAS throttle + warn text + descriptor-help
-   wording (§6.1) acceptable log-hygiene and operator-honest counter
-   semantics?
-3. Is the W2 preflight (§6.2) now sufficient to make a non-firing live
-   test attributable (NAT-mode vs routing vs counter defect)?
-4. Path verdict: W (repair watch, keep stage-2 shelved, file W4) vs K
-   (close as accepted-risk — AGY r1's vote) vs A1-with-commit-order-
-   inversion. The recommendation conditional (§5) makes this an operator
-   call; reviewers should attack the *framing*, not re-litigate settled
-   facts.
-5. **PLAN-KILL invitation stands:** if a reviewer shows the watch cannot
-   detect a realistic collision pattern even with W1 (counter + warn), or
-   that W's cost exceeds its conditional value, PLAN-KILL (keep shelve
-   as-is or close) is a fully legitimate verdict.
+1. Is the §2.3 coverage map complete for the v3 detector set — i.e. with
+   W3′ at `publish_shared_session` (every forward NAT session, incl.
+   seeds) plus the per-worker install/replica counter, is the ONLY
+   remaining blind case the standing collision against an
+   already-unindexed live session (closed by W5)? Known candidate the
+   author flags for adjudication: `install_helper_local_session_on_miss`
+   (`forwarding/mod.rs:1069`, caller `poll_descriptor:840`,
+   `SessionOrigin::LocalMiss`, LocalDelivery disposition, is_reverse=false)
+   installs into `nat_reverse_index` WITHOUT shared publish or
+   replication — can a local-delivery session genuinely share K with a
+   transit NAT session (interface-NAT to the same interface IP), or is it
+   outside the collision domain?
+2. Is W3′'s predicate (`displaced.key != entry.key`, alias-excluded)
+   free of false positives across RG migration, promote
+   (`SharedPromote` republish of the SAME logical session), HA re-sync,
+   and NAT64 alias shapes?
+3. Is W-lite (W1+W2+W3′+W4, standing-collision window documented-open) an
+   acceptable reduced ship, or does honesty require W5 in the same PR?
+4. Final path verdict on the DOCUMENT: W-conditional-on-deployment-posture
+   (default W-lite) vs K (close as accepted-risk) vs A1. PLAN-READY here
+   means "the plan, including its operator conditional, is converged and
+   honest"; attack the framing, not settled facts.
+5. **PLAN-KILL invitation stands:** if a reviewer shows W3′ still misses a
+   realistic first event, or that the amended W's cost exceeds its
+   conditional value, PLAN-KILL (keep shelve as-is or close) remains fully
+   legitimate.
