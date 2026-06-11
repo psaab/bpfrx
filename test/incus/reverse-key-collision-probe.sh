@@ -123,7 +123,7 @@ echo "probe source IPs: $PROBE_IP1 + $PROBE_IP2 (src port $SRC_PORT)"
 if [ "$VARIANT" = "cold" ]; then
     echo "-- cold preflight: prove target reachability (ephemeral source port,"
     echo "   does not occupy the colliding K) before disturbing neighbor state"
-    if ! inc "$LAN_HOST" "timeout 5 bash -c 'exec 3<>/dev/tcp/$TARGET/$TPORT' && exec 3<&- 2>/dev/null; true"; then
+    if ! inc "$LAN_HOST" "timeout 5 bash -c 'exec 3<>/dev/tcp/$TARGET/$TPORT'"; then
         echo "FAIL(cold preflight): $TARGET:$TPORT unreachable BEFORE the cold"
         echo "  construction — a later non-firing counter would be a path/"
         echo "  listener failure, not a watch defect. Fix the path first."
