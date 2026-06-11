@@ -1,8 +1,6 @@
 # #1736 / #1703 S2b — Live kernel-WireGuard-on-VM interop test + smoke
 
-Revision: v2 (post round-1: Codex PLAN-NEEDS-MAJOR + AGY PLAN-KILL
-[severity-refuted on F1/F2, observations folded] + Claude SMR
-PLAN-NEEDS-MAJOR — see §11)
+Revision: v3-final (CONVERGED PLAN-READY 3-of-3 at round 2 — see §11)
 Branch: `research/1736-wg-interop`
 Issue: https://github.com/psaab/xpf/issues/1736 (part of #1703; follow-up of
 #1432 S2a, PR #1739)
@@ -317,14 +315,21 @@ handshake + ping, skip >MTU/rekey/restart phases.
   wg0 TUN MTU (~1425) makes the kernel fragment the INNER (DF not set);
   both inner fragments encap individually and the peer reassembles after
   decap — assert success. Restore peer MTU/AllowedIPs afterward.
-- **P6 restart recovery (restart runbook)**: `systemctl restart xpfd` on fw0;
-  apply the issue's restart runbook on the peer (`ip link del wgref; ip link
-  add ...; wg set ...` — clears the peer's per-peer TAI64N high-water, which
-  xpf cannot exceed after restart until S6 persistence). Assert tunnel
-  re-establishes + ping passes within 30 s. ALSO capture the negative
-  control: restart xpfd WITHOUT flushing the peer and record whether the
-  handshake is rejected (TAI64N replay protection working as spec'd) — that
-  observation documents WHY the runbook step exists.
+- **P6 restart recovery (restart runbook)**: restore the initiator config
+  (endpoint back in the stanza — initiator-role is the case TAI64N
+  monotonicity can bite); `systemctl restart xpfd` on fw0; apply the
+  issue's restart runbook on the peer (`ip link del wgref; ip link add
+  ...; wg set ...` — clears the peer's per-peer TAI64N high-water). Assert
+  tunnel re-establishes + ping passes within 30 s. ALSO capture the
+  negative control FIRST: restart xpfd WITHOUT flushing the peer and
+  RECORD the outcome — note (SMR r2): xpf's TAI64N is wall-clock-derived
+  (`tai64n.rs`: `SystemTime` + whitened nanos), so with a sane NTP clock
+  the post-restart timestamps are naturally HIGHER and the peer will
+  normally accept without a flush; the flush guards the backwards
+  clock-step / same-whitened-tick edge (S1 §5.2). The negative control is
+  therefore observe-and-record (either acceptance-without-flush or a
+  TAI64N rejection is consistent with spec), NOT an assert — but the
+  runbook still performs the flush unconditionally per the issue text.
 - **P7 fast-path no-regress smoke**: with WG configured and the tunnel up
   (and idle-keepalive traffic only), run the standard smoke: iperf3 v4+v6
   push + reverse P=12 against 172.16.80.200, compare to the P0 baseline
@@ -465,11 +470,13 @@ during WG; WG perf optimization; any change to the shim or hot path.
    comprehensive smoke + future S4-S7 reuse) preferable to teardown-by-
    default? Current plan: teardown by default, `--keep` documented.
 5. (v2) Follow-up issues the harness PR will file regardless of outcome:
-   (a) WG telemetry counters (S6/#1434 adjacency); (b) responder-TX-fallback
-   to `peer.previous` during the unconfirmed window IF the measured P4 gap
-   is material; (c) shim `frag_off` awareness IF P5 lands on outcome (ii)
-   for fragment-path reasons. Reviewers: confirm this filing discipline is
-   the right boundary between "small in-PR fix" and "file the blocker".
+   (a) WG telemetry counters (S6/#1434 adjacency) — per AGY r2, include
+   exposing unconfirmed-window/decap drop REASONS (not just counts) so the
+   transient drop window is operator-triageable without tcpdump;
+   (b) responder-TX-fallback to `peer.previous` during the unconfirmed
+   window IF the measured P4 gap is material; (c) shim `frag_off`
+   awareness IF P5 lands on outcome (ii) for fragment-path reasons.
+   RESOLVED round 2: filing discipline confirmed by all three reviewers.
 
 ## 11. Convergence log
 
@@ -495,3 +502,23 @@ during WG; WG perf optimization; any change to the shim or hot path.
   `claude-smr-plan-r1.md` §S2 and §7.2/§7.4 here); its real observations
   (HA interference, telemetry blindness) are folded as mandatory
   mitigations. Round 2 to confirm.
+- **Round 2 verdicts — CONVERGED PLAN-READY 3-of-3**:
+  - Codex `task-mq91oljl-e4d97u`: **PLAN-READY** — all 7 r1 findings
+    verified resolved; confirmed the kernel staged-data-or-keepalive
+    confirmation claim, the lib.rs:567 fragment fallback, the
+    `compiler.go:161` node-group expansion + `/etc/xpf/node-id` chain, and
+    the P0..P7 phase-order protocol coherence.
+  - AGY `adversarial-review-mq91if0w-zxjm2r`: **PLAN-READY, r1 PLAN-KILL
+    revoked** — re-verified both refutations against the code; added the
+    arithmetic proof that the non-first outer fragment is always a
+    non-empty multiple of 8 bytes (so `parse_l4` never XDP_DROPs it);
+    recommended the S6 telemetry follow-up include drop REASONS (folded,
+    §10.5a) and the P6 expectation correction (folded).
+  - Claude SMR `claude-smr-plan-r2.md`: **PLAN-READY** — caught + fixed
+    the v2 P6 negative-control error (TAI64N is wall-clock-derived;
+    restart-without-flush normally succeeds; observe-and-record, flush
+    stays unconditional).
+- v3-final: P6 corrected, §10.5 telemetry scope extended. This is the
+  converged plan of record. Recommendation: **Path A** (loss-resident
+  Debian-13 VM peer `xpf-wg-peer`, mlx1 VF VLAN 3667, node0-scoped wg0
+  stanza), phases P0,P1,P2,P4a,P3,P4b,P5,P6,P7 + teardown.
