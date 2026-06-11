@@ -13,3 +13,9 @@
 - fairness-regimes.md counter-reset note (AGY F2 / SMR F1)
 - v8_unclaimed_carry_redeals_flow_proportionally_across_workers (pre-round, isolation pin)
 Gates re-run: cargo test --release 1969 passed / 0 failed; go test ./... green.
+
+## Round 2 (code head db48b6ddc / final head cf5161a0d docs-only)
+- Codex: task-mq9h98ej-pul5hk (session 019eb6ab-2ce4-79a2-888e-1e1f671a4b76) — MERGE-READY, no residuals (explicitly covered the cf5161a0d docs-only delta)
+- AGY: adversarial-review-mq9h7otg-f258kt — MERGE-READY, no residuals (all 4 r1 findings verified folded; regime-2 math + concurrency bound independently validated)
+- Claude SMR: claude-smr-code-r2.md — MERGE-READY
+- Copilot: 2x file-limit failures (>300 files) before the cf5161a0d slim; re-requested at 16 files — verdict pending
