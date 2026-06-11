@@ -65,6 +65,9 @@ func (s *Server) getSessionsCursor(ctx context.Context, req *pb.GetSessionsReque
 	}
 
 	filter := s.buildSessionFilter(req)
+	if err := filter.validate(); err != nil {
+		return nil, err
+	}
 	noEnrich := req.NoEnrich
 
 	now := monotonicSeconds()
@@ -255,6 +258,9 @@ type sessionFilter struct {
 	natOnly      bool
 	appFilter    string
 	ifaceFilter  string
+	snatPool     string       // source-nat-pool filter: pool name ("" = off)
+	snatPoolNets []*net.IPNet // resolved pool address set
+	snatPoolOK   bool         // pool name resolved to a configured source pool
 	cfg          *config.Config
 	zoneNames    map[uint16]string
 	zoneIfaces   map[uint16]string
@@ -262,6 +268,16 @@ type sessionFilter struct {
 	policyNames  map[uint32]string
 	appNames     map[uint16]string
 	hasFilters   bool // true if any filter narrows results
+}
+
+// validate reports operator-input errors that must fail the RPC rather
+// than silently match nothing (or, worse for clear paths, match
+// everything).
+func (f *sessionFilter) validate() error {
+	if f.snatPool != "" && !f.snatPoolOK {
+		return status.Errorf(codes.InvalidArgument, "source NAT pool %q not found", f.snatPool)
+	}
+	return nil
 }
 
 func (s *Server) buildSessionFilter(req *pb.GetSessionsRequest) *sessionFilter {
@@ -273,6 +289,7 @@ func (s *Server) buildSessionFilter(req *pb.GetSessionsRequest) *sessionFilter {
 		natOnly:      req.NatOnly,
 		appFilter:    req.Application,
 		ifaceFilter:  req.InterfaceFilter,
+		snatPool:     req.SourceNatPool,
 		cfg:          s.store.ActiveConfig(),
 		zoneNames:    make(map[uint16]string),
 		zoneIfaces:   make(map[uint16]string),
@@ -280,7 +297,10 @@ func (s *Server) buildSessionFilter(req *pb.GetSessionsRequest) *sessionFilter {
 	}
 	f.hasFilters = f.zoneFilter != 0 || f.protoFilter != "" || req.SourcePrefix != "" ||
 		req.DestinationPrefix != "" || f.srcPort != 0 || f.dstPort != 0 ||
-		f.natOnly || f.appFilter != "" || f.ifaceFilter != ""
+		f.natOnly || f.appFilter != "" || f.ifaceFilter != "" || f.snatPool != ""
+	if f.snatPool != "" && f.cfg != nil {
+		f.snatPoolNets, f.snatPoolOK = config.SourceNATPoolNets(&f.cfg.Security.NAT, f.snatPool)
+	}
 
 	// Parse CIDR prefix filters.
 	if req.SourcePrefix != "" {
@@ -385,6 +405,12 @@ func (f *sessionFilter) matchV4(key dataplane.SessionKey, val dataplane.SessionV
 			return false
 		}
 	}
+	if f.snatPool != "" {
+		if val.Flags&dataplane.SessFlagSNAT == 0 ||
+			!config.IPInNets(uint32ToIP(val.NATSrcIP), f.snatPoolNets) {
+			return false
+		}
+	}
 	return true
 }
 
@@ -421,6 +447,12 @@ func (f *sessionFilter) matchV6(key dataplane.SessionKeyV6, val dataplane.Sessio
 		inIf := f.zoneIfaces[val.IngressZone]
 		outIf := resolveSessionEgressIface(val.FibIfindex, val.FibVlanID, val.EgressZone, f.zoneIfaces, f.egressIfaces)
 		if !sessionIfaceMatches(f.ifaceFilter, inIf) && !sessionIfaceMatches(f.ifaceFilter, outIf) {
+			return false
+		}
+	}
+	if f.snatPool != "" {
+		if val.Flags&dataplane.SessFlagSNAT == 0 ||
+			!config.IPInNets(net.IP(val.NATSrcIP[:]), f.snatPoolNets) {
 			return false
 		}
 	}
@@ -488,6 +520,9 @@ func (s *Server) getSessionsLegacy(ctx context.Context, req *pb.GetSessionsReque
 	noEnrich := req.NoEnrich
 
 	filter := s.buildSessionFilter(req)
+	if err := filter.validate(); err != nil {
+		return nil, err
+	}
 	now := monotonicSeconds()
 	all := make([]*pb.SessionEntry, 0, limit)
 	idx := 0
@@ -645,7 +680,8 @@ func (s *Server) ClearSessions(ctx context.Context, req *pb.ClearSessionsRequest
 	if req.SourcePrefix == "" && req.DestinationPrefix == "" &&
 		req.Protocol == "" && req.Zone == "" &&
 		req.SourcePort == 0 && req.DestinationPort == 0 &&
-		req.Application == "" {
+		req.Application == "" && req.Interface == "" &&
+		!req.NatOnly && req.SourceNatPool == "" {
 		v4, v6, err := s.dp.ClearAllSessions()
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "%v", err)
@@ -659,53 +695,37 @@ func (s *Server) ClearSessions(ctx context.Context, req *pb.ClearSessionsRequest
 		}, nil
 	}
 
-	// Build filter
-	var srcNet, dstNet *net.IPNet
-	if req.SourcePrefix != "" {
-		cidr := req.SourcePrefix
-		if !strings.Contains(cidr, "/") {
-			if strings.Contains(cidr, ":") {
-				cidr += "/128"
-			} else {
-				cidr += "/32"
-			}
-		}
-		_, srcNet, _ = net.ParseCIDR(cidr)
+	// Build the SAME filter the show path uses (matchV4/matchV6) so
+	// show and clear can never diverge (#1827 PR-3). This also fixes
+	// the former inline filter comparing network-order key ports to
+	// host-order request ports, and adds the interface / nat-only /
+	// source-nat-pool filters the CLI advertises.
+	getReq := &pb.GetSessionsRequest{
+		Protocol:          req.Protocol,
+		SourcePrefix:      req.SourcePrefix,
+		DestinationPrefix: req.DestinationPrefix,
+		SourcePort:        req.SourcePort,
+		DestinationPort:   req.DestinationPort,
+		NatOnly:           req.NatOnly,
+		Application:       req.Application,
+		InterfaceFilter:   req.Interface,
+		SourceNatPool:     req.SourceNatPool,
 	}
-	if req.DestinationPrefix != "" {
-		cidr := req.DestinationPrefix
-		if !strings.Contains(cidr, "/") {
-			if strings.Contains(cidr, ":") {
-				cidr += "/128"
-			} else {
-				cidr += "/32"
-			}
-		}
-		_, dstNet, _ = net.ParseCIDR(cidr)
-	}
-
-	var proto uint8
-	switch strings.ToLower(req.Protocol) {
-	case "tcp":
-		proto = 6
-	case "udp":
-		proto = 17
-	case "icmp":
-		proto = 1
-	}
-
-	clearCfg := s.store.ActiveConfig()
-	var appNames map[uint16]string
-	cr := s.applyResult()
-	if cr != nil {
-		appNames = cr.AppNames
-	}
-
-	var zoneID uint16
 	if req.Zone != "" {
-		if cr != nil {
+		// An unresolvable zone must fail the RPC: leaving the zone ID
+		// at 0 would silently widen the clear to every zone.
+		var zoneID uint16
+		if cr := s.applyResult(); cr != nil {
 			zoneID = cr.ZoneIDs[req.Zone]
 		}
+		if zoneID == 0 {
+			return nil, status.Errorf(codes.InvalidArgument, "zone %q not found", req.Zone)
+		}
+		getReq.Zone = uint32(zoneID)
+	}
+	filter := s.buildSessionFilter(getReq)
+	if err := filter.validate(); err != nil {
+		return nil, err
 	}
 
 	// Clear matching IPv4 sessions
@@ -714,29 +734,7 @@ func (s *Server) ClearSessions(ctx context.Context, req *pb.ClearSessionsRequest
 	var v4RevKeys []dataplane.SessionKey
 	var snatDNATKeys []dataplane.DNATKey
 	_ = s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
-		if val.IsReverse != 0 {
-			return true
-		}
-		if proto != 0 && key.Protocol != proto {
-			return true
-		}
-		if srcNet != nil && !srcNet.Contains(net.IP(key.SrcIP[:])) {
-			return true
-		}
-		if dstNet != nil && !dstNet.Contains(net.IP(key.DstIP[:])) {
-			return true
-		}
-		if zoneID != 0 && val.IngressZone != zoneID && val.EgressZone != zoneID {
-			return true
-		}
-		if req.SourcePort != 0 && key.SrcPort != uint16(req.SourcePort) {
-			return true
-		}
-		if req.DestinationPort != 0 && key.DstPort != uint16(req.DestinationPort) {
-			return true
-		}
-		if req.Application != "" && !appid.SessionMatches(req.Application, appNames, clearCfg,
-			key.Protocol, ntohs(key.DstPort), val.AppID) {
+		if !filter.matchV4(key, val) {
 			return true
 		}
 		v4Keys = append(v4Keys, key)
@@ -776,29 +774,7 @@ func (s *Server) ClearSessions(ctx context.Context, req *pb.ClearSessionsRequest
 	var v6RevKeys []dataplane.SessionKeyV6
 	var snatDNATKeysV6 []dataplane.DNATKeyV6
 	_ = s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
-		if val.IsReverse != 0 {
-			return true
-		}
-		if proto != 0 && key.Protocol != proto {
-			return true
-		}
-		if srcNet != nil && !srcNet.Contains(net.IP(key.SrcIP[:])) {
-			return true
-		}
-		if dstNet != nil && !dstNet.Contains(net.IP(key.DstIP[:])) {
-			return true
-		}
-		if zoneID != 0 && val.IngressZone != zoneID && val.EgressZone != zoneID {
-			return true
-		}
-		if req.SourcePort != 0 && key.SrcPort != uint16(req.SourcePort) {
-			return true
-		}
-		if req.DestinationPort != 0 && key.DstPort != uint16(req.DestinationPort) {
-			return true
-		}
-		if req.Application != "" && !appid.SessionMatches(req.Application, appNames, clearCfg,
-			key.Protocol, ntohs(key.DstPort), val.AppID) {
+		if !filter.matchV6(key, val) {
 			return true
 		}
 		v6Keys = append(v6Keys, key)
