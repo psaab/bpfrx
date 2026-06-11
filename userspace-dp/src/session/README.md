@@ -92,13 +92,30 @@ since #1861 via the worker-runtime status path as
 `xpf_userspace[_worker]_session_*_total`):
 
 - `create_drops` — at-cap refusals from the install itself (repair,
-  seed, fabric-return, LocalMiss, UpsertLocal replica sites);
+  seed, fabric-return, LocalMiss sites);
 - `admission_refused` — preflight refusals (one per refused flow);
 - `install_partial` — post-preflight residuals, expected 0 forever
   (the call sites pair the count with `debug_assert!` per the #1855
   contract above).
 
 Decision record: `docs/research/1861-install-txn/plan.md`.
+
+### UpsertLocal is in the uncapped sync family (#1870)
+
+`upsert_synced_with_origin` has NO cap check (the #1861 plan's row
+I11): HA sync, replica fan-out, and reactive shared-hit
+materialization all install past `max_sessions` by design. Since
+#1870 the local-tunnel prewarm (`WorkerCommand::UpsertLocal`,
+`session_glue`) joins that family with `allow_replace_local=true` —
+the entries are coordinator-authoritative `SyncImport` replicas of
+state already published to the shared maps, and the capped install
+previously refused the worker-table copy at cap while the reactive
+materializer reinstalled the reverse entry uncapped on the next reply
+packet anyway (futile cap; polluted `create_drops`; cap-1 partial
+pairs). Consequently `create_drops` no longer counts `UpsertLocal`
+installs — they cannot fail. The future cap arbitration for the sync
+family (row I11) now covers `UpsertLocal` automatically. Decision
+record: `docs/research/1870-local-tunnel-pair/plan.md`.
 
 ## Why a slab + integer handles
 
