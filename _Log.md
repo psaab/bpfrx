@@ -5145,3 +5145,7 @@ top.
 - **Timestamp**: 2026-06-11
   **Action**: #1865 research — drafted plan v1 (WG telemetry: per-engine WgCounters, wire-additive wg_tunnels rows keyed by tunnel name, Prometheus family, Path B show command)
   **File(s)**: docs/research/1865-wg-telemetry/plan.md
+
+- **Timestamp**: 2026-06-11
+  **Action**: #1865 research — folded round-1 reviews into plan v2 (keepalive counter, created-vs-sent rename, absolute handshake timestamp, hex pubkey, name fallback, runt exclusion, test tightening; AGY stale-TUN finding refuted)
+  **File(s)**: docs/research/1865-wg-telemetry/{plan.md,codex-plan-r1.md,reviewer-ids.md}, _Log.md
