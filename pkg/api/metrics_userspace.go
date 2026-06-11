@@ -1264,6 +1264,19 @@ func (c *xpfCollector) emitCoSEqualFlowEnforcement(ch chan<- prometheus.Metric, 
 				1,
 				ifindexLabel, queueLabel,
 			)
+			// #1746: sibling info metric naming the active target
+			// policy. The Rust status overlay always populates the
+			// label for equal-flow leases; guard anyway so a
+			// mixed-version helper (older Rust, empty label) emits no
+			// empty-label series.
+			if queue.EqualFlowTargetPolicy != "" {
+				ch <- prometheus.MustNewConstMetric(
+					c.cosEqualFlowTargetPolicy,
+					prometheus.GaugeValue,
+					1,
+					ifindexLabel, queueLabel, queue.EqualFlowTargetPolicy,
+				)
+			}
 			ch <- prometheus.MustNewConstMetric(
 				c.cosEqualFlowEnforced,
 				prometheus.GaugeValue,

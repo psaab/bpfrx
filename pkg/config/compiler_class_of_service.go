@@ -251,6 +251,10 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 				sched.SurplusSharing = true
 			case "equal-flow-enforcement":
 				sched.EqualFlowEnforcement = true
+			case "equal-flow-target-policy":
+				// #1746: enum validated by the schema (set time) and
+				// validateClassOfServiceStrict (commit time).
+				sched.EqualFlowTargetPolicy = nodeVal(child)
 			case "codel-target":
 				// #1614 A3: value in milliseconds; store as
 				// nanoseconds. Empty value = 0 = disabled.

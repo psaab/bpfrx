@@ -361,6 +361,11 @@ func newCollector(srv *Server) *xpfCollector {
 			"1 when this exact CoS queue's shared v8 lease is configured for opt-in equal-flow suppression (#1304).",
 			[]string{"ifindex", "queue_id"}, nil,
 		),
+		cosEqualFlowTargetPolicy: prometheus.NewDesc(
+			"xpf_userspace_cos_equal_flow_target_policy",
+			"Info metric (always 1): the equal-flow target policy active on this exact CoS queue's shared v8 lease — policy label is one of slowest | mean | ideal-share (#1746). Sibling of the existing equal-flow gauges; series identity of those gauges is unchanged.",
+			[]string{"ifindex", "queue_id", "policy"}, nil,
+		),
 		cosEqualFlowEnforced: prometheus.NewDesc(
 			"xpf_userspace_cos_equal_flow_enforced",
 			"1 when this exact CoS queue's current shared v8 lease epoch is actively applying equal-flow suppression; 0 when configured but failed open (#1304).",

@@ -4422,6 +4422,62 @@ func TestBuildClassOfServiceSnapshotIncludesTransmitRateExact(t *testing.T) {
 	}
 }
 
+// #1746: the equal-flow target policy reaches the scheduler snapshot,
+// and an UNSET policy keeps the serialized snapshot byte-identical to
+// the pre-#1746 wire (omitempty) — the byte-unchanged-default proof.
+func TestBuildClassOfServiceSnapshotIncludesEqualFlowTargetPolicy(t *testing.T) {
+	cfg := &config.Config{
+		ClassOfService: &config.ClassOfServiceConfig{
+			Schedulers: map[string]*config.CoSScheduler{
+				"ef-sched": {
+					Name:                  "ef-sched",
+					TransmitRateBytes:     125_000_000,
+					TransmitRateExact:     true,
+					EqualFlowEnforcement:  true,
+					EqualFlowTargetPolicy: "mean",
+				},
+				"plain-sched": {
+					Name:                 "plain-sched",
+					TransmitRateBytes:    125_000_000,
+					TransmitRateExact:    true,
+					EqualFlowEnforcement: true,
+				},
+			},
+		},
+	}
+
+	snap := buildClassOfServiceSnapshot(cfg)
+	if snap == nil {
+		t.Fatal("expected non-nil class-of-service snapshot")
+	}
+	byName := map[string]CoSSchedulerSnapshot{}
+	for _, sched := range snap.Schedulers {
+		byName[sched.Name] = sched
+	}
+	if got := byName["ef-sched"].EqualFlowTargetPolicy; got != "mean" {
+		t.Fatalf("ef-sched EqualFlowTargetPolicy = %q, want mean", got)
+	}
+	if got := byName["plain-sched"].EqualFlowTargetPolicy; got != "" {
+		t.Fatalf("plain-sched EqualFlowTargetPolicy = %q, want empty", got)
+	}
+
+	// omitempty: the unset policy must not appear on the wire at all.
+	plain, err := json.Marshal(byName["plain-sched"])
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(plain), "equal_flow_target_policy") {
+		t.Fatalf("unset policy leaked onto the wire (breaks byte-unchanged default): %s", plain)
+	}
+	withPolicy, err := json.Marshal(byName["ef-sched"])
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(withPolicy), `"equal_flow_target_policy":"mean"`) {
+		t.Fatalf("set policy missing from wire: %s", withPolicy)
+	}
+}
+
 func TestBuildClassOfServiceSnapshotIncludesBufferSizePercent(t *testing.T) {
 	cfg := &config.Config{
 		ClassOfService: &config.ClassOfServiceConfig{

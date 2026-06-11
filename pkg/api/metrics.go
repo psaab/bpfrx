@@ -125,6 +125,7 @@ type xpfCollector struct {
 	// shared v8 CoS queue leases. Kept separate from the
 	// measurement-only xpf_fairness_equal_flow_* estimator gauges.
 	cosEqualFlowEnforcementEnabled       *prometheus.Desc
+	cosEqualFlowTargetPolicy             *prometheus.Desc
 	cosEqualFlowEnforced                 *prometheus.Desc
 	cosEqualFlowTargetPerFlowBPS         *prometheus.Desc
 	cosEqualFlowMaxWorkerCapBytes        *prometheus.Desc
@@ -364,6 +365,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.cosWaterfillPhase1BudgetBreaks
 	ch <- c.cosWaterfillMinEpochsPerWorker
 	ch <- c.cosEqualFlowEnforcementEnabled
+	ch <- c.cosEqualFlowTargetPolicy
 	ch <- c.cosEqualFlowEnforced
 	ch <- c.cosEqualFlowTargetPerFlowBPS
 	ch <- c.cosEqualFlowMaxWorkerCapBytes
