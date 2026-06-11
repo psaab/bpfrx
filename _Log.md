@@ -5141,3 +5141,7 @@ top.
 - **Timestamp**: 2026-06-11
   **Action**: "#1736 P6-flush second choreography trap fixed — the unconditional runbook flush after a SUCCESSFUL P6-noflush recovery (the expected sane-clock branch) wiped the peer under a live confirmed session, manufacturing the same S5 confirmed-but-dead blackhole the P6-pre fix removed (engine has no rekey/retry timers until S5, wg/peer.rs TODO; a confirmed engine never re-initiates). The runbook flush now runs only when the no-flush recovery fails (replay-guard/clock-step case), matching the runbook's own wording; pass message records which branch ran. Runbook updated: flush is conditional, plus an explicit do-NOT-flush-under-live-session warning"
   **File(s)**: test/incus/wg-interop.sh, docs/wg-interop-runbook.md
+
+- **Timestamp**: 2026-06-11
+  **Action**: #1865 research — drafted plan v1 (WG telemetry: per-engine WgCounters, wire-additive wg_tunnels rows keyed by tunnel name, Prometheus family, Path B show command)
+  **File(s)**: docs/research/1865-wg-telemetry/plan.md
