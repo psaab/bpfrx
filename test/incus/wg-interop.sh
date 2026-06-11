@@ -106,7 +106,7 @@ ping_gap_stats() { # ping_gap_stats <file> <expected_count>
 # Mbit/s from the iperf3 "[SUM] ... receiver" (or single-stream) line.
 iperf_mbps() { # iperf_mbps <file>
     awk '/receiver/ && (/SUM/ || !sum_seen) {
-            for (i = 1; i <= NF; i++) if ($(i+1) ~ /bits\/sec/) { v = $i; u = $(i+1) }
+            for (i = 1; i < NF; i++) if ($(i+1) ~ /bits\/sec/) { v = $i; u = $(i+1) }
             if (u == "Gbits/sec") v *= 1000
             else if (u == "Kbits/sec") v /= 1000
             else if (u == "bits/sec") v /= 1000000
@@ -531,7 +531,8 @@ test_p5() {
         > /tmp/p5-tcpdump.log 2>&1 < /dev/null & sleep 1"
     # Full-tunnel cryptokey routing + raised MTU on the peer side only
     # (wg set does not install routes; mgmt path stays usable).
-    ish "${PEER}" "wg set ${WG_KERNEL_IFACE} peer \$(cat /tmp/wgkeys/xpf.pub) \
+    ish "${PEER}" "set -eu
+        wg set ${WG_KERNEL_IFACE} peer \$(cat /tmp/wgkeys/xpf.pub) \
             allowed-ips 0.0.0.0/0,::/0 endpoint ${WG_XPF_OUTER4}:${WG_LISTEN_PORT} \
             persistent-keepalive ${WG_PEER_KEEPALIVE}
         ip link set ${WG_KERNEL_IFACE} mtu 1500"
@@ -553,11 +554,12 @@ test_p5() {
     ish "${PEER}" 'cat /tmp/p5-tcpdump.log 2>/dev/null' > "${EVID}/p5-tcpdump.txt" || true
     ish "${FW0}" 'systemctl is-active xpfd' | grep -q active || fail "P5: xpfd unhealthy after fragment exercise"
     # Restore.
-    ish "${PEER}" "pkill -x tcpdump 2>/dev/null
+    ish "${PEER}" "set -eu
+        pkill -x tcpdump 2>/dev/null || true
         wg set ${WG_KERNEL_IFACE} peer \$(cat /tmp/wgkeys/xpf.pub) \
             allowed-ips ${WG_INNER4_CIDR},${WG_INNER6_CIDR} endpoint ${WG_XPF_OUTER4}:${WG_LISTEN_PORT} \
             persistent-keepalive ${WG_PEER_KEEPALIVE}
-        ip link set ${WG_KERNEL_IFACE} mtu 1420; true"
+        ip link set ${WG_KERNEL_IFACE} mtu 1420"
     echo "frag_outcome=$([ $frag_ok = 1 ] && echo clean-success || echo clean-drop)" >> "${SUMMARY}"
     pass "P5 >MTU bounded (outer-frag outcome: $([ $frag_ok = 1 ] && echo 'clean success' || echo 'clean drop'); no wedge)"
 }
