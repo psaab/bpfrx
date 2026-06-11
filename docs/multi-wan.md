@@ -236,10 +236,15 @@ mass-clear healthy sessions). The operator decides:
 - **Clear by pool** (Junos 23.4R1 syntax):
 
   ```
-  show services ip-monitoring status                                  # confirm FAIL + applied routes
-  show security flow session source-nat-pool isp-a-pool summary      # count pinned sessions
-  clear security flow session source-nat-pool isp-a-pool             # release them
+  show services ip-monitoring status                              # confirm FAIL + applied routes
+  show security flow session source-nat-pool isp-a-pool           # list pinned sessions
+  clear security flow session source-nat-pool isp-a-pool          # release them
   ```
+
+  (The clear prints per-family cleared counts. In the local CLI,
+  `... source-nat-pool isp-a-pool summary` gives a filtered count;
+  the remote CLI's `summary` keyword shows the unfiltered table
+  summary — a pre-existing remote-CLI behavior for all filters.)
 
   Cleared flows re-establish via the surviving uplink and match the
   new egress zone's rule-set/pool. The filter matches sessions whose

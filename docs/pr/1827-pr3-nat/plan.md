@@ -171,8 +171,11 @@ is in-scope:
 - `clear security flow session ...` already reports per-family cleared
   counts; the new filter inherits that.
 - "How many sessions are pinned to the failed uplink?" =
-  `show security flow session source-nat-pool <pool> summary` — computed
-  on demand from the same session iteration. **No periodic scan** is
+  `show security flow session source-nat-pool <pool>` (filtered
+  listing; the local CLI's `summary` composes with filters for a
+  filtered count — the remote CLI's `summary` keyword bypasses filters,
+  a pre-existing behavior for every filter). Computed on demand from
+  the same session iteration. **No periodic scan** is
   added (session dumps ride the shared control socket; a per-poll-tick
   pinned-session gauge would violate the control-socket budget rule), so
   no new Prometheus series.
