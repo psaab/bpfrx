@@ -2,8 +2,10 @@ package userspace
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"sort"
+	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
 )
@@ -150,4 +152,43 @@ func buildTunnelEndpointSnapshots(cfg *config.Config, interfaces []InterfaceSnap
 		}
 	}
 	return out
+}
+
+// wgEndpointSetSummary returns a canonical "id:iface:port@ifindex"
+// summary of the snapshot's WireGuard endpoint set (#1866 D3). Used by
+// logWgEndpointSetTransitionLocked to emit a publish-boundary log line
+// whenever the WG endpoint set the helper is being given changes —
+// paired with the Rust-side apply-boundary log, one journal capture
+// disambiguates "Go published a stale set" from "Rust skipped the
+// prune" if a teardown leak ever recurs.
+func wgEndpointSetSummary(snap *ConfigSnapshot) string {
+	if snap == nil {
+		return ""
+	}
+	parts := make([]string, 0, len(snap.TunnelEndpoints))
+	for _, ep := range snap.TunnelEndpoints {
+		if ep.Mode != "wireguard" {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%d:%s:%d@%d", ep.ID, ep.Interface, ep.WgListenPort, ep.Ifindex))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ",")
+}
+
+// logWgEndpointSetTransitionLocked logs (Info, state-transition-only)
+// when the WG endpoint set of an outgoing snapshot differs from the
+// previously published one, then records the new set. Call after a
+// SUCCESSFUL apply_snapshot publish so the recorded set tracks what the
+// helper actually accepted. Caller must hold m.mu.
+func (m *Manager) logWgEndpointSetTransitionLocked(snap *ConfigSnapshot, path string) {
+	set := wgEndpointSetSummary(snap)
+	if set == m.lastPublishedWgEndpoints {
+		return
+	}
+	slog.Info("userspace: WG endpoint set changed in published snapshot",
+		"path", path,
+		"old", m.lastPublishedWgEndpoints,
+		"new", set)
+	m.lastPublishedWgEndpoints = set
 }
