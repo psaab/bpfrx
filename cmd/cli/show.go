@@ -414,6 +414,11 @@ func (c *ctl) handleShowSecurity(args []string) error {
 		return c.showMatchPolicies(args[1:])
 	case "vrrp":
 		return c.showVRRP()
+	case "wireguard":
+		if len(args) >= 2 && args[1] == "detail" {
+			return c.showText("wireguard-detail")
+		}
+		return c.showText("wireguard")
 	case "alarms":
 		if len(args) >= 2 && args[1] == "detail" {
 			return c.showText("security-alarms-detail")

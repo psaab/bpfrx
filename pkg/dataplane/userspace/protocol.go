@@ -731,6 +731,76 @@ type ProcessStatus struct {
 	NeighborNetlinkRedumpUpsertsTotal       uint64 `json:"neighbor_netlink_redump_upserts_total,omitempty"`
 	NeighborPendingKeys                     uint64 `json:"neighbor_pending_keys,omitempty"`
 	NegNeighKeys                            uint64 `json:"neg_neigh_keys,omitempty"`
+	// WgTunnels carries the #1865 per-WG-tunnel telemetry rows. Keyed
+	// by tunnel NAME (Tunnel) — TunnelEndpointID is informational only
+	// (#1873: positional ids renumber across commits). Absent/empty for
+	// non-WG deployments and for older helpers (key omitted on the
+	// Rust side when no tunnel is configured).
+	WgTunnels []WgTunnelStatus `json:"wg_tunnels,omitempty"`
+}
+
+// WgTunnelStatus mirrors the Rust WgTunnelStatus in
+// userspace-dp/src/protocol/control.rs — keep json tags identical on
+// BOTH sides (feedback_wire_protocol_both_sides). Counter semantics
+// and the reset rules live in userspace-dp/src/afxdp/wg/counters.rs;
+// the Prometheus emitters are in pkg/api/metrics_userspace.go.
+type WgTunnelStatus struct {
+	// Tunnel is the interface name (e.g. "wg0") — the PRIMARY key and
+	// the only Prometheus label. Helper falls back to
+	// "wg-endpoint-<id>" when the ifindex has no resolved name.
+	Tunnel           string `json:"tunnel,omitempty"`
+	TunnelEndpointID uint16 `json:"tunnel_endpoint_id,omitempty"`
+	ListenPort       uint16 `json:"listen_port,omitempty"`
+	// PeerPubkeyHex is the peer static public key, 64-char lowercase
+	// hex (same rendering as the config-side wg_peer_pubkey_hex; note
+	// `wg show` renders base64 — xpf surfaces are uniformly hex).
+	PeerPubkeyHex string `json:"peer_pubkey_hex,omitempty"`
+	// PeerEndpoint is the CONFIGURED endpoint (empty for a
+	// responder-only peer; the learned endpoint is not surfaced yet).
+	PeerEndpoint     string `json:"peer_endpoint,omitempty"`
+	SessionConfirmed bool   `json:"session_confirmed,omitempty"`
+	// LastHandshakeUnixSecs is wall-clock epoch seconds of the most
+	// recent handshake completion (either role); 0 = never (epoch 0 is
+	// unreachable, so the in-band sentinel is unambiguous).
+	LastHandshakeUnixSecs uint64 `json:"last_handshake_unix_secs,omitempty"`
+
+	HsInitiationsCreated      uint64 `json:"hs_initiations_created,omitempty"`
+	HsInitiationBuildFailures uint64 `json:"hs_initiation_build_failures,omitempty"`
+	HsResponsesCreated        uint64 `json:"hs_responses_created,omitempty"`
+	HsCompletionsInitiator    uint64 `json:"hs_completions_initiator,omitempty"`
+	HsRxDropsMac1Mismatch     uint64 `json:"hs_rx_drops_mac1_mismatch,omitempty"`
+	HsRxDropsMalformed        uint64 `json:"hs_rx_drops_malformed,omitempty"`
+	HsRxDropsCrypto           uint64 `json:"hs_rx_drops_crypto,omitempty"`
+	HsRxDropsUnknownPeer      uint64 `json:"hs_rx_drops_unknown_peer,omitempty"`
+	HsRxDropsStaleResponse    uint64 `json:"hs_rx_drops_stale_response,omitempty"`
+	HsRxDropsIndexExhausted   uint64 `json:"hs_rx_drops_index_exhausted,omitempty"`
+	HsRxCookieUnsupported     uint64 `json:"hs_rx_cookie_unsupported,omitempty"`
+	RxUnknownType             uint64 `json:"rx_unknown_type,omitempty"`
+	HsSendErrors              uint64 `json:"hs_send_errors,omitempty"`
+	HsRequestsArmed           uint64 `json:"hs_requests_armed,omitempty"`
+
+	DecapPackets              uint64 `json:"decap_packets,omitempty"`
+	DecapBytes                uint64 `json:"decap_bytes,omitempty"`
+	DecapKeepalives           uint64 `json:"decap_keepalives,omitempty"`
+	DecapDropsMalformedHeader uint64 `json:"decap_drops_malformed_header,omitempty"`
+	DecapDropsUnknownSession  uint64 `json:"decap_drops_unknown_session,omitempty"`
+	DecapDropsCounterCeiling  uint64 `json:"decap_drops_counter_ceiling,omitempty"`
+	DecapDropsCrypto          uint64 `json:"decap_drops_crypto,omitempty"`
+	DecapDropsReplay          uint64 `json:"decap_drops_replay,omitempty"`
+	DecapDropsAllowedIPs      uint64 `json:"decap_drops_allowed_ips,omitempty"`
+	DecapDropsMalformedInner  uint64 `json:"decap_drops_malformed_inner,omitempty"`
+	DecapDropsBuffer          uint64 `json:"decap_drops_buffer,omitempty"`
+
+	EncapPackets            uint64 `json:"encap_packets,omitempty"`
+	EncapBytes              uint64 `json:"encap_bytes,omitempty"`
+	EncapDropsNoSession     uint64 `json:"encap_drops_no_session,omitempty"`
+	EncapDropsUnconfirmed   uint64 `json:"encap_drops_unconfirmed,omitempty"`
+	EncapDropsRekeyRequired uint64 `json:"encap_drops_rekey_required,omitempty"`
+	EncapDropsOther         uint64 `json:"encap_drops_other,omitempty"`
+	EncapMtuDrops           uint64 `json:"encap_mtu_drops,omitempty"`
+	TransportSendErrors     uint64 `json:"transport_send_errors,omitempty"`
+	TunWriteErrors          uint64 `json:"tun_write_errors,omitempty"`
+	TunRxDropsNoEndpoint    uint64 `json:"tun_rx_drops_no_endpoint,omitempty"`
 }
 
 // MarshalJSON intentionally uses a value receiver so both ProcessStatus values

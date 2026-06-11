@@ -104,12 +104,17 @@ func (c *CLI) handleShowSecurity(args []string) error {
 	args[0] = resolved
 
 	cfg := c.store.ActiveConfig()
-	if cfg == nil && args[0] != "statistics" && args[0] != "ipsec" && args[0] != "alarms" {
+	if cfg == nil && args[0] != "statistics" && args[0] != "ipsec" && args[0] != "alarms" && args[0] != "wireguard" {
 		fmt.Println("no active configuration")
 		return nil
 	}
 
 	switch args[0] {
+	case "wireguard":
+		// #1865: dataplane WG telemetry — works without an active
+		// config (reads helper status only, like statistics).
+		return c.showSecurityWireguard(len(args) >= 2 && args[1] == "detail")
+
 	case "zones":
 		detail := false
 		filterZone := ""

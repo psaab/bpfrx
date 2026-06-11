@@ -33,6 +33,13 @@
 #![allow(dead_code)] // Most of this module is not yet wired into the hot path.
 
 pub(crate) mod allowed_ips;
+// #1865: operator-visible telemetry counters — one `WgCounters` per
+// engine (relaxed atomics). See counters.rs for the lifetime/reset
+// semantics (engine-Arc-bound; reset on identity rebuild, NEVER
+// inherited across #1873 positional-id renumbering) and the
+// reserved-reason list (tai64n-replay, rate-limit — no increment
+// sites until responder hardening).
+pub(crate) mod counters;
 pub(crate) mod dscp;
 pub(crate) mod engine;
 pub(crate) mod framing;
@@ -70,6 +77,21 @@ pub(crate) use engine::{
     WgEngineConfig, WgPeerConfig,
 };
 pub(crate) use scratch::WgWorkerScratch;
+
+/// Render a 32-byte WG key as the 64-char lowercase hex string used
+/// across xpf's WG config/wire surfaces (`wg_peer_pubkey_hex`,
+/// protocol/snapshot.rs). The inverse of
+/// `forwarding_build::tunnels::decode_wg_key_hex`. PUBLIC keys only —
+/// never call this on private key material.
+pub(crate) fn encode_wg_key_hex(key: &[u8; WG_KEY_LEN]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(WG_KEY_LEN * 2);
+    for b in key {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
 
 /// Canonicalize a WG peer endpoint address: unmap a V4-MAPPED IPv6
 /// (`::ffff:a.b.c.d`) to its canonical V4 form so overhead math

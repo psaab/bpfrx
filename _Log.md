@@ -5142,6 +5142,41 @@ top.
   **Action**: "#1736 P6-flush second choreography trap fixed — the unconditional runbook flush after a SUCCESSFUL P6-noflush recovery (the expected sane-clock branch) wiped the peer under a live confirmed session, manufacturing the same S5 confirmed-but-dead blackhole the P6-pre fix removed (engine has no rekey/retry timers until S5, wg/peer.rs TODO; a confirmed engine never re-initiates). The runbook flush now runs only when the no-flush recovery fails (replay-guard/clock-step case), matching the runbook's own wording; pass message records which branch ran. Runbook updated: flush is conditional, plus an explicit do-NOT-flush-under-live-session warning"
   **File(s)**: test/incus/wg-interop.sh, docs/wg-interop-runbook.md
 
+- **Timestamp**: 2026-06-11
+  **Action**: #1865 engineer — commit 1: per-engine WgCounters + engine/call-site increments + keepalive classification + 10 telemetry tests
+  **File(s)**: userspace-dp/src/afxdp/wg/{counters.rs,mod.rs,engine.rs,handshake_session.rs,tests.rs}, userspace-dp/src/afxdp/coordinator/wg_control.rs, userspace-dp/src/afxdp/frame/wg.rs
+
+- **Timestamp**: 2026-06-11
+  **Action**: #1865 engineer — commit 2: wg_tunnels wire rows (WgTunnelStatus) + coordinator status accessor + helpers populate + wire pins
+  **File(s)**: userspace-dp/src/protocol/{control.rs,tests.rs}, userspace-dp/src/afxdp/coordinator/status.rs, userspace-dp/src/server/{helpers.rs,lifecycle.rs}
+
+- **Timestamp**: 2026-06-11
+  **Action**: #1865 engineer — commit 3: Go WgTunnelStatus DTO mirror + cross-language wire pins (1..35 counter ladder)
+  **File(s)**: pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/wg_status_test.go
+
+- **Timestamp**: 2026-06-11
+  **Action**: #1865 engineer — commit 4: Prometheus xpf_userspace_wg_* family (12 descriptors, reason/role/direction/kind labels) + emitter + canary fixture row + series-set tests
+  **File(s)**: pkg/api/{metrics.go,metrics_descriptors.go,metrics_userspace.go,metrics_descriptor_coverage_test.go,metrics_wireguard_test.go}
+
+- **Timestamp**: 2026-06-11
+  **Action**: #1865 engineer — commit 5: show security wireguard [detail] (cmdtree node, shared FormatWireguardStatus formatter, local CLI + gRPC + remote CLI wiring, tests)
+  **File(s)**: pkg/cmdtree/tree.go, pkg/dataplane/userspace/{wgfmt.go,wgfmt_test.go}, pkg/cli/{cli_show_security_dispatch.go,cli_show_security_wireguard.go}, pkg/grpcapi/{server_show.go,server_show_security_text.go,server_show_security_wireguard_test.go}, cmd/cli/show.go
+
+- **Timestamp**: 2026-06-11
+  **Action**: #1865 engineer — commit 6: docs — runbook triage step 0 (local counters as primary oracle), resolved-limitation row, interop assert note
+  **File(s)**: docs/wg-interop-runbook.md, docs/wireguard-interop.md
+
+- **Timestamp**: 2026-06-11
+  **Action**: #1865 engineer — SMR code review r1 (MERGE-READY; worked traces A/B) + cosmetic keepalive-line dedup in detail view
+  **File(s)**: docs/pr/1865-wg-telemetry/claude-smr-code-r1.md, pkg/dataplane/userspace/wgfmt.go
+
+- **Timestamp**: 2026-06-11
+  **Action**: #1865 engineer — Codex code-r1 fixes: plan-faithful name fallback chain (TunnelEndpoint.interface_label middle layer) + summary wording 'initiations created'
+  **File(s)**: userspace-dp/src/afxdp/types/forwarding.rs, userspace-dp/src/afxdp/forwarding_build/tunnels.rs, userspace-dp/src/afxdp/coordinator/status.rs, pkg/dataplane/userspace/{wgfmt.go,wgfmt_test.go}
+
+- **Timestamp**: 2026-06-11
+  **Action**: #1865 engineer — MERGE-READY convergence (Codex r3 + AGY r2 + SMR; Copilot quota x3 -> 3-of-4); live evidence posted; awaiting parent smoke + merge
+  **File(s)**: docs/pr/1865-wg-telemetry/{reviewer-ids.md,codex-code-r3.md}
 - **Timestamp**: 2026-06-11 ~15:45 PT
   **Action**: #1875 /research (PLAN-READY 3-of-3, branch research/1875-cluster-ownership) + /engineer → PR #1878 (cluster lock cells: cluster-lock.sh, with-cluster.sh, self-locking cluster-setup/apply-cos verbs, marker-aware wg-interop inc(), 10-case selftest, docs protocol). Live guarded deploy + CoS re-apply + iperf3 validated on loss cluster. Quad review: Codex+AGY+SMR MERGE-READY, Copilot 3x quota-limited.
   **File(s)**: test/incus/{cluster-lock.sh,with-cluster.sh,with-cluster-selftest.sh,cluster-setup.sh,apply-cos-config.sh,wg-interop.sh,reverse-key-collision-probe.sh}, docs/engineering-style.md, CLAUDE.md, docs/wg-interop-runbook.md, docs/pr/1875-cluster-ownership/

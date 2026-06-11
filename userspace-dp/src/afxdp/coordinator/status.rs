@@ -629,6 +629,136 @@ impl super::Coordinator {
             .collect()
     }
 
+    /// #1865: per-WG-tunnel telemetry rows for `ProcessStatus.wg_tunnels`.
+    /// One row per `mode == "wireguard"` tunnel endpoint with a live
+    /// engine, sorted by endpoint id for deterministic wire output but
+    /// KEYED by tunnel name (`ifindex_to_name`; positional ids renumber
+    /// across commits — #1873). A missing name falls back to
+    /// `wg-endpoint-<id>` rather than dropping the row: broken bring-up
+    /// is exactly when telemetry matters. Counter loads are relaxed and
+    /// NOT transactional across fields (each atomic is read
+    /// independently while the control thread increments — fine for
+    /// observability, same posture as every other counter family).
+    pub fn wg_tunnel_statuses(&self) -> Vec<crate::protocol::WgTunnelStatus> {
+        let mut ids: Vec<u16> = self
+            .forwarding
+            .tunnel_endpoints
+            .iter()
+            .filter(|(_, ep)| ep.mode == "wireguard")
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let now_wall = Utc::now();
+        let now_mono = monotonic_nanos();
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let Some(endpoint) = self.forwarding.tunnel_endpoints.get(&id) else {
+                continue;
+            };
+            let Some(engine) = self.forwarding.wg_engines.get(&id) else {
+                continue;
+            };
+            // Name fallback chain (plan §3.2 / Codex code-r1 F1):
+            // ifindex_to_name → the snapshot row's attachment label →
+            // wg-endpoint-<id>. A row is never dropped, and the
+            // stable logical name wins over the positional id even
+            // when the live ifindex map has no entry (broken
+            // bring-up — exactly when telemetry matters).
+            let tunnel = self
+                .forwarding
+                .ifindex_to_name
+                .get(&endpoint.logical_ifindex)
+                .cloned()
+                .or_else(|| {
+                    (!endpoint.interface_label.is_empty())
+                        .then(|| endpoint.interface_label.clone())
+                })
+                .unwrap_or_else(|| format!("wg-endpoint-{id}"));
+            let c = engine.counters();
+            // Stamp-0 guard (plan §3.3 / SMR r2): a zero stamp means
+            // "never" and must NOT run through the monotonic→wall
+            // conversion (which would render ~boot time as a
+            // valid-looking date). A pre-epoch/failed conversion also
+            // maps to 0, never a wrapped huge value (Codex r2 note).
+            let stamp = c.last_handshake_complete_ns.load(Ordering::Relaxed);
+            let last_handshake_unix_secs = if stamp == 0 {
+                0
+            } else {
+                monotonic_timestamp_to_datetime(stamp, now_mono, now_wall)
+                    .map(|dt| dt.timestamp().max(0) as u64)
+                    .unwrap_or(0)
+            };
+            out.push(crate::protocol::WgTunnelStatus {
+                tunnel,
+                tunnel_endpoint_id: id,
+                listen_port: endpoint.wg_listen_port,
+                peer_pubkey_hex: crate::afxdp::wg::encode_wg_key_hex(&endpoint.wg_peer_pubkey),
+                peer_endpoint: endpoint
+                    .wg_endpoint
+                    .map(|ep| ep.to_string())
+                    .unwrap_or_default(),
+                session_confirmed: engine
+                    .peer_has_confirmed_session(&endpoint.wg_peer_pubkey),
+                last_handshake_unix_secs,
+                hs_initiations_created: c.hs_initiations_created.load(Ordering::Relaxed),
+                hs_initiation_build_failures: c
+                    .hs_initiation_build_failures
+                    .load(Ordering::Relaxed),
+                hs_responses_created: c.hs_responses_created.load(Ordering::Relaxed),
+                hs_completions_initiator: c.hs_completions_initiator.load(Ordering::Relaxed),
+                hs_rx_drops_mac1_mismatch: c.hs_rx_drops_mac1_mismatch.load(Ordering::Relaxed),
+                hs_rx_drops_malformed: c.hs_rx_drops_malformed.load(Ordering::Relaxed),
+                hs_rx_drops_crypto: c.hs_rx_drops_crypto.load(Ordering::Relaxed),
+                hs_rx_drops_unknown_peer: c.hs_rx_drops_unknown_peer.load(Ordering::Relaxed),
+                hs_rx_drops_stale_response: c
+                    .hs_rx_drops_stale_response
+                    .load(Ordering::Relaxed),
+                hs_rx_drops_index_exhausted: c
+                    .hs_rx_drops_index_exhausted
+                    .load(Ordering::Relaxed),
+                hs_rx_cookie_unsupported: c.hs_rx_cookie_unsupported.load(Ordering::Relaxed),
+                rx_unknown_type: c.rx_unknown_type.load(Ordering::Relaxed),
+                hs_send_errors: c.hs_send_errors.load(Ordering::Relaxed),
+                hs_requests_armed: c.hs_requests_armed.load(Ordering::Relaxed),
+                decap_packets: c.decap_packets.load(Ordering::Relaxed),
+                decap_bytes: c.decap_bytes.load(Ordering::Relaxed),
+                decap_keepalives: c.decap_keepalives.load(Ordering::Relaxed),
+                decap_drops_malformed_header: c
+                    .decap_drops_malformed_header
+                    .load(Ordering::Relaxed),
+                decap_drops_unknown_session: c
+                    .decap_drops_unknown_session
+                    .load(Ordering::Relaxed),
+                decap_drops_counter_ceiling: c
+                    .decap_drops_counter_ceiling
+                    .load(Ordering::Relaxed),
+                decap_drops_crypto: c.decap_drops_crypto.load(Ordering::Relaxed),
+                decap_drops_replay: c.decap_drops_replay.load(Ordering::Relaxed),
+                decap_drops_allowed_ips: c.decap_drops_allowed_ips.load(Ordering::Relaxed),
+                decap_drops_malformed_inner: c
+                    .decap_drops_malformed_inner
+                    .load(Ordering::Relaxed),
+                decap_drops_buffer: c.decap_drops_buffer.load(Ordering::Relaxed),
+                encap_packets: c.encap_packets.load(Ordering::Relaxed),
+                encap_bytes: c.encap_bytes.load(Ordering::Relaxed),
+                encap_drops_no_session: c.encap_drops_no_session.load(Ordering::Relaxed),
+                encap_drops_unconfirmed: c.encap_drops_unconfirmed.load(Ordering::Relaxed),
+                encap_drops_rekey_required: c
+                    .encap_drops_rekey_required
+                    .load(Ordering::Relaxed),
+                encap_drops_other: c.encap_drops_other.load(Ordering::Relaxed),
+                encap_mtu_drops: c.encap_mtu_drops.load(Ordering::Relaxed),
+                transport_send_errors: c.transport_send_errors.load(Ordering::Relaxed),
+                tun_write_errors: c.tun_write_errors.load(Ordering::Relaxed),
+                tun_rx_drops_no_endpoint: c.tun_rx_drops_no_endpoint.load(Ordering::Relaxed),
+            });
+        }
+        out
+    }
+
     pub fn identity_count(&self) -> usize {
         self.workers.identities.len()
     }

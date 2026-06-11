@@ -53,6 +53,7 @@
 //!     mutex before snow.read_message.)
 
 use super::allowed_ips::AllowedIps;
+use super::counters::WgCounters;
 use super::framing::{encode_data_header, parse_data_header};
 // PendingHandshake is defined alongside the handshake orchestration in
 // handshake_session.rs (same `wg` module); the engine struct holds a map of
@@ -321,6 +322,11 @@ pub(crate) struct WgEngine {
     /// so a request at `now_ns == 0` (tests) is not confused with "no
     /// request".
     pub(in crate::afxdp::wg) handshake_request_last_ns: std::sync::atomic::AtomicU64,
+    /// #1865: per-engine telemetry counters (relaxed atomics). Bound
+    /// to the engine Arc: survives control-thread respawns and
+    /// unrelated commits (engine reuse); resets with the engine on an
+    /// identity-changing rebuild — see counters.rs.
+    pub(in crate::afxdp::wg) counters: WgCounters,
 }
 
 /// Minimum spacing between worker-driven "please initiate" edges
@@ -358,6 +364,7 @@ impl WgEngine {
             sessions_by_local_index: RwLock::new(FxHashMap::default()),
             handshake_request_pending: std::sync::atomic::AtomicBool::new(false),
             handshake_request_last_ns: std::sync::atomic::AtomicU64::new(0),
+            counters: WgCounters::default(),
         };
         engine.reconcile_peers(&config.peers);
         engine
@@ -392,7 +399,15 @@ impl WgEngine {
             return false;
         }
         self.handshake_request_pending.store(true, Ordering::Relaxed);
+        WgCounters::bump(&self.counters.hs_requests_armed);
         true
+    }
+
+    /// #1865: the engine's telemetry counters. Call-site counters
+    /// (MTU guards, send/TUN errors, cookie/unknown-type) increment
+    /// through this accessor; engine-internal paths count directly.
+    pub(crate) fn counters(&self) -> &WgCounters {
+        &self.counters
     }
 
     /// Control side of the NoSession edge. Returns `true` if a handshake
@@ -700,13 +715,16 @@ impl WgEngine {
         // Cryptokey-routing safety: the forwarding decision tells
         // us which peer to encrypt to. We do NOT consult
         // AllowedIPs to pick a peer on egress.
-        let peer = self.peer_arc(peer_pubkey).ok_or(EncapError::UnknownPeer)?;
-        let session = peer
-            .current
-            .read()
-            .unwrap()
-            .clone()
-            .ok_or(EncapError::NoSession)?;
+        let peer = self
+            .peer_arc(peer_pubkey)
+            .ok_or_else(|| self.counters.count_encap_err(EncapError::UnknownPeer))?;
+        let Some(session) = peer.current.read().unwrap().clone() else {
+            // #1865: the no-current-session arm — distinct from the
+            // unconfirmed gate below (same wire error, different
+            // counter; AGY r2 #1736 mandated the split be visible).
+            WgCounters::bump(&self.counters.encap_drops_no_session);
+            return Err(EncapError::NoSession);
+        };
         // WG key-confirmation: the responder MUST NOT send transport
         // data on a fresh session until it has authenticated the
         // initiator's first data packet. Treat an unconfirmed session
@@ -718,6 +736,10 @@ impl WgEngine {
         // `WgSession::confirmed` doc for the rationale and Codex
         // final pre-merge finding 2 for the missed invariant.
         if !session.is_confirmed() {
+            // #1865: counter-only split — the returned variant stays
+            // `NoSession` so every caller contract (request_handshake
+            // kick + drop) is untouched; only the attribution differs.
+            WgCounters::bump(&self.counters.encap_drops_unconfirmed);
             return Err(EncapError::NoSession);
         }
 
@@ -739,14 +761,16 @@ impl WgEngine {
         let padded_len = pad_to_16(inner_ip.len());
         let required = WG_DATA_HEADER_LEN + padded_len + POLY1305_TAG_LEN;
         if out.len() < required {
-            return Err(EncapError::BufferTooSmall);
+            return Err(self.counters.count_encap_err(EncapError::BufferTooSmall));
         }
         if padded_len > PADDED_PLAINTEXT_MAX {
-            return Err(EncapError::BufferTooSmall);
+            return Err(self.counters.count_encap_err(EncapError::BufferTooSmall));
         }
-        let counter = session.next_tx_counter().ok_or(EncapError::RekeyRequired)?;
+        let counter = session
+            .next_tx_counter()
+            .ok_or_else(|| self.counters.count_encap_err(EncapError::RekeyRequired))?;
         let _ = encode_data_header(out, session.peer_index, counter)
-            .ok_or(EncapError::BufferTooSmall)?;
+            .ok_or_else(|| self.counters.count_encap_err(EncapError::BufferTooSmall))?;
         // Stage the padded plaintext on the stack. We use
         // `MaybeUninit` to skip the 4096-byte zero-init that a
         // `[0u8; PADDED_PLAINTEXT_MAX]` literal would force on every
@@ -810,7 +834,13 @@ impl WgEngine {
         let n = session
             .transport
             .write_message(counter, plaintext, payload)
-            .map_err(|_| EncapError::CryptoFailed)?;
+            .map_err(|_| self.counters.count_encap_err(EncapError::CryptoFailed))?;
+        // #1865: success accounting — inner-IP (un-padded) bytes,
+        // symmetric with the decap side.
+        WgCounters::bump(&self.counters.encap_packets);
+        self.counters
+            .encap_bytes
+            .fetch_add(inner_ip.len() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(EncapOutcome {
             len: WG_DATA_HEADER_LEN + n,
             receiver_index: session.peer_index,
@@ -829,14 +859,17 @@ impl WgEngine {
         wg_record: &[u8],
         out: &mut [u8],
     ) -> Result<DecapOutcome, DecapError> {
-        let hdr = parse_data_header(wg_record).ok_or(DecapError::MalformedHeader)?;
+        let hdr = parse_data_header(wg_record)
+            .ok_or_else(|| self.counters.count_decap_err(DecapError::MalformedHeader))?;
         // WG spec §6.5: drop inbound data packets whose counter is
         // at or above REJECT_AFTER_MESSAGES without doing AEAD. The
         // counter-space ceiling is symmetric across encap/decap;
         // the encap-side guard alone is not sufficient because a
         // malicious or buggy sender may send arbitrary high counters.
         if hdr.counter >= REJECT_AFTER_MESSAGES {
-            return Err(DecapError::CounterRejectAfterMessages);
+            return Err(self
+                .counters
+                .count_decap_err(DecapError::CounterRejectAfterMessages));
         }
         let session = self
             .sessions_by_local_index
@@ -844,7 +877,7 @@ impl WgEngine {
             .unwrap()
             .get(&hdr.receiver_index)
             .cloned()
-            .ok_or(DecapError::UnknownSession)?;
+            .ok_or_else(|| self.counters.count_decap_err(DecapError::UnknownSession))?;
         // Truncated-record DoS guard. `parse_data_header` only checks
         // that the buffer has at least WG_DATA_HEADER_LEN (16) bytes;
         // it does not enforce that the trailing ciphertext field is
@@ -860,22 +893,22 @@ impl WgEngine {
         // r-final-2 review (the truncated-record class was missed by
         // all 9 prior review rounds).
         if hdr.ciphertext.len() < POLY1305_TAG_LEN {
-            return Err(DecapError::ShortRecord);
+            return Err(self.counters.count_decap_err(DecapError::ShortRecord));
         }
         let plaintext_len_max = hdr.ciphertext.len() - POLY1305_TAG_LEN;
         if out.len() < plaintext_len_max {
-            return Err(DecapError::BufferTooSmall);
+            return Err(self.counters.count_decap_err(DecapError::BufferTooSmall));
         }
         {
             let replay = session.replay.lock().unwrap();
             if replay.definitely_out_of_window(hdr.counter) {
-                return Err(DecapError::ReplayOutOfWindow);
+                return Err(self.counters.count_decap_err(DecapError::ReplayOutOfWindow));
             }
         }
         let n = session
             .transport
             .read_message(hdr.counter, hdr.ciphertext, out)
-            .map_err(|_| DecapError::CryptoFailed)?;
+            .map_err(|_| self.counters.count_decap_err(DecapError::CryptoFailed))?;
         // WG key-confirmation: a successful AEAD authenticate is
         // proof that the peer has the session keys, so a responder-
         // role session can now be used for egress. Initiator-role
@@ -902,13 +935,29 @@ impl WgEngine {
                     // plaintext upstream. Cost is one memset per
                     // replay-reject — the rare path.
                     out[..n].fill(0);
-                    return Err(DecapError::ReplayDuplicate);
+                    return Err(self.counters.count_decap_err(DecapError::ReplayDuplicate));
                 }
                 ReplayDecision::OutOfWindow => {
                     out[..n].fill(0);
-                    return Err(DecapError::ReplayOutOfWindow);
+                    return Err(self.counters.count_decap_err(DecapError::ReplayOutOfWindow));
                 }
             }
+        }
+        // #1865: authenticated ZERO-length transport record == WG
+        // persistent keepalive (pad_to_16(0) == 0, so snow yields
+        // n == 0). It has done its protocol work above (AEAD
+        // authenticated, session confirmed, replay window advanced) but
+        // carries no inner packet to deliver. Count it as a keepalive
+        // and exit through the SAME error the inner-parse would have
+        // produced - external behavior is byte-identical to pre-#1865
+        // (no TUN write, caller treats it as unauthenticated for
+        // endpoint-learning; see plan §9 for that latent gap) - but
+        // the telemetry no longer reports a steady stream of false
+        // "malformed inner" drops for a keepalive peer (Codex r1 F1 +
+        // SMR r1 F1, independent convergence).
+        if n == 0 {
+            WgCounters::bump(&self.counters.decap_keepalives);
+            return Err(DecapError::MalformedInner);
         }
         // AllowedIPs gate on the inner src IP. WG spec §5.4.6:
         // "After decryption, the receiver verifies that the source
@@ -953,6 +1002,12 @@ impl WgEngine {
         match outcome {
             Ok((_inner_src, _peer_idx, inner_len)) => {
                 debug_assert!(inner_len <= n);
+                // #1865: success accounting - inner-IP (un-padded)
+                // bytes, symmetric with the encap side.
+                WgCounters::bump(&self.counters.decap_packets);
+                self.counters
+                    .decap_bytes
+                    .fetch_add(inner_len as u64, std::sync::atomic::Ordering::Relaxed);
                 Ok(DecapOutcome {
                     len: inner_len,
                     peer_pubkey: session.peer_pubkey,
@@ -963,7 +1018,7 @@ impl WgEngine {
                 // but cannot deliver. Covers MalformedInner,
                 // UnknownSession, and AllowedIpsViolation uniformly.
                 out[..n].fill(0);
-                Err(e)
+                Err(self.counters.count_decap_err(e))
             }
         }
     }

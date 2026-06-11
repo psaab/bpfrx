@@ -437,7 +437,10 @@ var OperationalTree = map[string]*Node{
 				"security-associations": {Desc: "Show IPsec SAs"},
 				"statistics":            {Desc: "Show IPsec statistics"},
 			}},
-			"vrrp":           {Desc: "Show VRRP high availability status"},
+			"vrrp": {Desc: "Show VRRP high availability status"},
+			"wireguard": {Desc: "Show WireGuard tunnel status", Children: map[string]*Node{
+				"detail": {Desc: "Show per-reason drop counters and handshake activity"},
+			}},
 			"match-policies": {Desc: "Match 5-tuple against policies"},
 		}},
 		"services": {Desc: "Show services information", Children: map[string]*Node{

@@ -166,6 +166,12 @@ pub(in crate::afxdp) struct EgressInterface {
 pub(in crate::afxdp) struct TunnelEndpoint {
     pub(in crate::afxdp) id: u16,
     pub(in crate::afxdp) logical_ifindex: i32,
+    /// #1865: the snapshot row's attachment label (linux_name, else
+    /// the logical interface name) carried so the telemetry row name
+    /// fallback chain matches the plan: ifindex_to_name -> this ->
+    /// wg-endpoint-<id>. Same convention as
+    /// `wg_tombstone_respawn_coherent`'s row_label.
+    pub(in crate::afxdp) interface_label: String,
     pub(in crate::afxdp) redundancy_group: i32,
     pub(in crate::afxdp) mode: String,
     pub(in crate::afxdp) outer_family: i32,
@@ -192,6 +198,7 @@ impl std::fmt::Debug for TunnelEndpoint {
         f.debug_struct("TunnelEndpoint")
             .field("id", &self.id)
             .field("logical_ifindex", &self.logical_ifindex)
+            .field("interface_label", &self.interface_label)
             .field("redundancy_group", &self.redundancy_group)
             .field("mode", &self.mode)
             .field("outer_family", &self.outer_family)

@@ -75,7 +75,9 @@ ip link set wgref up
 
 # Direction A: xpf create_initiation -> UDP <peer_vm_ip>:<P>; kernel wg
 #   verifies MAC1 + decrypts the TAI64N + replies type-2; xpf
-#   consume_response derives the session. Assert via `wg show wgref`.
+#   consume_response derives the session. Assert via `wg show wgref`
+#   (peer-side cross-check) and `show security wireguard` on xpf
+#   (#1865 — local handshake counters are the primary oracle).
 # Direction B: kernel wg initiates (persistent-keepalive 1); xpf
 #   consume_initiation_create_response replies; assert `wg show` completes.
 ```

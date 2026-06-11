@@ -46,6 +46,109 @@ func (c *xpfCollector) collectUserspaceStatus(ch chan<- prometheus.Metric, dp ap
 	c.emitFairnessThroughputGauges(ch, status)
 	c.emitNeighborWarmCounters(ch, status)
 	c.emitNeighborColdStartCapture(ch, status)
+	c.emitWireguardTelemetry(ch, status)
+}
+
+// emitWireguardTelemetry exposes the #1865 per-WG-tunnel telemetry
+// rows. Every counter series is emitted unconditionally per configured
+// tunnel — a 0 is a real "no drops" signal, not an absent series
+// (matching the #1771 §2.6 convention) — EXCEPT the last-handshake
+// gauge, which is absent until the first handshake completes (0 is the
+// in-band "never" sentinel on the wire). The tunnel label is the
+// tunnel NAME: stable across commits, unlike the positional
+// tunnel_endpoint_id (#1873).
+func (c *xpfCollector) emitWireguardTelemetry(ch chan<- prometheus.Metric, status dpuserspace.ProcessStatus) {
+	for _, t := range status.WgTunnels {
+		counter := func(desc *prometheus.Desc, v uint64, labels ...string) {
+			ch <- prometheus.MustNewConstMetric(
+				desc, prometheus.CounterValue, float64(v), labels...)
+		}
+		// Completions by role: role=responder is the helper's
+		// hs_responses_created (the single responder-completion
+		// increment site — session installed at msg2 creation).
+		counter(c.wgHandshakesCompletedTotal, t.HsCompletionsInitiator, t.Tunnel, "initiator")
+		counter(c.wgHandshakesCompletedTotal, t.HsResponsesCreated, t.Tunnel, "responder")
+		counter(c.wgHandshakeInitiationsCreatedTotal, t.HsInitiationsCreated, t.Tunnel)
+		counter(c.wgHandshakeInitiationBuildFailuresTotal, t.HsInitiationBuildFailures, t.Tunnel)
+		counter(c.wgHandshakeRequestsArmedTotal, t.HsRequestsArmed, t.Tunnel)
+
+		for _, r := range []struct {
+			reason string
+			v      uint64
+		}{
+			{"mac1_mismatch", t.HsRxDropsMac1Mismatch},
+			{"malformed", t.HsRxDropsMalformed},
+			{"crypto", t.HsRxDropsCrypto},
+			{"unknown_peer", t.HsRxDropsUnknownPeer},
+			{"stale_response", t.HsRxDropsStaleResponse},
+			{"index_exhausted", t.HsRxDropsIndexExhausted},
+			{"cookie_unsupported", t.HsRxCookieUnsupported},
+			{"unknown_type", t.RxUnknownType},
+		} {
+			counter(c.wgHandshakeRxDropsTotal, r.v, t.Tunnel, r.reason)
+		}
+
+		counter(c.wgTransportPacketsTotal, t.EncapPackets, t.Tunnel, "encap")
+		counter(c.wgTransportPacketsTotal, t.DecapPackets, t.Tunnel, "decap")
+		counter(c.wgTransportBytesTotal, t.EncapBytes, t.Tunnel, "encap")
+		counter(c.wgTransportBytesTotal, t.DecapBytes, t.Tunnel, "decap")
+		counter(c.wgKeepalivesReceivedTotal, t.DecapKeepalives, t.Tunnel)
+
+		for _, r := range []struct {
+			reason string
+			v      uint64
+		}{
+			{"malformed_header", t.DecapDropsMalformedHeader},
+			{"unknown_session", t.DecapDropsUnknownSession},
+			{"counter_ceiling", t.DecapDropsCounterCeiling},
+			{"crypto", t.DecapDropsCrypto},
+			{"replay", t.DecapDropsReplay},
+			{"allowed_ips", t.DecapDropsAllowedIPs},
+			{"malformed_inner", t.DecapDropsMalformedInner},
+			{"buffer", t.DecapDropsBuffer},
+		} {
+			counter(c.wgTransportDropsTotal, r.v, t.Tunnel, "decap", r.reason)
+		}
+		for _, r := range []struct {
+			reason string
+			v      uint64
+		}{
+			{"no_session", t.EncapDropsNoSession},
+			{"unconfirmed", t.EncapDropsUnconfirmed},
+			{"rekey_required", t.EncapDropsRekeyRequired},
+			{"mtu", t.EncapMtuDrops},
+			{"other", t.EncapDropsOther},
+		} {
+			counter(c.wgTransportDropsTotal, r.v, t.Tunnel, "encap", r.reason)
+		}
+
+		for _, k := range []struct {
+			kind string
+			v    uint64
+		}{
+			{"handshake", t.HsSendErrors},
+			{"transport", t.TransportSendErrors},
+			{"tun_write", t.TunWriteErrors},
+			{"tun_rx_no_endpoint", t.TunRxDropsNoEndpoint},
+		} {
+			counter(c.wgSendErrorsTotal, k.v, t.Tunnel, k.kind)
+		}
+
+		confirmed := 0.0
+		if t.SessionConfirmed {
+			confirmed = 1.0
+		}
+		ch <- prometheus.MustNewConstMetric(
+			c.wgSessionConfirmed, prometheus.GaugeValue, confirmed, t.Tunnel)
+		if t.LastHandshakeUnixSecs > 0 {
+			ch <- prometheus.MustNewConstMetric(
+				c.wgLastHandshakeTimeSeconds,
+				prometheus.GaugeValue,
+				float64(t.LastHandshakeUnixSecs),
+				t.Tunnel,
+			)
+		}
+	}
 }
 
 // emitNeighborColdStartCapture exposes the #1782 cold-start capture
