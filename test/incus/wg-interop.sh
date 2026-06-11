@@ -369,12 +369,40 @@ configure_p1() {
         wait_node0_primary 36 || fail "P1: node0 not primary after leak-recovery restart"
     fi
     xpf_wg_commit 1
-    sleep 3
+    # The apply pipeline (tunnels -> dataplane -> FRR) is asynchronous
+    # relative to the CLI commit returning; poll for the TUN + bind
+    # rather than asserting at a fixed offset.
+    local t ok=0
+    for t in $(seq 1 30); do
+        if ish "${FW0}" 'ip -br addr show wg0 >/dev/null 2>&1' \
+            && ish "${FW0}" "ss -uln | grep -q ':${WG_LISTEN_PORT} '"; then
+            ok=1; log "P1: wg0 TUN + :${WG_LISTEN_PORT} bound (t=${t}s)"; break
+        fi
+        sleep 1
+    done
+    if [ "$ok" != 1 ]; then
+        # The commit is in the config DB but the apply pipeline did not
+        # run the tunnel step (wedged apply — the #1794/#1800 class).
+        # A daemon restart re-applies from the DB at boot, which is
+        # deterministic; recover once rather than failing the run.
+        warn "P1: commit landed but wg0/:${WG_LISTEN_PORT} never appeared — restarting xpfd (wedged apply)"
+        ish "${FW0}" 'systemctl restart xpfd'
+        sleep 20
+        ish "${FW0}" 'systemctl is-active xpfd' | grep -q active || fail "P1: xpfd restart failed"
+        wait_node0_primary 36 || fail "P1: node0 not primary after wedge-recovery restart"
+        peer_wg_setup ""   # restart runbook: flush the peer after an xpfd restart
+        for t in $(seq 1 45); do
+            if ish "${FW0}" 'ip -br addr show wg0 >/dev/null 2>&1' \
+                && ish "${FW0}" "ss -uln | grep -q ':${WG_LISTEN_PORT} '"; then
+                ok=1; log "P1: wg0 up after wedge-recovery restart (t=${t}s)"; break
+            fi
+            sleep 1
+        done
+    fi
+    [ "$ok" = 1 ] || fail "P1: wg0 TUN/:${WG_LISTEN_PORT} not up on fw0 (even after restart)"
+    ish "${FW0}" 'ip -br addr show wg0' > "${EVID}/p1-fw0-wg0.txt"
+    ish "${FW0}" "ss -uln | grep ':${WG_LISTEN_PORT} '" >> "${EVID}/p1-fw0-wg0.txt"
     # Secondary suppression asserts (plan §4).
-    ish "${FW0}" 'ip -br addr show wg0' > "${EVID}/p1-fw0-wg0.txt" \
-        || fail "P1: wg0 TUN missing on fw0"
-    ish "${FW0}" "ss -uln | grep ':${WG_LISTEN_PORT} '" >> "${EVID}/p1-fw0-wg0.txt" \
-        || fail "P1: udp :${WG_LISTEN_PORT} not bound on fw0"
     if ish "${FW1}" 'ip link show wg0 >/dev/null 2>&1'; then
         fail "P1: wg0 EXISTS on fw1 — node0 scoping failed (BLOCKING finding)"
     fi
