@@ -310,7 +310,12 @@ both sides):
   plumbing at those sites).
 
 All three flow worker→coordinator→status JSON→Go→Prometheus. No hot-path
-cost (single-threaded u64 adds on refusal arms).
+cost (refusal-arm-only increments). Plumbing precedent: the #1789
+`session_publish_errors` per-binding `live` atomic aggregated in
+`coordinator/status.rs:99-104` → `protocol.go:657` — new counters follow
+the same shape (per-binding Relaxed atomics for poll-path arms; the
+SessionTable-internal `create_drops` exported via the worker status
+snapshot like `max_sessions` at `status.rs:583`).
 
 ## 8. Public API preservation + hidden invariants
 
