@@ -349,6 +349,9 @@ func (s *Server) buildSessionFilter(req *pb.GetSessionsRequest) *sessionFilter {
 	if f.snatPool != "" && f.cfg != nil {
 		f.snatPoolNets, f.snatPoolOK = config.SourceNATPoolNets(&f.cfg.Security.NAT, f.snatPool)
 	}
+	if req.Zone > 65535 {
+		f.setInputErr(status.Errorf(codes.InvalidArgument, "invalid zone id %d", req.Zone))
+	}
 	if req.SourcePort > 65535 {
 		f.setInputErr(status.Errorf(codes.InvalidArgument, "invalid source port %d", req.SourcePort))
 	}

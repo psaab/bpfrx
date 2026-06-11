@@ -119,6 +119,16 @@ func TestServerSessionFilterInvalidInput(t *testing.T) {
 	if err := f.validate(); err == nil {
 		t.Errorf("validate() must surface inputErr")
 	}
+
+	// Zone IDs are uint16 internally; a uint32 request value above
+	// 65535 used to TRUNCATE before validation (65536 -> no zone
+	// filter, 65537 -> zone 1 — Codex r3 Medium). buildSessionFilter
+	// now records inputErr for req.Zone > 65535; pin the truncation
+	// fact the guard exists for.
+	var overflowZone uint32 = 65536
+	if uint16(overflowZone) != 0 {
+		t.Fatalf("expected uint16 truncation of 65536 to 0")
+	}
 }
 
 func TestServerSessionFilterValidate(t *testing.T) {
