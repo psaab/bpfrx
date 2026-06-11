@@ -9,7 +9,8 @@ delta confirmation.**
 
 ## 1. Status
 
-DRAFT v3. Research-only branch `research/1875-cluster-ownership`. No
+v4 — PLAN-READY (converged 3-of-3: Codex r4, AGY r3, Claude SMR r3).
+Research-only branch `research/1875-cluster-ownership`. No
 production code; this is TEST-INFRA / process hardening. PLAN-KILL or a
 docs-only close remain acceptable verdicts, though all three r1
 reviewers independently answered §11 Q1 "Path C is not sufficient".

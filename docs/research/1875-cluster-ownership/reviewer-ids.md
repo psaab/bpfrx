@@ -34,3 +34,7 @@ All r2 findings folded into plan v3.
 - Claude SMR: claude-smr-plan-r3.md — PLAN-READY
 
 ## Round 4 (plan v4 — Codex residual text fix + fd-9 probe adopted)
+- Codex r4: session 019eb8ba-0ee9-7dd2-af3f-0008a2b7cc00 — PLAN-READY
+  (both v4 deltas confirmed; §1 DRAFT-v3 nit fixed in convergence commit)
+
+CONVERGED PLAN-READY 3-of-3: Codex r4 + AGY r3 + Claude SMR r3.
