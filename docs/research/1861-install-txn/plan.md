@@ -1,6 +1,15 @@
 # #1861 — Transactional session install (forward+reverse partial-failure interleavings)
 
-**Status:** DRAFT v1 — pending adversarial plan review
+**Status:** DRAFT v2 — round-1 verdicts: AGY PLAN-NEEDS-MINOR, Claude SMR
+PLAN-NEEDS-MINOR (Codex r1 re-dispatched — first dispatch killed by a
+concurrent session's Codex job; verdict folded on arrival). v2 folds:
+SMR F1 (I2 severity scoped to pool-mode SNAT; interface-mode rollback is a
+no-op), SMR F2 (new row I13: local-tunnel UpsertLocal pair ignores install
+result), SMR F3 (at-cap allocator churn unchanged, stated), SMR F4
+(stateless-limp-along → shed scenario named in §9), SMR F6 (rollback call
+shape), AGY F1 = SMR Q5 (`created: true` over-count fix accepted as
+in-scope ride-along — `install_reverse_session_from_forward_match` returns
+`(SessionLookup, bool)`).
 **Date:** 2026-06-11
 **Branch:** `research/1861-install-txn` (off origin/master `6d8fa810d`)
 **Issue:** #1861 (filed from the #1760 stage-2 revisit, W4 deliverable; both
@@ -71,17 +80,33 @@ facts, not the filed text):
    over-counts (the repair path returns `created: true` unconditionally —
    `session_glue/mod.rs:1086`).
 
-**The genuinely severe, previously-undocumented leak is in face (i):** the
-flow-cache insert at `mod.rs:2016` is not gated on `forward_installed`.
+**The genuinely severe, previously-undocumented leak is in face (i), and
+it is pool-mode-SNAT-scoped (SMR r1 F1):** the flow-cache insert at
+`mod.rs:2016` is not gated on `forward_installed`.
 `FlowCacheEntry::from_forward_decision` checks protocol/disposition/family
-only (`flow_cache.rs:227-233`). At cap, a new TCP/UDP flow whose install
-was refused gets its **rolled-back SNAT tuple cached**; every subsequent
-packet of that flow forwards via the cache using a translated (ip,port) the
-pool allocator believes is free and can grant to a different flow toward
-the same destination. That is wire-level tuple aliasing — the same
-cross-flow reply-misdelivery class as #1760 §2.6 — and it is **not
-self-healing** while traffic keeps the cache entry warm. This alone
-upgrades the fix from "nice hygiene" to a real correctness hole.
+only (`flow_cache.rs:227-233`), and the cache has **no idle TTL** — only
+config/FIB-generation invalidation and 4-way-set LRU collision eviction
+(`flow_cache.rs:384-404`; AGY r1 F2 confirmed). At cap, a new TCP/UDP flow
+whose install was refused gets its **rolled-back SNAT tuple cached**; every
+subsequent packet forwards via the cache using a translated (ip,port) the
+pool allocator believes is free (`allocator.rs:517/558` — `rollback_flow`
+removes the flow's `live_by_flow` entry, returning the port to the pool)
+and can grant to a different flow toward the same destination. That is
+wire-level tuple aliasing — the same cross-flow reply-misdelivery class as
+#1760 §2.6 — and it is **not self-healing**.
+
+**Severity scope:** this allocator desync exists only for **pool-mode
+SNAT** (port-translating, `nat/source.rs:453+`). Interface-mode SNAT — the
+default and the smoke config's mode — rewrites the source *address only*
+with no port allocation (`nat/source.rs:442-452`: no `rewrite_src_port`),
+so `release_source_nat_allocation_with_mode` short-circuits
+(`nat/source.rs:357-365`) and the failure-arm "rollback" is a no-op:
+nothing is allocated, nothing leaks, and a refused interface-SNAT flow's
+wire tuple is identical to what a successful install would have produced
+(residual collision exposure there is the pre-existing #1760 surface, not
+new). Pool mode is fully supported production config, so the hole is real
+— but narrower than a blanket "all SNAT" reading, and Q8's kill arithmetic
+must use this scoped severity.
 
 If reviewers conclude the at-cap behavior churn (plus mandatory failover
 gating) is not justified, PLAN-KILL is an acceptable verdict — but the
@@ -115,7 +140,7 @@ All at origin/master `6d8fa810d`. "Self-heals?" = without operator action.
 | # | Interleaving | Where | State leaked | Self-heals? | Operator symptom today |
 |---|---|---|---|---|---|
 | I1 | Forward install fails at cap, packet still forwarded | `mod.rs:1274/1340` | SYN/UDP leaves with rolled-back SNAT tuple; allocator free-list out of sync with wire reality while packet in flight | partially (single packet) — but see I2 | none: `create_drops` (`session/mod.rs:154`) is **write-only, never exported** |
-| I2 | I1 + flow-cache insert of rolled-back NAT decision | `mod.rs:2016` | cache forwards the whole flow statelessly on an **unreserved** SNAT tuple; allocator can grant same tuple to a new same-destination flow → wire tuple aliasing, cross-flow reply misdelivery | **NO** while traffic refreshes the entry | silent; at most #1762 collision counter on the *other* flow's reply path |
+| I2 | I1 + flow-cache insert of rolled-back NAT decision | `mod.rs:2016` | **pool-mode SNAT only** (interface mode allocates nothing — `nat/source.rs:442-452/357-365`): cache forwards the whole flow statelessly on an **unreserved** SNAT tuple; allocator can grant same tuple to a new same-destination flow → wire tuple aliasing, cross-flow reply misdelivery | **NO** — flow cache has no idle TTL (generation/LRU eviction only) | silent; at most #1762 collision counter on the *other* flow's reply path |
 | I3 | Forward fails, reverse install attempted anyway | `mod.rs:1436` | none **today** (cap fails both, §2.1); latent orphan-reverse for any future failure mode | n/a | none |
 | I4 | Forward succeeds at cap-1, reverse fails at cap | `mod.rs:1274/1436` | forward fully committed, no reverse entry + no BPF reverse key | YES below cap (repair `shared_ops.rs:556/702`); degraded at cap | replies ride cold path; `session_creates` over-counts (`created:true` on failed repair, `session_glue/mod.rs:1086`); `create_drops` invisible |
 | I5 | Reply repair install fails at cap | `shared_ops.rs:727` | none structural — decision still returned, reply forwarded | YES | per-reply cold path + telemetry skew (I4) |
@@ -126,9 +151,12 @@ All at origin/master `6d8fa810d`. "Self-heals?" = without operator action.
 | I10 | `publish_shared_session` partial | `shared_ops.rs:765` | only on mutex poison (a worker already panicked) — not a practical partial | n/a | process-fatal-adjacent; out of scope |
 | I11 | HA sync / replica upsert at cap | `session/mod.rs:766` (`upsert_synced_with_origin`) | **no cap check at all** — sync/replica installs bypass `max_sessions`; table can exceed cap via sync while local new flows are refused | n/a (design asymmetry, pre-existing) | none; documented here, change deferred (§10) |
 | I12 | HA sync partial: forward upsert rejected by `allow_replace_local` arbitration while synthesized reverse accepted (or vice versa) | `session_glue/commands/upsert_synced.rs:65`, `ha.rs:243-336` | one-sided synced state on standby | YES — next 1s sweep / traffic promotion re-asserts | none; pre-existing arbitration semantics, out of scope |
+| I13 | Local-tunnel forward+reverse `UpsertLocal` pair: shared maps published unconditionally, worker-table installs silently dropped at cap | `tunnel.rs:309-331` (publish + enqueue), `session_glue/mod.rs:556-569` (install result discarded) | shared-map/local-table divergence for tunnel sessions at cap; `wait_for_local_tunnel_session_install` 1 ms wait just times out | YES-ish — per-packet shared-map lookups service traffic (degraded); installs retried on the next ≥1s/5s re-enqueue (`tunnel.rs:295-305` refresh window) | none; counter-less today (SMR r1 F2) |
 
-The fix targets I1-I6. I7/I8 get counters+comments only. I9-I12 are
-documented non-goals.
+The fix targets I1-I6 (+ the I5 `created: true` telemetry ride-along, AGY
+r1 F1). I7/I8 get counters+comments only. I9-I13 are documented non-goals
+(I13: same uncapped-sync semantics debate as I11; document + optional
+counter only).
 
 ## 5. Concrete design — recommended Path A (pair preflight + drop-on-refusal)
 
@@ -193,6 +221,17 @@ population at `:2016` are skipped — I1 and I2 die together. The
 `track_in_userspace == false` case (`dns_fastpath_admit`, LocalDelivery)
 has `needed == 0` and is structurally untouched — the "tracking not
 required" vs "install attempted and failed" distinction the issue demands.
+
+Two call-shape notes (SMR r1 F3/F6): (a) the rollback in the refusal arm
+must mirror the existing residual-arm shape —
+`source_nat_release_key.as_ref().unwrap_or(&flow.forward_key)`
+(`mod.rs:1343-1345`) — not a bare `if let Some`, to avoid a semantics fork
+between the two arms; (b) the preflight sits after the SNAT decision
+(forced by `dns_fastpath_admit` needing `decision.nat`), so at-cap
+pool-mode packets still pay an allocate→rollback round-trip per refused
+packet. That churn is pre-existing, cold-path, and bounded by overload
+conditions; a `len() >= max` early-out before NAT evaluation is a
+follow-up optimization, not part of this fix.
 
 After a passing preflight, both installs are infallible by construction.
 Per the #1855 contract the residual is handled as:
@@ -303,7 +342,7 @@ Invariants:
 
 | Class | Level | Notes |
 |---|---|---|
-| Behavioral regression | **MED** | at-cap semantics change from "leak + forward" to "drop" (intended, Junos parity); cap-1 paired flows now refused (§11 Q2); away from cap: zero delta. Mitigated by deterministic pins for every row I1-I8 + smoke + failover |
+| Behavioral regression | **MED** | at-cap semantics change from "leak + forward" to "drop" (intended, Junos parity); cap-1 paired flows now refused (§11 Q2); away from cap: zero delta. Concrete named scenario (SMR r1 F4): a refused flow whose policy permits BOTH directions (permissive intrazone) today limps along statelessly at cap — Path A sheds it until capacity frees. Intended overload shedding; for the common deny-inbound case the reply is policy-dropped today anyway, so nothing is lost. Mitigated by deterministic pins for every row I1-I8 + smoke + failover |
 | Lifetime / borrow-checker | LOW | preflight reads `&self` before the `&mut` install calls in straight-line code; no overlapping borrows |
 | Performance regression | LOW | cold path only; two compares + counter adds; flow-cache/warm path untouched |
 | Architectural mismatch (#961-pattern) | LOW | no new abstraction; uses the existing refusal-arm idiom (`recycle + continue`) and existing counters plumbing. Does NOT touch the #1760 collision-refusal design space (HA arbitration stays unsolved, intentionally) |
@@ -320,9 +359,14 @@ MANDATORY before merge (project rule; stated in the issue).
 - I12 HA arbitration partials (`allow_replace_local` semantics).
 - #1760 collision install-time refusal (shelved; different problem).
 - Making `max_sessions` operator-configurable.
-- `session_creates` over-count on failed repair installs
-  (`created: true`, `session_glue/mod.rs:1086`) — candidate ride-along,
-  reviewers pick (§11 Q5).
+- ~~`session_creates` over-count on failed repair installs~~ — **moved
+  in-scope** as a ride-along per AGY r1 F1 + SMR Q5 answer:
+  `install_reverse_session_from_forward_match` returns
+  `(SessionLookup, bool)`; `resolve_flow_session_decision` propagates the
+  bool into `created` (also stops `publish_bpf_conntrack_entry` firing for
+  a session that does not exist locally).
+- I13 local-tunnel UpsertLocal divergence at cap (document + optional
+  counter only; same uncapped-sync debate as I11).
 
 ## 11. Open questions for adversarial review (PLAN-KILL invited)
 
