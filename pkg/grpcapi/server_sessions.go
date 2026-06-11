@@ -262,6 +262,7 @@ type sessionFilter struct {
 	snatPool     string       // source-nat-pool filter: pool name ("" = off)
 	snatPoolNets []*net.IPNet // resolved pool address set
 	snatPoolOK   bool         // pool name resolved to a configured source pool
+	inputErr     error        // invalid filter input (bad prefix/port) — must fail the RPC
 	cfg          *config.Config
 	zoneNames    map[uint16]string
 	zoneIfaces   map[uint16]string
@@ -269,6 +270,28 @@ type sessionFilter struct {
 	policyNames  map[uint32]string
 	appNames     map[uint16]string
 	hasFilters   bool // true if any filter narrows results
+}
+
+// parseSessionPrefix parses an operator prefix filter — a CIDR or a
+// bare IP (bare IPs become host networks).
+func parseSessionPrefix(prefix string) (*net.IPNet, error) {
+	cidr := prefix
+	if !strings.Contains(cidr, "/") {
+		if strings.Contains(cidr, ":") {
+			cidr += "/128"
+		} else {
+			cidr += "/32"
+		}
+	}
+	_, n, err := net.ParseCIDR(cidr)
+	return n, err
+}
+
+// setInputErr records the first invalid-input error.
+func (f *sessionFilter) setInputErr(err error) {
+	if f.inputErr == nil {
+		f.inputErr = err
+	}
 }
 
 // protoFilterMatches matches a session protocol against an operator
@@ -289,6 +312,9 @@ func protoFilterMatches(p uint8, filter string) bool {
 // than silently match nothing (or, worse for clear paths, match
 // everything).
 func (f *sessionFilter) validate() error {
+	if f.inputErr != nil {
+		return f.inputErr
+	}
 	if f.snatPool != "" && !f.snatPoolOK {
 		return status.Errorf(codes.InvalidArgument, "source NAT pool %q not found", f.snatPool)
 	}
@@ -297,10 +323,17 @@ func (f *sessionFilter) validate() error {
 
 func (s *Server) buildSessionFilter(req *pb.GetSessionsRequest) *sessionFilter {
 	f := &sessionFilter{
-		zoneFilter:   uint16(req.Zone),
-		protoFilter:  req.Protocol,
-		srcPort:      uint16(req.SourcePort),
-		dstPort:      uint16(req.DestinationPort),
+		zoneFilter:  uint16(req.Zone),
+		protoFilter: req.Protocol,
+		srcPort:     uint16(req.SourcePort),
+		dstPort:     uint16(req.DestinationPort),
+		// NOTE: every invalid-input branch below must set f.inputErr
+		// instead of silently zeroing the predicate. The clear path
+		// shares this matcher: a request like source_port=65536 or
+		// source_prefix=10.0.0.300 carries a non-empty filter (so the
+		// clear-all guard is bypassed) but a zeroed predicate would
+		// match EVERY session — a filtered clear degrading to
+		// clear-all (Codex r2 Critical).
 		natOnly:      req.NatOnly,
 		appFilter:    req.Application,
 		ifaceFilter:  req.InterfaceFilter,
@@ -316,29 +349,27 @@ func (s *Server) buildSessionFilter(req *pb.GetSessionsRequest) *sessionFilter {
 	if f.snatPool != "" && f.cfg != nil {
 		f.snatPoolNets, f.snatPoolOK = config.SourceNATPoolNets(&f.cfg.Security.NAT, f.snatPool)
 	}
+	if req.SourcePort > 65535 {
+		f.setInputErr(status.Errorf(codes.InvalidArgument, "invalid source port %d", req.SourcePort))
+	}
+	if req.DestinationPort > 65535 {
+		f.setInputErr(status.Errorf(codes.InvalidArgument, "invalid destination port %d", req.DestinationPort))
+	}
 
 	// Parse CIDR prefix filters.
 	if req.SourcePrefix != "" {
-		cidr := req.SourcePrefix
-		if !strings.Contains(cidr, "/") {
-			if strings.Contains(cidr, ":") {
-				cidr += "/128"
-			} else {
-				cidr += "/32"
-			}
+		n, err := parseSessionPrefix(req.SourcePrefix)
+		if err != nil {
+			f.setInputErr(status.Errorf(codes.InvalidArgument, "invalid source prefix %q", req.SourcePrefix))
 		}
-		_, f.srcNet, _ = net.ParseCIDR(cidr)
+		f.srcNet = n
 	}
 	if req.DestinationPrefix != "" {
-		cidr := req.DestinationPrefix
-		if !strings.Contains(cidr, "/") {
-			if strings.Contains(cidr, ":") {
-				cidr += "/128"
-			} else {
-				cidr += "/32"
-			}
+		n, err := parseSessionPrefix(req.DestinationPrefix)
+		if err != nil {
+			f.setInputErr(status.Errorf(codes.InvalidArgument, "invalid destination prefix %q", req.DestinationPrefix))
 		}
-		_, f.dstNet, _ = net.ParseCIDR(cidr)
+		f.dstNet = n
 	}
 
 	// Build zone/policy/app name maps.

@@ -8,6 +8,9 @@ import (
 	"net"
 	"testing"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/psaab/xpf/pkg/dataplane"
 )
 
@@ -90,6 +93,31 @@ func TestProtoFilterMatches(t *testing.T) {
 		if got := protoFilterMatches(tc.p, tc.filter); got != tc.want {
 			t.Errorf("protoFilterMatches(%d, %q) = %v, want %v", tc.p, tc.filter, got, tc.want)
 		}
+	}
+}
+
+// Invalid prefix/port inputs must fail validate() — they bypass the
+// no-filter clear-all guard (the request LOOKS filtered) while a
+// silently-zeroed predicate would match every session, turning a
+// filtered ClearSessions into clear-all (Codex r2 Critical).
+func TestServerSessionFilterInvalidInput(t *testing.T) {
+	if _, err := parseSessionPrefix("10.0.0.300"); err == nil {
+		t.Errorf("parseSessionPrefix(10.0.0.300) should fail")
+	}
+	if _, err := parseSessionPrefix("not-a-prefix"); err == nil {
+		t.Errorf("parseSessionPrefix(not-a-prefix) should fail")
+	}
+	if n, err := parseSessionPrefix("10.0.0.1"); err != nil || n == nil {
+		t.Errorf("parseSessionPrefix(10.0.0.1) = %v, %v; want host net", n, err)
+	}
+	if n, err := parseSessionPrefix("2001:db8::1"); err != nil || n == nil {
+		t.Errorf("parseSessionPrefix(2001:db8::1) = %v, %v; want host net", n, err)
+	}
+
+	f := &sessionFilter{}
+	f.setInputErr(status.Errorf(codes.InvalidArgument, "invalid source prefix"))
+	if err := f.validate(); err == nil {
+		t.Errorf("validate() must surface inputErr")
 	}
 }
 
