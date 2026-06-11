@@ -5094,3 +5094,15 @@ top.
 - **Timestamp**: 2026-06-10
   **Action**: "#1855 PR #1858 review round complete — Codex r1 NEEDS-CHANGES (1 MEDIUM: session README still said the timer-wheel sweep runs 'by the coordinator', inconsistent with the corrected per-worker ownership) fixed in 71f845fe5 (wheel.rs bullet -> each worker sweeps its own table from its poll loop via expire_stale_entries; GC section -> single-threaded per-worker); Codex r2 MERGE-READY (docs-only confirmed, zero coordinator matches remain); AGY MERGE-READY (5 verified findings incl. per-arm panic trace + both-profile runs); Claude SMR MERGE-READY (worked trace in docs/pr/1855-inplace-contract/claude-smr-review.md); Copilot quota-blocked 3 documented attempts -> 3-of-4. Named tests re-spot-checked green on final head in both profiles (14/14 each)"
   **File(s)**: userspace-dp/src/session/README.md, docs/pr/1855-inplace-contract/{claude-smr-review.md,reviewer-ids.md}, _Log.md
+
+- **Timestamp**: 2026-06-10 ~23:10 PDT
+  - **Action**: /research #1614 residual §3.B CONVERGED 3-of-3 PLAN-READY (plan v2)
+    → disposition executed: #1614 CLOSED healed-to-contract (heal = #1743 series,
+    A/B-proven via pre-#1743 redeploy e4556085a); #1693 closed overtaken; #1863
+    filed (honored-realization gap follow-up, hypothesis H1 + KILL exit); #1864
+    filed (make generate shim verifier landmine — took both cluster dataplanes
+    down mid-session, recovered by restoring tracked .o). 23 measurement cells
+    archived (9-rep decisive, controls, UDP perturbation, A/B, restore-sanity).
+  - **File(s)**: docs/research/1614-residual-v2/{plan.md, claude-smr-plan-r{1,2}.md,
+    codex-plan-r{1,2}.md, agy-plan-r{1,2}.md, reviewer-ids.md, run-cell.sh, raw/*}
+    (branch research/1614-residual-v2 @ ea90eb2c5; doc-only, no production code)
