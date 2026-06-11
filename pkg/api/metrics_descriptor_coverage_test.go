@@ -217,6 +217,26 @@ func populatedCoverageStatus() dpuserspace.ProcessStatus {
 		MaxSessions:         1000,
 		FlowCacheCapacity:   4096,
 		CoSInterfaces:       []dpuserspace.CoSInterfaceStatus{cosIface},
+		// #1865: one populated WG tunnel row so emitWireguardTelemetry's
+		// whole descriptor family is exercised by the canary (the
+		// zone/policy lesson at the top of this file: families that
+		// need fixture data silently fall out of coverage without it).
+		// LastHandshakeUnixSecs is nonzero so the gated gauge emits.
+		WgTunnels: []dpuserspace.WgTunnelStatus{
+			{
+				Tunnel:                "wg0",
+				TunnelEndpointID:      9,
+				ListenPort:            51820,
+				PeerPubkeyHex:         "ab",
+				SessionConfirmed:      true,
+				LastHandshakeUnixSecs: 1_770_000_000,
+				HsInitiationsCreated:  3,
+				DecapPackets:          5,
+				EncapPackets:          6,
+				EncapMtuDrops:         1,
+				HsSendErrors:          2,
+			},
+		},
 		WorkerRuntime: []dpuserspace.WorkerRuntimeStatus{
 			{
 				WorkerID: 0,
@@ -437,30 +457,30 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 	// a single desc) also fails this canary.
 	names := gatheredNames(mfs)
 	want := []string{
-		"xpf_packets_total",                                          // collectGlobalCounters
-		"xpf_zone_packets_total",                                     // collectZoneCounters
-		"xpf_policy_hits_total",                                      // collectPolicyCounters
-		"xpf_filter_hits_total",                                      // collectFilterCounters
-		"xpf_nat_pool_total_ports",                                   // collectNATPoolMetrics
-		"xpf_sessions_active",                                        // collectSessionGauges
-		"xpf_daemon_uptime_seconds",                                  // collectSystemMetrics
-		"xpf_daemon_neighbor_periodic_last_success_age_seconds",      // #1780 neighbor watchdog
-		"xpf_ipmon_policy_failed",                                    // #1827 ip-monitoring
-		"xpf_userspace_worker_dead",                                  // emitWorkerRuntime
-		"xpf_userspace_worker_cold_path_samples_v3_total",            // cold-path v3
-		"xpf_cos_drain_invocations_total",                            // CoS owner profile
-		"xpf_userspace_three_color_policer_drops_total",              // three-color policer
-		"xpf_userspace_source_nat_pool_live_flows",                   // userspace SNAT pool
-		"xpf_userspace_neighbor_warm_drops_total",                    // neighbor-warm
-		"xpf_userspace_neg_neigh_fast_fail_total",                    // #1782 cold-start H1
-		"xpf_userspace_worker_cos_wheel_ticks_advanced_total",        // #1782 Step-1 (i) wheel sum
-		"xpf_userspace_worker_cos_wheel_ticks_advanced_max",          // #1782 Step-1 (i) wheel max
-		"xpf_userspace_worker_cos_queue_lease_undergrant_total",      // #1782 Step-1 (ii) per-cause
-		"xpf_userspace_pending_neigh_duplicate_drops_total",          // #1782 cold-start H5
-		"xpf_userspace_dynamic_neighbor_present",                     // #1782 cold-start H2 dump
-		"xpf_userspace_session_publish_errors_total",                 // #1789 publish failures
+		"xpf_packets_total",                                                // collectGlobalCounters
+		"xpf_zone_packets_total",                                           // collectZoneCounters
+		"xpf_policy_hits_total",                                            // collectPolicyCounters
+		"xpf_filter_hits_total",                                            // collectFilterCounters
+		"xpf_nat_pool_total_ports",                                         // collectNATPoolMetrics
+		"xpf_sessions_active",                                              // collectSessionGauges
+		"xpf_daemon_uptime_seconds",                                        // collectSystemMetrics
+		"xpf_daemon_neighbor_periodic_last_success_age_seconds",            // #1780 neighbor watchdog
+		"xpf_ipmon_policy_failed",                                          // #1827 ip-monitoring
+		"xpf_userspace_worker_dead",                                        // emitWorkerRuntime
+		"xpf_userspace_worker_cold_path_samples_v3_total",                  // cold-path v3
+		"xpf_cos_drain_invocations_total",                                  // CoS owner profile
+		"xpf_userspace_three_color_policer_drops_total",                    // three-color policer
+		"xpf_userspace_source_nat_pool_live_flows",                         // userspace SNAT pool
+		"xpf_userspace_neighbor_warm_drops_total",                          // neighbor-warm
+		"xpf_userspace_neg_neigh_fast_fail_total",                          // #1782 cold-start H1
+		"xpf_userspace_worker_cos_wheel_ticks_advanced_total",              // #1782 Step-1 (i) wheel sum
+		"xpf_userspace_worker_cos_wheel_ticks_advanced_max",                // #1782 Step-1 (i) wheel max
+		"xpf_userspace_worker_cos_queue_lease_undergrant_total",            // #1782 Step-1 (ii) per-cause
+		"xpf_userspace_pending_neigh_duplicate_drops_total",                // #1782 cold-start H5
+		"xpf_userspace_dynamic_neighbor_present",                           // #1782 cold-start H2 dump
+		"xpf_userspace_session_publish_errors_total",                       // #1789 publish failures
 		"xpf_userspace_session_nat_reverse_key_shared_displacements_total", // #1760 W3' shared displacements
-		"xpf_userspace_worker_command_queue_poison_recoveries_total", // #1807 poison recoveries
+		"xpf_userspace_worker_command_queue_poison_recoveries_total",       // #1807 poison recoveries
 		// #1771 §2.6 resolver backoff + §2.5 ENOBUFS/re-dump + key gauges
 		"xpf_userspace_neighbor_resolver_get_backoff_attempts_total",
 		"xpf_userspace_neighbor_netlink_enobufs_total",
@@ -468,6 +488,14 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 		"xpf_userspace_neighbor_netlink_redump_upserts_total",
 		"xpf_userspace_neighbor_pending_keys",
 		"xpf_userspace_neg_neigh_keys",
+		// #1865 WireGuard telemetry family (emitWireguardTelemetry)
+		"xpf_userspace_wg_handshakes_completed_total",
+		"xpf_userspace_wg_handshake_rx_drops_total",
+		"xpf_userspace_wg_transport_packets_total",
+		"xpf_userspace_wg_transport_drops_total",
+		"xpf_userspace_wg_send_errors_total",
+		"xpf_userspace_wg_session_confirmed",
+		"xpf_userspace_wg_last_handshake_time_seconds",
 		// #1830 (g): bucket-vs-flow occupancy gauges
 		"xpf_userspace_cos_flow_fair_buckets_occupied",
 		"xpf_userspace_cos_flow_fair_flows_active",

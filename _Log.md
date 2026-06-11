@@ -5153,3 +5153,7 @@ top.
 - **Timestamp**: 2026-06-11
   **Action**: #1865 engineer — commit 3: Go WgTunnelStatus DTO mirror + cross-language wire pins (1..35 counter ladder)
   **File(s)**: pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/wg_status_test.go
+
+- **Timestamp**: 2026-06-11
+  **Action**: #1865 engineer — commit 4: Prometheus xpf_userspace_wg_* family (12 descriptors, reason/role/direction/kind labels) + emitter + canary fixture row + series-set tests
+  **File(s)**: pkg/api/{metrics.go,metrics_descriptors.go,metrics_userspace.go,metrics_descriptor_coverage_test.go,metrics_wireguard_test.go}

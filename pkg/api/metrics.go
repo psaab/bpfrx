@@ -319,6 +319,23 @@ type xpfCollector struct {
 	neighborNetlinkRedumpUpsertsTotal       *prometheus.Desc
 	neighborPendingKeys                     *prometheus.Desc
 	negNeighKeys                            *prometheus.Desc
+	// #1865: operator-visible WireGuard telemetry — per-tunnel
+	// handshake/encap/decap counters + drop reasons from the helper's
+	// wg_tunnels status rows. Label sets: {tunnel} (+ role / direction
+	// / reason / kind bounded enums). The tunnel label is the tunnel
+	// NAME (stable across commits; #1873 ids are not).
+	wgHandshakesCompletedTotal              *prometheus.Desc
+	wgHandshakeInitiationsCreatedTotal      *prometheus.Desc
+	wgHandshakeInitiationBuildFailuresTotal *prometheus.Desc
+	wgHandshakeRxDropsTotal                 *prometheus.Desc
+	wgHandshakeRequestsArmedTotal           *prometheus.Desc
+	wgTransportPacketsTotal                 *prometheus.Desc
+	wgTransportBytesTotal                   *prometheus.Desc
+	wgKeepalivesReceivedTotal               *prometheus.Desc
+	wgTransportDropsTotal                   *prometheus.Desc
+	wgSendErrorsTotal                       *prometheus.Desc
+	wgSessionConfirmed                      *prometheus.Desc
+	wgLastHandshakeTimeSeconds              *prometheus.Desc
 }
 
 func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
@@ -521,6 +538,18 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.neighborNetlinkRedumpUpsertsTotal
 	ch <- c.neighborPendingKeys
 	ch <- c.negNeighKeys
+	ch <- c.wgHandshakesCompletedTotal
+	ch <- c.wgHandshakeInitiationsCreatedTotal
+	ch <- c.wgHandshakeInitiationBuildFailuresTotal
+	ch <- c.wgHandshakeRxDropsTotal
+	ch <- c.wgHandshakeRequestsArmedTotal
+	ch <- c.wgTransportPacketsTotal
+	ch <- c.wgTransportBytesTotal
+	ch <- c.wgKeepalivesReceivedTotal
+	ch <- c.wgTransportDropsTotal
+	ch <- c.wgSendErrorsTotal
+	ch <- c.wgSessionConfirmed
+	ch <- c.wgLastHandshakeTimeSeconds
 }
 
 func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {

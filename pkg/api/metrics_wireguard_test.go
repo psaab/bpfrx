@@ -1,0 +1,249 @@
+package api
+
+import (
+	"testing"
+
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+)
+
+// #1865: full series-set + label-value pin for emitWireguardTelemetry.
+// Drives the emitter directly with one populated tunnel row (the 1..35
+// ladder mirroring the cross-language wire pins) and asserts:
+//   - the exact set of emitted series (name + labels), so a dropped
+//     reason/kind/role/direction label value fails here;
+//   - counter-vs-gauge dto types;
+//   - the never-handshaked gating of the last-handshake gauge;
+//   - zero-valued reasons are EMITTED (0 is a real signal).
+func TestEmitWireguardTelemetrySeriesSet(t *testing.T) {
+	c := &xpfCollector{
+		wgHandshakesCompletedTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_handshakes_completed_total", "t", []string{"tunnel", "role"}, nil),
+		wgHandshakeInitiationsCreatedTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_handshake_initiations_created_total", "t", []string{"tunnel"}, nil),
+		wgHandshakeInitiationBuildFailuresTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_handshake_initiation_build_failures_total", "t", []string{"tunnel"}, nil),
+		wgHandshakeRxDropsTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_handshake_rx_drops_total", "t", []string{"tunnel", "reason"}, nil),
+		wgHandshakeRequestsArmedTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_handshake_requests_armed_total", "t", []string{"tunnel"}, nil),
+		wgTransportPacketsTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_transport_packets_total", "t", []string{"tunnel", "direction"}, nil),
+		wgTransportBytesTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_transport_bytes_total", "t", []string{"tunnel", "direction"}, nil),
+		wgKeepalivesReceivedTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_keepalives_received_total", "t", []string{"tunnel"}, nil),
+		wgTransportDropsTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_transport_drops_total", "t", []string{"tunnel", "direction", "reason"}, nil),
+		wgSendErrorsTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_send_errors_total", "t", []string{"tunnel", "kind"}, nil),
+		wgSessionConfirmed: prometheus.NewDesc(
+			"xpf_userspace_wg_session_confirmed", "t", []string{"tunnel"}, nil),
+		wgLastHandshakeTimeSeconds: prometheus.NewDesc(
+			"xpf_userspace_wg_last_handshake_time_seconds", "t", []string{"tunnel"}, nil),
+	}
+	status := dpuserspace.ProcessStatus{
+		WgTunnels: []dpuserspace.WgTunnelStatus{{
+			Tunnel:                    "wg0",
+			SessionConfirmed:          true,
+			LastHandshakeUnixSecs:     1770000000,
+			HsInitiationsCreated:      1,
+			HsInitiationBuildFailures: 2,
+			HsResponsesCreated:        3,
+			HsCompletionsInitiator:    4,
+			HsRxDropsMac1Mismatch:     5,
+			HsRxDropsMalformed:        6,
+			HsRxDropsCrypto:           7,
+			HsRxDropsUnknownPeer:      8,
+			HsRxDropsStaleResponse:    9,
+			HsRxDropsIndexExhausted:   10,
+			HsRxCookieUnsupported:     11,
+			RxUnknownType:             12,
+			HsSendErrors:              13,
+			HsRequestsArmed:           14,
+			DecapPackets:              15,
+			DecapBytes:                16,
+			DecapKeepalives:           17,
+			DecapDropsMalformedHeader: 18,
+			DecapDropsUnknownSession:  19,
+			DecapDropsCounterCeiling:  20,
+			DecapDropsCrypto:          21,
+			DecapDropsReplay:          22,
+			DecapDropsAllowedIPs:      23,
+			DecapDropsMalformedInner:  24,
+			DecapDropsBuffer:          25,
+			EncapPackets:              26,
+			EncapBytes:                27,
+			EncapDropsNoSession:       28,
+			EncapDropsUnconfirmed:     29,
+			EncapDropsRekeyRequired:   30,
+			EncapDropsOther:           31,
+			EncapMtuDrops:             32,
+			TransportSendErrors:       33,
+			TunWriteErrors:            34,
+			TunRxDropsNoEndpoint:      0, // zero on purpose: must still emit
+		}},
+	}
+
+	ch := make(chan prometheus.Metric, 256)
+	c.emitWireguardTelemetry(ch, status)
+	close(ch)
+
+	got := map[string]float64{}
+	gotType := map[string]string{}
+	for m := range ch {
+		var d dto.Metric
+		if err := m.Write(&d); err != nil {
+			t.Fatalf("metric Write: %v", err)
+		}
+		key := m.Desc().String()
+		// Build a stable key: fqName is embedded in Desc().String();
+		// append sorted label pairs from the dto.
+		lbl := ""
+		for _, lp := range d.GetLabel() {
+			lbl += "," + lp.GetName() + "=" + lp.GetValue()
+		}
+		key = descFQName(key) + lbl
+		switch {
+		case d.Counter != nil:
+			got[key] = d.Counter.GetValue()
+			gotType[key] = "counter"
+		case d.Gauge != nil:
+			got[key] = d.Gauge.GetValue()
+			gotType[key] = "gauge"
+		default:
+			t.Fatalf("unexpected metric type for %s", key)
+		}
+	}
+
+	want := map[string]float64{
+		"xpf_userspace_wg_handshakes_completed_total,role=initiator,tunnel=wg0":                     4,
+		"xpf_userspace_wg_handshakes_completed_total,role=responder,tunnel=wg0":                     3,
+		"xpf_userspace_wg_handshake_initiations_created_total,tunnel=wg0":                           1,
+		"xpf_userspace_wg_handshake_initiation_build_failures_total,tunnel=wg0":                     2,
+		"xpf_userspace_wg_handshake_requests_armed_total,tunnel=wg0":                                14,
+		"xpf_userspace_wg_handshake_rx_drops_total,reason=mac1_mismatch,tunnel=wg0":                 5,
+		"xpf_userspace_wg_handshake_rx_drops_total,reason=malformed,tunnel=wg0":                     6,
+		"xpf_userspace_wg_handshake_rx_drops_total,reason=crypto,tunnel=wg0":                        7,
+		"xpf_userspace_wg_handshake_rx_drops_total,reason=unknown_peer,tunnel=wg0":                  8,
+		"xpf_userspace_wg_handshake_rx_drops_total,reason=stale_response,tunnel=wg0":                9,
+		"xpf_userspace_wg_handshake_rx_drops_total,reason=index_exhausted,tunnel=wg0":               10,
+		"xpf_userspace_wg_handshake_rx_drops_total,reason=cookie_unsupported,tunnel=wg0":            11,
+		"xpf_userspace_wg_handshake_rx_drops_total,reason=unknown_type,tunnel=wg0":                  12,
+		"xpf_userspace_wg_transport_packets_total,direction=encap,tunnel=wg0":                       26,
+		"xpf_userspace_wg_transport_packets_total,direction=decap,tunnel=wg0":                       15,
+		"xpf_userspace_wg_transport_bytes_total,direction=encap,tunnel=wg0":                         27,
+		"xpf_userspace_wg_transport_bytes_total,direction=decap,tunnel=wg0":                         16,
+		"xpf_userspace_wg_keepalives_received_total,tunnel=wg0":                                     17,
+		"xpf_userspace_wg_transport_drops_total,direction=decap,reason=malformed_header,tunnel=wg0": 18,
+		"xpf_userspace_wg_transport_drops_total,direction=decap,reason=unknown_session,tunnel=wg0":  19,
+		"xpf_userspace_wg_transport_drops_total,direction=decap,reason=counter_ceiling,tunnel=wg0":  20,
+		"xpf_userspace_wg_transport_drops_total,direction=decap,reason=crypto,tunnel=wg0":           21,
+		"xpf_userspace_wg_transport_drops_total,direction=decap,reason=replay,tunnel=wg0":           22,
+		"xpf_userspace_wg_transport_drops_total,direction=decap,reason=allowed_ips,tunnel=wg0":      23,
+		"xpf_userspace_wg_transport_drops_total,direction=decap,reason=malformed_inner,tunnel=wg0":  24,
+		"xpf_userspace_wg_transport_drops_total,direction=decap,reason=buffer,tunnel=wg0":           25,
+		"xpf_userspace_wg_transport_drops_total,direction=encap,reason=no_session,tunnel=wg0":       28,
+		"xpf_userspace_wg_transport_drops_total,direction=encap,reason=unconfirmed,tunnel=wg0":      29,
+		"xpf_userspace_wg_transport_drops_total,direction=encap,reason=rekey_required,tunnel=wg0":   30,
+		"xpf_userspace_wg_transport_drops_total,direction=encap,reason=mtu,tunnel=wg0":              32,
+		"xpf_userspace_wg_transport_drops_total,direction=encap,reason=other,tunnel=wg0":            31,
+		"xpf_userspace_wg_send_errors_total,kind=handshake,tunnel=wg0":                              13,
+		"xpf_userspace_wg_send_errors_total,kind=transport,tunnel=wg0":                              33,
+		"xpf_userspace_wg_send_errors_total,kind=tun_write,tunnel=wg0":                              34,
+		"xpf_userspace_wg_send_errors_total,kind=tun_rx_no_endpoint,tunnel=wg0":                     0,
+		"xpf_userspace_wg_session_confirmed,tunnel=wg0":                                             1,
+		"xpf_userspace_wg_last_handshake_time_seconds,tunnel=wg0":                                   1770000000,
+	}
+	if len(got) != len(want) {
+		t.Errorf("emitted %d series, want %d", len(got), len(want))
+	}
+	for k, v := range want {
+		gv, ok := got[k]
+		if !ok {
+			t.Errorf("missing series %s", k)
+			continue
+		}
+		if gv != v {
+			t.Errorf("series %s = %v, want %v", k, gv, v)
+		}
+	}
+	for k := range got {
+		if _, ok := want[k]; !ok {
+			t.Errorf("unexpected series %s", k)
+		}
+	}
+	if gotType["xpf_userspace_wg_session_confirmed,tunnel=wg0"] != "gauge" {
+		t.Errorf("session_confirmed must be a gauge")
+	}
+	if gotType["xpf_userspace_wg_transport_packets_total,direction=encap,tunnel=wg0"] != "counter" {
+		t.Errorf("transport packets must be a counter")
+	}
+}
+
+// Never-handshaked: the last-handshake gauge is ABSENT (0 is the
+// in-band wire sentinel for never, not a valid gauge sample), while
+// every counter series still emits with value 0.
+func TestEmitWireguardTelemetryNeverHandshakedGauge(t *testing.T) {
+	c := &xpfCollector{
+		wgHandshakesCompletedTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_handshakes_completed_total", "t", []string{"tunnel", "role"}, nil),
+		wgHandshakeInitiationsCreatedTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_handshake_initiations_created_total", "t", []string{"tunnel"}, nil),
+		wgHandshakeInitiationBuildFailuresTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_handshake_initiation_build_failures_total", "t", []string{"tunnel"}, nil),
+		wgHandshakeRxDropsTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_handshake_rx_drops_total", "t", []string{"tunnel", "reason"}, nil),
+		wgHandshakeRequestsArmedTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_handshake_requests_armed_total", "t", []string{"tunnel"}, nil),
+		wgTransportPacketsTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_transport_packets_total", "t", []string{"tunnel", "direction"}, nil),
+		wgTransportBytesTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_transport_bytes_total", "t", []string{"tunnel", "direction"}, nil),
+		wgKeepalivesReceivedTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_keepalives_received_total", "t", []string{"tunnel"}, nil),
+		wgTransportDropsTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_transport_drops_total", "t", []string{"tunnel", "direction", "reason"}, nil),
+		wgSendErrorsTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_send_errors_total", "t", []string{"tunnel", "kind"}, nil),
+		wgSessionConfirmed: prometheus.NewDesc(
+			"xpf_userspace_wg_session_confirmed", "t", []string{"tunnel"}, nil),
+		wgLastHandshakeTimeSeconds: prometheus.NewDesc(
+			"xpf_userspace_wg_last_handshake_time_seconds", "t", []string{"tunnel"}, nil),
+	}
+	status := dpuserspace.ProcessStatus{
+		WgTunnels: []dpuserspace.WgTunnelStatus{{Tunnel: "wg1"}},
+	}
+	ch := make(chan prometheus.Metric, 256)
+	c.emitWireguardTelemetry(ch, status)
+	close(ch)
+	count := 0
+	for m := range ch {
+		count++
+		if descFQName(m.Desc().String()) == "xpf_userspace_wg_last_handshake_time_seconds" {
+			t.Errorf("last-handshake gauge emitted for a never-handshaked tunnel")
+		}
+	}
+	// 2 completions + 3 singles + 8 hs reasons + 2 pkts + 2 bytes +
+	// 1 keepalive + 13 drop reasons + 4 send kinds + 1 confirmed = 36.
+	if count != 36 {
+		t.Errorf("emitted %d series for a zeroed tunnel, want 36 (zeros are real signals)", count)
+	}
+}
+
+// descFQName extracts the fqName from prometheus.Desc.String(), which
+// renders as `Desc{fqName: "name", help: ...}`.
+func descFQName(s string) string {
+	const pfx = `Desc{fqName: "`
+	i := len(pfx)
+	j := i
+	for j < len(s) && s[j] != '"' {
+		j++
+	}
+	if i >= len(s) {
+		return s
+	}
+	return s[i:j]
+}

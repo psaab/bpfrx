@@ -1137,5 +1137,70 @@ func newCollector(srv *Server) *xpfCollector {
 			"Keys currently held in the per-binding negative neighbor caches, summed across bindings (gauge; lazy-TTL upper bound — an expired entry stays counted until its next access) (#1771 §2.6).",
 			nil, nil,
 		),
+		// #1865: per-tunnel WireGuard telemetry. The tunnel label is
+		// the tunnel interface NAME (stable across commits — #1873
+		// positional ids renumber and are never a label). Counters
+		// reset when a commit changes the tunnel's crypto identity
+		// (engine rebuild); rate() handles the monotonic reset.
+		wgHandshakesCompletedTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_handshakes_completed_total",
+			"WireGuard handshake completions by role: initiator = a consumed response promoted our initiation; responder = we accepted an initiation and created (and installed the session for) the response (#1865).",
+			[]string{"tunnel", "role"}, nil,
+		),
+		wgHandshakeInitiationsCreatedTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_handshake_initiations_created_total",
+			"WireGuard handshake initiations BUILT (not necessarily sent — a failing socket send counts in xpf_userspace_wg_send_errors_total{kind=\"handshake\"}; created rising with completions flat and send errors rising is the silent-send fingerprint from #1736) (#1865).",
+			[]string{"tunnel"}, nil,
+		),
+		wgHandshakeInitiationBuildFailuresTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_handshake_initiation_build_failures_total",
+			"WireGuard initiation build failures (engine could not construct msg1 — unknown peer, index exhaustion, crypto/internal error; all folded) (#1865).",
+			[]string{"tunnel"}, nil,
+		),
+		wgHandshakeRxDropsTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_handshake_rx_drops_total",
+			"Inbound WireGuard handshake-path datagrams dropped, by reason (mac1_mismatch | malformed | crypto | unknown_peer | stale_response | index_exhausted | cookie_unsupported | unknown_type). mac1_mismatch is the wrong-key-peer signature (#1865).",
+			[]string{"tunnel", "reason"}, nil,
+		),
+		wgHandshakeRequestsArmedTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_handshake_requests_armed_total",
+			"Accepted NoSession worker→control handshake-request edges (rate-limited to 1/s) — ties an encap-drop burst to the re-initiation it triggered (#1865).",
+			[]string{"tunnel"}, nil,
+		),
+		wgTransportPacketsTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_transport_packets_total",
+			"WireGuard transport packets successfully processed, by direction (encap = egress encrypt, decap = ingress decrypt+deliver) (#1865).",
+			[]string{"tunnel", "direction"}, nil,
+		),
+		wgTransportBytesTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_transport_bytes_total",
+			"WireGuard transport INNER-IP bytes by direction (logical tunnel payload bytes, excluding WG+outer overhead — will not match a kernel peer's `wg show` transfer numbers) (#1865).",
+			[]string{"tunnel", "direction"}, nil,
+		),
+		wgKeepalivesReceivedTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_keepalives_received_total",
+			"Authenticated zero-length WireGuard transport records (peer persistent keepalives). Classified separately so keepalive traffic never inflates the malformed_inner drop reason (#1865).",
+			[]string{"tunnel"}, nil,
+		),
+		wgTransportDropsTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_transport_drops_total",
+			"WireGuard transport drops by direction and reason. decap: malformed_header | unknown_session | counter_ceiling | crypto | replay | allowed_ips | malformed_inner | buffer. encap: no_session | unconfirmed | rekey_required | mtu | other. `unconfirmed` is the responder key-confirmation window (transient at rekey — distinct from no_session so operators do not tcpdump a blip); `mtu` is the exact pad-aware guard at BOTH egress sites (the #1736 v4-mapped blackhole class) (#1865).",
+			[]string{"tunnel", "direction", "reason"}, nil,
+		),
+		wgSendErrorsTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_send_errors_total",
+			"WireGuard I/O errors by kind: handshake = msg1/msg2 socket send failed (the #1736 EINVAL class); transport = encap'd datagram send failed; tun_write = decap'd inner delivery to the wgN TUN failed; tun_rx_no_endpoint = inner packets drained+dropped while a responder-only peer has no learned endpoint (#1865).",
+			[]string{"tunnel", "kind"}, nil,
+		),
+		wgSessionConfirmed: prometheus.NewDesc(
+			"xpf_userspace_wg_session_confirmed",
+			"Whether the tunnel's peer currently holds a CONFIRMED (egress-usable) transport session (1/0 gauge). The liveness signal — a responder-side handshake completion alone does not imply the peer ever received our response (#1865).",
+			[]string{"tunnel"}, nil,
+		),
+		wgLastHandshakeTimeSeconds: prometheus.NewDesc(
+			"xpf_userspace_wg_last_handshake_time_seconds",
+			"Wall-clock epoch seconds of the most recent WireGuard handshake completion (either role). Absent until the first handshake completes; compute age as time() - this (#1865).",
+			[]string{"tunnel"}, nil,
+		),
 	}
 }
