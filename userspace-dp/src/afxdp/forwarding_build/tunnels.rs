@@ -168,7 +168,17 @@ pub(in crate::afxdp) fn hydrate_wg_identity(
     }
     let mut endpoint: Option<SocketAddr> = None;
     if !row.wg_endpoint.is_empty() {
-        endpoint = row.wg_endpoint.parse::<SocketAddr>().ok();
+        // Canonicalize (unmap ::ffff:a.b.c.d) so a configured v4-mapped
+        // literal gets the same logical-v4 treatment as a learned
+        // endpoint: correct (smaller) v4 MTU-guard overhead, v4 outer on
+        // the transit path, and a target the v4-fallback socket can send
+        // to (#1736 Codex r1; folded into the #1866 hydrate helper at
+        // the #1868/#1872 merge).
+        endpoint = row
+            .wg_endpoint
+            .parse::<SocketAddr>()
+            .ok()
+            .map(crate::afxdp::wg::canonicalize_endpoint);
     }
     Some(WgRowIdentity {
         local_privkey,

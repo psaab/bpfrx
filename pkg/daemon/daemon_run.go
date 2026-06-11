@@ -90,7 +90,18 @@ func collectAppliedTunnels(cfg *config.Config) []*config.TunnelConfig {
 		if ifc == nil {
 			continue
 		}
-		if ifc.Tunnel != nil && ifc.Tunnel.Source != "" {
+		// WireGuard tunnels carry no GRE-style local `source` (the peer
+		// lives in WgEndpoint; the local side is just a listen port), so
+		// the Source!="" gate that screens half-configured GRE/IPIP
+		// stanzas must not drop them. Found live in #1736 S2b: without
+		// this, `interfaces wgN tunnel mode wireguard` compiled and fed
+		// the dataplane snapshot, but applyWireguardTunLocked never ran,
+		// so the persistent wgN TUN was never created and the Rust
+		// control thread's open_tun failed. The dataplane side already
+		// special-cases the missing source
+		// (pkg/dataplane/userspace/tunnels.go); this is the routing-side
+		// twin.
+		if ifc.Tunnel != nil && (ifc.Tunnel.Source != "" || ifc.Tunnel.Mode == "wireguard") {
 			tc := *ifc.Tunnel
 			tc.AnchorOnly = anchorOnly
 			tunnels = append(tunnels, &tc)

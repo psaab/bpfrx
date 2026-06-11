@@ -12,8 +12,9 @@
 [WATCH]      1675  pkg/config/compiler.go
 [WATCH]      1669  cmd/cli/show.go
 [WATCH]      1663  pkg/dataplane/userspace/maps_sync.go
-[WATCH]      1624  pkg/dataplane/userspace/protocol.go
+[WATCH]      1636  pkg/dataplane/userspace/protocol.go
 [WATCH]      1621  pkg/config/schema.go
 [WATCH]      1580  userspace-dp/src/afxdp/types/cos.rs
 [WATCH]      1536  userspace-dp/src/session/mod.rs
+[WATCH]      1508  pkg/daemon/daemon_run.go
 [WATCH]      1502  userspace-dp/src/afxdp/frame/mod.rs
