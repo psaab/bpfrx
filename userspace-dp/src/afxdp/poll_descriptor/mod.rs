@@ -247,6 +247,13 @@ pub(super) fn poll_binding_process_descriptor(
                     let mut session_ingress_zone: Option<u16> = None;
                     let mut flow_cache_owner_rg_id = 0i32;
                     let mut apply_nat_on_fabric = false;
+                    // #1861 §5.4: true when a session install was attempted
+                    // for this packet's decision and refused (max_sessions).
+                    // Gates the flow-cache population below — caching a
+                    // sessionless decision would suppress the per-packet
+                    // reply repair (and, on the new-flow path, persist a
+                    // rolled-back SNAT tuple) until cache invalidation.
+                    let mut flow_cache_install_failed = false;
                     let mut decision = if let Some(flow) = flow.as_ref() {
                         if let Some(resolved) = resolve_flow_session_decision(
                             sessions,
@@ -270,6 +277,7 @@ pub(super) fn poll_binding_process_descriptor(
                         ) {
                             telemetry.counters.session_hits += 1;
                             telemetry.dbg.session_hit += 1;
+                            flow_cache_install_failed = resolved.install_failed;
                             if resolved.created {
                                 telemetry.counters.session_creates += 1;
                                 telemetry.dbg.session_create += 1;
@@ -1263,6 +1271,41 @@ pub(super) fn poll_binding_process_descriptor(
                                                 decision,
                                                 fabric_ingress,
                                             );
+                                        // #1861 §5.2: transaction boundary for the
+                                        // forward+reverse install pair. The table is
+                                        // per-worker single-threaded, so a passing
+                                        // preflight makes both installs below
+                                        // infallible within this descriptor
+                                        // iteration. On refusal: roll back the SNAT
+                                        // allocation (same call shape as the old
+                                        // failure arm), count, and DROP the trigger
+                                        // packet (Junos parity: session-creation
+                                        // failure ⇒ packet dropped) — skipping the
+                                        // reverse install, the forwarding block,
+                                        // and the flow-cache population.
+                                        // `needed == 0` is the tracking-not-required
+                                        // case (DNS fast-path, LocalDelivery): no
+                                        // install is attempted and nothing changes.
+                                        let needed_sessions = usize::from(track_in_userspace)
+                                            + usize::from(
+                                                track_in_userspace && install_local_reverse,
+                                            );
+                                        if needed_sessions > 0
+                                            && !sessions.can_admit(needed_sessions)
+                                        {
+                                            sessions.note_admission_refused();
+                                            rollback_source_nat_allocation(
+                                                &worker_ctx.forwarding.source_nat_rules,
+                                                source_nat_release_key
+                                                    .as_ref()
+                                                    .unwrap_or(&flow.forward_key),
+                                                decision.nat,
+                                                false,
+                                                now_ns,
+                                            );
+                                            binding.scratch.scratch_recycle.push(desc.addr);
+                                            continue;
+                                        }
                                         let forward_metadata = SessionMetadata {
                                             ingress_zone: from_zone_id,
                                             egress_zone: to_zone_id,
@@ -1281,6 +1324,31 @@ pub(super) fn poll_binding_process_descriptor(
                                                 meta.protocol,
                                                 meta.tcp_flags,
                                             );
+                                        if track_in_userspace && !forward_installed {
+                                            // #1861 §5.2 residual: impossible by
+                                            // construction after a passing
+                                            // can_admit (cap is the only install
+                                            // failure mode; nothing mutates the
+                                            // table mid-iteration). Debug: loud.
+                                            // Release (#1855 contract): count,
+                                            // roll back, drop — never half-commit.
+                                            debug_assert!(
+                                                false,
+                                                "forward install failed after can_admit preflight"
+                                            );
+                                            sessions.note_install_partial();
+                                            rollback_source_nat_allocation(
+                                                &worker_ctx.forwarding.source_nat_rules,
+                                                source_nat_release_key
+                                                    .as_ref()
+                                                    .unwrap_or(&flow.forward_key),
+                                                decision.nat,
+                                                false,
+                                                now_ns,
+                                            );
+                                            binding.scratch.scratch_recycle.push(desc.addr);
+                                            continue;
+                                        }
                                         if forward_installed {
                                             created += 1;
                                             let forward_entry = SyncedSessionEntry {
@@ -1338,6 +1406,13 @@ pub(super) fn poll_binding_process_descriptor(
                                                 );
                                             }
                                         } else {
+                                            // #1861: only reachable when
+                                            // track_in_userspace == false (a true
+                                            // install failure now drops above) —
+                                            // no session anchors the NAT state, so
+                                            // release any allocation. No-op for the
+                                            // DNS fast-path (its guard requires no
+                                            // NAT).
                                             rollback_source_nat_allocation(
                                                 &worker_ctx.forwarding.source_nat_rules,
                                                 source_nat_release_key
@@ -1431,7 +1506,16 @@ pub(super) fn poll_binding_process_descriptor(
                                             is_reverse: true,
                                             nat64_reverse: nat64_info,
                                         };
-                                        if track_in_userspace
+                                        // #1861 §5.2: the reverse install is gated on
+                                        // forward_installed (was track_in_userspace —
+                                        // a forward failure used to fall through and
+                                        // still attempt the reverse, the latent
+                                        // half-open-reverse hazard). At this point
+                                        // track_in_userspace ⇒ forward_installed
+                                        // (the residual arm above drops otherwise),
+                                        // so this gate is explicit, not a behavior
+                                        // fork.
+                                        let reverse_installed = forward_installed
                                             && install_local_reverse
                                             && sessions.install_with_protocol_with_origin(
                                                 reverse_key.clone(),
@@ -1441,8 +1525,28 @@ pub(super) fn poll_binding_process_descriptor(
                                                 now_ns,
                                                 meta.protocol,
                                                 meta.tcp_flags,
-                                            )
+                                            );
+                                        if forward_installed
+                                            && install_local_reverse
+                                            && !reverse_installed
                                         {
+                                            // #1861 §5.2 residual (reverse half):
+                                            // impossible after a passing can_admit
+                                            // for needed_sessions == 2. Release
+                                            // (#1855 contract): keep the committed
+                                            // forward (the reply repair services
+                                            // inbound), count, and suppress the
+                                            // flow-cache entry so the partially-
+                                            // installed flow is re-evaluated per
+                                            // packet instead of being persisted.
+                                            debug_assert!(
+                                                false,
+                                                "reverse install failed after can_admit preflight"
+                                            );
+                                            sessions.note_install_partial();
+                                            flow_cache_install_failed = true;
+                                        }
+                                        if reverse_installed {
                                             // #1789: count failed reverse-key
                                             // publishes (was `let _ =`; the
                                             // debug-only verify below re-reads
@@ -1992,7 +2096,16 @@ pub(super) fn poll_binding_process_descriptor(
                             // ── Flow cache population ────────────────────
                             // Cache ForwardCandidate decisions for established
                             // TCP/UDP flows. Skip NAT64/NPTv6 (non-cacheable).
-                            if let Some(flow) = flow.as_ref()
+                            // #1861 §5.4: never cache a decision whose backing
+                            // session install was attempted and refused
+                            // (flow_cache_install_failed) — a cached
+                            // sessionless decision would suppress the
+                            // per-packet reply repair until cache
+                            // invalidation. "No install required" paths
+                            // (DNS fast-path, fabric-return) keep the flag
+                            // false and cache as before.
+                            if !flow_cache_install_failed
+                                && let Some(flow) = flow.as_ref()
                                 && let Some(entry) = FlowCacheEntry::from_forward_decision(
                                     flow,
                                     meta,
@@ -2283,6 +2396,16 @@ pub(super) fn poll_binding_process_descriptor(
                                 // session miss → policy deny (no rule for WAN→LAN).
                                 let mut pending_decision = decision;
                                 let mut source_nat_release_key = None;
+                                // #1861 §5.3: true when the seed install was
+                                // ATTEMPTED and refused (max_sessions). Gates
+                                // the pending-neighbor buffering below: a
+                                // refused seed's SNAT allocation was rolled
+                                // back, so replaying the buffered frame after
+                                // neighbor resolution would forward it on an
+                                // unreserved NAT tuple with no session. Flow-
+                                // less packets (no install attempted) keep
+                                // buffering as before.
+                                let mut seed_install_refused = false;
                                 if let Some(flow) = flow.as_ref() {
                                     // #1620: cold-path histogram pre-eval gate
                                     // (session-install slow path). Per plan v4
@@ -2501,6 +2624,16 @@ pub(super) fn poll_binding_process_descriptor(
                                         );
                                         telemetry.counters.session_creates += 1;
                                     } else {
+                                        // #1861 §5.3: at-cap seed refusal. The
+                                        // single-entry install IS the
+                                        // transaction here (no pair); the
+                                        // refusal is counted by the table's
+                                        // create_drops (exported since #1861 —
+                                        // admission_refused stays preflight-
+                                        // only). Roll back the SNAT allocation
+                                        // and drop the frame instead of
+                                        // buffering it for replay.
+                                        seed_install_refused = true;
                                         rollback_source_nat_allocation(
                                             &worker_ctx.forwarding.source_nat_rules,
                                             source_nat_release_key
@@ -2533,7 +2666,15 @@ pub(super) fn poll_binding_process_descriptor(
                                 // resolved (the retry sweep needs next_hop to
                                 // look up a MAC), so it is not buffered —
                                 // recycled instead of held until timeout.
-                                if let Some(hop) = pending_decision.resolution.next_hop {
+                                // #1861 §5.3: a refused seed is recycled, not
+                                // buffered (see seed_install_refused above) —
+                                // the kernel ARP probe already fired, and the
+                                // next packet retries the install once the
+                                // table has room, converging with the #1771
+                                // duplicate-drop semantics.
+                                if !seed_install_refused
+                                    && let Some(hop) = pending_decision.resolution.next_hop
+                                {
                                     let pending_key =
                                         (pending_decision.resolution.egress_ifindex, hop);
                                     // #1782: split the buffer-admission test so
