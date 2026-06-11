@@ -731,3 +731,86 @@ fn bindings_settled_registered_needs_ready_or_error() {
         "registered with a terminal error counts as settled"
     );
 }
+
+// --- #1866: disarmed same-plan apply must not hold WG ports --------------
+
+/// PR #1872 Codex code-r1 F1 regression: with forwarding DISARMED, a
+/// same-plan apply_snapshot takes the refresh_runtime_snapshot leg
+/// (needs_reconcile is false while disarmed), which reconciles WG
+/// control threads for the running case — the handler must then stop
+/// them so a disarmed helper never holds WG listen ports (mirrors the
+/// reconcile_status_bindings → stop() semantics of the
+/// NOT-same-plan path).
+#[test]
+fn wg1866_disarmed_same_plan_apply_does_not_hold_wg_ports() {
+    use crate::{ConfigSnapshot, CONFIG_SNAPSHOT_PROTOCOL_VERSION};
+    let port: u16 = 51879;
+    let wg_snapshot = |generation: u64| ConfigSnapshot {
+        version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+        generation,
+        interfaces: vec![crate::protocol::snapshot::InterfaceSnapshot {
+            name: "wgt1866srv".to_string(),
+            linux_name: "wgt1866srv".to_string(),
+            ifindex: 4250,
+            tunnel: true,
+            ..Default::default()
+        }],
+        tunnel_endpoints: vec![crate::protocol::snapshot::TunnelEndpointSnapshot {
+            id: 1,
+            interface: "wgt1866srv".to_string(),
+            linux_name: "wgt1866srv".to_string(),
+            ifindex: 4250,
+            mode: "wireguard".to_string(),
+            wg_listen_port: port,
+            wg_local_privkey_hex:
+                "a01010101010101010101010101010101010101010101010101010101010101a"
+                    .to_string(),
+            wg_peer_pubkey_hex:
+                "b02020202020202020202020202020202020202020202020202020202020202b"
+                    .to_string(),
+            wg_allowed_ips: vec!["10.77.0.0/24".to_string()],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    // forwarding_armed defaults to false: disarmed throughout.
+    let state = new_state(ProcessStatus::default());
+    // Pre-bind the WG port for the whole test: a disarmed helper must
+    // not even ATTEMPT a bind (Codex code-r2 — the transient
+    // spawn/bind would surface here as a wg_bind_listen_port
+    // exception), so this blocker must never be hit.
+    let _blocker = std::net::UdpSocket::bind(("::", port)).expect("pre-bind");
+    // Codex code-r3 portability nit: on bindv6only=1 hosts the v6
+    // blocker does not cover the v4 fallback bind — add a v4 blocker
+    // opportunistically (it fails AddrInUse on dual-stack hosts, which
+    // is fine: the v6 blocker already covers both there).
+    let _blocker_v4 = std::net::UdpSocket::bind(("0.0.0.0", port)).ok();
+    // Apply 1: NOT-same-plan (no previous snapshot) — the disarmed
+    // reconcile path stops everything.
+    let mut first = req("apply_snapshot");
+    first.snapshot = Some(wg_snapshot(1));
+    let response = run_request(state.clone(), first);
+    assert!(response.ok, "first apply: {}", response.error);
+    // Apply 2: same-plan — takes the (disarmed) refresh leg.
+    let mut second = req("apply_snapshot");
+    second.snapshot = Some(wg_snapshot(2));
+    let response = run_request(state.clone(), second);
+    assert!(response.ok, "second apply: {}", response.error);
+    let guard = state.lock().expect("state");
+    assert!(
+        guard.afxdp.wg_control_threads.is_empty(),
+        "disarmed helper must hold no WG control entries after a same-plan apply"
+    );
+    let exceptions = guard
+        .afxdp
+        .recent_exceptions
+        .lock()
+        .expect("exceptions")
+        .iter()
+        .filter(|e| e.reason.contains("wg_bind_listen_port"))
+        .count();
+    assert_eq!(
+        exceptions, 0,
+        "disarmed helper must not even attempt a WG bind (no transient spawn)"
+    );
+}
