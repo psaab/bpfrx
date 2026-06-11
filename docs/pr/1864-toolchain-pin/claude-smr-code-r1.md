@@ -74,3 +74,10 @@ code path can be entered by the pre-flight.
 **MERGE-READY** at 03d67d228 (F1 fixed in-branch; all other contracts
 verified against the code). Pending: Codex + AGY + Copilot rounds and
 the parent's guarded deploy smoke.
+
+## Re-attestation at 8089ad089
+
+The two Codex r1 fixes (runnable no-sudo remediation; same-spec
+non-mutation assertion) match what I verified while implementing them:
+root-gated tests re-ran green (39s) including the new MaxEntries
+post-assertion, and bash -n is clean. MERGE-READY at 8089ad089.
