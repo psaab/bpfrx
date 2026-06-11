@@ -82,10 +82,16 @@ func splitAddrPort(s string) (string, string) {
 	return s[:idx], s[idx+1:]
 }
 
-// uint32ToIP converts a network byte order uint32 to net.IP.
+// uint32ToIP converts a dataplane IPv4 field to net.IP. Session-map
+// values hold IP bytes in network order read as a NATIVE-endian u32
+// (the Rust helper publishes u32::from_ne_bytes(octets); cilium/ebpf
+// decodes native-endian) — so the bytes are reconstructed with
+// NativeEndian, matching grpcapi's uint32ToIP and the userspace
+// manager's nativeUint32ToIP. The previous BigEndian decode reversed
+// NAT addresses in the local-CLI session display on little-endian.
 func uint32ToIP(v uint32) net.IP {
 	ip := make(net.IP, 4)
-	binary.BigEndian.PutUint32(ip, v)
+	binary.NativeEndian.PutUint32(ip, v)
 	return ip
 }
 

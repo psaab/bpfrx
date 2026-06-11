@@ -1,5 +1,34 @@
 # Action Log
 
+## 2026-06-10 — #1827 PR-3: NAT interplay (per-uplink SNAT + session-transition semantics)
+- **Timestamp**: 2026-06-10 UTC
+- **Action**: PR-3 of the #1827 multi-WAN program. Mini-plan +
+  semantics review at docs/pr/1827-pr3-nat/plan.md (adjudicated in the
+  PR's quad-review): per-uplink SNAT pools need NO new matcher (to-zone
+  derives from the resolved egress ifindex; verified by new Rust
+  per_uplink_* tests + Go snapshot test); session invalidation on
+  uplink transition is the Junos 23.4R1 `source-nat-pool` show/clear
+  session filter (translated source within the named pool's address
+  set), NOT an automatic clear. Repaired the filtered-clear path the
+  runbook rides on: peer-forwarded clears no longer drop
+  zone/interface/nat-only filters (an empty forwarded request meant
+  peer clear-ALL), interface-filtered local clears now populate the
+  iface maps (previously matched nothing), port filters now ntohs
+  network-order key ports, gRPC ClearSessions rebuilt on the shared
+  show matcher, unknown zone/pool names are errors, and pkg/cli
+  uint32ToIP decodes NativeEndian (BigEndian reversed NAT addresses in
+  local-CLI display). Filed #1855 for pre-existing master cargo-test
+  failures (session inplace debug_assert contract conflict).
+- **File(s)**: docs/pr/1827-pr3-nat/plan.md, proto/xpf/v1/xpf.proto,
+  pkg/grpcapi/xpfv1/*, pkg/config/natpool{,_test}.go,
+  pkg/grpcapi/server_sessions.go, pkg/grpcapi/session_filter_test.go,
+  pkg/cli/{session_filter,cli_clear,cli_show_flow,proto}.go,
+  pkg/cli/session_filter_test.go, cmd/cli/{show,clear}.go,
+  pkg/cmdtree/tree.go, userspace-dp/src/nat/tests.rs,
+  pkg/dataplane/userspace/nat_per_uplink_test.go, docs/multi-wan.md,
+  pkg/{cli,grpcapi}/README.md
+
+
 ## 2026-06-10 — #1824 proptest harness for frame parse/NAT/TSO
 - **Timestamp**: 2026-06-10 UTC
 - **Action**: Implemented the #1824 in-tree proptest harness per the

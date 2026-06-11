@@ -1,10 +1,12 @@
 # Multi-WAN failover (services rpm + services ip-monitoring)
 
-Status: PR-1 + PR-2 of the #1827 multi-WAN program (plan:
+Status: PR-1 + PR-2 + PR-3 of the #1827 multi-WAN program (plan:
 `docs/research/1827-multiwan/plan.md`). PR-1 delivers probe-driven
 route failover with Junos syntax; PR-2 adds per-policy uplink
-selection (FBF composition). NAT interplay and health-gated
-load-sharing are later PRs (§5 of the plan).
+selection (FBF composition); PR-3 defines the NAT interplay
+(per-uplink SNAT pools via existing matchers + session-transition
+semantics, mini-plan: `docs/pr/1827-pr3-nat/plan.md`). Health-gated
+load-sharing is a later PR (§5 of the plan).
 
 xpf models multi-WAN the way real SRX does — as the composition of
 existing subsystems, not an invented `services multi-wan` tree:
@@ -167,6 +169,106 @@ target environment. Uplink-failure path divergence (blackhole the
 ISP-B gateway upstream, watch `fbf-fallback` repoint `ISP-B.inet.0`)
 remains a manual smoke step — the harness cannot mutate the provider
 side.
+
+## NAT interplay (PR-3)
+
+### Per-uplink SNAT pools — existing matchers suffice
+
+No new NAT matcher exists or is needed. SNAT rule-set selection keys
+on the zone pair, and the **to-zone of every new flow is derived from
+its resolved egress interface** (the session-miss path resolves the
+route first, then maps `resolution.egress_ifindex` to the zone pair
+fed into source-NAT matching). When ip-monitoring flips the preferred
+route — or an FBF term steers a flow into an uplink's
+routing-instance — new flows resolve onto the other uplink's
+interface, the to-zone follows, and that uplink's rule-set/pool is
+chosen automatically.
+
+Recommended recipe — one zone, one rule-set, one pool per uplink:
+
+```
+set security zones security-zone untrust-a interfaces reth0.50
+set security zones security-zone untrust-b interfaces reth0.80
+set security nat source pool isp-a-pool address 203.0.113.10/32
+set security nat source pool isp-b-pool address 198.51.100.10/32
+set security nat source rule-set to-isp-a from zone trust
+set security nat source rule-set to-isp-a to zone untrust-a
+set security nat source rule-set to-isp-a rule snat-a match source-address 10.0.0.0/8
+set security nat source rule-set to-isp-a rule snat-a then source-nat pool isp-a-pool
+set security nat source rule-set to-isp-b from zone trust
+set security nat source rule-set to-isp-b to zone untrust-b
+set security nat source rule-set to-isp-b rule snat-b match source-address 10.0.0.0/8
+set security nat source rule-set to-isp-b rule snat-b then source-nat pool isp-b-pool
+```
+
+Alternative: `then source-nat interface` translates to the resolved
+egress interface's primary address — per-uplink by construction, even
+when both uplinks share one zone.
+
+Limitation (documented, not built): Junos additionally allows source
+NAT rule-sets scoped `to interface <if>` / `to routing-instance <ri>`;
+xpf rule-sets carry from-zone/to-zone only. Pool-mode SNAT with BOTH
+uplinks in a single shared zone therefore has no per-uplink rule-set
+discriminator — use zone-per-uplink (above) or interface SNAT.
+
+### Session behavior on uplink transition
+
+What happens to ESTABLISHED sessions when ip-monitoring fails over:
+
+1. The actuator publishes the overlay snapshot, then bumps the FIB
+   generation (order is load-bearing, PR-1b).
+2. The bump invalidates per-worker flow-cache entries; the session
+   table is untouched. On the next packet, a **locally-created**
+   session's stored forwarding resolution is reused in preference to a
+   fresh FIB lookup (`cached_session_resolution` on the session-hit
+   path), so the flow cache re-fills with the OLD egress under the new
+   generation.
+3. ⇒ Established locally-created sessions stay **pinned to the failed
+   uplink entirely** — old egress interface, old neighbor, and the
+   immutable NAT binding. Their traffic keeps leaving the dead path
+   and blackholes until the inactivity timeout or an operator clear.
+   New flows resolve via the injected route and are correct
+   immediately. (Two exceptions DO move onto the injected route:
+   peer-synced sessions, which resolve lookup-first; and tunnel-backed
+   sessions, whose OUTER path re-resolves before the stored-resolution
+   fast path. The pinning above is the ordinary direct-uplink case the
+   SNAT recipes produce.)
+
+This is Junos parity in substance: SRX likewise does not re-route or
+re-NAT established sessions on a route change by default. Junos
+ip-monitoring has no session-clear action, and neither does xpf's
+(deliberately — a flapping probe must never mass-clear healthy
+sessions). The operator clear below is therefore THE mechanism for
+moving established flows to the surviving uplink. The operator
+decides:
+
+- **Do nothing** — pinned sessions age out at their inactivity
+  timeout; new flows are correct immediately.
+- **Clear by pool** (Junos 23.4R1 syntax):
+
+  ```
+  show services ip-monitoring status                              # confirm FAIL + applied routes
+  show security flow session source-nat-pool isp-a-pool           # list pinned sessions
+  clear security flow session source-nat-pool isp-a-pool          # release them
+  ```
+
+  (The clear prints per-family cleared counts. In the local CLI,
+  `... source-nat-pool isp-a-pool summary` gives a filtered count;
+  the remote CLI's `summary` keyword shows the unfiltered table
+  summary — a pre-existing remote-CLI behavior for all filters.)
+
+  Cleared flows re-establish via the surviving uplink and match the
+  new egress zone's rule-set/pool. The filter matches sessions whose
+  TRANSLATED source lies in the named pool's address set (SNAT
+  sessions only; pre-NAT tuples never match). An unknown pool name is
+  a command error — never an empty (clear-all) filter. On an HA pair
+  the filtered clear is forwarded to the peer with the SAME filter.
+  Interface-mode SNAT bindings are not pool-named; clear those by
+  uplink zone (`clear security flow session zone untrust-a`) instead.
+
+Pool overlap caveat: membership is by translated address. If two
+source pools overlap (itself a misconfiguration), a pool-filtered
+clear can match sessions allocated from the other pool.
 
 ## Observability
 

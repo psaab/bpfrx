@@ -266,6 +266,7 @@ message GetSessionsRequest {
   string page_token = 13;
   int32 page_size = 14;           // max entries per page; 0 = use limit/offset path
   bool no_enrich = 15;            // skip reverse-entry merge & app name resolution
+  string source_nat_pool = 16;    // filter by source NAT pool name (translated source in pool)
 }
 message GetSessionsResponse {
   int32 total = 1;                  // exact count when unfiltered; -1 when filters active (avoids full scan)
@@ -504,6 +505,9 @@ message ClearSessionsRequest {
   uint32 source_port = 5;        // optional
   uint32 destination_port = 6;   // optional
   string application = 7;        // optional: application name filter
+  string interface = 8;          // optional: ingress/egress interface name filter
+  bool nat_only = 9;             // optional: only sessions with NAT translation
+  string source_nat_pool = 10;   // optional: source NAT pool name (translated source in pool)
 }
 message ClearSessionsResponse {
   int32 ipv4_cleared = 1;
