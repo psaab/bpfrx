@@ -1,15 +1,39 @@
 # #1861 — Transactional session install (forward+reverse partial-failure interleavings)
 
-**Status:** DRAFT v2 — round-1 verdicts: AGY PLAN-NEEDS-MINOR, Claude SMR
-PLAN-NEEDS-MINOR (Codex r1 re-dispatched — first dispatch killed by a
-concurrent session's Codex job; verdict folded on arrival). v2 folds:
-SMR F1 (I2 severity scoped to pool-mode SNAT; interface-mode rollback is a
-no-op), SMR F2 (new row I13: local-tunnel UpsertLocal pair ignores install
-result), SMR F3 (at-cap allocator churn unchanged, stated), SMR F4
-(stateless-limp-along → shed scenario named in §9), SMR F6 (rollback call
-shape), AGY F1 = SMR Q5 (`created: true` over-count fix accepted as
-in-scope ride-along — `install_reverse_session_from_forward_match` returns
-`(SessionLookup, bool)`).
+**Status:** DRAFT v3 — round-1 verdicts: Codex PLAN-NEEDS-MAJOR
+(`task-mq9d341w-jxx35f`), AGY PLAN-NEEDS-MINOR
+(`adversarial-review-mq9apsuk-83bel6`), Claude SMR PLAN-NEEDS-MINOR.
+v2 folded: SMR F1 (I2 severity scoped to pool-mode SNAT; interface-mode
+rollback is a no-op), SMR F2 (new row I13: local-tunnel UpsertLocal pair
+ignores install result), SMR F3 (at-cap allocator churn unchanged, stated),
+SMR F4 (stateless-limp-along → shed scenario named in §9), SMR F6 (rollback
+call shape), AGY F1 = SMR Q5 (`created: true` over-count fix accepted as
+in-scope ride-along).
+v3 folds Codex r1:
+- **C1 (High, accepted — verified):** face (ii) replies do NOT stay on the
+  cold path. The repaired reply's decision is itself flow-cache-inserted at
+  `mod.rs:2016` (no install-success gate), so after the FIRST repaired
+  reply, subsequent replies ride the fast path, the repair is never
+  retried, and the reverse session is never installed even after capacity
+  frees (until generation bump / LRU eviction). §2 refutation (b), rows
+  I4/I5, and the fix design (§5.4 cache-eligibility gate) rewritten.
+- **C2 (Medium, accepted):** NAT64 missing from the map → new row I14
+  (`mod.rs:574-582`, `nat64.rs:97-105`: round-robin source pick, no
+  reservation, no rollback needed; refused flow forwards one translated
+  packet; excluded from flow cache by `should_cache`'s `!nat64`). Path A
+  drop covers it; dedicated test pin added (§12).
+- **C3 (Medium, accepted-with-disposition):** I13 stays out of the fix PR
+  but is upgraded from "document" to "file a dedicated follow-up issue
+  before /engineer + explicit user-signoff line in the §10 scope note".
+  Rationale: the apply side (`session_glue/mod.rs:560`) is the uncapped
+  sync/replica family (I11) whose semantics (cap vs rollback vs higher
+  cap) need their own arbitration design; bolting a unilateral behavior
+  choice onto this PR violates the narrow-scope rule.
+- **C4 (Low, accepted):** I2 symptom column gains the embedded-ICMP blind
+  spot — `icmp_embed` consults sessions/shared maps only
+  (`session_match.rs:77-83`, `nat_match_v4.rs:41-43`), never the flow
+  cache, so ICMP errors for a leaked cached stateless flow do not
+  NAT-reverse.
 **Date:** 2026-06-11
 **Branch:** `research/1861-install-txn` (off origin/master `6d8fa810d`)
 **Issue:** #1861 (filed from the #1760 stage-2 revisit, W4 deliverable; both
@@ -65,7 +89,8 @@ facts, not the filed text):
    `track_in_userspace` flag — `mod.rs:1436` — so the
    tracking-not-required case skips both.) The half-open reverse entry is
    a *latent* hazard for any future non-cap failure mode, not a live one.
-2. **Face (ii) is not a "permanent one-way blackhole."** A reply with no
+2. **Face (ii) is not a "permanent one-way blackhole" — but it is also
+   not "cold path until capacity frees" (Codex r1 C1).** A reply with no
    reverse entry misses BPF, reaches userspace, misses
    `lookup_session_across_scopes`, and is repaired by
    `lookup_forward_nat_across_scopes` (`shared_ops.rs:556`) — the forward
@@ -73,12 +98,18 @@ facts, not the filed text):
    (`index_forward_nat_key_parts`, `session/mod.rs:1376-1411`, NAT'd or
    not). `install_reverse_session_from_forward_match`
    (`shared_ops.rs:702`) then returns the rebuilt reverse decision **even
-   when its own install fails at cap**, so the reply is forwarded. Face
-   (ii)'s real symptoms are degradation, not blackhole: every reply rides
-   the cold path until the table drops below cap, the repair install
-   retries and fails per reply packet, and `session_creates` telemetry
+   when its own install fails at cap**, so the reply is forwarded. The
+   FIRST repaired reply's decision is then **flow-cache-inserted at
+   `mod.rs:2016`** (no install-success gate), so subsequent replies ride
+   the fast path with a correct un-NAT decision but NO backing session:
+   the repair never re-fires, the reverse session is never installed even
+   after capacity frees (until config/FIB generation bump or LRU set
+   eviction), `show security flow session` shows a one-sided flow, and
+   embedded-ICMP errors for the reply direction cannot NAT-reverse
+   (`icmp_embed` never consults the flow cache). Plus `session_creates`
    over-counts (the repair path returns `created: true` unconditionally —
-   `session_glue/mod.rs:1086`).
+   `session_glue/mod.rs:1086`). Degradation + standing observability gap,
+   not blackhole.
 
 **The genuinely severe, previously-undocumented leak is in face (i), and
 it is pool-mode-SNAT-scoped (SMR r1 F1):** the flow-cache insert at
@@ -142,8 +173,8 @@ All at origin/master `6d8fa810d`. "Self-heals?" = without operator action.
 | I1 | Forward install fails at cap, packet still forwarded | `mod.rs:1274/1340` | SYN/UDP leaves with rolled-back SNAT tuple; allocator free-list out of sync with wire reality while packet in flight | partially (single packet) — but see I2 | none: `create_drops` (`session/mod.rs:154`) is **write-only, never exported** |
 | I2 | I1 + flow-cache insert of rolled-back NAT decision | `mod.rs:2016` | **pool-mode SNAT only** (interface mode allocates nothing — `nat/source.rs:442-452/357-365`): cache forwards the whole flow statelessly on an **unreserved** SNAT tuple; allocator can grant same tuple to a new same-destination flow → wire tuple aliasing, cross-flow reply misdelivery | **NO** — flow cache has no idle TTL (generation/LRU eviction only) | silent; at most #1762 collision counter on the *other* flow's reply path |
 | I3 | Forward fails, reverse install attempted anyway | `mod.rs:1436` | none **today** (cap fails both, §2.1); latent orphan-reverse for any future failure mode | n/a | none |
-| I4 | Forward succeeds at cap-1, reverse fails at cap | `mod.rs:1274/1436` | forward fully committed, no reverse entry + no BPF reverse key | YES below cap (repair `shared_ops.rs:556/702`); degraded at cap | replies ride cold path; `session_creates` over-counts (`created:true` on failed repair, `session_glue/mod.rs:1086`); `create_drops` invisible |
-| I5 | Reply repair install fails at cap | `shared_ops.rs:727` | none structural — decision still returned, reply forwarded | YES | per-reply cold path + telemetry skew (I4) |
+| I4 | Forward succeeds at cap-1, reverse fails at cap | `mod.rs:1274/1436` | forward fully committed, no reverse entry + no BPF reverse key; first repaired reply seeds a **sessionless reply-direction flow-cache entry** (`mod.rs:2016`) that suppresses further repair | PARTIAL — traffic flows, but the reverse session is NOT re-installed after capacity frees until cache invalidation (Codex r1 C1) | one-sided `show security flow session`; embedded-ICMP NAT-reversal blind spot for the reply direction; `session_creates` over-counts (`created:true` on failed repair, `session_glue/mod.rs:1086`); `create_drops` invisible |
+| I5 | Reply repair install fails at cap | `shared_ops.rs:727` | sessionless reply-direction cache entry (see I4); decision still returned, reply forwarded | PARTIAL (same as I4) | first reply cold path, rest fast path with no session; telemetry skew (I4) |
 | I6 | MissingNeighborSeed install fails, packet still **buffered** and later replayed | `mod.rs:2448/2504`, buffering below not gated on `pending_installed` | replayed frame forwarded with rolled-back SNAT tuple (I1-class); session-free replay (`neighbor_dispatch.rs` forwards buffered frames without sessions) | per-frame | none |
 | I7 | Fabric-return fast-path install fails, packet still forwarded | `mod.rs:479/508` | none harmful: packet was policy/NAT-validated by active peer; forwarding is stateless-degraded; no local NAT allocation | YES | none (acceptable; count only) |
 | I8 | LocalMiss helper-session install fails, local delivery proceeds | `mod.rs:840` | none (optimization entry only, no NAT) | YES | none (acceptable) |
@@ -151,12 +182,14 @@ All at origin/master `6d8fa810d`. "Self-heals?" = without operator action.
 | I10 | `publish_shared_session` partial | `shared_ops.rs:765` | only on mutex poison (a worker already panicked) — not a practical partial | n/a | process-fatal-adjacent; out of scope |
 | I11 | HA sync / replica upsert at cap | `session/mod.rs:766` (`upsert_synced_with_origin`) | **no cap check at all** — sync/replica installs bypass `max_sessions`; table can exceed cap via sync while local new flows are refused | n/a (design asymmetry, pre-existing) | none; documented here, change deferred (§10) |
 | I12 | HA sync partial: forward upsert rejected by `allow_replace_local` arbitration while synthesized reverse accepted (or vice versa) | `session_glue/commands/upsert_synced.rs:65`, `ha.rs:243-336` | one-sided synced state on standby | YES — next 1s sweep / traffic promotion re-asserts | none; pre-existing arbitration semantics, out of scope |
-| I13 | Local-tunnel forward+reverse `UpsertLocal` pair: shared maps published unconditionally, worker-table installs silently dropped at cap | `tunnel.rs:309-331` (publish + enqueue), `session_glue/mod.rs:556-569` (install result discarded) | shared-map/local-table divergence for tunnel sessions at cap; `wait_for_local_tunnel_session_install` 1 ms wait just times out | YES-ish — per-packet shared-map lookups service traffic (degraded); installs retried on the next ≥1s/5s re-enqueue (`tunnel.rs:295-305` refresh window) | none; counter-less today (SMR r1 F2) |
+| I13 | Local-tunnel forward+reverse `UpsertLocal` pair: shared maps published unconditionally, worker-table installs silently dropped at cap | `tunnel.rs:309-331` (publish + enqueue), `session_glue/mod.rs:556-569` (install result discarded) | shared-map/local-table divergence for tunnel sessions at cap; `wait_for_local_tunnel_session_install` 1 ms wait just times out | YES-ish — per-packet shared-map lookups service traffic (degraded); installs retried on the next ≥1s/5s re-enqueue (`tunnel.rs:295-305` refresh window) | none; counter-less today (SMR r1 F2); **follow-up issue filed before /engineer** (Codex r1 C3 disposition) |
+| I14 | NAT64 source pick precedes admission; refused NAT64 flow forwards one translated packet | `mod.rs:574-582` (`allocate_v4_source` before policy/install), `nat64.rs:97-105` | none persistent: round-robin address pick, **no reservation, nothing to roll back**; no flow-cache persistence (`should_cache` excludes `nat64`, `flow_cache.rs:229`) | per-packet (I1-class) | none (Codex r1 C2) |
 
-The fix targets I1-I6 (+ the I5 `created: true` telemetry ride-along, AGY
-r1 F1). I7/I8 get counters+comments only. I9-I13 are documented non-goals
-(I13: same uncapped-sync semantics debate as I11; document + optional
-counter only).
+The fix targets I1-I6 + I14 (all covered by the same §5.2 refusal arm) +
+the I4/I5 repair-path ride-along (created-flag + cache-eligibility gate,
+§5.4). I7/I8 get counters+comments only. I9-I13 are documented non-goals
+(I13: same uncapped-sync semantics debate as I11; dedicated follow-up
+issue + explicit user signoff in §10 per Codex r1 C3).
 
 ## 5. Concrete design — recommended Path A (pair preflight + drop-on-refusal)
 
@@ -266,7 +299,37 @@ existing duplicate-drop semantics. Optionally preflight with
 `can_admit(1)` before the SNAT allocation for symmetry; the seed path
 installs only a forward entry.
 
-### 5.4 Fabric-return (`:479`) and LocalMiss (`:840`)
+### 5.4 Repair-path ride-along: created-flag + cache-eligibility gate (Codex r1 C1 + AGY r1 F1)
+
+`install_reverse_session_from_forward_match` (`shared_ops.rs:702`) returns
+`(SessionLookup, bool)` — the bool is the actual install outcome.
+`resolve_flow_session_decision` propagates it twofold:
+
+1. `created: installed` (fixes the `session_creates` over-count and stops
+   `publish_bpf_conntrack_entry` firing for a session that does not exist
+   locally — AGY r1 F1);
+2. a new `install_failed: bool` on `ResolvedFlowSessionDecision`
+   (`false` on all hit paths), threaded to the flow-cache population gate
+   at `mod.rs:1995-2016`:
+
+```rust
+if !decision_install_failed            // §5.4: never cache a decision whose
+    && let Some(flow) = flow.as_ref() // backing install was refused
+    && let Some(entry) = FlowCacheEntry::from_forward_decision(/* unchanged */)
+{
+    binding.flow.flow_cache.insert(entry);
+}
+```
+
+Effect: a failed repair install keeps the reply on the slow path, so the
+repair re-fires per reply packet and succeeds on the first packet after
+the table drops below cap — restoring the "self-heals below cap" property
+that v1 wrongly claimed already existed. The new-flow refusal arm needs no
+flag (its `continue` already skips the block). Note this is reachable even
+post-Path-A: a synced forward-only flow's repair can race the cap from
+*other* flows' installs.
+
+### 5.5 Fabric-return (`:479`) and LocalMiss (`:840`)
 
 Behavior preserved (forwarding without local session is semantically valid
 there — peer-validated and local-delivery-optimization respectively). Add
@@ -370,8 +433,13 @@ MANDATORY before merge (project rule; stated in the issue).
   `(SessionLookup, bool)`; `resolve_flow_session_decision` propagates the
   bool into `created` (also stops `publish_bpf_conntrack_entry` firing for
   a session that does not exist locally).
-- I13 local-tunnel UpsertLocal divergence at cap (document + optional
-  counter only; same uncapped-sync debate as I11).
+- I13 local-tunnel UpsertLocal divergence at cap — **kept out of the fix
+  PR by explicit scope decision (Codex r1 C3 disposition):** the apply
+  side is the uncapped sync/replica family (I11) whose semantics need
+  their own arbitration design. Commitment: a dedicated follow-up issue
+  is filed BEFORE /engineer, and this scope line is surfaced verbatim in
+  the converged-plan issue comment so the user signs off on the exclusion
+  when approving /engineer.
 
 ## 11. Open questions for adversarial review (PLAN-KILL invited)
 
@@ -392,8 +460,12 @@ MANDATORY before merge (project rule; stated in the issue).
 4. **Fabric-return at cap (I7):** plan keeps forwarding without a local
    session there. Should it drop instead for strict transactional
    semantics, given the active peer already validated the packet?
-5. **Ride-along:** fix the `created: true` telemetry over-count on failed
-   repair installs in this PR, or file separately?
+5. **Ride-along:** ~~fix the `created: true` over-count in this PR or
+   separately?~~ Resolved r1: in this PR (AGY F1), expanded by Codex C1
+   into the §5.4 cache-eligibility gate. NEW sub-question for r2: is the
+   `install_failed` flag the right shape, or should the cache gate live
+   inside `from_forward_decision` (an extra parameter) to keep the
+   eligibility logic in one module?
 6. **Counter naming/cardinality:** three new counters (§7) vs folding
    admission refusals into the exported `create_drops` only?
 7. **Is the I2 flow-cache leak claim correct?** Hostile check invited:
@@ -429,10 +501,14 @@ MANDATORY before merge (project rule; stated in the issue).
   - I4 boundary: at cap-2 both install; at cap-1 paired flow refused
     (Path A) — pin the chosen semantics.
   - I5: reply at cap with forward-only state still forwarded
-    (repair-path preservation pin).
+    (repair-path preservation pin) AND **no flow-cache entry for the
+    failed-repair reply** (§5.4 gate pin, Codex C1); below cap, the next
+    reply installs the reverse session (self-heal-restored pin).
   - I6: seed-install refusal ⇒ frame recycled, NOT buffered
     (pending-neighbor map empty).
   - I7/I8: behavior preserved at cap (forwarded / locally delivered).
+  - I14: NAT64 v6→v4 SYN at cap ⇒ dropped, no session entries, no
+    flow-cache entry (Codex C2 pin).
   - Wire: counter key-absent pins both sides (Rust fixture + protocol.go).
 - Smoke on loss userspace cluster (parent-serialized) + **mandatory
   `make test-failover`** (install path + HA-adjacent).
