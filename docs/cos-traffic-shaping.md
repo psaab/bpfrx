@@ -953,6 +953,17 @@ Notes for this specific test:
   | `mean` | 1.242 G | 10.93 G (-12 %) | 16.7 % (-40 % relative) | NO |
   | `slowest` (default) | 0.87 G | 8.70 G (-30 %) | ~0 % | NO |
 
+  Live A/B (#1746 F1 + supplementary matrix,
+  `docs/pr/1746-equal-flow-target-policy/f1-measurement.md`): the effect
+  of `mean` is **regime-dependent** — on high-CoV baseline draws (skewed
+  RSS placement, per-flow CoV well above the structural floor) it
+  delivered a 52 % relative CoV reduction at ~zero aggregate cost; on
+  draws already near the fairness floor (~10 % CoV) it ADDED ~5 CoV
+  points and cost 4-8 % aggregate, because there is nothing above the
+  mean to trim and the enforcement duty cycle perturbs balanced flows.
+  Enable `mean` only on classes that chronically exhibit high per-flow
+  CoV; do not enable it on classes already near the floor.
+
   **No cap-based policy lifts the slowest band**: the cap is
   one-directional (`my_share.min(cap)`), and capacity freed by clipping a
   fast worker cannot reach a starved worker on a different queue/CPU.

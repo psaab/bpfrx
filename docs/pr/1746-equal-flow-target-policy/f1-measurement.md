@@ -104,3 +104,69 @@ the cap-hit deltas prove mid-run enforcement.
 4. None of the policies lift the slow band (1.1-1.2 G floor in matched
    draws) — confirming the structural one-directional-cap analysis;
    lifting the floor is #1748.
+
+---
+
+# Supplementary matrix (Codex r1 F2): v6 push + v4 reverse + node-0 parity
+
+Codex r1 correctly noted the plan section-8.2 smoke matrix calls for v4+v6
+and push+reverse per policy. Supplementary cells were run on the post-fix
+binary (includes the ideal-share lag-budget fix, which does not change
+`mean`/`slowest`/OFF behavior). NOTE: the comprehensive per-CoS-class
+smoke still runs at merge time under the serialized smoke protocol; these
+cells cover the decisive policy-vs-direction/family axes.
+
+## Validity note (first supplementary take discarded)
+
+The rolling redeploy let node0 (priority 200) preempt RG0 back from
+node1. The first supplementary run applied configs to fw1 — by then the
+SECONDARY — so the active dataplane on fw0 kept the prior equal-flow-OFF
+config and every "mean" cell measured OFF behavior (zero cap-hit deltas
+on both nodes confirmed this). Those cells were discarded; the re-run
+asserts the target's OWN node row is `primary` before applying.
+Lesson recorded: the injector must always target the CURRENT RG0
+primary, and enforcement deltas must be validated per-cell.
+
+## Take-2 cells (fw0 = RG0 primary, post-fix binary, 2 reps/cell)
+
+| cell | agg Gb/s (mean) | per-flow CoV (mean) | q10 cap-hit delta/rep |
+|---|---|---|---|
+| v4 push OFF | 18.21 | 10.4 % | 0 |
+| v4 push `mean` | 16.80 | 15.6 % | 3.2-3.4M (ifindex 14) |
+| v6 push OFF | 17.97 | 13.4 % | 0 |
+| v6 push `mean` | 17.18 | 10.2 % | 3.2-3.4M (ifindex 14) |
+| v4 reverse OFF (symmetric fixture) | 17.46 | 15.2 % | 0 |
+| v4 reverse `mean` (symmetric fixture) | 16.53 | 21.5 % | 2.2-2.9M (ifindex 5, LAN-side) |
+
+Per-direction deltas (mean vs OFF): v4 push **+50 % relative CoV**
+(10.4 -> 15.6 %) at 8 % aggregate cost; v6 push **-23 % relative CoV**
+(13.4 -> 10.2 %) at 4 % cost; v4 reverse **+42 % relative CoV**
+(15.2 -> 21.5 %) at 5 % cost. Enforcement engaged in every `mean` cell
+(millions of cap hits, correct interface per direction), so the
+PLAN-KILL arm of the gate ("live no-op") remains decisively excluded.
+
+## Regime-dependence: the honest synthesis
+
+Combining all cells across both nodes:
+
+- When the OFF baseline draw is HIGH-CoV (skewed RSS placement — the
+  fw1 v4-push cells at 18.5-44.7 %), `mean` delivers the large win
+  (27.6 % -> 13.3 %, 52 % relative, ~zero aggregate cost). This is the
+  regime the #1746 issue was filed about.
+- When the OFF baseline is already NEAR THE FAIRNESS FLOOR (fw0 v4-push
+  at 10.4 %; reverse at 15.2 %), the cap cannot help (nothing
+  meaningfully above the mean to trim) and the enforcement limit cycle
+  perturbs flows that were fine: CoV INCREASES ~5-6 points and
+  aggregate drops 4-8 %.
+- v6 sits between: modest win (23 % relative at 4 % cost).
+
+Disposition vs the F1 gate: the gate's kill arm (live no-op /
+sample-set collapse) is excluded by enforcement evidence in every cell.
+The headline >=30 %-at-<=15 % criterion is met in the high-CoV regime
+the gate was written against, and NOT met when the baseline is already
+at the floor — where no cap policy can help by construction
+(`docs/fairness-regimes.md` floor contract). Operator guidance in
+`docs/cos-traffic-shaping.md` is updated accordingly: enable `mean`
+only on classes that chronically exhibit high per-flow CoV; on classes
+already near the floor it adds variance and costs aggregate. The knob
+remains default-OFF with a non-work-conserving commit warning.
