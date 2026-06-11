@@ -1,5 +1,13 @@
 # #1863 implementation raw cells
 
+The raw artifacts (iperf3 JSON + Prometheus before/after snapshots per
+cell) live on the research branch to keep this PR under Copilot's
+300-file review limit:
+`research/1863-realization-gap:docs/research/1863-realization-gap/raw-impl/`
+(commit `776327062`). The converged research plan + its 20 research
+cells are alongside under `docs/research/1863-realization-gap/` on the
+same branch. This manifest is the index.
+
 All cells: loss userspace cluster, push, 12 streams/class, 30 s TCP,
 runner = docs/research/1863-realization-gap/run-cell.sh (research
 branch), under /tmp/xpf-cluster.lock with in-band version checks.

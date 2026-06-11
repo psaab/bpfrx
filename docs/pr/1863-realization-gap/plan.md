@@ -32,7 +32,7 @@ published share); all existing carry bounds + regime-3 cold-resume
 drop unchanged; fully-claimed epochs bank 0 (byte-identical steady
 state); EqualFlowSuppress leases excluded (byte-identical, suite-pinned).
 
-## Decisive before/after (raw/ + MANIFEST.md)
+## Decisive before/after (raw cells on the research branch — see raw/MANIFEST.md)
 
 | Cell | class | before (master) | after (g75f5ed727) | gate |
 |------|-------|-----------------|--------------------|------|
