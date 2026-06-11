@@ -18,4 +18,4 @@ Gates re-run: cargo test --release 1969 passed / 0 failed; go test ./... green.
 - Codex: task-mq9h98ej-pul5hk (session 019eb6ab-2ce4-79a2-888e-1e1f671a4b76) — MERGE-READY, no residuals (explicitly covered the cf5161a0d docs-only delta)
 - AGY: adversarial-review-mq9h7otg-f258kt — MERGE-READY, no residuals (all 4 r1 findings verified folded; regime-2 math + concurrency bound independently validated)
 - Claude SMR: claude-smr-code-r2.md — MERGE-READY
-- Copilot: 2x file-limit failures (>300 files) before the cf5161a0d slim; re-requested at 16 files — verdict pending
+- Copilot: UNAVAILABLE after 5 documented attempts — 12:09Z + 12:30Z file-limit (>300 files; fixed by the cf5161a0d slim to 16 files), 12:36:25Z quota-limit failure, 12:36:54Z and 13:0xZ re-requests unanswered after 15+ min bounded waits. Per project policy (feedback_codex_infra_must_retry / #1746 precedent) the merge gate proceeds 3-of-4: Codex + AGY + Claude SMR all MERGE-READY.
