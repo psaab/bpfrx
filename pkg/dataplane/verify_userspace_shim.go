@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/rlimit"
 )
 
 // verifyShrinkHashMaxEntries is the verify-only ceiling applied to
@@ -51,6 +52,9 @@ var ErrUserspaceShimVerifierReject = errors.New("userspace shim verifier reject"
 // would load at startup). Used by `xpfd verify-dataplane` as the
 // deploy-time pre-flight.
 func VerifyEmbeddedUserspaceShim() error {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		return fmt.Errorf("remove memlock rlimit: %w", err)
+	}
 	spec, err := loadRustUserspaceXDP()
 	if err != nil {
 		return err
@@ -62,6 +66,9 @@ func VerifyEmbeddedUserspaceShim() error {
 // on-disk candidate object. Used by cmd/shimverify as the build-time
 // gate in build-userspace-xdp.sh (verify-then-install).
 func VerifyUserspaceShimObject(path string) error {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		return fmt.Errorf("remove memlock rlimit: %w", err)
+	}
 	spec, err := ebpf.LoadCollectionSpec(path)
 	if err != nil {
 		return fmt.Errorf("load candidate spec from %s: %w", path, err)

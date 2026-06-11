@@ -11,8 +11,6 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/cilium/ebpf/rlimit"
-
 	"github.com/psaab/xpf/pkg/daemon"
 	"github.com/psaab/xpf/pkg/dataplane"
 	_ "github.com/psaab/xpf/pkg/dataplane/userspace"
@@ -53,10 +51,6 @@ func main() {
 	// this BEFORE stopping the old daemon; a REJECT refuses the deploy
 	// instead of killing the dataplane (the 2026-06-10 incident shape).
 	if len(os.Args) > 1 && os.Args[1] == "verify-dataplane" {
-		if err := rlimit.RemoveMemlock(); err != nil {
-			fmt.Fprintf(os.Stderr, "verify-dataplane: remove memlock rlimit: %v\n", err)
-			os.Exit(1)
-		}
 		if err := dataplane.VerifyEmbeddedUserspaceShim(); err != nil {
 			if errors.Is(err, dataplane.ErrUserspaceShimVerifierReject) {
 				fmt.Printf("REJECT embedded userspace shim\n%v\n", err)

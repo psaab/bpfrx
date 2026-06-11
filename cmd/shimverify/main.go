@@ -22,8 +22,6 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/cilium/ebpf/rlimit"
-
 	"github.com/psaab/xpf/pkg/dataplane"
 )
 
@@ -33,10 +31,6 @@ func main() {
 		os.Exit(2)
 	}
 	path := os.Args[1]
-	if err := rlimit.RemoveMemlock(); err != nil {
-		fmt.Fprintf(os.Stderr, "shimverify: remove memlock rlimit: %v\n", err)
-		os.Exit(1)
-	}
 	if err := dataplane.VerifyUserspaceShimObject(path); err != nil {
 		if errors.Is(err, dataplane.ErrUserspaceShimVerifierReject) {
 			fmt.Printf("REJECT %s\n%v\n", path, err)
