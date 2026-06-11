@@ -456,6 +456,45 @@ wait_handshake() { # wait_handshake <deadline_s> <label>
     return 1
 }
 
+# P1's stronger, data-driven variant: each tick ALSO pushes one inner
+# ping from fw0. Rationale (live forensics, 2026-06-11): the kernel
+# responder marks latest-handshakes at msg2-send, but xpf-as-initiator
+# emits no spontaneous post-handshake data (keepalive TX is S5), so a
+# REUSED wg0 (no fresh IPv6 ND/RS chatter) can leave the tunnel
+# established-but-silent and any peer-side accounting anomaly
+# unprobed. The inner ping (a) is initiator DATA that force-confirms
+# the responder keypair, (b) proves transport BOTH directions at P1,
+# and (c) on success short-circuits independent of peer counter
+# semantics. On timeout, capture a self-evidencing post-mortem BEFORE
+# the trap teardown destroys the state.
+wait_handshake_data_driven() { # wait_handshake_data_driven <deadline_s> <label>
+    local t hs
+    for t in $(seq 1 "$1"); do
+        if ish "${FW0}" "ping -c 1 -W 1 ${WG_INNER4_PEER} >/dev/null 2>&1"; then
+            log "$2: inner ping through the tunnel OK (t=${t}, transport proven)"
+            return 0
+        fi
+        hs=$(ish "${PEER}" "wg show ${WG_KERNEL_IFACE} latest-handshakes | awk '{print \$2}'" || echo 0)
+        if [ "${hs:-0}" -gt 0 ] 2>/dev/null; then
+            log "$2: peer handshake epoch ${hs} (t=${t}) — confirming with inner ping"
+            if ish "${FW0}" "ping -c 3 -W 2 ${WG_INNER4_PEER} >/dev/null 2>&1"; then
+                log "$2: transport confirmed"
+                return 0
+            fi
+        fi
+    done
+    # Post-mortem capture (survives the ERR-trap teardown).
+    {
+        echo "=== $2 post-mortem $(date -u +%H:%M:%S) ==="
+        ish "${PEER}" "wg show ${WG_KERNEL_IFACE}" 2>&1 || true
+        ish "${PEER}" "wg show ${WG_KERNEL_IFACE} transfer" 2>&1 || true
+        ish "${FW0}" "ip -br addr show wg0; ss -uln | grep ':${WG_LISTEN_PORT} ' ; ip route get ${WG_PEER_LAN4%%/*} 2>&1" 2>&1 || true
+        ish "${FW0}" "timeout 4 tcpdump -ni ge-0-0-1 -c 6 udp port ${WG_LISTEN_PORT} 2>&1" 2>&1 || true
+    } > "${EVID}/$2-postmortem.txt" 2>&1
+    warn "$2: post-mortem captured to ${EVID}/$2-postmortem.txt"
+    return 1
+}
+
 # P1 — configure + initiator handshake.
 configure_p1() {
     log "P1: keys + peer (responder) + xpf commit (initiator, node0-scoped)"
@@ -518,7 +557,7 @@ configure_p1() {
     if ish "${FW1}" "ss -uln | grep -q ':${WG_LISTEN_PORT} '"; then
         fail "P1: fw1 bound :${WG_LISTEN_PORT} — node0 scoping failed"
     fi
-    if ! wait_handshake $((WG_HANDSHAKE_TIMEOUT_S / 2)) "P1"; then
+    if ! wait_handshake_data_driven $((WG_HANDSHAKE_TIMEOUT_S / 2)) "P1"; then
         # The engine retries at 1/s and self-recovers the moment the
         # mastership/ARP conditions heal (proven live: handshake <5 s
         # after failback) — remediate and keep waiting instead of
@@ -526,8 +565,8 @@ configure_p1() {
         warn "P1: no handshake at half-budget — remediating mastership/ARP"
         check_build_identity "p1-midwait" || true
         ensure_wg_mastership "p1-midwait" || fail "P1: mastership/ARP not restorable mid-wait"
-        wait_handshake $((WG_HANDSHAKE_TIMEOUT_S / 2)) "P1" \
-            || fail "P1: no handshake within ${WG_HANDSHAKE_TIMEOUT_S}s (xpf initiator vs kernel responder)"
+        wait_handshake_data_driven $((WG_HANDSHAKE_TIMEOUT_S / 2)) "P1" \
+            || fail "P1: no handshake/transport within ${WG_HANDSHAKE_TIMEOUT_S}s (xpf initiator vs kernel responder)"
     fi
     ish "${PEER}" "wg show ${WG_KERNEL_IFACE}" > "${EVID}/p1-wg-show.txt"
     pass "P1 initiator handshake (fw0-only wg0 + bind; fw1 clean)"
@@ -676,7 +715,7 @@ test_p6() {
     xpf_wg_commit 1   # endpoint back (initiator role — the TAI64N-relevant case)
     sleep 3
     peer_wg_setup ""  # fresh peer state for a clean baseline handshake
-    wait_handshake "${WG_HANDSHAKE_TIMEOUT_S}" "P6-pre" || fail "P6: pre-restart handshake failed"
+    wait_handshake_data_driven "${WG_HANDSHAKE_TIMEOUT_S}" "P6-pre" || fail "P6: pre-restart handshake failed"
     # Negative control: restart WITHOUT flushing the peer. TAI64N is
     # wall-clock-derived, so acceptance is the EXPECTED outcome with a
     # sane clock; observe-and-record either way (plan P6).
@@ -686,7 +725,7 @@ test_p6() {
     ensure_wg_mastership "p6" || fail "P6: WG VIP not restored after restart + failback"
     local pre post
     pre=$(ish "${PEER}" "wg show ${WG_KERNEL_IFACE} latest-handshakes | awk '{print \$2}'")
-    if wait_handshake $((WG_RESTART_RECOVER_S * 2)) "P6-noflush"; then
+    if wait_handshake_data_driven $((WG_RESTART_RECOVER_S * 2)) "P6-noflush"; then
         post=$(ish "${PEER}" "wg show ${WG_KERNEL_IFACE} latest-handshakes | awk '{print \$2}'")
         if [ "${post}" != "${pre}" ] && ish "${FW0}" "ping -c 5 -W 2 ${WG_INNER4_PEER} >/dev/null"; then
             log "P6 negative control: recovered WITHOUT peer flush (wall-clock TAI64N moved forward) — recorded"
@@ -698,8 +737,8 @@ test_p6() {
     fi
     # Runbook flush, then the hard assert.
     peer_wg_setup ""
-    wait_handshake "${WG_RESTART_RECOVER_S}" "P6-flush" \
-        || fail "P6: no handshake within ${WG_RESTART_RECOVER_S}s after runbook flush"
+    wait_handshake_data_driven "${WG_RESTART_RECOVER_S}" "P6-flush" \
+        || fail "P6: no handshake/transport within ${WG_RESTART_RECOVER_S}s after runbook flush"
     ish "${FW0}" "ping -c 10 -i 0.5 -W 2 ${WG_INNER4_PEER}" > "${EVID}/p6-after.txt" \
         || fail "P6: tunnel traffic dead after restart + flush"
     pass "P6 restart recovery (runbook validated)"
