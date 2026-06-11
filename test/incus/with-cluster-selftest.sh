@@ -46,18 +46,19 @@ grep -q "held by pid" "$T/a.out" || fail "(a) waiter report missing holder pid"
 ok "waiter blocks and reports holder pid+purpose, timeout honors XPF_CLUSTER_LOCK_TIMEOUT"
 wait "$A_PID" || true
 
-# ── (b) kill -9 of the whole cell tree releases the lock immediately
+# ── (b) kill -9 of the wrapper (the SOLE fd-9 holder) plus its direct
+#        children releases the lock immediately. Deeper grandchildren
+#        may survive as orphans, but they run with fd 9 closed and can
+#        never hold the lock — wrapper death IS lock release.
 "$WC" "case-b victim" -- bash -c 'echo started >"'"$T"'/b.start"; sleep 60' &
 B_PID=$!
 waitfor 5 "cell B started" test -f "$T/b.start"
-# Kill the wrapper and every descendant (children run with fd 9 closed,
-# the wrapper holds the only lock fd).
 pkill -9 -P "$B_PID" 2>/dev/null || true
 kill -9 "$B_PID" 2>/dev/null || true
 wait "$B_PID" 2>/dev/null || true
 XPF_CLUSTER_LOCK_TIMEOUT=35 "$WC" "case-b reclaim" -- true \
-	|| fail "(b) lock not reclaimable after kill -9 of holder tree"
-ok "kill -9 of cell tree releases the lock (no orphan holder)"
+	|| fail "(b) lock not reclaimable after kill -9 of holder"
+ok "kill -9 of the wrapper releases the lock (no orphan holder)"
 
 # ── (c) nested cell is reentrant; outer owner metadata survives the
 #        inner cell's exit (acquired-only trap rule)
@@ -124,13 +125,60 @@ wait "$G_PID" || true
 "$WC" "case-g reclaim" -- true || fail "(g) post-holder reclaim failed"
 ok "rm-while-held fails closed with SPLIT MUTEX diagnosis; reclaim works after holder exits"
 
-# ── (h) marker survives an env-preserving re-exec boundary (sg-shaped:
-#        rebuilt command string, env vars forwarded explicitly)
+# ── (h) marker + XPF_CLUSTER_SKIP_BUILD survive the EXACT
+#        cluster-setup.sh sg re-exec shape: the same ${!BPFRX_@}/${!XPF_@}
+#        forwarding loop, the same rebuilt-%q-command-string boundary,
+#        and real `sg` when this host has the incus-admin group
+#        (bash -c stands in otherwise). This pins the
+#        deadlock/double-build regression path (Codex code-r1 F3).
 # shellcheck disable=SC2016  # single quotes deliberate: expansion happens inside the cell
-"$WC" "case-h outer" -- bash -c '
-	local_env="XPF_CLUSTER_LOCK=$(printf %q "$XPF_CLUSTER_LOCK") XPF_CLUSTER_OWNER=$(printf %q "$XPF_CLUSTER_OWNER") XPF_CLUSTER_LOCK_HELD=$(printf %q "$XPF_CLUSTER_LOCK_HELD")"
-	bash -c "${local_env} \"'"$WC"'\" case-h-inner -- true"
-' || fail "(h) marker did not survive the rebuilt-command-string boundary"
-ok "marker survives an sg-shaped rebuilt-command re-exec boundary"
+"$WC" "case-h outer" -- env XPF_CLUSTER_SKIP_BUILD=1 BPFRX_CLUSTER_ENV=/tmp/fake.env bash -c '
+	# Replicate cluster-setup.sh lines 39-60 verbatim: dynamic prefix
+	# forwarding + printf %q command rebuild + group re-exec.
+	local_env=""
+	for _v in "${!BPFRX_@}" "${!XPF_@}"; do
+		local_env+="${_v}=$(printf "%q" "${!_v}") "
+	done
+	inner="${local_env}$(printf "%q " "'"$WC"'" case-h-inner -- bash -c "[ \"\${XPF_CLUSTER_SKIP_BUILD:-}\" = 1 ] && [ \"\${BPFRX_CLUSTER_ENV:-}\" = /tmp/fake.env ]")"
+	if command -v sg >/dev/null 2>&1 && id -nG | grep -qw incus-admin; then
+		sg incus-admin -c "$inner"
+	else
+		bash -c "$inner"
+	fi
+' || fail "(h) marker/skip-build/env did not survive the sg-shaped forwarding re-exec"
+ok "marker + skip-build survive the real \${!XPF_@} forwarding loop across the sg boundary"
+
+# ── (i) builtins cannot subvert the cell: `exec` is not an external
+#        command, the cell fails (127) without releasing early or
+#        leaking owner metadata (env -- contract, Codex code-r1 F1)
+set +e
+"$WC" "case-i builtin" -- exec true 2>/dev/null
+I_RC=$?
+set -e
+[[ $I_RC -eq 127 ]] || fail "(i) builtin cell expected 127, got $I_RC"
+[[ ! -f "$XPF_CLUSTER_OWNER" ]] || fail "(i) owner file leaked after builtin rejection"
+"$WC" "case-i reclaim" -- true || fail "(i) lock not clean after builtin rejection"
+ok "shell builtins are rejected (127) without breaking the lock or leaking owner state"
+
+# ── (j) timeout normalization: leading-zero values are base-10, not a
+#        silent octal arithmetic error (Codex code-r1 F2); absurd
+#        values degrade to wait-forever instead of overflowing
+"$WC" "case-j holder" -- bash -c 'echo started >"'"$T"'/j.start"; sleep 4' &
+J_PID=$!
+waitfor 5 "cell J started" test -f "$T/j.start"
+set +e
+XPF_CLUSTER_LOCK_TIMEOUT=08 "$WC" "case-j octal" -- true >"$T/j.out" 2>&1
+J_RC=$?
+set -e
+# "08" must behave as 8 seconds: holder exits at ~4s, so the waiter
+# ACQUIRES (rc 0) — an octal error would have produced arithmetic
+# noise; a disabled timeout is indistinguishable here, so also check
+# no arithmetic error text leaked.
+[[ $J_RC -eq 0 ]] || fail "(j) leading-zero timeout broke acquire (rc=$J_RC)"
+grep -qi "value too great\|arithmetic" "$T/j.out" && fail "(j) octal arithmetic error leaked"
+wait "$J_PID" || true
+XPF_CLUSTER_LOCK_TIMEOUT=99999999999999999999 "$WC" "case-j huge" -- true \
+	|| fail "(j) absurd timeout value broke acquire"
+ok "timeout env normalizes base-10 and degrades absurd values safely"
 
 echo "ALL ${PASS} CASES PASS"

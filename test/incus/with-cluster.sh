@@ -48,14 +48,26 @@ shift
 
 # Reentrant case: a live ancestor cell already holds the lock. Run the
 # command directly — no second acquire, no owner write, no trap (the
-# outer cell owns cleanup).
+# outer cell owns cleanup). `env --` pins the command to an EXTERNAL
+# binary: a shell builtin like `exec` would otherwise run inside this
+# wrapper shell, drop the lock early, and skip the cleanup trap (Codex
+# code-r1 F1). Cells are processes by contract.
 if xpf_cluster_lock_held; then
-	exec "$@"
+	exec env -- "$@"
 fi
 
 WAITED=0
-TIMEOUT="${XPF_CLUSTER_LOCK_TIMEOUT:-0}"  # 0 = wait forever
-[[ "$TIMEOUT" =~ ^[0-9]+$ ]] || TIMEOUT=0
+# Timeout: digits only, forced base-10 (a leading zero like "08" must
+# not become an octal arithmetic error that silently disables the
+# timeout — Codex code-r1 F2), length-capped so absurd values cannot
+# overflow signed arithmetic. Anything else degrades to 0 = wait
+# forever, the safe direction.
+TIMEOUT="${XPF_CLUSTER_LOCK_TIMEOUT:-0}"
+if [[ "$TIMEOUT" =~ ^[0-9]{1,7}$ ]]; then
+	TIMEOUT=$((10#$TIMEOUT))
+else
+	TIMEOUT=0
+fi
 
 while :; do
 	# Append-only open: NEVER truncate (a concurrent holder's inode
@@ -139,7 +151,9 @@ echo "[with-cluster $(date +%H:%M:%S)] lock acquired (pid $$, purpose: ${PURPOSE
 
 # Run the cell with the lock fd closed: children never inherit fd 9,
 # so killing the cell's tree releases the lock the instant this
-# process dies.
+# process dies. `env --` pins the cell to an external command — a
+# builtin (`exec`, `eval`, ...) would mutate THIS wrapper instead of
+# running as a child (Codex code-r1 F1).
 rc=0
-"$@" 9>&- || rc=$?
+env -- "$@" 9>&- || rc=$?
 exit "$rc"
