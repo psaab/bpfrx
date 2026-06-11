@@ -1,0 +1,10 @@
+tcpdump: verbose output suppressed, use -v[v]... for full protocol decode
+listening on ge-0-0-1, link-type EN10MB (Ethernet), snapshot length 262144 bytes
+08:13:20.745547 IP 10.0.61.1.51820 > 10.0.61.103.51820: UDP, length 148
+08:13:20.746411 IP 10.0.61.103.51820 > 10.0.61.1.51820: UDP, length 92
+08:13:20.759411 IP 10.0.61.1.51820 > 10.0.61.103.51820: UDP, length 112
+08:13:20.946577 IP 10.0.61.1.51820 > 10.0.61.103.51820: UDP, length 112
+
+4 packets captured
+4 packets received by filter
+0 packets dropped by kernel

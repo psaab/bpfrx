@@ -75,7 +75,16 @@ pub(super) fn populate_tunnel_endpoints(
                 }
             }
             if !endpoint.wg_endpoint.is_empty() {
-                wg_endpoint = endpoint.wg_endpoint.parse::<SocketAddr>().ok();
+                // Canonicalize (unmap ::ffff:a.b.c.d) so a configured
+                // v4-mapped literal gets the same logical-v4 treatment
+                // as a learned endpoint: correct (smaller) v4 MTU-guard
+                // overhead, v4 outer on the transit path, and a target
+                // the v4-fallback socket can send to (#1736 Codex r1).
+                wg_endpoint = endpoint
+                    .wg_endpoint
+                    .parse::<SocketAddr>()
+                    .ok()
+                    .map(crate::afxdp::wg::canonicalize_endpoint);
             }
         }
 
