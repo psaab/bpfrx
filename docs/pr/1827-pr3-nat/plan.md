@@ -82,25 +82,57 @@ addresses.
 
 ## Part B — defined session behavior on uplink transition
 
-### B.1 The semantics (worked trace, what actually happens on master)
+### B.1 The semantics (worked trace, verified against source — REVISED in r1)
+
+> r1 revision (Codex High, verified): v1 of this trace claimed the
+> FIB-generation bump makes established flows re-resolve and egress
+> the surviving uplink. The source does not support that for
+> locally-created sessions; the corrected trace below is what the dp
+> actually does.
 
 1. Policy FAILs → ipmon actuator publishes the overlay snapshot, then
    `BumpFIBGeneration()` (PR-1b, order load-bearing).
-2. Established flows' cached resolutions carry the old generation
-   (`flow_cache.rs:626` stamp check; shim meta check
-   `forwarding/mod.rs:17`) → next packet re-resolves the route and
-   **egresses the surviving uplink**.
-3. The session's NAT binding is immutable after install: the forward
-   wire key is the pre-NAT tuple and `NATSrcIP/NATSrcPort`
-   (`pkg/dataplane/types.go:33`) are fixed at session creation. A
-   session SNAT'd to uplink A's pool now egresses uplink B **with
-   uplink A's source address**. Provider B drops it (uRPF/BCP38) or the
-   return path arrives at the dead uplink — either way the session
-   stalls until its inactivity timeout.
+2. The bump updates only validation state: workers invalidate
+   flow-cache entries stamped with the old generation
+   (`coordinator/mod.rs` `bump_fib_generation`; `flow_cache.rs:626`
+   stamp check). The session table is untouched.
+3. The next packet of an established flow misses the flow cache and
+   takes the session-hit path — which for **locally-created sessions**
+   prefers the session's **stored** forwarding resolution over a fresh
+   FIB lookup: `lookup_forwarding_resolution_for_session` passes
+   `allow_cached_fast_path = true` (`session_glue/mod.rs:65-77`) and
+   `cached_session_resolution` (`session_glue/mod.rs:18-42,104-107`)
+   returns the stored egress/neighbor whenever it is a usable
+   ForwardCandidate. The flow cache is then re-populated with the OLD
+   resolution under the NEW generation.
+4. ⇒ **Established locally-created sessions stay pinned to the failed
+   uplink entirely** — old egress interface, old neighbor MAC, old NAT
+   binding (`NATSrcIP/NATSrcPort` fixed at install,
+   `pkg/dataplane/types.go:33`). Their traffic keeps leaving the dead
+   path and blackholes until the inactivity timeout or an operator
+   clear. New flows resolve via the overlay and are correct
+   immediately.
+5. Asymmetry worth knowing: **peer-synced sessions** resolve
+   lookup-first (`lookup_forwarding_resolution_for_synced_session`,
+   `allow_cached_fast_path = false`) and fall back to the stored
+   resolution only on NoRoute/MissingNeighbor — those DO re-resolve
+   onto the injected route.
 
-This **is** Junos behavior: SRX sessions likewise keep their NAT binding
-across a route flip and time out unless the operator clears them. Junos
-ip-monitoring has **no** session-clear action.
+This is Junos parity in substance: SRX likewise does not re-route or
+re-NAT established sessions on a route change by default; they age out
+unless cleared. Junos ip-monitoring has **no** session-clear action.
+
+**Divergence from the program-plan row, surfaced by this mini-review:**
+the row's wording ("fib-generation re-resolution + invalidation of
+sessions whose SNAT binding references the failed uplink") assumed
+established flows re-resolve their route and only the NAT binding pins.
+The dp's actual contract is stronger pinning — stored-resolution reuse
+for local sessions — which makes the operator clear **the** mechanism
+for moving established flows to the surviving uplink, not merely a NAT-
+correctness aid. It also means the zone/interface clear filters remain
+accurate for pinned sessions (the stored EgressZone/FibIfindex never
+silently change). No code change required; the defined behavior is
+documented in `docs/multi-wan.md`.
 
 ### B.2 Decision: no automatic invalidation; Junos-parity operator clear
 

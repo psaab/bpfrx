@@ -217,19 +217,27 @@ What happens to ESTABLISHED sessions when ip-monitoring fails over:
 
 1. The actuator publishes the overlay snapshot, then bumps the FIB
    generation (order is load-bearing, PR-1b).
-2. Established flows' cached resolutions carry the old generation, so
-   their next packet re-resolves the route and egresses the surviving
-   uplink.
-3. The session's NAT binding is immutable after install: a session
-   SNAT'd to uplink A's pool now egresses uplink B **with uplink A's
-   source address**. Provider B drops it (uRPF) or the return path
-   targets the dead uplink — the session stalls until its inactivity
-   timeout.
+2. The bump invalidates per-worker flow-cache entries; the session
+   table is untouched. On the next packet, a **locally-created**
+   session's stored forwarding resolution is reused in preference to a
+   fresh FIB lookup (`cached_session_resolution` on the session-hit
+   path), so the flow cache re-fills with the OLD egress under the new
+   generation.
+3. ⇒ Established locally-created sessions stay **pinned to the failed
+   uplink entirely** — old egress interface, old neighbor, and the
+   immutable NAT binding. Their traffic keeps leaving the dead path
+   and blackholes until the inactivity timeout or an operator clear.
+   New flows resolve via the injected route and are correct
+   immediately. (Peer-synced sessions are the exception: they resolve
+   lookup-first and DO move onto the injected route.)
 
-This is Junos parity: SRX sessions likewise keep their NAT binding
-across a route flip; Junos ip-monitoring has no session-clear action,
-and neither does xpf's (deliberately — a flapping probe must never
-mass-clear healthy sessions). The operator decides:
+This is Junos parity in substance: SRX likewise does not re-route or
+re-NAT established sessions on a route change by default. Junos
+ip-monitoring has no session-clear action, and neither does xpf's
+(deliberately — a flapping probe must never mass-clear healthy
+sessions). The operator clear below is therefore THE mechanism for
+moving established flows to the surviving uplink. The operator
+decides:
 
 - **Do nothing** — pinned sessions age out at their inactivity
   timeout; new flows are correct immediately.
