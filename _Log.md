@@ -5098,3 +5098,11 @@ top.
 - **Timestamp**: 2026-06-10
   **Action**: "#1760 W-lite watch repair (PR #1862): W3' shared-map reverse-key displacement counter (4-round Codex-hardened alias-exclusion predicate), W1 durable journald warn (process-global CAS throttle), W2 live-fire harness, W4 wart issue #1861; quad-review converged (Codex r5 + AGY final + SMR MERGE-READY; Copilot quota-blocked 4x -> 3-of-4)"
   **File(s)**: userspace-dp/src/afxdp/{shared_ops.rs,worker/loop_body/mod.rs,coordinator/status.rs,session_glue/tests.rs}, userspace-dp/src/{protocol/control.rs,protocol/tests.rs,server/helpers.rs,server/lifecycle.rs}, userspace-dp/tests/fixtures/protocol_wire_v1.json, pkg/dataplane/userspace/{protocol.go,buffersfmt.go}, pkg/api/{metrics.go,metrics_descriptors.go,metrics_userspace.go,metrics_test.go,metrics_descriptor_coverage_test.go}, test/incus/reverse-key-collision-probe.sh, docs/pr/1760-reverse-key-watch/
+- **Timestamp**: 2026-06-10 ~23:10 PDT
+  **Action**: #1741 fix — sentinel-clear out-of-window flow-cache activity
+  stamps in the debug-cadence scan so u16 epoch-wrap can no longer
+  resurrect dead flows into the active-flow telemetry ("ghost
+  over-count"); 4 pinned regression tests; fairness-regimes gauge
+  contract note.
+  **File(s)**: userspace-dp/src/afxdp/flow_cache.rs,
+  userspace-dp/src/afxdp/flow_cache_tests.rs, docs/fairness-regimes.md
