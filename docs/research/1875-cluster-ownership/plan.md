@@ -1,13 +1,13 @@
 # #1875 — Cluster ownership serialization for the loss userspace cluster
 
-**Status: DRAFT v2 — revised after r1 (Codex task-mqa0tpqd-em6hzd,
-AGY adversarial-review-mqa0rv7z-t9pfyg, Claude SMR — all three
-PLAN-NEEDS-REVISION on v1, all three endorsing Path A direction and
-rejecting Path C). Pending r2 convergence.**
+**Status: DRAFT v3 — revised after r2 (Codex task-mqa1aikr [3 findings,
+PLAN-NEEDS-REVISION], AGY adversarial-review-mqa18s13-hgimly
+[PLAN-READY with recommendations], Claude SMR r2 [PLAN-NEEDS-REVISION,
+S1/S2]). All r2 findings folded; pending r3 ratification.**
 
 ## 1. Status
 
-DRAFT v2. Research-only branch `research/1875-cluster-ownership`. No
+DRAFT v3. Research-only branch `research/1875-cluster-ownership`. No
 production code; this is TEST-INFRA / process hardening. PLAN-KILL or a
 docs-only close remain acceptable verdicts, though all three r1
 reviewers independently answered §11 Q1 "Path C is not sufficient".
@@ -152,13 +152,24 @@ Acquire sequence (all r1 mechanics findings folded in):
    Default: wait forever (§11 Q2 resolution, 2-of-3 reviewers);
    `XPF_CLUSTER_LOCK_TIMEOUT=<s>` opts into a bounded wait that aborts
    loudly with the holder report.
-3. Post-acquire inode revalidation (SMR F1): `stat -c %i` of the path
-   vs `stat -L -c %i /proc/$$/fd/9`; mismatch (file unlinked/replaced
+3. Post-acquire **dev:inode** revalidation (SMR F1; Codex r2: compare
+   `%d:%i`, not inode alone): `stat -c %d:%i` of the path vs
+   `stat -L -c %d:%i /proc/$$/fd/9`; mismatch (file unlinked/replaced
    between open and lock — agent "cleanup" reflex or systemd-tmpfiles
    /tmp aging) → close fd, reopen, retry.
+3b. **Split-mutex assertion** (SMR r2 S2 — the §12 Q4 counter-example
+   was real: holder A on inode I, path rm'd, B acquires fresh inode J
+   and step 3 passes since path==fd==J): the owner record includes the
+   holder's lock `dev:ino`; if at acquire time the owner file names a
+   LIVE pid with a lock dev:ino different from B's own fd, mutual
+   exclusion has been split — **fail closed** with a diagnosis naming
+   both inodes (mirrors #1868 fail-closed philosophy). This is the one
+   deliberate exception to "owner file never gates execution": it errs
+   toward refusing to run, never toward clobbering; false positives
+   (stale owner + recycled pid) self-heal when the recycled pid exits.
 4. Atomic owner write: temp file + `mv` onto `$OWNER` containing
-   `<pid> <iso8601> <user> <git-branch> <purpose>`; EXIT trap (own
-   dedicated process, nothing to clobber) removes it.
+   `<pid> <iso8601> <user> <git-branch> <lock-dev:ino> <purpose>`;
+   EXIT trap (own dedicated process, nothing to clobber) removes it.
 5. `export XPF_CLUSTER_LOCK_HELD="$LOCK:$$"`, then run the command
    with **fd 9 closed** (`"$@" 9>&-`) so no child or grandchild ever
    inherits the lock fd — killing a cell's process tree releases the
@@ -186,15 +197,23 @@ Mutating verbs are `deploy`, `start`, `stop`, `restart`, `create`,
 networks and profiles, cluster-setup.sh:199/:205/:234). Dispatch shape:
 
 ```bash
-# inside cmd_deploy, after the local make build (the multi-minute
-# build must never hold the lock):
+# inside cmd_deploy: pre-lock work is target validation + local make
+# build ONLY (the multi-minute build must never hold the lock):
 if ! xpf_cluster_lock_held; then
     exec "$SCRIPT_DIR/with-cluster.sh" \
         "cluster-setup deploy ${target} ($(git -C "$PROJECT_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?'))" \
-        -- env XPF_CLUSTER_SKIP_BUILD=1 "$0" deploy "$target"
+        -- env XPF_CLUSTER_SKIP_BUILD=1 "$SCRIPT_DIR/cluster-setup.sh" deploy "$target"
 fi
-# reentrant path continues into deploy_vm / deploy_rolling
+# reentrant path: suppress_host_parent_ipv6_ra + deploy_vm/deploy_rolling
 ```
+
+**Lock-boundary rule (Codex r2 F1):** everything that mutates shared
+state runs *inside* the lock. v2 had `suppress_host_parent_ipv6_ra`
+(cluster-setup.sh:583 → sysctl/addr-flush/route-flush on the shared
+SR-IOV host parent, :126/:130/:135) running pre-lock; v3 moves it (and
+any future host-side mutation) into the reentrant continuation. The
+re-exec target is `"$SCRIPT_DIR/cluster-setup.sh"`, not `"$0"` (Codex
+r2: avoids PATH/symlink oddities).
 
 `XPF_CLUSTER_SKIP_BUILD=1` makes the re-invoked `cmd_deploy` skip the
 already-done build. The re-exec gives the fd-close-for-children
@@ -206,10 +225,26 @@ the skip-build env. Read-only verbs (`status`, `logs`, `journal`,
 `ssh`) stay lock-free — `ssh` is interactive and must never hold the
 cluster lock. `BPFRX_CLUSTER_ENV` and the rest of the caller env pass
 through `with-cluster.sh` untouched (it adds exactly one variable).
-The marker must survive both the `exec sg incus-admin -c` re-exec at
-cluster-setup.sh:41-50 (sg preserves exported env) and the
-`with-cluster.sh` boundary; the dry-run matrix proves it (§9.2d)
-rather than assuming it.
+
+**sg re-exec marker forwarding (SMR r2 S1 + AGY r2 + Codex r2 F3):**
+the group re-exec at cluster-setup.sh:41-50 rebuilds the command
+string and explicitly re-prefixes only `BPFRX_CLUSTER_ENV` — evidence
+the author did not trust `sg` env preservation. Codex r2 verified
+util-linux/shadow `sg` 2.41.3 *does* preserve exported env on this
+host, but the cell-from-non-incus-admin-shell path would deadlock on
+any platform where it doesn't (inner deploy loses the marker → blocks
+on its own ancestor's lock). v3: the `local_env` prefix dynamically
+forwards all exported `XPF_*` and `BPFRX_*` variables (printf %q
+loop over `${!XPF_@}` / `${!BPFRX_@}`), and §9.2d pins the *actual*
+`exec sg incus-admin -c "${local_env}$(printf '%q ' ...)"` shape —
+verifying both marker survival and skip-build (no double build).
+
+**A3b. `apply-cos-config.sh` self-locks the same way** (AGY r2
+recommendation, adopted): it commits cluster config and is routinely
+run standalone right after deploys; the marker-guarded
+`exec with-cluster.sh "apply-cos <target>" -- <self> <args>` header is
+~4 lines, has no build step, and is reentrancy-transparent inside
+cells.
 
 **A4. `wg-interop.sh` `inc()` honors the marker** — resolves the
 self-lock asymmetry:
@@ -307,11 +342,13 @@ metadata (owner file), without TTL semantics.
    first, then re-execs into the lock. A cell that builds *inside*
    `with-cluster.sh` holds the lock during the build; that is the
    caller's explicit choice (sometimes wanted for closure runs).
-2. **Exactly one process ever holds the lock fd** (`with-cluster.sh`),
-   and it runs its child with fd 9 closed. No other script may
-   `exec 9>>` the canonical lock. This single invariant subsumes v1's
-   fd-inheritance hazards and makes kill-the-tree equal
-   release-the-lock (Codex F2).
+2. **`with-cluster.sh` is the only long-lived / self-locking /
+   marker-exporting holder** (restated per Codex r2 F2: standalone
+   per-command `flock` holders — wg-interop's `inc()` else-branch, ad
+   hoc one-liners — legitimately persist and must NEVER set the
+   marker). No other *script* may `exec 9>>` the canonical lock and
+   hold it across commands; with-cluster.sh runs its child with fd 9
+   closed, making kill-the-tree equal release-the-lock (Codex F2).
 3. **Marker validity is path+pid+ancestry, never a bare boolean**
    (Codex F4, AGY §3, SMR F2). Any validation failure degrades to
    *waiting*, never to *skipping*.
@@ -356,17 +393,20 @@ metadata (owner file), without TTL semantics.
    (reentrancy), installs no second trap, and does NOT remove the
    owner file on exit (AGY double-release check: owner file still
    present until the outer cell exits);
-   (d) marker survives an env-preserving re-exec and a `bash -c`
-   boundary; a *forged/stale* marker (live but non-ancestor pid; dead
-   pid; mismatched lock path) is rejected → acquire proceeds normally;
+   (d) marker + `XPF_CLUSTER_SKIP_BUILD` survive the *actual*
+   `exec sg incus-admin -c "${local_env}$(printf '%q ' ...)"` re-exec
+   shape on this host (Codex r2 F3 — no deadlock, no double build) and
+   a `bash -c` boundary; a *forged/stale* marker (live but
+   non-ancestor pid; dead pid; mismatched lock path) is rejected →
+   acquire proceeds normally;
    (e) stale owner file + free lock → acquire proceeds, report flags
    dead pid; corrupt/empty owner file → no crash under `set -e`;
    (f) exit-status propagation: cell command exiting 3 →
    `with-cluster.sh` exits 3, owner file removed (SMR F9);
    (g) unlink race: delete the lock file while A holds → a new
-   acquirer's inode revalidation prevents a silent split (it must
-   never report acquired on a different inode without flagging the
-   split in its report);
+   acquirer B fails closed via the split-mutex assertion (A2 step 3b),
+   naming both dev:inodes; with A gone (dead recorded pid) B acquires
+   normally on the new inode;
    (h) `XPF_CLUSTER_LOCK_TIMEOUT=5` against a held lock → loud abort
    with holder report, non-zero exit.
 3. `wg-interop.sh` `inc()` smoke (read-only `inc info` path) with and
@@ -407,8 +447,9 @@ metadata (owner file), without TTL semantics.
    *common* case, and an aborting deploy invites exactly the
    lock-bypass retry behavior the mechanism exists to prevent; the
    periodic stderr report is the agent-visible affordance AGY's
-   timeout was reaching for. r2 AGY: please re-judge this specific
-   trade with the 25-40 min cell duration in evidence.
+   timeout was reaching for. **Resolved 3-of-3 at r2**: both AGY r2
+   and Codex r2 explicitly re-judged in favor of block-by-default
+   with the optional timeout override.
 3. **fd-close tradeoff** — close-fd, no process-group kill in v1
    (Codex + SMR; AGY's `kill -TERM -$$` is unsound as written — see
    A2 note).
@@ -425,18 +466,36 @@ metadata (owner file), without TTL semantics.
    three shipped scripts + runbook); 0666 best-effort creation (AGY);
    never-rm rule + inode report (SMR F1).
 
-## 12. Remaining open questions for r2
+## 12. r2 open questions — resolutions (all folded into v3 above)
 
-1. Is the post-acquire inode revalidation (A2 step 3) worth its ~6
-   lines, or is the never-rm doc rule + inode-in-report sufficient
-   (the systemd-tmpfiles /tmp-aging race is real but slow)?
-2. Does the `cmd_deploy` re-exec (`exec with-cluster.sh ... -- env
-   XPF_CLUSTER_SKIP_BUILD=1 "$0" deploy ...`) have a hole the §9.2
-   matrix misses — e.g. argument re-quoting through the re-dispatch,
-   or `BPFRX_CLUSTER_ENV` interaction with the sg re-exec path?
-3. Is deprecating raw outer-flock of self-locking verbs (A5/Codex F3)
-   acceptable, or does muscle-memory need a compat shim (e.g.
-   detecting a caller-held flock via `flock -n` probe — rejected so
-   far as unreliable: a free-at-probe-time lock proves nothing)?
-4. Any reviewer counter-example where two cooperating processes both
-   end up holding the canonical lock under this design?
+1. **Inode revalidation** — KEEP, 3-of-3 (AGY: "prevents silent
+   concurrent executions"; Codex: compare `dev:ino` not bare inode —
+   adopted; SMR: extend with the owner-recorded-inode split-mutex
+   assertion — adopted as A2 step 3b).
+2. **Re-exec holes** — two found, both folded: (a) the sg re-exec
+   env-forwarding gap (SMR S1 + AGY "critical"; Codex verified sg
+   2.41.3 preserves env on this host but agreed to pin the actual
+   shape in §9.2d) → dynamic `XPF_*`/`BPFRX_*` forwarding in
+   `local_env`; (b) `suppress_host_parent_ipv6_ra` mutated shared
+   host state pre-lock (Codex r2 F1) → moved inside the reentrant
+   continuation. Plus `"$SCRIPT_DIR/cluster-setup.sh"` over `"$0"`.
+3. **Raw outer-flock deprecation** — acceptable 3-of-3, no compat
+   shim; a `flock -n` probe cannot distinguish "my caller holds it"
+   from "someone else holds it" (Codex) — rejected permanently.
+4. **Two-holders counter-example** — exists only via rm-while-held
+   (SMR S2's inode-split scenario); v3 fails closed on it (A2 3b).
+   Codex: with the same-path + never-rm assumptions held, kernel
+   exclusive flock guarantees a single holder. Residual (accepted,
+   documented): wrapper-only SIGKILL while children continue is
+   concurrent mutation by a *non-holder*, not two holders — out of
+   scope per §10.
+
+## 13. Remaining question for r3 (ratification round)
+
+r3 is a delta-ratification of the v2→v3 fold (sections 5.A2 steps
+3/3b/4, 5.A3, 5.A3b, 7.2, 9.2d/g, 11.2, 12). One genuinely new design
+element invites scrutiny: the A2-3b split-mutex **fail-closed abort**
+is the single exception to "owner file never gates execution" — is
+the false-positive surface (stale owner record naming a live recycled
+pid + old inode) acceptably rare, given the failure direction is
+refuse-and-diagnose rather than clobber?
