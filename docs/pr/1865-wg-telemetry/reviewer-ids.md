@@ -28,5 +28,17 @@
   ifindex_to_name first preserves today's primary path; wording pin
   updated; whitespace fix is docs-only)
 
-## Code round 3 (whitespace fix)
-- pending Codex re-attest
+## Code round 3 (head 6511b9c94 — whitespace fix only)
+- Codex: session 019eb8f1-5f6e-7343-88e0-51d2d64f082a — MERGE-READY
+  (verified git diff --check clean across the full PR range) —
+  codex-code-r3.md
+
+## Convergence
+- Codex MERGE-READY (r3) + AGY MERGE-READY (r2) + Claude SMR
+  MERGE-READY (r1 + delta re-attest). Copilot: quota-limited on all
+  THREE documented retries (22:16 / 23:01 / 23:07 UTC review stubs on
+  the PR) -> 3-of-4 path per feedback_codex_infra_must_retry.
+- Live validation evidence on the PR (handshake counters, keepalive
+  classification, mac1-mismatch=5 forced drops, 37 Prometheus series,
+  show security wireguard detail).
+- NOT merged: parent runs final smoke + merge.
