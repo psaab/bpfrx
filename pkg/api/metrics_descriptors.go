@@ -537,6 +537,19 @@ func newCollector(srv *Server) *xpfCollector {
 				"research.",
 			nil, nil,
 		),
+		userspaceNatReverseKeySharedDisplacements: prometheus.NewDesc(
+			"xpf_userspace_session_nat_reverse_key_shared_displacements_total",
+			"Shared-map NAT reverse-key displacement events: a "+
+				"publish_shared_session insert displaced a DIFFERENT forward "+
+				"session's entry at the same reverse key (#1760 latent 1:N "+
+				"reverse-path corruption). The shared map is the choke point "+
+				"all transit forward NAT sessions pass through (including "+
+				"MissingNeighborSeed installs invisible to the per-worker "+
+				"counter). Event count, not a pair census: >=1 means at "+
+				"least one real collision occurred; standing collisions "+
+				"against an already-unindexed session are not counted.",
+			nil, nil,
+		),
 		userspaceSessionPublishErrors: prometheus.NewDesc(
 			"xpf_userspace_session_publish_errors_total",
 			"Failed USERSPACE_SESSIONS BPF-map publishes across all helper "+

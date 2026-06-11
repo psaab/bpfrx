@@ -354,6 +354,15 @@ func (c *xpfCollector) emitUserspaceDynamicBufferMetrics(ch chan<- prometheus.Me
 		float64(status.SessionPublishErrorsTotal),
 	)
 
+	// #1760 W3': shared-map NAT reverse-key displacement events. Emitted
+	// unconditionally so a 0 is a real "no collisions" signal rather
+	// than an absent series.
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceNatReverseKeySharedDisplacements,
+		prometheus.CounterValue,
+		float64(status.NatReverseKeySharedDisplacementsTotal),
+	)
+
 	// #1807: worker-command-queue poison recoveries. Also emitted
 	// unconditionally so a 0 is a real "no worker panics" signal rather
 	// than an absent series.

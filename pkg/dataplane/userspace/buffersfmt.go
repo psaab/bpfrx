@@ -15,6 +15,7 @@ const (
 	systemBufferLabelCoSQueueBytes           = "CoS queue bytes"
 	systemBufferLabelSessionTableEntries     = "Session table entries"
 	systemBufferLabelNatReverseKeyColl       = "NAT reverse-key collisions"
+	systemBufferLabelNatReverseKeySharedDisp = "NAT reverse-key shared displacements"
 	systemBufferLabelNeighborCacheEntries    = "Neighbor cache entries"
 	systemBufferLabelNeighborPendingMaxDepth = "Pending-neighbor max depth"
 	systemBufferLabelNeighborPendingTimeouts = "Pending-neighbor timeout drops"
@@ -463,6 +464,10 @@ func systemBufferCounterRows(status ProcessStatus, samples []systemBufferSample,
 	// section, never the Utilization table. Zero is suppressed by
 	// appendCounter, which is the common (collision-free) case.
 	appendCounter(systemBufferLabelNatReverseKeyColl, "aggregate", status.NatReverseKeyCollisions)
+	// #1760 W3': shared-map displacement events — the authoritative
+	// collision watch (covers MissingNeighborSeed installs the per-worker
+	// counter cannot see). Zero suppressed by appendCounter.
+	appendCounter(systemBufferLabelNatReverseKeySharedDisp, "shared", status.NatReverseKeySharedDisplacementsTotal)
 	if status.NeighborCacheCapacity == 0 {
 		appendCounter(systemBufferLabelNeighborCacheEntries, "dynamic", uint64(status.NeighborEntries))
 	}
