@@ -5,10 +5,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
+
+	"github.com/cilium/ebpf/rlimit"
 
 	"github.com/psaab/xpf/pkg/daemon"
 	"github.com/psaab/xpf/pkg/dataplane"
@@ -39,6 +42,30 @@ func main() {
 		// Also clear FRR managed routes so the kernel routing table is clean.
 		frr.New().Clear()
 		fmt.Println("all pinned BPF state and managed routes removed")
+		return
+	}
+
+	// #1864 deploy-time pre-flight: run the kernel BPF verifier against
+	// the shim object EMBEDDED IN THIS BINARY without touching any
+	// production state (anonymous maps, no pins, no attach, nothing
+	// detached — a running daemon's loaded program keeps forwarding).
+	// Deploy tooling pushes the NEW binary to a temp path and runs
+	// this BEFORE stopping the old daemon; a REJECT refuses the deploy
+	// instead of killing the dataplane (the 2026-06-10 incident shape).
+	if len(os.Args) > 1 && os.Args[1] == "verify-dataplane" {
+		if err := rlimit.RemoveMemlock(); err != nil {
+			fmt.Fprintf(os.Stderr, "verify-dataplane: remove memlock rlimit: %v\n", err)
+			os.Exit(1)
+		}
+		if err := dataplane.VerifyEmbeddedUserspaceShim(); err != nil {
+			if errors.Is(err, dataplane.ErrUserspaceShimVerifierReject) {
+				fmt.Printf("REJECT embedded userspace shim\n%v\n", err)
+				os.Exit(3)
+			}
+			fmt.Fprintf(os.Stderr, "verify-dataplane: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("PASS embedded userspace shim (verifier accepted; no production state touched)")
 		return
 	}
 

@@ -656,6 +656,24 @@ deploy_vm() {
 		die "Instance $vm does not exist. Run '$0 create' first."
 	fi
 
+	# #1864 pre-flight: verify the NEW binary's embedded shim object
+	# against the node's kernel verifier BEFORE stopping the running
+	# daemon. ORDERING INVARIANT: no `systemctl stop xpfd` and no
+	# `xpfd cleanup` may run before this check — the 2026-06-10
+	# incident was exactly a stop-then-load-fail that left the node in
+	# config-only mode. The check loads anonymous maps only (no pins,
+	# no attach), so the live dataplane is untouched; nice+taskset keep
+	# the ~17s worst-case verifier walk off the AF_XDP worker cores.
+	info "Pre-flight: verifying new xpfd dataplane object on $vm..."
+	incus file push "$PROJECT_ROOT/xpfd" "${rinst}/tmp/xpfd.preflight" --mode 0755
+	if ! incus exec "$rinst" -- nice -n 19 taskset -c 0 /tmp/xpfd.preflight verify-dataplane; then
+		incus exec "$rinst" -- rm -f /tmp/xpfd.preflight 2>/dev/null || true
+		die "verify-dataplane REJECTED the new binary's embedded shim on $vm — deploy aborted, old daemon untouched.
+  This is the #1864 failure mode. Rebuild with the pinned toolchain (make generate) or restore the tracked object:
+    git checkout -- pkg/dataplane/userspace_xdp_bpfel.o && make build"
+	fi
+	incus exec "$rinst" -- rm -f /tmp/xpfd.preflight 2>/dev/null || true
+
 	# Migrate from old bpfrxd naming if present.
 	incus exec "$rinst" -- systemctl stop bpfrxd 2>/dev/null || true
 	incus exec "$rinst" -- /usr/local/sbin/bpfrxd cleanup 2>/dev/null || true
