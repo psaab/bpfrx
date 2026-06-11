@@ -35,3 +35,11 @@
 - Codex: dispatched (codex-1872-r2)
 - AGY: adversarial-review-mq9h0jfr-m01dbb
 - Claude SMR: docs/pr/1866-wg-teardown/claude-smr-code-r2.md — MERGE-READY
+### Round 2 verdicts (target: 9f36e88b86b4)
+- Codex: NEEDS-CHANGES (F1 refined: transient disarmed spawn/bind; F2 resolved)
+- AGY: adversarial-review-mq9h0jfr-m01dbb — MERGE-READY
+### Round 3 (target: cee8d7094e0e) — CONVERGED
+- Codex: codex-1872-r3 — "No blocking findings" / MERGE-READY (non-blocking nit: v4 blocker for bindv6only=1, applied)
+- AGY: adversarial-review-mq9hgqmp-yvafoq — MERGE-READY
+- Claude SMR: docs/pr/1866-wg-teardown/claude-smr-code-r3.md — MERGE-READY
+- Copilot: quota-limited on all 3 documented attempts → 3-of-4 gate per protocol

@@ -780,6 +780,11 @@ fn wg1866_disarmed_same_plan_apply_does_not_hold_wg_ports() {
     // spawn/bind would surface here as a wg_bind_listen_port
     // exception), so this blocker must never be hit.
     let _blocker = std::net::UdpSocket::bind(("::", port)).expect("pre-bind");
+    // Codex code-r3 portability nit: on bindv6only=1 hosts the v6
+    // blocker does not cover the v4 fallback bind — add a v4 blocker
+    // opportunistically (it fails AddrInUse on dual-stack hosts, which
+    // is fine: the v6 blocker already covers both there).
+    let _blocker_v4 = std::net::UdpSocket::bind(("0.0.0.0", port)).ok();
     // Apply 1: NOT-same-plan (no previous snapshot) — the disarmed
     // reconcile path stops everything.
     let mut first = req("apply_snapshot");
