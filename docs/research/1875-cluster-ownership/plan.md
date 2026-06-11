@@ -1,12 +1,16 @@
 # #1875 — Cluster ownership serialization for the loss userspace cluster
 
-**Status: DRAFT v1 — pending adversarial plan review**
+**Status: DRAFT v2 — revised after r1 (Codex task-mqa0tpqd-em6hzd,
+AGY adversarial-review-mqa0rv7z-t9pfyg, Claude SMR — all three
+PLAN-NEEDS-REVISION on v1, all three endorsing Path A direction and
+rejecting Path C). Pending r2 convergence.**
 
 ## 1. Status
 
-DRAFT v1. Research-only branch `research/1875-cluster-ownership`. No
+DRAFT v2. Research-only branch `research/1875-cluster-ownership`. No
 production code; this is TEST-INFRA / process hardening. PLAN-KILL or a
-docs-only close are both acceptable verdicts.
+docs-only close remain acceptable verdicts, though all three r1
+reviewers independently answered §11 Q1 "Path C is not sufficient".
 
 ## 2. Issue framing
 
@@ -36,12 +40,12 @@ Root cause is structural, not behavioral: the project has an advisory
 3. **lock-usage is asymmetric across scripts**: `wg-interop.sh`
    self-locks per cluster command inside `inc()` (wg-interop.sh:64-71),
    so outer-wrapping it in `flock /tmp/xpf-cluster.lock` **deadlocks**
-   (the inner `flock` opens a new file description and blocks on the
-   caller's own lock). Other scripts (`reverse-key-collision-probe.sh`)
-   document "caller must wrap me in the flock". A third
-   (`test-mouse-latency-matrix.sh`) self-locks a *different* file with
-   `flock -n`. An agent cannot know which protocol a given harness
-   speaks without reading it;
+   (the inner `flock` opens a new open file description and blocks on
+   the caller's own lock — Codex r1 reproduced this locally). Other
+   scripts (`reverse-key-collision-probe.sh:47`) document "caller must
+   wrap me in the flock". A third (`test-mouse-latency-matrix.sh:54`)
+   self-locks a *different* file with `flock -n`. An agent cannot know
+   which protocol a given harness speaks without reading it;
 4. **lock holders are invisible**: a bare `flock` wait gives no
    holder identity; in a prior session a killed flocked pipeline left
    an orphaned child holding the inherited lock fd and the queue
@@ -54,81 +58,120 @@ The win is measured in *operator-days not wasted*: the 2026-06-11
 incident burned most of a day on a misdiagnosed "wedge" plus a failed
 closure run, and the same clobber class has recurred across the
 fairness campaigns (deploy wipes CoS mid-measurement). The cost is
-~150 lines of shell + docs. The counter-position is real: PR #1868's
-`check_build_identity` already converts silent clobbers into loud,
-attributable aborts, and one could argue detection suffices and
-conventions cover the rest — **if reviewers conclude the shipped
-identity gates + a docs codification suffice, PLAN-KILL of the
-mechanism (Path C, docs-only close) is an acceptable verdict.**
+~200 lines of shell + docs. The counter-position was put to all three
+r1 reviewers — PR #1868's `check_build_identity` already converts
+silent clobbers into loud, attributable aborts; maybe detection +
+codified convention suffices — and all three rejected it (§11 Q1):
+the convention already existed in three script headers and MEMORY when
+the incident happened, the *default tooling path* (`make
+cluster-deploy` → lock-free `cmd_deploy`, Makefile:211 →
+cluster-setup.sh:580) violates it, and convention text is
+context-fragile for LLM agents (MEMORY.md is only partially loaded —
+its own header warns so). Detection without serialization retries
+forever on a busy cluster.
 
-Important honesty point: among *cooperating same-host agents* an
-advisory lock is the entire requirement. Adversarial robustness
-(lease enforcement, fencing tokens, remote-host locks) is explicitly
-NOT needed and any plan drift in that direction is over-engineering.
+Honesty boundary, unchanged from v1: among *cooperating same-host
+agents* an advisory lock is the entire requirement. Adversarial
+robustness (fencing, leases, cross-host coordination) is explicitly
+NOT needed and plan drift in that direction is over-engineering. The
+mechanism *narrows* the bypass surface (a hand-rolled `incus file
+push` loop still bypasses it); #1868 detection remains the backstop
+for non-cooperating paths, and A5 adds an explicit CLAUDE.md
+prohibition on hand-rolled binary pushes.
 
 ## 4. What's already shipped (verified on master @ 9a536f810)
 
 | Mechanism | Where | What it covers | Gap left |
 |---|---|---|---|
-| Advisory flock convention `/tmp/xpf-cluster.lock` | wg-interop.sh `inc()` (line 64-71, `WG_CLUSTER_LOCK` in wg-interop.env:56); comment-documented in reverse-key-collision-probe.sh:47-49; docs/wg-interop-runbook.md:49 | Serializes individual incus commands among lock-takers | Voluntary; per-command not per-cell; deploys don't take it; no holder identity |
-| `check_build_identity` (PR #1868) | wg-interop.sh:240-265 — fail-closed, `-dirty`-aware, prefix-matches running `Software version: ...-g<sha>` against checkout HEAD; called at preflight, P1, and mid-wait | Detects foreign builds in-flight, names the SHA | Detection only, wg-interop-only; the run still dies; other harnesses (fairness, mouse-latency, failover) have no equivalent |
-| `verify-dataplane` deploy pre-flight (#1864/#1869) | cluster-setup.sh deploy_vm (lines ~660-720) | New binary's shim verified before touching the live daemon | Protects against *bad* binaries, not *foreign* ones |
+| Advisory flock convention `/tmp/xpf-cluster.lock` | wg-interop.sh `inc()` (lines 64-71, `WG_CLUSTER_LOCK` in wg-interop.env:56); comment-documented in reverse-key-collision-probe.sh:47-49; docs/wg-interop-runbook.md:49 | Serializes individual incus commands among lock-takers | Voluntary; per-command not per-cell; deploys don't take it; no holder identity |
+| `check_build_identity` (PR #1868) | wg-interop.sh:240-265 — fail-closed, `-dirty`-aware, prefix-matches running `Software version: ...-g<sha>` against checkout HEAD; called at preflight, P1, and mid-wait | Detects foreign builds in-flight, names the SHA | Detection only, wg-interop-only; the run still dies; other harnesses have no equivalent |
+| `verify-dataplane` deploy pre-flight (#1864/#1869) | cluster-setup.sh deploy_vm (~lines 660-720) | New binary's shim verified before touching the live daemon | Protects against *bad* binaries, not *foreign* ones |
 | Mouse-latency matrix mutex | test-mouse-latency-matrix.sh:54-62, `flock -n` on `/tmp/test-mouse-latency-matrix.lock` | Two matrix invocations can't interleave | Different lock file; doesn't compose with the cluster lock |
 | Smoke serialization discipline | MEMORY `feedback_smoke_serialized_single_agent` | One smoke at a time via agent protocol | Memory-resident convention; the 2026-06-11 deploy loop ignored it because *deploy* isn't *smoke* |
 
-Conclusion from the audit: detection is shipped (#1868), per-binary
-safety is shipped (#1869), but **acquisition is still 100% voluntary
-and the two most damaging writers — `cluster-setup.sh deploy` and
-multi-minute measurement cells — have no lock integration at all.**
+Conclusion: detection is shipped (#1868), per-binary safety is shipped
+(#1869), but **acquisition is still 100% voluntary and the two most
+damaging writers — `cluster-setup.sh deploy` and multi-minute
+measurement cells — have no lock integration at all.**
 
 ## 5. Concrete design — paths
 
-### Path A (recommended): mechanism + codification
+### Path A (recommended, revised in v2): one acquire point + codification
 
-Three small pieces, one shared protocol. All shell, all in
-`test/incus/`, plus docs.
+The v1 shape had two independent acquire implementations (with-cluster
+wrapper + in-process acquire in cluster-setup.sh). r1 killed the
+in-process variant twice over: Codex F2 showed `deploy_vm`'s many
+post-acquire `incus` children (cluster-setup.sh:674, :734, :743)
+inherit the lock fd, so a killed deploy shell leaves an `incus` child
+as a zombie holder — the exact 3-hour bug; AGY showed sourced-library
+EXIT traps clobber consumer traps and double-release owner metadata
+from bypassed nested acquires. **v2 therefore has exactly ONE process
+that ever holds the lock: `with-cluster.sh`.** Everything else either
+re-execs through it or honors its reentrancy marker.
 
-**A1. Shared lock library `test/incus/cluster-lock.sh`** (sourced, not
-executed). Defines:
+**A1. Shared helper library `test/incus/cluster-lock.sh`** (sourced).
+Canonical paths are hard-coded defaults (`/tmp/xpf-cluster.lock`,
+`/tmp/xpf-cluster.owner`); `XPF_CLUSTER_LOCK`/`XPF_CLUSTER_OWNER` env
+overrides exist for the dry-run test matrix only. Provides two
+functions, installs no traps, has no global side effects:
 
-```bash
-# Env knobs (defaults): XPF_CLUSTER_LOCK=/tmp/xpf-cluster.lock
-#                       XPF_CLUSTER_OWNER=/tmp/xpf-cluster.owner
-# Reentrancy marker:    XPF_CLUSTER_LOCK_HELD (set while a cell holds the lock)
+- `xpf_cluster_lock_held()` — returns 0 iff the reentrancy marker is
+  valid **for this lock path**. Marker format (Codex F4 + AGY §3 + SMR
+  F2 converged): `XPF_CLUSTER_LOCK_HELD="<lockpath>:<holderpid>"`.
+  Valid iff: lockpath component equals this consumer's lock path, AND
+  holderpid is numeric, alive (`kill -0` inside a guarded
+  conditional), AND an ancestor of the current process (PPid walk via
+  `/proc/<pid>/status`, AGY's `is_lock_holder_ancestor` sketch —
+  closes the backgrounded-daemon env-leak false-skip). On any parse
+  failure: returns 1 (treat as not held; worst case is a blocking
+  wait, never an unserialized run).
+- `xpf_cluster_owner_report()` — diagnostics-only, `set -e`-safe by
+  construction (AGY §4: `owner=$(cat "$OWNER" 2>/dev/null || true)`,
+  here-string `read -r`, regex-guard pid before `kill -0`,
+  `fuser -v "$LOCK" 2>&1 || true`). Reports holder pid + liveness +
+  user + branch + purpose + acquire timestamp + **lock-path inode**
+  (`stat -c %i`, SMR F1: makes a split-lock from a deleted/recreated
+  lock file diagnosable). A dead recorded pid prints an explicit
+  orphan/SIGKILL diagnosis line with the fuser output.
 
-xpf_cluster_lock() {  # xpf_cluster_lock "<purpose>"
-    # No-op when XPF_CLUSTER_LOCK_HELD is set (caller already in a cell).
-    # Otherwise: exec 9>>"$XPF_CLUSTER_LOCK"; loop on flock -n 9 with a
-    # held-by report every 15s sourced from the owner file:
-    #   "waiting for cluster lock — held by pid 12345 (alive) since
-    #    2026-06-11T12:03:11 purpose: deploy engineer/1736-wg-interop"
-    # If the recorded pid is dead, say so explicitly and print
-    # `fuser -v $XPF_CLUSTER_LOCK` output (the orphaned-flock-child
-    # diagnostic — this exact situation cost 3 hours once).
-    # On acquire: write "<pid> <iso8601> <user> <git-branch> <purpose>"
-    # to $XPF_CLUSTER_OWNER, install an EXIT trap that removes it,
-    # export XPF_CLUSTER_LOCK_HELD=$$.
-}
-```
-
-Owner-file writes happen only while holding the lock, so they cannot
-race. A SIGKILLed holder leaves a stale owner file but the kernel
-releases the flock; waiters report "pid dead" and proceed — stale
-metadata never blocks anyone (the lock is the mutex, the owner file is
-diagnostics only).
-
-**A2. Lock-cell wrapper `test/incus/with-cluster.sh`** (executable):
+**A2. Lock-cell wrapper `test/incus/with-cluster.sh`** (executable —
+the single acquire point):
 
 ```
 ./test/incus/with-cluster.sh "purpose string" -- cmd args...
 ```
 
-Sources A1, acquires, then runs the command with **fd 9 closed**
-(`"$@" 9>&-`) so grandchildren never inherit the lock fd — killing a
-cell's process tree releases the lock immediately instead of leaving a
-zombie holder. Exit status of the command is propagated. This is the
-standard way to make a *measurement cell* (deploy → apply-cos →
-measure) atomic:
+Acquire sequence (all r1 mechanics findings folded in):
+1. If `xpf_cluster_lock_held` → exec the command directly (reentrant
+   cell-in-cell; no trap installed, no owner write — AGY's
+   acquired-only-trap rule).
+2. `exec 9>>"$LOCK"` (append — never truncate; 0666 best-effort on
+   create), then a wait loop of `flock -w 30 9` iterations (SMR F3:
+   contends immediately instead of sleeping through free windows);
+   between iterations print `xpf_cluster_owner_report` to stderr.
+   Default: wait forever (§11 Q2 resolution, 2-of-3 reviewers);
+   `XPF_CLUSTER_LOCK_TIMEOUT=<s>` opts into a bounded wait that aborts
+   loudly with the holder report.
+3. Post-acquire inode revalidation (SMR F1): `stat -c %i` of the path
+   vs `stat -L -c %i /proc/$$/fd/9`; mismatch (file unlinked/replaced
+   between open and lock — agent "cleanup" reflex or systemd-tmpfiles
+   /tmp aging) → close fd, reopen, retry.
+4. Atomic owner write: temp file + `mv` onto `$OWNER` containing
+   `<pid> <iso8601> <user> <git-branch> <purpose>`; EXIT trap (own
+   dedicated process, nothing to clobber) removes it.
+5. `export XPF_CLUSTER_LOCK_HELD="$LOCK:$$"`, then run the command
+   with **fd 9 closed** (`"$@" 9>&-`) so no child or grandchild ever
+   inherits the lock fd — killing a cell's process tree releases the
+   lock immediately (AGY §1B verified the mechanics incl. subshells).
+   Exit status is captured (`rc=0; "$@" 9>&- || rc=$?`) and propagated
+   after the trap-driven owner cleanup.
+
+No process-group management in v1 (§11 Q3 resolution, Codex + SMR;
+AGY's `trap 'kill -TERM -$$' EXIT` counter-proposal is unsound as
+written — `with-cluster.sh` is not a process-group leader, so `-$$`
+would signal the *caller's* group including the invoking agent shell).
+
+Standard measurement-cell usage:
 
 ```bash
 ./test/incus/with-cluster.sh "1736 S2b closure" -- bash -c '
@@ -137,14 +180,36 @@ measure) atomic:
     WG_PEER_TYPE=container ./test/incus/wg-interop.sh all'
 ```
 
-**A3. `cluster-setup.sh` mutating verbs self-lock.** `cmd_deploy`
-sources A1 and calls `xpf_cluster_lock "deploy <branch> <target>"`
-**after** the local build (the multi-minute `make build` must not hold
-the lock) and before any instance is touched; same one-liner in
-`start|stop|restart|create|destroy`. Read-only verbs (`status`, `logs`,
-`journal`, `ssh`) stay lock-free — `ssh` is interactive and must never
-hold the cluster lock. Because of the A1 reentrancy marker, a deploy
-inside a `with-cluster.sh` cell does not deadlock.
+**A3. `cluster-setup.sh` mutating verbs re-exec through A2.**
+Mutating verbs are `deploy`, `start`, `stop`, `restart`, `create`,
+`destroy`, **and `init`** (Codex F5: `cmd_init` creates/deletes
+networks and profiles, cluster-setup.sh:199/:205/:234). Dispatch shape:
+
+```bash
+# inside cmd_deploy, after the local make build (the multi-minute
+# build must never hold the lock):
+if ! xpf_cluster_lock_held; then
+    exec "$SCRIPT_DIR/with-cluster.sh" \
+        "cluster-setup deploy ${target} ($(git -C "$PROJECT_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?'))" \
+        -- env XPF_CLUSTER_SKIP_BUILD=1 "$0" deploy "$target"
+fi
+# reentrant path continues into deploy_vm / deploy_rolling
+```
+
+`XPF_CLUSTER_SKIP_BUILD=1` makes the re-invoked `cmd_deploy` skip the
+already-done build. The re-exec gives the fd-close-for-children
+property to the whole deploy for free (Codex F2 resolved), installs
+zero traps in cluster-setup.sh (AGY trap-clobber resolved), and the
+marker makes the nested invocation lock-free. The quick verbs
+(start/stop/restart/create/destroy/init) re-exec the same way without
+the skip-build env. Read-only verbs (`status`, `logs`, `journal`,
+`ssh`) stay lock-free — `ssh` is interactive and must never hold the
+cluster lock. `BPFRX_CLUSTER_ENV` and the rest of the caller env pass
+through `with-cluster.sh` untouched (it adds exactly one variable).
+The marker must survive both the `exec sg incus-admin -c` re-exec at
+cluster-setup.sh:41-50 (sg preserves exported env) and the
+`with-cluster.sh` boundary; the dry-run matrix proves it (§9.2d)
+rather than assuming it.
 
 **A4. `wg-interop.sh` `inc()` honors the marker** — resolves the
 self-lock asymmetry:
@@ -152,7 +217,7 @@ self-lock asymmetry:
 ```bash
 inc() {
     local q; q=$(printf '%q ' incus "$@")
-    if [[ -n "${XPF_CLUSTER_LOCK_HELD:-}" ]]; then
+    if xpf_cluster_lock_held; then
         sg incus-admin -c "$q"
     else
         flock "${WG_CLUSTER_LOCK}" sg incus-admin -c "$q"
@@ -160,123 +225,155 @@ inc() {
 }
 ```
 
-Standalone invocation keeps today's per-command locking (long phases
-deliberately don't hold the lock); cell invocation gets whole-run
+Standalone invocation keeps today's per-command locking byte-for-byte
+(the else-branch is today's code); cell invocation gets whole-run
 ownership with no deadlock.
 
 **A5. Docs codification** (the Path-C content, folded in):
 
-- `docs/engineering-style.md` cluster-discipline section: the lock
-  protocol table — *who locks what*: deploys self-lock; measurement
-  cells use `with-cluster.sh`; scripts must either honor
-  `XPF_CLUSTER_LOCK_HELD` or document "caller locks"; never kill
-  another holder (the lock serializes you — wait or coordinate);
-  `cat /tmp/xpf-cluster.owner` + `fuser -v /tmp/xpf-cluster.lock` is
-  the queue-diagnosis recipe.
-- `CLAUDE.md` cluster test-environment section: 3-4 lines pointing at
-  the protocol (agents read CLAUDE.md, not engineering-style.md, first).
-- `docs/wg-interop-runbook.md`: note the cell-mode bypass.
+- `docs/engineering-style.md` cluster-discipline section — the lock
+  protocol table (*who locks what*): deploys self-lock via re-exec;
+  measurement cells use `with-cluster.sh`; scripts must either honor
+  the marker via `cluster-lock.sh` or document "caller locks"; never
+  kill another holder (the lock serializes you — wait or coordinate);
+  **never `rm` the lock or owner files** (SMR F1: flock binds the
+  inode — deleting the path silently splits the mutex, reintroducing
+  the incident; recovery is `kill <holder-pid>`, never `rm`); queue
+  diagnosis recipe: `cat /tmp/xpf-cluster.owner` + `fuser -v
+  /tmp/xpf-cluster.lock`.
+- **Raw outer-flock one-liners are deprecated for self-locking verbs**
+  (Codex F3): `flock /tmp/xpf-cluster.lock bash -c "make
+  cluster-deploy"` now self-waits (the inner re-exec can't see a raw
+  caller's lock). Update the two places that teach the raw pattern —
+  reverse-key-collision-probe.sh:47-49 comment and
+  docs/wg-interop-runbook.md:49 — to point at `with-cluster.sh`. Raw
+  per-command flock around *non-self-locking* commands (plain `incus
+  exec` one-liners) remains valid and contends correctly.
+- `CLAUDE.md` cluster test-environment section: 3-4 lines — use
+  `with-cluster.sh` for any multi-command cluster work; deploys
+  self-lock and may visibly queue; **never hand-roll `incus file
+  push` binary deploys to the loss cluster** (SMR F4); never kill
+  other holders; never rm the lock file.
+- `docs/wg-interop-runbook.md`: note the cell-mode marker bypass.
 
 ### Path B: ownership lease file with TTL + identity gates everywhere
 
-A lease file (`holder, purpose, expiry`) that writers must refresh;
-expired leases are stealable; every harness grows a
-`check_build_identity` equivalent. **Rejected.** flock already gives
-the one property a lease buys (no stale lock survives a crashed
-holder — the kernel releases it) without TTL's two failure modes:
-false expiry mid-long-measurement (exactly the runs we're protecting)
-and clock/renewal plumbing in every harness. Identity gates everywhere
-is shotgun duplication of #1868; gates *detect*, they don't *prevent*,
-so runs still die. Cooperating agents don't need steal semantics.
+Rejected (unchanged from v1, unchallenged in r1). flock already gives
+the one property a lease buys — no stale lock survives a crashed
+holder — without TTL's false-expiry hazard mid-long-measurement and
+renewal plumbing in every harness. Identity gates everywhere is
+shotgun duplication of #1868; gates detect, they don't prevent.
+Cooperating agents don't need steal semantics.
 
 ### Path C: docs-only close
 
-Codify A5's content and close. Cheapest, and defensible: #1868 already
-makes interference loud. **Why it's not recommended:** the 2026-06-11
-incident happened *with* the convention already in MEMORY and in three
-script headers — the offending deploy loop used `make cluster-deploy`,
-which has no lock hook, so even a perfectly obedient agent following
-the documented happy path clobbers others. A convention whose default
-tooling violates it is not a convention. Mechanism cost is ~150 lines
-of shell. If reviewers disagree, C is the close.
+Rejected by all three r1 reviewers independently (Codex: "the
+convention already exists ... while `make cluster-deploy` still
+reaches lock-free `cmd_deploy` today"; AGY: "a convention that is not
+enforced by the default tooling is not a convention"; SMR: convention
+text is context-fragile — MEMORY.md partial loading). Kept here as the
+documented kill-path: if r2 reverses, A5 ships alone and the issue
+closes.
 
 ### Path D: A + B hybrids
 
-Any TTL/lease addition on top of A is over-engineering per §3. The
-only B element worth keeping is already in A: holder *identity*
+Any TTL/lease addition on top of A remains over-engineering per §3.
+The only B element worth keeping is already in A: holder *identity*
 metadata (owner file), without TTL semantics.
 
 ## 6. Public API preservation
 
 - `cluster-setup.sh` verb set and arguments unchanged; `make
   cluster-deploy` unchanged. Behavior delta: mutating verbs may now
-  *block* (with a visible held-by report) instead of clobbering — that
-  is the feature.
-- `wg-interop.sh` CLI unchanged; standalone behavior byte-identical
-  (the `inc()` else-branch is today's code).
-- `/tmp/xpf-cluster.lock` path and meaning unchanged — existing ad-hoc
-  `flock /tmp/xpf-cluster.lock sg incus-admin -c ...` one-liners keep
-  working and correctly contend with the new acquirers.
-- New surface: `with-cluster.sh`, `cluster-lock.sh`,
-  `XPF_CLUSTER_LOCK_HELD` env contract, `/tmp/xpf-cluster.owner`.
+  *block* (with a visible held-by report on stderr) instead of
+  clobbering — that is the feature. Internal-only addition:
+  `XPF_CLUSTER_SKIP_BUILD` env.
+- `wg-interop.sh` CLI unchanged; standalone behavior byte-identical.
+- `/tmp/xpf-cluster.lock` path and meaning unchanged. Existing raw
+  per-command `flock /tmp/xpf-cluster.lock <non-self-locking-cmd>`
+  one-liners keep working and contend correctly with the new
+  acquirers. **Exception (breaking, deliberate, documented):** raw
+  *outer-wrapping of the now-self-locking verbs* self-waits; A5
+  updates the two in-tree teachers of that pattern (Codex F3).
+- New surface: `with-cluster.sh`, `cluster-lock.sh`, the
+  `XPF_CLUSTER_LOCK_HELD=<lockpath>:<pid>` marker contract,
+  `/tmp/xpf-cluster.owner`. Lock/owner files created 0666 best-effort
+  (AGY Q6: lets a second cooperating user contend on the same lock
+  under /tmp's sticky bit).
 
 ## 7. Hidden invariants the change must preserve
 
-1. **Lock is never held across `make build`** (multi-minute) — acquire
-   after build inside `cmd_deploy`; `with-cluster.sh` users own this
-   tradeoff explicitly (a cell that builds inside the cell holds the
-   lock during the build, which is sometimes *wanted* for closure
-   runs).
-2. **`flock` fd inheritance**: `with-cluster.sh` must close fd 9 for
-   the child (`9>&-`) or killing a cell leaves orphan holders — the
-   exact 3-hour failure being fixed. Conversely cluster-setup.sh's
-   internal acquire holds the fd for its own process lifetime, which
-   is correct (deploy dies → lock released).
-3. **Reentrancy is env-marked, not fd-detected** — `XPF_CLUSTER_LOCK_HELD`
-   must be exported by every acquirer and honored by every nested
-   acquirer, or A3+A4 deadlock inside A2 cells. This is the single
-   most regression-prone invariant; the test plan covers it.
-4. **Owner file is diagnostics only** — no code path may *block* on
-   owner-file state (stale files must never wedge the queue).
-5. **`set -euo pipefail` interaction**: the flock-wait loop and
-   `kill -0` liveness probes must not trip `-e` in either consumer.
-6. **sg incus-admin re-exec** (cluster-setup.sh:41-50) happens before
-   command dispatch; the lock acquire must live *after* the re-exec so
-   the lock fd isn't dropped across `exec sg`.
-7. **Remote-host reality**: the lock is host-local on the dev box; all
+1. **Lock is never held across `make build`** — `cmd_deploy` builds
+   first, then re-execs into the lock. A cell that builds *inside*
+   `with-cluster.sh` holds the lock during the build; that is the
+   caller's explicit choice (sometimes wanted for closure runs).
+2. **Exactly one process ever holds the lock fd** (`with-cluster.sh`),
+   and it runs its child with fd 9 closed. No other script may
+   `exec 9>>` the canonical lock. This single invariant subsumes v1's
+   fd-inheritance hazards and makes kill-the-tree equal
+   release-the-lock (Codex F2).
+3. **Marker validity is path+pid+ancestry, never a bare boolean**
+   (Codex F4, AGY §3, SMR F2). Any validation failure degrades to
+   *waiting*, never to *skipping*.
+4. **Owner file is diagnostics only** — no code path may block on
+   owner-file state; all reads are `set -e`-tolerant (AGY §4A/§4C);
+   writes are atomic (tmp+mv) and happen only while holding the lock;
+   only the acquiring process installs the cleanup trap (AGY §2).
+5. **`set -euo pipefail` discipline is a testable requirement, not a
+   warning** (Codex F6): §9.2 exercises stale-owner, corrupt-owner,
+   absent-owner, and dead-pid paths under `set -euo pipefail`.
+6. **sg re-exec transparency**: the marker must survive
+   `exec sg incus-admin -c` (cluster-setup.sh:41-50) — exported env
+   does; proven by §9.2d rather than assumed.
+7. **Append-only open of the lock file; never truncate, never rm**
+   (SMR F1) — inode identity is the mutex; post-acquire inode
+   revalidation closes the unlink race.
+8. **Remote-host reality**: the lock is host-local on the dev box; all
    agents drive `loss:` from this box, so /tmp is the correct shared
-   namespace. Document that driving the cluster from a second machine
-   bypasses everything (out of scope, cooperating-agents assumption).
+   namespace. Driving the cluster from a second machine bypasses
+   everything (documented, out of scope, cooperating-agents
+   assumption).
 
 ## 8. Risk assessment
 
 | Class | Level | Notes |
 |---|---|---|
-| Behavioral regression | LOW | Worst credible bug: a deadlock (self-wait) from a missed reentrancy marker — caught by the dry-run matrix in §9; recoverable by killing own process. No dataplane code touched. |
+| Behavioral regression | LOW | Worst credible bug: a deadlock (self-wait) from a marker-validation bug — caught by the §9.2 matrix; recoverable by killing own process; degraded mode is *waiting*, never unserialized clobbering. No dataplane code touched. |
 | Lifetime/borrow-checker | N/A | Shell + docs only. |
-| Performance regression | LOW | Deploys may queue behind a measurement cell — intended. Risk of a *hung* holder blocking everyone: mitigated by holder report + liveness flag; operator decides (never auto-steal). |
-| Architectural mismatch | LOW-MED | The honest hazard is *adoption*: a mechanism nobody invokes is Path C with extra files. Mitigated by hooking the default path (`make cluster-deploy` → `cmd_deploy` self-locks) so the laziest agent is the safest one. |
+| Performance regression | LOW | Deploys may queue behind a measurement cell — intended. A hung holder blocking everyone is mitigated by the named-holder report + liveness flag; operator decides (never auto-steal, no force-bypass env — a bypass flag is exactly what an impatient agent would reach for). |
+| Architectural mismatch | LOW-MED | The honest hazard is *adoption*: hand-rolled deploy loops bypass the hook (SMR F4). Mitigated three ways: the default path (`make cluster-deploy`) is the safe path; CLAUDE.md prohibits hand-rolled pushes; #1868 detection backstops non-cooperators. Residual risk accepted and documented. |
 
 ## 9. Test plan
 
-No cluster traffic is required to validate this (the mechanism is
-host-local shell), but one live guarded deploy proves the end-to-end
-path:
-
-1. `bash -n` + `shellcheck` (if available) on all touched scripts.
-2. **Dry-run contention matrix on /tmp** (no cluster): (a) cell A holds
-   via `with-cluster.sh "A" -- sleep 30`; cell B blocks and prints A's
-   pid/purpose/timestamp; (b) `kill -9` cell A's tree → B acquires
-   within one poll interval (orphan-release proof); (c) nested
-   `with-cluster.sh` inside a cell runs immediately (reentrancy);
-   (d) `cluster-setup.sh`-style internal acquire inside a cell does
-   not deadlock (env marker honored); (e) stale owner file + free lock
-   → acquire proceeds, reports stale pid.
-3. `wg-interop.sh` standalone smoke of `inc()` (a read-only `inc info`
-   path) with and without `XPF_CLUSTER_LOCK_HELD` set.
+1. `bash -n` on all touched scripts; `shellcheck` if available.
+2. **Dry-run contention matrix on /tmp** (no cluster, overridden lock
+   path), all under `set -euo pipefail`:
+   (a) cell A holds via `with-cluster.sh "A" -- sleep 30`; cell B
+   blocks and prints A's pid/purpose/timestamp/inode;
+   (b) `kill -9` cell A's whole tree → B acquires within one `flock
+   -w` window (orphan-release proof);
+   (c) nested `with-cluster.sh` inside a cell runs immediately
+   (reentrancy), installs no second trap, and does NOT remove the
+   owner file on exit (AGY double-release check: owner file still
+   present until the outer cell exits);
+   (d) marker survives an env-preserving re-exec and a `bash -c`
+   boundary; a *forged/stale* marker (live but non-ancestor pid; dead
+   pid; mismatched lock path) is rejected → acquire proceeds normally;
+   (e) stale owner file + free lock → acquire proceeds, report flags
+   dead pid; corrupt/empty owner file → no crash under `set -e`;
+   (f) exit-status propagation: cell command exiting 3 →
+   `with-cluster.sh` exits 3, owner file removed (SMR F9);
+   (g) unlink race: delete the lock file while A holds → a new
+   acquirer's inode revalidation prevents a silent split (it must
+   never report acquired on a different inode without flagging the
+   split in its report);
+   (h) `XPF_CLUSTER_LOCK_TIMEOUT=5` against a held lock → loud abort
+   with holder report, non-zero exit.
+3. `wg-interop.sh` `inc()` smoke (read-only `inc info` path) with and
+   without a valid marker.
 4. ONE live guarded `cluster-setup.sh deploy` on the loss userspace
-   cluster under the new self-lock (the lock serializes against any
-   concurrent holder — wait, never kill), followed by
+   cluster through the new re-exec path (the lock serializes against
+   any concurrent holder — wait, never kill), followed by
    `./test/incus/apply-cos-config.sh loss:xpf-userspace-fw0` (deploy
    wipes CoS) and the standard iperf3 sanity check.
 5. No Go/Rust changes expected; if any land, `go build ./...`.
@@ -285,40 +382,61 @@ path:
 
 - Per-harness `check_build_identity` rollout to fairness/mouse-latency
   scripts (worthy follow-up; detection layer, separable).
-- Cross-host locking, lease/steal semantics, CI enforcement.
+- Cross-host locking, lease/steal semantics, CI enforcement,
+  force-bypass escape hatches.
+- Process-group/session management in `with-cluster.sh` (v2 keeps
+  close-fd only; revisit only if the wrapper-SIGKILL-children-survive
+  edge is ever actually hit).
 - Retrofitting every existing script to take cells automatically —
   only `cluster-setup.sh` (the universal writer) and `wg-interop.sh`
   (the asymmetry exemplar) change; others adopt via docs + the helper.
 - The smoke-runner agent-protocol (`feedback_smoke_serialized_single_agent`)
-  — unchanged; this is the OS-level backstop beneath it.
+  — unchanged; this mechanism is the OS-level backstop beneath it.
 
-## 11. Open questions for adversarial review
+## 11. r1 open questions — resolutions (for r2 ratification)
 
-1. **Is Path C actually sufficient?** #1868 detection + codified
-   convention, zero new mechanism. If you believe agents will follow a
-   documented `with-cluster`-style convention without the default
-   `make cluster-deploy` path enforcing it — argue it and this becomes
-   a docs PR + close. PLAN-KILL of the mechanism is acceptable.
-2. **Blocking vs fail-fast default for deploy:** A3 blocks (with
-   report). Should deploy instead `flock -w 1800` and abort loudly, so
-   an unattended agent doesn't silently queue for hours? Which failure
-   mode is worse for LLM agents — invisible queueing or spurious abort?
-3. **fd-close tradeoff (A2):** closing fd 9 for the cell's children
-   means a SIGKILL of *only* the wrapper (children surviving) releases
-   the lock while the cell's commands still run. Keeping the fd open
-   inverts it (orphan holders, the 3-hour bug). Is close-fd the right
-   side, or should the wrapper run the cell in a new process group and
-   kill it on exit-trap to close both holes?
-4. **Reentrancy via env** can leak: a cell that backgrounds a daemonish
-   child leaves `XPF_CLUSTER_LOCK_HELD` set in its environment forever,
-   letting that child later skip locking. Acceptable for cooperating
-   agents, or does the marker need the holder pid + liveness check
-   (`XPF_CLUSTER_LOCK_HELD=<pid>` honored only if that pid is alive and
-   an ancestor)?
-5. **Should `create`/`destroy` lock at all?** They're rare,
-   catastrophic-if-raced, but also the verbs an operator runs when the
-   cluster is already broken — a stuck lock could block recovery.
-   Lock, or document-only?
-6. **Owner-file location/permissions:** /tmp, single-user assumption
-   (all agents run as `ps`). Any reason to prefer `/run/user/$UID` or
-   per-lock `chmod` hygiene given the multi-user /tmp sticky bit?
+1. **Path C sufficiency** — NO, 3-of-3 (Codex: default path reaches
+   lock-free `cmd_deploy` today; AGY: unenforced convention is not a
+   convention; SMR: context-fragility + the convention failed twice in
+   the same incident).
+2. **Blocking vs fail-fast deploy** — block by default with periodic
+   held-by reports; optional `XPF_CLUSTER_LOCK_TIMEOUT`. 2-of-3
+   (Codex + SMR); AGY preferred `flock -w 300` fail-fast. Rationale
+   for overriding AGY: a measurement cell legitimately holds for
+   25-40 min, so any short default timeout makes spurious aborts the
+   *common* case, and an aborting deploy invites exactly the
+   lock-bypass retry behavior the mechanism exists to prevent; the
+   periodic stderr report is the agent-visible affordance AGY's
+   timeout was reaching for. r2 AGY: please re-judge this specific
+   trade with the 25-40 min cell duration in evidence.
+3. **fd-close tradeoff** — close-fd, no process-group kill in v1
+   (Codex + SMR; AGY's `kill -TERM -$$` is unsound as written — see
+   A2 note).
+4. **Marker hardening** — adopted beyond Codex's stated minimum:
+   path-bound `<lockpath>:<pid>` + liveness + ancestor walk (AGY §3
+   leak scenario judged real; the check is ~12 lines and failure
+   degrades to waiting, never skipping).
+5. **create/destroy/init locking** — lock all three (Codex found
+   `init` missing in v1). No `XPF_CLUSTER_FORCE` bypass (AGY's
+   suggestion declined: the named-holder report + `kill <pid>` is the
+   operator recovery path; a bypass env is an attractive nuisance for
+   agents).
+6. **Location/permissions** — /tmp retained (path is load-bearing in
+   three shipped scripts + runbook); 0666 best-effort creation (AGY);
+   never-rm rule + inode report (SMR F1).
+
+## 12. Remaining open questions for r2
+
+1. Is the post-acquire inode revalidation (A2 step 3) worth its ~6
+   lines, or is the never-rm doc rule + inode-in-report sufficient
+   (the systemd-tmpfiles /tmp-aging race is real but slow)?
+2. Does the `cmd_deploy` re-exec (`exec with-cluster.sh ... -- env
+   XPF_CLUSTER_SKIP_BUILD=1 "$0" deploy ...`) have a hole the §9.2
+   matrix misses — e.g. argument re-quoting through the re-dispatch,
+   or `BPFRX_CLUSTER_ENV` interaction with the sg re-exec path?
+3. Is deprecating raw outer-flock of self-locking verbs (A5/Codex F3)
+   acceptable, or does muscle-memory need a compat shim (e.g.
+   detecting a caller-held flock via `flock -n` probe — rejected so
+   far as unreliable: a free-at-probe-time lock proves nothing)?
+4. Any reviewer counter-example where two cooperating processes both
+   end up holding the canonical lock under this design?

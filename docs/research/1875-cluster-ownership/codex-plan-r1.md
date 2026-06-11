@@ -1,0 +1,30 @@
+Reviewed `research/1875-cluster-ownership` at `c261a735e`. No files modified.
+
+**Findings**
+1. The current `wg-interop.sh` outer-flock deadlock claim is true. `inc()` always runs `flock "${WG_CLUSTER_LOCK}" sg ...` at [wg-interop.sh:67](/home/ps/git/bpfrx/.claude/worktrees/1875-research/test/incus/wg-interop.sh:67), and `WG_CLUSTER_LOCK` is `/tmp/xpf-cluster.lock` at [wg-interop.env:56](/home/ps/git/bpfrx/.claude/worktrees/1875-research/test/incus/wg-interop.env:56). A caller already holding that lock makes the inner `flock` block on a separate open file description. I also verified the same nested-flock shape locally: it timed out.
+
+2. A2’s `"$@" 9>&-` is the right fd-close direction, but the plan overstates the invariant for A3. The plan says cluster-setup’s internal acquire holds the fd for “its own process lifetime” and “deploy dies -> lock released” at [plan.md:230](/home/ps/git/bpfrx/.claude/worktrees/1875-research/docs/research/1875-cluster-ownership/plan.md:230). But `deploy_vm` runs many external `incus` children after lock acquisition, for example [cluster-setup.sh:674](/home/ps/git/bpfrx/.claude/worktrees/1875-research/test/incus/cluster-setup.sh:674), [cluster-setup.sh:734](/home/ps/git/bpfrx/.claude/worktrees/1875-research/test/incus/cluster-setup.sh:734), and [cluster-setup.sh:743](/home/ps/git/bpfrx/.claude/worktrees/1875-research/test/incus/cluster-setup.sh:743). Unless those children get fd 9 closed or A3 is implemented via a parent wrapper like `flock -o`, a killed deploy shell can leave an `incus` child holding the lock.
+
+3. Raw legacy `flock /tmp/xpf-cluster.lock ...` wrappers will deadlock around newly self-locking scripts. The plan says existing ad-hoc one-liners keep working at [plan.md:217](/home/ps/git/bpfrx/.claude/worktrees/1875-research/docs/research/1875-cluster-ownership/plan.md:217), while current docs/scripts already teach raw caller locking at [reverse-key-collision-probe.sh:47](/home/ps/git/bpfrx/.claude/worktrees/1875-research/test/incus/reverse-key-collision-probe.sh:47) and [wg-interop-runbook.md:49](/home/ps/git/bpfrx/.claude/worktrees/1875-research/docs/wg-interop-runbook.md:49). After A3, raw-flocking `cluster-setup.sh deploy` will self-wait unless the wrapper is `with-cluster.sh` or sets the reentrancy marker.
+
+4. The boolean reentrancy marker is too weak. A1 introduces `XPF_CLUSTER_LOCK` as an env knob at [plan.md:95](/home/ps/git/bpfrx/.claude/worktrees/1875-research/docs/research/1875-cluster-ownership/plan.md:95), while A4 skips locking on any non-empty `XPF_CLUSTER_LOCK_HELD` at [plan.md:155](/home/ps/git/bpfrx/.claude/worktrees/1875-research/docs/research/1875-cluster-ownership/plan.md:155). That permits false skips from a stale/manual marker or from a cell holding a different lock path. Make the marker path-bound at minimum, e.g. honor only `XPF_CLUSTER_LOCK_HELD=/tmp/xpf-cluster.lock` or `path:pid`.
+
+5. The mutating verb list misses `init`. The plan locks `deploy|start|stop|restart|create|destroy` at [plan.md:140](/home/ps/git/bpfrx/.claude/worktrees/1875-research/docs/research/1875-cluster-ownership/plan.md:140), but `cmd_init` calls `create_networks` and `create_profile` at [cluster-setup.sh:199](/home/ps/git/bpfrx/.claude/worktrees/1875-research/test/incus/cluster-setup.sh:199), which create/delete networks and profiles at [cluster-setup.sh:205](/home/ps/git/bpfrx/.claude/worktrees/1875-research/test/incus/cluster-setup.sh:205) and [cluster-setup.sh:234](/home/ps/git/bpfrx/.claude/worktrees/1875-research/test/incus/cluster-setup.sh:234). Lock `init` too, or explicitly mark it operator-only/out-of-band.
+
+6. The `set -euo pipefail` hazards need to be converted from warning to testable requirements. The plan flags this at [plan.md:241](/home/ps/git/bpfrx/.claude/worktrees/1875-research/docs/research/1875-cluster-ownership/plan.md:241), but owner-file reads can race because waiters read diagnostics while the holder writes/removes it, despite “writes happen only while holding the lock” at [plan.md:114](/home/ps/git/bpfrx/.claude/worktrees/1875-research/docs/research/1875-cluster-ownership/plan.md:114). Use tolerant reads, guard `kill -0` inside conditionals, `fuser ... || true`, atomic owner-file update if practical, and an explicit exit-status propagation test for `with-cluster.sh`.
+
+**Deadlock Matrix**
+A2 -> A4 is safe only if the marker survives; otherwise `wg-interop.sh` self-waits. A2 -> A3 is safe only if `XPF_CLUSTER_LOCK_HELD` survives the `sg incus-admin` re-exec path at [cluster-setup.sh:39](/home/ps/git/bpfrx/.claude/worktrees/1875-research/test/incus/cluster-setup.sh:39). A3 standalone is safe from self-deadlock, but not from fd inheritance to children. Raw `flock` -> A3/A4 is a deadlock class and must be documented as unsupported for self-locking scripts.
+
+**§11 Answers**
+1. Path C is not sufficient. The convention already exists in `wg-interop` docs and reverse-key comments, while `make cluster-deploy` still reaches lock-free `cmd_deploy` today via [Makefile:211](/home/ps/git/bpfrx/.claude/worktrees/1875-research/Makefile:211) -> [cluster-setup.sh:580](/home/ps/git/bpfrx/.claude/worktrees/1875-research/test/incus/cluster-setup.sh:580).
+2. Deploy should block by default with loud periodic owner reports. Add optional timeout env for callers, but no default fail-fast.
+3. Close fd 9 for A2 children. Do not add process-group killing in v1.
+4. Full pid+ancestor validation is probably YAGNI, but a path-bound marker is required in v1. `path:pid` with liveness is cheap if implemented carefully.
+5. Lock `create`, `destroy`, and `init`. Keep `ssh`, `journal`, `logs`, and `status` lock-free.
+6. Keep `/tmp` for compatibility with [wg-interop.env:56](/home/ps/git/bpfrx/.claude/worktrees/1875-research/test/incus/wg-interop.env:56). Document “never rm the lock file”; diagnose with owner file plus `fuser`.
+
+VERDICT: PLAN-NEEDS-REVISION
+
+Codex session ID: 019eb8a0-b485-7a80-8199-3fcc6b0af630
+Resume in Codex: codex resume 019eb8a0-b485-7a80-8199-3fcc6b0af630
