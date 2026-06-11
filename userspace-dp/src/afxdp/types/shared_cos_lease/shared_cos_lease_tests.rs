@@ -1918,3 +1918,93 @@ fn legacy_lease_reports_no_claim_flow() {
     let lease = SharedCoSQueueLease::new(10_000_000, 64 * 1024, 2);
     assert!(lease.v8_worker_claim_flow().is_none());
 }
+
+// #1863 Path A-ii: class-level unclaimed-budget carry at rotation.
+// Contract: an epoch's unclaimed class budget (prev_cap − prev_granted)
+// is banked into `epoch_carry_bytes` and drawn into the next rotation's
+// cap (flow-proportionally re-dealt by the share formula); a fully
+// claimed epoch banks nothing (byte-identical steady state); regime-3
+// cold-resume still drops carry; all existing bounds hold.
+
+// 12.5 MB/s → exactly 2,500 B per 200 µs epoch.
+const CARRY_TEST_RATE: u64 = 12_500_000;
+
+#[test]
+fn v8_unclaimed_budget_carries_into_next_epoch_cap() {
+    let lease = SharedCoSQueueLease::new_v8(CARRY_TEST_RATE, 64 * 1024, 2, 0);
+    lease.rehydrate_worker_active_count(0, 1);
+    // First rotation (start==0, regime 3): cap = one epoch = 2,500.
+    // Claim only 500 of it.
+    let (g1, _) = lease.acquire_v8_with_cause(0, EPOCH_DURATION_NS, 500);
+    assert_eq!(g1, 500);
+    // One epoch later: rotation banks the 2,000 unclaimed and draws it
+    // back — cap = base 2,500 + carry 2,000 = 4,500, all on worker 0's
+    // share (sole flow).
+    let (g2, _) = lease.acquire_v8_with_cause(0, 2 * EPOCH_DURATION_NS, 10_000);
+    assert_eq!(
+        g2, 4_500,
+        "unclaimed prior-epoch budget must be re-dealt, not evaporate"
+    );
+}
+
+#[test]
+fn v8_fully_claimed_epoch_banks_no_carry() {
+    let lease = SharedCoSQueueLease::new_v8(CARRY_TEST_RATE, 64 * 1024, 2, 0);
+    lease.rehydrate_worker_active_count(0, 1);
+    let (g1, _) = lease.acquire_v8_with_cause(0, EPOCH_DURATION_NS, 10_000);
+    assert_eq!(g1, 2_500, "full claim of the one-epoch cap");
+    // Healthy steady state: next epoch's cap is exactly the base —
+    // byte-identical to the pre-#1863 rotation.
+    let (g2, _) = lease.acquire_v8_with_cause(0, 2 * EPOCH_DURATION_NS, 10_000);
+    assert_eq!(g2, 2_500, "fully-claimed epoch must bank nothing");
+}
+
+#[test]
+fn v8_cold_resume_drops_unclaimed_carry() {
+    let lease = SharedCoSQueueLease::new_v8(CARRY_TEST_RATE, 64 * 1024, 2, 0);
+    lease.rehydrate_worker_active_count(0, 1);
+    let (g1, _) = lease.acquire_v8_with_cause(0, EPOCH_DURATION_NS, 500);
+    assert_eq!(g1, 500);
+    // Resume past the stall window (256 epochs): regime 3 grants one
+    // epoch and DROPS the banked remainder.
+    let stall_ns = EPOCH_DURATION_NS * 300;
+    let (g2, _) = lease.acquire_v8_with_cause(0, EPOCH_DURATION_NS + stall_ns, 10_000);
+    assert_eq!(g2, 2_500, "cold-resume must not burst stale unclaimed budget");
+}
+
+#[test]
+fn v8_unclaimed_carry_bounded_by_carry_max() {
+    let lease = SharedCoSQueueLease::new_v8(CARRY_TEST_RATE, 64 * 1024, 2, 0);
+    lease.rehydrate_worker_active_count(0, 1);
+    // 20 consecutive epochs claiming 1 byte each: unclaimed ~2,499/epoch
+    // accumulates but the bank is clamped at CARRY_MAX_EPOCHS (8) worth
+    // and each draw at CARRY_DRAIN_MAX_EPOCHS (7) worth.
+    for i in 1..=20u64 {
+        let _ = lease.acquire_v8_with_cause(0, i * EPOCH_DURATION_NS, 1);
+    }
+    let (g, _) = lease.acquire_v8_with_cause(0, 21 * EPOCH_DURATION_NS, 1_000_000);
+    let base = 2_500u64;
+    let drain_max = 7 * 2_500u64;
+    assert!(
+        g <= base + drain_max,
+        "carry draw must stay within the existing (base + drain_max) bound; got {g}"
+    );
+    assert!(g > base, "some banked budget must be drawn; got {g}");
+}
+
+#[test]
+fn v8_equal_flow_mode_never_banks_unclaimed_budget() {
+    // EqualFlowSuppress leases keep pre-#1863 evaporation semantics:
+    // an under-claimed (fail-open) epoch must NOT inflate the next cap.
+    let lease = new_equal_flow_lease_with_policy(EqualFlowTargetPolicy::Slowest);
+    lease.rehydrate_worker_active_count(0, 1);
+    let g1 = lease.acquire_v8(0, EPOCH_DURATION_NS, 500);
+    assert_eq!(g1, 500, "fail-open epoch grants proportionally");
+    // 50 MB/s -> 10,000 B/epoch. Without banking, the next epoch's cap
+    // is exactly the one-epoch base; with banking it would be 19,500.
+    let g2 = lease.acquire_v8(0, 2 * EPOCH_DURATION_NS, 50_000);
+    assert_eq!(
+        g2, 10_000,
+        "equal-flow mode must not recycle unclaimed budget"
+    );
+}

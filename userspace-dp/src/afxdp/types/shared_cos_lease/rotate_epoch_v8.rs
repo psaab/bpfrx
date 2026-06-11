@@ -186,17 +186,63 @@ impl SharedCoSQueueLease {
         let k_window_ns = EPOCH_DURATION_NS * MAX_ROTATION_LAG_EPOCHS;
         let stall_window_ns = EPOCH_DURATION_NS * STALL_THRESHOLD_EPOCHS;
 
+        // #1863 Path A-ii: the just-ended epoch's UNCLAIMED class budget.
+        // Workers claim their flow-proportional share only at drain-visit
+        // acquires; a worker whose visits miss an epoch lets its share
+        // evaporate at this rotation even though the class is backlogged
+        // (the Step-0 cells measured 21-29% of the class cap evaporating
+        // this way under aggressor pressure while EVERY active worker
+        // cumulatively over-asked its entitlement — claim-sampling loss,
+        // docs/research/1863-realization-gap/plan.md §5). Bank the
+        // remainder into the SAME bounded carry the lag machinery uses:
+        // the next rotation's `new_cap` draws it back and the share
+        // formula below re-deals it flow-proportionally, so per-worker
+        // isolation is preserved (no mid-epoch class-room racing — the
+        // rejected A-i shape) and every existing bound holds unchanged
+        // (`carry_max` = K epochs banked, `carry_drain_max` per draw,
+        // per-rotation grant ≤ (2K−1)×rate×EPOCH, regime-3 cold-resume
+        // still drops stale carry across HA gaps). Conservation: a banked
+        // byte was published in exactly one prior cap and not granted;
+        // re-banking a drawn-but-again-unclaimed byte loops the same
+        // budget, so Σ granted ≤ rate × wall-time + carry_max — the
+        // long-run hard cap (Gate 4) is unchanged. A fully-claimed epoch
+        // (`prev_granted == prev_cap`, the healthy steady state) banks 0
+        // and this rotation is byte-identical to pre-#1863 behavior.
+        //
+        // Equal-flow gate: banking is restricted to the default
+        // (CstructDefault) rate mode. In EqualFlowSuppress mode the
+        // unclaimed remainder of an ENFORCED epoch is budget the policy
+        // deliberately suppressed — recycling it would re-grant
+        // suppressed bytes later and partially defeat enforcement — and
+        // even fail-open epochs feed `new_cap` into the IdealShare
+        // target numerator (#1746), so banking there would couple the
+        // per-flow target to claim-sampling noise. Equal-flow leases
+        // therefore keep the pre-#1863 evaporation semantics
+        // byte-for-byte (their suite pins this); the #1863 gap was
+        // measured and is fixed in the default mode.
+        let prev_unclaimed = if v8.rate_mode == V8RateMode::EqualFlowSuppress {
+            0
+        } else {
+            prev_cap.saturating_sub(prev_granted)
+        };
+
         let (elapsed_ns, carry_draw) = if start == 0 || raw_elapsed_ns > stall_window_ns {
-            // REGIME 3 — cold-resume. One epoch, drop any stale carry.
+            // REGIME 3 — cold-resume. One epoch, drop any stale carry
+            // (including the just-ended epoch's unclaimed remainder: a
+            // post-stall class must not burst stale budget).
             v8.epoch.epoch_carry_bytes.store(0, Ordering::Release);
             (EPOCH_DURATION_NS, 0u64)
         } else if raw_elapsed_ns > k_window_ns {
             // REGIME 2 — bank residual beyond the K-epoch ceiling. Grant
-            // exactly `K×EPOCH` now; bank `rate × (raw − K×EPOCH)`.
+            // exactly `K×EPOCH` now; bank `rate × (raw − K×EPOCH)` plus
+            // the just-ended epoch's unclaimed remainder (#1863 A-ii).
             let overshoot_ns = (raw_elapsed_ns - k_window_ns) as u128;
             let new_owed = ((rate_bytes * overshoot_ns) / 1_000_000_000u128) as u64;
             let prev_carry = v8.epoch.epoch_carry_bytes.load(Ordering::Acquire);
-            let carry = prev_carry.saturating_add(new_owed).min(carry_max);
+            let carry = prev_carry
+                .saturating_add(new_owed)
+                .saturating_add(prev_unclaimed)
+                .min(carry_max);
             v8.epoch.epoch_carry_bytes.store(carry, Ordering::Release);
             (k_window_ns, 0u64)
         } else {
@@ -204,12 +250,15 @@ impl SharedCoSQueueLease {
             // (regime 2 caught anything above), so the base grant is
             // bounded by `K×rate×EPOCH`; the carry drain adds at most
             // `(K−1)×rate×EPOCH`, keeping the per-rotation grant ≤
-            // `(2K−1)×rate×EPOCH`.
+            // `(2K−1)×rate×EPOCH`. #1863 A-ii: bank the just-ended
+            // epoch's unclaimed remainder BEFORE drawing, so a one-epoch
+            // sampling miss is redistributable on the very next epoch.
             let prev_carry = v8.epoch.epoch_carry_bytes.load(Ordering::Acquire);
-            let draw = prev_carry.min(carry_drain_max);
+            let banked = prev_carry.saturating_add(prev_unclaimed).min(carry_max);
+            let draw = banked.min(carry_drain_max);
             v8.epoch
                 .epoch_carry_bytes
-                .store(prev_carry - draw, Ordering::Release);
+                .store(banked - draw, Ordering::Release);
             (raw_elapsed_ns, draw)
         };
 

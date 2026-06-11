@@ -1108,6 +1108,28 @@ unit policy:
   (with the partial-honour queue carrying its REMAINING quantum,
   not its full quantum, so total alloc per queue ≤ Q_i).
 
+  **Claim-side work conservation (#1863, Path A-ii):** the per-class
+  v8 lease that fuels the selector's token banks publishes a per-epoch
+  class budget (`rate × elapsed`) dealt to workers flow-proportionally
+  at each 200 µs rotation. Workers claim their share only when the
+  drain loop visits their queue, so under heavy competing load a
+  worker can miss an epoch entirely; pre-#1863 the missed share
+  evaporated at rotation — measured as 21-29% of the class budget for
+  honored mid classes under a Phase-2 aggressor (the
+  honored-realization gap, docs/research/1863-realization-gap). The
+  rotation now banks an epoch's UNCLAIMED class budget into the
+  existing bounded lag-carry (`epoch_carry_bytes`, ≤ 8 epochs banked,
+  ≤ 7 epochs drawn per rotation, dropped on the ≥256-epoch cold-resume
+  path) and the next rotation re-deals it through the same
+  flow-proportional share formula. Per-worker isolation is preserved
+  (no mid-epoch class-room racing); a fully-claimed epoch banks
+  nothing, so the healthy steady state is byte-identical; long-run
+  hard caps are unchanged (a banked byte is a published-but-ungranted
+  byte — the carry recycles, never mints). Equal-flow
+  (`EqualFlowSuppress`) leases are excluded and keep evaporation
+  semantics byte-for-byte (suppressed budget must not be re-granted;
+  the IdealShare target numerator must not track sampling noise).
+
 Junos configuration:
 
 ```
