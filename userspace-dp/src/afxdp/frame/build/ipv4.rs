@@ -86,7 +86,13 @@ pub(in crate::afxdp::frame) fn build_forwarded_frame_into_ipv4(
     if tunnel_tcp_mss > 0 {
         let _ = clamp_tcp_mss_frame(out, ip_start, tunnel_tcp_mss);
     }
-    if force_tunnel_l4_recompute || (repaired_ports && !enforced) {
+    // #1852: skip the full L4 recompute on a non-first fragment — it
+    // writes the checksum at ihl+16/+6, which is payload here. The forced
+    // tunnel-egress recompute (tunnel_endpoint_id != 0) would otherwise
+    // re-corrupt the very bytes the NAT/port gates above protected.
+    // (`repaired_ports` is already false for fragments — the ICMP-ident
+    // restore is gated — so only the forced-tunnel term can fire.)
+    if !non_first_fragment && (force_tunnel_l4_recompute || (repaired_ports && !enforced)) {
         recompute_l4_checksum_ipv4(&mut out[ip_start..], ihl, meta.protocol, true)?;
     }
     Some(())

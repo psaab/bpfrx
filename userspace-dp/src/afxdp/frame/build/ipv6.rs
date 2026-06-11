@@ -69,7 +69,11 @@ pub(in crate::afxdp::frame) fn build_forwarded_frame_into_ipv6(
     if tunnel_tcp_mss > 0 {
         let _ = clamp_tcp_mss_frame(out, ip_start, tunnel_tcp_mss);
     }
-    if force_tunnel_l4_recompute || (repaired_ports && !enforced) {
+    // #1852: skip the full L4 recompute on a non-first fragment — it
+    // writes the checksum at rel_l4+16/+6, which is payload here. The
+    // forced tunnel-egress recompute would otherwise re-corrupt the bytes
+    // the NAT/port gates above protected.
+    if !non_first_fragment && (force_tunnel_l4_recompute || (repaired_ports && !enforced)) {
         recompute_l4_checksum_ipv6(&mut out[ip_start..], rel_l4, meta.protocol)?;
     }
     Some(())

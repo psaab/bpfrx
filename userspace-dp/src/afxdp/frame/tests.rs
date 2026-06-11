@@ -5495,3 +5495,80 @@ fn clamp_tcp_mss_skips_non_first_fragment() {
     assert!(!super::tcp::clamp_tcp_mss(&mut frag, 1400));
     assert_eq!(&frag[20..], &before[..], "fragment payload untouched");
 }
+
+#[test]
+fn build_tunnel_egress_non_first_fragment_skips_forced_l4_recompute() {
+    // #1852 (Codex impl review): the copy builder's forced tunnel L4
+    // recompute (tunnel_endpoint_id != 0 -> force_tunnel_l4_recompute)
+    // must NOT run on a non-first fragment — it would write a checksum at
+    // ihl+16, which is payload, re-corrupting what the NAT/port gates
+    // protected. Build an eth + non-first IPv4 fragment + TCP-like
+    // payload and assert the payload is byte-identical after the build.
+    let mut out = Vec::new();
+    write_eth_header(
+        &mut out,
+        [0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5],
+        [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
+        0,
+        0x0800,
+    );
+    let ip_start = out.len(); // 14
+    // IPv4 header: non-first fragment (offset 1), ttl 64, proto TCP.
+    let payload = [0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+    let mut ip = vec![0u8; 20];
+    ip[0] = 0x45;
+    let total = (20 + payload.len()) as u16;
+    ip[2..4].copy_from_slice(&total.to_be_bytes());
+    ip[6..8].copy_from_slice(&0x0001u16.to_be_bytes()); // non-first
+    ip[8] = 64;
+    ip[9] = PROTO_TCP;
+    ip[12..16].copy_from_slice(&[10, 0, 0, 1]);
+    ip[16..20].copy_from_slice(&[10, 0, 0, 2]);
+    out.extend_from_slice(&ip);
+    out.extend_from_slice(&payload);
+    let before_payload = payload.to_vec();
+    let ingress = out.clone();
+
+    let meta: ForwardPacketMeta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: ip_start as u16,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        ..UserspaceDpMeta::default()
+    }
+    .into();
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 11,
+            tunnel_endpoint_id: 7, // tunnel egress -> force_tunnel_l4_recompute
+            next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))),
+            neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+            tx_vlan_id: 0,
+        },
+        nat: NatDecision::default(),
+    };
+
+    let mut egress = vec![0u8; ingress.len()];
+    let written = build_forwarded_frame_into_from_frame(
+        &mut egress,
+        &ingress,
+        meta,
+        &decision,
+        &ForwardingState::default(),
+        false,
+        None,
+    )
+    .expect("build");
+    let out_payload_start = 14 + 20; // eth + ihl
+    assert_eq!(
+        &egress[out_payload_start..written],
+        &before_payload[..],
+        "forced tunnel L4 recompute must not touch non-first fragment payload"
+    );
+}
