@@ -99,6 +99,16 @@ pub(super) fn apply(
         *persist_state = true;
     } else {
         let defer_workers = snapshot.defer_workers;
+        if defer_workers {
+            // #1866 Change 2b (D4): the defer branch stores the snapshot
+            // WITHOUT reconciling, leaving the coordinator's forwarding
+            // (and so its WG desired set) stale until the deferred
+            // bring-up. A WG endpoint REMOVED by this apply must still
+            // release its control thread + UDP port NOW — narrow
+            // prune-only reconcile against the new snapshot (no spawn,
+            // no forwarding mutation).
+            guard.afxdp.prune_wg_control_threads_for_snapshot(&snapshot);
+        }
         guard.snapshot = Some(snapshot);
         let replanned = replan_queues(
             guard.snapshot.as_ref(),
