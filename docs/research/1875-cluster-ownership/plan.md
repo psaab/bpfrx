@@ -1,9 +1,11 @@
 # #1875 — Cluster ownership serialization for the loss userspace cluster
 
-**Status: DRAFT v3 — revised after r2 (Codex task-mqa1aikr [3 findings,
-PLAN-NEEDS-REVISION], AGY adversarial-review-mqa18s13-hgimly
-[PLAN-READY with recommendations], Claude SMR r2 [PLAN-NEEDS-REVISION,
-S1/S2]). All r2 findings folded; pending r3 ratification.**
+**Status: v4 — r3 verdicts: AGY PLAN-READY
+(adversarial-review-mqa1ibg7-5uanbl), Claude SMR PLAN-READY, Codex
+PLAN-NEEDS-REVISION on one residual §5/§7.2 text contradiction (fixed
+here) + the optional /proc/<pid>/fd/9 hardening (adopted — AGY r3
+proposed the identical mechanism independently). Pending final Codex
+delta confirmation.**
 
 ## 1. Status
 
@@ -105,9 +107,13 @@ post-acquire `incus` children (cluster-setup.sh:674, :734, :743)
 inherit the lock fd, so a killed deploy shell leaves an `incus` child
 as a zombie holder — the exact 3-hour bug; AGY showed sourced-library
 EXIT traps clobber consumer traps and double-release owner metadata
-from bypassed nested acquires. **v2 therefore has exactly ONE process
-that ever holds the lock: `with-cluster.sh`.** Everything else either
-re-execs through it or honors its reentrancy marker.
+from bypassed nested acquires. **v2+ therefore has exactly ONE
+long-lived, self-locking, marker-exporting holder:
+`with-cluster.sh`** (standalone per-command `flock` holders —
+wg-interop's `inc()` else-branch, ad-hoc one-liners — legitimately
+persist and never export the marker; see invariant §7.2). Every
+self-locking script either re-execs through `with-cluster.sh` or
+honors its reentrancy marker.
 
 **A1. Shared helper library `test/incus/cluster-lock.sh`** (sourced).
 Canonical paths are hard-coded defaults (`/tmp/xpf-cluster.lock`,
@@ -165,8 +171,14 @@ Acquire sequence (all r1 mechanics findings folded in):
    exclusion has been split — **fail closed** with a diagnosis naming
    both inodes (mirrors #1868 fail-closed philosophy). This is the one
    deliberate exception to "owner file never gates execution": it errs
-   toward refusing to run, never toward clobbering; false positives
-   (stale owner + recycled pid) self-heal when the recycled pid exits.
+   toward refusing to run, never toward clobbering. Pid-recycling
+   false positives are defeated by the **fd-9 probe** (Codex r3 + AGY
+   r3 converged independently on the identical mechanism): before
+   aborting, check `stat -L -c %d:%i /proc/<recorded-pid>/fd/9` — only
+   abort if it still resolves to the recorded dev:ino (the recorded
+   holder provably still holds the old lock fd); a recycled pid
+   without fd 9 on that inode clears the stale owner path and acquire
+   proceeds. Same-user cooperating agents make /proc readable.
 4. Atomic owner write: temp file + `mv` onto `$OWNER` containing
    `<pid> <iso8601> <user> <git-branch> <lock-dev:ino> <purpose>`;
    EXIT trap (own dedicated process, nothing to clobber) removes it.

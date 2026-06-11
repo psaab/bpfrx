@@ -23,3 +23,14 @@
   forwarding REQUIRED; S2 split-mutex inode assertion RECOMMENDED)
 
 All r2 findings folded into plan v3.
+
+## Round 3 (plan v3 @ 9f17b51b3cd2 — delta ratification)
+
+- Codex: session 019eb8b2-dfe2-7602-b453-3479ae2711a4 — PLAN-NEEDS-REVISION
+  (single residual: §5 "exactly ONE process" text contradicted restated §7.2;
+  optional /proc/<pid>/fd/9 probe suggested; §13 answered acceptable)
+- AGY: adversarial-review-mqa1ibg7-5uanbl — PLAN-READY (§13 acceptable;
+  proposed the identical /proc/<pid>/fd/9 probe independently)
+- Claude SMR: claude-smr-plan-r3.md — PLAN-READY
+
+## Round 4 (plan v4 — Codex residual text fix + fd-9 probe adopted)
