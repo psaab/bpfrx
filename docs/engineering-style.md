@@ -362,6 +362,40 @@ they repeatedly bite:
 - **Deploy wipes CoS config.** After `cluster-setup.sh deploy`, re-run
   `./test/incus/apply-cos-config.sh <target>` before running iperf3
   for any #706 / #707 / #708 / #709 / #718 validation.
+- **Shared-cluster lock protocol (#1875).** The loss userspace cluster
+  is shared by concurrent agents; ownership is serialized by the
+  advisory flock on `/tmp/xpf-cluster.lock` with holder metadata in
+  `/tmp/xpf-cluster.owner`. Who locks what:
+  | Actor | Protocol |
+  |---|---|
+  | `cluster-setup.sh` deploy/start/stop/restart/create/destroy/init | self-locks (re-execs through `with-cluster.sh`; the build stays outside the lock) |
+  | `apply-cos-config.sh` | self-locks the same way |
+  | Multi-command measurement cells (deploy → apply-cos → measure) | wrap the WHOLE cell: `./test/incus/with-cluster.sh "purpose" -- cmd...` |
+  | `wg-interop.sh` | self-locks per command standalone; runs lock-free inside a cell (marker-aware) |
+  | Ad-hoc one-liners around commands that do NOT self-lock | `flock /tmp/xpf-cluster.lock sg incus-admin -c "..."` still valid |
+  Rules that keep the mutex sound:
+  - **Never wrap a self-locking script in a raw outer
+    `flock /tmp/xpf-cluster.lock`** — it deadlocks (the inner acquire
+    cannot see a raw caller's lock). Use `with-cluster.sh`, whose
+    `XPF_CLUSTER_LOCK_HELD=<lockpath>:<pid>` marker (validated by
+    path + pid liveness + ancestry) makes nesting safe.
+  - **Never `rm` the lock or owner files.** flock binds the inode —
+    deleting the path silently splits the mutex into two "owners".
+    Stuck holder recovery is `kill <holder-pid>` (kernel releases the
+    lock on fd close), and only for YOUR OWN holders.
+  - **Never kill another agent's holder.** The lock serializes you:
+    wait (the wait loop prints who holds it, since when, and why,
+    every 30s) or coordinate. `XPF_CLUSTER_LOCK_TIMEOUT=<s>` opts a
+    cell into fail-fast instead of waiting forever.
+  - **Never hand-roll binary deploys** (`incus file push` + restart
+    loops) to the cluster — they bypass the lock AND the #1864/#1869
+    verify-dataplane gate. Deploys go through `cluster-setup.sh
+    deploy` / `make cluster-deploy`.
+  - Queue diagnosis: `cat /tmp/xpf-cluster.owner` +
+    `fuser -v /tmp/xpf-cluster.lock`. A dead recorded pid with the
+    lock still held means a child inherited the fd (pre-#1875 raw
+    holders only; `with-cluster.sh` runs cells with the lock fd
+    closed, so killing a cell's tree releases instantly).
 - **Always `source ~/.sshrc` before `git push`.** The user's SSH agent
   config lives there.
 - **172.16.80.200 is the iperf3 test endpoint.** Not 172.16.50.x.

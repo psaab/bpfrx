@@ -555,8 +555,10 @@ func newCollector(srv *Server) *xpfCollector {
 			"Cumulative session installs refused at the max_sessions cap on "+
 				"this userspace worker's session table (#1861 — previously "+
 				"counted internally but never exported). Covers every "+
-				"install site (new-flow, reply repair, seed, fabric-return, "+
-				"LocalMiss helper, UpsertLocal replicas).",
+				"capped install site (new-flow, reply repair, seed, "+
+				"fabric-return, LocalMiss helper). UpsertLocal replicas "+
+				"moved to the uncapped sync-family install in #1870 and "+
+				"no longer contribute.",
 			[]string{"worker_id"}, nil,
 		),
 		workerSessionInstallAdmissionRefused: prometheus.NewDesc(

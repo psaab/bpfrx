@@ -36,6 +36,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=wg-interop.env
 source "${SCRIPT_DIR}/wg-interop.env"
+# #1875: marker-aware locking. Bind the marker check to the SAME path
+# inc() flocks, so a cell holding a different lock can never bypass
+# this script's per-command serialization.
+XPF_CLUSTER_LOCK="${WG_CLUSTER_LOCK}"
+# shellcheck source=cluster-lock.sh
+source "${SCRIPT_DIR}/cluster-lock.sh"
 
 R="${WG_REMOTE}"
 FW0="${R}:${WG_FW0}"
@@ -64,10 +70,18 @@ warn() { log "WARN: $*"; }
 # Cluster command plumbing. flock serializes against other agents; sg
 # grants the incus-admin group. printf %q-quoting survives the sg -c
 # string boundary. stdin passes through (used for cli heredocs).
+# #1875: inside a with-cluster.sh cell (valid marker from a live
+# ancestor holder) the per-command flock is skipped — the cell already
+# owns the cluster, and flocking the same file would deadlock against
+# our own ancestor. Standalone behavior is byte-identical to before.
 inc() {
     local q
     q=$(printf '%q ' incus "$@")
-    flock "${WG_CLUSTER_LOCK}" sg incus-admin -c "$q"
+    if xpf_cluster_lock_held; then
+        sg incus-admin -c "$q"
+    else
+        flock "${WG_CLUSTER_LOCK}" sg incus-admin -c "$q"
+    fi
 }
 
 # Run a shell snippet inside an instance.

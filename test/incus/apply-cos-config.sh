@@ -45,6 +45,19 @@
 #
 set -euo pipefail
 
+# #1875: this script commits config on the SHARED loss userspace
+# cluster — serialize against other agents. Inside a with-cluster.sh
+# cell (valid marker from a live ancestor holder) it runs directly;
+# standalone it re-execs through with-cluster.sh, which blocks with a
+# named-holder report until the cluster is ours.
+_LOCK_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=cluster-lock.sh
+source "${_LOCK_SCRIPT_DIR}/cluster-lock.sh"
+if ! xpf_cluster_lock_held; then
+    exec "${_LOCK_SCRIPT_DIR}/with-cluster.sh" "apply-cos-config $*" \
+        -- "${_LOCK_SCRIPT_DIR}/apply-cos-config.sh" "$@"
+fi
+
 # #929 compatibility: --same-class still selects
 # cos-iperf-same-class.set for older callers. That fixture mirrors the
 # default 520x/620x map and also preserves the legacy destination-port
