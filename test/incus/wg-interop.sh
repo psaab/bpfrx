@@ -147,26 +147,101 @@ gen_keys() { # gen_keys [force] — force regenerates (fresh WG identity)
     log "keys ready (xpf pub ${XPF_PUB_B64})"
 }
 
-# Wait until node0 is RG0 primary. The WG outer endpoint is the LAN VIP
-# and the wg0 stanza is node0-scoped, so a post-deploy/post-restart
-# window where fw1 still holds RG0 mastership black-holes the peer's
-# handshake responses (the peer ARPs 10.0.61.1 to fw1's virtual MAC,
-# which has no WG engine). Seen live: the first full run committed P1
-# ~90 s after a rolling deploy and timed out for exactly this reason.
-wait_node0_primary() { # wait_node0_primary <deadline_s>
+# The predicate WireGuard actually needs is the LAN VIP
+# (${WG_XPF_OUTER4}) being PRESENT on fw0 — the outer source address.
+# After any xpfd restart/deploy fw0 comes up SECONDARY on ALL
+# redundancy groups (preempt off) and the VIP is removed; the kernel
+# then fails every WG send with a silent EINVAL (no route/source — the
+# engine keeps retrying once per second and recovers by itself the
+# moment the VIP returns; root-caused live 2026-06-11 via strace:
+# sendto=EINVAL while backup, handshake within 5 s of failback).
+# Checking "RG0 primary" alone is NOT sufficient — the VIP follows the
+# reth's own RG. So: gate on the VIP, and if it is absent, fail back
+# EVERY RG to node0 (an xpfd restart on fw0 — including this
+# harness's own recovery restarts — leaves them all on node1).
+fw0_has_wg_vip() {
+    ish "${FW0}" "ip -4 addr show | grep -q ' ${WG_XPF_OUTER4}/'"
+}
+
+# Functional ARP check: the VIP ADDRESS can be present on BOTH nodes
+# (and absent on a backup), so presence alone is not mastership. What
+# WG actually needs is the peer's ARP for the VIP resolving to FW0's
+# LAN MAC — otherwise the peer's handshake responses land on fw1,
+# which has no WG engine (node0 scoping). Skips cleanly when the peer
+# instance does not exist yet (preflight runs before provision).
+peer_arp_resolves_to_fw0() {
+    local fw0_mac peer_mac
+    inc info "${PEER}" >/dev/null 2>&1 || return 0
+    fw0_mac=$(ish "${FW0}" "ip -br link show ge-0-0-1 | awk '{print \$3}'") || return 1
+    ish "${PEER}" "ping -c 1 -W 1 ${WG_XPF_OUTER4} >/dev/null 2>&1 || true"
+    peer_mac=$(ish "${PEER}" "ip neigh show ${WG_XPF_OUTER4} | awk '{for(i=1;i<NF;i++) if (\$i==\"lladdr\") print \$(i+1)}'") || return 1
+    [ -n "${fw0_mac}" ] && [ "${fw0_mac}" = "${peer_mac}" ]
+}
+
+ensure_wg_mastership() { # ensure_wg_mastership <label>
     local t
-    for t in $(seq 1 "$1"); do
-        if inc exec "${FW0}" -- /usr/local/sbin/cli <<'EOF' 2>/dev/null | grep -A2 "Redundancy group: 0" | grep -qE '^node0 .*primary'
+    for t in $(seq 1 12); do
+        if fw0_has_wg_vip && peer_arp_resolves_to_fw0; then
+            log "$1: WG VIP ${WG_XPF_OUTER4} on fw0 + peer ARP agrees (t=${t})"
+            return 0
+        fi
+        sleep 2
+    done
+    warn "$1: WG VIP absent on fw0 — failing ALL redundancy groups back to node0"
+    # Discover the configured RG ids from cluster status and fail each
+    # back. Hardcoding 0/1 missed RG2 live (three RGs on this cluster).
+    local rgs rg
+    rgs=$(inc exec "${FW0}" -- /usr/local/sbin/cli <<'EOF' 2>/dev/null | sed -n 's/^Redundancy group: \([0-9]*\) .*/\1/p'
 show chassis cluster status
 quit
 EOF
-        then
-            log "node0 is RG0 primary (t=${t}s)"
+    )
+    [ -n "${rgs}" ] || rgs="0 1"
+    for rg in ${rgs}; do
+        inc exec "${FW0}" -- /usr/local/sbin/cli <<EOF >> "${EVID}/$1-failback.txt" 2>&1
+request chassis cluster failover redundancy-group ${rg} node 0
+quit
+EOF
+    done
+    # Stale peer ARP can outlive a mastership change (the peer caches
+    # the OLD master's MAC); flush so the recheck re-resolves.
+    if inc info "${PEER}" >/dev/null 2>&1; then
+        ish "${PEER}" "ip neigh flush dev eth1 2>/dev/null || true"
+    fi
+    for t in $(seq 1 24); do
+        if fw0_has_wg_vip && peer_arp_resolves_to_fw0; then
+            log "$1: WG VIP + peer ARP restored after failback (t=${t})"
             return 0
         fi
-        sleep 5
+        sleep 2
     done
     return 1
+}
+
+# The deployed build must be THIS branch's build. The shared cluster
+# has concurrent agents with deploy loops; a foreign binary swap turns
+# into impossible-to-triage phase failures (lived twice in #1736: a
+# foreign build without the WG collect fix produced a "deterministic
+# wedge" that was really a stale binary). Compare the running
+# Software version's g<sha> suffix against this checkout's HEAD.
+check_build_identity() { # check_build_identity <label>
+    local want got
+    want=$(git -C "${SCRIPT_DIR}/../.." rev-parse HEAD 2>/dev/null) || return 0
+    got=$(inc exec "${FW0}" -- /usr/local/sbin/cli <<'EOF' 2>/dev/null | sed -n 's/^Software version: .*-g\([0-9a-f]*\)$/\1/p'
+show chassis cluster status
+quit
+EOF
+    )
+    if [ -z "${got}" ]; then
+        warn "$1: cannot read deployed software version (daemon mid-restart?)"
+        return 1
+    fi
+    # The version suffix is an abbreviated sha; prefix-match against
+    # the full HEAD sha so abbrev-length differences cannot bite.
+    case "${want}" in
+        "${got}"*) return 0 ;;
+    esac
+    fail "$1: deployed build g${got} != this branch ${want} — a concurrent deploy replaced the binaries; redeploy from this branch (make cluster-deploy) before running"
 }
 
 # ---------------------------------------------------------------------------
@@ -176,7 +251,8 @@ preflight() {
     inc info "${FW0}" >/dev/null || fail "cannot reach ${FW0}"
     ish "${FW0}" 'systemctl is-active xpfd' | grep -q active || fail "xpfd not active on fw0"
     ish "${FW1}" 'systemctl is-active xpfd' | grep -q active || fail "xpfd not active on fw1"
-    wait_node0_primary 36 || fail "node0 not RG0 primary within 180s — WG VIP would black-hole"
+    check_build_identity "preflight" || true
+    ensure_wg_mastership "preflight" || fail "WG VIP not on fw0 (even after all-RG failback) — WG sends would EINVAL"
     # Stale wg0 STANZA from a previous run: the config DB persists
     # across deploys (deploy pushes xpf.conf but the daemon loads the
     # DB first), so a prior run's stanza silently revives the engine at
@@ -366,7 +442,8 @@ configure_p1() {
     log "P1: keys + peer (responder) + xpf commit (initiator, node0-scoped)"
     gen_keys force
     peer_wg_setup ""   # peer responder: no endpoint — must learn from xpf msg1
-    wait_node0_primary 36 || fail "P1: node0 not RG0 primary — VIP would black-hole the handshake"
+    ensure_wg_mastership "p1" || fail "P1: WG VIP not on fw0 (even after all-RG failback)"
+    check_build_identity "p1" || true
     wg_stanza_delete   # remove any stale stanza (fresh-engine belt)
     # S2a removal-leak workaround (#1866): a leaked control thread from
     # a previous engine pins :51820 and would EADDRINUSE the fresh
@@ -378,7 +455,7 @@ configure_p1() {
         ish "${FW0}" 'systemctl restart xpfd'
         sleep 15
         ish "${FW0}" 'systemctl is-active xpfd' | grep -q active || fail "P1: xpfd restart failed"
-        wait_node0_primary 36 || fail "P1: node0 not primary after leak-recovery restart"
+        ensure_wg_mastership "p1-leak" || fail "P1: WG VIP not restored after leak-recovery restart + failback"
     fi
     xpf_wg_commit 1
     # The apply pipeline (tunnels -> dataplane -> FRR) is asynchronous
@@ -402,7 +479,7 @@ configure_p1() {
         ish "${FW0}" 'systemctl restart xpfd'
         sleep 20
         ish "${FW0}" 'systemctl is-active xpfd' | grep -q active || fail "P1: xpfd restart failed"
-        wait_node0_primary 36 || fail "P1: node0 not primary after wedge-recovery restart"
+        ensure_wg_mastership "p1-wedge" || fail "P1: WG VIP not restored after wedge-recovery restart + failback"
         peer_wg_setup ""   # restart runbook: flush the peer after an xpfd restart
         for t in $(seq 1 45); do
             if ish "${FW0}" 'ip -br addr show wg0 >/dev/null 2>&1' \
@@ -422,8 +499,17 @@ configure_p1() {
     if ish "${FW1}" "ss -uln | grep -q ':${WG_LISTEN_PORT} '"; then
         fail "P1: fw1 bound :${WG_LISTEN_PORT} — node0 scoping failed"
     fi
-    wait_handshake "${WG_HANDSHAKE_TIMEOUT_S}" "P1" \
-        || fail "P1: no handshake within ${WG_HANDSHAKE_TIMEOUT_S}s (xpf initiator vs kernel responder)"
+    if ! wait_handshake $((WG_HANDSHAKE_TIMEOUT_S / 2)) "P1"; then
+        # The engine retries at 1/s and self-recovers the moment the
+        # mastership/ARP conditions heal (proven live: handshake <5 s
+        # after failback) — remediate and keep waiting instead of
+        # failing fast on a transient post-deploy mastership split.
+        warn "P1: no handshake at half-budget — remediating mastership/ARP"
+        check_build_identity "p1-midwait" || true
+        ensure_wg_mastership "p1-midwait" || fail "P1: mastership/ARP not restorable mid-wait"
+        wait_handshake $((WG_HANDSHAKE_TIMEOUT_S / 2)) "P1" \
+            || fail "P1: no handshake within ${WG_HANDSHAKE_TIMEOUT_S}s (xpf initiator vs kernel responder)"
+    fi
     ish "${PEER}" "wg show ${WG_KERNEL_IFACE}" > "${EVID}/p1-wg-show.txt"
     pass "P1 initiator handshake (fw0-only wg0 + bind; fw1 clean)"
 }
@@ -578,7 +664,7 @@ test_p6() {
     ish "${FW0}" 'systemctl restart xpfd'
     sleep 15
     ish "${FW0}" 'systemctl is-active xpfd' | grep -q active || fail "P6: xpfd failed to restart"
-    wait_node0_primary 36 || fail "P6: node0 did not regain RG0 mastership after restart"
+    ensure_wg_mastership "p6" || fail "P6: WG VIP not restored after restart + failback"
     local pre post
     pre=$(ish "${PEER}" "wg show ${WG_KERNEL_IFACE} latest-handshakes | awk '{print \$2}'")
     if wait_handshake $((WG_RESTART_RECOVER_S * 2)) "P6-noflush"; then
@@ -631,7 +717,7 @@ teardown() {
     # silently fails leaves a poisoned cluster for the next run
     # (AGY PR-review F2 — observed live as a "node is not primary"
     # refusal reported as PASS).
-    wait_node0_primary 36 || fail "teardown: node0 not RG0 primary — cannot remove the stanza"
+    ensure_wg_mastership "teardown" || fail "teardown: WG VIP/mastership not restorable — cannot commit the stanza removal"
     fw0_cli > "${EVID}/teardown-commit.txt" 2>&1 <<EOF
 configure
 delete groups node0 interfaces wg0

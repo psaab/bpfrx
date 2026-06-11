@@ -124,10 +124,20 @@ that fw1 has neither a `wg0` netdev nor a `:51820` bind, and fails hard
   as a P4a tail blackout that was NOT a WireGuard bug. Before a run,
   check `/etc/xpf/.config.journal` on fw0 is quiet; if a phase dies
   mid-run, re-check it before triaging the engine.
-- **First WG commit after a daemon start brings the engine up late**
-  (next binding-reconcile pass, not synchronously — the listen-port
-  shim flag makes that apply a plan change). The harness budgets 90 s
-  for P1/P3; a second identical commit is instant. Tracked with #1866.
+- **The WG outer VIP is the real mastership predicate.** After any
+  xpfd restart/deploy, fw0 comes up SECONDARY on ALL redundancy groups
+  (preempt off) and 10.0.61.1 is removed from ge-0-0-1; the kernel then
+  fails every WG send with a SILENT EINVAL (no route/source — visible
+  only via strace or the RecentExceptions ring, #1865), so the tunnel
+  looks dead-air while `show chassis cluster status` can still read
+  "node0 primary" for RG0. The engine itself is fine: it keeps
+  initiating at 1/s and handshakes within seconds of the VIP returning
+  (root-caused live 2026-06-11). The harness gates every phase on
+  `ensure_wg_mastership` (VIP-present check + all-RG failback); when
+  driving manually, fail back EVERY RG, not just RG0:
+  `request chassis cluster failover redundancy-group <0|1|2> node 0`.
+  This mechanism also retro-explains the earlier "first commit after a
+  daemon start brings the engine up late" observation.
 - **Config removal leaks the control thread + port** (#1866): the
   harness preflight self-cleans the leaked TUN and P1 restarts xpfd if
   the listen port is still pinned with no stanza present.
