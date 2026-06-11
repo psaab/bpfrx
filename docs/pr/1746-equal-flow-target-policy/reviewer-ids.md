@@ -24,3 +24,6 @@
 - Copilot: attempts 1-2 failed with quota-limit responses
   (copilot-pull-request-reviewer[bot] COMMENTED "reached their quota
   limit" twice); retry 3 requested via comment + re-request API.
+- Copilot retry 3 outcome: third quota-limit response from
+  copilot-pull-request-reviewer[bot] (3 documented attempts total) —
+  3-of-4 fallback applies per feedback_codex_infra_must_retry.
