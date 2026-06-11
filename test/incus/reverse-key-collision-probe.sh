@@ -44,9 +44,11 @@
 # Usage:
 #   ./test/incus/reverse-key-collision-probe.sh [warm|cold]
 #
-# Run under the shared-cluster flock per project convention:
-#   flock /tmp/xpf-cluster.lock sg incus-admin -c \
-#     "./test/incus/reverse-key-collision-probe.sh warm"
+# Run inside a shared-cluster lock cell (#1875 — the raw outer-flock
+# pattern is deprecated; with-cluster.sh adds holder visibility and is
+# nesting-safe):
+#   ./test/incus/with-cluster.sh "reverse-key probe" -- \
+#     sg incus-admin -c "./test/incus/reverse-key-collision-probe.sh warm"
 set -euo pipefail
 
 VARIANT="${1:-warm}"
