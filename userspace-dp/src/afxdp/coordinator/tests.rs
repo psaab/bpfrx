@@ -2120,3 +2120,326 @@ fn aggregate_cos_statuses_max_merges_sojourn_across_worker_snapshots() {
         "windowed min (the gate metric) must MAX-merge across workers",
     );
 }
+
+// ---------------------------------------------------------------------
+// #1866 — WG control-thread teardown / lifecycle regression suite.
+//
+// These tests drive the REAL spawn path: refresh_runtime_snapshot
+// spawns an actual control thread that binds the listen UDP port and
+// then fails open_tun (no TUN device in the test environment) and
+// exits — which is exactly the early-exit shape the tombstone
+// machinery must handle. Each test uses a unique listen port so the
+// suite can run in parallel.
+// ---------------------------------------------------------------------
+
+const WG1866_PRIVKEY_A: &str =
+    "a01010101010101010101010101010101010101010101010101010101010101a";
+const WG1866_PRIVKEY_B: &str =
+    "c03030303030303030303030303030303030303030303030303030303030303c";
+const WG1866_PUBKEY: &str =
+    "b02020202020202020202020202020202020202020202020202020202020202b";
+
+fn wg1866_snapshot(id: u16, ifindex: i32, name: &str, port: u16, privkey: &str) -> ConfigSnapshot {
+    ConfigSnapshot {
+        interfaces: vec![crate::protocol::snapshot::InterfaceSnapshot {
+            name: name.to_string(),
+            linux_name: name.to_string(),
+            ifindex,
+            tunnel: true,
+            ..Default::default()
+        }],
+        tunnel_endpoints: vec![crate::protocol::snapshot::TunnelEndpointSnapshot {
+            id,
+            interface: name.to_string(),
+            linux_name: name.to_string(),
+            ifindex,
+            mode: "wireguard".to_string(),
+            wg_listen_port: port,
+            wg_local_privkey_hex: privkey.to_string(),
+            wg_peer_pubkey_hex: WG1866_PUBKEY.to_string(),
+            wg_allowed_ips: vec!["10.77.0.0/24".to_string()],
+            wg_endpoint: "127.0.0.1:9".to_string(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+/// Drive the finished sweep until the entry for `id` is a tombstone
+/// (its real thread exited) or the timeout elapses.
+fn wg1866_wait_tombstone(coordinator: &mut Coordinator, id: u16, timeout_ms: u64) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        // None snapshot: sweep-only (the tombstone-only respawn needs a
+        // coherent snapshot, so this can never spawn).
+        coordinator.reconcile_wg_control_liveness(None);
+        match coordinator.wg_control_threads.get(&id) {
+            Some(entry) if entry.handle.is_none() => return true,
+            _ => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Plan §9 test 1 — removal prune: a snapshot refresh that drops the
+/// WG endpoint stops + joins the thread, removes the entry, and
+/// releases the listen port.
+#[test]
+fn wg1866_removal_refresh_prunes_thread_and_releases_port() {
+    let mut coordinator = Coordinator::new();
+    let port: u16 = 51871;
+    coordinator.refresh_runtime_snapshot(&wg1866_snapshot(1, 4242, "wgt1866a", port, WG1866_PRIVKEY_A));
+    assert!(
+        coordinator.wg_control_threads.contains_key(&1),
+        "WG control entry created on snapshot with WG endpoint"
+    );
+    coordinator.refresh_runtime_snapshot(&ConfigSnapshot::default());
+    assert!(
+        coordinator.wg_control_threads.is_empty(),
+        "removal refresh must prune the entry (stop+join)"
+    );
+    let bind = std::net::UdpSocket::bind(("0.0.0.0", port));
+    assert!(
+        bind.is_ok(),
+        "listen port must be released after removal: {:?}",
+        bind.err()
+    );
+}
+
+/// Plan §9 tests 2+3 — EADDRINUSE regression (rigged old behavior) +
+/// tombstone backoff: a thread that dies on a pre-bound port leaves a
+/// tombstone; the sweep does NOT retry within the backoff window and
+/// DOES retry past it once the port is free.
+#[test]
+fn wg1866_eaddrinuse_tombstone_backoff_and_retry() {
+    let mut coordinator = Coordinator::new();
+    let port: u16 = 51872;
+    // Rig the failure: a dual-stack [::]:port blocker occupies the port
+    // for BOTH of bind_wg_socket's attempts (v6 preferred, v4 fallback).
+    let blocker = std::net::UdpSocket::bind(("::", port)).expect("pre-bind");
+    let snap = wg1866_snapshot(1, 4242, "wgt1866b", port, WG1866_PRIVKEY_A);
+    coordinator.refresh_runtime_snapshot(&snap);
+    assert!(
+        coordinator.wg_control_threads.contains_key(&1),
+        "spawn attempt recorded even though bind will fail"
+    );
+    // The thread exits on EADDRINUSE; the sweep must tombstone, not drop.
+    assert!(
+        wg1866_wait_tombstone(&mut coordinator, 1, 2_000),
+        "EADDRINUSE thread must become a tombstone"
+    );
+    let stamp_after_fail = coordinator
+        .wg_control_threads
+        .get(&1)
+        .expect("tombstone entry retained")
+        .last_spawn_attempt_ns;
+    // Within the backoff window: no respawn even with a coherent
+    // snapshot and the port now free.
+    drop(blocker);
+    coordinator.reconcile_wg_control_liveness(Some(&snap));
+    let entry = coordinator.wg_control_threads.get(&1).expect("entry kept");
+    assert!(entry.handle.is_none(), "no respawn within the 3s backoff");
+    assert_eq!(
+        entry.last_spawn_attempt_ns, stamp_after_fail,
+        "backoff stamp unchanged while gated"
+    );
+    // Force past the backoff (tests own the entry — no 3s sleep).
+    coordinator
+        .wg_control_threads
+        .get_mut(&1)
+        .expect("entry")
+        .last_spawn_attempt_ns = 0;
+    coordinator.reconcile_wg_control_liveness(Some(&snap));
+    let entry = coordinator.wg_control_threads.get(&1).expect("entry kept");
+    assert!(
+        entry.handle.is_some(),
+        "tombstone respawned past backoff with a coherent snapshot"
+    );
+    assert!(entry.last_spawn_attempt_ns > 0, "attempt re-stamped");
+}
+
+/// Plan §9 test 4 — the #1866 headline contract: remove then re-add
+/// the SAME identity; the re-add must spawn a fresh thread (no dead
+/// entry shadowing, no EADDRINUSE from a leaked holder).
+#[test]
+fn wg1866_remove_then_readd_same_identity_respawns() {
+    let mut coordinator = Coordinator::new();
+    let port: u16 = 51873;
+    let snap = wg1866_snapshot(1, 4242, "wgt1866c", port, WG1866_PRIVKEY_A);
+    coordinator.refresh_runtime_snapshot(&snap);
+    assert!(coordinator.wg_control_threads.contains_key(&1));
+    coordinator.refresh_runtime_snapshot(&ConfigSnapshot::default());
+    assert!(coordinator.wg_control_threads.is_empty());
+    coordinator.refresh_runtime_snapshot(&snap);
+    let entry = coordinator
+        .wg_control_threads
+        .get(&1)
+        .expect("re-add with the same identity must create a fresh entry");
+    assert!(entry.handle.is_some(), "fresh thread spawned on re-add");
+}
+
+/// Plan §9 test 5 — stop-gate shape: stop() clears all entries and a
+/// subsequent sweep (tombstone-only) cannot create any, even with a
+/// coherent snapshot in hand.
+#[test]
+fn wg1866_sweep_cannot_spawn_after_stop() {
+    let mut coordinator = Coordinator::new();
+    let port: u16 = 51874;
+    let snap = wg1866_snapshot(1, 4242, "wgt1866d", port, WG1866_PRIVKEY_A);
+    coordinator.refresh_runtime_snapshot(&snap);
+    assert!(coordinator.wg_control_threads.contains_key(&1));
+    coordinator.stop();
+    assert!(coordinator.wg_control_threads.is_empty(), "stop clears entries");
+    for _ in 0..3 {
+        coordinator.reconcile_wg_control_liveness(Some(&snap));
+    }
+    assert!(
+        coordinator.wg_control_threads.is_empty(),
+        "tombstone-only sweep must never create entries after stop"
+    );
+}
+
+/// Plan §9 tests 6+6b — defer-workers prune (Change 2b / D4) + F7
+/// regression: the prune stops the thread WITHOUT touching forwarding,
+/// and the sweep must NOT resurrect it from the stale forwarding state.
+#[test]
+fn wg1866_defer_prune_releases_port_and_sweep_does_not_resurrect() {
+    let mut coordinator = Coordinator::new();
+    let port: u16 = 51875;
+    let snap = wg1866_snapshot(1, 4242, "wgt1866e", port, WG1866_PRIVKEY_A);
+    coordinator.refresh_runtime_snapshot(&snap);
+    assert!(coordinator.wg_control_threads.contains_key(&1));
+    // Defer-branch apply removed the endpoint: narrow prune only.
+    let removed = ConfigSnapshot::default();
+    coordinator.prune_wg_control_threads_for_snapshot(&removed);
+    assert!(
+        coordinator.wg_control_threads.is_empty(),
+        "defer prune must stop+join+remove the entry"
+    );
+    assert!(
+        coordinator.forwarding.tunnel_endpoints.contains_key(&1),
+        "defer prune must NOT touch the (intentionally stale) forwarding state"
+    );
+    let bind = std::net::UdpSocket::bind(("0.0.0.0", port));
+    assert!(bind.is_ok(), "port released by the defer prune: {:?}", bind.err());
+    // F7 regression: repeated sweeps against the STORED (endpoint-free)
+    // snapshot must not resurrect the thread from stale forwarding.
+    for _ in 0..3 {
+        coordinator.reconcile_wg_control_liveness(Some(&removed));
+    }
+    assert!(
+        coordinator.wg_control_threads.is_empty(),
+        "tombstone-only sweep must not resurrect a defer-pruned endpoint"
+    );
+}
+
+/// Plan §9 test 6c — Codex r3 regression: a tombstone whose latest
+/// STORED snapshot row carries a DIFFERENT crypto identity must not
+/// respawn from the stale forwarding state during a defer window.
+#[test]
+fn wg1866_sweep_suppresses_stale_identity_respawn_under_defer() {
+    let mut coordinator = Coordinator::new();
+    let port: u16 = 51876;
+    let snap_a = wg1866_snapshot(1, 4242, "wgt1866f", port, WG1866_PRIVKEY_A);
+    coordinator.refresh_runtime_snapshot(&snap_a);
+    assert!(wg1866_wait_tombstone(&mut coordinator, 1, 2_000), "open_tun failure tombstones");
+    // Defer window: stored snapshot re-keys id 1 to identity B while
+    // forwarding still holds identity A. Force past the backoff.
+    let snap_b = wg1866_snapshot(1, 4242, "wgt1866f", port, WG1866_PRIVKEY_B);
+    coordinator
+        .wg_control_threads
+        .get_mut(&1)
+        .expect("tombstone")
+        .last_spawn_attempt_ns = 0;
+    coordinator.reconcile_wg_control_liveness(Some(&snap_b));
+    let entry = coordinator.wg_control_threads.get(&1).expect("tombstone kept");
+    assert!(
+        entry.handle.is_none(),
+        "sweep must not respawn identity A when the stored snapshot says identity B"
+    );
+    // The coherent apply with B then restarts cleanly (engine changed
+    // => stale prune => fresh spawn).
+    coordinator.refresh_runtime_snapshot(&snap_b);
+    let entry = coordinator.wg_control_threads.get(&1).expect("entry after B apply");
+    assert!(entry.handle.is_some(), "identity B spawns at the coherent apply");
+}
+
+/// Plan §9 test 6d — Codex r4 regression: same id, same crypto
+/// identity, RENAMED interface in the stored snapshot — the sweep must
+/// not respawn the OLD attachment from stale forwarding.
+#[test]
+fn wg1866_sweep_suppresses_stale_attachment_respawn_under_defer() {
+    let mut coordinator = Coordinator::new();
+    let port: u16 = 51877;
+    let snap_a = wg1866_snapshot(1, 4242, "wgt1866g", port, WG1866_PRIVKEY_A);
+    coordinator.refresh_runtime_snapshot(&snap_a);
+    assert!(wg1866_wait_tombstone(&mut coordinator, 1, 2_000), "open_tun failure tombstones");
+    // Stored snapshot renames the interface (same id + identity).
+    let snap_renamed = wg1866_snapshot(1, 4243, "wgt1866h", port, WG1866_PRIVKEY_A);
+    coordinator
+        .wg_control_threads
+        .get_mut(&1)
+        .expect("tombstone")
+        .last_spawn_attempt_ns = 0;
+    coordinator.reconcile_wg_control_liveness(Some(&snap_renamed));
+    let entry = coordinator.wg_control_threads.get(&1).expect("tombstone kept");
+    assert!(
+        entry.handle.is_none(),
+        "sweep must not respawn the old TUN attachment when the stored snapshot renamed it"
+    );
+}
+
+/// Plan §9 test 6e — D5 regression (pre-existing master gap): an
+/// apply-time interface rename with an UNCHANGED crypto identity must
+/// restart the thread on the new TUN attachment (the reused engine Arc
+/// alone must not keep the old thread).
+#[test]
+fn wg1866_apply_time_rename_restarts_thread_on_new_attachment() {
+    let mut coordinator = Coordinator::new();
+    let port: u16 = 51878;
+    coordinator.refresh_runtime_snapshot(&wg1866_snapshot(1, 4242, "wgt1866i", port, WG1866_PRIVKEY_A));
+    let entry = coordinator.wg_control_threads.get(&1).expect("entry");
+    assert_eq!(entry.spawned_tunnel_name, "wgt1866i");
+    // Rename (same id, same identity): engine Arc is REUSED, but the
+    // attachment-aware stale prune must restart the thread.
+    coordinator.refresh_runtime_snapshot(&wg1866_snapshot(1, 4243, "wgt1866j", port, WG1866_PRIVKEY_A));
+    let entry = coordinator.wg_control_threads.get(&1).expect("entry after rename");
+    assert_eq!(
+        entry.spawned_tunnel_name, "wgt1866j",
+        "rename must stop the old thread and spawn against the new TUN"
+    );
+    assert_eq!(entry.spawned_ifindex, 4243);
+}
+
+/// PR #1872 Codex code-r1 F2 regression: rows whose `linux_name` is
+/// empty resolve their forwarding label from the logical name
+/// (forwarding_build/interfaces.rs fallback) — the tombstone-respawn
+/// coherence check must apply the SAME fallback or self-heal never
+/// fires for such rows.
+#[test]
+fn wg1866_sweep_respawns_with_empty_linux_name_rows() {
+    let mut coordinator = Coordinator::new();
+    let port: u16 = 51880;
+    let mut snap = wg1866_snapshot(1, 4244, "wgt1866k", port, WG1866_PRIVKEY_A);
+    snap.interfaces[0].linux_name = String::new();
+    snap.tunnel_endpoints[0].linux_name = String::new();
+    coordinator.refresh_runtime_snapshot(&snap);
+    assert!(
+        wg1866_wait_tombstone(&mut coordinator, 1, 2_000),
+        "open_tun failure tombstones"
+    );
+    coordinator
+        .wg_control_threads
+        .get_mut(&1)
+        .expect("tombstone")
+        .last_spawn_attempt_ns = 0;
+    coordinator.reconcile_wg_control_liveness(Some(&snap));
+    let entry = coordinator.wg_control_threads.get(&1).expect("entry");
+    assert!(
+        entry.handle.is_some(),
+        "coherence check must accept the empty-linux_name fallback label and respawn"
+    );
+}

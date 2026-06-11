@@ -124,6 +124,10 @@ type Manager struct {
 	lastRSTAttempt    time.Time
 	lastRSTInstallOK  bool
 	lastSnapshotHash  [32]byte // content hash of last published snapshot (excludes volatile fields)
+	// #1866 D3: canonical summary of the WG endpoint set in the last
+	// successfully published snapshot, for publish-boundary transition
+	// logging (logWgEndpointSetTransitionLocked).
+	lastPublishedWgEndpoints string
 	// #1197: O(1) neighbor lookup index for the listener hot path.
 	// Keyed by (ifindex, ip-string). Rebuilt whenever lastSnapshot.Neighbors
 	// is replaced. Read under m.mu (existing snapshot lock).
@@ -661,6 +665,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	if err := m.requestLocked(ControlRequest{Type: "apply_snapshot", Snapshot: &publishSnap}, &status); err != nil {
 		return result, fmt.Errorf("publish userspace snapshot: %w", err)
 	}
+	m.logWgEndpointSetTransitionLocked(&publishSnap, "apply")
 	m.lastSnapshot = snap
 	// #1197 v4: apply_snapshot succeeded — userspace-dp has the
 	// new neighbors. NOW rebuild listener caches; before this
@@ -742,6 +747,7 @@ func (m *Manager) UpdatePolicyScheduleState(cfg *config.Config, activeState map[
 		slog.Warn("userspace: failed to publish policy scheduler state", "err", err)
 		return
 	}
+	m.logWgEndpointSetTransitionLocked(&publishSnap, "policy-scheduler")
 	m.generation = nextGeneration
 	m.lastSnapshot = &next
 	m.rebuildNeighborIndex()
@@ -859,6 +865,7 @@ func (m *Manager) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []conf
 	if err := m.requestLocked(ControlRequest{Type: "apply_snapshot", Snapshot: &publishSnap}, &status); err != nil {
 		return false, fmt.Errorf("publish route overlay snapshot: %w", err)
 	}
+	m.logWgEndpointSetTransitionLocked(&publishSnap, "route-overlay")
 	m.generation = nextGeneration
 	m.lastSnapshot = &next
 	m.rebuildNeighborIndex()

@@ -49,43 +49,24 @@ pub(super) fn populate_tunnel_endpoints(
         // WireGuard field hydration (#1432 S2a). On any malformed key the
         // endpoint is dropped — a WG tunnel with a bad local privkey or
         // peer pubkey cannot function and must not silently install a
-        // half-configured engine.
+        // half-configured engine. The hydration gates live in
+        // `hydrate_wg_identity` (#1866) so the coordinator's
+        // tombstone-respawn coherence check and the defer-branch prune
+        // can never drift from this path's semantics.
         let mut wg_local_privkey = zeroize::Zeroizing::new([0u8; 32]);
         let mut wg_peer_pubkey = [0u8; 32];
         let mut wg_allowed_ips: Vec<ipnet::IpNet> = Vec::new();
         let mut wg_endpoint: Option<SocketAddr> = None;
+        let mut wg_keepalive_secs = endpoint.wg_keepalive_secs;
         if is_wireguard {
-            // A WG tunnel with no listen port cannot bind a socket and is
-            // invisible to the shim steering gate (wg_listen_port == 0 ⇒
-            // "no WG"). Drop it rather than install a half-dead tunnel
-            // that binds port 0 (Codex MAJOR).
-            if endpoint.wg_listen_port == 0 {
+            let Some(identity) = hydrate_wg_identity(endpoint) else {
                 continue;
-            }
-            if decode_wg_key_hex(&endpoint.wg_local_privkey_hex, &mut wg_local_privkey).is_err() {
-                continue;
-            }
-            if decode_wg_key_hex(&endpoint.wg_peer_pubkey_hex, &mut wg_peer_pubkey).is_err() {
-                continue;
-            }
-            for cidr in &endpoint.wg_allowed_ips {
-                match cidr.parse::<ipnet::IpNet>() {
-                    Ok(net) => wg_allowed_ips.push(net),
-                    Err(_) => continue,
-                }
-            }
-            if !endpoint.wg_endpoint.is_empty() {
-                // Canonicalize (unmap ::ffff:a.b.c.d) so a configured
-                // v4-mapped literal gets the same logical-v4 treatment
-                // as a learned endpoint: correct (smaller) v4 MTU-guard
-                // overhead, v4 outer on the transit path, and a target
-                // the v4-fallback socket can send to (#1736 Codex r1).
-                wg_endpoint = endpoint
-                    .wg_endpoint
-                    .parse::<SocketAddr>()
-                    .ok()
-                    .map(crate::afxdp::wg::canonicalize_endpoint);
-            }
+            };
+            wg_local_privkey = identity.local_privkey;
+            wg_peer_pubkey = identity.peer_pubkey;
+            wg_allowed_ips = identity.allowed_ips;
+            wg_endpoint = identity.endpoint;
+            wg_keepalive_secs = identity.keepalive_secs;
         }
 
         state.tunnel_endpoints.insert(
@@ -106,7 +87,7 @@ pub(super) fn populate_tunnel_endpoints(
                 wg_peer_pubkey,
                 wg_allowed_ips,
                 wg_endpoint,
-                wg_keepalive_secs: endpoint.wg_keepalive_secs,
+                wg_keepalive_secs,
             },
         );
         state
@@ -116,6 +97,97 @@ pub(super) fn populate_tunnel_endpoints(
             state.has_wg_tunnels = true;
         }
     }
+}
+
+/// #1866: the hydratable WG identity of one tunnel-endpoint snapshot
+/// row — the exact field set `wg_identity_unchanged`
+/// (`forwarding_build/wg.rs`) keys engine reuse on, hydrated with the
+/// exact gates `populate_tunnel_endpoints` applies. Single source of
+/// truth shared by the populate pass, the coordinator's
+/// tombstone-respawn coherence check, and the defer-branch prune.
+pub(in crate::afxdp) struct WgRowIdentity {
+    pub(in crate::afxdp) local_privkey: zeroize::Zeroizing<[u8; 32]>,
+    pub(in crate::afxdp) peer_pubkey: [u8; 32],
+    pub(in crate::afxdp) allowed_ips: Vec<ipnet::IpNet>,
+    pub(in crate::afxdp) endpoint: Option<SocketAddr>,
+    pub(in crate::afxdp) listen_port: u16,
+    pub(in crate::afxdp) keepalive_secs: u16,
+}
+
+impl WgRowIdentity {
+    /// Whether this row identity is byte-identical to a hydrated
+    /// runtime endpoint — the same tuple `wg_identity_unchanged`
+    /// compares for engine-Arc reuse.
+    pub(in crate::afxdp) fn matches_endpoint(&self, ep: &TunnelEndpoint) -> bool {
+        self.listen_port == ep.wg_listen_port
+            && *self.local_privkey == *ep.wg_local_privkey
+            && self.peer_pubkey == ep.wg_peer_pubkey
+            && self.allowed_ips == ep.wg_allowed_ips
+            && self.endpoint == ep.wg_endpoint
+            && self.keepalive_secs == ep.wg_keepalive_secs
+    }
+}
+
+/// #1866: hydrate the WG identity of a snapshot row, applying the SAME
+/// gates as `populate_tunnel_endpoints`' WireGuard arm: mode must be
+/// "wireguard", listen_port must be nonzero, both keys must decode.
+/// Individually-invalid allowed-ips CIDRs are skipped (the row is
+/// kept), and an unparsable/empty `wg_endpoint` hydrates to `None`
+/// (responder-only) — neither disqualifies the row.
+///
+/// Returns `None` for non-WG rows and for rows the populate pass would
+/// drop. Callers needing the populate pass's id/ifindex gates
+/// (`id != 0 && ifindex > 0`) must check those separately.
+pub(in crate::afxdp) fn hydrate_wg_identity(
+    row: &crate::protocol::snapshot::TunnelEndpointSnapshot,
+) -> Option<WgRowIdentity> {
+    if row.mode != "wireguard" {
+        return None;
+    }
+    // A WG tunnel with no listen port cannot bind a socket and is
+    // invisible to the shim steering gate (wg_listen_port == 0 ⇒
+    // "no WG"). Drop it rather than install a half-dead tunnel
+    // that binds port 0 (Codex MAJOR, #1432).
+    if row.wg_listen_port == 0 {
+        return None;
+    }
+    let mut local_privkey = zeroize::Zeroizing::new([0u8; 32]);
+    if decode_wg_key_hex(&row.wg_local_privkey_hex, &mut local_privkey).is_err() {
+        return None;
+    }
+    let mut peer_pubkey = [0u8; 32];
+    if decode_wg_key_hex(&row.wg_peer_pubkey_hex, &mut peer_pubkey).is_err() {
+        return None;
+    }
+    let mut allowed_ips: Vec<ipnet::IpNet> = Vec::new();
+    for cidr in &row.wg_allowed_ips {
+        match cidr.parse::<ipnet::IpNet>() {
+            Ok(net) => allowed_ips.push(net),
+            Err(_) => continue,
+        }
+    }
+    let mut endpoint: Option<SocketAddr> = None;
+    if !row.wg_endpoint.is_empty() {
+        // Canonicalize (unmap ::ffff:a.b.c.d) so a configured v4-mapped
+        // literal gets the same logical-v4 treatment as a learned
+        // endpoint: correct (smaller) v4 MTU-guard overhead, v4 outer on
+        // the transit path, and a target the v4-fallback socket can send
+        // to (#1736 Codex r1; folded into the #1866 hydrate helper at
+        // the #1868/#1872 merge).
+        endpoint = row
+            .wg_endpoint
+            .parse::<SocketAddr>()
+            .ok()
+            .map(crate::afxdp::wg::canonicalize_endpoint);
+    }
+    Some(WgRowIdentity {
+        local_privkey,
+        peer_pubkey,
+        allowed_ips,
+        endpoint,
+        listen_port: row.wg_listen_port,
+        keepalive_secs: row.wg_keepalive_secs,
+    })
 }
 
 /// Decode a 64-char hex WG key into a 32-byte array. Returns `Err` on

@@ -41,6 +41,10 @@ pub(in crate::afxdp) use fib::{
     parse_route_next_hop_v6, resolve_ifindex, resolve_route_target_v4, resolve_route_target_v6,
 };
 pub(in crate::afxdp) use interfaces::{pick_interface_v4, pick_interface_v6};
+// #1866: WG row-identity hydration shared with the coordinator's
+// tombstone-respawn coherence check + defer-branch prune. (The
+// `WgRowIdentity` type itself is only named inside `tunnels`.)
+pub(in crate::afxdp) use tunnels::hydrate_wg_identity;
 
 // Plain (private) `use` for orchestrator-local symbols. NOT a
 // `pub(super) use` of a `pub(super)` item — that triggers E0364

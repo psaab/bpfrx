@@ -24,17 +24,55 @@ pub(in crate::afxdp) use session_manager::SessionManager;
 use supervisor::spawn_supervised_aux;
 pub(in crate::afxdp) use worker_manager::WorkerManager;
 
+/// #1866: minimum interval between WG control-thread spawn ATTEMPTS for
+/// one endpoint id (durable across thread exit via the tombstone entry).
+/// Bounds the retry/exception cadence under a persistently-failing bind
+/// (e.g. EADDRINUSE against a host kernel wgX) without ever giving up.
+pub(crate) const WG_SPAWN_BACKOFF_NS: u64 = 3_000_000_000;
+
+/// #1866 D3: canonical `id:port@ifindex` summary of a forwarding
+/// state's WireGuard endpoint set, for transition logging.
+fn wg_endpoint_set_summary(state: &ForwardingState) -> String {
+    let mut parts: Vec<String> = state
+        .tunnel_endpoints
+        .values()
+        .filter(|ep| ep.mode == "wireguard")
+        .map(|ep| format!("{}:{}@{}", ep.id, ep.wg_listen_port, ep.logical_ifindex))
+        .collect();
+    parts.sort();
+    parts.join(",")
+}
+
+/// #1866 D3: log a WG endpoint-set transition between two forwarding
+/// states. Silent when the set is unchanged (the common case) — fires
+/// only on real add/remove/port/attachment changes, so the cadence is
+/// state-transition-only per the logging rules.
+pub(in crate::afxdp) fn log_wg_endpoint_set_transition(
+    path: &str,
+    old: &ForwardingState,
+    new: &ForwardingState,
+) {
+    let old_set = wg_endpoint_set_summary(old);
+    let new_set = wg_endpoint_set_summary(new);
+    if old_set != new_set {
+        eprintln!(
+            "xpf-userspace-dp: WG endpoint set changed ({path}): [{old_set}] => [{new_set}]"
+        );
+    }
+}
+
 pub struct Coordinator {
     pub(crate) bpf_maps: BpfMaps,
     pub(crate) slow_path: Option<Arc<SlowPathReinjector>>,
     pub(crate) local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>>,
     pub(crate) tunnel_sources: BTreeMap<u16, LocalTunnelSourceHandle>,
-    /// #1432 S2a: WG control threads keyed by tunnel_endpoint_id. The
-    /// `usize` is the address of the `Arc<WgEngine>` the thread was
-    /// spawned with, so the runtime-refresh reconcile can detect a
-    /// config change (fresh engine ⇒ different Arc ⇒ restart) vs an
-    /// unchanged endpoint (reused Arc ⇒ keep the thread running).
-    pub(crate) wg_control_threads: BTreeMap<u16, (LocalTunnelSourceHandle, usize)>,
+    /// #1432 S2a / #1866: WG control-thread lifecycle entries keyed by
+    /// tunnel_endpoint_id. Each entry records the engine Arc address +
+    /// TUN attachment the thread was spawned with (so the apply-time
+    /// stale prune detects identity AND attachment changes), survives
+    /// thread exit as a tombstone carrying the respawn backoff stamp,
+    /// and is removed only when the endpoint leaves the desired set.
+    pub(crate) wg_control_threads: BTreeMap<u16, WgControlEntry>,
     pub(crate) last_slow_path_status: SlowPathStatus,
     pub(in crate::afxdp) ha: HaState,
     pub(crate) cos: SharedCoSState,
@@ -251,12 +289,18 @@ impl Coordinator {
         // #1432 S2a: stop + join WG control threads. The persistent wgN
         // TUN is owned by the Go control plane and intentionally NOT
         // torn down here (it must survive a reload — AGY r3 Hazard B).
-        for (handle, _) in self.wg_control_threads.values_mut() {
-            handle.stop.store(true, Ordering::Relaxed);
+        // #1866: tombstones are cleared too — after a stop the next
+        // reconcile re-legitimates entries from a coherent snapshot.
+        for entry in self.wg_control_threads.values_mut() {
+            if let Some(handle) = entry.handle.as_ref() {
+                handle.stop.store(true, Ordering::Relaxed);
+            }
         }
-        for (_, (handle, _)) in self.wg_control_threads.iter_mut() {
-            if let Some(join) = handle.join.take() {
-                let _ = join.join();
+        for entry in self.wg_control_threads.values_mut() {
+            if let Some(handle) = entry.handle.as_mut() {
+                if let Some(join) = handle.join.take() {
+                    let _ = join.join();
+                }
             }
         }
         self.wg_control_threads.clear();
@@ -481,19 +525,30 @@ impl Coordinator {
             .store(Arc::new(local_tunnel_deliveries));
     }
 
-    /// #1432 S2a: reconcile WG control threads against the current
-    /// `forwarding.wg_engines`. Called from both initial worker bring-up
-    /// AND `refresh_runtime_snapshot` (Copilot C1: a same-plan apply that
-    /// adds/removes/changes a WG endpoint must not leave stale threads).
+    /// #1432 S2a / #1866: reconcile WG control threads against the
+    /// current `forwarding.wg_engines`. Called from both initial worker
+    /// bring-up AND `refresh_runtime_snapshot` (Copilot C1: a same-plan
+    /// apply that adds/removes/changes a WG endpoint must not leave
+    /// stale threads). Three passes, in order:
     ///
-    /// Per endpoint id:
-    ///   - running thread whose endpoint vanished, is no longer WG, or
-    ///     whose engine `Arc` address changed (a config change rebuilt a
-    ///     fresh engine — `forwarding_build::wg`) ⇒ stop + join + drop.
-    ///   - a WG engine with no running thread (or just stopped above) ⇒
-    ///     spawn a fresh control thread bound to the current engine.
+    ///   1. Finished sweep — a thread that exited (bind/TUN failure,
+    ///      panic, clean stop) leaves a TOMBSTONE retaining the entry's
+    ///      backoff stamp + identity (#1866 D1: a dead entry must not
+    ///      permanently block respawn under an unchanged identity).
+    ///   2. Stale prune — endpoint vanished, engine `Arc` address
+    ///      changed, or TUN attachment changed (#1866 D5: an interface
+    ///      rename with an unchanged crypto identity must restart the
+    ///      thread on the new TUN) ⇒ stop + join + remove the entry.
+    ///      Entries (including tombstones) are removed here and ONLY
+    ///      here, so backoff state survives everything except a real
+    ///      desired-set change.
+    ///   3. Spawn — desired endpoints with no entry (new: immediate) or
+    ///      a tombstone (respawn: gated by `WG_SPAWN_BACKOFF_NS`).
+    ///
     /// An unchanged endpoint (reused engine Arc, §4.2) keeps its thread.
     fn spawn_wg_control_threads(&mut self) {
+        self.sweep_finished_wg_control_threads();
+
         // Current WG engines keyed by id, with their Arc address identity.
         let mut desired: BTreeMap<u16, usize> = BTreeMap::new();
         for endpoint in self.forwarding.tunnel_endpoints.values() {
@@ -505,93 +560,323 @@ impl Coordinator {
             }
         }
 
-        // Stop + join threads that are stale (gone, or engine Arc changed).
-        let stale: Vec<u16> = self
+        // Stale prune: gone, engine Arc changed, or attachment changed.
+        let mut stale: Vec<(u16, &'static str)> = Vec::new();
+        for (id, entry) in self.wg_control_threads.iter() {
+            let reason = match desired.get(id) {
+                None => Some("removed"),
+                Some(&ptr) if ptr != entry.engine_ptr => Some("engine_changed"),
+                Some(_) => {
+                    let attach_ok = self
+                        .forwarding
+                        .tunnel_endpoints
+                        .get(id)
+                        .is_some_and(|ep| {
+                            ep.logical_ifindex == entry.spawned_ifindex
+                                && self
+                                    .forwarding
+                                    .ifindex_to_name
+                                    .get(&ep.logical_ifindex)
+                                    .is_some_and(|name| *name == entry.spawned_tunnel_name)
+                        });
+                    if attach_ok {
+                        None
+                    } else {
+                        Some("attachment_changed")
+                    }
+                }
+            };
+            if let Some(reason) = reason {
+                stale.push((*id, reason));
+            }
+        }
+        for (id, reason) in stale {
+            self.stop_remove_wg_control_entry(id, reason);
+        }
+
+        // Spawn pass (apply-time only — the periodic sweep never creates
+        // entries; see reconcile_wg_control_liveness).
+        let now = monotonic_nanos();
+        let ids: Vec<u16> = desired.keys().copied().collect();
+        for id in ids {
+            match self.wg_control_threads.get(&id) {
+                Some(entry) if entry.handle.is_some() => continue, // live
+                Some(entry)
+                    if now.saturating_sub(entry.last_spawn_attempt_ns)
+                        < WG_SPAWN_BACKOFF_NS =>
+                {
+                    continue; // tombstone within backoff
+                }
+                _ => {}
+            }
+            self.spawn_one_wg_control_thread(id);
+        }
+    }
+
+    /// #1866 pass 1: join threads that already exited and tombstone
+    /// their entries (keep backoff stamp + identity; never remove).
+    fn sweep_finished_wg_control_threads(&mut self) {
+        let finished: Vec<u16> = self
             .wg_control_threads
             .iter()
-            .filter(|(id, (_, engine_ptr))| desired.get(id) != Some(engine_ptr))
+            .filter(|(_, entry)| {
+                entry
+                    .handle
+                    .as_ref()
+                    .is_some_and(|h| h.join.as_ref().is_none_or(|j| j.is_finished()))
+            })
             .map(|(id, _)| *id)
             .collect();
-        for id in stale {
-            if let Some((mut handle, _)) = self.wg_control_threads.remove(&id) {
+        for id in finished {
+            if let Some(entry) = self.wg_control_threads.get_mut(&id) {
+                if let Some(mut handle) = entry.handle.take() {
+                    handle.stop.store(true, Ordering::Relaxed);
+                    if let Some(join) = handle.join.take() {
+                        let _ = join.join();
+                    }
+                }
+                eprintln!(
+                    "xpf-userspace-dp: WG control thread exited endpoint={id} tun={} — tombstoned (respawn if still configured)",
+                    entry.spawned_tunnel_name
+                );
+            }
+        }
+    }
+
+    /// #1866 pass 2 helper: stop + join + REMOVE one entry (live thread
+    /// or tombstone). The only place entries leave the map besides
+    /// `stop_inner` and the defer-branch snapshot prune.
+    fn stop_remove_wg_control_entry(&mut self, id: u16, reason: &str) {
+        if let Some(mut entry) = self.wg_control_threads.remove(&id) {
+            if let Some(mut handle) = entry.handle.take() {
                 handle.stop.store(true, Ordering::Relaxed);
                 if let Some(join) = handle.join.take() {
                     let _ = join.join();
                 }
             }
-        }
-
-        // Spawn threads for WG engines that have none running.
-        for endpoint in self.forwarding.tunnel_endpoints.values() {
-            if endpoint.mode != "wireguard" {
-                continue;
-            }
-            let id = endpoint.id;
-            if self.wg_control_threads.contains_key(&id) {
-                continue;
-            }
-            let Some(engine) = self.forwarding.wg_engines.get(&id).cloned() else {
-                continue;
-            };
-            let engine_ptr = Arc::as_ptr(&engine) as usize;
-            let Some(tunnel_name) = self
-                .forwarding
-                .ifindex_to_name
-                .get(&endpoint.logical_ifindex)
-                .cloned()
-            else {
-                continue;
-            };
-            let stop = Arc::new(AtomicBool::new(false));
-            let stop_clone = stop.clone();
-            let recent_exceptions = self.recent_exceptions.clone();
-            let tunnel_endpoint_id = id;
-            let listen_port = endpoint.wg_listen_port;
-            let peer_endpoint = endpoint.wg_endpoint;
-            let thread_tunnel_name = tunnel_name.clone();
-            let join = spawn_supervised_aux(
-                format!("xpf-wg-control-{tunnel_name}"),
-                move || {
-                    wg_control::wg_control_loop(
-                        thread_tunnel_name,
-                        tunnel_endpoint_id,
-                        engine,
-                        listen_port,
-                        peer_endpoint,
-                        recent_exceptions,
-                        stop_clone,
-                    );
-                },
+            eprintln!(
+                "xpf-userspace-dp: stopped WG control thread endpoint={id} tun={} reason={reason}",
+                entry.spawned_tunnel_name
             );
-            match join {
-                Ok(join) => {
-                    self.wg_control_threads.insert(
-                        tunnel_endpoint_id,
-                        (
-                            LocalTunnelSourceHandle {
-                                stop,
-                                join: Some(join),
-                            },
-                            engine_ptr,
-                        ),
+        }
+    }
+
+    /// #1866 pass 3 helper: one spawn ATTEMPT for endpoint `id` against
+    /// the CURRENT forwarding state. Records the entry (live handle or
+    /// failure tombstone) with the attempt stamped either way, so a
+    /// failing spawn is retried no faster than `WG_SPAWN_BACKOFF_NS`.
+    /// Socket bind + TUN open happen INSIDE the spawned aux thread —
+    /// never on the control-socket thread (#1866 plan §7).
+    fn spawn_one_wg_control_thread(&mut self, id: u16) {
+        let Some(endpoint) = self.forwarding.tunnel_endpoints.get(&id) else {
+            return;
+        };
+        if endpoint.mode != "wireguard" {
+            return;
+        }
+        let Some(engine) = self.forwarding.wg_engines.get(&id).cloned() else {
+            return;
+        };
+        let engine_ptr = Arc::as_ptr(&engine) as usize;
+        let Some(tunnel_name) = self
+            .forwarding
+            .ifindex_to_name
+            .get(&endpoint.logical_ifindex)
+            .cloned()
+        else {
+            return;
+        };
+        let spawned_ifindex = endpoint.logical_ifindex;
+        let listen_port = endpoint.wg_listen_port;
+        let peer_endpoint = endpoint.wg_endpoint;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        let recent_exceptions = self.recent_exceptions.clone();
+        let thread_tunnel_name = tunnel_name.clone();
+        eprintln!(
+            "xpf-userspace-dp: spawning WG control thread endpoint={id} tun={tunnel_name} port={listen_port}"
+        );
+        let join = spawn_supervised_aux(
+            format!("xpf-wg-control-{tunnel_name}"),
+            move || {
+                wg_control::wg_control_loop(
+                    thread_tunnel_name,
+                    id,
+                    engine,
+                    listen_port,
+                    peer_endpoint,
+                    recent_exceptions,
+                    stop_clone,
+                );
+            },
+        );
+        let handle = match join {
+            Ok(join) => Some(LocalTunnelSourceHandle {
+                stop,
+                join: Some(join),
+            }),
+            Err(err) => {
+                if let Ok(mut recent) = self.recent_exceptions.lock() {
+                    push_recent_exception(
+                        &mut recent,
+                        ExceptionStatus {
+                            timestamp: Utc::now(),
+                            interface: tunnel_name.clone(),
+                            reason: format!("spawn_wg_control_failed:{id}:{err}"),
+                            ..ExceptionStatus::default()
+                        },
                     );
                 }
-                Err(err) => {
-                    if let Ok(mut recent) = self.recent_exceptions.lock() {
-                        push_recent_exception(
-                            &mut recent,
-                            ExceptionStatus {
-                                timestamp: Utc::now(),
-                                interface: tunnel_name,
-                                reason: format!(
-                                    "spawn_wg_control_failed:{tunnel_endpoint_id}:{err}"
-                                ),
-                                ..ExceptionStatus::default()
-                            },
-                        );
-                    }
-                }
+                eprintln!(
+                    "xpf-userspace-dp: WG control thread spawn FAILED endpoint={id}: {err}"
+                );
+                None
             }
+        };
+        self.wg_control_threads.insert(
+            id,
+            WgControlEntry {
+                handle,
+                engine_ptr,
+                spawned_ifindex,
+                spawned_tunnel_name: tunnel_name,
+                last_spawn_attempt_ns: monotonic_nanos(),
+            },
+        );
+    }
+
+    /// #1866 Change 2: periodic self-heal, called from the server's
+    /// `refresh_status` ONLY while `should_run_afxdp` holds. TOMBSTONE-
+    /// ONLY and SNAPSHOT-COHERENT:
+    ///
+    ///   - never creates entries for ids absent from the map (entry
+    ///     creation belongs to the apply path, where `self.forwarding`
+    ///     and the snapshot are coherent by construction — the desired
+    ///     set here can be STALE during a defer_workers window);
+    ///   - a tombstone respawns only past `WG_SPAWN_BACKOFF_NS` AND only
+    ///     when the latest STORED snapshot's row for the id is
+    ///     identity-identical and attachment-identical to the forwarding
+    ///     endpoint the spawn would use (a sweep must never start a
+    ///     thread the latest accepted snapshot does not describe);
+    ///   - at most one spawn attempt per invocation.
+    pub(crate) fn reconcile_wg_control_liveness(
+        &mut self,
+        latest_snapshot: Option<&crate::ConfigSnapshot>,
+    ) {
+        self.sweep_finished_wg_control_threads();
+        let Some(snapshot) = latest_snapshot else {
+            return;
+        };
+        let now = monotonic_nanos();
+        let tombstones: Vec<u16> = self
+            .wg_control_threads
+            .iter()
+            .filter(|(_, entry)| entry.handle.is_none())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in tombstones {
+            let Some(entry) = self.wg_control_threads.get(&id) else {
+                continue;
+            };
+            if now.saturating_sub(entry.last_spawn_attempt_ns) < WG_SPAWN_BACKOFF_NS {
+                continue;
+            }
+            if !self.wg_tombstone_respawn_coherent(id, snapshot) {
+                continue;
+            }
+            self.spawn_one_wg_control_thread(id);
+            break; // ≤1 spawn attempt per invocation
+        }
+    }
+
+    /// #1866: whether a tombstone respawn for `id` is coherent — the
+    /// latest stored snapshot must describe EXACTLY the thread the
+    /// spawn would create from the current forwarding state (crypto
+    /// identity via the shared `hydrate_wg_identity` gates, Codex r3;
+    /// TUN attachment via ifindex + linux name, Codex r4).
+    fn wg_tombstone_respawn_coherent(
+        &self,
+        id: u16,
+        snapshot: &crate::ConfigSnapshot,
+    ) -> bool {
+        let Some(endpoint) = self.forwarding.tunnel_endpoints.get(&id) else {
+            return false;
+        };
+        if endpoint.mode != "wireguard" || !self.forwarding.wg_engines.contains_key(&id) {
+            return false;
+        }
+        let Some(name) = self
+            .forwarding
+            .ifindex_to_name
+            .get(&endpoint.logical_ifindex)
+        else {
+            return false;
+        };
+        let Some(row) = snapshot
+            .tunnel_endpoints
+            .iter()
+            .find(|row| row.id == id && row.ifindex > 0)
+        else {
+            return false;
+        };
+        let Some(identity) = hydrate_wg_identity(row) else {
+            return false;
+        };
+        // Attachment label mirrors forwarding_build/interfaces.rs:
+        // linux_name with a fallback to the logical name when empty.
+        let row_label = if row.linux_name.is_empty() {
+            row.interface.as_str()
+        } else {
+            row.linux_name.as_str()
+        };
+        identity.matches_endpoint(endpoint)
+            && row.ifindex == endpoint.logical_ifindex
+            && row_label == name
+    }
+
+    /// #1866 (PR-review Codex r1 F1): stop + join + remove ALL WG
+    /// control-thread entries (live and tombstoned). Used by the
+    /// same-plan apply leg when the helper is disarmed
+    /// (`should_run_afxdp` false): `refresh_runtime_snapshot`
+    /// reconciles WG threads for the running case, but a disarmed
+    /// helper must not hold WG listen ports — mirror the
+    /// `reconcile_status_bindings → stop()` semantics.
+    pub(crate) fn stop_all_wg_control_threads(&mut self, reason: &str) {
+        let ids: Vec<u16> = self.wg_control_threads.keys().copied().collect();
+        for id in ids {
+            self.stop_remove_wg_control_entry(id, reason);
+        }
+    }
+
+    /// #1866 Change 2b (defect D4): removal propagation on the
+    /// defer-workers apply path. The NOT-same-plan + defer_workers
+    /// branch stores the snapshot WITHOUT reconciling, so
+    /// `self.forwarding` (and therefore the ordinary desired set) goes
+    /// stale — a removed WG endpoint's thread would keep its UDP port
+    /// until the deferred bring-up. This narrow prune stops + joins +
+    /// removes entries whose endpoint id is absent from (or no longer a
+    /// hydratable WG endpoint in) the new snapshot, mirroring the
+    /// populate gates via `hydrate_wg_identity`. It does NOT spawn,
+    /// does NOT touch `self.forwarding`, and does NOT mutate any
+    /// worker-visible state.
+    pub(crate) fn prune_wg_control_threads_for_snapshot(
+        &mut self,
+        snapshot: &crate::ConfigSnapshot,
+    ) {
+        let desired: std::collections::BTreeSet<u16> = snapshot
+            .tunnel_endpoints
+            .iter()
+            .filter(|row| row.id != 0 && row.ifindex > 0 && hydrate_wg_identity(row).is_some())
+            .map(|row| row.id)
+            .collect();
+        let stale: Vec<u16> = self
+            .wg_control_threads
+            .keys()
+            .filter(|id| !desired.contains(id))
+            .copied()
+            .collect();
+        for id in stale {
+            self.stop_remove_wg_control_entry(id, "removed_deferred");
         }
     }
 
@@ -620,6 +905,26 @@ impl Coordinator {
     }
 
     pub fn refresh_runtime_snapshot(&mut self, snapshot: &crate::ConfigSnapshot) {
+        self.refresh_runtime_snapshot_inner(snapshot, true);
+    }
+
+    /// #1866 (PR-review Codex r2): runtime-snapshot refresh for a
+    /// DISARMED helper (`should_run_afxdp` false). Identical to
+    /// `refresh_runtime_snapshot` EXCEPT it never spawns WG control
+    /// threads — a disarmed helper must not transiently bind WG listen
+    /// ports or emit handshake initiations; instead any existing
+    /// entries are stopped (mirrors `reconcile_status_bindings →
+    /// stop()`). Forwarding/validation state still refreshes so a
+    /// later arming starts from current state.
+    pub fn refresh_runtime_snapshot_disarmed(&mut self, snapshot: &crate::ConfigSnapshot) {
+        self.refresh_runtime_snapshot_inner(snapshot, false);
+    }
+
+    fn refresh_runtime_snapshot_inner(
+        &mut self,
+        snapshot: &crate::ConfigSnapshot,
+        spawn_wg: bool,
+    ) {
         // #1606: preflight policy validation BEFORE any
         // side-effecting mutation (neighbor manager keys,
         // validation, policy_counters). If integrity errors fire,
@@ -701,6 +1006,11 @@ impl Coordinator {
             }
         };
         self.policy_counters.reconcile_rules(&snapshot.policies);
+        // #1866 D3: WG endpoint-set transition log at the Rust apply
+        // boundary. Rare (only when the set actually changes); pairs
+        // with the Go publish-boundary log to pin which layer dropped
+        // or retained an endpoint in one journal capture.
+        log_wg_endpoint_set_transition("snapshot-refresh", &self.forwarding, &new_forwarding);
         self.forwarding = new_forwarding;
         if self.forwarding.fabrics.is_empty() && !preserved_fabrics.is_empty() {
             self.forwarding.fabrics = preserved_fabrics;
@@ -724,7 +1034,14 @@ impl Coordinator {
         // runtime-snapshot refresh, not just initial bring-up, so a
         // same-plan apply that adds/removes/changes a WG endpoint starts,
         // stops, or restarts the matching UDP/TUN control thread.
-        self.spawn_wg_control_threads();
+        // #1866 (Codex code-r2): NEVER on a disarmed helper — not even
+        // transiently (the control loop binds + may emit an initiation
+        // before its first stop check); stop anything present instead.
+        if spawn_wg {
+            self.spawn_wg_control_threads();
+        } else {
+            self.stop_all_wg_control_threads("disarmed");
+        }
         self.refresh_cos_owner_worker_map_from_identities();
         self.ha
             .fabrics

@@ -98,6 +98,9 @@ pub(super) fn wg_control_loop(
                 &tunnel_name,
                 format!("wg_bind_listen_port:{listen_port}:{err}"),
             );
+            eprintln!(
+                "xpf-userspace-dp: WG control thread exiting tun={tunnel_name}: bind :{listen_port} failed: {err}"
+            );
             return;
         }
     };
@@ -107,6 +110,9 @@ pub(super) fn wg_control_loop(
             &tunnel_name,
             format!("wg_socket_nonblocking:{err}"),
         );
+        eprintln!(
+            "xpf-userspace-dp: WG control thread exiting tun={tunnel_name}: set_nonblocking failed: {err}"
+        );
         return;
     }
 
@@ -115,11 +121,17 @@ pub(super) fn wg_control_loop(
     let mut tun = match open_tun(&tunnel_name) {
         Ok((file, _actual_name)) => file,
         Err(err) => {
+            eprintln!(
+                "xpf-userspace-dp: WG control thread exiting tun={tunnel_name}: open_tun failed: {err}"
+            );
             record_local_tunnel_exception(&recent_exceptions, &tunnel_name, err);
             return;
         }
     };
     if let Err(err) = set_fd_nonblocking(tun.as_raw_fd()) {
+        eprintln!(
+            "xpf-userspace-dp: WG control thread exiting tun={tunnel_name}: tun set_nonblocking failed: {err}"
+        );
         record_local_tunnel_exception(&recent_exceptions, &tunnel_name, err);
         return;
     }
@@ -268,6 +280,8 @@ pub(super) fn wg_control_loop(
             thread::sleep(WG_IDLE_SLEEP);
         }
     }
+    // #1866 D3: clean stop-flag exit (teardown) — rare, one line.
+    eprintln!("xpf-userspace-dp: WG control thread stopped tun={tunnel_name}");
     let _ = tunnel_endpoint_id;
 }
 
