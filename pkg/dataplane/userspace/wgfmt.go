@@ -45,7 +45,7 @@ func FormatWireguardStatus(status ProcessStatus, detail bool, now time.Time) str
 		fmt.Fprintf(&b, "  Session:            %s\n", state)
 		fmt.Fprintf(&b, "  Latest handshake:   %s\n",
 			formatHandshakeAge(t.LastHandshakeUnixSecs, now))
-		fmt.Fprintf(&b, "  Handshakes:         %d initiator, %d responder (initiations sent %d, send errors %d)\n",
+		fmt.Fprintf(&b, "  Handshakes:         %d initiator, %d responder (initiations created %d, send errors %d)\n",
 			t.HsCompletionsInitiator, t.HsResponsesCreated,
 			t.HsInitiationsCreated, t.HsSendErrors)
 		fmt.Fprintf(&b, "  Transfer:           %d pkts / %d bytes received, %d pkts / %d bytes sent (inner IP)\n",

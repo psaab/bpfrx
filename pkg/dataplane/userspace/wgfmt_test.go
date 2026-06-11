@@ -42,7 +42,7 @@ func TestFormatWireguardStatusSummary(t *testing.T) {
 		"Peer endpoint:      192.0.2.10:51820",
 		"Session:            session confirmed",
 		"Latest handshake:   1m30s ago",
-		"Handshakes:         2 initiator, 1 responder (initiations sent 4, send errors 1)",
+		"Handshakes:         2 initiator, 1 responder (initiations created 4, send errors 1)",
 		"Transfer:           100 pkts / 5000 bytes received, 90 pkts / 4500 bytes sent (inner IP)",
 		"Keepalives:         7 received",
 		"Drops:              2 receive, 3 transmit, 5 handshake, 1 I/O errors",

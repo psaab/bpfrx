@@ -5169,3 +5169,7 @@ top.
 - **Timestamp**: 2026-06-11
   **Action**: #1865 engineer — SMR code review r1 (MERGE-READY; worked traces A/B) + cosmetic keepalive-line dedup in detail view
   **File(s)**: docs/pr/1865-wg-telemetry/claude-smr-code-r1.md, pkg/dataplane/userspace/wgfmt.go
+
+- **Timestamp**: 2026-06-11
+  **Action**: #1865 engineer — Codex code-r1 fixes: plan-faithful name fallback chain (TunnelEndpoint.interface_label middle layer) + summary wording 'initiations created'
+  **File(s)**: userspace-dp/src/afxdp/types/forwarding.rs, userspace-dp/src/afxdp/forwarding_build/tunnels.rs, userspace-dp/src/afxdp/coordinator/status.rs, pkg/dataplane/userspace/{wgfmt.go,wgfmt_test.go}

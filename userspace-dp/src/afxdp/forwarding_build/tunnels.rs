@@ -74,6 +74,14 @@ pub(super) fn populate_tunnel_endpoints(
             TunnelEndpoint {
                 id: endpoint.id,
                 logical_ifindex: endpoint.ifindex,
+                // #1865: attachment label for the telemetry-row name
+                // fallback (linux_name, else logical name — mirrors
+                // wg_tombstone_respawn_coherent's row_label).
+                interface_label: if endpoint.linux_name.is_empty() {
+                    endpoint.interface.clone()
+                } else {
+                    endpoint.linux_name.clone()
+                },
                 redundancy_group: endpoint.redundancy_group,
                 mode: endpoint.mode.clone(),
                 outer_family,

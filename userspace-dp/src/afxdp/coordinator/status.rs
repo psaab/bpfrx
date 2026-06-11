@@ -661,11 +661,21 @@ impl super::Coordinator {
             let Some(engine) = self.forwarding.wg_engines.get(&id) else {
                 continue;
             };
+            // Name fallback chain (plan §3.2 / Codex code-r1 F1):
+            // ifindex_to_name → the snapshot row's attachment label →
+            // wg-endpoint-<id>. A row is never dropped, and the
+            // stable logical name wins over the positional id even
+            // when the live ifindex map has no entry (broken
+            // bring-up — exactly when telemetry matters).
             let tunnel = self
                 .forwarding
                 .ifindex_to_name
                 .get(&endpoint.logical_ifindex)
                 .cloned()
+                .or_else(|| {
+                    (!endpoint.interface_label.is_empty())
+                        .then(|| endpoint.interface_label.clone())
+                })
                 .unwrap_or_else(|| format!("wg-endpoint-{id}"));
             let c = engine.counters();
             // Stamp-0 guard (plan §3.3 / SMR r2): a zero stamp means
