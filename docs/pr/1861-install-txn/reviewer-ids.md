@@ -15,3 +15,10 @@
 - AGY: adversarial-review-mq9fdkfv-fepikc — MERGE-READY (all 7 priority targets verified, zero findings)
 - Claude SMR: docs/pr/1861-install-txn/claude-smr-code-r1.md — MERGE-READY (worked traces 1+2)
 - Copilot: quota-limited twice on first request; retry 1 posted (documented per feedback_copilot_quota policy)
+
+## Copilot quota outcome (per the 3-documented-retries policy)
+- Initial request + retries 1/2/3 posted 2026-06-11 (issuecomments on PR #1871);
+  copilot-pull-request-reviewer responded "quota limit" twice (11:38:29Z,
+  11:41:07Z) and did not produce further reviews on retries 2-3.
+- Gate satisfied 3-of-4: Codex MERGE-READY + AGY MERGE-READY + Claude SMR
+  MERGE-READY at head 773537d18485.
