@@ -182,6 +182,12 @@ pub(crate) struct ProcessStatus {
     pub neg_neigh_fast_fail_total: u64,
     #[serde(rename = "pending_neigh_duplicate_drops_total", default)]
     pub pending_neigh_duplicate_drops_total: u64,
+    /// #1902: GRE-decapped MissingNeighbor packets refused
+    /// `pending_neigh` admission (buffering the outer UMEM frame with
+    /// the post-decap inner meta would retry-TX a mis-rewritten outer
+    /// packet). Additive / defaulted for backward compatibility.
+    #[serde(rename = "pending_neigh_decap_drops_total", default)]
+    pub pending_neigh_decap_drops_total: u64,
     /// #1789: total failed USERSPACE_SESSIONS BPF-map publishes
     /// (per-binding worker-poll sites summed with the shared no-binding
     /// sites: HA upsert, session-glue worker publish, post-reconcile

@@ -301,6 +301,9 @@ type xpfCollector struct {
 	// capture harness can grep the t0' next-hop membership (H2).
 	negNeighFastFailTotal           *prometheus.Desc
 	pendingNeighDuplicateDropsTotal *prometheus.Desc
+	// #1902: decap-refusal gate at pending_neigh admission (frame/meta
+	// pairing defect class — see also #1885/#1873).
+	pendingNeighDecapDropsTotal *prometheus.Desc
 	dynamicNeighborPresent          *prometheus.Desc
 	// #1769: on-demand neighbor-resolver telemetry — the operator-visible
 	// signal for the MissingNeighbor stuck-state.
@@ -531,6 +534,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.neighborWarmDisconnectedTotal
 	ch <- c.negNeighFastFailTotal
 	ch <- c.pendingNeighDuplicateDropsTotal
+	ch <- c.pendingNeighDecapDropsTotal
 	ch <- c.dynamicNeighborPresent
 	ch <- c.neighborResolverQueueDepth
 	ch <- c.neighborResolverEnqueueDropsTotal

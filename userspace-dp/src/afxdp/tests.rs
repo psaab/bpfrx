@@ -5867,6 +5867,271 @@ fn native_gre_decap_tagged_ingress_yields_self_consistent_frame_meta() {
     assert_eq!(decap.meta.addr_family, libc::AF_INET as u8);
 }
 
+/// #1902 fixture: inner TCP SYN L3 packet (no Ethernet header — it is
+/// the flagless-GRE proto-0x0800 payload) 10.255.0.2 -> `dst`. With
+/// `dst` on the reth1.0 connected subnet the decap-INBOUND forward
+/// decision egresses a PLAIN interface (`tunnel_endpoint_id == 0`) —
+/// not LocalDelivery, not a tunnel-marked encap — so a cold neighbor
+/// reaches the MissingNeighbor pending_neigh admission site.
+fn build_gre_inner_tcp_syn_packet_v4(dst: Ipv4Addr) -> Vec<u8> {
+    let mut packet = Vec::new();
+    let d = dst.octets();
+    packet.extend_from_slice(&[
+        0x45, 0x00, 0x00, 0x28, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 255, 0,
+        2, d[0], d[1], d[2], d[3],
+    ]);
+    let ip_sum = checksum16(&packet[0..20]);
+    packet[10] = (ip_sum >> 8) as u8;
+    packet[11] = ip_sum as u8;
+    packet.extend_from_slice(&12345u16.to_be_bytes());
+    packet.extend_from_slice(&443u16.to_be_bytes());
+    packet.extend_from_slice(&1u32.to_be_bytes());
+    packet.extend_from_slice(&0u32.to_be_bytes());
+    packet.extend_from_slice(&[0x50, TCP_FLAG_SYN, 0xfa, 0xf0, 0x00, 0x00, 0x00, 0x00]);
+    packet
+}
+
+/// #1902 driver: one GRE-to-self outer frame whose INNER packet
+/// forwards out reth1.0 toward a COLD neighbor, end-to-end through
+/// `poll_binding_process_descriptor`, then neighbor resolution +
+/// `retry_pending_neigh`. Pre-#1902 the MissingNeighbor arm buffered
+/// `desc` (the un-decapped OUTER UMEM frame, VLAN-tagged on the
+/// reth0.80 underlay) paired with the post-decap INNER meta/decision,
+/// and the retry swept that entry into a prepared TX — the
+/// still-encapsulated outer GRE packet rewritten at inner-meta
+/// offsets, transmitted toward the inner next-hop. Fixed: the packet
+/// is never admitted (counted, recycled) and the retry TXes nothing;
+/// first-packet delivery rides the trailing decap-aware slow-path
+/// chokepoint (#1901), which pairs the INNER frame correctly.
+fn assert_decapped_missing_neighbor_never_buffered_or_retried(vlan_id: u16) {
+    let mut forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    let ha_state = txn_ha_state();
+    // bindings[0] = WAN parent ingress (ifindex 11); bindings[1] = the
+    // inner-egress LAN binding (ifindex 24) so a defective retry TX has
+    // a real target binding and would land in its pending_tx_prepared.
+    let mut bindings = vec![
+        BindingWorker::new_for_mirror_test(0, 0, 11, 0),
+        BindingWorker::new_for_mirror_test(1, 0, 24, 0),
+    ];
+    bindings[0].interface = Arc::<str>::from("ge-0-0-0");
+    bindings[1].interface = Arc::<str>::from("ge-0-0-1");
+    let mut sessions = SessionTable::new();
+
+    let inner_dst = Ipv4Addr::new(10, 0, 61, 50);
+    let inner = build_gre_inner_tcp_syn_packet_v4(inner_dst);
+    let frame = build_gre_to_self_outer_frame_v4(vlan_id, &inner);
+    let meta = gre_to_self_outer_meta(vlan_id, frame.len());
+
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut bindings[0],
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+    assert_eq!(
+        dbg.missing_neigh, 1,
+        "inner dst neighbor is cold -> the packet must take the MissingNeighbor arm"
+    );
+    assert!(
+        bindings[0].pending_neigh.is_empty(),
+        "#1902: a GRE-decapped packet must NEVER be admitted to pending_neigh — \
+         desc references the un-decapped OUTER frame while meta/decision \
+         describe the synthetic INNER frame"
+    );
+    assert_eq!(
+        bindings[0]
+            .live
+            .pending_neigh_decap_drops
+            .load(Ordering::Relaxed),
+        1,
+        "the decap-refusal gate must count the refused candidate"
+    );
+    assert!(
+        bindings[0].scratch.scratch_recycle.contains(&128),
+        "the refused frame must be recycled now, not pinned in pending_neigh"
+    );
+
+    // Resolve the inner next-hop and run the retry sweep: nothing may be
+    // TXed from the (empty) buffer. Pre-#1902 this swept the mis-paired
+    // entry into bindings[1].tx_pipeline.pending_tx_prepared.
+    forwarding.neighbors.insert(
+        (24, IpAddr::V4(inner_dst)),
+        NeighborEntry {
+            mac: [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        },
+    );
+    let lookup = WorkerBindingLookup::from_bindings(&bindings);
+    let mirror_targets = MirrorTargetMap::default();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+    let mut shared_recycles = Vec::new();
+    let area = bindings[0].umem.area() as *const MmapArea;
+    let (left, rest) = bindings.split_at_mut(0);
+    let (binding, right) = rest.split_first_mut().expect("ingress binding");
+    retry_pending_neigh(
+        binding,
+        left,
+        0,
+        right,
+        &lookup,
+        &mirror_targets,
+        &forwarding,
+        &dynamic_neighbors,
+        None,
+        123_000_000_100,
+        // SAFETY: `area` was cast from `&MmapArea` borrowed out of
+        // bindings[0].umem just above; the allocation lives past this
+        // call, the split borrows cover disjoint binding state (not the
+        // umem area), and the test is single-threaded.
+        unsafe { &*area },
+        &mut shared_recycles,
+    );
+    for (i, b) in bindings.iter().enumerate() {
+        assert!(
+            b.tx_pipeline.pending_tx_prepared.is_empty(),
+            "binding {i}: no retried TX may exist for a decapped packet — \
+             pre-#1902 the untagged variant held the OUTER GRE frame \
+             (proto 47, outer dst = the firewall itself) truncated to the \
+             inner length and MAC-rewritten toward the inner next-hop"
+        );
+    }
+}
+
+/// #1902: VLAN-tagged underlay (the live reth0.80 shape, #1885
+/// parity) — the buffered outer frame's L3 sits at 18 while the inner
+/// meta says 14, so the pre-fix retry rewrote the dot1q tail.
+#[test]
+fn txn_decapped_missing_neighbor_not_buffered_tagged() {
+    assert_decapped_missing_neighbor_never_buffered_or_retried(80);
+}
+
+/// #1902: untagged underlay — `outer_frame[14..]` IS the outer L3
+/// header (valid version nibble), so the pre-fix retry TXed the
+/// still-encapsulated OUTER GRE packet toward the INNER next-hop.
+/// Byte-indistinguishable from a valid frame at retry time, which is
+/// why the fix gates ADMISSION rather than detecting at retry.
+#[test]
+fn txn_decapped_missing_neighbor_not_buffered_untagged() {
+    assert_decapped_missing_neighbor_never_buffered_or_retried(0);
+}
+
+/// #1902 regression pin for the UNCHANGED path: a NON-decapped packet
+/// (desc and meta describe the same UMEM frame) with a cold neighbor
+/// must still buffer in pending_neigh, and after resolution the retry
+/// must TX the correctly rewritten ORIGINAL packet (resolved dst MAC,
+/// egress src MAC, TTL-1, IP/L4 bytes otherwise identical).
+#[test]
+fn txn_non_decap_missing_neighbor_buffers_and_retries_correctly() {
+    let mut forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    let ha_state = txn_ha_state();
+    let mut bindings = vec![BindingWorker::new_for_mirror_test(0, 0, 24, 0)];
+    bindings[0].interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+
+    // LAN hairpin: 10.0.61.102 -> 10.0.61.50, directly connected on
+    // reth1.0 (egress == ingress binding), neighbor cold.
+    let dst = Ipv4Addr::new(10, 0, 61, 50);
+    let frame = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        dst,
+        12345,
+        443,
+        TCP_FLAG_SYN,
+    );
+    let meta = txn_meta_v4(24, TCP_FLAG_SYN, (frame.len() - 14) as u16);
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut bindings[0],
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+    assert_eq!(dbg.missing_neigh, 1, "cold neighbor -> MissingNeighbor arm");
+    assert_eq!(
+        bindings[0].pending_neigh.len(),
+        1,
+        "a non-decapped cold-neighbor packet must still buffer"
+    );
+    assert_eq!(
+        bindings[0]
+            .live
+            .pending_neigh_decap_drops
+            .load(Ordering::Relaxed),
+        0,
+        "the decap gate must not touch UMEM-paired packets"
+    );
+
+    let mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+    forwarding
+        .neighbors
+        .insert((24, IpAddr::V4(dst)), NeighborEntry { mac });
+    let lookup = WorkerBindingLookup::from_bindings(&bindings);
+    let mirror_targets = MirrorTargetMap::default();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+    let mut shared_recycles = Vec::new();
+    let area = bindings[0].umem.area() as *const MmapArea;
+    let (left, rest) = bindings.split_at_mut(0);
+    let (binding, right) = rest.split_first_mut().expect("ingress binding");
+    retry_pending_neigh(
+        binding,
+        left,
+        0,
+        right,
+        &lookup,
+        &mirror_targets,
+        &forwarding,
+        &dynamic_neighbors,
+        None,
+        123_000_000_100,
+        // SAFETY: same single-threaded umem-area contract as above.
+        unsafe { &*area },
+        &mut shared_recycles,
+    );
+    assert!(
+        bindings[0].pending_neigh.is_empty(),
+        "entry consumed by retry"
+    );
+    let req = bindings[0]
+        .tx_pipeline
+        .pending_tx_prepared
+        .front()
+        .expect("resolved retry must produce a prepared TX");
+    let rewritten = bindings[0]
+        .umem
+        .area()
+        .slice(req.offset as usize, req.len as usize)
+        .expect("rewritten frame")
+        .to_vec();
+    assert_eq!(
+        &rewritten[0..6],
+        &mac,
+        "dst MAC must be the resolved neighbor"
+    );
+    assert_eq!(
+        &rewritten[6..12],
+        &[0x02, 0xbf, 0x72, 0x01, 0x00, 0x01],
+        "src MAC must be the reth1.0 egress interface MAC"
+    );
+    assert_eq!(
+        rewritten.len(),
+        frame.len(),
+        "no length change on a plain forward"
+    );
+    assert_eq!(rewritten[22], 63, "TTL decremented exactly once (64 -> 63)");
+    assert_eq!(
+        &rewritten[26..34],
+        &frame[26..34],
+        "IP src+dst must be byte-identical to the original packet"
+    );
+    assert_eq!(
+        &rewritten[34..],
+        &frame[34..],
+        "L4 segment must be byte-identical to the original packet"
+    );
+}
+
 /// #1873 replay-filter companion pin (AGY code r4 HIGH): filtering the
 /// preserved synced-session replay list by purged tunnel ids must
 /// mirror delete_synced_session's companion semantics — the derived
