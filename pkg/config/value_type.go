@@ -46,6 +46,14 @@ const (
 	ValueEnumOf
 	// ValueBool is "true" or "false".
 	ValueBool
+	// ValueIPAddress is an IP address without a prefix length. The
+	// accepted family (v4, v6, or either) is enforced by the leaf's
+	// validator (ValidateIPAddress / ValidateIPv4Address). #1319 PR 3.
+	ValueIPAddress
+	// ValueCIDR is an IP address WITH a prefix length (e.g.
+	// 10.0.1.10/24, 2001:db8::1/64). The accepted family is enforced by
+	// the leaf's validator (ValidateIPv4CIDR / ValidateIPv6CIDR).
+	ValueCIDR
 )
 
 // Placeholder returns the angle-bracket placeholder name shown in `?`
@@ -68,6 +76,10 @@ func (v ValueType) Placeholder() string {
 		return "<value>"
 	case ValueBool:
 		return "<true|false>"
+	case ValueIPAddress:
+		return "<address>"
+	case ValueCIDR:
+		return "<address/prefix-length>"
 	}
 	return ""
 }

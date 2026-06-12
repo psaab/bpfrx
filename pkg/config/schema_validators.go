@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"math"
+	"net"
 	"sort"
 	"strconv"
 	"strings"
@@ -121,6 +122,15 @@ func parsePercentWithSuffixStrict(raw string) (float64, error) {
 // review on PR #1845: no schema-only caps).
 const MaxDurationMillis = int64(math.MaxInt64) / int64(time.Millisecond)
 
+// MaxDurationSeconds is the seconds analogue of MaxDurationMillis: the
+// largest second count that survives `time.Duration(n) * time.Second`
+// without int64 overflow (math.MaxInt64 / 1e9 = 9223372036). Used for
+// second-denominated typed leaves whose runtime otherwise accepts any
+// non-negative value (e.g. services ip-monitoring hold-down,
+// pkg/ipmon/ipmon.go:480 — an overflowed negative hold would silently
+// invert the damping behaviour).
+const MaxDurationSeconds = int64(math.MaxInt64) / int64(time.Second)
+
 // ValidateIntegerMin returns a closure that accepts any bare integer
 // >= min — the "no upper bound" spelling for typed leaves whose runtime
 // consumes the full integer range. The representational maximum is
@@ -177,6 +187,122 @@ func ValidateEnum(allowed []string) LeafValidator {
 		}
 		return fmt.Errorf("invalid value %q (expected one of: %s)", raw, strings.Join(sorted, ", "))
 	}
+}
+
+// IP / CIDR validators (#1319 PR 3, interfaces subsystem). They reuse the
+// net package parsers the runtime consumers use (net.ParseIP /
+// net.ParseCIDR), so schema acceptance mirrors runtime parse acceptance
+// exactly — including the family classification rule ip.To4() != nil that
+// pkg/dataplane/userspace/interfaces.go buildConfiguredAddressSnapshots
+// applies to configured addresses.
+
+// ValidateIPAddress accepts any IPv4 or IPv6 address WITHOUT a prefix
+// length. Used for leaves the runtime feeds to net.ParseIP (e.g. GRE
+// tunnel source/destination, pkg/routing/tunnel.go:194), where garbage
+// silently disables the feature today.
+func ValidateIPAddress(raw string, _ *Config) error {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return fmt.Errorf("missing value (expected an IP address, e.g. 10.0.1.10 or 2001:db8::1)")
+	}
+	if net.ParseIP(trimmed) == nil {
+		if _, _, err := net.ParseCIDR(trimmed); err == nil {
+			return fmt.Errorf("prefix length not allowed here (got %q; use a bare IP address)", raw)
+		}
+		return fmt.Errorf("not a valid IP address (got %q)", raw)
+	}
+	return nil
+}
+
+// ValidateIPv4CIDR accepts an IPv4 address with an explicit prefix
+// length (e.g. 10.0.1.10/24). The prefix is REQUIRED: every runtime
+// consumer of configured interface addresses net.ParseCIDRs the string
+// and silently skips it on error (dataplane snapshot:
+// pkg/dataplane/userspace/interfaces.go:391; RETH link-local checks:
+// pkg/daemon/daemon_reth.go:308), so a bare IP would commit and then
+// silently not exist. The v4/v6 family split mirrors the runtime
+// classification ip.To4() != nil.
+func ValidateIPv4CIDR(raw string, _ *Config) error {
+	ip, err := parseCIDRStrict(raw, "10.0.1.10/24")
+	if err != nil {
+		return err
+	}
+	if ip.To4() == nil {
+		return fmt.Errorf("not an IPv4 address (got %q; IPv6 addresses belong under family inet6)", raw)
+	}
+	return nil
+}
+
+// ValidateIPv6CIDR accepts an IPv6 address with an explicit prefix
+// length (e.g. 2001:db8::1/64). See ValidateIPv4CIDR for why the prefix
+// is required; the family rule mirrors the runtime's ip.To4() == nil
+// classification, so 4-in-6 forms like ::ffff:10.0.1.1/96 — which the
+// runtime classifies as inet — are rejected under family inet6.
+func ValidateIPv6CIDR(raw string, _ *Config) error {
+	ip, err := parseCIDRStrict(raw, "2001:db8::1/64")
+	if err != nil {
+		return err
+	}
+	if ip.To4() != nil {
+		return fmt.Errorf("not an IPv6 address (got %q; IPv4 addresses belong under family inet)", raw)
+	}
+	return nil
+}
+
+// parseCIDRStrict is the shared require-a-prefix CIDR parse for the two
+// family validators. It upgrades the two common operator mistakes to
+// targeted messages: a bare IP (missing /prefix-length) and outright
+// garbage.
+func parseCIDRStrict(raw, example string) (net.IP, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, fmt.Errorf("missing value (expected address/prefix-length, e.g. %s)", example)
+	}
+	ip, _, err := net.ParseCIDR(trimmed)
+	if err != nil {
+		if net.ParseIP(trimmed) != nil {
+			return nil, fmt.Errorf("missing /prefix-length (got %q; the runtime silently skips addresses without one — write e.g. %s)", raw, example)
+		}
+		return nil, fmt.Errorf("not a valid address/prefix-length (expected e.g. %s): %v", example, err)
+	}
+	return ip, nil
+}
+
+// validateForwardingClassRef is the #1319 PR 3 tree-based
+// cross-reference validator for `firewall family inet/inet6 filter
+// <f> term <t> then forwarding-class <name>`. The dataplane resolves
+// the name with a map lookup against the CONFIGURED forwarding classes
+// (queue_by_forwarding_class, userspace-dp
+// src/afxdp/tx/cos_classify.rs:371) and silently leaves the packet on
+// the default queue when it misses — a dangling reference commits fine
+// and then does nothing. The reference is valid when:
+//
+//   - the name is defined via `class-of-service forwarding-classes
+//     queue <n> <name>` anywhere in the candidate tree (collected by
+//     collectSchemaRefs from the SAME tree being committed, so a
+//     definition + reference in one commit validates atomically), or
+//   - the name is "best-effort": when no forwarding-classes are
+//     configured the dataplane synthesizes a best-effort queue
+//     (forwarding_build/cos.rs:404-407), so that name is always
+//     resolvable.
+//
+// xpf-DIVERGENT from Junos: the other three Junos default classes
+// (expedited-forwarding, assured-forwarding, network-control) are NOT
+// implicitly defined by the xpf runtime — referencing them without a
+// definition is exactly the silent no-op this gate exists to close.
+func validateForwardingClassRef(raw string, refs *schemaRefs) error {
+	if strings.TrimSpace(raw) == "" {
+		return fmt.Errorf("missing value (expected a forwarding-class name)")
+	}
+	if raw == "best-effort" {
+		return nil
+	}
+	if refs != nil {
+		if _, ok := refs.forwardingClasses[raw]; ok {
+			return nil
+		}
+	}
+	return fmt.Errorf("forwarding-class %q is not defined; add `set class-of-service forwarding-classes queue <queue-id> %s` in the same commit (xpf does not implicitly define the Junos default classes other than best-effort)", raw, raw)
 }
 
 // validatePercent returns a closure that accepts a real number in

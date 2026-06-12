@@ -49,6 +49,10 @@ const (
 	ValueEnumOf = config.ValueEnumOf
 	// ValueBool is "true" or "false".
 	ValueBool = config.ValueBool
+	// ValueIPAddress is an IP address without a prefix length (#1319 PR 3).
+	ValueIPAddress = config.ValueIPAddress
+	// ValueCIDR is an IP address with a prefix length (#1319 PR 3).
+	ValueCIDR = config.ValueCIDR
 )
 
 // LeafValidator is the typed-leaf validator signature. cfg is the
