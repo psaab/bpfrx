@@ -2692,7 +2692,37 @@ pub(super) fn poll_binding_process_descriptor(
                                 // (counted drop) — the #1769 resolver keeps
                                 // driving the outer next-hop, and the flow
                                 // recovers via retransmission once resolved.
+                                // #1902 (sibling of #1885): a GRE-DECAPPED
+                                // packet is NEVER admitted to pending_neigh.
+                                // `desc` still references the un-decapped
+                                // OUTER UMEM frame while `meta`/the decision
+                                // describe the synthetic INNER frame in
+                                // `owned_packet_frame`; the retry path's
+                                // rewrite_forwarded_frame_in_place(pkt.desc,
+                                // pkt.meta, ..) would MAC/NAT/TTL-rewrite the
+                                // still-encapsulated outer packet at inner
+                                // offsets and TX it toward the inner next-hop
+                                // — a corrupt transmit, not a drop. The
+                                // kernel ARP/ICMP probe above already fired,
+                                // the trailing decap-aware
+                                // maybe_reinject_slow_path_from_frame
+                                // chokepoint (#1901) still hands the
+                                // correctly-paired INNER packet to the kernel
+                                // slow path, and the #1769 resolver +
+                                // retransmission recover the flow once the
+                                // neighbor resolves. Counted per binding so
+                                // the live gate is observable
+                                // (xpf_userspace_pending_neigh_decap_drops_total).
                                 if !seed_install_refused
+                                    && pending_decision.resolution.tunnel_endpoint_id == 0
+                                    && pending_decision.resolution.next_hop.is_some()
+                                    && owned_packet_frame.is_some()
+                                {
+                                    binding
+                                        .live
+                                        .pending_neigh_decap_drops
+                                        .fetch_add(1, Ordering::Relaxed);
+                                } else if !seed_install_refused
                                     && pending_decision.resolution.tunnel_endpoint_id == 0
                                     && let Some(hop) = pending_decision.resolution.next_hop
                                 {

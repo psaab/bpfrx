@@ -653,6 +653,11 @@ type ProcessStatus struct {
 	// are omitempty for wire-compat with older helpers.
 	NegNeighFastFailTotal           uint64   `json:"neg_neigh_fast_fail_total,omitempty"`
 	PendingNeighDuplicateDropsTotal uint64   `json:"pending_neigh_duplicate_drops_total,omitempty"`
+	// #1902: GRE-decapped MissingNeighbor packets refused pending_neigh
+	// admission — buffering the outer UMEM frame with the post-decap
+	// inner meta would retry-TX a mis-rewritten outer packet once the
+	// neighbor resolves.
+	PendingNeighDecapDropsTotal uint64   `json:"pending_neigh_decap_drops_total,omitempty"`
 	DynamicNeighborKeys             []string `json:"dynamic_neighbor_keys,omitempty"`
 	// #1789: total failed USERSPACE_SESSIONS BPF-map publishes (per-binding
 	// worker-poll sites summed with the shared no-binding sites: HA upsert,
