@@ -25,7 +25,9 @@ the first Load/Save/commit.
 - `DB` — `db.go`. Low-level durable file I/O (via `pkg/fsatomic`).
   `NewDB` sweeps crash-leaked `.*.tmp-*` temps from `.configdb`.
 - `History` — `history.go`. Bounded ring of recent commits.
-- `Journal` — `journal.go`. Append-only JSONL audit trail.
+- `journal.Journal` — subpackage `journal/` (#1896). Append-only,
+  size-rotated, tail-readable JSONL audit trail; `configstore` keeps
+  the alias `JournalEntry = journal.Entry`. See "Audit journal" below.
 - `crypto.go` — AES-256-GCM at-rest encryption helpers
   (`maybeEncryptTreeJSON`, `maybeDecryptTreeJSON`,
   `deriveEncryptionKey`). No public type; the encryption hooks are
@@ -100,6 +102,48 @@ per-path:
 Test seams (`test_seams.go`): `SetWriteActiveForTesting` injects
 persistence failures on every persist path;
 `SetPersistRetryBackoffForTesting` makes the retry loop deterministic.
+
+## Audit journal (#1896)
+
+`.config.journal` (next to the config file) is a JSONL audit trail
+owned by the `journal/` subpackage.
+
+- **Compact v2 entries** — `{v, timestamp, action, detail,
+  config_hash}`. The v1 format appended the FULL compiled config per
+  commit (read by nobody — `show system commit` prints only
+  timestamp/action/detail) so the file grew by a config snapshot per
+  commit and leaked config content (incl. secrets) into a 0644 file.
+  Full trees live in the rollback files (above), which remain the
+  canonical config history.
+- **`config_hash`** — sha256 hex of the post-action active tree's
+  `Format()` text, the same text `saveRollbackFiles` writes: while a
+  slot is retained, `sha256sum <config>.N` correlates the rollback
+  file to its journal entry. Best-effort correlation only — slots
+  shift every commit and only ~50 are kept.
+- **Bounded reads** — `ListCommitHistory(limit)` is O(limit), not
+  O(lifetime): `journal.Tail` reverse-scans segments newest-first in
+  64 KiB chunks and stops at `limit` entries. Semantics preserved from
+  v1: last `limit` entries of ANY action, then filtered to commit
+  actions. `limit <= 0` still reads everything. Line assembly is
+  capped at 16 MiB (corrupt newline-free content is skipped, not
+  buffered whole).
+- **Rotation** — at append time, when the current segment reaches
+  1 MiB it rotates to `.config.journal.1` (keep 2 rotated segments,
+  oldest deleted). A pre-#1896 fat journal rotates to `.1` intact on
+  the first append — old history stays readable until it ages out; no
+  migration pass, and boot never reads the journal.
+- **Durability** — appends are fsynced (operator-paced; the commit
+  path already pays several fsyncs), `fsatomic.SyncDir` covers
+  create/rotate namespace changes, and a torn tail (crash between
+  write and fsync) is confined to one line: the reader's parse-or-skip
+  rule drops it and the next append starts on a fresh line.
+- **Back-compat** — legacy v1 lines (with `before`/`after` payloads)
+  decode tolerantly; unknown fields are ignored. A journal `Log`
+  failure is a `slog.Warn`, never a commit failure, and the
+  `persist_error` path does not recurse.
+- **Concurrency** — `Journal` serializes `Log`/`Tail` internally;
+  `ListCommitHistory` deliberately takes no `Store.mu` (rotation +
+  concurrent read would otherwise duplicate entries).
 
 ## Gotchas
 

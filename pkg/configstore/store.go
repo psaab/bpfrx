@@ -3,6 +3,8 @@
 package configstore
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -14,8 +16,14 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/configstore/journal"
 	"github.com/psaab/xpf/pkg/fsatomic"
 )
+
+// JournalEntry is the audit-log record type, owned by the journal
+// subpackage since #1896 (compact v2 entries: no config payloads —
+// full trees live in the rollback slots; see journal.Entry).
+type JournalEntry = journal.Entry
 
 // Store manages the candidate and active configuration.
 type Store struct {
@@ -30,7 +38,7 @@ type Store struct {
 
 	// Persistent storage
 	db      *DB
-	journal *Journal
+	journal *journal.Journal
 
 	// writeActiveFn is a test seam for active-config persistence
 	// (#1799). nil (production) means s.db.WriteActive. Set via
@@ -107,7 +115,7 @@ func New(filePath string) (*Store, error) {
 		history:  NewHistory(50),
 		filePath: filePath,
 		db:       db,
-		journal:  NewJournal(journalPath),
+		journal:  journal.New(journalPath),
 		nodeID:   -1,
 	}, nil
 }
@@ -179,6 +187,29 @@ func (s *Store) writeActive(tree *config.ConfigTree) error {
 	return s.db.WriteActive(tree)
 }
 
+// journalLog appends an audit entry; a failure is surfaced as a
+// warning only — journaling must never fail a commit/sync/rollback,
+// and the persist_error path must not recurse into journaling its own
+// failure (#1896).
+func (s *Store) journalLog(e *JournalEntry) {
+	if err := s.journal.Log(e); err != nil {
+		slog.Warn("config journal append failed", "action", e.Action, "err", err)
+	}
+}
+
+// journalConfigHash returns the sha256 hex of the tree's Format() text
+// — the same text saveRollbackFiles writes to rollback slots, so a
+// retained rollback file can be correlated to its journal entry with
+// `sha256sum` (#1896). Best-effort correlation: slots shift on every
+// commit and only history.MaxSize() of them are kept.
+func journalConfigHash(tree *config.ConfigTree) string {
+	if tree == nil {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(tree.Format()))
+	return hex.EncodeToString(sum[:])
+}
+
 // ConfigPersistDegraded reports whether the running active config
 // failed to persist to disk on an Option-B path (SyncApply /
 // performAutoRollback) and the background retry has not yet succeeded
@@ -201,10 +232,9 @@ func (s *Store) noteActivePersistFailureLocked(action string, err error) {
 	slog.Error("active config persist failed — running config is not durable; restart would load stale config",
 		"action", action, "err", err, "issue", "#1799")
 	s.persistDegraded = true
-	s.journal.Log(&JournalEntry{
-		Timestamp: time.Now(),
-		Action:    "persist_error",
-		Detail:    fmt.Sprintf("%s: write active config failed: %v", action, err),
+	s.journalLog(&JournalEntry{
+		Action: "persist_error",
+		Detail: fmt.Sprintf("%s: write active config failed: %v", action, err),
 	})
 	if s.persistRetryActive {
 		return
@@ -249,10 +279,9 @@ func (s *Store) persistRetryLoop(backoff, maxBackoff time.Duration) {
 		if err == nil {
 			s.persistDegraded = false
 			s.persistRetryActive = false
-			s.journal.Log(&JournalEntry{
-				Timestamp: time.Now(),
-				Action:    "persist_recovered",
-				Detail:    "active config persisted after earlier write failure",
+			s.journalLog(&JournalEntry{
+				Action: "persist_recovered",
+				Detail: "active config persisted after earlier write failure",
 			})
 			s.mu.Unlock()
 			slog.Info("active config persisted after earlier write failure", "issue", "#1799")
@@ -460,10 +489,9 @@ func (s *Store) SyncApply(content string, chassisPreserve func(*config.ConfigTre
 		s.persistDegraded = false
 	}
 
-	s.journal.Log(&JournalEntry{
-		Timestamp: time.Now(),
-		Action:    "config_sync",
-		After:     compiled,
+	s.journalLog(&JournalEntry{
+		Action:     "config_sync",
+		ConfigHash: journalConfigHash(s.active),
 	})
 
 	s.saveRollbackFiles()
@@ -955,11 +983,10 @@ func (s *Store) CommitWithDescription(description string) (*config.Config, error
 	s.dirty = false
 
 	// Log to journal with description
-	s.journal.Log(&JournalEntry{
-		Timestamp: time.Now(),
-		Action:    "commit",
-		Detail:    description,
-		After:     compiled,
+	s.journalLog(&JournalEntry{
+		Action:     "commit",
+		Detail:     description,
+		ConfigHash: journalConfigHash(s.active),
 	})
 
 	s.saveRollbackFiles()
@@ -1055,10 +1082,9 @@ func (s *Store) CommitConfirmed(minutes int) (*config.Config, error) {
 	s.dirty = false
 
 	// Log to journal
-	s.journal.Log(&JournalEntry{
-		Timestamp: time.Now(),
-		Action:    "commit_confirmed",
-		After:     compiled,
+	s.journalLog(&JournalEntry{
+		Action:     "commit_confirmed",
+		ConfigHash: journalConfigHash(s.active),
 	})
 
 	s.saveRollbackFiles()
@@ -1147,10 +1173,9 @@ func (s *Store) performAutoRollback(gen uint64) {
 	}
 
 	// Log to journal
-	s.journal.Log(&JournalEntry{
-		Timestamp: time.Now(),
-		Action:    "auto_rollback",
-		After:     s.compiled,
+	s.journalLog(&JournalEntry{
+		Action:     "auto_rollback",
+		ConfigHash: journalConfigHash(s.active),
 	})
 
 	fn := s.centralRollbackFn
@@ -1264,9 +1289,16 @@ func (s *Store) ListHistory() []*HistoryEntry {
 	return s.history.List()
 }
 
-// ListCommitHistory returns recent commit journal entries (most recent last).
+// ListCommitHistory returns recent commit journal entries (most recent
+// last). The journal read is bounded by limit (#1896): the tail scan
+// stops after limit entries, so cost is O(limit), not O(lifetime
+// journal). Semantics preserved from v1: the last `limit` entries of
+// ANY action are read first, THEN filtered to commit actions — fewer
+// than `limit` commits can come back when other actions interleave.
+// limit <= 0 reads everything (persist_failure_test relies on it).
+// No Store.mu needed: the journal serializes Log/Tail internally.
 func (s *Store) ListCommitHistory(limit int) ([]*JournalEntry, error) {
-	entries, err := s.journal.ListEntries(limit)
+	entries, err := s.journal.Tail(limit)
 	if err != nil {
 		return nil, err
 	}
