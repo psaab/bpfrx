@@ -2332,7 +2332,11 @@ fn stale_session_never_adopts_reowned_tunnel_id() {
         resolved.tunnel_endpoint_id, 824,
         "the gated resolution stays tunnel-marked so the R-C gate drops it"
     );
-    assert_eq!(resolved.egress_ifindex, 0);
+    assert_eq!(
+        resolved.egress_ifindex,
+        row_ifindex + 1000,
+        "the stale egress_ifindex survives write-back so the gate stays sticky"
+    );
 
     // Control: a session created against the CURRENT owner re-resolves
     // normally (the cached ForwardCandidate fallback applies when the

@@ -105,8 +105,15 @@ fn lookup_forwarding_resolution_for_session_with_cache(
                 .get(&decision.resolution.tunnel_endpoint_id)
             {
                 if row.logical_ifindex != decision.resolution.egress_ifindex {
+                    // PRESERVE the stale egress_ifindex: several paths
+                    // write the re-resolved value back into the stored
+                    // entry (maybe_promote_synced_session, UpsertSynced)
+                    // — zeroing it would erase the discriminator and let
+                    // the NEXT packet adopt the new owner. With it
+                    // preserved the entry stays gated until purged/GC'd.
                     let mut gated = super::no_route_resolution(None);
                     gated.tunnel_endpoint_id = decision.resolution.tunnel_endpoint_id;
+                    gated.egress_ifindex = decision.resolution.egress_ifindex;
                     return gated;
                 }
             }
