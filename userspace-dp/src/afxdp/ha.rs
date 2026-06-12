@@ -421,20 +421,28 @@ impl super::Coordinator {
                 if id == 0 || !purge_ids.contains(&id) {
                     continue;
                 }
-                if entry.metadata.is_reverse {
-                    // Reverse companions are removed by the forward
-                    // entry's delete_synced_session pass.
-                    continue;
-                }
+                // Reverse entries are purged too: in an asymmetric
+                // topology the REVERSE resolution can be the
+                // tunnel-marked one while the forward entry is not in
+                // the purge set, so relying on the forward pass's
+                // companion removal alone would leave the reverse
+                // entry dangling on the remapped id (Claude SMR code
+                // review r1). delete_synced_session handles a reverse
+                // key as a standalone removal. Close deltas are
+                // emitted for FORWARD entries only (matching
+                // emit_close_delta_with_origin's is_reverse skip — the
+                // Go shadow keys off the forward delta).
                 keys.push(entry.key.clone());
-                deltas.push(crate::session::SessionDelta {
-                    kind: crate::session::SessionDeltaKind::Close,
-                    key: entry.key.clone(),
-                    decision: entry.decision,
-                    metadata: entry.metadata.clone(),
-                    origin: entry.origin,
-                    fabric_redirect_sync: false,
-                });
+                if !entry.metadata.is_reverse {
+                    deltas.push(crate::session::SessionDelta {
+                        kind: crate::session::SessionDeltaKind::Close,
+                        key: entry.key.clone(),
+                        decision: entry.decision,
+                        metadata: entry.metadata.clone(),
+                        origin: entry.origin,
+                        fabric_redirect_sync: false,
+                    });
+                }
             }
         }
         for key in &keys {
