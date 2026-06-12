@@ -85,12 +85,24 @@ func buildRuntimeDataPlane(dpType string) (dataplane.RuntimeDataPlane, error) {
 // daemon_apply step-0a bind loop targets. SHARED between step 0a and
 // the RIListMember scan in collectAppliedTunnels (#1884): the tunnel
 // manager's unbind-veto/observation logic must mirror exactly what 0a
-// binds. Deliberately the literal step-0a transform — NOT
-// cfg.ResolveKernelIfName — because 0a binds the literal ".N" form for
-// unit>0 entries today (a pre-existing 0a naming gap for "uN" per-unit
-// tunnel devices, tracked as a follow-up; fixing it only here would
-// make the veto claim binds 0a does not perform).
-func riMemberLinuxName(ifaceName string) string {
+// binds — both callers MUST pass a tunMap built from the SAME cfg via
+// cfg.TunnelNameMap().
+//
+// Tunnel refs resolve through tunMap (#1904): TunnelNameMap returns
+// the compiler-assigned TunnelConfig.Name verbatim — the same field
+// ApplyTunnels uses to create the kernel device — so a unit>0 member
+// like gr-0/0/0.1 binds the real per-unit "uN" device gr-0-0-0u1
+// (pkg/config/compiler_interfaces.go) and cannot diverge from the
+// device-naming scheme by construction. Non-tunnel refs keep the
+// literal pre-#1904 transform (LinuxIfName + unit-0 collapse)
+// byte-identically; widening to the full cfg.ResolveKernelIfName
+// (reth → physical member, st0.N verbatim, irb → bridge) would
+// silently activate binds 0a has never performed and needs its own
+// ratification.
+func riMemberLinuxName(tunMap map[string]string, ifaceName string) string {
+	if name, ok := tunMap[ifaceName]; ok && name != "" {
+		return name
+	}
 	// Convert Junos name (gr-0/0/0.0) to Linux name (gr-0-0-0).
 	// Strip ".0" unit suffix — unit 0 is the base interface.
 	linuxName := config.LinuxIfName(ifaceName)
@@ -110,12 +122,13 @@ func collectAppliedTunnels(cfg *config.Config) []*config.TunnelConfig {
 	// skipped; shared normalization; later entries overwrite, matching
 	// 0a's last-bind-wins iteration). Feeds TunnelConfig.RIListMember.
 	riListMember := map[string]string{}
+	tunMap := cfg.TunnelNameMap()
 	for _, ri := range cfg.RoutingInstances {
 		if ri == nil || ri.InstanceType == "forwarding" {
 			continue
 		}
 		for _, ifaceName := range ri.Interfaces {
-			riListMember[riMemberLinuxName(ifaceName)] = ri.Name
+			riListMember[riMemberLinuxName(tunMap, ifaceName)] = ri.Name
 		}
 	}
 	var tunnels []*config.TunnelConfig
