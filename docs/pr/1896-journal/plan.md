@@ -130,6 +130,50 @@ behavior — persist_error journaling on a failing disk must not recurse).
   the ≤limit-commits wrinkle but breaks pre/post equivalence).
 - Rollback-file encryption parity (pre-existing).
 
+### 6. SMR round-1 deltas (Claude self-review)
+
+- **Internal `sync.Mutex` in `Journal`** serializing `Log` and `Tail`.
+  `ListCommitHistory` (store.go:1268) does not hold `Store.mu`; without
+  internal locking, a reader that opens the current segment while a
+  rotation renames it to `.1` re-reads the same inode under both names
+  → duplicated entries in `show system commit`. Operator-paced, so a
+  plain mutex is free.
+- **`Tail` skips missing segments** (continue, not break): a crash
+  mid-shift can leave gaps (`.1` present, `.2` missing, `.3` present);
+  worst case is lost oldest retention, never corruption.
+- **Append fd is `O_RDWR|O_APPEND|O_CREATE`** so the torn-tail check
+  can `ReadAt` the last byte on the same fd.
+- **`Log` failures get a `slog.Warn`** via a store-side helper (today
+  every call site silently discards the error; with payloads gone the
+  journal is the only audit record, so at least surface the failure in
+  logs — still never fatal, and the persist_error path must not
+  recurse into journaling its own failure).
+- ConfigHash is documented as *best-effort correlation while the
+  rollback slot is retained* — not a referential-integrity guarantee
+  (slots shift per commit and only ~50 are kept; whether config_sync
+  pushes history is irrelevant under this phrasing).
+
+### 7. AGY plan-round-1 deltas (adversarial-review-mqb7hxhl-e7opzl, PLAN-NEEDS-CHANGES)
+
+- **F1 reader/writer race** — same defect as SMR delta 1; resolved by
+  the internal `Journal` mutex (chosen over `Store.mu.RLock` in
+  `ListCommitHistory`: every `Log` site already holds the Store write
+  lock, and journal-internal locking also covers any future caller).
+- **F2 UTF-8 split at chunk boundaries** — the scanner operates on
+  `[]byte` end-to-end (`bytes.IndexByte`/`bytes.Split`); no string
+  conversion until a full line is reassembled. Adopted as an explicit
+  implementation constraint + test with multi-byte Detail straddling a
+  chunk boundary.
+- **F3 missing intermediate segments** — same as SMR delta 2: `Tail`
+  continues over `os.IsNotExist` gaps up to maxSegments.
+- **F4 unbounded line accumulation** — a corrupt newline-free segment
+  would otherwise buffer the whole file. Cap reverse-scan line
+  assembly at 16 MiB (well above any real legacy fat entry, well below
+  whole-disk): past the cap the accumulated fragment is discarded and
+  the scanner resyncs at the previous newline (skip mode), dropping
+  only the poisoned line. v1 read the entire file unconditionally, so
+  this is strictly better.
+
 ## Tests
 
 1. **Bounded-read proof** (issue requirement): 5,000-entry journal;
