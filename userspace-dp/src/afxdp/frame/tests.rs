@@ -628,10 +628,12 @@ fn build_forwarded_frame_from_frame_encapsulates_native_gre() {
 #[test]
 fn local_origin_tunnel_tx_request_encapsulates_raw_ip_for_active_owner() {
     let state = build_forwarding_state(&native_gre_snapshot(true));
-    let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
+    // #1881: the loop now loads HA state once per iteration and
+    // passes the map down — the builder takes &BTreeMap directly.
+    let ha_state = BTreeMap::from([(
         1,
         active_ha_runtime(monotonic_nanos() / 1_000_000_000),
-    )])));
+    )]);
     let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
     let packet = build_icmp_echo_frame_v4(
         Ipv4Addr::new(10, 255, 192, 42),
@@ -659,10 +661,10 @@ fn local_origin_tunnel_tx_request_encapsulates_raw_ip_for_active_owner() {
 #[test]
 fn local_origin_tunnel_tx_request_rejects_inactive_owner() {
     let state = build_forwarding_state(&native_gre_snapshot(true));
-    let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
+    let ha_state = BTreeMap::from([(
         1,
         inactive_ha_runtime(monotonic_nanos() / 1_000_000_000),
-    )])));
+    )]);
     let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
     let packet = build_icmp_echo_frame_v4(
         Ipv4Addr::new(10, 255, 192, 42),
@@ -5570,5 +5572,42 @@ fn build_tunnel_egress_non_first_fragment_skips_forced_l4_recompute() {
         &egress[out_payload_start..written],
         &before_payload[..],
         "forced tunnel L4 recompute must not touch non-first fragment payload"
+    );
+}
+
+/// #1881 staleness-pin companion (plan §9 test 1): the local-origin
+/// builder follows WHATEVER state it is given — with the loop now
+/// tracking the shared forwarding ArcSwap, a destination edit reaches
+/// the very next packet. Pre-#1881 the loop held a spawn-time clone,
+/// so the old-state encap below is exactly what a stale thread kept
+/// emitting until restart.
+#[test]
+fn local_origin_tunnel_tx_request_follows_supplied_state_destination() {
+    let state_old = build_forwarding_state(&native_gre_snapshot(true));
+    let mut snapshot_new = native_gre_snapshot(true);
+    snapshot_new.tunnel_endpoints[0].destination = "2602:ffd3:0:2::9".to_string();
+    let state_new = build_forwarding_state(&snapshot_new);
+    let ha_state = BTreeMap::from([(
+        1,
+        active_ha_runtime(monotonic_nanos() / 1_000_000_000),
+    )]);
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
+    let packet = build_icmp_echo_frame_v4(
+        Ipv4Addr::new(10, 255, 192, 42),
+        Ipv4Addr::new(10, 255, 192, 41),
+        64,
+    );
+    // Outer IPv6 destination: eth(14) + vlan(4) + 24 = offset 42..58.
+    let plan_old =
+        build_local_origin_tunnel_tx_request(&packet[14..], 1, &state_old, &ha_state, &dynamic_neighbors)
+            .expect("old-state plan");
+    assert_eq!(plan_old.tx_request.bytes[57], 0x07, "old outer destination");
+    let plan_new =
+        build_local_origin_tunnel_tx_request(&packet[14..], 1, &state_new, &ha_state, &dynamic_neighbors)
+            .expect("new-state plan");
+    assert_eq!(
+        plan_new.tx_request.bytes[57], 0x09,
+        "destination edit reaches the encap as soon as the thread \
+         loads the rotated state"
     );
 }

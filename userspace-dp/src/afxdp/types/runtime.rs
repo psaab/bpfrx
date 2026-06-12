@@ -41,6 +41,34 @@ pub(in crate::afxdp) struct LocalTunnelSourceHandle {
     pub(in crate::afxdp) join: Option<JoinHandle<()>>,
 }
 
+/// #1881: lifecycle entry for one GRE local-origin thread, keyed by
+/// tunnel_endpoint_id in `Coordinator::tunnel_sources`. Mirrors
+/// `WgControlEntry` minus the engine pointer — GRE has no engine, and
+/// endpoint CONTENT changes (destination/source/key, routes, CoS)
+/// flow to the live thread through the shared forwarding ArcSwap, so
+/// only the TUN ATTACHMENT is spawn-baked identity.
+///
+/// `handle == None` is a TOMBSTONE (thread exited; backoff stamp +
+/// attachment retained). Entries are removed ONLY by the apply-time
+/// stale prune, the defer-branch snapshot prune, and `stop_inner` —
+/// never by the finished sweep (#1866 D1 rule).
+pub(crate) struct LocalTunnelSourceEntry {
+    /// Live (or finished-but-unswept) thread handle. `None` = tombstone.
+    pub(in crate::afxdp) handle: Option<LocalTunnelSourceHandle>,
+    /// TUN attachment captured at spawn: logical ifindex + resolved
+    /// tunnel name. Attachment drift is the ONLY restart condition.
+    pub(in crate::afxdp) spawned_ifindex: i32,
+    pub(in crate::afxdp) spawned_tunnel_name: String,
+    /// Delivery sender for the CURRENT spawn attempt. A fresh channel
+    /// pair is created per spawn (the Receiver dies with the thread);
+    /// a failed spawn leaves this `None`; publication into
+    /// `local_tunnel_deliveries` is restricted to entries with a live
+    /// handle (plan v3 SMR-2 / AGY r1 R2).
+    pub(in crate::afxdp) delivery_tx: Option<SyncSender<Vec<u8>>>,
+    /// Stamped at EVERY spawn attempt (success or failure).
+    pub(in crate::afxdp) last_spawn_attempt_ns: u64,
+}
+
 /// #1866: lifecycle entry for one WG control thread, keyed by
 /// tunnel_endpoint_id in `Coordinator::wg_control_threads`.
 ///

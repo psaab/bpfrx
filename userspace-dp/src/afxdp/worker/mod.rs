@@ -1051,7 +1051,9 @@ fn fallback_shared_group_to_private(err: SharedGroupBindError, bindings: &mut Ve
 /// today. The win is the steady-state short-circuit, not the
 /// on-change path.
 #[inline]
-fn load_arc_if_changed<T>(cached: &Arc<T>, shared: &ArcSwap<T>) -> Option<Arc<T>> {
+// #1881: pub(in crate::afxdp) so the GRE local-origin loop
+// (afxdp/tunnel.rs) shares the same per-tick refresh helper.
+pub(in crate::afxdp) fn load_arc_if_changed<T>(cached: &Arc<T>, shared: &ArcSwap<T>) -> Option<Arc<T>> {
     let guard = shared.load();
     if Arc::ptr_eq(cached, &*guard) {
         None
