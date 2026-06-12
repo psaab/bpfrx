@@ -2205,72 +2205,149 @@ fn tunnel_remap_purge_ids_owner_change_semantics() {
     let mut snap_removed = two_tunnel_snapshot();
     snap_removed.tunnel_endpoints.retain(|ep| ep.id == 7);
     let next = build_forwarding_state(&snap_removed);
-    assert_eq!(tunnel_remap_purge_ids(&prev, &next), vec![824]);
+    assert_eq!(tunnel_remap_purge_ids(&prev, &next, true), vec![824]);
 
     // (b) owner change: id 824 now belongs to a DIFFERENT logical name
     // (temporal hash reuse).
     let mut snap_reused = two_tunnel_snapshot();
     snap_reused.tunnel_endpoints[0].interface = "gr-9/9/9.0".into();
     let next = build_forwarding_state(&snap_reused);
-    assert_eq!(tunnel_remap_purge_ids(&prev, &next), vec![824]);
+    assert_eq!(tunnel_remap_purge_ids(&prev, &next, true), vec![824]);
 
     // (c) cosmetic linux_name rename, logical name unchanged: NO purge.
     let mut snap_renamed = two_tunnel_snapshot();
     snap_renamed.tunnel_endpoints[0].linux_name = "gre-renamed".into();
     let next = build_forwarding_state(&snap_renamed);
-    assert!(tunnel_remap_purge_ids(&prev, &next).is_empty());
+    assert!(tunnel_remap_purge_ids(&prev, &next, true).is_empty());
 
     // (d) identical set: NO purge.
     let next = build_forwarding_state(&two_tunnel_snapshot());
-    assert!(tunnel_remap_purge_ids(&prev, &next).is_empty());
+    assert!(tunnel_remap_purge_ids(&prev, &next, true).is_empty());
 }
 
-/// #1873 R-D defer pins (Codex code-review r1): a row whose id the
-/// previous state owned under a DIFFERENT logical name is deferred out
-/// of the built state (recorded in deferred_reowned_tunnel_ids), so a
-/// stale session can never resolve the old id into the new owner; an
-/// immediate rebuild with the deferred state as `previous` installs
-/// it. Same-name and fresh ids are never deferred.
+/// #1873 owner-check pins (Codex code r2 — replaces the unsound r1
+/// defer + rotation-barrier design): a re-owned id installs
+/// IMMEDIATELY (no defer), the unrelated WG endpoint's engine Arc is
+/// reused verbatim, and the purge set plus the per-packet owner check
+/// (not apply-time timing) carry the correctness burden.
 #[test]
-fn reowned_tunnel_id_is_deferred_then_installed() {
+fn reowned_tunnel_id_installs_immediately_with_engine_reuse() {
     let prev = build_forwarding_state(&two_tunnel_snapshot());
 
     // Same snapshot, id 824 re-owned by a different logical name.
     let mut snap_reused = two_tunnel_snapshot();
     snap_reused.tunnel_endpoints[0].interface = "gr-9/9/9.0".into();
-    let deferred_state = build_forwarding_state_with_policy_counters_and_previous(
+    let next = build_forwarding_state_with_policy_counters_and_previous(
         &snap_reused,
         &PolicyCounterStore::default(),
         Some(&prev),
     )
     .unwrap();
-    assert!(
-        !deferred_state.tunnel_endpoints.contains_key(&824),
-        "re-owned id must be DEFERRED out of the first build"
-    );
-    assert_eq!(deferred_state.deferred_reowned_tunnel_ids, vec![824]);
-    // The unrelated WG endpoint is untouched by the defer.
-    assert!(deferred_state.tunnel_endpoints.contains_key(&7));
-
-    // Follow-up rebuild (previous = the deferred state, id absent
-    // there) installs the new owner.
-    let full = build_forwarding_state_with_policy_counters_and_previous(
-        &snap_reused,
-        &PolicyCounterStore::default(),
-        Some(&deferred_state),
-    )
-    .unwrap();
-    assert!(full.deferred_reowned_tunnel_ids.is_empty());
-    let ep = full.tunnel_endpoints.get(&824).expect("new owner installed");
+    let ep = next.tunnel_endpoints.get(&824).expect("new owner installed");
     assert_eq!(ep.interface, "gr-9/9/9.0");
+    // The unrelated WG endpoint keeps its engine Arc across the apply.
+    assert!(next.tunnel_endpoints.contains_key(&7));
+    assert!(std::sync::Arc::ptr_eq(
+        prev.wg_engines.get(&7).expect("prev engine"),
+        next.wg_engines.get(&7).expect("next engine"),
+    ));
+}
 
-    // Control cases: identical set and plain removal never defer.
-    let same = build_forwarding_state_with_policy_counters_and_previous(
-        &two_tunnel_snapshot(),
-        &PolicyCounterStore::default(),
-        Some(&prev),
-    )
-    .unwrap();
-    assert!(same.deferred_reowned_tunnel_ids.is_empty());
-    assert!(same.tunnel_endpoints.contains_key(&824));
+/// #1873 purge-set pin (Codex code r2): an id NEWLY APPEARING in
+/// `next` (absent in `previous`) is purged when
+/// `include_new_appearances` is set — any entry still storing it
+/// (e.g. a synced copy installed with an unresolvable id during HA
+/// config skew) predates `previous` and must die before the new
+/// owner's row is reachable. The first-apply arm (flag false) skips
+/// it so boot-time synced sessions survive.
+#[test]
+fn newly_appearing_tunnel_id_is_purged_after_first_apply() {
+    use crate::afxdp::coordinator::tunnel_remap_purge_ids;
+    // previous has only the WG endpoint; next adds the GRE row (824).
+    let mut snap_wg_only = two_tunnel_snapshot();
+    snap_wg_only.tunnel_endpoints.retain(|ep| ep.id == 7);
+    let prev = build_forwarding_state(&snap_wg_only);
+    let next = build_forwarding_state(&two_tunnel_snapshot());
+    assert_eq!(tunnel_remap_purge_ids(&prev, &next, true), vec![824]);
+    assert!(tunnel_remap_purge_ids(&prev, &next, false).is_empty());
+}
+
+/// #1873 owner check (Codex code r2): a stale session whose stored
+/// tunnel resolution was created against a DIFFERENT owning netdev of
+/// the same id must NEVER adopt the new owner at re-resolution — the
+/// stored egress_ifindex (= the owner's logical_ifindex at resolve
+/// time) is the discriminator, independent of purge timing, worker
+/// rotation, or which forwarding state the worker held at create.
+#[test]
+fn stale_session_never_adopts_reowned_tunnel_id() {
+    use crate::afxdp::session_glue::lookup_forwarding_resolution_for_session;
+    use crate::afxdp::ShardedNeighborMap;
+
+    let state = build_forwarding_state(&two_tunnel_snapshot());
+    let row_ifindex = state
+        .tunnel_endpoints
+        .get(&824)
+        .expect("gre row")
+        .logical_ifindex;
+    let flow = crate::afxdp::SessionFlow {
+        src_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 61, 102)),
+        dst_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 7)),
+        forward_key: crate::session::SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: 6,
+            src_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 61, 102)),
+            dst_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 7)),
+            src_port: 55068,
+            dst_port: 5201,
+        },
+    };
+    let stale_decision = crate::session::SessionDecision {
+        resolution: crate::afxdp::ForwardingResolution {
+            disposition: crate::afxdp::ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            // The OLD owner's netdev ifindex — different from the
+            // current row's.
+            egress_ifindex: row_ifindex + 1000,
+            tx_ifindex: 3,
+            tunnel_endpoint_id: 824,
+            next_hop: None,
+            neighbor_mac: Some([2, 0, 0, 0, 0, 9]),
+            src_mac: Some([2, 0, 0, 0, 0, 1]),
+            tx_vlan_id: 0,
+        },
+        nat: crate::nat::NatDecision::default(),
+    };
+    let resolved = lookup_forwarding_resolution_for_session(
+        &state,
+        &std::sync::Arc::new(ShardedNeighborMap::new()),
+        &flow,
+        stale_decision,
+    );
+    assert_eq!(
+        resolved.disposition,
+        crate::afxdp::ForwardingDisposition::NoRoute,
+        "stale owner must be gated, never re-resolved into the new owner"
+    );
+    assert_eq!(
+        resolved.tunnel_endpoint_id, 824,
+        "the gated resolution stays tunnel-marked so the R-C gate drops it"
+    );
+    assert_eq!(resolved.egress_ifindex, 0);
+
+    // Control: a session created against the CURRENT owner re-resolves
+    // normally (the cached ForwardCandidate fallback applies when the
+    // outer route is unresolvable in this fixture).
+    let mut fresh_decision = stale_decision;
+    fresh_decision.resolution.egress_ifindex = row_ifindex;
+    let resolved = lookup_forwarding_resolution_for_session(
+        &state,
+        &std::sync::Arc::new(ShardedNeighborMap::new()),
+        &flow,
+        fresh_decision,
+    );
+    assert_ne!(
+        (resolved.disposition, resolved.egress_ifindex),
+        (crate::afxdp::ForwardingDisposition::NoRoute, 0),
+        "matching owner must not be gated"
+    );
 }

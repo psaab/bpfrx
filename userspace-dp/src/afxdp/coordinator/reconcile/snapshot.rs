@@ -44,6 +44,10 @@ pub(super) fn apply_snapshot(
         }
     };
 
+    // #1873 R-D: captured BEFORE the assignment below — gates the
+    // new-appearance purge arm (must not fire on the helper's first
+    // apply, where every configured id "appears").
+    let prior_snapshot_installed = coord.validation.snapshot_installed;
     coord.validation = ValidationState {
         snapshot_installed: true,
         config_generation: snapshot.generation,
@@ -60,29 +64,18 @@ pub(super) fn apply_snapshot(
     // #1873 R-D: compute the remap purge set BEFORE the swap and purge
     // BEFORE the stores. On this full-reconcile path the workers are
     // torn down and re-seeded from the (already purged) shared maps, so
-    // no old-owner session can survive into the new worker tables; a
-    // deferred re-owned row (populate skips it when `previous` owned
-    // the id under another name) is installed by an immediate rebuild
-    // below — no rotation barrier needed pre-bring-up.
-    let tunnel_purge_ids =
-        super::super::tunnel_remap_purge_ids(&coord.forwarding, &new_forwarding);
+    // no old-owner session can survive into the new worker tables. The
+    // purge is cleanup, not the correctness boundary — re-resolution
+    // and the encap builders refuse an id whose owning netdev ifindex
+    // differs from the session's stored one (Codex code-review r2;
+    // replaces the unsound r1 defer + rotation-barrier design).
+    let tunnel_purge_ids = super::super::tunnel_remap_purge_ids(
+        &coord.forwarding,
+        &new_forwarding,
+        prior_snapshot_installed,
+    );
     coord.purge_remapped_tunnel_sessions(&tunnel_purge_ids);
     coord.forwarding = new_forwarding;
-    if !coord.forwarding.deferred_reowned_tunnel_ids.is_empty() {
-        let deferred = coord.forwarding.deferred_reowned_tunnel_ids.clone();
-        coord.purge_remapped_tunnel_sessions(&deferred);
-        if let Ok(full) = build_forwarding_state_with_policy_counters_and_previous(
-            snapshot,
-            &coord.policy_counters,
-            Some(&coord.forwarding),
-        ) {
-            coord.forwarding = full;
-            eprintln!(
-                "xpf-userspace-dp: installed re-owned tunnel endpoint id(s) {:?} during reconcile (#1873)",
-                deferred
-            );
-        }
-    }
     coord.shared_validation.store(Arc::new(coord.validation));
     coord
         .ha
