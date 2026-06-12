@@ -327,6 +327,31 @@ func TestSchemaValidate_Interfaces_AcceptedValuesCompileAsWritten(t *testing.T) 
 	}
 }
 
+// Known residual, pinned for honesty (same class as the chassis PR-2
+// `node 0 priority 300;` one-liner): the hierarchical PACKED one-liner
+// `vrrp-group 1 priority 300;` packs the property into the instance
+// node's Keys, which the walker's compiler-faithful contract consumes
+// as identity tokens without validation — even though the vrrp
+// compiler's legacy Keys-packed loop (compiler_interfaces.go:376) DOES
+// compile it (priority 300 then wraps at the uint8 wire encode). The
+// structured spellings (flat-set `set ... vrrp-group 1 priority 300`
+// and the braced block) ARE gated — see the matrix.
+func TestSchemaValidate_Interfaces_PackedVrrpOneLinerBypassesGate(t *testing.T) {
+	if err := schemaCheck(t, `interfaces {
+    ge-0-0-0 {
+        unit 0 {
+            family inet {
+                address 10.0.1.10/24 {
+                    vrrp-group 1 priority 300;
+                }
+            }
+        }
+    }
+}`); err != nil {
+		t.Fatalf("documented bypass changed behaviour (now rejects?): %v", err)
+	}
+}
+
 // `set interfaces ge-0-0-0 unit 0 family inet address ?` — the typed
 // KEY slot surfaces the schema placeholder plus the example CIDR at the
 // empty identity slot on the live completion path.

@@ -448,10 +448,12 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"point-to-point": {desc: "Point-to-point interface", children: nil},
 			// 802.1Q VID is a 12-bit wire field: 0 is the compiler's
 			// "untagged" zero-value sentinel and 4095 is reserved, so
-			// 1..4094 is exactly the encodable range (networkd's VLAN
-			// .netdev Id= enforces the same ceiling). Compiled with the
-			// Atoi error swallowed (compiler_interfaces.go:293/:302) —
-			// garbage silently meant "no VLAN" before this gate.
+			// 1..4094 is exactly the usable range — the runtime creates
+			// the sub-interface via netlink.Vlan{VlanId} (pkg/dataplane/
+			// compiler_iface.go:96) and the kernel 8021q layer rejects
+			// anything outside it. Compiled with the Atoi error
+			// swallowed (compiler_interfaces.go:293/:302) — garbage
+			// silently meant "no VLAN" before this gate.
 			"vlan-id": {
 				desc:          "VLAN ID",
 				args:          1,
