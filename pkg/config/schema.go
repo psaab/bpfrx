@@ -1503,8 +1503,15 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		}},
 		"dataplane-type": {desc: "Dataplane type", args: 1, placeholder: "<type>", children: nil},
 		"dataplane": {desc: "Dataplane configuration", children: map[string]*schemaNode{
-			"cores":          {args: 1, desc: "Number of dataplane cores", children: nil},
-			"memory":         {args: 1, desc: "Dataplane memory allocation", children: nil},
+			// cores / memory / socket-mem / rx-mode / ports are DPDK-era
+			// knobs whose consumer was deleted in the #1525 retirement —
+			// compileUserspaceDataplane has no case for any of them. They
+			// stay in the grammar for stored-config compatibility (never
+			// break an existing stanza) but have NO effect; the compiler
+			// emits a per-knob commit warning instead (#1892,
+			// userspaceRetiredKnobWarnings).
+			"cores":          {args: 1, desc: "Legacy DPDK core count (retired, ignored)", children: nil},
+			"memory":         {args: 1, desc: "Legacy DPDK memory allocation (retired, ignored)", children: nil},
 			"socket-mem":     {args: 1, desc: "Legacy DPDK socket memory (retired, ignored)", children: nil},
 			"binary":         {args: 1, desc: "Userspace dataplane helper binary path", children: nil},
 			"control-socket": {args: 1, desc: "Unix control socket path", children: nil},
@@ -1626,15 +1633,15 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					children:      nil,
 				},
 			}},
-			"rx-mode": {children: map[string]*schemaNode{
-				"idle-threshold":   {args: 1, children: nil},
-				"resume-threshold": {args: 1, children: nil},
-				"sleep-timeout":    {args: 1, children: nil},
+			"rx-mode": {desc: "Legacy DPDK adaptive RX mode (retired, ignored)", children: map[string]*schemaNode{
+				"idle-threshold":   {args: 1, desc: "Legacy DPDK RX idle threshold (retired, ignored)", children: nil},
+				"resume-threshold": {args: 1, desc: "Legacy DPDK RX resume threshold (retired, ignored)", children: nil},
+				"sleep-timeout":    {args: 1, desc: "Legacy DPDK RX sleep timeout (retired, ignored)", children: nil},
 			}},
-			"ports": {wildcard: &schemaNode{children: map[string]*schemaNode{
-				"interface": {args: 1, children: nil},
-				"rx-mode":   {args: 1, children: nil},
-				"cores":     {args: 1, children: nil},
+			"ports": {desc: "Legacy DPDK per-port mapping (retired, ignored)", wildcard: &schemaNode{placeholder: "<port-name>", children: map[string]*schemaNode{
+				"interface": {args: 1, desc: "Legacy DPDK port interface binding (retired, ignored)", children: nil},
+				"rx-mode":   {args: 1, desc: "Legacy DPDK per-port RX mode (retired, ignored)", children: nil},
+				"cores":     {args: 1, desc: "Legacy DPDK per-port core list (retired, ignored)", children: nil},
 			}}},
 		}},
 		"services": {desc: "System services", children: map[string]*schemaNode{
