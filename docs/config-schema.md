@@ -145,6 +145,46 @@ Rules:
   This contract was converged across 7 hostile Codex review rounds; do not
   re-add packed-tail validation without re-checking compiler reachability.
 
+## Help-text discipline (#1892)
+
+Every `schemaNode` in `setSchema` MUST carry a `desc:` — an empty desc
+renders as a blank line in `?` completion across all three frontends.
+The #1892 audit filled all 493 previously-empty nodes; do not add new
+nodes without one. Rules:
+
+- **Verified behavior only.** A wrong help text is worse than a missing
+  one. Write the desc from the compiler/runtime consumer, not from what
+  the keyword sounds like. Containers get structural descs ("Source NAT
+  configuration"); behavior-bearing leaves state what the consumer does,
+  with enum values / units / defaults in parens ONLY when read from
+  code (model: `claim-host-tunables` — "Allow xpfd to write host-scope
+  tunables (true|false, default false)").
+- **desc / placeholder are display-only.** They never affect SetPath
+  grouping, so help fixes are always grouping-safe. Structure fields
+  (`args`, `children`, `wildcard`, `multi`) are NOT — see the typed-leaf
+  rules above.
+- **`groups <*>` mirrors the top level by pointer** (`init()` in
+  `schema.go`), so a top-level desc automatically documents the same
+  path under `groups <name> ...`. Never duplicate nodes to add help.
+
+## Retired knobs (#1525 / #1892)
+
+Retired DPDK-era `system dataplane` knobs — `cores`, `memory`,
+`socket-mem`, `rx-mode {idle-threshold, resume-threshold,
+sleep-timeout}`, `ports <name> {interface, rx-mode, cores}` — remain
+parseable for stored-config compatibility (a stanza that committed once
+must never stop loading), but have NO consumer:
+`compileUserspaceDataplane` records them in
+`UserspaceConfig.RetiredKnobsSeen` and `userspaceRetiredKnobWarnings`
+emits a per-knob commit warning ("retired DPDK-era knob (#1525),
+accepted for config compatibility but ignored") on both the strict and
+lenient compile paths. Their schema descs say "(retired, ignored)" so
+completion stops advertising them as live. Follow this pattern —
+keep-parsing + warn + honest desc — when retiring any future knob;
+hard-reject (the `dataplane-type dpdk` / `ebpf` sentinel errors) is
+reserved for whole-dataplane selection where a rewrite shim
+(`rewriteRetiredDataplaneType`) protects stored configs.
+
 ## Rollout (#1319)
 
 - **PR 1 (merged, #1682):** moved `ValueType` to `pkg/config`; added the

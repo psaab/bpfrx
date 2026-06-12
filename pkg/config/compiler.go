@@ -459,6 +459,12 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	// runtime ignores tracking.
 	cfg.Warnings = append(cfg.Warnings, vrrpTrackConfigWarnings(cfg)...)
 
+	// #1892: retired DPDK-era `system dataplane` knobs (cores, memory,
+	// socket-mem, rx-mode, ports) parse for stored-config compatibility
+	// but configure nothing — warn so the operator knows the stanza is
+	// inert instead of silently dropping it.
+	cfg.Warnings = append(cfg.Warnings, userspaceRetiredKnobWarnings(cfg)...)
+
 	// #1539: the structural invariant `cfg.System.DPDKDataplane = nil`
 	// was added on master (PR #1553) as a runtime safeguard against
 	// AST leakage of retired DPDK sub-tree fields. After this PR

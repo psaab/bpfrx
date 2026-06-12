@@ -114,6 +114,14 @@ type UserspaceConfig struct {
 	// these values dynamically and writes are a waste.
 	CoalescenceRXUsecs int `json:"coalescence_rx_usecs,omitempty"`
 	CoalescenceTXUsecs int `json:"coalescence_tx_usecs,omitempty"`
+
+	// RetiredKnobsSeen records which retired DPDK-era `system dataplane`
+	// knobs (cores, memory, socket-mem, rx-mode, ports — consumer deleted
+	// in #1525) were present in the compiled tree. They are accepted for
+	// stored-config compatibility but have no effect; the compiler turns
+	// each into a commit warning (userspaceRetiredKnobWarnings, #1892).
+	// Compile-time bookkeeping only — never serialized.
+	RetiredKnobsSeen []string `json:"-"`
 }
 
 // SharedUMEMConfig is an optional AF_XDP shared-UMEM policy override passed

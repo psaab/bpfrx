@@ -4734,6 +4734,30 @@ fn txn_run_descriptor(
     frame: &[u8],
     meta: UserspaceDpMeta,
 ) -> (BatchCounters, DebugPollCounters) {
+    let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+    txn_run_descriptor_with_deliveries(
+        binding,
+        sessions,
+        forwarding,
+        ha_state,
+        frame,
+        meta,
+        &local_tunnel_deliveries,
+    )
+}
+
+/// `txn_run_descriptor` with a caller-provided `local_tunnel_deliveries`
+/// map, so the GRE local-origin INBOUND delivery pins (#1885) can
+/// observe exactly the bytes that would be written to the gr- TUN.
+fn txn_run_descriptor_with_deliveries(
+    binding: &mut BindingWorker,
+    sessions: &mut SessionTable,
+    forwarding: &ForwardingState,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    local_tunnel_deliveries: &Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>>,
+) -> (BatchCounters, DebugPollCounters) {
     let meta_len = std::mem::size_of::<UserspaceDpMeta>();
     let frame_offset = 128;
     let meta_offset = frame_offset - meta_len;
@@ -4768,7 +4792,6 @@ fn txn_run_descriptor(
     let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
-    let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
     let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
     let last_resolution = Arc::new(Mutex::new(None));
     let peer_worker_commands = Vec::new();
@@ -4788,7 +4811,7 @@ fn txn_run_descriptor(
         shared_owner_rg_indexes: &shared_owner_rg_indexes,
         slow_path: None,
         event_stream: None,
-        local_tunnel_deliveries: &local_tunnel_deliveries,
+        local_tunnel_deliveries,
         recent_exceptions: &recent_exceptions,
         last_resolution: &last_resolution,
         peer_worker_commands: &peer_worker_commands,
@@ -5538,6 +5561,310 @@ fn txn_tunnel_marked_missing_neighbor_not_buffered() {
             > drops_after_first,
         "second packet must also be dropped+counted at the R-C gate"
     );
+}
+
+/// #1885 fixture: WAN underlay (reth0.80, VLAN 80) + a gre endpoint
+/// whose local outer address is 172.16.80.8 and whose gr- interface
+/// (ifindex 77) carries the inner address 10.255.0.1/30, so an inner
+/// packet to 10.255.0.1 resolves LocalDelivery with
+/// `local_ifindex == 77` — the `local_tunnel_deliveries` key.
+/// Default-permit so host-inbound resolution, not policy, decides.
+fn gre_to_self_snapshot() -> ConfigSnapshot {
+    let mut snapshot = nat_snapshot();
+    snapshot.default_policy = "permit".to_string();
+    snapshot.policies.clear();
+    snapshot.source_nat_rules.clear();
+    snapshot.interfaces.push(InterfaceSnapshot {
+        name: "gr-0/0/0.0".to_string(),
+        zone: "wan".to_string(),
+        linux_name: "gr-0-0-0".to_string(),
+        ifindex: 77,
+        tunnel: true,
+        addresses: vec![InterfaceAddressSnapshot {
+            family: "inet".to_string(),
+            address: "10.255.0.1/30".to_string(),
+            scope: 0,
+        }],
+        ..Default::default()
+    });
+    snapshot.tunnel_endpoints = vec![crate::protocol::snapshot::TunnelEndpointSnapshot {
+        id: 824,
+        interface: "gr-0/0/0.0".to_string(),
+        linux_name: "gr-0-0-0".to_string(),
+        ifindex: 77,
+        zone: "wan".to_string(),
+        mode: "gre".to_string(),
+        outer_family: "inet".to_string(),
+        source: "172.16.80.8".to_string(),
+        destination: "203.0.113.9".to_string(),
+        transport_table: "inet.0".to_string(),
+        ttl: 64,
+        ..Default::default()
+    }];
+    snapshot
+}
+
+/// Inner ICMP echo request 10.255.0.2 -> 10.255.0.1 (the gr-local
+/// inner address): 20-byte IPv4 header + 8-byte ICMP + 8 payload.
+fn build_gre_inner_icmp_packet_v4() -> Vec<u8> {
+    let mut packet = Vec::new();
+    packet.extend_from_slice(&[
+        0x45, 0x00, 0x00, 0x24, 0x00, 0x01, 0x00, 0x00, 64, PROTO_ICMP, 0x00, 0x00, 10, 255, 0,
+        2, 10, 255, 0, 1,
+    ]);
+    let ip_sum = checksum16(&packet[0..20]);
+    packet[10] = (ip_sum >> 8) as u8;
+    packet[11] = ip_sum as u8;
+    let mut icmp = vec![8u8, 0, 0, 0, 0x12, 0x34, 0x00, 0x01];
+    icmp.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef, 0x00, 0x11, 0x22, 0x33]);
+    let icmp_sum = checksum16(&icmp);
+    icmp[2] = (icmp_sum >> 8) as u8;
+    icmp[3] = icmp_sum as u8;
+    packet.extend_from_slice(&icmp);
+    packet
+}
+
+/// GRE-to-self OUTER frame: peer 203.0.113.9 -> local 172.16.80.8,
+/// proto 47, flagless GRE (proto 0x0800) wrapping `inner`. `vlan_id`
+/// 0 = untagged underlay (L3 at 14); nonzero = 802.1Q-tagged underlay
+/// (L3 at 18) — the live reth0.80 shape from #1885.
+fn build_gre_to_self_outer_frame_v4(vlan_id: u16, inner: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::new();
+    write_eth_header(
+        &mut frame,
+        [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
+        [0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5],
+        vlan_id,
+        0x0800,
+    );
+    let l3 = frame.len();
+    let total = (20 + 4 + inner.len()) as u16;
+    frame.extend_from_slice(&[0x45, 0x00]);
+    frame.extend_from_slice(&total.to_be_bytes());
+    frame.extend_from_slice(&[
+        0x00, 0x01, 0x00, 0x00, 64, PROTO_GRE, 0x00, 0x00, 203, 0, 113, 9, 172, 16, 80, 8,
+    ]);
+    let ip_sum = checksum16(&frame[l3..l3 + 20]);
+    frame[l3 + 10] = (ip_sum >> 8) as u8;
+    frame[l3 + 11] = ip_sum as u8;
+    frame.extend_from_slice(&[0x00, 0x00, 0x08, 0x00]); // flagless GRE, proto IPv4
+    frame.extend_from_slice(inner);
+    frame
+}
+
+/// Shim-contract meta for the GRE OUTER frame (`parse_l2` in
+/// userspace-xdp is VLAN-aware: tagged L3 at 18, untagged at 14).
+fn gre_to_self_outer_meta(vlan_id: u16, frame_len: usize) -> UserspaceDpMeta {
+    let l3: u16 = if vlan_id > 0 { 18 } else { 14 };
+    UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex: 11,
+        ingress_vlan_id: vlan_id,
+        ingress_vlan_present: u8::from(vlan_id > 0),
+        l3_offset: l3,
+        l4_offset: l3 + 20,
+        payload_offset: l3 + 24,
+        pkt_len: frame_len as u16 - l3,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_GRE,
+        config_generation: 7,
+        fib_generation: 9,
+        ..UserspaceDpMeta::default()
+    }
+}
+
+/// #1885 driver: run one GRE-to-self outer frame end-to-end through
+/// `poll_binding_process_descriptor` with a registered gr- delivery
+/// channel and assert the TUN-bound payload is the decapped INNER
+/// packet, byte-identical, delivered EXACTLY once.
+fn assert_gre_to_self_delivers_inner_exactly_once(vlan_id: u16) {
+    let forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 11, 0);
+    binding.interface = Arc::<str>::from("ge-0-0-0");
+    let mut sessions = SessionTable::new();
+
+    let inner = build_gre_inner_icmp_packet_v4();
+    let frame = build_gre_to_self_outer_frame_v4(vlan_id, &inner);
+    let meta = gre_to_self_outer_meta(vlan_id, frame.len());
+
+    let (tx, rx) = mpsc::sync_channel(8);
+    let mut deliveries = BTreeMap::new();
+    deliveries.insert(77, tx);
+    let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(deliveries));
+
+    txn_run_descriptor_with_deliveries(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+        &local_tunnel_deliveries,
+    );
+
+    let delivered = rx
+        .try_recv()
+        .expect("GRE-to-self inner packet must reach the gr- delivery channel");
+    assert_eq!(
+        delivered[0] >> 4,
+        4,
+        "TUN-bound payload must start with the IP version nibble \
+         (IFF_NO_PI contract — the #1885 EINVAL observable), got {:02x?}",
+        &delivered[..delivered.len().min(8)]
+    );
+    assert_eq!(
+        delivered, inner,
+        "delivery must be the decapped INNER packet byte-identical — \
+         not an outer-frame slice (mis-paired frame/meta, #1885)"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "exactly ONE delivery per packet — the LocalDelivery arm must \
+         not enqueue in addition to the leg's trailing chokepoint"
+    );
+}
+
+/// #1885 session-HIT pin: the live keepalive/echo-reply stream rides
+/// an EXISTING session (the first packet installs it), so the
+/// session-hit leg must ALSO deliver the decapped inner packet
+/// exactly once. Runs the same tagged GRE-to-self frame twice through
+/// one (binding, sessions) pair and asserts both deliveries.
+#[test]
+fn gre_to_self_session_hit_delivery_is_inner_packet_exactly_once() {
+    let forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 11, 0);
+    binding.interface = Arc::<str>::from("ge-0-0-0");
+    let mut sessions = SessionTable::new();
+
+    let inner = build_gre_inner_icmp_packet_v4();
+    let frame = build_gre_to_self_outer_frame_v4(80, &inner);
+
+    let (tx, rx) = mpsc::sync_channel(8);
+    let mut deliveries = BTreeMap::new();
+    deliveries.insert(77, tx);
+    let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(deliveries));
+
+    for pass in ["session-miss", "session-hit"] {
+        let meta = gre_to_self_outer_meta(80, frame.len());
+        txn_run_descriptor_with_deliveries(
+            &mut binding,
+            &mut sessions,
+            &forwarding,
+            &ha_state,
+            &frame,
+            meta,
+            &local_tunnel_deliveries,
+        );
+        let delivered = rx.try_recv().unwrap_or_else(|_| {
+            panic!("{pass} pass must deliver the inner packet to the gr- channel")
+        });
+        assert_eq!(
+            delivered, inner,
+            "{pass} pass delivery must be the decapped INNER packet byte-identical"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "{pass} pass must deliver exactly once"
+        );
+    }
+}
+
+/// #1885: VLAN-tagged underlay (the live reth0.80 topology). Pre-fix
+/// the LocalDelivery arm sliced the ORIGINAL tagged outer frame at the
+/// post-decap inner meta's l3_offset (14) — the payload started with
+/// the dot1q TCI tail (`00 50 86 dd ...` in the issue strace) and
+/// every TUN write failed EINVAL.
+#[test]
+fn gre_to_self_vlan_tagged_local_delivery_is_inner_packet_exactly_once() {
+    assert_gre_to_self_delivers_inner_exactly_once(80);
+}
+
+/// #1885 blast radius: on an UNTAGGED underlay the mis-paired slice
+/// started at the outer L3 header — a valid version nibble, so the TUN
+/// write SUCCEEDED but delivered the still-encapsulated OUTER packet.
+/// Byte-equality (not just the nibble check) pins this case.
+#[test]
+fn gre_to_self_untagged_local_delivery_is_inner_packet_exactly_once() {
+    assert_gre_to_self_delivers_inner_exactly_once(0);
+}
+
+/// #1885 blast radius: NON-decapped local delivery was enqueued TWICE
+/// (the in-arm desc-based call duplicated the leg's trailing
+/// decap-aware chokepoint — both pass the same disposition filter).
+/// A host-bound packet whose `local_ifindex` is not a registered
+/// tunnel channel funnels to the kernel slow-path TUN; with no
+/// reinjector wired the per-attempt `slow_path_drops` counter is the
+/// enqueue-attempt observable: pre-#1885 this read 2, fixed it must
+/// read exactly 1.
+#[test]
+fn unencapsulated_local_delivery_reinjects_slow_path_exactly_once() {
+    let forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+
+    let frame = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(10, 255, 0, 1),
+        12345,
+        179,
+        TCP_FLAG_SYN,
+    );
+    let meta = txn_meta_v4(24, TCP_FLAG_SYN, (frame.len() - 14) as u16);
+
+    let (tx, rx) = mpsc::sync_channel(8);
+    let mut deliveries = BTreeMap::new();
+    deliveries.insert(77, tx);
+    let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(deliveries));
+
+    let (_batch, dbg) = txn_run_descriptor_with_deliveries(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+        &local_tunnel_deliveries,
+    );
+
+    assert_eq!(dbg.local, 1, "packet must take the LocalDelivery arm");
+    assert!(
+        rx.try_recv().is_err(),
+        "a non-tunnel-ingress local packet must NOT hit the gr- channel"
+    );
+    assert_eq!(
+        binding.live.slow_path_drops.load(Ordering::Relaxed),
+        1,
+        "exactly ONE slow-path enqueue attempt per LocalDelivery packet \
+         (#1885 duplicate-enqueue pin — the in-arm call would make it 2)"
+    );
+}
+
+/// #1885 decap-level consistency pin: on VLAN-TAGGED ingress the decap
+/// must produce a synthetic frame and an inner meta that describe EACH
+/// OTHER — `synthetic[meta.l3_offset..]` IS the inner packet. (The
+/// poll-descriptor defect was pairing this inner meta with the
+/// original outer frame instead of the synthetic one.)
+#[test]
+fn native_gre_decap_tagged_ingress_yields_self_consistent_frame_meta() {
+    let forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    let inner = build_gre_inner_icmp_packet_v4();
+    let frame = build_gre_to_self_outer_frame_v4(80, &inner);
+    let meta = gre_to_self_outer_meta(80, frame.len());
+    let decap = try_native_gre_decap_from_frame(&frame, meta, &forwarding)
+        .expect("tagged GRE-to-self outer frame must decap");
+    assert_eq!(
+        &decap.frame[decap.meta.l3_offset as usize..],
+        &inner[..],
+        "synthetic frame and inner meta must be self-consistent"
+    );
+    assert_eq!(decap.meta.ingress_ifindex, 77);
+    assert_eq!(decap.meta.addr_family, libc::AF_INET as u8);
 }
 
 /// #1873 replay-filter companion pin (AGY code r4 HIGH): filtering the

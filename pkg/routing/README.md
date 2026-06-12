@@ -77,6 +77,56 @@ delegate to the owning domain. Exported types:
   (lower priority value = higher priority). PBR sits before main as
   well; rib-group sits after.
 
+## Tunnel reconcile-in-place (#1884)
+
+`tunnelManager.Apply` reconciles instead of clear-all +
+delete-and-recreate: an untouched tunnel keeps its netdev (stable
+ifindex — no FRR route churn, no userspace-dp TUN-reader death per
+commit, see #1881/#1887), tunnels removed from config are deleted via a
+set-diff against the previous DESIRED set (`ownedNames`, retained on a
+failed delete for retry), and a device is recreated only when the
+existing kernel link is genuinely incompatible:
+
+- **Anchors** (production userspace path): reuse requires TUN mode +
+  `NO_PI` (the Rust reader opens `IFF_TUN|IFF_NO_PI`) + persistent.
+  MTU ownership: `tc.MTU > 0` (config) is reconciled on every reuse
+  (the compiler MTU stage restores ZONED interfaces only); `tc.MTU ==
+  0` is written exactly once when ADOPTING a device this manager did
+  not own at the last apply (restart adoption; wireguard→gre same-name
+  flip repair — the WG-reduced MTU must not leak into the userspace
+  snapshot's live-MTU reads).
+- **Legacy non-anchor** (standalone-CLI only): compare-then-decide on
+  the config-driven attrs (type/family, endpoints, defaulted TTL,
+  keys, ip6tnl proto); kernel-populated fields (PMtu, Tos, flags,
+  encap-limit — mutated by the post-create `encaplimit none` exec) are
+  deliberately NOT compared. Real changes delete+recreate; the
+  encaplimit exec runs only on (re)create.
+- **Addresses**: symmetric reconcile; stale LINK-LOCAL addresses are
+  deleted only if recorded in `appliedAddrs` (a configured fe80 we
+  applied), never the kernel's autoconf fe80; failed LL deletes stay
+  tracked for retry. The WG branch uses the same helper with the nil
+  sentinel (blanket LL skip — pre-existing WG semantics).
+- **VRF claims** (`appliedRI`): written ONLY from a successful
+  `BindInterfaceToVRF` or a direct observation that the link's master
+  is `vrf-<RIListMember>` (a step-0a routing-instance interface-list
+  bind) — never from intent. `TunnelConfig.RIListMember` (populated by
+  `collectAppliedTunnels` with the exact step-0a name normalization)
+  vetoes unbinding when the config list-binds the tunnel. Unbind on
+  config-wants-none is identity-gated: only when the current master IS
+  the claimed RI's `vrf-` device; transient errors retain the claim
+  for retry.
+- **Keepalives** (legacy branch only — anchors never probe): runners
+  are reconciled by normalized identity `(remote, interval,
+  retry<=0→3)` and survive unrelated applies; `LinkSetUp` is SKIPPED
+  when a retained runner holds the tunnel down (the down-transition in
+  `keepaliveLoop` is gated on `state.Up`, so re-upping would strand
+  the link admin UP).
+
+`Clear()`/`ClearTunnels` keep delete-everything semantics and reset the
+reconcile state. Restart residuals (documented): anchors/addresses/RI
+claims orphaned while the daemon was down are adopted as-is, not
+retroactively diffed.
+
 ## Gotchas
 
 - #848 / #1698: each interface domain (`tunnelManager`, `xfrmManager`,
