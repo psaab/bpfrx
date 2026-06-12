@@ -96,7 +96,7 @@ wait_agent() {
 	while ! incus exec "$inst" -- true &>/dev/null; do
 		sleep 3
 		tries=$((tries + 1))
-		[ $tries -ge 80 ] && fail "$inst: incus agent not ready after 240s"
+		if [ $tries -ge 80 ]; then fail "$inst: incus agent not ready after 240s"; fi
 	done
 }
 
@@ -106,7 +106,7 @@ wait_unit_settled() {
 	while ! guest "$inst" systemctl is-active --quiet xpfd 2>/dev/null; do
 		sleep 3
 		tries=$((tries + 1))
-		[ $tries -ge 40 ] && fail "$inst: xpfd not active after 120s"
+		if [ $tries -ge 40 ]; then fail "$inst: xpfd not active after 120s"; fi
 	done
 }
 
@@ -115,7 +115,7 @@ wait_fxp0_dhcp() {
 	while ! guest "$inst" sh -c 'ip -4 addr show fxp0 2>/dev/null | grep -q "inet "'; do
 		sleep 3
 		tries=$((tries + 1))
-		[ $tries -ge 30 ] && fail "$inst: fxp0 has no IPv4 DHCP address after 90s"
+		if [ $tries -ge 30 ]; then fail "$inst: fxp0 has no IPv4 DHCP address after 90s"; fi
 	done
 }
 
@@ -198,7 +198,7 @@ EOF
 	while ! guest xpf-image-b sh -c '/usr/local/sbin/cli show configuration 2>/dev/null | grep -q "host-name xpf-day0-b"'; do
 		sleep 3
 		tries=$((tries + 1))
-		[ $tries -ge 20 ] && fail "committed config does not show host-name xpf-day0-b"
+		if [ $tries -ge 20 ]; then fail "committed config does not show host-name xpf-day0-b"; fi
 	done
 	guest xpf-image-b sh -c '[ "$(hostname)" = xpf-day0-b ]' || fail "hostname not applied"
 

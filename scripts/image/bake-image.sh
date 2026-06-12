@@ -207,6 +207,13 @@ net.ipv6.conf.all.accept_ra=0
 net.ipv6.conf.default.accept_ra=0'
 
 UNSTABLE_LIST='deb http://deb.debian.org/debian unstable main'
+
+# apt-get update exits 0 even when an index fetch fails — a transient
+# DNS blip inside the libguestfs appliance once made the kernel install
+# silently resolve linux-image-amd64 from TRIXIE (6.12) instead of
+# unstable, caught only by the in-guest kernel gate at boot validation.
+# --error-on=any makes index failures fatal; one retry covers blips.
+APT_UPDATE='apt-get update -qq -o Acquire::Retries=5 --error-on=any || { echo "apt update failed; retrying in 10s" >&2; sleep 10; apt-get update -qq -o Acquire::Retries=5 --error-on=any; }'
 PIN_PREF='Package: *
 Pin: release a=trixie
 Pin-Priority: 900
@@ -230,16 +237,17 @@ virt-customize -a "$WORK_DIR/work.qcow2" \
 	--run-command 'chmod 0755 /usr/local/sbin/xpfd /usr/local/sbin/cli /usr/local/sbin/xpf-userspace-dp /usr/local/sbin/xpf-day0-config /usr/lib/systemd/incus-agent-setup' \
 	--write "/etc/sysctl.d/99-xpf.conf:$SYSCTL_CONF" \
 	--run-command 'mkdir -p /etc/xpf && chmod 0750 /etc/xpf' \
-	--run-command 'export DEBIAN_FRONTEND=noninteractive && apt-get update -qq' \
-	--run-command "export DEBIAN_FRONTEND=noninteractive && apt-get install -y -qq ${RUNTIME_PACKAGES[*]}" \
+	--run-command "export DEBIAN_FRONTEND=noninteractive && $APT_UPDATE" \
+	--run-command "export DEBIAN_FRONTEND=noninteractive && apt-get install -y -qq -o Acquire::Retries=5 ${RUNTIME_PACKAGES[*]}" \
 	--write "/etc/apt/sources.list.d/unstable.list:$UNSTABLE_LIST" \
 	--write "/etc/apt/preferences.d/pin-stable:$PIN_PREF" \
-	--run-command 'export DEBIAN_FRONTEND=noninteractive && apt-get update -qq && apt-get install -y -qq linux-image-amd64' \
+	--run-command "export DEBIAN_FRONTEND=noninteractive && { $APT_UPDATE; } && apt-get install -y -qq -o Acquire::Retries=5 linux-image-amd64" \
+	--run-command 'latest=$(ls /lib/modules | sort -V | tail -1) && dpkg --compare-versions "${latest%%+*}" ge 6.18 || { echo "FATAL: newest installed kernel $latest < 6.18 (unstable kernel install silently fell through?)" >&2; exit 1; }' \
 	--run-command 'rm -f /etc/apt/sources.list.d/unstable.list /etc/apt/preferences.d/pin-stable' \
 	--run-command 'export DEBIAN_FRONTEND=noninteractive && apt-get purge -y -qq "linux-image-*cloud*" 2>/dev/null || true' \
 	--run-command 'export DEBIAN_FRONTEND=noninteractive && apt-get purge -y -qq "cloud-init*" 2>/dev/null || true; rm -rf /etc/cloud /var/lib/cloud' \
 	--run-command 'rm -f /etc/network/interfaces.d/* /etc/netplan/*.yaml 2>/dev/null || true' \
-	--run-command 'export DEBIAN_FRONTEND=noninteractive && apt-get autoremove -y -qq && apt-get update -qq' \
+	--run-command "export DEBIAN_FRONTEND=noninteractive && apt-get autoremove -y -qq && { $APT_UPDATE; }" \
 	--run-command 'systemctl enable systemd-networkd systemd-resolved' \
 	--run-command 'systemctl disable systemd-networkd-wait-online.service 2>/dev/null || true' \
 	--run-command 'ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf' \
