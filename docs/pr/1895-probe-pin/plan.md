@@ -77,15 +77,18 @@ currently-marked live test and the new pin set
 goroutines whose keys were removed, or whose deterministic mark is
 about to be reassigned, must not send against the band in flux either
 (Codex r2). Publication of the real results: the retry path publishes
-immediately (probe set unchanged under an unchanged hash); the
-full-apply path publishes only AFTER `rpm.Apply` (old goroutines
-drained by StopAll, new marks in place) — the first probe cycle after
-an RPM config change may therefore hold, bounded by one
+immediately (probe set unchanged under an unchanged hash); EVERY full
+apply — installer-backed or not (Codex r3) — uses one shared ordering:
+hold the union first, mutate, publish only AFTER `rpm.Apply` (old
+goroutines drained by StopAll, new marks in place). The first probe
+cycle after an RPM config change may therefore hold, bounded by one
 test-interval, which is the safe direction. Residual window =
 gate-check→sendto of a probe already past the gate (Codex r1/r2:
 acceptable). When no routing manager exists at all but pins are
-configured, every pin is marked `errNoProbePinInstaller` and published
-BEFORE Apply — no kernel band exists to race (Codex r1 MAJOR-2).
+configured, every pin is marked `errNoProbePinInstaller` (Codex r1
+MAJOR-2) under the same hold/publish ordering (Codex r3: publishing
+the new-keys-only set before Apply reopened the gate for an old held
+pin being removed from config).
 
 `reconcileRPM` passes the failed-pin map to the RPM manager via a new
 additive setter (`SetPinInstallResults`, mirroring `SetRethMap`)

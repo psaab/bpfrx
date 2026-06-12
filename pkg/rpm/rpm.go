@@ -177,9 +177,10 @@ func (m *Manager) SetRethMap(rethMap map[string]string) {
 // "probe/test", values the install error; nil/empty = all pins
 // installed). The map is replaced wholesale, so a successful re-apply
 // clears earlier failures and live probe loops resume on their next
-// tick — no probe restart required. Call before Apply on a config
-// change; safe to call on its own when the daemon retries a failed
-// pin install under an unchanged config (#1895).
+// tick — no probe restart required. On a config change the daemon
+// publishes AFTER Apply (the HoldPinsForReprogram union covers the
+// interim); on a hash-gated pin retry it publishes immediately
+// (#1895).
 func (m *Manager) SetPinInstallResults(failed map[string]error) {
 	cp := make(map[string]error, len(failed))
 	for k, v := range failed {
@@ -258,6 +259,12 @@ func (m *Manager) Apply(ctx context.Context, cfg *config.RPMConfig) {
 	m.StopAll()
 
 	if cfg == nil || len(cfg.Probes) == 0 {
+		// Clear the mark assignment too: stale marks would otherwise
+		// inflate later HoldPinsForReprogram unions (#1895 hygiene —
+		// no goroutines exist after StopAll, so this is cosmetic).
+		m.mu.Lock()
+		m.marks = nil
+		m.mu.Unlock()
 		return
 	}
 

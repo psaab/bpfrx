@@ -177,6 +177,19 @@ func TestReconcileRPMNoInstallerHoldsPinnedTests(t *testing.T) {
 	if got := d.rpm.PinInstallFailureCount(); got != 0 {
 		t.Fatalf("unpinned config must clear held pins: count = %d", got)
 	}
+	// Removing RPM entirely releases everything (Codex r3: the
+	// no-installer path shares the hold-then-publish-after-Apply
+	// ordering, so removal cannot leave stale holds — or release an
+	// old hold before the old goroutines are drained).
+	if !d.reconcileRPM(rpmPinnedTestConfig()) {
+		t.Fatal("pinned config must re-apply")
+	}
+	if !d.reconcileRPM(&config.Config{}) {
+		t.Fatal("RPM removal must re-apply")
+	}
+	if got := d.rpm.PinInstallFailureCount(); got != 0 {
+		t.Fatalf("RPM removal must clear held pins: count = %d", got)
+	}
 }
 
 // rpmTwoPinConfig returns a config with two pinned tests.

@@ -227,6 +227,15 @@ func probePinsAllFailed(pins []routing.ProbePin, err error) map[string]error {
 	return m
 }
 
+// probePinKeys extracts the TestKeys of a pin set.
+func probePinKeys(pins []routing.ProbePin) []string {
+	keys := make([]string, 0, len(pins))
+	for _, p := range pins {
+		keys = append(keys, p.TestKey)
+	}
+	return keys
+}
+
 // applyProbePinsHeld programs the pin band with the pinned probes
 // held: it pre-holds the UNION of every currently-marked (live)
 // pinned test and the new pin set — live goroutines whose keys were
@@ -238,11 +247,7 @@ func probePinsAllFailed(pins []routing.ProbePin, err error) map[string]error {
 // only AFTER rpm.Apply has drained the old goroutines and rebuilt the
 // marks. Callers hold rpmMu.
 func (d *Daemon) applyProbePinsHeld(applyPins func([]routing.ProbePin) map[string]error, pins []routing.ProbePin) map[string]error {
-	keys := make([]string, 0, len(pins))
-	for _, p := range pins {
-		keys = append(keys, p.TestKey)
-	}
-	d.rpm.HoldPinsForReprogram(keys, errProbePinReprogram)
+	d.rpm.HoldPinsForReprogram(probePinKeys(pins), errProbePinReprogram)
 	return applyPins(pins)
 }
 
@@ -289,21 +294,24 @@ func (d *Daemon) reconcileRPM(cfg *config.Config) bool {
 	}
 
 	// Pin state follows the prober lifecycle: clear-and-program the
-	// reserved band alongside every probe re-apply. The reprogram runs
-	// under the union pre-hold (applyProbePinsHeld) and the real
-	// results are published only AFTER rpm.Apply: old goroutines (old
-	// marks, possibly removed keys) stay held through the band
-	// reprogram and are drained by Apply's StopAll; the new
+	// reserved band alongside every probe re-apply. ONE ordering for
+	// every full apply (installer or not, Codex PR #1899 r2/r3):
+	// hold the union of old (live) and new pinned tests FIRST, mutate
+	// state (kernel band reprogram, or nothing when no installer
+	// exists), and publish the real per-pin results only AFTER
+	// rpm.Apply — old goroutines (old marks, possibly removed keys)
+	// stay held until Apply's StopAll drains them, and the new
 	// goroutines start against the pre-hold map and pick up the real
-	// results on their next gate check (first probe cycle may hold —
-	// bounded by one test-interval, the safe direction; Codex PR
-	// #1899 r2). With no installer at all, every configured pin is
-	// failed by definition and is published BEFORE Apply (no kernel
-	// band exists to race) — never let a next-hop test probe with a
-	// marked-but-unbacked socket.
+	// results on their next gate check. First probe cycle after an
+	// RPM config change may therefore hold — bounded by one
+	// test-interval, the safe direction. With no installer at all,
+	// every configured pin is failed by definition
+	// (errNoProbePinInstaller) — never let a next-hop test probe with
+	// a marked-but-unbacked socket.
+	d.rpm.HoldPinsForReprogram(probePinKeys(pins), errProbePinReprogram)
 	var failed map[string]error
 	if applyPins != nil {
-		failed = d.applyProbePinsHeld(applyPins, pins)
+		failed = applyPins(pins)
 		if len(failed) > 0 {
 			slog.Warn("probe pin install failures — affected tests hold state until a retry succeeds",
 				"failed", len(failed))
@@ -318,13 +326,8 @@ func (d *Daemon) reconcileRPM(cfg *config.Config) bool {
 	d.rpmPinsFailed = applyPins != nil && len(failed) > 0
 
 	d.rpm.SetRethMap(rethMap)
-	if applyPins == nil {
-		d.rpm.SetPinInstallResults(failed)
-	}
 	d.rpm.Apply(d.daemonCtx, effective)
-	if applyPins != nil {
-		d.rpm.SetPinInstallResults(failed)
-	}
+	d.rpm.SetPinInstallResults(failed)
 	d.activeRPMHash = h
 	probes := 0
 	if effective != nil {
