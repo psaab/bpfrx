@@ -79,15 +79,13 @@ pub(super) fn apply_snapshot(
     coord.purge_remapped_tunnel_sessions(&tunnel_purge_ids);
     // The bringup phase replays `preserved_synced_sessions` (captured
     // BEFORE this purge) into the shared maps — filter the purged ids
-    // out so the replay cannot resurrect them (pre-existing ordering
-    // hazard, found in code r3).
-    if !tunnel_purge_ids.is_empty() {
-        preserved_synced_sessions.retain(|entry| {
-            entry.decision.resolution.tunnel_endpoint_id == 0
-                || !tunnel_purge_ids
-                    .contains(&entry.decision.resolution.tunnel_endpoint_id)
-        });
-    }
+    // AND their derived reverse companions out so the replay cannot
+    // resurrect them, whole or as half-dead pairs (code r3; companion
+    // semantics per AGY code r4).
+    super::super::filter_replayed_synced_sessions(
+        preserved_synced_sessions,
+        &tunnel_purge_ids,
+    );
     coord.forwarding = new_forwarding;
     coord.shared_validation.store(Arc::new(coord.validation));
     coord

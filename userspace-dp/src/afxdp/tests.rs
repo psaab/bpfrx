@@ -5539,3 +5539,92 @@ fn txn_tunnel_marked_missing_neighbor_not_buffered() {
         "second packet must also be dropped+counted at the R-C gate"
     );
 }
+
+/// #1873 replay-filter companion pin (AGY code r4 HIGH): filtering the
+/// preserved synced-session replay list by purged tunnel ids must
+/// mirror delete_synced_session's companion semantics — the derived
+/// reverse companion (tunnel_endpoint_id == 0) of a dropped forward
+/// entry is dropped too, never resurrected as a half-dead pair; a
+/// reverse-marked entry drops standalone; unrelated entries survive.
+#[test]
+fn replay_filter_drops_purged_forward_and_derived_reverse_companion() {
+    use crate::afxdp::coordinator::filter_replayed_synced_sessions;
+
+    let nat = NatDecision {
+        rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+        ..NatDecision::default()
+    };
+    let forward_key = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        src_port: 12345,
+        dst_port: 5201,
+    };
+    let reverse_key = crate::session::reverse_session_key(&forward_key, nat);
+    let tunnel_resolution = ForwardingResolution {
+        disposition: ForwardingDisposition::ForwardCandidate,
+        local_ifindex: 0,
+        egress_ifindex: 41,
+        tx_ifindex: 3,
+        tunnel_endpoint_id: 824,
+        next_hop: None,
+        neighbor_mac: Some([2, 0, 0, 0, 0, 9]),
+        src_mac: Some([2, 0, 0, 0, 0, 1]),
+        tx_vlan_id: 0,
+    };
+    let plain_resolution = ForwardingResolution {
+        tunnel_endpoint_id: 0,
+        ..tunnel_resolution
+    };
+    let make = |key: &SessionKey,
+                resolution: ForwardingResolution,
+                is_reverse: bool| SyncedSessionEntry {
+        key: key.clone(),
+        decision: SessionDecision { resolution, nat },
+        metadata: SessionMetadata {
+            ingress_zone: 1,
+            egress_zone: 2,
+            owner_rg_id: 1,
+            fabric_ingress: false,
+            is_reverse,
+            nat64_reverse: None,
+        },
+        origin: SessionOrigin::SyncImport,
+        protocol: PROTO_TCP,
+        tcp_flags: 0,
+    };
+    let unrelated_key = SessionKey {
+        src_port: 23456,
+        ..forward_key.clone()
+    };
+
+    // Case 1: tunnel-marked forward + unmarked derived reverse
+    // companion + unrelated unmarked entry.
+    let mut entries = vec![
+        make(&forward_key, tunnel_resolution, false),
+        make(&reverse_key, plain_resolution, true),
+        make(&unrelated_key, plain_resolution, false),
+    ];
+    filter_replayed_synced_sessions(&mut entries, &[824]);
+    assert_eq!(entries.len(), 1, "forward + derived reverse both dropped");
+    assert_eq!(entries[0].key, unrelated_key);
+
+    // Case 2: reverse-marked tunnel entry drops standalone; its
+    // unmarked forward keeps forwarding (matches live purge
+    // semantics: delete_synced_session on a reverse key derives no
+    // companion).
+    let mut entries = vec![
+        make(&forward_key, plain_resolution, false),
+        make(&reverse_key, tunnel_resolution, true),
+    ];
+    filter_replayed_synced_sessions(&mut entries, &[824]);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].key, forward_key);
+
+    // Case 3: no purged ids — untouched.
+    let mut entries = vec![make(&forward_key, tunnel_resolution, false)];
+    filter_replayed_synced_sessions(&mut entries, &[7]);
+    assert_eq!(entries.len(), 1);
+}

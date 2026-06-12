@@ -98,6 +98,41 @@ pub(in crate::afxdp) fn tunnel_remap_purge_ids_from_owners(
     purge_ids
 }
 
+/// #1873 R-D (AGY code r4): filter the preserved synced-session replay
+/// list by the remap purge set, MIRRORING delete_synced_session's
+/// companion semantics — drop every entry whose stored id is purged,
+/// plus the derived reverse companion (reverse_session_key over the
+/// forward key + NAT decision) of each dropped FORWARD entry, which
+/// itself carries tunnel_endpoint_id == 0 in asymmetric topologies and
+/// would otherwise be resurrected as a half-dead pair by the bringup
+/// replay. A reverse-marked entry drops standalone (its unmarked
+/// forward keeps forwarding without the tunnel), matching the live
+/// purge's delete_synced_session(is_reverse) behavior.
+pub(in crate::afxdp) fn filter_replayed_synced_sessions(
+    entries: &mut Vec<SyncedSessionEntry>,
+    purge_ids: &[u16],
+) {
+    if purge_ids.is_empty() || entries.is_empty() {
+        return;
+    }
+    let mut drop_keys: Vec<crate::session::SessionKey> = Vec::new();
+    for entry in entries.iter() {
+        let id = entry.decision.resolution.tunnel_endpoint_id;
+        if id != 0 && purge_ids.contains(&id) {
+            drop_keys.push(entry.key.clone());
+            if !entry.metadata.is_reverse {
+                drop_keys.push(crate::session::reverse_session_key(
+                    &entry.key,
+                    entry.decision.nat,
+                ));
+            }
+        }
+    }
+    if !drop_keys.is_empty() {
+        entries.retain(|entry| !drop_keys.contains(&entry.key));
+    }
+}
+
 /// #1866 D3: log a WG endpoint-set transition between two forwarding
 /// states. Silent when the set is unchanged (the common case) — fires
 /// only on real add/remove/port/attachment changes, so the cadence is
