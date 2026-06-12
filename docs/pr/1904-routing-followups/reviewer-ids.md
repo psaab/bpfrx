@@ -29,3 +29,11 @@ survive. The post-r2 commits (5f0e43b9b, 3b36ead01) change
 interface-level multi-unit WG endpoint emission + the commit gate only
 — covered by unit regressions; the live scenarios exercise neither
 shape.
+
+## Convergence (final head 149d6fd1a)
+- Codex r7: task-mqbjev0d-ryo6ej (session 019ebe17-b8b9-7720-9c3e-c09c5c32b791) — MERGE-READY, no findings; (a) fix verified against compiler_interfaces.go:203/:646 + tunnels.go:143; regression non-vacuous; (b)/(c) pre-existing adjudication ACCEPTED with origin/master gate-code verification; no new divergence
+- AGY delta: adversarial-review-mqbjf0kt-fv6c7w — ready to merge; sticky-OR→overwrite proven non-vacuous both directions; r4 canonical + r5 bare-ref behaviors intact
+- Claude SMR: MERGE-READY at 149d6fd1a (in-conversation; independently verified compiler overwrite, expansion ordering, and all frozen folds incl. #1914 repro values)
+- Copilot: quota-blocked, documented retries (r1 ×3, r2 ×4) → 3-of-4 fallback per protocol
+- Gates: full go test ./... rc=0 at 149d6fd1a (Go-only PR, 0 Rust files)
+- Follow-up: #1914 (pre-existing wildcard-groups literal hashing + src/dst over-registration)
