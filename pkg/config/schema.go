@@ -87,7 +87,7 @@ func (n *schemaNode) isTypedLeaf() bool {
 // Keywords present in the schema at a given depth are treated as containers.
 // Keywords NOT in the schema become leaf nodes (all remaining tokens form the leaf's Keys).
 var setSchema = &schemaNode{children: map[string]*schemaNode{
-	"groups":       {wildcard: &schemaNode{}}, // children set in init()
+	"groups":       {desc: "Configuration groups", wildcard: &schemaNode{desc: "Group name", placeholder: "<group-name>"}}, // wildcard children set in init()
 	"apply-groups": {desc: "Groups from which to inherit configuration data", args: 1, multi: true, placeholder: "<group-name>", children: nil},
 	"security": {desc: "Security configuration", children: map[string]*schemaNode{
 		"zones": {desc: "Security zones", children: map[string]*schemaNode{
