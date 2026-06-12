@@ -4,7 +4,7 @@
 |----------|-------|---------|---------|
 | Codex | r1 | task-mqbduj72-met6ha | MERGE-READY (no Critical/High/Medium; 1 Low — see below) |
 | AGY (Antigravity) | r1 | adversarial-review-mqbduz6e-beyr8h | MERGE-READY (read-only; no writes; verified producer/consumer pairing, #1771 invariants, byte-trace, wire alignment) |
-| Copilot | r1 | review requested 2026-06-12 (attempt 1: quota-limited x2) | pending |
+| Copilot | r1 | 3 documented attempts 2026-06-12, ALL quota-limited (review ids 4489010877, 4489013876, 4489188427) | UNAVAILABLE — 3-of-4 fallback (per protocol: quota -> 3 documented retries -> 3-of-4) |
 | Claude SMR | r1 | in-conversation hostile byte-trace | MERGE-READY |
 
 ## Codex r1 Low — adjudicated, no code change
@@ -115,3 +115,12 @@ assert, in the documented known-flakies set, source untouched by this
 branch); standalone 5/5 pass, and one full-suite run was fully green
 (2072 passed / 0 failed). `go test ./...` rc=0 (38 packages ok);
 `cargo build --release` rc=0.
+
+## Follow-ups filed
+
+- #1912 — cold ENCAP outer next-hop blackholes tunnel-bound replies, no
+  probe observed (live capture evidence from this validation; #1873
+  R-E's claimed #1769-resolver recovery did not engage).
+- #1913 — trailing `maybe_reinject_slow_path_from_frame` runs for ALL
+  non-forward dispositions and the `_from_frame` variant has no
+  disposition filter (SMR observation, pre-existing since #1054).

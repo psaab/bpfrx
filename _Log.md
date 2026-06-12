@@ -5284,3 +5284,6 @@ top.
 - **Timestamp**: 2026-06-12 ~14:10
   **Action**: #1902 live validation r3 complete — gate counter 1->4 across cold windows, 0 corrupt frames, 18/18 inner delivery, retry dwell <1ms x2; recorded trail in ledger
   **File(s)**: docs/pr/1902-pending-neigh/reviewer-ids.md
+- **Timestamp**: 2026-06-12 ~14:25
+  **Action**: #1902 — posted live-validation PR comment, filed follow-ups #1912 (encap reply blackhole) + #1913 (unfiltered trailing reinject), Copilot 3x quota-limited -> 3-of-4 fallback recorded
+  **File(s)**: docs/pr/1902-pending-neigh/reviewer-ids.md
