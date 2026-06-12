@@ -26,3 +26,6 @@ __pycache__/
 .DS_Store
 test/xsk-repro/target/
 test/xsk-repro/xdp-tools*
+
+# Appliance image bake artifacts (#1879)
+/dist/
