@@ -5279,3 +5279,7 @@ top.
 - **Timestamp**: 2026-06-12 15:55
   **Action**: #1910 Codex r5 fix — parse-gated canonical refs in collectTunnelEndpointNamesAST (bare-ref when no unit parses; canonical %s.%d on all branches incl. non-WG/unit-level) + 2 regressions (overflow-only WG unit wg0/wg34524.0=17799; unit-level leading-zero wg0.01→wg0.1/wg341=14730). Lane agent died at spend limit; finishing inline.
   **File(s)**: pkg/config/tunnelid.go, pkg/config/tunnelid_test.go, docs/pr/1904-routing-followups/reviewer-ids.md
+
+- **Timestamp**: 2026-06-12 16:20
+  **Action**: #1910 Codex r6 — fixed duplicate-unit last-wins divergence in collision gate (overwrite mirrors ifc.Units[unitNum]=unit) + regression; adjudicated findings (b)/(c) pre-existing → filed #1914 (folds verified independently).
+  **File(s)**: pkg/config/tunnelid.go, pkg/config/tunnelid_test.go, docs/pr/1904-routing-followups/reviewer-ids.md

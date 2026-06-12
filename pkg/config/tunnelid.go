@@ -74,7 +74,14 @@ func collectTunnelEndpointNamesAST(ifacesNode *Node, out map[string]struct{}) {
 		hasIfaceTunnel := tunnelNode != nil
 		units := namedInstances(iface.FindChildren("unit"))
 		// Mirror the typed compiler's unit admission: only
-		// Atoi-parseable names become InterfaceUnit entries.
+		// Atoi-parseable names become InterfaceUnit entries, and a
+		// duplicate spelling of the same number (`unit 00` then
+		// `unit 0`) OVERWRITES — the compiler does
+		// `ifc.Units[unitNum] = unit` per instance, so the LAST
+		// declared instance wins and only ITS tunnel node counts
+		// (#1910 r6 Codex: sticky-OR here would falsely reject a
+		// collision on a ref whose tunnel lives only on an
+		// overwritten earlier instance).
 		unitNums := make([]int, 0, len(units))
 		unitTunnel := make(map[int]bool, len(units))
 		for _, unit := range units {
@@ -82,10 +89,10 @@ func collectTunnelEndpointNamesAST(ifacesNode *Node, out map[string]struct{}) {
 			if err != nil {
 				continue
 			}
-			unitNums = append(unitNums, n)
-			if unit.node.FindChild("tunnel") != nil {
-				unitTunnel[n] = true
+			if _, seen := unitTunnel[n]; !seen {
+				unitNums = append(unitNums, n)
 			}
+			unitTunnel[n] = unit.node.FindChild("tunnel") != nil
 		}
 		if hasIfaceTunnel {
 			if len(unitNums) == 0 {

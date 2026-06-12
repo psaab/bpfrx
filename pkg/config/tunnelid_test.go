@@ -190,6 +190,38 @@ func TestTunnelEndpointIDUnitLevelLeadingZeroStillCollides(t *testing.T) {
 	}
 }
 
+// #1910 r6 Codex: duplicate spellings of the same unit number must
+// follow the typed compiler's LAST-WINS overwrite
+// (ifc.Units[unitNum] = unit per instance). When `unit 00` carries
+// the tunnel but a later `unit 0` re-declares the unit without one,
+// the compiled unit has no tunnel and the builder emits nothing — the
+// gate must not register the ref (false reject). When the order is
+// reversed the tunnel-carrying instance wins and the collision is
+// real.
+func TestTunnelEndpointIDDuplicateUnitSpellingLastWins(t *testing.T) {
+	// Tunnel on the OVERWRITTEN earlier instance: no endpoint emitted,
+	// so the wg1408.0/wg78.0 collision (both refs would collide if
+	// emitted) must NOT reject the commit.
+	tree := buildTree(t, []string{
+		"set interfaces wg1408 unit 00 tunnel mode wireguard",
+		"set interfaces wg1408 unit 0 family inet address 10.70.3.1/30",
+		"set interfaces wg78 unit 0 tunnel mode wireguard",
+	})
+	if _, err := CompileConfig(tree); err != nil {
+		t.Fatalf("CompileConfig rejected a collision on a ref whose tunnel lives only on an overwritten duplicate unit instance: %v", err)
+	}
+	// Tunnel on the LAST instance: the unit compiles with the tunnel,
+	// the builder emits wg1408.0, and the collision must reject.
+	tree = buildTree(t, []string{
+		"set interfaces wg1408 unit 00 family inet address 10.70.3.1/30",
+		"set interfaces wg1408 unit 0 tunnel mode wireguard",
+		"set interfaces wg78 unit 0 tunnel mode wireguard",
+	})
+	if _, err := CompileConfig(tree); err == nil {
+		t.Fatalf("CompileConfig accepted a real collision whose tunnel lives on the last duplicate unit instance (wg1408.0 vs wg78.0)")
+	}
+}
+
 // And the inverse: a collision on the EMITTED lowest unit ref of an
 // interface-level WG tunnel must still be rejected.
 func TestTunnelEndpointIDCollisionOnEmittedWGUnitStillRejected(t *testing.T) {
