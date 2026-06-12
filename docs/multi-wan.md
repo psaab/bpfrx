@@ -65,9 +65,12 @@ set services rpm probe WAN test wan-a thresholds successive-loss 3
   through to the main table and report the *default* path's health as
   the pinned uplink's (false PASS, failover suppression). The test
   holds its prior state exactly like other setup errors, a partial
-  install is rolled back (no rule without its route), and the daemon
-  retries the pin install on any subsequent commit or RG transition
-  while it stays failed. Observability: rate-limited probe-loop
+  install is rolled back (best-effort — a failed rollback is swept by
+  the next band reprogram; the pin reports failed either way), and the
+  daemon retries the pin install on any subsequent commit or RG
+  transition while it stays failed. Pinned probes are also pre-held
+  while the band is being reprogrammed, and pins are marked failed
+  wholesale when no routing manager exists to install them. Observability: rate-limited probe-loop
   warning, per-pin install warnings, and the
   `xpf_rpm_probe_pin_install_failures` gauge (nonzero = those uplinks
   are not being health-checked).

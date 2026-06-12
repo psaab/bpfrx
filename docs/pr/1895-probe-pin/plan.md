@@ -1,8 +1,12 @@
 # #1895 — probe-pin install failures must hold RPM state, not false-PASS
 
-Status: PLAN v1 — adjudicated by the quad together with the code (this
+Status: PLAN v2 — adjudicated by the quad together with the code (this
 is a verification-grade defect fix, not an architecture refactor; the
-plan and implementation ship in the same PR).
+plan and implementation ship in the same PR). v2 folds in Codex r1:
+pins are pre-held while the band is reprogrammed (MAJOR-1), a missing
+routing manager marks all pins failed (MAJOR-2), and the rollback
+invariant is stated as best-effort with the band clear() as backstop
+(MEDIUM).
 
 ## Defect
 
@@ -46,6 +50,10 @@ class but never reach it.
 
 ### (a) pkg/routing — per-test install results + rule rollback
 
+(Rollback is best-effort: if the rollback RuleDel fails, the stale
+rule is logged and swept by the next apply's band clear(); the pin is
+reported failed either way, so the probe holds — the safe direction.)
+
 `probePinManager.Apply(pins []ProbePin) map[string]error` — returns a
 map keyed by `ProbePin.TestKey` containing ONLY the pins that failed
 to install, with the wrapped install error. Empty/nil map = all pins
@@ -61,6 +69,16 @@ on the next apply remains the backstop).
 `Manager.ApplyProbePins` passthrough signature follows.
 
 ### (b) pkg/daemon — thread results into rpm.Manager + retry
+
+Every band reprogram (full apply AND retry) runs with the pinned
+probes pre-held: `applyProbePinsHeld` marks all pins
+`errProbePinReprogram` before the clear-then-program and publishes the
+real results after, so a live probe ticking inside the reprogram
+window holds instead of racing an absent fwmark rule (Codex r1
+MAJOR-1; residual window = gate-check→sendto of a probe already past
+the gate). When no routing manager exists at all but pins are
+configured, every pin is marked `errNoProbePinInstaller` (Codex r1
+MAJOR-2).
 
 `reconcileRPM` passes the failed-pin map to the RPM manager via a new
 additive setter (`SetPinInstallResults`, mirroring `SetRethMap`)

@@ -19,6 +19,7 @@ type fakeProbePinOps struct {
 	links        map[string]int // name → ifindex
 	failRuleAdd  map[int]error  // rule priority → error
 	failRouteAdd map[int]error  // route table → error
+	failRuleDel  map[int]error  // rule priority → error (rollback failure)
 	ruleDelCalls int
 }
 
@@ -32,6 +33,9 @@ func (f *fakeProbePinOps) RuleAdd(r *netlink.Rule) error {
 
 func (f *fakeProbePinOps) RuleDel(r *netlink.Rule) error {
 	f.ruleDelCalls++
+	if err, ok := f.failRuleDel[r.Priority]; ok {
+		return err
+	}
 	for i := range f.rules {
 		if f.rules[i].Priority == r.Priority && f.rules[i].Family == r.Family {
 			f.rules = append(f.rules[:i], f.rules[i+1:]...)
@@ -392,5 +396,36 @@ func TestProbePinApplyRecoveryClearsFailure(t *testing.T) {
 	}
 	if len(ops.rules) != 2 || len(ops.routes) != 2 {
 		t.Fatalf("both pins must be installed: rules=%+v routes=%+v", ops.rules, ops.routes)
+	}
+}
+
+func TestProbePinApplyRollbackFailureStillReportsFailed(t *testing.T) {
+	// RouteAdd fails AND the rollback RuleDel fails: the pin must still
+	// be reported failed (the probe holds — safe direction); the stale
+	// rule is logged and left for the next band clear() to sweep.
+	ops := &fakeProbePinOps{
+		links:        map[string]int{"ge-0-0-1": 11, "ge-0-0-2": 12},
+		failRouteAdd: map[int]error{config.ProbeTableBase + 1: fmt.Errorf("ENETUNREACH")},
+		failRuleDel:  map[int]error{config.ProbeRulePriorityBase + 1: fmt.Errorf("EBUSY")},
+	}
+	p := &probePinManager{ops: ops}
+	pins := BuildProbePins(twoPinConfig(), nil)
+
+	failed := p.Apply(pins)
+	if _, ok := failed["WAN/b"]; !ok || len(failed) != 1 {
+		t.Fatalf("failed = %v, want exactly WAN/b despite rollback failure", failed)
+	}
+	// The stale rule remains (rollback failed) — documented best-effort;
+	// the next Apply's clear() sweeps the whole band.
+	if len(ops.rules) != 2 {
+		t.Fatalf("rules = %+v, want WAN/a's rule plus WAN/b's stale rule", ops.rules)
+	}
+	ops.failRuleDel = nil
+	ops.failRouteAdd = nil
+	if failed := p.Apply(pins); len(failed) != 0 {
+		t.Fatalf("re-apply after recovery: failed = %v, want none (clear sweeps stale rule)", failed)
+	}
+	if len(ops.rules) != 2 || len(ops.routes) != 2 {
+		t.Fatalf("re-apply must converge to exactly 2 rules + 2 routes: %+v / %+v", ops.rules, ops.routes)
 	}
 }

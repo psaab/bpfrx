@@ -146,10 +146,12 @@ type probePinManager struct {
 // pinned host route per pin. It returns a map keyed by ProbePin.TestKey
 // containing ONLY the pins whose kernel install failed (invalid
 // target/next-hop, missing egress link, RuleAdd/RouteAdd error), with
-// the wrapped cause; an empty/nil map means every pin installed. A pin
-// must never be left partially installed: when RouteAdd fails after a
-// successful RuleAdd, the fwmark rule is rolled back so no rule points
-// at an empty band table (#1895).
+// the wrapped cause; an empty/nil map means every pin installed. When
+// RouteAdd fails after a successful RuleAdd, the fwmark rule is rolled
+// back so a partial install does not persist (best-effort: if the
+// rollback RuleDel itself fails, the stale rule is logged and left for
+// the next apply's band clear() to sweep — the pin is reported failed
+// either way, so the probe holds rather than probing unpinned, #1895).
 //
 // Before #1895 every failure mode here was log-and-continue with an
 // unconditional nil return — the probe then ran with an unbacked

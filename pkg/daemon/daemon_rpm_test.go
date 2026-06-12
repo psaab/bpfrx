@@ -104,6 +104,13 @@ func TestReconcileRPMPinFailureRetry(t *testing.T) {
 		if len(pins) != 1 || pins[0].TestKey != "WAN/t" {
 			t.Fatalf("unexpected pins: %+v", pins)
 		}
+		// Codex PR #1899 r1 MAJOR-1: while the band is being
+		// cleared-and-reprogrammed, every pin must already be held
+		// (pre-marked) so a live probe cannot race the reprogram and
+		// false-PASS through the main table.
+		if got := d.rpm.PinInstallFailureCount(); got != len(pins) {
+			t.Fatalf("pins not pre-held during reprogram: count = %d, want %d", got, len(pins))
+		}
 		return retFailed
 	}
 	defer d.rpm.StopAll()
@@ -145,5 +152,29 @@ func TestReconcileRPMPinFailureRetry(t *testing.T) {
 	}
 	if d.reconcileRPM(cfg); calls != 3 {
 		t.Fatalf("pin apply calls = %d, want 3 (no retry once recovered)", calls)
+	}
+}
+
+// TestReconcileRPMNoInstallerHoldsPinnedTests: next-hop pins configured
+// but no routing manager (and no seam) — every pin must be marked
+// failed so rpm holds those tests; marks alone would otherwise send
+// marked-but-unbacked probes through the main table (Codex PR #1899
+// r1 MAJOR-2).
+func TestReconcileRPMNoInstallerHoldsPinnedTests(t *testing.T) {
+	d := &Daemon{rpm: rpm.New(), daemonCtx: context.Background()}
+	defer d.rpm.StopAll()
+
+	if !d.reconcileRPM(rpmPinnedTestConfig()) {
+		t.Fatal("first reconcile must apply")
+	}
+	if got := d.rpm.PinInstallFailureCount(); got != 1 {
+		t.Fatalf("pinned test without installer must be held: count = %d, want 1", got)
+	}
+	// Unpinned configs never report installer failures.
+	if !d.reconcileRPM(rpmTestConfig("192.0.2.9")) {
+		t.Fatal("config change must re-apply")
+	}
+	if got := d.rpm.PinInstallFailureCount(); got != 0 {
+		t.Fatalf("unpinned config must clear held pins: count = %d", got)
 	}
 }
