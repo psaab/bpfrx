@@ -2156,25 +2156,31 @@ pub(super) fn poll_binding_process_descriptor(
                         match decision.resolution.disposition {
                             ForwardingDisposition::LocalDelivery => {
                                 telemetry.dbg.local += 1;
-                                // Reinject to slow-path TUN so the kernel
-                                // processes host-bound traffic (NDP, ICMP echo,
-                                // BGP, etc.).  The first packet creates a BPF
-                                // session map entry so subsequent packets bypass
-                                // userspace entirely.
-                                maybe_reinject_slow_path(
-                                    worker_ctx.ident,
-                                    &binding.live,
-                                    worker_ctx.slow_path.as_deref(),
-                                    worker_ctx.local_tunnel_deliveries,
-                                    // SAFETY: per the `area` contract in
-                                    // this function's header comment.
-                                    unsafe { &*area },
-                                    desc,
-                                    meta,
-                                    decision,
-                                    worker_ctx.recent_exceptions,
-                                    worker_ctx.forwarding,
-                                );
+                                // Host-bound traffic (NDP, ICMP echo, BGP,
+                                // GRE-to-self inner packets, etc.) is
+                                // delivered by the SINGLE decap-aware
+                                // reinject chokepoint at the end of this
+                                // leg (`maybe_reinject_slow_path_from_frame`
+                                // over `packet_frame`). #1885: this arm used
+                                // to ALSO call the desc-based
+                                // `maybe_reinject_slow_path` here, pairing
+                                // the ORIGINAL UMEM frame (the VLAN-tagged
+                                // GRE OUTER frame on a tagged underlay) with
+                                // the post-decap INNER meta
+                                // (`stage_native_gre_decap` rebinds `meta`
+                                // but `desc` still points at the un-decapped
+                                // frame) — the slice landed 4 bytes early on
+                                // tagged ingress (TUN write EINVAL: payload
+                                // started with the dot1q TCI tail instead of
+                                // the IP version nibble) and delivered the
+                                // still-encapsulated OUTER packet on
+                                // untagged ingress. It was ALSO a duplicate
+                                // enqueue for non-decapped local packets
+                                // (both calls pass the same disposition
+                                // filter). The first delivered packet
+                                // creates a BPF session map entry so
+                                // subsequent packets bypass userspace
+                                // entirely.
                                 recycle_now = true;
                             }
                             ForwardingDisposition::NoRoute => {

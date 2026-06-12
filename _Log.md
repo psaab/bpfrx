@@ -1,5 +1,28 @@
 # Action Log
 
+## 2026-06-12 — #1885 local-delivery TUN mis-slice fix (engineer run)
+- **Timestamp**: 2026-06-12 UTC
+- **Action**: Verified the #1885 root cause is NOT the issue's framing
+  (extraction arithmetic) but a frame/meta pairing bug: the
+  poll_descriptor LocalDelivery arm passed the ORIGINAL UMEM desc (the
+  VLAN-tagged GRE OUTER frame) with the post-decap INNER meta
+  (l3_offset 14 relative to the synthetic decap frame) into
+  maybe_reinject_slow_path — 4-bytes-early slice on tagged underlays
+  (TUN EINVAL), outer-packet misdelivery on untagged, AND a latent
+  duplicate enqueue (the leg's trailing decap-aware chokepoint at
+  maybe_reinject_slow_path_from_frame(packet_frame, ..) also fires for
+  the same dispositions). Fix: delete the in-arm call; the trailing
+  chokepoint is the single, decap-correct delivery point. 4 regression
+  pins (tagged/untagged GRE-to-self byte-identical-exactly-once,
+  non-decap slow-path exactly-once, decap frame/meta self-consistency)
+  all FAIL pre-fix with the live strace signature and pass post-fix.
+  Gates: release build rc0 no new warnings (136=136), full release
+  suite 2023/1 (worker_queue concurrent_recovery ledger flake,
+  standalone-proven 5x), full debug 2050/0, go test rc0. Same-class
+  pending_neigh desc/meta mismatch documented for follow-up filing.
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/tests.rs, docs/pr/1885-vlan-slice/plan.md
+
 ## 2026-06-11 — #1873 PR #1882 code-review rounds 2-5 (resumed agent)
 - **Timestamp**: 2026-06-11/12 UTC
 - **Action**: Resumed the wedged #1873 /engineer run at PR #1882. Round 2:
