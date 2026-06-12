@@ -199,7 +199,12 @@ fi
 
 info "Crashing fw0 (sysrq reboot — unclean shutdown, tests worst-case failover)"
 
-incus exec "$FW0" -- bash -c 'echo b > /proc/sysrq-trigger' 2>/dev/null || true
+# timeout is load-bearing: sysrq-b resets the guest INSTANTLY, killing
+# the incus-agent serving this exec, so the exec may never observe an
+# exit status and would block forever (measured: a 47-minute hang on
+# the first live run of this phase). `|| true` alone cannot save a
+# command that never returns.
+timeout 10 incus exec "$FW0" -- bash -c 'echo b > /proc/sysrq-trigger' 2>/dev/null || true
 
 # Wait for fw1 to detect failure and become primary
 sleep 3
