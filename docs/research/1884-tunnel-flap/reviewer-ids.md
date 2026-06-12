@@ -13,3 +13,15 @@
 | r9 (v9 b2163ce9509b) | task-mqangyjc-do7knl | adversarial-review-mqan7eor-goab38 | claude-smr-plan-r9.md | **READY / READY / READY — CONVERGED** |
 
 PNR = PLAN-NEEDS-REVISION. Codex session IDs are recorded in each codex-plan-rN.md.
+
+## Implementation PR #1903 code-review rounds
+
+| Round | Codex | AGY | Claude SMR | Copilot | Verdicts |
+|---|---|---|---|---|---|
+| code-r1 (2cdad96d2/8b2095287) | task-mqaote9b-0g537t | adversarial-review-mqaostba-pouija | claude-smr-code-r1.md | quota-limit ×2 | MERGE-NEEDS-MINOR / MERGE-READY / MERGE-READY (SMR-c1 self-fix) |
+| code-r2 (87e8a88abcc0) | task-mqap55jy-045z9v | adversarial-review-mqap4qbk-kp1lia | (delta in r1 doc) | quota-limit ×3 (documented retries exhausted → 3-of-4 rule) | **MERGE-READY / MERGE-READY / MERGE-READY** |
+
+Live validation: lock cells "1884 reconcile validation" (deploy) + r2
+(checks) on loss:xpf-userspace-fw0 — ifindex 97 stable across two
+unrelated commits (0 flap journal lines), in-place address add/remove,
+restart adoption with `master vrf-sfmix` retained, service active.
