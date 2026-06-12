@@ -207,7 +207,10 @@ info "Crashing fw0 (sysrq reboot — unclean shutdown, tests worst-case failover
 # the client alive for 38+ minutes), so only the -k SIGKILL follow-up
 # reliably reaps the local client. `|| true` alone cannot save a
 # command that never returns.
-timeout -k 5 10 incus exec "$FW0" -- bash -c 'echo b > /proc/sysrq-trigger' 2>/dev/null || true
+# Braces, not just 2>/dev/null on the command: bash prints its own
+# "Killed" job notice for the SIGKILLed child, which would land in the
+# test transcript as alarming noise.
+{ timeout -k 5 10 incus exec "$FW0" -- bash -c 'echo b > /proc/sysrq-trigger' || true; } 2>/dev/null
 
 # Wait for fw1 to detect failure and become primary
 sleep 3

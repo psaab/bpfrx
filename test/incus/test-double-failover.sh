@@ -191,7 +191,7 @@ info "Crashing fw0 (sysrq reboot — unclean shutdown, tests worst-case failover
 # forwards SIGTERM to the (dead) remote session — only the SIGKILL
 # follow-up reliably reaps the local client (measured 47min/38min hangs
 # on test-failover.sh before the bound was added).
-timeout -k 5 10 incus exec "$FW0" -- bash -c 'echo b > /proc/sysrq-trigger' 2>/dev/null || true
+{ timeout -k 5 10 incus exec "$FW0" -- bash -c 'echo b > /proc/sysrq-trigger' || true; } 2>/dev/null
 
 # Wait for fw1 to detect failure and become primary
 sleep 5
@@ -295,7 +295,7 @@ fi
 info "Crashing fw1 (sysrq reboot — second failover, fw0 must take over)"
 
 # Same timeout -k rationale as the fw0 crash above (#1880).
-timeout -k 5 10 incus exec "$FW1" -- bash -c 'echo b > /proc/sysrq-trigger' 2>/dev/null || true
+{ timeout -k 5 10 incus exec "$FW1" -- bash -c 'echo b > /proc/sysrq-trigger' || true; } 2>/dev/null
 
 # Wait for fw0 to detect failure and become primary
 sleep 5
