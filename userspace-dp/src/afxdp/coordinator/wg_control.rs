@@ -35,6 +35,19 @@
 //!     kernel routes onto `wgN` are read, `try_encap`'d, and sent to the
 //!     peer endpoint. The transit AF_XDP egress is the other encap site
 //!     (frame/mod.rs).
+//!
+//! ## Timers + idle wait (#1888 S5 / #1889)
+//!
+//! The loop blocks in poll(2) over {socket, TUN} POLLIN when idle
+//! (timeout = min(next timer deadline, 100ms cap) — the cap bounds
+//! stop/join and worker-edge latency) and runs a 1s-granularity timer
+//! arm: session expiry (REJECT_AFTER_TIME teardown), the pure
+//! `WgEngine::timer_pass` (passive/persistent keepalives, no-reply
+//! reinit), and the handshake ATTEMPT machine (5s retransmit pacing,
+//! 90s give-up window, identity-based success). Per-use T1/T2/T3 age
+//! enforcement lives in the engine's encap/decap paths; this loop owns
+//! all sends. Design of record:
+//! `docs/research/1888-wg-timers/plan.md` (plan v9, 3/3 PLAN-READY).
 
 use super::*;
 use crate::afxdp::wg::counters::WgCounters;
