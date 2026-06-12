@@ -168,6 +168,11 @@ scenario_a() {
 	# would boot without NIC drivers.
 	guest xpf-image-a sh -c '[ "$(ls /lib/modules | wc -l)" -eq 1 ]' ||
 		fail "more than one kernel in /lib/modules — stale cloudimg kernel not purged"
+	# init_on_alloc=0 must be on the BOOTED cmdline (Ubuntu cloudimgs
+	# override GRUB_CMDLINE_LINUX_DEFAULT in grub.d — the xpf drop-in
+	# must actually win; ~20% CPU in the XDP path otherwise).
+	guest xpf-image-a sh -c 'grep -qw init_on_alloc=0 /proc/cmdline' ||
+		fail "init_on_alloc=0 missing from the booted kernel cmdline"
 
 	info "in-guest verify-dataplane (the bake gate, image kernel)..."
 	guest xpf-image-a nice -n 19 /usr/local/sbin/xpfd verify-dataplane ||
