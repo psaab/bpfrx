@@ -155,7 +155,12 @@ pub struct Coordinator {
     pub(crate) bpf_maps: BpfMaps,
     pub(crate) slow_path: Option<Arc<SlowPathReinjector>>,
     pub(crate) local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>>,
-    pub(crate) tunnel_sources: BTreeMap<u16, LocalTunnelSourceHandle>,
+    /// #1881: GRE local-origin thread lifecycle entries keyed by
+    /// tunnel_endpoint_id. Reconciled by the same three-pass shape as
+    /// `wg_control_threads` (finished sweep → attachment-stale prune →
+    /// spawn with backoff); content changes never restart a thread —
+    /// the loop tracks the shared forwarding ArcSwap (plan D.1).
+    pub(crate) tunnel_sources: BTreeMap<u16, LocalTunnelSourceEntry>,
     /// #1432 S2a / #1866: WG control-thread lifecycle entries keyed by
     /// tunnel_endpoint_id. Each entry records the engine Arc address +
     /// TUN attachment the thread was spawned with (so the apply-time
@@ -365,12 +370,19 @@ impl Coordinator {
         // worker, and the resolver thread is provably gone so no stale
         // mutation can occur. The next reconcile spawns a fresh resolver
         // and re-installs the handle on every worker.
-        for handle in self.tunnel_sources.values_mut() {
-            handle.stop.store(true, Ordering::Relaxed);
+        // #1881: entries may be tombstones (`handle == None`); stop
+        // then join live handles, clear everything (tombstones too —
+        // after a stop the next reconcile re-legitimates entries).
+        for entry in self.tunnel_sources.values_mut() {
+            if let Some(handle) = entry.handle.as_ref() {
+                handle.stop.store(true, Ordering::Relaxed);
+            }
         }
-        for (_, handle) in self.tunnel_sources.iter_mut() {
-            if let Some(join) = handle.join.take() {
-                let _ = join.join();
+        for entry in self.tunnel_sources.values_mut() {
+            if let Some(handle) = entry.handle.as_mut() {
+                if let Some(join) = handle.join.take() {
+                    let _ = join.join();
+                }
             }
         }
         self.tunnel_sources.clear();
@@ -521,98 +533,432 @@ impl Coordinator {
     }
 
 
-    fn spawn_local_tunnel_sources(&mut self) {
-        let mut local_tunnel_deliveries = BTreeMap::new();
-        for endpoint in self.forwarding.tunnel_endpoints.values() {
-            if endpoint.mode != "gre" && endpoint.mode != "ip6gre" {
+    /// #1881: reconcile GRE local-origin threads against the current
+    /// `forwarding.tunnel_endpoints`. Called from initial worker
+    /// bring-up AND every armed `refresh_runtime_snapshot` — tunnel
+    /// interfaces are excluded from the binding plan
+    /// (`include_userspace_binding_interface`), so tunnel-only commits
+    /// take the same-plan path and never reach a full reconcile.
+    /// Three passes, same shape as `spawn_wg_control_threads` (#1866):
+    ///
+    ///   1. Finished sweep — exited thread ⇒ TOMBSTONE (backoff stamp
+    ///      + attachment retained; delivery sender cleared).
+    ///   2. Stale prune — endpoint removed / mode no longer gre|ip6gre
+    ///      / TUN attachment changed ⇒ UNPUBLISH the delivery map
+    ///      first (Codex plan r1 MAJOR 2: workers must lose the
+    ///      sender BEFORE the join so a busy producer cannot extend
+    ///      it), then stop + join + remove. Endpoint CONTENT changes
+    ///      are deliberately NOT stale conditions — the live thread
+    ///      tracks them through the shared forwarding ArcSwap.
+    ///   3. Spawn — desired gre/ip6gre endpoints with no entry (new:
+    ///      immediate) or a tombstone past the backoff. Gated on live
+    ///      worker handles (plan SMR-1): the deferred same-plan window
+    ///      reaches this with ZERO workers, and a thread spawned there
+    ///      would freeze empty live/identities/worker_commands
+    ///      captures for its lifetime. WG deliberately has no such
+    ///      gate — WG control threads use kernel UDP+TUN and have no
+    ///      binding dependency; GRE local-origin TX does.
+    ///
+    /// The delivery map is republished (live handles only) whenever
+    /// any pass changed the set.
+    fn reconcile_local_tunnel_sources(&mut self) {
+        let swept = self.sweep_finished_local_tunnel_sources();
+
+        // Stale prune: removed, mode-flipped, or attachment drift.
+        let mut stale: Vec<(u16, &'static str)> = Vec::new();
+        for (id, entry) in self.tunnel_sources.iter() {
+            let reason = match self.forwarding.tunnel_endpoints.get(id) {
+                None => Some("removed"),
+                Some(ep) if ep.mode != "gre" && ep.mode != "ip6gre" => Some("mode_changed"),
+                Some(ep) => {
+                    let attach_ok = ep.logical_ifindex == entry.spawned_ifindex
+                        && self
+                            .forwarding
+                            .ifindex_to_name
+                            .get(&ep.logical_ifindex)
+                            .is_some_and(|name| *name == entry.spawned_tunnel_name);
+                    if attach_ok {
+                        None
+                    } else {
+                        Some("attachment_changed")
+                    }
+                }
+            };
+            if let Some(reason) = reason {
+                stale.push((*id, reason));
+            }
+        }
+        if swept > 0 || !stale.is_empty() {
+            // Store #1 (unpublish): live-handle-only rule applied to
+            // (entries − stale set) — swept tombstones drop out via
+            // the live-handle rule, stale entries via the exclusion.
+            let stale_ids: Vec<u16> = stale.iter().map(|(id, _)| *id).collect();
+            self.publish_local_tunnel_deliveries_excluding(&stale_ids);
+        }
+        for (id, reason) in &stale {
+            self.stop_remove_local_tunnel_entry(*id, reason);
+        }
+
+        // Spawn pass (apply-time only; the periodic liveness sweep
+        // respawns tombstones but never creates entries).
+        let mut spawned = false;
+        if !self.workers.handles.is_empty() {
+            let now = monotonic_nanos();
+            let desired: Vec<u16> = self
+                .forwarding
+                .tunnel_endpoints
+                .values()
+                .filter(|ep| ep.mode == "gre" || ep.mode == "ip6gre")
+                .map(|ep| ep.id)
+                .collect();
+            for id in desired {
+                match self.tunnel_sources.get(&id) {
+                    Some(entry) if entry.handle.is_some() => continue, // live
+                    Some(entry)
+                        if now.saturating_sub(entry.last_spawn_attempt_ns)
+                            < WG_SPAWN_BACKOFF_NS =>
+                    {
+                        continue; // tombstone within backoff
+                    }
+                    _ => {}
+                }
+                spawned |= self.spawn_one_local_tunnel_source(id);
+            }
+        }
+        if swept > 0 || !stale.is_empty() || spawned {
+            // Store #2: final live-handle-only publication.
+            self.publish_local_tunnel_deliveries_excluding(&[]);
+        }
+    }
+
+    /// #1881 pass 1: join threads that already exited and tombstone
+    /// their entries (keep backoff stamp + attachment; never remove).
+    /// Returns the number of entries tombstoned.
+    fn sweep_finished_local_tunnel_sources(&mut self) -> usize {
+        let finished: Vec<u16> = self
+            .tunnel_sources
+            .iter()
+            .filter(|(_, entry)| {
+                entry
+                    .handle
+                    .as_ref()
+                    .is_some_and(|h| h.join.as_ref().is_none_or(|j| j.is_finished()))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        let swept = finished.len();
+        for id in finished {
+            if let Some(entry) = self.tunnel_sources.get_mut(&id) {
+                if let Some(mut handle) = entry.handle.take() {
+                    handle.stop.store(true, Ordering::Relaxed);
+                    if let Some(join) = handle.join.take() {
+                        let _ = join.join();
+                    }
+                }
+                entry.delivery_tx = None;
+                eprintln!(
+                    "xpf-userspace-dp: GRE local-origin thread exited endpoint={id} tun={} — tombstoned (respawn if still configured)",
+                    entry.spawned_tunnel_name
+                );
+            }
+        }
+        swept
+    }
+
+    /// #1881 pass 2 helper: stop + join + REMOVE one entry (live
+    /// thread or tombstone). Callers UNPUBLISH the delivery map
+    /// before invoking this (unpublish-before-join).
+    fn stop_remove_local_tunnel_entry(&mut self, id: u16, reason: &str) {
+        if let Some(mut entry) = self.tunnel_sources.remove(&id) {
+            if let Some(mut handle) = entry.handle.take() {
+                handle.stop.store(true, Ordering::Relaxed);
+                if let Some(join) = handle.join.take() {
+                    let _ = join.join();
+                }
+            }
+            eprintln!(
+                "xpf-userspace-dp: stopped GRE local-origin thread endpoint={id} tun={} reason={reason}",
+                entry.spawned_tunnel_name
+            );
+        }
+    }
+
+    /// #1881: publish `local_tunnel_deliveries` from the entry map —
+    /// live handles only (tombstones and failed spawns never publish),
+    /// minus `exclude` (the pass-2 stale set, for the
+    /// unpublish-before-join store #1).
+    fn publish_local_tunnel_deliveries_excluding(&self, exclude: &[u16]) {
+        let mut map: BTreeMap<i32, SyncSender<Vec<u8>>> = BTreeMap::new();
+        for (id, entry) in self.tunnel_sources.iter() {
+            if exclude.contains(id) || entry.handle.is_none() {
                 continue;
             }
-            let Some(tunnel_name) = self
-                .forwarding
-                .ifindex_to_name
-                .get(&endpoint.logical_ifindex)
-                .cloned()
-            else {
-                continue;
-            };
-            let stop = Arc::new(AtomicBool::new(false));
-            let stop_clone = stop.clone();
-            let forwarding = self.forwarding.clone();
-            let ha_state = self.ha.rg_runtime.clone();
-            let dynamic_neighbors = self.neighbors.dynamic.clone();
-            let live = self.workers.live.clone();
-            let identities = self.workers.identities.clone();
-            let shared_sessions = self.sessions.synced.clone();
-            let shared_nat_sessions = self.sessions.nat.clone();
-            let shared_forward_wire_sessions = self.sessions.forward_wire.clone();
-            let shared_owner_rg_indexes = self.sessions.owner_rg_indexes.clone();
-            let worker_commands = self
-                .workers
-                .handles
-                .values()
-                .map(|handle| handle.commands.clone())
-                .collect::<Vec<_>>();
-            let recent_exceptions = self.recent_exceptions.clone();
-            let tunnel_endpoint_id = endpoint.id;
-            let thread_tunnel_name = tunnel_name.clone();
-            let logical_ifindex = endpoint.logical_ifindex;
-            let (delivery_tx, delivery_rx) = mpsc::sync_channel(LOCAL_TUNNEL_DELIVERY_QUEUE_DEPTH);
-            // #925-A: wrap aux tunnel-origin thread in catch_unwind.
-            // A panic here would otherwise silently stop locally-
-            // generated GRE traffic on this tunnel; transit packets
-            // continue through worker_loop unaffected.
-            let join = spawn_supervised_aux(
-                format!("xpf-native-gre-origin-{}", tunnel_name),
-                move || {
-                    local_tunnel_source_loop(
-                        thread_tunnel_name,
-                        tunnel_endpoint_id,
-                        forwarding,
-                        ha_state,
-                        dynamic_neighbors,
-                        live,
-                        identities,
-                        shared_sessions,
-                        shared_nat_sessions,
-                        shared_forward_wire_sessions,
-                        shared_owner_rg_indexes,
-                        worker_commands,
-                        delivery_rx,
-                        recent_exceptions,
-                        stop_clone,
-                    );
-                },
-            );
-            match join {
-                Ok(join) => {
-                    local_tunnel_deliveries.insert(logical_ifindex, delivery_tx);
-                    self.tunnel_sources.insert(
-                        tunnel_endpoint_id,
-                        LocalTunnelSourceHandle {
-                            stop,
-                            join: Some(join),
+            if let Some(tx) = entry.delivery_tx.as_ref() {
+                map.insert(entry.spawned_ifindex, tx.clone());
+            }
+        }
+        self.local_tunnel_deliveries.store(Arc::new(map));
+    }
+
+    /// #1881 pass 3 helper: one spawn ATTEMPT for endpoint `id`
+    /// against the CURRENT forwarding state. Records the entry (live
+    /// handle or failure tombstone) with the attempt stamped either
+    /// way. TUN open happens INSIDE the spawned aux thread — never on
+    /// the control-socket thread (#1866 §7 discipline). Returns true
+    /// when a live thread was started.
+    fn spawn_one_local_tunnel_source(&mut self, id: u16) -> bool {
+        let Some(endpoint) = self.forwarding.tunnel_endpoints.get(&id) else {
+            return false;
+        };
+        if endpoint.mode != "gre" && endpoint.mode != "ip6gre" {
+            return false;
+        }
+        let Some(tunnel_name) = self
+            .forwarding
+            .ifindex_to_name
+            .get(&endpoint.logical_ifindex)
+            .cloned()
+        else {
+            return false;
+        };
+        let logical_ifindex = endpoint.logical_ifindex;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        // #1881 D.1: the thread receives the SAME worker-visible
+        // forwarding ArcSwap handle (`ha.forwarding`) instead of a
+        // frozen clone — every store on the refresh/reconcile/fabric
+        // paths reaches it on its next iteration.
+        let shared_forwarding = self.ha.forwarding.clone();
+        let ha_state = self.ha.rg_runtime.clone();
+        let dynamic_neighbors = self.neighbors.dynamic.clone();
+        let live = self.workers.live.clone();
+        let identities = self.workers.identities.clone();
+        let shared_sessions = self.sessions.synced.clone();
+        let shared_nat_sessions = self.sessions.nat.clone();
+        let shared_forward_wire_sessions = self.sessions.forward_wire.clone();
+        let shared_owner_rg_indexes = self.sessions.owner_rg_indexes.clone();
+        let worker_commands = self
+            .workers
+            .handles
+            .values()
+            .map(|handle| handle.commands.clone())
+            .collect::<Vec<_>>();
+        let recent_exceptions = self.recent_exceptions.clone();
+        let thread_tunnel_name = tunnel_name.clone();
+        let (delivery_tx, delivery_rx) = mpsc::sync_channel(LOCAL_TUNNEL_DELIVERY_QUEUE_DEPTH);
+        eprintln!(
+            "xpf-userspace-dp: spawning GRE local-origin thread endpoint={id} tun={tunnel_name}"
+        );
+        // #925-A: wrap aux tunnel-origin thread in catch_unwind.
+        // A panic here would otherwise silently stop locally-
+        // generated GRE traffic on this tunnel; transit packets
+        // continue through worker_loop unaffected.
+        let join = spawn_supervised_aux(
+            format!("xpf-native-gre-origin-{}", tunnel_name),
+            move || {
+                local_tunnel_source_loop(
+                    thread_tunnel_name,
+                    id,
+                    logical_ifindex,
+                    shared_forwarding,
+                    ha_state,
+                    dynamic_neighbors,
+                    live,
+                    identities,
+                    shared_sessions,
+                    shared_nat_sessions,
+                    shared_forward_wire_sessions,
+                    shared_owner_rg_indexes,
+                    worker_commands,
+                    delivery_rx,
+                    recent_exceptions,
+                    stop_clone,
+                );
+            },
+        );
+        let (handle, delivery_tx, started) = match join {
+            Ok(join) => (
+                Some(LocalTunnelSourceHandle {
+                    stop,
+                    join: Some(join),
+                }),
+                Some(delivery_tx),
+                true,
+            ),
+            Err(err) => {
+                if let Ok(mut recent) = self.recent_exceptions.lock() {
+                    push_recent_exception(
+                        &mut recent,
+                        ExceptionStatus {
+                            timestamp: Utc::now(),
+                            interface: tunnel_name.clone(),
+                            reason: format!("spawn_local_tunnel_source_failed:{id}:{err}"),
+                            ..ExceptionStatus::default()
                         },
                     );
                 }
-                Err(err) => {
-                    if let Ok(mut recent) = self.recent_exceptions.lock() {
-                        push_recent_exception(
-                            &mut recent,
-                            ExceptionStatus {
-                                timestamp: Utc::now(),
-                                interface: tunnel_name,
-                                reason: format!(
-                                    "spawn_local_tunnel_source_failed:{tunnel_endpoint_id}:{err}"
-                                ),
-                                ..ExceptionStatus::default()
-                            },
-                        );
+                eprintln!(
+                    "xpf-userspace-dp: GRE local-origin thread spawn FAILED endpoint={id}: {err}"
+                );
+                (None, None, false)
+            }
+        };
+        self.tunnel_sources.insert(
+            id,
+            LocalTunnelSourceEntry {
+                handle,
+                spawned_ifindex: logical_ifindex,
+                spawned_tunnel_name: tunnel_name,
+                delivery_tx,
+                last_spawn_attempt_ns: monotonic_nanos(),
+            },
+        );
+        started
+    }
+
+    /// #1881: stop + join + remove ALL GRE local-origin entries (live
+    /// and tombstoned) and store the EMPTY delivery map (plan SMR2-2,
+    /// mirroring `stop_inner`). Used by the disarmed same-plan refresh
+    /// leg — a disarmed helper must not hold TUN reader fds (mirrors
+    /// `stop_all_wg_control_threads`); in practice a no-op because
+    /// `reconcile_status_bindings → stop()` already cleared them.
+    pub(crate) fn stop_all_local_tunnel_sources(&mut self, reason: &str) {
+        let ids: Vec<u16> = self.tunnel_sources.keys().copied().collect();
+        if ids.is_empty() {
+            return;
+        }
+        self.local_tunnel_deliveries
+            .store(Arc::new(BTreeMap::new()));
+        for id in ids {
+            self.stop_remove_local_tunnel_entry(id, reason);
+        }
+    }
+
+    /// #1881 (mirrors #1866 Change 2b): removal propagation on the
+    /// defer-workers apply path — the NOT-same-plan + defer_workers
+    /// branch stores the snapshot WITHOUT reconciling, so a removed
+    /// GRE tunnel's thread would keep its TUN reader fd (on a netdev
+    /// the Go side is deleting) until the deferred bring-up. Narrow
+    /// prune: stop + join + remove entries whose id is absent from,
+    /// or no longer gre/ip6gre in, the new snapshot. No spawn, no
+    /// forwarding mutation; unpublish-before-join discipline applies.
+    pub(crate) fn prune_local_tunnel_sources_for_snapshot(
+        &mut self,
+        snapshot: &crate::ConfigSnapshot,
+    ) {
+        let desired: std::collections::BTreeSet<u16> = snapshot
+            .tunnel_endpoints
+            .iter()
+            .filter(|row| {
+                row.id != 0
+                    && row.ifindex > 0
+                    && (row.mode == "gre" || row.mode == "ip6gre")
+            })
+            .map(|row| row.id)
+            .collect();
+        let stale: Vec<u16> = self
+            .tunnel_sources
+            .keys()
+            .filter(|id| !desired.contains(id))
+            .copied()
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        self.publish_local_tunnel_deliveries_excluding(&stale);
+        for id in stale {
+            self.stop_remove_local_tunnel_entry(id, "removed_deferred");
+        }
+    }
+
+    /// #1881 (mirrors `reconcile_wg_control_liveness`): periodic
+    /// self-heal, called from the server's `refresh_status` ONLY while
+    /// `should_run_afxdp` holds. TOMBSTONE-ONLY and SNAPSHOT-COHERENT:
+    /// never creates entries; a tombstone respawns only past the
+    /// backoff AND only when the latest STORED snapshot's row for the
+    /// id matches the forwarding endpoint's mode + attachment (the
+    /// spawn-baked identity). Endpoint CONTENT is NOT gated — the
+    /// thread reads it live through the ArcSwap, so a respawn bakes in
+    /// nothing but the attachment (plan v3 / AGY r1 R3). The delivery
+    /// map is republished when the sweep or a respawn changed the set
+    /// (Codex plan r1 R3: a respawn without republication would
+    /// restore the TUN reader but not inbound delivery).
+    pub(crate) fn reconcile_local_tunnel_liveness(
+        &mut self,
+        latest_snapshot: Option<&crate::ConfigSnapshot>,
+    ) {
+        let swept = self.sweep_finished_local_tunnel_sources();
+        let mut spawned = false;
+        if let Some(snapshot) = latest_snapshot {
+            if !self.workers.handles.is_empty() {
+                let now = monotonic_nanos();
+                let tombstones: Vec<u16> = self
+                    .tunnel_sources
+                    .iter()
+                    .filter(|(_, entry)| entry.handle.is_none())
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in tombstones {
+                    let Some(entry) = self.tunnel_sources.get(&id) else {
+                        continue;
+                    };
+                    if now.saturating_sub(entry.last_spawn_attempt_ns) < WG_SPAWN_BACKOFF_NS {
+                        continue;
                     }
+                    if !self.local_tunnel_tombstone_respawn_coherent(id, snapshot) {
+                        continue;
+                    }
+                    spawned = self.spawn_one_local_tunnel_source(id);
+                    break; // ≤1 spawn attempt per invocation
                 }
             }
         }
-        self.local_tunnel_deliveries
-            .store(Arc::new(local_tunnel_deliveries));
+        if swept > 0 || spawned {
+            self.publish_local_tunnel_deliveries_excluding(&[]);
+        }
+    }
+
+    /// #1881: whether a tombstone respawn for `id` is coherent — the
+    /// latest stored snapshot must describe EXACTLY the attachment the
+    /// spawn would create from the current forwarding state (mode +
+    /// ifindex + linux name; the GRE analog of
+    /// `wg_tombstone_respawn_coherent` minus the crypto identity).
+    fn local_tunnel_tombstone_respawn_coherent(
+        &self,
+        id: u16,
+        snapshot: &crate::ConfigSnapshot,
+    ) -> bool {
+        let Some(endpoint) = self.forwarding.tunnel_endpoints.get(&id) else {
+            return false;
+        };
+        if endpoint.mode != "gre" && endpoint.mode != "ip6gre" {
+            return false;
+        }
+        let Some(name) = self
+            .forwarding
+            .ifindex_to_name
+            .get(&endpoint.logical_ifindex)
+        else {
+            return false;
+        };
+        let Some(row) = snapshot
+            .tunnel_endpoints
+            .iter()
+            .find(|row| row.id == id && row.ifindex > 0)
+        else {
+            return false;
+        };
+        if row.mode != endpoint.mode {
+            return false;
+        }
+        // Attachment label mirrors forwarding_build/interfaces.rs:
+        // linux_name with a fallback to the logical name when empty.
+        let row_label = if row.linux_name.is_empty() {
+            row.interface.as_str()
+        } else {
+            row.linux_name.as_str()
+        };
+        row.ifindex == endpoint.logical_ifindex && row_label == name
     }
 
     /// #1432 S2a / #1866: reconcile WG control threads against the
@@ -1162,8 +1508,22 @@ impl Coordinator {
         // before its first stop check); stop anything present instead.
         if spawn_wg {
             self.spawn_wg_control_threads();
+            // #1881: reconcile GRE local-origin threads on every armed
+            // runtime-snapshot refresh — tunnel interfaces are excluded
+            // from the binding plan, so tunnel add/remove/reattach
+            // commits reach ONLY this path. Runs AFTER the forwarding
+            // swap + ha.forwarding.store above (same position as the WG
+            // reconcile): pass decisions and a fresh thread's first
+            // load_full() see the new state, and the store-to-join
+            // window is covered by the thread-side rotation gate
+            // (tunnel.rs endpoint_attachment_valid, plan D.1b).
+            self.reconcile_local_tunnel_sources();
         } else {
             self.stop_all_wg_control_threads("disarmed");
+            // #1881: a disarmed helper must not hold GRE TUN reader
+            // fds either (mirrors the WG rule; in practice a no-op —
+            // reconcile_status_bindings → stop() already cleared them).
+            self.stop_all_local_tunnel_sources("disarmed");
         }
         self.refresh_cos_owner_worker_map_from_identities();
         self.ha

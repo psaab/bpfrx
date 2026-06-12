@@ -16,10 +16,41 @@ fn local_tunnel_io_error_is_fatal(err: &io::Error) -> bool {
     )
 }
 
+/// #1881 D.1b: whether the loaded forwarding state still describes
+/// the tunnel this thread is attached to. The TUN fd is bound to the
+/// netdev captured at spawn — if the endpoint is gone, no longer a
+/// GRE mode, or re-attached to a different ifindex/name, this thread
+/// must PARK (drop without building) until the coordinator prune
+/// joins it. Recomputed ONLY when the forwarding Arc rotates, so the
+/// steady-state per-packet cost is zero. This is the correctness
+/// boundary for the store-to-join window in
+/// `refresh_runtime_snapshot_inner`: the #1873 owner check compares
+/// the endpoint row against a resolution derived from the SAME
+/// loaded state, so it cannot detect a thread reading the wrong TUN.
+pub(super) fn endpoint_attachment_valid(
+    forwarding: &ForwardingState,
+    tunnel_endpoint_id: u16,
+    spawned_logical_ifindex: i32,
+    spawned_tunnel_name: &str,
+) -> bool {
+    let Some(endpoint) = forwarding.tunnel_endpoints.get(&tunnel_endpoint_id) else {
+        return false;
+    };
+    if endpoint.mode != "gre" && endpoint.mode != "ip6gre" {
+        return false;
+    }
+    endpoint.logical_ifindex == spawned_logical_ifindex
+        && forwarding
+            .ifindex_to_name
+            .get(&endpoint.logical_ifindex)
+            .is_some_and(|name| name == spawned_tunnel_name)
+}
+
 pub(super) fn local_tunnel_source_loop(
     tunnel_name: String,
     tunnel_endpoint_id: u16,
-    forwarding: ForwardingState,
+    spawned_logical_ifindex: i32,
+    shared_forwarding: Arc<ArcSwap<ForwardingState>>,
     ha_state: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
     dynamic_neighbors: Arc<ShardedNeighborMap>,
     live: BTreeMap<u32, Arc<BindingLiveState>>,
@@ -49,8 +80,48 @@ pub(super) fn local_tunnel_source_loop(
     let mut next_slot = 0usize;
     let mut local_sessions = FastMap::<SessionKey, u64>::default();
     let mut local_sessions_last_prune_ns = 0u64;
+    // #1881 D.1: track the worker-visible forwarding ArcSwap instead
+    // of a spawn-time clone. ONE load point per outer iteration (the
+    // #1188 ptr_eq short-circuit); the same Arc is used for the WHOLE
+    // packet build below, so resolution, session synthesis, CoS, and
+    // encap are coherent by construction. Cost honesty: this loop is
+    // syscall-paced (one read(2) per iteration, 1ms sleep when idle,
+    // single-digit pps workload) — an iteration IS the batch (≤1
+    // packet), so the per-BATCH ArcSwap rule holds and the AF_XDP
+    // worker hot path is untouched.
+    let mut forwarding: Arc<ForwardingState> = shared_forwarding.load_full();
+    let mut endpoint_attached = endpoint_attachment_valid(
+        &forwarding,
+        tunnel_endpoint_id,
+        spawned_logical_ifindex,
+        &tunnel_name,
+    );
     while !stop.load(Ordering::Relaxed) {
+        if let Some(new_forwarding) =
+            super::worker::load_arc_if_changed(&forwarding, &shared_forwarding)
+        {
+            forwarding = new_forwarding;
+            endpoint_attached = endpoint_attachment_valid(
+                &forwarding,
+                tunnel_endpoint_id,
+                spawned_logical_ifindex,
+                &tunnel_name,
+            );
+        }
+        // #1881 (AGY plan r1): ONE HA-state load per iteration, passed
+        // down so resolution enforcement and reverse-entry synthesis
+        // see the same map. Cross-source (forwarding↔HA) atomicity is
+        // not claimed — they are published independently by design,
+        // matching the worker path.
+        let ha_runtime = ha_state.load();
         loop {
+            // #1881 (Codex plan r1 MAJOR 2): observe `stop` inside the
+            // delivery drain so a producer that keeps the queue
+            // non-empty cannot extend the coordinator's stop+join
+            // beyond one bounded chunk.
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
             match delivery_rx.try_recv() {
                 Ok(packet) => {
                     if let Err(err) = tun.write_all(&packet) {
@@ -72,12 +143,25 @@ pub(super) fn local_tunnel_source_loop(
         match tun.read(&mut packet) {
             Ok(0) => thread::sleep(Duration::from_millis(1)),
             Ok(len) => {
+                // #1881 D.1b: parked — the loaded state no longer
+                // describes this thread's TUN attachment (endpoint
+                // removed, mode flipped, or reattached). Drop without
+                // building; the coordinator prune will join us. Keep
+                // reading so the TUN never backs up.
+                if !endpoint_attached {
+                    debug_log!(
+                        "LOCAL_TUNNEL[{}]: drop endpoint={} reason=local_tunnel_unattached",
+                        tunnel_name,
+                        tunnel_endpoint_id
+                    );
+                    continue;
+                }
                 let packet = &packet[..len];
                 match build_local_origin_tunnel_tx_request(
                     packet,
                     tunnel_endpoint_id,
                     &forwarding,
-                    &ha_state,
+                    ha_runtime.as_ref(),
                     &dynamic_neighbors,
                 ) {
                     Ok(plan) => {
@@ -147,7 +231,7 @@ pub(super) fn build_local_origin_tunnel_tx_request(
     packet: &[u8],
     tunnel_endpoint_id: u16,
     forwarding: &ForwardingState,
-    ha_state: &Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
+    ha_runtime: &BTreeMap<i32, HAGroupRuntime>,
     dynamic_neighbors: &Arc<ShardedNeighborMap>,
 ) -> Result<LocalTunnelTxPlan, String> {
     let mut meta = local_origin_packet_meta(packet)
@@ -156,9 +240,12 @@ pub(super) fn build_local_origin_tunnel_tx_request(
     meta.l3_offset = 14;
     meta.l4_offset = meta.l4_offset.saturating_add(14);
     meta.payload_offset = meta.payload_offset.saturating_add(14);
-    let resolution = enforce_ha_resolution_at(
+    // #1881 (AGY plan r1): the caller loads HA state ONCE per loop
+    // iteration and passes the map down — resolution enforcement and
+    // the reverse-entry synthesis below must see the same HA map.
+    let resolution = enforce_ha_resolution_snapshot(
         forwarding,
-        ha_state,
+        ha_runtime,
         monotonic_nanos() / 1_000_000_000,
         resolve_tunnel_forwarding_resolution(
             forwarding,
@@ -211,7 +298,7 @@ pub(super) fn build_local_origin_tunnel_tx_request(
     };
     let reverse_session_entry = synthesized_synced_reverse_entry(
         forwarding,
-        ha_state.load().as_ref(),
+        ha_runtime,
         dynamic_neighbors,
         &session_entry,
         monotonic_nanos() / 1_000_000_000,

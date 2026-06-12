@@ -25,6 +25,12 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
         state
             .afxdp
             .reconcile_wg_control_liveness(state.snapshot.as_ref());
+        // #1881: GRE local-origin self-heal — tombstone-only +
+        // snapshot-coherent + worker-gated, ≤1 spawn per invocation;
+        // republishes the delivery map when the set changed.
+        state
+            .afxdp
+            .reconcile_local_tunnel_liveness(state.snapshot.as_ref());
     }
     let writer_status = state.state_writer.status();
     state.status.io_uring_active = writer_status.active;

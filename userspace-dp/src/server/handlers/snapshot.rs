@@ -120,6 +120,13 @@ pub(super) fn apply(
             // prune-only reconcile against the new snapshot (no spawn,
             // no forwarding mutation).
             guard.afxdp.prune_wg_control_threads_for_snapshot(&snapshot);
+            // #1881: same removal propagation for GRE local-origin
+            // threads — a removed/mode-flipped tunnel's thread must
+            // release its TUN reader fd NOW, not at the deferred
+            // bring-up (the Go side is deleting the netdev).
+            guard
+                .afxdp
+                .prune_local_tunnel_sources_for_snapshot(&snapshot);
         }
         guard.snapshot = Some(snapshot);
         let replanned = replan_queues(

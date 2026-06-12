@@ -628,10 +628,12 @@ fn build_forwarded_frame_from_frame_encapsulates_native_gre() {
 #[test]
 fn local_origin_tunnel_tx_request_encapsulates_raw_ip_for_active_owner() {
     let state = build_forwarding_state(&native_gre_snapshot(true));
-    let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
+    // #1881: the loop now loads HA state once per iteration and
+    // passes the map down — the builder takes &BTreeMap directly.
+    let ha_state = BTreeMap::from([(
         1,
         active_ha_runtime(monotonic_nanos() / 1_000_000_000),
-    )])));
+    )]);
     let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
     let packet = build_icmp_echo_frame_v4(
         Ipv4Addr::new(10, 255, 192, 42),
@@ -659,10 +661,10 @@ fn local_origin_tunnel_tx_request_encapsulates_raw_ip_for_active_owner() {
 #[test]
 fn local_origin_tunnel_tx_request_rejects_inactive_owner() {
     let state = build_forwarding_state(&native_gre_snapshot(true));
-    let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
+    let ha_state = BTreeMap::from([(
         1,
         inactive_ha_runtime(monotonic_nanos() / 1_000_000_000),
-    )])));
+    )]);
     let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
     let packet = build_icmp_echo_frame_v4(
         Ipv4Addr::new(10, 255, 192, 42),
