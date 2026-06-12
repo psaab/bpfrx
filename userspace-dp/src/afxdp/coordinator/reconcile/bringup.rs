@@ -442,7 +442,11 @@ pub(super) fn bring_up_workers(
         coord.neighbors.warm_queue = Some(tx);
         coord.neighbors.warm_stop = Some(warm_stop);
     }
-    coord.spawn_local_tunnel_sources();
+    // #1881: three-pass reconcile (degenerates to pure spawn here —
+    // stop_inner cleared the entry map before this bring-up, and the
+    // worker spawn loop above populated `workers.handles`, satisfying
+    // the spawn-pass worker gate).
+    coord.reconcile_local_tunnel_sources();
     coord.spawn_wg_control_threads();
 }
 
