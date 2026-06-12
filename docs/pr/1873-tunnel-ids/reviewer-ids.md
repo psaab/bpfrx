@@ -35,3 +35,28 @@ Converged: PLAN-READY 3-of-3 at round 4 on plan v4 (blanket R-C gate).
 | code-4 | Codex | task-mqacrbqj-iot5f9 | MERGE-NEEDS-MAJOR (replay filter resurrects the derived reverse companion of a purged forward — verified trace via ha.rs:344 + coordinator/mod.rs:473); CONFIRMED both r3 MAJORs closed → fixed in 6cac0bec4 (filter_replayed_synced_sessions collects purge KEYS incl. reverse_session_key of dropped forwards — exactly Codex's prescription, independently implemented from AGY r4's identical finding before the Codex result landed) |
 | code-4 | AGY | review-mqacrm2m-vflatf | no-ship (HIGH: same companion-resurrection hazard, NAT-companion counter-example) → fixed in 6cac0bec4 + pin replay_filter_drops_purged_forward_and_derived_reverse_companion |
 | code-4 | Claude SMR | (in-conversation) | Verified the filter mirrors delete_synced_session companion semantics exactly (reverse-marked drops standalone; forward drop derives reverse key); gates clean at 6cac0bec4 (full 2027/0 rc0) |
+| code-5 | Codex | task-mqad0msy-8t7xrh | MERGE-READY, no findings — verified 6cac0bec4 implements its r4 prescription faithfully (re-ran the F/R trace; key-semantic retention ratified; pin judged not-weak); r2-r4 fold chain re-confirmed closed |
+| code-5 | AGY | review-mqad0vbm-nvew2i | MERGE-READY — companion fix mirrors delete_synced_session semantics; pin adequate; no new hazard from key-based retention |
+| code-5 | Copilot | (re-requested at 2a4670695 and c4527957f — retries 4 and 5) | COMMENTED — quota limit; proceeding 3-of-4 per protocol |
+| code-5 | Claude SMR | (in-conversation) | MERGE-READY at 24ca330c1 |
+
+Converged: MERGE-READY 3-of-4 at code round 5 (Codex + AGY + Claude SMR; Copilot quota-blocked through 5 documented retries).
+
+## Live validation round 2 (head 24ca330c1, 2026-06-12)
+
+Deployed 24ca330c1 to both loss userspace nodes (rolling deploy, both
+report g24ca330c1). wg-interop configure (wg0 endpoint id 16091 — the
+hash-freeze pin value; control thread spawned once). Under
+with-cluster.sh lock: REMOVED gr-0/0/0 (+sfmix zone+VR, 8 statements)
+then RE-ADDED via rollback 1, with a continuous inner ping from the
+kernel-WG peer across both commits:
+
+- wg0 telemetry FROZEN across both commits: initiations 2,
+  completions 2/1, session_confirmed 1 — no rebuild, no re-handshake.
+- Journal: zero wg-control stop/spawn lines at either commit (only the
+  original configure spawn for endpoint 16091).
+- Inner ping: 263/263, 0% loss through remove+re-add.
+- gr-0-0-0 netdev restored after rollback; cluster RG0/1/2 primary on
+  node0, failover count 0; fw1 journal error-free.
+- Teardown PASS (--keep peer kept for parent smoke); CoS re-applied
+  (apply-cos-config atomic commit + verification OK).
