@@ -126,6 +126,32 @@ pub(crate) struct WgCounters {
     /// responder-only peer has no learned endpoint to send to.
     pub(crate) tun_rx_drops_no_endpoint: AtomicU64,
 
+    // --- #1888 S5 timers ---
+    /// Encap refused: current session past REJECT_AFTER_TIME (the
+    /// per-use T3 gate; arms the rekey edge).
+    pub(crate) encap_drops_expired: AtomicU64,
+    /// Decap refused: demuxed session past REJECT_AFTER_TIME
+    /// (drop-only; never arms the rekey edge — Codex r1 M4).
+    pub(crate) decap_drops_expired: AtomicU64,
+    /// Sessions torn down by the control thread's `expire_sessions`
+    /// pass (current + previous slots).
+    pub(crate) sessions_expired: AtomicU64,
+    /// Timer-driven handshake initiations by reason: `age` = the rekey
+    /// edge (T1 send-age / T2 receive-horizon / send-side T3),
+    /// `dead_peer` = T7 no-reply reinit, `keepalive_no_session` = T8
+    /// persistent-keepalive due with no usable session.
+    pub(crate) rekeys_initiated_age: AtomicU64,
+    pub(crate) rekeys_initiated_dead_peer: AtomicU64,
+    pub(crate) rekeys_initiated_keepalive_no_session: AtomicU64,
+    /// Keepalives SENT: T6 passive (incl. the post-msg2
+    /// key-confirmation keepalive) vs T8 persistent. RX side is the
+    /// pre-existing `decap_keepalives`.
+    pub(crate) keepalives_tx_passive: AtomicU64,
+    pub(crate) keepalives_tx_persistent: AtomicU64,
+    /// Pending-handshake reservations released by the T5
+    /// attempt-window give-up (`abort_pending_for_peer`).
+    pub(crate) pending_aborted_attempt_window: AtomicU64,
+
     // --- state (not a counter) ---
     /// Monotonic (CLOCK_MONOTONIC ns) stamp of the most recent
     /// handshake completion, either role. 0 = never. Converted to
@@ -158,6 +184,7 @@ impl WgCounters {
             DecapError::AllowedIpsViolation => &self.decap_drops_allowed_ips,
             DecapError::MalformedInner => &self.decap_drops_malformed_inner,
             DecapError::BufferTooSmall => &self.decap_drops_buffer,
+            DecapError::Expired => &self.decap_drops_expired,
         };
         Self::bump(c);
         e
@@ -254,6 +281,7 @@ mod counters_tests {
             DecapError::AllowedIpsViolation,
             DecapError::MalformedInner,
             DecapError::BufferTooSmall,
+            DecapError::Expired,
         ] {
             let back = c.count_decap_err(e.clone());
             assert_eq!(back, e, "mapper must hand the error back unchanged");
@@ -266,6 +294,7 @@ mod counters_tests {
         assert_eq!(c.decap_drops_allowed_ips.load(Ordering::Relaxed), 1);
         assert_eq!(c.decap_drops_malformed_inner.load(Ordering::Relaxed), 1);
         assert_eq!(c.decap_drops_buffer.load(Ordering::Relaxed), 1);
+        assert_eq!(c.decap_drops_expired.load(Ordering::Relaxed), 1);
         // The keepalive class never routes through the mapper.
         assert_eq!(c.decap_keepalives.load(Ordering::Relaxed), 0);
     }

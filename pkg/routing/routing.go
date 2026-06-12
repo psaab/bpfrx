@@ -183,8 +183,12 @@ func (m *Manager) ApplyPBRRules(rules []PBRRule) error { return m.pbr.Apply(rule
 // --- RPM probe pin domain (#1827) ---
 
 // ApplyProbePins clears the probe-pin band and programs one fwmark rule
-// plus one pinned host route per RPM next-hop pin.
-func (m *Manager) ApplyProbePins(pins []ProbePin) error { return m.probePin.Apply(pins) }
+// plus one pinned host route per RPM next-hop pin. It returns the
+// per-test install failures keyed by ProbePin.TestKey (empty/nil = all
+// installed); callers must thread the result into pkg/rpm so tests
+// with unbacked pins hold state instead of probing the default path
+// (#1895).
+func (m *Manager) ApplyProbePins(pins []ProbePin) map[string]error { return m.probePin.Apply(pins) }
 
 // ClearProbePins removes all probe pin rules and flushes the reserved
 // probe tables. Run at daemon startup so a crashed daemon never leaks

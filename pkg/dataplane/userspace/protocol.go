@@ -801,6 +801,17 @@ type WgTunnelStatus struct {
 	TransportSendErrors     uint64 `json:"transport_send_errors,omitempty"`
 	TunWriteErrors          uint64 `json:"tun_write_errors,omitempty"`
 	TunRxDropsNoEndpoint    uint64 `json:"tun_rx_drops_no_endpoint,omitempty"`
+
+	// #1888 S5 timer telemetry (wire-additive; zero on pre-S5 helpers).
+	EncapDropsExpired                 uint64 `json:"encap_drops_expired,omitempty"`
+	DecapDropsExpired                 uint64 `json:"decap_drops_expired,omitempty"`
+	SessionsExpired                   uint64 `json:"sessions_expired,omitempty"`
+	RekeysInitiatedAge                uint64 `json:"rekeys_initiated_age,omitempty"`
+	RekeysInitiatedDeadPeer           uint64 `json:"rekeys_initiated_dead_peer,omitempty"`
+	RekeysInitiatedKeepaliveNoSession uint64 `json:"rekeys_initiated_keepalive_no_session,omitempty"`
+	KeepalivesTxPassive               uint64 `json:"keepalives_tx_passive,omitempty"`
+	KeepalivesTxPersistent            uint64 `json:"keepalives_tx_persistent,omitempty"`
+	PendingAbortedAttemptWindow       uint64 `json:"pending_aborted_attempt_window,omitempty"`
 }
 
 // MarshalJSON intentionally uses a value receiver so both ProcessStatus values

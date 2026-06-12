@@ -82,14 +82,14 @@ sane NTP clock a restart usually recovers WITHOUT the flush
 (post-restart timestamps are naturally higher). The flush guards the
 backwards-clock-step / same-whitened-tick edge.
 
-**Do NOT flush the peer while xpf holds a live confirmed session.**
-The engine has no rekey/retry timers until S5 (`wg/peer.rs` TODO): a
-confirmed engine never re-initiates, so wiping the peer's state under
-a live session manufactures a confirmed-but-dead blackhole that only
-an identity-changing commit or an xpfd restart clears. This is also
-why the harness flushes the peer BEFORE (never after) each
-identity-changing xpf commit, and why P6 runs the runbook flush only
-when the no-flush recovery fails.
+**Peer-flush ordering note (historical severity downgraded by #1888).**
+Before the S5 timers shipped, a confirmed engine never re-initiated, so
+wiping the peer's state under a live session manufactured a
+confirmed-but-dead blackhole. Since #1888 the 15s no-reply reinit (T7)
+and the 180s expiry + rekey machinery repair that state automatically
+within seconds; the harness's flush-BEFORE-commit ordering and the P6
+no-flush-first branch are retained as obsolete-but-harmless (they also
+keep the runbook valid against pre-#1888 builds).
 
 ## Mandatory: node0 scoping of the WG stanza
 
@@ -188,8 +188,11 @@ that fw1 has neither a `wg0` netdev nor a `:51820` bind, and fails hard
    wireguard exemption); confirm the deployed build includes it.
 3. Handshake but no transport: AllowedIPs mismatch (xpf decap gates
    inner SOURCE against the peer's allowed-ips in the xpf config).
-4. P4a permanent blackout after ~180 s: file the S5 timer blocker with
-   the capture (plan §7.2).
+4. P4a blackout after ~180 s: should self-heal within ~15 s since the
+   #1888 S5 timers (T7 no-reply reinit / expiry-driven rekey) — a
+   PERMANENT blackout is now a regression; capture
+   xpf_userspace_wg_rekeys_initiated_total + sessions_expired and file
+   it.
 5. Cluster unhealthy / VIP not on fw0: the WG outer VIP follows the
    reth's OWN redundancy group (NOT RG0), and config commits need RG0
    primaryship — fail back EVERY RG:

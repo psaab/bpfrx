@@ -16,8 +16,13 @@ leaves may be typed (`Node.ValueType` / `ValueDesc` / `ValueExamples` /
 ## Config-mode grammar → `pkg/config` `setSchema`
 
 The `set` / `delete` / `show` / `edit` configuration grammar is owned by
-`config.setSchema` (a tree of `schemaNode` in `pkg/config/schema.go`), NOT by
-cmdtree. `setSchema` drives **four** things off one tree:
+`config.setSchema` (a tree of `schemaNode` rooted in `pkg/config/schema.go`),
+NOT by cmdtree. Since the #1891 domain split, `schema.go` holds the
+`schemaNode` type and the root composition; the per-domain subtrees live in
+sibling aspect files in the same package (`schema_security.go`,
+`schema_interfaces.go`, `schema_routing.go`, `schema_system.go`,
+`schema_chassis.go`, `schema_cos.go` — see the file map in `schema.go`).
+`setSchema` drives **four** things off one tree:
 
 1. **Structural completion** — what keywords are valid at each position.
 2. **Flat-set token grouping** — how `set a b c d` packs into AST
@@ -50,7 +55,8 @@ only supplies the config-mode TOP-LEVEL keywords (`set`/`delete`/`commit`/
 
 ## How to add a config-mode typed leaf
 
-Edit the leaf's `schemaNode` in `setSchema` (`pkg/config/schema.go`). Set:
+Edit the leaf's `schemaNode` in `setSchema` (in the domain's
+`pkg/config/schema_<domain>.go` aspect file). Set:
 
 ```go
 "transmit-rate": {
@@ -145,6 +151,46 @@ Rules:
   This contract was converged across 7 hostile Codex review rounds; do not
   re-add packed-tail validation without re-checking compiler reachability.
 
+## Help-text discipline (#1892)
+
+Every `schemaNode` in `setSchema` MUST carry a `desc:` — an empty desc
+renders as a blank line in `?` completion across all three frontends.
+The #1892 audit filled all 493 previously-empty nodes; do not add new
+nodes without one. Rules:
+
+- **Verified behavior only.** A wrong help text is worse than a missing
+  one. Write the desc from the compiler/runtime consumer, not from what
+  the keyword sounds like. Containers get structural descs ("Source NAT
+  configuration"); behavior-bearing leaves state what the consumer does,
+  with enum values / units / defaults in parens ONLY when read from
+  code (model: `claim-host-tunables` — "Allow xpfd to write host-scope
+  tunables (true|false, default false)").
+- **desc / placeholder are display-only.** They never affect SetPath
+  grouping, so help fixes are always grouping-safe. Structure fields
+  (`args`, `children`, `wildcard`, `multi`) are NOT — see the typed-leaf
+  rules above.
+- **`groups <*>` mirrors the top level by pointer** (`init()` in
+  `schema.go`), so a top-level desc automatically documents the same
+  path under `groups <name> ...`. Never duplicate nodes to add help.
+
+## Retired knobs (#1525 / #1892)
+
+Retired DPDK-era `system dataplane` knobs — `cores`, `memory`,
+`socket-mem`, `rx-mode {idle-threshold, resume-threshold,
+sleep-timeout}`, `ports <name> {interface, rx-mode, cores}` — remain
+parseable for stored-config compatibility (a stanza that committed once
+must never stop loading), but have NO consumer:
+`compileUserspaceDataplane` records them in
+`UserspaceConfig.RetiredKnobsSeen` and `userspaceRetiredKnobWarnings`
+emits a per-knob commit warning ("retired DPDK-era knob (#1525),
+accepted for config compatibility but ignored") on both the strict and
+lenient compile paths. Their schema descs say "(retired, ignored)" so
+completion stops advertising them as live. Follow this pattern —
+keep-parsing + warn + honest desc — when retiring any future knob;
+hard-reject (the `dataplane-type dpdk` / `ebpf` sentinel errors) is
+reserved for whole-dataplane selection where a rewrite shim
+(`rewriteRetiredDataplaneType`) protects stored configs.
+
 ## Rollout (#1319)
 
 - **PR 1 (merged, #1682):** moved `ValueType` to `pkg/config`; added the
@@ -161,7 +207,7 @@ Rules:
   takeover-hold-time, peer-fencing, RG node priority,
   gratuitous-arp-count, ip-monitoring global-weight / global-threshold /
   target weight) with runtime-derived, source-cited ranges. Deliberately
-  NOT typed, with reasons in the `schema.go` comments: the
+  NOT typed, with reasons in the `schema_chassis.go` comments: the
   `redundancy-group <id>` / RG-scoped `node <id>` instance-name slots
   (the walker's compiler-faithful contract consumes identity tokens
   without validation — typing them needs a new walker feature),
@@ -189,7 +235,8 @@ Rules:
   netdev-budget/coalescence knobs, the rpm probe knobs, ip-monitoring
   hold-down / preferred-metric) plus the `validateMultiValueLeaf`
   block-list walker extension the deployed `name-server { 1.1.1.1; }`
-  shape requires. Deliberately untyped, with reasons in `schema.go`:
+  shape requires. Deliberately untyped, with reasons in
+  `schema_system.go` / `schema_interfaces.go`:
   `unit <n>` / `vrrp-group <id>` instance ids (cross-referenced from other
   subsystems — one dedicated pass later), `track-interface priority-cost`
   (#1814 pre-walk owns it), `cpu-governor` (pass-through by design), dhcp
