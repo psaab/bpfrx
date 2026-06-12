@@ -2125,3 +2125,102 @@ fn wg_endpoint_with_zero_listen_port_is_dropped() {
     assert!(!state.has_wg_tunnels);
     assert!(!state.wg_engines.contains_key(&7));
 }
+
+// ---------------------------------------------------------------------
+// #1873 — stable-id contract: removing one tunnel preserves the OTHER
+// tunnels' engines + remap purge-set computation.
+// ---------------------------------------------------------------------
+
+fn two_tunnel_snapshot() -> ConfigSnapshot {
+    ConfigSnapshot {
+        tunnel_endpoints: vec![
+            crate::protocol::snapshot::TunnelEndpointSnapshot {
+                id: 824,
+                interface: "gr-0/0/0.0".into(),
+                linux_name: "gr-0-0-0".into(),
+                ifindex: 41,
+                mode: "gre".into(),
+                source: "172.16.80.8".into(),
+                destination: "203.0.113.9".into(),
+                transport_table: "inet.0".into(),
+                ttl: 64,
+                ..Default::default()
+            },
+            crate::protocol::snapshot::TunnelEndpointSnapshot {
+                id: 7,
+                interface: "wg0".into(),
+                linux_name: "wg0".into(),
+                ifindex: 42,
+                mode: "wireguard".into(),
+                wg_listen_port: 51820,
+                wg_local_privkey_hex: WG_TEST_PRIVKEY_HEX.into(),
+                wg_peer_pubkey_hex: WG_TEST_PEERKEY_HEX.into(),
+                wg_allowed_ips: vec!["10.0.0.0/24".into()],
+                wg_endpoint: "203.0.113.1:51820".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    }
+}
+
+/// #1873 contract pin: with stable (Go-side content-derived) ids, a
+/// snapshot that removes one tunnel keeps the OTHER tunnel's id, so
+/// `populate_wg_engines` reuses the survivor's engine Arc verbatim —
+/// no rebuild, no session reset, no TAI64N reseed. Under the retired
+/// positional allocator the survivor's id shifted and this test's
+/// Arc::ptr_eq assertion is exactly what broke.
+#[test]
+fn wg_engine_survives_unrelated_tunnel_removal() {
+    let snap = two_tunnel_snapshot();
+    let prev = build_forwarding_state(&snap);
+    let prev_engine = prev.wg_engines.get(&7).unwrap().clone();
+
+    // Remove the GRE tunnel; the WG row is byte-identical (same id —
+    // the Go allocator guarantees this since #1873).
+    let mut snap2 = two_tunnel_snapshot();
+    snap2.tunnel_endpoints.retain(|ep| ep.id == 7);
+    let next = build_forwarding_state_with_policy_counters_and_previous(
+        &snap2,
+        &PolicyCounterStore::default(),
+        Some(&prev),
+    )
+    .unwrap();
+    let next_engine = next.wg_engines.get(&7).unwrap();
+    assert!(
+        std::sync::Arc::ptr_eq(&prev_engine, next_engine),
+        "removing an unrelated tunnel must not rebuild the WG engine (#1873)"
+    );
+}
+
+/// #1873 R-D purge-set pins: (a) vanished id purged, (b) owner-name
+/// change purged, (c) cosmetic linux_name change NOT purged,
+/// (d) untouched ids NOT purged.
+#[test]
+fn tunnel_remap_purge_ids_owner_change_semantics() {
+    use crate::afxdp::coordinator::tunnel_remap_purge_ids;
+    let prev = build_forwarding_state(&two_tunnel_snapshot());
+
+    // (a) vanished: remove the GRE row.
+    let mut snap_removed = two_tunnel_snapshot();
+    snap_removed.tunnel_endpoints.retain(|ep| ep.id == 7);
+    let next = build_forwarding_state(&snap_removed);
+    assert_eq!(tunnel_remap_purge_ids(&prev, &next), vec![824]);
+
+    // (b) owner change: id 824 now belongs to a DIFFERENT logical name
+    // (temporal hash reuse).
+    let mut snap_reused = two_tunnel_snapshot();
+    snap_reused.tunnel_endpoints[0].interface = "gr-9/9/9.0".into();
+    let next = build_forwarding_state(&snap_reused);
+    assert_eq!(tunnel_remap_purge_ids(&prev, &next), vec![824]);
+
+    // (c) cosmetic linux_name rename, logical name unchanged: NO purge.
+    let mut snap_renamed = two_tunnel_snapshot();
+    snap_renamed.tunnel_endpoints[0].linux_name = "gre-renamed".into();
+    let next = build_forwarding_state(&snap_renamed);
+    assert!(tunnel_remap_purge_ids(&prev, &next).is_empty());
+
+    // (d) identical set: NO purge.
+    let next = build_forwarding_state(&two_tunnel_snapshot());
+    assert!(tunnel_remap_purge_ids(&prev, &next).is_empty());
+}

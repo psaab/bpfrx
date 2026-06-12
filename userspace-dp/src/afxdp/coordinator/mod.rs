@@ -43,6 +43,25 @@ fn wg_endpoint_set_summary(state: &ForwardingState) -> String {
     parts.join(",")
 }
 
+/// #1873 R-D: ids whose owner changed across a snapshot apply — absent
+/// in `next`, or present with a DIFFERENT logical interface name.
+/// Compared on the LOGICAL config name (never linux_name — a cosmetic
+/// kernel rename must not purge sessions).
+pub(in crate::afxdp) fn tunnel_remap_purge_ids(
+    previous: &ForwardingState,
+    next: &ForwardingState,
+) -> Vec<u16> {
+    let mut purge_ids: Vec<u16> = Vec::new();
+    for (id, prev_ep) in previous.tunnel_endpoints.iter() {
+        match next.tunnel_endpoints.get(id) {
+            None => purge_ids.push(*id),
+            Some(next_ep) if next_ep.interface != prev_ep.interface => purge_ids.push(*id),
+            Some(_) => {}
+        }
+    }
+    purge_ids
+}
+
 /// #1866 D3: log a WG endpoint-set transition between two forwarding
 /// states. Silent when the set is unchanged (the common case) — fires
 /// only on real add/remove/port/attachment changes, so the cadence is
@@ -1011,6 +1030,8 @@ impl Coordinator {
         // with the Go publish-boundary log to pin which layer dropped
         // or retained an endpoint in one journal capture.
         log_wg_endpoint_set_transition("snapshot-refresh", &self.forwarding, &new_forwarding);
+        // #1873 R-D: compute the remap purge set BEFORE the swap.
+        let tunnel_purge_ids = tunnel_remap_purge_ids(&self.forwarding, &new_forwarding);
         self.forwarding = new_forwarding;
         if self.forwarding.fabrics.is_empty() && !preserved_fabrics.is_empty() {
             self.forwarding.fabrics = preserved_fabrics;
@@ -1030,6 +1051,12 @@ impl Coordinator {
         }
         self.shared_validation.store(Arc::new(self.validation));
         self.ha.forwarding.store(Arc::new(self.forwarding.clone()));
+        // #1873 R-D: purge sessions whose stored tunnel id was remapped
+        // by this apply (absent, or owner name changed). Runs on the
+        // refresh path too — tunnel ifaces are excluded from the
+        // binding-plan key, so tunnel config commits land HERE, not in
+        // the full reconcile.
+        self.purge_remapped_tunnel_sessions(&tunnel_purge_ids);
         // #1432 S2a (Copilot C1): reconcile WG control threads on every
         // runtime-snapshot refresh, not just initial bring-up, so a
         // same-plan apply that adds/removes/changes a WG endpoint starts,

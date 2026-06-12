@@ -172,6 +172,11 @@ pub(in crate::afxdp) struct TunnelEndpoint {
     /// wg-endpoint-<id>. Same convention as
     /// `wg_tombstone_respawn_coherent`'s row_label.
     pub(in crate::afxdp) interface_label: String,
+    /// #1873 R-D: the LOGICAL config interface name (snapshot row's
+    /// `interface`, e.g. "wg0.0") — the purge-owner identity. NEVER
+    /// linux_name (a cosmetic kernel rename must not purge sessions)
+    /// and NEVER interface_label (which prefers linux_name).
+    pub(in crate::afxdp) interface: String,
     pub(in crate::afxdp) redundancy_group: i32,
     pub(in crate::afxdp) mode: String,
     pub(in crate::afxdp) outer_family: i32,

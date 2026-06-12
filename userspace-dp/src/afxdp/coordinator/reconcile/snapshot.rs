@@ -57,12 +57,17 @@ pub(super) fn apply_snapshot(
         &coord.forwarding,
         &new_forwarding,
     );
+    // #1873 R-D: compute the remap purge set BEFORE the swap, purge
+    // right after the shared stores (mirrors refresh_runtime_snapshot).
+    let tunnel_purge_ids =
+        super::super::tunnel_remap_purge_ids(&coord.forwarding, &new_forwarding);
     coord.forwarding = new_forwarding;
     coord.shared_validation.store(Arc::new(coord.validation));
     coord
         .ha
         .forwarding
         .store(Arc::new(coord.forwarding.clone()));
+    coord.purge_remapped_tunnel_sessions(&tunnel_purge_ids);
     coord.slow_path = if let Some(slow_path) = preserved_slow_path {
         coord.last_slow_path_status = slow_path.status();
         Some(slow_path)
