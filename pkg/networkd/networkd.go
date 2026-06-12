@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/psaab/xpf/pkg/fsatomic"
 )
 
 // networkctlTimeout bounds every networkctl shell-out. Apply runs on
@@ -219,6 +221,9 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 func restoreSlowPathRPFilter() {
 	const tunName = "xpf-usp0"
 	path := fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/rp_filter", tunName)
+	// BestEffortKernelKnob (#1894): procfs has no rename, so the
+	// fsatomic writers are impossible here by construction — the direct
+	// write is correct, not an oversight.
 	if err := os.WriteFile(path, []byte("0"), 0644); err != nil {
 		if os.IsNotExist(err) {
 			// TUN may not exist (userspace DP not active) — not an error.
@@ -527,7 +532,11 @@ func writeIfChanged(path, content string) bool {
 		return false
 	}
 
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+	// AtomicGeneratedConfig (#1894): .link/.network snippets are
+	// regenerated on boot/apply — keep them un-torn for networkd, but
+	// never pay an fsync on this hot apply path (many small files per
+	// reconcile).
+	if err := fsatomic.WriteFileAtomic(path, []byte(content), 0644); err != nil {
 		slog.Warn("failed to write networkd file", "path", path, "err", err)
 		return false
 	}

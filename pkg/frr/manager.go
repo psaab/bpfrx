@@ -22,14 +22,13 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/fsatomic"
 )
 
 const (
@@ -545,135 +544,27 @@ func (m *Manager) writeManagedSection(section string) error {
 	return nil
 }
 
-// atomicWriteFile writes data to a temporary file in the same directory as
-// path and renames it into place. The rename is atomic within a filesystem,
-// so a reader (or a crash) never observes a partially written file. The temp
-// file is removed on any error before the rename completes.
+// atomicWriteFile durably replaces path via pkg/fsatomic (#1894,
+// DurableState class: frr.conf carries operator content outside the
+// managed section, so losing it to a power cut is data loss — and a
+// half-written file is what creates the orphaned-begin-marker state
+// handled in writeManagedSection).
 //
-// Behavioral parity with the previous direct os.WriteFile path:
-//   - Mode/ownership: rename replaces the inode, so the mode (and ownership)
-//     of an existing target would otherwise be lost. os.WriteFile only applied
-//     perm on creation and preserved the mode of an existing file, so frr.conf
-//     deployed as e.g. 0640 must stay 0640. We stat the target and reuse its
-//     mode/ownership when it exists, falling back to perm for a new file.
-//   - Symlinks: os.WriteFile follows a symlink and writes through to its
-//     target. A naive rename onto the link path would instead destroy the
-//     link and leave a regular file. We resolve the symlink and create the
-//     temp file in the resolved target's directory, then rename onto the
-//     resolved path — preserving the operator's symlink.
+// The two options reproduce this function's pre-#1894 semantics
+// verbatim (they were lifted from here, see pkg/fsatomic):
+//   - WithPreserveExisting: an existing target's mode/ownership is
+//     reapplied on the temp fd (fchmod/fchown before rename, no
+//     path race; chown only when the owner differs, failure surfaced),
+//     falling back to perm for a new file.
+//   - WithResolveSymlinks: a symlinked frr.conf is resolved and
+//     replaced at its target, preserving the operator's symlink.
 //
-// chmod/chown are applied to the temp file's open fd before close (and before
-// rename), so the file is never world-visible at the final path with a
-// transient mode, and there is no path-based TOCTOU on the temp name.
-// ownerIDs holds a file's numeric owner uid/gid.
-type ownerIDs struct {
-	uid int
-	gid int
-}
-
-// currentOwner returns the uid/gid of an open file. ok is false when the
-// platform stat cannot be obtained, in which case callers should fall back to
-// attempting a chown rather than assuming a match.
-func currentOwner(f *os.File) (ownerIDs, bool) {
-	fi, err := f.Stat()
-	if err != nil {
-		return ownerIDs{}, false
-	}
-	st, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok {
-		return ownerIDs{}, false
-	}
-	return ownerIDs{uid: int(st.Uid), gid: int(st.Gid)}, true
-}
-
+// On top of the previous behavior the durable writer adds the
+// parent-directory fsync that was missing here, making the rename
+// itself crash-safe.
 func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
-	// Resolve a symlink target so the rename replaces the real file, not the
-	// link. EvalSymlinks succeeds only when the whole chain exists. When the
-	// final component is a *dangling* symlink (target does not exist yet),
-	// EvalSymlinks fails, but os.WriteFile would still follow the link and
-	// create the target — so fall back to Readlink to recover that target
-	// path (resolved relative to the link's directory). Only when path is not
-	// a symlink at all do we use it as given (the genuine new-file case).
-	target := path
-	if resolved, err := filepath.EvalSymlinks(path); err == nil {
-		target = resolved
-	} else if linkDest, lerr := os.Readlink(path); lerr == nil {
-		if filepath.IsAbs(linkDest) {
-			target = linkDest
-		} else {
-			target = filepath.Join(filepath.Dir(path), linkDest)
-		}
-	}
-
-	// Preserve the mode/ownership of an existing target across the rename.
-	mode := perm
-	var (
-		preserveOwner bool
-		uid, gid      int
-	)
-	if fi, statErr := os.Stat(target); statErr == nil {
-		mode = fi.Mode().Perm()
-		if st, ok := fi.Sys().(*syscall.Stat_t); ok {
-			preserveOwner = true
-			uid = int(st.Uid)
-			gid = int(st.Gid)
-		}
-	}
-
-	dir := filepath.Dir(target)
-	tmp, err := os.CreateTemp(dir, ".frr.conf.tmp-*")
-	if err != nil {
-		return fmt.Errorf("create temp file: %w", err)
-	}
-	tmpName := tmp.Name()
-	// Best-effort cleanup if we return before a successful rename.
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.Remove(tmpName)
-		}
-	}()
-
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("write temp file: %w", err)
-	}
-	// Apply mode/ownership on the open fd (fchmod/fchown) before rename, so the
-	// final path never appears with a transient mode and there is no path-race
-	// on the temp name.
-	if err := tmp.Chmod(mode); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("chmod temp file: %w", err)
-	}
-	// Preserve ownership only when it actually differs from the temp file's
-	// current owner. CreateTemp makes the file owned by the running process,
-	// so when xpfd already runs as the frr.conf owner (the common case) no
-	// chown is needed and we never call it. When the target's owner differs
-	// and we cannot change it, do NOT silently rename a differently-owned file
-	// over a 0640 frr.conf — that could break ownership and leave FRR unable
-	// to read its config; surface the error instead.
-	if preserveOwner {
-		if cur, ok := currentOwner(tmp); !ok || cur.uid != uid || cur.gid != gid {
-			if err := tmp.Chown(uid, gid); err != nil {
-				_ = tmp.Close()
-				return fmt.Errorf("chown temp file to %d:%d: %w", uid, gid, err)
-			}
-		}
-	}
-	// fsync the data before rename so the rename does not point at a file
-	// whose contents are still only in the page cache after a power loss.
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("sync temp file: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close temp file: %w", err)
-	}
-	if err := os.Rename(tmpName, target); err != nil {
-		return fmt.Errorf("rename temp file: %w", err)
-	}
-	cleanup = false
-	return nil
+	return fsatomic.WriteFileDurable(path, data, perm,
+		fsatomic.WithPreserveExisting(), fsatomic.WithResolveSymlinks())
 }
 
 // reloadLocked reloads FRR. Caller must hold reloadMu.

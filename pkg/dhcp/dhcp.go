@@ -20,6 +20,7 @@ import (
 	"github.com/insomniacslk/dhcp/dhcpv6"
 	"github.com/insomniacslk/dhcp/dhcpv6/nclient6"
 	"github.com/insomniacslk/dhcp/iana"
+	"github.com/psaab/xpf/pkg/fsatomic"
 	"github.com/vishvananda/netlink"
 )
 
@@ -558,7 +559,10 @@ func (m *Manager) saveDUID(ifaceName string, duid dhcpv6.DUID) error {
 	if err := os.MkdirAll(m.stateDir, 0755); err != nil {
 		return err
 	}
-	return os.WriteFile(m.duidPath(ifaceName), duid.ToBytes(), 0644)
+	// DurableState (#1894): the DUID is the client's stable DHCPv6
+	// identity — losing it to a power cut changes the identity the
+	// server knows us by across reboot (new leases, stale bindings).
+	return fsatomic.WriteFileDurable(m.duidPath(ifaceName), duid.ToBytes(), 0644)
 }
 
 // Leases returns a snapshot of all current DHCP leases.
