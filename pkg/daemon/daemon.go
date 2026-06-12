@@ -90,10 +90,23 @@ type Daemon struct {
 	rpmMu         sync.Mutex // serializes reconcileRPM callers (#1827)
 	activeRPMHash [32]byte   // config-hash gate for RPM re-apply (#1827)
 	// rpmPinsFailed records that the last probe-pin install left at
-	// least one pin unprogrammed (#1895): hash-gated reconcileRPM
-	// calls then retry the pin install (without restarting probes)
-	// until it succeeds. Guarded by rpmMu.
+	// least one pin unprogrammed (#1895): the install is retried
+	// (without restarting probes) on hash-gated reconcileRPM calls AND
+	// by the slow periodic probePinRetryLoop until it succeeds.
+	// Guarded by rpmMu.
 	rpmPinsFailed bool
+	// rpmPinRetryActive is true while a probePinRetryLoop goroutine is
+	// running (#1895 AGY fold — autonomous recovery of boot-time pin
+	// failures on a quiet box, no commit required). Guarded by rpmMu.
+	rpmPinRetryActive bool
+	// rpmEffective/rpmRethMap are the last-applied effective RPM
+	// config + RETH map, kept for the periodic pin retry (which has no
+	// fresh cfg in hand). Guarded by rpmMu.
+	rpmEffective *config.RPMConfig
+	rpmRethMap   map[string]string
+	// probePinRetryEvery overrides the periodic pin-retry cadence
+	// (tests); 0 = probePinRetryInterval.
+	probePinRetryEvery time.Duration
 	// probePinApply is the test seam for probe-pin programming; nil =
 	// d.routing.ApplyProbePins (#1895).
 	probePinApply func([]routing.ProbePin) map[string]error

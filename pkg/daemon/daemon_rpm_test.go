@@ -3,7 +3,9 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/routing"
@@ -96,9 +98,11 @@ func rpmPinnedTestConfig() *config.Config {
 // reconciles retry ONLY the pin install (no probe restart), and the
 // retry stops once the install recovers.
 func TestReconcileRPMPinFailureRetry(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	var calls int
 	retFailed := map[string]error{"WAN/t": fmt.Errorf("egress interface missing")}
-	d := &Daemon{rpm: rpm.New(), daemonCtx: context.Background()}
+	d := &Daemon{rpm: rpm.New(), daemonCtx: ctx}
 	d.probePinApply = func(pins []routing.ProbePin) map[string]error {
 		calls++
 		if len(pins) != 1 || pins[0].TestKey != "WAN/t" {
@@ -238,5 +242,68 @@ func TestReconcileRPMFullApplyHoldsUnionOfOldAndNewPins(t *testing.T) {
 	// All installs succeeded: published results clear every hold.
 	if got := d.rpm.PinInstallFailureCount(); got != 0 {
 		t.Fatalf("holds not released after publish: count = %d", got)
+	}
+}
+
+// TestProbePinPeriodicRetryRecoversWithoutCommit is the #1895 AGY-fold
+// contract: a pin that fails at apply time (boot ordering — egress
+// link not yet up) recovers via the slow periodic retry loop with NO
+// commit and NO RG transition, and the loop stops once every pin is
+// installed.
+func TestProbePinPeriodicRetryRecoversWithoutCommit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var mu sync.Mutex
+	linkUp := false
+	calls := 0
+	d := &Daemon{rpm: rpm.New(), daemonCtx: ctx, probePinRetryEvery: 5 * time.Millisecond}
+	d.probePinApply = func(pins []routing.ProbePin) map[string]error {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		if !linkUp {
+			return map[string]error{pins[0].TestKey: fmt.Errorf("egress interface missing")}
+		}
+		return nil
+	}
+	defer d.rpm.StopAll()
+
+	if !d.reconcileRPM(rpmPinnedTestConfig()) {
+		t.Fatal("first reconcile must apply")
+	}
+	if got := d.rpm.PinInstallFailureCount(); got != 1 {
+		t.Fatalf("pin must be held after failed apply: count = %d", got)
+	}
+
+	// The "link appears" with no further reconcileRPM calls: the
+	// periodic loop must recover the pin on its own.
+	mu.Lock()
+	linkUp = true
+	mu.Unlock()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && d.rpm.PinInstallFailureCount() != 0 {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := d.rpm.PinInstallFailureCount(); got != 0 {
+		t.Fatalf("periodic retry did not recover the pin without a commit: count = %d", got)
+	}
+
+	// The loop stops once recovered: no further installer calls.
+	mu.Lock()
+	settled := calls
+	mu.Unlock()
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	final := calls
+	mu.Unlock()
+	if final != settled {
+		t.Fatalf("retry loop kept running after recovery: %d -> %d installer calls", settled, final)
+	}
+	d.rpmMu.Lock()
+	active := d.rpmPinRetryActive
+	d.rpmMu.Unlock()
+	if active {
+		t.Fatal("rpmPinRetryActive still set after recovery")
 	}
 }

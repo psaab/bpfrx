@@ -76,8 +76,9 @@ pins probes to devices/next-hops via `SO_BINDTODEVICE` / `SO_MARK`.
   `ErrProbeSetup` (hold state, no socket opened) while the pin is in
   the `SetPinInstallResults` failed map — or when a next-hop test has
   no pin slot at all (band exhaustion belt-and-braces). The daemon
-  retries failed installs on hash-gated reconciles and clears the map
-  on success.
+  retries failed installs on hash-gated reconciles AND on a slow
+  periodic loop (30 s, only while pins are failed), and clears the
+  map on success — boot-time failures recover without a commit.
 - Events expose both the test owner (probe name) and the test name so
   event-options policies can match on either via `attributes-match`.
 - A consecutive-failure counter discriminates transient blips from

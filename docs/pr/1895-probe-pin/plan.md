@@ -96,19 +96,20 @@ On a full apply the publish happens AFTER `rpm.Apply` (the union
 pre-hold covers the interim — see above); the hash-gated retry
 publishes immediately.
 
-Retry: the config-hash gate previously meant a boot-ordering failure
-(egress link not yet present) stayed failed until the next RPM config
-change. Now, while any pin is failed (`d.rpmPinsFailed`, guarded by
-`rpmMu`), a hash-gated reconcile retries `ApplyProbePins` ONLY (no
-probe restart — probe state is preserved; the deterministic mark
-assignment cannot change while the hash is unchanged) and updates the
-manager via the setter. Recovery is therefore picked up on any
-subsequent commit or RG transition (`reconcileIPMonGating`).
-Residual: there is no timer-based retry; a failed pin with zero
-subsequent reconcile triggers stays held (visible via the gauge, the
-rate-limited Warn, and stalled TotalSent/LastProbeAt in
-`show services rpm`). Held is the safe direction — the pre-#1895
-behavior was false PASS.
+Retry: while any pin is failed (`d.rpmPinsFailed`, guarded by
+`rpmMu`), the pin install is retried with no probe restart (probe
+state is preserved; the deterministic mark assignment cannot change
+while the hash is unchanged) on every hash-gated reconcile (commit,
+RG transition) AND autonomously by a slow periodic loop
+(`probePinRetryLoop`, 30 s ticker, control-plane cost only, runs ONLY
+while `PinInstallFailureCount > 0`, stops itself at zero). The
+periodic loop is the AGY PR #1899 fold: without it, a pin failing
+during boot (egress links not yet up — the #1880-class window) held
+ip-monitoring indefinitely on a quiet box, i.e. failover protection
+silently off after a reboot until someone committed. Held remains the
+per-probe semantics while failed (the safe direction — pre-#1895 was
+false PASS); recovery is logged via the existing
+"probe pin install recovered on retry" INFO.
 
 A `probePinApply func([]routing.ProbePin) map[string]error` test seam
 on Daemon (nil = `d.routing.ApplyProbePins`) lets the daemon-level
@@ -211,7 +212,6 @@ prove probing resumes after a reconcile trigger.
 
 ## Out of scope
 
-- Timer-based pin retry (documented residual; held-state is safe).
 - The audit's `pkg/routing/probepin/` plan/apply/status split.
 - Surfacing pin status in `show services rpm` columns (journal +
   gauge + stalled counters cover the operator story).

@@ -12,3 +12,4 @@
 | r4 | Codex | session 019ebacf-fdeb-77a0-a42f-008d3c7244e2 (head c90f0af8ba6f) | MERGE-NEEDS-MINOR — doc-only (plan.md stale before-Apply wording, ledger staleness); r3 trace verified closed; both fixed in the ledger/doc commit |
 | r1-3 | Copilot | retries 07:30 / 07:41 / 07:50 UTC | QUOTA-BLOCKED all three documented retries — proceeding 3-of-4 per protocol (AGY also down: OAuth expired) |
 | final | Claude SMR | in-conversation | MERGE-READY — r3 ordering traces re-verified (no-installer removal, effective nil, retry) |
+| r5 | AGY (recovered) | adversarial-review-mqaqpe9f-1rewaz | structurally sound + ONE upheld finding: no autonomous recovery of failed pins (boot-time failure → ip-monitoring held indefinitely on a quiet box) — CLOSED by the periodic probePinRetryLoop fold (30s ticker, runs only while PinInstallFailureCount>0, stops at zero) |
