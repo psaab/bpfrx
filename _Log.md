@@ -1,5 +1,27 @@
 # Action Log
 
+## 2026-06-12 — #1879 Path C: appliance images + day-0 config drive (/engineer)
+- **Timestamp**: 2026-06-12 UTC
+- **Action**: Implemented the operator-pinned Path C deliverable on
+  branch engineer/1879-pathc-images: (1) configstore.CheckText +
+  `xpfd check-config` — the real strict commit-check (parse → #1319
+  SchemaValidate on the expanded tree → strict compile) as a CLI gate,
+  refactoring compileTree/schemaValidateExpandedTree to package-level
+  helpers; (2) first-boot day-0 config-drive loader (vSRX cdrom +
+  juniper.conf analog: LABEL=xpf-config or ISO9660, xpf.conf or
+  juniper.conf at root, optional node-id, untrusted-input hardening,
+  validate-before-install, never blocks boot, stamp idempotency) +
+  make-config-drive.sh; (3) offline image bake (Debian 13 genericcloud
+  base + virt-resize/virt-customize/virt-sysprep; runtime dependency
+  matrix, kernel ≥6.18 from unstable then de-pinned, cloud-init purged,
+  networkd enabled, incus-agent loader inert outside incus; exports ONE
+  root disk as qcow2 + incus VM image metadata + SHA256SUMS) with an
+  in-guest verify-dataplane validation gate; (4) docs/install-images.md.
+  Live validation: bake on this host + scenarios A/B/C under local
+  incus (xpf-image-*) + qcow2 boot under plain QEMU/OVMF.
+- **File(s)**: pkg/configstore/{check.go,check_test.go,store.go},
+  cmd/xpfd/main.go, scripts/image/*, Makefile, docs/install-images.md
+
 ## 2026-06-11 — #1873 PR #1882 code-review rounds 2-5 (resumed agent)
 - **Timestamp**: 2026-06-11/12 UTC
 - **Action**: Resumed the wedged #1873 /engineer run at PR #1882. Round 2:
