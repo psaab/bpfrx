@@ -103,18 +103,22 @@ type Manager struct {
 
 	// retryMu guards the degraded-retry episode fields below. Lock
 	// order: reloadMu → retryMu (retryMu is a leaf).
-	retryMu       sync.Mutex
-	retryEnabled  bool
-	retryCtx      context.Context
-	retryCancel   context.CancelFunc
-	retryDone     chan struct{}
-	retryWG       sync.WaitGroup
-	pytoolsWarned bool
+	retryMu      sync.Mutex
+	retryEnabled bool
+	retryCtx     context.Context
+	retryCancel  context.CancelFunc
+	retryDone    chan struct{}
+	retryWG      sync.WaitGroup
 
 	// retryDelays/retrySlow allow tests to compress the backoff; nil/0
 	// means the production degradedRetryDelays/degradedRetrySlowDelay.
 	retryDelays []time.Duration
 	retrySlow   time.Duration
+
+	// pytoolsWarnOnce gates the frr-pythontools-missing warning to one
+	// emission per manager lifetime (sync.Once — no extra lock
+	// traffic; AGY code-r1 f3).
+	pytoolsWarnOnce sync.Once
 
 	// mgrCtx is the manager lifetime: parent of every reload exec
 	// context and every retry episode, so Stop() kills in-flight
@@ -727,14 +731,10 @@ func isFrrReloadPyMissing(err error) bool {
 // manager lifetime (the degraded retry would otherwise repeat it every
 // 5 minutes forever).
 func (m *Manager) warnPytoolsOnce(err error) {
-	m.retryMu.Lock()
-	warned := m.pytoolsWarned
-	m.pytoolsWarned = true
-	m.retryMu.Unlock()
-	if !warned {
+	m.pytoolsWarnOnce.Do(func() {
 		slog.Warn("frr-pythontools not installed — FRR reload degraded to additive vtysh -f until it is",
 			"script", frrReloadScript, "err", err)
-	}
+	})
 }
 
 // noteReloadOutcomeLocked updates the degraded state machine after a
@@ -783,6 +783,13 @@ func (m *Manager) ensureRetryLocked(slowStart bool) {
 	m.retryMu.Lock()
 	defer m.retryMu.Unlock()
 	if !m.retryEnabled {
+		return
+	}
+	// No manager lifetime context (zero-value / legacy literal
+	// Managers) means no Stop() can ever cancel or reap an episode —
+	// never spawn one (AGY code-r1 f2). Only New() managers, which own
+	// mgrCtx/mgrCancel, run the background retry.
+	if m.mgrCtx == nil {
 		return
 	}
 	// A live (non-cancelled) episode already covers us. A
