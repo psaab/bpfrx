@@ -24,6 +24,7 @@ type linkOps interface {
 	LinkSetUp(netlink.Link) error
 	LinkSetDown(netlink.Link) error
 	LinkSetMaster(netlink.Link, netlink.Link) error
+	LinkSetNoMaster(netlink.Link) error
 	LinkSetMTU(netlink.Link, int) error
 	LinkList() ([]netlink.Link, error)
 	AddrAdd(netlink.Link, *netlink.Addr) error
@@ -61,6 +62,27 @@ type keepaliveRunner struct {
 	cancel context.CancelFunc
 	state  *KeepaliveState
 	done   chan struct{}
+
+	// Config identity at start time (#1884 A.7): the reconcile keeps an
+	// unchanged runner alive across applies instead of restarting it
+	// (which would reset probe state every commit).
+	remote     string
+	interval   int
+	maxRetries int // normalized: <=0 config value stored as 3
+}
+
+// matches reports whether the runner's identity equals the config's
+// NORMALIZED keepalive parameters. KeepaliveRetry <= 0 normalizes to 3
+// BEFORE comparison (#1884 r1 Codex F5: comparing a raw config 0
+// against the stored default 3 would restart the runner every apply).
+func (r *keepaliveRunner) matches(tc *config.TunnelConfig) bool {
+	retries := tc.KeepaliveRetry
+	if retries <= 0 {
+		retries = 3
+	}
+	return r.remote == tc.Destination &&
+		r.interval == tc.Keepalive &&
+		r.maxRetries == retries
 }
 
 // TunnelStatus holds the status of a tunnel interface.
@@ -84,19 +106,104 @@ type tunnelManager struct {
 	vrfBinder vrfBinder
 
 	mu         sync.Mutex
-	tunnels    []string                    // currently created tunnel interface names
+	tunnels    []string                    // tunnels successfully applied this round (GetStatus source)
 	keepalives map[string]*keepaliveRunner // tunnel name -> runner
+
+	// Reconcile-in-place state (#1884). All lazily initialized by Apply.
+	//
+	// ownedNames: ALL non-WireGuard tunnel names from the LAST Apply's
+	// DESIRED set (plus names whose removal LinkDel failed, retained for
+	// retry). The removal diff and the adoption decision both key off
+	// this — NOT off the success-tracked t.tunnels, whose
+	// failure-continue paths can leave a live kernel link untracked.
+	ownedNames map[string]bool
+	// appliedAddrs: per tunnel, the address set this manager itself
+	// ensured (successful adds + present-and-wanted + link-local whose
+	// stale-delete failed). Gates stale LINK-LOCAL deletion: a
+	// configured fe80 we applied is removable; the kernel's autoconf
+	// fe80 is never touched.
+	appliedAddrs map[string]map[string]bool
+	// appliedRI: per tunnel, the routing-instance whose VRF this
+	// manager successfully bound — or directly OBSERVED as the link's
+	// master for a step-0a `routing-instances <ri> interface` list
+	// bind. Invariant (#1884 r6-r8): a claim is only ever written from
+	// a successful bind or a master observation, never an intent.
+	// Unbind on config-wants-none is identity-gated against
+	// vrf-<claim>.
+	appliedRI map[string]string
 }
 
-// Apply creates GRE tunnel interfaces, brings them up, and assigns
-// addresses. Previous tunnels are removed first. Starts keepalive
-// probes for tunnels that have keepalive configured.
+// ensureReconcileStateLocked lazily initializes the reconcile maps so
+// directly-constructed managers (tests, façade) need no constructor
+// changes. Caller MUST hold mu.
+func (t *tunnelManager) ensureReconcileStateLocked() {
+	if t.ownedNames == nil {
+		t.ownedNames = map[string]bool{}
+	}
+	if t.appliedAddrs == nil {
+		t.appliedAddrs = map[string]map[string]bool{}
+	}
+	if t.appliedRI == nil {
+		t.appliedRI = map[string]string{}
+	}
+	if t.keepalives == nil {
+		t.keepalives = map[string]*keepaliveRunner{}
+	}
+}
+
+// Apply reconciles the kernel tunnel devices against the desired
+// config WITHOUT the historical clear-all + delete-and-recreate
+// (#1884): an untouched tunnel keeps its netdev (stable ifindex — no
+// FRR route churn, no userspace-dp TUN-reader death per commit, see
+// #1881), tunnels removed from config are deleted via a set-diff
+// against the previous desired set, and a device is recreated only
+// when the existing kernel link is genuinely incompatible. Keepalive
+// probes (legacy non-anchor branch only) are reconciled by identity
+// instead of being restarted every apply.
 func (t *tunnelManager) Apply(tunnels []*config.TunnelConfig) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if err := t.clearLocked(); err != nil {
-		slog.Warn("failed to clear previous tunnels", "err", err)
+	t.ensureReconcileStateLocked()
+
+	desired := make(map[string]bool, len(tunnels))
+	for _, tc := range tunnels {
+		// WireGuard TUNs stay untracked/persistent (#1432 S2a, AGY
+		// Hazard B) and are excluded from the removal diff.
+		if tc.Mode != "wireguard" {
+			desired[tc.Name] = true
+		}
 	}
+
+	// oldOwned is the ENTRY-TIME ownership snapshot — the adoption
+	// authority for the per-tunnel loop below (#1884 r2 Codex F1: the
+	// rewritten set would mark every desired tunnel "owned" and make
+	// adoption unreachable). next starts as the desired set; removal
+	// failures retain their names so the next Apply retries instead of
+	// orphaning a live link (r2 Codex F5).
+	oldOwned := t.ownedNames
+	next := make(map[string]bool, len(desired))
+	for name := range desired {
+		next[name] = true
+	}
+	for name := range oldOwned {
+		if desired[name] {
+			continue
+		}
+		t.stopKeepaliveLocked(name)
+		if link, err := t.ops.LinkByName(name); err == nil {
+			if delErr := t.ops.LinkDel(link); delErr != nil {
+				slog.Warn("failed to delete removed tunnel",
+					"name", name, "err", delErr)
+				next[name] = true // retain ownership; retry next apply
+				continue
+			}
+			slog.Info("tunnel removed", "name", name)
+		}
+		delete(t.appliedAddrs, name)
+		delete(t.appliedRI, name)
+	}
+	t.ownedNames = next
+	t.tunnels = nil // success-tracked (GetStatus); rebuilt below
 
 	for _, tc := range tunnels {
 		// WireGuard TUNs are persistent (#1432 S2a, AGY Hazard B): never
@@ -110,152 +217,279 @@ func (t *tunnelManager) Apply(tunnels []*config.TunnelConfig) error {
 			}
 			continue
 		}
-		if existing, err := t.ops.LinkByName(tc.Name); err == nil {
-			if err := t.ops.LinkDel(existing); err != nil {
-				slog.Warn("failed to replace existing tunnel link",
-					"name", tc.Name, "existing_type", existing.Type(), "err", err)
-				continue
-			}
-			slog.Info("removed existing tunnel link before apply",
-				"name", tc.Name, "existing_type", existing.Type())
-		}
-
+		// Adoption = this manager did NOT own the name at the last
+		// apply (daemon restart, wireguard→gre same-name flip, foreign
+		// but compatible TUN). Decided from the entry-time snapshot for
+		// BOTH the plain-reuse and the LinkAdd-EEXIST paths.
+		adopting := !oldOwned[tc.Name]
 		if tc.AnchorOnly {
-			anchor := &netlink.Tuntap{
-				LinkAttrs:  netlink.LinkAttrs{Name: tc.Name},
-				Mode:       netlink.TUNTAP_MODE_TUN,
-				Flags:      netlink.TUNTAP_NO_PI | netlink.TUNTAP_ONE_QUEUE,
-				Queues:     1,
-				NonPersist: false,
+			t.applyAnchorLocked(tc, adopting)
+			continue
+		}
+		t.applyKernelTunnelLocked(tc)
+	}
+
+	return nil
+}
+
+// anchorReusable reports whether an existing link can serve as the
+// userspace-dp TUN anchor in place (#1884 A.3): it must be a TUN (not
+// TAP/dummy/gre), carry NO_PI (the Rust side opens IFF_TUN|IFF_NO_PI —
+// userspace-dp/src/slowpath.rs; a PI-enabled foreign TUN would break
+// attach where recreate heals it), and be persistent (a non-persistent
+// TUN held alive only by a foreign fd would evaporate when that fd
+// closes). Kernel readback reconstructs Mode/NO_PI/persist via
+// IFLA_TUN_*; the obsolete ONE_QUEUE flag is not reported and not
+// checked.
+func anchorReusable(link netlink.Link) bool {
+	tt, ok := link.(*netlink.Tuntap)
+	if !ok || tt.Mode != netlink.TUNTAP_MODE_TUN {
+		return false
+	}
+	if tt.Flags&netlink.TUNTAP_NO_PI == 0 {
+		return false
+	}
+	return !tt.NonPersist
+}
+
+// applyAnchorLocked reconciles one AnchorOnly TUN device (the
+// production userspace-dp path). Caller MUST hold mu.
+func (t *tunnelManager) applyAnchorLocked(tc *config.TunnelConfig, adopting bool) {
+	// A leftover keepalive runner (legacy→anchor mode change) must not
+	// keep probing: anchors never run keepalives (probes LinkSetDown
+	// the device on failure — a behavior the anchor path never had).
+	t.stopKeepaliveLocked(tc.Name)
+
+	var link netlink.Link
+	created := false
+	if existing, lookupErr := t.ops.LinkByName(tc.Name); lookupErr == nil {
+		if anchorReusable(existing) {
+			// Operate on the kernel-fetched link (real ifindex and
+			// attributes), never a fresh ifindex-less struct (#1706).
+			link = existing
+			slog.Debug("tunnel anchor reused", "name", tc.Name)
+		} else {
+			slog.Info("replacing non-TUN tunnel anchor",
+				"name", tc.Name, "type", existing.Type())
+			if delErr := t.ops.LinkDel(existing); delErr != nil {
+				slog.Warn("failed to replace tunnel anchor",
+					"name", tc.Name, "err", delErr)
+				return
 			}
-			if err := t.ops.LinkAdd(anchor); err != nil {
-				// Handle upgrade from dummy-anchor to TUN: if a link with
-				// this name already exists, check if it's already a TUN.
-				// If it's a different type (e.g. dummy), delete and recreate.
-				if existing, lookupErr := t.ops.LinkByName(tc.Name); lookupErr == nil {
-					if existingTun, isTun := existing.(*netlink.Tuntap); isTun {
-						slog.Info("tunnel anchor already exists as TUN, reusing",
-							"name", tc.Name)
-						// Operate on the kernel-fetched link (which carries
-						// the real ifindex and attributes) rather than the
-						// freshly-constructed, ifindex-less anchor. The
-						// subsequent LinkSetUp/AddrAdd would otherwise rely
-						// on the netlink library re-resolving the index by
-						// name (ensureIndex) while still reading stale
-						// non-index LinkAttrs off the fresh struct.
-						// existingTun.Fds is nil on a kernel-fetched Tuntap,
-						// so closeTuntapFiles below is a safe no-op.
-						anchor = existingTun
-						goto anchorReady
-					}
-					slog.Info("replacing non-TUN tunnel anchor",
-						"name", tc.Name, "type", existing.Type())
-					_ = t.ops.LinkDel(existing)
-					if retryErr := t.ops.LinkAdd(anchor); retryErr != nil {
-						slog.Warn("failed to recreate tunnel anchor",
-							"name", tc.Name, "err", retryErr)
-						continue
-					}
-				} else {
-					slog.Warn("failed to create tunnel anchor",
-						"name", tc.Name, "err", err)
-					continue
-				}
+		}
+	}
+	if link == nil {
+		anchor := &netlink.Tuntap{
+			LinkAttrs:  netlink.LinkAttrs{Name: tc.Name},
+			Mode:       netlink.TUNTAP_MODE_TUN,
+			Flags:      netlink.TUNTAP_NO_PI | netlink.TUNTAP_ONE_QUEUE,
+			Queues:     1,
+			NonPersist: false,
+		}
+		if addErr := t.ops.LinkAdd(anchor); addErr != nil {
+			// LinkAdd-EEXIST / transient-lookup race (#1706): exactly
+			// ONE re-lookup; a compatible TUN is adopted via the
+			// KERNEL-FETCHED link (its Fds is nil, so the
+			// closeTuntapFiles below is skipped with it); anything else
+			// fails this apply (no unbounded retry).
+			existing, lkErr := t.ops.LinkByName(tc.Name)
+			if lkErr != nil || !anchorReusable(existing) {
+				slog.Warn("failed to create tunnel anchor",
+					"name", tc.Name, "err", addErr)
+				return
 			}
-		anchorReady:
+			slog.Info("tunnel anchor already exists as TUN, reusing",
+				"name", tc.Name)
+			link = existing
+		} else {
 			closeTuntapFiles(anchor.Fds)
-			if err := t.ops.LinkSetUp(anchor); err != nil {
-				slog.Warn("failed to bring up tunnel anchor",
-					"name", tc.Name, "err", err)
-			}
-			for _, addrStr := range tc.Addresses {
-				addr, err := netlink.ParseAddr(addrStr)
-				if err != nil {
-					slog.Warn("invalid tunnel anchor address",
-						"name", tc.Name, "addr", addrStr, "err", err)
-					continue
-				}
-				if err := t.ops.AddrAdd(anchor, addr); err != nil {
-					slog.Warn("failed to add tunnel anchor address",
-						"name", tc.Name, "addr", addrStr, "err", err)
-				}
-			}
-			if tc.RoutingInstance != "" {
-				if err := t.vrfBinder.BindInterfaceToVRF(tc.Name, tc.RoutingInstance); err != nil {
-					slog.Warn("failed to bind tunnel anchor to VRF",
-						"name", tc.Name, "vrf", tc.RoutingInstance, "err", err)
+			link = anchor
+			created = true
+			if tc.MTU > 0 {
+				// TUNSETIFF may ignore LinkAttrs.MTU (#1432 Codex r4
+				// precedent), and the compiler MTU stage restores only
+				// ZONED interfaces — set explicitly so a configured MTU
+				// on an unzoned tunnel is live too (#1884 r2/r4).
+				if mtuErr := t.ops.LinkSetMTU(link, tc.MTU); mtuErr != nil {
+					slog.Warn("failed to set tunnel anchor mtu",
+						"name", tc.Name, "mtu", tc.MTU, "err", mtuErr)
 				}
 			}
 			slog.Info("tunnel anchor created", "name", tc.Name, "mode", "tun")
-			t.tunnels = append(t.tunnels, tc.Name)
-			continue
 		}
+	}
+	if !created {
+		t.reconcileAnchorMTULocked(tc, link, adopting)
+	}
+	t.finishTunnelLocked(tc, link, false, "tunnel anchor")
+}
 
-		localIP := net.ParseIP(tc.Source)
-		remoteIP := net.ParseIP(tc.Destination)
-		if localIP == nil || remoteIP == nil {
-			slog.Warn("invalid tunnel endpoints",
-				"name", tc.Name, "src", tc.Source, "dst", tc.Destination)
-			continue
-		}
+// reconcileAnchorMTULocked applies the #1884 MTU ownership rule to a
+// reused/adopted anchor:
+//   - tc.MTU > 0: the config value is reconciled on EVERY reuse. The
+//     compiler stage restores MTU only through the zone interface
+//     path, so an UNZONED tunnel's configured MTU has no other writer;
+//     for zoned tunnels both writers derive the same value from the
+//     same config and both guard with !=, so there is no fighting.
+//   - tc.MTU == 0 && adopting: one-time normalization to the TUN
+//     default 1500 — repairs the wireguard→gre same-name flip, where
+//     the leftover WG device carries the reduced WG MTU that the
+//     userspace snapshot would otherwise publish into tunnel
+//     endpoints.
+//   - tc.MTU == 0 && owned: never touched.
+func (t *tunnelManager) reconcileAnchorMTULocked(tc *config.TunnelConfig, link netlink.Link, adopting bool) {
+	want := 0
+	switch {
+	case tc.MTU > 0:
+		want = tc.MTU
+	case adopting:
+		want = 1500
+	default:
+		return
+	}
+	if link.Attrs().MTU == want {
+		return
+	}
+	if mtuErr := t.ops.LinkSetMTU(link, want); mtuErr != nil {
+		slog.Warn("failed to set tunnel anchor mtu",
+			"name", tc.Name, "mtu", want, "err", mtuErr)
+		return
+	}
+	slog.Info("tunnel anchor mtu set", "name", tc.Name, "mtu", want)
+}
 
-		ttl := tc.TTL
-		if ttl == 0 {
-			ttl = 64
-		}
-
-		isIPv6 := localIP.To4() == nil
-
-		var tunnelLink netlink.Link
-		switch tc.Mode {
-		case "ipip":
-			if isIPv6 {
-				// IPIP over IPv6: use ip6tnl with IPPROTO_IPIP
-				tunnelLink = &netlink.Ip6tnl{
-					LinkAttrs: netlink.LinkAttrs{Name: tc.Name},
-					Local:     localIP,
-					Remote:    remoteIP,
-					Ttl:       uint8(ttl),
-					Proto:     4, // IPPROTO_IPIP
-				}
-			} else {
-				tunnelLink = &netlink.Iptun{
-					LinkAttrs: netlink.LinkAttrs{Name: tc.Name},
-					Local:     localIP,
-					Remote:    remoteIP,
-					Ttl:       uint8(ttl),
-				}
-			}
-		default: // "gre" or ""
-			// Gretun.Type() auto-detects IPv6 → returns "ip6gre"
-			greLink := &netlink.Gretun{
+// buildKernelTunnelLink constructs the desired netlink link for the
+// legacy (non-anchor) kernel tunnel branch.
+func buildKernelTunnelLink(tc *config.TunnelConfig, localIP, remoteIP net.IP, ttl uint8, isIPv6 bool) netlink.Link {
+	switch tc.Mode {
+	case "ipip":
+		if isIPv6 {
+			// IPIP over IPv6: use ip6tnl with IPPROTO_IPIP
+			return &netlink.Ip6tnl{
 				LinkAttrs: netlink.LinkAttrs{Name: tc.Name},
 				Local:     localIP,
 				Remote:    remoteIP,
-				Ttl:       uint8(ttl),
+				Ttl:       ttl,
+				Proto:     4, // IPPROTO_IPIP
 			}
-			if tc.Key > 0 {
-				greLink.IKey = tc.Key
-				greLink.OKey = tc.Key
-			}
-			tunnelLink = greLink
 		}
+		return &netlink.Iptun{
+			LinkAttrs: netlink.LinkAttrs{Name: tc.Name},
+			Local:     localIP,
+			Remote:    remoteIP,
+			Ttl:       ttl,
+		}
+	default: // "gre" or ""
+		// Gretun.Type() auto-detects IPv6 → returns "ip6gre"
+		greLink := &netlink.Gretun{
+			LinkAttrs: netlink.LinkAttrs{Name: tc.Name},
+			Local:     localIP,
+			Remote:    remoteIP,
+			Ttl:       ttl,
+		}
+		if tc.Key > 0 {
+			greLink.IKey = tc.Key
+			greLink.OKey = tc.Key
+		}
+		return greLink
+	}
+}
 
-		if err := t.ops.LinkAdd(tunnelLink); err != nil {
-			slog.Warn("failed to create tunnel",
-				"name", tc.Name, "mode", tc.Mode, "err", err)
-			continue
+// ipEqual is net.IP.Equal with nil-tolerance. The kernel returns
+// 4-byte v4 slices while net.ParseIP yields 16-byte forms — never
+// compare these bytewise.
+func ipEqual(a, b net.IP) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Equal(b)
+}
+
+// legacyTunnelMatches reports whether an existing kernel tunnel link
+// already matches the desired one, comparing ONLY the config-driven
+// attributes: concrete type + Type() string (catches v4↔v6 family
+// flips — both "gre" and "ip6gre" deserialize to *Gretun with a
+// family-derived Type()), endpoints, defaulted TTL, GRE keys, and the
+// ip6tnl Proto. Kernel-populated or post-create-mutated fields (PMtu,
+// Tos, flags, encap-limit — mutated by the `ip ... encaplimit none`
+// exec) are deliberately NOT compared: a false "changed" verdict would
+// silently restore the per-commit flap this code removes (#1884 A.6).
+func legacyTunnelMatches(existing, desired netlink.Link) bool {
+	switch d := desired.(type) {
+	case *netlink.Gretun:
+		e, ok := existing.(*netlink.Gretun)
+		return ok && e.Type() == d.Type() &&
+			ipEqual(e.Local, d.Local) && ipEqual(e.Remote, d.Remote) &&
+			e.Ttl == d.Ttl && e.IKey == d.IKey && e.OKey == d.OKey
+	case *netlink.Iptun:
+		e, ok := existing.(*netlink.Iptun)
+		return ok && ipEqual(e.Local, d.Local) &&
+			ipEqual(e.Remote, d.Remote) && e.Ttl == d.Ttl
+	case *netlink.Ip6tnl:
+		e, ok := existing.(*netlink.Ip6tnl)
+		return ok && ipEqual(e.Local, d.Local) &&
+			ipEqual(e.Remote, d.Remote) && e.Ttl == d.Ttl &&
+			e.Proto == d.Proto
+	default:
+		return false
+	}
+}
+
+// applyKernelTunnelLocked reconciles one legacy (non-anchor) kernel
+// GRE/IPIP tunnel device, reachable only via the standalone-CLI apply
+// path (the daemon always sets AnchorOnly). Compare-then-decide:
+// identical config-driven attrs reuse the device in place; any real
+// change is a legitimate delete+recreate. Caller MUST hold mu.
+func (t *tunnelManager) applyKernelTunnelLocked(tc *config.TunnelConfig) {
+	localIP := net.ParseIP(tc.Source)
+	remoteIP := net.ParseIP(tc.Destination)
+	if localIP == nil || remoteIP == nil {
+		slog.Warn("invalid tunnel endpoints",
+			"name", tc.Name, "src", tc.Source, "dst", tc.Destination)
+		return
+	}
+
+	ttl := tc.TTL
+	if ttl == 0 {
+		ttl = 64
+	}
+	isIPv6 := localIP.To4() == nil
+	desired := buildKernelTunnelLink(tc, localIP, remoteIP, uint8(ttl), isIPv6)
+
+	var link netlink.Link
+	created := false
+	if existing, lookupErr := t.ops.LinkByName(tc.Name); lookupErr == nil {
+		if legacyTunnelMatches(existing, desired) {
+			link = existing // kernel-fetched, real ifindex (#1706)
+			slog.Debug("tunnel reused", "name", tc.Name)
+		} else {
+			if delErr := t.ops.LinkDel(existing); delErr != nil {
+				slog.Warn("failed to replace existing tunnel link",
+					"name", tc.Name, "existing_type", existing.Type(), "err", delErr)
+				return
+			}
+			slog.Info("replaced tunnel link with changed parameters",
+				"name", tc.Name, "existing_type", existing.Type())
 		}
+	}
+	if link == nil {
+		if addErr := t.ops.LinkAdd(desired); addErr != nil {
+			slog.Warn("failed to create tunnel",
+				"name", tc.Name, "mode", tc.Mode, "err", addErr)
+			return
+		}
+		link = desired
+		created = true
 
 		// IPv6 GRE: disable encaplimit to avoid adding an IPv6
-		// Destination Options extension header.  Many transit networks
-		// drop IPv6 packets with extension headers (RFC 7872).
+		// Destination Options extension header. Many transit networks
+		// drop IPv6 packets with extension headers (RFC 7872). Runs
+		// only on a real (re)create — it is a per-create device attr
+		// and the 15s-bounded exec must not run per commit (#1884).
 		if isIPv6 && (tc.Mode == "gre" || tc.Mode == "") {
 			// Timeout-bounded (#1794/#1800): Apply runs under
-			// applyConfigLocked's applySem (daemon_apply.go ApplyTunnels),
-			// so a wedged `ip` would block every commit. cancel() is
-			// called inline (not deferred) because this runs in the
-			// per-tunnel loop.
+			// applyConfigLocked's applySem (daemon_apply.go
+			// ApplyTunnels), so a wedged `ip` would block every commit.
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			ipCmd := exec.CommandContext(ctx, "ip", "link", "set", tc.Name,
 				"type", "ip6gre", "encaplimit", "none")
@@ -268,45 +502,240 @@ func (t *tunnelManager) Apply(tunnels []*config.TunnelConfig) error {
 					"name", tc.Name, "err", err, "output", string(out))
 			}
 		}
-
-		if err := t.ops.LinkSetUp(tunnelLink); err != nil {
-			slog.Warn("failed to bring up tunnel",
-				"name", tc.Name, "err", err)
-		}
-
-		// Assign IP addresses
-		for _, addrStr := range tc.Addresses {
-			addr, err := netlink.ParseAddr(addrStr)
-			if err != nil {
-				slog.Warn("invalid tunnel address",
-					"name", tc.Name, "addr", addrStr, "err", err)
-				continue
-			}
-			if err := t.ops.AddrAdd(tunnelLink, addr); err != nil {
-				slog.Warn("failed to add tunnel address",
-					"name", tc.Name, "addr", addrStr, "err", err)
+		if tc.MTU > 0 {
+			if mtuErr := t.ops.LinkSetMTU(link, tc.MTU); mtuErr != nil {
+				slog.Warn("failed to set tunnel mtu",
+					"name", tc.Name, "mtu", tc.MTU, "err", mtuErr)
 			}
 		}
-
-		// Bind tunnel to VRF if routing-instance is configured.
-		if tc.RoutingInstance != "" {
-			if err := t.vrfBinder.BindInterfaceToVRF(tc.Name, tc.RoutingInstance); err != nil {
-				slog.Warn("failed to bind tunnel to VRF",
-					"name", tc.Name, "vrf", tc.RoutingInstance, "err", err)
-			}
-		}
-
 		slog.Info("tunnel created", "name", tc.Name,
 			"src", tc.Source, "dst", tc.Destination)
-		t.tunnels = append(t.tunnels, tc.Name)
-
-		// Start keepalive probe if configured
-		if tc.Keepalive > 0 {
-			t.startKeepalive(tc.Name, tc.Destination, tc.Keepalive, tc.KeepaliveRetry)
+	} else if tc.MTU > 0 && link.Attrs().MTU != tc.MTU {
+		// Config-owned MTU reconcile on reuse (#1884 r5). No
+		// adoption-default normalization here: kernel GRE/IPIP devices
+		// have protocol-specific default MTUs (1476/1462/...), not the
+		// TUN 1500.
+		if mtuErr := t.ops.LinkSetMTU(link, tc.MTU); mtuErr != nil {
+			slog.Warn("failed to set tunnel mtu",
+				"name", tc.Name, "mtu", tc.MTU, "err", mtuErr)
 		}
 	}
 
-	return nil
+	// Keepalive reconcile (#1884 A.7, LEGACY BRANCH ONLY — anchors
+	// never run probes). Identity-unchanged runners are retained so
+	// probe state survives commits; the retained-and-DOWN case must
+	// skip LinkSetUp below: keepaliveLoop's down-transition is gated
+	// on state.Up==true, so re-upping the link here would strand it
+	// admin UP forever while probes keep failing (r1 Codex F1 + AGY
+	// converged trace).
+	runner, hasRunner := t.keepalives[tc.Name]
+	restartKA := tc.Keepalive > 0 && (!hasRunner || created || !runner.matches(tc))
+	skipUp := false
+	if tc.Keepalive > 0 && hasRunner && !restartKA {
+		runner.state.mu.Lock()
+		skipUp = !runner.state.Up
+		runner.state.mu.Unlock()
+	}
+
+	t.finishTunnelLocked(tc, link, skipUp, "tunnel")
+
+	if tc.Keepalive > 0 {
+		if restartKA {
+			// startKeepalive stops+drains any predecessor itself;
+			// runs AFTER a recreate so the fresh runner probes the
+			// new device.
+			t.startKeepalive(tc.Name, tc.Destination, tc.Keepalive, tc.KeepaliveRetry)
+		}
+	} else if hasRunner {
+		t.stopKeepaliveLocked(tc.Name)
+	}
+}
+
+// finishTunnelLocked is the shared apply tail: admin-up (unless a
+// retained keepalive runner holds the tunnel down), symmetric address
+// reconciliation, VRF claim reconcile, and success tracking. Caller
+// MUST hold mu; link is the kernel-fetched (or just-created) device.
+func (t *tunnelManager) finishTunnelLocked(tc *config.TunnelConfig, link netlink.Link, skipUp bool, kind string) {
+	if skipUp {
+		slog.Debug("skipping link up: keepalive holds tunnel down",
+			"name", tc.Name)
+	} else if err := t.ops.LinkSetUp(link); err != nil {
+		slog.Warn("failed to bring up "+kind, "name", tc.Name, "err", err)
+	}
+	t.appliedAddrs[tc.Name] = t.reconcileLinkAddrsLocked(
+		link, tc.Name, tc.Addresses, t.appliedAddrs[tc.Name], kind)
+	t.reconcileVRFClaimLocked(tc, link)
+	t.tunnels = append(t.tunnels, tc.Name)
+}
+
+// reconcileLinkAddrsLocked symmetrically reconciles a link's addresses
+// against the configured set: add configured-but-missing, delete
+// present-but-unconfigured — EXCEPT link-local addresses, which are
+// deleted only when this manager itself applied them (`applied`
+// gate). The kernel's autoconf fe80 must never be deleted, while a
+// CONFIGURED fe80 removed from config must not leak forever (#1884 r1
+// Codex F2). applied == nil (also the WG-branch sentinel) means no
+// link-local deletion at all.
+//
+// Returns the new applied set: successful adds + present-and-wanted +
+// link-local addresses whose stale-delete FAILED (kept tracked so the
+// next apply retries — r2 Codex F4).
+func (t *tunnelManager) reconcileLinkAddrsLocked(link netlink.Link, name string, addrs []string, applied map[string]bool, kind string) map[string]bool {
+	want := make(map[string]bool, len(addrs))
+	for _, addrStr := range addrs {
+		addr, parseErr := netlink.ParseAddr(addrStr)
+		if parseErr != nil {
+			slog.Warn("invalid "+kind+" address",
+				"name", name, "addr", addrStr, "err", parseErr)
+			continue
+		}
+		want[addr.IPNet.String()] = true
+	}
+	newApplied := make(map[string]bool, len(want))
+	existing := map[string]bool{}
+	if list, listErr := t.ops.AddrList(link, netlink.FAMILY_ALL); listErr == nil {
+		for i := range list {
+			a := list[i]
+			key := a.IPNet.String()
+			existing[key] = true
+			if want[key] {
+				continue
+			}
+			if a.IP != nil && a.IP.IsLinkLocalUnicast() && (applied == nil || !applied[key]) {
+				// Kernel-managed or foreign link-local: never delete.
+				continue
+			}
+			if delErr := t.ops.AddrDel(link, &a); delErr != nil {
+				slog.Warn("failed to remove stale "+kind+" address",
+					"name", name, "addr", key, "err", delErr)
+				if a.IP != nil && a.IP.IsLinkLocalUnicast() {
+					newApplied[key] = true // retry next apply
+				}
+			} else {
+				slog.Info("removed stale "+kind+" address",
+					"name", name, "addr", key)
+			}
+		}
+	}
+	for _, addrStr := range addrs {
+		addr, parseErr := netlink.ParseAddr(addrStr)
+		if parseErr != nil {
+			continue
+		}
+		key := addr.IPNet.String()
+		if existing[key] {
+			newApplied[key] = true
+			continue
+		}
+		if addErr := t.ops.AddrAdd(link, addr); addErr != nil {
+			slog.Warn("failed to add "+kind+" address",
+				"name", name, "addr", addrStr, "err", addErr)
+		} else {
+			newApplied[key] = true
+		}
+	}
+	return newApplied
+}
+
+// reconcileVRFClaimLocked runs the #1884 A.5 ordered claim procedure.
+// The claim invariant (r6-r8): t.appliedRI[name] is only ever written
+// from a SUCCESSFUL BindInterfaceToVRF or a direct observation of the
+// link's master — never from intent — so the identity-gated unbind
+// below can neither strand a master we own nor touch one we do not.
+//
+//  1. stanza RI nonempty: bind; on success claim = stanza RI (stanza
+//     wins over a coexisting 0a list bind — today's effective apply
+//     order); on failure fall through to observation.
+//  2. stanza failed or empty, RIListMember nonempty: never unbind (0a
+//     owns list binds — the VETO); claim transfers to the list RI only
+//     when the observed master IS vrf-<RIListMember>, else the prior
+//     claim is retained.
+//  3. config wants no RI: identity-gated unbind of vrf-<claim>. Claim
+//     clears on successful unbind / identity mismatch (master not
+//     ours) / VRF device not-found (kernel already freed the slaves);
+//     it is RETAINED on transient errors so the next apply retries.
+//
+// Caller MUST hold mu.
+func (t *tunnelManager) reconcileVRFClaimLocked(tc *config.TunnelConfig, link netlink.Link) {
+	name := tc.Name
+	if tc.RoutingInstance != "" {
+		if err := t.vrfBinder.BindInterfaceToVRF(name, tc.RoutingInstance); err != nil {
+			slog.Warn("failed to bind tunnel to VRF",
+				"name", name, "vrf", tc.RoutingInstance, "err", err)
+			// r7/r8: a FAILED bind must not blind-write the claim (the
+			// kernel may still carry the previous master, or a 0a list
+			// bind). Observation may take the claim; else retain.
+			t.observeListClaimLocked(tc, link)
+			return
+		}
+		t.appliedRI[name] = tc.RoutingInstance
+		return
+	}
+	if tc.RIListMember != "" {
+		// Unbind VETO: a stanza→list move must never strip the 0a
+		// bind (r4 convergent counterexample).
+		t.observeListClaimLocked(tc, link)
+		return
+	}
+
+	claim := t.appliedRI[name]
+	if claim == "" {
+		return
+	}
+	master := link.Attrs().MasterIndex
+	if master == 0 {
+		// Nothing is bound — whatever we once bound is already gone.
+		delete(t.appliedRI, name)
+		return
+	}
+	vrf, err := t.ops.LinkByName("vrf-" + claim)
+	if err != nil {
+		if isLinkNotFound(err) {
+			// The VRF device is gone; deleting a master frees its
+			// slaves, so the current master cannot be ours.
+			delete(t.appliedRI, name)
+			return
+		}
+		// Transient lookup error: retain the claim, retry next apply.
+		return
+	}
+	if vrf.Attrs().Index != master {
+		// Master is not the VRF we bound (someone else's bind).
+		delete(t.appliedRI, name)
+		return
+	}
+	if err := t.ops.LinkSetNoMaster(link); err != nil {
+		slog.Warn("failed to unbind tunnel from VRF",
+			"name", name, "vrf", claim, "err", err)
+		return // retain claim; retry next apply
+	}
+	slog.Info("tunnel unbound from routing-instance",
+		"name", name, "vrf", claim)
+	delete(t.appliedRI, name)
+}
+
+// observeListClaimLocked transfers the appliedRI claim to the
+// routing-instance list member ONLY when the link's current master is
+// OBSERVED to be that RI's VRF device (#1884 r6/r8: a blind transfer
+// after a failed 0a bind would record an RI the kernel never took and
+// later strand the real master on a mismatch-clear). On any
+// non-observation the previous nonempty claim is retained. Caller MUST
+// hold mu.
+func (t *tunnelManager) observeListClaimLocked(tc *config.TunnelConfig, link netlink.Link) {
+	if tc.RIListMember == "" {
+		return
+	}
+	master := link.Attrs().MasterIndex
+	if master == 0 {
+		return // 0a bind absent or failed: no observation, retain prior
+	}
+	vrf, err := t.ops.LinkByName("vrf-" + tc.RIListMember)
+	if err != nil {
+		return // retain prior claim
+	}
+	if vrf.Attrs().Index == master {
+		t.appliedRI[tc.Name] = tc.RIListMember
+	}
 }
 
 // WG per-packet outer overhead (must mirror userspace-dp
@@ -430,50 +859,12 @@ func (t *tunnelManager) applyWireguardTunLocked(tc *config.TunnelConfig) error {
 
 	// Symmetric address reconciliation (Copilot C5): because the device
 	// is persistent and never recreated, addresses removed from the config
-	// would otherwise survive every reload and keep being routed. Add
-	// configured addresses not yet present, and delete present addresses
-	// not in the config — while preserving the device itself.
-	want := make(map[string]bool, len(tc.Addresses))
-	for _, addrStr := range tc.Addresses {
-		addr, parseErr := netlink.ParseAddr(addrStr)
-		if parseErr != nil {
-			slog.Warn("invalid wireguard tun address",
-				"name", tc.Name, "addr", addrStr, "err", parseErr)
-			continue
-		}
-		want[addr.IPNet.String()] = true
-	}
-	existing := map[string]bool{}
-	if addrs, listErr := t.ops.AddrList(link, netlink.FAMILY_ALL); listErr == nil {
-		for i := range addrs {
-			a := addrs[i]
-			key := a.IPNet.String()
-			existing[key] = true
-			// Skip link-local (fe80::) — the kernel manages it.
-			if !want[key] && a.IP != nil && !a.IP.IsLinkLocalUnicast() {
-				if delErr := t.ops.AddrDel(link, &a); delErr != nil {
-					slog.Warn("failed to remove stale wireguard tun address",
-						"name", tc.Name, "addr", key, "err", delErr)
-				} else {
-					slog.Info("removed stale wireguard tun address",
-						"name", tc.Name, "addr", key)
-				}
-			}
-		}
-	}
-	for _, addrStr := range tc.Addresses {
-		addr, parseErr := netlink.ParseAddr(addrStr)
-		if parseErr != nil {
-			continue
-		}
-		if existing[addr.IPNet.String()] {
-			continue
-		}
-		if addErr := t.ops.AddrAdd(link, addr); addErr != nil {
-			slog.Warn("failed to add wireguard tun address",
-				"name", tc.Name, "addr", addrStr, "err", addErr)
-		}
-	}
+	// would otherwise survive every reload and keep being routed. Shared
+	// helper (#1884); the nil applied-set sentinel preserves this
+	// branch's blanket link-local skip byte-identically ("the kernel
+	// manages fe80"). The configured-link-local removal leak this
+	// implies on the WG branch is pre-existing and tracked separately.
+	_ = t.reconcileLinkAddrsLocked(link, tc.Name, tc.Addresses, nil, "wireguard tun")
 
 	if tc.RoutingInstance != "" {
 		if bindErr := t.vrfBinder.BindInterfaceToVRF(tc.Name, tc.RoutingInstance); bindErr != nil {
@@ -520,15 +911,28 @@ func (t *tunnelManager) stopAllKeepalivesLocked() {
 	}
 }
 
+// stopKeepaliveLocked cancels, drains, and REMOVES the keepalive
+// runner for one tunnel, if any. Removing the map entry matters
+// (#1884 SMR2-2): a cancelled runner left behind would make
+// GetKeepaliveState report a dead probe and would let the apply
+// reconcile "retain" a corpse. Caller MUST hold mu.
+func (t *tunnelManager) stopKeepaliveLocked(name string) {
+	runner, ok := t.keepalives[name]
+	if !ok {
+		return
+	}
+	runner.cancel()
+	<-runner.done
+	delete(t.keepalives, name)
+	slog.Debug("stopped keepalive", "tunnel", name)
+}
+
 // startKeepalive starts a keepalive probe goroutine for a tunnel.
 // Caller MUST hold mu.
 func (t *tunnelManager) startKeepalive(tunnelName, remoteAddr string, interval, maxRetries int) {
 	// Stop existing keepalive for this tunnel if any. Drain on done
 	// so the replacement doesn't race the old goroutine on the handle.
-	if runner, ok := t.keepalives[tunnelName]; ok {
-		runner.cancel()
-		<-runner.done
-	}
+	t.stopKeepaliveLocked(tunnelName)
 
 	if maxRetries <= 0 {
 		maxRetries = 3
@@ -544,9 +948,12 @@ func (t *tunnelManager) startKeepalive(tunnelName, remoteAddr string, interval, 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	t.keepalives[tunnelName] = &keepaliveRunner{
-		cancel: cancel,
-		state:  state,
-		done:   done,
+		cancel:     cancel,
+		state:      state,
+		done:       done,
+		remote:     remoteAddr,
+		interval:   interval,
+		maxRetries: maxRetries,
 	}
 
 	go t.keepaliveLoop(ctx, done, tunnelName, state)
@@ -655,7 +1062,8 @@ func (t *tunnelManager) Clear() error {
 }
 
 // clearLocked is the lock-free body of Clear. Caller must hold mu.
-// Used internally by Apply which already holds the lock.
+// Apply no longer uses it (#1884 reconcile-in-place); it remains the
+// explicit delete-everything path for ClearTunnels.
 func (t *tunnelManager) clearLocked() error {
 	t.stopAllKeepalivesLocked()
 	for _, name := range t.tunnels {
@@ -670,6 +1078,11 @@ func (t *tunnelManager) clearLocked() error {
 		}
 	}
 	t.tunnels = nil
+	// Reset the reconcile state with the devices: a post-Clear Apply
+	// adopts whatever survives instead of trusting stale ownership.
+	t.ownedNames = nil
+	t.appliedAddrs = nil
+	t.appliedRI = nil
 	return nil
 }
 
