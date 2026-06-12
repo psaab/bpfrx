@@ -7,4 +7,8 @@
 | r1 | AGY retry | adversarial-review-mqalrfu5-00c0v0 | DEGENERATE (same auth failure — AGY unavailable this round, needs interactive login; proceeding 3-of-4 per protocol) |
 | r1 | Copilot | requested on PR #1899 | QUOTA-BLOCKED ("reached their quota limit", twice); retry 1 requested 07:30 UTC |
 | r1 | Claude SMR | in-conversation | MERGE-READY after r1 fixes (worked traces in PR conversation; pre-hold closes the retry race to gate->sendto residual) |
-| r2 | Codex | dispatched on head 400b813c6753 | pending |
+| r2 | Codex | task-mqaly4kf-q5352i (head 400b813c6753) | MERGE-NEEDS-MAJOR — retry path + MAJOR-2 + MEDIUM verified fixed; remaining: full-apply old-goroutine/old-marks reprogram race → fixed in 8aa16ed983d8 |
+| r3 | Codex | session 019ebac8-bb26-70d2-a864-82a07ec9124e (head 8aa16ed983d8) | MERGE-NEEDS-MAJOR — r2 trace closed; no-installer release-before-drain → fixed in c90f0af8ba6f |
+| r4 | Codex | session 019ebacf-fdeb-77a0-a42f-008d3c7244e2 (head c90f0af8ba6f) | MERGE-NEEDS-MINOR — doc-only (plan.md stale before-Apply wording, ledger staleness); r3 trace verified closed; both fixed in the ledger/doc commit |
+| r1-3 | Copilot | retries 07:30 / 07:41 / 07:50 UTC | QUOTA-BLOCKED all three documented retries — proceeding 3-of-4 per protocol (AGY also down: OAuth expired) |
+| final | Claude SMR | in-conversation | MERGE-READY — r3 ordering traces re-verified (no-installer removal, effective nil, retry) |

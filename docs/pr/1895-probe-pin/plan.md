@@ -90,9 +90,11 @@ MAJOR-2) under the same hold/publish ordering (Codex r3: publishing
 the new-keys-only set before Apply reopened the gate for an old held
 pin being removed from config).
 
-`reconcileRPM` passes the failed-pin map to the RPM manager via a new
-additive setter (`SetPinInstallResults`, mirroring `SetRethMap`)
-BEFORE `rpm.Apply`, so probes start with failure knowledge.
+`reconcileRPM` threads the failed-pin map into the RPM manager via a
+new additive setter (`SetPinInstallResults`, mirroring `SetRethMap`).
+On a full apply the publish happens AFTER `rpm.Apply` (the union
+pre-hold covers the interim — see above); the hash-gated retry
+publishes immediately.
 
 Retry: the config-hash gate previously meant a boot-ordering failure
 (egress link not yet present) stayed failed until the next RPM config
@@ -145,7 +147,8 @@ resumes normally — no probe restart needed.
 |---|---|---|
 | `routing.probePinManager.Apply` | `error` (always nil) | `map[string]error` (failed pins only) |
 | `routing.Manager.ApplyProbePins` | `error` | `map[string]error` |
-| `rpm.Manager.SetPinInstallResults` | — | new setter (call before `Apply`; replaces map) |
+| `rpm.Manager.SetPinInstallResults` | — | new setter (replaces map; published after `Apply` on config change, immediately on retry) |
+| `rpm.Manager.HoldPinsForReprogram` | — | new pre-hold (union of live marks + new pin keys) |
 | `rpm.Manager.PinInstallFailureCount` | — | new accessor (metrics) |
 | `api.Config.RPMPinFailedFn` | — | new optional Fn → gauge |
 | `Daemon.rpmPinsFailed` / `probePinApply` | — | unexported state + test seam |
