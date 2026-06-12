@@ -89,6 +89,14 @@ type Daemon struct {
 	rpm           *rpm.Manager
 	rpmMu         sync.Mutex // serializes reconcileRPM callers (#1827)
 	activeRPMHash [32]byte   // config-hash gate for RPM re-apply (#1827)
+	// rpmPinsFailed records that the last probe-pin install left at
+	// least one pin unprogrammed (#1895): hash-gated reconcileRPM
+	// calls then retry the pin install (without restarting probes)
+	// until it succeeds. Guarded by rpmMu.
+	rpmPinsFailed bool
+	// probePinApply is the test seam for probe-pin programming; nil =
+	// d.routing.ApplyProbePins (#1895).
+	probePinApply func([]routing.ProbePin) map[string]error
 	ipmon         *ipmon.Engine
 	// pendingFIBBump records an UNCONFIRMED FIB-generation bump after a
 	// successful route-overlay publish (#1844, Codex plan r2-1): the

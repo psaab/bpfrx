@@ -184,12 +184,33 @@ func lowestDataRG(cfg *config.Config) int {
 	return rg
 }
 
+// probePinApplyFn returns the probe-pin programmer: the test seam
+// when set, otherwise routing.Manager.ApplyProbePins, otherwise nil
+// (no routing manager — unit-test daemons).
+func (d *Daemon) probePinApplyFn() func([]routing.ProbePin) map[string]error {
+	if d.probePinApply != nil {
+		return d.probePinApply
+	}
+	if d.routing != nil {
+		return d.routing.ApplyProbePins
+	}
+	return nil
+}
+
 // reconcileRPM applies the RPM probe set when (and only when) the
 // rendered stanza changed, returning whether a re-apply happened (the
 // return value exists for the gating tests). Probe pin rules (fwmark +
 // reserved probe tables) follow the prober lifecycle: they are
-// reprogrammed on the same gate. Safe to call from applyConfigLocked
-// AND from other reconcile paths; rpmMu serializes callers.
+// reprogrammed on the same gate, and their per-test install results
+// are threaded into the RPM manager so a test whose pin failed to
+// program holds state (ErrProbeSetup) instead of probing the default
+// path and false-PASSing a dead pinned uplink (#1895). While any pin
+// is failed, hash-gated calls retry ONLY the pin install (no probe
+// restart — the deterministic mark assignment cannot change under an
+// unchanged hash), so transient failures (boot ordering, RETH churn)
+// recover on the next commit or RG transition. Safe to call from
+// applyConfigLocked AND from other reconcile paths; rpmMu serializes
+// callers.
 func (d *Daemon) reconcileRPM(cfg *config.Config) bool {
 	if d.rpm == nil || d.daemonCtx == nil || cfg == nil {
 		return false
@@ -200,19 +221,35 @@ func (d *Daemon) reconcileRPM(cfg *config.Config) bool {
 	effective := d.effectiveRPMConfig(cfg)
 	rethMap := cfg.RethToPhysical()
 	h := rpmConfigHash(effective, rethMap)
+	applyPins := d.probePinApplyFn()
 	if h == d.activeRPMHash {
+		if d.rpmPinsFailed && applyPins != nil {
+			failed := applyPins(routing.BuildProbePins(effective, rethMap))
+			d.rpm.SetPinInstallResults(failed)
+			d.rpmPinsFailed = len(failed) > 0
+			if !d.rpmPinsFailed {
+				slog.Info("probe pin install recovered on retry")
+			}
+		}
 		return false
 	}
 
 	// Pin state follows the prober lifecycle: clear-and-program the
-	// reserved band alongside every probe re-apply.
-	if d.routing != nil {
-		if err := d.routing.ApplyProbePins(routing.BuildProbePins(effective, rethMap)); err != nil {
-			slog.Warn("failed to apply probe pin rules", "err", err)
+	// reserved band alongside every probe re-apply, and hand the
+	// failed-pin set to the manager BEFORE Apply so probes start with
+	// install knowledge.
+	var failed map[string]error
+	if applyPins != nil {
+		failed = applyPins(routing.BuildProbePins(effective, rethMap))
+		if len(failed) > 0 {
+			slog.Warn("probe pin install failures — affected tests hold state until a retry succeeds",
+				"failed", len(failed))
 		}
 	}
+	d.rpmPinsFailed = len(failed) > 0
 
 	d.rpm.SetRethMap(rethMap)
+	d.rpm.SetPinInstallResults(failed)
 	d.rpm.Apply(d.daemonCtx, effective)
 	d.activeRPMHash = h
 	probes := 0

@@ -2,9 +2,11 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/routing"
 	"github.com/psaab/xpf/pkg/rpm"
 )
 
@@ -73,5 +75,75 @@ func TestRPMConfigHashSensitivity(t *testing.T) {
 	withPin.Probes["WAN"].Tests["t"].NextHop = "10.0.0.1"
 	if h1 == rpmConfigHash(withPin, nil) {
 		t.Fatal("next-hop change must change the hash")
+	}
+}
+
+// rpmPinnedTestConfig returns a config whose single test carries a
+// next-hop pin (so BuildProbePins yields one pin).
+func rpmPinnedTestConfig() *config.Config {
+	cfg := &config.Config{}
+	cfg.Services.RPM = &config.RPMConfig{Probes: map[string]*config.RPMProbe{
+		"WAN": {Name: "WAN", Tests: map[string]*config.RPMTest{
+			"t": {Name: "t", Target: "192.0.2.1", NextHop: "10.0.0.1",
+				DestinationInterface: "ge-0/0/2", TestInterval: 3600},
+		}},
+	}}
+	return cfg
+}
+
+// TestReconcileRPMPinFailureRetry is the #1895 daemon-side contract:
+// pin install failures are threaded into the RPM manager, hash-gated
+// reconciles retry ONLY the pin install (no probe restart), and the
+// retry stops once the install recovers.
+func TestReconcileRPMPinFailureRetry(t *testing.T) {
+	var calls int
+	retFailed := map[string]error{"WAN/t": fmt.Errorf("egress interface missing")}
+	d := &Daemon{rpm: rpm.New(), daemonCtx: context.Background()}
+	d.probePinApply = func(pins []routing.ProbePin) map[string]error {
+		calls++
+		if len(pins) != 1 || pins[0].TestKey != "WAN/t" {
+			t.Fatalf("unexpected pins: %+v", pins)
+		}
+		return retFailed
+	}
+	defer d.rpm.StopAll()
+
+	cfg := rpmPinnedTestConfig()
+	if !d.reconcileRPM(cfg) {
+		t.Fatal("first reconcile must apply")
+	}
+	if calls != 1 {
+		t.Fatalf("pin apply calls = %d, want 1", calls)
+	}
+	if got := d.rpm.PinInstallFailureCount(); got != 1 {
+		t.Fatalf("failure not threaded into rpm manager: count = %d, want 1", got)
+	}
+
+	// Hash-gated call: no probe re-apply, but the failed pin install
+	// is retried.
+	if d.reconcileRPM(cfg) {
+		t.Fatal("identical config must stay hash-gated while pins retry")
+	}
+	if calls != 2 {
+		t.Fatalf("pin apply calls = %d, want 2 (retry under unchanged hash)", calls)
+	}
+	if got := d.rpm.PinInstallFailureCount(); got != 1 {
+		t.Fatalf("still-failed retry must keep the failure: count = %d", got)
+	}
+
+	// Recovery: the next gated call retries, succeeds, clears the
+	// manager state, and stops retrying afterwards.
+	retFailed = nil
+	if d.reconcileRPM(cfg) {
+		t.Fatal("recovery retry must not count as a probe re-apply")
+	}
+	if calls != 3 {
+		t.Fatalf("pin apply calls = %d, want 3", calls)
+	}
+	if got := d.rpm.PinInstallFailureCount(); got != 0 {
+		t.Fatalf("recovered pins must clear the failure: count = %d", got)
+	}
+	if d.reconcileRPM(cfg); calls != 3 {
+		t.Fatalf("pin apply calls = %d, want 3 (no retry once recovered)", calls)
 	}
 }

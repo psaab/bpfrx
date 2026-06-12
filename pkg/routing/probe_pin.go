@@ -143,12 +143,30 @@ type probePinManager struct {
 }
 
 // Apply clears the probe-pin band and programs one fwmark rule + one
-// pinned host route per pin. Pins whose egress interface does not exist
-// are skipped with a warning (the probe will simply fail unpinned-time
-// resolution until the interface appears and the next apply runs).
-func (p *probePinManager) Apply(pins []ProbePin) error {
+// pinned host route per pin. It returns a map keyed by ProbePin.TestKey
+// containing ONLY the pins whose kernel install failed (invalid
+// target/next-hop, missing egress link, RuleAdd/RouteAdd error), with
+// the wrapped cause; an empty/nil map means every pin installed. A pin
+// must never be left partially installed: when RouteAdd fails after a
+// successful RuleAdd, the fwmark rule is rolled back so no rule points
+// at an empty band table (#1895).
+//
+// Before #1895 every failure mode here was log-and-continue with an
+// unconditional nil return — the probe then ran with an unbacked
+// SO_MARK, fell through to the main table, and reported the *pinned
+// uplink* healthy (false PASS, failover suppression). Callers now
+// thread the failed-pin map into pkg/rpm so affected tests hold state
+// (ErrProbeSetup) instead of probing the wrong path.
+func (p *probePinManager) Apply(pins []ProbePin) map[string]error {
 	if err := p.clear(); err != nil {
 		slog.Warn("failed to clear probe pin band", "err", err)
+	}
+	var failed map[string]error
+	fail := func(pin ProbePin, err error) {
+		if failed == nil {
+			failed = make(map[string]error)
+		}
+		failed[pin.TestKey] = err
 	}
 	for _, pin := range pins {
 		target := net.ParseIP(pin.Target)
@@ -156,6 +174,7 @@ func (p *probePinManager) Apply(pins []ProbePin) error {
 		if target == nil || nextHop == nil {
 			slog.Warn("probe pin: invalid target/next-hop",
 				"test", pin.TestKey, "target", pin.Target, "next_hop", pin.NextHop)
+			fail(pin, fmt.Errorf("invalid target %q / next-hop %q", pin.Target, pin.NextHop))
 			continue
 		}
 		family := unix.AF_INET
@@ -169,6 +188,7 @@ func (p *probePinManager) Apply(pins []ProbePin) error {
 		if err != nil {
 			slog.Warn("probe pin: egress interface not found",
 				"test", pin.TestKey, "interface", pin.Interface, "err", err)
+			fail(pin, fmt.Errorf("egress interface %q: %w", pin.Interface, err))
 			continue
 		}
 
@@ -180,6 +200,8 @@ func (p *probePinManager) Apply(pins []ProbePin) error {
 		if err := p.ops.RuleAdd(rule); err != nil {
 			slog.Warn("probe pin: failed to add fwmark rule",
 				"test", pin.TestKey, "mark", pin.Mark, "table", pin.Table, "err", err)
+			fail(pin, fmt.Errorf("fwmark rule add (mark %#x, table %d): %w",
+				pin.Mark, pin.Table, err))
 			continue
 		}
 
@@ -194,6 +216,17 @@ func (p *probePinManager) Apply(pins []ProbePin) error {
 			slog.Warn("probe pin: failed to add pinned route",
 				"test", pin.TestKey, "target", pin.Target,
 				"next_hop", pin.NextHop, "table", pin.Table, "err", err)
+			// Roll back the fwmark rule so a partial install never
+			// persists: a rule over an empty band table is stale state
+			// (empty-table lookups fall through, but a later stale or
+			// leftover route would silently re-route the probe). The
+			// band clear() on the next apply remains the backstop if
+			// the rollback itself fails.
+			if delErr := p.ops.RuleDel(rule); delErr != nil {
+				slog.Warn("probe pin: failed to roll back fwmark rule after route failure",
+					"test", pin.TestKey, "mark", pin.Mark, "table", pin.Table, "err", delErr)
+			}
+			fail(pin, fmt.Errorf("pinned route add (table %d): %w", pin.Table, err))
 			continue
 		}
 		slog.Info("probe pin programmed",
@@ -201,7 +234,7 @@ func (p *probePinManager) Apply(pins []ProbePin) error {
 			"interface", pin.Interface, "mark", fmt.Sprintf("%#x", pin.Mark),
 			"table", pin.Table)
 	}
-	return nil
+	return failed
 }
 
 // clear removes all ip rules in the probe-pin priority band and flushes
