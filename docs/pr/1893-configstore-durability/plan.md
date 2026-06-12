@@ -1,6 +1,10 @@
 # Plan: #1893 + #1894 — configstore fail-closed constructor + pkg/fsatomic durable writer
 
-**Status:** DRAFT v1 — pending adversarial plan review (Codex + AGY + Claude SMR)
+**Status:** v2 — round-1 adjudicated (Codex PLAN-NEEDS-MAJOR task-mqal7v2u-8adha1,
+AGY PLAN-NEEDS-MAJOR adversarial-review-mqal37pw-ehzagk; both endorse the
+architectural premise). All sustained findings adopted below; see the
+"Round-1 adjudication" section at the end for the finding-by-finding record,
+including the evidence-backed refutation of AGY finding 4 (stale checkout).
 
 ## Issue framing
 
@@ -77,12 +81,13 @@ func New(filePath string) (*Store, error)
 - `daemon.New` becomes `(*Daemon, error)`; `cmd/xpfd/main.go` prints the
   error to stderr and exits 1 (same shape as the existing `d.Run` error
   path).
-- 32 test files updated mechanically (`store := configstore.New(p)` →
-  `store, err := configstore.New(p)` + fatal-on-err). No `MustNew` panic
-  helper added to the production surface.
-- New test: point `New` at a path whose parent is unwritable (0555 tmpdir);
-  assert a non-nil error mentioning the dbDir and **no panic** (the exact
-  regression #1893 demands).
+- 32 test call sites across 25 `_test.go` files updated mechanically
+  (`store := configstore.New(p)` → `store, err := configstore.New(p)` +
+  fatal-on-err). No `MustNew` panic helper added to the production surface.
+- New test: place a **regular file** at the `.configdb` path so `MkdirAll`
+  fails with ENOTDIR — root/CAP_DAC_OVERRIDE-proof, unlike a 0555 parent
+  (Codex round-1 finding 6); assert a non-nil error mentioning the dbDir and
+  **no panic** (the exact regression #1893 demands).
 
 Boot semantics: hard fail-closed. Today the daemon panics at `Load()`
 moments later anyway; this converts the crash into a diagnosable error with
@@ -106,12 +111,41 @@ func WriteFileAtomic(path string, data []byte, perm os.FileMode, opts ...Option)
 // parent-directory fsync after rename. For state that must survive power
 // loss (DurableState class). A dir-fsync failure is an error, not a warn.
 func WriteFileDurable(path string, data []byte, perm os.FileMode, opts ...Option) error
+
+// SyncDir fsyncs a directory, making preceding renames/unlinks in it
+// durable. Used to batch namespace durability (rollback-file shuffle +
+// stale-slot cleanup pay ONE dir fsync, not one per file).
+func SyncDir(dir string) error
 ```
 
 Shared unexported core; one code path, `durable bool`. Temp file removed on
 every failure path. The symlink + mode/owner-preserve logic is a mechanical
 lift of FRR's `atomicWriteFile` (behavior-preserving; that code was just
 reviewed in #1883).
+
+Semantics adopted from round-1 review:
+
+- **Inode replacement, constant mode.** Unlike `os.WriteFile` over an
+  existing file (which keeps the target inode's mode/owner and writes
+  through symlinks), temp+rename replaces the inode and enforces the
+  caller's `perm` on every write. For every migrated site except frr.conf
+  the file is created/owned by xpfd with a fixed mode, so this is a
+  deliberate normalization, documented per-site (Codex finding 1). Symlinked
+  targets get replaced by regular files unless `WithResolveSymlinks` is
+  passed — only FRR opts in. Hardlinks: rename breaks `nlink>1`
+  write-through; documented in the fsatomic README, no rejection logic
+  (none of these paths is plausibly hardlinked) (Codex finding 2).
+- **Symlink-resolved dir fsync.** With `WithResolveSymlinks`, the temp file,
+  rename, and the parent-dir fsync all use the *resolved target's*
+  directory, not the symlink's (AGY finding 2).
+- **EINTR.** Go's `os.File.Sync` routes through `internal/poll.FD.Fsync`,
+  which wraps `syscall.Fsync` in `ignoringEINTR` — the stdlib already
+  retries; noted in a code comment, no extra loop (Codex finding 3).
+- **No post-rename fsync of the target file** — the temp-fd fsync already
+  flushed data+metadata; the dir fsync makes the rename durable (AGY).
+- **Crash-leaked temps.** `CreateTemp` names (`.<base>.tmp-*`) can leak on
+  crash. `NewDB` sweeps `.*.tmp-*` in `.configdb` at construction; FRR
+  already tolerates its own (`.frr.conf.tmp-*`) and is left as-is.
 
 Test seams (same-package, `test_seams` pattern already used in configstore):
 unexported function vars for CreateTemp / write / chmod / chown / sync /
@@ -124,7 +158,7 @@ asserting: error surfaced, target file untouched, temp file cleaned up.
 |---|---|---|---|
 | `configstore/db.go writeTree` (active.json + dormant candidate/rollback slots) | DurableState | `WriteFileDurable` 0644 | backs the #1799 persist-before-promote contract |
 | `configstore/crypto.go readOrCreateMasterKey` | DurableState | `WriteFileDurable` 0600 | loss = undecryptable config |
-| `configstore/store.go saveRollbackFiles` | DurableState | `WriteFileDurable` 0644 | canonical rollback history (fact 2); was plain WriteFile |
+| `configstore/store.go saveRollbackFiles` | DurableState (slot 1) + AtomicGeneratedConfig (slots 2..N) | `WriteFileDurable` slot 1, `WriteFileAtomic` rest, then ONE `SyncDir` after `cleanupRollbackFiles` | canonical rollback history (fact 2); was plain WriteFile. Slot 1 is the immediate rollback target; atomic rename keeps slots 2..N never-missing/never-torn so `loadRollbackHistory`'s break-on-first-missing stays sound (they may lag after power cut — documented); the trailing dir fsync makes the whole shuffle **and the stale-slot unlinks** durable at the cost of one fsync (Codex findings 4+5, AGY finding 3) |
 | `configstore/store.go SaveRescueConfig` | DurableState | `WriteFileDurable` 0644 | operator-requested safety net |
 | `configstore/store.go ArchiveConfig` | AtomicGeneratedConfig | `WriteFileAtomic` 0644 | new unique file per commit; best-effort archive (not in issue inventory; included for no-torn-file) |
 | `dhcp/dhcp.go saveDUID` | DurableState | `WriteFileDurable` 0644 | lost DUID changes client identity across reboot |
@@ -135,15 +169,17 @@ asserting: error surfaced, target file untouched, temp file cleaned up.
 | `networkd restoreSlowPathRPFilter` (:222) | BestEffortKernelKnob | direct `os.WriteFile` stays | procfs: rename is impossible there; comment added |
 | `configstore/journal.go` | — | untouched | #1896 owns the journal redesign |
 
-Fsync-cost note: `saveRollbackFiles` rewrites up to 50 history files per
-commit → worst case ~50 durable writes on the commit path. Operator-paced;
-accepted. If a reviewer judges this too heavy, the fallback position is
-Durable for slot 1 + Atomic for 2..N (recent rollbacks are the ones that
-matter after power loss) — adjudicate in review.
+Fsync-cost note: with the slot-1-durable design the commit path pays 2 file
+fsyncs + 3 dir fsyncs total (active.json durable, rollback slot 1 durable,
+one trailing SyncDir) instead of the v1 worst case of ~50 — all under the
+store mutex but operator-paced and bounded (Codex finding 4, AGY finding 3
+both demanded this; adopted).
 
-Canary: a test (grep-based, same spirit as `legacy_dataplane_canary_test.go`)
-asserting no direct `os.WriteFile` in the migrated packages outside an
-explicit allowlist (procfs knob, journal pending #1896, test files).
+Canary: an **AST-based** test (`go/parser` over the migrated packages'
+production files, resolving the `os` import's local name and matching
+`os.WriteFile` call selectors) with an explicit allowlist (procfs knob,
+journal pending #1896). Grep is brittle against comments and import aliases
+(Codex finding 7).
 
 ## Public API changes (deliberate, audited)
 
@@ -196,21 +232,26 @@ explicit allowlist (procfs knob, journal pending #1896, test files).
   correct fix per the issue is the constructor change.
 - O_TMPFILE / linkat optimizations; cross-platform (Linux-only daemon).
 
-## Open questions for adversarial review
+## Round-1 adjudication (Codex task-mqal7v2u-8adha1, AGY adversarial-review-mqal37pw-ehzagk)
 
-1. Is hard fail-closed the right boot semantic vs. booting read-only from
-   the text config with persistence disabled? (Position: yes — current code
-   panics anyway; a real read-only mode is new feature work nobody asked for.)
-2. `saveRollbackFiles`: Durable for all 50 slots vs Durable-slot-1 +
-   Atomic-rest? (Position: all Durable, accepted cost, simplest contract.)
-3. FRR migration now vs TODO-and-leave (the #1883 path was just reviewed)?
-   (Position: migrate — the lift is mechanical, tests pin behavior, and it
-   gains the missing dir-fsync; leaving it forks the policy the issue exists
-   to unify.)
-4. Should `WriteFileDurable` also fsync the directory on the **temp create**
-   side or only post-rename? (Position: post-rename only — the rename is the
-   commit point; pre-rename dir state is disposable.)
-5. Is `ArchiveConfig` scope creep? (Position: 3-line change, included; happy
-   to drop.)
-6. Mechanical 32-test-file update vs a test helper? (Position: mechanical —
-   no panic-helper in the production API.)
+Both reviewers: PLAN-NEEDS-MAJOR, premise endorsed (fail-closed constructor
+right, fsatomic shape right, hot-path classing right, single-caller claim
+independently verified by both).
+
+| # | Finding | Verdict | Disposition |
+|---|---|---|---|
+| C1 | Mode/symlink inode-replacement semantics underspecified outside FRR | SUSTAINED | "Semantics adopted" section: constant-mode normalization documented per-site; only FRR opts into preserve/resolve |
+| C2 | Hardlink write-through silently broken by rename | SUSTAINED (doc-level) | Documented in fsatomic README; no nlink rejection |
+| C3 | EINTR policy for fsync unstated | SUSTAINED (doc-level) | Go stdlib `poll.FD.Fsync` uses `ignoringEINTR`; code comment |
+| C4 / A3 | 50 durable writes per commit under the store mutex too expensive | SUSTAINED | Slot-1 Durable + slots 2..N Atomic + one trailing `SyncDir` |
+| C5 | `cleanupRollbackFiles` unlink durability ignored — stale slots can resurrect post-crash | SUSTAINED | Covered by the same trailing `SyncDir` |
+| C6 | 0555-parent constructor test is root-brittle | SUSTAINED | Regular file at `.configdb` → ENOTDIR |
+| C7 | "32 test files" wrong (32 sites / 25 files); grep canary brittle | SUSTAINED | Corrected; AST-based canary |
+| A2 | Dir fsync must target the symlink-RESOLVED parent | SUSTAINED | Adopted explicitly |
+| A4 | "Hallucination: `noteActivePersistFailureLocked` / persist-before-promote don't exist; code is promote-before-persist" | **REFUTED with evidence** | AGY audited the stale main checkout `/home/ps/git/bpfrx` at `ecdc16f2e` (its own file links say so), not this worktree at `0c4f92354`. In the worktree: `noteActivePersistFailureLocked` is defined at `pkg/configstore/store.go:194`, `persistDegraded` at `:48`, and the persist-before-promote contract comment at `:898-917`. `grep -c noteActivePersistFailureLocked` = 4 in worktree, 0 in the stale main checkout — exactly the #1799 machinery AGY claims doesn't exist |
+| A — | Post-rename fsync of target redundant | CONFIRMS design | No-op |
+
+Resolved former open questions: fail-closed boot YES (both reviewers);
+rollback slot-1 fallback ADOPTED; FRR migration PROCEED (no objection,
+frr_test.go:556/:604 pin behavior); dir fsync post-rename only CONFIRMED;
+ArchiveConfig Atomic KEPT (no objection); mechanical test update KEPT.
