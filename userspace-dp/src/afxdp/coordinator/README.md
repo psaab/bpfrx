@@ -21,6 +21,7 @@ the workers share.
 | `inject.rs` | `request inject-packet` RPC handler — synthesizes a packet against the live state, reports disposition. |
 | `neighbor_manager.rs` | `NeighborManager` — sharded ARP/NDP cache + netlink monitor for incremental updates. |
 | `session_manager.rs` | Cross-thread session-table state shared between coordinator, HA worker, and packet workers via `Arc<Mutex<...>>`. Holds the synced + nat + forward-wire tables together because they're written and queried as a unit. |
+| `snapshot_refresh.rs` | `refresh_runtime_snapshot{,_disarmed,_inner}` (armed/disarmed snapshot-apply legs: preflight, #1873 tunnel-remap purge, forwarding swap + stores, aux-thread reconcile, CoS owner-map + warm passes) and `refresh_fabric_links`. (#1890 split.) |
 | `status.rs` | Read-side snapshots for `show ...` queries. The exception is `drain_session_deltas`, which mutates per-binding state. |
 | `supervisor.rs` | `spawn_supervised_worker` / `spawn_supervised_aux` — catches panics, marks the worker dead on its `WorkerRuntimeAtomics`, captures a panic message into a per-worker slot. (#925 Phase 1.) |
 | `tunnel_supervision.rs` | GRE local-origin + WG control-thread LIFECYCLE (three-pass reconcile, tombstone backoff, periodic liveness sweeps, defer-branch snapshot prunes — see "Aux tunnel threads" below). The thread bodies live in `wg_control.rs` / `afxdp/tunnel.rs`; the entry maps (`tunnel_sources`, `wg_control_threads`) stay on `Coordinator` in `mod.rs`. (#1890 split.) |
