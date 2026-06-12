@@ -35,7 +35,7 @@ IPERF_DURATION=120      # seconds — long enough to span retries + reboot + fai
 IPERF_STREAMS=8
 MIN_SESSIONS=4          # minimum established sessions (control + some data streams)
 SYNC_WAIT=5             # seconds to wait for session sync sweep
-REBOOT_WAIT=60          # max seconds to wait for fw0 to come back
+REBOOT_WAIT=60          # max WALL-CLOCK seconds to wait for fw0 to come back (#1880)
 MIN_THROUGHPUT=1.0      # Gbps — iperf3 must report at least this
 
 PASS=0
@@ -183,11 +183,34 @@ else
 	fail "fw1 has only $fw1_sessions synced sessions (expected >= $MIN_SESSIONS)"
 fi
 
-# ── Phase 3: Reboot fw0 ─────────────────────────────────────────────
+# ── Phase 3: Crash fw0 (sysrq reboot) ───────────────────────────────
+#
+# sysrq-b is the repo's proven unclean primitive (same as
+# test-double-failover.sh): the guest resets instantly, with no unit
+# stops, no priority-0 VRRP burst, and no shutdown-job queueing. The
+# previous `reboot` here was a GRACEFUL systemd reboot despite the
+# "unclean" claim — xpfd got a clean stop (emitting the planned-shutdown
+# priority-0 burst, i.e. the ~1ms takeover path instead of the ~60ms
+# worst-case detection this test exists to exercise) AND the whole
+# shutdown queued behind any wedged stop job. The #1880 budget misses
+# were exactly that: post-deploy `systemctl reload frr` poisons
+# frr.service into a 2-minute stop-sigterm on FRR 10.6, and a graceful
+# reboot inside that window waited out the timer.
 
-info "Rebooting fw0 (unclean shutdown — tests worst-case failover)"
+info "Crashing fw0 (sysrq reboot — unclean shutdown, tests worst-case failover)"
 
-incus exec "$FW0" -- reboot 2>/dev/null || true
+# timeout is load-bearing AND needs -k: sysrq-b resets the guest
+# INSTANTLY, killing the incus-agent serving this exec, so the exec
+# never observes an exit status (measured: a 47-minute hang on the
+# first live run). Worse, `incus exec` FORWARDS SIGTERM to the (dead)
+# remote session instead of exiting (measured: `timeout 10` alone left
+# the client alive for 38+ minutes), so only the -k SIGKILL follow-up
+# reliably reaps the local client. `|| true` alone cannot save a
+# command that never returns.
+# Braces, not just 2>/dev/null on the command: bash prints its own
+# "Killed" job notice for the SIGKILLed child, which would land in the
+# test transcript as alarming noise.
+{ timeout -k 5 10 incus exec "$FW0" -- bash -c 'echo b > /proc/sysrq-trigger' || true; } 2>/dev/null
 
 # Wait for fw1 to detect failure and become primary
 sleep 3
@@ -203,11 +226,17 @@ fi
 
 info "Waiting for fw0 to reboot and rejoin as secondary (max ${REBOOT_WAIT}s)"
 
+# Wall-clock budget (#1880): the old `seq 1 $REBOOT_WAIT` loop counted
+# ITERATIONS as seconds, but each iteration costs ~1.2s (1s sleep +
+# ~240ms incus exec), so "60s" silently meant ~74s and the PASS message
+# under-reported by ~23%. Measured comebacks on the loss userspace
+# cluster: ~22s clean (sysrq), so 60s wall keeps ~2.7x headroom.
 fw0_back=false
-for i in $(seq 1 "$REBOOT_WAIT"); do
+wait_start=$SECONDS
+while (( SECONDS - wait_start < REBOOT_WAIT )); do
 	if wait_for_instance "$FW0" 1; then
 		fw0_back=true
-		info "fw0 xpfd active after ${i}s"
+		info "fw0 xpfd active after $((SECONDS - wait_start))s"
 		break
 	fi
 done

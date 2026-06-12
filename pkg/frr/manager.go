@@ -17,11 +17,15 @@ package frr
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -35,29 +39,156 @@ const (
 	markerBegin = "! BEGIN BPFRX MANAGED CONFIG - do not edit this section"
 	markerEnd   = "! END BPFRX MANAGED CONFIG"
 
-	// reloadTimeout is the maximum time we wait for `systemctl reload frr`
-	// or the `vtysh -f` fallback to complete before giving up. The systemd
-	// unit has TimeoutStopSec=20 as the outer safety net; this timeout is
-	// the inner shutdown-correctness invariant documented in
-	// docs/engineering-style.md.
+	// reloadTimeout bounds EACH reload shell-out independently: the
+	// primary `frr-reload.py --reload` gets its own 15s context and the
+	// `vtysh -f` fallback, when taken, gets a FRESH 15s context (a
+	// timed-out primary must not hand the fallback a dead context).
+	// Worst case on the apply path is therefore 30s plus up to two 5s
+	// WaitDelay teardown windows (≤40s). reload() runs on the apply path
+	// only — the daemon's shutdown sequence never reloads FRR (#1880
+	// measurement: the deploy-window reload came from `xpfd cleanup`,
+	// not the unit stop), so xpfd.service's TimeoutStopSec=20 is not in
+	// tension with this bound.
 	reloadTimeout = 15 * time.Second
+
+	// degradedRetrySlowDelay is the steady-state cadence of the
+	// degraded-retry loop once the initial backoff rungs are exhausted
+	// (and the immediate cadence when frr-pythontools is missing, where
+	// fast retries cannot succeed until the package is installed).
+	degradedRetrySlowDelay = 5 * time.Minute
 )
+
+// degradedRetryDelays are the initial backoff rungs of the
+// degraded-retry loop (#1880); after these, degradedRetrySlowDelay
+// applies forever (until convergence, supersession, or Stop).
+var degradedRetryDelays = []time.Duration{
+	15 * time.Second,
+	30 * time.Second,
+	60 * time.Second,
+}
+
+// ErrFRRReloadDegraded marks a reload that converged only via the
+// ADDITIVE `vtysh -f` fallback: every desired line was (re)applied but
+// stale config removal did not happen (the full frr-reload.py diff
+// failed). The manager's degraded-retry loop keeps re-running the
+// primary until a full diff converges; callers branch with errors.Is
+// to distinguish degraded from hard failure. (#1880)
+var ErrFRRReloadDegraded = errors.New("frr reload degraded: additive vtysh -f fallback applied, stale-config removal deferred")
 
 // Manager handles FRR config generation and state queries.
 type Manager struct {
 	frrConf string
-	// exec drives every vtysh / systemctl shell-out. Initialized in New().
-	// Tests inject a fake. A nil exec is tolerated via the executor()
-	// accessor — see executor() below.
+	// exec drives every vtysh / frr-reload.py shell-out. Initialized in
+	// New(). Tests inject a fake. A nil exec is tolerated via the
+	// executor() accessor — see executor() below.
 	exec frrExecutor
+
+	// reloadMu is the single-writer serialization point for FRR config
+	// (#1880): it covers the FULL write+reload critical section in
+	// ApplyFull/Clear (managed-section write, confGen bump, reload) AND
+	// every degraded-retry reload. confGen increments under reloadMu on
+	// every managed-section write; the retry captures it before the
+	// primary reload and refuses to clear the degraded state if it
+	// changed (a structural impossibility while the exec stays under
+	// reloadMu — kept as a fail-safe invariant against refactors that
+	// move the exec outside the lock).
+	reloadMu sync.Mutex
+	confGen  uint64
+
+	// degraded is 1 while the last APPLIED reload fell back to the
+	// additive vtysh -f path and the retry loop has not yet converged a
+	// full diff. Exported via ReloadDegraded() for the
+	// xpf_frr_reload_degraded Prometheus gauge.
+	degraded atomic.Bool
+
+	// retryMu guards the degraded-retry episode fields below. Lock
+	// order: reloadMu → retryMu (retryMu is a leaf).
+	retryMu      sync.Mutex
+	retryEnabled bool
+	retryCtx     context.Context
+	retryCancel  context.CancelFunc
+	retryDone    chan struct{}
+	retryWG      sync.WaitGroup
+
+	// retryDelays/retrySlow allow tests to compress the backoff; nil/0
+	// means the production degradedRetryDelays/degradedRetrySlowDelay.
+	retryDelays []time.Duration
+	retrySlow   time.Duration
+
+	// pytoolsWarnOnce gates the frr-pythontools-missing warning to one
+	// emission per manager lifetime (sync.Once — no extra lock
+	// traffic; AGY code-r1 f3).
+	pytoolsWarnOnce sync.Once
+
+	// mgrCtx is the manager lifetime: parent of every reload exec
+	// context and every retry episode, so Stop() kills in-flight
+	// frr-reload.py process groups and terminates the retry goroutine.
+	mgrCtx    context.Context
+	mgrCancel context.CancelFunc
 }
 
-// New creates a new FRR manager.
+// New creates a new FRR manager with the degraded-retry loop enabled
+// (the daemon configuration). One-shot consumers (`xpfd cleanup`) must
+// call DisableDegradedRetry; everyone constructing via New should
+// arrange for Stop() at teardown.
 func New() *Manager {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Manager{
-		frrConf: DefaultFRRConf,
-		exec:    realExecutor{},
+		frrConf:      DefaultFRRConf,
+		exec:         realExecutor{},
+		retryEnabled: true,
+		mgrCtx:       ctx,
+		mgrCancel:    cancel,
 	}
+}
+
+// DisableDegradedRetry marks this manager as one-shot: a degraded
+// reload outcome is reported to the caller but never schedules the
+// background retry loop. Used by `xpfd cleanup`, whose process exits
+// immediately after Clear(); its bounded-convergence story is the
+// deploy flow itself (the new daemon's first ApplyFull full-diffs any
+// residue). (#1880)
+func (m *Manager) DisableDegradedRetry() {
+	m.retryMu.Lock()
+	m.retryEnabled = false
+	m.retryMu.Unlock()
+}
+
+// ReloadDegraded reports whether the last applied FRR reload is still
+// in the degraded (additive-fallback) state. Backs the
+// xpf_frr_reload_degraded Prometheus gauge (0/1, no labels).
+func (m *Manager) ReloadDegraded() bool {
+	return m.degraded.Load()
+}
+
+// Stop cancels the manager lifetime context — killing any in-flight
+// frr-reload.py process group via its derived exec context — and waits
+// for the degraded-retry goroutine to exit. Wired into the daemon
+// shutdown sequence; safe to call multiple times and on managers that
+// never went degraded.
+func (m *Manager) Stop() {
+	// Disable BEFORE waiting (Codex code-r1 M1): an in-flight commit
+	// reaching its degraded handling after Stop() starts must not
+	// retryWG.Add a new episode behind the Wait (WaitGroup Add/Wait
+	// misuse + a leaked goroutine). retryEnabled is read and Add(1)
+	// happens under the same retryMu, so any ensure either completed
+	// its Add before this disable or observes it and spawns nothing.
+	m.retryMu.Lock()
+	m.retryEnabled = false
+	m.retryMu.Unlock()
+	if m.mgrCancel != nil {
+		m.mgrCancel()
+	}
+	m.retryWG.Wait()
+}
+
+// lifetimeCtx returns the manager lifetime context, tolerating
+// zero-value Managers (same contract as executor()).
+func (m *Manager) lifetimeCtx() context.Context {
+	if m.mgrCtx != nil {
+		return m.mgrCtx
+	}
+	return context.Background()
 }
 
 // executor returns m.exec if set, or a default realExecutor otherwise.
@@ -300,30 +431,58 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 		}
 	}
 
-	section := b.String()
+	return m.commitManagedSection(b.String())
+}
+
+// commitManagedSection is the single write+reload critical section
+// (#1880). It signal-cancels any pending degraded-retry episode FIRST
+// (an in-flight retry's frr-reload.py process group dies within one
+// WaitDelay window, so the apply waits at most ~5s behind it), then
+// holds reloadMu across the managed-section write, the confGen bump,
+// and the reload — preserving single-writer semantics against the
+// retry goroutine.
+//
+// Return contract: nil = full diff convergence; ErrFRRReloadDegraded
+// (errors.Is) = additive fallback applied, retry scheduled when
+// enabled; other errors = nothing converged.
+func (m *Manager) commitManagedSection(section string) error {
+	m.signalRetryCancel()
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+	// Re-arm guard (Codex code-r1 H1, runs BEFORE the unlock above by
+	// LIFO order): the pre-cancel assumed this commit supersedes the
+	// degraded state, but a failed write (early return below) or a
+	// hard reload failure leaves degraded=true with the old episode
+	// already cancelled — without this, stale-config removal would
+	// never retry until the next commit or restart. ensureRetryLocked
+	// is idempotent against the episode the degraded outcome itself
+	// may have just scheduled.
+	defer func() {
+		if m.degraded.Load() {
+			m.ensureRetryLocked(false)
+		}
+	}()
 
 	if err := m.writeManagedSection(section); err != nil {
 		return err
 	}
+	m.confGen++
+	slog.Info("FRR config written", "path", m.frrConf, "generation", m.confGen)
 
-	slog.Info("FRR config written", "path", m.frrConf)
-
-	// Reload FRR (frr-reload.py diffs running vs on-disk config)
-	if err := m.reload(); err != nil {
+	err := m.reloadLocked()
+	m.noteReloadOutcomeLocked(err)
+	if err != nil && !errors.Is(err, ErrFRRReloadDegraded) {
 		slog.Warn("FRR reload failed", "err", err)
-		return err
 	}
-
-	return nil
+	return err
 }
 
 // Clear removes the xpf managed section from frr.conf and reloads FRR.
+// Unlike the historical version it PROPAGATES the reload outcome
+// (including ErrFRRReloadDegraded) instead of discarding it — `xpfd
+// cleanup` logs it loudly while still exiting 0 (#1880).
 func (m *Manager) Clear() error {
-	if err := m.writeManagedSection(""); err != nil {
-		return err
-	}
-	_ = m.reload()
-	return nil
+	return m.commitManagedSection("")
 }
 
 // writeManagedSection replaces the xpf-managed section in frr.conf.
@@ -517,24 +676,243 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	return nil
 }
 
-// reload reloads FRR via systemctl, falling back to vtysh -f if systemctl
-// reload fails. The 15s context timeout is the inner shutdown-correctness
-// invariant — see reloadTimeout for the rationale.
-func (m *Manager) reload() error {
-	ctx, cancel := context.WithTimeout(context.Background(), reloadTimeout)
-	defer cancel()
-
-	// Try systemctl reload first (runs frr-reload.py which diffs running vs frr.conf)
-	if err := m.executor().SystemctlReload(ctx); err == nil {
-		slog.Info("FRR reloaded via systemctl")
+// reloadLocked reloads FRR. Caller must hold reloadMu.
+//
+// Primary: a DIRECT bounded `frr-reload.py --reload` — never
+// `systemctl reload frr`. On FRR 10.6 the unit's ExecReload restarts
+// watchfrr (the Type=forking MainPID), so every systemd-mediated
+// reload cancels its own job, parks frr.service in stop-sigterm for 2
+// minutes, and ends with systemd SIGKILLing all FRR daemons. That
+// poison window was queueing harness reboots behind the 2-minute
+// timer (#1880) and meant the systemctl branch had been 100%-failing —
+// every reload silently ran the additive fallback, breaking
+// stale-config removal on commit.
+//
+// Fallback: `vtysh -f` under a FRESH 15s context (never the primary's
+// possibly-dead one). The fallback is additive-convergent — desired
+// lines are (re)applied, only stale removals can be missed — which the
+// degraded-retry loop then converges. Fallback success returns
+// ErrFRRReloadDegraded (wrapping the primary cause, so errors.Is can
+// still see exec.ErrNotFound / fs ENOENT for the pythontools-missing
+// classification).
+func (m *Manager) reloadLocked() error {
+	pctx, pcancel := context.WithTimeout(m.lifetimeCtx(), reloadTimeout)
+	perr := m.executor().FrrReloadPy(pctx, m.frrConf)
+	pcancel()
+	if perr == nil {
+		slog.Info("FRR reloaded via frr-reload.py (full diff)")
 		return nil
 	}
+	if isFrrReloadPyMissing(perr) {
+		m.warnPytoolsOnce(perr)
+	} else {
+		slog.Warn("frr-reload.py reload failed; falling back to additive vtysh -f", "err", perr)
+	}
 
-	// Fallback: load config directly via vtysh
-	output, err := m.executor().VtyshLoad(ctx, m.frrConf)
+	fctx, fcancel := context.WithTimeout(m.lifetimeCtx(), reloadTimeout)
+	defer fcancel()
+	output, err := m.executor().VtyshLoad(fctx, m.frrConf)
 	if err != nil {
 		return fmt.Errorf("vtysh reload: %w: %s", err, string(output))
 	}
-	slog.Info("FRR config loaded via vtysh")
-	return nil
+	slog.Warn("FRR config loaded via additive vtysh -f (degraded: stale-config removal deferred to retry)")
+	return fmt.Errorf("%w: %w", ErrFRRReloadDegraded, perr)
+}
+
+// isFrrReloadPyMissing classifies a primary-reload error as
+// "frr-reload.py is not installed" (frr-pythontools absent).
+// exec.CommandContext with an absolute path surfaces fs ENOENT;
+// exec.ErrNotFound covers the LookPath shape for completeness.
+func isFrrReloadPyMissing(err error) bool {
+	return errors.Is(err, os.ErrNotExist) || errors.Is(err, exec.ErrNotFound)
+}
+
+// warnPytoolsOnce logs the frr-pythontools-missing warning once per
+// manager lifetime (the degraded retry would otherwise repeat it every
+// 5 minutes forever).
+func (m *Manager) warnPytoolsOnce(err error) {
+	m.pytoolsWarnOnce.Do(func() {
+		slog.Warn("frr-pythontools not installed — FRR reload degraded to additive vtysh -f until it is",
+			"script", frrReloadScript, "err", err)
+	})
+}
+
+// noteReloadOutcomeLocked updates the degraded state machine after a
+// reload. Caller must hold reloadMu.
+//
+//   - nil: full diff converged — clear the gauge and signal-cancel any
+//     pending retry episode (AGY r3 f2: a woken redundant retry must
+//     exit without exec'ing, so its own transient failure can never
+//     spuriously re-set the gauge).
+//   - ErrFRRReloadDegraded: set the gauge and ensure a retry episode
+//     (when enabled). A pythontools-missing cause starts the retry at
+//     the slow cadence directly.
+//   - other errors: nothing was applied at all; the gauge keeps
+//     reflecting the last APPLIED reload and the error propagates to
+//     the caller (warn-and-continue at commit, loud log at cleanup).
+func (m *Manager) noteReloadOutcomeLocked(err error) {
+	switch {
+	case err == nil:
+		m.degraded.Store(false)
+		m.signalRetryCancel()
+	case errors.Is(err, ErrFRRReloadDegraded):
+		m.degraded.Store(true)
+		m.ensureRetryLocked(isFrrReloadPyMissing(err))
+	}
+}
+
+// signalRetryCancel cancels the current retry episode WITHOUT waiting
+// for the goroutine to exit (it may be blocked on reloadMu, which the
+// caller can hold — waiting here would deadlock). The cancelled
+// goroutine self-cleans its episode fields and is reaped by retryWG at
+// Stop(). Idempotent.
+func (m *Manager) signalRetryCancel() {
+	m.retryMu.Lock()
+	cancel := m.retryCancel
+	m.retryMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// ensureRetryLocked spawns the single-flight degraded-retry episode if
+// none is live. Caller must hold reloadMu (lock order reloadMu →
+// retryMu). slowStart skips the fast backoff rungs (pythontools
+// missing — fast retries cannot succeed).
+func (m *Manager) ensureRetryLocked(slowStart bool) {
+	m.retryMu.Lock()
+	defer m.retryMu.Unlock()
+	if !m.retryEnabled {
+		return
+	}
+	// No manager lifetime context (zero-value / legacy literal
+	// Managers) means no Stop() can ever cancel or reap an episode —
+	// never spawn one (AGY code-r1 f2). Only New() managers, which own
+	// mgrCtx/mgrCancel, run the background retry.
+	if m.mgrCtx == nil {
+		return
+	}
+	// A live (non-cancelled) episode already covers us. A
+	// cancelled-but-draining episode does not — spawn a fresh one; the
+	// drainer's self-clean is identity-guarded so it cannot clobber the
+	// new episode's fields.
+	if m.retryDone != nil && m.retryCtx != nil && m.retryCtx.Err() == nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(m.lifetimeCtx())
+	done := make(chan struct{})
+	m.retryCtx, m.retryCancel, m.retryDone = ctx, cancel, done
+	start := 0
+	if slowStart {
+		start = len(m.retryDelaysOrDefault())
+	}
+	m.retryWG.Add(1)
+	go func() {
+		defer m.retryWG.Done()
+		m.degradedRetryLoop(ctx, done, start)
+	}()
+}
+
+func (m *Manager) retryDelaysOrDefault() []time.Duration {
+	if m.retryDelays != nil {
+		return m.retryDelays
+	}
+	return degradedRetryDelays
+}
+
+func (m *Manager) retrySlowOrDefault() time.Duration {
+	if m.retrySlow > 0 {
+		return m.retrySlow
+	}
+	return degradedRetrySlowDelay
+}
+
+// degradedRetryLoop re-runs the PRIMARY reload (no nested fallback)
+// until a full diff converges, the episode is superseded/cancelled, or
+// the manager stops. frr.conf on disk is the SSOT: every attempt
+// reloads the file as it stands, so a newer ApplyFull/Clear supersedes
+// automatically.
+func (m *Manager) degradedRetryLoop(ctx context.Context, myDone chan struct{}, attempt int) {
+	defer close(myDone)
+	defer m.clearEpisodeIfMine(myDone)
+	delays := m.retryDelaysOrDefault()
+	for {
+		var d time.Duration
+		if attempt < len(delays) {
+			d = delays[attempt]
+		} else {
+			d = m.retrySlowOrDefault()
+		}
+		timer := time.NewTimer(d)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		stop, notFound := m.retryReloadOnce(ctx)
+		if stop {
+			return
+		}
+		if notFound {
+			attempt = len(delays) // jump to the slow cadence
+		} else {
+			attempt++
+		}
+	}
+}
+
+// retryReloadOnce performs one degraded-retry attempt under reloadMu.
+// Returns stop=true when the episode is finished (converged, cancelled,
+// or superseded by an apply that already cleared the degraded state).
+func (m *Manager) retryReloadOnce(ctx context.Context) (stop, notFound bool) {
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+	// Both checks run INSIDE the critical section: a commit that
+	// cancelled/converged while we were waiting for reloadMu must win
+	// (no TOCTOU between gauge state and exec).
+	if ctx.Err() != nil {
+		return true, false
+	}
+	if !m.degraded.Load() {
+		return true, false
+	}
+	gen := m.confGen
+	rctx, rcancel := context.WithTimeout(ctx, reloadTimeout)
+	defer rcancel()
+	if err := m.executor().FrrReloadPy(rctx, m.frrConf); err != nil {
+		nf := isFrrReloadPyMissing(err)
+		if nf {
+			m.warnPytoolsOnce(err)
+		} else {
+			slog.Warn("FRR degraded-retry reload failed", "err", err)
+		}
+		return false, nf
+	}
+	if m.confGen != gen {
+		// Invariant assertion (#1880 plan r4): confGen cannot change
+		// while reloadMu is held — writes bump it under the same mutex.
+		// Kept so a refactor that moves the exec outside the lock fails
+		// SAFE: a stale success must never clear the degraded state.
+		slog.Warn("FRR degraded-retry succeeded against a stale generation; retrying",
+			"have", gen, "latest", m.confGen)
+		return false, false
+	}
+	m.degraded.Store(false)
+	slog.Info("FRR reload converged after degraded fallback", "generation", gen)
+	return true, false
+}
+
+// clearEpisodeIfMine nils the episode fields iff they still belong to
+// this goroutine (identity via the done channel) — a drainer from a
+// superseded episode must not clobber its successor's fields.
+func (m *Manager) clearEpisodeIfMine(myDone chan struct{}) {
+	m.retryMu.Lock()
+	defer m.retryMu.Unlock()
+	if m.retryDone == myDone {
+		if m.retryCancel != nil {
+			m.retryCancel() // release the ctx's resources
+		}
+		m.retryCtx, m.retryCancel, m.retryDone = nil, nil, nil
+	}
 }

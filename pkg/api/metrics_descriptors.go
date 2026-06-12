@@ -240,6 +240,14 @@ func newCollector(srv *Server) *xpfCollector {
 				"syscall (#1780).",
 			[]string{"phase"}, nil,
 		),
+		frrReloadDegraded: prometheus.NewDesc(
+			"xpf_frr_reload_degraded",
+			"1 while the last applied FRR reload fell back to the additive "+
+				"vtysh -f path (full frr-reload.py diff failed) and the "+
+				"in-manager retry has not yet converged; stale-config "+
+				"removal is deferred while set (#1880).",
+			nil, nil,
+		),
 		configPersistDegraded: prometheus.NewDesc(
 			"xpf_daemon_config_persist_degraded",
 			"1 while the running active configuration failed to persist "+

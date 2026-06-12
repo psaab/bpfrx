@@ -21,6 +21,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"strings"
@@ -158,8 +159,17 @@ func (d *Daemon) applyFRRConfig(fc *frr.FullConfig) {
 	if d.frr == nil {
 		return
 	}
+	// Warn-and-continue on FRR reload problems: an FRR hiccup must not
+	// fail an otherwise-valid commit. Degraded (#1880) means the config
+	// WAS applied additively and the manager's retry loop owns
+	// convergence of stale-config removal; the gauge
+	// xpf_frr_reload_degraded is 1 until it converges.
 	if err := d.frr.ApplyFull(fc); err != nil {
-		slog.Warn("failed to apply FRR config", "err", err)
+		if errors.Is(err, frr.ErrFRRReloadDegraded) {
+			slog.Warn("FRR reload degraded: additive vtysh -f applied; stale-config removal deferred to the in-manager retry", "err", err)
+		} else {
+			slog.Warn("failed to apply FRR config", "err", err)
+		}
 	}
 
 	// Set L4 ECMP hash when consistent-hash is configured.

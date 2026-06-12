@@ -37,8 +37,25 @@ func main() {
 		}
 		// Remove fabric IPVLAN interfaces created by the daemon.
 		daemon.CleanupFabricIPVLANs()
-		// Also clear FRR managed routes so the kernel routing table is clean.
-		frr.New().Clear()
+		// Also clear FRR managed routes so the kernel routing table is
+		// clean. One-shot contract (#1880): no degraded-retry loop in
+		// this short-lived process; a degraded/failed reload is logged
+		// LOUDLY but keeps exit status 0 — deploy tooling wraps cleanup
+		// in `|| true`, and the deploy flow itself bounds convergence
+		// (the new daemon's first ApplyFull full-diffs any residue).
+		// Critically, Clear() never runs `systemctl reload frr`: the
+		// FRR 10.6 ExecReload bounces watchfrr (the unit MainPID) and
+		// parks frr.service in a 2-minute stop-sigterm that queued
+		// post-deploy reboots behind it (the #1880 failover-harness
+		// budget misses) and ended in systemd SIGKILLing FRR.
+		fm := frr.New()
+		fm.DisableDegradedRetry()
+		if err := fm.Clear(); err != nil {
+			fmt.Fprintf(os.Stderr, "cleanup: FRR managed-section clear: %v\n"+
+				"  frr.conf was rewritten without the managed section, but the running\n"+
+				"  FRR config may retain it until the next xpfd start reapplies FRR.\n", err)
+		}
+		fm.Stop()
 		fmt.Println("all pinned BPF state and managed routes removed")
 		return
 	}
