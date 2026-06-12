@@ -127,6 +127,25 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, cfg *Config, 
 	consumed, descendSchema := consumeNodeKeys(node.Keys, childSchema)
 	newPath := append(append([]string(nil), path...), node.Keys[:consumed]...)
 
+	// Typed KEY slot (#1319 PR 3): a named-instance container with a
+	// keyValidator validates the identity arg token(s) packed into this
+	// node's Keys (e.g. the 10.0.1.10/24 in `address 10.0.1.10/24 {
+	// primary; }`). Only the declared arg span is validated — a compound
+	// sub-token is a keyword, not a value, and tokens past the identity
+	// are ignored per the compiler-faithful contract.
+	if childSchema.keyValidator != nil {
+		argEnd := declaredKeyTokens
+		if argEnd > len(node.Keys) {
+			argEnd = len(node.Keys)
+		}
+		keyPath := append(append([]string(nil), path...), keyword)
+		for _, tok := range node.Keys[1:argEnd] {
+			if err := childSchema.keyValidator(tok, cfg); err != nil {
+				return typedLeafInvalidErrorf(keyPath, tok, err)
+			}
+		}
+	}
+
 	// Dual AST shape: a schema node with args>0 packs the instance name(s)
 	// into Keys in flat-set form (`schedulers be` → Keys=["schedulers",
 	// "be"]) but presents them as nested AST children in hierarchical form
@@ -162,6 +181,16 @@ func walkInstanceChildren(node *Node, containerSchema *schemaNode, remaining int
 	consume := len(node.Keys)
 	if consume > remaining {
 		consume = remaining
+	}
+	// Typed KEY slot (#1319 PR 3): the peeled tokens ARE the instance
+	// name the compiler reads (namedInstances handles this nested shape
+	// too), so a key-typed container validates them here as well.
+	if containerSchema.keyValidator != nil {
+		for _, tok := range node.Keys[:consume] {
+			if err := containerSchema.keyValidator(tok, cfg); err != nil {
+				return typedLeafInvalidErrorf(path, tok, err)
+			}
+		}
 	}
 	newPath := append(append([]string(nil), path...), node.Keys[:consume]...)
 	if stillMissing := remaining - consume; stillMissing > 0 {

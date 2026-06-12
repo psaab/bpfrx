@@ -49,6 +49,23 @@ type schemaNode struct {
 	valueDesc     string        // one-line value-slot description for `?` help
 	valueExamples []string      // illustrative values surfaced in `?` help
 	validator     LeafValidator // commit-check validator for the value slot
+
+	// Typed KEY slot (#1319 PR 3). A named-instance CONTAINER (args > 0
+	// with a children map, e.g. `family inet address <cidr> { primary; }`)
+	// carries its value in the IDENTITY token, not in a leaf value slot —
+	// the walker consumes identity tokens without validation by default
+	// (the compiler-faithful contract from PR 2). Setting keyValidator
+	// opts the identity arg token(s) in to commit-check validation, and
+	// keyValueType/keyValueDesc/keyValueExamples surface in `?` completion
+	// for the empty key slot. The regular valueType/validator fields MUST
+	// stay unset on such a node: setting valueType would flip the walker
+	// into the typed-LEAF branch, which treats children as modifiers and
+	// would mis-validate the container's real block children. Not
+	// supported on midKeyword nodes (no current need).
+	keyValueType     ValueType     // non-ValueAny marks a typed identity-arg slot
+	keyValueDesc     string        // one-line key-slot description for `?` help
+	keyValueExamples []string      // illustrative key values surfaced in `?` help
+	keyValidator     LeafValidator // commit-check validator for identity arg tokens
 }
 
 // isTypedLeaf reports whether the node carries typed-value metadata
@@ -356,9 +373,41 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			}},
 		}},
 	}},
+	// #1319 PR 3 typed leaves (interfaces subsystem). Same fields-only
+	// discipline as the chassis PR 2 block: no children/args/multi
+	// changes, ranges derived from what the runtime actually consumes
+	// (cited per leaf). The `address` nodes use the typed-KEY-slot
+	// feature (keyValidator) because their value is a named-instance
+	// identity token, not a leaf value. Deliberately NOT typed:
+	// `unit <n>` / `vrrp-group <id>` instance ids (same deferral class
+	// as the chassis PR-2 redundancy-group/node ids: garbage ids make
+	// the compiler silently drop the instance, but these ids are
+	// cross-referenced from other subsystems — e.g. class-of-service
+	// `interfaces <if> unit <n>` — and deserve one dedicated pass that
+	// types every referencing slot together), `track-interface
+	// priority-cost`
+	// (already strict-rejected by the #1814 AST pre-walk in the
+	// compiler — typing here would shadow those curated errors), the
+	// dhcp/dhcpv6 client knobs and tunnel keepalives (deferred:
+	// low-risk pass-through integers), `speed`/`duplex`/`encapsulation`
+	// (free-form pass-through strings).
 	"interfaces": {desc: "Interface configuration", wildcard: &schemaNode{valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: map[string]*schemaNode{
-		"description":           {desc: "Text description of interface", args: 1, children: nil},
-		"mtu":                   {desc: "Maximum transmit packet size", args: 1, children: nil},
+		"description": {desc: "Text description of interface", args: 1, children: nil},
+		// Compiled verbatim (compiler_interfaces.go:44, Atoi with the
+		// error swallowed → garbage silently means "MTU not set", the
+		// zero-value sentinel) and passed through to networkd MTUBytes=
+		// and the dataplane interface snapshot. Min-only per the
+		// no-schema-only-caps doctrine: the kernel/driver owns the real
+		// ceiling and rejects loudly.
+		"mtu": {
+			desc:          "Maximum transmit packet size",
+			args:          1,
+			valueType:     ValueInteger,
+			valueDesc:     "MTU in bytes (>= 1; kernel/driver enforces its own ceiling)",
+			valueExamples: []string{"1500", "9000"},
+			validator:     ValidateIntegerMin(1),
+			children:      nil,
+		},
 		"speed":                 {desc: "Link speed", args: 1, children: nil},
 		"duplex":                {desc: "Link duplex mode", args: 1, children: nil},
 		"bandwidth":             {desc: "Interface bandwidth", args: 1, children: nil},
@@ -385,57 +434,143 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		"fabric-options": {desc: "Fabric interface options", children: map[string]*schemaNode{
 			"member-interfaces": {desc: "Member interfaces", children: nil},
 		}},
-		"tunnel": {desc: "Tunnel parameters", children: map[string]*schemaNode{
-			"source":          {desc: "Tunnel source address", args: 1, children: nil},
-			"destination":     {desc: "Tunnel destination address", args: 1, children: nil},
-			"mode":            {desc: "Tunnel mode", args: 1, children: nil},
-			"key":             {desc: "Tunnel key", args: 1, children: nil},
-			"ttl":             {desc: "Time to live", args: 1, children: nil},
-			"keepalive":       {desc: "Keepalive interval", args: 1, children: nil},
-			"keepalive-retry": {desc: "Keepalive retry count", args: 1, children: nil},
-			"routing-instance": {desc: "Routing instance", children: map[string]*schemaNode{
-				"destination": {desc: "Destination routing instance", args: 1, children: nil},
-			}},
-			"wireguard": wireguardSchemaNode(),
-		}},
+		"tunnel": {desc: "Tunnel parameters", children: tunnelSchemaChildren()},
 		"unit": {desc: "Logical unit number", args: 1, valueHint: ValueHintUnitNumber, placeholder: "<unit-number>", children: map[string]*schemaNode{
 			"description":    {desc: "Text description", args: 1, placeholder: "<text>", children: nil},
 			"point-to-point": {desc: "Point-to-point interface", children: nil},
-			"vlan-id":        {desc: "VLAN ID", args: 1, placeholder: "<number>", children: nil},
-			"inner-vlan-id":  {desc: "Inner VLAN ID", args: 1, placeholder: "<number>", children: nil},
-			"tunnel": {desc: "Tunnel parameters", children: map[string]*schemaNode{
-				"source":          {desc: "Tunnel source address", args: 1, placeholder: "<address>", children: nil},
-				"destination":     {desc: "Tunnel destination address", args: 1, placeholder: "<address>", children: nil},
-				"mode":            {desc: "Tunnel mode", args: 1, placeholder: "<mode>", children: nil},
-				"key":             {desc: "Tunnel key", args: 1, placeholder: "<key>", children: nil},
-				"ttl":             {desc: "Time to live", args: 1, placeholder: "<number>", children: nil},
-				"keepalive":       {desc: "Keepalive interval", args: 1, placeholder: "<seconds>", children: nil},
-				"keepalive-retry": {desc: "Keepalive retry count", args: 1, placeholder: "<number>", children: nil},
-				"routing-instance": {desc: "Routing instance", children: map[string]*schemaNode{
-					"destination": {desc: "Destination routing instance", args: 1, placeholder: "<name>", children: nil},
-				}},
-				"wireguard": wireguardSchemaNode(),
-			}},
+			// 802.1Q VID is a 12-bit wire field: 0 is the compiler's
+			// "untagged" zero-value sentinel and 4095 is reserved, so
+			// 1..4094 is exactly the encodable range (networkd's VLAN
+			// .netdev Id= enforces the same ceiling). Compiled with the
+			// Atoi error swallowed (compiler_interfaces.go:293/:302) —
+			// garbage silently meant "no VLAN" before this gate.
+			"vlan-id": {
+				desc:          "VLAN ID",
+				args:          1,
+				placeholder:   "<number>",
+				valueType:     ValueInteger,
+				valueDesc:     "802.1Q VLAN ID (1..4094)",
+				valueExamples: []string{"50", "80"},
+				validator:     ValidateInteger(1, 4094),
+				children:      nil,
+			},
+			"inner-vlan-id": {
+				desc:          "Inner VLAN ID",
+				args:          1,
+				placeholder:   "<number>",
+				valueType:     ValueInteger,
+				valueDesc:     "Inner (QinQ) 802.1Q VLAN ID (1..4094)",
+				valueExamples: []string{"100"},
+				validator:     ValidateInteger(1, 4094),
+				children:      nil,
+			},
+			"tunnel": {desc: "Tunnel parameters", children: tunnelSchemaChildren()},
 			"family": {desc: "Protocol family", compoundKey: true, children: map[string]*schemaNode{
 				"inet": {desc: "IPv4 protocol", children: map[string]*schemaNode{
-					"mtu": {desc: "Maximum transmit packet size", args: 1, placeholder: "<size>", children: nil},
-					"address": {desc: "IPv4 address", args: 1, placeholder: "<address>", children: map[string]*schemaNode{
-						"primary":   {desc: "Primary address", children: nil},
-						"preferred": {desc: "Preferred address", children: nil},
-						"vrrp-group": {desc: "VRRP group", args: 1, placeholder: "<group-id>", children: map[string]*schemaNode{
-							"virtual-address":     {desc: "Virtual IP address", args: 1, multi: true, placeholder: "<address>", children: nil},
-							"priority":            {desc: "VRRP priority", args: 1, placeholder: "<1..255>", children: nil},
-							"preempt":             {desc: "Allow preemption", children: nil},
-							"accept-data":         {desc: "Accept packets sent to the virtual address", children: nil},
-							"advertise-interval":  {desc: "Advertisement interval", args: 1, placeholder: "<seconds>", children: nil},
-							"authentication-type": {desc: "Authentication type", args: 1, placeholder: "<type>", children: nil},
-							"authentication-key":  {desc: "Authentication key", args: 1, placeholder: "<key>", children: nil},
-							"track-interface": {desc: "Interface to track", args: 1, placeholder: "<interface>", children: map[string]*schemaNode{
-								"priority-cost": {desc: "Priority cost subtracted while the tracked interface is down", args: 1, placeholder: "<1..254>", children: nil},
+					// Compiled verbatim (compiler_interfaces.go:539); same
+					// pass-through contract as the interface-level mtu.
+					"mtu": {
+						desc:          "Maximum transmit packet size",
+						args:          1,
+						placeholder:   "<size>",
+						valueType:     ValueInteger,
+						valueDesc:     "MTU in bytes (>= 1; kernel/driver enforces its own ceiling)",
+						valueExamples: []string{"1500"},
+						validator:     ValidateIntegerMin(1),
+						children:      nil,
+					},
+					// Typed KEY slot: the address value is this container's
+					// identity token. Every runtime consumer net.ParseCIDRs
+					// configured addresses and SILENTLY SKIPS unparseable
+					// ones (dataplane snapshot interfaces.go:391-394,
+					// networkd Address= lines, RETH/VIP/RA walks), so a
+					// bare IP or typo committed fine and then didn't exist.
+					// Family rule mirrors the runtime ip.To4() split.
+					"address": {
+						desc:             "IPv4 address",
+						args:             1,
+						placeholder:      "<address>",
+						keyValueType:     ValueCIDR,
+						keyValueDesc:     "IPv4 address with prefix length (e.g. 10.0.1.10/24)",
+						keyValueExamples: []string{"10.0.1.10/24"},
+						keyValidator:     ValidateIPv4CIDR,
+						children: map[string]*schemaNode{
+							"primary":   {desc: "Primary address", children: nil},
+							"preferred": {desc: "Preferred address", children: nil},
+							"vrrp-group": {desc: "VRRP group", args: 1, placeholder: "<group-id>", children: map[string]*schemaNode{
+								// xpf-DIVERGENT from Junos (bare IP): the VIP
+								// string is netlink.ParseAddr'd verbatim when
+								// the group masters (pkg/vrrp/instance.go:1076)
+								// and that parser REQUIRES a /prefix — a bare
+								// Junos-style virtual-address still gets
+								// advertised (sendAdvert strips an optional
+								// prefix, instance.go:897) but the address is
+								// never installed on the interface: a silent
+								// half-working group. VRRPConfig documents the
+								// CIDR contract (pkg/vrrp/vrrp.go:20).
+								"virtual-address": {
+									desc:          "Virtual IP address",
+									args:          1,
+									multi:         true,
+									placeholder:   "<address>",
+									valueType:     ValueCIDR,
+									valueDesc:     "Virtual IPv4 address with prefix length (e.g. 10.0.1.1/24; xpf requires the prefix, unlike Junos)",
+									valueExamples: []string{"10.0.1.1/24"},
+									validator:     ValidateIPv4CIDR,
+									children:      nil,
+								},
+								// VRRP priority is one wire byte
+								// (pkg/vrrp/instance.go:918 uint8); 0 is the
+								// "unset → default 100" compiler sentinel and
+								// also the RFC 5798 resignation value, 255 is
+								// the valid IP-owner priority (instance.go:256).
+								// Junos: 1..255 — identical.
+								"priority": {
+									desc:          "VRRP priority",
+									args:          1,
+									placeholder:   "<1..255>",
+									valueType:     ValueInteger,
+									valueDesc:     "VRRP priority (1..255; 255 = address owner)",
+									valueExamples: []string{"100", "200", "255"},
+									validator:     ValidateInteger(1, 255),
+									children:      nil,
+								},
+								"preempt":     {desc: "Allow preemption", children: nil},
+								"accept-data": {desc: "Accept packets sent to the virtual address", children: nil},
+								// Seconds. xpf-DIVERGENT from Junos (1..255 s):
+								// the value is converted seconds→ms
+								// (pkg/vrrp/vrrp.go:58) then ms→centiseconds
+								// (instance.go:915) into the 12-bit VRRPv3
+								// Max Advert Int field, so 40 s (4000 cs) is
+								// the last whole-second value that encodes;
+								// 41 s (4100 cs) overflows the 0x0FFF wire
+								// mask and aliases. 0 = unset → default 1 s
+								// (vrrp.go:55).
+								"advertise-interval": {
+									desc:          "Advertisement interval",
+									args:          1,
+									placeholder:   "<seconds>",
+									valueType:     ValueInteger,
+									valueDesc:     "Advertisement interval in seconds (1..40; VRRPv3 12-bit centisecond wire field — Junos allows up to 255)",
+									valueExamples: []string{"1", "5"},
+									validator:     ValidateInteger(1, 40),
+									children:      nil,
+								},
+								"authentication-type": {desc: "Authentication type", args: 1, placeholder: "<type>", children: nil},
+								"authentication-key":  {desc: "Authentication key", args: 1, placeholder: "<key>", children: nil},
+								// priority-cost stays untyped: the #1814 AST
+								// pre-walk in the compiler already strict-
+								// rejects out-of-range costs with curated
+								// errors (validateVRRPTrackInterfaceAST /
+								// parseTrackCost, compiler_interfaces.go:791);
+								// typing it here would shadow them.
+								"track-interface": {desc: "Interface to track", args: 1, placeholder: "<interface>", children: map[string]*schemaNode{
+									"priority-cost": {desc: "Priority cost subtracted while the tracked interface is down", args: 1, placeholder: "<1..254>", children: nil},
+								}},
+								"track-priority-cost": {desc: "Priority cost when tracked interface fails", args: 1, placeholder: "<cost>", children: nil},
 							}},
-							"track-priority-cost": {desc: "Priority cost when tracked interface fails", args: 1, placeholder: "<cost>", children: nil},
-						}},
-					}},
+						},
+					},
 					"dhcp": {desc: "DHCP client", children: map[string]*schemaNode{
 						"lease-time":              {desc: "Lease time", args: 1, placeholder: "<seconds>", children: nil},
 						"retransmission-attempt":  {desc: "Retransmission attempts", args: 1, placeholder: "<number>", children: nil},
@@ -452,12 +587,34 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					}},
 				}},
 				"inet6": {desc: "IPv6 protocol", children: map[string]*schemaNode{
-					"mtu":         {desc: "Maximum transmit packet size", args: 1, placeholder: "<size>", children: nil},
+					// Compiled at compiler_interfaces.go:578 (the lower of
+					// the per-family values wins); same pass-through
+					// contract as the interface-level mtu.
+					"mtu": {
+						desc:          "Maximum transmit packet size",
+						args:          1,
+						placeholder:   "<size>",
+						valueType:     ValueInteger,
+						valueDesc:     "MTU in bytes (>= 1; kernel/driver enforces its own ceiling)",
+						valueExamples: []string{"1500"},
+						validator:     ValidateIntegerMin(1),
+						children:      nil,
+					},
 					"dad-disable": {desc: "Disable duplicate address detection", children: nil},
-					"address": {desc: "IPv6 address", args: 1, placeholder: "<address>", children: map[string]*schemaNode{
-						"primary":   {desc: "Primary address", children: nil},
-						"preferred": {desc: "Preferred address", children: nil},
-					}},
+					// Typed KEY slot — see the family inet address comment.
+					"address": {
+						desc:             "IPv6 address",
+						args:             1,
+						placeholder:      "<address>",
+						keyValueType:     ValueCIDR,
+						keyValueDesc:     "IPv6 address with prefix length (e.g. 2001:db8::1/64)",
+						keyValueExamples: []string{"2001:db8::1/64"},
+						keyValidator:     ValidateIPv6CIDR,
+						children: map[string]*schemaNode{
+							"primary":   {desc: "Primary address", children: nil},
+							"preferred": {desc: "Preferred address", children: nil},
+						},
+					},
 					"sampling": {desc: "Traffic sampling", children: map[string]*schemaNode{
 						"input":  {desc: "Sample input traffic", children: nil},
 						"output": {desc: "Sample output traffic", children: nil},
@@ -1599,22 +1756,115 @@ func init() {
 	}
 }
 
+// tunnelSchemaChildren returns the config-mode schema children for the
+// `tunnel { ... }` stanza, shared between the physical-interface and
+// unit-level positions (the compiler parses both with the same property
+// switch, compiler_interfaces.go:153 / :241). #1319 PR 3 typed leaves:
+//
+//   - source / destination: the runtime net.ParseIPs both families
+//     (pkg/routing/tunnel.go:194-195; Gretun auto-selects gre vs ip6gre)
+//     and an unparseable address silently skips tunnel creation.
+//   - ttl: stored verbatim by the compiler, then truncated to the
+//     netlink uint8 Ttl field (tunnel.go:218/:226/:235) — 256 would
+//     silently wrap to 0. 0 = kernel default (inherit).
+//   - key: compiled via uint32(Atoi) (compiler_interfaces.go:168/:262),
+//     so negatives and values past 2^32-1 silently wrap; the GRE key
+//     wire field (IKey/OKey, tunnel.go:238-239) is exactly 32 bits.
+//   - keepalive / keepalive-retry: deliberately untyped (pass-through
+//     integers consumed by the keepalive prober only when > 0).
+func tunnelSchemaChildren() map[string]*schemaNode {
+	return map[string]*schemaNode{
+		"source": {
+			desc:          "Tunnel source address",
+			args:          1,
+			placeholder:   "<address>",
+			valueType:     ValueIPAddress,
+			valueDesc:     "Tunnel source IP address (IPv4 or IPv6)",
+			valueExamples: []string{"10.0.2.10", "2001:db8::1"},
+			validator:     ValidateIPAddress,
+			children:      nil,
+		},
+		"destination": {
+			desc:          "Tunnel destination address",
+			args:          1,
+			placeholder:   "<address>",
+			valueType:     ValueIPAddress,
+			valueDesc:     "Tunnel destination IP address (IPv4 or IPv6)",
+			valueExamples: []string{"192.0.2.1", "2001:db8::2"},
+			validator:     ValidateIPAddress,
+			children:      nil,
+		},
+		"mode": {desc: "Tunnel mode", args: 1, placeholder: "<mode>", children: nil},
+		"key": {
+			desc:          "Tunnel key",
+			args:          1,
+			placeholder:   "<key>",
+			valueType:     ValueInteger,
+			valueDesc:     "GRE key (0..4294967295; 32-bit wire field)",
+			valueExamples: []string{"100"},
+			validator:     ValidateInteger(0, 4294967295),
+			children:      nil,
+		},
+		"ttl": {
+			desc:          "Time to live",
+			args:          1,
+			placeholder:   "<number>",
+			valueType:     ValueInteger,
+			valueDesc:     "Tunnel TTL (0..255; 0 = inherit, one wire byte)",
+			valueExamples: []string{"64"},
+			validator:     ValidateInteger(0, 255),
+			children:      nil,
+		},
+		"keepalive":       {desc: "Keepalive interval", args: 1, placeholder: "<seconds>", children: nil},
+		"keepalive-retry": {desc: "Keepalive retry count", args: 1, placeholder: "<number>", children: nil},
+		"routing-instance": {desc: "Routing instance", children: map[string]*schemaNode{
+			"destination": {desc: "Destination routing instance", args: 1, placeholder: "<name>", children: nil},
+		}},
+		"wireguard": wireguardSchemaNode(),
+	}
+}
+
 // wireguardSchemaNode returns the config-mode schema subtree for the
 // `tunnel wireguard { ... }` stanza (#1432 S2a). Minimal generic
 // surface — listen-port / private-key / peer{public-key, allowed-ips,
 // endpoint, persistent-keepalive}. See parseTunnelWireguard in
 // compiler_interfaces.go for the matching parse.
+//
+// #1319 PR 3: listen-port and persistent-keepalive carry exactly the
+// bounds the compiler enforces SILENTLY today — parseTunnelWireguard
+// accepts only 1..65535 (compiler_interfaces.go:689) and
+// parseTunnelWireguardPeer only 0..65535 (:720), dropping anything else
+// without a trace. The typed leaves turn that silent drop into a commit
+// rejection.
 func wireguardSchemaNode() *schemaNode {
 	return &schemaNode{
 		desc: "WireGuard tunnel parameters",
 		children: map[string]*schemaNode{
-			"listen-port": {desc: "UDP listen port", args: 1, placeholder: "<port>", children: nil},
+			"listen-port": {
+				desc:          "UDP listen port",
+				args:          1,
+				placeholder:   "<port>",
+				valueType:     ValueInteger,
+				valueDesc:     "UDP listen port (1..65535)",
+				valueExamples: []string{"51820"},
+				validator:     ValidateInteger(1, 65535),
+				children:      nil,
+			},
 			"private-key": {desc: "Local static private key (hex)", args: 1, placeholder: "<hex-key>", children: nil},
 			"peer": {desc: "WireGuard peer", children: map[string]*schemaNode{
-				"public-key":           {desc: "Peer static public key (hex)", args: 1, placeholder: "<hex-key>", children: nil},
-				"allowed-ips":          {desc: "Peer allowed IPs (CIDR)", args: 1, multi: true, placeholder: "<prefix>", children: nil},
-				"endpoint":             {desc: "Peer endpoint (ip:port)", args: 1, placeholder: "<ip:port>", children: nil},
-				"persistent-keepalive": {desc: "Persistent keepalive seconds", args: 1, placeholder: "<seconds>", children: nil},
+				"public-key":  {desc: "Peer static public key (hex)", args: 1, placeholder: "<hex-key>", children: nil},
+				"allowed-ips": {desc: "Peer allowed IPs (CIDR)", args: 1, multi: true, placeholder: "<prefix>", children: nil},
+				"endpoint":    {desc: "Peer endpoint (ip:port)", args: 1, placeholder: "<ip:port>", children: nil},
+				"persistent-keepalive": {
+					desc:          "Persistent keepalive seconds",
+					args:          1,
+					placeholder:   "<seconds>",
+					valueType:     ValueInteger,
+					valueDesc:     "Persistent keepalive interval in seconds (0..65535; 0 = disabled)",
+					valueExamples: []string{"25"},
+					validator:     ValidateInteger(0, 65535),
+					children:      nil,
+				},
 			}},
 		},
 	}

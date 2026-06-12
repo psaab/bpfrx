@@ -148,3 +148,39 @@ func TestCommitCheck_RejectsOutOfRangeChassisLeaf(t *testing.T) {
 		t.Fatal("expected Commit to reject priority 255, got nil")
 	}
 }
+
+// #1319 PR 3 — boot safety for the interfaces typed leaves. A stored
+// bare (prefix-less) interface address was legal before the address key
+// slot was typed; it must keep booting (warn only), compile verbatim,
+// and be rejected by the next strict operator commit.
+func TestLoad_ToleratesStoredBareInterfaceAddress(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config")
+	writeStoredConfig(t, cfgPath,
+		"set interfaces ge-0-0-0 unit 0 family inet address 10.0.1.10",
+		"set interfaces ge-0-0-0 mtu 1500")
+
+	s := New(cfgPath)
+	if err := s.Load(); err != nil {
+		t.Fatalf("Load() must tolerate a stored bare interface address, got: %v", err)
+	}
+	active := s.ActiveConfig()
+	if active == nil {
+		t.Fatal("ActiveConfig() is nil after tolerated Load")
+	}
+	ifc := active.Interfaces.Interfaces["ge-0-0-0"]
+	if ifc == nil || ifc.Units[0] == nil ||
+		len(ifc.Units[0].Addresses) != 1 || ifc.Units[0].Addresses[0] != "10.0.1.10" {
+		t.Fatalf("stored bare address must compile verbatim, got %+v", ifc)
+	}
+
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	_, err := s.CommitCheck()
+	if err == nil {
+		t.Fatal("CommitCheck must reject the stored bare address, got nil")
+	}
+	if !strings.Contains(err.Error(), "address") {
+		t.Fatalf("CommitCheck error should reference address: %v", err)
+	}
+}
