@@ -203,6 +203,20 @@ pub(super) fn retry_pending_neigh(
             .remove(&key)
             .expect("key from this map");
         let mut decision = pkt.decision;
+        // #1873 R-E defense-in-depth: tunnel-marked entries are excluded
+        // at admission (poll_descriptor), so this should be unreachable —
+        // but an in-place rewrite of a tunnel inner packet transmits it
+        // PLAINTEXT (rewrite_forwarded_frame_in_place does MAC/VLAN/NAT
+        // only, no encapsulation), so a stray entry is dropped + counted,
+        // never TXed.
+        if decision.resolution.tunnel_endpoint_id != 0 {
+            binding
+                .live
+                .tunnel_encap_unresolved_drops
+                .fetch_add(1, Ordering::Relaxed);
+            binding.tx_pipeline.pending_fill_frames.push_back(pkt.addr);
+            continue;
+        }
         decision.resolution.neighbor_mac = Some(neighbor_mac);
         decision.resolution.disposition = ForwardingDisposition::ForwardCandidate;
         let expected_ports = None;

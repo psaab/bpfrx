@@ -5431,3 +5431,111 @@ fn tunnel_gate_keeps_local_tunnel_delivery_open() {
     let delivered = rx.try_recv().expect("local tunnel delivery still open");
     assert!(!delivered.is_empty());
 }
+
+/// #1873 R-E: a tunnel-marked decision whose OUTER next-hop is
+/// unresolved (MissingNeighbor) must NOT be buffered in pending_neigh
+/// — the retry path's in-place rewrite cannot encapsulate, so a
+/// buffered tunnel inner packet would later TX PLAINTEXT. The frame
+/// instead flows to the slow-path chokepoint where the R-C blanket
+/// gate drops + counts it.
+#[test]
+fn txn_tunnel_marked_missing_neighbor_not_buffered() {
+    let mut snapshot = nat_snapshot();
+    snapshot.interfaces.push(InterfaceSnapshot {
+        name: "gr-0/0/0.0".to_string(),
+        zone: "wan".to_string(),
+        linux_name: "gr-0-0-0".to_string(),
+        ifindex: 77,
+        ..Default::default()
+    });
+    snapshot.tunnel_endpoints = vec![crate::protocol::snapshot::TunnelEndpointSnapshot {
+        id: 824,
+        interface: "gr-0/0/0.0".to_string(),
+        linux_name: "gr-0-0-0".to_string(),
+        ifindex: 77,
+        zone: "wan".to_string(),
+        mode: "gre".to_string(),
+        outer_family: "inet".to_string(),
+        source: "172.16.80.8".to_string(),
+        destination: "203.0.113.9".to_string(),
+        transport_table: "inet.0".to_string(),
+        ttl: 64,
+        ..Default::default()
+    }];
+    snapshot.routes.push(RouteSnapshot {
+        table: "inet.0".to_string(),
+        family: "inet".to_string(),
+        destination: "8.8.8.8/32".to_string(),
+        next_hops: vec!["@gr-0/0/0.0".to_string()],
+        discard: false,
+        next_table: String::new(),
+    });
+    // No neighbors: the tunnel's OUTER destination (203.0.113.9 via the
+    // 172.16.80.1 default gateway) is unresolved -> MissingNeighbor
+    // with tunnel_endpoint_id preserved.
+    snapshot.neighbors.clear();
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+
+    let frame = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(8, 8, 8, 8),
+        12345,
+        443,
+        TCP_FLAG_SYN,
+    );
+    let meta = txn_meta_v4(24, TCP_FLAG_SYN, (frame.len() - 14) as u16);
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+    // First packet: the decision is tunnel-marked ForwardCandidate; the
+    // GRE encap build fails on the unresolved OUTER neighbor and the
+    // dispatch build-failure door funnels into the R-C gate.
+    assert!(
+        binding.pending_neigh.is_empty(),
+        "tunnel-marked frame must never be admitted to pending_neigh (#1873 R-E)"
+    );
+    let drops_after_first = binding
+        .live
+        .tunnel_encap_unresolved_drops
+        .load(Ordering::Relaxed);
+    assert!(
+        drops_after_first >= 1,
+        "tunnel-marked frame must be dropped+counted at the R-C gate"
+    );
+
+    // Second packet: the session now exists, so the per-packet path
+    // re-resolves the stored tunnel id. Whatever door the failure
+    // takes, the frame must never be buffered for in-place retry and
+    // must be counted at the R-C gate.
+    let meta2 = txn_meta_v4(24, TCP_FLAG_SYN, (frame.len() - 14) as u16);
+    let (_batch2, dbg2) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta2,
+    );
+    let _ = dbg2;
+    assert!(
+        binding.pending_neigh.is_empty(),
+        "tunnel-marked frame must skip pending_neigh admission on the session path too (#1873 R-E)"
+    );
+    assert!(
+        binding
+            .live
+            .tunnel_encap_unresolved_drops
+            .load(Ordering::Relaxed)
+            > drops_after_first,
+        "second packet must also be dropped+counted at the R-C gate"
+    );
+}
