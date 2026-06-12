@@ -155,12 +155,25 @@ scenario_a() {
 	*) fail "guest kernel $kver < 6.18" ;;
 	esac
 
+	# The trixie cloud kernel must be fully purged (metapackage purge +
+	# autoremove during bake); leftovers waste image space and risk a
+	# wrong GRUB default after a future kernel removal.
+	guest xpf-image-a sh -c '! ls /lib/modules | grep -q cloud' ||
+		fail "cloud kernel modules still present in /lib/modules"
+
 	info "in-guest verify-dataplane (the bake gate, image kernel)..."
 	guest xpf-image-a nice -n 19 /usr/local/sbin/xpfd verify-dataplane ||
 		fail "in-guest verify-dataplane REJECTED — image must not ship"
 
 	wait_fxp0_dhcp xpf-image-a
 	guest xpf-image-a sh -c 'ss -tln | grep -q ":22 "' || fail "sshd not listening"
+	# Factory credential posture: root password is EMPTY (console-only)
+	# — the effective sshd config must refuse root password and
+	# empty-password auth, or the empty password is network-exposed.
+	guest xpf-image-a sh -c 'sshd -T | grep -qx "permitrootlogin prohibit-password"' ||
+		fail "sshd effective config does not pin PermitRootLogin prohibit-password"
+	guest xpf-image-a sh -c 'sshd -T | grep -qx "permitemptypasswords no"' ||
+		fail "sshd effective config does not pin PermitEmptyPasswords no"
 	guest xpf-image-a test ! -e /etc/xpf/xpf.conf || fail "unexpected /etc/xpf/xpf.conf"
 	guest xpf-image-a test ! -e /etc/xpf/.day0-config-applied || fail "unexpected day-0 stamp"
 	guest xpf-image-a sh -c 'journalctl -u xpf-day0-config -b --no-pager | grep -q "no config medium found"' ||

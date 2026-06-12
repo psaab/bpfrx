@@ -50,11 +50,19 @@ Pipeline (offline — the image is never booted to provision it):
    bash history, package caches, random seed; `/etc/xpf` factory-empty.
 6. Export compressed qcow2 + incus metadata tarball + SHA256SUMS.
 7. **Validation gate** (default on): the image is imported into local
-   incus, booted, and `xpfd verify-dataplane` runs IN-GUEST against
-   the image's own kernel. A REJECT fails the bake — the image must
-   never ship a verifier-failing shim (#1864/#1869 discipline). Use
-   `--skip-validate` only for iteration; such artifacts are not
-   publishable.
+   incus and the FULL first-boot matrix runs — factory boot (fxp0
+   DHCP, sshd posture via `sshd -T`, cloud-kernel purge check) with
+   `xpfd verify-dataplane` IN-GUEST against the image's own kernel,
+   plus the valid- and invalid-day-0-drive scenarios. A failure fails
+   the bake — the image must never ship a verifier-failing shim
+   (#1864/#1869 discipline). Use `--skip-validate` only for
+   iteration; such artifacts are not publishable.
+
+Each bake also writes `dist/xpf-<ver>.manifest` recording the exact
+inputs (base image URL + verified SHA512, git commit, bake date/host
+kernel). Bakes are not bit-reproducible (the base tracks upstream
+`latest` unless `XPF_BASE_RELEASE` pins a dated release); the manifest
+is the traceability record.
 
 Full first-boot matrix (run after a bake, or standalone):
 
@@ -131,8 +139,11 @@ commit-check and refuses to build an ISO the appliance would reject.
 ## Credentials / security posture
 
 - No default password over the network, ever. The root password is
-  empty: login works on the hypervisor console only (sshd's
-  `PermitRootLogin prohibit-password` + empty-password refusal).
+  empty: login works on the hypervisor console only. The image pins
+  this explicitly — `/etc/ssh/sshd_config.d/10-xpf-factory.conf` sets
+  `PermitRootLogin prohibit-password` + `PermitEmptyPasswords no`
+  (not relying on distro defaults), and the validation harness
+  asserts the effective `sshd -T` output.
 - Headless/SSH access comes from the day-0 config (`system
   root-authentication`, `system login user ...`) — set credentials
   there, or use the console once and `commit` a config.

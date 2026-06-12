@@ -84,9 +84,12 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
-# Debian 13 genericcloud base. The base owns partitioning + bootloader;
-# pin a specific dated release for reproducible bakes (override via env
-# to track a newer point release).
+# Debian 13 genericcloud base. The base owns partitioning + bootloader.
+# Default tracks the upstream "latest" point release — bakes are NOT
+# bit-reproducible (base content, apt state, and timestamps move); for
+# repeatable input pinning set XPF_BASE_RELEASE to a dated upstream
+# release directory. Every bake records the exact base image SHA512 +
+# git commit in dist/<artifact>.manifest.
 BASE_RELEASE="${XPF_BASE_RELEASE:-latest}"
 BASE_URL="${XPF_BASE_URL:-https://cloud.debian.org/images/cloud/trixie/${BASE_RELEASE}}"
 BASE_IMG="debian-13-genericcloud-amd64.qcow2"
@@ -244,7 +247,7 @@ virt-customize -a "$WORK_DIR/work.qcow2" \
 	--run-command "export DEBIAN_FRONTEND=noninteractive && { $APT_UPDATE; } && apt-get install -y -qq -o Acquire::Retries=5 linux-image-amd64" \
 	--run-command 'latest=$(ls /lib/modules | sort -V | tail -1) && dpkg --compare-versions "${latest%%+*}" ge 6.18 || { echo "FATAL: newest installed kernel $latest < 6.18 (unstable kernel install silently fell through?)" >&2; exit 1; }' \
 	--run-command 'rm -f /etc/apt/sources.list.d/unstable.list /etc/apt/preferences.d/pin-stable' \
-	--run-command 'export DEBIAN_FRONTEND=noninteractive && apt-get purge -y -qq "linux-image-*cloud*" 2>/dev/null || true' \
+	--run-command 'export DEBIAN_FRONTEND=noninteractive && apt-get purge -y -qq linux-image-cloud-amd64 "linux-image-.*cloud.*" 2>/dev/null || true' \
 	--run-command 'export DEBIAN_FRONTEND=noninteractive && apt-get purge -y -qq "cloud-init*" 2>/dev/null || true; rm -rf /etc/cloud /var/lib/cloud' \
 	--run-command 'rm -f /etc/network/interfaces.d/* /etc/netplan/*.yaml 2>/dev/null || true' \
 	--run-command "export DEBIAN_FRONTEND=noninteractive && apt-get autoremove -y -qq && { $APT_UPDATE; }" \
@@ -255,6 +258,13 @@ virt-customize -a "$WORK_DIR/work.qcow2" \
 	--run-command 'sed -i "s/^pool /#pool /; s/^server /#server /" /etc/chrony/chrony.conf && mkdir -p /etc/chrony/sources.d' \
 	--run-command 'systemctl enable xpfd xpf-day0-config' \
 	--run-command 'sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=\"\(.*\)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\1 init_on_alloc=0\"/" /etc/default/grub && update-grub' \
+	--write '/etc/ssh/sshd_config.d/10-xpf-factory.conf:# xpf factory posture (#1879): root password is EMPTY (console-only
+# login, vSRX parity). Pin the OpenSSH defaults explicitly so a future
+# distro default change cannot silently expose the empty password or
+# root password auth over the network. Day-0 configs grant access via
+# system root-authentication ssh keys / login users.
+PermitRootLogin prohibit-password
+PermitEmptyPasswords no' \
 	--run-command 'passwd -d root' \
 	--run-command '/usr/local/sbin/xpfd version'
 
@@ -268,7 +278,7 @@ virt-customize -a "$WORK_DIR/work.qcow2" \
 info "Sealing image (virt-sysprep)..."
 virt-sysprep -a "$WORK_DIR/work.qcow2" --quiet \
 	--enable machine-id,ssh-hostkeys,ssh-userdir,logfiles,tmp-files,bash-history,package-manager-cache,backup-files,passwd-backups,utmp \
-	--run-command 'rm -rf /etc/xpf/.configdb /etc/xpf/xpf.conf /etc/xpf/.day0-config-applied /var/lib/systemd/random-seed 2>/dev/null || true'
+	--run-command 'rm -rf /etc/xpf/.configdb /etc/xpf/xpf.conf /etc/xpf/.day0-config-applied /var/lib/systemd/random-seed /var/lib/apt/lists/* 2>/dev/null || true'
 
 # ── 6. Export artifacts ───────────────────────────────────────────────
 QCOW_OUT="$OUT_DIR/xpf-$VERSION.qcow2"
@@ -293,12 +303,26 @@ tar -C "$WORK_DIR" -czf "$META_OUT" metadata.yaml
 info "Checksums:"
 cat "$OUT_DIR/SHA256SUMS"
 
+# Bake manifest: records the exact inputs (base image + its verified
+# SHA512, git commit, bake host/kernel) so any artifact can be traced
+# even though bakes are not bit-reproducible.
+cat >"$OUT_DIR/xpf-$VERSION.manifest" <<EOF
+version: $VERSION
+git_commit: $(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)
+base_image: $BASE_URL/$BASE_IMG
+base_image_sha512: $actual
+bake_date: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+bake_host_kernel: $(uname -r)
+EOF
+info "Manifest: $OUT_DIR/xpf-$VERSION.manifest"
+
 # ── 7. Validation gate (in-guest verify-dataplane + first-boot smoke) ─
 if [ "$SKIP_VALIDATE" -eq 1 ]; then
 	echo "WARNING: --skip-validate — these artifacts have NOT passed the in-guest verify-dataplane gate; do not publish them." >&2
 else
-	info "Running validation gate (scenario A: boot + in-guest verify-dataplane)..."
-	"$SCRIPT_DIR/validate-image.sh" --qcow2 "$QCOW_OUT" --metadata "$META_OUT" a ||
+	info "Running validation gate (full scenario matrix: factory boot +"
+	info "in-guest verify-dataplane + valid/invalid day-0 drives)..."
+	"$SCRIPT_DIR/validate-image.sh" --qcow2 "$QCOW_OUT" --metadata "$META_OUT" all ||
 		die "validation gate FAILED — artifacts in $OUT_DIR are NOT publishable"
 fi
 

@@ -66,20 +66,24 @@ regen_ssh_host_keys() {
 }
 
 # Candidate devices: labeled volumes first (explicit operator intent),
-# then any ISO9660 medium (vSRX cdrom parity).
+# then any ISO9660 medium (vSRX cdrom parity). blkid is run under
+# timeout: a faulty/hung virtual medium must not consume the unit's
+# TimeoutStartSec and delay xpfd/sshd by the full backstop.
 probe_devices() {
 	{
-		blkid -o device -t LABEL=xpf-config 2>/dev/null || true
-		blkid -o device -t TYPE=iso9660 2>/dev/null || true
+		timeout 15 blkid -o device -t LABEL=xpf-config 2>/dev/null || true
+		timeout 15 blkid -o device -t TYPE=iso9660 2>/dev/null || true
 	} | sort -u
 }
 
 # try_device <dev> — returns 0 if a config was validated and installed.
 try_device() {
-	local dev="$1" conf="" nodeid="" nodearg=() out rc
+	local dev="$1" conf="" nodeid="" nodearg=() out rc tmpconf=""
 	log "probing config medium $dev"
 	mkdir -p "$MNT"
-	if ! mount -o ro,nosuid,nodev,noexec "$dev" "$MNT" 2>/dev/null; then
+	# timeout: a hung backing device (e.g. a host-side network share
+	# behind a virtual cdrom) must not stall the boot path.
+	if ! timeout 20 mount -o ro,nosuid,nodev,noexec "$dev" "$MNT" 2>/dev/null; then
 		warn "cannot mount $dev read-only — skipping"
 		return 1
 	fi
@@ -97,10 +101,26 @@ try_device() {
 		return 1
 	fi
 
+	# Copy ONCE to a private root-only temp file, then size-check,
+	# validate, and install that same copy: a mutable backing store
+	# (hypervisor-side swap of an attached disk) must not be able to
+	# change the bytes between validation and install.
+	tmpconf=$(mktemp /run/xpf-day0-conf.XXXXXX) || {
+		warn "mktemp failed — skipping $dev"
+		umount "$MNT"
+		return 1
+	}
+	if ! head -c "$((MAX_CONF_BYTES + 1))" "$conf" >"$tmpconf" 2>/dev/null; then
+		warn "failed to read $conf — skipping $dev"
+		rm -f "$tmpconf"
+		umount "$MNT"
+		return 1
+	fi
 	local size
-	size=$(stat -c %s "$conf" 2>/dev/null || echo 0)
+	size=$(stat -c %s "$tmpconf" 2>/dev/null || echo 0)
 	if [ "$size" -le 0 ] || [ "$size" -gt "$MAX_CONF_BYTES" ]; then
 		warn "$conf size $size out of bounds (1..$MAX_CONF_BYTES) — skipping $dev"
+		rm -f "$tmpconf"
 		umount "$MNT"
 		return 1
 	fi
@@ -116,7 +136,7 @@ try_device() {
 	fi
 
 	log "validating $(basename "$conf") from $dev with the strict commit-check gate"
-	out=$(timeout "$CHECK_TIMEOUT" "$XPFD" check-config "${nodearg[@]}" "$conf" 2>&1)
+	out=$(timeout "$CHECK_TIMEOUT" "$XPFD" check-config "${nodearg[@]}" "$tmpconf" 2>&1)
 	rc=$?
 	if [ $rc -ne 0 ]; then
 		case $rc in
@@ -125,6 +145,7 @@ try_device() {
 		*) warn "day-0 config validation failed (exit $rc) — NOT installing" ;;
 		esac
 		while IFS= read -r line; do warn "  $line"; done <<<"$out"
+		rm -f "$tmpconf"
 		umount "$MNT"
 		return 1
 	fi
@@ -132,12 +153,15 @@ try_device() {
 	mkdir -p "$XPF_DIR"
 	chmod 0750 "$XPF_DIR" 2>/dev/null || true
 	# 0600: a day-0 config may carry credential material
-	# (root-authentication encrypted-password, IKE PSKs).
-	if ! install -o root -g root -m 0600 "$conf" "$XPF_DIR/xpf.conf"; then
+	# (root-authentication encrypted-password, IKE PSKs). Install the
+	# validated COPY, never re-read the medium.
+	if ! install -o root -g root -m 0600 "$tmpconf" "$XPF_DIR/xpf.conf"; then
 		warn "failed to install $XPF_DIR/xpf.conf"
+		rm -f "$tmpconf"
 		umount "$MNT"
 		return 1
 	fi
+	rm -f "$tmpconf"
 	if [ -n "$nodeid" ]; then
 		printf '%s\n' "$nodeid" >"$XPF_DIR/node-id"
 		log "installed node-id $nodeid"
