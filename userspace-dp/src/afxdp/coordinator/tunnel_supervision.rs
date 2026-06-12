@@ -539,9 +539,7 @@ impl super::Coordinator {
                 stale.push((*id, reason));
             }
         }
-        for (id, reason) in stale {
-            self.stop_remove_wg_control_entry(id, reason);
-        }
+        self.stop_remove_wg_control_entries(stale);
 
         // Spawn pass (apply-time only — the periodic sweep never creates
         // entries; see reconcile_wg_control_liveness).
@@ -592,9 +590,43 @@ impl super::Coordinator {
         }
     }
 
+    /// #1889: bulk stop + join + REMOVE. Signals ALL the listed
+    /// entries' stop flags FIRST, then joins each — with the control
+    /// loop blocked in poll(2) up to WG_POLL_CAP_MS, a serial
+    /// stop+join per entry would cost N x ~100ms on the control-socket
+    /// thread; signal-then-join bounds the whole batch at ~one cap.
+    /// Used by every multi-entry stop path (stale-prune, stop-all,
+    /// deferred snapshot prune).
+    fn stop_remove_wg_control_entries(&mut self, batch: Vec<(u16, &str)>) {
+        let mut removed: Vec<(u16, &str, super::LocalTunnelSourceHandle, String)> = Vec::new();
+        for (id, reason) in batch {
+            if let Some(mut entry) = self.wg_control_threads.remove(&id) {
+                let name = entry.spawned_tunnel_name.clone();
+                if let Some(handle) = entry.handle.take() {
+                    handle.stop.store(true, Ordering::Relaxed);
+                    removed.push((id, reason, handle, name));
+                } else {
+                    eprintln!(
+                        "xpf-userspace-dp: stopped WG control thread endpoint={id} tun={name} reason={reason}"
+                    );
+                }
+            }
+        }
+        for (id, reason, mut handle, name) in removed {
+            if let Some(join) = handle.join.take() {
+                let _ = join.join();
+            }
+            eprintln!(
+                "xpf-userspace-dp: stopped WG control thread endpoint={id} tun={name} reason={reason}"
+            );
+        }
+    }
+
     /// #1866 pass 2 helper: stop + join + REMOVE one entry (live thread
     /// or tombstone). The only place entries leave the map besides
-    /// `stop_inner` and the defer-branch snapshot prune.
+    /// `stop_inner` and the defer-branch snapshot prune. Single-entry
+    /// callers only; multi-entry paths use the bulk signal-then-join
+    /// helper above.
     fn stop_remove_wg_control_entry(&mut self, id: u16, reason: &str) {
         if let Some(mut entry) = self.wg_control_threads.remove(&id) {
             if let Some(mut handle) = entry.handle.take() {
@@ -791,10 +823,12 @@ impl super::Coordinator {
     /// helper must not hold WG listen ports — mirror the
     /// `reconcile_status_bindings → stop()` semantics.
     pub(crate) fn stop_all_wg_control_threads(&mut self, reason: &str) {
-        let ids: Vec<u16> = self.wg_control_threads.keys().copied().collect();
-        for id in ids {
-            self.stop_remove_wg_control_entry(id, reason);
-        }
+        let batch: Vec<(u16, &str)> = self
+            .wg_control_threads
+            .keys()
+            .map(|id| (*id, reason))
+            .collect();
+        self.stop_remove_wg_control_entries(batch);
     }
 
     /// #1866 Change 2b (defect D4): removal propagation on the
@@ -818,14 +852,12 @@ impl super::Coordinator {
             .filter(|row| row.id != 0 && row.ifindex > 0 && hydrate_wg_identity(row).is_some())
             .map(|row| row.id)
             .collect();
-        let stale: Vec<u16> = self
+        let stale: Vec<(u16, &str)> = self
             .wg_control_threads
             .keys()
             .filter(|id| !desired.contains(id))
-            .copied()
+            .map(|id| (*id, "removed_deferred"))
             .collect();
-        for id in stale {
-            self.stop_remove_wg_control_entry(id, "removed_deferred");
-        }
+        self.stop_remove_wg_control_entries(stale);
     }
 }
