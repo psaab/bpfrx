@@ -95,8 +95,33 @@ Rules:
   over: the compiler never reads it.)
 - **Validators live in `pkg/config/schema_validators.go`** and are stateless
   string-checkers reusing the compiler's parsers. Add a generic one
-  (`ValidateInteger(min,max)`, `ValidateEnum([...])`) or a bespoke
-  `ValidateX(raw string, cfg *Config) error`.
+  (`ValidateInteger(min,max)`, `ValidateEnum([...])`, the IP family
+  validators `ValidateIPAddress` / `ValidateIPv4CIDR` / `ValidateIPv6CIDR`)
+  or a bespoke `ValidateX(raw string, cfg *Config) error`. **cfg is always
+  nil in production** — both call sites run the gate BEFORE compile
+  (`configstore.compileTree` / `compileTreeLenient`), so a validator must
+  never depend on compiled state. Cross-reference validators use the
+  TREE-based `treeValidator` field instead: `SchemaValidate` pre-collects
+  referenceable definitions from the candidate tree into `schemaRefs`
+  (`collectSchemaRefs`, e.g. the forwarding-class names) and hands them to
+  the validator, so a definition + reference in the same commit validate
+  atomically. The refs union includes group bodies (applied or not) so
+  node-variable configs never false-reject.
+- **Typed KEY slots (named-instance containers).** A container whose value
+  is its IDENTITY token (`family inet address <cidr> { primary; }`) cannot
+  use `valueType`/`validator` — that would flip the walker into the
+  typed-LEAF branch and mis-validate the container's real block children.
+  Set `keyValueType`/`keyValueDesc`/`keyValueExamples`/`keyValidator`
+  instead: the walker validates the identity arg token(s) in both the
+  packed-Keys and the nested instance-name shapes (both of which
+  `namedInstances` compiles), and `?` completion surfaces the key
+  placeholder + examples at the empty identity slot.
+- **Multi value-tail leaves accept the block-list spelling.** A
+  `multi && children == nil` typed leaf is compiled from BOTH the packed
+  Keys (`name-server 1.1.1.1`, ranges with the `to` separator) and the
+  hierarchical block list (`name-server { 1.1.1.1; 8.8.8.8; }`) — the
+  walker's `validateMultiValueLeaf` validates each block child's FIRST
+  token, exactly what the compilers read.
 - The generic walker (`schema_walk.go`) needs **no** changes per leaf — it
   descends `setSchema` and validates any typed leaf it finds. Walker rows it
   handles: container/args/compoundKey/midKeyword/wildcard, the standard
@@ -148,8 +173,27 @@ Rules:
   `node 0 priority <v>;` bypasses the gate (identity-token rule) even
   though `compileChassis` reads its inline tokens — pinned by
   `TestSchemaValidate_ChassisCluster_PackedOneLinerBypassesGate`.
-- **PR 3..N:** interfaces address CIDR, firewall filter terms,
-  system/services numeric knobs — same recipe, no walker/infra changes.
+- **PR 3 (this work):** the remaining converged-plan sections in one PR —
+  (a) **interfaces**: `ValueIPAddress`/`ValueCIDR` value types, the typed
+  KEY-slot walker feature, and 16 typed slots (mtu ×3, vlan-id,
+  inner-vlan-id, family inet/inet6 `address` CIDR key slots, vrrp-group
+  priority / advertise-interval / virtual-address, tunnel
+  source/destination/ttl/key, wireguard listen-port /
+  persistent-keepalive); (b) **firewall**: the `then forwarding-class`
+  tree-based cross-ref for both families (dangling references reject at
+  commit; same-commit definition + reference passes; `best-effort` is
+  always resolvable; the other Junos default classes are deliberately NOT
+  implicit — xpf's runtime does not define them); (c) **system/services**:
+  22 typed slots (name-server, ssh root-login enum, the dataplane
+  workers/ring-entries/poll-mode/rss-indirection/claim-host-tunables/
+  netdev-budget/coalescence knobs, the rpm probe knobs, ip-monitoring
+  hold-down / preferred-metric) plus the `validateMultiValueLeaf`
+  block-list walker extension the deployed `name-server { 1.1.1.1; }`
+  shape requires. Deliberately untyped, with reasons in `schema.go`:
+  `unit <n>` / `vrrp-group <id>` instance ids (cross-referenced from other
+  subsystems — one dedicated pass later), `track-interface priority-cost`
+  (#1814 pre-walk owns it), `cpu-governor` (pass-through by design), dhcp
+  client knobs, tunnel keepalives.
 - **#1746:** added the `class-of-service schedulers <s>
   equal-flow-target-policy (slowest | mean | ideal-share)` typed enum
   leaf (ValueEnumOf + `ValidateEnum`, same recipe as the scheduler

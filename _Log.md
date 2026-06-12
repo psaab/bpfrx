@@ -5204,3 +5204,7 @@ top.
 - **Timestamp**: 2026-06-11 ~15:45 PT
   **Action**: #1875 /research (PLAN-READY 3-of-3, branch research/1875-cluster-ownership) + /engineer → PR #1878 (cluster lock cells: cluster-lock.sh, with-cluster.sh, self-locking cluster-setup/apply-cos verbs, marker-aware wg-interop inc(), 10-case selftest, docs protocol). Live guarded deploy + CoS re-apply + iperf3 validated on loss cluster. Quad review: Codex+AGY+SMR MERGE-READY, Copilot 3x quota-limited.
   **File(s)**: test/incus/{cluster-lock.sh,with-cluster.sh,with-cluster-selftest.sh,cluster-setup.sh,apply-cos-config.sh,wg-interop.sh,reverse-key-collision-probe.sh}, docs/engineering-style.md, CLAUDE.md, docs/wg-interop-runbook.md, docs/pr/1875-cluster-ownership/
+
+- **Timestamp**: 2026-06-11
+  **Action**: #1319 PR 3 rollout (engineer/1319-pr3-rollout) — interfaces CIDR/IP typed leaves + typed key-slot walker feature; firewall forwarding-class tree-based cross-ref (schemaRefs/walkContext, cfg-nil doc); system/services typed leaves + validateMultiValueLeaf block-list shape; per-section tests + configstore boot-safety/e2e proofs; docs/config-schema.md how-to + rollout update.
+  **File(s)**: pkg/config/{schema.go,schema_walk.go,schema_validators.go,schema_complete.go,value_type.go,schema_validate_{interfaces,firewall,system}_test.go}, pkg/configstore/typed_leaf_lenient_test.go, docs/config-schema.md
