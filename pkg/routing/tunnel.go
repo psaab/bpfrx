@@ -1069,10 +1069,22 @@ func (t *tunnelManager) Clear() error {
 
 // clearLocked is the lock-free body of Clear. Caller must hold mu.
 // Apply no longer uses it (#1884 reconcile-in-place); it remains the
-// explicit delete-everything path for ClearTunnels.
+// explicit delete-everything path for ClearTunnels. It deletes the
+// UNION of the success-tracked list and the ownership set: a
+// per-tunnel apply failure leaves the name in ownedNames but not in
+// t.tunnels (failure-continue before finishTunnelLocked), and the
+// delete-everything contract must still cover that live link (Codex
+// PR #1903 r1 MINOR).
 func (t *tunnelManager) clearLocked() error {
 	t.stopAllKeepalivesLocked()
+	names := make(map[string]bool, len(t.tunnels)+len(t.ownedNames))
 	for _, name := range t.tunnels {
+		names[name] = true
+	}
+	for name := range t.ownedNames {
+		names[name] = true
+	}
+	for name := range names {
 		link, err := t.ops.LinkByName(name)
 		if err != nil {
 			continue // already gone

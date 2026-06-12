@@ -807,3 +807,151 @@ func TestTunnelRestartAdoptionStableLink(t *testing.T) {
 		t.Fatal("restart adoption replaced the link object")
 	}
 }
+
+// --- Codex PR-r1 coverage adds: remaining claim cells + Clear union --
+
+func TestTunnelVRFListOnlyBindThenRemovedUnbinds(t *testing.T) {
+	ops := newFakeLinkOps()
+	seedVRF(ops, "blue", 200)
+	tm, _ := newReconcileManager(ops)
+
+	// List-ONLY tunnel (never stanza-bound): 0a bound it; observation
+	// records the claim.
+	tc := anchorTC("gr-0-0-0")
+	tc.RIListMember = "blue"
+	if err := tm.Apply([]*config.TunnelConfig{tc}); err != nil {
+		t.Fatalf("Apply 1: %v", err)
+	}
+	ops.links["gr-0-0-0"].Attrs().MasterIndex = 200 // 0a bind
+	if err := tm.Apply([]*config.TunnelConfig{tc}); err != nil {
+		t.Fatalf("Apply 2: %v", err)
+	}
+	if tm.appliedRI["gr-0-0-0"] != "blue" {
+		t.Fatalf("observed list claim = %q, want blue", tm.appliedRI["gr-0-0-0"])
+	}
+
+	// List membership removed ⇒ unbind via the observed claim.
+	if err := tm.Apply([]*config.TunnelConfig{anchorTC("gr-0-0-0")}); err != nil {
+		t.Fatalf("Apply 3: %v", err)
+	}
+	if len(ops.noMaster) != 1 {
+		t.Fatalf("list-only removal did not unbind: %v", ops.noMaster)
+	}
+}
+
+func TestTunnelVRFStanzaSuccessWinsOverList(t *testing.T) {
+	ops := newFakeLinkOps()
+	seedVRF(ops, "red", 100)
+	seedVRF(ops, "blue", 200)
+	tm, _ := newReconcileManager(ops)
+
+	// Both knobs present, stanza bind SUCCEEDS ⇒ stanza wins the claim
+	// (today's effective 0a-then-tunnel-apply order).
+	tc := anchorTC("gr-0-0-0")
+	tc.RoutingInstance = "red"
+	tc.RIListMember = "blue"
+	if err := tm.Apply([]*config.TunnelConfig{tc}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if tm.appliedRI["gr-0-0-0"] != "red" {
+		t.Fatalf("claim = %q, want red (stanza wins on success)", tm.appliedRI["gr-0-0-0"])
+	}
+	if got := ops.links["gr-0-0-0"].Attrs().MasterIndex; got != 100 {
+		t.Fatalf("master = %d, want vrf-red 100", got)
+	}
+}
+
+func TestTunnelVRFNotFoundClearsClaim(t *testing.T) {
+	ops := newFakeLinkOps()
+	seedVRF(ops, "red", 100)
+	tm, _ := newReconcileManager(ops)
+
+	tc := anchorTC("gr-0-0-0")
+	tc.RoutingInstance = "red"
+	if err := tm.Apply([]*config.TunnelConfig{tc}); err != nil {
+		t.Fatalf("Apply 1: %v", err)
+	}
+
+	// VRF device deleted out-of-band (kernel frees slaves; the fake
+	// mirrors that by zeroing the master). Claim must CLEAR via the
+	// not-found leg, with no unbind issued.
+	delete(ops.links, "vrf-red")
+	ops.links["gr-0-0-0"].Attrs().MasterIndex = 100 // stale-looking master
+	if err := tm.Apply([]*config.TunnelConfig{anchorTC("gr-0-0-0")}); err != nil {
+		t.Fatalf("Apply 2: %v", err)
+	}
+	if len(ops.noMaster) != 0 {
+		t.Fatalf("unbind issued despite VRF not-found: %v", ops.noMaster)
+	}
+	if got := tm.appliedRI["gr-0-0-0"]; got != "" {
+		t.Fatalf("claim not cleared on VRF not-found: %q", got)
+	}
+}
+
+func TestTunnelVRFTransientLookupRetainsClaim(t *testing.T) {
+	ops := newFakeLinkOps()
+	seedVRF(ops, "red", 100)
+	tm, _ := newReconcileManager(ops)
+
+	tc := anchorTC("gr-0-0-0")
+	tc.RoutingInstance = "red"
+	if err := tm.Apply([]*config.TunnelConfig{tc}); err != nil {
+		t.Fatalf("Apply 1: %v", err)
+	}
+
+	// Drive the unbind decision directly with a TRANSIENT (plain,
+	// non-not-found) error on the vrf-red lookup: byNameErrAfter is a
+	// global threshold, so pre-load vrf-red's per-name counter past it
+	// while the helper performs no other lookups (the tunnel link is
+	// passed in). Claim must be RETAINED, no unbind issued.
+	link := ops.links["gr-0-0-0"]
+	ops.byNameCount["vrf-red"] = 99
+	ops.byNameErrAfter = 1
+	tm.mu.Lock()
+	tm.reconcileVRFClaimLocked(anchorTC("gr-0-0-0"), link)
+	tm.mu.Unlock()
+	if got := tm.appliedRI["gr-0-0-0"]; got != "red" {
+		t.Fatalf("claim lost on transient lookup error: %q", got)
+	}
+	if len(ops.noMaster) != 0 {
+		t.Fatalf("unbind issued despite transient lookup error: %v", ops.noMaster)
+	}
+
+	// Error clears ⇒ retry unbinds.
+	ops.byNameErrAfter = 0
+	tm.mu.Lock()
+	tm.reconcileVRFClaimLocked(anchorTC("gr-0-0-0"), link)
+	tm.mu.Unlock()
+	if len(ops.noMaster) != 1 {
+		t.Fatalf("unbind not retried after transient lookup error: %v", ops.noMaster)
+	}
+}
+
+func TestClearTunnelsDeletesOwnershipUnion(t *testing.T) {
+	ops := newFakeLinkOps()
+	tm, _ := newReconcileManager(ops)
+
+	// Apply where the second tunnel FAILS mid-apply (non-TUN collision
+	// whose LinkDel fails): it stays in ownedNames but never reaches
+	// t.tunnels.
+	ops.links["gr-0-0-1"] = &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "gr-0-0-1", Index: 9}}
+	ops.delFail["gr-0-0-1"] = errors.New("EBUSY")
+	tcs := []*config.TunnelConfig{anchorTC("gr-0-0-0"), anchorTC("gr-0-0-1")}
+	if err := tm.Apply(tcs); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	// ClearTunnels must delete EVERYTHING it owns — including the
+	// failed-apply name once deletable (Codex PR r1 MINOR: union of
+	// t.tunnels and ownedNames, not the success list alone).
+	delete(ops.delFail, "gr-0-0-1")
+	if err := tm.Clear(); err != nil {
+		t.Fatalf("Clear: %v", err)
+	}
+	if _, ok := ops.links["gr-0-0-0"]; ok {
+		t.Fatal("Clear left the successful tunnel behind")
+	}
+	if _, ok := ops.links["gr-0-0-1"]; ok {
+		t.Fatal("Clear left the failed-apply owned link behind (union rule)")
+	}
+}
