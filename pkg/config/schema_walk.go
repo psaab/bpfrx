@@ -48,11 +48,36 @@ import (
 //
 // The tree passed in MUST already be apply-groups-expanded (configstore
 // expands before calling), so group bodies are inlined before the walk.
+// Cross-reference definitions are collected from this same tree; callers
+// that still hold the PRE-expansion candidate should prefer
+// SchemaValidateWithDefinitions so definitions living only in un-applied
+// groups survive (expansion removes the groups stanza outright).
 func SchemaValidate(tree *ConfigTree, cfg *Config) error {
+	return SchemaValidateWithDefinitions(tree, nil, cfg)
+}
+
+// SchemaValidateWithDefinitions is SchemaValidate with a separate
+// definitions source for the cross-reference sets (#1319 PR 3, AGY r1
+// HIGH): apply-groups expansion REMOVES the groups stanza from the
+// expanded tree (ast_groups.go "Remove the \"groups\" stanza itself"),
+// so a definition living ONLY in an un-applied group — e.g. the peer
+// node's `groups node1 { class-of-service ... }` while validating on
+// node0 of a "${node}" cluster config — would vanish from the refs
+// union and false-reject a shared-section reference that is deliberate
+// for the peer. Passing the PRE-expansion candidate as defsSource keeps
+// the permissive union the schemaRefs contract documents. defsSource
+// may be nil (refs come from tree alone).
+func SchemaValidateWithDefinitions(tree, defsSource *ConfigTree, cfg *Config) error {
 	if tree == nil {
 		return nil
 	}
-	vc := &walkContext{cfg: cfg, refs: collectSchemaRefs(tree)}
+	refs := collectSchemaRefs(tree)
+	if defsSource != nil {
+		for name := range collectSchemaRefs(defsSource).forwardingClasses {
+			refs.forwardingClasses[name] = struct{}{}
+		}
+	}
+	vc := &walkContext{cfg: cfg, refs: refs}
 	return walkSchemaChildren(tree.Children, setSchema, nil, vc)
 }
 

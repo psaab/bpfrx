@@ -2036,7 +2036,9 @@ func init() {
 //     and an unparseable address silently skips tunnel creation.
 //   - ttl: stored verbatim by the compiler, then truncated to the
 //     netlink uint8 Ttl field (tunnel.go:218/:226/:235) — 256 would
-//     silently wrap to 0. 0 = kernel default (inherit).
+//     silently wrap to 0. 0 = unset; the runtime substitutes its
+//     default of 64 (tunnel.go:202-205), not the kernel inherit
+//     behaviour (AGY r1 Low on PR #1886).
 //   - key: compiled via uint32(Atoi) (compiler_interfaces.go:168/:262),
 //     so negatives and values past 2^32-1 silently wrap; the GRE key
 //     wire field (IKey/OKey, tunnel.go:238-239) is exactly 32 bits.
@@ -2080,7 +2082,7 @@ func tunnelSchemaChildren() map[string]*schemaNode {
 			args:          1,
 			placeholder:   "<number>",
 			valueType:     ValueInteger,
-			valueDesc:     "Tunnel TTL (0..255; 0 = inherit, one wire byte)",
+			valueDesc:     "Tunnel TTL (0..255; 0 = use the default 64, one wire byte)",
 			valueExamples: []string{"64"},
 			validator:     ValidateInteger(0, 255),
 			children:      nil,

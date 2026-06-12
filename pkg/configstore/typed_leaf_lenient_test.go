@@ -253,6 +253,34 @@ func TestCommitCheck_AcceptsGroupDefinedForwardingClass(t *testing.T) {
 	}
 }
 
+// AGY r1 HIGH on PR #1886: apply-groups expansion REMOVES the groups
+// stanza, so a forwarding-class defined ONLY in the PEER node's group
+// (un-applied locally) used to vanish from the refs union — a shared
+// firewall section referencing it would commit on node1 but falsely
+// reject on node0, wedging cluster config sync. The strict gate now
+// collects definitions from the PRE-expansion candidate too
+// (SchemaValidateWithDefinitions).
+func TestCommitCheck_AcceptsPeerNodeGroupForwardingClass(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config")
+	writeStoredConfig(t, cfgPath,
+		"set groups node0 system host-name fw0",
+		"set groups node1 class-of-service forwarding-classes queue 5 iperf-video",
+		`set apply-groups "${node}"`,
+		"set firewall family inet filter f1 term t1 then forwarding-class iperf-video")
+
+	s := New(cfgPath)
+	s.SetNodeID(0) // node1's group is NOT applied here
+	if err := s.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	if _, err := s.CommitCheck(); err != nil {
+		t.Fatalf("peer-node group definition must satisfy the shared reference, got: %v", err)
+	}
+}
+
 // A stored dangling reference (legal before the leaf was typed) must
 // warn-boot, compile verbatim, and be rejected by the next strict commit.
 func TestLoad_ToleratesStoredDanglingForwardingClass(t *testing.T) {
