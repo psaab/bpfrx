@@ -238,6 +238,15 @@ Forward-only sweep entries are reconstructed into full conntrack state:
 ### FIB Cache (Not Synced — By Design)
 - `fib_ifindex`, `fib_dmac`, `fib_smac`, `fib_gen` are zeroed in synced sessions
 - Interface indices and MACs differ between nodes; zero forces fresh `bpf_fib_lookup`
+- **Userspace-dataplane exception (#1873):** when
+  `LogFlagUserspaceTunnelEndpoint` is set, `fib_gen` carries the
+  session's `tunnel_endpoint_id` across the cluster as a bare LE u16.
+  Ids are content-derived (`config.StableTunnelEndpointID` — a frozen
+  FNV-1a fold of the unit-qualified tunnel interface name), so both
+  nodes compute identical ids from identical config and the value is
+  portable by construction. The receiving node resolves it against its
+  own snapshot (`sessionSyncTunnelEndpointLocked`); an unknown id
+  degrades that synced session to NoRoute until configs converge.
 
 ### Known Issues
 - **NO_NEIGH after failover (FIXED, `0080cbc`):** Cold ARP cache on takeover previously caused `bpf_fib_lookup` rc=7 and mis-forward behavior. This was fixed in HA sync hardening.
