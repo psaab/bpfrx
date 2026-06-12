@@ -650,6 +650,14 @@ fn drive_attempt_machine(
             let _ = engine.take_rekey_request();
             let _ = engine.take_handshake_request();
             *attempt = None;
+            // Codex code-r1 BLOCKER: `actions` was computed BEFORE this
+            // cleanup — a T7 DeadPeer (or stale-edge) trigger captured
+            // in it would resurrect a fresh 90s window in the SAME
+            // pass, bypassing the boundary we just enforced. Return
+            // without evaluating triggers; the next pass (<=1s tick)
+            // recomputes actions from the post-cleanup state, where a
+            // genuinely-due T8 still starts its fresh window (AGY F4).
+            return WG_NO_DEADLINE_NS;
         }
     }
 
@@ -1320,6 +1328,59 @@ mod tests {
             started.elapsed()
         );
         assert!(!stop.load(Ordering::Relaxed));
+    }
+
+    /// Codex code-r1 BLOCKER regression: a T5 give-up must NOT
+    /// evaluate the (pre-cleanup) TimerActions in the same pass — a T7
+    /// DeadPeer trigger captured before the cleanup would resurrect a
+    /// fresh 90s window immediately, bypassing the give-up boundary.
+    #[test]
+    fn attempt_give_up_ignores_same_pass_stale_actions() {
+        use crate::afxdp::wg::session::REKEY_ATTEMPT_TIME_NS;
+        use crate::afxdp::wg::timers::{InitiateReason, TimerActions, WG_NO_DEADLINE_NS};
+        let (engine, socket, _tun, _pipe_w, exceptions, _stop) = poll_loop_fixture();
+        let pk = engine.first_peer_pubkey().unwrap();
+        let ep: SocketAddr = "127.0.0.1:39999".parse().unwrap();
+        let mut encap_buf = vec![0u8; 2048];
+        let now = 200_000_000_000u64;
+        let mut attempt = Some(HandshakeAttempt {
+            started_ns: now - REKEY_ATTEMPT_TIME_NS - 1,
+            last_tx_ns: now - 1_000_000_000,
+            baseline_session: None,
+        });
+        // Stale actions captured BEFORE the give-up cleanup, carrying a
+        // due T7 trigger.
+        let stale_actions = TimerActions {
+            initiate: Some(InitiateReason::DeadPeer),
+            send_keepalive: None,
+            next_deadline_ns: WG_NO_DEADLINE_NS,
+        };
+        let deadline = drive_attempt_machine(
+            &engine,
+            &socket,
+            false,
+            &pk,
+            Some(ep),
+            &stale_actions,
+            now,
+            &mut attempt,
+            &mut encap_buf,
+            "wg-test",
+            &exceptions,
+        );
+        assert!(
+            attempt.is_none(),
+            "give-up must not resurrect an attempt from stale same-pass actions"
+        );
+        assert_eq!(deadline, WG_NO_DEADLINE_NS);
+        assert_eq!(
+            engine
+                .counters()
+                .rekeys_initiated_dead_peer
+                .load(Ordering::Relaxed),
+            0,
+            "no DeadPeer attempt may start in the give-up pass"
+        );
     }
 
     /// AGY r3 G3: the ns->ms conversion clamps to the cap and never

@@ -41,3 +41,6 @@ CONVERGED at plan v9 (c0ad0bd07): 3/3 PLAN-READY. Path A (combined timers + poll
 
 # Implementation PR #1907 (engineer/1888-wg-timers)
 - Copilot: requested (comment "@copilot review")
+- Codex code-r1: task-mqat2zol-ke349t — NEEDS-REVISION (1 BLOCKER give-up same-pass stale-actions bypass — fixed; 1 MINOR help text — fixed; 1 NIT whitespace — fixed)
+- AGY code-r1: adversarial-review-mqat2q0z-tu2tk8 — MERGE-READY (8/8 plan guarantees VERIFIED; 1 no-change NIT)
+- Claude SMR code-r1: claude-smr-code-r1.md — MERGE-READY after F1/F5/F6 fixes (3 mandated worked traces PASS; independently confirmed the Codex BLOCKER)

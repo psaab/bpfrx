@@ -67,7 +67,7 @@ All five AGY Round 2 findings are verified as **RESOLVED** in the [plan.md](file
 The clock reversal ([plan.md:12-18](file:///home/ps/git/bpfrx/.claude/worktrees/1888-research/docs/research/1888-wg-timers/plan.md#L12-L18), [plan.md:308-320](file:///home/ps/git/bpfrx/.claude/worktrees/1888-research/docs/research/1888-wg-timers/plan.md#L308-L320)) is **accepted**.
 
 #### Cost Trace
-In the S2a topology, `try_decap` only runs on the control thread. Egress `try_encap` runs on the control thread and the rarely-hit AF_XDP worker transit path ([frame/wg.rs:98](file:///home/ps/git/bpfrx/.claude/worktrees/1888-research/userspace-dp/src/afxdp/frame/wg.rs#L98)). 
+In the S2a topology, `try_decap` only runs on the control thread. Egress `try_encap` runs on the control thread and the rarely-hit AF_XDP worker transit path ([frame/wg.rs:98](file:///home/ps/git/bpfrx/.claude/worktrees/1888-research/userspace-dp/src/afxdp/frame/wg.rs#L98)).
 *   **Control Thread:** Reading `CLOCK_MONOTONIC` via a vDSO call (~20–25ns) once per iteration is negligible compared to the socket and TUN I/O operations (~1000–5000ns).
 *   **Transit Path:** The transit path already heap-allocates twice per packet and calls `monotonic_nanos()` on its `NoSession` arm. A 20ns clock read is a tiny fraction of the allocation and AEAD encryption overhead (~500–1500ns).
 *   **Fast Path:** The AF_XDP worker fast path does not call `try_encap` or read the clock, so there is exactly **0ns** cost added to the main forwarding path.

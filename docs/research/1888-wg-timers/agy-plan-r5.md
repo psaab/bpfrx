@@ -4,11 +4,11 @@ An adversarial review of Plan v7 for the WireGuard timers implementation and blo
 
 ### 1. Resolution of Prior Findings (H1 / H2 / H3)
 
-*   **H1 (MAJOR - during-attempt T7 re-arm carried past give-up):** **RESOLVED.** 
+*   **H1 (MAJOR - during-attempt T7 re-arm carried past give-up):** **RESOLVED.**
     *   *Evidence:* Section 5.2 explicitly mandates that both attempt-end paths (success and give-up) clear `t7_arm` (lines 620–629), preventing egress data sent during the attempt from triggering an immediate fresh attempt window post-boundary.
-*   **H2 (MINOR - stale rekey edge after success):** **RESOLVED.** 
+*   **H2 (MINOR - stale rekey edge after success):** **RESOLVED.**
     *   *Evidence:* Section 5.2 specifies that both attempt-end paths drain both `take_rekey_request` and `take_handshake_request` edges (lines 620–629), ensuring stale during-attempt requests do not queue a redundant handshake.
-*   **H3 (NIT - `t8_last_attempt_ns` field omission):** **RESOLVED.** 
+*   **H3 (NIT - `t8_last_attempt_ns` field omission):** **RESOLVED.**
     *   *Evidence:* `t8_last_attempt_ns` is added as an `AtomicU64` to the `Peer` struct in Section 5.1 (line 355), making it engine-visible so `timer_pass` can read it for T8 due-ness and skip-pacing (lines 23–25).
 
 ---
