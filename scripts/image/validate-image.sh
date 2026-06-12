@@ -193,9 +193,10 @@ EOF
 	guest xpf-image-b test -s /etc/xpf/xpf.conf || fail "/etc/xpf/xpf.conf missing"
 	guest xpf-image-b sh -c 'journalctl -u xpf-day0-config -b --no-pager | grep -q "day-0 config installed"' ||
 		fail "day-0 loader did not log the install"
-	# Committed by xpfd's bootstrap-from-file: hostname applied + CLI shows it.
+	# Committed by xpfd's bootstrap-from-file: hostname applied + CLI shows
+	# it. The remote cli is interactive — pipe the command on stdin.
 	local tries=0
-	while ! guest xpf-image-b sh -c '/usr/local/sbin/cli show configuration 2>/dev/null | grep -q "host-name xpf-day0-b"'; do
+	while ! guest xpf-image-b sh -c 'echo "show configuration" | /usr/local/sbin/cli 2>/dev/null | grep -q "host-name xpf-day0-b"'; do
 		sleep 3
 		tries=$((tries + 1))
 		if [ $tries -ge 20 ]; then fail "committed config does not show host-name xpf-day0-b"; fi
