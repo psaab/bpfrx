@@ -98,6 +98,48 @@ func TestTunnelEndpointIDCollisionAcrossGroupsIsSymmetric(t *testing.T) {
 	}
 }
 
+// #1910 r3 Codex: the collision gate must not model endpoint ids the
+// snapshot builder never publishes. An interface-level WireGuard
+// tunnel with units emits exactly ONE endpoint (lowest unit ref), so
+// a collision involving a higher, never-emitted unit ref must not
+// reject the commit. Real collision under the frozen fold:
+// StableTunnelEndpointID("wg0.1") == StableTunnelEndpointID("wg341")
+// == 14730, but only "wg0.0" (16091) and "wg341" are published.
+func TestTunnelEndpointIDNoFalsePositiveOnNonEmittedWGUnit(t *testing.T) {
+	if a, b := StableTunnelEndpointID("wg0.1"), StableTunnelEndpointID("wg341"); a != b || a != 14730 {
+		t.Fatalf("precondition: wg0.1=%d wg341=%d, want both 14730 (frozen fold)", a, b)
+	}
+	tree := buildTree(t, []string{
+		"set interfaces wg0 tunnel mode wireguard",
+		"set interfaces wg0 unit 0 family inet address 10.70.0.1/30",
+		"set interfaces wg0 unit 1 family inet address 10.70.0.5/30",
+		"set interfaces wg341 tunnel mode wireguard",
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig rejected a config whose only id collision is on a never-emitted WG unit ref: %v", err)
+	}
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "collision") {
+			t.Fatalf("unexpected collision warning: %q", w)
+		}
+	}
+}
+
+// And the inverse: a collision on the EMITTED lowest unit ref of an
+// interface-level WG tunnel must still be rejected.
+func TestTunnelEndpointIDCollisionOnEmittedWGUnitStillRejected(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set interfaces wg1408 tunnel mode wireguard",
+		"set interfaces wg1408 unit 0 family inet address 10.70.1.1/30",
+		"set interfaces wg1408 unit 1 family inet address 10.70.1.5/30",
+		"set interfaces wg78 unit 0 tunnel mode wireguard",
+	})
+	if _, err := CompileConfig(tree); err == nil {
+		t.Fatalf("CompileConfig accepted a collision on the emitted lowest unit ref (wg1408.0 vs wg78.0)")
+	}
+}
+
 // Non-colliding multi-tunnel configs must compile clean (no false
 // positives from the gate).
 func TestTunnelEndpointIDNoFalsePositive(t *testing.T) {

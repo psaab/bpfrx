@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"sort"
+	"strconv"
 )
 
 // StableTunnelEndpointID maps a tunnel interface name (unit-qualified,
@@ -33,9 +34,14 @@ func StableTunnelEndpointID(name string) uint16 {
 // endpoint names declared under one "interfaces" hierarchy node,
 // mirroring buildTunnelEndpointSnapshots naming exactly:
 //
-//   - interface-level tunnel, no units  -> "name"
-//   - interface-level tunnel with units -> "name.N" per unit
-//   - unit-level tunnel                 -> "name.N"
+//   - interface-level tunnel, no units            -> "name"
+//   - interface-level WIREGUARD tunnel with units -> "name.N" of the
+//     lowest numeric unit only (one persistent TUN = one endpoint,
+//     #1910 r2/r3 Codex) — registering every unit would model ids the
+//     builder never publishes and could falsely reject a commit on a
+//     collision involving a never-emitted ref
+//   - interface-level non-WG tunnel with units    -> "name.N" per unit
+//   - unit-level tunnel                           -> "name.N"
 //
 // Handles both AST shapes (hierarchical merged keys and flat-set
 // single-key chains) via the same namedInstances helper the compiler
@@ -52,11 +58,33 @@ func collectTunnelEndpointNamesAST(ifacesNode *Node, out map[string]struct{}) {
 		if name == "" {
 			continue
 		}
-		hasIfaceTunnel := iface.FindChild("tunnel") != nil
+		tunnelNode := iface.FindChild("tunnel")
+		hasIfaceTunnel := tunnelNode != nil
 		units := namedInstances(iface.FindChildren("unit"))
 		if hasIfaceTunnel && len(units) == 0 {
 			out[name] = struct{}{}
 			continue
+		}
+		if hasIfaceTunnel && astTunnelModeWireguard(tunnelNode) {
+			// Mirror the builder's single-endpoint selection: the
+			// lowest numeric unit. (Non-numeric unit names never
+			// compile into typed Units; if none parses, fall through
+			// to per-unit registration below — same as pre-#1910.)
+			lowest, found := "", false
+			lowestNum := 0
+			for _, unit := range units {
+				n, err := strconv.Atoi(unit.name)
+				if err != nil {
+					continue
+				}
+				if !found || n < lowestNum {
+					lowest, lowestNum, found = unit.name, n, true
+				}
+			}
+			if found {
+				out[fmt.Sprintf("%s.%s", name, lowest)] = struct{}{}
+				continue
+			}
 		}
 		for _, unit := range units {
 			if unit.name == "" {
@@ -67,6 +95,24 @@ func collectTunnelEndpointNamesAST(ifacesNode *Node, out map[string]struct{}) {
 			}
 		}
 	}
+}
+
+// astTunnelModeWireguard reports whether a tunnel AST node carries an
+// explicit `mode wireguard` — the exact extraction the compiler uses
+// for TunnelConfig.Mode (prop Keys[1], compiler_interfaces.go), so the
+// collision gate's single-endpoint selection matches the compiled
+// outcome by construction. The compiler's prefix-derived default mode
+// is only ever gre/ipip, so wireguard is always explicit.
+func astTunnelModeWireguard(tunnelNode *Node) bool {
+	if tunnelNode == nil {
+		return false
+	}
+	for _, prop := range tunnelNode.Children {
+		if prop.Name() == "mode" && len(prop.Keys) >= 2 && prop.Keys[1] == "wireguard" {
+			return true
+		}
+	}
+	return false
 }
 
 // validateTunnelEndpointIDCollisionAST checks the UNION of tunnel

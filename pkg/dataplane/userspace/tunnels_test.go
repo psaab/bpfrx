@@ -94,16 +94,18 @@ func TestBuildTunnelEndpointSnapshotsInterfaceLevelWireguardMultiUnitSingleEndpo
 		t.Fatalf("endpoint id = %d, want stable id of lowest unit ref %d", ep.ID, want)
 	}
 
-	// A missing low-unit snapshot row must fall through to the next
-	// unit (parity with how per-unit emission skipped absent rows) —
-	// still exactly one endpoint, keyed by the surviving unit ref.
+	// The selected ref is a pure function of CONFIG (#1873): if the
+	// lowest configured unit's snapshot row is absent the endpoint is
+	// dropped — never re-keyed to another unit at runtime, which could
+	// diverge the endpoint id across HA nodes. (In practice rows are
+	// all-or-nothing: every unit of an interface-level wg shares one
+	// LinuxName/ifindex.)
 	withoutUnit0 := []InterfaceSnapshot{
-		{Name: "wg0", LinuxName: "wg0", Ifindex: 42},
 		{Name: "wg0.1", LinuxName: "wg0", Ifindex: 42},
 	}
 	endpoints = buildTunnelEndpointSnapshots(cfg, withoutUnit0)
-	if len(endpoints) != 1 || endpoints[0].Interface != "wg0.1" {
-		t.Fatalf("endpoints without unit-0 row = %+v, want one endpoint keyed wg0.1", endpoints)
+	if len(endpoints) != 0 {
+		t.Fatalf("endpoints without the lowest-unit row = %+v, want none (config-deterministic ref, no runtime re-keying)", endpoints)
 	}
 }
 

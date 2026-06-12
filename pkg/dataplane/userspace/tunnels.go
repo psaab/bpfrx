@@ -156,18 +156,17 @@ func buildTunnelEndpointSnapshots(cfg *config.Config, interfaces []InterfaceSnap
 				// second control thread tombstones on the duplicate UDP
 				// bind, so routes can select an engine whose control
 				// thread never came up. Emit exactly one endpoint,
-				// keyed by the lowest unit ref that has a snapshot row
-				// (so the common single-unit-0 shape keeps its existing
-				// stable id, and a missing/nil low unit falls through
-				// to the next one exactly like per-unit emission did).
-				for _, unitNum := range unitNums {
-					ref := fmt.Sprintf("%s.%d", name, unitNum)
-					if _, ok := ifaceByName[ref]; !ok {
-						continue
-					}
-					addEndpoint(ref, iface.Tunnel)
-					break
-				}
+				// keyed by the LOWEST CONFIGURED unit ref — a pure
+				// function of config, never of runtime snapshot rows,
+				// so both HA nodes compute the same endpoint id from
+				// the same config (#1873) and the commit-time collision
+				// gate (collectTunnelEndpointNamesAST) can mirror the
+				// selection exactly. The common single-unit-0 shape
+				// keeps its existing stable id. Rows for every unit of
+				// an interface-level wg share one LinuxName/ifindex, so
+				// row presence is all-or-nothing: if the device is
+				// absent, addEndpoint drops the ref like it always did.
+				addEndpoint(fmt.Sprintf("%s.%d", name, unitNums[0]), iface.Tunnel)
 				continue
 			}
 			for _, unitNum := range unitNums {
