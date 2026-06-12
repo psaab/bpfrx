@@ -86,12 +86,17 @@ type Store struct {
 	archiveMax int    // max archives to keep
 }
 
-// New creates a new config store.
-func New(filePath string) *Store {
+// New creates a new config store. It fails closed when the .configdb
+// directory cannot be created (#1893): there is no file-only fallback
+// backend — every persistence path (Load, writeActive, the #1799
+// persist-retry goroutine) dereferences the DB, so constructing a Store
+// without one would trade this precise boot-time error for a delayed
+// nil-pointer panic on the first Load/Save/commit.
+func New(filePath string) (*Store, error) {
 	dbDir := filepath.Join(filepath.Dir(filePath), ".configdb")
 	db, err := NewDB(dbDir)
 	if err != nil {
-		slog.Warn("failed to create config db, falling back to file-only", "err", err)
+		return nil, fmt.Errorf("config db %s unusable: %w (no file-only fallback exists; refusing to run without config persistence)", dbDir, err)
 	}
 
 	journalPath := filepath.Join(filepath.Dir(filePath), ".config.journal")
@@ -103,7 +108,7 @@ func New(filePath string) *Store {
 		db:       db,
 		journal:  NewJournal(journalPath),
 		nodeID:   -1,
-	}
+	}, nil
 }
 
 // Load builds the configuration from disk.

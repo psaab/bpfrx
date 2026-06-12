@@ -21,7 +21,6 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/psaab/xpf/pkg/config"
-	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/dataplane"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -154,7 +153,7 @@ func TestReadPolicyCountersPreservesScheduledRuleCountersAcrossDeleteReadd(t *te
 }
 
 func TestReadPolicyCountersMapsCommittedScheduledPolicyToHelperIdentity(t *testing.T) {
-	store := configstore.New(filepath.Join(t.TempDir(), "xpf.conf"))
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
 	if err := store.EnterConfigure(); err != nil {
 		t.Fatalf("EnterConfigure() error = %v", err)
 	}

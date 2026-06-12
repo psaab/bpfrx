@@ -5,12 +5,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/rpm"
 )
 
 func TestShowRPMProbeResultsFallsBackToConfigWhenLiveResultsEmpty(t *testing.T) {
-	store := configstore.New(filepath.Join(t.TempDir(), "config.conf"))
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "config.conf"))
 	_, err := store.SyncApply(`services {
     rpm {
         probe monitor {
@@ -49,7 +48,7 @@ func TestShowRPMProbeResultsFallsBackToConfigWhenLiveResultsEmpty(t *testing.T) 
 
 func TestShowRPMProbeResultsReportsNoActiveConfiguration(t *testing.T) {
 	c := &CLI{
-		store: configstore.New(filepath.Join(t.TempDir(), "config.conf")),
+		store: newConfigStore(t, filepath.Join(t.TempDir(), "config.conf")),
 		rpmResultsFn: func() []*rpm.ProbeResult {
 			return []*rpm.ProbeResult{}
 		},

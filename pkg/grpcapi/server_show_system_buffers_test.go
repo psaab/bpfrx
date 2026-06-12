@@ -5,7 +5,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
@@ -28,7 +27,7 @@ func (f *systemBuffersUserspaceDP) SessionCount() (int, int) {
 
 func TestShowTextSystemBuffersUsesUserspaceStatus(t *testing.T) {
 	s := &Server{
-		store: configstore.New(t.TempDir() + "/xpf.conf"),
+		store: newConfigStore(t, t.TempDir()+"/xpf.conf"),
 		dp: &systemBuffersUserspaceDP{
 			Manager: dataplane.New(),
 			v4:      3,
@@ -88,7 +87,7 @@ func TestShowTextSystemBuffersUsesUserspaceStatus(t *testing.T) {
 
 func TestShowTextSystemBuffersDetailIncludesUserspaceRowsAndSessions(t *testing.T) {
 	s := &Server{
-		store: configstore.New(t.TempDir() + "/xpf.conf"),
+		store: newConfigStore(t, t.TempDir()+"/xpf.conf"),
 		dp: &systemBuffersUserspaceDP{
 			Manager: dataplane.New(),
 			v4:      4,

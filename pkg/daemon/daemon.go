@@ -354,13 +354,19 @@ type CompileHealth struct {
 
 const standbyNeighborRefreshMinInterval = time.Second
 
-// New creates a new Daemon.
-func New(opts Options) *Daemon {
+// New creates a new Daemon. It fails when the config store cannot be
+// constructed (#1893 — the store is fail-closed on an unusable
+// .configdb): a daemon that cannot persist configuration must not
+// boot pretending otherwise.
+func New(opts Options) (*Daemon, error) {
 	if opts.ConfigFile == "" {
 		opts.ConfigFile = "/etc/xpf/xpf.conf"
 	}
 
-	store := configstore.New(opts.ConfigFile)
+	store, err := configstore.New(opts.ConfigFile)
+	if err != nil {
+		return nil, fmt.Errorf("config store: %w", err)
+	}
 
 	// Read cluster node ID from file. If the file exists and contains a
 	// valid integer, the daemon runs in cluster mode with ${node} variable
@@ -390,7 +396,7 @@ func New(opts Options) *Daemon {
 		localFailoverCommitDelay:   200 * time.Millisecond,
 		userspaceDemotionPrepUntil: make(map[int]time.Time),
 		applySem:                   semaphore.NewWeighted(1),
-	}
+	}, nil
 }
 
 // NOTE (#1519, sub-#1451 S4): the (*Daemon).legacyDP() escape hatch

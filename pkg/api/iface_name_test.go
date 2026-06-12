@@ -9,7 +9,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/dhcp"
 )
 
@@ -33,7 +32,7 @@ func TestInterfacesHandler_ResolvesRethToLoopback(t *testing.T) {
 	// Build a Junos config via configstore.LoadSet so we exercise the
 	// real compiler path. `lo { gigether-options { redundant-parent reth0; } }`
 	// plus `reth0` registers lo as reth0's physical member.
-	store := configstore.New(filepath.Join(t.TempDir(), "xpf.conf"))
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
 	if err := store.EnterConfigure(); err != nil {
 		t.Fatalf("EnterConfigure: %v", err)
 	}
@@ -129,7 +128,7 @@ func TestWriteInterfacesDetail_DHCPLeasePath(t *testing.T) {
 		t.Skipf("test runner has no lo netdev: %v", err)
 	}
 
-	store := configstore.New(filepath.Join(t.TempDir(), "xpf.conf"))
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
 	if err := store.EnterConfigure(); err != nil {
 		t.Fatalf("EnterConfigure: %v", err)
 	}

@@ -23,7 +23,7 @@ func (f *firewallFilterUserspaceDP) Status() (dpuserspace.ProcessStatus, error) 
 func newFirewallFilterTestStore(t *testing.T) *configstore.Store {
 	t.Helper()
 
-	store := configstore.New(filepath.Join(t.TempDir(), "xpf.conf"))
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
 	if err := store.EnterConfigure(); err != nil {
 		t.Fatalf("EnterConfigure() error = %v", err)
 	}
@@ -155,7 +155,7 @@ func TestScreenSYNCookieCounterRowsUsesUserspaceStatus(t *testing.T) {
 func matchPoliciesCLITestConfig(t *testing.T) *config.Config {
 	t.Helper()
 
-	store := configstore.New(filepath.Join(t.TempDir(), "xpf.conf"))
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
 	if err := store.EnterConfigure(); err != nil {
 		t.Fatalf("EnterConfigure() error = %v", err)
 	}
@@ -268,7 +268,7 @@ func TestShowMatchPoliciesValidation(t *testing.T) {
 // copy of the matcher. Malformed IPs must error rather than
 // wildcard-match; empty/valid inputs report a match (#1711).
 func TestTestPolicyValidation(t *testing.T) {
-	store := configstore.New(filepath.Join(t.TempDir(), "xpf.conf"))
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
 	if err := store.EnterConfigure(); err != nil {
 		t.Fatalf("EnterConfigure() error = %v", err)
 	}

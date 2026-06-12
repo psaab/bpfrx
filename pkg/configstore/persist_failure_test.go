@@ -114,7 +114,7 @@ func TestRestart_AfterFailedOperatorPersistLoadsPreviousConfig(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config")
 
-	s1 := New(path)
+	s1 := newTestStoreAt(t, path)
 	commitBaseline(t, s1)
 
 	if err := s1.SetFromInput("security zones security-zone untrust interfaces eth1.0"); err != nil {
@@ -126,7 +126,7 @@ func TestRestart_AfterFailedOperatorPersistLoadsPreviousConfig(t *testing.T) {
 	}
 
 	// "Restart": fresh store, real Load from disk.
-	s2 := New(path)
+	s2 := newTestStoreAt(t, path)
 	if err := s2.Load(); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -486,7 +486,7 @@ func TestCommit_SuccessClearsDegradedFlag(t *testing.T) {
 // rolling a NEWER commit back to an older tree.
 func TestStaleConfirmTimerCallbackIsNoOp(t *testing.T) {
 	dir := t.TempDir()
-	s := New(filepath.Join(dir, "config"))
+	s := newTestStoreAt(t, filepath.Join(dir, "config"))
 	commitBaseline(t, s)
 
 	// Commit 1 confirmed: arms timer generation g1.
