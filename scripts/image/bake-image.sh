@@ -253,7 +253,7 @@ virt-customize -a "$WORK_DIR/work.qcow2" \
 	--run-command "export DEBIAN_FRONTEND=noninteractive && $APT_UPDATE" \
 	--run-command "export DEBIAN_FRONTEND=noninteractive && apt-get install -y -qq -o Acquire::Retries=5 ${RUNTIME_PACKAGES[*]}" \
 	--run-command 'export DEBIAN_FRONTEND=noninteractive && apt-get install -y -qq -o Acquire::Retries=5 linux-generic' \
-	--run-command 'latest=$(ls /lib/modules | sort -V | tail -1) && dpkg --compare-versions "${latest%%-*}" ge 6.18 || { echo "FATAL: newest installed kernel $latest < 6.18 (verifier floor — the latest Ubuntu release regressed below it?)" >&2; exit 1; }' \
+	--run-command 'latest=$(ls /lib/modules | sort -V | tail -1) && case "$latest" in [0-9]*) ;; *) echo "FATAL: non-kernel entry $latest in /lib/modules (dpkg --compare-versions warn-passes non-numeric strings — refusing)" >&2; exit 1 ;; esac && dpkg --compare-versions "${latest%%-*}" ge 6.18 || { echo "FATAL: newest installed kernel $latest < 6.18 (verifier floor — the latest Ubuntu release regressed below it?)" >&2; exit 1; }' \
 	--run-command 'test -d "/lib/modules/$(ls /lib/modules | sort -V | tail -1)/kernel/drivers/net/ethernet/mellanox" || { echo "FATAL: linux-modules-extra missing (mlx5/i40e drivers) — linux-generic install incomplete" >&2; exit 1; }' \
 	--run-command 'export DEBIAN_FRONTEND=noninteractive && apt-get purge -y -qq linux-virtual linux-image-virtual linux-headers-virtual 2>/dev/null || true' \
 	--run-command 'export DEBIAN_FRONTEND=noninteractive; newest=$(ls /lib/modules | sort -V | tail -1) && dpkg-query -W -f "\${Package}\n" 2>/dev/null | grep -E "^linux-(image|modules|modules-extra)-[0-9]" | grep -v -- "$newest" | xargs -r apt-get purge -y -qq; true' \
@@ -306,7 +306,10 @@ info "Exporting $QCOW_OUT (sparsified + compressed qcow2)..."
 # stay ALLOCATED with stale data and defeat compression — the first
 # Ubuntu bake exported 3.5 GB instead of ~1 GB. Sparsify zero-fills
 # free space so the compressed image carries only live data.
-virt-sparsify --quiet --compress "$WORK_DIR/work.qcow2" "$QCOW_OUT"
+# --tmp pins the multi-GB temporary overlay to the work dir (whose
+# filesystem demonstrably has space — it already holds the work disk)
+# instead of whatever default tmp the host uses.
+virt-sparsify --quiet --tmp "$WORK_DIR" --compress "$WORK_DIR/work.qcow2" "$QCOW_OUT"
 
 info "Exporting $META_OUT (incus VM image metadata)..."
 cat >"$WORK_DIR/metadata.yaml" <<EOF
