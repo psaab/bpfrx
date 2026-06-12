@@ -2672,7 +2672,22 @@ pub(super) fn poll_binding_process_descriptor(
                                 // next packet retries the install once the
                                 // table has room, converging with the #1771
                                 // duplicate-drop semantics.
+                                // #1873 R-E: tunnel-marked decisions are
+                                // NEVER admitted to pending_neigh. The retry
+                                // path TXes buffered frames via in-place
+                                // MAC/VLAN rewrite with no encapsulation, so
+                                // a buffered tunnel inner packet would go out
+                                // PLAINTEXT on the physical wire when the
+                                // outer neighbor resolves (AGY plan r2,
+                                // verified). The kernel ARP/ICMP probe above
+                                // already fired, and the post-match
+                                // maybe_reinject_slow_path_from_frame call
+                                // routes this frame into the R-C tunnel gate
+                                // (counted drop) — the #1769 resolver keeps
+                                // driving the outer next-hop, and the flow
+                                // recovers via retransmission once resolved.
                                 if !seed_install_refused
+                                    && pending_decision.resolution.tunnel_endpoint_id == 0
                                     && let Some(hop) = pending_decision.resolution.next_hop
                                 {
                                     let pending_key =

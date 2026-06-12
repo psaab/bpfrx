@@ -28,6 +28,17 @@ pub(super) mod teardown;
 pub(in crate::afxdp) struct PreservedReconcileState {
     pub(super) synced_sessions: Vec<SyncedSessionEntry>,
     pub(super) slow_path: Option<Arc<SlowPathReinjector>>,
+    /// #1873 R-D (AGY code r3): the tunnel-owner map (id -> logical
+    /// interface name) captured BEFORE `stop_inner(false)` resets
+    /// `coord.forwarding` to default. The remap purge diff in
+    /// `apply_snapshot` MUST run against this — diffing the
+    /// post-teardown empty state makes every purge arm inert across a
+    /// reconcile boundary.
+    pub(super) tunnel_owners: Vec<(u16, String)>,
+    /// Captured before `stop_inner` resets `coord.validation`: gates
+    /// the new-appearance purge arm so only the GENUINE first apply of
+    /// the helper's life skips it (not every post-teardown apply).
+    pub(super) snapshot_was_installed: bool,
 }
 
 /// Owned BPF map FDs returned by [`snapshot::apply_snapshot`] and
@@ -95,16 +106,22 @@ impl Coordinator {
                 return;
             }
         }
-        let preserved = teardown::tear_down(self);
+        let mut preserved = teardown::tear_down(self);
         reset::reset_binding_counters(bindings);
         let Some(snapshot) = snapshot else {
             self.policy_counters.reconcile_rules(&[]);
             self.last_reconcile_stage = "no_snapshot".to_string();
             return;
         };
-        let Some(fds) =
-            snapshot::apply_snapshot(self, snapshot, bindings, preserved.slow_path)
-        else {
+        let Some(fds) = snapshot::apply_snapshot(
+            self,
+            snapshot,
+            bindings,
+            preserved.slow_path,
+            &preserved.tunnel_owners,
+            preserved.snapshot_was_installed,
+            &mut preserved.synced_sessions,
+        ) else {
             // last_reconcile_stage + per-binding last_error already set
             // inside apply_snapshot on the missing-pin/open-failed legs.
             return;

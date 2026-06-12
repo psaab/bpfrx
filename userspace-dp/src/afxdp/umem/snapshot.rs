@@ -109,6 +109,9 @@ impl BindingLiveState {
                 .load(Ordering::Relaxed),
             slow_path_drops: self.slow_path_drops.load(Ordering::Relaxed),
             slow_path_rate_limited: self.slow_path_rate_limited.load(Ordering::Relaxed),
+            tunnel_encap_unresolved_drops: self
+                .tunnel_encap_unresolved_drops
+                .load(Ordering::Relaxed),
             kernel_rx_dropped: self.kernel_rx_dropped.load(Ordering::Relaxed),
             kernel_rx_invalid_descs: self.kernel_rx_invalid_descs.load(Ordering::Relaxed),
             tx_packets: self.tx_packets.load(Ordering::Relaxed),

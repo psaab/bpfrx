@@ -50,6 +50,16 @@ pub(super) fn wg_encap_frame(
     let inner_meta = inner_meta.into();
     let id = decision.resolution.tunnel_endpoint_id;
     let endpoint = forwarding.tunnel_endpoints.get(&id)?;
+    // #1873 (Codex code r2): refuse to encapsulate when the id's
+    // owning netdev differs from the one recorded in the session's
+    // stored resolution (egress_ifindex = logical_ifindex at resolve
+    // time) — a re-owned id must fail the build (R-C gate drops the
+    // frame), never encapsulate into the new owner.
+    if decision.resolution.egress_ifindex > 0
+        && endpoint.logical_ifindex != decision.resolution.egress_ifindex
+    {
+        return None;
+    }
     let engine = forwarding.wg_engines.get(&id)?;
     let peer_endpoint = endpoint.wg_endpoint?;
     let dst_mac = decision.resolution.neighbor_mac?;

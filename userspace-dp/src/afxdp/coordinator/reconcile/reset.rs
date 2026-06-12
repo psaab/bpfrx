@@ -55,6 +55,7 @@ pub(super) fn reset_binding_counters(bindings: &mut [BindingStatus]) {
         binding.slow_path_forward_build_packets = 0;
         binding.slow_path_drops = 0;
         binding.slow_path_rate_limited = 0;
+        binding.tunnel_encap_unresolved_drops = 0;
         binding.kernel_rx_dropped = 0;
         binding.kernel_rx_invalid_descs = 0;
         binding.last_error.clear();

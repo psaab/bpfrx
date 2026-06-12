@@ -381,6 +381,11 @@ pub(in crate::afxdp) struct BindingLiveState {
     pub(super) slow_path_forward_build_packets: AtomicU64,
     pub(super) slow_path_drops: AtomicU64,
     pub(super) slow_path_rate_limited: AtomicU64,
+    /// #1873 R-C: tunnel-marked inner packets dropped at the slow-path
+    /// chokepoint instead of being reinjected to the kernel TUN
+    /// unencapsulated (the pre-#1873 plaintext-leak fallback). Also
+    /// bumped by the R-E pending-neigh tunnel exclusion.
+    pub(in crate::afxdp) tunnel_encap_unresolved_drops: AtomicU64,
     pub(super) kernel_rx_dropped: AtomicU64,
     pub(super) kernel_rx_invalid_descs: AtomicU64,
     pub(super) tx_packets: AtomicU64,
@@ -717,6 +722,7 @@ impl BindingLiveState {
             slow_path_forward_build_packets: AtomicU64::new(0),
             slow_path_drops: AtomicU64::new(0),
             slow_path_rate_limited: AtomicU64::new(0),
+            tunnel_encap_unresolved_drops: AtomicU64::new(0),
             kernel_rx_dropped: AtomicU64::new(0),
             kernel_rx_invalid_descs: AtomicU64::new(0),
             tx_packets: AtomicU64::new(0),

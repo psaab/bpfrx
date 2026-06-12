@@ -306,6 +306,16 @@ pub(super) fn encapsulate_native_gre_frame(
     let endpoint = forwarding
         .tunnel_endpoints
         .get(&decision.resolution.tunnel_endpoint_id)?;
+    // #1873 (Codex code r2): refuse to encapsulate when the id's
+    // owning netdev differs from the one recorded in the session's
+    // stored resolution (egress_ifindex = logical_ifindex at resolve
+    // time) — a re-owned id must fail the build (R-C gate drops the
+    // frame), never encapsulate into the new owner.
+    if decision.resolution.egress_ifindex > 0
+        && endpoint.logical_ifindex != decision.resolution.egress_ifindex
+    {
+        return None;
+    }
     let dst_mac = decision.resolution.neighbor_mac?;
     let src_mac = decision.resolution.src_mac?;
     let vlan_id = decision.resolution.tx_vlan_id;

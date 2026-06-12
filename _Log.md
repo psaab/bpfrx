@@ -1,5 +1,29 @@
 # Action Log
 
+## 2026-06-11 — #1873 PR #1882 code-review rounds 2-5 (resumed agent)
+- **Timestamp**: 2026-06-11/12 UTC
+- **Action**: Resumed the wedged #1873 /engineer run at PR #1882. Round 2:
+  Codex MERGE-NEEDS-MAJOR killed the r1 rotation-barrier design (private
+  fabric-overlay Arc at worker/loop_body/mod.rs:617; 250ms timeout
+  fail-open) — replaced defer+barrier with the structural per-packet
+  owner check (stored egress_ifindex vs row logical_ifindex at
+  session_glue re-resolve + both encap builders; sticky gate preserves
+  the stale ifindex across write-backs; new-appearance purge arm).
+  Round 3: fixed disarmed-refresh first-apply purge, owner-RG re-homing
+  of gated sessions, and the reconcile-boundary inert-diff (teardown
+  captures tunnel owners + installed flag into PreservedReconcileState;
+  replay-list filtering). Round 4: Codex+AGY converged on the
+  companion-resurrection hazard in the replay filter — extracted
+  filter_replayed_synced_sessions mirroring delete_synced_session
+  companion semantics + pin. Round 5: AGY MERGE-READY; Codex
+  ratification in flight. Gates at 24ca330c1: build rc0, full release
+  2027/0 rc0 (ledger flakes standalone-proven), wg:: 131/0, go rc0.
+- **File(s)**: userspace-dp/src/afxdp/{coordinator/mod.rs,
+  coordinator/reconcile/{mod,snapshot,teardown}.rs, forwarding/mod.rs,
+  forwarding_build/{mod,tunnels,tests}.rs, session_glue/mod.rs, gre.rs,
+  frame/wg.rs, types/forwarding.rs, tests.rs},
+  docs/pr/1873-tunnel-ids/{reviewer-ids.md,claude-smr-code-r2.md}, _Log.md
+
 ## 2026-06-10 — #1852 fragment-aware NAT + MSS-clamp v6 ext gap
 
 - **Action**: Implemented PLAN-READY v3.1 (Codex+AGY+SMR converged). Two

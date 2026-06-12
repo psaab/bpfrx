@@ -43,6 +43,96 @@ fn wg_endpoint_set_summary(state: &ForwardingState) -> String {
     parts.join(",")
 }
 
+/// #1873 R-D: ids whose owner changed across a snapshot apply — absent
+/// in `next`, present with a DIFFERENT logical interface name, or
+/// NEWLY APPEARING in `next` (absent in `previous` — Codex code r2:
+/// an id with no owner in the previous state cannot have a
+/// legitimately live session, so any entry still storing it — e.g. a
+/// synced copy installed with an unresolvable id during an HA config
+/// skew — predates `previous` and must be purged before the new
+/// owner's row becomes reachable). Compared on the LOGICAL config
+/// name (never linux_name — a cosmetic kernel rename must not purge
+/// sessions).
+///
+/// `include_new_appearances` must be FALSE for the first snapshot
+/// apply of a helper's life (previous state is the pristine default):
+/// there every configured id "appears", and purging would wipe
+/// legitimately synced sessions installed before the first apply.
+pub(in crate::afxdp) fn tunnel_remap_purge_ids(
+    previous: &ForwardingState,
+    next: &ForwardingState,
+    include_new_appearances: bool,
+) -> Vec<u16> {
+    let owners: Vec<(u16, String)> = previous
+        .tunnel_endpoints
+        .iter()
+        .map(|(id, ep)| (*id, ep.interface.clone()))
+        .collect();
+    tunnel_remap_purge_ids_from_owners(&owners, next, include_new_appearances)
+}
+
+/// #1873 R-D (AGY code r3): owners-list flavor for the reconcile path,
+/// where `stop_inner(false)` has already defaulted `coord.forwarding`
+/// and the diff baseline must be the owner map captured before
+/// teardown.
+pub(in crate::afxdp) fn tunnel_remap_purge_ids_from_owners(
+    prior_owners: &[(u16, String)],
+    next: &ForwardingState,
+    include_new_appearances: bool,
+) -> Vec<u16> {
+    let mut purge_ids: Vec<u16> = Vec::new();
+    for (id, prev_interface) in prior_owners {
+        match next.tunnel_endpoints.get(id) {
+            None => purge_ids.push(*id),
+            Some(next_ep) if next_ep.interface != *prev_interface => purge_ids.push(*id),
+            Some(_) => {}
+        }
+    }
+    if include_new_appearances {
+        for id in next.tunnel_endpoints.keys() {
+            if !prior_owners.iter().any(|(prev_id, _)| prev_id == id) {
+                purge_ids.push(*id);
+            }
+        }
+    }
+    purge_ids
+}
+
+/// #1873 R-D (AGY code r4): filter the preserved synced-session replay
+/// list by the remap purge set, MIRRORING delete_synced_session's
+/// companion semantics — drop every entry whose stored id is purged,
+/// plus the derived reverse companion (reverse_session_key over the
+/// forward key + NAT decision) of each dropped FORWARD entry, which
+/// itself carries tunnel_endpoint_id == 0 in asymmetric topologies and
+/// would otherwise be resurrected as a half-dead pair by the bringup
+/// replay. A reverse-marked entry drops standalone (its unmarked
+/// forward keeps forwarding without the tunnel), matching the live
+/// purge's delete_synced_session(is_reverse) behavior.
+pub(in crate::afxdp) fn filter_replayed_synced_sessions(
+    entries: &mut Vec<SyncedSessionEntry>,
+    purge_ids: &[u16],
+) {
+    if purge_ids.is_empty() || entries.is_empty() {
+        return;
+    }
+    let mut drop_keys: Vec<crate::session::SessionKey> = Vec::new();
+    for entry in entries.iter() {
+        let id = entry.decision.resolution.tunnel_endpoint_id;
+        if id != 0 && purge_ids.contains(&id) {
+            drop_keys.push(entry.key.clone());
+            if !entry.metadata.is_reverse {
+                drop_keys.push(crate::session::reverse_session_key(
+                    &entry.key,
+                    entry.decision.nat,
+                ));
+            }
+        }
+    }
+    if !drop_keys.is_empty() {
+        entries.retain(|entry| !drop_keys.contains(&entry.key));
+    }
+}
+
 /// #1866 D3: log a WG endpoint-set transition between two forwarding
 /// states. Silent when the set is unchanged (the common case) — fires
 /// only on real add/remove/port/attachment changes, so the cadence is
@@ -979,6 +1069,12 @@ impl Coordinator {
                 bulk.remove(key);
             }
         });
+        // #1873 R-D (Codex code r3): captured BEFORE the overwrite —
+        // gates the new-appearance purge arm below. False only when no
+        // coordinator apply has ever installed a snapshot (disarmed
+        // helper pre-first-arm), where boot-time synced sessions must
+        // not be purged as "new appearances" against a default state.
+        let prior_snapshot_installed = self.validation.snapshot_installed;
         self.validation = ValidationState {
             snapshot_installed: true,
             config_generation: snapshot.generation,
@@ -1011,6 +1107,33 @@ impl Coordinator {
         // with the Go publish-boundary log to pin which layer dropped
         // or retained an endpoint in one journal capture.
         log_wg_endpoint_set_transition("snapshot-refresh", &self.forwarding, &new_forwarding);
+        // #1873 R-D: compute the remap purge set BEFORE the swap, and
+        // PURGE before any store (Codex code-review r1). The worker
+        // loop reads the forwarding Arc, drains commands, THEN runs the
+        // RX sweep — so a worker that observes the new state in
+        // iteration N drains these DeleteSynced commands in the same
+        // iteration before processing a single packet with it. The
+        // purge is CLEANUP (shared maps, worker tables, HA delete
+        // propagation), not the correctness boundary: a stale session
+        // that escapes any purge window can never mis-encapsulate,
+        // because re-resolution and the encap builders refuse an id
+        // whose owning netdev ifindex differs from the one stored in
+        // the session's resolution (Codex code-review r2 — the r1
+        // rotation-barrier approach was unsound: workers can hold
+        // private fabric-overlay Arc clones, and a barrier timeout was
+        // fail-open).
+        // New-appearance purging is gated on a previously-installed
+        // snapshot (Codex code r3): a DISARMED helper stores synced
+        // sessions before its first coordinator apply (reconcile never
+        // ran — `self.forwarding` is still default), so a same-plan
+        // disarmed refresh would otherwise see every configured id as
+        // "new" and wipe those boot-time entries.
+        let tunnel_purge_ids = tunnel_remap_purge_ids(
+            &self.forwarding,
+            &new_forwarding,
+            prior_snapshot_installed,
+        );
+        self.purge_remapped_tunnel_sessions(&tunnel_purge_ids);
         self.forwarding = new_forwarding;
         if self.forwarding.fabrics.is_empty() && !preserved_fabrics.is_empty() {
             self.forwarding.fabrics = preserved_fabrics;

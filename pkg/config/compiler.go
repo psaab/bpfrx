@@ -107,6 +107,17 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 }
 
 func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) {
+	// #1873 R-B: tunnel-endpoint id collision gate. Runs on the
+	// PRE-expansion tree (ExpandGroups removes the groups stanza) so
+	// the check covers the UNION of tunnel names across all groups —
+	// both cluster nodes accept/reject identically. Strict paths
+	// hard-reject; lenient paths warn (see tunnelid.go).
+	tunnelIDWarnings, tunnelIDErr := validateTunnelEndpointIDCollisionAST(
+		tree, opts.sanitizeFreeTextControlChars)
+	if tunnelIDErr != nil {
+		return nil, tunnelIDErr
+	}
+
 	// Clone the tree before expanding groups — the caller's tree must retain
 	// groups and apply-groups nodes for display (show configuration groups).
 	tree = tree.Clone()
@@ -132,6 +143,7 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 	if usedNodeFallback {
 		cfg.Warnings = append(cfg.Warnings, `apply-groups "${node}" resolved using default node0 context during generic compile`)
 	}
+	cfg.Warnings = append(cfg.Warnings, tunnelIDWarnings...)
 	return cfg, nil
 }
 
@@ -159,6 +171,14 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 }
 
 func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts) (*Config, error) {
+	// #1873 R-B: union-of-groups tunnel id collision gate — see
+	// compileConfigWithOpts. Pre-expansion on purpose.
+	tunnelIDWarnings, tunnelIDErr := validateTunnelEndpointIDCollisionAST(
+		tree, opts.sanitizeFreeTextControlChars)
+	if tunnelIDErr != nil {
+		return nil, tunnelIDErr
+	}
+
 	tree = tree.Clone()
 
 	vars := map[string]string{"node": fmt.Sprintf("node%d", nodeID)}
@@ -166,7 +186,12 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 		return nil, fmt.Errorf("apply-groups: %w", err)
 	}
 
-	return compileExpanded(tree, opts)
+	cfg, err := compileExpanded(tree, opts)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Warnings = append(cfg.Warnings, tunnelIDWarnings...)
+	return cfg, nil
 }
 
 // compileExpanded compiles an already-expanded (groups resolved) ConfigTree

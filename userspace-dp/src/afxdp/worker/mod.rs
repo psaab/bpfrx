@@ -1269,6 +1269,8 @@ pub(crate) struct BindingLiveSnapshot {
     pub(crate) slow_path_forward_build_packets: u64,
     pub(crate) slow_path_drops: u64,
     pub(crate) slow_path_rate_limited: u64,
+    /// #1873 R-C/R-E tunnel-marked drop counter (see umem/mod.rs).
+    pub(crate) tunnel_encap_unresolved_drops: u64,
     pub(crate) kernel_rx_dropped: u64,
     pub(crate) kernel_rx_invalid_descs: u64,
     pub(crate) tx_packets: u64,
