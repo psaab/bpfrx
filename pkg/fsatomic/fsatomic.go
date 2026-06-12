@@ -1,0 +1,248 @@
+// Package fsatomic provides the project's two file-replacement writers
+// (#1894): WriteFileAtomic (temp-in-same-dir + rename, namespace
+// atomicity only) and WriteFileDurable (the same plus temp-file fsync
+// and parent-directory fsync, so the replacement survives power loss).
+//
+// Persistence classes (see docs/engineering-style.md, "Persistence
+// classes"):
+//
+//   - DurableState — must survive power loss (active config, rollback
+//     history, rescue config, master.key, DHCPv6 DUID, frr.conf):
+//     use WriteFileDurable.
+//   - AtomicGeneratedConfig — regenerated on boot/apply; a torn file is
+//     unacceptable but a lost-on-power-cut update is fine (swanctl,
+//     Kea, networkd snippets): use WriteFileAtomic. This class exists
+//     precisely so hot apply paths never pay an fsync.
+//   - BestEffortKernelKnob — procfs/sysfs writes: keep direct
+//     os.WriteFile; rename is impossible on those filesystems.
+//
+// Semantics shared by both writers (deliberate, reviewed in
+// docs/pr/1893-configstore-durability/plan.md):
+//
+//   - The target INODE is replaced and perm is enforced on every write.
+//     This differs from os.WriteFile over an existing file, which keeps
+//     the existing inode's mode/owner. Pass WithPreserveExisting to
+//     lift mode/ownership from an existing target instead (fchmod /
+//     fchown on the temp fd, never a path race).
+//   - A symlinked target is replaced by a regular file unless
+//     WithResolveSymlinks is passed, in which case the write lands on
+//     the resolved target (and, for WriteFileDurable, the directory
+//     fsync targets the RESOLVED target's parent).
+//   - Hardlinks: rename inherently breaks nlink>1 write-through — other
+//     links keep the old inode. No call site in this project hardlinks
+//     these files; documented rather than guarded.
+//   - The temp file is removed on every failure path before rename.
+//     After a crash, leaked ".<base>.tmp-*" temps are possible; writers
+//     of frequently-rewritten files should sweep them (configstore's
+//     NewDB does).
+//
+// Durability note: a WriteFileDurable error AFTER the rename (directory
+// fsync failure) means the new content is visible in the namespace but
+// its durability is unknown. Callers treating the write as failed must
+// tolerate the new content surviving — the same crash-window trade the
+// #1799 persist-before-promote contract already documents.
+package fsatomic
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"syscall"
+)
+
+type options struct {
+	preserveExisting bool
+	resolveSymlinks  bool
+}
+
+// Option configures WriteFileAtomic / WriteFileDurable.
+type Option func(*options)
+
+// WithPreserveExisting lifts mode and ownership from an existing target
+// file instead of enforcing the caller's perm. Ownership is restored
+// with fchown on the temp fd only when it actually differs from the
+// temp file's owner; a chown failure is surfaced, never silently
+// renamed over a differently-owned target (FRR #1883 semantics).
+func WithPreserveExisting() Option {
+	return func(o *options) { o.preserveExisting = true }
+}
+
+// WithResolveSymlinks resolves a symlinked path to its target before
+// writing, so the rename replaces the real file rather than the link.
+// A dangling symlink resolves to its (not-yet-existing) destination,
+// matching what os.WriteFile through the link would have created.
+func WithResolveSymlinks() Option {
+	return func(o *options) { o.resolveSymlinks = true }
+}
+
+// Test seams (#1894 injected-failure tests). Production code must never
+// mutate these.
+var (
+	createTemp = os.CreateTemp
+	renameFile = os.Rename
+	statFile   = os.Stat
+	openDir    = os.Open
+	writeTemp  = func(f *os.File, b []byte) (int, error) { return f.Write(b) }
+	chmodTemp  = func(f *os.File, m os.FileMode) error { return f.Chmod(m) }
+	chownTemp  = func(f *os.File, uid, gid int) error { return f.Chown(uid, gid) }
+	syncFile   = func(f *os.File) error { return f.Sync() }
+	closeTemp  = func(f *os.File) error { return f.Close() }
+)
+
+// WriteFileAtomic replaces path with data via create-temp-in-same-dir,
+// write, fchmod, close-with-error-check, rename. Namespace atomicity
+// only — NO fsync: after a power cut the rename may be lost or land on
+// not-yet-flushed data. For the AtomicGeneratedConfig class.
+func WriteFileAtomic(path string, data []byte, perm os.FileMode, opts ...Option) error {
+	return writeFile(path, data, perm, false, opts...)
+}
+
+// WriteFileDurable is WriteFileAtomic plus an fsync of the temp file
+// before the rename and an fsync of the (resolved) parent directory
+// after it, making both the content and the namespace change durable
+// across power loss. For the DurableState class.
+func WriteFileDurable(path string, data []byte, perm os.FileMode, opts ...Option) error {
+	return writeFile(path, data, perm, true, opts...)
+}
+
+// SyncDir fsyncs a directory, making previously-completed renames and
+// unlinks inside it durable. Lets a multi-file shuffle (e.g. the
+// configstore rollback-slot rewrite + stale-slot cleanup) batch its
+// namespace durability into one fsync.
+func SyncDir(dir string) error {
+	d, err := openDir(dir)
+	if err != nil {
+		return fmt.Errorf("open dir %s: %w", dir, err)
+	}
+	defer d.Close()
+	// Go's os.File.Sync routes through internal/poll.FD.Fsync, which
+	// already retries EINTR (ignoringEINTR) — no extra loop needed.
+	if err := syncFile(d); err != nil {
+		return fmt.Errorf("fsync dir %s: %w", dir, err)
+	}
+	return nil
+}
+
+// resolveSymlinkTarget returns the path the write should land on when
+// symlink resolution is requested. EvalSymlinks succeeds only when the
+// whole chain exists; for a *dangling* final symlink, fall back to
+// Readlink so the write creates the link's destination (what writing
+// through the link would have done). A non-symlink path is returned
+// as-is. Lifted verbatim from pkg/frr's atomicWriteFile (#1883).
+func resolveSymlinkTarget(path string) string {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
+	if linkDest, lerr := os.Readlink(path); lerr == nil {
+		if filepath.IsAbs(linkDest) {
+			return linkDest
+		}
+		return filepath.Join(filepath.Dir(path), linkDest)
+	}
+	return path
+}
+
+type ownerIDs struct {
+	uid, gid int
+}
+
+func fileOwner(fi os.FileInfo) (ownerIDs, bool) {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return ownerIDs{}, false
+	}
+	return ownerIDs{uid: int(st.Uid), gid: int(st.Gid)}, true
+}
+
+func tempOwner(f *os.File) (ownerIDs, bool) {
+	fi, err := f.Stat()
+	if err != nil {
+		return ownerIDs{}, false
+	}
+	return fileOwner(fi)
+}
+
+func writeFile(path string, data []byte, perm os.FileMode, durable bool, opts ...Option) error {
+	var o options
+	for _, opt := range opts {
+		opt(&o)
+	}
+
+	target := path
+	if o.resolveSymlinks {
+		target = resolveSymlinkTarget(path)
+	}
+
+	mode := perm
+	var (
+		preserveOwner bool
+		owner         ownerIDs
+	)
+	if o.preserveExisting {
+		if fi, err := statFile(target); err == nil {
+			mode = fi.Mode().Perm()
+			if ids, ok := fileOwner(fi); ok {
+				preserveOwner = true
+				owner = ids
+			}
+		}
+	}
+
+	dir := filepath.Dir(target)
+	tmp, err := createTemp(dir, "."+filepath.Base(target)+".tmp-")
+	if err != nil {
+		return fmt.Errorf("create temp file in %s: %w", dir, err)
+	}
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+
+	if _, err := writeTemp(tmp, data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write temp file: %w", err)
+	}
+	// Mode/ownership on the open fd (fchmod/fchown) before rename: the
+	// final path never appears with a transient mode and there is no
+	// path race on the temp name.
+	if err := chmodTemp(tmp, mode); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chmod temp file: %w", err)
+	}
+	if preserveOwner {
+		if cur, ok := tempOwner(tmp); !ok || cur != owner {
+			if err := chownTemp(tmp, owner.uid, owner.gid); err != nil {
+				_ = tmp.Close()
+				return fmt.Errorf("chown temp file to %d:%d: %w", owner.uid, owner.gid, err)
+			}
+		}
+	}
+	if durable {
+		// Flush data+metadata before the rename so the rename can never
+		// surface a zero-length/partial file after power loss. EINTR is
+		// retried inside the stdlib (internal/poll ignoringEINTR).
+		if err := syncFile(tmp); err != nil {
+			_ = tmp.Close()
+			return fmt.Errorf("sync temp file: %w", err)
+		}
+	}
+	if err := closeTemp(tmp); err != nil {
+		return fmt.Errorf("close temp file: %w", err)
+	}
+	if err := renameFile(tmpName, target); err != nil {
+		return fmt.Errorf("rename %s -> %s: %w", tmpName, target, err)
+	}
+	cleanup = false
+	if durable {
+		// Make the rename itself durable. Uses the RESOLVED target's
+		// parent — with WithResolveSymlinks the symlink's own directory
+		// is irrelevant to where the namespace change happened.
+		if err := SyncDir(dir); err != nil {
+			return err
+		}
+	}
+	return nil
+}
