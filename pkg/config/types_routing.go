@@ -303,6 +303,25 @@ type TunnelConfig struct {
 	KeepaliveRetry  int      // number of missed keepalives before declaring down (0 = default 3)
 	AnchorOnly      bool     // create a dummy anchor instead of a kernel tunnel device
 
+	// MTU is the config-desired link MTU for the tunnel device (#1884):
+	// the owning interface's `mtu` statement (unit-level overrides
+	// interface-level for unit tunnels, mirroring compiler_iface
+	// precedence). 0 means unconfigured — the tunnel manager then never
+	// writes MTU except the one-time TUN-default normalization when
+	// ADOPTING an anchor it did not create (wireguard→gre same-name flip
+	// repair). Populated by collectAppliedTunnels; the legacy
+	// standalone-CLI apply path leaves it 0.
+	MTU int
+
+	// RIListMember is the routing-instance whose `interface` LIST names
+	// this tunnel (after the daemon step-0a name normalization), or ""
+	// (#1884). It is NOT a bind instruction — daemon_apply step 0a owns
+	// list binds. The tunnel manager uses it as (a) an unbind VETO so a
+	// stanza→list move never strips the 0a bind, and (b) the
+	// observation-fallback claim target for later unbind-on-removal.
+	// Populated by collectAppliedTunnels; the legacy CLI path leaves "".
+	RIListMember string
+
 	// WireGuard (#1432 S2a). Populated only when Mode == "wireguard".
 	// Minimal generic surface (the #1703 "generic stanza") — not the
 	// full Junos wireguard grammar (S6). The engine keys encap on

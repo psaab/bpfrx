@@ -80,11 +80,44 @@ func buildRuntimeDataPlane(dpType string) (dataplane.RuntimeDataPlane, error) {
 	}
 }
 
+// riMemberLinuxName converts a routing-instance `interface` list entry
+// (Junos name, e.g. "gr-0/0/0.0") to the Linux interface name the
+// daemon_apply step-0a bind loop targets. SHARED between step 0a and
+// the RIListMember scan in collectAppliedTunnels (#1884): the tunnel
+// manager's unbind-veto/observation logic must mirror exactly what 0a
+// binds. Deliberately the literal step-0a transform — NOT
+// cfg.ResolveKernelIfName — because 0a binds the literal ".N" form for
+// unit>0 entries today (a pre-existing 0a naming gap for "uN" per-unit
+// tunnel devices, tracked as a follow-up; fixing it only here would
+// make the veto claim binds 0a does not perform).
+func riMemberLinuxName(ifaceName string) string {
+	// Convert Junos name (gr-0/0/0.0) to Linux name (gr-0-0-0).
+	// Strip ".0" unit suffix — unit 0 is the base interface.
+	linuxName := config.LinuxIfName(ifaceName)
+	if strings.HasSuffix(linuxName, ".0") {
+		linuxName = strings.TrimSuffix(linuxName, ".0")
+	}
+	return linuxName
+}
+
 func collectAppliedTunnels(cfg *config.Config) []*config.TunnelConfig {
 	if cfg == nil {
 		return nil
 	}
 	anchorOnly := dataplane.EffectiveType(cfg.System.DataplaneType) == dataplane.TypeUserspace
+	// Linux interface name -> routing-instance whose `interface` list
+	// names it, mirroring the step-0a bind loop (forwarding instances
+	// skipped; shared normalization; later entries overwrite, matching
+	// 0a's last-bind-wins iteration). Feeds TunnelConfig.RIListMember.
+	riListMember := map[string]string{}
+	for _, ri := range cfg.RoutingInstances {
+		if ri == nil || ri.InstanceType == "forwarding" {
+			continue
+		}
+		for _, ifaceName := range ri.Interfaces {
+			riListMember[riMemberLinuxName(ifaceName)] = ri.Name
+		}
+	}
 	var tunnels []*config.TunnelConfig
 	for _, ifc := range cfg.Interfaces.Interfaces {
 		if ifc == nil {
@@ -104,6 +137,8 @@ func collectAppliedTunnels(cfg *config.Config) []*config.TunnelConfig {
 		if ifc.Tunnel != nil && (ifc.Tunnel.Source != "" || ifc.Tunnel.Mode == "wireguard") {
 			tc := *ifc.Tunnel
 			tc.AnchorOnly = anchorOnly
+			tc.MTU = ifc.MTU
+			tc.RIListMember = riListMember[tc.Name]
 			tunnels = append(tunnels, &tc)
 		}
 		for _, unit := range ifc.Units {
@@ -112,6 +147,13 @@ func collectAppliedTunnels(cfg *config.Config) []*config.TunnelConfig {
 			}
 			tc := *unit.Tunnel
 			tc.AnchorOnly = anchorOnly
+			// Unit-level MTU overrides interface-level, mirroring the
+			// compiler_iface precedence (#1884).
+			tc.MTU = ifc.MTU
+			if unit.MTU > 0 {
+				tc.MTU = unit.MTU
+			}
+			tc.RIListMember = riListMember[tc.Name]
 			tunnels = append(tunnels, &tc)
 		}
 	}
