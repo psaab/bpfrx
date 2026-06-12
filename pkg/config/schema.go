@@ -257,7 +257,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"aging":                        {desc: "Aggressive session aging thresholds", children: nil},
 			"tcp-session":                  {desc: "TCP session options (timeouts, SYN checks)", children: nil},
 			"udp-session":                  {desc: "UDP session timeout (default 60 seconds)", children: nil},
-			"icmp-session":                 {desc: "ICMP session timeout (default 30 seconds)", children: nil},
+			"icmp-session":                 {desc: "ICMP session timeout (default 60 seconds)", children: nil},
 			"tcp-mss":                      {desc: "TCP MSS clamping (ipsec-vpn|gre-in|gre-out|all-tcp)", children: nil},
 			"allow-dns-reply":              {desc: "Allow unsolicited DNS reply packets", children: nil},
 			"allow-embedded-icmp":          {desc: "Allow ICMP error packets for existing sessions", children: nil},
@@ -355,7 +355,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				"url":             {desc: "Feed URL (takes precedence over hostname)", args: 1, placeholder: "<url>", children: nil},
 				"hostname":        {desc: "Server hostname for building per-feed URLs", args: 1, placeholder: "<hostname>", children: nil},
 				"update-interval": {desc: "Feed refresh interval in seconds (default 3600)", args: 1, placeholder: "<seconds>", children: nil},
-				"hold-interval":   {desc: "Feed hold interval in seconds (default 7200)", args: 1, placeholder: "<seconds>", children: nil},
+				"hold-interval":   {desc: "Feed hold interval in seconds (accepted and displayed; not consumed by the feed runtime)", args: 1, placeholder: "<seconds>", children: nil},
 				"feed-name": {desc: "Named feed on this server", args: 1, placeholder: "<feed-name>", children: map[string]*schemaNode{
 					"path": {desc: "Path on the feed server for this feed", args: 1, placeholder: "<path>", children: nil},
 				}},
@@ -1605,7 +1605,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			// unrecognised governors through so bare-metal operators can
 			// request powersave/ondemand without a schema change
 			// (compiler_system.go cpu-governor case).
-			"cpu-governor": {args: 1, desc: "Host cpufreq governor (performance|schedutil|default)", children: nil},
+			"cpu-governor": {args: 1, desc: "Host cpufreq governor (performance|schedutil|default; other governors pass through verbatim)", children: nil},
 			// 0 is the "use default" zero-value sentinel
 			// (resolvedHostTunables, pkg/daemon/host_tunables.go:494),
 			// so garbage silently meant the default budget.
