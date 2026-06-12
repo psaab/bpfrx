@@ -13,6 +13,17 @@ use std::time::Duration;
 pub(super) fn tear_down(coord: &mut Coordinator) -> PreservedReconcileState {
     let had_live_workers = !coord.workers.handles.is_empty();
     let synced_sessions = coord.snapshot_shared_session_entries();
+    // #1873 R-D (AGY code r3): capture the tunnel-owner map and the
+    // installed flag BEFORE stop_inner defaults coord.forwarding and
+    // coord.validation — apply_snapshot's remap purge diffs against
+    // these, not the (post-teardown empty) live state.
+    let tunnel_owners: Vec<(u16, String)> = coord
+        .forwarding
+        .tunnel_endpoints
+        .iter()
+        .map(|(id, ep)| (*id, ep.interface.clone()))
+        .collect();
+    let snapshot_was_installed = coord.validation.snapshot_installed;
     // Keep a healthy slow-path worker across back-to-back reconciles.
     // The userspace helper can receive multiple snapshot refreshes
     // during HA role changes; recreating the fixed-name TUN on every
@@ -36,5 +47,7 @@ pub(super) fn tear_down(coord: &mut Coordinator) -> PreservedReconcileState {
     PreservedReconcileState {
         synced_sessions,
         slow_path,
+        tunnel_owners,
+        snapshot_was_installed,
     }
 }

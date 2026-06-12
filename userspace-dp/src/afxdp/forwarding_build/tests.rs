@@ -2355,3 +2355,81 @@ fn stale_session_never_adopts_reowned_tunnel_id() {
         "matching owner must not be gated"
     );
 }
+
+/// #1873 owner-RG attribution pin (Codex code r3 MAJOR 2): a stale
+/// tunnel resolution (stored egress_ifindex != the current row's
+/// logical_ifindex) must NOT inherit the NEW owner's redundancy group
+/// — owner_rg_for_resolution returns 0 (unknown) so HA metadata and
+/// owner-RG indexes keep their existing attribution.
+#[test]
+fn stale_owner_resolution_does_not_inherit_new_owner_rg() {
+    use crate::afxdp::owner_rg_for_resolution;
+    let mut snap = two_tunnel_snapshot();
+    snap.tunnel_endpoints[0].redundancy_group = 2;
+    let state = build_forwarding_state(&snap);
+    let row_ifindex = state
+        .tunnel_endpoints
+        .get(&824)
+        .expect("gre row")
+        .logical_ifindex;
+    let mut resolution = crate::afxdp::ForwardingResolution {
+        disposition: crate::afxdp::ForwardingDisposition::ForwardCandidate,
+        local_ifindex: 0,
+        egress_ifindex: row_ifindex,
+        tx_ifindex: 3,
+        tunnel_endpoint_id: 824,
+        next_hop: None,
+        neighbor_mac: None,
+        src_mac: None,
+        tx_vlan_id: 0,
+    };
+    assert_eq!(owner_rg_for_resolution(&state, resolution), 2);
+    // Stale owner: a different netdev owned this id when the session
+    // resolved — never attribute the new owner's RG.
+    resolution.egress_ifindex = row_ifindex + 1000;
+    assert_eq!(owner_rg_for_resolution(&state, resolution), 0);
+    // Synced entries installed with an unresolvable id (egress 0)
+    // keep the current-row attribution (no discriminator to check).
+    resolution.egress_ifindex = 0;
+    assert_eq!(owner_rg_for_resolution(&state, resolution), 2);
+}
+
+/// #1873 reconcile-boundary purge pin (AGY code r3 / Codex code r3):
+/// the reconcile path diffs against the tunnel-owner map captured
+/// BEFORE teardown defaults coord.forwarding — the owners-list flavor
+/// must implement all three arms, and the new-appearance arm must be
+/// skippable for the genuine first apply.
+#[test]
+fn tunnel_remap_purge_ids_from_owners_semantics() {
+    use crate::afxdp::coordinator::tunnel_remap_purge_ids_from_owners;
+    let next = build_forwarding_state(&two_tunnel_snapshot());
+
+    // Vanished id.
+    let owners = vec![
+        (824u16, "gr-0/0/0.0".to_string()),
+        (7u16, "wg0".to_string()),
+        (901u16, "gr-1/1/1.0".to_string()),
+    ];
+    assert_eq!(
+        tunnel_remap_purge_ids_from_owners(&owners, &next, true),
+        vec![901]
+    );
+
+    // Owner change at a surviving id.
+    let owners = vec![(824u16, "gr-old/0/0.0".to_string()), (7u16, "wg0".to_string())];
+    assert_eq!(
+        tunnel_remap_purge_ids_from_owners(&owners, &next, true),
+        vec![824]
+    );
+
+    // New appearance: id 824 absent from the prior owners.
+    let owners = vec![(7u16, "wg0".to_string())];
+    assert_eq!(
+        tunnel_remap_purge_ids_from_owners(&owners, &next, true),
+        vec![824]
+    );
+    assert!(tunnel_remap_purge_ids_from_owners(&owners, &next, false).is_empty());
+
+    // Pristine first apply (empty owners + flag false): nothing purged.
+    assert!(tunnel_remap_purge_ids_from_owners(&[], &next, false).is_empty());
+}

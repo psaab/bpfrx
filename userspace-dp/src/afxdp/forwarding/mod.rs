@@ -271,6 +271,19 @@ pub(super) fn owner_rg_for_resolution(
         return forwarding
             .tunnel_endpoints
             .get(&resolution.tunnel_endpoint_id)
+            // #1873 (Codex code r3): a stored tunnel resolution whose
+            // egress_ifindex (= the owning netdev's logical_ifindex at
+            // resolve time) does not match the CURRENT row belongs to a
+            // re-owned id — attributing the NEW owner's RG to it would
+            // re-home a stale, drop-only session under the new tunnel
+            // in HA metadata/indexes. Return 0 (unknown owner) so
+            // callers keep the existing attribution. Fresh resolutions
+            // always match (same state), so this only fires for stale
+            // stored/synced entries.
+            .filter(|endpoint| {
+                resolution.egress_ifindex <= 0
+                    || endpoint.logical_ifindex == resolution.egress_ifindex
+            })
             .map(|endpoint| endpoint.redundancy_group.max(0))
             .unwrap_or_default();
     }

@@ -23,6 +23,9 @@ pub(super) fn apply_snapshot(
     snapshot: &ConfigSnapshot,
     bindings: &mut [BindingStatus],
     preserved_slow_path: Option<Arc<SlowPathReinjector>>,
+    prior_tunnel_owners: &[(u16, String)],
+    snapshot_was_installed: bool,
+    preserved_synced_sessions: &mut Vec<SyncedSessionEntry>,
 ) -> Option<ReconcileSnapshotFds> {
     // #1606: preflight policy build BEFORE any side-effecting
     // mutation. Surfaces address-book integrity errors (id=0,
@@ -44,10 +47,6 @@ pub(super) fn apply_snapshot(
         }
     };
 
-    // #1873 R-D: captured BEFORE the assignment below — gates the
-    // new-appearance purge arm (must not fire on the helper's first
-    // apply, where every configured id "appears").
-    let prior_snapshot_installed = coord.validation.snapshot_installed;
     coord.validation = ValidationState {
         snapshot_installed: true,
         config_generation: snapshot.generation,
@@ -61,20 +60,34 @@ pub(super) fn apply_snapshot(
         &coord.forwarding,
         &new_forwarding,
     );
-    // #1873 R-D: compute the remap purge set BEFORE the swap and purge
-    // BEFORE the stores. On this full-reconcile path the workers are
-    // torn down and re-seeded from the (already purged) shared maps, so
-    // no old-owner session can survive into the new worker tables. The
-    // purge is cleanup, not the correctness boundary — re-resolution
-    // and the encap builders refuse an id whose owning netdev ifindex
-    // differs from the session's stored one (Codex code-review r2;
-    // replaces the unsound r1 defer + rotation-barrier design).
-    let tunnel_purge_ids = super::super::tunnel_remap_purge_ids(
-        &coord.forwarding,
+    // #1873 R-D: the purge diff runs against the tunnel-owner map
+    // captured BEFORE teardown (AGY code r3) — stop_inner(false) has
+    // already defaulted coord.forwarding, so diffing the live state
+    // here would make every purge arm inert across a reconcile
+    // boundary while the preserved shared maps still hold the old
+    // entries. The purge is cleanup, not the correctness boundary —
+    // re-resolution and the encap builders refuse an id whose owning
+    // netdev ifindex differs from the session's stored one (Codex
+    // code-review r2; replaces the unsound r1 defer + rotation-barrier
+    // design). New-appearance purging is gated on the GENUINE first
+    // apply of the helper's life (flag captured before teardown).
+    let tunnel_purge_ids = super::super::tunnel_remap_purge_ids_from_owners(
+        prior_tunnel_owners,
         &new_forwarding,
-        prior_snapshot_installed,
+        snapshot_was_installed,
     );
     coord.purge_remapped_tunnel_sessions(&tunnel_purge_ids);
+    // The bringup phase replays `preserved_synced_sessions` (captured
+    // BEFORE this purge) into the shared maps — filter the purged ids
+    // out so the replay cannot resurrect them (pre-existing ordering
+    // hazard, found in code r3).
+    if !tunnel_purge_ids.is_empty() {
+        preserved_synced_sessions.retain(|entry| {
+            entry.decision.resolution.tunnel_endpoint_id == 0
+                || !tunnel_purge_ids
+                    .contains(&entry.decision.resolution.tunnel_endpoint_id)
+        });
+    }
     coord.forwarding = new_forwarding;
     coord.shared_validation.store(Arc::new(coord.validation));
     coord

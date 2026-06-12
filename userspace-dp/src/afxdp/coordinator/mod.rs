@@ -63,17 +63,34 @@ pub(in crate::afxdp) fn tunnel_remap_purge_ids(
     next: &ForwardingState,
     include_new_appearances: bool,
 ) -> Vec<u16> {
+    let owners: Vec<(u16, String)> = previous
+        .tunnel_endpoints
+        .iter()
+        .map(|(id, ep)| (*id, ep.interface.clone()))
+        .collect();
+    tunnel_remap_purge_ids_from_owners(&owners, next, include_new_appearances)
+}
+
+/// #1873 R-D (AGY code r3): owners-list flavor for the reconcile path,
+/// where `stop_inner(false)` has already defaulted `coord.forwarding`
+/// and the diff baseline must be the owner map captured before
+/// teardown.
+pub(in crate::afxdp) fn tunnel_remap_purge_ids_from_owners(
+    prior_owners: &[(u16, String)],
+    next: &ForwardingState,
+    include_new_appearances: bool,
+) -> Vec<u16> {
     let mut purge_ids: Vec<u16> = Vec::new();
-    for (id, prev_ep) in previous.tunnel_endpoints.iter() {
+    for (id, prev_interface) in prior_owners {
         match next.tunnel_endpoints.get(id) {
             None => purge_ids.push(*id),
-            Some(next_ep) if next_ep.interface != prev_ep.interface => purge_ids.push(*id),
+            Some(next_ep) if next_ep.interface != *prev_interface => purge_ids.push(*id),
             Some(_) => {}
         }
     }
     if include_new_appearances {
         for id in next.tunnel_endpoints.keys() {
-            if !previous.tunnel_endpoints.contains_key(id) {
+            if !prior_owners.iter().any(|(prev_id, _)| prev_id == id) {
                 purge_ids.push(*id);
             }
         }
@@ -1017,6 +1034,12 @@ impl Coordinator {
                 bulk.remove(key);
             }
         });
+        // #1873 R-D (Codex code r3): captured BEFORE the overwrite —
+        // gates the new-appearance purge arm below. False only when no
+        // coordinator apply has ever installed a snapshot (disarmed
+        // helper pre-first-arm), where boot-time synced sessions must
+        // not be purged as "new appearances" against a default state.
+        let prior_snapshot_installed = self.validation.snapshot_installed;
         self.validation = ValidationState {
             snapshot_installed: true,
             config_generation: snapshot.generation,
@@ -1064,7 +1087,17 @@ impl Coordinator {
         // rotation-barrier approach was unsound: workers can hold
         // private fabric-overlay Arc clones, and a barrier timeout was
         // fail-open).
-        let tunnel_purge_ids = tunnel_remap_purge_ids(&self.forwarding, &new_forwarding, true);
+        // New-appearance purging is gated on a previously-installed
+        // snapshot (Codex code r3): a DISARMED helper stores synced
+        // sessions before its first coordinator apply (reconcile never
+        // ran — `self.forwarding` is still default), so a same-plan
+        // disarmed refresh would otherwise see every configured id as
+        // "new" and wipe those boot-time entries.
+        let tunnel_purge_ids = tunnel_remap_purge_ids(
+            &self.forwarding,
+            &new_forwarding,
+            prior_snapshot_installed,
+        );
         self.purge_remapped_tunnel_sessions(&tunnel_purge_ids);
         self.forwarding = new_forwarding;
         if self.forwarding.fabrics.is_empty() && !preserved_fabrics.is_empty() {
