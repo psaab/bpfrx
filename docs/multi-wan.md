@@ -59,6 +59,18 @@ set services rpm probe WAN test wan-a thresholds successive-loss 3
   capability regression cannot inject/withdraw preferred routes
   fleet-wide. Only genuine on-the-wire failures (timeout, unreachable)
   drive ip-monitoring.
+- **Pin install failures hold state too (#1895)**: when a pin's kernel
+  programming fails (missing egress link at boot, rule/route add
+  error), the test does NOT probe — an unbacked `SO_MARK` would fall
+  through to the main table and report the *default* path's health as
+  the pinned uplink's (false PASS, failover suppression). The test
+  holds its prior state exactly like other setup errors, a partial
+  install is rolled back (no rule without its route), and the daemon
+  retries the pin install on any subsequent commit or RG transition
+  while it stays failed. Observability: rate-limited probe-loop
+  warning, per-pin install warnings, and the
+  `xpf_rpm_probe_pin_install_failures` gauge (nonzero = those uplinks
+  are not being health-checked).
 
 ## Failover policy (PR-1b)
 

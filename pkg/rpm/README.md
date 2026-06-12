@@ -22,6 +22,12 @@ pins probes to devices/next-hops via `SO_BINDTODEVICE` / `SO_MARK`.
 - `SetTransitionCallback(fn)` — `rpm.go` (#1827).
 - `SetRethMap(map[string]string)` — `rpm.go` (#1827). RETH → physical
   member translation for `destination-interface` resolution.
+- `SetPinInstallResults(map[string]error)` — `rpm.go` (#1895). Per-test
+  probe-pin install failures from `routing.Manager.ApplyProbePins`
+  (call before `Apply`; map replaced wholesale, so a successful retry
+  resumes probing without a probe restart).
+- `PinInstallFailureCount()` — `rpm.go` (#1895). Backs the
+  `xpf_rpm_probe_pin_install_failures` gauge.
 
 ## Callers
 
@@ -57,6 +63,15 @@ pins probes to devices/next-hops via `SO_BINDTODEVICE` / `SO_MARK`.
   derived from `routing.BuildProbePins` — the SAME deterministic
   assignment pkg/routing programs as fwmark rules, so socket mark and
   kernel rule cannot drift.
+- **A next-hop test whose pin failed to install never probes** (#1895):
+  an unbacked `SO_MARK` falls through to the main table and measures
+  the default path — a dead pinned uplink would false-PASS and
+  suppress ip-monitoring failover. `executeProbe` returns
+  `ErrProbeSetup` (hold state, no socket opened) while the pin is in
+  the `SetPinInstallResults` failed map — or when a next-hop test has
+  no pin slot at all (band exhaustion belt-and-braces). The daemon
+  retries failed installs on hash-gated reconciles and clears the map
+  on success.
 - Events expose both the test owner (probe name) and the test name so
   event-options policies can match on either via `attributes-match`.
 - A consecutive-failure counter discriminates transient blips from

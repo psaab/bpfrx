@@ -28,7 +28,7 @@ which makes each domain unit-testable with a fake (see `rules_test.go`'s
 | `tunnel.go` | `tunnelManager` | GRE/IPIP tunnels + keepalive goroutines; own `mu` |
 | `xfrm.go` | `xfrmManager` | XFRM/IPsec interface lifecycle; own `mu` |
 | `rules.go` | `nextTableManager` / `ribGroupManager` / `pbrManager` | policy-routing ip-rule reconcilers (`ruleOps`, stateless) |
-| `probe_pin.go` | `probePinManager` | RPM probe next-hop pin reconciler (#1827): fwmark rules in band 50-99 + pinned host routes in reserved tables 7000-7049 (`probePinOps`, stateless) |
+| `probe_pin.go` | `probePinManager` | RPM probe next-hop pin reconciler (#1827): fwmark rules in band 50-99 + pinned host routes in reserved tables 7000-7049 (`probePinOps`, stateless). `Apply` returns per-test install failures (keyed by TestKey) and rolls back the fwmark rule when the pinned route fails, so a pin is never partially installed; callers thread the failed map into `pkg/rpm` so affected tests hold state instead of probing unpinned (#1895) |
 | `bond.go` | `bondManager` | bond device lifecycle; own `mu` |
 | `reth.go` | `rethManager` | stale `reth*` bond cleanup |
 | `monitor.go` | `monitorManager` | interface-monitor HA signal; own `mu` |
