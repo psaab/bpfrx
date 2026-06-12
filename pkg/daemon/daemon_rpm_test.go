@@ -178,3 +178,52 @@ func TestReconcileRPMNoInstallerHoldsPinnedTests(t *testing.T) {
 		t.Fatalf("unpinned config must clear held pins: count = %d", got)
 	}
 }
+
+// rpmTwoPinConfig returns a config with two pinned tests.
+func rpmTwoPinConfig() *config.Config {
+	cfg := &config.Config{}
+	cfg.Services.RPM = &config.RPMConfig{Probes: map[string]*config.RPMProbe{
+		"WAN": {Name: "WAN", Tests: map[string]*config.RPMTest{
+			"a": {Name: "a", Target: "192.0.2.1", NextHop: "10.0.0.1",
+				DestinationInterface: "ge-0/0/1", TestInterval: 3600},
+			"b": {Name: "b", Target: "192.0.2.2", NextHop: "10.0.1.1",
+				DestinationInterface: "ge-0/0/2", TestInterval: 3600},
+		}},
+	}}
+	return cfg
+}
+
+// TestReconcileRPMFullApplyHoldsUnionOfOldAndNewPins: on a config
+// change, the band reprogram must run with BOTH the old (live) pinned
+// tests and the new pin set held — a removed/reordered old pin's live
+// goroutine must not send against the band in flux (Codex PR #1899
+// r2) — and the real results must only be published after rpm.Apply.
+func TestReconcileRPMFullApplyHoldsUnionOfOldAndNewPins(t *testing.T) {
+	var heldAtInstall []int
+	d := &Daemon{rpm: rpm.New(), daemonCtx: context.Background()}
+	d.probePinApply = func(pins []routing.ProbePin) map[string]error {
+		heldAtInstall = append(heldAtInstall, d.rpm.PinInstallFailureCount())
+		return nil
+	}
+	defer d.rpm.StopAll()
+
+	// First apply: no live marks yet — hold covers the 2 new pins.
+	if !d.reconcileRPM(rpmTwoPinConfig()) {
+		t.Fatal("first reconcile must apply")
+	}
+	// Config change drops WAN/a: the hold must cover the union of the
+	// 2 live old pins and the 1 surviving new pin = 2 keys.
+	one := rpmTwoPinConfig()
+	delete(one.Services.RPM.Probes["WAN"].Tests, "a")
+	if !d.reconcileRPM(one) {
+		t.Fatal("changed config must re-apply")
+	}
+	want := []int{2, 2} // first apply: 2 new; second: union{a,b}∪{b} = 2
+	if len(heldAtInstall) != 2 || heldAtInstall[0] != want[0] || heldAtInstall[1] != want[1] {
+		t.Fatalf("held counts at install time = %v, want %v", heldAtInstall, want)
+	}
+	// All installs succeeded: published results clear every hold.
+	if got := d.rpm.PinInstallFailureCount(); got != 0 {
+		t.Fatalf("holds not released after publish: count = %d", got)
+	}
+}

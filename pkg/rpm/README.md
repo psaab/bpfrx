@@ -24,8 +24,14 @@ pins probes to devices/next-hops via `SO_BINDTODEVICE` / `SO_MARK`.
   member translation for `destination-interface` resolution.
 - `SetPinInstallResults(map[string]error)` — `rpm.go` (#1895). Per-test
   probe-pin install failures from `routing.Manager.ApplyProbePins`
-  (call before `Apply`; map replaced wholesale, so a successful retry
-  resumes probing without a probe restart).
+  (map replaced wholesale, so a successful retry resumes probing
+  without a probe restart).
+- `HoldPinsForReprogram([]string, error)` — `rpm.go` (#1895). Pre-holds
+  the union of currently-marked live tests and the new pin set while
+  the kernel band is cleared-and-reprogrammed; the daemon publishes
+  the real results via `SetPinInstallResults` after the reprogram
+  (after `Apply` on a config change — the first probe cycle may hold,
+  bounded by one test-interval).
 - `PinInstallFailureCount()` — `rpm.go` (#1895). Backs the
   `xpf_rpm_probe_pin_install_failures` gauge.
 

@@ -71,14 +71,21 @@ on the next apply remains the backstop).
 ### (b) pkg/daemon — thread results into rpm.Manager + retry
 
 Every band reprogram (full apply AND retry) runs with the pinned
-probes pre-held: `applyProbePinsHeld` marks all pins
-`errProbePinReprogram` before the clear-then-program and publishes the
-real results after, so a live probe ticking inside the reprogram
-window holds instead of racing an absent fwmark rule (Codex r1
-MAJOR-1; residual window = gate-check→sendto of a probe already past
-the gate). When no routing manager exists at all but pins are
-configured, every pin is marked `errNoProbePinInstaller` (Codex r1
-MAJOR-2).
+probes pre-held: `applyProbePinsHeld` holds the UNION of every
+currently-marked live test and the new pin set
+(`rpm.HoldPinsForReprogram`) before the clear-then-program — live
+goroutines whose keys were removed, or whose deterministic mark is
+about to be reassigned, must not send against the band in flux either
+(Codex r2). Publication of the real results: the retry path publishes
+immediately (probe set unchanged under an unchanged hash); the
+full-apply path publishes only AFTER `rpm.Apply` (old goroutines
+drained by StopAll, new marks in place) — the first probe cycle after
+an RPM config change may therefore hold, bounded by one
+test-interval, which is the safe direction. Residual window =
+gate-check→sendto of a probe already past the gate (Codex r1/r2:
+acceptable). When no routing manager exists at all but pins are
+configured, every pin is marked `errNoProbePinInstaller` and published
+BEFORE Apply — no kernel band exists to race (Codex r1 MAJOR-2).
 
 `reconcileRPM` passes the failed-pin map to the RPM manager via a new
 additive setter (`SetPinInstallResults`, mirroring `SetRethMap`)

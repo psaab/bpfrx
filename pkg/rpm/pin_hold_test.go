@@ -180,3 +180,32 @@ func TestPinInstallFailureCount(t *testing.T) {
 		t.Fatalf("PinInstallFailureCount after clear = %d, want 0", got)
 	}
 }
+
+func TestHoldPinsForReprogramUnion(t *testing.T) {
+	// The pre-hold must cover the UNION of currently-marked (live)
+	// tests and the new pin set: a live goroutine whose key was
+	// removed — or whose mark is about to be reassigned — must not
+	// send during the band reprogram (Codex PR #1899 r2).
+	m := New()
+	m.marks = map[string]uint32{
+		"WAN/old":  uint32(config.ProbeFwmarkBase),
+		"WAN/keep": uint32(config.ProbeFwmarkBase + 1),
+	}
+	cause := fmt.Errorf("reprogram in progress")
+	m.HoldPinsForReprogram([]string{"WAN/keep", "WAN/new"}, cause)
+
+	if got := m.PinInstallFailureCount(); got != 3 {
+		t.Fatalf("union hold count = %d, want 3 (old+keep+new)", got)
+	}
+	for _, key := range []string{"WAN/old", "WAN/keep", "WAN/new"} {
+		test := &config.RPMTest{Name: "x", Target: "192.0.2.1", NextHop: "10.0.0.1"}
+		if err := m.pinInstallError(test, key); !errors.Is(err, ErrProbeSetup) {
+			t.Fatalf("key %q not held during reprogram: %v", key, err)
+		}
+	}
+	// Publishing the real results releases the hold.
+	m.SetPinInstallResults(nil)
+	if got := m.PinInstallFailureCount(); got != 0 {
+		t.Fatalf("publish did not release holds: count = %d", got)
+	}
+}

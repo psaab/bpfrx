@@ -190,6 +190,30 @@ func (m *Manager) SetPinInstallResults(failed map[string]error) {
 	m.pinFailed = cp
 }
 
+// HoldPinsForReprogram replaces the pin-failure map with one that
+// holds EVERY currently-marked (live) pinned test PLUS the supplied
+// new pin keys, all with cause. Called by the daemon immediately
+// before the kernel pin band is cleared-and-reprogrammed: live probe
+// goroutines — including ones whose keys are absent from the new pin
+// set, or whose deterministic mark is about to change — must not send
+// an SO_MARK probe against a band in flux (a stale mark can match
+// another test's new fwmark rule and measure the wrong uplink; Codex
+// PR #1899 r2). The caller publishes the real install results via
+// SetPinInstallResults once the reprogram (and, on a config change,
+// the probe re-Apply) has completed.
+func (m *Manager) HoldPinsForReprogram(newPinKeys []string, cause error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	held := make(map[string]error, len(m.marks)+len(newPinKeys))
+	for k := range m.marks {
+		held[k] = cause
+	}
+	for _, k := range newPinKeys {
+		held[k] = cause
+	}
+	m.pinFailed = held
+}
+
 // PinInstallFailureCount reports how many next-hop probe pins are
 // currently failed-to-install (backs the
 // xpf_rpm_probe_pin_install_failures gauge, #1895).
