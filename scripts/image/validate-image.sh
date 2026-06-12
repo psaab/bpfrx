@@ -54,21 +54,36 @@ done
 [ -f "${METADATA:-}" ] || fail "--metadata <tar.gz> required"
 
 ALIAS="xpf-image-validate"
+# Dedicated NAT/DHCP network: never depend on a pre-existing bridge
+# being healthy (a host bridge whose dnsmasq bound while the bridge was
+# down silently serves nothing). Override via XPF_VALIDATE_NETWORK.
+NET="${XPF_VALIDATE_NETWORK:-xpf-image-net}"
+CREATED_NET=0
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/xpf-validate.XXXXXX")
 INSTANCES=()
 
 cleanup() {
 	if [ "$KEEP" -eq 1 ]; then
-		echo "keeping instances: ${INSTANCES[*]:-none} and alias $ALIAS"
+		echo "keeping instances: ${INSTANCES[*]:-none}, alias $ALIAS, network $NET"
 	else
 		for i in "${INSTANCES[@]:-}"; do
 			[ -n "$i" ] && incus delete -f "$i" 2>/dev/null || true
 		done
 		incus image delete "$ALIAS" 2>/dev/null || true
+		[ "$CREATED_NET" -eq 1 ] && incus network delete "$NET" 2>/dev/null || true
 	fi
 	rm -rf "$WORK"
 }
 trap cleanup EXIT
+
+ensure_network() {
+	if ! incus network show "$NET" &>/dev/null; then
+		info "Creating validation network $NET (NAT + DHCP)..."
+		incus network create "$NET" \
+			ipv4.address=10.199.99.1/24 ipv4.nat=true ipv6.address=none
+		CREATED_NET=1
+	fi
+}
 
 # guest <inst> <cmd...> — exec in guest via the incus agent.
 guest() {
@@ -108,7 +123,10 @@ launch() {
 	# launch <name> [iso]
 	local name="$1" iso="${2:-}"
 	incus delete -f "$name" 2>/dev/null || true
+	# Management NIC on the dedicated validation network (the host's
+	# default profile may carry no NIC at all).
 	incus init "$ALIAS" "$name" --vm \
+		--network "$NET" \
 		-c limits.cpu=2 -c limits.memory=2GiB >/dev/null
 	if [ -n "$iso" ]; then
 		incus config device add "$name" day0 disk source="$(realpath "$iso")" >/dev/null
@@ -218,6 +236,7 @@ EOF
 	[ "$KEEP" -eq 1 ] || { incus delete -f xpf-image-c; INSTANCES=("${INSTANCES[@]/xpf-image-c}"); }
 }
 
+ensure_network
 import_image
 case "$SCENARIO" in
 a)   scenario_a ;;

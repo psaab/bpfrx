@@ -124,6 +124,19 @@ if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
 	echo "WARNING: no /dev/kvm access — libguestfs will use TCG (slow)." >&2
 fi
 
+# qemu-img/qemu use io_uring, which needs locked memory beyond the
+# common 8 MiB RLIMIT_MEMLOCK default ("Failed to initialize io_uring:
+# Cannot allocate memory"). Self-raise via passwordless sudo when
+# available; otherwise instruct.
+if [ "$(ulimit -Hl)" != "unlimited" ] && [ "$(ulimit -Hl)" -lt 1048576 ] 2>/dev/null; then
+	if sudo -n true 2>/dev/null; then
+		sudo -n prlimit --memlock=unlimited:unlimited --pid $$ ||
+			die "could not raise RLIMIT_MEMLOCK (libguestfs/qemu-img io_uring needs it)"
+	else
+		die "RLIMIT_MEMLOCK is $(ulimit -Hl) KiB — raise it (e.g. sudo prlimit --memlock=unlimited:unlimited --pid \$\$) and re-run"
+	fi
+fi
+
 mkdir -p "$OUT_DIR" "$CACHE_DIR"
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/xpf-bake.XXXXXX")"
 cleanup() {
@@ -209,11 +222,12 @@ virt-customize -a "$WORK_DIR/work.qcow2" \
 	--copy-in "$PROJECT_ROOT/cli:/usr/local/sbin" \
 	--copy-in "$PROJECT_ROOT/xpf-userspace-dp:/usr/local/sbin" \
 	--copy-in "$SCRIPT_DIR/xpf-day0-config:/usr/local/sbin" \
-	--copy-in "$SCRIPT_DIR/incus-agent-setup:/usr/local/sbin" \
 	--copy-in "$PROJECT_ROOT/test/incus/xpfd.service:/etc/systemd/system" \
 	--copy-in "$SCRIPT_DIR/xpf-day0-config.service:/etc/systemd/system" \
-	--copy-in "$SCRIPT_DIR/incus-agent.service:/etc/systemd/system" \
-	--run-command 'chmod 0755 /usr/local/sbin/xpfd /usr/local/sbin/cli /usr/local/sbin/xpf-userspace-dp /usr/local/sbin/xpf-day0-config /usr/local/sbin/incus-agent-setup' \
+	--copy-in "$SCRIPT_DIR/incus-agent.service:/usr/lib/systemd/system" \
+	--copy-in "$SCRIPT_DIR/incus-agent-setup:/usr/lib/systemd" \
+	--copy-in "$SCRIPT_DIR/99-incus-agent.rules:/usr/lib/udev/rules.d" \
+	--run-command 'chmod 0755 /usr/local/sbin/xpfd /usr/local/sbin/cli /usr/local/sbin/xpf-userspace-dp /usr/local/sbin/xpf-day0-config /usr/lib/systemd/incus-agent-setup' \
 	--write "/etc/sysctl.d/99-xpf.conf:$SYSCTL_CONF" \
 	--run-command 'mkdir -p /etc/xpf && chmod 0750 /etc/xpf' \
 	--run-command 'export DEBIAN_FRONTEND=noninteractive && apt-get update -qq' \
@@ -227,13 +241,14 @@ virt-customize -a "$WORK_DIR/work.qcow2" \
 	--run-command 'rm -f /etc/network/interfaces.d/* /etc/netplan/*.yaml 2>/dev/null || true' \
 	--run-command 'export DEBIAN_FRONTEND=noninteractive && apt-get autoremove -y -qq && apt-get update -qq' \
 	--run-command 'systemctl enable systemd-networkd systemd-resolved' \
+	--run-command 'systemctl disable systemd-networkd-wait-online.service 2>/dev/null || true' \
 	--run-command 'ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf' \
 	--run-command 'systemctl enable frr chrony' \
 	--run-command 'sed -i "s/^pool /#pool /; s/^server /#server /" /etc/chrony/chrony.conf && mkdir -p /etc/chrony/sources.d' \
-	--run-command 'systemctl enable xpfd xpf-day0-config incus-agent' \
+	--run-command 'systemctl enable xpfd xpf-day0-config' \
 	--run-command 'sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=\"\(.*\)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\1 init_on_alloc=0\"/" /etc/default/grub && update-grub' \
 	--run-command 'passwd -d root' \
-	--run-command '/usr/local/sbin/xpfd version && /usr/local/sbin/xpf-day0-config --help 2>/dev/null; true'
+	--run-command '/usr/local/sbin/xpfd version'
 
 # Factory-default credential posture (vSRX parity, documented in
 # docs/install-images.md): root password is EMPTY -> login works on the
@@ -244,8 +259,8 @@ virt-customize -a "$WORK_DIR/work.qcow2" \
 # ── 5. Seal ───────────────────────────────────────────────────────────
 info "Sealing image (virt-sysprep)..."
 virt-sysprep -a "$WORK_DIR/work.qcow2" --quiet \
-	--enable machine-id,ssh-hostkeys,logfiles,tmp-files,bash-history,package-manager-cache,random-seed,backup-files \
-	--run-command 'rm -rf /etc/xpf/.configdb /etc/xpf/xpf.conf /etc/xpf/.day0-config-applied /root/.ssh 2>/dev/null || true'
+	--enable machine-id,ssh-hostkeys,ssh-userdir,logfiles,tmp-files,bash-history,package-manager-cache,backup-files,passwd-backups,utmp \
+	--run-command 'rm -rf /etc/xpf/.configdb /etc/xpf/xpf.conf /etc/xpf/.day0-config-applied /var/lib/systemd/random-seed 2>/dev/null || true'
 
 # ── 6. Export artifacts ───────────────────────────────────────────────
 QCOW_OUT="$OUT_DIR/xpf-$VERSION.qcow2"

@@ -1,45 +1,70 @@
 #!/bin/sh
 # Incus guest agent setup for the xpf appliance image (#1879).
-#
-# Adapted from the loader script incus ships in its own VM images
-# (agent-loader template): mounts the runtime `config` share incus
-# provides (virtiofs, falling back to 9p), copies the agent binary to
-# /run/incus_agent, and lets incus-agent.service run it. Only ever
-# invoked under incus — the unit is gated on the incus virtio-serial
-# port existing.
+# Upstream-verbatim from the loader incus ships in its own VM images
+# (incus agent-loader template, Apache-2.0 — extracted from a live
+# images:debian/13 VM on incus 6.21). Mounts the runtime `config`
+# share (9p, then virtiofs, then the agent cdrom), copies the agent to
+# a tmpfs at /run/incus_agent, and lets incus-agent.service run it.
+# Only ever invoked under incus — activation is the udev rule on the
+# incus virtio-serial port.
 set -eu
 PREFIX="/run/incus_agent"
+CDROM="/dev/disk/by-id/scsi-0QEMU_QEMU_CD-ROM_incus_agent"
 
+# Functions.
 mount_virtiofs() {
-	mount -t virtiofs config "${PREFIX}/.mnt" >/dev/null 2>&1
+    mount -t virtiofs config "${PREFIX}.mnt" >/dev/null 2>&1
 }
 
 mount_9p() {
-	modprobe 9pnet_virtio >/dev/null 2>&1 || true
-	mount -t 9p config "${PREFIX}/.mnt" -o access=0,trans=virtio,size=1048576 >/dev/null 2>&1
+    modprobe 9pnet_virtio >/dev/null 2>&1 || true
+    mount -t 9p config "${PREFIX}.mnt" -o access=0,trans=virtio,size=1048576 >/dev/null 2>&1
+}
+
+mount_cdrom() {
+    mount "${CDROM}" "${PREFIX}.mnt" >/dev/null 2>&1
 }
 
 fail() {
-	umount -l "${PREFIX}" >/dev/null 2>&1 || true
-	rmdir "${PREFIX}" >/dev/null 2>&1 || true
-	echo "${1}"
-	exit 1
+    # Check if we already have an agent in place.
+    # This will typically be true during restart in the case of a cdrom-based setup.
+    if [ -x "${PREFIX}/incus-agent" ]; then
+        echo "${1}, reusing existing agent"
+        exit 0
+    fi
+
+    # Cleanup and fail.
+    umount -l "${PREFIX}" >/dev/null 2>&1 || true
+    eject "${CDROM}" >/dev/null 2>&1 || true
+    rmdir "${PREFIX}" >/dev/null 2>&1 || true
+    echo "${1}, failing"
+
+    exit 1
 }
+
+# Try getting an agent drive.
+mkdir -p "${PREFIX}.mnt"
+mount_9p || mount_virtiofs || mount_cdrom || fail "Couldn't mount 9p or cdrom"
 
 # Setup the mount target.
 umount -l "${PREFIX}" >/dev/null 2>&1 || true
-mkdir -p "${PREFIX}" "${PREFIX}/.mnt"
+mkdir -p "${PREFIX}"
+mount -t tmpfs tmpfs "${PREFIX}" -o mode=0700,size=50M
 
-# Try virtiofs first, then 9p.
-mount_virtiofs || mount_9p || fail "couldn't mount the incus config share (virtiofs or 9p)"
-
-# Copy the agent data.
-cp -Ra "${PREFIX}/.mnt/"* "${PREFIX}"
+# Copy the data.
+cp -Ra "${PREFIX}.mnt/"* "${PREFIX}"
 
 # Unmount the temporary mount.
-umount "${PREFIX}/.mnt"
-rmdir "${PREFIX}/.mnt"
+umount "${PREFIX}.mnt"
+rmdir "${PREFIX}.mnt"
+
+# Eject the cdrom in case it's present.
+eject "${CDROM}" >/dev/null 2>&1 || true
 
 # Fix up permissions.
-chmod 0700 "${PREFIX}"
+chown -R root:root "${PREFIX}"
+
+# Attempt to restore SELinux labels.
+restorecon -R "${PREFIX}" >/dev/null 2>&1 || true
+
 exit 0
