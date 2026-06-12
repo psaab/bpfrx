@@ -8,10 +8,12 @@ import (
 	"path/filepath"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/fsatomic"
 )
 
-// DB handles atomic persistence of configuration trees to disk.
-// It uses write-to-temp + rename for crash safety.
+// DB handles durable persistence of configuration trees to disk.
+// Writes go through fsatomic.WriteFileDurable (#1894): temp + fsync +
+// rename + dir fsync, so a persisted tree survives power loss.
 type DB struct {
 	dir string
 }
@@ -21,6 +23,15 @@ type DB struct {
 func NewDB(dir string) (*DB, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("create db dir: %w", err)
+	}
+	// Sweep temp files leaked by a crash mid-write (#1894). fsatomic
+	// names its temps ".<base>.tmp-<random>", so a daemon killed between
+	// CreateTemp and rename leaves one behind; they are dead weight and
+	// would accumulate forever in a long-lived .configdb.
+	if stale, err := filepath.Glob(filepath.Join(dir, ".*.tmp-*")); err == nil {
+		for _, p := range stale {
+			_ = os.Remove(p)
+		}
 	}
 	return &DB{dir: dir}, nil
 }
@@ -113,8 +124,10 @@ func (db *DB) readTree(path string) (*config.ConfigTree, error) {
 	return tree, nil
 }
 
-// writeTree persists a config tree to a JSON file atomically.
-// Uses write-to-temp + rename for crash safety.
+// writeTree persists a config tree to a JSON file durably (#1894,
+// DurableState class): temp + fsync + rename + dir fsync, so a commit
+// that reported success cannot be silently lost to a power cut — the
+// guarantee the #1799 persist-before-promote contract is built on.
 func (db *DB) writeTree(path string, tree *config.ConfigTree) error {
 	data, err := json.MarshalIndent(tree, "", "  ")
 	if err != nil {
@@ -125,13 +138,8 @@ func (db *DB) writeTree(path string, tree *config.ConfigTree) error {
 		return fmt.Errorf("encrypt config: %w", err)
 	}
 
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
-		return fmt.Errorf("write temp %s: %w", tmp, err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp) // best-effort cleanup
-		return fmt.Errorf("rename %s -> %s: %w", tmp, path, err)
+	if err := fsatomic.WriteFileDurable(path, data, 0644); err != nil {
+		return fmt.Errorf("persist %s: %w", path, err)
 	}
 	return nil
 }
