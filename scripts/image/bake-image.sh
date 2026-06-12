@@ -117,6 +117,7 @@ require qemu-img      "apt-get install qemu-utils"
 require virt-customize "apt-get install libguestfs-tools"
 require virt-resize   "apt-get install libguestfs-tools"
 require virt-sysprep  "apt-get install libguestfs-tools"
+require virt-sparsify "apt-get install libguestfs-tools"
 require virt-filesystems "apt-get install libguestfs-tools"
 require curl          "apt-get install curl"
 
@@ -299,8 +300,13 @@ virt-sysprep -a "$WORK_DIR/work.qcow2" --quiet \
 QCOW_OUT="$OUT_DIR/xpf-$VERSION.qcow2"
 META_OUT="$OUT_DIR/xpf-$VERSION.incus-metadata.tar.gz"
 
-info "Exporting $QCOW_OUT (compressed qcow2)..."
-qemu-img convert -O qcow2 -c "$WORK_DIR/work.qcow2" "$QCOW_OUT"
+info "Exporting $QCOW_OUT (sparsified + compressed qcow2)..."
+# virt-sparsify, not plain qemu-img convert -c: blocks freed by the
+# package churn during customize (kernel swap, snapd/cloud-init purge)
+# stay ALLOCATED with stale data and defeat compression — the first
+# Ubuntu bake exported 3.5 GB instead of ~1 GB. Sparsify zero-fills
+# free space so the compressed image carries only live data.
+virt-sparsify --quiet --compress "$WORK_DIR/work.qcow2" "$QCOW_OUT"
 
 info "Exporting $META_OUT (incus VM image metadata)..."
 cat >"$WORK_DIR/metadata.yaml" <<EOF
