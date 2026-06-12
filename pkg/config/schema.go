@@ -930,7 +930,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			}},
 		}},
 	}},
-	"chassis": {children: map[string]*schemaNode{
+	"chassis": {desc: "Chassis configuration", children: map[string]*schemaNode{
 		// #1319 PR 2 typed leaves (chassis cluster subsystem). Fields-only
 		// annotations — no children/args/multi changes, so SetPath flat-set
 		// grouping is untouched (TestSetPathGrouping_Golden). Range policy:
@@ -944,7 +944,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		// `node <id>`) are NOT value slots — the walker's compiler-faithful
 		// contract consumes identity tokens without validation; typing them
 		// needs a new walker feature (deferred, see docs/config-schema.md).
-		"cluster": {children: map[string]*schemaNode{
+		"cluster": {desc: "Chassis cluster (high-availability) configuration", children: map[string]*schemaNode{
 			// One byte in the RETH virtual MAC 02:bf:72:CC:RR:NN
 			// (cluster.RethMAC, pkg/cluster/reth.go:113) and in the stable
 			// link-local (reth.go:124) — 256+ would silently alias MACs.
@@ -952,6 +952,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			// is the narrowest consumer. Junos vSRX: 0..255 (0 = disabled).
 			// Deployed: 22 (docs/ha-cluster-userspace.conf:64).
 			"cluster-id": {
+				desc:          "Cluster identifier (0..255; one byte of the RETH virtual MAC)",
 				args:          1,
 				valueType:     ValueInteger,
 				valueDesc:     "Cluster identifier (0..255; one byte of the RETH virtual MAC)",
@@ -963,6 +964,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			// but every owner/peer decision (SlotToNodeID FPC mapping,
 			// election peer model) assumes 0|1. Junos vSRX: node 0..1.
 			"node": {
+				desc:          "Node identifier (0..1)",
 				args:          1,
 				valueType:     ValueInteger,
 				valueDesc:     "Node identifier (0..1)",
@@ -974,6 +976,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			// (compiler_system.go) and consumed for display (`show chassis
 			// cluster information`, pkg/cli/cli_show_cluster.go:182).
 			"reth-count": {
+				desc:          "Number of RETH interfaces (1..128)",
 				args:          1,
 				valueType:     ValueInteger,
 				valueDesc:     "Number of RETH interfaces (1..128)",
@@ -994,6 +997,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			// (group_state.go:56) overflows negative and the heartbeat
 			// sender ticker panics. No schema-only cap (Codex, PR #1845).
 			"heartbeat-interval": {
+				desc:          "Heartbeat send interval in milliseconds (default 100)",
 				args:          1,
 				valueType:     ValueInteger,
 				valueDesc:     "Heartbeat send interval in milliseconds (>= 1; xpf default 100, Junos allows 1000..2000)",
@@ -1009,6 +1013,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			// (Codex, PR #1845; the earlier 255 cap was schema-only). 0
 			// rejected (silently means default at runtime).
 			"heartbeat-threshold": {
+				desc:          "Missed heartbeats before the peer is declared lost (default 5)",
 				args:          1,
 				valueType:     ValueInteger,
 				valueDesc:     "Missed heartbeats before peer is declared lost (>= 1; xpf default 5, Junos allows 3..8)",
@@ -1016,23 +1021,23 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				validator:     ValidateIntegerMin(1),
 				children:      nil,
 			},
-			"control-link-recovery": {children: nil},
+			"control-link-recovery": {desc: "Control link recovery (accepted for Junos compatibility; no runtime effect)", children: nil},
 			// control-ports fpc/port: NOT typed — compileChassis never
 			// reads control-ports (compiled-leaf-only invariant).
-			"control-ports": {children: map[string]*schemaNode{
-				"fpc": {args: 1, children: map[string]*schemaNode{
-					"port": {args: 1, children: nil},
+			"control-ports": {desc: "Control port assignments (accepted for Junos compatibility; ignored)", children: map[string]*schemaNode{
+				"fpc": {desc: "FPC slot for the control port (ignored)", args: 1, placeholder: "<slot>", children: map[string]*schemaNode{
+					"port": {desc: "Control port number on the FPC (ignored)", args: 1, placeholder: "<port>", children: nil},
 				}},
 			}},
 			// Interface / address leaves stay untyped until the interfaces
 			// subsystem PR introduces the IP/identifier value types.
-			"control-interface":             {args: 1, children: nil},
-			"peer-address":                  {args: 1, children: nil},
-			"fabric-interface":              {args: 1, children: nil},
-			"fabric-peer-address":           {args: 1, children: nil},
-			"configuration-synchronize":     {children: nil},
-			"nat-state-synchronization":     {children: nil},
-			"ipsec-session-synchronization": {children: nil},
+			"control-interface":             {desc: "Control link interface for heartbeats and cluster sync", args: 1, placeholder: "<interface>", children: nil},
+			"peer-address":                  {desc: "Cluster peer IP address on the control link", args: 1, placeholder: "<address>", children: nil},
+			"fabric-interface":              {desc: "Fabric link interface for session sync and cross-chassis forwarding", args: 1, placeholder: "<interface>", children: nil},
+			"fabric-peer-address":           {desc: "Cluster peer IP address on the fabric link", args: 1, placeholder: "<address>", children: nil},
+			"configuration-synchronize":     {desc: "Synchronize committed configuration from primary to secondary", children: nil},
+			"nat-state-synchronization":     {desc: "NAT state synchronization (accepted for Junos compatibility; no runtime effect)", children: nil},
+			"ipsec-session-synchronization": {desc: "Synchronize IPsec SAs to the cluster peer", children: nil},
 			// Milliseconds, xpf extension (default 30, pkg/vrrp/vrrp.go).
 			// Both bounds are runtime-derived from the VRRPv3 encoding:
 			// the ms value is integer-divided to centiseconds
@@ -1044,6 +1049,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			// 10..40959 is exactly the encodable range; non-multiples of
 			// 10 floor to the same centisecond the runtime sends.
 			"reth-advertise-interval": {
+				desc:          "VRRP advertisement interval for RETH instances (milliseconds, default 30)",
 				args:          1,
 				valueType:     ValueInteger,
 				valueDesc:     "RETH VRRP advertisement interval in milliseconds (10..40959; default 30)",
@@ -1051,11 +1057,12 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				validator:     ValidateInteger(10, 40959),
 				children:      nil,
 			},
-			"hitless-restart": {children: nil},
+			"hitless-restart": {desc: "Keep dataplane forwarding active during daemon shutdown (HA default is fail-closed)", children: nil},
 			// xpf extension. Only "disable-rg" is acted on by the runtime
 			// (pkg/cluster/heartbeat_manager.go:362, failover.go:166); any
 			// other string compiled silently no-ops — the enum closes that.
 			"peer-fencing": {
+				desc:          "Fencing action sent to the peer when its heartbeats are lost (disable-rg)",
 				args:          1,
 				valueType:     ValueEnumOf,
 				valueDesc:     "Fencing action on heartbeat timeout (disable-rg)",
@@ -1072,6 +1079,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			// overflow point (group_state.go:75). The earlier 1 h cap was
 			// schema-only and removed (Codex, PR #1845).
 			"takeover-hold-time": {
+				desc:          "Extra delay before takeover in milliseconds (0 = immediate)",
 				args:          1,
 				valueType:     ValueInteger,
 				valueDesc:     "Extra delay before takeover in milliseconds (>= 0; 0 = immediate)",
@@ -1079,11 +1087,11 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				validator:     ValidateInteger(0, MaxDurationMillis),
 				children:      nil,
 			},
-			"no-reth-vrrp":           {children: nil},
-			"private-rg-election":    {children: nil},
-			"no-private-rg-election": {children: nil},
-			"redundancy-group": {args: 1, children: map[string]*schemaNode{
-				"node": {args: 1, children: map[string]*schemaNode{
+			"no-reth-vrrp":           {desc: "Disable VRRP on RETH interfaces (election over the control link only)", children: nil},
+			"private-rg-election":    {desc: "Elect RG primaries over the control link without RETH VRRP (default)", children: nil},
+			"no-private-rg-election": {desc: "Disable private RG election (use legacy RETH VRRP election)", children: nil},
+			"redundancy-group": {desc: "Redundancy group", args: 1, placeholder: "<group-id>", children: map[string]*schemaNode{
+				"node": {desc: "Per-node settings for this redundancy group", args: 1, placeholder: "<node-id>", children: map[string]*schemaNode{
 					// Junos vSRX: 1..254. Runtime-binding: the priority
 					// feeds VRRP and is truncated to uint8 on the wire
 					// (pkg/vrrp/instance.go:918); 255 is the RFC 5798
@@ -1092,6 +1100,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					// both excluded. Heartbeat carries uint16 but VRRP is
 					// the narrow consumer. Deployed: 200/100.
 					"priority": {
+						desc:          "Node priority for primary election (1..254; higher wins)",
 						args:          1,
 						valueType:     ValueInteger,
 						valueDesc:     "Node priority for primary election (1..254; higher wins)",
@@ -1110,6 +1119,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				// the runtime executes fine; a sanity cap belongs in the
 				// runtime first. Deployed: 8.
 				"gratuitous-arp-count": {
+					desc:          "Gratuitous ARP/NA burst count on failover (default 3)",
 					args:          1,
 					valueType:     ValueInteger,
 					valueDesc:     "Gratuitous ARP/NA burst count on failover (>= 1; default 3, Junos allows 1..16)",
@@ -1117,20 +1127,21 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					validator:     ValidateIntegerMin(1),
 					children:      nil,
 				},
-				"preempt": {children: nil},
+				"preempt": {desc: "Allow a higher-priority node to preempt the primary role", children: nil},
 				// interface-monitor weight is NOT typed in PR 2: the
 				// `<ifname> weight <n>` tokens pack inline into one leaf
 				// (children==nil here); typing the weight would require a
 				// children/wildcard map, which flips SetPath's
 				// replace-vs-container grouping — forbidden by the
 				// fields-only rule. Deferred (docs/config-schema.md).
-				"interface-monitor": {children: nil},
-				"ip-monitoring": {children: map[string]*schemaNode{
+				"interface-monitor": {desc: "Deduct weight from the redundancy group while a monitored interface is down", children: nil},
+				"ip-monitoring": {desc: "Probe monitored IPs and deduct weight on failure", children: map[string]*schemaNode{
 					// Junos vSRX: 0..255. Weight subtracted from the RG
 					// weight, which starts at 255 (group_state.go:29,
 					// SetMonitorWeight election.go:324); heartbeat monitor
 					// entries carry weight as uint8.
 					"global-weight": {
+						desc:          "Default weight deducted when a monitored IP fails (0..255)",
 						args:          1,
 						valueType:     ValueInteger,
 						valueDesc:     "Default weight deducted when a monitored IP fails (0..255)",
@@ -1141,6 +1152,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					// Junos vSRX: 0..255. Compiled verbatim
 					// (compiler_system.go IPMonitoring.GlobalThreshold).
 					"global-threshold": {
+						desc:          "Cumulative failure weight that triggers failover (0..255)",
 						args:          1,
 						valueType:     ValueInteger,
 						valueDesc:     "Cumulative failure weight that triggers failover (0..255)",
@@ -1148,11 +1160,12 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 						validator:     ValidateInteger(0, 255),
 						children:      nil,
 					},
-					"family": {compoundKey: true, children: map[string]*schemaNode{
-						"inet": {wildcard: &schemaNode{children: map[string]*schemaNode{
+					"family": {desc: "Address family of monitored IPs", compoundKey: true, children: map[string]*schemaNode{
+						"inet": {desc: "IPv4 monitored addresses", wildcard: &schemaNode{desc: "Monitored IPv4 address", placeholder: "<address>", children: map[string]*schemaNode{
 							// Junos vSRX: 0..255. 0 = inherit global-weight
 							// (pkg/cluster/monitor.go pollIPMonitors).
 							"weight": {
+								desc:          "Weight deducted when this IP fails (0 = use global-weight)",
 								args:          1,
 								valueType:     ValueInteger,
 								valueDesc:     "Weight deducted when this IP fails (0..255; 0 = use global-weight)",
@@ -1642,7 +1655,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				"resume-threshold": {args: 1, desc: "Legacy DPDK RX resume threshold (retired, ignored)", children: nil},
 				"sleep-timeout":    {args: 1, desc: "Legacy DPDK RX sleep timeout (retired, ignored)", children: nil},
 			}},
-			"ports": {desc: "Legacy DPDK per-port mapping (retired, ignored)", wildcard: &schemaNode{placeholder: "<port-name>", children: map[string]*schemaNode{
+			"ports": {desc: "Legacy DPDK per-port mapping (retired, ignored)", wildcard: &schemaNode{desc: "Legacy DPDK port name (retired, ignored)", placeholder: "<port-name>", children: map[string]*schemaNode{
 				"interface": {args: 1, desc: "Legacy DPDK port interface binding (retired, ignored)", children: nil},
 				"rx-mode":   {args: 1, desc: "Legacy DPDK per-port RX mode (retired, ignored)", children: nil},
 				"cores":     {args: 1, desc: "Legacy DPDK per-port core list (retired, ignored)", children: nil},
@@ -1678,7 +1691,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					"interface":                    {desc: "Interface", args: 1, placeholder: "<interface>", children: nil},
 				}},
 				"api-auth": {desc: "API authentication", children: map[string]*schemaNode{
-					"user": {desc: "User name", wildcard: &schemaNode{placeholder: "<username>", children: map[string]*schemaNode{
+					"user": {desc: "User name", wildcard: &schemaNode{desc: "Basic-auth user name for the REST API", placeholder: "<username>", children: map[string]*schemaNode{
 						"password": {desc: "Password", args: 1, placeholder: "<password>", children: nil},
 					}}},
 					"api-key": {desc: "API key", args: 1, placeholder: "<key>", children: nil},
@@ -1849,33 +1862,33 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				},
 			}},
 		}},
-		"flow-monitoring": {children: map[string]*schemaNode{
-			"version9": {children: map[string]*schemaNode{
-				"template": {args: 1, children: map[string]*schemaNode{
-					"flow-active-timeout":   {args: 1, children: nil},
-					"flow-inactive-timeout": {args: 1, children: nil},
-					"template-refresh-rate": {children: map[string]*schemaNode{
-						"seconds": {args: 1, children: nil},
+		"flow-monitoring": {desc: "Flow export (NetFlow v9 / IPFIX) template configuration", children: map[string]*schemaNode{
+			"version9": {desc: "NetFlow version 9 export", children: map[string]*schemaNode{
+				"template": {desc: "NetFlow v9 flow record template", args: 1, placeholder: "<template-name>", children: map[string]*schemaNode{
+					"flow-active-timeout":   {desc: "Active flow export timeout in seconds (default 60)", args: 1, placeholder: "<seconds>", children: nil},
+					"flow-inactive-timeout": {desc: "Inactive flow export timeout in seconds (default 15)", args: 1, placeholder: "<seconds>", children: nil},
+					"template-refresh-rate": {desc: "Interval between template re-exports", children: map[string]*schemaNode{
+						"seconds": {desc: "Template refresh interval in seconds (default 60)", args: 1, placeholder: "<seconds>", children: nil},
 					}},
 				}},
 			}},
-			"version-ipfix": {children: map[string]*schemaNode{
-				"template": {args: 1, children: map[string]*schemaNode{
-					"flow-active-timeout":   {args: 1, children: nil},
-					"flow-inactive-timeout": {args: 1, children: nil},
-					"template-refresh-rate": {children: map[string]*schemaNode{
-						"seconds": {args: 1, children: nil},
+			"version-ipfix": {desc: "IPFIX flow export", children: map[string]*schemaNode{
+				"template": {desc: "IPFIX flow record template", args: 1, placeholder: "<template-name>", children: map[string]*schemaNode{
+					"flow-active-timeout":   {desc: "Active flow export timeout in seconds (default 60)", args: 1, placeholder: "<seconds>", children: nil},
+					"flow-inactive-timeout": {desc: "Inactive flow export timeout in seconds (default 15)", args: 1, placeholder: "<seconds>", children: nil},
+					"template-refresh-rate": {desc: "Interval between template re-exports", children: map[string]*schemaNode{
+						"seconds": {desc: "Template refresh interval in seconds (default 60)", args: 1, placeholder: "<seconds>", children: nil},
 					}},
-					"ipv4-template": {children: map[string]*schemaNode{
-						"export-extension": {args: 1, children: nil},
+					"ipv4-template": {desc: "IPv4 flow record template options", children: map[string]*schemaNode{
+						"export-extension": {desc: "Export extension (accepted; not applied to IPFIX records)", args: 1, placeholder: "<extension>", children: nil},
 					}},
-					"ipv6-template": {children: map[string]*schemaNode{
-						"export-extension": {args: 1, children: nil},
+					"ipv6-template": {desc: "IPv6 flow record template options", children: map[string]*schemaNode{
+						"export-extension": {desc: "Export extension (accepted; not applied to IPFIX records)", args: 1, placeholder: "<extension>", children: nil},
 					}},
 				}},
 			}},
 		}},
-		"application-identification": {children: nil},
+		"application-identification": {desc: "Enable application identification against the predefined application catalog (port/protocol matching; no L7 DPI)", children: nil},
 	}},
 	"forwarding-options": {children: map[string]*schemaNode{
 		"family": {compoundKey: true, children: map[string]*schemaNode{
