@@ -209,6 +209,18 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, vc *walkConte
 	}
 
 	if childSchema.isTypedLeaf() && (childSchema.validator != nil || childSchema.treeValidator != nil) {
+		// Multi value-tail leaf (`multi && children == nil`): values can
+		// live in the packed Keys (`name-server 1.1.1.1`, bracketed
+		// lists, `destination-port 20000 to 20003`) AND/OR one-per-child
+		// in the hierarchical block-list shape (`name-server { 1.1.1.1;
+		// 8.8.8.8; }`, `virtual-address { a; b; }`) — the compilers read
+		// both (compiler_system.go name-server, compiler_interfaces.go
+		// virtual-address). Children here are VALUES, not modifiers, so
+		// this path replaces both validateTypedLeaf and the modifier
+		// loop below.
+		if childSchema.multi && childSchema.children == nil {
+			return validateMultiValueLeaf(node, childSchema, path, vc)
+		}
 		// Typed leaf: node.Keys[1:] are the value/modifier tokens. The leaf
 		// keyword is the only identity token.
 		if err := validateTypedLeaf(node, childSchema, path, siblings, vc); err != nil {
@@ -415,9 +427,9 @@ func consumeNodeKeys(keys []string, childSchema *schemaNode) (int, *schemaNode) 
 // Contract (mirrors the schema-feature→AST-match table in the #1319 plan):
 //   - standard typed leaf: the FIRST token is the value → run validator on
 //     it; any subsequent token must match a child keyword (e.g. `exact`).
-//   - multi && children==nil value-tail/range: every value token is
-//     validated; a fixed mid-token (`to`) is a separator, so
-//     `destination-port 20000 to 20003` validates 20000 and 20003.
+//   - multi && children==nil value-tail/range leaves are NOT handled
+//     here — walkSchemaNode dispatches them to validateMultiValueLeaf,
+//     which also accepts the hierarchical block-list spelling.
 //   - modifier-only sibling: a flat-set leaf carrying ONLY a known modifier
 //     (e.g. `transmit-rate exact`) is accepted IFF a sibling node supplies
 //     a valid value (`transmit-rate 1g`); otherwise it fails. This
@@ -429,37 +441,6 @@ func validateTypedLeaf(node *Node, leafSchema *schemaNode, parentPath []string, 
 	path := append(append([]string(nil), parentPath...), leafName)
 	values := node.Keys[1:]
 	check := leafSchema.checkValue(vc)
-
-	// Range / value-tail leaf: multi with no schema children. Validate
-	// every value token; treat a known fixed mid-token (`to`) as a
-	// separator.
-	if leafSchema.multi && leafSchema.children == nil {
-		if len(values) == 0 {
-			return typedLeafErrorf(path, "missing value")
-		}
-		validatedAny := false
-		lastWasSeparator := false
-		for _, tok := range values {
-			if tok == "to" {
-				if !validatedAny || lastWasSeparator {
-					return typedLeafErrorf(path, "missing value")
-				}
-				lastWasSeparator = true
-				continue
-			}
-			if err := check(tok); err != nil {
-				return typedLeafInvalidErrorf(path, tok, err)
-			}
-			validatedAny = true
-			lastWasSeparator = false
-		}
-		// Non-empty separator-only tails like ["to"] or ["to", "to"] reach
-		// here with no validated value tokens.
-		if !validatedAny || lastWasSeparator {
-			return typedLeafErrorf(path, "missing value")
-		}
-		return nil
-	}
 
 	if len(values) == 0 {
 		return typedLeafErrorf(path, "missing value")
@@ -491,6 +472,65 @@ func validateTypedLeaf(node *Node, leafSchema *schemaNode, parentPath []string, 
 		if _, ok := leafSchema.children[tok]; !ok {
 			return typedLeafErrorf(path, "unknown modifier %q", tok)
 		}
+	}
+	return nil
+}
+
+// validateMultiValueLeaf validates a `multi && children == nil` typed
+// leaf (the value-tail/range row of the walker contract). Value tokens
+// come from BOTH spellings the compilers read:
+//
+//   - packed Keys (`name-server 1.1.1.1`, bracketed `[ a b ]` lists,
+//     and ranges where the fixed mid-token `to` is a separator:
+//     `destination-port 20000 to 20003`), and
+//   - the hierarchical block-list shape, one child node per value
+//     (`name-server { 1.1.1.1; 8.8.8.8; }`). Only each child's FIRST
+//     token is validated — the compilers read exactly that
+//     (compiler_system.go name-server reads ns.Keys[0],
+//     compiler_interfaces.go virtual-address reads child.Name()) and
+//     the compiler-faithful contract forbids validating tokens the
+//     compiler ignores.
+//
+// A leaf with no value in either position fails, as do dangling /
+// separator-only tails (["to"], ["20000","to"]).
+func validateMultiValueLeaf(node *Node, leafSchema *schemaNode, parentPath []string, vc *walkContext) error {
+	leafName := node.Keys[0]
+	path := append(append([]string(nil), parentPath...), leafName)
+	check := leafSchema.checkValue(vc)
+
+	validatedAny := false
+	lastWasSeparator := false
+	for _, tok := range node.Keys[1:] {
+		if tok == "to" {
+			if !validatedAny || lastWasSeparator {
+				return typedLeafErrorf(path, "missing value")
+			}
+			lastWasSeparator = true
+			continue
+		}
+		if err := check(tok); err != nil {
+			return typedLeafInvalidErrorf(path, tok, err)
+		}
+		validatedAny = true
+		lastWasSeparator = false
+	}
+	if lastWasSeparator {
+		return typedLeafErrorf(path, "missing value")
+	}
+
+	// Block-list children: one value per child, first token only.
+	for _, c := range node.Children {
+		if c == nil || len(c.Keys) == 0 {
+			continue
+		}
+		if err := check(c.Keys[0]); err != nil {
+			return typedLeafInvalidErrorf(path, c.Keys[0], err)
+		}
+		validatedAny = true
+	}
+
+	if !validatedAny {
+		return typedLeafErrorf(path, "missing value")
 	}
 	return nil
 }

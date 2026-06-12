@@ -149,6 +149,35 @@ func TestCommitCheck_RejectsOutOfRangeChassisLeaf(t *testing.T) {
 	}
 }
 
+// #1319 PR 3 — boot safety for the system typed leaves. A stored
+// unknown poll-mode was silently ignored before the enum was typed; it
+// must keep booting (warn only) and be rejected by the next strict
+// commit.
+func TestLoad_ToleratesStoredUnknownPollMode(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config")
+	writeStoredConfig(t, cfgPath,
+		"set system dataplane poll-mode polling")
+
+	s := New(cfgPath)
+	if err := s.Load(); err != nil {
+		t.Fatalf("Load() must tolerate a stored unknown poll-mode, got: %v", err)
+	}
+	if s.ActiveConfig() == nil {
+		t.Fatal("ActiveConfig() is nil after tolerated Load")
+	}
+
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	_, err := s.CommitCheck()
+	if err == nil {
+		t.Fatal("CommitCheck must reject the stored unknown poll-mode, got nil")
+	}
+	if !strings.Contains(err.Error(), "poll-mode") {
+		t.Fatalf("CommitCheck error should reference poll-mode: %v", err)
+	}
+}
+
 // #1319 PR 3 — firewall forwarding-class cross-ref, end-to-end through
 // the PRODUCTION gate path (Store commit-check / Load / SyncApply, the
 // call sites that pass cfg=nil to SchemaValidate). These are the proving

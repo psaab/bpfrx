@@ -122,6 +122,15 @@ func parsePercentWithSuffixStrict(raw string) (float64, error) {
 // review on PR #1845: no schema-only caps).
 const MaxDurationMillis = int64(math.MaxInt64) / int64(time.Millisecond)
 
+// MaxDurationSeconds is the seconds analogue of MaxDurationMillis: the
+// largest second count that survives `time.Duration(n) * time.Second`
+// without int64 overflow (math.MaxInt64 / 1e9 = 9223372036). Used for
+// second-denominated typed leaves whose runtime otherwise accepts any
+// non-negative value (e.g. services ip-monitoring hold-down,
+// pkg/ipmon/ipmon.go:480 — an overflowed negative hold would silently
+// invert the damping behaviour).
+const MaxDurationSeconds = int64(math.MaxInt64) / int64(time.Second)
+
 // ValidateIntegerMin returns a closure that accepts any bare integer
 // >= min — the "no upper bound" spelling for typed leaves whose runtime
 // consumes the full integer range. The representational maximum is
