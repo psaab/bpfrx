@@ -170,9 +170,11 @@ scenario_a() {
 	# Factory credential posture: root password is EMPTY (console-only)
 	# — the effective sshd config must refuse root password and
 	# empty-password auth, or the empty password is network-exposed.
-	guest xpf-image-a sh -c 'sshd -T | grep -qx "permitrootlogin prohibit-password"' ||
-		fail "sshd effective config does not pin PermitRootLogin prohibit-password"
-	guest xpf-image-a sh -c 'sshd -T | grep -qx "permitemptypasswords no"' ||
+	# sshd -T normalizes prohibit-password to the legacy synonym
+	# without-password on Debian's OpenSSH; accept either (or no).
+	guest xpf-image-a sh -c '/usr/sbin/sshd -T | grep -qxE "permitrootlogin (prohibit-password|without-password|no)"' ||
+		fail "sshd effective config does not refuse root password auth"
+	guest xpf-image-a sh -c '/usr/sbin/sshd -T | grep -qx "permitemptypasswords no"' ||
 		fail "sshd effective config does not pin PermitEmptyPasswords no"
 	guest xpf-image-a test ! -e /etc/xpf/xpf.conf || fail "unexpected /etc/xpf/xpf.conf"
 	guest xpf-image-a test ! -e /etc/xpf/.day0-config-applied || fail "unexpected day-0 stamp"
