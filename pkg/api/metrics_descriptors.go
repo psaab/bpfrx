@@ -256,6 +256,15 @@ func newCollector(srv *Server) *xpfCollector {
 				"when config persistence is healthy.",
 			nil, nil,
 		),
+		rpmPinInstallFailures: prometheus.NewDesc(
+			"xpf_rpm_probe_pin_install_failures",
+			"Number of RPM next-hop probe pins whose kernel fwmark rule / "+
+				"pinned route failed to install. Affected tests hold their "+
+				"prior state (ErrProbeSetup) instead of probing the default "+
+				"path, so a nonzero value means those uplinks are NOT being "+
+				"health-checked (#1895).",
+			nil, nil,
+		),
 		ipmonPolicyFailed: prometheus.NewDesc(
 			"xpf_ipmon_policy_failed",
 			"1 while the services ip-monitoring policy is in FAIL state "+
