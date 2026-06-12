@@ -10,7 +10,7 @@ import (
 // The JSON literal below uses the EXACT key set the Rust side emits
 // (userspace-dp/src/protocol/control.rs WgTunnelStatus serde renames;
 // pinned there by process_status_wg_tunnels_roundtrip_and_compat with
-// the same 1..35 counter ladder). A key drift on either side breaks
+// the same 1..44 counter ladder). A key drift on either side breaks
 // one of the two pins.
 func TestProcessStatusWgTunnelsPopulatedDecode(t *testing.T) {
 	payload := `{
@@ -62,7 +62,16 @@ func TestProcessStatusWgTunnelsPopulatedDecode(t *testing.T) {
 			"encap_mtu_drops": 32,
 			"transport_send_errors": 33,
 			"tun_write_errors": 34,
-			"tun_rx_drops_no_endpoint": 35
+			"tun_rx_drops_no_endpoint": 35,
+			"encap_drops_expired": 36,
+			"decap_drops_expired": 37,
+			"sessions_expired": 38,
+			"rekeys_initiated_age": 39,
+			"rekeys_initiated_dead_peer": 40,
+			"rekeys_initiated_keepalive_no_session": 41,
+			"keepalives_tx_passive": 42,
+			"keepalives_tx_persistent": 43,
+			"pending_aborted_attempt_window": 44
 		}]
 	}`
 	var status ProcessStatus
@@ -85,7 +94,7 @@ func TestProcessStatusWgTunnelsPopulatedDecode(t *testing.T) {
 	if row.LastHandshakeUnixSecs != 1770000000 {
 		t.Fatalf("LastHandshakeUnixSecs = %d", row.LastHandshakeUnixSecs)
 	}
-	// The 1..35 counter ladder: every field carries its ordinal, so a
+	// The 1..44 counter ladder: every field carries its ordinal, so a
 	// swapped/mistagged field shows up as the wrong value.
 	ladder := []struct {
 		name string
@@ -127,6 +136,15 @@ func TestProcessStatusWgTunnelsPopulatedDecode(t *testing.T) {
 		{"TransportSendErrors", row.TransportSendErrors, 33},
 		{"TunWriteErrors", row.TunWriteErrors, 34},
 		{"TunRxDropsNoEndpoint", row.TunRxDropsNoEndpoint, 35},
+		{"EncapDropsExpired", row.EncapDropsExpired, 36},
+		{"DecapDropsExpired", row.DecapDropsExpired, 37},
+		{"SessionsExpired", row.SessionsExpired, 38},
+		{"RekeysInitiatedAge", row.RekeysInitiatedAge, 39},
+		{"RekeysInitiatedDeadPeer", row.RekeysInitiatedDeadPeer, 40},
+		{"RekeysInitiatedKeepaliveNoSession", row.RekeysInitiatedKeepaliveNoSession, 41},
+		{"KeepalivesTxPassive", row.KeepalivesTxPassive, 42},
+		{"KeepalivesTxPersistent", row.KeepalivesTxPersistent, 43},
+		{"PendingAbortedAttemptWindow", row.PendingAbortedAttemptWindow, 44},
 	}
 	for _, c := range ladder {
 		if c.got != c.want {

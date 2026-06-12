@@ -1462,6 +1462,17 @@ fn process_status_wg_tunnels_roundtrip_and_compat() {
         transport_send_errors: 33,
         tun_write_errors: 34,
         tun_rx_drops_no_endpoint: 35,
+        // #1888 S5 timer telemetry (36.. continuing the ladder; mirror
+        // of the Go-side TestEmitWireguardTelemetrySeriesSet values).
+        encap_drops_expired: 36,
+        decap_drops_expired: 37,
+        sessions_expired: 38,
+        rekeys_initiated_age: 39,
+        rekeys_initiated_dead_peer: 40,
+        rekeys_initiated_keepalive_no_session: 41,
+        keepalives_tx_passive: 42,
+        keepalives_tx_persistent: 43,
+        pending_aborted_attempt_window: 44,
     };
     let status = ProcessStatus {
         wg_tunnels: vec![row],
@@ -1480,6 +1491,9 @@ fn process_status_wg_tunnels_roundtrip_and_compat() {
     assert_eq!(wire_row["decap_keepalives"], 17);
     assert_eq!(wire_row["encap_drops_unconfirmed"], 29);
     assert_eq!(wire_row["encap_mtu_drops"], 32);
+    assert_eq!(wire_row["sessions_expired"], 38);
+    assert_eq!(wire_row["rekeys_initiated_age"], 39);
+    assert_eq!(wire_row["keepalives_tx_persistent"], 43);
     let back: ProcessStatus =
         serde_json::from_value(value).expect("deserialize ProcessStatus");
     assert_eq!(back.wg_tunnels.len(), 1);
@@ -1488,6 +1502,11 @@ fn process_status_wg_tunnels_roundtrip_and_compat() {
     assert_eq!(b.hs_initiations_created, 1);
     assert_eq!(b.decap_drops_buffer, 25);
     assert_eq!(b.tun_rx_drops_no_endpoint, 35);
+    assert_eq!(b.encap_drops_expired, 36);
+    assert_eq!(b.decap_drops_expired, 37);
+    assert_eq!(b.rekeys_initiated_keepalive_no_session, 41);
+    assert_eq!(b.keepalives_tx_passive, 42);
+    assert_eq!(b.pending_aborted_attempt_window, 44);
 
     // EMPTY-INVARIANT: a ProcessStatus with no WG tunnels serializes
     // with NO `wg_tunnels` key at all — non-WG deployments stay

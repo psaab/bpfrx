@@ -43,6 +43,14 @@ func TestEmitWireguardTelemetrySeriesSet(t *testing.T) {
 			"xpf_userspace_wg_session_confirmed", "t", []string{"tunnel"}, nil),
 		wgLastHandshakeTimeSeconds: prometheus.NewDesc(
 			"xpf_userspace_wg_last_handshake_time_seconds", "t", []string{"tunnel"}, nil),
+		wgRekeysInitiatedTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_rekeys_initiated_total", "t", []string{"tunnel", "reason"}, nil),
+		wgKeepalivesSentTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_keepalives_sent_total", "t", []string{"tunnel", "kind"}, nil),
+		wgSessionsExpiredTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_sessions_expired_total", "t", []string{"tunnel"}, nil),
+		wgHandshakeAttemptsAbortedTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_handshake_attempts_aborted_total", "t", []string{"tunnel"}, nil),
 	}
 	status := dpuserspace.ProcessStatus{
 		WgTunnels: []dpuserspace.WgTunnelStatus{{
@@ -84,6 +92,16 @@ func TestEmitWireguardTelemetrySeriesSet(t *testing.T) {
 			TransportSendErrors:       33,
 			TunWriteErrors:            34,
 			TunRxDropsNoEndpoint:      0, // zero on purpose: must still emit
+			// #1888 S5 timer telemetry (36.. continuing the ladder).
+			EncapDropsExpired:                 36,
+			DecapDropsExpired:                 37,
+			SessionsExpired:                   38,
+			RekeysInitiatedAge:                39,
+			RekeysInitiatedDeadPeer:           40,
+			RekeysInitiatedKeepaliveNoSession: 41,
+			KeepalivesTxPassive:               42,
+			KeepalivesTxPersistent:            43,
+			PendingAbortedAttemptWindow:       44,
 		}},
 	}
 
@@ -156,6 +174,15 @@ func TestEmitWireguardTelemetrySeriesSet(t *testing.T) {
 		"xpf_userspace_wg_send_errors_total,kind=tun_rx_no_endpoint,tunnel=wg0":                     0,
 		"xpf_userspace_wg_session_confirmed,tunnel=wg0":                                             1,
 		"xpf_userspace_wg_last_handshake_time_seconds,tunnel=wg0":                                   1770000000,
+		"xpf_userspace_wg_transport_drops_total,direction=encap,reason=expired,tunnel=wg0":          36,
+		"xpf_userspace_wg_transport_drops_total,direction=decap,reason=expired,tunnel=wg0":          37,
+		"xpf_userspace_wg_sessions_expired_total,tunnel=wg0":                                        38,
+		"xpf_userspace_wg_rekeys_initiated_total,reason=age,tunnel=wg0":                             39,
+		"xpf_userspace_wg_rekeys_initiated_total,reason=dead_peer,tunnel=wg0":                       40,
+		"xpf_userspace_wg_rekeys_initiated_total,reason=keepalive_no_session,tunnel=wg0":            41,
+		"xpf_userspace_wg_keepalives_sent_total,kind=passive,tunnel=wg0":                            42,
+		"xpf_userspace_wg_keepalives_sent_total,kind=persistent,tunnel=wg0":                         43,
+		"xpf_userspace_wg_handshake_attempts_aborted_total,tunnel=wg0":                              44,
 	}
 	if len(got) != len(want) {
 		t.Errorf("emitted %d series, want %d", len(got), len(want))
@@ -212,6 +239,14 @@ func TestEmitWireguardTelemetryNeverHandshakedGauge(t *testing.T) {
 			"xpf_userspace_wg_session_confirmed", "t", []string{"tunnel"}, nil),
 		wgLastHandshakeTimeSeconds: prometheus.NewDesc(
 			"xpf_userspace_wg_last_handshake_time_seconds", "t", []string{"tunnel"}, nil),
+		wgRekeysInitiatedTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_rekeys_initiated_total", "t", []string{"tunnel", "reason"}, nil),
+		wgKeepalivesSentTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_keepalives_sent_total", "t", []string{"tunnel", "kind"}, nil),
+		wgSessionsExpiredTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_sessions_expired_total", "t", []string{"tunnel"}, nil),
+		wgHandshakeAttemptsAbortedTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_handshake_attempts_aborted_total", "t", []string{"tunnel"}, nil),
 	}
 	status := dpuserspace.ProcessStatus{
 		WgTunnels: []dpuserspace.WgTunnelStatus{{Tunnel: "wg1"}},
@@ -227,9 +262,11 @@ func TestEmitWireguardTelemetryNeverHandshakedGauge(t *testing.T) {
 		}
 	}
 	// 2 completions + 3 singles + 8 hs reasons + 2 pkts + 2 bytes +
-	// 1 keepalive + 13 drop reasons + 4 send kinds + 1 confirmed = 36.
-	if count != 36 {
-		t.Errorf("emitted %d series for a zeroed tunnel, want 36 (zeros are real signals)", count)
+	// 1 keepalive + 15 drop reasons (incl. 2x expired, #1888) + 4 send
+	// kinds + 1 confirmed + 3 rekey reasons + 2 keepalive-sent kinds +
+	// 1 sessions-expired + 1 attempts-aborted = 45.
+	if count != 45 {
+		t.Errorf("emitted %d series for a zeroed tunnel, want 45 (zeros are real signals)", count)
 	}
 }
 

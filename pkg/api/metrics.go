@@ -337,6 +337,10 @@ type xpfCollector struct {
 	wgSendErrorsTotal                       *prometheus.Desc
 	wgSessionConfirmed                      *prometheus.Desc
 	wgLastHandshakeTimeSeconds              *prometheus.Desc
+	wgRekeysInitiatedTotal                  *prometheus.Desc
+	wgKeepalivesSentTotal                   *prometheus.Desc
+	wgSessionsExpiredTotal                  *prometheus.Desc
+	wgHandshakeAttemptsAbortedTotal         *prometheus.Desc
 }
 
 func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
@@ -552,6 +556,10 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.wgSendErrorsTotal
 	ch <- c.wgSessionConfirmed
 	ch <- c.wgLastHandshakeTimeSeconds
+	ch <- c.wgRekeysInitiatedTotal
+	ch <- c.wgKeepalivesSentTotal
+	ch <- c.wgSessionsExpiredTotal
+	ch <- c.wgHandshakeAttemptsAbortedTotal
 }
 
 func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {

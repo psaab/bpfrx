@@ -1212,5 +1212,25 @@ func newCollector(srv *Server) *xpfCollector {
 			"Wall-clock epoch seconds of the most recent WireGuard handshake completion (either role). Absent until the first handshake completes; compute age as time() - this (#1865).",
 			[]string{"tunnel"}, nil,
 		),
+		wgRekeysInitiatedTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_rekeys_initiated_total",
+			"Timer-driven WireGuard handshake initiations by reason: age = REKEY_AFTER_TIME/receive-horizon/expiry on the live session; dead_peer = 15s no-reply reinit (sent data, heard nothing); keepalive_no_session = persistent keepalive due with no usable session (#1888 S5).",
+			[]string{"tunnel", "reason"}, nil,
+		),
+		wgKeepalivesSentTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_keepalives_sent_total",
+			"WireGuard keepalives SENT by kind: passive = 10s KEEPALIVE_TIMEOUT replies to inbound data (incl. the post-handshake key-confirmation keepalive); persistent = operator-configured persistent-keepalive interval (#1888 S5).",
+			[]string{"tunnel", "kind"}, nil,
+		),
+		wgSessionsExpiredTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_sessions_expired_total",
+			"WireGuard transport sessions torn down at REJECT_AFTER_TIME (180s) by the control thread's expiry pass. Per-use refusals are the expired reason under xpf_userspace_wg_transport_drops_total (#1888 S5).",
+			[]string{"tunnel"}, nil,
+		),
+		wgHandshakeAttemptsAbortedTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_handshake_attempts_aborted_total",
+			"Pending WireGuard handshake reservations released by the REKEY_ATTEMPT_TIME (90s) give-up — a stale msg2 after this cannot complete the abandoned handshake (#1888 S5).",
+			[]string{"tunnel"}, nil,
+		),
 	}
 }

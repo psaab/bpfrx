@@ -754,6 +754,23 @@ impl super::Coordinator {
                 transport_send_errors: c.transport_send_errors.load(Ordering::Relaxed),
                 tun_write_errors: c.tun_write_errors.load(Ordering::Relaxed),
                 tun_rx_drops_no_endpoint: c.tun_rx_drops_no_endpoint.load(Ordering::Relaxed),
+                encap_drops_expired: c.encap_drops_expired.load(Ordering::Relaxed),
+                decap_drops_expired: c.decap_drops_expired.load(Ordering::Relaxed),
+                sessions_expired: c.sessions_expired.load(Ordering::Relaxed),
+                rekeys_initiated_age: c.rekeys_initiated_age.load(Ordering::Relaxed),
+                rekeys_initiated_dead_peer: c
+                    .rekeys_initiated_dead_peer
+                    .load(Ordering::Relaxed),
+                rekeys_initiated_keepalive_no_session: c
+                    .rekeys_initiated_keepalive_no_session
+                    .load(Ordering::Relaxed),
+                keepalives_tx_passive: c.keepalives_tx_passive.load(Ordering::Relaxed),
+                keepalives_tx_persistent: c
+                    .keepalives_tx_persistent
+                    .load(Ordering::Relaxed),
+                pending_aborted_attempt_window: c
+                    .pending_aborted_attempt_window
+                    .load(Ordering::Relaxed),
             });
         }
         out
