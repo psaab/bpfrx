@@ -2125,3 +2125,311 @@ fn wg_endpoint_with_zero_listen_port_is_dropped() {
     assert!(!state.has_wg_tunnels);
     assert!(!state.wg_engines.contains_key(&7));
 }
+
+// ---------------------------------------------------------------------
+// #1873 — stable-id contract: removing one tunnel preserves the OTHER
+// tunnels' engines + remap purge-set computation.
+// ---------------------------------------------------------------------
+
+fn two_tunnel_snapshot() -> ConfigSnapshot {
+    ConfigSnapshot {
+        tunnel_endpoints: vec![
+            crate::protocol::snapshot::TunnelEndpointSnapshot {
+                id: 824,
+                interface: "gr-0/0/0.0".into(),
+                linux_name: "gr-0-0-0".into(),
+                ifindex: 41,
+                mode: "gre".into(),
+                source: "172.16.80.8".into(),
+                destination: "203.0.113.9".into(),
+                transport_table: "inet.0".into(),
+                ttl: 64,
+                ..Default::default()
+            },
+            crate::protocol::snapshot::TunnelEndpointSnapshot {
+                id: 7,
+                interface: "wg0".into(),
+                linux_name: "wg0".into(),
+                ifindex: 42,
+                mode: "wireguard".into(),
+                wg_listen_port: 51820,
+                wg_local_privkey_hex: WG_TEST_PRIVKEY_HEX.into(),
+                wg_peer_pubkey_hex: WG_TEST_PEERKEY_HEX.into(),
+                wg_allowed_ips: vec!["10.0.0.0/24".into()],
+                wg_endpoint: "203.0.113.1:51820".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    }
+}
+
+/// #1873 contract pin: with stable (Go-side content-derived) ids, a
+/// snapshot that removes one tunnel keeps the OTHER tunnel's id, so
+/// `populate_wg_engines` reuses the survivor's engine Arc verbatim —
+/// no rebuild, no session reset, no TAI64N reseed. Under the retired
+/// positional allocator the survivor's id shifted and this test's
+/// Arc::ptr_eq assertion is exactly what broke.
+#[test]
+fn wg_engine_survives_unrelated_tunnel_removal() {
+    let snap = two_tunnel_snapshot();
+    let prev = build_forwarding_state(&snap);
+    let prev_engine = prev.wg_engines.get(&7).unwrap().clone();
+
+    // Remove the GRE tunnel; the WG row is byte-identical (same id —
+    // the Go allocator guarantees this since #1873).
+    let mut snap2 = two_tunnel_snapshot();
+    snap2.tunnel_endpoints.retain(|ep| ep.id == 7);
+    let next = build_forwarding_state_with_policy_counters_and_previous(
+        &snap2,
+        &PolicyCounterStore::default(),
+        Some(&prev),
+    )
+    .unwrap();
+    let next_engine = next.wg_engines.get(&7).unwrap();
+    assert!(
+        std::sync::Arc::ptr_eq(&prev_engine, next_engine),
+        "removing an unrelated tunnel must not rebuild the WG engine (#1873)"
+    );
+}
+
+/// #1873 R-D purge-set pins: (a) vanished id purged, (b) owner-name
+/// change purged, (c) cosmetic linux_name change NOT purged,
+/// (d) untouched ids NOT purged.
+#[test]
+fn tunnel_remap_purge_ids_owner_change_semantics() {
+    use crate::afxdp::coordinator::tunnel_remap_purge_ids;
+    let prev = build_forwarding_state(&two_tunnel_snapshot());
+
+    // (a) vanished: remove the GRE row.
+    let mut snap_removed = two_tunnel_snapshot();
+    snap_removed.tunnel_endpoints.retain(|ep| ep.id == 7);
+    let next = build_forwarding_state(&snap_removed);
+    assert_eq!(tunnel_remap_purge_ids(&prev, &next, true), vec![824]);
+
+    // (b) owner change: id 824 now belongs to a DIFFERENT logical name
+    // (temporal hash reuse).
+    let mut snap_reused = two_tunnel_snapshot();
+    snap_reused.tunnel_endpoints[0].interface = "gr-9/9/9.0".into();
+    let next = build_forwarding_state(&snap_reused);
+    assert_eq!(tunnel_remap_purge_ids(&prev, &next, true), vec![824]);
+
+    // (c) cosmetic linux_name rename, logical name unchanged: NO purge.
+    let mut snap_renamed = two_tunnel_snapshot();
+    snap_renamed.tunnel_endpoints[0].linux_name = "gre-renamed".into();
+    let next = build_forwarding_state(&snap_renamed);
+    assert!(tunnel_remap_purge_ids(&prev, &next, true).is_empty());
+
+    // (d) identical set: NO purge.
+    let next = build_forwarding_state(&two_tunnel_snapshot());
+    assert!(tunnel_remap_purge_ids(&prev, &next, true).is_empty());
+}
+
+/// #1873 owner-check pins (Codex code r2 — replaces the unsound r1
+/// defer + rotation-barrier design): a re-owned id installs
+/// IMMEDIATELY (no defer), the unrelated WG endpoint's engine Arc is
+/// reused verbatim, and the purge set plus the per-packet owner check
+/// (not apply-time timing) carry the correctness burden.
+#[test]
+fn reowned_tunnel_id_installs_immediately_with_engine_reuse() {
+    let prev = build_forwarding_state(&two_tunnel_snapshot());
+
+    // Same snapshot, id 824 re-owned by a different logical name.
+    let mut snap_reused = two_tunnel_snapshot();
+    snap_reused.tunnel_endpoints[0].interface = "gr-9/9/9.0".into();
+    let next = build_forwarding_state_with_policy_counters_and_previous(
+        &snap_reused,
+        &PolicyCounterStore::default(),
+        Some(&prev),
+    )
+    .unwrap();
+    let ep = next.tunnel_endpoints.get(&824).expect("new owner installed");
+    assert_eq!(ep.interface, "gr-9/9/9.0");
+    // The unrelated WG endpoint keeps its engine Arc across the apply.
+    assert!(next.tunnel_endpoints.contains_key(&7));
+    assert!(std::sync::Arc::ptr_eq(
+        prev.wg_engines.get(&7).expect("prev engine"),
+        next.wg_engines.get(&7).expect("next engine"),
+    ));
+}
+
+/// #1873 purge-set pin (Codex code r2): an id NEWLY APPEARING in
+/// `next` (absent in `previous`) is purged when
+/// `include_new_appearances` is set — any entry still storing it
+/// (e.g. a synced copy installed with an unresolvable id during HA
+/// config skew) predates `previous` and must die before the new
+/// owner's row is reachable. The first-apply arm (flag false) skips
+/// it so boot-time synced sessions survive.
+#[test]
+fn newly_appearing_tunnel_id_is_purged_after_first_apply() {
+    use crate::afxdp::coordinator::tunnel_remap_purge_ids;
+    // previous has only the WG endpoint; next adds the GRE row (824).
+    let mut snap_wg_only = two_tunnel_snapshot();
+    snap_wg_only.tunnel_endpoints.retain(|ep| ep.id == 7);
+    let prev = build_forwarding_state(&snap_wg_only);
+    let next = build_forwarding_state(&two_tunnel_snapshot());
+    assert_eq!(tunnel_remap_purge_ids(&prev, &next, true), vec![824]);
+    assert!(tunnel_remap_purge_ids(&prev, &next, false).is_empty());
+}
+
+/// #1873 owner check (Codex code r2): a stale session whose stored
+/// tunnel resolution was created against a DIFFERENT owning netdev of
+/// the same id must NEVER adopt the new owner at re-resolution — the
+/// stored egress_ifindex (= the owner's logical_ifindex at resolve
+/// time) is the discriminator, independent of purge timing, worker
+/// rotation, or which forwarding state the worker held at create.
+#[test]
+fn stale_session_never_adopts_reowned_tunnel_id() {
+    use crate::afxdp::session_glue::lookup_forwarding_resolution_for_session;
+    use crate::afxdp::ShardedNeighborMap;
+
+    let state = build_forwarding_state(&two_tunnel_snapshot());
+    let row_ifindex = state
+        .tunnel_endpoints
+        .get(&824)
+        .expect("gre row")
+        .logical_ifindex;
+    let flow = crate::afxdp::SessionFlow {
+        src_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 61, 102)),
+        dst_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 7)),
+        forward_key: crate::session::SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: 6,
+            src_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 61, 102)),
+            dst_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 7)),
+            src_port: 55068,
+            dst_port: 5201,
+        },
+    };
+    let stale_decision = crate::session::SessionDecision {
+        resolution: crate::afxdp::ForwardingResolution {
+            disposition: crate::afxdp::ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            // The OLD owner's netdev ifindex — different from the
+            // current row's.
+            egress_ifindex: row_ifindex + 1000,
+            tx_ifindex: 3,
+            tunnel_endpoint_id: 824,
+            next_hop: None,
+            neighbor_mac: Some([2, 0, 0, 0, 0, 9]),
+            src_mac: Some([2, 0, 0, 0, 0, 1]),
+            tx_vlan_id: 0,
+        },
+        nat: crate::nat::NatDecision::default(),
+    };
+    let resolved = lookup_forwarding_resolution_for_session(
+        &state,
+        &std::sync::Arc::new(ShardedNeighborMap::new()),
+        &flow,
+        stale_decision,
+    );
+    assert_eq!(
+        resolved.disposition,
+        crate::afxdp::ForwardingDisposition::NoRoute,
+        "stale owner must be gated, never re-resolved into the new owner"
+    );
+    assert_eq!(
+        resolved.tunnel_endpoint_id, 824,
+        "the gated resolution stays tunnel-marked so the R-C gate drops it"
+    );
+    assert_eq!(
+        resolved.egress_ifindex,
+        row_ifindex + 1000,
+        "the stale egress_ifindex survives write-back so the gate stays sticky"
+    );
+
+    // Control: a session created against the CURRENT owner re-resolves
+    // normally (the cached ForwardCandidate fallback applies when the
+    // outer route is unresolvable in this fixture).
+    let mut fresh_decision = stale_decision;
+    fresh_decision.resolution.egress_ifindex = row_ifindex;
+    let resolved = lookup_forwarding_resolution_for_session(
+        &state,
+        &std::sync::Arc::new(ShardedNeighborMap::new()),
+        &flow,
+        fresh_decision,
+    );
+    assert_ne!(
+        (resolved.disposition, resolved.egress_ifindex),
+        (crate::afxdp::ForwardingDisposition::NoRoute, 0),
+        "matching owner must not be gated"
+    );
+}
+
+/// #1873 owner-RG attribution pin (Codex code r3 MAJOR 2): a stale
+/// tunnel resolution (stored egress_ifindex != the current row's
+/// logical_ifindex) must NOT inherit the NEW owner's redundancy group
+/// — owner_rg_for_resolution returns 0 (unknown) so HA metadata and
+/// owner-RG indexes keep their existing attribution.
+#[test]
+fn stale_owner_resolution_does_not_inherit_new_owner_rg() {
+    use crate::afxdp::owner_rg_for_resolution;
+    let mut snap = two_tunnel_snapshot();
+    snap.tunnel_endpoints[0].redundancy_group = 2;
+    let state = build_forwarding_state(&snap);
+    let row_ifindex = state
+        .tunnel_endpoints
+        .get(&824)
+        .expect("gre row")
+        .logical_ifindex;
+    let mut resolution = crate::afxdp::ForwardingResolution {
+        disposition: crate::afxdp::ForwardingDisposition::ForwardCandidate,
+        local_ifindex: 0,
+        egress_ifindex: row_ifindex,
+        tx_ifindex: 3,
+        tunnel_endpoint_id: 824,
+        next_hop: None,
+        neighbor_mac: None,
+        src_mac: None,
+        tx_vlan_id: 0,
+    };
+    assert_eq!(owner_rg_for_resolution(&state, resolution), 2);
+    // Stale owner: a different netdev owned this id when the session
+    // resolved — never attribute the new owner's RG.
+    resolution.egress_ifindex = row_ifindex + 1000;
+    assert_eq!(owner_rg_for_resolution(&state, resolution), 0);
+    // Synced entries installed with an unresolvable id (egress 0)
+    // keep the current-row attribution (no discriminator to check).
+    resolution.egress_ifindex = 0;
+    assert_eq!(owner_rg_for_resolution(&state, resolution), 2);
+}
+
+/// #1873 reconcile-boundary purge pin (AGY code r3 / Codex code r3):
+/// the reconcile path diffs against the tunnel-owner map captured
+/// BEFORE teardown defaults coord.forwarding — the owners-list flavor
+/// must implement all three arms, and the new-appearance arm must be
+/// skippable for the genuine first apply.
+#[test]
+fn tunnel_remap_purge_ids_from_owners_semantics() {
+    use crate::afxdp::coordinator::tunnel_remap_purge_ids_from_owners;
+    let next = build_forwarding_state(&two_tunnel_snapshot());
+
+    // Vanished id.
+    let owners = vec![
+        (824u16, "gr-0/0/0.0".to_string()),
+        (7u16, "wg0".to_string()),
+        (901u16, "gr-1/1/1.0".to_string()),
+    ];
+    assert_eq!(
+        tunnel_remap_purge_ids_from_owners(&owners, &next, true),
+        vec![901]
+    );
+
+    // Owner change at a surviving id.
+    let owners = vec![(824u16, "gr-old/0/0.0".to_string()), (7u16, "wg0".to_string())];
+    assert_eq!(
+        tunnel_remap_purge_ids_from_owners(&owners, &next, true),
+        vec![824]
+    );
+
+    // New appearance: id 824 absent from the prior owners.
+    let owners = vec![(7u16, "wg0".to_string())];
+    assert_eq!(
+        tunnel_remap_purge_ids_from_owners(&owners, &next, true),
+        vec![824]
+    );
+    assert!(tunnel_remap_purge_ids_from_owners(&owners, &next, false).is_empty());
+
+    // Pristine first apply (empty owners + flag false): nothing purged.
+    assert!(tunnel_remap_purge_ids_from_owners(&[], &next, false).is_empty());
+}

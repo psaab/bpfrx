@@ -5275,3 +5275,356 @@ fn txn_nat64_refusal_at_cap_drops_translated_packet() {
     assert_eq!(batch2.session_creates, 2);
     assert_eq!(dbg2.tx, 1);
 }
+
+// === #1873 R-C: blanket tunnel gate at the slow-path chokepoint ===
+
+fn tunnel_gate_test_fixture() -> (
+    BindingIdentity,
+    BindingLiveState,
+    Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    UserspaceDpMeta,
+    Vec<u8>,
+) {
+    let frame =
+        build_icmp_echo_frame_v4(Ipv4Addr::new(10, 0, 61, 102), Ipv4Addr::new(1, 1, 1, 1), 64);
+    let binding = BindingIdentity {
+        slot: 7,
+        queue_id: 0,
+        worker_id: 0,
+        interface: Arc::<str>::from("ge-0-0-2"),
+        ifindex: 6,
+    };
+    let live = BindingLiveState::new();
+    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        l4_offset: 34,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        ..UserspaceDpMeta::default()
+    };
+    (binding, live, recent_exceptions, meta, frame)
+}
+
+fn tunnel_marked_decision(disposition: ForwardingDisposition) -> SessionDecision {
+    SessionDecision {
+        resolution: ForwardingResolution {
+            disposition,
+            local_ifindex: 0,
+            egress_ifindex: 6,
+            tx_ifindex: 0,
+            tunnel_endpoint_id: 824,
+            next_hop: None,
+            neighbor_mac: None,
+            src_mac: None,
+            tx_vlan_id: 0,
+        },
+        nat: NatDecision::default(),
+    }
+}
+
+/// #1873 R-C: a tunnel-marked inner packet must NEVER be enqueued to
+/// the kernel slow-path TUN — through ANY door (build-failure
+/// fallback, NoRoute, MissingNeighbor non-forward dispositions). It is
+/// dropped with the dedicated counter + exception, and the generic
+/// slow_path_drops counter stays untouched (proving the gate fires
+/// BEFORE the enqueue/unavailable handling, not as a side effect of
+/// slow_path being absent).
+#[test]
+fn tunnel_marked_frame_never_reaches_slow_path() {
+    for (i, disposition) in [
+        ForwardingDisposition::ForwardCandidate, // build-failure door
+        ForwardingDisposition::NoRoute,
+        ForwardingDisposition::MissingNeighbor,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (binding, live, recent_exceptions, meta, frame) = tunnel_gate_test_fixture();
+        let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+        maybe_reinject_slow_path_from_frame(
+            &binding,
+            &live,
+            None,
+            &local_tunnel_deliveries,
+            &frame,
+            meta,
+            tunnel_marked_decision(disposition),
+            &recent_exceptions,
+            "forward_build_slow_path",
+            &ForwardingState::default(),
+        );
+        assert_eq!(
+            live.tunnel_encap_unresolved_drops.load(Ordering::Relaxed),
+            1,
+            "case {i}: tunnel gate did not fire"
+        );
+        assert_eq!(
+            live.slow_path_drops.load(Ordering::Relaxed),
+            0,
+            "case {i}: generic slow-path drop counted — gate fired too late"
+        );
+        assert_eq!(live.slow_path_packets.load(Ordering::Relaxed), 0);
+        let exceptions = recent_exceptions.lock().expect("exceptions");
+        assert_eq!(
+            exceptions.back().expect("exception").reason,
+            "tunnel_encap_unresolved",
+            "case {i}"
+        );
+    }
+}
+
+/// #1873 R-C: the build-failure entry point (`handle_forward_build_failure`
+/// with fallback_to_slow_path = true) funnels through the same gate.
+#[test]
+fn tunnel_marked_build_failure_drops_instead_of_slow_path() {
+    let (binding, live, recent_exceptions, meta, frame) = tunnel_gate_test_fixture();
+    let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+    let mut dbg = DebugPollCounters::default();
+    handle_forward_build_failure(
+        &binding,
+        &live,
+        None,
+        &local_tunnel_deliveries,
+        &recent_exceptions,
+        &mut dbg,
+        6,
+        frame.len() as u32,
+        &frame,
+        meta,
+        tunnel_marked_decision(ForwardingDisposition::ForwardCandidate),
+        true,
+        &ForwardingState::default(),
+    );
+    assert_eq!(live.tunnel_encap_unresolved_drops.load(Ordering::Relaxed), 1);
+    assert_eq!(live.slow_path_drops.load(Ordering::Relaxed), 0);
+}
+
+/// #1873 R-C: the local_tunnel_deliveries branch (GRE local-origin
+/// INBOUND delivery, keyed by local_ifindex) must stay OPEN — the gate
+/// sits after it.
+#[test]
+fn tunnel_gate_keeps_local_tunnel_delivery_open() {
+    let (binding, live, recent_exceptions, meta, frame) = tunnel_gate_test_fixture();
+    let (tx, rx) = mpsc::sync_channel(4);
+    let mut deliveries = BTreeMap::new();
+    deliveries.insert(9, tx);
+    let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(deliveries));
+    let mut decision = tunnel_marked_decision(ForwardingDisposition::LocalDelivery);
+    decision.resolution.local_ifindex = 9;
+    maybe_reinject_slow_path_from_frame(
+        &binding,
+        &live,
+        None,
+        &local_tunnel_deliveries,
+        &frame,
+        meta,
+        decision,
+        &recent_exceptions,
+        "forward_build_slow_path",
+        &ForwardingState::default(),
+    );
+    assert_eq!(live.tunnel_encap_unresolved_drops.load(Ordering::Relaxed), 0);
+    let delivered = rx.try_recv().expect("local tunnel delivery still open");
+    assert!(!delivered.is_empty());
+}
+
+/// #1873 R-E: a tunnel-marked decision whose OUTER next-hop is
+/// unresolved (MissingNeighbor) must NOT be buffered in pending_neigh
+/// — the retry path's in-place rewrite cannot encapsulate, so a
+/// buffered tunnel inner packet would later TX PLAINTEXT. The frame
+/// instead flows to the slow-path chokepoint where the R-C blanket
+/// gate drops + counts it.
+#[test]
+fn txn_tunnel_marked_missing_neighbor_not_buffered() {
+    let mut snapshot = nat_snapshot();
+    snapshot.interfaces.push(InterfaceSnapshot {
+        name: "gr-0/0/0.0".to_string(),
+        zone: "wan".to_string(),
+        linux_name: "gr-0-0-0".to_string(),
+        ifindex: 77,
+        ..Default::default()
+    });
+    snapshot.tunnel_endpoints = vec![crate::protocol::snapshot::TunnelEndpointSnapshot {
+        id: 824,
+        interface: "gr-0/0/0.0".to_string(),
+        linux_name: "gr-0-0-0".to_string(),
+        ifindex: 77,
+        zone: "wan".to_string(),
+        mode: "gre".to_string(),
+        outer_family: "inet".to_string(),
+        source: "172.16.80.8".to_string(),
+        destination: "203.0.113.9".to_string(),
+        transport_table: "inet.0".to_string(),
+        ttl: 64,
+        ..Default::default()
+    }];
+    snapshot.routes.push(RouteSnapshot {
+        table: "inet.0".to_string(),
+        family: "inet".to_string(),
+        destination: "8.8.8.8/32".to_string(),
+        next_hops: vec!["@gr-0/0/0.0".to_string()],
+        discard: false,
+        next_table: String::new(),
+    });
+    // No neighbors: the tunnel's OUTER destination (203.0.113.9 via the
+    // 172.16.80.1 default gateway) is unresolved -> MissingNeighbor
+    // with tunnel_endpoint_id preserved.
+    snapshot.neighbors.clear();
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+
+    let frame = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(8, 8, 8, 8),
+        12345,
+        443,
+        TCP_FLAG_SYN,
+    );
+    let meta = txn_meta_v4(24, TCP_FLAG_SYN, (frame.len() - 14) as u16);
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+    // First packet: the decision is tunnel-marked ForwardCandidate; the
+    // GRE encap build fails on the unresolved OUTER neighbor and the
+    // dispatch build-failure door funnels into the R-C gate.
+    assert!(
+        binding.pending_neigh.is_empty(),
+        "tunnel-marked frame must never be admitted to pending_neigh (#1873 R-E)"
+    );
+    let drops_after_first = binding
+        .live
+        .tunnel_encap_unresolved_drops
+        .load(Ordering::Relaxed);
+    assert!(
+        drops_after_first >= 1,
+        "tunnel-marked frame must be dropped+counted at the R-C gate"
+    );
+
+    // Second packet: the session now exists, so the per-packet path
+    // re-resolves the stored tunnel id. Whatever door the failure
+    // takes, the frame must never be buffered for in-place retry and
+    // must be counted at the R-C gate.
+    let meta2 = txn_meta_v4(24, TCP_FLAG_SYN, (frame.len() - 14) as u16);
+    let (_batch2, dbg2) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta2,
+    );
+    let _ = dbg2;
+    assert!(
+        binding.pending_neigh.is_empty(),
+        "tunnel-marked frame must skip pending_neigh admission on the session path too (#1873 R-E)"
+    );
+    assert!(
+        binding
+            .live
+            .tunnel_encap_unresolved_drops
+            .load(Ordering::Relaxed)
+            > drops_after_first,
+        "second packet must also be dropped+counted at the R-C gate"
+    );
+}
+
+/// #1873 replay-filter companion pin (AGY code r4 HIGH): filtering the
+/// preserved synced-session replay list by purged tunnel ids must
+/// mirror delete_synced_session's companion semantics — the derived
+/// reverse companion (tunnel_endpoint_id == 0) of a dropped forward
+/// entry is dropped too, never resurrected as a half-dead pair; a
+/// reverse-marked entry drops standalone; unrelated entries survive.
+#[test]
+fn replay_filter_drops_purged_forward_and_derived_reverse_companion() {
+    use crate::afxdp::coordinator::filter_replayed_synced_sessions;
+
+    let nat = NatDecision {
+        rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+        ..NatDecision::default()
+    };
+    let forward_key = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        src_port: 12345,
+        dst_port: 5201,
+    };
+    let reverse_key = crate::session::reverse_session_key(&forward_key, nat);
+    let tunnel_resolution = ForwardingResolution {
+        disposition: ForwardingDisposition::ForwardCandidate,
+        local_ifindex: 0,
+        egress_ifindex: 41,
+        tx_ifindex: 3,
+        tunnel_endpoint_id: 824,
+        next_hop: None,
+        neighbor_mac: Some([2, 0, 0, 0, 0, 9]),
+        src_mac: Some([2, 0, 0, 0, 0, 1]),
+        tx_vlan_id: 0,
+    };
+    let plain_resolution = ForwardingResolution {
+        tunnel_endpoint_id: 0,
+        ..tunnel_resolution
+    };
+    let make = |key: &SessionKey,
+                resolution: ForwardingResolution,
+                is_reverse: bool| SyncedSessionEntry {
+        key: key.clone(),
+        decision: SessionDecision { resolution, nat },
+        metadata: SessionMetadata {
+            ingress_zone: 1,
+            egress_zone: 2,
+            owner_rg_id: 1,
+            fabric_ingress: false,
+            is_reverse,
+            nat64_reverse: None,
+        },
+        origin: SessionOrigin::SyncImport,
+        protocol: PROTO_TCP,
+        tcp_flags: 0,
+    };
+    let unrelated_key = SessionKey {
+        src_port: 23456,
+        ..forward_key.clone()
+    };
+
+    // Case 1: tunnel-marked forward + unmarked derived reverse
+    // companion + unrelated unmarked entry.
+    let mut entries = vec![
+        make(&forward_key, tunnel_resolution, false),
+        make(&reverse_key, plain_resolution, true),
+        make(&unrelated_key, plain_resolution, false),
+    ];
+    filter_replayed_synced_sessions(&mut entries, &[824]);
+    assert_eq!(entries.len(), 1, "forward + derived reverse both dropped");
+    assert_eq!(entries[0].key, unrelated_key);
+
+    // Case 2: reverse-marked tunnel entry drops standalone; its
+    // unmarked forward keeps forwarding (matches live purge
+    // semantics: delete_synced_session on a reverse key derives no
+    // companion).
+    let mut entries = vec![
+        make(&forward_key, plain_resolution, false),
+        make(&reverse_key, tunnel_resolution, true),
+    ];
+    filter_replayed_synced_sessions(&mut entries, &[824]);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].key, forward_key);
+
+    // Case 3: no purged ids — untouched.
+    let mut entries = vec![make(&forward_key, tunnel_resolution, false)];
+    filter_replayed_synced_sessions(&mut entries, &[7]);
+    assert_eq!(entries.len(), 1);
+}

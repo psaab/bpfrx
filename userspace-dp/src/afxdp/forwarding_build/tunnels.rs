@@ -82,6 +82,7 @@ pub(super) fn populate_tunnel_endpoints(
                 } else {
                     endpoint.linux_name.clone()
                 },
+                interface: endpoint.interface.clone(),
                 redundancy_group: endpoint.redundancy_group,
                 mode: endpoint.mode.clone(),
                 outer_family,

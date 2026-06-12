@@ -195,6 +195,34 @@ pub(in crate::afxdp) fn maybe_reinject_slow_path_from_frame(
         }
         return;
     }
+    // #1873 R-C (blanket gate, plan v4): a tunnel-marked inner packet
+    // is NEVER enqueued to the kernel slow-path TUN. Reinjection hands
+    // the UNENCAPSULATED inner packet to the kernel FIB; whenever the
+    // kernel's view diverges from the userspace FIB (tunnel removed,
+    // admin-down with the route withdrawn, VRF-table divergence) the
+    // kernel default-routes it — a plaintext leak (AGY plan r1/r3,
+    // verified). The gate is unconditional: the supposed WG cold-path
+    // benefit of reinjection is illusory (wg_control's TUN-read encap
+    // hits the same EncapError::NoSession and drops, and the worker
+    // already armed the handshake before the build returned None —
+    // frame/wg.rs), and GRE outer-neighbor cold start is recovered by
+    // the #1769 prober + retransmission. The local_tunnel_deliveries
+    // branch above stays open: that is GRE local-origin INBOUND
+    // delivery keyed by local_ifindex, never the generic TUN.
+    if decision.resolution.tunnel_endpoint_id != 0 {
+        live.tunnel_encap_unresolved_drops
+            .fetch_add(1, Ordering::Relaxed);
+        record_exception(
+            recent_exceptions,
+            binding,
+            "tunnel_encap_unresolved",
+            frame.len() as u32,
+            Some(meta),
+            None,
+            forwarding,
+        );
+        return;
+    }
     let selected_path = slow_path.cloned();
     let Some(slow_path) = selected_path else {
         live.slow_path_drops.fetch_add(1, Ordering::Relaxed);

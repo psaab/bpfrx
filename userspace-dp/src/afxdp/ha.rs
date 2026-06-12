@@ -392,6 +392,79 @@ impl super::Coordinator {
         }
     }
 
+    /// #1873 R-D: purge every session whose stored tunnel_endpoint_id
+    /// was REMAPPED by a snapshot apply — the id is absent from the
+    /// new forwarding state, or it now belongs to a DIFFERENT logical
+    /// tunnel name (temporal hash reuse, or the one-time
+    /// positional->hash upgrade re-id). Without the purge a live
+    /// session would re-resolve its stored id into the WRONG tunnel
+    /// (cross-tunnel encap) or permanently dead-end on the R-C gate.
+    ///
+    /// Each purged forward session goes through delete_synced_session
+    /// (shared maps + indexes + kernel session map + reverse companion
+    /// + worker DeleteSynced broadcast) and emits a Close delta on the
+    /// event stream so the Go shadow conntrack and the HA peer
+    /// delete-sync stay coherent (the standby additionally runs its
+    /// own purge when IT applies the snapshot).
+    pub(crate) fn purge_remapped_tunnel_sessions(&self, purge_ids: &[u16]) -> usize {
+        if purge_ids.is_empty() {
+            return 0;
+        }
+        let mut keys = Vec::new();
+        let mut deltas = Vec::new();
+        {
+            let Ok(sessions) = self.sessions.synced.lock() else {
+                return 0;
+            };
+            for entry in sessions.values() {
+                let id = entry.decision.resolution.tunnel_endpoint_id;
+                if id == 0 || !purge_ids.contains(&id) {
+                    continue;
+                }
+                // Reverse entries are purged too: in an asymmetric
+                // topology the REVERSE resolution can be the
+                // tunnel-marked one while the forward entry is not in
+                // the purge set, so relying on the forward pass's
+                // companion removal alone would leave the reverse
+                // entry dangling on the remapped id (Claude SMR code
+                // review r1). delete_synced_session handles a reverse
+                // key as a standalone removal. Close deltas are
+                // emitted for FORWARD entries only (matching
+                // emit_close_delta_with_origin's is_reverse skip — the
+                // Go shadow keys off the forward delta).
+                keys.push(entry.key.clone());
+                if !entry.metadata.is_reverse {
+                    deltas.push(crate::session::SessionDelta {
+                        kind: crate::session::SessionDeltaKind::Close,
+                        key: entry.key.clone(),
+                        decision: entry.decision,
+                        metadata: entry.metadata.clone(),
+                        origin: entry.origin,
+                        fabric_redirect_sync: false,
+                    });
+                }
+            }
+        }
+        for key in &keys {
+            self.delete_synced_session(key.clone());
+        }
+        if let Some(es) = self.event_stream.as_ref() {
+            let handle = es.worker_handle();
+            let zone_name_to_id = &self.forwarding.zone_name_to_id;
+            for delta in &deltas {
+                let _ = handle.push_delta_lossless(delta, zone_name_to_id);
+            }
+        }
+        if !keys.is_empty() {
+            eprintln!(
+                "xpf-userspace-dp: purged {} session(s) on tunnel-endpoint id remap (ids {:?}) (#1873)",
+                keys.len(),
+                purge_ids
+            );
+        }
+        keys.len()
+    }
+
     /// Export all locally-owned forward sessions through the event stream.
     ///
     /// Called on peer connect instead of the old BulkSync path. Iterates the

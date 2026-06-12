@@ -88,6 +88,36 @@ fn lookup_forwarding_resolution_for_session_with_cache(
         return decision.resolution;
     }
     if decision.resolution.tunnel_endpoint_id != 0 {
+        // #1873 (Codex code r2): the session's stored tunnel resolution
+        // carries the owning netdev's kernel ifindex (egress_ifindex =
+        // endpoint.logical_ifindex at resolve time). If the id has
+        // since been re-owned by a DIFFERENT netdev (temporal hash
+        // reuse: remove tunnel A, add tunnel B whose name folds to the
+        // same id), the stale session must NEVER adopt the new owner —
+        // no matter which forwarding state this worker held when the
+        // session was created. Kernel ifindexes are not reused within
+        // a boot, so inequality is authoritative. Tunnel-marked NoRoute
+        // funnels the frame into the R-C gate (drop + count), never the
+        // slow path and never B's encap.
+        if decision.resolution.egress_ifindex > 0 {
+            if let Some(row) = forwarding
+                .tunnel_endpoints
+                .get(&decision.resolution.tunnel_endpoint_id)
+            {
+                if row.logical_ifindex != decision.resolution.egress_ifindex {
+                    // PRESERVE the stale egress_ifindex: several paths
+                    // write the re-resolved value back into the stored
+                    // entry (maybe_promote_synced_session, UpsertSynced)
+                    // — zeroing it would erase the discriminator and let
+                    // the NEXT packet adopt the new owner. With it
+                    // preserved the entry stays gated until purged/GC'd.
+                    let mut gated = super::no_route_resolution(None);
+                    gated.tunnel_endpoint_id = decision.resolution.tunnel_endpoint_id;
+                    gated.egress_ifindex = decision.resolution.egress_ifindex;
+                    return gated;
+                }
+            }
+        }
         let resolved = super::resolve_tunnel_forwarding_resolution(
             forwarding,
             Some(dynamic_neighbors),

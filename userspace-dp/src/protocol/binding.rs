@@ -451,6 +451,11 @@ pub(crate) struct BindingStatus {
     pub slow_path_drops: u64,
     #[serde(rename = "slow_path_rate_limited", default)]
     pub slow_path_rate_limited: u64,
+    /// #1873 R-C/R-E: tunnel-marked inner packets dropped instead of
+    /// plaintext kernel reinjection / in-place TX. Wire-additive
+    /// (serde default; Go side omitempty).
+    #[serde(rename = "tunnel_encap_unresolved_drops", default)]
+    pub tunnel_encap_unresolved_drops: u64,
     #[serde(rename = "kernel_rx_dropped", default)]
     pub kernel_rx_dropped: u64,
     #[serde(rename = "kernel_rx_invalid_descs", default)]

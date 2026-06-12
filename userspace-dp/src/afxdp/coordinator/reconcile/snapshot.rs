@@ -23,6 +23,9 @@ pub(super) fn apply_snapshot(
     snapshot: &ConfigSnapshot,
     bindings: &mut [BindingStatus],
     preserved_slow_path: Option<Arc<SlowPathReinjector>>,
+    prior_tunnel_owners: &[(u16, String)],
+    snapshot_was_installed: bool,
+    preserved_synced_sessions: &mut Vec<SyncedSessionEntry>,
 ) -> Option<ReconcileSnapshotFds> {
     // #1606: preflight policy build BEFORE any side-effecting
     // mutation. Surfaces address-book integrity errors (id=0,
@@ -56,6 +59,32 @@ pub(super) fn apply_snapshot(
         "reconcile",
         &coord.forwarding,
         &new_forwarding,
+    );
+    // #1873 R-D: the purge diff runs against the tunnel-owner map
+    // captured BEFORE teardown (AGY code r3) — stop_inner(false) has
+    // already defaulted coord.forwarding, so diffing the live state
+    // here would make every purge arm inert across a reconcile
+    // boundary while the preserved shared maps still hold the old
+    // entries. The purge is cleanup, not the correctness boundary —
+    // re-resolution and the encap builders refuse an id whose owning
+    // netdev ifindex differs from the session's stored one (Codex
+    // code-review r2; replaces the unsound r1 defer + rotation-barrier
+    // design). New-appearance purging is gated on the GENUINE first
+    // apply of the helper's life (flag captured before teardown).
+    let tunnel_purge_ids = super::super::tunnel_remap_purge_ids_from_owners(
+        prior_tunnel_owners,
+        &new_forwarding,
+        snapshot_was_installed,
+    );
+    coord.purge_remapped_tunnel_sessions(&tunnel_purge_ids);
+    // The bringup phase replays `preserved_synced_sessions` (captured
+    // BEFORE this purge) into the shared maps — filter the purged ids
+    // AND their derived reverse companions out so the replay cannot
+    // resurrect them, whole or as half-dead pairs (code r3; companion
+    // semantics per AGY code r4).
+    super::super::filter_replayed_synced_sessions(
+        preserved_synced_sessions,
+        &tunnel_purge_ids,
     );
     coord.forwarding = new_forwarding;
     coord.shared_validation.store(Arc::new(coord.validation));

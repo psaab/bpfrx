@@ -41,9 +41,18 @@ func buildTunnelEndpointSnapshots(cfg *config.Config, interfaces []InterfaceSnap
 	}
 	sort.Strings(names)
 	out := make([]TunnelEndpointSnapshot, 0)
-	var nextID uint16 = 1
+	// #1873: ids are content-derived (config.StableTunnelEndpointID of
+	// the unit-qualified interface name), NOT positional — adding or
+	// removing one tunnel can never renumber another, and both HA
+	// nodes compute identical ids from identical config. usedIDs is
+	// the fail-closed belt-and-braces behind the commit-time collision
+	// gate (validateTunnelEndpointIDCollisionAST): a snapshot must
+	// never carry two rows with one id, so the later-sorting collider
+	// is dropped loudly. Iteration is sorted (names + unit numbers),
+	// so the drop is deterministic.
+	usedIDs := make(map[uint16]string)
 	addEndpoint := func(ifName string, tunnel *config.TunnelConfig) {
-		if tunnel == nil || nextID == 0 {
+		if tunnel == nil {
 			return
 		}
 		// WireGuard endpoints carry the peer in WgEndpoint and need no
@@ -88,8 +97,14 @@ func buildTunnelEndpointSnapshots(cfg *config.Config, interfaces []InterfaceSnap
 				}
 			}
 		}
+		id := config.StableTunnelEndpointID(ifName)
+		if owner, taken := usedIDs[id]; taken {
+			slog.Error("tunnel endpoint id collision — dropping later-sorting tunnel (#1873)",
+				"kept", owner, "dropped", ifName, "id", id)
+			return
+		}
 		snap := TunnelEndpointSnapshot{
-			ID:              nextID,
+			ID:              id,
 			Interface:       ifName,
 			LinuxName:       iface.LinuxName,
 			Ifindex:         iface.Ifindex,
@@ -113,7 +128,7 @@ func buildTunnelEndpointSnapshots(cfg *config.Config, interfaces []InterfaceSnap
 			snap.WgKeepaliveSecs = tunnel.WgKeepaliveSecs
 		}
 		out = append(out, snap)
-		nextID++
+		usedIDs[id] = ifName
 	}
 	for _, name := range names {
 		iface := cfg.Interfaces.Interfaces[name]

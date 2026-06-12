@@ -2172,8 +2172,8 @@ func TestBuildTunnelEndpointSnapshotsBuildsUnitEndpoint(t *testing.T) {
 	if len(endpoints) != 1 {
 		t.Fatalf("len(endpoints) = %d, want 1", len(endpoints))
 	}
-	if endpoints[0].ID != 1 {
-		t.Fatalf("endpoint id = %d, want 1", endpoints[0].ID)
+	if want := config.StableTunnelEndpointID("gr-0/0/0.0"); endpoints[0].ID != want {
+		t.Fatalf("endpoint id = %d, want %d (stable hash of name, #1873)", endpoints[0].ID, want)
 	}
 	if endpoints[0].Interface != "gr-0/0/0.0" {
 		t.Fatalf("endpoint interface = %q, want gr-0/0/0.0", endpoints[0].Interface)

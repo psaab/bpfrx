@@ -1385,6 +1385,11 @@ type BindingStatus struct {
 	SlowPathForwardBuildPackets       uint64 `json:"slow_path_forward_build_packets,omitempty"`
 	SlowPathDrops                     uint64 `json:"slow_path_drops,omitempty"`
 	SlowPathRateLimited               uint64 `json:"slow_path_rate_limited,omitempty"`
+	// TunnelEncapUnresolvedDrops counts tunnel-marked inner packets
+	// dropped at the slow-path chokepoint / pending-neigh exclusion
+	// instead of plaintext kernel reinjection (#1873 R-C/R-E).
+	// Wire-additive: older helpers omit it.
+	TunnelEncapUnresolvedDrops uint64 `json:"tunnel_encap_unresolved_drops,omitempty"`
 	KernelRXDropped                   uint64 `json:"kernel_rx_dropped,omitempty"`
 	KernelRXInvalidDescs              uint64 `json:"kernel_rx_invalid_descs,omitempty"`
 	TXPackets                         uint64 `json:"tx_packets,omitempty"`
