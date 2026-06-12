@@ -343,6 +343,94 @@ func TestTunnelLinkLocalDeleteFailureRetried(t *testing.T) {
 	}
 }
 
+// --- #1905: WG branch shares the applied-address record ---------------
+
+func wgTC(addrs ...string) *config.TunnelConfig {
+	return &config.TunnelConfig{Name: "wg0", Mode: "wireguard", Addresses: addrs}
+}
+
+// A CONFIGURED fe80 on the persistent wgN TUN, later removed from
+// config, must be reconciled away (pre-#1905 it leaked forever via the
+// nil applied-set sentinel) — while the kernel's autoconf fe80 on the
+// same device survives, exactly the GRE-branch split.
+func TestWireguardConfiguredLinkLocalRemoved(t *testing.T) {
+	ops := newFakeLinkOps()
+	tm, _ := newReconcileManager(ops)
+	if err := tm.Apply([]*config.TunnelConfig{wgTC("10.77.0.1/24", "fe80::8/64")}); err != nil {
+		t.Fatalf("Apply 1: %v", err)
+	}
+	if !ops.hasAddr("wg0", "fe80::8/64") {
+		t.Fatal("configured fe80 not applied")
+	}
+	// Simulate the kernel's autoconf link-local appearing too.
+	kernelLL, _ := netlink.ParseAddr("fe80::5054:ff:fe12:3456/64")
+	ops.addrs["wg0"] = append(ops.addrs["wg0"], *kernelLL)
+
+	if err := tm.Apply([]*config.TunnelConfig{wgTC("10.77.0.1/24")}); err != nil {
+		t.Fatalf("Apply 2: %v", err)
+	}
+	if ops.hasAddr("wg0", "fe80::8/64") {
+		t.Fatal("configured fe80 leaked after removal from config (#1905)")
+	}
+	if !ops.hasAddr("wg0", "fe80::5054:ff:fe12:3456/64") {
+		t.Fatal("kernel autoconf fe80 was deleted")
+	}
+	if !ops.hasAddr("wg0", "10.77.0.1/24") {
+		t.Fatal("configured non-LL address lost")
+	}
+	// The persistent device must not have been recreated by any of this.
+	if len(ops.delNames) != 0 {
+		t.Fatalf("wg0 was deleted/recreated: %v", ops.delNames)
+	}
+}
+
+// Adoption pass: an fe80 already on the device before this manager's
+// first apply (daemon restart over a persistent wgN) is untracked and
+// must never be deleted, even once it is absent from config.
+func TestWireguardForeignLinkLocalNeverDeleted(t *testing.T) {
+	ops := newFakeLinkOps()
+	seedAnchor(ops, "wg0", 7, 1412)
+	preLL, _ := netlink.ParseAddr("fe80::dead/64")
+	ops.addrs["wg0"] = append(ops.addrs["wg0"], *preLL)
+	tm, _ := newReconcileManager(ops)
+
+	for i := 0; i < 2; i++ { // adoption pass AND a tracked second pass
+		if err := tm.Apply([]*config.TunnelConfig{wgTC("10.77.0.1/24")}); err != nil {
+			t.Fatalf("Apply %d: %v", i+1, err)
+		}
+		if !ops.hasAddr("wg0", "fe80::dead/64") {
+			t.Fatalf("pre-existing fe80 deleted on apply %d", i+1)
+		}
+	}
+}
+
+// Failed fe80 stale-delete on the WG branch stays tracked and is
+// retried on the next apply (parity with the GRE-branch r2 Codex F4
+// retry).
+func TestWireguardLinkLocalDeleteFailureRetried(t *testing.T) {
+	ops := newFakeLinkOps()
+	tm, _ := newReconcileManager(ops)
+	if err := tm.Apply([]*config.TunnelConfig{wgTC("fe80::8/64")}); err != nil {
+		t.Fatalf("Apply 1: %v", err)
+	}
+
+	ops.addrDelFail["wg0|fe80::8/64"] = errors.New("EBUSY")
+	if err := tm.Apply([]*config.TunnelConfig{wgTC()}); err != nil {
+		t.Fatalf("Apply 2: %v", err)
+	}
+	if !ops.hasAddr("wg0", "fe80::8/64") {
+		t.Fatal("address gone despite injected delete failure")
+	}
+
+	delete(ops.addrDelFail, "wg0|fe80::8/64")
+	if err := tm.Apply([]*config.TunnelConfig{wgTC()}); err != nil {
+		t.Fatalf("Apply 3: %v", err)
+	}
+	if ops.hasAddr("wg0", "fe80::8/64") {
+		t.Fatal("failed-delete fe80 not retried (dropped from appliedAddrs)")
+	}
+}
+
 // --- §9 test 6: appliedRI claim state machine -------------------------
 
 func TestTunnelVRFStanzaBindAndUnbind(t *testing.T) {

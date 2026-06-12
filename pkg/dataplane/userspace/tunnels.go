@@ -145,6 +145,30 @@ func buildTunnelEndpointSnapshots(cfg *config.Config, interfaces []InterfaceSnap
 				unitNums = append(unitNums, unitNum)
 			}
 			sort.Ints(unitNums)
+			if iface.Tunnel.Mode == "wireguard" {
+				// Interface-level WireGuard is ONE persistent TUN with
+				// ONE listen port shared by every unit (#1910 r2 Codex
+				// High): now that TunnelNameMap resolves every unit ref
+				// of an interface-level wg to the base device, per-unit
+				// emission would produce N live endpoints with the SAME
+				// ifindex + listen port — the Rust side overwrites
+				// tunnel_endpoint_by_ifindex with the later id and the
+				// second control thread tombstones on the duplicate UDP
+				// bind, so routes can select an engine whose control
+				// thread never came up. Emit exactly one endpoint,
+				// keyed by the LOWEST CONFIGURED unit ref — a pure
+				// function of config, never of runtime snapshot rows,
+				// so both HA nodes compute the same endpoint id from
+				// the same config (#1873) and the commit-time collision
+				// gate (collectTunnelEndpointNamesAST) can mirror the
+				// selection exactly. The common single-unit-0 shape
+				// keeps its existing stable id. Rows for every unit of
+				// an interface-level wg share one LinuxName/ifindex, so
+				// row presence is all-or-nothing: if the device is
+				// absent, addEndpoint drops the ref like it always did.
+				addEndpoint(fmt.Sprintf("%s.%d", name, unitNums[0]), iface.Tunnel)
+				continue
+			}
 			for _, unitNum := range unitNums {
 				addEndpoint(fmt.Sprintf("%s.%d", name, unitNum), iface.Tunnel)
 			}

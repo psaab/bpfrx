@@ -46,6 +46,69 @@ func TestBuildTunnelEndpointSnapshotsDropsRemovedWireguard(t *testing.T) {
 	}
 }
 
+// #1910 r2 Codex High: an interface-level WireGuard tunnel with
+// multiple units is ONE persistent TUN with ONE listen port. Now that
+// TunnelNameMap resolves every unit ref of an interface-level wg to
+// the base device (so every per-unit snapshot row carries the TUN's
+// real positive ifindex), per-unit endpoint emission would produce
+// two live endpoints with the same ifindex + listen port — the Rust
+// populate pass would overwrite tunnel_endpoint_by_ifindex with the
+// later id while the second WG control thread tombstones on the
+// duplicate UDP bind. Exactly one endpoint (lowest unit ref) must be
+// emitted.
+func TestBuildTunnelEndpointSnapshotsInterfaceLevelWireguardMultiUnitSingleEndpoint(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"wg0": {
+			Name: "wg0",
+			Tunnel: &config.TunnelConfig{
+				Name:              "wg0",
+				Mode:              "wireguard",
+				WgListenPort:      51820,
+				WgLocalPrivkeyHex: "a01010101010101010101010101010101010101010101010101010101010101a",
+				WgPeerPubkeyHex:   "b02020202020202020202020202020202020202020202020202020202020202b",
+				WgAllowedIPs:      []string{"10.77.0.0/24"},
+			},
+			Units: map[int]*config.InterfaceUnit{
+				0: {Number: 0},
+				1: {Number: 1},
+			},
+		},
+	}
+	// Post-fix TunnelNameMap shape: BOTH unit rows resolve to the
+	// shared persistent TUN device (same LinuxName, same ifindex).
+	interfaces := []InterfaceSnapshot{
+		{Name: "wg0", LinuxName: "wg0", Ifindex: 42},
+		{Name: "wg0.0", LinuxName: "wg0", Ifindex: 42},
+		{Name: "wg0.1", LinuxName: "wg0", Ifindex: 42},
+	}
+	endpoints := buildTunnelEndpointSnapshots(cfg, interfaces)
+	if len(endpoints) != 1 {
+		t.Fatalf("endpoints = %+v, want exactly one wireguard endpoint", endpoints)
+	}
+	ep := endpoints[0]
+	if ep.Mode != "wireguard" || ep.Interface != "wg0.0" || ep.Ifindex != 42 {
+		t.Fatalf("endpoint = %+v, want wireguard endpoint keyed by lowest unit ref wg0.0 with ifindex 42", ep)
+	}
+	if want := config.StableTunnelEndpointID("wg0.0"); ep.ID != want {
+		t.Fatalf("endpoint id = %d, want stable id of lowest unit ref %d", ep.ID, want)
+	}
+
+	// The selected ref is a pure function of CONFIG (#1873): if the
+	// lowest configured unit's snapshot row is absent the endpoint is
+	// dropped — never re-keyed to another unit at runtime, which could
+	// diverge the endpoint id across HA nodes. (In practice rows are
+	// all-or-nothing: every unit of an interface-level wg shares one
+	// LinuxName/ifindex.)
+	withoutUnit0 := []InterfaceSnapshot{
+		{Name: "wg0.1", LinuxName: "wg0", Ifindex: 42},
+	}
+	endpoints = buildTunnelEndpointSnapshots(cfg, withoutUnit0)
+	if len(endpoints) != 0 {
+		t.Fatalf("endpoints without the lowest-unit row = %+v, want none (config-deterministic ref, no runtime re-keying)", endpoints)
+	}
+}
+
 // #1866 D3: the publish-boundary transition summary must change when
 // the WG endpoint set changes and ignore non-WG endpoints.
 func TestWgEndpointSetSummaryTransitions(t *testing.T) {
