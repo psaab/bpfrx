@@ -96,6 +96,11 @@ type xpfCollector struct {
 	ipmonRoutesApplied      *prometheus.Desc
 	ipmonUnresolvedNextHops *prometheus.Desc
 
+	// #1895: count of RPM next-hop probe pins whose kernel fwmark
+	// rule / pinned route failed to install (affected tests hold
+	// state instead of probing the default path).
+	rpmPinInstallFailures *prometheus.Desc
+
 	// #709: CoS owner-profile telemetry (userspace dataplane only).
 	// Cardinality estimate per plan §5: num_queues (≤ 64) × num_interfaces
 	// (≤ 8) × DRAIN_HIST_BUCKETS (16) = ≤ 8192 series for each of the
@@ -395,6 +400,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.ipmonPolicyTransitions
 	ch <- c.ipmonRoutesApplied
 	ch <- c.ipmonUnresolvedNextHops
+	ch <- c.rpmPinInstallFailures
 	ch <- c.cosDrainLatencyBucket
 	ch <- c.cosDrainInvocationsTotal
 	ch <- c.cosRedirectAcquireBucket

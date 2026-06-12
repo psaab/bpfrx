@@ -1,5 +1,48 @@
 # Action Log
 
+## 2026-06-12 — #1885 PR #1901 live validation + reviews
+- **Timestamp**: 2026-06-12 UTC (08:00-08:30)
+- **Action**: Live validation on loss userspace cluster against the real
+  sfmix GRE peer (outer IPv6 over VLAN-tagged reth0.80): baseline
+  pre-fix builds show write_local_tunnel_delivery EINVAL per
+  keepalive/reply (strace 00 50 86 dd garbage); fix build
+  (2347-g154d72c8d, version-pinned cells) — 4-min soak ring=0/dbg=0 at
+  6 checkpoints over two keepalive windows + miss/hit/re-miss pings,
+  final cell 40/40 pings 0% loss, 0 EINVAL, local-delivery accepts
+  flowing, transit 21.6 Gb/s. Cluster heavily contended (3 agents
+  interleaving deploys + sick fw1 recovered mid-window) — early
+  mid-failback window EINVALs attributed to mixed-version nodes; the
+  pinned cells are authoritative. PR #1901 (Closes #1885), follow-up
+  #1902 filed (pending_neigh desc/meta mismatch). Reviews: Codex r1
+  MERGE-NEEDS-MINOR (LOW doc name, fixed), AGY r1b MERGE-READY (r1
+  degenerate 0-byte, one retry), Claude SMR MERGE-READY; Copilot
+  quota-limited, documented retries.
+- **File(s)**: docs/pr/1885-vlan-slice/plan.md,
+  docs/pr/1885-vlan-slice/reviewer-ids.md, _Log.md
+
+## 2026-06-12 — #1885 local-delivery TUN mis-slice fix (engineer run)
+- **Timestamp**: 2026-06-12 UTC
+- **Action**: Verified the #1885 root cause is NOT the issue's framing
+  (extraction arithmetic) but a frame/meta pairing bug: the
+  poll_descriptor LocalDelivery arm passed the ORIGINAL UMEM desc (the
+  VLAN-tagged GRE OUTER frame) with the post-decap INNER meta
+  (l3_offset 14 relative to the synthetic decap frame) into
+  maybe_reinject_slow_path — 4-bytes-early slice on tagged underlays
+  (TUN EINVAL), outer-packet misdelivery on untagged, AND a latent
+  duplicate enqueue (the leg's trailing decap-aware chokepoint at
+  maybe_reinject_slow_path_from_frame(packet_frame, ..) also fires for
+  the same dispositions). Fix: delete the in-arm call; the trailing
+  chokepoint is the single, decap-correct delivery point. 4 regression
+  pins (tagged/untagged GRE-to-self byte-identical-exactly-once,
+  non-decap slow-path exactly-once, decap frame/meta self-consistency)
+  all FAIL pre-fix with the live strace signature and pass post-fix.
+  Gates: release build rc0 no new warnings (136=136), full release
+  suite 2023/1 (worker_queue concurrent_recovery ledger flake,
+  standalone-proven 5x), full debug 2050/0, go test rc0. Same-class
+  pending_neigh desc/meta mismatch documented for follow-up filing.
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/tests.rs, docs/pr/1885-vlan-slice/plan.md
+
 ## 2026-06-11 — #1873 PR #1882 code-review rounds 2-5 (resumed agent)
 - **Timestamp**: 2026-06-11/12 UTC
 - **Action**: Resumed the wedged #1873 /engineer run at PR #1882. Round 2:
@@ -5214,6 +5257,13 @@ top.
 - **Timestamp**: 2026-06-11 ~22:45 PT
   **Action**: #1880 /engineer complete — PR #1883 MERGE-READY at d13eaac4f29f (Codex r3 + AGY r2 + SMR; Copilot quota 3-of-4). Live: 2 consecutive first-run-after-deploy failover passes 14/14 (both with frr.service deliberately poisoned — Path B immune by construction), gate-2 deploy/commit no longer poison frr, gate-3 stale-route deletion converges in-commit. Review saves: Codex H1 (pre-cancel without supersession loses the retry episode on failed write/hard reload → deferred re-arm guard), Codex M1 (Stop vs WaitGroup Add race), Codex M2 (gauge behind dp gate), AGY Crit (test-double-failover sysrq hang — same bug measured live as 47-min/38-min harness hangs; incus exec forwards SIGTERM to the dead session → timeout -k), AGY Med (mgrCtx-nil uncancellable episode).
   **File(s)**: docs/pr/1880-boot-budget/, docs/research/1880-boot-budget/, test/incus/test-double-failover.sh, pkg/frr/, pkg/api/, _Log.md
+
+- **Timestamp**: 2026-06-12 08:05 UTC
+  **Action**: #1895 engineered to MERGE-READY as PR #1899 (probe-pin install failures → ErrProbeSetup hold-state instead of false PASS; per-pin install results + rollback, union pre-hold across band reprogram, publish-after-Apply, hash-gated retry, xpf_rpm_probe_pin_install_failures gauge). 4 Codex rounds (2 MAJOR traces fixed: full-apply old-marks race, no-installer release-before-drain), live validated on loss userspace cluster (held state + retry recovery + counterfactual ping). Copilot quota-blocked (3 documented retries); AGY OAuth-expired (2 attempts).
+  **File(s)**: pkg/routing/probe_pin.go, pkg/routing/routing.go, pkg/rpm/rpm.go, pkg/daemon/daemon_rpm.go, pkg/daemon/daemon.go, pkg/daemon/daemon_run.go, pkg/api/{metrics,metrics_descriptors,metrics_system,server}.go, tests, docs/pr/1895-probe-pin/, docs/multi-wan.md, READMEs
 - **Timestamp**: 2026-06-12
   **Action**: #1890 /engineer — coordinator/mod.rs modularity split (2,544 → 779 lines), pure code motion per the issue's corrected map, seams rederived post-#1887: tunnel_supervision.rs (GRE+WG thread lifecycle + WG_SPAWN_BACKOFF_NS, ~810 LOC), snapshot_refresh.rs (refresh_runtime_snapshot family + refresh_fabric_links, ~220 LOC), cos_leases.rs (refresh_cos_* methods + CoS builders/matchers/aggregation, ~775 LOC); build_mirror_target_map + shared purge/log free helpers deliberately stay in mod.rs (out-of-module consumers / non-CoS). Visibility deltas: pub(super) only, each documented. Audit artifact regenerated (folds post-ecdc16f2e drift). Gates: release build warning-set byte-identical to base at every commit; cargo test --release 2045/0 (worker_queue concurrency flake 5/5 standalone + full-suite green rerun); debug coordinator tests 79/0; go test ./... clean.
   **File(s)**: userspace-dp/src/afxdp/coordinator/{mod.rs,tunnel_supervision.rs,snapshot_refresh.rs,cos_leases.rs,README.md}, docs/refactoring-audit-current.txt, docs/pr/1890-coordinator-split/, _Log.md
+- **Timestamp**: 2026-06-12
+  **Action**: #1891 /engineer — pkg/config/schema.go domain split (2,169 → 121 lines), pure code motion, seams rederived on current master post-#1319-rollout (+40 typed slots) and post-#1892 (+~500 help texts): schema_security.go (security+applications, 316 LOC), schema_interfaces.go (interfaces + tunnelSchemaChildren/wireguardSchemaNode constructors, 395 LOC), schema_routing.go (routing-options/policy-options/protocols/forwarding-options/bridge-domains/routing-instances, 390 LOC), schema_system.go (system/services/snmp/event-options, 480 LOC), schema_chassis.go (chassis, 256 LOC), schema_cos.go (class-of-service+firewall, 285 LOC). Sibling aspect files in package config (NOT subpackage — unexported setSchema, two-SSOT doctrine). One building commit per domain. Proof: canonical full-field node-path inventory dump (1,962 nodes incl. groups-wildcard mirror) byte-identical pre/post at every commit; TestSchemaAllNodesHaveDesc (#1892 pin) + full go test ./... exit 0 (36 pkgs); schema test battery 5/5 flake-free; --color-moved=dimmed-zebra non-moved residue = headers + root-map rewrites + var openers only.
+  **File(s)**: pkg/config/{schema.go,schema_security.go,schema_interfaces.go,schema_routing.go,schema_system.go,schema_chassis.go,schema_cos.go}, docs/config-schema.md, _Log.md

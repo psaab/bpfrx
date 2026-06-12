@@ -212,10 +212,11 @@ func main() {
 
 func (c *ctl) handleCommit(args []string) error {
 	if len(args) > 0 && args[0] == "check" {
-		_, err := c.client.CommitCheck(c.ctx(), &pb.CommitCheckRequest{})
+		resp, err := c.client.CommitCheck(c.ctx(), &pb.CommitCheckRequest{})
 		if err != nil {
 			return fmt.Errorf("commit check failed: %v", err)
 		}
+		printRemoteConfigWarnings(resp.Warnings)
 		fmt.Println("configuration check succeeds")
 		return nil
 	}
@@ -231,6 +232,7 @@ func (c *ctl) handleCommit(args []string) error {
 			return fmt.Errorf("commit failed: %v", err)
 		}
 		c.refreshPrompt()
+		printRemoteConfigWarnings(resp.Warnings)
 		if resp.Summary != "" {
 			fmt.Printf("commit complete: %s\n", resp.Summary)
 		} else {
@@ -246,11 +248,12 @@ func (c *ctl) handleCommit(args []string) error {
 				minutes = int32(v)
 			}
 		}
-		_, err := c.client.CommitConfirmed(c.ctx(), &pb.CommitConfirmedRequest{Minutes: minutes})
+		resp, err := c.client.CommitConfirmed(c.ctx(), &pb.CommitConfirmedRequest{Minutes: minutes})
 		if err != nil {
 			return fmt.Errorf("commit confirmed failed: %v", err)
 		}
 		c.refreshPrompt()
+		printRemoteConfigWarnings(resp.Warnings)
 		fmt.Printf("commit confirmed will be automatically rolled back in %d minutes unless confirmed\n", minutes)
 		return nil
 	}
@@ -260,12 +263,24 @@ func (c *ctl) handleCommit(args []string) error {
 		return fmt.Errorf("commit failed: %v", err)
 	}
 	c.refreshPrompt()
+	printRemoteConfigWarnings(resp.Warnings)
 	if resp.Summary != "" {
 		fmt.Printf("commit complete: %s\n", resp.Summary)
 	} else {
 		fmt.Println("commit complete")
 	}
 	return nil
+}
+
+// printRemoteConfigWarnings mirrors the local CLI's printConfigWarnings
+// (pkg/cli/cli_config.go): the daemon ships compile warnings in the
+// Commit/CommitCheck/CommitConfirmed responses (#1892 — e.g. the
+// retired DPDK-era dataplane knobs), and the remote CLI used to drop
+// them on the floor, so the operator never saw them.
+func printRemoteConfigWarnings(warnings []string) {
+	for _, w := range warnings {
+		fmt.Printf("warning: %s\n", w)
+	}
 }
 
 func (c *ctl) handlePing(args []string) error {
