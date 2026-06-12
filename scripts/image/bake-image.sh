@@ -13,20 +13,23 @@
 #   1. make build / build-ctl / build-userspace-dp on the build host.
 #      `make build` embeds the git-tracked pinned-toolchain shim object
 #      (#1864) — the bake never runs `make generate`.
-#   2. Fetch + SHA512-verify the official Debian 13 genericcloud qcow2
-#      (the upstream image owns partitioning + UEFI/BIOS GRUB; we never
-#      hand-roll a bootloader).
+#   2. Discover the LATEST Ubuntu release (operator policy #1879: always
+#      the newest — 26.04 today, whatever is newest tomorrow; override
+#      with XPF_BASE_RELEASE), then fetch + SHA256-verify the official
+#      Ubuntu server cloud image (the upstream image owns partitioning +
+#      UEFI/BIOS GRUB; we never hand-roll a bootloader).
 #   3. virt-resize the root partition into a larger work disk.
 #   4. virt-customize: runtime package set (the Depends/Recommends
 #      matrix from the #1879 plan — cross-check test/incus/setup.sh
 #      provision_instance(), which is the package-inventory reference;
-#      the image deliberately ships NO build toolchain), kernel >= 6.18
-#      from Debian unstable then REMOVE the unstable apt source (a
-#      shipped appliance must not track unstable), purge cloud-init +
-#      the cloud kernel, enable systemd-networkd (xpfd owns all
-#      interfaces), sysctls, init_on_alloc=0, install xpfd + cli +
-#      xpf-userspace-dp + units, enable xpfd + the day-0 loader +
-#      the (incus-only, otherwise inert) incus-agent loader.
+#      the image deliberately ships NO build toolchain), replace the
+#      cloudimg's reduced linux-virtual kernel with linux-generic (full
+#      driver set — mlx5/i40e live in linux-modules-extra) and assert
+#      the kernel meets the >= 6.18 verifier floor, purge cloud-init +
+#      snapd + the virtual-kernel metapackages, enable systemd-networkd
+#      (xpfd owns all interfaces), sysctls, init_on_alloc=0, install
+#      xpfd + cli + xpf-userspace-dp + units, enable xpfd + the day-0
+#      loader + the (incus-only, otherwise inert) incus-agent loader.
 #   5. virt-sysprep seal: machine-id, ssh host keys, logs, tmp, bash
 #      history, package caches, random seed. First boot regenerates
 #      machine-id (systemd) and ssh host keys (day-0 loader unit).
@@ -50,7 +53,7 @@
 # Day-0 quickstarts (details + recovery: docs/install-images.md):
 #   libvirt: virt-install --name xpf --memory 4096 --vcpus 4 \
 #       --import --disk path=xpf-<ver>.qcow2 \
-#       --disk path=day0-config.iso,device=cdrom --osinfo debian13
+#       --disk path=day0-config.iso,device=cdrom --osinfo ubuntu26.04
 #   incus:   incus image import xpf-<ver>.incus-metadata.tar.gz \
 #       xpf-<ver>.qcow2 --alias xpf-appliance
 #            incus init xpf-appliance xpf1 --vm
@@ -83,16 +86,6 @@ while [ $# -gt 0 ]; do
 	*)               die "unknown option: $1" ;;
 	esac
 done
-
-# Debian 13 genericcloud base. The base owns partitioning + bootloader.
-# Default tracks the upstream "latest" point release — bakes are NOT
-# bit-reproducible (base content, apt state, and timestamps move); for
-# repeatable input pinning set XPF_BASE_RELEASE to a dated upstream
-# release directory. Every bake records the exact base image SHA512 +
-# git commit in dist/<artifact>.manifest.
-BASE_RELEASE="${XPF_BASE_RELEASE:-latest}"
-BASE_URL="${XPF_BASE_URL:-https://cloud.debian.org/images/cloud/trixie/${BASE_RELEASE}}"
-BASE_IMG="debian-13-genericcloud-amd64.qcow2"
 
 # Runtime dependency set (the #1879 plan §5 exec-grounded matrix:
 # Depends-level frr/iproute2/nftables/ethtool + Recommends-level
@@ -173,21 +166,42 @@ else
 	echo "NOTE: passwordless sudo unavailable — skipping build-host verify pre-gate (in-guest gate still enforces)." >&2
 fi
 
-# ── 2. Fetch + verify the base image ──────────────────────────────────
-info "Fetching Debian 13 genericcloud base ($BASE_URL)..."
+# ── 2. Discover the latest Ubuntu release; fetch + verify the base ────
+# Operator policy (#1879): ALWAYS the latest Ubuntu release — 26.04
+# today, whatever is newest tomorrow. The newest numeric release
+# directory is discovered from the upstream listing at bake time; pin
+# with XPF_BASE_RELEASE (e.g. 26.04). Bakes are NOT bit-reproducible
+# (base content, apt state, and timestamps move); every bake records
+# the exact base image SHA256 + git commit in dist/<artifact>.manifest.
+UBUNTU_RELEASES_URL="${XPF_UBUNTU_RELEASES_URL:-https://cloud-images.ubuntu.com/releases}"
+if [ -n "${XPF_BASE_RELEASE:-}" ]; then
+	BASE_RELEASE="$XPF_BASE_RELEASE"
+else
+	BASE_RELEASE=$(curl -fsSL "$UBUNTU_RELEASES_URL/" |
+		grep -oE 'href="[0-9]{2}\.[0-9]{2}/"' |
+		grep -oE '[0-9]{2}\.[0-9]{2}' | sort -uV | tail -1) || true
+	[ -n "$BASE_RELEASE" ] ||
+		die "could not discover the latest Ubuntu release from $UBUNTU_RELEASES_URL/ (set XPF_BASE_RELEASE to pin one)"
+fi
+BASE_URL="${XPF_BASE_URL:-$UBUNTU_RELEASES_URL/$BASE_RELEASE/release}"
+BASE_IMG="ubuntu-${BASE_RELEASE}-server-cloudimg-amd64.img"
+
+info "Fetching Ubuntu $BASE_RELEASE server cloud image base ($BASE_URL)..."
 if [ ! -f "$CACHE_DIR/$BASE_IMG" ]; then
 	curl -fsSL -o "$CACHE_DIR/$BASE_IMG.tmp" "$BASE_URL/$BASE_IMG"
 	mv "$CACHE_DIR/$BASE_IMG.tmp" "$CACHE_DIR/$BASE_IMG"
 fi
 # Always re-verify the cached base against the upstream checksum file
-# (supply-chain hygiene: the cache is not trusted either).
-curl -fsSL -o "$WORK_DIR/SHA512SUMS.upstream" "$BASE_URL/SHA512SUMS"
-expected=$(awk -v img="$BASE_IMG" '$2 == img {print $1}' "$WORK_DIR/SHA512SUMS.upstream")
-[ -n "$expected" ] || die "no SHA512 for $BASE_IMG in upstream SHA512SUMS"
-actual=$(sha512sum "$CACHE_DIR/$BASE_IMG" | awk '{print $1}')
+# (supply-chain hygiene: the cache is not trusted either). Ubuntu's
+# SHA256SUMS uses the "<hash> *<file>" binary-mode form.
+curl -fsSL -o "$WORK_DIR/SHA256SUMS.upstream" "$BASE_URL/SHA256SUMS"
+expected=$(awk -v img="*$BASE_IMG" '$2 == img {print $1}' "$WORK_DIR/SHA256SUMS.upstream")
+[ -n "$expected" ] || expected=$(awk -v img="$BASE_IMG" '$2 == img {print $1}' "$WORK_DIR/SHA256SUMS.upstream")
+[ -n "$expected" ] || die "no SHA256 for $BASE_IMG in upstream SHA256SUMS"
+actual=$(sha256sum "$CACHE_DIR/$BASE_IMG" | awk '{print $1}')
 if [ "$expected" != "$actual" ]; then
 	rm -f "$CACHE_DIR/$BASE_IMG"
-	die "base image SHA512 mismatch (cache removed — re-run; if it persists, upstream and mirror disagree)"
+	die "base image SHA256 mismatch (cache removed — re-run; if it persists, upstream and mirror disagree)"
 fi
 info "Base image checksum verified."
 
@@ -209,21 +223,12 @@ net.ipv6.conf.all.forwarding=1
 net.ipv6.conf.all.accept_ra=0
 net.ipv6.conf.default.accept_ra=0'
 
-UNSTABLE_LIST='deb http://deb.debian.org/debian unstable main'
-
 # apt-get update exits 0 even when an index fetch fails — a transient
-# DNS blip inside the libguestfs appliance once made the kernel install
-# silently resolve linux-image-amd64 from TRIXIE (6.12) instead of
-# unstable, caught only by the in-guest kernel gate at boot validation.
-# --error-on=any makes index failures fatal; one retry covers blips.
+# DNS blip inside the libguestfs appliance once let a kernel install
+# resolve from the wrong suite, caught only by the in-guest kernel gate
+# at boot validation. --error-on=any makes index failures fatal; one
+# retry covers blips.
 APT_UPDATE='apt-get update -qq -o Acquire::Retries=5 --error-on=any || { echo "apt update failed; retrying in 10s" >&2; sleep 10; apt-get update -qq -o Acquire::Retries=5 --error-on=any; }'
-PIN_PREF='Package: *
-Pin: release a=trixie
-Pin-Priority: 900
-
-Package: linux-image-amd64 linux-headers-amd64 linux-image-* linux-headers-*
-Pin: release a=unstable
-Pin-Priority: 990'
 
 virt-customize -a "$WORK_DIR/work.qcow2" \
 	--smp 4 --memsize 2048 \
@@ -242,12 +247,11 @@ virt-customize -a "$WORK_DIR/work.qcow2" \
 	--run-command 'mkdir -p /etc/xpf && chmod 0750 /etc/xpf' \
 	--run-command "export DEBIAN_FRONTEND=noninteractive && $APT_UPDATE" \
 	--run-command "export DEBIAN_FRONTEND=noninteractive && apt-get install -y -qq -o Acquire::Retries=5 ${RUNTIME_PACKAGES[*]}" \
-	--write "/etc/apt/sources.list.d/unstable.list:$UNSTABLE_LIST" \
-	--write "/etc/apt/preferences.d/pin-stable:$PIN_PREF" \
-	--run-command "export DEBIAN_FRONTEND=noninteractive && { $APT_UPDATE; } && apt-get install -y -qq -o Acquire::Retries=5 linux-image-amd64" \
-	--run-command 'latest=$(ls /lib/modules | sort -V | tail -1) && dpkg --compare-versions "${latest%%+*}" ge 6.18 || { echo "FATAL: newest installed kernel $latest < 6.18 (unstable kernel install silently fell through?)" >&2; exit 1; }' \
-	--run-command 'rm -f /etc/apt/sources.list.d/unstable.list /etc/apt/preferences.d/pin-stable' \
-	--run-command 'export DEBIAN_FRONTEND=noninteractive && apt-get purge -y -qq linux-image-cloud-amd64 "linux-image-.*cloud.*" 2>/dev/null || true' \
+	--run-command 'export DEBIAN_FRONTEND=noninteractive && apt-get install -y -qq -o Acquire::Retries=5 linux-generic' \
+	--run-command 'latest=$(ls /lib/modules | sort -V | tail -1) && dpkg --compare-versions "${latest%%-*}" ge 6.18 || { echo "FATAL: newest installed kernel $latest < 6.18 (verifier floor — the latest Ubuntu release regressed below it?)" >&2; exit 1; }' \
+	--run-command 'test -d "/lib/modules/$(ls /lib/modules | sort -V | tail -1)/kernel/drivers/net/ethernet/mellanox" || { echo "FATAL: linux-modules-extra missing (mlx5/i40e drivers) — linux-generic install incomplete" >&2; exit 1; }' \
+	--run-command 'export DEBIAN_FRONTEND=noninteractive && apt-get purge -y -qq linux-virtual linux-image-virtual linux-headers-virtual 2>/dev/null || true' \
+	--run-command 'export DEBIAN_FRONTEND=noninteractive && apt-get purge -y -qq snapd 2>/dev/null || true; rm -rf /snap /var/snap /var/lib/snapd /var/cache/snapd' \
 	--run-command 'export DEBIAN_FRONTEND=noninteractive && apt-get purge -y -qq "cloud-init*" 2>/dev/null || true; rm -rf /etc/cloud /var/lib/cloud' \
 	--run-command 'rm -f /etc/network/interfaces.d/* /etc/netplan/*.yaml 2>/dev/null || true' \
 	--run-command "export DEBIAN_FRONTEND=noninteractive && apt-get autoremove -y -qq && { $APT_UPDATE; }" \
@@ -257,7 +261,13 @@ virt-customize -a "$WORK_DIR/work.qcow2" \
 	--run-command 'systemctl enable frr chrony' \
 	--run-command 'sed -i "s/^pool /#pool /; s/^server /#server /" /etc/chrony/chrony.conf && mkdir -p /etc/chrony/sources.d' \
 	--run-command 'systemctl enable xpfd xpf-day0-config' \
-	--run-command 'sed -i "s/^GRUB_CMDLINE_LINUX_DEFAULT=\"\(.*\)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\1 init_on_alloc=0\"/" /etc/default/grub && update-grub' \
+	--write '/etc/default/grub.d/99-xpf.cfg:# xpf (#1879): init_on_alloc=0 — CONFIG_INIT_ON_ALLOC_DEFAULT_ON zeroes
+# every allocated page (~20% CPU in the virtio-net XDP path). A grub.d
+# drop-in, NOT a sed on /etc/default/grub: Ubuntu cloud images override
+# GRUB_CMDLINE_LINUX_DEFAULT in /etc/default/grub.d/50-cloudimg-settings.cfg,
+# which would silently win over an edit to the main file.
+GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT init_on_alloc=0"' \
+	--run-command 'update-grub' \
 	--write '/etc/ssh/sshd_config.d/10-xpf-factory.conf:# xpf factory posture (#1879): root password is EMPTY (console-only
 # login, vSRX parity). Pin the OpenSSH defaults explicitly so a future
 # distro default change cannot silently expose the empty password or
@@ -292,9 +302,9 @@ cat >"$WORK_DIR/metadata.yaml" <<EOF
 architecture: x86_64
 creation_date: $(date +%s)
 properties:
-  description: xpf appliance $VERSION (Debian 13, kernel >= 6.18, AF_XDP userspace dataplane)
-  os: Debian
-  release: trixie
+  description: xpf appliance $VERSION (Ubuntu $BASE_RELEASE, kernel >= 6.18, AF_XDP userspace dataplane)
+  os: Ubuntu
+  release: $BASE_RELEASE
   variant: xpf-appliance
 EOF
 tar -C "$WORK_DIR" -czf "$META_OUT" metadata.yaml
@@ -310,7 +320,8 @@ cat >"$OUT_DIR/xpf-$VERSION.manifest" <<EOF
 version: $VERSION
 git_commit: $(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)
 base_image: $BASE_URL/$BASE_IMG
-base_image_sha512: $actual
+base_release: $BASE_RELEASE
+base_image_sha256: $actual
 bake_date: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 bake_host_kernel: $(uname -r)
 EOF

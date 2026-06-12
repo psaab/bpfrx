@@ -1,12 +1,13 @@
 # xpf appliance images (#1879 Path C)
 
 vSRX-style prebuilt-image distribution: one bootable root disk, built
-offline, carrying everything xpf needs — Debian 13, a >= 6.18 kernel
-(the AF_XDP shim's verifier floor), FRR, strongSwan, Kea, chrony,
-systemd-networkd, and the xpf binaries (`xpfd`, `cli`,
-`xpf-userspace-dp`) with their systemd units. There is no dependency
-matrix to install and no kernel hunt: the image IS the dependency
-closure.
+offline, carrying everything xpf needs — the LATEST Ubuntu release
+(operator policy: always the newest — 26.04 today, discovered at bake
+time), a >= 6.18 kernel (the AF_XDP shim's verifier floor; 26.04 ships
+7.0), FRR, strongSwan, Kea, chrony, systemd-networkd, and the xpf
+binaries (`xpfd`, `cli`, `xpf-userspace-dp`) with their systemd units.
+There is no dependency matrix to install and no kernel hunt: the image
+IS the dependency closure.
 
 Two deliverables, same root disk:
 
@@ -33,36 +34,44 @@ Pipeline (offline — the image is never booted to provision it):
 1. `make build build-ctl build-userspace-dp`. The #1864 pinned-
    toolchain contract holds: `make build` embeds the git-tracked shim
    object; the bake never runs `make generate`.
-2. Fetch + SHA512-verify the official Debian 13 *genericcloud* qcow2.
-   Upstream owns partitioning and the UEFI/BIOS bootloader.
+2. Discover the LATEST Ubuntu release from the upstream listing
+   (`XPF_BASE_RELEASE` pins one), then fetch + SHA256-verify the
+   official Ubuntu *server cloudimg*. Upstream owns partitioning and
+   the UEFI/BIOS bootloader.
 3. `virt-resize` the root partition into an 8 GiB work disk
    (`XPF_IMAGE_DISK_SIZE` overrides).
 4. `virt-customize` offline: runtime package set (the #1879 plan §5
-   dependency matrix; no build toolchain), kernel >= 6.18 from Debian
-   unstable — after which the unstable apt source and pin are
-   REMOVED (a shipped appliance must not track unstable) — purge of
-   cloud-init (a competing network manager) and the cloud kernel,
-   systemd-networkd + resolved enabled, FRR + chrony enabled (default
-   NTP pools neutered; xpfd manages `sources.d/xpf.sources`), sysctls,
-   `init_on_alloc=0`, xpf binaries + units installed, `xpfd`,
-   `xpf-day0-config`, and the incus-agent loader enabled.
+   dependency matrix; no build toolchain), the cloudimg's reduced
+   `linux-virtual` kernel replaced by `linux-generic` (full driver set
+   — mlx5/i40e for passthrough NICs live in `linux-modules-extra`)
+   with in-bake asserts that the kernel meets the >= 6.18 verifier
+   floor and the extra-modules tree is present, purge of cloud-init
+   (a competing network manager), snapd, and the virtual-kernel
+   metapackages, systemd-networkd + resolved enabled, FRR + chrony
+   enabled (default NTP pools neutered; xpfd manages
+   `sources.d/xpf.sources`), sysctls, `init_on_alloc=0` (via an
+   `/etc/default/grub.d` drop-in — Ubuntu cloud images override
+   `GRUB_CMDLINE_LINUX_DEFAULT` there), xpf binaries + units
+   installed, `xpfd`, `xpf-day0-config`, and the incus-agent loader
+   enabled.
 5. `virt-sysprep` seal: machine-id, ssh host keys, logs, tmp files,
    bash history, package caches, random seed; `/etc/xpf` factory-empty.
 6. Export compressed qcow2 + incus metadata tarball + SHA256SUMS.
 7. **Validation gate** (default on): the image is imported into local
    incus and the FULL first-boot matrix runs — factory boot (fxp0
-   DHCP, sshd posture via `sshd -T`, cloud-kernel purge check) with
-   `xpfd verify-dataplane` IN-GUEST against the image's own kernel,
-   plus the valid- and invalid-day-0-drive scenarios. A failure fails
-   the bake — the image must never ship a verifier-failing shim
-   (#1864/#1869 discipline). Use `--skip-validate` only for
-   iteration; such artifacts are not publishable.
+   DHCP, sshd posture via `sshd -T`, -generic kernel flavor + full
+   driver set check) with `xpfd verify-dataplane` IN-GUEST against
+   the image's own kernel, plus the valid- and invalid-day-0-drive
+   scenarios. A failure fails the bake — the image must never ship a
+   verifier-failing shim (#1864/#1869 discipline). Use
+   `--skip-validate` only for iteration; such artifacts are not
+   publishable.
 
 Each bake also writes `dist/xpf-<ver>.manifest` recording the exact
-inputs (base image URL + verified SHA512, git commit, bake date/host
-kernel). Bakes are not bit-reproducible (the base tracks upstream
-`latest` unless `XPF_BASE_RELEASE` pins a dated release); the manifest
-is the traceability record.
+inputs (base image URL + release + verified SHA256, git commit, bake
+date/host kernel). Bakes are not bit-reproducible (the base tracks
+the newest upstream release unless `XPF_BASE_RELEASE` pins one); the
+manifest is the traceability record.
 
 Full first-boot matrix (run after a bake, or standalone):
 
@@ -96,7 +105,7 @@ virt-install --name xpf1 --memory 4096 --vcpus 4 \
     --import --disk path=xpf-<ver>.qcow2 \
     --disk path=day0.iso,device=cdrom \
     --network bridge=br-mgmt --network bridge=br-trust \
-    --osinfo debian13 --noautoconsole
+    --osinfo ubuntu26.04 --noautoconsole
 ```
 
 Plain QEMU works the same way (`-drive file=xpf-<ver>.qcow2`

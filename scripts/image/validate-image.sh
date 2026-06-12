@@ -155,11 +155,14 @@ scenario_a() {
 	*) fail "guest kernel $kver < 6.18" ;;
 	esac
 
-	# The trixie cloud kernel must be fully purged (metapackage purge +
-	# autoremove during bake); leftovers waste image space and risk a
-	# wrong GRUB default after a future kernel removal.
-	guest xpf-image-a sh -c '! ls /lib/modules | grep -q cloud' ||
-		fail "cloud kernel modules still present in /lib/modules"
+	# The image must run the -generic kernel flavor with the FULL driver
+	# set: the Ubuntu cloudimg ships the reduced linux-virtual kernel,
+	# which the bake replaces with linux-generic — mlx5/i40e for
+	# passthrough NICs live in linux-modules-extra.
+	guest xpf-image-a sh -c 'uname -r | grep -q -- -generic' ||
+		fail "running kernel is not the -generic flavor"
+	guest xpf-image-a sh -c 'test -d "/lib/modules/$(uname -r)/kernel/drivers/net/ethernet/mellanox"' ||
+		fail "linux-modules-extra (mlx5/i40e driver set) missing for the running kernel"
 
 	info "in-guest verify-dataplane (the bake gate, image kernel)..."
 	guest xpf-image-a nice -n 19 /usr/local/sbin/xpfd verify-dataplane ||
