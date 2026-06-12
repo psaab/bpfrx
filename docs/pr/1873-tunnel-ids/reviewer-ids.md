@@ -25,3 +25,7 @@ Converged: PLAN-READY 3-of-3 at round 4 on plan v4 (blanket R-C gate).
 | code-1 | Claude SMR | claude-smr-code-r1.md | MERGE-READY after self-found MAJOR fix 73f61b1db797 (reverse-only purge) |
 | code-1 | AGY | adversarial-review-mqa9m9r0-p48whc (timed out) → retry adversarial-review-mqa9u6b2-lq3y1y | MERGE-READY at 73f61b1db797 |
 | code-1 | Codex | task-mqa9mk6f-2etcct | MERGE-NEEDS-MAJOR (re-owned-id publication window) → fixed in 8909f3ac0e70 (purge-before-store + defer + rotation barrier) |
+| code-2 | Copilot | (review re-requested at 70206ae04 — retry 2; retry 3 requested before round-2 push) | COMMENTED — quota limit |
+| code-2 | AGY | review-mqaam2as-a3fgqq (job state under gemini state/1873-engineer-0721a2dc90c4f2cd/) | needs-attention (2 med 2 low, no verified counter-example) — mediums superseded by the r2 redesign; low (engine-Arc pin) FOLDED |
+| code-2 | Codex | task-mqaaoq6a-6afsma | MERGE-NEEDS-MAJOR (1: private fabric-overlay Arc defeats the rotation barrier, worker/loop_body/mod.rs:617; 2: 250ms timeout fail-open) → fixed in 140f310bd (structural owner check: stored egress_ifindex vs row logical_ifindex at re-resolve + both encap builders; new-appearance purge arm; defer/barrier deleted) |
+| code-2 | Claude SMR | claude-smr-code-r2.md | Confirmed both Codex findings; found+fixed the write-back erasure (gated resolution must PRESERVE stale egress_ifindex) and the first-apply purge guard; MERGE-READY pending Codex r3 ratification |
