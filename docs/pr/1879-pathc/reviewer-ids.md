@@ -12,3 +12,6 @@ PR: engineer/1879-pathc-images (number TBD)
 | 2 | AGY | adversarial-review-mqarffy5-z7yq5y (degenerate 0-byte) → retry adversarial-review-mqarus63-qqocj7 | MERGE-READY (all fixes verified with file:line evidence; tmpconf lifecycle pressure-tested) |
 | 2 | Claude SMR | in-conversation | MERGE-READY (round-2 pass over fix commits; worked traces A/B/C + second-boot proven live) |
 | 1-3 | Copilot | quota-limited on request + 3 documented retries (09:02, 09:34, 10:04, 10:17 UTC) | UNAVAILABLE — proceeding 3-of-4 per protocol |
+| 3 (Ubuntu base swap, operator-directed) | Codex | task-mqbak38w-farq0x — session 019ebd34-c971-7802-aaed-6e938417c0da | MERGE-READY @37feed1a4 (one Low comment-drift, fixed) |
+| 3 (Ubuntu base swap) | AGY | adversarial-review-mqbajcj4-o3wzbk | MERGE-NEEDS-CHANGES → fixes in 2df9711b5 (cmdline assert, crossed with dispatch) + d9c5fc431 (dpkg warn-pass guard, sparsify --tmp) |
+| 3 (Ubuntu base swap) | Claude SMR | in-conversation | MERGE-READY (purge one-liner substring trace; cmdline verified on live /proc/cmdline before asserting) |
