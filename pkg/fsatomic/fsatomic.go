@@ -123,6 +123,49 @@ func SyncDir(dir string) error {
 	return nil
 }
 
+// MkdirAllDurable is os.MkdirAll plus an fsync of every directory whose
+// entry set the call may have changed: each newly-created level and the
+// deepest pre-existing ancestor (which gained the topmost new entry).
+// Without this, a DurableState file written into a just-created
+// directory can survive a power cut while the directory itself does not
+// — fsyncing a file's parent (WriteFileDurable) persists the file's
+// entry in that directory, not the directory's own entry in ITS parent
+// (Codex code-r1 High on PR #1900). When the full path already exists
+// this degrades to plain MkdirAll with zero fsyncs.
+func MkdirAllDurable(dir string, perm os.FileMode) error {
+	// Record the levels that do not exist yet, deepest first, before
+	// creating anything. A racing creator only makes this list an
+	// overestimate, which costs harmless extra fsyncs.
+	var created []string
+	p := filepath.Clean(dir)
+	for {
+		if _, err := os.Stat(p); err == nil {
+			break
+		}
+		created = append(created, p)
+		parent := filepath.Dir(p)
+		if parent == p {
+			break
+		}
+		p = parent
+	}
+	if err := os.MkdirAll(dir, perm); err != nil {
+		return err
+	}
+	if len(created) == 0 {
+		return nil
+	}
+	// Each new level's entry lives in its parent: fsync the new levels
+	// (shallowest last is fine — order is irrelevant once all renames/
+	// mkdirs have happened) plus the pre-existing ancestor p.
+	for _, c := range created {
+		if err := SyncDir(c); err != nil {
+			return err
+		}
+	}
+	return SyncDir(p)
+}
+
 // resolveSymlinkTarget returns the path the write should land on when
 // symlink resolution is requested. EvalSymlinks succeeds only when the
 // whole chain exists; for a *dangling* final symlink, fall back to

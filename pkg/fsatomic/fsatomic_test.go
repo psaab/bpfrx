@@ -321,6 +321,44 @@ func TestDurableFsyncsFileAndDir(t *testing.T) {
 	}
 }
 
+func TestMkdirAllDurable(t *testing.T) {
+	resetSeams(t)
+	syncCalls := 0
+	syncFile = func(f *os.File) error { syncCalls++; return f.Sync() }
+
+	root := t.TempDir()
+	target := filepath.Join(root, "a", "b", "c")
+	if err := MkdirAllDurable(target, 0755); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(target)
+	if err != nil || !fi.IsDir() {
+		t.Fatalf("target not a dir: %v", err)
+	}
+	// Three created levels (a, b, c) + the pre-existing root = 4 fsyncs.
+	if syncCalls != 4 {
+		t.Fatalf("creation made %d fsyncs, want 4 (3 new levels + parent)", syncCalls)
+	}
+
+	// Existing path: plain MkdirAll, zero fsyncs.
+	syncCalls = 0
+	if err := MkdirAllDurable(target, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if syncCalls != 0 {
+		t.Fatalf("existing path made %d fsyncs, want 0", syncCalls)
+	}
+
+	// Regular file in the way: the MkdirAll error is surfaced.
+	blocked := filepath.Join(root, "file")
+	if err := os.WriteFile(blocked, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := MkdirAllDurable(filepath.Join(blocked, "x"), 0755); err == nil {
+		t.Fatal("MkdirAllDurable through a regular file should error")
+	}
+}
+
 func TestSyncDir(t *testing.T) {
 	if err := SyncDir(t.TempDir()); err != nil {
 		t.Fatalf("SyncDir: %v", err)

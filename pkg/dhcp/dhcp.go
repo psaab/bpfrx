@@ -556,7 +556,10 @@ func (m *Manager) loadDUID(ifaceName string) (dhcpv6.DUID, error) {
 }
 
 func (m *Manager) saveDUID(ifaceName string, duid dhcpv6.DUID) error {
-	if err := os.MkdirAll(m.stateDir, 0755); err != nil {
+	// Durable creation (#1894 code-r1): the state dir's own entry must
+	// be made durable on first creation or the DUID file can be lost
+	// with the whole directory after a power cut.
+	if err := fsatomic.MkdirAllDurable(m.stateDir, 0755); err != nil {
 		return err
 	}
 	// DurableState (#1894): the DUID is the client's stable DHCPv6

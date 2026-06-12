@@ -13,6 +13,13 @@ The project's single source of truth for replace-a-file-on-disk writes
 - `SyncDir(dir)` — one directory fsync covering previously-completed
   renames/unlinks; lets multi-file shuffles (configstore rollback slots)
   batch namespace durability into a single fsync.
+- `MkdirAllDurable(dir, perm)` — `os.MkdirAll` plus an fsync of every
+  newly-created level and of the deepest pre-existing ancestor. Required
+  when a DurableState file lives in a directory the writer itself
+  creates: `WriteFileDurable` persists the file's entry in its parent,
+  not the parent's own entry in *its* parent, so on first boot a power
+  cut could otherwise drop the whole just-created directory (PR #1900
+  code-r1). Zero fsyncs when the path already exists.
 
 ## Persistence classes
 

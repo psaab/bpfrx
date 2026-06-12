@@ -21,7 +21,11 @@ type DB struct {
 // NewDB creates a DB rooted at the given directory.
 // The directory is created if it doesn't exist.
 func NewDB(dir string) (*DB, error) {
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	// Durable creation (#1894 code-r1): on first boot the .configdb
+	// entry itself must survive power loss, or a commit that reported
+	// success can vanish with the whole directory. WriteFileDurable
+	// only fsyncs .configdb (the file's parent), not /etc/xpf.
+	if err := fsatomic.MkdirAllDurable(dir, 0755); err != nil {
 		return nil, fmt.Errorf("create db dir: %w", err)
 	}
 	// Sweep temp files leaked by a crash mid-write (#1894). fsatomic
