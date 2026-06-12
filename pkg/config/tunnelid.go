@@ -34,7 +34,7 @@ func StableTunnelEndpointID(name string) uint16 {
 // endpoint names declared under one "interfaces" hierarchy node,
 // mirroring buildTunnelEndpointSnapshots naming exactly:
 //
-//   - interface-level tunnel, no units            -> "name"
+//   - interface-level tunnel, no COMPILABLE units -> "name"
 //   - interface-level WIREGUARD tunnel with units -> "name.N" of the
 //     lowest numeric unit only (one persistent TUN = one endpoint,
 //     #1910 r2/r3 Codex) — registering every unit would model ids the
@@ -42,6 +42,18 @@ func StableTunnelEndpointID(name string) uint16 {
 //     collision involving a never-emitted ref
 //   - interface-level non-WG tunnel with units    -> "name.N" per unit
 //   - unit-level tunnel                           -> "name.N"
+//
+// Every registered ref is the CANONICAL decimal form "%s.%d" of an
+// Atoi-parsed unit number, because that is all the builder can ever
+// emit: the typed compiler skips any unit whose name fails
+// strconv.Atoi (compiler_interfaces.go), so iface.Units holds ints
+// and the builder formats "%s.%d". Hashing a raw spelling diverges
+// both ways (#1910 r4/r5 Codex): `unit 01` must hash as "wg0.1" or
+// the gate misses a real collision on the emitted ref, and an
+// overflow-only spelling like `unit 999…9` must NOT register a raw
+// ref the builder cannot emit — with every unit unparseable,
+// iface.Units is empty and the builder emits the BARE interface ref,
+// so the gate registers the bare name in that case too.
 //
 // Handles both AST shapes (hierarchical merged keys and flat-set
 // single-key chains) via the same namedInstances helper the compiler
@@ -61,42 +73,46 @@ func collectTunnelEndpointNamesAST(ifacesNode *Node, out map[string]struct{}) {
 		tunnelNode := iface.FindChild("tunnel")
 		hasIfaceTunnel := tunnelNode != nil
 		units := namedInstances(iface.FindChildren("unit"))
-		if hasIfaceTunnel && len(units) == 0 {
-			out[name] = struct{}{}
+		// Mirror the typed compiler's unit admission: only
+		// Atoi-parseable names become InterfaceUnit entries.
+		unitNums := make([]int, 0, len(units))
+		unitTunnel := make(map[int]bool, len(units))
+		for _, unit := range units {
+			n, err := strconv.Atoi(unit.name)
+			if err != nil {
+				continue
+			}
+			unitNums = append(unitNums, n)
+			if unit.node.FindChild("tunnel") != nil {
+				unitTunnel[n] = true
+			}
+		}
+		if hasIfaceTunnel {
+			if len(unitNums) == 0 {
+				// No unit compiles (none declared, or none parses):
+				// the builder sees len(iface.Units)==0 and emits the
+				// bare interface ref.
+				out[name] = struct{}{}
+				continue
+			}
+			if astTunnelModeWireguard(tunnelNode) {
+				lowest := unitNums[0]
+				for _, n := range unitNums[1:] {
+					if n < lowest {
+						lowest = n
+					}
+				}
+				out[fmt.Sprintf("%s.%d", name, lowest)] = struct{}{}
+				continue
+			}
+			for _, n := range unitNums {
+				out[fmt.Sprintf("%s.%d", name, n)] = struct{}{}
+			}
 			continue
 		}
-		if hasIfaceTunnel && astTunnelModeWireguard(tunnelNode) {
-			// Mirror the builder's single-endpoint selection: the
-			// lowest numeric unit, registered in CANONICAL decimal
-			// form (%d of the parsed number, #1910 r4 Codex) — the
-			// compiler stores units as ints and the builder emits
-			// "%s.%d", so a non-canonical spelling like `unit 01`
-			// must hash as "wg0.1", not "wg0.01", or the gate would
-			// miss a real collision on the emitted ref. (Non-numeric
-			// unit names never compile into typed Units; if none
-			// parses, fall through to per-unit registration below —
-			// same as pre-#1910.)
-			lowestNum, found := 0, false
-			for _, unit := range units {
-				n, err := strconv.Atoi(unit.name)
-				if err != nil {
-					continue
-				}
-				if !found || n < lowestNum {
-					lowestNum, found = n, true
-				}
-			}
-			if found {
-				out[fmt.Sprintf("%s.%d", name, lowestNum)] = struct{}{}
-				continue
-			}
-		}
-		for _, unit := range units {
-			if unit.name == "" {
-				continue
-			}
-			if hasIfaceTunnel || unit.node.FindChild("tunnel") != nil {
-				out[fmt.Sprintf("%s.%s", name, unit.name)] = struct{}{}
+		for _, n := range unitNums {
+			if unitTunnel[n] {
+				out[fmt.Sprintf("%s.%d", name, n)] = struct{}{}
 			}
 		}
 	}

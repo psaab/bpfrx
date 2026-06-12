@@ -5275,3 +5275,7 @@ top.
 - **Timestamp**: 2026-06-12 ~13:25 PT
   **Action**: #1904 + #1905 combined /engineer lane (both filed from the #1884 research). #1904: shared riMemberLinuxName now resolves RI tunnel list members through cfg.TunnelNameMap() (compiler-assigned TunnelConfig.Name verbatim — exact device-name parity by construction), so unit>0 members like gr-0/0/0.1 bind the real uN device (gr-0-0-0u1); non-tunnel refs keep the literal transform byte-identically. #1905: applyWireguardTunLocked passes/stores t.appliedAddrs like the GRE branch, so a CONFIGURED fe80 removed from config reconciles away while kernel-autonomous fe80s are never touched. Live on loss userspace cluster: 10/10 PASS (gr-0-0-1u1 master vrf-vrf1904; configured fe80 removed, foreign fe80::beef + kernel stable-privacy LL survive). go build/test/-race clean.
   **File(s)**: pkg/daemon/{daemon_run.go,daemon_apply.go,tunnel_anchor_test.go}, pkg/routing/{tunnel.go,tunnel_reconcile_test.go}, docs/pr/1904-routing-followups/, _Log.md
+
+- **Timestamp**: 2026-06-12 15:55
+  **Action**: #1910 Codex r5 fix — parse-gated canonical refs in collectTunnelEndpointNamesAST (bare-ref when no unit parses; canonical %s.%d on all branches incl. non-WG/unit-level) + 2 regressions (overflow-only WG unit wg0/wg34524.0=17799; unit-level leading-zero wg0.01→wg0.1/wg341=14730). Lane agent died at spend limit; finishing inline.
+  **File(s)**: pkg/config/tunnelid.go, pkg/config/tunnelid_test.go, docs/pr/1904-routing-followups/reviewer-ids.md

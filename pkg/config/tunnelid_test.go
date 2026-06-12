@@ -148,6 +148,48 @@ func TestTunnelEndpointIDLeadingZeroUnitStillCollides(t *testing.T) {
 	}
 }
 
+// #1910 r5 Codex: an interface-level WG tunnel whose ONLY unit
+// spelling overflows strconv.Atoi compiles with iface.Units empty, so
+// the builder emits the BARE interface ref — the gate must hash that
+// bare ref, not the raw overflow spelling (which hashes elsewhere and
+// would let a real builder-emitted collision pass strict compile,
+// landing on the runtime usedIDs drop instead of failing commit).
+// Frozen collision: StableTunnelEndpointID("wg0") ==
+// StableTunnelEndpointID("wg34524.0") == 17799.
+func TestTunnelEndpointIDOverflowOnlyUnitHashesBareRef(t *testing.T) {
+	if a, b := StableTunnelEndpointID("wg0"), StableTunnelEndpointID("wg34524.0"); a != b || a != 17799 {
+		t.Fatalf("precondition: wg0=%d wg34524.0=%d, want both 17799 (frozen fold)", a, b)
+	}
+	tree := buildTree(t, []string{
+		"set interfaces wg0 tunnel mode wireguard",
+		"set interfaces wg0 unit 99999999999999999999999999999999999999 family inet address 10.70.2.1/30",
+		"set interfaces wg34524 unit 0 tunnel mode wireguard",
+	})
+	if _, err := CompileConfig(tree); err == nil {
+		t.Fatalf("CompileConfig accepted a builder-emitted collision hidden behind an overflow-only unit spelling (wg0 emits bare ref, collides with wg34524.0)")
+	}
+}
+
+// The same canonicalization must hold on the per-unit branches: a
+// UNIT-LEVEL tunnel declared as `unit 01` compiles to unit 1 and the
+// builder emits "wg0.1" — the gate must hash the canonical ref there
+// too, or it misses the frozen wg0.1/wg341 collision (14730).
+func TestTunnelEndpointIDUnitLevelLeadingZeroStillCollides(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set interfaces wg0 unit 01 tunnel mode wireguard",
+		"set interfaces wg341 tunnel mode wireguard",
+	})
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatalf("CompileConfig accepted a builder-emitted collision hidden behind a unit-level leading-zero spelling (wg0.01 -> emits wg0.1, collides with wg341)")
+	}
+	for _, want := range []string{"wg0.1", "wg341", "collision"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("collision error %q does not mention %q", err.Error(), want)
+		}
+	}
+}
+
 // And the inverse: a collision on the EMITTED lowest unit ref of an
 // interface-level WG tunnel must still be rejected.
 func TestTunnelEndpointIDCollisionOnEmittedWGUnitStillRejected(t *testing.T) {
