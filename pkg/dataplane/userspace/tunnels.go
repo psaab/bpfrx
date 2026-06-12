@@ -145,6 +145,31 @@ func buildTunnelEndpointSnapshots(cfg *config.Config, interfaces []InterfaceSnap
 				unitNums = append(unitNums, unitNum)
 			}
 			sort.Ints(unitNums)
+			if iface.Tunnel.Mode == "wireguard" {
+				// Interface-level WireGuard is ONE persistent TUN with
+				// ONE listen port shared by every unit (#1910 r2 Codex
+				// High): now that TunnelNameMap resolves every unit ref
+				// of an interface-level wg to the base device, per-unit
+				// emission would produce N live endpoints with the SAME
+				// ifindex + listen port — the Rust side overwrites
+				// tunnel_endpoint_by_ifindex with the later id and the
+				// second control thread tombstones on the duplicate UDP
+				// bind, so routes can select an engine whose control
+				// thread never came up. Emit exactly one endpoint,
+				// keyed by the lowest unit ref that has a snapshot row
+				// (so the common single-unit-0 shape keeps its existing
+				// stable id, and a missing/nil low unit falls through
+				// to the next one exactly like per-unit emission did).
+				for _, unitNum := range unitNums {
+					ref := fmt.Sprintf("%s.%d", name, unitNum)
+					if _, ok := ifaceByName[ref]; !ok {
+						continue
+					}
+					addEndpoint(ref, iface.Tunnel)
+					break
+				}
+				continue
+			}
 			for _, unitNum := range unitNums {
 				addEndpoint(fmt.Sprintf("%s.%d", name, unitNum), iface.Tunnel)
 			}
