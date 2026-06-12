@@ -1,0 +1,31 @@
+# xpf day-0 config-drive loader (#1879 Path C).
+#
+# Ordering-only coupling: Before=xpfd.service delays the daemon until
+# the probe finishes (so a valid day-0 config is in place before
+# bootstrap-from-file runs), but there is NO Requires= in either
+# direction — a failed or timed-out probe can never block the boot or
+# keep xpfd from starting. The script itself always exits 0;
+# TimeoutStartSec is the backstop against a pathological hang (e.g. a
+# malicious medium wedging mount), after which systemd kills the unit
+# and the boot proceeds to the factory bootstrap (fxp0 DHCP).
+#
+# Before=ssh.service: the sealed image ships without ssh host keys; the
+# loader regenerates them so sshd starts with per-instance keys.
+[Unit]
+Description=xpf day-0 config drive loader
+Documentation=https://github.com/psaab/xpf/blob/master/docs/install-images.md
+After=local-fs.target
+Before=xpfd.service ssh.service
+ConditionPathExists=!/etc/xpf/.day0-config-applied
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=120
+ExecStart=/usr/local/sbin/xpf-day0-config
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=xpf-day0
+
+[Install]
+WantedBy=multi-user.target
