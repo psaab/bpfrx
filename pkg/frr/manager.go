@@ -163,6 +163,15 @@ func (m *Manager) ReloadDegraded() bool {
 // shutdown sequence; safe to call multiple times and on managers that
 // never went degraded.
 func (m *Manager) Stop() {
+	// Disable BEFORE waiting (Codex code-r1 M1): an in-flight commit
+	// reaching its degraded handling after Stop() starts must not
+	// retryWG.Add a new episode behind the Wait (WaitGroup Add/Wait
+	// misuse + a leaked goroutine). retryEnabled is read and Add(1)
+	// happens under the same retryMu, so any ensure either completed
+	// its Add before this disable or observes it and spawns nothing.
+	m.retryMu.Lock()
+	m.retryEnabled = false
+	m.retryMu.Unlock()
 	if m.mgrCancel != nil {
 		m.mgrCancel()
 	}
@@ -436,6 +445,19 @@ func (m *Manager) commitManagedSection(section string) error {
 	m.signalRetryCancel()
 	m.reloadMu.Lock()
 	defer m.reloadMu.Unlock()
+	// Re-arm guard (Codex code-r1 H1, runs BEFORE the unlock above by
+	// LIFO order): the pre-cancel assumed this commit supersedes the
+	// degraded state, but a failed write (early return below) or a
+	// hard reload failure leaves degraded=true with the old episode
+	// already cancelled — without this, stale-config removal would
+	// never retry until the next commit or restart. ensureRetryLocked
+	// is idempotent against the episode the degraded outcome itself
+	// may have just scheduled.
+	defer func() {
+		if m.degraded.Load() {
+			m.ensureRetryLocked(false)
+		}
+	}()
 
 	if err := m.writeManagedSection(section); err != nil {
 		return err

@@ -567,6 +567,19 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 			prometheus.GaugeValue, v)
 	}
 
+	// #1880: FRR reload-degraded is likewise a control-plane signal
+	// (the daemon applies FRR even in config-only mode) — emit it
+	// BEFORE the dataplane gate so it never disappears exactly when
+	// the fallback path is active.
+	if c.srv.frrReloadDegradedFn != nil {
+		v := 0.0
+		if c.srv.frrReloadDegradedFn() {
+			v = 1
+		}
+		ch <- prometheus.MustNewConstMetric(c.frrReloadDegraded,
+			prometheus.GaugeValue, v)
+	}
+
 	dp := c.srv.dp
 	if dp == nil || !dp.IsLoaded() {
 		return

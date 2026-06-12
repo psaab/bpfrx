@@ -252,3 +252,40 @@ func TestApplyFullPropagatesDegraded(t *testing.T) {
 		t.Errorf("ReloadDegraded() = false after degraded ApplyFull")
 	}
 }
+
+// TestHardFailureReArmsRetry pins Codex code-r1 H1: a superseding
+// commit pre-cancels the degraded-retry episode, but if that commit
+// then HARD-fails (both reload legs), it has not superseded anything —
+// degraded must stay set AND a live retry episode must exist again
+// (without it, stale-config removal would never retry until the next
+// commit or restart).
+func TestHardFailureReArmsRetry(t *testing.T) {
+	fake := &fakeExecutor{}
+	fake.frrReloadPyHook = func(call int) error {
+		return errors.New("primary down")
+	}
+	// Commit 1: primary fails, fallback succeeds -> degraded + episode.
+	m := newRetryTestManager(t, fake, []time.Duration{time.Hour}, time.Hour)
+	if err := m.Clear(); !errors.Is(err, ErrFRRReloadDegraded) {
+		t.Fatalf("Clear 1 = %v, want ErrFRRReloadDegraded", err)
+	}
+
+	// Commit 2: BOTH legs fail (hard failure). The pre-cancel killed
+	// the old episode; the re-arm guard must schedule a fresh one.
+	fake.mu.Lock()
+	fake.vtyshLoadErr = errors.New("vtysh also down")
+	fake.mu.Unlock()
+	err := m.Clear()
+	if err == nil || errors.Is(err, ErrFRRReloadDegraded) {
+		t.Fatalf("Clear 2 = %v, want hard (non-degraded) failure", err)
+	}
+	if !m.ReloadDegraded() {
+		t.Fatalf("degraded cleared by a hard failure")
+	}
+	m.retryMu.Lock()
+	live := m.retryDone != nil && m.retryCtx != nil && m.retryCtx.Err() == nil
+	m.retryMu.Unlock()
+	if !live {
+		t.Fatalf("no live retry episode after hard-failing commit — re-arm guard missing")
+	}
+}

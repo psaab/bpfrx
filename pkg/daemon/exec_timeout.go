@@ -10,7 +10,7 @@ import (
 
 // externalCommandTimeout bounds external commands run on the config-apply
 // path. 15s mirrors the established FRR precedent (pkg/frr/vtysh.go
-// SystemctlReload / VtyshLoad callers and the chrony reload in
+// FrrReloadPy / VtyshLoad callers and the chrony reload in
 // daemon_system.go): apply-path exec sites run while applySem is held,
 // so a single hung systemctl/useradd/chown would otherwise wedge every
 // CLI/gRPC/HTTP commit and HA config sync indefinitely (#1794).
