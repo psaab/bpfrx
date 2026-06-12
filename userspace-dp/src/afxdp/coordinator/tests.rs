@@ -2443,3 +2443,314 @@ fn wg1866_sweep_respawns_with_empty_linux_name_rows() {
         "coherence check must accept the empty-linux_name fallback label and respawn"
     );
 }
+
+// ---------------------------------------------------------------------
+// #1881 — GRE local-origin thread lifecycle regression suite.
+//
+// Same shape as the wg1866 suite above: these drive the REAL spawn
+// path; the spawned thread fails open_tun (no TUN privilege in the
+// test environment) and exits — exactly the early-exit shape the
+// tombstone machinery must handle. On master (pre-#1881) the
+// entry-creation pins fail outright: refresh_runtime_snapshot never
+// touched tunnel_sources (threads were spawned at bring-up only).
+// ---------------------------------------------------------------------
+
+fn gre1881_snapshot(id: u16, ifindex: i32, name: &str, dst: &str) -> ConfigSnapshot {
+    ConfigSnapshot {
+        interfaces: vec![crate::protocol::snapshot::InterfaceSnapshot {
+            name: name.to_string(),
+            linux_name: name.to_string(),
+            ifindex,
+            tunnel: true,
+            ..Default::default()
+        }],
+        tunnel_endpoints: vec![crate::protocol::snapshot::TunnelEndpointSnapshot {
+            id,
+            interface: name.to_string(),
+            linux_name: name.to_string(),
+            ifindex,
+            mode: "gre".to_string(),
+            outer_family: "inet".to_string(),
+            source: "192.0.2.1".to_string(),
+            destination: dst.to_string(),
+            ttl: 64,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+/// #1881 plan SMR-1: the spawn pass is gated on live worker handles —
+/// a thread spawned with zero workers would freeze EMPTY
+/// live/identities/worker_commands captures for its lifetime. Tests
+/// that want spawns install one fake handle.
+fn gre1881_fake_worker_handle() -> WorkerHandle {
+    WorkerHandle {
+        stop: Arc::new(AtomicBool::new(false)),
+        heartbeat: Arc::new(AtomicU64::new(0)),
+        commands: Arc::new(Mutex::new(VecDeque::new())),
+        session_export_ack: Arc::new(AtomicU64::new(0)),
+        cos_status: Arc::new(ArcSwap::from_pointee(Vec::new())),
+        runtime_atomics: Arc::new(crate::afxdp::worker_runtime::WorkerRuntimeAtomics::new()),
+        cold_path_atomics: Arc::new(crate::afxdp::cold_path_hist::WorkerColdPathAtomics::new()),
+        join: None,
+    }
+}
+
+fn gre1881_coordinator_with_worker() -> Coordinator {
+    let mut coordinator = Coordinator::new();
+    coordinator
+        .workers
+        .handles
+        .insert(0, gre1881_fake_worker_handle());
+    coordinator
+}
+
+/// Drive the finished sweep until the entry for `id` is a tombstone.
+fn gre1881_wait_tombstone(coordinator: &mut Coordinator, id: u16, timeout_ms: u64) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        coordinator.reconcile_local_tunnel_liveness(None);
+        match coordinator.tunnel_sources.get(&id) {
+            Some(entry) if entry.handle.is_none() => return true,
+            _ => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// THE bug pin (#1881 F3): a same-plan refresh that adds a GRE tunnel
+/// must create the local-origin entry AND publish its delivery sender.
+/// Fails on master, where refresh never reconciled tunnel_sources.
+#[test]
+fn gre1881_refresh_creates_entry_and_publishes_delivery() {
+    let mut coordinator = gre1881_coordinator_with_worker();
+    coordinator.refresh_runtime_snapshot(&gre1881_snapshot(1, 36281, "gre1881a", "198.51.100.7"));
+    let entry = coordinator
+        .tunnel_sources
+        .get(&1)
+        .expect("GRE local-origin entry created on armed refresh");
+    assert_eq!(entry.spawned_ifindex, 36281);
+    assert_eq!(entry.spawned_tunnel_name, "gre1881a");
+    assert!(entry.handle.is_some(), "live handle right after spawn");
+    assert!(
+        coordinator
+            .local_tunnel_deliveries
+            .load()
+            .contains_key(&36281),
+        "delivery sender published for the spawned ifindex"
+    );
+}
+
+/// #1881 F4: a refresh that REMOVES the tunnel stops + joins the
+/// thread, removes the entry, and unpublishes the delivery sender.
+#[test]
+fn gre1881_removal_refresh_prunes_entry_and_unpublishes() {
+    let mut coordinator = gre1881_coordinator_with_worker();
+    coordinator.refresh_runtime_snapshot(&gre1881_snapshot(1, 36282, "gre1881b", "198.51.100.7"));
+    assert!(coordinator.tunnel_sources.contains_key(&1));
+    coordinator.refresh_runtime_snapshot(&ConfigSnapshot::default());
+    assert!(
+        coordinator.tunnel_sources.is_empty(),
+        "removed endpoint prunes the entry"
+    );
+    assert!(
+        coordinator.local_tunnel_deliveries.load().is_empty(),
+        "removed endpoint unpublishes the delivery sender"
+    );
+}
+
+/// #1881 plan SMR-1: the deferred same-plan window reaches the armed
+/// refresh with ZERO worker handles — the spawn pass must do nothing.
+#[test]
+fn gre1881_no_workers_spawn_gate() {
+    let mut coordinator = Coordinator::new();
+    coordinator.refresh_runtime_snapshot(&gre1881_snapshot(1, 36283, "gre1881c", "198.51.100.7"));
+    assert!(
+        coordinator.tunnel_sources.is_empty(),
+        "no spawn without live worker handles (frozen empty captures)"
+    );
+    assert!(coordinator.local_tunnel_deliveries.load().is_empty());
+}
+
+/// #1881 core property: endpoint CONTENT changes (destination edit,
+/// same id + same attachment) must NOT restart the thread — the live
+/// loop tracks them through the shared forwarding ArcSwap. No respawn
+/// means the spawn-attempt stamp is untouched.
+#[test]
+fn gre1881_destination_edit_preserves_entry_without_respawn() {
+    let mut coordinator = gre1881_coordinator_with_worker();
+    coordinator.refresh_runtime_snapshot(&gre1881_snapshot(1, 36284, "gre1881d", "198.51.100.7"));
+    let stamp = coordinator
+        .tunnel_sources
+        .get(&1)
+        .expect("entry")
+        .last_spawn_attempt_ns;
+    coordinator.refresh_runtime_snapshot(&gre1881_snapshot(1, 36284, "gre1881d", "203.0.113.9"));
+    let entry = coordinator
+        .tunnel_sources
+        .get(&1)
+        .expect("destination edit keeps the entry");
+    assert_eq!(
+        entry.last_spawn_attempt_ns, stamp,
+        "destination-only edit must not respawn (no TUN churn)"
+    );
+}
+
+/// #1881: attachment drift (same id, new logical ifindex) is the ONLY
+/// restart condition — the TUN fd is bound to the old netdev.
+#[test]
+fn gre1881_attachment_change_restarts_thread() {
+    let mut coordinator = gre1881_coordinator_with_worker();
+    coordinator.refresh_runtime_snapshot(&gre1881_snapshot(1, 36285, "gre1881e", "198.51.100.7"));
+    let stamp = coordinator
+        .tunnel_sources
+        .get(&1)
+        .expect("entry")
+        .last_spawn_attempt_ns;
+    coordinator.refresh_runtime_snapshot(&gre1881_snapshot(1, 36286, "gre1881e", "198.51.100.7"));
+    let entry = coordinator
+        .tunnel_sources
+        .get(&1)
+        .expect("reattached endpoint respawned");
+    assert_eq!(entry.spawned_ifindex, 36286, "entry re-spawned on the new ifindex");
+    assert!(
+        entry.last_spawn_attempt_ns > stamp,
+        "attachment change respawns (fresh attempt stamp)"
+    );
+    let deliveries = coordinator.local_tunnel_deliveries.load();
+    assert!(deliveries.contains_key(&36286));
+    assert!(
+        !deliveries.contains_key(&36285),
+        "old attachment's sender unpublished"
+    );
+}
+
+/// #1881 / Codex plan r1 MAJOR 1 companion: a same-id mode flip
+/// gre→wireguard (reachable because ids are name-derived) prunes the
+/// GRE entry; the WG pass owns the id from then on.
+#[test]
+fn gre1881_mode_flip_to_wireguard_prunes_gre_entry() {
+    let mut coordinator = gre1881_coordinator_with_worker();
+    coordinator.refresh_runtime_snapshot(&gre1881_snapshot(1, 36287, "gre1881f", "198.51.100.7"));
+    assert!(coordinator.tunnel_sources.contains_key(&1));
+    coordinator
+        .refresh_runtime_snapshot(&wg1866_snapshot(1, 36287, "gre1881f", 51899, WG1866_PRIVKEY_A));
+    assert!(
+        !coordinator.tunnel_sources.contains_key(&1),
+        "mode flip prunes the GRE local-origin entry"
+    );
+    assert!(
+        coordinator.wg_control_threads.contains_key(&1),
+        "the WG pass owns the id after the flip"
+    );
+    assert!(coordinator.local_tunnel_deliveries.load().is_empty());
+}
+
+/// #1881 (mirrors the #1866 disarmed rule): a disarmed same-plan
+/// refresh stops all GRE local-origin threads and empties the
+/// delivery map (plan SMR2-2).
+#[test]
+fn gre1881_disarmed_refresh_stops_threads() {
+    let mut coordinator = gre1881_coordinator_with_worker();
+    let snap = gre1881_snapshot(1, 36288, "gre1881g", "198.51.100.7");
+    coordinator.refresh_runtime_snapshot(&snap);
+    assert!(coordinator.tunnel_sources.contains_key(&1));
+    coordinator.refresh_runtime_snapshot_disarmed(&snap);
+    assert!(
+        coordinator.tunnel_sources.is_empty(),
+        "disarmed refresh must not hold TUN reader fds"
+    );
+    assert!(coordinator.local_tunnel_deliveries.load().is_empty());
+}
+
+/// #1881 (mirrors #1866 Change 2b): the defer-workers narrow prune
+/// removes entries absent from (or no longer gre/ip6gre in) the new
+/// snapshot and keeps the rest.
+#[test]
+fn gre1881_defer_prune_removes_only_stale_entries() {
+    let mut coordinator = gre1881_coordinator_with_worker();
+    let snap = gre1881_snapshot(1, 36289, "gre1881h", "198.51.100.7");
+    coordinator.refresh_runtime_snapshot(&snap);
+    assert!(coordinator.tunnel_sources.contains_key(&1));
+    // Same snapshot: nothing pruned.
+    coordinator.prune_local_tunnel_sources_for_snapshot(&snap);
+    assert!(coordinator.tunnel_sources.contains_key(&1));
+    // Endpoint gone from the new snapshot: pruned + unpublished.
+    coordinator.prune_local_tunnel_sources_for_snapshot(&ConfigSnapshot::default());
+    assert!(coordinator.tunnel_sources.is_empty());
+    assert!(coordinator.local_tunnel_deliveries.load().is_empty());
+}
+
+/// #1881 F6: a thread that exits (open_tun failure here) is
+/// tombstoned by the periodic liveness sweep — which must ALSO
+/// unpublish its delivery sender (Codex plan r1 R3) — and respawns
+/// past the backoff only when the stored snapshot is coherent with
+/// the forwarding attachment.
+#[test]
+fn gre1881_exit_tombstones_sweep_unpublishes_and_respawn_is_coherence_gated() {
+    let mut coordinator = gre1881_coordinator_with_worker();
+    let snap = gre1881_snapshot(1, 36290, "gre1881i", "198.51.100.7");
+    coordinator.refresh_runtime_snapshot(&snap);
+    assert!(
+        gre1881_wait_tombstone(&mut coordinator, 1, 2_000),
+        "open_tun failure tombstones the entry"
+    );
+    assert!(
+        coordinator.local_tunnel_deliveries.load().is_empty(),
+        "sweep republishes the delivery map without the dead sender"
+    );
+    // Incoherent snapshot (attachment mismatch): no respawn even past
+    // the backoff.
+    coordinator
+        .tunnel_sources
+        .get_mut(&1)
+        .expect("tombstone")
+        .last_spawn_attempt_ns = 0;
+    let mismatched = gre1881_snapshot(1, 99999, "gre1881i", "198.51.100.7");
+    coordinator.reconcile_local_tunnel_liveness(Some(&mismatched));
+    assert_eq!(
+        coordinator
+            .tunnel_sources
+            .get(&1)
+            .expect("tombstone retained")
+            .last_spawn_attempt_ns,
+        0,
+        "incoherent snapshot must not respawn"
+    );
+    // Coherent snapshot past the backoff: one respawn attempt.
+    coordinator.reconcile_local_tunnel_liveness(Some(&snap));
+    assert!(
+        coordinator
+            .tunnel_sources
+            .get(&1)
+            .expect("entry retained")
+            .last_spawn_attempt_ns
+            > 0,
+        "tombstone respawned past backoff with a coherent snapshot"
+    );
+}
+
+/// #1881: after stop_inner the entry map and delivery map are empty,
+/// and a subsequent liveness sweep cannot create entries (tombstone-
+/// only rule), even with a coherent snapshot.
+#[test]
+fn gre1881_stop_inner_clears_and_sweep_creates_nothing() {
+    let mut coordinator = gre1881_coordinator_with_worker();
+    let snap = gre1881_snapshot(1, 36291, "gre1881j", "198.51.100.7");
+    coordinator.refresh_runtime_snapshot(&snap);
+    assert!(coordinator.tunnel_sources.contains_key(&1));
+    coordinator.stop_inner(false);
+    assert!(coordinator.tunnel_sources.is_empty(), "stop clears entries");
+    assert!(coordinator.local_tunnel_deliveries.load().is_empty());
+    for _ in 0..3 {
+        coordinator.reconcile_local_tunnel_liveness(Some(&snap));
+        assert!(
+            coordinator.tunnel_sources.is_empty(),
+            "liveness sweep never creates entries"
+        );
+    }
+}
