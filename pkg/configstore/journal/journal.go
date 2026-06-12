@@ -111,7 +111,11 @@ func WithMaxSegments(n int) Option {
 	return func(j *Journal) { j.maxSegments = n }
 }
 
-// New creates a journal at the given file path.
+// New creates a journal at the given file path. Out-of-range options
+// are clamped to the defaults: maxSegments < 1 would make rotation
+// resolve segmentPath(0) — the CURRENT file — and delete the live
+// journal (AGY code-r1 F2), and maxSegmentBytes < 1 would rotate on
+// every append.
 func New(path string, opts ...Option) *Journal {
 	j := &Journal{
 		path:            path,
@@ -120,6 +124,12 @@ func New(path string, opts ...Option) *Journal {
 	}
 	for _, o := range opts {
 		o(j)
+	}
+	if j.maxSegments < 1 {
+		j.maxSegments = DefaultMaxSegments
+	}
+	if j.maxSegmentBytes < 1 {
+		j.maxSegmentBytes = DefaultMaxSegmentBytes
 	}
 	return j
 }
@@ -346,19 +356,24 @@ func tailScan(r io.ReaderAt, size int64, limit int) ([]*Entry, error) {
 		nl := bytes.IndexByte(buf, '\n')
 		if nl < 0 {
 			pending = buf
-			if len(pending) > maxTailLineBytes {
-				pending = nil
-				skipping = true
+		} else {
+			complete := buf[nl+1:]
+			pending = buf[:nl+1] // head fragment incl. its terminating '\n'
+			lines := bytes.Split(complete, []byte{'\n'})
+			for i := len(lines) - 1; i >= 0 && len(entries) < limit; i-- {
+				if e := parseLine(lines[i]); e != nil {
+					entries = append(entries, e)
+				}
 			}
-			continue
 		}
-		complete := buf[nl+1:]
-		pending = buf[:nl+1] // head fragment incl. its terminating '\n'
-		lines := bytes.Split(complete, []byte{'\n'})
-		for i := len(lines) - 1; i >= 0 && len(entries) < limit; i-- {
-			if e := parseLine(lines[i]); e != nil {
-				entries = append(entries, e)
-			}
+		// Cap check on EVERY pending update, not only the no-newline
+		// path (AGY code-r1 F1): a fragment that retained its
+		// terminating '\n' (e.g. an over-cap line that ends in a
+		// newline) keeps satisfying IndexByte on later iterations and
+		// would otherwise grow without bound.
+		if len(pending) > maxTailLineBytes {
+			pending = nil
+			skipping = true
 		}
 	}
 	// Whatever is left runs from offset 0: the file's first line (or

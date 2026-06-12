@@ -182,6 +182,76 @@ func TestCommitJournalCompactEntry(t *testing.T) {
 	}
 }
 
+// TestConfigHashOnAllConfigBearingPaths (AGY code-r1 F3): every
+// config-bearing journal action — config_sync, commit_confirmed,
+// auto_rollback — must record the hash of the post-action active tree,
+// not just plain commit.
+func TestConfigHashOnAllConfigBearingPaths(t *testing.T) {
+	dir := t.TempDir()
+	s := newTestStoreAt(t, filepath.Join(dir, "config"))
+
+	// config_sync (not in the ListCommitHistory filter — read the
+	// journal directly).
+	if _, err := s.SyncApply("system {\n    host-name synced;\n}\n", nil); err != nil {
+		t.Fatalf("SyncApply: %v", err)
+	}
+	entries, err := s.journal.Tail(5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := entries[len(entries)-1]
+	if last.Action != "config_sync" {
+		t.Fatalf("want config_sync, got %q", last.Action)
+	}
+	if last.ConfigHash == "" || last.ConfigHash != journalConfigHash(s.ActiveTree()) {
+		t.Fatalf("config_sync hash mismatch: %q", last.ConfigHash)
+	}
+
+	// commit_confirmed.
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetFromInput("system host-name confirmed-host"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CommitConfirmed(10); err != nil {
+		t.Fatalf("CommitConfirmed: %v", err)
+	}
+	commits, err := s.ListCommitHistory(5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cc := commits[len(commits)-1]
+	if cc.Action != "commit_confirmed" {
+		t.Fatalf("want commit_confirmed, got %q", cc.Action)
+	}
+	if cc.ConfigHash == "" || cc.ConfigHash != journalConfigHash(s.ActiveTree()) {
+		t.Fatalf("commit_confirmed hash mismatch: %q", cc.ConfigHash)
+	}
+
+	// auto_rollback: fire the armed confirm timer's callback directly
+	// with the current generation; the hash must cover the REVERTED
+	// tree.
+	s.mu.RLock()
+	gen := s.confirmGen
+	s.mu.RUnlock()
+	s.performAutoRollback(gen)
+	commits, err = s.ListCommitHistory(5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ar := commits[len(commits)-1]
+	if ar.Action != "auto_rollback" {
+		t.Fatalf("want auto_rollback, got %q", ar.Action)
+	}
+	if ar.ConfigHash == "" || ar.ConfigHash != journalConfigHash(s.ActiveTree()) {
+		t.Fatalf("auto_rollback hash mismatch: %q", ar.ConfigHash)
+	}
+	if ar.ConfigHash == cc.ConfigHash {
+		t.Fatal("auto_rollback hash should differ from the rolled-back commit's hash")
+	}
+}
+
 // TestJournalConfigHashMatchesRollbackFile: the hash stored in the
 // journal entry for commit K must equal the sha256 of the rollback
 // file written when commit K+1 displaces that config — the operator

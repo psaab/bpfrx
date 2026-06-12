@@ -429,6 +429,54 @@ func TestSkipModeOverCapLine(t *testing.T) {
 	}
 }
 
+// TestSkipModeOverCapLineWithTrailingNewline (AGY code-r1 F1): an
+// over-cap line that ENDS with a newline keeps that newline inside the
+// pending fragment, so the no-newline branch never fires — the cap
+// must trigger on every pending update or the scanner buffers the
+// whole line. Valid entries on both sides must survive.
+func TestSkipModeOverCapLineWithTrailingNewline(t *testing.T) {
+	if testing.Short() {
+		t.Skip("writes >16MiB")
+	}
+	j := testJournal(t)
+	mustLog(t, j, &Entry{Action: "commit", Detail: "valid 1"})
+
+	f, err := os.OpenFile(j.path, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	garbage := bytes.Repeat([]byte{'x'}, maxTailLineBytes+2*readChunk)
+	garbage = append(garbage, '\n') // the F1 shape: poisoned line terminated by newline
+	if _, err := f.Write(garbage); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	mustLog(t, j, &Entry{Action: "commit", Detail: "valid 2"})
+
+	got, err := j.Tail(50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Detail != "valid 1" || got[1].Detail != "valid 2" {
+		t.Fatalf("trailing-newline over-cap line broke the scan: %+v", got)
+	}
+}
+
+// TestZeroMaxSegmentsClamped (AGY code-r1 F2): maxSegments=0 would make
+// rotation delete the CURRENT journal file (segmentPath(0) == path);
+// New must clamp it.
+func TestZeroMaxSegmentsClamped(t *testing.T) {
+	j := testJournal(t, WithMaxSegments(0), WithMaxSegmentBytes(0))
+	if j.maxSegments != DefaultMaxSegments || j.maxSegmentBytes != DefaultMaxSegmentBytes {
+		t.Fatalf("out-of-range options not clamped: segments=%d bytes=%d", j.maxSegments, j.maxSegmentBytes)
+	}
+	mustLog(t, j, &Entry{Action: "commit", Detail: "survives"})
+	got, err := j.Tail(10)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("journal lost after clamped-options append: %v, %d", err, len(got))
+	}
+}
+
 // TestParseLineRejectsNonEntries: blank lines, garbage, and decodable
 // JSON that is not a journal entry are skipped.
 func TestParseLineRejectsNonEntries(t *testing.T) {
