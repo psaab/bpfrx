@@ -71,6 +71,14 @@ func (c *xpfCollector) collectSystemMetrics(ch chan<- prometheus.Metric) {
 			prometheus.GaugeValue, float64(unresolved))
 	}
 
+	// #1895: currently-failed RPM probe-pin installs. Nonzero means
+	// next-hop-pinned tests are holding state (their uplinks are not
+	// being health-checked) until a pin retry succeeds.
+	if c.srv.rpmPinFailedFn != nil {
+		ch <- prometheus.MustNewConstMetric(c.rpmPinInstallFailures,
+			prometheus.GaugeValue, c.srv.rpmPinFailedFn())
+	}
+
 	// Daemon RSS from /proc/self/statm (field 1 = RSS in pages)
 	if data, err := os.ReadFile("/proc/self/statm"); err == nil {
 		fields := strings.Fields(string(data))
