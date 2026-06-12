@@ -163,6 +163,11 @@ scenario_a() {
 		fail "running kernel is not the -generic flavor"
 	guest xpf-image-a sh -c 'test -d "/lib/modules/$(uname -r)/kernel/drivers/net/ethernet/mellanox"' ||
 		fail "linux-modules-extra (mlx5/i40e driver set) missing for the running kernel"
+	# Exactly ONE kernel ships: the cloudimg's original (reduced-module)
+	# kernel must have been purged, or a future GRUB selection of it
+	# would boot without NIC drivers.
+	guest xpf-image-a sh -c '[ "$(ls /lib/modules | wc -l)" -eq 1 ]' ||
+		fail "more than one kernel in /lib/modules — stale cloudimg kernel not purged"
 
 	info "in-guest verify-dataplane (the bake gate, image kernel)..."
 	guest xpf-image-a nice -n 19 /usr/local/sbin/xpfd verify-dataplane ||

@@ -26,7 +26,11 @@
 #      cloudimg's reduced linux-virtual kernel with linux-generic (full
 #      driver set — mlx5/i40e live in linux-modules-extra) and assert
 #      the kernel meets the >= 6.18 verifier floor, purge cloud-init +
-#      snapd + the virtual-kernel metapackages, enable systemd-networkd
+#      snapd + the virtual-kernel metapackages + any stale versioned
+#      kernel (the cloudimg's original kernel is manually-marked, so
+#      autoremove keeps it; the image ships exactly ONE kernel — the
+#      stale one's reduced module tree would lack NIC drivers if GRUB
+#      ever selected it), enable systemd-networkd
 #      (xpfd owns all interfaces), sysctls, init_on_alloc=0, install
 #      xpfd + cli + xpf-userspace-dp + units, enable xpfd + the day-0
 #      loader + the (incus-only, otherwise inert) incus-agent loader.
@@ -251,6 +255,7 @@ virt-customize -a "$WORK_DIR/work.qcow2" \
 	--run-command 'latest=$(ls /lib/modules | sort -V | tail -1) && dpkg --compare-versions "${latest%%-*}" ge 6.18 || { echo "FATAL: newest installed kernel $latest < 6.18 (verifier floor — the latest Ubuntu release regressed below it?)" >&2; exit 1; }' \
 	--run-command 'test -d "/lib/modules/$(ls /lib/modules | sort -V | tail -1)/kernel/drivers/net/ethernet/mellanox" || { echo "FATAL: linux-modules-extra missing (mlx5/i40e drivers) — linux-generic install incomplete" >&2; exit 1; }' \
 	--run-command 'export DEBIAN_FRONTEND=noninteractive && apt-get purge -y -qq linux-virtual linux-image-virtual linux-headers-virtual 2>/dev/null || true' \
+	--run-command 'export DEBIAN_FRONTEND=noninteractive; newest=$(ls /lib/modules | sort -V | tail -1) && dpkg-query -W -f "\${Package}\n" 2>/dev/null | grep -E "^linux-(image|modules|modules-extra)-[0-9]" | grep -v -- "$newest" | xargs -r apt-get purge -y -qq; true' \
 	--run-command 'export DEBIAN_FRONTEND=noninteractive && apt-get purge -y -qq snapd 2>/dev/null || true; rm -rf /snap /var/snap /var/lib/snapd /var/cache/snapd' \
 	--run-command 'export DEBIAN_FRONTEND=noninteractive && apt-get purge -y -qq "cloud-init*" 2>/dev/null || true; rm -rf /etc/cloud /var/lib/cloud' \
 	--run-command 'rm -f /etc/network/interfaces.d/* /etc/netplan/*.yaml 2>/dev/null || true' \
