@@ -16,3 +16,12 @@
 | 4 | AGY | adversarial-review-mqa5s52d-b8j1xm | PLAN-READY |
 
 Converged: PLAN-READY 3-of-3 at round 4 on plan v4 (blanket R-C gate).
+
+## PR #1882 code review
+
+| Round | Reviewer | Task id | Verdict |
+|---|---|---|---|
+| code-1 | Copilot | (review requested) | COMMENTED — quota limit, retry 1 documented |
+| code-1 | Claude SMR | claude-smr-code-r1.md | MERGE-READY after self-found MAJOR fix 73f61b1db797 (reverse-only purge) |
+| code-1 | AGY | adversarial-review-mqa9m9r0-p48whc (timed out) → retry adversarial-review-mqa9u6b2-lq3y1y | MERGE-READY at 73f61b1db797 |
+| code-1 | Codex | task-mqa9mk6f-2etcct | MERGE-NEEDS-MAJOR (re-owned-id publication window) → fixed in 8909f3ac0e70 (purge-before-store + defer + rotation barrier) |
