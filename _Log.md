@@ -1,5 +1,25 @@
 # Action Log
 
+## 2026-06-12 — #1885 PR #1901 live validation + reviews
+- **Timestamp**: 2026-06-12 UTC (08:00-08:30)
+- **Action**: Live validation on loss userspace cluster against the real
+  sfmix GRE peer (outer IPv6 over VLAN-tagged reth0.80): baseline
+  pre-fix builds show write_local_tunnel_delivery EINVAL per
+  keepalive/reply (strace 00 50 86 dd garbage); fix build
+  (2347-g154d72c8d, version-pinned cells) — 4-min soak ring=0/dbg=0 at
+  6 checkpoints over two keepalive windows + miss/hit/re-miss pings,
+  final cell 40/40 pings 0% loss, 0 EINVAL, local-delivery accepts
+  flowing, transit 21.6 Gb/s. Cluster heavily contended (3 agents
+  interleaving deploys + sick fw1 recovered mid-window) — early
+  mid-failback window EINVALs attributed to mixed-version nodes; the
+  pinned cells are authoritative. PR #1901 (Closes #1885), follow-up
+  #1902 filed (pending_neigh desc/meta mismatch). Reviews: Codex r1
+  MERGE-NEEDS-MINOR (LOW doc name, fixed), AGY r1b MERGE-READY (r1
+  degenerate 0-byte, one retry), Claude SMR MERGE-READY; Copilot
+  quota-limited, documented retries.
+- **File(s)**: docs/pr/1885-vlan-slice/plan.md,
+  docs/pr/1885-vlan-slice/reviewer-ids.md, _Log.md
+
 ## 2026-06-12 — #1885 local-delivery TUN mis-slice fix (engineer run)
 - **Timestamp**: 2026-06-12 UTC
 - **Action**: Verified the #1885 root cause is NOT the issue's framing
