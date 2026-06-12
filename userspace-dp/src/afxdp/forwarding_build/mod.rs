@@ -142,7 +142,7 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     let (excluded_local_v4, excluded_local_v6) = nat_translated_local_exclusions(snapshot);
 
     zones::populate_zones(snapshot, &mut state);
-    tunnels::populate_tunnel_endpoints(snapshot, &mut state);
+    tunnels::populate_tunnel_endpoints(snapshot, &mut state, previous);
     // #1432 S2a: instantiate one WgEngine per mode=="wireguard" endpoint,
     // reusing the previous state's engine Arc when the endpoint config is
     // unchanged (TAI64N + live sessions survive the commit) and seeding a

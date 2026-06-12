@@ -12,10 +12,33 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 pub(super) fn populate_tunnel_endpoints(
     snapshot: &ConfigSnapshot,
     state: &mut ForwardingState,
+    previous: Option<&ForwardingState>,
 ) {
     for endpoint in &snapshot.tunnel_endpoints {
         if endpoint.id == 0 || endpoint.ifindex <= 0 {
             continue;
+        }
+        // #1873 R-D (Codex code-review r1): defer a row whose id the
+        // PREVIOUS state owned under a different logical name. Without
+        // the defer, a worker that observes this state before draining
+        // its DeleteSynced commands (or that created an old-owner
+        // session in the swap window) would re-resolve the stale id
+        // into THIS row and encapsulate the old tunnel's traffic into
+        // the new owner. With the row absent the stale id resolves
+        // NoRoute -> R-C drop. The coordinator installs the row via an
+        // immediate follow-up rebuild once every worker has rotated
+        // and the purge has run twice (see refresh_runtime_snapshot).
+        if let Some(prev) = previous {
+            if let Some(prev_ep) = prev.tunnel_endpoints.get(&endpoint.id) {
+                if prev_ep.interface != endpoint.interface {
+                    eprintln!(
+                        "xpf-userspace-dp: deferring tunnel endpoint id {} (owner {} -> {}) until the remap purge completes (#1873)",
+                        endpoint.id, prev_ep.interface, endpoint.interface
+                    );
+                    state.deferred_reowned_tunnel_ids.push(endpoint.id);
+                    continue;
+                }
+            }
         }
         let is_wireguard = endpoint.mode == "wireguard";
         // GRE/IPIP require concrete outer source/destination. WireGuard

@@ -2224,3 +2224,53 @@ fn tunnel_remap_purge_ids_owner_change_semantics() {
     let next = build_forwarding_state(&two_tunnel_snapshot());
     assert!(tunnel_remap_purge_ids(&prev, &next).is_empty());
 }
+
+/// #1873 R-D defer pins (Codex code-review r1): a row whose id the
+/// previous state owned under a DIFFERENT logical name is deferred out
+/// of the built state (recorded in deferred_reowned_tunnel_ids), so a
+/// stale session can never resolve the old id into the new owner; an
+/// immediate rebuild with the deferred state as `previous` installs
+/// it. Same-name and fresh ids are never deferred.
+#[test]
+fn reowned_tunnel_id_is_deferred_then_installed() {
+    let prev = build_forwarding_state(&two_tunnel_snapshot());
+
+    // Same snapshot, id 824 re-owned by a different logical name.
+    let mut snap_reused = two_tunnel_snapshot();
+    snap_reused.tunnel_endpoints[0].interface = "gr-9/9/9.0".into();
+    let deferred_state = build_forwarding_state_with_policy_counters_and_previous(
+        &snap_reused,
+        &PolicyCounterStore::default(),
+        Some(&prev),
+    )
+    .unwrap();
+    assert!(
+        !deferred_state.tunnel_endpoints.contains_key(&824),
+        "re-owned id must be DEFERRED out of the first build"
+    );
+    assert_eq!(deferred_state.deferred_reowned_tunnel_ids, vec![824]);
+    // The unrelated WG endpoint is untouched by the defer.
+    assert!(deferred_state.tunnel_endpoints.contains_key(&7));
+
+    // Follow-up rebuild (previous = the deferred state, id absent
+    // there) installs the new owner.
+    let full = build_forwarding_state_with_policy_counters_and_previous(
+        &snap_reused,
+        &PolicyCounterStore::default(),
+        Some(&deferred_state),
+    )
+    .unwrap();
+    assert!(full.deferred_reowned_tunnel_ids.is_empty());
+    let ep = full.tunnel_endpoints.get(&824).expect("new owner installed");
+    assert_eq!(ep.interface, "gr-9/9/9.0");
+
+    // Control cases: identical set and plain removal never defer.
+    let same = build_forwarding_state_with_policy_counters_and_previous(
+        &two_tunnel_snapshot(),
+        &PolicyCounterStore::default(),
+        Some(&prev),
+    )
+    .unwrap();
+    assert!(same.deferred_reowned_tunnel_ids.is_empty());
+    assert!(same.tunnel_endpoints.contains_key(&824));
+}

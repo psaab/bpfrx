@@ -1030,8 +1030,17 @@ impl Coordinator {
         // with the Go publish-boundary log to pin which layer dropped
         // or retained an endpoint in one journal capture.
         log_wg_endpoint_set_transition("snapshot-refresh", &self.forwarding, &new_forwarding);
-        // #1873 R-D: compute the remap purge set BEFORE the swap.
+        // #1873 R-D: compute the remap purge set BEFORE the swap, and
+        // PURGE before any store (Codex code-review r1). The worker
+        // loop reads the forwarding Arc, drains commands, THEN runs the
+        // RX sweep — so a worker that observes the new state in
+        // iteration N drains these DeleteSynced commands in the same
+        // iteration before processing a single packet with it.
         let tunnel_purge_ids = tunnel_remap_purge_ids(&self.forwarding, &new_forwarding);
+        self.purge_remapped_tunnel_sessions(&tunnel_purge_ids);
+        // Rotation-barrier handle for the deferred-id pass below: the
+        // Arc workers currently hold.
+        let prev_shared_forwarding = self.ha.forwarding.load_full();
         self.forwarding = new_forwarding;
         if self.forwarding.fabrics.is_empty() && !preserved_fabrics.is_empty() {
             self.forwarding.fabrics = preserved_fabrics;
@@ -1051,12 +1060,56 @@ impl Coordinator {
         }
         self.shared_validation.store(Arc::new(self.validation));
         self.ha.forwarding.store(Arc::new(self.forwarding.clone()));
-        // #1873 R-D: purge sessions whose stored tunnel id was remapped
-        // by this apply (absent, or owner name changed). Runs on the
-        // refresh path too — tunnel ifaces are excluded from the
-        // binding-plan key, so tunnel config commits land HERE, not in
-        // the full reconcile.
-        self.purge_remapped_tunnel_sessions(&tunnel_purge_ids);
+        // #1873 R-D deferred-id pass (Codex code-review r1): if any id
+        // was re-owned in this apply, its row was DEFERRED out of the
+        // published state (stale ids resolve NoRoute -> R-C drop, never
+        // the new owner). Install the new owner only after (a) every
+        // worker has rotated onto the deferred state — old-state
+        // workers could still CREATE old-owner sessions — and (b) a
+        // second purge has removed anything created in the window.
+        // The barrier is the old shared Arc's strong count: workers
+        // re-load per tick and drop their clone; 250 ms cap so a
+        // wedged external holder cannot stall the control thread (a
+        // worker that is not rotating is not forwarding either).
+        if !self.forwarding.deferred_reowned_tunnel_ids.is_empty() {
+            let deferred = self.forwarding.deferred_reowned_tunnel_ids.clone();
+            let weak_prev = Arc::downgrade(&prev_shared_forwarding);
+            drop(prev_shared_forwarding);
+            let barrier_start = std::time::Instant::now();
+            while weak_prev.upgrade().is_some()
+                && barrier_start.elapsed() < std::time::Duration::from_millis(250)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            if weak_prev.upgrade().is_some() {
+                eprintln!(
+                    "xpf-userspace-dp: tunnel remap rotation barrier timed out after 250ms — proceeding (#1873)"
+                );
+            }
+            self.purge_remapped_tunnel_sessions(&deferred);
+            match build_forwarding_state_with_policy_counters_and_previous(
+                snapshot,
+                &self.policy_counters,
+                Some(&self.forwarding),
+            ) {
+                Ok(mut full) => {
+                    full.fabrics = self.forwarding.fabrics.clone();
+                    self.forwarding = full;
+                    self.ha.forwarding.store(Arc::new(self.forwarding.clone()));
+                    eprintln!(
+                        "xpf-userspace-dp: installed re-owned tunnel endpoint id(s) {:?} after remap purge (#1873)",
+                        deferred
+                    );
+                }
+                Err(err) => {
+                    eprintln!(
+                        "xpf-userspace-dp: deferred tunnel endpoint rebuild failed: {err} — keeping deferred state (heals on next apply)"
+                    );
+                }
+            }
+        } else {
+            drop(prev_shared_forwarding);
+        }
         // #1432 S2a (Copilot C1): reconcile WG control threads on every
         // runtime-snapshot refresh, not just initial bring-up, so a
         // same-plan apply that adds/removes/changes a WG endpoint starts,

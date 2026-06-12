@@ -12,6 +12,17 @@ use super::*;
 
 #[derive(Clone, Debug, Default)]
 pub(in crate::afxdp) struct ForwardingState {
+    /// #1873 R-D (Codex code-review r1): tunnel-endpoint ids whose row
+    /// was DEFERRED by `populate_tunnel_endpoints` because the previous
+    /// state owned the same id under a DIFFERENT logical name (temporal
+    /// hash reuse in a single apply). While a deferred id is absent,
+    /// stale sessions holding it resolve NoRoute and drop at the R-C
+    /// gate instead of mis-encapsulating into the new owner. The
+    /// coordinator purges, waits for every worker to rotate onto this
+    /// state, purges again, then rebuilds (with this state as
+    /// `previous`) so the new owner's row installs only after no
+    /// old-owner session can exist.
+    pub(in crate::afxdp) deferred_reowned_tunnel_ids: Vec<u16>,
     pub(in crate::afxdp) local_v4: FastSet<Ipv4Addr>,
     pub(in crate::afxdp) local_v6: FastSet<Ipv6Addr>,
     pub(in crate::afxdp) interface_nat_v4: FastMap<Ipv4Addr, i32>,
