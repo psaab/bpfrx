@@ -5727,6 +5727,52 @@ fn assert_gre_to_self_delivers_inner_exactly_once(vlan_id: u16) {
     );
 }
 
+/// #1885 session-HIT pin: the live keepalive/echo-reply stream rides
+/// an EXISTING session (the first packet installs it), so the
+/// session-hit leg must ALSO deliver the decapped inner packet
+/// exactly once. Runs the same tagged GRE-to-self frame twice through
+/// one (binding, sessions) pair and asserts both deliveries.
+#[test]
+fn gre_to_self_session_hit_delivery_is_inner_packet_exactly_once() {
+    let forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 11, 0);
+    binding.interface = Arc::<str>::from("ge-0-0-0");
+    let mut sessions = SessionTable::new();
+
+    let inner = build_gre_inner_icmp_packet_v4();
+    let frame = build_gre_to_self_outer_frame_v4(80, &inner);
+
+    let (tx, rx) = mpsc::sync_channel(8);
+    let mut deliveries = BTreeMap::new();
+    deliveries.insert(77, tx);
+    let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(deliveries));
+
+    for pass in ["session-miss", "session-hit"] {
+        let meta = gre_to_self_outer_meta(80, frame.len());
+        txn_run_descriptor_with_deliveries(
+            &mut binding,
+            &mut sessions,
+            &forwarding,
+            &ha_state,
+            &frame,
+            meta,
+            &local_tunnel_deliveries,
+        );
+        let delivered = rx.try_recv().unwrap_or_else(|_| {
+            panic!("{pass} pass must deliver the inner packet to the gr- channel")
+        });
+        assert_eq!(
+            delivered, inner,
+            "{pass} pass delivery must be the decapped INNER packet byte-identical"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "{pass} pass must deliver exactly once"
+        );
+    }
+}
+
 /// #1885: VLAN-tagged underlay (the live reth0.80 topology). Pre-fix
 /// the LocalDelivery arm sliced the ORIGINAL tagged outer frame at the
 /// post-decap inner meta's l3_offset (14) — the payload started with
