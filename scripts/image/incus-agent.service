@@ -1,0 +1,28 @@
+# Incus guest agent loader for the xpf appliance image (#1879).
+#
+# Mirrors the loader that incus's own images ship (incus agent-loader
+# templates; see https://linuxcontainers.org/incus/docs/ "Install the
+# Incus agent"): the agent BINARY is never baked into the image — incus
+# exposes it to the guest at runtime on a 9p/virtiofs share tagged
+# `config`, and this unit copies and runs it. ConditionPathExists on
+# the incus virtio-serial port makes the unit completely inert when the
+# image boots under libvirt/QEMU or any non-incus hypervisor.
+[Unit]
+Description=Incus - agent
+Documentation=https://linuxcontainers.org/incus/docs/main/
+ConditionPathExists=/dev/virtio-ports/org.linuxcontainers.incus
+Before=multi-user.target
+DefaultDependencies=no
+StartLimitInterval=60
+StartLimitBurst=10
+
+[Service]
+Type=notify
+WorkingDirectory=-/run/incus_agent
+ExecStartPre=/usr/local/sbin/incus-agent-setup
+ExecStart=/run/incus_agent/incus-agent
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

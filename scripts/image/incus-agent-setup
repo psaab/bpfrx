@@ -1,0 +1,45 @@
+#!/bin/sh
+# Incus guest agent setup for the xpf appliance image (#1879).
+#
+# Adapted from the loader script incus ships in its own VM images
+# (agent-loader template): mounts the runtime `config` share incus
+# provides (virtiofs, falling back to 9p), copies the agent binary to
+# /run/incus_agent, and lets incus-agent.service run it. Only ever
+# invoked under incus — the unit is gated on the incus virtio-serial
+# port existing.
+set -eu
+PREFIX="/run/incus_agent"
+
+mount_virtiofs() {
+	mount -t virtiofs config "${PREFIX}/.mnt" >/dev/null 2>&1
+}
+
+mount_9p() {
+	modprobe 9pnet_virtio >/dev/null 2>&1 || true
+	mount -t 9p config "${PREFIX}/.mnt" -o access=0,trans=virtio,size=1048576 >/dev/null 2>&1
+}
+
+fail() {
+	umount -l "${PREFIX}" >/dev/null 2>&1 || true
+	rmdir "${PREFIX}" >/dev/null 2>&1 || true
+	echo "${1}"
+	exit 1
+}
+
+# Setup the mount target.
+umount -l "${PREFIX}" >/dev/null 2>&1 || true
+mkdir -p "${PREFIX}" "${PREFIX}/.mnt"
+
+# Try virtiofs first, then 9p.
+mount_virtiofs || mount_9p || fail "couldn't mount the incus config share (virtiofs or 9p)"
+
+# Copy the agent data.
+cp -Ra "${PREFIX}/.mnt/"* "${PREFIX}"
+
+# Unmount the temporary mount.
+umount "${PREFIX}/.mnt"
+rmdir "${PREFIX}/.mnt"
+
+# Fix up permissions.
+chmod 0700 "${PREFIX}"
+exit 0
