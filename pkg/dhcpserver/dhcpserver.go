@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/fsatomic"
 )
 
 // systemctlTimeout bounds every systemctl shell-out. Apply/Clear run on
@@ -655,5 +656,7 @@ func (m *Manager) writeKeaConfig(path string, keaCfg map[string]any) error {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("create %s: %w", dir, err)
 	}
-	return os.WriteFile(path, data, 0644)
+	// AtomicGeneratedConfig (#1894): regenerated on apply; Kea must
+	// never parse a torn file, but the apply path pays no fsync.
+	return fsatomic.WriteFileAtomic(path, data, 0644)
 }

@@ -8,7 +8,6 @@ import (
 
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
-	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/dataplane"
 	"github.com/psaab/xpf/pkg/networkd"
 	"github.com/psaab/xpf/pkg/vrrp"
@@ -34,7 +33,7 @@ func TestApplyConfigRuntimeResultDrivesDownstreamConsumers(t *testing.T) {
 		dp:          dp,
 		networkd:    networkd.NewInDir(networkDir),
 		sessionSync: ss,
-		store:       configstore.New(filepath.Join(t.TempDir(), "config.db")),
+		store:       newConfigStore(t, filepath.Join(t.TempDir(), "config.db")),
 		vrrpMgr:     vrrp.NewManager(),
 		opts:        Options{NoDataplane: true},
 	}

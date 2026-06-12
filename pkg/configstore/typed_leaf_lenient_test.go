@@ -24,7 +24,7 @@ import (
 // pre-gate binary.
 func writeStoredConfig(t *testing.T, cfgPath string, lines ...string) {
 	t.Helper()
-	writer := New(cfgPath)
+	writer := newTestStoreAt(t, cfgPath)
 	tree := &config.ConfigTree{}
 	for _, line := range lines {
 		path, err := config.ParseSetCommand(line)
@@ -48,7 +48,7 @@ func TestLoad_ToleratesStoredGarbageTypedLeaf(t *testing.T) {
 	writeStoredConfig(t, cfgPath,
 		"set class-of-service schedulers be transmit-rate asd")
 
-	s := New(cfgPath)
+	s := newTestStoreAt(t, cfgPath)
 	if err := s.Load(); err != nil {
 		t.Fatalf("Load() must tolerate stored typed-leaf garbage, got: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestLoad_ToleratesStoredGarbageTypedLeaf(t *testing.T) {
 // HA config sync from a primary carrying a typed-leaf violation must not
 // alarm-loop the standby: SyncApply uses the same lenient path as Load.
 func TestSyncApply_ToleratesTypedLeafViolation(t *testing.T) {
-	s := New(filepath.Join(t.TempDir(), "config"))
+	s := newTestStoreAt(t, filepath.Join(t.TempDir(), "config"))
 	cfg, err := s.SyncApply(`class-of-service {
     schedulers {
         be {
@@ -101,7 +101,7 @@ func TestLoad_ToleratesStoredOutOfRangeChassisLeaf(t *testing.T) {
 		"set chassis cluster cluster-id 999",
 		"set chassis cluster heartbeat-interval 200")
 
-	s := New(cfgPath)
+	s := newTestStoreAt(t, cfgPath)
 	if err := s.Load(); err != nil {
 		t.Fatalf("Load() must tolerate stored out-of-range cluster-id, got: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestLoad_ToleratesStoredOutOfRangeChassisLeaf(t *testing.T) {
 // Strict-path e2e for a chassis typed leaf: CommitCheck and Commit reject
 // an out-of-range value entered by the operator.
 func TestCommitCheck_RejectsOutOfRangeChassisLeaf(t *testing.T) {
-	s := New(filepath.Join(t.TempDir(), "config"))
+	s := newTestStoreAt(t, filepath.Join(t.TempDir(), "config"))
 	if err := s.EnterConfigure(); err != nil {
 		t.Fatalf("EnterConfigure: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestLoad_ToleratesStoredUnknownPollMode(t *testing.T) {
 	writeStoredConfig(t, cfgPath,
 		"set system dataplane poll-mode polling")
 
-	s := New(cfgPath)
+	s := newTestStoreAt(t, cfgPath)
 	if err := s.Load(); err != nil {
 		t.Fatalf("Load() must tolerate a stored unknown poll-mode, got: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestLoad_ToleratesStoredUnknownPollMode(t *testing.T) {
 // the same dangling reference WARN-boots through the tolerant paths.
 
 func TestCommitCheck_RejectsDanglingForwardingClass(t *testing.T) {
-	s := New(filepath.Join(t.TempDir(), "config"))
+	s := newTestStoreAt(t, filepath.Join(t.TempDir(), "config"))
 	if err := s.EnterConfigure(); err != nil {
 		t.Fatalf("EnterConfigure: %v", err)
 	}
@@ -209,7 +209,7 @@ func TestCommitCheck_RejectsDanglingForwardingClass(t *testing.T) {
 // commit and must validate against each other — the tree-based refs are
 // collected from the candidate tree itself, never from compiled state.
 func TestCommitCheck_AcceptsSameCommitForwardingClass(t *testing.T) {
-	s := New(filepath.Join(t.TempDir(), "config"))
+	s := newTestStoreAt(t, filepath.Join(t.TempDir(), "config"))
 	if err := s.EnterConfigure(); err != nil {
 		t.Fatalf("EnterConfigure: %v", err)
 	}
@@ -240,7 +240,7 @@ func TestCommitCheck_AcceptsGroupDefinedForwardingClass(t *testing.T) {
 		`set apply-groups "${node}"`,
 		"set firewall family inet filter f1 term t1 then forwarding-class iperf-video")
 
-	s := New(cfgPath)
+	s := newTestStoreAt(t, cfgPath)
 	s.SetNodeID(0)
 	if err := s.Load(); err != nil {
 		t.Fatalf("Load: %v", err)
@@ -268,7 +268,7 @@ func TestCommitCheck_AcceptsPeerNodeGroupForwardingClass(t *testing.T) {
 		`set apply-groups "${node}"`,
 		"set firewall family inet filter f1 term t1 then forwarding-class iperf-video")
 
-	s := New(cfgPath)
+	s := newTestStoreAt(t, cfgPath)
 	s.SetNodeID(0) // node1's group is NOT applied here
 	if err := s.Load(); err != nil {
 		t.Fatalf("Load: %v", err)
@@ -288,7 +288,7 @@ func TestLoad_ToleratesStoredDanglingForwardingClass(t *testing.T) {
 	writeStoredConfig(t, cfgPath,
 		"set firewall family inet filter f1 term t1 then forwarding-class no-such-class")
 
-	s := New(cfgPath)
+	s := newTestStoreAt(t, cfgPath)
 	if err := s.Load(); err != nil {
 		t.Fatalf("Load() must tolerate a stored dangling forwarding-class, got: %v", err)
 	}
@@ -315,7 +315,7 @@ func TestLoad_ToleratesStoredDanglingForwardingClass(t *testing.T) {
 
 // HA config sync carrying the dangling reference must not alarm-loop.
 func TestSyncApply_ToleratesDanglingForwardingClass(t *testing.T) {
-	s := New(filepath.Join(t.TempDir(), "config"))
+	s := newTestStoreAt(t, filepath.Join(t.TempDir(), "config"))
 	cfg, err := s.SyncApply(`firewall {
     family inet {
         filter f1 {
@@ -345,7 +345,7 @@ func TestLoad_ToleratesStoredBareInterfaceAddress(t *testing.T) {
 		"set interfaces ge-0-0-0 unit 0 family inet address 10.0.1.10",
 		"set interfaces ge-0-0-0 mtu 1500")
 
-	s := New(cfgPath)
+	s := newTestStoreAt(t, cfgPath)
 	if err := s.Load(); err != nil {
 		t.Fatalf("Load() must tolerate a stored bare interface address, got: %v", err)
 	}

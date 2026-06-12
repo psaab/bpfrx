@@ -38,13 +38,13 @@ func TestLoadBootsAndSanitizesPersistedNewlineDescription(t *testing.T) {
 	// Persist a bad tree directly (bypassing commit, as a pre-gate
 	// daemon would have): the DB stores the tree as JSON, so the real
 	// newline round-trips exactly.
-	s1 := New(path)
+	s1 := newTestStoreAt(t, path)
 	if err := s1.db.WriteActive(newlinePersistedTree(t)); err != nil {
 		t.Fatalf("WriteActive: %v", err)
 	}
 
 	// Gate (a): the box must boot.
-	s2 := New(path)
+	s2 := newTestStoreAt(t, path)
 	if err := s2.Load(); err != nil {
 		t.Fatalf("Load must boot on a persisted control-char config: %v", err)
 	}

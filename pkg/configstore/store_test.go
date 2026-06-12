@@ -10,12 +10,21 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 )
 
+// newTestStoreAt constructs a Store at path, failing the test when the
+// fail-closed constructor (#1893) reports an unusable config db.
+func newTestStoreAt(t *testing.T, path string) *Store {
+	t.Helper()
+	s, err := New(path)
+	if err != nil {
+		t.Fatalf("New(%s): %v", path, err)
+	}
+	return s
+}
+
 // newTestStore creates a Store backed by a temp file for testing.
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config")
-	return New(path)
+	return newTestStoreAt(t, filepath.Join(t.TempDir(), "config"))
 }
 
 // #1319: end-to-end gate — CommitCheck/Commit must reject typed-leaf
@@ -531,7 +540,7 @@ func TestLoadAndSave(t *testing.T) {
 	path := filepath.Join(dir, "config")
 
 	// Create and save config
-	s1 := New(path)
+	s1 := newTestStoreAt(t, path)
 	if err := s1.EnterConfigure(); err != nil {
 		t.Fatal(err)
 	}
@@ -542,7 +551,7 @@ func TestLoadAndSave(t *testing.T) {
 	}
 
 	// Load in a new store
-	s2 := New(path)
+	s2 := newTestStoreAt(t, path)
 	if err := s2.Load(); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -561,7 +570,7 @@ func TestLoadNonexistent(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "nonexistent")
 
-	s := New(path)
+	s := newTestStoreAt(t, path)
 	if err := s.Load(); err != nil {
 		t.Fatalf("Load should not error on non-existent file: %v", err)
 	}
@@ -571,7 +580,7 @@ func TestRollbackFilesPersistence(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config")
 
-	s := New(path)
+	s := newTestStoreAt(t, path)
 	if err := s.EnterConfigure(); err != nil {
 		t.Fatal(err)
 	}
@@ -595,7 +604,7 @@ func TestRollbackFilesPersistence(t *testing.T) {
 	}
 
 	// Load in new store and check history
-	s2 := New(path)
+	s2 := newTestStoreAt(t, path)
 	if err := s2.Load(); err != nil {
 		t.Fatal(err)
 	}
@@ -1530,7 +1539,7 @@ func TestLoad_PersistedDPDKDataplaneTypeRewrittenByLoad(t *testing.T) {
 
 	// Write a tree containing dataplane-type dpdk directly via
 	// the db API (commit path would reject it).
-	writer := New(cfgPath)
+	writer := newTestStoreAt(t, cfgPath)
 	tree := &config.ConfigTree{}
 	path, err := config.ParseSetCommand("set system dataplane-type dpdk")
 	if err != nil {
@@ -1547,7 +1556,7 @@ func TestLoad_PersistedDPDKDataplaneTypeRewrittenByLoad(t *testing.T) {
 	// because rewriteRetiredDataplaneType strips the dpdk leaf to
 	// empty before compile (#1558 / #1525). ActiveConfig must be
 	// non-nil with DataplaneType empty (defaults to userspace).
-	reader := New(cfgPath)
+	reader := newTestStoreAt(t, cfgPath)
 	if err := reader.Load(); err != nil {
 		t.Fatalf("Load() rejected persisted dpdk dataplane-type: %v", err)
 	}
@@ -1579,7 +1588,7 @@ func TestLoad_PersistedDPDKDataplaneTypeWithSubStanzaRewrittenByLoad(t *testing.
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config")
 
-	writer := New(cfgPath)
+	writer := newTestStoreAt(t, cfgPath)
 	tree := &config.ConfigTree{}
 	for _, line := range []string{
 		"set system dataplane-type dpdk",
@@ -1607,7 +1616,7 @@ func TestLoad_PersistedDPDKDataplaneTypeWithSubStanzaRewrittenByLoad(t *testing.
 		t.Fatalf("db.WriteActive: %v", err)
 	}
 
-	reader := New(cfgPath)
+	reader := newTestStoreAt(t, cfgPath)
 	if err := reader.Load(); err != nil {
 		t.Fatalf("Load() rejected persisted full DPDK sub-stanza: %v", err)
 	}

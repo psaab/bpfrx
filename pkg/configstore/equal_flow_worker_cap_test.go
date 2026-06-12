@@ -45,7 +45,7 @@ func TestStoreLoad_AcceptsEqualFlowAboveLegacyWorkerCap(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	store := New(filepath.Join(dir, "xpf.conf"))
+	store := newTestStoreAt(t, filepath.Join(dir, "xpf.conf"))
 
 	tree := mustParseTree(t, equalFlowManyWorkerSets()...)
 	if err := store.db.WriteActive(tree); err != nil {
@@ -74,7 +74,7 @@ func TestStoreSyncApply_AcceptsEqualFlowAboveLegacyWorkerCap(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	store := New(filepath.Join(dir, "xpf.conf"))
+	store := newTestStoreAt(t, filepath.Join(dir, "xpf.conf"))
 
 	content := mustParseTree(t, equalFlowManyWorkerSets()...).Format()
 

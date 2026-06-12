@@ -2,7 +2,9 @@
 
 Manages Kea DHCPv4/v6 server config and lifecycle. Generates
 `/etc/kea/kea-dhcp{4,6}.conf` from the typed config and reloads the
-`kea-dhcp{4,6}-server` units via systemd.
+`kea-dhcp{4,6}-server` units via systemd. Config writes are
+AtomicGeneratedConfig (#1894): `fsatomic.WriteFileAtomic` — Kea never
+parses a torn file, no fsync on the apply path.
 
 ## Entry points
 

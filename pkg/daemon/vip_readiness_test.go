@@ -256,7 +256,7 @@ func TestCheckNoRethTakeoverReadiness_UsesVIPReadinessOnly(t *testing.T) {
 func testStoreWithSetConfig(t *testing.T, lines []string) *configstore.Store {
 	t.Helper()
 
-	store := configstore.New(filepath.Join(t.TempDir(), "config"))
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "config"))
 	if err := store.EnterConfigure(); err != nil {
 		t.Fatalf("EnterConfigure: %v", err)
 	}

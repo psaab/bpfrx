@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/fsatomic"
 )
 
 // swanctlTimeout bounds every swanctl shell-out. reload() runs on the
@@ -75,7 +76,10 @@ func (m *Manager) Apply(ipsecCfg *config.IPsecConfig) error {
 		return fmt.Errorf("create config dir: %w", err)
 	}
 
-	if err := os.WriteFile(m.configPath, []byte(cfg), 0600); err != nil {
+	// AtomicGeneratedConfig (#1894): regenerated on every apply — a
+	// torn file must never reach the strongSwan parser, but fsync is
+	// deliberately skipped on this hot apply path.
+	if err := fsatomic.WriteFileAtomic(m.configPath, []byte(cfg), 0600); err != nil {
 		return fmt.Errorf("write config: %w", err)
 	}
 

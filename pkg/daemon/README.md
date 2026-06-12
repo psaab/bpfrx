@@ -35,7 +35,9 @@ the primary compile/apply gate.
 - `Daemon` — `daemon.go`.
 - `Options` — `daemon.go`. `ConfigPath`, `NoDataplane`, `APIAddr`,
   `GRPCAddr`, `Version`.
-- `New(opts Options) *Daemon` — `daemon.go`.
+- `New(opts Options) (*Daemon, error)` — `daemon.go`. Fails when the
+  config store cannot be constructed (#1893 fail-closed: unusable
+  `.configdb` means no boot, not a delayed nil-deref panic).
 - `CompileHealth` — `daemon.go`. Snapshot of the most recent compile
   outcome; `pkg/api` consumes it for the `/health` endpoint.
 

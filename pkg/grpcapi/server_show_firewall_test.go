@@ -24,7 +24,7 @@ func (f *firewallFilterShowUserspaceDP) Status() (dpuserspace.ProcessStatus, err
 func newFirewallFilterShowStore(t *testing.T) *configstore.Store {
 	t.Helper()
 
-	store := configstore.New(filepath.Join(t.TempDir(), "xpf.conf"))
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
 	if err := store.EnterConfigure(); err != nil {
 		t.Fatalf("EnterConfigure() error = %v", err)
 	}

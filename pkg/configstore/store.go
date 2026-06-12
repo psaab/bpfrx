@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/fsatomic"
 )
 
 // Store manages the candidate and active configuration.
@@ -86,12 +87,17 @@ type Store struct {
 	archiveMax int    // max archives to keep
 }
 
-// New creates a new config store.
-func New(filePath string) *Store {
+// New creates a new config store. It fails closed when the .configdb
+// directory cannot be created (#1893): there is no file-only fallback
+// backend — every persistence path (Load, writeActive, the #1799
+// persist-retry goroutine) dereferences the DB, so constructing a Store
+// without one would trade this precise boot-time error for a delayed
+// nil-pointer panic on the first Load/Save/commit.
+func New(filePath string) (*Store, error) {
 	dbDir := filepath.Join(filepath.Dir(filePath), ".configdb")
 	db, err := NewDB(dbDir)
 	if err != nil {
-		slog.Warn("failed to create config db, falling back to file-only", "err", err)
+		return nil, fmt.Errorf("config db %s unusable: %w (no file-only fallback exists; refusing to run without config persistence)", dbDir, err)
 	}
 
 	journalPath := filepath.Join(filepath.Dir(filePath), ".config.journal")
@@ -103,7 +109,7 @@ func New(filePath string) *Store {
 		db:       db,
 		journal:  NewJournal(journalPath),
 		nodeID:   -1,
-	}
+	}, nil
 }
 
 // Load builds the configuration from disk.
@@ -164,8 +170,8 @@ func (s *Store) Save() error {
 
 // writeActive persists tree as the on-disk active configuration.
 // Routes through the writeActiveFn test seam when set (#1799);
-// otherwise uses the DB's temp-file + rename atomic write. Caller
-// must hold s.mu (read or write lock).
+// otherwise uses the DB's durable temp + fsync + rename + dir-fsync
+// write (#1894). Caller must hold s.mu (read or write lock).
 func (s *Store) writeActive(tree *config.ConfigTree) error {
 	if s.writeActiveFn != nil {
 		return s.writeActiveFn(tree)
@@ -1327,6 +1333,16 @@ func (s *Store) rollbackPath(n int) string {
 
 // saveRollbackFiles writes rollback history entries to numbered files.
 // Must be called under write lock.
+//
+// Durability split (#1894, adjudicated in the plan round): these files
+// are the CANONICAL rollback history (loadRollbackHistory reads them at
+// boot; the DB rollback slots have no production callers). Slot 1 — the
+// immediate `rollback 1` target — is written durably; slots 2..N use
+// the atomic writer (never missing, never torn, so loadRollbackHistory's
+// break-on-first-missing stays sound; they may lag behind after a power
+// cut). One trailing SyncDir then makes the whole shuffle AND the
+// stale-slot unlinks durable for the cost of a single dir fsync,
+// instead of ~50 file+dir fsync pairs under the store mutex.
 func (s *Store) saveRollbackFiles() {
 	if s.filePath == "" {
 		return
@@ -1336,11 +1352,22 @@ func (s *Store) saveRollbackFiles() {
 	for i, entry := range entries {
 		path := s.rollbackPath(i + 1)
 		data := entry.Config.Format()
-		if err := os.WriteFile(path, []byte(data), 0644); err != nil {
+		var err error
+		if i == 0 {
+			err = fsatomic.WriteFileDurable(path, []byte(data), 0644)
+		} else {
+			err = fsatomic.WriteFileAtomic(path, []byte(data), 0644)
+		}
+		if err != nil {
 			slog.Warn("failed to write rollback file", "path", path, "err", err)
 		}
 	}
 	s.cleanupRollbackFiles(len(entries) + 1)
+	if len(entries) > 0 {
+		if err := fsatomic.SyncDir(filepath.Dir(s.filePath)); err != nil {
+			slog.Warn("failed to sync rollback directory", "err", err)
+		}
+	}
 }
 
 // cleanupRollbackFiles removes stale rollback files starting at startN.
@@ -1616,7 +1643,10 @@ func (s *Store) ArchiveConfig(archiveDir string, maxArchives int) error {
 
 	filename := fmt.Sprintf("config-%s.conf", time.Now().Format("20060102-150405"))
 	path := filepath.Join(archiveDir, filename)
-	if err := os.WriteFile(path, []byte(data), 0644); err != nil {
+	// AtomicGeneratedConfig (#1894): archives are best-effort history
+	// copies — atomic so a crash never leaves a torn archive, but not
+	// worth an fsync.
+	if err := fsatomic.WriteFileAtomic(path, []byte(data), 0644); err != nil {
 		return fmt.Errorf("write archive: %w", err)
 	}
 
@@ -1671,7 +1701,9 @@ func (s *Store) SaveRescueConfig() error {
 	s.mu.RUnlock()
 
 	path := s.rescuePath()
-	if err := os.WriteFile(path, []byte(data), 0644); err != nil {
+	// DurableState (#1894): the rescue config is the operator's
+	// explicitly-requested safety net — it must survive power loss.
+	if err := fsatomic.WriteFileDurable(path, []byte(data), 0644); err != nil {
 		return fmt.Errorf("save rescue config: %w", err)
 	}
 	slog.Info("rescue configuration saved", "path", path)

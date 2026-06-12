@@ -4,8 +4,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/psaab/xpf/pkg/configstore"
 )
 
 // #1319 PR 1 — frontend-boundary tests for typed-leaf value completion.
@@ -20,7 +18,7 @@ import (
 
 func newTypedLeafCLI(t *testing.T) *CLI {
 	t.Helper()
-	store := configstore.New(filepath.Join(t.TempDir(), "xpf.conf"))
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
 	if err := store.EnterConfigure(); err != nil {
 		t.Fatalf("EnterConfigure() error = %v", err)
 	}

@@ -9,6 +9,13 @@ This package is the only place in the codebase that's allowed to touch
 kernel routes — and it doesn't, directly. It writes config and reloads
 FRR, which then owns the kernel route table.
 
+`frr.conf` is DurableState (#1894): `atomicWriteFile` delegates to
+`fsatomic.WriteFileDurable` with `WithPreserveExisting` +
+`WithResolveSymlinks` (the #1883 mode/owner/symlink semantics were
+lifted into that package), gaining the parent-dir fsync the local
+writer lacked. The file carries operator content outside the managed
+section, so it must survive power loss.
+
 ## File layout
 
 The package is split across five sibling `.go` files (no sub-packages,

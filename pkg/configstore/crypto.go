@@ -18,6 +18,7 @@ import (
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/fsatomic"
 )
 
 const encryptedTreeFormat = "xpf-master-password-v1"
@@ -239,12 +240,12 @@ func (db *DB) readOrCreateMasterKey() ([]byte, error) {
 		return nil, fmt.Errorf("generate master key: %w", err)
 	}
 
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, key, 0600); err != nil {
-		return nil, fmt.Errorf("write master key: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
+	// DurableState (#1894): a master.key lost to a power cut after the
+	// first encrypted active-config write makes that config permanently
+	// undecryptable — the key must hit stable storage before any tree
+	// encrypted with it does (readOrCreateMasterKey runs inside the
+	// encrypt step of writeTree, so this ordering is structural).
+	if err := fsatomic.WriteFileDurable(path, key, 0600); err != nil {
 		return nil, fmt.Errorf("persist master key: %w", err)
 	}
 	return key, nil
