@@ -16,6 +16,78 @@ fn local_tunnel_io_error_is_fatal(err: &io::Error) -> bool {
     )
 }
 
+/// #1881: fatal-errno predicate for TUN delivery WRITES. Differs from
+/// the read predicate in exactly one errno: `EINVAL` on a TUN write
+/// means the kernel rejected THAT PACKET (malformed/mis-sliced inner
+/// — e.g. the off-by-VLAN local-delivery extraction observed live on
+/// the loss cluster), a per-packet condition. Treating it as fatal
+/// let ONE bad delivery kill the local-origin thread — permanently on
+/// pre-#1881 master (no respawn), and as a 15s tombstone/respawn churn
+/// loop with the #1881 liveness (every peer keepalive reply re-killed
+/// the fresh thread). On READS, `EINVAL` remains fatal (fd/iface-level
+/// condition). `EBADF`/`EBADFD`/`ENODEV`/`ENXIO` stay fatal in both
+/// directions — the fd is genuinely dead (anchor deleted/recreated).
+fn local_tunnel_write_error_is_fatal(err: &io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(code)
+            if code == libc::EBADF
+                || code == libc::EBADFD
+                || code == libc::ENODEV
+                || code == libc::ENXIO
+    )
+}
+
+pub(super) enum LocalTunnelDrainOutcome {
+    /// `stop` observed — the loop must return so the coordinator's
+    /// join is bounded even under a busy delivery producer (#1881,
+    /// Codex plan r1 MAJOR 2: the pre-#1881 drain ran to
+    /// `Empty`/`Disconnected` only, and the queue is deep enough for
+    /// a producer to keep it non-empty indefinitely).
+    Stopped,
+    /// Fatal TUN write errno — the loop must exit (finished sweep
+    /// tombstones the entry; liveness respawns it with a fresh fd).
+    FatalIo,
+    /// Queue drained (or one non-fatal write error) — proceed to the
+    /// TUN read.
+    Drained,
+}
+
+/// #1881: one bounded delivery-drain chunk, extracted from
+/// `local_tunnel_source_loop` so the stop-latency contract is unit
+/// testable (plan §9 test 4).
+pub(super) fn drain_local_tunnel_deliveries(
+    tun: &mut impl Write,
+    delivery_rx: &Receiver<Vec<u8>>,
+    stop: &AtomicBool,
+    tunnel_name: &str,
+    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+) -> LocalTunnelDrainOutcome {
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return LocalTunnelDrainOutcome::Stopped;
+        }
+        match delivery_rx.try_recv() {
+            Ok(packet) => {
+                if let Err(err) = tun.write_all(&packet) {
+                    record_local_tunnel_exception(
+                        recent_exceptions,
+                        tunnel_name,
+                        format!("write_local_tunnel_delivery:{err}"),
+                    );
+                    if local_tunnel_write_error_is_fatal(&err) {
+                        return LocalTunnelDrainOutcome::FatalIo;
+                    }
+                    return LocalTunnelDrainOutcome::Drained;
+                }
+            }
+            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => {
+                return LocalTunnelDrainOutcome::Drained;
+            }
+        }
+    }
+}
+
 /// #1881 D.1b: whether the loaded forwarding state still describes
 /// the tunnel this thread is attached to. The TUN fd is bound to the
 /// netdev captured at spawn — if the endpoint is gone, no longer a
@@ -114,31 +186,15 @@ pub(super) fn local_tunnel_source_loop(
         // not claimed — they are published independently by design,
         // matching the worker path.
         let ha_runtime = ha_state.load();
-        loop {
-            // #1881 (Codex plan r1 MAJOR 2): observe `stop` inside the
-            // delivery drain so a producer that keeps the queue
-            // non-empty cannot extend the coordinator's stop+join
-            // beyond one bounded chunk.
-            if stop.load(Ordering::Relaxed) {
-                return;
-            }
-            match delivery_rx.try_recv() {
-                Ok(packet) => {
-                    if let Err(err) = tun.write_all(&packet) {
-                        record_local_tunnel_exception(
-                            &recent_exceptions,
-                            &tunnel_name,
-                            format!("write_local_tunnel_delivery:{err}"),
-                        );
-                        if local_tunnel_io_error_is_fatal(&err) {
-                            return;
-                        }
-                        break;
-                    }
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => break,
-            }
+        match drain_local_tunnel_deliveries(
+            &mut tun,
+            &delivery_rx,
+            &stop,
+            &tunnel_name,
+            &recent_exceptions,
+        ) {
+            LocalTunnelDrainOutcome::Stopped | LocalTunnelDrainOutcome::FatalIo => return,
+            LocalTunnelDrainOutcome::Drained => {}
         }
         match tun.read(&mut packet) {
             Ok(0) => thread::sleep(Duration::from_millis(1)),

@@ -221,3 +221,60 @@ fn drain_local_tunnel_deliveries_drains_then_returns_when_not_stopped() {
     assert!(matches!(outcome, LocalTunnelDrainOutcome::Drained));
     assert_eq!(sink, vec![1, 2, 3, 4, 5], "all queued deliveries written");
 }
+
+// --- #1881 write-vs-read fatal-errno split (live finding) -------------
+
+#[test]
+fn local_tunnel_write_error_einval_is_not_fatal() {
+    // A TUN write EINVAL is a per-packet rejection (malformed inner),
+    // observed live: the off-by-VLAN local-delivery slice made every
+    // peer keepalive reply kill the thread (forever on pre-#1881
+    // master; 15s respawn churn with liveness). Drop the packet, keep
+    // the thread.
+    let einval = io::Error::from_raw_os_error(libc::EINVAL);
+    assert!(!local_tunnel_write_error_is_fatal(&einval));
+    assert!(
+        local_tunnel_io_error_is_fatal(&einval),
+        "read-side EINVAL stays fatal (fd/iface-level condition)"
+    );
+    for code in [libc::EBADF, libc::EBADFD, libc::ENODEV, libc::ENXIO] {
+        let err = io::Error::from_raw_os_error(code);
+        assert!(
+            local_tunnel_write_error_is_fatal(&err),
+            "fd-death errnos stay fatal on writes too"
+        );
+    }
+}
+
+#[test]
+fn drain_survives_einval_write_and_thread_keeps_draining() {
+    struct EinvalSink;
+    impl Write for EinvalSink {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from_raw_os_error(libc::EINVAL))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(8);
+    tx.try_send(vec![0u8, 0x50, 0x86, 0xdd]).expect("queued");
+    let stop = Arc::new(AtomicBool::new(false));
+    let recent = Arc::new(Mutex::new(VecDeque::new()));
+    let outcome = drain_local_tunnel_deliveries(
+        &mut EinvalSink,
+        &rx,
+        &stop,
+        "gre1881einval",
+        &recent,
+    );
+    assert!(
+        matches!(outcome, LocalTunnelDrainOutcome::Drained),
+        "EINVAL delivery write must NOT be FatalIo — the loop continues"
+    );
+    assert_eq!(
+        recent.lock().unwrap().len(),
+        1,
+        "the rejected delivery is recorded as an exception"
+    );
+}
