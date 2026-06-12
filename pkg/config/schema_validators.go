@@ -259,6 +259,43 @@ func parseCIDRStrict(raw, example string) (net.IP, error) {
 	return ip, nil
 }
 
+// validateForwardingClassRef is the #1319 PR 3 tree-based
+// cross-reference validator for `firewall family inet/inet6 filter
+// <f> term <t> then forwarding-class <name>`. The dataplane resolves
+// the name with a map lookup against the CONFIGURED forwarding classes
+// (queue_by_forwarding_class, userspace-dp
+// src/afxdp/tx/cos_classify.rs:371) and silently leaves the packet on
+// the default queue when it misses — a dangling reference commits fine
+// and then does nothing. The reference is valid when:
+//
+//   - the name is defined via `class-of-service forwarding-classes
+//     queue <n> <name>` anywhere in the candidate tree (collected by
+//     collectSchemaRefs from the SAME tree being committed, so a
+//     definition + reference in one commit validates atomically), or
+//   - the name is "best-effort": when no forwarding-classes are
+//     configured the dataplane synthesizes a best-effort queue
+//     (forwarding_build/cos.rs:404-407), so that name is always
+//     resolvable.
+//
+// xpf-DIVERGENT from Junos: the other three Junos default classes
+// (expedited-forwarding, assured-forwarding, network-control) are NOT
+// implicitly defined by the xpf runtime — referencing them without a
+// definition is exactly the silent no-op this gate exists to close.
+func validateForwardingClassRef(raw string, refs *schemaRefs) error {
+	if strings.TrimSpace(raw) == "" {
+		return fmt.Errorf("missing value (expected a forwarding-class name)")
+	}
+	if raw == "best-effort" {
+		return nil
+	}
+	if refs != nil {
+		if _, ok := refs.forwardingClasses[raw]; ok {
+			return nil
+		}
+	}
+	return fmt.Errorf("forwarding-class %q is not defined; add `set class-of-service forwarding-classes queue <queue-id> %s` in the same commit (xpf does not implicitly define the Junos default classes other than best-effort)", raw, raw)
+}
+
 // validatePercent returns a closure that accepts a real number in
 // [min, max] inclusive. The input must parse as a float.
 func ValidatePercent(min, max float64) LeafValidator {

@@ -50,6 +50,14 @@ type schemaNode struct {
 	valueExamples []string      // illustrative values surfaced in `?` help
 	validator     LeafValidator // commit-check validator for the value slot
 
+	// treeValidator is the TREE-based cross-reference alternative to
+	// validator (#1319 PR 3): it validates the value against
+	// definitions collected from the candidate tree itself
+	// (collectSchemaRefs → schemaRefs), because SchemaValidate's cfg is
+	// always nil in production — validation runs BEFORE compile. A
+	// typed leaf sets EITHER validator OR treeValidator, never both.
+	treeValidator treeLeafValidator
+
 	// Typed KEY slot (#1319 PR 3). A named-instance CONTAINER (args > 0
 	// with a children map, e.g. `family inet address <cidr> { primary; }`)
 	// carries its value in the IDENTITY token, not in a leaf value slot —
@@ -1345,11 +1353,24 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 							"syslog":           {children: nil},
 							"routing-instance": {args: 1, children: nil},
 							"count":            {args: 1, children: nil},
-							"forwarding-class": {args: 1, children: nil},
-							"loss-priority":    {args: 1, children: nil},
-							"dscp":             {args: 1, children: nil},
-							"traffic-class":    {args: 1, children: nil},
-							"policer":          {args: 1, children: nil},
+							// #1319 PR 3 tree-based cross-ref: the dataplane
+							// resolves this name against the CONFIGURED
+							// forwarding classes and silently defaults the
+							// queue on a miss (see validateForwardingClassRef
+							// for the runtime citations and the best-effort
+							// special case).
+							"forwarding-class": {
+								args:          1,
+								valueType:     ValueIdentifier,
+								valueDesc:     "Forwarding class to assign (must be defined under class-of-service forwarding-classes, or best-effort)",
+								valueExamples: []string{"best-effort"},
+								treeValidator: validateForwardingClassRef,
+								children:      nil,
+							},
+							"loss-priority": {args: 1, children: nil},
+							"dscp":          {args: 1, children: nil},
+							"traffic-class": {args: 1, children: nil},
+							"policer":       {args: 1, children: nil},
 						}},
 					}},
 				}},
@@ -1389,11 +1410,24 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 							"syslog":           {children: nil},
 							"routing-instance": {args: 1, children: nil},
 							"count":            {args: 1, children: nil},
-							"forwarding-class": {args: 1, children: nil},
-							"loss-priority":    {args: 1, children: nil},
-							"dscp":             {args: 1, children: nil},
-							"traffic-class":    {args: 1, children: nil},
-							"policer":          {args: 1, children: nil},
+							// #1319 PR 3 tree-based cross-ref: the dataplane
+							// resolves this name against the CONFIGURED
+							// forwarding classes and silently defaults the
+							// queue on a miss (see validateForwardingClassRef
+							// for the runtime citations and the best-effort
+							// special case).
+							"forwarding-class": {
+								args:          1,
+								valueType:     ValueIdentifier,
+								valueDesc:     "Forwarding class to assign (must be defined under class-of-service forwarding-classes, or best-effort)",
+								valueExamples: []string{"best-effort"},
+								treeValidator: validateForwardingClassRef,
+								children:      nil,
+							},
+							"loss-priority": {args: 1, children: nil},
+							"dscp":          {args: 1, children: nil},
+							"traffic-class": {args: 1, children: nil},
+							"policer":       {args: 1, children: nil},
 						}},
 					}},
 				}},

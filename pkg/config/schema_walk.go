@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -31,9 +32,19 @@ import (
 // SchemaValidate walks the AST against setSchema and invokes each typed
 // leaf's validator on its value. It returns the FIRST error encountered
 // (matching how the existing compiler surfaces commit-check failures).
-// cfg may be nil — none of the PR-1 schedulers validators need it, but the
-// signature reserves room for future cross-reference validators (e.g.
-// "forwarding-class X must exist").
+//
+// cfg is ALWAYS nil in production: both call sites
+// (configstore.compileTree / compileTreeLenient via
+// schemaValidateExpandedTree, pkg/configstore/store.go) run the gate
+// BEFORE the compiler, so no *Config exists yet. Validators must not
+// depend on it. Cross-reference validation is TREE-based instead: the
+// walk pre-collects referenceable definitions from the candidate tree
+// itself into schemaRefs (collectSchemaRefs below) and hands them to
+// treeValidator leaves — atomicity-correct, because a definition and its
+// reference added in the same commit validate against the same tree.
+// Removing the cfg parameter outright is a possible follow-up once we
+// are confident no post-compile consumer will ever appear; it is kept
+// for now because the LeafValidator signature is mirrored in cmdtree.
 //
 // The tree passed in MUST already be apply-groups-expanded (configstore
 // expands before calling), so group bodies are inlined before the walk.
@@ -41,7 +52,118 @@ func SchemaValidate(tree *ConfigTree, cfg *Config) error {
 	if tree == nil {
 		return nil
 	}
-	return walkSchemaChildren(tree.Children, setSchema, nil, cfg)
+	vc := &walkContext{cfg: cfg, refs: collectSchemaRefs(tree)}
+	return walkSchemaChildren(tree.Children, setSchema, nil, vc)
+}
+
+// walkContext carries the per-walk validation inputs: the (always-nil in
+// production) cfg pointer for the legacy LeafValidator signature, and
+// the tree-derived cross-reference sets for treeValidator leaves.
+type walkContext struct {
+	cfg  *Config
+	refs *schemaRefs
+}
+
+// config / collectedRefs are nil-receiver-safe accessors: the white-box
+// walker tests drive walkSchemaNode with a nil context, matching the
+// production reality that cfg is nil anyway.
+func (vc *walkContext) config() *Config {
+	if vc == nil {
+		return nil
+	}
+	return vc.cfg
+}
+
+func (vc *walkContext) collectedRefs() *schemaRefs {
+	if vc == nil {
+		return nil
+	}
+	return vc.refs
+}
+
+// treeLeafValidator is the TREE-based counterpart of LeafValidator for
+// cross-reference leaves: instead of the (always-nil in production)
+// *Config it receives the definitions collected from the candidate tree
+// by collectSchemaRefs, so a definition and its reference added in the
+// same commit validate atomically.
+type treeLeafValidator func(raw string, refs *schemaRefs) error
+
+// checkValue returns the per-token validation function for a typed
+// leaf: the scalar validator when set, else the tree-based
+// cross-reference validator bound to the walk's collected refs. A typed
+// leaf sets exactly one of the two (walkSchemaNode gates on either).
+func (n *schemaNode) checkValue(vc *walkContext) func(string) error {
+	if n.validator != nil {
+		return func(tok string) error { return n.validator(tok, vc.config()) }
+	}
+	if n.treeValidator != nil {
+		return func(tok string) error { return n.treeValidator(tok, vc.collectedRefs()) }
+	}
+	return func(string) error { return nil }
+}
+
+// schemaRefs holds the referenceable definitions collected from the
+// candidate tree before the walk (#1319 PR 3). Extend with new sets as
+// more cross-reference validators land.
+type schemaRefs struct {
+	// forwardingClasses are the names defined via `class-of-service
+	// forwarding-classes queue <n> <name>` anywhere in the tree —
+	// including group bodies, applied or not. Collecting from group
+	// definitions errs permissive: after apply-groups expansion the
+	// applied bodies are inlined at top level anyway, and a reference
+	// satisfied only by an UN-applied group must not be rejected (the
+	// compiler ignores both the definition and any reference inside
+	// that group, and node0/node1-variable configs legitimately keep
+	// peer-node definitions un-applied locally).
+	forwardingClasses map[string]struct{}
+}
+
+// collectSchemaRefs walks the tree for cross-referenceable definitions.
+// The forwarding-class collection mirrors compileClassOfService exactly
+// (compiler_class_of_service.go:82-89): `queue` leaves under a
+// `forwarding-classes` node, Keys = ["queue", <int>, <name>]; entries
+// whose queue number does not parse are skipped, as the compiler skips
+// them.
+func collectSchemaRefs(tree *ConfigTree) *schemaRefs {
+	refs := &schemaRefs{forwardingClasses: map[string]struct{}{}}
+	if tree == nil {
+		return refs
+	}
+	var collectCoS func(node *Node)
+	collectCoS = func(node *Node) {
+		fcNode := node.FindChild("forwarding-classes")
+		if fcNode == nil {
+			return
+		}
+		for _, queueNode := range fcNode.FindChildren("queue") {
+			if len(queueNode.Keys) < 3 {
+				continue
+			}
+			if _, err := strconv.Atoi(queueNode.Keys[1]); err != nil {
+				continue
+			}
+			refs.forwardingClasses[queueNode.Keys[2]] = struct{}{}
+		}
+	}
+	for _, top := range tree.Children {
+		if top == nil || len(top.Keys) == 0 {
+			continue
+		}
+		switch top.Name() {
+		case "class-of-service":
+			collectCoS(top)
+		case "groups":
+			for _, group := range top.Children {
+				if group == nil {
+					continue
+				}
+				if cos := group.FindChild("class-of-service"); cos != nil {
+					collectCoS(cos)
+				}
+			}
+		}
+	}
+	return refs
 }
 
 // walkSchemaChildren validates a slice of AST sibling nodes against the
@@ -49,7 +171,7 @@ func SchemaValidate(tree *ConfigTree, cfg *Config) error {
 // modifier-only sibling (e.g. flat-set `transmit-rate exact` next to
 // `transmit-rate 1g`) can be recognized as valid only when a sibling
 // supplies the value.
-func walkSchemaChildren(nodes []*Node, parent *schemaNode, path []string, cfg *Config) error {
+func walkSchemaChildren(nodes []*Node, parent *schemaNode, path []string, vc *walkContext) error {
 	if parent == nil {
 		return nil
 	}
@@ -57,7 +179,7 @@ func walkSchemaChildren(nodes []*Node, parent *schemaNode, path []string, cfg *C
 		if node == nil || len(node.Keys) == 0 {
 			continue
 		}
-		if err := walkSchemaNode(node, parent, path, cfg, nodes); err != nil {
+		if err := walkSchemaNode(node, parent, path, vc, nodes); err != nil {
 			return err
 		}
 	}
@@ -75,7 +197,7 @@ func walkSchemaChildren(nodes []*Node, parent *schemaNode, path []string, cfg *C
 //   - path:     consumed keyword path for error context.
 //   - siblings: the AST nodes at this level (for cross-sibling
 //     modifier-only recognition).
-func walkSchemaNode(node *Node, parent *schemaNode, path []string, cfg *Config, siblings []*Node) error {
+func walkSchemaNode(node *Node, parent *schemaNode, path []string, vc *walkContext, siblings []*Node) error {
 	keyword := node.Keys[0]
 
 	// Resolve the schema child for this keyword. Exact match first, then
@@ -86,10 +208,10 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, cfg *Config, 
 		return nil
 	}
 
-	if childSchema.isTypedLeaf() && childSchema.validator != nil {
+	if childSchema.isTypedLeaf() && (childSchema.validator != nil || childSchema.treeValidator != nil) {
 		// Typed leaf: node.Keys[1:] are the value/modifier tokens. The leaf
 		// keyword is the only identity token.
-		if err := validateTypedLeaf(node, childSchema, path, siblings, cfg); err != nil {
+		if err := validateTypedLeaf(node, childSchema, path, siblings, vc); err != nil {
 			return err
 		}
 		// Validate modifier CHILDREN. The flat-set grouping and hierarchical
@@ -100,7 +222,7 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, cfg *Config, 
 		// tokens packed in its Keys and NO unexpected descendants.
 		leafPath := append(append([]string(nil), path...), keyword)
 		for _, c := range node.Children {
-			if err := validateModifierChild(c, childSchema, leafPath, cfg); err != nil {
+			if err := validateModifierChild(c, childSchema, leafPath, vc); err != nil {
 				return err
 			}
 		}
@@ -140,7 +262,7 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, cfg *Config, 
 		}
 		keyPath := append(append([]string(nil), path...), keyword)
 		for _, tok := range node.Keys[1:argEnd] {
-			if err := childSchema.keyValidator(tok, cfg); err != nil {
+			if err := childSchema.keyValidator(tok, vc.config()); err != nil {
 				return typedLeafInvalidErrorf(keyPath, tok, err)
 			}
 		}
@@ -157,14 +279,14 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, cfg *Config, 
 	missingArgs := declaredKeyTokens - consumed
 	if missingArgs > 0 && !childSchema.compoundKey {
 		for _, c := range node.Children {
-			if err := walkInstanceChildren(c, childSchema, missingArgs, newPath, cfg); err != nil {
+			if err := walkInstanceChildren(c, childSchema, missingArgs, newPath, vc); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
 
-	return walkSchemaChildren(node.Children, descendSchema, newPath, cfg)
+	return walkSchemaChildren(node.Children, descendSchema, newPath, vc)
 }
 
 // walkInstanceChildren peels the missing instance-name level(s) off a
@@ -174,7 +296,7 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, cfg *Config, 
 // Keys; the leaves are the node's CHILDREN. Any extra tokens packed into the
 // instance node's Keys beyond the name are ignored (the compiler does not
 // compile them; see walkSchemaNode's container comment, Codex r7).
-func walkInstanceChildren(node *Node, containerSchema *schemaNode, remaining int, path []string, cfg *Config) error {
+func walkInstanceChildren(node *Node, containerSchema *schemaNode, remaining int, path []string, vc *walkContext) error {
 	if node == nil || len(node.Keys) == 0 {
 		return nil
 	}
@@ -187,7 +309,7 @@ func walkInstanceChildren(node *Node, containerSchema *schemaNode, remaining int
 	// too), so a key-typed container validates them here as well.
 	if containerSchema.keyValidator != nil {
 		for _, tok := range node.Keys[:consume] {
-			if err := containerSchema.keyValidator(tok, cfg); err != nil {
+			if err := containerSchema.keyValidator(tok, vc.config()); err != nil {
 				return typedLeafInvalidErrorf(path, tok, err)
 			}
 		}
@@ -196,7 +318,7 @@ func walkInstanceChildren(node *Node, containerSchema *schemaNode, remaining int
 	if stillMissing := remaining - consume; stillMissing > 0 {
 		// This node supplied only part of the name; keep peeling.
 		for _, c := range node.Children {
-			if err := walkInstanceChildren(c, containerSchema, stillMissing, newPath, cfg); err != nil {
+			if err := walkInstanceChildren(c, containerSchema, stillMissing, newPath, vc); err != nil {
 				return err
 			}
 		}
@@ -204,7 +326,7 @@ func walkInstanceChildren(node *Node, containerSchema *schemaNode, remaining int
 	}
 	// Name fully consumed. The instance's leaves are its block children;
 	// any leftover Keys past the name are not compiled and are ignored.
-	return walkSchemaChildren(node.Children, containerSchema, newPath, cfg)
+	return walkSchemaChildren(node.Children, containerSchema, newPath, vc)
 }
 
 // validateModifierChild validates one AST child of a typed leaf (e.g.
@@ -214,7 +336,7 @@ func walkInstanceChildren(node *Node, containerSchema *schemaNode, remaining int
 // descendants of its own (`exact { bogus; }`). Modifiers themselves carry
 // no typed value, so we only assert the keyword is recognized and nothing
 // trails it.
-func validateModifierChild(node *Node, leafSchema *schemaNode, leafPath []string, cfg *Config) error {
+func validateModifierChild(node *Node, leafSchema *schemaNode, leafPath []string, vc *walkContext) error {
 	if node == nil || len(node.Keys) == 0 {
 		return nil
 	}
@@ -239,7 +361,7 @@ func validateModifierChild(node *Node, leafSchema *schemaNode, leafPath []string
 		// If the modifier schema itself declares children (future nested
 		// modifiers), recurse; otherwise any descendant is unknown.
 		if modSchema != nil && modSchema.children != nil {
-			if err := validateModifierChild(c, modSchema, modPath, cfg); err != nil {
+			if err := validateModifierChild(c, modSchema, modPath, vc); err != nil {
 				return err
 			}
 			continue
@@ -302,10 +424,11 @@ func consumeNodeKeys(keys []string, childSchema *schemaNode) (int, *schemaNode) 
 //     preserves the pre-#1319 schedulerHasTypedTransmitRate behaviour.
 //   - missing value: a typed leaf with no value token fails.
 //   - unknown modifier: a non-value token matching no child keyword fails.
-func validateTypedLeaf(node *Node, leafSchema *schemaNode, parentPath []string, siblings []*Node, cfg *Config) error {
+func validateTypedLeaf(node *Node, leafSchema *schemaNode, parentPath []string, siblings []*Node, vc *walkContext) error {
 	leafName := node.Keys[0]
 	path := append(append([]string(nil), parentPath...), leafName)
 	values := node.Keys[1:]
+	check := leafSchema.checkValue(vc)
 
 	// Range / value-tail leaf: multi with no schema children. Validate
 	// every value token; treat a known fixed mid-token (`to`) as a
@@ -324,7 +447,7 @@ func validateTypedLeaf(node *Node, leafSchema *schemaNode, parentPath []string, 
 				lastWasSeparator = true
 				continue
 			}
-			if err := leafSchema.validator(tok, cfg); err != nil {
+			if err := check(tok); err != nil {
 				return typedLeafInvalidErrorf(path, tok, err)
 			}
 			validatedAny = true
@@ -349,7 +472,7 @@ func validateTypedLeaf(node *Node, leafSchema *schemaNode, parentPath []string, 
 	// value; else fail. This is the cross-sibling rule from the plan.
 	if len(values) == 1 && leafSchema.children != nil {
 		if _, isMod := leafSchema.children[first]; isMod {
-			if siblingSuppliesTypedValue(siblings, leafName, leafSchema, cfg) {
+			if siblingSuppliesTypedValue(siblings, leafName, leafSchema, vc) {
 				return nil
 			}
 			return typedLeafErrorf(path, "modifier %q requires a value (e.g. a sibling %s <value>)", first, leafName)
@@ -357,7 +480,7 @@ func validateTypedLeaf(node *Node, leafSchema *schemaNode, parentPath []string, 
 	}
 
 	// Standard typed leaf: first token is the value.
-	if err := leafSchema.validator(first, cfg); err != nil {
+	if err := check(first); err != nil {
 		return typedLeafInvalidErrorf(path, first, err)
 	}
 	// Remaining tokens must be known child-keyword modifiers (e.g. `exact`).
@@ -376,7 +499,8 @@ func validateTypedLeaf(node *Node, leafSchema *schemaNode, parentPath []string, 
 // leaf keyword carries a value token that the leaf's validator accepts.
 // Used to allow a flat-set modifier-only line (`transmit-rate exact`) when
 // the rate is set on a separate sibling node.
-func siblingSuppliesTypedValue(siblings []*Node, leafName string, leafSchema *schemaNode, cfg *Config) bool {
+func siblingSuppliesTypedValue(siblings []*Node, leafName string, leafSchema *schemaNode, vc *walkContext) bool {
+	check := leafSchema.checkValue(vc)
 	for _, s := range siblings {
 		if s == nil || len(s.Keys) == 0 || s.Keys[0] != leafName {
 			continue
@@ -388,7 +512,7 @@ func siblingSuppliesTypedValue(siblings []*Node, leafName string, leafSchema *sc
 					continue
 				}
 			}
-			if leafSchema.validator(tok, cfg) == nil {
+			if check(tok) == nil {
 				return true
 			}
 		}
