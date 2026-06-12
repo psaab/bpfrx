@@ -1167,36 +1167,36 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		}},
 	}},
 	"class-of-service": {desc: "Class of service configuration", children: map[string]*schemaNode{
-		"forwarding-classes": {children: map[string]*schemaNode{
-			"queue": {args: 2, multi: true, children: nil},
+		"forwarding-classes": {desc: "Forwarding class definitions", children: map[string]*schemaNode{
+			"queue": {desc: "Map a queue number to a forwarding-class name (one queue per class, one class per queue)", args: 2, multi: true, children: nil},
 		}},
-		"classifiers": {children: map[string]*schemaNode{
-			"dscp": {args: 1, multi: true, children: map[string]*schemaNode{
-				"forwarding-class": {args: 1, multi: true, children: map[string]*schemaNode{
-					"loss-priority": {args: 1, multi: true, children: map[string]*schemaNode{
-						"code-points": {args: 1, multi: true, children: nil},
+		"classifiers": {desc: "Classifiers mapping incoming code points to forwarding classes", children: map[string]*schemaNode{
+			"dscp": {desc: "DSCP classifier", args: 1, multi: true, placeholder: "<classifier-name>", children: map[string]*schemaNode{
+				"forwarding-class": {desc: "Forwarding class to assign to matching code points", args: 1, multi: true, placeholder: "<class-name>", children: map[string]*schemaNode{
+					"loss-priority": {desc: "Loss priority (accepted for Junos compatibility; not enforced by the userspace dataplane)", args: 1, multi: true, placeholder: "<level>", children: map[string]*schemaNode{
+						"code-points": {desc: "DSCP code points to match (alias such as ef, af11, cs6, or numeric 0..63)", args: 1, multi: true, placeholder: "<code-points>", children: nil},
 					}},
 				}},
 			}},
-			"ieee-802.1": {args: 1, multi: true, children: map[string]*schemaNode{
-				"forwarding-class": {args: 1, multi: true, children: map[string]*schemaNode{
-					"loss-priority": {args: 1, multi: true, children: map[string]*schemaNode{
-						"code-points": {args: 1, multi: true, children: nil},
-					}},
-				}},
-			}},
-		}},
-		"rewrite-rules": {children: map[string]*schemaNode{
-			"dscp": {args: 1, multi: true, children: map[string]*schemaNode{
-				"forwarding-class": {args: 1, multi: true, children: map[string]*schemaNode{
-					"loss-priority": {args: 1, multi: true, children: map[string]*schemaNode{
-						"code-point":  {args: 1, children: nil},
-						"code-points": {args: 1, multi: true, children: nil},
+			"ieee-802.1": {desc: "IEEE 802.1p classifier", args: 1, multi: true, placeholder: "<classifier-name>", children: map[string]*schemaNode{
+				"forwarding-class": {desc: "Forwarding class to assign to matching code points", args: 1, multi: true, placeholder: "<class-name>", children: map[string]*schemaNode{
+					"loss-priority": {desc: "Loss priority (accepted for Junos compatibility; not enforced by the userspace dataplane)", args: 1, multi: true, placeholder: "<level>", children: map[string]*schemaNode{
+						"code-points": {desc: "IEEE 802.1p code points to match (0..7)", args: 1, multi: true, placeholder: "<code-points>", children: nil},
 					}},
 				}},
 			}},
 		}},
-		"schedulers": {args: 1, multi: true, children: map[string]*schemaNode{
+		"rewrite-rules": {desc: "Egress rewrite rules mapping forwarding classes to code points", children: map[string]*schemaNode{
+			"dscp": {desc: "DSCP rewrite rule", args: 1, multi: true, placeholder: "<rewrite-rule-name>", children: map[string]*schemaNode{
+				"forwarding-class": {desc: "Forwarding class whose packets get the rewritten code point", args: 1, multi: true, placeholder: "<class-name>", children: map[string]*schemaNode{
+					"loss-priority": {desc: "Loss priority (accepted for Junos compatibility; not enforced by the userspace dataplane)", args: 1, multi: true, placeholder: "<level>", children: map[string]*schemaNode{
+						"code-point":  {desc: "DSCP code point to write (alias such as ef, af11, cs6, or numeric 0..63)", args: 1, placeholder: "<code-point>", children: nil},
+						"code-points": {desc: "DSCP code point to write (alias of code-point; first value is used)", args: 1, multi: true, placeholder: "<code-points>", children: nil},
+					}},
+				}},
+			}},
+		}},
+		"schedulers": {desc: "Scheduler definitions (transmit rate, priority, buffer)", args: 1, multi: true, placeholder: "<scheduler-name>", children: map[string]*schemaNode{
 			// #1319 typed leaves. Re-homed from the cmdtree overlay
 			// (cmdtree.ConfigClassOfServiceSchedulers, retired in this PR)
 			// onto setSchema so the live config-mode `set ... ?` completer
@@ -1204,16 +1204,18 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			// `exact` child predates #1319 and is unchanged — adding fields
 			// to transmit-rate does not alter SetPath grouping.
 			"transmit-rate": {
+				desc:          "Transmit rate in bits per second (e.g. 100k, 10m, 1g)",
 				args:          1,
 				valueType:     ValueRate,
 				valueDesc:     "Bandwidth (e.g. 100k, 10m, 1g) or bps integer; >= 8 bps",
 				valueExamples: []string{"100k", "10m", "1g", "10g"},
 				validator:     ValidateRate,
 				children: map[string]*schemaNode{
-					"exact": {children: nil},
+					"exact": {desc: "Cap the queue at the configured rate (no surplus borrowing unless surplus-sharing is set)", children: nil},
 				},
 			},
 			"priority": {
+				desc:          "Scheduler priority level",
 				args:          1,
 				valueType:     ValueEnumOf,
 				valueDesc:     "Scheduler priority (low | medium-low | medium-high | high | strict-high)",
@@ -1224,6 +1226,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				children: nil,
 			},
 			"buffer-size": {
+				desc:          "Queue buffer size (bytes with k/m/g suffix, or percent of the interface buffer pool; percents in one scheduler-map must not exceed 100%)",
 				args:          1,
 				valueType:     ValueByteSizeOrPercent,
 				valueDesc:     "Byte-size with explicit k/m/g suffix, or percent of interface CoS burst pool (e.g. 16m, 256k, 10%)",
@@ -1233,13 +1236,14 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			},
 			// `surplus-sharing` (#915) and `equal-flow-enforcement` are
 			// presence-only flags — no value to validate.
-			"surplus-sharing":        {children: nil},
-			"equal-flow-enforcement": {children: nil},
+			"surplus-sharing":        {desc: "Let this exact-rate queue draw surplus bandwidth once its own rate is exhausted (only meaningful with transmit-rate exact)", children: nil},
+			"equal-flow-enforcement": {desc: "Enforce equal per-flow rates on this queue (requires positive transmit-rate exact; cannot be combined with surplus-sharing)", children: nil},
 			// #1746: equal-flow target policy. Only meaningful with
 			// `equal-flow-enforcement`; unset == `slowest` (the
 			// byte-unchanged clip-to-slowest default). `mean` and
 			// `slowest` are non-work-conserving (commit warning).
 			"equal-flow-target-policy": {
+				desc:          "Per-flow target policy for equal-flow enforcement (slowest | mean | ideal-share, unset = slowest)",
 				args:          1,
 				valueType:     ValueEnumOf,
 				valueDesc:     "Equal-flow per-flow target policy (slowest | mean | ideal-share)",
@@ -1250,37 +1254,37 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				children: nil,
 			},
 		}},
-		"scheduler-maps": {args: 1, multi: true, children: map[string]*schemaNode{
-			"forwarding-class": {args: 1, multi: true, children: map[string]*schemaNode{
-				"scheduler": {args: 1, children: nil},
+		"scheduler-maps": {desc: "Scheduler map assigning schedulers to forwarding classes", args: 1, multi: true, placeholder: "<map-name>", children: map[string]*schemaNode{
+			"forwarding-class": {desc: "Forwarding class entry in this map", args: 1, multi: true, placeholder: "<class-name>", children: map[string]*schemaNode{
+				"scheduler": {desc: "Scheduler to apply to this forwarding class", args: 1, placeholder: "<scheduler-name>", children: nil},
 			}},
 		}},
-		"interfaces": {args: 1, multi: true, children: map[string]*schemaNode{
-			"unit": {args: 1, multi: true, children: map[string]*schemaNode{
-				"classifiers": {children: map[string]*schemaNode{
-					"dscp":       {args: 1, children: nil},
-					"ieee-802.1": {args: 1, children: nil},
+		"interfaces": {desc: "Apply CoS to an interface", args: 1, multi: true, placeholder: "<interface-name>", children: map[string]*schemaNode{
+			"unit": {desc: "Logical unit number", args: 1, multi: true, placeholder: "<unit-number>", children: map[string]*schemaNode{
+				"classifiers": {desc: "Classifiers applied to traffic arriving on this unit", children: map[string]*schemaNode{
+					"dscp":       {desc: "DSCP classifier to apply", args: 1, placeholder: "<classifier-name>", children: nil},
+					"ieee-802.1": {desc: "IEEE 802.1p classifier to apply", args: 1, placeholder: "<classifier-name>", children: nil},
 				}},
-				"rewrite-rules": {children: map[string]*schemaNode{
-					"dscp": {args: 1, children: nil},
+				"rewrite-rules": {desc: "Rewrite rules applied to traffic leaving this unit", children: map[string]*schemaNode{
+					"dscp": {desc: "DSCP rewrite rule to apply", args: 1, placeholder: "<rewrite-rule-name>", children: nil},
 				}},
-				"shaping-rate": {args: 1, children: map[string]*schemaNode{
-					"burst-size": {args: 1, children: nil},
+				"shaping-rate": {desc: "Shaping rate for this unit in bits per second (k/m/g suffixes)", args: 1, placeholder: "<rate>", children: map[string]*schemaNode{
+					"burst-size": {desc: "Shaping burst size in bytes (k/m/g suffixes)", args: 1, placeholder: "<bytes>", children: nil},
 				}},
-				"scheduler-map": {args: 1, children: nil},
+				"scheduler-map": {desc: "Scheduler map to apply to this unit", args: 1, placeholder: "<map-name>", children: nil},
 			}},
 		}},
-		"fairness": {children: map[string]*schemaNode{
-			"rss-expectation": {children: map[string]*schemaNode{
-				"ifindex": {args: 1, multi: true, children: map[string]*schemaNode{
-					"queue": {args: 1, multi: true, children: map[string]*schemaNode{
-						"any":                     {children: nil},
-						"balanced":                {children: nil},
-						"active-workers":          {args: 1, children: nil},
-						"at-least-active-workers": {args: 1, children: nil},
-						"max-worker-flow-share":   {args: 1, children: nil},
-						"cstruct":                 {args: 1, children: nil},
-						"cstruct-max":             {args: 1, children: nil},
+		"fairness": {desc: "Dataplane fairness observability configuration", children: map[string]*schemaNode{
+			"rss-expectation": {desc: "Declarative RSS flow-distribution expectations evaluated against live dataplane status (shown in fairness output and exported as Prometheus gauges)", children: map[string]*schemaNode{
+				"ifindex": {desc: "Kernel interface index to evaluate (positive integer)", args: 1, multi: true, placeholder: "<ifindex>", children: map[string]*schemaNode{
+					"queue": {desc: "CoS queue ID to evaluate (0..255; exactly one expectation per queue)", args: 1, multi: true, placeholder: "<queue-id>", children: map[string]*schemaNode{
+						"any":                     {desc: "No expectation; always passes", children: nil},
+						"balanced":                {desc: "Expect flows spread across min(flows, workers) workers with per-worker flow counts within 1", children: nil},
+						"active-workers":          {desc: "Alias for at-least-active-workers", args: 1, placeholder: "<count>", children: nil},
+						"at-least-active-workers": {desc: "Expect at least this many workers with active flows", args: 1, placeholder: "<count>", children: nil},
+						"max-worker-flow-share":   {desc: "Expect the busiest worker's share of active flows to be at most this threshold (fraction 0..1 or percent)", args: 1, placeholder: "<share>", children: nil},
+						"cstruct":                 {desc: "Alias for cstruct-max", args: 1, placeholder: "<threshold>", children: nil},
+						"cstruct-max":             {desc: "Expect the structural CoV ceiling (Cstruct) of the observed flow distribution to be at most this threshold (non-negative number or percent)", args: 1, placeholder: "<threshold>", children: nil},
 					}},
 				}},
 			}},
