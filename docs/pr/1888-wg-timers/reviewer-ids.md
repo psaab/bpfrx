@@ -44,3 +44,7 @@ CONVERGED at plan v9 (c0ad0bd07): 3/3 PLAN-READY. Path A (combined timers + poll
 - Codex code-r1: task-mqat2zol-ke349t — NEEDS-REVISION (1 BLOCKER give-up same-pass stale-actions bypass — fixed; 1 MINOR help text — fixed; 1 NIT whitespace — fixed)
 - AGY code-r1: adversarial-review-mqat2q0z-tu2tk8 — MERGE-READY (8/8 plan guarantees VERIFIED; 1 no-change NIT)
 - Claude SMR code-r1: claude-smr-code-r1.md — MERGE-READY after F1/F5/F6 fixes (3 mandated worked traces PASS; independently confirmed the Codex BLOCKER)
+- Codex code-r2: task-mqathtlo-n3kpbg — NEEDS-REVISION (blocker fix + test + F4 CONFIRMED; one residual whitespace NIT)
+- Codex code-r3: task-mqatlm7i-rxy88p — **MERGE-READY** at de5213c67
+- AGY delta-attest: adversarial-review-mqatn4vk-gk0u4k — **MERGE-READY** (F4 re-derivation confirmed; spin check clean)
+- Copilot: quota-limited on all of request + 3 documented retries → 3-of-4 rule (Claude SMR + Codex + AGY all MERGE-READY)
