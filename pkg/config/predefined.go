@@ -39,7 +39,7 @@ var PredefinedApplications = map[string]*Application{
 	"junos-snmp":           {Name: "junos-snmp", Protocol: "udp", DestinationPort: "161"},
 	"junos-snmp-agentx":    {Name: "junos-snmp-agentx", Protocol: "tcp", DestinationPort: "705"},
 	"junos-syslog":         {Name: "junos-syslog", Protocol: "udp", DestinationPort: "514"},
-	"junos-xnm-ssl":       {Name: "junos-xnm-ssl", Protocol: "tcp", DestinationPort: "3220"},
+	"junos-xnm-ssl":        {Name: "junos-xnm-ssl", Protocol: "tcp", DestinationPort: "3220"},
 	"junos-xnm-clear-text": {Name: "junos-xnm-clear-text", Protocol: "tcp", DestinationPort: "3221"},
 
 	// --- Routing ---
@@ -57,28 +57,28 @@ var PredefinedApplications = map[string]*Application{
 	"junos-radacct":   {Name: "junos-radacct", Protocol: "udp", DestinationPort: "1813"},
 
 	// --- VPN & tunneling ---
-	"junos-ike":     {Name: "junos-ike", Protocol: "udp", DestinationPort: "500"},
-	"junos-ike-nat": {Name: "junos-ike-nat", Protocol: "udp", DestinationPort: "4500"},
-	"junos-l2tp":    {Name: "junos-l2tp", Protocol: "udp", DestinationPort: "1701"},
-	"junos-gre":     {Name: "junos-gre", Protocol: "gre"},
+	"junos-ike":      {Name: "junos-ike", Protocol: "udp", DestinationPort: "500"},
+	"junos-ike-nat":  {Name: "junos-ike-nat", Protocol: "udp", DestinationPort: "4500"},
+	"junos-l2tp":     {Name: "junos-l2tp", Protocol: "udp", DestinationPort: "1701"},
+	"junos-gre":      {Name: "junos-gre", Protocol: "gre"},
 	"junos-ip-in-ip": {Name: "junos-ip-in-ip", Protocol: "4"},
-	"junos-ipip":    {Name: "junos-ipip", Protocol: "4"},
+	"junos-ipip":     {Name: "junos-ipip", Protocol: "4"},
 
 	// --- Windows/SMB ---
-	"junos-smb":              {Name: "junos-smb", Protocol: "tcp", DestinationPort: "445"},
-	"junos-smb-session":      {Name: "junos-smb-session", Protocol: "tcp", DestinationPort: "445"},
-	"junos-netbios-session":  {Name: "junos-netbios-session", Protocol: "tcp", DestinationPort: "139"},
-	"junos-nbname":           {Name: "junos-nbname", Protocol: "udp", DestinationPort: "137"},
-	"junos-nbds":             {Name: "junos-nbds", Protocol: "udp", DestinationPort: "138"},
-	"junos-ms-sql":           {Name: "junos-ms-sql", Protocol: "tcp", DestinationPort: "1433"},
-	"junos-ms-rpc-tcp":       {Name: "junos-ms-rpc-tcp", Protocol: "tcp", DestinationPort: "135"},
-	"junos-ms-rpc-udp":       {Name: "junos-ms-rpc-udp", Protocol: "udp", DestinationPort: "135"},
+	"junos-smb":             {Name: "junos-smb", Protocol: "tcp", DestinationPort: "445"},
+	"junos-smb-session":     {Name: "junos-smb-session", Protocol: "tcp", DestinationPort: "445"},
+	"junos-netbios-session": {Name: "junos-netbios-session", Protocol: "tcp", DestinationPort: "139"},
+	"junos-nbname":          {Name: "junos-nbname", Protocol: "udp", DestinationPort: "137"},
+	"junos-nbds":            {Name: "junos-nbds", Protocol: "udp", DestinationPort: "138"},
+	"junos-ms-sql":          {Name: "junos-ms-sql", Protocol: "tcp", DestinationPort: "1433"},
+	"junos-ms-rpc-tcp":      {Name: "junos-ms-rpc-tcp", Protocol: "tcp", DestinationPort: "135"},
+	"junos-ms-rpc-udp":      {Name: "junos-ms-rpc-udp", Protocol: "udp", DestinationPort: "135"},
 
 	// --- RPC / NFS ---
-	"junos-sun-rpc-tcp":  {Name: "junos-sun-rpc-tcp", Protocol: "tcp", DestinationPort: "111"},
-	"junos-sun-rpc-udp":  {Name: "junos-sun-rpc-udp", Protocol: "udp", DestinationPort: "111"},
-	"junos-nfsd-tcp":     {Name: "junos-nfsd-tcp", Protocol: "tcp", DestinationPort: "2049"},
-	"junos-nfsd-udp":     {Name: "junos-nfsd-udp", Protocol: "udp", DestinationPort: "2049"},
+	"junos-sun-rpc-tcp": {Name: "junos-sun-rpc-tcp", Protocol: "tcp", DestinationPort: "111"},
+	"junos-sun-rpc-udp": {Name: "junos-sun-rpc-udp", Protocol: "udp", DestinationPort: "111"},
+	"junos-nfsd-tcp":    {Name: "junos-nfsd-tcp", Protocol: "tcp", DestinationPort: "2049"},
+	"junos-nfsd-udp":    {Name: "junos-nfsd-udp", Protocol: "udp", DestinationPort: "2049"},
 
 	// --- Printing ---
 	"junos-printer": {Name: "junos-printer", Protocol: "tcp", DestinationPort: "515"},
@@ -125,10 +125,10 @@ var PredefinedApplications = map[string]*Application{
 	"junos-ns-global-pro": {Name: "junos-ns-global-pro", Protocol: "tcp", DestinationPort: "15397"},
 
 	// --- ICMP / ICMPv6 ---
-	"junos-ping":         {Name: "junos-ping", Protocol: "icmp"},
-	"junos-pingv6":       {Name: "junos-pingv6", Protocol: "icmpv6"},
-	"junos-icmp-all":     {Name: "junos-icmp-all", Protocol: "icmp"},
-	"junos-icmp6-all":    {Name: "junos-icmp6-all", Protocol: "icmpv6"},
+	"junos-ping":      {Name: "junos-ping", Protocol: "icmp"},
+	"junos-pingv6":    {Name: "junos-pingv6", Protocol: "icmpv6"},
+	"junos-icmp-all":  {Name: "junos-icmp-all", Protocol: "icmp"},
+	"junos-icmp6-all": {Name: "junos-icmp6-all", Protocol: "icmpv6"},
 
 	// --- Traceroute ---
 	"junos-traceroute": {Name: "junos-traceroute", Protocol: "udp", DestinationPort: "33434-33523"},

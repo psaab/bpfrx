@@ -89,6 +89,27 @@ type Daemon struct {
 	rpm           *rpm.Manager
 	rpmMu         sync.Mutex // serializes reconcileRPM callers (#1827)
 	activeRPMHash [32]byte   // config-hash gate for RPM re-apply (#1827)
+	// rpmPinsFailed records that the last probe-pin install left at
+	// least one pin unprogrammed (#1895): the install is retried
+	// (without restarting probes) on hash-gated reconcileRPM calls AND
+	// by the slow periodic probePinRetryLoop until it succeeds.
+	// Guarded by rpmMu.
+	rpmPinsFailed bool
+	// rpmPinRetryActive is true while a probePinRetryLoop goroutine is
+	// running (#1895 AGY fold — autonomous recovery of boot-time pin
+	// failures on a quiet box, no commit required). Guarded by rpmMu.
+	rpmPinRetryActive bool
+	// rpmEffective/rpmRethMap are the last-applied effective RPM
+	// config + RETH map, kept for the periodic pin retry (which has no
+	// fresh cfg in hand). Guarded by rpmMu.
+	rpmEffective *config.RPMConfig
+	rpmRethMap   map[string]string
+	// probePinRetryEvery overrides the periodic pin-retry cadence
+	// (tests); 0 = probePinRetryInterval.
+	probePinRetryEvery time.Duration
+	// probePinApply is the test seam for probe-pin programming; nil =
+	// d.routing.ApplyProbePins (#1895).
+	probePinApply func([]routing.ProbePin) map[string]error
 	ipmon         *ipmon.Engine
 	// pendingFIBBump records an UNCONFIRMED FIB-generation bump after a
 	// successful route-overlay publish (#1844, Codex plan r2-1): the
@@ -354,13 +375,19 @@ type CompileHealth struct {
 
 const standbyNeighborRefreshMinInterval = time.Second
 
-// New creates a new Daemon.
-func New(opts Options) *Daemon {
+// New creates a new Daemon. It fails when the config store cannot be
+// constructed (#1893 — the store is fail-closed on an unusable
+// .configdb): a daemon that cannot persist configuration must not
+// boot pretending otherwise.
+func New(opts Options) (*Daemon, error) {
 	if opts.ConfigFile == "" {
 		opts.ConfigFile = "/etc/xpf/xpf.conf"
 	}
 
-	store := configstore.New(opts.ConfigFile)
+	store, err := configstore.New(opts.ConfigFile)
+	if err != nil {
+		return nil, fmt.Errorf("config store: %w", err)
+	}
 
 	// Read cluster node ID from file. If the file exists and contains a
 	// valid integer, the daemon runs in cluster mode with ${node} variable
@@ -390,7 +417,7 @@ func New(opts Options) *Daemon {
 		localFailoverCommitDelay:   200 * time.Millisecond,
 		userspaceDemotionPrepUntil: make(map[int]time.Time),
 		applySem:                   semaphore.NewWeighted(1),
-	}
+	}, nil
 }
 
 // NOTE (#1519, sub-#1451 S4): the (*Daemon).legacyDP() escape hatch

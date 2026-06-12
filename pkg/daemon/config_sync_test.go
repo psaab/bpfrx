@@ -7,7 +7,6 @@ import (
 
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
-	"github.com/psaab/xpf/pkg/configstore"
 )
 
 // newClusterManager creates a cluster.Manager where node 0 is primary or
@@ -75,7 +74,7 @@ func TestHandleConfigSync_AcceptsWhenNoCluster(t *testing.T) {
 }
 
 func TestHandleConfigSync_SkipsWhenConfigAlreadyMatchesActive(t *testing.T) {
-	store := configstore.New(filepath.Join(t.TempDir(), "config"))
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "config"))
 	if err := store.EnterConfigure(); err != nil {
 		t.Fatalf("EnterConfigure: %v", err)
 	}

@@ -22,7 +22,7 @@ import (
 func newGRPCEBPFRejectStore(t *testing.T) *configstore.Store {
 	t.Helper()
 
-	store := configstore.New(filepath.Join(t.TempDir(), "xpf.conf"))
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
 	if err := store.EnterConfigure(); err != nil {
 		t.Fatalf("EnterConfigure() error = %v", err)
 	}
@@ -126,7 +126,7 @@ func TestCommitConfirmedRejectsRetiredEBPF(t *testing.T) {
 // pkg/config/compiler_test.go::TestCompileMultipleStrictErrorsAccumulated
 // so the two tests pin the same UX contract at two layers.
 func TestCompileCheckMultiErrorRendersThroughGRPC(t *testing.T) {
-	store := configstore.New(filepath.Join(t.TempDir(), "xpf.conf"))
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
 	if err := store.EnterConfigure(); err != nil {
 		t.Fatalf("EnterConfigure() error = %v", err)
 	}

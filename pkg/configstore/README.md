@@ -1,9 +1,17 @@
 # pkg/configstore
 
-Atomic candidate / active / rollback configuration persistence. JSON files
-written via temp-file + rename for crash safety, with a JSONL audit
-journal and rolling commit history. AES-GCM at-rest encryption when a
-master password is set.
+Durable candidate / active / rollback configuration persistence. JSON
+files written via `fsatomic.WriteFileDurable` (#1894: temp + fsync +
+rename + parent-dir fsync — they survive power loss, not just crashes),
+with a JSONL audit journal and rolling commit history. AES-GCM at-rest
+encryption when a master password is set.
+
+The constructor is fail-closed (#1893): `New(filePath) (*Store, error)`
+returns an error when the `.configdb` directory cannot be created.
+There is no file-only fallback backend — every persistence path
+dereferences the DB, so the old "falling back to file-only" warning was
+describing code that never existed, followed by a nil-pointer panic on
+the first Load/Save/commit.
 
 ## Entry points
 
@@ -14,9 +22,12 @@ master password is set.
   `EnterConfigureExclusive`, `ExitConfigure`, `SyncApply`. (See
   `store.go` for the full surface — there's no shorthand
   `Candidate()` or `History()`; use the `Show*` / `List*` forms.)
-- `DB` — `db.go`. Low-level atomic file I/O.
+- `DB` — `db.go`. Low-level durable file I/O (via `pkg/fsatomic`).
+  `NewDB` sweeps crash-leaked `.*.tmp-*` temps from `.configdb`.
 - `History` — `history.go`. Bounded ring of recent commits.
-- `Journal` — `journal.go`. Append-only JSONL audit trail.
+- `journal.Journal` — subpackage `journal/` (#1896). Append-only,
+  size-rotated, tail-readable JSONL audit trail; `configstore` keeps
+  the alias `JournalEntry = journal.Entry`. See "Audit journal" below.
 - `crypto.go` — AES-256-GCM at-rest encryption helpers
   (`maybeEncryptTreeJSON`, `maybeDecryptTreeJSON`,
   `deriveEncryptionKey`). No public type; the encryption hooks are
@@ -92,14 +103,66 @@ Test seams (`test_seams.go`): `SetWriteActiveForTesting` injects
 persistence failures on every persist path;
 `SetPersistRetryBackoffForTesting` makes the retry loop deterministic.
 
+## Audit journal (#1896)
+
+`.config.journal` (next to the config file) is a JSONL audit trail
+owned by the `journal/` subpackage.
+
+- **Compact v2 entries** — `{v, timestamp, action, detail,
+  config_hash}`. The v1 format appended the FULL compiled config per
+  commit (read by nobody — `show system commit` prints only
+  timestamp/action/detail) so the file grew by a config snapshot per
+  commit and leaked config content (incl. secrets) into a 0644 file.
+  Full trees live in the rollback files (above), which remain the
+  canonical config history.
+- **`config_hash`** — sha256 hex of the post-action active tree's
+  `Format()` text, the same text `saveRollbackFiles` writes: while a
+  slot is retained, `sha256sum <config>.N` correlates the rollback
+  file to its journal entry. Best-effort correlation only — slots
+  shift every commit and only ~50 are kept.
+- **Bounded reads** — `ListCommitHistory(limit)` is O(limit), not
+  O(lifetime): `journal.Tail` reverse-scans segments newest-first in
+  64 KiB chunks and stops at `limit` entries. Semantics preserved from
+  v1: last `limit` entries of ANY action, then filtered to commit
+  actions. `limit <= 0` still reads everything. Line assembly is
+  capped at 16 MiB (corrupt newline-free content is skipped, not
+  buffered whole).
+- **Rotation** — at append time, when the current segment reaches
+  1 MiB it rotates to `.config.journal.1` (keep 2 rotated segments,
+  oldest deleted). A pre-#1896 fat journal rotates to `.1` intact on
+  the first append — old history stays readable until it ages out; no
+  migration pass, and boot never reads the journal.
+- **Durability** — appends are fsynced (operator-paced; the commit
+  path already pays several fsyncs), `fsatomic.SyncDir` covers
+  create/rotate namespace changes, and a torn tail (crash between
+  write and fsync) is confined to one line: the reader's parse-or-skip
+  rule drops it and the next append starts on a fresh line.
+- **Back-compat** — legacy v1 lines (with `before`/`after` payloads)
+  decode tolerantly; unknown fields are ignored. A journal `Log`
+  failure is a `slog.Warn`, never a commit failure, and the
+  `persist_error` path does not recurse.
+- **Concurrency** — `Journal` serializes `Log`/`Tail` internally;
+  `ListCommitHistory` deliberately takes no `Store.mu` (rotation +
+  concurrent read would otherwise duplicate entries).
+
 ## Gotchas
 
-- Atomic write protocol: write temp file → `os.Rename` (POSIX-atomic
-  on the same filesystem). The previous file survives an interrupted
-  rename intact, and subsequent reads can fall back to a rollback
-  slot. Note: `db.go` does not call `f.Sync()` between write and
-  rename — durability against power-loss within the rename window
-  relies on the filesystem journal, not on an explicit `fsync`.
+- Durable write protocol (#1894): `fsatomic.WriteFileDurable` — temp
+  file in `.configdb`, fsync, rename, parent-dir fsync. The previous
+  file survives an interrupted write intact, and a completed write
+  survives power loss (the pre-#1894 writer skipped both fsyncs, so a
+  "successful" commit could surface as a zero-length file or silently
+  revert after a power cut).
+- Rollback text files (`<config>.N`) are the CANONICAL rollback
+  history (`loadRollbackHistory` reads them at boot; the DB rollback
+  slots have no production callers). `saveRollbackFiles` writes slot 1
+  durably and slots 2..N atomically (never missing, never torn; they
+  may lag after a power cut), then one `fsatomic.SyncDir` makes the
+  shuffle and the stale-slot unlinks durable — a single dir fsync
+  instead of ~50 fsync pairs under the store mutex.
+- `master.key` is written durably BEFORE any tree encrypted with it
+  (the key persist runs inside writeTree's encrypt step) — a lost key
+  meant a permanently undecryptable active config.
 - The candidate (in-memory) tree may be dirty (uncommitted edits
   accumulating). `Commit` atomically promotes candidate → active
   and bumps the rollback ring — but only after the new active has

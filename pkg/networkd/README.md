@@ -3,8 +3,10 @@
 systemd-networkd file generator. Writes `.link`, `.network`, and
 `.netdev` files for every xpfd-managed interface, handles MAC-based
 rename, VLAN parent flagging, DHCP avoidance, and atomic file
-replacement. Triggers `networkctl reload` only when files actually
-changed.
+replacement (AtomicGeneratedConfig, #1894: `fsatomic.WriteFileAtomic` —
+many small files per reconcile, deliberately no fsync; the procfs
+`rp_filter` knob stays a direct write, rename being impossible there).
+Triggers `networkctl reload` only when files actually changed.
 
 ## Entry points
 

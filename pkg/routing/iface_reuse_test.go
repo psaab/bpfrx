@@ -33,9 +33,28 @@ type fakeLinkOps struct {
 	// (goto anchorReady) is reached.
 	hiddenUntil map[string]int
 
+	// delFail[name] makes LinkDel fail for that link name (#1884
+	// removal-retention tests).
+	delFail map[string]error
+
+	// addrDelFail["name|ipnet"] makes AddrDel fail for that address on
+	// that link (#1884 link-local retention tests).
+	addrDelFail map[string]error
+
+	// noMasterErr makes LinkSetNoMaster fail (claim retention tests).
+	noMasterErr error
+
+	// addrs is the per-link kernel address store backing
+	// AddrAdd/AddrDel/AddrList for the #1884 reconcile tests.
+	addrs map[string][]netlink.Addr
+
 	// Recorded ops.
 	setUpLinks []netlink.Link
 	addrLinks  []netlink.Link
+	delNames   []string
+	noMaster   []string
+	mtuSet     map[string][]int
+	addrDels   map[string][]string
 }
 
 func newFakeLinkOps() *fakeLinkOps {
@@ -43,6 +62,11 @@ func newFakeLinkOps() *fakeLinkOps {
 		links:       map[string]netlink.Link{},
 		byNameCount: map[string]int{},
 		hiddenUntil: map[string]int{},
+		delFail:     map[string]error{},
+		addrDelFail: map[string]error{},
+		addrs:       map[string][]netlink.Addr{},
+		mtuSet:      map[string][]int{},
+		addrDels:    map[string][]string{},
 	}
 }
 
@@ -69,7 +93,13 @@ func (f *fakeLinkOps) LinkAdd(l netlink.Link) error {
 }
 
 func (f *fakeLinkOps) LinkDel(l netlink.Link) error {
-	delete(f.links, l.Attrs().Name)
+	name := l.Attrs().Name
+	if err, ok := f.delFail[name]; ok {
+		return err
+	}
+	f.delNames = append(f.delNames, name)
+	delete(f.links, name)
+	delete(f.addrs, name)
 	return nil
 }
 
@@ -81,24 +111,64 @@ func (f *fakeLinkOps) LinkSetUp(l netlink.Link) error {
 	return nil
 }
 
-func (f *fakeLinkOps) LinkSetDown(l netlink.Link) error        { return nil }
-func (f *fakeLinkOps) LinkSetMaster(l, m netlink.Link) error   { return nil }
-func (f *fakeLinkOps) LinkSetMTU(l netlink.Link, mtu int) error { return nil }
-func (f *fakeLinkOps) LinkList() ([]netlink.Link, error)       { return nil, nil }
+func (f *fakeLinkOps) LinkSetDown(l netlink.Link) error      { return nil }
+func (f *fakeLinkOps) LinkSetMaster(l, m netlink.Link) error { return nil }
+
+func (f *fakeLinkOps) LinkSetNoMaster(l netlink.Link) error {
+	if f.noMasterErr != nil {
+		return f.noMasterErr
+	}
+	f.noMaster = append(f.noMaster, l.Attrs().Name)
+	l.Attrs().MasterIndex = 0
+	return nil
+}
+
+func (f *fakeLinkOps) LinkSetMTU(l netlink.Link, mtu int) error {
+	name := l.Attrs().Name
+	f.mtuSet[name] = append(f.mtuSet[name], mtu)
+	l.Attrs().MTU = mtu
+	return nil
+}
+
+func (f *fakeLinkOps) LinkList() ([]netlink.Link, error) { return nil, nil }
 
 func (f *fakeLinkOps) AddrAdd(l netlink.Link, a *netlink.Addr) error {
 	_ = l.Attrs()
 	f.addrLinks = append(f.addrLinks, l)
+	name := l.Attrs().Name
+	f.addrs[name] = append(f.addrs[name], *a)
 	return nil
 }
 
 func (f *fakeLinkOps) AddrDel(l netlink.Link, a *netlink.Addr) error {
-	_ = l.Attrs()
+	name := l.Attrs().Name
+	key := a.IPNet.String()
+	if err, ok := f.addrDelFail[name+"|"+key]; ok {
+		return err
+	}
+	f.addrDels[name] = append(f.addrDels[name], key)
+	kept := f.addrs[name][:0]
+	for _, existing := range f.addrs[name] {
+		if existing.IPNet.String() != key {
+			kept = append(kept, existing)
+		}
+	}
+	f.addrs[name] = kept
 	return nil
 }
 
 func (f *fakeLinkOps) AddrList(l netlink.Link, family int) ([]netlink.Addr, error) {
-	return nil, nil
+	return append([]netlink.Addr(nil), f.addrs[l.Attrs().Name]...), nil
+}
+
+// hasAddr reports whether the fake kernel store holds ipnet on name.
+func (f *fakeLinkOps) hasAddr(name, ipnet string) bool {
+	for _, a := range f.addrs[name] {
+		if a.IPNet.String() == ipnet {
+			return true
+		}
+	}
+	return false
 }
 
 // noopVRFBinder satisfies vrfBinder without touching netlink.
@@ -118,12 +188,16 @@ func TestTunnelAnchorReuseUsesExistingLink(t *testing.T) {
 	existing := &netlink.Tuntap{
 		LinkAttrs: netlink.LinkAttrs{Name: name, Index: wantIndex},
 		Mode:      netlink.TUNTAP_MODE_TUN,
+		// #1884: the reuse gate now also requires NO_PI + persistent
+		// (anchorReusable), matching what kernel readback reports for a
+		// real anchor created by this code.
+		Flags: netlink.TUNTAP_NO_PI,
 	}
 	ops.links[name] = existing
 	ops.addExisting = true // force the LinkAdd-fails reuse branch
-	// The pre-loop delete lookup (call #1) must miss so the link is not
-	// deleted; LinkAdd then fails EEXIST and the fallback lookup (call #2)
-	// finds the existing TUN — the only path that reaches goto anchorReady.
+	// The reuse-first lookup (call #1) must miss so the link is not
+	// reused directly; LinkAdd then fails EEXIST and the fallback lookup
+	// (call #2) finds the existing TUN — the #1706 transient-race path.
 	ops.hiddenUntil[name] = 1
 
 	tm := &tunnelManager{ops: ops, vrfBinder: noopVRFBinder{}, keepalives: map[string]*keepaliveRunner{}}

@@ -32,7 +32,7 @@ func (d *natApplyResultAPIDP) ReadNATRuleCounter(counterID uint32) (dataplane.Co
 func newNATStatsAPIStore(t *testing.T) *configstore.Store {
 	t.Helper()
 
-	store := configstore.New(filepath.Join(t.TempDir(), "xpf.conf"))
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
 	if err := store.EnterConfigure(); err != nil {
 		t.Fatalf("EnterConfigure() error = %v", err)
 	}

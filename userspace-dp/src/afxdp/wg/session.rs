@@ -27,6 +27,42 @@ pub(crate) const REPLAY_WINDOW: u64 = 64;
 /// transport messages and rekey.
 pub(crate) const REJECT_AFTER_MESSAGES: u64 = u64::MAX - (1u64 << 13);
 
+const NANOS_PER_SEC: u64 = 1_000_000_000;
+
+/// WG whitepaper §6.1 timer constants (#1888 S5), all CLOCK_MONOTONIC
+/// nanoseconds. Enforcement loci are documented in
+/// `docs/research/1888-wg-timers/plan.md` §3 (the section of record).
+///
+/// REKEY_AFTER_TIME: on SENDING transport data, if the current session
+/// is older than this AND we initiated it, initiate a new handshake.
+pub(crate) const REKEY_AFTER_TIME_NS: u64 = 120 * NANOS_PER_SEC;
+/// REJECT_AFTER_TIME: session keys older than this MUST NOT be used to
+/// send or receive. Enforced per-use in try_encap/try_decap; the
+/// control thread's `expire_sessions` tears the session down.
+pub(crate) const REJECT_AFTER_TIME_NS: u64 = 180 * NANOS_PER_SEC;
+/// REKEY_TIMEOUT: handshake-initiation retransmit pacing. (Spec jitter
+/// of <=333ms is deliberately omitted — sub-granularity at the 1s
+/// control-thread tick, single-digit tunnel counts.)
+pub(crate) const REKEY_TIMEOUT_NS: u64 = 5 * NANOS_PER_SEC;
+/// REKEY_ATTEMPT_TIME: give up retransmitting after this long; resume
+/// only on a fresh trigger (new egress data / persistent keepalive).
+pub(crate) const REKEY_ATTEMPT_TIME_NS: u64 = 90 * NANOS_PER_SEC;
+/// KEEPALIVE_TIMEOUT: passive keepalive — after receiving data, if
+/// nothing (data or keepalive) was sent within this window, send an
+/// authenticated empty transport record.
+pub(crate) const KEEPALIVE_TIMEOUT_NS: u64 = 10 * NANOS_PER_SEC;
+/// "Suspect dead session": after sending data, if NO authenticated
+/// packet was received within KEEPALIVE_TIMEOUT + REKEY_TIMEOUT,
+/// initiate a new handshake. (Jitter omitted, same rationale as
+/// REKEY_TIMEOUT.)
+pub(crate) const NO_REPLY_REINIT_NS: u64 = KEEPALIVE_TIMEOUT_NS + REKEY_TIMEOUT_NS;
+/// Receive-horizon rekey: on RECEIVING a transport record, if the
+/// current session is older than REJECT_AFTER_TIME - KEEPALIVE_TIMEOUT
+/// - REKEY_TIMEOUT (165s) AND we initiated it, initiate — covers a
+/// receive-only initiator before the responder's 180s discard.
+pub(crate) const RECV_REKEY_HORIZON_NS: u64 =
+    REJECT_AFTER_TIME_NS - KEEPALIVE_TIMEOUT_NS - REKEY_TIMEOUT_NS;
+
 #[inline]
 fn reserve_next_counter(counter: &AtomicU64) -> Option<u64> {
     counter
@@ -91,6 +127,17 @@ pub(crate) struct WgSession {
     /// session is treated as no-usable-session until a successful
     /// inbound `read_message` flips the flag.
     pub(crate) confirmed: AtomicBool,
+    /// CLOCK_MONOTONIC ns at install (#1888 S5). Basis for the
+    /// REKEY_AFTER_TIME / RECV_REKEY_HORIZON / REJECT_AFTER_TIME age
+    /// checks. Stamped by the handshake-completion paths from
+    /// `WgEngine::now_ns()` so every age comparison shares one clock
+    /// domain (including under the test mock clock).
+    pub(crate) created_ns: u64,
+    /// Which side initiated this session (#1888 S5). REKEY_AFTER_TIME
+    /// and the receive-horizon rekey fire only on Initiator-role
+    /// sessions — the spec's initiator-only rule that prevents both
+    /// sides rekeying simultaneously.
+    pub(crate) role: SessionRole,
 }
 
 impl std::fmt::Debug for WgSession {
@@ -125,18 +172,23 @@ impl WgSession {
             peer_index,
             peer_pubkey,
             SessionRole::Initiator,
+            super::counters::monotonic_now_ns(),
         )
     }
 
     /// Create a session and record its role for key-confirmation
-    /// gating. See the `confirmed` field doc on `WgSession` for the
-    /// initiator-vs-responder contract.
+    /// gating plus its install stamp for the #1888 age timers. See the
+    /// `confirmed` field doc on `WgSession` for the
+    /// initiator-vs-responder contract. `created_ns` is the caller's
+    /// clock read (`WgEngine::now_ns()` on the completion paths) so the
+    /// age comparisons stay in one clock domain.
     pub(crate) fn new_with_role(
         transport: StatelessTransportState,
         local_index: u32,
         peer_index: u32,
         peer_pubkey: [u8; 32],
         role: SessionRole,
+        created_ns: u64,
     ) -> Self {
         let confirmed = matches!(role, SessionRole::Initiator);
         Self {
@@ -147,6 +199,8 @@ impl WgSession {
             replay: Mutex::new(ReplayState::default()),
             peer_pubkey,
             confirmed: AtomicBool::new(confirmed),
+            created_ns,
+            role,
         }
     }
 
@@ -349,6 +403,18 @@ mod session_tests {
     #[test]
     fn reject_after_messages_constant_matches_wireguard_spec() {
         assert_eq!(REJECT_AFTER_MESSAGES, 0xffff_ffff_ffff_dfff);
+    }
+
+    /// WG whitepaper §6.1 timer constants (#1888 S5).
+    #[test]
+    fn timer_constants_match_wireguard_spec() {
+        assert_eq!(REKEY_AFTER_TIME_NS, 120_000_000_000);
+        assert_eq!(REJECT_AFTER_TIME_NS, 180_000_000_000);
+        assert_eq!(REKEY_TIMEOUT_NS, 5_000_000_000);
+        assert_eq!(REKEY_ATTEMPT_TIME_NS, 90_000_000_000);
+        assert_eq!(KEEPALIVE_TIMEOUT_NS, 10_000_000_000);
+        assert_eq!(NO_REPLY_REINIT_NS, 15_000_000_000);
+        assert_eq!(RECV_REKEY_HORIZON_NS, 165_000_000_000);
     }
 
     #[test]

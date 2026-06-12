@@ -555,6 +555,25 @@ pub(crate) struct WgTunnelStatus {
     pub tun_write_errors: u64,
     #[serde(rename = "tun_rx_drops_no_endpoint", default)]
     pub tun_rx_drops_no_endpoint: u64,
+    // --- #1888 S5 timers ---
+    #[serde(rename = "encap_drops_expired", default)]
+    pub encap_drops_expired: u64,
+    #[serde(rename = "decap_drops_expired", default)]
+    pub decap_drops_expired: u64,
+    #[serde(rename = "sessions_expired", default)]
+    pub sessions_expired: u64,
+    #[serde(rename = "rekeys_initiated_age", default)]
+    pub rekeys_initiated_age: u64,
+    #[serde(rename = "rekeys_initiated_dead_peer", default)]
+    pub rekeys_initiated_dead_peer: u64,
+    #[serde(rename = "rekeys_initiated_keepalive_no_session", default)]
+    pub rekeys_initiated_keepalive_no_session: u64,
+    #[serde(rename = "keepalives_tx_passive", default)]
+    pub keepalives_tx_passive: u64,
+    #[serde(rename = "keepalives_tx_persistent", default)]
+    pub keepalives_tx_persistent: u64,
+    #[serde(rename = "pending_aborted_attempt_window", default)]
+    pub pending_aborted_attempt_window: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

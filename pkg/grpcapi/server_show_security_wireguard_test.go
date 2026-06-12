@@ -5,7 +5,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
@@ -25,7 +24,7 @@ func (f *wireguardUserspaceDP) Status() (dpuserspace.ProcessStatus, error) {
 // the same shared formatter the local CLI uses.
 func TestShowTextWireguardTopics(t *testing.T) {
 	s := &Server{
-		store: configstore.New(t.TempDir() + "/xpf.conf"),
+		store: newConfigStore(t, t.TempDir()+"/xpf.conf"),
 		dp: &wireguardUserspaceDP{
 			Manager: dataplane.New(),
 			status: dpuserspace.ProcessStatus{
@@ -84,7 +83,7 @@ func TestShowTextWireguardTopics(t *testing.T) {
 // message rather than nothing.
 func TestShowTextWireguardEmpty(t *testing.T) {
 	s := &Server{
-		store: configstore.New(t.TempDir() + "/xpf.conf"),
+		store: newConfigStore(t, t.TempDir()+"/xpf.conf"),
 		dp: &wireguardUserspaceDP{
 			Manager: dataplane.New(),
 		},

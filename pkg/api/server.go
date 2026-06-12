@@ -89,6 +89,14 @@ type Config struct {
 	// the xpf_ipmon_* metrics (#1827). Optional; if nil, the family is
 	// omitted.
 	IPMonStatusFn func() []ipmon.PolicyStatus
+	// RPMPinFailedFn surfaces the count of RPM next-hop probe pins
+	// whose kernel install (fwmark rule + pinned route) is currently
+	// failed — the affected tests hold state instead of probing the
+	// default path, so a nonzero value means those uplinks are not
+	// being health-checked (#1895). Backs the
+	// xpf_rpm_probe_pin_install_failures gauge. Optional; if nil, the
+	// gauge is not emitted.
+	RPMPinFailedFn func() float64
 	// FRRReloadDegradedFn reports whether the last applied FRR reload
 	// fell back to the additive vtysh -f path (full frr-reload.py diff
 	// failed) and the in-manager retry has not yet converged —
@@ -118,6 +126,7 @@ type Server struct {
 	neighborPhaseAgeFn      func() map[string]float64
 	frrReloadDegradedFn     func() bool
 	ipmonStatusFn           func() []ipmon.PolicyStatus
+	rpmPinFailedFn          func() float64
 	startTime               time.Time
 }
 
@@ -140,6 +149,7 @@ func NewServer(cfg Config) *Server {
 		neighborPhaseAgeFn:      cfg.NeighborPhaseAgeFn,
 		frrReloadDegradedFn:     cfg.FRRReloadDegradedFn,
 		ipmonStatusFn:           cfg.IPMonStatusFn,
+		rpmPinFailedFn:          cfg.RPMPinFailedFn,
 		startTime:               time.Now(),
 	}
 

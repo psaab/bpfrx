@@ -134,6 +134,16 @@ type Manager struct {
 	// pkg/routing programs (routing.BuildProbePins).
 	marks map[string]uint32
 
+	// pinFailed maps "probe/test" to the kernel install error for pins
+	// whose fwmark rule / pinned route failed to program (#1895), as
+	// reported by routing.Manager.ApplyProbePins and threaded in by the
+	// daemon via SetPinInstallResults. A test with a failed pin never
+	// probes (executeProbe returns ErrProbeSetup before any socket is
+	// opened) — an unbacked SO_MARK would fall through to the main
+	// table and measure the default path, turning a dead pinned uplink
+	// into a false PASS that suppresses ip-monitoring failover.
+	pinFailed map[string]error
+
 	// icmpListen is the injectable raw-socket seam for the ICMP echo
 	// prober. nil = realICMPListen.
 	icmpListen icmpListenFunc
@@ -160,6 +170,58 @@ func (m *Manager) SetRethMap(rethMap map[string]string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.rethMap = rethMap
+}
+
+// SetPinInstallResults supplies the per-test probe-pin install
+// failures from the most recent routing.Manager.ApplyProbePins (keys
+// "probe/test", values the install error; nil/empty = all pins
+// installed). The map is replaced wholesale, so a successful re-apply
+// clears earlier failures and live probe loops resume on their next
+// tick — no probe restart required. On a config change the daemon
+// publishes AFTER Apply (the HoldPinsForReprogram union covers the
+// interim); on a hash-gated pin retry it publishes immediately
+// (#1895).
+func (m *Manager) SetPinInstallResults(failed map[string]error) {
+	cp := make(map[string]error, len(failed))
+	for k, v := range failed {
+		cp[k] = v
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pinFailed = cp
+}
+
+// HoldPinsForReprogram replaces the pin-failure map with one that
+// holds EVERY currently-marked (live) pinned test PLUS the supplied
+// new pin keys, all with cause. Called by the daemon immediately
+// before the kernel pin band is cleared-and-reprogrammed: live probe
+// goroutines — including ones whose keys are absent from the new pin
+// set, or whose deterministic mark is about to change — must not send
+// an SO_MARK probe against a band in flux (a stale mark can match
+// another test's new fwmark rule and measure the wrong uplink; Codex
+// PR #1899 r2). The caller publishes the real install results via
+// SetPinInstallResults once the reprogram (and, on a config change,
+// the probe re-Apply) has completed.
+func (m *Manager) HoldPinsForReprogram(newPinKeys []string, cause error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	held := make(map[string]error, len(m.marks)+len(newPinKeys))
+	for k := range m.marks {
+		held[k] = cause
+	}
+	for _, k := range newPinKeys {
+		held[k] = cause
+	}
+	m.pinFailed = held
+}
+
+// PinInstallFailureCount reports how many next-hop probe pins are
+// currently failed-to-install (backs the
+// xpf_rpm_probe_pin_install_failures gauge, #1895).
+func (m *Manager) PinInstallFailureCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.pinFailed)
 }
 
 func (m *Manager) fireEvent(name, owner, testName string) {
@@ -197,6 +259,12 @@ func (m *Manager) Apply(ctx context.Context, cfg *config.RPMConfig) {
 	m.StopAll()
 
 	if cfg == nil || len(cfg.Probes) == 0 {
+		// Clear the mark assignment too: stale marks would otherwise
+		// inflate later HoldPinsForReprogram unions (#1895 hygiene —
+		// no goroutines exist after StopAll, so this is cosmetic).
+		m.mu.Lock()
+		m.marks = nil
+		m.mu.Unlock()
 		return
 	}
 
@@ -311,8 +379,10 @@ func (m *Manager) runSingleTest(ctx context.Context, probeName string, test *con
 		rtt, err := m.executeProbe(ctx, test, key)
 
 		// ErrProbeSetup = environment/capability failure (raw socket
-		// open denied, marshal): the probe never reached the wire, so
-		// it carries NO path-health signal. Hold the test's current
+		// open denied, marshal, probe pin not installed #1895): the
+		// probe never reached the wire — or must not be sent at all
+		// because its kernel pin is unbacked — so it carries NO
+		// path-health signal. Hold the test's current
 		// state completely — no counters, no status change, no
 		// events, no Transition — so ip-monitoring can never actuate
 		// routes off a capability regression (AGY PR #1843 F2). Log
@@ -415,7 +485,33 @@ func (m *Manager) probeOpts(test *config.RPMTest, key string) probeSockOpts {
 	return probeSockOpts{BindDevice: bindDev, Mark: mark}
 }
 
+// pinInstallError gates next-hop-pinned tests on their kernel pin
+// actually being installed (#1895). A pin that failed to program —
+// or a next-hop test that never received a pin slot at all
+// (band-exhaustion belt-and-braces; commit validation caps this on
+// the strict path) — returns an ErrProbeSetup-wrapped error so the
+// probe loop holds the test's state. The probe must NOT be sent: an
+// unbacked SO_MARK falls through to the main table and measures the
+// default path instead of the pinned uplink (false PASS).
+func (m *Manager) pinInstallError(test *config.RPMTest, key string) error {
+	if test.NextHop == "" {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if cause, ok := m.pinFailed[key]; ok {
+		return fmt.Errorf("%w: probe pin not installed: %v", ErrProbeSetup, cause)
+	}
+	if m.marks[key] == 0 {
+		return fmt.Errorf("%w: no probe pin slot assigned for next-hop test", ErrProbeSetup)
+	}
+	return nil
+}
+
 func (m *Manager) executeProbe(ctx context.Context, test *config.RPMTest, key string) (time.Duration, error) {
+	if err := m.pinInstallError(test, key); err != nil {
+		return 0, err
+	}
 	opts := m.probeOpts(test, key)
 	switch test.EffectiveProbeType() {
 	case "icmp-ping":

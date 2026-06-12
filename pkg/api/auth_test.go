@@ -8,8 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/psaab/xpf/pkg/configstore"
 )
 
 func basicAuth(user, pass string) string {
@@ -98,9 +96,9 @@ func TestAuthMiddleware(t *testing.T) {
 			want:   http.StatusUnauthorized,
 		},
 		{
-			name:   "www-authenticate header on 401",
-			path:   "/api/v1/security/sessions",
-			want:   http.StatusUnauthorized,
+			name: "www-authenticate header on 401",
+			path: "/api/v1/security/sessions",
+			want: http.StatusUnauthorized,
 		},
 	}
 
@@ -127,7 +125,7 @@ func TestAuthMiddleware(t *testing.T) {
 }
 
 func TestConfigExportHandler(t *testing.T) {
-	store := configstore.New(filepath.Join(t.TempDir(), "config"))
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "config"))
 	if err := store.EnterConfigure(); err != nil {
 		t.Fatal(err)
 	}

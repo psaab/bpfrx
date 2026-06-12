@@ -167,8 +167,8 @@ func main() {
 	// sampling (256× CPU cost — bounded-cohort microbench only),
 	// also pass --enable-cold-path-1-in-1-sampling.
 	const (
-		flagColdPathSampleMask  = "cold-path-sample-mask"
-		flagColdPath1in1        = "enable-cold-path-1-in-1-sampling"
+		flagColdPathSampleMask = "cold-path-sample-mask"
+		flagColdPath1in1       = "enable-cold-path-1-in-1-sampling"
 	)
 	coldPathSampleMask := flag.Uint64(flagColdPathSampleMask, 0xff,
 		"Cold-path latency histogram sample mask (powers-of-two minus one). "+
@@ -231,7 +231,7 @@ func main() {
 		Level: logLevel,
 	})))
 
-	d := daemon.New(daemon.Options{
+	d, err := daemon.New(daemon.Options{
 		ConfigFile:         *configFile,
 		NoDataplane:        *noDataplane,
 		APIAddr:            *apiAddr,
@@ -239,6 +239,12 @@ func main() {
 		Version:            version,
 		ColdPathSampleMask: coldPathMaskPtr,
 	})
+	if err != nil {
+		// #1893: fail closed — a daemon that cannot persist config must
+		// not boot pretending otherwise.
+		fmt.Fprintf(os.Stderr, "xpfd: %v\n", err)
+		os.Exit(1)
+	}
 
 	if err := d.Run(context.Background()); err != nil {
 		fmt.Fprintf(os.Stderr, "xpfd: %v\n", err)

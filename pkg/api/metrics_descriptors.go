@@ -256,6 +256,15 @@ func newCollector(srv *Server) *xpfCollector {
 				"when config persistence is healthy.",
 			nil, nil,
 		),
+		rpmPinInstallFailures: prometheus.NewDesc(
+			"xpf_rpm_probe_pin_install_failures",
+			"Number of RPM next-hop probe pins whose kernel fwmark rule / "+
+				"pinned route failed to install. Affected tests hold their "+
+				"prior state (ErrProbeSetup) instead of probing the default "+
+				"path, so a nonzero value means those uplinks are NOT being "+
+				"health-checked (#1895).",
+			nil, nil,
+		),
 		ipmonPolicyFailed: prometheus.NewDesc(
 			"xpf_ipmon_policy_failed",
 			"1 while the services ip-monitoring policy is in FAIL state "+
@@ -1194,7 +1203,7 @@ func newCollector(srv *Server) *xpfCollector {
 		),
 		wgTransportDropsTotal: prometheus.NewDesc(
 			"xpf_userspace_wg_transport_drops_total",
-			"WireGuard transport drops by direction and reason. decap: malformed_header | unknown_session | counter_ceiling | crypto | replay | allowed_ips | malformed_inner | buffer. encap: no_session | unconfirmed | rekey_required | mtu | other. `unconfirmed` is the responder key-confirmation window (transient at rekey — distinct from no_session so operators do not tcpdump a blip); `mtu` is the exact pad-aware guard at BOTH egress sites (the #1736 v4-mapped blackhole class) (#1865).",
+			"WireGuard transport drops by direction and reason. decap: malformed_header | unknown_session | counter_ceiling | crypto | replay | allowed_ips | malformed_inner | buffer | expired. encap: no_session | unconfirmed | rekey_required | mtu | other | expired. `expired` is the #1888 per-use REJECT_AFTER_TIME refusal (drop-only on decap; arms the rekey edge on encap). `unconfirmed` is the responder key-confirmation window (transient at rekey — distinct from no_session so operators do not tcpdump a blip); `mtu` is the exact pad-aware guard at BOTH egress sites (the #1736 v4-mapped blackhole class) (#1865).",
 			[]string{"tunnel", "direction", "reason"}, nil,
 		),
 		wgSendErrorsTotal: prometheus.NewDesc(
@@ -1210,6 +1219,26 @@ func newCollector(srv *Server) *xpfCollector {
 		wgLastHandshakeTimeSeconds: prometheus.NewDesc(
 			"xpf_userspace_wg_last_handshake_time_seconds",
 			"Wall-clock epoch seconds of the most recent WireGuard handshake completion (either role). Absent until the first handshake completes; compute age as time() - this (#1865).",
+			[]string{"tunnel"}, nil,
+		),
+		wgRekeysInitiatedTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_rekeys_initiated_total",
+			"Timer-driven WireGuard handshake initiations by reason: age = REKEY_AFTER_TIME/receive-horizon/expiry on the live session; dead_peer = 15s no-reply reinit (sent data, heard nothing); keepalive_no_session = persistent keepalive due with no usable session (#1888 S5).",
+			[]string{"tunnel", "reason"}, nil,
+		),
+		wgKeepalivesSentTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_keepalives_sent_total",
+			"WireGuard keepalives SENT by kind: passive = 10s KEEPALIVE_TIMEOUT replies to inbound data (incl. the post-handshake key-confirmation keepalive); persistent = operator-configured persistent-keepalive interval (#1888 S5).",
+			[]string{"tunnel", "kind"}, nil,
+		),
+		wgSessionsExpiredTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_sessions_expired_total",
+			"WireGuard transport sessions torn down at REJECT_AFTER_TIME (180s) by the control thread's expiry pass. Per-use refusals are the expired reason under xpf_userspace_wg_transport_drops_total (#1888 S5).",
+			[]string{"tunnel"}, nil,
+		),
+		wgHandshakeAttemptsAbortedTotal: prometheus.NewDesc(
+			"xpf_userspace_wg_handshake_attempts_aborted_total",
+			"Pending WireGuard handshake reservations released by the REKEY_ATTEMPT_TIME (90s) give-up — a stale msg2 after this cannot complete the abandoned handshake (#1888 S5).",
 			[]string{"tunnel"}, nil,
 		),
 	}

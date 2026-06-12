@@ -169,8 +169,8 @@ system {
 // used `tree.FindChild("system")` which returned only the FIRST
 // match, so a config like
 //
-//   system { host-name fw1; }
-//   system { dataplane-type ebpf; }
+//	system { host-name fw1; }
+//	system { dataplane-type ebpf; }
 //
 // slipped through the rewrite. The post-fix walker iterates over
 // every top-level child whose first key is "system" so all
@@ -262,7 +262,7 @@ func TestStoreLoad_RewritesPersistedEBPFDataplaneType(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	store := New(filepath.Join(dir, "xpf.conf"))
+	store := newTestStoreAt(t, filepath.Join(dir, "xpf.conf"))
 
 	// Build a retired-EBPF tree off-store and stamp it on disk.
 	retiredTree := mustParseTree(t, "set system dataplane-type ebpf")

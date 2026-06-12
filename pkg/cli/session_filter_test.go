@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/dataplane"
 )
 
@@ -195,7 +194,7 @@ func TestBuildPeerClearRequestProtocolCoverage(t *testing.T) {
 // produced an EMPTY filter and cleared the whole table (AGY r1
 // Finding 2 / Codex r1 High).
 func TestSessionFilterParseErrors(t *testing.T) {
-	c := &CLI{store: configstore.New(filepath.Join(t.TempDir(), "xpf.conf"))}
+	c := &CLI{store: newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))}
 	for _, tc := range []struct {
 		name string
 		args []string

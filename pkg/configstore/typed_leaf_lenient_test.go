@@ -24,7 +24,7 @@ import (
 // pre-gate binary.
 func writeStoredConfig(t *testing.T, cfgPath string, lines ...string) {
 	t.Helper()
-	writer := New(cfgPath)
+	writer := newTestStoreAt(t, cfgPath)
 	tree := &config.ConfigTree{}
 	for _, line := range lines {
 		path, err := config.ParseSetCommand(line)
@@ -48,7 +48,7 @@ func TestLoad_ToleratesStoredGarbageTypedLeaf(t *testing.T) {
 	writeStoredConfig(t, cfgPath,
 		"set class-of-service schedulers be transmit-rate asd")
 
-	s := New(cfgPath)
+	s := newTestStoreAt(t, cfgPath)
 	if err := s.Load(); err != nil {
 		t.Fatalf("Load() must tolerate stored typed-leaf garbage, got: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestLoad_ToleratesStoredGarbageTypedLeaf(t *testing.T) {
 // HA config sync from a primary carrying a typed-leaf violation must not
 // alarm-loop the standby: SyncApply uses the same lenient path as Load.
 func TestSyncApply_ToleratesTypedLeafViolation(t *testing.T) {
-	s := New(filepath.Join(t.TempDir(), "config"))
+	s := newTestStoreAt(t, filepath.Join(t.TempDir(), "config"))
 	cfg, err := s.SyncApply(`class-of-service {
     schedulers {
         be {
@@ -101,7 +101,7 @@ func TestLoad_ToleratesStoredOutOfRangeChassisLeaf(t *testing.T) {
 		"set chassis cluster cluster-id 999",
 		"set chassis cluster heartbeat-interval 200")
 
-	s := New(cfgPath)
+	s := newTestStoreAt(t, cfgPath)
 	if err := s.Load(); err != nil {
 		t.Fatalf("Load() must tolerate stored out-of-range cluster-id, got: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestLoad_ToleratesStoredOutOfRangeChassisLeaf(t *testing.T) {
 // Strict-path e2e for a chassis typed leaf: CommitCheck and Commit reject
 // an out-of-range value entered by the operator.
 func TestCommitCheck_RejectsOutOfRangeChassisLeaf(t *testing.T) {
-	s := New(filepath.Join(t.TempDir(), "config"))
+	s := newTestStoreAt(t, filepath.Join(t.TempDir(), "config"))
 	if err := s.EnterConfigure(); err != nil {
 		t.Fatalf("EnterConfigure: %v", err)
 	}
@@ -146,5 +146,227 @@ func TestCommitCheck_RejectsOutOfRangeChassisLeaf(t *testing.T) {
 	}
 	if _, err := s.Commit(); err == nil {
 		t.Fatal("expected Commit to reject priority 255, got nil")
+	}
+}
+
+// #1319 PR 3 — boot safety for the system typed leaves. A stored
+// unknown poll-mode was silently ignored before the enum was typed; it
+// must keep booting (warn only) and be rejected by the next strict
+// commit.
+func TestLoad_ToleratesStoredUnknownPollMode(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config")
+	writeStoredConfig(t, cfgPath,
+		"set system dataplane poll-mode polling")
+
+	s := newTestStoreAt(t, cfgPath)
+	if err := s.Load(); err != nil {
+		t.Fatalf("Load() must tolerate a stored unknown poll-mode, got: %v", err)
+	}
+	if s.ActiveConfig() == nil {
+		t.Fatal("ActiveConfig() is nil after tolerated Load")
+	}
+
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	_, err := s.CommitCheck()
+	if err == nil {
+		t.Fatal("CommitCheck must reject the stored unknown poll-mode, got nil")
+	}
+	if !strings.Contains(err.Error(), "poll-mode") {
+		t.Fatalf("CommitCheck error should reference poll-mode: %v", err)
+	}
+}
+
+// #1319 PR 3 — firewall forwarding-class cross-ref, end-to-end through
+// the PRODUCTION gate path (Store commit-check / Load / SyncApply, the
+// call sites that pass cfg=nil to SchemaValidate). These are the proving
+// tests for the tree-based design: a dangling reference rejects at
+// commit, a same-commit definition + reference passes (atomicity), and
+// the same dangling reference WARN-boots through the tolerant paths.
+
+func TestCommitCheck_RejectsDanglingForwardingClass(t *testing.T) {
+	s := newTestStoreAt(t, filepath.Join(t.TempDir(), "config"))
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	if err := s.SetFromInput("firewall family inet filter f1 term t1 then forwarding-class no-such-class"); err != nil {
+		t.Fatalf("SetFromInput: %v", err)
+	}
+	_, err := s.CommitCheck()
+	if err == nil {
+		t.Fatal("expected CommitCheck to reject the dangling forwarding-class, got nil")
+	}
+	if !strings.Contains(err.Error(), "no-such-class") {
+		t.Fatalf("CommitCheck error should name the dangling class: %v", err)
+	}
+	if _, err := s.Commit(); err == nil {
+		t.Fatal("expected Commit to reject the dangling forwarding-class, got nil")
+	}
+}
+
+// Atomicity: the class definition and the reference land in the SAME
+// commit and must validate against each other — the tree-based refs are
+// collected from the candidate tree itself, never from compiled state.
+func TestCommitCheck_AcceptsSameCommitForwardingClass(t *testing.T) {
+	s := newTestStoreAt(t, filepath.Join(t.TempDir(), "config"))
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	for _, line := range []string{
+		"class-of-service forwarding-classes queue 5 iperf-video",
+		"firewall family inet filter f1 term t1 then forwarding-class iperf-video",
+	} {
+		if err := s.SetFromInput(line); err != nil {
+			t.Fatalf("SetFromInput(%q): %v", line, err)
+		}
+	}
+	if _, err := s.CommitCheck(); err != nil {
+		t.Fatalf("same-commit definition + reference must pass CommitCheck, got: %v", err)
+	}
+	if _, err := s.Commit(); err != nil {
+		t.Fatalf("same-commit definition + reference must Commit, got: %v", err)
+	}
+}
+
+// A node-variable cluster config keeps its forwarding-class definitions
+// inside `groups node0 { ... }` selected via `apply-groups ${node}`.
+// The strict gate validates the EXPANDED tree (and the refs collection
+// also unions group bodies), so this must never false-reject.
+func TestCommitCheck_AcceptsGroupDefinedForwardingClass(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config")
+	writeStoredConfig(t, cfgPath,
+		"set groups node0 class-of-service forwarding-classes queue 5 iperf-video",
+		`set apply-groups "${node}"`,
+		"set firewall family inet filter f1 term t1 then forwarding-class iperf-video")
+
+	s := newTestStoreAt(t, cfgPath)
+	s.SetNodeID(0)
+	if err := s.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	if _, err := s.CommitCheck(); err != nil {
+		t.Fatalf("group-defined forwarding-class must pass the strict gate, got: %v", err)
+	}
+}
+
+// AGY r1 HIGH on PR #1886: apply-groups expansion REMOVES the groups
+// stanza, so a forwarding-class defined ONLY in the PEER node's group
+// (un-applied locally) used to vanish from the refs union — a shared
+// firewall section referencing it would commit on node1 but falsely
+// reject on node0, wedging cluster config sync. The strict gate now
+// collects definitions from the PRE-expansion candidate too
+// (SchemaValidateWithDefinitions).
+func TestCommitCheck_AcceptsPeerNodeGroupForwardingClass(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config")
+	writeStoredConfig(t, cfgPath,
+		"set groups node0 system host-name fw0",
+		"set groups node1 class-of-service forwarding-classes queue 5 iperf-video",
+		`set apply-groups "${node}"`,
+		"set firewall family inet filter f1 term t1 then forwarding-class iperf-video")
+
+	s := newTestStoreAt(t, cfgPath)
+	s.SetNodeID(0) // node1's group is NOT applied here
+	if err := s.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	if _, err := s.CommitCheck(); err != nil {
+		t.Fatalf("peer-node group definition must satisfy the shared reference, got: %v", err)
+	}
+}
+
+// A stored dangling reference (legal before the leaf was typed) must
+// warn-boot, compile verbatim, and be rejected by the next strict commit.
+func TestLoad_ToleratesStoredDanglingForwardingClass(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config")
+	writeStoredConfig(t, cfgPath,
+		"set firewall family inet filter f1 term t1 then forwarding-class no-such-class")
+
+	s := newTestStoreAt(t, cfgPath)
+	if err := s.Load(); err != nil {
+		t.Fatalf("Load() must tolerate a stored dangling forwarding-class, got: %v", err)
+	}
+	active := s.ActiveConfig()
+	if active == nil {
+		t.Fatal("ActiveConfig() is nil after tolerated Load")
+	}
+	filter := active.Firewall.FiltersInet["f1"]
+	if filter == nil || len(filter.Terms) != 1 || filter.Terms[0].ForwardingClass != "no-such-class" {
+		t.Fatalf("stored dangling reference must compile verbatim, got %+v", filter)
+	}
+
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	_, err := s.CommitCheck()
+	if err == nil {
+		t.Fatal("CommitCheck must reject the stored dangling forwarding-class, got nil")
+	}
+	if !strings.Contains(err.Error(), "no-such-class") {
+		t.Fatalf("CommitCheck error should name the dangling class: %v", err)
+	}
+}
+
+// HA config sync carrying the dangling reference must not alarm-loop.
+func TestSyncApply_ToleratesDanglingForwardingClass(t *testing.T) {
+	s := newTestStoreAt(t, filepath.Join(t.TempDir(), "config"))
+	cfg, err := s.SyncApply(`firewall {
+    family inet {
+        filter f1 {
+            term t1 {
+                then {
+                    forwarding-class no-such-class;
+                }
+            }
+        }
+    }
+}`, nil)
+	if err != nil {
+		t.Fatalf("SyncApply must tolerate a dangling forwarding-class, got: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("SyncApply returned nil config on tolerated violation")
+	}
+}
+
+// #1319 PR 3 — boot safety for the interfaces typed leaves. A stored
+// bare (prefix-less) interface address was legal before the address key
+// slot was typed; it must keep booting (warn only), compile verbatim,
+// and be rejected by the next strict operator commit.
+func TestLoad_ToleratesStoredBareInterfaceAddress(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config")
+	writeStoredConfig(t, cfgPath,
+		"set interfaces ge-0-0-0 unit 0 family inet address 10.0.1.10",
+		"set interfaces ge-0-0-0 mtu 1500")
+
+	s := newTestStoreAt(t, cfgPath)
+	if err := s.Load(); err != nil {
+		t.Fatalf("Load() must tolerate a stored bare interface address, got: %v", err)
+	}
+	active := s.ActiveConfig()
+	if active == nil {
+		t.Fatal("ActiveConfig() is nil after tolerated Load")
+	}
+	ifc := active.Interfaces.Interfaces["ge-0-0-0"]
+	if ifc == nil || ifc.Units[0] == nil ||
+		len(ifc.Units[0].Addresses) != 1 || ifc.Units[0].Addresses[0] != "10.0.1.10" {
+		t.Fatalf("stored bare address must compile verbatim, got %+v", ifc)
+	}
+
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	_, err := s.CommitCheck()
+	if err == nil {
+		t.Fatal("CommitCheck must reject the stored bare address, got nil")
+	}
+	if !strings.Contains(err.Error(), "address") {
+		t.Fatalf("CommitCheck error should reference address: %v", err)
 	}
 }

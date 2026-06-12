@@ -35,6 +35,19 @@
 //!     kernel routes onto `wgN` are read, `try_encap`'d, and sent to the
 //!     peer endpoint. The transit AF_XDP egress is the other encap site
 //!     (frame/mod.rs).
+//!
+//! ## Timers + idle wait (#1888 S5 / #1889)
+//!
+//! The loop blocks in poll(2) over {socket, TUN} POLLIN when idle
+//! (timeout = min(next timer deadline, 100ms cap) — the cap bounds
+//! stop/join and worker-edge latency) and runs a 1s-granularity timer
+//! arm: session expiry (REJECT_AFTER_TIME teardown), the pure
+//! `WgEngine::timer_pass` (passive/persistent keepalives, no-reply
+//! reinit), and the handshake ATTEMPT machine (5s retransmit pacing,
+//! 90s give-up window, identity-based success). Per-use T1/T2/T3 age
+//! enforcement lives in the engine's encap/decap paths; this loop owns
+//! all sends. Design of record:
+//! `docs/research/1888-wg-timers/plan.md` (plan v9, 3/3 PLAN-READY).
 
 use super::*;
 use crate::afxdp::wg::counters::WgCounters;
@@ -69,13 +82,25 @@ fn wg_encapped_size(inner_len: usize, outer_v6: bool) -> usize {
 /// versa).
 const WG_RX_BURST: usize = 64;
 
-/// Poll sleep when both directions are idle.
-const WG_IDLE_SLEEP: Duration = Duration::from_millis(1);
+/// poll(2) timeout cap when both directions are idle (#1889). Bounds
+/// stop/join latency and worker-edge (relaxed atomic) pickup latency at
+/// ~100ms; idle wakeups drop from 1,000/s (the prior 1ms sleep) to
+/// ~10/s per tunnel. With every timer deadline >= 1s out the idle
+/// timeout is effectively this constant — the deadline term only
+/// becomes load-bearing if the cap is ever raised.
+const WG_POLL_CAP_MS: i32 = 100;
 
-/// Initiator re-init poll interval: when an endpoint is configured and
-/// no confirmed session exists, re-drive the handshake at most this
-/// often.
-const WG_INITIATOR_POLL_NS: u64 = 1_000_000_000;
+/// Timer decision pass granularity (#1888 S5): expiry, T6/T7/T8, and
+/// the handshake attempt machine run at most once per tick — plus
+/// whenever a computed deadline is due (a mid-tick deadline gated on
+/// the tick alone would saturate the poll timeout to 0 and busy-spin).
+const WG_TIMER_TICK_NS: u64 = 1_000_000_000;
+
+/// Consecutive fatal (non-WouldBlock) TUN read errors before the
+/// thread exits (the TUN device was destroyed under us — poll returns
+/// instantly forever, reads keep failing; exiting hands recovery to
+/// the #1872 tombstone + backoff respawn machinery).
+const WG_TUN_FATAL_READ_LIMIT: u32 = 8;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn wg_control_loop(
@@ -137,8 +162,145 @@ pub(super) fn wg_control_loop(
         return;
     }
 
+    run_wg_control_loop(
+        &tunnel_name,
+        &engine,
+        &socket,
+        socket_is_v6,
+        tun,
+        peer_endpoint,
+        &recent_exceptions,
+        &stop,
+    );
+    // #1866 D3: clean stop-flag exit (teardown) — rare, one line.
+    eprintln!("xpf-userspace-dp: WG control thread stopped tun={tunnel_name}");
+    let _ = tunnel_endpoint_id;
+}
+
+/// One inbound datagram's disposition. Handshake completions must be
+/// handled INLINE at this site — before the same iteration's TUN
+/// burst — so the attempt machine's later pass cannot erase legitimate
+/// post-completion state (plan v9, Codex r5/r6 ordering traces).
+enum InboundOutcome {
+    /// Failed authentication / cookie / unknown type — no endpoint
+    /// learning, no stamps.
+    Unauthenticated,
+    /// Authenticated transport record (data or keepalive).
+    Authenticated,
+    /// Valid msg2 consumed — initiator-side handshake completion.
+    CompletedInitiator,
+    /// Valid msg1 consumed + msg2 sent — responder-side completion.
+    CompletedResponder,
+}
+
+impl InboundOutcome {
+    fn authenticated(&self) -> bool {
+        !matches!(self, InboundOutcome::Unauthenticated)
+    }
+}
+
+/// #1888 S5 handshake attempt window (thread-local state machine).
+/// While active, initiations retry every REKEY_TIMEOUT (5s) BYPASSING
+/// the confirmed-session gate (the attempt encodes the decision to
+/// replace the current session — losing one datagram must not starve a
+/// rekey until the 180s hard expiry); the window ends on SUCCESS (the
+/// peer's current-session identity changed — clock comparisons across
+/// the install seam are fragile, so identity it is) or GIVE-UP at
+/// REKEY_ATTEMPT_TIME (90s), which releases the pending reservation so
+/// a stale msg2 cannot complete later.
+struct HandshakeAttempt {
+    started_ns: u64,
+    last_tx_ns: u64,
+    baseline_session: Option<u32>,
+}
+
+/// Why an attempt is being started — picks the telemetry counter.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AttemptTrigger {
+    /// Configured-initiator bring-up (thread start).
+    BringUp,
+    /// Worker NoSession edge (gated on !confirmed, today's rule).
+    NoSessionEdge,
+    /// T1/T2/send-side-T3 rekey edge (ungated — replaces a live
+    /// confirmed-but-stale session).
+    RekeyEdge,
+    /// T7 no-reply reinit.
+    DeadPeer,
+    /// T8 persistent-keepalive due with no usable session.
+    KeepaliveNoSession,
+}
+
+/// poll(2) wait disposition.
+enum PollWait {
+    /// Timed out — run the timer arm and loop.
+    Idle,
+    /// At least one fd is readable (or EINTR — treat as a wakeup).
+    Ready,
+    /// Unrecoverable fd state — exit the thread (tombstone respawn is
+    /// the recovery path).
+    Fatal(&'static str),
+}
+
+/// Block in poll(2) on {socket, tun} POLLIN with `timeout_ms`.
+/// Fatal-exit policy (plan v6/v9): the TUN's POLLERR/POLLHUP/POLLNVAL
+/// are fatal (device destroyed/downed under us — poll would return
+/// instantly forever); the UDP socket's POLLNVAL is fatal (fd invalid);
+/// UDP POLLERR/POLLHUP are NOT fatal (ICMP errors are normal and are
+/// drained via the recv_from error arm).
+fn wg_poll_wait(socket_fd: i32, tun_fd: i32, timeout_ms: i32) -> PollWait {
+    let mut fds = [
+        libc::pollfd {
+            fd: socket_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: tun_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    let rc = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout_ms) };
+    if rc < 0 {
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            return PollWait::Ready; // spurious wakeup — re-run the loop
+        }
+        return PollWait::Fatal("poll_failed");
+    }
+    if rc == 0 {
+        return PollWait::Idle;
+    }
+    if fds[1].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+        return PollWait::Fatal("tun_revents");
+    }
+    if fds[0].revents & libc::POLLNVAL != 0 {
+        return PollWait::Fatal("socket_pollnval");
+    }
+    PollWait::Ready
+}
+
+/// Clamp the next timer deadline into a poll(2) timeout in ms
+/// (explicit ns->ms conversion, capped at WG_POLL_CAP_MS).
+fn poll_timeout_ms(next_deadline_ns: u64, now_ns: u64) -> i32 {
+    ((next_deadline_ns.saturating_sub(now_ns) / 1_000_000).min(WG_POLL_CAP_MS as u64)) as i32
+}
+
+/// The per-tunnel control loop proper, on pre-opened fds so the loop
+/// logic is unit-testable without a real TUN device (the production
+/// caller binds the socket and attaches the persistent wgN TUN above).
+#[allow(clippy::too_many_arguments)]
+fn run_wg_control_loop(
+    tunnel_name: &str,
+    engine: &crate::afxdp::wg::WgEngine,
+    socket: &UdpSocket,
+    socket_is_v6: bool,
+    mut tun: std::fs::File,
+    peer_endpoint: Option<SocketAddr>,
+    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    stop: &AtomicBool,
+) {
     let peer_pubkey = engine.first_peer_pubkey();
-    let mut last_initiate_ns: u64 = 0;
     // The endpoint used for egress + re-init. Starts at the configured
     // `wg_endpoint` (initiator role) and is LEARNED from the source of
     // any inbound WG datagram for a responder-only peer (Codex BLOCKER:
@@ -154,14 +316,33 @@ pub(super) fn wg_control_loop(
     let mut decap_buf = vec![0u8; 65_535];
     let mut encap_buf = vec![0u8; 65_535];
 
-    // Initial initiator bring-up: if an endpoint is configured, kick a
-    // handshake immediately so the tunnel comes up without waiting for
-    // egress traffic.
+    let socket_fd = socket.as_raw_fd();
+    let tun_fd = tun.as_raw_fd();
+
+    // #1888 S5 thread-local timer state. `next_deadline` starts at 0 so
+    // the FIRST iteration always runs a timer pass and computes real
+    // deadlines (u64::MAX = no deadline; never a stale past value).
+    let mut attempt: Option<HandshakeAttempt> = None;
+    let mut next_deadline: u64 = 0;
+    let mut last_timer_pass_ns: u64 = 0;
+    let mut tun_fatal_reads: u32 = 0;
+
+    // Initial initiator bring-up: a configured endpoint starts a real
+    // attempt window (BringUp class) so the REKEY_TIMEOUT/
+    // REKEY_ATTEMPT_TIME discipline applies from packet one and boot
+    // does not double-fire.
     if let (Some(ep), Some(pk)) = (effective_endpoint, peer_pubkey) {
-        last_initiate_ns = monotonic_nanos();
-        drive_initiation(
-            &engine, &socket, socket_is_v6, &pk, ep, &mut encap_buf, &tunnel_name,
-            &recent_exceptions,
+        attempt = start_attempt(
+            engine,
+            socket,
+            socket_is_v6,
+            &pk,
+            ep,
+            AttemptTrigger::BringUp,
+            monotonic_nanos(),
+            &mut encap_buf,
+            tunnel_name,
+            recent_exceptions,
         );
     }
 
@@ -177,30 +358,71 @@ pub(super) fn wg_control_loop(
                     // after the datagram cryptographically authenticates
                     // (Codex r3 MAJOR): updating on any inbound packet
                     // would let a spoofed source redirect our encrypted
-                    // egress. dispatch_inbound returns true only on a
-                    // successful consume_*/try_decap.
-                    let authenticated = dispatch_inbound(
-                        &engine,
-                        &socket,
+                    // egress.
+                    let outcome = dispatch_inbound(
+                        engine,
+                        socket,
                         socket_is_v6,
                         &mut tun,
                         &sock_buf[..len],
                         from,
                         &mut decap_buf,
                         &mut encap_buf,
-                        &tunnel_name,
-                        &recent_exceptions,
+                        tunnel_name,
+                        recent_exceptions,
                     );
-                    if authenticated {
+                    if outcome.authenticated() {
                         effective_endpoint = Some(canonicalize_endpoint(from));
+                    }
+                    // Completion-site cleanup (plan v9, Codex r5/r6):
+                    // a handshake completion obsoletes any request
+                    // edges armed by during-attempt egress on the old
+                    // session — drain them HERE, before this
+                    // iteration's TUN burst, so post-completion egress
+                    // can legitimately re-arm them. (The stale T7 arm
+                    // was already cleared inside the engine completion
+                    // path — a valid msg1/msg2 is an authenticated
+                    // receive.)
+                    match outcome {
+                        InboundOutcome::CompletedInitiator => {
+                            let _ = engine.take_rekey_request();
+                            let _ = engine.take_handshake_request();
+                            // Post-msg2 key-confirmation keepalive
+                            // (Codex r2 C4, Linux receive.c parity):
+                            // the peer's responder-role session is
+                            // unconfirmed until it authenticates our
+                            // first transport record. Send one
+                            // keepalive now so a handshake we
+                            // initiated with nothing to send does not
+                            // leave the peer's egress blackholed.
+                            if let Some(pk) = peer_pubkey {
+                                send_keepalive(
+                                    engine,
+                                    socket,
+                                    socket_is_v6,
+                                    &pk,
+                                    canonicalize_endpoint(from),
+                                    crate::afxdp::wg::timers::KeepaliveKind::Passive,
+                                    monotonic_nanos(),
+                                    &mut encap_buf,
+                                    tunnel_name,
+                                    recent_exceptions,
+                                );
+                            }
+                        }
+                        InboundOutcome::CompletedResponder => {
+                            let _ = engine.take_rekey_request();
+                            let _ = engine.take_handshake_request();
+                        }
+                        _ => {}
                     }
                 }
                 Ok(_) => break,
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => {
                     record_local_tunnel_exception(
-                        &recent_exceptions,
-                        &tunnel_name,
+                        recent_exceptions,
+                        tunnel_name,
                         format!("wg_socket_recv:{e}"),
                     );
                     break;
@@ -214,24 +436,26 @@ pub(super) fn wg_control_loop(
                 match tun.read(&mut tun_buf) {
                     Ok(len) if len > 0 => {
                         did_work = true;
+                        tun_fatal_reads = 0;
                         encap_and_send(
-                            &engine,
-                            &socket,
+                            engine,
+                            socket,
                             socket_is_v6,
                             &pk,
                             ep,
                             &tun_buf[..len],
                             &mut encap_buf,
-                            &tunnel_name,
-                            &recent_exceptions,
+                            tunnel_name,
+                            recent_exceptions,
                         );
                     }
                     Ok(_) => break,
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(e) => {
+                        tun_fatal_reads += 1;
                         record_local_tunnel_exception(
-                            &recent_exceptions,
-                            &tunnel_name,
+                            recent_exceptions,
+                            tunnel_name,
                             format!("wg_tun_read:{e}"),
                         );
                         break;
@@ -252,46 +476,321 @@ pub(super) fn wg_control_loop(
                         // learned endpoint to send to yet.
                         WgCounters::bump(&engine.counters().tun_rx_drops_no_endpoint);
                         did_work = true;
+                        tun_fatal_reads = 0;
                     }
-                    _ => break,
+                    Ok(_) => break,
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(_) => {
+                        tun_fatal_reads += 1;
+                        break;
+                    }
                 }
             }
         }
+        if tun_fatal_reads >= WG_TUN_FATAL_READ_LIMIT {
+            // Device destroyed/downed under us: poll would report the
+            // TUN ready forever while reads fail — exit cleanly and
+            // let the #1872 tombstone + backoff respawn recover.
+            record_local_tunnel_exception(
+                recent_exceptions,
+                tunnel_name,
+                "wg_tun_fatal_reads:exiting".to_string(),
+            );
+            return;
+        }
 
-        // --- Initiator re-init: NoSession edge OR coarse timer ---
-        // Only initiate toward an endpoint we actually know (configured
-        // OR learned). A responder-only peer we have never heard from has
-        // no endpoint, so we wait for it to initiate.
-        if let (Some(ep), Some(pk)) = (effective_endpoint, peer_pubkey) {
-            let now = monotonic_nanos();
-            let requested = engine.take_handshake_request();
-            let timer_due = now.saturating_sub(last_initiate_ns) >= WG_INITIATOR_POLL_NS;
-            // Only the configured-initiator role re-drives on the timer; a
-            // purely learned endpoint (responder-only) initiates only on
-            // an explicit NoSession egress request, never on the bare
-            // timer, so we don't spam a peer that is the designated
-            // initiator.
-            let allow_timer = peer_endpoint.is_some() && timer_due;
-            if (requested || allow_timer) && !engine.peer_has_confirmed_session(&pk) {
-                last_initiate_ns = now;
-                drive_initiation(
-                    &engine, &socket, socket_is_v6, &pk, ep, &mut encap_buf, &tunnel_name,
-                    &recent_exceptions,
+        // --- #1888 S5 timer arm (replaces the 1s re-init check) ---
+        // Runs when the 1s tick elapses OR a computed deadline is due
+        // (gating on the tick alone lets a mid-tick deadline saturate
+        // the poll timeout to 0 and busy-spin until the tick boundary).
+        let now = monotonic_nanos();
+        let tick_due = now.saturating_sub(last_timer_pass_ns) >= WG_TIMER_TICK_NS;
+        if tick_due || now >= next_deadline {
+            next_deadline = crate::afxdp::wg::timers::WG_NO_DEADLINE_NS;
+            if let Some(pk) = peer_pubkey {
+                engine.expire_sessions(now);
+                let endpoint_known = effective_endpoint.is_some();
+                let actions = engine.timer_pass(now, endpoint_known);
+                if let Some(kind) = actions.send_keepalive {
+                    if let Some(ep) = effective_endpoint {
+                        send_keepalive(
+                            engine, socket, socket_is_v6, &pk, ep, kind, now,
+                            &mut encap_buf, tunnel_name, recent_exceptions,
+                        );
+                    } else {
+                        pace_keepalive_skip(engine, &pk, kind, now);
+                    }
+                }
+                let attempt_deadline = drive_attempt_machine(
+                    engine,
+                    socket,
+                    socket_is_v6,
+                    &pk,
+                    effective_endpoint,
+                    &actions,
+                    now,
+                    &mut attempt,
+                    &mut encap_buf,
+                    tunnel_name,
+                    recent_exceptions,
                 );
-                did_work = true;
+                next_deadline = actions.next_deadline_ns.min(attempt_deadline);
+            }
+            if tick_due {
+                // Only tick-condition runs advance the 1s anchor —
+                // frequent sub-second deadline runs must not starve
+                // the periodic tick work (expiry).
+                last_timer_pass_ns = now;
             }
         }
 
         if !did_work {
-            thread::sleep(WG_IDLE_SLEEP);
+            match wg_poll_wait(socket_fd, tun_fd, poll_timeout_ms(next_deadline, now)) {
+                PollWait::Idle | PollWait::Ready => {}
+                PollWait::Fatal(reason) => {
+                    record_local_tunnel_exception(
+                        recent_exceptions,
+                        tunnel_name,
+                        format!("wg_poll_fatal:{reason}"),
+                    );
+                    return;
+                }
+            }
         }
     }
-    // #1866 D3: clean stop-flag exit (teardown) — rare, one line.
-    eprintln!("xpf-userspace-dp: WG control thread stopped tun={tunnel_name}");
-    let _ = tunnel_endpoint_id;
 }
 
-/// Bind the WG listen socket. Prefer a v6 dual-stack bind so a single
+/// Start a handshake attempt: consume the T7 obligation (it transfers
+/// to the attempt machine), advance the T8 anchor when T8 triggered,
+/// count the timer-driven rekey classes, send the first initiation,
+/// and record the baseline session identity the success check compares
+/// against.
+#[allow(clippy::too_many_arguments)]
+fn start_attempt(
+    engine: &crate::afxdp::wg::WgEngine,
+    socket: &UdpSocket,
+    socket_is_v6: bool,
+    peer_pubkey: &[u8; 32],
+    endpoint: SocketAddr,
+    trigger: AttemptTrigger,
+    now_ns: u64,
+    encap_buf: &mut [u8],
+    tunnel_name: &str,
+    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+) -> Option<HandshakeAttempt> {
+    engine.clear_t7_arm(peer_pubkey);
+    let counters = engine.counters();
+    match trigger {
+        AttemptTrigger::RekeyEdge => WgCounters::bump(&counters.rekeys_initiated_age),
+        AttemptTrigger::DeadPeer => WgCounters::bump(&counters.rekeys_initiated_dead_peer),
+        AttemptTrigger::KeepaliveNoSession => {
+            WgCounters::bump(&counters.rekeys_initiated_keepalive_no_session);
+            engine.note_t8_attempt(peer_pubkey, now_ns);
+        }
+        AttemptTrigger::BringUp | AttemptTrigger::NoSessionEdge => {}
+    }
+    let baseline_session = engine.current_session_local_index(peer_pubkey);
+    drive_initiation(
+        engine,
+        socket,
+        socket_is_v6,
+        peer_pubkey,
+        endpoint,
+        encap_buf,
+        tunnel_name,
+        recent_exceptions,
+    );
+    Some(HandshakeAttempt {
+        started_ns: now_ns,
+        last_tx_ns: now_ns,
+        baseline_session,
+    })
+}
+
+/// One step of the handshake attempt machine (runs inside the timer
+/// arm). Returns the machine's next deadline (retry or give-up) for
+/// the poll-timeout computation; WG_NO_DEADLINE_NS when idle.
+#[allow(clippy::too_many_arguments)]
+fn drive_attempt_machine(
+    engine: &crate::afxdp::wg::WgEngine,
+    socket: &UdpSocket,
+    socket_is_v6: bool,
+    peer_pubkey: &[u8; 32],
+    effective_endpoint: Option<SocketAddr>,
+    actions: &crate::afxdp::wg::timers::TimerActions,
+    now_ns: u64,
+    attempt: &mut Option<HandshakeAttempt>,
+    encap_buf: &mut [u8],
+    tunnel_name: &str,
+    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+) -> u64 {
+    use crate::afxdp::wg::session::{REKEY_ATTEMPT_TIME_NS, REKEY_TIMEOUT_NS};
+    use crate::afxdp::wg::timers::{InitiateReason, WG_NO_DEADLINE_NS};
+
+    // End checks. SUCCESS is an identity test: the current session's
+    // local_index changed from the attempt-start baseline (and is
+    // present — a mid-attempt expiry clearing current to None must NOT
+    // read as success). The success path mutates NOTHING beyond the
+    // attempt slot: all success-side cleanup ran inline at the
+    // authenticated completion site, before any same-iteration egress
+    // (plan v9).
+    if let Some(att) = attempt.as_ref() {
+        let current = engine.current_session_local_index(peer_pubkey);
+        if current.is_some() && current != att.baseline_session {
+            *attempt = None;
+        } else if now_ns.saturating_sub(att.started_ns) >= REKEY_ATTEMPT_TIME_NS {
+            // GIVE-UP: release the pending reservation (a stale msg2
+            // must not complete later), clear the T7 arm (egress
+            // during the attempt re-armed it; carried across the
+            // boundary it would reopen a fresh window next tick), and
+            // drain the request edges armed by during-attempt sends.
+            // Only traffic AFTER this boundary may re-trigger.
+            engine.abort_pending_for_peer(peer_pubkey);
+            engine.clear_t7_arm(peer_pubkey);
+            let _ = engine.take_rekey_request();
+            let _ = engine.take_handshake_request();
+            *attempt = None;
+            // Codex code-r1 BLOCKER: `actions` was computed BEFORE this
+            // cleanup — a T7 DeadPeer (or stale-edge) trigger captured
+            // in it would resurrect a fresh 90s window in the SAME
+            // pass, bypassing the boundary we just enforced. Return
+            // without evaluating triggers; the next pass (<=1s tick)
+            // recomputes actions from the post-cleanup state, where a
+            // genuinely-due T8 still starts its fresh window (AGY F4).
+            return WG_NO_DEADLINE_NS;
+        }
+    }
+
+    // Retry while active, paced by REKEY_TIMEOUT, BYPASSING the
+    // confirmed-session gate (the attempt encodes the decision).
+    if let Some(att) = attempt.as_mut() {
+        if now_ns.saturating_sub(att.last_tx_ns) >= REKEY_TIMEOUT_NS {
+            if let Some(ep) = effective_endpoint {
+                drive_initiation(
+                    engine,
+                    socket,
+                    socket_is_v6,
+                    peer_pubkey,
+                    ep,
+                    encap_buf,
+                    tunnel_name,
+                    recent_exceptions,
+                );
+            }
+            // A failed/skipped send still advances the pacing anchor
+            // (skip-pacing — the deadline must be strictly future).
+            att.last_tx_ns = now_ns;
+        }
+        return (att.last_tx_ns.saturating_add(REKEY_TIMEOUT_NS))
+            .min(att.started_ns.saturating_add(REKEY_ATTEMPT_TIME_NS));
+    }
+
+    // No attempt active: evaluate the start triggers per the plan's §3
+    // initiation-predicate table. Edges are consume-once; a consumed
+    // edge with no known endpoint is dropped (any subsequent send on a
+    // stale session re-arms it, so it cannot be permanently lost).
+    let rekey_edge = engine.take_rekey_request();
+    let nosession_edge = engine.take_handshake_request();
+    let trigger = if rekey_edge {
+        Some(AttemptTrigger::RekeyEdge)
+    } else if nosession_edge && !engine.peer_has_confirmed_session(peer_pubkey) {
+        Some(AttemptTrigger::NoSessionEdge)
+    } else {
+        match actions.initiate {
+            Some(InitiateReason::DeadPeer) => Some(AttemptTrigger::DeadPeer),
+            Some(InitiateReason::KeepaliveNoSession) => {
+                Some(AttemptTrigger::KeepaliveNoSession)
+            }
+            None => None,
+        }
+    };
+    if let (Some(trigger), Some(ep)) = (trigger, effective_endpoint) {
+        *attempt = start_attempt(
+            engine,
+            socket,
+            socket_is_v6,
+            peer_pubkey,
+            ep,
+            trigger,
+            now_ns,
+            encap_buf,
+            tunnel_name,
+            recent_exceptions,
+        );
+        return now_ns.saturating_add(REKEY_TIMEOUT_NS);
+    }
+    WG_NO_DEADLINE_NS
+}
+
+/// Emit one keepalive (T6 passive / T8 persistent / post-msg2
+/// confirmation) toward the peer endpoint. Failure paths advance the
+/// corresponding pacing anchor so a due-but-unsendable keepalive can
+/// never leave a past deadline spinning the poll loop (skip-pacing).
+#[allow(clippy::too_many_arguments)]
+fn send_keepalive(
+    engine: &crate::afxdp::wg::WgEngine,
+    socket: &UdpSocket,
+    socket_is_v6: bool,
+    peer_pubkey: &[u8; 32],
+    endpoint: SocketAddr,
+    kind: crate::afxdp::wg::timers::KeepaliveKind,
+    now_ns: u64,
+    encap_buf: &mut [u8],
+    tunnel_name: &str,
+    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+) {
+    use crate::afxdp::wg::timers::KeepaliveKind;
+    match engine.create_keepalive(peer_pubkey, encap_buf) {
+        Ok(outcome) => {
+            match wg_send_to(socket, socket_is_v6, &encap_buf[..outcome.len], endpoint) {
+                Ok(_) => {
+                    let counters = engine.counters();
+                    match kind {
+                        KeepaliveKind::Passive => {
+                            WgCounters::bump(&counters.keepalives_tx_passive)
+                        }
+                        KeepaliveKind::Persistent => {
+                            WgCounters::bump(&counters.keepalives_tx_persistent);
+                            engine.note_t8_attempt(peer_pubkey, now_ns);
+                        }
+                    }
+                }
+                Err(e) => {
+                    WgCounters::bump(&engine.counters().transport_send_errors);
+                    record_local_tunnel_exception(
+                        recent_exceptions,
+                        tunnel_name,
+                        format!("wg_keepalive_send:{e}"),
+                    );
+                    pace_keepalive_skip(engine, peer_pubkey, kind, now_ns);
+                }
+            }
+        }
+        // No usable session (engine gate) — T8 handles this via its
+        // KeepaliveNoSession initiation; pace so we don't re-fire
+        // every iteration.
+        Err(_) => pace_keepalive_skip(engine, peer_pubkey, kind, now_ns),
+    }
+}
+
+/// Skip-pacing by keepalive class (AGY r3 G1).
+fn pace_keepalive_skip(
+    engine: &crate::afxdp::wg::WgEngine,
+    peer_pubkey: &[u8; 32],
+    kind: crate::afxdp::wg::timers::KeepaliveKind,
+    now_ns: u64,
+) {
+    match kind {
+        crate::afxdp::wg::timers::KeepaliveKind::Passive => {
+            engine.pace_passive_keepalive_skip(peer_pubkey, now_ns)
+        }
+        crate::afxdp::wg::timers::KeepaliveKind::Persistent => {
+            engine.note_t8_attempt(peer_pubkey, now_ns)
+        }
+    }
+}
+
+/// Bind the WG listen socket./// Bind the WG listen socket. Prefer a v6 dual-stack bind so a single
 /// socket serves both v4-mapped and v6 peers; fall back to a v4 bind if
 /// the v6 bind fails.
 ///
@@ -436,23 +935,32 @@ fn drive_initiation(
     // completions flat is the #1736 EINVAL fingerprint.
     if let Ok(_local_index) = engine.create_initiation(peer_pubkey, out) {
         let len = crate::afxdp::wg::WG_MSG_INIT_LEN;
-        if let Err(e) = wg_send_to(socket, socket_is_v6, &out[..len], endpoint) {
-            WgCounters::bump(&engine.counters().hs_send_errors);
-            record_local_tunnel_exception(
-                recent_exceptions,
-                tunnel_name,
-                format!("wg_initiation_send:{endpoint}:{e}"),
-            );
+        match wg_send_to(socket, socket_is_v6, &out[..len], endpoint) {
+            Ok(_) => {
+                // #1888 S5: a handshake initiation on the wire is an
+                // authenticated SEND — clears the T6 arm, paces T8.
+                engine.note_handshake_sent(peer_pubkey, monotonic_nanos());
+            }
+            Err(e) => {
+                WgCounters::bump(&engine.counters().hs_send_errors);
+                record_local_tunnel_exception(
+                    recent_exceptions,
+                    tunnel_name,
+                    format!("wg_initiation_send:{endpoint}:{e}"),
+                );
+            }
         }
     }
 }
 
-/// Dispatch one inbound WG datagram on its type byte. Returns `true`
-/// iff the datagram cryptographically AUTHENTICATED (a successful
-/// consume_initiation/consume_response/try_decap) — the caller uses that
-/// to gate endpoint-learning so a spoofed source cannot redirect egress
-/// (Codex r3 MAJOR). Type-3 (cookie), unknown, and any failed
-/// authentication return `false`.
+/// Dispatch one inbound WG datagram on its type byte. The returned
+/// `InboundOutcome` tells the caller (a) whether the datagram
+/// cryptographically AUTHENTICATED — gating endpoint-learning so a
+/// spoofed source cannot redirect egress (Codex r3 MAJOR) — and (b)
+/// whether it COMPLETED a handshake, which the caller must handle
+/// inline (edge drain + post-msg2 keepalive) before this iteration's
+/// TUN burst (plan v9 completion-site ordering). Type-3 (cookie),
+/// unknown types, and failed authentication are `Unauthenticated`.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_inbound(
     engine: &crate::afxdp::wg::WgEngine,
@@ -465,41 +973,46 @@ fn dispatch_inbound(
     response_buf: &mut [u8],
     tunnel_name: &str,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
-) -> bool {
+) -> InboundOutcome {
     let Some(&wg_type) = datagram.first() else {
-        return false;
+        return InboundOutcome::Unauthenticated;
     };
     match wg_type {
         crate::afxdp::wg::WG_TYPE_INITIATION => {
             match engine.consume_initiation_create_response(datagram, response_buf) {
-                Ok((_peer_pubkey, _local_index)) => {
+                Ok((peer_pubkey, _local_index)) => {
                     let len = crate::afxdp::wg::WG_MSG_RESPONSE_LEN;
                     // #1865: the response send error was silently
                     // discarded (`let _ =`) — the responder mirror of
                     // the #1736 initiator-EINVAL class. Count + record.
-                    if let Err(e) =
-                        wg_send_to(socket, socket_is_v6, &response_buf[..len], from)
-                    {
-                        WgCounters::bump(&engine.counters().hs_send_errors);
-                        record_local_tunnel_exception(
-                            recent_exceptions,
-                            tunnel_name,
-                            format!("wg_response_send:{from}:{e}"),
-                        );
+                    match wg_send_to(socket, socket_is_v6, &response_buf[..len], from) {
+                        Ok(_) => {
+                            // #1888 S5: msg2 on the wire is an
+                            // authenticated SEND.
+                            engine.note_handshake_sent(&peer_pubkey, monotonic_nanos());
+                        }
+                        Err(e) => {
+                            WgCounters::bump(&engine.counters().hs_send_errors);
+                            record_local_tunnel_exception(
+                                recent_exceptions,
+                                tunnel_name,
+                                format!("wg_response_send:{from}:{e}"),
+                            );
+                        }
                     }
-                    true
+                    InboundOutcome::CompletedResponder
                 }
                 Err(_e) => {
                     debug_log!("WG[{}]: drop initiation reason={:?}", tunnel_name, _e);
-                    false
+                    InboundOutcome::Unauthenticated
                 }
             }
         }
         crate::afxdp::wg::WG_TYPE_RESPONSE => match engine.consume_response(datagram) {
-            Ok(_) => true,
+            Ok(_) => InboundOutcome::CompletedInitiator,
             Err(_e) => {
                 debug_log!("WG[{}]: drop response reason={:?}", tunnel_name, _e);
-                false
+                InboundOutcome::Unauthenticated
             }
         },
         crate::afxdp::wg::WG_TYPE_COOKIE => {
@@ -507,7 +1020,7 @@ fn dispatch_inbound(
             // authenticated for endpoint-learning purposes.
             WgCounters::bump(&engine.counters().hs_rx_cookie_unsupported);
             debug_log!("WG[{}]: drop cookie (S7)", tunnel_name);
-            false
+            InboundOutcome::Unauthenticated
         }
         crate::afxdp::wg::WG_TYPE_DATA => {
             match engine.try_decap(datagram, decap_buf) {
@@ -524,11 +1037,22 @@ fn dispatch_inbound(
                             format!("wg_tun_write:{e}"),
                         );
                     }
-                    true
+                    InboundOutcome::Authenticated
+                }
+                Err(crate::afxdp::wg::DecapError::MalformedInner) => {
+                    // MalformedInner is only ever returned POST-AEAD:
+                    // the authenticated zero-length keepalive exits
+                    // decap through it by design (#1865), and a
+                    // malformed-but-authenticated inner also proves
+                    // the peer holds the session keys. Both count for
+                    // endpoint learning (this closes the #1865 plan §9
+                    // latent gap: a keepalive-only roaming peer now
+                    // updates our egress endpoint).
+                    InboundOutcome::Authenticated
                 }
                 Err(_e) => {
                     debug_log!("WG[{}]: drop transport reason={:?}", tunnel_name, _e);
-                    false
+                    InboundOutcome::Unauthenticated
                 }
             }
         }
@@ -539,7 +1063,7 @@ fn dispatch_inbound(
             // exactly "well-formed UDP, non-WG type byte".
             WgCounters::bump(&engine.counters().rx_unknown_type);
             debug_log!("WG[{}]: drop unknown type {}", tunnel_name, wg_type);
-            false
+            InboundOutcome::Unauthenticated
         }
     }
 }
@@ -674,6 +1198,203 @@ mod tests {
         let mut buf = [0u8; 16];
         let (n, _) = rx.recv_from(&mut buf).expect("datagram must arrive");
         assert_eq!(&buf[..n], b"wg-v4");
+    }
+
+    // =======================================================================
+    // #1889: poll(2) loop tests on pre-opened fds (run_wg_control_loop —
+    // a pipe read-end stands in for the TUN; no real device needed).
+    // =======================================================================
+
+    fn poll_loop_fixture() -> (
+        std::sync::Arc<crate::afxdp::wg::WgEngine>,
+        UdpSocket,
+        std::fs::File,             // tun stand-in (pipe read end)
+        std::fs::File,             // pipe write end (keep open!)
+        std::sync::Arc<Mutex<VecDeque<ExceptionStatus>>>,
+        std::sync::Arc<AtomicBool>,
+    ) {
+        use std::os::fd::FromRawFd;
+        let engine = std::sync::Arc::new(crate::afxdp::wg::WgEngine::new(
+            crate::afxdp::wg::WgEngineConfig {
+                local_private_key: [7u8; 32],
+                listen_port: 0,
+                peers: vec![crate::afxdp::wg::WgPeerConfig {
+                    pubkey: [9u8; 32],
+                    endpoint: None, // responder-only: no bring-up sends
+                    persistent_keepalive: 0,
+                    allowed_ips: vec![],
+                }],
+            },
+        ));
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        socket.set_nonblocking(true).unwrap();
+        let mut fds = [0i32; 2];
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "pipe");
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        set_fd_nonblocking(read_fd).unwrap();
+        let tun = unsafe { std::fs::File::from_raw_fd(read_fd) };
+        let pipe_w = unsafe { std::fs::File::from_raw_fd(write_fd) };
+        let exceptions = std::sync::Arc::new(Mutex::new(VecDeque::new()));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        (engine, socket, tun, pipe_w, exceptions, stop)
+    }
+
+    fn spawn_poll_loop(
+        engine: std::sync::Arc<crate::afxdp::wg::WgEngine>,
+        socket: UdpSocket,
+        tun: std::fs::File,
+        exceptions: std::sync::Arc<Mutex<VecDeque<ExceptionStatus>>>,
+        stop: std::sync::Arc<AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            run_wg_control_loop(
+                "wg-test",
+                &engine,
+                &socket,
+                false,
+                tun,
+                None,
+                &exceptions,
+                &stop,
+            );
+        })
+    }
+
+    /// #1889 constraint 1: an idle-blocked loop must stop+join within
+    /// the poll cap budget (no eventfd — the 100ms cap bounds it).
+    #[test]
+    fn poll_loop_stop_joins_promptly_while_idle_blocked() {
+        let (engine, socket, tun, _pipe_w, exceptions, stop) = poll_loop_fixture();
+        let handle = spawn_poll_loop(engine, socket, tun, exceptions, stop.clone());
+        // Let the loop settle into its idle poll.
+        std::thread::sleep(Duration::from_millis(150));
+        let started = std::time::Instant::now();
+        stop.store(true, Ordering::Relaxed);
+        handle.join().expect("join");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "stop->join took {:?} (budget 500ms; cap is 100ms)",
+            started.elapsed()
+        );
+    }
+
+    /// #1889 constraint 2: a datagram arriving while idle-blocked wakes
+    /// the loop and is processed promptly (no 1s timer wait). A non-WG
+    /// type byte lands in rx_unknown_type deterministically.
+    #[test]
+    fn poll_loop_wakes_on_socket_readiness() {
+        let (engine, socket, tun, _pipe_w, exceptions, stop) = poll_loop_fixture();
+        let target = socket.local_addr().unwrap();
+        let counters_engine = engine.clone();
+        let handle = spawn_poll_loop(engine, socket, tun, exceptions, stop.clone());
+        std::thread::sleep(Duration::from_millis(120)); // reach idle poll
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        tx.send_to(&[0xee, 1, 2, 3], target).unwrap();
+        let mut seen = false;
+        for _ in 0..30 {
+            if counters_engine
+                .counters()
+                .rx_unknown_type
+                .load(Ordering::Relaxed)
+                == 1
+            {
+                seen = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop.store(true, Ordering::Relaxed);
+        handle.join().expect("join");
+        assert!(seen, "datagram not processed within 300ms of arrival");
+    }
+
+    /// Fatal-fd guard: destroying the TUN under the loop (pipe write
+    /// end dropped => POLLHUP on the read end) exits the thread
+    /// cleanly WITHOUT the stop flag — the #1872 tombstone respawn is
+    /// the recovery path. No busy-spin, no hang.
+    #[test]
+    fn poll_loop_exits_on_tun_teardown() {
+        let (engine, socket, tun, pipe_w, exceptions, stop) = poll_loop_fixture();
+        let handle = spawn_poll_loop(engine, socket, tun, exceptions, stop.clone());
+        std::thread::sleep(Duration::from_millis(120));
+        drop(pipe_w); // TUN "destroyed": POLLHUP forever
+        let started = std::time::Instant::now();
+        // Join must complete without stop ever being set.
+        handle.join().expect("join");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "fatal-TUN exit took {:?}",
+            started.elapsed()
+        );
+        assert!(!stop.load(Ordering::Relaxed));
+    }
+
+    /// Codex code-r1 BLOCKER regression: a T5 give-up must NOT
+    /// evaluate the (pre-cleanup) TimerActions in the same pass — a T7
+    /// DeadPeer trigger captured before the cleanup would resurrect a
+    /// fresh 90s window immediately, bypassing the give-up boundary.
+    #[test]
+    fn attempt_give_up_ignores_same_pass_stale_actions() {
+        use crate::afxdp::wg::session::REKEY_ATTEMPT_TIME_NS;
+        use crate::afxdp::wg::timers::{InitiateReason, TimerActions, WG_NO_DEADLINE_NS};
+        let (engine, socket, _tun, _pipe_w, exceptions, _stop) = poll_loop_fixture();
+        let pk = engine.first_peer_pubkey().unwrap();
+        let ep: SocketAddr = "127.0.0.1:39999".parse().unwrap();
+        let mut encap_buf = vec![0u8; 2048];
+        let now = 200_000_000_000u64;
+        let mut attempt = Some(HandshakeAttempt {
+            started_ns: now - REKEY_ATTEMPT_TIME_NS - 1,
+            last_tx_ns: now - 1_000_000_000,
+            baseline_session: None,
+        });
+        // Stale actions captured BEFORE the give-up cleanup, carrying a
+        // due T7 trigger.
+        let stale_actions = TimerActions {
+            initiate: Some(InitiateReason::DeadPeer),
+            send_keepalive: None,
+            next_deadline_ns: WG_NO_DEADLINE_NS,
+        };
+        let deadline = drive_attempt_machine(
+            &engine,
+            &socket,
+            false,
+            &pk,
+            Some(ep),
+            &stale_actions,
+            now,
+            &mut attempt,
+            &mut encap_buf,
+            "wg-test",
+            &exceptions,
+        );
+        assert!(
+            attempt.is_none(),
+            "give-up must not resurrect an attempt from stale same-pass actions"
+        );
+        assert_eq!(deadline, WG_NO_DEADLINE_NS);
+        assert_eq!(
+            engine
+                .counters()
+                .rekeys_initiated_dead_peer
+                .load(Ordering::Relaxed),
+            0,
+            "no DeadPeer attempt may start in the give-up pass"
+        );
+    }
+
+    /// AGY r3 G3: the ns->ms conversion clamps to the cap and never
+    /// yields a negative/zero-spin timeout for future deadlines.
+    #[test]
+    fn poll_timeout_ms_clamps_and_converts() {
+        let now = 1_000_000_000u64;
+        // Far-future deadline: capped.
+        assert_eq!(poll_timeout_ms(u64::MAX, now), WG_POLL_CAP_MS);
+        // 7ms out: exact conversion.
+        assert_eq!(poll_timeout_ms(now + 7_000_000, now), 7);
+        // Past deadline: 0 (the timer arm runs it on the next
+        // iteration via the now >= next_deadline condition).
+        assert_eq!(poll_timeout_ms(now - 1, now), 0);
     }
 
     /// The guard math this protects: at the v4/v6 boundary the same

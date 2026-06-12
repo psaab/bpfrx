@@ -256,6 +256,34 @@ inlining. Treat the trend as a defect, not a style preference.
 | Invariant violation at runtime (rare, driver bug) | Bump a dedicated counter, continue. Crashing the dataplane on a single misbehaved packet punishes every other flow. |
 | "Path not found" at config apply | Warn + continue if the path is a best-effort cleanup; fail hard if the path is load-bearing. Don't let `|| true` mask the load-bearing case. |
 
+## Persistence classes (#1894)
+
+Every file write that replaces on-disk state belongs to exactly one
+class, and the class picks the writer. `pkg/fsatomic` is the single
+source of truth; an AST canary in that package fails the suite when a
+new direct `os.WriteFile` lands in a migrated package unclassified.
+
+| Class | Writer | Meaning | Examples |
+|---|---|---|---|
+| DurableState | `fsatomic.WriteFileDurable` | Must survive power loss: temp + fsync + rename + parent-dir fsync. | active config (`.configdb`), rollback slot 1, rescue config, `master.key`, DHCPv6 DUID, `frr.conf` |
+| AtomicGeneratedConfig | `fsatomic.WriteFileAtomic` | Regenerated on boot/apply; a torn file is unacceptable, a lost-on-power-cut update is fine. **No fsync — this class exists so hot apply paths never pay one.** | swanctl conf, Kea configs, networkd `.link`/`.network`, rollback slots 2..N |
+| BestEffortKernelKnob | direct `os.WriteFile` | procfs/sysfs: rename does not exist there, the atomic writers are impossible by construction. | `rp_filter` knob |
+
+Rules of thumb:
+
+- fsync cost lands on operator-paced commit paths only (commit,
+  rollback save, rescue save, DUID persist, frr.conf reload) — never on
+  per-apply, per-packet, or per-poll-tick paths.
+- Multi-file shuffles batch namespace durability with one trailing
+  `fsatomic.SyncDir` (renames AND unlinks) instead of per-file dir
+  fsyncs — see configstore `saveRollbackFiles`.
+- Temp+rename WITHOUT fsync is namespace atomicity, not durability:
+  after power loss the rename can surface a zero-length file or vanish.
+  Do not hand-roll it; pick a class.
+- A daemon that cannot persist config must not boot pretending
+  otherwise: `configstore.New` is fail-closed (#1893) — there is no
+  "file-only" fallback backend.
+
 ## Review discipline
 
 ### Reviewing (adversarial by design)

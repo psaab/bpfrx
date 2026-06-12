@@ -15,7 +15,7 @@ therefore staged by capability, not by vendor.
 | S1 (#1709) | Wire-protocol compliance: TAI64N + handshake framing (msg type 1/2, MAC1) on build + parse, both roles | **DONE (this PR)** — validated by spec known-answer vectors + an xpf↔xpf framed-handshake regression. **NOT yet validated against an independent peer** (see "honesty note" below). |
 | S2 | Dataplane activation (AF_XDP hot-path encap/decap) **+ the live kernel-WireGuard-on-a-VM interop test** | pending |
 | S4 | Non-zero pre-shared key (PSK) plumbing | pending |
-| S5 | Persistent-keepalive + REKEY/REJECT-AFTER timers + endpoint roaming + empty-record (keepalive/key-confirm) handling + TAI64N disk persistence | pending |
+| S5 | Persistent-keepalive + REKEY/REJECT-AFTER timers + endpoint roaming + empty-record (keepalive/key-confirm) handling + TAI64N disk persistence | **timers + keepalives DONE (#1888/#1889)** — full whitepaper §6.1 timer machine (REKEY_AFTER_TIME 120s initiator-only, 165s receive horizon, REJECT_AFTER_TIME 180s per-use + expiry teardown, 5s/90s retry discipline, 10s passive + configured persistent keepalives, post-msg2 key-confirmation keepalive) on a blocking-poll(2) control loop; design of record `docs/research/1888-wg-timers/plan.md`. Authenticated-datagram endpoint LEARNING shipped in S2a/#1888 (keepalives now count); engine-level roam API + TAI64N disk persistence remain pending |
 | S6 | Junos config surface (grammar + compiler + snapshot population, base64↔hex keys) | pending |
 | S7 | Type-3 CookieReply + MAC2 generation/verification + IPv6 outer encap + DSCP/ECN | pending |
 | S8 | HA RG WG-session migration | pending |

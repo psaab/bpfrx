@@ -2841,12 +2841,12 @@ func TestDataplaneTypeDPDKRejectedAtCommitHierarchical(t *testing.T) {
 // three-color-policer single-rate + two-rate conflict because
 // it is the simplest validator-failing fixture
 // (validateThreeColorPolicersStrict). We verify that:
-//   1. The DPDK retirement message wins (the policer error does
-//      NOT surface).
-//   2. The policer fixture in isolation DOES fail with its own
-//      strict-validator error (proves the negative control is
-//      live — otherwise removing the dpdk line would surface
-//      neither error and the test would silently pass).
+//  1. The DPDK retirement message wins (the policer error does
+//     NOT surface).
+//  2. The policer fixture in isolation DOES fail with its own
+//     strict-validator error (proves the negative control is
+//     live — otherwise removing the dpdk line would surface
+//     neither error and the test would silently pass).
 //
 // Brittle by design: if a future refactor moves
 // validateDataplaneTypeStrict after validateThreeColorPolicers-
