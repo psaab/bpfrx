@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 
+	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/daemon"
 	"github.com/psaab/xpf/pkg/dataplane"
 	_ "github.com/psaab/xpf/pkg/dataplane/userspace"
@@ -77,6 +78,59 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println("PASS embedded userspace shim (verifier accepted; no production state touched)")
+		return
+	}
+
+	// #1879 day-0 validation gate: run the REAL strict commit-check
+	// pipeline (parse → typed-leaf SchemaValidate on the expanded tree →
+	// strict compile; configstore.CheckText) against a config file
+	// without touching any daemon, store, or dataplane state. The
+	// first-boot config-drive loader (scripts/image/xpf-day0-config)
+	// validates the untrusted day-0 config with this BEFORE installing
+	// it as /etc/xpf/xpf.conf. Exit codes mirror verify-dataplane's
+	// shape: 0 PASS, 2 config rejected, 1 other error (unreadable file,
+	// oversize, bad flags).
+	if len(os.Args) > 1 && os.Args[1] == "check-config" {
+		fs := flag.NewFlagSet("check-config", flag.ExitOnError)
+		nodeID := fs.Int("node-id", -1,
+			"cluster node ID for ${node} apply-group expansion (0 or 1; -1 = standalone)")
+		_ = fs.Parse(os.Args[2:])
+		if fs.NArg() != 1 {
+			fmt.Fprintf(os.Stderr, "usage: xpfd check-config [-node-id 0|1] <config-file>\n")
+			os.Exit(1)
+		}
+		if *nodeID < -1 || *nodeID > 1 {
+			fmt.Fprintf(os.Stderr, "check-config: -node-id must be 0, 1, or -1 (standalone)\n")
+			os.Exit(1)
+		}
+		path := fs.Arg(0)
+		// The day-0 config drive is untrusted input: hard-cap the size
+		// before reading so a garbage volume cannot balloon memory.
+		const maxCheckConfigBytes = 4 << 20 // 4 MiB
+		fi, err := os.Stat(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "check-config: %v\n", err)
+			os.Exit(1)
+		}
+		if !fi.Mode().IsRegular() {
+			fmt.Fprintf(os.Stderr, "check-config: %s: not a regular file\n", path)
+			os.Exit(1)
+		}
+		if fi.Size() > maxCheckConfigBytes {
+			fmt.Fprintf(os.Stderr, "check-config: %s: %d bytes exceeds %d byte limit\n",
+				path, fi.Size(), int64(maxCheckConfigBytes))
+			os.Exit(1)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "check-config: %v\n", err)
+			os.Exit(1)
+		}
+		if _, err := configstore.CheckText(string(data), *nodeID); err != nil {
+			fmt.Printf("FAIL %s\n%v\n", path, err)
+			os.Exit(2)
+		}
+		fmt.Printf("PASS %s (strict commit-check: parse + schema + compile)\n", path)
 		return
 	}
 

@@ -301,11 +301,21 @@ func (s *Store) SetNodeID(id int) {
 // (#1319 PR 2 boot safety). cfg is nil at this point because we haven't
 // compiled yet; the typed-leaf validators shipped so far don't need it.
 func (s *Store) compileTree(tree *config.ConfigTree) (*config.Config, error) {
-	if err := s.schemaValidateExpandedTree(tree); err != nil {
+	return compileTreeStrict(tree, s.nodeID)
+}
+
+// compileTreeStrict is the package-level strict commit-check pipeline
+// (typed-leaf SchemaValidate gate on the apply-groups-expanded view,
+// then strict compile). It backs both Store.compileTree (every
+// operator-driven commit / commit-check) and CheckText (check.go —
+// the #1879 `xpfd check-config` day-0 validation gate), so the two
+// callers can never drift apart.
+func compileTreeStrict(tree *config.ConfigTree, nodeID int) (*config.Config, error) {
+	if err := schemaValidateExpandedTreeForNode(tree, nodeID); err != nil {
 		return nil, err
 	}
-	if s.nodeID >= 0 {
-		return config.CompileConfigForNode(tree, s.nodeID)
+	if nodeID >= 0 {
+		return config.CompileConfigForNode(tree, nodeID)
 	}
 	return config.CompileConfig(tree)
 }
@@ -353,12 +363,16 @@ func (s *Store) compileTreeLenient(tree *config.ConfigTree) (*config.Config, err
 }
 
 func (s *Store) schemaValidateExpandedTree(tree *config.ConfigTree) error {
+	return schemaValidateExpandedTreeForNode(tree, s.nodeID)
+}
+
+func schemaValidateExpandedTreeForNode(tree *config.ConfigTree, nodeID int) error {
 	if tree == nil {
 		return nil
 	}
 	expanded := tree.Clone()
-	if s.nodeID >= 0 {
-		vars := map[string]string{"node": fmt.Sprintf("node%d", s.nodeID)}
+	if nodeID >= 0 {
+		vars := map[string]string{"node": fmt.Sprintf("node%d", nodeID)}
 		if err := expanded.ExpandGroupsWithVars(vars); err != nil {
 			return fmt.Errorf("apply-groups: %w", err)
 		}
