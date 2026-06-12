@@ -5278,3 +5278,9 @@ top.
 - **Timestamp**: 2026-06-12 ~13:55
   **Action**: #1902 PR #1911 — recorded Codex r1 (MERGE-READY, 1 Low adjudicated), AGY r1 (MERGE-READY), Claude SMR r1 (MERGE-READY, byte-trace) in reviewer ledger
   **File(s)**: docs/pr/1902-pending-neigh/reviewer-ids.md
+- **Timestamp**: 2026-06-12 ~14:05
+  **Action**: #1902 live validation — r1 vacuous (lanhost gre module missing, fixed via modprobe ip_gre on loss host), r2 gate fired (counter 0->1, 0 corrupt frames), wrote r3 diagnostic script to localize round-3 loss
+  **File(s)**: tmp/v1902b.sh
+- **Timestamp**: 2026-06-12 ~14:10
+  **Action**: #1902 live validation r3 complete — gate counter 1->4 across cold windows, 0 corrupt frames, 18/18 inner delivery, retry dwell <1ms x2; recorded trail in ledger
+  **File(s)**: docs/pr/1902-pending-neigh/reviewer-ids.md
