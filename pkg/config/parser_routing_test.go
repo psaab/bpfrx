@@ -3030,6 +3030,81 @@ func TestTunnelNameMap(t *testing.T) {
 	}
 }
 
+// #1910 r1 (Codex/AGY convergent High): a unit with its OWN per-unit
+// tunnel stanza keeps its compiler-assigned uN device name even when
+// an interface-level tunnel coexists on the same interface — the
+// compiler creates BOTH devices, and mapping the unit ref to the base
+// name would make step 0a / the RIListMember veto / ResolveKernelIfName
+// target the wrong device.
+func TestTunnelNameMapPerUnitNotShadowedByInterfaceLevel(t *testing.T) {
+	cmds := []string{
+		"set interfaces gr-0/0/0 tunnel source 10.0.0.1",
+		"set interfaces gr-0/0/0 tunnel destination 10.0.0.2",
+		"set interfaces gr-0/0/0 unit 0 family inet address 10.10.10.1/30",
+		"set interfaces gr-0/0/0 unit 1 tunnel source 3.3.3.3",
+		"set interfaces gr-0/0/0 unit 1 tunnel destination 4.4.4.4",
+		"set interfaces gr-0/0/0 unit 1 family inet address 10.0.1.1/30",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	nameMap := cfg.TunnelNameMap()
+	// Unit 0 has no per-unit tunnel: shares the interface device.
+	if got, want := nameMap["gr-0/0/0.0"], "gr-0-0-0"; got != want {
+		t.Errorf("TunnelNameMap[gr-0/0/0.0] = %q, want %q", got, want)
+	}
+	// Unit 1 has its own tunnel: the real per-unit uN device, NOT the
+	// interface-level base name.
+	if got, want := nameMap["gr-0/0/0.1"], "gr-0-0-0u1"; got != want {
+		t.Errorf("TunnelNameMap[gr-0/0/0.1] = %q, want %q", got, want)
+	}
+}
+
+// #1910 r1 (Codex/AGY convergent High): interface-level WireGuard
+// tunnels have no GRE-style source, so the Source!="" interface-level
+// gate must not drop them (the #1736 collectAppliedTunnels twin). All
+// units of wg0 share the single persistent TUN device.
+func TestTunnelNameMapWireguardInterfaceLevel(t *testing.T) {
+	cmds := []string{
+		"set interfaces wg0 tunnel mode wireguard",
+		"set interfaces wg0 tunnel wireguard listen-port 51820",
+		"set interfaces wg0 unit 0 family inet address 10.66.0.1/24",
+		"set interfaces wg0 unit 1 family inet address 10.66.1.1/24",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	nameMap := cfg.TunnelNameMap()
+	if got, want := nameMap["wg0.0"], "wg0"; got != want {
+		t.Errorf("TunnelNameMap[wg0.0] = %q, want %q", got, want)
+	}
+	if got, want := nameMap["wg0.1"], "wg0"; got != want {
+		t.Errorf("TunnelNameMap[wg0.1] = %q, want %q", got, want)
+	}
+}
+
 func TestInterfaceLevelTunnelLinuxName(t *testing.T) {
 	cmds := []string{"set interfaces gr-0/0/0 tunnel source 10.0.0.1", "set interfaces gr-0/0/0 tunnel destination 10.0.0.2", "set interfaces gr-0/0/0 unit 0 family inet address 10.10.10.1/30"}
 	tree := &ConfigTree{}

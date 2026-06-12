@@ -298,25 +298,34 @@ func IRBToBridge(bds []*BridgeDomainConfig) map[string]string {
 }
 
 // TunnelNameMap returns a mapping from Junos interface reference (e.g. "gr-0/0/0.0")
-// to the Linux tunnel interface name. For tunnel interfaces with per-unit tunnel config,
-// unit 0 uses the base Linux name, unit N>0 appends "uN".
+// to the Linux tunnel interface name. A unit WITH its own per-unit
+// tunnel stanza always maps to its compiler-assigned TunnelConfig.Name
+// (unit 0 = base Linux name, unit N>0 = "uN" suffix,
+// compiler_interfaces.go) — even when an interface-level tunnel
+// coexists, because the compiler creates BOTH devices and mapping the
+// unit ref to the base name would shadow the real uN device (#1910 r1
+// Codex/AGY convergent High). Units WITHOUT their own tunnel stanza
+// under an interface-level tunnel share the interface device; the
+// interface-level gate admits WireGuard despite its empty GRE-style
+// `source` (the #1736 collectAppliedTunnels twin — the persistent wgN
+// TUN is one shared device, so wg0.1 must resolve to wg0, not fall
+// through to a literal ".1" name).
 func (c *Config) TunnelNameMap() map[string]string {
 	m := make(map[string]string)
 	for ifName, ifc := range c.Interfaces.Interfaces {
-		if ifc.Tunnel != nil && ifc.Tunnel.Source != "" {
-			// Interface-level tunnel: all units share the same tunnel
-			baseName := LinuxIfName(ifName)
-			for unitNum := range ifc.Units {
-				ref := ifName + "." + strconv.Itoa(unitNum)
-				m[ref] = baseName
-			}
-			continue
-		}
-		// Per-unit tunnels: each unit with tunnel config gets its own Linux name
+		ifaceTunnel := ifc.Tunnel != nil &&
+			(ifc.Tunnel.Source != "" || ifc.Tunnel.Mode == "wireguard")
+		baseName := LinuxIfName(ifName)
 		for unitNum, unit := range ifc.Units {
-			if unit.Tunnel != nil {
-				ref := ifName + "." + strconv.Itoa(unitNum)
+			ref := ifName + "." + strconv.Itoa(unitNum)
+			if unit != nil && unit.Tunnel != nil && unit.Tunnel.Name != "" {
+				// Per-unit tunnel: its own Linux device, always.
 				m[ref] = unit.Tunnel.Name
+				continue
+			}
+			if ifaceTunnel {
+				// Interface-level tunnel: unit shares the device.
+				m[ref] = baseName
 			}
 		}
 	}
