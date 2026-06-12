@@ -109,9 +109,15 @@ harness still runs in the full-suite gate).
   same with untagged ingress (l3_offset 14); pins blast-radius case 2
   (byte-equality rules out the outer-packet misdelivery, which a
   nibble-only check would pass).
-- `unencapsulated_local_delivery_to_tunnel_address_delivers_exactly_once`
-  — non-decapped frame destined to the gr-local address; pins the
-  duplicate-enqueue removal (blast-radius case 3) at the same channel.
+- `unencapsulated_local_delivery_reinjects_slow_path_exactly_once` —
+  non-decapped frame destined to the gr-local address (its
+  `local_ifindex` resolves through the generic local path, so it
+  funnels to the kernel slow-path TUN, not the gr- channel); pins the
+  duplicate-enqueue removal (blast-radius case 3) via the per-attempt
+  `slow_path_drops` counter — pre-fix 2 attempts, fixed exactly 1.
+- `gre_to_self_session_hit_delivery_is_inner_packet_exactly_once` —
+  the live keepalive stream rides an existing session; same frame
+  twice through one (binding, sessions) pair pins the hit leg.
 - `native_gre_decap_tagged_ingress_yields_self_consistent_frame_meta` —
   decap-level pin: tagged outer frame → synthetic frame + inner meta
   are mutually consistent (`synthetic[meta.l3_offset..] == inner`).
