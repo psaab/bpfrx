@@ -380,6 +380,10 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 				"warm":         4.0,
 			}
 		},
+		// #1880: wire a non-nil FRR reload-degraded source so the
+		// xpf_frr_reload_degraded gauge emits and the canary covers its
+		// descriptor declaration.
+		frrReloadDegradedFn: func() bool { return true },
 		// #1827: wire a non-nil ip-monitoring status source so the
 		// xpf_ipmon_* family emits and the canary covers its
 		// descriptor declarations.
@@ -466,6 +470,7 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 		"xpf_daemon_uptime_seconds",                                        // collectSystemMetrics
 		"xpf_daemon_neighbor_periodic_last_success_age_seconds",            // #1780 neighbor watchdog
 		"xpf_ipmon_policy_failed",                                          // #1827 ip-monitoring
+		"xpf_frr_reload_degraded",                                          // #1880 FRR degraded reload
 		"xpf_userspace_worker_dead",                                        // emitWorkerRuntime
 		"xpf_userspace_worker_cold_path_samples_v3_total",                  // cold-path v3
 		"xpf_cos_drain_invocations_total",                                  // CoS owner profile

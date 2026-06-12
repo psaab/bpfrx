@@ -362,7 +362,11 @@ func (s *Store) schemaValidateExpandedTree(tree *config.ConfigTree) error {
 		if err := expanded.ExpandGroupsWithVars(vars); err != nil {
 			return fmt.Errorf("apply-groups: %w", err)
 		}
-		return config.SchemaValidate(expanded, nil)
+		// Pass the PRE-expansion candidate as the cross-reference
+		// definitions source: expansion removes the groups stanza, and
+		// definitions living only in un-applied peer-node groups must
+		// keep satisfying shared-section references (#1319 PR 3).
+		return config.SchemaValidateWithDefinitions(expanded, tree, nil)
 	}
 	if err := expanded.ExpandGroups(); err != nil {
 		if strings.Contains(err.Error(), `undefined group "${node}"`) {
@@ -374,7 +378,7 @@ func (s *Store) schemaValidateExpandedTree(tree *config.ConfigTree) error {
 			return fmt.Errorf("apply-groups: %w", err)
 		}
 	}
-	return config.SchemaValidate(expanded, nil)
+	return config.SchemaValidateWithDefinitions(expanded, tree, nil)
 }
 
 // SyncApply applies a config received from the cluster primary.

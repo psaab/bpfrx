@@ -259,7 +259,7 @@ in git history; `git log -- bpf/xdp/ bpf/tc/` walks the deleted source.
 - **Event debounce**: 500ms for cluster state → VRRP priority updates
 
 ### Shutdown
-- FRR reload commands use 15s context timeout to prevent hanging on `systemctl reload frr`
+- FRR reloads run `frr-reload.py` DIRECTLY (15s context per leg) — NEVER `systemctl reload frr`: FRR 10.6's ExecReload bounces watchfrr (the unit MainPID), which parks frr.service in a 2-min stop-sigterm and ends in systemd SIGKILLing FRR (#1880)
 - systemd unit has `TimeoutStopSec=20` as safety net, `RestartSec=1`
 
 ## Feature Coverage

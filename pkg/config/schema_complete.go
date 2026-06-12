@@ -73,6 +73,26 @@ func appendTypedValueCompletions(results []SchemaCompletion, node *schemaNode) [
 	return results
 }
 
+// appendTypedKeyCompletions is the typed-KEY-slot counterpart of
+// appendTypedValueCompletions (#1319 PR 3): a named-instance container
+// whose identity token is typed (keyValidator set, e.g. `family inet
+// address <cidr>`) surfaces its key placeholder + examples at the empty
+// identity slot. No-op for nodes without key-slot metadata.
+func appendTypedKeyCompletions(results []SchemaCompletion, node *schemaNode) []SchemaCompletion {
+	if node == nil || node.keyValueType == ValueAny {
+		return results
+	}
+	if node.placeholder == "" {
+		if ph := node.keyValueType.Placeholder(); ph != "" {
+			results = append(results, SchemaCompletion{Name: ph, Desc: node.keyValueDesc})
+		}
+	}
+	for _, ex := range node.keyValueExamples {
+		results = append(results, SchemaCompletion{Name: ex, Desc: node.keyValueDesc})
+	}
+	return results
+}
+
 // CompleteSetPathWithValues is like CompleteSetPath but uses a ValueProvider
 // to suggest dynamic values at positions where schema expects a name argument.
 // Returns SchemaCompletion pairs with names and descriptions.
@@ -184,16 +204,16 @@ func CompleteSetPathWithValues(tokens []string, provider ValueProvider) []Schema
 				if childSchema.placeholder != "" {
 					results = append([]SchemaCompletion{{Name: childSchema.placeholder, Desc: childSchema.desc}}, results...)
 				}
-				// Typed-value examples are additive to dynamic provider
+				// Typed-value/key examples are additive to dynamic provider
 				// results (#1319).
-				return appendTypedValueCompletions(results, childSchema)
+				return appendTypedKeyCompletions(appendTypedValueCompletions(results, childSchema), childSchema)
 			}
 			// No provider but have a placeholder — show it.
 			if childSchema.placeholder != "" {
-				return appendTypedValueCompletions(
+				return appendTypedKeyCompletions(appendTypedValueCompletions(
 					[]SchemaCompletion{{Name: childSchema.placeholder, Desc: childSchema.desc}},
 					childSchema,
-				)
+				), childSchema)
 			}
 			// #1319: a typed leaf with no valueHint/placeholder surfaces its
 			// own placeholder + example values at the empty value slot. This
@@ -201,6 +221,12 @@ func CompleteSetPathWithValues(tokens []string, provider ValueProvider) []Schema
 			// completer (e.g. `set ... transmit-rate ?` → <rate> + examples).
 			if childSchema.isTypedLeaf() {
 				return appendTypedValueCompletions(nil, childSchema)
+			}
+			// #1319 PR 3: a typed KEY slot (named-instance container with a
+			// validated identity token, e.g. `family inet address ?`)
+			// surfaces its key placeholder + examples the same way.
+			if childSchema.keyValueType != ValueAny {
+				return appendTypedKeyCompletions(nil, childSchema)
 			}
 			return nil
 		}

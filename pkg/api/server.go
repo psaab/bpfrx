@@ -89,6 +89,13 @@ type Config struct {
 	// the xpf_ipmon_* metrics (#1827). Optional; if nil, the family is
 	// omitted.
 	IPMonStatusFn func() []ipmon.PolicyStatus
+	// FRRReloadDegradedFn reports whether the last applied FRR reload
+	// fell back to the additive vtysh -f path (full frr-reload.py diff
+	// failed) and the in-manager retry has not yet converged —
+	// stale-config removal is deferred while set (#1880). Backs the
+	// xpf_frr_reload_degraded gauge (0/1, no labels). Optional; if nil,
+	// the gauge is not emitted.
+	FRRReloadDegradedFn func() bool
 }
 
 // Server is the HTTP API server.
@@ -109,6 +116,7 @@ type Server struct {
 	compileHealthFn         func() CompileHealthSnapshot
 	configPersistDegradedFn func() bool
 	neighborPhaseAgeFn      func() map[string]float64
+	frrReloadDegradedFn     func() bool
 	ipmonStatusFn           func() []ipmon.PolicyStatus
 	startTime               time.Time
 }
@@ -130,6 +138,7 @@ func NewServer(cfg Config) *Server {
 		compileHealthFn:         cfg.CompileHealthFn,
 		configPersistDegradedFn: cfg.ConfigPersistDegradedFn,
 		neighborPhaseAgeFn:      cfg.NeighborPhaseAgeFn,
+		frrReloadDegradedFn:     cfg.FRRReloadDegradedFn,
 		ipmonStatusFn:           cfg.IPMonStatusFn,
 		startTime:               time.Now(),
 	}

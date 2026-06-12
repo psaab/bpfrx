@@ -80,6 +80,7 @@ type xpfCollector struct {
 
 	// #1780: per-phase age of the Go periodic neighbor-maintenance loop.
 	neighborPeriodicAge *prometheus.Desc
+	frrReloadDegraded   *prometheus.Desc
 
 	// #1799: 0/1 gauge — 1 while the running active config failed to
 	// persist to disk and the configstore's background retry has not
@@ -384,6 +385,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.daemonUptime
 	ch <- c.daemonMemRSS
 	ch <- c.neighborPeriodicAge
+	ch <- c.frrReloadDegraded
 	ch <- c.configPersistDegraded
 	ch <- c.ipmonPolicyFailed
 	ch <- c.ipmonPolicyTransitions
@@ -562,6 +564,19 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 			v = 1
 		}
 		ch <- prometheus.MustNewConstMetric(c.configPersistDegraded,
+			prometheus.GaugeValue, v)
+	}
+
+	// #1880: FRR reload-degraded is likewise a control-plane signal
+	// (the daemon applies FRR even in config-only mode) — emit it
+	// BEFORE the dataplane gate so it never disappears exactly when
+	// the fallback path is active.
+	if c.srv.frrReloadDegradedFn != nil {
+		v := 0.0
+		if c.srv.frrReloadDegradedFn() {
+			v = 1
+		}
+		ch <- prometheus.MustNewConstMetric(c.frrReloadDegraded,
 			prometheus.GaugeValue, v)
 	}
 
