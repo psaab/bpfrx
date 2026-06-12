@@ -67,22 +67,27 @@ func collectTunnelEndpointNamesAST(ifacesNode *Node, out map[string]struct{}) {
 		}
 		if hasIfaceTunnel && astTunnelModeWireguard(tunnelNode) {
 			// Mirror the builder's single-endpoint selection: the
-			// lowest numeric unit. (Non-numeric unit names never
-			// compile into typed Units; if none parses, fall through
-			// to per-unit registration below — same as pre-#1910.)
-			lowest, found := "", false
-			lowestNum := 0
+			// lowest numeric unit, registered in CANONICAL decimal
+			// form (%d of the parsed number, #1910 r4 Codex) — the
+			// compiler stores units as ints and the builder emits
+			// "%s.%d", so a non-canonical spelling like `unit 01`
+			// must hash as "wg0.1", not "wg0.01", or the gate would
+			// miss a real collision on the emitted ref. (Non-numeric
+			// unit names never compile into typed Units; if none
+			// parses, fall through to per-unit registration below —
+			// same as pre-#1910.)
+			lowestNum, found := 0, false
 			for _, unit := range units {
 				n, err := strconv.Atoi(unit.name)
 				if err != nil {
 					continue
 				}
 				if !found || n < lowestNum {
-					lowest, lowestNum, found = unit.name, n, true
+					lowestNum, found = n, true
 				}
 			}
 			if found {
-				out[fmt.Sprintf("%s.%s", name, lowest)] = struct{}{}
+				out[fmt.Sprintf("%s.%d", name, lowestNum)] = struct{}{}
 				continue
 			}
 		}

@@ -126,6 +126,28 @@ func TestTunnelEndpointIDNoFalsePositiveOnNonEmittedWGUnit(t *testing.T) {
 	}
 }
 
+// #1910 r4 Codex: a non-canonical numeric unit spelling (`unit 01`)
+// compiles to unit 1 and the builder emits/hashes the canonical
+// "wg0.1" — the gate must hash the SAME canonical ref, or it misses
+// the frozen wg0.1/wg341 collision (14730) and the runtime usedIDs
+// belt silently drops an endpoint instead of failing the commit.
+func TestTunnelEndpointIDLeadingZeroUnitStillCollides(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set interfaces wg0 tunnel mode wireguard",
+		"set interfaces wg0 unit 01 family inet address 10.70.0.1/30",
+		"set interfaces wg341 tunnel mode wireguard",
+	})
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatalf("CompileConfig accepted a builder-emitted collision hidden behind a leading-zero unit spelling (wg0.01 -> emits wg0.1, collides with wg341)")
+	}
+	for _, want := range []string{"wg0.1", "wg341", "collision"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("collision error %q does not mention %q", err.Error(), want)
+		}
+	}
+}
+
 // And the inverse: a collision on the EMITTED lowest unit ref of an
 // interface-level WG tunnel must still be rejected.
 func TestTunnelEndpointIDCollisionOnEmittedWGUnitStillRejected(t *testing.T) {
