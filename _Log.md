@@ -21,6 +21,16 @@
   incus (xpf-image-*) + qcow2 boot under plain QEMU/OVMF.
 - **File(s)**: pkg/configstore/{check.go,check_test.go,store.go},
   cmd/xpfd/main.go, scripts/image/*, Makefile, docs/install-images.md
+- **Addendum (operator-directed)**: image base switched from Debian 13
+  genericcloud to the LATEST Ubuntu release, auto-discovered at bake
+  time (26.04/kernel 7.0 today; XPF_BASE_RELEASE pins). Deleted the
+  Debian-unstable kernel machinery; linux-virtual→linux-generic swap
+  with ≥6.18 + modules-extra asserts; snapd + stale-kernel purges
+  (single-kernel image); grub.d drop-in for init_on_alloc=0 (cloudimg
+  overrides GRUB_CMDLINE_LINUX_DEFAULT); virt-sparsify export (3.5 GB
+  → 1.6 GB). Round-3 reviews: Codex MERGE-READY, AGY findings fixed
+  (dpkg warn-pass guard, sparsify --tmp, cmdline assert). Final
+  artifacts xpf-1879-b542e2ac0.* — full A/B/C + QEMU/OVMF green.
 
 ## 2026-06-11 — #1873 PR #1882 code-review rounds 2-5 (resumed agent)
 - **Timestamp**: 2026-06-11/12 UTC
