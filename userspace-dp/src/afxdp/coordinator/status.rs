@@ -59,6 +59,19 @@ impl super::Coordinator {
             .sum()
     }
 
+    /// #1902: sum of per-binding `pending_neigh_decap_drops` across
+    /// every `BindingLiveState`. Counts GRE-decapped MissingNeighbor
+    /// packets refused pending_neigh admission (the buffered desc/meta
+    /// pairing would retry-TX a mis-rewritten outer frame). Surfaced as
+    /// `xpf_userspace_pending_neigh_decap_drops_total`.
+    pub fn pending_neigh_decap_drops_total(&self) -> u64 {
+        self.workers
+            .live
+            .values()
+            .map(|live| live.pending_neigh_decap_drops.load(Ordering::Relaxed))
+            .sum()
+    }
+
     /// #1771 §2.6: distinct unresolved `(egress_ifindex, next_hop)` keys
     /// currently buffered across every binding's `pending_neigh` map
     /// (gauge). Each per-binding value is a `len()` snapshot published

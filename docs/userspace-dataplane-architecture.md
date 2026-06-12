@@ -202,6 +202,20 @@ in `neighbor_dispatch.rs`). A hop that never resolves within the pending
 timeout is negatively cached for 3 s (`neg_neigh.rs`), and subsequent
 cold packets to it fast-fail at the buffer site.
 
+**Pairing contract (#1902, sibling of #1885/#1873):** an entry's
+`desc`/`meta`/`decision` must all describe the SAME UMEM frame, because
+`retry_pending_neigh` resumes the flow via an in-place UMEM rewrite +
+TX. Admission therefore refuses (counts
+`pending_neigh_decap_drops_total`, recycles) any GRE-DECAPPED packet —
+its `desc` still references the un-decapped OUTER frame while
+`meta`/`decision` describe the synthetic INNER frame, so a buffered
+entry would retry-TX a mis-rewritten outer packet toward the inner
+next-hop. Tunnel-MARKED (encap-bound) decisions are likewise excluded
+(#1873 R-E: the retry cannot encapsulate, so the inner packet would TX
+plaintext). In both cases the kernel probe has already fired and the
+trailing decap-aware slow-path chokepoint (#1901) handles first-packet
+delivery; the flow recovers normally once the neighbor resolves.
+
 **Invariant N1 (#1771 §2.4):** while a key is negatively cached, the
 shared on-demand resolver (`neighbor_resolver.rs`, #1769) continues to
 issue rate-limited single-key RTM_GETNEIGH probes for it — the negative

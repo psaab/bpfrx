@@ -60,6 +60,11 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     state.status.neg_neigh_fast_fail_total = state.afxdp.neg_neigh_fast_fail_total();
     state.status.pending_neigh_duplicate_drops_total =
         state.afxdp.pending_neigh_duplicate_drops_total();
+    // #1902: decap-refusal gate at pending_neigh admission (the
+    // outer-frame/inner-meta pairing must never reach the in-place
+    // retry TX path).
+    state.status.pending_neigh_decap_drops_total =
+        state.afxdp.pending_neigh_decap_drops_total();
     // #1789: total failed USERSPACE_SESSIONS BPF-map publishes
     // (per-binding worker-poll sites + shared no-binding sites). The
     // cause-side signal for rising XDP-shim NO_SESSION fallbacks.

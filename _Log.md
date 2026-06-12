@@ -5271,3 +5271,19 @@ top.
 - **Timestamp**: 2026-06-12
   **Action**: #1891 /engineer — pkg/config/schema.go domain split (2,169 → 121 lines), pure code motion, seams rederived on current master post-#1319-rollout (+40 typed slots) and post-#1892 (+~500 help texts): schema_security.go (security+applications, 316 LOC), schema_interfaces.go (interfaces + tunnelSchemaChildren/wireguardSchemaNode constructors, 395 LOC), schema_routing.go (routing-options/policy-options/protocols/forwarding-options/bridge-domains/routing-instances, 390 LOC), schema_system.go (system/services/snmp/event-options, 480 LOC), schema_chassis.go (chassis, 256 LOC), schema_cos.go (class-of-service+firewall, 285 LOC). Sibling aspect files in package config (NOT subpackage — unexported setSchema, two-SSOT doctrine). One building commit per domain. Proof: canonical full-field node-path inventory dump (1,962 nodes incl. groups-wildcard mirror) byte-identical pre/post at every commit; TestSchemaAllNodesHaveDesc (#1892 pin) + full go test ./... exit 0 (36 pkgs); schema test battery 5/5 flake-free; --color-moved=dimmed-zebra non-moved residue = headers + root-map rewrites + var openers only.
   **File(s)**: pkg/config/{schema.go,schema_security.go,schema_interfaces.go,schema_routing.go,schema_system.go,schema_chassis.go,schema_cos.go}, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-06-12
+  **Action**: #1902 — gate pending_neigh admission on owned_packet_frame.is_none() (GRE-decapped packets refused, counted via pending_neigh_decap_drops); status/wire/Prometheus plumbing; 3 deterministic pins; plan doc + architecture doc pairing contract.
+  **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs, userspace-dp/src/afxdp/umem/mod.rs, userspace-dp/src/afxdp/coordinator/status.rs, userspace-dp/src/server/{helpers,lifecycle}.rs, userspace-dp/src/protocol/control.rs, userspace-dp/src/afxdp/tests.rs, pkg/dataplane/userspace/protocol.go, pkg/api/{metrics.go,metrics_userspace.go,metrics_descriptors.go,metrics_descriptor_coverage_test.go}, docs/pr/1902-pending-neigh/plan.md, docs/userspace-dataplane-architecture.md
+- **Timestamp**: 2026-06-12 ~13:55
+  **Action**: #1902 PR #1911 — recorded Codex r1 (MERGE-READY, 1 Low adjudicated), AGY r1 (MERGE-READY), Claude SMR r1 (MERGE-READY, byte-trace) in reviewer ledger
+  **File(s)**: docs/pr/1902-pending-neigh/reviewer-ids.md
+- **Timestamp**: 2026-06-12 ~14:05
+  **Action**: #1902 live validation — r1 vacuous (lanhost gre module missing, fixed via modprobe ip_gre on loss host), r2 gate fired (counter 0->1, 0 corrupt frames), wrote r3 diagnostic script to localize round-3 loss
+  **File(s)**: tmp/v1902b.sh
+- **Timestamp**: 2026-06-12 ~14:10
+  **Action**: #1902 live validation r3 complete — gate counter 1->4 across cold windows, 0 corrupt frames, 18/18 inner delivery, retry dwell <1ms x2; recorded trail in ledger
+  **File(s)**: docs/pr/1902-pending-neigh/reviewer-ids.md
+- **Timestamp**: 2026-06-12 ~14:25
+  **Action**: #1902 — posted live-validation PR comment, filed follow-ups #1912 (encap reply blackhole) + #1913 (unfiltered trailing reinject), Copilot 3x quota-limited -> 3-of-4 fallback recorded
+  **File(s)**: docs/pr/1902-pending-neigh/reviewer-ids.md
