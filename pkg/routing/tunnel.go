@@ -574,8 +574,9 @@ func (t *tunnelManager) finishTunnelLocked(tc *config.TunnelConfig, link netlink
 // deleted only when this manager itself applied them (`applied`
 // gate). The kernel's autoconf fe80 must never be deleted, while a
 // CONFIGURED fe80 removed from config must not leak forever (#1884 r1
-// Codex F2). applied == nil (also the WG-branch sentinel) means no
-// link-local deletion at all.
+// Codex F2; extended to the WG branch in #1905). applied == nil (the
+// first apply for a link this manager has not tracked yet — restart
+// adoption) means no link-local deletion at all.
 //
 // Returns the new applied set: successful adds + present-and-wanted +
 // link-local addresses whose stale-delete FAILED (kept tracked so the
@@ -866,11 +867,18 @@ func (t *tunnelManager) applyWireguardTunLocked(tc *config.TunnelConfig) error {
 	// Symmetric address reconciliation (Copilot C5): because the device
 	// is persistent and never recreated, addresses removed from the config
 	// would otherwise survive every reload and keep being routed. Shared
-	// helper (#1884); the nil applied-set sentinel preserves this
-	// branch's blanket link-local skip byte-identically ("the kernel
-	// manages fe80"). The configured-link-local removal leak this
-	// implies on the WG branch is pre-existing and tracked separately.
-	_ = t.reconcileLinkAddrsLocked(link, tc.Name, tc.Addresses, nil, "wireguard tun")
+	// helper (#1884) with the per-link applied-address record (#1905) —
+	// the same configured-vs-autoconf link-local split as the GRE/IPIP
+	// branch: a CONFIGURED fe80 later removed from config is deleted
+	// (this manager applied it), while the kernel's autoconf fe80 — and
+	// any fe80 already present before this daemon's first apply
+	// (restart adoption pass, applied == nil) — is never touched.
+	// Because the wgN device persists when removed from config (S2a,
+	// see above), its appliedAddrs entry is retained with it so a later
+	// re-add keeps accurate tracking; S6 teardown (#1434) owns deleting
+	// both.
+	t.appliedAddrs[tc.Name] = t.reconcileLinkAddrsLocked(
+		link, tc.Name, tc.Addresses, t.appliedAddrs[tc.Name], "wireguard tun")
 
 	if tc.RoutingInstance != "" {
 		if bindErr := t.vrfBinder.BindInterfaceToVRF(tc.Name, tc.RoutingInstance); bindErr != nil {
