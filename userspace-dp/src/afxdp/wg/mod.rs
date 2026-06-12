@@ -67,6 +67,9 @@ pub(crate) mod peer;
 pub(crate) mod scratch;
 pub(crate) mod session;
 pub(crate) mod tai64n;
+// #1888 S5: engine clock, rekey edge, session expiry, and the pure
+// timer decision pass (T6/T7/T8) the per-tunnel control thread runs.
+pub(crate) mod timers;
 
 #[cfg(test)]
 #[path = "tests.rs"]

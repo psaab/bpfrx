@@ -106,6 +106,7 @@ func (c *xpfCollector) emitWireguardTelemetry(ch chan<- prometheus.Metric, statu
 			{"allowed_ips", t.DecapDropsAllowedIPs},
 			{"malformed_inner", t.DecapDropsMalformedInner},
 			{"buffer", t.DecapDropsBuffer},
+			{"expired", t.DecapDropsExpired},
 		} {
 			counter(c.wgTransportDropsTotal, r.v, t.Tunnel, "decap", r.reason)
 		}
@@ -118,6 +119,7 @@ func (c *xpfCollector) emitWireguardTelemetry(ch chan<- prometheus.Metric, statu
 			{"rekey_required", t.EncapDropsRekeyRequired},
 			{"mtu", t.EncapMtuDrops},
 			{"other", t.EncapDropsOther},
+			{"expired", t.EncapDropsExpired},
 		} {
 			counter(c.wgTransportDropsTotal, r.v, t.Tunnel, "encap", r.reason)
 		}
@@ -133,6 +135,15 @@ func (c *xpfCollector) emitWireguardTelemetry(ch chan<- prometheus.Metric, statu
 		} {
 			counter(c.wgSendErrorsTotal, k.v, t.Tunnel, k.kind)
 		}
+
+		// #1888 S5 timer telemetry.
+		counter(c.wgRekeysInitiatedTotal, t.RekeysInitiatedAge, t.Tunnel, "age")
+		counter(c.wgRekeysInitiatedTotal, t.RekeysInitiatedDeadPeer, t.Tunnel, "dead_peer")
+		counter(c.wgRekeysInitiatedTotal, t.RekeysInitiatedKeepaliveNoSession, t.Tunnel, "keepalive_no_session")
+		counter(c.wgKeepalivesSentTotal, t.KeepalivesTxPassive, t.Tunnel, "passive")
+		counter(c.wgKeepalivesSentTotal, t.KeepalivesTxPersistent, t.Tunnel, "persistent")
+		counter(c.wgSessionsExpiredTotal, t.SessionsExpired, t.Tunnel)
+		counter(c.wgHandshakeAttemptsAbortedTotal, t.PendingAbortedAttemptWindow, t.Tunnel)
 
 		confirmed := 0.0
 		if t.SessionConfirmed {

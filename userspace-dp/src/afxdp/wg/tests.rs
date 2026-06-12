@@ -108,6 +108,7 @@ fn established_pair(
         resp_local_index,
         resp_pub,
         super::session::SessionRole::Initiator,
+        super::counters::monotonic_now_ns(),
     ));
     let resp_session = Arc::new(WgSession::new_with_role(
         resp_xport,
@@ -115,6 +116,7 @@ fn established_pair(
         init_local_index,
         init_pub,
         super::session::SessionRole::Responder,
+        super::counters::monotonic_now_ns(),
     ));
     // Pre-confirm the responder so callers that don't want to drive
     // the gate (the bulk of the tests in this file) can encap from
@@ -959,6 +961,7 @@ fn responder_session_blocks_encap_until_initiator_data_authenticated() {
                 resp_local,
                 resp_pub,
                 SessionRole::Initiator,
+                super::counters::monotonic_now_ns(),
             )),
         )
         .unwrap();
@@ -969,6 +972,7 @@ fn responder_session_blocks_encap_until_initiator_data_authenticated() {
         init_local,
         init_pub,
         SessionRole::Responder,
+        super::counters::monotonic_now_ns(),
     ));
     assert!(
         !resp_session.is_confirmed(),
@@ -1355,6 +1359,7 @@ fn established_pair_responder_confirmation_flips_via_decap_path() {
                 resp_local,
                 resp_pub,
                 SessionRole::Initiator,
+                super::counters::monotonic_now_ns(),
             )),
         )
         .unwrap();
@@ -1364,6 +1369,7 @@ fn established_pair_responder_confirmation_flips_via_decap_path() {
         init_local,
         init_pub,
         SessionRole::Responder,
+        super::counters::monotonic_now_ns(),
     ));
     resp_engine
         .install_session(&init_pub, resp_session.clone())
@@ -2523,5 +2529,572 @@ mod telemetry_counters {
             }],
         });
         (init, resp, init_pub, resp_pub)
+    }
+}
+
+// ===========================================================================
+// #1888 S5: deterministic timer-semantics tests (mock engine clock).
+//
+// Fixture discipline: `established_pair` stamps `created_ns` from the
+// real CLOCK_MONOTONIC at fixture time; tests capture `t0` immediately
+// after and drive `set_mock_now_ns(t0 + offset)` with offsets that
+// carry >= 1s of margin against the fixture's microsecond setup skew,
+// so no assertion sits on an exact threshold boundary.
+// ===========================================================================
+mod s5_timer_tests {
+    use super::super::counters::monotonic_now_ns;
+    use super::super::session::SessionRole;
+    use super::super::timers::{InitiateReason, KeepaliveKind, WG_NO_DEADLINE_NS};
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    const SEC: u64 = 1_000_000_000;
+
+    fn pair() -> (WgEngine, WgEngine, [u8; 32], [u8; 32], u64) {
+        let (init, resp, init_pub, resp_pub) = super::established_pair(
+            vec!["10.0.1.0/24".parse().unwrap()],
+            vec!["10.0.0.0/24".parse().unwrap()],
+        );
+        let t0 = monotonic_now_ns();
+        (init, resp, init_pub, resp_pub, t0)
+    }
+
+    fn inner_from_init() -> Vec<u8> {
+        super::ipv4_packet(Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(10, 0, 1, 5))
+    }
+
+    fn inner_from_resp() -> Vec<u8> {
+        super::ipv4_packet(Ipv4Addr::new(10, 0, 1, 5), Ipv4Addr::new(10, 0, 0, 5))
+    }
+
+    /// T1: a send on an initiator-role session older than
+    /// REKEY_AFTER_TIME arms the rekey edge; younger does not; a
+    /// responder-role session NEVER arms on age (initiator-only rule);
+    /// pure aging without a send arms nothing.
+    #[test]
+    fn t1_rekey_edge_arms_on_send_past_120s_initiator_only() {
+        let (init, resp, init_pub, resp_pub, t0) = pair();
+        let mut wire = [0u8; 2048];
+
+        // Aging alone arms nothing.
+        init.set_mock_now_ns(t0 + 130 * SEC);
+        assert!(!init.take_rekey_request());
+
+        // 118s: send does not arm (margin below the 120s threshold).
+        init.set_mock_now_ns(t0 + 118 * SEC);
+        init.try_encap(&resp_pub, &inner_from_init(), &mut wire)
+            .unwrap();
+        assert!(!init.take_rekey_request(), "below REKEY_AFTER_TIME");
+
+        // 121s: send arms.
+        init.set_mock_now_ns(t0 + 121 * SEC);
+        init.try_encap(&resp_pub, &inner_from_init(), &mut wire)
+            .unwrap();
+        assert!(init.take_rekey_request(), "at/after REKEY_AFTER_TIME");
+        assert!(!init.take_rekey_request(), "edge is consume-once");
+
+        // Responder-role session: same age, no arm.
+        resp.set_mock_now_ns(t0 + 121 * SEC);
+        resp.try_encap(&init_pub, &inner_from_resp(), &mut wire)
+            .unwrap();
+        assert!(!resp.take_rekey_request(), "responder never age-rekeys");
+    }
+
+    /// T3 encap: refused at/after REJECT_AFTER_TIME with the session's
+    /// tx_counter untouched (on-Err contract), the expired counter
+    /// bumped, and the rekey edge armed (send-side initiates).
+    #[test]
+    fn t3_encap_refused_at_180s_counter_untouched() {
+        let (init, _resp, _init_pub, resp_pub, t0) = pair();
+        let mut wire = [0u8; 2048];
+        init.set_mock_now_ns(t0 + 181 * SEC);
+        let err = init
+            .try_encap(&resp_pub, &inner_from_init(), &mut wire)
+            .unwrap_err();
+        assert_eq!(err, EncapError::NoSession, "caller contract unchanged");
+        assert_eq!(
+            init.counters().encap_drops_expired.load(Ordering::Relaxed),
+            1
+        );
+        assert!(init.take_rekey_request(), "send-side T3 arms the edge");
+        let session = init
+            .sessions_by_local_index
+            .read()
+            .unwrap()
+            .get(&0xaaaa_0001)
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            session.tx_counter.load(Ordering::Relaxed),
+            0,
+            "on Err the tx counter must be untouched"
+        );
+    }
+
+    /// T3 decap: an inbound record addressed to an expired session is
+    /// dropped BEFORE AEAD with DecapError::Expired and does NOT arm
+    /// the rekey edge (replay at an expired session must not drive our
+    /// handshake cadence).
+    #[test]
+    fn t3_decap_refused_drop_only_no_rekey_arm() {
+        let (init, resp, init_pub, _resp_pub, t0) = pair();
+        let mut wire = [0u8; 2048];
+        let mut out = [0u8; 2048];
+        // Responder encrypts while its own clock is fresh.
+        resp.set_mock_now_ns(t0 + 1 * SEC);
+        let enc = resp
+            .try_encap(&init_pub, &inner_from_resp(), &mut wire)
+            .unwrap();
+        // Initiator's demuxed session is past 180s.
+        init.set_mock_now_ns(t0 + 181 * SEC);
+        let err = init.try_decap(&wire[..enc.len], &mut out).unwrap_err();
+        assert_eq!(err, DecapError::Expired);
+        assert_eq!(
+            init.counters().decap_drops_expired.load(Ordering::Relaxed),
+            1
+        );
+        assert!(
+            !init.take_rekey_request(),
+            "decap T3 is drop-only — no rekey arm"
+        );
+    }
+
+    /// T2: receiving a transport record on an initiator-role session
+    /// past the 165s horizon arms the rekey edge; a responder-role
+    /// session at the same age does not.
+    #[test]
+    fn t2_recv_horizon_arms_initiator_only() {
+        let (init, resp, init_pub, resp_pub, t0) = pair();
+        let mut wire = [0u8; 2048];
+        let mut out = [0u8; 2048];
+
+        // Peer-to-initiator record, initiator at 166s.
+        resp.set_mock_now_ns(t0 + 1 * SEC);
+        let enc = resp
+            .try_encap(&init_pub, &inner_from_resp(), &mut wire)
+            .unwrap();
+        init.set_mock_now_ns(t0 + 166 * SEC);
+        init.try_decap(&wire[..enc.len], &mut out).unwrap();
+        assert!(init.take_rekey_request(), "initiator receive past 165s");
+
+        // Initiator-to-responder record, responder at 166s: no arm.
+        init.set_mock_now_ns(t0 + 2 * SEC);
+        let enc2 = init
+            .try_encap(&resp_pub, &inner_from_init(), &mut wire)
+            .unwrap();
+        // The encap above stamped/armed init-side state; drain its edge.
+        let _ = init.take_rekey_request();
+        resp.set_mock_now_ns(t0 + 166 * SEC);
+        resp.try_decap(&wire[..enc2.len], &mut out).unwrap();
+        assert!(!resp.take_rekey_request(), "responder never age-rekeys");
+    }
+
+    /// expire_sessions tears down current sessions past 180s, removes
+    /// their demux entries, and counts them.
+    #[test]
+    fn expire_sessions_removes_demux_entries() {
+        let (init, _resp, _init_pub, resp_pub, t0) = pair();
+        let now = t0 + 181 * SEC;
+        let removed = init.expire_sessions(now);
+        assert_eq!(removed, 1, "one current session expired");
+        assert!(
+            init.sessions_by_local_index
+                .read()
+                .unwrap()
+                .get(&0xaaaa_0001)
+                .is_none(),
+            "demux entry removed"
+        );
+        assert_eq!(init.current_session_local_index(&resp_pub), None);
+        assert_eq!(
+            init.counters().sessions_expired.load(Ordering::Relaxed),
+            1
+        );
+        // Idempotent.
+        assert_eq!(init.expire_sessions(now), 0);
+    }
+
+    /// Keepalive encode: 32-byte record, consumes a tx counter, does
+    /// NOT count as a data packet, does NOT arm T7; the receiving side
+    /// counts it as a keepalive, stamps last_recv_any, and does NOT
+    /// arm T6 (no keepalive ping-pong).
+    #[test]
+    fn keepalive_roundtrip_semantics() {
+        let (init, resp, init_pub, resp_pub, t0) = pair();
+        let mut wire = [0u8; 2048];
+        let mut out = [0u8; 2048];
+        init.set_mock_now_ns(t0 + 1 * SEC);
+        let enc = init.create_keepalive(&resp_pub, &mut wire).unwrap();
+        assert_eq!(
+            enc.len,
+            super::super::WG_DATA_HEADER_LEN + super::super::POLY1305_TAG_LEN,
+            "keepalive is header + tag only"
+        );
+        assert_eq!(
+            init.counters().encap_packets.load(Ordering::Relaxed),
+            0,
+            "keepalive is not a data packet"
+        );
+        let init_peer = init.peer_arc(&resp_pub).unwrap();
+        assert_eq!(
+            init_peer.t7_armed_send_ns.load(Ordering::Relaxed),
+            0,
+            "a sent keepalive must not arm T7"
+        );
+        assert_eq!(
+            init_peer.last_send_any_ns.load(Ordering::Relaxed),
+            t0 + 1 * SEC,
+            "keepalive is an authenticated send"
+        );
+        let session = init
+            .sessions_by_local_index
+            .read()
+            .unwrap()
+            .get(&0xaaaa_0001)
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            session.tx_counter.load(Ordering::Relaxed),
+            1,
+            "keepalive consumes a tx counter"
+        );
+
+        resp.set_mock_now_ns(t0 + 2 * SEC);
+        let err = resp.try_decap(&wire[..enc.len], &mut out).unwrap_err();
+        assert_eq!(err, DecapError::MalformedInner, "existing keepalive arm");
+        assert_eq!(
+            resp.counters().decap_keepalives.load(Ordering::Relaxed),
+            1
+        );
+        let resp_peer = resp.peer_arc(&init_pub).unwrap();
+        assert_eq!(
+            resp_peer.last_recv_any_ns.load(Ordering::Relaxed),
+            t0 + 2 * SEC,
+            "received keepalive is an authenticated receive"
+        );
+        assert_eq!(
+            resp_peer.t6_armed_recv_ns.load(Ordering::Relaxed),
+            0,
+            "a received keepalive must not arm T6"
+        );
+    }
+
+    /// T6 armed model: data receive arms (first unanswered receive,
+    /// later receives don't push the deadline); fires at armed+10s
+    /// (NOT immediately on first inbound after idle); any
+    /// authenticated send clears it; an AllowedIPs-rejected but
+    /// authenticated record still arms it.
+    #[test]
+    fn t6_armed_passive_keepalive_semantics() {
+        let (init, resp, init_pub, _resp_pub, t0) = pair();
+        let mut wire = [0u8; 2048];
+        let mut out = [0u8; 2048];
+
+        resp.set_mock_now_ns(t0 + 1 * SEC);
+        let enc = resp
+            .try_encap(&init_pub, &inner_from_resp(), &mut wire)
+            .unwrap();
+        init.set_mock_now_ns(t0 + 5 * SEC);
+        init.try_decap(&wire[..enc.len], &mut out).unwrap();
+        let armed = init
+            .peer_arc(&_resp_pub)
+            .unwrap()
+            .t6_armed_recv_ns
+            .load(Ordering::Relaxed);
+        assert_eq!(armed, t0 + 5 * SEC, "first data receive arms T6");
+
+        // A second receive does not push the arm forward.
+        resp.set_mock_now_ns(t0 + 6 * SEC);
+        let enc2 = resp
+            .try_encap(&init_pub, &inner_from_resp(), &mut wire)
+            .unwrap();
+        init.set_mock_now_ns(t0 + 7 * SEC);
+        init.try_decap(&wire[..enc2.len], &mut out).unwrap();
+        assert_eq!(
+            init.peer_arc(&_resp_pub)
+                .unwrap()
+                .t6_armed_recv_ns
+                .load(Ordering::Relaxed),
+            t0 + 5 * SEC,
+            "subsequent receives must not push the T6 deadline"
+        );
+
+        // Not due 9s after arming: deadline reported, no action.
+        let a = init.timer_pass(t0 + 14 * SEC, true);
+        assert!(a.send_keepalive.is_none());
+        assert_eq!(a.next_deadline_ns, t0 + 15 * SEC, "armed+10s deadline");
+        // Due at armed+10s.
+        let a = init.timer_pass(t0 + 15 * SEC, true);
+        assert_eq!(a.send_keepalive, Some(KeepaliveKind::Passive));
+        // A send clears the arm.
+        init.set_mock_now_ns(t0 + 16 * SEC);
+        init.create_keepalive(&_resp_pub, &mut wire).unwrap();
+        let a = init.timer_pass(t0 + 30 * SEC, true);
+        assert!(a.send_keepalive.is_none(), "send cleared the T6 arm");
+    }
+
+    /// T7 armed model — the Codex r3 F1 regression: continuous
+    /// outbound-only traffic must NOT suppress the no-reply reinit.
+    /// The arm sticks at the FIRST unanswered data send and fires at
+    /// +15s regardless of later sends; an authenticated receive
+    /// clears it.
+    #[test]
+    fn t7_outbound_only_stream_fires_at_first_send_plus_15s() {
+        let (init, resp, init_pub, resp_pub, t0) = pair();
+        let mut wire = [0u8; 2048];
+        let mut out = [0u8; 2048];
+
+        for i in 0..14u64 {
+            init.set_mock_now_ns(t0 + (1 + i) * SEC);
+            init.try_encap(&resp_pub, &inner_from_init(), &mut wire)
+                .unwrap();
+        }
+        let peer = init.peer_arc(&resp_pub).unwrap();
+        assert_eq!(
+            peer.t7_armed_send_ns.load(Ordering::Relaxed),
+            t0 + 1 * SEC,
+            "arm pinned at the FIRST unanswered send"
+        );
+        // Due at first-send + 15s even though sends continued.
+        let a = init.timer_pass(t0 + 16 * SEC, true);
+        assert_eq!(a.initiate, Some(InitiateReason::DeadPeer));
+
+        // An authenticated receive clears the arm.
+        resp.set_mock_now_ns(t0 + 17 * SEC);
+        let enc = resp
+            .try_encap(&init_pub, &inner_from_resp(), &mut wire)
+            .unwrap();
+        init.set_mock_now_ns(t0 + 18 * SEC);
+        init.try_decap(&wire[..enc.len], &mut out).unwrap();
+        assert_eq!(peer.t7_armed_send_ns.load(Ordering::Relaxed), 0);
+        let a = init.timer_pass(t0 + 40 * SEC, true);
+        assert!(a.initiate.is_none(), "receive cleared T7");
+    }
+
+    /// T8: paces on authenticated traversal in EITHER direction; with
+    /// a usable session emits a persistent keepalive; with no usable
+    /// session initiates; 0 = fully off; the skip anchor advances the
+    /// deadline.
+    #[test]
+    fn t8_persistent_keepalive_traversal_pacing() {
+        let (init, resp, init_pub, resp_pub, t0) = pair();
+        let mut wire = [0u8; 2048];
+        let mut out = [0u8; 2048];
+        let peer = init.peer_arc(&resp_pub).unwrap();
+
+        // Off by default.
+        let a = init.timer_pass(t0 + 1000 * SEC, true);
+        assert!(a.send_keepalive.is_none() && a.initiate.is_none());
+
+        peer.persistent_keepalive.store(25, Ordering::Relaxed);
+
+        // Inbound-only traversal suppresses T8 (Codex r1 B1): a fresh
+        // authenticated receive resets the pacing.
+        resp.set_mock_now_ns(t0 + 1 * SEC);
+        let enc = resp
+            .try_encap(&init_pub, &inner_from_resp(), &mut wire)
+            .unwrap();
+        init.set_mock_now_ns(t0 + 2 * SEC);
+        init.try_decap(&wire[..enc.len], &mut out).unwrap();
+        let a = init.timer_pass(t0 + 20 * SEC, true);
+        assert!(
+            a.send_keepalive != Some(KeepaliveKind::Persistent),
+            "recent inbound traversal paces T8"
+        );
+        assert_eq!(
+            a.next_deadline_ns.min(t0 + 27 * SEC),
+            a.next_deadline_ns,
+            "deadline no later than traversal+25s"
+        );
+
+        // Due at traversal+25s with a usable session => Persistent.
+        let a = init.timer_pass(t0 + 28 * SEC, true);
+        assert_eq!(a.send_keepalive, Some(KeepaliveKind::Persistent));
+
+        // Skip-pacing: advancing the attempt anchor defers the due.
+        // (T6 — armed by the inbound data at t0+2 and never cleared by
+        // a send in this test — remains due, so the pass still emits a
+        // PASSIVE keepalive; the assertion is that T8 specifically is
+        // no longer due.)
+        init.note_t8_attempt(&resp_pub, t0 + 28 * SEC);
+        let a = init.timer_pass(t0 + 29 * SEC, true);
+        assert_eq!(
+            a.send_keepalive,
+            Some(KeepaliveKind::Passive),
+            "skip anchor advanced T8; only the due T6 action remains"
+        );
+        assert_eq!(a.next_deadline_ns, t0 + 53 * SEC);
+
+        // No usable session (expired) => initiate instead.
+        let a = init.timer_pass(t0 + 300 * SEC, true);
+        assert_eq!(a.initiate, Some(InitiateReason::KeepaliveNoSession));
+    }
+
+    /// Unknown endpoint: no actions, no deadlines (AGY r3 G1(b)).
+    #[test]
+    fn timer_pass_endpoint_unknown_emits_nothing() {
+        let (init, resp, init_pub, resp_pub, t0) = pair();
+        let mut wire = [0u8; 2048];
+        let mut out = [0u8; 2048];
+        let peer = init.peer_arc(&resp_pub).unwrap();
+        peer.persistent_keepalive.store(25, Ordering::Relaxed);
+        // Arm T6 + T7 via real traffic.
+        init.set_mock_now_ns(t0 + 1 * SEC);
+        init.try_encap(&resp_pub, &inner_from_init(), &mut wire)
+            .unwrap();
+        resp.set_mock_now_ns(t0 + 2 * SEC);
+        let enc = resp
+            .try_encap(&init_pub, &inner_from_resp(), &mut wire)
+            .unwrap();
+        init.set_mock_now_ns(t0 + 3 * SEC);
+        init.try_decap(&wire[..enc.len], &mut out).unwrap();
+        // T6 is armed (data received at +3, nothing sent since).
+        let a = init.timer_pass(t0 + 1000 * SEC, false);
+        assert!(a.initiate.is_none() && a.send_keepalive.is_none());
+        assert_eq!(a.next_deadline_ns, WG_NO_DEADLINE_NS);
+    }
+
+    /// Skip-pacing for a due passive keepalive that cannot be sent:
+    /// re-arming at `now` makes the recomputed deadline strictly
+    /// future (AGY r3 G1(a)).
+    #[test]
+    fn pace_passive_keepalive_skip_defers_deadline() {
+        let (init, resp, init_pub, resp_pub, t0) = pair();
+        let mut wire = [0u8; 2048];
+        let mut out = [0u8; 2048];
+        resp.set_mock_now_ns(t0 + 1 * SEC);
+        let enc = resp
+            .try_encap(&init_pub, &inner_from_resp(), &mut wire)
+            .unwrap();
+        init.set_mock_now_ns(t0 + 2 * SEC);
+        init.try_decap(&wire[..enc.len], &mut out).unwrap();
+        let now = t0 + 20 * SEC;
+        let a = init.timer_pass(now, true);
+        assert_eq!(a.send_keepalive, Some(KeepaliveKind::Passive));
+        init.pace_passive_keepalive_skip(&resp_pub, now);
+        let a = init.timer_pass(now, true);
+        assert!(a.send_keepalive.is_none());
+        assert!(a.next_deadline_ns > now, "deadline strictly future");
+    }
+
+    /// T5 give-up regression (Codex r1 M5): aborting the pending
+    /// reservation makes a LATER valid msg2 drop as
+    /// NoPendingHandshake instead of completing a stale handshake.
+    #[test]
+    fn abort_pending_drops_late_msg2() {
+        let (init_priv, init_pub) = super::keypair();
+        let (resp_priv, resp_pub) = super::keypair();
+        let init = WgEngine::new(WgEngineConfig {
+            local_private_key: init_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: resp_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec!["10.0.1.0/24".parse().unwrap()],
+            }],
+        });
+        let resp = WgEngine::new(WgEngineConfig {
+            local_private_key: resp_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: init_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+            }],
+        });
+        let mut msg1 = [0u8; 1024];
+        let mut msg2 = [0u8; 1024];
+        init.create_initiation(&resp_pub, &mut msg1).unwrap();
+        resp.consume_initiation_create_response(
+            &msg1[..super::super::WG_MSG_INIT_LEN],
+            &mut msg2,
+        )
+        .unwrap();
+        assert_eq!(init.pending_count(), 1);
+        init.abort_pending_for_peer(&resp_pub);
+        assert_eq!(init.pending_count(), 0);
+        assert_eq!(
+            init.counters()
+                .pending_aborted_attempt_window
+                .load(Ordering::Relaxed),
+            1
+        );
+        let err = init
+            .consume_response(&msg2[..super::super::WG_MSG_RESPONSE_LEN])
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                super::super::handshake_session::HandshakeError::NoPendingHandshake
+            ),
+            "late msg2 after give-up must not complete: {err:?}"
+        );
+    }
+
+    /// Sessions installed via the real handshake-completion paths
+    /// carry the role + created_ns the timers depend on.
+    #[test]
+    fn completion_paths_stamp_role_and_created() {
+        let (init_priv, init_pub) = super::keypair();
+        let (resp_priv, resp_pub) = super::keypair();
+        let init = WgEngine::new(WgEngineConfig {
+            local_private_key: init_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: resp_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec!["10.0.1.0/24".parse().unwrap()],
+            }],
+        });
+        let resp = WgEngine::new(WgEngineConfig {
+            local_private_key: resp_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: init_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+            }],
+        });
+        init.set_mock_now_ns(7_000 * SEC);
+        resp.set_mock_now_ns(8_000 * SEC);
+        let mut msg1 = [0u8; 1024];
+        let mut msg2 = [0u8; 1024];
+        init.create_initiation(&resp_pub, &mut msg1).unwrap();
+        resp.consume_initiation_create_response(
+            &msg1[..super::super::WG_MSG_INIT_LEN],
+            &mut msg2,
+        )
+        .unwrap();
+        init.consume_response(&msg2[..super::super::WG_MSG_RESPONSE_LEN])
+            .unwrap();
+        let init_peer = init.peer_arc(&resp_pub).unwrap();
+        let resp_peer = resp.peer_arc(&init_pub).unwrap();
+        {
+            let cur = init_peer.current.read().unwrap();
+            let s = cur.as_ref().unwrap();
+            assert_eq!(s.role, SessionRole::Initiator);
+            assert_eq!(s.created_ns, 7_000 * SEC);
+        }
+        {
+            let cur = resp_peer.current.read().unwrap();
+            let s = cur.as_ref().unwrap();
+            assert_eq!(s.role, SessionRole::Responder);
+            assert_eq!(s.created_ns, 8_000 * SEC);
+        }
+        // Both completions stamped last_recv_any (T7 clear rule).
+        assert_eq!(
+            init_peer.last_recv_any_ns.load(Ordering::Relaxed),
+            7_000 * SEC,
+            "valid msg2 is an authenticated receive"
+        );
+        assert_eq!(
+            resp_peer.last_recv_any_ns.load(Ordering::Relaxed),
+            8_000 * SEC,
+            "valid msg1 is an authenticated receive"
+        );
     }
 }
