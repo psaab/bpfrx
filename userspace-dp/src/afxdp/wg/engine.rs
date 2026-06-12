@@ -149,6 +149,13 @@ pub(crate) enum DecapError {
     /// AF_XDP worker by sending 16..31-byte UDP datagrams with a
     /// valid `receiver_index`.
     ShortRecord,
+    /// #1888 S5: the demuxed session is older than REJECT_AFTER_TIME.
+    /// Per WG spec the receiver MUST NOT use such keys — dropped
+    /// BEFORE AEAD, and deliberately withOUT arming the rekey edge
+    /// (initiation is send-side-only; an attacker replaying old
+    /// ciphertext at an expired session must not drive our handshake
+    /// cadence — Codex r1 M4).
+    Expired,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -327,6 +334,16 @@ pub(crate) struct WgEngine {
     /// unrelated commits (engine reuse); resets with the engine on an
     /// identity-changing rebuild — see counters.rs.
     pub(in crate::afxdp::wg) counters: WgCounters,
+    /// #1888 S5: "session is stale, rekey" edge — armed by the encap
+    /// (T1 / send-side T3) and decap (T2 receive-horizon) use sites,
+    /// consumed by the control loop's attempt machine, which initiates
+    /// WITHOUT the confirmed-session gate. See wg/timers.rs.
+    pub(in crate::afxdp::wg) rekey_request_pending: std::sync::atomic::AtomicBool,
+    /// #1888 S5 test hook: when nonzero, `now_ns()` returns this value
+    /// instead of CLOCK_MONOTONIC, making the timer semantics
+    /// deterministically testable. Compiled out of release builds.
+    #[cfg(test)]
+    pub(in crate::afxdp::wg) mock_now_ns: std::sync::atomic::AtomicU64,
 }
 
 /// Minimum spacing between worker-driven "please initiate" edges
@@ -365,6 +382,9 @@ impl WgEngine {
             handshake_request_pending: std::sync::atomic::AtomicBool::new(false),
             handshake_request_last_ns: std::sync::atomic::AtomicU64::new(0),
             counters: WgCounters::default(),
+            rekey_request_pending: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            mock_now_ns: std::sync::atomic::AtomicU64::new(0),
         };
         engine.reconcile_peers(&config.peers);
         engine
@@ -596,8 +616,9 @@ impl WgEngine {
 
     /// Take an atomic snapshot of the peer-routing table. Hot path.
     /// The returned `Arc<PeerTable>` is internally consistent for as
-    /// long as the caller holds it.
-    fn load_table(&self) -> Arc<PeerTable> {
+    /// long as the caller holds it. Module-visible so the #1888 timer
+    /// pass (wg/timers.rs) can walk the peer slab for expiry.
+    pub(in crate::afxdp::wg) fn load_table(&self) -> Arc<PeerTable> {
         self.table.load_full()
     }
 
@@ -712,6 +733,31 @@ impl WgEngine {
         inner_ip: &[u8],
         out: &mut [u8],
     ) -> Result<EncapOutcome, EncapError> {
+        self.encap_inner(peer_pubkey, inner_ip, out, false)
+    }
+
+    /// #1888 S5: build an authenticated EMPTY transport record — a WG
+    /// keepalive (pad_to_16(0) == 0, so the record is header + tag =
+    /// 32 bytes). Keepalives consume a tx counter and obey the same
+    /// T3 / REJECT_AFTER_MESSAGES / confirmed gates as data, but do
+    /// NOT count as `encap_packets` (the caller attributes them to
+    /// `keepalives_tx_passive` / `keepalives_tx_persistent`) and do
+    /// NOT arm the T7 no-reply detector (a keepalive is not data).
+    pub(crate) fn create_keepalive(
+        &self,
+        peer_pubkey: &[u8; 32],
+        out: &mut [u8],
+    ) -> Result<EncapOutcome, EncapError> {
+        self.encap_inner(peer_pubkey, &[], out, true)
+    }
+
+    fn encap_inner(
+        &self,
+        peer_pubkey: &[u8; 32],
+        inner_ip: &[u8],
+        out: &mut [u8],
+        is_keepalive: bool,
+    ) -> Result<EncapOutcome, EncapError> {
         // Cryptokey-routing safety: the forwarding decision tells
         // us which peer to encrypt to. We do NOT consult
         // AllowedIPs to pick a peer on egress.
@@ -741,6 +787,27 @@ impl WgEngine {
             // kick + drop) is untouched; only the attribution differs.
             WgCounters::bump(&self.counters.encap_drops_unconfirmed);
             return Err(EncapError::NoSession);
+        }
+
+        // #1888 S5: time-based gates, evaluated BEFORE any observable
+        // side effect (counter consume, header write) so the on-Err
+        // contract below holds. T3 (REJECT_AFTER_TIME): keys older
+        // than 180s MUST NOT encrypt — drop, arm the rekey edge so the
+        // control loop re-initiates, and return the caller-compatible
+        // NoSession. T1 (REKEY_AFTER_TIME): a send on an
+        // initiator-role session older than 120s arms the rekey edge
+        // and proceeds — the spec's exact "on send" semantics.
+        let now_ns = self.now_ns();
+        let age_ns = now_ns.saturating_sub(session.created_ns);
+        if age_ns >= super::session::REJECT_AFTER_TIME_NS {
+            WgCounters::bump(&self.counters.encap_drops_expired);
+            self.request_rekey();
+            return Err(EncapError::NoSession);
+        }
+        if session.role == super::session::SessionRole::Initiator
+            && age_ns >= super::session::REKEY_AFTER_TIME_NS
+        {
+            self.request_rekey();
         }
 
         // WG spec §5.4.6 mandates the plaintext be zero-padded to a
@@ -835,12 +902,22 @@ impl WgEngine {
             .transport
             .write_message(counter, plaintext, payload)
             .map_err(|_| self.counters.count_encap_err(EncapError::CryptoFailed))?;
-        // #1865: success accounting — inner-IP (un-padded) bytes,
-        // symmetric with the decap side.
-        WgCounters::bump(&self.counters.encap_packets);
-        self.counters
-            .encap_bytes
-            .fetch_add(inner_ip.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        // #1888 S5 activity stamps (§3 of the plan): any authenticated
+        // send clears the T6 passive-keepalive arm; a non-empty DATA
+        // send additionally arms (if unarmed) the T7 no-reply
+        // detector. Keepalives must not arm T7 — they are not data.
+        if is_keepalive {
+            peer.note_authenticated_send(now_ns);
+        } else {
+            peer.note_data_send(now_ns);
+            // #1865: success accounting — inner-IP (un-padded) bytes,
+            // symmetric with the decap side. Keepalives are counted by
+            // the caller under keepalives_tx_*, not as data packets.
+            WgCounters::bump(&self.counters.encap_packets);
+            self.counters
+                .encap_bytes
+                .fetch_add(inner_ip.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(EncapOutcome {
             len: WG_DATA_HEADER_LEN + n,
             receiver_index: session.peer_index,
@@ -895,6 +972,14 @@ impl WgEngine {
         if hdr.ciphertext.len() < POLY1305_TAG_LEN {
             return Err(self.counters.count_decap_err(DecapError::ShortRecord));
         }
+        // #1888 S5 T3 (REJECT_AFTER_TIME), receive side: refuse keys
+        // older than 180s BEFORE doing any AEAD work. Drop-only — no
+        // rekey arm (see DecapError::Expired). The control thread's
+        // expire_sessions tears the session down within one tick.
+        let now_ns = self.now_ns();
+        if now_ns.saturating_sub(session.created_ns) >= super::session::REJECT_AFTER_TIME_NS {
+            return Err(self.counters.count_decap_err(DecapError::Expired));
+        }
         let plaintext_len_max = hdr.ciphertext.len() - POLY1305_TAG_LEN;
         if out.len() < plaintext_len_max {
             return Err(self.counters.count_decap_err(DecapError::BufferTooSmall));
@@ -941,6 +1026,33 @@ impl WgEngine {
                     out[..n].fill(0);
                     return Err(self.counters.count_decap_err(DecapError::ReplayOutOfWindow));
                 }
+            }
+        }
+        // #1888 S5 activity stamps + T2 receive-horizon, applied to
+        // ANY authenticated, replay-accepted transport record. Stamped
+        // BEFORE the inner-parse/AllowedIPs gates (Codex r1 M3 —
+        // wireguard-go fires its receive timers once the packet
+        // authenticates, before routing delivery; an AllowedIPs-
+        // rejected packet still proves the peer is alive on this
+        // session). The non-empty/keepalive split picks data-recv
+        // (arms T6) vs authenticated-recv (clears T7 only — a received
+        // keepalive must not arm T6, no keepalive ping-pong).
+        {
+            if let Some(peer) = self.peer_arc(&session.peer_pubkey) {
+                if n == 0 {
+                    peer.note_authenticated_recv(now_ns);
+                } else {
+                    peer.note_data_recv(now_ns);
+                }
+            }
+            // T2: a receive on an initiator-role session past the 165s
+            // horizon arms the rekey edge (covers a receive-only
+            // initiator before the responder's 180s discard).
+            if session.role == super::session::SessionRole::Initiator
+                && now_ns.saturating_sub(session.created_ns)
+                    >= super::session::RECV_REKEY_HORIZON_NS
+            {
+                self.request_rekey();
             }
         }
         // #1865: authenticated ZERO-length transport record == WG

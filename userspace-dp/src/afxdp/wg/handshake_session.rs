@@ -400,7 +400,15 @@ impl WgEngine {
             parsed.sender_index,
             peer_pubkey,
             SessionRole::Initiator,
+            self.now_ns(),
         ));
+        // #1888 S5: a valid msg2 is an authenticated RECEIVE — stamp
+        // last_recv_any (clears the T7 no-reply arm) per the §3
+        // any-authenticated-receive rule. Done here at the completion
+        // site so it orders before any same-iteration TUN egress.
+        if let Some(peer) = self.peer_arc(&peer_pubkey) {
+            peer.note_authenticated_recv(self.now_ns());
+        }
         // Install the live session, then clear the reservation — both under
         // the reconcile_lock we already hold (install_session_locked must NOT
         // re-take it).
@@ -520,7 +528,13 @@ impl WgEngine {
             peer_sender_index,
             peer_pubkey,
             SessionRole::Responder,
+            self.now_ns(),
         ));
+        // #1888 S5: a valid msg1 is an authenticated RECEIVE — stamp
+        // last_recv_any (clears the T7 no-reply arm), §3 rule.
+        if let Some(peer) = self.peer_arc(&peer_pubkey) {
+            peer.note_authenticated_recv(self.now_ns());
+        }
         // Install the live session (UNCONFIRMED — egress gated until the first
         // authenticated inbound transport record), then clear the reservation.
         // Both under the reconcile_lock we already hold.

@@ -14,7 +14,7 @@
 
 use super::session::WgSession;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 #[derive(Debug)]
@@ -44,20 +44,41 @@ pub(crate) struct Peer {
     pub(crate) endpoint: RwLock<Option<SocketAddr>>,
     /// Optional keepalive interval in seconds (per WG: 0 = off).
     /// Interior-mutable so config updates apply in place — see the
-    /// `endpoint` doc for the rationale.
-    ///
-    /// TODO(#1499 r4 / timers): paired with `REJECT_AFTER_TIME` and
-    /// `REKEY_AFTER_TIME`, persistent-keepalive needs a timer-driven
-    /// slow-path worker. Currently the engine has zero time-based
-    /// state; the integration PR will introduce a coordinator-side
-    /// ticker that calls into the engine to (a) emit keepalive
-    /// records, (b) tear down sessions past REJECT_AFTER_TIME, and
-    /// (c) request rekey at REKEY_AFTER_TIME. Forward secrecy is
-    /// degraded until that timer ships — sessions live until counter
-    /// exhaustion (2^64-2^13-1 packets ≈ 39 thousand years at
-    /// 10 Gbps line rate, but the AEAD key never rotates without
-    /// the timer).
+    /// `endpoint` doc for the rationale. Consumed by the #1888 S5
+    /// timer pass (`WgEngine::timer_pass` T8 — see wg/timers.rs).
     pub(crate) persistent_keepalive: AtomicU16,
+    /// #1888 S5 activity stamps + armed timers, all CLOCK_MONOTONIC ns
+    /// relaxed atomics, 0 = never/unarmed. Peer-resident (NOT
+    /// session-resident) so a rekey does not reset keepalive pacing or
+    /// the dead-peer detector — matching wireguard-go, where all
+    /// timers hang off the peer. Semantics are pinned in
+    /// `docs/research/1888-wg-timers/plan.md` §3.
+    ///
+    /// Any authenticated packet SENT: transport data, keepalive, or a
+    /// handshake message we emitted. Paces T8 (persistent keepalive).
+    pub(crate) last_send_any_ns: AtomicU64,
+    /// Any authenticated packet RECEIVED: transport data, keepalive,
+    /// or a valid handshake message. Paces T8.
+    pub(crate) last_recv_any_ns: AtomicU64,
+    /// T6 (passive keepalive) ARMED timer — Linux pending-timer model:
+    /// SET only when currently 0 (CAS) on an authenticated,
+    /// replay-accepted, NON-EMPTY transport plaintext; CLEARED by any
+    /// authenticated send; fires at `armed + KEEPALIVE_TIMEOUT`. A
+    /// received keepalive does NOT arm it (no keepalive ping-pong).
+    pub(crate) t6_armed_recv_ns: AtomicU64,
+    /// T7 (no-reply reinit) ARMED timer: SET only when currently 0 on
+    /// a successful NON-EMPTY data encap; CLEARED by any authenticated
+    /// receive and by handshake-attempt start; fires at
+    /// `armed + NO_REPLY_REINIT_NS`. An armed-not-latest stamp is
+    /// load-bearing: a latest-send stamp would be refreshed by every
+    /// outbound packet and never accrue 15s under continuous
+    /// outbound-only traffic (Codex r3 F1).
+    pub(crate) t7_armed_send_ns: AtomicU64,
+    /// T8 skip/fail pacing anchor: advanced whenever the control loop
+    /// ACTS on a T8 due-tick (send attempt, initiate, or skip), so a
+    /// peer with no endpoint cannot leave a past-due deadline spinning
+    /// the poll loop (AGY r3 G1).
+    pub(crate) t8_last_attempt_ns: AtomicU64,
     /// The current transport session, if a handshake has completed.
     /// RwLock because rekey is a slow-path replacement and the hot
     /// path only takes a read guard to encrypt/decrypt.
@@ -78,9 +99,61 @@ impl Peer {
             pubkey,
             endpoint: RwLock::new(endpoint),
             persistent_keepalive: AtomicU16::new(persistent_keepalive),
+            last_send_any_ns: AtomicU64::new(0),
+            last_recv_any_ns: AtomicU64::new(0),
+            t6_armed_recv_ns: AtomicU64::new(0),
+            t7_armed_send_ns: AtomicU64::new(0),
+            t8_last_attempt_ns: AtomicU64::new(0),
             current: RwLock::new(None),
             previous: RwLock::new(None),
         }
+    }
+
+    /// Record any authenticated packet SENT (transport data,
+    /// keepalive, or handshake message). Clears the T6 passive-
+    /// keepalive arm — we just proved liveness to the peer.
+    #[inline]
+    pub(crate) fn note_authenticated_send(&self, now_ns: u64) {
+        self.last_send_any_ns.store(now_ns, Ordering::Relaxed);
+        self.t6_armed_recv_ns.store(0, Ordering::Relaxed);
+    }
+
+    /// Record a NON-EMPTY transport data send: authenticated-send
+    /// bookkeeping plus arm-if-unarmed of the T7 no-reply detector
+    /// (CAS from 0 so subsequent sends cannot push the deadline —
+    /// Linux pending-timer parity).
+    #[inline]
+    pub(crate) fn note_data_send(&self, now_ns: u64) {
+        self.note_authenticated_send(now_ns);
+        let _ = self.t7_armed_send_ns.compare_exchange(
+            0,
+            now_ns.max(1),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Record any authenticated packet RECEIVED (transport data,
+    /// keepalive, or valid handshake message). Clears the T7 arm —
+    /// the peer just proved it is alive.
+    #[inline]
+    pub(crate) fn note_authenticated_recv(&self, now_ns: u64) {
+        self.last_recv_any_ns.store(now_ns, Ordering::Relaxed);
+        self.t7_armed_send_ns.store(0, Ordering::Relaxed);
+    }
+
+    /// Record an authenticated, replay-accepted, NON-EMPTY transport
+    /// plaintext: authenticated-recv bookkeeping plus arm-if-unarmed
+    /// of the T6 passive-keepalive timer.
+    #[inline]
+    pub(crate) fn note_data_recv(&self, now_ns: u64) {
+        self.note_authenticated_recv(now_ns);
+        let _ = self.t6_armed_recv_ns.compare_exchange(
+            0,
+            now_ns.max(1),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
     }
 
     /// Update the mutable per-peer config fields in place. Called
