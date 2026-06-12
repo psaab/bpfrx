@@ -91,10 +91,16 @@ func main() {
 	// shape: 0 PASS, 2 config rejected, 1 other error (unreadable file,
 	// oversize, bad flags).
 	if len(os.Args) > 1 && os.Args[1] == "check-config" {
-		fs := flag.NewFlagSet("check-config", flag.ExitOnError)
+		// ContinueOnError, not ExitOnError: the flag package exits
+		// with status 2 on a bad flag, which would collide with this
+		// subcommand's "2 = config rejected" contract that the day-0
+		// loader keys its REJECT logging on.
+		fs := flag.NewFlagSet("check-config", flag.ContinueOnError)
 		nodeID := fs.Int("node-id", -1,
 			"cluster node ID for ${node} apply-group expansion (0 or 1; -1 = standalone)")
-		_ = fs.Parse(os.Args[2:])
+		if err := fs.Parse(os.Args[2:]); err != nil {
+			os.Exit(1)
+		}
 		if fs.NArg() != 1 {
 			fmt.Fprintf(os.Stderr, "usage: xpfd check-config [-node-id 0|1] <config-file>\n")
 			os.Exit(1)
@@ -124,6 +130,14 @@ func main() {
 		data, err := os.ReadFile(path)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "check-config: %v\n", err)
+			os.Exit(1)
+		}
+		// Re-check after the read: the Stat above is advisory (the
+		// file could grow between stat and read when the caller is
+		// not the ro-mounted day-0 loader).
+		if len(data) > maxCheckConfigBytes {
+			fmt.Fprintf(os.Stderr, "check-config: %s: %d bytes exceeds %d byte limit\n",
+				path, len(data), int64(maxCheckConfigBytes))
 			os.Exit(1)
 		}
 		if _, err := configstore.CheckText(string(data), *nodeID); err != nil {
