@@ -5275,3 +5275,6 @@ top.
 - **Timestamp**: 2026-06-12
   **Action**: #1902 — gate pending_neigh admission on owned_packet_frame.is_none() (GRE-decapped packets refused, counted via pending_neigh_decap_drops); status/wire/Prometheus plumbing; 3 deterministic pins; plan doc + architecture doc pairing contract.
   **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs, userspace-dp/src/afxdp/umem/mod.rs, userspace-dp/src/afxdp/coordinator/status.rs, userspace-dp/src/server/{helpers,lifecycle}.rs, userspace-dp/src/protocol/control.rs, userspace-dp/src/afxdp/tests.rs, pkg/dataplane/userspace/protocol.go, pkg/api/{metrics.go,metrics_userspace.go,metrics_descriptors.go,metrics_descriptor_coverage_test.go}, docs/pr/1902-pending-neigh/plan.md, docs/userspace-dataplane-architecture.md
+- **Timestamp**: 2026-06-12 ~13:55
+  **Action**: #1902 PR #1911 — recorded Codex r1 (MERGE-READY, 1 Low adjudicated), AGY r1 (MERGE-READY), Claude SMR r1 (MERGE-READY, byte-trace) in reviewer ledger
+  **File(s)**: docs/pr/1902-pending-neigh/reviewer-ids.md
