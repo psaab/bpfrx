@@ -601,7 +601,13 @@ func (t *tunnelManager) reconcileLinkAddrsLocked(link netlink.Link, name string,
 			if want[key] {
 				continue
 			}
-			if a.IP != nil && a.IP.IsLinkLocalUnicast() && (applied == nil || !applied[key]) {
+			if a.IP == nil {
+				// Defensive: the pre-#1884 WG block only deleted
+				// addresses with a non-nil IP; keep that byte-identical
+				// (and never delete something we cannot classify).
+				continue
+			}
+			if a.IP.IsLinkLocalUnicast() && (applied == nil || !applied[key]) {
 				// Kernel-managed or foreign link-local: never delete.
 				continue
 			}
