@@ -936,6 +936,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 				}
 				return nil
 			},
+			// #1895: currently-failed RPM probe-pin installs (tests
+			// holding state on ErrProbeSetup instead of probing the
+			// default path).
+			RPMPinFailedFn: func() float64 {
+				if d.rpm != nil {
+					return float64(d.rpm.PinInstallFailureCount())
+				}
+				return 0
+			},
 			// #1799: surface configstore persist-degraded state so
 			// /health returns 503 (and xpf_daemon_config_persist_degraded
 			// reads 1) while the running active config is not durable on

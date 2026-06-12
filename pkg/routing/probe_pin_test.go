@@ -10,19 +10,32 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// fakeProbePinOps is an in-memory probePinOps double.
+// fakeProbePinOps is an in-memory probePinOps double. The fail* hooks
+// inject per-call failures keyed by rule priority / route table so the
+// #1895 per-pin install-result tests can break exactly one pin.
 type fakeProbePinOps struct {
-	rules  []netlink.Rule
-	routes []netlink.Route
-	links  map[string]int // name → ifindex
+	rules        []netlink.Rule
+	routes       []netlink.Route
+	links        map[string]int // name → ifindex
+	failRuleAdd  map[int]error  // rule priority → error
+	failRouteAdd map[int]error  // route table → error
+	failRuleDel  map[int]error  // rule priority → error (rollback failure)
+	ruleDelCalls int
 }
 
 func (f *fakeProbePinOps) RuleAdd(r *netlink.Rule) error {
+	if err, ok := f.failRuleAdd[r.Priority]; ok {
+		return err
+	}
 	f.rules = append(f.rules, *r)
 	return nil
 }
 
 func (f *fakeProbePinOps) RuleDel(r *netlink.Rule) error {
+	f.ruleDelCalls++
+	if err, ok := f.failRuleDel[r.Priority]; ok {
+		return err
+	}
 	for i := range f.rules {
 		if f.rules[i].Priority == r.Priority && f.rules[i].Family == r.Family {
 			f.rules = append(f.rules[:i], f.rules[i+1:]...)
@@ -43,6 +56,9 @@ func (f *fakeProbePinOps) RuleList(family int) ([]netlink.Rule, error) {
 }
 
 func (f *fakeProbePinOps) RouteAdd(r *netlink.Route) error {
+	if err, ok := f.failRouteAdd[r.Table]; ok {
+		return err
+	}
 	f.routes = append(f.routes, *r)
 	return nil
 }
@@ -170,8 +186,8 @@ func TestProbePinApplyProgramsRulesAndRoutes(t *testing.T) {
 	rethMap := map[string]string{"reth0": "ge-0/0/2"}
 	pins := BuildProbePins(rpmConfigWithPins(), rethMap)
 
-	if err := p.Apply(pins); err != nil {
-		t.Fatalf("Apply: %v", err)
+	if failed := p.Apply(pins); len(failed) != 0 {
+		t.Fatalf("Apply reported failures: %v", failed)
 	}
 	if len(ops.rules) != 3 {
 		t.Fatalf("len(rules) = %d, want 3", len(ops.rules))
@@ -254,5 +270,162 @@ func TestResolveProbeInterface(t *testing.T) {
 		if got := ResolveProbeInterface(c.in, rethMap); got != c.want {
 			t.Fatalf("ResolveProbeInterface(%q) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+// --- #1895: per-pin install results + rollback ---
+
+// twoPinConfig returns a config with exactly two pinned tests sharing
+// one probe: index 0 = WAN/a (prio 50, table 7000), index 1 = WAN/b
+// (prio 51, table 7001).
+func twoPinConfig() *config.RPMConfig {
+	return &config.RPMConfig{Probes: map[string]*config.RPMProbe{
+		"WAN": {Name: "WAN", Tests: map[string]*config.RPMTest{
+			"a": {Name: "a", Target: "1.1.1.1", NextHop: "10.0.0.1", DestinationInterface: "ge-0/0/1"},
+			"b": {Name: "b", Target: "9.9.9.9", NextHop: "10.0.1.1", DestinationInterface: "ge-0/0/2"},
+		}},
+	}}
+}
+
+func TestProbePinApplyRuleAddFailureReported(t *testing.T) {
+	ops := &fakeProbePinOps{
+		links:       map[string]int{"ge-0-0-1": 11, "ge-0-0-2": 12},
+		failRuleAdd: map[int]error{config.ProbeRulePriorityBase: fmt.Errorf("EBUSY")},
+	}
+	p := &probePinManager{ops: ops}
+	pins := BuildProbePins(twoPinConfig(), nil)
+
+	failed := p.Apply(pins)
+	if len(failed) != 1 {
+		t.Fatalf("failed = %v, want exactly WAN/a", failed)
+	}
+	if err, ok := failed["WAN/a"]; !ok || err == nil {
+		t.Fatalf("WAN/a missing from failed map: %v", failed)
+	}
+	// The failed pin must leave nothing installed; the healthy pin must
+	// be fully installed.
+	if len(ops.rules) != 1 || ops.rules[0].Priority != config.ProbeRulePriorityBase+1 {
+		t.Fatalf("rules = %+v, want only WAN/b's rule", ops.rules)
+	}
+	if len(ops.routes) != 1 || ops.routes[0].Table != config.ProbeTableBase+1 {
+		t.Fatalf("routes = %+v, want only WAN/b's route", ops.routes)
+	}
+}
+
+func TestProbePinApplyRouteAddFailureRollsBackRule(t *testing.T) {
+	ops := &fakeProbePinOps{
+		links:        map[string]int{"ge-0-0-1": 11, "ge-0-0-2": 12},
+		failRouteAdd: map[int]error{config.ProbeTableBase + 1: fmt.Errorf("ENETUNREACH")},
+	}
+	p := &probePinManager{ops: ops}
+	pins := BuildProbePins(twoPinConfig(), nil)
+
+	failed := p.Apply(pins)
+	if len(failed) != 1 {
+		t.Fatalf("failed = %v, want exactly WAN/b", failed)
+	}
+	if err, ok := failed["WAN/b"]; !ok || err == nil {
+		t.Fatalf("WAN/b missing from failed map: %v", failed)
+	}
+	// Partial install must not persist: WAN/b's fwmark rule was added
+	// before RouteAdd failed and must be rolled back, leaving only
+	// WAN/a's rule+route.
+	if len(ops.rules) != 1 || ops.rules[0].Priority != config.ProbeRulePriorityBase {
+		t.Fatalf("rules = %+v, want only WAN/a's rule (WAN/b rolled back)", ops.rules)
+	}
+	if ops.ruleDelCalls == 0 {
+		t.Fatal("RuleDel was never called for the rollback")
+	}
+	if len(ops.routes) != 1 || ops.routes[0].Table != config.ProbeTableBase {
+		t.Fatalf("routes = %+v, want only WAN/a's route", ops.routes)
+	}
+}
+
+func TestProbePinApplyMissingLinkReported(t *testing.T) {
+	// Only WAN/a's egress link exists (boot ordering / RETH churn).
+	ops := &fakeProbePinOps{links: map[string]int{"ge-0-0-1": 11}}
+	p := &probePinManager{ops: ops}
+	pins := BuildProbePins(twoPinConfig(), nil)
+
+	failed := p.Apply(pins)
+	if len(failed) != 1 {
+		t.Fatalf("failed = %v, want exactly WAN/b", failed)
+	}
+	if _, ok := failed["WAN/b"]; !ok {
+		t.Fatalf("WAN/b missing from failed map: %v", failed)
+	}
+	if len(ops.rules) != 1 || len(ops.routes) != 1 {
+		t.Fatalf("healthy pin not fully installed: rules=%+v routes=%+v", ops.rules, ops.routes)
+	}
+}
+
+func TestProbePinApplyInvalidAddressReported(t *testing.T) {
+	cfg := &config.RPMConfig{Probes: map[string]*config.RPMProbe{
+		"WAN": {Name: "WAN", Tests: map[string]*config.RPMTest{
+			"bad": {Name: "bad", Target: "not-an-ip", NextHop: "10.0.0.1", DestinationInterface: "ge-0/0/1"},
+		}},
+	}}
+	ops := &fakeProbePinOps{links: map[string]int{"ge-0-0-1": 11}}
+	p := &probePinManager{ops: ops}
+
+	failed := p.Apply(BuildProbePins(cfg, nil))
+	if len(failed) != 1 {
+		t.Fatalf("failed = %v, want exactly WAN/bad", failed)
+	}
+	if _, ok := failed["WAN/bad"]; !ok {
+		t.Fatalf("WAN/bad missing from failed map: %v", failed)
+	}
+	if len(ops.rules) != 0 || len(ops.routes) != 0 {
+		t.Fatalf("nothing should be installed: rules=%+v routes=%+v", ops.rules, ops.routes)
+	}
+}
+
+func TestProbePinApplyRecoveryClearsFailure(t *testing.T) {
+	// First apply fails (missing link); after the link appears, a
+	// re-apply returns no failures and fully installs the pin.
+	ops := &fakeProbePinOps{links: map[string]int{"ge-0-0-1": 11}}
+	p := &probePinManager{ops: ops}
+	pins := BuildProbePins(twoPinConfig(), nil)
+
+	if failed := p.Apply(pins); len(failed) != 1 {
+		t.Fatalf("first apply: failed = %v, want 1", failed)
+	}
+	ops.links["ge-0-0-2"] = 12
+	if failed := p.Apply(pins); len(failed) != 0 {
+		t.Fatalf("re-apply after link appeared: failed = %v, want none", failed)
+	}
+	if len(ops.rules) != 2 || len(ops.routes) != 2 {
+		t.Fatalf("both pins must be installed: rules=%+v routes=%+v", ops.rules, ops.routes)
+	}
+}
+
+func TestProbePinApplyRollbackFailureStillReportsFailed(t *testing.T) {
+	// RouteAdd fails AND the rollback RuleDel fails: the pin must still
+	// be reported failed (the probe holds — safe direction); the stale
+	// rule is logged and left for the next band clear() to sweep.
+	ops := &fakeProbePinOps{
+		links:        map[string]int{"ge-0-0-1": 11, "ge-0-0-2": 12},
+		failRouteAdd: map[int]error{config.ProbeTableBase + 1: fmt.Errorf("ENETUNREACH")},
+		failRuleDel:  map[int]error{config.ProbeRulePriorityBase + 1: fmt.Errorf("EBUSY")},
+	}
+	p := &probePinManager{ops: ops}
+	pins := BuildProbePins(twoPinConfig(), nil)
+
+	failed := p.Apply(pins)
+	if _, ok := failed["WAN/b"]; !ok || len(failed) != 1 {
+		t.Fatalf("failed = %v, want exactly WAN/b despite rollback failure", failed)
+	}
+	// The stale rule remains (rollback failed) — documented best-effort;
+	// the next Apply's clear() sweeps the whole band.
+	if len(ops.rules) != 2 {
+		t.Fatalf("rules = %+v, want WAN/a's rule plus WAN/b's stale rule", ops.rules)
+	}
+	ops.failRuleDel = nil
+	ops.failRouteAdd = nil
+	if failed := p.Apply(pins); len(failed) != 0 {
+		t.Fatalf("re-apply after recovery: failed = %v, want none (clear sweeps stale rule)", failed)
+	}
+	if len(ops.rules) != 2 || len(ops.routes) != 2 {
+		t.Fatalf("re-apply must converge to exactly 2 rules + 2 routes: %+v / %+v", ops.rules, ops.routes)
 	}
 }
