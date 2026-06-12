@@ -2679,7 +2679,20 @@ fn gre1881_defer_prune_removes_only_stale_entries() {
     // Same snapshot: nothing pruned.
     coordinator.prune_local_tunnel_sources_for_snapshot(&snap);
     assert!(coordinator.tunnel_sources.contains_key(&1));
-    // Endpoint gone from the new snapshot: pruned + unpublished.
+    // Same id, MOVED attachment (Codex code r1): the defer branch
+    // never rotates forwarding, so the prune itself must catch
+    // attachment drift against the entry's spawned attachment.
+    let moved = gre1881_snapshot(1, 46289, "gre1881h", "198.51.100.7");
+    coordinator.prune_local_tunnel_sources_for_snapshot(&moved);
+    assert!(
+        coordinator.tunnel_sources.is_empty(),
+        "same-id attachment drift must prune on the defer path"
+    );
+    assert!(coordinator.local_tunnel_deliveries.load().is_empty());
+
+    // Re-arm an entry and verify full removal still prunes.
+    coordinator.refresh_runtime_snapshot(&snap);
+    assert!(coordinator.tunnel_sources.contains_key(&1));
     coordinator.prune_local_tunnel_sources_for_snapshot(&ConfigSnapshot::default());
     assert!(coordinator.tunnel_sources.is_empty());
     assert!(coordinator.local_tunnel_deliveries.load().is_empty());

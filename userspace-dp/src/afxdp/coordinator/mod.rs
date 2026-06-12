@@ -834,40 +834,59 @@ impl Coordinator {
         }
     }
 
-    /// #1881 (mirrors #1866 Change 2b): removal propagation on the
+    /// #1881 (mirrors #1866 Change 2b): stale propagation on the
     /// defer-workers apply path — the NOT-same-plan + defer_workers
     /// branch stores the snapshot WITHOUT reconciling, so a removed
     /// GRE tunnel's thread would keep its TUN reader fd (on a netdev
     /// the Go side is deleting) until the deferred bring-up. Narrow
-    /// prune: stop + join + remove entries whose id is absent from,
-    /// or no longer gre/ip6gre in, the new snapshot. No spawn, no
-    /// forwarding mutation; unpublish-before-join discipline applies.
+    /// prune: stop + join + remove entries whose snapshot row is
+    /// absent, no longer gre/ip6gre, OR attachment-drifted (Codex
+    /// code-review r1: the defer branch never rotates forwarding, so
+    /// the thread-side rotation gate cannot observe a moved
+    /// attachment — the stale predicate here must match the armed
+    /// pass-2 semantics, compared against the entry's SPAWNED
+    /// attachment because `self.forwarding` is stale by design on
+    /// this path). No spawn, no forwarding mutation;
+    /// unpublish-before-join discipline applies.
     pub(crate) fn prune_local_tunnel_sources_for_snapshot(
         &mut self,
         snapshot: &crate::ConfigSnapshot,
     ) {
-        let desired: std::collections::BTreeSet<u16> = snapshot
-            .tunnel_endpoints
-            .iter()
-            .filter(|row| {
-                row.id != 0
-                    && row.ifindex > 0
-                    && (row.mode == "gre" || row.mode == "ip6gre")
-            })
-            .map(|row| row.id)
-            .collect();
-        let stale: Vec<u16> = self
+        let stale: Vec<(u16, &'static str)> = self
             .tunnel_sources
-            .keys()
-            .filter(|id| !desired.contains(id))
-            .copied()
+            .iter()
+            .filter_map(|(id, entry)| {
+                let Some(row) = snapshot
+                    .tunnel_endpoints
+                    .iter()
+                    .find(|row| row.id == *id && row.ifindex > 0)
+                else {
+                    return Some((*id, "removed_deferred"));
+                };
+                if row.mode != "gre" && row.mode != "ip6gre" {
+                    return Some((*id, "mode_changed_deferred"));
+                }
+                // Attachment label mirrors forwarding_build/interfaces.rs.
+                let row_label = if row.linux_name.is_empty() {
+                    row.interface.as_str()
+                } else {
+                    row.linux_name.as_str()
+                };
+                if row.ifindex != entry.spawned_ifindex
+                    || row_label != entry.spawned_tunnel_name
+                {
+                    return Some((*id, "attachment_changed_deferred"));
+                }
+                None
+            })
             .collect();
         if stale.is_empty() {
             return;
         }
-        self.publish_local_tunnel_deliveries_excluding(&stale);
-        for id in stale {
-            self.stop_remove_local_tunnel_entry(id, "removed_deferred");
+        let stale_ids: Vec<u16> = stale.iter().map(|(id, _)| *id).collect();
+        self.publish_local_tunnel_deliveries_excluding(&stale_ids);
+        for (id, reason) in stale {
+            self.stop_remove_local_tunnel_entry(id, reason);
         }
     }
 

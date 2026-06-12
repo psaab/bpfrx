@@ -5,3 +5,5 @@ Research-phase (plan) ledger: docs/research/1881-gre-frozen-state/reviewer-ids.m
 
 | Round | Reviewer | Task id | Verdict |
 |---|---|---|---|
+| code r1 | AGY | 473fbb23-276e-4c2b-ac6c-8105bd24b8ad | MERGE-READY |
+
