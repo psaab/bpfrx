@@ -1,9 +1,17 @@
 # pkg/configstore
 
-Atomic candidate / active / rollback configuration persistence. JSON files
-written via temp-file + rename for crash safety, with a JSONL audit
-journal and rolling commit history. AES-GCM at-rest encryption when a
-master password is set.
+Durable candidate / active / rollback configuration persistence. JSON
+files written via `fsatomic.WriteFileDurable` (#1894: temp + fsync +
+rename + parent-dir fsync — they survive power loss, not just crashes),
+with a JSONL audit journal and rolling commit history. AES-GCM at-rest
+encryption when a master password is set.
+
+The constructor is fail-closed (#1893): `New(filePath) (*Store, error)`
+returns an error when the `.configdb` directory cannot be created.
+There is no file-only fallback backend — every persistence path
+dereferences the DB, so the old "falling back to file-only" warning was
+describing code that never existed, followed by a nil-pointer panic on
+the first Load/Save/commit.
 
 ## Entry points
 
@@ -14,7 +22,8 @@ master password is set.
   `EnterConfigureExclusive`, `ExitConfigure`, `SyncApply`. (See
   `store.go` for the full surface — there's no shorthand
   `Candidate()` or `History()`; use the `Show*` / `List*` forms.)
-- `DB` — `db.go`. Low-level atomic file I/O.
+- `DB` — `db.go`. Low-level durable file I/O (via `pkg/fsatomic`).
+  `NewDB` sweeps crash-leaked `.*.tmp-*` temps from `.configdb`.
 - `History` — `history.go`. Bounded ring of recent commits.
 - `Journal` — `journal.go`. Append-only JSONL audit trail.
 - `crypto.go` — AES-256-GCM at-rest encryption helpers
@@ -94,12 +103,22 @@ persistence failures on every persist path;
 
 ## Gotchas
 
-- Atomic write protocol: write temp file → `os.Rename` (POSIX-atomic
-  on the same filesystem). The previous file survives an interrupted
-  rename intact, and subsequent reads can fall back to a rollback
-  slot. Note: `db.go` does not call `f.Sync()` between write and
-  rename — durability against power-loss within the rename window
-  relies on the filesystem journal, not on an explicit `fsync`.
+- Durable write protocol (#1894): `fsatomic.WriteFileDurable` — temp
+  file in `.configdb`, fsync, rename, parent-dir fsync. The previous
+  file survives an interrupted write intact, and a completed write
+  survives power loss (the pre-#1894 writer skipped both fsyncs, so a
+  "successful" commit could surface as a zero-length file or silently
+  revert after a power cut).
+- Rollback text files (`<config>.N`) are the CANONICAL rollback
+  history (`loadRollbackHistory` reads them at boot; the DB rollback
+  slots have no production callers). `saveRollbackFiles` writes slot 1
+  durably and slots 2..N atomically (never missing, never torn; they
+  may lag after a power cut), then one `fsatomic.SyncDir` makes the
+  shuffle and the stale-slot unlinks durable — a single dir fsync
+  instead of ~50 fsync pairs under the store mutex.
+- `master.key` is written durably BEFORE any tree encrypted with it
+  (the key persist runs inside writeTree's encrypt step) — a lost key
+  meant a permanently undecryptable active config.
 - The candidate (in-memory) tree may be dirty (uncommitted edits
   accumulating). `Commit` atomically promotes candidate → active
   and bumps the rollback ring — but only after the new active has

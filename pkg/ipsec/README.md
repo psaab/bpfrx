@@ -4,6 +4,10 @@ strongSwan integration. Generates `swanctl.conf` from the typed config
 (IKE proposals, traffic selectors, DPD profiles, NAT traversal, XFRM
 interface IDs) and queries SA/SP state via `swanctl`.
 
+The conf write is AtomicGeneratedConfig (#1894):
+`fsatomic.WriteFileAtomic` — strongSwan never parses a torn file, and
+the apply path pays no fsync (the file is regenerated on every apply).
+
 ## Entry points
 
 - `Manager` — `ipsec.go`.

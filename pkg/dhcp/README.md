@@ -3,6 +3,8 @@
 DHCPv4 and DHCPv6 clients. Acquires and renews leases on firewall
 interfaces and (DHCPv6) delegated prefixes. Persists DUIDs across
 restarts so the same client identifier returns to the same lease.
+DUID files are DurableState (#1894): `fsatomic.WriteFileDurable`, so a
+power cut cannot silently change the client identity across reboot.
 
 ## Entry points
 
