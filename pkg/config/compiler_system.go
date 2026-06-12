@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strconv"
 )
 
@@ -434,6 +435,12 @@ func compileUserspaceDataplane(node *Node, cfg *UserspaceConfig) error {
 					return err
 				}
 			}
+		case "cores", "memory", "socket-mem", "rx-mode", "ports":
+			// Retired DPDK-era knobs (#1525 deleted the consumer; #1892
+			// documents the disposition). Accepted so stored configs keep
+			// loading, but they configure nothing — record the knob name
+			// so userspaceRetiredKnobWarnings surfaces a commit warning.
+			cfg.RetiredKnobsSeen = append(cfg.RetiredKnobsSeen, child.Name())
 		case "binary":
 			cfg.Binary = nodeVal(child)
 		case "control-socket":
@@ -519,6 +526,37 @@ func compileUserspaceDataplane(node *Node, cfg *UserspaceConfig) error {
 		}
 	}
 	return nil
+}
+
+// userspaceRetiredKnobWarnings turns each retired DPDK-era `system
+// dataplane` knob recorded by compileUserspaceDataplane into a commit
+// warning (#1892). The knobs (cores, memory, socket-mem, rx-mode, ports)
+// lost their consumer in the #1525 DPDK retirement; they stay parseable
+// so stored configs keep loading, but the operator must learn the stanza
+// is inert. Deduplicated and ordered for stable output.
+func userspaceRetiredKnobWarnings(cfg *Config) []string {
+	if cfg == nil || cfg.System.UserspaceDataplane == nil {
+		return nil
+	}
+	seen := cfg.System.UserspaceDataplane.RetiredKnobsSeen
+	if len(seen) == 0 {
+		return nil
+	}
+	uniq := make([]string, 0, len(seen))
+	have := make(map[string]bool, len(seen))
+	for _, k := range seen {
+		if !have[k] {
+			have[k] = true
+			uniq = append(uniq, k)
+		}
+	}
+	sort.Strings(uniq)
+	warnings := make([]string, 0, len(uniq))
+	for _, k := range uniq {
+		warnings = append(warnings, fmt.Sprintf(
+			"system dataplane %s: retired DPDK-era knob (#1525), accepted for config compatibility but ignored", k))
+	}
+	return warnings
 }
 
 func compileSharedUMEMConfig(node *Node) (*SharedUMEMConfig, error) {
