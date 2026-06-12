@@ -328,7 +328,7 @@ info "Checksums:"
 cat "$OUT_DIR/SHA256SUMS"
 
 # Bake manifest: records the exact inputs (base image + its verified
-# SHA512, git commit, bake host/kernel) so any artifact can be traced
+# SHA256, git commit, bake host/kernel) so any artifact can be traced
 # even though bakes are not bit-reproducible.
 cat >"$OUT_DIR/xpf-$VERSION.manifest" <<EOF
 version: $VERSION
