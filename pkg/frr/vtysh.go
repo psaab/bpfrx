@@ -1,11 +1,11 @@
 // vtysh.go holds the FRR shell-out surface for the package.
 //
-// All vtysh + systemctl shell-outs go through the frrExecutor interface
-// so tests can inject fakes. realExecutor wraps os/exec and is the
-// production default; New() pre-populates Manager.exec with it.
+// All vtysh + frr-reload.py shell-outs go through the frrExecutor
+// interface so tests can inject fakes. realExecutor wraps os/exec and
+// is the production default; New() pre-populates Manager.exec with it.
 //
 // Symbols:
-//   - frrExecutor interface (Vtysh / SystemctlReload / VtyshLoad)
+//   - frrExecutor interface (Vtysh / FrrReloadPy / VtyshLoad)
 //   - realExecutor (production implementation, exec.Command-backed)
 //   - Manager.ExecVtysh (public)
 //   - Thin raw-output shells: GetBFDPeers, GetRouteMapList,
@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"syscall"
 	"time"
 )
 
@@ -28,27 +29,46 @@ import (
 // gRPC/CLI), not the apply path — but a wedged vtysh (zebra hung, FRR
 // mid-restart) would hang those gRPC/CLI handlers indefinitely, the
 // same hang class #1794 bounded elsewhere. Same 15s budget as
-// reloadTimeout (manager.go), which already covers SystemctlReload /
+// reloadTimeout (manager.go), which already covers FrrReloadPy /
 // VtyshLoad via caller-supplied contexts. #1794/#1800.
 const vtyshTimeout = 15 * time.Second
 
+// frrReloadScript is the FRR diff-reload engine (frr-pythontools
+// package). Invoked DIRECTLY — never via `systemctl reload frr`: on
+// FRR 10.6 the unit's ExecReload (frrinit.sh reload) unconditionally
+// restarts watchfrr, which is the Type=forking unit's MainPID, so every
+// systemd-mediated reload cancels its own job, parks frr.service in
+// stop-sigterm for TimeoutStopSec (2 minutes), and ends with systemd
+// SIGKILLing every FRR daemon (#1880). Bypassing the systemd job
+// machinery keeps the unit state untouched.
+const frrReloadScript = "/usr/lib/frr/frr-reload.py"
+
+// frrReloadOutputTail bounds how much frr-reload.py output a failure
+// message carries (the interesting part is at the tail).
+const frrReloadOutputTail = 1024
+
 // frrExecutor is the package-private indirection that all vtysh and
-// systemctl shell-outs route through. Production code uses realExecutor;
-// tests inject a fake. The interface is intentionally minimal: it covers
-// only the three call shapes that exist in pkg/frr today.
+// frr-reload.py shell-outs route through. Production code uses
+// realExecutor; tests inject a fake. The interface is intentionally
+// minimal: it covers only the three call shapes that exist in pkg/frr
+// today.
 type frrExecutor interface {
 	// Vtysh runs `vtysh -c <command>` and returns stdout. Errors include
 	// the captured stderr in the message string.
 	Vtysh(command string) (string, error)
 
-	// SystemctlReload runs `systemctl reload frr` with the supplied
-	// context (which carries the 15s reload timeout). Output is dropped;
-	// only error is returned (mirrors the historical cmd.Run() shape).
-	SystemctlReload(ctx context.Context) error
+	// FrrReloadPy runs `frr-reload.py --reload <conf>` with the supplied
+	// context (which carries the 15s reload timeout). The config path is
+	// a parameter so tests that override Manager.frrConf exercise the
+	// real wiring. A nil return means the FULL diff (including removals)
+	// converged. (#1880 — replaces the retired SystemctlReload.)
+	FrrReloadPy(ctx context.Context, conf string) error
 
 	// VtyshLoad runs `vtysh -f <conf>` with the supplied context and
 	// returns CombinedOutput (so the caller can include stderr in error
-	// messages — preserves the historical behavior).
+	// messages — preserves the historical behavior). NOTE: vtysh -f is
+	// ADDITIVE — it re-applies every desired line but cannot remove
+	// stale config; it is the degraded fallback only.
 	VtyshLoad(ctx context.Context, conf string) ([]byte, error)
 }
 
@@ -76,11 +96,36 @@ func (realExecutor) Vtysh(command string) (string, error) {
 	return stdout.String(), nil
 }
 
-// SystemctlReload runs `systemctl reload frr` under ctx. Mirrors the
-// historical reload() systemctl branch (frr.go:1061-1064 pre-split).
-func (realExecutor) SystemctlReload(ctx context.Context) error {
-	cmd := exec.CommandContext(ctx, "systemctl", "reload", "frr")
-	return cmd.Run()
+// FrrReloadPy runs `frr-reload.py --reload <conf>` under ctx.
+//
+// Process-group teardown contract (#1880): frr-reload.py spawns vtysh
+// children to apply the diff; exec.CommandContext's default Cancel
+// kills only the direct python process, which could leave a child
+// vtysh writer racing the fallback `vtysh -f`. Setpgid puts the whole
+// tree in its own process group and Cancel SIGKILLs the group, so by
+// the time Run returns (bounded by WaitDelay) no child writer
+// survives.
+func (realExecutor) FrrReloadPy(ctx context.Context, conf string) error {
+	cmd := exec.CommandContext(ctx, frrReloadScript, "--reload", conf)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		// Negative pid = the whole process group (Setpgid above).
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	// WaitDelay caps the post-SIGKILL pipe-drain window; the fallback
+	// is only entered after Run (i.e. Wait) returns.
+	cmd.WaitDelay = 5 * time.Second
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if len(out) > frrReloadOutputTail {
+			out = out[len(out)-frrReloadOutputTail:]
+		}
+		return fmt.Errorf("%s --reload %s: %w: %s", frrReloadScript, conf, err, out)
+	}
+	return nil
 }
 
 // VtyshLoad runs `vtysh -f <conf>` under ctx and returns CombinedOutput.

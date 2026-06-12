@@ -877,6 +877,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// (stuck netlink/probe syscall) is observable as a climbing
 			// gauge before it manifests as the cold-connect hang.
 			NeighborPhaseAgeFn: d.NeighborPeriodicPhaseAges,
+			// #1880: 1 while the last applied FRR reload fell back to
+			// the additive vtysh -f path (stale-config removal deferred
+			// to the in-manager retry loop).
+			FRRReloadDegradedFn: func() bool {
+				if d.frr == nil {
+					return false
+				}
+				return d.frr.ReloadDegraded()
+			},
 			// #1827: ip-monitoring policy state for the xpf_ipmon_*
 			// metric family.
 			IPMonStatusFn: func() []ipmon.PolicyStatus {
@@ -1198,6 +1207,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// arrive during teardown).
 	if d.ipmon != nil {
 		d.ipmon.Stop()
+	}
+
+	// Stop the FRR manager (after ipmon, whose actuator is an FRR
+	// writer): cancels the degraded-retry goroutine and kills any
+	// in-flight frr-reload.py process group (#1880).
+	if d.frr != nil {
+		d.frr.Stop()
 	}
 
 	// Clean up LLDP.
