@@ -46,6 +46,17 @@ func (c *xpfCollector) collectSystemMetrics(ch chan<- prometheus.Metric) {
 		}
 	}
 
+	// #1880: FRR reload degraded state (additive vtysh -f fallback in
+	// effect, stale-config removal deferred to the in-manager retry).
+	if c.srv.frrReloadDegradedFn != nil {
+		v := 0.0
+		if c.srv.frrReloadDegradedFn() {
+			v = 1.0
+		}
+		ch <- prometheus.MustNewConstMetric(c.frrReloadDegraded,
+			prometheus.GaugeValue, v)
+	}
+
 	// #1827: services ip-monitoring policy state.
 	if c.srv.ipmonStatusFn != nil {
 		routesApplied := 0

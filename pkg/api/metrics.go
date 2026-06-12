@@ -80,6 +80,7 @@ type xpfCollector struct {
 
 	// #1780: per-phase age of the Go periodic neighbor-maintenance loop.
 	neighborPeriodicAge *prometheus.Desc
+	frrReloadDegraded   *prometheus.Desc
 
 	// #1799: 0/1 gauge — 1 while the running active config failed to
 	// persist to disk and the configstore's background retry has not
@@ -384,6 +385,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.daemonUptime
 	ch <- c.daemonMemRSS
 	ch <- c.neighborPeriodicAge
+	ch <- c.frrReloadDegraded
 	ch <- c.configPersistDegraded
 	ch <- c.ipmonPolicyFailed
 	ch <- c.ipmonPolicyTransitions
