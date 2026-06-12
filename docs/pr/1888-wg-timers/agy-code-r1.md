@@ -15,38 +15,38 @@ Run cargo test in userspace-dp}
 R
 u
 n
- 
+
 a
 l
 l
- 
+
 R
 u
 s
 t
- 
+
 t
 e
 s
 t
 s
- 
+
 s
 t
 s
- 
+
 *
 t
 s
- 
+
 s
- 
+
 s
- 
-t 
+
+t
 s
- 
-t 
+
+t
 *
 /}
 s
@@ -59,7 +59,7 @@ Completed At: 2026-06-12T10:53:40Z
 
 				The command failed with exit code: 101
 			Stdout:
-			
+
 			Stderr:
 			error: no matching package found
 searched for packages in the current directory and all of its parent directories; did you mean to start a new package here?
@@ -71,7 +71,7 @@ An adversarial code review of the implementation for branch `engineer/1888-wg-ti
 Below are the detailed verification findings and observations:
 
 ### 1. A1/H1 Guarantee: T7 Arm Consumption & CAS-from-0 Model (VERIFIED)
-* **Evidence:** 
+* **Evidence:**
   * `t7_armed_send_ns` is successfully cleared at attempt start inside `start_attempt` in `wg_control.rs` line 581 (`engine.clear_t7_arm(peer_pubkey);`) and on give-up inside `drive_attempt_machine` in `wg_control.rs` line 649 (`engine.clear_t7_arm(peer_pubkey);`).
   * In `peer.rs` lines 128-133 (`note_data_send`), the arm-if-unarmed CAS-from-0 logic is correctly implemented:
     ```rust
