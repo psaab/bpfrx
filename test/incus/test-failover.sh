@@ -199,12 +199,15 @@ fi
 
 info "Crashing fw0 (sysrq reboot — unclean shutdown, tests worst-case failover)"
 
-# timeout is load-bearing: sysrq-b resets the guest INSTANTLY, killing
-# the incus-agent serving this exec, so the exec may never observe an
-# exit status and would block forever (measured: a 47-minute hang on
-# the first live run of this phase). `|| true` alone cannot save a
+# timeout is load-bearing AND needs -k: sysrq-b resets the guest
+# INSTANTLY, killing the incus-agent serving this exec, so the exec
+# never observes an exit status (measured: a 47-minute hang on the
+# first live run). Worse, `incus exec` FORWARDS SIGTERM to the (dead)
+# remote session instead of exiting (measured: `timeout 10` alone left
+# the client alive for 38+ minutes), so only the -k SIGKILL follow-up
+# reliably reaps the local client. `|| true` alone cannot save a
 # command that never returns.
-timeout 10 incus exec "$FW0" -- bash -c 'echo b > /proc/sysrq-trigger' 2>/dev/null || true
+timeout -k 5 10 incus exec "$FW0" -- bash -c 'echo b > /proc/sysrq-trigger' 2>/dev/null || true
 
 # Wait for fw1 to detect failure and become primary
 sleep 3
