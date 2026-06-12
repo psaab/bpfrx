@@ -4,36 +4,52 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 )
 
 // fakeExecutor is a hand-rolled test double for the frrExecutor interface.
 // Per-method response programming + per-method call counting. No external
-// test framework dependencies.
+// test framework dependencies. All state is mutex-guarded because the
+// degraded-retry goroutine (#1880) calls FrrReloadPy concurrently with
+// test-goroutine assertions.
 type fakeExecutor struct {
+	mu sync.Mutex
+
 	// vtyshResp returns the canned response for a given input command.
 	// If the command is missing from the map, vtyshErr is returned.
 	vtyshResp map[string]string
 	vtyshErr  error
 
-	// systemctlReloadErr is returned by SystemctlReload.
-	systemctlReloadErr error
+	// frrReloadPyErr is returned by FrrReloadPy. frrReloadPyHook, when
+	// set, runs inside the call (under the manager's reloadMu) and its
+	// return value wins — used by the stale-success and
+	// converge-after-N tests.
+	frrReloadPyErr  error
+	frrReloadPyHook func(call int) error
 
 	// vtyshLoadResp / vtyshLoadErr are returned by VtyshLoad.
 	vtyshLoadResp []byte
 	vtyshLoadErr  error
 
 	// Capture: most recent call args.
-	lastVtyshCmd      string
-	lastVtyshLoadConf string
-	lastVtyshLoadCtx  context.Context
-	systemctlCalls    int
-	vtyshLoadCalls    int
-	vtyshCalls        int
-	lastSystemctlCtx  context.Context
+	lastVtyshCmd       string
+	lastVtyshLoadConf  string
+	lastVtyshLoadCtx   context.Context
+	frrReloadPyCalls   int
+	vtyshLoadCalls     int
+	vtyshCalls         int
+	lastFrrReloadPyCtx context.Context
+	lastFrrReloadConf  string
+
+	// vtyshLoadCtxLiveAtCall records whether the fallback's context was
+	// still live when VtyshLoad ran (fresh-context contract).
+	vtyshLoadCtxLiveAtCall bool
 }
 
 func (f *fakeExecutor) Vtysh(command string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.vtyshCalls++
 	f.lastVtyshCmd = command
 	if resp, ok := f.vtyshResp[command]; ok {
@@ -42,16 +58,36 @@ func (f *fakeExecutor) Vtysh(command string) (string, error) {
 	return "", f.vtyshErr
 }
 
-func (f *fakeExecutor) SystemctlReload(ctx context.Context) error {
-	f.systemctlCalls++
-	f.lastSystemctlCtx = ctx
-	return f.systemctlReloadErr
+func (f *fakeExecutor) FrrReloadPy(ctx context.Context, conf string) error {
+	f.mu.Lock()
+	f.frrReloadPyCalls++
+	call := f.frrReloadPyCalls
+	f.lastFrrReloadPyCtx = ctx
+	f.lastFrrReloadConf = conf
+	hook := f.frrReloadPyHook
+	err := f.frrReloadPyErr
+	f.mu.Unlock()
+	if hook != nil {
+		return hook(call)
+	}
+	return err
+}
+
+func (f *fakeExecutor) reloadPyCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.frrReloadPyCalls
 }
 
 func (f *fakeExecutor) VtyshLoad(ctx context.Context, conf string) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.vtyshLoadCalls++
 	f.lastVtyshLoadCtx = ctx
 	f.lastVtyshLoadConf = conf
+	// Liveness must be sampled AT CALL TIME — the caller's deferred
+	// cancel runs before the test can assert.
+	f.vtyshLoadCtxLiveAtCall = ctx.Err() == nil
 	return f.vtyshLoadResp, f.vtyshLoadErr
 }
 
@@ -105,45 +141,64 @@ Network            Next Hop         Metric From            Tag Time
 	}
 }
 
-// TestReloadUsesSystemctlHappyPath verifies that reload() calls
-// SystemctlReload first and returns successfully when it succeeds — the
-// VtyshLoad fallback must NOT be invoked.
-func TestReloadUsesSystemctlHappyPath(t *testing.T) {
+// reloadForTest wraps reloadLocked with the lock the production
+// callers (commitManagedSection, retryReloadOnce) hold.
+func (m *Manager) reloadForTest() error {
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+	return m.reloadLocked()
+}
+
+// TestReloadPrimaryHappyPath verifies that reload calls FrrReloadPy
+// first with the manager's conf path and a deadline-carrying context,
+// and that the VtyshLoad fallback is NOT invoked on success.
+func TestReloadPrimaryHappyPath(t *testing.T) {
 	fake := &fakeExecutor{
-		systemctlReloadErr: nil, // happy path
+		frrReloadPyErr: nil, // happy path
 	}
 	m := &Manager{exec: fake, frrConf: "/tmp/test-frr.conf"}
-	if err := m.reload(); err != nil {
+	if err := m.reloadForTest(); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
-	if fake.systemctlCalls != 1 {
-		t.Errorf("SystemctlReload calls = %d, want 1", fake.systemctlCalls)
+	if fake.frrReloadPyCalls != 1 {
+		t.Errorf("FrrReloadPy calls = %d, want 1", fake.frrReloadPyCalls)
 	}
 	if fake.vtyshLoadCalls != 0 {
 		t.Errorf("VtyshLoad calls = %d, want 0 on happy path", fake.vtyshLoadCalls)
 	}
-	if fake.lastSystemctlCtx == nil {
-		t.Fatalf("SystemctlReload called with nil context — expected the 15s WithTimeout")
+	if fake.lastFrrReloadConf != "/tmp/test-frr.conf" {
+		t.Errorf("FrrReloadPy conf = %q, want %q", fake.lastFrrReloadConf, "/tmp/test-frr.conf")
 	}
-	if _, ok := fake.lastSystemctlCtx.Deadline(); !ok {
-		t.Errorf("SystemctlReload ctx has no deadline; expected the 15s reload timeout")
+	if fake.lastFrrReloadPyCtx == nil {
+		t.Fatalf("FrrReloadPy called with nil context — expected the 15s WithTimeout")
+	}
+	if _, ok := fake.lastFrrReloadPyCtx.Deadline(); !ok {
+		t.Errorf("FrrReloadPy ctx has no deadline; expected the 15s reload timeout")
 	}
 }
 
-// TestReloadFallsBackToVtyshLoad verifies that reload() falls through to
-// VtyshLoad when systemctl reload returns an error.
+// TestReloadFallsBackToVtyshLoad verifies that reload falls through to
+// VtyshLoad when the primary frr-reload.py fails, that the fallback
+// gets a FRESH deadline-carrying context (never the primary's possibly
+// dead one — Codex/AGY plan-r1), and that the result is the
+// ErrFRRReloadDegraded sentinel wrapping the primary cause.
 func TestReloadFallsBackToVtyshLoad(t *testing.T) {
+	primaryErr := errors.New("frr-reload.py: vtysh socket refused")
 	fake := &fakeExecutor{
-		systemctlReloadErr: errors.New("systemctl: unit frr not loaded"),
-		vtyshLoadResp:      []byte(""),
-		vtyshLoadErr:       nil,
+		frrReloadPyErr: primaryErr,
+		vtyshLoadResp:  []byte(""),
+		vtyshLoadErr:   nil,
 	}
 	m := &Manager{exec: fake, frrConf: "/tmp/test-frr.conf"}
-	if err := m.reload(); err != nil {
-		t.Fatalf("reload: %v", err)
+	err := m.reloadForTest()
+	if !errors.Is(err, ErrFRRReloadDegraded) {
+		t.Fatalf("reload = %v, want ErrFRRReloadDegraded", err)
 	}
-	if fake.systemctlCalls != 1 {
-		t.Errorf("SystemctlReload calls = %d, want 1", fake.systemctlCalls)
+	if !errors.Is(err, primaryErr) {
+		t.Errorf("degraded sentinel does not wrap the primary cause: %v", err)
+	}
+	if fake.frrReloadPyCalls != 1 {
+		t.Errorf("FrrReloadPy calls = %d, want 1", fake.frrReloadPyCalls)
 	}
 	if fake.vtyshLoadCalls != 1 {
 		t.Errorf("VtyshLoad calls = %d, want 1 (fallback)", fake.vtyshLoadCalls)
@@ -152,26 +207,33 @@ func TestReloadFallsBackToVtyshLoad(t *testing.T) {
 		t.Errorf("VtyshLoad conf = %q, want %q", fake.lastVtyshLoadConf, "/tmp/test-frr.conf")
 	}
 	if fake.lastVtyshLoadCtx == nil {
-		t.Fatalf("VtyshLoad called with nil context — expected the 15s WithTimeout")
+		t.Fatalf("VtyshLoad called with nil context — expected the fresh 15s WithTimeout")
 	}
 	if _, ok := fake.lastVtyshLoadCtx.Deadline(); !ok {
-		t.Errorf("VtyshLoad ctx has no deadline; expected the 15s reload timeout")
+		t.Errorf("VtyshLoad ctx has no deadline; expected the fresh 15s reload timeout")
+	}
+	if !fake.vtyshLoadCtxLiveAtCall {
+		t.Errorf("VtyshLoad ctx already dead at call time — fallback must get a fresh context")
 	}
 }
 
-// TestReloadFallbackErrorPropagated verifies that when both systemctl and
-// vtysh -f fail, the error from VtyshLoad is wrapped with the captured
-// output and returned.
+// TestReloadFallbackErrorPropagated verifies that when both
+// frr-reload.py and vtysh -f fail, the error from VtyshLoad is wrapped
+// with the captured output and returned (and is NOT the degraded
+// sentinel — nothing was applied).
 func TestReloadFallbackErrorPropagated(t *testing.T) {
 	fake := &fakeExecutor{
-		systemctlReloadErr: errors.New("systemctl failed"),
-		vtyshLoadResp:      []byte("syntax error at line 12"),
-		vtyshLoadErr:       errors.New("exit status 1"),
+		frrReloadPyErr: errors.New("frr-reload.py failed"),
+		vtyshLoadResp:  []byte("syntax error at line 12"),
+		vtyshLoadErr:   errors.New("exit status 1"),
 	}
 	m := &Manager{exec: fake, frrConf: "/tmp/test-frr.conf"}
-	err := m.reload()
+	err := m.reloadForTest()
 	if err == nil {
 		t.Fatalf("reload: expected error, got nil")
+	}
+	if errors.Is(err, ErrFRRReloadDegraded) {
+		t.Errorf("hard double-failure must not be reported as degraded: %v", err)
 	}
 	if !strings.Contains(err.Error(), "syntax error at line 12") {
 		t.Errorf("reload error %q missing captured output", err.Error())

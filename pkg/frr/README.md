@@ -76,12 +76,40 @@ move or rename the markers — they're literal strings.
   active/active overlap.
 - `vtysh -c` is run synchronously in batch mode for state queries. There
   is no streaming; long output is buffered.
-- All `vtysh` and `systemctl` shell-outs route through the package-private
-  `frrExecutor` interface. Tests inject a fake; production uses
-  `realExecutor{}` (which `exec.Command`s the real binary). A zero-value
-  `Manager{}` is tolerated via the `executor()` accessor — useful for
-  same-package literals.
-- `Manager.reload()` enforces a 15-second `context.WithTimeout` around
-  the entire reload (systemctl + vtysh -f fallback). This is the inner
-  shutdown-correctness invariant; the systemd unit's `TimeoutStopSec=20`
-  is the outer safety net.
+- All `vtysh` and `frr-reload.py` shell-outs route through the
+  package-private `frrExecutor` interface. Tests inject a fake;
+  production uses `realExecutor{}` (which `exec.Command`s the real
+  binary). A zero-value `Manager{}` is tolerated via the `executor()`
+  accessor — useful for same-package literals.
+- Reload mechanism (#1880): the primary reload is a DIRECT bounded
+  `/usr/lib/frr/frr-reload.py --reload <frr.conf>` — NEVER
+  `systemctl reload frr`. On FRR 10.6 the unit's ExecReload
+  (frrinit.sh reload) unconditionally restarts watchfrr, the
+  Type=forking unit's MainPID, so every systemd-mediated reload cancels
+  its own job, parks frr.service in `stop-sigterm` for 2 minutes, and
+  ends with systemd SIGKILLing all FRR daemons. The direct invocation
+  keeps the unit state untouched and restores stale-config REMOVAL on
+  commit (the systemctl branch had been 100%-failing, so every reload
+  silently ran the additive fallback).
+- Each reload leg gets its OWN 15-second `context.WithTimeout`: the
+  primary and, when it fails (any cause, including timeout), a FRESH
+  context for the additive `vtysh -f` fallback. The real executor runs
+  frr-reload.py in its own process group and SIGKILLs the group on
+  cancel (`Setpgid` + `cmd.Cancel`), so no child `vtysh` writer can
+  survive a timeout and race the fallback. Worst case on the apply
+  path: ≤40s (2×15s + up to two 5s WaitDelay windows; an apply also
+  waits at most one teardown window behind a pre-cancelled in-flight
+  retry, ≤45s total).
+- Degraded mode: fallback success returns `ErrFRRReloadDegraded`
+  (wrapping the primary cause). A single-flight in-manager retry loop
+  re-runs the primary at 15s/30s/60s then every 5min until a full diff
+  converges (`frr.conf` on disk is the SSOT; a newer apply supersedes
+  and a fully-successful reload cancels the episode). All reloads —
+  applies AND the retry — serialize under `reloadMu`; `confGen` guards
+  against a stale success clearing the state. The condition is exported
+  via `Manager.ReloadDegraded()` → `xpf_frr_reload_degraded` (0/1
+  gauge). `frr-pythontools` missing is classified explicitly
+  (warn-once, slow-cadence retry). `Manager.Stop()` (wired into daemon
+  shutdown) cancels in-flight process groups and reaps the retry
+  goroutine; `DisableDegradedRetry()` is the one-shot (`xpfd cleanup`)
+  configuration.
