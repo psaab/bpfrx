@@ -13,6 +13,21 @@ package config
 // lives here alongside the rest of the schema_* family (schema_walk.go,
 // schema_validators.go, value_type.go); the procedural completion / path
 // resolution helpers live in schema_complete.go.
+//
+// #1891 domain split: schema.go keeps the schemaNode type, the setSchema
+// root composition, and the groups-wildcard init() wiring; the per-domain
+// subtrees live in sibling aspect files in this package — NOT a
+// subpackage, because setSchema is unexported and consumed in-package by
+// schema_complete.go / schema_walk.go (two-SSOT doctrine, #1319):
+//
+//	schema_security.go    security, applications
+//	schema_interfaces.go  interfaces (+ tunnel/wireguard constructors)
+//	schema_routing.go     routing-options, policy-options, protocols,
+//	                      forwarding-options, bridge-domains,
+//	                      routing-instances
+//	schema_system.go      system, services, snmp, event-options
+//	schema_chassis.go     chassis
+//	schema_cos.go         class-of-service, firewall
 
 // schemaNode defines a container keyword in the Junos config hierarchy.
 // It tells SetPath how to group flat path tokens into the correct tree structure.
