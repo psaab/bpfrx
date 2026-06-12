@@ -16,8 +16,13 @@ leaves may be typed (`Node.ValueType` / `ValueDesc` / `ValueExamples` /
 ## Config-mode grammar → `pkg/config` `setSchema`
 
 The `set` / `delete` / `show` / `edit` configuration grammar is owned by
-`config.setSchema` (a tree of `schemaNode` in `pkg/config/schema.go`), NOT by
-cmdtree. `setSchema` drives **four** things off one tree:
+`config.setSchema` (a tree of `schemaNode` rooted in `pkg/config/schema.go`),
+NOT by cmdtree. Since the #1891 domain split, `schema.go` holds the
+`schemaNode` type and the root composition; the per-domain subtrees live in
+sibling aspect files in the same package (`schema_security.go`,
+`schema_interfaces.go`, `schema_routing.go`, `schema_system.go`,
+`schema_chassis.go`, `schema_cos.go` — see the file map in `schema.go`).
+`setSchema` drives **four** things off one tree:
 
 1. **Structural completion** — what keywords are valid at each position.
 2. **Flat-set token grouping** — how `set a b c d` packs into AST
@@ -50,7 +55,8 @@ only supplies the config-mode TOP-LEVEL keywords (`set`/`delete`/`commit`/
 
 ## How to add a config-mode typed leaf
 
-Edit the leaf's `schemaNode` in `setSchema` (`pkg/config/schema.go`). Set:
+Edit the leaf's `schemaNode` in `setSchema` (in the domain's
+`pkg/config/schema_<domain>.go` aspect file). Set:
 
 ```go
 "transmit-rate": {
@@ -201,7 +207,7 @@ reserved for whole-dataplane selection where a rewrite shim
   takeover-hold-time, peer-fencing, RG node priority,
   gratuitous-arp-count, ip-monitoring global-weight / global-threshold /
   target weight) with runtime-derived, source-cited ranges. Deliberately
-  NOT typed, with reasons in the `schema.go` comments: the
+  NOT typed, with reasons in the `schema_chassis.go` comments: the
   `redundancy-group <id>` / RG-scoped `node <id>` instance-name slots
   (the walker's compiler-faithful contract consumes identity tokens
   without validation — typing them needs a new walker feature),
@@ -229,7 +235,8 @@ reserved for whole-dataplane selection where a rewrite shim
   netdev-budget/coalescence knobs, the rpm probe knobs, ip-monitoring
   hold-down / preferred-metric) plus the `validateMultiValueLeaf`
   block-list walker extension the deployed `name-server { 1.1.1.1; }`
-  shape requires. Deliberately untyped, with reasons in `schema.go`:
+  shape requires. Deliberately untyped, with reasons in
+  `schema_system.go` / `schema_interfaces.go`:
   `unit <n>` / `vrrp-group <id>` instance ids (cross-referenced from other
   subsystems — one dedicated pass later), `track-interface priority-cost`
   (#1814 pre-walk owns it), `cpu-governor` (pass-through by design), dhcp
