@@ -5275,3 +5275,159 @@ fn txn_nat64_refusal_at_cap_drops_translated_packet() {
     assert_eq!(batch2.session_creates, 2);
     assert_eq!(dbg2.tx, 1);
 }
+
+// === #1873 R-C: blanket tunnel gate at the slow-path chokepoint ===
+
+fn tunnel_gate_test_fixture() -> (
+    BindingIdentity,
+    BindingLiveState,
+    Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    UserspaceDpMeta,
+    Vec<u8>,
+) {
+    let frame =
+        build_icmp_echo_frame_v4(Ipv4Addr::new(10, 0, 61, 102), Ipv4Addr::new(1, 1, 1, 1), 64);
+    let binding = BindingIdentity {
+        slot: 7,
+        queue_id: 0,
+        worker_id: 0,
+        interface: Arc::<str>::from("ge-0-0-2"),
+        ifindex: 6,
+    };
+    let live = BindingLiveState::new();
+    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        l4_offset: 34,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        ..UserspaceDpMeta::default()
+    };
+    (binding, live, recent_exceptions, meta, frame)
+}
+
+fn tunnel_marked_decision(disposition: ForwardingDisposition) -> SessionDecision {
+    SessionDecision {
+        resolution: ForwardingResolution {
+            disposition,
+            local_ifindex: 0,
+            egress_ifindex: 6,
+            tx_ifindex: 0,
+            tunnel_endpoint_id: 824,
+            next_hop: None,
+            neighbor_mac: None,
+            src_mac: None,
+            tx_vlan_id: 0,
+        },
+        nat: NatDecision::default(),
+    }
+}
+
+/// #1873 R-C: a tunnel-marked inner packet must NEVER be enqueued to
+/// the kernel slow-path TUN — through ANY door (build-failure
+/// fallback, NoRoute, MissingNeighbor non-forward dispositions). It is
+/// dropped with the dedicated counter + exception, and the generic
+/// slow_path_drops counter stays untouched (proving the gate fires
+/// BEFORE the enqueue/unavailable handling, not as a side effect of
+/// slow_path being absent).
+#[test]
+fn tunnel_marked_frame_never_reaches_slow_path() {
+    for (i, disposition) in [
+        ForwardingDisposition::ForwardCandidate, // build-failure door
+        ForwardingDisposition::NoRoute,
+        ForwardingDisposition::MissingNeighbor,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (binding, live, recent_exceptions, meta, frame) = tunnel_gate_test_fixture();
+        let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+        maybe_reinject_slow_path_from_frame(
+            &binding,
+            &live,
+            None,
+            &local_tunnel_deliveries,
+            &frame,
+            meta,
+            tunnel_marked_decision(disposition),
+            &recent_exceptions,
+            "forward_build_slow_path",
+            &ForwardingState::default(),
+        );
+        assert_eq!(
+            live.tunnel_encap_unresolved_drops.load(Ordering::Relaxed),
+            1,
+            "case {i}: tunnel gate did not fire"
+        );
+        assert_eq!(
+            live.slow_path_drops.load(Ordering::Relaxed),
+            0,
+            "case {i}: generic slow-path drop counted — gate fired too late"
+        );
+        assert_eq!(live.slow_path_packets.load(Ordering::Relaxed), 0);
+        let exceptions = recent_exceptions.lock().expect("exceptions");
+        assert_eq!(
+            exceptions.back().expect("exception").reason,
+            "tunnel_encap_unresolved",
+            "case {i}"
+        );
+    }
+}
+
+/// #1873 R-C: the build-failure entry point (`handle_forward_build_failure`
+/// with fallback_to_slow_path = true) funnels through the same gate.
+#[test]
+fn tunnel_marked_build_failure_drops_instead_of_slow_path() {
+    let (binding, live, recent_exceptions, meta, frame) = tunnel_gate_test_fixture();
+    let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+    let mut dbg = DebugPollCounters::default();
+    handle_forward_build_failure(
+        &binding,
+        &live,
+        None,
+        &local_tunnel_deliveries,
+        &recent_exceptions,
+        &mut dbg,
+        6,
+        frame.len() as u32,
+        &frame,
+        meta,
+        tunnel_marked_decision(ForwardingDisposition::ForwardCandidate),
+        true,
+        &ForwardingState::default(),
+    );
+    assert_eq!(live.tunnel_encap_unresolved_drops.load(Ordering::Relaxed), 1);
+    assert_eq!(live.slow_path_drops.load(Ordering::Relaxed), 0);
+}
+
+/// #1873 R-C: the local_tunnel_deliveries branch (GRE local-origin
+/// INBOUND delivery, keyed by local_ifindex) must stay OPEN — the gate
+/// sits after it.
+#[test]
+fn tunnel_gate_keeps_local_tunnel_delivery_open() {
+    let (binding, live, recent_exceptions, meta, frame) = tunnel_gate_test_fixture();
+    let (tx, rx) = mpsc::sync_channel(4);
+    let mut deliveries = BTreeMap::new();
+    deliveries.insert(9, tx);
+    let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(deliveries));
+    let mut decision = tunnel_marked_decision(ForwardingDisposition::LocalDelivery);
+    decision.resolution.local_ifindex = 9;
+    maybe_reinject_slow_path_from_frame(
+        &binding,
+        &live,
+        None,
+        &local_tunnel_deliveries,
+        &frame,
+        meta,
+        decision,
+        &recent_exceptions,
+        "forward_build_slow_path",
+        &ForwardingState::default(),
+    );
+    assert_eq!(live.tunnel_encap_unresolved_drops.load(Ordering::Relaxed), 0);
+    let delivered = rx.try_recv().expect("local tunnel delivery still open");
+    assert!(!delivered.is_empty());
+}

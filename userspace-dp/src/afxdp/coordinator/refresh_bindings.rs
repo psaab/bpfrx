@@ -125,6 +125,7 @@ fn copy_live_snapshot(binding: &mut BindingStatus, snap: BindingLiveSnapshot) {
     binding.slow_path_forward_build_packets = snap.slow_path_forward_build_packets;
     binding.slow_path_drops = snap.slow_path_drops;
     binding.slow_path_rate_limited = snap.slow_path_rate_limited;
+    binding.tunnel_encap_unresolved_drops = snap.tunnel_encap_unresolved_drops;
     binding.kernel_rx_dropped = snap.kernel_rx_dropped;
     binding.kernel_rx_invalid_descs = snap.kernel_rx_invalid_descs;
     binding.tx_packets = snap.tx_packets;
@@ -298,6 +299,7 @@ fn zero_unbound_slot(binding: &mut BindingStatus) {
     binding.slow_path_forward_build_packets = 0;
     binding.slow_path_drops = 0;
     binding.slow_path_rate_limited = 0;
+    binding.tunnel_encap_unresolved_drops = 0;
     binding.kernel_rx_dropped = 0;
     binding.kernel_rx_invalid_descs = 0;
     binding.tx_packets = 0;
