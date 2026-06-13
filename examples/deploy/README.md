@@ -5,33 +5,56 @@ across the three NIC backings — **host bridges (virtio)**, **SR-IOV
 VFs**, and **whole physical cards (VFIO passthrough)** — for both
 standalone and HA-pair deployments.
 
-Read `docs/deploy-quickstart.md` first for the mental model. The rule
-that governs everything (verified against `pkg/daemon/linksetup.go`):
-**the guest names ALL virtio-backed NICs first (fxp0, em0, ge-low…),
-then ALL hardware-backed NICs (higher ge…); within each class your
-`--nic` order sets the names.** So list every virtio role
-(`net:`/`bridge:`/`macvlan:`) before every hardware role
-(`sriov:`/`physical:`/`pci:`) — the launcher rejects the other order
-because it would silently scramble the interface map.
+**The naming contract is positional** (matches `assignName()` in
+`pkg/daemon/linksetup.go`): the order you attach NICs is the order they
+are named.
+
+```
+                 standalone           cluster node 0      cluster node 1
+   NIC 1   ->     fxp0   (mgmt)        fxp0                fxp0
+   NIC 2   ->     ge-0/0/0             em0  (HA control)   em0
+   NIC 3   ->     ge-0/0/1             ge-0/0/0            ge-7/0/0
+   NIC 4   ->     ge-0/0/2             ge-0/0/1            ge-7/0/1
+   NIC N   ->     ge-0/0/(N-2)         ge-0/0/(N-3)        ge-7/0/(N-3)
+```
+
+(Under the hood the guest sorts `(virtio-first, then PCI bus)` so the
+mgmt/control links are robustly `fxp0`/`em0`; that equals pure position
+whenever virtio NICs sit on lower PCI slots than passthrough cards —
+i.e. every normal layout. The only divergence is a passthrough card on
+a *lower* slot than a virtio NIC; verify with `show interfaces terse`.)
+
+## Two ways to deploy
+
+**Recommended — YAML + `xpf-deploy.py`:** one file describes the whole
+appliance; the tool checks each interface's declared `role` against its
+position, builds the day-0 drive, and launches. A cluster is two files.
+
+```bash
+scripts/deploy/xpf-deploy.py --dry-run examples/deploy/standalone.yaml   # preview
+scripts/deploy/xpf-deploy.py           examples/deploy/standalone.yaml   # launch
+scripts/deploy/xpf-deploy.py examples/deploy/ha-fw0.yaml examples/deploy/ha-fw1.yaml  # HA pair
+```
+
+**Imperative — `xpf-launch.sh`:** the same thing as one command line
+with ordered `--nic` flags (no YAML). Good for one-offs and scripting.
 
 | File | What it is |
 |---|---|
+| `standalone.yaml` / `ha-fw0.yaml` / `ha-fw1.yaml` | **YAML deployment definitions** (role-validated) |
 | `standalone.conf` | 3-NIC LAN→WAN NAT firewall config (check-config-valid) |
 | `ha-pair.conf` | one config for both HA nodes (check-config-valid for `-node-id 0` and `1`) |
 | `show-host-nics.sh` | inventory host PFs/VFs/PCI-addresses/bridges → values for the recipes |
-| `ha-bridges.sh` | runnable: HA pair, all interfaces on bridges/virtio |
-| `ha-sriov.sh` | runnable: HA pair, mgmt/control/fabric virtio + dataplane SR-IOV VFs |
-| `ha-physical.sh` | runnable: HA pair, every interface a whole passthrough card |
+| `ha-bridges.sh` / `ha-sriov.sh` / `ha-physical.sh` | runnable imperative HA launchers, one per NIC backing |
 
-All three runnable scripts accept `--dry-run` (printed straight through
-to the launcher) so you can preview the exact `incus` commands before
-committing. Edit the variables at the top of each for your host, or
-override via env: `LAN_PF=enp8s0 WAN_PF=enp9s0 ./ha-sriov.sh`.
+Both paths accept `--dry-run` to preview the exact `incus` commands.
+Per-interface backings: `net:` (incus managed network), `bridge:`,
+`macvlan:`, `sriov:` (incus-allocated VF, MAC pinned host-side), `pci:`
+(VFIO passthrough of a PF or specific VF; `,mac=` pins a VF),
+`physical:`.
 
 ```bash
 examples/deploy/show-host-nics.sh        # see what your host has
-examples/deploy/ha-sriov.sh --dry-run    # preview
-examples/deploy/ha-sriov.sh              # launch
 ```
 
 ---

@@ -5318,3 +5318,7 @@ top.
 - **Timestamp**: 2026-06-13 00:55
   **Action**: PR #1906 deploy-delta round-4b — AGY full report escalated finding #1 (guest driver-class sort in linksetup.go). Reclassified sriov/physical/pci as hardware-class (hw00..) vs virtio (eth00..); guard rejects virtio-after-hardware; rewrote docs contract to the verified class-sort rule. Also: PF-up before VF MAC pin, hardened resolve_vf_parent, hermetic dry-run, nodearg set-u guard. AGY #5 ghost-bonds refuted via reference-config equivalence.
   **File(s)**: scripts/deploy/xpf-launch.sh, examples/deploy/{ha-sriov.sh,README.md}, docs/deploy-quickstart.md, docs/pr/1879-pathc/deploy-delta-reviewer-ids.md
+
+- **Timestamp**: 2026-06-13 09:55
+  **Action**: #1879 — operator confirmed interface naming is POSITIONAL (assignName: pos→fxp0/em0/ge). Built YAML-driven deployer scripts/deploy/xpf-deploy.py (role↔position validation, day-0 drive build, incus+libvirt emit, --dry-run) + examples/deploy/{standalone,ha-fw0,ha-fw1}.yaml. Reframed docs to positional-primary (driver-class = robustness tiebreaker, coincides in normal layouts).
+  **File(s)**: scripts/deploy/xpf-deploy.py, examples/deploy/{standalone,ha-fw0,ha-fw1}.yaml, examples/deploy/README.md, docs/deploy-quickstart.md
