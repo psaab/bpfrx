@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 # ha-sriov.sh — launch an xpf HA pair with mgmt/control/fabric on
-# virtio and the LAN+WAN dataplane ports on SR-IOV VFs. This is the
-# RECOMMENDED production topology: line-rate dataplane (native XDP on
-# mlx5 VFs) while the non-revenue links stay simple and host-portable.
-# It mirrors the project's own reference cluster
-# (test/incus/cluster-setup.sh).
+# virtio and the LAN+WAN dataplane ports on SR-IOV VFs, for a line-rate
+# dataplane (native XDP on mlx5 VFs) while the non-revenue links stay
+# simple and host-portable.
 #
 # Per-node NIC order (identical on both VMs) -> xpf interface name:
 #   1 fxp0   2 em0   3 ge-X/0/0 (fab)   4 ge-X/0/1 (LAN, VF)   5 ge-X/0/2 (WAN, VF)
@@ -12,6 +10,16 @@
 # incus 'sriov:<PF>' allocates a free VF on that PF and pins its MAC
 # host-side before passthrough, so the guest identity is stable across
 # host reboots. Each node gets its own VF on the (per-host) PF.
+#
+# ORDERING CAVEAT (read before production use): the reference cluster
+# (test/incus/cluster-setup.sh) passes VM dataplane VFs as raw
+# 'pci:<vf-addr>' devices and uses nictype=sriov ONLY for containers.
+# nictype=sriov for a VM does VF passthrough, but whether incus orders
+# that NIC in the name-sorted virtio group (so this script's
+# fxp0/em0/fab/LAN/WAN order holds) is NOT yet live-verified. For a
+# deterministic dataplane mapping today, prefer passing the VFs as
+# 'pci:<vf-addr>,mac=02:..' (the launcher pins the VF MAC), and ALWAYS
+# confirm the realized map with 'show interfaces terse' after boot.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAUNCH="$HERE/../../scripts/deploy/xpf-launch.sh"

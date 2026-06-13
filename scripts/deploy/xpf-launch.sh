@@ -66,6 +66,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 MAKE_DRIVE="${SCRIPT_DIR}/../image/make-config-drive.sh"
 
+# --dry-run must be hermetic — never touch incus. Detect it before the
+# group re-exec below (full parsing happens further down).
+case " $* " in *" --dry-run "*) export XPF_LAUNCH_DRY=1 ;; esac
+
 # Re-exec under the incus-admin group when needed (same pattern as
 # scripts/image/validate-image.sh).
 if [ -z "${XPF_LAUNCH_DRY:-}" ] && ! incus list >/dev/null 2>&1; then
@@ -89,7 +93,7 @@ while [ $# -gt 0 ]; do
 	--nic)      NICS+=("${2:?}"); shift 2 ;;
 	--no-start) START=0; shift ;;
 	--dry-run)  DRY=1; export XPF_LAUNCH_DRY=1; shift ;;
-	-h|--help)  sed -n '2,68p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+	-h|--help)  awk 'NR>1 && /^#/{sub(/^# ?/,"");print;next} NR>1{exit}' "$0"; exit 0 ;;
 	*)          die "unknown argument: $1 (see --help)" ;;
 	esac
 done
@@ -142,7 +146,7 @@ for spec in "${NICS[@]}"; do
 	[ "$kind" != "$spec" ] || { kind="net"; rest="$spec"; }
 	arg="${rest%%,*}"
 	mac=""
-	case "$rest" in *,mac=*) mac="${rest#*,mac=}" ;; esac
+	case "$rest" in *,mac=*) mac="${rest#*,mac=}"; mac="${mac%%,*}" ;; esac
 
 	case "$kind" in
 	net)
@@ -163,10 +167,12 @@ for spec in "${NICS[@]}"; do
 	physical)
 		dev=$(printf 'eth%02d' "$idx_v"); idx_v=$((idx_v+1))
 		[ "$seen_pci" -eq 0 ] || die "NIC '$spec' after a pci: spec — reorder"
+		echo "WARNING: nictype=physical does VFIO passthrough for VMs; its PCI-slot ordering RELATIVE to virtio NICs is not guaranteed by incus. For deterministic dataplane ordering prefer pci:<addr>. ALWAYS verify with 'cli -c \"show interfaces terse\"'." >&2
 		VIRTIO_ADDS+=("$dev|nic|nictype=physical|parent=$arg") ;;
 	sriov)
 		dev=$(printf 'eth%02d' "$idx_v"); idx_v=$((idx_v+1))
 		[ "$seen_pci" -eq 0 ] || die "NIC '$spec' after a pci: spec — reorder"
+		echo "WARNING: nictype=sriov does VF passthrough for VMs (the reference cluster uses raw pci: for VM VFs and nictype=sriov only for containers). VM NIC ordering relative to virtio is not guaranteed; for deterministic dataplane ordering prefer pci:<vf-addr>,mac=. ALWAYS verify with 'cli -c \"show interfaces terse\"'." >&2
 		e="$dev|nic|nictype=sriov|parent=$arg"; [ -n "$mac" ] && e="$e|hwaddr=$mac"
 		VIRTIO_ADDS+=("$e") ;;
 	pci)

@@ -5310,3 +5310,7 @@ top.
 - **Timestamp**: 2026-06-12 17:20
   **Action**: #1879 deployment examples — per-backing recipe book (bridges/SR-IOV/whole-physical × standalone+HA), host-NIC discovery helper, three runnable HA launchers, libvirt pinned-PCI recipe for all-physical determinism.
   **File(s)**: examples/deploy/README.md, examples/deploy/show-host-nics.sh, examples/deploy/{ha-bridges,ha-sriov,ha-physical}.sh, docs/deploy-quickstart.md
+
+- **Timestamp**: 2026-06-13 00:25
+  **Action**: PR #1906 deploy-delta round-4 review (operator-flagged the delta was unreviewed). AGY MERGE-NEEDS-MAJOR + Claude SMR: fixed --help code-leak, --dry-run non-hermetic re-exec, greedy mac parse; corrected sriov VM-ordering over-claim (runtime warning + doc fix). Codex r4 lost to infra. Delta NOT yet review-clean — sriov/physical VM ordering needs live verification.
+  **File(s)**: scripts/deploy/xpf-launch.sh, examples/deploy/{ha-sriov.sh,README.md}, docs/pr/1879-pathc/deploy-delta-reviewer-ids.md

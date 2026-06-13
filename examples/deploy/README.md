@@ -15,7 +15,7 @@ interface name.**
 | `ha-pair.conf` | one config for both HA nodes (check-config-valid for `-node-id 0` and `1`) |
 | `show-host-nics.sh` | inventory host PFs/VFs/PCI-addresses/bridges → values for the recipes |
 | `ha-bridges.sh` | runnable: HA pair, all interfaces on bridges/virtio |
-| `ha-sriov.sh` | runnable: HA pair, mgmt/control/fabric virtio + dataplane SR-IOV VFs (**recommended**) |
+| `ha-sriov.sh` | runnable: HA pair, mgmt/control/fabric virtio + dataplane SR-IOV VFs (see ordering caveat) |
 | `ha-physical.sh` | runnable: HA pair, every interface a whole passthrough card |
 
 All three runnable scripts accept `--dry-run` (printed straight through
@@ -128,7 +128,7 @@ differ); the config is `ha-pair.conf`, valid for both personalities.
 
 ```bash
 examples/deploy/ha-bridges.sh     # all bridges/virtio
-examples/deploy/ha-sriov.sh       # virtio mgmt/control/fabric + SR-IOV dataplane (recommended)
+examples/deploy/ha-sriov.sh       # virtio mgmt/control/fabric + SR-IOV dataplane (see ordering caveat)
 examples/deploy/ha-physical.sh    # every interface a passthrough card
 ```
 
