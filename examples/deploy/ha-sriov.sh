@@ -11,15 +11,15 @@
 # host-side before passthrough, so the guest identity is stable across
 # host reboots. Each node gets its own VF on the (per-host) PF.
 #
-# ORDERING CAVEAT (read before production use): the reference cluster
-# (test/incus/cluster-setup.sh) passes VM dataplane VFs as raw
-# 'pci:<vf-addr>' devices and uses nictype=sriov ONLY for containers.
-# nictype=sriov for a VM does VF passthrough, but whether incus orders
-# that NIC in the name-sorted virtio group (so this script's
-# fxp0/em0/fab/LAN/WAN order holds) is NOT yet live-verified. For a
-# deterministic dataplane mapping today, prefer passing the VFs as
-# 'pci:<vf-addr>,mac=02:..' (the launcher pins the VF MAC), and ALWAYS
-# confirm the realized map with 'show interfaces terse' after boot.
+# ORDERING (verified against pkg/daemon/linksetup.go): the guest names
+# all virtio NICs first, then all hardware NICs, each class by PCI bus.
+# Here the 3 virtio links (mgmt/em0/fabric) take fxp0/em0/ge-0-0-0 and
+# the 2 VFs (hardware-class) take ge-0-0-1/ge-0-0-2 — which is exactly
+# the intended map because the dataplane roles are listed last. The
+# reference cluster (test/incus/cluster-setup.sh) passes VM VFs as raw
+# 'pci:<vf-addr>' (also hardware-class); 'pci:<vf-addr>,mac=02:..' is the
+# equivalent if you prefer to pin a specific VF. ALWAYS confirm the
+# realized map with 'show interfaces terse' after first boot.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAUNCH="$HERE/../../scripts/deploy/xpf-launch.sh"

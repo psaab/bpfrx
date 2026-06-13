@@ -5314,3 +5314,7 @@ top.
 - **Timestamp**: 2026-06-13 00:25
   **Action**: PR #1906 deploy-delta round-4 review (operator-flagged the delta was unreviewed). AGY MERGE-NEEDS-MAJOR + Claude SMR: fixed --help code-leak, --dry-run non-hermetic re-exec, greedy mac parse; corrected sriov VM-ordering over-claim (runtime warning + doc fix). Codex r4 lost to infra. Delta NOT yet review-clean — sriov/physical VM ordering needs live verification.
   **File(s)**: scripts/deploy/xpf-launch.sh, examples/deploy/{ha-sriov.sh,README.md}, docs/pr/1879-pathc/deploy-delta-reviewer-ids.md
+
+- **Timestamp**: 2026-06-13 00:55
+  **Action**: PR #1906 deploy-delta round-4b — AGY full report escalated finding #1 (guest driver-class sort in linksetup.go). Reclassified sriov/physical/pci as hardware-class (hw00..) vs virtio (eth00..); guard rejects virtio-after-hardware; rewrote docs contract to the verified class-sort rule. Also: PF-up before VF MAC pin, hardened resolve_vf_parent, hermetic dry-run, nodearg set-u guard. AGY #5 ghost-bonds refuted via reference-config equivalence.
+  **File(s)**: scripts/deploy/xpf-launch.sh, examples/deploy/{ha-sriov.sh,README.md}, docs/deploy-quickstart.md, docs/pr/1879-pathc/deploy-delta-reviewer-ids.md

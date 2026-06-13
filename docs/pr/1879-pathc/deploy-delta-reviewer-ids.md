@@ -25,3 +25,53 @@ NO prior review (rounds 1-3 covered only the image-bake machinery).
   a mixed virtio+VF NIC set). Until then the deterministic dataplane path
   is raw `pci:<vf-addr>,mac=`, which the launcher supports and the docs
   now steer toward. A re-review round on the fix commit is also pending.
+
+## Round-4b — AGY full-report finding #1 (driver-class sort) fixed properly
+
+The AGY summary I first read understated finding #1; the full report
+escalated it and it is CONFIRMED against `pkg/daemon/linksetup.go:171-184`:
+the guest assigns vSRX names by sorting `(driver-class, PCI-bus)` —
+`virtio_net` sortKey 0, all other drivers sortKey 1 — so ALL virtio NICs
+are named before ALL hardware NICs regardless of PCI slot. My original
+"--nic order = PCI order = name" contract was wrong for mixed orderings,
+and I had mis-classified `sriov:`/`physical:` into the virtio group.
+
+Fix (this commit):
+- Reclassified `sriov:`/`physical:`/`pci:` as hardware-class; `net:`/
+  `bridge:`/`macvlan:` as virtio-class. Hardware devices now named
+  `hw00..` (sorts after `eth00..`), virtio `eth00..`.
+- The ordering guard now rejects a virtio spec after ANY hardware spec
+  (was: only after a `pci:` spec), with an explanation citing the
+  guest class sort.
+- Docs (README + deploy-quickstart) rewritten: the contract is now
+  "all virtio NICs named first, then all hardware NICs, each class in
+  launch order", grounded in linksetup.go. Dropped the earlier
+  "nictype=sriov ordering unverified" hedge — the class split IS
+  code-verified; within-class order uses the same name→PCI mechanism
+  the reference cluster relies on, with `show interfaces terse` as the
+  acceptance check.
+- The three shipped recipes all satisfy virtio-first/hardware-last and
+  therefore produce correct names (ha-bridges all-virtio; ha-sriov
+  3 virtio + 2 VF; ha-physical all-hardware).
+
+Also fixed from AGY #2/#3/#4 this round:
+- empty `nodearg` array expansion (set -u trip on bash <4.4) — replaced
+  with an explicit if/else.
+- VF MAC pin now brings the PF admininstratively `up` first (ixgbe/i40e
+  reject `vf N mac` on a down PF).
+- `resolve_vf_parent` PF derivation hardened to use the sysfs glob path
+  (`…/net/<PF>/device/virtfnN`) rather than the VF readlink target
+  (switchdev representor races).
+- `--dry-run` now skips the sysfs VF walk entirely (fully hermetic;
+  pci+mac under dry-run prints "(dry-run) would pin" instead of dying).
+
+AGY #5 (ghost bonds from global fab0+fab1) REFUTED: the working
+reference `docs/ha-cluster-userspace.conf` defines both fab0 and fab1
+globally with member-interfaces identically; the loss cluster runs it,
+so the compiler tolerates a fab interface whose members are absent on a
+node. `ha-pair.conf` mirrors the proven config.
+
+Status: shellcheck clean; full dry-run matrix correct; configs pass
+check-config. Codex r4 remains lost to infra. Live-boot verification of
+the realized interface map (esp. within-hardware-class order for
+nictype=sriov) is the one open item before this is fully closed.

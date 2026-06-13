@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # xpf-launch.sh — launch an xpf appliance VM on incus in one command.
 #
-# The whole deployment contract is NIC ORDER. The order of --nic flags
-# is the guest PCI order, and xpf names interfaces by PCI order:
+# The deployment contract is NIC ORDER, with one rule (verified against
+# pkg/daemon/linksetup.go): the guest names ALL virtio-backed NICs
+# first, THEN all hardware-backed NICs, each class in launch order. So
+# list every virtio role (net:/bridge:/macvlan:) before every hardware
+# role (sriov:/physical:/pci:) — the launcher rejects the reverse,
+# which would silently scramble the interface map. Given that ordering:
 #
-#   --nic #1               -> fxp0 (management, DHCP)
-#   --nic #2 (cluster)     -> em0  (HA control link; only with --node-id)
-#   remaining --nic flags  -> ge-0/0/0, ge-0/0/1, ... (node 1: ge-7/0/N)
+#   1st NIC               -> fxp0 (management, DHCP)
+#   2nd NIC (cluster)     -> em0  (HA control link; only with --node-id)
+#   remaining NICs        -> ge-0/0/0, ge-0/0/1, ... (node 1: ge-7/0/N)
 #
 # so the config you ship on the day-0 drive and the --nic list you
 # launch with are two views of the same table. Write the table once,
@@ -115,25 +119,40 @@ run() {
 }
 
 # --- Parse NIC specs into device-add argument lists -------------------
-# Virtio-backed devices are named eth00, eth01, ... — incus sorts
-# devices lexicographically when building the VM, so zero-padded names
-# pin the PCI order to the --nic order. Passthrough (pci:) devices are
-# named pt00, pt01, ... and always land on higher PCI slots than the
-# virtio group, which is why they must come last in the spec list.
-VIRTIO_ADDS=()   # serialized "name|type|k=v|k=v" entries
-PCI_ADDS=()
+# THE NAMING CONTRACT (verified against pkg/daemon/linksetup.go): the
+# guest daemon assigns vSRX names by sorting NICs (driver-class, then
+# PCI bus) — ALL virtio_net NICs first (fxp0, em0, ge-low...), THEN all
+# hardware NICs (higher ge...). So the operator's --nic list must put
+# every virtio-backed role (net:/bridge:/macvlan:) BEFORE every
+# hardware-backed role (sriov:/physical:/pci:), and within each class
+# the --nic order maps to ascending names. This is NOT "--nic order =
+# name" across the board — the class split is enforced by the guest, so
+# a virtio NIC listed after a hardware NIC would still be named first,
+# silently scrambling the map. The guard below rejects that ordering.
+#
+# Device naming pins the within-class order: virtio devices eth00.. and
+# hardware devices hw00.. ('e' < 'h', so hardware sorts after virtio in
+# incus's lexicographic device order too — belt-and-braces with the
+# guest's own class sort).
+VIRTIO_ADDS=()   # serialized "name|type|k=v|k=v" entries (driver class 0)
+HW_ADDS=()       # hardware-class devices (driver class 1), ordered after virtio
 PIN_CMDS=()      # host-side VF MAC pin commands (run before start)
-seen_pci=0
-idx_v=0 idx_p=0
+seen_hw=0
+idx_v=0 idx_h=0
 
 resolve_vf_parent() {
-	# resolve_vf_parent <vf-pci-addr> -> "PF VFNUM" or fails
+	# resolve_vf_parent <vf-pci-addr> -> "PF VFNUM" or fails. Skipped
+	# under --dry-run so dry-runs stay hermetic (no sysfs dependency).
+	[ "${DRY:-0}" -eq 1 ] && return 2
 	local addr="$1" pf vfp
 	for pf in /sys/class/net/*/device/virtfn*; do
 		[ -e "$pf" ] || continue
 		vfp="$(readlink -f "$pf")"
 		if [ "$(basename "$vfp")" = "$addr" ]; then
-			echo "$(echo "$pf" | cut -d/ -f5) $(basename "$pf" | sed 's/virtfn//')"
+			# PF netdev = the netdev whose device dir holds this virtfn
+			# (…/sys/class/net/<PF>/device/virtfnN). Derive it from the
+			# glob path directly, not from the VF's readlink target.
+			echo "$(basename "$(dirname "$(dirname "$pf")")") $(basename "$pf" | sed 's/virtfn//')"
 			return 0
 		fi
 	done
@@ -149,46 +168,39 @@ for spec in "${NICS[@]}"; do
 	case "$rest" in *,mac=*) mac="${rest#*,mac=}"; mac="${mac%%,*}" ;; esac
 
 	case "$kind" in
-	net)
+	net|bridge|macvlan)
+		[ "$seen_hw" -eq 0 ] || die "virtio NIC '$spec' after a hardware (sriov:/physical:/pci:) spec — the guest names ALL virtio NICs before hardware NICs, so list every net:/bridge:/macvlan: role first or the interface map scrambles"
 		dev=$(printf 'eth%02d' "$idx_v"); idx_v=$((idx_v+1))
-		[ "$seen_pci" -eq 0 ] || die "virtio NIC '$spec' after a pci: spec — virtio always enumerates below passthrough; reorder your --nic list"
-		e="$dev|nic|network=$arg"; [ -n "$mac" ] && e="$e|hwaddr=$mac"
-		VIRTIO_ADDS+=("$e") ;;
-	bridge)
-		dev=$(printf 'eth%02d' "$idx_v"); idx_v=$((idx_v+1))
-		[ "$seen_pci" -eq 0 ] || die "virtio NIC '$spec' after a pci: spec — reorder"
-		e="$dev|nic|nictype=bridged|parent=$arg"; [ -n "$mac" ] && e="$e|hwaddr=$mac"
-		VIRTIO_ADDS+=("$e") ;;
-	macvlan)
-		dev=$(printf 'eth%02d' "$idx_v"); idx_v=$((idx_v+1))
-		[ "$seen_pci" -eq 0 ] || die "virtio NIC '$spec' after a pci: spec — reorder"
-		e="$dev|nic|nictype=macvlan|parent=$arg"; [ -n "$mac" ] && e="$e|hwaddr=$mac"
+		case "$kind" in
+		net)     e="$dev|nic|network=$arg" ;;
+		bridge)  e="$dev|nic|nictype=bridged|parent=$arg" ;;
+		macvlan) e="$dev|nic|nictype=macvlan|parent=$arg" ;;
+		esac
+		[ -n "$mac" ] && e="$e|hwaddr=$mac"
 		VIRTIO_ADDS+=("$e") ;;
 	physical)
-		dev=$(printf 'eth%02d' "$idx_v"); idx_v=$((idx_v+1))
-		[ "$seen_pci" -eq 0 ] || die "NIC '$spec' after a pci: spec — reorder"
-		echo "WARNING: nictype=physical does VFIO passthrough for VMs; its PCI-slot ordering RELATIVE to virtio NICs is not guaranteed by incus. For deterministic dataplane ordering prefer pci:<addr>. ALWAYS verify with 'cli -c \"show interfaces terse\"'." >&2
-		VIRTIO_ADDS+=("$dev|nic|nictype=physical|parent=$arg") ;;
+		seen_hw=1
+		dev=$(printf 'hw%02d' "$idx_h"); idx_h=$((idx_h+1))
+		HW_ADDS+=("$dev|nic|nictype=physical|parent=$arg") ;;
 	sriov)
-		dev=$(printf 'eth%02d' "$idx_v"); idx_v=$((idx_v+1))
-		[ "$seen_pci" -eq 0 ] || die "NIC '$spec' after a pci: spec — reorder"
-		echo "WARNING: nictype=sriov does VF passthrough for VMs (the reference cluster uses raw pci: for VM VFs and nictype=sriov only for containers). VM NIC ordering relative to virtio is not guaranteed; for deterministic dataplane ordering prefer pci:<vf-addr>,mac=. ALWAYS verify with 'cli -c \"show interfaces terse\"'." >&2
+		seen_hw=1
+		dev=$(printf 'hw%02d' "$idx_h"); idx_h=$((idx_h+1))
 		e="$dev|nic|nictype=sriov|parent=$arg"; [ -n "$mac" ] && e="$e|hwaddr=$mac"
-		VIRTIO_ADDS+=("$e") ;;
+		HW_ADDS+=("$e") ;;
 	pci)
-		seen_pci=1
-		dev=$(printf 'pt%02d' "$idx_p"); idx_p=$((idx_p+1))
-		PCI_ADDS+=("$dev|pci|address=$arg")
+		seen_hw=1
+		dev=$(printf 'hw%02d' "$idx_h"); idx_h=$((idx_h+1))
+		HW_ADDS+=("$dev|pci|address=$arg")
 		if [ -n "$mac" ]; then
 			if pv=$(resolve_vf_parent "$arg"); then
 				PIN_CMDS+=("ip link set dev ${pv% *} vf ${pv#* } mac $mac")
+			elif [ "${DRY:-0}" -eq 1 ]; then
+				echo "(dry-run) would pin VF MAC for pci:$arg (sysfs not consulted)" >&2
 			else
 				die "pci:$arg,mac=: $arg is not an SR-IOV VF on this host (whole-PF passthrough keeps its burned-in MAC; drop mac=)"
 			fi
-		else
-			if resolve_vf_parent "$arg" >/dev/null 2>&1; then
-				echo "WARNING: pci:$arg is an SR-IOV VF with NO mac= pin — its MAC randomizes every host reboot. Pass ,mac=02:xx:.. for a stable guest identity." >&2
-			fi
+		elif [ "${DRY:-0}" -ne 1 ] && resolve_vf_parent "$arg" >/dev/null 2>&1; then
+			echo "WARNING: pci:$arg is an SR-IOV VF with NO mac= pin — its MAC randomizes every host reboot. Pass ,mac=02:xx:.. for a stable guest identity." >&2
 		fi ;;
 	*)
 		die "unknown NIC spec '$spec' (forms: net:|bridge:|macvlan:|sriov:|pci:|physical:)" ;;
@@ -199,10 +211,13 @@ done
 ISO=""
 if [ -n "$CONF" ]; then
 	ISO="$(pwd)/${NAME}-day0.iso"
-	nodearg=()
-	[ -n "$NODE_ID" ] && nodearg=(-n "$NODE_ID")
 	info "Building day-0 config drive ($ISO) — validated with check-config"
-	run "$MAKE_DRIVE" "${nodearg[@]}" -o "$ISO" "$CONF"
+	# Avoid expanding a possibly-empty array (trips set -u on bash < 4.4).
+	if [ -n "$NODE_ID" ]; then
+		run "$MAKE_DRIVE" -n "$NODE_ID" -o "$ISO" "$CONF"
+	else
+		run "$MAKE_DRIVE" -o "$ISO" "$CONF"
+	fi
 fi
 
 # --- Create the VM -----------------------------------------------------
@@ -219,7 +234,7 @@ add_devices() {
 	done
 }
 [ ${#VIRTIO_ADDS[@]} -eq 0 ] || add_devices "${VIRTIO_ADDS[@]}"
-[ ${#PCI_ADDS[@]} -eq 0 ] || add_devices "${PCI_ADDS[@]}"
+[ ${#HW_ADDS[@]} -eq 0 ] || add_devices "${HW_ADDS[@]}"
 
 if [ -n "$ISO" ]; then
 	run incus config device add "$NAME" day0 disk source="$ISO"
@@ -227,6 +242,11 @@ fi
 
 for cmd in "${PIN_CMDS[@]:-}"; do
 	[ -n "$cmd" ] || continue
+	# Some PF drivers (ixgbe/i40e) reject `vf N mac` while the PF is
+	# administratively down — bring it up first. Field 5 of the pin
+	# command is the PF netdev ("ip link set dev <PF> vf <n> mac <m>").
+	pf=$(printf '%s\n' "$cmd" | awk '{print $4}')
+	[ -n "$pf" ] && run sudo ip link set dev "$pf" up
 	info "Pinning VF MAC on host: $cmd"
 	# shellcheck disable=SC2086
 	run sudo $cmd

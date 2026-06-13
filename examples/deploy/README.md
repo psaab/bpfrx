@@ -5,9 +5,14 @@ across the three NIC backings — **host bridges (virtio)**, **SR-IOV
 VFs**, and **whole physical cards (VFIO passthrough)** — for both
 standalone and HA-pair deployments.
 
-Read `docs/deploy-quickstart.md` first for the mental model. The one
-rule that governs everything: **`--nic` order = guest PCI order = xpf
-interface name.**
+Read `docs/deploy-quickstart.md` first for the mental model. The rule
+that governs everything (verified against `pkg/daemon/linksetup.go`):
+**the guest names ALL virtio-backed NICs first (fxp0, em0, ge-low…),
+then ALL hardware-backed NICs (higher ge…); within each class your
+`--nic` order sets the names.** So list every virtio role
+(`net:`/`bridge:`/`macvlan:`) before every hardware role
+(`sriov:`/`physical:`/`pci:`) — the launcher rejects the other order
+because it would silently scramble the interface map.
 
 | File | What it is |
 |---|---|
@@ -15,7 +20,7 @@ interface name.**
 | `ha-pair.conf` | one config for both HA nodes (check-config-valid for `-node-id 0` and `1`) |
 | `show-host-nics.sh` | inventory host PFs/VFs/PCI-addresses/bridges → values for the recipes |
 | `ha-bridges.sh` | runnable: HA pair, all interfaces on bridges/virtio |
-| `ha-sriov.sh` | runnable: HA pair, mgmt/control/fabric virtio + dataplane SR-IOV VFs (see ordering caveat) |
+| `ha-sriov.sh` | runnable: HA pair, mgmt/control/fabric virtio + dataplane SR-IOV VFs |
 | `ha-physical.sh` | runnable: HA pair, every interface a whole passthrough card |
 
 All three runnable scripts accept `--dry-run` (printed straight through
@@ -115,9 +120,11 @@ scripts/deploy/xpf-launch.sh --name fw1 --conf examples/deploy/standalone.conf \
 ```
 
 Mixed is fine and common — e.g. mgmt on a bridge, LAN on a VF, WAN a
-whole card — as long as every virtio/VF/bridge NIC comes **before** any
-`pci:` passthrough (qemu enumerates virtio below passthrough; the
-launcher rejects a wrong order).
+whole card — as long as every **virtio** NIC (`net:`/`bridge:`/`macvlan:`)
+comes **before** every **hardware** NIC (`sriov:`/`physical:`/`pci:`).
+The guest names virtio-backed interfaces first regardless of slot, so a
+virtio role listed after a hardware role would take a *lower* name and
+scramble the map; the launcher rejects that order.
 
 ---
 
@@ -128,7 +135,7 @@ differ); the config is `ha-pair.conf`, valid for both personalities.
 
 ```bash
 examples/deploy/ha-bridges.sh     # all bridges/virtio
-examples/deploy/ha-sriov.sh       # virtio mgmt/control/fabric + SR-IOV dataplane (see ordering caveat)
+examples/deploy/ha-sriov.sh       # virtio mgmt/control/fabric + SR-IOV dataplane
 examples/deploy/ha-physical.sh    # every interface a passthrough card
 ```
 
@@ -152,11 +159,12 @@ segments between the two hosts (VLAN, direct cable, or a shared bridge).
 
 ## Full physical cards (libvirt, pinned PCI order)
 
-incus orders multiple passthrough devices best-effort (the launcher
-names them `pt00,pt01,…` to give a stable key, which matches the proven
-2-VF reference cluster). For an **all-physical** build where you want
-contractual ordering of fxp0/em0/fab/ge, libvirt lets you pin the guest
-PCI slot of every device — the deterministic choice:
+The launcher names hardware devices `hw00,hw01,…` in `--nic` order so
+they sort after the virtio `eth0N` group; within the hardware class the
+guest then orders by PCI bus. For an **all-physical** build where you
+want fully contractual ordering of fxp0/em0/fab/ge independent of how
+incus assigns PCI slots, libvirt lets you pin the guest PCI slot of
+every device — the most deterministic choice:
 
 ```xml
 <!-- virsh edit xpf-fw0 — fragment; one <hostdev> per card, slots ascending -->

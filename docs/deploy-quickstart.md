@@ -7,10 +7,14 @@ decision here is a table you write once and use twice.
 
 ## The 60-second mental model
 
-xpf names interfaces by **guest PCI order** at first boot
-(`enumerateAndRenameInterfaces()`), exactly like vSRX:
+xpf names interfaces at first boot (`enumerateAndRenameInterfaces()` →
+`linksetup.go`), exactly like vSRX, by sorting NICs **(driver class,
+then PCI bus)**: ALL virtio-backed NICs first, THEN all hardware-backed
+NICs. Within each class, your launch order sets the names. So as long
+as you list every virtio role before every hardware role (the launcher
+enforces this), the position table holds:
 
-| Guest PCI order | Standalone | Cluster member (`node-id` present) |
+| Position | Standalone | Cluster member (`node-id` present) |
 |---|---|---|
 | 1st NIC | `fxp0` (mgmt, DHCP) | `fxp0` (mgmt, DHCP) |
 | 2nd NIC | `ge-0/0/0` | `em0` (HA control link) |
@@ -34,19 +38,25 @@ contract.
 
 **What makes the order deterministic:**
 
-- **incus**: devices are placed on the PCI bus in *lexicographic
-  device-name order*. The launcher names virtio NICs `eth00, eth01, …`
-  (zero-padded) so flag order = bus order. Proven by the project's own
-  test environments (`test/incus/cluster-setup.sh` uses the same
-  pattern).
+- **Guest driver-class sort (the load-bearing rule).** `linksetup.go`
+  gives every `virtio_net` NIC sort-key 0 and every other driver
+  sort-key 1, then sorts by (key, PCI bus). So virtio-backed interfaces
+  are *always* named before hardware-backed ones, regardless of which
+  PCI slot the hypervisor hands them. List all virtio roles
+  (`net:`/`bridge:`/`macvlan:`) before all hardware roles
+  (`sriov:`/`physical:`/`pci:`); the launcher rejects the reverse.
+- **Within a class, name order pins PCI order.** The launcher names
+  virtio devices `eth00, eth01, …` and hardware devices `hw00, hw01, …`
+  (zero-padded, `e` < `h`); incus places devices on the PCI bus in
+  lexicographic device-name order, so launch order → bus order within
+  each class. The same name→bus mechanism is what the project's own
+  `test/incus/cluster-setup.sh` relies on.
 - **libvirt**: `--network`/`--hostdev` order on the `virt-install`
   command line becomes persisted `<address>` PCI slots in the domain
-  XML. Once defined, the order never drifts (this is the mechanism
-  Palo Alto VM-Series documents for the same positional contract).
-- **virtio enumerates below passthrough.** QEMU places virtio NICs on
-  lower PCI slots than VFIO devices, so put every bridge/virtio NIC
-  before any `pci:` passthrough in your table. The launcher enforces
-  this.
+  XML. Once defined, the order never drifts (the mechanism Palo Alto
+  VM-Series documents for the same positional contract). For full
+  control of the hardware-class order, pin guest `<address>` slots
+  (see the libvirt recipe in `examples/deploy/README.md`).
 - **Audit, don't trust**: after first boot,
   `incus exec fw1 -- cli -c "show interfaces terse"` (or the same via
   `virsh console`) prints the realized mapping. Make it part of the
