@@ -80,6 +80,13 @@ scripts/image/validate-image.sh --qcow2 dist/xpf-<ver>.qcow2 \
     --metadata dist/xpf-<ver>.incus-metadata.tar.gz all
 ```
 
+> **Deploying at scale?** `docs/deploy-quickstart.md` is the
+> operator-facing runbook: the NIC-order contract, the one-command
+> launcher (`scripts/deploy/xpf-launch.sh`), validated standalone and
+> HA-pair example configs (`examples/deploy/`), SR-IOV/passthrough MAC
+> rules, and the fleet pattern. The sections below are the raw
+> mechanics it builds on.
+
 ## Deploy quickstart — incus
 
 ```bash
