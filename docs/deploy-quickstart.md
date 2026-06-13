@@ -87,6 +87,11 @@ reboot.
 No config? Omit `--conf`. The box boots factory-default and you
 configure on the console (`incus exec fw1 -- cli`), vSRX-style.
 
+Worked recipes for every backing (bridges / SR-IOV / whole physical
+cards) across standalone and HA, plus host-prep and a libvirt
+pinned-PCI-order recipe, live in **`examples/deploy/README.md`**. Run
+`examples/deploy/show-host-nics.sh` to inventory your host first.
+
 ### NIC spec forms
 
 `scripts/deploy/xpf-launch.sh --nic` accepts, in deployment-table order:

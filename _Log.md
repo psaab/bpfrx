@@ -5306,3 +5306,7 @@ top.
 - **Timestamp**: 2026-06-12 16:55
   **Action**: #1879 deployment UX — one-command incus launcher (NIC-order contract, sriov/pci MAC pinning, day-0 drive build+attach), check-config-validated standalone + HA example configs, SRE-facing deploy-quickstart runbook.
   **File(s)**: scripts/deploy/xpf-launch.sh, examples/deploy/{standalone,ha-pair}.conf, docs/deploy-quickstart.md, docs/install-images.md
+
+- **Timestamp**: 2026-06-12 17:20
+  **Action**: #1879 deployment examples — per-backing recipe book (bridges/SR-IOV/whole-physical × standalone+HA), host-NIC discovery helper, three runnable HA launchers, libvirt pinned-PCI recipe for all-physical determinism.
+  **File(s)**: examples/deploy/README.md, examples/deploy/show-host-nics.sh, examples/deploy/{ha-bridges,ha-sriov,ha-physical}.sh, docs/deploy-quickstart.md
