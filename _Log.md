@@ -5360,3 +5360,6 @@ top.
 - **Timestamp**: 2026-06-12 ~14:25
   **Action**: #1902 — posted live-validation PR comment, filed follow-ups #1912 (encap reply blackhole) + #1913 (unfiltered trailing reinject), Copilot 3x quota-limited -> 3-of-4 fallback recorded
   **File(s)**: docs/pr/1902-pending-neigh/reviewer-ids.md
+
+- **Timestamp**: 2026-06-14 — Codex r1 (PR #1906) MERGE-NEEDS-MAJOR: fixed 5 findings — argparse globals/shorthand pre-parser, incus --no-profiles+root (phantom NIC), validate.py shlex reexec, day0 node-id write guard, bake.py prlimit die-on-fail.
+  **File(s)**: scripts/deploy/xpf-deploy.py, scripts/image/{validate.py,bake.py,xpf-day0-config}, examples/deploy/README.md, docs/pr/1879-pathc/deploy-delta-reviewer-ids.md

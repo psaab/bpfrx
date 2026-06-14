@@ -188,6 +188,7 @@ def load_yaml_appliance(path):
         "node_id": a.get("node_id"), "image": a.get("image", "xpf-appliance"),
         "cpu": a.get("cpu", 4), "memory": a.get("memory", "4GiB"),
         "config": a.get("config"), "interfaces": doc.get("interfaces") or [],
+        "pool": a.get("pool", "default"),
         "base_dir": os.path.dirname(os.path.abspath(path)),
     }
     validate_appliance(ap, path)
@@ -287,8 +288,16 @@ def deploy_incus(ap, runner, start):
     name = ap["name"]
     print_map(ap)
     iso = build_config_drive(ap, runner)
-    runner.run(["incus", "init", ap["image"], name, "--vm",
-                "-c", f"limits.cpu={ap['cpu']}", "-c", f"limits.memory={ap['memory']}"])
+    # --no-profiles: the default profile usually carries an `eth0` NIC,
+    # which would be an extra virtio device the guest names positionally
+    # alongside the declared dev00.. — a phantom interface that pollutes
+    # the NIC->name map. Suppress all profile devices and provide the root
+    # disk explicitly from the storage pool (default "default", override
+    # with `pool:` in YAML) so the device set is EXACTLY the declared NICs.
+    pool = ap.get("pool", "default")
+    runner.run(["incus", "init", ap["image"], name, "--vm", "--no-profiles",
+                "-c", f"limits.cpu={ap['cpu']}", "-c", f"limits.memory={ap['memory']}",
+                "-d", f"root,type=disk,pool={pool},path=/"])
     pins = []
     for i, ic in enumerate(ap["interfaces"]):
         dev = f"dev{i:02d}"
@@ -419,51 +428,59 @@ def cmd_launch(args):
 
 
 def main():
-    # Global options usable before OR after the subcommand: defined with
-    # real defaults on the main parser, and re-offered (SUPPRESS default)
-    # on each subparser so a post-subcommand value overrides without an
-    # unspecified copy clobbering the main-parser value.
-    common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS)
-    common.add_argument("--hypervisor", choices=["incus", "libvirt"], default=argparse.SUPPRESS)
-    common.add_argument("--no-start", action="store_true", default=argparse.SUPPRESS)
-    common.add_argument("--image", default=argparse.SUPPRESS)
-
-    p = argparse.ArgumentParser(prog="xpf-deploy.py", add_help=False,
-                                parents=[common],
-                                description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("-h", "--help", action="store_true")
-    p.set_defaults(dry_run=False, hypervisor="incus", no_start=False, image=None)
-    sub = p.add_subparsers(dest="cmd")
-
-    pd = sub.add_parser("deploy", add_help=False, parents=[common])
-    pd.add_argument("yamls", nargs="*")
-
-    pl = sub.add_parser("launch", add_help=False, parents=[common])
-    pl.add_argument("--name", required=True)
-    pl.add_argument("--mode", default="standalone", choices=["standalone", "cluster"])
-    pl.add_argument("--node-id", type=int, dest="node_id")
-    pl.add_argument("--cpu", type=int, default=4)
-    pl.add_argument("--mem", default="4GiB")
-    pl.add_argument("--config")
-    pl.add_argument("--nic", action="append", default=[])
-
-    sub.add_parser("inventory", add_help=False, parents=[common])
-
-    # Allow bare "xpf-deploy.py foo.yaml" as shorthand for "deploy foo.yaml".
     argv = sys.argv[1:]
-    head = next((a for a in argv if not a.startswith("-")), None)
-    if head and head not in ("deploy", "launch", "inventory"):
-        argv = ["deploy"] + argv
-    args = p.parse_args(argv)
-
-    if args.help or not args.cmd:
+    if "-h" in argv or "--help" in argv or not argv:
         print(__doc__)
-        return 0 if args.help else 2
-    if args.cmd == "inventory":
+        return 0 if ("-h" in argv or "--help" in argv) else 2
+
+    # Peel the global options from ANYWHERE on the command line with a
+    # globals-only pre-parser. parse_known_args picks up --dry-run /
+    # --hypervisor / --no-start / --image whether they appear before or
+    # after the subcommand, and (critically) it CONSUMES their values, so
+    # an option value can never be mistaken for the subcommand token.
+    g = argparse.ArgumentParser(add_help=False)
+    g.add_argument("--dry-run", action="store_true")
+    g.add_argument("--hypervisor", default="incus", choices=["incus", "libvirt"])
+    g.add_argument("--no-start", action="store_true")
+    g.add_argument("--image")
+    gargs, rest = g.parse_known_args(argv)
+
+    # `rest` now holds only the subcommand + its own args. The first token
+    # is the subcommand; if it isn't one, treat the whole of `rest` as
+    # YAML files for `deploy` (the bare-`xpf-deploy.py foo.yaml` shorthand).
+    if rest and rest[0] in ("deploy", "launch", "inventory"):
+        cmd, cmd_argv = rest[0], rest[1:]
+    else:
+        cmd, cmd_argv = "deploy", rest
+
+    if cmd == "inventory":
+        sub = argparse.ArgumentParser(prog="xpf-deploy.py inventory", add_help=False)
+        args = sub.parse_args(cmd_argv)
+    elif cmd == "launch":
+        sub = argparse.ArgumentParser(prog="xpf-deploy.py launch", add_help=False)
+        sub.add_argument("--name", required=True)
+        sub.add_argument("--mode", default="standalone", choices=["standalone", "cluster"])
+        sub.add_argument("--node-id", type=int, dest="node_id")
+        sub.add_argument("--cpu", type=int, default=4)
+        sub.add_argument("--mem", default="4GiB")
+        sub.add_argument("--config")
+        sub.add_argument("--nic", action="append", default=[])
+        args = sub.parse_args(cmd_argv)
+    else:  # deploy
+        sub = argparse.ArgumentParser(prog="xpf-deploy.py deploy", add_help=False)
+        sub.add_argument("yamls", nargs="*")
+        args = sub.parse_args(cmd_argv)
+
+    # Fold the peeled globals into the namespace the command handlers read.
+    args.cmd = cmd
+    args.dry_run = gargs.dry_run
+    args.hypervisor = gargs.hypervisor
+    args.no_start = gargs.no_start
+    args.image = gargs.image
+
+    if cmd == "inventory":
         return cmd_inventory(args)
-    if args.cmd == "launch":
+    if cmd == "launch":
         return cmd_launch(args)
     return cmd_deploy(args)
 

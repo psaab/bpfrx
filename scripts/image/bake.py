@@ -107,8 +107,11 @@ def ensure_memlock():
     if hard == resource.RLIM_INFINITY or hard >= 1048576 * 1024:
         return
     if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode == 0:
-        subprocess.run(["sudo", "-n", "prlimit", "--memlock=unlimited:unlimited",
-                        "--pid", str(os.getpid())], check=False)
+        # The shell original died if this failed; preserve that — a silent
+        # drop just relocates the failure into libguestfs/qemu later.
+        if subprocess.run(["sudo", "-n", "prlimit", "--memlock=unlimited:unlimited",
+                           "--pid", str(os.getpid())]).returncode != 0:
+            die("could not raise RLIMIT_MEMLOCK (libguestfs/qemu io_uring needs it)")
     else:
         die("RLIMIT_MEMLOCK too low for libguestfs/qemu io_uring — raise it "
             "(sudo prlimit --memlock=unlimited:unlimited --pid $$) and re-run")

@@ -162,8 +162,19 @@ try_device() {
 		return 1
 	fi
 	rm -f "$tmpconf"
+	# Persist node-id BEFORE stamping success: the config was commit-checked
+	# with -node-id and xpfd reads /etc/xpf/node-id before bootstrap. If this
+	# tiny write fails we must NOT stamp — a config validated as node 1 could
+	# otherwise boot with standalone/node-0 expansion while the stamp claims
+	# success. Return non-zero so the next boot retries (install is
+	# idempotent; the stamp gates retry).
 	if [ -n "$nodeid" ]; then
-		printf '%s\n' "$nodeid" >"$XPF_DIR/node-id"
+		if ! printf '%s\n' "$nodeid" >"$XPF_DIR/node-id"; then
+			warn "failed to persist node-id $nodeid — not stamping; will retry on reboot"
+			rm -f "$XPF_DIR/xpf.conf"
+			umount "$MNT"
+			return 1
+		fi
 		log "installed node-id $nodeid"
 	fi
 	printf 'applied %s from %s at %s\n' "$(basename "$conf")" "$dev" \

@@ -102,6 +102,7 @@ appliance:
   cpu:      4
   memory:   4GiB           # 4GiB | 4096MiB | 4096 (MB)
   config:   standalone.conf  # xpf.conf for the day-0 drive (path relative to this file)
+  pool:     default          # incus storage pool for the VM root disk (incus only)
 interfaces:                # ORDERED — position is the name
   - role:    fxp0          # expected name; checked against position, fails on mismatch
     backing: bridge        # net | bridge | macvlan | sriov | pci | physical

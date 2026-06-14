@@ -18,6 +18,7 @@ Usage:
 
 import argparse
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -245,8 +246,10 @@ def maybe_reexec_incus_admin():
     except Exception:
         in_grp = False
     if in_grp:
-        os.execvp("sg", ["sg", "incus-admin", "-c",
-                         " ".join([sys.executable] + sys.argv)])
+        # Quote every token — a qcow2/metadata path with spaces or shell
+        # metacharacters must not break (or inject into) the `sg -c` shell.
+        cmd = " ".join(shlex.quote(a) for a in [sys.executable] + sys.argv)
+        os.execvp("sg", ["sg", "incus-admin", "-c", cmd])
 
 
 def main():

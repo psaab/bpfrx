@@ -153,3 +153,36 @@ acceptance test is a live bake+boot (not run; needs root+libguestfs+incus).
 Net: 2 substantive MERGE-READY (Claude SMR + AGY); Codex + Copilot both
 infra/quota-blocked. NOT auto-merged — held for operator review/merge per
 the standing #1879 hold; live bake+boot acceptance test still outstanding.
+
+## Codex r1 (clean runtime) — MERGE-NEEDS-MAJOR, all 5 findings fixed
+
+task-mqdvqqar-e0srt1 (session 019ec688), head 43d010fc0. After the runtime
+recovered (/codex:setup green), the independent third pass found 5 real
+defects the two MERGE-READYs missed — the quad working as designed:
+
+1. [HIGH] xpf-deploy.py argparse: --dry-run/--hypervisor before the
+   subcommand were clobbered (verified: --dry-run launch went into a REAL
+   incus init), and the bare-yaml shorthand detector mistook an option
+   VALUE (e.g. `--hypervisor libvirt`) for the subcommand token. FIXED:
+   rewrote main() to peel globals with a globals-only parse_known_args
+   pre-parser (consumes option values; globals work before OR after the
+   subcommand). Verified across 5 argv shapes.
+2. [HIGH] deploy_incus: plain `incus init` inherited the default profile's
+   eth0 NIC → phantom virtio device polluting the positional map. FIXED:
+   `--no-profiles` + explicit `-d root,type=disk,pool=<pool>` (pool from
+   YAML `pool:`/default "default"). (Note: dev00 sorts before eth0 so fxp0
+   was not actually mis-bound, but the phantom NIC is gone now.)
+3. [MED] validate.py incus-admin reexec used " ".join not shlex — spaces/
+   metachars in qcow2/metadata paths break or inject. FIXED: shlex.quote.
+4. [MED] xpf-day0-config persisted node-id without checking the write, then
+   stamped success — a node-1 config could boot with node-0 expansion.
+   FIXED: guard the write; on failure remove xpf.conf, do NOT stamp, return
+   1 so the next boot retries.
+5. [MED] bake.py ran `sudo prlimit` with check=False (shell died on
+   failure) — silently dropped the RLIMIT_MEMLOCK remediation. FIXED: check
+   returncode, die on failure (shell parity).
+
+Codex confirmed PASSED: Go check-config↔compileTreeStrict parity (exit 1
+bad-flags / exit 2 reject), the big bake/validate asserts preserved, and
+the day-0 loader otherwise boot-safe. All fixes py_compile + dry-run
+verified; incus-runtime fixes (2,4) still want live-boot confirmation.
