@@ -135,3 +135,21 @@ real xpf-config ISO (xpf.conf + node-id); validate.py imports the drive
 builder; bake/validate arg-parse + required-arg errors correct; deploy
 tool regression green. NOT live-bake-verified (needs root + libguestfs +
 incus + boot) — same standing caveat as the rest of #1906.
+
+## /triple-review round (full-PR code review, head ba795ddd9)
+
+Scope: full delta origin/master...HEAD (~2988 insertions): Go day-0
+validation gate, Python deploy + image-build tooling, examples/docs.
+This PR ships NO forwarding-path code — iperf3 smoke is N/A; the real
+acceptance test is a live bake+boot (not run; needs root+libguestfs+incus).
+
+| Reviewer | Verdict | Notes |
+|---|---|---|
+| Claude SMR | MERGE-READY | gates green (go build+test rc=0, full go test rc=0, all 4 Python py_compile); diffed deleted shell vs Python ports — every functional assert preserved (kernel>=6.18, mellanox driver-set, single-kernel, init_on_alloc=0 cmdline, sshd posture, base SHA256 verify, sparsify); expected_name==assignName; role-validation + dry-run hermeticity + per-backing incus/libvirt translation verified |
+| AGY | MERGE-READY | adversarial-review-mqdatgnc-kw4kb7 — SUBSTANTIATED (log shows real inspection of main.go/check.go/store.go/check_test.go + Commit-flow parity, xpf-day0-config, validate.py, xpf-deploy.py, linksetup.go assignName, bake.py, make_config_drive.py + diff of original bake-image.sh; cited artifact). Confirmed: check-config→compileTreeStrict parity, flag.ContinueOnError no exit-collision, expected_name↔assignName, faithful assert preservation, day-0 TOCTOU-safe copy-then-verify + ro,nosuid,nodev,noexec + 0600 |
+| Codex | INFRA-BLOCKED | 3 documented attempts: bc3y92yqr + by31w7ilu (flock wrapper swallowed dispatch, no job) ; task-mqdb0f8w-67ghh4 (registered, ran ~16min stuck "running", result un-fetchable). Companion state-broken this session. Per feedback_codex_infra_must_retry → proceed without |
+| Copilot | QUOTA-BLOCKED | "unable to review… reached quota limit" on all 8 commits incl. head; 3-of-4 fallback |
+
+Net: 2 substantive MERGE-READY (Claude SMR + AGY); Codex + Copilot both
+infra/quota-blocked. NOT auto-merged — held for operator review/merge per
+the standing #1879 hold; live bake+boot acceptance test still outstanding.
