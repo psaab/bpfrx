@@ -103,7 +103,7 @@ audit-check:
 # verify-dataplane validation gate. See docs/install-images.md.
 .PHONY: image
 image:
-	./scripts/image/bake-image.sh
+	python3 scripts/image/bake.py
 
 clean:
 	rm -f $(BINARY) cli xpf-userspace-dp

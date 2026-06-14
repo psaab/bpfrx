@@ -101,3 +101,37 @@ incus and libvirt; launch + inventory subcommands work; real
 build_config_drive produces an xpf-config ISO (xpf.conf + node-id)
 validated by check-config; example .conf still pass the gate; no
 dangling references to the removed scripts.
+
+## Round-6 — image-build tooling converted to Python; upgrade follow-on filed
+
+Operator: "make sure what we use to build the initial bootstrap images is
+using python not shell scripts" + "think about how you will upgrade xpf
+in the future ... as a follow on issue/pr".
+
+- Filed #1917: in-place xpf upgrade (deploy new xpfd + xpf-userspace-dp
+  without re-imaging) — design surface (verify-before-cut #1869, HA
+  rolling-failover for dataplane restart, control-plane-only hot-restart,
+  wire-protocol compat, atomic swap+rollback, .deb packaging). Tracking;
+  needs a /research round.
+- Build-host bakery converted shell -> Python:
+  - scripts/image/bake.py (was bake-image.sh): full offline pipeline
+    (build, Ubuntu discovery + SHA256 verify, virt-resize/customize/
+    sysprep/sparsify, metadata, checksums, manifest, validation gate).
+  - scripts/image/validate.py (was validate-image.sh): incus first-boot
+    scenario matrix a/b/c (factory boot + in-guest verify-dataplane,
+    valid + invalid day-0 drives).
+  - scripts/image/make_config_drive.py (was make-config-drive.sh):
+    importable build_config_drive() + CLI; validate.py imports it.
+  - Makefile `image:` -> python3 scripts/image/bake.py; install-images.md
+    references updated.
+- KEPT as shell (deliberately, flagged): scripts/image/xpf-day0-config
+  (the boot-critical in-guest day-0 loader) and incus-agent-setup. These
+  run IN the guest at early boot, not on the build host; converting the
+  boot path is riskier and needs a live bake+boot to verify, so it is
+  offered separately rather than done blind.
+
+Validation: all four Python tools py_compile; make_config_drive builds a
+real xpf-config ISO (xpf.conf + node-id); validate.py imports the drive
+builder; bake/validate arg-parse + required-arg errors correct; deploy
+tool regression green. NOT live-bake-verified (needs root + libguestfs +
+incus + boot) — same standing caveat as the rest of #1906.

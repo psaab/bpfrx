@@ -20,7 +20,7 @@ Two deliverables, same root disk:
 ## Bake
 
 ```bash
-make image            # = scripts/image/bake-image.sh
+make image            # = python3 scripts/image/bake.py
 ```
 
 Build-host requirements: the normal xpf build toolchain (Go, cargo),
@@ -76,7 +76,7 @@ manifest is the traceability record.
 Full first-boot matrix (run after a bake, or standalone):
 
 ```bash
-scripts/image/validate-image.sh --qcow2 dist/xpf-<ver>.qcow2 \
+python3 scripts/image/validate.py --qcow2 dist/xpf-<ver>.qcow2 \
     --metadata dist/xpf-<ver>.incus-metadata.tar.gz all
 ```
 
@@ -86,9 +86,9 @@ scripts/image/validate-image.sh --qcow2 dist/xpf-<ver>.qcow2 \
 > — YAML-driven, incus/libvirt, builds the day-0 drive in-process),
 > validated standalone/HA example definitions, SR-IOV/passthrough, and
 > the fleet pattern. The sections below are the raw mechanics it builds
-> on. (`scripts/image/make-config-drive.sh` shown here is the image
-> bakery's own config-drive tool; the Python deployer builds drives
-> itself.)
+> on. (`scripts/image/make_config_drive.py` shown here is the image
+> bakery's config-drive tool; the Python deployer builds drives
+> in-process too.)
 
 ## Deploy quickstart — incus
 
@@ -97,7 +97,7 @@ incus image import dist/xpf-<ver>.incus-metadata.tar.gz \
     dist/xpf-<ver>.qcow2 --alias xpf-appliance
 
 # Optional day-0 config drive (see below):
-scripts/image/make-config-drive.sh -o day0.iso my-xpf.conf
+python3 scripts/image/make_config_drive.py -o day0.iso my-xpf.conf
 
 incus init xpf-appliance xpf1 --vm -c limits.cpu=4 -c limits.memory=4GiB
 incus config device add xpf1 day0 disk source=$PWD/day0.iso
@@ -149,7 +149,7 @@ Day-0 loader specifics (`scripts/image/xpf-day0-config`, oneshot unit
 Build a config drive:
 
 ```bash
-scripts/image/make-config-drive.sh [-n 0|1] [-o day0.iso] my-xpf.conf
+python3 scripts/image/make_config_drive.py [-n 0|1] [-o day0.iso] my-xpf.conf
 ```
 
 When an `xpfd` binary is present, the builder runs the same

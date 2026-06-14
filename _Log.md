@@ -5330,3 +5330,7 @@ top.
 - **Timestamp**: 2026-06-13 11:20
   **Action**: #1879 — operator directive "python not shell". Rewrote scripts/deploy/xpf-deploy.py into a self-contained Python tool (deploy/launch/inventory subcommands, in-process day-0 drive build via check-config+xorriso). Removed xpf-launch.sh + show-host-nics.sh + ha-{bridges,sriov,physical}.sh. Docs rewritten Python-only. make-config-drive.sh kept (image bakery).
   **File(s)**: scripts/deploy/xpf-deploy.py, examples/deploy/README.md, docs/deploy-quickstart.md, docs/install-images.md, examples/deploy/{standalone,ha-pair}.conf, examples/deploy/standalone-passthrough.yaml, docs/pr/1879-pathc/deploy-delta-reviewer-ids.md; removed 5 .sh
+
+- **Timestamp**: 2026-06-13 12:10
+  **Action**: #1879 image-build tooling shell->Python: bake.py, validate.py, make_config_drive.py (replace bake-image.sh/validate-image.sh/make-config-drive.sh); Makefile image target -> bake.py; docs updated. In-guest xpf-day0-config + incus-agent-setup kept as shell (boot-critical, flagged). Filed #1917 in-place upgrade follow-on.
+  **File(s)**: scripts/image/{bake,validate,make_config_drive}.py (+removed 3 .sh), Makefile, docs/install-images.md, docs/pr/1879-pathc/deploy-delta-reviewer-ids.md
