@@ -1,61 +1,61 @@
 #!/usr/bin/env python3
-"""xpf-deploy — launch xpf appliance VMs from a YAML definition.
+"""xpf-deploy — set up xpf appliance VMs (incus or libvirt), all in Python.
 
-One YAML file fully describes an appliance: its mode, the day-0 config to
-ship, and an ORDERED list of interfaces. Interface position is the whole
-naming contract (matches pkg/daemon/linksetup.go assignName):
+Subcommands:
+  deploy <appliance.yaml> [...]   launch from YAML definition(s); a cluster
+                                  is two files. (Default if args are *.yaml.)
+  launch --name … --nic …         imperative launch without a YAML file.
+  inventory                       list host NICs, SR-IOV VFs, bridges → the
+                                  values you drop into a definition.
 
-  standalone:        pos1 -> fxp0   pos2 -> ge-0/0/0   posN -> ge-0/0/(N-2)
-  cluster node 0:    pos1 -> fxp0   pos2 -> em0        posN -> ge-0/0/(N-3)
-  cluster node 1:    pos1 -> fxp0   pos2 -> em0        posN -> ge-7/0/(N-3)
+Interface naming is POSITIONAL (matches pkg/daemon/linksetup.go assignName):
 
-You declare the `role` you EXPECT at each position; the tool computes the
-real name from the position and refuses to launch if they disagree, so a
-miswired YAML fails on your laptop, not in production. It then builds the
-day-0 config drive (validated by `xpfd check-config`) and emits the incus
-(or libvirt) commands to bring the VM up with the NICs attached in order.
+  standalone:      pos1 -> fxp0   pos2 -> ge-0/0/0   posN -> ge-0/0/(N-2)
+  cluster node 0:  pos1 -> fxp0   pos2 -> em0        posN -> ge-0/0/(N-3)
+  cluster node 1:  pos1 -> fxp0   pos2 -> em0        posN -> ge-7/0/(N-3)
 
-Usage:
-  xpf-deploy.py [opts] <appliance.yaml> [<appliance2.yaml> ...]
+A NIC's backing (virtio bridge / SR-IOV VF / PCI passthrough) is declared
+explicitly per interface — `backing:` in YAML, or the `<backing>:<source>`
+spec for --nic. The tool translates each to the right incus device / libvirt
+virt-install argument. The day-0 config drive is built and check-config
+validated in-process (no shell helpers).
 
-Options:
-  --dry-run            print the commands instead of running them
-  --hypervisor X       incus (default) | libvirt
-  --no-start           create everything, don't start
-  --image ALIAS        override the YAML's image
-  -h, --help           this help
+Global options: --dry-run  --hypervisor incus|libvirt  --no-start  --image X
 
-A cluster is just two YAML files: `xpf-deploy.py ha-fw0.yaml ha-fw1.yaml`.
-See examples/deploy/*.yaml and docs/deploy-quickstart.md.
+Examples:
+  xpf-deploy.py deploy examples/deploy/standalone-sriov.yaml
+  xpf-deploy.py deploy --hypervisor libvirt examples/deploy/standalone-passthrough.yaml
+  xpf-deploy.py launch --name fw1 --config standalone.conf \\
+      --nic bridge:br-mgmt --nic sriov:enp8s0 --nic pci:0000:09:00.0
+  xpf-deploy.py inventory
 """
 
 import argparse
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 
 try:
     import yaml
 except ImportError:
-    sys.exit("ERROR: PyYAML is required (pip install pyyaml / apt install python3-yaml)")
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-MAKE_DRIVE = os.path.join(HERE, "..", "image", "make-config-drive.sh")
+    yaml = None
 
 VALID_BACKINGS = {"net", "bridge", "macvlan", "sriov", "physical", "pci"}
+SYS_NET = "/sys/class/net"
 
 
 def die(msg):
     sys.exit(f"ERROR: {msg}")
 
 
+# ── naming contract ───────────────────────────────────────────────────
 def expected_name(idx, mode, node_id):
-    """The vSRX name the guest assigns to the NIC at position idx (0-based).
-
-    Mirrors assignName() in pkg/daemon/linksetup.go exactly.
-    """
+    """vSRX name the guest assigns to the NIC at position idx (0-based);
+    mirrors assignName() in pkg/daemon/linksetup.go."""
     if idx == 0:
         return "fxp0"
     if mode == "cluster":
@@ -67,76 +67,201 @@ def expected_name(idx, mode, node_id):
 
 
 def norm_role(role):
-    """Normalize an interface name to slash form (ge-0-0-0 -> ge-0/0/0)."""
     r = role.strip()
     m = re.fullmatch(r"ge-(\d+)[-/]0[-/](\d+)", r)
-    if m:
-        return f"ge-{m.group(1)}/0/{m.group(2)}"
-    return r
+    return f"ge-{m.group(1)}/0/{m.group(2)}" if m else r
 
 
-def load_appliance(path):
+# ── host introspection ────────────────────────────────────────────────
+def _read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def is_physical_nic(dev):
+    if dev == "lo" or not os.path.isdir(os.path.join(SYS_NET, dev, "device")):
+        return False
+    return not re.match(r"(veth|tap|br-|virbr|docker|incusbr)", dev)
+
+
+def driver_of(dev):
+    link = os.path.join(SYS_NET, dev, "device", "driver")
+    return os.path.basename(os.path.realpath(link)) if os.path.exists(link) else "?"
+
+
+def pci_of(dev):
+    link = os.path.join(SYS_NET, dev, "device")
+    return os.path.basename(os.path.realpath(link)) if os.path.exists(link) else "?"
+
+
+def native_xdp_hint(driver):
+    if driver in ("mlx5_core", "i40e", "ice", "ixgbe", "bnxt_en", "nfp"):
+        return "native"
+    if driver in ("iavf", "ixgbevf", "virtio_net"):
+        return "no (generic)"
+    return "unknown"
+
+
+def vf_parent(addr):
+    """(PF_netdev, vf_index) for an SR-IOV VF PCI address, or None."""
+    if not os.path.isdir(SYS_NET):
+        return None
+    for pf in os.listdir(SYS_NET):
+        devdir = os.path.join(SYS_NET, pf, "device")
+        if not os.path.isdir(devdir):
+            continue
+        for entry in os.listdir(devdir):
+            if entry.startswith("virtfn") and \
+               os.path.basename(os.path.realpath(os.path.join(devdir, entry))) == addr:
+                return pf, entry[len("virtfn"):]
+    return None
+
+
+def cmd_inventory(_args):
+    print(f"=== Physical NICs ===")
+    print(f"{'NETDEV':<14} {'DRIVER':<10} {'PCI':<14} {'MAC':<18} {'LINK':<6} NATIVE-XDP")
+    for dev in sorted(os.listdir(SYS_NET)):
+        if not is_physical_nic(dev):
+            continue
+        drv = driver_of(dev)
+        print(f"{dev:<14} {drv:<10} {pci_of(dev):<14} "
+              f"{_read(os.path.join(SYS_NET, dev, 'address')):<18} "
+              f"{_read(os.path.join(SYS_NET, dev, 'operstate')):<6} {native_xdp_hint(drv)}")
+        devdir = os.path.join(SYS_NET, dev, "device")
+        total = _read(os.path.join(devdir, "sriov_totalvfs"))
+        if total and total != "0":
+            num = _read(os.path.join(devdir, "sriov_numvfs")) or "0"
+            print(f"    SR-IOV: {num}/{total} VFs. Create N:  "
+                  f"echo N | sudo tee {devdir}/sriov_numvfs")
+            for entry in sorted(os.listdir(devdir)):
+                if entry.startswith("virtfn"):
+                    vfpci = os.path.basename(os.path.realpath(os.path.join(devdir, entry)))
+                    print(f"      vf{entry[len('virtfn'):]:<3} pci:{vfpci}   "
+                          f"(sriov:{dev}  |  pci:{vfpci},mac=02:..)")
+    print("\n=== Host bridges (bridge:<name>) ===")
+    found = False
+    for dev in sorted(os.listdir(SYS_NET)):
+        if os.path.isdir(os.path.join(SYS_NET, dev, "bridge")):
+            print(f"  bridge:{dev}")
+            found = True
+    if not found:
+        print("  (none — create: sudo ip link add br-lan type bridge; ip link set br-lan up)")
+    return 0
+
+
+# ── appliance model ───────────────────────────────────────────────────
+def validate_appliance(ap, where):
+    if not ap.get("name"):
+        die(f"{where}: name is required")
+    if ap["mode"] not in ("standalone", "cluster"):
+        die(f"{where}: mode must be standalone|cluster")
+    if ap["mode"] == "cluster" and ap.get("node_id") not in (0, 1):
+        die(f"{where}: cluster needs node_id 0|1")
+    if not ap["interfaces"]:
+        die(f"{where}: at least one interface (position 1 = fxp0)")
+    for i, ic in enumerate(ap["interfaces"]):
+        if ic.get("backing") not in VALID_BACKINGS:
+            die(f"{where}: interface {i + 1} backing must be one of {sorted(VALID_BACKINGS)}")
+        if not ic.get("source"):
+            die(f"{where}: interface {i + 1} needs a source")
+        want = expected_name(i, ap["mode"], ap.get("node_id"))
+        if ic.get("role") and norm_role(ic["role"]) != want:
+            die(f"{where}: interface {i + 1} declares role '{ic['role']}' but position {i + 1} "
+                f"is '{want}' — reorder or fix; position is the contract.")
+        ic["_name"] = want
+
+
+def load_yaml_appliance(path):
+    if yaml is None:
+        die("PyYAML required for YAML deploy (apt install python3-yaml). "
+            "Use the 'launch' subcommand for a no-YAML, no-dependency path.")
     with open(path) as f:
         doc = yaml.safe_load(f)
     if not isinstance(doc, dict):
         die(f"{path}: top level must be a mapping")
-    ap = doc.get("appliance") or {}
-    name = ap.get("name")
-    if not name:
-        die(f"{path}: appliance.name is required")
-    mode = ap.get("mode", "standalone")
-    if mode not in ("standalone", "cluster"):
-        die(f"{path}: appliance.mode must be standalone|cluster")
-    node_id = ap.get("node_id")
-    if mode == "cluster" and node_id not in (0, 1):
-        die(f"{path}: cluster appliance needs node_id: 0|1")
-    ifaces = doc.get("interfaces") or []
-    if not ifaces:
-        die(f"{path}: at least one interface is required (position 1 = fxp0)")
-
-    # Validate each interface and check declared role == positional name.
-    for i, ic in enumerate(ifaces):
-        if not isinstance(ic, dict):
-            die(f"{path}: interfaces[{i}] must be a mapping")
-        backing = ic.get("backing")
-        if backing not in VALID_BACKINGS:
-            die(f"{path}: interfaces[{i}].backing must be one of {sorted(VALID_BACKINGS)}")
-        if not ic.get("source"):
-            die(f"{path}: interfaces[{i}].source is required")
-        want = expected_name(i, mode, node_id)
-        declared = ic.get("role")
-        if declared and norm_role(declared) != want:
-            die(f"{path}: interfaces[{i}] declares role '{declared}' but position {i + 1} "
-                f"is '{want}' ({mode}"
-                + (f" node {node_id}" if mode == "cluster" else "") + "). "
-                "Reorder the list or fix the role — position is the contract.")
-        ic["_name"] = want
-    return {
-        "name": name, "mode": mode, "node_id": node_id,
-        "image": ap.get("image", "xpf-appliance"),
-        "cpu": ap.get("cpu", 4), "memory": ap.get("memory", "4GiB"),
-        "config": ap.get("config"), "interfaces": ifaces,
-        "yaml_dir": os.path.dirname(os.path.abspath(path)),
+    a = doc.get("appliance") or {}
+    ap = {
+        "name": a.get("name"), "mode": a.get("mode", "standalone"),
+        "node_id": a.get("node_id"), "image": a.get("image", "xpf-appliance"),
+        "cpu": a.get("cpu", 4), "memory": a.get("memory", "4GiB"),
+        "config": a.get("config"), "interfaces": doc.get("interfaces") or [],
+        "base_dir": os.path.dirname(os.path.abspath(path)),
     }
+    validate_appliance(ap, path)
+    return ap
 
 
-def vf_parent(addr):
-    """Return (PF_netdev, vf_index) for an SR-IOV VF PCI address, or None."""
-    base = "/sys/class/net"
-    try:
-        pfs = os.listdir(base)
-    except OSError:
-        return None
-    for pf in pfs:
-        devdir = os.path.join(base, pf, "device")
-        if not os.path.isdir(devdir):
-            continue
-        for entry in os.listdir(devdir):
-            if not entry.startswith("virtfn"):
-                continue
-            if os.path.basename(os.path.realpath(os.path.join(devdir, entry))) == addr:
-                return pf, entry[len("virtfn"):]
+# ── day-0 config drive (pure Python; xorriso/genisoimage for the ISO) ──
+def find_xpfd():
+    for c in (os.environ.get("XPFD"), os.path.join(os.getcwd(), "xpfd"),
+              shutil.which("xpfd")):
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
     return None
+
+
+def build_config_drive(ap, runner):
+    cfg = ap.get("config")
+    if not cfg:
+        return None
+    cfg_path = cfg if os.path.isabs(cfg) else os.path.join(ap["base_dir"], cfg)
+    iso = os.path.join(os.getcwd(), f"{ap['name']}-day0.iso")
+    if runner.dry:
+        print(f"==> (dry-run) would build day-0 drive {iso} from {cfg_path} "
+              f"(label xpf-config, check-config validated)")
+        return iso
+    if not os.path.isfile(cfg_path):
+        die(f"config not found: {cfg_path}")
+    xpfd = find_xpfd()
+    if xpfd:
+        nodearg = ["-node-id", str(ap["node_id"])] if ap["mode"] == "cluster" else []
+        r = subprocess.run([xpfd, "check-config"] + nodearg + [cfg_path],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            die(f"day-0 config REJECTED by check-config:\n{r.stdout}{r.stderr}")
+        print(f"==> day-0 config validated ({os.path.basename(cfg_path)})")
+    else:
+        print("WARNING: no xpfd binary found — skipping build-host validation "
+              "(the appliance still validates at first boot).")
+    mkiso = next((t for t in ("xorriso", "genisoimage", "mkisofs") if shutil.which(t)), None)
+    if not mkiso:
+        die("need xorriso/genisoimage/mkisofs to build the config drive (apt install xorriso)")
+    stage = tempfile.mkdtemp(prefix="xpf-day0-")
+    try:
+        shutil.copyfile(cfg_path, os.path.join(stage, "xpf.conf"))
+        os.chmod(os.path.join(stage, "xpf.conf"), 0o644)
+        if ap["mode"] == "cluster":
+            with open(os.path.join(stage, "node-id"), "w") as f:
+                f.write(f"{ap['node_id']}\n")
+        if mkiso == "xorriso":
+            argv = ["xorriso", "-as", "mkisofs", "-quiet", "-V", "xpf-config",
+                    "-J", "-r", "-o", iso, stage]
+        else:
+            argv = [mkiso, "-quiet", "-V", "xpf-config", "-J", "-r", "-o", iso, stage]
+        subprocess.run(argv, check=True, capture_output=True, text=True)
+        print(f"==> built day-0 drive {iso} (label xpf-config)")
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+    return iso
+
+
+# ── memory / pci helpers ──────────────────────────────────────────────
+def memory_mb(val):
+    m = re.fullmatch(r"(\d+)\s*([GMgm]i?[Bb]?)?", str(val).strip())
+    if not m:
+        die(f"unparseable memory '{val}'")
+    return int(m.group(1)) * 1024 if (m.group(2) or "M").upper().startswith("G") else int(m.group(1))
+
+
+def pci_parts(addr):
+    m = re.fullmatch(r"([0-9a-fA-F]{4}):([0-9a-fA-F]{2}):([0-9a-fA-F]{2})\.([0-7])", addr)
+    if not m:
+        die(f"pci address '{addr}' is not DDDD:BB:DD.F")
+    return {"domain": "0x" + m.group(1), "bus": "0x" + m.group(2),
+            "slot": "0x" + m.group(3), "function": "0x" + m.group(4)}
 
 
 class Runner:
@@ -150,39 +275,24 @@ class Runner:
         return subprocess.run(argv, check=True, capture_output=True, text=True).stdout
 
 
-def build_config_drive(ap, runner):
-    cfg = ap["config"]
-    if not cfg:
-        return None
-    cfg_path = cfg if os.path.isabs(cfg) else os.path.join(ap["yaml_dir"], cfg)
-    if not runner.dry and not os.path.isfile(cfg_path):
-        die(f"config not found: {cfg_path}")
-    iso = os.path.join(os.getcwd(), f"{ap['name']}-day0.iso")
-    argv = ["bash", MAKE_DRIVE]
-    if ap["mode"] == "cluster":
-        argv += ["-n", str(ap["node_id"])]
-    argv += ["-o", iso, cfg_path]
-    print(f"==> building day-0 drive {iso} (validated by check-config)")
-    runner.run(argv)
-    return iso
+# ── deploy backends ───────────────────────────────────────────────────
+def print_map(ap):
+    tag = ap["mode"] + (f" node {ap['node_id']}" if ap["mode"] == "cluster" else "")
+    print(f"==> {ap['name']}: {tag}, {len(ap['interfaces'])} NICs")
+    for i, ic in enumerate(ap["interfaces"]):
+        print(f"      pos {i + 1}: {ic['_name']:<10} <- {ic['backing']}:{ic['source']}")
 
 
 def deploy_incus(ap, runner, start):
     name = ap["name"]
-    print(f"==> {name}: {ap['mode']}"
-          + (f" node {ap['node_id']}" if ap["mode"] == "cluster" else "")
-          + f", {len(ap['interfaces'])} NICs")
-    # Print the resolved position->name->role map up front.
-    for i, ic in enumerate(ap["interfaces"]):
-        print(f"      pos {i + 1}: {ic['_name']:<10} <- {ic['backing']}:{ic['source']}")
+    print_map(ap)
     iso = build_config_drive(ap, runner)
     runner.run(["incus", "init", ap["image"], name, "--vm",
                 "-c", f"limits.cpu={ap['cpu']}", "-c", f"limits.memory={ap['memory']}"])
     pins = []
     for i, ic in enumerate(ap["interfaces"]):
-        dev = f"dev{i:02d}"  # zero-padded => incus name order = position order
-        b, src = ic["backing"], str(ic["source"])
-        mac = ic.get("mac")
+        dev = f"dev{i:02d}"
+        b, src, mac = ic["backing"], str(ic["source"]), ic.get("mac")
         if b == "net":
             args = ["nic", f"network={src}"]
         elif b == "bridge":
@@ -204,13 +314,12 @@ def deploy_incus(ap, runner, start):
             elif runner.dry:
                 print(f"      (dry-run) would pin VF MAC for pci:{src}")
             else:
-                die(f"pci:{src} with mac= is not an SR-IOV VF on this host (drop mac= for whole-PF)")
+                die(f"pci:{src} with mac= is not an SR-IOV VF here (drop mac= for whole-PF)")
         runner.run(["incus", "config", "device", "add", name, dev] + args)
     if iso:
         runner.run(["incus", "config", "device", "add", name, "day0", "disk", f"source={iso}"])
     for pin in pins:
-        pf = pin[5]
-        runner.run(["sudo", "ip", "link", "set", "dev", pf, "up"])
+        runner.run(["sudo", "ip", "link", "set", "dev", pin[5], "up"])
         print(f"==> pinning VF MAC: {' '.join(pin)}")
         runner.run(pin)
     if start:
@@ -221,37 +330,13 @@ def deploy_incus(ap, runner, start):
         print(f"{name} created (not started): incus start {name}")
 
 
-def memory_mb(val):
-    """'4GiB'/'4096MiB'/4096/'4G' -> MB integer for virt-install."""
-    s = str(val).strip()
-    m = re.fullmatch(r"(\d+)\s*([GMgm]i?[Bb]?)?", s)
-    if not m:
-        die(f"unparseable memory '{val}'")
-    n = int(m.group(1))
-    unit = (m.group(2) or "M").upper()
-    return n * 1024 if unit.startswith("G") else n
-
-
-def pci_parts(addr):
-    """'0000:09:00.2' -> dict of hex domain/bus/slot/function for libvirt."""
-    m = re.fullmatch(r"([0-9a-fA-F]{4}):([0-9a-fA-F]{2}):([0-9a-fA-F]{2})\.([0-7])", addr)
-    if not m:
-        die(f"pci address '{addr}' is not DDDD:BB:DD.F")
-    return {"domain": "0x" + m.group(1), "bus": "0x" + m.group(2),
-            "slot": "0x" + m.group(3), "function": "0x" + m.group(4)}
-
-
 def deploy_libvirt(ap, runner, start):
-    """Emit a virt-install command. NIC order on the command line becomes
-    the persisted guest <address> PCI-slot order, which the guest then
-    names positionally — same contract as incus."""
     name = ap["name"]
+    print_map(ap)
     iso = build_config_drive(ap, runner)
-    disk = f"/var/lib/libvirt/images/{ap['image']}.qcow2"
-    argv = ["virt-install", "--name", name,
-            "--memory", str(memory_mb(ap["memory"])),
+    argv = ["virt-install", "--name", name, "--memory", str(memory_mb(ap["memory"])),
             "--vcpus", str(ap["cpu"]), "--import",
-            "--disk", f"path={disk}",
+            "--disk", f"path=/var/lib/libvirt/images/{ap['image']}.qcow2",
             "--osinfo", "ubuntu26.04", "--noautoconsole"]
     if iso:
         argv += ["--disk", f"path={iso},device=cdrom"]
@@ -259,80 +344,128 @@ def deploy_libvirt(ap, runner, start):
     for ic in ap["interfaces"]:
         b, src, mac = ic["backing"], str(ic["source"]), ic.get("mac")
         if b in ("net", "bridge"):
-            # incus managed net has no libvirt analogue — both map to a
-            # host bridge / libvirt network by name.
-            kind = "network" if b == "net" else "bridge"
-            net = f"{kind}={src},model=virtio"
-            if mac:
-                net += f",mac.address={mac}"
-            argv += ["--network", net]
+            net = f"{'network' if b == 'net' else 'bridge'}={src},model=virtio"
+            argv += ["--network", net + (f",mac.address={mac}" if mac else "")]
         elif b == "macvlan":
             net = f"type=direct,source={src},source_mode=bridge,model=virtio"
-            if mac:
-                net += f",mac.address={mac}"
-            argv += ["--network", net]
+            argv += ["--network", net + (f",mac.address={mac}" if mac else "")]
         elif b == "physical":
-            argv += ["--hostdev", src]   # whole card, keeps burned-in MAC
+            argv += ["--hostdev", src]
         elif b == "pci":
             if mac:
-                # SR-IOV VF with a pinned MAC -> hostdev-network form so
-                # libvirt programs the VF MAC on the PF before assignment.
                 p = pci_parts(src)
                 argv += ["--network",
-                         "type=hostdev,"
-                         f"source.address.type=pci,source.address.domain={p['domain']},"
-                         f"source.address.bus={p['bus']},source.address.slot={p['slot']},"
-                         f"source.address.function={p['function']},mac.address={mac}"]
+                         "type=hostdev,source.address.type=pci,"
+                         f"source.address.domain={p['domain']},source.address.bus={p['bus']},"
+                         f"source.address.slot={p['slot']},source.address.function={p['function']},"
+                         f"mac.address={mac}"]
             else:
-                argv += ["--hostdev", src]   # raw VF/PF passthrough
+                argv += ["--hostdev", src]
         elif b == "sriov":
-            # libvirt has no "pick a free VF on this PF" device; the
-            # idiomatic equivalent is a <forward mode='hostdev'> VF pool
-            # network named after the PF (one-time host setup).
             pool = f"{src}-vfpool"
-            net = f"network={pool}"
-            if mac:
-                net += f",mac.address={mac}"
-            argv += ["--network", net]
-            notes.append(
-                f"sriov:{src} -> libvirt VF pool '{pool}'. Define it once:\n"
-                f"      <network><name>{pool}</name>"
-                f"<forward mode='hostdev' managed='yes'>"
-                f"<pf dev='{src}'/></forward></network>\n"
-                f"      virsh net-define <file> && virsh net-start {pool} "
-                f"&& virsh net-autostart {pool}")
+            argv += ["--network", f"network={pool}" + (f",mac.address={mac}" if mac else "")]
+            notes.append(f"sriov:{src} -> libvirt VF pool '{pool}'. Define once:\n"
+                         f"      <network><name>{pool}</name>"
+                         f"<forward mode='hostdev' managed='yes'><pf dev='{src}'/></forward></network>\n"
+                         f"      virsh net-define <f> && virsh net-start {pool} && virsh net-autostart {pool}")
     print("# virt-install — NIC order = guest PCI-slot order = positional names.")
-    print("# For fully contractual hardware ordering, pin guest <address> slots in `virsh edit`.")
     for n in notes:
         print(f"# NOTE: {n}")
     runner.run(argv)
     if start:
-        print(f"\n{name}: after boot, verify with "
-              f"`virsh console {name}` then `cli -c \"show interfaces terse\"`.")
+        print(f"\n{name}: verify with `virsh console {name}` then "
+              f"`cli -c \"show interfaces terse\"`.")
+
+
+def deploy(ap, args):
+    runner = Runner(args.dry_run)
+    if args.image:
+        ap["image"] = args.image
+    (deploy_incus if args.hypervisor == "incus" else deploy_libvirt)(
+        ap, runner, not args.no_start)
+
+
+# ── subcommands ───────────────────────────────────────────────────────
+def cmd_deploy(args):
+    if not args.yamls:
+        die("deploy needs at least one YAML file")
+    for path in args.yamls:
+        deploy(load_yaml_appliance(path), args)
+    return 0
+
+
+def cmd_launch(args):
+    ifaces = []
+    for spec in args.nic:
+        kind, _, rest = spec.partition(":")
+        if not rest:
+            kind, rest = "net", spec
+        src, _, tail = rest.partition(",")
+        mac = None
+        m = re.search(r"mac=([^,]+)", tail)
+        if m:
+            mac = m.group(1)
+        ic = {"backing": kind, "source": src}
+        if mac:
+            ic["mac"] = mac
+        ifaces.append(ic)
+    ap = {"name": args.name, "mode": args.mode, "node_id": args.node_id,
+          "image": args.image or "xpf-appliance", "cpu": args.cpu,
+          "memory": args.mem, "config": args.config, "interfaces": ifaces,
+          "base_dir": os.getcwd()}
+    validate_appliance(ap, "launch")
+    deploy(ap, args)
+    return 0
 
 
 def main():
-    p = argparse.ArgumentParser(add_help=False)
-    p.add_argument("yamls", nargs="*")
-    p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--hypervisor", default="incus", choices=["incus", "libvirt"])
-    p.add_argument("--no-start", action="store_true")
-    p.add_argument("--image")
+    # Global options usable before OR after the subcommand: defined with
+    # real defaults on the main parser, and re-offered (SUPPRESS default)
+    # on each subparser so a post-subcommand value overrides without an
+    # unspecified copy clobbering the main-parser value.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS)
+    common.add_argument("--hypervisor", choices=["incus", "libvirt"], default=argparse.SUPPRESS)
+    common.add_argument("--no-start", action="store_true", default=argparse.SUPPRESS)
+    common.add_argument("--image", default=argparse.SUPPRESS)
+
+    p = argparse.ArgumentParser(prog="xpf-deploy.py", add_help=False,
+                                parents=[common],
+                                description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("-h", "--help", action="store_true")
-    args = p.parse_args()
-    if args.help or not args.yamls:
+    p.set_defaults(dry_run=False, hypervisor="incus", no_start=False, image=None)
+    sub = p.add_subparsers(dest="cmd")
+
+    pd = sub.add_parser("deploy", add_help=False, parents=[common])
+    pd.add_argument("yamls", nargs="*")
+
+    pl = sub.add_parser("launch", add_help=False, parents=[common])
+    pl.add_argument("--name", required=True)
+    pl.add_argument("--mode", default="standalone", choices=["standalone", "cluster"])
+    pl.add_argument("--node-id", type=int, dest="node_id")
+    pl.add_argument("--cpu", type=int, default=4)
+    pl.add_argument("--mem", default="4GiB")
+    pl.add_argument("--config")
+    pl.add_argument("--nic", action="append", default=[])
+
+    sub.add_parser("inventory", add_help=False, parents=[common])
+
+    # Allow bare "xpf-deploy.py foo.yaml" as shorthand for "deploy foo.yaml".
+    argv = sys.argv[1:]
+    head = next((a for a in argv if not a.startswith("-")), None)
+    if head and head not in ("deploy", "launch", "inventory"):
+        argv = ["deploy"] + argv
+    args = p.parse_args(argv)
+
+    if args.help or not args.cmd:
         print(__doc__)
         return 0 if args.help else 2
-    runner = Runner(args.dry_run)
-    for path in args.yamls:
-        ap = load_appliance(path)
-        if args.image:
-            ap["image"] = args.image
-        if args.hypervisor == "incus":
-            deploy_incus(ap, runner, not args.no_start)
-        else:
-            deploy_libvirt(ap, runner, not args.no_start)
-    return 0
+    if args.cmd == "inventory":
+        return cmd_inventory(args)
+    if args.cmd == "launch":
+        return cmd_launch(args)
+    return cmd_deploy(args)
 
 
 if __name__ == "__main__":

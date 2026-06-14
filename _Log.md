@@ -5326,3 +5326,7 @@ top.
 - **Timestamp**: 2026-06-13 10:25
   **Action**: #1879 comprehensive deploy samples — SR-IOV + passthrough YAMLs (standalone + HA), hardened libvirt code path (memory/PCI parsing, hostdev-network for VF+mac, VF-pool for sriov:), incus-vs-libvirt comparison + YAML schema reference + backing/XDP matrix in README. Same passthrough YAML deploys on both hypervisors.
   **File(s)**: scripts/deploy/xpf-deploy.py, examples/deploy/{standalone-sriov,standalone-passthrough,ha-fw0-sriov,ha-fw1-sriov}.yaml, examples/deploy/README.md
+
+- **Timestamp**: 2026-06-13 11:20
+  **Action**: #1879 — operator directive "python not shell". Rewrote scripts/deploy/xpf-deploy.py into a self-contained Python tool (deploy/launch/inventory subcommands, in-process day-0 drive build via check-config+xorriso). Removed xpf-launch.sh + show-host-nics.sh + ha-{bridges,sriov,physical}.sh. Docs rewritten Python-only. make-config-drive.sh kept (image bakery).
+  **File(s)**: scripts/deploy/xpf-deploy.py, examples/deploy/README.md, docs/deploy-quickstart.md, docs/install-images.md, examples/deploy/{standalone,ha-pair}.conf, examples/deploy/standalone-passthrough.yaml, docs/pr/1879-pathc/deploy-delta-reviewer-ids.md; removed 5 .sh

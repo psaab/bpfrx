@@ -5,7 +5,7 @@
 #   scripts/deploy/xpf-deploy.py                 examples/deploy/standalone-passthrough.yaml
 #   scripts/deploy/xpf-deploy.py --hypervisor libvirt examples/deploy/standalone-passthrough.yaml
 #
-# Find PCI addresses with examples/deploy/show-host-nics.sh. A bare PF
+# Find PCI addresses with scripts/deploy/xpf-deploy.py inventory. A bare PF
 # address = whole-card passthrough (keeps burned-in MAC; drop mac). A VF
 # address WITH mac = the launcher/libvirt pins the VF MAC on the PF.
 appliance:

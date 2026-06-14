@@ -75,3 +75,29 @@ Status: shellcheck clean; full dry-run matrix correct; configs pass
 check-config. Codex r4 remains lost to infra. Live-boot verification of
 the realized interface map (esp. within-hardware-class order for
 nictype=sriov) is the one open item before this is fully closed.
+
+## Round-5 — operator directive: Python, not shell
+
+Operator: "I don't want shell scripts to do this work, I want python
+scripts." Converted the deploy tooling to a single self-contained Python
+tool and removed the shell scripts.
+
+- scripts/deploy/xpf-deploy.py: now has subcommands `deploy` (YAML),
+  `launch` (imperative --nic, replaces xpf-launch.sh), and `inventory`
+  (host NIC/VF/bridge listing, replaces show-host-nics.sh). Builds the
+  day-0 config drive in-process (xpfd check-config validation + xorriso,
+  no make-config-drive.sh dependency). incus + libvirt; --dry-run
+  hermetic.
+- Removed: scripts/deploy/xpf-launch.sh, examples/deploy/show-host-nics.sh,
+  examples/deploy/ha-{bridges,sriov,physical}.sh (the per-topology bash
+  wrappers are redundant with the YAML samples).
+- scripts/image/make-config-drive.sh KEPT — it is the image bakery's
+  tool (used by validate-image.sh), a separate deliverable; the deployer
+  no longer calls it.
+- Docs (README, deploy-quickstart, install-images) rewritten Python-only.
+
+Validation: py_compile clean; all 7 YAMLs deploy-dry-run on BOTH
+incus and libvirt; launch + inventory subcommands work; real
+build_config_drive produces an xpf-config ISO (xpf.conf + node-id)
+validated by check-config; example .conf still pass the gate; no
+dangling references to the removed scripts.
