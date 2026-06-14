@@ -221,28 +221,94 @@ def deploy_incus(ap, runner, start):
         print(f"{name} created (not started): incus start {name}")
 
 
+def memory_mb(val):
+    """'4GiB'/'4096MiB'/4096/'4G' -> MB integer for virt-install."""
+    s = str(val).strip()
+    m = re.fullmatch(r"(\d+)\s*([GMgm]i?[Bb]?)?", s)
+    if not m:
+        die(f"unparseable memory '{val}'")
+    n = int(m.group(1))
+    unit = (m.group(2) or "M").upper()
+    return n * 1024 if unit.startswith("G") else n
+
+
+def pci_parts(addr):
+    """'0000:09:00.2' -> dict of hex domain/bus/slot/function for libvirt."""
+    m = re.fullmatch(r"([0-9a-fA-F]{4}):([0-9a-fA-F]{2}):([0-9a-fA-F]{2})\.([0-7])", addr)
+    if not m:
+        die(f"pci address '{addr}' is not DDDD:BB:DD.F")
+    return {"domain": "0x" + m.group(1), "bus": "0x" + m.group(2),
+            "slot": "0x" + m.group(3), "function": "0x" + m.group(4)}
+
+
 def deploy_libvirt(ap, runner, start):
-    """Emit a virt-install command (NIC order = positional name order)."""
+    """Emit a virt-install command. NIC order on the command line becomes
+    the persisted guest <address> PCI-slot order, which the guest then
+    names positionally — same contract as incus."""
     name = ap["name"]
     iso = build_config_drive(ap, runner)
-    argv = ["virt-install", "--name", name, "--memory",
-            str(ap["memory"]).rstrip("GiB") or "4096" if "GiB" not in str(ap["memory"]) else "4096",
+    disk = f"/var/lib/libvirt/images/{ap['image']}.qcow2"
+    argv = ["virt-install", "--name", name,
+            "--memory", str(memory_mb(ap["memory"])),
             "--vcpus", str(ap["cpu"]), "--import",
-            "--disk", f"path=/var/lib/libvirt/images/{ap['image']}.qcow2",
+            "--disk", f"path={disk}",
             "--osinfo", "ubuntu26.04", "--noautoconsole"]
     if iso:
         argv += ["--disk", f"path={iso},device=cdrom"]
+    notes = []
     for ic in ap["interfaces"]:
-        b, src = ic["backing"], str(ic["source"])
+        b, src, mac = ic["backing"], str(ic["source"]), ic.get("mac")
         if b in ("net", "bridge"):
-            argv += ["--network", f"bridge={src}"]
+            # incus managed net has no libvirt analogue — both map to a
+            # host bridge / libvirt network by name.
+            kind = "network" if b == "net" else "bridge"
+            net = f"{kind}={src},model=virtio"
+            if mac:
+                net += f",mac.address={mac}"
+            argv += ["--network", net]
         elif b == "macvlan":
-            argv += ["--network", f"type=direct,source={src},source_mode=bridge"]
-        elif b in ("pci", "physical", "sriov"):
-            argv += ["--hostdev", src + (f",mac.address={ic['mac']}" if ic.get("mac") else "")]
-    print("# virt-install (NIC order = positional name order); pin guest <address> "
-          "slots in `virsh edit` for fully contractual hardware ordering:")
+            net = f"type=direct,source={src},source_mode=bridge,model=virtio"
+            if mac:
+                net += f",mac.address={mac}"
+            argv += ["--network", net]
+        elif b == "physical":
+            argv += ["--hostdev", src]   # whole card, keeps burned-in MAC
+        elif b == "pci":
+            if mac:
+                # SR-IOV VF with a pinned MAC -> hostdev-network form so
+                # libvirt programs the VF MAC on the PF before assignment.
+                p = pci_parts(src)
+                argv += ["--network",
+                         "type=hostdev,"
+                         f"source.address.type=pci,source.address.domain={p['domain']},"
+                         f"source.address.bus={p['bus']},source.address.slot={p['slot']},"
+                         f"source.address.function={p['function']},mac.address={mac}"]
+            else:
+                argv += ["--hostdev", src]   # raw VF/PF passthrough
+        elif b == "sriov":
+            # libvirt has no "pick a free VF on this PF" device; the
+            # idiomatic equivalent is a <forward mode='hostdev'> VF pool
+            # network named after the PF (one-time host setup).
+            pool = f"{src}-vfpool"
+            net = f"network={pool}"
+            if mac:
+                net += f",mac.address={mac}"
+            argv += ["--network", net]
+            notes.append(
+                f"sriov:{src} -> libvirt VF pool '{pool}'. Define it once:\n"
+                f"      <network><name>{pool}</name>"
+                f"<forward mode='hostdev' managed='yes'>"
+                f"<pf dev='{src}'/></forward></network>\n"
+                f"      virsh net-define <file> && virsh net-start {pool} "
+                f"&& virsh net-autostart {pool}")
+    print("# virt-install — NIC order = guest PCI-slot order = positional names.")
+    print("# For fully contractual hardware ordering, pin guest <address> slots in `virsh edit`.")
+    for n in notes:
+        print(f"# NOTE: {n}")
     runner.run(argv)
+    if start:
+        print(f"\n{name}: after boot, verify with "
+              f"`virsh console {name}` then `cli -c \"show interfaces terse\"`.")
 
 
 def main():

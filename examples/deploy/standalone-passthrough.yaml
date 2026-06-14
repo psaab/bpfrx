@@ -1,0 +1,28 @@
+# xpf standalone — dataplane on whole physical cards / specific VFs via
+# VFIO passthrough (mgmt on a bridge). This definition is HYPERVISOR-
+# PORTABLE: `pci:` maps to an incus pci device and to a libvirt <hostdev>
+# / hostdev-network identically, so the same file deploys on both:
+#   scripts/deploy/xpf-deploy.py                 examples/deploy/standalone-passthrough.yaml
+#   scripts/deploy/xpf-deploy.py --hypervisor libvirt examples/deploy/standalone-passthrough.yaml
+#
+# Find PCI addresses with examples/deploy/show-host-nics.sh. A bare PF
+# address = whole-card passthrough (keeps burned-in MAC; drop mac). A VF
+# address WITH mac = the launcher/libvirt pins the VF MAC on the PF.
+appliance:
+  name: fw1
+  mode: standalone
+  image: xpf-appliance
+  cpu: 4
+  memory: 4GiB
+  config: standalone.conf
+interfaces:
+  - role: fxp0                 # pos 1 — mgmt, DHCP (virtio bridge)
+    backing: bridge
+    source: br-mgmt
+  - role: ge-0/0/0             # pos 2 — LAN, SR-IOV VF by PCI address
+    backing: pci
+    source: "0000:08:00.2"
+    mac: "02:bf:72:20:00:00"
+  - role: ge-0/0/1             # pos 3 — WAN, whole PF (native XDP)
+    backing: pci
+    source: "0000:09:00.0"     # no mac: whole-PF keeps its hardware MAC

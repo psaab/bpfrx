@@ -39,23 +39,82 @@ scripts/deploy/xpf-deploy.py examples/deploy/ha-fw0.yaml examples/deploy/ha-fw1.
 **Imperative — `xpf-launch.sh`:** the same thing as one command line
 with ordered `--nic` flags (no YAML). Good for one-offs and scripting.
 
-| File | What it is |
-|---|---|
-| `standalone.yaml` / `ha-fw0.yaml` / `ha-fw1.yaml` | **YAML deployment definitions** (role-validated) |
-| `standalone.conf` | 3-NIC LAN→WAN NAT firewall config (check-config-valid) |
-| `ha-pair.conf` | one config for both HA nodes (check-config-valid for `-node-id 0` and `1`) |
-| `show-host-nics.sh` | inventory host PFs/VFs/PCI-addresses/bridges → values for the recipes |
-| `ha-bridges.sh` / `ha-sriov.sh` / `ha-physical.sh` | runnable imperative HA launchers, one per NIC backing |
+| File | Topology | Backing |
+|---|---|---|
+| `standalone.yaml` | standalone | all bridges (simplest) |
+| `standalone-sriov.yaml` | standalone | mgmt bridge + SR-IOV VF dataplane |
+| `standalone-passthrough.yaml` | standalone | mgmt bridge + PCI passthrough (incus **and** libvirt) |
+| `ha-fw0.yaml` / `ha-fw1.yaml` | HA pair | all bridges |
+| `ha-fw0-sriov.yaml` / `ha-fw1-sriov.yaml` | HA pair | bridges + SR-IOV VF dataplane |
+| `standalone.conf` / `ha-pair.conf` | — | xpf.conf shipped on the day-0 drive (check-config-valid) |
+| `show-host-nics.sh` | — | inventory host PFs/VFs/PCI-addresses/bridges |
+| `ha-bridges.sh` / `ha-sriov.sh` / `ha-physical.sh` | HA pair | imperative (no-YAML) equivalents |
 
-Both paths accept `--dry-run` to preview the exact `incus` commands.
-Per-interface backings: `net:` (incus managed network), `bridge:`,
-`macvlan:`, `sriov:` (incus-allocated VF, MAC pinned host-side), `pci:`
-(VFIO passthrough of a PF or specific VF; `,mac=` pins a VF),
-`physical:`.
+Both paths accept `--dry-run` to preview the exact commands. Backings:
+
+| Backing | incus | libvirt | XDP |
+|---|---|---|---|
+| `net:<name>` | managed network | `--network network=` | virtio (vhost) |
+| `bridge:<br>` | `nictype=bridged` | `--network bridge=` | virtio (vhost) |
+| `macvlan:<dev>` | `nictype=macvlan` | `--network type=direct` | virtio (vhost) |
+| `sriov:<PF>` | `nictype=sriov` (incus picks VF, pins MAC) | VF-pool network (`<PF>-vfpool`) | mlx5 native / iavf generic |
+| `pci:<addr>` | `pci` device | `--hostdev` / hostdev-network | native (real driver) |
+| `physical:<dev>` | `nictype=physical` | `--hostdev` | native (real driver) |
+
+`pci:<vf-addr>,mac=` (a specific VF with a pinned MAC) is the one form
+that deploys **identically on incus and libvirt** — prefer it when you
+want one definition for both. `sriov:<PF>` is the incus convenience
+(auto VF pick); on libvirt it maps to a one-time VF-pool network.
 
 ```bash
 examples/deploy/show-host-nics.sh        # see what your host has
 ```
+
+## incus vs libvirt — which, and how they differ
+
+Both run the *same* qcow2 and the *same* day-0 config drive; the only
+difference is how the VM and its NICs are declared. `xpf-deploy.py`
+speaks both — pick with `--hypervisor` (default `incus`):
+
+| | incus | libvirt / KVM |
+|---|---|---|
+| **Best for** | quick, scriptable, clusters of VMs; the project's own test fleet | existing KVM/`virsh` shops; fine-grained guest PCI control |
+| **Tool does** | runs `incus init` + `device add…` + `start` end-to-end | emits a `virt-install` command you run (idempotent re-runs are yours to manage) |
+| **NIC ordering** | device-name order (`dev00…`) → PCI slot → positional name | command-line `--network`/`--hostdev` order → persisted `<address>` slots; or pin slots in `virsh edit` for full control |
+| **SR-IOV (auto VF)** | `nictype=sriov parent=<PF>` — incus allocates a VF and pins its MAC | define a `<forward mode='hostdev'>` VF-pool network once; `xpf-deploy.py` prints the XML |
+| **SR-IOV (specific VF)** | `pci:<vf-addr>,mac=` — launcher pins the VF MAC via the PF | `pci:<vf-addr>,mac=` — libvirt pins the VF MAC before assignment |
+| **Whole-PF passthrough** | `pci:<pf-addr>` | `pci:<pf-addr>` → `--hostdev` |
+| **Day-0 drive** | `disk source=<iso>` device | `--disk path=<iso>,device=cdrom` |
+| **Console / CLI** | `incus exec <vm> -- cli` | `virsh console <vm>` then `cli` |
+
+The same `standalone-passthrough.yaml` deploys on either:
+
+```bash
+scripts/deploy/xpf-deploy.py                       examples/deploy/standalone-passthrough.yaml
+scripts/deploy/xpf-deploy.py --hypervisor libvirt  examples/deploy/standalone-passthrough.yaml
+```
+
+## YAML schema reference
+
+```yaml
+appliance:
+  name:     fw0            # required — instance name
+  mode:     standalone     # standalone | cluster
+  node_id:  0              # required iff cluster (0 or 1); stamps the day-0 drive
+  image:    xpf-appliance  # incus image alias / libvirt qcow2 basename
+  cpu:      4
+  memory:   4GiB           # 4GiB | 4096MiB | 4096 (MB)
+  config:   standalone.conf  # xpf.conf for the day-0 drive (path relative to the YAML)
+interfaces:                # ORDERED — position is the name (see the table above)
+  - role:    fxp0          # the name you EXPECT here; checked against position, fails on mismatch
+    backing: bridge        # net | bridge | macvlan | sriov | pci | physical
+    source:  br-mgmt       # network/bridge/dev name, or PCI address for pci:
+    mac:     02:bf:72:..   # optional; pins VF/virtio MAC (recommended for VFs)
+```
+
+`role` is optional but recommended — it makes the YAML self-documenting
+and turns an off-by-one into a launch-time error instead of a
+production surprise. Omit it and the tool just uses the positional name.
 
 ---
 

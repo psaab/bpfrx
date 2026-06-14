@@ -5322,3 +5322,7 @@ top.
 - **Timestamp**: 2026-06-13 09:55
   **Action**: #1879 — operator confirmed interface naming is POSITIONAL (assignName: pos→fxp0/em0/ge). Built YAML-driven deployer scripts/deploy/xpf-deploy.py (role↔position validation, day-0 drive build, incus+libvirt emit, --dry-run) + examples/deploy/{standalone,ha-fw0,ha-fw1}.yaml. Reframed docs to positional-primary (driver-class = robustness tiebreaker, coincides in normal layouts).
   **File(s)**: scripts/deploy/xpf-deploy.py, examples/deploy/{standalone,ha-fw0,ha-fw1}.yaml, examples/deploy/README.md, docs/deploy-quickstart.md
+
+- **Timestamp**: 2026-06-13 10:25
+  **Action**: #1879 comprehensive deploy samples — SR-IOV + passthrough YAMLs (standalone + HA), hardened libvirt code path (memory/PCI parsing, hostdev-network for VF+mac, VF-pool for sriov:), incus-vs-libvirt comparison + YAML schema reference + backing/XDP matrix in README. Same passthrough YAML deploys on both hypervisors.
+  **File(s)**: scripts/deploy/xpf-deploy.py, examples/deploy/{standalone-sriov,standalone-passthrough,ha-fw0-sriov,ha-fw1-sriov}.yaml, examples/deploy/README.md
