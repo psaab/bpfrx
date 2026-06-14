@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"sort"
+	"strconv"
 )
 
 // StableTunnelEndpointID maps a tunnel interface name (unit-qualified,
@@ -33,9 +34,26 @@ func StableTunnelEndpointID(name string) uint16 {
 // endpoint names declared under one "interfaces" hierarchy node,
 // mirroring buildTunnelEndpointSnapshots naming exactly:
 //
-//   - interface-level tunnel, no units  -> "name"
-//   - interface-level tunnel with units -> "name.N" per unit
-//   - unit-level tunnel                 -> "name.N"
+//   - interface-level tunnel, no COMPILABLE units -> "name"
+//   - interface-level WIREGUARD tunnel with units -> "name.N" of the
+//     lowest numeric unit only (one persistent TUN = one endpoint,
+//     #1910 r2/r3 Codex) — registering every unit would model ids the
+//     builder never publishes and could falsely reject a commit on a
+//     collision involving a never-emitted ref
+//   - interface-level non-WG tunnel with units    -> "name.N" per unit
+//   - unit-level tunnel                           -> "name.N"
+//
+// Every registered ref is the CANONICAL decimal form "%s.%d" of an
+// Atoi-parsed unit number, because that is all the builder can ever
+// emit: the typed compiler skips any unit whose name fails
+// strconv.Atoi (compiler_interfaces.go), so iface.Units holds ints
+// and the builder formats "%s.%d". Hashing a raw spelling diverges
+// both ways (#1910 r4/r5 Codex): `unit 01` must hash as "wg0.1" or
+// the gate misses a real collision on the emitted ref, and an
+// overflow-only spelling like `unit 999…9` must NOT register a raw
+// ref the builder cannot emit — with every unit unparseable,
+// iface.Units is empty and the builder emits the BARE interface ref,
+// so the gate registers the bare name in that case too.
 //
 // Handles both AST shapes (hierarchical merged keys and flat-set
 // single-key chains) via the same namedInstances helper the compiler
@@ -52,21 +70,77 @@ func collectTunnelEndpointNamesAST(ifacesNode *Node, out map[string]struct{}) {
 		if name == "" {
 			continue
 		}
-		hasIfaceTunnel := iface.FindChild("tunnel") != nil
+		tunnelNode := iface.FindChild("tunnel")
+		hasIfaceTunnel := tunnelNode != nil
 		units := namedInstances(iface.FindChildren("unit"))
-		if hasIfaceTunnel && len(units) == 0 {
-			out[name] = struct{}{}
-			continue
-		}
+		// Mirror the typed compiler's unit admission: only
+		// Atoi-parseable names become InterfaceUnit entries, and a
+		// duplicate spelling of the same number (`unit 00` then
+		// `unit 0`) OVERWRITES — the compiler does
+		// `ifc.Units[unitNum] = unit` per instance, so the LAST
+		// declared instance wins and only ITS tunnel node counts
+		// (#1910 r6 Codex: sticky-OR here would falsely reject a
+		// collision on a ref whose tunnel lives only on an
+		// overwritten earlier instance).
+		unitNums := make([]int, 0, len(units))
+		unitTunnel := make(map[int]bool, len(units))
 		for _, unit := range units {
-			if unit.name == "" {
+			n, err := strconv.Atoi(unit.name)
+			if err != nil {
 				continue
 			}
-			if hasIfaceTunnel || unit.node.FindChild("tunnel") != nil {
-				out[fmt.Sprintf("%s.%s", name, unit.name)] = struct{}{}
+			if _, seen := unitTunnel[n]; !seen {
+				unitNums = append(unitNums, n)
+			}
+			unitTunnel[n] = unit.node.FindChild("tunnel") != nil
+		}
+		if hasIfaceTunnel {
+			if len(unitNums) == 0 {
+				// No unit compiles (none declared, or none parses):
+				// the builder sees len(iface.Units)==0 and emits the
+				// bare interface ref.
+				out[name] = struct{}{}
+				continue
+			}
+			if astTunnelModeWireguard(tunnelNode) {
+				lowest := unitNums[0]
+				for _, n := range unitNums[1:] {
+					if n < lowest {
+						lowest = n
+					}
+				}
+				out[fmt.Sprintf("%s.%d", name, lowest)] = struct{}{}
+				continue
+			}
+			for _, n := range unitNums {
+				out[fmt.Sprintf("%s.%d", name, n)] = struct{}{}
+			}
+			continue
+		}
+		for _, n := range unitNums {
+			if unitTunnel[n] {
+				out[fmt.Sprintf("%s.%d", name, n)] = struct{}{}
 			}
 		}
 	}
+}
+
+// astTunnelModeWireguard reports whether a tunnel AST node carries an
+// explicit `mode wireguard` — the exact extraction the compiler uses
+// for TunnelConfig.Mode (prop Keys[1], compiler_interfaces.go), so the
+// collision gate's single-endpoint selection matches the compiled
+// outcome by construction. The compiler's prefix-derived default mode
+// is only ever gre/ipip, so wireguard is always explicit.
+func astTunnelModeWireguard(tunnelNode *Node) bool {
+	if tunnelNode == nil {
+		return false
+	}
+	for _, prop := range tunnelNode.Children {
+		if prop.Name() == "mode" && len(prop.Keys) >= 2 && prop.Keys[1] == "wireguard" {
+			return true
+		}
+	}
+	return false
 }
 
 // validateTunnelEndpointIDCollisionAST checks the UNION of tunnel

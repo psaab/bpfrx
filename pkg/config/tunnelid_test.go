@@ -98,6 +98,144 @@ func TestTunnelEndpointIDCollisionAcrossGroupsIsSymmetric(t *testing.T) {
 	}
 }
 
+// #1910 r3 Codex: the collision gate must not model endpoint ids the
+// snapshot builder never publishes. An interface-level WireGuard
+// tunnel with units emits exactly ONE endpoint (lowest unit ref), so
+// a collision involving a higher, never-emitted unit ref must not
+// reject the commit. Real collision under the frozen fold:
+// StableTunnelEndpointID("wg0.1") == StableTunnelEndpointID("wg341")
+// == 14730, but only "wg0.0" (16091) and "wg341" are published.
+func TestTunnelEndpointIDNoFalsePositiveOnNonEmittedWGUnit(t *testing.T) {
+	if a, b := StableTunnelEndpointID("wg0.1"), StableTunnelEndpointID("wg341"); a != b || a != 14730 {
+		t.Fatalf("precondition: wg0.1=%d wg341=%d, want both 14730 (frozen fold)", a, b)
+	}
+	tree := buildTree(t, []string{
+		"set interfaces wg0 tunnel mode wireguard",
+		"set interfaces wg0 unit 0 family inet address 10.70.0.1/30",
+		"set interfaces wg0 unit 1 family inet address 10.70.0.5/30",
+		"set interfaces wg341 tunnel mode wireguard",
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig rejected a config whose only id collision is on a never-emitted WG unit ref: %v", err)
+	}
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "collision") {
+			t.Fatalf("unexpected collision warning: %q", w)
+		}
+	}
+}
+
+// #1910 r4 Codex: a non-canonical numeric unit spelling (`unit 01`)
+// compiles to unit 1 and the builder emits/hashes the canonical
+// "wg0.1" — the gate must hash the SAME canonical ref, or it misses
+// the frozen wg0.1/wg341 collision (14730) and the runtime usedIDs
+// belt silently drops an endpoint instead of failing the commit.
+func TestTunnelEndpointIDLeadingZeroUnitStillCollides(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set interfaces wg0 tunnel mode wireguard",
+		"set interfaces wg0 unit 01 family inet address 10.70.0.1/30",
+		"set interfaces wg341 tunnel mode wireguard",
+	})
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatalf("CompileConfig accepted a builder-emitted collision hidden behind a leading-zero unit spelling (wg0.01 -> emits wg0.1, collides with wg341)")
+	}
+	for _, want := range []string{"wg0.1", "wg341", "collision"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("collision error %q does not mention %q", err.Error(), want)
+		}
+	}
+}
+
+// #1910 r5 Codex: an interface-level WG tunnel whose ONLY unit
+// spelling overflows strconv.Atoi compiles with iface.Units empty, so
+// the builder emits the BARE interface ref — the gate must hash that
+// bare ref, not the raw overflow spelling (which hashes elsewhere and
+// would let a real builder-emitted collision pass strict compile,
+// landing on the runtime usedIDs drop instead of failing commit).
+// Frozen collision: StableTunnelEndpointID("wg0") ==
+// StableTunnelEndpointID("wg34524.0") == 17799.
+func TestTunnelEndpointIDOverflowOnlyUnitHashesBareRef(t *testing.T) {
+	if a, b := StableTunnelEndpointID("wg0"), StableTunnelEndpointID("wg34524.0"); a != b || a != 17799 {
+		t.Fatalf("precondition: wg0=%d wg34524.0=%d, want both 17799 (frozen fold)", a, b)
+	}
+	tree := buildTree(t, []string{
+		"set interfaces wg0 tunnel mode wireguard",
+		"set interfaces wg0 unit 99999999999999999999999999999999999999 family inet address 10.70.2.1/30",
+		"set interfaces wg34524 unit 0 tunnel mode wireguard",
+	})
+	if _, err := CompileConfig(tree); err == nil {
+		t.Fatalf("CompileConfig accepted a builder-emitted collision hidden behind an overflow-only unit spelling (wg0 emits bare ref, collides with wg34524.0)")
+	}
+}
+
+// The same canonicalization must hold on the per-unit branches: a
+// UNIT-LEVEL tunnel declared as `unit 01` compiles to unit 1 and the
+// builder emits "wg0.1" — the gate must hash the canonical ref there
+// too, or it misses the frozen wg0.1/wg341 collision (14730).
+func TestTunnelEndpointIDUnitLevelLeadingZeroStillCollides(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set interfaces wg0 unit 01 tunnel mode wireguard",
+		"set interfaces wg341 tunnel mode wireguard",
+	})
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatalf("CompileConfig accepted a builder-emitted collision hidden behind a unit-level leading-zero spelling (wg0.01 -> emits wg0.1, collides with wg341)")
+	}
+	for _, want := range []string{"wg0.1", "wg341", "collision"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("collision error %q does not mention %q", err.Error(), want)
+		}
+	}
+}
+
+// #1910 r6 Codex: duplicate spellings of the same unit number must
+// follow the typed compiler's LAST-WINS overwrite
+// (ifc.Units[unitNum] = unit per instance). When `unit 00` carries
+// the tunnel but a later `unit 0` re-declares the unit without one,
+// the compiled unit has no tunnel and the builder emits nothing — the
+// gate must not register the ref (false reject). When the order is
+// reversed the tunnel-carrying instance wins and the collision is
+// real.
+func TestTunnelEndpointIDDuplicateUnitSpellingLastWins(t *testing.T) {
+	// Tunnel on the OVERWRITTEN earlier instance: no endpoint emitted,
+	// so the wg1408.0/wg78.0 collision (both refs would collide if
+	// emitted) must NOT reject the commit.
+	tree := buildTree(t, []string{
+		"set interfaces wg1408 unit 00 tunnel mode wireguard",
+		"set interfaces wg1408 unit 0 family inet address 10.70.3.1/30",
+		"set interfaces wg78 unit 0 tunnel mode wireguard",
+	})
+	if _, err := CompileConfig(tree); err != nil {
+		t.Fatalf("CompileConfig rejected a collision on a ref whose tunnel lives only on an overwritten duplicate unit instance: %v", err)
+	}
+	// Tunnel on the LAST instance: the unit compiles with the tunnel,
+	// the builder emits wg1408.0, and the collision must reject.
+	tree = buildTree(t, []string{
+		"set interfaces wg1408 unit 00 family inet address 10.70.3.1/30",
+		"set interfaces wg1408 unit 0 tunnel mode wireguard",
+		"set interfaces wg78 unit 0 tunnel mode wireguard",
+	})
+	if _, err := CompileConfig(tree); err == nil {
+		t.Fatalf("CompileConfig accepted a real collision whose tunnel lives on the last duplicate unit instance (wg1408.0 vs wg78.0)")
+	}
+}
+
+// And the inverse: a collision on the EMITTED lowest unit ref of an
+// interface-level WG tunnel must still be rejected.
+func TestTunnelEndpointIDCollisionOnEmittedWGUnitStillRejected(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set interfaces wg1408 tunnel mode wireguard",
+		"set interfaces wg1408 unit 0 family inet address 10.70.1.1/30",
+		"set interfaces wg1408 unit 1 family inet address 10.70.1.5/30",
+		"set interfaces wg78 unit 0 tunnel mode wireguard",
+	})
+	if _, err := CompileConfig(tree); err == nil {
+		t.Fatalf("CompileConfig accepted a collision on the emitted lowest unit ref (wg1408.0 vs wg78.0)")
+	}
+}
+
 // Non-colliding multi-tunnel configs must compile clean (no false
 // positives from the gate).
 func TestTunnelEndpointIDNoFalsePositive(t *testing.T) {

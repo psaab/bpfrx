@@ -5334,3 +5334,29 @@ top.
 - **Timestamp**: 2026-06-13 12:10
   **Action**: #1879 image-build tooling shell->Python: bake.py, validate.py, make_config_drive.py (replace bake-image.sh/validate-image.sh/make-config-drive.sh); Makefile image target -> bake.py; docs updated. In-guest xpf-day0-config + incus-agent-setup kept as shell (boot-critical, flagged). Filed #1917 in-place upgrade follow-on.
   **File(s)**: scripts/image/{bake,validate,make_config_drive}.py (+removed 3 .sh), Makefile, docs/install-images.md, docs/pr/1879-pathc/deploy-delta-reviewer-ids.md
+- **Timestamp**: 2026-06-12 ~13:25 PT
+  **Action**: #1904 + #1905 combined /engineer lane (both filed from the #1884 research). #1904: shared riMemberLinuxName now resolves RI tunnel list members through cfg.TunnelNameMap() (compiler-assigned TunnelConfig.Name verbatim — exact device-name parity by construction), so unit>0 members like gr-0/0/0.1 bind the real uN device (gr-0-0-0u1); non-tunnel refs keep the literal transform byte-identically. #1905: applyWireguardTunLocked passes/stores t.appliedAddrs like the GRE branch, so a CONFIGURED fe80 removed from config reconciles away while kernel-autonomous fe80s are never touched. Live on loss userspace cluster: 10/10 PASS (gr-0-0-1u1 master vrf-vrf1904; configured fe80 removed, foreign fe80::beef + kernel stable-privacy LL survive). go build/test/-race clean.
+  **File(s)**: pkg/daemon/{daemon_run.go,daemon_apply.go,tunnel_anchor_test.go}, pkg/routing/{tunnel.go,tunnel_reconcile_test.go}, docs/pr/1904-routing-followups/, _Log.md
+
+- **Timestamp**: 2026-06-12 15:55
+  **Action**: #1910 Codex r5 fix — parse-gated canonical refs in collectTunnelEndpointNamesAST (bare-ref when no unit parses; canonical %s.%d on all branches incl. non-WG/unit-level) + 2 regressions (overflow-only WG unit wg0/wg34524.0=17799; unit-level leading-zero wg0.01→wg0.1/wg341=14730). Lane agent died at spend limit; finishing inline.
+  **File(s)**: pkg/config/tunnelid.go, pkg/config/tunnelid_test.go, docs/pr/1904-routing-followups/reviewer-ids.md
+
+- **Timestamp**: 2026-06-12 16:20
+  **Action**: #1910 Codex r6 — fixed duplicate-unit last-wins divergence in collision gate (overwrite mirrors ifc.Units[unitNum]=unit) + regression; adjudicated findings (b)/(c) pre-existing → filed #1914 (folds verified independently).
+  **File(s)**: pkg/config/tunnelid.go, pkg/config/tunnelid_test.go, docs/pr/1904-routing-followups/reviewer-ids.md
+- **Timestamp**: 2026-06-12
+  **Action**: #1902 — gate pending_neigh admission on owned_packet_frame.is_none() (GRE-decapped packets refused, counted via pending_neigh_decap_drops); status/wire/Prometheus plumbing; 3 deterministic pins; plan doc + architecture doc pairing contract.
+  **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs, userspace-dp/src/afxdp/umem/mod.rs, userspace-dp/src/afxdp/coordinator/status.rs, userspace-dp/src/server/{helpers,lifecycle}.rs, userspace-dp/src/protocol/control.rs, userspace-dp/src/afxdp/tests.rs, pkg/dataplane/userspace/protocol.go, pkg/api/{metrics.go,metrics_userspace.go,metrics_descriptors.go,metrics_descriptor_coverage_test.go}, docs/pr/1902-pending-neigh/plan.md, docs/userspace-dataplane-architecture.md
+- **Timestamp**: 2026-06-12 ~13:55
+  **Action**: #1902 PR #1911 — recorded Codex r1 (MERGE-READY, 1 Low adjudicated), AGY r1 (MERGE-READY), Claude SMR r1 (MERGE-READY, byte-trace) in reviewer ledger
+  **File(s)**: docs/pr/1902-pending-neigh/reviewer-ids.md
+- **Timestamp**: 2026-06-12 ~14:05
+  **Action**: #1902 live validation — r1 vacuous (lanhost gre module missing, fixed via modprobe ip_gre on loss host), r2 gate fired (counter 0->1, 0 corrupt frames), wrote r3 diagnostic script to localize round-3 loss
+  **File(s)**: tmp/v1902b.sh
+- **Timestamp**: 2026-06-12 ~14:10
+  **Action**: #1902 live validation r3 complete — gate counter 1->4 across cold windows, 0 corrupt frames, 18/18 inner delivery, retry dwell <1ms x2; recorded trail in ledger
+  **File(s)**: docs/pr/1902-pending-neigh/reviewer-ids.md
+- **Timestamp**: 2026-06-12 ~14:25
+  **Action**: #1902 — posted live-validation PR comment, filed follow-ups #1912 (encap reply blackhole) + #1913 (unfiltered trailing reinject), Copilot 3x quota-limited -> 3-of-4 fallback recorded
+  **File(s)**: docs/pr/1902-pending-neigh/reviewer-ids.md

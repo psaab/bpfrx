@@ -474,6 +474,19 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// `Coordinator::pending_neigh_duplicate_drops_total()` (Prometheus
     /// `xpf_userspace_pending_neigh_duplicate_drops_total`).
     pub(super) pending_neigh_duplicate_drops: AtomicU64,
+    /// #1902: per-binding count of GRE-decapped MissingNeighbor packets
+    /// REFUSED pending_neigh admission. A decapped packet's `desc`
+    /// references the un-decapped OUTER UMEM frame while `meta`/decision
+    /// describe the synthetic INNER frame, so the retry path's in-place
+    /// rewrite+TX would transmit a mis-rewritten outer packet. Refused
+    /// candidates are recycled; the trailing decap-aware slow-path
+    /// chokepoint (#1901) still delivers the inner packet to the kernel.
+    /// Counted only when the packet would otherwise have been an
+    /// admission candidate (non-tunnel decision with a next_hop, seed
+    /// not refused). Surfaced via
+    /// `Coordinator::pending_neigh_decap_drops_total()` (Prometheus
+    /// `xpf_userspace_pending_neigh_decap_drops_total`).
+    pub(super) pending_neigh_decap_drops: AtomicU64,
     /// #1771 §2.6: distinct unresolved `(egress_ifindex, next_hop)` keys
     /// currently buffered in this binding's `pending_neigh` map (gauge —
     /// post-#1779 §2.2 the map holds at most ONE representative packet
@@ -744,6 +757,7 @@ impl BindingLiveState {
             no_owner_binding_drops: AtomicU64::new(0),
             neg_neigh_fast_fail: AtomicU64::new(0),
             pending_neigh_duplicate_drops: AtomicU64::new(0),
+            pending_neigh_decap_drops: AtomicU64::new(0),
             pending_neigh_keys: AtomicU64::new(0),
             neg_neigh_keys: AtomicU64::new(0),
             session_publish_errors: AtomicU64::new(0),

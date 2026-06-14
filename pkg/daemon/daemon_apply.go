@@ -217,14 +217,18 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 	// Name normalization is shared with collectAppliedTunnels'
 	// RIListMember scan via riMemberLinuxName (#1884) so the tunnel
 	// manager's unbind veto can never diverge from what this loop
-	// actually binds.
+	// actually binds. Tunnel list members resolve through
+	// cfg.TunnelNameMap() (#1904) so a unit>0 entry like gr-0/0/0.1
+	// binds the real per-unit device (gr-0-0-0u1), not the literal
+	// ".1" name.
 	if d.routing != nil {
+		tunMap := cfg.TunnelNameMap()
 		for _, ri := range cfg.RoutingInstances {
 			if ri.InstanceType == "forwarding" {
 				continue
 			}
 			for _, ifaceName := range ri.Interfaces {
-				linuxName := riMemberLinuxName(ifaceName)
+				linuxName := riMemberLinuxName(tunMap, ifaceName)
 				if err := d.routing.BindInterfaceToVRF(linuxName, ri.Name); err != nil {
 					slog.Warn("failed to bind interface to VRF",
 						"interface", ifaceName, "linux", linuxName,
