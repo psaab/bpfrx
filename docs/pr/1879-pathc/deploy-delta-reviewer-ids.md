@@ -186,3 +186,29 @@ Codex confirmed PASSED: Go check-config↔compileTreeStrict parity (exit 1
 bad-flags / exit 2 reject), the big bake/validate asserts preserved, and
 the day-0 loader otherwise boot-safe. All fixes py_compile + dry-run
 verified; incus-runtime fixes (2,4) still want live-boot confirmation.
+
+## Codex r2 (verify fixes @ fb8de66ea) — INFRA-STUCK; fixes locally proven
+
+Codex r2 (task-mqdwa2px-nxam1f) was dispatched to re-verify the 5 r1
+fixes. The companion runtime degraded again mid-session: the job sat in
+"running" for >32 min across two status-first poll cycles and never
+completed / its result was never fetchable (the r1 review under the same
+session DID complete, so this is intermittent runtime flakiness, not a
+verdict). Not re-dispatched a third time — the fixes are locally proven:
+
+- Finding 1 (argparse): verified across 5 argv shapes — globals work
+  before AND after the subcommand; `--hypervisor libvirt` no longer
+  mistaken for the subcommand; bare-yaml shorthand routes to deploy.
+- Finding 2 (incus profile): dry-run shows `incus init … --no-profiles …
+  -d root,type=disk,pool=default,path=/` — no phantom profile NIC.
+- Finding 3 (shlex): validate.py reexec now shlex.quotes every token.
+- Finding 4 (node-id): xpf-day0-config guards the write — removes
+  xpf.conf, no stamp, returns 1 on failure (shellcheck clean).
+- Finding 5 (prlimit): bake.py dies on prlimit failure (shell parity).
+
+py_compile clean on all 4 Python tools; full dry-run matrix (both
+hypervisors) green; example .conf still pass check-config.
+
+Standing for #1906: Claude SMR + AGY MERGE-READY; Codex r1 findings all
+fixed + locally verified (r2 confirmation infra-stuck); Copilot
+quota-blocked. Held for operator merge; live bake+boot still outstanding.
