@@ -268,3 +268,16 @@ Claude SMR verified the embedded config + commands. All 7 fixed:
 Codex VERIFIED OK: the xpf-deploy.py CLI surface matches the docs; the
 Tier-2 router config + standalone.conf + ha-pair.conf (both node-ids)
 pass check-config; incus syntax valid (6.21); cross-refs resolve.
+
+## Live Tier-2 deployment (virtio incus) — image/control-plane GREEN, forwarding venue-blocked
+
+Ran the documented Tier-2 standalone deploy against the baked image.
+- FIXED: incus init `-d root,...` single-flag syntax was invalid; now three
+  -d flags. --no-profiles + explicit root confirmed: VM boots, no phantom NIC.
+- GREEN: image boot; day-0 loader installed router-test.conf; xpfd committed;
+  ge-0/0/0=10.66.1.1/24+fd66:1::1, ge-0/0/1=10.66.2.1/24+fd66:2::1 up;
+  positional naming correct; lanhost->gateway ping 0-loss (control plane).
+- BLOCKED (venue, not image bug): AF_XDP helper loops `libxdp private bind:
+  Device or resource busy` on virtio multi-queue; can't reduce channels
+  ("too low for existing zerocopy AF_XDP sockets"); 0 transit sessions.
+  Forwarding needs mlx5-VF (loss) / i40e-PF (standalone VM). Doc corrected.

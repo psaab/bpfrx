@@ -5372,3 +5372,5 @@ top.
 
 - **Timestamp**: 2026-06-15 — #1879 doc triple-review: Codex MERGE-NEEDS-MAJOR (7 real defects), AGY MERGE-READY, Claude SMR verified embedded config/commands. Fixed all 7 (Tier-2 tools+v6 SNAT, Tier-3 failover node, HA network names match YAML, README config path, naming slash/dash, Tier-1 precision, virtio generic-class).
   **File(s)**: docs/image-validation.md, docs/deploy-quickstart.md, examples/deploy/README.md, docs/pr/1879-pathc/deploy-delta-reviewer-ids.md
+
+- **2026-06-15** #1879 live Tier-2: fixed incus -d root syntax in xpf-deploy.py; image boot+day-0+control-plane GREEN; forwarding blocked on virtio (AF_XDP bind busy loop) — venue limitation, doc corrected (virtio not a forwarding venue).

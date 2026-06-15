@@ -295,9 +295,11 @@ def deploy_incus(ap, runner, start):
     # disk explicitly from the storage pool (default "default", override
     # with `pool:` in YAML) so the device set is EXACTLY the declared NICs.
     pool = ap.get("pool", "default")
+    # incus -d sets ONE key=value per flag (<device>,<key>=<value>), so the
+    # root disk needs three -d flags, not one comma-joined value.
     runner.run(["incus", "init", ap["image"], name, "--vm", "--no-profiles",
                 "-c", f"limits.cpu={ap['cpu']}", "-c", f"limits.memory={ap['memory']}",
-                "-d", f"root,type=disk,pool={pool},path=/"])
+                "-d", "root,type=disk", "-d", f"root,pool={pool}", "-d", "root,path=/"])
     pins = []
     for i, ic in enumerate(ap["interfaces"]):
         dev = f"dev{i:02d}"

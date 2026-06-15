@@ -76,6 +76,21 @@ self-contained on one incus host: the appliance is the L3 gateway, the
 LAN/WAN segments are pure L2 bridges, and interface SNAT means the WAN
 endpoint needs no route back.
 
+> **VENUE WARNING (verified 2026-06-15 live run).** The AF_XDP userspace
+> dataplane does NOT forward over **virtio** NICs in a plain incus VM: the
+> helper loops on `libxdp private bind: Device or resource busy` against
+> virtio multi-queue and never converges (you can't even drop the channel
+> count — "too low for existing zerocopy AF_XDP sockets"). On virtio,
+> everything up to and including the control plane works — boot, day-0
+> install/commit, interface bring-up with the configured addresses, and
+> the gateway is pingable (host-inbound) — but **L3 transit forwarding
+> yields 0 sessions**. Run the *forwarding* assertions only on a venue
+> with a real AF_XDP NIC: **mlx5 SR-IOV VFs** (the loss userspace cluster)
+> or **i40e PF passthrough** (the standalone test VM). On incus/virtio,
+> treat Tier 2 as a **control-plane + day-0 + interface-bring-up** check
+> (steps through "confirm the interface map" below), not a forwarding
+> proof.
+
 ### Topology
 
 ```
@@ -94,11 +109,10 @@ endpoint needs no route back.
 NIC order = interface name (positional contract). Names are shown in
 config/CLI slash form (`ge-0/0/0`); the Linux link name is the dash form
 (`ge-0-0-0`) that `assignName()` produces — the config layer translates
-between them. All NICs here are virtio bridges; virtio exercises the full
-userspace AF_XDP forwarding/NAT path, but treat it as **generic-XDP
-class** for planning (the same stance `xpf-deploy.py inventory` reports
-for `virtio_net`) — native line-rate XDP is the mlx5/i40e-VF story, not
-the venue of this functional test.
+between them. NOTE (per the venue warning above): on incus/virtio the
+AF_XDP dataplane does NOT converge its multi-queue bindings, so this
+topology validates control-plane + day-0 + interface bring-up, NOT
+transit forwarding. Run the forwarding assertions on mlx5-VF / i40e-PF.
 
 ### Host networks
 
@@ -255,11 +269,15 @@ Delete `fw0`/`fw1` and the five `xpf-ha-*` networks.
 
 ## Honest scope
 
-- Tiers 2–3 here run on **virtio** NICs (local incus bridges). That
-  exercises the full forwarding/NAT/HA control path but **not** mlx5/i40e
-  native-XDP line-rate behavior — for line-rate numbers use the loss
-  userspace cluster's SR-IOV smoke matrix (`docs/`), which tests the
-  *deployed binaries*, not a baked image.
+- **virtio is NOT a forwarding venue.** On local incus/virtio bridges the
+  AF_XDP dataplane fails to bind virtio multi-queue (`Device or resource
+  busy`, verified 2026-06-15), so Tiers 2–3 on virtio validate only boot +
+  day-0 + interface bring-up + control-plane reachability — NOT transit
+  forwarding/NAT/HA. Functional forwarding (and line-rate numbers) require
+  a real AF_XDP NIC: the loss userspace cluster's mlx5 SR-IOV VFs, or i40e
+  PF passthrough on the standalone test VM. The loss SR-IOV smoke matrix
+  (`docs/`) tests the *deployed binaries*; an image-based forwarding test
+  needs the image booted on one of those NIC venues.
 - The image is hardware-agnostic for these tiers: `verify-dataplane`
   and forwarding run against the image's own kernel + the userspace
   dataplane, so local KVM is a faithful functional venue.
