@@ -21,7 +21,18 @@ Plan rewritten to v2.
 r2 outcome: Codex KILL->NEEDS-MAJOR (progress). All 4 Codex findings addressed in
 v3. AGY r2 infra-timed-out -> re-dispatch fresh in r3.
 
-## Plan review round 3 (plan @ <pending>)
+## Plan review round 3 (plan @ 239d95501)
+| Reviewer | ID | Verdict |
+|---|---|---|
+| Codex | task-mqftqa63-k6xzr9 | PLAN-NEEDS-MAJOR (effective_rx_queues vs global-min uniform planner; 2 stale-text spots) |
+| AGY | adversarial-review-mqftqp2j-zyq5ff | PLAN-NEEDS-MINOR (CONFIRMED EBUSY root cause: rebind double-stop bypasses 500ms quiesce, rebind.rs:16 + teardown.rs:14-46) |
+
+r3 outcome: AGY confirmed the EBUSY-loop root cause in code (high value). Codex's
+blocker = the planner is global-min UNIFORM (helpers.rs:745, test
+main_tests.rs:609-631), so effective_rx_queues must be a uniform target + RSS
+constrain, not per-interface. v4 resolves both + scrubs stale gate text.
+
+## Plan review round 4 (plan @ <pending>)
 | Reviewer | ID | Verdict |
 |---|---|---|
 | Codex | <pending> | pending |

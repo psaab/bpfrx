@@ -1,14 +1,15 @@
 # #1921 — AF_XDP forwarding on virtio_net multi-queue: plan of action
 
-**Status:** DRAFT v2 — addresses r1 Codex PLAN-KILL + AGY PLAN-NEEDS-MAJOR +
-Claude SMR PLAN-NEEDS-MINOR. r1 corrections: (1) ring-mismatch refuted
-(queue_count tracks the registered set); (2) the all-or-nothing enable gate is
-NOT the cause — `armed` is a request flag, not bind success, so a failed bind
-does not trip it; the real mechanism is per-queue READY withholding → per-queue
-transit drop, and the *total* outage is most likely an EBUSY stale-socket race
-on rebind (unproven — Phase 0 decides). Fix reframed: Phase 0 first, then
-queue-reconciliation (driver-agnostic, ordering-correct) + teardown-before-rebind
-as likely co-primary.
+**Status:** DRAFT v4 — addresses Codex r3 PLAN-NEEDS-MAJOR (effective_rx_queues
+vs the global-min uniform planner; two stale-text scrubs) + AGY r3
+PLAN-NEEDS-MINOR (which CONFIRMED the EBUSY loop root cause in code). Evolution:
+r1 ring-mismatch refuted; r2 the all-or-nothing gate refuted (`armed` is a
+request flag); r3 the EBUSY loop pinned to a concrete bug — `rebind::handle`
+double-stops workers, so `tear_down`'s `had_live_workers` is false and the 500ms
+ZC-teardown quiesce is bypassed (verified, §3). Fix: primary = remove the rebind
+double-stop so the quiesce applies; surface-reducer = uniform-target channel/RSS
+reconciliation across all dataplane NICs (§6). Phase 0 confirms the
+first-attempt trigger + quiesce adequacy.
 
 ## 1. Issue framing
 
@@ -110,6 +111,30 @@ Phase 0 must capture, per queue: bind outcome (`bound`/`xsk_registered`/
 is chosen. The fix's shape (teardown-hardening vs channel-reconciliation vs
 both) depends on the answer.
 
+### CONFIRMED root cause of the EBUSY loop (AGY r3, verified in code)
+
+The rebind recovery path bypasses the very quiesce that exists to prevent this
+EBUSY. `rebind::handle` (`userspace-dp/src/server/handlers/rebind.rs:16`) calls
+`guard.afxdp.stop()` — which clears `coord.workers.handles` — *before*
+`reconcile_status_bindings` → `tear_down`. Inside `tear_down`
+(`coordinator/reconcile/teardown.rs:14`), `had_live_workers =
+!coord.workers.handles.is_empty()` therefore evaluates **false**, so the
+`thread::sleep(500ms)` quiesce at `teardown.rs:44-46` — whose comment says it
+"avoids EBUSY when a later snapshot refresh rebuilds the same queue set
+immediately after shutdown" (ZC queue teardown is async, not synchronously
+reusable) — is **skipped**. New socket creation races the kernel's still-pending
+`xsk_pool` teardown → EBUSY → the 5s bind-retry loop fails → the Go busy-binding
+watchdog fires after 5s → triggers another `rebind` → double-stop → quiesce
+skipped again → **infinite EBUSY/rebind loop**. This is the live failure's
+engine. The first-attempt EBUSY trigger (what kicks off the first rebind on a
+fresh virtio boot) is still for Phase 0 to confirm, but the *loop* — why it
+never recovers — is now code-proven. **Fix:** do not call `guard.afxdp.stop()`
+in `rebind::handle`; let the `reconcile`/`tear_down` pipeline stop workers so
+`had_live_workers` is captured truthfully and the 500ms quiesce applies. (Phase
+0 also validates whether 500ms is adequate for virtio ZC under load, or must be
+adaptive.) This likely makes the rebind-double-stop fix the **primary** fix and
+channel-reconciliation the surface-reducer.
+
 ## 4. What's already shipped / relevant
 
 - `select_userspace_queue` already *intends* ingress-queue-pinned handoff and has
@@ -126,11 +151,14 @@ both) depends on the answer.
 ## 5. Concrete design — Multiple Path Options
 
 The invariant to restore: **every NIC RSS-active queue has exactly one socket
-that actually binds + arms, and the enable gate does not require binds on queues
-the NIC will not deliver to.** Today the bound set = sysfs RX-queue count and
-`queue_count` already tracks the bound set (`queueCountFromBindings`), so the
-steering is self-consistent — the break is purely that surplus/unreliable queues
-fail to arm and the two all-or-nothing gates then disable everything.
+that actually binds + goes READY.** Today the bound set = sysfs RX-queue count
+and `queue_count` tracks the registered set (`queueCountFromBindings`), so the
+steering is self-consistent — the break is (1) the confirmed rebind double-stop
+that bypasses the ZC-teardown quiesce and loops on EBUSY (§3), and (2) the
+over-provisioned bound set, which multiplies the number of queues that must bind
+cleanly. (This is NOT a whole-dataplane enable-gate effect — per §3, `armed` is
+a request flag, so a failed bind does not trip `enabled`/`probeBindingsReady`;
+the per-queue effect is READY withholding → `binding_not_ready` transit drop.)
 
 ### Path A (RECOMMENDED) — reconcile NIC channels to `workers`
 
@@ -158,9 +186,11 @@ consistent). Effects:
 Tradeoff: virtio default `workers=1` caps the dataplane to one queue (≈ one
 core of AF_XDP throughput). Acceptable for the "labs/modest WAN" positioning;
 operators raise `set system … workers N` for more. Implementation touches:
-`replan_queues` (bind `0..workers`, not `0..rx_queue_count`), a new channel-pin
-step in the Go control plane (or helper) gated to dataplane virtio/iavf NICs and
-ordered before bind, and docs.
+`replan_queues` (its queue count comes from the reconciled `effective_rx_queues`
+in the snapshot — see §6 for the uniform-target constraint), a new
+channel-reconciliation step in the Go control plane applied to **every**
+dataplane NIC (not just virtio — see hazard 1) ordered before snapshot build,
+and docs.
 
 ### Path B — default `workers` to the NIC RX-queue count
 
@@ -252,22 +282,36 @@ the shim per-queue READY gate drops those packets anyway).
   `workers` already exist; we change how the bound set + NIC channels are
   derived, not the schema. (Confirm whether a new snapshot field is needed to
   carry "desired channels" vs computing in the helper.)
-- **`effective_rx_queues` invariant (resolves Codex r2 #2 contradiction).** The
-  bound set is NOT a blind `min(rx_queue_count, workers)`. It is the number of
-  RX queues the NIC will ACTUALLY RSS-deliver to after reconciliation:
-  - If channel reconciliation succeeded (or the NIC was already at the desired
-    count), `effective_rx_queues = workers` (clamped to hw max) and we bind
-    `0..effective_rx_queues-1`.
-  - If reconciliation was non-fatal-skipped (VF lacks `ethtool -L`, or it
-    failed), `effective_rx_queues = actual current RX-queue count` and we bind
-    ALL of them — never clamp to `workers` while the NIC still delivers on more
-    queues, or the shim's `rx_queue_index % queue_count` re-creates the
-    wrong-ring drop the plan warns about.
-  This value must be carried in the snapshot (Go computes it post-reconcile and
-  stamps `rx_queues`), since Rust trusts `snapshot.rx_queues` (`helpers.rs:698`)
-  — a helper-side recompute is too late (Codex #2/#3).
+- **`effective_rx_queues` invariant — UNIFORM across dataplane NICs (resolves
+  Codex r2 #2 and r3 main blocker).** Critical constraint:
+  `replan_bindings_from_candidates` (`helpers.rs:745`) takes the GLOBAL MINIMUM
+  queue count across all candidate interfaces and emits `0..queue_count` for
+  EVERY interface — a single uniform count, NOT per-interface (codified by
+  `queue_planner_uses_smallest_queue_count`, `main_tests.rs:609-631`). So the
+  reconciliation MUST produce one uniform target that every dataplane NIC
+  actually RSS-honors; a per-interface "bind all of NIC B's queues" is
+  unimplementable without reworking the planner. Definition:
+  - `target = min(workers, min hw-max-combined across reconcilable dataplane
+    NICs)` — uniform.
+  - For each dataplane NIC (fabric/generic parents excluded — hazard 5), make it
+    deliver only to `0..target-1`: prefer `ethtool -L combined target`; if the
+    driver lacks `-L` (many VFs), fall back to constraining the **RSS
+    indirection table** via `ethtool -X` to `0..target-1` (the codebase already
+    drives `-X`, `rss_indirection.go`). Either achieves "NIC delivers only to
+    the bound queues."
+  - If a NIC supports NEITHER `-L` nor `-X` and natively delivers on more than
+    `target`, uniformity is impossible without dropping its high-queue traffic.
+    Out of scope: **require homogeneous, constrainable dataplane NICs** (true for
+    both venues — all-virtio appliance, all-mlx5 loss). Document this limit; do
+    not silently clamp (the wrong-ring drop).
+  - The reconciliation is **transactional**: compute `target`, apply to all
+    dataplane NICs, verify each honors it, THEN build the snapshot stamping
+    `rx_queues = target` uniformly. Rust binds `0..target-1` (global-min planner
+    unchanged). Since Rust trusts `snapshot.rx_queues` (`helpers.rs:698`), the
+    pin/RSS-constrain must complete in Go before snapshot construction
+    (Codex #2/#3); a helper-side recompute is too late.
 - `replan_queues` signature unchanged; its queue-count source becomes the
-  snapshot's reconciled `effective_rx_queues`, not raw sysfs.
+  snapshot's uniform reconciled `target`, not raw sysfs.
 - Operator-facing `workers` semantics unchanged; document the new
   channel-reconciliation behavior.
 
