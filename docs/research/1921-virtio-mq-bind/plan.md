@@ -1,8 +1,14 @@
 # #1921 — AF_XDP forwarding on virtio_net multi-queue: plan of action
 
-**Status:** DRAFT v1 — pending adversarial plan review (Codex + AGY + Claude SMR)
-(ring-mismatch "Bug 1" self-refuted during drafting; primary failure is the
-EBUSY → unarmed-surplus → dual all-or-nothing enable gate)
+**Status:** DRAFT v2 — addresses r1 Codex PLAN-KILL + AGY PLAN-NEEDS-MAJOR +
+Claude SMR PLAN-NEEDS-MINOR. r1 corrections: (1) ring-mismatch refuted
+(queue_count tracks the registered set); (2) the all-or-nothing enable gate is
+NOT the cause — `armed` is a request flag, not bind success, so a failed bind
+does not trip it; the real mechanism is per-queue READY withholding → per-queue
+transit drop, and the *total* outage is most likely an EBUSY stale-socket race
+on rebind (unproven — Phase 0 decides). Fix reframed: Phase 0 first, then
+queue-reconciliation (driver-agnostic, ordering-correct) + teardown-before-rebind
+as likely co-primary.
 
 ## 1. Issue framing
 
@@ -46,46 +52,63 @@ each queue's packets target a socket bound to that same ring. No mismatch. The
 shim steering is self-consistent with the bound set; this is **not** the live
 failure.
 
-### Bug — EBUSY over-provision → unarmed surplus binding → all-or-nothing enable (PRIMARY)
+### Confirmed: over-provisioning
 
 `replan_bindings_from_candidates` (`userspace-dp/src/server/helpers.rs:745-779`)
-plans a binding for **every** sysfs RX queue (`rx_queue_count`, `:820`) on every
-interface — 4 on a 4-channel virtio NIC — **independent of `workers`**. With
-`workers=1`, all 4 are owned by worker 0 and bound as private-UMEM sockets in
-its setup loop. Surplus binds can fail EBUSY; the deep-research verdict is that
-EBUSY means the `(ifindex, queue_id)` is already held — a stale/leaked socket
-from a prior bind generation not released before rebind (virtio pool-disable is
-async), the same class as the existing mlx5 `SetDeferWorkers` /
-`PrepareLinkCycle→stop_workers` workaround (`pkg/dataplane/userspace/process.go:968`),
-whose timing is insufficient here. The retry loop spins 20×250ms
-(`afxdp/mod.rs:310-311`, `afxdp/bind.rs:423`) then `set_error`s; the failed
-binding stays `registered` but never `armed`/`xsk_registered`
-(`coordinator/refresh_bindings.rs:226`). The dataplane-enable gate then fails:
+plans a binding for **every** RX queue on every interface — the count comes from
+the snapshot's `rx_queues` (`:698`), which Go stamps from sysfs
+(`pkg/dataplane/userspace/interfaces.go:173`) — **independent of `workers`**.
+With `workers=1`, all 4 queues of a 4-channel virtio NIC are owned by worker 0
+and bound as private-UMEM sockets in its setup loop. The bind retry loop spins
+20×250ms on EBUSY (`afxdp/mod.rs:310-311`, `afxdp/bind.rs:423`) then `set_error`s.
+
+### Corrected mechanism: per-queue READY withholding (NOT a whole-dataplane gate)
+
+The v1 of this plan claimed a failed bind leaves the binding unarmed and the
+all-or-nothing `enabled`/`probeBindingsReady` gates then disable the entire
+dataplane. **That is wrong** (Codex r1, verified). `armed` is a control-plane
+*request* flag, set uniformly for every registered binding regardless of bind
+outcome:
 
 ```rust
-// userspace-dp/src/server/helpers.rs:211-217
-state.status.enabled = forwarding_armed && forwarding_supported
-    && !bindings.is_empty()
-    && bindings.iter().all(|b| b.registered && b.armed);   // ALL — one bad queue zeroes it
+// userspace-dp/src/server/helpers.rs:485-489  set_bindings_forwarding_armed
+binding.armed = armed && binding.registered;   // NOT derived from bind success
 ```
 
-The same all-or-nothing condition is enforced a **second** time on the Go side:
-`applyHelperStatusLocked` computes `probeBindingsReady` by requiring every
-registered binding (ifindex>0) to be `Armed` (`maps_sync.go:411-419`); one
-unarmed surplus queue keeps `probeBindingsReady=false`, so `ctrl.Enabled` never
-flips to 1 (`:444` onward). Result: ctrl flag 0 → shim `cpumap_or_pass` →
-XDP_PASS everywhere → kernel path has no SNAT → 0 sessions. **One EBUSY queue
-disables the whole dataplane**, via two independent all-or-nothing gates.
+Bind success is carried by `bound` / `xsk_registered` / `ready`
+(`refresh_bindings.rs:226`: `ready = registered && bound && xsk_registered &&
+heartbeat_fresh`). So a failed-bind queue is `registered=true, armed=true,
+ready=false`. The `all(registered && armed)` gate (`helpers.rs:210-217`) and Go
+`probeBindingsReady` (`maps_sync.go:411-419`) therefore do **not** necessarily
+trip on a per-queue bind failure. What actually gates per queue is the BPF
+binding-map READY flag (`maps_sync.go:97`: `Registered && Armed && Ready`):
+READY is withheld for the failed queue, and the shim drops that queue's transit
+(`userspace-xdp/src/lib.rs:427`, `binding_not_ready` → `drop_degraded_transit`).
+So the proven mechanism is a **per-queue** transit drop on the queues that fail
+to bind — not a whole-dataplane disable.
 
-### Why the EBUSY fires at all (must be confirmed in Phase 0)
+### Unproven: why the live result was 0 sessions / 100% loss
 
-On a fresh standalone appliance boot there is no obvious prior worker generation,
-yet surplus queues EBUSY. Leading hypotheses, to be distinguished by an
-instrumented repro: (a) the bootstrap→day-0-commit sequence runs two Compile
-reconciles; the second rebinds queues whose first-generation XSK sockets the
-helper has not yet released (virtio `xsk_pool` disable is async) → stale-socket
-EBUSY; (b) some queues simply never bind on first attempt and the retry races
-teardown. The fix's durability depends on which — see §5.
+A per-queue drop does not by itself explain a *total* forwarding outage. Two
+candidate explanations, to be distinguished by Phase 0 (do NOT assume):
+- **(A) All queues fail.** With `workers=1` the bootstrap→day-0-commit sequence
+  runs two Compile reconciles; if the second generation rebinds all 4 queues
+  before the first generation's `xsk_pool`s are released (virtio pool-disable is
+  async), **every** queue EBUSYs → no queue ever READY → all transit dropped →
+  0 sessions. This makes a **stale-socket-on-rebind race** the primary cause and
+  over-provisioning a multiplier (4 queues to leak instead of 1). The existing
+  mlx5 teardown workaround (`PrepareLinkCycle`→`stop_workers`,
+  `process.go:968`) is the same problem class; its timing is evidently
+  insufficient on virtio.
+- **(B) ctrl never enables.** Some other readiness condition
+  (`xskReceiveLive` RX-progress probe, neighbor gen) holds `ctrl.Enabled=0`
+  because no queue ever shows RX. 
+
+Phase 0 must capture, per queue: bind outcome (`bound`/`xsk_registered`/
+`last_error`), `ctrl.Enabled`, and the shim drop reason
+(`binding_missing`/`binding_not_ready`) — to pin the real chain before any fix
+is chosen. The fix's shape (teardown-hardening vs channel-reconciliation vs
+both) depends on the answer.
 
 ## 4. What's already shipped / relevant
 
@@ -155,17 +178,63 @@ Most general (tolerates partial binds on any driver) but the largest semantic
 change: "enabled" could mask real partial-bind failures, and RSS reprogramming
 mid-life is fiddly. Higher risk; recommend only as defense-in-depth on top of A.
 
-### Recommended composition
+### Recommended composition — Phase 0 decides, two likely co-primary fixes
 
-Path A as the primary fix. Add a **narrow slice of C** as defense-in-depth: the
-enable gate should not be held down by a binding for a queue the NIC no longer
-delivers on — but with Path A there are no such surplus bindings, so this is a
-belt-and-suspenders guard, scoped to "armed per owned queue," not a full
-degraded mode. Defer the EBUSY-stale-socket root cause (Path-C teardown
-hardening) behind a Phase-0 instrumented repro: if Path A's channel-pin removes
-the EBUSY entirely (because we never bind surplus queues, and the pin is ordered
-after stop_workers), no further teardown work is needed; if EBUSY persists on
-the `0..workers-1` set across reconcile, fix the socket lifecycle then.
+Do NOT pre-commit to a single path. **Phase 0 instrumented repro first** (it is
+cheap relative to a wrong fix). Decision rule:
+
+- If Phase 0 shows EBUSY confined to surplus (>`workers`) queues and the
+  `0..workers-1` set binds cleanly → **Path D (queue reconciliation)** is the
+  fix: stop planning `0..sysfs_rx_count`; plan `0..workers` AND reconcile the
+  NIC so it only RSS-delivers to those queues. This is the old "Path A" but
+  promoted and made driver-agnostic + ordering-correct (see hazards below).
+- If Phase 0 shows EBUSY on the `0..workers-1` set across the bootstrap→day-0
+  double reconcile (explanation A in §3) → **teardown-before-rebind correctness
+  is co-primary**: the helper must release (and confirm the kernel has torn
+  down) the prior generation's `xsk_pool`s before rebinding the same
+  `(ifindex, queue_id)`. Reuse/extend `PrepareLinkCycle`→`stop_workers`
+  (`process.go:968`); the current timing is insufficient on virtio.
+
+Most likely both are needed: reconcile the queue set (smaller surface, correct
+RSS) AND fix the rebind race. Path B (default workers = RX-queue count) and a
+full Path C (degraded enable + RSS-constrain) are documented above but are NOT
+recommended: B raises default CPU and does not touch the EBUSY race; C is more
+work than D for the same outcome (see SMR F3 — gate relaxation alone is
+insufficient because `queueCountFromBindings` still counts unarmed surplus and
+the shim per-queue READY gate drops those packets anyway).
+
+### Implementation hazards the fix MUST handle (reviewer-surfaced, all verified)
+
+1. **Driver-agnostic, operator-gated reconciliation, never a silent reduction**
+   (Codex #4, SMR F1). If we plan `0..workers` but pin channels only on virtio,
+   any NIC with `workers < hw RX queues` (e.g. an operator setting `workers=2`
+   on a 6-queue mlx5 VF) gets the ring-mismatch back: RSS spreads to queues with
+   no socket, `queue_count=workers` makes the modulo map them onto the wrong
+   ring → kernel drop. The reconciliation (channel/RSS = bound set) must apply
+   to **every** dataplane NIC, with explicit "`workers` = desired queue fanout"
+   semantics — and must never reduce a NIC below the fanout the operator
+   intends. `rss_indirection.go:164` already special-cases mlx5 workers==1;
+   integrate, don't fight it.
+2. **`ethtool -L` ordering** (Codex #3). Rust trusts `snapshot.rx_queues`
+   (`helpers.rs:698`), stamped by Go from sysfs (`interfaces.go:173`). The
+   channel set MUST happen in Go **before** snapshot construction, or the
+   snapshot must carry the explicitly-reconciled count. A helper-side pin after
+   snapshot receipt is too late.
+3. **`ethtool -L` async-teardown retry** (AGY #3). Running `-L` right after a
+   helper stop can fail while the kernel is still asynchronously tearing down ZC
+   socket contexts — wait/retry with backoff.
+4. **Non-fatal channel set** (AGY #4). Many VF drivers don't support `ethtool
+   -L`; failure must NOT fail-close the dataplane — log and proceed with the
+   actual queue count.
+5. **Exclude fabric/generic-mode parents** (Codex #5, AGY #4). Applying `-L` to
+   the fabric IPVLAN parent (`ge-0-0-0`, xdpgeneric) can reset the link →
+   packet loss + VRRP/control disruption on IPVLAN children, and may EBUSY.
+   Exclude fabric parents from channel reconciliation; validate fabric TX still
+   works.
+6. **Watchdog blind spot** (AGY #2). The busy-bindings auto-rebind watchdog
+   (`maps_sync.go:1285`) does not fire when queue 0 itself fails to bind
+   (`registeredArmed==0`); harden it to detect a fully-wedged interface, so a
+   total-bind-failure self-heals instead of black-holing.
 
 ## 6. API / interface preservation
 
@@ -207,10 +276,18 @@ the `0..workers-1` set across reconcile, fix the socket lifecycle then.
 
 **Repro venue is virtio, NOT the loss mlx5 cluster.** The bug cannot reproduce
 on loss (workers==queues). Required:
-- **Phase 0 (instrument + repro):** deploy the #1879 appliance on a virtio
-  multi-queue host (≥2 combined channels) via `xpf-deploy.py`; confirm 100% loss
-  + the EBUSY log; add a counter/trace distinguishing ring-mismatch redirect
-  drops from not-ready drops to PROVE Bug 1 is live (not just inferred).
+- **Phase 0 (instrument + repro) — MANDATORY FIRST, decides the fix path:**
+  deploy the #1879 appliance on a virtio multi-queue host (≥2 combined channels)
+  via `xpf-deploy.py`; confirm the outage and capture, per queue: bind outcome
+  (`bound`/`xsk_registered`/`last_error`), `ctrl.Enabled`, and the shim drop
+  reason (`binding_missing` vs `binding_not_ready` — existing trace stages in
+  `lib.rs`). This distinguishes §3 explanation A (all queues EBUSY, stale-socket
+  race) from B (ctrl never enables) and tells us whether teardown-hardening,
+  queue-reconciliation, or both are required.
+- **Fix-iteration loop (SMR F4):** after the one-time appliance deploy, iterate
+  the fix by pushing rebuilt `xpfd` + `xpf-userspace-dp` into the running VM
+  (`scp` + `systemctl restart xpfd`), NOT by re-baking the image (too slow; the
+  bake/day-0 path is already covered by #1879).
 - **Phase 1 (fix) acceptance on virtio:** clean deploy → LAN→WAN v4+v6 ping +
   iperf3 push/reverse + SNAT session install, 0 transit loss; `show security
   flow session` non-zero; no EBUSY loop; helper `enabled=true`.

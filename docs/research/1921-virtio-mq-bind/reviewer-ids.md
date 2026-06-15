@@ -1,17 +1,19 @@
 # #1921 virtio-MQ forwarding — reviewer ledger
 
 ## Plan review round 1 (plan @ 96eee9025)
-
 | Reviewer | ID | Verdict |
 |---|---|---|
-| Claude SMR | claude-smr-plan-r1.md | PLAN-NEEDS-MINOR (F1 MAJOR: driver-agnostic channel pin) |
-| Codex | task-mqfnykhy-2jfzzu | pending |
-| AGY | adversarial-review-mqfnzlwk-gu7f3v | pending |
+| Claude SMR | claude-smr-plan-r1.md | PLAN-NEEDS-MINOR (F1 driver-agnostic pin) |
+| Codex | task-mqfnykhy-2jfzzu | PLAN-KILL (armed != bind success; gate diagnosis wrong) |
+| AGY | adversarial-review-mqfnzlwk-gu7f3v | PLAN-NEEDS-MAJOR (stale-socket, ethtool race, fabric/VF, watchdog) |
 
-Copilot joins at /engineer on the implementation PR.
+r1 outcome: NOT converged. Codex correctly refuted the central enable-gate
+chain (verified: helpers.rs:487 `armed = armed && registered`, a request flag).
+Plan rewritten to v2.
 
-## Notes
-- Ring-mismatch "Bug 1" self-refuted during drafting (queueCountFromBindings
-  tracks bound set; bootstrap qc=1 write is Enabled=0).
-- Validation venue: virtio multi-queue repro (NOT loss mlx5, which can't repro)
-  + loss cluster for mlx5 regression.
+## Plan review round 2 (plan @ <pending>)
+| Reviewer | ID | Verdict |
+|---|---|---|
+| Claude SMR | (this rewrite authored the corrections) | pending re-attest |
+| Codex | <pending> | pending |
+| AGY | <pending> | pending |
