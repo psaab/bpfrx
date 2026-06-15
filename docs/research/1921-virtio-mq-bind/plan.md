@@ -139,11 +139,14 @@ hardware max) **before** any XSK bind, at clean helper startup and after
 `stop_workers` on reconcile. Then bind exactly queues `0..workers-1`
 (`queueCountFromBindings` then reports `workers`, keeping the shim steering
 consistent). Effects:
-- Only `workers` queues are planned/bound → **no surplus queues to fail-arm**,
-  so neither all-or-nothing gate (helper `enabled`, Go `probeBindingsReady`) is
-  held down → forwarding enables on the queues that bound.
-- NIC delivers only on `workers` RSS queues, all of which are owned → no flow is
-  RSS-hashed to a queue with no socket.
+- NIC delivers only on `workers` RSS queues, all of which are owned by a socket
+  that binds → no flow is RSS-hashed to a queue whose binding never goes READY
+  (which the shim would drop as `binding_not_ready`, `lib.rs:427`).
+- Fewer queues = smaller EBUSY surface and fewer sockets to leak across a
+  rebind. (This does NOT by itself prevent the EBUSY race on the surviving
+  queues — see teardown co-primary fix and the §3 caveat. It is not a
+  whole-dataplane "gate" effect: per the r1 correction, `armed` is a request
+  flag, so a failed bind does not trip `enabled`/`probeBindingsReady`.)
 - Ordering avoids the "channels too low for existing ZC sockets" refusal: set
   channels only when no XSK is bound (fresh start, or post-`stop_workers`).
 - mlx5/i40e: `workers` already == queue count, so `combined=workers` is a no-op
@@ -231,10 +234,17 @@ the shim per-queue READY gate drops those packets anyway).
    packet loss + VRRP/control disruption on IPVLAN children, and may EBUSY.
    Exclude fabric parents from channel reconciliation; validate fabric TX still
    works.
-6. **Watchdog blind spot** (AGY #2). The busy-bindings auto-rebind watchdog
-   (`maps_sync.go:1285`) does not fire when queue 0 itself fails to bind
-   (`registeredArmed==0`); harden it to detect a fully-wedged interface, so a
-   total-bind-failure self-heals instead of black-holing.
+6. **Auto-rebind must do teardown-before-rebind, or it loops** (refines AGY #2;
+   AGY's "blind spot" framing was REFUTED by Codex r2 and verified false). The
+   busy-bindings watchdog DOES fire on the all-queues-EBUSY case:
+   `hasBusyBindingsWedgeLocked` (`maps_sync.go:1265-1285`) triggers on
+   `registeredArmed > 0 && bound == 0 && ready == 0 && busyErr`, and
+   `registeredArmed` counts any registered+armed binding — which a failed-bind
+   queue still is (`armed` is a request flag), so the wedge is detected (unit
+   test `manager_test.go:2943` covers queue-0-busy). The real concern is that
+   the auto-rebind path re-hits the same stale-socket EBUSY and re-wedges; the
+   teardown-before-rebind fix must therefore live in the rebind path too, not
+   just first bind.
 
 ## 6. API / interface preservation
 
@@ -242,8 +252,22 @@ the shim per-queue READY gate drops those packets anyway).
   `workers` already exist; we change how the bound set + NIC channels are
   derived, not the schema. (Confirm whether a new snapshot field is needed to
   carry "desired channels" vs computing in the helper.)
-- `replan_queues` signature unchanged; its queue-count source changes from
-  `rx_queue_count` to `min(rx_queue_count, workers)` (or the pinned count).
+- **`effective_rx_queues` invariant (resolves Codex r2 #2 contradiction).** The
+  bound set is NOT a blind `min(rx_queue_count, workers)`. It is the number of
+  RX queues the NIC will ACTUALLY RSS-deliver to after reconciliation:
+  - If channel reconciliation succeeded (or the NIC was already at the desired
+    count), `effective_rx_queues = workers` (clamped to hw max) and we bind
+    `0..effective_rx_queues-1`.
+  - If reconciliation was non-fatal-skipped (VF lacks `ethtool -L`, or it
+    failed), `effective_rx_queues = actual current RX-queue count` and we bind
+    ALL of them — never clamp to `workers` while the NIC still delivers on more
+    queues, or the shim's `rx_queue_index % queue_count` re-creates the
+    wrong-ring drop the plan warns about.
+  This value must be carried in the snapshot (Go computes it post-reconcile and
+  stamps `rx_queues`), since Rust trusts `snapshot.rx_queues` (`helpers.rs:698`)
+  — a helper-side recompute is too late (Codex #2/#3).
+- `replan_queues` signature unchanged; its queue-count source becomes the
+  snapshot's reconciled `effective_rx_queues`, not raw sysfs.
 - Operator-facing `workers` semantics unchanged; document the new
   channel-reconciliation behavior.
 
@@ -279,11 +303,16 @@ on loss (workers==queues). Required:
 - **Phase 0 (instrument + repro) — MANDATORY FIRST, decides the fix path:**
   deploy the #1879 appliance on a virtio multi-queue host (≥2 combined channels)
   via `xpf-deploy.py`; confirm the outage and capture, per queue: bind outcome
-  (`bound`/`xsk_registered`/`last_error`), `ctrl.Enabled`, and the shim drop
-  reason (`binding_missing` vs `binding_not_ready` — existing trace stages in
-  `lib.rs`). This distinguishes §3 explanation A (all queues EBUSY, stale-socket
-  race) from B (ctrl never enables) and tells us whether teardown-hardening,
-  queue-reconciliation, or both are required.
+  (`bound`/`xsk_registered`/`last_error`) and the shim drop reason
+  (`binding_missing` vs `binding_not_ready` — existing trace stages in `lib.rs`).
+  Capture the FULL ctrl-enable state machine, not just final `ctrl.Enabled`
+  (Codex r2 #4): `ctrl.Enabled` transitions, `probeBindingsReady`,
+  `neighborSyncReady`, `xskLivenessProven`, `xskLivenessFailed`
+  (`maps_sync.go:444-501`). This distinguishes §3 explanation A (all queues
+  EBUSY, stale-socket race — `bound==0` everywhere, `last_error` resource-busy)
+  from B (ctrl enables then `xskLivenessFailed` flips it back off because no
+  queue shows RX) and tells us whether teardown-hardening, queue-reconciliation,
+  or both are required.
 - **Fix-iteration loop (SMR F4):** after the one-time appliance deploy, iterate
   the fix by pushing rebuilt `xpfd` + `xpf-userspace-dp` into the running VM
   (`scp` + `systemctl restart xpfd`), NOT by re-baking the image (too slow; the

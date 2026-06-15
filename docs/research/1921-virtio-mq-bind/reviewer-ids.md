@@ -11,9 +11,18 @@ r1 outcome: NOT converged. Codex correctly refuted the central enable-gate
 chain (verified: helpers.rs:487 `armed = armed && registered`, a request flag).
 Plan rewritten to v2.
 
-## Plan review round 2 (plan @ <pending>)
+## Plan review round 2 (plan @ cdd7a1bcd)
 | Reviewer | ID | Verdict |
 |---|---|---|
-| Claude SMR | (this rewrite authored the corrections) | pending re-attest |
+| Codex | task-mqftf67e-wfs37n | PLAN-NEEDS-MAJOR (stale gate text in §5; min() contradiction; watchdog claim wrong; tighten Phase-0 ctrl instr) |
+| AGY | adversarial-review-mqftflub-s27we1 | INFRA-TIMEOUT (job ran, result never captured; r1 findings already folded) |
+| Claude SMR | authored v3 corrections | n/a |
+
+r2 outcome: Codex KILL->NEEDS-MAJOR (progress). All 4 Codex findings addressed in
+v3. AGY r2 infra-timed-out -> re-dispatch fresh in r3.
+
+## Plan review round 3 (plan @ <pending>)
+| Reviewer | ID | Verdict |
+|---|---|---|
 | Codex | <pending> | pending |
 | AGY | <pending> | pending |
