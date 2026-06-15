@@ -1,15 +1,6 @@
 # #1921 — AF_XDP forwarding on virtio_net multi-queue: plan of action
 
-**Status:** DRAFT v5 — AGY r4 PLAN-READY; addresses Codex r4 fabric blocker (fabric parents are AF_XDP ingress: constrain via ethtool -X, stamp rx_queues=target, NOT excluded from RSS reconciliation) + link-UP RSS-reset hazard (AGY r4) + nits. Prior: addresses Codex r3 PLAN-NEEDS-MAJOR (effective_rx_queues
-vs the global-min uniform planner; two stale-text scrubs) + AGY r3
-PLAN-NEEDS-MINOR (which CONFIRMED the EBUSY loop root cause in code). Evolution:
-r1 ring-mismatch refuted; r2 the all-or-nothing gate refuted (`armed` is a
-request flag); r3 the EBUSY loop pinned to a concrete bug — `rebind::handle`
-double-stops workers, so `tear_down`'s `had_live_workers` is false and the 500ms
-ZC-teardown quiesce is bypassed (verified, §3). Fix: primary = remove the rebind
-double-stop so the quiesce applies; surface-reducer = uniform-target channel/RSS
-reconciliation across all dataplane NICs (§6). Phase 0 confirms the
-first-attempt trigger + quiesce adequacy.
+**Status:** DRAFT v6 — RESTRUCTURED to minimal-first after Codex r5. Committed fix = Phase 1 (remove rebind::handle double-stop so tear_down's 500ms ZC quiesce applies; code-verified, also fixes synced-session wipe + tunnel-owner remap blinding) + Phase 0 instrumented virtio repro. ALL channel/RSS reconciliation (old Path A/D, effective_rx_queues, fabric handling) is demoted to a CONTINGENT, design-open Phase 2 that only triggers if Phase 1 leaves queues unbindable — it collides with the global-min uniform planner (fabric-parent bind-impossibility, Codex r5) and needs its own round. Evolution: r1 ring-mismatch refuted; r2 all-or-nothing gate refuted (armed is a request flag); r3 EBUSY loop pinned to the rebind double-stop; r4 AGY PLAN-READY + confirmed the fix repairs 2 latent bugs; r5 Codex surfaced the fabric bind-impossibility in the reconciliation half -> scoped it out of the committed fix.
 
 ## 1. Issue framing
 
@@ -163,19 +154,46 @@ RETH-MAC link-cycle path: Go already sends `stop_workers` (→
 - `workers` is operator config (`set system … workers N`,
   `compiler_system.go:450`), default 1.
 
-## 5. Concrete design — Multiple Path Options
+## 5. Concrete design — phased, minimal-first
 
-The invariant to restore: **every NIC RSS-active queue has exactly one socket
-that actually binds + goes READY.** Today the bound set = sysfs RX-queue count
-and `queue_count` tracks the registered set (`queueCountFromBindings`), so the
-steering is self-consistent — the break is (1) the confirmed rebind double-stop
-that bypasses the ZC-teardown quiesce and loops on EBUSY (§3), and (2) the
-over-provisioned bound set, which multiplies the number of queues that must bind
-cleanly. (This is NOT a whole-dataplane enable-gate effect — per §3, `armed` is
-a request flag, so a failed bind does not trip `enabled`/`probeBindingsReady`;
-the per-queue effect is READY withholding → `binding_not_ready` transit drop.)
+**The committed fix is small and proven; everything else is contingent.** The
+EBUSY loop's engine is code-verified (§3, both reviewers): `rebind::handle`
+double-stops workers, bypassing `tear_down`'s 500ms ZC-teardown quiesce. The
+plan therefore commits to that one fix and validates it before doing anything
+larger:
 
-### Path A (RECOMMENDED) — reconcile NIC channels to the uniform `target`
+- **Phase 0 — instrument + repro (mandatory first).** On a virtio multi-queue
+  venue, confirm the outage and capture per-queue bind outcome + the full ctrl
+  state machine (§9), proving the rebind→quiesce-bypass→EBUSY loop is the live
+  cause.
+- **Phase 1 — PRIMARY FIX: remove the `rebind::handle` double-stop** so
+  `tear_down` owns the worker stop, `had_live_workers` is captured truthfully,
+  and the 500ms quiesce applies (also repairs the synced-session wipe +
+  tunnel-owner remap blinding, §3). Re-test on virtio. **Expected sufficient on
+  its own:** once all RX queues bind cleanly, `queue_count == actual queue
+  count` (identity modulo), every queue goes READY, and forwarding works — there
+  is no surplus to reduce, and `worker_id = queue_id % workers` simply means one
+  worker services several queues' sockets, which is fine. The "ring-mismatch"
+  and "over-provision" concerns are both moot when the binds succeed.
+- **Phase 2 — CONTINGENT channel/RSS reconciliation (ONLY if Phase 1 leaves
+  queues unbindable).** If Phase 0/1 show queues that still cannot bind for a
+  non-stale-socket reason, reduce/align the active queue set. This is design-OPEN
+  and would need its own review round, because it collides with the existing
+  global-min UNIFORM planner that also enumerates fabric parents (Codex r4/r5):
+  a uniform `target` either caps the dataplane to a low-queue fabric parent's
+  count, or stamping fabric `rx_queues=target` asks Rust to bind fabric queues
+  that don't exist (`helpers.rs:718→745→752→bind.rs:82→xsk_ffi.rs:1166`).
+  Resolving that requires either a per-interface bind-count planner (replacing
+  the global-min, updating `main_tests.rs:609-631`) or splitting fabric parents
+  out of the AF_XDP planner — a separate design decision, NOT part of the
+  committed fix. The Path-A/§6 material below is preserved as **design notes for
+  Phase 2 only**, not the committed plan.
+
+The remainder of this section and §6's `effective_rx_queues` are **Phase-2
+design notes (contingent, design-open)** — do not implement without a fresh
+review round confirming Phase 1 was insufficient.
+
+### [PHASE-2 DESIGN NOTE, CONTINGENT] Path A — reconcile NIC channels to the uniform `target`
 
 (`target = min(workers, hw-max)` per the §6 uniform invariant; the lines below
 say `workers` for the common appliance case but the binding/RSS count is always
@@ -229,32 +247,25 @@ Most general (tolerates partial binds on any driver) but the largest semantic
 change: "enabled" could mask real partial-bind failures, and RSS reprogramming
 mid-life is fiddly. Higher risk; recommend only as defense-in-depth on top of A.
 
-### Recommended composition — Phase 0 decides, two likely co-primary fixes
+### Recommendation (supersedes the co-primary framing above)
 
-Do NOT pre-commit to a single path. **Phase 0 instrumented repro first** (it is
-cheap relative to a wrong fix). Decision rule:
+Commit only **Phase 1 (the rebind double-stop fix)** plus **Phase 0** to prove
+it. It is small, code-verified, and independently corrects two latent rebind
+bugs. Phase 2 (channel/RSS reconciliation) is contingent and design-open per the
+§5 intro — do NOT bundle it into the committed PR unless Phase 0/1 prove the
+binds still fail after the rebind fix. The decision rule:
 
-- If Phase 0 shows EBUSY confined to surplus (>`workers`) queues and the
-  `0..workers-1` set binds cleanly → **Path D (queue reconciliation)** is the
-  fix: stop planning `0..sysfs_rx_count`; plan `0..workers` AND reconcile the
-  NIC so it only RSS-delivers to those queues. This is the old "Path A" but
-  promoted and made driver-agnostic + ordering-correct (see hazards below).
-- If Phase 0 shows EBUSY on the `0..workers-1` set across the bootstrap→day-0
-  double reconcile (explanation A in §3) → **teardown-before-rebind correctness
-  is co-primary**: the helper must release (and confirm the kernel has torn
-  down) the prior generation's `xsk_pool`s before rebinding the same
-  `(ifindex, queue_id)`. Reuse/extend `PrepareLinkCycle`→`stop_workers`
-  (`process.go:968`); the current timing is insufficient on virtio.
+- Phase 1 makes the `0..actual_rx_count` set bind cleanly (the expected outcome
+  once the quiesce is no longer bypassed) → **DONE**; no reconciliation, no
+  ring-mismatch (queue_count == actual), no surplus.
+- Phase 1 still leaves queues unbindable for a non-stale-socket reason → open a
+  Phase-2 design round for queue reconciliation, resolving the
+  uniform-vs-per-interface planner + fabric-parent question first.
 
-Most likely both are needed: reconcile the queue set (smaller surface, correct
-RSS) AND fix the rebind race. Path B (default workers = RX-queue count) and a
-full Path C (degraded enable + RSS-constrain) are documented above but are NOT
-recommended: B raises default CPU and does not touch the EBUSY race; C is more
-work than D for the same outcome (see SMR F3 — gate relaxation alone is
-insufficient because `queueCountFromBindings` still counts unarmed surplus and
-the shim per-queue READY gate drops those packets anyway).
+Phase B (default workers = RX-queue count) and Phase C (degraded enable) are
+documented as alternatives but NOT recommended.
 
-### Implementation hazards the fix MUST handle (reviewer-surfaced, all verified)
+### [PHASE-2 DESIGN NOTE, CONTINGENT] Implementation hazards if reconciliation is ever needed
 
 1. **Driver-agnostic, operator-gated reconciliation, never a silent reduction**
    (Codex #4, SMR F1). If we plan `0..workers` but pin channels only on virtio,
@@ -324,8 +335,13 @@ the shim per-queue READY gate drops those packets anyway).
   `workers` already exist; we change how the bound set + NIC channels are
   derived, not the schema. (Confirm whether a new snapshot field is needed to
   carry "desired channels" vs computing in the helper.)
-- **`effective_rx_queues` invariant — UNIFORM across dataplane NICs (resolves
-  Codex r2 #2 and r3 main blocker).** Critical constraint:
+- **[PHASE-2 DESIGN NOTE, CONTINGENT — not part of the committed Phase-1 fix;
+  design-open per §5, needs its own review round.] `effective_rx_queues`
+  invariant — UNIFORM across dataplane NICs.** Known-unresolved: this collides
+  with the global-min planner enumerating fabric parents (a single-queue fabric
+  parent stamped to `target>1` would bind nonexistent queues — Codex r5). A
+  per-interface bind-count planner or fabric split-out must be decided first.
+  Critical constraint:
   `replan_bindings_from_candidates` (`helpers.rs:745`) takes the GLOBAL MINIMUM
   queue count across all candidate interfaces and emits `0..queue_count` for
   EVERY interface — a single uniform count, NOT per-interface (codified by
