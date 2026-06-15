@@ -1,6 +1,6 @@
 # #1921 — AF_XDP forwarding on virtio_net multi-queue: plan of action
 
-**Status:** DRAFT v4 — addresses Codex r3 PLAN-NEEDS-MAJOR (effective_rx_queues
+**Status:** DRAFT v5 — AGY r4 PLAN-READY; addresses Codex r4 fabric blocker (fabric parents are AF_XDP ingress: constrain via ethtool -X, stamp rx_queues=target, NOT excluded from RSS reconciliation) + link-UP RSS-reset hazard (AGY r4) + nits. Prior: addresses Codex r3 PLAN-NEEDS-MAJOR (effective_rx_queues
 vs the global-min uniform planner; two stale-text scrubs) + AGY r3
 PLAN-NEEDS-MINOR (which CONFIRMED the EBUSY loop root cause in code). Evolution:
 r1 ring-mismatch refuted; r2 the all-or-nothing gate refuted (`armed` is a
@@ -132,8 +132,23 @@ never recovers — is now code-proven. **Fix:** do not call `guard.afxdp.stop()`
 in `rebind::handle`; let the `reconcile`/`tear_down` pipeline stop workers so
 `had_live_workers` is captured truthfully and the 500ms quiesce applies. (Phase
 0 also validates whether 500ms is adequate for virtio ZC under load, or must be
-adaptive.) This likely makes the rebind-double-stop fix the **primary** fix and
-channel-reconciliation the surface-reducer.
+adaptive — though the 20×250ms bind-retry already gives a ~5s adaptive buffer
+on top, AGY r4.) This likely makes the rebind-double-stop fix the **primary**
+fix and channel-reconciliation the surface-reducer.
+
+Removing the `rebind::handle` stop is also independently correct (AGY r4,
+verified): `afxdp.stop()` runs `stop_inner(true)`, which vs `tear_down`'s
+`stop_inner(false)` *additionally* (a) wipes the in-memory synced-session map
+(`coordinator/mod.rs:488-499`) that should be replayed into BPF maps on rebind
+bringup, and (b) defaults `coord.forwarding`/`coord.validation` BEFORE
+`tear_down` captures `tunnel_owners`/`snapshot_was_installed`
+(`teardown.rs:20,26`), so the capture is blind and the tunnel-owner remap purge
+in `apply_snapshot` is broken across ALL rebinds. Letting `tear_down` own the
+stop fixes the EBUSY loop AND these two latent rebind bugs. Safe for the
+RETH-MAC link-cycle path: Go already sends `stop_workers` (→
+`stop_workers::handle` → `afxdp.stop()`) before the link cycle
+(`process.go:959`), waits 1s, and sends `rebind` after link-up
+(`process.go:1018`); the hardware-teardown cleanup remains covered.
 
 ## 4. What's already shipped / relevant
 
@@ -160,9 +175,12 @@ cleanly. (This is NOT a whole-dataplane enable-gate effect — per §3, `armed` 
 a request flag, so a failed bind does not trip `enabled`/`probeBindingsReady`;
 the per-queue effect is READY withholding → `binding_not_ready` transit drop.)
 
-### Path A (RECOMMENDED) — reconcile NIC channels to `workers`
+### Path A (RECOMMENDED) — reconcile NIC channels to the uniform `target`
 
-Pin `ethtool -L <dataplane-if> combined = workers` (clamped to the NIC's
+(`target = min(workers, hw-max)` per the §6 uniform invariant; the lines below
+say `workers` for the common appliance case but the binding/RSS count is always
+the reconciled `target`.) Pin `ethtool -L <dataplane-if> combined = target`
+(clamped to the NIC's
 hardware max) **before** any XSK bind, at clean helper startup and after
 `stop_workers` on reconcile. Then bind exactly queues `0..workers-1`
 (`queueCountFromBindings` then reports `workers`, keeping the shim steering
@@ -256,14 +274,38 @@ the shim per-queue READY gate drops those packets anyway).
 3. **`ethtool -L` async-teardown retry** (AGY #3). Running `-L` right after a
    helper stop can fail while the kernel is still asynchronously tearing down ZC
    socket contexts — wait/retry with backoff.
-4. **Non-fatal channel set** (AGY #4). Many VF drivers don't support `ethtool
-   -L`; failure must NOT fail-close the dataplane — log and proceed with the
-   actual queue count.
-5. **Exclude fabric/generic-mode parents** (Codex #5, AGY #4). Applying `-L` to
-   the fabric IPVLAN parent (`ge-0-0-0`, xdpgeneric) can reset the link →
-   packet loss + VRRP/control disruption on IPVLAN children, and may EBUSY.
-   Exclude fabric parents from channel reconciliation; validate fabric TX still
-   works.
+4. **Non-fatal channel set, but keep the target uniform** (AGY #4). Many VF
+   drivers don't support `ethtool -L`; an `-L` failure must NOT fail-close the
+   dataplane. But the fallback is NOT "proceed with this NIC's actual count"
+   (that breaks the uniform planner and re-creates wrong-ring): fall back to
+   `ethtool -X` RSS-constrain to `0..target-1`; if neither `-L` nor `-X` works
+   and the NIC natively delivers beyond `target`, that is the documented
+   homogeneous-constrainable-NIC limit (§6). The snapshot is stamped with the
+   uniform verified `target` (transactional, per §6) regardless.
+5. **Fabric/IPVLAN parents: `-X` not `-L`, and must ALSO be constrained**
+   (resolves Codex r4 blocker + AGY r4 clarification). Fabric parents ARE
+   AF_XDP-bound ingress interfaces — Rust adds them as binding candidates
+   (`helpers.rs:709-726`) and Go marks them userspace-ingress
+   (`maps_sync.go:1430`). So excluding them from reconciliation entirely would
+   leave them RSS-delivering on `> target` queues → the wrong-ring drop on the
+   fabric NIC. Resolution: exclude fabric parents from `ethtool -L` only (it
+   resets the link → VRRP/control + IPVLAN-child disruption), but STILL
+   constrain their RSS via `ethtool -X` to `0..target-1` (no link reset). Go
+   stamps the fabric parent's snapshot `rx_queues = target` so the global-min
+   planner (`helpers.rs:745`) computes the intended uniform `target` rather than
+   being pulled up/down by an unreconciled fabric count (AGY r4). Phase 0 must
+   measure the fabric parent's actual RX-queue count and whether its (generic
+   XDP, HA-only, low-volume) ingress is RSS-distributed at all — if it is
+   single-queue, the constraint is trivially satisfied; validate fabric TX still
+   works after `-X`.
+7. **Drivers reset channels/RSS to defaults on link-UP** (AGY r4, new). After a
+   RETH-MAC link cycle (link DOWN→UP), mlx5/virtio_net revert channel counts and
+   the RSS indirection table to hardware defaults. If Go issues `rebind` without
+   first re-applying the channel/RSS pinning, the helper binds `0..target-1` but
+   the NIC again spreads across all queues → wrong-ring/EBUSY. Go MUST re-run
+   the channel/RSS reconciliation inside `NotifyLinkCycle`
+   (`process.go:1018-1065`) after the 1s settle and BEFORE issuing the `rebind`
+   ControlRequest.
 6. **Auto-rebind must do teardown-before-rebind, or it loops** (refines AGY #2;
    AGY's "blind spot" framing was REFUTED by Codex r2 and verified false). The
    busy-bindings watchdog DOES fire on the all-queues-EBUSY case:

@@ -32,8 +32,16 @@ blocker = the planner is global-min UNIFORM (helpers.rs:745, test
 main_tests.rs:609-631), so effective_rx_queues must be a uniform target + RSS
 constrain, not per-interface. v4 resolves both + scrubs stale gate text.
 
-## Plan review round 4 (plan @ <pending>)
+## Plan review round 4 (plan @ bfe8d909c)
 | Reviewer | ID | Verdict |
 |---|---|---|
-| Codex | <pending> | pending |
-| AGY | <pending> | pending |
+| Codex | task-mqfu1sg0-sn4l6h | PLAN-NEEDS-MAJOR (fabric parents are AF_XDP ingress but excluded from reconciliation -> wrong-ring on fabric; 2 nits) |
+| AGY | adversarial-review-mqfu24d2-bi1w2w | PLAN-READY (confirmed rebind fix also repairs synced-session wipe + tunnel-owner remap blinding; new hazard: link-UP resets channels/RSS) |
+
+r4 outcome: AGY READY. Codex one blocker (fabric) + 2 nits, all addressed in v5.
+
+## Plan review round 5 (plan @ <pending>)
+| Reviewer | ID | Verdict |
+|---|---|---|
+| Codex | <pending> | pending (confirm fabric resolution) |
+| AGY | r4 PLAN-READY carries (v5 = exactly AGY's fabric-stamp + link-up asks) | READY |
