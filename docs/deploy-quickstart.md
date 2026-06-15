@@ -8,7 +8,10 @@ The comprehensive reference (every backing, schema, recipes) is
 ## The 60-second mental model
 
 xpf names interfaces **by position** (`assignName()` in `linksetup.go`),
-exactly like vSRX:
+exactly like vSRX. (`assignName()` returns the Linux link name in dash
+form — `ge-0-0-0`; config and CLI use the slash form — `ge-0/0/0` — and
+the config layer translates between them. The tables below use the
+slash/CLI form.)
 
 | Position | Standalone | Cluster node 0 | Cluster node 1 |
 |---|---|---|---|
@@ -80,8 +83,13 @@ comparison and the SR-IOV VF-pool / pinned-guest-PCI details.
 A cluster is two YAML files in one invocation:
 
 ```bash
+# Create EVERY network the HA YAMLs reference as a source (br-mgmt,
+# ha-control, ha-fabric, br-lan, br-wan) so they deploy unedited:
+incus network create br-mgmt    ipv4.address=10.167.0.1/24 ipv4.nat=true ipv6.address=none
 incus network create ha-control ipv4.address=none ipv6.address=none
 incus network create ha-fabric  ipv4.address=none ipv6.address=none
+incus network create br-lan     ipv4.address=none ipv6.address=none
+incus network create br-wan     ipv4.address=none ipv6.address=none
 scripts/deploy/xpf-deploy.py examples/deploy/ha-fw0.yaml examples/deploy/ha-fw1.yaml
 incus exec fw0 -- cli -c "show chassis cluster status"
 ```
@@ -101,7 +109,7 @@ shim). The NIC the VM sees decides the rest:
 | `pci:` whole PF (i40e/ice/mlx5) | vendor PF | native, fastest | claims the entire NIC |
 | `sriov:` / `pci:` mlx5 VF | mlx5_core | **native** | the loss-cluster reference shape |
 | `sriov:` / `pci:` Intel VF | iavf | generic only (~3-4× slower) | works, but know it |
-| `bridge:` / `net:` | virtio_net | native (vhost) | fine for labs / modest WANs |
+| `bridge:` / `net:` | virtio_net | generic-class | fine for labs / modest WANs (`inventory` hints `no (generic)`) |
 
 virtio for mgmt and anything under a few Gb/s; mlx5 VFs or PF
 passthrough for line-rate ports.

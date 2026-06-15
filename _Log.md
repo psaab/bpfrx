@@ -5369,3 +5369,6 @@ top.
 
 - **Timestamp**: 2026-06-15 — #1879: wrote docs/image-validation.md (complete 3-tier validation runbook: Tier-1 automated first-boot gate, Tier-2 standalone forwarding+SNAT, Tier-3 HA forwarding+failover) with topology, networks, deploy YAML, router config, traffic steps, pass criteria, cleanup, honest-scope. Cross-linked from install-images.md.
   **File(s)**: docs/image-validation.md, docs/install-images.md
+
+- **Timestamp**: 2026-06-15 — #1879 doc triple-review: Codex MERGE-NEEDS-MAJOR (7 real defects), AGY MERGE-READY, Claude SMR verified embedded config/commands. Fixed all 7 (Tier-2 tools+v6 SNAT, Tier-3 failover node, HA network names match YAML, README config path, naming slash/dash, Tier-1 precision, virtio generic-class).
+  **File(s)**: docs/image-validation.md, docs/deploy-quickstart.md, examples/deploy/README.md, docs/pr/1879-pathc/deploy-delta-reviewer-ids.md

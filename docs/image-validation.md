@@ -60,8 +60,8 @@ and all are deleted on exit. Scenarios:
 
 | Scenario | Proves |
 |---|---|
-| **a** no config drive | factory boot; kernel ≥6.18 + `-generic` flavor + mlx5/i40e driver set; exactly one kernel; `init_on_alloc=0` on the booted cmdline; **in-guest `xpfd verify-dataplane` PASS**; `fxp0` DHCP; sshd listening with `PermitRootLogin prohibit-password` + `PermitEmptyPasswords no`; no stray `/etc/xpf/xpf.conf` or stamp |
-| **b** valid day-0 drive | config validated + installed (`0600`) + committed (hostname applied, CLI shows it); a reboot does **not** re-apply (stamp honored) |
+| **a** no config drive | factory boot; kernel ≥6.18 + `-generic` flavor; `linux-modules-extra` present (checked via the Mellanox driver dir as the sentinel — the broader mlx5/i40e set rides with it); exactly one kernel; `init_on_alloc=0` on the booted cmdline; **in-guest `xpfd verify-dataplane` PASS**; `fxp0` DHCP; sshd listening with `PermitRootLogin prohibit-password` + `PermitEmptyPasswords no`; no stray `/etc/xpf/xpf.conf` or stamp |
+| **b** valid day-0 drive | config validated + installed + committed (hostname applied, CLI shows it); reboot does **not** re-apply (stamp honored). *(The loader installs the config `0600`; the scenario asserts it exists and is non-empty, not the mode.)* |
 | **c** invalid day-0 drive | commit-check REJECT logged, nothing installed, no stamp, factory bootstrap still reachable |
 
 **Pass:** `Validation complete.` with all selected scenarios PASS. Any
@@ -91,9 +91,14 @@ endpoint needs no route back.
    fd66:1::10/64                  fd66:2::10/64
 ```
 
-NIC order = interface name (positional contract); all virtio bridges →
-the userspace AF_XDP dataplane runs native XDP via vhost (same forwarding
-path as mlx5 VFs, just virtio).
+NIC order = interface name (positional contract). Names are shown in
+config/CLI slash form (`ge-0/0/0`); the Linux link name is the dash form
+(`ge-0-0-0`) that `assignName()` produces — the config layer translates
+between them. All NICs here are virtio bridges; virtio exercises the full
+userspace AF_XDP forwarding/NAT path, but treat it as **generic-XDP
+class** for planning (the same stance `xpf-deploy.py inventory` reports
+for `virtio_net`) — native line-rate XDP is the mlx5/i40e-VF story, not
+the venue of this functional test.
 
 ### Host networks
 
@@ -162,7 +167,9 @@ incus exec lanhost -- ip route add default via 10.66.1.1
 incus exec lanhost -- ip -6 route add default via fd66:1::1
 incus exec wanhost -- ip addr add 10.66.2.10/24 dev eth0
 incus exec wanhost -- ip -6 addr add fd66:2::10/64 dev eth0
-incus exec wanhost -- sh -c 'apt-get install -y iperf3 >/dev/null 2>&1; iperf3 -s -D'
+# Tools: iperf3 client on lanhost, iperf3 server + tcpdump on wanhost.
+incus exec lanhost -- sh -c 'apt-get update -qq && apt-get install -y iperf3 >/dev/null 2>&1'
+incus exec wanhost -- sh -c 'apt-get update -qq && apt-get install -y iperf3 tcpdump >/dev/null 2>&1; iperf3 -s -D'
 
 # Wait for the appliance + confirm the interface map
 incus exec xpf-rtr -- cli -c "show interfaces terse"   # fxp0 / ge-0/0/0 / ge-0/0/1
@@ -175,13 +182,14 @@ incus exec lanhost -- iperf3 -c fd66:2::10 -t 5
 
 # Prove it ROUTED + NAT'd (not just L2):
 incus exec xpf-rtr -- cli -c "show security flow session"      # LAN→WAN sessions w/ translation
-incus exec wanhost -- timeout 5 tcpdump -ni eth0 -c3 'src 10.66.2.1'  # SNAT source = appliance WAN
+incus exec wanhost -- timeout 6 tcpdump -ni eth0 -c3 'src 10.66.2.1'    # v4 SNAT source = appliance WAN
+incus exec wanhost -- timeout 6 tcpdump -ni eth0 -c3 'src fd66:2::1'    # v6 SNAT source = appliance WAN
 ```
 
 ### Pass criteria
 - v4 + v6 ping succeed; iperf3 moves nonzero throughput both families.
 - `show security flow session` shows the forwarded flows with interface SNAT.
-- `wanhost` sees traffic sourced from `10.66.2.1` / `fd66:2::1` (SNAT confirmed, not bridged).
+- `wanhost` sees traffic sourced from `10.66.2.1` (v4) AND `fd66:2::1` (v6) — SNAT confirmed for both families, not bridged.
 
 ### Cleanup
 ```bash
@@ -200,28 +208,39 @@ as Tier 2 but two appliances sharing reth interfaces, plus dedicated
 `em0` (control) and fabric L2 segments.
 
 ### Networks
+
+Create the networks the shipped HA YAMLs actually reference as interface
+`source`s — `br-mgmt`, `ha-control`, `ha-fabric`, `br-lan`, `br-wan`
+(`examples/deploy/ha-fw0.yaml`/`ha-fw1.yaml`). Use these exact names so the
+YAMLs deploy unedited; `br-mgmt` is NAT (admin + fxp0 DHCP), the rest are
+L2-only point-to-point/segment bridges:
+
 ```bash
-incus network create xpf-ha-mgmt    ipv4.address=10.167.0.1/24 ipv4.nat=true ipv6.address=none
-incus network create xpf-ha-control ipv4.address=none ipv6.address=none   # em0, point-to-point
-incus network create xpf-ha-fabric  ipv4.address=none ipv6.address=none   # fabric
-incus network create xpf-ha-lan     ipv4.address=none ipv6.address=none   # reth1 members
-incus network create xpf-ha-wan     ipv4.address=none ipv6.address=none   # reth0 members
+incus network create br-mgmt    ipv4.address=10.167.0.1/24 ipv4.nat=true ipv6.address=none
+incus network create ha-control ipv4.address=none ipv6.address=none   # em0, point-to-point
+incus network create ha-fabric  ipv4.address=none ipv6.address=none   # fabric
+incus network create br-lan     ipv4.address=none ipv6.address=none   # reth1 members
+incus network create br-wan     ipv4.address=none ipv6.address=none   # reth0 members
 ```
 
-### Deploy (the shipped HA examples + their day-0 node-ids)
+### Deploy (the shipped HA examples, unedited)
 ```bash
 python3 scripts/deploy/xpf-deploy.py examples/deploy/ha-fw0.yaml examples/deploy/ha-fw1.yaml
-# (point each YAML's interface sources at the xpf-ha-* networks; both nodes
-#  attach NICs in the SAME order: mgmt, control, fabric, lan, wan)
+# Both nodes attach NICs in the SAME order (mgmt, control, fabric, lan, wan)
+# and share ha-pair.conf; only node_id (day-0 drive) + the ge FPC differ.
 ```
 
 ### Verify + failover
 ```bash
 incus exec fw0 -- cli -c "show chassis cluster status"          # RG0/1/2 primary/secondary
-# start a long transfer LAN→WAN through the cluster VIP, then:
-incus restart fw1            # or: incus stop fw0 (kill the RG-1 primary)
-# assert: the transfer survives with a sub-second gap; cluster re-elects;
-#         no session loss for the synced flows.
+# ha-pair.conf gives node 0 priority 200 / node 1 priority 100 for RG1 (WAN)
+# and RG2 (LAN), so fw0 is the data-path PRIMARY. To exercise failover you
+# must take down the PRIMARY (fw0), not the secondary:
+# start a long transfer LAN→WAN through the reth VIP, then:
+incus stop fw0               # kill the RG1/RG2 primary; fw1 must take over
+# assert: the transfer survives with a sub-second gap; fw1 becomes primary
+#         for RG1/RG2; no session loss for the synced flows. Then restart
+#         fw0 and confirm failback (preempt) or steady secondary per config.
 ```
 
 ### Pass criteria

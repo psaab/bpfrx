@@ -16,7 +16,9 @@ scripts/deploy/xpf-deploy.py deploy         examples/deploy/standalone.yaml     
 ## The naming contract is positional
 
 The order you attach NICs is the order they are named (matches
-`assignName()` in `pkg/daemon/linksetup.go`):
+`assignName()` in `pkg/daemon/linksetup.go`, which yields the Linux link
+name in dash form `ge-0-0-0`; config/CLI use the slash form `ge-0/0/0`
+shown below, and the config layer translates):
 
 ```
                  standalone           cluster node 0      cluster node 1
@@ -115,9 +117,12 @@ interfaces:                # ORDERED — position is the name
 Same result without a file:
 
 ```bash
-scripts/deploy/xpf-deploy.py launch --name fw1 --config standalone.conf \
+scripts/deploy/xpf-deploy.py launch --name fw1 --config examples/deploy/standalone.conf \
     --nic bridge:br-mgmt --nic sriov:enp8s0 --nic pci:0000:09:00.0,mac=02:bf:72:00:00:01
 ```
+
+(`launch` resolves a relative `--config` from the current directory, so
+give the path as you'd type it from where you run the command.)
 
 Cluster member: add `--mode cluster --node-id 0`.
 
@@ -146,9 +151,17 @@ passthrough gives native XDP but claims the entire card.
 A cluster is two YAML files passed together (one tool invocation):
 
 ```bash
+# The -sriov HA YAMLs source: br-mgmt, ha-control, ha-fabric (bridges) +
+# enp8s0/enp9s0 (SR-IOV PFs). Create the bridges and carve VFs first:
+incus network create br-mgmt ipv4.address=10.167.0.1/24 ipv4.nat=true ipv6.address=none
+for n in ha-control ha-fabric; do incus network create $n ipv4.address=none ipv6.address=none; done
+echo 4 | sudo tee /sys/class/net/enp8s0/device/sriov_numvfs   # + enp9s0
 scripts/deploy/xpf-deploy.py examples/deploy/ha-fw0-sriov.yaml examples/deploy/ha-fw1-sriov.yaml
 incus exec fw0 -- cli -c "show chassis cluster status"
 ```
+(The all-bridge HA pair — `ha-fw0.yaml`/`ha-fw1.yaml` — instead sources
+`br-lan`/`br-wan` for the dataplane; create those two bridges in place of
+the VF step.)
 
 Both nodes share `ha-pair.conf`; only `node_id` (stamped on the day-0
 drive) and the ge FPC (`0` vs `7`) differ. Two-host cluster: run the

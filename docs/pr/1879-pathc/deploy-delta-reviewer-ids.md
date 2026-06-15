@@ -237,3 +237,34 @@ local incus, vm-capable). It caught a ship-blocking defect no review found:
 This closes the "needs a live bake+boot" caveat that stood on #1906. The
 image actually boots, ships exactly one ≥6.18 kernel with the full driver
 set, passes its own verifier gate, and the day-0 loader behaves to spec.
+
+## Doc /triple-review (image-validation runbook + deploy docs)
+
+Codex (task-mqfff19j-sa2jzp) MERGE-NEEDS-MAJOR — 7 real copy-paste/accuracy
+defects; AGY (adversarial-review-mqfffbz9) MERGE-READY (missed them);
+Claude SMR verified the embedded config + commands. All 7 fixed:
+
+1. Tier-2: iperf3 installed only on wanhost (lanhost is the client) +
+   tcpdump uninstalled + v6 SNAT proof missing → install iperf3 on both,
+   tcpdump on wanhost, added the fd66:2::1 v6 tcpdump filter.
+2. Tier-3: `incus restart fw1` restarts the SECONDARY (ha-pair.conf:
+   node0=200/node1=100 for RG1/RG2) → fails to test failover; changed to
+   `incus stop fw0` (the data-path primary) + failback note.
+3. HA network names didn't match the shipped YAML sources → image-
+   validation Tier-3, deploy-quickstart, and README now create the exact
+   br-mgmt/ha-control/ha-fabric/br-lan/br-wan (and the -sriov path's
+   PFs); deploy unedited.
+4. README no-YAML launch used `--config standalone.conf` (fails from repo
+   root; launch resolves from cwd) → `examples/deploy/standalone.conf`.
+5. Naming docs conflated config slash form (ge-0/0/0) with the Linux dash
+   form (ge-0-0-0) assignName returns → added the distinction in both docs.
+6. Tier-1 table overclaimed: "mlx5/i40e driver set" (validate.py only
+   checks the Mellanox dir as the modules-extra sentinel) and "0600" (the
+   scenario checks exists/non-empty, not mode) → softened to match the
+   harness.
+7. virtio "native (vhost)" contradicted xpf-deploy.py inventory's
+   "no (generic)" → aligned both docs to generic-class.
+
+Codex VERIFIED OK: the xpf-deploy.py CLI surface matches the docs; the
+Tier-2 router config + standalone.conf + ha-pair.conf (both node-ids)
+pass check-config; incus syntax valid (6.21); cross-refs resolve.
