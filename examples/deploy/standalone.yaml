@@ -1,0 +1,21 @@
+# xpf standalone appliance — deploy with:
+#   scripts/deploy/xpf-deploy.py examples/deploy/standalone.yaml
+# Position is the naming contract (standalone): pos1=fxp0, pos2=ge-0/0/0, ...
+# The `role:` you write is checked against the position; a mismatch fails fast.
+appliance:
+  name: fw1
+  mode: standalone
+  image: xpf-appliance
+  cpu: 4
+  memory: 4GiB
+  config: standalone.conf      # xpf.conf shipped on the day-0 drive (validated)
+interfaces:                    # ORDERED — position N -> the name below
+  - role: fxp0                 # pos 1  — management, DHCP
+    backing: bridge
+    source: br-mgmt
+  - role: ge-0/0/0             # pos 2  — LAN
+    backing: bridge
+    source: br-lan
+  - role: ge-0/0/1             # pos 3  — WAN
+    backing: bridge
+    source: br-wan

@@ -94,6 +94,17 @@ audit-check:
 	}; \
 	echo "audit-check: refactoring-audit-current.txt is up to date"
 
+# Bake the distributable appliance image (#1879 Path C): one
+# offline-built bootable root disk (LATEST Ubuntu server cloudimg base
+# discovered at bake time — XPF_BASE_RELEASE pins; linux-generic
+# kernel >= 6.18, xpfd + cli + xpf-userspace-dp + day-0 config-drive
+# loader), exported as a qcow2 for libvirt/KVM AND as an incus VM
+# image (metadata tarball + the same qcow2). Includes the in-guest
+# verify-dataplane validation gate. See docs/install-images.md.
+.PHONY: image
+image:
+	python3 scripts/image/bake.py
+
 clean:
 	rm -f $(BINARY) cli xpf-userspace-dp
 	# Narrowed glob (#1476): the retained Rust shim object lives at

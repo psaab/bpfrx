@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+# xpf day-0 config-drive loader (#1879 Path C).
+#
+# vSRX parity: Juniper vSRX on KVM accepts a bootstrap Junos config on
+# an attached CD-ROM ISO carrying juniper.conf at the volume root,
+# applied at first boot while the system is factory-default. This is
+# the xpf analog, run as a oneshot systemd unit ordered Before=xpfd:
+#
+#   1. If the system has ever had a config (stamp file, configstore DB,
+#      or a preseeded /etc/xpf/xpf.conf), do nothing. A day-0 config is
+#      applied at most once; later boots never re-apply or clobber.
+#   2. Probe attached block devices for a config medium: any volume
+#      labeled `xpf-config` (any filesystem type), plus any ISO9660
+#      medium (the vSRX cdrom convention). The medium must carry
+#      xpf.conf — or juniper.conf as the vSRX-parity alias — at its
+#      root, optionally with a node-id file (`0` or `1`) for cluster
+#      members.
+#   3. Validate with the REAL commit-check gate (`xpfd check-config`,
+#      configstore.CheckText: strict parse + #1319 SchemaValidate +
+#      strict compile). Only a config that a real commit would accept
+#      is installed as /etc/xpf/xpf.conf; xpfd's normal
+#      bootstrap-from-file path then imports and commits it.
+#   4. Any failure — no medium, no config file, validation reject,
+#      mount error — logs loudly and falls back to the factory
+#      bootstrap (xpfd brings up fxp0 via DHCP). This script NEVER
+#      blocks or fails the boot: it always exits 0, and the unit is
+#      ordering-only (Before=, no Requires=) with a start timeout.
+#
+# Security posture: the config drive is UNTRUSTED operator input. It is
+# mounted ro,nosuid,nodev,noexec; only two fixed filenames at the volume
+# root are considered; the config is size-capped (here and again inside
+# `xpfd check-config`); node-id must be literally `0` or `1`; validation
+# runs under a timeout. Nothing on the medium is ever executed.
+#
+# Retriability: a medium that fails validation does NOT write the stamp,
+# so the operator can fix the config and reboot — the system is still
+# unconfigured, so this is safe and matches the "first boot of a
+# factory-default system" semantic rather than literally "first boot".
+
+set -u
+
+XPF_DIR=/etc/xpf
+STAMP="$XPF_DIR/.day0-config-applied"
+MNT=/run/xpf-day0
+XPFD=/usr/local/sbin/xpfd
+MAX_CONF_BYTES=$((4 * 1024 * 1024)) # keep in sync with xpfd check-config
+CHECK_TIMEOUT=60
+
+log()  { echo "xpf-day0: $*"; }
+warn() { echo "xpf-day0: WARNING: $*" >&2; }
+
+cleanup() {
+	umount "$MNT" 2>/dev/null || true
+	rmdir "$MNT" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# The sealed image ships without ssh host keys (virt-sysprep); first
+# boot regenerates them. This unit is Before=ssh.service so sshd starts
+# with fresh, per-instance keys.
+regen_ssh_host_keys() {
+	if ! ls /etc/ssh/ssh_host_*_key >/dev/null 2>&1; then
+		log "regenerating ssh host keys (sealed-image first boot)"
+		ssh-keygen -A >/dev/null 2>&1 || warn "ssh-keygen -A failed"
+	fi
+}
+
+# Candidate devices: labeled volumes first (explicit operator intent),
+# then any ISO9660 medium (vSRX cdrom parity). blkid is run under
+# timeout: a faulty/hung virtual medium must not consume the unit's
+# TimeoutStartSec and delay xpfd/sshd by the full backstop.
+probe_devices() {
+	{
+		timeout 15 blkid -o device -t LABEL=xpf-config 2>/dev/null || true
+		timeout 15 blkid -o device -t TYPE=iso9660 2>/dev/null || true
+	} | sort -u
+}
+
+# try_device <dev> — returns 0 if a config was validated and installed.
+try_device() {
+	local dev="$1" conf="" nodeid="" nodearg=() out rc tmpconf=""
+	log "probing config medium $dev"
+	mkdir -p "$MNT"
+	# timeout: a hung backing device (e.g. a host-side network share
+	# behind a virtual cdrom) must not stall the boot path.
+	if ! timeout 20 mount -o ro,nosuid,nodev,noexec "$dev" "$MNT" 2>/dev/null; then
+		warn "cannot mount $dev read-only — skipping"
+		return 1
+	fi
+
+	local f
+	for f in xpf.conf juniper.conf; do
+		if [ -f "$MNT/$f" ] && [ ! -L "$MNT/$f" ]; then
+			conf="$MNT/$f"
+			break
+		fi
+	done
+	if [ -z "$conf" ]; then
+		log "$dev carries no xpf.conf/juniper.conf at its root — skipping"
+		umount "$MNT"
+		return 1
+	fi
+
+	# Copy ONCE to a private root-only temp file, then size-check,
+	# validate, and install that same copy: a mutable backing store
+	# (hypervisor-side swap of an attached disk) must not be able to
+	# change the bytes between validation and install.
+	tmpconf=$(mktemp /run/xpf-day0-conf.XXXXXX) || {
+		warn "mktemp failed — skipping $dev"
+		umount "$MNT"
+		return 1
+	}
+	if ! head -c "$((MAX_CONF_BYTES + 1))" "$conf" >"$tmpconf" 2>/dev/null; then
+		warn "failed to read $conf — skipping $dev"
+		rm -f "$tmpconf"
+		umount "$MNT"
+		return 1
+	fi
+	local size
+	size=$(stat -c %s "$tmpconf" 2>/dev/null || echo 0)
+	if [ "$size" -le 0 ] || [ "$size" -gt "$MAX_CONF_BYTES" ]; then
+		warn "$conf size $size out of bounds (1..$MAX_CONF_BYTES) — skipping $dev"
+		rm -f "$tmpconf"
+		umount "$MNT"
+		return 1
+	fi
+
+	if [ -f "$MNT/node-id" ] && [ ! -L "$MNT/node-id" ]; then
+		nodeid=$(head -c 16 "$MNT/node-id" | tr -d '[:space:]')
+		if [ "$nodeid" != "0" ] && [ "$nodeid" != "1" ]; then
+			warn "node-id on $dev is not 0 or 1 (got '$nodeid') — ignoring node-id"
+			nodeid=""
+		else
+			nodearg=(-node-id "$nodeid")
+		fi
+	fi
+
+	log "validating $(basename "$conf") from $dev with the strict commit-check gate"
+	out=$(timeout "$CHECK_TIMEOUT" "$XPFD" check-config "${nodearg[@]}" "$tmpconf" 2>&1)
+	rc=$?
+	if [ $rc -ne 0 ]; then
+		case $rc in
+		2) warn "day-0 config on $dev REJECTED by commit-check — NOT installing; falling back to factory bootstrap (fxp0 DHCP)" ;;
+		124) warn "day-0 config validation timed out after ${CHECK_TIMEOUT}s — NOT installing" ;;
+		*) warn "day-0 config validation failed (exit $rc) — NOT installing" ;;
+		esac
+		while IFS= read -r line; do warn "  $line"; done <<<"$out"
+		rm -f "$tmpconf"
+		umount "$MNT"
+		return 1
+	fi
+
+	mkdir -p "$XPF_DIR"
+	chmod 0750 "$XPF_DIR" 2>/dev/null || true
+	# 0600: a day-0 config may carry credential material
+	# (root-authentication encrypted-password, IKE PSKs). Install the
+	# validated COPY, never re-read the medium.
+	if ! install -o root -g root -m 0600 "$tmpconf" "$XPF_DIR/xpf.conf"; then
+		warn "failed to install $XPF_DIR/xpf.conf"
+		rm -f "$tmpconf"
+		umount "$MNT"
+		return 1
+	fi
+	rm -f "$tmpconf"
+	# Persist node-id BEFORE stamping success: the config was commit-checked
+	# with -node-id and xpfd reads /etc/xpf/node-id before bootstrap. If this
+	# tiny write fails we must NOT stamp — a config validated as node 1 could
+	# otherwise boot with standalone/node-0 expansion while the stamp claims
+	# success. Return non-zero so the next boot retries (install is
+	# idempotent; the stamp gates retry).
+	if [ -n "$nodeid" ]; then
+		if ! printf '%s\n' "$nodeid" >"$XPF_DIR/node-id"; then
+			warn "failed to persist node-id $nodeid — not stamping; will retry on reboot"
+			rm -f "$XPF_DIR/xpf.conf"
+			umount "$MNT"
+			return 1
+		fi
+		log "installed node-id $nodeid"
+	fi
+	printf 'applied %s from %s at %s\n' "$(basename "$conf")" "$dev" \
+		"$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$STAMP"
+	log "day-0 config installed as $XPF_DIR/xpf.conf — xpfd will import and commit it at startup"
+	umount "$MNT"
+	return 0
+}
+
+main() {
+	regen_ssh_host_keys
+
+	if [ -e "$STAMP" ]; then
+		log "day-0 config already applied ($STAMP) — skipping"
+		return 0
+	fi
+	if [ -e "$XPF_DIR/.configdb" ]; then
+		log "configstore DB exists — system already configured, skipping day-0 probe"
+		return 0
+	fi
+	if [ -e "$XPF_DIR/xpf.conf" ]; then
+		log "preseeded $XPF_DIR/xpf.conf exists — skipping day-0 probe"
+		return 0
+	fi
+	if [ ! -x "$XPFD" ]; then
+		warn "$XPFD not found — cannot validate a day-0 config, skipping probe"
+		return 0
+	fi
+
+	local devs dev tries
+	for tries in 1 2; do
+		devs=$(probe_devices)
+		[ -n "$devs" ] && break
+		# Give udev a moment on first boot — a cdrom attached at power-on
+		# can enumerate a beat after local-fs.target.
+		[ "$tries" -eq 1 ] && sleep 2
+	done
+
+	if [ -z "${devs:-}" ]; then
+		log "no config medium found — factory bootstrap (fxp0 DHCP) will run"
+		return 0
+	fi
+
+	for dev in $devs; do
+		if try_device "$dev"; then
+			return 0
+		fi
+	done
+
+	log "no usable day-0 config found — factory bootstrap (fxp0 DHCP) will run"
+	return 0
+}
+
+main "$@"
+exit 0

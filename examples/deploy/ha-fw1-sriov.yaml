@@ -1,0 +1,25 @@
+# xpf HA node 1 — line-rate dataplane on SR-IOV VFs. Deploy the pair:
+#   scripts/deploy/xpf-deploy.py examples/deploy/ha-fw0-sriov.yaml examples/deploy/ha-fw1-sriov.yaml
+#
+# Position = name (cluster node 1): pos1=fxp0, pos2=em0,
+# pos3=ge-7/0/0 (fabric), pos4=ge-7/0/1 (LAN VF), pos5=ge-7/0/2 (WAN VF).
+# mgmt/control/fabric stay on bridges (no line-rate need); only the two
+# dataplane ports are VFs — the recommended production split. Both nodes
+# share ha-pair.conf; only node_id (day-0 drive) + the ge FPC differ.
+#
+# Two-host cluster: run node 0 on host A, node 1 on host B, each pointing
+# at that host's PFs. Single-host lab: use distinct PFs/VFs per node.
+appliance:
+  name: fw1
+  mode: cluster
+  node_id: 1
+  image: xpf-appliance
+  cpu: 4
+  memory: 4GiB
+  config: ha-pair.conf
+interfaces:
+  - {role: fxp0,         backing: bridge, source: br-mgmt}                          # pos 1 mgmt
+  - {role: em0,          backing: bridge, source: ha-control}                       # pos 2 HA control
+  - {role: ge-7/0/0, backing: bridge, source: ha-fabric}                        # pos 3 fabric
+  - {role: ge-7/0/1, backing: sriov,  source: enp8s0, mac: "02:bf:72:01:01:00"}  # pos 4 LAN VF
+  - {role: ge-7/0/2, backing: sriov,  source: enp9s0, mac: "02:bf:72:01:01:01"}  # pos 5 WAN VF

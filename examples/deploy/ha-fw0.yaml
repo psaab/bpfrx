@@ -1,0 +1,19 @@
+# xpf HA cluster — node 0. Deploy the pair with:
+#   scripts/deploy/xpf-deploy.py examples/deploy/ha-fw0.yaml examples/deploy/ha-fw1.yaml
+# Position is the naming contract (cluster node 0): pos1=fxp0, pos2=em0,
+# pos3=ge-0/0/0, pos4=ge-0/0/1, pos5=ge-0/0/2. Both nodes share ha-pair.conf;
+# only node_id (stamped on the day-0 drive) and the ge FPC (0 vs 7) differ.
+appliance:
+  name: fw0
+  mode: cluster
+  node_id: 0
+  image: xpf-appliance
+  cpu: 4
+  memory: 4GiB
+  config: ha-pair.conf
+interfaces:
+  - {role: fxp0,     backing: bridge, source: br-mgmt}     # pos 1 — mgmt DHCP
+  - {role: em0,      backing: bridge, source: ha-control}  # pos 2 — HA control
+  - {role: ge-0/0/0, backing: bridge, source: ha-fabric}   # pos 3 — fabric
+  - {role: ge-0/0/1, backing: bridge, source: br-lan}      # pos 4 — LAN (reth1)
+  - {role: ge-0/0/2, backing: bridge, source: br-wan}      # pos 5 — WAN (reth0)

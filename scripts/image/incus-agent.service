@@ -1,0 +1,26 @@
+# Incus guest agent for the xpf appliance image (#1879).
+#
+# Byte-compatible with the unit incus's own images ship (incus
+# agent-loader template, Apache-2.0 — verified against a live
+# images:debian/13 VM on incus 6.21). The unit is NOT enabled: it is
+# pulled in by the udev rule 99-incus-agent.rules when the incus
+# virtio-serial port appears, which makes it completely inert when the
+# image boots under libvirt/QEMU or any non-incus hypervisor. The agent
+# BINARY is never baked in — incus exposes it at runtime on the
+# `config` 9p/virtiofs share and incus-agent-setup copies it to a
+# tmpfs.
+[Unit]
+Description=Incus - agent
+Documentation=https://linuxcontainers.org/incus/docs/main/
+Before=multi-user.target cloud-init.target cloud-init.service cloud-init-local.service
+DefaultDependencies=no
+
+[Service]
+Type=notify
+WorkingDirectory=-/run/incus_agent
+ExecStartPre=/lib/systemd/incus-agent-setup
+ExecStart=/run/incus_agent/incus-agent
+Restart=on-failure
+RestartSec=5s
+StartLimitInterval=60
+StartLimitBurst=10

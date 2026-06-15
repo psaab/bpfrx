@@ -1,0 +1,17 @@
+# xpf HA cluster — node 1. Same wiring as ha-fw0.yaml; names use FPC 7
+# (ge-7/0/N) per the vSRX convention. Run on the second host (or same host
+# with distinct bridges/VFs). Shares ha-pair.conf with node 0.
+appliance:
+  name: fw1
+  mode: cluster
+  node_id: 1
+  image: xpf-appliance
+  cpu: 4
+  memory: 4GiB
+  config: ha-pair.conf
+interfaces:
+  - {role: fxp0,     backing: bridge, source: br-mgmt}     # pos 1 — mgmt DHCP
+  - {role: em0,      backing: bridge, source: ha-control}  # pos 2 — HA control
+  - {role: ge-7/0/0, backing: bridge, source: ha-fabric}   # pos 3 — fabric
+  - {role: ge-7/0/1, backing: bridge, source: br-lan}      # pos 4 — LAN (reth1)
+  - {role: ge-7/0/2, backing: bridge, source: br-wan}      # pos 5 — WAN (reth0)

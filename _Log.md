@@ -1,5 +1,36 @@
 # Action Log
 
+## 2026-06-12 — #1879 Path C: appliance images + day-0 config drive (/engineer)
+- **Timestamp**: 2026-06-12 UTC
+- **Action**: Implemented the operator-pinned Path C deliverable on
+  branch engineer/1879-pathc-images: (1) configstore.CheckText +
+  `xpfd check-config` — the real strict commit-check (parse → #1319
+  SchemaValidate on the expanded tree → strict compile) as a CLI gate,
+  refactoring compileTree/schemaValidateExpandedTree to package-level
+  helpers; (2) first-boot day-0 config-drive loader (vSRX cdrom +
+  juniper.conf analog: LABEL=xpf-config or ISO9660, xpf.conf or
+  juniper.conf at root, optional node-id, untrusted-input hardening,
+  validate-before-install, never blocks boot, stamp idempotency) +
+  make-config-drive.sh; (3) offline image bake (Debian 13 genericcloud
+  base + virt-resize/virt-customize/virt-sysprep; runtime dependency
+  matrix, kernel ≥6.18 from unstable then de-pinned, cloud-init purged,
+  networkd enabled, incus-agent loader inert outside incus; exports ONE
+  root disk as qcow2 + incus VM image metadata + SHA256SUMS) with an
+  in-guest verify-dataplane validation gate; (4) docs/install-images.md.
+  Live validation: bake on this host + scenarios A/B/C under local
+  incus (xpf-image-*) + qcow2 boot under plain QEMU/OVMF.
+- **File(s)**: pkg/configstore/{check.go,check_test.go,store.go},
+  cmd/xpfd/main.go, scripts/image/*, Makefile, docs/install-images.md
+- **Addendum (operator-directed)**: image base switched from Debian 13
+  genericcloud to the LATEST Ubuntu release, auto-discovered at bake
+  time (26.04/kernel 7.0 today; XPF_BASE_RELEASE pins). Deleted the
+  Debian-unstable kernel machinery; linux-virtual→linux-generic swap
+  with ≥6.18 + modules-extra asserts; snapd + stale-kernel purges
+  (single-kernel image); grub.d drop-in for init_on_alloc=0 (cloudimg
+  overrides GRUB_CMDLINE_LINUX_DEFAULT); virt-sparsify export (3.5 GB
+  → 1.6 GB). Round-3 reviews: Codex MERGE-READY, AGY findings fixed
+  (dpkg warn-pass guard, sparsify --tmp, cmdline assert). Final
+  artifacts xpf-1879-b542e2ac0.* — full A/B/C + QEMU/OVMF green.
 ## 2026-06-12 — #1885 PR #1901 live validation + reviews
 - **Timestamp**: 2026-06-12 UTC (08:00-08:30)
 - **Action**: Live validation on loss userspace cluster against the real
@@ -5272,6 +5303,37 @@ top.
   **Action**: #1891 /engineer — pkg/config/schema.go domain split (2,169 → 121 lines), pure code motion, seams rederived on current master post-#1319-rollout (+40 typed slots) and post-#1892 (+~500 help texts): schema_security.go (security+applications, 316 LOC), schema_interfaces.go (interfaces + tunnelSchemaChildren/wireguardSchemaNode constructors, 395 LOC), schema_routing.go (routing-options/policy-options/protocols/forwarding-options/bridge-domains/routing-instances, 390 LOC), schema_system.go (system/services/snmp/event-options, 480 LOC), schema_chassis.go (chassis, 256 LOC), schema_cos.go (class-of-service+firewall, 285 LOC). Sibling aspect files in package config (NOT subpackage — unexported setSchema, two-SSOT doctrine). One building commit per domain. Proof: canonical full-field node-path inventory dump (1,962 nodes incl. groups-wildcard mirror) byte-identical pre/post at every commit; TestSchemaAllNodesHaveDesc (#1892 pin) + full go test ./... exit 0 (36 pkgs); schema test battery 5/5 flake-free; --color-moved=dimmed-zebra non-moved residue = headers + root-map rewrites + var openers only.
   **File(s)**: pkg/config/{schema.go,schema_security.go,schema_interfaces.go,schema_routing.go,schema_system.go,schema_chassis.go,schema_cos.go}, docs/config-schema.md, _Log.md
 
+- **Timestamp**: 2026-06-12 16:55
+  **Action**: #1879 deployment UX — one-command incus launcher (NIC-order contract, sriov/pci MAC pinning, day-0 drive build+attach), check-config-validated standalone + HA example configs, SRE-facing deploy-quickstart runbook.
+  **File(s)**: scripts/deploy/xpf-launch.sh, examples/deploy/{standalone,ha-pair}.conf, docs/deploy-quickstart.md, docs/install-images.md
+
+- **Timestamp**: 2026-06-12 17:20
+  **Action**: #1879 deployment examples — per-backing recipe book (bridges/SR-IOV/whole-physical × standalone+HA), host-NIC discovery helper, three runnable HA launchers, libvirt pinned-PCI recipe for all-physical determinism.
+  **File(s)**: examples/deploy/README.md, examples/deploy/show-host-nics.sh, examples/deploy/{ha-bridges,ha-sriov,ha-physical}.sh, docs/deploy-quickstart.md
+
+- **Timestamp**: 2026-06-13 00:25
+  **Action**: PR #1906 deploy-delta round-4 review (operator-flagged the delta was unreviewed). AGY MERGE-NEEDS-MAJOR + Claude SMR: fixed --help code-leak, --dry-run non-hermetic re-exec, greedy mac parse; corrected sriov VM-ordering over-claim (runtime warning + doc fix). Codex r4 lost to infra. Delta NOT yet review-clean — sriov/physical VM ordering needs live verification.
+  **File(s)**: scripts/deploy/xpf-launch.sh, examples/deploy/{ha-sriov.sh,README.md}, docs/pr/1879-pathc/deploy-delta-reviewer-ids.md
+
+- **Timestamp**: 2026-06-13 00:55
+  **Action**: PR #1906 deploy-delta round-4b — AGY full report escalated finding #1 (guest driver-class sort in linksetup.go). Reclassified sriov/physical/pci as hardware-class (hw00..) vs virtio (eth00..); guard rejects virtio-after-hardware; rewrote docs contract to the verified class-sort rule. Also: PF-up before VF MAC pin, hardened resolve_vf_parent, hermetic dry-run, nodearg set-u guard. AGY #5 ghost-bonds refuted via reference-config equivalence.
+  **File(s)**: scripts/deploy/xpf-launch.sh, examples/deploy/{ha-sriov.sh,README.md}, docs/deploy-quickstart.md, docs/pr/1879-pathc/deploy-delta-reviewer-ids.md
+
+- **Timestamp**: 2026-06-13 09:55
+  **Action**: #1879 — operator confirmed interface naming is POSITIONAL (assignName: pos→fxp0/em0/ge). Built YAML-driven deployer scripts/deploy/xpf-deploy.py (role↔position validation, day-0 drive build, incus+libvirt emit, --dry-run) + examples/deploy/{standalone,ha-fw0,ha-fw1}.yaml. Reframed docs to positional-primary (driver-class = robustness tiebreaker, coincides in normal layouts).
+  **File(s)**: scripts/deploy/xpf-deploy.py, examples/deploy/{standalone,ha-fw0,ha-fw1}.yaml, examples/deploy/README.md, docs/deploy-quickstart.md
+
+- **Timestamp**: 2026-06-13 10:25
+  **Action**: #1879 comprehensive deploy samples — SR-IOV + passthrough YAMLs (standalone + HA), hardened libvirt code path (memory/PCI parsing, hostdev-network for VF+mac, VF-pool for sriov:), incus-vs-libvirt comparison + YAML schema reference + backing/XDP matrix in README. Same passthrough YAML deploys on both hypervisors.
+  **File(s)**: scripts/deploy/xpf-deploy.py, examples/deploy/{standalone-sriov,standalone-passthrough,ha-fw0-sriov,ha-fw1-sriov}.yaml, examples/deploy/README.md
+
+- **Timestamp**: 2026-06-13 11:20
+  **Action**: #1879 — operator directive "python not shell". Rewrote scripts/deploy/xpf-deploy.py into a self-contained Python tool (deploy/launch/inventory subcommands, in-process day-0 drive build via check-config+xorriso). Removed xpf-launch.sh + show-host-nics.sh + ha-{bridges,sriov,physical}.sh. Docs rewritten Python-only. make-config-drive.sh kept (image bakery).
+  **File(s)**: scripts/deploy/xpf-deploy.py, examples/deploy/README.md, docs/deploy-quickstart.md, docs/install-images.md, examples/deploy/{standalone,ha-pair}.conf, examples/deploy/standalone-passthrough.yaml, docs/pr/1879-pathc/deploy-delta-reviewer-ids.md; removed 5 .sh
+
+- **Timestamp**: 2026-06-13 12:10
+  **Action**: #1879 image-build tooling shell->Python: bake.py, validate.py, make_config_drive.py (replace bake-image.sh/validate-image.sh/make-config-drive.sh); Makefile image target -> bake.py; docs updated. In-guest xpf-day0-config + incus-agent-setup kept as shell (boot-critical, flagged). Filed #1917 in-place upgrade follow-on.
+  **File(s)**: scripts/image/{bake,validate,make_config_drive}.py (+removed 3 .sh), Makefile, docs/install-images.md, docs/pr/1879-pathc/deploy-delta-reviewer-ids.md
 - **Timestamp**: 2026-06-12 ~13:25 PT
   **Action**: #1904 + #1905 combined /engineer lane (both filed from the #1884 research). #1904: shared riMemberLinuxName now resolves RI tunnel list members through cfg.TunnelNameMap() (compiler-assigned TunnelConfig.Name verbatim — exact device-name parity by construction), so unit>0 members like gr-0/0/0.1 bind the real uN device (gr-0-0-0u1); non-tunnel refs keep the literal transform byte-identically. #1905: applyWireguardTunLocked passes/stores t.appliedAddrs like the GRE branch, so a CONFIGURED fe80 removed from config reconciles away while kernel-autonomous fe80s are never touched. Live on loss userspace cluster: 10/10 PASS (gr-0-0-1u1 master vrf-vrf1904; configured fe80 removed, foreign fe80::beef + kernel stable-privacy LL survive). go build/test/-race clean.
   **File(s)**: pkg/daemon/{daemon_run.go,daemon_apply.go,tunnel_anchor_test.go}, pkg/routing/{tunnel.go,tunnel_reconcile_test.go}, docs/pr/1904-routing-followups/, _Log.md
@@ -5298,3 +5360,17 @@ top.
 - **Timestamp**: 2026-06-12 ~14:25
   **Action**: #1902 — posted live-validation PR comment, filed follow-ups #1912 (encap reply blackhole) + #1913 (unfiltered trailing reinject), Copilot 3x quota-limited -> 3-of-4 fallback recorded
   **File(s)**: docs/pr/1902-pending-neigh/reviewer-ids.md
+
+- **Timestamp**: 2026-06-14 — Codex r1 (PR #1906) MERGE-NEEDS-MAJOR: fixed 5 findings — argparse globals/shorthand pre-parser, incus --no-profiles+root (phantom NIC), validate.py shlex reexec, day0 node-id write guard, bake.py prlimit die-on-fail.
+  **File(s)**: scripts/deploy/xpf-deploy.py, scripts/image/{validate.py,bake.py,xpf-day0-config}, examples/deploy/README.md, docs/pr/1879-pathc/deploy-delta-reviewer-ids.md
+
+- **Timestamp**: 2026-06-14 — #1879 LIVE BAKE+BOOT green. Live bake caught a real 2-kernel image bug (26.04 cloudimg -generic + apt linux-generic newer point release); fixed bake.py purge (apt glob + rm -rf module dir/boot + single-kernel assert). Re-baked single-kernel; full a/b/c validation PASS incl. in-guest verify-dataplane.
+  **File(s)**: scripts/image/bake.py, docs/pr/1879-pathc/deploy-delta-reviewer-ids.md
+
+- **Timestamp**: 2026-06-15 — #1879: wrote docs/image-validation.md (complete 3-tier validation runbook: Tier-1 automated first-boot gate, Tier-2 standalone forwarding+SNAT, Tier-3 HA forwarding+failover) with topology, networks, deploy YAML, router config, traffic steps, pass criteria, cleanup, honest-scope. Cross-linked from install-images.md.
+  **File(s)**: docs/image-validation.md, docs/install-images.md
+
+- **Timestamp**: 2026-06-15 — #1879 doc triple-review: Codex MERGE-NEEDS-MAJOR (7 real defects), AGY MERGE-READY, Claude SMR verified embedded config/commands. Fixed all 7 (Tier-2 tools+v6 SNAT, Tier-3 failover node, HA network names match YAML, README config path, naming slash/dash, Tier-1 precision, virtio generic-class).
+  **File(s)**: docs/image-validation.md, docs/deploy-quickstart.md, examples/deploy/README.md, docs/pr/1879-pathc/deploy-delta-reviewer-ids.md
+
+- **2026-06-15** #1879 live Tier-2: fixed incus -d root syntax in xpf-deploy.py; image boot+day-0+control-plane GREEN; forwarding blocked on virtio (AF_XDP bind busy loop) — venue limitation, doc corrected (virtio not a forwarding venue).

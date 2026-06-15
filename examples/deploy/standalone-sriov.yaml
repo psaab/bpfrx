@@ -1,0 +1,31 @@
+# xpf standalone — line-rate dataplane on SR-IOV VFs (mgmt on a bridge).
+#   scripts/deploy/xpf-deploy.py examples/deploy/standalone-sriov.yaml
+#
+# Position = name: pos1=fxp0, pos2=ge-0/0/0 (LAN), pos3=ge-0/0/1 (WAN).
+# Host prep first (see examples/deploy/README.md "SR-IOV"):
+#   echo 4 | sudo tee /sys/class/net/enp8s0/device/sriov_numvfs
+#   echo 4 | sudo tee /sys/class/net/enp9s0/device/sriov_numvfs
+#
+# Portability: `sriov:` (PF name, incus picks a VF) is incus-only. For a
+# definition that ALSO deploys on libvirt unchanged, use `pci:` with a
+# specific VF address + mac (see standalone-passthrough.yaml). mlx5 VFs
+# get native XDP; iavf VFs are generic-mode only.
+appliance:
+  name: fw1
+  mode: standalone
+  image: xpf-appliance
+  cpu: 4
+  memory: 4GiB
+  config: standalone.conf
+interfaces:
+  - role: fxp0                 # pos 1 — mgmt, DHCP (virtio bridge)
+    backing: bridge
+    source: br-mgmt
+  - role: ge-0/0/0             # pos 2 — LAN, SR-IOV VF
+    backing: sriov
+    source: enp8s0
+    mac: "02:bf:72:10:00:00"   # optional but recommended (stable identity)
+  - role: ge-0/0/1             # pos 3 — WAN, SR-IOV VF
+    backing: sriov
+    source: enp9s0
+    mac: "02:bf:72:10:00:01"
