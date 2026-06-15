@@ -313,6 +313,76 @@ fn sync_session_delete_with_unparseable_ip_is_rejected() {
     );
 }
 
+// --- rebind (#1921) -----------------------------------------------------
+
+#[test]
+fn rebind_preserves_synced_sessions() {
+    // #1921 regression. `rebind::handle` must NOT call `guard.afxdp.stop()`:
+    // that runs `stop_inner(true)`, which clears `coord.workers.handles`
+    // before `tear_down` samples them (so the 500ms zero-copy teardown
+    // quiesce is bypassed -> EBUSY/rebind loop) AND wipes the in-memory
+    // synced-session map (mod.rs:488). The reconcile pipeline's `tear_down`
+    // owns the worker stop via `stop_inner(false)`, which preserves synced
+    // state for replay. This test pins the observable consequence: a synced
+    // session installed before a rebind must survive it. If someone re-adds
+    // the explicit stop to rebind::handle, the synced map is wiped and this
+    // fails.
+    //
+    // Forwarding must be armed + supported so reconcile_status_bindings takes
+    // the real afxdp.reconcile() path (tear_down -> stop_inner(false), which
+    // preserves synced state). Its OTHER branch — the `!should_run_afxdp`
+    // early return at helpers.rs — itself calls afxdp.stop() (stop_inner(true))
+    // and would wipe synced regardless of rebind::handle, so an unarmed status
+    // would not isolate the rebind path.
+    let state = new_state(ProcessStatus {
+        forwarding_armed: true,
+        capabilities: UserspaceCapabilities {
+            forwarding_supported: true,
+            unsupported_reasons: Vec::new(),
+        },
+        ..ProcessStatus::default()
+    });
+
+    let mut upsert = req("sync_session");
+    upsert.session_sync = Some(SessionSyncRequest {
+        operation: "upsert".to_string(),
+        addr_family: 2,
+        protocol: 6,
+        src_ip: "10.0.0.1".to_string(),
+        dst_ip: "10.0.0.2".to_string(),
+        src_port: 1234,
+        dst_port: 80,
+        egress_ifindex: 7,
+        neighbor_mac: "02:bf:72:01:02:03".to_string(),
+        src_mac: "02:bf:72:0a:0b:0c".to_string(),
+        ..SessionSyncRequest::default()
+    });
+    let upsert_resp = run_request(state.clone(), upsert);
+    assert!(upsert_resp.ok, "upsert failed: {}", upsert_resp.error);
+    assert!(
+        !state
+            .lock()
+            .unwrap()
+            .afxdp
+            .snapshot_shared_session_entries()
+            .is_empty(),
+        "synced session should be present after upsert"
+    );
+
+    let rebind_resp = run_request(state.clone(), req("rebind"));
+    assert!(rebind_resp.ok, "rebind failed: {}", rebind_resp.error);
+    assert!(
+        !state
+            .lock()
+            .unwrap()
+            .afxdp
+            .snapshot_shared_session_entries()
+            .is_empty(),
+        "#1921: rebind wiped the synced-session map — did rebind::handle \
+         regain a guard.afxdp.stop() call before reconcile_status_bindings?"
+    );
+}
+
 // --- bump_fib_generation ------------------------------------------------
 
 #[test]
