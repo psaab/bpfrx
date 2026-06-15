@@ -40,8 +40,24 @@ constrain, not per-interface. v4 resolves both + scrubs stale gate text.
 
 r4 outcome: AGY READY. Codex one blocker (fabric) + 2 nits, all addressed in v5.
 
-## Plan review round 5 (plan @ <pending>)
+## Plan review round 5 (plan @ 1d2b5d6a4)
 | Reviewer | ID | Verdict |
 |---|---|---|
-| Codex | <pending> | pending (confirm fabric resolution) |
-| AGY | r4 PLAN-READY carries (v5 = exactly AGY's fabric-stamp + link-up asks) | READY |
+| Codex | task-mqfucfoi-7v3h9s | PLAN-NEEDS-MAJOR (fabric rx_queues=target stamping -> bind nonexistent queues; reconciliation half fights the uniform planner) |
+| AGY | r4 carries | READY |
+
+r5 outcome: Codex's fabric finding showed the channel-reconciliation half was
+speculative and architecture-fighting. RESTRUCTURED to minimal-first (v6).
+
+## Plan review round 6 (plan @ 46b557399) — CONVERGED
+| Reviewer | ID | Verdict |
+|---|---|---|
+| Codex | task-mqfumqk6-1bfq0o | **PLAN-READY** (no committed-scope blocker; 3 non-blocking impl asks) |
+| AGY | adversarial-review-mqfun5uz-sdygce | **PLAN-READY** |
+| Claude SMR | authored v2-v6 corrections | **PLAN-READY** |
+
+CONVERGED at 46b557399. Committed scope: Phase 0 instrumented virtio repro +
+Phase 1 (remove rebind::handle double-stop). Reconciliation = contingent Phase 2.
+Codex non-blocking asks for /engineer: (a) acceptance validates ACTUAL RX
+delivery vs bound set; (b) Phase 0 captures USERSPACE_TRACE_STAGE_REDIRECT; (c)
+add regression test that rebind does not call afxdp.stop() before reconcile.
