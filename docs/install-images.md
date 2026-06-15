@@ -202,6 +202,15 @@ follow-up, not part of this deliverable.
   `xpfd check-config [-node-id 0|1] my-xpf.conf` (exit 0 PASS / 2
   reject).
 
+## Validation
+
+`docs/image-validation.md` is the full validation runbook: Tier 1
+(automated first-boot gate via `scripts/image/validate.py` — boot,
+single ≥6.18 kernel, in-guest `verify-dataplane`, day-0 valid/invalid),
+Tier 2 (standalone forwarding + SNAT, manual), and Tier 3 (HA pair
+forwarding + failover, manual). Tier 1 gates the bake; Tiers 2–3 push
+real traffic and prove the image actually routes.
+
 ## What the image does NOT solve
 
 AF_XDP line-rate behavior remains coupled to the NIC driver exposed to

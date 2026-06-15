@@ -5366,3 +5366,6 @@ top.
 
 - **Timestamp**: 2026-06-14 — #1879 LIVE BAKE+BOOT green. Live bake caught a real 2-kernel image bug (26.04 cloudimg -generic + apt linux-generic newer point release); fixed bake.py purge (apt glob + rm -rf module dir/boot + single-kernel assert). Re-baked single-kernel; full a/b/c validation PASS incl. in-guest verify-dataplane.
   **File(s)**: scripts/image/bake.py, docs/pr/1879-pathc/deploy-delta-reviewer-ids.md
+
+- **Timestamp**: 2026-06-15 — #1879: wrote docs/image-validation.md (complete 3-tier validation runbook: Tier-1 automated first-boot gate, Tier-2 standalone forwarding+SNAT, Tier-3 HA forwarding+failover) with topology, networks, deploy YAML, router config, traffic steps, pass criteria, cleanup, honest-scope. Cross-linked from install-images.md.
+  **File(s)**: docs/image-validation.md, docs/install-images.md
