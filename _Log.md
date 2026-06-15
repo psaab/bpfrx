@@ -5363,3 +5363,6 @@ top.
 
 - **Timestamp**: 2026-06-14 — Codex r1 (PR #1906) MERGE-NEEDS-MAJOR: fixed 5 findings — argparse globals/shorthand pre-parser, incus --no-profiles+root (phantom NIC), validate.py shlex reexec, day0 node-id write guard, bake.py prlimit die-on-fail.
   **File(s)**: scripts/deploy/xpf-deploy.py, scripts/image/{validate.py,bake.py,xpf-day0-config}, examples/deploy/README.md, docs/pr/1879-pathc/deploy-delta-reviewer-ids.md
+
+- **Timestamp**: 2026-06-14 — #1879 LIVE BAKE+BOOT green. Live bake caught a real 2-kernel image bug (26.04 cloudimg -generic + apt linux-generic newer point release); fixed bake.py purge (apt glob + rm -rf module dir/boot + single-kernel assert). Re-baked single-kernel; full a/b/c validation PASS incl. in-guest verify-dataplane.
+  **File(s)**: scripts/image/bake.py, docs/pr/1879-pathc/deploy-delta-reviewer-ids.md

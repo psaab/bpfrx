@@ -212,3 +212,28 @@ hypervisors) green; example .conf still pass check-config.
 Standing for #1906: Claude SMR + AGY MERGE-READY; Codex r1 findings all
 fixed + locally verified (r2 confirmation infra-stuck); Copilot
 quota-blocked. Held for operator merge; live bake+boot still outstanding.
+
+## LIVE BAKE + BOOT (the outstanding acceptance gate) — GREEN after fixing a real bug
+
+Ran the full bake+boot on this build host (KVM via the kvm group; boot on
+local incus, vm-capable). It caught a ship-blocking defect no review found:
+
+- Bake 1 → boot scenario A FAILED: "more than one kernel in /lib/modules".
+  Root cause: Ubuntu 26.04 cloudimg already runs -generic (7.0.0-15), so
+  `apt install linux-generic` pulls a newer point release (7.0.0-22) and
+  leaves the original; the old narrow-regex purge missed 26.04's
+  per-version packages (linux-main-modules-zfs-*, linux-headers-*) + depmod
+  leftovers.
+- Fix (committed): purge every non-newest kernel VERSION via apt glob
+  (linux-*<ver>*) + rm -rf the /lib/modules/<ver> dir & /boot files, plus a
+  HARD in-bake single-kernel assert (caught a 2-kernel image on bake 2,
+  proving the assert works).
+- Bake 3 → single kernel (7.0.0-22-generic); full matrix GREEN:
+  A factory boot + IN-GUEST verify-dataplane PASS (kernel 7.0.0-22-generic,
+    -generic, full driver set, init_on_alloc=0, sshd posture, no stray cfg);
+  B valid day-0 drive installed + committed + NOT re-applied on reboot;
+  C invalid day-0 (dataplane-type ebpf) REJECTED, factory fallback reachable.
+
+This closes the "needs a live bake+boot" caveat that stood on #1906. The
+image actually boots, ships exactly one ≥6.18 kernel with the full driver
+set, passes its own verifier gate, and the day-0 loader behaves to spec.

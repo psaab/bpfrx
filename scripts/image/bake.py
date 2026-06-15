@@ -206,10 +206,26 @@ def virt_customize(work_qcow):
         '{ echo "FATAL: linux-modules-extra missing (mlx5/i40e)" >&2; exit 1; }',
         "--run-command", "export DEBIAN_FRONTEND=noninteractive && apt-get purge -y -qq "
                          "linux-virtual linux-image-virtual linux-headers-virtual 2>/dev/null || true",
+        # Ship EXACTLY ONE kernel. Ubuntu 26.04's cloudimg already runs a
+        # -generic kernel, so `apt install linux-generic` pulls a NEWER
+        # point release (e.g. 7.0.0-22 over the stock 7.0.0-15) and leaves
+        # the original — across packages a narrow name regex misses
+        # (linux-main-modules-zfs-<ver>, linux-headers-<ver>, …) AND
+        # depmod-generated files dpkg doesn't own. So for every non-newest
+        # version: purge ALL its packages via an apt glob, then rm -rf the
+        # leftover module dir + its /boot files. update-grub (below)
+        # regenerates the menu. Then HARD-ASSERT one kernel remains — the
+        # bake must catch this itself, not only the boot validation
+        # (this assert caught a real 2-kernel image during #1879 live bake).
         "--run-command",
-        'export DEBIAN_FRONTEND=noninteractive; newest=$(ls /lib/modules | sort -V | tail -1) && '
-        'dpkg-query -W -f "${Package}\\n" 2>/dev/null | grep -E "^linux-(image|modules|modules-extra)-[0-9]" '
-        '| grep -v -- "$newest" | xargs -r apt-get purge -y -qq; true',
+        'export DEBIAN_FRONTEND=noninteractive; newest=$(ls /lib/modules | sort -V | tail -1); '
+        'for v in $(ls /lib/modules | grep -vxF "$newest"); do '
+        'apt-get purge -y -qq "linux-*$v*" 2>/dev/null || true; '
+        'rm -rf "/lib/modules/$v" /boot/*"$v"*; done; '
+        'apt-get autoremove --purge -y -qq 2>/dev/null || true; true',
+        "--run-command",
+        'n=$(ls /lib/modules | wc -l); [ "$n" -eq 1 ] || '
+        '{ echo "FATAL: $n kernels in /lib/modules after purge ($(ls /lib/modules | tr "\\n" " "))" >&2; exit 1; }',
         "--run-command", "export DEBIAN_FRONTEND=noninteractive && apt-get purge -y -qq snapd "
                          "2>/dev/null || true; rm -rf /snap /var/snap /var/lib/snapd /var/cache/snapd",
         "--run-command", 'export DEBIAN_FRONTEND=noninteractive && apt-get purge -y -qq "cloud-init*" '
