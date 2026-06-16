@@ -5403,3 +5403,5 @@ top.
 - **File(s)**: pkg/upgrade/{state,runner,cutover,flip,system_linux,runner_test}.go (new)
 - **Action**: HA rolling driver (B1) + `xpfd upgrade [--rolling]` subcommand + CLI-backed RollingCluster
 - **File(s)**: pkg/upgrade/{rolling,cluster_cli,rolling_test}.go (new), cmd/xpfd/{upgrade.go (new),main.go}
+- **Action**: C1 dogfood — postinst HA-mode contract (stage-only on clustered, cut on standalone) + cluster-setup.sh XPF_DEPLOY_DEB rolling deb deploy
+- **File(s)**: debian/xpf.postinst, test/incus/cluster-setup.sh
