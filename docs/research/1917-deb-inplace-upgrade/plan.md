@@ -1,14 +1,14 @@
 # #1917 — In-place xpf upgrade (new xpfd + userspace-dp without re-imaging)
 
-- **Revision:** 6
-- **Status:** PLAN-REVISED (round 3 → round 4 confirmation). Round-1: all three
-  reviewers PLAN-NEEDS-REVISION (no KILL; composed A+B+C endorsed). Round-2: Codex 3
-  blockers (fixed v4), Claude SMR premature-READY (self-corrected), AGY 4 blockers
-  (incorporated). Round-3: Codex confirmed 1+3, refined blocker 2 (stop-before-flip,
-  fixed v5) + scrubbed stale alias; AGY surfaced FIVE new operational blockers
-  (daemon-not-fail-closed, dpkg-deletes-versioned-dir, needrestart, softdog-early-
-  boot, GRUB_DEFAULT=saved) — all confirmed against code and folded into v6.
-  Awaiting round-4 confirmation for PLAN-READY.
+- **Revision:** 7
+- **Status:** PLAN-REVISED (round 4 → round 5 confirmation). No reviewer has ever
+  PLAN-KILLed; composed A+B+C endorsed throughout. R1: all three NEEDS-REVISION.
+  R2: Codex 3 (fixed v4), SMR premature-READY (self-corrected), AGY 4 (folded). R3:
+  Codex confirmed 1+3 + refined #2 (v5); AGY 5 new operational blockers (folded v6).
+  R4: AGY confirmed all 5 round-3 blockers resolved + raised Gap A
+  (`GRUB_SAVEDEFAULT=true` boot-loop), Gap B (`/var/lib/xpf/versions` retention),
+  Gap C (HA session-sync wire back-compat) + the stale-path contradictions (already
+  fixed v6.1) — all folded into v7. Codex round-4 in-flight. Awaiting round-5.
 - **Branch:** `research/1917-deb-inplace-upgrade`
 - **Scope:** RESEARCH ONLY. No production source touched. Deliverable is this plan
   + three reviewer verdicts + an issue comment. Implementation is a separate
@@ -320,14 +320,25 @@ the kernel-fallback, all confirmed real:
   Ubuntu server installs `needrestart` by default; at the end of an apt transaction
   it scans for processes running *deleted* binaries and auto-restarts them —
   cutting the dataplane mid-`apt` even with `--no-stop-on-upgrade`. **Fix:** ship
-  `/etc/needrestart/conf.d/xpf.conf` blacklisting `xpfd.service` / the xpf binary
-  paths from auto-restart. (The dpkg-static-staging fix above also helps: if the
-  *running* binary's path is never deleted, needrestart has nothing to trigger on.)
-- **`grub-reboot` requires `GRUB_DEFAULT=saved`.** The §6.7 one-shot kernel boot
-  silently no-ops (or boot-loops) if the appliance image hardcodes `GRUB_DEFAULT=0`.
-  **Fix:** the bake / package postinst must set `GRUB_DEFAULT=saved` (+
-  `GRUB_SAVEDEFAULT` handling) and `update-grub`; `xpf-upgrade kernel` asserts it
-  before arming a one-shot boot.
+  `/etc/needrestart/conf.d/xpf.conf` blacklisting `xpfd.service` and the
+  `/var/lib/xpf/versions/` + `/usr/local/share/xpf/staged/` paths from auto-restart.
+  (The dpkg-static-staging fix above also helps: the *running* binary lives in the
+  non-dpkg `/var/lib/xpf/versions/<active>/` and is never deleted by the apt
+  transaction, so needrestart has nothing to trigger on.)
+- **`grub-reboot` requires `GRUB_DEFAULT=saved` AND `GRUB_SAVEDEFAULT` disabled.**
+  The §6.7 one-shot kernel boot silently no-ops (or boot-loops) if the appliance
+  image hardcodes `GRUB_DEFAULT=0`. **And (round-4 AGY Gap A) `GRUB_SAVEDEFAULT`
+  MUST be `false`/absent:** with `GRUB_SAVEDEFAULT=true`, GRUB writes the
+  candidate entry to `grubenv` as the *permanent* default at the moment it boots —
+  so a candidate that then hangs/fails verification is retried on the watchdog
+  reset = boot loop / brick, defeating the one-shot fallback. **Fix:** the bake /
+  package postinst sets `GRUB_DEFAULT=saved`, ensures `GRUB_SAVEDEFAULT` is unset
+  (`false`), and `update-grub`; `xpf-upgrade kernel` asserts both before arming a
+  one-shot boot.
+- **`/var/lib/xpf/versions/` retention (round-4 AGY Gap B).** Because the runtime
+  versioned dirs are NOT dpkg-managed, successive upgrades accumulate and can fill
+  `/var`. `xpf-upgrade` MUST enforce a retention policy: keep the active version,
+  the immediate rollback (N-1), and the staged candidate; prune the rest.
 
 ### 6.3 The `.deb` `postinst` — verify-before-cut, delegating the mechanism
 
@@ -405,6 +416,18 @@ helper's `ping`/status, and **force a full dataplane cycle (M-mech-1) on
 mismatch** rather than attempt a hot re-attach. The `XPF_PROTOCOL_WIRE_REGEN`
 fixtures + key-absent pins are the compatibility test surface to extend with a
 "new-xpfd vs old-running-helper protocol-gate" case.
+
+**HA session-sync wire back-compat (round-4 AGY Gap C).** During a rolling HA
+upgrade, node A (N+1) and node B (N) coexist and must keep syncing sessions or the
+rolling cut drops connections. The existing HA-protocol-version check
+(`daemon_ha_userspace.go:930`) gates *transfer readiness* but does NOT make the
+*session-sync frame format* back-compatible. The plan therefore MANDATES: **if the
+session-sync wire format changes in N+1, it MUST remain backwards-compatible for at
+least one release — N+1 accepts and parses version-N sync frames (and emits frames
+N can parse, or negotiates down)** — so a rolling upgrade can complete with sessions
+intact. If a sync-format break is unavoidable, that release is NOT rolling-upgradable
+and must go through Path C (image-replace of both nodes) with the connection loss
+documented. Extend the wire-regen fixtures with an N↔N+1 session-sync round-trip.
 
 ### 6.7 The held/verify-gated kernel channel (resolves the Path-A contradiction)
 
@@ -589,6 +612,9 @@ pin / one-kernel assert / verify-dataplane gate logic in bake.py is unchanged; t
 | 15 | `needrestart` (default on Ubuntu server) auto-restarts xpfd running a deleted binary → cuts dataplane mid-apt regardless of dh flags | Availability | High | High | Ship `/etc/needrestart/conf.d/xpf.conf` blacklist; static staging means running path is never deleted (§6.3c) |
 | 16 | `softdog` can't catch a candidate-kernel early-boot hang (loads after the hang) → brick | Availability | Med | Critical | Require HW/hypervisor `/dev/watchdog`, not softdog, for the never-brick guarantee (§6.7) |
 | 17 | `grub-reboot` no-ops / boot-loops if image hardcodes `GRUB_DEFAULT=0` | Availability | Med | High | Set `GRUB_DEFAULT=saved` in bake/postinst; `xpf-upgrade kernel` asserts it before arming (§6.3c/§6.7) |
+| 18 | `GRUB_SAVEDEFAULT=true` saves the candidate kernel as permanent default at boot → bad kernel retried on watchdog reset = boot loop/brick | Availability | Med | Critical | Mandate `GRUB_SAVEDEFAULT` false/absent; `xpf-upgrade kernel` asserts before arming (§6.3c/§6.7) |
+| 19 | `/var/lib/xpf/versions/` accumulates over upgrades → `/var` fills | Availability | Low | Med | `xpf-upgrade` retention: keep active + N-1 rollback + staged candidate, prune rest (§6.3c) |
+| 20 | HA session-sync wire format breaks across N/N+1 → rolling upgrade drops connections (HA-protocol-version gate covers readiness, not sync-frame format) | Availability/Correctness | Med | High | Require session-sync back-compat ≥1 release (N+1 parses N frames); else not rolling-upgradable → Path C (§6.5) |
 
 ## 10. Test plan
 
