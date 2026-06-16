@@ -5417,3 +5417,5 @@ top.
 - **File(s)**: pkg/upgrade/cutover.go, pkg/upgrade/runner_test.go
 - **Action**: Code-review round 4 fixes (Codex r4) — PeerTakeoverReady rejects Takeover/Transfer-ready:no + Monitor-failures; parseDrainComplete resets curRG on malformed header (no row bleed)
 - **File(s)**: pkg/upgrade/cluster_cli.go, pkg/upgrade/cluster_cli_test.go
+- **Action**: Code-review round 5 fix (Codex r5) — PeerTakeoverReady checks the state TOKEN after the colon, not a line substring (a YES reason embedding "no" no longer false-positives)
+- **File(s)**: pkg/upgrade/cluster_cli.go, pkg/upgrade/cluster_cli_test.go

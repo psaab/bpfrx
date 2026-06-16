@@ -261,10 +261,14 @@ func parsePeerTakeoverReady(s string) bool {
 	}
 	for _, line := range strings.Split(s, "\n") {
 		ll := strings.ToLower(strings.TrimSpace(line))
-		if strings.HasPrefix(ll, "takeover ready:") && strings.Contains(ll, "no") {
+		// Check the STATE TOKEN (the first word after the colon), NOT a
+		// substring of the whole line — a YES line whose reason text embeds
+		// "no" (e.g. "Takeover ready: yes (no prior failures)") must not
+		// trip the guard (Codex r5).
+		if tok, ok := firstTokenAfterColon(ll, "takeover ready:"); ok && tok == "no" {
 			return false
 		}
-		if strings.HasPrefix(ll, "transfer ready:") && strings.Contains(ll, "no") {
+		if tok, ok := firstTokenAfterColon(ll, "transfer ready:"); ok && tok == "no" {
 			return false
 		}
 		if strings.HasPrefix(ll, "monitor failures:") {
@@ -280,6 +284,22 @@ func parsePeerTakeoverReady(s string) bool {
 		}
 	}
 	return true
+}
+
+// firstTokenAfterColon returns the first whitespace-delimited token after
+// the given "key:" prefix in line (lowercased), e.g. for
+// "takeover ready: yes (no prior failures)" with prefix "takeover ready:"
+// it returns ("yes", true).
+func firstTokenAfterColon(line, prefix string) (string, bool) {
+	if !strings.HasPrefix(line, prefix) {
+		return "", false
+	}
+	rest := strings.TrimSpace(line[len(prefix):])
+	f := strings.Fields(rest)
+	if len(f) == 0 {
+		return "", false
+	}
+	return f[0], true
 }
 
 // parseDrainComplete evaluates the `show chassis cluster status`

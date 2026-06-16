@@ -147,8 +147,18 @@ func TestPeerTakeoverReady_Fixtures(t *testing.T) {
 	transferNo := strings.ReplaceAll(ready, "Transfer ready: yes", "Transfer ready: no")
 	monFail := strings.ReplaceAll(ready, "Monitor failures: none", "Monitor failures: ge-0-0-1")
 
+	// A YES line whose reason text embeds the substring "no" must NOT trip
+	// the "no" guard (Codex r5: hardens against future/localized reason
+	// strings). The state token is "yes"; "no" only appears in the reason.
+	readyReasonWithNo := strings.ReplaceAll(ready,
+		"Takeover ready: yes (since 12:00:00)",
+		"Takeover ready: yes (no prior failures)")
+
 	if !parsePeerTakeoverReady(ready) {
 		t.Error("all-green should be takeover-ready")
+	}
+	if !parsePeerTakeoverReady(readyReasonWithNo) {
+		t.Error("a YES line whose reason embeds 'no' must NOT be treated as not-ready")
 	}
 	if parsePeerTakeoverReady(takeoverNo) {
 		t.Error("'Takeover ready: no' must block (VIP stranding risk)")
