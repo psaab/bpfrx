@@ -250,10 +250,22 @@ func trailingInt(line string) (int, bool) {
 }
 
 func parsePeerTakeoverReady(s string) bool {
-	// The PEER is takeover-ready when it is healthy AND no RG reports a
-	// takeover blocker. The information topic (FormatInformation) emits
-	// "Takeover ready: no (...)", "Transfer ready: no", and a "Monitor
-	// failures:" line when an RG cannot take over (status.go). Conservative
+	// IMPORTANT (Codex): the information topic renders the LOCAL node's
+	// view, so "Takeover ready" / "Transfer ready" / "Monitor failures"
+	// reflect THIS node's readiness, not the peer's. We cannot directly see
+	// the peer's takeover-readiness from the local control socket. This
+	// precheck is therefore a BEST-EFFORT pre-demotion gate: it requires
+	// the peer alive ("Remote node: healthy") and no LOCAL takeover blocker
+	// (a local monitor/interface fault that would also affect the handoff).
+	// The AUTHORITATIVE guard is DrainComplete, which AFTER demotion
+	// confirms the peer ACTUALLY holds primary for every RG; if it does not
+	// within the deadline the rolling driver fails back and ABORTS WITHOUT
+	// cutting (rolling.go). So a peer that cannot take over cannot lead to a
+	// cut — at worst the drain times out and the node is restored.
+	//
+	// The information topic (FormatInformation) emits "Takeover ready:
+	// no (...)", "Transfer ready: no", and a "Monitor failures:" line when
+	// an RG cannot take over (status.go). Conservative
 	// — ANY of these blockers fails the precheck (Codex r4 High: the parser
 	// must not be fail-open on the real not-ready tokens).
 	if !lineHasAll(s, "Remote node:", "healthy") {
@@ -445,8 +457,14 @@ func parseNodeToken(tok string) (int, bool) {
 }
 
 func (g *grpcCluster) ResetFailover() error {
+	// ForceSecondary demotes EVERY configured RG, so ResetFailover must
+	// reset every configured RG — not a hardcoded {0,1} (Codex: shipped
+	// configs include RG 2, which would otherwise stay held demoted after
+	// cutover). Enumerate the live RG IDs from the status output; fall back
+	// to {0,1,2} if enumeration fails.
+	rgs := g.configuredRGs()
 	var firstErr error
-	for _, rg := range []int{0, 1} {
+	for _, rg := range rgs {
 		if err := g.systemAction(fmt.Sprintf("cluster-failover-reset:%d", rg)); err != nil {
 			if firstErr == nil {
 				firstErr = err
@@ -454,6 +472,39 @@ func (g *grpcCluster) ResetFailover() error {
 		}
 	}
 	return firstErr
+}
+
+// configuredRGs returns the redundancy-group IDs from the status output,
+// or a conservative {0,1,2} fallback if it cannot enumerate them.
+func (g *grpcCluster) configuredRGs() []int {
+	s, err := g.statusText()
+	if err == nil {
+		if rgs := parseRGIDs(s); len(rgs) > 0 {
+			return rgs
+		}
+	}
+	return []int{0, 1, 2}
+}
+
+// parseRGIDs extracts the redundancy-group IDs from "Redundancy group: N"
+// header lines in FormatStatus output.
+func parseRGIDs(s string) []int {
+	seen := map[int]bool{}
+	var out []int
+	for _, line := range strings.Split(s, "\n") {
+		l := strings.TrimSpace(line)
+		if strings.HasPrefix(strings.ToLower(l), "redundancy group:") {
+			rest := strings.TrimSpace(l[len("Redundancy group:"):])
+			f := strings.Fields(rest)
+			if len(f) > 0 {
+				if n, ok := atoiSafe(f[0]); ok && !seen[n] {
+					seen[n] = true
+					out = append(out, n)
+				}
+			}
+		}
+	}
+	return out
 }
 
 func (g *grpcCluster) LocalPrimary() (bool, error) {

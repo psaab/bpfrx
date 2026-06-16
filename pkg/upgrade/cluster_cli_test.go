@@ -216,6 +216,25 @@ func TestSyncParser_Fixtures(t *testing.T) {
 	}
 }
 
+// TestParseRGIDs proves ResetFailover enumerates ALL configured RGs
+// (Codex: shipped configs include RG 2; ForceSecondary demotes all RGs so
+// reset must cover all of them, not a hardcoded {0,1}).
+func TestParseRGIDs(t *testing.T) {
+	s := strings.Join([]string{
+		"Node name: node0",
+		"Redundancy group: 0 , Failover count: 0",
+		"node0   200      primary   yes no None",
+		"Redundancy group: 1 , Failover count: 0",
+		"node0   100      secondary yes no None",
+		"Redundancy group: 2 , Failover count: 0",
+		"node0   200      primary   yes no None",
+	}, "\n")
+	got := parseRGIDs(s)
+	if len(got) != 3 || got[0] != 0 || got[1] != 1 || got[2] != 2 {
+		t.Fatalf("parseRGIDs = %v, want [0 1 2]", got)
+	}
+}
+
 func TestParseHAProtocolCompatible(t *testing.T) {
 	match := "HA protocol version: 1\nPeer HA protocol version: 1\n"
 	mismatch := "HA protocol version: 1\nPeer HA protocol version: 2\n"

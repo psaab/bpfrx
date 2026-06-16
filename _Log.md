@@ -5419,3 +5419,5 @@ top.
 - **File(s)**: pkg/upgrade/cluster_cli.go, pkg/upgrade/cluster_cli_test.go
 - **Action**: Code-review round 5 fix (Codex r5) — PeerTakeoverReady checks the state TOKEN after the colon, not a line substring (a YES reason embedding "no" no longer false-positives)
 - **File(s)**: pkg/upgrade/cluster_cli.go, pkg/upgrade/cluster_cli_test.go
+- **Action**: Code-review round 5 follow-up (Codex full re-read) — ResetFailover resets ALL configured RGs (enumerated, was hardcoded 0,1); documented PeerTakeoverReady best-effort + DrainComplete authoritative
+- **File(s)**: pkg/upgrade/cluster_cli.go, pkg/upgrade/cluster_cli_test.go, docs/in-place-upgrade.md

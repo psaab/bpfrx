@@ -127,6 +127,17 @@ raw push+restart path (and `XPF_DEPLOY_FAST`) is unchanged for the dev
 inner loop. The deb path is opt-in until validated live; it then becomes
 the CI/smoke default.
 
+## Peer-takeover-readiness is best-effort; DrainComplete is authoritative
+
+The local control socket renders the LOCAL node's view, so the
+pre-demotion `PeerTakeoverReady` check cannot directly read the PEER's
+takeover-readiness — it requires the peer alive and no LOCAL takeover
+blocker. The AUTHORITATIVE guard is `DrainComplete`, which AFTER demotion
+confirms the peer ACTUALLY holds primary for EVERY RG; if it does not
+within the deadline, the rolling driver fails back and ABORTS WITHOUT
+cutting. A peer that cannot take over therefore never leads to a cut — at
+worst the drain times out and the local node is restored to forwarding.
+
 ## Rolling protocol-bump limitation
 
 `HAProtocolCompatible` compares the RUNNING local daemon's HA protocol
