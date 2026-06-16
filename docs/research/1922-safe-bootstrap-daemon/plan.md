@@ -481,8 +481,12 @@ the protection off fxp0. Confirm this is the right escape valve.
    daemon is about to remove. The lifeline `.network` survives `networkctl
    reload`, daemon restarts, and rollback-to-bootstrap.
 3. **Protected-set enforcement is config-independent:** the designation
-   (leaf ∪ fxp0 ∪ lifeline-record) is effective under empty/absent/corrupt/
-   rolled-back configs — it lives in the reconcile path, not (only) the config tree.
+   (leaf ∪ fxp0 ∪ lifeline-record) lives in the reconcile path, not (only) the
+   config tree, so it holds under empty/absent/rolled-back configs. On a
+   **corrupt/too-new DB the daemon is fatal (case 4) and never runs reconcile** —
+   there protected-set "enforcement" is only the *persisted* prior lifeline/
+   networkd state (no new reconcile or write occurs on a corrupt DB); a
+   never-booted corrupt box has no prior state (console-only, bounded residual).
 4. **RETH `.link` semantics** (`MACAddress=` vs `OriginalName=`,
    `ensureRethLinkOriginalName`), `KeepConfiguration=static` VIP preservation,
    and FPC-7 node-1 naming untouched — the SAFE-BOOTSTRAP diff is confined to the
@@ -546,9 +550,11 @@ the protection off fxp0. Confirm this is the right escape valve.
   - **T2 fresh-foreign-host bootstrap:** wipe `.configdb` + `xpf.conf`, boot →
     bootstrap mode, fxp0 DHCP reachable, NICs NOT renamed beyond lifeline path,
     dataplane NOT armed; `commit confirmed` + confirm → full takeover.
-  - **T3 corrupt-DB-lifeline:** write a too-new envelope DB (case 4) → daemon
-    fatal per #1917 D1, BUT mgmt reachable on the lifeline for repair (OQ-A:
-    whether lifeline `.network` is written before the fatal exit).
+  - **T3 corrupt-DB fail-closed (C4):** write a too-new envelope DB (case 4) on a
+    PREVIOUSLY-BOOTED node → daemon fatal per #1917 D1, NO new lifeline written,
+    mgmt still reachable for repair via the prior-boot lifeline/networkd files.
+    Negative case: a never-booted box with a corrupt day-0 DB has no prior mgmt
+    identity → console-only (bounded residual, asserted not silently masked).
   - **T4 mgmt-not-idx-0 refusal:** default route on a non-idx-0 NIC → daemon
     refuses takeover, stays bootstrap, logs loudly, mgmt stays reachable.
 - **HA:** `make test-failover` for any commit touching daemon startup /
