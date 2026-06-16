@@ -69,7 +69,7 @@ func TestEnvelopeOnDiskHasMagicHeader(t *testing.T) {
 // silent-wipe defect the floor closes: an old reader must reject, not
 // empty-load.
 func TestOldReaderRejectsEnvelope(t *testing.T) {
-	body := wrapEnvelope([]byte(`{"Children":null}`), "1.0")
+	body := wrapEnvelope([]byte(`{"Children":null}`), "1.0", true)
 	var tree config.ConfigTree
 	if err := json.Unmarshal(body, &tree); err == nil {
 		t.Fatal("old reader (bare json.Unmarshal) accepted the envelope; floor is broken — it must reject")

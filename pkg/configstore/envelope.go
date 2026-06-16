@@ -76,6 +76,19 @@ const (
 	EnvelopeRollbackFormatVersion = 1
 )
 
+// committedFieldKey is the envelope header field that records whether the
+// active.json on disk represents a SUCCESSFULLY-COMMITTED config
+// (committed=1) or a never-successfully-committed marker (committed=0)
+// written by the #1922 Item 1b first-commit rollback (`enterBootstrapMode`).
+// It is the #1922 Item 2 step-0 marker.
+//
+// Migration rule (C3, mandatory): a DB written by an OLDER build lacks this
+// field. The reader MUST default a MISSING field to committed=TRUE — an
+// upgraded box with an existing active config can NEVER misclassify into
+// bootstrap. The never-committed marker is therefore FORWARD-ONLY: only a DB
+// this build itself wrote with committed=0 ever reads never-committed.
+const committedFieldKey = "committed"
+
 // envelopeHeader is the parsed content of the magic header line.
 type envelopeHeader struct {
 	FormatVersion  int
@@ -83,6 +96,14 @@ type envelopeHeader struct {
 	ASTVersion     int
 	MinReader      int
 	RollbackFormat int
+
+	// Committed records the #1922 step-0 marker. It defaults to TRUE — a
+	// header that omits the committed= field (an older-build DB, or any
+	// pre-#1922 envelope) reads as committed so an upgrade can never
+	// misclassify a populated active config into bootstrap (migration rule
+	// C3). Only an explicit `committed=0` written by this build's
+	// never-committed marker path reads false.
+	Committed bool
 }
 
 // hasEnvelope reports whether data begins with the envelope magic line.
@@ -91,17 +112,24 @@ func hasEnvelope(data []byte) bool {
 }
 
 // buildEnvelopeHeaderLine renders the magic header line (including the
-// trailing newline) for the given writer version.
-func buildEnvelopeHeaderLine(writer string) []byte {
+// trailing newline) for the given writer version. committed stamps the
+// #1922 step-0 marker (committed=1 for a real commit/sync, committed=0 for
+// the never-committed first-commit-rollback marker).
+func buildEnvelopeHeaderLine(writer string, committed bool) []byte {
 	if writer == "" {
 		writer = "unknown"
 	}
 	// writer is a build version string; strip any whitespace/newline so it
 	// can never break the single-line header grammar.
 	writer = sanitizeEnvelopeToken(writer)
-	line := fmt.Sprintf("%s v=%d writer=%s ast=%d min-reader=%d rollback-fmt=%d\n",
+	c := 0
+	if committed {
+		c = 1
+	}
+	line := fmt.Sprintf("%s v=%d writer=%s ast=%d min-reader=%d rollback-fmt=%d %s=%d\n",
 		envelopeMagic, EnvelopeFormatVersion, writer,
-		EnvelopeASTVersion, EnvelopeMinReaderVersion, EnvelopeRollbackFormatVersion)
+		EnvelopeASTVersion, EnvelopeMinReaderVersion, EnvelopeRollbackFormatVersion,
+		committedFieldKey, c)
 	return []byte(line)
 }
 
@@ -120,9 +148,10 @@ func sanitizeEnvelopeToken(s string) string {
 }
 
 // wrapEnvelope prepends the magic header line to body. body is the
-// already-(maybe-)encrypted JSON bytes.
-func wrapEnvelope(body []byte, writer string) []byte {
-	header := buildEnvelopeHeaderLine(writer)
+// already-(maybe-)encrypted JSON bytes. committed stamps the #1922 step-0
+// marker (see buildEnvelopeHeaderLine).
+func wrapEnvelope(body []byte, writer string, committed bool) []byte {
+	header := buildEnvelopeHeaderLine(writer, committed)
 	out := make([]byte, 0, len(header)+len(body))
 	out = append(out, header...)
 	out = append(out, body...)
@@ -176,7 +205,11 @@ func parseEnvelopeHeader(line string) (*envelopeHeader, error) {
 	if len(fields) == 0 || fields[0] != envelopeMagic {
 		return nil, fmt.Errorf("config envelope: malformed header line %q", line)
 	}
-	hdr := &envelopeHeader{}
+	// Default committed=true (migration rule C3): a header that omits the
+	// committed= field is an older-build envelope and must read as a
+	// successfully-committed config so an upgrade never misclassifies into
+	// bootstrap. Only an explicit committed=0 flips this.
+	hdr := &envelopeHeader{Committed: true}
 	seenVersion := false
 	for _, f := range fields[1:] {
 		k, v, ok := strings.Cut(f, "=")
@@ -211,6 +244,12 @@ func parseEnvelopeHeader(line string) (*envelopeHeader, error) {
 				return nil, fmt.Errorf("config envelope: bad rollback-fmt=%q: %w", v, err)
 			}
 			hdr.RollbackFormat = n
+		case committedFieldKey:
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				return nil, fmt.Errorf("config envelope: bad %s=%q: %w", committedFieldKey, v, err)
+			}
+			hdr.Committed = n != 0
 		default:
 			// Unknown fields are tolerated (additive forward-compat); the
 			// v=/min-reader gate is what governs readability.

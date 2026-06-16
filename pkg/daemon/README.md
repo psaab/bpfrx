@@ -57,7 +57,45 @@ between physical and virtual at boot, and `ensureRethLinkOriginalName()`
 auto-fixes stale `.link` files.
 
 Any interface not declared in the active config is brought down and given
-`ActivationPolicy=always-down` in networkd.
+`ActivationPolicy=always-down` in networkd — EXCEPT the #1922 protected set
+(see below).
+
+## Bootstrap mode + management lifeline (#1922)
+
+`bootstrap.go` implements the SAFE-BOOTSTRAP daemon state so the daemon can
+never lock an operator out of a remote box it manages.
+
+- **Five-case boot predicate** (`computeBootClass`, computed once in `Run`
+  after `Store.Load` + `bootstrapFromFile`): fresh / never-committed →
+  **bootstrap**; valid `active.json` / clean day-0 import /
+  operator-committed-empty → **normal**; corrupt/too-new → fail-safe (already
+  fatal via #1917 D1). The **HA-node guard** keys on `/etc/xpf/node-id` FILE
+  presence (NOT the config-derived `clusterMode`): a node-id node always
+  resolves NOT-bootstrap.
+- **Bootstrap mode** (`d.bootstrapMode` atomic): runs gRPC/REST/CLI normally
+  but SUPPRESSES interface takeover ACTIONS — the full rename loop, host
+  tunables, `enableForwarding`, dataplane arm (`dp.Start`), and boot-time
+  `applyConfig`. Managers are still constructed (so the exit reconcile wires
+  every subsystem). A plain first `commit` is REFUSED — the operator must
+  `commit confirmed`. Exit is one-way, on the first non-empty config apply
+  (confirmed commit OR cluster `SyncApply`); `runBootstrapExitStartup` then
+  runs the deferred startup takeover before the reconcile.
+- **PCI-keyed lifeline** (`setupBootstrapLifeline`): in bootstrap mode the
+  daemon detects the default-route mgmt NIC (v4 then v6, else refuse +
+  console), records its PCI+MAC to `/etc/xpf/lifeline-interface` (keyed by
+  PCI, survives rename/restart/rollback), and — only if that NIC is
+  enumeration index 0 — renames just it to fxp0 and snapshots its addressing
+  into the bootstrap `.network`.
+- **Protected set** (`resolveProtectedInterfaces` →
+  `dataplane.SetProtectedInterfaceResolver`): fxp0 + the lifeline NIC + an
+  explicit `system management-interface` leaf are NEVER marked Unmanaged /
+  always-down / address-stripped, even on an empty/absent/rolled-back config.
+  An explicit non-fxp0 leaf narrows fxp0 off the auto-protection.
+- **First-commit rollback** (`enterBootstrapMode`): a timed-out first
+  `commit confirmed` removes the takeover `.network` files (keeping the
+  lifeline + `.link` files), clears the FRR managed section, and detaches the
+  dataplane — instead of applying an empty config — and the store persists
+  the never-committed marker so a restart re-enters bootstrap.
 
 ## Notable gotchas
 

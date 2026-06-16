@@ -354,6 +354,19 @@ type Daemon struct {
 	priorTunablesMu     sync.Mutex
 	priorTunables       *priorHostTunables
 	priorTunablesActive bool // true once the current config has applied host tunables
+
+	// bootstrapMode is the #1922 explicit bootstrap-mode flag. When set, the
+	// daemon runs gRPC/REST/CLI as normal but suppresses ALL interface
+	// takeover ACTIONS (rename loop beyond the lifeline path, link cycles,
+	// networkd takeover writes beyond the lifeline .network, dataplane arm,
+	// FRR managed-section, boot-time applyConfig, VRRP instance creation).
+	// Set once at startup from the five-case boot predicate (computeBootClass)
+	// and cleared one-way on the first non-empty config apply (local confirmed
+	// commit or cluster SyncApply). Read on every commit gate / reconcile, so
+	// an atomic avoids a lock on the hot read path. Managers are still
+	// constructed unconditionally (C1) so the bootstrap-exit reconcile wires
+	// every subsystem.
+	bootstrapMode atomic.Bool
 }
 
 func (d *Daemon) applyResult() *dataplane.ApplyResult {

@@ -196,6 +196,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// promotion + dataplane re-apply atomically; see executeConfirmedRollback.
 	d.store.SetRollbackExecutor(d.executeConfirmedRollback)
 
+	// Register the #1922 Item 4 protected-set resolver so the dataplane
+	// reconcile (compileZones unmanaged strip) never brings down the
+	// management lifeline / fxp0, even on an empty/absent/rolled-back
+	// config. The resolver lives in the reconcile path (config-independent);
+	// it reads the persisted PCI-keyed lifeline record + the (optional)
+	// `system management-interface` leaf. Set even in NoDataplane mode is
+	// harmless (the compiler is not exercised there).
+	dataplane.SetProtectedInterfaceResolver(d.resolveProtectedInterfaces)
+
 	// Load persisted configuration from DB, falling back to text config file.
 	//
 	// Fatal-on-parse floor (#1917 increment B, plan §6.4 / D1): a PRESENT
@@ -234,6 +243,33 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 	} else {
 		slog.Info("configuration loaded from db")
+	}
+
+	// #1922 Item 2: the five-case boot predicate, computed ONCE here after
+	// Load + bootstrapFromFile have resolved. Case 4 (corrupt/too-new DB)
+	// already exited fatally above (#1917 D1). The remaining cases select
+	// bootstrap vs normal. Bootstrap mode suppresses interface/dataplane
+	// TAKEOVER actions (but not the management control surfaces or manager
+	// construction — C1). Every existing deployment resolves NOT-bootstrap
+	// (case 2/3, or case 5 committed-empty) → zero behavior change.
+	nodeIDPresent := hasNodeIDFile()
+	bootClass := computeBootClass(d.store.ActiveConfig() != nil, d.store.EverCommitted(), nodeIDPresent)
+	if bootClass == bootClassBootstrap {
+		d.bootstrapMode.Store(true)
+		slog.Warn("xpf daemon entering BOOTSTRAP mode: no committed configuration found",
+			"detail", "management control plane (gRPC/REST/CLI) runs normally, but interface "+
+				"rename/takeover, dataplane arm, and FRR/VRRP takeover are SUPPRESSED until the "+
+				"first 'commit confirmed' (+ confirm) or cluster config sync. This keeps a "+
+				"foreign/non-appliance host reachable on its existing management NIC.")
+	} else if nodeIDPresent && d.store.ActiveConfig() == nil {
+		// HA-node guard (C2/C8): node-id present but NEITHER a DB nor an
+		// importable xpf.conf. Resolved to NOT-bootstrap so takeover is not
+		// silently suppressed on a normal deploy, but HA availability is NOT
+		// promised — this is an operator misconfiguration. Log loudly.
+		slog.Error("xpf HA node has /etc/xpf/node-id but no committed config and no importable "+
+			"xpf.conf; proceeding with EMPTY config takeover (NOT bootstrap mode). HA availability "+
+			"is NOT promised in this state — push the cluster config and commit",
+			"node_id_file", nodeIDFile)
 	}
 
 	// Enumerate PCI NICs and assign vSRX-style names (fxp0, em0, ge-X-0-Y)
@@ -297,21 +333,31 @@ func (d *Daemon) Run(ctx context.Context) error {
 				coalesceTX = cfg.System.UserspaceDataplane.CoalescenceTXUsecs
 			}
 		}
-		if err := enumerateAndRenameInterfaces(nodeID, clusterMode, userspaceWorkers, rssEnabled, rssAllowed); err != nil {
-			slog.Warn("interface naming failed", "err", err)
+		if d.inBootstrap() {
+			// #1922 Item 2/3: bootstrap mode suppresses the full rename loop
+			// and host tunables. Instead, the lifeline-gated path identifies
+			// the management NIC by its default route, records its PCI
+			// identity, and (only if it would become fxp0) renames JUST that
+			// NIC + snapshots its addressing into the bootstrap .network so
+			// the operator stays reachable. No other NIC is touched.
+			d.setupBootstrapLifeline()
+		} else {
+			if err := enumerateAndRenameInterfaces(nodeID, clusterMode, userspaceWorkers, rssEnabled, rssAllowed); err != nil {
+				slog.Warn("interface naming failed", "err", err)
+			}
+			// #801: host tunables + coalescence. Runs after the interface
+			// rename but still before the dataplane is loaded — matches
+			// the D3 "before any AF_XDP bind" invariant. Best-effort: any
+			// failure logs and continues.
+			//
+			// B1 opt-in gate: host-scope knobs (governor + netdev_budget +
+			// adaptive-rx/tx flip) only apply when `claim-host-tunables
+			// true` is set. This keeps xpfd from stepping on shared hosts
+			// silently. D3 and per-iface rx-usecs/tx-usecs continue to run
+			// as before — both are interface-scoped.
+			d.applyStep0Tunables(userspaceDP, claimHostTunables, governor, netdevBudget,
+				coalesceExplicit, coalesceEnable, coalesceRX, coalesceTX, rssAllowed)
 		}
-		// #801: host tunables + coalescence. Runs after the interface
-		// rename but still before the dataplane is loaded — matches
-		// the D3 "before any AF_XDP bind" invariant. Best-effort: any
-		// failure logs and continues.
-		//
-		// B1 opt-in gate: host-scope knobs (governor + netdev_budget +
-		// adaptive-rx/tx flip) only apply when `claim-host-tunables
-		// true` is set. This keeps xpfd from stepping on shared hosts
-		// silently. D3 and per-iface rx-usecs/tx-usecs continue to run
-		// as before — both are interface-scoped.
-		d.applyStep0Tunables(userspaceDP, claimHostTunables, governor, netdevBudget,
-			coalesceExplicit, coalesceEnable, coalesceRX, coalesceTX, rssAllowed)
 	}
 
 	// Initialize routing, FRR, and IPsec managers
@@ -396,7 +442,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 
 	// Enable IP forwarding — required for the firewall to route packets.
-	if !d.opts.NoDataplane {
+	// #1922: suppressed in bootstrap mode (a takeover host tunable; the
+	// bootstrap-exit reconcile enables it on the first confirmed commit).
+	if !d.opts.NoDataplane && !d.inBootstrap() {
 		enableForwarding()
 	}
 
@@ -493,34 +541,45 @@ func (d *Daemon) Run(ctx context.Context) error {
 				}
 			}
 		}
-		if d.dp != nil {
-			if err := d.dp.Start(ctx); err != nil {
-				slog.Warn("failed to start dataplane, running in config-only mode",
-					"err", err)
-				d.dp = nil
-			} else {
-				// natSeeder is satisfied by both *dataplane.Manager
-				// (legacy eBPF — SeedNATPortCounters in maps_nat.go,
-				// SeedSessionIDCounter in maps_session.go) and the userspace
-				// *LegacyDataPlaneAdapter (via embedded bpfShim). The
-				// seed methods are no-ops on the userspace fast path
-				// but harmless to invoke. The legacyDP() round-trip is
-				// no longer required (#1519).
-				if seeder, ok := d.dp.(natSeeder); ok {
-					seeder.SeedNATPortCounters()
-					nodeID := 0
-					if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.Cluster != nil {
-						nodeID = cfg.Chassis.Cluster.NodeID
+		// #1922 Item 2: in bootstrap mode, do NOT arm the dataplane
+		// (AF_XDP attach) and do NOT run the boot-time applyConfig
+		// (interface/FRR/routing takeover). The backend object stays
+		// constructed (d.dp != nil) so the bootstrap-exit reconcile can
+		// arm it on the first confirmed commit (C1: construct always, arm
+		// only when not bootstrap). The control plane (gRPC/REST/CLI) is
+		// started later regardless.
+		if d.inBootstrap() {
+			slog.Info("bootstrap mode: dataplane arm and boot-time config apply suppressed")
+		} else {
+			if d.dp != nil {
+				if err := d.dp.Start(ctx); err != nil {
+					slog.Warn("failed to start dataplane, running in config-only mode",
+						"err", err)
+					d.dp = nil
+				} else {
+					// natSeeder is satisfied by both *dataplane.Manager
+					// (legacy eBPF — SeedNATPortCounters in maps_nat.go,
+					// SeedSessionIDCounter in maps_session.go) and the userspace
+					// *LegacyDataPlaneAdapter (via embedded bpfShim). The
+					// seed methods are no-ops on the userspace fast path
+					// but harmless to invoke. The legacyDP() round-trip is
+					// no longer required (#1519).
+					if seeder, ok := d.dp.(natSeeder); ok {
+						seeder.SeedNATPortCounters()
+						nodeID := 0
+						if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.Cluster != nil {
+							nodeID = cfg.Chassis.Cluster.NodeID
+						}
+						seeder.SeedSessionIDCounter(nodeID)
 					}
-					seeder.SeedSessionIDCounter(nodeID)
 				}
 			}
-		}
-		// Apply current config — needed even in config-only mode so that
-		// VRFs, interfaces, and routing are configured before cluster comms.
-		if cfg := d.store.ActiveConfig(); cfg != nil {
-			slog.Info("applying active configuration")
-			d.applyConfig(cfg)
+			// Apply current config — needed even in config-only mode so that
+			// VRFs, interfaces, and routing are configured before cluster comms.
+			if cfg := d.store.ActiveConfig(); cfg != nil {
+				slog.Info("applying active configuration")
+				d.applyConfig(cfg)
+			}
 		}
 	}
 	// #1715: the boot-time DNS reconcile (inside the apply above) ran
@@ -1441,6 +1500,60 @@ func enableForwarding() {
 		}
 	}
 	slog.Info("IP forwarding enabled, RA acceptance disabled")
+}
+
+// runBootstrapExitStartup performs the one-time startup TAKEOVER steps that
+// bootstrap mode suppressed at boot — interface rename, IP forwarding, and
+// dataplane arm — when the daemon leaves bootstrap on its first non-empty
+// config apply (#1922 Item 2). It runs under d.applySem (the apply caller
+// holds it) and strictly BEFORE the reconcile that wires the config onto
+// these subsystems. It mirrors the boot block in Run; bootstrap exit is
+// one-way, so this runs at most once.
+func (d *Daemon) runBootstrapExitStartup(cfg *config.Config) {
+	if d.opts.NoDataplane {
+		return
+	}
+
+	clusterMode := false
+	nodeID := 0
+	userspaceWorkers := 0
+	rssEnabled := true
+	var rssAllowed []string
+	if cfg.Chassis.Cluster != nil {
+		clusterMode = true
+		nodeID = cfg.Chassis.Cluster.NodeID
+	}
+	if dataplane.EffectiveType(cfg.System.DataplaneType) == dataplane.TypeUserspace &&
+		cfg.System.UserspaceDataplane != nil {
+		userspaceWorkers = cfg.System.UserspaceDataplane.Workers
+		if cfg.System.UserspaceDataplane.RSSIndirectionDisabled {
+			rssEnabled = false
+		}
+		rssAllowed = dpuserspace.UserspaceBoundLinuxInterfaces(cfg)
+	}
+
+	// Full rename loop — the lifeline-gated path only renamed fxp0 (or
+	// nothing). Now claim every NIC per the vSRX naming scheme.
+	if err := enumerateAndRenameInterfaces(nodeID, clusterMode, userspaceWorkers, rssEnabled, rssAllowed); err != nil {
+		slog.Warn("bootstrap exit: interface naming failed", "err", err)
+	}
+
+	// Enable IP forwarding (suppressed in bootstrap).
+	enableForwarding()
+
+	// Arm the dataplane (AF_XDP attach) — the backend object was
+	// constructed at boot (C1) but never started in bootstrap mode.
+	if d.dp != nil {
+		if err := d.dp.Start(d.daemonCtx); err != nil {
+			slog.Warn("bootstrap exit: failed to start dataplane, running in config-only mode",
+				"err", err)
+			d.dp = nil
+		} else if seeder, ok := d.dp.(natSeeder); ok {
+			seeder.SeedNATPortCounters()
+			seeder.SeedSessionIDCounter(nodeID)
+		}
+	}
+	slog.Info("bootstrap exit: startup takeover complete; applying first config")
 }
 
 func inferIPv6StaticNextHopInterfaces(cfg *config.Config) map[string]map[string]string {

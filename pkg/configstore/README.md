@@ -122,14 +122,39 @@ non-daemon embedders) the timer falls back to the self-contained
 `performAutoRollback`, which promotes store state but does not re-apply
 a dataplane it has no handle on.
 
-The `prevCfg == nil` first-commit rollback target (rolling a fresh box's
-first `commit confirmed` back to bootstrap + persisting a
-never-committed marker) is #1922 Item 1b, DEFERRED to PR-2:
-`PromoteRollback` returns `(nil, false)` and leaves that path's current
-behavior unchanged.
+The `prevCfg == nil` first-commit rollback target (#1922 Item 1b) is now
+implemented: on a FRESH-store first `commit confirmed` timeout
+`PromoteRollback` reverts the store to the empty bootstrap tree, persists
+the **never-committed marker** (committed=0, NOT an empty *committed*
+tree — see step-0 marker below), clears the in-memory `everCommitted`
+flag, and returns `(nil, true)`. The daemon executor detects the nil
+`prevCfg` and calls `enterBootstrapMode` (interface/FRR/dataplane takeover
+cleanup, keeping the management lifeline) instead of applying an empty
+config to the dataplane. A subsequent restart therefore re-classifies into
+bootstrap (the marker disambiguates never-committed from
+operator-committed-empty).
+
+### Step-0 committed marker (#1922 Item 2)
+
+The config-DB compatibility envelope (#1917) carries a `committed=` header
+field that records whether the on-disk `active.json` is a
+successfully-committed config (`committed=1`) or the never-committed
+marker (`committed=0`) written by the Item-1b first-commit rollback. The
+five-case boot predicate (in `pkg/daemon`) reads `Store.EverCommitted()`
+to decide bootstrap vs normal when the active config is empty.
+
+**Migration rule (mandatory):** a DB written by an OLDER build omits the
+field; `parseEnvelopeHeader` defaults a missing `committed=` to **true**,
+and a legacy no-envelope DB also reads committed. An upgraded box with an
+existing active config can therefore never misclassify into bootstrap; the
+never-committed marker is forward-only. `WriteActive` stamps
+`committed=1`; `WriteActiveMarker(tree, false)` writes the never-committed
+marker. `everCommitted` is set on `Commit` / `CommitConfirmed` /
+`SyncApply` and cleared by the first-commit rollback.
 
 Test seams (`test_seams.go`): `SetWriteActiveForTesting` injects
 persistence failures on every persist path;
+`SetWriteActiveMarkerForTesting` observes the step-0 committed bit;
 `SetPersistRetryBackoffForTesting` makes the retry loop deterministic.
 
 ## Audit journal (#1896)

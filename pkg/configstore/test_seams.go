@@ -23,6 +23,17 @@ func (s *Store) SetWriteActiveForTesting(fn func(*config.ConfigTree) error) {
 	s.writeActiveFn = fn
 }
 
+// SetWriteActiveMarkerForTesting overrides the marker-aware active-config
+// persistence path (#1922 step-0). fn(tree, committed) replaces
+// db.WriteActiveMarker so tests can observe the committed bit the Item 1b
+// first-commit rollback writes. Pass nil to restore the real DB write. Not
+// for production callers.
+func (s *Store) SetWriteActiveMarkerForTesting(fn func(*config.ConfigTree, bool) error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.writeActiveMarkerFn = fn
+}
+
 // ConfirmGenForTesting returns the current commit-confirmed generation
 // token (#1922 Item 1a). Tests use it to call PromoteRollback /
 // executeConfirmedRollback with the generation that armed the pending
