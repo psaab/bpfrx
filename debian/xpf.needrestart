@@ -1,0 +1,19 @@
+# xpf (#1917 §6.3c): keep needrestart from auto-restarting xpfd.
+#
+# Ubuntu server installs needrestart by default; at the end of an apt
+# transaction it scans for processes running deleted binaries and
+# auto-restarts their services. That would cut the dataplane mid-apt
+# even though our packaging never stops xpfd on upgrade. Two defences:
+#
+#   1. The running xpfd binary lives under the non-dpkg runtime path
+#      (the live /usr/local/sbin symlink chain), which an `apt upgrade
+#      xpf` only refreshes in the dpkg-static staging area — so the
+#      running binary is not deleted and needrestart has nothing to
+#      trigger on for the common case.
+#   2. Belt-and-braces: explicitly blacklist xpfd.service so even if a
+#      future layout exposes a deleted-binary condition, needrestart
+#      never restarts the dataplane. The verified cut-over is driven
+#      explicitly by the in-place upgrade mechanism, never by
+#      needrestart.
+$nrconf{override_rc}{qr(^xpfd\.service$)} = 0;
+$nrconf{override_rc}{qr(^xpf-day0-config\.service$)} = 0;

@@ -286,3 +286,47 @@ loss-cluster-stop:
 
 loss-cluster-restart:
 	$(LOSS_CLUSTER_SETUP) restart $(NODE)
+
+# Build the xpf Debian package (#1917 increment A). Produces ../xpf_*.deb
+# and ../xpf-appliance_*.deb relative to the source tree (dpkg's default
+# parent-dir output), then copies them into dist/deb/.
+#
+# The package build delegates to `make build build-ctl build-userspace-dp`
+# (see debian/rules), so it picks up the embedded #1864 shim and the
+# pinned cargo helper. The changelog version is rewritten from
+# `git describe` here, normalized to a Debian-policy-valid native version
+# (dashes -> dots; a `-` is illegal in a native package version).
+# Debian native versions MUST start with a digit and exclude `-`. The
+# project's git tags are non-numeric (e.g. userspace-forwarding-ok-*),
+# so synthesize 0.0.<commit-count>+g<short-sha>[.dirty] — monotonic in
+# commit count, carries the exact source sha, and is policy-valid.
+DEB_GIT_COUNT ?= $(shell git rev-list --count HEAD 2>/dev/null || echo 0)
+DEB_GIT_SHA   ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+DEB_GIT_DIRTY ?= $(shell git diff --quiet 2>/dev/null || echo .dirty)
+DEB_VERSION ?= 0.0.$(DEB_GIT_COUNT)+g$(DEB_GIT_SHA)$(DEB_GIT_DIRTY)
+DEB_OUT ?= $(CURDIR)/dist/deb
+
+.PHONY: deb
+deb:
+	@echo "==> xpf .deb version: $(DEB_VERSION)"
+	@# Stamp the build version into the (committed-as-0.0.0) changelog,
+	@# build, then RESTORE the version token to 0.0.0 so the tree stays
+	@# clean (the build version is derived from git, not committed). Only
+	@# the top line's version token is rewritten; the rest of the entry and
+	@# trailer stay intact so dpkg can parse it. The restore runs whether
+	@# the build succeeds or fails. (A backup FILE under debian/ would be
+	@# deleted by dpkg-buildpackage's own clean phase, so re-sed instead.)
+	sed -i "1s/^xpf ([^)]*)/xpf ($(DEB_VERSION))/" debian/changelog
+	dpkg-buildpackage -us -uc -b --no-sign; rc=$$?; \
+	  sed -i "1s/^xpf ([^)]*)/xpf (0.0.0)/" debian/changelog; \
+	  test $$rc -eq 0 || exit $$rc
+	mkdir -p $(DEB_OUT)
+	cp ../xpf_$(DEB_VERSION)_*.deb ../xpf-appliance_$(DEB_VERSION)_*.deb $(DEB_OUT)/
+	@# dpkg-buildpackage writes the .deb/.changes/.buildinfo to the PARENT
+	@# dir (not configurable). We keep the canonical copies in dist/deb/;
+	@# remove the parent-dir artifacts so they do not litter the tree above
+	@# the source dir (which may be a git worktree parent).
+	rm -f ../xpf_$(DEB_VERSION)_*.deb ../xpf-appliance_$(DEB_VERSION)_*.deb \
+	      ../xpf_$(DEB_VERSION)_*.changes ../xpf_$(DEB_VERSION)_*.buildinfo
+	@echo "==> packages in $(DEB_OUT):"
+	@ls -1 $(DEB_OUT)/*.deb

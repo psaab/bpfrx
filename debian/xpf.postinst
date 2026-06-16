@@ -1,0 +1,61 @@
+#!/bin/sh
+# xpf postinst (increment A of #1917).
+#
+# Increment A is packaging-only. The in-place upgrade cut-over
+# mechanism (staged -> runtime versioned dir copy, verify-dataplane
+# gate, atomic symlink flip, HA rolling failover, rollback) is a
+# separate increment and is intentionally NOT implemented here.
+#
+# dpkg installs the binary set to the dpkg-static staging path
+# /usr/local/share/xpf/staged/. The running daemon resolves its
+# binaries via /usr/local/sbin/* which are SYMLINKS into the staging
+# path. On FIRST install (no previously configured version) we create
+# those symlinks so xpfd actually runs. On UPGRADE we deliberately
+# leave the live symlinks untouched: a plain `apt upgrade xpf` only
+# refreshes the staging path and must never cut the dataplane. The
+# verified cut-over is driven explicitly by the increment-B mechanism.
+
+set -e
+
+STAGED=/usr/local/share/xpf/staged
+SBIN=/usr/local/sbin
+BINS="xpfd cli xpf-userspace-dp xpf-day0-config"
+
+case "$1" in
+    configure)
+        # $2 is the previously-configured version, empty on first install.
+        if [ -z "$2" ]; then
+            mkdir -p "$SBIN"
+            for b in $BINS; do
+                # First install: point the live path at the staged binary.
+                # Use a relative-free absolute symlink target; ln -sfn so a
+                # pre-existing symlink/dir is replaced atomically.
+                ln -sfn "$STAGED/$b" "$SBIN/$b"
+            done
+        else
+            # Upgrade: do NOT touch the live symlinks. Only ensure they
+            # exist (e.g. recovering from a partially-set-up state); never
+            # repoint an existing one — repointing while the daemon is up
+            # would let the running xpfd resolve a different-version helper
+            # (the increment-B cut-over owns that, behind a verify gate).
+            for b in $BINS; do
+                if [ ! -e "$SBIN/$b" ]; then
+                    mkdir -p "$SBIN"
+                    ln -sfn "$STAGED/$b" "$SBIN/$b"
+                fi
+            done
+        fi
+        # State under /etc/xpf (.configdb, node-id, master.key) is runtime
+        # state, NOT package-owned. Do not create, seed, or modify it here.
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

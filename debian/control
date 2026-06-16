@@ -1,0 +1,59 @@
+Source: xpf
+Section: net
+Priority: optional
+Maintainer: xpf maintainers <noreply@anthropic.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Homepage: https://github.com/psaab/xpf
+Rules-Requires-Root: no
+
+Package: xpf
+Architecture: amd64
+Depends: ${misc:Depends}, adduser
+Description: Junos-style firewall with AF_XDP userspace dataplane
+ xpf is a Junos-style stateful firewall that clones Juniper vSRX
+ capabilities using native Junos configuration syntax. The runtime
+ forwarding path is a Rust AF_XDP userspace dataplane driven by the
+ Go control plane (xpfd).
+ .
+ This package ships the binary set (xpfd, xpf-userspace-dp, cli),
+ the day-0 config-drive loader, and the systemd units. Binaries are
+ installed to a dpkg-static staging path; the live /usr/local/sbin
+ symlinks are created on first install (the in-place upgrade cut-over
+ mechanism that flips them after a verify gate is a separate increment
+ and is intentionally not part of this package's postinst).
+ .
+ The AF_XDP shim is embedded into the xpfd binary (go:embed), so no
+ separate shim object is shipped.
+
+Package: xpf-appliance
+Architecture: amd64
+Depends: ${misc:Depends},
+ xpf (= ${binary:Version}),
+ frr,
+ strongswan,
+ strongswan-swanctl,
+ kea-dhcp4-server,
+ kea-dhcp6-server,
+ chrony,
+ iproute2,
+ nftables,
+ ethtool,
+ tcpdump,
+ pciutils,
+ iputils-ping,
+ traceroute,
+ openssh-server,
+ openssh-client,
+ systemd-resolved,
+ rsyslog,
+ curl,
+ ca-certificates
+Description: xpf firewall appliance metapackage
+ Pulls in the xpf firewall binary package plus the full runtime
+ dependency set (routing, IPsec, DHCP server, time sync, networking
+ tooling) that the appliance image installs. This metapackage is what
+ the appliance image bake installs to provision a complete firewall.
+ .
+ The held/pinned kernel channel and the in-place kernel-upgrade
+ mechanism are out of scope for this package and tracked separately.

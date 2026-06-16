@@ -1,0 +1,41 @@
+#!/bin/sh
+# xpf postrm (increment A of #1917).
+#
+# Remove ONLY the live /usr/local/sbin symlinks this package created,
+# and ONLY when they still point into our staging path (so we never
+# clobber an operator's or increment-B's relinked target). State under
+# /etc/xpf (.configdb, node-id, master.key) is runtime state and is
+# NEVER touched here, not even on purge.
+
+set -e
+
+STAGED=/usr/local/share/xpf/staged
+SBIN=/usr/local/sbin
+BINS="xpfd cli xpf-userspace-dp xpf-day0-config"
+
+case "$1" in
+    remove|purge)
+        for b in $BINS; do
+            link="$SBIN/$b"
+            # Only remove a symlink we own (target inside the staging path).
+            if [ -L "$link" ]; then
+                target=$(readlink "$link" 2>/dev/null || true)
+                case "$target" in
+                    "$STAGED"/*)
+                        rm -f "$link"
+                        ;;
+                esac
+            fi
+        done
+        ;;
+    upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+    *)
+        echo "postrm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0
