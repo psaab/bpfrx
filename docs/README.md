@@ -24,6 +24,7 @@ docs.
   userspace dataplane capability/admission boundary.
 - [`network-topology.md`](network-topology.md) — test-VM and HA-cluster
   interface maps.
+- [`test_env.md`](test_env.md) — test topology and validation steps.
 - [`critical-patterns.md`](critical-patterns.md) — project-specific
   gotchas (byte order, struct alignment, BPF verifier, SR-IOV/XDP,
   interface management, HA timing).
@@ -40,6 +41,8 @@ docs.
   file/function map for forwarding and debugging.
 - [`userspace-dataplane-gaps.md`](userspace-dataplane-gaps.md) — current
   capability/admission boundary.
+- [`userspace-dnat-plan.md`](userspace-dnat-plan.md) — destination NAT
+  implementation plan for the userspace dataplane.
 - [`xdp-io-uring-userspace-dataplane.md`](xdp-io-uring-userspace-dataplane.md)
   — original userspace dataplane design.
 - [`shared-umem-plan.md`](shared-umem-plan.md) — cross-NIC shared UMEM
@@ -57,6 +60,8 @@ docs.
 - [`in-place-upgrade.md`](in-place-upgrade.md) — in-service upgrade.
 - [`userspace-ha-validation.md`](userspace-ha-validation.md) — HA
   failover validation procedures.
+- `ha-cluster-userspace.conf` — the unified HA cluster config with
+  `${node}` variable expansion (used by the loss userspace cluster).
 
 ## Performance & CoS
 
