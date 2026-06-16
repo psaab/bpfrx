@@ -49,8 +49,11 @@ pending only these two engineer-time values:
 - **OQ-2 — Signing identity.** WHICH signing key, and key management: who
   holds the secret key, rotation cadence, and where the public key is pinned.
 
-These are surfaced as `XPF_DIST_BASE_URL` (or equivalent) and a checked-in
-public key file + `XPF_SIGN_SECKEY` (path, never the key itself). See §9.
+These are surfaced as config inputs — `XPF_IMAGE_BASE_URL` + `XPF_APT_BASE_URL`
+(§3 N4 two-URL split) and a checked-in public key file + `XPF_SIGN_SECKEY`
+(path, never the key itself). See §9. (References below to "the dist host" /
+"XPF_DIST_BASE_URL" mean whichever of the two URLs serves the artifact in
+question — the trust-model point is identical for both.)
 
 ## 2. Blast radius / affected surface
 
@@ -589,7 +592,7 @@ is the usability bar (the issue's "rather than copying files by hand").
 - Bootstrap: **install.sh** with the archive keyring embedded inline +
   optional `install.sh.minisig` for verify-before-run. TOFU rejected.
 - Hosting: host-agnostic `make dist-publish` via `XPF_PUBLISH_CMD` +
-  `XPF_DIST_BASE_URL`. No backend hardcoded.
+  `XPF_IMAGE_BASE_URL` / `XPF_APT_BASE_URL`. No backend hardcoded.
 - Ship as Inc 1–3 (each independently reviewable); Inc 4 (CI release) is
   optional + gated on OQ-1/OQ-2/OQ-4.
 - The two OPEN QUESTIONS (hosting target, signing identity) are engineer-time
