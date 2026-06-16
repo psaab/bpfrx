@@ -1,11 +1,13 @@
 # #1917 — In-place xpf upgrade (new xpfd + userspace-dp without re-imaging)
 
-- **Revision:** 3
-- **Status:** PLAN-REVISED (round 1 complete → round 2). Round-1 verdicts: Codex =
-  PLAN-NEEDS-REVISION, Claude SMR = PLAN-NEEDS-REVISION, AGY = PLAN-NEEDS-REVISION
-  (no KILL; composed A+B endorsed by all three). v3 folds in ALL round-1 blockers
-  including AGY's four novel Debian/kernel/state ones. Awaiting round-2 re-review
-  for PLAN-READY.
+- **Revision:** 4
+- **Status:** PLAN-REVISED (round 2 complete → round 3 confirmation). Round-1: all
+  three reviewers PLAN-NEEDS-REVISION (no KILL; composed A+B+C endorsed). Round-2:
+  Codex = PLAN-NEEDS-REVISION (3 concrete blockers, now fixed in v4), Claude SMR =
+  PLAN-READY, AGY round-2 result flaked to an intent-log (its round-1 four blockers
+  are all incorporated). v4 fixes the round-2 Codex blockers: old-reader-rejecting
+  manifest envelope, single install form, kernel watchdog spec, dh helper flag.
+  Awaiting round-3 confirmation for PLAN-READY.
 - **Branch:** `research/1917-deb-inplace-upgrade`
 - **Scope:** RESEARCH ONLY. No production source touched. Deliverable is this plan
   + three reviewer verdicts + an issue comment. Implementation is a separate
