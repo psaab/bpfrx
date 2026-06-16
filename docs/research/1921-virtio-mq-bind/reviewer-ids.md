@@ -1,0 +1,80 @@
+# #1921 virtio-MQ forwarding — reviewer ledger
+
+## Plan review round 1 (plan @ 96eee9025)
+| Reviewer | ID | Verdict |
+|---|---|---|
+| Claude SMR | claude-smr-plan-r1.md | PLAN-NEEDS-MINOR (F1 driver-agnostic pin) |
+| Codex | task-mqfnykhy-2jfzzu | PLAN-KILL (armed != bind success; gate diagnosis wrong) |
+| AGY | adversarial-review-mqfnzlwk-gu7f3v | PLAN-NEEDS-MAJOR (stale-socket, ethtool race, fabric/VF, watchdog) |
+
+r1 outcome: NOT converged. Codex correctly refuted the central enable-gate
+chain (verified: helpers.rs:487 `armed = armed && registered`, a request flag).
+Plan rewritten to v2.
+
+## Plan review round 2 (plan @ cdd7a1bcd)
+| Reviewer | ID | Verdict |
+|---|---|---|
+| Codex | task-mqftf67e-wfs37n | PLAN-NEEDS-MAJOR (stale gate text in §5; min() contradiction; watchdog claim wrong; tighten Phase-0 ctrl instr) |
+| AGY | adversarial-review-mqftflub-s27we1 | INFRA-TIMEOUT (job ran, result never captured; r1 findings already folded) |
+| Claude SMR | authored v3 corrections | n/a |
+
+r2 outcome: Codex KILL->NEEDS-MAJOR (progress). All 4 Codex findings addressed in
+v3. AGY r2 infra-timed-out -> re-dispatch fresh in r3.
+
+## Plan review round 3 (plan @ 239d95501)
+| Reviewer | ID | Verdict |
+|---|---|---|
+| Codex | task-mqftqa63-k6xzr9 | PLAN-NEEDS-MAJOR (effective_rx_queues vs global-min uniform planner; 2 stale-text spots) |
+| AGY | adversarial-review-mqftqp2j-zyq5ff | PLAN-NEEDS-MINOR (CONFIRMED EBUSY root cause: rebind double-stop bypasses 500ms quiesce, rebind.rs:16 + teardown.rs:14-46) |
+
+r3 outcome: AGY confirmed the EBUSY-loop root cause in code (high value). Codex's
+blocker = the planner is global-min UNIFORM (helpers.rs:745, test
+main_tests.rs:609-631), so effective_rx_queues must be a uniform target + RSS
+constrain, not per-interface. v4 resolves both + scrubs stale gate text.
+
+## Plan review round 4 (plan @ bfe8d909c)
+| Reviewer | ID | Verdict |
+|---|---|---|
+| Codex | task-mqfu1sg0-sn4l6h | PLAN-NEEDS-MAJOR (fabric parents are AF_XDP ingress but excluded from reconciliation -> wrong-ring on fabric; 2 nits) |
+| AGY | adversarial-review-mqfu24d2-bi1w2w | PLAN-READY (confirmed rebind fix also repairs synced-session wipe + tunnel-owner remap blinding; new hazard: link-UP resets channels/RSS) |
+
+r4 outcome: AGY READY. Codex one blocker (fabric) + 2 nits, all addressed in v5.
+
+## Plan review round 5 (plan @ 1d2b5d6a4)
+| Reviewer | ID | Verdict |
+|---|---|---|
+| Codex | task-mqfucfoi-7v3h9s | PLAN-NEEDS-MAJOR (fabric rx_queues=target stamping -> bind nonexistent queues; reconciliation half fights the uniform planner) |
+| AGY | r4 carries | READY |
+
+r5 outcome: Codex's fabric finding showed the channel-reconciliation half was
+speculative and architecture-fighting. RESTRUCTURED to minimal-first (v6).
+
+## Plan review round 6 (plan @ 46b557399) — CONVERGED
+| Reviewer | ID | Verdict |
+|---|---|---|
+| Codex | task-mqfumqk6-1bfq0o | **PLAN-READY** (no committed-scope blocker; 3 non-blocking impl asks) |
+| AGY | adversarial-review-mqfun5uz-sdygce | **PLAN-READY** |
+| Claude SMR | authored v2-v6 corrections | **PLAN-READY** |
+
+CONVERGED at 46b557399. Committed scope: Phase 0 instrumented virtio repro +
+Phase 1 (remove rebind::handle double-stop). Reconciliation = contingent Phase 2.
+Codex non-blocking asks for /engineer: (a) acceptance validates ACTUAL RX
+delivery vs bound set; (b) Phase 0 captures USERSPACE_TRACE_STAGE_REDIRECT; (c)
+add regression test that rebind does not call afxdp.stop() before reconcile.
+
+## Implementation (PR #1927, commit 76e78848a)
+| Reviewer | ID | Verdict |
+|---|---|---|
+| Codex | task-mqfvhp06-j87ohi | MERGE-READY |
+| AGY | adversarial-review-mqfvilij-3vcj2v | MERGE-READY |
+| Claude SMR | PR comment | MERGE-READY |
+| Copilot | — | quota-limited (3-of-4 fallback per feedback_codex_infra_must_retry) |
+
+Validation:
+- loss-cluster deploy: fix binary deployed (rebind no-stop string present), xpfd
+  active, 0 EBUSY in journal (mlx5 regression clean).
+- make test-failover: 14 passed, 0 failed (exercises the RETH-MAC rebind path
+  the fix touches, under live iperf3 + node reboot).
+- virtio end-to-end repro: NOT done (standalone 4-queue virtio VM has no rebind
+  trigger; needs #1879 appliance day-0 boot path). #1879 deploy already showed
+  the EBUSY loop on 4-queue virtio; fix is code-verified by all 4 reviewers.
