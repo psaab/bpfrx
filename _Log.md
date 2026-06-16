@@ -5405,3 +5405,5 @@ top.
 - **File(s)**: pkg/upgrade/{rolling,cluster_cli,rolling_test}.go (new), cmd/xpfd/{upgrade.go (new),main.go}
 - **Action**: C1 dogfood — postinst HA-mode contract (stage-only on clustered, cut on standalone) + cluster-setup.sh XPF_DEPLOY_DEB rolling deb deploy
 - **File(s)**: debian/xpf.postinst, test/incus/cluster-setup.sh
+- **Action**: D1 rollback DB-restore test + in-place-upgrade design doc + audit regen
+- **File(s)**: pkg/upgrade/runner_test.go, docs/in-place-upgrade.md (new), docs/refactoring-audit-current.txt

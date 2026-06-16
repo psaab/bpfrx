@@ -35,6 +35,9 @@ type fakeSystem struct {
 	// healthFailVersions: versions for which health fails (overrides
 	// healthErr when matched).
 	healthFailVersions map[string]bool
+	// healthHook, if set, runs at the start of HelperHealthy (used to
+	// simulate the new daemon mutating the live config DB post-start).
+	healthHook func()
 
 	// calls records the ordered call log for assertions.
 	calls []string
@@ -76,6 +79,9 @@ func (f *fakeSystem) VerifyDataplane(string, []string) (bool, error) {
 func (f *fakeSystem) BinaryVersion(string) (string, error) { return f.stagedVersion, nil }
 func (f *fakeSystem) HelperHealthy(ver string, _ time.Duration) error {
 	f.log("health:" + ver)
+	if f.healthHook != nil {
+		f.healthHook()
+	}
 	if f.healthFailVersions[ver] {
 		return fmt.Errorf("health fail for %s", ver)
 	}
@@ -253,6 +259,56 @@ func TestRun_AutoRollbackOnUnhealthyStart(t *testing.T) {
 	// drop-in must pin 1.0.0 again.
 	if !strings.Contains(fs.dropinContent, filepath.Join(cfg.VersionsDir, "1.0.0", "xpfd")) {
 		t.Errorf("drop-in not re-pinned to 1.0.0 after rollback:\n%s", fs.dropinContent)
+	}
+}
+
+// TestRun_RollbackRestoresDBBeforeReflip proves the binary+DB-atomic
+// rollback restores the pre-upgrade config-DB snapshot (so an old binary
+// never boots against a too-new envelope DB and fatal-rejects it). It
+// mutates the live DB to simulate the N+1 daemon writing a new-format
+// active.json, then asserts rollback restores the PRE-upgrade content.
+func TestRun_RollbackRestoresDBBeforeReflip(t *testing.T) {
+	fs := newFakeSystem(t, "1.0.0")
+	r, cfg := testEnv(t, fs)
+	if err := r.Run(Options{}); err != nil {
+		t.Fatalf("first cut: %v", err)
+	}
+
+	// Record the pre-upgrade DB content (what PREFLIGHT will snapshot).
+	dbFile := filepath.Join(cfg.ConfigDBDir, "active.json")
+	preContent := "#xpf-config-envelope v=1\n{}"
+	mkfile(t, dbFile, preContent)
+
+	// Stage 2.0.0, unhealthy. The cut's PREFLIGHT snapshots preContent.
+	fs.stagedVersion = "2.0.0"
+	writeFakeBin(t, filepath.Join(cfg.StagedDir, "xpfd"), "binary-xpfd-2.0.0")
+	for _, b := range managedBins[1:] {
+		writeFakeBin(t, filepath.Join(cfg.StagedDir, b), "binary-"+b+"-2.0.0")
+	}
+	fs.healthFailVersions["2.0.0"] = true
+
+	// Hook: corrupt the live DB to a too-new format AFTER the snapshot is
+	// taken but before rollback. We approximate the N+1 daemon's write by
+	// overwriting the live DB right after Run starts; simplest is to make
+	// StartUnit (called post-flip, before the failing health check) mutate
+	// the DB. We can't inject into the fake easily, so overwrite here is
+	// done via a custom health probe that writes the new-format DB then
+	// fails.
+	newFormatContent := "#xpf-config-envelope v=1 min-reader=99\n{}"
+	fs.healthHook = func() {
+		mkfile(t, dbFile, newFormatContent)
+	}
+
+	_ = r.Run(Options{})
+
+	// After rollback, the DB must be restored to the PRE-upgrade content,
+	// not the too-new N+1 content.
+	got, err := os.ReadFile(dbFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != preContent {
+		t.Errorf("DB not restored to pre-upgrade content after rollback.\n got=%q\nwant=%q", got, preContent)
 	}
 }
 
