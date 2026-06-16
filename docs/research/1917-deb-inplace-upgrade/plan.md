@@ -189,8 +189,9 @@ One binary package + one metapackage (round-1: two-package split bought nothing
 once the shim is embedded — the protocol pair is enforced by *versioned immutable
 paths*, §6.3a, not by dpkg `Depends:` metadata which an old xpfd can ignore):
 
-- **`xpf`** — `/usr/local/lib/xpf/<version>/{xpfd,xpf-userspace-dp,cli,xpf-day0-config}`
-  (versioned install dir), `xpfd.service`, `xpf-day0-config.service`. The live
+- **`xpf`** — `/usr/local/lib/xpf/<version>/{xpfd,xpf-userspace-dp,cli,xpf-day0-config,xpf-upgrade}`
+  (versioned install dir — `xpf-upgrade` ships HERE so the staged N+1 orchestrator
+  is always available by absolute path), `xpfd.service`, `xpf-day0-config.service`. The live
   paths `/usr/local/sbin/{xpfd,cli,...}` are **symlinks** into the active
   versioned dir, flipped atomically by `xpf-upgrade` (§6.3a) — NOT written
   directly by dpkg. xpfd and the helper ship and move as one matched-protocol
@@ -239,9 +240,11 @@ default Debian helper appends a `systemctl try-restart xpfd.service` block to th
 generated `postinst` on upgrade — which would fire a full dataplane cycle on *any*
 `apt upgrade xpf`, defeating the "dpkg only stages" design even though our custom
 `postinst` never flips the symlink. `debian/rules` MUST call
-`dh_installsystemd --no-restart-on-upgrade --no-stop-on-upgrade` (NOT
-`--restart-after-upgrade`). The live restart happens ONLY when `xpf-upgrade`
-explicitly drives it after a verify PASS.
+`dh_installsystemd --no-stop-on-upgrade` (NOT `--restart-after-upgrade`; prefer
+`--no-stop-on-upgrade` since `--no-restart-on-upgrade` is a documented *deprecated
+alias*, round-2 Codex note) and pin the `debhelper-compat` level explicitly so the
+helper's restart-class behavior is stable across debhelper versions. The live
+restart happens ONLY when `xpf-upgrade` explicitly drives it after a verify PASS.
 
 **Run the NEWLY-STAGED orchestrator, not the live symlink (round-2 AGY blocker).**
 After `apt upgrade` stages N+1 under `/usr/local/lib/xpf/<N+1>/`, the live
@@ -256,18 +259,18 @@ flip, and (standalone) the restart.
 `postinst configure` must NOT naively `systemctl restart xpfd`. It must:
 
 1. Run the **new** `xpfd verify-dataplane` against the **running** kernel. On exit
-   3 (verifier REJECT) or 1 (error): **abort the configure**, leave the old binary
-   path in place (dpkg's new files are already unpacked, so the package must stage
-   the swap such that the *running* paths are unchanged until verify passes — i.e.
-   install to a versioned path + the live path is a symlink that `xpf-upgrade`
-   flips, OR `postinst` calls `xpf-upgrade cut-over` which does the fsatomic
-   rename). The simplest dpkg-native form: install binaries to
-   `/usr/local/sbin/`, but have `xpf-upgrade`/`xpfd` keep a **known-good previous
-   copy** and a boot-time `verify-dataplane` gate (ExecStartPre) so a bad unpack
-   fails closed at restart and `Restart=on-failure` + the retained copy enables
-   rollback. The cleaner form (recommended): **versioned install paths +
-   atomic-symlink flip owned by `xpf-upgrade`**, `postinst` invokes
-   `xpf-upgrade cut-over --from-package`.
+   3 (verifier REJECT) or 1 (error): **abort the cut-over** (the package files are
+   staged under the versioned dir; the live symlink is NOT flipped), surface the
+   exit code, and leave the running set serving traffic. **There is exactly ONE
+   install form (round-2 Codex blocker — the "simplest dpkg-native install to
+   /usr/local/sbin" alternative is DELETED):** binaries install ONLY to
+   `/usr/local/lib/xpf/<version>/`; the cut is the atomic symlink flip owned by
+   `xpf-upgrade` (§6.3a). A live `/usr/local/sbin` overwrite is forbidden because
+   the running xpfd resolves the helper from its own dir / PATH
+   (`findBinary`, process.go:168) and would respawn a newly-unpacked helper before
+   the intended cut — reopening the protocol-mismatch window. The staged
+   orchestrator MUST launch the staged `xpfd`/helper by **absolute versioned
+   path**, never via PATH or the live symlink.
 2. Detect **HA vs standalone** (presence of `/etc/xpf/node-id`). Standalone: do the
    verified cut (control-plane-only if eligible, else full cycle with a bounded,
    measured gap + auto-rollback on post-cut health failure). HA: **do not cut
@@ -345,10 +348,21 @@ permanent blanket hold:
   watchdog fallback, NOT a verify-then-set-default**: install the candidate kernel,
   `grub-reboot <candidate>` (boot it exactly once without changing the default),
   on that boot a oneshot unit runs `verify-dataplane` + a health check; on PASS it
-  promotes the candidate to `grub-set-default`; on FAIL or a no-show (boot hang /
-  no health beacon within a deadline) the box reboots back into the unchanged old
-  default — so a bad kernel can never brick the node, it just falls back. HA: do
-  this on the drained/secondary node only.
+  promotes the candidate via `grub-set-default`. **The no-show/boot-hang fallback
+  needs a watchdog ARMED BEFORE the reboot (round-2 Codex blocker), or the "never
+  brick" claim is overstated.** Concretely: arm the **hardware/softdog watchdog**
+  (`/dev/watchdog`, systemd `RuntimeWatchdogSec`) such that if the candidate
+  kernel never reaches the promotion oneshot (early-boot hang, no `systemd`), the
+  watchdog resets the box; because GRUB's *default* was never changed
+  (`grub-reboot` is one-shot), the reset boots the OLD default. The promotion
+  oneshot must (a) run early enough to pet/disarm the watchdog only AFTER a
+  `verify-dataplane` PASS + health beacon, (b) write a durable promotion marker,
+  (c) within a bounded deadline. **Honest bound:** with a kernel/HW watchdog this
+  is brick-proof against boot hangs; without one (pure `grub-reboot`) the GRUB
+  default is preserved but an early-boot hang needs external/operator recovery —
+  the plan REQUIRES the watchdog for the "never brick" guarantee. HA: do the
+  one-shot kernel boot on the drained/secondary node only, sequenced inside the
+  rolling drive so both nodes never reboot together.
 - Heavy/uncertain kernel moves still go through Path C (image-replace), the
   fully-tested unit.
 
@@ -415,14 +429,27 @@ pin / one-kernel assert / verify-dataplane gate logic in bake.py is unchanged; t
   additive and safe for the very first upgrade.
   **The manifest must NOT be a second file (round-2 AGY blocker):** writing
   `manifest.json` separately from `active.json` opens a crash-consistency gap (a
-  power cut between the two leaves a mismatched DB). Instead, embed the version
-  metadata IN `active.json` — wrap the marshaled `config.ConfigTree` in a parent
-  envelope `{ "manifest": {writer, ast_schema, min_reader, rollback_fmt,
-  journal_schema}, "tree": <ConfigTree> }`, or a plaintext version header line for
-  the encrypted form — so the existing single-file `fsatomic.WriteFileDurable`
-  rename stays the atomic unit. `ReadActive` (db.go) gains an envelope-aware
-  reader with a legacy fallback (a bare `ConfigTree` with no envelope = schema-0,
-  per case (b) above).
+  power cut between the two leaves a mismatched DB). Embed the version metadata IN
+  `active.json` so the existing single-file `fsatomic.WriteFileDurable` rename
+  stays the atomic unit.
+  **The envelope MUST use an old-reader-REJECTING encoding (round-2 Codex
+  blocker — critical).** A naive object envelope
+  `{ "manifest": ..., "tree": <ConfigTree> }` is UNSAFE: `config.ConfigTree` has
+  only a `Children` field (ast.go:98) and Go's `json.Unmarshal` *silently ignores
+  unknown object fields*, so old binary N would parse the envelope object into an
+  **empty tree** instead of failing closed — defeating the `min_reader` gate and
+  booting/rolling into empty config. The encoding must therefore be one that the
+  legacy `json.Unmarshal(data, *ConfigTree)` at db.go:124 *rejects with an error*:
+  e.g. a **magic line-prefix header** (`# xpf-configdb v=<n> min_reader=<n>\n` then
+  the JSON body — a leading `#` makes the whole blob invalid JSON to an old reader,
+  which fails closed), or a top-level JSON **array** `[manifest, tree]` (an old
+  reader unmarshaling an array into a struct errors). The same prefix/array wraps
+  the encrypted form so the version is readable pre-decrypt. The new reader strips
+  the header (or reads element 0), gates on `min_reader`, then parses the body; a
+  **bare object with no header = legacy schema-0** (case (b)). **A
+  legacy-reader test is mandatory: prove binary N fails closed (errors), NOT
+  empty-loads, when handed an N+1 envelope.** Alternatively ship one
+  compatibility release that can *read* envelopes before any release *writes* one.
 - **Shim verifier gate must hold post-cut and post-kernel-bump:** ExecStartPre
   verify on every start; bake-time assert one kernel ≥6.18; **base apt kernel
   updates HELD by default** and only moved through the §6.7 verify-gated kernel
