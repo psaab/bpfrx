@@ -31,9 +31,13 @@ needed (qemu's io_uring).
 
 Pipeline (offline — the image is never booted to provision it):
 
-1. `make build build-ctl build-userspace-dp`. The #1864 pinned-
-   toolchain contract holds: `make build` embeds the git-tracked shim
-   object; the bake never runs `make generate`.
+1. `make deb` (#1917 increment A). This runs `make build build-ctl
+   build-userspace-dp` via `debian/rules`, so the #1864 pinned-toolchain
+   contract holds — `make build` embeds the git-tracked shim object and
+   the bake never runs `make generate` — then packages the freshly built
+   binaries into the `xpf` Debian package (binary set staged under
+   `/usr/local/share/xpf/staged`). The bake installs that `.deb` instead
+   of copying raw binaries.
 2. Discover the LATEST Ubuntu release from the upstream listing
    (`XPF_BASE_RELEASE` pins one), then fetch + SHA256-verify the
    official Ubuntu *server cloudimg*. Upstream owns partitioning and
@@ -51,9 +55,16 @@ Pipeline (offline — the image is never booted to provision it):
    enabled (default NTP pools neutered; xpfd manages
    `sources.d/xpf.sources`), sysctls, `init_on_alloc=0` (via an
    `/etc/default/grub.d` drop-in — Ubuntu cloud images override
-   `GRUB_CMDLINE_LINUX_DEFAULT` there), xpf binaries + units
-   installed, `xpfd`, `xpf-day0-config`, and the incus-agent loader
-   enabled.
+   `GRUB_CMDLINE_LINUX_DEFAULT` there), and `apt-get install ./xpf.deb`.
+   The package's `postinst` stages the binary set, creates the live
+   `/usr/local/sbin/{xpfd,cli,xpf-userspace-dp,xpf-day0-config}` symlinks
+   into the staging path, and enables `xpfd` + `xpf-day0-config` (so the
+   bake no longer hand-copies binaries/units or runs `systemctl enable
+   xpfd`). The incus-agent loader is still copied in and enabled
+   directly. A plain `apt upgrade xpf` only refreshes the staging path
+   and never restarts xpfd (`dh_installsystemd --no-stop-on-upgrade` + a
+   `needrestart` blacklist); the verified in-place cut-over is a separate
+   increment.
 5. `virt-sysprep` seal: machine-id, ssh host keys, logs, tmp files,
    bash history, package caches, random seed; `/etc/xpf` factory-empty.
 6. Export compressed qcow2 + incus metadata tarball + SHA256SUMS.

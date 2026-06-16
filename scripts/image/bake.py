@@ -8,12 +8,14 @@ image to provision it) and exports it for both hypervisors:
   dist/xpf-<ver>.incus-metadata.tar.gz  - incus VM image metadata
   dist/SHA256SUMS
 
-Pipeline: build artifacts (no `make generate` — embeds the #1864 tracked
-shim) -> discover + SHA256-verify the latest Ubuntu cloud image
-(XPF_BASE_RELEASE pins) -> virt-resize root into a work disk -> virt-customize
-(runtime packages, linux-generic >= 6.18 with the full driver set, purge
-cloud-init/snapd/stale kernels, networkd, init_on_alloc=0, install xpf +
-units) -> virt-sysprep seal -> virt-sparsify+compress export -> checksums +
+Pipeline: build the xpf .deb (`make deb`; no `make generate` — embeds the
+#1864 tracked shim) -> discover + SHA256-verify the latest Ubuntu cloud
+image (XPF_BASE_RELEASE pins) -> virt-resize root into a work disk ->
+virt-customize (runtime packages, linux-generic >= 6.18 with the full
+driver set, purge cloud-init/snapd/stale kernels, networkd,
+init_on_alloc=0, `apt-get install ./xpf.deb` which stages the binaries +
+creates the /usr/local/sbin symlinks + enables the units via its postinst)
+-> virt-sysprep seal -> virt-sparsify+compress export -> checksums +
 manifest -> in-guest verify-dataplane validation gate (validate.py).
 
 Requirements: make/go/cargo, libguestfs-tools, qemu-utils, curl; incus for
@@ -172,23 +174,24 @@ def fetch_base(cache_dir, work_dir):
     return rel, base_url, img, cached, actual
 
 
-def virt_customize(work_qcow):
+def virt_customize(work_qcow, xpf_deb):
     pkgs = " ".join(RUNTIME_PACKAGES)
+    deb_name = os.path.basename(xpf_deb)
     argv = [
         "virt-customize", "-a", work_qcow, "--smp", "4", "--memsize", "2048",
         "--hostname", "xpf",
-        "--copy-in", f"{ROOT}/xpfd:/usr/local/sbin",
-        "--copy-in", f"{ROOT}/cli:/usr/local/sbin",
-        "--copy-in", f"{ROOT}/xpf-userspace-dp:/usr/local/sbin",
-        "--copy-in", f"{HERE}/xpf-day0-config:/usr/local/sbin",
-        "--copy-in", f"{ROOT}/test/incus/xpfd.service:/etc/systemd/system",
-        "--copy-in", f"{HERE}/xpf-day0-config.service:/etc/systemd/system",
+        # #1917 increment A: install xpf via the .deb instead of copying raw
+        # binaries. The package stages the binary set under
+        # /usr/local/share/xpf/staged, creates the live /usr/local/sbin
+        # symlinks, and enables xpfd + xpf-day0-config in its postinst — so
+        # the bake no longer hand-copies binaries/units or runs `systemctl
+        # enable xpfd`. The git-tracked, kernel-verified shim travels
+        # embedded inside the staged xpfd binary (#1864 contract preserved).
+        "--copy-in", f"{xpf_deb}:/var/tmp",
         "--copy-in", f"{HERE}/incus-agent.service:/usr/lib/systemd/system",
         "--copy-in", f"{HERE}/incus-agent-setup:/usr/lib/systemd",
         "--copy-in", f"{HERE}/99-incus-agent.rules:/usr/lib/udev/rules.d",
-        "--run-command", "chmod 0755 /usr/local/sbin/xpfd /usr/local/sbin/cli "
-                         "/usr/local/sbin/xpf-userspace-dp /usr/local/sbin/xpf-day0-config "
-                         "/usr/lib/systemd/incus-agent-setup",
+        "--run-command", "chmod 0755 /usr/lib/systemd/incus-agent-setup",
         "--write", f"/etc/sysctl.d/99-xpf.conf:{SYSCTL_CONF}",
         "--run-command", "mkdir -p /etc/xpf && chmod 0750 /etc/xpf",
         "--run-command", f"export DEBIAN_FRONTEND=noninteractive && {APT_UPDATE}",
@@ -239,7 +242,17 @@ def virt_customize(work_qcow):
         "--run-command", "systemctl enable frr chrony",
         "--run-command", 'sed -i "s/^pool /#pool /; s/^server /#server /" /etc/chrony/chrony.conf '
                          "&& mkdir -p /etc/chrony/sources.d",
-        "--run-command", "systemctl enable xpfd xpf-day0-config",
+        # Install the xpf .deb. apt resolves the package's deps (adduser,
+        # present) from the local file. The postinst stages the binaries,
+        # creates the /usr/local/sbin symlinks, and enables xpfd +
+        # xpf-day0-config — so there is no separate `systemctl enable xpfd`
+        # here. systemd is not running under virt-customize, so the
+        # postinst's deb-systemd-invoke start is a harmless no-op (the units
+        # are enabled and start on the real first boot). The xpfd version
+        # check below confirms the symlink resolves the staged binary.
+        "--run-command", "export DEBIAN_FRONTEND=noninteractive && "
+                         f"apt-get install -y -qq -o Acquire::Retries=5 /var/tmp/{deb_name} && "
+                         f"rm -f /var/tmp/{deb_name}",
         "--write", f"/etc/default/grub.d/99-xpf.cfg:{GRUB_DROPIN}",
         "--run-command", "update-grub",
         "--write", f"/etc/ssh/sshd_config.d/10-xpf-factory.conf:{SSHD_DROPIN}",
@@ -277,19 +290,35 @@ def main():
     os.makedirs(cache_dir, exist_ok=True)
     work = tempfile.mkdtemp(prefix="xpf-bake-", dir=os.environ.get("TMPDIR", "/tmp"))
 
+    import glob
     try:
-        # 1. build
+        # 1. build the xpf .deb (#1917 increment A). `make deb` runs
+        #    `make build build-ctl build-userspace-dp` via debian/rules, so
+        #    it picks up the embedded #1864 shim and the pinned cargo helper,
+        #    then packages the freshly-built binaries. The image consumes the
+        #    .deb instead of raw --copy-in binaries.
+        deb_dir = os.path.join(ROOT, "dist", "deb")
         if not a.skip_build:
-            info("building xpfd, cli, xpf-userspace-dp...")
-            run(["make", "-C", ROOT, "build", "build-ctl", "build-userspace-dp"])
-        for b in ("xpfd", "cli", "xpf-userspace-dp"):
-            if not os.access(os.path.join(ROOT, b), os.X_OK):
-                die(f"missing {ROOT}/{b} (run without --skip-build)")
-        # build-host pre-gate (best-effort)
+            info("building xpf .deb (xpfd, cli, xpf-userspace-dp -> staged)...")
+            run(["make", "-C", ROOT, "deb"])
+        # The git-derived version is computed by the Makefile; glob for the
+        # binary package (NOT the xpf-appliance metapackage).
+        debs = sorted(g for g in glob.glob(os.path.join(deb_dir, "xpf_*.deb"))
+                      if "xpf-appliance" not in os.path.basename(g))
+        if not debs:
+            die(f"no xpf_*.deb in {deb_dir} (run without --skip-build, or run `make deb`)")
+        xpf_deb = debs[-1]
+        info(f"using package: {xpf_deb}")
+        # build-host pre-gate (best-effort): verify the staged shim against
+        # the build-host kernel before baking it in (#1864). The staged
+        # binary inside the package is byte-identical to ROOT/xpfd.
+        host_xpfd = os.path.join(ROOT, "xpfd")
+        if not os.access(host_xpfd, os.X_OK):
+            die(f"missing {host_xpfd} (make deb should have built it)")
         if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode == 0:
             info(f"build-host pre-gate: xpfd verify-dataplane (host kernel {os.uname().release})...")
             if subprocess.run(["sudo", "-n", "nice", "-n", "19",
-                               f"{ROOT}/xpfd", "verify-dataplane"]).returncode != 0:
+                               host_xpfd, "verify-dataplane"]).returncode != 0:
                 die("embedded shim REJECTED by the build-host kernel verifier (#1864)")
         else:
             print("NOTE: no passwordless sudo — skipping build-host verify pre-gate "
@@ -313,7 +342,7 @@ def main():
 
         # 4. customize
         info("customizing image offline (packages, kernel >= 6.18, xpf install)...")
-        virt_customize(work_qcow)
+        virt_customize(work_qcow, xpf_deb)
 
         # 5. seal
         info("sealing image (virt-sysprep)...")
