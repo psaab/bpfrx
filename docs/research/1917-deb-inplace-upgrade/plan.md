@@ -526,10 +526,14 @@ package — no separate shim artifact is packaged.
   config syntax can make the *rollback* binary fail to parse on-disk state — a
   split-brain hazard under HA rolling (node A writes new-syntax state, node B old
   binary can't parse after failover). **The issue's own codex-review-010 comment
-  already demands a `.configdb/manifest.json` (writer version, AST/schema version,
-  min-reader version, rollback-slot format version, journal schema version) +
-  startup validation + gating auto-rollback on "state-format floor not advanced."
-  This plan adopts that requirement verbatim as a §6 deliverable.**
+  demands a manifest carrying writer version, AST/schema version, min-reader
+  version, rollback-slot format version, journal schema version + startup
+  validation + gating auto-rollback on "state-format floor not advanced." This plan
+  adopts those FIELDS and that gating, but — per the round-2/3 findings below —
+  stores them NOT as a separate `.configdb/manifest.json` (the codex-review-010
+  comment's original phrasing) but EMBEDDED in `active.json` via an
+  old-reader-rejecting envelope, because a second file is non-atomic with the
+  config write.**
   **First-upgrade chicken-and-egg, resolved (round-1):** absence of a manifest is
   NOT corruption. The manifest's job is *forward*-gating (an old binary refusing
   too-new state), not backward corruption detection. The N→N+1 boot defines these
@@ -618,7 +622,7 @@ package — no separate shim artifact is packaged.
 | # | Risk | Class | Likelihood | Impact | Mitigation |
 |---|------|-------|-----------|--------|------------|
 | 1 | Operator/plan assumes zero-gap xpfd-only restart exists → ships a "hot restart" that actually full-cycles the dataplane (seconds gap) | Correctness/Design | High | High | §6.4: state plainly it does NOT exist; scope M-mech-2 as future daemon work; ship M-mech-1 (full cycle + HA rolling) honestly with a *measured* gap |
-| 2 | apt base-OS update pulls a new kernel out from under the verifier-gated shim `.o` → dataplane fails verify at boot, box has no dataplane | Availability | Med | Critical | Hold/pin `linux-*`; kernel bumps go through image-replace (Path C); boot ExecStartPre verify fails closed; document the held-kernel channel |
+| 2 | apt base-OS update pulls a new kernel out from under the verifier-gated shim `.o` → dataplane fails verify at boot, box has no dataplane | Availability | Med | Critical | Hold/pin `linux-*`; routine kernel bumps via the §6.7 verify-gated in-place channel, heavy/uncertain via image-replace (Path C); boot ExecStartPre verify fails closed; document the held-kernel channel |
 | 3 | Config-DB / rollback-slot format drift across versions → rollback binary or HA peer can't parse on-disk state (split-brain) | Data/Correctness | Med | High | Manifest (writer/min-reader/AST/rollback/journal versions) EMBEDDED in `active.json` via an old-reader-rejecting envelope (§8) — NOT a second file; startup fail-closed (§6.3b); gate auto-rollback on state-floor advance (codex-review-010) |
 | 4 | `postinst restart` on an HA node cuts traffic instead of failing over (no rolling orchestration in dpkg) | Availability | High | High | `postinst` detects `/etc/xpf/node-id`, refuses local cut on HA, requires `xpf-upgrade --rolling`; reuse `ForceSecondary`/VRRP drain |
 | 5 | Protocol-version mismatch during an M-mech-2 hot re-attach (new xpfd ↔ old helper) | Correctness | Low (single-package lockstep) | High | `xpfd`+helper in one `xpf` package, cut over as one matched set (§6.1); gate on `ping` protocol version; force full cycle on mismatch; extend WIRE_REGEN fixtures |
