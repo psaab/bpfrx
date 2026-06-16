@@ -25,8 +25,11 @@ import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(ROOT, "scripts", "dist"))
 import make_config_drive  # noqa: E402
+import sign  # noqa: E402  (#1924 signed-distribution helper)
 
 ALIAS = "xpf-image-validate"
 
@@ -57,8 +60,11 @@ def guest_sh(inst, script):
 
 
 class Harness:
-    def __init__(self, qcow2, metadata, net, keep):
+    def __init__(self, qcow2, metadata, net, keep, verify_sig=True):
         self.qcow2, self.metadata, self.net, self.keep = qcow2, metadata, net, keep
+        # verify_sig: True = verify if a .minisig is present (default),
+        # "force" = require one, False = never (dev escape hatch).
+        self.verify_sig = verify_sig
         self.created_net = False
         self.instances = []
         self.work = tempfile.mkdtemp(prefix="xpf-validate-")
@@ -71,7 +77,44 @@ class Harness:
                   "ipv4.nat=true", "ipv6.address=none")
             self.created_net = True
 
+    def verify_signatures(self):
+        """Verify the EXACT qcow2 + metadata files against the signed
+        per-version manifest sitting next to them (#1924 §5.2). Per-file:
+        each artifact's hash is checked against the signed manifest entry for
+        its basename. Default ON when a .minisig is present; --no-verify-sig
+        opts out for a local dev bake that skipped signing."""
+        if not self.verify_sig:
+            return
+        sigdir = os.path.dirname(os.path.abspath(self.qcow2))
+        import glob
+        manifests = sorted(glob.glob(os.path.join(sigdir, "*.SHA256SUMS")))
+        sigs = [m for m in manifests if os.path.isfile(m + ".minisig")]
+        if not sigs:
+            if self.verify_sig == "force":
+                fail("--verify-sig forced but no signed *.SHA256SUMS.minisig "
+                     f"found next to {self.qcow2}")
+            info("no signed manifest next to the artifacts — skipping "
+                 "signature verification (dev bake; use --verify-sig to force)")
+            return
+        # Bind both consumed files to their signed manifest. Try each manifest;
+        # the one that lists this version's basenames is the match.
+        for art in (self.qcow2, self.metadata):
+            base = os.path.basename(art)
+            verified = False
+            last_err = None
+            for manifest in sigs:
+                try:
+                    sign.verify_image_artifact(art, manifest, manifest + ".minisig")
+                    verified = True
+                    info(f"signature OK: {base} (manifest {os.path.basename(manifest)})")
+                    break
+                except sign.SignError as e:
+                    last_err = e
+            if not verified:
+                fail(f"image signature verification FAILED for {base}: {last_err}")
+
     def import_image(self):
+        self.verify_signatures()
         incus("image", "delete", ALIAS, check=False, capture=True)
         info(f"importing image into local incus as {ALIAS}")
         incus("image", "import", self.metadata, self.qcow2, "--alias", ALIAS)
@@ -259,6 +302,12 @@ def main():
     p.add_argument("--qcow2", required=True)
     p.add_argument("--metadata", required=True)
     p.add_argument("--keep", action="store_true")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--verify-sig", dest="verify_sig", action="store_const",
+                   const="force", help="require a signed manifest (#1924)")
+    g.add_argument("--no-verify-sig", dest="verify_sig", action="store_const",
+                   const=False, help="skip image signature verification (dev)")
+    p.set_defaults(verify_sig=True)  # default: verify if a .minisig is present
     p.add_argument("scenario", nargs="?", default="all", choices=["a", "b", "c", "all"])
     a = p.parse_args()
     if not os.path.isfile(a.qcow2):
@@ -266,7 +315,7 @@ def main():
     if not os.path.isfile(a.metadata):
         fail(f"--metadata not found: {a.metadata}")
     net = os.environ.get("XPF_VALIDATE_NETWORK", "xpf-image-net")
-    h = Harness(a.qcow2, a.metadata, net, a.keep)
+    h = Harness(a.qcow2, a.metadata, net, a.keep, a.verify_sig)
     try:
         h.ensure_network()
         h.import_image()

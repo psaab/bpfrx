@@ -6,7 +6,9 @@ image to provision it) and exports it for both hypervisors:
 
   dist/xpf-<ver>.qcow2                  - libvirt/KVM (virt-install)
   dist/xpf-<ver>.incus-metadata.tar.gz  - incus VM image metadata
-  dist/SHA256SUMS
+  dist/xpf-<ver>.SHA256SUMS             - per-version checksum manifest (#1924)
+  dist/xpf-<ver>.SHA256SUMS.minisig     - minisign signature over the manifest
+                                          (only when XPF_SIGN_SECKEY is set)
 
 Pipeline: build the xpf .deb (`make deb`; no `make generate` — embeds the
 #1864 tracked shim) -> discover + SHA256-verify the latest Ubuntu cloud
@@ -36,6 +38,10 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
+
+# Signed-distribution helpers (#1924) live under scripts/dist.
+sys.path.insert(0, os.path.join(ROOT, "scripts", "dist"))
+import sign  # noqa: E402
 
 # Runtime dependency set installed explicitly into the image. This is the
 # same set the xpf-appliance metapackage Depends on (debian/control). The
@@ -390,12 +396,39 @@ def main():
                     "  variant: xpf-appliance\n")
         run(["tar", "-C", work, "-czf", meta_out, "metadata.yaml"])
 
-        sums = os.path.join(a.out, "SHA256SUMS")
-        with open(sums, "w") as f:
-            for path in (qcow_out, meta_out):
-                f.write(f"{sha256(path)}  {os.path.basename(path)}\n")
+        # Per-version, version-named checksum manifest (#1924 §5.1): each
+        # bake owns its manifest so retaining v1 next to v2 never orphans
+        # v1's checksums. Verification (validate.py / xpf-deploy.py fetch)
+        # is PER-FILE against the basenames listed here.
+        sums = os.path.join(a.out, f"xpf-{ver}.SHA256SUMS")
+        sign.write_manifest(sums, [qcow_out, meta_out])
         info("checksums:")
         print(open(sums).read(), end="")
+
+        # Sign the manifest with minisign (#1924 §5.1). Fail-OPEN at bake
+        # (a dev bake without a key still produces artifacts), fail-CLOSED
+        # at publish (scripts/dist/publish.py refuses unsigned artifacts).
+        # XPF_SIGN_SECKEY is a PATH to the secret key; the bytes never enter
+        # this process. The pinned public key is copied into dist/ so the
+        # published tree is self-describing (its trust root remains the
+        # in-repo checked-in copy, not this convenience copy).
+        seckey = os.environ.get("XPF_SIGN_SECKEY")
+        if seckey:
+            try:
+                sign.require_minisign()
+                sig = sign.sign_manifest(sums, seckey,
+                                         comment=f"xpf image {ver} sha256sums")
+                info(f"signed manifest: {os.path.basename(sig)}")
+                pub_src = sign.DEFAULT_IMAGE_PUBKEY
+                if os.path.isfile(pub_src):
+                    shutil.copyfile(pub_src, os.path.join(a.out, "xpf-image.pub"))
+            except sign.SignError as e:
+                die(f"image signing FAILED: {e}")
+        else:
+            print("WARNING: XPF_SIGN_SECKEY unset — manifest NOT signed. This "
+                  "dev artifact is NOT publishable; `make dist-publish` will "
+                  "refuse it. Set XPF_SIGN_SECKEY=<path-to-minisign-seckey> to "
+                  "sign (#1924).", file=sys.stderr)
 
         try:
             commit = out_text(["git", "-C", ROOT, "rev-parse", "HEAD"]).strip()

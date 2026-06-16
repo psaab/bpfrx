@@ -5464,3 +5464,14 @@ top.
 - **Timestamp**: 2026-06-16
   - **Action**: README getting-started restructure (PR #1937) — rewrote README into install/getting-started guide (3 paths: .deb, incus image, kvm/libvirt) cross-checked against Makefile deb/image targets, debian/control+postinst, scripts/image/bake.py + make_config_drive.py, scripts/deploy/xpf-deploy.py. Moved deep reference content into new docs/architecture.md, docs/feature-coverage.md, docs/network-topology.md, docs/critical-patterns.md, docs/README.md. Docs-only.
   - **File(s)**: README.md, docs/architecture.md, docs/feature-coverage.md, docs/network-topology.md, docs/critical-patterns.md, docs/README.md, docs/pr/readme-getting-started/reviewer-ids.md
+
+## #1924 signed/hosted appliance distribution (engineer)
+- **Timestamp**: 2026-06-16
+- **Action**: Add minisign image-signing mechanism: shared scripts/dist/sign.py
+  (sign/verify + per-version manifest, per-file verification), wire signing into
+  scripts/image/bake.py (per-version xpf-<ver>.SHA256SUMS + .minisig, fail-open),
+  wire verification into scripts/image/validate.py (--verify-sig/--no-verify-sig,
+  verify exact qcow2+metadata before import). Placeholder pinned pubkey.
+- **File(s)**: scripts/dist/sign.py, scripts/dist/README.md,
+  scripts/dist/xpf-image.pub.placeholder, scripts/image/bake.py,
+  scripts/image/validate.py
