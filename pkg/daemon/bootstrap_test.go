@@ -25,6 +25,11 @@ func TestComputeBootClass(t *testing.T) {
 		{"committed-empty", false, true, false, bootClassNormal},
 		// Case 5 never-committed: no active config, never committed => bootstrap.
 		{"never-committed", false, false, false, bootClassBootstrap},
+		// AGY r1 CRITICAL: post-first-commit-rollback restart. The empty tree
+		// on disk (committed=0) compiles to a NON-nil config, so
+		// hasActiveConfig is TRUE — but everCommitted is FALSE, so the box
+		// must stay in bootstrap, NOT misclassify as normal.
+		{"post-rollback-restart-empty-compiled", true, false, false, bootClassBootstrap},
 		// HA-node guard (C2/C8): node-id present always resolves NOT-bootstrap,
 		// even with no active config and never committed.
 		{"ha-node-no-config", false, false, true, bootClassNormal},

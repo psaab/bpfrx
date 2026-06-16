@@ -1,9 +1,12 @@
 package configstore
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/psaab/xpf/pkg/config"
 )
@@ -154,5 +157,77 @@ func TestFirstCommitRollbackWritesNeverCommittedMarker(t *testing.T) {
 	}
 	if st.EverCommitted() {
 		t.Fatal("after first-commit rollback: EverCommitted=true; want false")
+	}
+}
+
+// TestFirstCommitRollbackDegradedRetryKeepsNeverCommitted is the regression
+// for the Codex r1 release-blocker: if the never-committed marker write FAILS
+// on the first-commit rollback and later heals via the #1799 degraded-retry
+// loop, the healed write MUST still stamp committed=0 (never-committed), NOT
+// committed=1. Otherwise a restart misclassifies the rolled-back box as
+// operator-committed-empty (normal) and takes over interfaces on empty config.
+func TestFirstCommitRollbackDegradedRetryKeepsNeverCommitted(t *testing.T) {
+	dir := t.TempDir()
+	st, err := New(filepath.Join(dir, "xpf.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.SetPersistRetryBackoffForTesting(5*time.Millisecond, 10*time.Millisecond)
+
+	var (
+		mu           sync.Mutex
+		failFirst    = true
+		healedCommit *bool // committed flag observed on the successful (healed) write
+	)
+	st.SetWriteActiveMarkerForTesting(func(_ *config.ConfigTree, committed bool) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if failFirst {
+			failFirst = false
+			return fmt.Errorf("simulated persist failure")
+		}
+		c := committed
+		healedCommit = &c
+		return nil
+	})
+
+	// First commit confirmed on a fresh store, then roll back (timeout).
+	if err := st.EnterConfigure(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.LoadOverride("system { host-name box; }"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CommitConfirmed(1); err != nil {
+		t.Fatal(err)
+	}
+	st.ExitConfigure()
+
+	gen := st.ConfirmGenForTesting()
+	if _, ok := st.PromoteRollback(gen); !ok {
+		t.Fatal("PromoteRollback ok=false")
+	}
+
+	// The first marker write failed; wait for the retry loop to heal it.
+	deadline := time.After(2 * time.Second)
+	for {
+		mu.Lock()
+		got := healedCommit
+		mu.Unlock()
+		if got != nil {
+			if *got {
+				t.Fatal("degraded retry healed the first-commit rollback with committed=1; " +
+					"the never-committed marker was LOST (Codex r1 release-blocker)")
+			}
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("degraded retry never healed the never-committed marker write")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	if st.ConfigPersistDegraded() {
+		t.Fatal("persist-degraded flag should be cleared after the retry healed")
 	}
 }

@@ -74,6 +74,16 @@ type Store struct {
 	persistRetryInitialBackoff time.Duration
 	persistRetryMaxBackoff     time.Duration
 
+	// persistMarkerCommitted records the #1922 step-0 committed flag the
+	// degraded-persist retry loop must re-write. Defaults true; set false
+	// ONLY by the Item 1b first-commit rollback so a FAILED never-committed
+	// marker write that later heals via the retry loop persists committed=0
+	// (never-committed), NOT committed=1 — otherwise a restart would
+	// misclassify the rolled-back box as operator-committed-empty (normal)
+	// and take over interfaces on an empty config (Codex r1 release-blocker).
+	// Every successful committed write resets it to true.
+	persistMarkerCommitted bool
+
 	// Commit confirmed state. confirmGen is a generation token
 	// guarding the auto-rollback callback against staleness: a timer
 	// that has already fired and is blocked on s.mu when a nested
@@ -141,12 +151,13 @@ func New(filePath string) (*Store, error) {
 	journalPath := filepath.Join(filepath.Dir(filePath), ".config.journal")
 
 	return &Store{
-		active:   &config.ConfigTree{},
-		history:  NewHistory(50),
-		filePath: filePath,
-		db:       db,
-		journal:  journal.New(journalPath),
-		nodeID:   -1,
+		active:                 &config.ConfigTree{},
+		history:                NewHistory(50),
+		filePath:               filePath,
+		db:                     db,
+		journal:                journal.New(journalPath),
+		nodeID:                 -1,
+		persistMarkerCommitted: true,
 	}, nil
 }
 
@@ -304,6 +315,10 @@ func (s *Store) noteActivePersistFailureLocked(action string, err error) {
 	slog.Error("active config persist failed — running config is not durable; restart would load stale config",
 		"action", action, "err", err, "issue", "#1799")
 	s.persistDegraded = true
+	// The retry loop re-writes s.active with the marker last requested by the
+	// failing path. Callers that need the never-committed marker (Item 1b)
+	// set s.persistMarkerCommitted=false BEFORE invoking this; all other
+	// paths leave it at the default true.
 	s.journalLog(&JournalEntry{
 		Action: "persist_error",
 		Detail: fmt.Sprintf("%s: write active config failed: %v", action, err),
@@ -347,7 +362,11 @@ func (s *Store) persistRetryLoop(backoff, maxBackoff time.Duration) {
 			s.mu.Unlock()
 			return
 		}
-		err := s.writeActive(s.active)
+		// #1922: re-write with the marker the failing path requested
+		// (committed=false only for a first-commit rollback). For every
+		// other path persistMarkerCommitted is true, so this matches the
+		// pre-#1922 committed=1 write exactly.
+		err := s.writeActiveMarker(s.active, s.persistMarkerCommitted)
 		if err == nil {
 			s.persistDegraded = false
 			s.persistRetryActive = false
@@ -569,17 +588,19 @@ func (s *Store) SyncApply(content string, chassisPreserve func(*config.ConfigTre
 	// failure becomes visible (degraded flag → /health 503 +
 	// Prometheus gauge + journal ERROR) and self-healing (singleton
 	// background retry with backoff).
+	//
+	// #1922 step-0: a successful config sync from the primary counts as a
+	// commit for the never-vs-empty disambiguation — a synced secondary has
+	// an authoritative config and must never read as never-committed. Set
+	// the markers BEFORE the persist so a failed-then-healed write (the
+	// retry loop) also stamps committed=1.
+	s.everCommitted = true
+	s.persistMarkerCommitted = true
 	if err := s.writeActive(s.active); err != nil {
 		s.noteActivePersistFailureLocked("config_sync", err)
 	} else {
 		s.persistDegraded = false
 	}
-	// #1922 step-0: a successful config sync from the primary counts as a
-	// commit for the never-vs-empty disambiguation — a synced secondary
-	// has an authoritative config and must never read as never-committed.
-	// (The daemon's bootstrap-exit-on-SyncApply gate, keyed on non-empty,
-	// is separate; this flag records that the store has been committed to.)
-	s.everCommitted = true
 
 	s.journalLog(&JournalEntry{
 		Action:     "config_sync",
@@ -1060,7 +1081,8 @@ func (s *Store) CommitWithDescription(description string) (*config.Config, error
 		return nil, fmt.Errorf("commit failed: persist active config: %w", err)
 	}
 	s.persistDegraded = false // disk now holds the current config
-	s.everCommitted = true    // #1922 step-0: a real commit has succeeded
+	s.everCommitted = true          // #1922 step-0: a real commit has succeeded
+	s.persistMarkerCommitted = true // #1922: degraded-retry writes committed=1
 
 	// Push current active to history with description
 	s.history.Push(&HistoryEntry{
@@ -1163,6 +1185,7 @@ func (s *Store) CommitConfirmed(minutes int) (*config.Config, error) {
 	// committed config; if the timer fires, the Item 1b first-commit
 	// rollback path (prevCfg==nil) re-writes the never-committed marker.
 	s.everCommitted = true
+	s.persistMarkerCommitted = true
 
 	if s.confirmTimer != nil {
 		// Nested confirmed commit: cancel the pending timer but keep
@@ -1333,9 +1356,14 @@ func (s *Store) PromoteRollback(gen uint64) (prevCfg *config.Config, ok bool) {
 	// never-committed without a restart.
 	var perr error
 	if firstCommitRollback {
-		perr = s.writeActiveMarker(s.active, false)
+		// Record the never-committed marker for BOTH the immediate write
+		// and the degraded-retry loop, so a failed-then-healed write still
+		// persists committed=0 (Codex r1 release-blocker).
+		s.persistMarkerCommitted = false
 		s.everCommitted = false
+		perr = s.writeActiveMarker(s.active, false)
 	} else {
+		s.persistMarkerCommitted = true
 		perr = s.writeActive(s.active)
 	}
 	if perr != nil {

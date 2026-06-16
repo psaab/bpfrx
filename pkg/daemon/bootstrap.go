@@ -102,22 +102,30 @@ func computeBootClass(hasActiveConfig, everCommitted, nodeIDPresent bool) bootCl
 		return bootClassNormal
 	}
 
-	if hasActiveConfig {
-		// Case 2 (day-0/preseeded valid import) or case 3 (valid
-		// active.json). Either way a real config is loaded → normal.
-		return bootClassNormal
+	// The step-0 marker (everCommitted) is checked BEFORE hasActiveConfig.
+	// This is load-bearing (AGY r1 CRITICAL): after an Item-1b first-commit
+	// rollback the DB holds an EMPTY tree with committed=0. On the next
+	// restart Store.Load compiles that empty tree into a NON-nil
+	// *config.Config, so hasActiveConfig is TRUE even though the box was
+	// never successfully committed. Checking hasActiveConfig first would
+	// then misclassify the rolled-back box as normal and take over
+	// interfaces on an empty config — exactly the lockout this issue closes.
+	//
+	//   - everCommitted == false → fresh/no-config (case 1) OR
+	//     never-committed incl. post-first-commit-rollback (case 5) →
+	//     bootstrap.
+	//   - everCommitted == true  → a real commit/sync happened, OR a
+	//     legacy/older-build DB (migration rule C3 defaults committed=true),
+	//     OR operator-committed-empty (case 5 committed-empty) → normal
+	//     (cases 2/3, and the operator-meant-it empty case; the protected
+	//     set still shields mgmt). hasActiveConfig is implied here for
+	//     cases 2/3 and not required for the decision, but is retained in
+	//     the signature for the call-site log/HA-guard diagnostics.
+	if !everCommitted {
+		return bootClassBootstrap
 	}
-
-	// No active config loaded. Disambiguate via the step-0 marker:
-	//   - everCommitted == true  → operator committed empty (case 5
-	//     committed-empty) → normal (the operator meant it; the protected
-	//     set still shields mgmt).
-	//   - everCommitted == false → fresh/no-config (case 1) or
-	//     never-committed (case 5 never-committed) → bootstrap.
-	if everCommitted {
-		return bootClassNormal
-	}
-	return bootClassBootstrap
+	_ = hasActiveConfig
+	return bootClassNormal
 }
 
 // inBootstrap reports whether the daemon is currently in bootstrap mode.
