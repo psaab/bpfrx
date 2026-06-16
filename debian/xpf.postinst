@@ -97,9 +97,21 @@ case "$1" in
                 # install on a cut-over abort (the operator can re-run
                 # xpf-upgrade); surface it loudly instead.
                 if ! "$STAGED/xpfd" upgrade; then
-                    echo "xpf: WARNING in-place cut-over did not complete;" \
-                         "the previous version is still live. Re-run:" \
-                         "xpfd upgrade" >&2
+                    echo "xpf: WARNING in-place cut-over did not complete." >&2
+                    # Safety net (Copilot): the cut STOPs the unit before it
+                    # FLIPs. Most failures (preflight/copy/verify) abort
+                    # BEFORE the stop and leave the daemon running; the
+                    # standalone START failure path auto-rolls-back and
+                    # restarts. But a flip/daemon-reload error between STOP
+                    # and START could leave the unit stopped. If it is not
+                    # active, try to bring it back up so the node is not left
+                    # offline after `apt upgrade`.
+                    if ! systemctl is-active --quiet xpfd; then
+                        echo "xpf: unit not active after a failed cut-over; restarting" >&2
+                        systemctl start xpfd 2>/dev/null || \
+                            echo "xpf: WARNING could not restart xpfd; run: xpfd upgrade" >&2
+                    fi
+                    echo "xpf: inspect with 'journalctl -u xpfd' and re-run: xpfd upgrade" >&2
                 fi
             fi
         fi

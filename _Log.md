@@ -5421,3 +5421,5 @@ top.
 - **File(s)**: pkg/upgrade/cluster_cli.go, pkg/upgrade/cluster_cli_test.go
 - **Action**: Code-review round 5 follow-up (Codex full re-read) — ResetFailover resets ALL configured RGs (enumerated, was hardcoded 0,1); documented PeerTakeoverReady best-effort + DrainComplete authoritative
 - **File(s)**: pkg/upgrade/cluster_cli.go, pkg/upgrade/cluster_cli_test.go, docs/in-place-upgrade.md
+- **Action**: Copilot formal review fixes — fail-closed msg points at .configdb/active.json; postinst restart safety-net on cut-over failure; cutover Options doc (UnitAlreadyStopped). Other Copilot findings already fixed in r1-r5.
+- **File(s)**: pkg/daemon/daemon_run.go, debian/xpf.postinst, pkg/upgrade/cutover.go

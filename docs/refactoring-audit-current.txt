@@ -12,7 +12,7 @@
 [WATCH]      1698  userspace-dp/src/afxdp/forwarding/mod.rs
 [WATCH]      1674  cmd/cli/show.go
 [WATCH]      1663  pkg/dataplane/userspace/maps_sync.go
-[WATCH]      1611  pkg/daemon/daemon_run.go
+[WATCH]      1615  pkg/daemon/daemon_run.go
 [WATCH]      1604  userspace-dp/src/session/mod.rs
 [WATCH]      1580  userspace-dp/src/afxdp/types/cos.rs
 [WATCH]      1533  pkg/api/metrics_userspace.go

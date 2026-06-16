@@ -14,11 +14,12 @@ type Options struct {
 	// by the HA path, where rollback is operator-driven, plan §8 inv. 8).
 	SkipStartHealthRollback bool
 
-	// StopUnitBeforeFlip controls whether Run performs the STOP step. The
-	// HA driver drains the node to its peer and stops the unit itself
-	// (so the cluster keeps forwarding); it then calls Run with the unit
-	// already stopped. Standalone always stops here. Default false =
-	// Run owns the stop.
+	// UnitAlreadyStopped tells Run to SKIP the STOP step because the caller
+	// already stopped the unit. Default false => Run owns the stop (the
+	// standalone single-node flow). The HA rolling driver currently does
+	// NOT set this — Runner.Run performs the stop after the node has been
+	// drained to its peer via the cluster state machine, so the cluster
+	// keeps forwarding regardless.
 	UnitAlreadyStopped bool
 }
 

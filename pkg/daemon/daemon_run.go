@@ -207,10 +207,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// here).
 	if err := d.store.Load(); err != nil {
 		if errors.Is(err, configstore.ErrConfigDBUnreadable) {
+			// Point recovery at the actual unreadable artifact — the config
+			// DB under .configdb/, NOT the text config file (Copilot).
+			dbPath := filepath.Join(filepath.Dir(d.opts.ConfigFile), ".configdb", "active.json")
 			return fmt.Errorf("config DB is present but unreadable; refusing to "+
-				"start and overwrite it (fail closed). Inspect/repair %s or roll "+
-				"the xpf binary forward to a build that can read it: %w",
-				d.opts.ConfigFile, err)
+				"start and overwrite it (fail closed). Inspect/repair %s (the on-disk "+
+				"config DB, NOT the text config file) or roll the xpf binary forward "+
+				"to a build that can read it: %w",
+				dbPath, err)
 		}
 		slog.Warn("failed to load config from db", "err", err)
 	}
