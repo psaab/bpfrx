@@ -407,9 +407,12 @@ Two sub-mechanisms, sequenced:
 
 `ProtocolVersion = 3` (protocol.go:11) is embedded in every `ConfigSnapshot`; the
 Rust side declares the matching `CONFIG_SNAPSHOT_PROTOCOL_VERSION = 3`
-(control.rs); mismatch is a hard reject in version-sensitive ops. Because the `xpf`
-package `Depends:` on `xpf-dataplane (= same version)` (§6.1), the **common**
-upgrade moves both in lockstep → no live mismatch. The dangerous window is
+(control.rs); mismatch is a hard reject in version-sensitive ops. Because `xpfd`
+and the helper ship in the SINGLE `xpf` package and are cut over as one matched set
+via the staged→runtime-version copy + symlink flip (§6.1/§6.3a), the **common**
+upgrade moves both in lockstep → no live mismatch (no cross-package `Depends:`
+needed — the lockstep is structural in the package + cut-over ordering). The
+dangerous window is
 **M-mech-2 only** (xpfd restarts while a helper of a different version stays up):
 there the new xpfd must gate on a protocol-version match read from the running
 helper's `ping`/status, and **force a full dataplane cycle (M-mech-1) on
@@ -483,8 +486,9 @@ files into the image once → `--run-command "apt-get install -y
 ./xpf-appliance_<ver>.deb"` (or from the #1924 signed local apt repo). The kernel
 pin / one-kernel assert / verify-dataplane gate logic in bake.py is unchanged; the
 `xpf-appliance` metapackage just becomes the thing installed. The embedded-shim /
-`make generate`-skip behavior is preserved because the shim ships *inside* the
-`xpf-dataplane` package built from the same tracked `.o`.
+`make generate`-skip behavior is preserved because the shim is compiled *into* the
+`xpfd` binary (`//go:embed userspace_xdp_bpfel.o`) shipped in the single `xpf`
+package — no separate shim artifact is packaged.
 
 ## 7. Preserved interfaces (must not change)
 
@@ -599,7 +603,7 @@ pin / one-kernel assert / verify-dataplane gate logic in bake.py is unchanged; t
 | 2 | apt base-OS update pulls a new kernel out from under the verifier-gated shim `.o` → dataplane fails verify at boot, box has no dataplane | Availability | Med | Critical | Hold/pin `linux-*`; kernel bumps go through image-replace (Path C); boot ExecStartPre verify fails closed; document the held-kernel channel |
 | 3 | Config-DB / rollback-slot format drift across versions → rollback binary or HA peer can't parse on-disk state (split-brain) | Data/Correctness | Med | High | `.configdb/manifest.json` (writer/min-reader/AST/rollback/journal versions) + startup validation + gate auto-rollback on state-floor advance (codex-review-010) |
 | 4 | `postinst restart` on an HA node cuts traffic instead of failing over (no rolling orchestration in dpkg) | Availability | High | High | `postinst` detects `/etc/xpf/node-id`, refuses local cut on HA, requires `xpf-upgrade --rolling`; reuse `ForceSecondary`/VRRP drain |
-| 5 | Protocol-version mismatch during an M-mech-2 hot re-attach (new xpfd ↔ old helper) | Correctness | Low (lockstep `Depends:`) | High | `Depends: xpf-dataplane (= same version)`; gate on `ping` protocol version; force full cycle on mismatch; extend WIRE_REGEN fixtures |
+| 5 | Protocol-version mismatch during an M-mech-2 hot re-attach (new xpfd ↔ old helper) | Correctness | Low (single-package lockstep) | High | `xpfd`+helper in one `xpf` package, cut over as one matched set (§6.1); gate on `ping` protocol version; force full cycle on mismatch; extend WIRE_REGEN fixtures |
 | 6 | Half-unpacked binary set serves traffic if `postinst` aborts mid-way | Correctness/Availability | Med | High | Versioned install paths + atomic-symlink flip owned by `xpf-upgrade`; running paths unchanged until verify passes |
 | 7 | `postrm purge` deletes `/etc/xpf/.configdb`/`node-id`/`master.key` | Data loss | Med | Critical | Explicitly exclude runtime state from package ownership; `postrm` never touches `/etc/xpf` |
 | 8 | CoS / per-flow state silently lost after an in-place full cycle (deploy-wipes-CoS gotcha) | Perf/Fairness | High | Med | Re-publish CoS config post-cut in `xpf-upgrade`; document re-apply; add a post-cut CoS-present check |
