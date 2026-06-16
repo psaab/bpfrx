@@ -1,7 +1,11 @@
 # #1917 — In-place xpf upgrade (new xpfd + userspace-dp without re-imaging)
 
-- **Revision:** 8
-- **Status:** PLAN-READY (converged round 5). No reviewer ever PLAN-KILLed;
+- **Revision:** 8 (CONVERGED)
+- **Status:** **PLAN-READY — all three reviewers converged.** Codex (round 7) =
+  PLAN-READY, AGY (round 5) = PLAN-READY, Claude SMR = PLAN-READY. No reviewer ever
+  PLAN-KILLed; composed A+B+C endorsed throughout. STOP here — implementation is a
+  separate `/engineer 1917` after manual approval (Copilot joins as the 4th
+  reviewer then). Round-by-round history below.
   composed A+B+C endorsed throughout. R1: all three NEEDS-REVISION. R2: Codex 3
   (fixed v4), SMR premature-READY (self-corrected), AGY 4 (folded). R3: Codex
   confirmed 1+3 + refined #2 (v5); AGY 5 operational blockers (folded v6). R4: AGY

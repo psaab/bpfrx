@@ -34,3 +34,10 @@ Record Codex task IDs + AGY job IDs per round so continuations can fetch by id
 
 ## Round 6 (Codex consistency re-confirm)
 - Codex: task-mqga8cko-fzl6l5
+## Round 6/7 verdicts (CONVERGED)
+- Codex round-6: task-mqga8cko-fzl6l5 -> 2 stale-wording (fixed v8)
+- Codex round-7: task-mqgab6wy-3gq5d4 -> PLAN-READY
+- AGY round-5: PLAN-READY
+- Claude SMR: PLAN-READY
+
+ALL THREE CONVERGED PLAN-READY. No reviewer ever PLAN-KILLed.
