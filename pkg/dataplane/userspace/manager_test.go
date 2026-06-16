@@ -1637,6 +1637,150 @@ func TestMergeHAStateFromMaps(t *testing.T) {
 	}
 }
 
+// TestMergeHAStateFromMapsFabricatesGroupsFromArrayMap documents the #1928
+// failure mechanism: rg_active is a fixed-size ARRAY (max_entries 16), so it
+// is ALWAYS fully populated with keys 0-15 regardless of whether any
+// redundancy group is configured. On a standalone (non-cluster) firewall every
+// entry is value=0, and mergeHAStateFromMaps therefore returns 16 inactive HA
+// groups. Shipping those to the helper makes its per-packet HA gate drop all
+// transit traffic as HAInactive. The startup path in Apply guards
+// refreshHAStateFromMapsLocked/syncHAStateLocked behind m.clusterHA so a
+// standalone never fabricates and publishes these phantom groups (matching the
+// pre-existing m.clusterHA guard on the periodic status poll in process.go).
+func TestMergeHAStateFromMapsFabricatesGroupsFromArrayMap(t *testing.T) {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Skipf("RemoveMemlock: %v", err)
+	}
+	rgMap, err := ebpf.NewMap(&ebpf.MapSpec{
+		Type:       ebpf.Array,
+		KeySize:    4,
+		ValueSize:  1,
+		MaxEntries: 16,
+	})
+	if err != nil {
+		t.Fatalf("NewMap(rg_active array): %v", err)
+	}
+	defer rgMap.Close()
+	wdMap, err := ebpf.NewMap(&ebpf.MapSpec{
+		Type:       ebpf.Array,
+		KeySize:    4,
+		ValueSize:  8,
+		MaxEntries: 16,
+	})
+	if err != nil {
+		t.Fatalf("NewMap(ha_watchdog array): %v", err)
+	}
+	defer wdMap.Close()
+
+	// Leave both arrays at their default zero values — the standalone case.
+	merged, err := mergeHAStateFromMaps(rgMap, wdMap, map[int]HAGroupStatus{})
+	if err != nil {
+		t.Fatalf("mergeHAStateFromMaps: %v", err)
+	}
+	if len(merged) != 16 {
+		t.Fatalf("array map yielded %d HA groups, want 16 (the phantom-group source #1928 guards against)", len(merged))
+	}
+	for id, group := range merged {
+		if group.Active {
+			t.Fatalf("standalone array entry RG%d unexpectedly Active", id)
+		}
+	}
+}
+
+// TestSeedHAGroupInventoryLockedClearsGroupsWithoutCluster covers the #1928
+// cluster->standalone transition: when a cluster config is removed, the manager
+// must drop any HA groups retained from the prior clustered apply so it does not
+// keep them around (and so the Apply path's clearHelperHAStateLocked can flush
+// the helper). Before the fix, seedHAGroupInventoryLocked returned early without
+// clearing m.haGroups, leaving stale groups that re-armed the HAInactive
+// transit-drop gate.
+func TestSeedHAGroupInventoryLockedClearsGroupsWithoutCluster(t *testing.T) {
+	m := &Manager{
+		haGroups: map[int]HAGroupStatus{
+			0: {RGID: 0, Active: true},
+			1: {RGID: 1, Active: true},
+			2: {RGID: 2, Active: false},
+		},
+	}
+	// cfg with no chassis cluster — the standalone / post-decluster case.
+	m.seedHAGroupInventoryLocked(&config.Config{})
+	if len(m.haGroups) != 0 {
+		t.Fatalf("standalone seed left %d HA groups, want 0: %+v", len(m.haGroups), m.haGroups)
+	}
+
+	// nil cfg must also clear (defensive — same early-return branch).
+	m.haGroups = map[int]HAGroupStatus{3: {RGID: 3, Active: true}}
+	m.seedHAGroupInventoryLocked(nil)
+	if len(m.haGroups) != 0 {
+		t.Fatalf("nil-cfg seed left %d HA groups, want 0", len(m.haGroups))
+	}
+}
+
+// TestClearHelperHAStateLockedSendsEmptyUpdate verifies the helper-side half of
+// the #1928 fix: clearHelperHAStateLocked must send an update_ha_state request
+// carrying an empty group set so the helper rebuilds an empty ha_state and drops
+// any groups a prior clustered apply pushed. The empty ha_state is what bypasses
+// the helper's HAInactive transit-drop gate on a standalone node.
+func TestClearHelperHAStateLockedSendsEmptyUpdate(t *testing.T) {
+	dir := t.TempDir()
+	controlSock := filepath.Join(dir, "control.sock")
+	ln, err := net.Listen("unix", controlSock)
+	if err != nil {
+		t.Fatalf("listen control socket: %v", err)
+	}
+	defer ln.Close()
+
+	reqCh := make(chan ControlRequest, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		var req ControlRequest
+		if err := json.NewDecoder(conn).Decode(&req); err != nil {
+			return
+		}
+		reqCh <- req
+		_ = json.NewEncoder(conn).Encode(ControlResponse{
+			OK:     true,
+			Status: &ProcessStatus{PID: 4321},
+		})
+	}()
+
+	proc, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatalf("FindProcess: %v", err)
+	}
+	m := New()
+	m.proc = &exec.Cmd{Process: proc}
+	m.cfg.ControlSocket = controlSock
+
+	// clearHelperHAStateLocked sends the request, then calls
+	// applyHelperStatusLocked, which needs BPF maps not loaded in this unit
+	// test. We assert on the request the helper RECEIVED (captured before the
+	// response), so a post-send applyHelperStatusLocked error is tolerated —
+	// the wire request is what this test validates.
+	m.mu.Lock()
+	_ = m.clearHelperHAStateLocked()
+	m.mu.Unlock()
+
+	select {
+	case req := <-reqCh:
+		if req.Type != "update_ha_state" {
+			t.Fatalf("request type = %q, want update_ha_state", req.Type)
+		}
+		if req.HAState == nil {
+			t.Fatal("ha_state payload missing — helper would reject as 'missing HA state'")
+		}
+		if len(req.HAState.Groups) != 0 {
+			t.Fatalf("clear sent %d groups, want 0: %+v", len(req.HAState.Groups), req.HAState.Groups)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no control request received from clearHelperHAStateLocked")
+	}
+}
+
 func TestSeedHAGroupInventoryLockedSeedsConfiguredStandbyGroups(t *testing.T) {
 	m := &Manager{
 		haGroups: map[int]HAGroupStatus{

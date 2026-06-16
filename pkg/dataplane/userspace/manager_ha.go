@@ -66,6 +66,32 @@ func (m *Manager) syncHAStateLocked() error {
 	return m.syncDesiredForwardingStateLocked()
 }
 
+// clearHelperHAStateLocked publishes an empty HA group set to the helper so it
+// drops any redundancy-group state a prior clustered apply pushed. It is the
+// non-cluster counterpart to syncHAStateLocked: on a standalone node the helper
+// must observe an empty ha_state, otherwise its per-packet gate
+// (enforce_ha_resolution_snapshot) keeps treating transit ForwardCandidates as
+// HAInactive (owner_rg_id<=0 && !ha_state.is_empty()) and drops them. Sending an
+// empty update is idempotent — the helper's update_ha_state rebuilds ha_state
+// from the supplied groups, so an empty slice clears it (afxdp/ha.rs). This runs
+// only on snapshot apply for non-cluster nodes (rare), not on the hot path.
+func (m *Manager) clearHelperHAStateLocked() error {
+	if m.proc == nil || m.proc.Process == nil {
+		return nil
+	}
+	var status ProcessStatus
+	req := ControlRequest{
+		Type: "update_ha_state",
+		HAState: &HAStateUpdateRequest{
+			Groups: []HAGroupStatus{},
+		},
+	}
+	if err := m.requestLocked(req, &status); err != nil {
+		return err
+	}
+	return m.applyHelperStatusLocked(&status)
+}
+
 // SyncFabricState pushes current fabric snapshots (with fresh peer MACs)
 // to the Rust helper. Called from the daemon after refreshFabricFwd succeeds
 // so the helper has up-to-date fabric MAC info for cross-chassis redirect.
@@ -128,6 +154,11 @@ func (m *Manager) refreshHAStateFromMapsLocked() error {
 
 func (m *Manager) seedHAGroupInventoryLocked(cfg *config.Config) {
 	if cfg == nil || cfg.Chassis.Cluster == nil {
+		// #1928: a non-cluster config has no redundancy groups. Drop any HA
+		// groups retained from a prior clustered apply so the manager's view
+		// matches reality and the startup path does not re-publish phantom HA
+		// state to the helper (the source of the standalone transit-drop bug).
+		m.haGroups = make(map[int]HAGroupStatus)
 		return
 	}
 	seeded := make(map[int]HAGroupStatus, len(cfg.Chassis.Cluster.RedundancyGroups)+1)

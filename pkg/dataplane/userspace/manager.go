@@ -622,6 +622,19 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 		if err := m.syncUserspaceClassifierMapsFailClosedLocked(snap); err != nil {
 			return result, err
 		}
+		// #1928 (Codex review Q1): the deferred-publish resume path
+		// (syncSnapshotLocked in process.go) never syncs HA state, so a
+		// cluster->standalone reconfig that lands during the XSK-startup
+		// deferral window would leave stale HA groups in the helper and
+		// re-arm the HAInactive transit-drop gate. seedHAGroupInventoryLocked
+		// already cleared m.haGroups for the non-cluster case above; clear the
+		// helper side here too so the standalone state is consistent
+		// regardless of which apply path runs. (Idempotent empty update.)
+		if !m.clusterHA {
+			if err := m.clearHelperHAStateLocked(); err != nil {
+				return result, fmt.Errorf("clear userspace HA state (deferred startup): %w", err)
+			}
+		}
 		m.lastSnapshot = snap
 		m.cfg = ucfg
 		m.recordApplyResultLocked(dataplane.ApplyResultFromCompileResult(result), caps, snap.Generation)
@@ -681,11 +694,31 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	if err := m.applyHelperStatusLocked(&status); err != nil {
 		return result, fmt.Errorf("sync helper status: %w", err)
 	}
-	if err := m.refreshHAStateFromMapsLocked(); err != nil {
-		return result, fmt.Errorf("replay userspace HA state from maps: %w", err)
-	}
-	if err := m.syncHAStateLocked(); err != nil {
-		return result, fmt.Errorf("publish userspace HA state: %w", err)
+	// #1928: HA group state must only be replayed/published for chassis-cluster
+	// members. The rg_active map is a fixed-size ARRAY (16 entries, keys 0-15)
+	// so it is ALWAYS fully populated — even on a standalone firewall with no
+	// redundancy groups, where every entry is inactive. On standalone the old
+	// unconditional refreshHAStateFromMapsLocked() therefore fabricated 16
+	// inactive HA groups and shipped them to the helper; the helper's per-packet
+	// HA gate (enforce_ha_resolution_snapshot) then treats every transit
+	// ForwardCandidate as HAInactive (owner_rg_id<=0 && !ha_state.is_empty())
+	// and drops it — a total transit forwarding outage on non-cluster nodes. The
+	// periodic status poll already guards the refresh with m.clusterHA (see
+	// process.go); the startup path must match.
+	if m.clusterHA {
+		if err := m.refreshHAStateFromMapsLocked(); err != nil {
+			return result, fmt.Errorf("replay userspace HA state from maps: %w", err)
+		}
+		if err := m.syncHAStateLocked(); err != nil {
+			return result, fmt.Errorf("publish userspace HA state: %w", err)
+		}
+	} else if err := m.clearHelperHAStateLocked(); err != nil {
+		// Non-cluster node: ensure neither the manager nor the helper retains
+		// HA groups. seedHAGroupInventoryLocked already cleared m.haGroups
+		// above; this also clears any groups a prior clustered apply pushed to
+		// the helper (cluster->standalone live reconfig), which would otherwise
+		// keep the HAInactive transit-drop gate armed (Codex review #1928 Q3).
+		return result, fmt.Errorf("clear userspace HA state: %w", err)
 	}
 	if err := m.syncDesiredForwardingStateLocked(); err != nil {
 		return result, fmt.Errorf("sync userspace forwarding state: %w", err)
