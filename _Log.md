@@ -5374,3 +5374,17 @@ top.
   **File(s)**: docs/image-validation.md, docs/deploy-quickstart.md, examples/deploy/README.md, docs/pr/1879-pathc/deploy-delta-reviewer-ids.md
 
 - **2026-06-15** #1879 live Tier-2: fixed incus -d root syntax in xpf-deploy.py; image boot+day-0+control-plane GREEN; forwarding blocked on virtio (AF_XDP bind busy loop) — venue limitation, doc corrected (virtio not a forwarding venue).
+
+- **2026-06-15** #1928 virtio MQ forwarding outage ROOT-CAUSED + fixed.
+  - **Action**: standalone HA-gate bug — `refreshHAStateFromMapsLocked` ran
+    unconditionally at snapshot-apply, fabricating 16 inactive HA groups from
+    the fixed-size `rg_active` ARRAY map and shipping them to the helper;
+    helper's `enforce_ha_resolution_snapshot` then dropped ALL transit as
+    `HAInactive` (owner_rg<=0 && !ha_state.is_empty()). Fix: guard startup HA
+    refresh+sync behind `if m.clusterHA`, matching the existing poll-path guard.
+    Dropped the earlier bind-flag commit (refuted by isolation experiment: AUTO
+    bind + HA fix forwards 5000pps). Validated v4+v6 0% loss, SNAT, nonzero
+    tx_completions on virtio t1921-fw.
+  - **File(s)**: pkg/dataplane/userspace/manager.go,
+    pkg/dataplane/userspace/manager_test.go,
+    docs/research/1928-virtio-copy-xsk-rx/plan.md
