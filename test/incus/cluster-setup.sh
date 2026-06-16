@@ -613,18 +613,35 @@ cmd_deploy() {
 		*) die "Usage: $0 deploy [0|1|all]" ;;
 	esac
 
+	# Dogfood deploy mode (#1917 increment B, C1). XPF_DEPLOY_DEB=1 builds
+	# the .deb and drives the verified in-place cut-over (`xpfd upgrade
+	# --rolling`), exercising the real upgrade mechanism every cycle. The
+	# default (and XPF_DEPLOY_FAST=1) keeps the raw incus-file-push +
+	# restart for the tight dev inner loop (no deb rebuild, no verified
+	# cut). The deb path is opt-in until it is validated live on the loss
+	# userspace cluster (it then becomes the CI/smoke default per the plan).
+	#
+	# #1875 lock discipline is PRESERVED: `make deb` builds OUTSIDE the
+	# lock (it is multi-minute and local); only the install + cut-over
+	# runs under the lock via the locked re-invocation below.
+
 	# #1875: build OUTSIDE the lock — it is multi-minute and purely
 	# local, and holding the shared-cluster lock across it would
 	# starve other agents for no reason. The locked re-invocation
 	# below skips the rebuild via XPF_CLUSTER_SKIP_BUILD.
 	if [[ -z "${XPF_CLUSTER_SKIP_BUILD:-}" ]]; then
-		info "Building xpfd and cli..."
-		make -C "$PROJECT_ROOT" build build-ctl
-		if [[ -x "$HOME/.cargo/bin/cargo" || -n "$(command -v cargo 2>/dev/null)" ]]; then
-			info "Building xpf-userspace-dp helper..."
-			make -C "$PROJECT_ROOT" build-userspace-dp
+		if [[ "${XPF_DEPLOY_DEB:-}" = "1" ]]; then
+			info "Building xpf .deb (dogfood in-place upgrade)..."
+			make -C "$PROJECT_ROOT" deb
 		else
-			warn "Rust toolchain not found; skipping xpf-userspace-dp build"
+			info "Building xpfd and cli..."
+			make -C "$PROJECT_ROOT" build build-ctl
+			if [[ -x "$HOME/.cargo/bin/cargo" || -n "$(command -v cargo 2>/dev/null)" ]]; then
+				info "Building xpf-userspace-dp helper..."
+				make -C "$PROJECT_ROOT" build-userspace-dp
+			else
+				warn "Rust toolchain not found; skipping xpf-userspace-dp build"
+			fi
 		fi
 	fi
 
@@ -646,11 +663,73 @@ cmd_deploy() {
 		suppress_host_parent_ipv6_ra "$SRIOV_LAN_PARENT"
 	fi
 
-	case "$target" in
-		0)   deploy_vm 0 ;;
-		1)   deploy_vm 1 ;;
-		all) deploy_rolling ;;
-	esac
+	if [[ "${XPF_DEPLOY_DEB:-}" = "1" ]]; then
+		case "$target" in
+			0)   deploy_vm_deb 0 ;;
+			1)   deploy_vm_deb 1 ;;
+			all) deploy_rolling_deb ;;
+		esac
+	else
+		case "$target" in
+			0)   deploy_vm 0 ;;
+			1)   deploy_vm 1 ;;
+			all) deploy_rolling ;;
+		esac
+	fi
+}
+
+# deploy_vm_deb installs the .deb on a clustered node (STAGE-ONLY per the
+# postinst HA-mode contract — node-id present => no local cut) and then
+# drives the verified single-node cut via `xpfd upgrade --rolling`, which
+# performs the controlled drain so the peer keeps forwarding. #1917 C1.
+deploy_vm_deb() {
+	local idx="$1"
+	local vm rinst deb
+	vm=$(vm_name "$idx")
+	rinst=$(r "$vm")
+	if ! incus info "$rinst" &>/dev/null 2>&1; then
+		die "Instance $vm does not exist. Run '$0 create' first."
+	fi
+	# Locate the freshly-built .deb (Makefile deb: target output dir is
+	# dist/deb/; install the runtime xpf_*.deb, NOT the xpf-appliance meta).
+	deb=$(ls -t "$PROJECT_ROOT"/dist/deb/xpf_*.deb 2>/dev/null | head -1 || true)
+	[[ -n "$deb" ]] || die "no xpf_*.deb found in dist/deb/ — run 'make deb' first (XPF_DEPLOY_DEB build)"
+
+	info "Pushing $(basename "$deb") to $vm..."
+	incus file push "$deb" "${rinst}/tmp/$(basename "$deb")"
+	# apt install is STAGE-ONLY on a clustered node (node-id present): it
+	# refreshes the staging path but does NOT cut the dataplane.
+	incus exec "$rinst" -- apt-get install -y --reinstall "/tmp/$(basename "$deb")"
+
+	# Drive the verified controlled-drain cut on THIS node (peer keeps
+	# forwarding). Run on the node directly so the rolling driver sees the
+	# local cluster state.
+	info "Cutting over node${idx} via 'xpfd upgrade --rolling'..."
+	incus exec "$rinst" -- /usr/local/share/xpf/staged/xpfd upgrade --rolling
+	info "Cut-over complete for $vm."
+}
+
+# deploy_rolling_deb sequences the deb cut across both nodes (secondary
+# first), so the cluster keeps forwarding through the whole upgrade.
+#
+# Determine which node is secondary by asking node0 for ITS OWN local RG
+# state via `show chassis cluster information` (FormatInformation emits
+# "  Local state: Primary|Secondary"). The legacy deploy_rolling grep
+# pattern "secondary:node0" never matched the space-separated status rows
+# (AGY r1) and silently always upgraded node1 first; this checks the real
+# field. If node0 is Secondary, upgrade it first; else node1.
+deploy_rolling_deb() {
+	local secondary=1 primary=0
+	if incus exec "$(r "$VM0")" -- cli -c "show chassis cluster information" 2>/dev/null \
+		| grep -qiE '^[[:space:]]*Local state:[[:space:]]+Secondary'; then
+		secondary=0
+		primary=1
+	fi
+	info "Rolling deb deploy: secondary=node${secondary}, primary=node${primary}"
+	deploy_vm_deb "$secondary"
+	sleep 5
+	deploy_vm_deb "$primary"
+	info "Rolling deb deploy complete."
 }
 
 # Rolling deploy: secondary first, wait for sync, then primary.

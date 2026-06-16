@@ -1,29 +1,24 @@
 #!/bin/sh
-# xpf postinst (increment A of #1917).
-#
-# Increment A is packaging-only. The in-place upgrade cut-over
-# mechanism (staged -> runtime versioned dir copy, verify-dataplane
-# gate, atomic symlink flip, HA rolling failover, rollback) is a
-# separate increment and is intentionally NOT implemented here.
+# xpf postinst (#1917 — increment A packaging + increment B cut-over hook).
 #
 # dpkg installs the binary set to the dpkg-static staging path
 # /usr/local/share/xpf/staged/. The running daemon resolves its
-# binaries via /usr/local/sbin/* which are SYMLINKS into the staging
-# path. On FIRST install (no previously configured version) we create
-# those symlinks so xpfd actually runs. On UPGRADE we deliberately
-# leave the live symlinks untouched: a plain `apt upgrade xpf` only
-# refreshes the staging path and must never cut the dataplane. The
-# verified cut-over is driven explicitly by the increment-B mechanism.
+# binaries via /usr/local/sbin/* which are SYMLINKS. On FIRST install
+# (no previously configured version) we create those symlinks so xpfd
+# runs. On UPGRADE we leave the live symlinks untouched and hand the
+# verified cut-over to the increment-B mechanism (`xpfd upgrade`):
 #
-# ACCEPTED increment-A limitation (plan §6.3a): because the live symlinks
-# in increment A point straight at the staging path, after a plain
-# `apt upgrade xpf` a SUBSEQUENT xpfd restart/reboot starts the new
-# version without the verify-gated cut, and a running old xpfd that
-# respawns its helper would resolve the NEW helper (protocol mismatch).
-# Increment B closes this window structurally (stage->runtime versioned
-# dir + atomic symlink flip behind a verify gate, or versioned ExecStart).
-# Until then the operator-facing guidance is: do not `apt upgrade xpf` a
-# live HA node out-of-band; use the increment-B cut-over.
+#  - STANDALONE node: the postinst invokes `xpfd upgrade` — the
+#    verified, atomic, rollback-capable STOP->FLIP->START cut to the
+#    staged version (the increment-A window is now closed: the cut
+#    copies staging into a versioned runtime dir, runs the kernel
+#    verify gate, flips atomically, and pins the unit ExecStart to the
+#    concrete version so a respawn never resolves a mismatched helper).
+#  - CLUSTERED node (/etc/xpf/node-id present): STAGE-ONLY. The postinst
+#    does NOT cut — a clustered node is cut ONLY by `xpfd upgrade
+#    --rolling`, which sequences a controlled per-node drain so the
+#    cluster keeps forwarding. Keyed on node-id ALONE so a degraded-HA
+#    node never falls through to an uncoordinated standalone cut.
 
 set -e
 
@@ -60,6 +55,65 @@ case "$1" in
                     ln -sfnT "$STAGED/$b" "$SBIN/$b"
                 fi
             done
+
+            # === increment-B cut-over (HA-mode contract, plan §6.3) ===
+            #
+            # dpkg has refreshed the staging path. Whether we now CUT OVER
+            # to it depends on whether this is a clustered node:
+            #
+            #  - CLUSTERED node (/etc/xpf/node-id present): STAGE-ONLY. We
+            #    MUST NOT perform a local single-node cut — that would take
+            #    one node down uncoordinated and bypass the rolling drain.
+            #    The cut is driven ONLY by `xpfd upgrade --rolling` (operator
+            #    or the dogfood deploy driver), which sequences the
+            #    controlled drain and itself checks peer liveness. The gate
+            #    is keyed on the node-id file ALONE, NOT on a "live cluster"
+            #    check: a degraded-HA node (node-id present but peer/daemon
+            #    down at apt time) must NOT fall through to a standalone cut.
+            #    "live cluster" is a ROLLING-readiness check, not postinst
+            #    cut permission.
+            #
+            #  - STANDALONE node (no node-id): invoke the verified
+            #    single-node STOP->FLIP->START cut. This is a bounded,
+            #    MEASURED multi-second dataplane gap (the helper cannot be
+            #    re-attached today — true zero-gap is future M-mech-2); the
+            #    verify gate + atomic flip + rollback still earn their keep
+            #    over a blind binary swap. The operator can suppress the
+            #    auto-cut with XPF_NO_POSTINST_CUT=1 and run `xpfd upgrade`
+            #    manually.
+            if [ -f /etc/xpf/node-id ]; then
+                echo "xpf: clustered node (node-id present) — staged only;" \
+                     "cut over with: xpfd upgrade --rolling" >&2
+            elif [ "${XPF_NO_POSTINST_CUT:-}" = "1" ]; then
+                echo "xpf: XPF_NO_POSTINST_CUT=1 — staged only;" \
+                     "cut over with: xpfd upgrade" >&2
+            else
+                echo "xpf: standalone node — performing verified in-place cut-over" >&2
+                # Run the staged binary's upgrade subcommand: it copies
+                # staging into the versioned runtime dir, runs the kernel
+                # verify-dataplane gate, and on PASS does the atomic
+                # STOP->FLIP->START with rollback. A REJECT/abort leaves the
+                # running daemon untouched. We do NOT fail the package
+                # install on a cut-over abort (the operator can re-run
+                # xpf-upgrade); surface it loudly instead.
+                if ! "$STAGED/xpfd" upgrade; then
+                    echo "xpf: WARNING in-place cut-over did not complete." >&2
+                    # Safety net (Copilot): the cut STOPs the unit before it
+                    # FLIPs. Most failures (preflight/copy/verify) abort
+                    # BEFORE the stop and leave the daemon running; the
+                    # standalone START failure path auto-rolls-back and
+                    # restarts. But a flip/daemon-reload error between STOP
+                    # and START could leave the unit stopped. If it is not
+                    # active, try to bring it back up so the node is not left
+                    # offline after `apt upgrade`.
+                    if ! systemctl is-active --quiet xpfd; then
+                        echo "xpf: unit not active after a failed cut-over; restarting" >&2
+                        systemctl start xpfd 2>/dev/null || \
+                            echo "xpf: WARNING could not restart xpfd; run: xpfd upgrade" >&2
+                    fi
+                    echo "xpf: inspect with 'journalctl -u xpfd' and re-run: xpfd upgrade" >&2
+                fi
+            fi
         fi
         # State under /etc/xpf (.configdb, node-id, master.key) is runtime
         # state, NOT package-owned. Do not create, seed, or modify it here.

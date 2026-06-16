@@ -61,6 +61,16 @@ func main() {
 		return
 	}
 
+	// #1917 increment B in-place upgrade cut-over. `xpfd upgrade` performs
+	// the verified, atomic, rollback-capable STOP->FLIP->START cut to the
+	// dpkg-staged version; `xpfd upgrade --rolling` drives a controlled
+	// per-node HA drain so a cluster stays forwarding. Invoked from the
+	// .deb postinst (standalone) and by the operator / dogfood driver.
+	if len(os.Args) > 1 && os.Args[1] == "upgrade" {
+		runUpgradeSubcommand(os.Args[2:])
+		return
+	}
+
 	// #1864 deploy-time pre-flight: run the kernel BPF verifier against
 	// the shim object EMBEDDED IN THIS BINARY without touching any
 	// production state (anonymous maps, no pins, no attach, nothing

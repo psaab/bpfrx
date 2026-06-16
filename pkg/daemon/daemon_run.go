@@ -23,6 +23,7 @@ import (
 	"github.com/psaab/xpf/pkg/cli"
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/dhcp"
@@ -187,8 +188,34 @@ func (d *Daemon) Run(ctx context.Context) error {
 		"config", d.opts.ConfigFile,
 		"pid", os.Getpid())
 
-	// Load persisted configuration from DB, falling back to text config file
+	// Load persisted configuration from DB, falling back to text config file.
+	//
+	// Fatal-on-parse floor (#1917 increment B, plan §6.4 / D1): a PRESENT
+	// but unreadable active.json (JSON parse error, decrypt failure, or a
+	// config compatibility envelope this build cannot read because it was
+	// written by a NEWER xpf) must FAIL CLOSED — return the error from Run
+	// instead of warning-and-proceeding to a blind bootstrapFromFile() that
+	// would OVERWRITE the unreadable DB and silently wipe the operator's
+	// config. This is the structural guard that makes a future config-format
+	// change safe to roll out: an old reader refuses a too-new DB rather than
+	// empty-loading it. A compile error (handled leniently inside Load) or an
+	// absent DB (start-fresh) is NOT this case and still degrades gracefully.
+	//
+	// mgmt-never-stranded (#1922): on the appliance the day-0 + protected-set
+	// lifeline keeps mgmt reachable through a fail-closed boot; #1922 hardens
+	// the foreign/non-appliance host case (noted in the PR; not implemented
+	// here).
 	if err := d.store.Load(); err != nil {
+		if errors.Is(err, configstore.ErrConfigDBUnreadable) {
+			// Point recovery at the actual unreadable artifact — the config
+			// DB under .configdb/, NOT the text config file (Copilot).
+			dbPath := filepath.Join(filepath.Dir(d.opts.ConfigFile), ".configdb", "active.json")
+			return fmt.Errorf("config DB is present but unreadable; refusing to "+
+				"start and overwrite it (fail closed). Inspect/repair %s (the on-disk "+
+				"config DB, NOT the text config file) or roll the xpf binary forward "+
+				"to a build that can read it: %w",
+				dbPath, err)
+		}
 		slog.Warn("failed to load config from db", "err", err)
 	}
 

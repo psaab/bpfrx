@@ -5393,3 +5393,33 @@ top.
 - **Timestamp**: 2026-06-16T14:00Z
 - **Action**: Implemented increment A (packaging only) of #1917; subsumes #1923. Added debian/ (control, rules, changelog, source/format, xpf.postinst/postrm, xpf.needrestart), `make deb` target, and changed scripts/image/bake.py to build+install the .deb instead of --copy-in. Addressed round-1 AGY (7) + Codex (incl. HIGH ExecStartPre) findings. End-to-end bake validation PASS (Scenario A/B/C). 
 - **File(s)**: debian/control, debian/rules, debian/changelog, debian/source/format, debian/xpf.postinst, debian/xpf.postrm, debian/xpf.needrestart, debian/.gitignore, Makefile, scripts/image/bake.py, docs/install-images.md, docs/pr/1917a-xpf-deb/reviewer-ids.md
+
+## #1917 increment B — in-place upgrade mechanism
+
+- **Timestamp**: 2026-06-16
+- **Action**: D1 compatibility floor — config-DB envelope + fatal-on-parse
+- **File(s)**: pkg/configstore/envelope.go (new), pkg/configstore/envelope_test.go (new), pkg/configstore/db.go, pkg/configstore/store.go, pkg/daemon/daemon.go, pkg/daemon/daemon_run.go
+- **Action**: A1 cut-over state machine (pkg/upgrade) — STAGED→PREFLIGHT→COPIED→VERIFIED→STOPPED→FLIPPED→STARTED→COMMITTED, crash-safe journal, binary+DB rollback, N=3 GC
+- **File(s)**: pkg/upgrade/{state,runner,cutover,flip,system_linux,runner_test}.go (new)
+- **Action**: HA rolling driver (B1) + `xpfd upgrade [--rolling]` subcommand + CLI-backed RollingCluster
+- **File(s)**: pkg/upgrade/{rolling,cluster_cli,rolling_test}.go (new), cmd/xpfd/{upgrade.go (new),main.go}
+- **Action**: C1 dogfood — postinst HA-mode contract (stage-only on clustered, cut on standalone) + cluster-setup.sh XPF_DEPLOY_DEB rolling deb deploy
+- **File(s)**: debian/xpf.postinst, test/incus/cluster-setup.sh
+- **Action**: D1 rollback DB-restore test + in-place-upgrade design doc + audit regen
+- **File(s)**: pkg/upgrade/runner_test.go, docs/in-place-upgrade.md (new), docs/refactoring-audit-current.txt
+- **Action**: Code-review round 1 fixes (Codex + AGY) — rollback journal clear/resume, crash-safe DB restore, --unit health, gRPC non-interactive cluster binding + real-format-validated drain parsing + true HA-proto compare, cluster-setup grep fix
+- **File(s)**: pkg/upgrade/{state,cutover,flip,system_linux,cluster_cli,runner_test,cluster_cli_test}.go, cmd/xpfd/upgrade.go, test/incus/cluster-setup.sh
+- **Action**: Code-review round 2 fixes (Codex r2 + AGY r2) — DrainComplete requires peer-primary (status topic), sync gate on Status: Up, stale half-cut finished-to-completion, orphan dbsnap gc sweep, protocol-bump limitation documented
+- **File(s)**: pkg/upgrade/{cutover,cluster_cli,flip,runner_test,cluster_cli_test}.go, docs/in-place-upgrade.md
+- **Action**: Code-review round 3 fix (Codex r3 High) — parseDrainComplete now per-RG paired (every RG: local secondary + peer primary), not global any-peer-primary
+- **File(s)**: pkg/upgrade/cluster_cli.go, pkg/upgrade/cluster_cli_test.go
+- **Action**: Code-review round 3 follow-up (AGY r3 Medium) — post-flip StartUnit exec failure now triggers auto-rollback (was: abort leaving daemon offline)
+- **File(s)**: pkg/upgrade/cutover.go, pkg/upgrade/runner_test.go
+- **Action**: Code-review round 4 fixes (Codex r4) — PeerTakeoverReady rejects Takeover/Transfer-ready:no + Monitor-failures; parseDrainComplete resets curRG on malformed header (no row bleed)
+- **File(s)**: pkg/upgrade/cluster_cli.go, pkg/upgrade/cluster_cli_test.go
+- **Action**: Code-review round 5 fix (Codex r5) — PeerTakeoverReady checks the state TOKEN after the colon, not a line substring (a YES reason embedding "no" no longer false-positives)
+- **File(s)**: pkg/upgrade/cluster_cli.go, pkg/upgrade/cluster_cli_test.go
+- **Action**: Code-review round 5 follow-up (Codex full re-read) — ResetFailover resets ALL configured RGs (enumerated, was hardcoded 0,1); documented PeerTakeoverReady best-effort + DrainComplete authoritative
+- **File(s)**: pkg/upgrade/cluster_cli.go, pkg/upgrade/cluster_cli_test.go, docs/in-place-upgrade.md
+- **Action**: Copilot formal review fixes — fail-closed msg points at .configdb/active.json; postinst restart safety-net on cut-over failure; cutover Options doc (UnitAlreadyStopped). Other Copilot findings already fixed in r1-r5.
+- **File(s)**: pkg/daemon/daemon_run.go, debian/xpf.postinst, pkg/upgrade/cutover.go
