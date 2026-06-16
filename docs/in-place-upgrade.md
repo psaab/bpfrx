@@ -88,7 +88,13 @@ both); exactly one node is primary throughout.
    RG keeps forwarding while VRRP is still MASTER). On timeout: fail back
    and ABORT WITHOUT cutting (node still forwarding — no harm).
 5. single-node cut (auto-rollback disabled).
-6. wait for session sync to re-establish.
+6. wait for session sync to re-establish, bounded by `RejoinDeadline`
+   (60s default). The cut just restarted xpfd, so the local gRPC socket
+   refuses connections for the first few seconds — that `connection
+   refused` is the EXPECTED transient, treated as "not ready yet" and
+   re-polled until the deadline (NOT a hard abort on the first dial
+   error). Only the deadline aborts, surfacing the last observed error;
+   the node is then left secondary for the operator to inspect.
 7. `ResetFailover()` to rejoin election; forward-verify is the natural
    post-promotion check (`make test-failover`) — a passive node
    structurally cannot forward, so it is never "verified while passive".

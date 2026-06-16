@@ -133,8 +133,10 @@ func runRollingWith(r *Runner, cl RollingCluster, rc RollingConfig) error {
 		return fmt.Errorf("rolling: force secondary: %w", err)
 	}
 
-	// 4. Wait for the STRONG drain predicate.
-	if err := waitPredicate(rc, cl.DrainComplete); err != nil {
+	// 4. Wait for the STRONG drain predicate. The local daemon is still up
+	//    here, so a predicate error is NOT expected — fail fast (the abort
+	//    direction below is safe: we have not cut yet, node still forwards).
+	if err := waitPredicate(rc, false, cl.DrainComplete); err != nil {
 		// Drain incomplete: the node may still be forwarding. Best-effort
 		// failback so we don't leave it half-drained, then abort.
 		logf("rolling: drain predicate not met within %s; resetting failover and aborting", rc.DrainDeadline)
@@ -152,11 +154,18 @@ func runRollingWith(r *Runner, cl RollingCluster, rc RollingConfig) error {
 			"operator-driven — inspect the node): %w", err)
 	}
 
-	// 6. Wait for sync to re-establish on the upgraded node.
+	// 6. Wait for sync to re-establish on the upgraded node. The cut just
+	//    restarted xpfd, so the local gRPC socket is unavailable for the
+	//    first few seconds (connection refused) — that is the EXPECTED
+	//    transient, not a failure. Tolerate predicate errors and keep
+	//    polling until RejoinDeadline; only the deadline (with the last
+	//    observed error) aborts. Without this, the first dial failure
+	//    short-circuits the wait and the RejoinDeadline tolerance is never
+	//    used (false-negative abort while the daemon is healthily starting).
 	if err := waitPredicate(RollingConfig{
 		DrainDeadline: rc.RejoinDeadline,
 		PollInterval:  rc.PollInterval,
-	}, cl.SyncEstablished); err != nil {
+	}, true, cl.SyncEstablished); err != nil {
 		return fmt.Errorf("rolling: upgraded node did not re-establish session sync "+
 			"within %s — leaving it secondary; operator should verify before "+
 			"failing back: %w", rc.RejoinDeadline, err)
@@ -174,18 +183,32 @@ func runRollingWith(r *Runner, cl RollingCluster, rc RollingConfig) error {
 }
 
 // waitPredicate polls pred until it returns true or the deadline elapses.
-func waitPredicate(rc RollingConfig, pred func() (bool, error)) error {
+//
+// When tolerateTransientErr is false, the first predicate error aborts
+// immediately (fail-fast). When true, a predicate error is treated as
+// "not ready yet" — the poll continues until the deadline, and the last
+// observed error is surfaced if the deadline elapses without success.
+// The tolerant mode is for waits where an error is the EXPECTED transient
+// (e.g. polling a gRPC socket that is briefly unavailable while the daemon
+// restarts after a cut); the deadline is the backstop that still bounds it.
+func waitPredicate(rc RollingConfig, tolerateTransientErr bool, pred func() (bool, error)) error {
 	rc.withDefaults()
 	end := time.Now().Add(rc.DrainDeadline)
+	var lastErr error
 	for {
 		ok, err := pred()
-		if err != nil {
+		switch {
+		case err != nil && !tolerateTransientErr:
 			return err
-		}
-		if ok {
+		case err != nil:
+			lastErr = err // keep polling; treat as not-ready
+		case ok:
 			return nil
 		}
 		if time.Now().After(end) {
+			if lastErr != nil {
+				return fmt.Errorf("predicate not satisfied within %s (last error: %w)", rc.DrainDeadline, lastErr)
+			}
 			return fmt.Errorf("predicate not satisfied within %s", rc.DrainDeadline)
 		}
 		time.Sleep(rc.PollInterval)
