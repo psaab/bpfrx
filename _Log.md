@@ -5460,3 +5460,7 @@ top.
   pkg/dataplane/compiler_iface.go, protected_iface_test.go;
   pkg/config/types_system.go; pkg/configstore/README.md;
   docs/refactoring-audit-current.txt.
+
+- **Timestamp**: 2026-06-16
+  - **Action**: README getting-started restructure (PR #1937) — rewrote README into install/getting-started guide (3 paths: .deb, incus image, kvm/libvirt) cross-checked against Makefile deb/image targets, debian/control+postinst, scripts/image/bake.py + make_config_drive.py, scripts/deploy/xpf-deploy.py. Moved deep reference content into new docs/architecture.md, docs/feature-coverage.md, docs/network-topology.md, docs/critical-patterns.md, docs/README.md. Docs-only.
+  - **File(s)**: README.md, docs/architecture.md, docs/feature-coverage.md, docs/network-topology.md, docs/critical-patterns.md, docs/README.md, docs/pr/readme-getting-started/reviewer-ids.md
