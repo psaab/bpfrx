@@ -35,3 +35,27 @@ Branch: engineer/1922-pr1-rollback-executor
 All r1 findings addressed in f8e16e1 (daemon nil-guard + standalone-cli
 store executor + total==2 + timer-fire-once test via shared fireConfirmTimer
 + corrected lock-order comment).
+
+### Round 2 (re-review of f8e16e1 / cc0a1a78b)
+
+- **Codex** `task-mqh4p3z8-qe9b7o` — **MERGE-READY**. All 5 checks PASS
+  (nil-deref closed on all paths incl. fallback; no standalone/daemon
+  double-registration; tests catch TryAcquire-skip + drive real
+  fireConfirmTimer; timer extraction lock-safe; no deadlock/torn-state;
+  corrected comment matches code). No new findings.
+- **AGY** (agy-rescue agent) — **MERGE-READY**. All 6 hunt categories
+  verified clean (lock order, nil-deref, lost-wakeup/double-fire/stale-gen,
+  double-registration, torn state, #1817/#1799 preservation). Severity:
+  None.
+- **Claude SMR** — MERGE-READY.
+- **Copilot** — r1 findings (both = the Critical) addressed; re-requested
+  on HEAD.
+
+### Live gate
+
+Service-mode gRPC `commit confirmed 1` (delete lan->wan allow-all,
+unconfirmed) on loss:xpf-userspace-fw0: mid-window forwarding BLOCKED,
+post-timeout store reverted (policy back) AND dataplane re-applied
+(forwarding restored). Journal: "commit confirmed timed out, configuration
+rolled back". v4+v6+reverse forwarding sanity 0% loss. Deployed hash
+verified == local.
