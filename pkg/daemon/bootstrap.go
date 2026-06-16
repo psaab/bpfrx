@@ -160,6 +160,14 @@ func (d *Daemon) exitBootstrapMode(reason string) {
 func (d *Daemon) enterBootstrapMode() {
 	d.bootstrapMode.Store(true)
 
+	// Test seam: when the apply body is stubbed (unit tests), skip the
+	// real filesystem / networkctl / FRR / dataplane teardown — those touch
+	// /etc/systemd/network and run external commands. The flag flip above is
+	// the observable behavior under test.
+	if d.applyBodyForTest != nil {
+		return
+	}
+
 	// (2) Remove xpf-written takeover .network files (NOT the lifeline fxp0
 	// .network and NOT the .link rename files — those keep mgmt reachable and
 	// the rename stable). The lifeline .network is the bootstrap fxp0 file.
@@ -215,17 +223,32 @@ type lifelineRecord struct {
 	MAC     string // MAC address (tiebreaker for non-PCI NICs)
 }
 
+// lifelineRecordFileForTest overrides lifelineRecordFile in tests (the real
+// path is /etc, not writable in the test sandbox). Empty => use the const.
+var lifelineRecordFileForTest string
+
+func lifelinePath() string {
+	if lifelineRecordFileForTest != "" {
+		return lifelineRecordFileForTest
+	}
+	return lifelineRecordFile
+}
+
 // writeLifelineRecord persists the lifeline identity. Keyed by PCI address so
 // it survives the rename to fxp0 and daemon restarts (invariant 2). The file
 // lives outside .configdb so it is config-independent (Item 4 invariant 3)
 // and survives rollback-to-bootstrap.
 func writeLifelineRecord(rec lifelineRecord) error {
+	return writeLifelineRecordAt(lifelinePath(), rec)
+}
+
+func writeLifelineRecordAt(path string, rec lifelineRecord) error {
 	content := fmt.Sprintf("# Managed by xpfd — #1922 management lifeline identity\npci=%s\nmac=%s\n",
 		rec.PCIAddr, rec.MAC)
-	if err := os.MkdirAll(filepath.Dir(lifelineRecordFile), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return fmt.Errorf("create lifeline record dir: %w", err)
 	}
-	if err := os.WriteFile(lifelineRecordFile, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		return fmt.Errorf("write lifeline record: %w", err)
 	}
 	return nil
@@ -236,7 +259,11 @@ func writeLifelineRecord(rec lifelineRecord) error {
 // — the protected set then falls back to fxp0 + any management-interface
 // leaf only).
 func readLifelineRecord() (lifelineRecord, bool) {
-	data, err := os.ReadFile(lifelineRecordFile)
+	return readLifelineRecordAt(lifelinePath())
+}
+
+func readLifelineRecordAt(path string) (lifelineRecord, bool) {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return lifelineRecord{}, false
 	}
