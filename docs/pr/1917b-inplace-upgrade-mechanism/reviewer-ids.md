@@ -72,9 +72,11 @@ Codex: 5 rounds, each narrowing; final findings were a doc-only Low + two pre-ex
 ## Fix round (commit e7d8840f9 — rejoin wait transient-error tolerance; found by live gate)
 | Reviewer | Task ID | Round | Verdict |
 |---|---|---|---|
-| Codex | task-mqgwf75u-y0a8qx | fix-r1 | (pending) |
-| AGY | adversarial-review-mqgwfh8o-099pvw | fix-r1 | (pending) |
+| Codex | task-mqgwf75u-y0a8qx | fix-r1 | MERGE-READY (A-F all pass; 2 non-blocking nits) |
+| AGY | adversarial-review-mqgwfh8o-099pvw | fix-r1 | MERGE-READY (same lastErr-staleness nit) |
 | Copilot | (formal PR review on push) | fix-r1 | (pending) |
 
 Live re-smoke (resmoke-1933): rolling upgrade end-to-end both nodes + measured gap — (pending).
 Prior live gate (smoke-1933): test-failover 13/0; secondary cut 0-gap/0-retr; rolling aborted before node0 cut on the now-fixed false-negative (PR comment 4721307538).
+
+Fix-round nits (both reviewers): (1) lastErr could surface a stale early transient on timeout; (2) tighten timeout test. BOTH ADDRESSED in commit below — waitPredicate clears lastErr on a clean not-ready poll; timeout test now asserts cut-happened + post-cut polling.

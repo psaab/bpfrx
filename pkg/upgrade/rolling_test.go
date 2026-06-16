@@ -188,8 +188,19 @@ func TestRolling_RejoinTimesOutSurfacesLastErr(t *testing.T) {
 	if !strings.Contains(err.Error(), "connection refused") {
 		t.Errorf("expected the last observed error surfaced, got %v", err)
 	}
-	// The cut DID happen (we are past it); the node is left secondary, not
-	// failed back — ResetFailover (rejoin election) must NOT have run.
+	// The cut DID happen (we are past it) — the rejoin wait is reached only
+	// after the single-node cut wrote the version drop-in.
+	if fs.dropinContent == "" {
+		t.Error("cut did not happen before the rejoin wait (timeout was not in step 6)")
+	}
+	// Post-cut polling must have actually occurred (poll #1 is the pre-cut
+	// precheck), so the timeout is genuinely the rejoin wait exhausting
+	// RejoinDeadline, not a precheck failure.
+	if cl.syncPolls <= 1 {
+		t.Errorf("rejoin wait did not poll post-cut: syncPolls=%d", cl.syncPolls)
+	}
+	// The node is left secondary, not failed back — ResetFailover (rejoin
+	// election) must NOT have run.
 	if cl.resetCalled {
 		t.Error("ResetFailover (failback) ran despite the rejoin never completing — node should be left secondary")
 	}

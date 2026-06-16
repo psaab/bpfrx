@@ -204,6 +204,11 @@ func waitPredicate(rc RollingConfig, tolerateTransientErr bool, pred func() (boo
 			lastErr = err // keep polling; treat as not-ready
 		case ok:
 			return nil
+		default:
+			// Clean poll, just not ready yet — drop any stale earlier
+			// error so a timeout reports the most recent state, not a
+			// transient that has since cleared.
+			lastErr = nil
 		}
 		if time.Now().After(end) {
 			if lastErr != nil {
