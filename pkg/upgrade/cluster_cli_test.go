@@ -134,6 +134,57 @@ func TestDrainParser_Fixtures(t *testing.T) {
 	}
 }
 
+// TestPeerTakeoverReady_Fixtures covers the real not-ready tokens
+// FormatInformation emits (Codex r4 High).
+func TestPeerTakeoverReady_Fixtures(t *testing.T) {
+	ready := strings.Join([]string{
+		"  Remote node: healthy (node1)",
+		"  Takeover ready: yes (since 12:00:00)",
+		"  Transfer ready: yes",
+		"  Monitor failures: none",
+	}, "\n")
+	takeoverNo := strings.ReplaceAll(ready, "Takeover ready: yes (since 12:00:00)", "Takeover ready: no (interface ge-0-0-1 down)")
+	transferNo := strings.ReplaceAll(ready, "Transfer ready: yes", "Transfer ready: no")
+	monFail := strings.ReplaceAll(ready, "Monitor failures: none", "Monitor failures: ge-0-0-1")
+
+	if !parsePeerTakeoverReady(ready) {
+		t.Error("all-green should be takeover-ready")
+	}
+	if parsePeerTakeoverReady(takeoverNo) {
+		t.Error("'Takeover ready: no' must block (VIP stranding risk)")
+	}
+	if parsePeerTakeoverReady(transferNo) {
+		t.Error("'Transfer ready: no' must block")
+	}
+	if parsePeerTakeoverReady(monFail) {
+		t.Error("'Monitor failures: <iface>' must block")
+	}
+}
+
+// TestDrainComplete_MalformedHeaderNoBleed proves a malformed RG header
+// does not let following node rows bleed into the previous RG (Codex r4
+// Medium): the rows after the bad header are dropped (curRG reset to -1),
+// so the previous RG keeps only its own (incomplete) rows and the result
+// is NOT drained.
+func TestDrainComplete_MalformedHeaderNoBleed(t *testing.T) {
+	// RG0 local-primary (not drained); then a MALFORMED header; then rows
+	// that, if they bled into RG0, would look secondary/primary. The
+	// malformed header must prevent the bleed so RG0 stays primary => not
+	// drained.
+	s := strings.Join([]string{
+		"Node name: node0",
+		"Redundancy group: 0 , Failover count: 0",
+		"node0   200      primary        yes      no       None",
+		"node1   100      secondary      yes      no       None",
+		"Redundancy group: XYZ , Failover count: 0", // malformed number
+		"node0   100      secondary      yes      no       None",
+		"node1   200      primary        yes      no       None",
+	}, "\n")
+	if parseDrainComplete(s) {
+		t.Error("malformed header let node rows bleed into the previous RG — must NOT read drained")
+	}
+}
+
 // TestSyncParser_Fixtures covers the Status: Up/Down sync gate.
 func TestSyncParser_Fixtures(t *testing.T) {
 	up := strings.Join([]string{

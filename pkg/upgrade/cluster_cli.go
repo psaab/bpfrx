@@ -251,13 +251,33 @@ func trailingInt(line string) (int, bool) {
 
 func parsePeerTakeoverReady(s string) bool {
 	// The PEER is takeover-ready when it is healthy AND no RG reports a
-	// takeover blocker. Conservative — a monitor fail anywhere blocks.
+	// takeover blocker. The information topic (FormatInformation) emits
+	// "Takeover ready: no (...)", "Transfer ready: no", and a "Monitor
+	// failures:" line when an RG cannot take over (status.go). Conservative
+	// — ANY of these blockers fails the precheck (Codex r4 High: the parser
+	// must not be fail-open on the real not-ready tokens).
 	if !lineHasAll(s, "Remote node:", "healthy") {
 		return false
 	}
-	low := strings.ToLower(s)
-	if strings.Contains(low, "monitor: fail") || strings.Contains(low, "monitorfail") {
-		return false
+	for _, line := range strings.Split(s, "\n") {
+		ll := strings.ToLower(strings.TrimSpace(line))
+		if strings.HasPrefix(ll, "takeover ready:") && strings.Contains(ll, "no") {
+			return false
+		}
+		if strings.HasPrefix(ll, "transfer ready:") && strings.Contains(ll, "no") {
+			return false
+		}
+		if strings.HasPrefix(ll, "monitor failures:") {
+			// A "Monitor failures:" line with any content after the colon
+			// is a blocker; "none"/empty is fine.
+			rest := strings.TrimSpace(ll[len("monitor failures:"):])
+			if rest != "" && rest != "none" {
+				return false
+			}
+		}
+		if strings.Contains(ll, "monitor: fail") || strings.Contains(ll, "monitorfail") {
+			return false
+		}
 	}
 	return true
 }
@@ -300,6 +320,11 @@ func parseDrainComplete(s string) bool {
 		ll := strings.ToLower(l)
 		// RG header: "Redundancy group: N , Failover count: M".
 		if strings.HasPrefix(ll, "redundancy group:") {
+			// Reset curRG FIRST (Codex r4 Medium): a malformed header that
+			// fails to parse a number must NOT leave curRG pointing at the
+			// PREVIOUS RG, or the node rows after it would bleed into the
+			// wrong group's state.
+			curRG = -1
 			rest := strings.TrimSpace(l[len("Redundancy group:"):])
 			f := strings.Fields(rest)
 			if len(f) > 0 {
