@@ -1,11 +1,12 @@
 # Plan of action — #1924: signed, hosted appliance distribution
 
-> Revision: r2 (2026-06-16)
-> Status: REVISED after r1 3-way hostile review (Codex + AGY + Claude SMR all
-> PLAN-NEEDS-MAJOR). r2 changes log at the bottom (§12).
+> Revision: r3 (2026-06-16)
+> Status: REVISED after r2 review (Codex PLAN-NEEDS-MAJOR + Claude SMR
+> PLAN-NEEDS-MAJOR + AGY PLAN-READY-WITH-NITS). r3 resolves the r2-introduced
+> contradictions (N1–N5) + the key-rotation lockout (NIT-2). Change logs §12.
 > Branch: research/1924-signed-hosted-dist
-> Mode: `/research` — STOPS at PLAN-READY. No implementation, no PR, no
-> production source touched until `/engineer 1924`.
+> Mode: `/research` convergence; implementation begins only on the user's own
+> `/engineer 1924`. No production source touched in this doc.
 
 ## 1. Problem statement
 
@@ -63,6 +64,7 @@ source is touched. Surface:
 | `.deb` repo build tooling | NEW | `scripts/dist/` (repo builder + signer) |
 | `install.sh` | NEW | `scripts/dist/install.sh` (or `dist/install.sh` template) |
 | Public key (pinned) | NEW (placeholder until OQ-2) | `scripts/dist/xpf-image.pub` (minisign, image+install.sh) + `scripts/dist/xpf-archive-keyring.asc` (PGP, apt) |
+| Packaged archive keyring (r3 NIT-2) | NEW (one `debian/install` line, no postinst logic) | ships `xpf-archive-keyring.asc` to `/etc/apt/keyrings/` so existing hosts get rotated keys via `apt upgrade` |
 | Makefile | extend | `dist-sign`, `dist-repo`, `dist-publish` targets |
 | Docs | extend / NEW | `docs/install-images.md`, NEW `docs/distribution.md` |
 | CI/release (optional) | NEW (deferrable) | `.github/workflows/release.yml` |
@@ -81,14 +83,34 @@ Three independent-but-coordinated mechanisms, each gated by a config input:
    incus metadata. Verify on import in `validate.py` / `xpf-deploy.py`.
 2. **Build + sign an apt repo** for the `xpf` / `xpf-appliance` `.deb`s, so
    `apt install xpf-appliance` works from a hosted, authenticated index.
-3. **`install.sh`** (Tailscale-style) that bootstraps trust (installs the
-   pinned archive keyring), adds the apt source, and runs `apt install
-   xpf-appliance` — one command on a fresh Debian/Ubuntu host.
+3. **`install.sh`** (Tailscale-style) that runs a PREFLIGHT (amd64 + kernel
+   ≥6.18 + systemd-networkd present), bootstraps trust (installs the archive
+   keyring), adds the apt source, and runs `apt install xpf-appliance` — one
+   command on a Debian/Ubuntu host **that already meets the kernel floor**.
 
-Publishing (where bytes land) is a thin `dist-publish` target parametrised by
-`XPF_DIST_BASE_URL` (OQ-1). The mechanism is host-agnostic: a static file
-server, an S3/GCS bucket fronted by HTTPS, or GitHub Releases all satisfy the
-contract "serve these files under a base URL over TLS".
+**r3 (resolves N5) — install.sh targets a host that meets the IMAGE's kernel
+floor; it does NOT install a kernel.** The appliance's verifier floor is kernel
+≥6.18 + the mlx5/i40e driver set (the IMAGE owns that closure; `debian/control`
+states kernel handling is out of scope). A bare-metal `apt install
+xpf-appliance` on Debian 12 / Ubuntu 24.04 would install the packages but
+`xpfd verify-dataplane` would REJECT the host kernel. So install.sh PREFLIGHTS
+and REFUSES with a clear message ("xpf requires kernel ≥6.18 + native-XDP NIC;
+use the appliance image, or upgrade the host kernel") rather than leaving a
+broken install. The image (bake.py) remains the turnkey path for hosts that do
+not meet the floor.
+
+**r3 (resolves N4) — TWO base URLs, not one.** Images and the apt pool have
+different hosting shapes, so the mechanism takes two parameters:
+- `XPF_IMAGE_BASE_URL` (OQ-1a): serves the image artifacts + sigs +
+  `latest.json` + `install.sh`. Satisfiable by ANY static host INCLUDING
+  GitHub Releases (flat assets are fine for images).
+- `XPF_APT_BASE_URL` (OQ-1b): serves the `dists/`+`pool/` tree. Requires a
+  real directory-serving host (static bucket / Pages / file server) — **GitHub
+  Releases CANNOT serve this** (flat assets only). install.sh writes
+  `URIs: <XPF_APT_BASE_URL>`.
+They MAY be the same host (a bucket serves both); they need not be. Publishing
+is a thin `dist-publish` target parametrised by both (each fed to
+`XPF_PUBLISH_CMD`). The mechanism is host-agnostic per URL.
 
 ### Trust model (the spine of the design)
 
@@ -188,7 +210,7 @@ Channel layout (deb822, the contract install.sh writes):
 ```
 /etc/apt/sources.list.d/xpf.sources:
   Types: deb
-  URIs: <XPF_DIST_BASE_URL>/apt        # OQ-1
+  URIs: <XPF_APT_BASE_URL>             # OQ-1b (dists/+pool/ tree)
   Suites: stable                       # or edge
   Components: main
   Architectures: amd64
@@ -235,9 +257,10 @@ separated UX tiers, labeled as such in the docs:
 | **Self-hosted static file server** | full control | the user runs+secures it |
 
 **Mechanism (host-agnostic):** `make dist-publish` rsync/`aws s3 sync`/`gh
-release upload`s the `dist/` tree (images + sigs) and the reprepro `apt/` pool
-to `XPF_DIST_BASE_URL`. The plan provides a pluggable `XPF_PUBLISH_CMD` so the
-user wires their chosen backend without the mechanism caring. Retention +
+release upload`s the image tree (images + sigs + `latest.json` + install.sh) to
+`XPF_IMAGE_BASE_URL` and the flat `apt/` pool tree to `XPF_APT_BASE_URL` (§3 N4
+two-URL split). The plan provides a pluggable `XPF_PUBLISH_CMD` so the user
+wires their chosen backend without the mechanism caring. Retention +
 channel layout are documented defaults (keep last N images per channel) the
 user tunes. **No backend is hardcoded.**
 
@@ -293,15 +316,26 @@ reused by both consumers.
 Wire it as:
 - `validate.py`: `--verify-sig` (default ON when a `.minisig` is present next
   to the artifacts; `--no-verify-sig` escape hatch for local dev bakes).
-- `xpf-deploy.py`: verify each image file before `incus image import` /
-  `virt-install --import`. Future `--image-url` fetches then verifies then
-  imports the EXACT downloaded file.
+- **r3 (resolves N1) — image verify lives at IMPORT time, not alias-launch.**
+  Today `xpf-deploy.py` does NOT import an image: it `incus init <alias>` /
+  `virt-install --import <existing qcow2>` against an artifact the operator
+  ALREADY placed locally. There is no qcow2/metadata path at deploy time for
+  the incus-alias flow, so the deploy path CANNOT bind image bytes — and the
+  plan no longer claims it does. Image verification is wired in the TWO places
+  that actually touch raw image bytes:
+  1. `validate.py` (the bake gate) — it DOES `incus image import <meta>
+     <qcow2>`; verify the exact `--qcow2`/`--metadata` files there.
+  2. A NEW `xpf-deploy.py fetch` / `--image-url` subcommand that downloads from
+     `XPF_IMAGE_BASE_URL`, verifies the EXACT downloaded file, then imports it
+     to a local alias. The existing `deploy` (alias-launch) path is unchanged
+     and simply consumes a previously-verified alias (documented: "verify at
+     fetch/import, not at launch").
 - Pinned pubkey path is a checked-in constant; `XPF_IMAGE_PUBKEY` overrides for
   rotation/testing.
 
 ### 5.3 Apt repo (NEW scripts/dist/build-apt-repo.sh)
 Default = the flat signed repo (stateless-safe, §4B); reprepro is an opt-in.
-- Inputs: the existing pool (synced down from `XPF_DIST_BASE_URL` if present),
+- Inputs: the existing pool (synced down from `XPF_APT_BASE_URL` if present),
   the freshly built `dist/deb/xpf_*.deb` + `xpf-appliance_*.deb`, the channel
   (`stable`/`edge`), the PGP key (OQ-2).
 - Flat path: lay out `pool/main/x/xpf/*.deb`; `apt-ftparchive packages` →
@@ -320,17 +354,29 @@ Default = the flat signed repo (stateless-safe, §4B); reprepro is an opt-in.
 
 ### 5.4 install.sh (NEW)
 Tailscale-shaped, POSIX sh, idempotent:
-1. Detect distro/arch; refuse non-amd64 / non-Debian-family with a clear msg.
+1. PREFLIGHT (r3 N5): refuse non-amd64 / non-Debian-family / kernel <6.18 /
+   no systemd-networkd, each with a clear actionable message.
 2. Install the pinned archive keyring to `/etc/apt/keyrings/
    xpf-archive-keyring.asc` (embedded inline, `0644`).
 3. Write `/etc/apt/sources.list.d/xpf.sources` (deb822, `Signed-By`,
-   `XPF_DIST_BASE_URL` substituted; default channel `stable`,
+   `XPF_APT_BASE_URL` substituted; default channel `stable`,
    `XPF_CHANNEL=edge` override).
 4. `apt-get update && apt-get install -y xpf-appliance`.
+
+**r3 (resolves NIT-2) — the archive keyring also ships in the PACKAGE payload.**
+install.sh's inline keyring bootstraps NEW hosts, but existing hosts never
+re-run install.sh, so a key rotation would lock them out of `apt update` once
+the old key retires. The mechanism therefore ALSO ships the keyring as a
+package-owned conffile at `/etc/apt/keyrings/xpf-archive-keyring.asc` (in the
+`xpf` package). During a dual-sign rotation window a normal `apt upgrade`
+delivers the new key to existing hosts BEFORE the old key is retired — the
+standard apt-keyring-in-package pattern. (This is the one place #1924 touches
+`debian/` — a packaged keyring file + its `debian/install` line; no postinst
+logic. It is in scope because without it rotation is a fleet lockout.)
 5. Print next steps (day-0 config, `cli`, mgmt reachability caveat — the
    interface-takeover warning from #1879 is RESTATED here because a bare-metal
    `apt install` on a remote box can cut mgmt if fxp0 mapping is wrong).
-- `install.sh` is itself published at `XPF_DIST_BASE_URL/install.sh` and the
+- `install.sh` is itself published at `XPF_IMAGE_BASE_URL/install.sh` and the
   doc gives both Tier A (one-liner) and Tier B (verify-before-run) per §4C.
 
 **r2 (resolves AGY-HIGH-2) — apt UPGRADE inherits #1917's postinst cut-over.**
@@ -360,11 +406,15 @@ obligations here are DOCUMENTATION:
   non-zero, nothing uploaded) unless, for every artifact in the publish set:
   (a) each image has a verifying `xpf-<ver>.SHA256SUMS.minisig` against the
   pinned pubkey; (b) the apt `InRelease` verifies against the archive pubkey;
-  (c) `install.sh.minisig` verifies (if install.sh is in the set). Bake may be
+  (c) `install.sh.minisig` verifies (if install.sh is in the set); **(d) r3
+  (resolves N2): the per-channel `latest.json` verifies against the image pubkey
+  AND names a version present in the publish set** (so a stale/unsigned
+  freshness pointer can never ship). Bake may be
   fail-open (dev ergonomics) but PUBLISH is fail-closed — an unsigned dev bake
   can never reach the channel.
 - **r2 `XPF_PUBLISH_CMD` contract (resolves SMR-F5):** invoked exactly as
-  `$XPF_PUBLISH_CMD <local-dist-dir> <XPF_DIST_BASE_URL>`; must be idempotent
+  `$XPF_PUBLISH_CMD <local-dist-dir> <dest-base-url>`; called once per URL
+  (image tree → `XPF_IMAGE_BASE_URL`, apt tree → `XPF_APT_BASE_URL`); idempotent
   and exit non-zero on failure. The plan documents this signature so the
   backend (rsync / `aws s3 sync` / `gh release upload` wrapper) is a thin shim.
 - NEW `docs/distribution.md`: the publisher runbook (key management pointers,
@@ -382,12 +432,21 @@ Mitigations, scaled to a single-publisher appliance (not full TUF):
 - **Apt:** the signed `Release`/`InRelease` carries `Valid-Until` (flat path
   sets it explicitly; reprepro via `conf/distributions` `ValidFor`). apt warns/
   refuses a stale `Release` — built-in replay protection for the package path,
-  re-signed each publish.
+  re-signed each publish. **r3 (resolves NIT-1): with MANUAL/air-gap signing
+  (OQ-4) a SHORT `Valid-Until` would expire the repo between releases and break
+  `apt update`. The mechanism therefore sets a LONG default `Valid-Until` (1
+  year) aligned to a manual cadence, and documents that a shorter window
+  REQUIRES an automated re-sign job. The duration is a config input
+  (`XPF_APT_VALID_DAYS`).**
 - **Images:** a signed, per-channel `dist/<channel>/latest.json` (version +
   bake date + the per-version manifest name) signed with the image key. The
   operator/`xpf-deploy.py --image-url` resolves `latest.json`, checks it is not
   older than a locally-remembered version (simple monotonic check), then
-  fetches the named version. This is a LIGHTWEIGHT anti-rollback signal, not a
+  fetches the named version. **r3 (resolves NIT-3): the watermark is persisted
+  at `${XDG_STATE_HOME:-~/.local/state}/xpf/image-watermark.json`; because
+  xpf-deploy is a stateless multi-operator CLI, this check is documented as
+  BEST-EFFORT (a fresh workstation has no watermark and trusts latest.json's
+  own signature + date).** This is a LIGHTWEIGHT anti-rollback signal, not a
   guarantee against a sophisticated freeze attack — documented honestly as
   "detects stale mirrors / accidental rollback," with TUF-grade freshness
   called out as a future option (not in #1924 scope). Flagged so reviewers do
@@ -397,10 +456,11 @@ Mitigations, scaled to a single-publisher appliance (not full TUF):
 
 No loss-cluster smoke (no forwarding change). Validation is local + CI-shaped:
 
-1. **Sign/verify round-trip (image):** bake (or a stub SHA256SUMS) → sign with
-   a throwaway minisign key → `verify_artifacts` PASSES; flip one byte of the
-   qcow2 → verify FAILS at `sha256sum -c`; flip the `.minisig` → verify FAILS
-   at `minisign -V`; wrong pubkey → FAILS. (Negative tests are mandatory — a
+1. **Sign/verify round-trip (image):** bake (or a stub per-version
+   `xpf-<ver>.SHA256SUMS`) → sign with a throwaway minisign key →
+   `verify_image_artifact` PASSES; flip one byte of the qcow2 → verify FAILS at
+   the parsed-hash comparison (§5.2); flip the `.minisig` → verify FAILS at
+   `minisign -V`; wrong pubkey → FAILS. (Negative tests are mandatory — a
    verify that can't fail is theater.)
 2. **Apt repo:** build the signed repo into a temp dir → spin a Debian
    container (or the local incus image flow) → run install.sh pointed at a
@@ -434,9 +494,10 @@ The signing key used in tests is a generated throwaway, NEVER OQ-2's real key.
 - **Inc 1 — image signing + verify** (bake.py emit `.minisig`; validate.py +
   xpf-deploy.py verify; checked-in image pubkey placeholder; round-trip +
   negative tests; docs). Shippable alone; gives signed images immediately.
-- **Inc 2 — apt repo build tooling** (`scripts/dist/build-apt-repo.sh`,
-  reprepro `conf/distributions`, `make dist-repo`, PGP archive pubkey
-  placeholder; container repo test). Shippable alone.
+- **Inc 2 — apt repo build tooling** (`scripts/dist/build-apt-repo.sh` —
+  FLAT signed repo default per §4B, reprepro opt-in via `XPF_APT_TOOL`;
+  `make dist-repo`; PGP archive pubkey placeholder; container repo test).
+  Shippable alone.
 - **Inc 3 — install.sh + publish + docs** (`install.sh`, `make dist-publish`
   with `XPF_PUBLISH_CMD`, `docs/distribution.md`; install.sh container test).
 - **Inc 4 (optional, deferrable) — CI release workflow** (`.github/workflows/
@@ -463,9 +524,12 @@ the values are dropped in at engineer/release time.
   must not hardcode a single key. Mitigation: pubkey paths are overridable
   (`XPF_IMAGE_PUBKEY`, apt `Signed-By` is a file), and the plan documents a
   rotation runbook (publish new pubkey, dual-sign during overlap, retire old).
-- **R3 — apt repo correctness (stale Packages index, missing arch).** Use
-  reprepro (it owns index generation) rather than hand-rolled scanning;
-  negative test (tampered Release must fail apt).
+- **R3 — apt repo correctness (stale Packages index, missing arch).** The flat
+  default uses `apt-ftparchive` (a maintained tool that owns index generation —
+  NOT ad-hoc scanning); reprepro is the opt-in for persistent publishers. Either
+  way, a negative test (tampered `Release` must fail apt) is the gate. (NOTE:
+  this is the FLAT-default path of §4B — earlier r1 prose that said "use
+  reprepro" is superseded.)
 - **R4 — signing-tool availability on build host.** `minisign` and `reprepro`
   may not be installed. Mitigation: `require()`-style preflight in the new
   scripts with an apt-install hint (matches bake.py's existing `require`
@@ -486,8 +550,10 @@ the values are dropped in at engineer/release time.
 
 ## 9. Open questions (engineer-time inputs — NOT blockers to PLAN-READY)
 
-- **OQ-1 (hosting target):** the value of `XPF_DIST_BASE_URL`, the channel
-  layout (which suites exist), and the retention policy. Mechanism treats it as
+- **OQ-1 (hosting target):** the values of `XPF_IMAGE_BASE_URL` (images +
+  install.sh + latest.json) and `XPF_APT_BASE_URL` (the dists/+pool/ tree — NOT
+  GitHub Releases; needs a directory-serving host), the channel layout (which
+  suites exist), and the retention policy. Mechanism treats it as
   a parameter; the user supplies the URL + picks GitHub Releases / bucket /
   self-host at `/engineer`/release time.
 - **OQ-2 (signing identity):** the minisign keypair (image) and the OpenPGP
@@ -514,8 +580,12 @@ is the usability bar (the issue's "rather than copying files by hand").
 
 - Image: **minisign** over `SHA256SUMS` (one pinned Ed25519 pubkey), verified
   in validate.py + xpf-deploy.py. Additive to bake.py.
-- Apt: **reprepro**-built signed repo (PGP `Release`), `stable`/`edge` suites,
-  deb822 `Signed-By`.
+- Apt: **flat signed repo** (default, stateless-CI-safe; reprepro opt-in for
+  persistent publishers) with PGP-signed `InRelease`/`Release`, `stable`/`edge`
+  suites, deb822 `Signed-By`, `Valid-Until` freshness. The archive keyring is
+  shipped BOTH inline in install.sh (new installs) AND in the package payload
+  (`/etc/apt/keyrings/xpf-archive-keyring.asc`) so existing hosts get rotated
+  keys via `apt upgrade` (NIT-2).
 - Bootstrap: **install.sh** with the archive keyring embedded inline +
   optional `install.sh.minisig` for verify-before-run. TOFU rejected.
 - Hosting: host-agnostic `make dist-publish` via `XPF_PUBLISH_CMD` +
@@ -525,9 +595,10 @@ is the usability bar (the issue's "rather than copying files by hand").
 - The two OPEN QUESTIONS (hosting target, signing identity) are engineer-time
   inputs, not PLAN-READY blockers; the mechanism is complete pending only their
   values.
-```
 
-## 12. r1 → r2 change log (response to 3-way hostile review)
+## 12. Change logs (response to hostile review)
+
+### 12a. r1 → r2
 
 All three r1 reviewers returned **PLAN-NEEDS-MAJOR** (Codex, AGY, Claude SMR).
 The convergent + unique findings and their resolutions:
@@ -554,3 +625,29 @@ AGY-HIGH-2 (postinst cut-over is #1917's reviewed mechanism) and the
 single-tool §4A-alt (kept as the user's OQ-3 fallback). The minisign(image) +
 PGP(apt) split, deb822 `Signed-By`, and TOFU-rejection were affirmed by all
 three reviewers as correct and are unchanged.
+
+### 12b. r2 → r3
+
+r2 verdicts: Codex PLAN-NEEDS-MAJOR (5 contract contradictions), Claude SMR
+PLAN-NEEDS-MAJOR (same 5 + elevate NIT-2), AGY PLAN-READY-WITH-NITS (3 nits).
+All r1 findings were confirmed RESOLVED by all three; r3 fixes the contradictions
+the r2 restructuring introduced + the rotation lockout.
+
+| Finding | Source(s) | Resolution in r3 |
+|---|---|---|
+| N1 — xpf-deploy.py can't bind image bytes (incus alias-launch flow has no qcow2 path) | Codex-1, SMR-N1 | §5.2: image verify lives at IMPORT (validate.py) + a NEW `xpf-deploy.py fetch`/`--image-url`; the alias-launch path no longer claims to verify. |
+| N2 — fail-closed publish omits the freshness `latest.json` | Codex-2, SMR-N2 | §5.5 gate clause (d): `latest.json` must verify AND name a version in the publish set. |
+| N3 — apt backend self-contradiction (flat-default vs §8/§11 "use reprepro") | Codex-3, SMR-N3 | §8 R3 + §11 summary rewritten to flat-default (`apt-ftparchive`), reprepro opt-in; Inc-2 wording fixed. |
+| N4 — GitHub Releases listed as a full hosting target but can't serve dists/pool | Codex-4, SMR-N4 | §3: TWO base URLs — `XPF_IMAGE_BASE_URL` (GH Releases OK) vs `XPF_APT_BASE_URL` (directory host required); §9 OQ-1 + all functional refs split. |
+| N5 — "fresh Debian/Ubuntu host" overpromise (kernel ≥6.18 floor) | Codex-5, SMR-N5 | §3 + §5.4: install.sh PREFLIGHT refuses kernel <6.18 / non-amd64 / no-networkd with a clear message; image stays the turnkey path. |
+| NIT-2 — key rotation strands existing hosts (inline-only keyring) | AGY-NIT-2, SMR (elevated) | §5.4 + §2 + §11: archive keyring ALSO ships in the package payload (`/etc/apt/keyrings/`), so `apt upgrade` delivers rotated keys during the dual-sign window. One `debian/install` line, no postinst logic. |
+| NIT-1 — Valid-Until vs manual signing expiry deadlock | AGY-NIT-1, SMR | §5.6: long default `Valid-Until` (1y, `XPF_APT_VALID_DAYS`) for manual cadence; short window requires an automated re-sign job. |
+| NIT-3 — monotonic freshness watermark has no storage | AGY-NIT-3, SMR | §5.6: watermark at `${XDG_STATE_HOME}/xpf/image-watermark.json`; documented best-effort for stateless/multi-operator CLI. |
+| Nit — §6 "fails at sha256sum -c" stale vs parsed verifier | Codex nit | §6 test 1 reworded to the parsed-hash comparison. |
+| Nit — stray code fence before §12 | Codex nit | Removed. |
+
+Affirmed unchanged across all rounds: minisign(image) + PGP(apt) split, deb822
+`Signed-By` (not apt-key), TOFU rejection, the additive blast radius. The only
+`debian/` touch in #1924 scope is the packaged keyring conffile (NIT-2); no
+postinst / `pkg/upgrade` code (AGY-HIGH-2 confirmed #1917-owned, documentation
+only).
