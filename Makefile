@@ -332,8 +332,8 @@ deb:
 	          ../xpf_$(DEB_VERSION)_*.changes ../xpf_$(DEB_VERSION)_*.buildinfo; \
 	  }; \
 	  trap cleanup EXIT; \
-	  trap 'cleanup; trap - INT; kill -INT $$' INT; \
-	  trap 'cleanup; trap - TERM; kill -TERM $$' TERM; \
+	  trap 'cleanup; trap - INT; kill -INT $$$$' INT; \
+	  trap 'cleanup; trap - TERM; kill -TERM $$$$' TERM; \
 	  sed -i "1s/^xpf ([^)]*)/xpf ($(DEB_VERSION))/" debian/changelog; \
 	  dpkg-buildpackage -us -uc -b --no-sign; \
 	  mkdir -p $(DEB_OUT); \
