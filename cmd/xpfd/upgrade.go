@@ -43,7 +43,7 @@ func runUpgradeSubcommand(args []string) {
 		JournalPath:         *journalPath,
 		Unit:                *unit,
 		StartHealthDeadline: *healthDeadline,
-		Sys:                 upgrade.NewSystem(),
+		Sys:                 upgrade.NewSystem(*unit),
 		Logf:                func(format string, a ...any) { fmt.Printf(format+"\n", a...) },
 	}
 	r, err := upgrade.NewRunner(cfg)

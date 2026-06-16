@@ -262,6 +262,79 @@ func TestRun_AutoRollbackOnUnhealthyStart(t *testing.T) {
 	}
 }
 
+// TestRun_RollbackClearsJournalNoResurrectFailedTarget proves Codex r1
+// Critical#1 is fixed: after an auto-rollback, a re-run of Run does NOT
+// resume the FAILED target and mark it committed. The previous version
+// must remain live.
+func TestRun_RollbackClearsJournalNoResurrectFailedTarget(t *testing.T) {
+	fs := newFakeSystem(t, "1.0.0")
+	r, cfg := testEnv(t, fs)
+	if err := r.Run(Options{}); err != nil {
+		t.Fatalf("first cut: %v", err)
+	}
+
+	// Stage 2.0.0, unhealthy -> auto-rollback to 1.0.0.
+	fs.stagedVersion = "2.0.0"
+	for _, b := range managedBins {
+		writeFakeBin(t, filepath.Join(cfg.StagedDir, b), "binary-"+b+"-2.0.0")
+	}
+	fs.healthFailVersions["2.0.0"] = true
+	_ = r.Run(Options{}) // rolls back to 1.0.0
+
+	if _, err := os.Stat(cfg.JournalPath); !os.IsNotExist(err) {
+		t.Fatalf("journal not cleared after rollback — a re-run could resurrect the failed target")
+	}
+
+	// A re-run: 2.0.0 is still staged and now "healthy" (operator fixed
+	// it). The re-run must do a FRESH cut from 1.0.0 -> 2.0.0, NOT resume
+	// the stale FLIPPED journal of the failed attempt.
+	delete(fs.healthFailVersions, "2.0.0")
+	if err := r.Run(Options{}); err != nil {
+		t.Fatalf("re-run after rollback: %v", err)
+	}
+	target, _ := os.Readlink(filepath.Join(cfg.VersionsDir, "current"))
+	if filepath.Base(target) != "2.0.0" {
+		t.Errorf("re-run did not cleanly cut to 2.0.0: current=%q", target)
+	}
+}
+
+// TestRollback_ResumeMidRollback proves a crash mid-rollback (journal at
+// ROLLINGBACK) resumes the rollback to PreviousVersion, not the failed
+// forward cut.
+func TestRollback_ResumeMidRollback(t *testing.T) {
+	fs := newFakeSystem(t, "1.0.0")
+	r, cfg := testEnv(t, fs)
+	if err := r.Run(Options{}); err != nil {
+		t.Fatalf("first cut: %v", err)
+	}
+	// Stage + copy + flip 2.0.0 so the on-disk state matches a cut that
+	// then crashed during rollback (journal=ROLLINGBACK, target=2.0.0,
+	// prev=1.0.0).
+	fs.stagedVersion = "2.0.0"
+	for _, b := range managedBins {
+		writeFakeBin(t, filepath.Join(cfg.StagedDir, b), "binary-"+b+"-2.0.0")
+	}
+	j := &Journal{
+		State:           StateRollingBack,
+		TargetVersion:   "2.0.0",
+		PreviousVersion: "1.0.0",
+	}
+	must(t, r.copyStaged(j))  // create versions/2.0.0
+	must(t, r.flip("2.0.0"))  // current -> 2.0.0 (the failed cut)
+	must(t, r.saveJournal(j)) // journal = ROLLINGBACK
+
+	if err := r.Run(Options{}); err != nil {
+		t.Fatalf("resume rollback: %v", err)
+	}
+	target, _ := os.Readlink(filepath.Join(cfg.VersionsDir, "current"))
+	if filepath.Base(target) != "1.0.0" {
+		t.Errorf("resumed rollback did not land on 1.0.0: current=%q", target)
+	}
+	if _, err := os.Stat(cfg.JournalPath); !os.IsNotExist(err) {
+		t.Errorf("journal not cleared after resumed rollback")
+	}
+}
+
 // TestRun_RollbackRestoresDBBeforeReflip proves the binary+DB-atomic
 // rollback restores the pre-upgrade config-DB snapshot (so an old binary
 // never boots against a too-new envelope DB and fatal-rejects it). It

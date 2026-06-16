@@ -127,6 +127,19 @@ func (r *Runner) rollback(j *Journal) error {
 			"version %s is unhealthy and there is no prior runtime version — "+
 			"operator intervention required", j.TargetVersion)
 	}
+	// Journal the rollback so a crash mid-rollback resumes the rollback,
+	// NOT the failed forward cut. Codex r1 Critical#1: an auto-rollback
+	// that re-flips to PreviousVersion but leaves the journal at FLIPPED
+	// (target=failed) would let a re-run resume at START for the FAILED
+	// target and mark it COMMITTED. We retarget the journal to the
+	// previous version and mark the state ROLLINGBACK; on terminal success
+	// the journal is CLEARED (the failed cut is abandoned — the operator
+	// re-stages to retry).
+	j.State = StateRollingBack
+	if err := r.saveJournal(j); err != nil {
+		return fmt.Errorf("rollback: journal rollback intent: %w", err)
+	}
+
 	// 1. stop the failed new daemon.
 	if err := r.cfg.Sys.StopUnit(r.cfg.Unit); err != nil {
 		return fmt.Errorf("rollback: stop failed new daemon: %w", err)
@@ -146,25 +159,63 @@ func (r *Runner) rollback(j *Journal) error {
 	if err := r.cfg.Sys.StartUnit(r.cfg.Unit); err != nil {
 		return fmt.Errorf("rollback: start previous daemon: %w", err)
 	}
-	return nil
+	// 5. Terminal: clear the journal. The previous version is live; the
+	//    failed cut is abandoned. A re-run of `xpfd upgrade` starts fresh
+	//    against whatever is now staged (it will not resume the failed
+	//    target).
+	return r.clearJournal()
 }
 
-// restoreDBSnapshot atomically replaces the live config DB dir with the
-// snapshot taken in PREFLIGHT. The live dir is swapped via a sibling
-// .partial restore + rename so a crash mid-restore is recoverable.
+// restoreDBSnapshot replaces the live config DB dir with the snapshot taken
+// in PREFLIGHT, crash-safely. Strategy:
+//
+//  1. stage the snapshot into a sibling .restore.partial (copy+fsync);
+//  2. if a leftover .old exists from a prior interrupted swap, the live
+//     dir may be absent — recover by completing the swap first;
+//  3. swap: move the (current) live dir to .old, then rename the staged
+//     restore into place. If a crash lands between those two renames, the
+//     live dir is absent BUT BOTH .old (the failed-new DB) AND
+//     .restore.partial (the snapshot to install) exist on disk, so the
+//     next rollback re-run completes the swap. A re-run NEVER finds the
+//     live DB permanently destroyed.
 func (r *Runner) restoreDBSnapshot(snapDir string) error {
 	parent := filepath.Dir(r.cfg.ConfigDBDir)
 	restore := r.cfg.ConfigDBDir + ".restore.partial"
+	old := r.cfg.ConfigDBDir + ".old"
+
+	// Recovery: a prior interrupted swap may have left ConfigDBDir absent
+	// with .restore.partial already staged. If so, complete the install
+	// from the staged restore without re-copying.
+	_, liveErr := os.Stat(r.cfg.ConfigDBDir)
+	_, restErr := os.Stat(restore)
+	if os.IsNotExist(liveErr) && restErr == nil {
+		if err := os.Rename(restore, r.cfg.ConfigDBDir); err != nil {
+			return fmt.Errorf("complete interrupted DB restore swap: %w", err)
+		}
+		if err := fsatomic.SyncDir(parent); err != nil {
+			return err
+		}
+		_ = os.RemoveAll(old)
+		return nil
+	}
+
+	// Fresh stage of the snapshot.
 	_ = os.RemoveAll(restore)
 	if _, err := copyTree(snapDir, restore); err != nil {
+		_ = os.RemoveAll(restore)
 		return fmt.Errorf("stage DB restore copy: %w", err)
 	}
 	if err := fsatomic.SyncDir(restore); err != nil {
+		_ = os.RemoveAll(restore)
 		return err
 	}
-	// Swap: move live aside, move restore into place. A crash between the
-	// two leaves either the live or a recoverable .old; re-run completes.
-	old := r.cfg.ConfigDBDir + ".old"
+	if err := fsatomic.SyncDir(parent); err != nil { // make .restore.partial entry durable
+		return err
+	}
+
+	// Swap. Both .old and .restore.partial are durable on disk before the
+	// live dir is moved aside, so a crash between the two renames is
+	// recoverable by the recovery branch above on re-run.
 	_ = os.RemoveAll(old)
 	if _, err := os.Stat(r.cfg.ConfigDBDir); err == nil {
 		if err := os.Rename(r.cfg.ConfigDBDir, old); err != nil {
@@ -172,7 +223,7 @@ func (r *Runner) restoreDBSnapshot(snapDir string) error {
 		}
 	}
 	if err := os.Rename(restore, r.cfg.ConfigDBDir); err != nil {
-		// Try to put the live dir back.
+		// Put the live dir back.
 		_ = os.Rename(old, r.cfg.ConfigDBDir)
 		return fmt.Errorf("move restored DB into place: %w", err)
 	}

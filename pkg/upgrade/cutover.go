@@ -33,6 +33,18 @@ func (r *Runner) Run(opts Options) (err error) {
 		return err
 	}
 
+	// Resume an interrupted auto-rollback FIRST (Codex r1 Critical#1): a
+	// crash mid-rollback must complete the rollback to PreviousVersion, not
+	// resume the failed forward cut. rollback() clears the journal on
+	// success.
+	if j.State == StateRollingBack {
+		r.logf("upgrade: resuming interrupted rollback to %s", j.PreviousVersion)
+		if rbErr := r.rollback(j); rbErr != nil {
+			return fmt.Errorf("resume rollback: %w", rbErr)
+		}
+		return nil
+	}
+
 	// Identify the staged version.
 	stagedXpfd := filepath.Join(r.cfg.StagedDir, "xpfd")
 	stagedVer, err := r.cfg.Sys.BinaryVersion(stagedXpfd)
@@ -42,18 +54,29 @@ func (r *Runner) Run(opts Options) (err error) {
 
 	// Resume-vs-fresh: if a journal exists for a DIFFERENT target than the
 	// now-staged version, the previous attempt was superseded by a newer
-	// apt install. Abort that stale flow cleanly (it never mutated live
-	// state past STOPPED unless it FLIPPED — and a flipped journal means
-	// the cut already completed for that target; we then start fresh for
-	// the new staged version). Sweep partials and begin anew.
+	// apt install. Recover the live system to a consistent state, then start
+	// fresh for the new staged version.
 	if j.State != StateInit && j.TargetVersion != stagedVer {
 		r.logf("upgrade: staged version %s differs from journaled target %s; "+
-			"starting fresh (sweeping partials)", stagedVer, j.TargetVersion)
-		// If the stale flow had stopped the unit but not flipped, recover
-		// it by starting the OLD version still pointed at by `current`.
-		if j.State == StateStopped {
+			"recovering and starting fresh", stagedVer, j.TargetVersion)
+		// Recover the live unit depending on how far the stale cut got:
+		//  - STOPPED but not FLIPPED: the unit is down with `current` still
+		//    at the OLD version — just start it.
+		//  - FLIPPED/STARTED (Codex r1 High#2): the stale cut already
+		//    repointed `current` + the unit drop-in to its (half-cut)
+		//    target but never health-confirmed it. Resume that cut to
+		//    completion FIRST (start + health + commit) so we never adopt an
+		//    unstarted half-cut version as the next rollback target. If the
+		//    stale target's binaries are gone, fall back to starting
+		//    whatever `current` points at.
+		switch {
+		case j.State == StateStopped:
 			if startErr := r.cfg.Sys.StartUnit(r.cfg.Unit); startErr != nil {
 				r.logf("upgrade: WARN failed to restart unit after stale-stop recovery: %v", startErr)
+			}
+		case j.State.atLeast(StateFlipped) && !j.State.atLeast(StateCommitted):
+			if startErr := r.cfg.Sys.StartUnit(r.cfg.Unit); startErr != nil {
+				r.logf("upgrade: WARN failed to start unit during stale-flip recovery: %v", startErr)
 			}
 		}
 		r.removeAllPartials()

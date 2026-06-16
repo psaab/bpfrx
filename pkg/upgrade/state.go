@@ -66,6 +66,13 @@ const (
 
 	// StateCommitted: GC of versions beyond N=3 done. Terminal success.
 	StateCommitted State = "COMMITTED"
+
+	// StateRollingBack marks an in-progress auto-rollback (standalone). A
+	// crash here resumes the rollback (re-flip to PreviousVersion + DB
+	// restore), NOT the failed forward cut. On terminal rollback success
+	// the journal is CLEARED. order() returns the sentinel -1 for it so
+	// atLeast() never treats it as a forward milestone.
+	StateRollingBack State = "ROLLINGBACK"
 )
 
 // order ranks states for resume comparisons.

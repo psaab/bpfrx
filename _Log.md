@@ -5407,3 +5407,5 @@ top.
 - **File(s)**: debian/xpf.postinst, test/incus/cluster-setup.sh
 - **Action**: D1 rollback DB-restore test + in-place-upgrade design doc + audit regen
 - **File(s)**: pkg/upgrade/runner_test.go, docs/in-place-upgrade.md (new), docs/refactoring-audit-current.txt
+- **Action**: Code-review round 1 fixes (Codex + AGY) — rollback journal clear/resume, crash-safe DB restore, --unit health, gRPC non-interactive cluster binding + real-format-validated drain parsing + true HA-proto compare, cluster-setup grep fix
+- **File(s)**: pkg/upgrade/{state,cutover,flip,system_linux,cluster_cli,runner_test,cluster_cli_test}.go, cmd/xpfd/upgrade.go, test/incus/cluster-setup.sh

@@ -711,9 +711,17 @@ deploy_vm_deb() {
 
 # deploy_rolling_deb sequences the deb cut across both nodes (secondary
 # first), so the cluster keeps forwarding through the whole upgrade.
+#
+# Determine which node is secondary by asking node0 for ITS OWN local RG
+# state via `show chassis cluster information` (FormatInformation emits
+# "  Local state: Primary|Secondary"). The legacy deploy_rolling grep
+# pattern "secondary:node0" never matched the space-separated status rows
+# (AGY r1) and silently always upgraded node1 first; this checks the real
+# field. If node0 is Secondary, upgrade it first; else node1.
 deploy_rolling_deb() {
 	local secondary=1 primary=0
-	if incus exec "$(r "$VM0")" -- cli -c "show chassis cluster status" 2>/dev/null | grep -q "secondary:node0"; then
+	if incus exec "$(r "$VM0")" -- cli -c "show chassis cluster information" 2>/dev/null \
+		| grep -qiE '^[[:space:]]*Local state:[[:space:]]+Secondary'; then
 		secondary=0
 		primary=1
 	fi

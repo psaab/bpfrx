@@ -18,6 +18,10 @@ type realSystem struct {
 	// systemdUnitDir is /etc/systemd/system (drop-ins go under
 	// <unit>.service.d/). Overridable for tests.
 	systemdUnitDir string
+	// unit is the systemd unit name (without .service) the health probe
+	// polls. Must match the Runner's Config.Unit (Codex r1 Medium: a
+	// custom --unit must not be ignored by the health check).
+	unit string
 	// helperHealth is an optional hook the daemon wires to check its
 	// running helper's reported version (set by the caller in xpfd, which
 	// has the userspace manager). When nil, HelperHealthy degrades to a
@@ -25,15 +29,22 @@ type realSystem struct {
 	helperHealth func(expectVersion string, deadline time.Duration) error
 }
 
-// NewSystem returns the production System implementation.
-func NewSystem() System {
-	return &realSystem{systemdUnitDir: "/etc/systemd/system"}
+// NewSystem returns the production System implementation for the given
+// systemd unit.
+func NewSystem(unit string) System {
+	if unit == "" {
+		unit = DefaultUnit
+	}
+	return &realSystem{systemdUnitDir: "/etc/systemd/system", unit: unit}
 }
 
 // NewSystemWithHelperHealth returns the production System with a helper
 // health probe (used by xpfd, which can query its own helper version).
-func NewSystemWithHelperHealth(probe func(expectVersion string, deadline time.Duration) error) System {
-	return &realSystem{systemdUnitDir: "/etc/systemd/system", helperHealth: probe}
+func NewSystemWithHelperHealth(unit string, probe func(expectVersion string, deadline time.Duration) error) System {
+	if unit == "" {
+		unit = DefaultUnit
+	}
+	return &realSystem{systemdUnitDir: "/etc/systemd/system", unit: unit, helperHealth: probe}
 }
 
 func (s *realSystem) StopUnit(unit string) error {
@@ -122,18 +133,16 @@ func (s *realSystem) HelperHealthy(expectVersion string, deadline time.Duration)
 	// wired.
 	end := time.Now().Add(deadline)
 	for {
-		out, _ := exec.Command("systemctl", "is-active", expectActiveUnit()).Output()
+		out, _ := exec.Command("systemctl", "is-active", s.unit+".service").Output()
 		if strings.TrimSpace(string(out)) == "active" {
 			return nil
 		}
 		if time.Now().After(end) {
-			return fmt.Errorf("unit did not become active within %s", deadline)
+			return fmt.Errorf("unit %s did not become active within %s", s.unit, deadline)
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 }
-
-func expectActiveUnit() string { return DefaultUnit + ".service" }
 
 func (s *realSystem) Now() time.Time { return time.Now() }
 
