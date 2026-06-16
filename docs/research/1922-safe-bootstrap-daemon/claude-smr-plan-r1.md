@@ -118,3 +118,37 @@ marker migration) are left fully open rather than decided, and the startup gate
 cluster short-circuit. Fold F1/F2/F4 into stated requirements (not OQs), add the
 F3 matrix as a /engineer-time deliverable, adopt the F5 two-PR split, and this is
 PLAN-READY.
+
+---
+
+# Claude SMR — plan review r2 (v3, convergence)
+
+v3 folds all five r1 SMR findings, both AGY CRITICALs, and both Codex
+refinements:
+
+- F1/OQ-A (corrupt-DB lifeline) → **C4**: decided — no new lifeline on a
+  corrupt boot (fail-closed); rely on prior-boot networkd files; never-booted
+  corrupt box = console (bounded residual stated). No longer an open question.
+- F2 (marker migration) → **C3**: envelope committed-gen field; missing field on
+  an old DB defaults committed=true; marker forward-only. Migration hazard closed.
+- F3 (gate actions not construction + startup matrix) → **C1 + C6**: managers
+  constructed unconditionally; only takeover ACTIONS gated; subsystem gate matrix
+  added.
+- F4 (cluster) → **C2 + C8**: HA-node guard keyed on `/etc/xpf/node-id` presence
+  (Codex correctly noted `clusterMode` is config-derived and cannot pre-empt the
+  predicate); bootstrap-exit-on-SyncApply belt-and-suspenders.
+- F5 (split) → **C5**: two-PR sequencing adopted.
+- Codex C7: Item 1 scope narrowed to the timeout-rollback executor + first-commit
+  target (the forward `commitConfirmedAndApply` path is already correct) — a real
+  diff-shrinking refinement.
+
+I re-verified the two newly-load-bearing facts: `clusterMode` IS derived only
+from `cfg.Chassis.Cluster` (`daemon_run.go:256-259`) and node-id is read
+independently from `/etc/xpf/node-id` (`daemon.go:398-405`), so keying the guard
+on the node-id file (C8) is correct; and `commitConfirmedAndApply` DOES hold
+applySem across commit+apply (`daemon_apply.go:136-148`), so C7's scope narrowing
+is right. No residual architectural concern. OQ-B (first-commit gate scope /
+no-confirm escape hatch) and OQ-C (lifeline detection heuristic for multi-homed
+hosts) are genuine /engineer-time design choices, not plan blockers.
+
+**Verdict: PLAN-READY (r2).**

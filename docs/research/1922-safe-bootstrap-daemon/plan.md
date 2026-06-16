@@ -1,6 +1,6 @@
 # #1922 M1b — SAFE-BOOTSTRAP daemon work (plan of action)
 
-**Revision:** v2 — 2026-06-16 (folds round-1 Claude SMR + AGY findings; Codex pending)
+**Revision:** v3 — 2026-06-16 (folds round-1 Claude SMR + AGY + Codex; converged)
 **Branch:** `research/1922-safe-bootstrap-daemon`
 **Status:** research only — STOP at PLAN-READY; no production code touched.
 
@@ -18,12 +18,18 @@
 
 ## 1. Status
 
-v2. Re-uses the converged #1879 §5 SAFE-BOOTSTRAP design. Scopes to the four
-daemon-side deferred items (M1b). No code written. Round-1 verdicts: **Claude
-SMR PLAN-NEEDS-CHANGES** (5 findings); **AGY PLAN-NEEDS-CHANGES**
-(`adversarial-review-mqh0nudo-ov2222`, 4 findings — 2 CRITICAL); **Codex
-pending**. v2 folds the SMR+AGY convergence; the changes are recorded in the
-**round-1 changelog** at the end of this section.
+v3 — CONVERGED. Re-uses the converged #1879 §5 SAFE-BOOTSTRAP design. Scopes to
+the four daemon-side deferred items (M1b). No code written. Round-1 verdicts (all
+three NEEDS-CHANGES, none could PLAN-KILL — all code grounding verified correct):
+**Claude SMR PLAN-NEEDS-CHANGES** (5 findings); **AGY PLAN-NEEDS-CHANGES**
+(`adversarial-review-mqh0nudo-ov2222`, 2 CRITICAL + 2 HIGH); **Codex
+PLAN-NEEDS-CHANGES** (1 High + 2 Med + 2 Low; all 4 required code checks PASS).
+The three reviewers converged on the SAME architecture and the SAME required
+changes. v2 folded SMR+AGY (changelog below); **v3 folds the two Codex
+refinements (C7, C8)** — both are tightenings of existing changes, not new
+architecture, so this is the convergence revision.
+
+### Round-1 changelog (v1 → v2 → v3)
 
 ### Round-1 changelog (v1 → v2)
 
@@ -65,6 +71,31 @@ pending**. v2 folds the SMR+AGY convergence; the changes are recorded in the
 - **OQ-D resolution (both reviewers): auto-exempt the protected interface from
   dataplane claim while still allowing mgmt-zone policy** (not strict
   refuse-zone-assignment). Recorded under Item 4 / OQ-D.
+- **C7 (Codex Low — tighten Item 1 scope).** Codex verified the gRPC/REST
+  `commit confirmed` FORWARD path is ALREADY correct: `commitConfirmedAndApply`
+  (`daemon_apply.go:136-148`) acquires `applySem` then runs
+  `store.CommitConfirmed` + `applyConfigLocked` together. The bug is ONLY the
+  **timeout rollback executor** (the timer→`centralRollbackFn` path, mis-wired +
+  non-atomic) and the **first-commit rollback target** (`prevCfg==nil`). **v3:**
+  Item 1 scope is narrowed explicitly to those two — do NOT touch the
+  already-serialized forward commit path. This shrinks PR-1's diff and removes a
+  false target.
+- **C8 (Codex Med — sharpen the C2 cluster short-circuit; node-id ≠
+  clusterMode).** Codex found a real nuance: `clusterMode=true` is derived ONLY
+  from a compiled active config carrying `Chassis.Cluster`
+  (`daemon_run.go:256-259`), while node-id comes from `/etc/xpf/node-id`
+  independently (`daemon.go:398-405`). So a node-id-only boot with no DB/xpf.conf
+  is NOT structurally a cluster boot — C2's "clusterMode && node-id" can't fire
+  because clusterMode is false until a cluster config loads. **v3 decision:** the
+  cluster short-circuit keys on **node-id-file presence** (the
+  install-time-stable signal), NOT on `clusterMode`: *a node with
+  `/etc/xpf/node-id` present is HA-managed and resolves NOT-bootstrap* (case 2/3
+  via its own DB/xpf.conf; if neither exists it is fail-safe-with-loud-error, and
+  **HA availability is explicitly NOT promised for a node-id-only-no-config
+  boot** — that is an operator misconfiguration, documented). This matches how
+  `cluster-setup.sh:886-909` always pushes config + node-id + clears `.configdb`
+  before enabling xpfd. Belt-and-suspenders bootstrap-exit-on-`SyncApply` (C2)
+  remains.
 
 ## 2. Issue framing
 
@@ -201,6 +232,12 @@ an interactive shell ran). The interactive shell's existing handler reduces to a
 TTY notification. A dedicated serialization test (rollback-vs-concurrent-commit)
 lands alongside `apply_serialize_test.go`.
 
+**Scope (C7, Codex-verified):** the fix touches ONLY the timeout-rollback
+executor and the first-commit rollback target (1b). The gRPC/REST/CLI FORWARD
+`commit confirmed` path is ALREADY correct — `commitConfirmedAndApply`
+(`daemon_apply.go:136-148`) acquires `applySem` then runs `store.CommitConfirmed`
++ `applyConfigLocked` together. Do NOT refactor the forward path.
+
 *Path option A (executor callback):* store exposes a registration like
 `SetRollbackExecutor(func(target) error)`; `performAutoRollback` defers ALL
 mutation into the executor (executor acquires `applySem`, promotes store state
@@ -261,11 +298,19 @@ rollback-to-bootstrap; stable across restarts). Each case maps to exactly one of
 | 4 | **Corrupt / too-new active.json**: `Load` → `ErrConfigDBUnreadable` (#1917 D1, MERGED) | **fail-safe** (fatal-on-parse) | **already** fatal: refuse to start (`daemon_run.go:209`) | **unchanged fatal — touch nothing** (C4). No NEW lifeline is written (fail-closed). Mgmt reachability for repair relies on the networkd files + lifeline record persisted by a PRIOR successful boot (invariant 2). A never-booted box with a corrupt day-0 DB has no prior mgmt identity → hypervisor/physical console (bounded residual). |
 | 5 | **Degraded / never-confirmed**: never-successfully-committed (incl. the post-rollback-from-first-commit state from Item 1b), OR operator-committed-empty | never-committed → **bootstrap**; committed-empty → **normal** (operator meant it; protected set still shields mgmt) | committed-empty and never-committed are indistinguishable today | the step-0 marker (C3) disambiguates |
 
-**Cluster short-circuit (C2, mandatory):** the predicate yields **NOT-bootstrap**
-whenever `clusterMode==true` AND a node-id is present, regardless of the five
-cases above. A cluster node always boots from its own persisted DB or preseeded
-`xpf.conf` + node-id (case 2/3); this is belt-and-suspenders so a transient
-read hiccup can never put a cluster member into bootstrap mode and break failover.
+**Cluster / HA-node guard (C2 + C8, mandatory):** keyed on **`/etc/xpf/node-id`
+presence** (the install-time-stable HA signal), NOT on `clusterMode` — Codex
+verified `clusterMode=true` is derived only from a compiled active config with
+`Chassis.Cluster` (`daemon_run.go:256-259`), so it is false until a cluster
+config loads and cannot be used to pre-empt the predicate. Rule: a node with
+`/etc/xpf/node-id` present is HA-managed; it resolves NOT-bootstrap via its own
+persisted DB or preseeded `xpf.conf` + node-id (case 2/3, the
+`cluster-setup.sh:886-909` deploy path). **If an HA node has node-id but NEITHER
+a DB nor an importable `xpf.conf`, it is fail-safe-with-loud-error and HA
+availability is explicitly NOT promised** (operator misconfiguration —
+documented, tested). Belt-and-suspenders: bootstrap-exit also fires on a
+successful non-empty `SyncApply` from the primary (so even a hypothetical
+empty-boot secondary recovers on first config sync).
 
 **Bootstrap mode, defined** (new — does not exist today). Active iff the
 predicate yields bootstrap. In bootstrap mode the daemon: runs gRPC/REST/CLI as
@@ -449,10 +494,12 @@ the protection off fxp0. Confirm this is the right escape valve.
    `applySem` (the Item-1a fix); a dedicated serialization test enforces it.
 7. **No new hot-path code:** entirely control-plane/startup work; zero
    dataplane-loop changes.
-8. **Cluster behavior:** `clusterMode==true` + node-id present ⇒ NOT-bootstrap
-   by explicit predicate short-circuit (C2), so a cluster member can never enter
-   bootstrap mode. Bootstrap exit also fires on `SyncApply` (C2) as a second
-   guard. `make test-failover` enforces no failover regression.
+8. **Cluster behavior:** `/etc/xpf/node-id` present ⇒ HA-managed ⇒ NOT-bootstrap
+   via the node's own DB/xpf.conf (C2+C8 — keyed on node-id FILE, not the
+   config-derived `clusterMode`), so a cluster member can never enter bootstrap
+   mode on a normal deploy. node-id-without-config = fail-safe-with-loud-error
+   (HA availability not promised). Bootstrap exit also fires on `SyncApply` as a
+   second guard. `make test-failover` enforces no failover regression.
 9. **Manager construction is unconditional (C1):** bootstrap mode suppresses
    takeover ACTIONS only; `d.routing`/`d.frr`/`d.networkd`/`d.dp` are never nil,
    so the bootstrap-exit reconcile wires every subsystem.
@@ -486,8 +533,9 @@ the protection off fxp0. Confirm this is the right escape valve.
   (g) `system management-interface` schema test (if Item 3B lands);
   (h) **marker migration (C3):** a pre-M1b DB (populated or empty active tree,
   no committed-generation field) → reads committed=true → NOT bootstrap;
-  (i) **cluster short-circuit (C2):** `clusterMode + node-id` ⇒ NOT bootstrap
-  regardless of DB state, and bootstrap-exit-on-`SyncApply`;
+  (i) **HA-node guard (C2+C8):** `/etc/xpf/node-id` present ⇒ NOT bootstrap when
+  a DB/xpf.conf exists; node-id-without-config ⇒ fail-safe-with-loud-error (HA
+  not promised); and bootstrap-exit-on-`SyncApply`;
   (j) **manager-nonnil (C1):** bootstrap-then-exit reconcile actually actuates
   routing/FRR/networkd/dataplane (managers constructed at boot, never nil).
 - **Named must-pass integration (standalone incus VM):**
@@ -537,8 +585,12 @@ the protection off fxp0. Confirm this is the right escape valve.
 - **OQ-D — RESOLVED (v2):** auto-exempt-from-claim (not refuse-zone-assignment);
   explicit non-fxp0 `system management-interface` narrows the auto-protection off
   fxp0. Confirm the escape valve.
-- **OQ-E — RESOLVED (C2):** explicit `clusterMode + node-id ⇒ NOT-bootstrap`
-  short-circuit + bootstrap-exit-on-SyncApply; cluster-boot test in §9.
+- **OQ-E — RESOLVED (C2 + C8):** the HA-node guard keys on `/etc/xpf/node-id`
+  presence (NOT `clusterMode`, which is config-derived per Codex), resolving
+  NOT-bootstrap via the node's own DB/xpf.conf; node-id-without-config is
+  fail-safe-with-loud-error and does NOT promise HA availability;
+  bootstrap-exit-on-`SyncApply` is the belt-and-suspenders guard. Cluster-boot
+  test in §9.
 - **OQ-F — RESOLVED (C3):** envelope option (a) (committed-generation field),
   missing-field-defaults-committed=true migration rule.
 - **OQ-G — RESOLVED (C5):** ship as two PRs (Item 1; then Items 2-4). Reviewers
