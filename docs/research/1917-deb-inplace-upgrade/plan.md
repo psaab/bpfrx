@@ -236,10 +236,13 @@ dpkg metadata (`Depends: = same version`) does NOT prevent an old `xpfd` from
 respawning whatever helper is on the live path (`findBinary`/`exec.Command`,
 process.go:168/76), so it cannot by itself guarantee a matched protocol pair, and
 a naive in-place file overwrite can leave a half-swapped set serving traffic. The
-plan therefore mandates: **binaries install to a versioned dir
-`/usr/local/lib/xpf/<version>/`; the running paths are symlinks; the cut-over is a
-single atomic symlink flip owned by `xpf-upgrade` after verify PASS.** dpkg only
-*stages* the new versioned dir; it never touches the live symlink. This makes the
+plan therefore mandates: **the package stages binaries to a dpkg-static path
+(`/usr/local/share/xpf/staged/`, §6.1/§6.3c); `xpf-upgrade` copies them into a
+non-dpkg runtime versioned dir (`/var/lib/xpf/versions/<version>/`); the running
+paths are symlinks into the active runtime version; the cut-over is a single atomic
+symlink flip owned by `xpf-upgrade` after verify PASS.** dpkg only writes the
+static staging path; it never touches the live symlink or a runtime version. This
+makes the
 "never serve a half-swapped set" and "matched protocol pair" invariants
 structural, not advisory.
 
@@ -274,12 +277,13 @@ helper's restart-class behavior is stable across debhelper versions. The live
 restart happens ONLY when `xpf-upgrade` explicitly drives it after a verify PASS.
 
 **Run the NEWLY-STAGED orchestrator, not the live symlink (round-2 AGY blocker).**
-After `apt upgrade` stages N+1 under `/usr/local/lib/xpf/<N+1>/`, the live
-`/usr/local/sbin/xpf-upgrade` symlink still points at N, which may lack the N+1
-protocol/orchestration logic. The `postinst` and the operator runbook MUST invoke
-the *staged* `/usr/local/lib/xpf/<N+1>/xpf-upgrade cut-over` to drive the cut,
-never the live-symlink path. The staged orchestrator owns the verify, the symlink
-flip, and (standalone) the restart.
+After `apt upgrade` stages N+1 to `/usr/local/share/xpf/staged/`, the live
+`/usr/local/sbin/xpf-upgrade` symlink still points at the running version, which
+may lack the N+1 protocol/orchestration logic. The `postinst` and the operator
+runbook MUST invoke the *staged* `/usr/local/share/xpf/staged/xpf-upgrade cut-over`
+to drive the cut, never the live-symlink path. The staged orchestrator copies
+itself + the binary set into `/var/lib/xpf/versions/<N+1>/`, then owns the verify,
+the symlink flip, and (standalone) the restart.
 
 ### 6.3b Daemon MUST fail-closed on a config-DB parse error (round-3 AGY blocker — critical)
 
@@ -331,12 +335,14 @@ the kernel-fallback, all confirmed real:
 
 1. Run the **new** `xpfd verify-dataplane` against the **running** kernel. On exit
    3 (verifier REJECT) or 1 (error): **abort the cut-over** (the package files are
-   staged under the versioned dir; the live symlink is NOT flipped), surface the
-   exit code, and leave the running set serving traffic. **There is exactly ONE
-   install form (round-2 Codex blocker — the "simplest dpkg-native install to
-   /usr/local/sbin" alternative is DELETED):** binaries install ONLY to
-   `/usr/local/lib/xpf/<version>/`; the cut is the atomic symlink flip owned by
-   `xpf-upgrade` (§6.3a). A live `/usr/local/sbin` overwrite is forbidden because
+   in the dpkg-static staging path; nothing was copied to a runtime version, the
+   live symlink is NOT flipped), surface the exit code, and leave the running set
+   serving traffic. **There is exactly ONE install form (round-2 Codex blocker —
+   the "simplest dpkg-native install to /usr/local/sbin" alternative is DELETED):**
+   the package writes ONLY `/usr/local/share/xpf/staged/`; `xpf-upgrade` copies into
+   `/var/lib/xpf/versions/<version>/` and the cut is the atomic symlink flip owned
+   by `xpf-upgrade` (§6.3a/§6.3c). A live `/usr/local/sbin` overwrite is forbidden
+   because
    the running xpfd resolves the helper from its own dir / PATH
    (`findBinary`, process.go:168) and would respawn a newly-unpacked helper before
    the intended cut — reopening the protocol-mismatch window. The staged
@@ -615,7 +621,7 @@ console). Confirms the "hold the kernel" mitigation is load-bearing.
 contains NO `systemctl ... restart`/`try-restart` block (grep the maintainer
 script) — proves `--no-stop-on-upgrade` took (no restart/try-restart block emitted). Assert `apt upgrade xpf` on a
 running standalone box does NOT bounce the daemon until `xpf-upgrade` is invoked.
-Assert the staged `/usr/local/lib/xpf/<N+1>/xpf-upgrade` is the binary that runs
+Assert the staged `/usr/local/share/xpf/staged/xpf-upgrade` is the binary that runs
 the cut (not the live symlink). Negative kernel test: `grub-reboot` a deliberately
 verifier-failing candidate kernel → assert the box auto-falls-back to the old
 default and the old default stays the boot default (no brick).
