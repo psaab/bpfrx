@@ -80,6 +80,31 @@ func TestProtectedInterfaces(t *testing.T) {
 			t.Fatal("explicit non-fxp0 leaf must NARROW fxp0 out of the auto-protection (OQ-D)")
 		}
 	})
+
+	// OQ-D BLOCKER (Codex r3): the lifeline-record union must NOT silently
+	// re-add fxp0 when an explicit non-fxp0 leaf narrowed it off. Exercised
+	// via the pure core with an injected lifeline name.
+	t.Run("lifeline-fxp0-does-not-defeat-narrowing", func(t *testing.T) {
+		set := protectedInterfacesWith("ge-0-0-3", "fxp0")
+		if !set["ge-0-0-3"] {
+			t.Fatal("explicit non-fxp0 leaf must protect that interface")
+		}
+		if set["fxp0"] {
+			t.Fatal("lifeline resolving to fxp0 must NOT re-add fxp0 when narrowed off (OQ-D)")
+		}
+	})
+	t.Run("lifeline-protected-when-no-leaf", func(t *testing.T) {
+		set := protectedInterfacesWith("", "ge-0-0-5")
+		if !set["fxp0"] || !set["ge-0-0-5"] {
+			t.Fatalf("no leaf: fxp0 + lifeline both protected; got %v", set)
+		}
+	})
+	t.Run("lifeline-added-when-leaf-is-fxp0", func(t *testing.T) {
+		set := protectedInterfacesWith("fxp0", "ge-0-0-5")
+		if !set["fxp0"] || !set["ge-0-0-5"] {
+			t.Fatalf("explicit fxp0 leaf: fxp0 + lifeline both protected; got %v", set)
+		}
+	})
 }
 
 // TestReadLifelineRecord proves the persisted record round-trips and an

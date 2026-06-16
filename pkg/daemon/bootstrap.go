@@ -401,18 +401,32 @@ func resolveLifelineCurrentName() (string, bool) {
 // unset). The OQ-D escape valve: an explicit non-fxp0 leaf NARROWS fxp0 out
 // of the auto-protection so an operator can repurpose fxp0 as a revenue port.
 func protectedInterfaces(mgmtLeaf string) map[string]bool {
+	lifeline, ok := resolveLifelineCurrentName()
+	if !ok {
+		lifeline = ""
+	}
+	return protectedInterfacesWith(mgmtLeaf, lifeline)
+}
+
+// protectedInterfacesWith is the pure core of protectedInterfaces, taking the
+// already-resolved lifeline name (or "") so the OQ-D narrowing is unit
+// testable without sysfs.
+func protectedInterfacesWith(mgmtLeaf, lifeline string) map[string]bool {
 	set := make(map[string]bool)
+	// narrowFxp0 is the OQ-D escape valve: an explicit non-fxp0
+	// management-interface leaf removes fxp0 from the auto-protection so the
+	// operator can repurpose fxp0 as a revenue port. It must apply to BOTH
+	// the leaf/default contribution AND the lifeline-record union — the
+	// persisted lifeline record can resolve to fxp0 and would otherwise
+	// silently re-add it (Codex r3 BLOCKER).
+	narrowFxp0 := mgmtLeaf != "" && mgmtLeaf != defaultMgmtInterface
 	if mgmtLeaf != "" {
-		// An explicit leaf is authoritative. When it is non-fxp0, fxp0 is
-		// NOT added — that is the OQ-D escape valve (fxp0 narrowed off so it
-		// can be repurposed as a revenue port). When it IS fxp0 this adds
-		// fxp0, same as the default branch.
 		set[mgmtLeaf] = true
 	} else {
 		set[defaultMgmtInterface] = true
 	}
-	if name, ok := resolveLifelineCurrentName(); ok {
-		set[name] = true
+	if lifeline != "" && !(narrowFxp0 && lifeline == defaultMgmtInterface) {
+		set[lifeline] = true
 	}
 	return set
 }
