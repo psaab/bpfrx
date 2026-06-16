@@ -193,7 +193,12 @@ func extractPCIAddr(path string) string {
 	parts := strings.Split(path, "/")
 	var last string
 	for _, p := range parts {
-		if len(p) >= 10 && p[4] == ':' && p[7] == ':' && p[10] == '.' {
+		// A PCI address is DDDD:BB:DD.F (>= 12 chars). The length guard must
+		// admit index 10 (the '.'), so require >= 11 — a bare >= 10 lets a
+		// 10-char component with ':' at 4 and 7 index p[10] out of bounds
+		// (AGY r2 Low, hardened now that the bootstrap lifeline path calls
+		// extractPCIAddr on arbitrary sysfs components).
+		if len(p) >= 11 && p[4] == ':' && p[7] == ':' && p[10] == '.' {
 			last = p
 		}
 	}

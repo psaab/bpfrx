@@ -29,9 +29,33 @@ Plan: `git show origin/research/1922-safe-bootstrap-daemon:docs/research/1922-sa
 | Reviewer | Task ID | Round | Verdict |
 |---|---|---|---|
 | Codex | bvo39rwsi (r1) / 019ed26c-5f23-7d91-9015-15433bb64d78 (r2) | r1→r2 | r1 NEEDS-CHANGES (2 release-blockers) → **r2 MERGE-READY** |
-| AGY | adversarial-review-mqh69wa0-bkp0t6 (r1) / adversarial-review-mqh6o06z-wfmlzb (r2) | r1→r2 | r1 NEEDS-CHANGES (1 CRITICAL) → r2 pending |
-| Claude SMR | n/a | r1 | reviewed (concerns checked; no new blockers beyond the two below) |
+| AGY | adversarial-review-mqh69wa0-bkp0t6 (r1) / adversarial-review-mqh6o06z-wfmlzb (r2) | r1→r2 | r1 NEEDS-CHANGES (1 CRITICAL) → **r2 MERGE-READY** (2 Low folded) |
+| Claude SMR | n/a | r1 | reviewed — route-detect semantics, bootstrapFromFile-not-gated, exit-startup writer guard, gate-race-benign all checked; no new blockers |
 | Copilot | n/a (gh add-reviewer) | r1 | pending formal review |
+
+## Round-2 (AGY) low-severity findings folded (commit after r2)
+
+- **AGY r2 Low — applyConfigLocked nil cfg.** Added an explicit top-level
+  `if cfg == nil { return nil }` guard (no production caller passes nil; the
+  bootstrap-exit block and the historical cfg.Warnings deref made the
+  contract ambiguous).
+- **AGY r2 Low — extractPCIAddr OOB.** `len(p) >= 10` could index `p[10]`
+  out of bounds on a 10-char component; hardened to `>= 11` (a PCI address is
+  >= 12 chars). Pre-existing code, hardened now that the lifeline path calls it.
+
+## Live validation (loss userspace cluster)
+
+- Deploy to loss:xpf-userspace-fw0/fw1 (worktree binary, hash-verified): both
+  nodes boot NORMAL (node-id + day-0 import → everCommitted → not bootstrap).
+  Zero `entering BOOTSTRAP` log lines — the regression-safe path holds.
+- `show chassis cluster status`: healthy HA, node0 primary / node1 secondary,
+  RG0+RG1 Monitor-failures None, takeover/transfer ready, peer version
+  exchanged (heartbeat live).
+- test-connectivity (cluster): LAN→WAN iperf3 IPv4 TCP PASS, IPv6 TCP PASS,
+  cross-zone + RETH VIP v4/v6 + mtr paths PASS. (heartbeat/fabric direct-ICMP
+  + external-IPv6-internet failures are env/topology artifacts, not
+  forwarding-path regressions — protocol heartbeat verified live above.)
+- make test-failover: see PR thread.
 
 ## Round-1 findings folded (commit 640de42e6)
 

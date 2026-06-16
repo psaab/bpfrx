@@ -227,6 +227,15 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 		return nil
 	}
 
+	// Defensive nil guard (AGY r2 Low): no production caller passes a nil
+	// compiled config (commitAndApply / syncAndApply / the boot apply all
+	// nil-check first), but the bootstrap-exit block below reads cfg, and
+	// the historical body dereferences cfg.Warnings — make the contract
+	// explicit so a future caller cannot panic the reconcile.
+	if cfg == nil {
+		return nil
+	}
+
 	// #1922 Item 2 bootstrap exit: the FIRST apply of a non-empty config
 	// (an interface-claiming confirmed commit, or a cluster SyncApply from
 	// the primary) leaves bootstrap mode and runs the one-time startup
