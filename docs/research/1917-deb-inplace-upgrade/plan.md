@@ -1,14 +1,16 @@
 # #1917 — In-place xpf upgrade (new xpfd + userspace-dp without re-imaging)
 
-- **Revision:** 7
-- **Status:** PLAN-REVISED (round 4 → round 5 confirmation). No reviewer has ever
-  PLAN-KILLed; composed A+B+C endorsed throughout. R1: all three NEEDS-REVISION.
-  R2: Codex 3 (fixed v4), SMR premature-READY (self-corrected), AGY 4 (folded). R3:
-  Codex confirmed 1+3 + refined #2 (v5); AGY 5 new operational blockers (folded v6).
-  R4: AGY confirmed all 5 round-3 blockers resolved + raised Gap A
-  (`GRUB_SAVEDEFAULT=true` boot-loop), Gap B (`/var/lib/xpf/versions` retention),
-  Gap C (HA session-sync wire back-compat) + the stale-path contradictions (already
-  fixed v6.1) — all folded into v7. Codex round-4 in-flight. Awaiting round-5.
+- **Revision:** 8
+- **Status:** PLAN-READY (converged round 5). No reviewer ever PLAN-KILLed;
+  composed A+B+C endorsed throughout. R1: all three NEEDS-REVISION. R2: Codex 3
+  (fixed v4), SMR premature-READY (self-corrected), AGY 4 (folded). R3: Codex
+  confirmed 1+3 + refined #2 (v5); AGY 5 operational blockers (folded v6). R4: AGY
+  confirmed 5 + raised Gaps A/B/C (folded v7); Codex caught the two-package
+  contradiction (fixed v7). **R5: AGY = PLAN-READY; Codex = 3 wording-consistency
+  blockers (copy/verify ordering, kernel in-place-vs-Path-C scope, stale risk-3
+  manifest-file) — all fixed in v8; Claude SMR = PLAN-READY (empirically verified
+  the envelope fail-closed).** v8 also folds AGY's two round-5 non-blockers
+  (test-plan peer-helper wording, first-upgrade auto-rollback compat sequencing).
 - **Branch:** `research/1917-deb-inplace-upgrade`
 - **Scope:** RESEARCH ONLY. No production source touched. Deliverable is this plan
   + three reviewer verdicts + an issue comment. Implementation is a separate
@@ -172,9 +174,12 @@ The `.deb` (Path A, subsuming #1923; distribution via #1924) is the right delive
 and version-management layer. The **in-place cut-over mechanism is Path B** — a
 staged-verify-then-atomic-swap with control-plane-only vs full-cycle modes and
 HA-rolling-failover drive — owned by `xpfd`/`xpf-upgrade`, and **invoked from the
-`.deb` `postinst`**. The **base kernel is held/pinned** so apt base-updates can't
-move the verifier floor; kernel bumps go through Path C (image replace), the tested
-unit. This composition is what the rest of this plan designs.
+`.deb` `postinst`**. The **base kernel is held/pinned** so unattended apt
+base-updates can't move the verifier floor; *routine* kernel bumps go through the
+§6.7 verify-gated in-place kernel channel (one-shot `grub-reboot` + watchdog +
+verify-then-promote), while *heavy or uncertain* kernel moves go through Path C
+(image replace), the fully-tested unit. This composition is what the rest of this
+plan designs.
 
 ## 6. Concrete design for the recommended path
 
@@ -344,10 +349,14 @@ the kernel-fallback, all confirmed real:
 
 `postinst configure` must NOT naively `systemctl restart xpfd`. It must:
 
-1. Run the **new** `xpfd verify-dataplane` against the **running** kernel. On exit
-   3 (verifier REJECT) or 1 (error): **abort the cut-over** (the package files are
-   in the dpkg-static staging path; nothing was copied to a runtime version, the
-   live symlink is NOT flipped), surface the exit code, and leave the running set
+1. **Canonical cut-over sequence:** `xpf-upgrade` copies the staged set into
+   `/var/lib/xpf/versions/<N+1>/` (temp-dir + rename so a partial copy is never
+   activated) → runs the **new** `/var/lib/xpf/versions/<N+1>/xpfd verify-dataplane`
+   against the **running** kernel → flips the live symlink ONLY on PASS. On exit
+   3 (verifier REJECT) or 1 (error): **abort the cut-over** — the live symlink is
+   NOT flipped, so the running version keeps serving; the copied-but-unactivated
+   `/var/lib/xpf/versions/<N+1>/` dir is harmless and is pruned by the §6.3c
+   retention policy. Surface the exit code and leave the running set
    serving traffic. **There is exactly ONE install form (round-2 Codex blocker —
    the "simplest dpkg-native install to /usr/local/sbin" alternative is DELETED):**
    the package writes ONLY `/usr/local/share/xpf/staged/`; `xpf-upgrade` copies into
@@ -559,6 +568,15 @@ package — no separate shim artifact is packaged.
   legacy-reader test is mandatory: prove binary N fails closed (errors), NOT
   empty-loads, when handed an N+1 envelope.** Alternatively ship one
   compatibility release that can *read* envelopes before any release *writes* one.
+  **First-upgrade auto-rollback hazard (round-5 AGY non-blocker, pin it):** if N+1
+  boots, writes the new envelope, then fails post-cut health and auto-rolls-back to
+  N, the legacy N daemon (lacking the §6.3b fatal-parse fix AND envelope-awareness)
+  hits the new envelope and would overwrite/run-degraded. The implementation MUST
+  therefore EITHER (a) restore the config DB to N-format from the rollback slot
+  *before* starting the N daemon on rollback, OR (b) ship the §8/§6.3b
+  compatibility release (reads envelopes + fatal-parse) as the floor BEFORE any
+  release writes the envelope. (b) is the cleaner sequencing and is recommended as
+  the first `/engineer` increment.
 - **Shim verifier gate must hold post-cut and post-kernel-bump:** ExecStartPre
   verify on every start; bake-time assert one kernel ≥6.18; **base apt kernel
   updates HELD by default** and only moved through the §6.7 verify-gated kernel
@@ -601,7 +619,7 @@ package — no separate shim artifact is packaged.
 |---|------|-------|-----------|--------|------------|
 | 1 | Operator/plan assumes zero-gap xpfd-only restart exists → ships a "hot restart" that actually full-cycles the dataplane (seconds gap) | Correctness/Design | High | High | §6.4: state plainly it does NOT exist; scope M-mech-2 as future daemon work; ship M-mech-1 (full cycle + HA rolling) honestly with a *measured* gap |
 | 2 | apt base-OS update pulls a new kernel out from under the verifier-gated shim `.o` → dataplane fails verify at boot, box has no dataplane | Availability | Med | Critical | Hold/pin `linux-*`; kernel bumps go through image-replace (Path C); boot ExecStartPre verify fails closed; document the held-kernel channel |
-| 3 | Config-DB / rollback-slot format drift across versions → rollback binary or HA peer can't parse on-disk state (split-brain) | Data/Correctness | Med | High | `.configdb/manifest.json` (writer/min-reader/AST/rollback/journal versions) + startup validation + gate auto-rollback on state-floor advance (codex-review-010) |
+| 3 | Config-DB / rollback-slot format drift across versions → rollback binary or HA peer can't parse on-disk state (split-brain) | Data/Correctness | Med | High | Manifest (writer/min-reader/AST/rollback/journal versions) EMBEDDED in `active.json` via an old-reader-rejecting envelope (§8) — NOT a second file; startup fail-closed (§6.3b); gate auto-rollback on state-floor advance (codex-review-010) |
 | 4 | `postinst restart` on an HA node cuts traffic instead of failing over (no rolling orchestration in dpkg) | Availability | High | High | `postinst` detects `/etc/xpf/node-id`, refuses local cut on HA, requires `xpf-upgrade --rolling`; reuse `ForceSecondary`/VRRP drain |
 | 5 | Protocol-version mismatch during an M-mech-2 hot re-attach (new xpfd ↔ old helper) | Correctness | Low (single-package lockstep) | High | `xpfd`+helper in one `xpf` package, cut over as one matched set (§6.1); gate on `ping` protocol version; force full cycle on mismatch; extend WIRE_REGEN fixtures |
 | 6 | Half-unpacked binary set serves traffic if `postinst` aborts mid-way | Correctness/Availability | Med | High | Versioned install paths + atomic-symlink flip owned by `xpf-upgrade`; running paths unchanged until verify passes |
@@ -637,8 +655,12 @@ package — no separate shim artifact is packaged.
 run the `failover-test` iperf3 harness, drive `xpf-upgrade --rolling` to N+1
 (drain fw0 RGs → peer, upgrade fw0, fail back, then fw1). **Acceptance = zero
 connection loss**, `make test-failover`-equivalent evidence (0-retr / 0-drop across
-the two node cuts). Negative: protocol-version mismatch between staged xpfd and the
-peer's running helper → assert safe full-cycle fallback, no split-brain.
+the two node cuts). Negative (two distinct mismatches — a node's `xpfd` never talks
+to the *peer's* helper directly): (i) **local** new-`xpfd` ↔ local old running helper
+(the M-mech-2 hot-restart window) → assert safe full-cycle fallback on a protocol
+mismatch; (ii) **node A `xpfd` ↔ node B `xpfd`** session-sync wire mismatch (§6.5) →
+assert back-compat parse, or the release is flagged not-rolling-upgradable. No
+split-brain in either.
 
 **Base-OS apt update does not break xpf:** on the appliance image, `apt update &&
 apt upgrade` with `linux-*` HELD → assert: no kernel change, xpfd/helper unaffected,
@@ -679,8 +701,10 @@ works; assert local rollback still has the previous version's binaries on disk.
 - SAFE-BOOTSTRAP daemon hardening (bootstrap mode, five-case predicate, PCI-keyed
   lifeline, protected-set) — that is **#1922**, a declared dependency for the
   mgmt-never-stranded invariant on foreign hosts, not re-implemented here.
-- Kernel upgrades as an in-place operation — kernel bumps go through Path C
-  (image-replace), the tested unit.
+- *Heavy/uncertain* kernel moves as an in-place operation — those go through Path C
+  (image-replace), the fully-tested unit. (Routine kernel bumps ARE in scope via
+  the §6.7 verify-gated one-shot-boot channel; this exclusion is only the
+  big/risky kernel transitions.)
 - RPM / non-Debian packaging.
 
 ## Hostile open questions (each invitable to PLAN-KILL)
