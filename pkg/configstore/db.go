@@ -71,23 +71,44 @@ func (db *DB) rollbackPath(n int) string {
 // ReadActive loads the active configuration from disk.
 // Returns nil (no error) if the file doesn't exist.
 func (db *DB) ReadActive() (*config.ConfigTree, error) {
-	return db.readTree(db.activePath())
+	tree, _, err := db.readTreeMeta(db.activePath())
+	return tree, err
 }
 
-// WriteActive persists the active configuration to disk atomically.
+// ReadActiveMeta loads the active configuration AND the #1922 step-0
+// committed marker. committed is TRUE when the file is absent (no marker to
+// honor — Load treats absent as start-fresh anyway), TRUE for a legacy
+// (no-envelope) DB, and TRUE for any enveloped DB that omits or sets
+// committed=1; it is FALSE only for an enveloped DB this build wrote with
+// the explicit never-committed marker (committed=0).
+func (db *DB) ReadActiveMeta() (tree *config.ConfigTree, committed bool, err error) {
+	return db.readTreeMeta(db.activePath())
+}
+
+// WriteActive persists the active configuration to disk atomically. The
+// on-disk envelope is stamped committed=1 (a real successful commit/sync).
 func (db *DB) WriteActive(tree *config.ConfigTree) error {
-	return db.writeTree(db.activePath(), tree)
+	return db.writeTreeMarked(db.activePath(), tree, true)
+}
+
+// WriteActiveMarker persists tree as the active config with an explicit
+// #1922 step-0 committed marker. committed=false writes the never-committed
+// marker used by the Item 1b first-commit rollback (enterBootstrapMode):
+// the empty tree on disk must NOT later classify as operator-committed-empty.
+func (db *DB) WriteActiveMarker(tree *config.ConfigTree, committed bool) error {
+	return db.writeTreeMarked(db.activePath(), tree, committed)
 }
 
 // ReadCandidate loads the candidate configuration from disk.
 // Returns nil (no error) if the file doesn't exist.
 func (db *DB) ReadCandidate() (*config.ConfigTree, error) {
-	return db.readTree(db.candidatePath())
+	tree, _, err := db.readTreeMeta(db.candidatePath())
+	return tree, err
 }
 
 // WriteCandidate persists the candidate configuration to disk atomically.
 func (db *DB) WriteCandidate(tree *config.ConfigTree) error {
-	return db.writeTree(db.candidatePath(), tree)
+	return db.writeTreeMarked(db.candidatePath(), tree, true)
 }
 
 // DeleteCandidate removes the candidate file from disk.
@@ -102,12 +123,13 @@ func (db *DB) DeleteCandidate() error {
 // ReadRollback loads a rollback configuration from slot n (1-based).
 // Returns nil (no error) if the file doesn't exist.
 func (db *DB) ReadRollback(n int) (*config.ConfigTree, error) {
-	return db.readTree(db.rollbackPath(n))
+	tree, _, err := db.readTreeMeta(db.rollbackPath(n))
+	return tree, err
 }
 
 // WriteRollback persists a rollback configuration to slot n (1-based).
 func (db *DB) WriteRollback(n int, tree *config.ConfigTree) error {
-	return db.writeTree(db.rollbackPath(n), tree)
+	return db.writeTreeMarked(db.rollbackPath(n), tree, true)
 }
 
 // DeleteRollback removes rollback slot n from disk.
@@ -119,46 +141,52 @@ func (db *DB) DeleteRollback(n int) error {
 	return nil
 }
 
-// readTree reads and parses a config tree from a JSON file.
-// Returns (nil, nil) if the file doesn't exist.
-func (db *DB) readTree(path string) (*config.ConfigTree, error) {
+// readTreeMeta reads and parses a config tree from a JSON file, returning
+// the #1922 step-0 committed marker alongside it. Returns (nil, true, nil)
+// if the file doesn't exist (absent => start-fresh; committed is irrelevant
+// but defaults true so an absent-DB caller never sees a spurious
+// never-committed signal). A legacy (no-envelope) DB also reads committed.
+func (db *DB) readTreeMeta(path string) (*config.ConfigTree, bool, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil, true, nil
 		}
-		return nil, fmt.Errorf("read %s: %w", path, err)
+		return nil, true, fmt.Errorf("read %s: %w", path, err)
 	}
 	// Config compatibility envelope (#1917 increment B). The envelope is
 	// the OUTERMOST framing — a magic header line prepended to the
 	// (possibly-encrypted) body. Strip+validate it BEFORE decryption so a
 	// too-new DB fails closed here, never silently empty-loads. A body
-	// with no envelope is a pre-floor (legacy) DB and is read unchanged.
+	// with no envelope is a pre-floor (legacy) DB and is read unchanged
+	// (committed defaults true — migration rule C3).
+	committed := true
 	if hasEnvelope(data) {
-		body, _, eerr := stripEnvelope(data)
+		body, hdr, eerr := stripEnvelope(data)
 		if eerr != nil {
-			return nil, fmt.Errorf("read %s: %w", path, eerr)
+			return nil, true, fmt.Errorf("read %s: %w", path, eerr)
 		}
 		data = body
+		committed = hdr.Committed
 	}
 
 	data, err = db.maybeDecryptTreeJSON(data)
 	if err != nil {
-		return nil, fmt.Errorf("decrypt %s: %w", path, err)
+		return nil, true, fmt.Errorf("decrypt %s: %w", path, err)
 	}
 
 	tree := &config.ConfigTree{}
 	if err := json.Unmarshal(data, tree); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", path, err)
+		return nil, true, fmt.Errorf("parse %s: %w", path, err)
 	}
-	return tree, nil
+	return tree, committed, nil
 }
 
 // writeTree persists a config tree to a JSON file durably (#1894,
 // DurableState class): temp + fsync + rename + dir fsync, so a commit
 // that reported success cannot be silently lost to a power cut — the
 // guarantee the #1799 persist-before-promote contract is built on.
-func (db *DB) writeTree(path string, tree *config.ConfigTree) error {
+func (db *DB) writeTreeMarked(path string, tree *config.ConfigTree, committed bool) error {
 	data, err := json.MarshalIndent(tree, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
@@ -172,7 +200,8 @@ func (db *DB) writeTree(path string, tree *config.ConfigTree) error {
 	// envelope (#1917 increment B). The magic header line makes a pre-floor
 	// reader fail closed (its json.Unmarshal rejects a leading '#'), so a
 	// future format bump can never silently empty-load on an old reader.
-	data = wrapEnvelope(data, db.writerVersion)
+	// committed stamps the #1922 step-0 marker.
+	data = wrapEnvelope(data, db.writerVersion, committed)
 
 	if err := fsatomic.WriteFileDurable(path, data, 0644); err != nil {
 		return fmt.Errorf("persist %s: %w", path, err)

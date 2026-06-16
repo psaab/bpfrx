@@ -45,6 +45,21 @@ type Store struct {
 	// SetWriteActiveForTesting; never assigned on production paths.
 	writeActiveFn func(*config.ConfigTree) error
 
+	// writeActiveMarkerFn is the marker-aware test seam for the #1922
+	// step-0 committed marker. nil (production) routes to
+	// db.WriteActiveMarker. Set via SetWriteActiveMarkerForTesting.
+	writeActiveMarkerFn func(*config.ConfigTree, bool) error
+
+	// everCommitted is the #1922 step-0 marker as loaded/observed in
+	// memory: true once a config has been successfully committed or
+	// synced to this store (or loaded from a committed/legacy DB), false
+	// on a fresh store and after the Item 1b first-commit rollback writes
+	// the never-committed marker. The boot predicate (BootClassify) reads
+	// it to disambiguate operator-committed-empty (normal) from
+	// never-committed (bootstrap). Default false on a new Store; Load sets
+	// it from the on-disk envelope marker (absent/legacy DB => true).
+	everCommitted bool
+
 	// #1799 Option B (degrade-not-fail) state for the persist paths
 	// that must proceed in memory even when the disk write fails
 	// (SyncApply HA convergence, performAutoRollback safety revert).
@@ -148,7 +163,7 @@ func (s *Store) Load() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	tree, err := s.db.ReadActive()
+	tree, committed, err := s.db.ReadActiveMeta()
 	if err != nil {
 		// A read/parse/decrypt/envelope failure on a PRESENT active.json is
 		// the fail-closed case (#1917 increment B, D1): an unparseable or
@@ -159,8 +174,18 @@ func (s *Store) Load() error {
 		return fmt.Errorf("read config: %w: %w", ErrConfigDBUnreadable, err)
 	}
 	if tree == nil {
-		return nil // start fresh with empty config
+		// Absent DB: start fresh. everCommitted stays false (a never-booted
+		// store has never committed); the daemon's bootstrapFromFile may
+		// import a preseeded xpf.conf, which resolves NOT-bootstrap on its
+		// own (case 2). The #1922 step-0 marker only governs the DB-present
+		// disambiguation.
+		return nil
 	}
+	// #1922 step-0 marker: record whether the on-disk DB represents a
+	// successfully-committed config. A legacy/older-build DB (no envelope
+	// field) reads committed=true (migration rule C3), so an upgrade never
+	// misclassifies an existing active config into bootstrap.
+	s.everCommitted = committed
 
 	// Rolling-upgrade tolerance (#1373 / #1525): a node may boot
 	// with `system dataplane-type ebpf` or `... dpdk` persisted
@@ -214,6 +239,24 @@ func (s *Store) writeActive(tree *config.ConfigTree) error {
 		return s.writeActiveFn(tree)
 	}
 	return s.db.WriteActive(tree)
+}
+
+// writeActiveMarker persists tree as the on-disk active config with an
+// explicit #1922 step-0 committed marker. committed=false writes the
+// never-committed marker (Item 1b first-commit rollback). Routes through
+// the writeActiveMarkerFn test seam when set; otherwise the production
+// DB.WriteActiveMarker. Caller must hold s.mu. When only the legacy
+// writeActiveFn seam is set (older tests), the marker degrades to that seam
+// (the committed bit is not observable through it, which is acceptable for
+// those tests — the marker behavior has dedicated coverage via the DB seam).
+func (s *Store) writeActiveMarker(tree *config.ConfigTree, committed bool) error {
+	if s.writeActiveMarkerFn != nil {
+		return s.writeActiveMarkerFn(tree, committed)
+	}
+	if s.writeActiveFn != nil {
+		return s.writeActiveFn(tree)
+	}
+	return s.db.WriteActiveMarker(tree, committed)
 }
 
 // journalLog appends an audit entry; a failure is surfaced as a
@@ -531,6 +574,12 @@ func (s *Store) SyncApply(content string, chassisPreserve func(*config.ConfigTre
 	} else {
 		s.persistDegraded = false
 	}
+	// #1922 step-0: a successful config sync from the primary counts as a
+	// commit for the never-vs-empty disambiguation — a synced secondary
+	// has an authoritative config and must never read as never-committed.
+	// (The daemon's bootstrap-exit-on-SyncApply gate, keyed on non-empty,
+	// is separate; this flag records that the store has been committed to.)
+	s.everCommitted = true
 
 	s.journalLog(&JournalEntry{
 		Action:     "config_sync",
@@ -1011,6 +1060,7 @@ func (s *Store) CommitWithDescription(description string) (*config.Config, error
 		return nil, fmt.Errorf("commit failed: persist active config: %w", err)
 	}
 	s.persistDegraded = false // disk now holds the current config
+	s.everCommitted = true    // #1922 step-0: a real commit has succeeded
 
 	// Push current active to history with description
 	s.history.Push(&HistoryEntry{
@@ -1107,6 +1157,12 @@ func (s *Store) CommitConfirmed(minutes int) (*config.Config, error) {
 		return nil, fmt.Errorf("commit confirmed failed: persist active config: %w", err)
 	}
 	s.persistDegraded = false // disk now holds the current config
+	// #1922 step-0: a commit confirmed persists the candidate as the
+	// active config (committed=1 on disk via writeActive). The marker is
+	// set here, NOT gated on confirmation — the on-disk DB is now a real
+	// committed config; if the timer fires, the Item 1b first-commit
+	// rollback path (prevCfg==nil) re-writes the never-committed marker.
+	s.everCommitted = true
 
 	if s.confirmTimer != nil {
 		// Nested confirmed commit: cancel the pending timer but keep
@@ -1251,14 +1307,14 @@ func (s *Store) PromoteRollback(gen uint64) (prevCfg *config.Config, ok bool) {
 
 	s.confirmTimer = nil
 	s.confirmPrevTree = nil
-	// #1922 Item 1b (PR-2): first-commit rollback target. On a fresh-store
-	// FIRST commit confirmed, confirmPrevCfg is nil here, so prevCfg below
-	// is nil and ok is true — the store reverts to the empty tree but the
-	// caller skips the dataplane re-apply (prevCfg==nil guard). Rolling
-	// that case back to bootstrap + persisting a never-committed marker
-	// instead of an empty committed tree is DEFERRED to PR-2.
+	// #1922 Item 1b: first-commit rollback target. On a fresh-store FIRST
+	// commit confirmed, confirmPrevCfg is nil here, so prevCfg below is nil
+	// and ok is true — the store reverts to the empty tree. The caller
+	// (the daemon executor) detects prevCfg==nil and rolls the dataplane
+	// back via enterBootstrapMode rather than applying an empty config.
 	prevCfg = s.confirmPrevCfg
 	s.confirmPrevCfg = nil
+	firstCommitRollback := prevCfg == nil
 
 	// Persist reverted config to disk. Option B (#1799): the rollback
 	// ALWAYS proceeds in memory — reverting the running config is the
@@ -1267,8 +1323,23 @@ func (s *Store) PromoteRollback(gen uint64) (prevCfg *config.Config, ok bool) {
 	// the operator never confirmed. The degraded flag + singleton
 	// retry make the failure visible (/health 503, gauge, journal
 	// ERROR) and heal the disk in the background.
-	if err := s.writeActive(s.active); err != nil {
-		s.noteActivePersistFailureLocked("auto_rollback", err)
+	//
+	// #1922 Item 1b: on a first-commit rollback the reverted tree is the
+	// empty bootstrap tree. It MUST be persisted with the never-committed
+	// marker (committed=0), NOT as an operator-committed-empty config —
+	// otherwise a subsequent restart would classify committed-empty =>
+	// normal (Item 2 case 5) and take over interfaces on an empty config.
+	// everCommitted is cleared so the in-memory predicate also reads
+	// never-committed without a restart.
+	var perr error
+	if firstCommitRollback {
+		perr = s.writeActiveMarker(s.active, false)
+		s.everCommitted = false
+	} else {
+		perr = s.writeActive(s.active)
+	}
+	if perr != nil {
+		s.noteActivePersistFailureLocked("auto_rollback", perr)
 	} else {
 		s.persistDegraded = false
 	}
@@ -1370,6 +1441,19 @@ func (s *Store) ActiveConfig() *config.Config {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.compiled
+}
+
+// EverCommitted reports the #1922 step-0 marker: true once a config has
+// been successfully committed or synced to this store, or loaded from a
+// committed/legacy DB (migration rule C3 defaults a marker-less DB to
+// committed). It is false on a fresh store and after the Item 1b
+// first-commit rollback persists the never-committed marker. The daemon's
+// five-case boot predicate reads it to disambiguate operator-committed-empty
+// (normal) from never-committed (bootstrap) when the active config is empty.
+func (s *Store) EverCommitted() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.everCommitted
 }
 
 // ActiveTree returns a deep copy of the active configuration tree.
