@@ -100,6 +100,25 @@ func (g *grpcCluster) SyncEstablished() (bool, error) {
 	return parseSyncEstablished(s), nil
 }
 
+func (g *grpcCluster) DrainComplete() (bool, error) {
+	// DrainComplete needs BOTH the local node's RG states (Secondary) AND
+	// the PEER node's RG states (Primary) — i.e. the peer has actually
+	// taken ownership, not merely that the local node demoted itself. The
+	// status topic (FormatStatus) renders both the local AND peer node
+	// lines per RG; the information topic renders only the local view. So
+	// drain-complete is evaluated against the STATUS topic.
+	st, err := g.statusText()
+	if err != nil {
+		return false, err
+	}
+	// Also require the peer alive + sync up from the information topic.
+	info, err := g.information()
+	if err != nil {
+		return false, err
+	}
+	return parseDrainComplete(st) && parsePeerAlive(info) && parseSyncEstablished(info), nil
+}
+
 func (g *grpcCluster) HAProtocolCompatible() (bool, error) {
 	// The HA protocol version lines are in the STATUS topic
 	// (FormatStatus), not information (FormatInformation).
@@ -139,14 +158,6 @@ func (g *grpcCluster) ForceSecondary() error {
 	return g.systemAction("in-service-upgrade")
 }
 
-func (g *grpcCluster) DrainComplete() (bool, error) {
-	s, err := g.information()
-	if err != nil {
-		return false, err
-	}
-	return parseDrainComplete(s), nil
-}
-
 // --- pure parsers over `show chassis cluster information`
 // (cluster.Manager.FormatInformation) text. Kept pure + exported-to-tests
 // so a status-format drift is caught by cluster_cli_test.go (which feeds
@@ -157,13 +168,28 @@ func parsePeerAlive(s string) bool {
 	return lineHasAll(s, "Remote node:", "healthy")
 }
 
+// parseSyncEstablished checks the session/fabric sync link is UP. The
+// information topic (FormatInformation) renders a "Sync link statistics"
+// (or "Fabric link statistics") block with a "Status: Up|Down" line
+// (status.go). Require BOTH a healthy remote AND Status: Up. A missing
+// Status line or "Status: Down" fails closed (Codex r2 High: a healthy
+// heartbeat with session sync DOWN must NOT proceed to drain+cut).
 func parseSyncEstablished(s string) bool {
-	// Conservative: a healthy remote (peer present + heartbeat) is the
-	// sync precondition. An explicit unsynced/hold marker fails closed.
 	if strings.Contains(strings.ToLower(s), "unsynced") {
 		return false
 	}
-	return lineHasAll(s, "Remote node:", "healthy")
+	if !lineHasAll(s, "Remote node:", "healthy") {
+		return false
+	}
+	// Find the sync-link "Status:" line.
+	for _, line := range strings.Split(s, "\n") {
+		ll := strings.ToLower(strings.TrimSpace(line))
+		if strings.HasPrefix(ll, "status:") {
+			return strings.Contains(ll, "up")
+		}
+	}
+	// No Status line rendered: fail closed (do not assume sync is up).
+	return false
 }
 
 // parseHAProtocolCompatible compares the local and peer HA protocol
@@ -236,30 +262,87 @@ func parsePeerTakeoverReady(s string) bool {
 	return true
 }
 
+// parseDrainComplete evaluates the `show chassis cluster status`
+// (FormatStatus) text. It requires BOTH:
+//   - every LOCAL node RG row is `secondary` (the local node demoted), AND
+//   - every PEER node RG row is `primary` (the peer actually OWNS the RGs)
+//
+// Checking only the local side (Codex r2 Critical) is insufficient:
+// ForceSecondary forcibly demotes the local node regardless of whether the
+// peer became primary, so a healthy-but-stuck peer could leave BOTH nodes
+// secondary with VIPs stranded. We confirm the peer has taken ownership.
+//
+// FormatStatus emits a "Node name: nodeL" header then, per RG, a local row
+// "nodeL  <prio>  <state> ..." immediately followed (if the peer is alive)
+// by a peer row "nodeP  <prio>  <state> ...". We classify each
+// "node<N> ... <state>" row by whether <N> is the local node id.
 func parseDrainComplete(s string) bool {
-	// STRONG predicate: every RG's "Local state:" must be Secondary (peer
-	// owns the RGs) AND the remote is healthy. If ANY "Local state:" line
-	// is Primary (or an unrecognized transitional state), NOT drained.
-	if !lineHasAll(s, "Remote node:", "healthy") {
-		return false
+	localID, ok := parseLocalNodeID(s)
+	if !ok {
+		return false // cannot identify the local node => fail closed
 	}
-	sawState := false
+	sawLocal, sawPeerPrimary := false, false
 	for _, line := range strings.Split(s, "\n") {
-		ll := strings.ToLower(strings.TrimSpace(line))
-		if !strings.HasPrefix(ll, "local state:") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
 			continue
 		}
-		sawState = true
-		if strings.Contains(ll, "primary") {
-			return false
+		// Node rows start with "node<N>".
+		if !strings.HasPrefix(fields[0], "node") {
+			continue
 		}
-		if !strings.Contains(ll, "secondary") {
-			return false // hold / transition => not drained yet
+		id, idOK := parseNodeToken(fields[0])
+		if !idOK {
+			continue
+		}
+		// The state column is field index 2 ("node prio state ...").
+		state := strings.ToLower(fields[2])
+		if id == localID {
+			sawLocal = true
+			if state != "secondary" {
+				return false // local still owns an RG (or transitional)
+			}
+		} else {
+			if state == "primary" {
+				sawPeerPrimary = true
+			}
 		}
 	}
-	// Require at least one RG state line so empty/garbled output never reads
-	// as "drained".
-	return sawState
+	// Require we saw the local node demoted AND the peer holding primary.
+	return sawLocal && sawPeerPrimary
+}
+
+// parseLocalNodeID reads the "Node name: nodeN" header line FormatStatus
+// emits.
+func parseLocalNodeID(s string) (int, bool) {
+	for _, line := range strings.Split(s, "\n") {
+		l := strings.TrimSpace(line)
+		if strings.HasPrefix(strings.ToLower(l), "node name:") {
+			fields := strings.Fields(l)
+			return parseNodeToken(fields[len(fields)-1])
+		}
+	}
+	return 0, false
+}
+
+// parseNodeToken parses "nodeN" -> N.
+func parseNodeToken(tok string) (int, bool) {
+	low := strings.ToLower(strings.TrimSpace(tok))
+	if !strings.HasPrefix(low, "node") {
+		return 0, false
+	}
+	num := low[len("node"):]
+	if num == "" {
+		return 0, false
+	}
+	n := 0
+	for _, r := range num {
+		if r < '0' || r > '9' {
+			return 0, false
+		}
+		n = n*10 + int(r-'0')
+	}
+	return n, true
 }
 
 func (g *grpcCluster) ResetFailover() error {

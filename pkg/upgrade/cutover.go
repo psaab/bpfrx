@@ -54,33 +54,55 @@ func (r *Runner) Run(opts Options) (err error) {
 
 	// Resume-vs-fresh: if a journal exists for a DIFFERENT target than the
 	// now-staged version, the previous attempt was superseded by a newer
-	// apt install. Recover the live system to a consistent state, then start
-	// fresh for the new staged version.
+	// apt install. Recover the live system to a consistent state BEFORE
+	// starting fresh, so the new cut's PreviousVersion (read from `current`)
+	// is always a verified-live version, never an unstarted half-cut
+	// (Codex r1 High#2 / r2 High).
 	if j.State != StateInit && j.TargetVersion != stagedVer {
-		r.logf("upgrade: staged version %s differs from journaled target %s; "+
-			"recovering and starting fresh", stagedVer, j.TargetVersion)
-		// Recover the live unit depending on how far the stale cut got:
-		//  - STOPPED but not FLIPPED: the unit is down with `current` still
-		//    at the OLD version — just start it.
-		//  - FLIPPED/STARTED (Codex r1 High#2): the stale cut already
-		//    repointed `current` + the unit drop-in to its (half-cut)
-		//    target but never health-confirmed it. Resume that cut to
-		//    completion FIRST (start + health + commit) so we never adopt an
-		//    unstarted half-cut version as the next rollback target. If the
-		//    stale target's binaries are gone, fall back to starting
-		//    whatever `current` points at.
-		switch {
-		case j.State == StateStopped:
-			if startErr := r.cfg.Sys.StartUnit(r.cfg.Unit); startErr != nil {
-				r.logf("upgrade: WARN failed to restart unit after stale-stop recovery: %v", startErr)
+		if j.State.atLeast(StateFlipped) && !j.State.atLeast(StateStarted) {
+			// The stale cut already flipped `current` + the unit to its
+			// target but never health-confirmed it. FINISH that cut
+			// (start + health-confirm) to completion so `current` is a
+			// known-good version. If it is unhealthy, fall through to its
+			// own auto-rollback — we do NOT silently adopt an unstarted
+			// half-cut as the next rollback base.
+			r.logf("upgrade: finishing a stale half-cut to %s before the new %s cut",
+				j.TargetVersion, stagedVer)
+			if err := r.cfg.Sys.StartUnit(r.cfg.Unit); err != nil {
+				return fmt.Errorf("finish stale half-cut: start unit: %w", err)
 			}
-		case j.State.atLeast(StateFlipped) && !j.State.atLeast(StateCommitted):
-			if startErr := r.cfg.Sys.StartUnit(r.cfg.Unit); startErr != nil {
-				r.logf("upgrade: WARN failed to start unit during stale-flip recovery: %v", startErr)
+			if healthErr := r.cfg.Sys.HelperHealthy(j.TargetVersion, r.cfg.StartHealthDeadline); healthErr != nil {
+				r.logf("upgrade: stale half-cut %s unhealthy (%v); AUTO-ROLLBACK before the new cut",
+					j.TargetVersion, healthErr)
+				if rbErr := r.rollback(j); rbErr != nil {
+					return fmt.Errorf("stale half-cut unhealthy (%v) AND rollback failed: %w", healthErr, rbErr)
+				}
+				// Rollback cleared the journal and restored PreviousVersion;
+				// re-enter fresh for the new staged version.
+				j = &Journal{State: StateInit}
+			} else {
+				// Stale cut healthy: commit it (GC) then start fresh.
+				if err := r.gc(j); err != nil {
+					r.logf("upgrade: WARN gc of finished stale cut failed: %v", err)
+				}
+				_ = r.clearJournal()
+				r.removeAllPartials()
+				j = &Journal{State: StateInit}
 			}
+		} else {
+			// STAGED/PREFLIGHT/COPIED/VERIFIED (pure, live untouched) or
+			// STOPPED (unit down, `current` still OLD). Restart the unit if
+			// it was stopped, sweep partials, begin anew.
+			r.logf("upgrade: staged version %s differs from journaled target %s; "+
+				"recovering and starting fresh", stagedVer, j.TargetVersion)
+			if j.State == StateStopped {
+				if startErr := r.cfg.Sys.StartUnit(r.cfg.Unit); startErr != nil {
+					r.logf("upgrade: WARN failed to restart unit after stale-stop recovery: %v", startErr)
+				}
+			}
+			r.removeAllPartials()
+			j = &Journal{State: StateInit}
 		}
-		r.removeAllPartials()
-		j = &Journal{State: StateInit}
 	}
 
 	// Initialize a fresh journal entry.

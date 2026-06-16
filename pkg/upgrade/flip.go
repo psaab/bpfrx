@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/psaab/xpf/pkg/fsatomic"
 )
@@ -300,6 +301,27 @@ func (r *Runner) gc(j *Journal) error {
 		}
 		// Remove its DB snapshot too, if any.
 		_ = os.RemoveAll(filepath.Join(r.cfg.VersionsDir, "."+v.name+".dbsnap"))
+	}
+
+	// Sweep ORPHAN DB snapshots (AGY r2): a PREFLIGHT abort takes the
+	// snapshot before the version dir exists, so a `.<ver>.dbsnap` can be
+	// left with no matching version dir. Remove any `.<ver>.dbsnap` whose
+	// base version is not protected (current/target/previous) and has no
+	// surviving version dir.
+	for _, e := range entries {
+		n := e.Name()
+		if !strings.HasPrefix(n, ".") || !strings.HasSuffix(n, ".dbsnap") {
+			continue
+		}
+		ver := strings.TrimSuffix(strings.TrimPrefix(n, "."), ".dbsnap")
+		if protected[ver] {
+			continue
+		}
+		if _, err := os.Stat(r.versionDir(ver)); err == nil {
+			continue // version dir survives; keep its snapshot
+		}
+		r.logf("upgrade: gc removing orphan DB snapshot %s", n)
+		_ = os.RemoveAll(filepath.Join(r.cfg.VersionsDir, n))
 	}
 	return nil
 }

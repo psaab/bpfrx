@@ -43,57 +43,86 @@ func TestParsers_AgainstRealFormatInformation(t *testing.T) {
 		t.Fatalf("FormatInformation() lacks 'Local state:' line the parsers key on:\n%s", info)
 	}
 
-	// No peer configured => remote lost => peer not alive, not drained.
+	// No peer configured => remote lost => peer not alive.
 	if parsePeerAlive(info) {
 		t.Errorf("parsePeerAlive true with no peer (remote should be lost):\n%s", info)
 	}
-	if parseDrainComplete(info) {
-		t.Errorf("parseDrainComplete true with no healthy peer — would cut with no peer to own RGs")
+
+	// parseDrainComplete consumes the STATUS topic (node rows). A real
+	// FormatStatus with no peer must NOT read as drained (no peer-primary).
+	st := m.FormatStatus()
+	if !strings.Contains(st, "Node name:") {
+		t.Fatalf("FormatStatus lacks 'Node name:' header parseLocalNodeID keys on:\n%s", st)
+	}
+	if parseDrainComplete(st) {
+		t.Errorf("parseDrainComplete true with no peer — would cut with no peer owning RGs:\n%s", st)
 	}
 }
 
-// TestParsers_Fixtures exercises the parsers against fixtures matching the
-// FormatInformation grammar (status.go) for states a live Manager is
-// awkward to drive to from an external test.
-func TestParsers_Fixtures(t *testing.T) {
-	healthyPeerSecondary := strings.Join([]string{
-		"Node health:",
-		"  Local node: healthy",
-		"  Remote node: healthy (node1)",
+// TestDrainParser_Fixtures exercises parseDrainComplete against
+// FormatStatus-grammar fixtures (status.go node rows). Drain is complete
+// ONLY when the LOCAL node row is secondary AND the PEER node row is
+// primary (the peer actually took ownership).
+func TestDrainParser_Fixtures(t *testing.T) {
+	// FormatStatus row: "node<id>  <prio>  <state>  <preempt> <manual> <mon>".
+	drained := strings.Join([]string{
+		"Node name: node0",
 		"",
-		"Redundancy group 0:",
-		"  Local priority: 100",
-		"  Local state: Secondary",
-		"  Takeover ready: yes (since 12:00:00)",
+		"Redundancy group: 0 , Failover count: 1",
+		"node0   100      secondary      yes      no       None",
+		"node1   200      primary        yes      no       None",
 		"",
 	}, "\n")
-	healthyPeerPrimary := strings.ReplaceAll(healthyPeerSecondary, "Local state: Secondary", "Local state: Primary")
-	remoteLost := strings.ReplaceAll(healthyPeerSecondary, "Remote node: healthy (node1)", "Remote node: lost")
+	localStillPrimary := strings.Join([]string{
+		"Node name: node0",
+		"node0   200      primary        yes      no       None",
+		"node1   100      secondary      yes      no       None",
+	}, "\n")
+	bothSecondary := strings.Join([]string{
+		"Node name: node0",
+		"node0   100      secondary      yes      no       None",
+		"node1   100      secondary      yes      no       None",
+	}, "\n")
+	localSecondaryNoPeer := strings.Join([]string{
+		"Node name: node0",
+		"node0   100      secondary      yes      no       None",
+	}, "\n")
 
-	if !parsePeerAlive(healthyPeerSecondary) {
-		t.Error("healthy peer not detected as alive")
+	if !parseDrainComplete(drained) {
+		t.Error("local secondary + peer primary should be drain-complete")
 	}
-	if parsePeerAlive(remoteLost) {
-		t.Error("lost remote read as alive")
+	if parseDrainComplete(localStillPrimary) {
+		t.Error("local primary must NOT be drain-complete")
 	}
-	if !parseDrainComplete(healthyPeerSecondary) {
-		t.Error("local Secondary + healthy peer should be drain-complete")
+	if parseDrainComplete(bothSecondary) {
+		t.Error("both-secondary must NOT be drain-complete (peer has not taken ownership — VIP stranding)")
 	}
-	if parseDrainComplete(healthyPeerPrimary) {
-		t.Error("local Primary must NOT be drain-complete (node still owns an RG)")
+	if parseDrainComplete(localSecondaryNoPeer) {
+		t.Error("local secondary with no peer-primary row must NOT be drain-complete")
 	}
-	if parseDrainComplete(remoteLost) {
-		t.Error("drain-complete with a lost remote — no peer to own the RGs")
-	}
-	if !parsePeerTakeoverReady(healthyPeerSecondary) {
-		t.Error("healthy peer should be takeover-ready")
-	}
-	if parsePeerTakeoverReady(remoteLost) {
-		t.Error("lost remote must not be takeover-ready")
-	}
-	// Empty / garbled output must never read as drained.
-	if parseDrainComplete("garbage\nno fields here") {
+	if parseDrainComplete("garbage\nno node rows") {
 		t.Error("garbled output read as drained")
+	}
+}
+
+// TestSyncParser_Fixtures covers the Status: Up/Down sync gate.
+func TestSyncParser_Fixtures(t *testing.T) {
+	up := strings.Join([]string{
+		"  Remote node: healthy (node1)",
+		"Sync link statistics (control-link):",
+		"  Status: Up",
+	}, "\n")
+	down := strings.ReplaceAll(up, "Status: Up", "Status: Down")
+	noStatus := "  Remote node: healthy (node1)\n"
+
+	if !parseSyncEstablished(up) {
+		t.Error("Status: Up should read as sync established")
+	}
+	if parseSyncEstablished(down) {
+		t.Error("Status: Down must NOT read as sync established (would drop sessions on cut)")
+	}
+	if parseSyncEstablished(noStatus) {
+		t.Error("missing Status line must fail closed")
 	}
 }
 

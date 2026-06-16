@@ -127,6 +127,20 @@ raw push+restart path (and `XPF_DEPLOY_FAST`) is unchanged for the dev
 inner loop. The deb path is opt-in until validated live; it then becomes
 the CI/smoke default.
 
+## Rolling protocol-bump limitation
+
+`HAProtocolCompatible` compares the RUNNING local daemon's HA protocol
+version against the peer's. It cannot see the STAGED version's protocol
+before the cut. So if a release BUMPS `CurrentHAProtocolVersion`, the
+first node's precheck passes (running N vs peer N), it cuts to N+1, and
+then the SECOND node's precheck fails (running N vs peer N+1) and aborts —
+leaving a mixed-version cluster. This is the "not rolling-upgradable"
+outcome the plan flags (Path C image-replace), but it is detected on the
+second node, not pre-emptively. Operators MUST treat a protocol bump as a
+non-rolling release (image-replace both nodes). A pre-emptive guard would
+require the staged binary to report its protocol version to the driver
+before the first cut (future work).
+
 ## Honest limits
 
 - **No true zero-gap standalone restart.** The helper is an `exec.Command`

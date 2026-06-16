@@ -298,6 +298,27 @@ func TestRun_RollbackClearsJournalNoResurrectFailedTarget(t *testing.T) {
 	}
 }
 
+// TestGC_SweepsOrphanDBSnapshot proves an orphan .<ver>.dbsnap (left by a
+// PREFLIGHT abort before the version dir exists) is swept by gc (AGY r2).
+func TestGC_SweepsOrphanDBSnapshot(t *testing.T) {
+	fs := newFakeSystem(t, "1.0.0")
+	r, cfg := testEnv(t, fs)
+	if err := r.Run(Options{}); err != nil {
+		t.Fatalf("first cut: %v", err)
+	}
+	// Plant an orphan dbsnap for a version with no version dir.
+	orphan := filepath.Join(cfg.VersionsDir, ".9.9.9.dbsnap")
+	mkfile(t, filepath.Join(orphan, "active.json"), "x")
+
+	j := &Journal{TargetVersion: "1.0.0"}
+	if err := r.gc(j); err != nil {
+		t.Fatalf("gc: %v", err)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Errorf("orphan dbsnap not swept by gc")
+	}
+}
+
 // TestRollback_ResumeMidRollback proves a crash mid-rollback (journal at
 // ROLLINGBACK) resumes the rollback to PreviousVersion, not the failed
 // forward cut.
