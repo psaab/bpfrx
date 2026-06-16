@@ -198,6 +198,17 @@ else
     ok "publish refuses an unsigned manifest"
 fi
 
+# Orphan image artifact NOT covered by any manifest (Codex-r2-1).
+PGO="$WORK/pgorphan"; mkdir -p "$PGO"
+cp "$QCOW" "$META" "$MANIFEST" "$MANIFEST.minisig" "$PGO/"
+head -c 64 /dev/urandom > "$PGO/xpf-9.9.9.qcow2"   # orphan, no manifest covers it
+if XPF_IMAGE_PUBKEY="$WORK/img.pub" $PY "$DIST/publish.py" \
+     --dist "$PGO" --channel stable --no-apt >/dev/null 2>&1; then
+    bad "publish MUST refuse an orphan image artifact but PASSED"
+else
+    ok "publish refuses an orphan image artifact"
+fi
+
 # ── 6. install.sh dry-run ──────────────────────────────────────────────────
 info "6. install.sh --dry-run (preflight + source rendering)"
 if XPF_DRY_RUN=1 XPF_APT_BASE_URL="https://example.invalid/apt" XPF_CHANNEL=stable \

@@ -57,6 +57,26 @@ def die(m):
     sys.exit(f"PUBLISH ERROR: {m}")
 
 
+def image_pubkey():
+    """Resolve the minisign IMAGE pubkey ONCE, honoring XPF_IMAGE_PUBKEY
+    (Codex-r2-3). Fail-CLOSED on the placeholder (Codex-r2-2): the gate must
+    never verify against a key whose secret is held by no one."""
+    pub = os.environ.get("XPF_IMAGE_PUBKEY") or sign.DEFAULT_IMAGE_PUBKEY
+    if sign.is_placeholder_pubkey(pub):
+        die("image pubkey is the #1924 PLACEHOLDER — cannot verify image "
+            "signatures. Supply the real key (XPF_IMAGE_PUBKEY / "
+            "scripts/dist/xpf-image.pub) before publishing.")
+    if not os.path.isfile(pub):
+        die(f"image pubkey not found: {pub}")
+    return pub
+
+
+# Image artifact basenames we sweep for orphans (Codex-r2-1): any of these in
+# `dist` that is NOT covered by a verified manifest blocks the publish, because
+# the whole dist tree is uploaded.
+IMAGE_ARTIFACT_SUFFIXES = (".qcow2", ".incus-metadata.tar.gz")
+
+
 def archive_pubkey():
     """Resolve the OpenPGP archive pubkey path (override or pinned, else
     placeholder). gpg verifies InRelease against an ephemeral keyring built
@@ -98,22 +118,21 @@ def list_versions(dist):
 
 def gate_images(dist):
     """(a)+(c): every signed image manifest verifies and the listed files
-    hash-match; install.sh has a verifying signature if present."""
+    hash-match; EVERY image artifact in dist is covered by a verified manifest
+    (no orphans); install.sh has a verifying signature and is not the
+    placeholder."""
     versions = list_versions(dist)
     if not versions:
         die(f"no signed image manifests (xpf-*.SHA256SUMS + .minisig) in {dist} "
             "— nothing publishable. Set XPF_SIGN_SECKEY and re-bake.")
-    if sign.is_placeholder_pubkey(sign.DEFAULT_IMAGE_PUBKEY) \
-            and not os.environ.get("XPF_IMAGE_PUBKEY"):
-        die("image pubkey is the #1924 PLACEHOLDER — cannot verify image "
-            "signatures. Supply the real key (XPF_IMAGE_PUBKEY / "
-            "scripts/dist/xpf-image.pub) before publishing.")
+    pub = image_pubkey()
+    covered = set()
     for ver, manifest in sorted(versions.items()):
         sig = manifest + ".minisig"
         try:
             # Verify the signature BEFORE parsing the manifest (Codex-L6):
             # never trust an unauthenticated manifest's contents.
-            sign.verify_signature(manifest, sig, sign.DEFAULT_IMAGE_PUBKEY)
+            sign.verify_signature(manifest, sig, pub)
             checks = sign.parse_manifest(manifest)
         except sign.SignError as e:
             die(f"image manifest {os.path.basename(manifest)} failed verify: {e}")
@@ -124,26 +143,40 @@ def gate_images(dist):
                 die(f"manifest {os.path.basename(manifest)} lists {base} but it "
                     f"is absent from {dist} — refusing to publish a partial set.")
             try:
-                sign.verify_image_artifact(path, manifest, sig)
+                sign.verify_image_artifact(path, manifest, sig, pub)
             except sign.SignError as e:
                 die(f"image artifact {base} failed verify: {e}")
+            covered.add(base)
         info(f"image set {ver}: signature + {len(checks)} file hashes OK")
-    # (c) install.sh
+    # Orphan sweep (Codex-r2-1): the WHOLE dist tree is uploaded, so any image
+    # artifact NOT covered by a verified manifest (e.g. a stale dev qcow2)
+    # would be published unverified. Refuse it.
+    for name in sorted(os.listdir(dist)):
+        if name.endswith(IMAGE_ARTIFACT_SUFFIXES) and name not in covered:
+            die(f"orphan image artifact in the publish set: {name} is not listed "
+                "in any verified manifest — refusing to publish unverified bytes. "
+                "Remove it or sign a manifest covering it.")
+    # (c) install.sh — signed AND not the placeholder.
     installsh = os.path.join(dist, "install.sh")
     if os.path.isfile(installsh):
+        with open(installsh) as f:
+            if "PLACEHOLDER-xpf-archive-keyring" in f.read():
+                die("install.sh in the publish set still embeds the PLACEHOLDER "
+                    "archive key — refusing to publish an installer that cannot "
+                    "verify the repo. Substitute the real key first.")
         isig = installsh + ".minisig"
         if not os.path.isfile(isig):
             die("install.sh is in the publish set but install.sh.minisig is "
                 "missing — sign it before publishing.")
         try:
-            sign.verify_signature(installsh, isig, sign.DEFAULT_IMAGE_PUBKEY)
+            sign.verify_signature(installsh, isig, pub)
             info("install.sh signature OK")
         except sign.SignError as e:
             die(f"install.sh signature failed verify: {e}")
-    return versions
+    return versions, pub
 
 
-def gate_latest(dist, channel, versions):
+def gate_latest(dist, channel, versions, pub):
     """(d): latest.json verifies and names a present version."""
     latest = os.path.join(dist, channel, "latest.json")
     if not os.path.isfile(latest):
@@ -154,7 +187,7 @@ def gate_latest(dist, channel, versions):
         die(f"{channel}/latest.json.minisig missing — the freshness pointer "
             "must be signed.")
     try:
-        sign.verify_signature(latest, sig, sign.DEFAULT_IMAGE_PUBKEY)
+        sign.verify_signature(latest, sig, pub)
     except sign.SignError as e:
         die(f"latest.json signature failed verify: {e}")
     with open(latest) as f:
@@ -191,6 +224,30 @@ def gate_apt(dist, channel):
         if r.returncode != 0:
             die(f"apt InRelease signature FAILED: {r.stderr.strip()}")
     info(f"apt InRelease ({channel}) signature OK")
+    # The pooled .deb must not carry the PLACEHOLDER archive keyring
+    # (Codex-r2-2): a package built before the real key existed would, once
+    # installed, overwrite a host's real /usr/share/keyrings key with the
+    # placeholder and break `apt update`. Refuse to publish such a pool.
+    pool = os.path.join(dist, "apt", "pool")
+    if os.path.isdir(pool):
+        import tempfile as _tf
+        for root, _dirs, files in os.walk(pool):
+            for fn in files:
+                if not fn.endswith(".deb"):
+                    continue
+                debp = os.path.join(root, fn)
+                with _tf.TemporaryDirectory() as td:
+                    r = subprocess.run(["dpkg-deb", "-x", debp, td],
+                                       capture_output=True, text=True)
+                    if r.returncode != 0:
+                        continue  # not the xpf package / unreadable; skip
+                    kp = os.path.join(td, "usr/share/keyrings/"
+                                      "xpf-archive-keyring.asc")
+                    if os.path.isfile(kp) and _is_placeholder(kp):
+                        die(f"pooled package {fn} ships the PLACEHOLDER archive "
+                            "keyring — refusing to publish (it would clobber a "
+                            "host's real key on upgrade). Rebuild the .deb after "
+                            "dropping in scripts/dist/xpf-archive-keyring.asc.")
 
 
 def make_latest(dist, channel, version):
@@ -254,10 +311,9 @@ def main(argv):
         die(f"dist dir not found: {dist}")
 
     # ── fail-closed gate ──
-    versions = {}
     if not a.no_image:
-        versions = gate_images(dist)
-        gate_latest(dist, a.channel, versions)
+        versions, pub = gate_images(dist)
+        gate_latest(dist, a.channel, versions, pub)
     if not a.no_apt:
         gate_apt(dist, a.channel)
 
