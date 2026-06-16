@@ -16,4 +16,4 @@ Record Codex task IDs + AGY job IDs per round so continuations can fetch by id
 
 ## Round 3 (confirmation)
 - Codex: task-mqg9kz3s-nehkub
-- AGY: adversarial-review-mqg9l5qv-r9zvc8
+- AGY: adversarial-review-mqg9l5qv-r9zvc8 -> PLAN-NEEDS-REVISION (5 NEW confirmed blockers: daemon-not-fail-closed/daemon_run.go, dpkg-deletes-versioned-dir, needrestart, softdog-early-boot, GRUB_DEFAULT=saved) -> all folded v6

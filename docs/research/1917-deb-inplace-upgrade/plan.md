@@ -1,13 +1,14 @@
 # #1917 — In-place xpf upgrade (new xpfd + userspace-dp without re-imaging)
 
-- **Revision:** 5
-- **Status:** PLAN-READY (converged round 3). Round-1: all three reviewers
-  PLAN-NEEDS-REVISION (no KILL; composed A+B+C endorsed). Round-2: Codex 3 blockers
-  (fixed v4), Claude SMR premature-READY (self-corrected), AGY 4 round-1 blockers
-  (incorporated). Round-3: Codex confirmed blockers 1+3 resolved and refined
-  blocker 2 (stop-before-flip / versioned ExecStart — fixed v5) + flagged two stale
-  alias mentions (scrubbed v5); Claude SMR PLAN-READY (empirically verified the
-  envelope fail-closed); AGY round-3 in-flight. v5 closes the last Codex refinement.
+- **Revision:** 6
+- **Status:** PLAN-REVISED (round 3 → round 4 confirmation). Round-1: all three
+  reviewers PLAN-NEEDS-REVISION (no KILL; composed A+B+C endorsed). Round-2: Codex 3
+  blockers (fixed v4), Claude SMR premature-READY (self-corrected), AGY 4 blockers
+  (incorporated). Round-3: Codex confirmed 1+3, refined blocker 2 (stop-before-flip,
+  fixed v5) + scrubbed stale alias; AGY surfaced FIVE new operational blockers
+  (daemon-not-fail-closed, dpkg-deletes-versioned-dir, needrestart, softdog-early-
+  boot, GRUB_DEFAULT=saved) — all confirmed against code and folded into v6.
+  Awaiting round-4 confirmation for PLAN-READY.
 - **Branch:** `research/1917-deb-inplace-upgrade`
 - **Scope:** RESEARCH ONLY. No production source touched. Deliverable is this plan
   + three reviewer verdicts + an issue comment. Implementation is a separate
@@ -191,9 +192,14 @@ One binary package + one metapackage (round-1: two-package split bought nothing
 once the shim is embedded — the protocol pair is enforced by *versioned immutable
 paths*, §6.3a, not by dpkg `Depends:` metadata which an old xpfd can ignore):
 
-- **`xpf`** — `/usr/local/lib/xpf/<version>/{xpfd,xpf-userspace-dp,cli,xpf-day0-config,xpf-upgrade}`
-  (versioned install dir — `xpf-upgrade` ships HERE so the staged N+1 orchestrator
-  is always available by absolute path), `xpfd.service`, `xpf-day0-config.service`. The live
+- **`xpf`** — the `.deb` installs the binary set to a **dpkg-static staging path**
+  `/usr/local/share/xpf/staged/{xpfd,xpf-userspace-dp,cli,xpf-day0-config,xpf-upgrade}`
+  (NOT a versioned dir — see §6.3c: dpkg deleting an old versioned dir would destroy
+  the rollback target). `xpf-upgrade` copies the staged set into a
+  **non-dpkg-managed runtime versioned dir** `/var/lib/xpf/versions/<version>/` and
+  the live symlinks point THERE. Plus `xpfd.service`, `xpf-day0-config.service`, the
+  `needrestart` override (`/etc/needrestart/conf.d/xpf.conf`), and the GRUB
+  `GRUB_DEFAULT=saved` drop-in (§6.3c). The live
   paths `/usr/local/sbin/{xpfd,cli,...}` are **symlinks** into the active
   versioned dir, flipped atomically by `xpf-upgrade` (§6.3a) — NOT written
   directly by dpkg. xpfd and the helper ship and move as one matched-protocol
@@ -274,6 +280,50 @@ protocol/orchestration logic. The `postinst` and the operator runbook MUST invok
 the *staged* `/usr/local/lib/xpf/<N+1>/xpf-upgrade cut-over` to drive the cut,
 never the live-symlink path. The staged orchestrator owns the verify, the symlink
 flip, and (standalone) the restart.
+
+### 6.3b Daemon MUST fail-closed on a config-DB parse error (round-3 AGY blocker — critical)
+
+The old-reader-rejecting envelope (§8) makes binary N's `db.ReadActive` *return an
+error* on N+1 state — but that is necessary, NOT sufficient, because the daemon
+startup is currently LENIENT. Verified: `store.New` fails closed only when the
+`.configdb` directory is unusable (store.go:104); but `Store.Load()` returning a
+*parse* error is handled by the caller in `daemon_run.go` by **logging a warning
+and proceeding** — then, because `ActiveConfig()` is nil, it calls
+`bootstrapFromFile()` (daemon_apply.go:32) which `Commit()`s `/etc/xpf/xpf.conf`
+and **overwrites the unparseable `active.json`**, erasing the DB; absent that file
+it starts with empty config. So the min-reader gate is defeated at the daemon
+layer. **The mechanism MUST change daemon startup so a config-DB parse error
+(anything except `os.IsNotExist`) is FATAL — exit immediately, do NOT bootstrap or
+run unconfigured.** This is a small daemon change that #1917 owns (it is the
+enforcement half of the manifest gate). Test: binary N handed an N+1 envelope
+exits non-zero and leaves `active.json` byte-for-byte unchanged.
+
+### 6.3c dpkg-static staging vs runtime versioned dirs + needrestart + GRUB (round-3 AGY blockers)
+
+Three packaging hazards that defeat the "dpkg only stages, never cuts" design and
+the kernel-fallback, all confirmed real:
+
+- **dpkg deletes the old versioned dir on upgrade.** If the package installs
+  binaries directly to `/usr/local/lib/xpf/<version>/`, upgrading N→N+1 makes dpkg
+  remove `/usr/local/lib/xpf/<N>/` — destroying the rollback target AND any binary
+  a still-running N daemon might re-exec mid-transaction. **Fix:** separate
+  dpkg-owned *staging* from runtime: the `.deb` installs to a STATIC path
+  (`/usr/local/share/xpf/staged/`); `xpf-upgrade` copies the staged set into a
+  **non-dpkg-managed** runtime versioned dir (`/var/lib/xpf/versions/<version>/`)
+  and the live symlink points there. dpkg never deletes a runtime version; rollback
+  retains N+ the previous known-good.
+- **`needrestart` will restart the daemon regardless of `dh_installsystemd`.**
+  Ubuntu server installs `needrestart` by default; at the end of an apt transaction
+  it scans for processes running *deleted* binaries and auto-restarts them —
+  cutting the dataplane mid-`apt` even with `--no-stop-on-upgrade`. **Fix:** ship
+  `/etc/needrestart/conf.d/xpf.conf` blacklisting `xpfd.service` / the xpf binary
+  paths from auto-restart. (The dpkg-static-staging fix above also helps: if the
+  *running* binary's path is never deleted, needrestart has nothing to trigger on.)
+- **`grub-reboot` requires `GRUB_DEFAULT=saved`.** The §6.7 one-shot kernel boot
+  silently no-ops (or boot-loops) if the appliance image hardcodes `GRUB_DEFAULT=0`.
+  **Fix:** the bake / package postinst must set `GRUB_DEFAULT=saved` (+
+  `GRUB_SAVEDEFAULT` handling) and `update-grub`; `xpf-upgrade kernel` asserts it
+  before arming a one-shot boot.
 
 ### 6.3 The `.deb` `postinst` — verify-before-cut, delegating the mechanism
 
@@ -371,17 +421,22 @@ permanent blanket hold:
   on that boot a oneshot unit runs `verify-dataplane` + a health check; on PASS it
   promotes the candidate via `grub-set-default`. **The no-show/boot-hang fallback
   needs a watchdog ARMED BEFORE the reboot (round-2 Codex blocker), or the "never
-  brick" claim is overstated.** Concretely: arm the **hardware/softdog watchdog**
-  (`/dev/watchdog`, systemd `RuntimeWatchdogSec`) such that if the candidate
-  kernel never reaches the promotion oneshot (early-boot hang, no `systemd`), the
-  watchdog resets the box; because GRUB's *default* was never changed
-  (`grub-reboot` is one-shot), the reset boots the OLD default. The promotion
-  oneshot must (a) run early enough to pet/disarm the watchdog only AFTER a
-  `verify-dataplane` PASS + health beacon, (b) write a durable promotion marker,
-  (c) within a bounded deadline. **Honest bound:** with a kernel/HW watchdog this
-  is brick-proof against boot hangs; without one (pure `grub-reboot`) the GRUB
-  default is preserved but an early-boot hang needs external/operator recovery —
-  the plan REQUIRES the watchdog for the "never brick" guarantee. HA: do the
+  brick" claim is overstated.** Concretely: arm a **HARDWARE / hypervisor-level
+  watchdog** (`/dev/watchdog`, systemd `RuntimeWatchdogSec`) such that if the
+  candidate kernel never reaches the promotion oneshot (early-boot hang, no
+  `systemd`), the watchdog resets the box. **`softdog` is INSUFFICIENT (round-3 AGY
+  blocker):** a kernel software watchdog cannot fire if the candidate kernel hangs
+  in decompression / early init *before* the softdog module + systemd load and arm
+  it — that path bricks. The HW/hypervisor watchdog fires independently of the
+  candidate kernel reaching userspace. Because GRUB's *default* was never changed
+  (`grub-reboot` is one-shot, and REQUIRES `GRUB_DEFAULT=saved` — §6.3c), the reset
+  boots the OLD default. The promotion oneshot must (a) run early enough to
+  pet/disarm the watchdog only AFTER a `verify-dataplane` PASS + health beacon,
+  (b) write a durable promotion marker, (c) within a bounded deadline. **Honest
+  bound:** with a HW/hypervisor watchdog this is brick-proof against boot hangs;
+  with only `softdog` or pure `grub-reboot` the GRUB default is preserved but an
+  early-boot hang needs external/operator recovery — the plan REQUIRES the
+  HW/hypervisor watchdog for the "never brick" guarantee. HA: do the
   one-shot kernel boot on the drained/secondary node only, sequenced inside the
   rolling drive so both nodes never reboot together.
 - Heavy/uncertain kernel moves still go through Path C (image-replace), the
@@ -522,7 +577,12 @@ pin / one-kernel assert / verify-dataplane gate logic in bake.py is unchanged; t
 | 9 | `dh_installsystemd` auto-appends `try-restart` to `postinst` → any `apt upgrade xpf` cuts the dataplane | Availability | High | High | `debian/rules`: `dh_installsystemd --no-stop-on-upgrade` + pinned debhelper-compat; live restart only via `xpf-upgrade` post-verify (§6.3a) |
 | 10 | Verify-gated kernel channel tries to verify an *unbooted* kernel (impossible — verifier is in the running kernel) → bad kernel could brick the node | Availability | Med | Critical | One-shot `grub-reboot` + boot-watchdog auto-fallback to old default; promote only on a PASS health beacon (§6.7) |
 | 11 | Non-atomic manifest: power cut between `active.json` and a separate `manifest.json` → mismatched DB | Data/Correctness | Med | High | Embed manifest IN `active.json` (envelope/header), keep the single-file `fsatomic` rename atomic (§8) |
-| 12 | Rolling upgrade driven by the *old* `xpf-upgrade` symlink (N) lacking N+1 orchestration logic | Correctness | Med | High | `postinst`/runbook exec the *staged* `/usr/local/lib/xpf/<N+1>/xpf-upgrade` (§6.3a) |
+| 12 | Rolling upgrade driven by the *old* `xpf-upgrade` symlink (N) lacking N+1 orchestration logic | Correctness | Med | High | `postinst`/runbook exec the *staged* `/usr/local/share/xpf/staged/xpf-upgrade` (§6.3a/§6.3c) |
+| 13 | Binary N can't parse N+1 envelope but daemon LOGS-AND-PROCEEDS → bootstrapFromFile overwrites active.json or runs empty (min-reader gate defeated at daemon layer) | Data/Availability | Med | Critical | Make config-DB parse error (non-IsNotExist) FATAL at startup — no bootstrap, no unconfigured run (§6.3b, daemon_run.go fix) |
+| 14 | dpkg deletes old `/usr/local/lib/xpf/<N>/` on upgrade → rollback target + mid-txn re-exec binary gone | Availability | High | High | dpkg installs to static `/usr/local/share/xpf/staged/`; `xpf-upgrade` copies to non-dpkg `/var/lib/xpf/versions/<ver>/` (§6.1/§6.3c) |
+| 15 | `needrestart` (default on Ubuntu server) auto-restarts xpfd running a deleted binary → cuts dataplane mid-apt regardless of dh flags | Availability | High | High | Ship `/etc/needrestart/conf.d/xpf.conf` blacklist; static staging means running path is never deleted (§6.3c) |
+| 16 | `softdog` can't catch a candidate-kernel early-boot hang (loads after the hang) → brick | Availability | Med | Critical | Require HW/hypervisor `/dev/watchdog`, not softdog, for the never-brick guarantee (§6.7) |
+| 17 | `grub-reboot` no-ops / boot-loops if image hardcodes `GRUB_DEFAULT=0` | Availability | Med | High | Set `GRUB_DEFAULT=saved` in bake/postinst; `xpf-upgrade kernel` asserts it before arming (§6.3c/§6.7) |
 
 ## 10. Test plan
 
@@ -561,9 +621,18 @@ verifier-failing candidate kernel → assert the box auto-falls-back to the old
 default and the old default stays the boot default (no brick).
 
 **Config-DB compat:** write `active.json` + rollback slot with binary N+1 that
-emits a new leaf; attempt to boot binary N → assert the manifest min-reader gate
-fails closed with an actionable error (not a silent degraded load); assert
-auto-rollback is refused when the state floor advanced.
+emits a new leaf; attempt to boot binary N → assert binary N **exits non-zero**
+(daemon fail-closed, §6.3b) and leaves `active.json` byte-for-byte unchanged (NOT
+a silent bootstrap-overwrite or degraded empty load); assert auto-rollback is
+refused when the state floor advanced. Also assert the old-reader-rejecting
+encoding: feed binary N an N+1 envelope directly to `db.ReadActive` → error, not an
+empty `ConfigTree`.
+
+**Packaging hazards (round-3):** assert dpkg upgrade N→N+1 does NOT delete the
+running version's binaries (static staging + runtime versioned dir); assert
+`needrestart` does not bounce `xpfd` during the apt transaction (override present +
+running path not deleted); assert `GRUB_DEFAULT=saved` is set so `grub-reboot`
+works; assert local rollback still has the previous version's binaries on disk.
 
 ## 11. Out of scope
 
