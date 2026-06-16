@@ -49,8 +49,14 @@ STAGED = /usr/local/share/xpf/staged
 # binary the gate runs is the live /usr/local/sbin/xpfd symlink.
 override_dh_auto_build:
 	$(MAKE) build build-ctl build-userspace-dp
-	sed '/^ExecStart=/i ExecStartPre=/usr/local/sbin/xpfd verify-dataplane' \
+	@# Match ExecStart tolerating leading whitespace and spaces around '='
+	@# (systemd accepts those), then HARD-ASSERT the gate landed — a silent
+	@# sed miss (e.g. if the unit source is reformatted) must FAIL the build,
+	@# never ship a package-staged unit that skips the verifier (AGY r2).
+	sed -E '/^[[:space:]]*ExecStart[[:space:]]*=/i ExecStartPre=/usr/local/sbin/xpfd verify-dataplane' \
 	    test/incus/xpfd.service > debian/xpf.xpfd.service
+	grep -q '^ExecStartPre=/usr/local/sbin/xpfd verify-dataplane$$' debian/xpf.xpfd.service || \
+	    { echo "FATAL: ExecStartPre verify-dataplane injection failed (xpfd.service ExecStart line not matched)" >&2; exit 1; }
 	cp scripts/image/xpf-day0-config.service debian/xpf.xpf-day0-config.service
 
 # Nothing to test in the package build itself; the project test suite

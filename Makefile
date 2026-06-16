@@ -320,13 +320,20 @@ deb:
 	@# the .deb/.changes/.buildinfo to the PARENT dir (not configurable);
 	@# we keep the canonical copies in dist/deb/ and scrub the parent so it
 	@# never litters the tree above the source dir (a git worktree parent).
+	@# Signal traps re-raise the caught signal after cleanup (trap - SIG;
+	@# kill -SIG $$) so an interrupted build returns the SIGNAL exit status,
+	@# not 0. A bare `trap cleanup INT TERM` with a cleanup that returns 0
+	@# would mask Ctrl-C / CI-kill as success under dash (AGY r2). The EXIT
+	@# trap covers normal completion + dpkg-buildpackage failure (set -e).
 	set -e; \
 	  cleanup() { \
 	    sed -i "1s/^xpf ([^)]*)/xpf (0.0.0)/" debian/changelog; \
 	    rm -f ../xpf_$(DEB_VERSION)_*.deb ../xpf-appliance_$(DEB_VERSION)_*.deb \
 	          ../xpf_$(DEB_VERSION)_*.changes ../xpf_$(DEB_VERSION)_*.buildinfo; \
 	  }; \
-	  trap cleanup EXIT INT TERM; \
+	  trap cleanup EXIT; \
+	  trap 'cleanup; trap - INT; kill -INT $$' INT; \
+	  trap 'cleanup; trap - TERM; kill -TERM $$' TERM; \
 	  sed -i "1s/^xpf ([^)]*)/xpf ($(DEB_VERSION))/" debian/changelog; \
 	  dpkg-buildpackage -us -uc -b --no-sign; \
 	  mkdir -p $(DEB_OUT); \
