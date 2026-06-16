@@ -48,7 +48,7 @@ the userspace dataplane admission boundary is in
   `.link` files, configures addresses/DHCP via `.network` files, brings
   down unconfigured interfaces (see
   [`network-topology.md`](network-topology.md) and the interface-management
-  notes in [`engineering-style.md`](engineering-style.md)).
+  notes in [`critical-patterns.md`](critical-patterns.md)).
 
 ## High availability
 

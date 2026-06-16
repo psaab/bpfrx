@@ -174,9 +174,10 @@ editing cmdtree.
 ## See also
 
 - [`engineering-style.md`](engineering-style.md) — coding/review
-  discipline, hot-path allocation rules, and the project-specific gotchas
-  (byte order, struct alignment, BPF verifier, SR-IOV/XDP, interface
-  management) that repeatedly bite.
+  discipline and hot-path allocation rules.
+- [`critical-patterns.md`](critical-patterns.md) — the project-specific
+  gotchas (byte order, struct alignment, BPF verifier, SR-IOV/XDP,
+  interface management) that repeatedly bite.
 - [`network-topology.md`](network-topology.md) — test-VM and HA-cluster
   interface maps.
 - [`feature-coverage.md`](feature-coverage.md) — the full feature matrix.

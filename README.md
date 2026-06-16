@@ -14,12 +14,12 @@ by a Go control plane.
 
 ## Getting started
 
-There are three ways to get a running firewall. **(C) the prebuilt
-appliance image is the recommended path** — it is the dependency closure
-(kernel ≥ 6.18, FRR, strongSwan, Kea, the xpf binaries and units) baked
-into one bootable disk, deployable on incus or libvirt/KVM/QEMU. Install
-the `.deb` on a host you already manage; build from source for
-development.
+There are three ways to get a running firewall. **The prebuilt appliance
+image (paths B and C) is the recommended path** — it is the dependency
+closure (kernel ≥ 6.18, FRR, strongSwan, Kea, the xpf binaries and units)
+baked into one bootable disk, deployable on incus (B) or
+libvirt/KVM/QEMU (C). Install the `.deb` (A) on a host you already manage;
+build from source for development.
 
 | Path | Use when | Jump to |
 |------|----------|---------|
@@ -176,7 +176,7 @@ security {
     zones {
         security-zone trust {
             interfaces {
-                ge-0/0/0.0;
+                ge-0/0/0;
             }
             host-inbound-traffic {
                 system-services {
@@ -207,7 +207,7 @@ The same thing as flat `set` commands:
 
 ```
 set interfaces ge-0/0/0 unit 0 family inet address 10.0.1.1/24
-set security zones security-zone trust interfaces ge-0/0/0.0
+set security zones security-zone trust interfaces ge-0/0/0
 set security policies from-zone trust to-zone untrust policy allow-all match source-address any destination-address any application any
 set security policies from-zone trust to-zone untrust policy allow-all then permit
 ```

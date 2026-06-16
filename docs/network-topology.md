@@ -4,8 +4,8 @@ This documents the interface maps for the two test environments. For how
 *deployed* appliances map vNICs/SR-IOV to interface names, see the
 positional naming contract in [`deploy-quickstart.md`](deploy-quickstart.md)
 and [`../examples/deploy/README.md`](../examples/deploy/README.md). For
-the SR-IOV/XDP driver caveats, see the "XDP on SR-IOV Interfaces" section
-of [`engineering-style.md`](engineering-style.md).
+the SR-IOV/XDP driver caveats, see the "XDP on SR-IOV interfaces" section
+of [`critical-patterns.md`](critical-patterns.md).
 
 All interfaces are managed by xpfd — renamed via `.link` files,
 configured via `.network` files. Startup naming by
