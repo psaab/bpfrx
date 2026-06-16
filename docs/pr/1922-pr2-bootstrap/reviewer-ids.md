@@ -28,8 +28,8 @@ Plan: `git show origin/research/1922-safe-bootstrap-daemon:docs/research/1922-sa
 
 | Reviewer | Task ID | Round | Verdict |
 |---|---|---|---|
-| Codex | bvo39rwsi (r1) / 019ed26c-5f23-7d91-9015-15433bb64d78 (r2) | r1→r2 | r1 NEEDS-CHANGES (2 release-blockers) → **r2 MERGE-READY** |
-| AGY | adversarial-review-mqh69wa0-bkp0t6 (r1) / adversarial-review-mqh6o06z-wfmlzb (r2) | r1→r2 | r1 NEEDS-CHANGES (1 CRITICAL) → **r2 MERGE-READY** (2 Low folded) |
+| Codex | bvo39rwsi (r1) / 019ed26c-5f23-7d91-9015-15433bb64d78 (r2) | r1→r2 | r1 NEEDS-CHANGES (2 release-blockers) → **r2 MERGE-READY** → r3 NEEDS-CHANGES (1 OQ-D blocker) → **r4 MERGE-READY** |
+| AGY | adversarial-review-mqh69wa0-bkp0t6 (r1) / adversarial-review-mqh6o06z-wfmlzb (r2) | r1→r2 | r1 NEEDS-CHANGES (1 CRITICAL) → **r2 MERGE-READY** → r3 NEEDS-CHANGES (1 OQ-D blocker) → **r4 MERGE-READY** (2 Low folded) |
 | Claude SMR | n/a | r1 | reviewed — route-detect semantics, bootstrapFromFile-not-gated, exit-startup writer guard, gate-race-benign all checked; no new blockers |
 | Copilot | n/a (gh add-reviewer) | r1 | COMMENTED — 5 findings; 1 dup of fixed release-blocker, 4 folded |
 
