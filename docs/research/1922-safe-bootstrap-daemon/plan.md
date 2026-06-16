@@ -1,6 +1,6 @@
 # #1922 M1b — SAFE-BOOTSTRAP daemon work (plan of action)
 
-**Revision:** v1 (DRAFT) — 2026-06-16
+**Revision:** v2 — 2026-06-16 (folds round-1 Claude SMR + AGY findings; Codex pending)
 **Branch:** `research/1922-safe-bootstrap-daemon`
 **Status:** research only — STOP at PLAN-READY; no production code touched.
 
@@ -18,9 +18,53 @@
 
 ## 1. Status
 
-DRAFT v1. Re-uses the converged #1879 §5 SAFE-BOOTSTRAP design. Scopes to the
-four daemon-side deferred items (M1b). No code written. Awaiting 3-way hostile
-plan review (Codex + AGY + Claude SMR).
+v2. Re-uses the converged #1879 §5 SAFE-BOOTSTRAP design. Scopes to the four
+daemon-side deferred items (M1b). No code written. Round-1 verdicts: **Claude
+SMR PLAN-NEEDS-CHANGES** (5 findings); **AGY PLAN-NEEDS-CHANGES**
+(`adversarial-review-mqh0nudo-ov2222`, 4 findings — 2 CRITICAL); **Codex
+pending**. v2 folds the SMR+AGY convergence; the changes are recorded in the
+**round-1 changelog** at the end of this section.
+
+### Round-1 changelog (v1 → v2)
+
+- **C1 (AGY F2 CRITICAL + SMR F3): gate takeover ACTIONS, not manager
+  construction.** v1 said "gate the `!d.opts.NoDataplane` block behind
+  `if !bootstrapMode`." That would leave `d.routing`/`d.frr`/`d.networkd`/`d.dp`
+  nil; the apply path nil-guards every one of them, so the first confirmed
+  commit (bootstrap exit) would silently skip all of them → permanently
+  unconfigured. **v2:** managers are instantiated unconditionally at startup;
+  only the *takeover actions* are gated (interface rename, host tunables,
+  boot-time `applyConfig`, dataplane attach, FRR managed-section write, VRRP
+  instance creation). See revised Item 2.
+- **C2 (AGY F3 HIGH + SMR F4): bootstrap exit on SyncApply + explicit cluster
+  short-circuit.** v1 exited bootstrap only on a local confirmed commit, which
+  would strand a cluster secondary that first-boots empty and receives config
+  via `SyncApply`. **v2:** (i) exit bootstrap on ANY successful apply of a
+  non-empty config to the store (local confirmed commit OR `SyncApply`); (ii)
+  the predicate short-circuits to NOT-bootstrap when `clusterMode==true` AND a
+  node-id is present.
+- **C3 (AGY F4 HIGH + SMR F2): marker migration rule fixed.** **v2:** the
+  step-0 marker is **envelope option (a)** (a committed-generation field in the
+  #1917 envelope, integrates with the #1799 retry loop), and a missing field on
+  a DB written by an older build defaults to **committed=true** — an upgraded
+  box with an existing active config can never misclassify into bootstrap.
+- **C4 (SMR F1 + AGY OQ-A: corrupt-DB lifeline ordering decided).** **v2:**
+  on a corrupt/too-new DB (case 4) the daemon does NOT write a new lifeline —
+  fail-closed means touch nothing. Mgmt reachability for repair relies on the
+  networkd files + lifeline record persisted by a PRIOR successful boot (which
+  survive `networkctl reload` and restarts, invariant 2). A never-booted box
+  with a corrupt day-0-seeded DB has no prior mgmt identity to preserve and
+  falls back to the hypervisor/physical console — honest, bounded residual.
+- **C5 (SMR F5: two-PR split adopted as the recommended sequencing).** PR-1 =
+  Item 1 (commit-confirmed service-mode fixes + serialization test),
+  independently valuable and low-churn; PR-2 = Items 2-4 (bootstrap mode +
+  lifeline + protected-set). See §5 sequencing note + OQ-G.
+- **C6 (SMR F3: startup subsystem gate matrix).** Added as a named
+  /engineer-time deliverable (revised Item 2) — the highest-churn part of the
+  diff.
+- **OQ-D resolution (both reviewers): auto-exempt the protected interface from
+  dataplane claim while still allowing mgmt-zone policy** (not strict
+  refuse-zone-assignment). Recorded under Item 4 / OQ-D.
 
 ## 2. Issue framing
 
@@ -115,6 +159,14 @@ single job is to be provably no-op for those.
 > `pkg/dataplane/compiler_iface.go` (protected-set exemption), `pkg/config/`
 > (one schema leaf), and the relevant docs/tests. Zero dataplane-loop code.
 
+**Recommended sequencing — two PRs (C5).** **PR-1 = Item 1** (commit-confirmed
+service-mode fixes + the rollback-vs-concurrent-commit serialization test):
+independently valuable, hardens an existing shipped feature, no startup-gating
+churn, low risk. **PR-2 = Items 2-4** (bootstrap mode + five-case predicate +
+PCI-keyed lifeline + protected-set): the cohesive larger change with the
+high-churn startup gate. Bisectable; lets the risky gate land separately; gives
+an early operator win. Each PR carries its own named must-pass tests (§9).
+
 ### Item 1 — commit-confirmed service-mode fixes
 
 **1a. Daemon-owned rollback transaction (Codex #1879 r2-1, GROUNDED).**
@@ -181,16 +233,21 @@ store to distinguish "never committed" from "operator committed empty".
 
 ### Item 2 — explicit bootstrap mode + five-case boot predicate
 
-**Step-0 marker (prerequisite).** The store gains a way to distinguish
-*never-successfully-committed* from *operator-committed-empty*. Today
-`ActiveConfig()` returns `s.compiled` (nil when nothing loaded) and an absent DB
-(`ReadActive` → `tree == nil`) returns nil from `Load` (start-fresh). There is
-no committed-generation marker. /engineer picks the representation —
-candidates: (a) a committed-generation counter persisted in the DB envelope
-(0 = never committed), (b) presence/absence of an active record distinct from
-"empty active record". **Constraint:** the representation MUST preserve the
-#1799 persist-failure semantics (`persistDegraded` + retry) and the #1917
-envelope format (do not break `ErrConfigDBUnreadable` detection).
+**Step-0 marker (prerequisite) — DECIDED in v2 (C3).** The store distinguishes
+*never-successfully-committed* from *operator-committed-empty* via **envelope
+option (a): a committed-generation field in the #1917 config-DB envelope**
+(0 / absent = never committed; ≥1 = committed). This integrates cleanly with the
+#1799 persist-degraded retry loop (the field rides the same envelope write) and
+does not disturb `ErrConfigDBUnreadable` detection (it is a header field, not a
+new file). **Migration rule (C3, mandatory):** a DB written by an older build
+lacks the field; the new reader MUST default a missing field on an otherwise
+valid envelope to **committed=true** — an upgraded box with an existing active
+config can NEVER misclassify into bootstrap. (Belt-and-suspenders: any persisted
+active tree, empty or not, also reads as committed; the never-committed marker is
+forward-only, applied only to DBs this build itself created without a successful
+commit.) Today `ActiveConfig()` returns `s.compiled` (nil when nothing loaded)
+and an absent DB (`ReadActive` → `tree == nil`) returns nil from `Load`
+(start-fresh); there is no marker yet.
 
 **The five-case predicate** (computed once at startup and on
 rollback-to-bootstrap; stable across restarts). Each case maps to exactly one of
@@ -201,19 +258,46 @@ rollback-to-bootstrap; stable across restarts). Each case maps to exactly one of
 | 1 | **Fresh / no config**: absent `.configdb` (`ReadActive` → nil) AND no readable `xpf.conf` (or `bootstrapFromFile` import fails) | **bootstrap** | renames all NICs, DHCP fxp0, takes over interfaces on empty config | bootstrap mode: no rename (except lifeline path), no takeover, fxp0 DHCP, control plane up |
 | 2 | **Day-0 / preseeded valid**: absent DB but `xpf.conf` imports cleanly (every existing test/cluster deploy; the day-0 image path) | **normal** | bootstrap from file → full takeover | **unchanged** (zero regression — this is the no-op case) |
 | 3 | **Valid active.json**: DB present, `Load` succeeds, `ActiveConfig() != nil` | **normal** | loads from DB, full takeover | **unchanged** |
-| 4 | **Corrupt / too-new active.json**: `Load` → `ErrConfigDBUnreadable` (#1917 D1, MERGED) | **fail-safe** (fatal-on-parse) | **already** fatal: refuse to start (`daemon_run.go:209`) | **unchanged fatal**, BUT the lifeline `.network` (Item 3) is written/preserved *before* the fatal exit OR the predicate runs before the fatal decision so mgmt stays reachable for repair. (OQ-A: order of lifeline-write vs fatal exit.) |
-| 5 | **Degraded / never-confirmed**: never-successfully-committed (incl. the post-rollback-from-first-commit state from Item 1b), OR operator-committed-empty | never-committed → **bootstrap**; committed-empty → **normal** (operator meant it; protected set still shields mgmt) | committed-empty and never-committed are indistinguishable today | the step-0 marker disambiguates |
+| 4 | **Corrupt / too-new active.json**: `Load` → `ErrConfigDBUnreadable` (#1917 D1, MERGED) | **fail-safe** (fatal-on-parse) | **already** fatal: refuse to start (`daemon_run.go:209`) | **unchanged fatal — touch nothing** (C4). No NEW lifeline is written (fail-closed). Mgmt reachability for repair relies on the networkd files + lifeline record persisted by a PRIOR successful boot (invariant 2). A never-booted box with a corrupt day-0 DB has no prior mgmt identity → hypervisor/physical console (bounded residual). |
+| 5 | **Degraded / never-confirmed**: never-successfully-committed (incl. the post-rollback-from-first-commit state from Item 1b), OR operator-committed-empty | never-committed → **bootstrap**; committed-empty → **normal** (operator meant it; protected set still shields mgmt) | committed-empty and never-committed are indistinguishable today | the step-0 marker (C3) disambiguates |
+
+**Cluster short-circuit (C2, mandatory):** the predicate yields **NOT-bootstrap**
+whenever `clusterMode==true` AND a node-id is present, regardless of the five
+cases above. A cluster node always boots from its own persisted DB or preseeded
+`xpf.conf` + node-id (case 2/3); this is belt-and-suspenders so a transient
+read hiccup can never put a cluster member into bootstrap mode and break failover.
 
 **Bootstrap mode, defined** (new — does not exist today). Active iff the
 predicate yields bootstrap. In bootstrap mode the daemon: runs gRPC/REST/CLI as
 normal; performs **NO** PCI rename beyond the lifeline-gated path (Item 3),
 **NO** link down/up cycles, **NO** networkd takeover writes except the lifeline
 `.network`, **NO** AF_XDP attach / dataplane load, **NO** FRR managed-section
-writes. Concretely this gates the `!d.opts.NoDataplane` block at
-`daemon_run.go:231-307` (and the dataplane/FRR/VRRP init that follows) behind
-`if !bootstrapMode`. Exit from bootstrap mode happens exactly once, at the first
-successful confirmed commit (Item 1 / 4-gate below), which then runs the full
-normal startup reconcile.
+writes, **NO** boot-time `applyConfig`, **NO** VRRP instance creation.
+
+**Gate ACTIONS, not construction (C1, CRITICAL).** v1's "gate the
+`!d.opts.NoDataplane` block at `daemon_run.go:231-307` behind `if !bootstrapMode`"
+was WRONG: the apply path nil-guards every manager (`d.routing`/`d.frr`/
+`d.networkd`/`d.dp`), so leaving them nil would make the first confirmed commit
+(bootstrap exit) silently skip all of them → permanently unconfigured. **v2: all
+managers are constructed unconditionally at startup; only the takeover ACTIONS
+are suppressed in bootstrap mode.** The /engineer deliverable (C6) is a **startup
+subsystem gate matrix** classifying each subsystem as construct-always /
+arm-only-when-not-bootstrap:
+
+| Subsystem | Construct at boot? | Armed/actuated in bootstrap? |
+|---|---|---|
+| gRPC / REST / CLI control surfaces | yes | **yes** (management must work) |
+| routing / FRR / networkd / dataplane managers | yes | **no** (no managed-section / takeover writes / AF_XDP attach) |
+| `enumerateAndRenameInterfaces` rename loop | n/a | **no** (except the lifeline-gated path, Item 3) |
+| host tunables / RSS indirection | n/a | **no** |
+| boot-time `applyConfig` | n/a | **no** |
+| VRRP / cluster takeover | constructed if clusterMode (but clusterMode ⇒ NOT bootstrap per C2) | n/a in bootstrap |
+
+**Exit from bootstrap mode (C2):** happens on the FIRST successful apply of a
+non-empty config to the store — a local confirmed commit (Item 1 / 4-gate) OR a
+cluster `SyncApply` from the primary — which then runs the full normal startup
+reconcile (rename, networkd, dataplane, FRR). Exit is one-way for the daemon's
+lifetime.
 
 *Path option for predicate placement:* (A) compute in `daemon_run.go` right
 after `Load()` + `bootstrapFromFile()` resolve, using `ActiveConfig() != nil`
@@ -320,11 +404,15 @@ keeps the compiler a pure function of (config, protected-set input) and keeps
 file/sysfs I/O (PCI→name resolution) in the daemon, matching the existing
 pattern where the daemon assembles inputs and the compiler is deterministic.
 
-**OQ-D (Item 4 semantics, #1879 OQ-1):** should `system management-interface`
-*refuse* zone assignment of the protected interface at commit-check (strict
-Junos fxp0 fidelity — out-of-band, not zone-assignable), or auto-exempt it from
-dataplane claim while allowing mgmt-zone policy? And is the union too wide for a
-box that legitimately repurposes fxp0 as a revenue port?
+**OQ-D — RESOLVED in v2 (both reviewers):** **auto-exempt** the protected
+interface from dataplane claim while still allowing normal mgmt-zone policy to
+apply. (Not strict Junos refuse-zone-assignment — that is more rigid than xpf
+needs and breaks an operator who wants mgmt-zone firewall policy on fxp0.)
+Residual question for review: is the protected-set union too wide for a box that
+legitimately repurposes fxp0 as a revenue port? Proposed mitigation: the
+`system management-interface` leaf, when explicitly set to a non-fxp0 NIC,
+*narrows* (b) so fxp0 is no longer auto-protected — i.e. the operator can move
+the protection off fxp0. Confirm this is the right escape valve.
 
 ## 6. Operator-facing surface preservation
 
@@ -361,10 +449,16 @@ box that legitimately repurposes fxp0 as a revenue port?
    `applySem` (the Item-1a fix); a dedicated serialization test enforces it.
 7. **No new hot-path code:** entirely control-plane/startup work; zero
    dataplane-loop changes.
-8. **Cluster behavior:** clusters run with `clusterMode=true` and a committed
-   config (case 2/3) → never enter bootstrap mode. Verify the predicate cannot
-   misclassify a secondary that boots before its first config sync (it boots from
-   its own persisted DB or preseeded `xpf.conf` — case 2/3). **OQ-E.**
+8. **Cluster behavior:** `clusterMode==true` + node-id present ⇒ NOT-bootstrap
+   by explicit predicate short-circuit (C2), so a cluster member can never enter
+   bootstrap mode. Bootstrap exit also fires on `SyncApply` (C2) as a second
+   guard. `make test-failover` enforces no failover regression.
+9. **Manager construction is unconditional (C1):** bootstrap mode suppresses
+   takeover ACTIONS only; `d.routing`/`d.frr`/`d.networkd`/`d.dp` are never nil,
+   so the bootstrap-exit reconcile wires every subsystem.
+10. **Marker is forward-only (C3):** a pre-M1b DB (no committed field) reads as
+    committed=true; only DBs this build creates without a successful commit ever
+    read never-committed — no upgrade can misclassify into bootstrap.
 
 ## 8. Risk assessment
 
@@ -389,7 +483,13 @@ box that legitimately repurposes fxp0 as a revenue port?
   (e) PCI-keyed lifeline resolution across a simulated rename
   (recorded PCI → new name); (f) protected-set never marks fxp0/lifeline
   `Unmanaged` even with empty/absent/rolled-back config (compileZones test);
-  (g) `system management-interface` schema test (if Item 3B lands).
+  (g) `system management-interface` schema test (if Item 3B lands);
+  (h) **marker migration (C3):** a pre-M1b DB (populated or empty active tree,
+  no committed-generation field) → reads committed=true → NOT bootstrap;
+  (i) **cluster short-circuit (C2):** `clusterMode + node-id` ⇒ NOT bootstrap
+  regardless of DB state, and bootstrap-exit-on-`SyncApply`;
+  (j) **manager-nonnil (C1):** bootstrap-then-exit reconcile actually actuates
+  routing/FRR/networkd/dataplane (managers constructed at boot, never nil).
 - **Named must-pass integration (standalone incus VM):**
   - **T1 rollback-restores-lifeline:** first `commit confirmed 1` with a
     deliberately broken/lockout config in SERVICE mode (no interactive shell), do
@@ -424,32 +524,22 @@ box that legitimately repurposes fxp0 as a revenue port?
 
 ## 11. Open questions for adversarial review
 
-- **OQ-A (lifeline vs fatal ordering, case 4):** when `Load` →
-  `ErrConfigDBUnreadable`, the daemon exits fatal at `daemon_run.go:209` BEFORE
-  the enumerate/lifeline block (:231). For mgmt to stay reachable for repair, the
-  lifeline `.network` must be written/preserved before the fatal exit — but the
-  fail-closed contract says "do nothing, refuse to start." Options: (1) write/
-  preserve the lifeline `.network` then exit fatal; (2) rely on a PREVIOUSLY
-  written lifeline record (from a prior successful boot) so nothing new is written
-  on the corrupt boot; (3) accept that a never-booted box with a corrupt DB has no
-  lifeline (only an upgraded-then-corrupted box does). Which?
+- **OQ-A — RESOLVED (C4):** corrupt-DB boot writes no new lifeline (fail-closed);
+  reachability relies on the prior-boot networkd files + lifeline record; a
+  never-booted corrupt box = console. Residual accepted as bounded.
 - **OQ-B (first-commit gate scope):** any first commit vs only interface-claiming
   first commits. Is the `commit no-confirm` escape hatch itself a foot-gun on a
-  foreign host (operator types it reflexively, locks themselves out)?
+  foreign host (operator types it reflexively, locks themselves out)? *Still open.*
 - **OQ-C (lifeline detection heuristic):** default-route interface as primary
   signal — sufficient for multi-homed / split v4-v6-default / policy-routed mgmt?
   Is "v4 default, else v6 default, else refuse" the right fallback ladder?
-- **OQ-D (protected-set semantics):** refuse zone-assignment of the protected
-  interface at commit-check (strict Junos) vs auto-exempt-from-claim? Is the
-  union (leaf ∪ fxp0 ∪ lifeline) too wide for a box repurposing fxp0?
-- **OQ-E (cluster):** can a cluster secondary that boots before its first config
-  sync misclassify into bootstrap mode and refuse takeover? (Belief: no — it boots
-  from its own persisted DB / preseeded `xpf.conf` = case 2/3 — but this must be
-  proven, not assumed.)
-- **OQ-F (step-0 marker representation):** committed-generation counter in the
-  envelope vs active-record presence/absence. Which survives #1799 persist-degraded
-  and #1917 envelope correctly without a migration hazard for existing DBs?
-- **OQ-G (kill / scope):** is M1b worth shipping as one PR, or should it split
-  (Item 1 commit-confirmed fixes alone are independently valuable and lower-risk;
-  Items 2-4 bootstrap-mode are the larger, riskier change)? Reviewers may
-  recommend a staged split or PLAN-KILL a sub-item.
+  *Still open.*
+- **OQ-D — RESOLVED (v2):** auto-exempt-from-claim (not refuse-zone-assignment);
+  explicit non-fxp0 `system management-interface` narrows the auto-protection off
+  fxp0. Confirm the escape valve.
+- **OQ-E — RESOLVED (C2):** explicit `clusterMode + node-id ⇒ NOT-bootstrap`
+  short-circuit + bootstrap-exit-on-SyncApply; cluster-boot test in §9.
+- **OQ-F — RESOLVED (C3):** envelope option (a) (committed-generation field),
+  missing-field-defaults-committed=true migration rule.
+- **OQ-G — RESOLVED (C5):** ship as two PRs (Item 1; then Items 2-4). Reviewers
+  may still PLAN-KILL a sub-item, but the split is the recommended sequencing.
