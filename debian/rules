@@ -1,0 +1,107 @@
+#!/usr/bin/make -f
+# xpf Debian package rules (increment A of #1917).
+#
+# We deliberately do NOT use dh-golang or dh's auto Go/Cargo build:
+# xpfd embeds the kernel-verified AF_XDP shim (#1864) and the helper
+# is built with a pinned cargo via the project Makefile. Re-deriving
+# the build inside dh would bypass that discipline. So the build step
+# delegates to the project Makefile and the install step copies the
+# freshly built binaries into the dpkg-static staging path.
+#
+# Layout (plan #1917 §6.1 / §6.3c):
+#   /usr/local/share/xpf/staged/{xpfd,xpf-userspace-dp,cli,xpf-day0-config}
+#       dpkg-static staging path. dpkg owns ONLY this path. It never
+#       writes the live /usr/local/sbin symlinks or any runtime
+#       versioned dir. The in-place cut-over mechanism (increment B)
+#       owns /var/lib/xpf/versions/<v>/ and the atomic symlink flip.
+#   The live /usr/local/sbin/{xpfd,cli,...} symlinks are created by
+#   the maintainer scripts on FIRST install only (no running version
+#   to protect). On upgrade dpkg only refreshes the staging path; the
+#   live symlinks are left untouched so a plain apt upgrade never cuts
+#   the dataplane (increment B drives the verified cut explicitly).
+
+export DH_VERBOSE = 1
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+STAGED = /usr/local/share/xpf/staged
+
+%:
+	dh $@
+
+# Build the binary set via the project Makefile so the embedded shim
+# and pinned cargo build are used unchanged. CARGO_TARGET_DIR is left
+# at the project default on purpose: the Makefile's build-userspace-dp
+# installs from userspace-dp/target/release/, and overriding the target
+# dir to a scratch path would install a stale binary.
+#
+# Stage the systemd units into debian/ under the package-canonical
+# names so dh_installsystemd finds them. The unit sources remain in
+# test/incus/ and scripts/image/ (the test env and bake consume the
+# same files); the package re-homes them at /lib/systemd/system.
+#
+# The package-owned xpfd.service gets an ExecStartPre verify-dataplane
+# gate injected (plan §6.2 / §7): the #1864/#1869 kernel-verifier gate
+# must run at EVERY boot, not only once at bake time — a later kernel
+# change or a skipped bake validation must never reach ExecStart with a
+# verifier-failing shim. exit 3 = REJECT aborts the start. We inject it
+# here (rather than editing test/incus/xpfd.service) so the gate ships in
+# the appliance package without changing the dev/test unit source; the
+# binary the gate runs is the live /usr/local/sbin/xpfd symlink.
+override_dh_auto_build:
+	$(MAKE) build build-ctl build-userspace-dp
+	@# Match ExecStart tolerating leading whitespace and spaces around '='
+	@# (systemd accepts those), then HARD-ASSERT the gate landed — a silent
+	@# sed miss (e.g. if the unit source is reformatted) must FAIL the build,
+	@# never ship a package-staged unit that skips the verifier (AGY r2).
+	sed -E '/^[[:space:]]*ExecStart[[:space:]]*=/i ExecStartPre=/usr/local/sbin/xpfd verify-dataplane' \
+	    test/incus/xpfd.service > debian/xpf.xpfd.service
+	grep -q '^ExecStartPre=/usr/local/sbin/xpfd verify-dataplane$$' debian/xpf.xpfd.service || \
+	    { echo "FATAL: ExecStartPre verify-dataplane injection failed (xpfd.service ExecStart line not matched)" >&2; exit 1; }
+	cp scripts/image/xpf-day0-config.service debian/xpf.xpf-day0-config.service
+
+# Nothing to test in the package build itself; the project test suite
+# is run separately. Skip dh's auto test (it would try `go test`).
+override_dh_auto_test:
+
+override_dh_auto_install:
+	install -d debian/xpf$(STAGED)
+	install -m 0755 xpfd              debian/xpf$(STAGED)/xpfd
+	install -m 0755 cli               debian/xpf$(STAGED)/cli
+	install -m 0755 xpf-userspace-dp  debian/xpf$(STAGED)/xpf-userspace-dp
+	install -m 0755 scripts/image/xpf-day0-config \
+	                                  debian/xpf$(STAGED)/xpf-day0-config
+	install -d debian/xpf/etc/needrestart/conf.d
+	install -m 0644 debian/xpf.needrestart \
+	                debian/xpf/etc/needrestart/conf.d/xpf.conf
+
+# Disable the auto-restart-on-upgrade block dh_installsystemd would
+# otherwise append to postinst. A plain `apt upgrade xpf` must NOT
+# cycle xpfd (a full dataplane gap); the verified cut-over is driven
+# explicitly by the increment-B mechanism. --no-stop-on-upgrade is the
+# documented directive (--no-restart-on-upgrade is a deprecated alias).
+# The units are still enabled on install via dh_installsystemd.
+override_dh_installsystemd:
+	dh_installsystemd --no-stop-on-upgrade --name=xpfd
+	dh_installsystemd --no-stop-on-upgrade --name=xpf-day0-config
+
+override_dh_clean:
+	rm -f debian/xpf.xpfd.service debian/xpf.xpf-day0-config.service
+	dh_clean
+
+# xpf is an APPLIANCE package, not a Debian-archive package: it
+# deliberately owns /usr/local (the staged binary set under
+# /usr/local/share/xpf/staged and the live /usr/local/sbin symlinks the
+# maintainer scripts manage) because the appliance image, the systemd
+# units, and the in-place upgrade mechanism all key off /usr/local/sbin.
+# dh_usrlocal enforces the Debian Policy rule that archive packages must
+# not ship FILES under /usr/local; we accept that deviation here and
+# skip it. Removal of the /usr/local dirs/symlinks is handled by our own
+# postrm (symlinks) and is otherwise harmless (shared, admin-owned tree).
+override_dh_usrlocal:
+
+# The staged binaries are stripped by the upstream build already where
+# applicable; do not let dh strip / instrument them further (the Go
+# binaries are static and the Rust binary carries its own settings).
+override_dh_strip:
+
+override_dh_dwz:

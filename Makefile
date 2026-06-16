@@ -286,3 +286,57 @@ loss-cluster-stop:
 
 loss-cluster-restart:
 	$(LOSS_CLUSTER_SETUP) restart $(NODE)
+
+# Build the xpf Debian package (#1917 increment A). Produces ../xpf_*.deb
+# and ../xpf-appliance_*.deb relative to the source tree (dpkg's default
+# parent-dir output), then copies them into dist/deb/.
+#
+# The package build delegates to `make build build-ctl build-userspace-dp`
+# (see debian/rules), so it picks up the embedded #1864 shim and the
+# pinned cargo helper. The changelog version is rewritten from
+# `git describe` here, normalized to a Debian-policy-valid native version
+# (dashes -> dots; a `-` is illegal in a native package version).
+# Debian native versions MUST start with a digit and exclude `-`. The
+# project's git tags are non-numeric (e.g. userspace-forwarding-ok-*),
+# so synthesize 0.0.<commit-count>+g<short-sha>[.dirty] — monotonic in
+# commit count, carries the exact source sha, and is policy-valid.
+DEB_GIT_COUNT ?= $(shell git rev-list --count HEAD 2>/dev/null || echo 0)
+DEB_GIT_SHA   ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+DEB_GIT_DIRTY ?= $(shell git diff --quiet 2>/dev/null || echo .dirty)
+DEB_VERSION ?= 0.0.$(DEB_GIT_COUNT)+g$(DEB_GIT_SHA)$(DEB_GIT_DIRTY)
+DEB_OUT ?= $(CURDIR)/dist/deb
+
+.PHONY: deb
+deb:
+	@echo "==> xpf .deb version: $(DEB_VERSION)"
+	@# Run the whole build inside ONE shell with a trap so the changelog
+	@# version is ALWAYS restored to the committed 0.0.0 and the parent-dir
+	@# build byproducts are ALWAYS removed — even on SIGINT/SIGTERM or a
+	@# failed dpkg-buildpackage. (A backup FILE under debian/ would be
+	@# deleted by dpkg-buildpackage's own clean phase, so re-sed instead.)
+	@# The build version is derived from git at build time, not committed;
+	@# only the top changelog line's version token is rewritten so the rest
+	@# of the entry/trailer stays dpkg-parseable. dpkg-buildpackage writes
+	@# the .deb/.changes/.buildinfo to the PARENT dir (not configurable);
+	@# we keep the canonical copies in dist/deb/ and scrub the parent so it
+	@# never litters the tree above the source dir (a git worktree parent).
+	@# Signal traps re-raise the caught signal after cleanup (trap - SIG;
+	@# kill -SIG $$) so an interrupted build returns the SIGNAL exit status,
+	@# not 0. A bare `trap cleanup INT TERM` with a cleanup that returns 0
+	@# would mask Ctrl-C / CI-kill as success under dash (AGY r2). The EXIT
+	@# trap covers normal completion + dpkg-buildpackage failure (set -e).
+	set -e; \
+	  cleanup() { \
+	    sed -i "1s/^xpf ([^)]*)/xpf (0.0.0)/" debian/changelog; \
+	    rm -f ../xpf_$(DEB_VERSION)_*.deb ../xpf-appliance_$(DEB_VERSION)_*.deb \
+	          ../xpf_$(DEB_VERSION)_*.changes ../xpf_$(DEB_VERSION)_*.buildinfo; \
+	  }; \
+	  trap cleanup EXIT; \
+	  trap 'cleanup; trap - INT; kill -INT $$$$' INT; \
+	  trap 'cleanup; trap - TERM; kill -TERM $$$$' TERM; \
+	  sed -i "1s/^xpf ([^)]*)/xpf ($(DEB_VERSION))/" debian/changelog; \
+	  dpkg-buildpackage -us -uc -b --no-sign; \
+	  mkdir -p $(DEB_OUT); \
+	  cp ../xpf_$(DEB_VERSION)_*.deb ../xpf-appliance_$(DEB_VERSION)_*.deb $(DEB_OUT)/
+	@echo "==> packages in $(DEB_OUT):"
+	@ls -1 $(DEB_OUT)/*.deb
