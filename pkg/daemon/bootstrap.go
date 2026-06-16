@@ -403,11 +403,11 @@ func resolveLifelineCurrentName() (string, bool) {
 func protectedInterfaces(mgmtLeaf string) map[string]bool {
 	set := make(map[string]bool)
 	if mgmtLeaf != "" {
+		// An explicit leaf is authoritative. When it is non-fxp0, fxp0 is
+		// NOT added — that is the OQ-D escape valve (fxp0 narrowed off so it
+		// can be repurposed as a revenue port). When it IS fxp0 this adds
+		// fxp0, same as the default branch.
 		set[mgmtLeaf] = true
-		// Explicit non-fxp0 leaf narrows fxp0 off (OQ-D escape valve).
-		if mgmtLeaf == defaultMgmtInterface {
-			set[defaultMgmtInterface] = true
-		}
 	} else {
 		set[defaultMgmtInterface] = true
 	}
@@ -510,15 +510,15 @@ func (d *Daemon) setupBootstrapLifeline() {
 func writeBootstrapLifelineNetwork(lifeline string) bool {
 	path := filepath.Join(linkDir, linkPrefix+"fxp0.network")
 
+	// Snapshot the lifeline's addressing ONCE (Copilot: avoid the duplicate
+	// netlink walk). DHCP-managed or address-less lifelines get a plain DHCP
+	// .network; a statically-addressed one gets an Address=/Gateway= snapshot.
+	v4, v6, gw4, gw6 := interfaceAddrSnapshot(lifeline)
 	var content string
-	if isDHCPManaged(lifeline) || func() bool {
-		v4, v6, _, _ := interfaceAddrSnapshot(lifeline)
-		return len(v4) == 0 && len(v6) == 0
-	}() {
+	if isDHCPManaged(lifeline) || (len(v4) == 0 && len(v6) == 0) {
 		content = "# Managed by xpfd — #1922 bootstrap lifeline (DHCP)\n" +
 			"[Match]\nName=fxp0\n\n[Network]\nDHCP=yes\n\n[DHCPv4]\nUseDNS=yes\nUseRoutes=yes\n"
 	} else {
-		v4, v6, gw4, gw6 := interfaceAddrSnapshot(lifeline)
 		var b strings.Builder
 		b.WriteString("# Managed by xpfd — #1922 bootstrap lifeline (static snapshot)\n")
 		b.WriteString("[Match]\nName=fxp0\n\n[Network]\n")

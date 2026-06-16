@@ -97,9 +97,16 @@ func (d *Daemon) commitAndApply(ctx context.Context, comment string, syncPeer bo
 	// plain commits work normally. The day-0 image path never hits this —
 	// it resolves NOT-bootstrap before any interactive session.
 	if d.inBootstrap() {
-		return nil, fmt.Errorf("first commit on this system must be 'commit confirmed <minutes>': " +
-			"the initial interface takeover can cut off management, so the system rolls back " +
-			"automatically unless you confirm it from a still-reachable session")
+		// The daemon is in bootstrap mode (no interface takeover has been
+		// confirmed yet). A plain commit is refused regardless of whether
+		// this is literally the first commit — bootstrap only exits on a
+		// CONFIRMED non-empty (interface-claiming) commit, so until then any
+		// takeover must go through commit-confirmed (Copilot: message worded
+		// for the mode, not "first commit", since a confirmed-but-empty
+		// commit leaves the daemon in bootstrap).
+		return nil, fmt.Errorf("system is in bootstrap mode: commit the takeover config with " +
+			"'commit confirmed <minutes>' (the interface takeover can cut off management, so the " +
+			"system rolls back automatically unless you confirm it from a still-reachable session)")
 	}
 
 	if err := d.applySem.Acquire(ctx, 1); err != nil {

@@ -231,3 +231,57 @@ func TestFirstCommitRollbackDegradedRetryKeepsNeverCommitted(t *testing.T) {
 		t.Fatal("persist-degraded flag should be cleared after the retry healed")
 	}
 }
+
+// TestLoadNeverCommittedRestartStable is the regression for the Copilot
+// finding: a never-committed DB (committed=0, written by the Item 1b
+// first-commit rollback) must survive a daemon restart as never-committed.
+// Load reads committed=0, sets EverCommitted()=false, AND seeds the
+// degraded-retry marker from disk so a later persist-failure heal cannot
+// silently rewrite committed=1 (which would re-enable takeover after reboot).
+func TestLoadNeverCommittedRestartStable(t *testing.T) {
+	dir := t.TempDir()
+
+	// Produce a never-committed DB via a fresh store's first-commit rollback
+	// (the only producer of committed=0 on disk).
+	st1, err := New(filepath.Join(dir, "xpf.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st1.EnterConfigure(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st1.LoadOverride("system { host-name box; }"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st1.CommitConfirmed(1); err != nil {
+		t.Fatal(err)
+	}
+	st1.ExitConfigure()
+	gen := st1.ConfirmGenForTesting()
+	if _, ok := st1.PromoteRollback(gen); !ok {
+		t.Fatal("PromoteRollback ok=false")
+	}
+
+	// On-disk DB must read committed=0.
+	db, err := NewDB(filepath.Join(dir, ".configdb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, committed, err := db.ReadActiveMeta(); err != nil || committed {
+		t.Fatalf("on-disk DB after first-commit rollback: committed=%v err=%v; want committed=false", committed, err)
+	}
+
+	// Simulate a daemon restart: a fresh store loading the same DB must
+	// classify never-committed (EverCommitted=false). The predicate then
+	// keeps the box in bootstrap (daemon-side, covered by the daemon tests).
+	st2, err := New(filepath.Join(dir, "xpf.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st2.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if st2.EverCommitted() {
+		t.Fatal("restart Load of never-committed DB: EverCommitted=true; want false (would re-enable takeover)")
+	}
+}

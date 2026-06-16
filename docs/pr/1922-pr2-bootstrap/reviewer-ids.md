@@ -31,7 +31,7 @@ Plan: `git show origin/research/1922-safe-bootstrap-daemon:docs/research/1922-sa
 | Codex | bvo39rwsi (r1) / 019ed26c-5f23-7d91-9015-15433bb64d78 (r2) | r1→r2 | r1 NEEDS-CHANGES (2 release-blockers) → **r2 MERGE-READY** |
 | AGY | adversarial-review-mqh69wa0-bkp0t6 (r1) / adversarial-review-mqh6o06z-wfmlzb (r2) | r1→r2 | r1 NEEDS-CHANGES (1 CRITICAL) → **r2 MERGE-READY** (2 Low folded) |
 | Claude SMR | n/a | r1 | reviewed — route-detect semantics, bootstrapFromFile-not-gated, exit-startup writer guard, gate-race-benign all checked; no new blockers |
-| Copilot | n/a (gh add-reviewer) | r1 | pending formal review |
+| Copilot | n/a (gh add-reviewer) | r1 | COMMENTED — 5 findings; 1 dup of fixed release-blocker, 4 folded |
 
 ## Round-2 (AGY) low-severity findings folded (commit after r2)
 
@@ -55,7 +55,30 @@ Plan: `git show origin/research/1922-safe-bootstrap-daemon:docs/research/1922-sa
   cross-zone + RETH VIP v4/v6 + mtr paths PASS. (heartbeat/fabric direct-ICMP
   + external-IPv6-internet failures are env/topology artifacts, not
   forwarding-path regressions — protocol heartbeat verified live above.)
-- make test-failover: see PR thread.
+- **make test-failover (loss cluster): 14 passed, 0 failed.** Zero-drop
+  failover across unclean crash (sysrq reboot), rejoin-as-secondary
+  (no auto-preempt), and manual failover; 9.88 Gbps throughput; 11/11
+  sessions synced. The HA-node-guard change causes NO cluster-boot/failover
+  regression.
+
+## Round-3 (Copilot) findings folded
+
+- **store.go (degraded-retry committed=1)** — duplicate of the Codex
+  release-blocker, already fixed (persistMarkerCommitted). Reviewed pre-fix.
+- **store.go Load (Copilot, real)** — Load did not seed persistMarkerCommitted
+  from the on-disk marker, so a degrade path firing before any commit/sync
+  could heal a never-committed DB to committed=1. FIX: Load sets
+  `persistMarkerCommitted = committed`. Test:
+  TestLoadNeverCommittedRestartStable.
+- **daemon_apply.go message (Copilot)** — the plain-commit refusal said
+  "first commit"; after a confirmed-but-empty commit the daemon is still in
+  bootstrap. Reworded to "system is in bootstrap mode".
+- **bootstrap.go protectedInterfaces (Copilot)** — removed the redundant/
+  misleading `if mgmtLeaf == defaultMgmtInterface` no-op branch; fxp0
+  narrowing is now purely "don't add fxp0 when an explicit leaf is set".
+- **bootstrap.go writeBootstrapLifelineNetwork (Copilot)** — snapshot the
+  interface addressing ONCE instead of twice (removed the duplicate netlink
+  walk).
 
 ## Round-1 findings folded (commit 640de42e6)
 

@@ -197,6 +197,13 @@ func (s *Store) Load() error {
 	// field) reads committed=true (migration rule C3), so an upgrade never
 	// misclassifies an existing active config into bootstrap.
 	s.everCommitted = committed
+	// Seed the degraded-retry marker from the on-disk state too (Copilot
+	// finding): if Load reads a never-committed DB (committed=0) and a later
+	// persist failure triggers the #1799 retry loop BEFORE any commit/sync
+	// resets the marker, the retry must re-write committed=0 — not the
+	// New() default of true, which would silently heal the never-committed
+	// marker into an operator-committed-empty DB and re-enable takeover.
+	s.persistMarkerCommitted = committed
 
 	// Rolling-upgrade tolerance (#1373 / #1525): a node may boot
 	// with `system dataplane-type ebpf` or `... dpdk` persisted
