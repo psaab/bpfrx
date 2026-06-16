@@ -93,11 +93,40 @@ per-path:
   CURRENT `s.active` under `s.mu` on each attempt, clears the flag on
   success, and exits. Successful writes on any commit/sync path also
   clear the flag.
-- **`performAutoRollback` (confirm-timer expiry) — Option B.** The
-  in-memory rollback always proceeds (reverting the running config is
-  the safety property); a persist failure gets the same degraded flag
-  + retry, which replaces the unconfirmed candidate the earlier
-  `CommitConfirmed` left on disk with the rolled-back tree.
+- **`PromoteRollback` / `performAutoRollback` (confirm-timer expiry) —
+  Option B.** The in-memory rollback always proceeds (reverting the
+  running config is the safety property); a persist failure gets the
+  same degraded flag + retry, which replaces the unconfirmed candidate
+  the earlier `CommitConfirmed` left on disk with the rolled-back tree.
+
+### Commit-confirmed timeout rollback ownership (#1922 Item 1a)
+
+The store owns ONLY the store-state promotion primitive
+(`PromoteRollback(gen) (prevCfg, ok)`): under `s.mu` it honors the
+#1817 `confirmGen` staleness guard, promotes `active`/`compiled` to the
+saved pre-confirmed state, persists with the #1799 degrade-not-fail
+semantics, journals `auto_rollback`, and returns the compiled
+pre-confirmed config. It does NOT touch the dataplane.
+
+The DAEMON owns the rollback *transaction*. xpfd registers
+`executeConfirmedRollback` via `SetRollbackExecutor` at daemon init, so
+the confirm timer (which fires on its own goroutine) hands it the
+generation; the executor acquires the apply semaphore FIRST, then calls
+`PromoteRollback` + the full dataplane reconcile inside that one
+critical section. This makes store promotion and dataplane re-apply
+atomic with respect to a concurrent `commit` (which also holds the apply
+semaphore), and — unlike the old interactive-only
+`SetCentralRollbackHandler` callback — wires the rollback in SERVICE
+mode (gRPC/REST/remote-cli) too. When no executor is registered (tests,
+non-daemon embedders) the timer falls back to the self-contained
+`performAutoRollback`, which promotes store state but does not re-apply
+a dataplane it has no handle on.
+
+The `prevCfg == nil` first-commit rollback target (rolling a fresh box's
+first `commit confirmed` back to bootstrap + persisting a
+never-committed marker) is #1922 Item 1b, DEFERRED to PR-2:
+`PromoteRollback` returns `(nil, false)` and leaves that path's current
+behavior unchanged.
 
 Test seams (`test_seams.go`): `SetWriteActiveForTesting` injects
 persistence failures on every persist path;

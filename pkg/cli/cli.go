@@ -281,22 +281,17 @@ func (c *CLI) Run() error {
 	}
 	defer c.rl.Close()
 
-	// Register auto-rollback handler for commit confirmed.
-	// Prefer the daemon's full reconcile (applyConfigFn) so D3,
-	// cluster, VRRP, etc. all re-converge on rollback — matches the
-	// gRPC/HTTP rollback path. Falls back to applyToDataplane if
-	// applyConfigFn is not wired (e.g. CLI spawned outside daemon).
-	c.store.SetCentralRollbackHandler(func(cfg *config.Config) {
-		if c.applyConfigFn != nil {
-			c.applyConfigFn(cfg)
-		} else if c.dp != nil {
-			if err := c.applyToDataplane(cfg); err != nil {
-				fmt.Fprintf(os.Stderr, "\nwarning: auto-rollback dataplane apply failed: %v\n", err)
-			}
-		}
-		c.reloadSyslog(cfg)
-		fmt.Fprintf(os.Stderr, "\ncommit confirmed timed out, configuration has been rolled back\n")
-	})
+	// Commit-confirmed timeout rollback is owned by the daemon now
+	// (#1922 Item 1a): xpfd registers d.executeConfirmedRollback via
+	// store.SetRollbackExecutor at daemon init, which acquires the apply
+	// semaphore then runs store promotion + the full dataplane reconcile
+	// atomically — in ALL modes (gRPC/REST/remote-cli service mode as
+	// well as this interactive in-process shell). The CLI no longer
+	// registers its own rollback dataplane apply (the old
+	// SetCentralRollbackHandler path was interactive-only and non-atomic).
+	// A CLI embedded WITHOUT a daemon (no executor registered) falls back
+	// to the store's self-contained performAutoRollback via the confirm
+	// timer's else-branch, which reverts store state correctly.
 
 	fmt.Println("xpf stateful firewall - Junos-style CLI")
 	fmt.Println("Type '?' for help")

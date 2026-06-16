@@ -188,6 +188,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 		"config", d.opts.ConfigFile,
 		"pid", os.Getpid())
 
+	// Register the daemon-owned commit-confirmed timeout rollback executor
+	// (#1922 Item 1a). Wiring it here — at daemon init, before any commit can
+	// be issued — covers ALL commit-confirmed paths (gRPC/REST/remote-cli
+	// service mode as well as the interactive in-process CLI), not just the
+	// interactive shell. The executor acquires d.applySem then runs store
+	// promotion + dataplane re-apply atomically; see executeConfirmedRollback.
+	d.store.SetRollbackExecutor(d.executeConfirmedRollback)
+
 	// Load persisted configuration from DB, falling back to text config file.
 	//
 	// Fatal-on-parse floor (#1917 increment B, plan §6.4 / D1): a PRESENT

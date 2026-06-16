@@ -1,5 +1,28 @@
 # Action Log
 
+## 2026-06-16 — #1922 PR-1 (Item 1a): commit-confirmed service-mode rollback executor (/engineer)
+- **Timestamp**: 2026-06-16 UTC
+- **Action**: Made the commit-confirmed timeout rollback atomic and
+  service-mode-correct. Added `Store.PromoteRollback(gen) (prevCfg, ok)`
+  — the store-state promotion half only (confirmGen guard #1817 +
+  persist-degrade #1799 preserved verbatim; prevCfg==nil first-commit
+  case is Item 1b, deferred to PR-2, returns (nil,false)). Replaced the
+  interactive-only `centralRollbackFn`/`SetCentralRollbackHandler` apply
+  callback with a daemon-registered `rollbackExecutor`/`SetRollbackExecutor`.
+  The confirm timer now calls the executor (off-lock) when set, else falls
+  back to the self-contained `performAutoRollback`. Daemon owns the
+  transaction via `executeConfirmedRollback`: Acquire(applySem) →
+  PromoteRollback → applyConfigLocked, registered at daemon init
+  (daemon_run.go) so gRPC/REST/remote-cli are covered. CLI rollback
+  registration removed (daemon owns it in all modes). Added daemon
+  serialization tests (rollback vs concurrent commit: maxSeen==1 +
+  store/apply consistency over 50 iters) and store gen-guard /
+  prevCfg==nil tests.
+- **File(s)**: pkg/configstore/store.go, pkg/configstore/test_seams.go,
+  pkg/configstore/store_test.go, pkg/configstore/README.md,
+  pkg/daemon/daemon_apply.go, pkg/daemon/daemon_run.go,
+  pkg/daemon/rollback_serialize_test.go, pkg/cli/cli.go
+
 ## 2026-06-12 — #1879 Path C: appliance images + day-0 config drive (/engineer)
 - **Timestamp**: 2026-06-12 UTC
 - **Action**: Implemented the operator-pinned Path C deliverable on

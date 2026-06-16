@@ -67,11 +67,26 @@ type Store struct {
 	// started (Codex review on PR #1817). Every arm/confirm bumps the
 	// generation; the callback carries the value at arm time and
 	// performAutoRollback rejects mismatches.
-	confirmGen        uint64
-	confirmTimer      *time.Timer
-	confirmPrevTree   *config.ConfigTree   // active tree before confirmed commit
-	confirmPrevCfg    *config.Config       // compiled config before confirmed commit
-	centralRollbackFn func(*config.Config) // callback for dataplane central-apply
+	confirmGen      uint64
+	confirmTimer    *time.Timer
+	confirmPrevTree *config.ConfigTree // active tree before confirmed commit
+	confirmPrevCfg  *config.Config     // compiled config before confirmed commit
+
+	// rollbackExecutor is the daemon-registered transaction that owns
+	// the WHOLE commit-confirmed timeout rollback (#1922 Item 1a). When
+	// set, the auto-rollback timer hands it the confirm generation and
+	// the executor acquires the daemon's apply semaphore FIRST, then
+	// calls PromoteRollback (store-state promotion) + the dataplane
+	// re-apply inside that one critical section. This makes promotion and
+	// re-apply atomic with respect to a concurrent commit (which also
+	// holds applySem), closing the store-vs-kernel split-brain window of
+	// the old centralRollbackFn callback. It also wires the rollback in
+	// SERVICE mode (gRPC/REST/remote-cli), where no interactive CLI.Run
+	// ever registered the old callback. When nil (tests, non-daemon
+	// embedders such as the standalone `cli` binary) the timer falls back
+	// to performAutoRollback, which stays self-contained and correct for
+	// that path.
+	rollbackExecutor func(gen uint64)
 
 	// Exclusive configuration mode
 	exclusiveHolder string // who holds exclusive lock (empty = unlocked)
@@ -1035,11 +1050,18 @@ func (s *Store) CommitWithDescription(description string) (*config.Config, error
 	return compiled, nil
 }
 
-// SetCentralRollbackHandler registers a callback for central-rollback dataplane re-apply.
-func (s *Store) SetCentralRollbackHandler(fn func(*config.Config)) {
+// SetRollbackExecutor registers the daemon's commit-confirmed timeout
+// rollback transaction (#1922 Item 1a). The executor is invoked (on the
+// timer's own goroutine, never under s.mu) with the confirm generation
+// that armed the timer. It MUST acquire the daemon apply semaphore
+// first, then call PromoteRollback(gen) + re-apply the returned config,
+// so store promotion and dataplane re-apply are atomic under the same
+// lock that serializes commits. Registering nil disables the executor
+// and reverts to the self-contained performAutoRollback fallback.
+func (s *Store) SetRollbackExecutor(fn func(gen uint64)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.centralRollbackFn = fn
+	s.rollbackExecutor = fn
 }
 
 // CommitConfirmed validates, compiles, and applies the candidate with an
@@ -1123,7 +1145,22 @@ func (s *Store) CommitConfirmed(minutes int) (*config.Config, error) {
 	s.confirmGen++
 	gen := s.confirmGen
 	s.confirmTimer = time.AfterFunc(time.Duration(minutes)*time.Minute, func() {
-		s.performAutoRollback(gen)
+		// #1922 Item 1a: prefer the daemon-owned rollback transaction so
+		// store promotion + dataplane re-apply run atomically under the
+		// apply semaphore (and so service-mode commit-confirmed timeouts
+		// re-apply the dataplane at all). The timer fires on its own
+		// goroutine; read the executor under s.mu but invoke it WITHOUT
+		// holding s.mu (it acquires applySem then re-enters the store via
+		// PromoteRollback). Fall back to the self-contained
+		// performAutoRollback for tests / non-daemon embedders.
+		s.mu.Lock()
+		exec := s.rollbackExecutor
+		s.mu.Unlock()
+		if exec != nil {
+			exec(gen)
+		} else {
+			s.performAutoRollback(gen)
+		}
 	})
 
 	slog.Info("commit confirmed started", "timeout_minutes", minutes)
@@ -1156,23 +1193,41 @@ func (s *Store) IsConfirmPending() bool {
 	return s.confirmTimer != nil
 }
 
-// performAutoRollback reverts the active config to the saved
-// pre-confirmed state. gen must be the confirmGen captured when the
-// calling timer was armed: a mismatch means this callback was
-// superseded (nested CommitConfirmed re-armed, or ConfirmCommit
-// confirmed) after it fired but before it acquired s.mu, and rolling
-// back would revert a NEWER commit to an older tree (Codex review on
-// PR #1817).
-func (s *Store) performAutoRollback(gen uint64) {
+// PromoteRollback performs ONLY the store-state half of a commit-confirmed
+// timeout rollback, atomically under s.mu, and returns the compiled
+// pre-confirmed config so the caller can re-apply it to the dataplane
+// (#1922 Item 1a, Path Option B). The store is the single owner of the
+// promotion primitive; the daemon's rollback executor holds the apply
+// semaphore around this call + its own re-apply so promotion and re-apply
+// are one critical section relative to a concurrent commit.
+//
+// gen must be the confirmGen captured when the calling timer was armed.
+// A mismatch means the callback was superseded (nested CommitConfirmed
+// re-armed, or ConfirmCommit confirmed) after it fired but before it took
+// s.mu; rolling back would revert a NEWER commit to an older tree (Codex
+// review on PR #1817). On mismatch this returns (nil, false) and mutates
+// nothing.
+//
+// The first-commit prevCfg==nil case (confirmPrevTree==nil, i.e. the
+// confirmed commit's rollback target is the empty pre-config tree)
+// returns (nil, false) and is left UNCHANGED here — that is #1922 Item 1b
+// (PR-2: roll back to bootstrap + persist the never-committed marker
+// instead of writing an empty committed tree). The #1817 confirmGen guard
+// and #1799 persist-failure semantics are preserved verbatim.
+func (s *Store) PromoteRollback(gen uint64) (prevCfg *config.Config, ok bool) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	if gen != s.confirmGen {
-		s.mu.Unlock()
-		return
+		return nil, false
 	}
 	if s.confirmPrevTree == nil {
-		s.mu.Unlock()
-		return
+		// #1922 Item 1b (PR-2): first-commit rollback target — roll back
+		// to bootstrap + persist the never-committed marker. Until PR-2
+		// this path keeps its current behavior (no store promotion, no
+		// dataplane re-apply): the confirmed first-commit's state stays
+		// in place. DEFERRED.
+		return nil, false
 	}
 
 	s.active = s.confirmPrevTree
@@ -1184,7 +1239,7 @@ func (s *Store) performAutoRollback(gen uint64) {
 
 	s.confirmTimer = nil
 	s.confirmPrevTree = nil
-	prevCfg := s.confirmPrevCfg
+	prevCfg = s.confirmPrevCfg
 	s.confirmPrevCfg = nil
 
 	// Persist reverted config to disk. Option B (#1799): the rollback
@@ -1206,15 +1261,21 @@ func (s *Store) performAutoRollback(gen uint64) {
 		ConfigHash: journalConfigHash(s.active),
 	})
 
-	fn := s.centralRollbackFn
-	s.mu.Unlock()
+	return prevCfg, true
+}
 
-	slog.Warn("commit confirmed timed out, configuration rolled back")
-
-	// Call dataplane re-apply outside the lock
-	if fn != nil && prevCfg != nil {
-		fn(prevCfg)
+// performAutoRollback is the self-contained fallback rollback used when no
+// daemon rollback executor is registered (tests / non-daemon embedders).
+// It promotes store state via PromoteRollback (the single promotion
+// primitive); it does NOT re-apply the dataplane — a non-daemon embedder
+// has no dataplane to re-apply, and the daemon path goes through
+// SetRollbackExecutor + executeConfirmedRollback instead (#1922 Item 1a).
+// gen must be the confirmGen captured when the calling timer was armed.
+func (s *Store) performAutoRollback(gen uint64) {
+	if _, ok := s.PromoteRollback(gen); !ok {
+		return
 	}
+	slog.Warn("commit confirmed timed out, configuration rolled back")
 }
 
 // Rollback reverts the candidate to a previous configuration.
