@@ -67,7 +67,7 @@ source is touched. Surface:
 | `.deb` repo build tooling | NEW | `scripts/dist/` (repo builder + signer) |
 | `install.sh` | NEW | `scripts/dist/install.sh` (or `dist/install.sh` template) |
 | Public key (pinned) | NEW (placeholder until OQ-2) | `scripts/dist/xpf-image.pub` (minisign, image+install.sh) + `scripts/dist/xpf-archive-keyring.asc` (PGP, apt) |
-| Packaged archive keyring (r3 NIT-2) | NEW (one `debian/install` line, no postinst logic) | ships `xpf-archive-keyring.asc` to `/etc/apt/keyrings/` so existing hosts get rotated keys via `apt upgrade` |
+| Packaged archive keyring (r3 NIT-2) | NEW (one `debian/xpf.install` line, no postinst logic) | ships `xpf-archive-keyring.asc` to `/etc/apt/keyrings/` so existing hosts get rotated keys via `apt upgrade` |
 | Makefile | extend | `dist-sign`, `dist-repo`, `dist-publish` targets |
 | Docs | extend / NEW | `docs/install-images.md`, NEW `docs/distribution.md` |
 | CI/release (optional) | NEW (deferrable) | `.github/workflows/release.yml` |
@@ -374,7 +374,7 @@ package-owned conffile at `/etc/apt/keyrings/xpf-archive-keyring.asc` (in the
 `xpf` package). During a dual-sign rotation window a normal `apt upgrade`
 delivers the new key to existing hosts BEFORE the old key is retired — the
 standard apt-keyring-in-package pattern. (This is the one place #1924 touches
-`debian/` — a packaged keyring file + its `debian/install` line; no postinst
+`debian/` — a packaged keyring file + its `debian/xpf.install` line; no postinst
 logic. It is in scope because without it rotation is a fleet lockout.)
 5. Print next steps (day-0 config, `cli`, mgmt reachability caveat — the
    interface-takeover warning from #1879 is RESTATED here because a bare-metal
@@ -425,7 +425,7 @@ obligations here are DOCUMENTATION:
   §5.4) + the operator runbook (install.sh Tier A/B, the manual apt steps, the
   image verify steps, the out-of-band pubkey source).
 - Extend `docs/install-images.md`: replace "copy files by hand" with "fetch +
-  verify from `XPF_DIST_BASE_URL`"; document the per-version
+  verify from `XPF_IMAGE_BASE_URL`"; document the per-version
   `xpf-<ver>.SHA256SUMS.minisig`.
 
 ### 5.6 Freshness / anti-rollback (r2 — resolves Codex-4)
@@ -643,7 +643,7 @@ the r2 restructuring introduced + the rotation lockout.
 | N3 — apt backend self-contradiction (flat-default vs §8/§11 "use reprepro") | Codex-3, SMR-N3 | §8 R3 + §11 summary rewritten to flat-default (`apt-ftparchive`), reprepro opt-in; Inc-2 wording fixed. |
 | N4 — GitHub Releases listed as a full hosting target but can't serve dists/pool | Codex-4, SMR-N4 | §3: TWO base URLs — `XPF_IMAGE_BASE_URL` (GH Releases OK) vs `XPF_APT_BASE_URL` (directory host required); §9 OQ-1 + all functional refs split. |
 | N5 — "fresh Debian/Ubuntu host" overpromise (kernel ≥6.18 floor) | Codex-5, SMR-N5 | §3 + §5.4: install.sh PREFLIGHT refuses kernel <6.18 / non-amd64 / no-networkd with a clear message; image stays the turnkey path. |
-| NIT-2 — key rotation strands existing hosts (inline-only keyring) | AGY-NIT-2, SMR (elevated) | §5.4 + §2 + §11: archive keyring ALSO ships in the package payload (`/etc/apt/keyrings/`), so `apt upgrade` delivers rotated keys during the dual-sign window. One `debian/install` line, no postinst logic. |
+| NIT-2 — key rotation strands existing hosts (inline-only keyring) | AGY-NIT-2, SMR (elevated) | §5.4 + §2 + §11: archive keyring ALSO ships in the package payload (`/etc/apt/keyrings/`), so `apt upgrade` delivers rotated keys during the dual-sign window. One `debian/xpf.install` line, no postinst logic. |
 | NIT-1 — Valid-Until vs manual signing expiry deadlock | AGY-NIT-1, SMR | §5.6: long default `Valid-Until` (1y, `XPF_APT_VALID_DAYS`) for manual cadence; short window requires an automated re-sign job. |
 | NIT-3 — monotonic freshness watermark has no storage | AGY-NIT-3, SMR | §5.6: watermark at `${XDG_STATE_HOME}/xpf/image-watermark.json`; documented best-effort for stateless/multi-operator CLI. |
 | Nit — §6 "fails at sha256sum -c" stale vs parsed verifier | Codex nit | §6 test 1 reworded to the parsed-hash comparison. |
