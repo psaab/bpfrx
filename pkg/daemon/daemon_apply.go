@@ -166,17 +166,30 @@ func (d *Daemon) commitConfirmedAndApply(ctx context.Context, minutes int, syncP
 // because no interactive CLI.Run had registered the callback.
 //
 // Lock order is applySem -> s.mu (matches commitAndApply / syncAndApply):
-// PromoteRollback takes and releases s.mu internally while applySem is
-// held, and applyConfigLocked never takes s.mu, so there is no inversion.
+// every store call made while applySem is held (PromoteRollback, and the
+// store calls inside applyConfigLocked such as SetArchiveConfig) takes and
+// releases s.mu internally — applySem is always acquired FIRST and s.mu is
+// never held across an applySem acquisition, so there is no inversion.
 func (d *Daemon) executeConfirmedRollback(gen uint64) {
 	_ = d.applySem.Acquire(context.Background(), 1)
 	defer d.applySem.Release(1)
 
 	prevCfg, ok := d.store.PromoteRollback(gen)
 	if !ok {
-		// Superseded (nested CommitConfirmed / ConfirmCommit) or the
-		// first-commit prevCfg==nil case (#1922 Item 1b, PR-2). Nothing
-		// to re-apply.
+		// Superseded (nested CommitConfirmed / ConfirmCommit) or no
+		// pending rollback target — nothing happened, nothing to apply.
+		return
+	}
+	if prevCfg == nil {
+		// #1922 Item 1b (PR-2): first commit confirmed on a fresh store.
+		// The store reverted to the empty tree but there is no compiled
+		// pre-config to re-apply (a fresh store has compiled==nil at arm
+		// time). Match the prior behavior — store reverts, dataplane is
+		// NOT re-applied with a nil config (which would panic in
+		// applyConfigLocked). Rolling the first commit back to bootstrap
+		// is DEFERRED to PR-2.
+		slog.Warn("commit confirmed (first commit) timed out, store reverted to empty config; " +
+			"dataplane re-apply to bootstrap is deferred (#1922 Item 1b)")
 		return
 	}
 	if err := d.applyConfigLocked(prevCfg); err != nil {

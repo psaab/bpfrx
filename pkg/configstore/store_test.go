@@ -577,19 +577,22 @@ func TestPromoteRollbackGenGuardAndFirstCommit(t *testing.T) {
 		}
 	})
 
-	t.Run("first-commit prevCfg==nil early-return (Item 1b deferred)", func(t *testing.T) {
+	t.Run("first-commit returns (nil,true): store reverts, no compiled to apply", func(t *testing.T) {
 		s := newTestStore(t)
 		if err := s.EnterConfigure(); err != nil {
 			t.Fatal(err)
 		}
-		// FIRST commit confirmed on a fresh store: the rollback target is
-		// the empty pre-config tree, so confirmPrevTree is non-nil but
-		// confirmPrevCfg compiles to an empty config. The Item 1a contract
-		// is: when confirmPrevTree is the empty baseline, PromoteRollback
-		// still promotes (it is a real prior tree). The genuinely-nil
-		// target case is exercised by a confirmed-then-rolled store: after
-		// the first PromoteRollback clears confirmPrevTree, a subsequent
-		// call returns (nil,false). Validate that early-return path here.
+		// FIRST commit confirmed on a fresh store. The rollback target
+		// tree (confirmPrevTree) is the empty pre-config tree — NON-nil —
+		// but the compiled config recorded at arm time is nil (a fresh
+		// store has active=&ConfigTree{} but compiled=nil). PromoteRollback
+		// must therefore promote the store back to the empty tree and
+		// return (nil, TRUE) — NOT (nil,false). The daemon executor's
+		// prevCfg==nil guard then skips the dataplane re-apply (which would
+		// panic on a nil config). Re-applying that first-commit-to-bootstrap
+		// case is #1922 Item 1b, DEFERRED to PR-2. (Codex r1 Critical: the
+		// old guard keyed on confirmPrevTree==nil, which is never true for a
+		// fresh store, so the nil compiled would reach applyConfigLocked.)
 		if err := s.SetFromInput("system host-name First"); err != nil {
 			t.Fatal(err)
 		}
@@ -597,17 +600,21 @@ func TestPromoteRollbackGenGuardAndFirstCommit(t *testing.T) {
 			t.Fatal(err)
 		}
 		gen := s.ConfirmGenForTesting()
-		// First rollback reverts to the empty baseline tree.
-		if _, ok := s.PromoteRollback(gen); !ok {
+
+		prevCfg, ok := s.PromoteRollback(gen)
+		if !ok {
 			t.Fatalf("first-commit PromoteRollback should promote the empty baseline, got ok=false")
+		}
+		if prevCfg != nil {
+			t.Fatalf("first-commit PromoteRollback prevCfg = %v, want nil (fresh store has no compiled config)", prevCfg)
 		}
 		if got := s.ActiveConfig(); got != nil && got.System.HostName != "" {
 			t.Fatalf("after first-commit rollback active host-name = %q, want empty", got.System.HostName)
 		}
-		// With confirmPrevTree now nil, PromoteRollback hits the
-		// prevCfg==nil early-return (Item 1b deferred) and is a no-op.
+
+		// With confirmPrevTree now cleared, a second call is a no-op.
 		if cfg, ok := s.PromoteRollback(gen); ok || cfg != nil {
-			t.Fatalf("prevCfg==nil PromoteRollback = (%v,%v), want (nil,false)", cfg, ok)
+			t.Fatalf("double PromoteRollback after first-commit = (%v,%v), want (nil,false)", cfg, ok)
 		}
 	})
 }

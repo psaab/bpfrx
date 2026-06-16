@@ -1145,22 +1145,7 @@ func (s *Store) CommitConfirmed(minutes int) (*config.Config, error) {
 	s.confirmGen++
 	gen := s.confirmGen
 	s.confirmTimer = time.AfterFunc(time.Duration(minutes)*time.Minute, func() {
-		// #1922 Item 1a: prefer the daemon-owned rollback transaction so
-		// store promotion + dataplane re-apply run atomically under the
-		// apply semaphore (and so service-mode commit-confirmed timeouts
-		// re-apply the dataplane at all). The timer fires on its own
-		// goroutine; read the executor under s.mu but invoke it WITHOUT
-		// holding s.mu (it acquires applySem then re-enters the store via
-		// PromoteRollback). Fall back to the self-contained
-		// performAutoRollback for tests / non-daemon embedders.
-		s.mu.Lock()
-		exec := s.rollbackExecutor
-		s.mu.Unlock()
-		if exec != nil {
-			exec(gen)
-		} else {
-			s.performAutoRollback(gen)
-		}
+		s.fireConfirmTimer(gen)
 	})
 
 	slog.Info("commit confirmed started", "timeout_minutes", minutes)
@@ -1193,6 +1178,29 @@ func (s *Store) IsConfirmPending() bool {
 	return s.confirmTimer != nil
 }
 
+// fireConfirmTimer is the commit-confirmed auto-rollback timer's expiry
+// dispatch (#1922 Item 1a). It runs on the timer's own goroutine.
+//
+// It prefers the daemon-owned rollback transaction (rollbackExecutor) so
+// store promotion + dataplane re-apply run atomically under the daemon
+// apply semaphore — and so SERVICE-mode (gRPC/REST/remote-cli) timeouts
+// re-apply the dataplane at all, which the old interactive-only callback
+// never did. The executor is read under s.mu but invoked WITHOUT holding
+// s.mu (it acquires applySem then re-enters the store via PromoteRollback;
+// holding s.mu across that would invert the applySem->s.mu lock order).
+// When no executor is registered (tests / non-daemon embedders) it falls
+// back to the self-contained performAutoRollback (store-state only).
+func (s *Store) fireConfirmTimer(gen uint64) {
+	s.mu.Lock()
+	exec := s.rollbackExecutor
+	s.mu.Unlock()
+	if exec != nil {
+		exec(gen)
+	} else {
+		s.performAutoRollback(gen)
+	}
+}
+
 // PromoteRollback performs ONLY the store-state half of a commit-confirmed
 // timeout rollback, atomically under s.mu, and returns the compiled
 // pre-confirmed config so the caller can re-apply it to the dataplane
@@ -1205,15 +1213,24 @@ func (s *Store) IsConfirmPending() bool {
 // A mismatch means the callback was superseded (nested CommitConfirmed
 // re-armed, or ConfirmCommit confirmed) after it fired but before it took
 // s.mu; rolling back would revert a NEWER commit to an older tree (Codex
-// review on PR #1817). On mismatch this returns (nil, false) and mutates
-// nothing.
+// review on PR #1817). On mismatch — or when there is no pending rollback
+// target (confirmPrevTree==nil, e.g. a stale/double timer fire) — this
+// returns (nil, false) and mutates nothing.
 //
-// The first-commit prevCfg==nil case (confirmPrevTree==nil, i.e. the
-// confirmed commit's rollback target is the empty pre-config tree)
-// returns (nil, false) and is left UNCHANGED here — that is #1922 Item 1b
-// (PR-2: roll back to bootstrap + persist the never-committed marker
-// instead of writing an empty committed tree). The #1817 confirmGen guard
-// and #1799 persist-failure semantics are preserved verbatim.
+// IMPORTANT: ok=true means "store state was promoted", NOT "prevCfg is
+// non-nil". On a FIRST commit confirmed (fresh store) the rollback target
+// tree is the empty pre-config tree (confirmPrevTree != nil) but the
+// compiled config recorded at arm time is nil (a fresh store has
+// active=&ConfigTree{} but compiled=nil). PromoteRollback then promotes
+// the store back to the empty tree exactly as the prior performAutoRollback
+// did and returns (nil, true). The caller MUST nil-check prevCfg before
+// applying it to the dataplane — exactly as the old code's
+// `if fn != nil && prevCfg != nil` guard did. Re-applying that
+// first-commit-to-bootstrap case to the dataplane (and not persisting an
+// empty *committed* tree) is #1922 Item 1b, DEFERRED to PR-2; this PR
+// leaves that path's behavior unchanged (store reverts, dataplane is not
+// re-applied). The #1817 confirmGen guard and #1799 persist-failure
+// semantics are preserved verbatim.
 func (s *Store) PromoteRollback(gen uint64) (prevCfg *config.Config, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1222,11 +1239,6 @@ func (s *Store) PromoteRollback(gen uint64) (prevCfg *config.Config, ok bool) {
 		return nil, false
 	}
 	if s.confirmPrevTree == nil {
-		// #1922 Item 1b (PR-2): first-commit rollback target — roll back
-		// to bootstrap + persist the never-committed marker. Until PR-2
-		// this path keeps its current behavior (no store promotion, no
-		// dataplane re-apply): the confirmed first-commit's state stays
-		// in place. DEFERRED.
 		return nil, false
 	}
 
@@ -1239,6 +1251,12 @@ func (s *Store) PromoteRollback(gen uint64) (prevCfg *config.Config, ok bool) {
 
 	s.confirmTimer = nil
 	s.confirmPrevTree = nil
+	// #1922 Item 1b (PR-2): first-commit rollback target. On a fresh-store
+	// FIRST commit confirmed, confirmPrevCfg is nil here, so prevCfg below
+	// is nil and ok is true — the store reverts to the empty tree but the
+	// caller skips the dataplane re-apply (prevCfg==nil guard). Rolling
+	// that case back to bootstrap + persisting a never-committed marker
+	// instead of an empty committed tree is DEFERRED to PR-2.
 	prevCfg = s.confirmPrevCfg
 	s.confirmPrevCfg = nil
 
