@@ -68,3 +68,13 @@ Codex: 5 rounds, each narrowing; final findings were a doc-only Low + two pre-ex
 - Live `xpfd upgrade --rolling` on loss:xpf-userspace-fw0/fw1 + MEASURED client gap.
 - `make test-failover` (mandatory for cluster/VRRP/sync changes).
 - Live validation of the cluster_cli status-text parsers against real output.
+
+## Fix round (commit e7d8840f9 — rejoin wait transient-error tolerance; found by live gate)
+| Reviewer | Task ID | Round | Verdict |
+|---|---|---|---|
+| Codex | task-mqgwf75u-y0a8qx | fix-r1 | (pending) |
+| AGY | adversarial-review-mqgwfh8o-099pvw | fix-r1 | (pending) |
+| Copilot | (formal PR review on push) | fix-r1 | (pending) |
+
+Live re-smoke (resmoke-1933): rolling upgrade end-to-end both nodes + measured gap — (pending).
+Prior live gate (smoke-1933): test-failover 13/0; secondary cut 0-gap/0-retr; rolling aborted before node0 cut on the now-fixed false-negative (PR comment 4721307538).
