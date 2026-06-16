@@ -26,3 +26,11 @@ Record Codex task IDs + AGY job IDs per round so continuations can fetch by id
 ## Round 5 (final confirmation)
 - Codex: task-mqga29vu-0wxirw
 - AGY: adversarial-review-mqga2k1c-glunnk
+
+## Round 5 verdicts
+- Codex: task-mqga29vu-0wxirw -> 3 wording-consistency blockers (fixed v8)
+- AGY: adversarial-review-mqga2k1c-glunnk -> PLAN-READY (+ 2 non-blockers folded)
+- Claude SMR: PLAN-READY (empirically verified envelope fail-closed)
+
+## Round 6 (Codex consistency re-confirm)
+- Codex: task-mqga8cko-fzl6l5
