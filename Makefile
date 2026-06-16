@@ -309,24 +309,27 @@ DEB_OUT ?= $(CURDIR)/dist/deb
 .PHONY: deb
 deb:
 	@echo "==> xpf .deb version: $(DEB_VERSION)"
-	@# Stamp the build version into the (committed-as-0.0.0) changelog,
-	@# build, then RESTORE the version token to 0.0.0 so the tree stays
-	@# clean (the build version is derived from git, not committed). Only
-	@# the top line's version token is rewritten; the rest of the entry and
-	@# trailer stay intact so dpkg can parse it. The restore runs whether
-	@# the build succeeds or fails. (A backup FILE under debian/ would be
+	@# Run the whole build inside ONE shell with a trap so the changelog
+	@# version is ALWAYS restored to the committed 0.0.0 and the parent-dir
+	@# build byproducts are ALWAYS removed — even on SIGINT/SIGTERM or a
+	@# failed dpkg-buildpackage. (A backup FILE under debian/ would be
 	@# deleted by dpkg-buildpackage's own clean phase, so re-sed instead.)
-	sed -i "1s/^xpf ([^)]*)/xpf ($(DEB_VERSION))/" debian/changelog
-	dpkg-buildpackage -us -uc -b --no-sign; rc=$$?; \
-	  sed -i "1s/^xpf ([^)]*)/xpf (0.0.0)/" debian/changelog; \
-	  test $$rc -eq 0 || exit $$rc
-	mkdir -p $(DEB_OUT)
-	cp ../xpf_$(DEB_VERSION)_*.deb ../xpf-appliance_$(DEB_VERSION)_*.deb $(DEB_OUT)/
-	@# dpkg-buildpackage writes the .deb/.changes/.buildinfo to the PARENT
-	@# dir (not configurable). We keep the canonical copies in dist/deb/;
-	@# remove the parent-dir artifacts so they do not litter the tree above
-	@# the source dir (which may be a git worktree parent).
-	rm -f ../xpf_$(DEB_VERSION)_*.deb ../xpf-appliance_$(DEB_VERSION)_*.deb \
-	      ../xpf_$(DEB_VERSION)_*.changes ../xpf_$(DEB_VERSION)_*.buildinfo
+	@# The build version is derived from git at build time, not committed;
+	@# only the top changelog line's version token is rewritten so the rest
+	@# of the entry/trailer stays dpkg-parseable. dpkg-buildpackage writes
+	@# the .deb/.changes/.buildinfo to the PARENT dir (not configurable);
+	@# we keep the canonical copies in dist/deb/ and scrub the parent so it
+	@# never litters the tree above the source dir (a git worktree parent).
+	set -e; \
+	  cleanup() { \
+	    sed -i "1s/^xpf ([^)]*)/xpf (0.0.0)/" debian/changelog; \
+	    rm -f ../xpf_$(DEB_VERSION)_*.deb ../xpf-appliance_$(DEB_VERSION)_*.deb \
+	          ../xpf_$(DEB_VERSION)_*.changes ../xpf_$(DEB_VERSION)_*.buildinfo; \
+	  }; \
+	  trap cleanup EXIT INT TERM; \
+	  sed -i "1s/^xpf ([^)]*)/xpf ($(DEB_VERSION))/" debian/changelog; \
+	  dpkg-buildpackage -us -uc -b --no-sign; \
+	  mkdir -p $(DEB_OUT); \
+	  cp ../xpf_$(DEB_VERSION)_*.deb ../xpf-appliance_$(DEB_VERSION)_*.deb $(DEB_OUT)/
 	@echo "==> packages in $(DEB_OUT):"
 	@ls -1 $(DEB_OUT)/*.deb

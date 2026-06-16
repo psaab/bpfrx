@@ -14,6 +14,16 @@
 # leave the live symlinks untouched: a plain `apt upgrade xpf` only
 # refreshes the staging path and must never cut the dataplane. The
 # verified cut-over is driven explicitly by the increment-B mechanism.
+#
+# ACCEPTED increment-A limitation (plan §6.3a): because the live symlinks
+# in increment A point straight at the staging path, after a plain
+# `apt upgrade xpf` a SUBSEQUENT xpfd restart/reboot starts the new
+# version without the verify-gated cut, and a running old xpfd that
+# respawns its helper would resolve the NEW helper (protocol mismatch).
+# Increment B closes this window structurally (stage->runtime versioned
+# dir + atomic symlink flip behind a verify gate, or versioned ExecStart).
+# Until then the operator-facing guidance is: do not `apt upgrade xpf` a
+# live HA node out-of-band; use the increment-B cut-over.
 
 set -e
 
@@ -28,20 +38,26 @@ case "$1" in
             mkdir -p "$SBIN"
             for b in $BINS; do
                 # First install: point the live path at the staged binary.
-                # Use a relative-free absolute symlink target; ln -sfn so a
-                # pre-existing symlink/dir is replaced atomically.
-                ln -sfn "$STAGED/$b" "$SBIN/$b"
+                # ln -sfnT replaces a pre-existing symlink atomically and,
+                # crucially, FAILS (under set -e) rather than nesting a
+                # symlink INSIDE the target if it happens to be a real
+                # directory — a directory at /usr/local/sbin/xpfd would
+                # otherwise leave the daemon unlaunchable with a "success".
+                ln -sfnT "$STAGED/$b" "$SBIN/$b"
             done
         else
-            # Upgrade: do NOT touch the live symlinks. Only ensure they
-            # exist (e.g. recovering from a partially-set-up state); never
-            # repoint an existing one — repointing while the daemon is up
-            # would let the running xpfd resolve a different-version helper
-            # (the increment-B cut-over owns that, behind a verify gate).
+            # Upgrade: do NOT touch the live symlinks. Only create one that
+            # is COMPLETELY absent (not even a broken symlink); never repoint
+            # an existing OR dangling link. Repointing while the daemon is up
+            # would let the running xpfd resolve a different-version helper,
+            # and stealing a dangling link that increment-B repointed to a
+            # transiently-missing /var/lib/xpf/versions/<v>/ target would
+            # bypass its verify gate. -e alone follows the link (a broken
+            # link reads as absent), so guard with -L too.
             for b in $BINS; do
-                if [ ! -e "$SBIN/$b" ]; then
+                if [ ! -e "$SBIN/$b" ] && [ ! -L "$SBIN/$b" ]; then
                     mkdir -p "$SBIN"
-                    ln -sfn "$STAGED/$b" "$SBIN/$b"
+                    ln -sfnT "$STAGED/$b" "$SBIN/$b"
                 fi
             done
         fi

@@ -9,7 +9,7 @@ Rules-Requires-Root: no
 
 Package: xpf
 Architecture: amd64
-Depends: ${misc:Depends}, adduser
+Depends: ${misc:Depends}
 Description: Junos-style firewall with AF_XDP userspace dataplane
  xpf is a Junos-style stateful firewall that clones Juniper vSRX
  capabilities using native Junos configuration syntax. The runtime
@@ -52,8 +52,16 @@ Depends: ${misc:Depends},
 Description: xpf firewall appliance metapackage
  Pulls in the xpf firewall binary package plus the full runtime
  dependency set (routing, IPsec, DHCP server, time sync, networking
- tooling) that the appliance image installs. This metapackage is what
- the appliance image bake installs to provision a complete firewall.
+ tooling). This is the operator-facing entry point: `apt install
+ xpf-appliance` provisions a complete firewall in one step (e.g. from a
+ hosted apt repo).
+ .
+ NOTE: the appliance image bake (scripts/image/bake.py) installs the
+ runtime dependency set explicitly plus the xpf binary package, rather
+ than this metapackage, so apt does not have to resolve the full
+ dependency closure against a single local .deb during the offline bake.
+ The dependency set here MUST stay in sync with bake.py's
+ RUNTIME_PACKAGES.
  .
  The held/pinned kernel channel and the in-place kernel-upgrade
  mechanism are out of scope for this package and tracked separately.

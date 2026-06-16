@@ -37,6 +37,14 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 
+# Runtime dependency set installed explicitly into the image. This is the
+# same set the xpf-appliance metapackage Depends on (debian/control). The
+# bake installs the runtime packages explicitly + the xpf BINARY package,
+# rather than the metapackage, so apt does not have to resolve the full
+# dependency closure against a single local .deb during the offline bake;
+# the xpf-appliance metapackage is the operator-facing `apt install`
+# entry point (e.g. from a future hosted repo, #1924). Keep this list and
+# the metapackage Depends in debian/control in sync.
 RUNTIME_PACKAGES = [
     "frr", "strongswan", "strongswan-swanctl",
     "kea-dhcp4-server", "kea-dhcp6-server", "chrony",
@@ -302,23 +310,32 @@ def main():
             info("building xpf .deb (xpfd, cli, xpf-userspace-dp -> staged)...")
             run(["make", "-C", ROOT, "deb"])
         # The git-derived version is computed by the Makefile; glob for the
-        # binary package (NOT the xpf-appliance metapackage).
-        debs = sorted(g for g in glob.glob(os.path.join(deb_dir, "xpf_*.deb"))
-                      if "xpf-appliance" not in os.path.basename(g))
+        # binary package (NOT the xpf-appliance metapackage) and pick the
+        # NEWEST by mtime so a stale deb from an earlier (e.g. dirty-tree)
+        # build in dist/deb/ is never selected over the one just built.
+        debs = sorted((g for g in glob.glob(os.path.join(deb_dir, "xpf_*.deb"))
+                       if "xpf-appliance" not in os.path.basename(g)),
+                      key=os.path.getmtime)
         if not debs:
             die(f"no xpf_*.deb in {deb_dir} (run without --skip-build, or run `make deb`)")
         xpf_deb = debs[-1]
         info(f"using package: {xpf_deb}")
-        # build-host pre-gate (best-effort): verify the staged shim against
-        # the build-host kernel before baking it in (#1864). The staged
-        # binary inside the package is byte-identical to ROOT/xpfd.
-        host_xpfd = os.path.join(ROOT, "xpfd")
-        if not os.access(host_xpfd, os.X_OK):
-            die(f"missing {host_xpfd} (make deb should have built it)")
+        # build-host pre-gate (best-effort): verify the embedded shim against
+        # the build-host kernel before baking it in (#1864). Verify the xpfd
+        # that is ACTUALLY IN THE SELECTED .deb (extracted from the staging
+        # path), not ROOT/xpfd — under --skip-build those can diverge (a
+        # stale loose ROOT/xpfd next to a newer packaged binary), and the
+        # one that ships is the packaged one.
+        staged_xpfd = os.path.join(work, "pregate", "usr", "local",
+                                   "share", "xpf", "staged", "xpfd")
+        run(["dpkg-deb", "-x", xpf_deb, os.path.join(work, "pregate")])
+        if not os.access(staged_xpfd, os.X_OK):
+            die(f"package {xpf_deb} does not contain an executable staged xpfd")
         if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode == 0:
-            info(f"build-host pre-gate: xpfd verify-dataplane (host kernel {os.uname().release})...")
+            info(f"build-host pre-gate: packaged xpfd verify-dataplane "
+                 f"(host kernel {os.uname().release})...")
             if subprocess.run(["sudo", "-n", "nice", "-n", "19",
-                               host_xpfd, "verify-dataplane"]).returncode != 0:
+                               staged_xpfd, "verify-dataplane"]).returncode != 0:
                 die("embedded shim REJECTED by the build-host kernel verifier (#1864)")
         else:
             print("NOTE: no passwordless sudo — skipping build-host verify pre-gate "
