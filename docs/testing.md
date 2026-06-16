@@ -1,14 +1,14 @@
 # Testing & Performance Guide
 
-> Deprecation notice (#1373): routine dataplane validation now targets the
-> userspace AF_XDP cluster by default, and omitted runtime configuration now
-> selects userspace. The legacy eBPF dataplane remains available for explicit
-> compatibility and regression coverage during the staged retirement. Later
-> phases own source, loader, build, and CLI removals.
+> Retirement notice (#1373, complete): the eBPF dataplane retirement is
+> done — the Rust AF_XDP userspace dataplane is the only runtime forwarding
+> path, the legacy XDP/TC source was deleted in #1476, and `system
+> dataplane-type ebpf` is hard-rejected at commit and runtime. The eBPF
+> standalone/HA procedures and performance notes below are HISTORICAL: they
+> describe a backend that is no longer selectable and are preserved only as
+> context. For current validation, use the userspace path.
 
-This page still contains legacy eBPF standalone/HA procedures and historical
-performance notes. Treat them as regression context unless a workstream
-explicitly calls for legacy coverage. For current userspace validation, use
+For current userspace validation, use
 [`userspace-ha-validation.md`](userspace-ha-validation.md) and the
 `loss:xpf-userspace-fw0/fw1` cluster.
 

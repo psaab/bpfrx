@@ -1,211 +1,170 @@
 # xpf
 
-Stateful firewall with native Junos configuration syntax.
+xpf is a high-performance, Junos-style stateful firewall that replicates
+Juniper vSRX capabilities. It uses the familiar Junos hierarchical
+configuration syntax and a full interactive CLI (tab completion, `?`
+help), and forwards packets on a Rust AF_XDP userspace dataplane driven
+by a Go control plane.
 
-> Dataplane notice (#1373, complete): the eBPF dataplane retirement is done.
-> The Rust AF_XDP userspace dataplane is the only runtime forwarding path.
-> Explicit `system dataplane-type ebpf` is hard-rejected at commit
-> (`ErrEBPFDataplaneRetired`) and at runtime (`ErrEBPFBackendRetired`); use
-> `set system dataplane-type userspace`, or omit the knob for the default.
-> The legacy BPF source (`bpf/xdp/*.c`, `bpf/tc/*.c`) was deleted in #1476;
-> the only retained eBPF artifacts are the userspace XDP shim
-> (`userspace-xdp/`) and the shared `bpf/headers/*.h` map/struct bootstrap.
+> Dataplane: the Rust AF_XDP userspace dataplane is the **only** runtime
+> forwarding path (eBPF retired in #1373/#1476, DPDK in #1525). See
+> [`docs/architecture.md`](docs/architecture.md).
 
-xpf is a high-performance stateful firewall that replicates Juniper vSRX
-capabilities. It uses the familiar Junos hierarchical configuration syntax and
-provides a full interactive CLI with tab completion and `?` help.
+---
 
-## Dataplane Architecture
+## Getting started
 
-xpf has a single runtime forwarding path: the Rust AF_XDP userspace dataplane.
-It is driven by the Go control plane (config, HA, routing, CLI, APIs).
+There are three ways to get a running firewall. **The prebuilt appliance
+image (paths B and C) is the recommended path** — it is the dependency
+closure (kernel ≥ 6.18, FRR, strongSwan, Kea, the xpf binaries and units)
+baked into one bootable disk, deployable on incus (B) or
+libvirt/KVM/QEMU (C). Install the `.deb` (A) on a host you already manage;
+build from source for development.
 
-The userspace AF_XDP backend is selected by `set system dataplane-type
-userspace`, or by omitting the knob entirely (the default). The legacy eBPF
-forwarding backend was retired in #1373/#1476: explicit `system dataplane-type
-ebpf` is hard-rejected at commit time with `ErrEBPFDataplaneRetired` and at
-runtime with `ErrEBPFBackendRetired`. The parser still *accepts* the `ebpf`
-token so that `load merge`/`load override` of a pre-retirement config does not
-syntax-error during a rolling upgrade — but `commit check` then fails with the
-retirement error, and the remediation is `set system dataplane-type userspace`.
-If a persisted config still names `ebpf` on startup, the daemon runs in
-config-only mode until the operator updates it. The current userspace admission
-boundary is tracked in
-[`docs/userspace-dataplane-gaps.md`](docs/userspace-dataplane-gaps.md).
+| Path | Use when | Jump to |
+|------|----------|---------|
+| **(A) Debian package** | You have a Debian/Ubuntu host (kernel ≥ 6.18) and want xpf on it | [below](#a-debian-package-deb) |
+| **(B) Incus appliance image** | You run incus and want a VM appliance | [below](#b-incus-appliance-image) |
+| **(C) KVM / QEMU / libvirt** | You run libvirt/KVM/QEMU | [below](#c-kvm--qemu--libvirt) |
 
-### Userspace Dataplane (the runtime forwarding path)
+All paths give you the same firewall. After it boots, the **mgmt
+interface `fxp0` comes up on DHCP** and you reach the box over SSH (once
+your day-0 config sets credentials) or via the hypervisor console. First
+contact is always `cli`.
 
-A Rust-based forwarding engine receives packets via AF_XDP sockets and
-processes them in userspace. A Rust XDP shim stamps metadata, redirects transit
-traffic into AF_XDP, and still hands proven local/control traffic back to the
-kernel when needed. If helper/XSK forwarding is degraded, non-local transit
-fails closed in both compat and strict modes instead of bypassing policy, NAT,
-or conntrack.
+> **Interface naming is positional, like vSRX.** The first vNIC is `fxp0`
+> (out-of-band mgmt); the rest map to `ge-0/0/N` in attach order (cluster
+> nodes insert `em0` for HA control at position 2). The order you attach
+> NICs is the order they are named, with one wrinkle: enumeration sorts
+> virtio NICs ahead of other drivers and then by PCI bus address
+> (`enumerateAndRenameInterfaces()` in `pkg/daemon/linksetup.go`), so a
+> virtio mgmt NIC stays `fxp0`/`em0` even when dataplane ports are
+> SR-IOV/passthrough. In a normal layout this is identical to pure attach
+> order; verify with `show interfaces terse`. Full contract in
+> [`docs/deploy-quickstart.md`](docs/deploy-quickstart.md).
 
-```
-NIC → XDP shim (redirect transit, pass local/control, drop degraded transit)
-    → AF_XDP socket
-    → Rust worker thread (session → policy → NAT → FIB → TX)
-    → AF_XDP TX ring → NIC
-```
+### (A) Debian package (.deb)
 
-- **Per-worker architecture**: one worker per queue shard, with session/NAT/policy/FIB handled in Rust
-- **AF_XDP fast path**: current code supports both copy and zero-copy modes depending on driver/path behavior
-- **Kernel pass-through**: cpumap-assisted delivery keeps local/kernel-owned traffic out of the AF_XDP fast path
-- **Fail-closed admission**: unsupported userspace configs are gated or
-  fail closed rather than bypassing policy, NAT, or conntrack
-- **Degraded mode**: when helper/XSK forwarding is unavailable, the shim
-  keeps non-local transit out of the kernel forwarding path, passes only
-  proven local/control traffic, and drops degraded transit
-- **Best for**: all dataplane forwarding — there is no other runtime backend
-- **See**: [`docs/userspace-dataplane-architecture.md`](docs/userspace-dataplane-architecture.md) for the current architecture and [`docs/userspace-debug-map.md`](docs/userspace-debug-map.md) for the active debugging map
-
-**To tune the userspace dataplane:**
-
-```junos
-system {
-    dataplane {
-        binary /usr/local/sbin/xpf-userspace-dp;
-        workers 6;
-        ring-entries 8192;
-    }
-}
-```
-
-### Historical note: the retired eBPF dataplane
-
-The original dataplane ran in-kernel using 14 BPF programs chained via tail
-calls (XDP ingress `main -> screen -> zone -> conntrack -> policy -> nat ->
-nat64 -> forward`; TC egress `main -> screen_egress -> conntrack -> nat ->
-forward`) and reached 25+ Gbps on native XDP (mlx5, i40e, ice). That source
-(`bpf/xdp/*.c`, `bpf/tc/*.c`) was deleted in #1476; the pipeline is preserved
-only in git history (`git log -- bpf/xdp/ bpf/tc/`). It is no longer a
-selectable backend — see the hard-reject contract above.
-
-### Userspace Dataplane Capabilities
-
-| Capability | Userspace AF_XDP (the runtime path) |
-|------------|-----------|
-| Stateful forwarding | Yes |
-| Zone + global policies | Yes |
-| Application matching | Yes |
-| Source NAT (interface + pool) | Interface and pool mode yes; userspace `address-persistent` uses a documented userspace-v1 hash. Non-HA per-pool `persistent-nat` lease reuse and pool exhaustion counters are implemented in helper-local runtime state; HA/restart persistence and cross-backend new-flow parity remain outside the current contract |
-| Destination NAT | Yes |
-| Static NAT (1:1) | Yes |
-| NAT64 (IPv6↔IPv4) | Yes |
-| NPTv6 (RFC 6296) | Yes |
-| Screen/IDS (11 checks) | Yes; userspace SYN-cookie runtime is wired |
-| Firewall filters + policers | Filters yes; three-color policers admitted for the reviewed color-blind `then discard` slice; broader color-aware and non-drop action work is tracked as production hardening |
-| TCP MSS clamping | Yes |
-| GRE tunnel transit | Yes (passthrough) |
-| IPsec / XFRM | Yes (passthrough) |
-| VLANs (802.1Q) | Yes |
-| Flow export (NetFlow v9) | Yes |
-| HA cluster + session sync | Integrated; HA hardening tracked in open issues |
-| SYN cookie flood protection | Yes |
-| Throughput (25G mlx5) | See validation/perf docs for current results |
-
-The userspace dataplane covers the transit feature set in native Rust.
-SYN-cookie-dependent screen behavior runs in userspace with bounded
-SYN-ACK/RST replies and userspace status counters (#1374 closed). Port
-mirroring has bounded userspace runtime admission (#1376 closed). Three-color
-policers are admitted for the bounded color-blind `then discard` runtime
-slice (#1375 closed); remaining color-aware, non-drop action, and HA/restart
-continuity work is production hardening tracked in open issues such as
-[#1614](https://github.com/psaab/xpf/issues/1614) (CoS regression) and
-[#1608](https://github.com/psaab/xpf/issues/1608) (cold-path hardening), not
-the closed #1373 feature-gap trackers. Pool-mode SNAT is admitted,
-#1385 added userspace-v1
-`address-persistent` selection, and the runtime fails closed for unusable
-or exhausted source-NAT pool rules before forwarding. Non-HA per-pool
-`persistent-nat` lease reuse is helper-local userspace state; it does not
-survive helper restart and HA persistent-NAT configs remain gated. The exact
-admission boundary is documented in
-[`docs/userspace-dataplane-gaps.md`](docs/userspace-dataplane-gaps.md).
-
-## Architecture
-
-- **Go control plane** handles config compilation, session GC, management APIs, HA cluster, and routing
-- **Rust AF_XDP userspace dataplane** owns the only packet-forwarding path
-- **Retained eBPF surface** is the userspace XDP shim (`userspace-xdp/`) plus the shared `bpf/headers/*.h` map/struct bootstrap — not a forwarding backend
-- **Dual session entries** (forward + reverse) in the shared conntrack hash map
-- **Three-phase config compilation**: Junos AST → typed Go structs → userspace-dp control messages
-
-## Features
-
-### Firewall & Security
-- **Zone-based policies** with stateful inspection, address books, application matching, global policies
-- **NAT**: source (interface + pool, userspace-v1 address-persistent), destination (with hit counters), static 1:1, NAT64, NPTv6 (RFC 6296 stateless prefix translation)
-- **Dual-stack**: IPv4 + IPv6, DHCPv4/v6 clients, embedded Router Advertisement sender (replaces radvd), SLAAC
-- **Screen/IDS**: 11 checks (land, SYN flood, ping of death, teardrop, SYN-FIN, no-flag, winnuke, FIN-no-ACK, rate-limiting), SYN cookie flood protection (userspace-minted/validated SYN-ACK cookies replied through the AF_XDP TX path)
-- **Firewall filters**: policer (token bucket + three-color), lo0 filter, flexible match, port ranges, hit counters, logging, forwarding-class DSCP rewrite
-
-### Flow Processing
-- **TCP MSS clamping** in the userspace AF_XDP dataplane (all-tcp, ipsec-vpn, and GRE gre-in/gre-out)
-- **ALG control**, allow-dns-reply, allow-embedded-icmp
-- **Configurable timeouts** (per-application inactivity)
-- **Session management**: filtered clearing, idle time tracking, brief tabular view, aggregation reporting
-
-### Routing & Networking
-- **FRR integration**: static, OSPF, BGP, IS-IS, RIP, ECMP multipath, export/redistribute
-- **VRFs** with inter-VRF route leaking (next-table + rib-group)
-- **GRE tunnels**, XFRM interfaces, PBR (policy-based routing)
-- **VLANs**: 802.1Q tagging, trunk ports
-- **IPsec**: strongSwan config generation, IKE proposals, gateway compilation
-- **Full interface management**: xpfd owns ALL interfaces — renames via `.link` files, configures addresses/DHCP via `.network` files, brings down unconfigured interfaces
-
-### High Availability
-- **Chassis cluster** with ~60ms failover (30ms VRRP intervals)
-- **Native VRRPv3**: Go state machine, AF_PACKET, per-instance sockets, IPv6 NODAD, 30ms RETH advertisements, async GARP burst
-- **Bondless RETH**: VRRP on physical member interfaces, per-node virtual MAC (`02:bf:72:CC:RR:NN`), no Linux bonding required
-- **Session sync**: incremental 1s sweep + ring buffer + GC delete callbacks, TCP on fabric link
-- **Config sync**: primary → secondary with `${node}` variable expansion, reverse-sync on reconnect
-- **IPsec SA sync**: shared IKE/ESP state across cluster nodes
-- **Dual fabric links**: independent fab0/fab1 for redundancy (no bonding)
-- **Fabric cross-chassis forwarding**: `try_fabric_redirect()` redirects to peer when FIB fails for synced sessions
-- **Dataplane watchdogs**: userspace heartbeat checks fail closed on daemon/helper failure; if a persisted config still names the retired `ebpf` backend, the daemon runs in config-only mode until it is updated
-- **Readiness gate**: per-RG readiness (interfaces + VRRP) + hold timer gates election
-- **Planned shutdown**: near-instant takeover (priority-0 burst), failback ~130ms
-- **ISSU**: in-service software upgrade with rolling deploy
-- **RA lifecycle**: goodbye RAs (lifetime=0) on failover/startup to prevent stale IPv6 ECMP routes
-
-### Observability
-- **Syslog**: facility/severity/category filtering, structured RT_FLOW format, TCP/TLS transport, event mode local file
-- **NetFlow v9**: 1-in-N sampling
-- **Prometheus metrics** (`/metrics` endpoint)
-- **SNMP**: system + ifTable MIB
-- **RPM probes**, dynamic address feeds
-- **Dataplane buffer utilization** (`show system buffers`): AF_XDP UMEM/TX-ring capacity, CoS queued-byte capacity, helper-published session-table and flow-cache capacity
-- **LLDP**: link layer discovery protocol
-
-### Management
-- **Interactive CLI**: Junos-style prefix matching, tab completion, `?` help, pipe filters (`| match`, `| count`, `| except`)
-- **Remote CLI**: `cli` binary connects via gRPC with full tab/`?` parity
-- **gRPC API**: 48+ RPCs (config, sessions, stats, routes, IPsec, DHCP, cluster)
-- **REST API**: HTTP on port 8080 (health, Prometheus, config, full gRPC parity)
-- **Config management**: candidate/active with commit model, 50 rollback slots, `load override`/`load merge`, `show | display set`
-- **Configure mode protection**: blocked on secondary cluster nodes (RG0 primary is config authority)
-- **DHCP server**: Kea integration with lease display
-- **DHCP relay**: Option 82 support
-- **Event engine**: event-driven automation
-
-## Quick Start
+Install xpf onto an existing Debian/Ubuntu host. **Requires kernel ≥
+6.18** (the AF_XDP shim's verifier floor; ≥ 6.18 also gives full NAT64).
 
 ```bash
-make generate           # Generate the retained Rust AF_XDP userspace XDP shim object (post-#1476; no legacy bpf2go)
-make build              # Build xpfd daemon (embeds version from git)
-make build-ctl          # Build remote CLI client
-make build-userspace-dp # Build Rust AF_XDP dataplane binary (requires cargo)
-make test               # Run 1020+ tests across 24 packages
+# On the build host (Go + cargo toolchain):
+make deb                       # builds xpfd + xpf-userspace-dp + cli,
+                               # packages them into dist/deb/xpf_<ver>_amd64.deb
+                               # (+ the xpf-appliance metapackage)
+
+# Copy dist/deb/xpf_<ver>_amd64.deb to the target host, then there:
+sudo apt install ./xpf_<ver>_amd64.deb     # ${shlibs:Depends} pulled in by apt
 ```
+
+The `xpf` package ships the binary set (`xpfd`, `xpf-userspace-dp`,
+`cli`), the day-0 config-drive loader, and the systemd units. The
+`postinst` stages the binaries and, on first install, creates the live
+`/usr/local/sbin/{xpfd,cli,xpf-userspace-dp}` symlinks and enables
+`xpfd`. For the full runtime stack (FRR, strongSwan, Kea, chrony,
+networking tooling) in one shot, install the **`xpf-appliance`**
+metapackage instead — e.g. `sudo apt install xpf-appliance` from a hosted
+apt repo.
+
+Then configure the firewall (see [Configuration](#configuration)) and:
+
+```bash
+sudo systemctl status xpfd
+cli                            # interactive Junos-style CLI
+```
+
+### (B) Incus appliance image
+
+Build (or fetch) the appliance image and deploy an instance from a YAML
+definition. The image carries everything xpf needs; there is no
+dependency matrix to install.
+
+```bash
+# 1. Build the image (or obtain dist/xpf-<ver>.{qcow2,incus-metadata.tar.gz}):
+make image                     # = python3 scripts/image/bake.py
+
+# 2. Import it into incus:
+incus image import dist/xpf-<ver>.incus-metadata.tar.gz \
+    dist/xpf-<ver>.qcow2 --alias xpf-appliance
+
+# 3. See your host NICs, then deploy from a definition:
+scripts/deploy/xpf-deploy.py inventory
+scripts/deploy/xpf-deploy.py deploy examples/deploy/standalone.yaml
+```
+
+`examples/deploy/standalone.yaml` is a working 3-NIC LAN→WAN NAT firewall
+(mgmt, LAN, WAN). The deployer validates the role↔position match, builds
+the day-0 config drive from the referenced `xpf.conf`, and launches the
+VM with the NICs attached in order. Then:
+
+```bash
+incus exec <name> -- cli       # reach the CLI immediately (incus-agent loader)
+```
+
+For HA pairs, SR-IOV/passthrough backings, the `launch` (no-YAML) form,
+and the fleet pattern, see
+[`docs/deploy-quickstart.md`](docs/deploy-quickstart.md) and
+[`examples/deploy/README.md`](examples/deploy/README.md). The image bake
+itself is documented in [`docs/install-images.md`](docs/install-images.md).
+
+### (C) KVM / QEMU / libvirt
+
+The baked qcow2 boots directly under libvirt/KVM or plain QEMU (UEFI or
+BIOS). The day-0 config is supplied as a CD-ROM ISO.
+
+```bash
+# Build the day-0 config drive from your xpf.conf (optional but recommended;
+# the builder runs the real commit-check and refuses an invalid config):
+python3 scripts/image/make_config_drive.py [-n 0|1] -o day0.iso my-xpf.conf
+
+# Boot directly with libvirt (NIC order = positional interface names):
+virt-install --name xpf1 --memory 4096 --vcpus 4 \
+    --import --disk path=dist/xpf-<ver>.qcow2 \
+    --disk path=day0.iso,device=cdrom \
+    --network bridge=br-mgmt --network bridge=br-trust \
+    --osinfo ubuntu26.04 --noautoconsole
+```
+
+Plain QEMU works the same way: `-drive file=dist/xpf-<ver>.qcow2`
+`-cdrom day0.iso`.
+
+You can also drive libvirt through the same deployer used for incus —
+`scripts/deploy/xpf-deploy.py --hypervisor libvirt deploy <file>.yaml`
+builds the day-0 drive and runs `virt-install`, including SR-IOV VF-pool
+and PCI-passthrough wiring (add `--dry-run` to print the command instead
+of running it). **vNIC / SR-IOV mapping:** the order NICs appear on the
+guest PCI bus is the order they are named (`fxp0`, then `ge-0/0/N`),
+subject to the virtio-first tiebreaker noted above. For line-rate dataplane ports, pass through a whole PF
+(i40e/ice/mlx5, native XDP) or an **mlx5** VF (also native XDP); Intel
+VFs fall back to generic-mode XDP (~3-4× slower); virtio/bridge is fine
+for mgmt and modest WANs. The backing matrix is in
+[`docs/deploy-quickstart.md`](docs/deploy-quickstart.md) and the SR-IOV
+caveats in [`docs/critical-patterns.md`](docs/critical-patterns.md).
+
+### Day-0 config & first login
+
+Every path uses the same **day-0 config drive**: a volume labeled
+`xpf-config` (or any ISO9660 medium) with `xpf.conf` at its root
+(`juniper.conf` accepted as an alias), plus an optional `node-id` file
+(`0`/`1`) for cluster members. At first boot the loader re-validates it
+with the real commit-check gate and installs it as `/etc/xpf/xpf.conf`. A
+rejected config logs loudly (`journalctl -u xpf-day0-config`) and leaves
+the box factory-default (fxp0 DHCP + console login). Set SSH credentials
+via `system root-authentication` / `system login user ...` in that
+config. Full first-boot, credentials, upgrade, and recovery contract:
+[`docs/install-images.md`](docs/install-images.md).
+
+---
 
 ## Configuration
 
-xpf uses Junos-style configuration syntax:
+xpf uses Junos-style configuration syntax — both hierarchical `{ }`
+blocks and flat `set` commands:
 
 ```junos
 interfaces {
-    trust0 {
+    ge-0/0/0 {
         unit 0 {
             family inet {
                 address 10.0.1.1/24;
@@ -217,7 +176,7 @@ security {
     zones {
         security-zone trust {
             interfaces {
-                trust0;
+                ge-0/0/0;
             }
             host-inbound-traffic {
                 system-services {
@@ -244,151 +203,117 @@ security {
 }
 ```
 
-The config supports both hierarchical `{ }` blocks and flat `set` commands:
+The same thing as flat `set` commands:
 
 ```
-set interfaces trust0 unit 0 family inet address 10.0.1.1/24
-set security zones security-zone trust interfaces trust0
+set interfaces ge-0/0/0 unit 0 family inet address 10.0.1.1/24
+set security zones security-zone trust interfaces ge-0/0/0
 set security policies from-zone trust to-zone untrust policy allow-all match source-address any destination-address any application any
 set security policies from-zone trust to-zone untrust policy allow-all then permit
 ```
 
-## Management Interfaces
+Pre-flight any config on a build host with
+`xpfd check-config [-node-id 0|1] my-xpf.conf` (exit 0 PASS / 2 reject).
 
-- **Local CLI**: run `xpfd` in a TTY for interactive Junos-style shell
-- **Remote CLI**: `cli -addr <host>:50051` connects via gRPC
-- **gRPC API**: 48+ RPCs on port 50051 (config, sessions, stats, routes, IPsec, DHCP, cluster)
-- **REST API**: HTTP on port 8080 (health, Prometheus `/metrics`, config endpoints)
+## Management interfaces
 
-## Performance
+- **Local CLI**: run `cli` on the firewall for the interactive
+  Junos-style shell.
+- **Remote CLI**: `cli -addr <host>:50051` connects via gRPC with full
+  tab/`?` parity.
+- **gRPC API**: 48+ RPCs on port 50051 (config, sessions, stats, routes,
+  IPsec, DHCP, cluster).
+- **REST API**: HTTP on port 8080 (health, Prometheus `/metrics`, config
+  endpoints).
 
-- **Userspace dataplane** (the runtime path)
-  - **AF_XDP-based forwarding** with per-worker Rust session/NAT/policy/FIB processing
-  - **Copy or zero-copy mode** depending on NIC driver/path behavior
-  - **Kernel pass-through via cpumap** for local and other kernel-owned traffic
-  - **See** [`docs/userspace-ha-validation.md`](docs/userspace-ha-validation.md) and [`docs/userspace-perf-compare.md`](docs/userspace-perf-compare.md) for current validation and profiling workflow
-- **Cluster / control plane**
-  - **Hitless restarts** with zero packet loss
-  - **~60ms cluster failover** (30ms VRRP, ~97ms masterDown interval)
-  - **Near-instant planned shutdown** (priority-0 burst, peer takes over in ~1ms)
-- **Historical (retired eBPF dataplane, git history only)**
-  - **25+ Gbps** with native XDP (i40e/ice PF passthrough), **15.6 Gbps** with virtio-net
+---
 
-## Test Environment
-
-An Incus-based test environment provisions Debian VMs with FRR, strongSwan, and test containers:
+## Build from source (development)
 
 ```bash
-# Single VM (standalone firewall)
-make test-env-init   # One-time setup
-make test-vm         # Create VM
-make test-deploy     # Build + deploy + restart service
-make test-logs       # View daemon logs
-
-# Two-VM HA cluster (defaults to loss userspace cluster)
-make cluster-init    # Create networks + profile
-make cluster-create  # Launch xpf-userspace-fw0 + xpf-userspace-fw1 + LAN host
-make cluster-deploy  # Rolling deploy: secondary first, then primary (preserves traffic)
+make generate           # Rebuild the retained Rust AF_XDP shim — ONLY when
+                        # userspace-xdp/ changed (pinned toolchain + kernel
+                        # verifier gate, #1864)
+make build              # Build xpfd daemon (uses the git-tracked shim object;
+                        # does NOT require make generate)
+make build-ctl          # Build remote CLI client
+make build-userspace-dp # Build the Rust AF_XDP dataplane binary (needs cargo)
+make test               # Run the Go test suite
+make deb                # Package the binaries into a .deb
+make image              # Bake the appliance image (qcow2 + incus metadata)
 ```
 
-Userspace dataplane testing (requires mlx5 NICs on loss cluster):
+Requirements: Linux kernel ≥ 6.18, Go 1.22+, Rust stable, clang/llvm
+(only for `make generate`), FRR (routing), strongSwan (IPsec, optional),
+Kea (DHCP server, optional).
+
+The full development process (plan → review → code → review → merge) is
+in [`docs/development-workflow.md`](docs/development-workflow.md); the
+coding/review discipline is in
+[`docs/engineering-style.md`](docs/engineering-style.md).
+
+## Test environment
+
+An Incus-based test environment provisions Debian VMs with FRR,
+strongSwan, and test containers, plus a two-VM HA cluster.
 
 ```bash
-# Userspace HA cluster
-make cluster-deploy
-./scripts/userspace-ha-validation.sh --env test/incus/loss-userspace-cluster.env
-./scripts/userspace-perf-compare.sh
+make test-env-init      # One-time setup
+make test-vm            # Create a standalone VM
+make test-deploy        # Build + deploy + restart service
+
+make cluster-init       # HA: create networks + profile
+make cluster-create     # HA: launch fw0 + fw1 + LAN host
+make cluster-deploy     # HA: rolling deploy (secondary first)
+make test-failover      # iperf3 survives fw0 reboot (session sync + VRRP)
 ```
 
-### Cluster Deployment
+The test topology (standalone + HA interface maps) is in
+[`docs/network-topology.md`](docs/network-topology.md); test categories,
+procedures, and userspace validation are in
+[`docs/testing-procedures.md`](docs/testing-procedures.md) and
+[`docs/userspace-ha-validation.md`](docs/userspace-ha-validation.md).
 
-`make cluster-deploy` performs a **rolling deploy** to maintain traffic continuity:
+---
 
-1. Determines which node is currently secondary
-2. Deploys to the secondary (primary continues forwarding traffic)
-3. Waits for the secondary to sync sessions from the primary
-4. Deploys to the primary (upgraded secondary takes over via VRRP failover)
+## Where to go next
 
-To deploy to a single node: `make cluster-deploy NODE=0` or `make cluster-deploy NODE=1`.
+**Operating xpf**
 
-### Test Suite
+- [`docs/install-images.md`](docs/install-images.md) — appliance image
+  bake, first-boot contract, credentials, upgrades, recovery.
+- [`docs/deploy-quickstart.md`](docs/deploy-quickstart.md) +
+  [`examples/deploy/README.md`](examples/deploy/README.md) — the
+  positional naming contract, the YAML deployer, SR-IOV/passthrough,
+  standalone + HA examples, the fleet pattern.
+- [`docs/feature-coverage.md`](docs/feature-coverage.md) — the full
+  feature matrix (firewall, NAT, routing, HA, observability, management)
+  and the userspace dataplane capability/admission boundary.
 
-| Test | Command | Description |
-|------|---------|-------------|
-| Unit tests | `make test` | 1020+ Go tests across 24 packages |
-| Connectivity | `make test-connectivity` | End-to-end IPv4/IPv6 routing and SNAT |
-| Failover | `make test-failover` | iperf3 survives fw0 reboot (session sync + VRRP) |
-| Hard crash | `make test-ha-crash` | Force-stop, daemon stop, multi-cycle crash recovery |
-| Restart | `make test-restart-connectivity` | Zero packet loss during daemon restart |
-| Private RG | `./test/incus/test-private-rg.sh` | VRRP elimination via private-rg-election |
+**Understanding xpf**
 
-## Code Layout
+- [`docs/architecture.md`](docs/architecture.md) — control plane +
+  dataplane architecture, key design patterns, and the code layout.
+- [`docs/network-topology.md`](docs/network-topology.md) — test-VM and
+  HA-cluster interface maps.
+- [`docs/userspace-dataplane-architecture.md`](docs/userspace-dataplane-architecture.md)
+  — the comprehensive AF_XDP dataplane design.
+- [`docs/sync-protocol.md`](docs/sync-protocol.md) /
+  [`docs/fabric-cross-chassis-fwd.md`](docs/fabric-cross-chassis-fwd.md)
+  — HA session-sync wire protocol and fabric cross-chassis forwarding.
 
-| Path | Description |
-|------|-------------|
-| `bpf/headers/*.h` | Shared C structs/constants consumed by the retained Rust AF_XDP shim build and userspace-dp parity tests. The legacy `bpf/xdp/*.c` and `bpf/tc/*.c` source were deleted in #1476 |
-| `pkg/config/` | Junos parser, AST, typed config, compiler |
-| `pkg/cmdtree/` | Single source of truth for all CLI command trees |
-| `pkg/configstore/` | Candidate/active/commit/rollback, atomic DB persistence |
-| `pkg/dataplane/` | Runtime contracts, retained userspace shim embed/loader, and eBPF/DPDK retirement-error sentinels (#1476/#1525) |
-| `pkg/dataplane/userspace/` | Go manager for the Rust userspace dataplane |
-| `userspace-xdp/` | Retained Rust XDP shim that redirects packets into the AF_XDP userspace runtime |
-| `pkg/daemon/` | Daemon lifecycle, reconciliation, interface management |
-| `pkg/cluster/` | Chassis cluster HA (state machine, session sync, config sync) |
-| `pkg/vrrp/` | Native VRRPv3 state machine (30ms RETH advertisements) |
-| `pkg/ra/` | Embedded RA sender (replaces radvd) |
-| `pkg/cli/` | Interactive Junos-style CLI |
-| `pkg/conntrack/` | Session garbage collection (with HA delete sync) |
-| `pkg/logging/` | Ring buffer reader, event buffer, syslog client |
-| `pkg/dhcp/` | DHCPv4/DHCPv6 clients |
-| `pkg/frr/` | FRR config generation + managed section in frr.conf |
-| `pkg/networkd/` | systemd-networkd .link/.network file generation |
-| `pkg/routing/` | GRE tunnels, VRFs, XFRM interfaces, route leaking |
-| `pkg/ipsec/` | strongSwan config + SA queries |
-| `pkg/api/` | HTTP REST API + Prometheus collector |
-| `pkg/grpcapi/` | gRPC server + protobuf bindings |
-| `pkg/flowexport/` | NetFlow v9 exporter |
-| `pkg/feeds/` | Dynamic address feed fetcher |
-| `pkg/dhcpserver/` | Kea DHCP server management |
-| `pkg/dhcprelay/` | DHCP relay with Option 82 |
-| `pkg/eventengine/` | Event-driven automation engine |
-| `pkg/rpm/` | RPM probe manager |
-| `pkg/snmp/` | SNMP agent (system + ifTable MIB) |
-| `pkg/lldp/` | LLDP protocol |
-| `proto/xpf/v1/` | Protobuf service definition |
-| `cmd/xpfd/` | Daemon main binary |
-| `cmd/cli/` | Remote CLI client binary |
-| `userspace-dp/` | Rust AF_XDP userspace dataplane binary |
-| `docs/` | Protocol docs, test plans, feature gaps |
-| `test/incus/` | Test environment scripts and configs |
+**Developing xpf**
 
-## Documentation
+- [`docs/development-workflow.md`](docs/development-workflow.md) — how
+  changes land.
+- [`docs/engineering-style.md`](docs/engineering-style.md) +
+  [`docs/critical-patterns.md`](docs/critical-patterns.md) — coding/review
+  discipline and the project-specific gotchas (byte order, struct
+  alignment, BPF verifier, SR-IOV/XDP, interface management).
+- [`docs/config-schema.md`](docs/config-schema.md) — how to add a
+  config-mode typed leaf.
+- [`docs/feature-gaps.md`](docs/feature-gaps.md) — vSRX feature parity
+  tracking.
 
-See `docs/` for detailed design documents:
-- `sync-protocol.md` — Cluster session sync wire protocol and algorithms
-- `fabric-cross-chassis-fwd.md` — Fabric link cross-chassis forwarding design
-- `ha-cluster.conf` — Unified HA cluster config with `${node}` variable expansion
-- `testing-procedures.md` — Test categories, procedures, and debugging tips
-- `phases.md` — Development phase history (40+ sprints)
-- `bugs.md` — Bug tracker with root cause analysis
-- `optimizations.md` — Performance profiling and optimization notes
-- `test_env.md` — Test topology and validation steps
-- `feature-gaps.md` — vSRX feature parity tracking
-- `userspace-dataplane-architecture.md` — Comprehensive userspace AF_XDP dataplane architecture
-- `userspace-debug-map.md` — Active file/function map for userspace forwarding and debugging
-- `xdp-io-uring-userspace-dataplane.md` — Original userspace dataplane design document
-- `shared-umem-plan.md` — Cross-NIC shared UMEM design and validation plan
-- `userspace-ha-validation.md` — HA failover validation procedures
-- `userspace-perf-compare.md` — Throughput benchmarking methodology
-- `userspace-dnat-plan.md` — Destination NAT implementation plan for userspace dataplane
-- `userspace-dataplane-gaps.md` — Current userspace AF_XDP capability/admission boundary
-
-## Requirements
-
-- Linux kernel 6.12+ (6.18+ recommended for full NAT64 support)
-- Go 1.22+
-- clang/llvm (for generating the retained Rust AF_XDP userspace XDP shim object)
-- Rust stable (for the primary userspace dataplane)
-- FRR (for routing protocol integration)
-- strongSwan (for IPsec, optional)
-- Kea (for DHCP server, optional)
+A fuller index of design docs is in
+[`docs/README.md`](docs/README.md).
