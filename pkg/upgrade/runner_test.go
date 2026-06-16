@@ -38,6 +38,9 @@ type fakeSystem struct {
 	// healthHook, if set, runs at the start of HelperHealthy (used to
 	// simulate the new daemon mutating the live config DB post-start).
 	healthHook func()
+	// startFailOnce makes the NEXT StartUnit call fail once (to simulate a
+	// post-flip start-exec failure that must trigger auto-rollback).
+	startFailOnce bool
 
 	// calls records the ordered call log for assertions.
 	calls []string
@@ -60,10 +63,20 @@ func newFakeSystem(t *testing.T, ver string) *fakeSystem {
 	}
 }
 
-func (f *fakeSystem) log(s string)           { f.calls = append(f.calls, s) }
-func (f *fakeSystem) StopUnit(string) error  { f.log("stop"); f.unitRunning = false; return nil }
-func (f *fakeSystem) StartUnit(string) error { f.log("start"); f.unitRunning = true; return nil }
-func (f *fakeSystem) DaemonReload() error    { f.log("daemon-reload"); f.daemonReloaded++; return nil }
+func (f *fakeSystem) log(s string)          { f.calls = append(f.calls, s) }
+func (f *fakeSystem) StopUnit(string) error { f.log("stop"); f.unitRunning = false; return nil }
+func (f *fakeSystem) StartUnit(string) error {
+	f.log("start")
+	// startFailVersions: fail StartUnit while the target is the named
+	// version (cleared once the unit is back on a non-failing version).
+	if f.startFailOnce {
+		f.startFailOnce = false
+		return fmt.Errorf("synthetic start failure")
+	}
+	f.unitRunning = true
+	return nil
+}
+func (f *fakeSystem) DaemonReload() error { f.log("daemon-reload"); f.daemonReloaded++; return nil }
 func (f *fakeSystem) FreeBytes(string) (uint64, error) {
 	return f.free, nil
 }
@@ -295,6 +308,33 @@ func TestRun_RollbackClearsJournalNoResurrectFailedTarget(t *testing.T) {
 	target, _ := os.Readlink(filepath.Join(cfg.VersionsDir, "current"))
 	if filepath.Base(target) != "2.0.0" {
 		t.Errorf("re-run did not cleanly cut to 2.0.0: current=%q", target)
+	}
+}
+
+// TestRun_StartUnitFailureTriggersRollback proves a post-flip StartUnit
+// exec failure (not just an unhealthy helper) triggers auto-rollback to
+// the previous version (AGY r3 Medium) — the binary is already flipped-in,
+// so a failed start would otherwise leave the daemon offline.
+func TestRun_StartUnitFailureTriggersRollback(t *testing.T) {
+	fs := newFakeSystem(t, "1.0.0")
+	r, cfg := testEnv(t, fs)
+	if err := r.Run(Options{}); err != nil {
+		t.Fatalf("first cut: %v", err)
+	}
+	// Stage 2.0.0; make its post-flip StartUnit fail once.
+	fs.stagedVersion = "2.0.0"
+	for _, b := range managedBins {
+		writeFakeBin(t, filepath.Join(cfg.StagedDir, b), "binary-"+b+"-2.0.0")
+	}
+	fs.startFailOnce = true
+
+	err := r.Run(Options{})
+	if err == nil || !strings.Contains(err.Error(), "rolled back to 1.0.0") {
+		t.Fatalf("expected start-failure rollback to 1.0.0, got %v", err)
+	}
+	target, _ := os.Readlink(filepath.Join(cfg.VersionsDir, "current"))
+	if filepath.Base(target) != "1.0.0" {
+		t.Errorf("after start-failure rollback current=%q want 1.0.0", target)
 	}
 }
 

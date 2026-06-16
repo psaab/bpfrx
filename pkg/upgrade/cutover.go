@@ -181,21 +181,29 @@ func (r *Runner) Run(opts Options) (err error) {
 
 	// ---- START ----
 	if !j.State.atLeast(StateStarted) {
-		if err := r.cfg.Sys.StartUnit(r.cfg.Unit); err != nil {
-			return fmt.Errorf("start unit: %w", err)
+		// A StartUnit exec failure is treated the SAME as an unhealthy
+		// start (AGY r3 Medium): the binary is already flipped-in, so a
+		// failure to start leaves the daemon OFFLINE unless we roll back.
+		// Both the start-exec error and the health error route through the
+		// standalone auto-rollback (or surface for operator-driven HA
+		// rollback when SkipStartHealthRollback is set).
+		startErr := r.cfg.Sys.StartUnit(r.cfg.Unit)
+		var healthErr error
+		if startErr == nil {
+			healthErr = r.cfg.Sys.HelperHealthy(j.TargetVersion, r.cfg.StartHealthDeadline)
 		}
-		healthErr := r.cfg.Sys.HelperHealthy(j.TargetVersion, r.cfg.StartHealthDeadline)
-		if healthErr != nil {
+		if failErr := firstNonNil(startErr, healthErr); failErr != nil {
 			if opts.SkipStartHealthRollback {
-				return fmt.Errorf("new version %s unhealthy after start (HA: rollback is "+
-					"operator-driven): %w", j.TargetVersion, healthErr)
+				return fmt.Errorf("new version %s failed to come up after flip (HA: "+
+					"rollback is operator-driven): %w", j.TargetVersion, failErr)
 			}
-			r.logf("upgrade: new version %s unhealthy after start (%v); AUTO-ROLLBACK", j.TargetVersion, healthErr)
+			r.logf("upgrade: new version %s failed to come up after start (%v); AUTO-ROLLBACK",
+				j.TargetVersion, failErr)
 			if rbErr := r.rollback(j); rbErr != nil {
-				return fmt.Errorf("new version unhealthy (%v) AND rollback failed: %w", healthErr, rbErr)
+				return fmt.Errorf("new version failed (%v) AND rollback failed: %w", failErr, rbErr)
 			}
-			return fmt.Errorf("new version %s unhealthy; rolled back to %s: %w",
-				j.TargetVersion, j.PreviousVersion, healthErr)
+			return fmt.Errorf("new version %s failed to come up; rolled back to %s: %w",
+				j.TargetVersion, j.PreviousVersion, failErr)
 		}
 		if err := r.transition(j, StateStarted); err != nil {
 			return err
@@ -213,6 +221,16 @@ func (r *Runner) Run(opts Options) (err error) {
 	}
 	r.logf("upgrade: committed version %s", j.TargetVersion)
 	return r.clearJournal()
+}
+
+// firstNonNil returns the first non-nil error.
+func firstNonNil(errs ...error) error {
+	for _, e := range errs {
+		if e != nil {
+			return e
+		}
+	}
+	return nil
 }
 
 // preflight checks disk space (incl. the rollback DB snapshot), GCs

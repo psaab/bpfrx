@@ -5413,3 +5413,5 @@ top.
 - **File(s)**: pkg/upgrade/{cutover,cluster_cli,flip,runner_test,cluster_cli_test}.go, docs/in-place-upgrade.md
 - **Action**: Code-review round 3 fix (Codex r3 High) — parseDrainComplete now per-RG paired (every RG: local secondary + peer primary), not global any-peer-primary
 - **File(s)**: pkg/upgrade/cluster_cli.go, pkg/upgrade/cluster_cli_test.go
+- **Action**: Code-review round 3 follow-up (AGY r3 Medium) — post-flip StartUnit exec failure now triggers auto-rollback (was: abort leaving daemon offline)
+- **File(s)**: pkg/upgrade/cutover.go, pkg/upgrade/runner_test.go
