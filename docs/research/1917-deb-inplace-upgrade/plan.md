@@ -1,9 +1,11 @@
 # #1917 — In-place xpf upgrade (new xpfd + userspace-dp without re-imaging)
 
-- **Revision:** 2
-- **Status:** PLAN-REVISED (round 1 → round 2). Codex = PLAN-NEEDS-REVISION,
-  Claude SMR = PLAN-NEEDS-REVISION, AGY = in-flight. v2 folds in the converged
-  round-1 blocking corrections; awaiting round-2 re-review for PLAN-READY.
+- **Revision:** 3
+- **Status:** PLAN-REVISED (round 1 complete → round 2). Round-1 verdicts: Codex =
+  PLAN-NEEDS-REVISION, Claude SMR = PLAN-NEEDS-REVISION, AGY = PLAN-NEEDS-REVISION
+  (no KILL; composed A+B endorsed by all three). v3 folds in ALL round-1 blockers
+  including AGY's four novel Debian/kernel/state ones. Awaiting round-2 re-review
+  for PLAN-READY.
 - **Branch:** `research/1917-deb-inplace-upgrade`
 - **Scope:** RESEARCH ONLY. No production source touched. Deliverable is this plan
   + three reviewer verdicts + an issue comment. Implementation is a separate
@@ -232,6 +234,23 @@ single atomic symlink flip owned by `xpf-upgrade` after verify PASS.** dpkg only
 "never serve a half-swapped set" and "matched protocol pair" invariants
 structural, not advisory.
 
+**`dh_installsystemd` auto-restart MUST be disabled (round-2 AGY blocker).** The
+default Debian helper appends a `systemctl try-restart xpfd.service` block to the
+generated `postinst` on upgrade — which would fire a full dataplane cycle on *any*
+`apt upgrade xpf`, defeating the "dpkg only stages" design even though our custom
+`postinst` never flips the symlink. `debian/rules` MUST call
+`dh_installsystemd --no-restart-on-upgrade --no-stop-on-upgrade` (NOT
+`--restart-after-upgrade`). The live restart happens ONLY when `xpf-upgrade`
+explicitly drives it after a verify PASS.
+
+**Run the NEWLY-STAGED orchestrator, not the live symlink (round-2 AGY blocker).**
+After `apt upgrade` stages N+1 under `/usr/local/lib/xpf/<N+1>/`, the live
+`/usr/local/sbin/xpf-upgrade` symlink still points at N, which may lack the N+1
+protocol/orchestration logic. The `postinst` and the operator runbook MUST invoke
+the *staged* `/usr/local/lib/xpf/<N+1>/xpf-upgrade cut-over` to drive the cut,
+never the live-symlink path. The staged orchestrator owns the verify, the symlink
+flip, and (standalone) the restart.
+
 ### 6.3 The `.deb` `postinst` — verify-before-cut, delegating the mechanism
 
 `postinst configure` must NOT naively `systemctl restart xpfd`. It must:
@@ -318,11 +337,18 @@ permanent blanket hold:
 
 - `linux-*` is held by default (`apt-mark hold`), so unattended `apt upgrade`
   cannot move the floor.
-- A kernel bump is an explicit operator action (`xpf-upgrade kernel <ver>`) that:
-  installs the candidate kernel *unbooted*, runs `verify-dataplane` against it
-  (boot once in a holding state or via a kexec-style probe), and only on PASS
-  marks it the boot default. A verify FAIL leaves the running kernel as boot
-  default and surfaces an actionable error.
+- A kernel bump is an explicit operator action (`xpf-upgrade kernel <ver>`).
+  **`verify-dataplane` cannot validate an unbooted kernel (round-2 AGY blocker):**
+  the BPF verifier is kernel-space — `ebpf.NewCollection` (verify_userspace_shim.go)
+  loads the spec into the *running* kernel, so the candidate kernel must actually
+  be running to be verified. The mechanism is therefore a **one-shot boot +
+  watchdog fallback, NOT a verify-then-set-default**: install the candidate kernel,
+  `grub-reboot <candidate>` (boot it exactly once without changing the default),
+  on that boot a oneshot unit runs `verify-dataplane` + a health check; on PASS it
+  promotes the candidate to `grub-set-default`; on FAIL or a no-show (boot hang /
+  no health beacon within a deadline) the box reboots back into the unchanged old
+  default — so a bad kernel can never brick the node, it just falls back. HA: do
+  this on the drained/secondary node only.
 - Heavy/uncertain kernel moves still go through Path C (image-replace), the
   fully-tested unit.
 
@@ -383,11 +409,20 @@ pin / one-kernel assert / verify-dataplane gate logic in bake.py is unchanged; t
   manifest-version-0; (d) **corrupt/truncated active** — caught by the existing
   `json.Unmarshal` error path independent of the manifest, so manifest absence
   never masks corruption; (e) **encrypted active with/without `master.key`** —
-  the manifest is written *outside* the encryption envelope (its version readable
-  pre-decrypt) so a min-reader gate fires before a decrypt failure is misread as
-  corruption. Only once a manifest EXISTS does its `min_reader_version` gate a
-  too-old binary. This makes the manifest purely additive and safe for the very
-  first upgrade.
+  the manifest version is readable pre-decrypt so a min-reader gate fires before a
+  decrypt failure is misread as corruption. Only once a manifest EXISTS does its
+  `min_reader_version` gate a too-old binary. This makes the manifest purely
+  additive and safe for the very first upgrade.
+  **The manifest must NOT be a second file (round-2 AGY blocker):** writing
+  `manifest.json` separately from `active.json` opens a crash-consistency gap (a
+  power cut between the two leaves a mismatched DB). Instead, embed the version
+  metadata IN `active.json` — wrap the marshaled `config.ConfigTree` in a parent
+  envelope `{ "manifest": {writer, ast_schema, min_reader, rollback_fmt,
+  journal_schema}, "tree": <ConfigTree> }`, or a plaintext version header line for
+  the encrypted form — so the existing single-file `fsatomic.WriteFileDurable`
+  rename stays the atomic unit. `ReadActive` (db.go) gains an envelope-aware
+  reader with a legacy fallback (a bare `ConfigTree` with no envelope = schema-0,
+  per case (b) above).
 - **Shim verifier gate must hold post-cut and post-kernel-bump:** ExecStartPre
   verify on every start; bake-time assert one kernel ≥6.18; **base apt kernel
   updates HELD by default** and only moved through the §6.7 verify-gated kernel
@@ -436,6 +471,10 @@ pin / one-kernel assert / verify-dataplane gate logic in bake.py is unchanged; t
 | 6 | Half-unpacked binary set serves traffic if `postinst` aborts mid-way | Correctness/Availability | Med | High | Versioned install paths + atomic-symlink flip owned by `xpf-upgrade`; running paths unchanged until verify passes |
 | 7 | `postrm purge` deletes `/etc/xpf/.configdb`/`node-id`/`master.key` | Data loss | Med | Critical | Explicitly exclude runtime state from package ownership; `postrm` never touches `/etc/xpf` |
 | 8 | CoS / per-flow state silently lost after an in-place full cycle (deploy-wipes-CoS gotcha) | Perf/Fairness | High | Med | Re-publish CoS config post-cut in `xpf-upgrade`; document re-apply; add a post-cut CoS-present check |
+| 9 | `dh_installsystemd` auto-appends `try-restart` to `postinst` → any `apt upgrade xpf` cuts the dataplane | Availability | High | High | `debian/rules`: `dh_installsystemd --no-restart-on-upgrade --no-stop-on-upgrade`; live restart only via `xpf-upgrade` post-verify (§6.3a) |
+| 10 | Verify-gated kernel channel tries to verify an *unbooted* kernel (impossible — verifier is in the running kernel) → bad kernel could brick the node | Availability | Med | Critical | One-shot `grub-reboot` + boot-watchdog auto-fallback to old default; promote only on a PASS health beacon (§6.7) |
+| 11 | Non-atomic manifest: power cut between `active.json` and a separate `manifest.json` → mismatched DB | Data/Correctness | Med | High | Embed manifest IN `active.json` (envelope/header), keep the single-file `fsatomic` rename atomic (§8) |
+| 12 | Rolling upgrade driven by the *old* `xpf-upgrade` symlink (N) lacking N+1 orchestration logic | Correctness | Med | High | `postinst`/runbook exec the *staged* `/usr/local/lib/xpf/<N+1>/xpf-upgrade` (§6.3a) |
 
 ## 10. Test plan
 
@@ -463,6 +502,15 @@ verify-dataplane still passes, dataplane uninterrupted. Then explicitly *unhold*
 bump the kernel in a throwaway VM → assert boot ExecStartPre verify GATES (PASS on a
 ≥6.18 tested kernel; REJECT path leaves no dataplane but a recoverable box via
 console). Confirms the "hold the kernel" mitigation is load-bearing.
+
+**Packaging guards (round-2):** assert the built `.deb`'s generated `postinst`
+contains NO `systemctl ... restart`/`try-restart` block (grep the maintainer
+script) — proves `--no-restart-on-upgrade` took. Assert `apt upgrade xpf` on a
+running standalone box does NOT bounce the daemon until `xpf-upgrade` is invoked.
+Assert the staged `/usr/local/lib/xpf/<N+1>/xpf-upgrade` is the binary that runs
+the cut (not the live symlink). Negative kernel test: `grub-reboot` a deliberately
+verifier-failing candidate kernel → assert the box auto-falls-back to the old
+default and the old default stays the boot default (no brick).
 
 **Config-DB compat:** write `active.json` + rollback slot with binary N+1 that
 emits a new leaf; attempt to boot binary N → assert the manifest min-reader gate
