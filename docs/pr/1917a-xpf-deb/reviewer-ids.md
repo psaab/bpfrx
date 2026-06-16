@@ -24,3 +24,17 @@
 
 ## Re-review
 - Re-review requested on the updated diff after the two fix commits.
+
+## Round-2 verdicts
+- **Codex r2** (agent a350baec750858dc1): MERGE-READY — all r1 fixes verified, no new defects.
+- **AGY r2** (adversarial-review-mqgpjqoz-gyin2d): NEEDS-REVISION — (1) CRITICAL Makefile signal-mask, (2) fragile sed ExecStartPre. Both fixed in `00dc252ef`.
+
+## Round-3 confirmation (dispatched on HEAD 00dc252ef)
+- **Codex r3**: agent a7ad3f1a3cb0dcc7a
+- **AGY r3**: adversarial-review-mqgpvijr-sn3022
+
+## Copilot
+- Quota-unavailable ("reached their quota limit"). Fallback: Codex + AGY + Claude SMR + boot/verify validation.
+
+## End-to-end validation
+- Bake from .deb -> image boots; Scenario A (factory boot + in-guest verify-dataplane) PASS, B (valid day-0) PASS, C (invalid day-0 fallback) PASS; `bake complete`.
