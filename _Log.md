@@ -5446,3 +5446,17 @@ top.
 - **File(s)**: pkg/upgrade/cluster_cli.go, pkg/upgrade/cluster_cli_test.go, docs/in-place-upgrade.md
 - **Action**: Copilot formal review fixes — fail-closed msg points at .configdb/active.json; postinst restart safety-net on cut-over failure; cutover Options doc (UnitAlreadyStopped). Other Copilot findings already fixed in r1-r5.
 - **File(s)**: pkg/daemon/daemon_run.go, debian/xpf.postinst, pkg/upgrade/cutover.go
+
+## 2026-06-16 — #1922 PR-2 SAFE-BOOTSTRAP daemon (Items 2-4 + 1b)
+
+- **Timestamp**: 2026-06-16
+- **Action**: Implement #1922 PR-2 — explicit bootstrap mode + five-case boot
+  predicate (Item 2), PCI-keyed management lifeline (Item 3), protected-set
+  enforcement (Item 4), first-commit rollback-to-bootstrap (Item 1b) + step-0
+  committed marker.
+- **File(s)**: pkg/configstore/envelope.go, db.go, store.go, test_seams.go,
+  marker_test.go; pkg/daemon/bootstrap.go, daemon.go, daemon_run.go,
+  daemon_apply.go, bootstrap_test.go, bootstrap_rollback_test.go, README.md;
+  pkg/dataplane/compiler_iface.go, protected_iface_test.go;
+  pkg/config/types_system.go; pkg/configstore/README.md;
+  docs/refactoring-audit-current.txt.
