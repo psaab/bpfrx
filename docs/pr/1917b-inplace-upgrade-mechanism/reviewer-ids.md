@@ -1,6 +1,6 @@
 # #1917 increment B — code-review reviewer ledger
 
-PR: (filled after open)
+PR: https://github.com/psaab/xpf/pull/1933
 Branch: engineer/1917b-inplace-upgrade
 
 ## Plan-review (research phase, already converged PLAN-READY v4)
