@@ -45,5 +45,26 @@ r3 findings resolved: per-RG drain pairing (commit 9fa7c23a), StartUnit-failure 
 ### Round 4 (verify r3 fixes)
 | Reviewer | Task ID | Round | Verdict |
 |---|---|---|---|
-| Codex | (pending) | r4 | (pending) |
-| AGY | (pending) | r4 | (pending) |
+| Codex | 019ed148-6fcf-7df0-ba39-711da9ffb71d | r4 | NEEDS-REVISION (r3 verified; new: PeerTakeoverReady fail-open, curRG bleed) |
+| AGY | adversarial-review-mqgv2sxu-morswk | r4 | MERGE-READY |
+
+r4 findings resolved: PeerTakeoverReady not-ready tokens + curRG reset (commit 0b8d0666).
+
+### Round 5 (verify r4 fixes)
+| Reviewer | Task ID | Round | Verdict |
+|---|---|---|---|
+| Codex | 019ed14d-fc32-71a3-852f-db2aac66419a | r5 | r4 fixes correct; Low test-gap (YES-reason-with-"no") |
+| Codex (full re-read) | 019ed14d... cont | r5 | ResetFailover all-RGs + PeerTakeoverReady local-view doc |
+
+r5 findings resolved: token-match (not substring) for takeover-ready (commit 7d489933); ResetFailover enumerates all RGs + peer-ready doc (commit ebb8b5fd).
+
+### Copilot (formal PR review)
+COMMENTED — 16 inline comments. Overlapped r1-r5 (DrainComplete strong predicate, ResetFailover all-RGs, LocalPrimary, PeerTakeoverReady, deploy grep, --unit health — ALL already fixed). Net-new Copilot items fixed in commit 8b222491: fail-closed msg path (.configdb/active.json), postinst restart safety-net, cutover Options doc.
+
+## Convergence summary
+Codex: 5 rounds, each narrowing; final findings were a doc-only Low + two pre-existing design points (ResetFailover RG-scope FIXED; PeerTakeoverReady local-view DOCUMENTED with DrainComplete as the authoritative guard). AGY: r4 MERGE-READY. Copilot: net-new items all addressed. Claude SMR: concurred each round, drove the fixes.
+
+## Residual gates (require the serialized live cluster — NOT run here)
+- Live `xpfd upgrade --rolling` on loss:xpf-userspace-fw0/fw1 + MEASURED client gap.
+- `make test-failover` (mandatory for cluster/VRRP/sync changes).
+- Live validation of the cluster_cli status-text parsers against real output.
