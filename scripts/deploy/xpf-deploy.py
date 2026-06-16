@@ -7,6 +7,11 @@ Subcommands:
   launch --name … --nic …         imperative launch without a YAML file.
   inventory                       list host NICs, SR-IOV VFs, bridges → the
                                   values you drop into a definition.
+  fetch --version V [--image-url] download a signed appliance image from
+                                  XPF_IMAGE_BASE_URL, VERIFY the exact bytes
+                                  against the signed manifest (#1924), then
+                                  import it to a local incus alias. Verify
+                                  happens here, not at deploy/launch.
 
 Interface naming is POSITIONAL (matches pkg/daemon/linksetup.go assignName):
 
@@ -429,6 +434,87 @@ def cmd_launch(args):
     return 0
 
 
+def cmd_fetch(args):
+    """Download an appliance image from XPF_IMAGE_BASE_URL, VERIFY the exact
+    downloaded bytes against the signed per-version manifest (#1924 §5.2),
+    then import it to a local incus alias. Verification happens HERE (at
+    fetch/import), not at deploy/launch — the alias-launch path consumes a
+    previously-verified alias. This is the only deploy-side place that
+    touches raw image bytes, so it is where the signature is bound."""
+    HERE_D = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, os.path.join(os.path.dirname(HERE_D), "dist"))
+    import sign  # noqa: E402
+
+    base = args.image_url or os.environ.get("XPF_IMAGE_BASE_URL")
+    if not base:
+        die("fetch needs --image-url or XPF_IMAGE_BASE_URL (the image host).")
+    base = base.rstrip("/")
+    ver = args.version
+    out = os.path.abspath(args.out or os.getcwd())
+    os.makedirs(out, exist_ok=True)
+
+    names = {
+        "qcow2": f"xpf-{ver}.qcow2",
+        "metadata": f"xpf-{ver}.incus-metadata.tar.gz",
+        "manifest": f"xpf-{ver}.SHA256SUMS",
+        "sig": f"xpf-{ver}.SHA256SUMS.minisig",
+    }
+
+    def fetch_one(name):
+        dst = os.path.join(out, name)
+        url = f"{base}/{name}"
+        if args.dry_run:
+            print(f"  (dry-run) curl -fsSL {url} -> {dst}")
+            return dst
+        print(f"==> fetching {url}")
+        r = subprocess.run(["curl", "-fsSL", "-o", dst + ".tmp", url])
+        if r.returncode != 0:
+            die(f"download failed: {url}")
+        os.replace(dst + ".tmp", dst)
+        return dst
+
+    # Need at least the manifest + sig + the artifact(s) the operator wants.
+    want = ["qcow2"] if args.qcow2_only else ["qcow2", "metadata"]
+    fetch_one(names["manifest"])
+    fetch_one(names["sig"])
+    for w in want:
+        fetch_one(names[w])
+
+    if args.dry_run:
+        print("  (dry-run) verify each fetched file against the signed manifest,"
+              " then incus image import")
+        return 0
+
+    manifest = os.path.join(out, names["manifest"])
+    sig = os.path.join(out, names["sig"])
+    for w in want:
+        path = os.path.join(out, names[w])
+        try:
+            sign.verify_image_artifact(path, manifest, sig)
+            print(f"==> signature OK: {names[w]}")
+        except sign.SignError as e:
+            die(f"VERIFICATION FAILED for {names[w]}: {e}")
+
+    if args.no_import or args.qcow2_only:
+        print(f"==> verified into {out} (not imported — use the qcow2 with "
+              "virt-install --import, or re-run without --qcow2-only/--no-import "
+              "for an incus image import).")
+        return 0
+
+    alias = args.alias or "xpf-appliance"
+    subprocess.run(["incus", "image", "delete", alias],
+                   capture_output=True, text=True)
+    print(f"==> importing verified image as incus alias '{alias}'")
+    r = subprocess.run(["incus", "image", "import",
+                        os.path.join(out, names["metadata"]),
+                        os.path.join(out, names["qcow2"]), "--alias", alias])
+    if r.returncode != 0:
+        die("incus image import failed")
+    print(f"==> done. Deploy with: xpf-deploy.py deploy <appliance.yaml> "
+          f"(image: {alias})")
+    return 0
+
+
 def main():
     argv = sys.argv[1:]
     if "-h" in argv or "--help" in argv or not argv:
@@ -450,12 +536,23 @@ def main():
     # `rest` now holds only the subcommand + its own args. The first token
     # is the subcommand; if it isn't one, treat the whole of `rest` as
     # YAML files for `deploy` (the bare-`xpf-deploy.py foo.yaml` shorthand).
-    if rest and rest[0] in ("deploy", "launch", "inventory"):
+    if rest and rest[0] in ("deploy", "launch", "inventory", "fetch"):
         cmd, cmd_argv = rest[0], rest[1:]
     else:
         cmd, cmd_argv = "deploy", rest
 
-    if cmd == "inventory":
+    if cmd == "fetch":
+        sub = argparse.ArgumentParser(prog="xpf-deploy.py fetch", add_help=False)
+        sub.add_argument("--version", required=True)
+        sub.add_argument("--image-url", dest="image_url")
+        sub.add_argument("--out")
+        sub.add_argument("--alias")
+        sub.add_argument("--qcow2-only", action="store_true",
+                         help="fetch+verify only the qcow2 (libvirt/KVM path)")
+        sub.add_argument("--no-import", action="store_true",
+                         help="verify only; do not incus image import")
+        args = sub.parse_args(cmd_argv)
+    elif cmd == "inventory":
         sub = argparse.ArgumentParser(prog="xpf-deploy.py inventory", add_help=False)
         args = sub.parse_args(cmd_argv)
     elif cmd == "launch":
@@ -480,6 +577,8 @@ def main():
     args.no_start = gargs.no_start
     args.image = gargs.image
 
+    if cmd == "fetch":
+        return cmd_fetch(args)
     if cmd == "inventory":
         return cmd_inventory(args)
     if cmd == "launch":

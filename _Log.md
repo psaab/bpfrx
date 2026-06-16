@@ -5475,3 +5475,12 @@ top.
 - **File(s)**: scripts/dist/sign.py, scripts/dist/README.md,
   scripts/dist/xpf-image.pub.placeholder, scripts/image/bake.py,
   scripts/image/validate.py
+- **Timestamp**: 2026-06-16
+- **Action**: Add apt repo build tooling (flat signed default + reprepro opt-in),
+  Tailscale-style install.sh (preflight/keyring/source), fail-closed publish gate
+  + signed latest.json + XPF_PUBLISH_CMD dispatch, xpf-deploy.py fetch (verify
+  exact bytes at import), debian/xpf keyring payload (rotation), Makefile dist-*
+  targets, selftest.sh roundtrip gate (13/13), docs/distribution.md + install-images.md.
+- **File(s)**: scripts/dist/{build-apt-repo.sh,install.sh,publish.py,selftest.sh,
+  xpf-archive-keyring.asc.placeholder}, scripts/deploy/xpf-deploy.py, debian/rules,
+  Makefile, docs/distribution.md, docs/install-images.md
