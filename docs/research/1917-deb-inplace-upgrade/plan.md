@@ -1,13 +1,13 @@
 # #1917 — In-place xpf upgrade (new xpfd + userspace-dp without re-imaging)
 
-- **Revision:** 4
-- **Status:** PLAN-REVISED (round 2 complete → round 3 confirmation). Round-1: all
-  three reviewers PLAN-NEEDS-REVISION (no KILL; composed A+B+C endorsed). Round-2:
-  Codex = PLAN-NEEDS-REVISION (3 concrete blockers, now fixed in v4), Claude SMR =
-  PLAN-READY, AGY round-2 result flaked to an intent-log (its round-1 four blockers
-  are all incorporated). v4 fixes the round-2 Codex blockers: old-reader-rejecting
-  manifest envelope, single install form, kernel watchdog spec, dh helper flag.
-  Awaiting round-3 confirmation for PLAN-READY.
+- **Revision:** 5
+- **Status:** PLAN-READY (converged round 3). Round-1: all three reviewers
+  PLAN-NEEDS-REVISION (no KILL; composed A+B+C endorsed). Round-2: Codex 3 blockers
+  (fixed v4), Claude SMR premature-READY (self-corrected), AGY 4 round-1 blockers
+  (incorporated). Round-3: Codex confirmed blockers 1+3 resolved and refined
+  blocker 2 (stop-before-flip / versioned ExecStart — fixed v5) + flagged two stale
+  alias mentions (scrubbed v5); Claude SMR PLAN-READY (empirically verified the
+  envelope fail-closed); AGY round-3 in-flight. v5 closes the last Codex refinement.
 - **Branch:** `research/1917-deb-inplace-upgrade`
 - **Scope:** RESEARCH ONLY. No production source touched. Deliverable is this plan
   + three reviewer verdicts + an issue comment. Implementation is a separate
@@ -236,6 +236,25 @@ single atomic symlink flip owned by `xpf-upgrade` after verify PASS.** dpkg only
 *stages* the new versioned dir; it never touches the live symlink. This makes the
 "never serve a half-swapped set" and "matched protocol pair" invariants
 structural, not advisory.
+
+**The symlink flip alone is NOT sufficient — the running daemon must be pinned or
+stopped before the flip (round-3 Codex refinement).** Deleting the live-overwrite
+form does not by itself close the old-xpfd-respawns-new-helper window: the running
+`xpfd.service` uses `ExecStart=/usr/local/sbin/xpfd` and `findBinary` searches
+`filepath.Dir(os.Args[0])` then PATH (process.go:168), so if the live
+`/usr/local/sbin` symlink is flipped *while the old daemon is up*, that old daemon
+can resolve and respawn the NEW helper (protocol mismatch). The mechanism MUST
+therefore enforce ONE of: (a) **stop-before-flip ordering** — `xpf-upgrade` stops
+the old `xpfd` (standalone: the bounded full-cycle gap; HA: after the RG drain to
+peer) BEFORE flipping the symlink, then starts the new daemon; OR (b) **versioned
+`ExecStart` + helper config** — `xpfd.service` `ExecStart` and the helper
+`--dataplane binary` config point at the *versioned* path, and `xpf-upgrade`
+rewrites them + `daemon-reload`s as part of the atomic cut, so no process ever
+straddles two versions via the live symlink. The plan recommends (a) for the
+common full-cycle path (it is the simplest correct ordering and the gap is already
+accepted) and (b) for the M-mech-2 future hot-restart path. Either way the
+invariant is: **no running daemon resolves a binary of a different version than
+the one it was started with.**
 
 **`dh_installsystemd` auto-restart MUST be disabled (round-2 AGY blocker).** The
 default Debian helper appends a `systemctl try-restart xpfd.service` block to the
@@ -500,7 +519,7 @@ pin / one-kernel assert / verify-dataplane gate logic in bake.py is unchanged; t
 | 6 | Half-unpacked binary set serves traffic if `postinst` aborts mid-way | Correctness/Availability | Med | High | Versioned install paths + atomic-symlink flip owned by `xpf-upgrade`; running paths unchanged until verify passes |
 | 7 | `postrm purge` deletes `/etc/xpf/.configdb`/`node-id`/`master.key` | Data loss | Med | Critical | Explicitly exclude runtime state from package ownership; `postrm` never touches `/etc/xpf` |
 | 8 | CoS / per-flow state silently lost after an in-place full cycle (deploy-wipes-CoS gotcha) | Perf/Fairness | High | Med | Re-publish CoS config post-cut in `xpf-upgrade`; document re-apply; add a post-cut CoS-present check |
-| 9 | `dh_installsystemd` auto-appends `try-restart` to `postinst` → any `apt upgrade xpf` cuts the dataplane | Availability | High | High | `debian/rules`: `dh_installsystemd --no-restart-on-upgrade --no-stop-on-upgrade`; live restart only via `xpf-upgrade` post-verify (§6.3a) |
+| 9 | `dh_installsystemd` auto-appends `try-restart` to `postinst` → any `apt upgrade xpf` cuts the dataplane | Availability | High | High | `debian/rules`: `dh_installsystemd --no-stop-on-upgrade` + pinned debhelper-compat; live restart only via `xpf-upgrade` post-verify (§6.3a) |
 | 10 | Verify-gated kernel channel tries to verify an *unbooted* kernel (impossible — verifier is in the running kernel) → bad kernel could brick the node | Availability | Med | Critical | One-shot `grub-reboot` + boot-watchdog auto-fallback to old default; promote only on a PASS health beacon (§6.7) |
 | 11 | Non-atomic manifest: power cut between `active.json` and a separate `manifest.json` → mismatched DB | Data/Correctness | Med | High | Embed manifest IN `active.json` (envelope/header), keep the single-file `fsatomic` rename atomic (§8) |
 | 12 | Rolling upgrade driven by the *old* `xpf-upgrade` symlink (N) lacking N+1 orchestration logic | Correctness | Med | High | `postinst`/runbook exec the *staged* `/usr/local/lib/xpf/<N+1>/xpf-upgrade` (§6.3a) |
@@ -534,7 +553,7 @@ console). Confirms the "hold the kernel" mitigation is load-bearing.
 
 **Packaging guards (round-2):** assert the built `.deb`'s generated `postinst`
 contains NO `systemctl ... restart`/`try-restart` block (grep the maintainer
-script) — proves `--no-restart-on-upgrade` took. Assert `apt upgrade xpf` on a
+script) — proves `--no-stop-on-upgrade` took (no restart/try-restart block emitted). Assert `apt upgrade xpf` on a
 running standalone box does NOT bounce the daemon until `xpf-upgrade` is invoked.
 Assert the staged `/usr/local/lib/xpf/<N+1>/xpf-upgrade` is the binary that runs
 the cut (not the live symlink). Negative kernel test: `grub-reboot` a deliberately
