@@ -13,3 +13,7 @@ Record Codex task IDs + AGY job IDs per round so continuations can fetch by id
 - AGY: adversarial-review-mqg9bbwp-77zben (result flaked to intent-log; round-1 4 blockers all folded into v3/v4; r1 brain artifact cd31d3a1 captures position)
 - Codex r2 verdict: PLAN-NEEDS-REVISION (3 blockers: envelope unknown-field empty-load, stale /usr/local/sbin alt, watchdog unspecified) -> fixed in v4
 - Claude SMR: in-conversation
+
+## Round 3 (confirmation)
+- Codex: task-mqg9kz3s-nehkub
+- AGY: adversarial-review-mqg9l5qv-r9zvc8
