@@ -5401,3 +5401,5 @@ top.
 - **File(s)**: pkg/configstore/envelope.go (new), pkg/configstore/envelope_test.go (new), pkg/configstore/db.go, pkg/configstore/store.go, pkg/daemon/daemon.go, pkg/daemon/daemon_run.go
 - **Action**: A1 cut-over state machine (pkg/upgrade) — STAGED→PREFLIGHT→COPIED→VERIFIED→STOPPED→FLIPPED→STARTED→COMMITTED, crash-safe journal, binary+DB rollback, N=3 GC
 - **File(s)**: pkg/upgrade/{state,runner,cutover,flip,system_linux,runner_test}.go (new)
+- **Action**: HA rolling driver (B1) + `xpfd upgrade [--rolling]` subcommand + CLI-backed RollingCluster
+- **File(s)**: pkg/upgrade/{rolling,cluster_cli,rolling_test}.go (new), cmd/xpfd/{upgrade.go (new),main.go}
