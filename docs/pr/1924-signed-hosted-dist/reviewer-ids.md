@@ -14,5 +14,9 @@ Research-mode 3-way hostile plan review. Stop at PLAN-READY.
 
 ## Round 3 (final revision — all three re-review)
 - Codex: codex exec, output codex-plan-r3.md
-- AGY: adversarial-review-mqh8qe7m-14w41l
+- AGY: adversarial-review-mqh8qe7m-14w41l (MISFIRED — reviewed #1930; empty result.md)
+- AGY (re-dispatch, pinned to #1924 abs path): adversarial-review-mqh8w7bz-hbrw2r (PLAN-READY)
+- Codex: codex-plan-r3.md (PLAN-READY-WITH-NITS — both nits applied)
 - Claude SMR: claude-smr-plan-r3.md (PLAN-READY)
+
+## Convergence: PLAN-READY at r3 (all three).

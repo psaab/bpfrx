@@ -1,9 +1,10 @@
 # Plan of action — #1924: signed, hosted appliance distribution
 
 > Revision: r3 (2026-06-16)
-> Status: REVISED after r2 review (Codex PLAN-NEEDS-MAJOR + Claude SMR
-> PLAN-NEEDS-MAJOR + AGY PLAN-READY-WITH-NITS). r3 resolves the r2-introduced
-> contradictions (N1–N5) + the key-rotation lockout (NIT-2). Change logs §12.
+> Status: **PLAN-READY** — converged 3-way at r3 (Codex PLAN-READY-WITH-NITS,
+> nits applied; AGY PLAN-READY; Claude SMR PLAN-READY). All r1+r2 findings from
+> all three reviewers resolved (change logs §12). Awaiting the user's
+> `/engineer 1924` + the two OPEN QUESTIONS (hosting URLs, signing identity).
 > Branch: research/1924-signed-hosted-dist
 > Mode: `/research` convergence; implementation begins only on the user's own
 > `/engineer 1924`. No production source touched in this doc.
