@@ -1,7 +1,9 @@
 # #1917 — In-place xpf upgrade (new xpfd + userspace-dp without re-imaging)
 
-- **Revision:** 1
-- **Status:** PLAN-DRAFT (round 1, awaiting Codex + AGY + Claude-SMR hostile review)
+- **Revision:** 2
+- **Status:** PLAN-REVISED (round 1 → round 2). Codex = PLAN-NEEDS-REVISION,
+  Claude SMR = PLAN-NEEDS-REVISION, AGY = in-flight. v2 folds in the converged
+  round-1 blocking corrections; awaiting round-2 re-review for PLAN-READY.
 - **Branch:** `research/1917-deb-inplace-upgrade`
 - **Scope:** RESEARCH ONLY. No production source touched. Deliverable is this plan
   + three reviewer verdicts + an issue comment. Implementation is a separate
@@ -173,22 +175,27 @@ unit. This composition is what the rest of this plan designs.
 
 ### 6.1 Package layout (Path A subsuming #1923)
 
-Two binary packages + one metapackage:
+**The shim is EMBEDDED, not a file (round-1 correction).**
+`pkg/dataplane/userspace_xdp_rust.go:11` is `//go:embed userspace_xdp_bpfel.o`;
+`verify-dataplane` → `VerifyEmbeddedUserspaceShim` (verify_userspace_shim.go:50)
+and the production loader `loadRustUserspaceXDP()` (loader_userspace_shim.go:82)
+both consume the *embedded* bytes. A `.deb` shipping a separate `.o` file is dead
+weight nobody loads, and a drift hazard. **The shim therefore travels inside the
+`xpfd` binary; no separate shim file is packaged.**
 
-- **`xpf-dataplane`** — `/usr/local/sbin/xpf-userspace-dp` + the AF_XDP shim object
-  (the #1864 git-tracked, verifier-gated `.o`, installed to a fixed path xpfd reads
-  — note today the shim is *embedded* in the xpfd/verify binary via `go:embed`/the
-  `bpfShim`, so the `.o` may not need a separate file; the package must ship
-  *whatever the verify path consumes* and keep the embedded-vs-file decision
-  explicit). Ships `Depends:` on a kernel-floor predicate.
-- **`xpf`** — `/usr/local/sbin/xpfd`, `/usr/local/sbin/cli`,
-  `xpf-day0-config`, `xpfd.service`, `xpf-day0-config.service`. `Depends:
-  xpf-dataplane (= same version)` so the control plane and dataplane move as a
-  matched protocol pair (avoids a protocol-version mismatch by construction in the
-  common upgrade).
+One binary package + one metapackage (round-1: two-package split bought nothing
+once the shim is embedded — the protocol pair is enforced by *versioned immutable
+paths*, §6.3a, not by dpkg `Depends:` metadata which an old xpfd can ignore):
+
+- **`xpf`** — `/usr/local/lib/xpf/<version>/{xpfd,xpf-userspace-dp,cli,xpf-day0-config}`
+  (versioned install dir), `xpfd.service`, `xpf-day0-config.service`. The live
+  paths `/usr/local/sbin/{xpfd,cli,...}` are **symlinks** into the active
+  versioned dir, flipped atomically by `xpf-upgrade` (§6.3a) — NOT written
+  directly by dpkg. xpfd and the helper ship and move as one matched-protocol
+  unit (so `ProtocolVersion` cannot split in the common upgrade).
 - **`xpf-appliance`** (metapackage) — pulls `xpf` + runtime deps (frr, strongswan,
-  kea, chrony, …, the current `RUNTIME_PACKAGES` set) + the held kernel
-  meta-package. This is what the bake installs.
+  kea, chrony, …, the current `RUNTIME_PACKAGES` set) + a **held/pinned kernel
+  channel** (§6.7). This is what the bake installs.
 
 **Initial/default config:** ship **no** operator `xpf.conf` in the `.deb`
 (`conffiles` would fight day-0 and commit/rollback). The factory bootstrap (fxp0
@@ -211,6 +218,19 @@ with the test env consuming the packaged unit). Add to the unit:
   the package does not add a `xpf-userspace-dp.service`. (Whether to *split* the
   helper into its own unit so it can outlive an xpfd restart is the §6.4 daemon
   question — out of scope for packaging, in scope for the mechanism.)
+
+### 6.3a Versioned immutable paths + atomic-symlink flip (round-1 blocking fix)
+
+dpkg metadata (`Depends: = same version`) does NOT prevent an old `xpfd` from
+respawning whatever helper is on the live path (`findBinary`/`exec.Command`,
+process.go:168/76), so it cannot by itself guarantee a matched protocol pair, and
+a naive in-place file overwrite can leave a half-swapped set serving traffic. The
+plan therefore mandates: **binaries install to a versioned dir
+`/usr/local/lib/xpf/<version>/`; the running paths are symlinks; the cut-over is a
+single atomic symlink flip owned by `xpf-upgrade` after verify PASS.** dpkg only
+*stages* the new versioned dir; it never touches the live symlink. This makes the
+"never serve a half-swapped set" and "matched protocol pair" invariants
+structural, not advisory.
 
 ### 6.3 The `.deb` `postinst` — verify-before-cut, delegating the mechanism
 
@@ -287,6 +307,29 @@ mismatch** rather than attempt a hot re-attach. The `XPF_PROTOCOL_WIRE_REGEN`
 fixtures + key-absent pins are the compatibility test surface to extend with a
 "new-xpfd vs old-running-helper protocol-gate" case.
 
+### 6.7 The held/verify-gated kernel channel (resolves the Path-A contradiction)
+
+The operator premise "base OS self-updates via apt" is **partially self-defeating**
+because the shim is verifier-gated to a kernel floor (≥6.18), so an unattended
+kernel bump can land a kernel the embedded `.o` has never been verified against.
+The honest restatement: **userspace self-updates freely via apt; the KERNEL does
+NOT free-update.** The plan offers a *verify-gated kernel channel* rather than a
+permanent blanket hold:
+
+- `linux-*` is held by default (`apt-mark hold`), so unattended `apt upgrade`
+  cannot move the floor.
+- A kernel bump is an explicit operator action (`xpf-upgrade kernel <ver>`) that:
+  installs the candidate kernel *unbooted*, runs `verify-dataplane` against it
+  (boot once in a holding state or via a kexec-style probe), and only on PASS
+  marks it the boot default. A verify FAIL leaves the running kernel as boot
+  default and surfaces an actionable error.
+- Heavy/uncertain kernel moves still go through Path C (image-replace), the
+  fully-tested unit.
+
+This converts "hold the kernel forever" (which guts Path A's value) into "the
+kernel updates through a tested gate," which preserves the appliance's verifier
+invariant without abandoning kernel CVE remediation.
+
 ### 6.6 How the bake consumes the `.deb` (replaces `--copy-in`)
 
 `bake.py` `virt_customize()` drops the 6 `--copy-in` lines for the xpf binaries +
@@ -329,9 +372,44 @@ pin / one-kernel assert / verify-dataplane gate logic in bake.py is unchanged; t
   min-reader version, rollback-slot format version, journal schema version) +
   startup validation + gating auto-rollback on "state-format floor not advanced."
   This plan adopts that requirement verbatim as a §6 deliverable.**
+  **First-upgrade chicken-and-egg, resolved (round-1):** absence of a manifest is
+  NOT corruption. The manifest's job is *forward*-gating (an old binary refusing
+  too-new state), not backward corruption detection. The N→N+1 boot defines these
+  no-manifest cases explicitly: (a) **fresh install** — no `active.json`, no
+  manifest → start clean, write a manifest on first commit; (b) **legacy
+  parseable state** — `active.json` present, no manifest → treat as
+  schema-version-0, parse normally, write a manifest on first successful load;
+  (c) **missing active**, rollback slots present → existing boot fallback,
+  manifest-version-0; (d) **corrupt/truncated active** — caught by the existing
+  `json.Unmarshal` error path independent of the manifest, so manifest absence
+  never masks corruption; (e) **encrypted active with/without `master.key`** —
+  the manifest is written *outside* the encryption envelope (its version readable
+  pre-decrypt) so a min-reader gate fires before a decrypt failure is misread as
+  corruption. Only once a manifest EXISTS does its `min_reader_version` gate a
+  too-old binary. This makes the manifest purely additive and safe for the very
+  first upgrade.
 - **Shim verifier gate must hold post-cut and post-kernel-bump:** ExecStartPre
   verify on every start; bake-time assert one kernel ≥6.18; **base apt kernel
-  updates HELD** so they cannot move the floor without a tested image-replace.
+  updates HELD by default** and only moved through the §6.7 verify-gated kernel
+  channel (verify the embedded shim against the candidate kernel before making it
+  boot default) or a tested image-replace. The operator premise is restated:
+  **userspace self-updates via apt; the kernel does NOT free-update** (RISK #2).
+- **HA auto-rollback is unsafe mid-rolling (round-1, RISK #7):** heartbeat already
+  carries the software version (`heartbeat.go:66`) but it is *surfaced, not gated*
+  (`status.go:34`); only HA-protocol mismatch blocks transfer readiness
+  (`daemon_ha_userspace.go:930`). So **auto-rollback is standalone-only**; in HA a
+  node that fails post-cut health stays drained/secondary and ALERTS rather than
+  auto-reverting into a version-split cluster. A future enhancement may *gate*
+  takeover on a software-version transaction, but #1917 ships operator-driven HA
+  rollback.
+- **Honest dataplane gap (round-1, RISK #1/#6):** a standalone full cycle is a
+  **measured multi-second outage**, not "brief": helper respawn has a 3s NAPI
+  bootstrap window (process.go:98), ctrl-enable adds 3s standalone / 15s HA
+  (maps_sync.go:370/392), and XSK liveness can run up to 10s (maps_sync.go:482).
+  The plan commits to *measuring* it; if the number is unacceptable for a
+  standalone box, that box should use image-replace (Path C), and the issue's
+  "zero dataplane gap" standalone acceptance is **unmeetable without the future
+  M-mech-2 decoupled-helper work**.
 - **Mgmt never stranded:** a cut-over / apt action must not bring down fxp0 or the
   lifeline NIC. This is #1922's protected-set; #1917 depends on it for foreign-host
   / non-appliance installs and for any apt action that perturbs interfaces.
@@ -362,7 +440,8 @@ pin / one-kernel assert / verify-dataplane gate logic in bake.py is unchanged; t
 ## 10. Test plan
 
 **Standalone in-place upgrade (M-mech-1):**
-- Build `xpf`/`xpf-dataplane` `.deb`s at commit N and N+1.
+- Build the `xpf` (+ `xpf-appliance`) `.deb` at commit N and N+1 (single binary
+  package — shim embedded, §6.1).
 - On the standalone test VM (`make test-deploy` env): `apt install xpf=N`, establish
   iperf3 + long-lived sessions, `apt install xpf=N+1`, assert: verify-dataplane ran
   and passed before cut; **measure and bound the dataplane gap** (iperf3 retr +
@@ -404,6 +483,16 @@ auto-rollback is refused when the state floor advanced.
 - RPM / non-Debian packaging.
 
 ## Hostile open questions (each invitable to PLAN-KILL)
+
+> **Round-1 resolution status (v2):** Q1 resolved → re-scope #1917 to
+> mechanism+HA-rolling consuming #1923 (§4). Q2 resolved → §6.7 verify-gated
+> kernel channel + restated premise (RISK #2). Q3 resolved → honest measured
+> multi-second gap, M-mech-1 not zero-gap (§8/RISK #1). Q5 resolved → manifest
+> first-upgrade five-case enumeration (§8). Q6 resolved → embedded shim, no file
+> packaged (§6.1). Q7 resolved → HA auto-rollback operator-driven (§8/RISK #7).
+> Q4 (postinst safe on HA?) resolved → versioned immutable paths + symlink flip
+> + HA-refuse (§6.3a). Remaining live for round-2 review: whether the residual
+> M-mech-2 follow-up scoping and the kernel-channel implementability hold up.
 
 1. **Does the `.deb` framing actually buy anything #1917 needs that Path B alone
    doesn't?** If the hard mechanism (verify/cut/rollback/HA-rolling) lives in
