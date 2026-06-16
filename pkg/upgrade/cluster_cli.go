@@ -272,44 +272,98 @@ func parsePeerTakeoverReady(s string) bool {
 // peer became primary, so a healthy-but-stuck peer could leave BOTH nodes
 // secondary with VIPs stranded. We confirm the peer has taken ownership.
 //
-// FormatStatus emits a "Node name: nodeL" header then, per RG, a local row
-// "nodeL  <prio>  <state> ..." immediately followed (if the peer is alive)
-// by a peer row "nodeP  <prio>  <state> ...". We classify each
-// "node<N> ... <state>" row by whether <N> is the local node id.
+// FormatStatus emits, per RG, a "Redundancy group: N , Failover count: M"
+// header then a local row "nodeL  <prio>  <state> ..." and (if the peer is
+// alive) a peer row "nodeP  <prio>  <state> ...". Drain is complete only
+// when, for EVERY redundancy group, the local row is secondary AND the
+// peer row is primary — a PER-RG pairing (Codex r3 High): a global
+// "any peer primary" OR would wrongly pass an active-active cluster where
+// the peer owns one RG but not the other the local node evacuated.
 func parseDrainComplete(s string) bool {
 	localID, ok := parseLocalNodeID(s)
 	if !ok {
 		return false // cannot identify the local node => fail closed
 	}
-	sawLocal, sawPeerPrimary := false, false
+
+	type rgPair struct {
+		localState string
+		peerState  string
+		sawLocal   bool
+		sawPeer    bool
+	}
+	groups := map[int]*rgPair{}
+	curRG := -1
+	sawAnyRG := false
+
 	for _, line := range strings.Split(s, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 3 {
+		l := strings.TrimSpace(line)
+		ll := strings.ToLower(l)
+		// RG header: "Redundancy group: N , Failover count: M".
+		if strings.HasPrefix(ll, "redundancy group:") {
+			rest := strings.TrimSpace(l[len("Redundancy group:"):])
+			f := strings.Fields(rest)
+			if len(f) > 0 {
+				if n, nok := atoiSafe(f[0]); nok {
+					curRG = n
+					sawAnyRG = true
+					if groups[curRG] == nil {
+						groups[curRG] = &rgPair{}
+					}
+				}
+			}
 			continue
 		}
-		// Node rows start with "node<N>".
-		if !strings.HasPrefix(fields[0], "node") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 || !strings.HasPrefix(fields[0], "node") {
 			continue
 		}
 		id, idOK := parseNodeToken(fields[0])
-		if !idOK {
+		if !idOK || curRG < 0 {
 			continue
 		}
-		// The state column is field index 2 ("node prio state ...").
-		state := strings.ToLower(fields[2])
+		state := strings.ToLower(fields[2]) // "node prio state ..."
+		g := groups[curRG]
+		if g == nil {
+			g = &rgPair{}
+			groups[curRG] = g
+		}
 		if id == localID {
-			sawLocal = true
-			if state != "secondary" {
-				return false // local still owns an RG (or transitional)
-			}
+			g.localState, g.sawLocal = state, true
 		} else {
-			if state == "primary" {
-				sawPeerPrimary = true
-			}
+			g.peerState, g.sawPeer = state, true
 		}
 	}
-	// Require we saw the local node demoted AND the peer holding primary.
-	return sawLocal && sawPeerPrimary
+
+	if !sawAnyRG || len(groups) == 0 {
+		return false // no RG rows => fail closed
+	}
+	for _, g := range groups {
+		if !g.sawLocal || !g.sawPeer {
+			return false // both rows required to confirm the handoff
+		}
+		if g.localState != "secondary" || g.peerState != "primary" {
+			return false
+		}
+	}
+	return true
+}
+
+// atoiSafe parses a base-10 non-negative integer, tolerating trailing
+// non-digit cruft is NOT allowed (strict — the caller passes a clean
+// field).
+func atoiSafe(tok string) (int, bool) {
+	tok = strings.TrimSpace(tok)
+	if tok == "" {
+		return 0, false
+	}
+	n := 0
+	for _, r := range tok {
+		if r < '0' || r > '9' {
+			return 0, false
+		}
+		n = n*10 + int(r-'0')
+	}
+	return n, true
 }
 
 // parseLocalNodeID reads the "Node name: nodeN" header line FormatStatus

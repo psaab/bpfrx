@@ -75,17 +75,40 @@ func TestDrainParser_Fixtures(t *testing.T) {
 	}, "\n")
 	localStillPrimary := strings.Join([]string{
 		"Node name: node0",
+		"Redundancy group: 0 , Failover count: 0",
 		"node0   200      primary        yes      no       None",
 		"node1   100      secondary      yes      no       None",
 	}, "\n")
 	bothSecondary := strings.Join([]string{
 		"Node name: node0",
+		"Redundancy group: 0 , Failover count: 0",
 		"node0   100      secondary      yes      no       None",
 		"node1   100      secondary      yes      no       None",
 	}, "\n")
 	localSecondaryNoPeer := strings.Join([]string{
 		"Node name: node0",
+		"Redundancy group: 0 , Failover count: 0",
 		"node0   100      secondary      yes      no       None",
+	}, "\n")
+	// Multi-RG (Codex r3): RG0 fully handed off, RG1 peer still secondary —
+	// NOT drained (per-RG pairing, not global any-peer-primary).
+	multiRGPartial := strings.Join([]string{
+		"Node name: node0",
+		"Redundancy group: 0 , Failover count: 1",
+		"node0   100      secondary      yes      no       None",
+		"node1   200      primary        yes      no       None",
+		"Redundancy group: 1 , Failover count: 0",
+		"node0   100      secondary      yes      no       None",
+		"node1   100      secondary      yes      no       None",
+	}, "\n")
+	multiRGDrained := strings.Join([]string{
+		"Node name: node0",
+		"Redundancy group: 0 , Failover count: 1",
+		"node0   100      secondary      yes      no       None",
+		"node1   200      primary        yes      no       None",
+		"Redundancy group: 1 , Failover count: 1",
+		"node0   100      secondary      yes      no       None",
+		"node1   200      primary        yes      no       None",
 	}, "\n")
 
 	if !parseDrainComplete(drained) {
@@ -99,6 +122,12 @@ func TestDrainParser_Fixtures(t *testing.T) {
 	}
 	if parseDrainComplete(localSecondaryNoPeer) {
 		t.Error("local secondary with no peer-primary row must NOT be drain-complete")
+	}
+	if parseDrainComplete(multiRGPartial) {
+		t.Error("multi-RG with one RG peer-secondary must NOT be drain-complete (per-RG pairing)")
+	}
+	if !parseDrainComplete(multiRGDrained) {
+		t.Error("multi-RG all-handed-off should be drain-complete")
 	}
 	if parseDrainComplete("garbage\nno node rows") {
 		t.Error("garbled output read as drained")

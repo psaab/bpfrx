@@ -5411,3 +5411,5 @@ top.
 - **File(s)**: pkg/upgrade/{state,cutover,flip,system_linux,cluster_cli,runner_test,cluster_cli_test}.go, cmd/xpfd/upgrade.go, test/incus/cluster-setup.sh
 - **Action**: Code-review round 2 fixes (Codex r2 + AGY r2) — DrainComplete requires peer-primary (status topic), sync gate on Status: Up, stale half-cut finished-to-completion, orphan dbsnap gc sweep, protocol-bump limitation documented
 - **File(s)**: pkg/upgrade/{cutover,cluster_cli,flip,runner_test,cluster_cli_test}.go, docs/in-place-upgrade.md
+- **Action**: Code-review round 3 fix (Codex r3 High) — parseDrainComplete now per-RG paired (every RG: local secondary + peer primary), not global any-peer-primary
+- **File(s)**: pkg/upgrade/cluster_cli.go, pkg/upgrade/cluster_cli_test.go
