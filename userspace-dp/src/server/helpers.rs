@@ -695,6 +695,20 @@ pub(crate) fn replan_queues(
             } else {
                 iface.linux_name.clone()
             };
+            // #1921: dedup by Linux netdev. The snapshot lists BOTH the
+            // physical interface (`ge-0/0/0`) and its unit (`ge-0/0/0.0`);
+            // both start with `ge-` and (for a non-VLAN unit) resolve to the
+            // SAME Linux netdev (`ge-0-0-0`). Without this guard each netdev
+            // is pushed twice, so replan_bindings_from_candidates plans two
+            // bindings per (ifindex, queue_id) — a guaranteed double-bind:
+            // the second XSK bind on an already-bound queue returns EBUSY,
+            // the queue never goes READY, and the shim drops all transit on
+            // it (the virtio multi-queue forwarding outage). One XSK per
+            // (netdev, queue) is the AF_XDP contract; collapse duplicates
+            // here exactly as the fabric loop below already does.
+            if seen_linux.contains(&linux_name) {
+                continue;
+            }
             let rx_queues = if iface.rx_queues > 0 {
                 iface.rx_queues
             } else {

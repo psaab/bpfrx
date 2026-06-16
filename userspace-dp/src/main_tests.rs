@@ -640,6 +640,57 @@ fn queue_planner_uses_smallest_queue_count() {
 }
 
 #[test]
+fn queue_planner_dedups_physical_and_unit_to_same_netdev() {
+    // #1921 regression: the snapshot lists BOTH the physical interface and
+    // its unit (`ge-0/0/0` + `ge-0/0/0.0`); for a non-VLAN unit both resolve
+    // to the SAME Linux netdev. replan_queues must plan ONE binding per
+    // (netdev, queue_id), not two — a duplicate is a guaranteed double-bind
+    // (the second XSK on an already-bound queue returns EBUSY, the queue
+    // never goes READY, and transit is dropped: the virtio multi-queue
+    // forwarding outage).
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![
+            InterfaceSnapshot {
+                name: "ge-0/0/0".to_string(),
+                linux_name: "ge-0-0-0".to_string(),
+                rx_queues: 4,
+                ..Default::default()
+            },
+            InterfaceSnapshot {
+                // unit 0 of the same physical NIC — same Linux netdev.
+                name: "ge-0/0/0.0".to_string(),
+                linux_name: "ge-0-0-0".to_string(),
+                rx_queues: 4,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let bindings = replan_queues(Some(&snapshot), 1, &[]);
+    // 4 queues x 1 netdev = 4 bindings, NOT 8.
+    assert_eq!(
+        bindings.len(),
+        4,
+        "physical+unit on the same netdev must not double the binding plan"
+    );
+    // Every (ifindex, queue_id) pair must be unique (no double-bind).
+    let mut seen = std::collections::HashSet::new();
+    for b in &bindings {
+        assert!(
+            seen.insert((b.ifindex, b.queue_id)),
+            "duplicate binding for (ifindex={}, queue_id={})",
+            b.ifindex,
+            b.queue_id
+        );
+    }
+    let queues = summarize_queues(&bindings);
+    assert_eq!(queues.len(), 4);
+    for q in &queues {
+        assert_eq!(q.interfaces, vec!["ge-0-0-0".to_string()]);
+    }
+}
+
+#[test]
 fn afxdp_runtime_stays_off_when_forwarding_is_unarmed() {
     let status = ProcessStatus {
         forwarding_armed: false,
