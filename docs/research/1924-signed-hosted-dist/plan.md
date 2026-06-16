@@ -1,7 +1,8 @@
 # Plan of action — #1924: signed, hosted appliance distribution
 
-> Revision: r1 (2026-06-16)
-> Status: DRAFTING — pre-review
+> Revision: r2 (2026-06-16)
+> Status: REVISED after r1 3-way hostile review (Codex + AGY + Claude SMR all
+> PLAN-NEEDS-MAJOR). r2 changes log at the bottom (§12).
 > Branch: research/1924-signed-hosted-dist
 > Mode: `/research` — STOPS at PLAN-READY. No implementation, no PR, no
 > production source touched until `/engineer 1924`.
@@ -61,7 +62,7 @@ source is touched. Surface:
 | Image verify (deploy/validate) | extend (optional gate) | `scripts/deploy/xpf-deploy.py`, `scripts/image/validate.py` |
 | `.deb` repo build tooling | NEW | `scripts/dist/` (repo builder + signer) |
 | `install.sh` | NEW | `scripts/dist/install.sh` (or `dist/install.sh` template) |
-| Public key (pinned) | NEW (placeholder until OQ-2) | `scripts/dist/xpf-archive-keyring.asc` / `xpf.pub` |
+| Public key (pinned) | NEW (placeholder until OQ-2) | `scripts/dist/xpf-image.pub` (minisign, image+install.sh) + `scripts/dist/xpf-archive-keyring.asc` (PGP, apt) |
 | Makefile | extend | `dist-sign`, `dist-repo`, `dist-publish` targets |
 | Docs | extend / NEW | `docs/install-images.md`, NEW `docs/distribution.md` |
 | CI/release (optional) | NEW (deferrable) | `.github/workflows/release.yml` |
@@ -101,10 +102,15 @@ There are TWO distinct trust roots, and the plan keeps them clean:
   `/etc/apt/keyrings/` (modern deb822 / signed-by, NOT legacy `apt-key`).
 
 The `install.sh` bootstrap is the ONLY moment trust is established over the
-network, so it is the highest-risk step and gets the most scrutiny (§5, §8).
-We **pin the keyring fingerprint inside install.sh** (and verify the fetched
-keyring against it) so a compromised host serving a bad keyring is caught —
-install.sh's own integrity is the remaining root (mitigations in §8).
+network, so it is the highest-risk step and gets the most scrutiny (§4C, §8).
+**r2:** install.sh **embeds the archive keyring inline** (it does NOT fetch +
+pin a fingerprint — those were mutually exclusive in r1; we picked inline).
+install.sh's own integrity is therefore the bootstrap root. The minisign
+**image** pubkey (`xpf-image.pub`) used for Tier-B verify-before-run has its
+root of trust in the **in-repo checked-in copy obtained via `git clone` /
+GitHub — independent of `XPF_DIST_BASE_URL`**; the copy served from the dist
+host is a convenience, NEVER the trust root (else verification is circular).
+Mitigations and the honest trust tiers are in §4C + §8.
 
 ## 4. Multiple Path Options
 
@@ -150,12 +156,33 @@ signing identity.
 | **aptly** | snapshots, multi-version, mirroring, publish to S3 natively, channels (stable/edge) map to "distributions" cleanly | larger, its own DB, more moving parts than we need for one package |
 | **flat signed repo** (hand-rolled `dpkg-scanpackages` + `apt-ftparchive` + `gpg` over a flat `Release`) | zero extra tooling beyond dpkg + gpg; trivially scriptable; matches the appliance's "small set of debs" reality | we own all the index correctness; flat repos are slightly less standard for deb822 `signed-by` (work fine though) |
 
-**Recommendation:** **reprepro** for the pool repo. It is the smallest mature
-tool that produces a correct signed `Release`/`InRelease` with channels via
-distinct distributions (`stable`, `edge`), and its `conf/distributions` is one
-readable file. `aptly` is the upgrade path IF OQ-1 picks S3 + we later need
-snapshots/mirroring. The flat-repo path is the zero-dependency fallback
-(documented) if reprepro is unwanted on the build host.
+**Recommendation (r2 REVISED — resolves AGY-MEDIUM-2):** the choice now
+DEPENDS on the publish model (OQ-1), and the plan says so instead of
+prescribing reprepro unconditionally:
+- **Stateful publisher (a persistent host/bucket that survives between
+  releases): reprepro.** Smallest mature tool, signed `Release`/`InRelease`,
+  `stable`/`edge` as distinct distributions, one readable `conf/distributions`.
+  Its Berkeley-DB under `db/` is fine when that state persists.
+- **Stateless CI publisher (e.g. a fresh GitHub Actions runner each release):
+  flat signed repo** generated from scratch via `apt-ftparchive` /
+  `dpkg-scanpackages` + `gpg --clearsign` over `Release`/`InRelease`. No DB to
+  carry between runs; the existing pool is `aws s3 sync`'d down (or `gh release
+  download`'d), the new `.deb` added, the indices regenerated, re-signed,
+  re-uploaded. This is the model that does NOT break when the runner's local
+  `db/` is destroyed (AGY-MEDIUM-2).
+- **aptly** remains the option if S3-native publish + snapshots/mirroring are
+  wanted (it manages its own state + publishes to S3 directly).
+
+**Default recommendation: the flat signed repo**, because it is robust to BOTH
+stateful and stateless publishers and has zero non-dpkg/gpg dependencies; pick
+reprepro only if the publisher is known-persistent and the operator prefers its
+ergonomics. Either way the on-disk contract is identical (deb822 `Signed-By`,
+signed `InRelease`), so the install.sh side is unaffected by the choice.
+
+**r2 retention (resolves Codex-3 for the apt side):** apt suites keep the
+latest `.deb` per arch; apt-level rollback to an older `.deb` is NOT a goal —
+rollback is `xpfd upgrade`'s job (#1917). If apt-pin-to-old IS wanted, that is
+the aptly/multi-version path (a user OQ, flagged in §9).
 
 Channel layout (deb822, the contract install.sh writes):
 ```
@@ -180,10 +207,24 @@ Channel layout (deb822, the contract install.sh writes):
 install.sh (Tailscale does exactly this) AND verify the fetched `.deb`/repo
 through apt's own signed `Release`. The keyring-in-install.sh means there is
 exactly ONE artifact whose integrity matters at bootstrap (install.sh itself),
-and we publish install.sh over HTTPS at a stable URL + document a
-`curl … | sha256sum` / signature check for the paranoid (§8). Inline-embed is
-strictly simpler to reason about than fetch+pin-fingerprint (which still
-reduces to "trust the fingerprint hash in install.sh"). TOFU is rejected.
+and we publish install.sh over HTTPS at a stable URL. **r2 (resolves Codex-5):**
+the inline-embed and the "fetch keyring + pin fingerprint" options are mutually
+exclusive — the plan picks inline-embed and drops the fingerprint-pin language
+from §3. The trust model is therefore precisely: *"an authentic install.sh
+CONTAINS the apt archive key."* TOFU is rejected.
+
+**r2 honest trust tiers (resolves SMR-F2 + Codex-6):** there are two clearly
+separated UX tiers, labeled as such in the docs:
+- **Tier A — `curl -fsSL <url>/install.sh | sh`** (the one-liner). Trust level:
+  TLS + first-fetch trust of install.sh. This is the SAME level Tailscale /
+  Docker / rustup accept. The `.minisig` does NOT retroactively protect this
+  user (they ran the script before verifying). State this honestly.
+- **Tier B — verify-before-run.** The operator obtains `xpf-image.pub` **via
+  `git clone` of the source repo (out-of-band root)**, fetches install.sh +
+  `install.sh.minisig`, runs `minisign -V`, reads the script, THEN runs it.
+  The loop closes ONLY because the pubkey came from the repo, not the dist host
+  (SMR-F1). Docs MUST say: "get the pubkey/fingerprint from the source repo or
+  release notes, NEVER from `XPF_DIST_BASE_URL`."
 
 ### 4D. Hosting / publish (OQ-1 — value is the user's; mechanism here)
 
@@ -202,41 +243,80 @@ user tunes. **No backend is hardcoded.**
 
 ## 5. Detailed mechanism (recommended path)
 
-### 5.1 Image signing (bake.py, additive)
-After step 6 writes `dist/SHA256SUMS`, add step 6b:
+### 5.1 Image signing (bake.py, additive) — PER-VERSION, not a global SHA256SUMS
+
+**r2 change (resolves Codex-3 retention + AGY-HIGH-1 partial-download +
+SMR-F3/Codex-1 path-binding):** the bake stops emitting a single global
+`dist/SHA256SUMS`. Instead each bake writes a **per-version, version-named**
+checksum manifest and signs THAT:
 ```
-minisign -S -s "$XPF_SIGN_SECKEY" -m dist/SHA256SUMS \
-         -t "xpf image $ver" -x dist/SHA256SUMS.minisig
+dist/xpf-<ver>.SHA256SUMS          # lists exactly this version's qcow2 + metadata
+dist/xpf-<ver>.SHA256SUMS.minisig  # minisign over the per-version manifest
 ```
+Signing step (after step 6):
+```
+minisign -S -s "$XPF_SIGN_SECKEY" -m dist/xpf-<ver>.SHA256SUMS \
+         -t "xpf image <ver> sha256sums" -x dist/xpf-<ver>.SHA256SUMS.minisig
+```
+- **Why per-version:** retaining v1 alongside v2 (Codex-3) no longer orphans
+  v1's checksums — each version owns its signed manifest. A `latest` symlink/
+  pointer (`dist/<channel>/latest -> xpf-<ver>.*`) is a convenience, never the
+  trust root.
+- The manifest lists BOTH the qcow2 and the incus metadata, BUT verification
+  (§5.2) is **per-file**, so the libvirt operator who only fetched the qcow2
+  can verify it without the metadata present (AGY-HIGH-1).
 - `XPF_SIGN_SECKEY` is a PATH to the secret key (OQ-2), never the key bytes.
-  If unset, bake prints a clear WARNING and skips signing (so a dev bake still
-  works), exactly like `--skip-validate` today warns "do not publish".
+  If unset, bake prints a loud WARNING and skips signing (dev ergonomics);
+  the publish-time guard (§5.5) then REFUSES to publish unsigned artifacts —
+  signing is fail-OPEN at bake but fail-CLOSED at publish.
 - The pinned PUBLIC key ships in-repo as `scripts/dist/xpf-image.pub` and is
-  ALSO copied into `dist/` so the published tree is self-describing.
-- One signature over `SHA256SUMS` transitively covers both image artifacts
-  (the checksums inside are verified after the signature checks out).
+  copied into `dist/` so the published tree is self-describing. **Its root of
+  trust is the in-repo checked-in copy obtained via `git clone`/GitHub —
+  independent of `XPF_DIST_BASE_URL`. The published copy is convenience only,
+  NEVER the root** (SMR-F1, Codex-6, AGY-MEDIUM-1).
 
-### 5.2 Image verify (validate.py + xpf-deploy.py, optional gate)
-Add a `verify_artifacts(qcow2, metadata, sigdir)` helper:
-1. `minisign -V -p <pinned pub> -m SHA256SUMS -x SHA256SUMS.minisig`
-2. then `sha256sum -c SHA256SUMS` for the two files.
+### 5.2 Image verify (validate.py + xpf-deploy.py) — verify the EXACT imported file
+
+**r2 change (resolves SMR-F3 + Codex-1 + AGY-HIGH-1):** the verifier does NOT
+run a cwd-relative `sha256sum -c`. It:
+1. `minisign -V -p <pinned pub> -m xpf-<ver>.SHA256SUMS -x …minisig` — proves
+   the manifest is authentic.
+2. **Parses** the manifest, rejecting pathful entries and duplicate basenames,
+   into `{basename: hash}`.
+3. For EACH file actually being imported (the concrete `--qcow2` / `--metadata`
+   argument paths), computes its SHA256 and compares against the manifest entry
+   for that file's basename. A file not listed, or a hash mismatch, FAILS.
+   Files in the manifest that the operator did NOT fetch are simply not checked
+   (per-file, so qcow2-only libvirt verifies fine).
+Helper: `verify_image_artifact(path, manifest, minisig, pubkey)` — single-file,
+reused by both consumers.
 Wire it as:
-- `validate.py`: a new `--verify-sig` flag (default ON when a `.minisig` is
-  present next to the artifacts; a `--no-verify-sig` escape hatch for local
-  dev bakes that skipped signing).
-- `xpf-deploy.py`: verify the image at `import_image`-equivalent time before
-  `incus image import` / `virt-install --import`. If the operator points at a
-  hosted URL (future `--image-url`), fetch then verify then import.
-- The pinned pubkey path is a constant in the script (checked-in pub) with an
-  `XPF_IMAGE_PUBKEY` override for rotation/testing.
+- `validate.py`: `--verify-sig` (default ON when a `.minisig` is present next
+  to the artifacts; `--no-verify-sig` escape hatch for local dev bakes).
+- `xpf-deploy.py`: verify each image file before `incus image import` /
+  `virt-install --import`. Future `--image-url` fetches then verifies then
+  imports the EXACT downloaded file.
+- Pinned pubkey path is a checked-in constant; `XPF_IMAGE_PUBKEY` overrides for
+  rotation/testing.
 
-### 5.3 Apt repo (NEW scripts/dist/build-apt-repo.sh + reprepro)
-- `conf/distributions` with `stable` and `edge` suites, `Components: main`,
-  `Architectures: amd64`, `SignWith: <KEYID>` (OQ-2 PGP key).
-- `make dist-repo` runs `make deb` then `reprepro -b <repo> includedeb
-  <suite> dist/deb/xpf_*.deb dist/deb/xpf-appliance_*.deb`.
-- Output is the standard pool/dists tree under `dist/apt/`, ready to publish.
-- Flat-repo fallback script documented for no-reprepro hosts.
+### 5.3 Apt repo (NEW scripts/dist/build-apt-repo.sh)
+Default = the flat signed repo (stateless-safe, §4B); reprepro is an opt-in.
+- Inputs: the existing pool (synced down from `XPF_DIST_BASE_URL` if present),
+  the freshly built `dist/deb/xpf_*.deb` + `xpf-appliance_*.deb`, the channel
+  (`stable`/`edge`), the PGP key (OQ-2).
+- Flat path: lay out `pool/main/x/xpf/*.deb`; `apt-ftparchive packages` →
+  `dists/<suite>/main/binary-amd64/Packages{,.gz}`; `apt-ftparchive release` →
+  `dists/<suite>/Release`; `gpg --clearsign -o InRelease` + `gpg -abs -o
+  Release.gpg`; include `Valid-Until` (§5.6 freshness).
+- reprepro path (opt-in `XPF_APT_TOOL=reprepro`): `conf/distributions` with
+  `stable`/`edge`, `Components: main`, `Architectures: amd64`,
+  `SignWith: <KEYID>`; `reprepro includedeb <suite> …`.
+- Output: standard `dists/` + `pool/` tree under `dist/apt/`, ready to publish.
+- **r2 GitHub-Releases caveat (AGY-MEDIUM-3):** if OQ-1 = GitHub Releases, a
+  per-tag flat-asset layout CANNOT serve a `dists/`+`pool/` directory tree;
+  GitHub Pages or a bucket is required for the APT pool even when the IMAGES
+  use Release assets. The plan flags this as an OQ-1 constraint, not a blocker
+  to the mechanism (the flat tree is identical wherever it is served from).
 
 ### 5.4 install.sh (NEW)
 Tailscale-shaped, POSIX sh, idempotent:
@@ -251,17 +331,67 @@ Tailscale-shaped, POSIX sh, idempotent:
    interface-takeover warning from #1879 is RESTATED here because a bare-metal
    `apt install` on a remote box can cut mgmt if fxp0 mapping is wrong).
 - `install.sh` is itself published at `XPF_DIST_BASE_URL/install.sh` and the
-  doc gives the `curl -fsSL … | sh` one-liner PLUS the paranoid
-  "download, read, verify, run" variant.
+  doc gives both Tier A (one-liner) and Tier B (verify-before-run) per §4C.
 
-### 5.5 Makefile + docs
+**r2 (resolves AGY-HIGH-2) — apt UPGRADE inherits #1917's postinst cut-over.**
+install.sh's FIRST install is safe (no running daemon to cut). But a later
+`apt upgrade xpf-appliance` (the whole point of the repo) runs the `xpf`
+package's postinst, which on a STANDALONE node invokes `xpfd upgrade` — a
+verified STOP→FLIP→START with a bounded MEASURED multi-second DATAPLANE gap
+(it does not cut the mgmt path; fxp0/SSH is not forward-switched, and the
+postinst has a safety-net `systemctl is-active` restart). This is #1917's
+existing, reviewed mechanism — **#1924 does NOT change it**. The plan's only
+obligations here are DOCUMENTATION:
+- `docs/distribution.md` states that `apt upgrade` triggers a dataplane blip on
+  standalone nodes, and documents `XPF_NO_POSTINST_CUT=1 apt-get upgrade` (the
+  existing postinst escape hatch) for operators who want stage-only + manual
+  `xpfd upgrade` at a chosen time.
+- For HA nodes (`/etc/xpf/node-id` present) the postinst is already STAGE-ONLY;
+  the repo upgrade does NOT cut — `xpfd upgrade --rolling` does. Doc restates
+  this so an operator does not `apt upgrade` both nodes expecting auto-rolling.
+- No `postinst` / `pkg/upgrade` code is in scope for #1924.
+
+### 5.5 Makefile + docs + fail-closed publish
+
 - `make dist-sign` (sign existing dist/ image artifacts), `make dist-repo`
   (build signed apt repo), `make dist-publish` (push via `XPF_PUBLISH_CMD`).
+- **r2 fail-closed publish (resolves Codex-2 + SMR-F6):** `make dist-publish`
+  runs a PRECONDITION gate before invoking `XPF_PUBLISH_CMD`. It REFUSES (exit
+  non-zero, nothing uploaded) unless, for every artifact in the publish set:
+  (a) each image has a verifying `xpf-<ver>.SHA256SUMS.minisig` against the
+  pinned pubkey; (b) the apt `InRelease` verifies against the archive pubkey;
+  (c) `install.sh.minisig` verifies (if install.sh is in the set). Bake may be
+  fail-open (dev ergonomics) but PUBLISH is fail-closed — an unsigned dev bake
+  can never reach the channel.
+- **r2 `XPF_PUBLISH_CMD` contract (resolves SMR-F5):** invoked exactly as
+  `$XPF_PUBLISH_CMD <local-dist-dir> <XPF_DIST_BASE_URL>`; must be idempotent
+  and exit non-zero on failure. The plan documents this signature so the
+  backend (rsync / `aws s3 sync` / `gh release upload` wrapper) is a thin shim.
 - NEW `docs/distribution.md`: the publisher runbook (key management pointers,
-  channel policy, retention, publish backends) + the operator runbook (the
-  install.sh one-liner, the manual apt steps, the image verify steps).
+  channel policy, retention, publish backends, the `apt upgrade` blip note from
+  §5.4) + the operator runbook (install.sh Tier A/B, the manual apt steps, the
+  image verify steps, the out-of-band pubkey source).
 - Extend `docs/install-images.md`: replace "copy files by hand" with "fetch +
-  verify from `XPF_DIST_BASE_URL`"; document `SHA256SUMS.minisig`.
+  verify from `XPF_DIST_BASE_URL`"; document the per-version
+  `xpf-<ver>.SHA256SUMS.minisig`.
+
+### 5.6 Freshness / anti-rollback (r2 — resolves Codex-4)
+
+Authenticity ≠ freshness: a compromised mirror can serve OLD signed artifacts.
+Mitigations, scaled to a single-publisher appliance (not full TUF):
+- **Apt:** the signed `Release`/`InRelease` carries `Valid-Until` (flat path
+  sets it explicitly; reprepro via `conf/distributions` `ValidFor`). apt warns/
+  refuses a stale `Release` — built-in replay protection for the package path,
+  re-signed each publish.
+- **Images:** a signed, per-channel `dist/<channel>/latest.json` (version +
+  bake date + the per-version manifest name) signed with the image key. The
+  operator/`xpf-deploy.py --image-url` resolves `latest.json`, checks it is not
+  older than a locally-remembered version (simple monotonic check), then
+  fetches the named version. This is a LIGHTWEIGHT anti-rollback signal, not a
+  guarantee against a sophisticated freeze attack — documented honestly as
+  "detects stale mirrors / accidental rollback," with TUF-grade freshness
+  called out as a future option (not in #1924 scope). Flagged so reviewers do
+  not read it as a strong guarantee.
 
 ## 6. Test / validation strategy (research scope = how /engineer will prove it)
 
@@ -278,7 +408,16 @@ No loss-cluster smoke (no forwarding change). Validation is local + CI-shaped:
    xpf-appliance` succeeds → `apt-get update` against a TAMPERED `Release`
    FAILS with apt's signature error (negative test).
 3. **install.sh:** shellcheck-clean; idempotent (run twice = no error); refuses
-   wrong arch; the keyring fingerprint embedded matches the published keyring.
+   wrong arch; the inline-embedded keyring matches the archive signing key used
+   to sign the test repo's `InRelease` (so apt accepts it). `--dry-run` mode
+   prints the actions without mutating the host (for CI).
+3b. **Fail-closed publish (r2):** `make dist-publish` with an UNSIGNED image in
+   the set EXITS non-zero and uploads NOTHING (assert the publish shim is never
+   invoked). With everything signed it proceeds. (The single most likely
+   production mistake — publishing an unsigned dev bake — is blocked here.)
+3c. **Freshness (r2):** an apt `Release` past `Valid-Until` makes `apt-get
+   update` fail; `latest.json` older than the remembered version is rejected by
+   the image fetch path.
 4. **bake.py unchanged paths:** the existing image-validation matrix
    (`scripts/image/validate.py a|b|c`) still passes; signing is additive and
    does not perturb the boot/day-0 contract.
@@ -387,3 +526,31 @@ is the usability bar (the issue's "rather than copying files by hand").
   inputs, not PLAN-READY blockers; the mechanism is complete pending only their
   values.
 ```
+
+## 12. r1 → r2 change log (response to 3-way hostile review)
+
+All three r1 reviewers returned **PLAN-NEEDS-MAJOR** (Codex, AGY, Claude SMR).
+The convergent + unique findings and their resolutions:
+
+| Finding | Source(s) | Resolution in r2 |
+|---|---|---|
+| Verify can authenticate the WRONG bytes (cwd `sha256sum -c` vs the imported path) | SMR-F3, Codex-1, AGY-HIGH-1 | §5.2: verify the EXACT imported file's hash against the parsed signed manifest; reject pathful/dup entries; per-file. |
+| Partial download (libvirt fetches only qcow2) crashes `sha256sum -c` on missing metadata | AGY-HIGH-1 | §5.1/§5.2: per-file verification; missing-but-unfetched files are not checked. |
+| install.sh trust circular / pubkey from dist host | SMR-F1, Codex-6, AGY-MEDIUM-1 | §3 + §4C + §8: image pubkey root = in-repo `git clone` copy, NOT the dist host; honest Tier A/B trust labels. |
+| install.sh inline-keyring vs fetch+pin contradiction | Codex-5 | §3 + §4C: picked inline-embed; dropped fingerprint-pin language. |
+| `curl \| sh` honest trust level | SMR-F2 | §4C: Tier A = TLS + first-fetch trust (same as Tailscale/Docker/rustup), stated plainly. |
+| Publish not fail-closed (unsigned dev bake can ship) | Codex-2, SMR-F6 | §5.5: `make dist-publish` precondition gate refuses unsigned artifacts. |
+| Retention breaks the single global SHA256SUMS | Codex-3 | §5.1: per-version `xpf-<ver>.SHA256SUMS(.minisig)`; `latest` is convenience only. |
+| Replay / freshness missing | Codex-4 | §5.6: apt `Valid-Until` + signed per-channel `latest.json` anti-rollback (honestly scoped, not TUF). |
+| reprepro stateful DB breaks in stateless CI | AGY-MEDIUM-2 | §4B: default = flat signed repo (stateless-safe); reprepro opt-in for persistent publishers. |
+| apt UPGRADE inherits #1917 postinst cut-over (dataplane blip / HA) | AGY-HIGH-2 | §5.4: documented (`XPF_NO_POSTINST_CUT`, HA stage-only); no postinst code in #1924 scope. |
+| GitHub Releases can't host a `dists/`+`pool/` tree | AGY-MEDIUM-3 | §5.3: flagged as an OQ-1 constraint (Pages/bucket needed for the pool). |
+| OQ coupling = hidden blockers? | AGY-MEDIUM-3 | §9: confirmed engineer-time inputs; every §5 mechanism runs with placeholder key + parametrised URL. |
+| `XPF_PUBLISH_CMD` under-specified | SMR-F5 | §5.5: exact contract `$CMD <dist-dir> <base-url>`, idempotent. |
+| Pubkey naming inconsistent | SMR-F7 | Unified: `xpf-image.pub` (minisign), `xpf-archive-keyring.asc` (PGP). |
+
+Two findings examined and held as documentation-only (not #1924 code scope):
+AGY-HIGH-2 (postinst cut-over is #1917's reviewed mechanism) and the
+single-tool §4A-alt (kept as the user's OQ-3 fallback). The minisign(image) +
+PGP(apt) split, deb822 `Signed-By`, and TOFU-rejection were affirmed by all
+three reviewers as correct and are unchanged.
