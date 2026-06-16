@@ -12,6 +12,12 @@ configured via `.network` files. Startup naming by
 `enumerateAndRenameInterfaces()` (`pkg/daemon/linksetup.go`) assigns
 vSRX names based on PCI bus order.
 
+> **Name form.** The interface maps below use the **Linux link / dash
+> form** (`ge-0-0-0`) — what `ip link` and `enumerateAndRenameInterfaces()`
+> produce. The **config and CLI use the slash form** (`ge-0/0/0`); the
+> config layer translates between the two. Use the slash form in `cli`
+> and in `xpf.conf`, the dash form in `ip`/`ethtool` on the box.
+
 ## Standalone VM (xpf-fw)
 
 No `/etc/xpf/node-id`, no `em0`:
