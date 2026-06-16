@@ -23,6 +23,28 @@ func (s *Store) SetWriteActiveForTesting(fn func(*config.ConfigTree) error) {
 	s.writeActiveFn = fn
 }
 
+// ConfirmGenForTesting returns the current commit-confirmed generation
+// token (#1922 Item 1a). Tests use it to call PromoteRollback /
+// executeConfirmedRollback with the generation that armed the pending
+// confirm timer, since the confirm timer's closure captures the gen
+// privately. Not for production callers.
+func (s *Store) ConfirmGenForTesting() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.confirmGen
+}
+
+// InvokeRollbackTimerForTesting drives the EXACT dispatch logic the
+// commit-confirmed auto-rollback timer runs on expiry (#1922 Item 1a):
+// read the registered rollbackExecutor under s.mu, then invoke it (with
+// the given generation) WITHOUT holding s.mu, falling back to
+// performAutoRollback when no executor is registered. Tests use it to
+// exercise the real timer branch deterministically without waiting for a
+// wall-clock minute. Not for production callers.
+func (s *Store) InvokeRollbackTimerForTesting(gen uint64) {
+	s.fireConfirmTimer(gen)
+}
+
 // SetPersistRetryBackoffForTesting overrides the degraded-persist
 // retry loop's initial/max backoff (#1799) so tests can drive the
 // loop deterministically with tiny intervals. Must be called BEFORE

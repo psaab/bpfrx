@@ -281,22 +281,40 @@ func (c *CLI) Run() error {
 	}
 	defer c.rl.Close()
 
-	// Register auto-rollback handler for commit confirmed.
-	// Prefer the daemon's full reconcile (applyConfigFn) so D3,
-	// cluster, VRRP, etc. all re-converge on rollback — matches the
-	// gRPC/HTTP rollback path. Falls back to applyToDataplane if
-	// applyConfigFn is not wired (e.g. CLI spawned outside daemon).
-	c.store.SetCentralRollbackHandler(func(cfg *config.Config) {
-		if c.applyConfigFn != nil {
-			c.applyConfigFn(cfg)
-		} else if c.dp != nil {
-			if err := c.applyToDataplane(cfg); err != nil {
-				fmt.Fprintf(os.Stderr, "\nwarning: auto-rollback dataplane apply failed: %v\n", err)
+	// Commit-confirmed timeout rollback ownership (#1922 Item 1a).
+	//
+	// In daemon mode the in-process CLI routes commit-confirmed through
+	// commitConfirmedFn (= d.commitConfirmedAndApply), so the timer is
+	// armed inside the daemon's store and xpfd's own rollback executor
+	// (d.executeConfirmedRollback, registered via store.SetRollbackExecutor
+	// at daemon init) owns the timeout rollback — acquiring the apply
+	// semaphore then running store promotion + full reconcile atomically,
+	// in ALL modes (gRPC/REST/remote-cli as well as this shell). The old
+	// interactive-only, non-atomic SetCentralRollbackHandler path is gone.
+	//
+	// Standalone mode (commitConfirmedFn nil, e.g. a CLI embedded without
+	// a daemon): runCommitConfirmed arms c.store's own timer and there is
+	// no daemon executor. Register a minimal store executor here so the
+	// timeout still re-applies the rolled-back config to the dataplane —
+	// preserving the prior standalone behavior — instead of falling back
+	// to the store's store-only performAutoRollback.
+	if c.commitConfirmedFn == nil {
+		c.store.SetRollbackExecutor(func(gen uint64) {
+			prevCfg, ok := c.store.PromoteRollback(gen)
+			if !ok || prevCfg == nil {
+				return
 			}
-		}
-		c.reloadSyslog(cfg)
-		fmt.Fprintf(os.Stderr, "\ncommit confirmed timed out, configuration has been rolled back\n")
-	})
+			if c.applyConfigFn != nil {
+				c.applyConfigFn(prevCfg)
+			} else if c.dp != nil {
+				if err := c.applyToDataplane(prevCfg); err != nil {
+					fmt.Fprintf(os.Stderr, "\nwarning: auto-rollback dataplane apply failed: %v\n", err)
+				}
+			}
+			c.reloadSyslog(prevCfg)
+			fmt.Fprintf(os.Stderr, "\ncommit confirmed timed out, configuration has been rolled back\n")
+		})
+	}
 
 	fmt.Println("xpf stateful firewall - Junos-style CLI")
 	fmt.Println("Type '?' for help")

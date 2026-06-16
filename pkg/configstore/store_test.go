@@ -490,9 +490,10 @@ func TestCommitConfirmedAutoRollback(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Track rollback callback
+	// Track rollback executor invocation (#1922 Item 1a: the store now
+	// hands the daemon a generation-keyed executor, not an apply callback).
 	rollbackCalled := make(chan struct{}, 1)
-	s.SetCentralRollbackHandler(func(cfg *config.Config) {
+	s.SetRollbackExecutor(func(gen uint64) {
 		rollbackCalled <- struct{}{}
 	})
 
@@ -521,6 +522,101 @@ func TestCommitConfirmedAutoRollback(t *testing.T) {
 	if s.IsConfirmPending() {
 		t.Error("should not have pending confirm after ConfirmCommit")
 	}
+}
+
+// #1922 Item 1a: PromoteRollback is the store-state promotion primitive
+// for the commit-confirmed timeout rollback. It must honor the #1817
+// confirmGen staleness guard and the (Item 1b, deferred) prevCfg==nil
+// first-commit early-return.
+func TestPromoteRollbackGenGuardAndFirstCommit(t *testing.T) {
+	t.Run("stale gen is a no-op", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.EnterConfigure(); err != nil {
+			t.Fatal(err)
+		}
+		// Confirmed baseline A so the rollback target is non-nil.
+		if err := s.SetFromInput("system host-name A"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		// Unconfirmed promote to B; rollback target = A.
+		if err := s.SetFromInput("system host-name B"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.CommitConfirmed(1); err != nil {
+			t.Fatal(err)
+		}
+		gen := s.ConfirmGenForTesting()
+
+		// A stale (superseded) generation must NOT roll back.
+		if cfg, ok := s.PromoteRollback(gen - 1); ok || cfg != nil {
+			t.Fatalf("PromoteRollback(stale gen) = (%v,%v), want (nil,false)", cfg, ok)
+		}
+		if got := s.ActiveConfig().System.HostName; got != "B" {
+			t.Fatalf("stale-gen rollback mutated active to %q, want B", got)
+		}
+
+		// The matching generation rolls back to A and returns it.
+		cfg, ok := s.PromoteRollback(gen)
+		if !ok || cfg == nil {
+			t.Fatalf("PromoteRollback(gen) = (%v,%v), want (cfg,true)", cfg, ok)
+		}
+		if cfg.System.HostName != "A" {
+			t.Fatalf("PromoteRollback returned host-name %q, want A", cfg.System.HostName)
+		}
+		if got := s.ActiveConfig().System.HostName; got != "A" {
+			t.Fatalf("after rollback active host-name = %q, want A", got)
+		}
+
+		// A second call with the same gen is now a no-op (confirmPrevTree
+		// cleared) — the generation matches but the target is gone.
+		if cfg, ok := s.PromoteRollback(gen); ok || cfg != nil {
+			t.Fatalf("double PromoteRollback = (%v,%v), want (nil,false)", cfg, ok)
+		}
+	})
+
+	t.Run("first-commit returns (nil,true): store reverts, no compiled to apply", func(t *testing.T) {
+		s := newTestStore(t)
+		if err := s.EnterConfigure(); err != nil {
+			t.Fatal(err)
+		}
+		// FIRST commit confirmed on a fresh store. The rollback target
+		// tree (confirmPrevTree) is the empty pre-config tree — NON-nil —
+		// but the compiled config recorded at arm time is nil (a fresh
+		// store has active=&ConfigTree{} but compiled=nil). PromoteRollback
+		// must therefore promote the store back to the empty tree and
+		// return (nil, TRUE) — NOT (nil,false). The daemon executor's
+		// prevCfg==nil guard then skips the dataplane re-apply (which would
+		// panic on a nil config). Re-applying that first-commit-to-bootstrap
+		// case is #1922 Item 1b, DEFERRED to PR-2. (Codex r1 Critical: the
+		// old guard keyed on confirmPrevTree==nil, which is never true for a
+		// fresh store, so the nil compiled would reach applyConfigLocked.)
+		if err := s.SetFromInput("system host-name First"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.CommitConfirmed(1); err != nil {
+			t.Fatal(err)
+		}
+		gen := s.ConfirmGenForTesting()
+
+		prevCfg, ok := s.PromoteRollback(gen)
+		if !ok {
+			t.Fatalf("first-commit PromoteRollback should promote the empty baseline, got ok=false")
+		}
+		if prevCfg != nil {
+			t.Fatalf("first-commit PromoteRollback prevCfg = %v, want nil (fresh store has no compiled config)", prevCfg)
+		}
+		if got := s.ActiveConfig(); got != nil && got.System.HostName != "" {
+			t.Fatalf("after first-commit rollback active host-name = %q, want empty", got.System.HostName)
+		}
+
+		// With confirmPrevTree now cleared, a second call is a no-op.
+		if cfg, ok := s.PromoteRollback(gen); ok || cfg != nil {
+			t.Fatalf("double PromoteRollback after first-commit = (%v,%v), want (nil,false)", cfg, ok)
+		}
+	})
 }
 
 func TestConfirmWithoutPending(t *testing.T) {

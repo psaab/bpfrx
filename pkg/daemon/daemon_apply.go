@@ -152,6 +152,52 @@ func (d *Daemon) commitConfirmedAndApply(ctx context.Context, minutes int, syncP
 	return compiled, nil
 }
 
+// executeConfirmedRollback is the daemon-owned commit-confirmed timeout
+// rollback transaction (#1922 Item 1a). The configstore confirm timer
+// fires this (via SetRollbackExecutor) on its own goroutine, NOT under
+// the store lock. It acquires d.applySem FIRST, then promotes the store
+// state (PromoteRollback) and re-applies the rolled-back config to the
+// dataplane inside that single critical section, so a concurrent commit
+// (which also holds d.applySem via commitAndApply / commitConfirmedAndApply)
+// cannot interleave between store promotion and dataplane re-apply. This
+// fixes both bugs the old CLI-registered centralRollbackFn callback had:
+// the non-atomic promote-then-apply split-brain window, and service-mode
+// (gRPC/REST/remote-cli) timeouts that never re-applied the dataplane
+// because no interactive CLI.Run had registered the callback.
+//
+// Lock order is applySem -> s.mu (matches commitAndApply / syncAndApply):
+// every store call made while applySem is held (PromoteRollback, and the
+// store calls inside applyConfigLocked such as SetArchiveConfig) takes and
+// releases s.mu internally — applySem is always acquired FIRST and s.mu is
+// never held across an applySem acquisition, so there is no inversion.
+func (d *Daemon) executeConfirmedRollback(gen uint64) {
+	_ = d.applySem.Acquire(context.Background(), 1)
+	defer d.applySem.Release(1)
+
+	prevCfg, ok := d.store.PromoteRollback(gen)
+	if !ok {
+		// Superseded (nested CommitConfirmed / ConfirmCommit) or no
+		// pending rollback target — nothing happened, nothing to apply.
+		return
+	}
+	if prevCfg == nil {
+		// #1922 Item 1b (PR-2): first commit confirmed on a fresh store.
+		// The store reverted to the empty tree but there is no compiled
+		// pre-config to re-apply (a fresh store has compiled==nil at arm
+		// time). Match the prior behavior — store reverts, dataplane is
+		// NOT re-applied with a nil config (which would panic in
+		// applyConfigLocked). Rolling the first commit back to bootstrap
+		// is DEFERRED to PR-2.
+		slog.Warn("commit confirmed (first commit) timed out, store reverted to empty config; " +
+			"dataplane re-apply to bootstrap is deferred (#1922 Item 1b)")
+		return
+	}
+	if err := d.applyConfigLocked(prevCfg); err != nil {
+		slog.Error("commit confirmed auto-rollback dataplane apply failed", "err", err)
+	}
+	slog.Warn("commit confirmed timed out, configuration rolled back")
+}
+
 // applyConfigLocked runs the actual reconcile pipeline. MUST be
 // called with d.applySem held.
 func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
