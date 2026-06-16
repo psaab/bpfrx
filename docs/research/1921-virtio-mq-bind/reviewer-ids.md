@@ -61,3 +61,20 @@ Phase 1 (remove rebind::handle double-stop). Reconciliation = contingent Phase 2
 Codex non-blocking asks for /engineer: (a) acceptance validates ACTUAL RX
 delivery vs bound set; (b) Phase 0 captures USERSPACE_TRACE_STAGE_REDIRECT; (c)
 add regression test that rebind does not call afxdp.stop() before reconcile.
+
+## Implementation (PR #1927, commit 76e78848a)
+| Reviewer | ID | Verdict |
+|---|---|---|
+| Codex | task-mqfvhp06-j87ohi | MERGE-READY |
+| AGY | adversarial-review-mqfvilij-3vcj2v | MERGE-READY |
+| Claude SMR | PR comment | MERGE-READY |
+| Copilot | — | quota-limited (3-of-4 fallback per feedback_codex_infra_must_retry) |
+
+Validation:
+- loss-cluster deploy: fix binary deployed (rebind no-stop string present), xpfd
+  active, 0 EBUSY in journal (mlx5 regression clean).
+- make test-failover: 14 passed, 0 failed (exercises the RETH-MAC rebind path
+  the fix touches, under live iperf3 + node reboot).
+- virtio end-to-end repro: NOT done (standalone 4-queue virtio VM has no rebind
+  trigger; needs #1879 appliance day-0 boot path). #1879 deploy already showed
+  the EBUSY loop on 4-queue virtio; fix is code-verified by all 4 reviewers.
