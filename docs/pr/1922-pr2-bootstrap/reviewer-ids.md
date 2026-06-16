@@ -61,6 +61,41 @@ Plan: `git show origin/research/1922-safe-bootstrap-daemon:docs/research/1922-sa
   sessions synced. The HA-node-guard change causes NO cluster-boot/failover
   regression.
 
+## Live SAFE-BOOTSTRAP behavior validation (standalone VM bpfrx-fw, final binary f75dcf2f)
+
+The new bootstrap path was exercised live on a wiped standalone VM (no
+node-id, native NIC names, no config) — the genuine foreign-host case:
+
+- **Fresh → bootstrap**: `entering BOOTSTRAP mode: no committed configuration
+  found`; `bootstrap lifeline: recorded management NIC identity interface=enp5s0
+  pci=0000:05:00.0 mac=10:66:6a:ed:0c:86`; `renamed management NIC to fxp0
+  from=enp5s0` (ONLY mgmt renamed — enp6s0..enp10s0f0np1 stayed native);
+  `dataplane arm and boot-time config apply suppressed`; no xpf-userspace-dp
+  helper; fxp0 kept 10.0.100.50/24 + default route; CLI `show system uptime`
+  responds; only `10-xpf-fxp0.{link,network}` written (static-snapshot
+  bootstrap .network), no other takeover files.
+- **First-takeover gate (OQ-B)**: a plain `commit` in bootstrap is REFUSED —
+  "system is in bootstrap mode: commit the takeover config with 'commit
+  confirmed <minutes>'".
+- **commit confirmed → exit + full takeover**: `exiting bootstrap mode ...
+  reason="first non-empty config applied"`; all NICs renamed
+  enp6s0→ge-0-0-0 … enp10s0f0np1→ge-0-0-4; `bootstrap exit: startup takeover
+  complete`; ge-* up + addressed. `commit` (confirm) → `commit complete`,
+  on-disk marker flips to `committed=1`, a second plain commit succeeds
+  (bootstrap one-way exit stable), fxp0 mgmt reachable throughout.
+- **Item 1b (first-commit-confirmed timeout → enterBootstrapMode)**: with a
+  `commit confirmed 1`, after the 60s timeout: `commit confirmed (first
+  commit) timed out; rolling back to BOOTSTRAP mode (removing
+  interface/FRR/dataplane takeover, keeping the management lifeline)`;
+  `bootstrap rollback complete`; fxp0 kept 10.0.100.50/24 (mgmt reachable);
+  on-disk marker `committed=0` (never-committed, NOT an empty committed tree).
+- **AGY/Codex CRITICAL fix, live**: after the Item-1b rollback (committed=0),
+  a daemon RESTART RE-ENTERS bootstrap ("no committed configuration found")
+  — proving the empty-tree-compiles-non-nil misclassification is fixed on a
+  real box, not just in unit tests.
+- **Protected-set / mgmt-never-downed**: fxp0 retained its address across
+  bootstrap, takeover, Item-1b rollback, and restart — never brought down.
+
 ## Round-3 (Copilot) findings folded
 
 - **store.go (degraded-retry committed=1)** — duplicate of the Codex
