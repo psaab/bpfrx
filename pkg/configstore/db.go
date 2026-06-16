@@ -16,6 +16,19 @@ import (
 // rename + dir fsync, so a persisted tree survives power loss.
 type DB struct {
 	dir string
+
+	// writerVersion is the xpf build version stamped into the config
+	// compatibility-envelope header on write (#1917 increment B, plan
+	// §6.4 / D1). Empty => "unknown". Set via SetWriterVersion from the
+	// daemon's ldflags version before the first write.
+	writerVersion string
+}
+
+// SetWriterVersion sets the build version stamped into the config-DB
+// compatibility envelope on write (#1917). Call once at startup before
+// any WriteActive; the daemon's single init path is the only caller.
+func (db *DB) SetWriterVersion(v string) {
+	db.writerVersion = v
 }
 
 // NewDB creates a DB rooted at the given directory.
@@ -116,6 +129,19 @@ func (db *DB) readTree(path string) (*config.ConfigTree, error) {
 		}
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
+	// Config compatibility envelope (#1917 increment B). The envelope is
+	// the OUTERMOST framing — a magic header line prepended to the
+	// (possibly-encrypted) body. Strip+validate it BEFORE decryption so a
+	// too-new DB fails closed here, never silently empty-loads. A body
+	// with no envelope is a pre-floor (legacy) DB and is read unchanged.
+	if hasEnvelope(data) {
+		body, _, eerr := stripEnvelope(data)
+		if eerr != nil {
+			return nil, fmt.Errorf("read %s: %w", path, eerr)
+		}
+		data = body
+	}
+
 	data, err = db.maybeDecryptTreeJSON(data)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt %s: %w", path, err)
@@ -141,6 +167,12 @@ func (db *DB) writeTree(path string, tree *config.ConfigTree) error {
 	if err != nil {
 		return fmt.Errorf("encrypt config: %w", err)
 	}
+
+	// Wrap the (possibly-encrypted) body in the config compatibility
+	// envelope (#1917 increment B). The magic header line makes a pre-floor
+	// reader fail closed (its json.Unmarshal rejects a leading '#'), so a
+	// future format bump can never silently empty-load on an old reader.
+	data = wrapEnvelope(data, db.writerVersion)
 
 	if err := fsatomic.WriteFileDurable(path, data, 0644); err != nil {
 		return fmt.Errorf("persist %s: %w", path, err)

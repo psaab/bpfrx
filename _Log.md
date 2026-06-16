@@ -5393,3 +5393,9 @@ top.
 - **Timestamp**: 2026-06-16T14:00Z
 - **Action**: Implemented increment A (packaging only) of #1917; subsumes #1923. Added debian/ (control, rules, changelog, source/format, xpf.postinst/postrm, xpf.needrestart), `make deb` target, and changed scripts/image/bake.py to build+install the .deb instead of --copy-in. Addressed round-1 AGY (7) + Codex (incl. HIGH ExecStartPre) findings. End-to-end bake validation PASS (Scenario A/B/C). 
 - **File(s)**: debian/control, debian/rules, debian/changelog, debian/source/format, debian/xpf.postinst, debian/xpf.postrm, debian/xpf.needrestart, debian/.gitignore, Makefile, scripts/image/bake.py, docs/install-images.md, docs/pr/1917a-xpf-deb/reviewer-ids.md
+
+## #1917 increment B — in-place upgrade mechanism
+
+- **Timestamp**: 2026-06-16
+- **Action**: D1 compatibility floor — config-DB envelope + fatal-on-parse
+- **File(s)**: pkg/configstore/envelope.go (new), pkg/configstore/envelope_test.go (new), pkg/configstore/db.go, pkg/configstore/store.go, pkg/daemon/daemon.go, pkg/daemon/daemon_run.go

@@ -389,6 +389,12 @@ func New(opts Options) (*Daemon, error) {
 		return nil, fmt.Errorf("config store: %w", err)
 	}
 
+	// Stamp the build version into the config-DB compatibility envelope on
+	// write (#1917 increment B, plan §6.4 / D1). The envelope's magic header
+	// makes a future format bump fail closed on an old reader instead of
+	// silently empty-loading.
+	store.SetConfigDBWriterVersion(opts.Version)
+
 	// Read cluster node ID from file. If the file exists and contains a
 	// valid integer, the daemon runs in cluster mode with ${node} variable
 	// expansion in apply-groups. If the file does not exist, standalone mode.

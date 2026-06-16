@@ -120,6 +120,14 @@ func New(filePath string) (*Store, error) {
 	}, nil
 }
 
+// SetConfigDBWriterVersion sets the xpf build version stamped into the
+// config-DB compatibility-envelope header on write (#1917 increment B).
+// Call once at startup before any Commit/Save; the daemon's single init
+// path is the only caller.
+func (s *Store) SetConfigDBWriterVersion(v string) {
+	s.db.SetWriterVersion(v)
+}
+
 // Load builds the configuration from disk.
 func (s *Store) Load() error {
 	s.mu.Lock()
@@ -127,7 +135,13 @@ func (s *Store) Load() error {
 
 	tree, err := s.db.ReadActive()
 	if err != nil {
-		return fmt.Errorf("read config: %w", err)
+		// A read/parse/decrypt/envelope failure on a PRESENT active.json is
+		// the fail-closed case (#1917 increment B, D1): an unparseable or
+		// too-new DB must NOT be silently overwritten by a blind bootstrap.
+		// Tag it with ErrConfigDBUnreadable so the daemon can make it fatal
+		// (daemon_run.go), distinct from a compile error (handled leniently
+		// below) or an absent DB (handled above as start-fresh).
+		return fmt.Errorf("read config: %w: %w", ErrConfigDBUnreadable, err)
 	}
 	if tree == nil {
 		return nil // start fresh with empty config
