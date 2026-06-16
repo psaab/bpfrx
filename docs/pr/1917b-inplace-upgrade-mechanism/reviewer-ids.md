@@ -29,5 +29,21 @@ See docs/research/1917b-inplace-upgrade-mechanism/ for plan-review ids.
 ### Round 2 (verify fixes)
 | Reviewer | Task ID | Round | Verdict |
 |---|---|---|---|
-| Codex | (pending) | r2 | (pending) |
-| AGY | (pending) | r2 | (pending) |
+| Codex | 019ed139-daee-7692-b2cc-89365fbb7472 | r2 | NEEDS-REVISION (r1 Criticals verified fixed; new: peer-ownership, sync-down, stale-flip) |
+| AGY | adversarial-review-mqguhxi4-ob1gq1 | r2 | NEEDS-REVISION (same class + orphan dbsnap + proto-bump doc) |
+
+r2 findings resolved in commit 17df1edb (peer-primary drain, Status:Up sync gate, finish-stale-half-cut, orphan dbsnap gc, proto-bump documented).
+
+### Round 3 (verify r2 fixes)
+| Reviewer | Task ID | Round | Verdict |
+|---|---|---|---|
+| Codex | 019ed142-d414-7b90-a2c6-76b57c09f52f | r3 | NEEDS-REVISION (all prior FIXED; new High: per-RG drain pairing) |
+| AGY | adversarial-review-mqguunjw-2g2wpy | r3 | NEEDS-REVISION (same per-RG; new Medium: StartUnit-failure rollback) |
+
+r3 findings resolved: per-RG drain pairing (commit 9fa7c23a), StartUnit-failure auto-rollback (commit 500e2776).
+
+### Round 4 (verify r3 fixes)
+| Reviewer | Task ID | Round | Verdict |
+|---|---|---|---|
+| Codex | (pending) | r4 | (pending) |
+| AGY | (pending) | r4 | (pending) |
