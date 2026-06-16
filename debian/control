@@ -9,7 +9,7 @@ Rules-Requires-Root: no
 
 Package: xpf
 Architecture: amd64
-Depends: ${misc:Depends}
+Depends: ${shlibs:Depends}, ${misc:Depends}
 Description: Junos-style firewall with AF_XDP userspace dataplane
  xpf is a Junos-style stateful firewall that clones Juniper vSRX
  capabilities using native Junos configuration syntax. The runtime
