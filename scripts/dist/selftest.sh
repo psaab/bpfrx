@@ -170,6 +170,12 @@ if [ -f "$INREL" ] && gpg --batch --verify "$INREL" >/dev/null 2>&1; then
 else
     bad "InRelease missing or signature failed"
 fi
+# Valid-Until must actually be emitted (Codex-M3 regression).
+if grep -q "^Valid-Until:" "$OUT/apt/dists/stable/Release"; then
+    ok "Release carries Valid-Until"
+else
+    bad "Release missing Valid-Until (ValidTime knob regression)"
+fi
 # Negative: a tampered InRelease must fail.
 if [ -f "$INREL" ]; then
     cp "$INREL" "$WORK/InRelease.tampered"
@@ -179,6 +185,17 @@ if [ -f "$INREL" ]; then
     else
         ok "tampered InRelease fails verify"
     fi
+fi
+
+# ── 5b. publish gate fail-closed (Codex-H1 / AGY-A2) ──────────────────────
+info "5b. publish gate fail-closed on an unsigned manifest"
+PG="$WORK/pgate"; mkdir -p "$PG"
+printf 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef  xpf-9.9.9.qcow2\n' \
+    > "$PG/xpf-9.9.9.SHA256SUMS"   # NO .minisig
+if $PY "$DIST/publish.py" --dist "$PG" --channel stable --no-apt >/dev/null 2>&1; then
+    bad "publish MUST refuse an unsigned manifest but PASSED"
+else
+    ok "publish refuses an unsigned manifest"
 fi
 
 # ── 6. install.sh dry-run ──────────────────────────────────────────────────

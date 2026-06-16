@@ -64,6 +64,27 @@ def require_minisign():
     return exe
 
 
+def is_placeholder_pubkey(pubkey_path):
+    """True if `pubkey_path` is the shipped placeholder (its secret was
+    shredded at generation, so it can never authenticate a real release)."""
+    return os.path.basename(pubkey_path).endswith(".placeholder")
+
+
+def require_real_pubkey(pubkey_path):
+    """Fail-CLOSED if the image pubkey is the placeholder (Codex-M4). The
+    placeholder exists only so the mechanism + tests have a key-path shape;
+    a real verify against it would either always fail (no holder of its
+    secret) or — worse — pass if an attacker re-signed with a self-generated
+    placeholder secret. Refuse it explicitly, mirroring the apt-key
+    placeholder refusal in publish.py."""
+    if is_placeholder_pubkey(pubkey_path):
+        raise SignError(
+            f"image public key {os.path.basename(pubkey_path)} is the #1924 "
+            "PLACEHOLDER — refusing to verify against it. Supply the real key "
+            "(XPF_IMAGE_PUBKEY or scripts/dist/xpf-image.pub) — see "
+            "scripts/dist/README.md.")
+
+
 def sha256_file(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -183,8 +204,25 @@ def verify_image_artifact(path, manifest_path, sig_path, pubkey_path=None):
         raise SignError(
             f"image public key not found: {pubkey_path} "
             "(set XPF_IMAGE_PUBKEY or ship scripts/dist/xpf-image.pub).")
-    verify_signature(manifest_path, sig_path, pubkey_path)
-    manifest = parse_manifest(manifest_path)
+    require_real_pubkey(pubkey_path)
+    # TOCTOU hardening (Codex-M5/AGY-A4): the manifest may live in a
+    # user-writable dir, so a concurrent process could swap its bytes between
+    # the minisign signature check and the parse. Copy the manifest + its
+    # signature into a private 0700 temp dir and run BOTH steps on that copy,
+    # so the bytes we parse are exactly the bytes whose signature we verified.
+    import shutil as _sh
+    import tempfile as _tf
+    tmp = _tf.mkdtemp(prefix="xpf-verify-")
+    try:
+        os.chmod(tmp, 0o700)
+        m_copy = os.path.join(tmp, os.path.basename(manifest_path))
+        s_copy = m_copy + ".minisig"
+        _sh.copyfile(manifest_path, m_copy)
+        _sh.copyfile(sig_path, s_copy)
+        verify_signature(m_copy, s_copy, pubkey_path)
+        manifest = parse_manifest(m_copy)
+    finally:
+        _sh.rmtree(tmp, ignore_errors=True)
     base = os.path.basename(path)
     if base not in manifest:
         raise SignError(

@@ -93,10 +93,25 @@ fi
 # ── flat signed repo (default) ───────────────────────────────────────────
 command -v apt-ftparchive >/dev/null 2>&1 || die "apt-ftparchive not found (apt-get install apt-utils)"
 
+# Clear stale signed metadata BEFORE rebuilding (Codex-H2): an unsigned
+# rebuild that left yesterday's signed InRelease/Release.gpg behind would let
+# the publish gate green-light a tampered/unsigned pool against the old
+# signature. Always start from a clean Release set for this suite.
+rm -f "$APT/dists/$SUITE/Release" "$APT/dists/$SUITE/Release.gpg" \
+      "$APT/dists/$SUITE/InRelease"
+
+# DEBS holds paths this script controls (built debs / explicit --debs). Guard
+# the word-split loop against pathname globbing with `set -f` (A5); paths must
+# not contain whitespace (asserted below).
+set -f
 for d in $DEBS; do
+    set +f
+    case "$d" in *[!-./_A-Za-z0-9]*) die "deb path contains an unsupported char: $d";; esac
     cp -f "$d" "$POOL/"
     info "pooled $(basename "$d")"
+    set -f
 done
+set +f
 
 # Packages index (paths in the index are relative to the repo root $APT).
 ( cd "$APT" && apt-ftparchive packages "pool/$COMPONENT" > "dists/$SUITE/$COMPONENT/binary-$ARCH/Packages" )
@@ -104,10 +119,11 @@ gzip -9 -kf "$DISTDIR/Packages"
 info "wrote Packages ($(wc -l < "$DISTDIR/Packages") lines) + Packages.gz"
 
 # Release over the suite tree. apt-ftparchive computes the per-index
-# checksums; we add the descriptive + freshness fields via -o overrides.
+# checksums; ValidTime (SECONDS, not a date) makes apt-ftparchive emit the
+# Valid-Until field (Codex-M3 — APT::FTPArchive::Release::ValidUntil does NOT
+# exist; the knob is ValidTime).
 NOW=$(date -u +%s)
-UNTIL=$(date -u -d "@$((NOW + VALID_DAYS * 86400))" +"%a, %d %b %Y %H:%M:%S UTC" 2>/dev/null \
-        || date -u -r "$((NOW + VALID_DAYS * 86400))" +"%a, %d %b %Y %H:%M:%S UTC")
+VALID_SECONDS=$((VALID_DAYS * 86400))
 NOWSTR=$(date -u -d "@$NOW" +"%a, %d %b %Y %H:%M:%S UTC" 2>/dev/null \
         || date -u -r "$NOW" +"%a, %d %b %Y %H:%M:%S UTC")
 ( cd "$APT" && apt-ftparchive \
@@ -118,9 +134,13 @@ NOWSTR=$(date -u -d "@$NOW" +"%a, %d %b %Y %H:%M:%S UTC" 2>/dev/null \
     -o "APT::FTPArchive::Release::Architectures=$ARCH" \
     -o "APT::FTPArchive::Release::Components=$COMPONENT" \
     -o "APT::FTPArchive::Release::Date=$NOWSTR" \
-    -o "APT::FTPArchive::Release::ValidUntil=$UNTIL" \
+    -o "APT::FTPArchive::Release::ValidTime=$VALID_SECONDS" \
     release "dists/$SUITE" > "dists/$SUITE/Release" )
-info "wrote Release (Valid-Until $UNTIL)"
+# Assert the freshness field actually landed (a silent apt-ftparchive knob
+# rename must FAIL the build, never ship a repo without Valid-Until).
+grep -q "^Valid-Until:" "$APT/dists/$SUITE/Release" \
+    || die "apt-ftparchive did not emit Valid-Until (ValidTime knob may have changed)"
+info "wrote Release ($(grep '^Valid-Until:' "$APT/dists/$SUITE/Release"))"
 
 # Sign Release -> InRelease (inline) + Release.gpg (detached).
 if [ -n "${XPF_GPG_KEY:-}" ]; then

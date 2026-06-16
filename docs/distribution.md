@@ -108,8 +108,8 @@ checksums.
 ### Key rotation
 
 The archive keyring ships BOTH inline in `install.sh` (new installs) AND in the
-`xpf` package payload at `/etc/apt/keyrings/xpf-archive-keyring.asc` (via
-`debian/xpf.install`). During a dual-sign window, a normal `apt upgrade`
+`xpf` package payload at `/usr/share/keyrings/xpf-archive-keyring.asc` (via
+`debian/rules`). During a dual-sign window, a normal `apt upgrade`
 delivers the rotated key to EXISTING hosts before the old key retires — so
 rotation is not a fleet lockout. Image-pubkey rotation: publish the new
 `xpf-image.pub`, dual-sign during overlap, retire the old.

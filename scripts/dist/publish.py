@@ -79,11 +79,17 @@ def _is_placeholder(path):
 
 
 def list_versions(dist):
-    """Discover baked versions from signed manifests in `dist`."""
+    """Discover baked versions from manifests in `dist`. FAIL-CLOSED
+    (Codex-H1/AGY-A2): if ANY xpf-*.SHA256SUMS lacks a .minisig, refuse the
+    whole publish — the upload step pushes the entire dist tree, so an
+    unsigned dev bake sitting next to a signed one would otherwise be
+    uploaded. Do not silently skip the unsigned one."""
     out = {}
-    for m in glob.glob(os.path.join(dist, "xpf-*.SHA256SUMS")):
+    for m in sorted(glob.glob(os.path.join(dist, "xpf-*.SHA256SUMS"))):
         if not os.path.isfile(m + ".minisig"):
-            continue
+            die(f"unsigned manifest in the publish set: {os.path.basename(m)} "
+                "has no .minisig. The whole dist tree is uploaded — refusing to "
+                "publish an unsigned artifact. Sign it or remove it.")
         base = os.path.basename(m)
         ver = base[len("xpf-"):-len(".SHA256SUMS")]
         out[ver] = m
@@ -97,11 +103,18 @@ def gate_images(dist):
     if not versions:
         die(f"no signed image manifests (xpf-*.SHA256SUMS + .minisig) in {dist} "
             "— nothing publishable. Set XPF_SIGN_SECKEY and re-bake.")
+    if sign.is_placeholder_pubkey(sign.DEFAULT_IMAGE_PUBKEY) \
+            and not os.environ.get("XPF_IMAGE_PUBKEY"):
+        die("image pubkey is the #1924 PLACEHOLDER — cannot verify image "
+            "signatures. Supply the real key (XPF_IMAGE_PUBKEY / "
+            "scripts/dist/xpf-image.pub) before publishing.")
     for ver, manifest in sorted(versions.items()):
         sig = manifest + ".minisig"
         try:
-            checks = sign.parse_manifest(manifest)  # structural
+            # Verify the signature BEFORE parsing the manifest (Codex-L6):
+            # never trust an unauthenticated manifest's contents.
             sign.verify_signature(manifest, sig, sign.DEFAULT_IMAGE_PUBKEY)
+            checks = sign.parse_manifest(manifest)
         except sign.SignError as e:
             die(f"image manifest {os.path.basename(manifest)} failed verify: {e}")
         # Every file the manifest lists must be present + hash-match.

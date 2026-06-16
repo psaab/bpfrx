@@ -96,22 +96,27 @@ class Harness:
             info("no signed manifest next to the artifacts — skipping "
                  "signature verification (dev bake; use --verify-sig to force)")
             return
-        # Bind both consumed files to their signed manifest. Try each manifest;
-        # the one that lists this version's basenames is the match.
-        for art in (self.qcow2, self.metadata):
-            base = os.path.basename(art)
-            verified = False
-            last_err = None
-            for manifest in sigs:
-                try:
-                    sign.verify_image_artifact(art, manifest, manifest + ".minisig")
-                    verified = True
-                    info(f"signature OK: {base} (manifest {os.path.basename(manifest)})")
-                    break
-                except sign.SignError as e:
-                    last_err = e
-            if not verified:
-                fail(f"image signature verification FAILED for {base}: {last_err}")
+        # Bind BOTH consumed files to the SAME signed manifest (AGY-A3): a
+        # mismatched pair (qcow2 from v2's manifest, metadata from v1's) must
+        # NOT pass. Find the single manifest that authenticates both; if none
+        # does, fail.
+        chosen = None
+        last_err = None
+        for manifest in sigs:
+            sig = manifest + ".minisig"
+            try:
+                sign.verify_image_artifact(self.qcow2, manifest, sig)
+                sign.verify_image_artifact(self.metadata, manifest, sig)
+                chosen = manifest
+                break
+            except sign.SignError as e:
+                last_err = e
+        if not chosen:
+            fail("image signature verification FAILED — no single signed "
+                 f"manifest authenticates both {os.path.basename(self.qcow2)} and "
+                 f"{os.path.basename(self.metadata)}: {last_err}")
+        info(f"signature OK: {os.path.basename(self.qcow2)} + "
+             f"{os.path.basename(self.metadata)} (manifest {os.path.basename(chosen)})")
 
     def import_image(self):
         self.verify_signatures()

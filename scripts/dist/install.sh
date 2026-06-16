@@ -13,7 +13,7 @@
 #      xpf's verifier floor is kernel >= 6.18 with a native-XDP NIC; this
 #      installer does NOT install a kernel. A host below the floor is refused
 #      with a clear message (use the appliance image instead).
-#   2. Install the pinned apt archive keyring to /etc/apt/keyrings (inline).
+#   2. Install the pinned apt archive keyring to /usr/share/keyrings (inline).
 #   3. Write /etc/apt/sources.list.d/xpf.sources (deb822, Signed-By).
 #   4. apt-get update && apt-get install -y xpf-appliance.
 #   5. Print next steps + the interface-takeover caveat (#1879).
@@ -26,13 +26,17 @@
 # The archive keyring below is a PLACEHOLDER (its secret is held by no one).
 # The release build substitutes the real ASCII-armored archive public key
 # between the BEGIN/END markers. The SAME keyring also ships in the xpf
-# package (/etc/apt/keyrings via debian/xpf.install) so existing hosts get
+# package (/usr/share/keyrings via debian/rules) so existing hosts get
 # rotated keys via `apt upgrade` even though they never re-run this script.
 set -eu
 
 CHANNEL="${XPF_CHANNEL:-stable}"
 DRY="${XPF_DRY_RUN:-0}"
-KEYRING=/etc/apt/keyrings/xpf-archive-keyring.asc
+# /usr/share/keyrings (NOT /etc/apt/keyrings): the xpf package ships the same
+# keyring here as a package-owned (non-conffile) file, so this bootstrap write
+# and the later `apt install` agree without a dpkg conffile prompt, and key
+# rotation lands seamlessly on `apt upgrade` (AGY-A1).
+KEYRING=/usr/share/keyrings/xpf-archive-keyring.asc
 SRC=/etc/apt/sources.list.d/xpf.sources
 
 die() { echo "xpf-install ERROR: $*" >&2; exit 1; }
@@ -112,7 +116,7 @@ keyring that cannot verify the repo. A release build substitutes the real key."
         fi
     fi
     info "installing archive keyring -> $KEYRING"
-    run "install -d -m 0755 /etc/apt/keyrings"
+    run "install -d -m 0755 /usr/share/keyrings"
     if [ "$DRY" = "1" ]; then
         echo "  (dry-run) write $KEYRING (mode 0644) from embedded key"
     else
