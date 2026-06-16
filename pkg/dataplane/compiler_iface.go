@@ -13,6 +13,27 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+// protectedInterfaceResolver returns the #1922 management protected set — the
+// interfaces (fxp0, the lifeline NIC, an explicit `system
+// management-interface` leaf) that the reconcile path must NEVER mark
+// Unmanaged / always-down / address-strip, EVEN when the active config is
+// empty, absent, or rolled back. The set is resolved by the DAEMON (PCI→name
+// sysfs I/O lives there) and injected out-of-band so it is config-independent
+// (invariant 3): the designation cannot be removed by the very rollback it
+// protects. nil (the default, and in unit tests / non-daemon embedders) means
+// "no extra protection beyond what the config carries" — preserving the
+// pre-#1922 behavior exactly for every caller that does not set it.
+var protectedInterfaceResolver func() map[string]bool
+
+// SetProtectedInterfaceResolver registers the daemon's #1922 protected-set
+// provider (Item 4). Called once at daemon startup. Passing nil restores the
+// pre-#1922 (no extra protection) behavior. The resolver is invoked during
+// compileZones' unmanaged-interface strip; it must be cheap and side-effect
+// free (it reads sysfs / the lifeline record).
+func SetProtectedInterfaceResolver(fn func() map[string]bool) {
+	protectedInterfaceResolver = fn
+}
+
 // resolveInterfaceRef parses an interface reference like "enp6s0" or "enp6s0.100"
 // and returns the physical Linux name, config name, unit number, and VLAN ID.
 // For RETH interfaces, configName stays as "reth0" (for config lookups) while
@@ -1089,6 +1110,23 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 	}
 	for _, bd := range cfg.BridgeDomains {
 		daemonOwned["br-"+bd.Name] = true
+	}
+
+	// #1922 Item 4 protected set: the management lifeline / fxp0 / explicit
+	// management-interface leaf are NEVER brought down or address-stripped by
+	// the unmanaged strip, EVEN on an empty/absent/rolled-back config. The
+	// set is resolved by the daemon (config-independent, lives in the
+	// reconcile path) and merged into the skip map here. OQ-D resolution:
+	// the interface is auto-EXEMPTED from the dataplane claim (skipped from
+	// the unmanaged strip), while normal mgmt-zone policy still applies when
+	// the operator assigns it to a zone in the config. nil resolver (unit
+	// tests / non-daemon) leaves pre-#1922 behavior unchanged.
+	if protectedInterfaceResolver != nil {
+		for name := range protectedInterfaceResolver() {
+			if name != "" {
+				daemonOwned[name] = true
+			}
+		}
 	}
 
 	allIfaces, _ := net.Interfaces()

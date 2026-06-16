@@ -84,6 +84,24 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 // safe to interrupt mid-stream — kernel route writes, FRR reload,
 // etc.).
 func (d *Daemon) commitAndApply(ctx context.Context, comment string, syncPeer bool) (*config.Config, error) {
+	// #1922 Item 2 first-takeover gate (OQ-B, blunt resolution). In
+	// bootstrap mode a plain `commit` is refused: the first commit on a
+	// foreign/non-appliance host claims interfaces and can cut off
+	// management, so it MUST go through `commit confirmed <minutes>` (the
+	// system rolls back automatically unless the operator confirms it from
+	// a still-reachable session). The gate is blunt (any first commit, not
+	// just interface-claiming ones) — the simplest safe rule, matching the
+	// #1879 §5 recommendation; the confirmed-commit path is the escape
+	// hatch (no separate `commit no-confirm` foot-gun is introduced). Once
+	// the first confirmed commit is confirmed (bootstrap exits one-way),
+	// plain commits work normally. The day-0 image path never hits this —
+	// it resolves NOT-bootstrap before any interactive session.
+	if d.inBootstrap() {
+		return nil, fmt.Errorf("first commit on this system must be 'commit confirmed <minutes>': " +
+			"the initial interface takeover can cut off management, so the system rolls back " +
+			"automatically unless you confirm it from a still-reachable session")
+	}
+
 	if err := d.applySem.Acquire(ctx, 1); err != nil {
 		return nil, err
 	}
@@ -181,15 +199,18 @@ func (d *Daemon) executeConfirmedRollback(gen uint64) {
 		return
 	}
 	if prevCfg == nil {
-		// #1922 Item 1b (PR-2): first commit confirmed on a fresh store.
-		// The store reverted to the empty tree but there is no compiled
-		// pre-config to re-apply (a fresh store has compiled==nil at arm
-		// time). Match the prior behavior — store reverts, dataplane is
-		// NOT re-applied with a nil config (which would panic in
-		// applyConfigLocked). Rolling the first commit back to bootstrap
-		// is DEFERRED to PR-2.
-		slog.Warn("commit confirmed (first commit) timed out, store reverted to empty config; " +
-			"dataplane re-apply to bootstrap is deferred (#1922 Item 1b)")
+		// #1922 Item 1b: first commit confirmed on a fresh store timed out.
+		// The store already reverted to the empty tree AND persisted the
+		// never-committed marker (PromoteRollback). A normal apply of an
+		// empty config is WRONG here — it would resurrect the dataplane the
+		// failed takeover started and leave a half-configured box. Instead
+		// roll the daemon back to bootstrap mode: re-suppress takeover and
+		// clean up the takeover artifacts (networkd files, FRR managed
+		// section, dataplane attach) the failed first commit created, except
+		// the management lifeline. Runs under d.applySem (held above).
+		slog.Warn("commit confirmed (first commit) timed out; rolling back to BOOTSTRAP mode " +
+			"(removing interface/FRR/dataplane takeover, keeping the management lifeline)")
+		d.enterBootstrapMode()
 		return
 	}
 	if err := d.applyConfigLocked(prevCfg); err != nil {
@@ -205,6 +226,20 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 		d.applyBodyForTest(cfg)
 		return nil
 	}
+
+	// #1922 Item 2 bootstrap exit: the FIRST apply of a non-empty config
+	// (an interface-claiming confirmed commit, or a cluster SyncApply from
+	// the primary) leaves bootstrap mode and runs the one-time startup
+	// takeover steps that were suppressed at boot — interface rename, IP
+	// forwarding, dataplane arm — BEFORE the reconcile below wires the
+	// config onto them. Exit is one-way for the daemon's lifetime. An empty
+	// config (no interfaces) does NOT exit bootstrap (a confirmed-but-empty
+	// commit is not a takeover). Runs under d.applySem (the caller holds it).
+	if d.inBootstrap() && cfg != nil && len(cfg.Interfaces.Interfaces) > 0 {
+		d.exitBootstrapMode("first non-empty config applied")
+		d.runBootstrapExitStartup(cfg)
+	}
+
 	// Reset VIP warning suppression so new config gets fresh warnings.
 	d.vipWarnedIfaces = nil
 

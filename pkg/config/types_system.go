@@ -33,6 +33,18 @@ type SystemConfig struct {
 	LicenseAutoUpdate        string   // license autoupdate URL
 	DisabledProcesses        []string // processes marked "disable"
 	PersistGroupsInheritance bool     // system commit persist-groups-inheritance (syntax accepted, runtime no-op)
+
+	// ManagementInterface is the #1922 Item 3B/Item 4 explicit management
+	// interface override ("" = unset, defaults to fxp0). When set, it joins
+	// the protected set (never brought down by the unmanaged strip); an
+	// explicit non-fxp0 value also NARROWS fxp0 out of the auto-protection
+	// (OQ-D escape valve, so fxp0 can be repurposed as a revenue port).
+	// The typed field is wired through the protected-set resolver; the
+	// config-mode `set system management-interface <name>` parser grammar is
+	// deferred (the no-config bootstrap default-route signal is the primary
+	// lifeline path; this leaf is the operator override once a config
+	// exists). See docs/research/1922-safe-bootstrap-daemon/plan.md Item 3B.
+	ManagementInterface string
 }
 
 // UserspaceConfig holds separate-process userspace dataplane configuration.
