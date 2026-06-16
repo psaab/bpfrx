@@ -1,10 +1,11 @@
 # Development workflow — plan, review, code, review, merge
 
-> Deprecation notice (#1373): new dataplane work and routine forwarding
-> validation target the Rust AF_XDP userspace dataplane by default. Omitted
-> runtime configuration now selects userspace. The legacy eBPF dataplane
-> remains in-tree for explicit compatibility and regression coverage during the
-> staged retirement. Later phases own source, loader, build, and CLI removals.
+> Retirement notice (#1373, complete): all dataplane work targets the Rust
+> AF_XDP userspace dataplane — it is the only runtime forwarding path.
+> Omitted runtime configuration selects userspace. The legacy eBPF backend
+> is retired: its XDP/TC source was deleted in #1476 and `system
+> dataplane-type ebpf` is hard-rejected at commit and runtime. The only
+> retained eBPF artifact is the userspace XDP shim (`userspace-xdp/`).
 
 How non-trivial changes land in this repo. Roles and agent-boundary
 rules are in `AGENTS.md`; read that first. This doc is the process

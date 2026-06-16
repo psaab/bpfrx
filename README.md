@@ -33,9 +33,14 @@ your day-0 config sets credentials) or via the hypervisor console. First
 contact is always `cli`.
 
 > **Interface naming is positional, like vSRX.** The first vNIC is `fxp0`
-> (out-of-band mgmt); the rest map to `ge-0/0/N` in attach order
-> (cluster nodes insert `em0` for HA control at position 2). The order
-> you attach NICs is the order they are named — see the contract in
+> (out-of-band mgmt); the rest map to `ge-0/0/N` in attach order (cluster
+> nodes insert `em0` for HA control at position 2). The order you attach
+> NICs is the order they are named, with one wrinkle: enumeration sorts
+> virtio NICs ahead of other drivers and then by PCI bus address
+> (`enumerateAndRenameInterfaces()` in `pkg/daemon/linksetup.go`), so a
+> virtio mgmt NIC stays `fxp0`/`em0` even when dataplane ports are
+> SR-IOV/passthrough. In a normal layout this is identical to pure attach
+> order; verify with `show interfaces terse`. Full contract in
 > [`docs/deploy-quickstart.md`](docs/deploy-quickstart.md).
 
 ### (A) Debian package (.deb)
@@ -49,7 +54,7 @@ make deb                       # builds xpfd + xpf-userspace-dp + cli,
                                # packages them into dist/deb/xpf_<ver>_amd64.deb
                                # (+ the xpf-appliance metapackage)
 
-# On the target host:
+# Copy dist/deb/xpf_<ver>_amd64.deb to the target host, then there:
 sudo apt install ./xpf_<ver>_amd64.deb     # ${shlibs:Depends} pulled in by apt
 ```
 
@@ -126,10 +131,11 @@ Plain QEMU works the same way: `-drive file=dist/xpf-<ver>.qcow2`
 
 You can also drive libvirt through the same deployer used for incus —
 `scripts/deploy/xpf-deploy.py --hypervisor libvirt deploy <file>.yaml`
-emits the `virt-install` command, including SR-IOV VF-pool and
-PCI-passthrough wiring. **vNIC / SR-IOV mapping:** the order NICs appear
-on the guest PCI bus is the order they are named (`fxp0`, then
-`ge-0/0/N`). For line-rate dataplane ports, pass through a whole PF
+builds the day-0 drive and runs `virt-install`, including SR-IOV VF-pool
+and PCI-passthrough wiring (add `--dry-run` to print the command instead
+of running it). **vNIC / SR-IOV mapping:** the order NICs appear on the
+guest PCI bus is the order they are named (`fxp0`, then `ge-0/0/N`),
+subject to the virtio-first tiebreaker noted above. For line-rate dataplane ports, pass through a whole PF
 (i40e/ice/mlx5, native XDP) or an **mlx5** VF (also native XDP); Intel
 VFs fall back to generic-mode XDP (~3-4× slower); virtio/bridge is fine
 for mgmt and modest WANs. The backing matrix is in
