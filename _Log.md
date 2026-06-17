@@ -1,5 +1,21 @@
 # Action Log
 
+## 2026-06-16 — #1930 INC-3: mixed-base gate + image-roll driver + LANE-2/3 docs
+- **Timestamp**: 2026-06-16 UTC
+- **Action**: Added the LANE-2 mixed-base compatibility gate
+  (pkg/upgrade/imageversions.go: parseImageVersions + GateMixedBaseSwap;
+  fail-closed; back-compat window [min-compat,version] for HA + exact
+  session-sync match; 6 unit tests). Added `xpf-deploy.py image-roll` — a
+  rolling image-replace driver that drains, runs the mixed-base gate before
+  the first swap (reads the new image manifest + the running peer's live
+  protocol-versions), recreates each node via an operator --recreate-hook,
+  polls, and rejoins (reusing the INC-2 drain/rejoin verbs, never-both-down).
+  Documented the LANE-1/2/3 decision rule, the mixed-base gate, the
+  text-config state-carry contract, and do-release-upgrade UNSUPPORTED in
+  docs/in-place-upgrade.md; pointed install-images.md at the manifest fields.
+- **File(s)**: pkg/upgrade/imageversions.go, pkg/upgrade/imageversions_test.go,
+  scripts/deploy/xpf-deploy.py, docs/in-place-upgrade.md, docs/install-images.md
+
 ## 2026-06-16 — #1930 INC-3 (LANE-2/3): protocol-versions subcommand + bake manifest
 - **Timestamp**: 2026-06-16 UTC
 - **Action**: Started INC-3 (final PR, Closes #1930). Added `xpfd

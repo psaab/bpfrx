@@ -244,3 +244,78 @@ not be set (the node would not know it is a candidate), and an unverified
 candidate could become primary. The journaled state machine for the
 #1917 binary roll has the same requirement. This is a platform invariant
 of the appliance image (`docs/install-images.md`), not a tunable.
+
+## Kernel / OS upgrade lanes (#1930)
+
+A kernel or base-OS move picks a lane by how big the change is:
+
+| Change | Lane | Mechanism |
+|---|---|---|
+| Same kernel SERIES, in-place (verified shim already passes) | LANE 1 | `xpfd upgrade kernel` A/B UEFI boot channel (above) |
+| New kernel SERIES, or kernel arriving with a base bump | LANE 2 | image-replace (`xpf-deploy.py image-roll`) |
+| Base-OS major version (Ubuntu N → N+1) | LANE 3 | image-replace ONLY (the new kernel rides inside the image) |
+
+The decision rule is **series change ⇒ LANE 2**: the AF_XDP shim's
+kernel verifier (#1864) has only been proven against the kernel baked
+into the image, so a new series goes through the fully-tested image
+substrate (`bake.py` builds it, `validate.py` boot-gates it) rather than
+the in-place channel.
+
+### LANE 2 — rolling image-replace (`xpf-deploy.py image-roll`)
+
+There is **no in-place base-OS swap**. `image-roll` recreates each HA
+node from a new baked image ONE AT A TIME (built on the existing per-node
+`launch` + day-0 re-apply), so the peer keeps forwarding:
+
+1. **Mixed-base gate (before the FIRST swap).** After node[0] is replaced
+   it runs the NEW image while node[1] still runs the OLD one — a
+   *mixed-base* cluster. Sessions survive that window only if the new
+   image's HA + session-sync protocols are back-compatible with the
+   still-running peer. The driver reads the new image's
+   `xpf-<ver>.manifest` (the `ha-protocol-version` /
+   `ha-protocol-min-compat` / `session-sync-protocol-version` fields the
+   bake records from `xpfd protocol-versions`) and the running peer's live
+   `xpfd protocol-versions`, and applies `upgrade.GateMixedBaseSwap`
+   (mirrored in the driver, unit-tested in Go): sessions survive **iff**
+   the peer's HA protocol is within the new image's
+   `[min-compat, version]` window AND the session-sync protocol matches
+   exactly. It is **fail-closed** — any missing field, any out-of-window
+   peer, any session-sync mismatch STOPS the roll with
+   "re-image both nodes (sessions drop)". `--allow-session-drop` proceeds
+   node-by-node anyway (sessions drop at the failover).
+2. **drain** node[0] → peer (confirmed; the INC-2 `xpfd upgrade kernel
+   drain` verb, never recreate an undrained primary).
+3. **recreate** node[0] from the new image via the operator's
+   `--recreate-hook` (backend-specific destroy+launch+day-0; the
+   sequencing + never-both-down stays in the driver while the recreate
+   mechanics stay environment-specific). The node boots the new base,
+   factory-bootstraps its config DB from the day-0 text, verifies the
+   dataplane.
+4. **poll** until it is back (xpfd answers `protocol-versions`), then
+   **rejoin** + confirm sync BEFORE touching node[1] (never-both-down;
+   the INC-2 `rejoin` verb). Repeat for node[1].
+
+**Standalone** is a documented reboot/recreate gap (image swap + factory
+boot + day-0 re-apply); there is no zero-gap standalone image replace.
+
+### LANE 3 — base-OS major upgrade: image-replace only
+
+**Default and ONLY supported path: image-replace (LANE 2).** A baked N+1
+image carries the new kernel, glibc, systemd, FRR, strongSwan, kea, and
+chrony as one `validate.py`-gated unit.
+
+**State carries as TEXT config, not the encrypted DB.** The portable
+artifact is `/etc/xpf/xpf.conf` (+ `/etc/xpf/node-id` for HA identity),
+re-applied via the day-0 drive; the freshly-imaged node factory-bootstraps
+`.configdb` from the text on first boot. `master.key` is RE-GENERATED on
+the new image, NOT carried — do not attempt to carry `.configdb`/
+`master.key` across a fresh image (the new key cannot decrypt a carried
+DB). (For an *in-place* #1917 upgrade the DB persists; image-replace
+re-bootstraps from text — different paths.)
+
+**In-place `do-release-upgrade` is UNSUPPORTED.** It modifies the entire
+userspace in-place and irreversibly (no rollback if the new userspace
+fails to forward); constrained with `apt-mark hold linux-*` it leaves the
+release half-upgraded; it can leave N+1 userspace on the old N kernel
+where the shim may not verify; and it cannot be CI-tested. Operators who
+run it anyway do so at their own risk and should re-image afterward.

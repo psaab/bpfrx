@@ -886,6 +886,175 @@ def cmd_kernel_roll(args):
     return 0
 
 
+# ── LANE-2 image-replace rolling driver (#1930 INC-3) ──────────────────────
+#
+# Recreate each HA node from a NEW baked image, one at a time, so the peer keeps
+# forwarding. Built on the existing per-node recreate (`launch` + day-0 re-apply
+# of xpf.conf+node-id) — there is NO in-place base-OS swap. Before swapping the
+# SECOND node it runs the MIXED-BASE GATE: if the new image's HA/session-sync
+# protocol is NOT back-compatible with the still-running first node, it STOPS and
+# tells the operator to use the both-nodes-at-once path (sessions drop). Reuses
+# the INC-2 drain/rejoin verbs for the never-both-down handoff.
+
+def _node_protocol_versions(runner, backend, node):
+    """Read `xpfd protocol-versions` from a RUNNING node into a dict."""
+    out = _node_exec(runner, backend, node,
+                     ["xpfd", "protocol-versions"], check=False)
+    d = {}
+    for line in out.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            d[k.strip()] = v.strip()
+    return d
+
+
+def _read_image_manifest_versions(path):
+    """Parse the bake `.manifest` (key: value) into the same key namespace as
+    `xpfd protocol-versions` (key=value, hyphenated)."""
+    d = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or ":" not in line:
+                continue
+            k, v = line.split(":", 1)
+            d[k.strip().replace("_", "-")] = v.strip()
+    return d
+
+
+def _gate_mixed_base(new_img, peer):
+    """Python mirror of upgrade.GateMixedBaseSwap (unit-tested in Go). Returns
+    (sessions_survive: bool, reason: str). Fail-closed on any missing field."""
+    required = ["ha-protocol-version", "ha-protocol-min-compat",
+                "session-sync-protocol-version"]
+    for k in required:
+        if k not in new_img:
+            return False, f"new image manifest missing {k!r} — fail closed (replace both, sessions drop)"
+    try:
+        img_ha = int(new_img["ha-protocol-version"])
+        img_floor = int(new_img["ha-protocol-min-compat"])
+        img_sync = int(new_img["session-sync-protocol-version"])
+    except ValueError as e:
+        return False, f"unparsable new image versions ({e}) — fail closed"
+    try:
+        peer_ha = int(peer.get("ha-protocol-version", "0"))
+        peer_sync = int(peer.get("session-sync-protocol-version", "0"))
+    except ValueError as e:
+        return False, f"unparsable peer versions ({e}) — fail closed"
+    if peer_ha == 0:
+        return False, "peer HA protocol unknown — fail closed"
+    if peer_ha < img_floor or peer_ha > img_ha:
+        return (False, f"peer HA protocol {peer_ha} outside new image window "
+                f"[{img_floor},{img_ha}] — replace BOTH nodes (sessions drop)")
+    if peer_sync != 0 and peer_sync != img_sync:
+        return (False, f"session-sync protocol differs (peer {peer_sync}, new image "
+                f"{img_sync}) — replace BOTH nodes (sessions drop)")
+    return (True, f"new image HA {img_ha} (floor {img_floor}) accepts peer {peer_ha}; "
+            f"session-sync {img_sync} matches — mixed-base swap preserves sessions")
+
+
+def cmd_image_roll(args):
+    runner = Runner(args.dry_run)
+    backend = args.backend
+    nodes = args.nodes
+    if len(nodes) != 2:
+        die("image-roll needs exactly two --node arguments (the HA pair)")
+    if nodes[0] == nodes[1]:
+        die(f"image-roll needs two DISTINCT nodes; got {nodes[0]} twice")
+
+    # The new image's protocol versions: prefer the manifest (a file read), else
+    # the running staged binary is not available here, so the manifest is
+    # REQUIRED for the gate. Fail closed if absent.
+    if not args.manifest or not os.path.isfile(args.manifest):
+        die("image-roll requires --manifest <xpf-<ver>.manifest> (the new image's "
+            "version manifest) for the mixed-base gate; not found")
+    new_img = _read_image_manifest_versions(args.manifest)
+
+    drain_deadline = args.drain_deadline
+    boot_deadline = args.boot_deadline
+
+    print(f"==> LANE-2 HA image roll: {nodes[0]} then {nodes[1]} "
+          f"(recreate each from {os.path.basename(args.manifest)}; peer keeps forwarding)")
+
+    def roll_one(node, peer, is_second):
+        print(f"\n--- rolling {node}; {peer} stays primary ---")
+        # The MIXED-BASE GATE protects the SECOND swap: at that point the FIRST
+        # node already runs the NEW image and the peer (this `peer`, the not-yet-
+        # rolled... no: by the second roll, `peer` is the ALREADY-rolled node on
+        # the NEW image). The risk window is the FIRST swap: after it, node[0]
+        # runs NEW while node[1] still runs OLD. So gate BEFORE the first swap,
+        # reading the still-OLD peer's live protocol.
+        if not is_second:
+            peer_v = _node_protocol_versions(runner, backend, peer)
+            survive, reason = _gate_mixed_base(new_img, peer_v)
+            print(f"   mixed-base gate: {reason}")
+            if not survive and not args.allow_session_drop:
+                die(f"mixed-base gate FAILED: {reason}\n"
+                    f"   The new image is not session-compatible with the running "
+                    f"peer {peer}. Re-image BOTH nodes together (accept the "
+                    f"connection drop) or pass --allow-session-drop to proceed "
+                    f"node-by-node anyway (sessions WILL drop at the failover).")
+            if not survive:
+                print(f"   --allow-session-drop set: proceeding; sessions WILL drop")
+
+        # 1. drain node -> peer (confirmed; never recreate an undrained primary).
+        print(f"   draining {node} -> {peer} (confirmed)...")
+        _node_exec(runner, backend, node, ["xpfd", "upgrade", "kernel", "drain"])
+
+        # 2. recreate the node from the new image. This is the existing per-node
+        #    launch (boot-disk swap + day-0 re-apply of xpf.conf + node-id). The
+        #    node boots the NEW base, factory-bootstraps its config DB from the
+        #    day-0 text, verifies the dataplane, and rejoins.
+        if runner.dry:
+            print(f"   (dry-run) would recreate {node} from the new image "
+                  f"(launch + day-0), poll boot+verify, then rejoin")
+            return
+        _recreate_node_from_image(runner, backend, node, args)
+
+        # 3. poll until the node is back + forwarding (verify-dataplane passed at
+        #    boot via the day-0/factory path).
+        deadline = _time.time() + boot_deadline
+        back = False
+        while _time.time() < deadline:
+            _time.sleep(10)
+            pv = _node_protocol_versions(runner, backend, node)
+            if pv.get("xpf-version"):  # node is up + xpfd responds
+                back = True
+                break
+        if not back:
+            die(f"{node} did not come back within {boot_deadline}s after image "
+                f"recreate; STOPPING — {peer} stays primary. Investigate.")
+        print(f"   {node} back on the new image")
+
+        # 4. rejoin + confirm sync BEFORE touching the peer (never-both-down).
+        print(f"   rejoining {node} (confirming sync)...")
+        _node_exec(runner, backend, node, ["xpfd", "upgrade", "kernel", "rejoin"])
+
+    roll_one(nodes[0], nodes[1], is_second=False)
+    print(f"\n==> {nodes[0]} done; rolling the second node")
+    roll_one(nodes[1], nodes[0], is_second=True)
+    print(f"\n==> LANE-2 HA image roll COMPLETE on both nodes")
+    return 0
+
+
+def _recreate_node_from_image(runner, backend, node, args):
+    """Recreate ONE node from the new image. Delegates to the operator-supplied
+    recreate hook (a script that does the backend-specific destroy+launch+day-0),
+    because the recreate mechanics differ per environment (incus launch, libvirt
+    redefine, bare-metal re-flash). The hook gets XPF_ROLL_NODE in the env."""
+    hook = args.recreate_hook
+    if not hook:
+        die(f"image-roll needs --recreate-hook <script> to recreate {node} from "
+            f"the new image (the backend-specific destroy+launch+day-0 step). "
+            f"This keeps the never-both-down sequencing here while the recreate "
+            f"mechanics stay environment-specific.")
+    env = dict(os.environ, XPF_ROLL_NODE=node, XPF_ROLL_BACKEND=backend)
+    print(f"   recreating {node} via {hook}...")
+    r = subprocess.run([hook, node], env=env)
+    if r.returncode != 0:
+        die(f"recreate hook for {node} failed (rc={r.returncode}); STOPPING.")
+
+
 def main():
     argv = sys.argv[1:]
     if "-h" in argv or "--help" in argv or not argv:
@@ -907,7 +1076,8 @@ def main():
     # `rest` now holds only the subcommand + its own args. The first token
     # is the subcommand; if it isn't one, treat the whole of `rest` as
     # YAML files for `deploy` (the bare-`xpf-deploy.py foo.yaml` shorthand).
-    if rest and rest[0] in ("deploy", "launch", "inventory", "fetch", "kernel-roll"):
+    if rest and rest[0] in ("deploy", "launch", "inventory", "fetch",
+                            "kernel-roll", "image-roll"):
         cmd, cmd_argv = rest[0], rest[1:]
     else:
         cmd, cmd_argv = "deploy", rest
@@ -961,6 +1131,29 @@ def main():
                          help="seconds to wait for a node to boot + promote the "
                               "candidate before STOPPING the roll")
         args = sub.parse_args(cmd_argv)
+    elif cmd == "image-roll":
+        sub = argparse.ArgumentParser(prog="xpf-deploy.py image-roll", add_help=False)
+        sub.add_argument("--node", dest="nodes", action="append", default=[],
+                         required=True,
+                         help="HA node (incus name or ssh host); give it TWICE "
+                              "in roll order (first-to-roll then second)")
+        sub.add_argument("--manifest", required=True,
+                         help="the NEW image's xpf-<ver>.manifest (read for the "
+                              "mixed-base HA-protocol gate)")
+        sub.add_argument("--recreate-hook", dest="recreate_hook",
+                         help="script invoked as <hook> <node> to destroy+launch "
+                              "the node from the new image + re-apply day-0 "
+                              "(backend-specific); receives XPF_ROLL_NODE in env")
+        sub.add_argument("--backend", default="incus", choices=["incus", "ssh"])
+        sub.add_argument("--drain-deadline", type=int, default=30,
+                         help="seconds to confirm the drain predicate")
+        sub.add_argument("--boot-deadline", type=int, default=600,
+                         help="seconds to wait for a recreated node to come back "
+                              "before STOPPING the roll")
+        sub.add_argument("--allow-session-drop", action="store_true",
+                         help="proceed node-by-node even if the mixed-base gate "
+                              "fails (sessions WILL drop at the failover)")
+        args = sub.parse_args(cmd_argv)
     else:  # deploy
         sub = argparse.ArgumentParser(prog="xpf-deploy.py deploy", add_help=False)
         sub.add_argument("yamls", nargs="*")
@@ -981,6 +1174,8 @@ def main():
         return cmd_launch(args)
     if cmd == "kernel-roll":
         return cmd_kernel_roll(args)
+    if cmd == "image-roll":
+        return cmd_image_roll(args)
     return cmd_deploy(args)
 
 

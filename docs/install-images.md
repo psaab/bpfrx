@@ -98,7 +98,15 @@ Each bake also writes `dist/xpf-<ver>.manifest` recording the exact
 inputs (base image URL + release + verified SHA256, git commit, bake
 date/host kernel). Bakes are not bit-reproducible (the base tracks
 the newest upstream release unless `XPF_BASE_RELEASE` pins one); the
-manifest is the traceability record.
+manifest is the traceability record. The manifest ALSO records the
+staged binary's compile-time protocol versions (`ha_protocol_version`,
+`ha_protocol_min_compat`, `session_sync_protocol_version`,
+`configdb_*_version`, from `xpfd protocol-versions`); the #1930 LANE-2
+mixed-base HA gate (`xpf-deploy.py image-roll`) reads these to decide —
+without booting the image — whether a rolling image-replace can preserve
+sessions across the mixed-base window or must replace both nodes at once.
+See `docs/in-place-upgrade.md` (Kernel / OS upgrade lanes) for the full
+LANE-1/2/3 decision rule and the state-carry contract.
 
 Full first-boot matrix (run after a bake, or standalone):
 
