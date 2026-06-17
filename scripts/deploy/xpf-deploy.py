@@ -628,10 +628,15 @@ def _node_exec(runner, backend, node, argv, check=True):
         # exec passes argv through verbatim, so this only bites the ssh backend.
         # Quote each element so the remote shell reconstructs the exact argv.
         remote = " ".join(shlex.quote(a) for a in argv)
+        # No "--" before the remote command: ssh has no option/command
+        # separator — getopt stops at the destination (`node`), so everything
+        # after it is the remote command. A literal "--" would be sent as the
+        # first token of the remote command string, and the remote login shell
+        # would try to run `-- <cmd>` → "--: command not found" (Copilot).
         full = ["ssh",
                 "-o", "BatchMode=yes",
                 "-o", "ConnectTimeout=15",
-                node, "--", remote]
+                node, remote]
     else:
         full = ["incus", "exec", node, "--"] + argv
     if runner.dry:
