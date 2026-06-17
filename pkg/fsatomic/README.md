@@ -28,9 +28,9 @@ decides the writer:
 
 | Class | Writer | Examples |
 |---|---|---|
-| DurableState | `WriteFileDurable` | active config, rollback slot 1, rescue config, `master.key`, DHCPv6 DUID, `frr.conf` |
-| AtomicGeneratedConfig | `WriteFileAtomic` | swanctl conf, Kea configs, networkd `.link`/`.network`, rollback slots 2..N |
-| BestEffortKernelKnob | direct `os.WriteFile` | procfs/sysfs knobs (rename impossible there) |
+| DurableState | `WriteFileDurable` | active config, rollback slot 1, rescue config, `master.key`, DHCPv6 DUID, `frr.conf`, `/etc/hostname`, sudoers + `authorized_keys`, TLS cert + key, lifeline record, provisioned-users marker |
+| AtomicGeneratedConfig | `WriteFileAtomic` | swanctl conf, Kea configs, networkd `.link`/`.network`, rollback slots 2..N, sshd/rsyslog/chrony drop-ins, `ssh_known_hosts`, `/etc/timezone`, `/etc/resolv.conf` |
+| BestEffortKernelKnob | direct `os.WriteFile` | procfs/sysfs knobs (rename impossible there); the `/etc/resolv.conf` bind-mount in-place fallback (EXDEV/EBUSY) |
 
 The AtomicGeneratedConfig class exists precisely so hot apply paths never
 pay an fsync; fsync costs land only on operator-paced commit paths.
@@ -47,9 +47,20 @@ pay an fsync; fsync costs land only on operator-paced commit paths.
   target (dangling links resolve to their destination); the durable
   dir-fsync targets the resolved parent. Without it, a symlinked target
   is replaced by a regular file.
+- `WithOwner(uid, gid)` (#1916) — fchown the temp fd to a specific
+  user/group BEFORE the rename, so the new inode is installed
+  already-correctly-owned with no post-rename chown race. Required for
+  DurableState `authorized_keys`: a plain durable write replaces the inode
+  with a root-owned temp, and a crash before a separate chown would leave
+  root-owned `0600` keys that sshd refuses (EACCES → lockout). Resolve the
+  uid/gid cgo-free (the codebase parses `/etc/passwd` directly via
+  `lookupUIDGID`, never `os/user`).
+  - **Precedence vs `WithPreserveExisting`**: if both are set, owner =
+    `WithOwner`'s, mode = preserved-existing's (explicit owner always wins).
 
-Both options together reproduce `pkg/frr`'s `atomicWriteFile` (#1883)
-semantics, which this package lifted; FRR now delegates here.
+`WithPreserveExisting()` + `WithResolveSymlinks()` together reproduce
+`pkg/frr`'s `atomicWriteFile` (#1883) semantics, which this package lifted;
+FRR now delegates here.
 
 ## Deliberate non-features
 
@@ -79,12 +90,31 @@ configstore #1799 persist-before-promote contract documents.
 `fsatomic_test.go` injects one failure per writer stage through the
 package-private seams (create/write/chmod/chown/sync/close/rename/
 dir-open) and asserts the three invariants: error names the stage,
-target untouched (pre-rename stages), temp cleaned up.
+target untouched (pre-rename stages), temp cleaned up. `WithOwner` is
+tested for owned-before-rename ordering and for precedence over
+`WithPreserveExisting`.
+
+## Canary (`canary_test.go`)
+
+`TestNoDirectOsWriteFile` is the writer-class enforcement test. It walks
+EVERY production (non-`_test.go`) `.go` file under `pkg/` with `go/ast`
+(not grep — comments may mention `os.WriteFile` and import aliases of
+`os` are still caught) and flags any direct `os.WriteFile` whose
+enclosing function is not on the allowlist. #1916 changed it from a
+package allowlist (which let a NEW package silently escape) to a
+repo-wide scan keyed RECEIVER-AWARE by `<pkg-relpath>::[RecvType.]func`
+(a method `(*T).writeFile` keys as `pkg::T.writeFile`; a plain func keys
+as `pkg::func`), so a future same-named function on a different receiver
+in the same package does NOT inherit an exemption. The allowlist holds
+only BestEffortKernelKnob entries (procfs/sysfs/bind-mount). A
+self-test guard fails if the walk scans zero files. To keep a giant
+function (e.g. `applyConfigLocked`) off the allowlist, extract its procfs
+write into a tiny single-purpose helper and allowlist the helper.
 
 ## Callers
 
 `pkg/configstore`, `pkg/frr`, `pkg/ipsec`, `pkg/dhcpserver`,
-`pkg/networkd`, `pkg/dhcp`.
+`pkg/networkd`, `pkg/dhcp`, `pkg/daemon`, `pkg/api`.
 
 ## Dependencies
 

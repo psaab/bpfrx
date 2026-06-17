@@ -260,14 +260,36 @@ inlining. Treat the trend as a defect, not a style preference.
 
 Every file write that replaces on-disk state belongs to exactly one
 class, and the class picks the writer. `pkg/fsatomic` is the single
-source of truth; an AST canary in that package fails the suite when a
-new direct `os.WriteFile` lands in a migrated package unclassified.
+source of truth; an AST canary in that package (`TestNoDirectOsWriteFile`)
+walks EVERY production `.go` file under `pkg/` (#1916, repo-wide — not a
+package allowlist) and fails the suite when a direct `os.WriteFile` lands
+in a function that is not on the receiver-aware allowlist.
 
 | Class | Writer | Meaning | Examples |
 |---|---|---|---|
-| DurableState | `fsatomic.WriteFileDurable` | Must survive power loss: temp + fsync + rename + parent-dir fsync. | active config (`.configdb`), rollback slot 1, rescue config, `master.key`, DHCPv6 DUID, `frr.conf` |
-| AtomicGeneratedConfig | `fsatomic.WriteFileAtomic` | Regenerated on boot/apply; a torn file is unacceptable, a lost-on-power-cut update is fine. **No fsync — this class exists so hot apply paths never pay one.** | swanctl conf, Kea configs, networkd `.link`/`.network`, rollback slots 2..N |
-| BestEffortKernelKnob | direct `os.WriteFile` | procfs/sysfs: rename does not exist there, the atomic writers are impossible by construction. | `rp_filter` knob |
+| DurableState | `fsatomic.WriteFileDurable` | Must survive power loss: temp + fsync + rename + parent-dir fsync. | active config (`.configdb`), rollback slot 1, rescue config, `master.key`, DHCPv6 DUID, `frr.conf`, `/etc/hostname`, sudoers drop-in, user + root `authorized_keys`, TLS cert + key (`/etc/xpf/tls/*`), lifeline record, provisioned-users marker |
+| AtomicGeneratedConfig | `fsatomic.WriteFileAtomic` | Regenerated on boot/apply; a torn file is unacceptable, a lost-on-power-cut update is fine. **No fsync — this class exists so hot apply paths never pay one.** | swanctl conf, Kea configs, networkd `.link`/`.network`, rollback slots 2..N, sshd drop-in, rsyslog drop-in, chrony drop-in, `ssh_known_hosts`, `/etc/timezone`, `/etc/resolv.conf` |
+| BestEffortKernelKnob | direct `os.WriteFile` | procfs/sysfs: rename does not exist there, the atomic writers are impossible by construction. Also the `/etc/resolv.conf` bind-mount in-place fallback (rename onto a bind mount is EXDEV/EBUSY). | `rp_filter`, `accept_dad`/`addr_gen_mode`, RPS/RFS/XPS, `fib_multipath_hash_policy`, socket-buffer sysctls |
+
+Special cases:
+
+- **TLS cert + key are DurableState** (#1916 D6): the HTTPS API can bind a
+  non-loopback `system services web-management https interface` address, so
+  cert churn after a power-cut loss would break remote clients' TOFU pins.
+  The pair is written with the #1916 D5 STRICT sequence — strict-remove the
+  stale pair (ignore only ENOENT; any other remove/SyncDir error ABORTS the
+  write, so the `{neither}` start is proven) → key (0600) → cert (0644) — so
+  a crash can never leave a MISMATCHED pair. A persistence failure logs and
+  serves the in-memory cert (HTTPS still installs); only a true generation
+  failure returns a non-nil error.
+- **`authorized_keys` uses `fsatomic.WithOwner(uid, gid)`** (#1916 D7): a
+  plain durable write replaces the inode with a root-owned temp, and a crash
+  before a separate post-rename chown would leave root-owned `0600` keys that
+  sshd refuses (EACCES → lockout). `WithOwner` fchowns the temp fd BEFORE the
+  rename so the file is correctly owned atomically at install. The owner is
+  resolved cgo-free from `/etc/passwd` (`lookupUIDGID` — never `os/user`).
+- **`WithOwner` vs `WithPreserveExisting` precedence**: if both are set,
+  owner = `WithOwner`'s, mode = preserved-existing's (explicit owner wins).
 
 Rules of thumb:
 
