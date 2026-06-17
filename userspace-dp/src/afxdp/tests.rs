@@ -5669,10 +5669,16 @@ fn txn_tunnel_marked_missing_neighbor_not_buffered() {
     );
     let _ = dbg;
 
-    // Second packet: the session now exists, so the per-packet path
-    // re-resolves the stored tunnel id. The frame must still never be
-    // buffered for in-place retry and must still be dropped (not
-    // reinjected) on the session path too.
+    // Second packet: the HAInactive arm never seeds a session, so this
+    // run re-executes the session-miss path (the `sessions` table is
+    // still empty). It re-resolves to the same residual HAInactive
+    // tunnel decision and must again be dropped — never buffered for
+    // in-place retry and never reinjected.
+    assert_eq!(
+        sessions.len(),
+        0,
+        "HAInactive frame must NOT seed a session (second run stays on the miss path)"
+    );
     let meta2 = txn_meta_v4(24, TCP_FLAG_SYN, (frame.len() - 14) as u16);
     let (_batch2, dbg2) = txn_run_descriptor(
         &mut binding,
@@ -5685,7 +5691,7 @@ fn txn_tunnel_marked_missing_neighbor_not_buffered() {
     let _ = dbg2;
     assert!(
         binding.pending_neigh.is_empty(),
-        "tunnel-marked frame must skip pending_neigh admission on the session path too (#1873 R-E)"
+        "tunnel-marked frame must skip pending_neigh admission on the re-run too (#1873 R-E)"
     );
     assert_eq!(
         binding.live.slow_path_packets.load(Ordering::Relaxed),
