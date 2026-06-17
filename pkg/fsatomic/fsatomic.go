@@ -23,7 +23,13 @@
 //     This differs from os.WriteFile over an existing file, which keeps
 //     the existing inode's mode/owner. Pass WithPreserveExisting to
 //     lift mode/ownership from an existing target instead (fchmod /
-//     fchown on the temp fd, never a path race).
+//     fchown on the temp fd, never a path race). Pass WithOwner(uid,
+//     gid) to install the new inode already owned by a specific
+//     user/group (fchown the temp fd before rename — required for
+//     DurableState authorized_keys so a crash can never leave
+//     root-owned keys sshd refuses). If both WithOwner and
+//     WithPreserveExisting are set, owner = WithOwner's, mode =
+//     preserved-existing's.
 //   - A symlinked target is replaced by a regular file unless
 //     WithResolveSymlinks is passed, in which case the write lands on
 //     the resolved target (and, for WriteFileDurable, the directory
@@ -53,6 +59,7 @@ import (
 type options struct {
 	preserveExisting bool
 	resolveSymlinks  bool
+	owner            *ownerIDs
 }
 
 // Option configures WriteFileAtomic / WriteFileDurable.
@@ -65,6 +72,23 @@ type Option func(*options)
 // renamed over a differently-owned target (FRR #1883 semantics).
 func WithPreserveExisting() Option {
 	return func(o *options) { o.preserveExisting = true }
+}
+
+// WithOwner sets the owner (uid/gid) of the temp file via fchown on the
+// open fd BEFORE the rename, so the final path is installed already
+// correctly-owned — there is no post-rename chown race. This is the
+// mechanism the DurableState authorized_keys writers need: a plain
+// WriteFileDurable replaces the target inode with a root-owned temp, and
+// a crash before a separate post-rename chown would leave root-owned
+// 0600 keys that sshd refuses (EACCES → lockout). WithOwner closes that
+// window by owning the inode atomically at install time.
+//
+// Precedence vs WithPreserveExisting: WithPreserveExisting may lift the
+// MODE from an existing target, but an explicit WithOwner always WINS
+// OWNERSHIP. If both are passed, owner = WithOwner's uid/gid, mode =
+// the preserved-existing mode.
+func WithOwner(uid, gid int) Option {
+	return func(o *options) { o.owner = &ownerIDs{uid: uid, gid: gid} }
 }
 
 // WithResolveSymlinks resolves a symlinked path to its target before
@@ -218,17 +242,23 @@ func writeFile(path string, data []byte, perm os.FileMode, durable bool, opts ..
 
 	mode := perm
 	var (
-		preserveOwner bool
-		owner         ownerIDs
+		setOwner bool
+		owner    ownerIDs
 	)
 	if o.preserveExisting {
 		if fi, err := statFile(target); err == nil {
 			mode = fi.Mode().Perm()
 			if ids, ok := fileOwner(fi); ok {
-				preserveOwner = true
+				setOwner = true
 				owner = ids
 			}
 		}
+	}
+	// WithOwner always wins ownership (explicit beats preserved-existing);
+	// the mode lifted by WithPreserveExisting above is left untouched.
+	if o.owner != nil {
+		setOwner = true
+		owner = *o.owner
 	}
 
 	dir := filepath.Dir(target)
@@ -255,7 +285,7 @@ func writeFile(path string, data []byte, perm os.FileMode, durable bool, opts ..
 		_ = tmp.Close()
 		return fmt.Errorf("chmod temp file: %w", err)
 	}
-	if preserveOwner {
+	if setOwner {
 		if cur, ok := tempOwner(tmp); !ok || cur != owner {
 			if err := chownTemp(tmp, owner.uid, owner.gid); err != nil {
 				_ = tmp.Close()

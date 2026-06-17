@@ -23,6 +23,7 @@ import (
 	"github.com/psaab/xpf/pkg/conntrack"
 	"github.com/psaab/xpf/pkg/dhcp"
 	"github.com/psaab/xpf/pkg/frr"
+	"github.com/psaab/xpf/pkg/fsatomic"
 	"github.com/psaab/xpf/pkg/ipmon"
 	"github.com/psaab/xpf/pkg/ipsec"
 	"github.com/psaab/xpf/pkg/logging"
@@ -315,20 +316,60 @@ func (s *Server) Run(ctx context.Context) error {
 }
 
 const (
+	tlsDir   = "/etc/xpf/tls"
 	certPath = "/etc/xpf/tls/cert.pem"
 	keyPath  = "/etc/xpf/tls/key.pem"
 )
 
-// generateSelfSignedCert creates or loads a self-signed TLS certificate.
-// If cert/key files exist on disk, they are loaded. Otherwise, a new
-// ECDSA P-256 certificate is generated and persisted for reuse across restarts.
+// TLS persistence test seams (#1916 injected-failure tests). Production
+// code must never mutate these.
+var (
+	tlsMkdirAllDurable  = fsatomic.MkdirAllDurable
+	tlsRemove           = os.Remove
+	tlsSyncDir          = fsatomic.SyncDir
+	tlsWriteFileDurable = fsatomic.WriteFileDurable
+)
+
+// generateSelfSignedCert creates or loads a self-signed TLS certificate
+// using the production /etc/xpf/tls paths. See generateSelfSignedCertAt.
 func generateSelfSignedCert() (tls.Certificate, error) {
-	// Try loading existing cert
+	return generateSelfSignedCertAt(tlsDir, certPath, keyPath)
+}
+
+// generateSelfSignedCertAt creates or loads a self-signed TLS certificate
+// at the given paths.
+//
+// If a usable cert/key pair already exists on disk it is loaded and
+// returned. Otherwise a new ECDSA P-256 certificate is generated and
+// persisted (both cert and key are DurableState per #1916 D6: the HTTPS
+// API can bind a non-loopback `web-management https interface` address,
+// so cert churn after a power-cut loss would break remote clients' TOFU
+// pins — the cert must survive power loss).
+//
+// Persistence follows the #1916 D5 STRICT sequence so a crash can never
+// leave a MISMATCHED cert/key pair on disk:
+//  1. MkdirAllDurable(dir).
+//  2. Strict-remove any stale cert AND key (ignore ONLY os.IsNotExist;
+//     ANY other remove error OR a SyncDir error aborts the write — the
+//     {neither} start state is proven, not assumed), then SyncDir.
+//  3. WriteFileDurable(key, 0600).
+//  4. WriteFileDurable(cert, 0644).
+//
+// On ANY persistence error (steps 1-4) the function logs and returns the
+// in-memory generated pair with a NIL error: the cert is usable this boot,
+// only the disk write failed, so HTTPS still installs (the caller binds
+// httpsServer on the nil-error path). A non-nil error is returned ONLY for
+// a true generation failure (no usable cert at all).
+func generateSelfSignedCertAt(dir, certPath, keyPath string) (tls.Certificate, error) {
+	// Try loading an existing on-disk pair. LoadX509KeyPair reads the cert
+	// first and errors on a key-only / mismatched state → falls through to
+	// regen, which restores a matching pair.
 	if cert, err := tls.LoadX509KeyPair(certPath, keyPath); err == nil {
 		return cert, nil
 	}
 
-	// Generate new ECDSA key
+	// Generate new ECDSA key + self-signed cert (true generation failures
+	// below return a non-nil error: there is no usable cert at all).
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return tls.Certificate{}, err
@@ -360,10 +401,54 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 	}
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 
-	// Persist for reuse across restarts
-	os.MkdirAll("/etc/xpf/tls", 0700)
-	os.WriteFile(certPath, certPEM, 0644)
-	os.WriteFile(keyPath, keyPEM, 0600)
+	inMemory, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		// The just-generated PEM does not parse — a true generation
+		// failure, not a persistence one.
+		return tls.Certificate{}, err
+	}
 
-	return tls.X509KeyPair(certPEM, keyPEM)
+	// From here, any failure is a PERSISTENCE failure: log it and return
+	// the usable in-memory pair with a nil error so HTTPS still installs.
+	if err := persistSelfSignedCert(dir, certPath, keyPath, certPEM, keyPEM); err != nil {
+		slog.Error("failed to persist self-signed TLS certificate; serving in-memory cert this boot (will regenerate next boot)",
+			"dir", dir, "err", err)
+	}
+	return inMemory, nil
+}
+
+// persistSelfSignedCert implements the #1916 D5 STRICT write sequence. Any
+// returned error means the disk state is clean: either the directory could
+// not be created, a strict-remove could not establish a provable {neither}
+// start state (so no new write was attempted), a SyncDir failed to make the
+// removes durable, or a durable write itself failed — in every case no
+// mismatched pair is left visible on disk.
+func persistSelfSignedCert(dir, certPath, keyPath string, certPEM, keyPEM []byte) error {
+	if err := tlsMkdirAllDurable(dir, 0700); err != nil {
+		return err
+	}
+	// Strict-remove the stale pair so the start state is provably {neither}.
+	// Ignore ONLY os.IsNotExist; any other remove error aborts (do NOT
+	// write) so we never leave a stale cert beside a fresh key.
+	if err := tlsRemove(certPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := tlsRemove(keyPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	// Make the unlinks durable before writing the new pair; a SyncDir
+	// failure also aborts (the {neither} start is not proven).
+	if err := tlsSyncDir(dir); err != nil {
+		return err
+	}
+	// Ordered durable writes: key first (DurableState 0600), then cert
+	// (DurableState 0644). The only crash-visible states are {neither},
+	// {key-only}, {both-matching}; LoadX509KeyPair rejects {key-only}.
+	if err := tlsWriteFileDurable(keyPath, keyPEM, 0600); err != nil {
+		return err
+	}
+	if err := tlsWriteFileDurable(certPath, certPEM, 0644); err != nil {
+		return err
+	}
+	return nil
 }

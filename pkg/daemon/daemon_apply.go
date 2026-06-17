@@ -24,6 +24,30 @@ import (
 	"github.com/psaab/xpf/pkg/vrrp"
 )
 
+// setRethIPv6Knobs writes the per-interface IPv6 procfs knobs for a RETH
+// member: disable DAD (the virtual MAC may still collide with the peer on
+// some deployments) and suppress kernel-generated link-locals (which else
+// trigger continuous MLDv2 reports on the L2 segment; VIPs are managed
+// explicitly). These are BestEffortKernelKnob procfs writes — a rename(2)
+// is impossible on procfs, so they stay direct os.WriteFile. Extracted from
+// applyConfigLocked (#1916 §2.D) so the giant apply function is never
+// allowlisted in the fsatomic canary; this single-purpose helper is.
+func setRethIPv6Knobs(iface string) {
+	dadPath := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/accept_dad", iface)
+	os.WriteFile(dadPath, []byte("0"), 0644)
+	addrGenPath := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/addr_gen_mode", iface)
+	os.WriteFile(addrGenPath, []byte("1"), 0644)
+}
+
+// setVLANSubAddrGenMode suppresses kernel-generated link-locals on a VLAN
+// sub-interface (addr_gen_mode=1). BestEffortKernelKnob procfs write,
+// extracted from applyConfigLocked (#1916 §2.D) so it can be allowlisted
+// without exempting the whole apply function.
+func setVLANSubAddrGenMode(iface string) {
+	subAddrGen := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/addr_gen_mode", iface)
+	os.WriteFile(subAddrGen, []byte("1"), 0644)
+}
+
 // bootstrapFromFile reads the text Junos config file and imports it as the
 // initial active configuration. This is called on first start when the DB
 // has no active config yet.
@@ -640,16 +664,7 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 			// programming — the interface reboots with physical MAC but
 			// the MACAddress= line might reference the wrong one.
 			ensureRethLinkOriginalName(linuxName)
-			// Disable DAD — virtual MAC may still collide with peer on
-			// some deployments; disable to avoid DAD failures.
-			dadPath := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/accept_dad", linuxName)
-			os.WriteFile(dadPath, []byte("0"), 0644)
-			// Suppress auto link-local generation on RETH member interfaces.
-			// The virtual MAC triggers a kernel-generated link-local (fe80::...)
-			// which causes continuous MLDv2 multicast reports on the L2 segment.
-			// VIPs are managed explicitly; auto link-locals are unnecessary.
-			addrGenPath := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/addr_gen_mode", linuxName)
-			os.WriteFile(addrGenPath, []byte("1"), 0644)
+			setRethIPv6Knobs(linuxName)
 			mac := cluster.RethMAC(cc.ClusterID, rethCfg.RedundancyGroup, cc.NodeID)
 			linkCycled, err := programRethMAC(linuxName, mac)
 			if err != nil {
@@ -697,8 +712,7 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 					}
 					subName := l.Attrs().Name
 					// Suppress auto link-local on VLAN sub-interfaces too.
-					subAddrGen := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/addr_gen_mode", subName)
-					os.WriteFile(subAddrGen, []byte("1"), 0644)
+					setVLANSubAddrGenMode(subName)
 					if !bytes.Equal(l.Attrs().HardwareAddr, mac) {
 						if err := netlink.LinkSetHardwareAddr(l, mac); err != nil {
 							slog.Warn("failed to propagate MAC to VLAN sub-interface",

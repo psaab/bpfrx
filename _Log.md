@@ -1,5 +1,18 @@
 # Action Log
 
+## 2026-06-17 — #1916 review: authorized_keys lockout fix + persistSelfSignedCert comment
+
+- **Timestamp**: 2026-06-17
+- **Action**: Address Copilot code review on PR #1916. (1) daemon_system.go:
+  when lookupUIDGID fails, refuse the authorized_keys write entirely (keep
+  prior file intact) instead of falling back to a root-owned write + later
+  chown -R — the crash window between the root-owned write and chown was
+  exactly the lockout risk D7 aimed to eliminate. (2) server.go: reword the
+  persistSelfSignedCert comment to accurately enumerate all abort cases
+  (mkdir, strict-remove failure, SyncDir failure, durable-write failure) and
+  clarify the shared guarantee: no mismatched pair is left visible on disk.
+- **File(s)**: pkg/daemon/daemon_system.go, pkg/api/server.go, _Log.md
+
 ## 2026-06-17 — #1914 tunnel-endpoint collision gate three-view union (Path 1)
 
 - **Timestamp**: 2026-06-17
@@ -5795,3 +5808,7 @@ top.
 - **Timestamp**: 2026-06-17
   - **Action**: #1913 Codex r3 fix (HIGH). The r2 deny gate (after zone-ids, before probe) still sat BELOW the negative-cache fast-fail at the top of the MissingNeighbor arm: a negatively-cached denied flow hit neg_neigh_gate first → resolver.enqueue (RTM_GETNEIGH/ARP probe) + recycle+continue, never reaching the deny conversion (no policy_deny count, resolver side-effect for a drop). Moved the zone-id computation + the entire policy-deny gate to the VERY TOP of the MissingNeighbor arm (before neg_neigh_gate). Removed the now-duplicate mid-arm zone-id + policy block. New regression txn_policy_denied_missing_neighbor_skips_neg_cache_fast_fail (pre-seeds neg_neigh_cache, asserts policy_deny>=1, neg_neigh_fast_fail==0, no reinject/buffer).
   - **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs, userspace-dp/src/afxdp/tests.rs, docs/userspace-dataplane-architecture.md, _Log.md
+
+- **Timestamp**: 2026-06-17
+  - **Action**: #1916 fsatomic durability coverage gap — full implementation (Steps 0-8). Step 0: added `fsatomic.WithOwner(uid,gid) Option` (fchown temp fd before rename via the chownTemp seam; precedence: WithOwner wins ownership, WithPreserveExisting keeps mode) + unit tests (owned-before-rename, precedence). Step 0b: extended `lookupUID` → `lookupUIDGID(name)(uid,gid,ok)` parsing /etc/passwd fields 2+3, cgo-free (no os/user); markProvisioned → MkdirAllDurable + WriteFileDurable. Step 1: refactored TLS to `generateSelfSignedCertAt`, implemented the D5 STRICT sequence (MkdirAllDurable → strict-remove stale cert+key [ignore only ENOENT] → SyncDir [abort on any other error, do not write] → key WriteFileDurable 0600 → cert WriteFileDurable 0644 [D6: cert is DurableState — non-loopback https-interface bind, pin stability]); persistence failure logs + returns in-memory cert with NIL error so HTTPS still installs; non-nil only on true generation failure. Step 2/2b: hostname/sudoers/user-keys(+WithOwner)/root-keys(+WithOwner(0,0)) → WriteFileDurable; chrony/ssh_known_hosts/rsyslog/sshd-drop-in → WriteFileAtomic; timezone r4 case-split (touch symlink only when localtime wrong, always write /etc/timezone atomically when content differs incl the localtime-already-correct branch — repairs AGY early-return loophole without the Codex remove-correct-localtime crash window). Step 3: fixRethLinkFile/writeLinkFile/writeBootstrapFxp0Network/bootstrap-fxp0-network → WriteFileAtomic; writeLifelineRecordAt → MkdirAllDurable + WriteFileDurable. Step 4: extracted `writeResolvConfBindMountFallback`, routed happy path through WriteFileAtomic with isCrossDeviceOrBusy (already errors.Is) fallback. Step 5: extracted procfs helpers setRethIPv6Knobs/setVLANSubAddrGenMode (from applyConfigLocked) + setFibMultipathHashPolicy (from applyFRRConfig) — pure refactor so the giant functions stay off the allowlist. Step 6: rewrote the canary `TestNoDirectOsWriteFile` as a repo-wide WalkDir over pkg/**/*.go with a receiver-aware keyer (`<pkg-relpath>::[RecvType.]func`), seeded the complete §2.C/§2.D knob allowlist, added a scanned-count self-test guard + a keyer unit test. Step 7: added pkg/api/tls_test.go (happy, failed cert/key write, mismatched-start, stale-cert-only, strict-remove-failure, dir-sync-failure, mkdir-failure, HTTPS-still-installed-on-persist-failure). Step 8: updated docs/engineering-style.md "Persistence classes" + pkg/fsatomic/README.md (WithOwner+precedence+receiver-aware repo-wide canary). Validation: go build ./... clean, go test ./... green, canary scans 351 files & passes. D4 (journal ReadAt) deferred to a follow-up issue. D8 failover is the only remaining gate (parent runs the serialized loss-cluster smoke).
+  - **File(s)**: pkg/fsatomic/fsatomic.go, pkg/fsatomic/fsatomic_test.go, pkg/fsatomic/canary_test.go, pkg/fsatomic/README.md, pkg/api/server.go, pkg/api/tls_test.go, pkg/daemon/login_password.go, pkg/daemon/daemon_system.go, pkg/daemon/daemon_reth.go, pkg/daemon/linksetup.go, pkg/daemon/bootstrap.go, pkg/daemon/daemon_dns.go, pkg/daemon/daemon_apply.go, pkg/daemon/daemon_ipmon.go, docs/engineering-style.md, _Log.md

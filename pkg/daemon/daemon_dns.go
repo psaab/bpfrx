@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -17,6 +16,7 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/daemon/system"
 	"github.com/psaab/xpf/pkg/dhcp"
+	"github.com/psaab/xpf/pkg/fsatomic"
 )
 
 // isCrossDeviceOrBusy reports whether err is an EXDEV/EBUSY from rename(2)
@@ -214,44 +214,45 @@ func (r *dnsReconciler) reconcile(in system.ResolvedDropinInput, bootEmptyRepair
 		"replaced_symlink", isSymlink)
 }
 
-// atomicWrite replaces resolvConfPath with content. It writes a temp file
-// in the same directory and renames it over the target. rename(2)
-// atomically replaces a symlink target WITHOUT following it, so a
-// dangling/stub symlink is swapped for a real file with no ENOENT window
-// and no need to os.Remove the symlink first.
+// atomicWrite replaces resolvConfPath with content via
+// fsatomic.WriteFileAtomic (temp-in-same-dir + rename). rename(2)
+// atomically replaces a symlink target WITHOUT following it (fsatomic's
+// default, no WithResolveSymlinks), so a dangling/stub symlink is swapped
+// for a real file with no ENOENT window and no need to os.Remove the
+// symlink first — matching the prior hand-rolled semantics.
 //
 // On EXDEV/EBUSY (rename across a bind mount, common in CI/containers
-// where /etc/resolv.conf is bind-mounted) it falls back to truncating
-// and writing the target in place.
+// where /etc/resolv.conf is bind-mounted) it falls back to
+// writeResolvConfBindMountFallback (in-place write).
 func (r *dnsReconciler) atomicWrite(content string) error {
-	dir := filepath.Dir(r.resolvConfPath)
-	tmp, err := os.CreateTemp(dir, ".resolv.conf.xpf-*")
-	if err != nil {
-		return fmt.Errorf("create temp: %w", err)
+	// AtomicGeneratedConfig (D3): regenerated from declarative DNS config
+	// on every apply, so a power-cut loss self-heals. fsatomic's default
+	// (no WithResolveSymlinks) renames over the path itself — replacing a
+	// symlink with a regular file, matching the prior rename-over-symlink
+	// semantics.
+	err := fsatomic.WriteFileAtomic(r.resolvConfPath, []byte(content), 0644)
+	if err == nil {
+		return nil
 	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op once renamed away
-	if _, err := tmp.WriteString(content); err != nil {
-		tmp.Close()
-		return fmt.Errorf("write temp: %w", err)
+	// EXDEV/EBUSY (matched through fsatomic's %w wrapping via errors.Is) is
+	// the bind-mount symptom: rename onto the mount point is not permitted,
+	// so write through in place. This BestEffortKernelKnob-style fallback is
+	// the sole allowlisted direct write here.
+	if isCrossDeviceOrBusy(err) {
+		slog.Warn("DNS: rename onto /etc/resolv.conf failed (likely bind mount); writing in place", "err", err)
+		return writeResolvConfBindMountFallback(r.resolvConfPath, content)
 	}
-	if err := tmp.Chmod(0644); err != nil {
-		tmp.Close()
-		return fmt.Errorf("chmod temp: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close temp: %w", err)
-	}
-	if err := os.Rename(tmpName, r.resolvConfPath); err != nil {
-		if isCrossDeviceOrBusy(err) {
-			// Bind-mount fallback: write through to the target in place.
-			slog.Warn("DNS: rename onto /etc/resolv.conf failed (likely bind mount); writing in place", "err", err)
-			if werr := os.WriteFile(r.resolvConfPath, []byte(content), 0644); werr != nil {
-				return fmt.Errorf("in-place write fallback: %w", werr)
-			}
-			return nil
-		}
-		return fmt.Errorf("rename onto target: %w", err)
+	return err
+}
+
+// writeResolvConfBindMountFallback writes content to path in place
+// (truncate+write), used only when an atomic rename is impossible because
+// /etc/resolv.conf is a bind mount (EXDEV/EBUSY). This is the one
+// deliberately-direct os.WriteFile in the DNS path — a rename(2) cannot
+// replace a bind-mount target, so it is allowlisted in the fsatomic canary.
+func writeResolvConfBindMountFallback(path, content string) error {
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		return fmt.Errorf("in-place write fallback: %w", err)
 	}
 	return nil
 }

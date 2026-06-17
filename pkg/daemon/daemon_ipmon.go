@@ -174,14 +174,24 @@ func (d *Daemon) applyFRRConfig(fc *frr.FullConfig) {
 
 	// Set L4 ECMP hash when consistent-hash is configured.
 	if fc.ConsistentHash {
-		path := "/proc/sys/net/ipv4/fib_multipath_hash_policy"
-		current, _ := os.ReadFile(path)
-		if strings.TrimSpace(string(current)) != "1" {
-			if err := os.WriteFile(path, []byte("1\n"), 0644); err != nil {
-				slog.Warn("failed to set fib_multipath_hash_policy", "err", err)
-			} else {
-				slog.Info("enabled L4 ECMP hashing (consistent-hash)")
-			}
+		setFibMultipathHashPolicy()
+	}
+}
+
+// setFibMultipathHashPolicy enables L4 (5-tuple) ECMP hashing by writing
+// net.ipv4.fib_multipath_hash_policy=1 when it is not already set.
+// BestEffortKernelKnob procfs write — rename(2) is impossible on procfs, so
+// it stays a direct os.WriteFile. Extracted from applyFRRConfig (#1916
+// §2.D) so the enclosing function is never allowlisted in the fsatomic
+// canary; this single-purpose helper is.
+func setFibMultipathHashPolicy() {
+	path := "/proc/sys/net/ipv4/fib_multipath_hash_policy"
+	current, _ := os.ReadFile(path)
+	if strings.TrimSpace(string(current)) != "1" {
+		if err := os.WriteFile(path, []byte("1\n"), 0644); err != nil {
+			slog.Warn("failed to set fib_multipath_hash_policy", "err", err)
+		} else {
+			slog.Info("enabled L4 ECMP hashing (consistent-hash)")
 		}
 	}
 }

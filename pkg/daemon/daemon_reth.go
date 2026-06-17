@@ -13,6 +13,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/fsatomic"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
@@ -23,7 +24,10 @@ import (
 func fixRethLinkFile(ifName, kernelName string) {
 	path := fmt.Sprintf("/etc/systemd/network/10-xpf-%s.link", ifName)
 	content := fmt.Sprintf("# Managed by xpfd — do not edit\n[Match]\nOriginalName=%s\n\n[Link]\nName=%s\n", kernelName, ifName)
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+	// AtomicGeneratedConfig: regenerated each apply/boot; a torn file is
+	// unacceptable (would mis-name a RETH member) but a power-cut loss
+	// self-heals next apply.
+	if err := fsatomic.WriteFileAtomic(path, []byte(content), 0644); err != nil {
 		slog.Warn("failed to fix RETH .link file", "path", path, "err", err)
 	}
 }
