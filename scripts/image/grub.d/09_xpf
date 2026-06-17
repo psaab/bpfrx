@@ -1,0 +1,55 @@
+#!/bin/sh
+# xpf (#1930) — LANE-1 A/B kernel-slot $cmdpath branch.
+#
+# WHY a /etc/grub.d/ drop-in and not a hand-edit of grub.cfg: update-grub
+# regenerates /boot/grub/grub.cfg from /etc/grub.d/* on every kernel
+# install/purge, so any direct grub.cfg edit is clobbered (r5 AGY b). This
+# script is re-emitted by every update-grub, so the branch survives.
+#
+# WHY $cmdpath and not a per-slot grub.cfg: the Canonical-signed grubx64.efi
+# has a cryptographically signed, hardcoded prefix; launched from \EFI\xpf-A\
+# it does NOT read a grub.cfg sitting beside it — it loads the SHARED
+# /boot/grub/grub.cfg (r4 AGY Flaw 1). So the SHARED config branches on
+# $cmdpath (the dir GRUB was launched from), sourcing that slot's selector.
+#
+# WHY no string-compare on $cmdpath: GRUB sets $cmdpath WITH the device prefix
+# (e.g. "(hd0,gpt1)/EFI/xpf-A"), and drive enumeration is not stable, so a
+# literal compare is fragile and `regexp` may be unavailable under Secure-Boot
+# lockdown (r5 AGY a). We reference $cmdpath DIRECTLY as a path:
+# `source "$cmdpath/xpf.selector"` expands natively to the launched slot.
+#
+# WHY the selector is a GRUB-SCRIPT (not raw text): GRUB must parse it under
+# Secure-Boot lockdown; `source` of a script that `set`s vars works, a raw
+# text file does not (r5 AGY d). The selector sets xpf_slot_kernel /
+# xpf_slot_initrd; this fragment emits ONE self-contained default menuentry
+# that sources it and boots that kernel (implicit `boot` at menuentry end —
+# r5 Codex FLAW-1; a bare top-level linux/initrd would fall through).
+#
+# If $cmdpath has no selector (e.g. the box was NOT launched via an xpf-A/B
+# slot — a recovery/firmware boot), this emits nothing and the normal
+# 10_linux menu entries apply, so the box still boots.
+
+set -e
+
+PREFIX_DIR=""
+# $cmdpath is exported into the grub.d environment by grub-mkconfig only on
+# some setups; the authoritative read is at GRUB runtime. We therefore emit a
+# menuentry whose BODY reads $cmdpath at boot (not at generation time).
+cat <<'EOF'
+# --- xpf (#1930) A/B kernel-slot selector entry ---
+if [ -s "${cmdpath}/xpf.selector" ]; then
+  menuentry 'xpf kernel slot' --id xpf-slot {
+    source "${cmdpath}/xpf.selector"
+    if [ -z "${xpf_slot_kernel}" ]; then
+      echo "xpf: empty selector in ${cmdpath}; falling through"
+    else
+      search --no-floppy --set=root --file "/boot/${xpf_slot_kernel}"
+      linux  "/boot/${xpf_slot_kernel}" root=LABEL=cloudimg-rootfs ro ${GRUB_CMDLINE_LINUX} ${GRUB_CMDLINE_LINUX_DEFAULT}
+      if [ -n "${xpf_slot_initrd}" ]; then
+        initrd "/boot/${xpf_slot_initrd}"
+      fi
+    fi
+  }
+fi
+# --- end xpf A/B selector entry ---
+EOF

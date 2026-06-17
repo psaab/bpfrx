@@ -1,0 +1,22 @@
+[Unit]
+Description=xpf #1930 — register A/B UEFI kernel-channel boot slots (idempotent)
+Documentation=https://github.com/psaab/xpf/issues/1930
+# Deliberately NOT ordered Before=xpfd.service (r5 AGY c): a hanging efibootmgr
+# must NEVER block xpfd / the SAFE-BOOTSTRAP mgmt lifeline (#1922). This unit is
+# best-effort and degrades to "LANE-1 unavailable" on read-only/no-efivars
+# platforms. Run after local fs + the ESP are mounted.
+After=local-fs.target
+ConditionPathExists=/boot/efi
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Bounded: a stuck efibootmgr must not wedge the boot. The script itself is
+# non-fatal on every failure path, but the timeout is belt-and-braces.
+TimeoutStartSec=20
+ExecStart=/usr/local/sbin/xpf-uefi-slots
+# A failure here is NOT a boot failure — LANE 1 just stays unavailable.
+SuccessExitStatus=0
+
+[Install]
+WantedBy=multi-user.target

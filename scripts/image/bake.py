@@ -79,7 +79,11 @@ GRUB_DROPIN = (
     '# every allocated page (~20% CPU in the virtio-net XDP path). A grub.d\n'
     '# drop-in, NOT a sed on /etc/default/grub: Ubuntu cloud images override\n'
     '# GRUB_CMDLINE_LINUX_DEFAULT in /etc/default/grub.d/50-cloudimg-settings.cfg.\n'
-    'GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT init_on_alloc=0"'
+    'GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT init_on_alloc=0"\n'
+    '# xpf (#1930): flatten the menu so the LANE-1 A/B selector menuentry\n'
+    '# (/etc/grub.d/09_xpf) is a stable top-level entry and submenu reordering\n'
+    "# by update-grub can't bury a candidate (r2/r5 AGY).\n"
+    'GRUB_DISABLE_SUBMENU=y'
 )
 
 SSHD_DROPIN = (
@@ -315,6 +319,50 @@ def virt_customize(work_qcow, xpf_deb):
         # default override_rc set. We do NOT add a second bake-written file: a
         # whole-hash assignment would wipe those defaults, and writing into
         # /etc/needrestart/conf.d before the .deb creates it would fail the bake.
+        # #1930 INC-1: stage the LANE-1 A/B UEFI kernel-slot substrate (A4).
+        #   - the $cmdpath branch fragment (re-emitted by every update-grub);
+        #   - the SEPARATE non-blocking slot-registration oneshot (shipped here
+        #     AND in the .deb for foreign hosts; NVRAM registration is first-boot,
+        #     not offline-bake — r4 AGY F2);
+        #   - two FIXED A/B ESP slot dirs, each a copy of the signed shim+grub +
+        #     a GRUB-script selector SEEDED to the shipped known-good kernel.
+        #     Kernels stay in /boot, NEVER on the ESP (r4 AGY F3).
+        "--copy-in", f"{HERE}/grub.d/09_xpf:/etc/grub.d",
+        "--run-command", "chmod 0755 /etc/grub.d/09_xpf",
+        "--copy-in", f"{HERE}/xpf-uefi-slots:/usr/local/sbin",
+        "--copy-in", f"{HERE}/xpf-uefi-slots.service:/usr/lib/systemd/system",
+        "--run-command", "chmod 0755 /usr/local/sbin/xpf-uefi-slots",
+        "--run-command", "systemctl enable xpf-uefi-slots.service",
+        # Stage the A/B slot dirs: copy the signed shim+grub (so each slot boots
+        # shim->grub->MOK kernel — Secure-Boot-correct, r4 AGY Hazard C) and seed
+        # both selectors at the shipped known-good kernel (the GRUB-script form
+        # the 09_xpf branch sources — r5 AGY d).
+        "--run-command",
+        'set -e; src=/boot/efi/EFI/ubuntu; '
+        '[ -f "$src/shimx64.efi" ] || { echo "FATAL: no signed shim at $src" >&2; exit 1; }; '
+        'kv=$(ls /lib/modules | sort -V | tail -1); '
+        'for slot in xpf-A xpf-B; do '
+        'd=/boot/efi/EFI/$slot; mkdir -p "$d"; '
+        'cp -f "$src/shimx64.efi" "$src/grubx64.efi" "$src/mmx64.efi" "$d/" 2>/dev/null || '
+        'cp -f "$src/shimx64.efi" "$src/grubx64.efi" "$d/"; '
+        'printf \'set xpf_slot_kernel="vmlinuz-%s"\\nset xpf_slot_initrd="initrd.img-%s"\\n\' "$kv" "$kv" > "$d/xpf.selector"; '
+        'done; '
+        'echo "#1930: staged A/B slots seeded at kernel $kv"',
+        # Record the watchdog-persistence platform flag (Path Option D). The bake
+        # cannot know the deploy platform's watchdog behavior, so default to
+        # ABSENT (D2 warn-and-proceed): operators on a platform with a verified
+        # warm-reset-surviving HW/hypervisor watchdog drop the marker to enable
+        # D1 strict. (The dir + a README; the marker file is intentionally NOT
+        # created by the bake.)
+        "--run-command", "mkdir -p /etc/xpf/kernel-channel",
+        "--write",
+        "/etc/xpf/kernel-channel/README:"
+        "# xpf (#1930) LANE-1 kernel channel.\n"
+        "# Create the file 'watchdog-persistent' in this dir ONLY on a platform\n"
+        "# whose watchdog is known to survive a warm reset (firmware/BMC/\n"
+        "# hypervisor). Its presence enables Path-D1 strict (fail-closed if the\n"
+        "# watchdog is unavailable). Absent = Path-D2 (BootNext still closes the\n"
+        "# boot-loop; an EARLY-boot hang needs one external reset to recover).\n",
         "--write", f"/etc/default/grub.d/99-xpf.cfg:{GRUB_DROPIN}",
         "--run-command", "update-grub",
         "--write", f"/etc/ssh/sshd_config.d/10-xpf-factory.conf:{SSHD_DROPIN}",
