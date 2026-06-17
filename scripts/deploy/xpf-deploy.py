@@ -36,6 +36,7 @@ Examples:
 """
 
 import argparse
+import json
 import os
 import re
 import shlex
@@ -453,6 +454,38 @@ def cmd_fetch(args):
     out = os.path.abspath(args.out or os.getcwd())
     os.makedirs(out, exist_ok=True)
 
+    # Best-effort monotonic anti-rollback watermark (#1924 §5.6 / NIT-3):
+    # remember the highest version fetched per channel so a stale mirror
+    # serving an OLDER (still-signed) version is detected. Stateless CLI, so
+    # this is best-effort: a fresh workstation has no watermark and trusts the
+    # artifact's own signature. Override the channel with --channel; bypass the
+    # guard with --allow-rollback (e.g. a deliberate downgrade).
+    state_home = os.environ.get("XDG_STATE_HOME") or os.path.expanduser(
+        "~/.local/state")
+    wm_path = os.path.join(state_home, "xpf", "image-watermark.json")
+
+    def _ver_key(v):
+        # Compare dotted numeric components; non-numeric tail compares as text.
+        out_parts = []
+        for tok in str(v).replace("-", ".").split("."):
+            out_parts.append((0, int(tok)) if tok.isdigit() else (1, tok))
+        return out_parts
+
+    def read_watermark():
+        try:
+            with open(wm_path) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {}
+
+    if not args.dry_run and not args.allow_rollback:
+        wm = read_watermark()
+        prev = wm.get(args.channel)
+        if prev and _ver_key(ver) < _ver_key(prev):
+            die(f"requested version {ver} is OLDER than the last fetched "
+                f"{prev} on channel '{args.channel}' (possible stale mirror / "
+                "rollback). Pass --allow-rollback for a deliberate downgrade.")
+
     names = {
         "qcow2": f"xpf-{ver}.qcow2",
         "metadata": f"xpf-{ver}.incus-metadata.tar.gz",
@@ -494,6 +527,23 @@ def cmd_fetch(args):
             print(f"==> signature OK: {names[w]}")
         except sign.SignError as e:
             die(f"VERIFICATION FAILED for {names[w]}: {e}")
+
+    # Advance the monotonic watermark only AFTER a successful verify (so a
+    # failed/tampered fetch never moves it). Best-effort: a write failure is
+    # non-fatal (the signature is the real gate).
+    if not args.allow_rollback:
+        try:
+            wm = read_watermark()
+            prev = wm.get(args.channel)
+            if not prev or _ver_key(ver) >= _ver_key(prev):
+                wm[args.channel] = ver
+                os.makedirs(os.path.dirname(wm_path), exist_ok=True)
+                tmpw = wm_path + ".tmp"
+                with open(tmpw, "w") as f:
+                    json.dump(wm, f, indent=2, sort_keys=True)
+                os.replace(tmpw, wm_path)
+        except OSError:
+            pass  # best-effort; never block a verified fetch on watermark I/O
 
     if args.no_import or args.qcow2_only:
         print(f"==> verified into {out} (not imported — use the qcow2 with "
@@ -547,6 +597,11 @@ def main():
         sub.add_argument("--image-url", dest="image_url")
         sub.add_argument("--out")
         sub.add_argument("--alias")
+        sub.add_argument("--channel", default="stable",
+                         help="watermark channel (anti-rollback bucket)")
+        sub.add_argument("--allow-rollback", action="store_true",
+                         help="permit fetching an older version than the "
+                              "recorded watermark (deliberate downgrade)")
         sub.add_argument("--qcow2-only", action="store_true",
                          help="fetch+verify only the qcow2 (libvirt/KVM path)")
         sub.add_argument("--no-import", action="store_true",

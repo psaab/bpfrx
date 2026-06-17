@@ -102,8 +102,11 @@ checksums.
   an automated re-sign job.
 - Images: `latest.json` (signed) names the current version per channel.
   `xpf-deploy.py fetch` records a best-effort monotonic watermark at
-  `${XDG_STATE_HOME:-~/.local/state}/xpf/image-watermark.json`. This detects
-  stale mirrors / accidental rollback; it is not TUF-grade freeze protection.
+  `${XDG_STATE_HOME:-~/.local/state}/xpf/image-watermark.json` (per
+  `--channel`, default `stable`) and REFUSES a version older than the recorded
+  one — `--allow-rollback` permits a deliberate downgrade. This detects stale
+  mirrors / accidental rollback; it is not TUF-grade freeze protection, and a
+  fresh workstation with no watermark trusts the artifact's own signature.
 
 ### Key rotation
 
