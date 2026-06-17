@@ -788,6 +788,65 @@ func TestNonWGRemovalTransientLookupRetained(t *testing.T) {
 	}
 }
 
+// Inverse handoff (Codex r3): a same-name non-WG→WG transition must NOT
+// leave the now-active persistent WG link tracked in ownedNames — even
+// when the non-WG removal step hits a transient LinkByName error or a
+// failed LinkDel. Otherwise a LATER Apply would LinkDel the active WG link
+// (WG is excluded from `desired`), violating the persistent-WG invariant.
+func TestNonWGToWireguardSameNameNoOwnedRetention(t *testing.T) {
+	run := func(t *testing.T, inject func(ops *fakeLinkOps)) {
+		ops := newFakeLinkOps()
+		tm, _ := newReconcileManager(ops)
+		// Start as a non-WG anchor (tracked in ownedNames).
+		if err := tm.Apply([]*config.TunnelConfig{anchorTC("wg0", "10.1.1.1/24")}); err != nil {
+			t.Fatalf("Apply 1 (anchor): %v", err)
+		}
+		tm.mu.Lock()
+		owned := tm.ownedNames["wg0"]
+		tm.mu.Unlock()
+		if !owned {
+			t.Fatal("anchor not tracked in ownedNames")
+		}
+		inject(ops)
+		// Transition the SAME name to WireGuard.
+		if err := tm.Apply([]*config.TunnelConfig{wgTC("172.16.0.1/30")}); err != nil {
+			t.Fatalf("Apply 2 (transition to WG): %v", err)
+		}
+		// The name must be handed off: NOT retained in ownedNames.
+		tm.mu.Lock()
+		stillOwned := tm.ownedNames["wg0"]
+		tm.mu.Unlock()
+		if stillOwned {
+			t.Fatal("active WG name retained in ownedNames after non-WG→WG transition (Codex r3 inverse handoff)")
+		}
+		// Clear injection and run another Apply: the persistent WG link must
+		// survive — never LinkDel'd by the removal diff.
+		ops.delFail = map[string]error{}
+		ops.byNameHardErr = map[string]error{}
+		if err := tm.Apply([]*config.TunnelConfig{wgTC("172.16.0.1/30")}); err != nil {
+			t.Fatalf("Apply 3: %v", err)
+		}
+		for _, d := range ops.delNames {
+			if d == "wg0" {
+				t.Fatal("persistent WG link wrongly deleted after transition (#1432 S2a violated)")
+			}
+		}
+		if _, err := ops.LinkByName("wg0"); err != nil {
+			t.Fatalf("WG link gone after transition: %v", err)
+		}
+	}
+	t.Run("transient-lookup", func(t *testing.T) {
+		run(t, func(ops *fakeLinkOps) {
+			ops.byNameHardErr["wg0"] = errors.New("EBUSY: transient netlink error")
+		})
+	})
+	t.Run("failed-linkdel", func(t *testing.T) {
+		run(t, func(ops *fakeLinkOps) {
+			ops.delFail["wg0"] = errors.New("EBUSY")
+		})
+	})
+}
+
 // --- §9 test 6: appliedRI claim state machine -------------------------
 
 func TestTunnelVRFStanzaBindAndUnbind(t *testing.T) {

@@ -268,10 +268,13 @@ func (t *tunnelManager) Apply(tunnels []*config.TunnelConfig) error {
 	t.ensureReconcileStateLocked()
 
 	desired := make(map[string]bool, len(tunnels))
+	wgDesired := map[string]bool{}
 	for _, tc := range tunnels {
 		// WireGuard TUNs stay untracked/persistent (#1432 S2a, AGY
 		// Hazard B) and are excluded from the removal diff.
-		if tc.Mode != "wireguard" {
+		if tc.Mode == "wireguard" {
+			wgDesired[tc.Name] = true
+		} else {
 			desired[tc.Name] = true
 		}
 	}
@@ -289,6 +292,20 @@ func (t *tunnelManager) Apply(tunnels []*config.TunnelConfig) error {
 	}
 	for name := range oldOwned {
 		if desired[name] {
+			continue
+		}
+		if wgDesired[name] {
+			// Same-name non-WG→WG transition: this name is being (re)claimed
+			// as a persistent WireGuard tunnel by the apply loop below. WG
+			// links are intentionally untracked in ownedNames and must NEVER
+			// be torn by the removal diff (#1432 S2a). Hand off WITHOUT
+			// deleting AND WITHOUT retaining ownership — retaining would
+			// leave the active WG link in ownedNames and let a later Apply
+			// LinkDel it (Codex r3 inverse-handoff hole). Drop the GRE/anchor
+			// tracking; applyWireguardTunLocked repopulates appliedAddrs.
+			t.stopKeepaliveLocked(name)
+			delete(t.appliedAddrs, name)
+			delete(t.appliedRI, name)
 			continue
 		}
 		t.stopKeepaliveLocked(name)
@@ -330,12 +347,7 @@ func (t *tunnelManager) Apply(tunnels []*config.TunnelConfig) error {
 	// this manager applied to its persistent wgN device. wgConfigured
 	// records the WG names tracked at the last Apply; here we prune the
 	// addresses of any that disappeared while KEEPING the link.
-	wgDesired := map[string]bool{}
-	for _, tc := range tunnels {
-		if tc.Mode == "wireguard" {
-			wgDesired[tc.Name] = true
-		}
-	}
+	// (wgDesired is computed once at the top of Apply.)
 	oldWG := t.wgConfigured
 	nextWG := make(map[string]bool, len(wgDesired))
 	for name := range wgDesired {
