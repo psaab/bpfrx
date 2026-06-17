@@ -777,9 +777,9 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) {
 				// install time. The user was created above, so it resolves.
 				//
 				// If the owner cannot be resolved we must NOT degrade to a
-				// root-owned durable write + post-rename chown — that is the
-				// exact crash window WithOwner exists to close (Codex r1
-				// HIGH). Abort the write instead and retry next apply.
+				// root-owned durable write + post-rename chown — a power cut
+				// between the rename and chown leaves root-owned 0600 keys
+				// that sshd refuses (EACCES → lockout). Abort instead.
 				uid, gid, ok := lookupUIDGID(user.Name)
 				if !ok {
 					slog.Warn("could not resolve uid/gid for authorized_keys owner; skipping write to avoid a root-owned-keys lockout window",
