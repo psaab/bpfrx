@@ -87,6 +87,17 @@ func (r *KernelRunner) Arm(candidateVersion string) error {
 			"(journal state=%s candidate=%s); reboot to trial it or clear %s",
 			j.State, j.CandidateVersion, r.cfg.JournalPath)
 	}
+	// Resume-version guard (r1 Copilot): if a PRIOR Arm() got past PREFLIGHT
+	// (so the journal records a candidate) and this call requests a DIFFERENT
+	// version, the journaled candidate is authoritative — refuse rather than
+	// install version B against a journal that preflighted/installed version A.
+	// The operator must clear the journal to switch candidates mid-flight.
+	if j.State.atLeast(KernelStatePreflight) && j.CandidateVersion != "" &&
+		j.CandidateVersion != candidateVersion {
+		return fmt.Errorf("kernel-upgrade: an in-progress run targets candidate %s "+
+			"(journal state=%s); refusing to resume with a different candidate %s — "+
+			"clear %s to start over", j.CandidateVersion, j.State, candidateVersion, r.cfg.JournalPath)
+	}
 
 	// ---- PREFLIGHT (fail-closed; no mutation) ----
 	if !j.State.atLeast(KernelStatePreflight) {
@@ -376,9 +387,14 @@ func (r *KernelRunner) Promote() error {
 		return r.revert(j, fmt.Errorf("forward beacon FAILED on candidate kernel %s", running))
 	}
 
-	// PASS: promote — non-destructive BootOrder reorder (candidate first).
+	// PASS: promote — non-destructive BootOrder reorder (candidate first). If
+	// the reorder FAILS, the candidate is running but NOT durably the default;
+	// the safe action is to REVERT (reboot to known-good) rather than leave it
+	// un-promoted (which the oneshot would treat as a non-revert "infra error"
+	// and continue booting an un-promoted candidate — r1 Copilot). revert()
+	// restores the known-good BootOrder front + reboots.
 	if err := sys.SetBootOrderFront(candID); err != nil {
-		return fmt.Errorf("kernel-upgrade promote: set BootOrder front %s: %w", candID, err)
+		return r.revert(j, fmt.Errorf("promote: set BootOrder front %s failed: %w", candID, err))
 	}
 	if err := sys.DisarmWatchdog(); err != nil {
 		r.logf("kernel-upgrade promote: WARNING disarm watchdog: %v", err)
@@ -443,6 +459,14 @@ func (r *KernelRunner) revert(j *KernelJournal, reason error) error {
 		r.logf("kernel-upgrade: WARNING read boot entries on revert: %v", err)
 	}
 
+	// Disarm the watchdog on revert (r1 Copilot): Arm() armed it before the
+	// candidate reboot; if we do not disarm, a watchdog armed with a finite
+	// timeout could keep firing AFTER the fallback reboot and bounce the
+	// known-good boot. Best-effort (the firmware fallback is the floor).
+	if err := sys.DisarmWatchdog(); err != nil {
+		r.logf("kernel-upgrade: WARNING disarm watchdog on revert: %v", err)
+	}
+
 	// Prune the inactive slot's candidate staging + the un-promoted kernel
 	// pkg; reset the inactive selector back to the known-good kernel so a
 	// later boot of that slot is safe. Best-effort: a prune failure must not
@@ -470,6 +494,11 @@ func (r *KernelRunner) revert(j *KernelJournal, reason error) error {
 // on known-good and this same no-reboot path runs again.
 func (r *KernelRunner) cleanupAlreadyOnKnownGood(j *KernelJournal, why error) error {
 	r.logf("kernel-upgrade: already on a known-good slot (%v); cleaning up, NO reboot", why)
+	// Disarm the watchdog Arm() set before the (failed) candidate reboot, so it
+	// can't keep firing on the known-good boot (r1 Copilot).
+	if err := r.cfg.Sys.DisarmWatchdog(); err != nil {
+		r.logf("kernel-upgrade: WARNING disarm watchdog on known-good cleanup: %v", err)
+	}
 	if err := r.cfg.Sys.PruneInactiveSlot(j.InactiveSlot, j.KnownGoodVersion, j.CandidateVersion); err != nil {
 		r.logf("kernel-upgrade: WARNING prune on known-good cleanup: %v", err)
 	}

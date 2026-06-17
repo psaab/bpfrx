@@ -2,6 +2,7 @@ package upgrade
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -30,11 +31,12 @@ type fakeKernelSystem struct {
 	bootNext  string
 	wdArmed   bool
 
-	bootCurrent string
-	verifyPass  bool
-	verifyErr   error
-	beaconPass  bool
-	beaconErr   error
+	bootCurrent       string
+	bootOrderFrontErr bool
+	verifyPass        bool
+	verifyErr         error
+	beaconPass        bool
+	beaconErr         error
 
 	rebooted bool
 	calls    []string
@@ -129,6 +131,9 @@ func (f *fakeKernelSystem) ForwardBeacon(time.Duration) (bool, error) {
 	return f.beaconPass, f.beaconErr
 }
 func (f *fakeKernelSystem) SetBootOrderFront(id string) error {
+	if f.bootOrderFrontErr {
+		return fmt.Errorf("simulated bootorder write failure")
+	}
 	f.log("bootorder-front:" + id)
 	// non-destructive: move id to front, preserve the rest in order
 	out := []string{id}
@@ -512,5 +517,73 @@ func TestKernelIsArmed(t *testing.T) {
 	armed, j, _ := r.IsArmed()
 	if !armed || j.CandidateVersion != "6.18.5-12-generic" {
 		t.Fatalf("expected armed candidate, got armed=%v j=%+v", armed, j)
+	}
+}
+
+// --- Arm refuses to resume with a DIFFERENT candidate than the journaled one
+// (r1 Copilot: don't install version B against a version-A journal). ---
+func TestKernelArmRefusesResumeWithDifferentCandidate(t *testing.T) {
+	f := newFakeKernelSystem()
+	r := newKernelRunner(t, f)
+	// Seed a journal already past PREFLIGHT targeting version A.
+	j := &KernelJournal{
+		CandidateVersion: "6.18.5-12-generic", KnownGoodVersion: "6.18.5-10-generic",
+		ActiveSlot: SlotA, InactiveSlot: SlotB, State: KernelStatePreflight,
+	}
+	if err := r.saveKernelJournal(j); err != nil {
+		t.Fatalf("seed journal: %v", err)
+	}
+	// Arm with a DIFFERENT version must refuse and not reboot.
+	if err := r.Arm("6.18.5-13-generic"); err == nil {
+		t.Fatal("expected refusal to resume with a different candidate")
+	}
+	if f.rebooted {
+		t.Fatal("must not reboot on a candidate-mismatch resume")
+	}
+	// Arm with the SAME journaled version resumes (installs + arms + reboots).
+	if err := r.Arm("6.18.5-12-generic"); err != nil {
+		t.Fatalf("resume with the journaled candidate should proceed: %v", err)
+	}
+	if !f.rebooted {
+		t.Fatal("resume with the journaled candidate should reach reboot")
+	}
+}
+
+// --- revert disarms the watchdog (r1 Copilot: an armed watchdog must not keep
+// firing after the fallback reboot). ---
+func TestKernelRevertDisarmsWatchdog(t *testing.T) {
+	f := newFakeKernelSystem()
+	r := newKernelRunner(t, f)
+	_ = r.Arm("6.18.5-12-generic")
+	if !f.wdArmed {
+		t.Fatal("Arm should have armed the watchdog")
+	}
+	// candidate boots but verify REJECTs -> revert.
+	f.bootCurrent = "0004"
+	f.running = "6.18.5-12-generic"
+	f.verifyPass = false
+	if err := r.Promote(); !errorsIsReverted(err) {
+		t.Fatalf("expected revert, got %v", err)
+	}
+	if f.wdArmed {
+		t.Fatal("revert must disarm the watchdog")
+	}
+}
+
+// --- promote with a BootOrder-reorder failure REVERTS (r1 Copilot: don't leave
+// the candidate running un-promoted as a non-revert infra error). ---
+func TestKernelPromoteRevertsOnBootOrderFailure(t *testing.T) {
+	f := newFakeKernelSystem()
+	r := newKernelRunner(t, f)
+	_ = r.Arm("6.18.5-12-generic")
+	f.bootCurrent = "0004"
+	f.running = "6.18.5-12-generic"
+	f.verifyPass = true
+	f.beaconPass = true
+	f.bootOrderFrontErr = true // SetBootOrderFront fails
+
+	err := r.Promote()
+	if !errorsIsReverted(err) {
+		t.Fatalf("expected a REVERT when promote BootOrder reorder fails, got %v", err)
 	}
 }

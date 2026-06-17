@@ -574,6 +574,27 @@ func holdLinuxPackages() error {
 	return runCmd("apt-mark", append([]string{"hold"}, linuxPackages...)...)
 }
 
+// kernelPkgPrefixes are the ACTUAL kernel image/module/header package families
+// the channel holds. `linux-*` is too broad (r1 Copilot): it would pin
+// linux-base, linux-libc-dev, linux-firmware, linux-tools-*, etc. — unrelated
+// packages whose long-term hold blocks security updates and diverges from the
+// bake's intent (which holds only the kernel set). We hold exactly the kernel
+// families + the metapackages that pull them.
+var kernelPkgPrefixes = []string{
+	"linux-image-", "linux-modules-", "linux-modules-extra-",
+	"linux-headers-", "linux-generic", "linux-image-generic",
+	"linux-headers-generic", "linux-image-virtual", "linux-virtual",
+}
+
+func isKernelPkg(pkg string) bool {
+	for _, p := range kernelPkgPrefixes {
+		if pkg == p || strings.HasPrefix(pkg, p) {
+			return true
+		}
+	}
+	return false
+}
+
 func currentLinuxPackages() []string {
 	out, err := captureCmd("dpkg-query", "-W", "-f=${binary:Package}\n", "linux-*")
 	if err != nil {
@@ -583,7 +604,9 @@ func currentLinuxPackages() []string {
 	var pkgs []string
 	for _, line := range strings.Split(out, "\n") {
 		pkg := strings.TrimSpace(line)
-		if pkg == "" || !strings.HasPrefix(pkg, "linux-") || seen[pkg] {
+		// Only the kernel image/module/header families + metas — NOT the broad
+		// linux-* set (excludes linux-base / linux-libc-dev / firmware / tools).
+		if pkg == "" || !isKernelPkg(pkg) || seen[pkg] {
 			continue
 		}
 		seen[pkg] = true
