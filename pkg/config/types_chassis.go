@@ -6,6 +6,87 @@ package config
 // ChassisConfig holds chassis-level configuration (clustering, etc).
 type ChassisConfig struct {
 	Cluster *ClusterConfig
+	// DeviceMap is the #1956 bare-metal stable-identity managed allowlist.
+	// nil OR an empty entry set means positional mode (today's behavior);
+	// device-map mode is selected on len(DeviceMap.Entries) > 0, never on
+	// DeviceMap != nil (an empty `chassis device-map {}` block must not
+	// trip the silent-all-unconfigured trap — R-7/V-7).
+	DeviceMap *DeviceMapConfig
+}
+
+// DeviceMapConfig is the #1956 bare-metal device-map: an opt-in stanza that
+// binds host NICs (by stable identity — PCI bus address with permanent-MAC
+// fallback) to xpf logical names, and governs everything NOT named here via
+// UnmappedPolicy. See docs/bare-metal-device-map.md and the plan in
+// docs/research/1956-bare-metal-device-map/.
+type DeviceMapConfig struct {
+	// Entries binds each logical name to a stable host identity.
+	Entries []DeviceMapEntry
+	// UnmappedPolicy governs NICs with no entry:
+	//   "leave-alone" (default in device-map mode): never renamed, never
+	//                 marked always-down, never address-stripped.
+	//   "manage-down": today's claim-all behavior (bring unconfigured NICs
+	//                 down). Provided for operators who DO want xpf to own
+	//                 the whole box.
+	UnmappedPolicy string
+}
+
+// DeviceMapPolicyLeaveAlone / DeviceMapPolicyManageDown are the two
+// unmapped-interface-policy values. Leave-alone is the bare-metal default.
+const (
+	DeviceMapPolicyLeaveAlone = "leave-alone"
+	DeviceMapPolicyManageDown = "manage-down"
+)
+
+// DeviceMapKey* are the per-entry identity key-order values (V-5). The
+// default (empty) is treated as pci-then-mac.
+const (
+	DeviceMapKeyPCIThenMAC = "pci-then-mac"
+	DeviceMapKeyMACThenPCI = "mac-then-pci"
+	DeviceMapKeyPCI        = "pci"
+	DeviceMapKeyMAC        = "mac"
+)
+
+// DeviceMapEntry binds one xpf logical name to one host NIC identity.
+type DeviceMapEntry struct {
+	// LogicalName is the xpf/vSRX name the bound NIC is renamed to
+	// (e.g. "ge-0/0/3", "fxp0"). Stored Junos-style with slashes; the
+	// daemon converts to the Linux kernel name (ge-0-0-3) via LinuxIfName.
+	LogicalName string
+	// PCIAddr is the primary identity key (DDDD:BB:DD.F), "" if unset.
+	PCIAddr string
+	// MAC is the permanent/factory-MAC fallback key, "" if unset. Compared
+	// against PermHWAddr, never the running MAC (RETH virtual-MAC alternates
+	// — R-3/R-6).
+	MAC string
+	// KeyOrder selects the resolution priority chain (DeviceMapKey*).
+	// "" => pci-then-mac.
+	KeyOrder string
+}
+
+// EffectiveKeyOrder returns the entry's key-order, defaulting empty to
+// pci-then-mac.
+func (e DeviceMapEntry) EffectiveKeyOrder() string {
+	if e.KeyOrder == "" {
+		return DeviceMapKeyPCIThenMAC
+	}
+	return e.KeyOrder
+}
+
+// EffectiveUnmappedPolicy returns the device-map's unmapped-interface-policy,
+// defaulting empty to leave-alone (the bare-metal-safe default — an operator
+// who wrote a map clearly wants selective management).
+func (d *DeviceMapConfig) EffectiveUnmappedPolicy() string {
+	if d == nil || d.UnmappedPolicy == "" {
+		return DeviceMapPolicyLeaveAlone
+	}
+	return d.UnmappedPolicy
+}
+
+// Active reports whether device-map mode is engaged: a non-nil config with at
+// least one entry. An empty `device-map {}` block is positional mode (R-7).
+func (d *DeviceMapConfig) Active() bool {
+	return d != nil && len(d.Entries) > 0
 }
 
 // ClusterConfig defines chassis cluster settings for HA.

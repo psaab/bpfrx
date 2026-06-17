@@ -342,7 +342,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// the operator stays reachable. No other NIC is touched.
 			d.setupBootstrapLifeline()
 		} else {
-			if err := enumerateAndRenameInterfaces(nodeID, clusterMode, userspaceWorkers, rssEnabled, rssAllowed); err != nil {
+			// #1956: device-map mode (opt-in) renames ONLY mapped NICs by
+			// stable identity and leaves the rest alone. Positional mode
+			// (no device-map) is bit-identical to pre-#1956.
+			if err := applyStartupNamingPolicy(d.store.ActiveConfig(), nodeID, clusterMode,
+				userspaceWorkers, rssEnabled, rssAllowed, d.resolveProtectedInterfaces()); err != nil {
+				// Log stays generic: helper already selected device-map vs
+				// positional; callers care only that startup naming failed.
 				slog.Warn("interface naming failed", "err", err)
 			}
 			// #801: host tunables + coalescence. Runs after the interface
@@ -378,6 +384,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.ipsec = ipsec.New()
 		d.ra = ra.New()
 		d.networkd = networkd.New()
+		// #1956 AGY r3 CRITICAL: exempt the #1922 management protected set
+		// from networkd.Apply's stale-file sweep so the lifeline's rename +
+		// addressing survive a commit that leaves it out of the config.
+		d.networkd.SetProtectedResolver(d.resolveProtectedInterfaces)
 		d.dhcpServer = dhcpserver.New()
 	}
 
@@ -1553,8 +1563,14 @@ func (d *Daemon) runBootstrapExitStartup(cfg *config.Config) {
 	}
 
 	// Full rename loop — the lifeline-gated path only renamed fxp0 (or
-	// nothing). Now claim every NIC per the vSRX naming scheme.
-	if err := enumerateAndRenameInterfaces(nodeID, clusterMode, userspaceWorkers, rssEnabled, rssAllowed); err != nil {
+	// nothing). Now claim the NICs per the active naming policy.
+	//
+	// #1956 R-4: bootstrap-exit (the FIRST real commit) is exactly when a
+	// device-map first appears, so this site must branch too — otherwise
+	// day-0 bare metal claims every NIC positionally before the map ever
+	// applies.
+	if err := applyStartupNamingPolicy(cfg, nodeID, clusterMode, userspaceWorkers,
+		rssEnabled, rssAllowed, d.resolveProtectedInterfaces()); err != nil {
 		slog.Warn("bootstrap exit: interface naming failed", "err", err)
 	}
 

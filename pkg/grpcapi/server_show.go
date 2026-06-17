@@ -210,6 +210,14 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 		// #1043 Phase 2: case body extracted to server_show_chassis.go
 		s.showChassis(&buf)
 
+	case "chassis-device-map":
+		// #1956: bare-metal device-map resolved bindings.
+		s.showChassisDeviceMap(cfg, &buf)
+
+	case "chassis-device-map-candidates":
+		// #1956: copy-paste NIC inventory for authoring a device-map.
+		s.showChassisDeviceMapCandidates(&buf)
+
 	case "storage":
 		// #1043 Phase 7: case body extracted to server_show_system.go
 		s.showStorage(&buf)

@@ -629,3 +629,45 @@ func TestSanitizeUnitValue(t *testing.T) {
 		t.Errorf("control chars not stripped: %q", got)
 	}
 }
+
+// TestApplyPreservesProtectedFiles is the #1956 AGY r3 CRITICAL regression:
+// Apply's stale-file sweep must NOT delete a #1922-protected interface's
+// 10-xpf-*.{link,network} even when that interface is absent from the
+// compiled config (it is exempt from the unmanaged bring-down, so it never
+// appears in ManagedInterfaces). Sweeping it would strip the live management
+// NIC's rename + addressing on reload -> instant lockout.
+func TestApplyPreservesProtectedFiles(t *testing.T) {
+	dir := t.TempDir()
+	// Pre-existing protected mgmt files (as written by the rename path).
+	mustWrite := func(name, body string) {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustWrite("10-xpf-fxp0.link", "[Match]\nOriginalName=enp5s0\n\n[Link]\nName=fxp0\n")
+	mustWrite("10-xpf-fxp0.network", "[Match]\nName=fxp0\n\n[Network]\nDHCP=yes\n")
+	// A genuinely stale file that SHOULD be swept.
+	mustWrite("10-xpf-ge-0-0-9.link", "[Match]\nOriginalName=enp99s0\n\n[Link]\nName=ge-0-0-9\n")
+
+	m := NewInDir(dir)
+	m.SetProtectedResolver(func() map[string]bool { return map[string]bool{"fxp0": true} })
+
+	// Apply a config that manages only ge-0-0-3 — fxp0 is NOT in the list
+	// (protected, exempt from the compiled set). Apply may return a
+	// networkctl-reload error in the unit sandbox (no systemd); that is
+	// environmental — the file-state assertions below are what matter.
+	_ = m.Apply([]InterfaceConfig{
+		{Name: "ge-0-0-3", MACAddress: "aa:bb:cc:dd:ee:01"},
+	})
+
+	// Protected fxp0 files MUST survive.
+	for _, f := range []string{"10-xpf-fxp0.link", "10-xpf-fxp0.network"} {
+		if _, err := os.Stat(filepath.Join(dir, f)); err != nil {
+			t.Fatalf("protected file %s was swept (lockout!): %v", f, err)
+		}
+	}
+	// The genuinely stale file MUST be removed.
+	if _, err := os.Stat(filepath.Join(dir, "10-xpf-ge-0-0-9.link")); !os.IsNotExist(err) {
+		t.Fatalf("stale ge-0-0-9 .link should have been swept")
+	}
+}

@@ -1087,7 +1087,7 @@ func (s *Store) CommitWithDescription(description string) (*config.Config, error
 	if err := s.writeActive(s.candidate); err != nil {
 		return nil, fmt.Errorf("commit failed: persist active config: %w", err)
 	}
-	s.persistDegraded = false // disk now holds the current config
+	s.persistDegraded = false       // disk now holds the current config
 	s.everCommitted = true          // #1922 step-0: a real commit has succeeded
 	s.persistMarkerCommitted = true // #1922: degraded-retry writes committed=1
 
@@ -1476,6 +1476,22 @@ func (s *Store) ActiveConfig() *config.Config {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.compiled
+}
+
+// CompileCandidate strictly compiles the current candidate WITHOUT mutating
+// any store state (no promote, no persist, no confirm-timer). It is the
+// read-only pre-commit hook the daemon's #1956 device-map commit pre-flight
+// uses to resolve the proposed map against live hardware BEFORE the store
+// promotes it — so a map that would strand management on next boot is
+// rejected while the operator is still connected, not at the next reboot.
+// Returns the same compiled config Commit() would, or the commit-check error.
+func (s *Store) CompileCandidate() (*config.Config, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.candidate == nil {
+		return nil, fmt.Errorf("not in configuration mode")
+	}
+	return s.compileTree(s.candidate)
 }
 
 // EverCommitted reports the #1922 step-0 marker: true once a config has

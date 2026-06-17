@@ -1,5 +1,17 @@
 # Action Log
 
+## 2026-06-17 — #1956 startup naming helper coverage
+
+- **Timestamp**: 2026-06-17
+- **Action**: Tighten the #1956 startup-decision regression by centralizing the
+  real mapped-vs-positional startup naming branch in
+  `applyStartupNamingPolicy`, routing both boot sites through it, and updating
+  the test to stub the actual rename calls rather than only asserting the pure
+  predicate. This catches branch regression in the helper while preserving
+  behavior.
+- **File(s)**: pkg/daemon/device_map.go, pkg/daemon/daemon_run.go,
+  pkg/daemon/device_map_startup_test.go, _Log.md
+
 ## 2026-06-17 — #1916 review: authorized_keys lockout fix + persistSelfSignedCert comment
 
 - **Timestamp**: 2026-06-17
@@ -5820,3 +5832,15 @@ top.
 - **Timestamp**: 2026-06-17
   - **Action**: #1946 PR #1957 Codex impl-review fix (MEDIUM). The Prebuilt frame fast path (embedded-ICMP NAT-reversed errors, finalize_embedded_icmp_resolution can return FabricRedirect) is handled at the TOP of enqueue_pending_forwards, before the desc-frame FabricRedirect no-binding block — so a Prebuilt FabricRedirect with no fabric XSK binding (or whose local enqueue failed) was dropped at the early recycle+continue arms WITHOUT the fabric_redirect_unsendable_drops counter/exception, leaving the "all unsendable FabricRedirect paths counted" invariant incomplete. Gated both Prebuilt arms: no-binding -> reason fabric_redirect_no_binding, enqueue-failure -> reason fabric_redirect_build_failed, same shared counter, non-FabricRedirect Prebuilt drops keep their prior silent recycle. New regression enqueue_pending_forwards_counts_prebuilt_fabric_redirect_no_binding drives the full enqueue_pending_forwards loop with a Prebuilt FabricRedirect to a non-existent binding and asserts counter==1 + reason. Updated docs/fabric-cross-chassis-fwd.md to cover the Prebuilt path. Build + full release suite green (same pre-existing concurrent_recovery flake).
   - **File(s)**: userspace-dp/src/afxdp/tx/dispatch/mod.rs, userspace-dp/src/afxdp/tx/dispatch/dispatch_tests.rs, docs/fabric-cross-chassis-fwd.md, _Log.md
+
+- **Timestamp**: 2026-06-17
+  - **Action**: #1956 bare-metal device-map — implemented the PLAN-READY plan (v3.1) as a 5-commit feature on engineer/1956-device-map. Opt-in `set chassis device-map` stable-identity managed allowlist (PCI-primary + permanent-MAC fallback) replacing positional naming for mapped NICs only; unmapped-interface-policy {leave-alone(default)|manage-down}; mode-by-config-presence (len(Entries)>0) so no-map is bit-identical to today. pkg/devicemap shared pure resolver (topology-change REFUSE, RETH-PCI-only, ambiguous-MAC refuse, key-order); collision-safe multi-pass rename (V-2) + OQ-15.3 stranded-NIC restore via udevadm; branch BOTH rename sites (R-4); leave-alone reconcile skip (F2 fix); commit pre-flight rejecting mgmt-stranding maps + validating rollback target (R-8/V-3, OQ-15.2 apply-unconditionally); managed->unmapped teardown before networkd.Apply (V-4); passive-node SyncApply loud admission alarm (V-1/OQ-15.1a); §9.6 no-auto-fxp0/console-lifeline; show chassis device-map [candidates] (local + remote CLI). Forward-compatible with #1958 (pluggable identity key) but scoped bare-metal-only. go build/vet/test green, 5x flake-clean.
+  - **File(s)**: pkg/config/{types_chassis.go,value_type.go,schema_validators.go,schema_chassis.go,compiler_system.go,compiler_chassis.go,compiler.go,compiler_chassis_device_map_test.go}, pkg/devicemap/{devicemap.go,devicemap_test.go}, pkg/daemon/{device_map.go,device_map_test.go,daemon_run.go,daemon_apply.go,linksetup.go}, pkg/dataplane/compiler_iface.go, pkg/configstore/store.go, pkg/cmdtree/tree.go, pkg/cli/cli_show_cluster.go, cmd/cli/show.go, pkg/grpcapi/{server_show.go,server_show_device_map.go}, docs/{config-schema.md,bare-metal-device-map.md}, CLAUDE.md, _Log.md
+
+- **Timestamp**: 2026-06-17
+  - **Action**: #1956 fix two Copilot review bugs. Bug 1 (pkg/daemon/device_map.go): when a mapped NIC is already at its final logical name and no prior .link file exists, recoverOriginalName returns the logical name itself — the .link OriginalName= would be wrong and udev would never match it on next boot. Fix: add deriveKernelNameFn fallback (injectable for tests) at the originalByCurrent population site; uses sysfs PCI→kernel-name derivation when recoverOriginalName yields no improvement. Bug 2 (pkg/devicemap/devicemap.go): BindBoundViaMAC was set for any entry with a PCIAddr whenever MAC matched, even when MAC was the PRIMARY key (key=mac or key=mac-then-pci). Fix: only set BindBoundViaMAC when the effective key order is pci-then-mac (PCI was tried first). Updated TestResolveKeyOrderMACThenPCI (was asserting BindBoundViaMAC for mac-then-pci, now correctly expects BindBound). Added TestDeviceMapOriginalNameFallbackViaDeriveKernelName, TestResolveMACPrimaryKeyIsNotFlagged, TestResolvePCIThenMACFallbackFlagged. go test ./pkg/devicemap/... ./pkg/daemon/... ./pkg/config/... green.
+  - **File(s)**: pkg/daemon/device_map.go, pkg/daemon/device_map_test.go, pkg/devicemap/devicemap.go, pkg/devicemap/devicemap_test.go, _Log.md
+
+- **Timestamp**: 2026-06-17
+  - **Action**: #1956 boot-path investigation — REFUTED the stale-ActiveConfig() bug (device-map applies on every boot path; proven on live xpf-devmap VM + Codex code trace). Added testable seam `deviceMapNamingActive` + startup-decision regression test (the gap that let the feature "look dead" on the demo's pre-commit boot).
+  - **File(s)**: pkg/daemon/device_map.go, pkg/daemon/daemon_run.go, pkg/daemon/device_map_startup_test.go, docs/pr/1956-device-map/reviewers.md

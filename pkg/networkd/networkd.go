@@ -69,6 +69,20 @@ type InterfaceConfig struct {
 // Manager handles systemd-networkd .link and .network file generation.
 type Manager struct {
 	networkDir string
+	// protectedResolver returns the #1922 management protected set (logical
+	// names). Files for these interfaces (10-xpf-<name>.{link,network}) are
+	// NEVER swept by Apply even when the interface is absent from the
+	// compiled config — sweeping them would delete the live management NIC's
+	// rename + addressing and lock the operator out (#1956 AGY r3 CRITICAL,
+	// also the #1922 lifeline invariant). nil => no exemption (legacy).
+	protectedResolver func() map[string]bool
+}
+
+// SetProtectedResolver registers the management protected-set provider so
+// Apply can exempt the lifeline's files from the stale-file sweep. Called once
+// at daemon init alongside the dataplane protected resolver.
+func (m *Manager) SetProtectedResolver(fn func() map[string]bool) {
+	m.protectedResolver = fn
 }
 
 // New creates a new networkd manager.
@@ -126,6 +140,22 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 			expected[filePrefix+ifc.Name+".netdev"] = true
 		}
 		expected[filePrefix+ifc.Name+".network"] = true
+	}
+
+	// #1956 AGY r3 CRITICAL: never sweep the management protected set's files.
+	// A protected interface (the lifeline / fxp0 / mgmt leaf) is exempt from
+	// the unmanaged bring-down and is therefore absent from `interfaces`, so
+	// the stale-file sweep below would otherwise delete its 10-xpf-*.link and
+	// .network — instantly stripping the live mgmt NIC's rename + addressing
+	// on reload. Add its files to `expected` so the sweep preserves them.
+	if m.protectedResolver != nil {
+		for name := range m.protectedResolver() {
+			if name == "" {
+				continue
+			}
+			expected[filePrefix+name+".link"] = true
+			expected[filePrefix+name+".network"] = true
+		}
 	}
 
 	changed := false

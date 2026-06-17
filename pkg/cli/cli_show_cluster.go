@@ -8,8 +8,10 @@ import (
 	"strings"
 
 	"github.com/psaab/xpf/pkg/cmdtree"
+	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	"github.com/psaab/xpf/pkg/devicemap"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
@@ -57,9 +59,91 @@ func (c *CLI) showChassis(args []string) error {
 			return c.showChassisEnvironment()
 		case "forwarding":
 			return c.showChassisForwarding()
+		case "device-map":
+			return c.showChassisDeviceMap(args[1:])
 		}
 	}
 	cmdtree.PrintTreeHelp("show chassis:", operationalTree, "show", "chassis")
+	return nil
+}
+
+// showChassisDeviceMap renders the #1956 bare-metal device-map: the resolved
+// bindings of the active config, or — with `candidates` — every present NIC's
+// identity so an operator can copy-paste a map without memorizing PCI BDFs.
+func (c *CLI) showChassisDeviceMap(args []string) error {
+	if len(args) > 0 && args[0] == "candidates" {
+		return c.showChassisDeviceMapCandidates()
+	}
+
+	// Check device-map presence BEFORE enumerating NICs (Codex r3 LOW:
+	// match the gRPC server's safer order — no sysfs walk when not configured).
+	cfg := c.store.ActiveConfig()
+	var dm *config.DeviceMapConfig
+	if cfg != nil {
+		dm = cfg.Chassis.DeviceMap
+	}
+	if !dm.Active() {
+		fmt.Println("Device-map: not configured (positional interface naming is in effect).")
+		fmt.Println("Run 'show chassis device-map candidates' to list NICs, then")
+		fmt.Println("'set chassis device-map interface <name> pci <addr>' to author a map.")
+		return nil
+	}
+
+	nics, err := devicemap.EnumeratePresentNICs()
+	if err != nil {
+		return fmt.Errorf("enumerate NICs: %w", err)
+	}
+	bindings := devicemap.Resolve(dm.Entries, nics, devicemap.RethMembersFromConfig(cfg))
+	fmt.Printf("Device-map (unmapped-interface-policy: %s):\n\n", dm.EffectiveUnmappedPolicy())
+	fmt.Printf("%-12s %-24s %-16s %s\n", "Logical", "Identity (key)", "Resolved kernel", "Status")
+	fmt.Printf("%-12s %-24s %-16s %s\n", "-------", "--------------", "---------------", "------")
+	for _, b := range bindings {
+		ident := b.Entry.PCIAddr
+		if ident == "" {
+			ident = b.Entry.MAC
+		} else if b.Entry.MAC != "" {
+			ident += " (+mac)"
+		}
+		resolved := b.CurrentNIC
+		if resolved == "" {
+			resolved = "—"
+		} else {
+			resolved = fmt.Sprintf("%s→%s", resolved, b.Logical)
+		}
+		fmt.Printf("%-12s %-24s %-16s %s\n", b.Entry.LogicalName, ident, resolved, b.Status.String())
+	}
+	return nil
+}
+
+// showChassisDeviceMapCandidates lists every present NIC with its PCI address,
+// permanent MAC, current name, and link state — the copy-paste source for
+// authoring a device-map (operator priority: no hand-typed BDF archaeology).
+func (c *CLI) showChassisDeviceMapCandidates() error {
+	nics, err := devicemap.EnumeratePresentNICs()
+	if err != nil {
+		return fmt.Errorf("enumerate NICs: %w", err)
+	}
+	if len(nics) == 0 {
+		fmt.Println("No PCI network interfaces found.")
+		return nil
+	}
+	fmt.Print("Device-map candidates (copy a PCI address into a map entry):\n\n")
+	fmt.Printf("%-16s %-18s %-14s %s\n", "PCI address", "Permanent MAC", "Current name", "Link")
+	fmt.Printf("%-16s %-18s %-14s %s\n", "-----------", "-------------", "------------", "----")
+	for _, n := range nics {
+		perm := n.PermMAC
+		if perm == "" {
+			perm = "(none)"
+		}
+		link := "down"
+		if n.LinkUp {
+			link = "up"
+		}
+		fmt.Printf("%-16s %-18s %-14s %s\n", n.PCIAddr, perm, n.Name, link)
+	}
+	fmt.Println("\nExample:")
+	fmt.Printf("  set chassis device-map interface ge-0/0/3 pci %s\n", nics[0].PCIAddr)
+	fmt.Println("  set chassis device-map unmapped-interface-policy leave-alone")
 	return nil
 }
 

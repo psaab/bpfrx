@@ -253,4 +253,66 @@ var schemaChassis = &schemaNode{desc: "Chassis configuration", children: map[str
 			}},
 		}},
 	}},
+	// #1956 bare-metal device-map (sibling of cluster, so per-node
+	// apply-groups compose). Opt-in stable-identity managed allowlist:
+	// binds host NICs by PCI/permanent-MAC to xpf logical names and
+	// governs everything else via unmapped-interface-policy. Absent or
+	// empty => positional mode (today's behavior). See
+	// docs/bare-metal-device-map.md.
+	"device-map": {desc: "Bare-metal stable-identity interface map (#1956)", children: map[string]*schemaNode{
+		// `interface <logical-name>` is a named-instance container. The
+		// identity token is the xpf/vSRX logical name (ge-0/0/3, fxp0);
+		// keyValueType marks it typed so `?` completion shows the slot,
+		// keyValidator validates the name shape at commit. The regular
+		// valueType MUST stay unset (this is a container, not a leaf).
+		"interface": {
+			desc:             "Bind a host NIC to an xpf logical interface name",
+			args:             1,
+			placeholder:      "<logical-name>",
+			keyValueType:     ValueIdentifier,
+			keyValueDesc:     "xpf logical interface name (e.g. ge-0/0/3, fxp0)",
+			keyValueExamples: []string{"ge-0/0/3", "fxp0"},
+			keyValidator:     ValidateDeviceMapLogicalName,
+			children: map[string]*schemaNode{
+				"pci": {
+					desc:          "PCI bus address of the host NIC (primary identity key)",
+					args:          1,
+					valueType:     ValuePCIAddr,
+					valueDesc:     "PCI bus address (DDDD:BB:DD.F; copy from `show chassis device-map candidates`)",
+					valueExamples: []string{"0000:09:00.0"},
+					validator:     ValidatePCIAddr,
+					children:      nil,
+				},
+				"mac": {
+					desc:          "Permanent (factory) MAC of the host NIC (fallback identity key)",
+					args:          1,
+					valueType:     ValueMAC,
+					valueDesc:     "Permanent MAC address (xx:xx:xx:xx:xx:xx; fallback when PCI moves)",
+					valueExamples: []string{"00:11:22:33:44:55"},
+					validator:     ValidateMAC,
+					children:      nil,
+				},
+				"key": {
+					desc:          "Identity resolution order (default pci-then-mac)",
+					args:          1,
+					valueType:     ValueEnumOf,
+					valueDesc:     "Identity key order (pci-then-mac | mac-then-pci | pci | mac)",
+					valueExamples: []string{"pci-then-mac", "mac"},
+					validator: ValidateEnum([]string{
+						"pci-then-mac", "mac-then-pci", "pci", "mac",
+					}),
+					children: nil,
+				},
+			},
+		},
+		"unmapped-interface-policy": {
+			desc:          "Policy for NICs with no map entry (default leave-alone)",
+			args:          1,
+			valueType:     ValueEnumOf,
+			valueDesc:     "Unmapped-NIC policy (leave-alone | manage-down)",
+			valueExamples: []string{"leave-alone", "manage-down"},
+			validator:     ValidateEnum([]string{"leave-alone", "manage-down"}),
+			children:      nil,
+		},
+	}},
 }}
