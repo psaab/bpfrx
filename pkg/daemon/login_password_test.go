@@ -225,6 +225,44 @@ func TestReconcileApplyBoundaryRevalidatesHash(t *testing.T) {
 	}
 }
 
+// TestRootAuthApplyBoundaryRevalidatesHash mirrors the per-user apply-boundary
+// guard for `system root-authentication encrypted-password` (#1944 E1 shares
+// ValidateCryptHash with root-auth; Codex r2 High). The lenient Load/SyncApply
+// ingress can carry an invalid value, so applyRootAuth must re-validate before
+// `chpasswd -e` — skipping the exec for plaintext while still applying a valid
+// hash.
+func TestRootAuthApplyBoundaryRevalidatesHash(t *testing.T) {
+	dir := t.TempDir()
+	sentinel := filepath.Join(dir, "chpasswd-ran")
+	fakeBin := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\ntouch " + sentinel + "\ncat >/dev/null\n"
+	if err := os.WriteFile(filepath.Join(fakeBin, "chpasswd"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+":"+os.Getenv("PATH"))
+
+	d := &Daemon{}
+
+	// Invalid plaintext → no chpasswd.
+	cfgBad := &config.Config{}
+	cfgBad.System.RootAuthentication = &config.RootAuthConfig{EncryptedPassword: "password12345"}
+	d.applyRootAuth(cfgBad)
+	if _, err := os.Stat(sentinel); err == nil {
+		t.Fatal("chpasswd ran for an INVALID root hash — apply-boundary guard missing")
+	}
+
+	// Valid hash → chpasswd runs.
+	cfgGood := &config.Config{}
+	cfgGood.System.RootAuthentication = &config.RootAuthConfig{EncryptedPassword: "$6$rootsalt$roothash"}
+	d.applyRootAuth(cfgGood)
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatal("chpasswd did NOT run for a VALID root hash — guard over-rejects")
+	}
+}
+
 // TestLookupUID exercises the direct /etc/passwd UID parse via the
 // injectable passwdPath.
 func TestLookupUID(t *testing.T) {

@@ -47,3 +47,25 @@ Codex r1 (CHANGES-REQUIRED):
 
 AGY r1 (MERGE-READY): independently verified all three invariants on the
 strict path; did not exercise the lenient ingress (Codex High #2 gap).
+
+## Round 2 (head 510523739 → 8f-fix)
+
+| Reviewer | Task / ID | Round | Verdict |
+|----------|-----------|-------|---------|
+| Codex    | foreground (/tmp/codex-1944-r2-out.txt) | r2 | CHANGES-REQUIRED → fixed |
+| AGY      | adversarial-review-mqhvi9y9-hvahz1 | r2 | (see below) |
+| Claude SMR | in-conversation | r2 | concur Codex r2 High |
+| Copilot  | PR #1949 | r2 | re-requested |
+
+Codex r2: confirmed the per-user apply-boundary guard + no-auth warning
+fixes are correct and complete, then found the SYMMETRIC **High**:
+`applyRootAuth` (root-authentication) had the same lenient-ingress hole —
+it sent `root:<value>` to `chpasswd -e` checking only non-empty, so a
+persisted/synced plaintext root password would be applied. Since #1944
+explicitly shares `ValidateCryptHash` with root-auth (E1), the
+apply-boundary guard belongs there too. FIXED: `applyRootAuth` now
+re-runs `config.ValidateCryptHash` before the root `chpasswd -e` and
+skips+warns on failure (SSH keys still applied). New test
+`TestRootAuthApplyBoundaryRevalidatesHash`. No-regression: per-user path,
+inline-form-compiles-to-"", and the no-auth warning all still verified by
+Codex r2.

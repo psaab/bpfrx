@@ -864,12 +864,27 @@ func (d *Daemon) applyRootAuth(cfg *config.Config) {
 
 	// Set root password from encrypted-password (crypt(3) hash)
 	if ra.EncryptedPassword != "" {
-		// Use chpasswd -e to set pre-hashed password
-		stdin := strings.NewReader("root:" + ra.EncryptedPassword + "\n")
-		if out, err := runCommandStdinTimeout(stdin, "chpasswd", "-e"); err != nil {
-			slog.Warn("failed to set root password", "err", err, "output", string(out))
+		// Defense-in-depth at the apply boundary, mirroring
+		// reconcileUserPassword (#1944 E1 shares ValidateCryptHash between
+		// root-auth and per-user auth). The strict operator-commit gate
+		// rejects plaintext/DES/empty-checksum/':' values, but the lenient
+		// Load/SyncApply ingress (pkg/configstore/store.go) only downgrades
+		// that to a warning, so a persisted/synced bad value would otherwise
+		// reach `chpasswd -e` verbatim — writing plaintext as root's password
+		// or corrupting the chpasswd stdin line via ':'. Re-check here and
+		// skip+warn so "plaintext never reaches /etc/shadow" holds for root
+		// on every path too, without bricking boot. SSH keys below are
+		// still applied regardless.
+		if err := config.ValidateCryptHash(ra.EncryptedPassword, nil); err != nil {
+			slog.Warn("refusing to apply invalid root encrypted-password to /etc/shadow", "err", err)
 		} else {
-			slog.Info("root encrypted-password applied")
+			// Use chpasswd -e to set pre-hashed password
+			stdin := strings.NewReader("root:" + ra.EncryptedPassword + "\n")
+			if out, err := runCommandStdinTimeout(stdin, "chpasswd", "-e"); err != nil {
+				slog.Warn("failed to set root password", "err", err, "output", string(out))
+			} else {
+				slog.Info("root encrypted-password applied")
+			}
 		}
 	}
 
