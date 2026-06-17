@@ -245,31 +245,31 @@ func writeDeviceMapLinkFile(target, originalName string, rethMembers map[string]
 
 // deviceMapStrandsManagement reports whether applying cfg's device-map would,
 // on next boot, leave the #1922 management/lifeline NIC unbound or rebound to
-// a different port — i.e. strand the operator. It resolves the LOCAL node's
-// device-map against the present hardware (nics) and checks the protected set
-// (lifeline record + management leaf). Returns a non-empty reason when it
-// would strand, "" when safe. A nil/empty device-map is always safe (the
-// #1922 protected set is the independent backstop; positional mode is
-// unchanged). Pure given the NIC inventory + protected set, so it is unit
-// testable.
-func deviceMapStrandsManagement(cfg *config.Config, nics []presentNIC, protected map[string]bool) string {
+// a different port — i.e. strand the operator. Returns a non-empty reason when
+// it would strand, "" when safe. A nil/empty device-map is always safe (the
+// #1922 protected set is the independent backstop; positional mode unchanged).
+//
+// protected is the set of protected LOGICAL names (mgmt leaf / fxp0 +
+// lifeline). lifelineCurrentName is the CURRENT kernel name of the lifeline
+// NIC resolved by its persisted IDENTITY ("" if none) — load-bearing because
+// on first boot the live mgmt NIC still carries its kernel name (enp5s0), not
+// the protected target name (fxp0), so a name-only check would miss a steal
+// (Codex HIGH-2). Pure given the inputs, so it is unit testable.
+func deviceMapStrandsManagement(cfg *config.Config, nics []presentNIC, protected map[string]bool, lifelineCurrentName string) string {
 	if cfg == nil {
 		return ""
 	}
 	dm := cfg.Chassis.DeviceMap
 	if !dm.Active() {
-		// Positional mode: the protected set shields management; never
-		// stranded by a device-map (there is none).
 		return ""
 	}
 	bindings := resolveDeviceMap(dm.Entries, nics, rethMembersFromConfig(cfg))
 
-	// Map current kernel name -> its resolved final logical name.
 	finalByCurrent := make(map[string]string)
 	for _, b := range bindings {
 		// A REFUSED binding on ANY entry is a hard stop: a card was swapped
-		// at a pinned slot, so the operator's intent no longer matches the
-		// hardware — refuse the commit while they are still connected.
+		// at a pinned identity, so the operator's intent no longer matches
+		// the hardware — refuse while they are still connected.
 		if b.Status == devicemap.BindRefusedAmbig {
 			return fmt.Sprintf("device-map entry %q refuses to bind: a different card is present "+
 				"at its pinned identity (topology changed). Re-pin the entry before committing.",
@@ -280,44 +280,42 @@ func deviceMapStrandsManagement(cfg *config.Config, nics []presentNIC, protected
 		}
 	}
 
-	// For each protected (management/lifeline) NIC currently present: if it
-	// would be renamed to a logical name by this map, that is fine (the
-	// operator deliberately mapped it). The dangerous case is a protected
-	// NIC that is NOT mapped while unmapped-policy is manage-down — but the
-	// protected set is config-independent and the reconcile already exempts
-	// it, so it is never downed. The genuine lockout we CAN detect here is a
-	// device-map that maps the mgmt NIC's logical name to a DIFFERENT
-	// physical NIC than the one currently carrying management (a port swap).
+	// The live management NIC's CURRENT kernel name. Prefer the
+	// identity-resolved lifeline name (correct even before the rename); fall
+	// back to a present NIC literally named like a protected target (the
+	// already-renamed steady state).
+	liveMgmt := map[string]bool{}
+	if lifelineCurrentName != "" {
+		liveMgmt[lifelineCurrentName] = true
+	}
+	for i := range nics {
+		if protected[nics[i].Name] {
+			liveMgmt[nics[i].Name] = true
+		}
+	}
+
 	for prot := range protected {
 		if prot == "" {
 			continue
 		}
-		// Is `prot` currently a present NIC (the live mgmt NIC)?
-		liveMgmtPresent := false
-		for i := range nics {
-			if nics[i].Name == prot {
-				liveMgmtPresent = true
-				break
+		// Case A: a live management NIC is mapped to a DIFFERENT name —
+		// management moves off it on next boot.
+		for lm := range liveMgmt {
+			if final, ok := finalByCurrent[lm]; ok && final != prot && final != lm {
+				return fmt.Sprintf("device-map would rename the live management NIC %q to %q on "+
+					"next boot, moving management off it. Map the management NIC to its own name, "+
+					"or adjust the map before committing.", lm, final)
 			}
 		}
-		if !liveMgmtPresent {
-			continue // protected name not currently a present NIC
-		}
-		// Case A: the live mgmt NIC itself is mapped to a DIFFERENT name —
-		// management moves off it on next boot.
-		if final, ok := finalByCurrent[prot]; ok && final != prot {
-			return fmt.Sprintf("device-map would rename the live management NIC %q to %q on next "+
-				"boot, moving management off it. Map the management NIC to its own name, or "+
-				"adjust the map before committing.", prot, final)
-		}
-		// Case B: some OTHER NIC is mapped to the protected name and the live
-		// mgmt NIC is NOT itself mapped to keep that name — a collision that
-		// would steal the management name from the live NIC on next boot.
+		// Case B: some NIC that is NOT a live management NIC is mapped to a
+		// protected name — it would steal the management name on next boot,
+		// even if the live mgmt NIC still wears its kernel name today
+		// (Codex HIGH-2: this fires before any rename).
 		for current, final := range finalByCurrent {
-			if final == prot && current != prot {
-				return fmt.Sprintf("device-map would rename NIC %q to the management name %q on "+
+			if final == prot && !liveMgmt[current] {
+				return fmt.Sprintf("device-map would assign the management name %q to NIC %q on "+
 					"next boot, taking it from the live management NIC. Re-pin the device-map "+
-					"before committing.", current, prot)
+					"before committing.", prot, current)
 			}
 		}
 	}
@@ -345,20 +343,23 @@ func (d *Daemon) deviceMapCommitPreflight(candidate, rollbackTarget *config.Conf
 		slog.Warn("device-map pre-flight: NIC enumeration failed; skipping (lifeline still protects mgmt)", "err", err)
 		return nil
 	}
+	// The lifeline NIC's CURRENT kernel name, resolved by its persisted
+	// IDENTITY — correct even before the rename (Codex HIGH-2).
+	lifelineName, _ := resolveLifelineCurrentName()
 	// AGY HIGH-2: resolve the protected set from EACH config's OWN
 	// management-interface leaf (not the active config's), so a commit that
 	// repoints `system management-interface` is validated against the
 	// intent it is establishing — neither a silent lockout (using the stale
 	// active leaf) nor a false rejection of a legitimate mgmt migration. The
 	// lifeline record stays config-independent in both.
-	if reason := deviceMapStrandsManagement(candidate, nics, protectedForConfig(candidate)); reason != "" {
+	if reason := deviceMapStrandsManagement(candidate, nics, protectedForConfig(candidate), lifelineName); reason != "" {
 		return fmt.Errorf("device-map commit rejected: %s", reason)
 	}
 	// V-3(a): validate the rollback target too, so a confirmed-commit
 	// timeout reverts to a KNOWN-safe config and can be applied
 	// unconditionally (OQ-15.2 — no rollback-time abort, no split-brain).
 	if rollbackTarget != nil {
-		if reason := deviceMapStrandsManagement(rollbackTarget, nics, protectedForConfig(rollbackTarget)); reason != "" {
+		if reason := deviceMapStrandsManagement(rollbackTarget, nics, protectedForConfig(rollbackTarget), lifelineName); reason != "" {
 			return fmt.Errorf("commit confirmed rejected: the rollback target (current active "+
 				"config, restored on timeout) would strand management: %s", reason)
 		}

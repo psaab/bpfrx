@@ -104,6 +104,23 @@ func Resolve(entries []config.DeviceMapEntry, nics []PresentNIC, rethMembers map
 		allowMAC := e.MAC != "" && !isRETH
 		allowPCI := e.PCIAddr != ""
 
+		// Order-INDEPENDENT topology-change refusal (Codex HIGH-1): when an
+		// entry pins BOTH a PCI address and a MAC, a present NIC at that PCI
+		// whose permanent MAC mismatches means a card was swapped into the
+		// pinned slot. That must REFUSE regardless of key order — otherwise a
+		// `mac-then-pci` (or any MAC-first) entry would bind via MAC and
+		// silently skip the slot-swap check. Skip for RETH members (MAC is
+		// not a usable key for them) and when either side lacks a perm-MAC to
+		// compare (PCI-only-unverified is handled in the key loop).
+		if allowPCI && e.MAC != "" && !isRETH {
+			if pm := byPCI[strings.ToLower(e.PCIAddr)]; len(pm) == 1 &&
+				pm[0].PermMAC != "" && !strings.EqualFold(pm[0].PermMAC, e.MAC) {
+				rb.Status, rb.CurrentNIC, rb.Logical = BindRefusedAmbig, "", ""
+				out = append(out, rb)
+				continue
+			}
+		}
+
 		for _, key := range keySequence(e, allowPCI, allowMAC) {
 			switch key {
 			case config.DeviceMapKeyPCI:

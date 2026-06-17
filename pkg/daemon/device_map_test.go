@@ -130,7 +130,7 @@ func TestDeviceMapStrandsManagementSafeWhenMgmtMapped(t *testing.T) {
 	}}}
 	nics := []devicemap.PresentNIC{{Name: "fxp0", PCIAddr: "0000:05:00.0"}}
 	protected := map[string]bool{"fxp0": true}
-	if r := deviceMapStrandsManagement(cfg, nics, protected); r != "" {
+	if r := deviceMapStrandsManagement(cfg, nics, protected, "fxp0"); r != "" {
 		t.Fatalf("mapping mgmt NIC to its own name must be safe, got %q", r)
 	}
 }
@@ -146,7 +146,7 @@ func TestDeviceMapStrandsManagementDetectsPortSwap(t *testing.T) {
 		{Name: "enp9s0", PCIAddr: "0000:09:00.0"}, // becomes fxp0
 	}
 	protected := map[string]bool{"fxp0": true}
-	if r := deviceMapStrandsManagement(cfg, nics, protected); r == "" {
+	if r := deviceMapStrandsManagement(cfg, nics, protected, "fxp0"); r == "" {
 		t.Fatalf("expected strand detection when mgmt name moves to another port")
 	}
 }
@@ -159,8 +159,28 @@ func TestDeviceMapStrandsManagementRefuseOnTopologyChange(t *testing.T) {
 		},
 	}}}
 	nics := []devicemap.PresentNIC{{Name: "enp9s0", PCIAddr: "0000:09:00.0", PermMAC: "de:ad:be:ef:00:01"}}
-	if r := deviceMapStrandsManagement(cfg, nics, nil); r == "" {
+	if r := deviceMapStrandsManagement(cfg, nics, nil, ""); r == "" {
 		t.Fatalf("expected refusal on topology change (PCI hit, MAC mismatch)")
+	}
+}
+
+func TestDeviceMapStrandsManagementCatchesPreRenameSteal(t *testing.T) {
+	// Codex HIGH-2: on first boot the live mgmt NIC still wears its kernel
+	// name (enp5s0), NOT the protected target (fxp0). A different NIC mapped
+	// to fxp0 must still be caught as a steal even though no present NIC is
+	// literally named fxp0 yet. The lifeline identity resolves enp5s0 as the
+	// live mgmt NIC.
+	cfg := &config.Config{Chassis: config.ChassisConfig{DeviceMap: &config.DeviceMapConfig{
+		Entries: []config.DeviceMapEntry{{LogicalName: "fxp0", PCIAddr: "0000:09:00.0"}},
+	}}}
+	nics := []devicemap.PresentNIC{
+		{Name: "enp5s0", PCIAddr: "0000:05:00.0"}, // live mgmt NIC (un-renamed)
+		{Name: "enp9s0", PCIAddr: "0000:09:00.0"}, // mapped to fxp0 -> steal
+	}
+	protected := map[string]bool{"fxp0": true}
+	// lifeline resolves the live mgmt NIC's CURRENT name = enp5s0.
+	if r := deviceMapStrandsManagement(cfg, nics, protected, "enp5s0"); r == "" {
+		t.Fatalf("expected steal detection before rename (live mgmt still enp5s0)")
 	}
 }
 
@@ -186,7 +206,7 @@ func TestDeviceMapStrandsManagementPositionalIsSafe(t *testing.T) {
 	// No device-map => positional mode, never stranded by a (non-existent)
 	// map; the #1922 protected set is the backstop.
 	cfg := &config.Config{}
-	if r := deviceMapStrandsManagement(cfg, nil, map[string]bool{"fxp0": true}); r != "" {
+	if r := deviceMapStrandsManagement(cfg, nil, map[string]bool{"fxp0": true}, ""); r != "" {
 		t.Fatalf("positional mode must never report stranding, got %q", r)
 	}
 }

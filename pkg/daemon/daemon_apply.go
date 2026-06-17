@@ -221,7 +221,8 @@ func (d *Daemon) deviceMapPassiveAdmissionAlarm(synced *config.Config) {
 			"on this node.", "err", err)
 		return
 	}
-	if reason := deviceMapStrandsManagement(synced, nics, protectedForConfig(synced)); reason != "" {
+	lifelineName, _ := resolveLifelineCurrentName()
+	if reason := deviceMapStrandsManagement(synced, nics, protectedForConfig(synced), lifelineName); reason != "" {
 		slog.Error("HA CONFIG-SYNC ALARM: the peer-pushed device-map would STRAND this node's "+
 			"management on next boot. The config is applied (stores stay consistent) and the "+
 			"management lifeline keeps the box reachable now, but a reboot would lock this node "+
