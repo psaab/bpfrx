@@ -70,7 +70,9 @@ func (f *fakeKernelSystem) BootEntries() (map[string]string, error) {
 	}
 	return cp, nil
 }
-func (f *fakeKernelSystem) BootOrder() ([]string, error) { return append([]string(nil), f.order...), nil }
+func (f *fakeKernelSystem) BootOrder() ([]string, error) {
+	return append([]string(nil), f.order...), nil
+}
 func (f *fakeKernelSystem) GrubSubmenuDisabled() (bool, error) { return f.submenuOK, nil }
 func (f *fakeKernelSystem) WatchdogStatus() (bool, bool)       { return f.wdPresent, f.wdPersist }
 func (f *fakeKernelSystem) FreeBytes(p string) (uint64, error) {
@@ -109,9 +111,13 @@ func (f *fakeKernelSystem) WriteSlotSelector(slot, unameR string) error {
 func (f *fakeKernelSystem) ReadSlotSelector(slot string) (string, error) {
 	return f.selectors[slot], nil
 }
-func (f *fakeKernelSystem) SetBootNext(id string) error { f.log("bootnext:" + id); f.bootNext = id; return nil }
-func (f *fakeKernelSystem) ArmWatchdog() error          { f.wdArmed = true; return nil }
-func (f *fakeKernelSystem) Reboot() error               { f.log("reboot"); f.rebooted = true; return nil }
+func (f *fakeKernelSystem) SetBootNext(id string) error {
+	f.log("bootnext:" + id)
+	f.bootNext = id
+	return nil
+}
+func (f *fakeKernelSystem) ArmWatchdog() error { f.wdArmed = true; return nil }
+func (f *fakeKernelSystem) Reboot() error      { f.log("reboot"); f.rebooted = true; return nil }
 func (f *fakeKernelSystem) BootCurrent() (string, error) {
 	if f.bootCurrent != "" {
 		return f.bootCurrent, nil
@@ -365,7 +371,7 @@ func TestKernelArmStrictWatchdogAborts(t *testing.T) {
 // --- D2: no persistent watchdog -> proceeds (BootNext closes the loop). ---
 func TestKernelArmD2ProceedsWithoutPersistentWatchdog(t *testing.T) {
 	f := newFakeKernelSystem()
-	f.wdPersist = false // present but not verified-persistent
+	f.wdPersist = false        // present but not verified-persistent
 	r := newKernelRunner(t, f) // StrictWatchdog defaults false (D2)
 	if err := r.Arm("6.18.5-12-generic"); err != nil {
 		t.Fatalf("D2 should proceed, got %v", err)

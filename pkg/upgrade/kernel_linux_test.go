@@ -11,7 +11,7 @@ func TestBootEntryRegex(t *testing.T) {
 		{"Boot0003* xpf-A\tHD(1,GPT,8a827350)/\\EFI\\xpf-A\\shimx64.efi", "0003", "xpf-A"},
 		{"Boot0004* xpf-B\tHD(1,GPT,abc)/\\EFI\\xpf-B\\shimx64.efi", "0004", "xpf-B"},
 		{"Boot0002* Ubuntu\tHD(1,GPT,xyz)/\\EFI\\ubuntu\\shimx64.efi", "0002", "Ubuntu"},
-		{"Boot0000* UiApp", "0000", "UiApp"}, // no loader path
+		{"Boot0000* UiApp", "0000", "UiApp"},                                 // no loader path
 		{"Boot0001  inactive-entry\tPciRoot(0x0)", "0001", "inactive-entry"}, // no '*'
 	}
 	for _, c := range cases {
