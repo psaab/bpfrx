@@ -1406,6 +1406,12 @@ type BindingStatus struct {
 	// instead of plaintext kernel reinjection (#1873 R-C/R-E).
 	// Wire-additive: older helpers omit it.
 	TunnelEncapUnresolvedDrops uint64 `json:"tunnel_encap_unresolved_drops,omitempty"`
+	// FabricRedirectUnsendableDrops counts FabricRedirect frames dropped
+	// fail-closed because they could not be TX'd to the HA peer (no
+	// fabric XSK binding, or the forward-frame build/enqueue failed)
+	// instead of being reinjected to the local kernel FIB (#1946).
+	// Wire-additive: older helpers omit it.
+	FabricRedirectUnsendableDrops uint64 `json:"fabric_redirect_unsendable_drops,omitempty"`
 	KernelRXDropped                   uint64 `json:"kernel_rx_dropped,omitempty"`
 	KernelRXInvalidDescs              uint64 `json:"kernel_rx_invalid_descs,omitempty"`
 	TXPackets                         uint64 `json:"tx_packets,omitempty"`

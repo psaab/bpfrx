@@ -1352,6 +1352,40 @@ fn binding_status_post_drain_backup_cos_drops_wire_keys_1642() {
     assert_eq!(cos["post_drain_backup_bytes"], 1u64);
 }
 
+// #1946: wire key + roundtrip + omitempty pin for the FabricRedirect
+// fail-closed drop counter. Feeds pkg/dataplane/userspace/protocol.go
+// (FabricRedirectUnsendableDrops). A rename or skip-semantics change on
+// either side must fail here instead of silently decoding empty; the
+// `default` attribute keeps a mixed-version control socket (older helper
+// omits the key) decoding to 0.
+#[test]
+fn binding_status_fabric_redirect_unsendable_drops_wire_key_1946() {
+    let status = BindingStatus {
+        fabric_redirect_unsendable_drops: 9,
+        ..Default::default()
+    };
+    let value: serde_json::Value =
+        serde_json::to_value(&status).expect("serialize BindingStatus");
+    assert_eq!(value["fabric_redirect_unsendable_drops"], 9u64);
+
+    // Round-trip preserves the value.
+    let decoded: BindingStatus =
+        serde_json::from_value(value).expect("deserialize BindingStatus");
+    assert_eq!(decoded.fabric_redirect_unsendable_drops, 9);
+
+    // Mixed-version tolerance: an older helper that omits the key (but
+    // still emits the required fields) decodes it to the default 0.
+    let mut legacy_value =
+        serde_json::to_value(BindingStatus::default()).expect("serialize default BindingStatus");
+    legacy_value
+        .as_object_mut()
+        .expect("object")
+        .remove("fabric_redirect_unsendable_drops");
+    let legacy: BindingStatus =
+        serde_json::from_value(legacy_value).expect("deserialize legacy BindingStatus");
+    assert_eq!(legacy.fabric_redirect_unsendable_drops, 0);
+}
+
 #[test]
 fn process_status_event_stream_fields_wire_keys_1642() {
     let status = ProcessStatus {

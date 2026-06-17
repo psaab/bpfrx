@@ -112,6 +112,9 @@ impl BindingLiveState {
             tunnel_encap_unresolved_drops: self
                 .tunnel_encap_unresolved_drops
                 .load(Ordering::Relaxed),
+            fabric_redirect_unsendable_drops: self
+                .fabric_redirect_unsendable_drops
+                .load(Ordering::Relaxed),
             kernel_rx_dropped: self.kernel_rx_dropped.load(Ordering::Relaxed),
             kernel_rx_invalid_descs: self.kernel_rx_invalid_descs.load(Ordering::Relaxed),
             tx_packets: self.tx_packets.load(Ordering::Relaxed),

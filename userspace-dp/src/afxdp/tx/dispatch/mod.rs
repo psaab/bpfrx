@@ -221,33 +221,31 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
             // parents have bindings; this is a safety-net fallback in case
             // the binding is not yet ready or bind() failed.
             if request.decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
-                if matches!(request.frame, PendingForwardFrame::Owned(_)) {
-                    maybe_reinject_slow_path_from_frame(
-                        ingress_ident,
-                        ingress_live,
-                        slow_path,
-                        local_tunnel_deliveries,
-                        source_frame,
-                        request.meta,
-                        request.decision,
-                        recent_exceptions,
-                        "slow_path",
-                        forwarding,
-                    );
-                } else {
-                    maybe_reinject_slow_path(
-                        ingress_ident,
-                        ingress_live,
-                        slow_path,
-                        local_tunnel_deliveries,
-                        unsafe { &*ingress_area },
-                        request.desc,
-                        request.meta,
-                        request.decision,
-                        recent_exceptions,
-                        forwarding,
-                    );
-                }
+                // #1946: a FabricRedirect with no XSK binding on the
+                // fabric parent is a rare safety net (bind not ready /
+                // bind() failed). The frame is a cross-chassis L2 redirect
+                // destined for the peer's pipeline, NOT a kernel-FIB-
+                // routable packet — reinjecting it to the local kernel
+                // slow path is a wrong-path / conntrack-poison hazard (the
+                // pre-#1946 PendingForwardFrame::Owned branch did exactly
+                // that, while the Live branch was silently dropped by the
+                // filtered maybe_reinject_slow_path wrapper). Drop BOTH
+                // frame kinds identically, fail-closed, and count (cf. the
+                // #1873 R-C tunnel_encap_unresolved_drops gate). We touch
+                // neither frame, so the Owned (GRE-decapped copy) vs Live
+                // (raw in-UMEM) representation difference is irrelevant.
+                ingress_live
+                    .fabric_redirect_unsendable_drops
+                    .fetch_add(1, Ordering::Relaxed);
+                record_exception(
+                    recent_exceptions,
+                    ingress_ident,
+                    "fabric_redirect_no_binding",
+                    request.desc.len,
+                    Some(request.meta.into()),
+                    None,
+                    forwarding,
+                );
                 recycle_ingress_frame(ingress_binding, source_offset, now_ns);
                 continue;
             }

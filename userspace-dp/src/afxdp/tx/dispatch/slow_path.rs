@@ -57,6 +57,33 @@ pub(in crate::afxdp) fn handle_forward_build_failure(
         None,
         forwarding,
     );
+    // #1946: a FabricRedirect frame is a cross-chassis L2 redirect for the
+    // peer's pipeline, never a kernel-FIB-routable packet. If the
+    // forward-frame build/enqueue failed (binding present but build/TX
+    // failed), reinjecting it to the local kernel slow path via the raw
+    // `maybe_reinject_slow_path_from_frame` primitive is the same
+    // wrong-path / conntrack-poison hazard the no-binding fallback in
+    // `tx/dispatch/mod.rs` now avoids. Drop fail-closed and count on the
+    // SHARED `fabric_redirect_unsendable_drops` counter (distinct
+    // exception reason for path observability). This also keeps the
+    // documented invariant true: after #1946 the only intentional
+    // unfiltered caller of the raw primitive is the ForwardCandidate
+    // build-failure reinject below (ForwardCandidate IS a route the
+    // kernel may legitimately serve).
+    if decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
+        live.fabric_redirect_unsendable_drops
+            .fetch_add(1, Ordering::Relaxed);
+        record_exception(
+            recent_exceptions,
+            binding,
+            "fabric_redirect_build_failed",
+            packet_length,
+            Some(meta),
+            None,
+            forwarding,
+        );
+        return;
+    }
     if fallback_to_slow_path {
         maybe_reinject_slow_path_from_frame(
             binding,
@@ -135,14 +162,25 @@ pub(in crate::afxdp) fn maybe_reinject_slow_path(
 /// `poll_descriptor::poll_binding_process_descriptor`, #1913), which both
 /// apply the predicate.
 ///
-/// The two INTENTIONAL unfiltered callers (dispositions deliberately
+/// The ONE INTENTIONAL unfiltered caller (disposition deliberately
 /// outside the allow-list):
-///   - `tx/dispatch/mod.rs` FabricRedirect-Owned fallback: reinjects a
-///     `FabricRedirect` frame when the target XSK binding is missing.
 ///   - `handle_forward_build_failure` (above): reinjects a
-///     `ForwardCandidate` frame when the forward descriptor build fails.
-/// Both rely on the unfiltered behavior; do NOT add a disposition filter
-/// inside this primitive (it would break them — #1913 Path B, rejected).
+///     `ForwardCandidate` frame when the forward descriptor build fails
+///     (ForwardCandidate IS a route the kernel FIB may legitimately
+///     serve). That helper now drops `FabricRedirect` fail-closed BEFORE
+///     reaching this primitive (#1946), so it never raw-reinjects a
+///     fabric frame.
+/// This caller relies on the unfiltered behavior; do NOT add a
+/// disposition filter inside this primitive (it would break it — #1913
+/// Path B, rejected).
+///
+/// #1946: the former second unfiltered caller — the `tx/dispatch/mod.rs`
+/// FabricRedirect-Owned no-binding fallback — was removed; a
+/// FabricRedirect with no fabric XSK binding (or whose build/enqueue
+/// failed) is now dropped fail-closed and counted
+/// (`fabric_redirect_unsendable_drops`) rather than reinjected to the
+/// local kernel FIB (a cross-chassis L2 redirect is never kernel-FIB
+/// routable).
 #[cold]
 #[inline(never)]
 pub(in crate::afxdp) fn maybe_reinject_slow_path_from_frame(

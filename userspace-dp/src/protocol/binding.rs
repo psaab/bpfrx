@@ -456,6 +456,12 @@ pub(crate) struct BindingStatus {
     /// (serde default; Go side omitempty).
     #[serde(rename = "tunnel_encap_unresolved_drops", default)]
     pub tunnel_encap_unresolved_drops: u64,
+    /// #1946: FabricRedirect frames dropped fail-closed because they
+    /// could not be TX'd to the HA peer (no fabric XSK binding, or the
+    /// forward-frame build/enqueue failed). Wire-additive (serde
+    /// default; Go side omitempty).
+    #[serde(rename = "fabric_redirect_unsendable_drops", default)]
+    pub fabric_redirect_unsendable_drops: u64,
     #[serde(rename = "kernel_rx_dropped", default)]
     pub kernel_rx_dropped: u64,
     #[serde(rename = "kernel_rx_invalid_descs", default)]
