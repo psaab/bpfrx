@@ -16,10 +16,13 @@ import (
 )
 
 var (
-	// efibootmgr marks ACTIVE entries with a trailing '*' after the id and
-	// INACTIVE entries without it; tolerate both so a (transiently) inactive
-	// slot is still discoverable. ids are uppercase hex.
-	bootEntryRE          = regexp.MustCompile(`^Boot([0-9A-F]{4})\*?\s+(.+)`)
+	// An efibootmgr entry line is "BootXXXX*<sp>LABEL<TAB>loader-path"
+	// (active entries have the '*', inactive do not). The LABEL is the field
+	// between the id and the TAB that introduces the device/loader path —
+	// capture ONLY the label, not the trailing tab+path (a `(.+)` greedy
+	// capture would fold the whole path into the key — caught live, #1930).
+	// Some entries have no loader path (no tab) — `[^\t]+` then tolerates EOL.
+	bootEntryRE          = regexp.MustCompile(`^Boot([0-9A-F]{4})\*?\s+([^\t]+?)(?:\t.*)?$`)
 	bootCurrentRE        = regexp.MustCompile(`^BootCurrent:\s*([0-9A-F]{4})`)
 	slotSelectorKernelRE = regexp.MustCompile(`xpf_slot_kernel="vmlinuz-([^"]+)"`)
 )

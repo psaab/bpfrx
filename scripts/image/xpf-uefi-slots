@@ -62,8 +62,13 @@ fi
 # loader path is \EFI\<slot>\shimx64.efi.
 register_slot() {
     slot="$1"
-    # already registered?
-    if efibootmgr | grep -qE "^Boot[0-9A-Fa-f]{4}\*? +${slot}\$"; then
+    # already registered? An efibootmgr line is:
+    #   Boot0003* xpf-A\tHD(1,GPT,...)/\EFI\xpf-A\shimx64.efi
+    # i.e. "BootXXXX*<sp>LABEL<TAB>loader-path" — the LABEL is followed by a TAB
+    # + the loader path, NOT line-end. So the guard must match the label
+    # bounded by the trailing TAB/space, NOT anchored at $ (that miss created
+    # duplicate slots — caught live, #1930).
+    if efibootmgr | grep -qE "^Boot[0-9A-Fa-f]{4}\*?[[:space:]]+${slot}[[:space:]]"; then
         log "slot ${slot} already registered"
         return 0
     fi
@@ -83,37 +88,45 @@ register_slot() {
     return 0
 }
 
+# Record whether an xpf slot already led BootOrder BEFORE we (re)register —
+# only then do we preserve the existing default. Otherwise we normalize to a
+# deterministic xpf-A-first order (efibootmgr --create PREPENDS each new entry,
+# so creating A then B would otherwise leave B in front — caught live, #1930).
+slot_id() { efibootmgr | sed -nE "s/^Boot([0-9A-Fa-f]{4})\*?[[:space:]]+$1[[:space:]].*/\\1/p" | head -1; }
+PRE_FRONT=$(efibootmgr | sed -nE 's/^BootOrder: ([^,]*).*$/\1/p')
+PRE_A=$(slot_id xpf-A)
+PRE_B=$(slot_id xpf-B)
+LED_BEFORE=no
+case "$PRE_FRONT" in
+    "$PRE_A"|"$PRE_B")
+        # An xpf slot already led AND both were registered before this run.
+        [ -n "$PRE_A" ] && [ -n "$PRE_B" ] && LED_BEFORE=yes
+        ;;
+esac
+
 register_slot xpf-A || true
 register_slot xpf-B || true
 
-# --- seed BootOrder so an xpf slot is the default, if neither is yet ---
-# Read the ids for our slots.
-slot_id() { efibootmgr | sed -nE "s/^Boot([0-9A-Fa-f]{4})\*? +$1\$/\\1/p" | head -1; }
+# --- normalize BootOrder ---
 A_ID=$(slot_id xpf-A)
 B_ID=$(slot_id xpf-B)
 ORDER=$(efibootmgr | sed -nE 's/^BootOrder: (.*)$/\1/p')
 
-# Is an xpf slot already the front of BootOrder?
-FRONT=$(echo "$ORDER" | cut -d, -f1)
-case "$FRONT" in
-    "$A_ID"|"$B_ID")
-        log "an xpf slot ($FRONT) already leads BootOrder; preserving"
-        ;;
-    *)
-        if [ -n "$A_ID" ]; then
-            # Put xpf-A first, preserving every other existing entry.
-            REST=$(echo "$ORDER" | tr ',' '\n' | grep -vxF "$A_ID" | grep -vxF "${B_ID:-__none__}" | paste -sd, -)
-            NEW="$A_ID"
-            [ -n "$B_ID" ] && NEW="$NEW,$B_ID"
-            [ -n "$REST" ] && NEW="$NEW,$REST"
-            log "seeding BootOrder: $NEW (was: $ORDER)"
-            efibootmgr --quiet --bootorder "$NEW" 2>/dev/null \
-                || log "WARNING: failed to seed BootOrder (non-fatal)"
-        else
-            log "no xpf-A slot id; leaving BootOrder unchanged"
-        fi
-        ;;
-esac
+if [ "$LED_BEFORE" = yes ]; then
+    log "an xpf slot already led BootOrder before this run; preserving the default ($PRE_FRONT)"
+elif [ -n "$A_ID" ]; then
+    # Deterministic seed: xpf-A first, xpf-B second, then every other entry in
+    # its existing order (preserving PXE/recovery/firmware — non-destructive).
+    REST=$(echo "$ORDER" | tr ',' '\n' | grep -vxF "$A_ID" | grep -vxF "${B_ID:-__none__}" | paste -sd, -)
+    NEW="$A_ID"
+    [ -n "$B_ID" ] && NEW="$NEW,$B_ID"
+    [ -n "$REST" ] && NEW="$NEW,$REST"
+    log "seeding BootOrder: $NEW (was: $ORDER)"
+    efibootmgr --quiet --bootorder "$NEW" 2>/dev/null \
+        || log "WARNING: failed to seed BootOrder (non-fatal)"
+else
+    log "no xpf-A slot id; leaving BootOrder unchanged"
+fi
 
 log "done"
 exit 0
