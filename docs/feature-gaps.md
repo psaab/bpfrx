@@ -404,7 +404,7 @@ xpf manages all interfaces with .link/.network files, supports VLANs, tunnel int
 
 ## 22. System Enhancements
 
-xpf has hostname, domain-name, domain-search, timezone, name-servers, NTP, services (SSH, web-management, DNS), syslog, SNMP, login users/classes, root-authentication, archival, internet-options, backup-router, DHCP server (Kea), and ~~DPDK~~ config (DPDK retired #1525, removed in #1527/#1528).
+xpf has hostname, domain-name, domain-search, timezone, name-servers, NTP, services (SSH, web-management, DNS), syslog, SNMP, login users/classes (including per-user `authentication encrypted-password` for console login — #1944, see [docs/system-login.md](system-login.md)), root-authentication, archival, internet-options, backup-router, DHCP server (Kea), and ~~DPDK~~ config (DPDK retired #1525, removed in #1527/#1528).
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|

@@ -300,10 +300,11 @@ type LoginConfig struct {
 
 // LoginUser defines a system user account.
 type LoginUser struct {
-	Name    string
-	UID     int
-	Class   string   // "super-user", "read-only", etc.
-	SSHKeys []string // authorized SSH public keys
+	Name              string
+	UID               int
+	Class             string   // "super-user", "read-only", etc.
+	EncryptedPassword string   // crypt(3) hash; applied via `chpasswd -e` (#1944)
+	SSHKeys           []string // authorized SSH public keys
 }
 
 // ServicesConfig holds service configuration (flow-monitoring, RPM, etc.).

@@ -54,6 +54,12 @@ const (
 	// 10.0.1.10/24, 2001:db8::1/64). The accepted family is enforced by
 	// the leaf's validator (ValidateIPv4CIDR / ValidateIPv6CIDR).
 	ValueCIDR
+	// ValueCryptHash is a crypt(3) modular password hash (e.g.
+	// $6$salt$checksum) or an explicit lock sentinel (*, !, !!). The
+	// leaf's validator (ValidateCryptHash) rejects plaintext at commit
+	// check so an operator cannot paste cleartext into an
+	// encrypted-password directive. #1944.
+	ValueCryptHash
 )
 
 // Placeholder returns the angle-bracket placeholder name shown in `?`
@@ -80,6 +86,8 @@ func (v ValueType) Placeholder() string {
 		return "<address>"
 	case ValueCIDR:
 		return "<address/prefix-length>"
+	case ValueCryptHash:
+		return "<crypt-hash>"
 	}
 	return ""
 }
