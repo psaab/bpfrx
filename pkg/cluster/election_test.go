@@ -167,6 +167,37 @@ func TestElection_SplitBrain_HigherNodeLoses(t *testing.T) {
 	}
 }
 
+// #1930 INC-2 r2 AGY Critical: a kernel-upgrade candidate boot sets an
+// unconditional election hold. Even ISOLATED (no peer) — where a normal node
+// auto-promotes to primary — the held node must stay SECONDARY until the
+// promotion gate verifies the dataplane. This is the case the prior
+// ForceSecondary fix missed (peerAlive=false at boot made it a no-op).
+func TestElection_KernelUpgradeHold_IsolatedStaysSecondary(t *testing.T) {
+	m := NewManager(0, 1)
+	m.SetKernelUpgradeHold() // candidate boot, before the cluster starts electing
+	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200}))
+	m.UpdateConfig(cfg)
+
+	// An ordinary isolated node would win the single-node election and be
+	// primary. The hold must keep it secondary even with no peer in sight.
+	if m.IsLocalPrimary(0) {
+		t.Fatal("kernel-upgrade hold must keep an isolated candidate SECONDARY")
+	}
+
+	// A peer timeout re-runs election; the hold must still keep us secondary
+	// (it is NOT auto-cleared the way ManualFailover is for an isolated node).
+	m.handlePeerTimeout()
+	if m.IsLocalPrimary(0) {
+		t.Fatal("kernel-upgrade hold must survive a re-election (not auto-cleared)")
+	}
+
+	// Clearing the hold (promote success / rejoin) lets it take its role.
+	m.ClearKernelUpgradeHold()
+	if !m.IsLocalPrimary(0) {
+		t.Fatal("after ClearKernelUpgradeHold the isolated node must become primary")
+	}
+}
+
 func TestElection_LocalWeightZero_BecomesSecondary(t *testing.T) {
 	m := NewManager(0, 1)
 	cfg := makeConfig(makeRG(0, true, map[int]int{0: 250}))

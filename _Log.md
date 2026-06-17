@@ -1,5 +1,28 @@
 # Action Log
 
+## 2026-06-16 — #1930 INC-2: AGY r2 candidate-preempt fix (/engineer)
+- **Timestamp**: 2026-06-16 UTC
+- **Action**: Fixed AGY r2 CRITICAL — the r1 candidate-preempt fix
+  (`ForceSecondary` at startup) was a no-op because `peerAlive` is false
+  before heartbeats start, leaving a kernel candidate election-eligible
+  at boot. Replaced with an unconditional `kernelUpgradeHold` election
+  flag honored in BOTH `electRG` (peer-aware) and `electSingleNode`
+  (isolated) paths — the isolated path was the real hole (a candidate
+  with no peer yet auto-promotes). Hold is set BEFORE `cluster.Start()`,
+  is NOT auto-cleared (unlike ManualFailover), cleared only by
+  promote/rejoin/revert. `ClearKernelUpgradeHold` re-elects via the same
+  peer-aware dispatch so an isolated cleared node promotes. Also
+  addressed AGY r2's long-hanging-roll TTL split-brain: self-recovery
+  now refuses to rejoin while the kernel journal is STILL ARMED even on
+  an expired lease (the promote/revert oneshot owns the resolution).
+  Documented the `/var/lib/xpf` persistence precondition + the three
+  candidate safety nets in docs/in-place-upgrade.md.
+- **File(s)**: pkg/cluster/election.go, pkg/cluster/manager.go,
+  pkg/cluster/kernel_selfrecover.go, pkg/cluster/election_test.go,
+  pkg/daemon/daemon_run.go, pkg/daemon/kernel_selfrecover.go,
+  pkg/upgrade/kernel_selfrecover.go,
+  pkg/upgrade/kernel_selfrecover_test.go, docs/in-place-upgrade.md
+
 ## 2026-06-16 — #1922 PR-1 (Item 1a): commit-confirmed service-mode rollback executor (/engineer)
 - **Timestamp**: 2026-06-16 UTC
 - **Action**: Made the commit-confirmed timeout rollback atomic and

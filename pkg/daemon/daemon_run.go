@@ -430,6 +430,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.cluster = cluster.NewManager(cc.NodeID, cc.ClusterID)
 		d.cluster.SetSoftwareVersion(d.opts.Version)
 		d.cluster.UpdateConfig(cc)
+
+		// #1930 INC-2: if THIS boot is a kernel-candidate trial (the kernel
+		// journal is ARMED), set the unconditional election hold BEFORE Start()
+		// so the candidate can never win an election (even isolated) until the
+		// promotion gate verifies the dataplane. ManualFailover is in-memory and
+		// lost across the reboot, and peerAlive is still false at this point, so
+		// the hold — not ForceSecondary — is what keeps an unverified candidate
+		// from preempting the healthy peer and blackholing traffic (r2 AGY
+		// Critical). No-op on an ordinary boot. MUST precede Start(): once the
+		// run loop starts, an election window opens.
+		d.holdSecondaryIfKernelCandidateArmed()
+
 		d.cluster.Start(ctx)
 		// Wire event-drop callback: on dropped cluster events, trigger
 		// immediate reconciliation so the safety net doesn't wait 2s.
@@ -439,13 +451,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 		// Watch cluster events for state transitions (primary/secondary).
 		go d.watchClusterEvents(ctx)
-
-		// #1930 INC-2: if THIS boot is a kernel-candidate trial (the kernel
-		// journal is ARMED), hold SECONDARY until the promotion gate verifies the
-		// dataplane — so an unverified candidate can't preempt the healthy peer
-		// and blackhole traffic (ManualFailover is in-memory, lost across the
-		// reboot). No-op on an ordinary boot.
-		d.drainIfKernelCandidateArmed(ctx)
 
 		// #1930 INC-2: bounded local self-recovery for the LANE-1 HA kernel
 		// channel — auto-rejoin if an external kernel-roll orchestrator crashed

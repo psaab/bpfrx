@@ -112,6 +112,53 @@ func TestSelfRecoveryExpiredLeaseDoesNotSuppress(t *testing.T) {
 	}
 }
 
+// A STILL-ARMED candidate is a trial in flight even if the lease expired (a
+// legitimately long-hanging roll that outran its TTL). Self-recovery must NOT
+// rejoin it — the promote/revert oneshot owns the resolution and the election
+// hold keeps it secondary (r2 AGY long-hanging-roll TTL split-brain).
+func TestSelfRecoveryArmedSuppressesEvenOnExpiredLease(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	cl := &fakeSRCluster{drained: true, peerOK: true}
+	sr := NewKernelSelfRecovery(SelfRecoveryConfig{
+		NodeID:    0,
+		LeasePath: filepath.Join(t.TempDir(), "kernel-roll.lease"),
+		Grace:     10 * time.Second,
+		Now:       func() time.Time { return now },
+		Armed:     func() (bool, error) { return true, nil }, // trial still in flight
+	}, cl)
+	writeLease(t, sr.cfg.LeasePath, KernelRollLease{NodeID: 0, ExpiresAt: now.Add(-time.Minute)})
+
+	_, _ = sr.Tick()
+	now = now.Add(11 * time.Second) // well past grace
+	if did, err := sr.Tick(); err != nil || did || cl.resets != 0 {
+		t.Fatalf("a STILL-ARMED candidate must NOT be self-recovered even with an "+
+			"expired lease (did=%v err=%v resets=%d)", did, err, cl.resets)
+	}
+}
+
+// When the candidate is NO LONGER armed (the trial resolved to promoted/reverted
+// but the orchestrator died before clearing the lease), the expired-lease path
+// still recovers an orphaned-drained node.
+func TestSelfRecoveryNotArmedExpiredLeaseRecovers(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	cl := &fakeSRCluster{drained: true, peerOK: true}
+	sr := NewKernelSelfRecovery(SelfRecoveryConfig{
+		NodeID:    0,
+		LeasePath: filepath.Join(t.TempDir(), "kernel-roll.lease"),
+		Grace:     10 * time.Second,
+		Now:       func() time.Time { return now },
+		Armed:     func() (bool, error) { return false, nil },
+	}, cl)
+	writeLease(t, sr.cfg.LeasePath, KernelRollLease{NodeID: 0, ExpiresAt: now.Add(-time.Minute)})
+
+	_, _ = sr.Tick()
+	now = now.Add(11 * time.Second)
+	if did, err := sr.Tick(); err != nil || !did || cl.resets != 1 {
+		t.Fatalf("not-armed + expired lease + drained + healthy peer must recover "+
+			"(did=%v err=%v resets=%d)", did, err, cl.resets)
+	}
+}
+
 // A lease naming the OTHER node is NOT our kernel roll -> we must NOT
 // self-recover off it (it is the peer's concern, not ours).
 func TestSelfRecoveryOtherNodeLeaseDoesNotRecover(t *testing.T) {

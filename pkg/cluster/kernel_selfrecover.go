@@ -43,10 +43,45 @@ func (m *Manager) PeerHealthyPrimary() bool {
 	return false
 }
 
+// SetKernelUpgradeHold holds this node SECONDARY in election unconditionally
+// (#1930 INC-2 — a kernel-upgrade candidate boot must not become primary until
+// the promotion gate verifies the dataplane). Unlike ManualFailover this is NOT
+// auto-cleared for an isolated node, so a candidate that cannot see the peer
+// still cannot blackhole traffic by claiming primary (r2 AGY Critical). Set it
+// BEFORE Start() on a candidate boot. Idempotent.
+func (m *Manager) SetKernelUpgradeHold() {
+	m.mu.Lock()
+	m.kernelUpgradeHold = true
+	m.mu.Unlock()
+}
+
+// ClearKernelUpgradeHold releases the kernel-upgrade election hold and re-runs
+// election so the node can take its normal role. Called on promote success
+// (the candidate is verified) and on revert (the node is rebooting to known-good
+// anyway). Also implied by ResetAllFailover so the rejoin path clears it.
+func (m *Manager) ClearKernelUpgradeHold() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.kernelUpgradeHold {
+		m.kernelUpgradeHold = false
+		// Re-elect with the same peer-aware dispatch the rest of the manager
+		// uses: an isolated cleared node (peerAlive=false) must go through the
+		// single-node path to claim primary; runElection alone would not promote
+		// it. Both require m.mu held (we hold it).
+		if m.peerAlive {
+			m.runElection()
+		} else {
+			m.electSingleNode()
+		}
+	}
+}
+
 // ResetAllFailover clears manual failover on every redundancy group (rejoin as
 // eligible; the election + VRRP preempt rules then decide primary). Used by the
 // kernel self-recovery when an orchestrator crash left this node orphaned-drained.
+// It also clears any kernel-upgrade election hold (the rejoin path).
 func (m *Manager) ResetAllFailover() error {
+	m.ClearKernelUpgradeHold()
 	m.mu.RLock()
 	ids := make([]int, 0, len(m.groups))
 	for id := range m.groups {

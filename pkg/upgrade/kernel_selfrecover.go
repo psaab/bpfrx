@@ -76,6 +76,15 @@ type SelfRecoveryConfig struct {
 	Now func() time.Time
 	// Logf is an optional progress sink.
 	Logf func(format string, args ...any)
+	// Armed reports whether a kernel candidate is STILL armed on this node
+	// (journal state >= ARMED and not yet PROMOTED/REVERTED). When it returns
+	// true a candidate trial is genuinely in flight — the promotion oneshot will
+	// resolve it to PROMOTED or REVERTED — so self-recovery MUST NOT rejoin the
+	// node even if the orchestrator's lease has expired (r2 AGY: a legitimately
+	// long-hanging roll whose lease TTL elapsed would otherwise be torn back into
+	// the election as an unverified candidate -> split-brain). Optional; if nil,
+	// self-recovery does not gate on armed state (tests / non-kernel callers).
+	Armed func() (bool, error)
 }
 
 func (c *SelfRecoveryConfig) withDefaults() {
@@ -165,6 +174,25 @@ func (s *KernelSelfRecovery) Tick() (bool, error) {
 	if st != leaseExpiredOurs {
 		s.drainedSince = time.Time{}
 		return false, nil
+	}
+
+	// A still-ARMED journal means a candidate trial is genuinely in flight (the
+	// promotion oneshot will drive it to PROMOTED or REVERTED), regardless of how
+	// long it has taken — an expired orchestrator lease does NOT make it safe to
+	// rejoin (r2 AGY long-hanging-roll TTL split-brain). Refuse self-recovery
+	// while armed; the bounded promote/revert path owns the resolution. The
+	// election hold (kernelUpgradeHold) keeps the node SECONDARY meanwhile.
+	if s.cfg.Armed != nil {
+		armed, err := s.cfg.Armed()
+		if err != nil {
+			return false, fmt.Errorf("kernel self-recovery: armed check: %w", err)
+		}
+		if armed {
+			s.drainedSince = time.Time{}
+			s.cfg.Logf("kernel self-recovery: lease expired but a candidate is STILL ARMED; " +
+				"a trial is in flight (promote/revert owns it) -> NOT recovering")
+			return false, nil
+		}
 	}
 
 	drained, err := s.cl.LocalDrained()

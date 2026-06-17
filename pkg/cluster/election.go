@@ -39,6 +39,17 @@ func (m *Manager) electRG(rg *RedundancyGroupState, peerGroup *PeerGroupState) (
 		return electNoChange, ""
 	}
 
+	// #1930 INC-2: a node booted as a kernel-upgrade CANDIDATE holds SECONDARY
+	// unconditionally until the promotion gate verifies the dataplane. Unlike
+	// ManualFailover (which the isolated-node path below auto-clears after 2s so
+	// a lone node can reclaim primary), this hold is NOT auto-cleared — a
+	// candidate with a broken dataplane must NEVER become primary even if it
+	// can't see the peer, or it would blackhole traffic (r2 AGY Critical). It is
+	// cleared only by promote/rejoin/revert (KernelUpgradeHoldClear).
+	if m.kernelUpgradeHold {
+		return electNoChange, ""
+	}
+
 	clearedManualFailover := false
 
 	// ManualFailover normally blocks election (stays secondary-hold until
@@ -285,6 +296,15 @@ func (m *Manager) runElection() {
 // stay secondary and wait for the heartbeat timeout to confirm the peer
 // is truly absent before claiming primary.
 func (m *Manager) electSingleNode() {
+	// #1930 INC-2 r2 AGY Critical: a kernel-upgrade candidate boot holds
+	// SECONDARY unconditionally — and the single-node path is exactly where an
+	// isolated candidate would otherwise auto-promote (no peer to hold it back).
+	// The hold is NOT auto-cleared (unlike ManualFailover), so an isolated
+	// candidate with a broken dataplane never claims primary. Cleared only by
+	// promote/rejoin/revert.
+	if m.kernelUpgradeHold {
+		return
+	}
 	for _, rg := range m.groups {
 		if rg.State == StateDisabled || rg.ManualFailover {
 			continue

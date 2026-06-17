@@ -18,17 +18,21 @@ func (a kernelSRCluster) LocalDrained() (bool, error)       { return a.m.LocalDr
 func (a kernelSRCluster) PeerHealthyPrimary() (bool, error) { return a.m.PeerHealthyPrimary(), nil }
 func (a kernelSRCluster) ResetFailover() error              { return a.m.ResetAllFailover() }
 
-// drainIfKernelCandidateArmed keeps a CANDIDATE-TRIAL boot DRAINED until the
-// promotion gate verifies the dataplane (r2 AGY Critical). ManualFailover is
-// in-memory in the cluster Manager and is lost across the reboot, so a candidate
-// node boots election-eligible and — under preempt — could claim primary BEFORE
-// xpf-kernel-promote.service has run verify-dataplane + the forward beacon. If
-// the candidate's shim is verifier-rejected, that would blackhole cluster
-// traffic. So: at startup, if the kernel journal shows an ARMED candidate (this
-// IS the trial boot), ForceSecondary so the node stays secondary until promote
-// (on PASS the orchestrator's `rejoin` / the promote path restores it; on a
-// REVERT the node reboots to known-good anyway). No-op on an ordinary boot.
-func (d *Daemon) drainIfKernelCandidateArmed(ctx context.Context) {
+// holdSecondaryIfKernelCandidateArmed keeps a CANDIDATE-TRIAL boot SECONDARY
+// until the promotion gate verifies the dataplane (r2 AGY Critical). The drain
+// the orchestrator set is in-memory ManualFailover, lost across the reboot, so a
+// candidate node boots election-eligible and — under preempt, OR via the
+// isolated-node auto-promote path if it can't see the peer — could claim primary
+// BEFORE xpf-kernel-promote.service runs verify-dataplane + the forward beacon.
+// A verifier-rejected candidate claiming primary would blackhole cluster traffic.
+//
+// FIX (r2 AGY: the prior ForceSecondary-at-startup was a no-op because peerAlive
+// is still false before heartbeats start): set the UNCONDITIONAL
+// kernelUpgradeHold flag — which election honors regardless of peer state and
+// does NOT auto-clear for an isolated node — and do it BEFORE cluster.Start so
+// there is no election window. The hold is cleared by promote (verified) /
+// rejoin / revert. No-op on an ordinary boot.
+func (d *Daemon) holdSecondaryIfKernelCandidateArmed() {
 	if d.cluster == nil {
 		return
 	}
@@ -40,20 +44,9 @@ func (d *Daemon) drainIfKernelCandidateArmed(ctx context.Context) {
 	if err != nil || !armed {
 		return
 	}
-	// Only hold-secondary if the peer can actually take over; otherwise forcing
-	// secondary would strand traffic (no primary). If the peer is not ready we
-	// leave election to run — the promote gate still reverts a bad candidate.
-	if !d.cluster.PeerHealthyPrimary() {
-		slog.Warn("kernel-candidate boot: peer not a healthy primary; "+
-			"NOT holding secondary (promote gate still guards)", "candidate", j.CandidateVersion)
-		return
-	}
-	if err := d.cluster.ForceSecondary(); err != nil {
-		slog.Warn("kernel-candidate boot: could not hold secondary", "err", err)
-		return
-	}
-	slog.Info("kernel-candidate boot: holding SECONDARY until promotion verifies the dataplane",
-		"candidate", j.CandidateVersion)
+	d.cluster.SetKernelUpgradeHold()
+	slog.Info("kernel-candidate boot: holding SECONDARY (election hold) until promotion "+
+		"verifies the dataplane", "candidate", j.CandidateVersion)
 }
 
 // startKernelSelfRecovery runs the bounded local self-recovery loop for the
@@ -73,6 +66,16 @@ func (d *Daemon) startKernelSelfRecovery(ctx context.Context) {
 	sr := upgrade.NewKernelSelfRecovery(upgrade.SelfRecoveryConfig{
 		NodeID: d.cluster.NodeID(),
 		Logf:   func(f string, a ...any) { slog.Info("kernel-self-recovery", "msg", fmt.Sprintf(f, a...)) },
+		// Refuse self-recovery while a candidate trial is still ARMED — even if
+		// the orchestrator lease expired (r2 AGY long-hanging-roll TTL split-brain).
+		Armed: func() (bool, error) {
+			r, err := upgrade.NewKernelRunner(upgrade.KernelConfig{Sys: upgrade.NewKernelSystem()})
+			if err != nil {
+				return false, err
+			}
+			armed, _, err := r.IsArmed()
+			return armed, err
+		},
 	}, kernelSRCluster{m: d.cluster})
 
 	go func() {
