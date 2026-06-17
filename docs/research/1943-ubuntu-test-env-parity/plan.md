@@ -2,7 +2,9 @@
 
 - **Issue:** #1943 — Test env drift: standalone test VM is Debian 13 but
   production is Ubuntu 26.04.
-- **Revision:** r2 (addresses AGY r1 + Claude SMR r1; Codex r1 pending fold-in)
+- **Revision:** r3 (editorial-consistency pass over r2 — resolves Codex r2's two
+  stale-text STILL-OPENs + the version-exact package-name inconsistency; folds
+  AGY r2 NEW-2/NEW-3 implementation notes)
 - **Branch:** `research/1943-ubuntu-test-env-parity`
 - **Scope class:** TEST-ENV / TOOLING only. No production source code is touched.
 - **Skill:** `/research` — STOP at PLAN-READY. No PR, no implementation.
@@ -32,8 +34,9 @@ pin `linux-image-amd64`/`linux-headers-amd64` to `a=unstable` at priority 990,
 `apt install`, then reboot into the new kernel.
 
 This drift is what bit #1930: the A4 verify-gated kernel boot channel
-(Secure-Boot shim→grub→MOK chain, A/B ESP slots, `grub-reboot` one-shot promote
-/rollback) **could not be validated on the Debian-13 test VM** — it had to be
+(Secure-Boot shim→grub→MOK chain, A/B ESP slots, `efibootmgr --bootnext`
+one-shot promote/rollback — see §6.4 for the mechanism, NOT `grub-reboot`)
+**could not be validated on the Debian-13 test VM** — it had to be
 exercised on a one-off Ubuntu 26.04 UEFI VM stood up by hand. The production
 boot path lives in `scripts/image/{grub.d/09_xpf, xpf-uefi-slots,
 xpf-kernel-promote*}` and is Ubuntu/shim-specific; the Debian test VM cannot
@@ -51,8 +54,10 @@ faithfully reproduce it.
    satisfies the >= 6.18 floor** (verified, not assumed), with a hard floor
    assertion retained so the VM fails loudly if the base ever ships < 6.18.
 3. Package install lines use **Ubuntu package names** (delta vs Debian:
-   `linux-image-amd64`/`linux-headers-amd64` → `linux-generic`/
-   `linux-headers-generic`; `golang` availability; everything else identical).
+   `linux-headers-amd64` → `linux-headers-$(uname -r)`, ADD
+   `linux-modules-extra-$(uname -r)`, `linux-perf` → `linux-tools-$(uname -r)`,
+   `host` → `bind9-host`, drop `golang`; everything else identical — full list
+   in §6.3).
 4. `CLAUDE.md` "Test Environment (Incus VM)" + the `make test-vm` comment +
    any Debian-13 references are updated to Ubuntu 26.04.
 5. A **UEFI Secure-Boot-capable** standalone test VM profile exists, so #1930
@@ -97,7 +102,7 @@ the chosen kernel path follows the measurement, not the assumption.
 
 | File | Change |
 |------|--------|
-| `test/incus/setup.sh` | env-overridable `IMAGE_VM/IMAGE_CT` → Ubuntu 26.04; pkg renames (+`linux-modules-extra-generic`, `linux-tools-generic`, `bind9-host`; −`golang`); drop kernel-install dance but KEEP grub-apply reboot; `security.secureboot` in `xpf-vm` profile; optional `XPF_BASE_IMAGE`/baked-qcow2 path for A4 |
+| `test/incus/setup.sh` | env-overridable `IMAGE_VM/IMAGE_CT` → Ubuntu 26.04; pkg renames (+`linux-modules-extra-$(uname -r)`, `linux-headers-$(uname -r)`, `linux-tools-$(uname -r)`, `bind9-host`; −`golang`); drop kernel-install dance but KEEP grub-apply reboot; `security.secureboot` in `xpf-vm` profile; optional `XPF_BASE_IMAGE`/baked-qcow2 path for A4 |
 | `test/incus/cluster-setup.sh` | same image + pkg + kernel changes (if C1 — Path-C §7); already uses `${IMAGE_VM:-…}` pattern |
 | `CLAUDE.md` | "Test Environment (Incus VM)" section + line 69 + any Debian-13 refs → Ubuntu 26.04 + `XPF_BASE_RELEASE` pin + SB note |
 | `docs/install-images.md` | (optional) cross-link the baked-image test-VM path for A4 validation |
@@ -168,19 +173,37 @@ doesn't fight an override), so default to it.
 
 ### 6.3 Package names (setup.sh:281, cluster-setup.sh:459)
 Delta Debian→Ubuntu for the test-tooling install line:
-- `linux-image-amd64 linux-headers-amd64` → `linux-headers-generic` (headers
-  for the running `-generic` kernel; the image already has the kernel).
-- **ADD `linux-modules-extra-generic`** (AGY r1 #1 — HIGH). Ubuntu splits NIC
-  drivers (`mlx5_core`, `i40e`, `ixgbe`) into `linux-modules-extra`, NOT the
-  base kernel package. Both test envs need physical PCI passthrough
-  (`setup.sh` WAN/loss PF) or SR-IOV VFs (`cluster-setup.sh` mlx5 VFs). Without
-  `linux-modules-extra`, those interfaces never bind → total test failure.
-  bake.py already HARD-ASSERTS this dir exists (`bake.py:227-228`,
-  `…/drivers/net/ethernet/mellanox`); the test VM must install the package the
-  baked image gets via `linux-generic`. Mirror bake.py's assertion as a
-  provisioning check.
-- `linux-perf` → `linux-tools-generic` (the Ubuntu equivalent for the running
-  kernel; `linux-perf` is Debian-only).
+- `linux-image-amd64 linux-headers-amd64` → `linux-headers-$(uname -r)`
+  (version-exact headers for the stock image kernel; the image already has the
+  kernel — see the version-exact rationale below and AGY r2 NEW-3).
+- **kernel-package version policy (AGY r2 NEW-2/NEW-3 — implementation note):**
+  pin ALL three kernel-adjacent packages (`linux-headers`, `linux-tools`,
+  `linux-modules-extra`) to `$(uname -r)` so they match the booted stock image
+  kernel — otherwise `perf` (tools) version-mismatches `uname -r`, and the
+  `-generic` metapackages would pull a *newer* kernel. **Footgun:** version-exact
+  pins can fail `apt-get` if that exact point release was retired from the
+  updates/security mirror between image build and provisioning. Mitigation
+  options for /engineer (pick at impl): (a) install version-exact and accept the
+  rare retire-window failure (re-run picks a fresh image), or (b) if the probe
+  shows the metapackages do NOT advance past the stock kernel on this stream,
+  use the `-generic` metapackages + the §8 single-kernel assertion. The
+  version-exact form is the safer default for the "ship exactly one kernel"
+  invariant bake.py enforces.
+- **ADD `linux-modules-extra-$(uname -r)`** (AGY r1 #1 + Codex r1 #2 — HIGH;
+  SMR r2 N4 refines the exact name). Ubuntu splits NIC drivers (`mlx5_core`,
+  `i40e`, `ixgbe`) into `linux-modules-extra`, NOT the base kernel package.
+  Both test envs need physical PCI passthrough (`setup.sh` WAN/loss PF) or
+  SR-IOV VFs (`cluster-setup.sh` mlx5 VFs). Without it those interfaces never
+  bind → total test failure. **Use the version-exact
+  `linux-modules-extra-$(uname -r)`, NOT the `-generic` metapackage:** the test
+  VM boots the *stock image* kernel, and `linux-modules-extra-generic` could
+  pull a NEWER kernel + its modules, re-introducing the multi-kernel situation
+  bake.py works hard to prevent (`bake.py:243-250` purges all-but-newest and
+  hard-asserts exactly one kernel). Mirror bake.py's driver-dir assertion
+  (`bake.py:227-228`, `…/drivers/net/ethernet/mellanox`) as a provisioning
+  check (§8 step-3).
+- `linux-perf` → `linux-tools-$(uname -r)` (the Ubuntu equivalent, version-exact
+  so `perf` matches the running kernel; `linux-perf` is Debian-only).
 - **DROP `golang`** (AGY r1 #5 + SMR F5). The VM never compiles Go — `make
   build` runs on the HOST and `test-deploy` pushes the binary
   (`setup.sh:376-401`). `golang` is ~500 MB of pure provisioning waste. Also
@@ -199,8 +222,9 @@ Delta Debian→Ubuntu for the test-tooling install line:
 - **Validation (MANDATORY before merge, Codex r1 #3):** §8 step-2 runs
   `apt-get install --simulate` against the **exact full standalone list AND the
   exact full cluster list** on the probe VM — not a spot-check. Every rename
-  (`linux-headers-generic`, `linux-modules-extra-generic`, `linux-tools-generic`,
-  `bind9-host`, golang dropped) is confirmed to resolve. Do not assume any name.
+  (`linux-headers-$(uname -r)`, `linux-modules-extra-$(uname -r)`,
+  `linux-tools-$(uname -r)`, `bind9-host`, golang dropped) is confirmed to
+  resolve. Do not assume any name.
 
 ### 6.4 UEFI Secure-Boot profile + the A4 substrate reality (revised r2)
 
@@ -233,9 +257,12 @@ So the secureboot work splits into two distinct deliverables:
 1. **SB on the default/standalone VM** (`security.secureboot` explicit in the
    `xpf-vm` profile) — proves shim→grub→kernel + AF_XDP-shim-under-SB. Cheap,
    prod-faithful posture. This is Path-SB1.
-2. **A baked-image boot-path VM** (Path V2) — `incus image import` the
-   `bake.py` output qcow2, launch it, and exercise the real A4
-   BootNext promote/rollback. This is the only thing that actually closes the
+2. **A baked-image boot-path VM** (Path V2) — `incus image import
+   <metadata.tar.gz> <qcow2>` of the `bake.py` output (incus VM import needs
+   BOTH the `*.incus-metadata.tar.gz` tarball and the qcow2 —
+   `docs/install-images.md:17,131`; bake.py already produces both), launch it,
+   and exercise the real A4 BootNext promote/rollback. This is the only thing
+   that actually closes the
    #1930 "validate A4 in-lab" gap. Document it as `make test-vm-baked` (or a
    `XPF_BAKED_IMAGE=<path>` toggle in setup.sh).
 
@@ -309,8 +336,10 @@ Decision on profile shape: Path-SB1 (single SB-on profile) — see §7.
   title implies and avoids "fixed standalone, cluster still drifts."
   Risk: the loss cluster is the smoke-gating env; a botched cluster realign
   blocks all smoke. Mitigation: land standalone first, validate, then cluster
-  as a separate reviewed increment; keep `IMAGE_VM` env-overridable so a
-  rollback to `images:debian/13` is a one-liner.
+  as a separate reviewed increment; rolling-replace one node at a time to keep
+  HA up during the swap. Rollback is `git revert` of the cluster increment
+  (NOT a runtime env-override — Debian package names + the 6.18 floor make a
+  `images:debian/13` re-launch fail; see §10).
 - **C2: standalone only (minimum to close #1943).** The issue body is
   explicitly scoped to the standalone VM. Cluster realign could be a follow-up
   issue. Lower blast radius, but leaves known drift.
@@ -335,12 +364,13 @@ Decision on profile shape: Path-SB1 (single SB-on profile) — see §7.
 1. **Kernel probe (GATE):** `incus launch images:ubuntu/26.04/cloud probe --vm`
    → `uname -r` >= 6.18? Records the K-path decision (K1 vs K2).
 2. **Package probe:** dry `apt-get install --simulate` the full REVISED tooling
-   list (with `linux-headers-generic`, `linux-modules-extra-generic`,
-   `linux-tools-generic`, golang dropped) on the probe VM; confirm every name
-   resolves. Adjust §6.3 names per result.
+   list (with `linux-headers-$(uname -r)`, `linux-modules-extra-$(uname -r)`,
+   `linux-tools-$(uname -r)`, golang dropped) on the probe VM; confirm every
+   name resolves (also catches the AGY r2 NEW-2 mirror-retire-window risk).
+   Adjust §6.3 names per result.
 3. **NIC-driver probe (GATE for SR-IOV/passthrough):** confirm
    `/lib/modules/$(uname -r)/kernel/drivers/net/ethernet/{mellanox,intel}`
-   exist after installing `linux-modules-extra-generic` (mirror
+   exist after installing `linux-modules-extra-$(uname -r)` (mirror
    `bake.py:227-228`). Without this both test envs fail to bring up dataplane
    NICs.
 4. **init_on_alloc verify:** after the grub.d drop-in + reboot, confirm
@@ -359,7 +389,7 @@ Decision on profile shape: Path-SB1 (single SB-on profile) — see §7.
    independently confirms SB does not block XDP-type BPF). If anything breaks,
    fall back to Path-SB2 (toggle, default-off).
 8. **A4 boot-path validation (the real #1930 payoff — requires Path V2):**
-   `bake.py` → `incus image import` the qcow2 → launch → confirm
+   `bake.py` → `incus image import <metadata.tar.gz> <qcow2>` → launch → confirm
    `xpf-uefi-slots` registered both A/B slots, then exercise A4: arm
    `efibootmgr --bootnext <inactive>` for a candidate kernel → reboot → confirm
    firmware booted the candidate and cleared BootNext → promote-on-success;
@@ -381,7 +411,7 @@ Decision on profile shape: Path-SB1 (single SB-on profile) — see §7.
 | Risk | Severity | Mitigation |
 |------|----------|------------|
 | `images:ubuntu/26.04` stream ships kernel < 6.18 | High (blocks shim) | §4 GATE probe before deleting dance; Path-K2 fallback |
-| **`linux-modules-extra` missing → mlx5/i40e NICs never bind → total test failure** | **High** | §6.3 ADD `linux-modules-extra-generic`; §8 step-3 driver-dir assert mirroring `bake.py:227` (AGY r1 #1, Codex r1 #2) |
+| **`linux-modules-extra` missing → mlx5/i40e NICs never bind → total test failure** | **High** | §6.3 ADD `linux-modules-extra-$(uname -r)`; §8 step-3 driver-dir assert mirroring `bake.py:227` (AGY r1 #1, Codex r1 #2) |
 | Package name deltas break provisioning (`golang`, `linux-perf`, `host`) | Med | §6.3 renames + drop golang; §8 step-2 simulate the FULL standalone+cluster lists (AGY #5, Codex #3) |
 | `init_on_alloc=0` inactive — dropped reboot OR cloudimg override | Med | keep a post-grub reboot (AGY #2); grub.d drop-in form; §8 step-4 verify `/proc/cmdline` on the actual V1 stream (SMR F1) |
 | Cluster realign breaks smoke-gating env | High | C1 as separate post-standalone increment; recreate (not deploy) under cluster lock + rolling replace (Codex #5) |
@@ -398,8 +428,8 @@ artifact, no shipped image, no deploy path changes).
 
 **Rollback is `git revert` of the setup-script + CLAUDE.md diff — NOT a runtime
 env-override (r1 fallacy, AGY #3 + SMR).** Once the scripts carry Ubuntu package
-names (`linux-headers-generic`, `linux-modules-extra-generic`,
-`linux-tools-generic`) and drop the Debian-unstable kernel dance,
+names (`linux-headers-$(uname -r)`, `linux-modules-extra-$(uname -r)`,
+`linux-tools-$(uname -r)`) and drop the Debian-unstable kernel dance,
 `IMAGE_VM=images:debian/13 make test-vm` would FAIL: those package names don't
 exist on Debian, and Debian 13's stock kernel is < 6.18 so the AF_XDP shim
 verifier floor (`pkg/dataplane/verify_userspace_shim.go`) rejects the dataplane.
@@ -426,8 +456,9 @@ Debian in test). `git revert` of the tooling commit is the rollback.
 + mitigated above, are: (a) **`linux-modules-extra` omission** (would silently
 break SR-IOV/passthrough NICs — the highest-impact finding); (b) the
 linuxcontainers kernel-stream floor (probe-gated); (c) package renames
-(`linux-headers/tools-generic`, `bind9-host`, drop `golang`) verified by a
-full simulate; (d) keep a reboot so `init_on_alloc=0` actually applies; (e) the
+(version-exact `linux-headers/tools/modules-extra-$(uname -r)`, `bind9-host`,
+drop `golang`) verified by a full simulate; (d) keep a reboot so
+`init_on_alloc=0` actually applies; (e) the
 grub.d override quirk; (f) A4 validation needs the **baked image (V2)**, not a
 vanilla SB cloud VM; (g) rollback is `git revert`, not a runtime env-override.
 
@@ -441,13 +472,25 @@ vanilla SB cloud VM; (g) rollback is `git revert`, not a runtime env-override.
 | r1 | AGY (adversarial-review-mqhsj7h5-33m3ob) | PLAN-NEEDS-WORK — 5 findings (modules-extra, reboot, rollback fallacy, EFI varstore lifecycle, drop golang) |
 | r1 | Claude SMR | PLAN-NEEDS-WORK (minor) — 6 findings (grub-stream probe, V1-fidelity wording, SB+lockdown, destroy-path, vestigial toolchain, pin-drift) |
 
-**r2 resolves all of the above.** Convergent themes across all three reviewers:
-(1) `linux-modules-extra` is mandatory (AGY+Codex independently); (2) keep a
-reboot for the grub change (AGY+Codex); (3) rollback is git-revert not
-env-override (AGY+Codex); (4) A4 needs the baked substrate + the mechanism is
-`efibootmgr BootNext` not `grub-reboot` (Codex+SMR); (5) drop `golang`
-(AGY+SMR). No reviewer recommended PLAN-KILL — all three judged the direction
-correct and the issue worth doing.
+| r2 | Codex (gpt-5.5, xhigh) | PLAN-NEEDS-WORK — 4 of 6 RESOLVED; 2 STILL-OPEN were stale wording only (§1 grub-reboot string, Path-C rollback line) + 1 new package-name inconsistency (`-generic` vs `-$(uname -r)`). NOT a kill — "direction is right." |
+| r2 | AGY (adversarial-review-mqhsx10w-x4r3qi) | **PLAN-READY** — all 5 r1 RESOLVED; 3 minor NEW (same naming inconsistency NEW-1; NEW-2 mirror-retire-window; NEW-3 perf tools version-match) folded as impl notes |
+| r2 | Claude SMR | **PLAN-READY** — all 6 r1 RESOLVED; new-issue hunt found only impl-notes (N4 version-exact modules-extra name) |
 
-r2 re-review dispatched after this revision; convergence verdicts recorded in
-`reviewer-ids.md` and the issue comment.
+**r1 convergence:** no PLAN-KILL — all three judged the direction correct.
+Dominant shared findings: `linux-modules-extra` mandatory (AGY+Codex), keep a
+reboot (AGY+Codex), rollback=git-revert (AGY+Codex), A4 needs the baked
+substrate + `efibootmgr BootNext` not `grub-reboot` (Codex+SMR), drop `golang`
+(AGY+SMR).
+
+**r2 → r3:** AGY and Claude SMR both returned PLAN-READY on r2. Codex's r2
+PLAN-NEEDS-WORK was three EDITORIAL items only (two stale-text leftovers it
+itself confirmed are "fixed later," plus the `-generic`/`-$(uname -r)`
+inconsistency I introduced) — no architectural objection. r3 (this revision)
+scrubs all three: §1 now says `efibootmgr --bootnext`, Path-C rollback now says
+`git revert`, and every kernel-package reference is version-exact
+`-$(uname -r)` consistently. AGY r2 NEW-2/NEW-3 (mirror-retire-window +
+perf-tools version-match) folded into §6.3 as implementation notes.
+
+**Net standing at r3:** AGY PLAN-READY, Claude SMR PLAN-READY, Codex's only
+open items were the three editorial fixes now applied. No reviewer raised an
+architectural blocker on any round. Converged.
