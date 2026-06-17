@@ -358,9 +358,13 @@ func TestKeepaliveStatusNotBlockedByNetlink(t *testing.T) {
 	tm := &tunnelManager{ops: ops}
 	state, gen := newKAState(true, 1, 1)
 	// Register the runner in the manager so GetKeepaliveState finds it.
+	// Setup mutates manager state guarded by mu in production, so hold mu
+	// for the setup block (Copilot PR #1947 r4 — test/contract alignment).
+	tm.mu.Lock()
 	tm.ensureReconcileStateLocked()
 	tm.keepalives["gr0"] = &keepaliveRunner{state: state, remote: state.RemoteAddr}
 	tm.tunnels = []string{"gr0"}
+	tm.mu.Unlock()
 
 	prober := &fakeProber{results: []probeOutcome{{result: ProbeDead, kind: UnsupportedNone}}}
 
@@ -424,6 +428,10 @@ func TestApplyTransientLookupKeepsRunner(t *testing.T) {
 	ops := newKaOps()
 	ops.byNameErr = errors.New("transient netlink transport error") // NOT a LinkNotFound
 	tm := &tunnelManager{ops: ops, vrfBinder: noopVRFBinder{}}
+	// applyKernelTunnelLocked + the helpers below all require mu held in
+	// production; hold it for the whole body (Copilot PR #1947 r4).
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
 	tm.ensureReconcileStateLocked()
 
 	// Seed a live keepalive runner + its generation token.
@@ -460,10 +468,14 @@ func TestApplyTransientLookupKeepsRunner(t *testing.T) {
 func TestKeepaliveUnknownReasonSurfacedInStatus(t *testing.T) {
 	ops := newKaOps()
 	tm := &tunnelManager{ops: ops}
+	// Setup mutates mu-guarded state (Copilot PR #1947 r4); GetStatus later
+	// takes mu, so lock only the setup block, not the read.
+	tm.mu.Lock()
 	tm.ensureReconcileStateLocked()
 	state, gen := newKAState(true, 3, 1)
 	tm.keepalives["gr0"] = &keepaliveRunner{state: state, remote: state.RemoteAddr}
 	tm.tunnels = []string{"gr0"}
+	tm.mu.Unlock()
 
 	// A transient unsupported with a concrete reason.
 	prober := &fakeProber{results: []probeOutcome{{
@@ -493,8 +505,10 @@ func TestKeepaliveUnknownReasonSurfacedInStatus(t *testing.T) {
 
 	// A structural unsupported with a reason → reason shown too.
 	state2, gen2 := newKAState(true, 3, 1)
+	tm.mu.Lock()
 	tm.keepalives["gr1"] = &keepaliveRunner{state: state2, remote: state2.RemoteAddr}
 	tm.tunnels = append(tm.tunnels, "gr1")
+	tm.mu.Unlock()
 	prober2 := &fakeProber{results: []probeOutcome{{
 		result: ProbeUnsupported, kind: UnsupportedStructural,
 		reason: "listen udp4 198.51.100.99: cannot assign requested address",
@@ -515,6 +529,10 @@ func TestApplyRecreateDelFailRestartsKeepalive(t *testing.T) {
 	ops := newKaOps()
 	ops.delErr = errors.New("transient LinkDel failure") // recreate aborts
 	tm := &tunnelManager{ops: ops, vrfBinder: noopVRFBinder{}}
+	// applyKernelTunnelLocked + stopKeepaliveLocked require mu in
+	// production; hold it for the whole body (Copilot PR #1947 r4).
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
 	tm.ensureReconcileStateLocked()
 
 	// Seed a live keepalive runner. LinkByName returns a *netlink.Dummy,
