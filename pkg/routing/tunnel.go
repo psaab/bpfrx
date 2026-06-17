@@ -299,12 +299,19 @@ func (t *tunnelManager) Apply(tunnels []*config.TunnelConfig) error {
 			// as a persistent WireGuard tunnel by the apply loop below. WG
 			// links are intentionally untracked in ownedNames and must NEVER
 			// be torn by the removal diff (#1432 S2a). Hand off WITHOUT
-			// deleting AND WITHOUT retaining ownership — retaining would
-			// leave the active WG link in ownedNames and let a later Apply
-			// LinkDel it (Codex r3 inverse-handoff hole). Drop the GRE/anchor
-			// tracking; applyWireguardTunLocked repopulates appliedAddrs.
+			// deleting the link AND WITHOUT retaining ownedNames — retaining
+			// would leave the active WG link in ownedNames and let a later
+			// Apply LinkDel it (Codex r3 inverse-handoff hole).
+			//
+			// PRESERVE appliedAddrs (Codex r4): applyWireguardTunLocked's
+			// reconcile needs the applied set to gate LINK-LOCAL deletion —
+			// a configured fe80 this manager applied as the anchor must be
+			// deletable by the WG reconcile (it is absent from the new WG
+			// desired set), not re-classified as foreign and leaked. This
+			// mirrors the forward WG→non-WG handoff, which also keeps
+			// appliedAddrs. Drop only appliedRI: the GRE/anchor VRF claim is
+			// no longer valid (WG binds VRF directly, never via appliedRI).
 			t.stopKeepaliveLocked(name)
-			delete(t.appliedAddrs, name)
 			delete(t.appliedRI, name)
 			continue
 		}

@@ -797,10 +797,14 @@ func TestNonWGToWireguardSameNameNoOwnedRetention(t *testing.T) {
 	run := func(t *testing.T, inject func(ops *fakeLinkOps)) {
 		ops := newFakeLinkOps()
 		tm, _ := newReconcileManager(ops)
-		// Start as a non-WG anchor (tracked in ownedNames).
-		if err := tm.Apply([]*config.TunnelConfig{anchorTC("wg0", "10.1.1.1/24")}); err != nil {
+		// Start as a non-WG anchor with a CONFIGURED fe80 (tracked in both
+		// ownedNames and appliedAddrs link-local ownership).
+		if err := tm.Apply([]*config.TunnelConfig{anchorTC("wg0", "10.1.1.1/24", "fe80::a/64")}); err != nil {
 			t.Fatalf("Apply 1 (anchor): %v", err)
 		}
+		// Plus a kernel autoconf fe80 that must always survive.
+		kernelLL, _ := netlink.ParseAddr("fe80::5054:ff:fe99:1/64")
+		ops.addrs["wg0"] = append(ops.addrs["wg0"], *kernelLL)
 		tm.mu.Lock()
 		owned := tm.ownedNames["wg0"]
 		tm.mu.Unlock()
@@ -808,9 +812,18 @@ func TestNonWGToWireguardSameNameNoOwnedRetention(t *testing.T) {
 			t.Fatal("anchor not tracked in ownedNames")
 		}
 		inject(ops)
-		// Transition the SAME name to WireGuard.
+		// Transition the SAME name to WireGuard (new addr, old fe80 dropped).
 		if err := tm.Apply([]*config.TunnelConfig{wgTC("172.16.0.1/30")}); err != nil {
 			t.Fatalf("Apply 2 (transition to WG): %v", err)
+		}
+		// The configured anchor fe80 must be pruned by the WG reconcile — its
+		// applied-ownership must survive the handoff (Codex r4); the kernel
+		// autoconf fe80 must survive.
+		if ops.hasAddr("wg0", "fe80::a/64") {
+			t.Fatal("configured anchor fe80 leaked across non-WG→WG handoff (appliedAddrs ownership dropped — Codex r4)")
+		}
+		if !ops.hasAddr("wg0", "fe80::5054:ff:fe99:1/64") {
+			t.Fatal("kernel autoconf fe80 wrongly deleted across transition")
 		}
 		// The name must be handed off: NOT retained in ownedNames.
 		tm.mu.Lock()
