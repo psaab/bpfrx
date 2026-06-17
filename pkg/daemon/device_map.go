@@ -55,7 +55,12 @@ func rethMembersFromConfig(cfg *config.Config) map[string]bool {
 //
 // It does NOT run the D3 RSS indirection (that is driven from the caller, as
 // in the positional path) — the caller invokes applyStep0Tunables after.
-func enumerateAndRenameMapped(dm *config.DeviceMapConfig, cfg *config.Config) error {
+//
+// protected is the #1922 protected set (management lifeline / fxp0 / mgmt
+// leaf). Protected names are treated as implicitly desired: their .link is
+// NOT scrubbed (so the management NIC keeps its managed name across reboots
+// even when the operator left it out of the device-map — AGY r2 CRITICAL).
+func enumerateAndRenameMapped(dm *config.DeviceMapConfig, cfg *config.Config, protected map[string]bool) error {
 	if !dm.Active() {
 		return nil
 	}
@@ -216,8 +221,20 @@ func enumerateAndRenameMapped(dm *config.DeviceMapConfig, cfg *config.Config) er
 
 	// Phase 4: scrub stale xpf .link files whose target name is no longer a
 	// desired binding (a NIC dropped from the map). This keeps next boot's
-	// udev rule set exactly equal to the resolved bindings (R-2).
-	if scrubStaleDeviceMapLinks(desiredNames) {
+	// udev rule set exactly equal to the resolved bindings (R-2). Protected
+	// names (the management lifeline) are kept as implicitly-desired so the
+	// mgmt NIC retains its managed name across reboots even if it is not in
+	// the device-map (AGY r2 CRITICAL).
+	keepLinks := make(map[string]bool, len(desiredNames)+len(protected))
+	for n := range desiredNames {
+		keepLinks[n] = true
+	}
+	for n := range protected {
+		if n != "" {
+			keepLinks[n] = true
+		}
+	}
+	if scrubStaleDeviceMapLinks(keepLinks) {
 		changed = true
 	}
 
@@ -292,9 +309,9 @@ func deviceMapStrandsManagement(cfg *config.Config, nics []presentNIC, protected
 		}
 	}
 
-	// The live management NIC's CURRENT kernel name. Prefer the
-	// identity-resolved lifeline name (correct even before the rename); fall
-	// back to a present NIC literally named like a protected target (the
+	// The live management NIC's CURRENT kernel name(s). Prefer the
+	// identity-resolved lifeline name (correct even before the rename); also
+	// include any present NIC literally named like a protected target (the
 	// already-renamed steady state).
 	liveMgmt := map[string]bool{}
 	if lifelineCurrentName != "" {
@@ -306,18 +323,25 @@ func deviceMapStrandsManagement(cfg *config.Config, nics []presentNIC, protected
 		}
 	}
 
+	// Case A: a live management NIC must keep a PROTECTED name after the map
+	// is applied. If a live mgmt NIC is mapped to a NON-protected name,
+	// management moves off it on next boot. If it is not mapped at all, it
+	// keeps its current (protected) name — safe, because the teardown/scrub
+	// preserve protected names (AGY r2). This loop iterates the live mgmt
+	// NICs (not the protected-name set) so legitimately mapping the live mgmt
+	// NIC from its kernel name (enp5s0) to a protected name (fxp0) is NOT
+	// flagged (Codex r2 HIGH-A false-positive fix).
+	for lm := range liveMgmt {
+		if final, ok := finalByCurrent[lm]; ok && !protected[final] {
+			return fmt.Sprintf("device-map would rename the live management NIC %q to %q (a "+
+				"non-management name) on next boot, moving management off it. Map the management "+
+				"NIC to its management name, or adjust the map before committing.", lm, final)
+		}
+	}
+
 	for prot := range protected {
 		if prot == "" {
 			continue
-		}
-		// Case A: a live management NIC is mapped to a DIFFERENT name —
-		// management moves off it on next boot.
-		for lm := range liveMgmt {
-			if final, ok := finalByCurrent[lm]; ok && final != prot && final != lm {
-				return fmt.Sprintf("device-map would rename the live management NIC %q to %q on "+
-					"next boot, moving management off it. Map the management NIC to its own name, "+
-					"or adjust the map before committing.", lm, final)
-			}
 		}
 		// Case B: some NIC that is NOT a live management NIC is mapped to a
 		// protected name — it would steal the management name on next boot,
@@ -408,7 +432,7 @@ func protectedForConfig(cfg *config.Config) map[string]bool {
 // claim-all teardown via the compiler reconcile. It is no-op idempotent:
 // when nothing transitioned, it touches nothing (operator priority #1 —
 // zero churn on an unrelated commit).
-func teardownUnmappedManaged(dm *config.DeviceMapConfig) {
+func teardownUnmappedManaged(dm *config.DeviceMapConfig, protected map[string]bool) {
 	if !dm.Active() || dm.EffectiveUnmappedPolicy() != config.DeviceMapPolicyLeaveAlone {
 		return
 	}
@@ -430,6 +454,20 @@ func teardownUnmappedManaged(dm *config.DeviceMapConfig) {
 		target := strings.TrimSuffix(strings.TrimPrefix(fname, linkPrefix), ".link")
 		if desiredNames[target] {
 			continue // still managed — leave it
+		}
+		// AGY r2 CRITICAL: NEVER tear down a #1922-protected interface (the
+		// management lifeline / fxp0 / mgmt leaf), even when it is absent from
+		// the device-map. Renaming it back to its predictable name and
+		// deleting its .network here would cause an immediate management
+		// lockout at commit time. The protected set is the config-independent
+		// backstop; leaving the unmapped-but-protected NIC managed under its
+		// xpf name keeps mgmt reachable. (The commit pre-flight separately
+		// warns the operator to add it to the map — deviceMapStrandsManagement
+		// Case C.)
+		if protected[target] {
+			slog.Info("device-map teardown: skipping #1922-protected interface left unmapped "+
+				"(kept managed to preserve the management lifeline)", "name", target)
+			continue
 		}
 		// A previously-managed NIC is no longer mapped. Find the live device
 		// currently wearing this xpf name and restore it.

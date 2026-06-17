@@ -346,7 +346,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// stable identity and leaves the rest alone. Positional mode
 			// (no device-map) is bit-identical to pre-#1956.
 			if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.DeviceMap.Active() {
-				if err := enumerateAndRenameMapped(cfg.Chassis.DeviceMap, cfg); err != nil {
+				if err := enumerateAndRenameMapped(cfg.Chassis.DeviceMap, cfg, d.resolveProtectedInterfaces()); err != nil {
 					slog.Warn("device-map interface naming failed", "err", err)
 				}
 			} else if err := enumerateAndRenameInterfaces(nodeID, clusterMode, userspaceWorkers, rssEnabled, rssAllowed); err != nil {
@@ -1567,7 +1567,7 @@ func (d *Daemon) runBootstrapExitStartup(cfg *config.Config) {
 	// day-0 bare metal claims every NIC positionally before the map ever
 	// applies.
 	if cfg.Chassis.DeviceMap.Active() {
-		if err := enumerateAndRenameMapped(cfg.Chassis.DeviceMap, cfg); err != nil {
+		if err := enumerateAndRenameMapped(cfg.Chassis.DeviceMap, cfg, d.resolveProtectedInterfaces()); err != nil {
 			slog.Warn("bootstrap exit: device-map interface naming failed", "err", err)
 		}
 	} else if err := enumerateAndRenameInterfaces(nodeID, clusterMode, userspaceWorkers, rssEnabled, rssAllowed); err != nil {

@@ -79,7 +79,7 @@ func TestTeardownUnmappedManagedNoOpWhenAllMapped(t *testing.T) {
 		Entries:        []config.DeviceMapEntry{{LogicalName: "ge-0/0/3", PCIAddr: "0000:09:00.0"}},
 		UnmappedPolicy: config.DeviceMapPolicyLeaveAlone,
 	}
-	teardownUnmappedManaged(dm) // must not panic, must not remove the .link
+	teardownUnmappedManaged(dm, nil) // must not panic, must not remove the .link
 	if _, err := os.Stat(filepath.Join(dir, linkPrefix+"ge-0-0-3.link")); err != nil {
 		t.Fatalf("teardown removed a still-mapped .link: %v", err)
 	}
@@ -95,7 +95,7 @@ func TestTeardownManageDownIsNoOp(t *testing.T) {
 		Entries:        []config.DeviceMapEntry{{LogicalName: "ge-0/0/3", PCIAddr: "0000:09:00.0"}},
 		UnmappedPolicy: config.DeviceMapPolicyManageDown,
 	}
-	teardownUnmappedManaged(dm)
+	teardownUnmappedManaged(dm, nil)
 	if _, err := os.Stat(filepath.Join(dir, linkPrefix+"ge-0-0-9.link")); err != nil {
 		t.Fatalf("manage-down teardown must not touch .link files: %v", err)
 	}
@@ -231,6 +231,49 @@ func TestDeviceMapStrandsManagementCatchesPreRenameSteal(t *testing.T) {
 	// lifeline resolves the live mgmt NIC's CURRENT name = enp5s0.
 	if r := deviceMapStrandsManagement(cfg, nics, protected, "enp5s0"); r == "" {
 		t.Fatalf("expected steal detection before rename (live mgmt still enp5s0)")
+	}
+}
+
+func TestDeviceMapStrandsManagementAllowsLegitMgmtRemap(t *testing.T) {
+	// Codex r2 HIGH-A: the live mgmt NIC still wears its kernel name enp5s0,
+	// the lifeline resolves it, and BOTH enp5s0 (lifeline current name) and
+	// fxp0 (mgmt target) are in the protected set. Mapping enp5s0 -> fxp0 is
+	// the LEGITIMATE management mapping and must NOT be flagged.
+	cfg := &config.Config{Chassis: config.ChassisConfig{DeviceMap: &config.DeviceMapConfig{
+		Entries: []config.DeviceMapEntry{{LogicalName: "fxp0", PCIAddr: "0000:05:00.0"}},
+	}}}
+	nics := []devicemap.PresentNIC{{Name: "enp5s0", PCIAddr: "0000:05:00.0"}}
+	protected := map[string]bool{"fxp0": true, "enp5s0": true}
+	if r := deviceMapStrandsManagement(cfg, nics, protected, "enp5s0"); r != "" {
+		t.Fatalf("legit mgmt remap enp5s0->fxp0 must be allowed, got %q", r)
+	}
+}
+
+func TestDeviceMapStrandsManagementMgmtMovedToNonMgmtName(t *testing.T) {
+	// The live mgmt NIC mapped to a NON-protected name moves management off
+	// it — strand.
+	cfg := &config.Config{Chassis: config.ChassisConfig{DeviceMap: &config.DeviceMapConfig{
+		Entries: []config.DeviceMapEntry{{LogicalName: "ge-0/0/9", PCIAddr: "0000:05:00.0"}},
+	}}}
+	nics := []devicemap.PresentNIC{{Name: "enp5s0", PCIAddr: "0000:05:00.0"}}
+	protected := map[string]bool{"fxp0": true, "enp5s0": true}
+	if r := deviceMapStrandsManagement(cfg, nics, protected, "enp5s0"); r == "" {
+		t.Fatalf("expected strand when mgmt NIC mapped to a non-mgmt name")
+	}
+}
+
+func TestTeardownSkipsProtectedInterface(t *testing.T) {
+	// AGY r2 CRITICAL: an unmapped-but-protected mgmt interface must NOT be
+	// torn down (no immediate lockout). The .link survives.
+	dir := withTempLinkDir(t)
+	writeLinkFile("fxp0", "enp5s0") // mgmt NIC currently managed as fxp0
+	dm := &config.DeviceMapConfig{
+		Entries:        []config.DeviceMapEntry{{LogicalName: "ge-0/0/3", PCIAddr: "0000:09:00.0"}},
+		UnmappedPolicy: config.DeviceMapPolicyLeaveAlone,
+	}
+	teardownUnmappedManaged(dm, map[string]bool{"fxp0": true})
+	if _, err := os.Stat(filepath.Join(dir, linkPrefix+"fxp0.link")); err != nil {
+		t.Fatalf("teardown removed the protected fxp0 .link (lockout!): %v", err)
 	}
 }
 

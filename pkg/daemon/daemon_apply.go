@@ -697,7 +697,7 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 	// No-op idempotent when nothing transitioned (zero churn on an
 	// unrelated commit).
 	if cfg.Chassis.DeviceMap.Active() {
-		teardownUnmappedManaged(cfg.Chassis.DeviceMap)
+		teardownUnmappedManaged(cfg.Chassis.DeviceMap, protectedForConfig(cfg))
 	}
 
 	// 2.5. Write systemd-networkd config for managed interfaces

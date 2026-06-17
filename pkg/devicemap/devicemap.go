@@ -104,16 +104,25 @@ func Resolve(entries []config.DeviceMapEntry, nics []PresentNIC, rethMembers map
 		allowMAC := e.MAC != "" && !isRETH
 		allowPCI := e.PCIAddr != ""
 
-		// Order-INDEPENDENT topology-change refusal (Codex HIGH-1): when an
-		// entry pins BOTH a PCI address and a MAC, a present NIC at that PCI
-		// whose permanent MAC mismatches means a card was swapped into the
-		// pinned slot. That must REFUSE regardless of key order — otherwise a
-		// `mac-then-pci` (or any MAC-first) entry would bind via MAC and
-		// silently skip the slot-swap check. Skip for RETH members (MAC is
-		// not a usable key for them) and when either side lacks a perm-MAC to
-		// compare (PCI-only-unverified is handled in the key loop).
-		if allowPCI && e.MAC != "" && !isRETH {
-			if pm := byPCI[strings.ToLower(e.PCIAddr)]; len(pm) == 1 &&
+		// Order-INDEPENDENT refusals (run BEFORE the key loop so NO key order
+		// can bypass them — Codex HIGH-1 / r2 HIGH-B):
+		if allowPCI {
+			pm := byPCI[strings.ToLower(e.PCIAddr)]
+			// (a) Same-PCI ambiguity: two present NICs share this entry's PCI
+			// address. Refuse regardless of key order (a `key mac` /
+			// `mac-then-pci` entry would otherwise bind via MAC and never
+			// reach the PCI arm's len>1 guard).
+			if len(pm) > 1 {
+				rb.Status, rb.CurrentNIC, rb.Logical = BindRefusedAmbig, "", ""
+				out = append(out, rb)
+				continue
+			}
+			// (b) Topology change: a single present NIC at the pinned PCI
+			// whose permanent MAC mismatches the entry's MAC means a card was
+			// swapped into the slot. Refuse regardless of key order. Skip for
+			// RETH members (MAC is not a usable key for them) and when either
+			// side lacks a perm-MAC to compare.
+			if e.MAC != "" && !isRETH && len(pm) == 1 &&
 				pm[0].PermMAC != "" && !strings.EqualFold(pm[0].PermMAC, e.MAC) {
 				rb.Status, rb.CurrentNIC, rb.Logical = BindRefusedAmbig, "", ""
 				out = append(out, rb)
@@ -165,6 +174,25 @@ func Resolve(entries []config.DeviceMapEntry, nics []PresentNIC, rethMembers map
 			}
 		}
 		out = append(out, rb)
+	}
+
+	// Post-pass (Codex r2 HIGH-C): two DIFFERENT entries can resolve to the
+	// SAME present NIC via cross-key identities (entry A keyed by PCI, entry B
+	// keyed by that same NIC's permanent MAC) — the strict compile-time
+	// duplicate checks compare PCI-to-PCI and MAC-to-MAC and miss this. Left
+	// alone, the daemon's desiredByCurrent would last-wins one logical name
+	// onto the NIC. Detect the collision here and REFUSE every entry that
+	// landed on a multiply-claimed NIC, rather than silently dropping one.
+	claims := make(map[string]int)
+	for i := range out {
+		if out[i].Status.Bound() {
+			claims[out[i].CurrentNIC]++
+		}
+	}
+	for i := range out {
+		if out[i].Status.Bound() && claims[out[i].CurrentNIC] > 1 {
+			out[i].Status, out[i].CurrentNIC, out[i].Logical = BindRefusedAmbig, "", ""
+		}
 	}
 	return out
 }

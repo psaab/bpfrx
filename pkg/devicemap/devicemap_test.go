@@ -108,6 +108,42 @@ func TestResolveAmbiguousPCIRefuses(t *testing.T) {
 	}
 }
 
+func TestResolveAmbiguousPCIRefusesUnderMACKey(t *testing.T) {
+	// Codex r2 HIGH-B: same-PCI ambiguity must refuse REGARDLESS of key order.
+	// With key mac (PCI arm never runs), the order-independent pre-check must
+	// still catch two NICs sharing the entry's PCI address.
+	nics := []PresentNIC{
+		nic("enp9s0", "0000:09:00.0", "00:11:22:33:44:55"),
+		nic("enp9s0v1", "0000:09:00.0", "00:11:22:33:44:66"),
+	}
+	entries := []config.DeviceMapEntry{
+		{LogicalName: "ge-0/0/3", PCIAddr: "0000:09:00.0", MAC: "00:11:22:33:44:55",
+			KeyOrder: config.DeviceMapKeyMAC},
+	}
+	got := Resolve(entries, nics, nil)
+	if got[0].Status != BindRefusedAmbig {
+		t.Fatalf("ambiguous PCI must refuse even under key mac, got %v", got[0].Status)
+	}
+}
+
+func TestResolveCrossKeySameNICRefusesBoth(t *testing.T) {
+	// Codex r2 HIGH-C: two entries resolving to the SAME present NIC via
+	// cross-key identities (one by PCI, one by that NIC's MAC) must REFUSE
+	// both, not silently last-wins one logical name onto the NIC.
+	nics := []PresentNIC{nic("enp9s0", "0000:09:00.0", "00:11:22:33:44:55")}
+	entries := []config.DeviceMapEntry{
+		{LogicalName: "ge-0/0/3", PCIAddr: "0000:09:00.0", KeyOrder: config.DeviceMapKeyPCI},
+		{LogicalName: "ge-0/0/4", MAC: "00:11:22:33:44:55", KeyOrder: config.DeviceMapKeyMAC},
+	}
+	got := Resolve(entries, nics, nil)
+	for _, b := range got {
+		if b.Status != BindRefusedAmbig {
+			t.Fatalf("entry %s should REFUSE (two entries claim one NIC), got %v",
+				b.Entry.LogicalName, b.Status)
+		}
+	}
+}
+
 func TestResolveAmbiguousMACRefuses(t *testing.T) {
 	// Two NICs with the same permanent MAC (cloned/bonded) => refuse.
 	nics := []PresentNIC{
