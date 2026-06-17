@@ -1461,4 +1461,52 @@ mod tests {
         drop(resolver); // drops the producer → recv disconnects promptly
         handle.join().expect("resolver join");
     }
+
+    // #1912: the MissingNeighbor arm enqueues the resolver keyed by
+    // outer_neighbor_ifindex(...) for a tunnel-marked decision. Pin that
+    // keying contract: the ResolveItem the arm enqueues for a GRE tunnel
+    // resolution must carry the OUTER L3 egress ifindex (the VLAN subif
+    // where the outer neighbor lives), NOT the tunnel logical ifindex.
+    // Drives the same enqueue(neigh_if, hop, name) call the arm makes.
+    #[test]
+    fn tunnel_marked_resolver_enqueue_keys_outer_l3_egress() {
+        use crate::afxdp::forwarding::{
+            outer_neighbor_ifindex, resolve_tunnel_forwarding_resolution,
+        };
+        use crate::afxdp::forwarding_build::build_forwarding_state;
+        use crate::afxdp::test_fixtures::native_gre_snapshot;
+
+        let state = build_forwarding_state(&native_gre_snapshot(false));
+        let resolution = resolve_tunnel_forwarding_resolution(&state, None, 1, 0);
+        assert_eq!(resolution.egress_ifindex, 362, "tunnel logical ifindex");
+        let next_hop = resolution.next_hop.expect("outer next hop");
+
+        // The arm computes neigh_if exactly this way before enqueueing.
+        let neigh_if = outer_neighbor_ifindex(&state, None, &resolution);
+        assert_eq!(neigh_if, 12, "outer L3 egress (reth0.80 subif)");
+
+        let (tx, rx) = mpsc::sync_channel::<ResolveItem>(1);
+        let counters = Arc::new(ResolverCounters::default());
+        let resolver = NeighborResolver::new(
+            tx,
+            counters,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(super::super::neighbor_latency::NeighborLatencyHist::default()),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let name = state
+            .ifindex_to_name
+            .get(&neigh_if)
+            .cloned()
+            .expect("outer egress has a name");
+        resolver.enqueue(neigh_if, next_hop, name);
+
+        let item = rx.try_recv().expect("item enqueued");
+        assert_eq!(
+            item.ifindex, 12,
+            "resolver must be keyed on the outer L3 egress, not the tunnel logical (362)"
+        );
+        assert_eq!(item.hop, next_hop);
+    }
 }
