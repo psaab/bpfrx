@@ -115,7 +115,9 @@ that fw1 has neither a `wg0` netdev nor a `:51820` bind, and fails hard
 | ~~no `wg show`-equivalent / WG counters on the xpf side~~ | RESOLVED by #1865: `show security wireguard [detail]` + `xpf_userspace_wg_*` Prometheus family + `wg_tunnels` status rows | done (#1865) |
 | cookie (type 3) messages dropped | cookie/MAC2 consume unimplemented | S7 |
 | PSK must be absent/zero on the peer | PSK plumbing unimplemented | S4 |
-| WG tunnel removed from config leaks the wgN TUN until `ip link del`/restart | S2a persistent-TUN tradeoff | S6; harness teardown deletes it |
+| WG tunnel removed from config keeps the persistent wgN TUN link (by design — tearing it flaps the device + live peer) but now PRUNES the kernel addresses this manager applied (#1919), so they no longer route; the kernel connected route (and any FRR direct→connected redistribution of it) goes with the address | link kept = S2a persistent-TUN tradeoff; address prune fixed in #1919 | link teardown S6 (#1434); harness teardown still `ip link del`s the persistent link |
+| WG tunnel removed while the daemon was DOWN is not address-pruned on the next start | restart-adoption: the manager only prunes WG addresses it tracked applying | S6 (#1434) restart-time WG reconcile |
+| WG tunnel removed from config does NOT unbind its VRF master | WG binds VRF directly, bypassing the appliedRI claim machinery (same root cause as no-unbind-on-routing-instance-removal for a still-configured WG tunnel) | S6 (#1434) VRF-claim adoption for WG |
 | failover during WG = tunnel outage until fw0 preempts back | WG engine state is per-node, not HA-synced; wg0 is node0-scoped | S8 |
 
 ## >MTU / fragmentation semantics (P5)

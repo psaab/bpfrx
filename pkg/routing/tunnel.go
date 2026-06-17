@@ -188,6 +188,16 @@ type tunnelManager struct {
 	// Unbind on config-wants-none is identity-gated against
 	// vrf-<claim>.
 	appliedRI map[string]string
+	// wgConfigured: WireGuard tunnel names configured at the LAST Apply
+	// (plus names whose address prune left residual tracked addresses,
+	// retained for retry). NEVER feeds the LinkDel removal loop — WG
+	// links persist (#1432 S2a). Drives the WG address-prune-on-removal
+	// diff (#1919): a WG tunnel removed from config keeps its persistent
+	// wgN link but has the kernel addresses this manager applied pruned
+	// away, so they no longer route. The link-itself diff still excludes
+	// WG (the link is kept); this set exists solely so removal can find
+	// the now-absent WG name and reconcile its addresses to empty.
+	wgConfigured map[string]bool
 }
 
 // ensureReconcileStateLocked lazily initializes the reconcile maps so
@@ -202,6 +212,9 @@ func (t *tunnelManager) ensureReconcileStateLocked() {
 	}
 	if t.appliedRI == nil {
 		t.appliedRI = map[string]string{}
+	}
+	if t.wgConfigured == nil {
+		t.wgConfigured = map[string]bool{}
 	}
 	if t.keepalives == nil {
 		t.keepalives = map[string]*keepaliveRunner{}
@@ -293,6 +306,62 @@ func (t *tunnelManager) Apply(tunnels []*config.TunnelConfig) error {
 	}
 	t.ownedNames = next
 	t.tunnels = nil // success-tracked (GetStatus); rebuilt below
+
+	// WireGuard address-prune-on-removal diff (#1919). WG links persist
+	// (#1432 S2a) and are deliberately excluded from `desired`/ownedNames
+	// above, so the GRE removal loop never visits them and the per-tunnel
+	// apply loop below only reconciles addresses for STILL-configured WG.
+	// A WG tunnel removed from config therefore leaks the kernel addresses
+	// this manager applied to its persistent wgN device. wgConfigured
+	// records the WG names tracked at the last Apply; here we prune the
+	// addresses of any that disappeared while KEEPING the link.
+	wgDesired := map[string]bool{}
+	for _, tc := range tunnels {
+		if tc.Mode == "wireguard" {
+			wgDesired[tc.Name] = true
+		}
+	}
+	oldWG := t.wgConfigured
+	nextWG := make(map[string]bool, len(wgDesired))
+	for name := range wgDesired {
+		nextWG[name] = true
+	}
+	for name := range oldWG {
+		if wgDesired[name] {
+			continue // still configured; reconciled by the apply loop below
+		}
+		link, err := t.ops.LinkByName(name)
+		if err != nil {
+			if isLinkNotFound(err) {
+				// Device genuinely gone (manual `ip link del`, or never
+				// existed). Nothing to prune; drop tracking.
+				delete(t.appliedAddrs, name)
+			} else {
+				// Transient lookup error (EBUSY/netlink/timeout): we cannot
+				// conclude the device is clean. Retain the name AND its
+				// tracked address set so the next Apply retries the prune —
+				// dropping here would forget a still-leaked address forever
+				// (#1919 r1 Codex/AGY MAJOR).
+				slog.Warn("failed to look up wireguard tun for address prune",
+					"name", name, "err", err)
+				nextWG[name] = true
+			}
+			continue
+		}
+		failed, retry := t.pruneAppliedAddrsLocked(link, name, t.appliedAddrs[name])
+		if retry {
+			// Could not prove the device clean (an AddrDel failed, or
+			// AddrList itself failed). Carry the residual set forward (it
+			// gates link-local deletion next pass) and retry next Apply.
+			t.appliedAddrs[name] = failed
+			nextWG[name] = true
+			continue
+		}
+		// Proven clean: drop tracking so the next Apply is a no-op for this
+		// name (idempotent — it is in neither wgDesired nor nextWG).
+		delete(t.appliedAddrs, name)
+	}
+	t.wgConfigured = nextWG
 
 	for _, tc := range tunnels {
 		// WireGuard TUNs are persistent (#1432 S2a, AGY Hazard B): never
@@ -784,6 +853,66 @@ func (t *tunnelManager) reconcileLinkAddrsLocked(link netlink.Link, name string,
 	return newApplied
 }
 
+// pruneAppliedAddrsLocked deletes the addresses on a WG link being pruned
+// (config-removal of a persistent wgN, #1919), KEEPING the link itself
+// (#1432 S2a invariant — never LinkDel a wgN here). It deletes every
+// present non-link-local address (the manager owns the device's
+// non-link-local address set, identical to reconcileLinkAddrsLocked's
+// steady-state semantics) plus configured/applied link-locals; the
+// kernel autoconf / foreign fe80 is never touched (same gate as
+// reconcileLinkAddrsLocked at the link-local check).
+//
+// It returns (failed, retry):
+//   - failed: addresses whose AddrDel FAILED, across ALL families. This
+//     is carried forward as the new appliedAddrs[name] so the link-local
+//     gate stays correct on the retry pass.
+//   - retry:  true when the device could NOT be proven clean this pass —
+//     either an AddrDel failed OR AddrList itself failed. AddrList failure
+//     means we cannot enumerate, hence cannot conclude clean, so we retry
+//     unconditionally even when the prior applied set was empty (#1919 r2
+//     Codex MAJOR: an empty applied with a real stale address must still
+//     retry). The caller retains the name in wgConfigured on retry, NOT on
+//     len(failed)>0 — decoupling enumerate-failed from delete-failed.
+//
+// Distinct from reconcileLinkAddrsLocked (left untouched, frozen #1884
+// contract): that function only records a FAILED non-link-local delete
+// when the address is link-local, so its return cannot drive a
+// non-link-local retry signal (#1919 r1 MAJOR). This helper records every
+// family's failed delete.
+//
+// Caller MUST hold mu.
+func (t *tunnelManager) pruneAppliedAddrsLocked(link netlink.Link, name string, applied map[string]bool) (map[string]bool, bool) {
+	list, err := t.ops.AddrList(link, netlink.FAMILY_ALL)
+	if err != nil {
+		// Cannot enumerate ⇒ cannot conclude the device is clean. Keep the
+		// existing tracked set (so the link-local gate stays correct next
+		// pass) and signal retry unconditionally — even if applied is empty.
+		slog.Warn("failed to list wireguard tun addresses for prune",
+			"name", name, "err", err)
+		return applied, true
+	}
+	failed := map[string]bool{}
+	for i := range list {
+		a := list[i]
+		if a.IP == nil {
+			continue // unclassifiable: never delete (parity with reconcile)
+		}
+		key := a.IPNet.String()
+		if a.IP.IsLinkLocalUnicast() && (applied == nil || !applied[key]) {
+			continue // kernel autoconf / foreign link-local: never delete
+		}
+		if delErr := t.ops.AddrDel(link, &a); delErr != nil {
+			slog.Warn("failed to prune wireguard tun address",
+				"name", name, "addr", key, "err", delErr)
+			failed[key] = true // ALL families (the #1919 r1 MAJOR fix)
+		} else {
+			slog.Info("pruned wireguard tun address (removed from config)",
+				"name", name, "addr", key)
+		}
+	}
+	return failed, len(failed) > 0
+}
+
 // reconcileVRFClaimLocked runs the #1884 A.5 ordered claim procedure.
 // The claim invariant (r6-r8): t.appliedRI[name] is only ever written
 // from a SUCCESSFUL BindInterfaceToVRF or a direct observation of the
@@ -927,11 +1056,25 @@ func wgTunMTUForEndpoint(tc *config.TunnelConfig) int {
 // in t.tunnels: clearLocked must not delete it on reload (AGY Hazard B
 // — flapping wgN destroys its addresses and FRR routes every commit).
 //
-// Known S2a limitation (AGY M1): because the device is untracked, a WG
-// tunnel REMOVED from the config is not torn down by clearLocked and
-// leaks until `ip link del` or daemon restart. S2a single-tunnel scope
-// accepts this in exchange for reload stability; multi-instance teardown
-// is owned by the S6 grammar work (#1434).
+// On config removal the persistent wgN LINK is intentionally kept (S2a:
+// tearing it would flap the device and destroy the live peer/session),
+// but the kernel ADDRESSES this manager applied are now pruned away by
+// Apply's WG-removal diff (#1919): wgConfigured records the WG names from
+// the last Apply, and a name that disappears has pruneAppliedAddrsLocked
+// reconcile its addresses to empty while keeping the link. So a removed WG
+// tunnel no longer leaks its addresses (or the kernel connected route the
+// address auto-installs, removed by the kernel on AddrDel — and hence any
+// FRR direct→connected redistribution of it).
+//
+// Remaining boundaries (#1434 scope): (1) a WG tunnel removed while the
+// daemon was DOWN is not in wgConfigured on the next start, so it is not
+// pruned (restart-adoption limitation shared by the whole manager — it
+// only prunes what it tracked applying); (2) the wgN link and its live
+// Rust-attached peer/session are kept (not torn) by design; (3) VRF
+// membership is NOT unbound on removal (WG binds VRF directly, bypassing
+// the appliedRI claim machinery, so there is no identity-gated unbind —
+// the same root cause as the no-unbind-on-routing-instance-removal gap
+// for a still-configured WG tunnel).
 //
 // The Rust control thread (coordinator/wg_control.rs) attaches to this
 // persistent device by name.
@@ -1013,10 +1156,10 @@ func (t *tunnelManager) applyWireguardTunLocked(tc *config.TunnelConfig) error {
 	// (this manager applied it), while the kernel's autoconf fe80 — and
 	// any fe80 already present before this daemon's first apply
 	// (restart adoption pass, applied == nil) — is never touched.
-	// Because the wgN device persists when removed from config (S2a,
-	// see above), its appliedAddrs entry is retained with it so a later
-	// re-add keeps accurate tracking; S6 teardown (#1434) owns deleting
-	// both.
+	// On config REMOVAL the wgN link persists (S2a) but its addresses are
+	// now pruned by Apply's WG-removal diff (#1919, see the function doc
+	// above); the appliedAddrs entry is dropped once the device is proven
+	// clean, so a later re-add starts tracking fresh.
 	t.appliedAddrs[tc.Name] = t.reconcileLinkAddrsLocked(
 		link, tc.Name, tc.Addresses, t.appliedAddrs[tc.Name], "wireguard tun")
 
@@ -1391,6 +1534,12 @@ func (t *tunnelManager) clearLocked() error {
 	t.ownedNames = nil
 	t.appliedAddrs = nil
 	t.appliedRI = nil
+	// Reset the WG-removal-prune tracking too (#1919). ClearTunnels does
+	// NOT delete WG links (they are persistent and not in tunnels/
+	// ownedNames) — only the tracking map is dropped so a post-Clear Apply
+	// re-adopts cleanly. Whether ClearTunnels should also flush WG
+	// addresses is deferred to #1434 (full teardown grammar).
+	t.wgConfigured = nil
 	// clearLocked drains every keepalive runner first
 	// (stopAllKeepalivesLocked above), so no live runner holds a stale
 	// linkGen pointer; dropping the map is safe and prevents removed names

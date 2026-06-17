@@ -106,6 +106,26 @@ existing kernel link is genuinely incompatible:
   applied), never the kernel's autoconf fe80; failed LL deletes stay
   tracked for retry. The WG branch uses the same helper with the nil
   sentinel (blanket LL skip — pre-existing WG semantics).
+- **WireGuard removal address prune** (`wgConfigured`, #1919): WG `wgN`
+  TUNs are persistent (#1432 S2a) — they are deliberately excluded from
+  the `ownedNames` removal diff so the link is NEVER torn on reload
+  (tearing it flaps the device + live peer). But that exclusion meant a
+  WG tunnel REMOVED from config never had its addresses reconciled away
+  (the per-tunnel apply loop only reconciles still-configured WG). `Apply`
+  now keeps a WG-only `wgConfigured` set; a name that disappears from it
+  has `pruneAppliedAddrsLocked` delete every present non-link-local
+  address (manager owns the device's non-LL set, same as steady-state
+  reconcile) plus configured/applied link-locals, while KEEPING the link.
+  The helper returns `(failed, retry)`; the name is retained for retry
+  when an `AddrDel` failed OR `AddrList` itself failed (cannot prove
+  clean) — decoupled from `len(failed)` so an empty applied set with a
+  transient list failure still retries (it does NOT reuse
+  `reconcileLinkAddrsLocked`, whose return only records failed LL
+  deletes). A transient `LinkByName` error (vs `isLinkNotFound`) also
+  retains for retry; a genuine not-found drops tracking. Residuals
+  deferred to #1434: removal while the daemon was DOWN is not pruned
+  (only tracked-applied addresses prune), and VRF membership is not
+  unbound (WG binds VRF directly, no `appliedRI` claim).
 - **VRF claims** (`appliedRI`): written ONLY from a successful
   `BindInterfaceToVRF` or a direct observation that the link's master
   is `vrf-<RIListMember>` (a step-0a routing-instance interface-list

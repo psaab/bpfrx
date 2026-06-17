@@ -1,5 +1,29 @@
 # Action Log
 
+## 2026-06-17 — #1919 WireGuard removal address-prune (implement converged r3 plan)
+
+- **Timestamp**: 2026-06-17
+- **Action**: Implemented #1919 — removing a WireGuard tunnel from config
+  leaked the kernel addresses on its persistent wgN device (and the
+  kernel connected route / any FRR direct→connected redistribution of
+  it). WG links are intentionally excluded from the `ownedNames` removal
+  diff (#1432 S2a: never tear wgN), but address reconcile only ran for
+  still-configured WG, so a removed WG name was never visited again. Added
+  a WG-only `wgConfigured` tracking set + `pruneAppliedAddrsLocked` helper
+  (returns `(failed, retry)`: retry on AddrDel-failure OR AddrList-failure,
+  decoupled from `len(failed)`; deletes all present non-link-local addrs +
+  configured/applied link-locals, gates autoconf fe80). `Apply` prunes the
+  addresses of disappeared WG names while KEEPING the link; transient
+  `LinkByName` errors retain for retry, genuine not-found drops tracking.
+  `reconcileLinkAddrsLocked` left untouched (frozen #1884 contract).
+  `clearLocked` resets `wgConfigured`. Updated `applyWireguardTunLocked`
+  doc, routing README, wg-interop-runbook. 9 new tests. Branched off
+  origin/master post-#1918 (probeICMP keepalive — no interaction; WG has
+  no keepalive).
+- **File(s)**: pkg/routing/tunnel.go, pkg/routing/iface_reuse_test.go,
+  pkg/routing/tunnel_reconcile_test.go, pkg/routing/README.md,
+  docs/wg-interop-runbook.md, _Log.md
+
 ## 2026-06-17 — #1915 DHCP relay socket lifecycle (implement converged r4 plan)
 
 - **Timestamp**: 2026-06-17

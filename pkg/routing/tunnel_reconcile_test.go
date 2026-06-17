@@ -431,6 +431,237 @@ func TestWireguardLinkLocalDeleteFailureRetried(t *testing.T) {
 	}
 }
 
+// --- #1919: WireGuard removal address-prune diff ----------------------
+
+// A WG tunnel REMOVED from config must have the kernel addresses this
+// manager applied pruned away — while the persistent wgN LINK is kept
+// (never LinkDel'd, #1432 S2a) and any kernel autoconf fe80 survives.
+func TestWireguardRemovedFromConfigPrunesAddresses(t *testing.T) {
+	ops := newFakeLinkOps()
+	tm, _ := newReconcileManager(ops)
+	if err := tm.Apply([]*config.TunnelConfig{wgTC("172.16.0.1/30", "fe80::8/64")}); err != nil {
+		t.Fatalf("Apply 1: %v", err)
+	}
+	if !ops.hasAddr("wg0", "172.16.0.1/30") || !ops.hasAddr("wg0", "fe80::8/64") {
+		t.Fatal("configured addresses not applied")
+	}
+	// Kernel autoconf link-local also present on the device.
+	kernelLL, _ := netlink.ParseAddr("fe80::5054:ff:fe12:3456/64")
+	ops.addrs["wg0"] = append(ops.addrs["wg0"], *kernelLL)
+
+	// Remove the WG tunnel entirely from config.
+	if err := tm.Apply(nil); err != nil {
+		t.Fatalf("Apply 2 (removal): %v", err)
+	}
+	if len(ops.delNames) != 0 {
+		t.Fatalf("persistent wgN link was deleted on removal: %v", ops.delNames)
+	}
+	if _, err := ops.LinkByName("wg0"); err != nil {
+		t.Fatalf("wg0 link gone after removal (must be kept): %v", err)
+	}
+	if ops.hasAddr("wg0", "172.16.0.1/30") {
+		t.Fatal("non-link-local address leaked after tunnel removal (#1919)")
+	}
+	if ops.hasAddr("wg0", "fe80::8/64") {
+		t.Fatal("configured fe80 leaked after tunnel removal (#1919)")
+	}
+	if !ops.hasAddr("wg0", "fe80::5054:ff:fe12:3456/64") {
+		t.Fatal("kernel autoconf fe80 was wrongly pruned on removal")
+	}
+}
+
+// After a clean prune the name is dropped from tracking: a subsequent
+// Apply with the tunnel still absent must not re-list / re-AddrDel it.
+func TestWireguardRemovalPruneIdempotent(t *testing.T) {
+	ops := newFakeLinkOps()
+	tm, _ := newReconcileManager(ops)
+	if err := tm.Apply([]*config.TunnelConfig{wgTC("172.16.0.1/30")}); err != nil {
+		t.Fatalf("Apply 1: %v", err)
+	}
+	if err := tm.Apply(nil); err != nil {
+		t.Fatalf("Apply 2 (removal): %v", err)
+	}
+	if len(ops.addrDels["wg0"]) != 1 {
+		t.Fatalf("expected exactly one AddrDel on removal, got %v", ops.addrDels["wg0"])
+	}
+	lookupsBefore := ops.byNameCount["wg0"]
+	if err := tm.Apply(nil); err != nil {
+		t.Fatalf("Apply 3 (still removed): %v", err)
+	}
+	if len(ops.addrDels["wg0"]) != 1 {
+		t.Fatalf("prune was not idempotent — extra AddrDel: %v", ops.addrDels["wg0"])
+	}
+	if ops.byNameCount["wg0"] != lookupsBefore {
+		t.Fatalf("dropped name re-looked-up: %d→%d", lookupsBefore, ops.byNameCount["wg0"])
+	}
+}
+
+// A FAILED AddrDel of a NON-link-local address on removal must retain the
+// name in tracking and retry on the next Apply (direct guard for the
+// #1919 r1 MAJOR — reconcileLinkAddrsLocked's return cannot carry this).
+func TestWireguardRemovalAddrDelFailureRetried(t *testing.T) {
+	ops := newFakeLinkOps()
+	tm, _ := newReconcileManager(ops)
+	if err := tm.Apply([]*config.TunnelConfig{wgTC("172.16.0.1/30")}); err != nil {
+		t.Fatalf("Apply 1: %v", err)
+	}
+	ops.addrDelFail["wg0|172.16.0.1/30"] = errors.New("EBUSY")
+	if err := tm.Apply(nil); err != nil {
+		t.Fatalf("Apply 2 (removal, AddrDel fails): %v", err)
+	}
+	if !ops.hasAddr("wg0", "172.16.0.1/30") {
+		t.Fatal("address gone despite injected AddrDel failure")
+	}
+	// Retry: AddrDel now succeeds → address pruned, tracking dropped.
+	delete(ops.addrDelFail, "wg0|172.16.0.1/30")
+	if err := tm.Apply(nil); err != nil {
+		t.Fatalf("Apply 3 (retry): %v", err)
+	}
+	if ops.hasAddr("wg0", "172.16.0.1/30") {
+		t.Fatal("non-link-local prune not retried (dropped from tracking) — #1919 r1 MAJOR")
+	}
+	// And idempotent afterward.
+	delsAfter := len(ops.addrDels["wg0"])
+	if err := tm.Apply(nil); err != nil {
+		t.Fatalf("Apply 4: %v", err)
+	}
+	if len(ops.addrDels["wg0"]) != delsAfter {
+		t.Fatalf("extra AddrDel after clean prune: %v", ops.addrDels["wg0"])
+	}
+}
+
+// LinkByName returning a NOT-FOUND error on removal (device manually
+// `ip link del`'d) drops tracking with no panic and a no-op next Apply.
+func TestWireguardRemovalDeviceNotFoundDropsTracking(t *testing.T) {
+	ops := newFakeLinkOps()
+	tm, _ := newReconcileManager(ops)
+	if err := tm.Apply([]*config.TunnelConfig{wgTC("172.16.0.1/30")}); err != nil {
+		t.Fatalf("Apply 1: %v", err)
+	}
+	// Device vanished from the kernel.
+	delete(ops.links, "wg0")
+	delete(ops.addrs, "wg0")
+	if err := tm.Apply(nil); err != nil {
+		t.Fatalf("Apply 2 (removal, device not found): %v", err)
+	}
+	if len(ops.addrDels["wg0"]) != 0 {
+		t.Fatalf("AddrDel attempted on a not-found device: %v", ops.addrDels["wg0"])
+	}
+	lookupsBefore := ops.byNameCount["wg0"]
+	if err := tm.Apply(nil); err != nil {
+		t.Fatalf("Apply 3: %v", err)
+	}
+	if ops.byNameCount["wg0"] != lookupsBefore {
+		t.Fatal("tracking not dropped on not-found removal (name re-visited)")
+	}
+}
+
+// A TRANSIENT (non-not-found) LinkByName error on removal must RETAIN the
+// name in tracking; a later Apply where the link resolves prunes the
+// address (direct guard for the #1919 r1 Codex/AGY MAJOR #2).
+func TestWireguardRemovalTransientLookupRetained(t *testing.T) {
+	ops := newFakeLinkOps()
+	tm, _ := newReconcileManager(ops)
+	if err := tm.Apply([]*config.TunnelConfig{wgTC("172.16.0.1/30")}); err != nil {
+		t.Fatalf("Apply 1: %v", err)
+	}
+	ops.byNameHardErr["wg0"] = errors.New("EBUSY: transient netlink error")
+	if err := tm.Apply(nil); err != nil {
+		t.Fatalf("Apply 2 (removal, transient lookup error): %v", err)
+	}
+	if ops.hasAddr("wg0", "172.16.0.1/30") != true {
+		t.Fatal("address pruned despite transient lookup failure (should retry)")
+	}
+	// Link resolves now → prune proceeds.
+	delete(ops.byNameHardErr, "wg0")
+	if err := tm.Apply(nil); err != nil {
+		t.Fatalf("Apply 3 (lookup recovers): %v", err)
+	}
+	if ops.hasAddr("wg0", "172.16.0.1/30") {
+		t.Fatal("address not pruned after transient lookup recovered (tracking lost) — #1919 r1 MAJOR #2")
+	}
+}
+
+// Re-adding the same WG name after a removal-prune tracks the NEW address
+// fresh and does not re-leak the old one.
+func TestWireguardReAddAfterRemovalTracksFresh(t *testing.T) {
+	ops := newFakeLinkOps()
+	tm, _ := newReconcileManager(ops)
+	if err := tm.Apply([]*config.TunnelConfig{wgTC("172.16.0.1/30")}); err != nil {
+		t.Fatalf("Apply 1: %v", err)
+	}
+	if err := tm.Apply(nil); err != nil {
+		t.Fatalf("Apply 2 (removal): %v", err)
+	}
+	if ops.hasAddr("wg0", "172.16.0.1/30") {
+		t.Fatal("old address not pruned on removal")
+	}
+	// Re-add with a NEW address.
+	if err := tm.Apply([]*config.TunnelConfig{wgTC("172.16.9.1/30")}); err != nil {
+		t.Fatalf("Apply 3 (re-add): %v", err)
+	}
+	if !ops.hasAddr("wg0", "172.16.9.1/30") {
+		t.Fatal("re-added address not applied")
+	}
+	if ops.hasAddr("wg0", "172.16.0.1/30") {
+		t.Fatal("old address re-leaked after re-add")
+	}
+}
+
+// AddrList returning an error on removal (cannot enumerate ⇒ cannot prove
+// clean) with an EMPTY applied set must RETAIN the name (retry), no
+// panic; a later Apply where AddrList succeeds prunes the address. Proves
+// the (failed, retry) decoupling (#1919 r2 Codex MAJOR).
+func TestWireguardRemovalAddrListFailureRetained(t *testing.T) {
+	ops := newFakeLinkOps()
+	tm, _ := newReconcileManager(ops)
+	// Configure with NO managed addresses so appliedAddrs["wg0"] is empty,
+	// then plant a stale non-link-local address directly in the kernel.
+	if err := tm.Apply([]*config.TunnelConfig{wgTC()}); err != nil {
+		t.Fatalf("Apply 1: %v", err)
+	}
+	stale, _ := netlink.ParseAddr("172.16.0.1/30")
+	ops.addrs["wg0"] = append(ops.addrs["wg0"], *stale)
+
+	ops.addrListFail["wg0"] = errors.New("EBUSY: cannot enumerate")
+	if err := tm.Apply(nil); err != nil {
+		t.Fatalf("Apply 2 (removal, AddrList fails): %v", err)
+	}
+	if !ops.hasAddr("wg0", "172.16.0.1/30") {
+		t.Fatal("address gone despite AddrList failure")
+	}
+	// AddrList recovers → the stale address is pruned (name was retained).
+	delete(ops.addrListFail, "wg0")
+	if err := tm.Apply(nil); err != nil {
+		t.Fatalf("Apply 3 (AddrList recovers): %v", err)
+	}
+	if ops.hasAddr("wg0", "172.16.0.1/30") {
+		t.Fatal("stale address not pruned after AddrList recovered — (failed,retry) decoupling broken (#1919 r2 MAJOR)")
+	}
+}
+
+// Restart-adoption boundary (#1919 R5): a FRESH manager (empty
+// wgConfigured) with a wgN already carrying addresses and an empty config
+// must NOT prune — the manager only prunes what it tracked applying;
+// restart-time removal is #1434 scope. Encodes the deferral.
+func TestWireguardRemovedWhileDaemonDownNotPruned(t *testing.T) {
+	ops := newFakeLinkOps()
+	seedAnchor(ops, "wg0", 7, 1412)
+	preAddr, _ := netlink.ParseAddr("172.16.0.1/30")
+	ops.addrs["wg0"] = append(ops.addrs["wg0"], *preAddr)
+	tm, _ := newReconcileManager(ops)
+
+	if err := tm.Apply(nil); err != nil {
+		t.Fatalf("Apply (fresh manager, empty config): %v", err)
+	}
+	if len(ops.addrDels["wg0"]) != 0 {
+		t.Fatalf("restart-time WG address wrongly pruned: %v", ops.addrDels["wg0"])
+	}
+	if !ops.hasAddr("wg0", "172.16.0.1/30") {
+		t.Fatal("pre-existing address removed at restart (must defer to #1434)")
+	}
+}
+
 // --- §9 test 6: appliedRI claim state machine -------------------------
 
 func TestTunnelVRFStanzaBindAndUnbind(t *testing.T) {
