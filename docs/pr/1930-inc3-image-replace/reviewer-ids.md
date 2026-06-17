@@ -44,3 +44,15 @@ Final increment of the #1930 kernel/OS-upgrade umbrella. PR body carries
   `-allow-mixed-ha` (single dash), so the probe now matches the bare
   `allow-mixed-ha` token rather than `--allow-mixed-ha`. Verified the probe
   detects the flag over BOTH incus- and ssh-style pipelines.
+
+### Copilot round-2 (rev ca6b493f0 / 8d047cd2a) — 3 findings addressed (rev 4)
+- Copilot (sync.go:30): `SessionSyncWireVersion` derived from the FIXED
+  `LegacyHAProtocolVersion` would silently pin the gate to a stale schema
+  after an HA bump. FIXED → derive from `CurrentHAProtocolVersion`.
+- Copilot (kernel_drain.go:21): `DrainAndConfirm` doc still claimed it always
+  refuses HA-incompatible peers, but `allowMixedHA` bypasses it. FIXED doc.
+- Copilot (xpf-deploy.py): `--allow-session-drop` relaxes the drain HA-equality
+  check even when the gate failed for HA-OUT-OF-WINDOW (not just session-sync).
+  Behavior is intentional (operator opted into the drop + node-by-node roll),
+  but the warning now LOUDLY names that the HA-equality precheck is bypassed and
+  the cluster may run split-protocol until the second node is rolled.

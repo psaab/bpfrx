@@ -25,9 +25,14 @@ var syncMagic = [4]byte{'B', 'P', 'S', 'Y'}
 // sync wire schema. Bump this whenever the `syncMsg*` set or `syncHeader`
 // changes incompatibly. The header has no on-wire version field today
 // (compatibility has ridden the HA protocol version); this constant makes the
-// sync schema version explicit for the gate. It is currently pinned to the HA
-// protocol version since the two have evolved together.
-const SessionSyncWireVersion = uint16(LegacyHAProtocolVersion)
+// sync schema version explicit for the gate. It tracks CurrentHAProtocolVersion
+// (NOT LegacyHAProtocolVersion): the sync wire schema and the HA protocol have
+// evolved together, so a CurrentHAProtocolVersion bump that changes the
+// `syncMsg*`/`syncHeader` format carries the sync version with it. Deriving
+// from the fixed Legacy constant would silently pin the gate to the stale
+// schema version after an HA bump (Copilot). If the sync wire format ever
+// diverges from the HA protocol version, replace this with its own counter.
+const SessionSyncWireVersion = uint16(CurrentHAProtocolVersion)
 
 const (
 	syncMsgSessionV4              = 1

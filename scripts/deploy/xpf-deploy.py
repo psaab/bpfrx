@@ -1072,7 +1072,20 @@ def cmd_image_roll(args):
                         f"connection drop) or pass --allow-session-drop to proceed "
                         f"node-by-node anyway (sessions WILL drop at the failover).")
                 if not survive:
-                    print(f"   --allow-session-drop set: proceeding; sessions WILL drop")
+                    # The operator explicitly accepted the drop. The gate may
+                    # have failed because the peer's HA protocol is OUT of the
+                    # new image's compat WINDOW (not merely a session-sync
+                    # mismatch), so relaxing the drain's exact-equality HA check
+                    # here can drain into a genuinely mixed-PROTOCOL cluster
+                    # (Copilot). That is the documented consequence of
+                    # --allow-session-drop: sessions drop AND the cluster runs
+                    # split-protocol until the second node is rolled; the
+                    # peer-alive / takeover-ready prechecks still guarantee the
+                    # peer can serve NEW traffic. Name it loudly.
+                    print(f"   --allow-session-drop set: proceeding — sessions "
+                          f"WILL drop, AND the drain's HA-protocol-equality "
+                          f"precheck is bypassed (the cluster may run "
+                          f"split-protocol until {peer} is rolled).")
                     allow_mixed = True  # gate waived -> also relax the drain HA check
 
             # 1. drain node -> peer (confirmed; never recreate an undrained

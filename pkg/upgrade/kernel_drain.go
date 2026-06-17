@@ -17,8 +17,13 @@ const drainPollInterval = 1 * time.Second
 
 // DrainAndConfirm demotes the local node and waits for the STRONG drain
 // predicate (peer owns the RGs + sync clean) within deadline. It first refuses
-// to drain if the peer is not takeover-ready or the HA protocol is incompatible
-// — so a drain can never strand VIPs or split a mixed-protocol cluster.
+// to drain if the peer is not alive or not takeover-ready — so a drain can never
+// strand VIPs. Unless allowMixedHA is set, it ALSO refuses an HA-incompatible
+// peer (exact-equality), so a single-version LANE-1 roll never splits a
+// mixed-protocol cluster. allowMixedHA=true (the LANE-2 image-roll second drain,
+// whose mixed-base gate already validated window-compat) intentionally BYPASSES
+// only that exact-equality HA check; the peer-alive and takeover-ready prechecks
+// still apply (Copilot).
 func DrainAndConfirm(cl RollingCluster, deadline time.Duration, allowMixedHA bool) error {
 	// Pre-checks: a peer that cannot take over must NOT be drained to.
 	alive, err := cl.PeerAlive()
