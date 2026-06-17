@@ -87,9 +87,11 @@ PROFILE="${PROFILE:-xpf-cluster}"
 # Ubuntu release; IMAGE_VM/IMAGE_CT stay env-overridable for a different *Ubuntu*
 # release, NOT a Debian fallback (the script now uses Ubuntu package names + a
 # >= 6.18 kernel floor). Rollback is `git revert`, not a runtime IMAGE_VM swap.
+# VM uses the /cloud (cloud-init) variant; the LAN-host container uses the
+# plain non-cloud alias (no need for cloud-init in a container) — Copilot r2.
 XPF_BASE_RELEASE="${XPF_BASE_RELEASE:-26.04}"
 IMAGE_VM="${IMAGE_VM:-images:ubuntu/${XPF_BASE_RELEASE}/cloud}"
-IMAGE_CT="${IMAGE_CT:-images:ubuntu/${XPF_BASE_RELEASE}/cloud}"
+IMAGE_CT="${IMAGE_CT:-images:ubuntu/${XPF_BASE_RELEASE}}"
 LAN_ADDR="${LAN_ADDR:-}"
 LAN_GW="${LAN_GW:-}"
 

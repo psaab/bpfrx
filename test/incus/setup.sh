@@ -15,10 +15,18 @@
 
 set -euo pipefail
 
-# Re-exec under incus-admin group if needed
+# Re-exec under incus-admin group if needed. Forward XPF_* scalar vars
+# (e.g. XPF_BASE_RELEASE / IMAGE_VM / IMAGE_CT) across the re-exec: sg's
+# env preservation is not guaranteed on every platform, so without this a
+# `XPF_BASE_RELEASE=... make test-vm` would silently fall back to the
+# default after the sg re-exec (Copilot r2). Mirrors cluster-setup.sh.
 if ! incus list &>/dev/null 2>&1; then
 	if getent group incus-admin &>/dev/null && id -nG | grep -qw incus-admin; then
-		exec sg incus-admin -c "$(printf '%q ' "$0" "$@")"
+		local_env=""
+		for _v in "${!XPF_@}" "${!IMAGE_@}"; do
+			local_env+="${_v}=$(printf '%q' "${!_v}") "
+		done
+		exec sg incus-admin -c "${local_env}$(printf '%q ' "$0" "$@")"
 	fi
 fi
 
@@ -34,13 +42,14 @@ CT_PROFILE="xpf-container"
 # script now uses Ubuntu package names and a >= 6.18 kernel floor, so a Debian
 # image would fail. Rollback is `git revert`, not a runtime IMAGE_VM override.
 #
-# The images:ubuntu/<rel>/cloud alias publishes BOTH a VIRTUAL-MACHINE and a
-# CONTAINER variant; incus auto-selects by the launch mode (`--vm` vs not), so
-# the same string works for both create-vm and create-ct (verified live —
-# `incus launch images:ubuntu/26.04/cloud <ct>` boots a container).
+# VM uses the /cloud (cloud-init) variant to match bake.py's cloudimg base; the
+# container uses the plain non-cloud alias — both aliases publish a CONTAINER
+# rootfs, but the non-cloud one avoids dragging cloud-init into a container that
+# does not need it (Copilot r2). Both are env-overridable for a different Ubuntu
+# release (NOT a Debian fallback — Ubuntu package names + the 6.18 floor apply).
 XPF_BASE_RELEASE="${XPF_BASE_RELEASE:-26.04}"
 IMAGE_VM="${IMAGE_VM:-images:ubuntu/${XPF_BASE_RELEASE}/cloud}"
-IMAGE_CT="${IMAGE_CT:-images:ubuntu/${XPF_BASE_RELEASE}/cloud}"
+IMAGE_CT="${IMAGE_CT:-images:ubuntu/${XPF_BASE_RELEASE}}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
@@ -333,14 +342,16 @@ EOF'
 		incus exec "$INSTANCE_NAME" -- bash -c 'kver=$(uname -r); dpkg --compare-versions "${kver%%-*}" ge 6.18 || { echo "FATAL: base kernel $kver < 6.18 (verifier floor)" >&2; exit 1; }' \
 			|| die "base image kernel below the 6.18 AF_XDP verifier floor"
 
-		# Assert the dataplane NIC drivers are present (mirrors bake.py:227-228).
-		# On Ubuntu these ship in the in-image linux-modules package, NOT a
-		# separate linux-modules-extra; without them the WAN/loss PFs never bind.
-		# Check mellanox (mlx5) + intel/i40e as representative dataplane drivers;
-		# they live in the same linux-modules package as ixgbe/iavf/ice, so these
-		# two passing implies the rest are present too.
+		# Assert the dataplane NIC drivers are present. On Ubuntu these ship in
+		# the in-image linux-modules package, NOT a separate linux-modules-extra;
+		# without them the WAN/loss PFs never bind. Gate on the mellanox (mlx5)
+		# directory only, mirroring the production image gate
+		# (scripts/image/validate.py:188 + bake.py:227-228) — the full ethernet
+		# driver set (i40e/ixgbe/iavf/ice) ships in the same linux-modules
+		# package, so the mellanox dir presence is the representative check and
+		# a stricter AND on i40e could false-negative on an otherwise-fine base.
 		info "Asserting dataplane NIC driver modules present..."
-		incus exec "$INSTANCE_NAME" -- bash -c 'd=/lib/modules/$(uname -r)/kernel/drivers/net/ethernet; test -d "$d/mellanox" && test -e "$d/intel/i40e" || { echo "FATAL: mlx5/i40e driver modules missing" >&2; exit 1; }' \
+		incus exec "$INSTANCE_NAME" -- bash -c 'test -d "/lib/modules/$(uname -r)/kernel/drivers/net/ethernet/mellanox" || { echo "FATAL: mlx5 driver modules missing" >&2; exit 1; }' \
 			|| die "dataplane NIC driver modules missing from base image"
 
 		# Disable init_on_alloc — the default CONFIG_INIT_ON_ALLOC_DEFAULT_ON
