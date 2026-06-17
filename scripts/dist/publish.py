@@ -154,10 +154,26 @@ def gate_images(dist):
     # wherever it sits (e.g. a nested dist/stable/xpf-evil.qcow2). The apt pool
     # is gated separately (gate_apt) so skip apt/.
     apt_dir = os.path.join(dist, "apt")
-    for root, _dirs, files in os.walk(dist):
+    for root, dirs, files in os.walk(dist):
         if root == apt_dir or root.startswith(apt_dir + os.sep):
+            dirs[:] = []
             continue
+        # Reject symlinks under the image publish root (Codex-r4): os.walk
+        # does not follow dir symlinks, but a backend that dereferences them
+        # (some sync tools) could upload nested unverified bytes the sweep
+        # never saw. Refuse any symlink (dir or file) outside apt/.
+        for d in list(dirs):
+            if os.path.islink(os.path.join(root, d)):
+                rel = os.path.relpath(os.path.join(root, d), dist)
+                die(f"symlinked directory in the image publish set: {rel} — "
+                    "refusing (a dereferencing backend could upload "
+                    "unverified bytes).")
         for name in sorted(files):
+            full = os.path.join(root, name)
+            if os.path.islink(full):
+                rel = os.path.relpath(full, dist)
+                die(f"symlink in the image publish set: {rel} — refusing "
+                    "(a dereferencing backend could upload unverified bytes).")
             if not name.endswith(IMAGE_ARTIFACT_SUFFIXES):
                 continue
             rel = os.path.relpath(os.path.join(root, name), dist)
@@ -346,6 +362,16 @@ def main(argv):
     dist = a.dist
     if not os.path.isdir(dist):
         die(f"dist dir not found: {dist}")
+
+    # An image-only publish (--no-apt) dispatches the WHOLE dist root, which
+    # includes dist/apt if present — so apt bytes would ship UNGATED
+    # (Codex-r4). Refuse --no-apt when an apt tree exists; either gate it too
+    # or publish from a tree without apt/.
+    if a.no_apt and not a.no_image and os.path.isdir(os.path.join(dist, "apt")):
+        die("--no-apt but dist/apt exists: an image publish uploads the whole "
+            "dist tree (including apt/), so the apt repo would ship UNGATED. "
+            "Drop --no-apt (gate apt too), or move dist/apt out of the publish "
+            "root.")
 
     # ── fail-closed gate ──
     if not a.no_image:

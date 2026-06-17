@@ -209,6 +209,17 @@ else
     ok "publish refuses an orphan image artifact"
 fi
 
+# Symlink under the image publish root (Codex-r4).
+PGS="$WORK/pgsym"; mkdir -p "$PGS"
+cp "$QCOW" "$META" "$MANIFEST" "$MANIFEST.minisig" "$PGS/"
+ln -s /etc/passwd "$PGS/sneaky.qcow2"
+if XPF_IMAGE_PUBKEY="$WORK/img.pub" $PY "$DIST/publish.py" \
+     --dist "$PGS" --channel stable --no-apt >/dev/null 2>&1; then
+    bad "publish MUST refuse a symlink in the image set but PASSED"
+else
+    ok "publish refuses a symlink in the image set"
+fi
+
 # ── 6. install.sh dry-run ──────────────────────────────────────────────────
 info "6. install.sh --dry-run (preflight + source rendering)"
 if XPF_DRY_RUN=1 XPF_APT_BASE_URL="https://example.invalid/apt" XPF_CHANNEL=stable \
