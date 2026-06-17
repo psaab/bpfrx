@@ -2203,6 +2203,159 @@ pub(super) fn poll_binding_process_descriptor(
                             }
                             ForwardingDisposition::MissingNeighbor => {
                                 telemetry.dbg.missing_neigh += 1;
+                                // #919/#922: zero-allocation ID-native zone
+                                // resolution. Computed at the TOP of the arm so
+                                // the #1913 policy gate below can run BEFORE the
+                                // negative-cache fast-fail / resolver enqueue.
+                                let (from_zone_id, to_zone_id) =
+                                    zone_pair_ids_for_flow_with_override(
+                                        worker_ctx.forwarding,
+                                        meta.ingress_ifindex as i32,
+                                        ingress_zone_override,
+                                        decision.resolution.egress_ifindex,
+                                    );
+                                // Borrow zone names as &str (no clone) for the
+                                // string-typed downstream NAT helpers.
+                                let from_zone: &str = worker_ctx
+                                    .forwarding
+                                    .zone_id_to_name
+                                    .get(&from_zone_id)
+                                    .map(|s| s.as_str())
+                                    .unwrap_or("");
+                                let to_zone: &str = worker_ctx
+                                    .forwarding
+                                    .zone_id_to_name
+                                    .get(&to_zone_id)
+                                    .map(|s| s.as_str())
+                                    .unwrap_or("");
+                                // #1913 (Codex r2/r3): evaluate policy for the
+                                // MissingNeighbor cold path BEFORE any forwarding
+                                // OR neighbor-resolution side-effect. The
+                                // MissingNeighbor arm has its OWN policy
+                                // evaluation (the main deny→PolicyDenied
+                                // conversion lives only in the ForwardCandidate
+                                // branch). A DENY must exit here so a denied flow
+                                // never enqueues the shared resolver / fires a
+                                // kernel ARP/NDP probe (network traffic for a
+                                // flow policy says to drop, repeated per packet
+                                // since denied frames are not buffered), never
+                                // runs the negative-cache fast-fail, never seeds
+                                // a session, never buffers in pending_neigh, and
+                                // never reaches the slow-path reinject gate.
+                                // `MissingNeighbor` is slow-path-eligible, so
+                                // without this conversion a denied unresolved-
+                                // neighbor cold-path packet was forwarded by the
+                                // kernel FIB (a zone-policy bypass). The cold-path
+                                // histogram samples this eval (session-install
+                                // slow path).
+                                if let Some(flow) = flow.as_ref() {
+                                    let (cp_sample_tag, cp_t_in) = {
+                                        let cp = &mut binding.cold_path;
+                                        cp.sample_phase =
+                                            cp.sample_phase.wrapping_add(1);
+                                        let tag = (cp.sample_phase
+                                            & worker_ctx.cold_path_sample_mask)
+                                            == 0;
+                                        let t = if tag {
+                                            crate::afxdp::cold_path_hist::sample_tsc_start()
+                                        } else {
+                                            0
+                                        };
+                                        (tag, t)
+                                    };
+                                    let policy_result = evaluate_policy_result_with_len(
+                                        &worker_ctx.forwarding.policy,
+                                        from_zone_id,
+                                        to_zone_id,
+                                        flow.src_ip,
+                                        flow.dst_ip,
+                                        flow.forward_key.protocol,
+                                        flow.forward_key.src_port,
+                                        flow.forward_key.dst_port,
+                                        desc.len as u64,
+                                    );
+                                    if cp_sample_tag {
+                                        let t_out =
+                                            crate::afxdp::cold_path_hist::sample_tsc_end();
+                                        let q32 = binding.cold_path.ns_per_tsc_q32;
+                                        if q32 != 0 {
+                                            let delta_tsc =
+                                                t_out.saturating_sub(cp_t_in);
+                                            let raw_ns = ((delta_tsc as u128
+                                                * q32 as u128)
+                                                >> 32)
+                                                as u64;
+                                            let baseline =
+                                                binding.cold_path.wrapper_ns_baseline;
+                                            let delta_ns = if raw_ns < baseline {
+                                                binding
+                                                    .cold_path
+                                                    .wrapper_underflow_count = binding
+                                                    .cold_path
+                                                    .wrapper_underflow_count
+                                                    .saturating_add(1);
+                                                0
+                                            } else {
+                                                raw_ns - baseline
+                                            };
+                                            if let Some(slot) =
+                                                crate::afxdp::cold_path_hist::lookup_slot(
+                                                    &worker_ctx
+                                                        .forwarding
+                                                        .cold_path_slot_map,
+                                                    from_zone_id,
+                                                    to_zone_id,
+                                                )
+                                            {
+                                                binding.cold_path.record_sample(
+                                                    slot,
+                                                    from_zone_id,
+                                                    to_zone_id,
+                                                    delta_ns,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    if !matches!(policy_result.action, PolicyAction::Permit) {
+                                        let owner_rg_id = owner_rg_for_resolution(
+                                            worker_ctx.forwarding,
+                                            decision.resolution,
+                                        );
+                                        emit_policy_deny_event(
+                                            worker_ctx.event_stream,
+                                            flow,
+                                            meta,
+                                            from_zone_id,
+                                            to_zone_id,
+                                            owner_rg_id,
+                                            policy_result.policy_id,
+                                            policy_result.action,
+                                            now_ns,
+                                        );
+                                        telemetry.dbg.policy_deny += 1;
+                                        decision.resolution.disposition =
+                                            ForwardingDisposition::PolicyDenied;
+                                        record_forwarding_disposition(
+                                            &worker_ctx.ident,
+                                            DispositionCounters::Hot(telemetry.counters),
+                                            decision.resolution,
+                                            desc.len as u32,
+                                            Some(meta),
+                                            debug.as_ref(),
+                                            worker_ctx.recent_exceptions,
+                                            worker_ctx.last_resolution,
+                                            worker_ctx.forwarding,
+                                        );
+                                        binding.scratch.scratch_recycle.push(desc.addr);
+                                        continue;
+                                    }
+                                }
+                                // No flow tuple (e.g. non-first fragment) skips
+                                // the early policy gate and falls through to the
+                                // negative-cache / probe / reinject path,
+                                // preserving the pre-#1913 behavior —
+                                // `MissingNeighbor` for a flowless packet was
+                                // always slow-path-eligible.
                                 // #1651 B3: dead-host fast-fail gate. Runs at
                                 // the very top of the MissingNeighbor arm,
                                 // BEFORE the kernel probe, session seed, and
@@ -2341,153 +2494,6 @@ pub(super) fn poll_binding_process_descriptor(
                                         continue;
                                     }
                                 }
-                                // #919/#922: zero-allocation ID-native resolution.
-                                let (from_zone_id, to_zone_id) = zone_pair_ids_for_flow_with_override(
-                                    worker_ctx.forwarding,
-                                    meta.ingress_ifindex as i32,
-                                    ingress_zone_override,
-                                    decision.resolution.egress_ifindex,
-                                );
-                                // Borrow zone names as &str (no clone) for the
-                                // string-typed downstream NAT helpers.
-                                let from_zone: &str = worker_ctx
-                                    .forwarding
-                                    .zone_id_to_name
-                                    .get(&from_zone_id)
-                                    .map(|s| s.as_str())
-                                    .unwrap_or("");
-                                let to_zone: &str = worker_ctx
-                                    .forwarding
-                                    .zone_id_to_name
-                                    .get(&to_zone_id)
-                                    .map(|s| s.as_str())
-                                    .unwrap_or("");
-                                // #1913 (Codex r2): evaluate policy for the
-                                // MissingNeighbor cold path BEFORE any
-                                // forwarding-side-effect. The MissingNeighbor
-                                // arm has its OWN policy evaluation (the main
-                                // deny→PolicyDenied conversion lives only in the
-                                // ForwardCandidate branch). A DENY must exit here
-                                // so a denied flow never triggers a kernel
-                                // ARP/NDP probe (network traffic for a flow
-                                // policy says to drop, repeated per packet since
-                                // denied frames are not buffered), never seeds a
-                                // session, never buffers in pending_neigh, and
-                                // never reaches the slow-path reinject gate.
-                                // `MissingNeighbor` is slow-path-eligible, so
-                                // without this conversion a denied unresolved-
-                                // neighbor cold-path packet was forwarded by the
-                                // kernel FIB (a zone-policy bypass). The cold-path
-                                // histogram samples this eval (session-install
-                                // slow path).
-                                if let Some(flow) = flow.as_ref() {
-                                    let (cp_sample_tag, cp_t_in) = {
-                                        let cp = &mut binding.cold_path;
-                                        cp.sample_phase =
-                                            cp.sample_phase.wrapping_add(1);
-                                        let tag = (cp.sample_phase
-                                            & worker_ctx.cold_path_sample_mask)
-                                            == 0;
-                                        let t = if tag {
-                                            crate::afxdp::cold_path_hist::sample_tsc_start()
-                                        } else {
-                                            0
-                                        };
-                                        (tag, t)
-                                    };
-                                    let policy_result = evaluate_policy_result_with_len(
-                                        &worker_ctx.forwarding.policy,
-                                        from_zone_id,
-                                        to_zone_id,
-                                        flow.src_ip,
-                                        flow.dst_ip,
-                                        flow.forward_key.protocol,
-                                        flow.forward_key.src_port,
-                                        flow.forward_key.dst_port,
-                                        desc.len as u64,
-                                    );
-                                    // #1620: cold-path histogram post-eval record.
-                                    if cp_sample_tag {
-                                        let t_out =
-                                            crate::afxdp::cold_path_hist::sample_tsc_end();
-                                        let q32 = binding.cold_path.ns_per_tsc_q32;
-                                        if q32 != 0 {
-                                            let delta_tsc =
-                                                t_out.saturating_sub(cp_t_in);
-                                            let raw_ns = ((delta_tsc as u128
-                                                * q32 as u128)
-                                                >> 32)
-                                                as u64;
-                                            let baseline =
-                                                binding.cold_path.wrapper_ns_baseline;
-                                            let delta_ns = if raw_ns < baseline {
-                                                binding
-                                                    .cold_path
-                                                    .wrapper_underflow_count = binding
-                                                    .cold_path
-                                                    .wrapper_underflow_count
-                                                    .saturating_add(1);
-                                                0
-                                            } else {
-                                                raw_ns - baseline
-                                            };
-                                            if let Some(slot) =
-                                                crate::afxdp::cold_path_hist::lookup_slot(
-                                                    &worker_ctx
-                                                        .forwarding
-                                                        .cold_path_slot_map,
-                                                    from_zone_id,
-                                                    to_zone_id,
-                                                )
-                                            {
-                                                binding.cold_path.record_sample(
-                                                    slot,
-                                                    from_zone_id,
-                                                    to_zone_id,
-                                                    delta_ns,
-                                                );
-                                            }
-                                        }
-                                    }
-                                    if !matches!(policy_result.action, PolicyAction::Permit) {
-                                        let owner_rg_id = owner_rg_for_resolution(
-                                            worker_ctx.forwarding,
-                                            decision.resolution,
-                                        );
-                                        emit_policy_deny_event(
-                                            worker_ctx.event_stream,
-                                            flow,
-                                            meta,
-                                            from_zone_id,
-                                            to_zone_id,
-                                            owner_rg_id,
-                                            policy_result.policy_id,
-                                            policy_result.action,
-                                            now_ns,
-                                        );
-                                        telemetry.dbg.policy_deny += 1;
-                                        decision.resolution.disposition =
-                                            ForwardingDisposition::PolicyDenied;
-                                        record_forwarding_disposition(
-                                            &worker_ctx.ident,
-                                            DispositionCounters::Hot(telemetry.counters),
-                                            decision.resolution,
-                                            desc.len as u32,
-                                            Some(meta),
-                                            debug.as_ref(),
-                                            worker_ctx.recent_exceptions,
-                                            worker_ctx.last_resolution,
-                                            worker_ctx.forwarding,
-                                        );
-                                        binding.scratch.scratch_recycle.push(desc.addr);
-                                        continue;
-                                    }
-                                }
-                                // No flow tuple (e.g. non-first fragment) skips
-                                // the early policy gate and falls through to the
-                                // probe + reinject path, preserving the pre-#1913
-                                // behavior — `MissingNeighbor` for a flowless
-                                // packet was always slow-path-eligible.
                                 // Send ARP/NDP solicitation via RAW socket (not XSK)
                                 // so the reply goes through the kernel's normal RX
                                 // path (cpumap_or_pass), bypassing XSK fill ring issues.

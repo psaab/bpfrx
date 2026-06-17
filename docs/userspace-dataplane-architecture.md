@@ -734,7 +734,10 @@ is [`userspace-dataplane-gaps.md`](userspace-dataplane-gaps.md).
   branch) and converts a deny to `PolicyDenied` — dropping and recycling
   without seeding a session or buffering for neighbor retry — so a denied
   unresolved-neighbor cold-path packet is not slow-path-reinjected (#1913).
-  This deny check runs BEFORE the kernel ARP/NDP probe in the
-  MissingNeighbor arm, so a denied flow never induces neighbor-resolution
-  network traffic on the egress interface (it would otherwise re-probe on
-  every packet, since denied frames are not buffered).
+  This deny check runs at the TOP of the MissingNeighbor arm — before the
+  negative-cache fast-fail / shared-resolver enqueue AND before the kernel
+  ARP/NDP probe — so a denied flow never induces neighbor-resolution
+  network traffic on the egress interface, never enqueues a resolver
+  probe, and never takes the dead-host fast-fail recycle path (it would
+  otherwise re-probe on every packet, since denied frames are not
+  buffered).

@@ -5766,6 +5766,71 @@ fn txn_policy_denied_missing_neighbor_is_dropped_not_reinjected() {
     );
 }
 
+/// #1913 (Codex r3): the deny gate must run BEFORE the negative-cache
+/// fast-fail / resolver enqueue at the top of the MissingNeighbor arm.
+/// With the dst's neg-cache key pre-seeded, a denied flow must STILL be
+/// converted to PolicyDenied and counted — not silently recycled by the
+/// neg_neigh_gate fast-fail path (which would skip the deny event/count
+/// and could enqueue a resolver probe for a flow policy says to drop).
+#[test]
+fn txn_policy_denied_missing_neighbor_skips_neg_cache_fast_fail() {
+    let mut snapshot = policy_deny_snapshot();
+    snapshot.zones = vec![
+        ZoneSnapshot {
+            name: "lan".to_string(),
+            id: TEST_LAN_ZONE_ID,
+        },
+        ZoneSnapshot {
+            name: "wan".to_string(),
+            id: TEST_WAN_ZONE_ID,
+        },
+    ];
+    snapshot.neighbors.clear();
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = BTreeMap::new();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    // Pre-seed the negative cache for the connected WAN dst's neg-cache
+    // key (egress reth0.80 ifindex 12, next_hop = the connected dst). If
+    // the deny gate ran AFTER neg_neigh_gate, this packet would fast-fail
+    // and recycle as a dead-host miss with NO policy deny counted.
+    let now_ns = 123_000_000_000u64;
+    binding.neg_neigh_cache.insert(
+        (12, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
+        now_ns,
+    );
+    let mut sessions = SessionTable::new();
+
+    let frame = build_policy_deny_tcp_syn_frame();
+    let meta = txn_meta_v4(24, TCP_FLAG_SYN, (frame.len() - 14) as u16);
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+
+    assert!(
+        dbg.policy_deny >= 1,
+        "denied flow must be counted as a policy deny even with the neg-cache key seeded (#1913 Codex r3)"
+    );
+    assert_eq!(
+        dbg.neg_neigh_fast_fail, 0,
+        "deny gate must run BEFORE the neg-cache fast-fail — a denied flow must not take the dead-host recycle path (#1913 Codex r3)"
+    );
+    assert_eq!(
+        binding.live.slow_path_packets.load(Ordering::Relaxed),
+        0,
+        "denied flow must NOT be reinjected (#1913)"
+    );
+    assert!(
+        binding.pending_neigh.is_empty(),
+        "denied flow must NOT be buffered (#1913)"
+    );
+}
+
 /// #1885 fixture: WAN underlay (reth0.80, VLAN 80) + a gre endpoint
 /// whose local outer address is 172.16.80.8 and whose gr- interface
 /// (ifindex 77) carries the inner address 10.255.0.1/30, so an inner
