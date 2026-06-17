@@ -76,20 +76,23 @@ self-contained on one incus host: the appliance is the L3 gateway, the
 LAN/WAN segments are pure L2 bridges, and interface SNAT means the WAN
 endpoint needs no route back.
 
-> **VENUE WARNING (verified 2026-06-15 live run).** The AF_XDP userspace
-> dataplane does NOT forward over **virtio** NICs in a plain incus VM: the
-> helper loops on `libxdp private bind: Device or resource busy` against
-> virtio multi-queue and never converges (you can't even drop the channel
-> count — "too low for existing zerocopy AF_XDP sockets"). On virtio,
-> everything up to and including the control plane works — boot, day-0
-> install/commit, interface bring-up with the configured addresses, and
-> the gateway is pingable (host-inbound) — but **L3 transit forwarding
-> yields 0 sessions**. Run the *forwarding* assertions only on a venue
-> with a real AF_XDP NIC: **mlx5 SR-IOV VFs** (the loss userspace cluster)
-> or **i40e PF passthrough** (the standalone test VM). On incus/virtio,
-> treat Tier 2 as a **control-plane + day-0 + interface-bring-up** check
-> (steps through "confirm the interface map" below), not a forwarding
-> proof.
+> **VENUE NOTE (updated 2026-06-17, #1921 RESOLVED).** The earlier warning
+> here — that the AF_XDP userspace dataplane could not forward over
+> **virtio** NICs in a plain incus VM (helper looping on `libxdp private
+> bind: Device or resource busy` against virtio multi-queue, L3 transit
+> yielding 0 sessions) — described the **#1921 bug, now fixed**. The cause
+> was threefold: a rebind double-stop EBUSY loop and a physical+unit
+> candidate double-bind (#1927), plus the actual transit outage — a
+> standalone node replaying 16 phantom inactive HA groups so the helper
+> gated all transit as HA-inactive and dropped it after XSK RX (#1929,
+> guard startup HA replay behind `if m.clusterHA`). With both merged,
+> virtio multi-queue AF_XDP forwards on a plain incus VM (proven: AUTO
+> bind flags=0 + the HA-gate fix forwards 5000 pps). Tier 2 forwarding
+> assertions therefore now run on incus/virtio as well as on a real
+> AF_XDP NIC venue (**mlx5 SR-IOV VFs** — the loss userspace cluster — or
+> **i40e PF passthrough** — the standalone test VM). Treat a virtio
+> `Device or resource busy` rebind loop or `0 sessions` transit as a
+> regression of #1921, not an expected venue limitation.
 
 ### Topology
 
