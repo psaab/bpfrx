@@ -548,14 +548,29 @@ func (t *tunnelManager) applyKernelTunnelLocked(tc *config.TunnelConfig) {
 	// existed inside startKeepalive but ran AFTER the recreate. After the
 	// drain the old runner's goroutine has returned and cannot issue any
 	// further LinkSet*. linkGen is the defense-in-depth backstop.
+	//
+	// A lookup error must be classified (Codex PR #1947 r1 HIGH): only a
+	// genuine NOT-FOUND means "absent → create". Any OTHER lookup error
+	// (EBUSY / transport hiccup) is TRANSIENT — it does NOT mean the link
+	// is gone, so we must NOT drain the live keepalive runner and must NOT
+	// fall through to a LinkAdd that would EEXIST. Abort and retry next
+	// apply, exactly like a transient LinkDel failure below.
 	willRecreate := false
 	var existing netlink.Link
-	if e, lookupErr := t.ops.LinkByName(tc.Name); lookupErr == nil {
+	e, lookupErr := t.ops.LinkByName(tc.Name)
+	switch {
+	case lookupErr == nil:
 		existing = e
 		willRecreate = !legacyTunnelMatches(e, desired)
-	} else {
-		// No existing link → a create (LinkAdd) below is a (re)create.
+	case isLinkNotFound(lookupErr):
+		// Absent → the LinkAdd below is a (re)create.
 		willRecreate = true
+	default:
+		// Transient lookup error: leave the runner and any live link
+		// untouched; retry on the next apply.
+		slog.Warn("tunnel lookup failed transiently; deferring apply",
+			"name", tc.Name, "err", lookupErr)
+		return
 	}
 	if willRecreate {
 		// Drain the stale runner first; bump the generation so any runner

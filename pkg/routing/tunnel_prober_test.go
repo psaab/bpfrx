@@ -177,6 +177,30 @@ func TestProberUnknownErrnoIsTransient(t *testing.T) {
 	})
 }
 
+// WriteTo local-resource errors must NOT be reported as Dead (Codex PR
+// #1947 r1 HIGH): a transmit-buffer storm would otherwise self-inflict a
+// tunnel down.
+func TestProberWriteResourceErrorIsTransient(t *testing.T) {
+	conn := &fakeProbeConn{writeErr: &os.SyscallError{Syscall: "sendto", Err: syscall.ENOBUFS}}
+	withListenICMP(conn, nil, func() {
+		res, kind := icmpProber{}.Probe("198.51.100.1", "203.0.113.1", 7, []byte("n"), 50*time.Millisecond)
+		if res != ProbeUnsupported || kind != UnsupportedTransient {
+			t.Fatalf("ENOBUFS on WriteTo must be Unsupported/Transient, got %v/%v", res, kind)
+		}
+	})
+}
+
+// WriteTo path-unreachable errors ARE a real liveness signal → Dead.
+func TestProberWritePathUnreachableIsDead(t *testing.T) {
+	conn := &fakeProbeConn{writeErr: &os.SyscallError{Syscall: "sendto", Err: syscall.EHOSTUNREACH}}
+	withListenICMP(conn, nil, func() {
+		res, _ := icmpProber{}.Probe("198.51.100.1", "203.0.113.1", 7, []byte("n"), 50*time.Millisecond)
+		if res != ProbeDead {
+			t.Fatalf("EHOSTUNREACH on WriteTo must be Dead, got %v", res)
+		}
+	})
+}
+
 func TestProberBadDestStructural(t *testing.T) {
 	res, kind := icmpProber{}.Probe("198.51.100.1", "not-an-ip", 7, []byte("n"), 50*time.Millisecond)
 	if res != ProbeUnsupported || kind != UnsupportedStructural {

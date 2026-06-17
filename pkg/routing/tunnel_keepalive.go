@@ -163,11 +163,16 @@ func (icmpProber) Probe(source, dst string, seq int, nonce []byte, deadline time
 		return ProbeUnsupported, classifyListenErr(err)
 	}
 	if _, err := conn.WriteTo(b, &net.UDPAddr{IP: ip}); err != nil {
-		// A write error after a successful socket open is most plausibly a
-		// path/route problem (ENETUNREACH/EHOSTUNREACH/no route): that IS a
-		// liveness signal, so report Dead rather than Unsupported. Resource
-		// errnos on write are rare; bucketing them Dead at worst costs one
-		// retry, never a silent forever-hold.
+		// Classify a write error (Codex PR #1947 r1 HIGH). A path/route
+		// problem (ENETUNREACH/EHOSTUNREACH/ENETDOWN — no route to the
+		// underlay peer) IS a real liveness signal → Dead. A LOCAL RESOURCE
+		// fault (ENOBUFS/ENOMEM/EAGAIN — transmit buffer pressure) is NOT
+		// peer death; bucketing it Dead would let a local resource storm
+		// self-inflict a tunnel down. Route it through hold-on-unknown
+		// (transient) instead, mirroring the ListenPacket classifier.
+		if kind := classifyWriteErr(err); kind != UnsupportedNone {
+			return ProbeUnsupported, kind
+		}
 		return ProbeDead, UnsupportedNone
 	}
 
@@ -241,6 +246,32 @@ func classifyListenErr(err error) UnsupportedKind {
 	default:
 		// Total default — UNRECOGNIZED → TRANSIENT (escalate).
 		return UnsupportedTransient
+	}
+}
+
+// classifyWriteErr buckets a WriteTo error. A LOCAL RESOURCE fault
+// (transmit-buffer pressure) returns UnsupportedTransient so the loop
+// holds-on-unknown rather than self-inflicting a down. Anything else
+// (path/route unreachable — ENETUNREACH/EHOSTUNREACH/ENETDOWN — or an
+// unclassifiable error) returns UnsupportedNone, telling the caller to
+// treat it as a real Dead liveness signal. NOTE the asymmetry with
+// classifyListenErr's "unrecognized → transient" default: a ListenPacket
+// failure means we could not probe at all (hold), but a WriteTo failure
+// to a specific destination is most plausibly that destination being
+// unreachable (Dead), so an unrecognized write error counts toward the
+// real-death path.
+func classifyWriteErr(err error) UnsupportedKind {
+	var errno syscall.Errno
+	if !errors.As(err, &errno) {
+		return UnsupportedNone // not an errno → treat as Dead
+	}
+	switch errno {
+	case syscall.ENOBUFS, syscall.ENOMEM, syscall.EAGAIN, syscall.EINTR, syscall.EMFILE, syscall.ENFILE:
+		return UnsupportedTransient
+	default:
+		// ENETUNREACH, EHOSTUNREACH, ENETDOWN, EADDRNOTAVAIL, etc. — a real
+		// path/liveness signal.
+		return UnsupportedNone
 	}
 }
 

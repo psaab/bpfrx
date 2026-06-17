@@ -409,6 +409,45 @@ func TestKeepaliveSourceBindAndMatches(t *testing.T) {
 	}
 }
 
+// --- Finding 1 (Codex PR #1947 r1 HIGH): a TRANSIENT LinkByName error
+// during apply must NOT drain the live keepalive runner nor bump the
+// generation; only a genuine NOT-FOUND or a present-but-changed link is
+// a recreate. ---
+func TestApplyTransientLookupKeepsRunner(t *testing.T) {
+	ops := newKaOps()
+	ops.byNameErr = errors.New("transient netlink transport error") // NOT a LinkNotFound
+	tm := &tunnelManager{ops: ops, vrfBinder: noopVRFBinder{}}
+	tm.ensureReconcileStateLocked()
+
+	// Seed a live keepalive runner + its generation token.
+	state, gen := newKAState(true, 3, 5)
+	tm.linkGen["gr0"] = gen
+	startGen := gen.Load()
+	tm.keepalives["gr0"] = &keepaliveRunner{
+		cancel:   func() {},
+		state:    state,
+		done:     make(chan struct{}),
+		remote:   "203.0.113.1",
+		source:   "198.51.100.1",
+		interval: 5, maxRetries: 3,
+		linkGen: gen, startGen: startGen,
+	}
+
+	tc := &config.TunnelConfig{
+		Name: "gr0", Mode: "gre",
+		Source: "198.51.100.1", Destination: "203.0.113.1",
+		Keepalive: 5, KeepaliveRetry: 3,
+	}
+	tm.applyKernelTunnelLocked(tc)
+
+	if _, ok := tm.keepalives["gr0"]; !ok {
+		t.Fatal("transient lookup error must NOT drain the keepalive runner")
+	}
+	if gen.Load() != startGen {
+		t.Fatalf("transient lookup error must NOT bump the generation: %d -> %d", startGen, gen.Load())
+	}
+}
+
 // --- prober errno classification ---
 func TestClassifyListenErr(t *testing.T) {
 	if got := classifyListenErr(errors.New("plain")); got != UnsupportedStructural {
