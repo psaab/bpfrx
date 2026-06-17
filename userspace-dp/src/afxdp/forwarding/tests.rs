@@ -2257,3 +2257,68 @@ fn tx_binding_resolution_uses_fabric_parent_ifindex() {
     let state = build_forwarding_state(&nat_snapshot_with_fabric());
     assert_eq!(resolve_tx_binding_ifindex(&state, 21), 21);
 }
+
+// === #1912: cold ENCAP outer next-hop neighbor keying ===
+
+#[test]
+fn outer_neighbor_ifindex_non_tunnel_returns_egress_ifindex() {
+    // For a non-tunnel resolution the helper must be byte-identical to
+    // egress_ifindex (the off-tunnel path is unchanged).
+    let state = build_forwarding_state(&nat_snapshot());
+    let resolution = lookup_forwarding_resolution_v4(
+        &state,
+        None,
+        Ipv4Addr::new(172, 16, 80, 200),
+        "inet.0",
+        0,
+        true,
+    );
+    assert_eq!(resolution.tunnel_endpoint_id, 0);
+    assert_eq!(
+        outer_neighbor_ifindex(&state, None, &resolution),
+        resolution.egress_ifindex
+    );
+}
+
+#[test]
+fn resolve_tunnel_outer_returns_outer_l3_egress() {
+    // The factored SSOT returns the OUTER transport resolution whose
+    // egress_ifindex is the outer L3 egress (reth0.80, ifindex 12 — a VLAN
+    // subif), NOT the tunnel logical ifindex (gr-0-0-0, 362).
+    let state = build_forwarding_state(&native_gre_snapshot(true));
+    let outer = resolve_tunnel_outer(&state, None, 1, 0).expect("outer resolves");
+    assert_eq!(outer.egress_ifindex, 12);
+    // VLAN outer transport: tx_ifindex is the PARENT (bind_ifindex 6), so
+    // the neighbor key (the subif) differs from tx_ifindex — keying by
+    // tx_ifindex would be wrong.
+    assert_eq!(outer.tx_ifindex, 6);
+}
+
+#[test]
+fn outer_neighbor_ifindex_tunnel_returns_outer_vlan_subif_not_logical_or_parent() {
+    // A tunnel-marked resolution carries egress_ifindex = tunnel logical
+    // (362) but next_hop = outer hop. The helper must return the outer L3
+    // egress (12, the VLAN subif), not the tunnel logical (362) and not the
+    // VLAN parent / tx_ifindex (6).
+    let state = build_forwarding_state(&native_gre_snapshot(false));
+    let resolution = resolve_tunnel_forwarding_resolution(&state, None, 1, 0);
+    assert_ne!(resolution.tunnel_endpoint_id, 0);
+    assert_eq!(resolution.egress_ifindex, 362);
+    assert_eq!(resolution.disposition, ForwardingDisposition::MissingNeighbor);
+    let neigh_if = outer_neighbor_ifindex(&state, None, &resolution);
+    assert_eq!(neigh_if, 12, "outer L3 subif, not tunnel logical");
+    assert_ne!(neigh_if, resolution.egress_ifindex, "not the tunnel logical");
+    assert_ne!(neigh_if, resolution.tx_ifindex, "not the VLAN parent");
+}
+
+#[test]
+fn outer_neighbor_ifindex_missing_endpoint_falls_back_to_egress_ifindex() {
+    // The `> 0` fallback: a tunnel-marked resolution whose endpoint id is
+    // unknown to live state must fall back to egress_ifindex rather than
+    // probe ifindex 0.
+    let state = build_forwarding_state(&native_gre_snapshot(true));
+    let mut resolution = no_route_resolution(None);
+    resolution.tunnel_endpoint_id = 9999; // not present in state
+    resolution.egress_ifindex = 777;
+    assert_eq!(outer_neighbor_ifindex(&state, None, &resolution), 777);
+}
