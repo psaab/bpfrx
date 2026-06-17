@@ -20,3 +20,25 @@ Convergence requires Claude SMR + Codex + AGY all PLAN-READY on the FINAL rev.
 6. sshd class inconsistency §2 vs §4/§5 (Codex MEDIUM) — settle.
 7. TLS cert class vs pinning harm (Codex#2) — settle both-DurableState or drop pinning harm.
 8. DNS B-route underspecified (Codex MEDIUM) — must check isCrossDeviceOrBusy on fsatomic err, no WithResolveSymlinks.
+
+## r2 verdicts (all PLAN-NEEDS-REVISION)
+| Round | Reviewer | Task/Job ID | Verdict | Artifact |
+|---|---|---|---|---|
+| r2 | Codex | foreground nohup pid 3117577, log /tmp/1916-codex-r2.log | PLAN-NEEDS-REVISION | codex-plan-r2.md |
+| r2 | AGY | adversarial-review-mqi2c6h9-7bi6qk | PLAN-NEEDS-REVISION | agy-plan-r2.md |
+| r2 | Claude SMR | n/a | PLAN-NEEDS-REVISION (M1: cert non-loopback → DurableState) | claude-smr-plan-r2.md |
+
+## r3 (final) — pending re-review
+| r3 | Codex | (pending) | | codex-plan-r3.md |
+| r3 | AGY | (pending) | | agy-plan-r3.md |
+| r3 | Claude SMR | n/a | | claude-smr-plan-r3.md |
+
+## r2 findings addressed in r3 (§13 changelog)
+- Claude SMR M1: cert=DurableState (non-loopback https-interface bind refutes r2 loopback premise)
+- Codex HIGH#1: D5 strict unlink contract (ignore only ENOENT, abort on other error)
+- Codex HIGH#2: /etc/timezone added to §2.B; count fixed (36 real, 4 comment)
+- Codex MED#1: caller wiring — persistence failure returns nil err + in-memory cert; HTTPS stays installed
+- Codex MED#2 / AGY #6b: canary receiver-aware keying relpath::recv.method
+- Codex LOW: WithOwner vs WithPreserveExisting precedence
+- AGY #3: timezone early-return crash loophole (check both halves)
+- AGY #6a: cgo-free lookupUIDGID, no os/user

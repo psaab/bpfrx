@@ -3,8 +3,9 @@
 - **Issue**: #1916 — Durability coverage gap: fsatomic canary excludes
   `pkg/daemon` + `pkg/api`; TLS cert/key persisted non-atomically with
   ignored errors.
-- **Revision**: r2 (addresses all r1 convergent findings: Claude SMR +
-  Codex + AGY all PLAN-NEEDS-REVISION). Changelog at §12.
+- **Revision**: r3 (addresses all r2 findings: Claude SMR M1 +
+  Codex HIGH×2/MED×2/LOW + AGY timezone/cgo/keying). r2 changelog at §12,
+  r3 changelog at §13.
 - **Branch**: `research/1916-durability-coverage`
 - **Base**: `origin/master` @ `26e4a112d` (post-#1944 #1949 merge, post-#1950)
 - **Scope class**: bug / durability hardening + test-coverage extension.
@@ -43,17 +44,21 @@ The gap is **scope, not mechanism**:
      cert/key pair on disk that does not match (the order makes this
      worse when a stale pair pre-exists — see §4 D5).
 
-   **Cert-pinning harm — settled (Codex HIGH#2 / D6):** the self-signed
-   cert is generated for the HTTP REST API on 127.0.0.1:8080 (loopback).
-   It is NOT distributed to remote clients that pin it; the only consumer
-   is local. We therefore **DROP the "clients that pinned the previous
-   cert break" harm** from the problem statement — it was speculative and
-   contradicted the cert's AtomicGeneratedConfig classification. The real,
-   operator-visible harm is the **silent persistence failure** (operator
-   believes the cert persisted; it did not) and the **cosmetic cert churn
-   on every boot** if the key fails to persist. This resolves the Codex
-   HIGH#2 "cannot both be true" contradiction in favor of "cert loss after
-   power cut is acceptable; silent failure is not."
+   **Cert-pinning harm — CORRECTED in r3 (Claude SMR M1 reverses r2 D6).**
+   r2 claimed the cert was loopback-only and dropped the pinning harm.
+   That premise is **false**, verified in
+   `pkg/daemon/daemon_run.go:1093-1099`: when `system services
+   web-management https interface <if>` is configured, the HTTPS API binds
+   to a **non-loopback interface address** (`httpsBindIP =
+   resolveInterfaceAddr(wm.HTTPSInterface, ...)`, `HTTPSAddr =
+   httpsBindIP + ":8443"`) and is reached by **remote** management
+   clients. So cert churn after a power-cut loss of the cert DOES break
+   remote clients' TOFU pin / triggers browser warnings — a real
+   operator-visible regression. **r3 keeps the cert-stability harm** and
+   classifies **both cert and key as DurableState** (see D6). The silent
+   persistence failure (operator believes persistence succeeded; it did
+   not, so HTTPS may even be disabled — see D5 caller wiring) remains the
+   other real harm.
 
 3. **`pkg/daemon/daemon_system.go` writes management-critical files**
    raw: `/etc/hostname`, rsyslog drop-ins, `/etc/sudoers.d/xpf-<user>`,
@@ -78,16 +83,19 @@ The gap is **scope, not mechanism**:
 
 ## 2. Complete repo-wide `os.WriteFile` inventory (verified against base)
 
-**This is the exhaustive inventory** (r1 missed 7 sites — Claude C1 /
-AGY#2 / Codex#4). Verified via `grep -rn 'os\.WriteFile' pkg/ --include=
-'*.go' | grep -v _test.go` (40 hits; the 3 in `pkg/fsatomic/fsatomic.go`
-are COMMENTS, not calls — the AST canary correctly ignores them).
-Classified by `docs/engineering-style.md` §"Persistence classes (#1894)".
+**This is the exhaustive inventory** (r1 missed 7 sites; r2 missed
+`/etc/timezone` in the table — Codex r2 HIGH#2 / AGY r2). Verified via
+`grep -rn 'os\.WriteFile' pkg/ --include='*.go' | grep -v _test.go`
+(40 hits total; **4 are non-call comment hits** — `pkg/frr/manager.go:502`
+plus the 3 in `pkg/fsatomic/fsatomic.go` — leaving **36 real production
+calls**; the AST canary correctly ignores comment hits). Classified by
+`docs/engineering-style.md` §"Persistence classes (#1894)".
 
 ### A. To migrate — DurableState → `fsatomic.WriteFileDurable`
 | File:line | Enclosing func | File | Notes |
 |---|---|---|---|
 | `api/server.go:366` | `generateSelfSignedCert` | TLS key | secret; D5 ordering |
+| `api/server.go:365` | `generateSelfSignedCert` | TLS cert | **D6 r3: DurableState (non-loopback bind, pin-stability)**; D5 ordering |
 | `daemon/daemon_system.go:219` | `applyHostname` | `/etc/hostname` | identity |
 | `daemon/daemon_system.go:707` | `applySystemLogin` | sudoers | security-critical |
 | `daemon/daemon_system.go:724` | `applySystemLogin` | user authorized_keys | **needs owner fix, D7** |
@@ -98,9 +106,9 @@ Classified by `docs/engineering-style.md` §"Persistence classes (#1894)".
 ### B. To migrate — AtomicGeneratedConfig → `fsatomic.WriteFileAtomic`
 | File:line | Enclosing func | File |
 |---|---|---|
-| `api/server.go:365` | `generateSelfSignedCert` | TLS cert (D6: regenerable, loopback) |
 | `daemon/daemon_system.go:304` | `reconcileManagedFile` | chrony drop-in |
 | `daemon/daemon_system.go:476` | `applySSHKnownHosts` | ssh_known_hosts (D2b) |
+| `daemon/daemon_system.go:510` | `applyTimezone` | `/etc/timezone` (Step 2b; early-return fix — AGY r2 #3) |
 | `daemon/daemon_system.go:636` | `applySystemSyslog` | rsyslog drop-in |
 | `daemon/daemon_system.go:844` | `applySSHConfig` | sshd drop-in (D2: settled AtomicGeneratedConfig) |
 | `daemon/daemon_reth.go:26` | `fixRethLinkFile` | RETH `.link` |
@@ -169,12 +177,25 @@ durable write there is still caught.
 ## 4. Settled decisions (r1 left these open; reviewers required closure)
 
 - **D1 — canary scope: Path A (writer-class repo-wide scanner), keyed by
-  `relpath::funcName`.** SETTLED. Removes the recurring "new package
-  escapes" failure mode. The `relpath::func` key avoids the global-name
-  collision the old bare-name map risked (now multiple packages
-  contribute knob helpers). Path B (extend package allowlist) remains a
-  strictly-smaller fallback if review re-opens, but all three reviewers
-  accepted A in principle once the inventory is complete (§2).
+  RECEIVER-AWARE `relpath::[recv.]funcName`.** SETTLED (r3 closes the
+  Codex r2 MED#2 / AGY r2 #6b open question). The repo-wide scan removes
+  the "new package escapes" failure mode. The key MUST disambiguate
+  methods, not just packages: r2's bare `relpath::funcName` still
+  allowlists EVERY same-named function/method in the same package dir
+  (e.g. `daemon::writeFile` would exempt any future `writeFile` in
+  `pkg/daemon`). **r3 settles the canary to extend the AST keyer to format
+  the receiver type for methods**: a `*ast.FuncDecl` with a non-nil `Recv`
+  is keyed `relpath::RecvType.MethodName` (strip a leading `*`), and a
+  plain function is keyed `relpath::FuncName`. Concrete allowlist forms:
+  `dataplane::CompileResult.tuneInterfaceBuffers`,
+  `daemon::realHostTunableFS.writeFile`; plain-func entries like
+  `daemon::applyKernelTuning`. This is a small extension to the existing
+  keyer (read `fn.Recv.List[0].Type`) and is NOT left as an
+  implementation-time open question — it is part of the canary policy this
+  PR delivers. Path B (extend package allowlist) remains a strictly-smaller
+  fallback if review re-opens, but all three reviewers accepted A in
+  principle once the inventory is complete (§2) and the keying is
+  receiver-aware.
 - **D2 — sshd drop-in = AtomicGeneratedConfig.** SETTLED (was internally
   inconsistent in r1 — Codex MEDIUM). Rationale: it is regenerated from
   config on every apply and reloaded immediately; a power-cut loss
@@ -221,28 +242,57 @@ durable write there is still caught.
   starting state is {neither}), THEN write key (durable), THEN cert
   (atomic). With a clean {neither} start, the only crash-visible states
   are {neither}, {key-only}, {both-matching}. `tls.LoadX509KeyPair` reads
-  the cert first and errors on key-only → clean regen. Sequence:
-  1. `fsatomic.MkdirAllDurable("/etc/xpf/tls", 0700)`
-  2. remove stale cert + key if present (best-effort `os.Remove`; then one
-     `fsatomic.SyncDir("/etc/xpf/tls")` to make the unlinks durable)
-  3. `fsatomic.WriteFileDurable(keyPath, keyPEM, 0600)`
-  4. `fsatomic.WriteFileAtomic(certPath, certPEM, 0644)`
-  5. on ANY error in 2-4: `slog.Error(...)` with path+err, still return the
-     in-memory `tls.X509KeyPair(certPEM, keyPEM)` so the server starts.
-  Claim in the plan is now: "no crash-visible *mismatched* pair, given the
-  stale-pair removal in step 2." This is honest and testable (D5 tests in
-  §5 Step 7 cover stale-cert-only and stale-mismatched starts).
+  the cert first and errors on key-only → clean regen.
+
+  **r3 strict unlink contract (Codex r2 HIGH#1).** "best-effort
+  `os.Remove`" was too weak: an ignored non-ENOENT remove error or a
+  failed dir sync leaves a stale cert, and writing the new key then
+  crashing reproduces the very mismatch D5 claims is gone. Contract:
+  ignore ONLY `os.IsNotExist`; on ANY other remove error OR on `SyncDir`
+  error, do NOT proceed to write the new key/cert — surface the error and
+  return the in-memory cert, so the {neither} start is *proven*, not
+  assumed. Sequence:
+  1. `fsatomic.MkdirAllDurable("/etc/xpf/tls", 0700)`; on error → step 5.
+  2. `os.Remove(certPath)` then `os.Remove(keyPath)`: `os.IsNotExist` =
+     success; ANY other error → abort to step 5 (do NOT write). Then
+     `fsatomic.SyncDir("/etc/xpf/tls")`; on error → abort to step 5. Only
+     now is the start state provably {neither}.
+  3. `fsatomic.WriteFileDurable(keyPath, keyPEM, 0600)`; on error → step 5.
+  4. `fsatomic.WriteFileDurable(certPath, certPEM, 0644)`; on error → 5.
+     (Both DurableState per D6 r3.)
+  5. **Error handling + caller wiring (Codex r2 MED#1).** On ANY error in
+     1-4: `slog.Error(...)` with path+err, and the helper returns the
+     in-memory `tls.X509KeyPair(certPEM, keyPEM)` with a **nil** error for
+     a *persistence* failure (the cert was generated; only the disk write
+     failed). A non-nil error is returned ONLY for a true *generation*
+     failure (no usable cert at all). **The caller
+     (`pkg/api/server.go:264-277`) installs `s.httpsServer` only in the
+     nil-error `else` branch today — fine under this contract because
+     persistence failures now return nil error, so HTTPS is NOT disabled
+     by a disk-write failure.** A server-level test asserts HTTPS is still
+     installed (httpsServer != nil) when persistence fails.
+  Claim is now: "no crash-visible *mismatched* pair, given the *strict*
+  remove+sync contract in step 2; a disk-write failure logs + still serves
+  HTTPS with the in-memory cert." Testable (§5 Step 7 covers
+  stale-cert-only, mismatched-start, remove-failure, dir-sync-failure,
+  crash-after-key, and the still-serves-HTTPS-on-persist-failure case).
   - **Alternative considered & rejected**: a versioned single-bundle
     pointer (write `tls/v<N>/` then atomic-symlink swap). Heavier; the
-    remove-then-ordered-write achieves the same crash-safety for a
-    loopback self-signed cert. Documented for the record.
-- **D6 — TLS cert class = AtomicGeneratedConfig; cert-pinning harm
-  DROPPED.** SETTLED (Codex HIGH#2). See §1 item 2. The key is
-  DurableState; the cert is AtomicGeneratedConfig. The contradiction is
-  resolved by removing the (incorrect, loopback) pinning harm. **Open
-  micro-question for reviewers:** if any reviewer asserts the cert IS
-  consumed by a non-loopback pinner, promote cert to DurableState too
-  (cheap; one fsync on the rare regen path). Default: AtomicGeneratedConfig.
+    strict-remove-then-ordered-durable-write achieves equivalent
+    crash-safety. Documented for the record.
+- **D6 — TLS cert class = DurableState (r3 CORRECTION).** Claude SMR M1
+  REVERSES the r2 settlement. r2 set cert = AtomicGeneratedConfig and
+  dropped the pinning harm on a FALSE loopback premise. Verified in
+  `pkg/daemon/daemon_run.go:1093-1099`: `system services web-management
+  https interface <if>` binds the HTTPS API to a **non-loopback** address
+  reachable by remote clients, so cert churn after power-cut loss breaks
+  remote TOFU pins / triggers browser warnings — a real regression. **r3:
+  BOTH cert and key are DurableState** (`fsatomic.WriteFileDurable`). Cost:
+  one extra fsync on the rare regen path (operator/boot-paced) —
+  acceptable. This RESOLVES Codex r2 HIGH#2's contradiction the *other*
+  way: keep the harm in §1, make the cert durable. **Flagged for Codex +
+  AGY re-review** — Codex r2 accepted AtomicGeneratedConfig only because it
+  accepted r2's loopback premise (now refuted with code evidence).
 - **D7 — authorized_keys ownership across inode replacement.** SETTLED
   (Codex HIGH#3 / AGY#1). The r1 "keep `chown -R` after" is **NOT
   behavior-preserving**: `os.WriteFile` over an existing user-owned file
@@ -255,12 +305,24 @@ durable write there is still caught.
     that `fchown`s the temp fd before close/rename (mirrors the existing
     `chownTemp` seam used by `WithPreserveExisting`). Call sites:
     `WriteFileDurable(keysFile, content, 0600, fsatomic.WithOwner(uid,
-    gid))`. Resolve `uid/gid` via `user.Lookup(user.Name)` once. The
-    user/dir already exists (created earlier in `applySystemLogin`), so the
-    UID is resolvable. This makes the rename atomically install a
-    correctly-owned file — no post-rename chown race. Keep a
-    `chown` of the *.ssh dir* (the dir is created by `os.MkdirAll` as root;
-    fix it once, idempotent) — but the *file* is correctly-owned at rename.
+    gid))`. **Resolve `uid/gid` cgo-free (AGY r2 #6a).** Do NOT use
+    `os/user.Lookup` — the codebase deliberately avoids it (cgo/nsswitch)
+    and parses `/etc/passwd` directly via `lookupUID`
+    (`pkg/daemon/login_password.go:115-137`, "cgo-free, consistent with
+    currentShadowHash"). GID is field 3 on the same `/etc/passwd` line, so
+    **extend `lookupUID` → `lookupUIDGID(name) (uid, gid int, ok bool)`**
+    (or add a sibling) and reuse the existing parse. The user/dir already
+    exists (created earlier in `applySystemLogin`), so the entry is
+    resolvable. This makes the rename atomically install a correctly-owned
+    file — no post-rename chown race. Keep a `chown` of the *.ssh dir*
+    (created by `os.MkdirAll` as root; fix once, idempotent) — but the
+    *file* is correctly-owned at rename.
+    - **`WithOwner` vs `WithPreserveExisting` precedence (Codex r2 LOW).**
+      Define: `WithPreserveExisting` may lift mode from an existing target,
+      but an explicit `WithOwner` always WINS ownership (the chown uses the
+      `WithOwner` uid/gid). If both are passed, owner = `WithOwner`'s, mode
+      = preserved-existing's. Unit-test this precedence. authorized_keys
+      uses `WithOwner` only (no preserve).
   - **D7-b (fallback): `WithPreserveExisting()`** — lifts the existing
     file's owner. Correct on *re-writes* but NOT first-write (no existing
     file → temp stays root-owned). Would still need an explicit owner set
@@ -292,38 +354,56 @@ durable write there is still caught.
 - Add `func WithOwner(uid, gid int) Option` + an `owner *ownerIDs` field
   on `options`; in `writeFile`, after `chmodTemp`, if `WithOwner` set,
   `chownTemp(tmp, uid, gid)` before the durable sync/close/rename. Reuses
-  the existing `chownTemp` test seam. Unit test: temp fd owned as
-  requested before rename (inject `chownTemp` to assert call order).
-- Document the new option in `pkg/fsatomic/fsatomic.go` header +
-  `pkg/fsatomic/README.md`.
+  the existing `chownTemp` test seam. **Precedence (Codex r2 LOW):** if
+  both `WithOwner` and `WithPreserveExisting` are set, owner =
+  `WithOwner`'s uid/gid (explicit wins), mode = preserved-existing's.
+  Unit test: temp fd owned as requested before rename (inject `chownTemp`
+  to assert call order) + the precedence combination.
+- Document the new option + precedence in `pkg/fsatomic/fsatomic.go`
+  header + `pkg/fsatomic/README.md`.
+
+### Step 0b — cgo-free uid/gid resolver (AGY r2 #6a)
+- Extend `pkg/daemon/login_password.go` `lookupUID` →
+  `lookupUIDGID(name) (uid, gid int, ok bool)` (or a sibling), parsing
+  `/etc/passwd` fields 2 (uid) and 3 (gid) in the same scan. Do NOT
+  introduce `os/user` (cgo/nsswitch — used nowhere in the repo, verified).
+  `applySystemLogin` (D7-a call site) uses this to feed `WithOwner`.
 
 ### Step 1 — TLS persistence (`pkg/api/server.go`) — D5 + D6
 - Refactor to a path-parameterized inner func
   `generateSelfSignedCertAt(certPath, keyPath string) (tls.Certificate,
   error)`; the existing entry delegates with the package paths. (Test seam
   per D-test; avoids a `const`→`var` global-race — Claude M3.)
-- Implement the D5 sequence (MkdirAllDurable → remove stale pair +
-  SyncDir → key durable → cert atomic → log errors, return in-memory pair).
+- Implement the D5 STRICT sequence (MkdirAllDurable → strict-remove stale
+  pair [ignore only ENOENT] + SyncDir → **abort on any non-ENOENT/sync
+  error** → key durable → cert **durable** [D6 r3] → on persistence error,
+  log + return in-memory cert with NIL error so HTTPS still installs).
+- **Caller wiring (Codex r2 MED#1):** confirm `pkg/api/server.go:264-277`
+  installs `s.httpsServer` whenever a usable cert is returned. Under the
+  nil-error-on-persistence-failure contract the existing `else` branch is
+  correct; add a server-level test asserting `httpsServer != nil` when the
+  disk write fails.
 
 ### Step 2 — `pkg/daemon/daemon_system.go` migrations
 - DurableState → `WriteFileDurable`: hostname (219), sudoers (707), user
-  keys (724, **+ `WithOwner(uid,gid)`** D7-a), root keys (899, optionally
+  keys (724, **+ `WithOwner(uid,gid)`** D7-a via Step 0b), root keys (899,
   `WithOwner(0,0)`).
 - AtomicGeneratedConfig → `WriteFileAtomic`: chrony (304), ssh_known_hosts
-  (476), rsyslog (636), sshd drop-in (844).
-- timezone (510): **D-decision below.**
+  (476), rsyslog (636), sshd drop-in (844), timezone (510 — Step 2b).
 
-### Step 2b — timezone (D from r1 §10 + AGY#3 + Codex MEDIUM)
-r1 classified `/etc/timezone` DurableState, but it is paired with the
-`/etc/localtime` symlink which is updated NON-atomically
-(`os.Remove`+`os.Symlink`, no dir sync). Making only `/etc/timezone`
-durable leaves the pair inconsistent after a crash. **SETTLED:** classify
-`/etc/timezone` as **AtomicGeneratedConfig** (`WriteFileAtomic`). The
-timezone is re-derived and re-applied on every boot from the active
-config, so a power-cut loss of either half self-heals on next apply; there
-is no need to pay DurableState + a symlink-durability redesign for a file
-the daemon regenerates. (Leave the `/etc/localtime` symlink logic
-unchanged — out of scope; it is regenerated on apply.)
+### Step 2b — timezone (AGY r2 #3 early-return crash loophole)
+Classify `/etc/timezone` as **AtomicGeneratedConfig** (`WriteFileAtomic`):
+it is re-derived and re-applied every boot from active config, so a
+power-cut loss self-heals next apply; not worth DurableState + a
+symlink-durability redesign. **BUT fix the early-return loophole
+(AGY r2 #3):** `applyTimezone` currently returns early when
+`/etc/localtime` already points at the target — so if a prior crash wrote
+the symlink but NOT `/etc/timezone`, the next boot short-circuits and
+`/etc/timezone` stays stale forever. **Change the early-return guard to
+require BOTH `/etc/localtime` target matches AND `/etc/timezone` content
+matches** before skipping; otherwise fall through and (re)write
+`/etc/timezone`. (Leave the `os.Remove`+`os.Symlink` localtime logic
+otherwise unchanged — out of scope.)
 
 ### Step 3 — `pkg/daemon` networkd / lifeline / marker
 - AtomicGeneratedConfig → `WriteFileAtomic`: `fixRethLinkFile` (reth 26),
@@ -346,25 +426,29 @@ unchanged — out of scope; it is regenerated on apply.)
   from `applyConfigLocked` / `applyFRRConfig`. Pure refactor — same calls,
   named home. Allowlist these three helpers.
 
-### Step 6 — Canary rewrite (Path A, `relpath::func` keys)
+### Step 6 — Canary rewrite (Path A, RECEIVER-AWARE `relpath::[recv.]func` keys)
 - Replace `migratedPackages` walk with `filepath.WalkDir("../", ...)` over
   all `pkg/**/*.go` (skip `_test.go`; verify no generated `.pb.go` contains
   a real `os.WriteFile` call — none do per grep).
-- Key `allowedFunctions` by `<pkg-relpath>::<funcName>` computed from the
-  fileset position. Seed it with the COMPLETE §2.C + §2.D list:
+- **Extend the AST keyer to be receiver-aware (D1, Codex r2 MED#2):** for
+  a `*ast.FuncDecl` with non-nil `Recv`, key
+  `<pkg-relpath>::<RecvType>.<MethodName>` (strip a leading `*` from
+  `fn.Recv.List[0].Type`); for a plain function key
+  `<pkg-relpath>::<FuncName>`. Compute `<pkg-relpath>` from the fileset
+  position. Seed `allowedFunctions` with the COMPLETE §2.C + §2.D list:
   `daemon::applyKernelTuning`, `daemon::enableForwarding`,
-  `daemon::(realHostTunableFS).writeFile`, `ra::ensureLinkLocal`,
-  `dataplane::(*CompileResult).tuneInterfaceBuffers`,
+  `daemon::realHostTunableFS.writeFile`, `ra::ensureLinkLocal`,
+  `dataplane::CompileResult.tuneInterfaceBuffers`,
   `dataplane::ensureVLANSubInterface`,
   `dataplane/userspace::tuneSocketBuffers`,
   `networkd::restoreSlowPathRPFilter`,
   `daemon::writeResolvConfBindMountFallback`, `daemon::setRethIPv6Knobs`,
   `daemon::setVLANSubAddrGenMode`, `daemon::setFibMultipathHashPolicy`.
-  (Method receivers: the canary keys on `fn.Name.Name` today, which is the
-  bare method name — confirm whether `(realHostTunableFS).writeFile` /
-  `(*CompileResult).tuneInterfaceBuffers` resolve to `writeFile` /
-  `tuneInterfaceBuffers`; key accordingly. The `relpath::` prefix
-  disambiguates same-named methods across packages.)
+  (Receiver-aware keying closes the residual same-package-same-name hole
+  Codex r2 flagged — a future `pkg/daemon` `writeFile` on a DIFFERENT type
+  or a plain func would NOT inherit `realHostTunableFS.writeFile`'s
+  exemption.) Unit-test the keyer (plain func, value receiver, pointer
+  receiver).
 - Keep the existing dot-import / alias resolution (correct).
 - **Self-test guard**: `t.Logf("scanned %d files", n)` and
   `if n == 0 { t.Fatal(...) }` so a future zero-glob bug is caught.
@@ -385,14 +469,23 @@ Using `generateSelfSignedCertAt(certPath, keyPath)`:
 - **Stale cert-only / crash-after-key** (D5): seed cert-only, simulate
   failure after key write → assert next call yields a matching pair (no
   durable mismatch).
+- **Strict remove failure (Codex r2 HIGH#1)**: make `os.Remove(certPath)`
+  return a non-ENOENT error (inject/seam) → assert NO new key/cert is
+  written and the error is surfaced (the {neither} invariant is enforced,
+  not assumed).
+- **Dir-sync failure (Codex r2 HIGH#1)**: make `SyncDir` fail → assert no
+  key/cert write proceeds + error surfaced.
+- **HTTPS still installed on persistence failure (Codex r2 MED#1)**:
+  server-level test — cert generation OK but disk write fails → assert
+  `httpsServer != nil` (HTTPS not disabled by a disk error).
 
 ### Step 8 — Docs
-- `docs/engineering-style.md` §"Persistence classes" examples: add TLS key
-  + hostname + authorized_keys + sudoers (DurableState); TLS cert + sshd /
-  rsyslog / chrony / networkd drop-ins + timezone (AtomicGeneratedConfig);
-  note `WithOwner`.
-- `pkg/fsatomic/README.md`: writer-class repo-wide canary + `relpath::func`
-  key + `WithOwner` option.
+- `docs/engineering-style.md` §"Persistence classes" examples: add TLS cert
+  + TLS key + hostname + authorized_keys + sudoers (DurableState); sshd /
+  rsyslog / chrony / ssh_known_hosts / networkd drop-ins + timezone
+  (AtomicGeneratedConfig); note `WithOwner` + precedence.
+- `pkg/fsatomic/README.md`: writer-class repo-wide receiver-aware canary +
+  `relpath::[recv.]func` key + `WithOwner` option/precedence.
 - `_Log.md` per the project logging rule for each Write/Edit.
 
 ### Dir durability
@@ -408,8 +501,8 @@ survives a power cut (fsatomic.go:126-167 rationale).
 - `pkg/fsatomic/canary_test.go` — rewrite (Step 6).
 - `pkg/api/server.go` (+ `server_test.go` new/extended) — Steps 1, 7.
 - `pkg/daemon/daemon_system.go` — Steps 2, 2b.
-- `pkg/daemon/daemon_reth.go`, `linksetup.go`, `bootstrap.go`,
-  `login_password.go` — Step 3.
+- `pkg/daemon/daemon_reth.go`, `linksetup.go`, `bootstrap.go` — Step 3.
+- `pkg/daemon/login_password.go` — Steps 0b (`lookupUIDGID`) + 3 (marker).
 - `pkg/daemon/daemon_dns.go` — Step 4.
 - `pkg/daemon/daemon_apply.go`, `daemon_ipmon.go` — Step 5 (helper
   extraction).
@@ -427,7 +520,12 @@ writes stay direct knobs). No proto, no Rust, no HA-timing logic.
 | Risk | Mitigation |
 |---|---|
 | authorized_keys root-owned after inode replace → sshd EACCES lockout (AGY#1/Codex#3) | D7-a `WithOwner` sets owner on temp fd BEFORE rename; file is correctly-owned atomically. Validation stats owner+mode on user/root keys. |
-| TLS mismatched pair from stale-pair start (Codex#1/AGY#4) | D5: durably remove stale pair (+SyncDir) before ordered key→cert write; start state is {neither}. Tests cover stale-cert-only + mismatched starts. |
+| TLS mismatched pair from stale-pair start (Codex#1/AGY#4) | D5 r3: STRICT remove (ignore only ENOENT) + SyncDir, abort writes on any other error, before ordered durable key→cert. Tests cover stale-cert-only, mismatched-start, remove-failure, dir-sync-failure. |
+| TLS persistence failure silently disables HTTPS (Codex r2 MED#1) | Helper returns in-memory cert + nil error on persistence failure; caller installs httpsServer; server-level test asserts httpsServer != nil on disk-write failure. |
+| TLS cert churn breaks remote pins (Claude SMR M1; non-loopback https-interface bind) | D6 r3: cert = DurableState (survives power loss). |
+| timezone stale forever after crash-between-symlink-and-file (AGY r2 #3) | Step 2b: early-return guard requires BOTH localtime target AND /etc/timezone content match before skipping. |
+| D7-a pulls in cgo via os/user (AGY r2 #6a) | Step 0b: extend cgo-free /etc/passwd parser (lookupUIDGID); no os/user. |
+| Canary same-package same-name false-negative (Codex r2 MED#2) | D1 r3: receiver-aware keying relpath::recv.method. |
 | Canary Path A noisy/incomplete (Claude C1/AGY#2/Codex#4) | §2.C/§2.D exhaustive inventory; seed all knob helpers; extract embedded procfs writes so big functions are never allowlisted. Run `go test ./pkg/fsatomic/` green before commit. |
 | Allowlisting `applyConfigLocked`/`applyFRRConfig` = false-negative hole (Codex#4) | Extract 3 tiny helpers (Step 5); allowlist helpers only. |
 | RETH `.link` mechanism change is cluster-adjacent (Codex/AGY#5) | D8: run `make test-failover` + `make test-ha-crash`; mechanism-only change, expected green. |
@@ -443,8 +541,11 @@ writes stay direct knobs). No proto, no Rust, no HA-timing logic.
   in-scope writer migrated or allowlisted) + the new scanned-file-count
   guard.
 - `pkg/api` TLS tests (Step 7): happy, failed-cert, failed-key,
-  mismatched-start, stale-cert/crash-after-key.
-- `pkg/fsatomic` `WithOwner` unit test (owner set before rename).
+  mismatched-start, stale-cert/crash-after-key, strict-remove-failure,
+  dir-sync-failure, HTTPS-still-installed-on-persist-failure.
+- `pkg/fsatomic` `WithOwner` unit test (owner set before rename +
+  precedence vs `WithPreserveExisting`).
+- canary keyer unit test (plain func / value receiver / pointer receiver).
 - `go vet ./...`, `gofmt` clean on touched files.
 - **`make test-failover` + `make test-ha-crash`** (D8) — RETH `.link`
   write mechanism is cluster-adjacent; not waived.
@@ -467,23 +568,22 @@ writes stay direct knobs). No proto, no Rust, no HA-timing logic.
 
 ---
 
-## 10. Remaining open questions for reviewers (all majors settled in §4)
+## 10. Remaining open questions for reviewers
 
-1. **D6 micro**: is the self-signed cert EVER consumed by a non-loopback
-   pinner? If yes, promote cert to DurableState. Default = AtomicGeneratedConfig.
-2. **D7 method**: `WithOwner` (new fsatomic Option) vs reusing
-   `WithPreserveExisting` + a first-write owner set? Plan recommends
-   `WithOwner` (correct on both first-write and re-write).
-3. **Canary method-receiver keying**: confirm the AST keys method writers
-   by bare method name under `relpath::`; if collisions remain, key by
-   `relpath::recv.method`.
+All r1 and r2 findings are settled in §4 / §5 (D6 cert=DurableState, D7-a
+`WithOwner` via cgo-free `lookupUIDGID`, D1 receiver-aware keying, D5
+strict-remove contract + caller wiring, timezone early-return fix). **No
+open design questions remain.** The one item flagged for explicit
+re-review attention: **D6 r3 REVERSES r2** (cert = DurableState, not
+AtomicGeneratedConfig) on Claude SMR M1's code-grounded refutation of the
+loopback premise — Codex/AGY should confirm they accept the reversal.
 
 ---
 
 ## 11. Reviewer convergence ledger
 
 See `reviewer-ids.md`. Convergence requires Claude SMR + Codex + AGY to
-re-review the FINAL revision (r2) and reach PLAN-READY.
+re-review the FINAL revision (r3) and reach PLAN-READY.
 
 ---
 
@@ -512,3 +612,34 @@ re-review the FINAL revision (r2) and reach PLAN-READY.
 - **Claude M3 (test seam race)** → Step 1: parameterized
   `generateSelfSignedCertAt`, no `const`→`var` global.
 - **D4 (journal ReadAt)** → deferred to a LOW follow-up issue.
+
+---
+
+## 13. r2 → r3 changelog (every r2 finding mapped)
+
+- **Claude SMR M1 (cert non-loopback → DurableState)** → §1 item 2
+  corrected (non-loopback `https interface` bind, `daemon_run.go:1093`);
+  D6 r3 REVERSED to cert = DurableState; §2 cert row moved to class A; D5
+  step 4 now `WriteFileDurable`. This supersedes r2's D6 (which Codex r2
+  had "resolved" only under the false loopback premise).
+- **Codex r2 HIGH#1 (best-effort remove breaks invariant)** → D5 strict
+  unlink contract: ignore only ENOENT; abort writes on any other
+  remove/SyncDir error; tests for remove-failure + dir-sync-failure.
+- **Codex r2 HIGH#2 (/etc/timezone missing from inventory)** → added to
+  §2.B; hit accounting corrected (36 real calls, 4 comment hits incl.
+  `frr/manager.go:502`).
+- **Codex r2 MED#1 (HTTPS disabled on persist failure)** → D5 step 5 +
+  Step 1 caller wiring: persistence failure returns nil error + in-memory
+  cert; server-level test asserts httpsServer != nil.
+- **Codex r2 MED#2 / AGY r2 #6b (canary method keying)** → D1 r3
+  receiver-aware `relpath::recv.method`; Step 6 extends the AST keyer;
+  keyer unit test.
+- **Codex r2 LOW (WithOwner precedence)** → Step 0: explicit wins
+  ownership, preserve-existing may keep mode; precedence unit test.
+- **AGY r2 #3 (timezone early-return crash loophole)** → Step 2b: guard
+  requires BOTH localtime target AND /etc/timezone content match.
+- **AGY r2 #6a (cgo-free uid/gid)** → Step 0b: extend `lookupUID` →
+  `lookupUIDGID` parsing /etc/passwd; no `os/user`.
+- Confirmed-resolved by all r2 reviewers (no r3 change needed): cert
+  ownership design (D7-a chownTemp seam), helper extraction (§2.D),
+  sshd class (D2), failover (D8), DNS B-route (D3).
