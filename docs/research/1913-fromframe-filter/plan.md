@@ -15,8 +15,10 @@
 meta, decision, ..)` at `userspace-dp/src/afxdp/poll_descriptor/mod.rs:2814`,
 immediately after the `match decision.resolution.disposition` block at
 `:2156`. That match has arms for `LocalDelivery`, `NoRoute`, `MissingNeighbor`,
-`PolicyDenied`, `HAInactive`, and a `_` catch-all (which covers `DiscardRoute`,
-`ForwardCandidate`, `FabricRedirect`, `NextTableUnsupported`).
+`PolicyDenied`, `HAInactive`, and a `_` catch-all. The `_` arm covers
+`DiscardRoute` and `NextTableUnsupported`; `ForwardCandidate`/`FabricRedirect`
+do NOT reach this match (they are consumed by the forward `if` at
+mod.rs:1794-1798 — see §2.1).
 
 The disposition allow-list
 
