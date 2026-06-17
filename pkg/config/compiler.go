@@ -80,6 +80,20 @@ type compileOpts struct {
 	// compile decision the read-only schema walk cannot make (and since
 	// #1319 PR 2 SchemaValidate violations only warn on tolerant paths).
 	lenientVRRPTrackDuplicates bool
+
+	// lenientDeviceMap (#1956 V-1) downgrades the cross-entry device-map
+	// validator (validateDeviceMapStrict) from a hard compile error to a
+	// cfg.Warnings entry. Set ONLY on the tolerant load / peer-sync paths
+	// (CompileConfigLenient / CompileConfigForNodeLenient): an active node's
+	// strict commit validates only ITS OWN node section against its own
+	// hardware (R-8 pre-flight does the live-hardware half), but it cannot
+	// fail on the PEER node's section (different box, structural rules like
+	// FPC/node alignment differ per node). The peer's SyncApply compiles
+	// leniently, so a peer-section structural finding warns rather than
+	// stalling the whole config sync. The narrow management-lockout class
+	// that lenient must NOT swallow is handled by the daemon's passive-node
+	// SyncApply admission gate (V-1), not by this compile flag.
+	lenientDeviceMap bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -103,6 +117,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 	return compileConfigWithOpts(tree, compileOpts{
 		sanitizeFreeTextControlChars: true,
 		lenientVRRPTrackDuplicates:   true,
+		lenientDeviceMap:             true,
 	})
 }
 
@@ -167,6 +182,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 	return compileConfigForNodeWithOpts(tree, nodeID, compileOpts{
 		sanitizeFreeTextControlChars: true,
 		lenientVRRPTrackDuplicates:   true,
+		lenientDeviceMap:             true,
 	})
 }
 
@@ -446,6 +462,22 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	if err := errors.Join(strictErrs...); err != nil {
 		return nil, err
 	}
+
+	// #1956 device-map cross-entry validation. Strict on commit /
+	// commit-check (hard-reject duplicate names/PCI/MAC, RETH key-mac,
+	// FPC/node misalignment); lenient on load / peer-sync (warn so an
+	// already-persisted or peer-section config still boots — V-1). Runs
+	// AFTER the accumulator so a structural CoS/policer error still wins
+	// the first-error slot.
+	if err := validateDeviceMapStrict(cfg); err != nil {
+		if opts.lenientDeviceMap {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("device-map (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
 	if warnings := ValidateConfig(cfg); len(warnings) > 0 {
 		for _, w := range warnings {
 			cfg.Warnings = append(cfg.Warnings, w)

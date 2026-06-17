@@ -60,6 +60,13 @@ const (
 	// check so an operator cannot paste cleartext into an
 	// encrypted-password directive. #1944.
 	ValueCryptHash
+	// ValuePCIAddr is a PCI bus address (DDDD:BB:DD.F, e.g.
+	// 0000:09:00.0), the #1956 device-map primary identity key. Validated
+	// by ValidatePCIAddr.
+	ValuePCIAddr
+	// ValueMAC is a MAC address (xx:xx:xx:xx:xx:xx), the #1956 device-map
+	// permanent-MAC fallback identity key. Validated by ValidateMAC.
+	ValueMAC
 )
 
 // Placeholder returns the angle-bracket placeholder name shown in `?`
@@ -88,6 +95,10 @@ func (v ValueType) Placeholder() string {
 		return "<address/prefix-length>"
 	case ValueCryptHash:
 		return "<crypt-hash>"
+	case ValuePCIAddr:
+		return "<pci-address>"
+	case ValueMAC:
+		return "<mac-address>"
 	}
 	return ""
 }

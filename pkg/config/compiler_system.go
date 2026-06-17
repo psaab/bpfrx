@@ -877,6 +877,15 @@ func compileSchedulers(node *Node, cfg *Config) error {
 }
 
 func compileChassis(node *Node, ch *ChassisConfig) error {
+	// #1956 R-7/V-7: the device-map subtree compiles INDEPENDENTLY of
+	// cluster — a sibling `device-map` must not be dropped on a standalone
+	// (no-cluster) box. Compile it first, then fall through to cluster.
+	if dmNode := node.FindChild("device-map"); dmNode != nil {
+		if dm := compileDeviceMap(dmNode); dm != nil {
+			ch.DeviceMap = dm
+		}
+	}
+
 	clusterNode := node.FindChild("cluster")
 	if clusterNode == nil {
 		return nil
