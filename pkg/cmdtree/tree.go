@@ -162,6 +162,9 @@ var OperationalTree = map[string]*Node{
 				}},
 				"fence-status": {Desc: "Show peer fencing configuration and history"},
 			}},
+			"device-map": {Desc: "Show bare-metal device-map bindings (#1956)", Children: map[string]*Node{
+				"candidates": {Desc: "List every NIC (addr/MAC/name/link) to author a device-map"},
+			}},
 			"alarms":         {Desc: "Show chassis alarm status"},
 			"environment":    {Desc: "Show chassis environment"},
 			"forwarding":     {Desc: "Show forwarding daemon status and utilization"},

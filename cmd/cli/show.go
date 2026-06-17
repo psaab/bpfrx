@@ -67,6 +67,11 @@ func (c *ctl) handleShow(args []string) error {
 				return c.showText("chassis-forwarding")
 			case "hardware":
 				return c.showText("chassis-hardware")
+			case "device-map":
+				if len(args) >= 3 && args[2] == "candidates" {
+					return c.showText("chassis-device-map-candidates")
+				}
+				return c.showText("chassis-device-map")
 			}
 		}
 		return c.showText("chassis")
