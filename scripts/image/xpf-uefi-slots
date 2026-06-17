@@ -73,17 +73,28 @@ register_slot() {
     # accepted, or the slot would chainload the wrong loader (r1 Codex High).
     # efibootmgr prints the loader as "...File(\EFI\<slot>\shimx64.efi)" or
     # "...\EFI\<slot>\shimx64.efi"; match the slot's shim path case-insensitively.
-    existing=$(efibootmgr | grep -E "^Boot[0-9A-Fa-f]{4}\*?[[:space:]]+${slot}[[:space:]]" || true)
-    if [ -n "$existing" ]; then
-        if echo "$existing" | grep -qiE "EFI.${slot}.shimx64\.efi"; then
-            log "slot ${slot} already registered (loader path verified)"
-            return 0
-        fi
-        log "slot ${slot} exists but loader path is WRONG; re-creating: $existing"
-        # Delete the mismatched entry/entries before re-creating.
-        for n in $(echo "$existing" | sed -nE 's/^Boot([0-9A-Fa-f]{4}).*/\1/p'); do
+    # Enumerate ALL entries with this label. Delete every WRONG-path one
+    # unconditionally (a stale/foreign label-collision would poison BootNext —
+    # r2 Codex High), and dedup any CORRECT ones down to exactly one. This
+    # guarantees the slot maps to a single, correct Boot#### id afterwards.
+    correct_kept=""
+    for n in $(efibootmgr | sed -nE "s/^Boot([0-9A-Fa-f]{4})\*?[[:space:]]+${slot}[[:space:]].*/\\1/p"); do
+        line=$(efibootmgr | grep -E "^Boot${n}\*?[[:space:]]+${slot}[[:space:]]")
+        if echo "$line" | grep -qiE "EFI.${slot}.shimx64\.efi"; then
+            if [ -z "$correct_kept" ]; then
+                correct_kept="$n"   # keep the first correct one
+            else
+                log "slot ${slot}: deleting duplicate correct entry Boot${n}"
+                efibootmgr --quiet -b "$n" -B 2>/dev/null || true
+            fi
+        else
+            log "slot ${slot}: deleting WRONG-path entry Boot${n} ($line)"
             efibootmgr --quiet -b "$n" -B 2>/dev/null || true
-        done
+        fi
+    done
+    if [ -n "$correct_kept" ]; then
+        log "slot ${slot} already registered (loader path verified, deduped to Boot${correct_kept})"
+        return 0
     fi
     # the slot's ESP dir must exist (bake/INC-1 staged shim+grub there)
     if [ ! -f "/boot/efi/EFI/${slot}/shimx64.efi" ]; then

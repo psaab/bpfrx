@@ -16,8 +16,12 @@
 #             known-good via the firmware-cleared BootNext). Leave the box
 #             usable for diagnosis rather than bouncing it.
 #
-# It runs BEFORE xpfd admits traffic but is NOT a hard ordering dependency of
-# xpfd (a stuck promote must never wedge the box): see the .service.
+# It runs AFTER xpfd is up (the forward-beacon gate pings through the dataplane,
+# which needs xpfd active) but is NOT a hard ordering dependency of xpfd (a stuck
+# promote must never wedge the box): see the .service. The promotion is gated on
+# verify-dataplane (the #1864 kernel verifier — structural) AND a real forward
+# beacon (off-box reachability through the dataplane), so a candidate that boots
+# + verifies but cannot forward is reverted, not promoted.
 
 set -u
 log() { echo "xpf-kernel-promote: $*" >&2; }

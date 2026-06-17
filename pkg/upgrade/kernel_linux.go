@@ -30,16 +30,22 @@ var (
 // realKernelSystem is the production KernelSystem backed by UEFI, apt, GRUB,
 // systemd, and the Linux watchdog device.
 type realKernelSystem struct {
-	// ProbeFunc is wired by the caller when a real forward-health probe is
-	// available. The default only checks whether the dataplane unit is active.
+	// ProbeFunc is wired by the caller when a richer forward-health probe is
+	// available (e.g. xpfd with its dataplane manager). When nil, ForwardBeacon
+	// does a real reachability ping through the dataplane to BeaconTarget.
 	ProbeFunc func(deadline time.Time) (bool, error)
+	// BeaconTarget is the ForwardBeacon ping target; empty -> the IPv4 default
+	// gateway. Set via XPF_KERNEL_BEACON_TARGET for a topology-specific peer.
+	BeaconTarget string
 }
 
 var _ KernelSystem = (*realKernelSystem)(nil)
 
-// NewKernelSystem returns the production KernelSystem implementation.
+// NewKernelSystem returns the production KernelSystem implementation. The
+// forward-beacon target may be pinned via XPF_KERNEL_BEACON_TARGET (else the
+// IPv4 default gateway is used).
 func NewKernelSystem() *realKernelSystem {
-	return &realKernelSystem{}
+	return &realKernelSystem{BeaconTarget: os.Getenv("XPF_KERNEL_BEACON_TARGET")}
 }
 
 func (s *realKernelSystem) IsUEFI() bool {
@@ -332,19 +338,63 @@ func (s *realKernelSystem) VerifyDataplane() (bool, error) {
 	return false, fmt.Errorf("verify-dataplane exec failed: %w (output: %s)", err, strings.TrimSpace(out.String()))
 }
 
+// ForwardBeacon proves the candidate kernel can actually FORWARD, not merely
+// that a unit is active (r2 Codex Critical: `systemctl is-active` is not a
+// forwarding proof). A wired ProbeFunc (the richest probe, when the caller has
+// the dataplane manager) takes precedence; otherwise this does a REAL
+// reachability probe through the dataplane: xpfd must be active AND a ping to
+// BeaconTarget (default: the IPv4 default gateway) must succeed within the
+// deadline. A candidate kernel whose shim verified (Gate 3) but cannot forward
+// fails the ping -> revert. The gateway is the most universally-available
+// off-box target that exercises the forwarding path; an operator can override
+// BeaconTarget for a topology-specific peer-link target.
 func (s *realKernelSystem) ForwardBeacon(deadline time.Duration) (bool, error) {
 	if s.ProbeFunc != nil {
 		return s.ProbeFunc(time.Now().Add(deadline))
 	}
-	// The real forward probe is wired by the caller. Without it, unit
-	// activity is the best local proxy available to this package.
-	if runCmd("systemctl", "is-active", "xpfd-userspace-dp") == nil {
-		return true, nil
+	// xpfd (the dataplane owner) must be up at all — a down daemon cannot
+	// forward regardless of ping.
+	if runCmd("systemctl", "is-active", "xpfd") != nil &&
+		runCmd("systemctl", "is-active", "xpfd-userspace-dp") != nil {
+		return false, nil
 	}
-	if runCmd("systemctl", "is-active", "xpfd") == nil {
-		return true, nil
+	target := s.BeaconTarget
+	if target == "" {
+		target = defaultGateway()
 	}
-	return false, nil
+	if target == "" {
+		// No reachable target to probe. Be HONEST: we cannot prove forwarding,
+		// so do NOT promote on a "pass" we can't substantiate — return false so
+		// the caller reverts (a conservative, fail-safe default; the operator
+		// can set BeaconTarget to enable promotion on a box with no gateway).
+		return false, fmt.Errorf("no forward-beacon target (no default gateway; set BeaconTarget)")
+	}
+	secs := int(deadline.Seconds())
+	if secs < 1 {
+		secs = 1
+	}
+	// ping -c <n> -w <deadline>: a single reply within the window proves the
+	// dataplane forwarded a packet off-box on the candidate kernel.
+	if err := runCmd("ping", "-c", "3", "-w", fmt.Sprintf("%d", secs), target); err != nil {
+		return false, nil
+	}
+	return true, nil
+}
+
+// defaultGateway returns the IPv4 default-route next hop, or "" if none.
+func defaultGateway() string {
+	out, err := captureCmd("ip", "-4", "route", "show", "default")
+	if err != nil {
+		return ""
+	}
+	// "default via 10.0.0.1 dev eth0 ..."
+	fields := strings.Fields(out)
+	for i := 0; i+1 < len(fields); i++ {
+		if fields[i] == "via" {
+			return fields[i+1]
+		}
+	}
+	return ""
 }
 
 func (s *realKernelSystem) SetBootOrderFront(bootID string) error {
@@ -381,11 +431,33 @@ func (s *realKernelSystem) PruneInactiveSlot(slot, knownGoodUnameR, candidateVer
 	if err := s.WriteSlotSelector(slot, knownGoodUnameR); err != nil {
 		return err
 	}
-	_ = aptGet("purge", "-y",
-		"linux-image-"+candidateVersion,
-		"linux-modules-"+candidateVersion,
-		"linux-headers-"+candidateVersion,
-	)
+	// The candidate kernel packages are HELD (InstallCandidateKernel re-holds
+	// the full set), so `apt-get purge` must be allowed to change held packages
+	// or it leaves the candidate installed-in-dpkg while we delete its files
+	// (r2 Codex High). Include linux-modules-extra (the install adds it). All
+	// best-effort: a prune failure must not block the revert (the firmware
+	// fallback is the safety), but we no longer purge a held pkg without the
+	// override and we cover the same package set the install added.
+	candPkgs := []string{
+		"linux-image-" + candidateVersion,
+		"linux-modules-" + candidateVersion,
+		"linux-modules-extra-" + candidateVersion,
+		"linux-headers-" + candidateVersion,
+	}
+	// Only purge packages that are actually installed (avoid apt errors on a
+	// never-installed optional pkg like headers/modules-extra).
+	var installed []string
+	for _, p := range candPkgs {
+		if isPkgInstalled(p) {
+			installed = append(installed, p)
+		}
+	}
+	if len(installed) > 0 {
+		args := append([]string{"purge", "-y", "--allow-change-held-packages"}, installed...)
+		if err := aptGet(args...); err != nil {
+			fmt.Fprintf(os.Stderr, "kernel-upgrade: WARNING purge un-promoted candidate %s: %v\n", candidateVersion, err)
+		}
+	}
 	_ = os.RemoveAll(filepath.Join("/lib/modules", candidateVersion))
 	if matches, err := filepath.Glob(filepath.Join("/boot", "*-"+candidateVersion)); err == nil {
 		for _, match := range matches {
@@ -393,6 +465,15 @@ func (s *realKernelSystem) PruneInactiveSlot(slot, knownGoodUnameR, candidateVer
 		}
 	}
 	return nil
+}
+
+// isPkgInstalled reports whether a dpkg package is in the "installed" state.
+func isPkgInstalled(pkg string) bool {
+	out, err := captureCmd("dpkg-query", "-W", "-f=${Status}", pkg)
+	if err != nil {
+		return false
+	}
+	return strings.Contains(out, "install ok installed")
 }
 
 func (s *realKernelSystem) Now() time.Time {

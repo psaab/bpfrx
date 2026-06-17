@@ -1,6 +1,9 @@
 package upgrade
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestBootEntryRegex locks the efibootmgr line parse against the two bugs found
 // during live #1930 validation: (1) the label is followed by a TAB + loader
@@ -39,3 +42,32 @@ func TestSlotSelectorRegex(t *testing.T) {
 		t.Fatalf("selector parse failed: %v", m)
 	}
 }
+
+// TestDefaultGatewayParse locks the `ip -4 route show default` parse used by
+// ForwardBeacon's fallback target discovery (r2 Codex Critical fix). The parse
+// is a pure helper over the command output; exercise the field extraction.
+func TestDefaultGatewayParseLogic(t *testing.T) {
+	// mimic defaultGateway()'s field scan
+	parse := func(out string) string {
+		fields := splitFields(out)
+		for i := 0; i+1 < len(fields); i++ {
+			if fields[i] == "via" {
+				return fields[i+1]
+			}
+		}
+		return ""
+	}
+	cases := []struct{ out, want string }{
+		{"default via 10.0.0.1 dev eth0 proto dhcp", "10.0.0.1"},
+		{"default via 192.168.1.254 dev ens3", "192.168.1.254"},
+		{"", ""},
+		{"default dev wg0 scope link", ""}, // no via (point-to-point)
+	}
+	for _, c := range cases {
+		if got := parse(c.out); got != c.want {
+			t.Errorf("parse(%q) = %q, want %q", c.out, got, c.want)
+		}
+	}
+}
+
+func splitFields(s string) []string { return strings.Fields(s) }

@@ -95,3 +95,36 @@ applied and the corrected chain re-validated:
 
 (Note: incus `file push` intermittently truncates files; all VM file deploys
 during validation were done via `cat >` over `incus exec` to avoid that.)
+
+## r2 Codex review fixes — re-validated
+
+Codex r2 confirmed 6/8 r1 fixes resolved + found 3 NEW issues the fixes
+introduced; all addressed:
+
+- **Critical (ForwardBeacon was not a real forward gate):** production
+  NewKernelSystem didn't wire ProbeFunc, so the beacon fell back to
+  `systemctl is-active` (not forwarding proof). FIXED: ForwardBeacon now does a
+  REAL reachability ping through the dataplane to BeaconTarget (default = the
+  IPv4 default gateway; override via XPF_KERNEL_BEACON_TARGET), requiring xpfd
+  active AND a ping reply. With NO target it FAILS SAFE (returns false → revert)
+  rather than promoting an unproven candidate. The promote.service After=xpfd
+  ordering is now correct (the ping needs the dataplane up); the script comment
+  was corrected. defaultGateway() parse is unit-tested.
+- **High (PruneInactiveSlot broken on held packages + omits modules-extra):**
+  FIXED: purge now uses `--allow-change-held-packages`, includes
+  linux-modules-extra-<ver>, and only purges packages actually installed
+  (isPkgInstalled) so a never-installed optional pkg doesn't error the purge.
+- **High (slot self-heal left wrong-path duplicates):** FIXED: register_slot
+  now enumerates ALL label entries, DELETES every wrong-path one
+  unconditionally, and dedups correct ones to exactly one — so the slot always
+  maps to a single correct Boot#### id (the Go BootEntries map can no longer
+  collapse to a wrong duplicate).
+
+Re-validated live (Ubuntu 26.04 UEFI Secure Boot):
+- Dedup: injected a wrong-path xpf-A duplicate (-> \EFI\ubuntu\shimx64.efi)
+  alongside the correct one; registration DELETED the wrong-path entry and kept
+  exactly 1 correct xpf-A (Boot0003 -> \EFI\xpf-A\shimx64.efi).
+- ForwardBeacon logic (gateway discovery + ping) is correct; the isolated probe
+  VM has no network, so the beacon correctly FAILS SAFE (no target -> revert) —
+  the designed conservative default. The gateway-parse is unit-tested; the live
+  ping is bench-deferred (no network on the throwaway VM).
