@@ -1,5 +1,23 @@
 # Action Log
 
+## 2026-06-17 — #1915 DHCP relay socket lifecycle (implement converged r4 plan)
+
+- **Timestamp**: 2026-06-17
+- **Action**: Implemented #1915 — fix multi-interface EADDRINUSE,
+  Stop()/reapply hang, dead-relay-on-boot, dropped broadcast replies.
+  Added `setReusePort`/`setBroadcast` sockopts; `packetConnFactory` +
+  `ifaceResolver` injectable seams; default factory uses
+  `net.ListenConfig.Control` (REUSEADDR+REUSEPORT+BINDTODEVICE+BROADCAST
+  pre-bind, mirrors vrfListenConfig); programmed to `net.PacketConn`;
+  close-on-cancel watcher closing BOTH conns started last; WaitGroup join
+  with cross-cancellation via inner-func `defer cancel()` before outer
+  `wg.Wait()`; bounded ctx-cancelable giaddr retry re-resolving the
+  interface each attempt; removed `default:` no-op; loops exit on
+  ctx-cancel OR ErrClosed. New lifecycle/regression tests via the factory
+  seam.
+- **File(s)**: pkg/dhcprelay/relay.go, pkg/dhcprelay/sockopt_linux.go,
+  pkg/dhcprelay/relay_test.go, pkg/dhcprelay/README.md
+
 ## 2026-06-16 — #1930 INC-3: address quad-review (AGY CRITICAL + Codex 2 HIGH + 1 LOW)
 - **Timestamp**: 2026-06-16 UTC
 - **Action**: Resume final INC-3 increment; dispatched 4-way review on PR
