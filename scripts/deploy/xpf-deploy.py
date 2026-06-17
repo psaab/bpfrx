@@ -1060,6 +1060,14 @@ def cmd_image_roll(args):
                     f"holds it, or the lock timed out) — released {got or 'nothing'} "
                     f"and aborting.")
         completed = False
+        # state_changed flips True at the FIRST mutation (the drain). Until then
+        # (lease acquisition + the pre-drain mixed-base gate) nothing on the
+        # cluster has moved, so a failure there must RELEASE the leases, not
+        # TTL-hold them — otherwise the gate's own suggested remediation (rerun
+        # with --allow-session-drop) fails immediately on the caller's stale
+        # lease for the full TTL (Codex). TTL-hold is only for a genuine
+        # half-rolled cluster (state_changed and not completed).
+        state_changed = False
         try:
             # MIXED-BASE GATE: the risk window is the FIRST swap (after it node[0]
             # is NEW while node[1] is still OLD). Gate BEFORE the first swap,
@@ -1086,7 +1094,12 @@ def cmd_image_roll(args):
                     # --allow-session-drop: sessions drop AND the cluster runs
                     # split-protocol until the second node is rolled; the
                     # peer-alive / takeover-ready prechecks still guarantee the
-                    # peer can serve NEW traffic. Name it loudly.
+                    # peer can serve NEW traffic. Name it loudly. NOTE (Codex):
+                    # this relaxes only the exact-equality HA-PROTOCOL precheck;
+                    # the drain's transfer-readiness gate still enforces HA
+                    # compatibility, so a genuinely HA-skewed peer (Transfer
+                    # ready: no) is still refused — not a blanket skew bypass.
+                    # Dormant today since HA/session-sync versions are exact.
                     print(f"   --allow-session-drop set: proceeding — sessions "
                           f"WILL drop, AND the drain's HA-protocol-equality "
                           f"precheck is bypassed (the cluster may run "
@@ -1117,6 +1130,9 @@ def cmd_image_roll(args):
                           f"drain aborts as HA-incompatible, the OLD image cannot "
                           f"relax it — re-image BOTH nodes together.")
             print(f"   draining {node} -> {peer} (confirmed)...")
+            # First mutation: from here on a failure leaves a half-rolled
+            # cluster, so leases must stay TTL-held (never-both-down).
+            state_changed = True
             _node_exec(runner, backend, node, drain_cmd)
 
             # 2. recreate the node from the new image (launch + day-0 re-apply).
@@ -1157,14 +1173,20 @@ def cmd_image_roll(args):
             # drain verb's own peer-alive/takeover-ready precheck is the hard
             # backstop; keeping the lease held is defense-in-depth so recovery is
             # operator-gated, not a TTL race.
-            if completed:
+            if completed or not state_changed:
+                # Clean roll, OR a failure BEFORE any mutation (lease acquire /
+                # pre-drain mixed-base gate): nothing is half-rolled, so release
+                # the leases — otherwise the operator's own retry (e.g. rerun
+                # with --allow-session-drop) would be blocked by this caller's
+                # stale lease for the full TTL (Codex).
                 _clear_lease(runner, backend, node, holder)
                 _clear_lease(runner, backend, peer, holder)
             else:
-                print(f"   roll of {node} did NOT complete — holding the "
-                      f"image-roll lease on {node} and {peer} until TTL "
-                      f"({lease_ttl}s) so no other orchestrator drains the "
-                      f"still-primary peer. Investigate the half-rolled cluster.")
+                print(f"   roll of {node} did NOT complete after the drain "
+                      f"began — holding the image-roll lease on {node} and "
+                      f"{peer} until TTL ({lease_ttl}s) so no other orchestrator "
+                      f"drains the still-primary peer. Investigate the "
+                      f"half-rolled cluster.")
 
     roll_one(nodes[0], nodes[1], is_second=False)
     print(f"\n==> {nodes[0]} done; rolling the second node")

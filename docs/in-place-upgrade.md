@@ -308,6 +308,18 @@ precheck, which is correct whenever old/new advertise the same HA version
 in-window protocol *difference* cannot be relaxed by an OLD binary, so the
 operator must re-image both nodes together.
 
+Scope note (Codex): `--allow-mixed-ha` relaxes ONLY the drain's
+exact-equality *HA-protocol* precheck (`HAProtocolCompatible`). The drain's
+`PeerTakeoverReady` / transfer-readiness check is still enforced, and on a
+real HA mismatch the peer reports `Transfer ready: no`
+(`daemon_ha_userspace.go`), which still aborts the drain. So neither
+`--allow-mixed-ha` nor `--allow-session-drop` is a blanket "drain under any
+HA skew" bypass — a genuinely HA-skewed peer is still refused at the
+transfer-readiness gate. This is dormant in practice today because the HA /
+session-sync protocol versions are pinned exact-version, so the only
+in-window cases that reach the relaxed precheck advertise equal HA versions;
+the scope matters for any future release that widens the HA compat window.
+
 **Standalone** is a documented reboot/recreate gap (image swap + factory
 boot + day-0 re-apply); there is no zero-gap standalone image replace.
 
