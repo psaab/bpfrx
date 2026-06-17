@@ -747,6 +747,47 @@ func TestWireguardLinkLocalOwnershipSurvivesAddrListFailure(t *testing.T) {
 	}
 }
 
+// A TRANSIENT (non-not-found) LinkByName error while REMOVING a non-WG
+// tunnel must RETAIN the name in ownedNames so a later Apply retries the
+// LinkDel — dropping it would orphan a live link with stale addresses and
+// no state left to clean it up (#1919 r2 Codex: closes the
+// WG→non-WG-handoff + transient-removal leak chain).
+func TestNonWGRemovalTransientLookupRetained(t *testing.T) {
+	ops := newFakeLinkOps()
+	tm, _ := newReconcileManager(ops)
+	if err := tm.Apply([]*config.TunnelConfig{anchorTC("gr-0-0-0", "10.1.2.3/32")}); err != nil {
+		t.Fatalf("Apply 1: %v", err)
+	}
+	// Remove from config, but LinkByName transiently fails on removal.
+	ops.byNameHardErr["gr-0-0-0"] = errors.New("EBUSY: transient netlink error")
+	if err := tm.Apply(nil); err != nil {
+		t.Fatalf("Apply 2 (removal, transient lookup): %v", err)
+	}
+	if len(ops.delNames) != 0 {
+		t.Fatalf("link wrongly deleted under transient lookup error: %v", ops.delNames)
+	}
+	tm.mu.Lock()
+	retained := tm.ownedNames["gr-0-0-0"]
+	tm.mu.Unlock()
+	if !retained {
+		t.Fatal("ownership dropped on transient removal lookup error (orphans the link) — #1919 r2 Codex")
+	}
+	// Recover: the retried Apply now resolves the link and deletes it.
+	delete(ops.byNameHardErr, "gr-0-0-0")
+	if err := tm.Apply(nil); err != nil {
+		t.Fatalf("Apply 3 (lookup recovers): %v", err)
+	}
+	found := false
+	for _, d := range ops.delNames {
+		if d == "gr-0-0-0" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("link not deleted after transient lookup recovered (retry lost)")
+	}
+}
+
 // --- §9 test 6: appliedRI claim state machine -------------------------
 
 func TestTunnelVRFStanzaBindAndUnbind(t *testing.T) {

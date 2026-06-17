@@ -300,6 +300,21 @@ func (t *tunnelManager) Apply(tunnels []*config.TunnelConfig) error {
 				continue
 			}
 			slog.Info("tunnel removed", "name", name)
+		} else if !isLinkNotFound(err) {
+			// Transient LinkByName error (EBUSY/netlink/timeout): we have
+			// NOT proven the device gone and have NOT deleted it. Retain
+			// ownership so the next Apply retries the LinkDel — dropping it
+			// here would orphan a live link (and any stale addresses on it)
+			// with no state left to clean it up. A genuine not-found falls
+			// through to drop tracking. (#1919 r2 Codex: closes the
+			// WG→non-WG-handoff + transient-removal leak chain; also hardens
+			// the pre-existing GRE/anchor removal path against transient
+			// lookup errors, mirroring the WG prune loop's isLinkNotFound
+			// discipline below.)
+			slog.Warn("failed to look up removed tunnel for deletion",
+				"name", name, "err", err)
+			next[name] = true
+			continue
 		}
 		delete(t.appliedAddrs, name)
 		delete(t.appliedRI, name)

@@ -84,8 +84,10 @@ delete-and-recreate: an untouched tunnel keeps its netdev (stable
 ifindex — no FRR route churn, no userspace-dp TUN-reader death per
 commit, see #1881/#1887), tunnels removed from config are deleted via a
 set-diff against the previous DESIRED set (`ownedNames`, retained on a
-failed delete for retry), and a device is recreated only when the
-existing kernel link is genuinely incompatible:
+failed delete OR a TRANSIENT `LinkByName` lookup error for retry — a
+genuine not-found drops tracking; a transient error must not orphan a
+live link with stale addresses, #1919 r2), and a device is recreated only
+when the existing kernel link is genuinely incompatible:
 
 - **Anchors** (production userspace path): reuse requires TUN mode +
   `NO_PI` (the Rust reader opens `IFF_TUN|IFF_NO_PI`) + persistent.
