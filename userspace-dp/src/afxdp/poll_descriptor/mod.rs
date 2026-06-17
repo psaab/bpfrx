@@ -2372,9 +2372,28 @@ pub(super) fn poll_binding_process_descriptor(
                                 // forwarding. Otherwise, if it is still
                                 // negatively cached + un-expired, recycle the
                                 // frame immediately.
+                                // #1912: key the OUTER-hop neighbor
+                                // resolution side-effects (ARP/NDP probe,
+                                // #1769 resolver enqueue, neg-cache,
+                                // resolved-wins, already-probing dedup) by the
+                                // OUTER transport's L3 egress ifindex, not the
+                                // tunnel logical ifindex. For a non-tunnel
+                                // resolution this equals
+                                // decision.resolution.egress_ifindex so the
+                                // path is byte-identical; for a tunnel-marked
+                                // decision (next_hop = outer hop) it is the
+                                // outer transport egress where the outer
+                                // neighbor is actually keyed (a VLAN outer
+                                // transport keys on the L3 subif, not the VLAN
+                                // parent / tx_ifindex). Computed once per cold
+                                // packet on this arm.
+                                let neigh_if = outer_neighbor_ifindex(
+                                    worker_ctx.forwarding,
+                                    Some(worker_ctx.dynamic_neighbors),
+                                    &decision.resolution,
+                                );
                                 if let Some(next_hop) = decision.resolution.next_hop {
-                                    let neg_key =
-                                        (decision.resolution.egress_ifindex, next_hop);
+                                    let neg_key = (neigh_if, next_hop);
                                     // neg_neigh_gate runs the resolved-wins
                                     // probe (static neighbors THEN dynamic,
                                     // same order as retry_pending_neigh /
@@ -2512,14 +2531,23 @@ pub(super) fn poll_binding_process_descriptor(
                                     // (egress_ifindex, next_hop), so the
                                     // "already probing this hop" dedup is a
                                     // direct contains_key (was an O(n) iter scan).
-                                    let already_probing = binding.pending_neigh.contains_key(&(
-                                        decision.resolution.egress_ifindex,
-                                        next_hop,
-                                    ));
+                                    // #1912: dedup + iface lookup on the OUTER
+                                    // L3 egress (neigh_if), not the tunnel
+                                    // logical ifindex. pending_neigh is never
+                                    // populated for tunnel-marked decisions
+                                    // (R-E gate below), so for those the
+                                    // contains_key is always false and the
+                                    // probe always fires on the correct outer
+                                    // iface; for non-tunnel neigh_if ==
+                                    // egress_ifindex so the dedup is identical.
+                                    let already_probing = binding
+                                        .pending_neigh
+                                        .contains_key(&(neigh_if, next_hop));
                                     if !already_probing {
-                                        let iface_name = worker_ctx.forwarding
+                                        let iface_name = worker_ctx
+                                            .forwarding
                                             .ifindex_to_name
-                                            .get(&decision.resolution.egress_ifindex)
+                                            .get(&neigh_if)
                                             .cloned();
                                         if let Some(name) = iface_name {
                                             // Fast path: ICMP socket triggers kernel ARP
