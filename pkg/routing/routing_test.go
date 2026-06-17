@@ -891,17 +891,13 @@ func TestBuildPBRRules(t *testing.T) {
 	})
 }
 
-func TestProbeICMP(t *testing.T) {
-	// localhost should always be reachable (via UDP fallback at minimum)
-	if !probeICMP("127.0.0.1") {
-		t.Error("expected probe to 127.0.0.1 to succeed")
-	}
-
-	// Invalid address should fail
-	if probeICMP("not-an-ip") {
-		t.Error("expected probe to invalid address to fail")
-	}
-}
+// NOTE (#1918): the former TestProbeICMP asserted probeICMP("127.0.0.1")
+// returns true (route exists) and probeICMP("not-an-ip") returns false.
+// Both encoded the bug — the old prober returned true on socket-open
+// without any echo round-trip, i.e. a route-existence check, not a
+// liveness check. probeICMP is deleted; the real prober (icmpProber) and
+// its consumer (keepaliveLoop) are now covered by deterministic,
+// injected-prober tests in tunnel_keepalive_test.go.
 
 func TestKeepaliveState(t *testing.T) {
 	state := &KeepaliveState{

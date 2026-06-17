@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -47,9 +48,31 @@ type KeepaliveState struct {
 	Failures    int  // consecutive probe failures
 	LastSuccess time.Time
 	LastFailure time.Time
-	RemoteAddr  string // remote endpoint being probed
+	RemoteAddr  string // underlay remote endpoint being probed
+	SourceAddr  string // tunnel local endpoint IP bound for the probe (§5c)
 	Interval    int    // probe interval in seconds
 	MaxRetries  int    // failures before declaring down
+
+	// #1918 hold-on-unknown bookkeeping. When the prober cannot perform a
+	// probe (ProbeUnsupported), the loop holds the prior Up value and
+	// reports the link liveness as unknown (KeepaliveUp == nil) rather
+	// than tearing the link down for a self-inflicted reason.
+	//   Unknown       — last tick could not probe (status renders "unknown").
+	//   UnknownKind   — structural (hold indefinitely) vs transient.
+	//   UnknownErrno  — human errno string for the escalated status.
+	//   unknownStreak — consecutive unknown ticks; gates transient
+	//                   escalation after MaxRetries consecutive ticks.
+	//   warnedUnknown — one-shot guard for the structural slog.Warn.
+	Unknown       bool
+	UnknownKind   UnsupportedKind
+	UnknownErrno  string
+	unknownStreak int
+	warnedUnknown bool
+
+	// seq is the monotonic 16-bit ICMP echo sequence counter (§5a). Each
+	// probe increments it; the reply must match Seq AND the per-probe
+	// Data-nonce.
+	seq int
 }
 
 // keepaliveRunner manages the goroutine for a single tunnel's keepalive.
@@ -67,32 +90,52 @@ type keepaliveRunner struct {
 	// unchanged runner alive across applies instead of restarting it
 	// (which would reset probe state every commit).
 	remote     string
+	source     string // tunnel local endpoint IP probed-from (#1918 §5c)
 	interval   int
 	maxRetries int // normalized: <=0 config value stored as 3
+
+	// linkGen is the per-tunnel generation token captured at start
+	// (#1918 §6 Axis D, defense-in-depth). The runner reads it LOCK-FREE
+	// (.Load()) before each netlink op and drops the action if it no
+	// longer matches the manager's current generation — so a stale runner
+	// cannot down/up a recreated link. The runner NEVER takes t.mu (AGY
+	// r5 deadlock note: a tick blocked on t.mu while Apply blocks on the
+	// drain would deadlock).
+	linkGen  *atomic.Uint64
+	startGen uint64
 }
 
 // matches reports whether the runner's identity equals the config's
 // NORMALIZED keepalive parameters. KeepaliveRetry <= 0 normalizes to 3
 // BEFORE comparison (#1884 r1 Codex F5: comparing a raw config 0
 // against the stored default 3 would restart the runner every apply).
+// The tunnel SOURCE is part of the identity (#1918 §5c): a source-only
+// change must restart the runner so the probe binds the new endpoint.
 func (r *keepaliveRunner) matches(tc *config.TunnelConfig) bool {
 	retries := tc.KeepaliveRetry
 	if retries <= 0 {
 		retries = 3
 	}
 	return r.remote == tc.Destination &&
+		r.source == tc.Source &&
 		r.interval == tc.Keepalive &&
 		r.maxRetries == retries
 }
 
 // TunnelStatus holds the status of a tunnel interface.
 type TunnelStatus struct {
-	Name          string
-	Source        string
-	Destination   string
-	State         string // "up" or "down"
-	Addresses     []string
-	KeepaliveUp   *bool  // nil if no keepalive configured
+	Name        string
+	Source      string
+	Destination string
+	State       string // "up" or "down"
+	Addresses   []string
+	// KeepaliveUp is tri-state (#1918): non-nil true/false when liveness is
+	// KNOWN (probe succeeded/failed), and nil when EITHER no keepalive is
+	// configured OR liveness is currently UNKNOWN (ProbeUnsupported —
+	// hold-on-unknown). The two nil cases are distinguished by
+	// KeepaliveInfo: "" → not configured; "unknown (...)" → configured but
+	// liveness unknown.
+	KeepaliveUp   *bool
 	KeepaliveInfo string // human-readable keepalive status
 }
 
@@ -105,9 +148,23 @@ type tunnelManager struct {
 	ops       linkOps
 	vrfBinder vrfBinder
 
+	// prober performs the keepalive ICMP echo. nil → the production
+	// icmpProber (lazily resolved by keepaliveProber). Tests inject a
+	// deterministic fake (#1918).
+	prober tunnelProber
+
 	mu         sync.Mutex
 	tunnels    []string                    // tunnels successfully applied this round (GetStatus source)
 	keepalives map[string]*keepaliveRunner // tunnel name -> runner
+
+	// linkGen is the per-tunnel monotonic generation counter (#1918 §6
+	// Axis D, defense-in-depth recreate guard). The MAP structure is
+	// mutated only under mu (by Apply, via bumpLinkGenLocked); the counter
+	// values are *atomic.Uint64 so a keepalive runner can Load() them
+	// lock-free at tick time without ever taking mu (AGY r5 deadlock
+	// note). Apply bumps the counter on a tunnel link create/recreate so a
+	// stale runner captured at the old generation drops its LinkSet*.
+	linkGen map[string]*atomic.Uint64
 
 	// Reconcile-in-place state (#1884). All lazily initialized by Apply.
 	//
@@ -149,6 +206,38 @@ func (t *tunnelManager) ensureReconcileStateLocked() {
 	if t.keepalives == nil {
 		t.keepalives = map[string]*keepaliveRunner{}
 	}
+	if t.linkGen == nil {
+		t.linkGen = map[string]*atomic.Uint64{}
+	}
+}
+
+// linkGenForLocked returns the (lazily created) generation counter for a
+// tunnel name. Caller MUST hold mu.
+func (t *tunnelManager) linkGenForLocked(name string) *atomic.Uint64 {
+	g, ok := t.linkGen[name]
+	if !ok {
+		g = &atomic.Uint64{}
+		t.linkGen[name] = g
+	}
+	return g
+}
+
+// bumpLinkGenLocked advances a tunnel's generation token. Called by
+// Apply whenever it CREATES or RECREATES the kernel link for a tunnel,
+// so any keepalive runner still holding the previous generation drops
+// its netlink op (#1918 §6 Axis D defense-in-depth). Caller MUST hold
+// mu.
+func (t *tunnelManager) bumpLinkGenLocked(name string) {
+	t.linkGenForLocked(name).Add(1)
+}
+
+// keepaliveProber resolves the prober used by keepalive goroutines: the
+// injected test fake when set, else the production datagram-ICMP prober.
+func (t *tunnelManager) keepaliveProber() tunnelProber {
+	if t.prober != nil {
+		return t.prober
+	}
+	return icmpProber{}
 }
 
 // Apply reconciles the kernel tunnel devices against the desired
@@ -456,16 +545,67 @@ func (t *tunnelManager) applyKernelTunnelLocked(tc *config.TunnelConfig) {
 	isIPv6 := localIP.To4() == nil
 	desired := buildKernelTunnelLink(tc, localIP, remoteIP, uint8(ttl), isIPv6)
 
+	// #1918 §6 Axis D F7 — drain-before-recreate. Decide up front whether
+	// this apply will recreate (delete + re-add) the kernel link. If so,
+	// CANCEL + DRAIN any existing keepalive runner BEFORE the LinkDel /
+	// LinkAdd, so no stale runner goroutine can be mid-LinkSet* while the
+	// link is recreated and the kernel reuses its ifindex (the F7
+	// counterexample). The drain is the real serializer; it already
+	// existed inside startKeepalive but ran AFTER the recreate. After the
+	// drain the old runner's goroutine has returned and cannot issue any
+	// further LinkSet*. linkGen is the defense-in-depth backstop.
+	//
+	// A lookup error must be classified (Codex PR #1947 r1 HIGH): only a
+	// genuine NOT-FOUND means "absent → create". Any OTHER lookup error
+	// (EBUSY / transport hiccup) is TRANSIENT — it does NOT mean the link
+	// is gone, so we must NOT drain the live keepalive runner and must NOT
+	// fall through to a LinkAdd that would EEXIST. Abort and retry next
+	// apply, exactly like a transient LinkDel failure below.
+	willRecreate := false
+	var existing netlink.Link
+	e, lookupErr := t.ops.LinkByName(tc.Name)
+	switch {
+	case lookupErr == nil:
+		existing = e
+		willRecreate = !legacyTunnelMatches(e, desired)
+	case isLinkNotFound(lookupErr):
+		// Absent → the LinkAdd below is a (re)create.
+		willRecreate = true
+	default:
+		// Transient lookup error: leave the runner and any live link
+		// untouched; retry on the next apply.
+		slog.Warn("tunnel lookup failed transiently; deferring apply",
+			"name", tc.Name, "err", lookupErr)
+		return
+	}
+	if willRecreate {
+		// Drain the stale runner first; bump the generation so any runner
+		// that somehow survives (future code paths) drops its netlink op.
+		t.stopKeepaliveLocked(tc.Name)
+		t.bumpLinkGenLocked(tc.Name)
+	}
+
 	var link netlink.Link
 	created := false
-	if existing, lookupErr := t.ops.LinkByName(tc.Name); lookupErr == nil {
-		if legacyTunnelMatches(existing, desired) {
+	if existing != nil {
+		if !willRecreate {
 			link = existing // kernel-fetched, real ifindex (#1706)
 			slog.Debug("tunnel reused", "name", tc.Name)
 		} else {
 			if delErr := t.ops.LinkDel(existing); delErr != nil {
 				slog.Warn("failed to replace existing tunnel link",
 					"name", tc.Name, "existing_type", existing.Type(), "err", delErr)
+				// The recreate failed but the OLD link is still live. We
+				// already drained its keepalive runner before the LinkDel
+				// (F7 ordering). Restart it against the surviving link so a
+				// transient LinkDel failure does not silently leave the
+				// tunnel running with NO keepalive until the next successful
+				// apply (Copilot PR #1947 r3). Safe because the link was NOT
+				// recreated — the restarted runner captures the just-bumped
+				// generation and probes the same device.
+				if tc.Keepalive > 0 {
+					t.startKeepalive(tc.Name, tc.Source, tc.Destination, tc.Keepalive, tc.KeepaliveRetry)
+				}
 				return
 			}
 			slog.Info("replaced tunnel link with changed parameters",
@@ -543,8 +683,8 @@ func (t *tunnelManager) applyKernelTunnelLocked(tc *config.TunnelConfig) {
 		if restartKA {
 			// startKeepalive stops+drains any predecessor itself;
 			// runs AFTER a recreate so the fresh runner probes the
-			// new device.
-			t.startKeepalive(tc.Name, tc.Destination, tc.Keepalive, tc.KeepaliveRetry)
+			// new device. tc.Source is the bind endpoint (#1918 §5c).
+			t.startKeepalive(tc.Name, tc.Source, tc.Destination, tc.Keepalive, tc.KeepaliveRetry)
 		}
 	} else if hasRunner {
 		t.stopKeepaliveLocked(tc.Name)
@@ -942,8 +1082,9 @@ func (t *tunnelManager) stopKeepaliveLocked(name string) {
 }
 
 // startKeepalive starts a keepalive probe goroutine for a tunnel.
-// Caller MUST hold mu.
-func (t *tunnelManager) startKeepalive(tunnelName, remoteAddr string, interval, maxRetries int) {
+// source is the tunnel local endpoint IP the probe binds to (#1918
+// §5c); "" → wildcard. Caller MUST hold mu.
+func (t *tunnelManager) startKeepalive(tunnelName, source, remoteAddr string, interval, maxRetries int) {
 	// Stop existing keepalive for this tunnel if any. Drain on done
 	// so the replacement doesn't race the old goroutine on the handle.
 	t.stopKeepaliveLocked(tunnelName)
@@ -955,9 +1096,16 @@ func (t *tunnelManager) startKeepalive(tunnelName, remoteAddr string, interval, 
 	state := &KeepaliveState{
 		Up:         true,
 		RemoteAddr: remoteAddr,
+		SourceAddr: source,
 		Interval:   interval,
 		MaxRetries: maxRetries,
 	}
+
+	// Capture the current generation token (#1918 §6 Axis D
+	// defense-in-depth). The runner reads it LOCK-FREE — it never takes
+	// t.mu — so an Apply blocked on the drain can never deadlock a tick.
+	gen := t.linkGenForLocked(tunnelName)
+	startGen := gen.Load()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -966,18 +1114,49 @@ func (t *tunnelManager) startKeepalive(tunnelName, remoteAddr string, interval, 
 		state:      state,
 		done:       done,
 		remote:     remoteAddr,
+		source:     source,
 		interval:   interval,
 		maxRetries: maxRetries,
+		linkGen:    gen,
+		startGen:   startGen,
 	}
 
-	go t.keepaliveLoop(ctx, done, tunnelName, state)
+	prober := t.keepaliveProber()
+	go t.keepaliveLoop(ctx, done, tunnelName, state, prober, gen, startGen)
 	slog.Info("started keepalive", "tunnel", tunnelName,
-		"remote", remoteAddr, "interval", interval, "retries", maxRetries)
+		"source", source, "remote", remoteAddr, "interval", interval, "retries", maxRetries)
 }
 
-// keepaliveLoop runs periodic ICMP probes to the tunnel remote endpoint.
+// keepaliveProbeDeadline returns the per-probe round-trip budget: a
+// fraction of the interval, capped at 800ms (R5). Keeps the probe well
+// inside the tick so a slow/lost reply cannot overrun the next tick.
+func keepaliveProbeDeadline(intervalSec int) time.Duration {
+	const maxDeadline = 800 * time.Millisecond
+	half := time.Duration(intervalSec) * time.Second / 2
+	if half <= 0 || half > maxDeadline {
+		return maxDeadline
+	}
+	return half
+}
+
+// keepaliveLoop runs periodic ICMP echo probes to the tunnel underlay
+// endpoint and drives the link admin state off REAL liveness (#1918).
 // Closes `done` when it returns so stopAll can drain.
-func (t *tunnelManager) keepaliveLoop(ctx context.Context, done chan struct{}, tunnelName string, state *KeepaliveState) {
+//
+// Tick body is the §6 Axis D COMMIT-AFTER-SUCCESS sequence:
+//  1. Under state.mu: classify the probe; commit pure counters
+//     (Failures/LastSuccess/LastFailure/unknown bookkeeping); compute
+//     the transition INTENT (wantUp/wantDown) WITHOUT writing Up; Unlock.
+//     A racing GetStatus/Apply therefore never observes an uncommitted Up.
+//  2. No intent → done (no netlink, no Up write).
+//  3. LinkByName; on error do nothing (Up unchanged → retried next tick).
+//  4. Lock-free gen.Load() guard: if the generation changed, the link
+//     was recreated under us → DROP the action (do not down/up the
+//     replacement). Never takes t.mu (AGY r5).
+//  5. The single LinkSetUp/LinkSetDown, OUTSIDE state.mu, capturing err.
+//  6. Commit Up ONLY on netlink success; on error leave Up unchanged so
+//     the transition retries.
+func (t *tunnelManager) keepaliveLoop(ctx context.Context, done chan struct{}, tunnelName string, state *KeepaliveState, prober tunnelProber, gen *atomic.Uint64, startGen uint64) {
 	defer close(done)
 	ticker := time.NewTicker(time.Duration(state.Interval) * time.Second)
 	defer ticker.Stop()
@@ -987,67 +1166,170 @@ func (t *tunnelManager) keepaliveLoop(ctx context.Context, done chan struct{}, t
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			ok := probeICMP(state.RemoteAddr)
-			state.mu.Lock()
-			if ok {
-				state.LastSuccess = time.Now()
-				if !state.Up {
-					slog.Info("tunnel keepalive recovered", "tunnel", tunnelName,
-						"remote", state.RemoteAddr)
-					state.Up = true
-					state.Failures = 0
-					// Bring tunnel back up
-					if link, err := t.ops.LinkByName(tunnelName); err == nil {
-						t.ops.LinkSetUp(link)
-					}
-				}
-				state.Failures = 0
-			} else {
-				state.Failures++
-				state.LastFailure = time.Now()
-				if state.Up && state.Failures >= state.MaxRetries {
-					slog.Warn("tunnel keepalive failed, marking down",
-						"tunnel", tunnelName, "remote", state.RemoteAddr,
-						"failures", state.Failures)
-					state.Up = false
-					// Bring tunnel down
-					if link, err := t.ops.LinkByName(tunnelName); err == nil {
-						t.ops.LinkSetDown(link)
-					}
-				}
-			}
-			state.mu.Unlock()
+			t.keepaliveTick(tunnelName, state, prober, gen, startGen)
 		}
 	}
 }
 
-// probeICMP sends a single ICMP echo request and returns true if the host responds.
-func probeICMP(addr string) bool {
-	ip := net.ParseIP(addr)
-	if ip == nil {
-		return false
-	}
+// keepaliveTick runs one §6 Axis D commit-after-success probe cycle. It
+// is the per-tick body of keepaliveLoop, extracted so tests can drive a
+// single deterministic tick without a real ticker. It NEVER takes t.mu
+// (AGY r5): only state.mu (two short sections) and a lock-free gen.Load().
+func (t *tunnelManager) keepaliveTick(tunnelName string, state *KeepaliveState, prober tunnelProber, gen *atomic.Uint64, startGen uint64) {
+	deadline := keepaliveProbeDeadline(state.Interval)
+	seq := nextSeq(state)
+	nonce := makeNonce()
+	result, kind, reason := prober.Probe(state.SourceAddr, state.RemoteAddr, seq, nonce, deadline)
 
-	network := "ip4:icmp"
-	if ip.To4() == nil {
-		network = "ip6:ipv6-icmp"
-	}
-
-	conn, err := net.DialTimeout(network, addr, 3*time.Second)
-	if err != nil {
-		// Fallback: use UDP dial as a reachability check when raw socket
-		// is not available (no CAP_NET_RAW). A successful UDP dial only
-		// means the route exists, but for keepalive purposes this is
-		// close enough. ping utility would be better but adds exec overhead.
-		conn2, err2 := net.DialTimeout("udp", net.JoinHostPort(addr, "1"), 3*time.Second)
-		if err2 != nil {
-			return false
+	// ---- Step 1: classify + commit counters, compute intent ----
+	state.mu.Lock()
+	var wantUp, wantDown bool
+	switch result {
+	case ProbeAlive:
+		state.LastSuccess = time.Now()
+		state.clearUnknownLocked()
+		if !state.Up {
+			wantUp = true // recovery edge
 		}
-		conn2.Close()
-		return true
+		state.Failures = 0
+	case ProbeDead:
+		state.LastFailure = time.Now()
+		state.clearUnknownLocked()
+		state.Failures++
+		if state.Up && state.Failures >= state.MaxRetries {
+			wantDown = true
+		}
+	case ProbeUnsupported:
+		// Hold-on-unknown (§6 Axis C, C1): do NOT touch Failures,
+		// do NOT transition the link. Surface as unknown; escalate a
+		// sustained TRANSIENT unknown after MaxRetries ticks. The prober's
+		// reason (real syscall/config detail) is recorded so the status and
+		// escalation log are actionable (Copilot PR #1947).
+		detail := reason
+		if detail == "" {
+			detail = classifyErrnoString(kind)
+		}
+		state.markUnknownLocked(tunnelName, kind, detail)
 	}
-	conn.Close()
-	return true
+	state.mu.Unlock()
+
+	// ---- Step 2: no transition intent → nothing to do ----
+	if !wantUp && !wantDown {
+		return
+	}
+
+	// ---- Step 3: resolve the link; error → retry next tick ----
+	link, err := t.ops.LinkByName(tunnelName)
+	if err != nil {
+		// Do NOT write Up; the guard in step 1 fires again next
+		// tick (Up unchanged). No spurious latch from a transient
+		// netlink lookup hiccup (§4.6).
+		slog.Debug("keepalive transition deferred: link lookup failed",
+			"tunnel", tunnelName, "err", err)
+		return
+	}
+
+	// ---- Step 4: lock-free generation guard (defense-in-depth) --
+	if gen.Load() != startGen {
+		// The link was recreated by Apply since this runner started.
+		// Drop the action so we never down/up the replacement link.
+		slog.Debug("keepalive transition dropped: link generation changed",
+			"tunnel", tunnelName)
+		return
+	}
+
+	// ---- Step 5: the single netlink op, OUTSIDE state.mu --------
+	var nlErr error
+	if wantUp {
+		nlErr = t.ops.LinkSetUp(link)
+	} else {
+		nlErr = t.ops.LinkSetDown(link)
+	}
+
+	// ---- Step 6: commit Up only on netlink success -------------
+	if nlErr != nil {
+		// Up retains its pre-transition value → the transition is
+		// retried next tick until the kernel op succeeds. Never a
+		// lost transition (Codex r3 counterexample).
+		slog.Warn("keepalive netlink transition failed; will retry",
+			"tunnel", tunnelName, "want_up", wantUp, "err", nlErr)
+		return
+	}
+	state.mu.Lock()
+	if wantUp {
+		state.Up = true
+		state.Failures = 0
+		slog.Info("tunnel keepalive recovered", "tunnel", tunnelName,
+			"remote", state.RemoteAddr)
+	} else {
+		state.Up = false
+		slog.Warn("tunnel keepalive failed, marking down",
+			"tunnel", tunnelName, "remote", state.RemoteAddr,
+			"failures", state.Failures)
+	}
+	state.mu.Unlock()
+}
+
+// nextSeq returns a fresh monotonic 16-bit sequence number for a probe
+// (§5a). Wraps at 0xffff; the per-probe nonce disambiguates a wrapped
+// collision. Mutates Failures-adjacent state under its own lock.
+func nextSeq(state *KeepaliveState) int {
+	state.mu.Lock()
+	state.seq = (state.seq + 1) & 0xffff
+	s := state.seq
+	state.mu.Unlock()
+	return s
+}
+
+// clearUnknownLocked resets the hold-on-unknown bookkeeping after a
+// definitive Alive/Dead probe. Caller MUST hold state.mu.
+func (s *KeepaliveState) clearUnknownLocked() {
+	s.Unknown = false
+	s.UnknownKind = UnsupportedNone
+	s.UnknownErrno = ""
+	s.unknownStreak = 0
+	s.warnedUnknown = false
+}
+
+// markUnknownLocked records a ProbeUnsupported tick. Structural emits a
+// one-shot Warn and holds indefinitely; transient holds but escalates to
+// slog.Error after MaxRetries consecutive unknown ticks (§6 Axis C,
+// transient escalation). Never changes Up or Failures. Caller MUST hold
+// state.mu.
+func (s *KeepaliveState) markUnknownLocked(tunnelName string, kind UnsupportedKind, errStr string) {
+	s.Unknown = true
+	s.UnknownKind = kind
+	s.UnknownErrno = errStr
+	s.unknownStreak++
+	switch kind {
+	case UnsupportedStructural:
+		if !s.warnedUnknown {
+			s.warnedUnknown = true
+			slog.Warn("tunnel keepalive cannot probe (ICMP unavailable); holding prior state",
+				"tunnel", tunnelName, "remote", s.RemoteAddr,
+				"hint", "set net.ipv4.ping_group_range or grant CAP_NET_RAW")
+		}
+	case UnsupportedTransient:
+		if s.unknownStreak >= s.MaxRetries && !s.warnedUnknown {
+			s.warnedUnknown = true
+			slog.Error("tunnel keepalive probe failing on local resource error; cannot verify peer liveness",
+				"tunnel", tunnelName, "remote", s.RemoteAddr,
+				"errno", errStr, "consecutive", s.unknownStreak)
+		}
+	}
+}
+
+// classifyErrnoString renders a short label for the unknown kind used in
+// the status string.
+func classifyErrnoString(kind UnsupportedKind) string {
+	switch kind {
+	case UnsupportedTransient:
+		return "probe socket error"
+	case UnsupportedStructural:
+		return "ICMP probe unavailable"
+	default:
+		return "unknown"
+	}
 }
 
 // GetKeepaliveState returns the keepalive state for a tunnel, or nil
@@ -1109,6 +1391,11 @@ func (t *tunnelManager) clearLocked() error {
 	t.ownedNames = nil
 	t.appliedAddrs = nil
 	t.appliedRI = nil
+	// clearLocked drains every keepalive runner first
+	// (stopAllKeepalivesLocked above), so no live runner holds a stale
+	// linkGen pointer; dropping the map is safe and prevents removed names
+	// from leaking generation counters (#1918).
+	t.linkGen = nil
 	return nil
 }
 
@@ -1154,17 +1441,40 @@ func (t *tunnelManager) GetStatus() ([]TunnelStatus, error) {
 			}
 		}
 
-		// Add keepalive info
+		// Add keepalive info.
 		if ks := t.GetKeepaliveState(name); ks != nil {
 			ks.mu.Lock()
-			up := ks.Up
-			ts.KeepaliveUp = &up
-			if up {
-				ts.KeepaliveInfo = fmt.Sprintf("up (interval %ds, %d retries)",
-					ks.Interval, ks.MaxRetries)
-			} else {
-				ts.KeepaliveInfo = fmt.Sprintf("down (%d consecutive failures)",
-					ks.Failures)
+			switch {
+			case ks.Unknown:
+				// Hold-on-unknown (#1918 §6 Axis C): the prober could not
+				// verify liveness. KeepaliveUp stays nil ("liveness
+				// unknown") — never reported up — and the info string tells
+				// the operator why so they can fix the sysctl/caps. A
+				// sustained transient unknown carries the escalated errno.
+				ts.KeepaliveUp = nil
+				switch {
+				case ks.UnknownKind == UnsupportedTransient:
+					ts.KeepaliveInfo = fmt.Sprintf(
+						"unknown (%s; %d consecutive)",
+						ks.UnknownErrno, ks.unknownStreak)
+				case ks.UnknownErrno != "":
+					// Structural with a captured reason (the real syscall/config
+					// detail): show it so the operator can fix the root cause.
+					ts.KeepaliveInfo = fmt.Sprintf(
+						"unknown (ICMP probe unavailable: %s)", ks.UnknownErrno)
+				default:
+					ts.KeepaliveInfo = "unknown (ICMP probe unavailable)"
+				}
+			default:
+				up := ks.Up
+				ts.KeepaliveUp = &up
+				if up {
+					ts.KeepaliveInfo = fmt.Sprintf("up (interval %ds, %d retries)",
+						ks.Interval, ks.MaxRetries)
+				} else {
+					ts.KeepaliveInfo = fmt.Sprintf("down (%d consecutive failures)",
+						ks.Failures)
+				}
 			}
 			ks.mu.Unlock()
 		}

@@ -116,11 +116,62 @@ existing kernel link is genuinely incompatible:
   the claimed RI's `vrf-` device; transient errors retain the claim
   for retry.
 - **Keepalives** (legacy branch only — anchors never probe): runners
-  are reconciled by normalized identity `(remote, interval,
+  are reconciled by normalized identity `(remote, source, interval,
   retry<=0→3)` and survive unrelated applies; `LinkSetUp` is SKIPPED
   when a retained runner holds the tunnel down (the down-transition in
   `keepaliveLoop` is gated on `state.Up`, so re-upping would strand
-  the link admin UP).
+  the link admin UP). A change to the tunnel SOURCE restarts the runner
+  (#1918 §5c): the source is the probe bind address.
+
+## Keepalive liveness probing (`tunnel_keepalive.go`, #1918)
+
+The keepalive performs a **real ICMP echo round-trip** — it is a
+liveness check, not a route-existence check. (The pre-#1918 `probeICMP`
+opened a socket and returned `true` without sending anything, so a dead
+peer behind a valid route read up forever and the fail-safe
+`LinkSetDown` was unreachable.)
+
+- **Mechanism**: unprivileged datagram ICMP (`udp4`/`udp6` via
+  `golang.org/x/net/icmp`), the same mechanism as the tested
+  `pkg/cluster/monitor.go` precedent. Requires `net.ipv4.ping_group_range`
+  to admit the daemon gid (or `CAP_NET_RAW`); when it does not, the probe
+  is **ProbeUnsupported** and the link is HELD (never torn down — see
+  hold-on-unknown).
+- **Reply match**: `Seq` + a per-probe random **Data-nonce** — NOT the
+  ICMP ID. Datagram ("ping") sockets rewrite the outbound id to the
+  socket source port, so id is advisory only.
+- **Probe target / table**: the underlay `Destination`, routed in the
+  GLOBAL/underlay FIB (no `SO_BINDTODEVICE` to an overlay VRF) — exactly
+  where the tunnel's encapsulated packets resolve.
+- **Source bind**: the probe binds the tunnel's local `Source` IP so the
+  echo egresses from, and the reply returns to, the tunnel endpoint
+  (multi-homed / policy-routed correctness). Empty source → wildcard.
+- **Typed result** (`ProbeResult`): `ProbeAlive | ProbeDead |
+  ProbeUnsupported`. The old `bool` erased "could not probe".
+- **Hold-on-unknown** (Axis C): on `ProbeUnsupported` the loop does NOT
+  change `Failures` and does NOT transition the link; it holds the prior
+  `Up` and reports `KeepaliveUp == nil` with `KeepaliveInfo = "unknown
+  (...)"`. Structural causes (missing `ping_group_range`/cap, bound
+  source not local) hold indefinitely with a one-shot `slog.Warn`;
+  transient causes (FD/memory exhaustion, unrecognized errno) hold but
+  escalate to `slog.Error` after `MaxRetries` consecutive unknown ticks
+  so a real peer death is never silently masked. Tearing the link down
+  because the daemon cannot probe would be a self-inflicted outage.
+- **Commit-after-success / lock scope** (Axis D): the tick classifies the
+  probe and computes the transition INTENT under `state.mu`, releases the
+  lock, performs the single `LinkSetUp`/`LinkSetDown` OUTSIDE the lock,
+  and commits `state.Up` ONLY if the netlink op succeeded. A
+  `LinkByName`/`LinkSet*` error leaves `Up` unchanged so the transition
+  retries next tick (never a lost or half-applied transition), and a
+  racing `GetStatus` never blocks behind a slow netlink op nor observes
+  an uncommitted `Up`.
+- **Recreate safety**: `applyKernelTunnelLocked` cancels + DRAINS the
+  existing keepalive runner BEFORE it deletes/recreates the kernel link
+  (drain-before-recreate), so no stale runner can issue a `LinkSet*`
+  against a recreated link that reused the ifindex. A per-tunnel
+  `linkGen` (`*atomic.Uint64`, read LOCK-FREE by the runner — it never
+  takes `t.mu`) is the defense-in-depth backstop; the runner drops any
+  transition whose captured generation no longer matches.
 
 `Clear()`/`ClearTunnels` keep delete-everything semantics and reset the
 reconcile state. Restart residuals (documented): anchors/addresses/RI
