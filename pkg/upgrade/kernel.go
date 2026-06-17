@@ -204,6 +204,14 @@ type KernelSystem interface {
 	// return — the process is gone). Tests inject a no-op + flag.
 	Reboot() error
 
+	// WritePromotionMarker durably records that <unameR> was promoted at the
+	// given time (survives the journal clear), so the external HA orchestrator's
+	// post-reboot version-check ("running kernel == target AND promotion
+	// confirmed") has a durable signal to poll via `xpfd upgrade kernel status`.
+	WritePromotionMarker(unameR string) error
+	// ReadPromotionMarker returns the last promoted uname -r (or "" if none).
+	ReadPromotionMarker() (string, error)
+
 	// ---- promotion-gate surface (runs on the candidate boot) ----
 
 	// BootCurrent returns the Boot#### id the firmware actually booted.

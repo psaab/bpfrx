@@ -399,6 +399,14 @@ func (r *KernelRunner) Promote() error {
 	if err := sys.DisarmWatchdog(); err != nil {
 		r.logf("kernel-upgrade promote: WARNING disarm watchdog: %v", err)
 	}
+	// Write the DURABLE promotion marker BEFORE clearing the journal, so the
+	// external HA orchestrator's post-reboot version-check has a signal that
+	// survives the clear (INC-2). Best-effort: a marker-write failure does not
+	// un-promote (the BootOrder reorder already succeeded), but the orchestrator
+	// then relies on `uname -r == target` alone.
+	if err := sys.WritePromotionMarker(running); err != nil {
+		r.logf("kernel-upgrade promote: WARNING write promotion marker: %v", err)
+	}
 	// The candidate slot is now the active/known-good slot; the OTHER slot
 	// (the former active) becomes the rollback target and keeps its kernel.
 	if err := r.ktransition(j, KernelStatePromoted); err != nil {

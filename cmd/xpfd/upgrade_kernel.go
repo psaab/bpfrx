@@ -90,16 +90,30 @@ func runUpgradeKernelSubcommand(args []string) {
 		fmt.Println("kernel candidate promoted")
 
 	case "status":
+		// Report the durable promotion marker too — the external HA orchestrator
+		// (INC-2) polls this post-reboot to confirm "this node promoted version
+		// X" (the journal is cleared on promote, so the marker is the durable
+		// signal). Machine-parseable: "promoted=<uname>" / "promoted=none".
+		promoted, perr := cfg.Sys.ReadPromotionMarker()
+		if perr != nil {
+			fmt.Fprintf(os.Stderr, "upgrade kernel status: read promotion marker: %v\n", perr)
+			os.Exit(1)
+		}
+		if promoted == "" {
+			fmt.Println("promoted=none")
+		} else {
+			fmt.Printf("promoted=%s\n", promoted)
+		}
 		armed, j, err := r.IsArmed()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "upgrade kernel status: %v\n", err)
 			os.Exit(1)
 		}
 		if !armed {
-			fmt.Println("no kernel upgrade armed")
+			fmt.Println("armed=none")
 			return
 		}
-		fmt.Printf("armed: candidate=%s known-good=%s active-slot=%s inactive-slot=%s state=%s\n",
+		fmt.Printf("armed=true candidate=%s known-good=%s active-slot=%s inactive-slot=%s state=%s\n",
 			j.CandidateVersion, j.KnownGoodVersion, j.ActiveSlot, j.InactiveSlot, j.State)
 
 	default:

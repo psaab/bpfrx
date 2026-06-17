@@ -323,6 +323,28 @@ func (s *realKernelSystem) Reboot() error {
 	return exec.Command("systemctl", "reboot").Run()
 }
 
+// promotionMarkerPath records the last promoted kernel uname -r (survives the
+// journal clear) for the external HA orchestrator's post-reboot version-check.
+const promotionMarkerPath = "/var/lib/xpf/kernel-promoted"
+
+func (s *realKernelSystem) WritePromotionMarker(unameR string) error {
+	if err := fsatomic.MkdirAllDurable(filepath.Dir(promotionMarkerPath), 0755); err != nil {
+		return fmt.Errorf("create promotion marker dir: %w", err)
+	}
+	return fsatomic.WriteFileDurable(promotionMarkerPath, []byte(unameR+"\n"), 0644)
+}
+
+func (s *realKernelSystem) ReadPromotionMarker() (string, error) {
+	data, err := os.ReadFile(promotionMarkerPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("read promotion marker: %w", err)
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
 func (s *realKernelSystem) BootCurrent() (string, error) {
 	out, err := captureCmd("efibootmgr")
 	if err != nil {
