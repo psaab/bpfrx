@@ -14,6 +14,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 // errWGIncompatibleLinkRetained is returned by applyWireguardTunLocked
@@ -940,8 +941,20 @@ func (t *tunnelManager) reconcileLinkAddrsLocked(link netlink.Link, name string,
 			continue
 		}
 		if addErr := t.ops.AddrAdd(link, addr); addErr != nil {
-			slog.Warn("failed to add "+kind+" address",
-				"name", name, "addr", addrStr, "err", addErr)
+			if errors.Is(addErr, unix.EEXIST) {
+				// The address is already present — idempotent success, not a
+				// failure. This is the common outcome after an AddrList
+				// enumeration failure above (we could not see it in
+				// `existing`, so it fell through to this add). Track it as
+				// applied and log at Debug to avoid misleading Warn noise
+				// (Copilot PR #1950).
+				newApplied[key] = true
+				slog.Debug("'"+kind+"' address already present",
+					"name", name, "addr", addrStr)
+			} else {
+				slog.Warn("failed to add "+kind+" address",
+					"name", name, "addr", addrStr, "err", addErr)
+			}
 		} else {
 			newApplied[key] = true
 		}

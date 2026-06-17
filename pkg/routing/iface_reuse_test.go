@@ -6,6 +6,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 // fakeLinkOps is an in-memory linkOps for the #1706 tunnel/xfrm reuse
@@ -155,7 +156,9 @@ func (f *fakeLinkOps) LinkList() ([]netlink.Link, error) { return nil, nil }
 func (f *fakeLinkOps) AddrAdd(l netlink.Link, a *netlink.Addr) error {
 	_ = l.Attrs()
 	if f.addrAddFail {
-		return errors.New("file exists")
+		// Mirror real netlink: adding an already-present address yields
+		// EEXIST (matched via errors.Is in reconcileLinkAddrsLocked).
+		return unix.EEXIST
 	}
 	f.addrLinks = append(f.addrLinks, l)
 	name := l.Attrs().Name
