@@ -385,6 +385,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.ipsec = ipsec.New()
 		d.ra = ra.New()
 		d.networkd = networkd.New()
+		// #1956 AGY r3 CRITICAL: exempt the #1922 management protected set
+		// from networkd.Apply's stale-file sweep so the lifeline's rename +
+		// addressing survive a commit that leaves it out of the config.
+		d.networkd.SetProtectedResolver(d.resolveProtectedInterfaces)
 		d.dhcpServer = dhcpserver.New()
 	}
 

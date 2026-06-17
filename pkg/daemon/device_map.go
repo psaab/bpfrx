@@ -44,6 +44,31 @@ func rethMembersFromConfig(cfg *config.Config) map[string]bool {
 	return devicemap.RethMembersFromConfig(cfg)
 }
 
+// deviceMapOriginalNameFor computes the OriginalName= to record in a mapped
+// NIC's .link, given the NIC's CURRENT kernel name and its FINAL logical name.
+//   - If an existing .link already records the original (recoverOriginalName
+//     returns something other than the current name), use that.
+//   - Else, when the NIC already wears its FINAL logical name (current ==
+//     logical) and no .link exists (a second+ boot whose .link was lost),
+//     derive the true pre-rename kernel name from sysfs — the logical name is
+//     not something udev will ever present (Copilot SWE fallback).
+//   - Else (current != logical and no .link), the current name IS the real
+//     pre-rename kernel name (e.g. ens3 on a fresh first map). Keep it; do NOT
+//     synthesize an enpXsY name, which would not match udev on next boot
+//     (AGY r3 MAJOR).
+func deviceMapOriginalNameFor(currentNIC, logical string) string {
+	orig := recoverOriginalName(currentNIC)
+	if orig != currentNIC {
+		return orig // an existing .link chain recorded the true original
+	}
+	if currentNIC == logical {
+		if dk := deriveKernelNameFn(currentNIC); dk != "" {
+			return dk
+		}
+	}
+	return currentNIC
+}
+
 // enumerateAndRenameMapped is the device-map-mode replacement for
 // enumerateAndRenameInterfaces. It renames ONLY mapped NICs to their bound
 // logical names, writes .link files for ONLY those, scrubs stale xpf .link
@@ -83,19 +108,7 @@ func enumerateAndRenameMapped(dm *config.DeviceMapConfig, cfg *config.Config, pr
 		switch {
 		case b.Status.Bound():
 			desiredByCurrent[b.CurrentNIC] = b.Logical
-			orig := recoverOriginalName(b.CurrentNIC)
-			if orig == b.CurrentNIC {
-				// recoverOriginalName found no existing .link for this name.
-				// The NIC may already carry its final logical name (second+ boot
-				// with device-map) but the .link was absent. Derive the true
-				// pre-rename kernel name (e.g. enp9s0) from sysfs so the .link
-				// is written with the correct OriginalName= that udev will match
-				// on next boot, not the logical name that udev would never see.
-				if dk := deriveKernelNameFn(b.CurrentNIC); dk != "" {
-					orig = dk
-				}
-			}
-			originalByCurrent[b.CurrentNIC] = orig
+			originalByCurrent[b.CurrentNIC] = deviceMapOriginalNameFor(b.CurrentNIC, b.Logical)
 			desiredNames[b.Logical] = true
 			slog.Info("device-map: resolved binding",
 				"logical", b.Entry.LogicalName, "current", b.CurrentNIC, "status", b.Status.String())
@@ -339,6 +352,12 @@ func deviceMapStrandsManagement(cfg *config.Config, nics []presentNIC, protected
 		}
 	}
 
+	// Set of present interface names (current kernel names) for Case C.
+	present := make(map[string]bool, len(nics))
+	for i := range nics {
+		present[nics[i].Name] = true
+	}
+
 	for prot := range protected {
 		if prot == "" {
 			continue
@@ -352,6 +371,28 @@ func deviceMapStrandsManagement(cfg *config.Config, nics []presentNIC, protected
 				return fmt.Sprintf("device-map would assign the management name %q to NIC %q on "+
 					"next boot, taking it from the live management NIC. Re-pin the device-map "+
 					"before committing.", prot, current)
+			}
+		}
+		// Case C (AGY r3 MAJOR B.1): a protected name is CURRENTLY held by a
+		// present interface that is NOT mapped to keep it, while SOME mapped
+		// entry assigns that same protected name to a different NIC. On next
+		// boot both the stale .link of the current holder and the new
+		// binding's .link target the same name — a udev rename collision that
+		// can strand the management NIC. Refuse so the operator re-pins.
+		if present[prot] {
+			heldKept := false
+			if final, ok := finalByCurrent[prot]; ok && final == prot {
+				heldKept = true // the current holder is mapped to keep the name
+			}
+			if !heldKept {
+				for current, final := range finalByCurrent {
+					if final == prot && current != prot {
+						return fmt.Sprintf("device-map would assign the management name %q to NIC "+
+							"%q while the interface currently named %q is left unmapped — a rename "+
+							"collision on next boot. Map the current %q holder explicitly (or to a "+
+							"different name) before committing.", prot, current, prot, prot)
+					}
+				}
 			}
 		}
 	}

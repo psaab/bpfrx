@@ -234,6 +234,58 @@ func TestDeviceMapStrandsManagementCatchesPreRenameSteal(t *testing.T) {
 	}
 }
 
+func TestDeviceMapOriginalNameForFreshKernelName(t *testing.T) {
+	// AGY r3 MAJOR: on a fresh first map the NIC wears its real kernel name
+	// (ens3) and current != logical, so deviceMapOriginalNameFor must KEEP
+	// the kernel name, NOT synthesize an enpXsY via deriveKernelName (which
+	// would break the udev match on next boot).
+	withTempLinkDir(t) // empty link dir => recoverOriginalName returns input
+	called := false
+	old := deriveKernelNameFn
+	deriveKernelNameFn = func(string) string { called = true; return "enp0s3" }
+	t.Cleanup(func() { deriveKernelNameFn = old })
+
+	got := deviceMapOriginalNameFor("ens3", "ge-0-0-3")
+	if got != "ens3" {
+		t.Fatalf("fresh-box OriginalName must be the real kernel name ens3, got %q", got)
+	}
+	if called {
+		t.Fatalf("deriveKernelName must NOT be consulted when current != logical")
+	}
+}
+
+func TestDeviceMapOriginalNameForDerivesWhenWearingLogicalName(t *testing.T) {
+	// Second+ boot whose .link was lost: the NIC already wears its logical
+	// name (ge-0-0-3) and no .link exists, so derive the true kernel name.
+	withTempLinkDir(t)
+	old := deriveKernelNameFn
+	deriveKernelNameFn = func(string) string { return "enp9s0" }
+	t.Cleanup(func() { deriveKernelNameFn = old })
+
+	got := deviceMapOriginalNameFor("ge-0-0-3", "ge-0-0-3")
+	if got != "enp9s0" {
+		t.Fatalf("when wearing the logical name, OriginalName must derive the kernel name, got %q", got)
+	}
+}
+
+func TestDeviceMapStrandsManagementCaseCCollision(t *testing.T) {
+	// AGY r3 MAJOR B.1: a protected name currently held by an unmapped NIC,
+	// while a mapped entry assigns that same protected name to a different
+	// NIC -> rename collision on next boot -> refuse.
+	cfg := &config.Config{Chassis: config.ChassisConfig{DeviceMap: &config.DeviceMapConfig{
+		// enp9s0 -> ge-0/0/3 (a protected name currently held by another NIC).
+		Entries: []config.DeviceMapEntry{{LogicalName: "ge-0/0/3", PCIAddr: "0000:09:00.0"}},
+	}}}
+	nics := []devicemap.PresentNIC{
+		{Name: "ge-0-0-3", PCIAddr: "0000:0c:00.0"}, // unmapped current holder of the name
+		{Name: "enp9s0", PCIAddr: "0000:09:00.0"},   // mapped to ge-0/0/3
+	}
+	protected := map[string]bool{"ge-0-0-3": true}
+	if r := deviceMapStrandsManagement(cfg, nics, protected, ""); r == "" {
+		t.Fatalf("expected Case C collision rejection")
+	}
+}
+
 func TestDeviceMapStrandsManagementAllowsLegitMgmtRemap(t *testing.T) {
 	// Codex r2 HIGH-A: the live mgmt NIC still wears its kernel name enp5s0,
 	// the lifeline resolves it, and BOTH enp5s0 (lifeline current name) and
