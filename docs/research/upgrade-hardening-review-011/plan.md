@@ -1,12 +1,13 @@
 # Upgrade-subsystem hardening — plan of action (review-011)
 
-**Status:** DRAFT v2.2 — r1 all-three PLAN-NEEDS-MAJOR (folded in v2);
-r2 Claude SMR + AGY both PLAN-NEEDS-MINOR (folded here in v2.2); Codex r2
-infra-dropped, retried on v2.2. v2.2 adds: verify-dataplane as the real
-torn-binary backstop (not the preinst gate), C as an unconditional pre-STOP
-invariant, preinst idempotency hardening, lock re-entrancy for the rolling
-path, flip-failure non-nil return, postrm purge handling, preinst exec
-fallback.
+**Status:** DRAFT v2.3 — r1 all-three PLAN-NEEDS-MAJOR (folded v2); r2 SMR+AGY
+PLAN-NEEDS-MINOR (folded v2.2); r3 SMR PLAN-READY, AGY PLAN-NEEDS-MINOR (5
+lifecycle edge cases, folded v2.3); Codex r2/r3 infra-dropped (documented
+retries — `feedback_codex_infra_must_retry`). v2.3 adds: package-downgrade
+cleanup, systemd drop-in removal on remove/purge, preinst rename-collision
+(ENOTEMPTY) retry guard, atomic shell symlink repoint, verify-fail copy
+cleanup. The architecture has been unchallenged since r1; remaining items are
+maintainer-script implementation details, all now enumerated.
 **Base:** `3cd181323` (origin/master)
 **Issues:** #1964 (F1, HIGH), #1965 (F2, HIGH), #1966 (F3, LOW), #1967 (C1–C4 +
 two new must-fixes, MEDIUM). `/research` only — no code is written here.
@@ -103,10 +104,17 @@ versioned rollback target, because it does not know those paths exist.
   unconditionally, and gate only the snapshot-copy on `versions/current`
   absence. Always `rm -rf versions/<oldver>.partial` before copying. Snapshot
   only when the staged runtime version still equals `<oldver>` (AGY-1).
-  **`<oldver>` source (AGY-r2-4):** try `staged/xpfd version` (validated safe
-  segment); if the old binary will not exec (corrupt / lib / arch mismatch),
-  **fall back to a sanitized dpkg `$2`** and do NOT fail the transaction on
-  exec failure. Writes **no** upgrade journal.
+  **Rename-collision retry (AGY-r3-3):** a crash *after* the `.partial`→
+  `versions/<oldver>` rename but *before* `current` is created leaves a
+  populated `versions/<oldver>` + absent `current`; a naive retry re-renames
+  and fails `ENOTEMPTY`, blocking apt. Fix: if `versions/<oldver>` already
+  exists, skip copy+rename and jump to creating `current`. **Atomic shell
+  symlink repoint (AGY-r3-4):** `ln -sfnT` unlinks-then-creates (non-atomic
+  window where a respawn finds no path); use `ln -sf <tgt> <link>.tmp && mv -f
+  <link>.tmp <link>`. **`<oldver>` source (AGY-r2-4):** try `staged/xpfd
+  version` (validated safe segment); if the old binary will not exec (corrupt /
+  lib / arch mismatch), **fall back to a sanitized dpkg `$2`** and do NOT fail
+  the transaction on exec failure. Writes **no** upgrade journal.
 - **C — refuse-before-STOP (Go, runner.go).** Before `StopUnit`, hard-fail the
   cut when `PreviousVersion==""` and the run is not an explicitly sanctioned
   no-rollback first cut. Guarantees a healthy daemon is never stopped without a
@@ -117,12 +125,23 @@ versioned rollback target, because it does not know those paths exist.
 postinst/runner-side logic + tests. The legacy preinst migration (B) is shell
 in `debian/xpf.preinst` (cannot use the not-yet-unpacked Go binary).
 
-**postrm (AGY-r2-§5.3):** extend `debian/xpf.postrm` to also remove sbin links
-pointing through `versions/current`. `versions/` is package-derived (not user
-config): **leave on `remove`, remove the maintainer-managed `versions/` tree on
-`purge`** (Debian Policy §6.8 — purge removes all package state). Unlike
-`/etc/xpf` (master.key/configdb — deliberately never touched), `versions/` is
-just copied binaries, so purge-removal is correct.
+**postrm / lifecycle (AGY-r2-§5.3, AGY-r3-1, AGY-r3-2):** extend
+`debian/xpf.postrm`:
+- **remove/purge:** remove sbin links pointing through `versions/current`;
+  remove the runtime systemd drop-in
+  `/etc/systemd/system/xpfd.service.d/10-xpf-version.conf` (written by
+  `writeUnitDropin`, flip.go:98-112) + `rmdir` the `.d` dir if empty — else
+  systemd references a deleted binary path. `versions/` is package-derived (not
+  user config): **leave on `remove`, remove on `purge`** (Policy §6.8). Unlike
+  `/etc/xpf` (master.key/configdb — deliberately never touched), `versions/` is
+  copied binaries, so purge-removal is correct.
+- **downgrade (`postrm upgrade <new-version>` where `<new>` predates the
+  hardened layout):** the old package's postinst leaves existing sbin links
+  untouched, so without cleanup the lingering drop-in + `versions/current`
+  symlinks keep running the *newer* binaries — a silent version mismatch. The
+  hardened `postrm` must detect a downgrade below the hardened-layout version
+  and clean up: remove the drop-in, repoint sbin back to
+  `/usr/local/share/xpf/staged/*` (atomic), `systemctl daemon-reload`.
 
 **Version key:** `staged/xpfd version` (runtime), validated as a safe single
 path segment (shared with C1).
@@ -215,6 +234,12 @@ the drain window.
   START-failure auto-rollback (cutover.go:183), so this is not a correctness
   fix.
 - **C4:** `SyncDir(VersionsDir)` immediately after `removeAllPartials()`.
+- **NEW — verify-fail copy cleanup (AGY-r3-5):** `copyStaged` skips the copy
+  when `versions/<ver>` already exists (cutover.go:313-318). If a prior run
+  failed at `verify` and the operator drops a corrected binary into `staged/`
+  under the *same* version string (common in dev/test/reinstall), the retry
+  skips the copy and re-verifies the stale failing copy. Fix: on `verify`
+  failure, remove `versions/<ver>` so a subsequent run recopies from `staged/`.
 
 ## 7. Public API / contract preservation
 
