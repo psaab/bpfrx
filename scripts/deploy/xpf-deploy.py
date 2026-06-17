@@ -630,39 +630,52 @@ def _node_exec(runner, backend, node, argv, check=True):
 
 
 def _acquire_lease(runner, backend, node, target_node_id, holder, ttl_secs):
-    """ATOMICALLY acquire the lease on `node`, or fail if another holder has an
-    unexpired one. Closes the check-then-overwrite TOCTOU (r2 Codex): the claim
-    is a single `set -C` (noclobber) create — O_EXCL semantics — after first
-    removing an EXPIRED lease. Two racing drivers cannot both win the create.
-    expires_at is rendered in the NODE's clock (clock-skew safe). Exit 0 = won;
-    nonzero = a live lease is held by someone else (the caller aborts)."""
+    """ATOMICALLY acquire the lease on `node`, or die if another holder has an
+    unexpired one. The whole read-expired-decide-write is run inside an
+    OS-level flock on a dedicated lock file, so the expired-lease RECLAIM is
+    serialized too — closing the r3-Codex TOCTOU where a stale-read `rm` could
+    delete a racing driver's just-created live lease. (flock is util-linux,
+    present on the Debian/Ubuntu appliance base.) expires_at is rendered in the
+    NODE's clock (clock-skew safe)."""
     h = holder.replace('"', "")
-    script = (
-        "set -u; f=/var/lib/xpf/kernel-roll.lease; "
-        # If a lease exists, drop it ONLY if expired (in the node's clock);
-        # a live one is left in place so our exclusive create below fails.
+    # Inner critical section (runs while holding the flock): reclaim ONLY an
+    # expired lease, then create the new one. Because the whole section is
+    # serialized by flock, no other driver can interleave between the reclaim
+    # and the create.
+    crit = (
+        "f=/var/lib/xpf/kernel-roll.lease; "
         'if [ -f "$f" ]; then '
         'exp=$(sed -n \'s/.*"expires_at": *"\\([^"]*\\)".*/\\1/p\' "$f"); '
         'now=$(date -u +%%s); ee=$(date -u -d "$exp" +%%s 2>/dev/null || echo 0); '
-        '[ "$now" -ge "$ee" ] && rm -f "$f"; '
+        # live lease held by someone else -> do NOT touch it; fail to acquire.
+        'if [ "$now" -lt "$ee" ]; then exit 1; fi; '
         'fi; '
-        # Exclusive create (noclobber): fails if the file now exists (a live
-        # lease, or a racing driver that created it first).
         "exp=$(date -u -d \"+%d seconds\" +%%Y-%%m-%%dT%%H:%%M:%%SZ); "
-        "umask 022; ( set -C; "
+        "umask 022; "
         "printf '{\"node_id\": %d, \"holder\": \"%s\", \"expires_at\": \"%%s\"}' "
-        "\"$exp\" > \"$f\" ) 2>/dev/null"
+        "\"$exp\" > \"$f\""
     ) % (ttl_secs, target_node_id, h)
-    out = _node_exec(runner, backend, node, ["sh", "-c", script + " && echo ACQUIRED"],
-                     check=False)
+    # flock -w 30 serializes the critical section across concurrent drivers on
+    # this node; -E 9 distinguishes a lock-acquire timeout (exit 9) from the
+    # critical section's own exit-1 (live lease held).
+    script = (
+        "mkdir -p /var/lib/xpf; "
+        "flock -w 30 -E 9 /var/lib/xpf/kernel-roll.lock "
+        "sh -c " + shlex.quote(crit) + " && echo ACQUIRED"
+    )
+    out = _node_exec(runner, backend, node, ["sh", "-c", script], check=False)
     if not runner.dry and "ACQUIRED" not in out:
-        die(f"{node}: could not acquire kernel-roll lease (another orchestrator "
-            f"holds a live lease) — aborting.")
+        die(f"{node}: could not acquire kernel-roll lease (a live lease is held "
+            f"by another orchestrator, or the lock timed out) — aborting.")
 
 
 def _clear_lease(runner, backend, node):
-    _node_exec(runner, backend, node,
-               ["rm", "-f", "/var/lib/xpf/kernel-roll.lease"], check=False)
+    # Clear under the same flock as acquire, so a release can't interleave a
+    # concurrent acquire's reclaim/create critical section.
+    _node_exec(runner, backend, node, ["sh", "-c",
+               "flock -w 30 /var/lib/xpf/kernel-roll.lock "
+               "rm -f /var/lib/xpf/kernel-roll.lease 2>/dev/null || "
+               "rm -f /var/lib/xpf/kernel-roll.lease"], check=False)
 
 
 def _kernel_status(runner, backend, node):
