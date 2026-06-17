@@ -174,17 +174,22 @@ through its full pipeline. A FabricRedirect frame is therefore a
 cross-chassis L2 redirect — it is **never** a packet for the local kernel
 FIB.
 
-There are two rare paths where the helper cannot TX a FabricRedirect to
-the peer:
+There are two rare conditions where the helper cannot TX a FabricRedirect
+to the peer, across both the desc-frame path and the Prebuilt fast path
+(an embedded-ICMP NAT-reversed error whose resolution turned into a
+fabric redirect via `finalize_embedded_icmp_resolution`):
 
 1. **No XSK binding on the fabric parent** — the bind is not yet ready or
    `bind()` failed (`tx/dispatch/mod.rs`, the
-   `resolve_pending_forward_target_binding` `None` arm).
+   `resolve_pending_forward_target_binding` `None` arm — both the
+   desc-frame fallback and the Prebuilt fast path).
 2. **Build/enqueue failure** — the fabric parent binding exists but the
    forward-frame build or TX-ring enqueue failed
-   (`handle_forward_build_failure`, `tx/dispatch/slow_path.rs`).
+   (`handle_forward_build_failure`, `tx/dispatch/slow_path.rs`, for the
+   desc-frame path; the Prebuilt local-enqueue failure arm in
+   `tx/dispatch/mod.rs`).
 
-In both paths the frame is **dropped fail-closed** and counted on the
+In all of these the frame is **dropped fail-closed** and counted on the
 per-binding `fabric_redirect_unsendable_drops` counter (surfaced on
 `BindingStatus`; Go `FabricRedirectUnsendableDrops`), with a distinct
 exception reason (`fabric_redirect_no_binding` vs
