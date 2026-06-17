@@ -40,3 +40,7 @@
 |----------|-------------------|---------|
 | AGY adversarial | (pending) | (pending) |
 | Codex hostile | (pending) | (pending) |
+
+### R3 verdicts + dispositions
+- AGY r3 (adversarial-review-mqiepgva-dkp3qa): NEEDS-MAJOR (reviewed fe798fccb). 1 CRITICAL: networkd.Apply sweep deletes protected mgmt files -> lockout (FIXED: networkd SetProtectedResolver exempts them). MAJOR: deriveKernelName breaks fresh-box ens3 naming (FIXED: deviceMapOriginalNameFor derives only when wearing the logical name). MAJOR B.1: Case C rename collision (FIXED). B.2 absent-lifeline = acceptable per §9.6. Detail: agy-impl-r3.md. All fixed in b083b3445.
+- Codex r3: (pending agent return)
