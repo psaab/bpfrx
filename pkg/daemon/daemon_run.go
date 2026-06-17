@@ -439,6 +439,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 		// Watch cluster events for state transitions (primary/secondary).
 		go d.watchClusterEvents(ctx)
+
+		// #1930 INC-2: bounded local self-recovery for the LANE-1 HA kernel
+		// channel — auto-rejoin if an external kernel-roll orchestrator crashed
+		// while this node was drained+rebooting (no-op unless orphaned-drained).
+		d.startKernelSelfRecovery(ctx)
 	}
 
 	// Enable IP forwarding — required for the firewall to route packets.

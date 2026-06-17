@@ -1,0 +1,187 @@
+package upgrade
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"time"
+)
+
+// Kernel-channel HA bounded local self-recovery (#1930 INC-2).
+//
+// The LANE-1 HA kernel roll is driven by an EXTERNAL orchestrator
+// (scripts/deploy/xpf-deploy.py): it drains a node (ForceSecondary), reboots it
+// into the candidate, and on success ResetFailover()s it back. The hazard
+// (r2 AGY): if the orchestrator CRASHES while a node is drained+rebooting, the
+// node comes back up still drained (all RGs ManualFailover=true, weight 0) with
+// nothing to ResetFailover it — it sits passive forever, halving cluster
+// capacity and leaving no automatic recovery.
+//
+// This is the bounded LOCAL self-recovery: at daemon startup (and periodically),
+// a node that finds itself DRAINED, with NO active kernel-roll lease naming it,
+// and a HEALTHY PRIMARY peer, auto-ResetFailover()s after a grace period. The
+// lease is the coordination point: while a roll is legitimately in progress the
+// orchestrator holds a lease naming the node, which SUPPRESSES self-recovery
+// (so we never fight a real in-flight roll); once the orchestrator finishes (or
+// crashes, letting the lease EXPIRE), self-recovery is free to act.
+//
+// Conservative by construction: it only ResetFailovers (rejoins as ELIGIBLE —
+// VRRP preempt rules then decide who is primary); it never forces primary. If
+// the peer is not a healthy primary, it does nothing (a real dual-down needs
+// operator/orchestrator attention, not an automatic rejoin race).
+
+// KernelRollLease is the coordination record the external orchestrator writes
+// to each node it is actively rolling. Its presence + unexpired TTL SUPPRESSES
+// that node's self-recovery. A crashed orchestrator's lease expires, re-enabling
+// self-recovery.
+type KernelRollLease struct {
+	// NodeID is the cluster node-id the orchestrator is actively rolling.
+	NodeID int `json:"node_id"`
+	// Holder identifies the orchestrator (host/pid/run-id) for diagnostics.
+	Holder string `json:"holder,omitempty"`
+	// ExpiresAt is the lease TTL deadline; past it the lease is dead.
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// DefaultKernelRollLeasePath is where the orchestrator drops the per-node lease
+// and where self-recovery reads it.
+const DefaultKernelRollLeasePath = "/var/lib/xpf/kernel-roll.lease"
+
+// SelfRecoveryCluster is the minimal cluster surface the self-recovery needs.
+// The daemon supplies an adapter over its cluster.Manager.
+type SelfRecoveryCluster interface {
+	// LocalDrained reports whether THIS node is drained (all enabled RGs in
+	// ManualFailover / weight 0 — the ForceSecondary state).
+	LocalDrained() (bool, error)
+	// PeerHealthyPrimary reports whether the peer is alive AND owns the RGs
+	// (a real primary that can keep forwarding while we rejoin).
+	PeerHealthyPrimary() (bool, error)
+	// ResetFailover clears the local manual-failover on all RGs (rejoin as
+	// eligible; VRRP preempt rules then govern primary).
+	ResetFailover() error
+}
+
+// SelfRecoveryConfig configures a KernelSelfRecovery.
+type SelfRecoveryConfig struct {
+	// NodeID is THIS node's cluster node-id (matched against a lease's NodeID).
+	NodeID int
+	// LeasePath is the kernel-roll lease file (default DefaultKernelRollLeasePath).
+	LeasePath string
+	// Grace is how long the node must continuously observe the
+	// drained-no-lease-healthy-peer condition before auto-ResetFailover. It
+	// absorbs the normal boot→rejoin settle so a legitimately-mid-roll node
+	// (whose lease is briefly missing during a write) is not prematurely reset.
+	Grace time.Duration
+	// Now is the clock (injectable for tests).
+	Now func() time.Time
+	// Logf is an optional progress sink.
+	Logf func(format string, args ...any)
+}
+
+func (c *SelfRecoveryConfig) withDefaults() {
+	if c.LeasePath == "" {
+		c.LeasePath = DefaultKernelRollLeasePath
+	}
+	if c.Grace == 0 {
+		c.Grace = 90 * time.Second
+	}
+	if c.Now == nil {
+		c.Now = time.Now
+	}
+	if c.Logf == nil {
+		c.Logf = func(string, ...any) {}
+	}
+}
+
+// KernelSelfRecovery is the bounded local self-recovery state machine.
+type KernelSelfRecovery struct {
+	cfg SelfRecoveryConfig
+	cl  SelfRecoveryCluster
+	// drainedSince is when this node first observed the recoverable condition
+	// (drained + no active lease for us + healthy peer); zero when not observed.
+	drainedSince time.Time
+}
+
+// NewKernelSelfRecovery builds the self-recovery helper.
+func NewKernelSelfRecovery(cfg SelfRecoveryConfig, cl SelfRecoveryCluster) *KernelSelfRecovery {
+	cfg.withDefaults()
+	return &KernelSelfRecovery{cfg: cfg, cl: cl}
+}
+
+// activeLeaseForUs reports whether an UNEXPIRED lease naming THIS node exists
+// (which suppresses self-recovery — a roll is legitimately in progress). A
+// missing/expired/other-node lease does NOT suppress.
+func (s *KernelSelfRecovery) activeLeaseForUs() bool {
+	data, err := os.ReadFile(s.cfg.LeasePath)
+	if err != nil {
+		return false // no lease (or unreadable) -> not suppressed
+	}
+	var l KernelRollLease
+	if err := json.Unmarshal(data, &l); err != nil {
+		s.cfg.Logf("kernel self-recovery: ignoring unparsable lease %s: %v", s.cfg.LeasePath, err)
+		return false
+	}
+	if l.NodeID != s.cfg.NodeID {
+		return false // lease is for the OTHER node — does not suppress us
+	}
+	if !s.cfg.Now().Before(l.ExpiresAt) {
+		s.cfg.Logf("kernel self-recovery: lease for node %d EXPIRED at %s (orchestrator gone?)",
+			l.NodeID, l.ExpiresAt.Format(time.RFC3339))
+		return false // expired -> not suppressed
+	}
+	return true // unexpired lease for us -> a roll is in progress, suppress
+}
+
+// Tick evaluates the recovery condition once. Call it at startup and on a timer.
+// It auto-ResetFailovers only after the condition holds continuously for Grace.
+// Returns true iff it performed a ResetFailover this tick.
+func (s *KernelSelfRecovery) Tick() (bool, error) {
+	// A live lease for us means a real roll is in progress — never self-recover.
+	if s.activeLeaseForUs() {
+		s.drainedSince = time.Time{}
+		return false, nil
+	}
+
+	drained, err := s.cl.LocalDrained()
+	if err != nil {
+		return false, fmt.Errorf("kernel self-recovery: local drained check: %w", err)
+	}
+	if !drained {
+		s.drainedSince = time.Time{} // not drained -> reset the timer
+		return false, nil
+	}
+
+	peerOK, err := s.cl.PeerHealthyPrimary()
+	if err != nil {
+		return false, fmt.Errorf("kernel self-recovery: peer health check: %w", err)
+	}
+	if !peerOK {
+		// Drained but the peer is NOT a healthy primary — a real dual-down /
+		// split scenario. Do NOT auto-rejoin (that could race a recovering
+		// peer); leave it for the orchestrator/operator.
+		s.drainedSince = time.Time{}
+		s.cfg.Logf("kernel self-recovery: drained but peer is not a healthy primary; " +
+			"NOT auto-recovering (needs orchestrator/operator)")
+		return false, nil
+	}
+
+	now := s.cfg.Now()
+	if s.drainedSince.IsZero() {
+		s.drainedSince = now
+		s.cfg.Logf("kernel self-recovery: observed drained+no-lease+healthy-peer; "+
+			"will auto-ResetFailover in %s if it persists", s.cfg.Grace)
+		return false, nil
+	}
+	if now.Sub(s.drainedSince) < s.cfg.Grace {
+		return false, nil // still within grace
+	}
+
+	// Condition held for Grace -> the orchestrator is gone and left us drained.
+	s.cfg.Logf("kernel self-recovery: drained+orphaned for %s with a healthy peer; " +
+		"auto-ResetFailover (rejoin as eligible)")
+	if err := s.cl.ResetFailover(); err != nil {
+		return false, fmt.Errorf("kernel self-recovery: ResetFailover: %w", err)
+	}
+	s.drainedSince = time.Time{}
+	return true, nil
+}

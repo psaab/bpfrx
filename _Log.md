@@ -5499,3 +5499,7 @@ top.
 - **Timestamp**: 2026-06-16
   - **Action**: #1930 INC-2 (PR-3) signal surface — durable promotion marker. Added KernelSystem.WritePromotionMarker/ReadPromotionMarker (kernel.go interface + kernel_linux.go /var/lib/xpf/kernel-promoted via fsatomic); Promote() writes it before clearing the journal; `xpfd upgrade kernel status` now reports machine-parseable promoted=<uname>/none + armed=true/none so the external HA orchestrator can poll the post-reboot version-check. Fake updated.
   - **File(s)**: pkg/upgrade/kernel.go, pkg/upgrade/kernel_run.go, pkg/upgrade/kernel_linux.go, cmd/xpfd/upgrade_kernel.go, pkg/upgrade/kernel_test.go, _Log.md
+
+- **Timestamp**: 2026-06-16
+  - **Action**: #1930 INC-2 bounded local self-recovery. pkg/upgrade/kernel_selfrecover.go (KernelSelfRecovery: lease-suppressed, drained+healthy-peer+grace -> auto ResetFailover; 7 unit tests). pkg/cluster/kernel_selfrecover.go (Manager.LocalDrained/PeerHealthyPrimary/ResetAllFailover predicates). pkg/daemon/kernel_selfrecover.go (adapter + HA-only 30s safety-net loop, wired after cluster.Start). Guards the orchestrator-crash-mid-roll case (r2 AGY).
+  - **File(s)**: pkg/upgrade/kernel_selfrecover.go, pkg/upgrade/kernel_selfrecover_test.go, pkg/cluster/kernel_selfrecover.go, pkg/daemon/kernel_selfrecover.go, pkg/daemon/daemon_run.go, _Log.md
