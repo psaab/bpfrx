@@ -54,6 +54,9 @@
 | Reviewer | Task / session id | Verdict |
 |----------|-------------------|---------|
 | AGY adversarial | adversarial-review-mqif9rop-046u12 | **MERGE-READY** (all 5 cases a-e verified; topology REFUSE intact) |
-| Codex hostile | (final confirm agent) | (pending) |
+| Codex hostile | session 019ed6e2-9c63-70d2-a12e-4b26037da5bd | **MERGE-READY** (all 5 cases a-e PASS; REFUSE short-circuit intact) |
 
 Copilot: 2 inline findings (r1) addressed + Copilot SWE-agent autonomously contributed the deriveKernelName fallback (integrated).
+
+## Convergence: 4-of-4 MERGE-READY
+- Codex MERGE-READY (019ed6e2); AGY MERGE-READY (mqif9rop-046u12); Copilot addressed (2 findings + SWE deriveKernelName contribution); Claude SMR MERGE-READY (drove the OriginalName + unified-strand fixes). Final SHA recorded by the engineer run.
