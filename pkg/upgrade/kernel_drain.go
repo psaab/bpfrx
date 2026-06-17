@@ -49,19 +49,26 @@ func DrainAndConfirm(cl RollingCluster, deadline time.Duration) error {
 	}
 
 	// Wait for the STRONG drain predicate. If it does not hold within the
-	// deadline, the caller must NOT proceed (returning an error keeps the
-	// orchestrator from arming an undrained node).
+	// deadline, the caller must NOT proceed AND we must NOT leave the node
+	// force-demoted with the peer not having taken over — that would strand the
+	// VIPs (r2 Codex). FAIL BACK (ResetFailover) before returning the error, so
+	// this node resumes serving rather than sitting demoted with no primary.
 	dl := time.Now().Add(deadline)
 	for {
-		ok, err := cl.DrainComplete()
-		if err == nil && ok {
+		ok, derr := cl.DrainComplete()
+		if derr == nil && ok {
 			return nil
 		}
 		if time.Now().After(dl) {
-			if err != nil {
-				return fmt.Errorf("drain did not complete within %s (last error: %w)", deadline, err)
+			if rbErr := cl.ResetFailover(); rbErr != nil {
+				return fmt.Errorf("drain did not complete within %s AND failback "+
+					"failed (%v) — node may be stranded demoted; operator attention needed "+
+					"(drain error: %v)", deadline, rbErr, derr)
 			}
-			return fmt.Errorf("drain did not complete within %s (peer has not taken over / sync not clean)", deadline)
+			if derr != nil {
+				return fmt.Errorf("drain did not complete within %s (failed back; last error: %w)", deadline, derr)
+			}
+			return fmt.Errorf("drain did not complete within %s (peer did not take over / sync not clean; failed back)", deadline)
 		}
 		time.Sleep(drainPollInterval)
 	}

@@ -47,12 +47,18 @@ func TestDrainAndConfirmRefusesIncompatibleProtocol(t *testing.T) {
 	}
 }
 
-// Drain that never completes within the deadline -> error (orchestrator must not
-// then arm the undrained node).
-func TestDrainAndConfirmTimesOut(t *testing.T) {
+// Drain that never completes within the deadline -> error AND failback (r2
+// Codex: must not leave the node force-demoted with VIPs stranded).
+func TestDrainAndConfirmTimesOutAndFailsBack(t *testing.T) {
 	f := &fakeCluster{peerAlive: true, compatible: true, peerReady: true, drainAfter: 1000}
 	if err := DrainAndConfirm(f, 50*time.Millisecond); err == nil {
 		t.Fatal("expected timeout when drain never completes")
+	}
+	if !f.forced {
+		t.Fatal("expected ForceSecondary to have been attempted")
+	}
+	if !f.resetCalled {
+		t.Fatal("expected FAILBACK (ResetFailover) on drain timeout — must not strand VIPs")
 	}
 }
 

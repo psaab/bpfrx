@@ -629,35 +629,35 @@ def _node_exec(runner, backend, node, argv, check=True):
     return r.stdout
 
 
-def _write_lease(runner, backend, node, target_node_id, holder, ttl_secs):
-    # Compute expires_at IN THE NODE'S OWN CLOCK (r1 Codex High: a driver-clock
-    # absolute timestamp is clock-skew-unsafe vs the node that reads it). The
-    # node renders `date -u -d "+<ttl> seconds"`; the lease JSON is assembled
-    # in-guest so the expiry is always in the reader's clock. Written atomically
-    # (temp + mv); /var/lib/xpf exists (xpfd owns it).
-    holder_q = shlex.quote(holder)
+def _acquire_lease(runner, backend, node, target_node_id, holder, ttl_secs):
+    """ATOMICALLY acquire the lease on `node`, or fail if another holder has an
+    unexpired one. Closes the check-then-overwrite TOCTOU (r2 Codex): the claim
+    is a single `set -C` (noclobber) create — O_EXCL semantics — after first
+    removing an EXPIRED lease. Two racing drivers cannot both win the create.
+    expires_at is rendered in the NODE's clock (clock-skew safe). Exit 0 = won;
+    nonzero = a live lease is held by someone else (the caller aborts)."""
+    h = holder.replace('"', "")
     script = (
-        "umask 022; "
+        "set -u; f=/var/lib/xpf/kernel-roll.lease; "
+        # If a lease exists, drop it ONLY if expired (in the node's clock);
+        # a live one is left in place so our exclusive create below fails.
+        'if [ -f "$f" ]; then '
+        'exp=$(sed -n \'s/.*"expires_at": *"\\([^"]*\\)".*/\\1/p\' "$f"); '
+        'now=$(date -u +%%s); ee=$(date -u -d "$exp" +%%s 2>/dev/null || echo 0); '
+        '[ "$now" -ge "$ee" ] && rm -f "$f"; '
+        'fi; '
+        # Exclusive create (noclobber): fails if the file now exists (a live
+        # lease, or a racing driver that created it first).
         "exp=$(date -u -d \"+%d seconds\" +%%Y-%%m-%%dT%%H:%%M:%%SZ); "
-        "printf '{\"node_id\": %d, \"holder\": \"%s\", \"expires_at\": \"%%s\"}' \"$exp\" "
-        "> /var/lib/xpf/.kernel-roll.lease.tmp && "
-        "mv -f /var/lib/xpf/.kernel-roll.lease.tmp /var/lib/xpf/kernel-roll.lease"
-    ) % (ttl_secs, target_node_id, holder.replace('"', ""))
-    _node_exec(runner, backend, node, ["sh", "-c", script])
-
-
-def _active_lease_holder(runner, backend, node):
-    """Return the holder string of an UNEXPIRED lease on `node`, else ''."""
-    # Evaluate expiry IN THE NODE'S CLOCK: a lease is active iff now < expires_at.
-    script = (
-        "f=/var/lib/xpf/kernel-roll.lease; [ -f \"$f\" ] || exit 0; "
-        "exp=$(sed -n 's/.*\"expires_at\": *\"\\([^\"]*\\)\".*/\\1/p' \"$f\"); "
-        "hold=$(sed -n 's/.*\"holder\": *\"\\([^\"]*\\)\".*/\\1/p' \"$f\"); "
-        "[ -n \"$exp\" ] || exit 0; "
-        "now=$(date -u +%s); ee=$(date -u -d \"$exp\" +%s 2>/dev/null || echo 0); "
-        "[ \"$now\" -lt \"$ee\" ] && printf %s \"$hold\" || exit 0"
-    )
-    return _node_exec(runner, backend, node, ["sh", "-c", script], check=False).strip()
+        "umask 022; ( set -C; "
+        "printf '{\"node_id\": %d, \"holder\": \"%s\", \"expires_at\": \"%%s\"}' "
+        "\"$exp\" > \"$f\" ) 2>/dev/null"
+    ) % (ttl_secs, target_node_id, h)
+    out = _node_exec(runner, backend, node, ["sh", "-c", script + " && echo ACQUIRED"],
+                     check=False)
+    if not runner.dry and "ACQUIRED" not in out:
+        die(f"{node}: could not acquire kernel-roll lease (another orchestrator "
+            f"holds a live lease) — aborting.")
 
 
 def _clear_lease(runner, backend, node):
@@ -702,19 +702,13 @@ def cmd_kernel_roll(args):
     def roll_one(node, peer):
         nid = node_ids[node]
         print(f"\n--- rolling {node} (node-id {nid}); {peer} stays primary ---")
-        # 0. cluster lock: refuse if an UNEXPIRED lease already names EITHER node
-        #    (another orchestrator is mid-roll). The lease is the cross-driver
-        #    mutex (r1 Codex Critical: blind overwrite let two drivers race).
-        for n in (node, peer):
-            held = _active_lease_holder(runner, backend, n)
-            if held:
-                die(f"{n} already has an active kernel-roll lease ({held}); "
-                    f"another orchestrator is rolling this cluster — aborting.")
-        # 1. lease on BOTH nodes (suppress self-recovery on `node`, cluster lock).
-        #    The expiry is computed ON EACH NODE in its own clock (r1 Codex High:
-        #    a driver-clock absolute timestamp is skew-unsafe vs the node clock).
-        _write_lease(runner, backend, node, nid, holder, lease_ttl)
-        _write_lease(runner, backend, peer, nid, holder, lease_ttl)
+        # 1. ATOMICALLY acquire the lease on BOTH nodes (cross-driver mutex via
+        #    O_EXCL create — r2 Codex: a check-then-write had a TOCTOU; expiry
+        #    is rendered in each node's own clock — clock-skew safe). Acquiring
+        #    on `node` also suppresses ITS local self-recovery during the roll.
+        #    A live foreign lease makes _acquire_lease die() before any mutation.
+        _acquire_lease(runner, backend, node, nid, holder, lease_ttl)
+        _acquire_lease(runner, backend, peer, nid, holder, lease_ttl)
         try:
             # 2. DRAIN node -> peer via the non-interactive in-guest verb, which
             #    CONFIRMS the strong drain predicate (peer holds RGs, sync clean)

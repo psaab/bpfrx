@@ -102,10 +102,13 @@ func (r *KernelRunner) Arm(candidateVersion string) error {
 	// Clear any STALE promotion marker from a PRIOR roll BEFORE arming a fresh
 	// one (r1 Codex High): otherwise the external orchestrator's post-reboot
 	// `promoted==<ver>` check could be satisfied by a previous successful roll
-	// to the SAME version, masking a revert of THIS roll. Best-effort.
+	// to the SAME version, masking a revert of THIS roll. This is FATAL on
+	// failure (r2 Codex): if we cannot guarantee the marker is gone, we must NOT
+	// arm — proceeding would leave a stale marker that could false-confirm.
 	if !j.State.atLeast(KernelStatePreflight) {
 		if err := r.cfg.Sys.ClearPromotionMarker(); err != nil {
-			r.logf("kernel-upgrade arm: WARNING clear stale promotion marker: %v", err)
+			return fmt.Errorf("kernel-upgrade arm: clear stale promotion marker (refusing "+
+				"to arm with a possibly-stale marker): %w", err)
 		}
 	}
 
