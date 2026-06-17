@@ -1,0 +1,181 @@
+#!/bin/sh
+# xpf (#1930) — register the two FIXED A/B UEFI boot slots (xpf-A / xpf-B).
+#
+# This is the SEPARATE, NON-BLOCKING slot-registration step the LANE-1 kernel
+# channel needs (r4 AGY F2 / r5 AGY c). Rationale:
+#   - UEFI Boot#### vars live in the target's firmware NVRAM, which the OFFLINE
+#     bake (virt-customize) cannot write — registration MUST happen in-guest on
+#     real hardware (r4 AGY F2).
+#   - It is NOT folded into xpf-day0-config: that unit is Before=xpfd and exits
+#     early once /etc/xpf/.configdb exists, so a SAFE-BOOTSTRAP node (configured
+#     via the lifeline, no day-0 media) would NEVER get its slots registered;
+#     and a hanging efibootmgr Before=xpfd would block the lifeline = brick
+#     (r5 AGY c).
+#   - So this is its own oneshot, shipped in the .deb (foreign-host installs get
+#     it too), NOT ordered Before=xpfd, with a bounded timeout and non-fatal
+#     error handling: read-only / no-efivars platforms log a warning, leave LANE
+#     1 unavailable, and the box boots normally (degraded, not bricked).
+#
+# IDEMPOTENT + self-healing (r5 SMR N3): every boot it verifies the two slots
+# exist with the right loader path and the active slot is reachable in BootOrder,
+# (re)creating ONLY what is missing — a firmware reset / VM redefinition that
+# wiped NVRAM self-heals, and repeated boots never duplicate slots.
+#
+# It does NOT change which slot is the DEFAULT beyond an initial seeding: if
+# neither slot is in BootOrder yet (fresh box), it puts xpf-A first; once the
+# kernel channel has promoted a slot, that ordering is preserved.
+
+set -u
+
+# Force the C locale so efibootmgr's "BootOrder:" / "BootCurrent:" / "BootXXXX*"
+# headings are never localized — a translated heading would break every parse
+# below and could (pre-guard) wipe BootOrder (r1 AGY: locale-robust parsing).
+export LC_ALL=C LANG=C
+
+log() { echo "xpf-uefi-slots: $*" >&2; }
+
+# --- capability gate: UEFI + efibootmgr + writable efivars (all non-fatal) ---
+if [ ! -d /sys/firmware/efi/efivars ]; then
+    log "not a UEFI boot (no efivars); LANE-1 kernel channel unavailable — skipping"
+    exit 0
+fi
+if ! command -v efibootmgr >/dev/null 2>&1; then
+    log "efibootmgr not installed; skipping (LANE-1 unavailable)"
+    exit 0
+fi
+if ! efibootmgr >/dev/null 2>&1; then
+    log "efibootmgr cannot read NVRAM (read-only firmware?); skipping (LANE-1 unavailable)"
+    exit 0
+fi
+
+# --- discover the ESP block device + partition for --disk/--part ---
+ESP_SRC=$(findmnt -no SOURCE /boot/efi 2>/dev/null || true)
+if [ -z "$ESP_SRC" ]; then
+    log "no ESP mounted at /boot/efi; skipping"
+    exit 0
+fi
+# /dev/sda1 -> disk=/dev/sda part=1 ; /dev/nvme0n1p1 -> disk=/dev/nvme0n1 part=1
+ESP_PART=$(echo "$ESP_SRC" | grep -oE '[0-9]+$' || true)
+ESP_DISK=$(echo "$ESP_SRC" | sed -E 's/p?[0-9]+$//')
+if [ -z "$ESP_PART" ] || [ -z "$ESP_DISK" ] || [ ! -b "$ESP_DISK" ]; then
+    log "could not parse ESP disk/part from '$ESP_SRC'; skipping"
+    exit 0
+fi
+
+# The signed shim is the loader for BOTH slots (shim->grub->MOK kernel). Each
+# slot's EFI dir holds its own shim+grub copy (staged by the bake / INC-1); the
+# loader path is \EFI\<slot>\shimx64.efi.
+register_slot() {
+    slot="$1"
+    # already registered? An efibootmgr line is:
+    #   Boot0003* xpf-A\tHD(1,GPT,...)/\EFI\xpf-A\shimx64.efi
+    # i.e. "BootXXXX*<sp>LABEL<TAB>loader-path" — the LABEL is followed by a TAB
+    # + the loader path, NOT line-end. So the guard must match the label
+    # bounded by the trailing TAB/space, NOT anchored at $ (that miss created
+    # duplicate slots — caught live, #1930).
+    # Verify BOTH the label AND the loader path: an entry that merely shares
+    # the label but points elsewhere (e.g. a stale/foreign entry) must NOT be
+    # accepted, or the slot would chainload the wrong loader (r1 Codex High).
+    # efibootmgr prints the loader as "...File(\EFI\<slot>\shimx64.efi)" or
+    # "...\EFI\<slot>\shimx64.efi"; match the slot's shim path case-insensitively.
+    # Enumerate ALL entries with this label. Delete every WRONG-path one
+    # unconditionally (a stale/foreign label-collision would poison BootNext —
+    # r2 Codex High), and dedup any CORRECT ones down to exactly one. This
+    # guarantees the slot maps to a single, correct Boot#### id afterwards.
+    correct_kept=""
+    for n in $(efibootmgr | sed -nE "s/^Boot([0-9A-Fa-f]{4})\*?[[:space:]]+${slot}[[:space:]].*/\\1/p"); do
+        line=$(efibootmgr | grep -E "^Boot${n}\*?[[:space:]]+${slot}[[:space:]]")
+        if echo "$line" | grep -qiE "EFI.${slot}.shimx64\.efi"; then
+            if [ -z "$correct_kept" ]; then
+                correct_kept="$n"   # keep the first correct one
+            else
+                log "slot ${slot}: deleting duplicate correct entry Boot${n}"
+                efibootmgr --quiet -b "$n" -B 2>/dev/null || true
+            fi
+        else
+            log "slot ${slot}: deleting WRONG-path entry Boot${n} ($line)"
+            efibootmgr --quiet -b "$n" -B 2>/dev/null || true
+        fi
+    done
+    if [ -n "$correct_kept" ]; then
+        log "slot ${slot} already registered (loader path verified, deduped to Boot${correct_kept})"
+        return 0
+    fi
+    # the slot's ESP dir must exist (bake/INC-1 staged shim+grub there)
+    if [ ! -f "/boot/efi/EFI/${slot}/shimx64.efi" ]; then
+        log "slot ${slot} ESP dir not staged (no shimx64.efi); skipping ${slot}"
+        return 1
+    fi
+    log "registering slot ${slot} -> \\EFI\\${slot}\\shimx64.efi"
+    if ! efibootmgr --quiet --create \
+            --disk "$ESP_DISK" --part "$ESP_PART" \
+            --label "$slot" \
+            --loader "\\EFI\\${slot}\\shimx64.efi" 2>/dev/null; then
+        log "WARNING: failed to register slot ${slot} (non-fatal)"
+        return 1
+    fi
+    return 0
+}
+
+# Record WHICH xpf slot (if any) led BootOrder BEFORE we (re)register. If an xpf
+# slot already led, that is the PROMOTED default and MUST be preserved — even if
+# the OTHER slot is currently missing (e.g. B was promoted and A's entry was
+# lost). Only when NO xpf slot leads do we seed a deterministic order (because
+# efibootmgr --create PREPENDS each new entry, creating A then B would otherwise
+# leave B in front — caught live, #1930; the self-heal-undoes-promotion case was
+# r1 Codex High).
+slot_id() { efibootmgr | sed -nE "s/^Boot([0-9A-Fa-f]{4})\*?[[:space:]]+$1[[:space:]].*/\\1/p" | head -1; }
+PRE_FRONT=$(efibootmgr | sed -nE 's/^BootOrder: ([^,]*).*$/\1/p')
+PRE_A=$(slot_id xpf-A)
+PRE_B=$(slot_id xpf-B)
+LED_SLOT=""   # which xpf slot label led before this run, if any
+[ -n "$PRE_A" ] && [ "$PRE_FRONT" = "$PRE_A" ] && LED_SLOT=xpf-A
+[ -n "$PRE_B" ] && [ "$PRE_FRONT" = "$PRE_B" ] && LED_SLOT=xpf-B
+
+register_slot xpf-A || true
+register_slot xpf-B || true
+
+# --- normalize BootOrder ---
+A_ID=$(slot_id xpf-A)
+B_ID=$(slot_id xpf-B)
+ORDER=$(efibootmgr | sed -nE 's/^BootOrder: (.*)$/\1/p')
+
+# GUARD: if BootOrder could not be parsed (empty — a transient efibootmgr read
+# failure, or an unexpected format), DO NOT write a BootOrder — a reseed built
+# from empty $ORDER would WIPE all other entries (PXE/recovery/firmware), the
+# opposite of non-destructive (r1 AGY destructive-wipe). Leave NVRAM untouched.
+if [ -z "$ORDER" ]; then
+    log "WARNING: could not read BootOrder; leaving it unchanged (no destructive reseed)"
+elif [ -n "$LED_SLOT" ]; then
+    # An xpf slot was the promoted default before this run — keep THAT slot in
+    # front (re-assert in case a --create reshuffled BootOrder), preserving the
+    # rest non-destructively. NEVER force A-first over a promoted B.
+    LEAD_ID=$(slot_id "$LED_SLOT")
+    if [ -n "$LEAD_ID" ]; then
+        REST=$(echo "$ORDER" | tr ',' '\n' | grep -vxF "$LEAD_ID" | paste -sd, -)
+        NEW="$LEAD_ID"
+        [ -n "$REST" ] && NEW="$NEW,$REST"
+        if [ "$NEW" != "$ORDER" ]; then
+            log "preserving promoted slot $LED_SLOT as default: $NEW (was: $ORDER)"
+            efibootmgr --quiet --bootorder "$NEW" 2>/dev/null \
+                || log "WARNING: failed to re-assert promoted default (non-fatal)"
+        else
+            log "promoted slot $LED_SLOT already leads BootOrder; preserving"
+        fi
+    fi
+elif [ -n "$A_ID" ]; then
+    # No xpf slot led (fresh box) — deterministic seed: xpf-A first, xpf-B
+    # second, then every other entry in its existing order (non-destructive).
+    REST=$(echo "$ORDER" | tr ',' '\n' | grep -vxF "$A_ID" | grep -vxF "${B_ID:-__none__}" | paste -sd, -)
+    NEW="$A_ID"
+    [ -n "$B_ID" ] && NEW="$NEW,$B_ID"
+    [ -n "$REST" ] && NEW="$NEW,$REST"
+    log "seeding BootOrder: $NEW (was: $ORDER)"
+    efibootmgr --quiet --bootorder "$NEW" 2>/dev/null \
+        || log "WARNING: failed to seed BootOrder (non-fatal)"
+else
+    log "no xpf-A slot id; leaving BootOrder unchanged"
+fi
+
+log "done"
+exit 0

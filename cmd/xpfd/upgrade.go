@@ -19,6 +19,13 @@ import (
 //
 // Exit codes: 0 success, 1 error (including a rollback report).
 func runUpgradeSubcommand(args []string) {
+	// #1930: `xpfd upgrade kernel ...` is the LANE-1 verify-gated in-place
+	// kernel channel (a distinct sub-verb from the #1917 binary cut-over).
+	if len(args) > 0 && args[0] == "kernel" {
+		runUpgradeKernelSubcommand(args[1:])
+		return
+	}
+
 	fs := flag.NewFlagSet("upgrade", flag.ContinueOnError)
 	rolling := fs.Bool("rolling", false,
 		"HA rolling upgrade: drive a controlled per-node drain + cut so the "+

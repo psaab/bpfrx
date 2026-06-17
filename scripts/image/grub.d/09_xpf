@@ -1,0 +1,97 @@
+#!/bin/sh
+# xpf (#1930) — LANE-1 A/B kernel-slot $cmdpath branch.
+#
+# WHY a /etc/grub.d/ drop-in and not a hand-edit of grub.cfg: update-grub
+# regenerates /boot/grub/grub.cfg from /etc/grub.d/* on every kernel
+# install/purge, so any direct grub.cfg edit is clobbered (r5 AGY b). This
+# script is re-emitted by every update-grub, so the branch survives.
+#
+# WHY $cmdpath and not a per-slot grub.cfg: the Canonical-signed grubx64.efi
+# has a cryptographically signed, hardcoded prefix; launched from \EFI\xpf-A\
+# it does NOT read a grub.cfg sitting beside it — it loads the SHARED
+# /boot/grub/grub.cfg (r4 AGY Flaw 1). So the SHARED config branches on
+# $cmdpath (the dir GRUB was launched from), sourcing that slot's selector.
+#
+# WHY no string-compare on $cmdpath: GRUB sets $cmdpath WITH the device prefix
+# (e.g. "(hd0,gpt1)/EFI/xpf-A"), and drive enumeration is not stable, so a
+# literal compare is fragile and `regexp` may be unavailable under Secure-Boot
+# lockdown (r5 AGY a). We reference $cmdpath DIRECTLY as a path:
+# `source "$cmdpath/xpf.selector"` expands natively to the launched slot.
+#
+# WHY the selector is a GRUB-SCRIPT (not raw text): GRUB must parse it under
+# Secure-Boot lockdown; `source` of a script that `set`s vars works, a raw
+# text file does not (r5 AGY d). The selector sets xpf_slot_kernel /
+# xpf_slot_initrd; this fragment emits ONE self-contained default menuentry
+# that sources it and boots that kernel (implicit `boot` at menuentry end —
+# r5 Codex FLAW-1; a bare top-level linux/initrd would fall through).
+#
+# If $cmdpath has no selector (e.g. the box was NOT launched via an xpf-A/B
+# slot — a recovery/firmware boot), this emits nothing and the normal
+# 10_linux menu entries apply, so the box still boots.
+
+set -e
+
+# Source grub-mkconfig's helper library so we can resolve the SAME kernel
+# cmdline + root device that 10_linux would (rather than hardcoding them — r1
+# Codex Medium: GRUB_CMDLINE_LINUX_DEFAULT is a generation-time shell var, NOT a
+# GRUB runtime var, so a literal "${GRUB_CMDLINE_LINUX_DEFAULT}" in the emitted
+# menuentry would be EMPTY at boot). prepare_grub_to_access_device + the
+# GRUB_CMDLINE_* vars are populated by grub-mkconfig before it runs /etc/grub.d.
+if [ -r /usr/share/grub/grub-mkconfig_lib ]; then
+    . /usr/share/grub/grub-mkconfig_lib
+elif [ -r /usr/lib/grub/grub-mkconfig_lib ]; then
+    . /usr/lib/grub/grub-mkconfig_lib
+fi
+
+# Resolve the kernel command line exactly as 10_linux does (these vars are
+# exported into the grub.d environment by grub-mkconfig at generation time).
+XPF_CMDLINE="${GRUB_CMDLINE_LINUX} ${GRUB_CMDLINE_LINUX_DEFAULT}"
+# Resolve root= by UUID, NOT a bare device path (r1 AGY: root=/dev/sda2 breaks
+# when disk enumeration shifts under virtualization / multi-controller). Prefer
+# GRUB_DEVICE_UUID (set by grub-mkconfig); fall back to the device path only if
+# no UUID is available.
+if [ -n "${GRUB_DEVICE_UUID:-}" ]; then
+    XPF_ROOT_ARG="root=UUID=${GRUB_DEVICE_UUID}"
+elif [ -n "${GRUB_DEVICE:-}" ]; then
+    XPF_ROOT_ARG="root=${GRUB_DEVICE}"
+else
+    XPF_ROOT_ARG=""
+fi
+
+# Resolve the boot-dir prefix RELATIVE to the filesystem GRUB sets as root, like
+# 10_linux does (r1/r2 AGY: a separate /boot partition holds the kernel at the
+# PARTITION ROOT, so the kernel path is "/vmlinuz-…" there, not "/boot/…"). On a
+# single-root system this resolves to "/boot"; on a separate /boot partition it
+# resolves to "" (root of that partition). The selector stores the bare filename
+# (vmlinuz-<ver>), so we prefix it with the resolved boot dir at GENERATION time.
+if command -v make_system_path_relative_to_its_root >/dev/null 2>&1; then
+    XPF_BOOT="$(make_system_path_relative_to_its_root /boot)"
+else
+    XPF_BOOT="/boot"
+fi
+XPF_BOOT="${XPF_BOOT%/}"   # strip a trailing slash; "" means partition root
+
+# Emit the menuentry. The BODY reads $cmdpath + sources the selector at BOOT
+# (single-quoted heredoc preserves $cmdpath/$xpf_slot_* for GRUB runtime); the
+# cmdline/root are substituted at GENERATION time (double-substituted below).
+# If the selector is absent OR malformed (no xpf_slot_kernel), we DO NOT emit a
+# default-bootable entry — GRUB falls through to the 10_linux entries so the box
+# always boots a real kernel (r1 Codex Medium).
+cat <<EOF
+# --- xpf (#1930) A/B kernel-slot selector entry ---
+if [ -s "\${cmdpath}/xpf.selector" ]; then
+  source "\${cmdpath}/xpf.selector"
+  if [ -n "\${xpf_slot_kernel}" -a -f "${XPF_BOOT}/\${xpf_slot_kernel}" ]; then
+    menuentry 'xpf kernel slot' --id xpf-slot {
+      search --no-floppy --set=root --file "${XPF_BOOT}/\${xpf_slot_kernel}"
+      linux  "${XPF_BOOT}/\${xpf_slot_kernel}" ${XPF_ROOT_ARG} ro ${XPF_CMDLINE}
+      if [ -n "\${xpf_slot_initrd}" -a -f "${XPF_BOOT}/\${xpf_slot_initrd}" ]; then
+        initrd "${XPF_BOOT}/\${xpf_slot_initrd}"
+      fi
+    }
+  else
+    echo "xpf: selector in \${cmdpath} is empty/invalid; falling through to default menu"
+  fi
+fi
+# --- end xpf A/B selector entry ---
+EOF

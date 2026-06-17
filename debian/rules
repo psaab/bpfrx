@@ -58,6 +58,13 @@ override_dh_auto_build:
 	grep -q '^ExecStartPre=/usr/local/sbin/xpfd verify-dataplane$$' debian/xpf.xpfd.service || \
 	    { echo "FATAL: ExecStartPre verify-dataplane injection failed (xpfd.service ExecStart line not matched)" >&2; exit 1; }
 	cp scripts/image/xpf-day0-config.service debian/xpf.xpf-day0-config.service
+	@# #1930 LANE-1 kernel channel: stage the two oneshot units under the
+	@# package-canonical names so dh_installsystemd enables them. These ship in
+	@# the .deb (not only the bake) so foreign-host / manual installs get the
+	@# full A4 substrate (r1 Codex: packaging must not miss the slot substrate +
+	@# the promotion gate).
+	cp scripts/image/xpf-uefi-slots.service debian/xpf.xpf-uefi-slots.service
+	cp scripts/image/xpf-kernel-promote.service debian/xpf.xpf-kernel-promote.service
 
 # Nothing to test in the package build itself; the project test suite
 # is run separately. Skip dh's auto test (it would try `go test`).
@@ -91,6 +98,18 @@ override_dh_auto_install:
 	    install -m 0644 scripts/dist/xpf-archive-keyring.asc.placeholder \
 	            debian/xpf/usr/share/keyrings/xpf-archive-keyring.asc; \
 	fi
+	@# #1930 LANE-1 kernel channel: the slot-registration + promotion-gate
+	@# scripts and the $cmdpath grub.d fragment ship in the .deb so a manual /
+	@# foreign-host install gets the full A4 substrate (the bake also stages the
+	@# A/B ESP slot dirs, which are image-specific).
+	install -d debian/xpf/usr/local/sbin
+	install -m 0755 scripts/image/xpf-uefi-slots \
+	                debian/xpf/usr/local/sbin/xpf-uefi-slots
+	install -m 0755 scripts/image/xpf-kernel-promote \
+	                debian/xpf/usr/local/sbin/xpf-kernel-promote
+	install -d debian/xpf/etc/grub.d
+	install -m 0755 scripts/image/grub.d/09_xpf \
+	                debian/xpf/etc/grub.d/09_xpf
 
 # Disable the auto-restart-on-upgrade block dh_installsystemd would
 # otherwise append to postinst. A plain `apt upgrade xpf` must NOT
@@ -101,9 +120,15 @@ override_dh_auto_install:
 override_dh_installsystemd:
 	dh_installsystemd --no-stop-on-upgrade --name=xpfd
 	dh_installsystemd --no-stop-on-upgrade --name=xpf-day0-config
+	@# #1930: enable the two LANE-1 oneshots. They are best-effort + non-fatal
+	@# (degrade to "LANE 1 unavailable" on non-UEFI / read-only NVRAM) and are
+	@# NOT ordered Before=xpfd, so enabling them cannot block the daemon.
+	dh_installsystemd --no-stop-on-upgrade --name=xpf-uefi-slots
+	dh_installsystemd --no-stop-on-upgrade --name=xpf-kernel-promote
 
 override_dh_clean:
-	rm -f debian/xpf.xpfd.service debian/xpf.xpf-day0-config.service
+	rm -f debian/xpf.xpfd.service debian/xpf.xpf-day0-config.service \
+	      debian/xpf.xpf-uefi-slots.service debian/xpf.xpf-kernel-promote.service
 	dh_clean
 
 # xpf is an APPLIANCE package, not a Debian-archive package: it

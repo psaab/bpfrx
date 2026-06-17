@@ -1,0 +1,22 @@
+[Unit]
+Description=xpf #1930 — LANE-1 kernel-channel promotion gate (candidate boot)
+Documentation=https://github.com/psaab/xpf/issues/1930
+# Run after the dataplane/network is up enough for verify-dataplane + the
+# forward beacon, but this is NOT a hard Before=xpfd dependency: a stuck gate
+# must never wedge the box (the SAFE-BOOTSTRAP lifeline must still come up).
+# Ordering Wants/After local-fs + network so the beacon can probe.
+After=local-fs.target network-online.target xpfd.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Bounded: a stuck verify/beacon must not hang the boot indefinitely. On
+# timeout the gate is treated as un-promoted (the candidate keeps running this
+# boot; the next plain reboot falls back to known-good via the firmware-cleared
+# BootNext). The script itself only reboots on an explicit exit-3 (revert).
+TimeoutStartSec=120
+ExecStart=/usr/local/sbin/xpf-kernel-promote
+
+[Install]
+WantedBy=multi-user.target
