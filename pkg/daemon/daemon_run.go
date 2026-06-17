@@ -345,7 +345,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// #1956: device-map mode (opt-in) renames ONLY mapped NICs by
 			// stable identity and leaves the rest alone. Positional mode
 			// (no device-map) is bit-identical to pre-#1956.
-			if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.DeviceMap.Active() {
+			if cfg := d.store.ActiveConfig(); deviceMapNamingActive(cfg) {
 				if err := enumerateAndRenameMapped(cfg.Chassis.DeviceMap, cfg, d.resolveProtectedInterfaces()); err != nil {
 					slog.Warn("device-map interface naming failed", "err", err)
 				}
@@ -1570,7 +1570,7 @@ func (d *Daemon) runBootstrapExitStartup(cfg *config.Config) {
 	// device-map first appears, so this site must branch too — otherwise
 	// day-0 bare metal claims every NIC positionally before the map ever
 	// applies.
-	if cfg.Chassis.DeviceMap.Active() {
+	if deviceMapNamingActive(cfg) {
 		if err := enumerateAndRenameMapped(cfg.Chassis.DeviceMap, cfg, d.resolveProtectedInterfaces()); err != nil {
 			slog.Warn("bootstrap exit: device-map interface naming failed", "err", err)
 		}

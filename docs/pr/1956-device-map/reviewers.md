@@ -60,3 +60,50 @@ Copilot: 2 inline findings (r1) addressed + Copilot SWE-agent autonomously contr
 
 ## Convergence: 4-of-4 MERGE-READY
 - Codex MERGE-READY (019ed6e2); AGY MERGE-READY (mqif9rop-046u12); Copilot addressed (2 findings + SWE deriveKernelName contribution); Claude SMR MERGE-READY (drove the OriginalName + unified-strand fixes). Final SHA recorded by the engineer run.
+
+## Round 6 (boot-path bug investigation + startup-decision regression test)
+
+Parent flagged a MERGE-BLOCKING bug from a live fresh-VM demo: "device-map
+never applies on a normal boot — interfaces stay positional even after
+committing a map + rebooting," hypothesised as a stale `ActiveConfig()` read at
+`daemon_run.go:348` (active not yet promoted at naming time).
+
+### Investigation outcome — CLAIM REFUTED (no functional bug at HEAD)
+- Empirical, on the live `xpf-devmap` VM (snapshot→test→restore):
+  - DB-load boot ("configuration loaded from db") → device-map branch ran,
+    "device-map: resolved binding" + renames. WORKS.
+  - Bootstrap-from-file boot (device-map placed in `/etc/xpf/xpf.conf`, DB
+    wiped) → device-map branch ran, "device-map: interface naming unchanged".
+    WORKS.
+  - The ONLY boot that took the positional path was the demo's FIRST boot,
+    where `xpf.conf` had no device-map and none was committed yet — correct
+    behavior, misread as the bug.
+- Code trace (confirmed independently by Codex, session
+  019ed6cf… rescue): `Store.Load` sets `s.compiled` synchronously
+  (`store.go:237-238`); `bootstrapFromFile`→`Store.Commit` promotes + sets
+  `s.compiled` synchronously before returning (`store.go:1101-1105`).
+  `bootstrapFromFile` runs at `daemon_run.go:241`, BEFORE the naming decision
+  at 348, so `ActiveConfig()` is populated there on every boot path. The
+  "applying active configuration" log (611) is the first dataplane APPLY, not
+  the first promotion. Bootstrap-exit (`runBootstrapExitStartup`, 1543) takes
+  the freshly-committed `cfg` parameter — not a stale read — and already
+  branches at 1573.
+
+### Real gap closed: the missing startup-decision test
+The shipped tests exercised `enumerateAndRenameMapped` in isolation, so the
+branch SELECTION (the thing that drives boot behavior) was never covered — a
+genuine regression hole. Closed by:
+- extracted seam `deviceMapNamingActive(cfg)` in `device_map.go`, used at BOTH
+  rename sites (no behavior change — same predicate);
+- `TestDeviceMapNamingActiveStartupDecision` (`device_map_startup_test.go`):
+  bootstraps a config-on-disk via the same EnterConfigure→LoadOverride→Commit
+  the boot path runs, then asserts the seam selects device-map for a committed
+  map, positional for no-map / empty-block / nil. Catches both a dropped branch
+  and a broken synchronous promotion, without a live VM.
+
+| Reviewer | Task / session id | Verdict |
+|----------|-------------------|---------|
+| Codex hostile | (pending) | (pending) |
+| AGY adversarial | (pending) | (pending) |
+| Copilot | (pending) | (pending) |
+| Claude SMR | inline | REFUTED-bug + seam/test MERGE-READY |

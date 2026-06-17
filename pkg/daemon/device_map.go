@@ -44,6 +44,26 @@ func rethMembersFromConfig(cfg *config.Config) map[string]bool {
 	return devicemap.RethMembersFromConfig(cfg)
 }
 
+// deviceMapNamingActive is the single predicate every startup naming site uses
+// to choose the device-map branch over the positional enumerate-and-rename.
+// It returns true only for a non-nil config carrying a non-empty
+// `chassis device-map` (DeviceMapConfig.Active). Extracted as a named seam so
+// the startup decision is unit-testable WITHOUT a live VM (#1956): the original
+// tests exercised enumerateAndRenameMapped in isolation, so the branch
+// selection itself — the thing that actually drives boot behavior — was never
+// covered. A regression that drops or inverts this branch is now caught by
+// TestDeviceMapNamingActiveStartupDecision.
+//
+// The caller at the normal-boot site sources cfg from d.store.ActiveConfig(),
+// which Store.Load (DB boot) and Store.Commit (bootstrap-from-file boot) both
+// populate SYNCHRONOUSLY before the naming decision runs — so a committed or
+// preseeded device-map is visible here on every boot path. The bootstrap-exit
+// site passes the freshly-committed config parameter. Neither is a deferred /
+// not-yet-promoted read.
+func deviceMapNamingActive(cfg *config.Config) bool {
+	return cfg != nil && cfg.Chassis.DeviceMap.Active()
+}
+
 // deviceMapOriginalNameFor computes the OriginalName= to record in a mapped
 // NIC's .link, given the NIC's CURRENT kernel name and its FINAL logical name.
 //   - If an existing .link already records the original (recoverOriginalName
