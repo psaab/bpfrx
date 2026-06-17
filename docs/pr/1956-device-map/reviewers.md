@@ -44,3 +44,16 @@
 ### R3 verdicts + dispositions
 - AGY r3 (adversarial-review-mqiepgva-dkp3qa): NEEDS-MAJOR (reviewed fe798fccb). 1 CRITICAL: networkd.Apply sweep deletes protected mgmt files -> lockout (FIXED: networkd SetProtectedResolver exempts them). MAJOR: deriveKernelName breaks fresh-box ens3 naming (FIXED: deviceMapOriginalNameFor derives only when wearing the logical name). MAJOR B.1: Case C rename collision (FIXED). B.2 absent-lifeline = acceptable per §9.6. Detail: agy-impl-r3.md. All fixed in b083b3445.
 - Codex r3: (pending agent return)
+
+### R4 verdicts + dispositions
+- Codex r4 (session 019ed6e2-9c63-70d2-a12e-4b26037da5bd): MERGE-READY. Confirmed networkd protected-file preservation, deriveKernelName gating, and CLI order fixes all PASS; no CRITICAL/HIGH (reviewed 4c28cbbda).
+- AGY r4 (adversarial-review-mqiezwzh-pv854d): verified deriveKernelName + SetProtectedResolver correct; found CRITICAL false-positive in strand Case C (legit port swap rejected). FIXED by rewriting deviceMapStrandsManagement to two order-free invariants (reachable + no-collision) — commit b6a4eeffa.
+
+## Round 5 (final confirmation on b6a4eeffa)
+
+| Reviewer | Task / session id | Verdict |
+|----------|-------------------|---------|
+| AGY adversarial | adversarial-review-mqif9rop-046u12 | (pending) |
+| Codex hostile | (final confirm agent) | (pending) |
+
+Copilot: 2 inline findings (r1) addressed + Copilot SWE-agent autonomously contributed the deriveKernelName fallback (integrated).
