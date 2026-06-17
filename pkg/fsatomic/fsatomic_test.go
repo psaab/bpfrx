@@ -117,6 +117,89 @@ func TestPreserveExistingMode(t *testing.T) {
 	}
 }
 
+// TestWithOwnerChownsTempBeforeRename asserts WithOwner fchowns the temp
+// fd (not a post-rename path chown) and that the chown happens before the
+// rename — the invariant that prevents a crash-window root-owned keys file.
+func TestWithOwnerChownsTempBeforeRename(t *testing.T) {
+	resetSeams(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "out.conf")
+
+	var (
+		chownedUID, chownedGID int
+		chownCalled, renamed   bool
+		chownBeforeRename      bool
+	)
+	chownTemp = func(f *os.File, uid, gid int) error {
+		chownCalled = true
+		chownedUID, chownedGID = uid, gid
+		if !renamed {
+			chownBeforeRename = true
+		}
+		return nil // cannot actually chown to arbitrary uid as non-root
+	}
+	renameFile = func(oldp, newp string) error {
+		renamed = true
+		return os.Rename(oldp, newp)
+	}
+
+	if err := WriteFileDurable(path, []byte("new"), 0600, WithOwner(4242, 4343)); err != nil {
+		t.Fatalf("WriteFileDurable: %v", err)
+	}
+	if !chownCalled {
+		t.Fatal("WithOwner did not chown the temp fd")
+	}
+	if chownedUID != 4242 || chownedGID != 4343 {
+		t.Fatalf("chown(%d,%d), want (4242,4343)", chownedUID, chownedGID)
+	}
+	if !chownBeforeRename {
+		t.Fatal("chown ran after rename — temp must be owned before install")
+	}
+	if got := mustRead(t, path); got != "new" {
+		t.Fatalf("content = %q, want new", got)
+	}
+	assertNoTemps(t, dir)
+}
+
+// TestWithOwnerPrecedenceOverPreserveExisting pins the settled precedence:
+// when both options are set, WithOwner WINS ownership and
+// WithPreserveExisting keeps the existing target's MODE.
+func TestWithOwnerPrecedenceOverPreserveExisting(t *testing.T) {
+	resetSeams(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "out.conf")
+	if err := os.WriteFile(path, []byte("old"), 0640); err != nil {
+		t.Fatal(err)
+	}
+	// Existing target reports owner 12345:12345 via the stat seam.
+	statFile = func(name string) (os.FileInfo, error) {
+		fi, err := os.Stat(name)
+		if err != nil {
+			return nil, err
+		}
+		return fakeFileInfo{FileInfo: fi, st: &syscall.Stat_t{Uid: 12345, Gid: 12345, Mode: uint32(fi.Mode().Perm())}}, nil
+	}
+	var chownedUID, chownedGID int
+	chownTemp = func(f *os.File, uid, gid int) error {
+		chownedUID, chownedGID = uid, gid
+		return nil
+	}
+
+	if err := WriteFileDurable(path, []byte("new"), 0644,
+		WithPreserveExisting(), WithOwner(7000, 7001)); err != nil {
+		t.Fatalf("WriteFileDurable: %v", err)
+	}
+	// Ownership comes from WithOwner, not the preserved 12345:12345.
+	if chownedUID != 7000 || chownedGID != 7001 {
+		t.Fatalf("chown(%d,%d), want WithOwner (7000,7001)", chownedUID, chownedGID)
+	}
+	// Mode comes from WithPreserveExisting (0640), not the perm arg (0644).
+	fi, _ := os.Stat(path)
+	if fi.Mode().Perm() != 0640 {
+		t.Fatalf("mode = %v, want preserved 0640", fi.Mode().Perm())
+	}
+}
+
 func TestResolveSymlinksWritesThrough(t *testing.T) {
 	dir := t.TempDir()
 	real := filepath.Join(dir, "real.conf")

@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/psaab/xpf/pkg/fsatomic"
 )
 
 // login_password.go implements the `system login user <name> authentication
@@ -109,31 +111,45 @@ func currentShadowHash(name string) (string, bool) {
 	return "", false
 }
 
-// lookupUID returns the numeric UID for name by parsing /etc/passwd
-// directly (cgo-free, consistent with currentShadowHash). Returns
-// (uid, true) on success, (0, false) if absent or unparseable.
-func lookupUID(name string) (int, bool) {
+// lookupUIDGID returns the numeric UID and GID for name by parsing
+// /etc/passwd directly (cgo-free, consistent with currentShadowHash —
+// the codebase deliberately avoids os/user to stay free of cgo/nsswitch).
+// /etc/passwd field 2 is the UID, field 3 is the primary GID. Returns
+// (uid, gid, true) on success, (0, 0, false) if absent or unparseable.
+//
+// fsatomic.WithOwner uses this so a DurableState authorized_keys write
+// installs the file already owned by the target user/group at rename
+// time — no post-rename chown race that could leave root-owned keys.
+func lookupUIDGID(name string) (uid, gid int, ok bool) {
 	data, err := os.ReadFile(passwdPath)
 	if err != nil {
-		return 0, false
+		return 0, 0, false
 	}
 	for _, line := range strings.Split(string(data), "\n") {
 		if line == "" {
 			continue
 		}
 		fields := strings.Split(line, ":")
-		if len(fields) < 3 {
+		if len(fields) < 4 {
 			continue
 		}
 		if fields[0] == name {
-			uid, err := strconv.Atoi(fields[2])
-			if err != nil {
-				return 0, false
+			u, uerr := strconv.Atoi(fields[2])
+			g, gerr := strconv.Atoi(fields[3])
+			if uerr != nil || gerr != nil {
+				return 0, 0, false
 			}
-			return uid, true
+			return u, g, true
 		}
 	}
-	return 0, false
+	return 0, 0, false
+}
+
+// lookupUID returns the numeric UID for name (the GID-less convenience
+// wrapper over lookupUIDGID, kept for existing callers).
+func lookupUID(name string) (int, bool) {
+	uid, _, ok := lookupUIDGID(name)
+	return uid, ok
 }
 
 // markerPath returns the provenance marker file path for name. names are
@@ -150,10 +166,14 @@ func markerPath(name string) string {
 // removing the directive will lock it. Best-effort: a marker write failure
 // is logged by the caller, not fatal. #1944 §5.4.
 func markProvisioned(name string, uid int) error {
-	if err := os.MkdirAll(provisionedUsersDir, 0o700); err != nil {
+	// DurableState: the marker must survive a power cut so a post-reboot
+	// declarative lock can still identify the account xpf provisioned
+	// (#1944 §5.4). MkdirAllDurable persists the directory entry itself,
+	// not just the file's entry within it.
+	if err := fsatomic.MkdirAllDurable(provisionedUsersDir, 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(markerPath(name), []byte(strconv.Itoa(uid)), 0o600)
+	return fsatomic.WriteFileDurable(markerPath(name), []byte(strconv.Itoa(uid)), 0o600)
 }
 
 // xpfProvisioned reports whether xpf manages name's password for the
