@@ -330,70 +330,72 @@ func deviceMapStrandsManagement(cfg *config.Config, nics []presentNIC, protected
 	if lifelineCurrentName != "" {
 		liveMgmt[lifelineCurrentName] = true
 	}
+	present := make(map[string]bool, len(nics))
 	for i := range nics {
+		present[nics[i].Name] = true
 		if protected[nics[i].Name] {
 			liveMgmt[nics[i].Name] = true
 		}
 	}
 
-	// Case A: a live management NIC must keep a PROTECTED name after the map
-	// is applied. If a live mgmt NIC is mapped to a NON-protected name,
-	// management moves off it on next boot. If it is not mapped at all, it
-	// keeps its current (protected) name — safe, because the teardown/scrub
-	// preserve protected names (AGY r2). This loop iterates the live mgmt
-	// NICs (not the protected-name set) so legitimately mapping the live mgmt
-	// NIC from its kernel name (enp5s0) to a protected name (fxp0) is NOT
-	// flagged (Codex r2 HIGH-A false-positive fix).
-	for lm := range liveMgmt {
-		if final, ok := finalByCurrent[lm]; ok && !protected[final] {
-			return fmt.Sprintf("device-map would rename the live management NIC %q to %q (a "+
-				"non-management name) on next boot, moving management off it. Map the management "+
-				"NIC to its management name, or adjust the map before committing.", lm, final)
+	// Compute the NAME each present NIC will carry AFTER the map is applied:
+	// its mapped logical name if mapped, else its current name (an unmapped
+	// NIC keeps its name — protected ones are preserved by teardown/scrub).
+	finalNameOf := func(current string) string {
+		if f, ok := finalByCurrent[current]; ok {
+			return f
+		}
+		return current
+	}
+
+	// Invariant 1 — management stays reachable: after apply, at least one
+	// present NIC must carry a protected name. This is true if any NIC is
+	// mapped to a protected name (incl. the live mgmt NIC mapped to itself —
+	// Codex r2 HIGH-A) OR an unmapped live mgmt NIC keeps its protected name
+	// (AGY r2). A deliberate port swap (old mgmt -> non-mgmt name, new NIC ->
+	// fxp0) satisfies this via the new NIC (AGY r4). Only a map that leaves
+	// ZERO present NICs with a protected name strands management.
+	mgmtReachable := false
+	for i := range nics {
+		if protected[finalNameOf(nics[i].Name)] {
+			mgmtReachable = true
+			break
 		}
 	}
-
-	// Set of present interface names (current kernel names) for Case C.
-	present := make(map[string]bool, len(nics))
-	for i := range nics {
-		present[nics[i].Name] = true
+	if !mgmtReachable {
+		// Identify a live mgmt NIC being moved off for a precise message.
+		for lm := range liveMgmt {
+			if f, ok := finalByCurrent[lm]; ok && !protected[f] {
+				return fmt.Sprintf("device-map would rename the live management NIC %q to %q (a "+
+					"non-management name) on next boot with no other NIC taking a management name "+
+					"— management would be unreachable. Map a NIC to its management name before "+
+					"committing.", lm, f)
+			}
+		}
+		return "device-map would leave no interface carrying a management name on next boot — " +
+			"management would be unreachable. Map a NIC to its management name before committing."
 	}
 
+	// Invariant 2 — no udev rename collision on a protected name: two present
+	// NICs must not both end up carrying the same protected name on next boot.
+	// This catches both a steal (a non-mgmt NIC grabbing a name the live mgmt
+	// NIC keeps — Codex HIGH-2) and the unmapped-current-holder collision (AGY
+	// r3 B.1). A deliberate swap is fine because the vacating NIC's final name
+	// differs (AGY r4).
 	for prot := range protected {
 		if prot == "" {
 			continue
 		}
-		// Case B: some NIC that is NOT a live management NIC is mapped to a
-		// protected name — it would steal the management name on next boot,
-		// even if the live mgmt NIC still wears its kernel name today
-		// (Codex HIGH-2: this fires before any rename).
-		for current, final := range finalByCurrent {
-			if final == prot && !liveMgmt[current] {
-				return fmt.Sprintf("device-map would assign the management name %q to NIC %q on "+
-					"next boot, taking it from the live management NIC. Re-pin the device-map "+
-					"before committing.", prot, current)
+		holders := make([]string, 0, 2)
+		for i := range nics {
+			if finalNameOf(nics[i].Name) == prot {
+				holders = append(holders, nics[i].Name)
 			}
 		}
-		// Case C (AGY r3 MAJOR B.1): a protected name is CURRENTLY held by a
-		// present interface that is NOT mapped to keep it, while SOME mapped
-		// entry assigns that same protected name to a different NIC. On next
-		// boot both the stale .link of the current holder and the new
-		// binding's .link target the same name — a udev rename collision that
-		// can strand the management NIC. Refuse so the operator re-pins.
-		if present[prot] {
-			heldKept := false
-			if final, ok := finalByCurrent[prot]; ok && final == prot {
-				heldKept = true // the current holder is mapped to keep the name
-			}
-			if !heldKept {
-				for current, final := range finalByCurrent {
-					if final == prot && current != prot {
-						return fmt.Sprintf("device-map would assign the management name %q to NIC "+
-							"%q while the interface currently named %q is left unmapped — a rename "+
-							"collision on next boot. Map the current %q holder explicitly (or to a "+
-							"different name) before committing.", prot, current, prot, prot)
-					}
-				}
-			}
+		if len(holders) > 1 {
+			return fmt.Sprintf("device-map would assign the management name %q to more than one "+
+				"interface on next boot (%v) — a rename collision that can strand management. "+
+				"Re-pin the device-map so exactly one NIC carries %q.", prot, holders, prot)
 		}
 	}
 	return ""

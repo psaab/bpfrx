@@ -214,23 +214,38 @@ func TestDeviceMapStrandsManagementRefuseOnTopologyChange(t *testing.T) {
 	}
 }
 
-func TestDeviceMapStrandsManagementCatchesPreRenameSteal(t *testing.T) {
-	// Codex HIGH-2: on first boot the live mgmt NIC still wears its kernel
-	// name (enp5s0), NOT the protected target (fxp0). A different NIC mapped
-	// to fxp0 must still be caught as a steal even though no present NIC is
-	// literally named fxp0 yet. The lifeline identity resolves enp5s0 as the
-	// live mgmt NIC.
+func TestDeviceMapStrandsManagementLifelineRenamedOffStrands(t *testing.T) {
+	// The genuine pre-rename strand (Codex HIGH-2 intent, corrected by the
+	// unified model): the lifeline NIC (currently enp5s0) is itself mapped to
+	// a NON-management name and NO NIC takes a management name -> management
+	// becomes unreachable on next boot.
+	cfg := &config.Config{Chassis: config.ChassisConfig{DeviceMap: &config.DeviceMapConfig{
+		Entries: []config.DeviceMapEntry{{LogicalName: "ge-0/0/0", PCIAddr: "0000:05:00.0"}},
+	}}}
+	nics := []devicemap.PresentNIC{
+		{Name: "enp5s0", PCIAddr: "0000:05:00.0"}, // lifeline, mapped to ge-0/0/0
+		{Name: "enp9s0", PCIAddr: "0000:09:00.0"}, // not mapped to a mgmt name
+	}
+	protected := map[string]bool{"fxp0": true}
+	if r := deviceMapStrandsManagement(cfg, nics, protected, "enp5s0"); r == "" {
+		t.Fatalf("expected strand when the lifeline NIC is renamed off and no NIC takes a mgmt name")
+	}
+}
+
+func TestDeviceMapStrandsManagementUnmappedLifelineKeepsMgmt(t *testing.T) {
+	// Corrected semantics: the lifeline NIC (enp5s0) is left UNMAPPED, so it
+	// KEEPS its name and address — management stays reachable. Another NIC
+	// taking fxp0 does NOT strand it (no collision; mgmt is on enp5s0).
 	cfg := &config.Config{Chassis: config.ChassisConfig{DeviceMap: &config.DeviceMapConfig{
 		Entries: []config.DeviceMapEntry{{LogicalName: "fxp0", PCIAddr: "0000:09:00.0"}},
 	}}}
 	nics := []devicemap.PresentNIC{
-		{Name: "enp5s0", PCIAddr: "0000:05:00.0"}, // live mgmt NIC (un-renamed)
-		{Name: "enp9s0", PCIAddr: "0000:09:00.0"}, // mapped to fxp0 -> steal
+		{Name: "enp5s0", PCIAddr: "0000:05:00.0"}, // lifeline, unmapped -> keeps name
+		{Name: "enp9s0", PCIAddr: "0000:09:00.0"}, // -> fxp0
 	}
 	protected := map[string]bool{"fxp0": true}
-	// lifeline resolves the live mgmt NIC's CURRENT name = enp5s0.
-	if r := deviceMapStrandsManagement(cfg, nics, protected, "enp5s0"); r == "" {
-		t.Fatalf("expected steal detection before rename (live mgmt still enp5s0)")
+	if r := deviceMapStrandsManagement(cfg, nics, protected, "enp5s0"); r != "" {
+		t.Fatalf("an unmapped lifeline NIC keeps mgmt; must be safe, got %q", r)
 	}
 }
 
@@ -283,6 +298,28 @@ func TestDeviceMapStrandsManagementCaseCCollision(t *testing.T) {
 	protected := map[string]bool{"ge-0-0-3": true}
 	if r := deviceMapStrandsManagement(cfg, nics, protected, ""); r == "" {
 		t.Fatalf("expected Case C collision rejection")
+	}
+}
+
+func TestDeviceMapStrandsManagementCaseCAllowsPortSwap(t *testing.T) {
+	// AGY r4 CRITICAL: a LEGITIMATE port swap must NOT be flagged by Case C.
+	// The current fxp0 holder is re-mapped to ge-0/0/9 (its .link is rewritten
+	// away from fxp0, no stale rule) AND a new NIC is mapped to fxp0. No
+	// collision on next boot. fxp0 stays protected (mgmt remains on a
+	// protected name via the new NIC).
+	cfg := &config.Config{Chassis: config.ChassisConfig{DeviceMap: &config.DeviceMapConfig{
+		Entries: []config.DeviceMapEntry{
+			{LogicalName: "ge-0/0/9", PCIAddr: "0000:05:00.0"}, // old fxp0 NIC -> ge-0-0-9
+			{LogicalName: "fxp0", PCIAddr: "0000:09:00.0"},     // new NIC -> fxp0
+		},
+	}}}
+	nics := []devicemap.PresentNIC{
+		{Name: "fxp0", PCIAddr: "0000:05:00.0"},   // current fxp0 holder
+		{Name: "enp9s0", PCIAddr: "0000:09:00.0"}, // becomes fxp0
+	}
+	protected := map[string]bool{"fxp0": true}
+	if r := deviceMapStrandsManagement(cfg, nics, protected, "fxp0"); r != "" {
+		t.Fatalf("legit port swap (fxp0->ge-0-0-9, enp9s0->fxp0) must be allowed, got %q", r)
 	}
 }
 
