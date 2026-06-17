@@ -12,3 +12,13 @@
 | r1 | Copilot | (auto on PR) | pending |
 
 ## 3-of-4 APPROVE at HEAD eb9b20b90 (Codex + AGY + SMR); awaiting Copilot.
+
+## Final round (after Copilot fixes + rebase onto master)
+| Reviewer | Verdict |
+|----------|---------|
+| Codex (final confirm @ 5574645d7) | APPROVE |
+| AGY (r3) | APPROVE |
+| Claude SMR | APPROVE |
+| Copilot (r1+r2 all findings addressed) | resolved |
+
+## 4-of-4 satisfied at HEAD 5574645d7 (rebased, MERGEABLE/CLEAN). Live-validated.
