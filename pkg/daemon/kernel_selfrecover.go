@@ -86,8 +86,14 @@ func (d *Daemon) reconcileKernelUpgradeHold() {
 	promoted, err := sys.ReadPromotionMarker()
 	if err != nil || promoted == "" || promoted != running {
 		// Not yet a confirmed promotion of THIS running kernel — keep holding.
-		// (Covers verifying, reverted-pending-reboot, and marker-write failures:
-		// fail SAFE toward keeping the unverified candidate secondary.)
+		// Covers: still verifying; reverted-pending-reboot; and the marker-write
+		// failure on an OTHERWISE-successful promote. The last case leaves the
+		// node SECONDARY on a GOOD kernel — accepted: a marker write failure
+		// means /var/lib/xpf is unwritable (the same catastrophe that breaks the
+		// journal), and the SAFE outcome there is the peer keeping primary while
+		// the orchestrator (which also reads the marker and would see
+		// promoted=none) stops the roll for operator recovery. Failing toward
+		// "secondary, peer serves" beats releasing a possibly-unverified node.
 		return
 	}
 	d.cluster.ClearKernelUpgradeHold()
