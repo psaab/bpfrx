@@ -669,13 +669,21 @@ def _acquire_lease(runner, backend, node, target_node_id, holder, ttl_secs):
             f"by another orchestrator, or the lock timed out) — aborting.")
 
 
-def _clear_lease(runner, backend, node):
-    # Clear under the same flock as acquire, so a release can't interleave a
-    # concurrent acquire's reclaim/create critical section.
+def _clear_lease(runner, backend, node, holder):
+    # Release ONLY if WE still hold the lease (holder matches), under the same
+    # flock as acquire (r4 Codex: an unconditional rm could delete a SUCCESSOR's
+    # live lease if ours had expired and someone else re-acquired). No unlocked
+    # fallback — a failure to take the lock means we do NOT delete (safer to
+    # leave a lease that will expire than to delete a live successor's).
+    h = holder.replace('"', "")
+    crit = (
+        'f=/var/lib/xpf/kernel-roll.lease; [ -f "$f" ] || exit 0; '
+        'cur=$(sed -n \'s/.*"holder": *"\\([^"]*\\)".*/\\1/p\' "$f"); '
+        '[ "$cur" = "%s" ] && rm -f "$f"; exit 0'
+    ) % h
     _node_exec(runner, backend, node, ["sh", "-c",
-               "flock -w 30 /var/lib/xpf/kernel-roll.lock "
-               "rm -f /var/lib/xpf/kernel-roll.lease 2>/dev/null || "
-               "rm -f /var/lib/xpf/kernel-roll.lease"], check=False)
+               "flock -w 30 /var/lib/xpf/kernel-roll.lock sh -c " + shlex.quote(crit)],
+               check=False)
 
 
 def _kernel_status(runner, backend, node):
@@ -775,8 +783,8 @@ def cmd_kernel_roll(args):
             return True
         finally:
             # 7. release this node's lease on both nodes (best-effort)
-            _clear_lease(runner, backend, node)
-            _clear_lease(runner, backend, peer)
+            _clear_lease(runner, backend, node, holder)
+            _clear_lease(runner, backend, peer, holder)
 
     roll_one(nodes[0], nodes[1])
     print(f"\n==> {nodes[0]} done; rolling the second node")
