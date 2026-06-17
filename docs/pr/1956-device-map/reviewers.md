@@ -53,7 +53,7 @@
 
 | Reviewer | Task / session id | Verdict |
 |----------|-------------------|---------|
-| AGY adversarial | adversarial-review-mqif9rop-046u12 | (pending) |
+| AGY adversarial | adversarial-review-mqif9rop-046u12 | **MERGE-READY** (all 5 cases a-e verified; topology REFUSE intact) |
 | Codex hostile | (final confirm agent) | (pending) |
 
 Copilot: 2 inline findings (r1) addressed + Copilot SWE-agent autonomously contributed the deriveKernelName fallback (integrated).
