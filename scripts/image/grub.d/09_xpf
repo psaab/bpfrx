@@ -58,6 +58,19 @@ else
     XPF_ROOT_ARG=""
 fi
 
+# Resolve the boot-dir prefix RELATIVE to the filesystem GRUB sets as root, like
+# 10_linux does (r1/r2 AGY: a separate /boot partition holds the kernel at the
+# PARTITION ROOT, so the kernel path is "/vmlinuz-…" there, not "/boot/…"). On a
+# single-root system this resolves to "/boot"; on a separate /boot partition it
+# resolves to "" (root of that partition). The selector stores the bare filename
+# (vmlinuz-<ver>), so we prefix it with the resolved boot dir at GENERATION time.
+if command -v make_system_path_relative_to_its_root >/dev/null 2>&1; then
+    XPF_BOOT="$(make_system_path_relative_to_its_root /boot)"
+else
+    XPF_BOOT="/boot"
+fi
+XPF_BOOT="${XPF_BOOT%/}"   # strip a trailing slash; "" means partition root
+
 # Emit the menuentry. The BODY reads $cmdpath + sources the selector at BOOT
 # (single-quoted heredoc preserves $cmdpath/$xpf_slot_* for GRUB runtime); the
 # cmdline/root are substituted at GENERATION time (double-substituted below).
@@ -68,12 +81,12 @@ cat <<EOF
 # --- xpf (#1930) A/B kernel-slot selector entry ---
 if [ -s "\${cmdpath}/xpf.selector" ]; then
   source "\${cmdpath}/xpf.selector"
-  if [ -n "\${xpf_slot_kernel}" -a -f "/boot/\${xpf_slot_kernel}" ]; then
+  if [ -n "\${xpf_slot_kernel}" -a -f "${XPF_BOOT}/\${xpf_slot_kernel}" ]; then
     menuentry 'xpf kernel slot' --id xpf-slot {
-      search --no-floppy --set=root --file "/boot/\${xpf_slot_kernel}"
-      linux  "/boot/\${xpf_slot_kernel}" ${XPF_ROOT_ARG} ro ${XPF_CMDLINE}
-      if [ -n "\${xpf_slot_initrd}" -a -f "/boot/\${xpf_slot_initrd}" ]; then
-        initrd "/boot/\${xpf_slot_initrd}"
+      search --no-floppy --set=root --file "${XPF_BOOT}/\${xpf_slot_kernel}"
+      linux  "${XPF_BOOT}/\${xpf_slot_kernel}" ${XPF_ROOT_ARG} ro ${XPF_CMDLINE}
+      if [ -n "\${xpf_slot_initrd}" -a -f "${XPF_BOOT}/\${xpf_slot_initrd}" ]; then
+        initrd "${XPF_BOOT}/\${xpf_slot_initrd}"
       fi
     }
   else

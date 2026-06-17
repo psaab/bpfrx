@@ -158,3 +158,13 @@ addressed:
   residual; the strong gate is an operator-set dataplane target.
 
 Re-validated live: 09_xpf emits root=UUID=...; build/test/gofmt green.
+
+## AGY r2 fix — separate /boot partition
+
+AGY r2 confirmed all r1 fixes resolved; one remaining: 09_xpf hardcoded the
+/boot prefix, which breaks on a foreign host with a SEPARATE /boot partition
+(the kernel lives at the partition root there, not /boot/). FIXED: 09_xpf now
+resolves the boot-dir prefix at generation time via
+make_system_path_relative_to_its_root /boot (exactly like 10_linux) — "/boot" on
+a single-root system, "" on a separate /boot partition. Live-confirmed on the
+single-root VM (resolves to /boot/${xpf_slot_kernel}); grub.cfg still VALID.
