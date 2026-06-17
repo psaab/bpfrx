@@ -255,3 +255,179 @@ func TestTunnelEndpointIDNoFalsePositive(t *testing.T) {
 		}
 	}
 }
+
+// #1914 Defect A: a WILDCARD apply-group splices `unit 0 tunnel mode
+// wireguard` onto the interfaces that reference it. The pre-expansion
+// View-1 collector hashes only the LITERAL group ref `<*>.0` (50477) — it
+// never sees the concrete post-expansion `wg78.0`/`wg1408.0`, both folding
+// to 824 — so View 1 alone FALSELY ACCEPTS a builder-emitted collision the
+// runtime usedIDs belt then drops with a loud slog.Error. The post-expansion
+// Views 2/3 expand the wildcard onto wg78 + wg1408, see both concrete refs,
+// and must REJECT the commit (strict path).
+func TestTunnelEndpointIDWildcardApplyGroupsCollisionRejected(t *testing.T) {
+	// Frozen-fold preconditions: the literal wildcard ref does NOT collide
+	// with the concrete refs, but the two concrete refs collide with each
+	// other (so only the post-expansion views can catch it).
+	if got := StableTunnelEndpointID("<*>.0"); got != 50477 {
+		t.Fatalf("precondition: <*>.0=%d, want 50477 (frozen fold)", got)
+	}
+	if a, b := StableTunnelEndpointID("wg78.0"), StableTunnelEndpointID("wg1408.0"); a != b || a != 824 {
+		t.Fatalf("precondition: wg78.0=%d wg1408.0=%d, want both 824 (frozen fold)", a, b)
+	}
+	tree := buildTree(t, []string{
+		"set groups wgtun interfaces <*> unit 0 tunnel mode wireguard",
+		"set interfaces wg78 apply-groups wgtun",
+		"set interfaces wg1408 unit 0 tunnel mode wireguard",
+	})
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatalf("CompileConfig accepted a wildcard-apply-groups builder-emitted collision (wg78.0 vs wg1408.0)")
+	}
+	for _, want := range []string{"wg78.0", "wg1408.0", "collision", "rename"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("collision error %q does not mention %q", err.Error(), want)
+		}
+	}
+}
+
+// #1914 Defect A lenient: the same wildcard-apply-groups collision must
+// WARN (not error) on the tolerant load/peer-sync path.
+func TestTunnelEndpointIDWildcardApplyGroupsCollisionLenientWarns(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set groups wgtun interfaces <*> unit 0 tunnel mode wireguard",
+		"set interfaces wg78 apply-groups wgtun",
+		"set interfaces wg1408 unit 0 tunnel mode wireguard",
+	})
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("CompileConfigLenient rejected a wildcard-apply-groups collision: %v", err)
+	}
+	found := false
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "collision") && strings.Contains(w, "wg78.0") && strings.Contains(w, "wg1408.0") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("lenient compile carried no wildcard-collision warning: %v", cfg.Warnings)
+	}
+}
+
+// #1914 Defect A symmetry: the wildcard-apply-groups collision must reject
+// IDENTICALLY under both per-node compiles, or config-sync would split.
+func TestTunnelEndpointIDWildcardApplyGroupsCollisionSymmetric(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set groups wgtun interfaces <*> unit 0 tunnel mode wireguard",
+		"set interfaces wg78 apply-groups wgtun",
+		"set interfaces wg1408 unit 0 tunnel mode wireguard",
+	})
+	if _, err := CompileConfigForNode(tree, 0); err == nil {
+		t.Fatalf("node0 compile accepted a wildcard-apply-groups collision")
+	}
+	if _, err := CompileConfigForNode(tree, 1); err == nil {
+		t.Fatalf("node1 compile accepted a wildcard-apply-groups collision")
+	}
+}
+
+// #1914 View-1 byte-identity / cross-node symmetry: the #1873 guarantee
+// that a collision hidden in a `groups node1` block (never applied on
+// node0's effective config) still rejects on BOTH nodes must survive the
+// addition of Views 2/3 — Views 2/3 never expand the un-applied group, so
+// only the UNCHANGED presence union (View 1) catches it. This is the
+// regression guard for "don't narrow View 1".
+func TestTunnelEndpointIDView1PresenceUnionPreserved(t *testing.T) {
+	tree := buildTree(t, []string{
+		// Collision hidden in an UN-APPLIED groups node1 block; node0
+		// never applies it (no apply-groups "${node}"). Views 2/3 expand
+		// to empty for this group, so only View 1's presence union can
+		// reject — proving View 1 was not narrowed.
+		"set groups node1 interfaces wg1408 unit 0 tunnel mode wireguard",
+		"set interfaces wg78 unit 0 tunnel mode wireguard",
+	})
+	if _, err := CompileConfigForNode(tree, 0); err == nil {
+		t.Fatalf("node0 compile accepted a collision hidden in un-applied groups node1 (View 1 was narrowed?)")
+	}
+	if _, err := CompileConfigForNode(tree, 1); err == nil {
+		t.Fatalf("node1 compile accepted a collision hidden in groups node1")
+	}
+}
+
+// #1914 Defect B (DOCUMENTED LIMITATION — pin CURRENT behavior): View 1
+// registers a non-WG tunnel ref from presence alone, with no src/dest
+// check, while the builder drops an incomplete non-WG tunnel. A
+// half-configured GRE whose unit ref folds onto a real emitted ref still
+// REJECTS — the accepted residual. This test pins the limitation so a
+// future reader knows it is intentional (Defect B is mutually exclusive
+// with the Defect-A fix), not a new bug. Frozen collision:
+// gr-0/0/0.0 == wg29715.0 == 44687.
+func TestTunnelEndpointIDDefectBIncompleteGREStillRejects(t *testing.T) {
+	if a, b := StableTunnelEndpointID("gr-0/0/0.0"), StableTunnelEndpointID("wg29715.0"); a != b || a != 44687 {
+		t.Fatalf("precondition: gr-0/0/0.0=%d wg29715.0=%d, want both 44687 (frozen fold)", a, b)
+	}
+	tree := buildTree(t, []string{
+		// Incomplete GRE: no source/dest. The builder drops it, but View 1
+		// registers it (presence-only). It folds onto the real wg29715.0.
+		"set interfaces gr-0/0/0 unit 0 tunnel mode gre",
+		"set interfaces wg29715 unit 0 tunnel mode wireguard",
+	})
+	if _, err := CompileConfig(tree); err == nil {
+		t.Fatalf("Defect B residual changed: incomplete-GRE phantom no longer rejects (View 1 was narrowed?)")
+	}
+}
+
+// #1914 no false positive: a WG wildcard apply-group applied to a SINGLE
+// interface (no second colliding ref) must compile clean — Views 2/3 add
+// exactly one concrete ref, no collision.
+func TestTunnelEndpointIDWildcardApplyGroupsSingleInterfaceClean(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set groups wgtun interfaces <*> unit 0 tunnel mode wireguard",
+		"set interfaces wg78 apply-groups wgtun",
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig rejected a single-interface wildcard WG group: %v", err)
+	}
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "tunnel endpoint id collision") {
+			t.Fatalf("unexpected collision warning: %q", w)
+		}
+	}
+}
+
+// #1914 non-fatal peer-group expansion: a config that defines only
+// `groups node0` and applies "${node}" has NO `groups node1`, so View 3
+// (node1 expansion) hits `undefined group "node1"`. That MUST be non-fatal
+// (View 3 contributes the empty set) and the config must COMMIT cleanly —
+// the gate must not turn a valid-on-the-local-node config into a spurious
+// failure.
+func TestTunnelEndpointIDNonFatalUndefinedPeerGroup(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set groups node0 interfaces wg0 unit 0 tunnel mode wireguard",
+		`set apply-groups "${node}"`,
+	})
+	if _, err := CompileConfig(tree); err != nil {
+		t.Fatalf("CompileConfig (generic, node0 fallback) failed on undefined peer group: %v", err)
+	}
+	if _, err := CompileConfigForNode(tree, 0); err != nil {
+		t.Fatalf("node0 compile failed on a config with only groups node0: %v", err)
+	}
+}
+
+// #1914 no-recursion regression: the gate on a wildcard / multi-node config
+// must return in bounded time. If a future edit reintroduces a
+// CompileConfig* call from the gate it recurses to stack overflow; this
+// test guards the recursion-free invariant by simply requiring the gate to
+// terminate (a recursion would panic/hang well before this returns).
+func TestTunnelEndpointIDGateTerminatesNoRecursion(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set groups wgtun interfaces <*> unit 0 tunnel mode wireguard",
+		"set interfaces wg78 apply-groups wgtun",
+		"set interfaces wg1408 unit 0 tunnel mode wireguard",
+		"set groups node0 interfaces gr-0/0/0 unit 0 tunnel mode gre",
+		`set apply-groups "${node}"`,
+	})
+	// Direct gate call: must terminate (and reject the real wg collision).
+	if _, err := validateTunnelEndpointIDCollisionAST(tree, false); err == nil {
+		t.Fatalf("gate accepted a wildcard collision (or recursed before returning)")
+	}
+}

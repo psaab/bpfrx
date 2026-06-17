@@ -1,5 +1,24 @@
 # Action Log
 
+## 2026-06-17 — #1914 tunnel-endpoint collision gate three-view union (Path 1)
+
+- **Timestamp**: 2026-06-17
+- **Action**: Implement Path 1 for Defect A — close the wildcard
+  apply-groups false-accept in the #1873 tunnel-endpoint id collision
+  gate. Add the config-pure SSOT emitter `EmitTunnelEndpointNames`;
+  refactor `buildTunnelEndpointSnapshots` onto it; extend
+  `validateTunnelEndpointIDCollisionAST` to a three-view union (V1
+  pre-expansion presence union UNCHANGED + V2/V3 post-expansion node0/node1
+  emitted names via clone+ExpandGroupsWithVars+compileInterfaces+emitter,
+  recursion-free, pre-usedIDs, per-node expansion error → empty set).
+  Defect B is document-only (in-code contract on the gate). Add tests:
+  wildcard reject/lenient-warn/symmetric, View-1 byte-identity preserved,
+  Defect-B residual pinned, single-iface clean, non-fatal undefined peer
+  group, no-recursion, and emitter↔builder parity.
+- **File(s)**: pkg/config/tunnelemit.go (new), pkg/config/tunnelid.go,
+  pkg/config/tunnelid_test.go, pkg/dataplane/userspace/tunnels.go,
+  pkg/dataplane/userspace/tunnels_test.go
+
 ## 2026-06-17 — #1919 WireGuard removal address-prune (implement converged r3 plan)
 
 - **Timestamp**: 2026-06-17

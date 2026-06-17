@@ -143,16 +143,93 @@ func astTunnelModeWireguard(tunnelNode *Node) bool {
 	return false
 }
 
-// validateTunnelEndpointIDCollisionAST checks the UNION of tunnel
-// endpoint names across the main "interfaces" hierarchy AND every
-// "groups" block for StableTunnelEndpointID collisions (#1873 R-B).
+// emitNodeExpandedTunnelNames returns the concrete tunnel-endpoint names
+// the snapshot builder would emit after expanding the candidate tree for
+// chassis-cluster node nodeID. It is the #1914 post-expansion view (View 2
+// for node0, View 3 for node1) used by validateTunnelEndpointIDCollisionAST.
 //
-// The union (rather than the per-node effective config) keeps the
-// accept/reject decision identical on both chassis-cluster nodes: a
-// collision involving a `groups node0`-scoped tunnel must fail commit
-// on node1 too, or config-sync would split (originator accepts, peer
-// rejects). It runs on the PRE-expansion tree because ExpandGroups
-// removes the groups stanza.
+// It is RECURSION-FREE by construction: it clones the candidate, expands
+// groups for the node, runs the gate-free interfaces sub-compiler
+// (compileInterfaces — which does NOT call this collision gate) into a
+// throwaway InterfacesConfig, and feeds that typed config through the SSOT
+// emitter EmitTunnelEndpointNames. It NEVER calls CompileConfig* (which
+// would call the gate first and recurse) and NEVER consults the
+// post-usedIDs snapshot (the builder's collision drop has not run, so both
+// colliding refs are present).
+//
+// Per-node expansion or compile errors are NON-FATAL: the view contributes
+// the EMPTY set. A config that defines only `groups node0` and references
+// `${node}` legitimately has no `groups node1`, so expanding for node1
+// hits `undefined group "node1"`; that is a separate, already-handled
+// condition on the real per-node compile path (CompileConfig falls back to
+// node0 for an undefined ${node}), and the collision gate must not turn it
+// into a spurious commit failure. View 1's pre-expansion presence union
+// still covers any collision inside the un-expandable group, so dropping
+// the failed node's view loses no real coverage and keeps the verdict a
+// pure function of the candidate config (both nodes compute identical
+// error-to-empty-set handling).
+func emitNodeExpandedTunnelNames(tree *ConfigTree, nodeID int, out map[string]struct{}) {
+	clone := tree.Clone()
+	vars := map[string]string{"node": fmt.Sprintf("node%d", nodeID)}
+	if err := clone.ExpandGroupsWithVars(vars); err != nil {
+		return
+	}
+	ifacesNode := clone.FindChild("interfaces")
+	if ifacesNode == nil {
+		return
+	}
+	ifaces := InterfacesConfig{Interfaces: make(map[string]*InterfaceConfig)}
+	if err := compileInterfaces(ifacesNode, &ifaces); err != nil {
+		return
+	}
+	cfg := &Config{Interfaces: ifaces}
+	for _, ep := range EmitTunnelEndpointNames(cfg) {
+		out[ep.Name] = struct{}{}
+	}
+}
+
+// validateTunnelEndpointIDCollisionAST checks the UNION of tunnel
+// endpoint names across three views of the candidate config for
+// StableTunnelEndpointID collisions (#1873 R-B, #1914):
+//
+//	View 1 — the PRE-expansion presence union across the main
+//	  "interfaces" hierarchy AND every "groups" block (unchanged since
+//	  #1873). It runs on the pre-expansion tree because ExpandGroups
+//	  removes the groups stanza, and it keeps the accept/reject decision
+//	  identical on both chassis-cluster nodes: a collision involving a
+//	  `groups node0`-scoped tunnel must fail commit on node1 too, or
+//	  config-sync would split (originator accepts, peer rejects).
+//	View 2 — the concrete tunnel names the builder would emit after
+//	  expanding the candidate for node0 (emitNodeExpandedTunnelNames).
+//	View 3 — the same for node1.
+//
+// Views 2/3 (added in #1914) close Defect A: a wildcard apply-group
+// (`groups g interfaces <*> unit 0 tunnel mode wireguard`) registers only
+// the literal `<*>.0` in View 1, never the post-expansion concrete
+// `wg78.0` / `wg1408.0` that fold to the same id — so View 1 alone falsely
+// ACCEPTS a builder-emitted collision that the runtime usedIDs belt then
+// drops with a loud slog.Error. Views 2/3 expand the wildcard onto the
+// real applying interfaces, see both concrete refs, and reject at commit.
+// Because all three views are pure functions of the SAME candidate config
+// (View 2/3 both expand the shared candidate for a fixed node, computed on
+// BOTH nodes), the union stays a pure function of config — HA symmetry is
+// preserved. The union is monotone over View 1 (adding Views 2/3 only ADDS
+// rejects), so every reject View 1 produced today is preserved.
+//
+// DOCUMENTED LIMITATION (Defect B, #1914): View 1 registers a ref from
+// tunnel-node presence alone with NO source/destination check, while the
+// builder drops a non-WireGuard tunnel whose Source or Destination is empty
+// (tunnels.go addEndpoint). So a half-configured non-WG tunnel (e.g.
+// `gr-0/0/0 unit 0 tunnel mode gre` with no source/dest) registers a
+// phantom View-1 ref the builder never emits; if that phantom folds onto a
+// real emitted ref (≈1/65535 per pair) the commit is FALSELY REJECTED. This
+// is accepted, not fixed: View 1 MUST stay presence-only or the Defect-A
+// fix re-opens a false ACCEPT (a group can SUPPLY src/dst later, and an
+// un-applied nested-apply-groups group is never expanded by Views 2/3, so a
+// complete-only View 1 would under-register and miss a real cross-node
+// collision). Narrowing View 1 is mutually exclusive with the Defect-A fix;
+// the runtime usedIDs slog.Error belt and the printed "rename one
+// interface" remediation are the operator's recourse for the residual.
 //
 // Strict (commit / commit-check) returns an error; lenient (load /
 // peer-sync of an already-active config) returns a warning so an
@@ -161,6 +238,7 @@ func astTunnelModeWireguard(tunnelNode *Node) bool {
 // buildTunnelEndpointSnapshots).
 func validateTunnelEndpointIDCollisionAST(tree *ConfigTree, lenient bool) ([]string, error) {
 	names := make(map[string]struct{})
+	// View 1 — pre-expansion presence union (UNCHANGED, #1873).
 	collectTunnelEndpointNamesAST(tree.FindChild("interfaces"), names)
 	for _, child := range tree.Children {
 		if child.Name() != "groups" {
@@ -176,6 +254,12 @@ func validateTunnelEndpointIDCollisionAST(tree *ConfigTree, lenient bool) ([]str
 			collectTunnelEndpointNamesAST(group.FindChild("interfaces"), names)
 		}
 	}
+	// Views 2/3 — post-expansion emitted names for node0 and node1
+	// (#1914). Both computed on both nodes from the shared candidate, so
+	// the union stays HA-symmetric; per-node expansion errors contribute
+	// the empty set (non-fatal).
+	emitNodeExpandedTunnelNames(tree, 0, names)
+	emitNodeExpandedTunnelNames(tree, 1, names)
 	if len(names) < 2 {
 		return nil, nil
 	}
