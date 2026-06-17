@@ -124,12 +124,18 @@ func (r *keepaliveRunner) matches(tc *config.TunnelConfig) bool {
 
 // TunnelStatus holds the status of a tunnel interface.
 type TunnelStatus struct {
-	Name          string
-	Source        string
-	Destination   string
-	State         string // "up" or "down"
-	Addresses     []string
-	KeepaliveUp   *bool  // nil if no keepalive configured
+	Name        string
+	Source      string
+	Destination string
+	State       string // "up" or "down"
+	Addresses   []string
+	// KeepaliveUp is tri-state (#1918): non-nil true/false when liveness is
+	// KNOWN (probe succeeded/failed), and nil when EITHER no keepalive is
+	// configured OR liveness is currently UNKNOWN (ProbeUnsupported —
+	// hold-on-unknown). The two nil cases are distinguished by
+	// KeepaliveInfo: "" → not configured; "unknown (...)" → configured but
+	// liveness unknown.
+	KeepaliveUp   *bool
 	KeepaliveInfo string // human-readable keepalive status
 }
 
@@ -1162,7 +1168,7 @@ func (t *tunnelManager) keepaliveTick(tunnelName string, state *KeepaliveState, 
 	deadline := keepaliveProbeDeadline(state.Interval)
 	seq := nextSeq(state)
 	nonce := makeNonce()
-	result, kind := prober.Probe(state.SourceAddr, state.RemoteAddr, seq, nonce, deadline)
+	result, kind, reason := prober.Probe(state.SourceAddr, state.RemoteAddr, seq, nonce, deadline)
 
 	// ---- Step 1: classify + commit counters, compute intent ----
 	state.mu.Lock()
@@ -1185,8 +1191,14 @@ func (t *tunnelManager) keepaliveTick(tunnelName string, state *KeepaliveState, 
 	case ProbeUnsupported:
 		// Hold-on-unknown (§6 Axis C, C1): do NOT touch Failures,
 		// do NOT transition the link. Surface as unknown; escalate a
-		// sustained TRANSIENT unknown after MaxRetries ticks.
-		state.markUnknownLocked(tunnelName, kind, classifyErrnoString(kind))
+		// sustained TRANSIENT unknown after MaxRetries ticks. The prober's
+		// reason (real syscall/config detail) is recorded so the status and
+		// escalation log are actionable (Copilot PR #1947).
+		detail := reason
+		if detail == "" {
+			detail = classifyErrnoString(kind)
+		}
+		state.markUnknownLocked(tunnelName, kind, detail)
 	}
 	state.mu.Unlock()
 
@@ -1429,11 +1441,17 @@ func (t *tunnelManager) GetStatus() ([]TunnelStatus, error) {
 				// the operator why so they can fix the sysctl/caps. A
 				// sustained transient unknown carries the escalated errno.
 				ts.KeepaliveUp = nil
-				if ks.UnknownKind == UnsupportedTransient {
+				switch {
+				case ks.UnknownKind == UnsupportedTransient:
 					ts.KeepaliveInfo = fmt.Sprintf(
 						"unknown (%s; %d consecutive)",
 						ks.UnknownErrno, ks.unknownStreak)
-				} else {
+				case ks.UnknownErrno != "":
+					// Structural with a captured reason (the real syscall/config
+					// detail): show it so the operator can fix the root cause.
+					ts.KeepaliveInfo = fmt.Sprintf(
+						"unknown (ICMP probe unavailable: %s)", ks.UnknownErrno)
+				default:
 					ts.KeepaliveInfo = "unknown (ICMP probe unavailable)"
 				}
 			default:

@@ -2,6 +2,7 @@ package routing
 
 import (
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -27,20 +28,21 @@ type fakeProber struct {
 type probeOutcome struct {
 	result ProbeResult
 	kind   UnsupportedKind
+	reason string
 }
 
-func (p *fakeProber) Probe(source, dst string, seq int, nonce []byte, deadline time.Duration) (ProbeResult, UnsupportedKind) {
+func (p *fakeProber) Probe(source, dst string, seq int, nonce []byte, deadline time.Duration) (ProbeResult, UnsupportedKind, string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.calls++
 	p.lastSource = source
 	p.sources = append(p.sources, source)
 	if len(p.results) == 0 {
-		return ProbeAlive, UnsupportedNone
+		return ProbeAlive, UnsupportedNone, ""
 	}
 	o := p.results[p.idx%len(p.results)]
 	p.idx++
-	return o.result, o.kind
+	return o.result, o.kind, o.reason
 }
 
 // kaOps is a controllable linkOps for keepalive tick tests: it counts
@@ -145,7 +147,7 @@ func TestKeepaliveAliveStaysUp(t *testing.T) {
 	ops := newKaOps()
 	tm := &tunnelManager{ops: ops}
 	state, gen := newKAState(true, 3, 1)
-	prober := &fakeProber{results: []probeOutcome{{ProbeAlive, UnsupportedNone}}}
+	prober := &fakeProber{results: []probeOutcome{{result: ProbeAlive, kind: UnsupportedNone}}}
 
 	tickN(tm, "gr0", state, prober, gen, 0, 5)
 
@@ -165,7 +167,7 @@ func TestKeepaliveDeadGoesDownOnce(t *testing.T) {
 	ops := newKaOps()
 	tm := &tunnelManager{ops: ops}
 	state, gen := newKAState(true, 3, 1)
-	prober := &fakeProber{results: []probeOutcome{{ProbeDead, UnsupportedNone}}}
+	prober := &fakeProber{results: []probeOutcome{{result: ProbeDead, kind: UnsupportedNone}}}
 
 	// First two dead ticks: increment failures, no transition.
 	tickN(tm, "gr0", state, prober, gen, 0, 2)
@@ -198,13 +200,13 @@ func TestKeepaliveRecoversUpOnce(t *testing.T) {
 	ops := newKaOps()
 	tm := &tunnelManager{ops: ops}
 	state, gen := newKAState(true, 3, 1)
-	dead := &fakeProber{results: []probeOutcome{{ProbeDead, UnsupportedNone}}}
+	dead := &fakeProber{results: []probeOutcome{{result: ProbeDead, kind: UnsupportedNone}}}
 	tickN(tm, "gr0", state, dead, gen, 0, 3) // down
 	if state.Up || ops.downs() != 1 {
 		t.Fatalf("precondition: want down once; up=%v downs=%d", state.Up, ops.downs())
 	}
 
-	alive := &fakeProber{results: []probeOutcome{{ProbeAlive, UnsupportedNone}}}
+	alive := &fakeProber{results: []probeOutcome{{result: ProbeAlive, kind: UnsupportedNone}}}
 	tm.keepaliveTick("gr0", state, alive, gen, 0)
 	if ops.ups() != 1 {
 		t.Fatalf("expected exactly one LinkSetUp on recovery, got %d", ops.ups())
@@ -224,7 +226,7 @@ func TestKeepaliveStructuralUnsupportedHolds(t *testing.T) {
 	ops := newKaOps()
 	tm := &tunnelManager{ops: ops}
 	state, gen := newKAState(true, 3, 1)
-	prober := &fakeProber{results: []probeOutcome{{ProbeUnsupported, UnsupportedStructural}}}
+	prober := &fakeProber{results: []probeOutcome{{result: ProbeUnsupported, kind: UnsupportedStructural}}}
 
 	tickN(tm, "gr0", state, prober, gen, 0, 5)
 	if ops.ups() != 0 || ops.downs() != 0 {
@@ -246,7 +248,7 @@ func TestKeepaliveTransientUnsupportedEscalates(t *testing.T) {
 	ops := newKaOps()
 	tm := &tunnelManager{ops: ops}
 	state, gen := newKAState(true, 3, 1)
-	prober := &fakeProber{results: []probeOutcome{{ProbeUnsupported, UnsupportedTransient}}}
+	prober := &fakeProber{results: []probeOutcome{{result: ProbeUnsupported, kind: UnsupportedTransient}}}
 
 	tickN(tm, "gr0", state, prober, gen, 0, 4)
 	if ops.downs() != 0 {
@@ -266,7 +268,7 @@ func TestKeepaliveLinkByNameErrorNoLatch(t *testing.T) {
 	ops.byNameErr = errors.New("transient netlink error")
 	tm := &tunnelManager{ops: ops}
 	state, gen := newKAState(true, 3, 1)
-	prober := &fakeProber{results: []probeOutcome{{ProbeDead, UnsupportedNone}}}
+	prober := &fakeProber{results: []probeOutcome{{result: ProbeDead, kind: UnsupportedNone}}}
 
 	tickN(tm, "gr0", state, prober, gen, 0, 5)
 	// LinkByName keeps failing → no down committed, Up stays true.
@@ -299,7 +301,7 @@ func TestKeepaliveLinkSetDownErrorRetries(t *testing.T) {
 	ops.setDownErr = errors.New("netlink busy")
 	tm := &tunnelManager{ops: ops}
 	state, gen := newKAState(true, 3, 1)
-	prober := &fakeProber{results: []probeOutcome{{ProbeDead, UnsupportedNone}}}
+	prober := &fakeProber{results: []probeOutcome{{result: ProbeDead, kind: UnsupportedNone}}}
 
 	tickN(tm, "gr0", state, prober, gen, 0, 4)
 	// Down keeps erroring → Up must NOT be committed false.
@@ -328,7 +330,7 @@ func TestKeepaliveGenerationGuardDropsAction(t *testing.T) {
 	ops := newKaOps()
 	tm := &tunnelManager{ops: ops}
 	state, gen := newKAState(true, 1, 1) // MaxRetries=1 → dead immediately transitions
-	prober := &fakeProber{results: []probeOutcome{{ProbeDead, UnsupportedNone}}}
+	prober := &fakeProber{results: []probeOutcome{{result: ProbeDead, kind: UnsupportedNone}}}
 
 	startGen := gen.Load()
 	// Bump the generation (simulating Apply recreate) before the tick.
@@ -355,7 +357,7 @@ func TestKeepaliveStatusNotBlockedByNetlink(t *testing.T) {
 	tm.keepalives["gr0"] = &keepaliveRunner{state: state, remote: state.RemoteAddr}
 	tm.tunnels = []string{"gr0"}
 
-	prober := &fakeProber{results: []probeOutcome{{ProbeDead, UnsupportedNone}}}
+	prober := &fakeProber{results: []probeOutcome{{result: ProbeDead, kind: UnsupportedNone}}}
 
 	// Run a tick in a goroutine; it will park inside LinkSetDown.
 	go tm.keepaliveTick("gr0", state, prober, gen, 0)
@@ -386,7 +388,7 @@ func TestKeepaliveSourceBindAndMatches(t *testing.T) {
 	ops := newKaOps()
 	tm := &tunnelManager{ops: ops}
 	state, gen := newKAState(true, 3, 1)
-	prober := &fakeProber{results: []probeOutcome{{ProbeAlive, UnsupportedNone}}}
+	prober := &fakeProber{results: []probeOutcome{{result: ProbeAlive, kind: UnsupportedNone}}}
 	tm.keepaliveTick("gr0", state, prober, gen, 0)
 	if prober.lastSource != state.SourceAddr {
 		t.Fatalf("prober bind source = %q, want %q", prober.lastSource, state.SourceAddr)
@@ -445,6 +447,59 @@ func TestApplyTransientLookupKeepsRunner(t *testing.T) {
 	}
 	if gen.Load() != startGen {
 		t.Fatalf("transient lookup error must NOT bump the generation: %d -> %d", startGen, gen.Load())
+	}
+}
+
+// --- Copilot PR #1947: the prober reason (real syscall/config detail)
+// must propagate to KeepaliveInfo, not a generic label. ---
+func TestKeepaliveUnknownReasonSurfacedInStatus(t *testing.T) {
+	ops := newKaOps()
+	tm := &tunnelManager{ops: ops}
+	tm.ensureReconcileStateLocked()
+	state, gen := newKAState(true, 3, 1)
+	tm.keepalives["gr0"] = &keepaliveRunner{state: state, remote: state.RemoteAddr}
+	tm.tunnels = []string{"gr0"}
+
+	// A transient unsupported with a concrete reason.
+	prober := &fakeProber{results: []probeOutcome{{
+		result: ProbeUnsupported, kind: UnsupportedTransient,
+		reason: "listen udp4 198.51.100.1: too many open files",
+	}}}
+	tickN(tm, "gr0", state, prober, gen, 0, 4)
+
+	statuses, err := tm.GetStatus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var info string
+	var kaUp *bool
+	for _, s := range statuses {
+		if s.Name == "gr0" {
+			info = s.KeepaliveInfo
+			kaUp = s.KeepaliveUp
+		}
+	}
+	if kaUp != nil {
+		t.Fatalf("KeepaliveUp must be nil on unknown, got %v", *kaUp)
+	}
+	if !strings.Contains(info, "too many open files") {
+		t.Fatalf("status must carry the real probe reason, got %q", info)
+	}
+
+	// A structural unsupported with a reason → reason shown too.
+	state2, gen2 := newKAState(true, 3, 1)
+	tm.keepalives["gr1"] = &keepaliveRunner{state: state2, remote: state2.RemoteAddr}
+	tm.tunnels = append(tm.tunnels, "gr1")
+	prober2 := &fakeProber{results: []probeOutcome{{
+		result: ProbeUnsupported, kind: UnsupportedStructural,
+		reason: "listen udp4 198.51.100.99: cannot assign requested address",
+	}}}
+	tm.keepaliveTick("gr1", state2, prober2, gen2, 0)
+	statuses, _ = tm.GetStatus()
+	for _, s := range statuses {
+		if s.Name == "gr1" && !strings.Contains(s.KeepaliveInfo, "cannot assign requested address") {
+			t.Fatalf("structural status must carry the reason, got %q", s.KeepaliveInfo)
+		}
 	}
 }
 

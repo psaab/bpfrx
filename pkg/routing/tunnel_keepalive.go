@@ -66,8 +66,13 @@ const (
 // traffic (§5b — NO overlay-VRF bind). seq + nonce uniquely key the
 // reply to THIS probe (§5a — NOT the ICMP ID, which datagram sockets
 // rewrite to the socket source port).
+// The reason return is a short human-readable detail for a
+// ProbeUnsupported result (the actual syscall errno / config failure),
+// surfaced in KeepaliveInfo and the escalation log so the operator sees
+// WHY the probe could not run — not just a generic label (Copilot PR
+// #1947). Empty for Alive/Dead.
 type tunnelProber interface {
-	Probe(source, dst string, seq int, nonce []byte, deadline time.Duration) (ProbeResult, UnsupportedKind)
+	Probe(source, dst string, seq int, nonce []byte, deadline time.Duration) (result ProbeResult, kind UnsupportedKind, reason string)
 }
 
 // icmpProber is the production tunnelProber. It uses unprivileged
@@ -100,12 +105,12 @@ var listenICMP = func(network, source string) (probeConn, error) {
 }
 
 // Probe sends one ICMP echo to dst and reports the typed result.
-func (icmpProber) Probe(source, dst string, seq int, nonce []byte, deadline time.Duration) (ProbeResult, UnsupportedKind) {
+func (icmpProber) Probe(source, dst string, seq int, nonce []byte, deadline time.Duration) (ProbeResult, UnsupportedKind, string) {
 	ip := net.ParseIP(dst)
 	if ip == nil {
 		// A non-parseable destination is a configuration error, not a
 		// transient resource problem: hold-on-unknown structural.
-		return ProbeUnsupported, UnsupportedStructural
+		return ProbeUnsupported, UnsupportedStructural, "destination not an IP: " + dst
 	}
 
 	isIPv6 := ip.To4() == nil
@@ -135,7 +140,7 @@ func (icmpProber) Probe(source, dst string, seq int, nonce []byte, deadline time
 
 	conn, err := listenICMP(network, listen)
 	if err != nil {
-		return ProbeUnsupported, classifyListenErr(err)
+		return ProbeUnsupported, classifyListenErr(err), "listen " + network + " " + listen + ": " + err.Error()
 	}
 	defer conn.Close()
 
@@ -155,12 +160,12 @@ func (icmpProber) Probe(source, dst string, seq int, nonce []byte, deadline time
 	if err != nil {
 		// Marshal of a fixed-shape echo should never fail; treat a failure
 		// as a structural (non-flapping) unknown.
-		return ProbeUnsupported, UnsupportedStructural
+		return ProbeUnsupported, UnsupportedStructural, "echo marshal: " + err.Error()
 	}
 
 	abs := time.Now().Add(deadline)
 	if err := conn.SetReadDeadline(abs); err != nil {
-		return ProbeUnsupported, classifyListenErr(err)
+		return ProbeUnsupported, classifyListenErr(err), "set deadline: " + err.Error()
 	}
 	if _, err := conn.WriteTo(b, &net.UDPAddr{IP: ip}); err != nil {
 		// Classify a write error (Codex PR #1947 r1 HIGH). A path/route
@@ -171,9 +176,9 @@ func (icmpProber) Probe(source, dst string, seq int, nonce []byte, deadline time
 		// self-inflict a tunnel down. Route it through hold-on-unknown
 		// (transient) instead, mirroring the ListenPacket classifier.
 		if kind := classifyWriteErr(err); kind != UnsupportedNone {
-			return ProbeUnsupported, kind
+			return ProbeUnsupported, kind, "write echo: " + err.Error()
 		}
-		return ProbeDead, UnsupportedNone
+		return ProbeDead, UnsupportedNone, ""
 	}
 
 	reply := make([]byte, 1500)
@@ -181,12 +186,12 @@ func (icmpProber) Probe(source, dst string, seq int, nonce []byte, deadline time
 		// R4: re-check the absolute deadline each iteration so a datagram
 		// flood cannot extend a probe past its budget.
 		if remaining := time.Until(abs); remaining <= 0 {
-			return ProbeDead, UnsupportedNone
+			return ProbeDead, UnsupportedNone, ""
 		}
 		n, _, err := conn.ReadFrom(reply)
 		if err != nil {
 			// Deadline exceeded or read error → no matching reply → Dead.
-			return ProbeDead, UnsupportedNone
+			return ProbeDead, UnsupportedNone, ""
 		}
 		parsed, perr := icmp.ParseMessage(proto, reply[:n])
 		if perr != nil || parsed.Type != replyType {
@@ -199,7 +204,7 @@ func (icmpProber) Probe(source, dst string, seq int, nonce []byte, deadline time
 		// §5a authoritative match: Seq AND Data-nonce. ID is ignored
 		// (kernel-substituted on datagram sockets).
 		if echo.Seq == seq && bytesEqual(echo.Data, nonce) {
-			return ProbeAlive, UnsupportedNone
+			return ProbeAlive, UnsupportedNone, ""
 		}
 		// A stale/foreign reply (different probe) — keep reading until the
 		// deadline.
