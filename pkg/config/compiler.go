@@ -717,8 +717,13 @@ func ValidateConfig(cfg *Config) []string {
 			if u == nil || u.Name == "" || u.Name == "root" {
 				continue
 			}
+			// A usable password is a non-empty value that is neither a bare
+			// lock sentinel ("*"/"!"/"!!") NOR a locked-but-restorable form
+			// (any value beginning with "!", e.g. "!$6$salt$hash"). A
+			// leading "!" means the account cannot password-login until it
+			// is unlocked, so it does not count (Codex #1944 r1 Low).
 			pw := u.EncryptedPassword
-			usablePassword := pw != "" && pw != "*" && pw != "!" && pw != "!!"
+			usablePassword := pw != "" && pw != "*" && !strings.HasPrefix(pw, "!")
 			if len(u.SSHKeys) == 0 && !usablePassword {
 				warnings = append(warnings, fmt.Sprintf(
 					"login user %s has no usable authentication method: no "+

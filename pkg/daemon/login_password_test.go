@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // TestPasswordAction is the central #1944 safety-invariant table test
@@ -162,6 +164,64 @@ func TestCurrentShadowHashParse(t *testing.T) {
 	shadowPath = filepath.Join(dir, "does-not-exist")
 	if _, ok := currentShadowHash("op"); ok {
 		t.Error("currentShadowHash with missing file ok = true, want false")
+	}
+}
+
+// TestReconcileApplyBoundaryRevalidatesHash proves the defense-in-depth
+// re-validation in reconcileUserPassword (Codex #1944 r1 High #2): the
+// lenient Load/SyncApply ingress only downgrades a ValidateCryptHash
+// violation to a warning, so a persisted/synced plaintext value could
+// otherwise reach `chpasswd -e`. The apply boundary MUST re-check the hash
+// and skip the chpasswd exec for an invalid value, while still applying a
+// valid one. We detect whether chpasswd ran by shadowing it with a fake on
+// PATH that drops a sentinel file.
+func TestReconcileApplyBoundaryRevalidatesHash(t *testing.T) {
+	dir := t.TempDir()
+
+	// Temp /etc/shadow + /etc/passwd so passwordAction decides pwApply
+	// (op present with a DIFFERENT hash than desired) and lookupUID
+	// succeeds.
+	shadow := filepath.Join(dir, "shadow")
+	if err := os.WriteFile(shadow, []byte("op:$6$old$existinghash:19000:0:99999:7:::\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	passwd := filepath.Join(dir, "passwd")
+	if err := os.WriteFile(passwd, []byte("op:x:1001:1001:,,,:/home/op:/bin/bash\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldShadow, oldPasswd, oldDir := shadowPath, passwdPath, provisionedUsersDir
+	shadowPath = shadow
+	passwdPath = passwd
+	provisionedUsersDir = filepath.Join(dir, "provisioned-users")
+	t.Cleanup(func() { shadowPath, passwdPath, provisionedUsersDir = oldShadow, oldPasswd, oldDir })
+
+	// Fake chpasswd on PATH that records that it was invoked.
+	sentinel := filepath.Join(dir, "chpasswd-ran")
+	fakeBin := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\ntouch " + sentinel + "\ncat >/dev/null\n"
+	if err := os.WriteFile(filepath.Join(fakeBin, "chpasswd"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+":"+os.Getenv("PATH"))
+
+	d := &Daemon{}
+
+	// Invalid (plaintext) desired — guard must skip chpasswd entirely.
+	d.reconcileUserPassword(&config.LoginUser{Name: "op", EncryptedPassword: "password12345"})
+	if _, err := os.Stat(sentinel); err == nil {
+		t.Fatal("chpasswd ran for an INVALID (plaintext) hash — apply-boundary guard missing")
+	}
+	if _, err := os.Stat(markerPath("op")); err == nil {
+		t.Fatal("provenance marker written despite skipped apply")
+	}
+
+	// Valid hash — chpasswd must run.
+	d.reconcileUserPassword(&config.LoginUser{Name: "op", EncryptedPassword: "$6$newsalt$newhash"})
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatal("chpasswd did NOT run for a VALID hash — guard over-rejects")
 	}
 }
 

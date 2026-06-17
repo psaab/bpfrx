@@ -185,6 +185,14 @@ func TestLoginUserNoAuthMethodWarning(t *testing.T) {
 	}{
 		{"no auth at all", &LoginUser{Name: "op"}, true},
 		{"lock sentinel only", &LoginUser{Name: "op", EncryptedPassword: "!"}, true},
+		{"double-bang sentinel only", &LoginUser{Name: "op", EncryptedPassword: "!!"}, true},
+		{"star sentinel only", &LoginUser{Name: "op", EncryptedPassword: "*"}, true},
+		// locked-but-restorable hash: cannot password-login until
+		// unlocked, so it is NOT a usable auth method (Codex r1 Low).
+		{"locked-restorable hash no ssh", &LoginUser{Name: "op", EncryptedPassword: "!$6$salt$hash"}, true},
+		{"double-bang restorable hash no ssh", &LoginUser{Name: "op", EncryptedPassword: "!!$6$salt$hash"}, true},
+		// locked-restorable hash + ssh key: ssh path is usable, no warning.
+		{"locked-restorable hash with ssh", &LoginUser{Name: "op", EncryptedPassword: "!$6$salt$hash", SSHKeys: []string{"ssh-ed25519 AAAA"}}, false},
 		{"usable password", &LoginUser{Name: "op", EncryptedPassword: "$6$salt$hash"}, false},
 		{"ssh key only", &LoginUser{Name: "op", SSHKeys: []string{"ssh-ed25519 AAAA"}}, false},
 	}

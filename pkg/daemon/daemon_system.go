@@ -757,6 +757,24 @@ func (d *Daemon) reconcileUserPassword(user *config.LoginUser) {
 
 	switch passwordAction(cur, ok, desired) {
 	case pwApply:
+		// Defense-in-depth: re-validate the hash at the apply boundary
+		// before it reaches /etc/shadow. The strict operator commit gate
+		// (config.SchemaValidate → ValidateCryptHash) already rejects
+		// plaintext/DES/empty-checksum/':' values, BUT the lenient
+		// Load/SyncApply ingress (pkg/configstore/store.go
+		// compileTreeLenient, #1319 PR 2) only DOWNGRADES that violation
+		// to a warning so an older-binary persisted config or a synced
+		// peer value cannot brick boot. Without this guard, such a value
+		// would still be written to /etc/shadow verbatim — a plaintext
+		// password or a chpasswd-stdin-corrupting ':' (Codex #1944 r1
+		// High #2). Re-checking here makes "plaintext never reaches
+		// /etc/shadow" hold on EVERY path, while still not bricking boot
+		// (we skip+warn, leaving the existing shadow field untouched).
+		if err := config.ValidateCryptHash(desired, nil); err != nil {
+			slog.Warn("refusing to apply invalid login encrypted-password to /etc/shadow",
+				"user", user.Name, "err", err)
+			break
+		}
 		stdin := strings.NewReader(user.Name + ":" + desired + "\n")
 		if out, err := runCommandStdinTimeout(stdin, "chpasswd", "-e"); err != nil {
 			slog.Warn("failed to set user password",
