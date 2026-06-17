@@ -371,7 +371,8 @@ func (s *realKernelSystem) VerifyDataplane() (bool, error) {
 // but the strong gate is an operator-set dataplane BeaconTarget. A wired
 // ProbeFunc (the richest probe, when the caller has the dataplane manager) takes
 // precedence; otherwise this does a REAL reachability probe through the
-// dataplane: xpfd must be active AND a ping to BeaconTarget (default: the IPv4
+// dataplane: the dataplane daemon (xpfd OR xpfd-userspace-dp) must be active AND
+// a ping to BeaconTarget (default: the IPv4
 // default gateway) must succeed within the
 // deadline. A candidate kernel whose shim verified (Gate 3) but cannot forward
 // fails the ping -> revert. The gateway is the most universally-available
@@ -381,7 +382,8 @@ func (s *realKernelSystem) ForwardBeacon(deadline time.Duration) (bool, error) {
 	if s.ProbeFunc != nil {
 		return s.ProbeFunc(time.Now().Add(deadline))
 	}
-	// xpfd (the dataplane owner) must be up at all — a down daemon cannot
+	// the dataplane daemon (xpfd OR xpfd-userspace-dp) must be up at all — a
+	// down daemon cannot
 	// forward regardless of ping.
 	if runCmd("systemctl", "is-active", "xpfd") != nil &&
 		runCmd("systemctl", "is-active", "xpfd-userspace-dp") != nil {

@@ -413,8 +413,6 @@ func (r *KernelRunner) Promote() error {
 // to the known-good slot. The boot-LOOP is already closed by firmware (BootNext
 // was consumed), so the reboot lands on the known-good slot.
 func (r *KernelRunner) revert(j *KernelJournal, reason error) error {
-	sys := r.cfg.Sys
-
 	// Boot-attempt guard (r1 AGY catastrophic): if the journal cannot be
 	// CLEARED (e.g. read-only root after a kernel oops), a naive revert would
 	// loop forever — each boot re-reads ARMED, reverts, exits 3, reboots. Bound
@@ -430,50 +428,23 @@ func (r *KernelRunner) revert(j *KernelJournal, reason error) error {
 			"(avoid a read-only-root reboot loop) — staying up for operator recovery", err)
 		return fmt.Errorf("kernel-upgrade revert (journal unwritable, not rebooting): %v", reason)
 	}
+	// Restore the box to the safest reachable state (known-good BootOrder front
+	// + disarm watchdog + prune candidate) BEFORE deciding whether to reboot —
+	// so that EVEN the attempt-cap-exceeded "give up" path below leaves the box
+	// on the known-good default rather than abandoning it candidate-first
+	// (r2 Copilot: the cap path previously cleared the journal without
+	// restoring BootOrder).
+	r.restoreKnownGood(j)
+
 	if j.PromoteAttempts > maxPromoteAttempts {
 		r.logf("kernel-upgrade: REVERT but %d attempts exceeded cap %d; NOT rebooting again "+
-			"— staying up for operator recovery (firmware default is known-good)", j.PromoteAttempts, maxPromoteAttempts)
+			"— staying up for operator recovery (BootOrder restored to known-good)", j.PromoteAttempts, maxPromoteAttempts)
 		_ = r.clearKernelJournal()
 		return fmt.Errorf("kernel-upgrade revert (attempt cap exceeded, not rebooting): %v", reason)
 	}
 	r.logf("kernel-upgrade: REVERT (%v); candidate NOT promoted, rebooting to known-good (attempt %d/%d)",
 		reason, j.PromoteAttempts, maxPromoteAttempts)
 
-	// FORCE the known-good (active) slot back to the FRONT of BootOrder before
-	// rebooting (r1 Codex High): the common revert path relies on the firmware
-	// fallback (BootNext already consumed), but a crash in a PRIOR promote
-	// attempt could have left the candidate slot first in BootOrder with the
-	// journal still ARMED; a plain reboot would then re-enter the candidate.
-	// Restoring the active slot to the front makes the revert reboot
-	// deterministic regardless of how we got here. Best-effort: if BootOrder
-	// can't be read/written, the firmware-cleared BootNext is still the floor.
-	if entries, err := sys.BootEntries(); err == nil {
-		if activeID, ok := entries[j.ActiveSlot]; ok {
-			if err := sys.SetBootOrderFront(activeID); err != nil {
-				r.logf("kernel-upgrade: WARNING restore known-good BootOrder front on revert: %v", err)
-			}
-		} else {
-			r.logf("kernel-upgrade: WARNING active slot %s not in NVRAM on revert", j.ActiveSlot)
-		}
-	} else {
-		r.logf("kernel-upgrade: WARNING read boot entries on revert: %v", err)
-	}
-
-	// Disarm the watchdog on revert (r1 Copilot): Arm() armed it before the
-	// candidate reboot; if we do not disarm, a watchdog armed with a finite
-	// timeout could keep firing AFTER the fallback reboot and bounce the
-	// known-good boot. Best-effort (the firmware fallback is the floor).
-	if err := sys.DisarmWatchdog(); err != nil {
-		r.logf("kernel-upgrade: WARNING disarm watchdog on revert: %v", err)
-	}
-
-	// Prune the inactive slot's candidate staging + the un-promoted kernel
-	// pkg; reset the inactive selector back to the known-good kernel so a
-	// later boot of that slot is safe. Best-effort: a prune failure must not
-	// block the revert reboot (the firmware fallback is what matters).
-	if err := sys.PruneInactiveSlot(j.InactiveSlot, j.KnownGoodVersion, j.CandidateVersion); err != nil {
-		r.logf("kernel-upgrade: WARNING prune inactive slot on revert: %v", err)
-	}
 	_ = r.ktransition(j, KernelStateReverted)
 	// Clear the journal so the next boot is a clean ordinary boot.
 	_ = r.clearKernelJournal()
@@ -481,6 +452,34 @@ func (r *KernelRunner) revert(j *KernelJournal, reason error) error {
 	// known-good), distinct from an infra error (exit 1). reason is chained
 	// for the log/operator.
 	return fmt.Errorf("%w: %v", ErrKernelReverted, reason)
+}
+
+// restoreKnownGood puts the box in the safest reachable state: the known-good
+// (active) slot at the FRONT of BootOrder (so even if a prior crash left the
+// candidate first, a reboot lands on known-good — Codex High), the watchdog
+// disarmed (so an Arm()-armed watchdog can't bounce the known-good boot —
+// Copilot), and the un-promoted candidate pruned. All best-effort: the
+// firmware-cleared BootNext remains the floor regardless. Shared by revert()
+// (incl. the attempt-cap give-up path) and cleanupAlreadyOnKnownGood.
+func (r *KernelRunner) restoreKnownGood(j *KernelJournal) {
+	sys := r.cfg.Sys
+	if entries, err := sys.BootEntries(); err == nil {
+		if activeID, ok := entries[j.ActiveSlot]; ok {
+			if err := sys.SetBootOrderFront(activeID); err != nil {
+				r.logf("kernel-upgrade: WARNING restore known-good BootOrder front: %v", err)
+			}
+		} else {
+			r.logf("kernel-upgrade: WARNING active slot %s not in NVRAM", j.ActiveSlot)
+		}
+	} else {
+		r.logf("kernel-upgrade: WARNING read boot entries: %v", err)
+	}
+	if err := sys.DisarmWatchdog(); err != nil {
+		r.logf("kernel-upgrade: WARNING disarm watchdog: %v", err)
+	}
+	if err := sys.PruneInactiveSlot(j.InactiveSlot, j.KnownGoodVersion, j.CandidateVersion); err != nil {
+		r.logf("kernel-upgrade: WARNING prune inactive slot: %v", err)
+	}
 }
 
 // cleanupAlreadyOnKnownGood handles the case where the gate runs but the box is
@@ -494,21 +493,9 @@ func (r *KernelRunner) revert(j *KernelJournal, reason error) error {
 // on known-good and this same no-reboot path runs again.
 func (r *KernelRunner) cleanupAlreadyOnKnownGood(j *KernelJournal, why error) error {
 	r.logf("kernel-upgrade: already on a known-good slot (%v); cleaning up, NO reboot", why)
-	// Disarm the watchdog Arm() set before the (failed) candidate reboot, so it
-	// can't keep firing on the known-good boot (r1 Copilot).
-	if err := r.cfg.Sys.DisarmWatchdog(); err != nil {
-		r.logf("kernel-upgrade: WARNING disarm watchdog on known-good cleanup: %v", err)
-	}
-	if err := r.cfg.Sys.PruneInactiveSlot(j.InactiveSlot, j.KnownGoodVersion, j.CandidateVersion); err != nil {
-		r.logf("kernel-upgrade: WARNING prune on known-good cleanup: %v", err)
-	}
-	// Best-effort restore the known-good slot to the BootOrder front (in case a
-	// prior crash left the candidate first), then clear the journal.
-	if entries, err := r.cfg.Sys.BootEntries(); err == nil {
-		if activeID, ok := entries[j.ActiveSlot]; ok {
-			_ = r.cfg.Sys.SetBootOrderFront(activeID)
-		}
-	}
+	// Restore the safest reachable state (BootOrder known-good front + disarm
+	// watchdog + prune candidate), then clear the journal.
+	r.restoreKnownGood(j)
 	if err := r.clearKernelJournal(); err != nil {
 		r.logf("kernel-upgrade: WARNING could not clear journal on known-good cleanup: %v "+
 			"(non-fatal: next boot re-runs this no-reboot path)", err)
