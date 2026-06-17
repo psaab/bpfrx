@@ -317,7 +317,7 @@ func TestSystemConfigRootAuthAndArchival(t *testing.T) {
 	input := `
 system {
     root-authentication {
-        encrypted-password "$6$abc123";
+        encrypted-password "$6$saltsalt$abc123def456";
         ssh-ed25519 "ssh-ed25519 AAAA... user@host";
         ssh-rsa "ssh-rsa AAAA... user@host";
     }
@@ -355,8 +355,8 @@ system {
 	if ra == nil {
 		t.Fatal("root-authentication is nil")
 	}
-	if ra.EncryptedPassword != "$6$abc123" {
-		t.Errorf("encrypted-password = %q, want %q", ra.EncryptedPassword, "$6$abc123")
+	if ra.EncryptedPassword != "$6$saltsalt$abc123def456" {
+		t.Errorf("encrypted-password = %q, want %q", ra.EncryptedPassword, "$6$saltsalt$abc123def456")
 	}
 	if len(ra.SSHKeys) != 2 {
 		t.Fatalf("ssh keys count = %d, want 2", len(ra.SSHKeys))
@@ -724,7 +724,7 @@ system {
 }
 
 func TestSystemConfigSetSyntax(t *testing.T) {
-	cmds := []string{"set system root-authentication encrypted-password \"$6$abc\"", "set system root-authentication ssh-ed25519 \"ssh-ed25519 AAAA\"", "set system master-password pseudorandom-function juniper-prf1", "set system license autoupdate url https://example.com/keys", "set system processes utmd disable", "set system services web-management https system-generated-certificate", "set system services web-management https interface fxp0.0", "set system syslog user * any emergency", "set system syslog host 10.0.0.1 any any", "set system syslog host 10.0.0.1 daemon info"}
+	cmds := []string{"set system root-authentication encrypted-password \"$6$abcsalt$hashhash\"", "set system root-authentication ssh-ed25519 \"ssh-ed25519 AAAA\"", "set system master-password pseudorandom-function juniper-prf1", "set system license autoupdate url https://example.com/keys", "set system processes utmd disable", "set system services web-management https system-generated-certificate", "set system services web-management https interface fxp0.0", "set system syslog user * any emergency", "set system syslog host 10.0.0.1 any any", "set system syslog host 10.0.0.1 daemon info"}
 	tree := &ConfigTree{}
 	for _, cmd := range cmds {
 		path, err := ParseSetCommand(cmd)
@@ -742,7 +742,7 @@ func TestSystemConfigSetSyntax(t *testing.T) {
 	if cfg.System.RootAuthentication == nil {
 		t.Fatal("root-authentication is nil")
 	}
-	if cfg.System.RootAuthentication.EncryptedPassword != "$6$abc" {
+	if cfg.System.RootAuthentication.EncryptedPassword != "$6$abcsalt$hashhash" {
 		t.Errorf("encrypted-password = %q", cfg.System.RootAuthentication.EncryptedPassword)
 	}
 	if len(cfg.System.RootAuthentication.SSHKeys) != 1 {

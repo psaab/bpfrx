@@ -680,7 +680,23 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) {
 				continue
 			}
 			slog.Info("created system user", "user", user.Name, "uid", user.UID)
+			// Record provenance keyed by the account's actual UID so a
+			// later directive removal can lock THIS exact account (D2),
+			// while an out-of-band userdel+recreate with a different UID
+			// is left untouched (#1944 §5.4).
+			if uid, ok := lookupUID(user.Name); ok {
+				if err := markProvisioned(user.Name, uid); err != nil {
+					slog.Warn("failed to write provisioned-user marker",
+						"user", user.Name, "err", err)
+				}
+			}
 		}
+
+		// Apply / lock the login password (#1944). Mirrors applyRootAuth's
+		// `chpasswd -e` idiom; idempotent via a direct /etc/shadow read;
+		// D2-locks the account when the directive is removed but ONLY for
+		// the exact xpf-provisioned account (UID-keyed marker).
+		d.reconcileUserPassword(user)
 
 		// Grant sudo for super-user class
 		if user.Class == "super-user" {
@@ -718,6 +734,75 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) {
 				}
 				slog.Info("SSH keys updated", "user", user.Name, "keys", len(user.SSHKeys))
 			}
+		}
+	}
+}
+
+// reconcileUserPassword applies, leaves, or locks a login user's OS
+// password per the declarative #1944 lifecycle. It runs inside
+// applySystemLogin (under the apply lock, so there is no marker/shadow
+// race) and never touches root (excluded by the applySystemLogin loop).
+//
+//   - encrypted-password set → write it via `chpasswd -e` unless the
+//     on-disk shadow hash already equals it (idempotent); a successful
+//     apply (re)records the UID-keyed provenance marker.
+//   - encrypted-password absent → LOCK the account (Path D2) so removing
+//     the directive disables password login instead of orphaning a live
+//     credential — but only for the exact xpf-provisioned account (marker
+//     UID matches the current UID) and never on a shadow read error.
+func (d *Daemon) reconcileUserPassword(user *config.LoginUser) {
+	desired := user.EncryptedPassword
+	curUID, uidOK := lookupUID(user.Name)
+	cur, ok := currentShadowHash(user.Name)
+
+	switch passwordAction(cur, ok, desired) {
+	case pwApply:
+		// Defense-in-depth: re-validate the hash at the apply boundary
+		// before it reaches /etc/shadow. The strict operator commit gate
+		// (config.SchemaValidate → ValidateCryptHash) already rejects
+		// plaintext/DES/empty-checksum/':' values, BUT the lenient
+		// Load/SyncApply ingress (pkg/configstore/store.go
+		// compileTreeLenient, #1319 PR 2) only DOWNGRADES that violation
+		// to a warning so an older-binary persisted config or a synced
+		// peer value cannot brick boot. Without this guard, such a value
+		// would still be written to /etc/shadow verbatim — a plaintext
+		// password or a chpasswd-stdin-corrupting ':' (Codex #1944 r1
+		// High #2). Re-checking here makes "plaintext never reaches
+		// /etc/shadow" hold on EVERY path, while still not bricking boot
+		// (we skip+warn, leaving the existing shadow field untouched).
+		if err := config.ValidateCryptHash(desired, nil); err != nil {
+			slog.Warn("refusing to apply invalid login encrypted-password to /etc/shadow",
+				"user", user.Name, "err", err)
+			break
+		}
+		stdin := strings.NewReader(user.Name + ":" + desired + "\n")
+		if out, err := runCommandStdinTimeout(stdin, "chpasswd", "-e"); err != nil {
+			slog.Warn("failed to set user password",
+				"user", user.Name, "err", err, "output", strings.TrimSpace(string(out)))
+		} else {
+			// xpf now manages this exact account's password — mark it so a
+			// later directive removal locks it (covers a pre-existing or
+			// marker-wiped account, #1944 §5.4).
+			if uidOK {
+				if err := markProvisioned(user.Name, curUID); err != nil {
+					slog.Warn("failed to write provisioned-user marker",
+						"user", user.Name, "err", err)
+				}
+			}
+			slog.Info("user encrypted-password applied", "user", user.Name)
+		}
+	case pwLock:
+		// Only lock the exact account xpf provisioned (UID-keyed marker).
+		if !uidOK || !xpfProvisioned(user.Name, curUID) {
+			break
+		}
+		stdin := strings.NewReader(user.Name + ":!\n")
+		if out, err := runCommandStdinTimeout(stdin, "chpasswd", "-e"); err != nil {
+			slog.Warn("failed to lock user password",
+				"user", user.Name, "err", err, "output", strings.TrimSpace(string(out)))
+		} else {
+			slog.Info("user password locked (no encrypted-password in config)",
+				"user", user.Name)
 		}
 	}
 }
@@ -779,12 +864,27 @@ func (d *Daemon) applyRootAuth(cfg *config.Config) {
 
 	// Set root password from encrypted-password (crypt(3) hash)
 	if ra.EncryptedPassword != "" {
-		// Use chpasswd -e to set pre-hashed password
-		stdin := strings.NewReader("root:" + ra.EncryptedPassword + "\n")
-		if out, err := runCommandStdinTimeout(stdin, "chpasswd", "-e"); err != nil {
-			slog.Warn("failed to set root password", "err", err, "output", string(out))
+		// Defense-in-depth at the apply boundary, mirroring
+		// reconcileUserPassword (#1944 E1 shares ValidateCryptHash between
+		// root-auth and per-user auth). The strict operator-commit gate
+		// rejects plaintext/DES/empty-checksum/':' values, but the lenient
+		// Load/SyncApply ingress (pkg/configstore/store.go) only downgrades
+		// that to a warning, so a persisted/synced bad value would otherwise
+		// reach `chpasswd -e` verbatim — writing plaintext as root's password
+		// or corrupting the chpasswd stdin line via ':'. Re-check here and
+		// skip+warn so "plaintext never reaches /etc/shadow" holds for root
+		// on every path too, without bricking boot. SSH keys below are
+		// still applied regardless.
+		if err := config.ValidateCryptHash(ra.EncryptedPassword, nil); err != nil {
+			slog.Warn("refusing to apply invalid root encrypted-password to /etc/shadow", "err", err)
 		} else {
-			slog.Info("root encrypted-password applied")
+			// Use chpasswd -e to set pre-hashed password
+			stdin := strings.NewReader("root:" + ra.EncryptedPassword + "\n")
+			if out, err := runCommandStdinTimeout(stdin, "chpasswd", "-e"); err != nil {
+				slog.Warn("failed to set root password", "err", err, "output", string(out))
+			} else {
+				slog.Info("root encrypted-password applied")
+			}
 		}
 	}
 

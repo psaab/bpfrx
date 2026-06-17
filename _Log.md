@@ -24,6 +24,23 @@
   pkg/routing/tunnel_reconcile_test.go, pkg/routing/README.md,
   docs/wg-interop-runbook.md, _Log.md
 
+## 2026-06-17 — #1944 system login user encrypted-password (console login)
+
+- **Timestamp**: 2026-06-17
+- **Action**: Implement converged r5 plan — per-user
+  `authentication encrypted-password` reaches `/etc/shadow` via
+  `chpasswd -e`; shared `ValidateCryptHash` (rejects plaintext + DES,
+  accepts modular crypt + lock sentinels) wired to both per-user and
+  root-auth typed leaves; idempotent pure `passwordAction`; Path D2
+  lock-on-removal gated by a UID-keyed `/var/lib/xpf/provisioned-users`
+  marker; §5.8 no-usable-auth commit warning; docs/system-login.md.
+- **File(s)**: pkg/config/types_system.go, compiler_system.go,
+  schema_system.go, schema_validators.go, value_type.go, compiler.go,
+  pkg/daemon/login_password.go, daemon_system.go,
+  pkg/config/login_password_test.go,
+  pkg/daemon/login_password_test.go, parser_system_test.go,
+  docs/system-login.md, docs/feature-gaps.md
+
 ## 2026-06-17 — #1915 DHCP relay socket lifecycle (implement converged r4 plan)
 
 - **Timestamp**: 2026-06-17

@@ -17,7 +17,7 @@ For current userspace validation, use
 ### VM Setup (Incus)
 ```
 Host: Debian, kernel 6.18.5+deb14-amd64
-VM:   Debian 13, kernel 6.18.9 (from unstable repo)
+VM:   Ubuntu 26.04, stock kernel >= 6.18 (#1943; bake.py parity)
       8 vCPU, 4 GB RAM
 ```
 

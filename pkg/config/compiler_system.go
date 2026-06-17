@@ -95,6 +95,8 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 					case "authentication":
 						for _, authChild := range prop.Children {
 							switch authChild.Name() {
+							case "encrypted-password":
+								user.EncryptedPassword = nodeVal(authChild)
 							case "ssh-ed25519", "ssh-rsa", "ssh-dsa":
 								if v := nodeVal(authChild); v != "" {
 									user.SSHKeys = append(user.SSHKeys, v)

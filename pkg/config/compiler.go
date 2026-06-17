@@ -707,6 +707,34 @@ func ValidateConfig(cfg *Config) []string {
 				"this warning.")
 	}
 
+	// #1944 §5.8: warn when a configured login user has no usable auth
+	// method — no ssh-* keys AND no usable encrypted-password (absent, or
+	// a bare lock sentinel which only locks the account). Mirrors the
+	// root-auth warning style above; directly addresses the "non-root
+	// operator cannot log in" bug class this issue closes.
+	if cfg.System.Login != nil {
+		for _, u := range cfg.System.Login.Users {
+			if u == nil || u.Name == "" || u.Name == "root" {
+				continue
+			}
+			// A usable password is a non-empty value that is neither a bare
+			// lock sentinel ("*"/"!"/"!!") NOR a locked-but-restorable form
+			// (any value beginning with "!", e.g. "!$6$salt$hash"). A
+			// leading "!" means the account cannot password-login until it
+			// is unlocked, so it does not count (Codex #1944 r1 Low).
+			pw := u.EncryptedPassword
+			usablePassword := pw != "" && pw != "*" && !strings.HasPrefix(pw, "!")
+			if len(u.SSHKeys) == 0 && !usablePassword {
+				warnings = append(warnings, fmt.Sprintf(
+					"login user %s has no usable authentication method: no "+
+						"ssh keys and no encrypted-password (a bare lock "+
+						"sentinel does not count) — this account cannot log "+
+						"in. Set `authentication encrypted-password` (hash "+
+						"from `openssl passwd -6`) or an ssh key.", u.Name))
+			}
+		}
+	}
+
 	// Collect valid zone names
 	zones := make(map[string]bool)
 	for name := range cfg.Security.Zones {

@@ -29,10 +29,14 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 		"destination": {desc: "Destination network", args: 1, placeholder: "<network>", children: nil},
 	}},
 	"root-authentication": {desc: "Root authentication", children: map[string]*schemaNode{
-		"encrypted-password": {desc: "Encrypted password", args: 1, placeholder: "<password>", children: nil},
-		"ssh-ed25519":        {desc: "SSH ED25519 public key", args: 1, placeholder: "<key>", children: nil},
-		"ssh-rsa":            {desc: "SSH RSA public key", args: 1, placeholder: "<key>", children: nil},
-		"ssh-dsa":            {desc: "SSH DSA public key", args: 1, placeholder: "<key>", children: nil},
+		// #1944 E1: share ValidateCryptHash with per-user
+		// authentication so root's identical plaintext footgun is
+		// closed (one validator, one error message).
+		"encrypted-password": {desc: "Encrypted password", args: 1, placeholder: "<crypt-hash>",
+			valueType: ValueCryptHash, validator: ValidateCryptHash, children: nil},
+		"ssh-ed25519": {desc: "SSH ED25519 public key", args: 1, placeholder: "<key>", children: nil},
+		"ssh-rsa":     {desc: "SSH RSA public key", args: 1, placeholder: "<key>", children: nil},
+		"ssh-dsa":     {desc: "SSH DSA public key", args: 1, placeholder: "<key>", children: nil},
 	}},
 	"archival": {desc: "Configuration archival", children: map[string]*schemaNode{
 		"configuration": {desc: "Configuration archival", children: map[string]*schemaNode{
@@ -65,9 +69,18 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 	}},
 	"login": {desc: "Login configuration", children: map[string]*schemaNode{
 		"user": {desc: "User name", args: 1, placeholder: "<username>", children: map[string]*schemaNode{
-			"uid":            {desc: "User ID", args: 1, placeholder: "<uid>", children: nil},
-			"class":          {desc: "Login class", args: 1, placeholder: "<class>", children: nil},
-			"authentication": {desc: "Authentication methods", children: nil},
+			"uid":   {desc: "User ID", args: 1, placeholder: "<uid>", children: nil},
+			"class": {desc: "Login class", args: 1, placeholder: "<class>", children: nil},
+			// #1944: close the schema asymmetry the compiler already
+			// half-implemented — give `authentication` a value-bearing
+			// children map (encrypted-password typed leaf + ssh-* keys).
+			"authentication": {desc: "Authentication methods", children: map[string]*schemaNode{
+				"encrypted-password": {desc: "Encrypted password", args: 1, placeholder: "<crypt-hash>",
+					valueType: ValueCryptHash, validator: ValidateCryptHash, children: nil},
+				"ssh-ed25519": {desc: "SSH ED25519 public key", args: 1, placeholder: "<key>", children: nil},
+				"ssh-rsa":     {desc: "SSH RSA public key", args: 1, placeholder: "<key>", children: nil},
+				"ssh-dsa":     {desc: "SSH DSA public key", args: 1, placeholder: "<key>", children: nil},
+			}},
 		}},
 	}},
 	"dataplane-type": {desc: "Dataplane type", args: 1, placeholder: "<type>", children: nil},

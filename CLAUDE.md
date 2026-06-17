@@ -66,7 +66,7 @@ make test            # Run Go tests
 ## Test Environment (Incus VM)
 ```bash
 make test-env-init   # One-time: install incus, create networks + profiles
-make test-vm         # Create Debian 13 VM with FRR, strongSwan
+make test-vm         # Create Ubuntu 26.04 VM with FRR, strongSwan
 make test-deploy     # Build -> push binary + config + unit -> systemctl enable --now
 make test-ssh        # Shell into VM
 make test-status     # Instance + service + network info
@@ -79,6 +79,18 @@ make test-destroy    # Tear down VM
 ```
 
 If `incus` commands fail with permission errors, use `sg incus-admin -c "make ..."`.
+
+**Ubuntu 26.04 parity (#1943):** the test VM uses `images:ubuntu/26.04/cloud`
+to match the production appliance base (`scripts/image/bake.py`). Pin a
+different Ubuntu release with `XPF_BASE_RELEASE=<rel> make test-vm` (the test VM
+tracks whatever release production was last baked at — a deliberate, reviewed
+bump, not auto-latest). The `xpf-vm` profile sets `security.secureboot: "true"`
+so shim->grub->kernel + AF_XDP-shim-under-Secure-Boot is the default posture.
+A vanilla Secure-Boot VM does NOT exercise the #1930 A4 kernel promote/rollback
+channel — that needs the baked qcow2 (the `xpf-uefi-slots`/`09_xpf` A/B-ESP
+substrate lives only in `bake.py` output). Rollback to Debian is `git revert`,
+not a runtime `IMAGE_VM` override (the scripts now use Ubuntu package names + a
+>= 6.18 kernel floor).
 
 ## Cluster Test Environment (Two-VM HA)
 
