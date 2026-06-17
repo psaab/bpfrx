@@ -1478,6 +1478,22 @@ func (s *Store) ActiveConfig() *config.Config {
 	return s.compiled
 }
 
+// CompileCandidate strictly compiles the current candidate WITHOUT mutating
+// any store state (no promote, no persist, no confirm-timer). It is the
+// read-only pre-commit hook the daemon's #1956 device-map commit pre-flight
+// uses to resolve the proposed map against live hardware BEFORE the store
+// promotes it — so a map that would strand management on next boot is
+// rejected while the operator is still connected, not at the next reboot.
+// Returns the same compiled config Commit() would, or the commit-check error.
+func (s *Store) CompileCandidate() (*config.Config, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.candidate == nil {
+		return nil, fmt.Errorf("not in configuration mode")
+	}
+	return s.compileTree(s.candidate)
+}
+
 // EverCommitted reports the #1922 step-0 marker: true once a config has
 // been successfully committed or synced to this store, or loaded from a
 // committed/legacy DB (migration rule C3 defaults a marker-less DB to

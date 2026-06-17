@@ -401,6 +401,197 @@ func writeDeviceMapLinkFile(target, originalName string, rethMembers map[string]
 	return writeLinkFile(target, originalName)
 }
 
+// deviceMapStrandsManagement reports whether applying cfg's device-map would,
+// on next boot, leave the #1922 management/lifeline NIC unbound or rebound to
+// a different port — i.e. strand the operator. It resolves the LOCAL node's
+// device-map against the present hardware (nics) and checks the protected set
+// (lifeline record + management leaf). Returns a non-empty reason when it
+// would strand, "" when safe. A nil/empty device-map is always safe (the
+// #1922 protected set is the independent backstop; positional mode is
+// unchanged). Pure given the NIC inventory + protected set, so it is unit
+// testable.
+func deviceMapStrandsManagement(cfg *config.Config, nics []presentNIC, protected map[string]bool) string {
+	if cfg == nil {
+		return ""
+	}
+	dm := cfg.Chassis.DeviceMap
+	if !dm.Active() {
+		// Positional mode: the protected set shields management; never
+		// stranded by a device-map (there is none).
+		return ""
+	}
+	bindings := resolveDeviceMap(dm.Entries, nics, rethMembersFromConfig(cfg))
+
+	// Map current kernel name -> its resolved final logical name.
+	finalByCurrent := make(map[string]string)
+	for _, b := range bindings {
+		// A REFUSED binding on ANY entry is a hard stop: a card was swapped
+		// at a pinned slot, so the operator's intent no longer matches the
+		// hardware — refuse the commit while they are still connected.
+		if b.status == bindRefusedAmbig {
+			return fmt.Sprintf("device-map entry %q refuses to bind: a different card is present "+
+				"at its pinned identity (topology changed). Re-pin the entry before committing.",
+				b.entry.LogicalName)
+		}
+		if b.currentNIC != "" {
+			finalByCurrent[b.currentNIC] = b.logical
+		}
+	}
+
+	// For each protected (management/lifeline) NIC currently present: if it
+	// would be renamed to a logical name by this map, that is fine (the
+	// operator deliberately mapped it). The dangerous case is a protected
+	// NIC that is NOT mapped while unmapped-policy is manage-down — but the
+	// protected set is config-independent and the reconcile already exempts
+	// it, so it is never downed. The genuine lockout we CAN detect here is a
+	// device-map that maps the mgmt NIC's logical name to a DIFFERENT
+	// physical NIC than the one currently carrying management (a port swap).
+	for prot := range protected {
+		if prot == "" {
+			continue
+		}
+		// Find the present NIC currently named `prot` (the live mgmt NIC).
+		var liveMgmt *presentNIC
+		for i := range nics {
+			if nics[i].name == prot {
+				liveMgmt = &nics[i]
+				break
+			}
+		}
+		if liveMgmt == nil {
+			continue // protected name not currently a present NIC
+		}
+		// If some OTHER physical NIC is mapped to this protected logical
+		// name, the live mgmt NIC would lose its name on next boot.
+		if final, ok := finalByCurrent[liveMgmt.name]; ok && final != prot {
+			return fmt.Sprintf("device-map would rename the live management NIC %q to %q on next "+
+				"boot, moving management off it. Map the management NIC to its own name, or "+
+				"adjust the map before committing.", prot, final)
+		}
+	}
+	return ""
+}
+
+// deviceMapCommitPreflight is the #1956 R-8/V-3 node-local commit pre-flight.
+// It resolves the candidate's LOCAL device-map (and, for commit-confirmed,
+// the rollback target) against present hardware and rejects a commit that
+// would strand management on next boot — converting a latent reboot-time
+// lockout into a commit-time error while the operator is still connected.
+// rollbackTarget is the config that would be restored on a confirmed-commit
+// timeout (the currently-active config); pass nil for a plain commit.
+func (d *Daemon) deviceMapCommitPreflight(candidate, rollbackTarget *config.Config) error {
+	// Fast path: neither config engages device-map mode — nothing to check.
+	candActive := candidate != nil && candidate.Chassis.DeviceMap.Active()
+	rbActive := rollbackTarget != nil && rollbackTarget.Chassis.DeviceMap.Active()
+	if !candActive && !rbActive {
+		return nil
+	}
+	nics, err := enumeratePresentNICs()
+	if err != nil {
+		// Cannot enumerate hardware — do not block the commit on a
+		// transient sysfs error; the #1922 lifeline is the backstop.
+		slog.Warn("device-map pre-flight: NIC enumeration failed; skipping (lifeline still protects mgmt)", "err", err)
+		return nil
+	}
+	protected := d.resolveProtectedInterfaces()
+
+	if reason := deviceMapStrandsManagement(candidate, nics, protected); reason != "" {
+		return fmt.Errorf("device-map commit rejected: %s", reason)
+	}
+	// V-3(a): validate the rollback target too, so a confirmed-commit
+	// timeout reverts to a KNOWN-safe config and can be applied
+	// unconditionally (OQ-15.2 — no rollback-time abort, no split-brain).
+	if rollbackTarget != nil {
+		if reason := deviceMapStrandsManagement(rollbackTarget, nics, protected); reason != "" {
+			return fmt.Errorf("commit confirmed rejected: the rollback target (current active "+
+				"config, restored on timeout) would strand management: %s", reason)
+		}
+	}
+	return nil
+}
+
+// teardownUnmappedManaged is the #1956 V-4 managed->unmapped teardown,
+// ordered to run BEFORE networkd.Apply on the live apply path. It is the
+// single authority for the leave-alone transition: a NIC that xpf PREVIOUSLY
+// managed (has a 10-xpf-<name>.link on disk) but whose name is no longer a
+// desired binding is renamed back to its host-predictable name and its xpf
+// .link/.network removed — so by the time networkd.Apply's stale-file sweep
+// runs, that interface is already absent from BOTH the desired set and the
+// on-disk xpf set and Apply has nothing to half-clean (which would otherwise
+// un-rename it).
+//
+// The "previously managed" source of truth is the 10-xpf-*.link glob (the
+// durable record of what xpf renamed), NOT the now-absent config. It runs
+// only in device-map mode with leave-alone; manage-down keeps today's
+// claim-all teardown via the compiler reconcile. It is no-op idempotent:
+// when nothing transitioned, it touches nothing (operator priority #1 —
+// zero churn on an unrelated commit).
+func teardownUnmappedManaged(dm *config.DeviceMapConfig) {
+	if !dm.Active() || dm.EffectiveUnmappedPolicy() != config.DeviceMapPolicyLeaveAlone {
+		return
+	}
+	desiredNames := make(map[string]bool)
+	for _, e := range dm.Entries {
+		desiredNames[config.LinuxIfName(e.LogicalName)] = true
+	}
+
+	entries, err := os.ReadDir(linkDir)
+	if err != nil {
+		return
+	}
+	reloaded := false
+	for _, fe := range entries {
+		fname := fe.Name()
+		if !strings.HasPrefix(fname, linkPrefix) || !strings.HasSuffix(fname, ".link") {
+			continue
+		}
+		target := strings.TrimSuffix(strings.TrimPrefix(fname, linkPrefix), ".link")
+		if desiredNames[target] {
+			continue // still managed — leave it
+		}
+		// A previously-managed NIC is no longer mapped. Find the live device
+		// currently wearing this xpf name and restore it.
+		if link, err := netlink.LinkByName(target); err == nil {
+			nic := presentNIC{name: target}
+			if devReal, err := filepath.EvalSymlinks(
+				filepath.Join("/sys/class/net", target, "device")); err == nil {
+				nic.pciAddr = extractPCIAddr(devReal)
+			}
+			predictable := predictableName(nic)
+			if predictable != "" && predictable != target {
+				if err := renameInterface(target, predictable); err == nil {
+					slog.Info("device-map teardown: restored unmapped NIC to predictable name",
+						"from", target, "to", predictable)
+					reloaded = true
+				} else {
+					slog.Warn("device-map teardown: rename-back failed; leaving device under xpf "+
+						"name but dropping management", "name", target, "err", err)
+				}
+			} else {
+				slog.Warn("device-map teardown: no predictable name for unmapped NIC; dropping "+
+					"xpf management without renaming", "name", target)
+			}
+			_ = link
+		}
+		// Remove the stale .link and any matching .network regardless of the
+		// rename outcome — xpf stops managing this NIC.
+		if err := os.Remove(filepath.Join(linkDir, fname)); err == nil {
+			reloaded = true
+			slog.Info("device-map teardown: removed stale .link", "file", fname)
+		}
+		netFile := linkPrefix + target + ".network"
+		if err := os.Remove(filepath.Join(linkDir, netFile)); err == nil {
+			reloaded = true
+			slog.Info("device-map teardown: removed stale .network", "file", netFile)
+		}
+	}
+	if reloaded {
+		if err := networkctlReload(); err != nil {
+			slog.Warn("device-map teardown: networkctl reload failed", "err", err)
+		}
+	}
+}
+
 // predictableNameLookup is the udev predictable-name resolver, injectable
 // for tests (the real one shells out to `udevadm`, unavailable in the unit
 // sandbox). It maps a present NIC (currently wearing a temp name) to the

@@ -133,6 +133,15 @@ func (d *Daemon) commitAndApply(ctx context.Context, comment string, syncPeer bo
 			"system rolls back automatically unless you confirm it from a still-reachable session)")
 	}
 
+	// #1956 R-8 device-map pre-flight: reject a candidate whose device-map
+	// would strand management on next boot, while the operator is still
+	// connected. Plain commit has no auto-rollback target, so pass nil.
+	if cand, err := d.store.CompileCandidate(); err == nil {
+		if err := d.deviceMapCommitPreflight(cand, nil); err != nil {
+			return nil, err
+		}
+	}
+
 	if err := d.applySem.Acquire(ctx, 1); err != nil {
 		return nil, err
 	}
@@ -176,13 +185,58 @@ func (d *Daemon) syncAndApply(ctx context.Context, configText string, chassisPre
 		if err := d.applyConfigLocked(compiled); err != nil {
 			return nil, err
 		}
+		// #1956 V-1 passive-node device-map admission gate (OQ-15.1 option
+		// (a): passive gate + loud health alarm). The active node's strict
+		// commit can only validate ITS OWN hardware (R-8), so a synced
+		// config whose LOCAL device-map section would strand THIS node's
+		// management on next boot must be surfaced loudly here. We do NOT
+		// strip/modify the synced delta (that creates the config-divergence
+		// overwrite loop AGY flagged); the stores stay identical and the
+		// #1922 lifeline keeps mgmt reachable at runtime. The alarm is the
+		// operator's signal that the peer-pushed map needs fixing before a
+		// reboot. (Option (b), distributed pre-commit validation, is the
+		// documented end-state follow-up.)
+		d.deviceMapPassiveAdmissionAlarm(compiled)
 	}
 	return compiled, nil
+}
+
+// deviceMapPassiveAdmissionAlarm raises a loud, never-silent HA-health alarm
+// when a peer-synced config's LOCAL device-map would strand this node's
+// management on next boot. Stores are NOT modified (no divergence loop) — the
+// alarm + the #1922 lifeline are the safety net. See syncAndApply.
+func (d *Daemon) deviceMapPassiveAdmissionAlarm(synced *config.Config) {
+	if synced == nil || !synced.Chassis.DeviceMap.Active() {
+		return
+	}
+	nics, err := enumeratePresentNICs()
+	if err != nil {
+		return
+	}
+	if reason := deviceMapStrandsManagement(synced, nics, d.resolveProtectedInterfaces()); reason != "" {
+		slog.Error("HA CONFIG-SYNC ALARM: the peer-pushed device-map would STRAND this node's "+
+			"management on next boot. The config is applied (stores stay consistent) and the "+
+			"management lifeline keeps the box reachable now, but a reboot would lock this node "+
+			"out. Fix the device-map on the primary and re-sync BEFORE rebooting this node.",
+			"reason", reason)
+	}
 }
 
 // commitConfirmedAndApply is the commit-confirmed analogue of
 // commitAndApply. Same atomicity guarantees.
 func (d *Daemon) commitConfirmedAndApply(ctx context.Context, minutes int, syncPeer bool) (*config.Config, error) {
+	// #1956 R-8/V-3 device-map pre-flight: validate BOTH the candidate AND
+	// the rollback target (the currently-active config, restored on a
+	// confirmed-commit timeout) against present hardware. If EITHER would
+	// strand management on next boot, reject while the operator is still
+	// connected — so when a timeout fires the target is KNOWN-safe and is
+	// applied UNCONDITIONALLY (OQ-15.2, no rollback-time abort).
+	if cand, err := d.store.CompileCandidate(); err == nil {
+		if err := d.deviceMapCommitPreflight(cand, d.store.ActiveConfig()); err != nil {
+			return nil, err
+		}
+	}
+
 	if err := d.applySem.Acquire(ctx, 1); err != nil {
 		return nil, err
 	}
@@ -244,6 +298,13 @@ func (d *Daemon) executeConfirmedRollback(gen uint64) {
 		d.enterBootstrapMode()
 		return
 	}
+	// #1956 V-3/OQ-15.2: the non-nil rollback target is applied
+	// UNCONDITIONALLY here — never aborted for device-map safety. Its
+	// device-map safety was validated at commit-confirmed time (the R-8
+	// pre-flight checks BOTH candidate and rollback target), so by the time
+	// this fires the target is KNOWN-safe. Aborting here would diverge the
+	// already-promoted store from the running dataplane (split-brain), which
+	// is strictly worse than applying a validated target.
 	if err := d.applyConfigLocked(prevCfg); err != nil {
 		slog.Error("commit confirmed auto-rollback dataplane apply failed", "err", err)
 	}
@@ -619,6 +680,14 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 	// 2.2. Build zone→RG map for per-RG session sync.
 	if d.sessionSync != nil && applyResult != nil {
 		d.sessionSync.SetZoneRGMap(buildZoneRGMap(cfg, applyResult.ZoneIDs))
+	}
+
+	// 2.45. #1956 V-4: managed->unmapped teardown MUST run BEFORE
+	// networkd.Apply so its stale-file sweep has nothing to half-clean.
+	// No-op idempotent when nothing transitioned (zero churn on an
+	// unrelated commit).
+	if cfg.Chassis.DeviceMap.Active() {
+		teardownUnmappedManaged(cfg.Chassis.DeviceMap)
 	}
 
 	// 2.5. Write systemd-networkd config for managed interfaces
