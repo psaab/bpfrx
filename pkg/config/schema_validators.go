@@ -420,10 +420,18 @@ func ValidateCryptHash(raw string, _ *Config) error {
 		return fmt.Errorf("empty checksum in crypt hash %q — a trailing $ "+
 			"with no checksum writes a malformed shadow field", raw)
 	}
-	// Every salt/param/checksum field must use only the crypt alphabet
-	// (which excludes ':' and whitespace), so the value can never corrupt
-	// the chpasswd `user:hash` stdin line or smuggle a separator.
+	// Every salt/param/checksum field must be NON-EMPTY and use only the
+	// crypt alphabet (which excludes ':' and whitespace), so the value can
+	// never corrupt the chpasswd `user:hash` stdin line or smuggle a
+	// separator. An empty intermediate field (e.g. "$6$salt$$hash", a
+	// doubled '$') is not a valid modular crypt hash — it would pass an
+	// alphabet-only check (no chars to reject) but fail at PAM, locking the
+	// operator out. Reject it at commit (Copilot #1944 review).
 	for _, f := range fields[2:] {
+		if f == "" {
+			return fmt.Errorf("empty field in crypt hash %q — a doubled "+
+				"'$' (e.g. $6$salt$$hash) is malformed", raw)
+		}
 		for _, r := range f {
 			if !cryptFieldRune(r) {
 				return fmt.Errorf("invalid character %q in crypt hash %q", r, raw)

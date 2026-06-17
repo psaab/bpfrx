@@ -69,3 +69,30 @@ skips+warns on failure (SSH keys still applied). New test
 `TestRootAuthApplyBoundaryRevalidatesHash`. No-regression: per-user path,
 inline-form-compiles-to-"", and the no-auth warning all still verified by
 Codex r2.
+
+## Round 3 — FINAL (head 8cfdacf68 → +copilot-fix)
+
+| Reviewer | Task / ID | Round | Verdict |
+|----------|-----------|-------|---------|
+| Codex    | foreground (/tmp/codex-1944-r3-out.txt) | r3 | **MERGE-READY** |
+| AGY      | adversarial-review-mqhvqwzm-ubulh5 | r3 | **MERGE-READY** |
+| Claude SMR | in-conversation | r3 | **MERGE-READY** |
+| Copilot  | PR #1949 (reviews @ 09:37) | r2 | findings fixed → re-requested |
+
+Codex r3: no findings — r2 root-auth High closed; confirmed NO unvalidated
+value reaches `chpasswd -e` on any production path (per-user apply
+validates `desired`; per-user lock sends constant `!`; root apply
+validates `ra.EncryptedPassword`; no other chpasswd sites). All three
+invariants reconfirmed.
+
+AGY r3: MERGE-READY — independently reconfirmed lock-on-removal (locks /
+never-orphans / never-on-read-error / UID-keyed), the apply-boundary guard
+on all three chpasswd inputs, and empty-passwordless-shadow → D2 lock.
+
+Copilot (formal, 2 comments on the head): `ValidateCryptHash` accepted an
+empty INTERMEDIATE `$`-field (`$6$salt$$hash`, doubled `$`) — passes the
+alphabet-only check (no chars) but is malformed and fails at PAM. FIXED:
+reject any empty field in `fields[2:]`; added `$6$salt$$hash` and
+`$6$$$hash` to the TestValidateCryptHash reject table.
+
+All four reviewers clean / addressed on the final revision.

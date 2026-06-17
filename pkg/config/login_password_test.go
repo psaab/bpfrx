@@ -46,6 +46,8 @@ func TestValidateCryptHash(t *testing.T) {
 		"$6$salt$ab cd",  // space
 		"$6$salt$ab\tcd", // tab control char
 		"$6salt$hash",    // missing $ after id
+		"$6$salt$$hash",  // empty intermediate field / doubled $ (Copilot review)
+		"$6$$$hash",      // empty salt AND empty param
 	}
 	for _, in := range reject {
 		if err := ValidateCryptHash(in, nil); err == nil {
