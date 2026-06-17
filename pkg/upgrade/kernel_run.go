@@ -501,6 +501,16 @@ func (r *KernelRunner) restoreKnownGood(j *KernelJournal) {
 	if err := sys.PruneInactiveSlot(j.InactiveSlot, j.KnownGoodVersion, j.CandidateVersion); err != nil {
 		r.logf("kernel-upgrade: WARNING prune inactive slot: %v", err)
 	}
+	// Clear the durable promotion marker (r2 AGY #6: a reverted node must not
+	// retain a "promoted" marker from a prior same-version roll) and the local
+	// kernel-roll lease (r2 AGY #5: a stranded lease would suppress this node's
+	// self-recovery for the full TTL after the dead roll). Both best-effort.
+	if err := sys.ClearPromotionMarker(); err != nil {
+		r.logf("kernel-upgrade: WARNING clear promotion marker on restore: %v", err)
+	}
+	if err := sys.ClearRollLease(); err != nil {
+		r.logf("kernel-upgrade: WARNING clear roll lease on restore: %v", err)
+	}
 }
 
 // cleanupAlreadyOnKnownGood handles the case where the gate runs but the box is

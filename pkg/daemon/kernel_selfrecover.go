@@ -18,6 +18,44 @@ func (a kernelSRCluster) LocalDrained() (bool, error)       { return a.m.LocalDr
 func (a kernelSRCluster) PeerHealthyPrimary() (bool, error) { return a.m.PeerHealthyPrimary(), nil }
 func (a kernelSRCluster) ResetFailover() error              { return a.m.ResetAllFailover() }
 
+// drainIfKernelCandidateArmed keeps a CANDIDATE-TRIAL boot DRAINED until the
+// promotion gate verifies the dataplane (r2 AGY Critical). ManualFailover is
+// in-memory in the cluster Manager and is lost across the reboot, so a candidate
+// node boots election-eligible and — under preempt — could claim primary BEFORE
+// xpf-kernel-promote.service has run verify-dataplane + the forward beacon. If
+// the candidate's shim is verifier-rejected, that would blackhole cluster
+// traffic. So: at startup, if the kernel journal shows an ARMED candidate (this
+// IS the trial boot), ForceSecondary so the node stays secondary until promote
+// (on PASS the orchestrator's `rejoin` / the promote path restores it; on a
+// REVERT the node reboots to known-good anyway). No-op on an ordinary boot.
+func (d *Daemon) drainIfKernelCandidateArmed(ctx context.Context) {
+	if d.cluster == nil {
+		return
+	}
+	r, err := upgrade.NewKernelRunner(upgrade.KernelConfig{Sys: upgrade.NewKernelSystem()})
+	if err != nil {
+		return
+	}
+	armed, j, err := r.IsArmed()
+	if err != nil || !armed {
+		return
+	}
+	// Only hold-secondary if the peer can actually take over; otherwise forcing
+	// secondary would strand traffic (no primary). If the peer is not ready we
+	// leave election to run — the promote gate still reverts a bad candidate.
+	if !d.cluster.PeerHealthyPrimary() {
+		slog.Warn("kernel-candidate boot: peer not a healthy primary; "+
+			"NOT holding secondary (promote gate still guards)", "candidate", j.CandidateVersion)
+		return
+	}
+	if err := d.cluster.ForceSecondary(); err != nil {
+		slog.Warn("kernel-candidate boot: could not hold secondary", "err", err)
+		return
+	}
+	slog.Info("kernel-candidate boot: holding SECONDARY until promotion verifies the dataplane",
+		"candidate", j.CandidateVersion)
+}
+
 // startKernelSelfRecovery runs the bounded local self-recovery loop for the
 // LANE-1 HA kernel channel (#1930 INC-2). If the external orchestrator crashes
 // while this node is drained+rebooting for a kernel roll, the node would come

@@ -440,6 +440,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// Watch cluster events for state transitions (primary/secondary).
 		go d.watchClusterEvents(ctx)
 
+		// #1930 INC-2: if THIS boot is a kernel-candidate trial (the kernel
+		// journal is ARMED), hold SECONDARY until the promotion gate verifies the
+		// dataplane — so an unverified candidate can't preempt the healthy peer
+		// and blackhole traffic (ManualFailover is in-memory, lost across the
+		// reboot). No-op on an ordinary boot.
+		d.drainIfKernelCandidateArmed(ctx)
+
 		// #1930 INC-2: bounded local self-recovery for the LANE-1 HA kernel
 		// channel — auto-rejoin if an external kernel-roll orchestrator crashed
 		// while this node was drained+rebooting (no-op unless orphaned-drained).

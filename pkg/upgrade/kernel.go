@@ -216,6 +216,10 @@ type KernelSystem interface {
 	// successful roll to the SAME version) cannot false-satisfy the external
 	// orchestrator's post-reboot version-check for THIS roll (r1 Codex High).
 	ClearPromotionMarker() error
+	// ClearRollLease removes the local kernel-roll lease. Called on a REVERT so
+	// a stranded lease does not suppress this node's self-recovery for the full
+	// TTL after a dead roll (r2 AGY).
+	ClearRollLease() error
 
 	// ---- promotion-gate surface (runs on the candidate boot) ----
 

@@ -652,8 +652,11 @@ def _acquire_lease(runner, backend, node, target_node_id, holder, ttl_secs):
         'fi; '
         "exp=$(date -u -d \"+%d seconds\" +%%Y-%%m-%%dT%%H:%%M:%%SZ); "
         "umask 022; "
+        # Write to a temp file then atomic-rename, so a reader (the self-recovery
+        # loop, which does NOT take the flock) never observes a partial/truncated
+        # lease (r2 AGY non-atomic-write). The flock still serializes writers.
         "printf '{\"node_id\": %d, \"holder\": \"%s\", \"expires_at\": \"%%s\"}' "
-        "\"$exp\" > \"$f\""
+        "\"$exp\" > \"$f.tmp\" && mv -f \"$f.tmp\" \"$f\""
     ) % (ttl_secs, target_node_id, h)
     # flock -w 30 serializes the critical section across concurrent drivers on
     # this node; -E 9 distinguishes a lock-acquire timeout (exit 9) from the
@@ -710,7 +713,12 @@ def cmd_kernel_roll(args):
     nodes = args.nodes               # ordered [first-to-roll, second]
     node_ids = {nodes[0]: args.node0_id, nodes[1]: args.node1_id}
     version = args.version
-    holder = f"{os.uname().nodename}:pid{os.getpid()}"
+    # Sanitize the holder to a safe token set (r2 AGY): the nodename is
+    # interpolated into a shell printf AND a Python %-format, so strip anything
+    # that isn't [A-Za-z0-9._-] (drops quotes, %, spaces, shell metachars).
+    import re as _re
+    _raw_holder = f"{os.uname().nodename}:pid{os.getpid()}"
+    holder = _re.sub(r"[^A-Za-z0-9._:-]", "_", _raw_holder)
     lease_ttl = args.lease_ttl
     poll_deadline = args.boot_deadline
 

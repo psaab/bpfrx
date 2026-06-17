@@ -39,11 +39,15 @@ func writeLease(t *testing.T, path string, l KernelRollLease) {
 	}
 }
 
-// Drained + no lease + healthy peer, held for Grace -> auto-ResetFailover.
+// EXPIRED-lease-ours (crashed orchestrator) + drained + healthy peer, held for
+// Grace -> auto-ResetFailover. (Self-recovery fires ONLY on an expired lease
+// naming us — the crashed-orchestrator fingerprint.)
 func TestSelfRecoveryRecoversAfterGrace(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	cl := &fakeSRCluster{drained: true, peerOK: true}
 	sr := newSR(t, cl, &now, 90*time.Second)
+	// an EXPIRED lease naming node 0 (the orchestrator wrote it then died)
+	writeLease(t, sr.cfg.LeasePath, KernelRollLease{NodeID: 0, ExpiresAt: now.Add(-time.Minute)})
 
 	if did, err := sr.Tick(); err != nil || did {
 		t.Fatalf("first tick should only START the timer (did=%v err=%v)", did, err)
@@ -59,6 +63,21 @@ func TestSelfRecoveryRecoversAfterGrace(t *testing.T) {
 	}
 	if !did || cl.resets != 1 {
 		t.Fatalf("expected auto-ResetFailover after grace (did=%v resets=%d)", did, cl.resets)
+	}
+}
+
+// NO lease present (manual maintenance / #1917 binary-rolling drain) -> NEVER
+// self-recover, even drained-with-healthy-peer past grace (r2 AGY: the
+// cross-feature interaction — self-recovery must not break an operator's or
+// #1917's drain window).
+func TestSelfRecoveryNoLeaseNeverRecovers(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	cl := &fakeSRCluster{drained: true, peerOK: true}
+	sr := newSR(t, cl, &now, 1*time.Second) // no lease file written
+	_, _ = sr.Tick()
+	now = now.Add(10 * time.Second) // well past grace
+	if did, _ := sr.Tick(); did || cl.resets != 0 {
+		t.Fatal("no kernel-roll lease => must NOT self-recover (manual maint / #1917 drain)")
 	}
 }
 
@@ -93,18 +112,20 @@ func TestSelfRecoveryExpiredLeaseDoesNotSuppress(t *testing.T) {
 	}
 }
 
-// A lease for the OTHER node does not suppress THIS node.
-func TestSelfRecoveryOtherNodeLeaseDoesNotSuppress(t *testing.T) {
+// A lease naming the OTHER node is NOT our kernel roll -> we must NOT
+// self-recover off it (it is the peer's concern, not ours).
+func TestSelfRecoveryOtherNodeLeaseDoesNotRecover(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	cl := &fakeSRCluster{drained: true, peerOK: true}
-	sr := newSR(t, cl, &now, 10*time.Second)
-	writeLease(t, sr.cfg.LeasePath, KernelRollLease{NodeID: 1, ExpiresAt: now.Add(10 * time.Minute)})
+	sr := newSR(t, cl, &now, 1*time.Second)
+	// an expired lease, but for node 1 — not us.
+	writeLease(t, sr.cfg.LeasePath, KernelRollLease{NodeID: 1, ExpiresAt: now.Add(-time.Minute)})
 
 	_, _ = sr.Tick()
 	now = now.Add(11 * time.Second)
 	did, _ := sr.Tick()
-	if !did || cl.resets != 1 {
-		t.Fatalf("a lease for node 1 must not suppress node 0 recovery (did=%v resets=%d)", did, cl.resets)
+	if did || cl.resets != 0 {
+		t.Fatal("a lease for node 1 must NOT trigger node 0 self-recovery")
 	}
 }
 
@@ -119,11 +140,13 @@ func TestSelfRecoveryNoOpWhenNotDrained(t *testing.T) {
 	}
 }
 
-// Drained but peer NOT a healthy primary -> do NOT auto-recover (dual-down).
+// EXPIRED-lease-ours but peer NOT a healthy primary -> do NOT auto-recover
+// (dual-down — leave for orchestrator/operator).
 func TestSelfRecoveryNoOpWhenPeerUnhealthy(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	cl := &fakeSRCluster{drained: true, peerOK: false}
 	sr := newSR(t, cl, &now, 1*time.Second)
+	writeLease(t, sr.cfg.LeasePath, KernelRollLease{NodeID: 0, ExpiresAt: now.Add(-time.Minute)})
 	now = now.Add(10 * time.Second)
 	if did, _ := sr.Tick(); did || cl.resets != 0 {
 		t.Fatal("must not auto-recover when the peer is not a healthy primary")
@@ -131,11 +154,12 @@ func TestSelfRecoveryNoOpWhenPeerUnhealthy(t *testing.T) {
 }
 
 // The timer RESETS if the condition lapses (e.g. peer flaps), so a transient
-// blip doesn't accumulate toward the grace deadline.
+// blip doesn't accumulate toward the grace deadline. (expired-lease-ours present)
 func TestSelfRecoveryTimerResetsOnConditionLapse(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	cl := &fakeSRCluster{drained: true, peerOK: true}
 	sr := newSR(t, cl, &now, 60*time.Second)
+	writeLease(t, sr.cfg.LeasePath, KernelRollLease{NodeID: 0, ExpiresAt: now.Add(-time.Minute)})
 	_, _ = sr.Tick() // start timer
 	now = now.Add(40 * time.Second)
 	cl.drained = false // condition lapses

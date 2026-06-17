@@ -352,6 +352,13 @@ func (s *realKernelSystem) ClearPromotionMarker() error {
 	return nil
 }
 
+func (s *realKernelSystem) ClearRollLease() error {
+	if err := os.Remove(DefaultKernelRollLeasePath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("clear kernel-roll lease: %w", err)
+	}
+	return nil
+}
+
 func (s *realKernelSystem) BootCurrent() (string, error) {
 	out, err := captureCmd("efibootmgr")
 	if err != nil {

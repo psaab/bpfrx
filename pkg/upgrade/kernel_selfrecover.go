@@ -108,36 +108,61 @@ func NewKernelSelfRecovery(cfg SelfRecoveryConfig, cl SelfRecoveryCluster) *Kern
 	return &KernelSelfRecovery{cfg: cfg, cl: cl}
 }
 
-// activeLeaseForUs reports whether an UNEXPIRED lease naming THIS node exists
-// (which suppresses self-recovery — a roll is legitimately in progress). A
-// missing/expired/other-node lease does NOT suppress.
-func (s *KernelSelfRecovery) activeLeaseForUs() bool {
+// leaseState classifies the kernel-roll lease w.r.t. THIS node.
+type leaseState int
+
+const (
+	leaseNone        leaseState = iota // no (readable) lease present
+	leaseActiveOurs                    // unexpired lease naming this node
+	leaseExpiredOurs                   // expired lease naming this node
+	leaseOther                         // lease names the OTHER node
+)
+
+// readLeaseState classifies the on-disk lease. The DISTINCTION drives the fix
+// for AGY's "self-recovery fires during manual maintenance / #1917" (r2):
+// self-recovery acts ONLY on leaseExpiredOurs — the unambiguous fingerprint of
+// a CRASHED kernel-roll orchestrator (it wrote a lease naming us, then died
+// without clearing it). leaseNone is NOT a self-recovery trigger: a manually
+// drained node or a #1917 binary-rolling drain never wrote a kernel-roll lease,
+// so we leave it alone.
+func (s *KernelSelfRecovery) readLeaseState() leaseState {
 	data, err := os.ReadFile(s.cfg.LeasePath)
 	if err != nil {
-		return false // no lease (or unreadable) -> not suppressed
+		return leaseNone // no lease (or unreadable) — not a kernel roll
 	}
 	var l KernelRollLease
 	if err := json.Unmarshal(data, &l); err != nil {
+		// A transient partial read during the orchestrator's atomic write — treat
+		// as "no decision this tick" (none); the grace timer + next tick re-read
+		// absorb it (r2 AGY non-atomic-write transient).
 		s.cfg.Logf("kernel self-recovery: ignoring unparsable lease %s: %v", s.cfg.LeasePath, err)
-		return false
+		return leaseNone
 	}
 	if l.NodeID != s.cfg.NodeID {
-		return false // lease is for the OTHER node — does not suppress us
+		return leaseOther
 	}
-	if !s.cfg.Now().Before(l.ExpiresAt) {
-		s.cfg.Logf("kernel self-recovery: lease for node %d EXPIRED at %s (orchestrator gone?)",
-			l.NodeID, l.ExpiresAt.Format(time.RFC3339))
-		return false // expired -> not suppressed
+	if s.cfg.Now().Before(l.ExpiresAt) {
+		return leaseActiveOurs
 	}
-	return true // unexpired lease for us -> a roll is in progress, suppress
+	s.cfg.Logf("kernel self-recovery: EXPIRED lease for node %d (orchestrator crashed mid-roll?)", l.NodeID)
+	return leaseExpiredOurs
 }
 
 // Tick evaluates the recovery condition once. Call it at startup and on a timer.
 // It auto-ResetFailovers only after the condition holds continuously for Grace.
 // Returns true iff it performed a ResetFailover this tick.
 func (s *KernelSelfRecovery) Tick() (bool, error) {
-	// A live lease for us means a real roll is in progress — never self-recover.
-	if s.activeLeaseForUs() {
+	// Self-recovery fires ONLY on an EXPIRED lease naming this node — the
+	// unambiguous fingerprint of a CRASHED kernel-roll orchestrator (r2 AGY):
+	//   - leaseActiveOurs: a roll is legitimately in progress — never recover.
+	//   - leaseOther / leaseNone: NOT our kernel roll — a manually drained node
+	//     or a #1917 binary-rolling drain never wrote a lease naming us, so we
+	//     must NOT auto-rejoin (that would break the operator's / #1917's
+	//     maintenance window — the cross-feature interaction AGY flagged).
+	//   - leaseExpiredOurs: the orchestrator wrote our lease then died without
+	//     clearing it — THIS is the case self-recovery exists for.
+	st := s.readLeaseState()
+	if st != leaseExpiredOurs {
 		s.drainedSince = time.Time{}
 		return false, nil
 	}
