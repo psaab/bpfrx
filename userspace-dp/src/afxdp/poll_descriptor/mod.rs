@@ -68,6 +68,44 @@ use filter::{
 // polling — so each shared reborrow is valid and cannot alias a
 // mutable reference. The raw pointer only decouples the immutable
 // UMEM-area borrow from the `&mut BindingWorker` borrow.
+/// #1769/#1912: per-key rate-limited enqueue of the shared neighbor
+/// resolver. Both the neg-cache fast-fail branch and the #1912 tunnel
+/// outer-hop branch use the identical throttle-check / `ifindex_to_name`
+/// clone / `enqueue` / cap-clear / `insert` sequence keyed by
+/// `(ifindex, next_hop)` — factored here so the throttle window, the cap
+/// constant, and the clear-vs-evict policy live in ONE place (Copilot
+/// #1912 r1 Medium). Returns true iff it actually enqueued (i.e. was not
+/// throttled and the iface had a name). Cold-path only.
+#[inline]
+fn try_enqueue_resolver(
+    resolver: &NeighborResolver,
+    throttle: &mut FastMap<(i32, IpAddr), u64>,
+    ifindex_to_name: &FastMap<i32, String>,
+    key: (i32, IpAddr),
+    now_ns: u64,
+) -> bool {
+    // Cheap (i32, IpAddr) map check runs before any clone.
+    let throttled = matches!(
+        throttle.get(&key),
+        Some(&t) if now_ns.saturating_sub(t) < RESOLVER_ENQUEUE_THROTTLE_NS
+    );
+    if throttled {
+        return false;
+    }
+    let Some(name) = ifindex_to_name.get(&key.0) else {
+        return false;
+    };
+    resolver.enqueue(key.0, key.1, name.clone());
+    // Bound the throttle map like the negative cache: a /24 scan touches
+    // <=254 keys, so clear wholesale past the cap (best-effort — losing
+    // throttle for a few keys only risks one extra clone).
+    if throttle.len() >= MAX_NEG_NEIGH_CACHE && !throttle.contains_key(&key) {
+        throttle.clear();
+    }
+    throttle.insert(key, now_ns);
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn poll_binding_process_descriptor(
     binding: &mut BindingWorker,
@@ -2445,63 +2483,21 @@ pub(super) fn poll_binding_process_descriptor(
                                         // try_send here (not per-packet — this
                                         // arm fires only on the negative fast-
                                         // fail).
+                                        // Per-key rate-limited (the resolver
+                                        // coalesces per-key anyway) so a
+                                        // dead-host SYN storm does NOT clone +
+                                        // try_send per fast-failed packet. See
+                                        // try_enqueue_resolver.
                                         if let Some(resolver) =
                                             worker_ctx.neighbor_resolver
                                         {
-                                            // Per-binding throttle: only
-                                            // clone the iface name +
-                                            // try_send once per key per
-                                            // RESOLVER_ENQUEUE_THROTTLE_NS
-                                            // so a dead-host SYN storm does
-                                            // NOT allocate per fast-failed
-                                            // packet (the resolver coalesces
-                                            // per-key anyway). The cheap
-                                            // (i32, IpAddr) map check runs
-                                            // before any clone.
-                                            let throttled = matches!(
-                                                binding
-                                                    .resolver_enqueue_throttle
-                                                    .get(&neg_key),
-                                                Some(&t) if now_ns.saturating_sub(t)
-                                                    < RESOLVER_ENQUEUE_THROTTLE_NS
+                                            try_enqueue_resolver(
+                                                resolver,
+                                                &mut binding.resolver_enqueue_throttle,
+                                                &worker_ctx.forwarding.ifindex_to_name,
+                                                neg_key,
+                                                now_ns,
                                             );
-                                            if !throttled {
-                                                if let Some(name) = worker_ctx
-                                                    .forwarding
-                                                    .ifindex_to_name
-                                                    .get(&neg_key.0)
-                                                {
-                                                    resolver.enqueue(
-                                                        neg_key.0,
-                                                        neg_key.1,
-                                                        name.clone(),
-                                                    );
-                                                    // Bound the throttle
-                                                    // map like the negative
-                                                    // cache: a /24 scan
-                                                    // touches <=254 keys, so
-                                                    // clear wholesale past
-                                                    // the cap (best-effort —
-                                                    // losing throttle for a
-                                                    // few keys only risks one
-                                                    // extra clone).
-                                                    if binding
-                                                        .resolver_enqueue_throttle
-                                                        .len()
-                                                        >= MAX_NEG_NEIGH_CACHE
-                                                        && !binding
-                                                            .resolver_enqueue_throttle
-                                                            .contains_key(&neg_key)
-                                                    {
-                                                        binding
-                                                            .resolver_enqueue_throttle
-                                                            .clear();
-                                                    }
-                                                    binding
-                                                        .resolver_enqueue_throttle
-                                                        .insert(neg_key, now_ns);
-                                                }
-                                            }
                                         }
                                         // Fresh RX descriptor → recycle via
                                         // scratch_recycle + continue, matching
@@ -2526,30 +2522,43 @@ pub(super) fn poll_binding_process_descriptor(
                                 // picks up the resolved entry instantly.
                                 if let Some(next_hop) = decision.resolution.next_hop {
                                     // #1912: tunnel-marked decisions are NEVER
-                                    // buffered in pending_neigh (R-E), so the
-                                    // per-hop neg-cache that arms only on a
-                                    // pending_neigh timeout (neighbor_dispatch.rs)
-                                    // never arms for an unresolved OUTER hop —
-                                    // the top-of-arm neg fast-fail therefore can
-                                    // never suppress this block for a tunnel
-                                    // flow. Without an explicit throttle EVERY
-                                    // cold packet of an unresolved tunnel-bound
-                                    // flow would fire trigger_kernel_arp_probe
-                                    // (a raw-socket open/setsockopt/sendto/close
-                                    // per packet) — a syscall storm under a SYN
-                                    // flood (AGY #1912 r1, High). So for a
-                                    // tunnel-marked decision gate BOTH the kernel
-                                    // ARP probe AND the resolver enqueue behind
-                                    // the existing per-(neigh_if, next_hop)
-                                    // resolver_enqueue_throttle: at most one
-                                    // probe + enqueue per outer key per window.
-                                    // The neg-cache miss-arming gap is unchanged
-                                    // for non-tunnel flows (they DO buffer +
-                                    // time out → neg_neigh_record).
+                                    // buffered in pending_neigh (R-E), and the
+                                    // per-hop neg-cache arms only on a
+                                    // pending_neigh timeout (neighbor_dispatch.rs
+                                    // neg_neigh_record), so for an unresolved
+                                    // OUTER hop the top-of-arm neg fast-fail can
+                                    // never arm and suppress this block. The
+                                    // outer-hop probe + resolver are therefore
+                                    // gated by the per-(neigh_if, next_hop)
+                                    // resolver_enqueue_throttle window below.
+                                    //
+                                    // outer_if_distinct: true only when this is a
+                                    // tunnel decision whose outer transport
+                                    // RESOLVED to a real L3 egress distinct from
+                                    // the tunnel logical ifindex. If
+                                    // outer_neighbor_ifindex fell back to
+                                    // egress_ifindex (endpoint vanished / outer
+                                    // egress <= 0 — unreachable within the
+                                    // single-threaded worker loop, but explicit),
+                                    // neigh_if == egress_ifindex == tunnel logical;
+                                    // probing / RTM_GETNEIGH on the GRE logical
+                                    // iface is the useless pre-#1912 behavior, so
+                                    // skip it (Copilot #1912 r1 Low).
                                     let tunnel_marked =
                                         decision.resolution.tunnel_endpoint_id != 0;
+                                    let outer_if_distinct = tunnel_marked
+                                        && neigh_if > 0
+                                        && neigh_if != decision.resolution.egress_ifindex;
                                     let throttle_key = (neigh_if, next_hop);
-                                    let tunnel_throttled = tunnel_marked
+                                    // For a tunnel decision, gate BOTH the kernel
+                                    // ARP probe AND the resolver enqueue behind
+                                    // ONE throttle window so a SYN flood to a
+                                    // flushed outer hop fires at most one
+                                    // probe + enqueue per outer key per window
+                                    // (else trigger_kernel_arp_probe — a raw
+                                    // socket open/setsockopt/sendto/close — would
+                                    // run per packet; AGY #1912 r1 High).
+                                    let tunnel_throttled = outer_if_distinct
                                         && matches!(
                                             binding
                                                 .resolver_enqueue_throttle
@@ -2569,12 +2578,24 @@ pub(super) fn poll_binding_process_descriptor(
                                     // neigh_if == egress_ifindex so the dedup is
                                     // byte-identical; for a tunnel flow
                                     // pending_neigh never holds the key (R-E), so
-                                    // the per-window throttle above is the
-                                    // probe-storm bound instead.
+                                    // the per-window throttle is the probe-storm
+                                    // bound instead.
                                     let already_probing = binding
                                         .pending_neigh
                                         .contains_key(&(neigh_if, next_hop));
-                                    if !already_probing && !tunnel_throttled {
+                                    // Suppress the probe for a tunnel decision
+                                    // with NO distinct outer egress: neigh_if
+                                    // would be the tunnel logical ifindex and the
+                                    // probe would bind to the GRE iface (no ARP —
+                                    // the useless pre-#1912 behavior). For a
+                                    // non-tunnel flow tunnel_marked is false so
+                                    // this never suppresses (byte-identical).
+                                    let tunnel_without_outer =
+                                        tunnel_marked && !outer_if_distinct;
+                                    if !already_probing
+                                        && !tunnel_throttled
+                                        && !tunnel_without_outer
+                                    {
                                         let iface_name = worker_ctx
                                             .forwarding
                                             .ifindex_to_name
@@ -2587,49 +2608,43 @@ pub(super) fn poll_binding_process_descriptor(
                                         }
                                     }
                                     // #1912: for a tunnel-marked MissingNeighbor
-                                    // (e.g. GRE outer hop), ALSO drive the #1769
-                                    // resolver on the OUTER L3 egress (neigh_if),
-                                    // not only on the neg-cache fast-fail. A
-                                    // freshly-flushed outer hop has no negative
-                                    // entry, so without this only the one-shot
-                                    // kernel ARP probe above fires; the resolver
-                                    // hardens the STALE/DELAY outer-entry case by
-                                    // issuing an RTM_GETNEIGH revalidation. The
-                                    // frame is STILL NOT buffered (R-E), so no
-                                    // plaintext-leak window is opened. Shares the
-                                    // tunnel_throttled window with the probe so a
-                                    // single bump per key per window gates both.
-                                    if tunnel_marked && neigh_if > 0 && !tunnel_throttled {
+                                    // with a DISTINCT resolved outer egress (e.g.
+                                    // GRE outer hop), ALSO drive the #1769
+                                    // resolver on the OUTER L3 egress, not only on
+                                    // the neg-cache fast-fail. A freshly-flushed
+                                    // outer hop has no negative entry, so without
+                                    // this only the one-shot kernel ARP probe
+                                    // fires; the resolver hardens the STALE/DELAY
+                                    // outer-entry case via RTM_GETNEIGH. The frame
+                                    // is STILL NOT buffered (R-E), so no
+                                    // plaintext-leak window opens. try_enqueue_-
+                                    // resolver re-reads the SAME throttle entry
+                                    // and bumps it once, so the probe above and
+                                    // this enqueue share one window per key.
+                                    if outer_if_distinct && !tunnel_throttled {
                                         if let Some(resolver) = worker_ctx.neighbor_resolver {
-                                            if let Some(name) = worker_ctx
-                                                .forwarding
-                                                .ifindex_to_name
-                                                .get(&neigh_if)
+                                            try_enqueue_resolver(
+                                                resolver,
+                                                &mut binding.resolver_enqueue_throttle,
+                                                &worker_ctx.forwarding.ifindex_to_name,
+                                                throttle_key,
+                                                now_ns,
+                                            );
+                                        } else {
+                                            // No resolver (probe-only build): bump
+                                            // the throttle directly so the probe
+                                            // above is still rate-limited to one
+                                            // per window. Bounded like the neg
+                                            // cache.
+                                            let throttle =
+                                                &mut binding.resolver_enqueue_throttle;
+                                            if throttle.len() >= MAX_NEG_NEIGH_CACHE
+                                                && !throttle.contains_key(&throttle_key)
                                             {
-                                                resolver.enqueue(
-                                                    neigh_if,
-                                                    next_hop,
-                                                    name.clone(),
-                                                );
+                                                throttle.clear();
                                             }
+                                            throttle.insert(throttle_key, now_ns);
                                         }
-                                    }
-                                    // #1912: bump the shared tunnel throttle once
-                                    // after firing (probe and/or enqueue), so the
-                                    // NEXT cold packet within the window skips
-                                    // both. Bounded like the negative cache.
-                                    if tunnel_marked && neigh_if > 0 && !tunnel_throttled {
-                                        if binding.resolver_enqueue_throttle.len()
-                                            >= MAX_NEG_NEIGH_CACHE
-                                            && !binding
-                                                .resolver_enqueue_throttle
-                                                .contains_key(&throttle_key)
-                                        {
-                                            binding.resolver_enqueue_throttle.clear();
-                                        }
-                                        binding
-                                            .resolver_enqueue_throttle
-                                            .insert(throttle_key, now_ns);
                                     }
                                 }
                                 // Create the session NOW so the SYN-ACK (reverse
@@ -3034,4 +3049,74 @@ pub(super) fn poll_binding_process_descriptor(
         }
         received.release();
         drop(received);
+}
+
+#[cfg(test)]
+mod try_enqueue_resolver_tests {
+    use super::*;
+    use crate::afxdp::neighbor_resolver::{NeighborResolver, ResolveItem, ResolverCounters};
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::mpsc;
+
+    fn make_resolver() -> (NeighborResolver, mpsc::Receiver<ResolveItem>) {
+        let (tx, rx) = mpsc::sync_channel::<ResolveItem>(8);
+        let resolver = NeighborResolver::new(
+            tx,
+            Arc::new(ResolverCounters::default()),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(crate::afxdp::neighbor_latency::NeighborLatencyHist::default()),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        (resolver, rx)
+    }
+
+    #[test]
+    fn try_enqueue_resolver_throttles_within_window_and_bounds_map() {
+        let (resolver, rx) = make_resolver();
+        let mut throttle: FastMap<(i32, IpAddr), u64> = FastMap::default();
+        let mut names: FastMap<i32, String> = FastMap::default();
+        names.insert(12, "ge-0-0-2.80".to_string());
+        let key = (12, IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)));
+
+        // First call enqueues and records the throttle entry.
+        assert!(try_enqueue_resolver(&resolver, &mut throttle, &names, key, 1_000));
+        assert_eq!(rx.try_recv().expect("first enqueue").ifindex, 12);
+        assert!(throttle.contains_key(&key));
+
+        // Second call within RESOLVER_ENQUEUE_THROTTLE_NS is throttled: no
+        // enqueue (storm bound — at most one per key per window).
+        assert!(!try_enqueue_resolver(
+            &resolver,
+            &mut throttle,
+            &names,
+            key,
+            1_000 + RESOLVER_ENQUEUE_THROTTLE_NS - 1
+        ));
+        assert!(rx.try_recv().is_err(), "throttled call must not enqueue");
+
+        // After the window elapses, it enqueues again.
+        assert!(try_enqueue_resolver(
+            &resolver,
+            &mut throttle,
+            &names,
+            key,
+            1_000 + RESOLVER_ENQUEUE_THROTTLE_NS
+        ));
+        assert_eq!(rx.try_recv().expect("post-window enqueue").ifindex, 12);
+    }
+
+    #[test]
+    fn try_enqueue_resolver_skips_when_iface_has_no_name() {
+        let (resolver, rx) = make_resolver();
+        let mut throttle: FastMap<(i32, IpAddr), u64> = FastMap::default();
+        let names: FastMap<i32, String> = FastMap::default(); // empty
+        let key = (362, IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)));
+        // No name for the ifindex ⇒ no enqueue, no throttle entry.
+        assert!(!try_enqueue_resolver(&resolver, &mut throttle, &names, key, 1_000));
+        assert!(rx.try_recv().is_err());
+        assert!(throttle.is_empty());
+    }
 }
