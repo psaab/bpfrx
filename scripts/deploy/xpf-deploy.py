@@ -908,6 +908,25 @@ def _node_protocol_versions(runner, backend, node):
     return d
 
 
+def _node_drain_supports_mixed_ha(runner, backend, node):
+    """Feature-detect whether a node's RUNNING xpfd accepts the INC-3
+    `--allow-mixed-ha` drain flag. An image rolled FROM a pre-INC-3 release has
+    no such flag and would abort on it (AGY CRITICAL); the second image-roll
+    drain runs on the still-OLD node, so this MUST be probed before the flag is
+    passed. `drain --help` lists flags (on STDERR — Go's flag package writes
+    usage there) WITHOUT performing a drain; absence of the token (or any probe
+    failure) is treated as unsupported (fail safe: omit the flag, fall back to
+    the exact-equality precheck). stderr is merged via `sh -c` so the backend
+    captures the usage text (_node_exec returns stdout only)."""
+    if runner.dry:
+        return True  # dry-run prints the planned command; assume new image
+    out = _node_exec(runner, backend, node,
+                     ["sh", "-c",
+                      "xpfd upgrade kernel drain --help 2>&1 || true"],
+                     check=False)
+    return "--allow-mixed-ha" in out
+
+
 def _read_image_manifest_versions(path):
     """Parse the bake `.manifest` (key: value) into the same key namespace as
     `xpfd protocol-versions` (key=value, hyphenated)."""
@@ -1024,6 +1043,7 @@ def cmd_image_roll(args):
                 die(f"{n}: could not acquire image-roll lease (another orchestrator "
                     f"holds it, or the lock timed out) — released {got or 'nothing'} "
                     f"and aborting.")
+        completed = False
         try:
             # MIXED-BASE GATE: the risk window is the FIRST swap (after it node[0]
             # is NEW while node[1] is still OLD). Gate BEFORE the first swap,
@@ -1048,10 +1068,25 @@ def cmd_image_roll(args):
             #    primary). --allow-mixed-ha relaxes the drain's exact-equality HA
             #    precheck when the gate already validated window-compat (HIGH
             #    Codex): the second node drains against an already-rolled peer.
+            #    FORWARD-COMPAT (AGY CRITICAL): the SECOND node is still on the
+            #    OLD image at drain time (recreate is step 2). An image rolled
+            #    FROM a pre-INC-3 release has an xpfd that does NOT know
+            #    --allow-mixed-ha and would abort on the unknown flag. Append it
+            #    only if the node's running binary actually supports it; the old
+            #    binary's exact-equality precheck is the safety net otherwise
+            #    (and is correct whenever old/new advertise the same HA version,
+            #    which is the only in-window case a same-version roll produces).
             drain_cmd = ["xpfd", "upgrade", "kernel", "drain",
                          "--drain-deadline", f"{drain_deadline}s"]
             if allow_mixed:
-                drain_cmd.append("--allow-mixed-ha")
+                if _node_drain_supports_mixed_ha(runner, backend, node):
+                    drain_cmd.append("--allow-mixed-ha")
+                else:
+                    print(f"   note: {node}'s xpfd predates --allow-mixed-ha; "
+                          f"draining with the exact-equality HA precheck (safe "
+                          f"when old/new advertise the same HA version). If the "
+                          f"drain aborts as HA-incompatible, the OLD image cannot "
+                          f"relax it — re-image BOTH nodes together.")
             print(f"   draining {node} -> {peer} (confirmed)...")
             _node_exec(runner, backend, node, drain_cmd)
 
@@ -1059,6 +1094,7 @@ def cmd_image_roll(args):
             if runner.dry:
                 print(f"   (dry-run) would recreate {node} from the new image "
                       f"(launch + day-0), poll boot+verify, then rejoin")
+                completed = True  # dry-run: release the leases on the way out
                 return
             _recreate_node_from_image(runner, backend, node, args)
 
@@ -1081,9 +1117,25 @@ def cmd_image_roll(args):
             _node_exec(runner, backend, node,
                        ["xpfd", "upgrade", "kernel", "rejoin",
                         "--drain-deadline", f"{drain_deadline}s"])
+            completed = True
         finally:
-            _clear_lease(runner, backend, node, holder)
-            _clear_lease(runner, backend, peer, holder)
+            # Release the cross-orchestrator mutex ONLY on a clean roll of THIS
+            # node (HIGH Codex never-both-down): on a mid-roll abort the cluster
+            # is half-rolled (this node may be drained/down/unrejoined), so the
+            # leases stay HELD until their TTL — a second orchestrator is blocked
+            # from draining the still-primary peer (which would put both nodes
+            # down) and the operator must investigate the half-rolled pair. The
+            # drain verb's own peer-alive/takeover-ready precheck is the hard
+            # backstop; keeping the lease held is defense-in-depth so recovery is
+            # operator-gated, not a TTL race.
+            if completed:
+                _clear_lease(runner, backend, node, holder)
+                _clear_lease(runner, backend, peer, holder)
+            else:
+                print(f"   roll of {node} did NOT complete — holding the "
+                      f"image-roll lease on {node} and {peer} until TTL "
+                      f"({lease_ttl}s) so no other orchestrator drains the "
+                      f"still-primary peer. Investigate the half-rolled cluster.")
 
     roll_one(nodes[0], nodes[1], is_second=False)
     print(f"\n==> {nodes[0]} done; rolling the second node")

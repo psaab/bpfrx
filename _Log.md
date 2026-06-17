@@ -1,5 +1,24 @@
 # Action Log
 
+## 2026-06-16 — #1930 INC-3: address quad-review (AGY CRITICAL + Codex 2 HIGH + 1 LOW)
+- **Timestamp**: 2026-06-16 UTC
+- **Action**: Resume final INC-3 increment; dispatched 4-way review on PR
+  #1942. AGY CRITICAL: image-roll passed `--allow-mixed-ha` unconditionally to
+  the second node, which is still on the OLD image (no such flag) → unknown-flag
+  abort mid-roll. Fix: feature-detect the flag on the node's running xpfd
+  (`_node_drain_supports_mixed_ha`) and fall back to exact-equality + warn when
+  absent. Codex HIGH-1: Go parsed session-sync/configdb versions with signed
+  `Atoi` while Python used `_u16` → a negative value could falsely pass the
+  exact-match (parity bypass). Fix: `ParseUint(.,16)` in Go + regression test.
+  Codex HIGH-2: lease cleared on mid-roll abort opened a cross-orchestrator
+  never-both-down window; now hold leases until TTL on abort (clear only on
+  clean per-node completion / dry-run); drain peer-alive precheck is the hard
+  backstop. Codex LOW-1: corrected the bake.py warning (gate reads manifest
+  only + fails closed; no staged-binary fallback exists).
+- **File(s)**: scripts/deploy/xpf-deploy.py, pkg/upgrade/imageversions.go,
+  pkg/upgrade/imageversions_test.go, scripts/image/bake.py,
+  docs/in-place-upgrade.md, docs/pr/1930-inc3-image-replace/*
+
 ## 2026-06-16 — #1930 INC-3: address Codex r1 (6 HIGH + 2 MED + 1 LOW)
 - **Timestamp**: 2026-06-16 UTC
 - **Action**: Fixed Codex review findings on INC-3. HIGH: (1)

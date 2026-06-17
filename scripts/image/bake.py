@@ -546,9 +546,11 @@ def main():
         # mixed-base image-replace gate is a FILE READ (no boot, no cross-arch
         # binary run needed). The packaged binary already passed the
         # verify-dataplane pre-gate above, so it is the authoritative source.
-        # Best-effort: a parse/run failure leaves the version lines out (the
-        # gate then falls back to `xpfd protocol-versions` on the staged binary,
-        # or fails closed) rather than aborting the bake.
+        # Best-effort: a parse/run failure leaves the version lines out rather
+        # than aborting the bake. The image-roll gate reads ONLY the manifest
+        # and FAILS CLOSED on missing protocol fields (it does not re-run the
+        # staged binary), so a manifest baked without these lines forces the
+        # operator to either re-bake or pass --allow-session-drop.
         proto_lines = ""
         try:
             pv = out_text([staged_xpfd, "protocol-versions"])
@@ -559,8 +561,9 @@ def main():
                     proto_lines += f"{k.strip().replace('-', '_')}: {v.strip()}\n"
         except Exception as e:
             print(f"WARNING: could not read staged xpfd protocol-versions for the "
-                  f"manifest ({e}); the mixed-base gate will run the staged binary "
-                  f"directly instead.", file=sys.stderr)
+                  f"manifest ({e}); the manifest will OMIT the protocol-version "
+                  f"fields and the mixed-base image-roll gate will FAIL CLOSED "
+                  f"(re-bake, or roll with --allow-session-drop).", file=sys.stderr)
 
         manifest = os.path.join(a.out, f"xpf-{ver}.manifest")
         with open(manifest, "w") as f:

@@ -295,6 +295,19 @@ node from a new baked image ONE AT A TIME (built on the existing per-node
    **rejoin** + confirm sync BEFORE touching node[1] (never-both-down;
    the INC-2 `rejoin` verb). Repeat for node[1].
 
+When draining node[1] (the SECOND node), its peer is the already-rolled
+NEW image, so the drain's exact-equality HA precheck is relaxed with
+`xpfd upgrade kernel drain --allow-mixed-ha` (the gate already validated
+window-compat). node[1] is still on the OLD image at that point, so the
+driver **feature-detects** `--allow-mixed-ha` on node[1]'s running binary
+(`drain --help`) and only passes it when supported — an image rolled FROM
+a pre-INC-3 release has no such flag and would otherwise abort on it. When
+the flag is absent the driver falls back to the OLD binary's exact-equality
+precheck, which is correct whenever old/new advertise the same HA version
+(the only in-window case a same-version roll produces); a genuine
+in-window protocol *difference* cannot be relaxed by an OLD binary, so the
+operator must re-image both nodes together.
+
 **Standalone** is a documented reboot/recreate gap (image swap + factory
 boot + day-0 re-apply); there is no zero-gap standalone image replace.
 

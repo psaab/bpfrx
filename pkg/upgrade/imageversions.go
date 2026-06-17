@@ -73,18 +73,27 @@ func parseImageVersions(text string) (*ImageVersions, error) {
 				iv.present[k] = true
 			}
 		case "session-sync-protocol-version":
-			if n, err := strconv.Atoi(v); err == nil {
-				iv.SessionSyncProtocol = n
+			// Parse as unsigned 16-bit, matching the on-wire constant
+			// (cluster.SessionSyncWireVersion is a uint16) AND the Python gate's
+			// _u16() — a signed strconv.Atoi here would accept a negative value
+			// that the Python gate rejects (fail-closed), and a peer reporting
+			// e.g. -1 against a new image also at -1 would falsely pass the
+			// exact-match check (Go/Python parity bypass; r4 Codex HIGH).
+			if n, err := strconv.ParseUint(v, 10, 16); err == nil {
+				iv.SessionSyncProtocol = int(n)
 				iv.present[k] = true
 			}
 		case "configdb-envelope-version":
-			if n, err := strconv.Atoi(v); err == nil {
-				iv.ConfigDBEnvelope = n
+			// Unsigned for the same Go/Python parity reason (kept symmetric with
+			// session-sync even though config-DB versions are informational for
+			// the HA gate today).
+			if n, err := strconv.ParseUint(v, 10, 16); err == nil {
+				iv.ConfigDBEnvelope = int(n)
 				iv.present[k] = true
 			}
 		case "configdb-min-reader-version":
-			if n, err := strconv.Atoi(v); err == nil {
-				iv.ConfigDBMinReader = n
+			if n, err := strconv.ParseUint(v, 10, 16); err == nil {
+				iv.ConfigDBMinReader = int(n)
 				iv.present[k] = true
 			}
 		}

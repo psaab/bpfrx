@@ -83,6 +83,36 @@ func TestGateMixedBase_UnknownPeerSessionSync_DropsClosed(t *testing.T) {
 	}
 }
 
+// TestParseImageVersions_NegativeSessionSync_FailsClosed locks the r4 Codex
+// HIGH Go/Python parity fix: a negative (or out-of-uint16-range)
+// session-sync-protocol-version must be REJECTED at parse (not stored), so the
+// required key is absent and the gate fails closed — matching the Python
+// _u16() rejection. A signed strconv.Atoi would have stored -1 and let a peer
+// also reporting -1 falsely pass the exact-match.
+func TestParseImageVersions_NegativeSessionSync_FailsClosed(t *testing.T) {
+	const txt = `ha-protocol-version=2
+ha-protocol-min-compat=1
+session-sync-protocol-version=-1
+`
+	iv, err := parseImageVersions(txt)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if iv.has("session-sync-protocol-version") {
+		t.Fatal("negative session-sync must be rejected at parse (key absent)")
+	}
+	// Peer also reporting -1 must NOT pass: the gate fails closed on the absent
+	// required key regardless of the (rejected) peer value.
+	if v := GateMixedBaseSwap(iv, 1, -1); v.SessionsSurvive {
+		t.Fatalf("negative session-sync must fail closed: %s", v.Reason)
+	}
+	// Out-of-uint16-range is likewise rejected.
+	iv2, _ := parseImageVersions("ha-protocol-version=2\nha-protocol-min-compat=1\nsession-sync-protocol-version=70000\n")
+	if iv2.has("session-sync-protocol-version") {
+		t.Fatal("out-of-uint16-range session-sync must be rejected at parse")
+	}
+}
+
 func TestGateMixedBase_MissingFields_DropsClosed(t *testing.T) {
 	iv, _ := parseImageVersions("xpf-version=1.2.3\n") // no protocol fields
 	if v := GateMixedBaseSwap(iv, 1, 3); v.SessionsSurvive {
