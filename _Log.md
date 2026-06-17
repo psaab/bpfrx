@@ -1,5 +1,20 @@
 # Action Log
 
+## 2026-06-16 — #1930 INC-2: fix leaked election hold after promote (SMR)
+- **Timestamp**: 2026-06-16 UTC
+- **Action**: Claude SMR caught a leaked-hold: the promotion gate runs in
+  a SEPARATE process (`xpf-kernel-promote.service`, After=xpfd) that
+  clears only the on-disk journal, so the running daemon's in-memory
+  `kernelUpgradeHold` would never clear after a SUCCESSFUL promote — the
+  verified candidate would stay SECONDARY forever. Added
+  `Manager.KernelUpgradeHeld()` getter + a 5s daemon reconcile loop
+  (`reconcileKernelUpgradeHold`) that releases the hold once the journal
+  is no longer ARMED (promoted/reverted). 5s cadence (not the 30s
+  self-recovery tick) for fast failback. Hold persists while still armed.
+- **File(s)**: pkg/cluster/kernel_selfrecover.go,
+  pkg/daemon/kernel_selfrecover.go, pkg/cluster/election_test.go,
+  docs/in-place-upgrade.md
+
 ## 2026-06-16 — #1930 INC-2: AGY r2 candidate-preempt fix (/engineer)
 - **Timestamp**: 2026-06-16 UTC
 - **Action**: Fixed AGY r2 CRITICAL — the r1 candidate-preempt fix

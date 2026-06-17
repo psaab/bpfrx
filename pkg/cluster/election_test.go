@@ -175,6 +175,9 @@ func TestElection_SplitBrain_HigherNodeLoses(t *testing.T) {
 func TestElection_KernelUpgradeHold_IsolatedStaysSecondary(t *testing.T) {
 	m := NewManager(0, 1)
 	m.SetKernelUpgradeHold() // candidate boot, before the cluster starts electing
+	if !m.KernelUpgradeHeld() {
+		t.Fatal("SetKernelUpgradeHold must make KernelUpgradeHeld report true")
+	}
 	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200}))
 	m.UpdateConfig(cfg)
 
@@ -193,6 +196,9 @@ func TestElection_KernelUpgradeHold_IsolatedStaysSecondary(t *testing.T) {
 
 	// Clearing the hold (promote success / rejoin) lets it take its role.
 	m.ClearKernelUpgradeHold()
+	if m.KernelUpgradeHeld() {
+		t.Fatal("ClearKernelUpgradeHold must make KernelUpgradeHeld report false")
+	}
 	if !m.IsLocalPrimary(0) {
 		t.Fatal("after ClearKernelUpgradeHold the isolated node must become primary")
 	}

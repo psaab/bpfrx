@@ -55,6 +55,17 @@ func (m *Manager) SetKernelUpgradeHold() {
 	m.mu.Unlock()
 }
 
+// KernelUpgradeHeld reports whether the kernel-upgrade election hold is set.
+// Used by the daemon's self-recovery loop to reconcile the hold against the
+// journal: the promotion gate runs in a SEPARATE process (xpf-kernel-promote.
+// service, After=xpfd) and clears only the on-disk journal, so the running
+// daemon must notice "held but no longer armed" and release the hold itself.
+func (m *Manager) KernelUpgradeHeld() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.kernelUpgradeHold
+}
+
 // ClearKernelUpgradeHold releases the kernel-upgrade election hold and re-runs
 // election so the node can take its normal role. Called on promote success
 // (the candidate is verified) and on revert (the node is rebooting to known-good

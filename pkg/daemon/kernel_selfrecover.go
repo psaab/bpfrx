@@ -49,6 +49,32 @@ func (d *Daemon) holdSecondaryIfKernelCandidateArmed() {
 		"verifies the dataplane", "candidate", j.CandidateVersion)
 }
 
+// reconcileKernelUpgradeHold releases the election hold once the candidate trial
+// has RESOLVED. The promotion gate runs in a SEPARATE process
+// (xpf-kernel-promote.service, After=xpfd) and clears only the on-disk journal,
+// so the running daemon — which set the in-memory hold at boot — must notice
+// "held but no longer armed" and release it; otherwise a SUCCESSFULLY promoted
+// candidate would stay SECONDARY forever (a leaked hold). It is a no-op unless
+// the hold is set, and clears it only once the journal is no longer ARMED
+// (promote -> PROMOTED, or revert -> REVERTED/reboot). While still armed the
+// hold persists (the trial is in flight and the hold is doing its job).
+func (d *Daemon) reconcileKernelUpgradeHold() {
+	if d.cluster == nil || !d.cluster.KernelUpgradeHeld() {
+		return
+	}
+	r, err := upgrade.NewKernelRunner(upgrade.KernelConfig{Sys: upgrade.NewKernelSystem()})
+	if err != nil {
+		return
+	}
+	armed, _, err := r.IsArmed()
+	if err != nil || armed {
+		return // still a trial in flight (or can't tell) — keep holding
+	}
+	d.cluster.ClearKernelUpgradeHold()
+	slog.Info("kernel-candidate trial resolved (no longer armed); releasing the " +
+		"SECONDARY election hold so the node can take its normal role")
+}
+
 // startKernelSelfRecovery runs the bounded local self-recovery loop for the
 // LANE-1 HA kernel channel (#1930 INC-2). If the external orchestrator crashes
 // while this node is drained+rebooting for a kernel roll, the node would come
@@ -79,22 +105,36 @@ func (d *Daemon) startKernelSelfRecovery(ctx context.Context) {
 	}, kernelSRCluster{m: d.cluster})
 
 	go func() {
+		// Reconcile the in-memory election hold against the journal on a SHORT
+		// cadence from the start: the promotion gate (a separate process) can
+		// resolve within ~120s of boot, and we want the verified candidate to
+		// drop its hold and resume its role promptly (fast failback), not wait
+		// out the self-recovery settle. Cheap (a journal read; an election only
+		// on the resolving tick).
+		holdTick := time.NewTicker(5 * time.Second)
+		defer holdTick.Stop()
+
 		// Initial settle so a normal boot→election→rejoin completes before the
-		// first evaluation (the grace inside Tick adds further hysteresis).
-		t := time.NewTimer(30 * time.Second)
-		defer t.Stop()
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-		}
+		// first self-recovery evaluation (the grace inside Tick adds further
+		// hysteresis). The hold reconcile runs throughout this window.
+		settle := time.NewTimer(30 * time.Second)
+		defer settle.Stop()
+		settled := false
+
 		tick := time.NewTicker(30 * time.Second)
 		defer tick.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
+			case <-holdTick.C:
+				d.reconcileKernelUpgradeHold()
+			case <-settle.C:
+				settled = true
 			case <-tick.C:
+				if !settled {
+					continue // not past the initial settle yet
+				}
 				if did, err := sr.Tick(); err != nil {
 					slog.Debug("kernel-self-recovery tick error", "err", err)
 				} else if did {

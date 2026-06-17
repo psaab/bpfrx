@@ -201,7 +201,13 @@ carrying traffic:
    ForceSecondary call would be a no-op). Unlike `ManualFailover` this
    hold is NOT auto-cleared for an isolated node — a candidate with a
    broken dataplane stays secondary even if it can't see the peer. It is
-   cleared only by promote (verified), rejoin, or revert.
+   cleared only by promote (verified), rejoin, or revert. Because the
+   promotion gate runs in a SEPARATE process (`xpf-kernel-promote.service`,
+   `After=xpfd`) that clears only the on-disk journal, the running daemon
+   reconciles the in-memory hold against the journal on a 5s cadence and
+   releases it once the candidate is no longer ARMED (promoted or
+   reverted) — otherwise a successfully promoted candidate would stay
+   secondary forever.
 2. **Lease-suppressed self-recovery.** If the orchestrator CRASHES while a
    node is drained+rebooting, the node would sit passive forever. The
    bounded local self-recovery (`pkg/upgrade/KernelSelfRecovery`,
