@@ -12,9 +12,10 @@ Pipeline: build the xpf .deb (`make deb`; no `make generate` — embeds the
 #1864 tracked shim) -> discover + SHA256-verify the latest Ubuntu cloud
 image (XPF_BASE_RELEASE pins) -> virt-resize root into a work disk ->
 virt-customize (runtime packages, linux-generic >= 6.18 with the full
-driver set, purge cloud-init/snapd/stale kernels, networkd,
-init_on_alloc=0, `apt-get install ./xpf.deb` which stages the binaries +
-creates the /usr/local/sbin symlinks + enables the units via its postinst)
+driver set, purge cloud-init/snapd/stale kernels, HOLD the kernel so apt
+cannot move the verifier floor (#1930), networkd, init_on_alloc=0,
+`apt-get install ./xpf.deb` which stages the binaries + creates the
+/usr/local/sbin symlinks + enables the units via its postinst)
 -> virt-sysprep seal -> virt-sparsify+compress export -> checksums +
 manifest -> in-guest verify-dataplane validation gate (validate.py).
 
@@ -237,6 +238,39 @@ def virt_customize(work_qcow, xpf_deb):
         "--run-command",
         'n=$(ls /lib/modules | wc -l); [ "$n" -eq 1 ] || '
         '{ echo "FATAL: $n kernels in /lib/modules after purge ($(ls /lib/modules | tr "\\n" " "))" >&2; exit 1; }',
+        # #1930 INC-0: HOLD the kernel so an unattended `apt upgrade` cannot move
+        # the running kernel out from under the verifier-gated shim .o (#1864).
+        # The embedded AF_XDP shim is kernel-space-verifier-gated; a kernel the
+        # .o has never been verified against can REJECT it at boot -> no
+        # dataplane. A kernel bump must be an explicit, verify-gated operator
+        # action (the LANE-1 channel, #1930), never silent apt drift.
+        #
+        # `apt-mark hold linux-*` MUST NOT be a bare glob: apt-mark does not
+        # expand wildcards, and the shell would expand `linux-*` against the cwd
+        # (holding nothing). Enumerate the installed kernel package set via
+        # dpkg-query instead. HARD-ASSERT at least the meta + image are held so a
+        # silent hold failure cannot ship an unprotected image.
+        "--run-command",
+        'export DEBIAN_FRONTEND=noninteractive; '
+        'pkgs=$(dpkg-query -W -f="${Package}\\n" "linux-image-*" "linux-headers-*" '
+        '"linux-modules-*" "linux-generic" 2>/dev/null | sort -u); '
+        '[ -n "$pkgs" ] || { echo "FATAL: no linux-* packages found to hold" >&2; exit 1; }; '
+        'apt-mark hold $pkgs >/dev/null; '
+        'held=$(apt-mark showhold | grep -c "^linux-"); '
+        '[ "$held" -ge 2 ] || '
+        '{ echo "FATAL: kernel hold did not take ($held linux-* held: $(apt-mark showhold | tr "\\n" " "))" >&2; exit 1; }; '
+        'echo "#1930: held $held linux-* packages"',
+        # Exclude linux-* from unattended-upgrades too: a hold protects an
+        # interactive `apt upgrade`, but unattended-upgrades can be configured to
+        # bypass holds for security. Kernel CVEs flow through the verify-gated
+        # LANE-1 channel (#1930), NOT unattended-upgrades.
+        "--write",
+        "/etc/apt/apt.conf.d/99-xpf-kernel-hold:"
+        "// xpf (#1930): never let unattended-upgrades move the kernel.\n"
+        "// The embedded AF_XDP shim is kernel-verifier-gated (#1864); kernel\n"
+        "// bumps go through the verify-gated LANE-1 channel, not background apt.\n"
+        'Unattended-Upgrade::Package-Blacklist { "linux-"; "linux-image-"; '
+        '"linux-headers-"; "linux-modules-"; "linux-generic"; };\n',
         "--run-command", "export DEBIAN_FRONTEND=noninteractive && apt-get purge -y -qq snapd "
                          "2>/dev/null || true; rm -rf /snap /var/snap /var/lib/snapd /var/cache/snapd",
         "--run-command", 'export DEBIAN_FRONTEND=noninteractive && apt-get purge -y -qq "cloud-init*" '
@@ -261,6 +295,17 @@ def virt_customize(work_qcow, xpf_deb):
         "--run-command", "export DEBIAN_FRONTEND=noninteractive && "
                          f"apt-get install -y -qq -o Acquire::Retries=5 /var/tmp/{deb_name} && "
                          f"rm -f /var/tmp/{deb_name}",
+        # #1930 INC-0: keep needrestart from auto-restarting xpfd mid-apt. On a
+        # base with needrestart installed, the end-of-transaction scan restarts
+        # processes running deleted binaries — which would cut the dataplane
+        # during a kernel install in the LANE-1 channel. Blacklist xpfd + the
+        # runtime version dirs (harmless no-op if needrestart is absent).
+        "--write",
+        "/etc/needrestart/conf.d/99-xpf.conf:"
+        "# xpf (#1930): never auto-restart the dataplane during an apt run.\n"
+        '$nrconf{override_rc} = { qr(^xpfd\\.service$) => 0 };\n'
+        "push @{$nrconf{blacklist}}, "
+        "qr(^/var/lib/xpf/versions/), qr(^/usr/local/share/xpf/staged/);\n",
         "--write", f"/etc/default/grub.d/99-xpf.cfg:{GRUB_DROPIN}",
         "--run-command", "update-grub",
         "--write", f"/etc/ssh/sshd_config.d/10-xpf-factory.conf:{SSHD_DROPIN}",

@@ -5464,3 +5464,7 @@ top.
 - **Timestamp**: 2026-06-16
   - **Action**: README getting-started restructure (PR #1937) — rewrote README into install/getting-started guide (3 paths: .deb, incus image, kvm/libvirt) cross-checked against Makefile deb/image targets, debian/control+postinst, scripts/image/bake.py + make_config_drive.py, scripts/deploy/xpf-deploy.py. Moved deep reference content into new docs/architecture.md, docs/feature-coverage.md, docs/network-topology.md, docs/critical-patterns.md, docs/README.md. Docs-only.
   - **File(s)**: README.md, docs/architecture.md, docs/feature-coverage.md, docs/network-topology.md, docs/critical-patterns.md, docs/README.md, docs/pr/readme-getting-started/reviewer-ids.md
+
+- **Timestamp**: 2026-06-16
+  - **Action**: #1930 INC-0 (PR-1 first slice) — image kernel hold + apt safety. bake.py now `apt-mark hold`s the installed linux-* set (dpkg-query enumeration, not a bare glob; HARD-ASSERTs ≥2 held), writes an unattended-upgrades Package-Blacklist for linux-*, and a needrestart blacklist for xpfd + the runtime version dirs. Closes the "unattended apt moves the verifier floor" hole with no daemon code.
+  - **File(s)**: scripts/image/bake.py, docs/install-images.md, _Log.md

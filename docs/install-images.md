@@ -49,7 +49,12 @@ Pipeline (offline — the image is never booted to provision it):
    `linux-virtual` kernel replaced by `linux-generic` (full driver set
    — mlx5/i40e for passthrough NICs live in `linux-modules-extra`)
    with in-bake asserts that the kernel meets the >= 6.18 verifier
-   floor and the extra-modules tree is present, purge of cloud-init
+   floor and the extra-modules tree is present, **the kernel held
+   (`apt-mark hold`) + excluded from unattended-upgrades so an apt run
+   cannot move the verifier floor out from under the gated shim .o
+   (#1930) — kernel bumps go through the verify-gated LANE-1 channel, not
+   background apt; a `needrestart` blacklist keeps an apt run from
+   restarting xpfd mid-transaction**, purge of cloud-init
    (a competing network manager), snapd, and the virtual-kernel
    metapackages, systemd-networkd + resolved enabled, FRR + chrony
    enabled (default NTP pools neutered; xpfd manages
