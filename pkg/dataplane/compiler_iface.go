@@ -1129,6 +1129,24 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 		}
 	}
 
+	// #1956: in device-map mode with unmapped-interface-policy leave-alone
+	// (the bare-metal default), NICs that are neither mapped nor protected
+	// are INVISIBLE to xpf — never marked Unmanaged, never address-stripped,
+	// never brought down. This is the F2 fix: a real host has NICs xpf must
+	// not touch (BMC/IPMI shared NIC, storage fabric, the admin's own mgmt
+	// path). manage-down reproduces today's claim-all for operators who DO
+	// want xpf to own the whole box.
+	leaveAloneUnmapped := false
+	mappedLinuxNames := make(map[string]bool)
+	if dm := cfg.Chassis.DeviceMap; dm.Active() {
+		if dm.EffectiveUnmappedPolicy() == config.DeviceMapPolicyLeaveAlone {
+			leaveAloneUnmapped = true
+		}
+		for _, e := range dm.Entries {
+			mappedLinuxNames[config.LinuxIfName(e.LogicalName)] = true
+		}
+	}
+
 	allIfaces, _ := net.Interfaces()
 	for _, iface := range allIfaces {
 		name := iface.Name
@@ -1141,6 +1159,13 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 			if seen[name[:idx]] {
 				continue
 			}
+		}
+		// #1956 leave-alone: skip any NIC that is not a mapped logical name
+		// (mapped-but-unconfigured NICs still fall through to the normal
+		// unmanaged handling so a mapped-but-not-in-a-zone NIC is brought
+		// down as before; only genuinely UNMAPPED NICs are left alone).
+		if leaveAloneUnmapped && !mappedLinuxNames[name] {
+			continue
 		}
 		mac := iface.HardwareAddr.String()
 		if mac == "" {

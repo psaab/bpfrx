@@ -342,7 +342,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// the operator stays reachable. No other NIC is touched.
 			d.setupBootstrapLifeline()
 		} else {
-			if err := enumerateAndRenameInterfaces(nodeID, clusterMode, userspaceWorkers, rssEnabled, rssAllowed); err != nil {
+			// #1956: device-map mode (opt-in) renames ONLY mapped NICs by
+			// stable identity and leaves the rest alone. Positional mode
+			// (no device-map) is bit-identical to pre-#1956.
+			if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.DeviceMap.Active() {
+				if err := enumerateAndRenameMapped(cfg.Chassis.DeviceMap, cfg); err != nil {
+					slog.Warn("device-map interface naming failed", "err", err)
+				}
+			} else if err := enumerateAndRenameInterfaces(nodeID, clusterMode, userspaceWorkers, rssEnabled, rssAllowed); err != nil {
 				slog.Warn("interface naming failed", "err", err)
 			}
 			// #801: host tunables + coalescence. Runs after the interface
@@ -1553,8 +1560,17 @@ func (d *Daemon) runBootstrapExitStartup(cfg *config.Config) {
 	}
 
 	// Full rename loop — the lifeline-gated path only renamed fxp0 (or
-	// nothing). Now claim every NIC per the vSRX naming scheme.
-	if err := enumerateAndRenameInterfaces(nodeID, clusterMode, userspaceWorkers, rssEnabled, rssAllowed); err != nil {
+	// nothing). Now claim the NICs per the active naming policy.
+	//
+	// #1956 R-4: bootstrap-exit (the FIRST real commit) is exactly when a
+	// device-map first appears, so this site must branch too — otherwise
+	// day-0 bare metal claims every NIC positionally before the map ever
+	// applies.
+	if cfg.Chassis.DeviceMap.Active() {
+		if err := enumerateAndRenameMapped(cfg.Chassis.DeviceMap, cfg); err != nil {
+			slog.Warn("bootstrap exit: device-map interface naming failed", "err", err)
+		}
+	} else if err := enumerateAndRenameInterfaces(nodeID, clusterMode, userspaceWorkers, rssEnabled, rssAllowed); err != nil {
 		slog.Warn("bootstrap exit: interface naming failed", "err", err)
 	}
 
