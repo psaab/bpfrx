@@ -101,6 +101,27 @@ func TestTeardownManageDownIsNoOp(t *testing.T) {
 	}
 }
 
+// TestDeviceMapLinkOriginalNameRoundTrips proves boot-stability of the
+// on-disk record: a written .link for a mapped NIC records the TRUE kernel
+// OriginalName=, and a later run recovers exactly that name (so the same
+// physical NIC keeps the same logical name across reboots / re-runs).
+func TestDeviceMapLinkOriginalNameRoundTrips(t *testing.T) {
+	withTempLinkDir(t)
+	// First run: enp9s0 -> ge-0-0-3 records OriginalName=enp9s0.
+	if !writeDeviceMapLinkFile("ge-0-0-3", "enp9s0", nil, nil) {
+		t.Fatalf("first .link write should report changed")
+	}
+	// A subsequent run that sees the NIC already named ge-0-0-3 must recover
+	// the original kernel name from the existing .link, not the logical name.
+	if got := recoverOriginalName("ge-0-0-3"); got != "enp9s0" {
+		t.Fatalf("OriginalName round-trip failed: recovered %q, want enp9s0", got)
+	}
+	// Re-writing the identical .link is a no-op (no churn).
+	if writeDeviceMapLinkFile("ge-0-0-3", "enp9s0", nil, nil) {
+		t.Fatalf("identical .link re-write must be a no-op")
+	}
+}
+
 func TestDeviceMapStrandsManagementSafeWhenMgmtMapped(t *testing.T) {
 	// The live mgmt NIC (enp5s0 currently == fxp0) is mapped to its own
 	// name => safe.

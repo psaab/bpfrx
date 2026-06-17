@@ -69,10 +69,16 @@ func enumerateAndRenameMapped(dm *config.DeviceMapConfig, cfg *config.Config) er
 	// Desired final name -> the NIC currently holding the identity.
 	desiredByCurrent := make(map[string]string) // currentName -> finalName
 	desiredNames := make(map[string]bool)       // set of final logical names
+	// originalByCurrent records the TRUE pre-rename kernel name for each
+	// bound NIC, captured BEFORE any temp rename, so the .link OriginalName=
+	// is the real udev-matchable name (a transient xpf-tmp-* name must never
+	// be recorded as OriginalName — it would not match on next boot).
+	originalByCurrent := make(map[string]string) // currentName -> OriginalName
 	for _, b := range bindings {
 		switch {
 		case b.Status.Bound():
 			desiredByCurrent[b.CurrentNIC] = b.Logical
+			originalByCurrent[b.CurrentNIC] = recoverOriginalName(b.CurrentNIC)
 			desiredNames[b.Logical] = true
 			slog.Info("device-map: resolved binding",
 				"logical", b.Entry.LogicalName, "current", b.CurrentNIC, "status", b.Status.String())
@@ -117,6 +123,12 @@ func enumerateAndRenameMapped(dm *config.DeviceMapConfig, cfg *config.Config) er
 		if final, ok := desiredByCurrent[n.Name]; ok {
 			delete(desiredByCurrent, n.Name)
 			desiredByCurrent[tmpName] = final
+			// Carry the TRUE original name across the temp rename so phase 2
+			// writes the correct OriginalName= (not xpf-tmp-N).
+			if orig, ok := originalByCurrent[n.Name]; ok {
+				delete(originalByCurrent, n.Name)
+				originalByCurrent[tmpName] = orig
+			}
 		} else {
 			// Unmapped NIC that was wearing a desired name — strand it for
 			// predictable-name restore in phase 3.
@@ -128,17 +140,22 @@ func enumerateAndRenameMapped(dm *config.DeviceMapConfig, cfg *config.Config) er
 	// Phase 2: rename each mapped NIC to its final logical name.
 	changed := false
 	for current, final := range desiredByCurrent {
+		// The OriginalName= is the TRUE pre-rename kernel name captured
+		// before any temp rename; fall back to recovering it if absent.
+		original := originalByCurrent[current]
+		if original == "" {
+			original = recoverOriginalName(current)
+		}
 		if current == final {
 			// Ensure a .link exists for boot persistence even when the name
 			// already matches (idempotent — writeDeviceMapLinkFile skips
 			// unchanged files).
-			if writeDeviceMapLinkFile(final, current, rethMembers, dm.Entries) {
+			if writeDeviceMapLinkFile(final, original, rethMembers, dm.Entries) {
 				changed = true
 			}
 			continue
 		}
 		// Write the .link FIRST so next boot's udev is correct, then rename.
-		original := deviceMapOriginalName(current, final)
 		if writeDeviceMapLinkFile(final, original, rethMembers, dm.Entries) {
 			changed = true
 		}
@@ -196,18 +213,6 @@ func enumerateAndRenameMapped(dm *config.DeviceMapConfig, cfg *config.Config) er
 		slog.Info("device-map: interface naming unchanged")
 	}
 	return nil
-}
-
-// deviceMapOriginalName returns the OriginalName= value to record for a
-// mapped NIC's .link file. We record the pre-rename kernel name (recovering
-// through any existing .link chain so a re-run is idempotent).
-func deviceMapOriginalName(current, final string) string {
-	// If `current` is already an xpf temp/logical name, recover the true
-	// original via the existing .link chain.
-	if rec := recoverOriginalName(current); rec != "" && rec != current {
-		return rec
-	}
-	return current
 }
 
 // writeDeviceMapLinkFile writes the .link for a mapped NIC. RETH members
