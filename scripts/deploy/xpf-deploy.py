@@ -922,31 +922,49 @@ def _read_image_manifest_versions(path):
     return d
 
 
+def _u16(s):
+    """Parse a uint16 (matches the Go strconv.ParseUint(.,10,16) gate semantics —
+    MEDIUM Codex: Python int() would accept -1 / 70000). Returns None on failure
+    so the caller fails closed, exactly as the Go gate's `present` map does."""
+    try:
+        n = int(s)
+    except (TypeError, ValueError):
+        return None
+    if n < 0 or n > 0xFFFF:
+        return None
+    return n
+
+
 def _gate_mixed_base(new_img, peer):
-    """Python mirror of upgrade.GateMixedBaseSwap (unit-tested in Go). Returns
-    (sessions_survive: bool, reason: str). Fail-closed on any missing field."""
+    """EXACT Python mirror of upgrade.GateMixedBaseSwap (unit-tested in Go).
+    Returns (sessions_survive: bool, reason: str). Fail-closed on any missing or
+    out-of-range field, an unknown peer HA, an out-of-window peer, or an unknown
+    / mismatched peer session-sync."""
     required = ["ha-protocol-version", "ha-protocol-min-compat",
                 "session-sync-protocol-version"]
     for k in required:
         if k not in new_img:
             return False, f"new image manifest missing {k!r} — fail closed (replace both, sessions drop)"
-    try:
-        img_ha = int(new_img["ha-protocol-version"])
-        img_floor = int(new_img["ha-protocol-min-compat"])
-        img_sync = int(new_img["session-sync-protocol-version"])
-    except ValueError as e:
-        return False, f"unparsable new image versions ({e}) — fail closed"
-    try:
-        peer_ha = int(peer.get("ha-protocol-version", "0"))
-        peer_sync = int(peer.get("session-sync-protocol-version", "0"))
-    except ValueError as e:
-        return False, f"unparsable peer versions ({e}) — fail closed"
+    img_ha = _u16(new_img["ha-protocol-version"])
+    img_floor = _u16(new_img["ha-protocol-min-compat"])
+    img_sync = _u16(new_img["session-sync-protocol-version"])
+    if img_ha is None or img_floor is None or img_sync is None:
+        return False, "unparsable/out-of-range new image versions — fail closed"
+    peer_ha = _u16(peer.get("ha-protocol-version", "0"))
+    peer_sync = _u16(peer.get("session-sync-protocol-version", "0"))
+    if peer_ha is None or peer_sync is None:
+        return False, "unparsable/out-of-range peer versions — fail closed"
     if peer_ha == 0:
         return False, "peer HA protocol unknown — fail closed"
     if peer_ha < img_floor or peer_ha > img_ha:
         return (False, f"peer HA protocol {peer_ha} outside new image window "
                 f"[{img_floor},{img_ha}] — replace BOTH nodes (sessions drop)")
-    if peer_sync != 0 and peer_sync != img_sync:
+    # An UNKNOWN peer session-sync (0) fails closed — same as the Go gate
+    # (r3 Codex HIGH: 0 must NOT be skipped as compatible).
+    if peer_sync == 0:
+        return False, ("peer session-sync protocol unknown — fail closed "
+                       "(replace both nodes, sessions drop)")
+    if peer_sync != img_sync:
         return (False, f"session-sync protocol differs (peer {peer_sync}, new image "
                 f"{img_sync}) — replace BOTH nodes (sessions drop)")
     return (True, f"new image HA {img_ha} (floor {img_floor}) accepts peer {peer_ha}; "
@@ -954,6 +972,8 @@ def _gate_mixed_base(new_img, peer):
 
 
 def cmd_image_roll(args):
+    import time as _time
+    import re as _re
     runner = Runner(args.dry_run)
     backend = args.backend
     nodes = args.nodes
@@ -961,15 +981,25 @@ def cmd_image_roll(args):
         die("image-roll needs exactly two --node arguments (the HA pair)")
     if nodes[0] == nodes[1]:
         die(f"image-roll needs two DISTINCT nodes; got {nodes[0]} twice")
+    node_ids = {nodes[0]: args.node0_id, nodes[1]: args.node1_id}
 
-    # The new image's protocol versions: prefer the manifest (a file read), else
-    # the running staged binary is not available here, so the manifest is
-    # REQUIRED for the gate. Fail closed if absent.
+    # Validate the recreate hook BEFORE any drain (MEDIUM Codex: detecting a
+    # missing hook only after node[0] is drained would strand it demoted). The
+    # hook is required for the real run; dry-run only prints the plan.
+    if not args.dry_run and not args.recreate_hook:
+        die("image-roll needs --recreate-hook <script> (the backend-specific "
+            "destroy+launch+day-0 recreate step); refusing to drain without it.")
+
+    # The new image's protocol versions come from its manifest (a file read).
+    # REQUIRED for the gate — fail closed if absent.
     if not args.manifest or not os.path.isfile(args.manifest):
         die("image-roll requires --manifest <xpf-<ver>.manifest> (the new image's "
             "version manifest) for the mixed-base gate; not found")
     new_img = _read_image_manifest_versions(args.manifest)
 
+    holder = _re.sub(r"[^A-Za-z0-9._:-]", "_",
+                     f"{os.uname().nodename}:pid{os.getpid()}")
+    lease_ttl = args.lease_ttl
     drain_deadline = args.drain_deadline
     boot_deadline = args.boot_deadline
 
@@ -977,58 +1007,83 @@ def cmd_image_roll(args):
           f"(recreate each from {os.path.basename(args.manifest)}; peer keeps forwarding)")
 
     def roll_one(node, peer, is_second):
-        print(f"\n--- rolling {node}; {peer} stays primary ---")
-        # The MIXED-BASE GATE protects the SECOND swap: at that point the FIRST
-        # node already runs the NEW image and the peer (this `peer`, the not-yet-
-        # rolled... no: by the second roll, `peer` is the ALREADY-rolled node on
-        # the NEW image). The risk window is the FIRST swap: after it, node[0]
-        # runs NEW while node[1] still runs OLD. So gate BEFORE the first swap,
-        # reading the still-OLD peer's live protocol.
-        if not is_second:
-            peer_v = _node_protocol_versions(runner, backend, peer)
-            survive, reason = _gate_mixed_base(new_img, peer_v)
-            print(f"   mixed-base gate: {reason}")
-            if not survive and not args.allow_session_drop:
-                die(f"mixed-base gate FAILED: {reason}\n"
-                    f"   The new image is not session-compatible with the running "
-                    f"peer {peer}. Re-image BOTH nodes together (accept the "
-                    f"connection drop) or pass --allow-session-drop to proceed "
-                    f"node-by-node anyway (sessions WILL drop at the failover).")
-            if not survive:
-                print(f"   --allow-session-drop set: proceeding; sessions WILL drop")
+        nid = node_ids[node]
+        print(f"\n--- rolling {node} (node-id {nid}); {peer} stays primary ---")
+        # Cross-orchestrator mutex (HIGH Codex): acquire the SAME kernel-roll
+        # lease on BOTH nodes in canonical (sorted) order before draining, so two
+        # operators rolling in opposite order can't both drain concurrently
+        # (no-primary window). Release-what-we-got + abort on partial acquisition.
+        ordered = sorted([node, peer])
+        got = []
+        for n in ordered:
+            if _acquire_lease(runner, backend, n, nid, holder, lease_ttl):
+                got.append(n)
+            else:
+                for g in got:
+                    _clear_lease(runner, backend, g, holder)
+                die(f"{n}: could not acquire image-roll lease (another orchestrator "
+                    f"holds it, or the lock timed out) — released {got or 'nothing'} "
+                    f"and aborting.")
+        try:
+            # MIXED-BASE GATE: the risk window is the FIRST swap (after it node[0]
+            # is NEW while node[1] is still OLD). Gate BEFORE the first swap,
+            # reading the still-OLD peer's live protocol. The second swap is into
+            # the same already-validated pair, so it is not re-gated.
+            allow_mixed = is_second  # second drain runs against the rolled (NEW) peer
+            if not is_second:
+                peer_v = _node_protocol_versions(runner, backend, peer)
+                survive, reason = _gate_mixed_base(new_img, peer_v)
+                print(f"   mixed-base gate: {reason}")
+                if not survive and not args.allow_session_drop:
+                    die(f"mixed-base gate FAILED: {reason}\n"
+                        f"   The new image is not session-compatible with the running "
+                        f"peer {peer}. Re-image BOTH nodes together (accept the "
+                        f"connection drop) or pass --allow-session-drop to proceed "
+                        f"node-by-node anyway (sessions WILL drop at the failover).")
+                if not survive:
+                    print(f"   --allow-session-drop set: proceeding; sessions WILL drop")
+                    allow_mixed = True  # gate waived -> also relax the drain HA check
 
-        # 1. drain node -> peer (confirmed; never recreate an undrained primary).
-        print(f"   draining {node} -> {peer} (confirmed)...")
-        _node_exec(runner, backend, node, ["xpfd", "upgrade", "kernel", "drain"])
+            # 1. drain node -> peer (confirmed; never recreate an undrained
+            #    primary). --allow-mixed-ha relaxes the drain's exact-equality HA
+            #    precheck when the gate already validated window-compat (HIGH
+            #    Codex): the second node drains against an already-rolled peer.
+            drain_cmd = ["xpfd", "upgrade", "kernel", "drain",
+                         "--drain-deadline", f"{drain_deadline}s"]
+            if allow_mixed:
+                drain_cmd.append("--allow-mixed-ha")
+            print(f"   draining {node} -> {peer} (confirmed)...")
+            _node_exec(runner, backend, node, drain_cmd)
 
-        # 2. recreate the node from the new image. This is the existing per-node
-        #    launch (boot-disk swap + day-0 re-apply of xpf.conf + node-id). The
-        #    node boots the NEW base, factory-bootstraps its config DB from the
-        #    day-0 text, verifies the dataplane, and rejoins.
-        if runner.dry:
-            print(f"   (dry-run) would recreate {node} from the new image "
-                  f"(launch + day-0), poll boot+verify, then rejoin")
-            return
-        _recreate_node_from_image(runner, backend, node, args)
+            # 2. recreate the node from the new image (launch + day-0 re-apply).
+            if runner.dry:
+                print(f"   (dry-run) would recreate {node} from the new image "
+                      f"(launch + day-0), poll boot+verify, then rejoin")
+                return
+            _recreate_node_from_image(runner, backend, node, args)
 
-        # 3. poll until the node is back + forwarding (verify-dataplane passed at
-        #    boot via the day-0/factory path).
-        deadline = _time.time() + boot_deadline
-        back = False
-        while _time.time() < deadline:
-            _time.sleep(10)
-            pv = _node_protocol_versions(runner, backend, node)
-            if pv.get("xpf-version"):  # node is up + xpfd responds
-                back = True
-                break
-        if not back:
-            die(f"{node} did not come back within {boot_deadline}s after image "
-                f"recreate; STOPPING — {peer} stays primary. Investigate.")
-        print(f"   {node} back on the new image")
+            # 3. poll until the node is back (xpfd answers protocol-versions).
+            deadline = _time.time() + boot_deadline
+            back = False
+            while _time.time() < deadline:
+                _time.sleep(10)
+                pv = _node_protocol_versions(runner, backend, node)
+                if pv.get("xpf-version"):
+                    back = True
+                    break
+            if not back:
+                die(f"{node} did not come back within {boot_deadline}s after image "
+                    f"recreate; STOPPING — {peer} stays primary. Investigate.")
+            print(f"   {node} back on the new image")
 
-        # 4. rejoin + confirm sync BEFORE touching the peer (never-both-down).
-        print(f"   rejoining {node} (confirming sync)...")
-        _node_exec(runner, backend, node, ["xpfd", "upgrade", "kernel", "rejoin"])
+            # 4. rejoin + confirm sync BEFORE touching the peer (never-both-down).
+            print(f"   rejoining {node} (confirming sync)...")
+            _node_exec(runner, backend, node,
+                       ["xpfd", "upgrade", "kernel", "rejoin",
+                        "--drain-deadline", f"{drain_deadline}s"])
+        finally:
+            _clear_lease(runner, backend, node, holder)
+            _clear_lease(runner, backend, peer, holder)
 
     roll_one(nodes[0], nodes[1], is_second=False)
     print(f"\n==> {nodes[0]} done; rolling the second node")
@@ -1145,8 +1200,15 @@ def main():
                               "the node from the new image + re-apply day-0 "
                               "(backend-specific); receives XPF_ROLL_NODE in env")
         sub.add_argument("--backend", default="incus", choices=["incus", "ssh"])
+        sub.add_argument("--node0-id", type=int, default=0,
+                         help="cluster node-id of the FIRST --node (default 0)")
+        sub.add_argument("--node1-id", type=int, default=1,
+                         help="cluster node-id of the SECOND --node (default 1)")
+        sub.add_argument("--lease-ttl", type=int, default=1800,
+                         help="image-roll lease TTL seconds (cross-orchestrator "
+                              "mutex; also suppresses the node's self-recovery)")
         sub.add_argument("--drain-deadline", type=int, default=30,
-                         help="seconds to confirm the drain predicate")
+                         help="seconds to confirm the drain/rejoin predicate")
         sub.add_argument("--boot-deadline", type=int, default=600,
                          help="seconds to wait for a recreated node to come back "
                               "before STOPPING the roll")

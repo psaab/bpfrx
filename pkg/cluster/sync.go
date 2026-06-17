@@ -17,6 +17,18 @@ import (
 // syncMagic identifies cluster session-sync protocol packets.
 var syncMagic = [4]byte{'B', 'P', 'S', 'Y'}
 
+// SessionSyncWireVersion is the schema version of the CROSS-CHASSIS session-sync
+// wire protocol (the `syncMagic`/`syncMsg*`/`syncHeader` binary format below —
+// NOT the daemon↔helper local control socket `userspace.ProtocolVersion`). It is
+// the version the #1930 INC-3 mixed-base image-replace gate must compare across
+// a mixed-base cluster: two nodes can only sync sessions if they speak the same
+// sync wire schema. Bump this whenever the `syncMsg*` set or `syncHeader`
+// changes incompatibly. The header has no on-wire version field today
+// (compatibility has ridden the HA protocol version); this constant makes the
+// sync schema version explicit for the gate. It is currently pinned to the HA
+// protocol version since the two have evolved together.
+const SessionSyncWireVersion = uint16(LegacyHAProtocolVersion)
+
 const (
 	syncMsgSessionV4              = 1
 	syncMsgSessionV6              = 2

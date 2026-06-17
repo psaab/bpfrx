@@ -15,7 +15,7 @@ import (
 	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/daemon"
 	"github.com/psaab/xpf/pkg/dataplane"
-	"github.com/psaab/xpf/pkg/dataplane/userspace"
+	_ "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/frr"
 )
 
@@ -44,8 +44,11 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "protocol-versions" {
 		fmt.Printf("xpf-version=%s\n", version)
 		fmt.Printf("ha-protocol-version=%d\n", cluster.CurrentHAProtocolVersion)
-		fmt.Printf("ha-protocol-min-compat=%d\n", cluster.LegacyHAProtocolVersion)
-		fmt.Printf("session-sync-protocol-version=%d\n", userspace.ProtocolVersion)
+		fmt.Printf("ha-protocol-min-compat=%d\n", cluster.MinCompatHAProtocolVersion)
+		// The CROSS-CHASSIS session-sync wire schema (pkg/cluster/sync.go) —
+		// NOT the daemon↔helper local control socket (userspace.ProtocolVersion),
+		// which has nothing to do with whether two CHASSIS can sync sessions.
+		fmt.Printf("session-sync-protocol-version=%d\n", cluster.SessionSyncWireVersion)
 		fmt.Printf("configdb-envelope-version=%d\n", configstore.EnvelopeFormatVersion)
 		fmt.Printf("configdb-min-reader-version=%d\n", configstore.EnvelopeMinReaderVersion)
 		return

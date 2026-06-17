@@ -19,7 +19,7 @@ const drainPollInterval = 1 * time.Second
 // predicate (peer owns the RGs + sync clean) within deadline. It first refuses
 // to drain if the peer is not takeover-ready or the HA protocol is incompatible
 // — so a drain can never strand VIPs or split a mixed-protocol cluster.
-func DrainAndConfirm(cl RollingCluster, deadline time.Duration) error {
+func DrainAndConfirm(cl RollingCluster, deadline time.Duration, allowMixedHA bool) error {
 	// Pre-checks: a peer that cannot take over must NOT be drained to.
 	alive, err := cl.PeerAlive()
 	if err != nil {
@@ -28,13 +28,22 @@ func DrainAndConfirm(cl RollingCluster, deadline time.Duration) error {
 	if !alive {
 		return fmt.Errorf("peer is not alive — refusing to drain (no node to take over)")
 	}
-	compat, err := cl.HAProtocolCompatible()
-	if err != nil {
-		return fmt.Errorf("HA-protocol check: %w", err)
-	}
-	if !compat {
-		return fmt.Errorf("HA/session-sync protocol incompatible with peer — " +
-			"this kernel roll is not safe; use image-replace (LANE 2)")
+	// HAProtocolCompatible is EXACT-equality (local==peer). For the LANE-1
+	// kernel roll the cluster is single-version, so equality is correct. For the
+	// LANE-2 image-roll the mixed-base gate has ALREADY validated window-compat
+	// (peer in [min-compat, version]), and the SECOND node's drain runs against
+	// an already-rolled peer that may legitimately differ within that window —
+	// exact-equality would wrongly abort it (r3 Codex HIGH). The orchestrator
+	// passes allowMixedHA to relax this one check in that vetted case only.
+	if !allowMixedHA {
+		compat, err := cl.HAProtocolCompatible()
+		if err != nil {
+			return fmt.Errorf("HA-protocol check: %w", err)
+		}
+		if !compat {
+			return fmt.Errorf("HA/session-sync protocol incompatible with peer — " +
+				"this kernel roll is not safe; use image-replace (LANE 2)")
+		}
 	}
 	ready, err := cl.PeerTakeoverReady()
 	if err != nil {

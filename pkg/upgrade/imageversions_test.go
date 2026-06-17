@@ -75,6 +75,14 @@ func TestGateMixedBase_SessionSyncMismatch_DropsClosed(t *testing.T) {
 	}
 }
 
+func TestGateMixedBase_UnknownPeerSessionSync_DropsClosed(t *testing.T) {
+	iv, _ := parseImageVersions(sampleProtoVersions) // sync 3, HA window [1,2]
+	// peer HA is fine (1) but peer session-sync is UNKNOWN (0) -> fail closed.
+	if v := GateMixedBaseSwap(iv, 1, 0); v.SessionsSurvive {
+		t.Fatalf("unknown peer session-sync must fail closed: %s", v.Reason)
+	}
+}
+
 func TestGateMixedBase_MissingFields_DropsClosed(t *testing.T) {
 	iv, _ := parseImageVersions("xpf-version=1.2.3\n") // no protocol fields
 	if v := GateMixedBaseSwap(iv, 1, 3); v.SessionsSurvive {

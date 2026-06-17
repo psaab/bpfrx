@@ -1,5 +1,27 @@
 # Action Log
 
+## 2026-06-16 — #1930 INC-3: address Codex r1 (6 HIGH + 2 MED + 1 LOW)
+- **Timestamp**: 2026-06-16 UTC
+- **Action**: Fixed Codex review findings on INC-3. HIGH: (1)
+  protocol-versions emitted userspace.ProtocolVersion (local socket) as
+  session-sync — added cluster.SessionSyncWireVersion (the cross-chassis
+  wire schema) + emit it; (2) min-compat was LegacyHAProtocolVersion —
+  added cluster.MinCompatHAProtocolVersion (a deliberate floor, re-eval per
+  bump); (3) unknown peer session-sync (0) treated compatible — now fail
+  closed (Go + Python); (4) second image-roll drain reused LANE-1 exact-eq
+  HA precheck — added DrainAndConfirm allowMixedHA + `--allow-mixed-ha`
+  drain flag, image-roll passes it on the second node; (5) image-roll
+  crashed on undefined _time — added import; (6) no cross-orchestrator
+  lease — image-roll now acquires/releases the kernel-roll lease on both
+  nodes (canonical order, finally-release). MED: hook validated before any
+  drain; Python _u16 bounds-checks like Go ParseUint(16). LOW: wired
+  --drain-deadline through drain/rejoin. New tests:
+  GateMixedBase_UnknownPeerSessionSync, DrainAndConfirmAllowMixedHA.
+- **File(s)**: cmd/xpfd/main.go, cmd/xpfd/upgrade_kernel.go,
+  pkg/cluster/heartbeat.go, pkg/cluster/sync.go, pkg/upgrade/kernel_drain.go,
+  pkg/upgrade/kernel_drain_test.go, pkg/upgrade/imageversions.go,
+  pkg/upgrade/imageversions_test.go, scripts/deploy/xpf-deploy.py
+
 ## 2026-06-16 — #1930 INC-3: mixed-base gate + image-roll driver + LANE-2/3 docs
 - **Timestamp**: 2026-06-16 UTC
 - **Action**: Added the LANE-2 mixed-base compatibility gate

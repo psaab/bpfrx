@@ -150,8 +150,14 @@ func GateMixedBaseSwap(newImg *ImageVersions, peerHAProtocol uint16, peerSession
 				"replace BOTH nodes (sessions drop)",
 			peerHAProtocol, newImg.HAProtocolMinCompat, newImg.HAProtocol)}
 	}
-	// Session-sync frame format is exact-match (unversioned for skew).
-	if peerSessionSync != 0 && peerSessionSync != newImg.SessionSyncProtocol {
+	// Session-sync frame format is exact-match (unversioned for skew). An UNKNOWN
+	// peer session-sync (0) fails closed — we cannot prove the synced frames will
+	// decode (r3 Codex HIGH: 0 was previously skipped as "compatible").
+	if peerSessionSync == 0 {
+		return MixedBaseVerdict{false,
+			"peer session-sync protocol unknown — fail closed (replace both nodes, sessions drop)"}
+	}
+	if peerSessionSync != newImg.SessionSyncProtocol {
 		return MixedBaseVerdict{false, fmt.Sprintf(
 			"session-sync protocol differs (peer %d, new image %d) — synced sessions "+
 				"would not decode across the mixed cluster; replace BOTH nodes (sessions drop)",
