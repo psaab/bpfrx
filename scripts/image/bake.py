@@ -12,9 +12,10 @@ Pipeline: build the xpf .deb (`make deb`; no `make generate` — embeds the
 #1864 tracked shim) -> discover + SHA256-verify the latest Ubuntu cloud
 image (XPF_BASE_RELEASE pins) -> virt-resize root into a work disk ->
 virt-customize (runtime packages, linux-generic >= 6.18 with the full
-driver set, purge cloud-init/snapd/stale kernels, networkd,
-init_on_alloc=0, `apt-get install ./xpf.deb` which stages the binaries +
-creates the /usr/local/sbin symlinks + enables the units via its postinst)
+driver set, purge cloud-init/snapd/stale kernels, HOLD the kernel so apt
+cannot move the verifier floor (#1930), networkd, init_on_alloc=0,
+`apt-get install ./xpf.deb` which stages the binaries + creates the
+/usr/local/sbin symlinks + enables the units via its postinst)
 -> virt-sysprep seal -> virt-sparsify+compress export -> checksums +
 manifest -> in-guest verify-dataplane validation gate (validate.py).
 
@@ -237,6 +238,46 @@ def virt_customize(work_qcow, xpf_deb):
         "--run-command",
         'n=$(ls /lib/modules | wc -l); [ "$n" -eq 1 ] || '
         '{ echo "FATAL: $n kernels in /lib/modules after purge ($(ls /lib/modules | tr "\\n" " "))" >&2; exit 1; }',
+        # #1930 INC-0: HOLD the kernel so an unattended `apt upgrade` cannot move
+        # the running kernel out from under the verifier-gated shim .o (#1864).
+        # The embedded AF_XDP shim is kernel-space-verifier-gated; a kernel the
+        # .o has never been verified against can REJECT it at boot -> no
+        # dataplane. A kernel bump must be an explicit, verify-gated operator
+        # action (the LANE-1 channel, #1930), never silent apt drift.
+        #
+        # `apt-mark hold linux-*` MUST NOT be a bare glob: apt-mark does not
+        # expand wildcards, and the shell would expand `linux-*` against the cwd
+        # (holding nothing). Enumerate the installed kernel package set via
+        # dpkg-query instead. `set -e` makes an apt-mark failure fatal, and we
+        # then VERIFY every enumerated package is actually in `apt-mark showhold`
+        # (per-package, not a count) so neither a partial hold nor a pre-existing
+        # unrelated hold can ship an unprotected image.
+        "--run-command",
+        'set -e; export DEBIAN_FRONTEND=noninteractive; '
+        'pkgs=$(dpkg-query -W -f="${Package}\\n" "linux-image-*" "linux-headers-*" '
+        '"linux-modules-*" "linux-generic" 2>/dev/null | sort -u); '
+        '[ -n "$pkgs" ] || { echo "FATAL: no linux-* packages found to hold" >&2; exit 1; }; '
+        # apt-mark hold failure is fatal (set -e + no output swallow); then
+        # verify EACH enumerated package is actually in showhold, so a
+        # pre-existing unrelated hold cannot mask a partial/failed hold.
+        'apt-mark hold $pkgs; '
+        'hold_set=$(apt-mark showhold); '
+        'for p in $pkgs; do '
+        'printf "%s\\n" "$hold_set" | grep -qxF "$p" || '
+        '{ echo "FATAL: $p not held after apt-mark hold (held: $(printf %s "$hold_set" | tr "\\n" " "))" >&2; exit 1; }; '
+        'done; '
+        'echo "#1930: held $(printf %s "$pkgs" | wc -w) linux-* packages: $(printf %s "$pkgs" | tr "\\n" " ")"',
+        # Exclude linux-* from unattended-upgrades too: a hold protects an
+        # interactive `apt upgrade`, but unattended-upgrades can be configured to
+        # bypass holds for security. Kernel CVEs flow through the verify-gated
+        # LANE-1 channel (#1930), NOT unattended-upgrades.
+        "--write",
+        "/etc/apt/apt.conf.d/99-xpf-kernel-hold:"
+        "// xpf (#1930): never let unattended-upgrades move the kernel.\n"
+        "// The embedded AF_XDP shim is kernel-verifier-gated (#1864); kernel\n"
+        "// bumps go through the verify-gated LANE-1 channel, not background apt.\n"
+        'Unattended-Upgrade::Package-Blacklist { "linux-"; "linux-image-"; '
+        '"linux-headers-"; "linux-modules-"; "linux-generic"; };\n',
         "--run-command", "export DEBIAN_FRONTEND=noninteractive && apt-get purge -y -qq snapd "
                          "2>/dev/null || true; rm -rf /snap /var/snap /var/lib/snapd /var/cache/snapd",
         "--run-command", 'export DEBIAN_FRONTEND=noninteractive && apt-get purge -y -qq "cloud-init*" '
@@ -261,6 +302,13 @@ def virt_customize(work_qcow, xpf_deb):
         "--run-command", "export DEBIAN_FRONTEND=noninteractive && "
                          f"apt-get install -y -qq -o Acquire::Retries=5 /var/tmp/{deb_name} && "
                          f"rm -f /var/tmp/{deb_name}",
+        # #1930 INC-0: the needrestart blacklist for xpfd is ALREADY shipped by
+        # the package (debian/xpf.needrestart -> /etc/needrestart/conf.d/xpf.conf,
+        # installed by the .deb above) using the correct APPEND form
+        # ($nrconf{override_rc}{qr(...)} = 0), which preserves needrestart's
+        # default override_rc set. We do NOT add a second bake-written file: a
+        # whole-hash assignment would wipe those defaults, and writing into
+        # /etc/needrestart/conf.d before the .deb creates it would fail the bake.
         "--write", f"/etc/default/grub.d/99-xpf.cfg:{GRUB_DROPIN}",
         "--run-command", "update-grub",
         "--write", f"/etc/ssh/sshd_config.d/10-xpf-factory.conf:{SSHD_DROPIN}",
