@@ -31,7 +31,7 @@ use super::poll_stages::{
     stage_screen_syn_cookie_ack_on_session_miss,
 };
 use super::*;
-use crate::policy::{evaluate_policy_result_with_len, evaluate_policy_with_len};
+use crate::policy::evaluate_policy_result_with_len;
 
 use cookie_reply::{SynCookieReply, enqueue_syn_cookie_reply};
 use nat_exception::{record_source_nat_failure, source_nat_decision_for_flow};
@@ -2430,20 +2430,76 @@ pub(super) fn poll_binding_process_descriptor(
                                         };
                                         (tag, t)
                                     };
-                                    let permit = matches!(
-                                        evaluate_policy_with_len(
-                                            &worker_ctx.forwarding.policy,
+                                    // #1913: the MissingNeighbor arm has its
+                                    // OWN policy evaluation (the main deny→
+                                    // PolicyDenied conversion lives only in the
+                                    // ForwardCandidate branch). Before this fix
+                                    // a DENY here merely skipped the SNAT
+                                    // allocation and fell through to session
+                                    // install + pending-neighbor buffer + the
+                                    // trailing reinject chokepoint with the
+                                    // disposition still MissingNeighbor — which
+                                    // IS slow-path-eligible, so a denied
+                                    // unresolved-neighbor cold-path packet was
+                                    // handed to the kernel FIB (a zone-policy
+                                    // bypass). Capture the full result so a DENY
+                                    // is converted to PolicyDenied, accounted,
+                                    // and dropped+recycled here, matching the
+                                    // ForwardCandidate deny path.
+                                    let policy_result = evaluate_policy_result_with_len(
+                                        &worker_ctx.forwarding.policy,
+                                        from_zone_id,
+                                        to_zone_id,
+                                        flow.src_ip,
+                                        flow.dst_ip,
+                                        flow.forward_key.protocol,
+                                        flow.forward_key.src_port,
+                                        flow.forward_key.dst_port,
+                                        desc.len as u64,
+                                    );
+                                    let permit =
+                                        matches!(policy_result.action, PolicyAction::Permit);
+                                    if !permit {
+                                        let owner_rg_id = owner_rg_for_resolution(
+                                            worker_ctx.forwarding,
+                                            pending_decision.resolution,
+                                        );
+                                        emit_policy_deny_event(
+                                            worker_ctx.event_stream,
+                                            flow,
+                                            meta,
                                             from_zone_id,
                                             to_zone_id,
-                                            flow.src_ip,
-                                            flow.dst_ip,
-                                            flow.forward_key.protocol,
-                                            flow.forward_key.src_port,
-                                            flow.forward_key.dst_port,
-                                            desc.len as u64,
-                                        ),
-                                        PolicyAction::Permit
-                                    );
+                                            owner_rg_id,
+                                            policy_result.policy_id,
+                                            policy_result.action,
+                                            now_ns,
+                                        );
+                                        telemetry.dbg.policy_deny += 1;
+                                        // Convert the disposition so per-
+                                        // disposition accounting records a
+                                        // policy_denied (not a neighbor miss)
+                                        // and the trailing reinject gate drops
+                                        // it. No session is seeded and the
+                                        // pending-neighbor buffer is skipped:
+                                        // a denied flow must never create
+                                        // forwarding state.
+                                        decision.resolution.disposition =
+                                            ForwardingDisposition::PolicyDenied;
+                                        record_forwarding_disposition(
+                                            &worker_ctx.ident,
+                                            DispositionCounters::Hot(telemetry.counters),
+                                            decision.resolution,
+                                            desc.len as u32,
+                                            Some(meta),
+                                            debug.as_ref(),
+                                            worker_ctx.recent_exceptions,
+                                            worker_ctx.last_resolution,
+                                            worker_ctx.forwarding,
+                                        );
+                                        binding.scratch.scratch_recycle.push(desc.addr);
+                                        continue;
+                                    }
                                     // #1620: cold-path histogram post-eval record.
                                     if cp_sample_tag {
                                         let t_out =

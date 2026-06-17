@@ -5694,6 +5694,72 @@ fn txn_tunnel_marked_missing_neighbor_not_buffered() {
     );
 }
 
+/// #1913 (Codex r1): a packet DENIED by zone policy whose forwarding
+/// resolution is `MissingNeighbor` (connected destination, no neighbor
+/// learned yet) must NOT be reinjected to the kernel slow path. The
+/// MissingNeighbor arm has its own policy evaluation that historically
+/// only gated SNAT — a DENY fell through to session install + pending-
+/// neighbor buffer + the trailing reinject chokepoint with the
+/// disposition still `MissingNeighbor` (slow-path-eligible), so a denied
+/// unresolved-neighbor cold-path packet leaked to the kernel FIB. The
+/// fix converts the deny to `PolicyDenied` and drops+recycles it inside
+/// the arm. Asserts: zero reinjects, no session created, not buffered.
+#[test]
+fn txn_policy_denied_missing_neighbor_is_dropped_not_reinjected() {
+    let mut snapshot = policy_deny_snapshot();
+    snapshot.zones = vec![
+        ZoneSnapshot {
+            name: "lan".to_string(),
+            id: TEST_LAN_ZONE_ID,
+        },
+        ZoneSnapshot {
+            name: "wan".to_string(),
+            id: TEST_WAN_ZONE_ID,
+        },
+    ];
+    // No neighbor for 172.16.80.200: the connected WAN route resolves
+    // but ARP is unresolved -> MissingNeighbor (the cold path under test).
+    snapshot.neighbors.clear();
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = BTreeMap::new();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+
+    // src 10.0.61.102 (lan, ingress ifindex 24) -> dst 172.16.80.200
+    // (connected wan). lan->wan is default-deny.
+    let frame = build_policy_deny_tcp_syn_frame();
+    let meta = txn_meta_v4(24, TCP_FLAG_SYN, (frame.len() - 14) as u16);
+    let sessions_before = sessions.len();
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+
+    assert!(
+        dbg.policy_deny >= 1,
+        "denied MissingNeighbor flow must be counted as a policy deny (#1913)"
+    );
+    assert_eq!(
+        binding.live.slow_path_packets.load(Ordering::Relaxed),
+        0,
+        "denied MissingNeighbor flow must NOT be reinjected to the kernel slow path (#1913)"
+    );
+    assert!(
+        binding.pending_neigh.is_empty(),
+        "denied flow must NOT be buffered for in-place neighbor retry (#1913)"
+    );
+    assert_eq!(
+        sessions.len(),
+        sessions_before,
+        "denied flow must NOT seed a MissingNeighbor session (#1913)"
+    );
+}
+
 /// #1885 fixture: WAN underlay (reth0.80, VLAN 80) + a gre endpoint
 /// whose local outer address is 172.16.80.8 and whose gr- interface
 /// (ifindex 77) carries the inner address 10.255.0.1/30, so an inner

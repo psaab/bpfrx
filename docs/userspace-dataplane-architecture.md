@@ -727,3 +727,10 @@ is [`userspace-dataplane-gaps.md`](userspace-dataplane-gaps.md).
   filter; its two intentional unfiltered callers (the FabricRedirect-Owned
   fallback in `tx/dispatch/mod.rs` and the ForwardCandidate build-failure
   fallback in `tx/dispatch/slow_path.rs`) own the eligibility decision.
+  Note that `MissingNeighbor` IS slow-path-eligible, so a denied flow
+  must be converted to `PolicyDenied` BEFORE it reaches the gate: the
+  MissingNeighbor arm has its own policy evaluation (the main
+  deny→PolicyDenied conversion lives only in the ForwardCandidate
+  branch) and converts a deny to `PolicyDenied` — dropping and recycling
+  without seeding a session or buffering for neighbor retry — so a denied
+  unresolved-neighbor cold-path packet is not slow-path-reinjected (#1913).
