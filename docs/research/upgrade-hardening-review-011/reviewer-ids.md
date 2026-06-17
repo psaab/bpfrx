@@ -25,3 +25,10 @@ Plan @ 99842573b on research/upgrade-hardening-review-011.
 
 Note: Codex r2 (task-mqinx2ih-6sbsso) was infra-dropped ("No job found");
 retried as task-mqio8yrx-i5zg40 per feedback_codex_infra_must_retry.
+
+## r4 (plan @ 2ed361a40, v2.3 — final confirm)
+| Round | Reviewer | ID | Verdict |
+|---|---|---|---|
+| r4 | Claude SMR | (PLAN-READY, unchanged from r3 — all AGY r3 folded) | PLAN-READY |
+| r4 | AGY | adversarial-review-mqiojq38-qdhj86 | pending |
+| r4 | Codex (retry) | task-mqiojqag-3xu8nc | pending (r2/r3 infra-dropped) |
