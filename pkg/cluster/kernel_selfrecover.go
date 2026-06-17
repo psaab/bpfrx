@@ -79,16 +79,15 @@ func (m *Manager) KernelUpgradeHeld() bool {
 }
 
 // ClearKernelUpgradeHold releases the kernel-upgrade election hold and re-runs
-// election so the node can take its normal role. The two real callers are
-// (1) the daemon's reconcileKernelUpgradeHold once the promotion marker confirms
-// THIS kernel was verified+promoted, and (2) ResetAllFailover (the local
-// self-recovery rejoin). NOTE: the orchestrator's gRPC `rejoin` clears manual
-// failover PER-RG (Manager.ResetFailover, not ResetAllFailover) and does NOT go
-// through here — that is fine, because the orchestrator only issues rejoin after
-// status reports promoted==version, by which point the marker-driven reconcile
-// has already released the hold. A reverted/failed roll deliberately KEEPS the
-// hold (fail-safe); the hold is then dropped by the reboot to known-good, where
-// it is never re-set.
+// election so the node can take its normal role. Callers: (1) the daemon's
+// reconcileKernelUpgradeHold once the promotion marker confirms THIS kernel was
+// verified+promoted, and (2) ResetAllFailover (the local self-recovery rejoin).
+// The orchestrator's gRPC `rejoin` clears the hold via a third path —
+// Manager.ResetFailover drops it inline per-RG so the node is election-eligible
+// the INSTANT rejoin returns, closing the never-both-down gap (r2 Codex HIGH:
+// otherwise the driver drains the peer while this node is still held). A
+// reverted/failed roll deliberately KEEPS the hold (fail-safe); it is then
+// dropped by the reboot to known-good, where it is never re-set.
 func (m *Manager) ClearKernelUpgradeHold() {
 	m.mu.Lock()
 	defer m.mu.Unlock()

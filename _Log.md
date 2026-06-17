@@ -1,5 +1,22 @@
 # Action Log
 
+## 2026-06-16 — #1930 INC-2: Codex 2 HIGH (arm-fail drain leak, rejoin/hold race)
+- **Timestamp**: 2026-06-16 UTC
+- **Action**: Fixed Codex's two HIGH findings. HIGH-1 (arm-failure leaves
+  node drained): `arm` is called check=False (a successful arm reboots →
+  nonzero exit), so an arm preflight FAILURE that never reboots left the
+  node ForceSecondary-drained with no lease; a retry could drain the peer
+  → no-primary window. Fix: track drained/completed/rebooted in roll_one;
+  the finally REJOINS a drained node that never rebooted (best-effort),
+  restoring forwarding. A rebooted node already lost the in-memory drain
+  so it is left alone. HIGH-2 (rejoin returns before hold clears →
+  both-secondary up to 5s): made Manager.ResetFailover (the gRPC rejoin
+  path) drop kernelUpgradeHold INLINE per-RG, so the node is
+  election-eligible the instant rejoin returns. Tests:
+  TestResetFailover_ClearsKernelUpgradeHold.
+- **File(s)**: scripts/deploy/xpf-deploy.py, pkg/cluster/failover.go,
+  pkg/cluster/kernel_selfrecover.go, pkg/cluster/election_test.go
+
 ## 2026-06-16 — #1930 INC-2: Copilot findings (orchestrator + drain + lease)
 - **Timestamp**: 2026-06-16 UTC
 - **Action**: Addressed Copilot review findings on the final diff. (Stale,

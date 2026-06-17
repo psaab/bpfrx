@@ -153,6 +153,19 @@ func (m *Manager) ResetFailover(rgID int) error {
 	if !ok {
 		return fmt.Errorf("redundancy group %d not found", rgID)
 	}
+	// A rejoin (manual `request ... reset`, or the kernel-roll orchestrator's
+	// `xpfd upgrade kernel rejoin`) means this node is verified and re-entering
+	// the cluster — drop the kernel-upgrade election hold too, SYNCHRONOUSLY, so
+	// the node is election-eligible the instant rejoin returns. Otherwise the
+	// hold would persist until the daemon's 5s reconcile tick, and the kernel-
+	// roll driver — which advances to drain the PEER as soon as rejoin returns —
+	// could leave BOTH nodes secondary for up to 5s (r2 Codex HIGH never-both-
+	// down). Cleared inline (we already hold m.mu); the recalcWeight election
+	// below then lets the node reclaim its role.
+	if m.kernelUpgradeHold {
+		m.kernelUpgradeHold = false
+		slog.Info("cluster: kernel-upgrade hold cleared by failover reset (rejoin)", "rg", rgID)
+	}
 	rg.ManualFailover = false
 	rg.ManualFailoverAt = time.Time{}
 	m.recalcWeight(rg) // restore weight from monitor state + run election

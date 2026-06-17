@@ -228,6 +228,32 @@ func TestElection_KernelUpgradeHold_DemotesAlreadyPrimary(t *testing.T) {
 	}
 }
 
+// r2 Codex HIGH (never-both-down): the orchestrator's gRPC rejoin clears manual
+// failover PER-RG via Manager.ResetFailover. That path MUST also drop the kernel
+// hold synchronously, so the rejoined node is election-eligible the instant
+// rejoin returns — otherwise the driver could drain the peer while this node is
+// still held secondary (both secondary, no primary).
+func TestResetFailover_ClearsKernelUpgradeHold(t *testing.T) {
+	m := NewManager(0, 1)
+	m.SetKernelUpgradeHold()
+	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200}))
+	m.UpdateConfig(cfg)
+	if m.IsLocalPrimary(0) {
+		t.Fatal("precondition: held candidate must be secondary")
+	}
+	drainEvents(m, 4)
+
+	if err := m.ResetFailover(0); err != nil {
+		t.Fatalf("ResetFailover: %v", err)
+	}
+	if m.KernelUpgradeHeld() {
+		t.Fatal("ResetFailover (rejoin) must clear the kernel-upgrade hold synchronously")
+	}
+	if !m.IsLocalPrimary(0) {
+		t.Fatal("after rejoin the isolated node must reclaim primary (hold cleared)")
+	}
+}
+
 func TestElection_LocalWeightZero_BecomesSecondary(t *testing.T) {
 	m := NewManager(0, 1)
 	cfg := makeConfig(makeRG(0, true, map[int]int{0: 250}))

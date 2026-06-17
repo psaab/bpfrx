@@ -759,6 +759,10 @@ def cmd_kernel_roll(args):
                 die(f"{n}: could not acquire kernel-roll lease (a live lease is "
                     f"held by another orchestrator, or the lock timed out) — "
                     f"released {got or 'nothing'} and aborting.")
+        drained = False        # we issued a confirmed drain (node is ForceSecondary)
+        completed = False      # the roll finished (rejoin confirmed) OR the node
+                               # rebooted (revert/promote — drain state is gone)
+        rebooted = False       # the node actually rebooted into the candidate
         try:
             # 2. DRAIN node -> peer via the non-interactive in-guest verb, which
             #    CONFIRMS the strong drain predicate (peer holds RGs, sync clean)
@@ -768,17 +772,25 @@ def cmd_kernel_roll(args):
             print(f"   draining {node} -> {peer} (confirmed)...")
             _node_exec(runner, backend, node,
                        ["xpfd", "upgrade", "kernel", "drain"])  # check=True: abort on fail
+            drained = True
             # 3. clear any STALE promotion marker so a prior roll to the SAME
             #    version can't false-satisfy this roll's poll (r1 Codex High);
             #    `arm` clears it in-guest too, belt-and-braces here for clarity.
             # 4. arm+install+reboot into the candidate (in-guest verb). `arm`
-            #    reboots on success and the exec transport drops — expected.
+            #    reboots on success and the exec transport drops — expected, so
+            #    check=False. BUT a FAILED arm (UEFI/NVRAM preflight, package
+            #    install) also returns nonzero WITHOUT rebooting, which would
+            #    leave the node drained-but-running (r1 Codex High). We cannot
+            #    distinguish the two by exit code, so the poll below detects a
+            #    no-reboot (uname never changes off known-good while armed=none),
+            #    and the finally REJOINS a drained node that never rebooted.
             print(f"   arming candidate {version} on {node} (will reboot)...")
             _node_exec(runner, backend, node,
                        ["xpfd", "upgrade", "kernel", "arm", version], check=False)
             if runner.dry:
                 print(f"   (dry-run) would poll {node} for promoted={version}, "
                       f"then `xpfd upgrade kernel rejoin`")
+                completed = True
                 return True
             # 5. poll until back + promoted==version (or STOP on revert/timeout)
             deadline = _time.time() + poll_deadline
@@ -788,7 +800,10 @@ def cmd_kernel_roll(args):
                 st = _kernel_status(runner, backend, node)
                 running = _running_kernel(runner, backend, node)
                 if not running:
-                    continue  # node still rebooting / unreachable
+                    rebooted = True   # transport dropped -> the box is rebooting
+                    continue          # node still rebooting / unreachable
+                if running == version:
+                    rebooted = True   # booted the candidate kernel
                 if st.get("promoted") == version and running == version:
                     promoted = True
                     break
@@ -801,13 +816,24 @@ def cmd_kernel_roll(args):
                 if (running != version and "armed" in st
                         and st.get("armed") == "none"):
                     # node booted a NON-candidate kernel and nothing is armed ->
-                    # it REVERTED. STOP: leave peer primary, do NOT roll peer.
+                    # it REVERTED. The revert reboot already cleared the in-memory
+                    # drain (ManualFailover is lost across a reboot), so the node
+                    # self-recovers on its known-good boot — no rejoin needed.
+                    # STOP: leave peer primary, do NOT roll peer.
+                    completed = True   # drain state gone via the revert reboot
                     die(f"{node} REVERTED (running {running}, not {version}); "
                         f"stopping the roll — {peer} stays primary, {node} is on "
                         f"its known-good kernel. Investigate before retrying.")
             if not promoted:
+                # If the node rebooted (revert/hang) the drain is already gone and
+                # the finally must NOT rejoin a possibly-candidate node; if it
+                # NEVER rebooted (arm failed pre-reboot) the finally rejoins the
+                # still-drained node. `rebooted` distinguishes the two.
+                completed = rebooted
                 die(f"{node} did not promote {version} within {poll_deadline}s "
-                    f"(running={running}); stopping — {peer} stays primary.")
+                    f"(running={running}, rebooted={rebooted}); stopping — "
+                    f"{peer} stays primary"
+                    + ("" if rebooted else f"; rejoining {node} (it never rebooted)"))
             print(f"   {node} promoted {version}")
             # 6. REJOIN + CONFIRM sync re-established BEFORE we touch the peer
             #    (the "never both down" gate — r1 Codex Critical). `rejoin`
@@ -816,9 +842,25 @@ def cmd_kernel_roll(args):
             print(f"   rejoining {node} (confirming sync)...")
             _node_exec(runner, backend, node,
                        ["xpfd", "upgrade", "kernel", "rejoin"])  # check=True: abort on fail
+            completed = True
             return True
         finally:
-            # 7. release this node's lease on both nodes (best-effort)
+            # 7a. If we drained the node but the roll did not complete AND the
+            #     node never rebooted, the node is stuck ForceSecondary-drained
+            #     (e.g. `arm` failed its preflight before rebooting). REJOIN it
+            #     best-effort so it resumes forwarding — otherwise it sits drained
+            #     with no lease and a later retry could drain the peer while this
+            #     node is down, opening a no-primary window (r1 Codex High).
+            #     (A node that rebooted has already lost the in-memory drain.)
+            if drained and not completed and not rebooted and not runner.dry:
+                print(f"   roll did not complete and {node} never rebooted; "
+                      f"rejoining {node} to restore forwarding...")
+                try:
+                    _node_exec(runner, backend, node,
+                               ["xpfd", "upgrade", "kernel", "rejoin"], check=False)
+                except Exception as e:  # best-effort: never mask the original error
+                    print(f"   WARNING: best-effort rejoin of {node} failed: {e}")
+            # 7b. release this node's lease on both nodes (best-effort)
             _clear_lease(runner, backend, node, holder)
             _clear_lease(runner, backend, peer, holder)
 
