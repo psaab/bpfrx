@@ -247,3 +247,26 @@ reserved for whole-dataplane selection where a rewrite shim
   `priority` leaf): value-slot completion, flat-set commit-check
   rejection of unknown values, plus a strict-compile re-check for
   externally-assembled configs.
+- **#1956 (chassis device-map):** added the bare-metal stable-identity
+  managed allowlist under `chassis device-map` (a SIBLING of `cluster`, so
+  per-node apply-groups compose). New value types `ValuePCIAddr` /
+  `ValueMAC` with `ValidatePCIAddr` (canonical `DDDD:BB:DD.F`) /
+  `ValidateMAC` (6-octet unicast, non-zero); a named-instance
+  `interface <logical-name>` container using the typed-KEY-slot recipe
+  (`keyValueType` + `ValidateDeviceMapLogicalName`) carrying typed `pci` /
+  `mac` / `key` leaves; and the `unmapped-interface-policy` enum leaf
+  (`leave-alone` default / `manage-down`). Compile lives in
+  `compiler_chassis.go` (`compileDeviceMap`), independent of `cluster`
+  (`compileChassis` compiles the device-map subtree even with no cluster —
+  a standalone box). Cross-entry invariants that a single typed-leaf
+  validator cannot express (duplicate logical name / PCI / MAC FATAL,
+  RETH-member-must-be-PCI, FPC/node alignment in cluster mode) live in
+  `validateDeviceMapStrict`, wired into the strict accumulator group in
+  `compiler.go` and DOWNGRADED to a warning on the lenient load / peer-sync
+  paths via the `lenientDeviceMap` compile opt (so a peer-node section with
+  different hardware does not stall config sync — #1956 V-1). Device-map
+  MODE is selected on `len(Entries) > 0`, never `DeviceMap != nil`, so an
+  empty `device-map {}` block is positional mode (closes the
+  empty-tree-compiles-non-nil trap). The pure identity resolver +
+  host-NIC enumeration live in `pkg/devicemap` (shared by the daemon rename
+  / pre-flight and the CLI `show`).

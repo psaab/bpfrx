@@ -133,19 +133,21 @@ func (d *Daemon) commitAndApply(ctx context.Context, comment string, syncPeer bo
 			"system rolls back automatically unless you confirm it from a still-reachable session)")
 	}
 
+	if err := d.applySem.Acquire(ctx, 1); err != nil {
+		return nil, err
+	}
+	defer d.applySem.Release(1)
+
 	// #1956 R-8 device-map pre-flight: reject a candidate whose device-map
 	// would strand management on next boot, while the operator is still
-	// connected. Plain commit has no auto-rollback target, so pass nil.
+	// connected and BEFORE the store promotes it. Runs under applySem (after
+	// Acquire) but before Commit, so a reject never leaves a promoted store.
+	// Plain commit has no auto-rollback target, so pass nil.
 	if cand, err := d.store.CompileCandidate(); err == nil {
 		if err := d.deviceMapCommitPreflight(cand, nil); err != nil {
 			return nil, err
 		}
 	}
-
-	if err := d.applySem.Acquire(ctx, 1); err != nil {
-		return nil, err
-	}
-	defer d.applySem.Release(1)
 
 	var compiled *config.Config
 	var err error
@@ -225,22 +227,23 @@ func (d *Daemon) deviceMapPassiveAdmissionAlarm(synced *config.Config) {
 // commitConfirmedAndApply is the commit-confirmed analogue of
 // commitAndApply. Same atomicity guarantees.
 func (d *Daemon) commitConfirmedAndApply(ctx context.Context, minutes int, syncPeer bool) (*config.Config, error) {
+	if err := d.applySem.Acquire(ctx, 1); err != nil {
+		return nil, err
+	}
+	defer d.applySem.Release(1)
+
 	// #1956 R-8/V-3 device-map pre-flight: validate BOTH the candidate AND
 	// the rollback target (the currently-active config, restored on a
 	// confirmed-commit timeout) against present hardware. If EITHER would
 	// strand management on next boot, reject while the operator is still
 	// connected — so when a timeout fires the target is KNOWN-safe and is
-	// applied UNCONDITIONALLY (OQ-15.2, no rollback-time abort).
+	// applied UNCONDITIONALLY (OQ-15.2, no rollback-time abort). Runs under
+	// applySem before Commit, so a reject never leaves a promoted store.
 	if cand, err := d.store.CompileCandidate(); err == nil {
 		if err := d.deviceMapCommitPreflight(cand, d.store.ActiveConfig()); err != nil {
 			return nil, err
 		}
 	}
-
-	if err := d.applySem.Acquire(ctx, 1); err != nil {
-		return nil, err
-	}
-	defer d.applySem.Release(1)
 
 	compiled, err := d.store.CommitConfirmed(minutes)
 	if err != nil {

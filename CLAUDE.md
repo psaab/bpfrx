@@ -244,6 +244,27 @@ in git history; `git log -- bpf/xdp/ bpf/tc/` walks the deleted source.
 - **DHCP interfaces**: daemon's DHCP client manages the address; address reconciliation is skipped
 - **Bootstrap**: daemon's `enumerateAndRenameInterfaces()` runs at startup, writes `.link` files + bootstrap fxp0 DHCP `.network`
 - DHCP-learned default routes get admin distance 200 in FRR (lower priority than static routes)
+- **Device-map mode (#1956, bare metal)**: an opt-in `set chassis device-map`
+  stanza replaces positional naming with a STABLE-IDENTITY managed allowlist.
+  When `len(chassis device-map entries) > 0`, the daemon renames ONLY the
+  mapped NICs (by PCI bus address with permanent-MAC fallback, via
+  `enumerateAndRenameMapped` in `pkg/daemon/device_map.go` → `pkg/devicemap`),
+  and everything not named is governed by `unmapped-interface-policy`
+  (`leave-alone` default = invisible to xpf; `manage-down` = today's
+  claim-all). No map = positional mode, bit-identical to pre-#1956.
+  Key invariants: BOTH rename sites branch (normal boot + bootstrap-exit);
+  the bring-down reconcile (`compiler_iface.go`) SKIPS unmapped NICs under
+  leave-alone; topology-change detection REFUSES a binding when PCI matches
+  but the permanent MAC differs (card swapped — never silent hijack); RETH
+  members stay PCI-keyed + `OriginalName=` (their MAC alternates); collision-
+  safe multi-pass rename breaks stale-udev EEXIST; a commit pre-flight rejects
+  a map that would strand management on next boot (validating the rollback
+  target too for `commit confirmed`); a managed→unmapped teardown runs BEFORE
+  `networkd.Apply`. **§9.6: no auto-fxp0 / no bootstrap DHCP in device-map mode**
+  — the console is the lifeline on bare metal; `fxp0` is bindable only if the
+  operator explicitly maps a NIC to it. `show chassis device-map [candidates]`
+  lists NICs to author a map without hand-typing PCI BDFs. Operator doc:
+  `docs/bare-metal-device-map.md`.
 
 ### XDP on SR-IOV Interfaces
 - **iavf (VF driver) has NO native XDP support** — only generic/SKB mode works, which creates a full `sk_buff` per packet (~16% CPU overhead from `memcpy_orig` + `memset_orig`). Performance drops from 25+ Gbps to ~6.8 Gbps

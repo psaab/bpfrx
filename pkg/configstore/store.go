@@ -1087,7 +1087,7 @@ func (s *Store) CommitWithDescription(description string) (*config.Config, error
 	if err := s.writeActive(s.candidate); err != nil {
 		return nil, fmt.Errorf("commit failed: persist active config: %w", err)
 	}
-	s.persistDegraded = false // disk now holds the current config
+	s.persistDegraded = false       // disk now holds the current config
 	s.everCommitted = true          // #1922 step-0: a real commit has succeeded
 	s.persistMarkerCommitted = true // #1922: degraded-retry writes committed=1
 

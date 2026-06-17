@@ -13,10 +13,11 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
-const (
-	linkDir    = "/etc/systemd/network"
-	linkPrefix = "10-xpf-"
-)
+const linkPrefix = "10-xpf-"
+
+// linkDir is the systemd-networkd config directory. A var (not const) so
+// tests can redirect it to a temp dir; production never reassigns it.
+var linkDir = "/etc/systemd/network"
 
 // pciNIC holds enumeration data for one physical NIC.
 type pciNIC struct {

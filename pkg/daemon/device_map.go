@@ -273,23 +273,33 @@ func deviceMapStrandsManagement(cfg *config.Config, nics []presentNIC, protected
 		if prot == "" {
 			continue
 		}
-		// Find the present NIC currently named `prot` (the live mgmt NIC).
-		var liveMgmt *presentNIC
+		// Is `prot` currently a present NIC (the live mgmt NIC)?
+		liveMgmtPresent := false
 		for i := range nics {
 			if nics[i].Name == prot {
-				liveMgmt = &nics[i]
+				liveMgmtPresent = true
 				break
 			}
 		}
-		if liveMgmt == nil {
+		if !liveMgmtPresent {
 			continue // protected name not currently a present NIC
 		}
-		// If some OTHER physical NIC is mapped to this protected logical
-		// name, the live mgmt NIC would lose its name on next boot.
-		if final, ok := finalByCurrent[liveMgmt.Name]; ok && final != prot {
+		// Case A: the live mgmt NIC itself is mapped to a DIFFERENT name —
+		// management moves off it on next boot.
+		if final, ok := finalByCurrent[prot]; ok && final != prot {
 			return fmt.Sprintf("device-map would rename the live management NIC %q to %q on next "+
 				"boot, moving management off it. Map the management NIC to its own name, or "+
 				"adjust the map before committing.", prot, final)
+		}
+		// Case B: some OTHER NIC is mapped to the protected name and the live
+		// mgmt NIC is NOT itself mapped to keep that name — a collision that
+		// would steal the management name from the live NIC on next boot.
+		for current, final := range finalByCurrent {
+			if final == prot && current != prot {
+				return fmt.Sprintf("device-map would rename NIC %q to the management name %q on "+
+					"next boot, taking it from the live management NIC. Re-pin the device-map "+
+					"before committing.", current, prot)
+			}
 		}
 	}
 	return ""

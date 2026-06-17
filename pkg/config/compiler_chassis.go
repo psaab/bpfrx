@@ -28,9 +28,11 @@ func compileDeviceMap(node *Node) *DeviceMapConfig {
 
 	for _, inst := range namedInstances(node.FindChildren("interface")) {
 		entry := DeviceMapEntry{LogicalName: inst.name}
-		entry.PCIAddr = deviceMapProp(inst.node, "pci")
-		entry.MAC = deviceMapProp(inst.node, "mac")
-		entry.KeyOrder = deviceMapProp(inst.node, "key")
+		props := map[string]string{}
+		collectDeviceMapProps(inst.node, props)
+		entry.PCIAddr = props["pci"]
+		entry.MAC = props["mac"]
+		entry.KeyOrder = props["key"]
 		dm.Entries = append(dm.Entries, entry)
 	}
 
@@ -47,24 +49,45 @@ func compileDeviceMap(node *Node) *DeviceMapConfig {
 	return dm
 }
 
-// deviceMapProp reads a single property of a device-map `interface` instance,
-// handling both AST shapes: nested (`interface ge-0/0/3 { pci 0000:09:00.0; }`)
-// and inline flat-set (`Keys: [interface ge-0/0/3 pci 0000:09:00.0]`).
-func deviceMapProp(instNode *Node, prop string) string {
-	// Inline form: the property keyword appears in the instance node's
-	// Keys, with its value the following token.
-	for i := 2; i+1 < len(instNode.Keys); i++ {
-		if instNode.Keys[i] == prop {
-			return instNode.Keys[i+1]
+// collectDeviceMapProps walks a device-map `interface` instance subtree and
+// records the pci/mac/key properties into props. It handles every AST shape
+// the parser/SetPath produce:
+//   - inline flat-set: a single line `interface ge-0/0/3 pci A mac B key C`
+//     nests each prop under the previous (interface -> pci -> mac -> key),
+//     each node Keys=[name, value];
+//   - hierarchical: `interface ge-0/0/3 { pci A; mac B; }` — separate child
+//     property nodes;
+//   - inline-on-instance: extra tokens packed into the instance node's Keys.
+//
+// First value wins per property so a later malformed re-set cannot clobber a
+// good one silently.
+func collectDeviceMapProps(instNode *Node, props map[string]string) {
+	// Scan inline Keys at EVERY node in the subtree: SetPath packs trailing
+	// property tokens into the deepest leaf's Keys
+	// (e.g. mac node Keys=[mac, <val>, key, mac-then-pci]), so a prop can
+	// appear as Keys[i]==prop with its value at Keys[i+1] at any depth.
+	var walk func(n *Node)
+	walk = func(n *Node) {
+		start := 0
+		if n == instNode {
+			start = 2 // skip "interface <name>"
+		}
+		for i := start; i+1 < len(n.Keys); i++ {
+			if isDeviceMapProp(n.Keys[i]) {
+				if _, ok := props[n.Keys[i]]; !ok {
+					props[n.Keys[i]] = n.Keys[i+1]
+				}
+			}
+		}
+		for _, c := range n.Children {
+			walk(c)
 		}
 	}
-	// Nested form: a child node named prop with its value.
-	if n := instNode.FindChild(prop); n != nil {
-		if v := nodeVal(n); v != "" {
-			return v
-		}
-	}
-	return ""
+	walk(instNode)
+}
+
+func isDeviceMapProp(s string) bool {
+	return s == "pci" || s == "mac" || s == "key"
 }
 
 // validateDeviceMapStrict is the #1956 cross-entry commit-check validator.
