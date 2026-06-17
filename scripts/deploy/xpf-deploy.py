@@ -630,20 +630,34 @@ def _node_exec(runner, backend, node, argv, check=True):
 
 
 def _write_lease(runner, backend, node, target_node_id, holder, ttl_secs):
-    import json as _json
-    import time as _time
-    lease = _json.dumps({
-        "node_id": target_node_id,
-        "holder": holder,
-        "expires_at": _time.strftime(
-            "%Y-%m-%dT%H:%M:%SZ", _time.gmtime(_time.time() + ttl_secs)),
-    })
-    # write atomically in-guest (temp + mv); /var/lib/xpf exists (xpfd owns it).
-    _node_exec(runner, backend, node, [
-        "sh", "-c",
-        "umask 022; printf %s " + shlex.quote(lease) +
-        " > /var/lib/xpf/.kernel-roll.lease.tmp && "
-        "mv -f /var/lib/xpf/.kernel-roll.lease.tmp /var/lib/xpf/kernel-roll.lease"])
+    # Compute expires_at IN THE NODE'S OWN CLOCK (r1 Codex High: a driver-clock
+    # absolute timestamp is clock-skew-unsafe vs the node that reads it). The
+    # node renders `date -u -d "+<ttl> seconds"`; the lease JSON is assembled
+    # in-guest so the expiry is always in the reader's clock. Written atomically
+    # (temp + mv); /var/lib/xpf exists (xpfd owns it).
+    holder_q = shlex.quote(holder)
+    script = (
+        "umask 022; "
+        "exp=$(date -u -d \"+%d seconds\" +%%Y-%%m-%%dT%%H:%%M:%%SZ); "
+        "printf '{\"node_id\": %d, \"holder\": \"%s\", \"expires_at\": \"%%s\"}' \"$exp\" "
+        "> /var/lib/xpf/.kernel-roll.lease.tmp && "
+        "mv -f /var/lib/xpf/.kernel-roll.lease.tmp /var/lib/xpf/kernel-roll.lease"
+    ) % (ttl_secs, target_node_id, holder.replace('"', ""))
+    _node_exec(runner, backend, node, ["sh", "-c", script])
+
+
+def _active_lease_holder(runner, backend, node):
+    """Return the holder string of an UNEXPIRED lease on `node`, else ''."""
+    # Evaluate expiry IN THE NODE'S CLOCK: a lease is active iff now < expires_at.
+    script = (
+        "f=/var/lib/xpf/kernel-roll.lease; [ -f \"$f\" ] || exit 0; "
+        "exp=$(sed -n 's/.*\"expires_at\": *\"\\([^\"]*\\)\".*/\\1/p' \"$f\"); "
+        "hold=$(sed -n 's/.*\"holder\": *\"\\([^\"]*\\)\".*/\\1/p' \"$f\"); "
+        "[ -n \"$exp\" ] || exit 0; "
+        "now=$(date -u +%s); ee=$(date -u -d \"$exp\" +%s 2>/dev/null || echo 0); "
+        "[ \"$now\" -lt \"$ee\" ] && printf %s \"$hold\" || exit 0"
+    )
+    return _node_exec(runner, backend, node, ["sh", "-c", script], check=False).strip()
 
 
 def _clear_lease(runner, backend, node):
@@ -688,23 +702,41 @@ def cmd_kernel_roll(args):
     def roll_one(node, peer):
         nid = node_ids[node]
         print(f"\n--- rolling {node} (node-id {nid}); {peer} stays primary ---")
-        # 1. lease on BOTH nodes (suppress self-recovery on `node`, cluster lock)
+        # 0. cluster lock: refuse if an UNEXPIRED lease already names EITHER node
+        #    (another orchestrator is mid-roll). The lease is the cross-driver
+        #    mutex (r1 Codex Critical: blind overwrite let two drivers race).
+        for n in (node, peer):
+            held = _active_lease_holder(runner, backend, n)
+            if held:
+                die(f"{n} already has an active kernel-roll lease ({held}); "
+                    f"another orchestrator is rolling this cluster — aborting.")
+        # 1. lease on BOTH nodes (suppress self-recovery on `node`, cluster lock).
+        #    The expiry is computed ON EACH NODE in its own clock (r1 Codex High:
+        #    a driver-clock absolute timestamp is skew-unsafe vs the node clock).
         _write_lease(runner, backend, node, nid, holder, lease_ttl)
         _write_lease(runner, backend, peer, nid, holder, lease_ttl)
         try:
-            # 2. drain node -> peer (in-service-upgrade demote) + confirm
+            # 2. DRAIN node -> peer via the non-interactive in-guest verb, which
+            #    CONFIRMS the strong drain predicate (peer holds RGs, sync clean)
+            #    before returning — so we never arm an undrained primary (r1
+            #    Codex Critical). It also pre-checks peer-takeover-ready + HA
+            #    protocol compat and refuses otherwise.
+            print(f"   draining {node} -> {peer} (confirmed)...")
             _node_exec(runner, backend, node,
-                       ["cli", "-c", "request system in-service-upgrade"], check=False)
-            # 3. arm+install+reboot into the candidate (in-guest verb).
-            #    `arm` reboots on success and does not return 0 cleanly over
-            #    exec; treat a transport drop as the expected reboot.
+                       ["xpfd", "upgrade", "kernel", "drain"])  # check=True: abort on fail
+            # 3. clear any STALE promotion marker so a prior roll to the SAME
+            #    version can't false-satisfy this roll's poll (r1 Codex High);
+            #    `arm` clears it in-guest too, belt-and-braces here for clarity.
+            # 4. arm+install+reboot into the candidate (in-guest verb). `arm`
+            #    reboots on success and the exec transport drops — expected.
             print(f"   arming candidate {version} on {node} (will reboot)...")
             _node_exec(runner, backend, node,
                        ["xpfd", "upgrade", "kernel", "arm", version], check=False)
-            # 4. poll until back + promoted==version (or STOP on revert/timeout)
             if runner.dry:
-                print(f"   (dry-run) would poll {node} for promoted={version}")
+                print(f"   (dry-run) would poll {node} for promoted={version}, "
+                      f"then `xpfd upgrade kernel rejoin`")
                 return True
+            # 5. poll until back + promoted==version (or STOP on revert/timeout)
             deadline = _time.time() + poll_deadline
             promoted = False
             while _time.time() < deadline:
@@ -726,13 +758,16 @@ def cmd_kernel_roll(args):
                 die(f"{node} did not promote {version} within {poll_deadline}s "
                     f"(running={running}); stopping — {peer} stays primary.")
             print(f"   {node} promoted {version}")
-            # 5. rejoin + confirm sync
+            # 6. REJOIN + CONFIRM sync re-established BEFORE we touch the peer
+            #    (the "never both down" gate — r1 Codex Critical). `rejoin`
+            #    clears manual failover on ALL RGs and confirms peer-alive +
+            #    sync; a failure here STOPS the roll (the peer stays primary).
+            print(f"   rejoining {node} (confirming sync)...")
             _node_exec(runner, backend, node,
-                       ["cli", "-c", "request chassis cluster failover reset "
-                        "redundancy-group 0"], check=False)
+                       ["xpfd", "upgrade", "kernel", "rejoin"])  # check=True: abort on fail
             return True
         finally:
-            # 6. release this node's lease on both nodes (best-effort)
+            # 7. release this node's lease on both nodes (best-effort)
             _clear_lease(runner, backend, node)
             _clear_lease(runner, backend, peer)
 

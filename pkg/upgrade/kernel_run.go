@@ -99,6 +99,16 @@ func (r *KernelRunner) Arm(candidateVersion string) error {
 			"clear %s to start over", j.CandidateVersion, j.State, candidateVersion, r.cfg.JournalPath)
 	}
 
+	// Clear any STALE promotion marker from a PRIOR roll BEFORE arming a fresh
+	// one (r1 Codex High): otherwise the external orchestrator's post-reboot
+	// `promoted==<ver>` check could be satisfied by a previous successful roll
+	// to the SAME version, masking a revert of THIS roll. Best-effort.
+	if !j.State.atLeast(KernelStatePreflight) {
+		if err := r.cfg.Sys.ClearPromotionMarker(); err != nil {
+			r.logf("kernel-upgrade arm: WARNING clear stale promotion marker: %v", err)
+		}
+	}
+
 	// ---- PREFLIGHT (fail-closed; no mutation) ----
 	if !j.State.atLeast(KernelStatePreflight) {
 		if err := r.preflight(j, candidateVersion); err != nil {

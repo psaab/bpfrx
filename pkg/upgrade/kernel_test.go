@@ -126,6 +126,7 @@ func (f *fakeKernelSystem) WritePromotionMarker(u string) error {
 	return nil
 }
 func (f *fakeKernelSystem) ReadPromotionMarker() (string, error) { return f.promotionMarker, nil }
+func (f *fakeKernelSystem) ClearPromotionMarker() error          { f.promotionMarker = ""; return nil }
 func (f *fakeKernelSystem) BootCurrent() (string, error) {
 	if f.bootCurrent != "" {
 		return f.bootCurrent, nil

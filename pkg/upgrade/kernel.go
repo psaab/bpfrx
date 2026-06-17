@@ -211,6 +211,11 @@ type KernelSystem interface {
 	WritePromotionMarker(unameR string) error
 	// ReadPromotionMarker returns the last promoted uname -r (or "" if none).
 	ReadPromotionMarker() (string, error)
+	// ClearPromotionMarker removes the durable promotion marker. Called at the
+	// start of an Arm so a STALE marker from a PRIOR roll (e.g. a previous
+	// successful roll to the SAME version) cannot false-satisfy the external
+	// orchestrator's post-reboot version-check for THIS roll (r1 Codex High).
+	ClearPromotionMarker() error
 
 	// ---- promotion-gate surface (runs on the candidate boot) ----
 

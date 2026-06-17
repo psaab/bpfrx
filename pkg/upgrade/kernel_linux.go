@@ -345,6 +345,13 @@ func (s *realKernelSystem) ReadPromotionMarker() (string, error) {
 	return strings.TrimSpace(string(data)), nil
 }
 
+func (s *realKernelSystem) ClearPromotionMarker() error {
+	if err := os.Remove(promotionMarkerPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("clear promotion marker: %w", err)
+	}
+	return nil
+}
+
 func (s *realKernelSystem) BootCurrent() (string, error) {
 	out, err := captureCmd("efibootmgr")
 	if err != nil {
