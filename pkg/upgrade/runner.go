@@ -263,6 +263,7 @@ func copyTree(src, dst string) (string, error) {
 	}
 	sort.Slice(ents, func(i, j int) bool { return ents[i].rel < ents[j].rel })
 
+	var createdDirs []string
 	for _, e := range ents {
 		target := filepath.Join(dst, e.rel)
 		switch {
@@ -270,6 +271,7 @@ func copyTree(src, dst string) (string, error) {
 			if err := os.MkdirAll(target, 0755); err != nil {
 				return "", fmt.Errorf("mkdir %s: %w", target, err)
 			}
+			createdDirs = append(createdDirs, target)
 		case e.info.Mode().IsRegular():
 			if err := copyFileFsync(e.path, target, e.info.Mode()); err != nil {
 				return "", err
@@ -286,6 +288,24 @@ func copyTree(src, dst string) (string, error) {
 			f.Close()
 		default:
 			return "", fmt.Errorf("copyTree: unsupported file type for %s", e.path)
+		}
+	}
+	// Fsync every copied directory. copyFileFsync commits file *contents*, but
+	// a newly-created directory entry (a file or a nested subdir) is durable
+	// only once its parent directory fd is fsynced. Callers fsync only the
+	// top-level copy root (SyncDir(partial)/SyncDir(snapPartial)); nested dirs
+	// are NOT covered there, so a power loss after the atomic rename could
+	// orphan nested entries and a later rollback would restore a corrupt
+	// snapshot. Latent today (.configdb and staged are both flat — AGY
+	// review-011 Part I) but this makes copyTree durable for any future
+	// nesting. Deepest-first so each child dir's entries are committed before
+	// the parent dir entry that references it.
+	sort.Slice(createdDirs, func(i, j int) bool {
+		return len(createdDirs[i]) > len(createdDirs[j])
+	})
+	for _, d := range createdDirs {
+		if err := fsatomic.SyncDir(d); err != nil {
+			return "", fmt.Errorf("fsync copied dir %s: %w", d, err)
 		}
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil

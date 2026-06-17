@@ -551,3 +551,59 @@ func assertOrder(t *testing.T, calls []string, before, after string) {
 		t.Errorf("%q (idx %d) did not happen before %q (idx %d); calls=%v", before, bi, after, ai, calls)
 	}
 }
+
+// TestCopyTree_NestedDirsDurable exercises the copyTree directory-fsync path
+// (AGY review-011 Part I): a NESTED source tree must copy completely, with
+// every file and intermediate directory present and contents intact, and the
+// content checksum must be deterministic. The .configdb/staged trees are flat
+// today, so this is the only coverage of the nested branch (the new
+// createdDirs fsync loop). A bug in that loop — e.g. erroring on a nested dir
+// — fails here rather than silently shipping.
+func TestCopyTree_NestedDirsDurable(t *testing.T) {
+	src := t.TempDir()
+	files := map[string]string{
+		"top.txt":        "root file",
+		"a/d.txt":        "mid file",
+		"a/b/c.txt":      "deep file",
+		"a/b/e/leaf.txt": "leaf file",
+	}
+	for rel, content := range files {
+		full := filepath.Join(src, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatalf("mkdir src %s: %v", full, err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0644); err != nil {
+			t.Fatalf("write src %s: %v", full, err)
+		}
+	}
+
+	dst := filepath.Join(t.TempDir(), "copy1")
+	sum1, err := copyTree(src, dst)
+	if err != nil {
+		t.Fatalf("copyTree nested tree: %v", err)
+	}
+	if sum1 == "" {
+		t.Fatal("copyTree returned empty checksum")
+	}
+
+	// Every file (and thus every intermediate dir) must be present + intact.
+	for rel, want := range files {
+		got, rerr := os.ReadFile(filepath.Join(dst, rel))
+		if rerr != nil {
+			t.Fatalf("nested entry %s not copied: %v", rel, rerr)
+		}
+		if string(got) != want {
+			t.Errorf("nested entry %s = %q, want %q", rel, got, want)
+		}
+	}
+
+	// Checksum is deterministic for the same source tree.
+	dst2 := filepath.Join(t.TempDir(), "copy2")
+	sum2, err := copyTree(src, dst2)
+	if err != nil {
+		t.Fatalf("copyTree second pass: %v", err)
+	}
+	if sum1 != sum2 {
+		t.Errorf("copyTree checksum non-deterministic: %s != %s", sum1, sum2)
+	}
+}
