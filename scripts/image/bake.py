@@ -540,13 +540,36 @@ def main():
             commit = out_text(["git", "-C", ROOT, "rev-parse", "HEAD"]).strip()
         except Exception:
             commit = "unknown"
+
+        # #1930 INC-3 LANE-2: record the staged binary's compile-time HA /
+        # session-sync / config-DB protocol versions in the manifest so the
+        # mixed-base image-replace gate is a FILE READ (no boot, no cross-arch
+        # binary run needed). The packaged binary already passed the
+        # verify-dataplane pre-gate above, so it is the authoritative source.
+        # Best-effort: a parse/run failure leaves the version lines out (the
+        # gate then falls back to `xpfd protocol-versions` on the staged binary,
+        # or fails closed) rather than aborting the bake.
+        proto_lines = ""
+        try:
+            pv = out_text([staged_xpfd, "protocol-versions"])
+            # Re-key into the manifest namespace (manifest uses `key: value`).
+            for ln in pv.splitlines():
+                if "=" in ln:
+                    k, v = ln.split("=", 1)
+                    proto_lines += f"{k.strip().replace('-', '_')}: {v.strip()}\n"
+        except Exception as e:
+            print(f"WARNING: could not read staged xpfd protocol-versions for the "
+                  f"manifest ({e}); the mixed-base gate will run the staged binary "
+                  f"directly instead.", file=sys.stderr)
+
         manifest = os.path.join(a.out, f"xpf-{ver}.manifest")
         with open(manifest, "w") as f:
             f.write(f"version: {ver}\ngit_commit: {commit}\n"
                     f"base_image: {base_url}/{base_img}\nbase_release: {rel}\n"
                     f"base_image_sha256: {base_sha}\n"
                     f"bake_date: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
-                    f"bake_host_kernel: {os.uname().release}\n")
+                    f"bake_host_kernel: {os.uname().release}\n"
+                    + proto_lines)
         info(f"manifest: {manifest}")
 
         # 7. validation gate

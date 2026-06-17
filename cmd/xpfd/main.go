@@ -11,10 +11,11 @@ import (
 	"log/slog"
 	"os"
 
+	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/daemon"
 	"github.com/psaab/xpf/pkg/dataplane"
-	_ "github.com/psaab/xpf/pkg/dataplane/userspace"
+	"github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/frr"
 )
 
@@ -28,6 +29,25 @@ var (
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "version" {
 		fmt.Printf("xpfd %s (commit %s, built %s)\n", version, commit, buildTime)
+		return
+	}
+
+	// `xpfd protocol-versions` emits the compile-time HA / session-sync /
+	// config-DB version constants this binary embeds, machine-parseably
+	// (key=value lines). #1930 INC-3 LANE-2: the mixed-base image-replace gate
+	// reads these from the STAGED binary (unpacked from the new image, run on
+	// the deploy host) to decide — WITHOUT booting the image — whether the new
+	// image's HA/session-sync protocol is back-compatible with the still-running
+	// peer. Pairs with the bake version manifest (a file read where the binary
+	// can't be run, e.g. cross-arch). Keep keys stable: external tooling parses
+	// them.
+	if len(os.Args) > 1 && os.Args[1] == "protocol-versions" {
+		fmt.Printf("xpf-version=%s\n", version)
+		fmt.Printf("ha-protocol-version=%d\n", cluster.CurrentHAProtocolVersion)
+		fmt.Printf("ha-protocol-min-compat=%d\n", cluster.LegacyHAProtocolVersion)
+		fmt.Printf("session-sync-protocol-version=%d\n", userspace.ProtocolVersion)
+		fmt.Printf("configdb-envelope-version=%d\n", configstore.EnvelopeFormatVersion)
+		fmt.Printf("configdb-min-reader-version=%d\n", configstore.EnvelopeMinReaderVersion)
 		return
 	}
 

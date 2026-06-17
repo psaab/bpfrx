@@ -1,5 +1,17 @@
 # Action Log
 
+## 2026-06-16 — #1930 INC-3 (LANE-2/3): protocol-versions subcommand + bake manifest
+- **Timestamp**: 2026-06-16 UTC
+- **Action**: Started INC-3 (final PR, Closes #1930). Added `xpfd
+  protocol-versions` subcommand emitting machine-parseable HA /
+  session-sync / config-DB version constants (cluster.CurrentHAProtocolVersion,
+  cluster.LegacyHAProtocolVersion, userspace.ProtocolVersion,
+  configstore.EnvelopeFormatVersion/EnvelopeMinReaderVersion). bake.py now
+  records these in the per-version manifest by running the staged binary's
+  protocol-versions, so the LANE-2 mixed-base gate is a file read (no boot,
+  no cross-arch run). Foundation for the mixed-base compatibility gate.
+- **File(s)**: cmd/xpfd/main.go, scripts/image/bake.py
+
 ## 2026-06-16 — #1930 INC-2: Codex 2 HIGH (arm-fail drain leak, rejoin/hold race)
 - **Timestamp**: 2026-06-16 UTC
 - **Action**: Fixed Codex's two HIGH findings. HIGH-1 (arm-failure leaves
