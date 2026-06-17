@@ -2555,6 +2555,65 @@ pub(super) fn poll_binding_process_descriptor(
                                             trigger_kernel_arp_probe(&name, next_hop);
                                         }
                                     }
+                                    // #1912: for a tunnel-marked MissingNeighbor
+                                    // (e.g. GRE outer hop), ALSO drive the #1769
+                                    // resolver on the OUTER L3 egress (neigh_if),
+                                    // not only on the neg-cache fast-fail. A
+                                    // freshly-flushed outer hop has no negative
+                                    // entry, so without this only the one-shot
+                                    // kernel ARP probe above fires; the resolver
+                                    // hardens the STALE/DELAY outer-entry case by
+                                    // issuing an RTM_GETNEIGH revalidation. The
+                                    // frame is STILL NOT buffered (R-E: tunnel-
+                                    // marked never enters pending_neigh), so no
+                                    // plaintext-leak window is opened. Rate-
+                                    // limited per (neigh_if, next_hop) via the
+                                    // existing resolver_enqueue_throttle so an
+                                    // outer-hop storm fires at most one enqueue
+                                    // per key per window; the resolver coalesces
+                                    // per-key anyway. Non-tunnel decisions skip
+                                    // this entirely (the neg-cache fast-fail path
+                                    // already owns their resolver enqueue).
+                                    if decision.resolution.tunnel_endpoint_id != 0
+                                        && neigh_if > 0
+                                    {
+                                        if let Some(resolver) = worker_ctx.neighbor_resolver {
+                                            let key = (neigh_if, next_hop);
+                                            let throttled = matches!(
+                                                binding.resolver_enqueue_throttle.get(&key),
+                                                Some(&t) if now_ns.saturating_sub(t)
+                                                    < RESOLVER_ENQUEUE_THROTTLE_NS
+                                            );
+                                            if !throttled {
+                                                if let Some(name) = worker_ctx
+                                                    .forwarding
+                                                    .ifindex_to_name
+                                                    .get(&neigh_if)
+                                                {
+                                                    resolver.enqueue(
+                                                        neigh_if,
+                                                        next_hop,
+                                                        name.clone(),
+                                                    );
+                                                    if binding
+                                                        .resolver_enqueue_throttle
+                                                        .len()
+                                                        >= MAX_NEG_NEIGH_CACHE
+                                                        && !binding
+                                                            .resolver_enqueue_throttle
+                                                            .contains_key(&key)
+                                                    {
+                                                        binding
+                                                            .resolver_enqueue_throttle
+                                                            .clear();
+                                                    }
+                                                    binding
+                                                        .resolver_enqueue_throttle
+                                                        .insert(key, now_ns);
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                                 // Create the session NOW so the SYN-ACK (reverse
                                 // direction) finds the forward NAT match and creates
