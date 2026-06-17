@@ -20,3 +20,11 @@ For continuation after context loss (fetch by id).
 ## Codex
 - INC-2 r1-r6 (drain/rejoin verbs, lease concurrency) — see prior commits
   1518cfc08, 3bb61d7e0, 8684f70a8 messages.
+
+## Final verdicts (HEAD 1e78dfdec)
+- Codex r1: 2 HIGH (arm-fail drain leak, rejoin/hold race). task a9bf181b94712a737
+- Codex r2: HIGH-2 CLOSED, HIGH-1 NOT closed (revert/arm-fail misclassify). task acb920b48ec0c9efa
+- Codex r3: MERGE-READY (HIGH-1 closed, all 6 paths traced). task a9961d694a17358ea
+- AGY r3: CONVERGED (agy-review-r3.md). task adversarial-review-mqhh81or-79tk7t
+- Claude SMR: MERGE-READY (smr-review.md)
+- Copilot: all inline findings addressed; no new inline findings on latest review.

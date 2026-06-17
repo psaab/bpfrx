@@ -63,3 +63,25 @@ shared loss cluster) with the target host up, then
 peer keeps forwarding across each node's reboot. Recorded as the remaining
 manual step; not run here to avoid disrupting the shared cluster + the
 unavailable SR-IOV target.
+
+## Review gate (HEAD 1e78dfdec)
+- **Codex**: MERGE-READY after 3 rounds. r1 found 2 HIGH (arm-fail drain leak,
+  rejoin/hold never-both-down race); r2 confirmed HIGH-2 closed, HIGH-1 still
+  open (revert/arm-fail misclassification); r3 traced all 6 roll_one exit paths
+  and confirmed HIGH-1 closed, no new CRITICAL/HIGH.
+- **AGY**: r3 CONVERGED (r2 found 3 — boot-time election window CRITICAL,
+  revert/reboot split-brain HIGH, gate-timeout leaked-hold MEDIUM; all fixed;
+  the one r3 LOW also resolved by the ResetFailover hold-clear).
+- **Claude SMR**: MERGE-READY (smr-review.md) — independently found the leaked
+  hold + the election window before AGY r2 confirmed them.
+- **Copilot**: all inline findings addressed (orchestrator IndexError, revert
+  false-positive, ssh hang, drain deadline overshoot, lease error logging);
+  latest review posted no new inline findings.
+
+All four reviewers clear. The live `make test-failover` no-regression run
+stays blocked by the external SR-IOV target outage; the candidate-preempt
+code is a strict NO-OP on a normal (non-armed) boot — `holdSecondaryIfKernel
+CandidateArmed` only sets the hold when `IsArmed()` is true, which never
+happens outside a candidate trial — so a deployed INC-2 binary's cluster
+behavior is identical to master on an ordinary boot (no-regression by
+construction).
