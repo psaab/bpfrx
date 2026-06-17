@@ -33,6 +33,11 @@ CT_PROFILE="xpf-container"
 # different *Ubuntu* release — they are NOT a Debian fallback path (#1943): the
 # script now uses Ubuntu package names and a >= 6.18 kernel floor, so a Debian
 # image would fail. Rollback is `git revert`, not a runtime IMAGE_VM override.
+#
+# The images:ubuntu/<rel>/cloud alias publishes BOTH a VIRTUAL-MACHINE and a
+# CONTAINER variant; incus auto-selects by the launch mode (`--vm` vs not), so
+# the same string works for both create-vm and create-ct (verified live —
+# `incus launch images:ubuntu/26.04/cloud <ct>` boots a container).
 XPF_BASE_RELEASE="${XPF_BASE_RELEASE:-26.04}"
 IMAGE_VM="${IMAGE_VM:-images:ubuntu/${XPF_BASE_RELEASE}/cloud}"
 IMAGE_CT="${IMAGE_CT:-images:ubuntu/${XPF_BASE_RELEASE}/cloud}"
@@ -331,6 +336,9 @@ EOF'
 		# Assert the dataplane NIC drivers are present (mirrors bake.py:227-228).
 		# On Ubuntu these ship in the in-image linux-modules package, NOT a
 		# separate linux-modules-extra; without them the WAN/loss PFs never bind.
+		# Check mellanox (mlx5) + intel/i40e as representative dataplane drivers;
+		# they live in the same linux-modules package as ixgbe/iavf/ice, so these
+		# two passing implies the rest are present too.
 		info "Asserting dataplane NIC driver modules present..."
 		incus exec "$INSTANCE_NAME" -- bash -c 'd=/lib/modules/$(uname -r)/kernel/drivers/net/ethernet; test -d "$d/mellanox" && test -e "$d/intel/i40e" || { echo "FATAL: mlx5/i40e driver modules missing" >&2; exit 1; }' \
 			|| die "dataplane NIC driver modules missing from base image"
