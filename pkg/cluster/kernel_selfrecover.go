@@ -51,8 +51,19 @@ func (m *Manager) PeerHealthyPrimary() bool {
 // BEFORE Start() on a candidate boot. Idempotent.
 func (m *Manager) SetKernelUpgradeHold() {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.kernelUpgradeHold = true
-	m.mu.Unlock()
+	// Defense in depth: the daemon sets the hold before the first election, so
+	// normally no group is primary yet. But setting the hold only BLOCKS future
+	// promotions — it must also DEMOTE any group that is already primary, so the
+	// hold is correct regardless of call ordering (r2 AGY Finding 1). Idempotent:
+	// a no-op when nothing is primary (the common candidate-boot case).
+	for _, rg := range m.groups {
+		if rg.State == StatePrimary {
+			rg.State = StateSecondary
+			m.sendEvent(rg.GroupID, StatePrimary, StateSecondary, "kernel-upgrade hold armed")
+		}
+	}
 }
 
 // KernelUpgradeHeld reports whether the kernel-upgrade election hold is set.

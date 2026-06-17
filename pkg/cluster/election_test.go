@@ -204,6 +204,30 @@ func TestElection_KernelUpgradeHold_IsolatedStaysSecondary(t *testing.T) {
 	}
 }
 
+// Defense in depth (r2 AGY Finding 1): if the hold is ever set AFTER a group is
+// already primary, SetKernelUpgradeHold must DEMOTE it — not just block future
+// promotions — so the hold is correct regardless of call ordering.
+func TestElection_KernelUpgradeHold_DemotesAlreadyPrimary(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200}))
+	m.UpdateConfig(cfg)
+	// Isolated node — wins the single-node election and is primary.
+	if !m.IsLocalPrimary(0) {
+		t.Fatal("precondition: isolated node should be primary before the hold")
+	}
+	drainEvents(m, 4)
+
+	m.SetKernelUpgradeHold()
+	if m.IsLocalPrimary(0) {
+		t.Fatal("SetKernelUpgradeHold must DEMOTE an already-primary group")
+	}
+	// And it must stay secondary across a re-election.
+	m.handlePeerTimeout()
+	if m.IsLocalPrimary(0) {
+		t.Fatal("held node must stay secondary after re-election")
+	}
+}
+
 func TestElection_LocalWeightZero_BecomesSecondary(t *testing.T) {
 	m := NewManager(0, 1)
 	cfg := makeConfig(makeRG(0, true, map[int]int{0: 250}))

@@ -29,9 +29,12 @@ func (a kernelSRCluster) ResetFailover() error              { return a.m.ResetAl
 // FIX (r2 AGY: the prior ForceSecondary-at-startup was a no-op because peerAlive
 // is still false before heartbeats start): set the UNCONDITIONAL
 // kernelUpgradeHold flag — which election honors regardless of peer state and
-// does NOT auto-clear for an isolated node — and do it BEFORE cluster.Start so
-// there is no election window. The hold is cleared by promote (verified) /
-// rejoin / revert. No-op on an ordinary boot.
+// does NOT auto-clear for an isolated node. The caller invokes this BEFORE
+// cluster.UpdateConfig (which itself runs the first election) so there is no
+// election window. The hold is released by reconcileKernelUpgradeHold once the
+// promotion marker confirms this kernel was verified+promoted (a reverted node
+// reboots to known-good where the hold is never set), or by rejoin
+// (ResetAllFailover). No-op on an ordinary boot.
 func (d *Daemon) holdSecondaryIfKernelCandidateArmed() {
 	if d.cluster == nil {
 		return
@@ -49,30 +52,48 @@ func (d *Daemon) holdSecondaryIfKernelCandidateArmed() {
 		"verifies the dataplane", "candidate", j.CandidateVersion)
 }
 
-// reconcileKernelUpgradeHold releases the election hold once the candidate trial
-// has RESOLVED. The promotion gate runs in a SEPARATE process
-// (xpf-kernel-promote.service, After=xpfd) and clears only the on-disk journal,
-// so the running daemon — which set the in-memory hold at boot — must notice
-// "held but no longer armed" and release it; otherwise a SUCCESSFULLY promoted
-// candidate would stay SECONDARY forever (a leaked hold). It is a no-op unless
-// the hold is set, and clears it only once the journal is no longer ARMED
-// (promote -> PROMOTED, or revert -> REVERTED/reboot). While still armed the
-// hold persists (the trial is in flight and the hold is doing its job).
+// reconcileKernelUpgradeHold releases the election hold ONLY when the candidate
+// has been affirmatively VERIFIED+PROMOTED. The promotion gate runs in a
+// SEPARATE process (xpf-kernel-promote.service, After=xpfd) that clears only the
+// on-disk journal, so the running daemon — which set the in-memory hold at boot
+// — must notice the promotion and release the hold itself; otherwise a
+// successfully promoted candidate would stay SECONDARY forever (a leaked hold).
+//
+// The release predicate is "the durable promotion marker names the CURRENTLY
+// RUNNING kernel", NOT merely "no longer armed". A bare not-armed test is unsafe
+// on the REVERT path: revert() clears the journal and THEN reboots, leaving a
+// window where the journal is gone (not armed) but the broken candidate kernel
+// is still running and shutting down. Clearing the hold there would let the
+// unverified candidate transiently claim primary for the seconds before the
+// reboot completes (r2 AGY Finding 2, HIGH). The marker is written only on
+// PROMOTE (for the running kernel), so:
+//   - promoted same-boot: marker == running -> release (correct).
+//   - reverted: marker does NOT name the candidate -> keep holding; the node
+//     reboots to known-good, where a fresh daemon never sets the hold (journal
+//     cleared, IsArmed false) -> the hold is gone by construction.
+//   - still verifying: marker not yet written -> keep holding.
+//
+// No-op unless the hold is set.
 func (d *Daemon) reconcileKernelUpgradeHold() {
 	if d.cluster == nil || !d.cluster.KernelUpgradeHeld() {
 		return
 	}
-	r, err := upgrade.NewKernelRunner(upgrade.KernelConfig{Sys: upgrade.NewKernelSystem()})
+	sys := upgrade.NewKernelSystem()
+	running, err := sys.RunningKernel()
 	if err != nil {
 		return
 	}
-	armed, _, err := r.IsArmed()
-	if err != nil || armed {
-		return // still a trial in flight (or can't tell) — keep holding
+	promoted, err := sys.ReadPromotionMarker()
+	if err != nil || promoted == "" || promoted != running {
+		// Not yet a confirmed promotion of THIS running kernel — keep holding.
+		// (Covers verifying, reverted-pending-reboot, and marker-write failures:
+		// fail SAFE toward keeping the unverified candidate secondary.)
+		return
 	}
 	d.cluster.ClearKernelUpgradeHold()
-	slog.Info("kernel-candidate trial resolved (no longer armed); releasing the " +
-		"SECONDARY election hold so the node can take its normal role")
+	slog.Info("kernel-candidate PROMOTED (promotion marker matches running kernel); "+
+		"releasing the SECONDARY election hold so the node takes its normal role",
+		"kernel", running)
 }
 
 // startKernelSelfRecovery runs the bounded local self-recovery loop for the

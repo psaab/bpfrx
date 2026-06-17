@@ -1,0 +1,22 @@
+[Unit]
+Description=xpf #1930 — LANE-1 kernel-channel gate failure recovery (reboot to known-good)
+Documentation=https://github.com/psaab/xpf/issues/1930
+# Triggered by xpf-kernel-promote.service's OnFailure= when the promotion gate
+# HANGS (TimeoutStartSec) or is killed before its own exit-3 reboot path runs.
+# A failed/hung gate on a CANDIDATE boot would otherwise leave the node booted
+# on the unverified candidate kernel and held SECONDARY forever (r2 AGY
+# Finding 3). Reboot once to the known-good slot.
+#
+# Loop-safe: an ordinary (known-good) boot's gate is a fast exit-0 no-op, so the
+# triggering unit never FAILS there and this never fires; and Arm() set only the
+# firmware-cleared BootNext (never reordered BootOrder), so the reboot lands on
+# the known-good slot. DefaultDependencies=no so it can run during early
+# shutdown/failure handling.
+DefaultDependencies=no
+Conflicts=reboot.target
+
+[Service]
+Type=oneshot
+# --no-wall: unattended recovery reboot. The fallback `reboot` covers a systemd
+# that cannot honor the verb.
+ExecStart=/bin/sh -c 'echo "xpf-kernel-promote-failed: gate failed/hung on a candidate boot; rebooting to known-good slot" >&2; systemctl reboot --no-wall || reboot'

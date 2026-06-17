@@ -201,13 +201,24 @@ carrying traffic:
    ForceSecondary call would be a no-op). Unlike `ManualFailover` this
    hold is NOT auto-cleared for an isolated node — a candidate with a
    broken dataplane stays secondary even if it can't see the peer. It is
-   cleared only by promote (verified), rejoin, or revert. Because the
-   promotion gate runs in a SEPARATE process (`xpf-kernel-promote.service`,
-   `After=xpfd`) that clears only the on-disk journal, the running daemon
-   reconciles the in-memory hold against the journal on a 5s cadence and
-   releases it once the candidate is no longer ARMED (promoted or
-   reverted) — otherwise a successfully promoted candidate would stay
-   secondary forever.
+   set BEFORE `cluster.UpdateConfig` (which itself runs the first
+   election) — not merely before `Start()` — so a candidate can never win
+   even the initial single-node election. `SetKernelUpgradeHold` also
+   DEMOTES any already-primary group as defense in depth. The hold is
+   released only when the candidate is affirmatively VERIFIED+PROMOTED:
+   the promotion gate runs in a SEPARATE process
+   (`xpf-kernel-promote.service`, `After=xpfd`) and writes a durable
+   promotion marker for the running kernel, so the daemon reconciles the
+   hold on a 5s cadence and releases it only once the marker NAMES THE
+   RUNNING KERNEL. A bare "no longer armed" test would be unsafe on the
+   revert path: `revert()` clears the journal and THEN reboots, so a
+   not-armed test could release the hold while the broken candidate is
+   still running (transient split-brain) — the marker test fails safe (a
+   reverted node reboots to known-good, where the hold is never set).
+   On a gate HANG/timeout the unit's `OnFailure=` triggers
+   `xpf-kernel-promote-failed.service`, which reboots once to known-good
+   (the firmware-cleared BootNext + un-reordered BootOrder land it there)
+   so a hung verify never leaves the node held secondary forever.
 2. **Lease-suppressed self-recovery.** If the orchestrator CRASHES while a
    node is drained+rebooting, the node would sit passive forever. The
    bounded local self-recovery (`pkg/upgrade/KernelSelfRecovery`,

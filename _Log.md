@@ -1,5 +1,27 @@
 # Action Log
 
+## 2026-06-16 — #1930 INC-2: AGY r2 Findings 1/2/3 (demote, revert race, timeout)
+- **Timestamp**: 2026-06-16 UTC
+- **Action**: Addressed AGY r2's three findings. F1 (CRITICAL, already
+  fixed by the pre-UpdateConfig ordering) + defense-in-depth:
+  SetKernelUpgradeHold now also DEMOTES any already-primary group so the
+  hold is correct regardless of call ordering. F2 (HIGH, real race I
+  introduced): reconcileKernelUpgradeHold released the hold on a bare
+  "not armed" test, but revert() clears the journal THEN reboots — the
+  broken candidate could transiently claim primary in that window.
+  Changed the release predicate to "promotion marker NAMES THE RUNNING
+  KERNEL" (written only on PROMOTE); a reverted node reboots to
+  known-good where the hold is never set, so it fails safe. F3 (MEDIUM):
+  a gate HANG/timeout left the node held SECONDARY forever; added
+  OnFailure=xpf-kernel-promote-failed.service (new unit) that reboots
+  once to known-good, plus bake.py copy-in. Tests:
+  TestElection_KernelUpgradeHold_DemotesAlreadyPrimary.
+- **File(s)**: pkg/cluster/kernel_selfrecover.go,
+  pkg/daemon/kernel_selfrecover.go, pkg/cluster/election_test.go,
+  scripts/image/xpf-kernel-promote.service,
+  scripts/image/xpf-kernel-promote-failed.service, scripts/image/bake.py,
+  docs/in-place-upgrade.md
+
 ## 2026-06-16 — #1930 INC-2: set hold BEFORE UpdateConfig (election window) (SMR)
 - **Timestamp**: 2026-06-16 UTC
 - **Action**: Claude SMR caught a residual election window: the hold was
