@@ -81,7 +81,7 @@ contract that #1913 deliberately established; Option B aligns with it.
 **(d) There is an exact precedent for Option B's shape.** #1873 R-C
 added `tunnel_encap_unresolved_drops` (`umem/mod.rs:388`): a deliberate
 drop + counter for a disposition whose reinjection would be a wrong-path
-hazard. Option B mirrors it: a `fabric_redirect_no_binding_drops`
+hazard. Option B mirrors it: a `fabric_redirect_unsendable_drops`
 counter + a `record_exception("fabric_redirect_no_binding")`.
 
 **(e) Why is the Owned branch even reachable here, and what does it
@@ -143,13 +143,13 @@ In scope:
   reaches this because it has a valid `target_binding` (the fabric
   parent) and flows through `build_forwarded_frame_from_frame`. Fix:
   gate FabricRedirect inside `handle_forward_build_failure` BEFORE the
-  reinject — drop + bump the SAME `fabric_redirect_no_binding_drops`
+  reinject — drop + bump the SAME `fabric_redirect_unsendable_drops`
   counter (rename concept to "fabric_redirect_no_tx" / keep one counter;
   see §4) + record_exception. This makes BOTH FabricRedirect slow-path
   bypass paths (no-binding AND build-failure) fail-closed. ForwardCandidate
   build failure stays an intentional reinject (it IS a kernel-servable
   route).
-- A new per-binding counter `fabric_redirect_no_binding_drops`
+- A new per-binding counter `fabric_redirect_unsendable_drops`
   (`AtomicU64`) following the `tunnel_encap_unresolved_drops` precedent,
   plumbed snapshot → worker rollup → protocol JSON → Go struct.
 - Update the `maybe_reinject_slow_path_from_frame` doc comment
@@ -189,7 +189,7 @@ if request.decision.resolution.disposition == ForwardingDisposition::FabricRedir
     // kernel-FIB-routable packet — reinjecting it to the local kernel
     // slow path is a wrong-path hazard (cf. #1873 R-C). Drop both frame
     // kinds (Owned + Live) identically and count; never reinject.
-    ingress_live.fabric_redirect_no_binding_drops.fetch_add(1, Ordering::Relaxed);
+    ingress_live.fabric_redirect_unsendable_drops.fetch_add(1, Ordering::Relaxed);
     record_exception(
         recent_exceptions, ingress_ident, "fabric_redirect_no_binding",
         request.desc.len, Some(request.meta.into()), None, forwarding,
@@ -296,9 +296,10 @@ absence.
 
 If the asymmetry were correct-by-design (Owned reinject intended, Live
 drop intended) the right outcome would be PLAN-KILL + a doc note. It is
-NOT correct-by-design: the Owned/Live split is a storage detail
-(copy-out vs in-UMEM), not a forwarding-semantic one (§2e), so the two
-*must* agree; and the agreed value is "drop" per the #1913 contract
+NOT correct-by-design: the Owned/Live split is a frame-representation
+detail (Owned = GRE-decap copy, Live = raw in-UMEM frame; §2e), not a
+forwarding-semantic one, so the two *must* agree; and the agreed value
+is "drop" per the #1913 contract
 (§2c) and the fabric design (§2a/b). PLAN-KILL rejected.
 
 ## 10. Reviewer questions to settle
@@ -321,8 +322,15 @@ NOT correct-by-design: the Owned/Live split is a storage detail
 | r1 | Claude SMR | PLAN-READY | (in-conversation) |
 | r1 | Codex | PLAN-NEEDS-WORK → addressed | task-mqi86st4-5n620c |
 | r1 | AGY | PLAN-NEEDS-WORK → addressed | adversarial-review-mqi87f3t-vf66ct |
-| r2 | Codex | (pending re-review) | — |
-| r2 | AGY | (pending re-review) | — |
+| r2 | Codex | **PLAN-READY** | task-mqi8g0px-katnme |
+| r2 | AGY | **PLAN-READY** | adversarial-review-mqi8g6qf-jyxikq |
+
+**3-way converged PLAN-READY (Claude SMR + Codex r2 + AGY r2).** Codex r2
+confirmed no other ungated FabricRedirect reinject path remains; AGY r2
+confirmed gating in `handle_forward_build_failure` is the right layer and
+mixed-version serde tolerance is fine. Codex r2 nit (stale
+`fabric_redirect_no_binding_drops` name) folded — counter is
+`fabric_redirect_unsendable_drops` throughout.
 
 ### AGY r1 findings → disposition
 
