@@ -322,3 +322,113 @@ func ValidatePercent(min, max float64) LeafValidator {
 		return nil
 	}
 }
+
+// cryptModularIDs is the set of crypt(3) modular-hash identifiers xpf
+// accepts in an encrypted-password value. It is a permissive superset of
+// what Debian 13 glibc / libxcrypt actually verify against — the OS, not
+// this validator, is the final authority at PAM time, so we err toward
+// "clearly a hash" rather than a brittle per-id structural parse. yescrypt
+// ($y$) is the Debian 13 default; $6$ (sha512crypt) is universal; $2a$/
+// $2b$/$2y$ (bcrypt), $5$ (sha256crypt), $1$ (md5crypt), $7$ (scrypt) and
+// $gy$ (gost-yescrypt) are present via libxcrypt. #1944 §5.5.
+var cryptModularIDs = map[string]bool{
+	"1": true, "2a": true, "2b": true, "2y": true,
+	"5": true, "6": true, "7": true, "y": true, "gy": true,
+}
+
+// cryptFieldRune reports whether r is allowed inside a crypt(3) salt or
+// checksum field. The crypt-base64 alphabet is [./0-9A-Za-z]; modular
+// param fields (e.g. yescrypt $y$j9T$... or sha512crypt
+// $6$rounds=656000$...) additionally use '=' to introduce a parameter
+// value. We allow '=' here and reject ':' implicitly (not in the set) so
+// a value can never corrupt the `user:hash` chpasswd stdin line.
+func cryptFieldRune(r rune) bool {
+	switch {
+	case r >= 'a' && r <= 'z':
+		return true
+	case r >= 'A' && r <= 'Z':
+		return true
+	case r >= '0' && r <= '9':
+		return true
+	case r == '.' || r == '/' || r == '=':
+		return true
+	}
+	return false
+}
+
+// ValidateCryptHash accepts a crypt(3) modular password hash or an
+// explicit lock sentinel, and HARD-REJECTS plaintext. It is shared by
+// `system root-authentication encrypted-password` and `system login user
+// <name> authentication encrypted-password` (#1944, E1).
+//
+// Accepted:
+//   - A modular crypt hash: an optional leading "!" or "!!" (the
+//     locked-but-restorable form), then $<id>$<salt>$<checksum> where
+//     <id> ∈ cryptModularIDs, <salt> is non-empty (and may itself carry
+//     $-separated params such as rounds=N), and the FINAL $-field (the
+//     checksum) is non-empty. A trailing empty checksum ($6$salt$) is
+//     rejected — it writes a malformed shadow field PAM refuses.
+//   - A bare lock sentinel: "*", "!", or "!!". This is the intentional
+//     Unix way to lock an account and the only way to lock root via
+//     config (root is excluded from the per-user D2 auto-lock). Accepting
+//     a deliberate sentinel is NOT the plaintext footgun.
+//
+// Rejected: plaintext (no leading $-id, not a sentinel — the real
+// footgun), the empty string, an unknown $<id>$, an empty salt or empty
+// checksum, and any value carrying ':' (would corrupt chpasswd stdin) or
+// a control character. Legacy 13-char DES is deliberately NOT accepted so
+// that "reject plaintext" is an absolute guarantee (a 13-char alnum
+// password would otherwise pass).
+func ValidateCryptHash(raw string, _ *Config) error {
+	if raw == "" {
+		return fmt.Errorf("missing value (expected a crypt(3) hash, e.g. from `openssl passwd -6`)")
+	}
+	// Bare lock sentinels — deliberate, accepted as-is.
+	if raw == "*" || raw == "!" || raw == "!!" {
+		return nil
+	}
+	// Modular crypt hash, with an optional locked-but-restorable prefix.
+	body := raw
+	if strings.HasPrefix(body, "!!") {
+		body = body[2:]
+	} else if strings.HasPrefix(body, "!") {
+		body = body[1:]
+	}
+	if !strings.HasPrefix(body, "$") {
+		return fmt.Errorf("not an encrypted password hash (got %q) — plaintext is not "+
+			"allowed; generate a hash with `openssl passwd -6` or `mkpasswd -m sha512crypt`", raw)
+	}
+	// Split into $-separated fields: leading "$" yields an empty first
+	// element, so fields[0]=="" , fields[1]=<id>, fields[2..]=salt/params,
+	// fields[last]=checksum. Require at least id + salt + checksum.
+	fields := strings.Split(body, "$")
+	// fields[0] is the empty string before the first '$'.
+	if len(fields) < 4 {
+		return fmt.Errorf("malformed crypt hash %q — expected $<id>$<salt>$<checksum>", raw)
+	}
+	id := fields[1]
+	if !cryptModularIDs[id] {
+		return fmt.Errorf("unknown crypt hash id %q in %q — expected one of "+
+			"1, 2a, 2b, 2y, 5, 6, 7, y, gy", id, raw)
+	}
+	salt := fields[2]
+	checksum := fields[len(fields)-1]
+	if salt == "" {
+		return fmt.Errorf("empty salt in crypt hash %q", raw)
+	}
+	if checksum == "" {
+		return fmt.Errorf("empty checksum in crypt hash %q — a trailing $ "+
+			"with no checksum writes a malformed shadow field", raw)
+	}
+	// Every salt/param/checksum field must use only the crypt alphabet
+	// (which excludes ':' and whitespace), so the value can never corrupt
+	// the chpasswd `user:hash` stdin line or smuggle a separator.
+	for _, f := range fields[2:] {
+		for _, r := range f {
+			if !cryptFieldRune(r) {
+				return fmt.Errorf("invalid character %q in crypt hash %q", r, raw)
+			}
+		}
+	}
+	return nil
+}
