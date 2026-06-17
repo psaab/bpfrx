@@ -2811,18 +2811,29 @@ pub(super) fn poll_binding_process_descriptor(
                             worker_ctx.last_resolution,
                             worker_ctx.forwarding,
                         );
-                        maybe_reinject_slow_path_from_frame(
-                            &worker_ctx.ident,
-                            &binding.live,
-                            worker_ctx.slow_path,
-                            worker_ctx.local_tunnel_deliveries,
-                            packet_frame,
-                            meta,
-                            decision,
-                            worker_ctx.recent_exceptions,
-                            "slow_path",
-                            worker_ctx.forwarding,
-                        );
+                        // #1913: gate the trailing reinjection with the
+                        // shared allow-list. Without this, PolicyDenied /
+                        // HAInactive / DiscardRoute frames were handed to
+                        // the kernel FIB unfiltered (a zone-policy DENY
+                        // silently bypassed on the cold path). When the
+                        // predicate rejects the disposition the frame is
+                        // already counted by record_forwarding_disposition
+                        // above and recycled by the recycle_now epilogue
+                        // below — no leak, no double-count.
+                        if decision.resolution.disposition.is_slow_path_eligible() {
+                            maybe_reinject_slow_path_from_frame(
+                                &worker_ctx.ident,
+                                &binding.live,
+                                worker_ctx.slow_path,
+                                worker_ctx.local_tunnel_deliveries,
+                                packet_frame,
+                                meta,
+                                decision,
+                                worker_ctx.recent_exceptions,
+                                "slow_path",
+                                worker_ctx.forwarding,
+                            );
+                        }
                     }
                 } else {
                     record_disposition(

@@ -713,4 +713,17 @@ is [`userspace-dataplane-gaps.md`](userspace-dataplane-gaps.md).
   to cpumap/kernel handling.
 - IPsec/XFRM and GRE transit use kernel/pass-through or tunnel-specific
   handling where required.
-- Packets failing forwarding resolution can enter the bounded slow path.
+- Packets failing forwarding resolution can enter the bounded slow path,
+  but ONLY for the slow-path-eligible dispositions: `LocalDelivery`,
+  `NoRoute`, `MissingNeighbor`, and `NextTableUnsupported`
+  (`ForwardingDisposition::is_slow_path_eligible`, the single source of
+  truth shared by the filtered `maybe_reinject_slow_path` wrapper and the
+  trailing chokepoint in `poll_binding_process_descriptor`). `PolicyDenied`,
+  `HAInactive`, and `DiscardRoute` are NOT eligible — reinjecting them
+  would hand the packet to the kernel FIB and silently bypass a zone-policy
+  DENY / HA gate / discard route (#1913). They are dropped (counted by
+  `record_forwarding_disposition`, recycled) instead. The raw
+  `maybe_reinject_slow_path_from_frame` primitive does NOT apply the
+  filter; its two intentional unfiltered callers (the FabricRedirect-Owned
+  fallback in `tx/dispatch/mod.rs` and the ForwardCandidate build-failure
+  fallback in `tx/dispatch/slow_path.rs`) own the eligibility decision.
