@@ -299,10 +299,18 @@ func (m *Manager) runRelay(ctx context.Context, cancel context.CancelFunc,
 	slog.Info("dhcp-relay: listening",
 		"interface", ifaceName, "giaddr", giaddr)
 
+	// Both the cancel watcher and the server-response goroutine are tracked by
+	// the WaitGroup so the runner's wg.Wait() is a true join of every spawned
+	// goroutine — runRelay does not return (and ir.done does not close) until
+	// the watcher's two Close() calls have completed.
+	var wg sync.WaitGroup
+
 	// Cancel watcher — started LAST, after BOTH conns exist. Closing both is
 	// REQUIRED for the wg.Wait() liveness chain: it unblocks both ReadFrom
 	// calls. Double-close (here + the defers) is an idempotent no-op.
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		<-ctx.Done()
 		_ = conn.Close()
 		_ = serverConn.Close()
@@ -311,7 +319,6 @@ func (m *Manager) runRelay(ctx context.Context, cancel context.CancelFunc,
 	// Track the server-response goroutine so the runner joins it. Its exit
 	// cancels the shared ctx (cross-cancellation) so the watcher closes both
 	// conns and the main loop unblocks too.
-	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
