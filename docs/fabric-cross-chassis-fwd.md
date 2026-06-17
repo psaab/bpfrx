@@ -163,3 +163,50 @@ forwarding changes. LAN connectivity (ping 10.0.60.1) works correctly.
     Normal path:   WAN → fw0 → FIB → LAN
     Failback path: WAN → fw0 → FIB FAIL → fabric → fw1 → FIB → LAN
 ```
+
+## Userspace dataplane: FabricRedirect unsendable fail-closed (#1946)
+
+The Rust AF_XDP helper resolves a `FabricRedirect` disposition
+(`resolve_fabric_redirect`, `userspace-dp/src/afxdp/forwarding/mod.rs`)
+into an L2 redirect: re-header the original packet with the fabric
+peer/local MACs and TX it out the fabric parent so the **peer** runs it
+through its full pipeline. A FabricRedirect frame is therefore a
+cross-chassis L2 redirect — it is **never** a packet for the local kernel
+FIB.
+
+There are two rare conditions where the helper cannot TX a FabricRedirect
+to the peer, across both the desc-frame path and the Prebuilt fast path
+(an embedded-ICMP NAT-reversed error whose resolution turned into a
+fabric redirect via `finalize_embedded_icmp_resolution`):
+
+1. **No XSK binding on the fabric parent** — the bind is not yet ready or
+   `bind()` failed (`tx/dispatch/mod.rs`, the
+   `resolve_pending_forward_target_binding` `None` arm — both the
+   desc-frame fallback and the Prebuilt fast path).
+2. **Build/enqueue failure** — the fabric parent binding exists but the
+   forward-frame build or TX-ring enqueue failed
+   (`handle_forward_build_failure`, `tx/dispatch/slow_path.rs`, for the
+   desc-frame path; the Prebuilt local-enqueue failure arm in
+   `tx/dispatch/mod.rs`).
+
+In all of these the frame is **dropped fail-closed** and counted on the
+per-binding `fabric_redirect_unsendable_drops` counter (surfaced on
+`BindingStatus`; Go `FabricRedirectUnsendableDrops`), with a distinct
+exception reason (`fabric_redirect_no_binding` vs
+`fabric_redirect_build_failed`) for path observability. It is **not**
+reinjected to the local kernel slow path.
+
+Reinjecting a FabricRedirect locally would re-introduce exactly the
+wrong-path / session-poisoning hazard this whole mechanism exists to
+avoid (the kernel-route fallback in the asymmetric-routing window), plus
+the slow-path reinject primitive strips L2 and applies NAT — wrong for a
+fabric redirect that wants the original L2 frame, pre-NAT. This is the
+same class of fail-closed gate as the #1873 R-C
+`tunnel_encap_unresolved_drops` tunnel-reinject guard.
+
+Before #1946 this was asymmetric: an `Owned` (GRE-decapped copy) no-
+binding frame was raw-reinjected while a `Live` (raw in-UMEM) one was
+silently dropped by the filtered `maybe_reinject_slow_path` wrapper
+(`FabricRedirect` is excluded by `is_slow_path_eligible`), and the
+build-failure path raw-reinjected both. #1946 makes all of them drop
+fail-closed + count.

@@ -4557,6 +4557,175 @@ fn handle_forward_build_failure_without_fallback_only_records_build_failure() {
     assert_eq!(reasons, vec!["forward_build_failed"]);
 }
 
+/// #1946: a FabricRedirect frame whose forward-frame build/enqueue failed
+/// must NOT be raw-reinjected to the local kernel slow path (a
+/// cross-chassis L2 redirect is not kernel-FIB routable — wrong-path /
+/// conntrack-poison hazard). It is dropped fail-closed and counted on the
+/// shared `fabric_redirect_unsendable_drops` counter with a distinct
+/// `fabric_redirect_build_failed` exception, even when
+/// `fallback_to_slow_path == true`.
+#[test]
+fn handle_forward_build_failure_drops_fabric_redirect_fail_closed() {
+    let frame =
+        build_icmp_echo_frame_v4(Ipv4Addr::new(10, 0, 61, 102), Ipv4Addr::new(1, 1, 1, 1), 64);
+    let binding = BindingIdentity {
+        slot: 7,
+        queue_id: 0,
+        worker_id: 0,
+        interface: Arc::<str>::from("ge-0-0-2"),
+        ifindex: 6,
+    };
+    let live = BindingLiveState::new();
+    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        l4_offset: 34,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        ..UserspaceDpMeta::default()
+    };
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::FabricRedirect,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 12,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 99, 0, 2))),
+            neighbor_mac: Some([0, 1, 2, 3, 4, 5]),
+            src_mac: Some([6, 7, 8, 9, 10, 11]),
+            tx_vlan_id: 0,
+        },
+        nat: NatDecision::default(),
+    };
+    let mut dbg = DebugPollCounters::default();
+    let local_tunnel_reinjectors = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+
+    // `slow_path = None` would make even an eligible disposition record a
+    // `slow_path_unavailable` drop; pass None so that, if the gate were
+    // ever removed, the reasons vector would differ from the expected
+    // fail-closed sequence and the test would catch the regression.
+    handle_forward_build_failure(
+        &binding,
+        &live,
+        None,
+        &local_tunnel_reinjectors,
+        &recent_exceptions,
+        &mut dbg,
+        12,
+        frame.len() as u32,
+        &frame,
+        meta,
+        decision,
+        true,
+        &ForwardingState::default(),
+    );
+
+    assert_eq!(dbg.build_fail, 1);
+    assert_eq!(
+        live.fabric_redirect_unsendable_drops.load(Ordering::Relaxed),
+        1
+    );
+    // Fail-closed: no slow-path reinjection of any kind.
+    assert_eq!(live.slow_path_packets.load(Ordering::Relaxed), 0);
+    assert_eq!(live.slow_path_drops.load(Ordering::Relaxed), 0);
+    let reasons: Vec<String> = recent_exceptions
+        .lock()
+        .expect("exceptions")
+        .iter()
+        .map(|entry| entry.reason.clone())
+        .collect();
+    assert_eq!(
+        reasons,
+        vec!["forward_build_failed", "fabric_redirect_build_failed"]
+    );
+}
+
+/// #1946 regression guard: the FabricRedirect gate in
+/// `handle_forward_build_failure` must be disposition-specific.
+/// `ForwardCandidate` IS a route the kernel FIB may legitimately serve,
+/// so it must STILL reinject (not be caught by the fabric gate). With
+/// `slow_path = None` the reinject lands on `slow_path_unavailable`,
+/// proving the gate let it through.
+#[test]
+fn handle_forward_build_failure_still_reinjects_forward_candidate() {
+    let frame =
+        build_icmp_echo_frame_v4(Ipv4Addr::new(10, 0, 61, 102), Ipv4Addr::new(1, 1, 1, 1), 64);
+    let binding = BindingIdentity {
+        slot: 7,
+        queue_id: 0,
+        worker_id: 0,
+        interface: Arc::<str>::from("ge-0-0-2"),
+        ifindex: 6,
+    };
+    let live = BindingLiveState::new();
+    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        l4_offset: 34,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        ..UserspaceDpMeta::default()
+    };
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 12,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))),
+            neighbor_mac: Some([0, 1, 2, 3, 4, 5]),
+            src_mac: Some([6, 7, 8, 9, 10, 11]),
+            tx_vlan_id: 0,
+        },
+        nat: NatDecision::default(),
+    };
+    let mut dbg = DebugPollCounters::default();
+    let local_tunnel_reinjectors = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+
+    handle_forward_build_failure(
+        &binding,
+        &live,
+        None,
+        &local_tunnel_reinjectors,
+        &recent_exceptions,
+        &mut dbg,
+        12,
+        frame.len() as u32,
+        &frame,
+        meta,
+        decision,
+        true,
+        &ForwardingState::default(),
+    );
+
+    assert_eq!(dbg.build_fail, 1);
+    // The fabric gate must NOT have caught a ForwardCandidate.
+    assert_eq!(
+        live.fabric_redirect_unsendable_drops.load(Ordering::Relaxed),
+        0
+    );
+    // It reinjected (and dropped only because slow_path is None).
+    assert_eq!(live.slow_path_drops.load(Ordering::Relaxed), 1);
+    let reasons: Vec<String> = recent_exceptions
+        .lock()
+        .expect("exceptions")
+        .iter()
+        .map(|entry| entry.reason.clone())
+        .collect();
+    assert_eq!(
+        reasons,
+        vec!["forward_build_failed", "slow_path_unavailable"]
+    );
+}
+
 #[test]
 fn slow_path_accept_is_categorized_by_reason_and_disposition() {
     let live = BindingLiveState::new();

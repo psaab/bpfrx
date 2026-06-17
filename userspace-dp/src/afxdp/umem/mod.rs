@@ -386,6 +386,15 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// unencapsulated (the pre-#1873 plaintext-leak fallback). Also
     /// bumped by the R-E pending-neigh tunnel exclusion.
     pub(in crate::afxdp) tunnel_encap_unresolved_drops: AtomicU64,
+    /// #1946: FabricRedirect frames dropped fail-closed because they
+    /// could not be TX'd to the HA peer over the fabric link — either the
+    /// fabric parent had no XSK binding (bind not ready / `bind()` failed)
+    /// or the forward-frame build/enqueue failed. A FabricRedirect is a
+    /// cross-chassis L2 redirect for the peer's pipeline, never a
+    /// kernel-FIB-routable packet, so it is dropped rather than reinjected
+    /// to the local kernel slow path (a wrong-path / conntrack-poison
+    /// hazard; cf. the #1873 R-C `tunnel_encap_unresolved_drops` gate).
+    pub(in crate::afxdp) fabric_redirect_unsendable_drops: AtomicU64,
     pub(super) kernel_rx_dropped: AtomicU64,
     pub(super) kernel_rx_invalid_descs: AtomicU64,
     pub(super) tx_packets: AtomicU64,
@@ -736,6 +745,7 @@ impl BindingLiveState {
             slow_path_drops: AtomicU64::new(0),
             slow_path_rate_limited: AtomicU64::new(0),
             tunnel_encap_unresolved_drops: AtomicU64::new(0),
+            fabric_redirect_unsendable_drops: AtomicU64::new(0),
             kernel_rx_dropped: AtomicU64::new(0),
             kernel_rx_invalid_descs: AtomicU64::new(0),
             tx_packets: AtomicU64::new(0),

@@ -320,12 +320,14 @@ impl ForwardingDisposition {
     ///   - `DiscardRoute`: matched a discard/reject route whose entire
     ///     purpose is to drop the traffic.
     ///   - `ForwardCandidate` / `FabricRedirect`: handled by the forward /
-    ///     fabric path, never the generic slow path. (The two intentional
-    ///     unfiltered `_from_frame` callers — the FabricRedirect-Owned
-    ///     fallback in `tx/dispatch/mod.rs` and the ForwardCandidate
-    ///     build-failure fallback in `tx/dispatch/slow_path.rs` — bypass
+    ///     fabric path, never the generic slow path. The ONE intentional
+    ///     unfiltered `_from_frame` caller — the ForwardCandidate
+    ///     build-failure fallback in `tx/dispatch/slow_path.rs` — bypasses
     ///     this predicate on purpose; see the doc on
-    ///     `maybe_reinject_slow_path_from_frame`.)
+    ///     `maybe_reinject_slow_path_from_frame`. (#1946: `FabricRedirect`
+    ///     with no fabric XSK binding, or whose build/enqueue failed, is
+    ///     dropped fail-closed + counted, never reinjected — a
+    ///     cross-chassis L2 redirect is not kernel-FIB routable.)
     pub(in crate::afxdp) fn is_slow_path_eligible(self) -> bool {
         matches!(
             self,

@@ -596,6 +596,76 @@ fn enqueue_pending_forwards_mirrors_live_frame_and_records_counter() {
     assert!(!forwarded_req.mirror_clone);
 }
 
+/// #1946: a Prebuilt FabricRedirect frame (e.g. an embedded-ICMP
+/// NAT-reversed error whose resolution turned into a fabric redirect)
+/// that is unsendable to the peer because the fabric parent has no XSK
+/// binding must be dropped fail-closed AND counted on
+/// `fabric_redirect_unsendable_drops` — not silently recycled. Drives the
+/// Prebuilt no-binding arm of `enqueue_pending_forwards`.
+#[test]
+fn enqueue_pending_forwards_counts_prebuilt_fabric_redirect_no_binding() {
+    let mut bindings = vec![BindingWorker::new_for_mirror_test(0, 0, 11, 0)];
+    let mut forwarding = test_forwarding_with_egress_mtu(1500);
+    forwarding.fabrics.clear();
+    let lookup = WorkerBindingLookup::from_bindings(&bindings);
+    let mirror_targets = MirrorTargetMap::default();
+
+    // Target ifindex 4242 has no binding in `lookup`, so
+    // resolve_pending_forward_target_binding returns None.
+    let mut decision = test_forwarding_decision_to_bound_ifindex(4242);
+    decision.resolution.disposition = ForwardingDisposition::FabricRedirect;
+    let mut request = test_live_forward_request_for_frame(64, decision);
+    request.frame = PendingForwardFrame::Prebuilt(vec![0u8; 64]);
+    let mut pending = vec![request];
+
+    let mut post_recycles = Vec::new();
+    let ingress_ident = bindings[0].identity();
+    let ingress_live = &*bindings[0].live as *const BindingLiveState;
+    let local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>> =
+        Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let worker_commands_by_id: BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>> = BTreeMap::new();
+    let mut dbg = DebugPollCounters::default();
+    let (left, rest) = bindings.split_at_mut(0);
+    let (ingress, right) = rest.split_first_mut().expect("ingress binding");
+
+    enqueue_pending_forwards(
+        left,
+        0,
+        ingress,
+        right,
+        &lookup,
+        &mirror_targets,
+        &mut pending,
+        &mut post_recycles,
+        1,
+        &forwarding,
+        &ingress_ident,
+        unsafe { &*ingress_live },
+        None,
+        &local_tunnel_deliveries,
+        &recent_exceptions,
+        &mut dbg,
+        0,
+        &worker_commands_by_id,
+    );
+
+    assert_eq!(
+        bindings[0]
+            .live
+            .fabric_redirect_unsendable_drops
+            .load(Ordering::Relaxed),
+        1
+    );
+    let reasons: Vec<String> = recent_exceptions
+        .lock()
+        .expect("exceptions")
+        .iter()
+        .map(|entry| entry.reason.clone())
+        .collect();
+    assert_eq!(reasons, vec!["fabric_redirect_no_binding"]);
+}
+
 #[test]
 fn shared_exact_policy_uses_requested_queue_id() {
     let cos_fast_interfaces = test_cos_fast_interfaces(80, 5, &[(5, true)]);

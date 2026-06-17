@@ -130,6 +130,17 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
         // Fast path: prebuilt frame (e.g. ICMP error NAT reversal).
         // The frame is already fully rewritten — just enqueue for TX.
         if let PendingForwardFrame::Prebuilt(prebuilt) = &mut request.frame {
+            // #1946: a Prebuilt frame (e.g. an embedded-ICMP NAT-reversed
+            // error) can carry a FabricRedirect resolution
+            // (`finalize_embedded_icmp_resolution`). When that frame is
+            // unsendable to the peer — no fabric XSK binding, or the
+            // local enqueue fails — drop it fail-closed AND count it on
+            // `fabric_redirect_unsendable_drops`, the same observability
+            // invariant as the desc-frame no-binding / build-failure
+            // paths. (Non-FabricRedirect Prebuilt drops keep their prior
+            // silent recycle+continue.)
+            let prebuilt_is_fabric_redirect = request.decision.resolution.disposition
+                == ForwardingDisposition::FabricRedirect;
             let Some(target_binding) = resolve_pending_forward_target_binding(
                 left,
                 ingress_index,
@@ -140,6 +151,20 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                 target_binding_index,
                 request.target_ifindex,
             ) else {
+                if prebuilt_is_fabric_redirect {
+                    ingress_live
+                        .fabric_redirect_unsendable_drops
+                        .fetch_add(1, Ordering::Relaxed);
+                    record_exception(
+                        recent_exceptions,
+                        ingress_ident,
+                        "fabric_redirect_no_binding",
+                        request.desc.len,
+                        Some(request.meta.into()),
+                        None,
+                        forwarding,
+                    );
+                }
                 recycle_ingress_frame(ingress_binding, source_offset, now_ns);
                 continue;
             };
@@ -157,6 +182,20 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                 enqueue_ns: 0,
             };
             if enqueue_local_request_to_target_or_owner(target_binding, req).is_err() {
+                if prebuilt_is_fabric_redirect {
+                    ingress_live
+                        .fabric_redirect_unsendable_drops
+                        .fetch_add(1, Ordering::Relaxed);
+                    record_exception(
+                        recent_exceptions,
+                        ingress_ident,
+                        "fabric_redirect_build_failed",
+                        request.desc.len,
+                        Some(request.meta.into()),
+                        None,
+                        forwarding,
+                    );
+                }
                 recycle_ingress_frame(ingress_binding, source_offset, now_ns);
                 continue;
             }
@@ -221,33 +260,31 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
             // parents have bindings; this is a safety-net fallback in case
             // the binding is not yet ready or bind() failed.
             if request.decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
-                if matches!(request.frame, PendingForwardFrame::Owned(_)) {
-                    maybe_reinject_slow_path_from_frame(
-                        ingress_ident,
-                        ingress_live,
-                        slow_path,
-                        local_tunnel_deliveries,
-                        source_frame,
-                        request.meta,
-                        request.decision,
-                        recent_exceptions,
-                        "slow_path",
-                        forwarding,
-                    );
-                } else {
-                    maybe_reinject_slow_path(
-                        ingress_ident,
-                        ingress_live,
-                        slow_path,
-                        local_tunnel_deliveries,
-                        unsafe { &*ingress_area },
-                        request.desc,
-                        request.meta,
-                        request.decision,
-                        recent_exceptions,
-                        forwarding,
-                    );
-                }
+                // #1946: a FabricRedirect with no XSK binding on the
+                // fabric parent is a rare safety net (bind not ready /
+                // bind() failed). The frame is a cross-chassis L2 redirect
+                // destined for the peer's pipeline, NOT a kernel-FIB-
+                // routable packet — reinjecting it to the local kernel
+                // slow path is a wrong-path / conntrack-poison hazard (the
+                // pre-#1946 PendingForwardFrame::Owned branch did exactly
+                // that, while the Live branch was silently dropped by the
+                // filtered maybe_reinject_slow_path wrapper). Drop BOTH
+                // frame kinds identically, fail-closed, and count (cf. the
+                // #1873 R-C tunnel_encap_unresolved_drops gate). We touch
+                // neither frame, so the Owned (GRE-decapped copy) vs Live
+                // (raw in-UMEM) representation difference is irrelevant.
+                ingress_live
+                    .fabric_redirect_unsendable_drops
+                    .fetch_add(1, Ordering::Relaxed);
+                record_exception(
+                    recent_exceptions,
+                    ingress_ident,
+                    "fabric_redirect_no_binding",
+                    request.desc.len,
+                    Some(request.meta.into()),
+                    None,
+                    forwarding,
+                );
                 recycle_ingress_frame(ingress_binding, source_offset, now_ns);
                 continue;
             }
