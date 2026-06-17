@@ -32,3 +32,15 @@ retried as task-mqio8yrx-i5zg40 per feedback_codex_infra_must_retry.
 | r4 | Claude SMR | (PLAN-READY, unchanged from r3 — all AGY r3 folded) | PLAN-READY |
 | r4 | AGY | adversarial-review-mqiojq38-qdhj86 | pending |
 | r4 | Codex (retry) | task-mqiojqag-3xu8nc | pending (r2/r3 infra-dropped) |
+
+## Convergence (v2.4 @ final)
+| Round | Reviewer | Verdict |
+|---|---|---|
+| r4 | Claude SMR | PLAN-READY (claude-smr-plan-r4.md) |
+| r4 | AGY | PLAN-NEEDS-MINOR (5 impl edge cases — all folded into v2.4) — adversarial-review-mqiojq38-qdhj86 |
+| r4 | Codex | infra-dropped (task-mqiojqag-3xu8nc, "No job found" on fetch) |
+
+CONVERGED PLAN-READY: architecture unchallenged since r1; SMR READY; every AGY
+finding (r1-r4) folded; Codex r1 MAJOR points folded, r2-r4 infra-blocked
+(3 documented retries per feedback_codex_infra_must_retry). Residual AGY items
+are code-level implementation details carried to /engineer's 4-way review.

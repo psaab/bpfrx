@@ -1,13 +1,27 @@
 # Upgrade-subsystem hardening — plan of action (review-011)
 
-**Status:** DRAFT v2.3 — r1 all-three PLAN-NEEDS-MAJOR (folded v2); r2 SMR+AGY
-PLAN-NEEDS-MINOR (folded v2.2); r3 SMR PLAN-READY, AGY PLAN-NEEDS-MINOR (5
-lifecycle edge cases, folded v2.3); Codex r2/r3 infra-dropped (documented
-retries — `feedback_codex_infra_must_retry`). v2.3 adds: package-downgrade
-cleanup, systemd drop-in removal on remove/purge, preinst rename-collision
-(ENOTEMPTY) retry guard, atomic shell symlink repoint, verify-fail copy
-cleanup. The architecture has been unchallenged since r1; remaining items are
-maintainer-script implementation details, all now enumerated.
+**Status:** PLAN-READY (v2.4, converged 2026-06-17).
+
+**Convergence:** the architecture (the `versions/`-maintainer-managed contract +
+A/B/C seeding + one host-wide `/run` lock + `verify-dataplane` torn-binary
+backstop) has been **unchallenged by all reviewers since r1** — every round
+since has only refined maintainer-script/cleanup *implementation* details, each
+folded into the plan. Round trail:
+- r1: Codex + AGY + SMR all PLAN-NEEDS-MAJOR → folded (v2/v2.1).
+- r2: SMR + AGY PLAN-NEEDS-MINOR → folded (v2.2). Codex r2 infra-dropped.
+- r3: SMR PLAN-READY; AGY PLAN-NEEDS-MINOR (5 lifecycle edge cases) → folded
+  (v2.3). Codex r3 retry infra-dropped.
+- r4: SMR PLAN-READY; AGY PLAN-NEEDS-MINOR (5 finer edge cases, all consequences
+  of the v2.3 additions) → folded (v2.4). Codex r4 retry — see ledger.
+
+**Convergence call:** declared PLAN-READY. AGY's residual findings are concrete
+implementation edge cases (verify-fail journal reset, never-delete-active-
+version, boot-guarded `systemctl`, `mkdir /run/xpf`) now fully enumerated in
+§4–§6 — they are code-level bugs in not-yet-written maintainer scripts that
+`/engineer`'s 4-way code review (with Copilot + actual tests) will verify
+against real code. Per `feedback_codex_infra_must_retry`, Codex was retried each
+round (r1 substantive, r2–r4 infra-dropped/documented); convergence rests on
+SMR (READY) + AGY (all findings folded) + Codex r1 (MAJOR points all folded).
 **Base:** `3cd181323` (origin/master)
 **Issues:** #1964 (F1, HIGH), #1965 (F2, HIGH), #1966 (F3, LOW), #1967 (C1–C4 +
 two new must-fixes, MEDIUM). `/research` only — no code is written here.
@@ -141,7 +155,14 @@ in `debian/xpf.preinst` (cannot use the not-yet-unpacked Go binary).
   symlinks keep running the *newer* binaries — a silent version mismatch. The
   hardened `postrm` must detect a downgrade below the hardened-layout version
   and clean up: remove the drop-in, repoint sbin back to
-  `/usr/local/share/xpf/staged/*` (atomic), `systemctl daemon-reload`.
+  `/usr/local/share/xpf/staged/*` (atomic), **delete `versions/current`**
+  (AGY-r4-1 — else a later re-upgrade sees `current` present, skips the
+  snapshot, and repoints sbin to a stale version dir), `systemctl
+  daemon-reload`.
+- **boot-guard (AGY-r4-4):** all `systemctl` calls in maintainer scripts run
+  under `set -e`; in a non-booted env (docker/chroot/bake) `systemctl` exits 1
+  and fails the transaction. Guard: `[ -d /run/systemd/system ] && systemctl
+  … || true`.
 
 **Version key:** `staged/xpfd version` (runtime), validated as a safe single
 path segment (shared with C1).
@@ -179,8 +200,9 @@ path segment (shared with C1).
   concurrent source overwrite yields matching torn bytes on both sides
   (undetected). The checksum catches copy/disk corruption, not concurrent
   source mutation. **Fix (layered, corrected per SMR-r2-m1):**
-  (i) `debian/xpf.preinst` acquires `/run/xpf/upgrade.lock` (`LOCK_NB`) and
-  **fails the package operation before unpack** if busy — this blocks the case
+  (i) `debian/xpf.preinst` (after `mkdir -p /run/xpf` — `/run` tmpfs may lack
+  the dir on a fresh boot, AGY-r4-5) acquires `/run/xpf/upgrade.lock`
+  (`LOCK_NB`) and **fails the package operation before unpack** if busy — this blocks the case
   where an operator *already holds* the lock when apt starts (clean fail-loud,
   apt aborts before any mutation). It does **NOT** fully serialize unpack vs a
   concurrent operator copy: a flock fd dies at preinst exit, so the lock is not
@@ -234,12 +256,19 @@ the drain window.
   START-failure auto-rollback (cutover.go:183), so this is not a correctness
   fix.
 - **C4:** `SyncDir(VersionsDir)` immediately after `removeAllPartials()`.
-- **NEW — verify-fail copy cleanup (AGY-r3-5):** `copyStaged` skips the copy
-  when `versions/<ver>` already exists (cutover.go:313-318). If a prior run
-  failed at `verify` and the operator drops a corrected binary into `staged/`
-  under the *same* version string (common in dev/test/reinstall), the retry
-  skips the copy and re-verifies the stale failing copy. Fix: on `verify`
-  failure, remove `versions/<ver>` so a subsequent run recopies from `staged/`.
+- **NEW — verify-fail copy cleanup (AGY-r3-5), with guards (AGY-r4-2/3):**
+  `copyStaged` skips the copy when `versions/<ver>` already exists
+  (cutover.go:313-318). If a prior run failed at `verify` and the operator
+  drops a corrected binary into `staged/` under the *same* version string
+  (dev/test/reinstall), the retry skips the copy and re-verifies the stale
+  failing copy. Fix: on `verify` failure, remove `versions/<ver>` so a
+  subsequent run recopies. **Two mandatory guards:** (a) **never delete the
+  active version** — only remove `versions/<TargetVersion>` when
+  `TargetVersion != PreviousVersion` and it is not the `versions/current`
+  target (AGY-r4-3 — else a same-version verify-fail deletes the *running*
+  daemon's binaries); (b) **reset the journal** to `StatePreflight`/`StateInit`
+  and persist it when deleting (AGY-r4-2 — else the journal stays `StateCopied`,
+  the next run skips `copyStaged`, and `verify` fails file-not-found).
 
 ## 7. Public API / contract preservation
 
