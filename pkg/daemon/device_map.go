@@ -98,7 +98,22 @@ func enumerateAndRenameMapped(dm *config.DeviceMapConfig, cfg *config.Config) er
 	// equals a desired final name, but which is NOT the NIC we want there,
 	// is moved to a unique temp name first (V-2).
 	tempStranded := make(map[string]presentNIC) // tempName -> original NIC info
-	tmpIdx := 0
+	// Track names currently in use (present NICs) so a leftover xpf-tmp-N
+	// from a prior crashed run does not cause an EEXIST temp-rename (AGY
+	// MEDIUM-3). freeTempName picks the first unused xpf-tmp-N.
+	inUse := make(map[string]bool, len(nics))
+	for i := range nics {
+		inUse[nics[i].Name] = true
+	}
+	freeTempName := func() string {
+		for k := 0; ; k++ {
+			cand := fmt.Sprintf("xpf-tmp-%d", k)
+			if !inUse[cand] {
+				inUse[cand] = true
+				return cand
+			}
+		}
+	}
 	for i := range nics {
 		n := &nics[i]
 		if !desiredNames[n.Name] {
@@ -110,8 +125,7 @@ func enumerateAndRenameMapped(dm *config.DeviceMapConfig, cfg *config.Config) er
 		}
 		// A different NIC occupies a desired name (stale-udev misrename, or
 		// the intended NIC is elsewhere). Move it out of the way.
-		tmpName := fmt.Sprintf("xpf-tmp-%d", tmpIdx)
-		tmpIdx++
+		tmpName := freeTempName()
 		if err := renameInterface(n.Name, tmpName); err != nil {
 			slog.Warn("device-map: temp-rename to break collision failed",
 				"from", n.Name, "to", tmpName, "err", err)
@@ -331,21 +345,38 @@ func (d *Daemon) deviceMapCommitPreflight(candidate, rollbackTarget *config.Conf
 		slog.Warn("device-map pre-flight: NIC enumeration failed; skipping (lifeline still protects mgmt)", "err", err)
 		return nil
 	}
-	protected := d.resolveProtectedInterfaces()
-
-	if reason := deviceMapStrandsManagement(candidate, nics, protected); reason != "" {
+	// AGY HIGH-2: resolve the protected set from EACH config's OWN
+	// management-interface leaf (not the active config's), so a commit that
+	// repoints `system management-interface` is validated against the
+	// intent it is establishing — neither a silent lockout (using the stale
+	// active leaf) nor a false rejection of a legitimate mgmt migration. The
+	// lifeline record stays config-independent in both.
+	if reason := deviceMapStrandsManagement(candidate, nics, protectedForConfig(candidate)); reason != "" {
 		return fmt.Errorf("device-map commit rejected: %s", reason)
 	}
 	// V-3(a): validate the rollback target too, so a confirmed-commit
 	// timeout reverts to a KNOWN-safe config and can be applied
 	// unconditionally (OQ-15.2 — no rollback-time abort, no split-brain).
 	if rollbackTarget != nil {
-		if reason := deviceMapStrandsManagement(rollbackTarget, nics, protected); reason != "" {
+		if reason := deviceMapStrandsManagement(rollbackTarget, nics, protectedForConfig(rollbackTarget)); reason != "" {
 			return fmt.Errorf("commit confirmed rejected: the rollback target (current active "+
 				"config, restored on timeout) would strand management: %s", reason)
 		}
 	}
 	return nil
+}
+
+// protectedForConfig resolves the #1922 protected set using the SPECIFIC
+// config's management-interface leaf (plus the config-independent lifeline
+// record), rather than the currently-active config. The pre-flight uses this
+// so a commit that repoints `system management-interface` is validated
+// against the mgmt NIC it is ESTABLISHING.
+func protectedForConfig(cfg *config.Config) map[string]bool {
+	mgmtLeaf := ""
+	if cfg != nil {
+		mgmtLeaf = cfg.System.ManagementInterface
+	}
+	return protectedInterfaces(mgmtLeaf)
 }
 
 // teardownUnmappedManaged is the #1956 V-4 managed->unmapped teardown,

@@ -213,9 +213,15 @@ func (d *Daemon) deviceMapPassiveAdmissionAlarm(synced *config.Config) {
 	}
 	nics, err := enumeratePresentNICs()
 	if err != nil {
+		// AGY MINOR-5: do not let a transient hardware-lookup failure
+		// silently bypass the admission gate — log loudly so the operator
+		// knows the peer map was applied unchecked.
+		slog.Warn("HA CONFIG-SYNC: could not enumerate NICs to check the peer-pushed device-map "+
+			"for a management-lockout; the config is applied UNCHECKED. Re-verify the device-map "+
+			"on this node.", "err", err)
 		return
 	}
-	if reason := deviceMapStrandsManagement(synced, nics, d.resolveProtectedInterfaces()); reason != "" {
+	if reason := deviceMapStrandsManagement(synced, nics, protectedForConfig(synced)); reason != "" {
 		slog.Error("HA CONFIG-SYNC ALARM: the peer-pushed device-map would STRAND this node's "+
 			"management on next boot. The config is applied (stores stay consistent) and the "+
 			"management lifeline keeps the box reachable now, but a reboot would lock this node "+

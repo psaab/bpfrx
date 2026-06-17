@@ -188,6 +188,32 @@ func TestDeviceMapLenientDowngradesToWarning(t *testing.T) {
 	}
 }
 
+func TestDeviceMapMACNormalizedToColonLowercase(t *testing.T) {
+	// AGY HIGH-1: a hyphenated/upper-case committed MAC must be normalized to
+	// the kernel's colon-lower-case form so the resolver matches it.
+	tree := buildTree(t, []string{
+		"set chassis device-map interface ge-0/0/3 mac AA-BB-CC-DD-EE-FF",
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	got := cfg.Chassis.DeviceMap.Entries[0].MAC
+	if got != "aa:bb:cc:dd:ee:ff" {
+		t.Fatalf("MAC not normalized: got %q, want aa:bb:cc:dd:ee:ff", got)
+	}
+}
+
+func TestDeviceMapPCIAddrNormalizedToLowercase(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set chassis device-map interface ge-0/0/3 pci 0000:09:00.0",
+	})
+	cfg, _ := CompileConfig(tree)
+	if cfg.Chassis.DeviceMap.Entries[0].PCIAddr != "0000:09:00.0" {
+		t.Fatalf("PCI not normalized lowercase: %q", cfg.Chassis.DeviceMap.Entries[0].PCIAddr)
+	}
+}
+
 func TestDeviceMapPCIAddrValidatorRejectsGarbage(t *testing.T) {
 	tree := buildTree(t, []string{
 		"set chassis device-map interface ge-0/0/3 pci not-a-pci-addr",

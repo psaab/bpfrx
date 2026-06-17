@@ -164,6 +164,24 @@ func TestDeviceMapStrandsManagementRefuseOnTopologyChange(t *testing.T) {
 	}
 }
 
+func TestProtectedForConfigUsesConfigMgmtLeaf(t *testing.T) {
+	// AGY HIGH-2: the protected set must come from the SPECIFIC config's
+	// management-interface leaf. With no lifeline record, a config that sets
+	// `system management-interface em0` protects em0 (and narrows fxp0 out).
+	lifelineRecordFileForTest = filepath.Join(t.TempDir(), "no-lifeline")
+	t.Cleanup(func() { lifelineRecordFileForTest = "" })
+
+	cfg := &config.Config{}
+	cfg.System.ManagementInterface = "em0"
+	got := protectedForConfig(cfg)
+	if !got["em0"] {
+		t.Fatalf("protectedForConfig must protect the config's mgmt leaf em0; got %v", got)
+	}
+	if got["fxp0"] {
+		t.Fatalf("an explicit non-fxp0 mgmt leaf must narrow fxp0 out; got %v", got)
+	}
+}
+
 func TestDeviceMapStrandsManagementPositionalIsSafe(t *testing.T) {
 	// No device-map => positional mode, never stranded by a (non-existent)
 	// map; the #1922 protected set is the backstop.

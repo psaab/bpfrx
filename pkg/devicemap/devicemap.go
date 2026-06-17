@@ -81,12 +81,13 @@ type Binding struct {
 // R-6); the strict commit validator already rejects key mac on a RETH
 // member, so here the MAC leg is skipped for them as defense in depth.
 func Resolve(entries []config.DeviceMapEntry, nics []PresentNIC, rethMembers map[string]bool) []Binding {
-	byPCI := make(map[string]*PresentNIC)
+	byPCI := make(map[string][]*PresentNIC)
 	byPermMAC := make(map[string][]*PresentNIC)
 	for i := range nics {
 		n := &nics[i]
 		if n.PCIAddr != "" {
-			byPCI[strings.ToLower(n.PCIAddr)] = n
+			lp := strings.ToLower(n.PCIAddr)
+			byPCI[lp] = append(byPCI[lp], n)
 		}
 		if n.PermMAC != "" {
 			lm := strings.ToLower(n.PermMAC)
@@ -106,7 +107,13 @@ func Resolve(entries []config.DeviceMapEntry, nics []PresentNIC, rethMembers map
 		for _, key := range keySequence(e, allowPCI, allowMAC) {
 			switch key {
 			case config.DeviceMapKeyPCI:
-				if nic, ok := byPCI[strings.ToLower(e.PCIAddr)]; ok {
+				pm := byPCI[strings.ToLower(e.PCIAddr)]
+				if len(pm) > 1 {
+					// Two present NICs share one PCI address — ambiguous,
+					// refuse rather than bind a non-deterministic one.
+					rb.Status, rb.CurrentNIC, rb.Logical = BindRefusedAmbig, "", ""
+				} else if len(pm) == 1 {
+					nic := pm[0]
 					if e.MAC != "" && nic.PermMAC != "" {
 						if strings.EqualFold(nic.PermMAC, e.MAC) {
 							rb.Status, rb.CurrentNIC, rb.Logical = BindBound, nic.Name, logical

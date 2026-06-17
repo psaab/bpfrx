@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"sort"
 	"strings"
 )
@@ -30,8 +31,14 @@ func compileDeviceMap(node *Node) *DeviceMapConfig {
 		entry := DeviceMapEntry{LogicalName: inst.name}
 		props := map[string]string{}
 		collectDeviceMapProps(inst.node, props)
-		entry.PCIAddr = props["pci"]
-		entry.MAC = props["mac"]
+		entry.PCIAddr = strings.ToLower(props["pci"])
+		// Normalize the MAC to canonical colon-lowercase so it matches the
+		// kernel's PermHWAddr formatting at resolve time regardless of the
+		// committed spelling (net.ParseMAC also accepts aa-bb-.. and
+		// aabb.ccdd.eeff) — AGY HIGH-1. A malformed MAC was already rejected
+		// by ValidateMAC at commit; here we keep the raw value if parsing
+		// fails (lenient path) so the resolver's miss is at worst UNBOUND.
+		entry.MAC = normalizeMAC(props["mac"])
 		entry.KeyOrder = props["key"]
 		dm.Entries = append(dm.Entries, entry)
 	}
@@ -88,6 +95,24 @@ func collectDeviceMapProps(instNode *Node, props map[string]string) {
 
 func isDeviceMapProp(s string) bool {
 	return s == "pci" || s == "mac" || s == "key"
+}
+
+// normalizeMAC canonicalizes a MAC to colon-separated lower-case hex
+// (the form the kernel reports for PermHWAddr), so the device-map resolver's
+// string comparison matches regardless of the committed spelling. Returns the
+// trimmed input unchanged if it does not parse as a 6-octet MAC (a malformed
+// MAC is already rejected by ValidateMAC on the strict path; the lenient path
+// leaves it as-is, yielding at worst an UNBOUND resolve, never a misbind).
+func normalizeMAC(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	hw, err := net.ParseMAC(s)
+	if err != nil || len(hw) != 6 {
+		return s
+	}
+	return hw.String() // net.HardwareAddr.String() is colon-lower-case
 }
 
 // validateDeviceMapStrict is the #1956 cross-entry commit-check validator.

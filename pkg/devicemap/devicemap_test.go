@@ -92,6 +92,22 @@ func TestResolveRETHMemberIgnoresMACFallback(t *testing.T) {
 	}
 }
 
+func TestResolveAmbiguousPCIRefuses(t *testing.T) {
+	// AGY MEDIUM-4: two present NICs sharing one PCI address must refuse
+	// (deterministic), not silently bind whichever the map iterated last.
+	nics := []PresentNIC{
+		nic("enp9s0", "0000:09:00.0", "00:11:22:33:44:55"),
+		nic("enp9s0v1", "0000:09:00.0", "00:11:22:33:44:66"),
+	}
+	entries := []config.DeviceMapEntry{
+		{LogicalName: "ge-0/0/3", PCIAddr: "0000:09:00.0", KeyOrder: config.DeviceMapKeyPCI},
+	}
+	got := Resolve(entries, nics, nil)
+	if got[0].Status != BindRefusedAmbig {
+		t.Fatalf("want REFUSED on ambiguous PCI, got %v", got[0].Status)
+	}
+}
+
 func TestResolveAmbiguousMACRefuses(t *testing.T) {
 	// Two NICs with the same permanent MAC (cloned/bonded) => refuse.
 	nics := []PresentNIC{
