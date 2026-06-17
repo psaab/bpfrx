@@ -59,6 +59,9 @@ func DrainAndConfirm(cl RollingCluster, deadline time.Duration) error {
 		if derr == nil && ok {
 			return nil
 		}
+		// Bound the next sleep to the remaining time so we do not overshoot the
+		// deadline by up to a full poll interval (Copilot): small deadlines (incl.
+		// tests) must not silently turn into deadline+interval.
 		if time.Now().After(dl) {
 			if rbErr := cl.ResetFailover(); rbErr != nil {
 				return fmt.Errorf("drain did not complete within %s AND failback "+
@@ -70,8 +73,23 @@ func DrainAndConfirm(cl RollingCluster, deadline time.Duration) error {
 			}
 			return fmt.Errorf("drain did not complete within %s (peer did not take over / sync not clean; failed back)", deadline)
 		}
-		time.Sleep(drainPollInterval)
+		sleepBounded(dl)
 	}
+}
+
+// sleepBounded sleeps for drainPollInterval, but never past dl — so a poll loop
+// re-checks (and reports timeout) at the deadline rather than overshooting it by
+// up to a full interval.
+func sleepBounded(dl time.Time) {
+	rem := time.Until(dl)
+	if rem <= 0 {
+		return
+	}
+	if rem < drainPollInterval {
+		time.Sleep(rem)
+		return
+	}
+	time.Sleep(drainPollInterval)
 }
 
 // RejoinAndConfirm clears manual failover on the local node and confirms it is
@@ -97,6 +115,6 @@ func RejoinAndConfirm(cl RollingCluster, deadline time.Duration) error {
 			return fmt.Errorf("rejoin not confirmed within %s "+
 				"(peer-alive=%v sync-established=%v)", deadline, alive, synced)
 		}
-		time.Sleep(drainPollInterval)
+		sleepBounded(dl)
 	}
 }

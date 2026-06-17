@@ -137,7 +137,16 @@ const (
 func (s *KernelSelfRecovery) readLeaseState() leaseState {
 	data, err := os.ReadFile(s.cfg.LeasePath)
 	if err != nil {
-		return leaseNone // no lease (or unreadable) — not a kernel roll
+		// A genuinely absent lease is the common case (no roll in progress) — not
+		// worth logging. A non-NotExist error (permission/I/O) IS actionable: log
+		// it. Either way return leaseNone, which is a NO-OP in Tick (it acts only
+		// on leaseExpiredOurs), so a transient read error can only DELAY recovery
+		// (the safe direction), never trigger an unintended ResetFailover.
+		if !os.IsNotExist(err) {
+			s.cfg.Logf("kernel self-recovery: lease %s unreadable (%v); treating as no-lease "+
+				"this tick (will retry)", s.cfg.LeasePath, err)
+		}
+		return leaseNone
 	}
 	var l KernelRollLease
 	if err := json.Unmarshal(data, &l); err != nil {

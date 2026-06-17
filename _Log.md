@@ -1,5 +1,21 @@
 # Action Log
 
+## 2026-06-16 — #1930 INC-2: Copilot findings (orchestrator + drain + lease)
+- **Timestamp**: 2026-06-16 UTC
+- **Action**: Addressed Copilot review findings on the final diff. (Stale,
+  already fixed: hold-before-UpdateConfig.) Fixed: (1) xpf-deploy.py
+  IndexError on a single --node + identical-node collapse — validate the
+  pair before indexing; (2) REVERT detection falsely firing on a transient
+  status-read failure — require the `armed` key present AND == "none"
+  (affirmative read), not a missing key; (3) ssh backend hang on
+  host-key/password prompt — BatchMode=yes + ConnectTimeout=15;
+  (4) DrainAndConfirm/RejoinAndConfirm deadline overshoot — sleepBounded
+  caps the final sleep to remaining time; (5) readLeaseState swallowed
+  non-NotExist read errors silently — now logs them (still leaseNone =
+  safe no-op in the leaseExpiredOurs-only Tick).
+- **File(s)**: scripts/deploy/xpf-deploy.py, pkg/upgrade/kernel_drain.go,
+  pkg/upgrade/kernel_selfrecover.go
+
 ## 2026-06-16 — #1930 INC-2: AGY r2 Findings 1/2/3 (demote, revert race, timeout)
 - **Timestamp**: 2026-06-16 UTC
 - **Action**: Addressed AGY r2's three findings. F1 (CRITICAL, already

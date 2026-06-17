@@ -616,7 +616,13 @@ def cmd_fetch(args):
 def _node_exec(runner, backend, node, argv, check=True):
     """Run argv inside `node` via the chosen backend (incus|ssh)."""
     if backend == "ssh":
-        full = ["ssh", node, "--"] + argv
+        # Non-interactive automation: never hang on a host-key / password prompt
+        # or a dead host (Copilot). BatchMode disables all prompts (fail fast
+        # instead), ConnectTimeout bounds the TCP connect.
+        full = ["ssh",
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=15",
+                node, "--"] + argv
     else:
         full = ["incus", "exec", node, "--"] + argv
     if runner.dry:
@@ -711,6 +717,13 @@ def cmd_kernel_roll(args):
     runner = Runner(args.dry_run)
     backend = args.backend
     nodes = args.nodes               # ordered [first-to-roll, second]
+    # Validate the pair BEFORE indexing nodes[0]/nodes[1] (Copilot: a single
+    # --node would otherwise raise IndexError instead of a clear message; two
+    # identical --node values would collapse the dict to one key).
+    if len(nodes) != 2:
+        die("kernel-roll needs exactly two --node arguments (the HA pair)")
+    if nodes[0] == nodes[1]:
+        die(f"kernel-roll needs two DISTINCT nodes; got {nodes[0]} twice")
     node_ids = {nodes[0]: args.node0_id, nodes[1]: args.node1_id}
     version = args.version
     # Sanitize the holder to a safe token set (r2 AGY): the nodename is
@@ -721,9 +734,6 @@ def cmd_kernel_roll(args):
     holder = _re.sub(r"[^A-Za-z0-9._:-]", "_", _raw_holder)
     lease_ttl = args.lease_ttl
     poll_deadline = args.boot_deadline
-
-    if len(nodes) != 2:
-        die("kernel-roll needs exactly two --node arguments (the HA pair)")
 
     print(f"==> LANE-1 HA kernel roll to {version}: {nodes[0]} then {nodes[1]} "
           f"(one node at a time; peer keeps forwarding)")
@@ -782,7 +792,14 @@ def cmd_kernel_roll(args):
                 if st.get("promoted") == version and running == version:
                     promoted = True
                     break
-                if running and running != version and st.get("armed") in (None, "none"):
+                # REVERT detection requires an AFFIRMATIVE status read (Copilot):
+                # a transient status-command failure yields an EMPTY dict whose
+                # `armed` is absent — do NOT treat that as armed=none (it would
+                # falsely `die` a revert). Only declare revert when status was
+                # actually read (`armed` key present) and explicitly == "none"
+                # while running a non-candidate kernel.
+                if (running != version and "armed" in st
+                        and st.get("armed") == "none"):
                     # node booted a NON-candidate kernel and nothing is armed ->
                     # it REVERTED. STOP: leave peer primary, do NOT roll peer.
                     die(f"{node} REVERTED (running {running}, not {version}); "
