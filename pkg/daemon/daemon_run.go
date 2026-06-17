@@ -429,19 +429,22 @@ func (d *Daemon) Run(ctx context.Context) error {
 		cc := cfg.Chassis.Cluster
 		d.cluster = cluster.NewManager(cc.NodeID, cc.ClusterID)
 		d.cluster.SetSoftwareVersion(d.opts.Version)
-		d.cluster.UpdateConfig(cc)
 
 		// #1930 INC-2: if THIS boot is a kernel-candidate trial (the kernel
-		// journal is ARMED), set the unconditional election hold BEFORE Start()
-		// so the candidate can never win an election (even isolated) until the
-		// promotion gate verifies the dataplane. ManualFailover is in-memory and
-		// lost across the reboot, and peerAlive is still false at this point, so
-		// the hold — not ForceSecondary — is what keeps an unverified candidate
-		// from preempting the healthy peer and blackholing traffic (r2 AGY
-		// Critical). No-op on an ordinary boot. MUST precede Start(): once the
-		// run loop starts, an election window opens.
+		// journal is ARMED), set the unconditional election hold BEFORE the
+		// FIRST election so the candidate can never win it (even isolated) until
+		// the promotion gate verifies the dataplane. UpdateConfig() ITSELF runs
+		// an election (single-node path when no peer is up yet, which is exactly
+		// the candidate-boot case), so the hold MUST precede UpdateConfig — not
+		// merely Start() — or the node is already StatePrimary by the time the
+		// hold is set and Start()'s heartbeat/VRRP would advertise primary and
+		// preempt the healthy peer. ManualFailover is in-memory (lost across the
+		// reboot) and peerAlive is still false here, so the unconditional hold —
+		// not ForceSecondary — is what keeps an unverified candidate from
+		// blackholing traffic (r2 AGY Critical). No-op on an ordinary boot.
 		d.holdSecondaryIfKernelCandidateArmed()
 
+		d.cluster.UpdateConfig(cc)
 		d.cluster.Start(ctx)
 		// Wire event-drop callback: on dropped cluster events, trigger
 		// immediate reconciliation so the safety net doesn't wait 2s.

@@ -1,5 +1,19 @@
 # Action Log
 
+## 2026-06-16 — #1930 INC-2: set hold BEFORE UpdateConfig (election window) (SMR)
+- **Timestamp**: 2026-06-16 UTC
+- **Action**: Claude SMR caught a residual election window: the hold was
+  set AFTER `cluster.UpdateConfig(cc)`, but UpdateConfig ITSELF runs an
+  election (single-node path on a candidate boot, no peer up yet) and
+  promotes the node to StatePrimary before the hold takes effect — then
+  Start()'s heartbeat/VRRP would advertise primary and preempt the
+  healthy peer (the exact CRITICAL). Moved
+  holdSecondaryIfKernelCandidateArmed() to run right after NewManager
+  (pure construction, no election) and BEFORE UpdateConfig. Verified
+  NewManager triggers no election/goroutine, so this fully closes the
+  window: the first election (inside UpdateConfig) now sees the hold.
+- **File(s)**: pkg/daemon/daemon_run.go
+
 ## 2026-06-16 — #1930 INC-2: fix leaked election hold after promote (SMR)
 - **Timestamp**: 2026-06-16 UTC
 - **Action**: Claude SMR caught a leaked-hold: the promotion gate runs in
