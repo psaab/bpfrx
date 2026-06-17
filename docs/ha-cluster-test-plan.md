@@ -416,7 +416,7 @@ make cluster-start/stop/restart  # Service lifecycle (NODE=0|1|all)
 
 ### What `create` does per VM
 
-1. Launch Debian 13 VM with `xpf-cluster` profile (4 virtio NICs)
+1. Launch Ubuntu 26.04 VM with `xpf-cluster` profile (4 virtio NICs)
 2. Add SR-IOV VF via PCI passthrough (stop VM → add device → restart)
 3. Write `.link` files for vSRX-style interface renaming (MAC-based)
 4. Install packages: FRR, strongSwan, tcpdump, iperf3, bpftool, ethtool, etc.
