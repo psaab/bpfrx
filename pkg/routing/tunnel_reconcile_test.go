@@ -910,6 +910,45 @@ func TestLegacyToWireguardSameNameIncompatibleLinkDelFailureRetained(t *testing.
 	}
 }
 
+// A healthy persistent WG link must NOT be re-tracked in ownedNames when
+// applyWireguardTunLocked fails for a reason that does NOT leave a stale
+// non-WG link (transient LinkByName error → treated as create-needed →
+// LinkAdd fails, while the live WG TUN still exists). Re-tracking it would
+// let a later config removal LinkDel the live wgN (#1432 S2a, Codex r6
+// create-failure counterexample).
+func TestWireguardCreateFailureDoesNotRetainOwnership(t *testing.T) {
+	ops := newFakeLinkOps()
+	tm, _ := newReconcileManager(ops)
+	if err := tm.Apply([]*config.TunnelConfig{wgTC("172.16.0.1/30")}); err != nil {
+		t.Fatalf("Apply 1: %v", err)
+	}
+	// Next Apply (still WG): LinkByName transiently fails → mustCreate, and
+	// LinkAdd then fails. The live WG TUN still exists in the fake.
+	ops.byNameHardErr["wg0"] = errors.New("EBUSY: transient netlink error")
+	ops.addExisting = true // LinkAdd returns "file exists"
+	if err := tm.Apply([]*config.TunnelConfig{wgTC("172.16.0.1/30")}); err != nil {
+		t.Fatalf("Apply 2 (create fails): %v", err)
+	}
+	tm.mu.Lock()
+	owned := tm.ownedNames["wg0"]
+	tm.mu.Unlock()
+	if owned {
+		t.Fatal("healthy WG link re-tracked in ownedNames on create failure (Codex r6) — later removal would LinkDel the live wgN")
+	}
+	// Recover, then REMOVE the WG tunnel: the persistent link must NOT be
+	// LinkDel'd by the removal diff.
+	delete(ops.byNameHardErr, "wg0")
+	ops.addExisting = false
+	if err := tm.Apply(nil); err != nil {
+		t.Fatalf("Apply 3 (removal): %v", err)
+	}
+	for _, d := range ops.delNames {
+		if d == "wg0" {
+			t.Fatal("persistent WG link wrongly deleted on removal (#1432 S2a violated)")
+		}
+	}
+}
+
 // --- §9 test 6: appliedRI claim state machine -------------------------
 
 func TestTunnelVRFStanzaBindAndUnbind(t *testing.T) {

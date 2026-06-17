@@ -2,6 +2,7 @@ package routing
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -14,6 +15,16 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/vishvananda/netlink"
 )
+
+// errWGIncompatibleLinkRetained is returned by applyWireguardTunLocked
+// ONLY when a same-name link of the WRONG type (a non-TUN: GRE/IPIP/TAP/
+// dummy) is present and its replacement LinkDel failed — so a stale
+// NON-WG kernel link remains under the WG name. Apply uses this sentinel
+// (and only this one) to re-retain the name in ownedNames for non-WG
+// removal-retry (#1919 r5/r6): every OTHER applyWireguardTunLocked error
+// (transient lookup, failed create) either leaves no link or leaves a
+// HEALTHY persistent WG link, which must stay untracked (#1432 S2a).
+var errWGIncompatibleLinkRetained = errors.New("wireguard tun: stale incompatible link retained for retry")
 
 // linkOps is the narrow netlink surface the interface domains
 // (tunnel, xfrm, bond, reth) use for link/address lifecycle. Satisfied
@@ -419,20 +430,23 @@ func (t *tunnelManager) Apply(tunnels []*config.TunnelConfig) error {
 			if err := t.applyWireguardTunLocked(tc); err != nil {
 				slog.Warn("failed to apply wireguard tunnel",
 					"name", tc.Name, "err", err)
-				// The WG link could NOT be established (e.g. an incompatible
-				// same-name non-WG link whose replacement LinkDel failed, or
-				// a failed create). A stale non-WG link may still be present
-				// under this name; the inverse-handoff guard above already
-				// dropped it from ownedNames, so without this it would be
-				// orphaned — the WG prune path only touches addresses, never
-				// the link, and the non-WG removal loop never revisits it
-				// (Codex r5). Retain it in ownedNames so a future Apply
-				// retries the non-WG-style cleanup (LinkDel on config-remove,
-				// or the WG apply re-attempts the replacement). A successful
-				// applyWireguardTunLocked returns nil and is NOT re-added —
-				// a healthy persistent WG link must stay untracked (#1432
-				// S2a, Codex r3).
-				t.ownedNames[tc.Name] = true
+				// Re-retain ownedNames ONLY when a stale NON-WG link remains
+				// under this name (incompatible same-name link whose
+				// replacement LinkDel failed — errWGIncompatibleLinkRetained).
+				// The inverse-handoff guard above dropped the name from
+				// ownedNames, and the WG prune path only touches addresses,
+				// never the link, so without this the stale non-WG link would
+				// be orphaned (Codex r5). A future Apply then retries the
+				// non-WG cleanup (LinkDel on config-remove or WG re-replace).
+				//
+				// Do NOT re-retain on any OTHER error (transient lookup,
+				// failed create): those either left no link or left a HEALTHY
+				// persistent WG link, which must stay untracked — re-adding it
+				// would let a later removal LinkDel the live wgN (#1432 S2a,
+				// Codex r6 create-failure counterexample).
+				if errors.Is(err, errWGIncompatibleLinkRetained) {
+					t.ownedNames[tc.Name] = true
+				}
 			}
 			continue
 		}
@@ -1179,7 +1193,12 @@ func (t *tunnelManager) applyWireguardTunLocked(tc *config.TunnelConfig) error {
 			slog.Info("replacing non-TUN link before wireguard tun create",
 				"name", tc.Name, "type", link.Type())
 			if delErr := t.ops.LinkDel(link); delErr != nil {
-				return fmt.Errorf("replace non-tun wireguard link %s: %w", tc.Name, delErr)
+				// A stale NON-WG link remains under this name. Wrap with the
+				// sentinel so Apply re-retains ownedNames for non-WG cleanup
+				// retry (#1919 r5/r6) — distinct from a create failure that
+				// may leave a healthy WG link.
+				return fmt.Errorf("replace non-tun wireguard link %s: %w: %w",
+					tc.Name, delErr, errWGIncompatibleLinkRetained)
 			}
 			mustCreate = true
 		}
