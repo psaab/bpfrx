@@ -69,41 +69,55 @@ committing a map + rebooting," hypothesised as a stale `ActiveConfig()` read at
 `daemon_run.go:348` (active not yet promoted at naming time).
 
 ### Investigation outcome — CLAIM REFUTED (no functional bug at HEAD)
-- Empirical, on the live `xpf-devmap` VM (snapshot→test→restore):
-  - DB-load boot ("configuration loaded from db") → device-map branch ran,
+- Empirical, on the live `xpf-devmap` VM (snapshot->test->restore):
+  - DB-load boot ("configuration loaded from db") -> device-map branch ran,
     "device-map: resolved binding" + renames. WORKS.
   - Bootstrap-from-file boot (device-map placed in `/etc/xpf/xpf.conf`, DB
-    wiped) → device-map branch ran, "device-map: interface naming unchanged".
+    wiped) -> device-map branch ran, "device-map: interface naming unchanged".
     WORKS.
-  - The ONLY boot that took the positional path was the demo's FIRST boot,
-    where `xpf.conf` had no device-map and none was committed yet — correct
-    behavior, misread as the bug.
-- Code trace (confirmed independently by Codex, session
-  019ed6cf… rescue): `Store.Load` sets `s.compiled` synchronously
-  (`store.go:237-238`); `bootstrapFromFile`→`Store.Commit` promotes + sets
-  `s.compiled` synchronously before returning (`store.go:1101-1105`).
-  `bootstrapFromFile` runs at `daemon_run.go:241`, BEFORE the naming decision
-  at 348, so `ActiveConfig()` is populated there on every boot path. The
-  "applying active configuration" log (611) is the first dataplane APPLY, not
-  the first promotion. Bootstrap-exit (`runBootstrapExitStartup`, 1543) takes
-  the freshly-committed `cfg` parameter — not a stale read — and already
-  branches at 1573.
+  - The ONLY positional boot was the demo's FIRST boot, where `xpf.conf` had no
+    device-map and none was committed yet — correct behavior, misread as the bug.
+- Code trace (Codex + AGY independently): `Store.Load` sets `s.compiled`
+  synchronously (store.go:237-238); `bootstrapFromFile`->`Store.Commit` promotes
+  + sets `s.compiled` synchronously (store.go:1101-1105) BEFORE the naming
+  decision (`daemon_run.go:241` runs before 348). The "applying active
+  configuration" log (611) is the first dataplane APPLY, not the first
+  promotion. Bootstrap-exit (`runBootstrapExitStartup`, 1543) takes the
+  freshly-committed `cfg` parameter — not a stale read.
 
 ### Real gap closed: the missing startup-decision test
 The shipped tests exercised `enumerateAndRenameMapped` in isolation, so the
-branch SELECTION (the thing that drives boot behavior) was never covered — a
-genuine regression hole. Closed by:
-- extracted seam `deviceMapNamingActive(cfg)` in `device_map.go`, used at BOTH
-  rename sites (no behavior change — same predicate);
-- `TestDeviceMapNamingActiveStartupDecision` (`device_map_startup_test.go`):
-  bootstraps a config-on-disk via the same EnterConfigure→LoadOverride→Commit
-  the boot path runs, then asserts the seam selects device-map for a committed
-  map, positional for no-map / empty-block / nil. Catches both a dropped branch
-  and a broken synchronous promotion, without a live VM.
+branch SELECTION (the thing that drives boot behavior) was never covered.
+Closed across two commits:
+- `aa4a9d67d` (Claude): extracted seam `deviceMapNamingActive(cfg)` used at both
+  rename sites; predicate + synchronous-promotion regression test.
+- `dd610c449` (Copilot SWE agent): centralized the ACTUAL branch into
+  `applyStartupNamingPolicy` (single decision site, both boot paths route
+  through it) and rewrote the test to STUB `enumerateAndRenameMappedFn` /
+  `enumerateAndRenameInterfacesFn` and assert the real mapped-vs-positional
+  dispatch (mapped=1/pos=0 for a committed map; mapped=0/pos=1 for
+  no-map/empty/nil). This pins the real branch — a drop/inversion inside the
+  helper now fails the test. Supersedes Claude's source-level guard (redundant).
 
 | Reviewer | Task / session id | Verdict |
 |----------|-------------------|---------|
-| Codex hostile | (pending) | (pending) |
-| AGY adversarial | (pending) | (pending) |
-| Copilot | (pending) | (pending) |
-| Claude SMR | inline | REFUTED-bug + seam/test MERGE-READY |
+| Codex hostile | sessions ad42b7d7, a94267060619f3c1f | **MERGE-READY** (seam bit-identical both sites; refutation sound; test gap CLOSED by dd610c449; AGY hidden-risk = pre-existing follow-up) |
+| AGY adversarial | adversarial-review-mqiiktwm-5wqzg9 | refutation CORRECT + seam bit-identical; raised test-gap (CLOSED by dd610c449) + Hidden Risk Path (compile-fail+everCommitted -> positional claim-all) |
+| Copilot | SWE agent contributed dd610c449 (centralized helper + real-dispatch test) | MERGE-READY (authored the converging fix) |
+| Claude SMR | inline | REFUTED-bug; drove seam + investigation; adopted Copilot's stronger helper/test |
+
+### R6 dispositions
+- Test-gap (Codex MEDIUM / AGY CRITICAL): CLOSED by dd610c449 —
+  `applyStartupNamingPolicy` is the single branch, both sites route through it,
+  the test stubs+asserts the real dispatch. Codex re-review confirmed an
+  inversion would now fail the test.
+- AGY Hidden Risk Path (persisted-DB compile failure with everCommitted=true
+  falls back to positional claim-all): adjudicated PRE-EXISTING (predates #1956
+  at 5d452736e) and NOT triggerable by a device-map alone (compileTreeLenient
+  downgrades device-map errors to warnings, compiler.go:472-474); D1 fail-closed
+  is scoped to UNREADABLE DB only. Filed as follow-up issue #1960; NOT a blocker.
+
+## Convergence: MERGE-READY on dd610c449
+- Codex MERGE-READY; AGY findings resolved/deferred; Copilot authored the
+  converging fix; Claude SMR MERGE-READY. PR stays DRAFT for the user; the
+  parent re-runs the live commit->reboot->swap acceptance demo.
