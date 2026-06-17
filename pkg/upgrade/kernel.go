@@ -123,6 +123,11 @@ type KernelJournal struct {
 
 	// StartedAt is when the run began (for stale-run detection).
 	StartedAt time.Time `json:"started_at"`
+
+	// PromoteAttempts counts revert-reboots for THIS armed candidate. Bounded
+	// by maxPromoteAttempts so a read-only-root journal that cannot clear cannot
+	// loop reboots forever (r1 AGY catastrophic).
+	PromoteAttempts int `json:"promote_attempts,omitempty"`
 }
 
 // ErrKernelChannelUnavailable marks a pre-assert failure that means LANE 1

@@ -27,6 +27,11 @@
 
 set -u
 
+# Force the C locale so efibootmgr's "BootOrder:" / "BootCurrent:" / "BootXXXX*"
+# headings are never localized — a translated heading would break every parse
+# below and could (pre-guard) wipe BootOrder (r1 AGY: locale-robust parsing).
+export LC_ALL=C LANG=C
+
 log() { echo "xpf-uefi-slots: $*" >&2; }
 
 # --- capability gate: UEFI + efibootmgr + writable efivars (all non-fatal) ---
@@ -135,7 +140,13 @@ A_ID=$(slot_id xpf-A)
 B_ID=$(slot_id xpf-B)
 ORDER=$(efibootmgr | sed -nE 's/^BootOrder: (.*)$/\1/p')
 
-if [ -n "$LED_SLOT" ]; then
+# GUARD: if BootOrder could not be parsed (empty — a transient efibootmgr read
+# failure, or an unexpected format), DO NOT write a BootOrder — a reseed built
+# from empty $ORDER would WIPE all other entries (PXE/recovery/firmware), the
+# opposite of non-destructive (r1 AGY destructive-wipe). Leave NVRAM untouched.
+if [ -z "$ORDER" ]; then
+    log "WARNING: could not read BootOrder; leaving it unchanged (no destructive reseed)"
+elif [ -n "$LED_SLOT" ]; then
     # An xpf slot was the promoted default before this run — keep THAT slot in
     # front (re-assert in case a --create reshuffled BootOrder), preserving the
     # rest non-destructively. NEVER force A-first over a promoted B.

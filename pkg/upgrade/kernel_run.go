@@ -10,6 +10,13 @@ import (
 	"github.com/psaab/xpf/pkg/fsatomic"
 )
 
+// maxPromoteAttempts bounds the number of revert-reboots for a single armed
+// candidate. Beyond this, the promotion gate stops requesting reboots and
+// leaves the box up (on the firmware-preferred known-good default) so a
+// pathological loop (e.g. read-only root that cannot clear the journal) cannot
+// brick the node out of operator reach (r1 AGY catastrophic).
+const maxPromoteAttempts = 3
+
 // loadKernelJournal reads the persisted kernel-channel journal, or a zero
 // journal if none exists.
 func (r *KernelRunner) loadKernelJournal() (*KernelJournal, error) {
@@ -327,14 +334,19 @@ func (r *KernelRunner) Promote() error {
 	}
 	cur, err := sys.BootCurrent()
 	if err != nil {
-		return r.revert(j, fmt.Errorf("read BootCurrent: %w", err))
+		// Can't tell which slot we booted. Do NOT reboot (that risks a loop on
+		// a flaky efibootmgr — r1 AGY): clean up to known-good in place.
+		return r.cleanupAlreadyOnKnownGood(j, fmt.Errorf("read BootCurrent: %w", err))
 	}
 	if cur != candID {
-		// Firmware ignored BootNext / fell back — this boot is NOT the
-		// candidate. Do not promote; treat as a (benign) revert: the box is
-		// already on a non-candidate slot.
-		return r.revert(j, fmt.Errorf("BootCurrent=%s != candidate slot %s (%s) — "+
-			"firmware did not boot the candidate", cur, j.InactiveSlot, candID))
+		// Firmware ignored BootNext / fell back — this boot is ALREADY on a
+		// non-candidate (known-good) slot. This is NOT a revert-needing reboot:
+		// rebooting again would be redundant (r1 AGY double-reboot) and, if the
+		// journal can't be cleared (read-only root), would loop forever
+		// bypassing the SAFE-BOOTSTRAP lifeline (r1 AGY catastrophic). Just
+		// clean up in place and continue THIS boot (exit 0, no reboot).
+		return r.cleanupAlreadyOnKnownGood(j, fmt.Errorf(
+			"BootCurrent=%s != candidate slot %s (%s) — already on known-good, no reboot", cur, j.InactiveSlot, candID))
 	}
 
 	// Gate 2: is the running kernel actually the candidate?
@@ -385,8 +397,31 @@ func (r *KernelRunner) Promote() error {
 // to the known-good slot. The boot-LOOP is already closed by firmware (BootNext
 // was consumed), so the reboot lands on the known-good slot.
 func (r *KernelRunner) revert(j *KernelJournal, reason error) error {
-	r.logf("kernel-upgrade: REVERT (%v); the candidate is NOT promoted, rebooting to known-good", reason)
 	sys := r.cfg.Sys
+
+	// Boot-attempt guard (r1 AGY catastrophic): if the journal cannot be
+	// CLEARED (e.g. read-only root after a kernel oops), a naive revert would
+	// loop forever — each boot re-reads ARMED, reverts, exits 3, reboots. Bound
+	// the reboot requests: bump PromoteAttempts; once it exceeds the cap, STOP
+	// requesting reboots (return nil = exit 0, continue THIS boot) so the box
+	// stays up on whatever slot it is on (the firmware already prefers the
+	// known-good default) and the SAFE-BOOTSTRAP lifeline is reachable for the
+	// operator. We also confirm we can persist the bump; if we cannot, we must
+	// NOT request a reboot (the loop-avoidance is the priority).
+	j.PromoteAttempts++
+	if err := r.saveKernelJournal(j); err != nil {
+		r.logf("kernel-upgrade: REVERT but journal NOT persistable (%v); NOT rebooting "+
+			"(avoid a read-only-root reboot loop) — staying up for operator recovery", err)
+		return fmt.Errorf("kernel-upgrade revert (journal unwritable, not rebooting): %v", reason)
+	}
+	if j.PromoteAttempts > maxPromoteAttempts {
+		r.logf("kernel-upgrade: REVERT but %d attempts exceeded cap %d; NOT rebooting again "+
+			"— staying up for operator recovery (firmware default is known-good)", j.PromoteAttempts, maxPromoteAttempts)
+		_ = r.clearKernelJournal()
+		return fmt.Errorf("kernel-upgrade revert (attempt cap exceeded, not rebooting): %v", reason)
+	}
+	r.logf("kernel-upgrade: REVERT (%v); candidate NOT promoted, rebooting to known-good (attempt %d/%d)",
+		reason, j.PromoteAttempts, maxPromoteAttempts)
 
 	// FORCE the known-good (active) slot back to the FRONT of BootOrder before
 	// rebooting (r1 Codex High): the common revert path relies on the firmware
@@ -422,6 +457,34 @@ func (r *KernelRunner) revert(j *KernelJournal, reason error) error {
 	// known-good), distinct from an infra error (exit 1). reason is chained
 	// for the log/operator.
 	return fmt.Errorf("%w: %v", ErrKernelReverted, reason)
+}
+
+// cleanupAlreadyOnKnownGood handles the case where the gate runs but the box is
+// ALREADY on a non-candidate (known-good) slot — the firmware fell back, or we
+// can't even tell which slot booted. There is nothing to revert TO (we're
+// already safe), so this must NOT request a reboot (r1 AGY: a reboot here is
+// redundant, and loops forever if the journal can't be cleared on a read-only
+// root, bypassing the SAFE-BOOTSTRAP lifeline). It best-effort prunes the
+// un-promoted candidate + clears the journal and returns nil (exit 0 — continue
+// THIS boot). Journal-clear failure is non-fatal: on the next boot we are still
+// on known-good and this same no-reboot path runs again.
+func (r *KernelRunner) cleanupAlreadyOnKnownGood(j *KernelJournal, why error) error {
+	r.logf("kernel-upgrade: already on a known-good slot (%v); cleaning up, NO reboot", why)
+	if err := r.cfg.Sys.PruneInactiveSlot(j.InactiveSlot, j.KnownGoodVersion, j.CandidateVersion); err != nil {
+		r.logf("kernel-upgrade: WARNING prune on known-good cleanup: %v", err)
+	}
+	// Best-effort restore the known-good slot to the BootOrder front (in case a
+	// prior crash left the candidate first), then clear the journal.
+	if entries, err := r.cfg.Sys.BootEntries(); err == nil {
+		if activeID, ok := entries[j.ActiveSlot]; ok {
+			_ = r.cfg.Sys.SetBootOrderFront(activeID)
+		}
+	}
+	if err := r.clearKernelJournal(); err != nil {
+		r.logf("kernel-upgrade: WARNING could not clear journal on known-good cleanup: %v "+
+			"(non-fatal: next boot re-runs this no-reboot path)", err)
+	}
+	return nil
 }
 
 // IsArmed reports whether a candidate is currently armed (used by the

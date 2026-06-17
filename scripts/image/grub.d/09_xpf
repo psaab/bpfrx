@@ -46,11 +46,14 @@ fi
 # Resolve the kernel command line exactly as 10_linux does (these vars are
 # exported into the grub.d environment by grub-mkconfig at generation time).
 XPF_CMDLINE="${GRUB_CMDLINE_LINUX} ${GRUB_CMDLINE_LINUX_DEFAULT}"
-# Resolve the root= the running system uses (the GRUB_DEVICE the rest of the
-# menu boots from). Fall back to the kernel's current root= if unset.
-XPF_ROOT="${LINUX_ROOT_DEVICE:-${GRUB_DEVICE}}"
-if [ -n "${XPF_ROOT}" ]; then
-    XPF_ROOT_ARG="root=${XPF_ROOT}"
+# Resolve root= by UUID, NOT a bare device path (r1 AGY: root=/dev/sda2 breaks
+# when disk enumeration shifts under virtualization / multi-controller). Prefer
+# GRUB_DEVICE_UUID (set by grub-mkconfig); fall back to the device path only if
+# no UUID is available.
+if [ -n "${GRUB_DEVICE_UUID:-}" ]; then
+    XPF_ROOT_ARG="root=UUID=${GRUB_DEVICE_UUID}"
+elif [ -n "${GRUB_DEVICE:-}" ]; then
+    XPF_ROOT_ARG="root=${GRUB_DEVICE}"
 else
     XPF_ROOT_ARG=""
 fi

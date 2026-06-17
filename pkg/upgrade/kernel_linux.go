@@ -282,8 +282,25 @@ func (s *realKernelSystem) SetBootNext(bootID string) error {
 	return runCmd("efibootmgr", "--bootnext", bootID)
 }
 
-// ArmWatchdog intentionally closes /dev/watchdog without the magic "V"
-// disarm byte. The caller must keep petting the watchdog or the host reboots.
+// watchdogTimeoutSecs is the timeout armed before the candidate reboot. It must
+// exceed the WORST-CASE time from this arm to the candidate boot petting/
+// disarming the watchdog — which on physical servers includes a full UEFI POST
+// + memory training (minutes), so a 60s default would reset the box mid-POST
+// (r1 AGY). Default 600s; overridable via XPF_KERNEL_WATCHDOG_TIMEOUT_SECS.
+func watchdogTimeoutSecs() int32 {
+	if v := os.Getenv("XPF_KERNEL_WATCHDOG_TIMEOUT_SECS"); v != "" {
+		var n int
+		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 0 {
+			return int32(n)
+		}
+	}
+	return 600
+}
+
+// ArmWatchdog sets a generous timeout and pets once. NOTE: the watchdog is
+// best-effort (Path Option D2): the firmware-cleared BootNext is what actually
+// closes the boot-LOOP; the watchdog only converts an early-boot HANG into the
+// reset that triggers that fallback. It is armed only right before the reboot.
 func (s *realKernelSystem) ArmWatchdog() error {
 	if _, err := os.Stat("/dev/watchdog"); err != nil {
 		return fmt.Errorf("/dev/watchdog unavailable: %w", err)
@@ -294,11 +311,11 @@ func (s *realKernelSystem) ArmWatchdog() error {
 	}
 	defer unix.Close(fd)
 
-	timeout := int32(60)
-	_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(unix.WDIOC_SETTIMEOUT), uintptr(unsafe.Pointer(&timeout)))
-	if errno != 0 {
-		return writeWatchdogKeepalive(fd)
-	}
+	timeout := watchdogTimeoutSecs()
+	// WDIOC_SETTIMEOUT failure (driver doesn't support it) is non-fatal — fall
+	// through to a keepalive write to at least pet whatever default timeout the
+	// driver has; the keepalive is the minimal arm signal.
+	_, _, _ = unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(unix.WDIOC_SETTIMEOUT), uintptr(unsafe.Pointer(&timeout)))
 	return writeWatchdogKeepalive(fd)
 }
 
@@ -340,10 +357,22 @@ func (s *realKernelSystem) VerifyDataplane() (bool, error) {
 
 // ForwardBeacon proves the candidate kernel can actually FORWARD, not merely
 // that a unit is active (r2 Codex Critical: `systemctl is-active` is not a
-// forwarding proof). A wired ProbeFunc (the richest probe, when the caller has
-// the dataplane manager) takes precedence; otherwise this does a REAL
-// reachability probe through the dataplane: xpfd must be active AND a ping to
-// BeaconTarget (default: the IPv4 default gateway) must succeed within the
+// forwarding proof).
+//
+// BeaconTarget guidance (r1 AGY): for a meaningful proof the operator SHOULD set
+// XPF_KERNEL_BEACON_TARGET to a DATAPLANE-side target (e.g. the HA peer link or
+// a known host reachable only through a dataplane interface). The default
+// IPv4-gateway fallback is a WEAK best-effort: on a box whose default route is
+// the out-of-band management interface it can false-PASS (ping succeeds over
+// mgmt while the dataplane is broken), and on a transit/BGP router with no
+// static default route it returns "" and fail-SAFE-reverts. Neither is a silent
+// brick — a false-pass still required verify-dataplane (the #1864 kernel
+// verifier, Gate 3) to PASS first, and the fail-safe revert is recoverable —
+// but the strong gate is an operator-set dataplane BeaconTarget. A wired
+// ProbeFunc (the richest probe, when the caller has the dataplane manager) takes
+// precedence; otherwise this does a REAL reachability probe through the
+// dataplane: xpfd must be active AND a ping to BeaconTarget (default: the IPv4
+// default gateway) must succeed within the
 // deadline. A candidate kernel whose shim verified (Gate 3) but cannot forward
 // fails the ping -> revert. The gateway is the most universally-available
 // off-box target that exercises the forwarding path; an operator can override
@@ -491,6 +520,11 @@ func grubDefaultFiles() []string {
 
 func captureCmd(name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)
+	// Force the C locale so the parsed output (efibootmgr "BootCurrent:" /
+	// "BootOrder:", uname, ip route, dpkg-query) is never localized/translated,
+	// which would break the regex/field parses and trigger spurious reverts
+	// (r1 AGY: locale-robust parsing). LC_ALL=C wins over LANG/LC_*.
+	cmd.Env = append(os.Environ(), "LC_ALL=C", "LANG=C")
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out

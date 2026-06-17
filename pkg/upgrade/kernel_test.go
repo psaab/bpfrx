@@ -170,6 +170,8 @@ func contains(calls []string, want string) bool {
 	return false
 }
 
+func errorsIsReverted(err error) bool { return errors.Is(err, ErrKernelReverted) }
+
 // --- Arm happy path: preflight -> install -> arm -> reboot, all journaled. ---
 func TestKernelArmHappyPath(t *testing.T) {
 	f := newFakeKernelSystem()
@@ -286,8 +288,10 @@ func TestKernelPromoteRevertOnBeaconFail(t *testing.T) {
 	}
 }
 
-// --- Revert: firmware fell back (BootCurrent != candidate slot). ---
-func TestKernelPromoteRevertOnWrongBootCurrent(t *testing.T) {
+// --- Firmware fell back (BootCurrent != candidate): ALREADY on known-good ->
+// clean up in place, NO reboot (r1 AGY: rebooting here is redundant + loops on
+// a read-only-root journal). Promote() returns nil (exit 0, continue boot). ---
+func TestKernelPromoteAlreadyKnownGoodNoReboot(t *testing.T) {
 	f := newFakeKernelSystem()
 	r := newKernelRunner(t, f)
 	_ = r.Arm("6.18.5-12-generic")
@@ -297,11 +301,60 @@ func TestKernelPromoteRevertOnWrongBootCurrent(t *testing.T) {
 	f.verifyPass = true
 	f.beaconPass = true
 
-	if err := r.Promote(); err == nil {
-		t.Fatal("expected revert when BootCurrent != candidate slot")
+	// NO error (no reboot requested — we're already on known-good).
+	if err := r.Promote(); err != nil {
+		t.Fatalf("expected nil (already on known-good, no reboot), got %v", err)
 	}
 	if contains(f.calls, "bootorder-front:0004") {
 		t.Fatal("promoted despite firmware not booting the candidate")
+	}
+	// the candidate slot was cleaned up
+	if !contains(f.calls, "prune:"+SlotB) {
+		t.Fatal("did not prune the un-promoted candidate on known-good cleanup")
+	}
+	// journal cleared (no terminal-state stuck ARMED that would re-run forever)
+	j, _ := r.loadKernelJournal()
+	if j.State != KernelStateInit {
+		t.Fatalf("journal not cleared on known-good cleanup (state=%s)", j.State)
+	}
+}
+
+// --- Revert reboot is bounded: after maxPromoteAttempts the gate stops
+// requesting reboots (r1 AGY catastrophic read-only-root loop guard). We
+// simulate the candidate-booted-but-gate-fails path repeatedly with a journal
+// that DOES persist; the attempt counter caps the reboots. ---
+func TestKernelPromoteRevertAttemptsCapped(t *testing.T) {
+	f := newFakeKernelSystem()
+	r := newKernelRunner(t, f)
+	_ = r.Arm("6.18.5-12-generic")
+	// candidate DID boot (BootCurrent==candidate) but the gate fails (verify
+	// REJECT), so each Promote() is a real revert that requests a reboot.
+	f.bootCurrent = "0004"
+	f.running = "6.18.5-12-generic"
+	f.verifyPass = false
+
+	reverts := 0
+	// Re-arm-free: simulate the journal surviving across "reboots" by NOT
+	// clearing it between calls — but revert() clears on success, so to model
+	// the read-only-root case we re-write ARMED before each call.
+	for i := 0; i < maxPromoteAttempts+2; i++ {
+		// restore ARMED (model: journal could not be cleared on a R/O root)
+		jj, _ := r.loadKernelJournal()
+		if jj.State == KernelStateInit {
+			jj = &KernelJournal{
+				CandidateVersion: "6.18.5-12-generic", KnownGoodVersion: "6.18.5-10-generic",
+				ActiveSlot: SlotA, InactiveSlot: SlotB, State: KernelStateArmed,
+				PromoteAttempts: i,
+			}
+			_ = r.saveKernelJournal(jj)
+		}
+		err := r.Promote()
+		if errorsIsReverted(err) {
+			reverts++
+		}
+	}
+	if reverts > maxPromoteAttempts {
+		t.Fatalf("revert reboots not capped: %d reverts > cap %d", reverts, maxPromoteAttempts)
 	}
 }
 

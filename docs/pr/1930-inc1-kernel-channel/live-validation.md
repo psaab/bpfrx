@@ -128,3 +128,33 @@ Re-validated live (Ubuntu 26.04 UEFI Secure Boot):
   VM has no network, so the beacon correctly FAILS SAFE (no target -> revert) —
   the designed conservative default. The gateway-parse is unit-tested; the live
   ping is bench-deferred (no network on the throwaway VM).
+
+## AGY r1 review fixes — re-validated
+
+AGY (run in the worktree) found hardware/production hazards Codex missed; all
+addressed:
+
+- **CATASTROPHIC (read-only-FS infinite reboot loop bypassing SAFE-BOOTSTRAP):**
+  the gate now (a) does NOT reboot when already on a known-good slot
+  (cleanupAlreadyOnKnownGood -> exit 0, no reboot), and (b) bounds revert
+  reboots via PromoteAttempts <= maxPromoteAttempts (3) AND refuses to reboot if
+  the journal is not persistable — so a R/O root cannot loop the box out of
+  operator reach. Unit-tested (TestKernelPromoteAlreadyKnownGoodNoReboot,
+  TestKernelPromoteRevertAttemptsCapped).
+- **Redundant double-reboot on firmware fallback:** same cleanupAlreadyOnKnownGood
+  fix — BootCurrent != candidate means we're already safe; no second reboot.
+- **Watchdog 60s too short for physical POST:** default raised to 600s,
+  XPF_KERNEL_WATCHDOG_TIMEOUT_SECS override; watchdog is best-effort (D2) anyway.
+- **Locale-robust parsing:** captureCmd (Go) and xpf-uefi-slots (shell) now force
+  LC_ALL=C/LANG=C so a localized efibootmgr heading can't break the parse.
+- **09_xpf root= by UUID not /dev/sdaN:** uses GRUB_DEVICE_UUID
+  (root=UUID=2e1d5b9b-... confirmed live) — survives disk-ordering shifts.
+- **Destructive BootOrder wipe on empty parse:** xpf-uefi-slots now guards an
+  empty ORDER and leaves NVRAM untouched (no reseed from empty -> no wipe).
+- **ForwardBeacon mgmt-false-pass / BGP-false-revert:** documented that
+  BeaconTarget SHOULD be a dataplane-side target (XPF_KERNEL_BEACON_TARGET); the
+  gateway fallback is a weak best-effort (a false-pass still required Gate-3
+  verify-dataplane PASS; the no-route case fail-safe-reverts). Acknowledged
+  residual; the strong gate is an operator-set dataplane target.
+
+Re-validated live: 09_xpf emits root=UUID=...; build/test/gofmt green.
