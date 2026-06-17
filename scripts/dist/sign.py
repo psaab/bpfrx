@@ -170,7 +170,7 @@ def parse_manifest(manifest_path):
                     f"{manifest_path}:{lineno}: malformed manifest line: {raw!r}")
             digest, name = parts
             name = name.lstrip("*")  # sha256sum binary-mode marker
-            if "/" in name or name in ("", ".", ".."):
+            if "/" in name or "\\" in name or name in ("", ".", ".."):
                 raise SignError(
                     f"{manifest_path}:{lineno}: manifest entry must be a bare "
                     f"basename, got {name!r}")
@@ -186,18 +186,7 @@ def parse_manifest(manifest_path):
     return result
 
 
-def verify_image_artifact(path, manifest_path, sig_path, pubkey_path=None):
-    """Verify ONE artifact `path` against a signed manifest.
-
-    Steps (plan §5.2):
-      1. minisign-verify the manifest signature against the pinned pubkey.
-      2. parse the manifest into {basename: hash} (rejecting pathful/dup).
-      3. hash the EXACT `path` and compare to the manifest entry for its
-         basename. Missing entry or mismatch -> raise.
-
-    This binds the bytes the caller is about to import/use, not a
-    cwd-relative `sha256sum -c` (which could pass against a stale local copy).
-    """
+def _resolve_pubkey(pubkey_path):
     if pubkey_path is None:
         pubkey_path = os.environ.get("XPF_IMAGE_PUBKEY", DEFAULT_IMAGE_PUBKEY)
     if not os.path.isfile(pubkey_path):
@@ -205,24 +194,64 @@ def verify_image_artifact(path, manifest_path, sig_path, pubkey_path=None):
             f"image public key not found: {pubkey_path} "
             "(set XPF_IMAGE_PUBKEY or ship scripts/dist/xpf-image.pub).")
     require_real_pubkey(pubkey_path)
-    # TOCTOU hardening (Codex-M5/AGY-A4): the manifest may live in a
-    # user-writable dir, so a concurrent process could swap its bytes between
-    # the minisign signature check and the parse. Copy the manifest + its
-    # signature into a private 0700 temp dir and run BOTH steps on that copy,
-    # so the bytes we parse are exactly the bytes whose signature we verified.
+    return pubkey_path
+
+
+def verify_and_read(signed_path, sig_path, pubkey_path=None):
+    """minisign-verify `signed_path` and return its VERIFIED bytes.
+
+    TOCTOU-safe (Codex-M5/AGY-A4/AGY-r3): the file may live in a user-writable
+    dir, so a concurrent process could swap its bytes between the signature
+    check and a later read. Copy the file + its signature into a private 0700
+    temp dir, verify the COPY, and return the COPY's bytes — so what the caller
+    parses/uses is exactly what was verified. Use this for every signed text
+    artifact (the per-version manifest, latest.json, ...).
+    """
+    pubkey_path = _resolve_pubkey(pubkey_path)
     import shutil as _sh
     import tempfile as _tf
     tmp = _tf.mkdtemp(prefix="xpf-verify-")
     try:
         os.chmod(tmp, 0o700)
-        m_copy = os.path.join(tmp, os.path.basename(manifest_path))
-        s_copy = m_copy + ".minisig"
-        _sh.copyfile(manifest_path, m_copy)
+        f_copy = os.path.join(tmp, os.path.basename(signed_path))
+        s_copy = f_copy + ".minisig"
+        _sh.copyfile(signed_path, f_copy)
         _sh.copyfile(sig_path, s_copy)
-        verify_signature(m_copy, s_copy, pubkey_path)
-        manifest = parse_manifest(m_copy)
+        verify_signature(f_copy, s_copy, pubkey_path)
+        with open(f_copy, "rb") as fh:
+            return fh.read()
     finally:
         _sh.rmtree(tmp, ignore_errors=True)
+
+
+def verify_manifest_map(manifest_path, sig_path, pubkey_path=None):
+    """Verify a signed manifest and return its {basename: hash} map, parsed
+    from the VERIFIED bytes (TOCTOU-safe)."""
+    data = verify_and_read(manifest_path, sig_path, pubkey_path)
+    import tempfile as _tf
+    tmp = _tf.mkdtemp(prefix="xpf-manifest-")
+    try:
+        os.chmod(tmp, 0o700)
+        p = os.path.join(tmp, "m")
+        with open(p, "wb") as fh:
+            fh.write(data)
+        return parse_manifest(p)
+    finally:
+        import shutil as _sh
+        _sh.rmtree(tmp, ignore_errors=True)
+
+
+def verify_image_artifact(path, manifest_path, sig_path, pubkey_path=None):
+    """Verify ONE artifact `path` against a signed manifest.
+
+    1. verify+parse the manifest from its VERIFIED bytes (TOCTOU-safe).
+    2. hash the EXACT `path` and compare to the manifest entry for its
+       basename. Missing entry or mismatch -> raise.
+
+    Binds the bytes the caller is about to import/use, not a cwd-relative
+    `sha256sum -c` (which could pass against a stale local copy).
+    """
+    manifest = verify_manifest_map(manifest_path, sig_path, pubkey_path)
     base = os.path.basename(path)
     if base not in manifest:
         raise SignError(

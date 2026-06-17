@@ -130,10 +130,10 @@ def gate_images(dist):
     for ver, manifest in sorted(versions.items()):
         sig = manifest + ".minisig"
         try:
-            # Verify the signature BEFORE parsing the manifest (Codex-L6):
-            # never trust an unauthenticated manifest's contents.
-            sign.verify_signature(manifest, sig, pub)
-            checks = sign.parse_manifest(manifest)
+            # Verify + parse from the VERIFIED bytes (Codex-L6 + AGY-r3-F3
+            # TOCTOU): never parse a live manifest that could be swapped after
+            # the signature check.
+            checks = sign.verify_manifest_map(manifest, sig, pub)
         except sign.SignError as e:
             die(f"image manifest {os.path.basename(manifest)} failed verify: {e}")
         # Every file the manifest lists must be present + hash-match.
@@ -148,14 +148,32 @@ def gate_images(dist):
                 die(f"image artifact {base} failed verify: {e}")
             covered.add(base)
         info(f"image set {ver}: signature + {len(checks)} file hashes OK")
-    # Orphan sweep (Codex-r2-1): the WHOLE dist tree is uploaded, so any image
-    # artifact NOT covered by a verified manifest (e.g. a stale dev qcow2)
-    # would be published unverified. Refuse it.
-    for name in sorted(os.listdir(dist)):
-        if name.endswith(IMAGE_ARTIFACT_SUFFIXES) and name not in covered:
-            die(f"orphan image artifact in the publish set: {name} is not listed "
-                "in any verified manifest — refusing to publish unverified bytes. "
-                "Remove it or sign a manifest covering it.")
+    # Orphan sweep (Codex-r2-1 / r3): the WHOLE dist tree is uploaded
+    # RECURSIVELY (rsync -a / aws s3 sync), so walk the tree — not just the top
+    # level — and refuse any image artifact NOT covered by a verified manifest,
+    # wherever it sits (e.g. a nested dist/stable/xpf-evil.qcow2). The apt pool
+    # is gated separately (gate_apt) so skip apt/.
+    apt_dir = os.path.join(dist, "apt")
+    for root, _dirs, files in os.walk(dist):
+        if root == apt_dir or root.startswith(apt_dir + os.sep):
+            continue
+        for name in sorted(files):
+            if not name.endswith(IMAGE_ARTIFACT_SUFFIXES):
+                continue
+            rel = os.path.relpath(os.path.join(root, name), dist)
+            # Image artifacts live ONLY at the top level (the bake writes
+            # dist/xpf-<ver>.*). A nested one (e.g. dist/stable/xpf-evil.qcow2)
+            # can never be a verified artifact — a manifest binds BASENAMES, so
+            # a nested duplicate basename would also escape a basename-only
+            # `covered` check. Refuse any image artifact below the top level.
+            if os.path.abspath(root) != os.path.abspath(dist):
+                die(f"image artifact outside the top-level dist dir: {rel} — "
+                    "images belong at dist/xpf-<ver>.*; refusing to publish "
+                    "unverified nested bytes.")
+            if name not in covered:
+                die(f"orphan image artifact in the publish set: {rel} is not "
+                    "listed in any verified manifest — refusing to publish "
+                    "unverified bytes. Remove it or sign a manifest covering it.")
     # (c) install.sh — signed AND not the placeholder.
     installsh = os.path.join(dist, "install.sh")
     if os.path.isfile(installsh):
@@ -186,12 +204,14 @@ def gate_latest(dist, channel, versions, pub):
     if not os.path.isfile(sig):
         die(f"{channel}/latest.json.minisig missing — the freshness pointer "
             "must be signed.")
+    # Verify + parse from the VERIFIED bytes (AGY-r3-F1 TOCTOU): do not re-open
+    # the live latest.json after the signature check.
     try:
-        sign.verify_signature(latest, sig, pub)
+        data = json.loads(sign.verify_and_read(latest, sig, pub).decode())
     except sign.SignError as e:
         die(f"latest.json signature failed verify: {e}")
-    with open(latest) as f:
-        data = json.load(f)
+    except (ValueError, UnicodeDecodeError) as e:
+        die(f"latest.json is not valid JSON after verify: {e}")
     ver = data.get("version")
     if ver not in versions:
         die(f"latest.json names version {ver!r} which is NOT in the publish set "
@@ -200,16 +220,22 @@ def gate_latest(dist, channel, versions, pub):
 
 
 def gate_apt(dist, channel):
-    """(b): the apt InRelease for `channel` verifies against the archive key."""
-    inrelease = os.path.join(dist, "apt", "dists", channel, "InRelease")
-    if not os.path.isfile(inrelease):
-        die(f"apt InRelease for suite {channel} missing "
-            f"({inrelease}) — build a SIGNED repo (XPF_GPG_KEY) first.")
+    """(b): the apt InRelease verifies against the archive key. The whole
+    apt/ tree is uploaded (rsync/s3 sync), so EVERY suite present under
+    dists/ — not just the target `channel` — must carry a verifying
+    InRelease (AGY-r3-F2). The target channel must exist."""
+    distsdir = os.path.join(dist, "apt", "dists")
+    target = os.path.join(distsdir, channel, "InRelease")
+    if not os.path.isfile(target):
+        die(f"apt InRelease for the target suite {channel} missing "
+            f"({target}) — build a SIGNED repo (XPF_GPG_KEY) first.")
     pub = archive_pubkey()
     if _is_placeholder(pub):
         die("archive pubkey is the #1924 PLACEHOLDER — cannot verify InRelease. "
             "Supply the real archive key (XPF_ARCHIVE_PUBKEY / "
             "scripts/dist/xpf-archive-keyring.asc) before publishing.")
+    suites = sorted(d for d in os.listdir(distsdir)
+                    if os.path.isdir(os.path.join(distsdir, d)))
     # Verify against an ephemeral keyring built only from the pinned pubkey.
     import tempfile
     with tempfile.TemporaryDirectory() as gnupghome:
@@ -219,11 +245,17 @@ def gate_apt(dist, channel):
                            env=env, capture_output=True, text=True)
         if r.returncode != 0:
             die(f"could not import archive pubkey {pub}: {r.stderr.strip()}")
-        r = subprocess.run(["gpg", "--batch", "--verify", inrelease],
-                           env=env, capture_output=True, text=True)
-        if r.returncode != 0:
-            die(f"apt InRelease signature FAILED: {r.stderr.strip()}")
-    info(f"apt InRelease ({channel}) signature OK")
+        for suite in suites:
+            inrel = os.path.join(distsdir, suite, "InRelease")
+            if not os.path.isfile(inrel):
+                die(f"suite {suite} under dists/ has no InRelease — the whole "
+                    "apt tree is uploaded, so every suite must be signed. "
+                    "Rebuild or remove it.")
+            r = subprocess.run(["gpg", "--batch", "--verify", inrel],
+                               env=env, capture_output=True, text=True)
+            if r.returncode != 0:
+                die(f"apt InRelease ({suite}) signature FAILED: {r.stderr.strip()}")
+            info(f"apt InRelease ({suite}) signature OK")
     # The pooled .deb must not carry the PLACEHOLDER archive keyring
     # (Codex-r2-2): a package built before the real key existed would, once
     # installed, overwrite a host's real /usr/share/keyrings key with the
@@ -240,7 +272,12 @@ def gate_apt(dist, channel):
                     r = subprocess.run(["dpkg-deb", "-x", debp, td],
                                        capture_output=True, text=True)
                     if r.returncode != 0:
-                        continue  # not the xpf package / unreadable; skip
+                        # Fail-CLOSED (Codex-r3): an uninspectable pooled .deb
+                        # must NOT be published — we cannot confirm it does not
+                        # ship the placeholder keyring.
+                        die(f"cannot extract pooled package {fn} for inspection "
+                            f"(dpkg-deb rc={r.returncode}): {r.stderr.strip()} — "
+                            "refusing to publish an uninspectable package.")
                     kp = os.path.join(td, "usr/share/keyrings/"
                                       "xpf-archive-keyring.asc")
                     if os.path.isfile(kp) and _is_placeholder(kp):
