@@ -6,6 +6,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 // fakeLinkOps is an in-memory linkOps for the #1706 tunnel/xfrm reuse
@@ -41,6 +42,20 @@ type fakeLinkOps struct {
 	// that link (#1884 link-local retention tests).
 	addrDelFail map[string]error
 
+	// addrListFail[name] makes AddrList return an error for that link
+	// (#1919 prune AddrList-failure retry test).
+	addrListFail map[string]error
+
+	// byNameHardErr[name] makes LinkByName return a NON-not-found
+	// (transient) error for that name — distinct from errLinkNotFound, so
+	// isLinkNotFound(err) is false (#1919 transient-lookup retention test).
+	byNameHardErr map[string]error
+
+	// addrAddFail makes AddrAdd fail (models real-netlink EEXIST when an
+	// address is already present and AddrList could not report it — #1919
+	// AddrList-failure link-local ownership preservation test).
+	addrAddFail bool
+
 	// noMasterErr makes LinkSetNoMaster fail (claim retention tests).
 	noMasterErr error
 
@@ -59,19 +74,25 @@ type fakeLinkOps struct {
 
 func newFakeLinkOps() *fakeLinkOps {
 	return &fakeLinkOps{
-		links:       map[string]netlink.Link{},
-		byNameCount: map[string]int{},
-		hiddenUntil: map[string]int{},
-		delFail:     map[string]error{},
-		addrDelFail: map[string]error{},
-		addrs:       map[string][]netlink.Addr{},
-		mtuSet:      map[string][]int{},
-		addrDels:    map[string][]string{},
+		links:         map[string]netlink.Link{},
+		byNameCount:   map[string]int{},
+		hiddenUntil:   map[string]int{},
+		delFail:       map[string]error{},
+		addrDelFail:   map[string]error{},
+		addrListFail:  map[string]error{},
+		byNameHardErr: map[string]error{},
+		addrs:         map[string][]netlink.Addr{},
+		mtuSet:        map[string][]int{},
+		addrDels:      map[string][]string{},
 	}
 }
 
 func (f *fakeLinkOps) LinkByName(name string) (netlink.Link, error) {
 	f.byNameCount[name]++
+	if err, ok := f.byNameHardErr[name]; ok {
+		// Non-not-found (transient) error: isLinkNotFound(err) is false.
+		return nil, err
+	}
 	if f.byNameErrAfter > 0 && f.byNameCount[name] > f.byNameErrAfter {
 		return nil, errors.New("transient netlink error")
 	}
@@ -134,6 +155,11 @@ func (f *fakeLinkOps) LinkList() ([]netlink.Link, error) { return nil, nil }
 
 func (f *fakeLinkOps) AddrAdd(l netlink.Link, a *netlink.Addr) error {
 	_ = l.Attrs()
+	if f.addrAddFail {
+		// Mirror real netlink: adding an already-present address yields
+		// EEXIST (matched via errors.Is in reconcileLinkAddrsLocked).
+		return unix.EEXIST
+	}
 	f.addrLinks = append(f.addrLinks, l)
 	name := l.Attrs().Name
 	f.addrs[name] = append(f.addrs[name], *a)
@@ -158,7 +184,11 @@ func (f *fakeLinkOps) AddrDel(l netlink.Link, a *netlink.Addr) error {
 }
 
 func (f *fakeLinkOps) AddrList(l netlink.Link, family int) ([]netlink.Addr, error) {
-	return append([]netlink.Addr(nil), f.addrs[l.Attrs().Name]...), nil
+	name := l.Attrs().Name
+	if err, ok := f.addrListFail[name]; ok {
+		return nil, err
+	}
+	return append([]netlink.Addr(nil), f.addrs[name]...), nil
 }
 
 // hasAddr reports whether the fake kernel store holds ipnet on name.
