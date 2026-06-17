@@ -2525,6 +2525,38 @@ pub(super) fn poll_binding_process_descriptor(
                                 // tagging and TX offload. The netlink monitor then
                                 // picks up the resolved entry instantly.
                                 if let Some(next_hop) = decision.resolution.next_hop {
+                                    // #1912: tunnel-marked decisions are NEVER
+                                    // buffered in pending_neigh (R-E), so the
+                                    // per-hop neg-cache that arms only on a
+                                    // pending_neigh timeout (neighbor_dispatch.rs)
+                                    // never arms for an unresolved OUTER hop —
+                                    // the top-of-arm neg fast-fail therefore can
+                                    // never suppress this block for a tunnel
+                                    // flow. Without an explicit throttle EVERY
+                                    // cold packet of an unresolved tunnel-bound
+                                    // flow would fire trigger_kernel_arp_probe
+                                    // (a raw-socket open/setsockopt/sendto/close
+                                    // per packet) — a syscall storm under a SYN
+                                    // flood (AGY #1912 r1, High). So for a
+                                    // tunnel-marked decision gate BOTH the kernel
+                                    // ARP probe AND the resolver enqueue behind
+                                    // the existing per-(neigh_if, next_hop)
+                                    // resolver_enqueue_throttle: at most one
+                                    // probe + enqueue per outer key per window.
+                                    // The neg-cache miss-arming gap is unchanged
+                                    // for non-tunnel flows (they DO buffer +
+                                    // time out → neg_neigh_record).
+                                    let tunnel_marked =
+                                        decision.resolution.tunnel_endpoint_id != 0;
+                                    let throttle_key = (neigh_if, next_hop);
+                                    let tunnel_throttled = tunnel_marked
+                                        && matches!(
+                                            binding
+                                                .resolver_enqueue_throttle
+                                                .get(&throttle_key),
+                                            Some(&t) if now_ns.saturating_sub(t)
+                                                < RESOLVER_ENQUEUE_THROTTLE_NS
+                                        );
                                     // Only spawn ping if we don't already have a
                                     // pending probe for this (ifindex, hop).
                                     // #1771 §2.2: pending_neigh is keyed by
@@ -2533,17 +2565,16 @@ pub(super) fn poll_binding_process_descriptor(
                                     // direct contains_key (was an O(n) iter scan).
                                     // #1912: dedup + iface lookup on the OUTER
                                     // L3 egress (neigh_if), not the tunnel
-                                    // logical ifindex. pending_neigh is never
-                                    // populated for tunnel-marked decisions
-                                    // (R-E gate below), so for those the
-                                    // contains_key is always false and the
-                                    // probe always fires on the correct outer
-                                    // iface; for non-tunnel neigh_if ==
-                                    // egress_ifindex so the dedup is identical.
+                                    // logical ifindex. For a non-tunnel flow
+                                    // neigh_if == egress_ifindex so the dedup is
+                                    // byte-identical; for a tunnel flow
+                                    // pending_neigh never holds the key (R-E), so
+                                    // the per-window throttle above is the
+                                    // probe-storm bound instead.
                                     let already_probing = binding
                                         .pending_neigh
                                         .contains_key(&(neigh_if, next_hop));
-                                    if !already_probing {
+                                    if !already_probing && !tunnel_throttled {
                                         let iface_name = worker_ctx
                                             .forwarding
                                             .ifindex_to_name
@@ -2564,55 +2595,41 @@ pub(super) fn poll_binding_process_descriptor(
                                     // kernel ARP probe above fires; the resolver
                                     // hardens the STALE/DELAY outer-entry case by
                                     // issuing an RTM_GETNEIGH revalidation. The
-                                    // frame is STILL NOT buffered (R-E: tunnel-
-                                    // marked never enters pending_neigh), so no
-                                    // plaintext-leak window is opened. Rate-
-                                    // limited per (neigh_if, next_hop) via the
-                                    // existing resolver_enqueue_throttle so an
-                                    // outer-hop storm fires at most one enqueue
-                                    // per key per window; the resolver coalesces
-                                    // per-key anyway. Non-tunnel decisions skip
-                                    // this entirely (the neg-cache fast-fail path
-                                    // already owns their resolver enqueue).
-                                    if decision.resolution.tunnel_endpoint_id != 0
-                                        && neigh_if > 0
-                                    {
+                                    // frame is STILL NOT buffered (R-E), so no
+                                    // plaintext-leak window is opened. Shares the
+                                    // tunnel_throttled window with the probe so a
+                                    // single bump per key per window gates both.
+                                    if tunnel_marked && neigh_if > 0 && !tunnel_throttled {
                                         if let Some(resolver) = worker_ctx.neighbor_resolver {
-                                            let key = (neigh_if, next_hop);
-                                            let throttled = matches!(
-                                                binding.resolver_enqueue_throttle.get(&key),
-                                                Some(&t) if now_ns.saturating_sub(t)
-                                                    < RESOLVER_ENQUEUE_THROTTLE_NS
-                                            );
-                                            if !throttled {
-                                                if let Some(name) = worker_ctx
-                                                    .forwarding
-                                                    .ifindex_to_name
-                                                    .get(&neigh_if)
-                                                {
-                                                    resolver.enqueue(
-                                                        neigh_if,
-                                                        next_hop,
-                                                        name.clone(),
-                                                    );
-                                                    if binding
-                                                        .resolver_enqueue_throttle
-                                                        .len()
-                                                        >= MAX_NEG_NEIGH_CACHE
-                                                        && !binding
-                                                            .resolver_enqueue_throttle
-                                                            .contains_key(&key)
-                                                    {
-                                                        binding
-                                                            .resolver_enqueue_throttle
-                                                            .clear();
-                                                    }
-                                                    binding
-                                                        .resolver_enqueue_throttle
-                                                        .insert(key, now_ns);
-                                                }
+                                            if let Some(name) = worker_ctx
+                                                .forwarding
+                                                .ifindex_to_name
+                                                .get(&neigh_if)
+                                            {
+                                                resolver.enqueue(
+                                                    neigh_if,
+                                                    next_hop,
+                                                    name.clone(),
+                                                );
                                             }
                                         }
+                                    }
+                                    // #1912: bump the shared tunnel throttle once
+                                    // after firing (probe and/or enqueue), so the
+                                    // NEXT cold packet within the window skips
+                                    // both. Bounded like the negative cache.
+                                    if tunnel_marked && neigh_if > 0 && !tunnel_throttled {
+                                        if binding.resolver_enqueue_throttle.len()
+                                            >= MAX_NEG_NEIGH_CACHE
+                                            && !binding
+                                                .resolver_enqueue_throttle
+                                                .contains_key(&throttle_key)
+                                        {
+                                            binding.resolver_enqueue_throttle.clear();
+                                        }
+                                        binding
+                                            .resolver_enqueue_throttle
+                                            .insert(throttle_key, now_ns);
                                     }
                                 }
                                 // Create the session NOW so the SYN-ACK (reverse
