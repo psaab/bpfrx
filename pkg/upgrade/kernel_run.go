@@ -270,11 +270,27 @@ func (r *KernelRunner) armCandidate(j *KernelJournal) error {
 		r.logf("kernel-upgrade arm: WARNING arm watchdog: %v (continuing; BootNext closes the loop)", err)
 	}
 
+	// Journal ARMED *before* arming BootNext (r1 Codex Critical-2): the
+	// reboot-boundary crash hole is "firmware booted the candidate but the
+	// journal still says INSTALLED, so Promote() no-ops". By persisting ARMED
+	// first, any crash after this point leaves a recoverable ARMED journal that
+	// Promote() acts on. The selector + ARMED journal are both harmless without
+	// BootNext (the firmware default is still the known-good slot), so ordering
+	// the durable ARMED write ahead of the one-shot is strictly safe.
+	if err := r.ktransition(j, KernelStateArmed); err != nil {
+		return err
+	}
+
 	if err := sys.SetBootNext(inactiveID); err != nil {
+		// Roll the journal back to INSTALLED so a retry re-arms cleanly; the
+		// selector is already correct and BootNext was not set, so the box
+		// still boots the known-good default.
+		j.State = KernelStateInstalled
+		_ = r.saveKernelJournal(j)
 		return fmt.Errorf("kernel-upgrade arm: efibootmgr --bootnext %s: %w", inactiveID, err)
 	}
 
-	return r.ktransition(j, KernelStateArmed)
+	return nil
 }
 
 // Promote runs the POST-REBOOT promotion gate from the candidate boot. It is
@@ -370,17 +386,42 @@ func (r *KernelRunner) Promote() error {
 // was consumed), so the reboot lands on the known-good slot.
 func (r *KernelRunner) revert(j *KernelJournal, reason error) error {
 	r.logf("kernel-upgrade: REVERT (%v); the candidate is NOT promoted, rebooting to known-good", reason)
+	sys := r.cfg.Sys
+
+	// FORCE the known-good (active) slot back to the FRONT of BootOrder before
+	// rebooting (r1 Codex High): the common revert path relies on the firmware
+	// fallback (BootNext already consumed), but a crash in a PRIOR promote
+	// attempt could have left the candidate slot first in BootOrder with the
+	// journal still ARMED; a plain reboot would then re-enter the candidate.
+	// Restoring the active slot to the front makes the revert reboot
+	// deterministic regardless of how we got here. Best-effort: if BootOrder
+	// can't be read/written, the firmware-cleared BootNext is still the floor.
+	if entries, err := sys.BootEntries(); err == nil {
+		if activeID, ok := entries[j.ActiveSlot]; ok {
+			if err := sys.SetBootOrderFront(activeID); err != nil {
+				r.logf("kernel-upgrade: WARNING restore known-good BootOrder front on revert: %v", err)
+			}
+		} else {
+			r.logf("kernel-upgrade: WARNING active slot %s not in NVRAM on revert", j.ActiveSlot)
+		}
+	} else {
+		r.logf("kernel-upgrade: WARNING read boot entries on revert: %v", err)
+	}
+
 	// Prune the inactive slot's candidate staging + the un-promoted kernel
 	// pkg; reset the inactive selector back to the known-good kernel so a
 	// later boot of that slot is safe. Best-effort: a prune failure must not
 	// block the revert reboot (the firmware fallback is what matters).
-	if err := r.cfg.Sys.PruneInactiveSlot(j.InactiveSlot, j.KnownGoodVersion, j.CandidateVersion); err != nil {
+	if err := sys.PruneInactiveSlot(j.InactiveSlot, j.KnownGoodVersion, j.CandidateVersion); err != nil {
 		r.logf("kernel-upgrade: WARNING prune inactive slot on revert: %v", err)
 	}
 	_ = r.ktransition(j, KernelStateReverted)
 	// Clear the journal so the next boot is a clean ordinary boot.
 	_ = r.clearKernelJournal()
-	return fmt.Errorf("kernel-upgrade reverted: %w", reason)
+	// Wrap ErrKernelReverted so the CLI maps this to exit 3 (reboot to
+	// known-good), distinct from an infra error (exit 1). reason is chained
+	// for the log/operator.
+	return fmt.Errorf("%w: %v", ErrKernelReverted, reason)
 }
 
 // IsArmed reports whether a candidate is currently armed (used by the

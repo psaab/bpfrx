@@ -1,0 +1,51 @@
+#!/bin/sh
+# xpf (#1930) — LANE-1 kernel-channel promotion gate (runs on EVERY boot).
+#
+# This is the early-boot half of the A4 channel (r1 Codex Critical-1: the gate
+# must actually be invoked, and a REVERT must actually reboot). On an ordinary
+# boot (no candidate armed) `xpfd upgrade kernel promote` is a fast no-op. On a
+# candidate trial boot it runs the gate (BootCurrent==candidate slot + uname ==
+# candidate + verify-dataplane PASS + forward beacon PASS):
+#   exit 0 -> PROMOTED (durable BootOrder reorder already done) — continue boot.
+#   exit 3 -> REVERTED (candidate failed the gate) — reboot NOW; the firmware
+#             already cleared BootNext, so the reboot falls through BootOrder to
+#             the known-good slot (revert() also restored it).
+#   exit 1/other -> infra error — do NOT reboot-loop on a transient failure;
+#             log and continue this boot (the candidate is running but
+#             un-promoted, so the NEXT plain reboot still falls back to
+#             known-good via the firmware-cleared BootNext). Leave the box
+#             usable for diagnosis rather than bouncing it.
+#
+# It runs BEFORE xpfd admits traffic but is NOT a hard ordering dependency of
+# xpfd (a stuck promote must never wedge the box): see the .service.
+
+set -u
+log() { echo "xpf-kernel-promote: $*" >&2; }
+
+if ! command -v xpfd >/dev/null 2>&1; then
+    log "xpfd not found; skipping promotion gate"
+    exit 0
+fi
+
+xpfd upgrade kernel promote
+rc=$?
+
+case "$rc" in
+    0)
+        log "promotion gate: clean (promoted or ordinary boot)"
+        exit 0
+        ;;
+    3)
+        log "promotion gate: REVERT — candidate failed; rebooting to known-good slot"
+        # The firmware already consumed BootNext and revert() restored the
+        # known-good slot to the BootOrder front, so this reboot lands on
+        # known-good. Use --no-wall; this is an unattended recovery reboot.
+        systemctl reboot --no-wall || reboot
+        # If reboot somehow returns, exit non-zero so the unit records failure.
+        exit 3
+        ;;
+    *)
+        log "promotion gate: infra error (rc=$rc); NOT rebooting (avoid a bounce loop) — candidate is un-promoted, next plain reboot falls back to known-good"
+        exit 0
+        ;;
+esac

@@ -131,6 +131,14 @@ type KernelJournal struct {
 // to use LANE 2 (image-replace). Distinct from a transient/IO error.
 var ErrKernelChannelUnavailable = errors.New("kernel channel unavailable (use image-replace / LANE 2)")
 
+// ErrKernelReverted marks the EXPECTED outcome of a failed promotion gate: the
+// candidate did not pass (REJECT / wrong-kernel / beacon fail / firmware
+// fell-back), so it was not promoted and the box must reboot to the known-good
+// slot. The CLI maps this to exit 3 (the promotion oneshot reboots), distinct
+// from a genuine infrastructure error (exit 1) — a unit must be able to tell
+// "reverted" from "broken" (r1 Codex High).
+var ErrKernelReverted = errors.New("kernel candidate reverted (reboot to known-good)")
+
 // KernelSystem abstracts the OS / firmware / apt / boot surface so the kernel
 // state machine is unit-testable without a live UEFI host. The production
 // implementation is realKernelSystem (kernel_linux.go).

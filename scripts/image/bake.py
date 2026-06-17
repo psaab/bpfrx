@@ -333,6 +333,13 @@ def virt_customize(work_qcow, xpf_deb):
         "--copy-in", f"{HERE}/xpf-uefi-slots.service:/usr/lib/systemd/system",
         "--run-command", "chmod 0755 /usr/local/sbin/xpf-uefi-slots",
         "--run-command", "systemctl enable xpf-uefi-slots.service",
+        # the promotion gate (r1 Codex Critical-1): runs `xpfd upgrade kernel
+        # promote` early on EVERY boot — a fast no-op on an ordinary boot, the
+        # gate + reboot-on-revert on a candidate trial boot.
+        "--copy-in", f"{HERE}/xpf-kernel-promote:/usr/local/sbin",
+        "--copy-in", f"{HERE}/xpf-kernel-promote.service:/usr/lib/systemd/system",
+        "--run-command", "chmod 0755 /usr/local/sbin/xpf-kernel-promote",
+        "--run-command", "systemctl enable xpf-kernel-promote.service",
         # Stage the A/B slot dirs: copy the signed shim+grub (so each slot boots
         # shim->grub->MOK kernel — Secure-Boot-correct, r4 AGY Hazard C) and seed
         # both selectors at the shipped known-good kernel (the GRUB-script form

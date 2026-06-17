@@ -49,3 +49,49 @@ watchdog, so that specific case is bench/manual-on-HW. The BOOT-LOOP itself is
 closed unconditionally by the firmware-cleared BootNext (proven above in both
 directions) regardless of the watchdog — the watchdog only converts a hang into
 the reset that triggers the already-proven firmware fallback (Path Option D2).
+
+## r1 Codex review fixes — re-validated live
+
+After Codex's REQUEST-CHANGES (2 Critical, 5 High, 1 Medium), the fixes were
+applied and the corrected chain re-validated:
+
+- **Critical-1 (promotion oneshot was not shipped):** added
+  `xpf-kernel-promote`(+.service) — runs `xpfd upgrade kernel promote` early on
+  EVERY boot (no-op on ordinary boots; gate + reboot-on-revert on a candidate
+  trial). Shipped in BOTH the bake and the .deb (debian/rules), enabled, NOT
+  Before=xpfd.
+- **Critical-2 (SetBootNext before ARMED journal):** the ARMED journal is now
+  written BEFORE `efibootmgr --bootnext`; a crash in the window leaves a
+  recoverable ARMED state Promote() acts on (BootNext failure rolls the journal
+  back to INSTALLED). Covered by the existing crash-resume tests.
+- **High (revert didn't restore BootOrder):** revert() now forces the known-good
+  (active) slot back to the BootOrder front before rebooting.
+- **High (CLI mapped all Promote errors to exit 3):** added ErrKernelReverted;
+  the CLI maps ONLY a revert to exit 3, infra errors to exit 1.
+- **High (install dropped linux-modules-extra):** InstallCandidateKernel now
+  includes linux-modules-extra-<ver> (mlx5/i40e) when available.
+- **High (weak rehold):** holdLinuxPackages returns an error (fatal on the final
+  rehold); KernelHeld verifies the FULL installed linux-* set is held.
+- **High (slot self-heal could undo a promoted default):** register_slot now
+  verifies the loader PATH (re-creates a label-only/wrong-path entry); the
+  BootOrder normalizer preserves whichever xpf slot LED before this run (a
+  promoted B is kept first), only seeding A-first on a fresh box.
+- **Medium (09_xpf empty cmdline + fall-through):** the fragment now sources
+  grub-mkconfig_lib and BAKES the real `GRUB_CMDLINE_LINUX*` + `root=` at
+  generation time, and only emits a bootable menuentry when the selector is
+  valid (else falls through to the 10_linux menu).
+
+**Re-validated live (Ubuntu 26.04 UEFI Secure Boot):**
+- update-grub emits the xpf-slot block with a REAL baked cmdline:
+  `linux /boot/${xpf_slot_kernel} root=/dev/sda2 ro quiet splash console=...`;
+  whole grub.cfg passes grub-script-check.
+- Fixed registration: idempotent (loader-path verified, 2 runs → exactly 2
+  slots), xpf-A first.
+- FULL CHAIN through a real reboot: arm xpf-B selector + `--bootnext 0004` →
+  reboot → `BootCurrent: 0004`, BootNext cleared, OS booted (uname 7.0.0-22,
+  root=/dev/sda2) — i.e. firmware → xpf-B shim → grub → 09_xpf `$cmdpath` →
+  sourced xpf-B selector → kernel → running OS. The `$cmdpath` selector
+  mechanism (the load-bearing A4 piece) drives a real boot.
+
+(Note: incus `file push` intermittently truncates files; all VM file deploys
+during validation were done via `cat >` over `incus exec` to avoid that.)

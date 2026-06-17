@@ -150,29 +150,59 @@ func (s *realKernelSystem) RunningKernel() (string, error) {
 	return strings.TrimSpace(out), nil
 }
 
+// KernelHeld reports whether EVERY currently-installed linux-* package is held
+// (r1 Codex High: a "any linux- is held" check false-passes a PARTIAL rehold).
 func (s *realKernelSystem) KernelHeld() (bool, error) {
 	out, err := captureCmd("apt-mark", "showhold")
 	if err != nil {
 		return false, err
 	}
+	held := map[string]bool{}
 	for _, line := range strings.Split(out, "\n") {
-		if strings.HasPrefix(strings.TrimSpace(line), "linux-") {
-			return true, nil
+		if p := strings.TrimSpace(line); p != "" {
+			held[p] = true
 		}
 	}
-	return false, nil
+	installed := currentLinuxPackages()
+	if len(installed) == 0 {
+		// No linux-* installed at all — treat as "not held" so the caller
+		// surfaces the anomaly rather than silently passing.
+		return false, nil
+	}
+	for _, p := range installed {
+		if !held[p] {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func (s *realKernelSystem) InstallCandidateKernel(version string) (string, error) {
 	unholdLinuxPackages()
 	reheld := false
 	defer func() {
+		// On ANY early return (install/initramfs/grub failure) the deferred
+		// rehold restores the safety floor. A best-effort rehold here is
+		// acceptable ONLY because the caller's KernelHeld() pre-arm re-assert
+		// (kernel_run.go) verifies the FULL set is held and aborts the arm
+		// otherwise (r1 Codex High); we log a failure so it is not silent.
 		if !reheld {
-			holdLinuxPackages()
+			if err := holdLinuxPackages(); err != nil {
+				fmt.Fprintf(os.Stderr, "kernel-upgrade: WARNING deferred rehold after failed install: %v\n", err)
+			}
 		}
 	}()
 
 	pkgs := []string{"linux-image-" + version, "linux-modules-" + version}
+	// linux-modules-extra carries the mlx5/i40e (and other) NIC drivers the
+	// appliance bake explicitly requires (bake.py asserts it). Omitting it
+	// would boot a candidate that cannot drive the dataplane NICs — a failure
+	// the virtio OVMF test would NOT surface (r1 Codex High). Include it when
+	// available so the candidate has the same driver set as the running kernel.
+	extraPkg := "linux-modules-extra-" + version
+	if aptPackageAvailable(extraPkg) {
+		pkgs = append(pkgs, extraPkg)
+	}
 	headersPkg := "linux-headers-" + version
 	if aptPackageAvailable(headersPkg) {
 		pkgs = append(pkgs, headersPkg)
@@ -188,9 +218,15 @@ func (s *realKernelSystem) InstallCandidateKernel(version string) (string, error
 		return "", err
 	}
 
-	holdLinuxPackages()
+	// Rehold is load-bearing (the candidate must not be apt-movable after this
+	// window) — a failure here is FATAL to the install (r1 Codex High).
+	if err := holdLinuxPackages(); err != nil {
+		return "", fmt.Errorf("rehold linux-* after candidate install: %w", err)
+	}
 	reheld = true
 
+	// The candidate's uname -r is the requested version when the standard
+	// "<version>" naming holds; prefer the actual /lib/modules dir if present.
 	if _, err := os.Stat(filepath.Join("/lib/modules", version)); err == nil {
 		return version, nil
 	}
@@ -410,15 +446,17 @@ func unholdLinuxPackages() {
 	if len(linuxPackages) == 0 {
 		return
 	}
+	// Unhold failure is non-fatal: at worst the candidate install fails (apt
+	// refuses to touch a held pkg), which is itself surfaced as an error.
 	_ = runCmd("apt-mark", append([]string{"unhold"}, linuxPackages...)...)
 }
 
-func holdLinuxPackages() {
+func holdLinuxPackages() error {
 	linuxPackages := currentLinuxPackages()
 	if len(linuxPackages) == 0 {
-		return
+		return fmt.Errorf("no linux-* packages found to hold")
 	}
-	_ = runCmd("apt-mark", append([]string{"hold"}, linuxPackages...)...)
+	return runCmd("apt-mark", append([]string{"hold"}, linuxPackages...)...)
 }
 
 func currentLinuxPackages() []string {

@@ -68,9 +68,22 @@ register_slot() {
     # + the loader path, NOT line-end. So the guard must match the label
     # bounded by the trailing TAB/space, NOT anchored at $ (that miss created
     # duplicate slots — caught live, #1930).
-    if efibootmgr | grep -qE "^Boot[0-9A-Fa-f]{4}\*?[[:space:]]+${slot}[[:space:]]"; then
-        log "slot ${slot} already registered"
-        return 0
+    # Verify BOTH the label AND the loader path: an entry that merely shares
+    # the label but points elsewhere (e.g. a stale/foreign entry) must NOT be
+    # accepted, or the slot would chainload the wrong loader (r1 Codex High).
+    # efibootmgr prints the loader as "...File(\EFI\<slot>\shimx64.efi)" or
+    # "...\EFI\<slot>\shimx64.efi"; match the slot's shim path case-insensitively.
+    existing=$(efibootmgr | grep -E "^Boot[0-9A-Fa-f]{4}\*?[[:space:]]+${slot}[[:space:]]" || true)
+    if [ -n "$existing" ]; then
+        if echo "$existing" | grep -qiE "EFI.${slot}.shimx64\.efi"; then
+            log "slot ${slot} already registered (loader path verified)"
+            return 0
+        fi
+        log "slot ${slot} exists but loader path is WRONG; re-creating: $existing"
+        # Delete the mismatched entry/entries before re-creating.
+        for n in $(echo "$existing" | sed -nE 's/^Boot([0-9A-Fa-f]{4}).*/\1/p'); do
+            efibootmgr --quiet -b "$n" -B 2>/dev/null || true
+        done
     fi
     # the slot's ESP dir must exist (bake/INC-1 staged shim+grub there)
     if [ ! -f "/boot/efi/EFI/${slot}/shimx64.efi" ]; then
@@ -88,21 +101,20 @@ register_slot() {
     return 0
 }
 
-# Record whether an xpf slot already led BootOrder BEFORE we (re)register —
-# only then do we preserve the existing default. Otherwise we normalize to a
-# deterministic xpf-A-first order (efibootmgr --create PREPENDS each new entry,
-# so creating A then B would otherwise leave B in front — caught live, #1930).
+# Record WHICH xpf slot (if any) led BootOrder BEFORE we (re)register. If an xpf
+# slot already led, that is the PROMOTED default and MUST be preserved — even if
+# the OTHER slot is currently missing (e.g. B was promoted and A's entry was
+# lost). Only when NO xpf slot leads do we seed a deterministic order (because
+# efibootmgr --create PREPENDS each new entry, creating A then B would otherwise
+# leave B in front — caught live, #1930; the self-heal-undoes-promotion case was
+# r1 Codex High).
 slot_id() { efibootmgr | sed -nE "s/^Boot([0-9A-Fa-f]{4})\*?[[:space:]]+$1[[:space:]].*/\\1/p" | head -1; }
 PRE_FRONT=$(efibootmgr | sed -nE 's/^BootOrder: ([^,]*).*$/\1/p')
 PRE_A=$(slot_id xpf-A)
 PRE_B=$(slot_id xpf-B)
-LED_BEFORE=no
-case "$PRE_FRONT" in
-    "$PRE_A"|"$PRE_B")
-        # An xpf slot already led AND both were registered before this run.
-        [ -n "$PRE_A" ] && [ -n "$PRE_B" ] && LED_BEFORE=yes
-        ;;
-esac
+LED_SLOT=""   # which xpf slot label led before this run, if any
+[ -n "$PRE_A" ] && [ "$PRE_FRONT" = "$PRE_A" ] && LED_SLOT=xpf-A
+[ -n "$PRE_B" ] && [ "$PRE_FRONT" = "$PRE_B" ] && LED_SLOT=xpf-B
 
 register_slot xpf-A || true
 register_slot xpf-B || true
@@ -112,11 +124,26 @@ A_ID=$(slot_id xpf-A)
 B_ID=$(slot_id xpf-B)
 ORDER=$(efibootmgr | sed -nE 's/^BootOrder: (.*)$/\1/p')
 
-if [ "$LED_BEFORE" = yes ]; then
-    log "an xpf slot already led BootOrder before this run; preserving the default ($PRE_FRONT)"
+if [ -n "$LED_SLOT" ]; then
+    # An xpf slot was the promoted default before this run — keep THAT slot in
+    # front (re-assert in case a --create reshuffled BootOrder), preserving the
+    # rest non-destructively. NEVER force A-first over a promoted B.
+    LEAD_ID=$(slot_id "$LED_SLOT")
+    if [ -n "$LEAD_ID" ]; then
+        REST=$(echo "$ORDER" | tr ',' '\n' | grep -vxF "$LEAD_ID" | paste -sd, -)
+        NEW="$LEAD_ID"
+        [ -n "$REST" ] && NEW="$NEW,$REST"
+        if [ "$NEW" != "$ORDER" ]; then
+            log "preserving promoted slot $LED_SLOT as default: $NEW (was: $ORDER)"
+            efibootmgr --quiet --bootorder "$NEW" 2>/dev/null \
+                || log "WARNING: failed to re-assert promoted default (non-fatal)"
+        else
+            log "promoted slot $LED_SLOT already leads BootOrder; preserving"
+        fi
+    fi
 elif [ -n "$A_ID" ]; then
-    # Deterministic seed: xpf-A first, xpf-B second, then every other entry in
-    # its existing order (preserving PXE/recovery/firmware — non-destructive).
+    # No xpf slot led (fresh box) — deterministic seed: xpf-A first, xpf-B
+    # second, then every other entry in its existing order (non-destructive).
     REST=$(echo "$ORDER" | tr ',' '\n' | grep -vxF "$A_ID" | grep -vxF "${B_ID:-__none__}" | paste -sd, -)
     NEW="$A_ID"
     [ -n "$B_ID" ] && NEW="$NEW,$B_ID"

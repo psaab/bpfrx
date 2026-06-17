@@ -76,12 +76,16 @@ func runUpgradeKernelSubcommand(args []string) {
 
 	case "promote":
 		if err := r.Promote(); err != nil {
-			// A revert is a non-error outcome of the gate: the candidate did
-			// not pass, the box must reboot to the known-good slot. Exit 3 so
-			// the promotion oneshot distinguishes revert (reboot) from a real
-			// error (1).
 			fmt.Fprintf(os.Stderr, "upgrade kernel promote: %v\n", err)
-			os.Exit(3)
+			// A REVERT is the expected "candidate failed the gate" outcome:
+			// exit 3 so the promotion oneshot reboots to the known-good slot.
+			// Any OTHER error (journal/firmware/BootOrder-write failure) is a
+			// genuine infra error: exit 1 (the oneshot must NOT treat it as a
+			// clean revert) — r1 Codex High.
+			if errors.Is(err, upgrade.ErrKernelReverted) {
+				os.Exit(3)
+			}
+			os.Exit(1)
 		}
 		fmt.Println("kernel candidate promoted")
 

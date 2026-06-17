@@ -31,25 +31,51 @@
 
 set -e
 
-PREFIX_DIR=""
-# $cmdpath is exported into the grub.d environment by grub-mkconfig only on
-# some setups; the authoritative read is at GRUB runtime. We therefore emit a
-# menuentry whose BODY reads $cmdpath at boot (not at generation time).
-cat <<'EOF'
+# Source grub-mkconfig's helper library so we can resolve the SAME kernel
+# cmdline + root device that 10_linux would (rather than hardcoding them — r1
+# Codex Medium: GRUB_CMDLINE_LINUX_DEFAULT is a generation-time shell var, NOT a
+# GRUB runtime var, so a literal "${GRUB_CMDLINE_LINUX_DEFAULT}" in the emitted
+# menuentry would be EMPTY at boot). prepare_grub_to_access_device + the
+# GRUB_CMDLINE_* vars are populated by grub-mkconfig before it runs /etc/grub.d.
+if [ -r /usr/share/grub/grub-mkconfig_lib ]; then
+    . /usr/share/grub/grub-mkconfig_lib
+elif [ -r /usr/lib/grub/grub-mkconfig_lib ]; then
+    . /usr/lib/grub/grub-mkconfig_lib
+fi
+
+# Resolve the kernel command line exactly as 10_linux does (these vars are
+# exported into the grub.d environment by grub-mkconfig at generation time).
+XPF_CMDLINE="${GRUB_CMDLINE_LINUX} ${GRUB_CMDLINE_LINUX_DEFAULT}"
+# Resolve the root= the running system uses (the GRUB_DEVICE the rest of the
+# menu boots from). Fall back to the kernel's current root= if unset.
+XPF_ROOT="${LINUX_ROOT_DEVICE:-${GRUB_DEVICE}}"
+if [ -n "${XPF_ROOT}" ]; then
+    XPF_ROOT_ARG="root=${XPF_ROOT}"
+else
+    XPF_ROOT_ARG=""
+fi
+
+# Emit the menuentry. The BODY reads $cmdpath + sources the selector at BOOT
+# (single-quoted heredoc preserves $cmdpath/$xpf_slot_* for GRUB runtime); the
+# cmdline/root are substituted at GENERATION time (double-substituted below).
+# If the selector is absent OR malformed (no xpf_slot_kernel), we DO NOT emit a
+# default-bootable entry — GRUB falls through to the 10_linux entries so the box
+# always boots a real kernel (r1 Codex Medium).
+cat <<EOF
 # --- xpf (#1930) A/B kernel-slot selector entry ---
-if [ -s "${cmdpath}/xpf.selector" ]; then
-  menuentry 'xpf kernel slot' --id xpf-slot {
-    source "${cmdpath}/xpf.selector"
-    if [ -z "${xpf_slot_kernel}" ]; then
-      echo "xpf: empty selector in ${cmdpath}; falling through"
-    else
-      search --no-floppy --set=root --file "/boot/${xpf_slot_kernel}"
-      linux  "/boot/${xpf_slot_kernel}" root=LABEL=cloudimg-rootfs ro ${GRUB_CMDLINE_LINUX} ${GRUB_CMDLINE_LINUX_DEFAULT}
-      if [ -n "${xpf_slot_initrd}" ]; then
-        initrd "/boot/${xpf_slot_initrd}"
+if [ -s "\${cmdpath}/xpf.selector" ]; then
+  source "\${cmdpath}/xpf.selector"
+  if [ -n "\${xpf_slot_kernel}" -a -f "/boot/\${xpf_slot_kernel}" ]; then
+    menuentry 'xpf kernel slot' --id xpf-slot {
+      search --no-floppy --set=root --file "/boot/\${xpf_slot_kernel}"
+      linux  "/boot/\${xpf_slot_kernel}" ${XPF_ROOT_ARG} ro ${XPF_CMDLINE}
+      if [ -n "\${xpf_slot_initrd}" -a -f "/boot/\${xpf_slot_initrd}" ]; then
+        initrd "/boot/\${xpf_slot_initrd}"
       fi
-    fi
-  }
+    }
+  else
+    echo "xpf: selector in \${cmdpath} is empty/invalid; falling through to default menu"
+  fi
 fi
 # --- end xpf A/B selector entry ---
 EOF
