@@ -104,8 +104,11 @@ existing kernel link is genuinely incompatible:
 - **Addresses**: symmetric reconcile; stale LINK-LOCAL addresses are
   deleted only if recorded in `appliedAddrs` (a configured fe80 we
   applied), never the kernel's autoconf fe80; failed LL deletes stay
-  tracked for retry. The WG branch uses the same helper with the nil
-  sentinel (blanket LL skip — pre-existing WG semantics).
+  tracked for retry. On an `AddrList` enumeration failure the reconcile
+  deletes nothing AND preserves the prior applied LINK-LOCAL ownership
+  (so a configured fe80 mid-removal is not silently re-classified as
+  foreign and leaked on a later WG prune — #1919 r1 Codex MAJOR); the
+  configured-address AddrAdd pass still runs (idempotent on EEXIST).
 - **WireGuard removal address prune** (`wgConfigured`, #1919): WG `wgN`
   TUNs are persistent (#1432 S2a) — they are deliberately excluded from
   the `ownedNames` removal diff so the link is NEVER torn on reload

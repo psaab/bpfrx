@@ -662,6 +662,91 @@ func TestWireguardRemovedWhileDaemonDownNotPruned(t *testing.T) {
 	}
 }
 
+// A same-name WG→non-WG mode transition (wg0 reconfigured as an anchor of
+// the same name) must NOT let the WG-removal prune race / clobber the
+// now-active non-WG tunnel's address — even when the first WG prune
+// AddrDel fails and retry would otherwise persist the name (Codex r1
+// MAJOR #2). Ownership is handed to the non-WG apply path.
+func TestWireguardToNonWGSameNameNoPruneRace(t *testing.T) {
+	ops := newFakeLinkOps()
+	tm, _ := newReconcileManager(ops)
+	// Apply wg0 as WireGuard with an address.
+	if err := tm.Apply([]*config.TunnelConfig{wgTC("172.16.0.1/30")}); err != nil {
+		t.Fatalf("Apply 1 (wg): %v", err)
+	}
+	// Make any AddrDel on wg0's old WG address fail, to exercise the retry
+	// path that would (buggily) persist the name in wgConfigured.
+	ops.addrDelFail["wg0|172.16.0.1/30"] = errors.New("EBUSY")
+	// Reconfigure wg0 as a non-WG anchor with a NEW address. The non-WG
+	// apply path owns it now; the WG prune must be skipped for this name.
+	if err := tm.Apply([]*config.TunnelConfig{anchorTC("wg0", "10.5.5.1/24")}); err != nil {
+		t.Fatalf("Apply 2 (transition): %v", err)
+	}
+	if !ops.hasAddr("wg0", "10.5.5.1/24") {
+		t.Fatal("non-WG address not applied after transition")
+	}
+	// After the transition the name must be HANDED to the non-WG path —
+	// never retained in WG prune tracking (which would re-run the prune
+	// against the active tunnel on later applies).
+	tm.mu.Lock()
+	stillWGTracked := tm.wgConfigured["wg0"]
+	tm.mu.Unlock()
+	if stillWGTracked {
+		t.Fatal("wg0 retained in WG prune tracking after WG→non-WG transition (Codex r1 MAJOR #2)")
+	}
+	delete(ops.addrDelFail, "wg0|172.16.0.1/30")
+	// Subsequent Apply: the WG prune must NOT delete the active non-WG
+	// address. Record the AddrDel log delta — the active address must NOT
+	// be deleted (before the fix, the prune AddrDel'd 10.5.5.1/24 mid-Apply
+	// and the anchor reconcile only re-added it afterward, hiding the churn
+	// from a state-only assertion — so assert on the delete log directly).
+	delsBefore := len(ops.addrDels["wg0"])
+	if err := tm.Apply([]*config.TunnelConfig{anchorTC("wg0", "10.5.5.1/24")}); err != nil {
+		t.Fatalf("Apply 3: %v", err)
+	}
+	for _, d := range ops.addrDels["wg0"][delsBefore:] {
+		if d == "10.5.5.1/24" {
+			t.Fatal("WG prune deleted the active non-WG address mid-Apply (Codex r1 MAJOR #2)")
+		}
+	}
+	if !ops.hasAddr("wg0", "10.5.5.1/24") {
+		t.Fatal("active non-WG address missing after Apply 3")
+	}
+}
+
+// A configured WG link-local that survives a TRANSIENT AddrList failure on
+// a still-configured reconcile must NOT lose its applied-ownership — so a
+// later full WG removal still prunes it instead of treating it as foreign
+// and leaking it forever (Codex r1 MAJOR #1).
+func TestWireguardLinkLocalOwnershipSurvivesAddrListFailure(t *testing.T) {
+	ops := newFakeLinkOps()
+	tm, _ := newReconcileManager(ops)
+	// Apply wg0 with a configured fe80 — tracked in appliedAddrs.
+	if err := tm.Apply([]*config.TunnelConfig{wgTC("10.77.0.1/24", "fe80::8/64")}); err != nil {
+		t.Fatalf("Apply 1: %v", err)
+	}
+	if !ops.hasAddr("wg0", "fe80::8/64") {
+		t.Fatal("configured fe80 not applied")
+	}
+	// Still-configured reconcile where AddrList transiently fails. Make
+	// AddrAdd of the already-present addresses fail too (real netlink
+	// returns EEXIST) so newApplied gets nothing from the add branch.
+	ops.addrListFail["wg0"] = errors.New("EBUSY: cannot enumerate")
+	ops.addrAddFail = true
+	if err := tm.Apply([]*config.TunnelConfig{wgTC("10.77.0.1/24", "fe80::8/64")}); err != nil {
+		t.Fatalf("Apply 2 (AddrList fails, still configured): %v", err)
+	}
+	// Recover and FULLY remove the WG tunnel from config.
+	delete(ops.addrListFail, "wg0")
+	ops.addrAddFail = false
+	if err := tm.Apply(nil); err != nil {
+		t.Fatalf("Apply 3 (removal): %v", err)
+	}
+	if ops.hasAddr("wg0", "fe80::8/64") {
+		t.Fatal("configured fe80 leaked after AddrList-failure dropped its ownership (Codex r1 MAJOR #1)")
+	}
+}
+
 // --- §9 test 6: appliedRI claim state machine -------------------------
 
 func TestTunnelVRFStanzaBindAndUnbind(t *testing.T) {

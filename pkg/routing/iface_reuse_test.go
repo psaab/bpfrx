@@ -50,6 +50,11 @@ type fakeLinkOps struct {
 	// isLinkNotFound(err) is false (#1919 transient-lookup retention test).
 	byNameHardErr map[string]error
 
+	// addrAddFail makes AddrAdd fail (models real-netlink EEXIST when an
+	// address is already present and AddrList could not report it — #1919
+	// AddrList-failure link-local ownership preservation test).
+	addrAddFail bool
+
 	// noMasterErr makes LinkSetNoMaster fail (claim retention tests).
 	noMasterErr error
 
@@ -149,6 +154,9 @@ func (f *fakeLinkOps) LinkList() ([]netlink.Link, error) { return nil, nil }
 
 func (f *fakeLinkOps) AddrAdd(l netlink.Link, a *netlink.Addr) error {
 	_ = l.Attrs()
+	if f.addrAddFail {
+		return errors.New("file exists")
+	}
 	f.addrLinks = append(f.addrLinks, l)
 	name := l.Attrs().Name
 	f.addrs[name] = append(f.addrs[name], *a)

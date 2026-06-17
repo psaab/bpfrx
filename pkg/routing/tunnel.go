@@ -328,7 +328,20 @@ func (t *tunnelManager) Apply(tunnels []*config.TunnelConfig) error {
 	}
 	for name := range oldWG {
 		if wgDesired[name] {
-			continue // still configured; reconciled by the apply loop below
+			continue // still configured as WG; reconciled by the apply loop below
+		}
+		if desired[name] {
+			// Same-name WG→non-WG mode transition (e.g. wg0 reconfigured as
+			// a GRE/anchor tunnel of the same name). The name is now owned by
+			// the non-WG apply path, which reconciles its addresses itself
+			// (reconcileLinkAddrsLocked deletes the stale WG addresses against
+			// the new desired set). Running the WG prune here would race that
+			// path and could delete the newly-configured non-WG address, or —
+			// on a prune AddrDel retry — persist in nextWG and prune the
+			// active tunnel on a later Apply (Codex r1 MAJOR). Hand ownership
+			// to the non-WG path: drop from WG tracking, keep appliedAddrs so
+			// the non-WG reconcile can still gate its link-locals correctly.
+			continue
 		}
 		link, err := t.ops.LinkByName(name)
 		if err != nil {
@@ -803,7 +816,28 @@ func (t *tunnelManager) reconcileLinkAddrsLocked(link netlink.Link, name string,
 	}
 	newApplied := make(map[string]bool, len(want))
 	existing := map[string]bool{}
-	if list, listErr := t.ops.AddrList(link, netlink.FAMILY_ALL); listErr == nil {
+	list, listErr := t.ops.AddrList(link, netlink.FAMILY_ALL)
+	if listErr != nil {
+		// Cannot enumerate: we cannot classify present addresses this pass,
+		// so we delete nothing AND must NOT lose link-local OWNERSHIP. A
+		// configured fe80 we previously applied that is absent from `want`
+		// (mid-removal) would otherwise fall to the AddrAdd branch below
+		// (returns EEXIST in real netlink), leave newApplied empty, and so
+		// be re-classified as foreign on the next pass — permanently leaking
+		// it on a later WG removal prune (Codex #1919 r1 MAJOR). Carry the
+		// prior applied link-locals forward so the gate stays correct.
+		// Non-link-local ownership is not gated by `applied`, so it need not
+		// be preserved here.
+		slog.Warn("failed to list "+kind+" addresses for reconcile",
+			"name", name, "err", listErr)
+		for key := range applied {
+			if addr, err := netlink.ParseAddr(key); err == nil &&
+				addr.IP != nil && addr.IP.IsLinkLocalUnicast() {
+				newApplied[key] = true
+			}
+		}
+	}
+	if listErr == nil {
 		for i := range list {
 			a := list[i]
 			key := a.IPNet.String()
