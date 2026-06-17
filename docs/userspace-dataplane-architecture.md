@@ -713,4 +713,31 @@ is [`userspace-dataplane-gaps.md`](userspace-dataplane-gaps.md).
   to cpumap/kernel handling.
 - IPsec/XFRM and GRE transit use kernel/pass-through or tunnel-specific
   handling where required.
-- Packets failing forwarding resolution can enter the bounded slow path.
+- Packets failing forwarding resolution can enter the bounded slow path,
+  but ONLY for the slow-path-eligible dispositions: `LocalDelivery`,
+  `NoRoute`, `MissingNeighbor`, and `NextTableUnsupported`
+  (`ForwardingDisposition::is_slow_path_eligible`, the single source of
+  truth shared by the filtered `maybe_reinject_slow_path` wrapper and the
+  trailing chokepoint in `poll_binding_process_descriptor`). `PolicyDenied`,
+  `HAInactive`, and `DiscardRoute` are NOT eligible — reinjecting them
+  would hand the packet to the kernel FIB and silently bypass a zone-policy
+  DENY / HA gate / discard route (#1913). They are dropped (counted by
+  `record_forwarding_disposition`, recycled) instead. The raw
+  `maybe_reinject_slow_path_from_frame` primitive does NOT apply the
+  filter; its two intentional unfiltered callers (the FabricRedirect-Owned
+  fallback in `tx/dispatch/mod.rs` and the ForwardCandidate build-failure
+  fallback in `tx/dispatch/slow_path.rs`) own the eligibility decision.
+  Note that `MissingNeighbor` IS slow-path-eligible, so a denied flow
+  must be converted to `PolicyDenied` BEFORE it reaches the gate: the
+  MissingNeighbor arm has its own policy evaluation (the main
+  deny→PolicyDenied conversion lives only in the ForwardCandidate
+  branch) and converts a deny to `PolicyDenied` — dropping and recycling
+  without seeding a session or buffering for neighbor retry — so a denied
+  unresolved-neighbor cold-path packet is not slow-path-reinjected (#1913).
+  This deny check runs at the TOP of the MissingNeighbor arm — before the
+  negative-cache fast-fail / shared-resolver enqueue AND before the kernel
+  ARP/NDP probe — so a denied flow never induces neighbor-resolution
+  network traffic on the egress interface, never enqueues a resolver
+  probe, and never takes the dead-host fast-fail recycle path (it would
+  otherwise re-probe on every packet, since denied frames are not
+  buffered).

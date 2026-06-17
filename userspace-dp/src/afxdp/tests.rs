@@ -4182,6 +4182,119 @@ fn maybe_reinject_slow_path_ignores_forward_candidate_disposition() {
     assert!(recent_exceptions.lock().expect("exceptions").is_empty());
 }
 
+// #1913: the slow-path eligibility predicate is the single source of
+// truth for which dispositions may be reinjected to the kernel slow
+// path. PolicyDenied / HAInactive / DiscardRoute (and the
+// forward/fabric dispositions) MUST be rejected so a zone-policy DENY is
+// not silently bypassed on the cold path.
+#[test]
+fn slow_path_eligibility_predicate_allow_list() {
+    use ForwardingDisposition::*;
+    // Eligible: terminate locally or defer to the kernel FIB.
+    assert!(LocalDelivery.is_slow_path_eligible());
+    assert!(NoRoute.is_slow_path_eligible());
+    assert!(MissingNeighbor.is_slow_path_eligible());
+    assert!(NextTableUnsupported.is_slow_path_eligible());
+    // NOT eligible: must drop, never reinject.
+    assert!(!PolicyDenied.is_slow_path_eligible());
+    assert!(!HAInactive.is_slow_path_eligible());
+    assert!(!DiscardRoute.is_slow_path_eligible());
+    // Forward/fabric dispositions never reach the generic slow path.
+    assert!(!ForwardCandidate.is_slow_path_eligible());
+    assert!(!FabricRedirect.is_slow_path_eligible());
+}
+
+// #1913: the filtered wrapper must drop (no enqueue, no exception,
+// no drop-counter bump) for every should-drop disposition. Exercises
+// the shared predicate via maybe_reinject_slow_path with a valid frame
+// so the only thing keeping the packet out of the slow path is the
+// disposition filter.
+#[test]
+fn maybe_reinject_slow_path_drops_ineligible_dispositions() {
+    for disposition in [
+        ForwardingDisposition::PolicyDenied,
+        ForwardingDisposition::HAInactive,
+        ForwardingDisposition::DiscardRoute,
+    ] {
+        let frame = build_icmp_echo_frame_v4(
+            Ipv4Addr::new(10, 0, 61, 102),
+            Ipv4Addr::new(1, 1, 1, 1),
+            64,
+        );
+        let mut area = MmapArea::new(4096).expect("mmap");
+        area.slice_mut(0, frame.len())
+            .expect("slice")
+            .copy_from_slice(&frame);
+        let local_tunnel_reinjectors = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+
+        let binding = BindingIdentity {
+            slot: 3,
+            queue_id: 2,
+            worker_id: 1,
+            interface: Arc::<str>::from("ge-0-0-1"),
+            ifindex: 5,
+        };
+        let live = BindingLiveState::new();
+        let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            l4_offset: 34,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            ..UserspaceDpMeta::default()
+        };
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition,
+                local_ifindex: 0,
+                egress_ifindex: 6,
+                tx_ifindex: 6,
+                tunnel_endpoint_id: 0,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))),
+                neighbor_mac: Some([0, 1, 2, 3, 4, 5]),
+                src_mac: Some([6, 7, 8, 9, 10, 11]),
+                tx_vlan_id: 0,
+            },
+            nat: NatDecision::default(),
+        };
+
+        maybe_reinject_slow_path(
+            &binding,
+            &live,
+            None,
+            &local_tunnel_reinjectors,
+            &area,
+            XdpDesc {
+                addr: 0,
+                len: frame.len() as u32,
+                options: 0,
+            },
+            meta,
+            decision,
+            &recent_exceptions,
+            &ForwardingState::default(),
+        );
+
+        assert_eq!(
+            live.slow_path_packets.load(Ordering::Relaxed),
+            0,
+            "{disposition:?} must not be enqueued to the slow path",
+        );
+        assert_eq!(
+            live.slow_path_drops.load(Ordering::Relaxed),
+            0,
+            "{disposition:?} is filtered before any drop accounting",
+        );
+        assert!(
+            recent_exceptions.lock().expect("exceptions").is_empty(),
+            "{disposition:?} filtered cleanly with no exception",
+        );
+    }
+}
+
 #[test]
 fn maybe_reinject_slow_path_records_extract_failure_for_invalid_desc() {
     let area = MmapArea::new(128).expect("mmap");
@@ -5456,11 +5569,22 @@ fn tunnel_gate_keeps_local_tunnel_delivery_open() {
 }
 
 /// #1873 R-E: a tunnel-marked decision whose OUTER next-hop is
-/// unresolved (MissingNeighbor) must NOT be buffered in pending_neigh
-/// — the retry path's in-place rewrite cannot encapsulate, so a
-/// buffered tunnel inner packet would later TX PLAINTEXT. The frame
-/// instead flows to the slow-path chokepoint where the R-C blanket
-/// gate drops + counts it.
+/// unresolved must NOT be buffered in pending_neigh — the retry path's
+/// in-place rewrite cannot encapsulate, so a buffered tunnel inner
+/// packet would later TX PLAINTEXT. The frame is dropped instead.
+///
+/// In this fixture the tunnel endpoint carries no redundancy_group and
+/// the egress RG is unowned, so the HA gate resolves the tunnel-marked
+/// decision to a residual `HAInactive` (rg=0) — the §2.3 corner. Before
+/// #1913 the trailing reinject chokepoint ran UNFILTERED, so this
+/// HAInactive frame fell into `maybe_reinject_slow_path_from_frame` and
+/// was dropped+counted at the R-C tunnel gate
+/// (`tunnel_encap_unresolved_drops`). After #1913 the chokepoint gates
+/// on `is_slow_path_eligible`, so the HAInactive frame is dropped
+/// EARLIER, at the disposition gate (counted as an `ha_inactive`
+/// exception and recycled) and never reaches `_from_frame`. Either way
+/// the frame is DROPPED, NOT buffered, and NOT reinjected to the kernel
+/// FIB — which is the R-E invariant under test.
 #[test]
 fn txn_tunnel_marked_missing_neighbor_not_buffered() {
     let mut snapshot = nat_snapshot();
@@ -5519,26 +5643,42 @@ fn txn_tunnel_marked_missing_neighbor_not_buffered() {
         &frame,
         meta,
     );
-    // First packet: the decision is tunnel-marked ForwardCandidate; the
-    // GRE encap build fails on the unresolved OUTER neighbor and the
-    // dispatch build-failure door funnels into the R-C gate.
+    // First packet: residual HAInactive (rg=0) tunnel-marked frame.
+    // R-E invariant: never buffered for in-place retry.
     assert!(
         binding.pending_neigh.is_empty(),
         "tunnel-marked frame must never be admitted to pending_neigh (#1873 R-E)"
     );
-    let drops_after_first = binding
-        .live
-        .tunnel_encap_unresolved_drops
-        .load(Ordering::Relaxed);
-    assert!(
-        drops_after_first >= 1,
-        "tunnel-marked frame must be dropped+counted at the R-C gate"
+    // #1913: the HAInactive frame is dropped at the disposition gate
+    // (not eligible for slow-path reinjection) and never reaches
+    // `_from_frame`, so it is NOT handed to the kernel FIB. It is
+    // counted as an `ha_inactive` exception by record_forwarding_
+    // disposition and recycled.
+    assert_eq!(
+        binding.live.slow_path_packets.load(Ordering::Relaxed),
+        0,
+        "HAInactive tunnel frame must NOT be reinjected to the kernel slow path (#1913)"
     );
+    assert_eq!(
+        binding
+            .live
+            .tunnel_encap_unresolved_drops
+            .load(Ordering::Relaxed),
+        0,
+        "HAInactive frame is gated before the R-C tunnel gate post-#1913"
+    );
+    let _ = dbg;
 
-    // Second packet: the session now exists, so the per-packet path
-    // re-resolves the stored tunnel id. Whatever door the failure
-    // takes, the frame must never be buffered for in-place retry and
-    // must be counted at the R-C gate.
+    // Second packet: the HAInactive arm never seeds a session, so this
+    // run re-executes the session-miss path (the `sessions` table is
+    // still empty). It re-resolves to the same residual HAInactive
+    // tunnel decision and must again be dropped — never buffered for
+    // in-place retry and never reinjected.
+    assert_eq!(
+        sessions.len(),
+        0,
+        "HAInactive frame must NOT seed a session (second run stays on the miss path)"
+    );
     let meta2 = txn_meta_v4(24, TCP_FLAG_SYN, (frame.len() - 14) as u16);
     let (_batch2, dbg2) = txn_run_descriptor(
         &mut binding,
@@ -5551,15 +5691,143 @@ fn txn_tunnel_marked_missing_neighbor_not_buffered() {
     let _ = dbg2;
     assert!(
         binding.pending_neigh.is_empty(),
-        "tunnel-marked frame must skip pending_neigh admission on the session path too (#1873 R-E)"
+        "tunnel-marked frame must skip pending_neigh admission on the re-run too (#1873 R-E)"
+    );
+    assert_eq!(
+        binding.live.slow_path_packets.load(Ordering::Relaxed),
+        0,
+        "second packet must also NOT be reinjected to the kernel slow path (#1913)"
+    );
+}
+
+/// #1913 (Codex r1): a packet DENIED by zone policy whose forwarding
+/// resolution is `MissingNeighbor` (connected destination, no neighbor
+/// learned yet) must NOT be reinjected to the kernel slow path. The
+/// MissingNeighbor arm has its own policy evaluation that historically
+/// only gated SNAT — a DENY fell through to session install + pending-
+/// neighbor buffer + the trailing reinject chokepoint with the
+/// disposition still `MissingNeighbor` (slow-path-eligible), so a denied
+/// unresolved-neighbor cold-path packet leaked to the kernel FIB. The
+/// fix converts the deny to `PolicyDenied` and drops+recycles it inside
+/// the arm. Asserts: zero reinjects, no session created, not buffered.
+#[test]
+fn txn_policy_denied_missing_neighbor_is_dropped_not_reinjected() {
+    let mut snapshot = policy_deny_snapshot();
+    snapshot.zones = vec![
+        ZoneSnapshot {
+            name: "lan".to_string(),
+            id: TEST_LAN_ZONE_ID,
+        },
+        ZoneSnapshot {
+            name: "wan".to_string(),
+            id: TEST_WAN_ZONE_ID,
+        },
+    ];
+    // No neighbor for 172.16.80.200: the connected WAN route resolves
+    // but ARP is unresolved -> MissingNeighbor (the cold path under test).
+    snapshot.neighbors.clear();
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = BTreeMap::new();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+
+    // src 10.0.61.102 (lan, ingress ifindex 24) -> dst 172.16.80.200
+    // (connected wan). lan->wan is default-deny.
+    let frame = build_policy_deny_tcp_syn_frame();
+    let meta = txn_meta_v4(24, TCP_FLAG_SYN, (frame.len() - 14) as u16);
+    let sessions_before = sessions.len();
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+
+    assert!(
+        dbg.policy_deny >= 1,
+        "denied MissingNeighbor flow must be counted as a policy deny (#1913)"
+    );
+    assert_eq!(
+        binding.live.slow_path_packets.load(Ordering::Relaxed),
+        0,
+        "denied MissingNeighbor flow must NOT be reinjected to the kernel slow path (#1913)"
     );
     assert!(
-        binding
-            .live
-            .tunnel_encap_unresolved_drops
-            .load(Ordering::Relaxed)
-            > drops_after_first,
-        "second packet must also be dropped+counted at the R-C gate"
+        binding.pending_neigh.is_empty(),
+        "denied flow must NOT be buffered for in-place neighbor retry (#1913)"
+    );
+    assert_eq!(
+        sessions.len(),
+        sessions_before,
+        "denied flow must NOT seed a MissingNeighbor session (#1913)"
+    );
+}
+
+/// #1913 (Codex r3): the deny gate must run BEFORE the negative-cache
+/// fast-fail / resolver enqueue at the top of the MissingNeighbor arm.
+/// With the dst's neg-cache key pre-seeded, a denied flow must STILL be
+/// converted to PolicyDenied and counted — not silently recycled by the
+/// neg_neigh_gate fast-fail path (which would skip the deny event/count
+/// and could enqueue a resolver probe for a flow policy says to drop).
+#[test]
+fn txn_policy_denied_missing_neighbor_skips_neg_cache_fast_fail() {
+    let mut snapshot = policy_deny_snapshot();
+    snapshot.zones = vec![
+        ZoneSnapshot {
+            name: "lan".to_string(),
+            id: TEST_LAN_ZONE_ID,
+        },
+        ZoneSnapshot {
+            name: "wan".to_string(),
+            id: TEST_WAN_ZONE_ID,
+        },
+    ];
+    snapshot.neighbors.clear();
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = BTreeMap::new();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    // Pre-seed the negative cache for the connected WAN dst's neg-cache
+    // key (egress reth0.80 ifindex 12, next_hop = the connected dst). If
+    // the deny gate ran AFTER neg_neigh_gate, this packet would fast-fail
+    // and recycle as a dead-host miss with NO policy deny counted.
+    let now_ns = 123_000_000_000u64;
+    binding.neg_neigh_cache.insert(
+        (12, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
+        now_ns,
+    );
+    let mut sessions = SessionTable::new();
+
+    let frame = build_policy_deny_tcp_syn_frame();
+    let meta = txn_meta_v4(24, TCP_FLAG_SYN, (frame.len() - 14) as u16);
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+
+    assert!(
+        dbg.policy_deny >= 1,
+        "denied flow must be counted as a policy deny even with the neg-cache key seeded (#1913 Codex r3)"
+    );
+    assert_eq!(
+        dbg.neg_neigh_fast_fail, 0,
+        "deny gate must run BEFORE the neg-cache fast-fail — a denied flow must not take the dead-host recycle path (#1913 Codex r3)"
+    );
+    assert_eq!(
+        binding.live.slow_path_packets.load(Ordering::Relaxed),
+        0,
+        "denied flow must NOT be reinjected (#1913)"
+    );
+    assert!(
+        binding.pending_neigh.is_empty(),
+        "denied flow must NOT be buffered (#1913)"
     );
 }
 
