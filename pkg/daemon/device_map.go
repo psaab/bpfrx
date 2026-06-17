@@ -29,6 +29,11 @@ import (
 // presentNIC is the daemon-local alias for the shared inventory type.
 type presentNIC = devicemap.PresentNIC
 
+var (
+	enumerateAndRenameMappedFn     = enumerateAndRenameMapped
+	enumerateAndRenameInterfacesFn = enumerateAndRenameInterfaces
+)
+
 // enumeratePresentNICs reads the live host NIC inventory (sysfs + netlink).
 func enumeratePresentNICs() ([]presentNIC, error) {
 	return devicemap.EnumeratePresentNICs()
@@ -62,6 +67,20 @@ func rethMembersFromConfig(cfg *config.Config) map[string]bool {
 // not-yet-promoted read.
 func deviceMapNamingActive(cfg *config.Config) bool {
 	return cfg != nil && cfg.Chassis.DeviceMap.Active()
+}
+
+// applyStartupNamingPolicy owns the ACTUAL startup naming branch used by both
+// normal boot and bootstrap exit. Centralizing it here keeps the decision
+// single-source and lets the regression test pin the real mapped-vs-positional
+// call instead of only the pure predicate. Nil / inactive config falls back to
+// positional naming to preserve the pre-#1956 default.
+func applyStartupNamingPolicy(cfg *config.Config, nodeID int, clusterMode bool,
+	userspaceWorkers int, rssEnabled bool, rssAllowed []string,
+	protected map[string]bool) error {
+	if deviceMapNamingActive(cfg) {
+		return enumerateAndRenameMappedFn(cfg.Chassis.DeviceMap, cfg, protected)
+	}
+	return enumerateAndRenameInterfacesFn(nodeID, clusterMode, userspaceWorkers, rssEnabled, rssAllowed)
 }
 
 // deviceMapOriginalNameFor computes the OriginalName= to record in a mapped

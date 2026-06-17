@@ -345,11 +345,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// #1956: device-map mode (opt-in) renames ONLY mapped NICs by
 			// stable identity and leaves the rest alone. Positional mode
 			// (no device-map) is bit-identical to pre-#1956.
-			if cfg := d.store.ActiveConfig(); deviceMapNamingActive(cfg) {
-				if err := enumerateAndRenameMapped(cfg.Chassis.DeviceMap, cfg, d.resolveProtectedInterfaces()); err != nil {
-					slog.Warn("device-map interface naming failed", "err", err)
-				}
-			} else if err := enumerateAndRenameInterfaces(nodeID, clusterMode, userspaceWorkers, rssEnabled, rssAllowed); err != nil {
+			if err := applyStartupNamingPolicy(d.store.ActiveConfig(), nodeID, clusterMode,
+				userspaceWorkers, rssEnabled, rssAllowed, d.resolveProtectedInterfaces()); err != nil {
+				// Log stays generic: helper already selected device-map vs
+				// positional; callers care only that startup naming failed.
 				slog.Warn("interface naming failed", "err", err)
 			}
 			// #801: host tunables + coalescence. Runs after the interface
@@ -1570,11 +1569,8 @@ func (d *Daemon) runBootstrapExitStartup(cfg *config.Config) {
 	// device-map first appears, so this site must branch too — otherwise
 	// day-0 bare metal claims every NIC positionally before the map ever
 	// applies.
-	if deviceMapNamingActive(cfg) {
-		if err := enumerateAndRenameMapped(cfg.Chassis.DeviceMap, cfg, d.resolveProtectedInterfaces()); err != nil {
-			slog.Warn("bootstrap exit: device-map interface naming failed", "err", err)
-		}
-	} else if err := enumerateAndRenameInterfaces(nodeID, clusterMode, userspaceWorkers, rssEnabled, rssAllowed); err != nil {
+	if err := applyStartupNamingPolicy(cfg, nodeID, clusterMode, userspaceWorkers,
+		rssEnabled, rssAllowed, d.resolveProtectedInterfaces()); err != nil {
 		slog.Warn("bootstrap exit: interface naming failed", "err", err)
 	}
 

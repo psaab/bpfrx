@@ -38,24 +38,45 @@ func commitConfigForStartup(t *testing.T, text string) *config.Config {
 	return cfg
 }
 
+func withStartupNamingStubs(t *testing.T) (mappedCalls, positionalCalls *int) {
+	t.Helper()
+	savedMapped := enumerateAndRenameMappedFn
+	savedPositional := enumerateAndRenameInterfacesFn
+	var mapped, positional int
+	enumerateAndRenameMappedFn = func(*config.DeviceMapConfig, *config.Config, map[string]bool) error {
+		mapped++
+		return nil
+	}
+	enumerateAndRenameInterfacesFn = func(int, bool, int, bool, []string) error {
+		positional++
+		return nil
+	}
+	t.Cleanup(func() {
+		enumerateAndRenameMappedFn = savedMapped
+		enumerateAndRenameInterfacesFn = savedPositional
+	})
+	return &mapped, &positional
+}
+
 // TestDeviceMapNamingActiveStartupDecision is the #1956 regression guard the
 // feature shipped WITHOUT: the original tests exercised enumerateAndRenameMapped
-// in isolation, so a device-map could be silently ignored at boot (the naming
-// branch never selected) and every unit test still passed. This locks in the
-// STARTUP DECISION itself.
+// in isolation, so a device-map could be silently ignored at boot (the startup
+// branch never selected) and every unit test still passed. This now pins the
+// real startup naming helper both boot sites use.
 //
-// It exercises the exact seam both rename sites use (deviceMapNamingActive) over
-// a config produced by the same EnterConfigure→LoadOverride→Commit sequence the
-// boot path runs (bootstrapFromFile) — so it proves end-to-end that:
+// It exercises the exact helper both rename sites use (applyStartupNamingPolicy)
+// over a config produced by the same EnterConfigure→LoadOverride→Commit
+// sequence the boot path runs (bootstrapFromFile) — so it proves end-to-end
+// that:
 //   - a committed/bootstrapped config carrying an active `chassis device-map`
-//     promotes to ActiveConfig() and selects the device-map branch;
+//     promotes to ActiveConfig() and dispatches the device-map branch;
 //   - a config with no device-map selects positional (bit-identical default);
 //   - an empty `device-map {}` block stays positional (R-7);
 //   - a nil config selects positional.
 //
-// A future change that drops or inverts the branch — or breaks synchronous
-// promotion so ActiveConfig() is nil at naming time — fails here, without a
-// live VM.
+// A future change that drops or inverts the ACTUAL branch inside the helper —
+// or breaks synchronous promotion so ActiveConfig() is nil at naming time —
+// fails here, without a live VM.
 func TestDeviceMapNamingActiveStartupDecision(t *testing.T) {
 	const withMap = `
 chassis {
@@ -109,35 +130,51 @@ interfaces {
 
 	t.Run("committed device-map selects device-map branch", func(t *testing.T) {
 		cfg := commitConfigForStartup(t, withMap)
+		mappedCalls, positionalCalls := withStartupNamingStubs(t)
 		if cfg.Chassis.DeviceMap == nil || len(cfg.Chassis.DeviceMap.Entries) == 0 {
 			t.Fatal("committed device-map did not compile into ActiveConfig()")
 		}
-		if !deviceMapNamingActive(cfg) {
-			t.Fatal("startup naming must select the device-map branch for a " +
-				"committed active device-map — the positional path silently " +
-				"ignores the map (#1956 boot bug)")
+		if err := applyStartupNamingPolicy(cfg, 0, false, 0, true, nil, nil); err != nil {
+			t.Fatalf("applyStartupNamingPolicy: %v", err)
+		}
+		if *mappedCalls != 1 || *positionalCalls != 0 {
+			t.Fatalf("startup naming dispatched mapped=%d positional=%d, want mapped=1 positional=0",
+				*mappedCalls, *positionalCalls)
 		}
 	})
 
 	t.Run("no device-map selects positional", func(t *testing.T) {
 		cfg := commitConfigForStartup(t, noMap)
-		if deviceMapNamingActive(cfg) {
-			t.Fatal("no-device-map config must select positional naming " +
-				"(bit-identical to pre-#1956)")
+		mappedCalls, positionalCalls := withStartupNamingStubs(t)
+		if err := applyStartupNamingPolicy(cfg, 0, false, 0, true, nil, nil); err != nil {
+			t.Fatalf("applyStartupNamingPolicy: %v", err)
+		}
+		if *mappedCalls != 0 || *positionalCalls != 1 {
+			t.Fatalf("startup naming dispatched mapped=%d positional=%d, want mapped=0 positional=1",
+				*mappedCalls, *positionalCalls)
 		}
 	})
 
 	t.Run("empty device-map block stays positional", func(t *testing.T) {
 		cfg := commitConfigForStartup(t, emptyMapBlock)
-		if deviceMapNamingActive(cfg) {
-			t.Fatal("an empty `device-map {}` block is positional mode (R-7), " +
-				"not device-map mode")
+		mappedCalls, positionalCalls := withStartupNamingStubs(t)
+		if err := applyStartupNamingPolicy(cfg, 0, false, 0, true, nil, nil); err != nil {
+			t.Fatalf("applyStartupNamingPolicy: %v", err)
+		}
+		if *mappedCalls != 0 || *positionalCalls != 1 {
+			t.Fatalf("startup naming dispatched mapped=%d positional=%d, want mapped=0 positional=1",
+				*mappedCalls, *positionalCalls)
 		}
 	})
 
 	t.Run("nil config selects positional", func(t *testing.T) {
-		if deviceMapNamingActive(nil) {
-			t.Fatal("nil config must select positional naming, never device-map")
+		mappedCalls, positionalCalls := withStartupNamingStubs(t)
+		if err := applyStartupNamingPolicy(nil, 0, false, 0, true, nil, nil); err != nil {
+			t.Fatalf("applyStartupNamingPolicy: %v", err)
+		}
+		if *mappedCalls != 0 || *positionalCalls != 1 {
+			t.Fatalf("startup naming dispatched mapped=%d positional=%d, want mapped=0 positional=1",
+				*mappedCalls, *positionalCalls)
 		}
 	})
 }

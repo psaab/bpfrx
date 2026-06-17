@@ -1,5 +1,17 @@
 # Action Log
 
+## 2026-06-17 — #1956 startup naming helper coverage
+
+- **Timestamp**: 2026-06-17
+- **Action**: Tighten the #1956 startup-decision regression by centralizing the
+  real mapped-vs-positional startup naming branch in
+  `applyStartupNamingPolicy`, routing both boot sites through it, and updating
+  the test to stub the actual rename calls rather than only asserting the pure
+  predicate. This catches branch regression in the helper while preserving
+  behavior.
+- **File(s)**: pkg/daemon/device_map.go, pkg/daemon/daemon_run.go,
+  pkg/daemon/device_map_startup_test.go, _Log.md
+
 ## 2026-06-17 — #1916 review: authorized_keys lockout fix + persistSelfSignedCert comment
 
 - **Timestamp**: 2026-06-17
