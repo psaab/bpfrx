@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/fsatomic"
 	"github.com/psaab/xpf/pkg/logging"
 	"github.com/vishvananda/netlink"
 )
@@ -215,8 +216,9 @@ func (d *Daemon) applyHostname(cfg *config.Config) {
 		return
 	}
 
-	// Persist to /etc/hostname
-	if err := os.WriteFile("/etc/hostname", []byte(cfg.System.HostName+"\n"), 0644); err != nil {
+	// Persist to /etc/hostname (DurableState: node identity must survive
+	// a power cut so the box keeps its configured name across reboot).
+	if err := fsatomic.WriteFileDurable("/etc/hostname", []byte(cfg.System.HostName+"\n"), 0644); err != nil {
 		slog.Warn("failed to write /etc/hostname", "err", err)
 	}
 	slog.Info("hostname set", "hostname", cfg.System.HostName)
@@ -301,7 +303,9 @@ func reconcileManagedFile(path, content string) (bool, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return false, fmt.Errorf("create dir for %s: %w", path, err)
 	}
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+	// AtomicGeneratedConfig: regenerated from active config every apply; a
+	// torn file is unacceptable but a power-cut loss self-heals next apply.
+	if err := fsatomic.WriteFileAtomic(path, []byte(content), 0644); err != nil {
 		return false, fmt.Errorf("write %s: %w", path, err)
 	}
 	return true, nil
@@ -473,7 +477,10 @@ func (d *Daemon) applySSHKnownHosts(cfg *config.Config) {
 		return
 	}
 
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+	// AtomicGeneratedConfig (D2b): regenerated from declarative config and
+	// governs only outbound host-key verification — a torn/lost file
+	// re-renders next apply; no power-loss durability needed.
+	if err := fsatomic.WriteFileAtomic(path, []byte(content), 0644); err != nil {
 		slog.Warn("failed to write ssh known hosts", "err", err)
 		return
 	}
@@ -486,28 +493,55 @@ func (d *Daemon) applyTimezone(cfg *config.Config) {
 		return
 	}
 
-	// Check current timezone
+	// #1916 Step 2b r4 case-split. The /etc/localtime symlink and the
+	// /etc/timezone file are two pieces of the same setting; a prior crash
+	// between the symlink write and the file write could leave them
+	// inconsistent. The old code returned early whenever the symlink alone
+	// matched, so a stale /etc/timezone would never be repaired (AGY r2 #3).
+	// The naive fix (require BOTH to match before skipping, else fall
+	// through) re-ran os.Remove("/etc/localtime")+Symlink even when the
+	// symlink was already correct — a crash after the Remove would break a
+	// correct symlink (Codex r3). So split the cases explicitly: only touch
+	// the symlink when it is wrong; always (re)write /etc/timezone when its
+	// content differs, including when the symlink was already correct.
 	current, _ := os.Readlink("/etc/localtime")
 	target := "/usr/share/zoneinfo/" + cfg.System.TimeZone
-	if current == target {
+
+	tzContent := cfg.System.TimeZone + "\n"
+	tzCurrent, _ := os.ReadFile("/etc/timezone")
+	tzMatches := string(tzCurrent) == tzContent
+
+	// Case 1: both pieces already correct → nothing to do.
+	if current == target && tzMatches {
 		return
 	}
 
-	// Verify timezone file exists
+	// Verify the zoneinfo file exists before mutating anything.
 	if _, err := os.Stat(target); err != nil {
 		slog.Warn("invalid timezone", "timezone", cfg.System.TimeZone, "err", err)
 		return
 	}
 
-	// Set timezone via symlink
-	os.Remove("/etc/localtime")
-	if err := os.Symlink(target, "/etc/localtime"); err != nil {
-		slog.Warn("failed to set timezone", "err", err)
-		return
+	// Case 2: only re-run the symlink mutation when localtime is wrong; do
+	// NOT remove an already-correct symlink (that opens a crash window).
+	if current != target {
+		os.Remove("/etc/localtime")
+		if err := os.Symlink(target, "/etc/localtime"); err != nil {
+			slog.Warn("failed to set timezone", "err", err)
+			return
+		}
 	}
 
-	// Also write /etc/timezone for tools that read it
-	os.WriteFile("/etc/timezone", []byte(cfg.System.TimeZone+"\n"), 0644)
+	// Case 3: always write /etc/timezone (AtomicGeneratedConfig) whenever
+	// its content differs — including the symlink-already-correct branch,
+	// which is how a "timezone-only stale" state gets repaired without
+	// touching the good symlink.
+	if !tzMatches {
+		if err := fsatomic.WriteFileAtomic("/etc/timezone", []byte(tzContent), 0644); err != nil {
+			slog.Warn("failed to write /etc/timezone", "err", err)
+			return
+		}
+	}
 	slog.Info("timezone set", "timezone", cfg.System.TimeZone)
 }
 
@@ -633,7 +667,8 @@ func (d *Daemon) applySyslogFiles(cfg *config.Config) {
 		path := filepath.Join(confDir, name)
 		current, _ := os.ReadFile(path)
 		if string(current) != content {
-			if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+			// AtomicGeneratedConfig: regenerated each apply.
+			if err := fsatomic.WriteFileAtomic(path, []byte(content), 0644); err != nil {
 				slog.Warn("failed to write rsyslog config", "file", name, "err", err)
 				continue
 			}
@@ -704,7 +739,10 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) {
 			sudoLine := fmt.Sprintf("%s ALL=(ALL) NOPASSWD: ALL\n", user.Name)
 			current, _ := os.ReadFile(sudoFile)
 			if string(current) != sudoLine {
-				if err := os.WriteFile(sudoFile, []byte(sudoLine), 0440); err != nil {
+				// DurableState: a torn or lost sudoers file is a
+				// management-access (sudo) hazard, so it must survive a
+				// power cut.
+				if err := fsatomic.WriteFileDurable(sudoFile, []byte(sudoLine), 0440); err != nil {
 					slog.Warn("failed to write sudoers file",
 						"user", user.Name, "err", err)
 				}
@@ -721,12 +759,29 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) {
 			keysFile := sshDir + "/authorized_keys"
 			current, _ := os.ReadFile(keysFile)
 			if string(current) != keysContent {
-				if err := os.WriteFile(keysFile, []byte(keysContent), 0600); err != nil {
+				// DurableState authorized_keys: SSH access must survive a
+				// power cut. WriteFileDurable replaces the inode with a
+				// root-owned temp; without WithOwner a crash before the
+				// post-rename chown would leave root-owned 0600 keys that
+				// sshd refuses (EACCES → lockout, #1916 D7). Resolve the
+				// owner cgo-free from /etc/passwd and chown the temp fd
+				// BEFORE the rename so the file is correctly-owned at
+				// install time. The user was created above, so it resolves.
+				var opts []fsatomic.Option
+				if uid, gid, ok := lookupUIDGID(user.Name); ok {
+					opts = append(opts, fsatomic.WithOwner(uid, gid))
+				} else {
+					slog.Warn("could not resolve uid/gid for authorized_keys owner; relying on dir chown",
+						"user", user.Name)
+				}
+				if err := fsatomic.WriteFileDurable(keysFile, []byte(keysContent), 0600, opts...); err != nil {
 					slog.Warn("failed to write authorized_keys",
 						"user", user.Name, "err", err)
 					continue
 				}
-				// Fix ownership
+				// Fix ownership of the .ssh DIR (created by os.MkdirAll as
+				// root). The authorized_keys FILE is already correctly owned
+				// at rename via WithOwner above. chown -R is idempotent.
 				if out, err := runCommandTimeout("chown", "-R", user.Name+":"+user.Name, sshDir); err != nil {
 					slog.Warn("failed to chown ssh dir",
 						"user", user.Name, "dir", sshDir,
@@ -841,7 +896,11 @@ func (d *Daemon) applySSHConfig(cfg *config.Config) {
 	}
 
 	os.MkdirAll("/etc/ssh/sshd_config.d", 0755)
-	if err := os.WriteFile(confPath, []byte(content), 0644); err != nil {
+	// AtomicGeneratedConfig (D2): regenerated each apply and reloaded
+	// immediately. A power-cut loss reverts PermitRootLogin to the base
+	// image default (prohibit-password) until the next boot apply — that
+	// FAILS SAFE (more restrictive, never more permissive), so no fsync.
+	if err := fsatomic.WriteFileAtomic(confPath, []byte(content), 0644); err != nil {
 		slog.Warn("failed to write sshd config", "err", err)
 		return
 	}
@@ -896,7 +955,10 @@ func (d *Daemon) applyRootAuth(cfg *config.Config) {
 		keysFile := sshDir + "/authorized_keys"
 		current, _ := os.ReadFile(keysFile)
 		if string(current) != keysContent {
-			if err := os.WriteFile(keysFile, []byte(keysContent), 0600); err != nil {
+			// DurableState: root SSH access must survive a power cut.
+			// WithOwner(0,0) is harmless/explicit (root keys are already
+			// uid 0) and keeps the install correctly-owned at rename.
+			if err := fsatomic.WriteFileDurable(keysFile, []byte(keysContent), 0600, fsatomic.WithOwner(0, 0)); err != nil {
 				slog.Warn("failed to write root authorized_keys", "err", err)
 			} else {
 				slog.Info("root SSH keys applied", "keys", len(ra.SSHKeys))

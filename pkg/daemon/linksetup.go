@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/psaab/xpf/pkg/fsatomic"
 	"github.com/vishvananda/netlink"
 )
 
@@ -280,7 +281,9 @@ Name=%s`, originalName, target)
 		return false // unchanged
 	}
 
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+	// AtomicGeneratedConfig: regenerated at daemon start; a torn file is
+	// unacceptable but a power-cut loss is re-derived next boot.
+	if err := fsatomic.WriteFileAtomic(path, []byte(content), 0644); err != nil {
 		slog.Warn("linksetup: failed to write .link file",
 			"path", path, "err", err)
 		return false
@@ -310,7 +313,9 @@ DHCP=yes
 UseDNS=yes
 UseRoutes=yes`
 
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+	// AtomicGeneratedConfig: bootstrap provisioning file, re-created if
+	// missing on next boot.
+	if err := fsatomic.WriteFileAtomic(path, []byte(content), 0644); err != nil {
 		slog.Warn("linksetup: failed to write fxp0 .network file",
 			"path", path, "err", err)
 		return false

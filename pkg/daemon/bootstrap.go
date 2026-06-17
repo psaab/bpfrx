@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/psaab/xpf/pkg/fsatomic"
 	"github.com/vishvananda/netlink"
 )
 
@@ -253,10 +254,14 @@ func writeLifelineRecord(rec lifelineRecord) error {
 func writeLifelineRecordAt(path string, rec lifelineRecord) error {
 	content := fmt.Sprintf("# Managed by xpfd — #1922 management lifeline identity\npci=%s\nmac=%s\n",
 		rec.PCIAddr, rec.MAC)
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	// DurableState: the lifeline identity must survive a power cut (and a
+	// rollback-to-bootstrap) so the daemon can always recover the
+	// management NIC. MkdirAllDurable persists the directory entry itself,
+	// not just the record file's entry within it (#1922).
+	if err := fsatomic.MkdirAllDurable(filepath.Dir(path), 0755); err != nil {
 		return fmt.Errorf("create lifeline record dir: %w", err)
 	}
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+	if err := fsatomic.WriteFileDurable(path, []byte(content), 0644); err != nil {
 		return fmt.Errorf("write lifeline record: %w", err)
 	}
 	return nil
@@ -555,7 +560,10 @@ func writeBootstrapLifelineNetwork(lifeline string) bool {
 	if err == nil && string(existing) == content {
 		return false
 	}
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+	// AtomicGeneratedConfig: a bootstrap .network snapshot regenerated from
+	// the lifeline state; a torn file is unacceptable but a power-cut loss
+	// is re-derived next boot.
+	if err := fsatomic.WriteFileAtomic(path, []byte(content), 0644); err != nil {
 		slog.Warn("bootstrap lifeline: failed to write fxp0 .network", "path", path, "err", err)
 		return false
 	}
