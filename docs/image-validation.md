@@ -112,10 +112,11 @@ endpoint needs no route back.
 NIC order = interface name (positional contract). Names are shown in
 config/CLI slash form (`ge-0/0/0`); the Linux link name is the dash form
 (`ge-0-0-0`) that `assignName()` produces — the config layer translates
-between them. NOTE (per the venue warning above): on incus/virtio the
-AF_XDP dataplane does NOT converge its multi-queue bindings, so this
-topology validates control-plane + day-0 + interface bring-up, NOT
-transit forwarding. Run the forwarding assertions on mlx5-VF / i40e-PF.
+between them. NOTE (per the venue note above, #1921 resolved): incus/virtio
+multi-queue AF_XDP now converges and forwards, so this topology validates
+transit forwarding as well as control-plane + day-0 + interface bring-up.
+A virtio bind loop / 0-session transit here is a #1921 regression, not a
+venue limitation; mlx5-VF / i40e-PF remain the line-rate venues.
 
 ### Host networks
 
@@ -272,15 +273,19 @@ Delete `fw0`/`fw1` and the five `xpf-ha-*` networks.
 
 ## Honest scope
 
-- **virtio is NOT a forwarding venue.** On local incus/virtio bridges the
-  AF_XDP dataplane fails to bind virtio multi-queue (`Device or resource
-  busy`, verified 2026-06-15), so Tiers 2–3 on virtio validate only boot +
-  day-0 + interface bring-up + control-plane reachability — NOT transit
-  forwarding/NAT/HA. Functional forwarding (and line-rate numbers) require
-  a real AF_XDP NIC: the loss userspace cluster's mlx5 SR-IOV VFs, or i40e
-  PF passthrough on the standalone test VM. The loss SR-IOV smoke matrix
-  (`docs/`) tests the *deployed binaries*; an image-based forwarding test
-  needs the image booted on one of those NIC venues.
+- **virtio IS a forwarding venue (since #1921 fixed, 2026-06-17).** On local
+  incus/virtio bridges the AF_XDP dataplane now binds virtio multi-queue and
+  forwards transit traffic; the earlier `Device or resource busy` bind loop /
+  0-session transit (observed 2026-06-15) was the #1921 bug, fixed in #1927
+  (rebind double-stop + physical+unit double-bind) and #1929 (standalone
+  phantom-HA-group transit gate). So Tiers 2–3 on virtio validate boot +
+  day-0 + interface bring-up + control-plane reachability AND transit
+  forwarding/NAT/HA. *Line-rate* numbers still require a real AF_XDP NIC —
+  the loss userspace cluster's mlx5 SR-IOV VFs, or i40e PF passthrough on the
+  standalone test VM — because virtio caps below line rate; but functional
+  forwarding correctness is now testable on virtio. The loss SR-IOV smoke
+  matrix (`docs/`) tests the *deployed binaries*; an image-based forwarding
+  test can run on virtio for correctness and on a NIC venue for throughput.
 - The image is hardware-agnostic for these tiers: `verify-dataplane`
   and forwarding run against the image's own kernel + the userspace
   dataplane, so local KVM is a faithful functional venue.
