@@ -248,18 +248,25 @@ def virt_customize(work_qcow, xpf_deb):
         # `apt-mark hold linux-*` MUST NOT be a bare glob: apt-mark does not
         # expand wildcards, and the shell would expand `linux-*` against the cwd
         # (holding nothing). Enumerate the installed kernel package set via
-        # dpkg-query instead. HARD-ASSERT at least the meta + image are held so a
-        # silent hold failure cannot ship an unprotected image.
+        # dpkg-query instead. `set -e` makes an apt-mark failure fatal, and we
+        # then VERIFY every enumerated package is actually in `apt-mark showhold`
+        # (per-package, not a count) so neither a partial hold nor a pre-existing
+        # unrelated hold can ship an unprotected image.
         "--run-command",
-        'export DEBIAN_FRONTEND=noninteractive; '
+        'set -e; export DEBIAN_FRONTEND=noninteractive; '
         'pkgs=$(dpkg-query -W -f="${Package}\\n" "linux-image-*" "linux-headers-*" '
         '"linux-modules-*" "linux-generic" 2>/dev/null | sort -u); '
         '[ -n "$pkgs" ] || { echo "FATAL: no linux-* packages found to hold" >&2; exit 1; }; '
-        'apt-mark hold $pkgs >/dev/null; '
-        'held=$(apt-mark showhold | grep -c "^linux-"); '
-        '[ "$held" -ge 2 ] || '
-        '{ echo "FATAL: kernel hold did not take ($held linux-* held: $(apt-mark showhold | tr "\\n" " "))" >&2; exit 1; }; '
-        'echo "#1930: held $held linux-* packages"',
+        # apt-mark hold failure is fatal (set -e + no output swallow); then
+        # verify EACH enumerated package is actually in showhold, so a
+        # pre-existing unrelated hold cannot mask a partial/failed hold.
+        'apt-mark hold $pkgs; '
+        'hold_set=$(apt-mark showhold); '
+        'for p in $pkgs; do '
+        'printf "%s\\n" "$hold_set" | grep -qxF "$p" || '
+        '{ echo "FATAL: $p not held after apt-mark hold (held: $(printf %s "$hold_set" | tr "\\n" " "))" >&2; exit 1; }; '
+        'done; '
+        'echo "#1930: held $(printf %s "$pkgs" | wc -w) linux-* packages: $(printf %s "$pkgs" | tr "\\n" " ")"',
         # Exclude linux-* from unattended-upgrades too: a hold protects an
         # interactive `apt upgrade`, but unattended-upgrades can be configured to
         # bypass holds for security. Kernel CVEs flow through the verify-gated
@@ -295,17 +302,13 @@ def virt_customize(work_qcow, xpf_deb):
         "--run-command", "export DEBIAN_FRONTEND=noninteractive && "
                          f"apt-get install -y -qq -o Acquire::Retries=5 /var/tmp/{deb_name} && "
                          f"rm -f /var/tmp/{deb_name}",
-        # #1930 INC-0: keep needrestart from auto-restarting xpfd mid-apt. On a
-        # base with needrestart installed, the end-of-transaction scan restarts
-        # processes running deleted binaries — which would cut the dataplane
-        # during a kernel install in the LANE-1 channel. Blacklist xpfd + the
-        # runtime version dirs (harmless no-op if needrestart is absent).
-        "--write",
-        "/etc/needrestart/conf.d/99-xpf.conf:"
-        "# xpf (#1930): never auto-restart the dataplane during an apt run.\n"
-        '$nrconf{override_rc} = { qr(^xpfd\\.service$) => 0 };\n'
-        "push @{$nrconf{blacklist}}, "
-        "qr(^/var/lib/xpf/versions/), qr(^/usr/local/share/xpf/staged/);\n",
+        # #1930 INC-0: the needrestart blacklist for xpfd is ALREADY shipped by
+        # the package (debian/xpf.needrestart -> /etc/needrestart/conf.d/xpf.conf,
+        # installed by the .deb above) using the correct APPEND form
+        # ($nrconf{override_rc}{qr(...)} = 0), which preserves needrestart's
+        # default override_rc set. We do NOT add a second bake-written file: a
+        # whole-hash assignment would wipe those defaults, and writing into
+        # /etc/needrestart/conf.d before the .deb creates it would fail the bake.
         "--write", f"/etc/default/grub.d/99-xpf.cfg:{GRUB_DROPIN}",
         "--run-command", "update-grub",
         "--write", f"/etc/ssh/sshd_config.d/10-xpf-factory.conf:{SSHD_DROPIN}",
