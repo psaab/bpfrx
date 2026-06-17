@@ -100,3 +100,30 @@ Codex (6) + AGY (5) converged REQUEST-CHANGES. All resolved:
 Gate after fixes: shellcheck clean, py compile clean, **selftest 15/15** (added
 Valid-Until + publish-fail-closed regression cases). Verdict: **APPROVE**
 (pending Codex + AGY re-review + Copilot).
+
+---
+
+## r3–r7 — iterated hardening (Codex + AGY + Copilot)
+
+Both Codex and AGY drove multiple REQUEST-CHANGES rounds; every finding fixed:
+
+- r3 (Codex): orphan sweep must walk recursively (publish uploads the tree);
+  gate_apt must fail-closed on dpkg-deb extraction failure. FIXED.
+- r3 (AGY): gate_latest + gate_images manifest-parse TOCTOU → new
+  verify_and_read/verify_manifest_map (copy→0700→verify→return bytes);
+  multi-suite apt gate (every suite under dists/ must verify); reject `\` in
+  basenames. FIXED. AGY APPROVE at r3-followup.
+- r4 (Codex): --no-apt would upload dist/apt ungated → refuse --no-apt when
+  dist/apt exists; reject symlinks under the image publish root. FIXED. AGY
+  APPROVE at r4.
+- r5 (Codex): symlinks under dist/apt also dereferenceable → gate_apt rejects
+  them too. FIXED. AGY APPROVE at r5.
+- Copilot: docs claimed a fetch watermark that wasn't implemented → implemented
+  the monotonic anti-rollback watermark in cmd_fetch (refuse older,
+  --allow-rollback override, advance-after-verify, best-effort). FIXED + tested
+  live.
+
+Final gate: go build clean, shellcheck clean, py compile clean, selftest 17/17
+(sign/verify, 4 tamper vectors, per-file, flat signed repo + InRelease verify +
+tamper-fail + Valid-Until, publish fail-closed on unsigned/orphan/symlink,
+install.sh dry-run). SMR verdict: APPROVE.
