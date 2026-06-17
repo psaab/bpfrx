@@ -240,6 +240,18 @@ def gate_apt(dist, channel):
     apt/ tree is uploaded (rsync/s3 sync), so EVERY suite present under
     dists/ — not just the target `channel` — must carry a verifying
     InRelease (AGY-r3-F2). The target channel must exist."""
+    apt_root = os.path.join(dist, "apt")
+    # Reject symlinks anywhere under apt/ (Codex-r5): the apt tree is uploaded
+    # as part of the dist root, and a dereferencing backend could follow a
+    # symlink to publish unverified bytes — the same class as the image-sweep
+    # symlink rejection, through the apt subtree.
+    if os.path.isdir(apt_root):
+        for root, dirs, files in os.walk(apt_root):
+            for nm in list(dirs) + files:
+                if os.path.islink(os.path.join(root, nm)):
+                    rel = os.path.relpath(os.path.join(root, nm), dist)
+                    die(f"symlink in the apt publish set: {rel} — refusing "
+                        "(a dereferencing backend could upload unverified bytes).")
     distsdir = os.path.join(dist, "apt", "dists")
     target = os.path.join(distsdir, channel, "InRelease")
     if not os.path.isfile(target):
