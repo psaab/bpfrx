@@ -123,6 +123,19 @@ commit never silently skips the password.
 
 The password path is a `chpasswd` **process** invocation (which performs
 its own `lckpwdf`-protected shadow update), not a direct file write, so
-the #1916 fsatomic file-write wrapper does not apply to it. The sudoers
-and `authorized_keys` writes in the same apply function are ordinary
-file writes and are unchanged.
+the #1916 fsatomic file-write wrapper does not apply to it.
+
+The sudoers drop-in and `authorized_keys` writes in the same apply
+function ARE direct file writes and were migrated to **DurableState** in
+#1916 (`fsatomic.WriteFileDurable`): a torn sudoers file is a
+management-access hazard, and SSH keys must survive a power cut. The
+`authorized_keys` writes additionally use `fsatomic.WithOwner(uid, gid)`
+(owner resolved cgo-free via `lookupUIDGID`) so the file is installed
+already-correctly-owned — a plain durable write would replace the inode
+with a root-owned temp, and a crash before the post-rename `chown` would
+leave root-owned `0600` keys that sshd refuses (EACCES → lockout). If the
+owner cannot be resolved the write is SKIPPED (retried next apply) rather
+than degrading to that unsafe root-owned path. The enclosing `.ssh`
+directory is created with `fsatomic.MkdirAllDurable` so the directory
+entry itself also survives a power cut. The provisioned-users marker
+(`markProvisioned`) is likewise DurableState.

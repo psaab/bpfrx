@@ -753,7 +753,15 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) {
 		if len(user.SSHKeys) > 0 {
 			homeDir := fmt.Sprintf("/home/%s", user.Name)
 			sshDir := homeDir + "/.ssh"
-			os.MkdirAll(sshDir, 0700)
+			// MkdirAllDurable (not plain MkdirAll): authorized_keys is a
+			// DurableState file written into this dir; WriteFileDurable
+			// persists the file's entry in .ssh, not .ssh's own entry in
+			// its parent, so a power cut could otherwise drop the
+			// just-created .ssh directory (Codex r1, fsatomic README).
+			if err := fsatomic.MkdirAllDurable(sshDir, 0700); err != nil {
+				slog.Warn("failed to create .ssh dir", "user", user.Name, "dir", sshDir, "err", err)
+				continue
+			}
 
 			keysContent := strings.Join(user.SSHKeys, "\n") + "\n"
 			keysFile := sshDir + "/authorized_keys"
@@ -767,21 +775,25 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) {
 				// owner cgo-free from /etc/passwd and chown the temp fd
 				// BEFORE the rename so the file is correctly-owned at
 				// install time. The user was created above, so it resolves.
-				var opts []fsatomic.Option
-				if uid, gid, ok := lookupUIDGID(user.Name); ok {
-					opts = append(opts, fsatomic.WithOwner(uid, gid))
-				} else {
-					slog.Warn("could not resolve uid/gid for authorized_keys owner; relying on dir chown",
+				//
+				// If the owner cannot be resolved we must NOT degrade to a
+				// root-owned durable write + post-rename chown — that is the
+				// exact crash window WithOwner exists to close (Codex r1
+				// HIGH). Abort the write instead and retry next apply.
+				uid, gid, ok := lookupUIDGID(user.Name)
+				if !ok {
+					slog.Warn("could not resolve uid/gid for authorized_keys owner; skipping write to avoid a root-owned-keys lockout window",
 						"user", user.Name)
+					continue
 				}
-				if err := fsatomic.WriteFileDurable(keysFile, []byte(keysContent), 0600, opts...); err != nil {
+				if err := fsatomic.WriteFileDurable(keysFile, []byte(keysContent), 0600, fsatomic.WithOwner(uid, gid)); err != nil {
 					slog.Warn("failed to write authorized_keys",
 						"user", user.Name, "err", err)
 					continue
 				}
-				// Fix ownership of the .ssh DIR (created by os.MkdirAll as
-				// root). The authorized_keys FILE is already correctly owned
-				// at rename via WithOwner above. chown -R is idempotent.
+				// Fix ownership of the .ssh DIR (created above as root). The
+				// authorized_keys FILE is already correctly owned at rename
+				// via WithOwner above. chown -R is idempotent.
 				if out, err := runCommandTimeout("chown", "-R", user.Name+":"+user.Name, sshDir); err != nil {
 					slog.Warn("failed to chown ssh dir",
 						"user", user.Name, "dir", sshDir,
@@ -950,7 +962,13 @@ func (d *Daemon) applyRootAuth(cfg *config.Config) {
 	// Write SSH authorized_keys for root
 	if len(ra.SSHKeys) > 0 {
 		sshDir := "/root/.ssh"
-		os.MkdirAll(sshDir, 0700)
+		// MkdirAllDurable: root authorized_keys is DurableState written into
+		// this dir, so the dir's own entry must survive a power cut too
+		// (Codex r1).
+		if err := fsatomic.MkdirAllDurable(sshDir, 0700); err != nil {
+			slog.Warn("failed to create /root/.ssh dir", "err", err)
+			return
+		}
 		keysContent := strings.Join(ra.SSHKeys, "\n") + "\n"
 		keysFile := sshDir + "/authorized_keys"
 		current, _ := os.ReadFile(keysFile)

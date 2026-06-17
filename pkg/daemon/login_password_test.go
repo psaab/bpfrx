@@ -288,3 +288,39 @@ func TestLookupUID(t *testing.T) {
 		t.Error("lookupUID(bad) ok = true, want false (unparseable uid)")
 	}
 }
+
+// TestLookupUIDGID exercises the /etc/passwd UID+GID parse (field 2 uid,
+// field 3 gid), including a distinct uid/gid pair, an unparseable gid, and
+// an absent user.
+func TestLookupUIDGID(t *testing.T) {
+	dir := t.TempDir()
+	passwd := filepath.Join(dir, "passwd")
+	// Distinct uid (1001) and gid (2002) so a uid/gid field swap is caught.
+	content := "root:x:0:0:root:/root:/bin/bash\n" +
+		"op:x:1001:2002:,,,:/home/op:/bin/bash\n" +
+		"baduid:x:notanumber:1002::/home/b:/bin/bash\n" +
+		"badgid:x:1003:notanumber::/home/b:/bin/bash\n"
+	if err := os.WriteFile(passwd, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := passwdPath
+	passwdPath = passwd
+	t.Cleanup(func() { passwdPath = old })
+
+	uid, gid, ok := lookupUIDGID("op")
+	if !ok || uid != 1001 || gid != 2002 {
+		t.Errorf("lookupUIDGID(op) = %d,%d,%v, want 1001,2002,true", uid, gid, ok)
+	}
+	if u, g, ok := lookupUIDGID("root"); !ok || u != 0 || g != 0 {
+		t.Errorf("lookupUIDGID(root) = %d,%d,%v, want 0,0,true", u, g, ok)
+	}
+	if _, _, ok := lookupUIDGID("absent"); ok {
+		t.Error("lookupUIDGID(absent) ok = true, want false")
+	}
+	if _, _, ok := lookupUIDGID("baduid"); ok {
+		t.Error("lookupUIDGID(baduid) ok = true, want false (unparseable uid)")
+	}
+	if _, _, ok := lookupUIDGID("badgid"); ok {
+		t.Error("lookupUIDGID(badgid) ok = true, want false (unparseable gid)")
+	}
+}
