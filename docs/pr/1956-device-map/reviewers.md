@@ -28,3 +28,15 @@
 |----------|-------------------|---------|
 | AGY adversarial | adversarial-review-mqieathe-sf3cjh | (pending) |
 | Codex hostile | (background agent, session pending) | (pending) |
+
+### R2 verdicts + dispositions
+- AGY r2 (adversarial-review-mqieathe-sf3cjh): NEEDS-MAJOR -> after fixes its own re-check said MERGE-READY. 1 CRITICAL: unmapped-mgmt lockout (teardown). Fixed: teardown + scrub skip protected; commit f-block. Detail: agy-impl-r2.md. (AGY wrote a fix into the worktree; reverted per policy and re-implemented with the Codex-r2 cases AGY missed.)
+- Codex r2 (session 019ed6cf-d272-7ab0-98b3-fb1009844961): NEEDS-MAJOR. HIGH-A legit-mgmt-remap false reject (Case A rewrite); HIGH-B same-PCI ambiguity bypass under mac key (order-independent pre-check); HIGH-C cross-key same-NIC last-wins (resolver post-pass refuse). All fixed.
+- Copilot SWE-agent autonomously pushed 24ec36525 (deriveKernelName fallback for OriginalName= on a fresh box with no prior .link) — a genuine improvement; integrated via rebase.
+
+## Round 3 (re-review after r2 fixes)
+
+| Reviewer | Task / session id | Verdict |
+|----------|-------------------|---------|
+| AGY adversarial | (pending) | (pending) |
+| Codex hostile | (pending) | (pending) |
