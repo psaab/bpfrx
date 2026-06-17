@@ -84,15 +84,25 @@ drop + counter for a disposition whose reinjection would be a wrong-path
 hazard. Option B mirrors it: a `fabric_redirect_no_binding_drops`
 counter + a `record_exception("fabric_redirect_no_binding")`.
 
-**(e) Why is the Owned branch even reachable here?** `Owned` vs `Live`
-is decided upstream (`poll_descriptor/mod.rs` and `flow_cache_hit.rs`:
-`...map(PendingForwardFrame::Owned).unwrap_or(PendingForwardFrame::Live)`)
-purely by whether the worker had to copy the frame out of UMEM (e.g.
-the ingress slice had to be retained / shared-UMEM constraints), NOT by
-any forwarding-semantic difference. There is **no semantic reason** the
-two frame kinds should differ for the fabric-no-binding fallback — they
-are the same packet, differing only in storage. That is precisely why the
-asymmetry is a bug and symmetry is required regardless of A vs B.
+**(e) Why is the Owned branch even reachable here, and what does it
+mean?** `Owned` vs `Live` is decided upstream
+(`poll_descriptor/mod.rs:521-524` and `:2078-2081`,
+`flow_cache_hit.rs:366-367`:
+`owned_packet_frame.take().map(PendingForwardFrame::Owned).unwrap_or(PendingForwardFrame::Live)`).
+`owned_packet_frame` is the output of `stage_native_gre_decap`
+(`poll_descriptor/mod.rs:164`) — it is `Some` **only when the worker
+GRE-decapped the frame into a fresh buffer**; otherwise the raw in-UMEM
+desc frame (`Live`) is used. So the two kinds are NOT a benign
+storage detail — `Owned` is specifically a *decapped copy whose meta may
+diverge from the on-wire bytes*, which is exactly the un-decapped /
+different-frame hazard the issue flags (#1902 class). This makes the
+current asymmetry doubly wrong: Option A would reinject a **decapped**
+inner frame on the Owned branch vs the raw outer frame on the Live
+branch — divergent, both wrong for a fabric cross-chassis L2 redirect.
+Option B touches **neither** frame (drop + count using `desc.len`/`meta`
+for bookkeeping only), sidestepping the decap/meta-pairing hazard
+entirely. The asymmetry is a bug regardless; the safe symmetric value is
+"drop."
 
 ### Why not Option A?
 
@@ -122,13 +132,37 @@ In scope:
   `if Owned { reinject } else { reinject-filtered }` block with a single
   symmetric **drop + count + record_exception** for the
   FabricRedirect-no-binding fallback (both frame kinds identical).
+- **(Codex r1 HIGH)** `handle_forward_build_failure`
+  (`tx/dispatch/slow_path.rs:25`): the SECOND FabricRedirect → kernel-FIB
+  bypass. When the fabric parent binding EXISTS but the forward-frame
+  build / enqueue fails (`build_failed = true; fallback_to_slow_path =
+  true` at mod.rs:575/843/856; or the local-enqueue err at :555), the
+  build-failure handler calls `maybe_reinject_slow_path_from_frame`
+  (raw, no gate) with `request.decision` whose disposition is
+  FabricRedirect → reinjected to the local kernel FIB. FabricRedirect
+  reaches this because it has a valid `target_binding` (the fabric
+  parent) and flows through `build_forwarded_frame_from_frame`. Fix:
+  gate FabricRedirect inside `handle_forward_build_failure` BEFORE the
+  reinject — drop + bump the SAME `fabric_redirect_no_binding_drops`
+  counter (rename concept to "fabric_redirect_no_tx" / keep one counter;
+  see §4) + record_exception. This makes BOTH FabricRedirect slow-path
+  bypass paths (no-binding AND build-failure) fail-closed. ForwardCandidate
+  build failure stays an intentional reinject (it IS a kernel-servable
+  route).
 - A new per-binding counter `fabric_redirect_no_binding_drops`
   (`AtomicU64`) following the `tunnel_encap_unresolved_drops` precedent,
   plumbed snapshot → worker rollup → protocol JSON → Go struct.
 - Update the `maybe_reinject_slow_path_from_frame` doc comment
-  (`slow_path.rs:138-145`) — after this change there is **one** remaining
-  intentional unfiltered caller (the ForwardCandidate build-failure
-  fallback). Remove the FabricRedirect-Owned bullet.
+  (`slow_path.rs:138-145`) — after BOTH fixes there is **one** remaining
+  intentional unfiltered caller: the ForwardCandidate build-failure
+  fallback. Remove the FabricRedirect-Owned bullet. **(Codex r1 HIGH-2)**
+  The doc claim is only true if `handle_forward_build_failure` actually
+  gates FabricRedirect (above) — otherwise the comment would document an
+  invariant the code does not enforce. The gate makes the "one remaining
+  caller is ForwardCandidate" claim TRUE by construction. To make it
+  enforced (not just documented), the gate is an explicit
+  `if disposition == FabricRedirect { drop+count; return; }` at the top
+  of the reinject section in `handle_forward_build_failure`.
 - Update the `is_slow_path_eligible` doc (`types/forwarding.rs:322-328`)
   to drop the "FabricRedirect-Owned fallback ... bypass this predicate"
   clause.
@@ -171,26 +205,49 @@ vs `ingress_live` does not conflict with the subsequent
 `recycle_ingress_frame(ingress_binding, ...)` — `ingress_live` is a
 separate `&BindingLiveState` ref already in scope at the call sites.)
 
-Counter plumbing (mirror `tunnel_encap_unresolved_drops`):
-- `umem/mod.rs`: add field + zero-init in the constructor.
-- `umem/snapshot.rs`: load into the snapshot struct.
-- `worker/mod.rs`: add `fabric_redirect_no_binding_drops: u64` rollup.
-- `coordinator/refresh_bindings.rs` + `reconcile/reset.rs`: copy / zero
-  on refresh and reset (match the existing two sites).
-- `protocol/binding.rs`: serde field.
-- `pkg/dataplane/userspace/protocol.go`: Go struct field
-  `FabricRedirectNoBindingDrops uint64`.
+**Counter (single counter for BOTH paths).** Name it
+`fabric_redirect_unsendable_drops` (covers no-binding AND build-failure —
+"fabric redirect could not be TX'd to the peer, dropped fail-closed").
+Both the no-binding block AND the `handle_forward_build_failure`
+FabricRedirect gate bump this one counter (distinct
+`record_exception` reasons: `"fabric_redirect_no_binding"` and
+`"fabric_redirect_build_failed"` for observability of which path fired).
+
+Plumbing — mirror `tunnel_encap_unresolved_drops` EXACTLY (it lives ONLY
+on `BindingStatus`, NOT on `BindingCountersSnapshot` — confirmed
+`protocol/binding.rs:457` is BindingStatus-only; **(Codex r1 MEDIUM-2)**
+resolved: BindingStatus-only, do not add to the lean snapshot):
+- `umem/mod.rs:382` region: add `AtomicU64` field; `:736` ctor zero-init.
+- `umem/snapshot.rs:110` region: load into snapshot.
+- `worker/mod.rs:1272` region: add `u64` rollup field.
+- `coordinator/refresh_bindings.rs:128,302`: copy on refresh + zero.
+- `coordinator/reconcile/reset.rs:58`: zero on reset.
+- `protocol/binding.rs:457` region: serde `#[serde(rename, default)]`.
+- `pkg/dataplane/userspace/protocol.go:1404` region: Go field
+  `FabricRedirectUnsendableDrops uint64` with matching json tag.
+- **(AGY r1 CRITICAL)** Regenerate the checked-in wire specimen
+  `userspace-dp/tests/fixtures/protocol_wire_v1.json` — adding a
+  `BindingStatus` field makes `wire_invariant_default_specimens`
+  (`protocol/tests.rs:1083`) fail until the fixture is regenerated via
+  `XPF_PROTOCOL_WIRE_REGEN=1 cargo test --bin xpf-userspace-dp
+  wire_invariant_default_specimens`, then review the diff (it should add
+  exactly the one new `"fabric_redirect_unsendable_drops": 0` line) and
+  commit it. MUST be in the same commit as the serde field.
 
 ## 5. Risks / edge cases
 
-- **Behavior change for the Owned branch:** previously Owned fabric
-  fallback frames were reinjected (routed locally, possibly delivered).
-  After this change they are dropped+counted. This is the intended fix
-  (the reinject was the bug). The path is a rare safety net; functionally
-  the peer would not have received the redirect anyway (local kernel
-  routing during a bind-not-ready window is the wrong destination). No
-  production traffic should depend on it. Counter makes the (rare) event
-  observable.
+- **Behavior change (fail-closed):** previously Owned no-binding +ANY
+  build-failure FabricRedirect frames were reinjected (routed via the
+  LOCAL kernel FIB). After this change they are dropped + counted —
+  **fail-closed**. **(Codex r1 LOW)** A binding outage / build failure
+  can drop packets the current bug might occasionally "salvage" IF the
+  local kernel happened to route them to the right place. That salvage is
+  unsound (local routing during a fabric-parent outage / on the standby
+  is the wrong path — exactly the asymmetric-routing hazard the fabric
+  mechanism exists to avoid, and on an HAInactive→FabricRedirect frame it
+  is a wrong-node plaintext send). Fail-closed + counted is the correct
+  posture; the counter makes the rare event observable. We do NOT claim
+  "no traffic ever depended on it" — we assert the dependency was unsound.
 - **Borrow checker:** ensure the new counter bump + record_exception +
   recycle compile (the prior code already called record_exception on the
   non-fabric no-binding path right below, so the refs are available).
@@ -200,20 +257,28 @@ Counter plumbing (mirror `tunnel_encap_unresolved_drops`):
 
 ## 6. Test plan
 
-- New Rust unit test `fabric_redirect_no_binding_drops_both_frame_kinds`
-  (in `afxdp/tests.rs`): drive the dispatch fallback with a
-  FabricRedirect decision and no target binding, once with
-  `PendingForwardFrame::Owned` and once with `PendingForwardFrame::Live`;
-  assert (a) `fabric_redirect_no_binding_drops == 1` each, (b) no
-  slow-path enqueue / no `slow_path_accept`, (c) frame recycled. If the
-  full dispatch loop is hard to drive in a unit test, assert the
-  invariant at the helper level: confirm `is_slow_path_eligible(
-  FabricRedirect) == false` (already true) AND that the new symmetric
-  block does not call either reinject helper (structural test / or a
-  focused harness around the fallback block if one exists).
-- `cargo build`, `cargo test --release`, 5× flake on the new test.
-- `go test ./pkg/dataplane/userspace/` (protocol struct parses the new
-  field).
+- **Test 1 (build-failure gate — Codex r1 HIGH):**
+  `handle_forward_build_failure` with a FabricRedirect `SessionDecision`
+  + `fallback_to_slow_path = true` + a stub `slow_path` reinjector MUST
+  NOT enqueue (assert `slow_path.enqueue` not called / accept count 0)
+  and MUST bump `fabric_redirect_unsendable_drops`. Contrast with a
+  ForwardCandidate decision which MUST still reinject (regression guard
+  that the gate is FabricRedirect-only). `handle_forward_build_failure`
+  is directly callable (`pub(in crate::afxdp)`), so this is a focused
+  unit test.
+- **Test 2 (no-binding symmetry):** assert both frame kinds (`Owned` +
+  `Live`) drop+count identically on the no-binding fallback. If the full
+  dispatch loop is hard to drive, assert at the invariant level:
+  `is_slow_path_eligible(FabricRedirect) == false` AND that the new
+  symmetric no-binding block bumps the counter for both kinds without
+  calling either reinject helper.
+- **Wire test (Codex r1 MEDIUM-2):** a Rust serde round-trip test (or
+  reuse the existing BindingStatus serde test) confirming
+  `fabric_redirect_unsendable_drops` serializes/deserializes; the Go
+  `go test ./pkg/dataplane/userspace/` confirms the Go
+  `BindingStatus`-equivalent struct parses the new json field (default 0
+  when absent — mixed-version tolerance).
+- `cargo build`, `cargo test --release`, 5× flake on the new tests.
 
 ## 7. Rollback
 
@@ -253,6 +318,39 @@ NOT correct-by-design: the Owned/Live split is a storage detail
 
 | Round | Reviewer | Verdict | Task id |
 |-------|----------|---------|---------|
-| r1 | Claude SMR | (pending) | — |
-| r1 | Codex | (pending) | — |
-| r1 | AGY | (pending) | — |
+| r1 | Claude SMR | PLAN-READY | (in-conversation) |
+| r1 | Codex | PLAN-NEEDS-WORK → addressed | task-mqi86st4-5n620c |
+| r1 | AGY | PLAN-NEEDS-WORK → addressed | adversarial-review-mqi87f3t-vf66ct |
+| r2 | Codex | (pending re-review) | — |
+| r2 | AGY | (pending re-review) | — |
+
+### AGY r1 findings → disposition
+
+- CRITICAL (wire specimen fixture omission breaks
+  `wire_invariant_default_specimens`): **ACCEPTED** — added the
+  `XPF_PROTOCOL_WIRE_REGEN=1` regen + commit step to §4. Confirmed the
+  fixture `userspace-dp/tests/fixtures/protocol_wire_v1.json` already
+  carries `tunnel_encap_unresolved_drops`, so the new field needs the
+  same treatment.
+- HIGH (build-failure → wrong-path reinject): **ACCEPTED** — same as
+  Codex r1 HIGH; gated in `handle_forward_build_failure` (§3/§4).
+- (Owned/Live, borrow validation): AGY concurred no borrow hazard.
+
+### Codex r1 findings → disposition
+
+- HIGH (build-failure FabricRedirect raw-reinject): **ACCEPTED** —
+  expanded scope (§3, §4) to gate FabricRedirect in
+  `handle_forward_build_failure`; one shared counter, both paths
+  fail-closed. Test 1 added.
+- HIGH-2 (doc claim false unless build-failure gated): **ACCEPTED** —
+  the gate makes "one remaining ForwardCandidate caller" true by
+  construction (§3).
+- MEDIUM (Owned vs Live not "purely storage"): **ACCEPTED** — §2e already
+  reframed (Owned = GRE-decapped copy); rationale is "two representations
+  of the canonical packet; representation must not change FabricRedirect
+  disposition policy; the drop block touches neither frame."
+- MEDIUM-2 (snapshot vs BindingStatus): **RESOLVED** — BindingStatus-only
+  (precedent `tunnel_encap_unresolved_drops` is BindingStatus-only).
+- LOW (soften "no legit traffic"): **ACCEPTED** — reframed as fail-closed
+  / unsound-dependency (§5).
+- LOW (no borrow hazard): acknowledged.
