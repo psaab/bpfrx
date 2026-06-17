@@ -2362,6 +2362,132 @@ pub(super) fn poll_binding_process_descriptor(
                                     .get(&to_zone_id)
                                     .map(|s| s.as_str())
                                     .unwrap_or("");
+                                // #1913 (Codex r2): evaluate policy for the
+                                // MissingNeighbor cold path BEFORE any
+                                // forwarding-side-effect. The MissingNeighbor
+                                // arm has its OWN policy evaluation (the main
+                                // deny→PolicyDenied conversion lives only in the
+                                // ForwardCandidate branch). A DENY must exit here
+                                // so a denied flow never triggers a kernel
+                                // ARP/NDP probe (network traffic for a flow
+                                // policy says to drop, repeated per packet since
+                                // denied frames are not buffered), never seeds a
+                                // session, never buffers in pending_neigh, and
+                                // never reaches the slow-path reinject gate.
+                                // `MissingNeighbor` is slow-path-eligible, so
+                                // without this conversion a denied unresolved-
+                                // neighbor cold-path packet was forwarded by the
+                                // kernel FIB (a zone-policy bypass). The cold-path
+                                // histogram samples this eval (session-install
+                                // slow path).
+                                if let Some(flow) = flow.as_ref() {
+                                    let (cp_sample_tag, cp_t_in) = {
+                                        let cp = &mut binding.cold_path;
+                                        cp.sample_phase =
+                                            cp.sample_phase.wrapping_add(1);
+                                        let tag = (cp.sample_phase
+                                            & worker_ctx.cold_path_sample_mask)
+                                            == 0;
+                                        let t = if tag {
+                                            crate::afxdp::cold_path_hist::sample_tsc_start()
+                                        } else {
+                                            0
+                                        };
+                                        (tag, t)
+                                    };
+                                    let policy_result = evaluate_policy_result_with_len(
+                                        &worker_ctx.forwarding.policy,
+                                        from_zone_id,
+                                        to_zone_id,
+                                        flow.src_ip,
+                                        flow.dst_ip,
+                                        flow.forward_key.protocol,
+                                        flow.forward_key.src_port,
+                                        flow.forward_key.dst_port,
+                                        desc.len as u64,
+                                    );
+                                    // #1620: cold-path histogram post-eval record.
+                                    if cp_sample_tag {
+                                        let t_out =
+                                            crate::afxdp::cold_path_hist::sample_tsc_end();
+                                        let q32 = binding.cold_path.ns_per_tsc_q32;
+                                        if q32 != 0 {
+                                            let delta_tsc =
+                                                t_out.saturating_sub(cp_t_in);
+                                            let raw_ns = ((delta_tsc as u128
+                                                * q32 as u128)
+                                                >> 32)
+                                                as u64;
+                                            let baseline =
+                                                binding.cold_path.wrapper_ns_baseline;
+                                            let delta_ns = if raw_ns < baseline {
+                                                binding
+                                                    .cold_path
+                                                    .wrapper_underflow_count = binding
+                                                    .cold_path
+                                                    .wrapper_underflow_count
+                                                    .saturating_add(1);
+                                                0
+                                            } else {
+                                                raw_ns - baseline
+                                            };
+                                            if let Some(slot) =
+                                                crate::afxdp::cold_path_hist::lookup_slot(
+                                                    &worker_ctx
+                                                        .forwarding
+                                                        .cold_path_slot_map,
+                                                    from_zone_id,
+                                                    to_zone_id,
+                                                )
+                                            {
+                                                binding.cold_path.record_sample(
+                                                    slot,
+                                                    from_zone_id,
+                                                    to_zone_id,
+                                                    delta_ns,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    if !matches!(policy_result.action, PolicyAction::Permit) {
+                                        let owner_rg_id = owner_rg_for_resolution(
+                                            worker_ctx.forwarding,
+                                            decision.resolution,
+                                        );
+                                        emit_policy_deny_event(
+                                            worker_ctx.event_stream,
+                                            flow,
+                                            meta,
+                                            from_zone_id,
+                                            to_zone_id,
+                                            owner_rg_id,
+                                            policy_result.policy_id,
+                                            policy_result.action,
+                                            now_ns,
+                                        );
+                                        telemetry.dbg.policy_deny += 1;
+                                        decision.resolution.disposition =
+                                            ForwardingDisposition::PolicyDenied;
+                                        record_forwarding_disposition(
+                                            &worker_ctx.ident,
+                                            DispositionCounters::Hot(telemetry.counters),
+                                            decision.resolution,
+                                            desc.len as u32,
+                                            Some(meta),
+                                            debug.as_ref(),
+                                            worker_ctx.recent_exceptions,
+                                            worker_ctx.last_resolution,
+                                            worker_ctx.forwarding,
+                                        );
+                                        binding.scratch.scratch_recycle.push(desc.addr);
+                                        continue;
+                                    }
+                                }
+                                // No flow tuple (e.g. non-first fragment) skips
+                                // the early policy gate and falls through to the
+                                // probe + reinject path, preserving the pre-#1913
+                                // behavior — `MissingNeighbor` for a flowless
+                                // packet was always slow-path-eligible.
                                 // Send ARP/NDP solicitation via RAW socket (not XSK)
                                 // so the reply goes through the kernel's normal RX
                                 // path (cpumap_or_pass), bypassing XSK fill ring issues.
@@ -2413,139 +2539,15 @@ pub(super) fn poll_binding_process_descriptor(
                                 // buffering as before.
                                 let mut seed_install_refused = false;
                                 if let Some(flow) = flow.as_ref() {
-                                    // #1620: cold-path histogram pre-eval gate
-                                    // (session-install slow path). Per plan v4
-                                    // §4.4: scoped &mut borrow ends before eval.
-                                    let (cp_sample_tag, cp_t_in) = {
-                                        let cp = &mut binding.cold_path;
-                                        cp.sample_phase =
-                                            cp.sample_phase.wrapping_add(1);
-                                        let tag = (cp.sample_phase
-                                            & worker_ctx.cold_path_sample_mask)
-                                            == 0;
-                                        let t = if tag {
-                                            crate::afxdp::cold_path_hist::sample_tsc_start()
-                                        } else {
-                                            0
-                                        };
-                                        (tag, t)
-                                    };
-                                    // #1913: the MissingNeighbor arm has its
-                                    // OWN policy evaluation (the main deny→
-                                    // PolicyDenied conversion lives only in the
-                                    // ForwardCandidate branch). Before this fix
-                                    // a DENY here merely skipped the SNAT
-                                    // allocation and fell through to session
-                                    // install + pending-neighbor buffer + the
-                                    // trailing reinject chokepoint with the
-                                    // disposition still MissingNeighbor — which
-                                    // IS slow-path-eligible, so a denied
-                                    // unresolved-neighbor cold-path packet was
-                                    // handed to the kernel FIB (a zone-policy
-                                    // bypass). Capture the full result so a DENY
-                                    // is converted to PolicyDenied, accounted,
-                                    // and dropped+recycled here, matching the
-                                    // ForwardCandidate deny path.
-                                    let policy_result = evaluate_policy_result_with_len(
-                                        &worker_ctx.forwarding.policy,
-                                        from_zone_id,
-                                        to_zone_id,
-                                        flow.src_ip,
-                                        flow.dst_ip,
-                                        flow.forward_key.protocol,
-                                        flow.forward_key.src_port,
-                                        flow.forward_key.dst_port,
-                                        desc.len as u64,
-                                    );
-                                    let permit =
-                                        matches!(policy_result.action, PolicyAction::Permit);
-                                    if !permit {
-                                        let owner_rg_id = owner_rg_for_resolution(
-                                            worker_ctx.forwarding,
-                                            pending_decision.resolution,
-                                        );
-                                        emit_policy_deny_event(
-                                            worker_ctx.event_stream,
-                                            flow,
-                                            meta,
-                                            from_zone_id,
-                                            to_zone_id,
-                                            owner_rg_id,
-                                            policy_result.policy_id,
-                                            policy_result.action,
-                                            now_ns,
-                                        );
-                                        telemetry.dbg.policy_deny += 1;
-                                        // Convert the disposition so per-
-                                        // disposition accounting records a
-                                        // policy_denied (not a neighbor miss)
-                                        // and the trailing reinject gate drops
-                                        // it. No session is seeded and the
-                                        // pending-neighbor buffer is skipped:
-                                        // a denied flow must never create
-                                        // forwarding state.
-                                        decision.resolution.disposition =
-                                            ForwardingDisposition::PolicyDenied;
-                                        record_forwarding_disposition(
-                                            &worker_ctx.ident,
-                                            DispositionCounters::Hot(telemetry.counters),
-                                            decision.resolution,
-                                            desc.len as u32,
-                                            Some(meta),
-                                            debug.as_ref(),
-                                            worker_ctx.recent_exceptions,
-                                            worker_ctx.last_resolution,
-                                            worker_ctx.forwarding,
-                                        );
-                                        binding.scratch.scratch_recycle.push(desc.addr);
-                                        continue;
-                                    }
-                                    // #1620: cold-path histogram post-eval record.
-                                    if cp_sample_tag {
-                                        let t_out =
-                                            crate::afxdp::cold_path_hist::sample_tsc_end();
-                                        let q32 = binding.cold_path.ns_per_tsc_q32;
-                                        if q32 != 0 {
-                                            let delta_tsc =
-                                                t_out.saturating_sub(cp_t_in);
-                                            let raw_ns = ((delta_tsc as u128
-                                                * q32 as u128)
-                                                >> 32)
-                                                as u64;
-                                            let baseline =
-                                                binding.cold_path.wrapper_ns_baseline;
-                                            let delta_ns = if raw_ns < baseline {
-                                                binding
-                                                    .cold_path
-                                                    .wrapper_underflow_count = binding
-                                                    .cold_path
-                                                    .wrapper_underflow_count
-                                                    .saturating_add(1);
-                                                0
-                                            } else {
-                                                raw_ns - baseline
-                                            };
-                                            // #1635: direct slot map lookup;
-                                            // skip the sample on a miss.
-                                            if let Some(slot) =
-                                                crate::afxdp::cold_path_hist::lookup_slot(
-                                                    &worker_ctx
-                                                        .forwarding
-                                                        .cold_path_slot_map,
-                                                    from_zone_id,
-                                                    to_zone_id,
-                                                )
-                                            {
-                                                binding.cold_path.record_sample(
-                                                    slot,
-                                                    from_zone_id,
-                                                    to_zone_id,
-                                                    delta_ns,
-                                                );
-                                            }
-                                        }
-                                    }
-                                    if permit {
+                                    // #1913 (Codex r2): policy was already
+                                    // evaluated (and any DENY dropped+recycled)
+                                    // above, BEFORE the kernel ARP probe. Only a
+                                    // permitted flow reaches here, so the SNAT
+                                    // allocation runs unconditionally for the
+                                    // permitted MissingNeighbor flow. The
+                                    // cold-path histogram sample is taken at the
+                                    // early eval site above.
+                                    {
                                         let nat_match_flow = flow.with_destination(
                                             pending_decision.nat.rewrite_dst.unwrap_or(flow.dst_ip),
                                         );
