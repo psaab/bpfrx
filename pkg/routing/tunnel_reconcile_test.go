@@ -860,6 +860,56 @@ func TestNonWGToWireguardSameNameNoOwnedRetention(t *testing.T) {
 	})
 }
 
+// A legacy non-TUN (GRE/IPIP) link transitioning to WG of the SAME name,
+// where WG's incompatible-link replacement LinkDel FAILS, must not orphan
+// the stale non-WG link: the handoff guard drops it from ownedNames, but
+// applyWireguardTunLocked's error must re-retain it so a later config
+// removal still LinkDels it (Codex r5).
+func TestLegacyToWireguardSameNameIncompatibleLinkDelFailureRetained(t *testing.T) {
+	ops := newFakeLinkOps()
+	tm, _ := newReconcileManager(ops)
+	// Seed a legacy GRE link adopted as owned (apply it as a legacy tunnel).
+	gre := &config.TunnelConfig{Name: "wg0", Mode: "gre", Source: "10.0.0.1", Destination: "10.0.0.2", Addresses: []string{"10.9.9.1/30"}}
+	if err := tm.Apply([]*config.TunnelConfig{gre}); err != nil {
+		t.Fatalf("Apply 1 (gre): %v", err)
+	}
+	tm.mu.Lock()
+	owned := tm.ownedNames["wg0"]
+	tm.mu.Unlock()
+	if !owned {
+		t.Fatal("gre wg0 not tracked in ownedNames")
+	}
+	// Transition to WG; WG must replace the non-TUN GRE link, but its
+	// LinkDel fails.
+	ops.delFail["wg0"] = errors.New("EBUSY")
+	if err := tm.Apply([]*config.TunnelConfig{wgTC("172.16.0.1/30")}); err != nil {
+		t.Fatalf("Apply 2 (transition, LinkDel fails): %v", err)
+	}
+	// The stale GRE link could not be replaced — it must be RETAINED in
+	// ownedNames so cleanup is retried (not orphaned).
+	tm.mu.Lock()
+	retained := tm.ownedNames["wg0"]
+	tm.mu.Unlock()
+	if !retained {
+		t.Fatal("stale non-WG link orphaned after failed WG replacement (Codex r5)")
+	}
+	// Now remove the tunnel from config entirely with LinkDel working: the
+	// non-WG removal loop must delete the stale link.
+	delete(ops.delFail, "wg0")
+	if err := tm.Apply(nil); err != nil {
+		t.Fatalf("Apply 3 (removal): %v", err)
+	}
+	found := false
+	for _, d := range ops.delNames {
+		if d == "wg0" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("orphaned stale link never deleted after config removal (Codex r5)")
+	}
+}
+
 // --- §9 test 6: appliedRI claim state machine -------------------------
 
 func TestTunnelVRFStanzaBindAndUnbind(t *testing.T) {

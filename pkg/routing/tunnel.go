@@ -419,6 +419,20 @@ func (t *tunnelManager) Apply(tunnels []*config.TunnelConfig) error {
 			if err := t.applyWireguardTunLocked(tc); err != nil {
 				slog.Warn("failed to apply wireguard tunnel",
 					"name", tc.Name, "err", err)
+				// The WG link could NOT be established (e.g. an incompatible
+				// same-name non-WG link whose replacement LinkDel failed, or
+				// a failed create). A stale non-WG link may still be present
+				// under this name; the inverse-handoff guard above already
+				// dropped it from ownedNames, so without this it would be
+				// orphaned — the WG prune path only touches addresses, never
+				// the link, and the non-WG removal loop never revisits it
+				// (Codex r5). Retain it in ownedNames so a future Apply
+				// retries the non-WG-style cleanup (LinkDel on config-remove,
+				// or the WG apply re-attempts the replacement). A successful
+				// applyWireguardTunLocked returns nil and is NOT re-added —
+				// a healthy persistent WG link must stay untracked (#1432
+				// S2a, Codex r3).
+				t.ownedNames[tc.Name] = true
 			}
 			continue
 		}
