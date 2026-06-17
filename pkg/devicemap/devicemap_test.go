@@ -150,10 +150,10 @@ func TestResolveKeyOrderMACThenPCI(t *testing.T) {
 			KeyOrder: config.DeviceMapKeyMACThenPCI},
 	}
 	got := Resolve(entries, nics, nil)
-	if got[0].Status != BindBoundViaMAC {
-		// PCI is present in the entry, so the MAC bind is reported as a
-		// fallback-class outcome; the key point is it binds the right NIC.
-		t.Logf("status=%v", got[0].Status)
+	// MAC is the PRIMARY key here (mac-then-pci), so the bind must be a clean
+	// BindBound, NOT the "via MAC fallback — PCI moved" status (Copilot).
+	if got[0].Status != BindBound {
+		t.Fatalf("mac-then-pci is MAC-primary, want BindBound, got %v", got[0].Status)
 	}
 	if got[0].CurrentNIC != "enp9s0" {
 		t.Fatalf("mac-then-pci bound wrong NIC: %+v", got[0])
