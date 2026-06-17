@@ -289,6 +289,52 @@ impl ForwardingDisposition {
             ForwardingDisposition::ForwardCandidate | ForwardingDisposition::FabricRedirect
         )
     }
+
+    /// Whether a frame with this disposition is eligible for the generic
+    /// kernel slow-path reinjection (the filtered wrapper
+    /// `maybe_reinject_slow_path` and the trailing chokepoint at
+    /// `poll_descriptor::poll_binding_process_descriptor`).
+    ///
+    /// This is the single source of truth for the slow-path allow-list
+    /// (#1913). A disposition that is NOT eligible must be dropped, NOT
+    /// handed to the kernel FIB.
+    ///
+    /// Eligible (reinject to the kernel slow path):
+    ///   - `LocalDelivery`: terminate at the kernel stack (or a local
+    ///     tunnel-delivery channel) — this is the intended destination.
+    ///   - `NoRoute`: userspace has no route, but the kernel FIB may
+    ///     (e.g. a route the helper has not yet learned); let the kernel
+    ///     try, rate-limited.
+    ///   - `MissingNeighbor`: route exists, ARP/NDP unresolved; the kernel
+    ///     can resolve and forward (the userspace prober runs in parallel).
+    ///   - `NextTableUnsupported`: inter-VRF next-table the helper does not
+    ///     implement; defer to the kernel FIB.
+    ///
+    /// NOT eligible (drop — do NOT reinject):
+    ///   - `PolicyDenied`: a zone-policy DENY. Reinjecting would silently
+    ///     bypass the firewall by forwarding the packet via the kernel FIB
+    ///     (the bug #1913 fixes).
+    ///   - `HAInactive`: the owning RG is not active on this node;
+    ///     reinjecting hands the packet to the standby's kernel FIB
+    ///     (duplicate/asymmetric forwarding, wrong-node plaintext send).
+    ///   - `DiscardRoute`: matched a discard/reject route whose entire
+    ///     purpose is to drop the traffic.
+    ///   - `ForwardCandidate` / `FabricRedirect`: handled by the forward /
+    ///     fabric path, never the generic slow path. (The two intentional
+    ///     unfiltered `_from_frame` callers — the FabricRedirect-Owned
+    ///     fallback in `tx/dispatch/mod.rs` and the ForwardCandidate
+    ///     build-failure fallback in `tx/dispatch/slow_path.rs` — bypass
+    ///     this predicate on purpose; see the doc on
+    ///     `maybe_reinject_slow_path_from_frame`.)
+    pub(in crate::afxdp) fn is_slow_path_eligible(self) -> bool {
+        matches!(
+            self,
+            ForwardingDisposition::LocalDelivery
+                | ForwardingDisposition::NoRoute
+                | ForwardingDisposition::MissingNeighbor
+                | ForwardingDisposition::NextTableUnsupported
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

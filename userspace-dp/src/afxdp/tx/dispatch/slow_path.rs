@@ -88,13 +88,11 @@ pub(in crate::afxdp) fn maybe_reinject_slow_path(
     forwarding: &ForwardingState,
 ) {
     let meta = meta.into();
-    if !matches!(
-        decision.resolution.disposition,
-        ForwardingDisposition::LocalDelivery
-            | ForwardingDisposition::NoRoute
-            | ForwardingDisposition::MissingNeighbor
-            | ForwardingDisposition::NextTableUnsupported
-    ) {
+    // #1913: single source of truth for the slow-path allow-list. A
+    // disposition the predicate rejects (PolicyDenied / HAInactive /
+    // DiscardRoute / ForwardCandidate / FabricRedirect) must be dropped,
+    // never reinjected to the kernel FIB.
+    if !decision.resolution.disposition.is_slow_path_eligible() {
         return;
     }
     let Some(frame) = area.slice(desc.addr as usize, desc.len as usize) else {
@@ -124,6 +122,27 @@ pub(in crate::afxdp) fn maybe_reinject_slow_path(
     );
 }
 
+/// RAW / unchecked slow-path reinjection primitive.
+///
+/// This helper does NOT filter on `decision.resolution.disposition`: it
+/// will hand ANY parseable L3 frame to the kernel slow path (or local
+/// tunnel-delivery channel). Callers are responsible for applying
+/// [`ForwardingDisposition::is_slow_path_eligible`] BEFORE calling this,
+/// unless they have a documented reason to bypass the allow-list.
+///
+/// The filtered entry point is the `maybe_reinject_slow_path` wrapper
+/// above (and the gated trailing chokepoint in
+/// `poll_descriptor::poll_binding_process_descriptor`, #1913), which both
+/// apply the predicate.
+///
+/// The two INTENTIONAL unfiltered callers (dispositions deliberately
+/// outside the allow-list):
+///   - `tx/dispatch/mod.rs` FabricRedirect-Owned fallback: reinjects a
+///     `FabricRedirect` frame when the target XSK binding is missing.
+///   - `handle_forward_build_failure` (above): reinjects a
+///     `ForwardCandidate` frame when the forward descriptor build fails.
+/// Both rely on the unfiltered behavior; do NOT add a disposition filter
+/// inside this primitive (it would break them — #1913 Path B, rejected).
 #[cold]
 #[inline(never)]
 pub(in crate::afxdp) fn maybe_reinject_slow_path_from_frame(
