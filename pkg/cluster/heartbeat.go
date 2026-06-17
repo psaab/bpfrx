@@ -30,6 +30,17 @@ const (
 	// way that breaks mixed-version interoperability.
 	CurrentHAProtocolVersion = LegacyHAProtocolVersion
 
+	// MinCompatHAProtocolVersion is the OLDEST HA protocol version
+	// CurrentHAProtocolVersion can still interoperate with — the back-compat
+	// floor the #1930 INC-3 mixed-base image-replace gate advertises. It is NOT
+	// LegacyHAProtocolVersion: legacy is a fixed historical constant (1), whereas
+	// this is the deliberate "how far back are we compatible" decision that an
+	// author MUST re-evaluate on every CurrentHAProtocolVersion bump. They are
+	// equal today (this build speaks 1 and is compatible back to 1); a future
+	// incompatible bump raises Current AND sets this floor to the oldest peer the
+	// new build can still sync with (which may equal Current if no back-compat).
+	MinCompatHAProtocolVersion = CurrentHAProtocolVersion
+
 	// maxHeartbeatSize is the max packet size we'll read/write.
 	// 1472 = 1500 MTU - 20 IP header - 8 UDP header.
 	maxHeartbeatSize = 1472

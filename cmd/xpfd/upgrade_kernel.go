@@ -40,6 +40,10 @@ func runUpgradeKernelSubcommand(args []string) {
 		"forward-health-beacon deadline on the candidate boot (promote)")
 	drainDeadline := fs.Duration("drain-deadline", 30*time.Second,
 		"deadline for the STRONG drain predicate (drain) / rejoin confirm (rejoin)")
+	allowMixedHA := fs.Bool("allow-mixed-ha", false,
+		"relax the drain HA-protocol-compatible precheck (the LANE-2 image-roll "+
+			"mixed-base gate already validated window-compat; the exact-equality "+
+			"check would otherwise abort a legitimate in-window mixed-base roll)")
 	unit := fs.String("unit", "xpfd", "systemd unit (cluster gRPC target)")
 	if err := fs.Parse(args[1:]); err != nil {
 		os.Exit(1)
@@ -128,7 +132,7 @@ func runUpgradeKernelSubcommand(args []string) {
 		// the RGs + sync clean) before reporting success — so the orchestrator
 		// never arms+reboots an undrained primary.
 		cl := upgrade.NewCLICluster(*unit)
-		if err := upgrade.DrainAndConfirm(cl, *drainDeadline); err != nil {
+		if err := upgrade.DrainAndConfirm(cl, *drainDeadline, *allowMixedHA); err != nil {
 			fmt.Fprintf(os.Stderr, "upgrade kernel drain: %v\n", err)
 			os.Exit(1)
 		}

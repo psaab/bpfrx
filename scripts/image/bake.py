@@ -540,13 +540,39 @@ def main():
             commit = out_text(["git", "-C", ROOT, "rev-parse", "HEAD"]).strip()
         except Exception:
             commit = "unknown"
+
+        # #1930 INC-3 LANE-2: record the staged binary's compile-time HA /
+        # session-sync / config-DB protocol versions in the manifest so the
+        # mixed-base image-replace gate is a FILE READ (no boot, no cross-arch
+        # binary run needed). The packaged binary already passed the
+        # verify-dataplane pre-gate above, so it is the authoritative source.
+        # Best-effort: a parse/run failure leaves the version lines out rather
+        # than aborting the bake. The image-roll gate reads ONLY the manifest
+        # and FAILS CLOSED on missing protocol fields (it does not re-run the
+        # staged binary), so a manifest baked without these lines forces the
+        # operator to either re-bake or pass --allow-session-drop.
+        proto_lines = ""
+        try:
+            pv = out_text([staged_xpfd, "protocol-versions"])
+            # Re-key into the manifest namespace (manifest uses `key: value`).
+            for ln in pv.splitlines():
+                if "=" in ln:
+                    k, v = ln.split("=", 1)
+                    proto_lines += f"{k.strip().replace('-', '_')}: {v.strip()}\n"
+        except Exception as e:
+            print(f"WARNING: could not read staged xpfd protocol-versions for the "
+                  f"manifest ({e}); the manifest will OMIT the protocol-version "
+                  f"fields and the mixed-base image-roll gate will FAIL CLOSED "
+                  f"(re-bake, or roll with --allow-session-drop).", file=sys.stderr)
+
         manifest = os.path.join(a.out, f"xpf-{ver}.manifest")
         with open(manifest, "w") as f:
             f.write(f"version: {ver}\ngit_commit: {commit}\n"
                     f"base_image: {base_url}/{base_img}\nbase_release: {rel}\n"
                     f"base_image_sha256: {base_sha}\n"
                     f"bake_date: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
-                    f"bake_host_kernel: {os.uname().release}\n")
+                    f"bake_host_kernel: {os.uname().release}\n"
+                    + proto_lines)
         info(f"manifest: {manifest}")
 
         # 7. validation gate

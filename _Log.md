@@ -1,5 +1,88 @@
 # Action Log
 
+## 2026-06-16 — #1930 INC-3: address quad-review (AGY CRITICAL + Codex 2 HIGH + 1 LOW)
+- **Timestamp**: 2026-06-16 UTC
+- **Action**: Resume final INC-3 increment; dispatched 4-way review on PR
+  #1942. AGY CRITICAL: image-roll passed `--allow-mixed-ha` unconditionally to
+  the second node, which is still on the OLD image (no such flag) → unknown-flag
+  abort mid-roll. Fix: feature-detect the flag on the node's running xpfd
+  (`_node_drain_supports_mixed_ha`) and fall back to exact-equality + warn when
+  absent. Codex HIGH-1: Go parsed session-sync/configdb versions with signed
+  `Atoi` while Python used `_u16` → a negative value could falsely pass the
+  exact-match (parity bypass). Fix: `ParseUint(.,16)` in Go + regression test.
+  Codex HIGH-2: lease cleared on mid-roll abort opened a cross-orchestrator
+  never-both-down window; now hold leases until TTL on abort (clear only on
+  clean per-node completion / dry-run); drain peer-alive precheck is the hard
+  backstop. Codex LOW-1: corrected the bake.py warning (gate reads manifest
+  only + fails closed; no staged-binary fallback exists).
+- **File(s)**: scripts/deploy/xpf-deploy.py, pkg/upgrade/imageversions.go,
+  pkg/upgrade/imageversions_test.go, scripts/image/bake.py,
+  docs/in-place-upgrade.md, docs/pr/1930-inc3-image-replace/*
+
+## 2026-06-16 — #1930 INC-3: r2 fix — SSH backend arg-splitting + probe token
+- **Timestamp**: 2026-06-16 UTC
+- **Action**: AGY r2 confirmed the r1 fixes and raised a HIGH: `_node_exec`
+  space-joins the ssh remote argv, so `sh -c "<script>"` (the lease helpers and
+  the new --allow-mixed-ha probe) is shredded on the ssh backend (incus exec is
+  fine). Fixed `_node_exec` to `shlex.quote`-join the ssh remote command into a
+  single string the remote shell reconstructs verbatim — fixes the new probe
+  AND the pre-existing `_acquire_lease`/`_clear_lease`. While verifying, found
+  the probe matched `--allow-mixed-ha` but Go's flag usage prints the
+  single-dash `-allow-mixed-ha`; switched to the bare `allow-mixed-ha` token.
+  Verified detection over both incus- and ssh-style pipelines.
+- **File(s)**: scripts/deploy/xpf-deploy.py,
+  docs/pr/1930-inc3-image-replace/reviewer-ids.md
+
+## 2026-06-16 — #1930 INC-3: address Codex r1 (6 HIGH + 2 MED + 1 LOW)
+- **Timestamp**: 2026-06-16 UTC
+- **Action**: Fixed Codex review findings on INC-3. HIGH: (1)
+  protocol-versions emitted userspace.ProtocolVersion (local socket) as
+  session-sync — added cluster.SessionSyncWireVersion (the cross-chassis
+  wire schema) + emit it; (2) min-compat was LegacyHAProtocolVersion —
+  added cluster.MinCompatHAProtocolVersion (a deliberate floor, re-eval per
+  bump); (3) unknown peer session-sync (0) treated compatible — now fail
+  closed (Go + Python); (4) second image-roll drain reused LANE-1 exact-eq
+  HA precheck — added DrainAndConfirm allowMixedHA + `--allow-mixed-ha`
+  drain flag, image-roll passes it on the second node; (5) image-roll
+  crashed on undefined _time — added import; (6) no cross-orchestrator
+  lease — image-roll now acquires/releases the kernel-roll lease on both
+  nodes (canonical order, finally-release). MED: hook validated before any
+  drain; Python _u16 bounds-checks like Go ParseUint(16). LOW: wired
+  --drain-deadline through drain/rejoin. New tests:
+  GateMixedBase_UnknownPeerSessionSync, DrainAndConfirmAllowMixedHA.
+- **File(s)**: cmd/xpfd/main.go, cmd/xpfd/upgrade_kernel.go,
+  pkg/cluster/heartbeat.go, pkg/cluster/sync.go, pkg/upgrade/kernel_drain.go,
+  pkg/upgrade/kernel_drain_test.go, pkg/upgrade/imageversions.go,
+  pkg/upgrade/imageversions_test.go, scripts/deploy/xpf-deploy.py
+
+## 2026-06-16 — #1930 INC-3: mixed-base gate + image-roll driver + LANE-2/3 docs
+- **Timestamp**: 2026-06-16 UTC
+- **Action**: Added the LANE-2 mixed-base compatibility gate
+  (pkg/upgrade/imageversions.go: parseImageVersions + GateMixedBaseSwap;
+  fail-closed; back-compat window [min-compat,version] for HA + exact
+  session-sync match; 6 unit tests). Added `xpf-deploy.py image-roll` — a
+  rolling image-replace driver that drains, runs the mixed-base gate before
+  the first swap (reads the new image manifest + the running peer's live
+  protocol-versions), recreates each node via an operator --recreate-hook,
+  polls, and rejoins (reusing the INC-2 drain/rejoin verbs, never-both-down).
+  Documented the LANE-1/2/3 decision rule, the mixed-base gate, the
+  text-config state-carry contract, and do-release-upgrade UNSUPPORTED in
+  docs/in-place-upgrade.md; pointed install-images.md at the manifest fields.
+- **File(s)**: pkg/upgrade/imageversions.go, pkg/upgrade/imageversions_test.go,
+  scripts/deploy/xpf-deploy.py, docs/in-place-upgrade.md, docs/install-images.md
+
+## 2026-06-16 — #1930 INC-3 (LANE-2/3): protocol-versions subcommand + bake manifest
+- **Timestamp**: 2026-06-16 UTC
+- **Action**: Started INC-3 (final PR, Closes #1930). Added `xpfd
+  protocol-versions` subcommand emitting machine-parseable HA /
+  session-sync / config-DB version constants (cluster.CurrentHAProtocolVersion,
+  cluster.LegacyHAProtocolVersion, userspace.ProtocolVersion,
+  configstore.EnvelopeFormatVersion/EnvelopeMinReaderVersion). bake.py now
+  records these in the per-version manifest by running the staged binary's
+  protocol-versions, so the LANE-2 mixed-base gate is a file read (no boot,
+  no cross-arch run). Foundation for the mixed-base compatibility gate.
+- **File(s)**: cmd/xpfd/main.go, scripts/image/bake.py
+
 ## 2026-06-16 — #1930 INC-2: Codex 2 HIGH (arm-fail drain leak, rejoin/hold race)
 - **Timestamp**: 2026-06-16 UTC
 - **Action**: Fixed Codex's two HIGH findings. HIGH-1 (arm-failure leaves
