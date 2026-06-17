@@ -295,66 +295,79 @@ net.ipv6.conf.default.accept_ra=0
 EOF'
 	incus exec "$INSTANCE_NAME" -- sysctl --system
 
-	# Package names are Ubuntu 26.04 (#1943), version-exact against the stock
-	# image kernel so `perf`/headers match `uname -r` and no metapackage pulls a
-	# NEWER kernel (bake.py ships exactly one kernel). Deltas vs the old Debian
-	# list: linux-headers-amd64 -> linux-headers-$(uname -r); linux-perf ->
-	# linux-tools-$(uname -r); host -> bind9-host; golang dropped (the VM never
-	# compiles Go — `make build` runs on the host, `test-deploy` pushes the
-	# binary). NO linux-modules-extra: on images:ubuntu/26.04/cloud the NIC
-	# drivers (mlx5/i40e/ixgbe) ship in the base linux-modules package already
-	# in the image, and no linux-modules-extra-* package exists for this kernel
-	# (verified by live `apt-cache policy` probe, #1943). clang/llvm/libbpf-dev
-	# are kept for ad-hoc in-VM debugging.
+	# Userspace tooling installed in BOTH the VM and the container. Ubuntu 26.04
+	# package names (#1943): host -> bind9-host; golang dropped (the instance
+	# never compiles Go — `make build` runs on the host, `test-deploy` pushes the
+	# binary). clang/llvm/libbpf-dev kept for ad-hoc in-instance debugging.
 	info "Installing packages (this may take a few minutes)..."
-	incus exec "$INSTANCE_NAME" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential clang llvm libbpf-dev linux-headers-$(uname -r) linux-tools-$(uname -r) tcpdump iproute2 iperf3 bpftool frr strongswan strongswan-swanctl kea-dhcp4-server kea-dhcp6-server chrony mtr-tiny bind9-host pciutils curl wget ripgrep'
+	incus exec "$INSTANCE_NAME" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential clang llvm libbpf-dev tcpdump iproute2 iperf3 bpftool frr strongswan strongswan-swanctl kea-dhcp4-server kea-dhcp6-server chrony mtr-tiny bind9-host pciutils curl wget ripgrep'
 
-	# Ubuntu 26.04 already ships a stock kernel >= 6.18 (the AF_XDP shim
-	# verifier floor), so the old Debian-unstable kernel-pinning dance is gone.
-	# Assert the floor so the VM fails loudly if the base ever regresses below
-	# it, mirroring bake.py:233-242.
-	info "Asserting kernel >= 6.18 (AF_XDP shim verifier floor)..."
-	incus exec "$INSTANCE_NAME" -- bash -c 'kver=$(uname -r); dpkg --compare-versions "${kver%%-*}" ge 6.18 || { echo "FATAL: base kernel $kver < 6.18 (verifier floor)" >&2; exit 1; }' \
-		|| die "base image kernel below the 6.18 AF_XDP verifier floor"
+	# Kernel-coupled provisioning is VM-ONLY (Codex r1 HIGH). A container shares
+	# the HOST kernel, so `uname -r` inside it is the host's (here a Debian
+	# kernel) — installing linux-headers/linux-tools-$(uname -r), asserting guest
+	# module dirs, editing grub, or rebooting are all meaningless or actively
+	# wrong in a container. Containers get only the userspace tooling above; the
+	# frr/chrony enable below still runs for both instance types.
+	if [[ "$type" == "vm" ]]; then
+		# Kernel-version-exact packages so `perf`/headers match `uname -r` and
+		# no metapackage pulls a NEWER kernel (bake.py ships exactly one kernel).
+		# Deltas vs the old Debian list: linux-headers-amd64 ->
+		# linux-headers-$(uname -r); linux-perf -> linux-tools-$(uname -r). NO
+		# linux-modules-extra: on images:ubuntu/26.04/cloud the NIC drivers
+		# (mlx5/i40e/ixgbe) ship in the base linux-modules package already in the
+		# image, and no linux-modules-extra-* exists for this kernel (verified by
+		# live `apt-cache policy`, #1943).
+		info "Installing kernel-version-exact packages (VM)..."
+		incus exec "$INSTANCE_NAME" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq linux-headers-$(uname -r) linux-tools-$(uname -r)'
 
-	# Assert the dataplane NIC drivers are present (mirrors bake.py:227-228).
-	# On Ubuntu these ship in the in-image linux-modules package, NOT a separate
-	# linux-modules-extra; without them the WAN PF / loss PF never bind.
-	info "Asserting dataplane NIC driver modules present..."
-	incus exec "$INSTANCE_NAME" -- bash -c 'd=/lib/modules/$(uname -r)/kernel/drivers/net/ethernet; test -d "$d/mellanox" && test -e "$d/intel/i40e" || { echo "FATAL: mlx5/i40e driver modules missing" >&2; exit 1; }' \
-		|| die "dataplane NIC driver modules missing from base image"
+		# Ubuntu 26.04 already ships a stock kernel >= 6.18 (the AF_XDP shim
+		# verifier floor), so the old Debian-unstable kernel-pinning dance is
+		# gone. Assert the floor so the VM fails loudly if the base ever
+		# regresses below it, mirroring bake.py:233-242.
+		info "Asserting kernel >= 6.18 (AF_XDP shim verifier floor)..."
+		incus exec "$INSTANCE_NAME" -- bash -c 'kver=$(uname -r); dpkg --compare-versions "${kver%%-*}" ge 6.18 || { echo "FATAL: base kernel $kver < 6.18 (verifier floor)" >&2; exit 1; }' \
+			|| die "base image kernel below the 6.18 AF_XDP verifier floor"
 
-	# Disable init_on_alloc — the default CONFIG_INIT_ON_ALLOC_DEFAULT_ON zeros
-	# every allocated page, costing ~20% CPU in the virtio-net XDP path. Use a
-	# grub.d drop-in (NOT a sed on /etc/default/grub): the Ubuntu image's
-	# /etc/default/grub.d/50-*.cfg re-sets GRUB_CMDLINE_LINUX_DEFAULT, so a sed
-	# is silently lost. The drop-in appends instead of fighting that override.
-	# This mirrors bake.py's GRUB_DROPIN. Verified to reach /proc/cmdline on
-	# images:ubuntu/26.04/cloud (#1943).
-	info "Disabling init_on_alloc for XDP performance (grub.d drop-in)..."
-	incus exec "$INSTANCE_NAME" -- bash -c 'cat > /etc/default/grub.d/99-xpf.cfg <<EOF
+		# Assert the dataplane NIC drivers are present (mirrors bake.py:227-228).
+		# On Ubuntu these ship in the in-image linux-modules package, NOT a
+		# separate linux-modules-extra; without them the WAN/loss PFs never bind.
+		info "Asserting dataplane NIC driver modules present..."
+		incus exec "$INSTANCE_NAME" -- bash -c 'd=/lib/modules/$(uname -r)/kernel/drivers/net/ethernet; test -d "$d/mellanox" && test -e "$d/intel/i40e" || { echo "FATAL: mlx5/i40e driver modules missing" >&2; exit 1; }' \
+			|| die "dataplane NIC driver modules missing from base image"
+
+		# Disable init_on_alloc — the default CONFIG_INIT_ON_ALLOC_DEFAULT_ON
+		# zeros every allocated page, costing ~20% CPU in the virtio-net XDP
+		# path. Use a grub.d drop-in (NOT a sed on /etc/default/grub): the Ubuntu
+		# image's /etc/default/grub.d/50-*.cfg re-sets GRUB_CMDLINE_LINUX_DEFAULT,
+		# so a sed is silently lost. The drop-in appends instead of fighting that
+		# override. Mirrors bake.py's GRUB_DROPIN. Verified to reach
+		# /proc/cmdline on images:ubuntu/26.04/cloud (#1943).
+		info "Disabling init_on_alloc for XDP performance (grub.d drop-in)..."
+		incus exec "$INSTANCE_NAME" -- bash -c 'cat > /etc/default/grub.d/99-xpf.cfg <<EOF
 # xpf (#1943/#1879): init_on_alloc=0 in the virtio-net XDP path.
 GRUB_CMDLINE_LINUX_DEFAULT="\$GRUB_CMDLINE_LINUX_DEFAULT init_on_alloc=0"
 EOF'
-	incus exec "$INSTANCE_NAME" -- update-grub
+		incus exec "$INSTANCE_NAME" -- update-grub
 
-	# A reboot is still required so the init_on_alloc=0 cmdline takes effect —
-	# the kernel-install dance is gone, but the grub change is not live until
-	# the next boot. Skipping it leaves every test running with init_on_alloc=1.
-	info "Rebooting VM to apply the init_on_alloc=0 grub change..."
-	incus restart "$INSTANCE_NAME"
-	local ktries=0
-	while ! incus exec "$INSTANCE_NAME" -- true &>/dev/null; do
-		sleep 2
-		ktries=$((ktries + 1))
-		if [[ $ktries -ge 30 ]]; then
-			warn "VM did not come back after the grub-apply reboot"
-			break
-		fi
-	done
-	incus exec "$INSTANCE_NAME" -- uname -r
-	# Confirm the tuning actually reached the running kernel cmdline.
-	incus exec "$INSTANCE_NAME" -- bash -c 'grep -q init_on_alloc=0 /proc/cmdline || echo "WARNING: init_on_alloc=0 not in /proc/cmdline" >&2'
+		# A reboot is still required so the init_on_alloc=0 cmdline takes
+		# effect — the kernel-install dance is gone, but the grub change is not
+		# live until the next boot. Skipping it leaves every test running with
+		# init_on_alloc=1.
+		info "Rebooting VM to apply the init_on_alloc=0 grub change..."
+		incus restart "$INSTANCE_NAME"
+		local ktries=0
+		while ! incus exec "$INSTANCE_NAME" -- true &>/dev/null; do
+			sleep 2
+			ktries=$((ktries + 1))
+			if [[ $ktries -ge 30 ]]; then
+				warn "VM did not come back after the grub-apply reboot"
+				break
+			fi
+		done
+		incus exec "$INSTANCE_NAME" -- uname -r
+		# Confirm the tuning actually reached the running kernel cmdline.
+		incus exec "$INSTANCE_NAME" -- bash -c 'grep -q init_on_alloc=0 /proc/cmdline || echo "WARNING: init_on_alloc=0 not in /proc/cmdline" >&2'
+	fi
 
 	incus exec "$INSTANCE_NAME" -- systemctl enable frr
 
