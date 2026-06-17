@@ -664,9 +664,9 @@ def _acquire_lease(runner, backend, node, target_node_id, holder, ttl_secs):
         "sh -c " + shlex.quote(crit) + " && echo ACQUIRED"
     )
     out = _node_exec(runner, backend, node, ["sh", "-c", script], check=False)
-    if not runner.dry and "ACQUIRED" not in out:
-        die(f"{node}: could not acquire kernel-roll lease (a live lease is held "
-            f"by another orchestrator, or the lock timed out) — aborting.")
+    # Return whether WE won the lease (the caller releases-what-it-got + aborts
+    # on a partial acquisition, rather than die()ing here with a stranded lease).
+    return runner.dry or "ACQUIRED" in out
 
 
 def _clear_lease(runner, backend, node, holder):
@@ -723,13 +723,24 @@ def cmd_kernel_roll(args):
     def roll_one(node, peer):
         nid = node_ids[node]
         print(f"\n--- rolling {node} (node-id {nid}); {peer} stays primary ---")
-        # 1. ATOMICALLY acquire the lease on BOTH nodes (cross-driver mutex via
-        #    O_EXCL create — r2 Codex: a check-then-write had a TOCTOU; expiry
-        #    is rendered in each node's own clock — clock-skew safe). Acquiring
-        #    on `node` also suppresses ITS local self-recovery during the roll.
-        #    A live foreign lease makes _acquire_lease die() before any mutation.
-        _acquire_lease(runner, backend, node, nid, holder, lease_ttl)
-        _acquire_lease(runner, backend, peer, nid, holder, lease_ttl)
+        # 1. ATOMICALLY acquire the lease on BOTH nodes (cross-driver mutex,
+        #    flock-serialized + holder-guarded). Acquire in a CANONICAL order
+        #    (sorted node name), NOT the roll order, so two drivers rolling in
+        #    OPPOSITE order can't each grab one node and deadlock (r5 Codex):
+        #    both contend for the same node's lease first. If we get the first
+        #    but not the second, RELEASE the first (no stranded lease until TTL)
+        #    and abort. Acquiring on `node` also suppresses its self-recovery.
+        ordered = sorted([node, peer])
+        got = []
+        for n in ordered:
+            if _acquire_lease(runner, backend, n, nid, holder, lease_ttl):
+                got.append(n)
+            else:
+                for g in got:
+                    _clear_lease(runner, backend, g, holder)
+                die(f"{n}: could not acquire kernel-roll lease (a live lease is "
+                    f"held by another orchestrator, or the lock timed out) — "
+                    f"released {got or 'nothing'} and aborting.")
         try:
             # 2. DRAIN node -> peer via the non-interactive in-guest verb, which
             #    CONFIRMS the strong drain predicate (peer holds RGs, sync clean)
