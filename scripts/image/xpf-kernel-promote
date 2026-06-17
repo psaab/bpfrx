@@ -45,8 +45,12 @@ case "$rc" in
         # known-good slot to the BootOrder front, so this reboot lands on
         # known-good. Use --no-wall; this is an unattended recovery reboot.
         systemctl reboot --no-wall || reboot
-        # If reboot somehow returns, exit non-zero so the unit records failure.
-        exit 3
+        # Exit 0: issuing the recovery reboot IS the intended outcome of a
+        # revert, so the unit must NOT record failure here — otherwise OnFailure=
+        # (the hang/timeout recovery) would double-fire a second reboot. The
+        # OnFailure handler is reserved for the case where this script never
+        # reaches its own reboot (SIGTERM on TimeoutStartSec).
+        exit 0
         ;;
     *)
         log "promotion gate: infra error (rc=$rc); NOT rebooting (avoid a bounce loop) — candidate is un-promoted, next plain reboot falls back to known-good"

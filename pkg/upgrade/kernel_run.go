@@ -99,6 +99,19 @@ func (r *KernelRunner) Arm(candidateVersion string) error {
 			"clear %s to start over", j.CandidateVersion, j.State, candidateVersion, r.cfg.JournalPath)
 	}
 
+	// Clear any STALE promotion marker from a PRIOR roll BEFORE arming a fresh
+	// one (r1 Codex High): otherwise the external orchestrator's post-reboot
+	// `promoted==<ver>` check could be satisfied by a previous successful roll
+	// to the SAME version, masking a revert of THIS roll. This is FATAL on
+	// failure (r2 Codex): if we cannot guarantee the marker is gone, we must NOT
+	// arm — proceeding would leave a stale marker that could false-confirm.
+	if !j.State.atLeast(KernelStatePreflight) {
+		if err := r.cfg.Sys.ClearPromotionMarker(); err != nil {
+			return fmt.Errorf("kernel-upgrade arm: clear stale promotion marker (refusing "+
+				"to arm with a possibly-stale marker): %w", err)
+		}
+	}
+
 	// ---- PREFLIGHT (fail-closed; no mutation) ----
 	if !j.State.atLeast(KernelStatePreflight) {
 		if err := r.preflight(j, candidateVersion); err != nil {
@@ -399,6 +412,14 @@ func (r *KernelRunner) Promote() error {
 	if err := sys.DisarmWatchdog(); err != nil {
 		r.logf("kernel-upgrade promote: WARNING disarm watchdog: %v", err)
 	}
+	// Write the DURABLE promotion marker BEFORE clearing the journal, so the
+	// external HA orchestrator's post-reboot version-check has a signal that
+	// survives the clear (INC-2). Best-effort: a marker-write failure does not
+	// un-promote (the BootOrder reorder already succeeded), but the orchestrator
+	// then relies on `uname -r == target` alone.
+	if err := sys.WritePromotionMarker(running); err != nil {
+		r.logf("kernel-upgrade promote: WARNING write promotion marker: %v", err)
+	}
 	// The candidate slot is now the active/known-good slot; the OTHER slot
 	// (the former active) becomes the rollback target and keeps its kernel.
 	if err := r.ktransition(j, KernelStatePromoted); err != nil {
@@ -479,6 +500,16 @@ func (r *KernelRunner) restoreKnownGood(j *KernelJournal) {
 	}
 	if err := sys.PruneInactiveSlot(j.InactiveSlot, j.KnownGoodVersion, j.CandidateVersion); err != nil {
 		r.logf("kernel-upgrade: WARNING prune inactive slot: %v", err)
+	}
+	// Clear the durable promotion marker (r2 AGY #6: a reverted node must not
+	// retain a "promoted" marker from a prior same-version roll) and the local
+	// kernel-roll lease (r2 AGY #5: a stranded lease would suppress this node's
+	// self-recovery for the full TTL after the dead roll). Both best-effort.
+	if err := sys.ClearPromotionMarker(); err != nil {
+		r.logf("kernel-upgrade: WARNING clear promotion marker on restore: %v", err)
+	}
+	if err := sys.ClearRollLease(); err != nil {
+		r.logf("kernel-upgrade: WARNING clear roll lease on restore: %v", err)
 	}
 }
 

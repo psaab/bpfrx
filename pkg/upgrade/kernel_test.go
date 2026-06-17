@@ -38,9 +38,10 @@ type fakeKernelSystem struct {
 	beaconPass        bool
 	beaconErr         error
 
-	rebooted bool
-	calls    []string
-	now      time.Time
+	rebooted        bool
+	promotionMarker string
+	calls           []string
+	now             time.Time
 }
 
 func newFakeKernelSystem() *fakeKernelSystem {
@@ -120,6 +121,13 @@ func (f *fakeKernelSystem) SetBootNext(id string) error {
 }
 func (f *fakeKernelSystem) ArmWatchdog() error { f.wdArmed = true; return nil }
 func (f *fakeKernelSystem) Reboot() error      { f.log("reboot"); f.rebooted = true; return nil }
+func (f *fakeKernelSystem) WritePromotionMarker(u string) error {
+	f.promotionMarker = u
+	return nil
+}
+func (f *fakeKernelSystem) ReadPromotionMarker() (string, error) { return f.promotionMarker, nil }
+func (f *fakeKernelSystem) ClearPromotionMarker() error          { f.promotionMarker = ""; return nil }
+func (f *fakeKernelSystem) ClearRollLease() error                { return nil }
 func (f *fakeKernelSystem) BootCurrent() (string, error) {
 	if f.bootCurrent != "" {
 		return f.bootCurrent, nil

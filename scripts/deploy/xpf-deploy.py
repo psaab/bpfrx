@@ -12,6 +12,14 @@ Subcommands:
                                   against the signed manifest (#1924), then
                                   import it to a local incus alias. Verify
                                   happens here, not at deploy/launch.
+  kernel-roll --node A --node B   LANE-1 HA kernel roll (#1930 INC-2): drive a
+              --version V          verify-gated kernel bump across the HA pair
+                                  ONE NODE AT A TIME (drain -> arm+reboot into
+                                  the candidate -> poll until promoted -> rejoin,
+                                  then the peer). Survives the per-node reboots;
+                                  holds a leased lock; STOPS (leaving the peer
+                                  primary) if a node reverts. The per-node
+                                  arm/verify/promote is `xpfd upgrade kernel`.
 
 Interface naming is POSITIONAL (matches pkg/daemon/linksetup.go assignName):
 
@@ -578,6 +586,306 @@ def cmd_fetch(args):
     return 0
 
 
+# ── LANE-1 HA kernel-rolling orchestration (#1930 INC-2) ──────────────────
+#
+# Drive a verify-gated kernel bump across an HA pair ONE NODE AT A TIME so the
+# cluster keeps forwarding. Per the converged plan (§3.1-HA): the per-node
+# arm/verify/promote/revert is owned by the in-guest `xpfd upgrade kernel`
+# (INC-1, merged); this EXTERNAL driver survives the per-node reboots (an
+# in-process driver would die at the reboot it triggers) and owns the cross-node
+# sequencing + the "never both down" gate.
+#
+# Sequence per node N (peer P stays primary throughout):
+#   1. hold a LEASE naming N (TTL) on BOTH nodes — suppresses N's local
+#      self-recovery (INC-2 Go side) so it won't fight the roll, and is the
+#      cluster-wide lock (a crashed driver's lease expires, freeing future rolls).
+#   2. drain N -> P (xpfd upgrade kernel relies on the node being secondary; we
+#      demote via the cluster CLI) and confirm P holds the RGs.
+#   3. `xpfd upgrade kernel arm <ver>` on N -> N installs+arms+reboots into the
+#      candidate; the in-guest promotion oneshot verifies+promotes or reverts.
+#   4. poll N until it is back AND `uname -r == <ver>` AND `xpfd upgrade kernel
+#      status` reports `promoted=<ver>` (a REVERTED node boots the OLD kernel and
+#      reports promoted!=<ver> -> we STOP and leave P primary, never touch P).
+#   5. rejoin N (clear failover) + confirm sync re-established.
+#   6. release N's lease, then repeat for P.
+#
+# If a true cross-node reboot-roll cannot be driven (e.g. --dry-run, or a node
+# is unreachable), the driver aborts BEFORE draining the second node, so the
+# cluster never ends up with both nodes down.
+
+def _node_exec(runner, backend, node, argv, check=True):
+    """Run argv inside `node` via the chosen backend (incus|ssh)."""
+    if backend == "ssh":
+        # Non-interactive automation: never hang on a host-key / password prompt
+        # or a dead host (Copilot). BatchMode disables all prompts (fail fast
+        # instead), ConnectTimeout bounds the TCP connect.
+        full = ["ssh",
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=15",
+                node, "--"] + argv
+    else:
+        full = ["incus", "exec", node, "--"] + argv
+    if runner.dry:
+        print("   " + " ".join(shlex.quote(a) for a in full))
+        return ""
+    r = subprocess.run(full, capture_output=True, text=True)
+    if check and r.returncode != 0:
+        die(f"{node}: command failed ({' '.join(argv)}): "
+            f"{r.stdout.strip()} {r.stderr.strip()}")
+    return r.stdout
+
+
+def _acquire_lease(runner, backend, node, target_node_id, holder, ttl_secs):
+    """ATOMICALLY acquire the lease on `node`, or die if another holder has an
+    unexpired one. The whole read-expired-decide-write is run inside an
+    OS-level flock on a dedicated lock file, so the expired-lease RECLAIM is
+    serialized too — closing the r3-Codex TOCTOU where a stale-read `rm` could
+    delete a racing driver's just-created live lease. (flock is util-linux,
+    present on the Debian/Ubuntu appliance base.) expires_at is rendered in the
+    NODE's clock (clock-skew safe)."""
+    h = holder.replace('"', "")
+    # Inner critical section (runs while holding the flock): reclaim ONLY an
+    # expired lease, then create the new one. Because the whole section is
+    # serialized by flock, no other driver can interleave between the reclaim
+    # and the create.
+    crit = (
+        "f=/var/lib/xpf/kernel-roll.lease; "
+        'if [ -f "$f" ]; then '
+        'exp=$(sed -n \'s/.*"expires_at": *"\\([^"]*\\)".*/\\1/p\' "$f"); '
+        'now=$(date -u +%%s); ee=$(date -u -d "$exp" +%%s 2>/dev/null || echo 0); '
+        # live lease held by someone else -> do NOT touch it; fail to acquire.
+        'if [ "$now" -lt "$ee" ]; then exit 1; fi; '
+        'fi; '
+        "exp=$(date -u -d \"+%d seconds\" +%%Y-%%m-%%dT%%H:%%M:%%SZ); "
+        "umask 022; "
+        # Write to a temp file then atomic-rename, so a reader (the self-recovery
+        # loop, which does NOT take the flock) never observes a partial/truncated
+        # lease (r2 AGY non-atomic-write). The flock still serializes writers.
+        "printf '{\"node_id\": %d, \"holder\": \"%s\", \"expires_at\": \"%%s\"}' "
+        "\"$exp\" > \"$f.tmp\" && mv -f \"$f.tmp\" \"$f\""
+    ) % (ttl_secs, target_node_id, h)
+    # flock -w 30 serializes the critical section across concurrent drivers on
+    # this node; -E 9 distinguishes a lock-acquire timeout (exit 9) from the
+    # critical section's own exit-1 (live lease held).
+    script = (
+        "mkdir -p /var/lib/xpf; "
+        "flock -w 30 -E 9 /var/lib/xpf/kernel-roll.lock "
+        "sh -c " + shlex.quote(crit) + " && echo ACQUIRED"
+    )
+    out = _node_exec(runner, backend, node, ["sh", "-c", script], check=False)
+    # Return whether WE won the lease (the caller releases-what-it-got + aborts
+    # on a partial acquisition, rather than die()ing here with a stranded lease).
+    return runner.dry or "ACQUIRED" in out
+
+
+def _clear_lease(runner, backend, node, holder):
+    # Release ONLY if WE still hold the lease (holder matches), under the same
+    # flock as acquire (r4 Codex: an unconditional rm could delete a SUCCESSOR's
+    # live lease if ours had expired and someone else re-acquired). No unlocked
+    # fallback — a failure to take the lock means we do NOT delete (safer to
+    # leave a lease that will expire than to delete a live successor's).
+    h = holder.replace('"', "")
+    crit = (
+        'f=/var/lib/xpf/kernel-roll.lease; [ -f "$f" ] || exit 0; '
+        'cur=$(sed -n \'s/.*"holder": *"\\([^"]*\\)".*/\\1/p\' "$f"); '
+        '[ "$cur" = "%s" ] && rm -f "$f"; exit 0'
+    ) % h
+    _node_exec(runner, backend, node, ["sh", "-c",
+               "flock -w 30 /var/lib/xpf/kernel-roll.lock sh -c " + shlex.quote(crit)],
+               check=False)
+
+
+def _kernel_status(runner, backend, node):
+    """Return dict parsed from `xpfd upgrade kernel status` (promoted=, armed=)."""
+    out = _node_exec(runner, backend, node,
+                     ["xpfd", "upgrade", "kernel", "status"], check=False)
+    st = {}
+    for line in out.splitlines():
+        for tok in line.split():
+            if "=" in tok:
+                k, v = tok.split("=", 1)
+                st[k] = v
+    return st
+
+
+def _running_kernel(runner, backend, node):
+    return _node_exec(runner, backend, node, ["uname", "-r"], check=False).strip()
+
+
+def cmd_kernel_roll(args):
+    import time as _time
+    runner = Runner(args.dry_run)
+    backend = args.backend
+    nodes = args.nodes               # ordered [first-to-roll, second]
+    # Validate the pair BEFORE indexing nodes[0]/nodes[1] (Copilot: a single
+    # --node would otherwise raise IndexError instead of a clear message; two
+    # identical --node values would collapse the dict to one key).
+    if len(nodes) != 2:
+        die("kernel-roll needs exactly two --node arguments (the HA pair)")
+    if nodes[0] == nodes[1]:
+        die(f"kernel-roll needs two DISTINCT nodes; got {nodes[0]} twice")
+    node_ids = {nodes[0]: args.node0_id, nodes[1]: args.node1_id}
+    version = args.version
+    # Sanitize the holder to a safe token set (r2 AGY): the nodename is
+    # interpolated into a shell printf AND a Python %-format, so strip anything
+    # that isn't [A-Za-z0-9._-] (drops quotes, %, spaces, shell metachars).
+    import re as _re
+    _raw_holder = f"{os.uname().nodename}:pid{os.getpid()}"
+    holder = _re.sub(r"[^A-Za-z0-9._:-]", "_", _raw_holder)
+    lease_ttl = args.lease_ttl
+    poll_deadline = args.boot_deadline
+
+    print(f"==> LANE-1 HA kernel roll to {version}: {nodes[0]} then {nodes[1]} "
+          f"(one node at a time; peer keeps forwarding)")
+
+    def roll_one(node, peer):
+        nid = node_ids[node]
+        print(f"\n--- rolling {node} (node-id {nid}); {peer} stays primary ---")
+        # 1. ATOMICALLY acquire the lease on BOTH nodes (cross-driver mutex,
+        #    flock-serialized + holder-guarded). Acquire in a CANONICAL order
+        #    (sorted node name), NOT the roll order, so two drivers rolling in
+        #    OPPOSITE order can't each grab one node and deadlock (r5 Codex):
+        #    both contend for the same node's lease first. If we get the first
+        #    but not the second, RELEASE the first (no stranded lease until TTL)
+        #    and abort. Acquiring on `node` also suppresses its self-recovery.
+        ordered = sorted([node, peer])
+        got = []
+        for n in ordered:
+            if _acquire_lease(runner, backend, n, nid, holder, lease_ttl):
+                got.append(n)
+            else:
+                for g in got:
+                    _clear_lease(runner, backend, g, holder)
+                die(f"{n}: could not acquire kernel-roll lease (a live lease is "
+                    f"held by another orchestrator, or the lock timed out) — "
+                    f"released {got or 'nothing'} and aborting.")
+        drained = False        # we issued a confirmed drain (node is ForceSecondary)
+        completed = False      # the roll finished (rejoin confirmed) OR the node
+                               # rebooted (revert/promote — drain state is gone)
+        rebooted = False       # the node actually rebooted into the candidate
+        try:
+            # 2. DRAIN node -> peer via the non-interactive in-guest verb, which
+            #    CONFIRMS the strong drain predicate (peer holds RGs, sync clean)
+            #    before returning — so we never arm an undrained primary (r1
+            #    Codex Critical). It also pre-checks peer-takeover-ready + HA
+            #    protocol compat and refuses otherwise.
+            print(f"   draining {node} -> {peer} (confirmed)...")
+            _node_exec(runner, backend, node,
+                       ["xpfd", "upgrade", "kernel", "drain"])  # check=True: abort on fail
+            drained = True
+            # 3. clear any STALE promotion marker so a prior roll to the SAME
+            #    version can't false-satisfy this roll's poll (r1 Codex High);
+            #    `arm` clears it in-guest too, belt-and-braces here for clarity.
+            # 4. arm+install+reboot into the candidate (in-guest verb). `arm`
+            #    reboots on success and the exec transport drops — expected, so
+            #    check=False. BUT a FAILED arm (UEFI/NVRAM preflight, package
+            #    install) also returns nonzero WITHOUT rebooting, which would
+            #    leave the node drained-but-running (r1 Codex High). We cannot
+            #    distinguish the two by exit code, so the poll below detects a
+            #    no-reboot (uname never changes off known-good while armed=none),
+            #    and the finally REJOINS a drained node that never rebooted.
+            print(f"   arming candidate {version} on {node} (will reboot)...")
+            _node_exec(runner, backend, node,
+                       ["xpfd", "upgrade", "kernel", "arm", version], check=False)
+            if runner.dry:
+                print(f"   (dry-run) would poll {node} for promoted={version}, "
+                      f"then `xpfd upgrade kernel rejoin`")
+                completed = True
+                return True
+            # 5. poll until back + promoted==version (or STOP on revert/timeout)
+            deadline = _time.time() + poll_deadline
+            promoted = False
+            while _time.time() < deadline:
+                _time.sleep(10)
+                st = _kernel_status(runner, backend, node)
+                running = _running_kernel(runner, backend, node)
+                if not running:
+                    rebooted = True   # transport dropped -> the box is rebooting
+                    continue          # node still rebooting / unreachable
+                if running == version:
+                    rebooted = True   # booted the candidate kernel
+                if st.get("promoted") == version and running == version:
+                    promoted = True
+                    break
+                # REVERT detection requires an AFFIRMATIVE status read (Copilot):
+                # a transient status-command failure yields an EMPTY dict whose
+                # `armed` is absent — do NOT treat that as armed=none (it would
+                # falsely `die` a revert). Only declare revert when status was
+                # actually read (`armed` key present) and explicitly == "none"
+                # while running a non-candidate kernel.
+                #
+                # AND it requires rebooted==True (r2 Codex): a genuine revert
+                # means the node REBOOTED to known-good (the reboot cleared the
+                # in-memory ForceSecondary drain, so no rejoin is needed). But an
+                # `arm` that FAILED its preflight BEFORE rebooting shows the SAME
+                # signature (running==known-good, armed=none) while still drained
+                # — it must NOT be classified as a revert, or `completed=True`
+                # would suppress the finally-rejoin and strand the node drained.
+                if (rebooted and running != version and "armed" in st
+                        and st.get("armed") == "none"):
+                    # node REBOOTED to a NON-candidate kernel and nothing is armed
+                    # -> it REVERTED. drain state is gone via the reboot, the node
+                    # self-recovers on its known-good boot — no rejoin needed.
+                    # STOP: leave peer primary, do NOT roll peer.
+                    completed = True   # drain state gone via the revert reboot
+                    die(f"{node} REVERTED (running {running}, not {version}); "
+                        f"stopping the roll — {peer} stays primary, {node} is on "
+                        f"its known-good kernel. Investigate before retrying.")
+                # NOT rebooted + armed=none + running==known-good post-drain ->
+                # `arm` failed its preflight without rebooting. Stop polling now;
+                # `completed` stays False + `rebooted` stays False, so the finally
+                # rejoins the still-drained node and the timeout `die` below
+                # reports the arm failure.
+                if (not rebooted and "armed" in st
+                        and st.get("armed") == "none" and running != version):
+                    break
+            if not promoted:
+                # If the node rebooted (revert/hang) the drain is already gone and
+                # the finally must NOT rejoin a possibly-candidate node; if it
+                # NEVER rebooted (arm failed pre-reboot) the finally rejoins the
+                # still-drained node. `rebooted` distinguishes the two.
+                completed = rebooted
+                die(f"{node} did not promote {version} within {poll_deadline}s "
+                    f"(running={running}, rebooted={rebooted}); stopping — "
+                    f"{peer} stays primary"
+                    + ("" if rebooted else f"; rejoining {node} (it never rebooted)"))
+            print(f"   {node} promoted {version}")
+            # 6. REJOIN + CONFIRM sync re-established BEFORE we touch the peer
+            #    (the "never both down" gate — r1 Codex Critical). `rejoin`
+            #    clears manual failover on ALL RGs and confirms peer-alive +
+            #    sync; a failure here STOPS the roll (the peer stays primary).
+            print(f"   rejoining {node} (confirming sync)...")
+            _node_exec(runner, backend, node,
+                       ["xpfd", "upgrade", "kernel", "rejoin"])  # check=True: abort on fail
+            completed = True
+            return True
+        finally:
+            # 7a. If we drained the node but the roll did not complete AND the
+            #     node never rebooted, the node is stuck ForceSecondary-drained
+            #     (e.g. `arm` failed its preflight before rebooting). REJOIN it
+            #     best-effort so it resumes forwarding — otherwise it sits drained
+            #     with no lease and a later retry could drain the peer while this
+            #     node is down, opening a no-primary window (r1 Codex High).
+            #     (A node that rebooted has already lost the in-memory drain.)
+            if drained and not completed and not rebooted and not runner.dry:
+                print(f"   roll did not complete and {node} never rebooted; "
+                      f"rejoining {node} to restore forwarding...")
+                try:
+                    _node_exec(runner, backend, node,
+                               ["xpfd", "upgrade", "kernel", "rejoin"], check=False)
+                except Exception as e:  # best-effort: never mask the original error
+                    print(f"   WARNING: best-effort rejoin of {node} failed: {e}")
+            # 7b. release this node's lease on both nodes (best-effort)
+            _clear_lease(runner, backend, node, holder)
+            _clear_lease(runner, backend, peer, holder)
+
+    roll_one(nodes[0], nodes[1])
+    print(f"\n==> {nodes[0]} done; rolling the second node")
+    roll_one(nodes[1], nodes[0])
+    print(f"\n==> LANE-1 HA kernel roll to {version} COMPLETE on both nodes")
+    return 0
+
+
 def main():
     argv = sys.argv[1:]
     if "-h" in argv or "--help" in argv or not argv:
@@ -599,7 +907,7 @@ def main():
     # `rest` now holds only the subcommand + its own args. The first token
     # is the subcommand; if it isn't one, treat the whole of `rest` as
     # YAML files for `deploy` (the bare-`xpf-deploy.py foo.yaml` shorthand).
-    if rest and rest[0] in ("deploy", "launch", "inventory", "fetch"):
+    if rest and rest[0] in ("deploy", "launch", "inventory", "fetch", "kernel-roll"):
         cmd, cmd_argv = rest[0], rest[1:]
     else:
         cmd, cmd_argv = "deploy", rest
@@ -633,6 +941,26 @@ def main():
         sub.add_argument("--config")
         sub.add_argument("--nic", action="append", default=[])
         args = sub.parse_args(cmd_argv)
+    elif cmd == "kernel-roll":
+        sub = argparse.ArgumentParser(prog="xpf-deploy.py kernel-roll", add_help=False)
+        sub.add_argument("--node", dest="nodes", action="append", default=[],
+                         required=True,
+                         help="HA node (incus name or ssh host); give it TWICE "
+                              "in roll order (first-to-roll then second)")
+        sub.add_argument("--version", required=True,
+                         help="candidate kernel uname -r to roll to")
+        sub.add_argument("--backend", default="incus", choices=["incus", "ssh"])
+        sub.add_argument("--node0-id", type=int, default=0,
+                         help="cluster node-id of the FIRST --node (default 0)")
+        sub.add_argument("--node1-id", type=int, default=1,
+                         help="cluster node-id of the SECOND --node (default 1)")
+        sub.add_argument("--lease-ttl", type=int, default=1800,
+                         help="kernel-roll lease TTL seconds (suppresses the "
+                              "node's local self-recovery during the roll)")
+        sub.add_argument("--boot-deadline", type=int, default=600,
+                         help="seconds to wait for a node to boot + promote the "
+                              "candidate before STOPPING the roll")
+        args = sub.parse_args(cmd_argv)
     else:  # deploy
         sub = argparse.ArgumentParser(prog="xpf-deploy.py deploy", add_help=False)
         sub.add_argument("yamls", nargs="*")
@@ -651,6 +979,8 @@ def main():
         return cmd_inventory(args)
     if cmd == "launch":
         return cmd_launch(args)
+    if cmd == "kernel-roll":
+        return cmd_kernel_roll(args)
     return cmd_deploy(args)
 
 

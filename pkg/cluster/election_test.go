@@ -167,6 +167,93 @@ func TestElection_SplitBrain_HigherNodeLoses(t *testing.T) {
 	}
 }
 
+// #1930 INC-2 r2 AGY Critical: a kernel-upgrade candidate boot sets an
+// unconditional election hold. Even ISOLATED (no peer) — where a normal node
+// auto-promotes to primary — the held node must stay SECONDARY until the
+// promotion gate verifies the dataplane. This is the case the prior
+// ForceSecondary fix missed (peerAlive=false at boot made it a no-op).
+func TestElection_KernelUpgradeHold_IsolatedStaysSecondary(t *testing.T) {
+	m := NewManager(0, 1)
+	m.SetKernelUpgradeHold() // candidate boot, before the cluster starts electing
+	if !m.KernelUpgradeHeld() {
+		t.Fatal("SetKernelUpgradeHold must make KernelUpgradeHeld report true")
+	}
+	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200}))
+	m.UpdateConfig(cfg)
+
+	// An ordinary isolated node would win the single-node election and be
+	// primary. The hold must keep it secondary even with no peer in sight.
+	if m.IsLocalPrimary(0) {
+		t.Fatal("kernel-upgrade hold must keep an isolated candidate SECONDARY")
+	}
+
+	// A peer timeout re-runs election; the hold must still keep us secondary
+	// (it is NOT auto-cleared the way ManualFailover is for an isolated node).
+	m.handlePeerTimeout()
+	if m.IsLocalPrimary(0) {
+		t.Fatal("kernel-upgrade hold must survive a re-election (not auto-cleared)")
+	}
+
+	// Clearing the hold (promote success / rejoin) lets it take its role.
+	m.ClearKernelUpgradeHold()
+	if m.KernelUpgradeHeld() {
+		t.Fatal("ClearKernelUpgradeHold must make KernelUpgradeHeld report false")
+	}
+	if !m.IsLocalPrimary(0) {
+		t.Fatal("after ClearKernelUpgradeHold the isolated node must become primary")
+	}
+}
+
+// Defense in depth (r2 AGY Finding 1): if the hold is ever set AFTER a group is
+// already primary, SetKernelUpgradeHold must DEMOTE it — not just block future
+// promotions — so the hold is correct regardless of call ordering.
+func TestElection_KernelUpgradeHold_DemotesAlreadyPrimary(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200}))
+	m.UpdateConfig(cfg)
+	// Isolated node — wins the single-node election and is primary.
+	if !m.IsLocalPrimary(0) {
+		t.Fatal("precondition: isolated node should be primary before the hold")
+	}
+	drainEvents(m, 4)
+
+	m.SetKernelUpgradeHold()
+	if m.IsLocalPrimary(0) {
+		t.Fatal("SetKernelUpgradeHold must DEMOTE an already-primary group")
+	}
+	// And it must stay secondary across a re-election.
+	m.handlePeerTimeout()
+	if m.IsLocalPrimary(0) {
+		t.Fatal("held node must stay secondary after re-election")
+	}
+}
+
+// r2 Codex HIGH (never-both-down): the orchestrator's gRPC rejoin clears manual
+// failover PER-RG via Manager.ResetFailover. That path MUST also drop the kernel
+// hold synchronously, so the rejoined node is election-eligible the instant
+// rejoin returns — otherwise the driver could drain the peer while this node is
+// still held secondary (both secondary, no primary).
+func TestResetFailover_ClearsKernelUpgradeHold(t *testing.T) {
+	m := NewManager(0, 1)
+	m.SetKernelUpgradeHold()
+	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200}))
+	m.UpdateConfig(cfg)
+	if m.IsLocalPrimary(0) {
+		t.Fatal("precondition: held candidate must be secondary")
+	}
+	drainEvents(m, 4)
+
+	if err := m.ResetFailover(0); err != nil {
+		t.Fatalf("ResetFailover: %v", err)
+	}
+	if m.KernelUpgradeHeld() {
+		t.Fatal("ResetFailover (rejoin) must clear the kernel-upgrade hold synchronously")
+	}
+	if !m.IsLocalPrimary(0) {
+		t.Fatal("after rejoin the isolated node must reclaim primary (hold cleared)")
+	}
+}
+
 func TestElection_LocalWeightZero_BecomesSecondary(t *testing.T) {
 	m := NewManager(0, 1)
 	cfg := makeConfig(makeRG(0, true, map[int]int{0: 250}))

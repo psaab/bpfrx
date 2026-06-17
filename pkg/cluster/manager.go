@@ -111,6 +111,12 @@ type Manager struct {
 	garpCounts     map[int]int // rgID -> gratuitous ARP count from config
 	history        *EventHistory
 
+	// kernelUpgradeHold, when set, unconditionally holds this node SECONDARY in
+	// election (#1930 INC-2): a kernel-upgrade candidate boot must not become
+	// primary until the promotion gate verifies the dataplane. Set BEFORE
+	// Start() on a candidate boot; cleared by promote/rejoin/revert.
+	kernelUpgradeHold bool
+
 	// Peer state tracking (heartbeat).
 	peerAlive    bool
 	peerEverSeen bool // true once first heartbeat received; distinguishes "never heard" from "lost"

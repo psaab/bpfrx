@@ -26,7 +26,7 @@ import (
 // 3 candidate REVERTED (promote path — the oneshot reboots to known-good).
 func runUpgradeKernelSubcommand(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: xpfd upgrade kernel {arm <version>|promote|status} [flags]")
+		fmt.Fprintln(os.Stderr, "usage: xpfd upgrade kernel {arm <version>|promote|status|drain|rejoin} [flags]")
 		os.Exit(1)
 	}
 	verb := args[0]
@@ -38,6 +38,9 @@ func runUpgradeKernelSubcommand(args []string) {
 			"needs one external reset)")
 	beaconDeadline := fs.Duration("beacon-deadline", 20*time.Second,
 		"forward-health-beacon deadline on the candidate boot (promote)")
+	drainDeadline := fs.Duration("drain-deadline", 30*time.Second,
+		"deadline for the STRONG drain predicate (drain) / rejoin confirm (rejoin)")
+	unit := fs.String("unit", "xpfd", "systemd unit (cluster gRPC target)")
 	if err := fs.Parse(args[1:]); err != nil {
 		os.Exit(1)
 	}
@@ -90,20 +93,61 @@ func runUpgradeKernelSubcommand(args []string) {
 		fmt.Println("kernel candidate promoted")
 
 	case "status":
+		// Report the durable promotion marker too — the external HA orchestrator
+		// (INC-2) polls this post-reboot to confirm "this node promoted version
+		// X" (the journal is cleared on promote, so the marker is the durable
+		// signal). Machine-parseable: "promoted=<uname>" / "promoted=none".
+		promoted, perr := cfg.Sys.ReadPromotionMarker()
+		if perr != nil {
+			fmt.Fprintf(os.Stderr, "upgrade kernel status: read promotion marker: %v\n", perr)
+			os.Exit(1)
+		}
+		if promoted == "" {
+			fmt.Println("promoted=none")
+		} else {
+			fmt.Printf("promoted=%s\n", promoted)
+		}
 		armed, j, err := r.IsArmed()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "upgrade kernel status: %v\n", err)
 			os.Exit(1)
 		}
 		if !armed {
-			fmt.Println("no kernel upgrade armed")
+			fmt.Println("armed=none")
 			return
 		}
-		fmt.Printf("armed: candidate=%s known-good=%s active-slot=%s inactive-slot=%s state=%s\n",
+		fmt.Printf("armed=true candidate=%s known-good=%s active-slot=%s inactive-slot=%s state=%s\n",
 			j.CandidateVersion, j.KnownGoodVersion, j.ActiveSlot, j.InactiveSlot, j.State)
 
+	case "drain":
+		// Non-interactive drain for the external HA roll (r1 Codex Critical:
+		// `cli -c 'request system ... in-service-upgrade'` cannot confirm in a
+		// non-TTY, and the cli path needs interactive confirmation). This drives
+		// the SAME automation path #1917 rolling uses (ForceSecondary via the
+		// gRPC SystemAction) and CONFIRMS the STRONG drain predicate (peer holds
+		// the RGs + sync clean) before reporting success — so the orchestrator
+		// never arms+reboots an undrained primary.
+		cl := upgrade.NewCLICluster(*unit)
+		if err := upgrade.DrainAndConfirm(cl, *drainDeadline); err != nil {
+			fmt.Fprintf(os.Stderr, "upgrade kernel drain: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("drained (peer holds all RGs, sync clean)")
+
+	case "rejoin":
+		// Non-interactive rejoin: clear manual failover on all RGs and confirm
+		// the node is back as an eligible cluster member with sync re-established
+		// (so the orchestrator never advances to the peer until this node is
+		// fully rejoined — r1 Codex Critical "never both down").
+		cl := upgrade.NewCLICluster(*unit)
+		if err := upgrade.RejoinAndConfirm(cl, *drainDeadline); err != nil {
+			fmt.Fprintf(os.Stderr, "upgrade kernel rejoin: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("rejoined (manual failover cleared, sync re-established)")
+
 	default:
-		fmt.Fprintf(os.Stderr, "upgrade kernel: unknown verb %q (want arm|promote|status)\n", verb)
+		fmt.Fprintf(os.Stderr, "upgrade kernel: unknown verb %q (want arm|promote|status|drain|rejoin)\n", verb)
 		os.Exit(1)
 	}
 }

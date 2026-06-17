@@ -167,3 +167,80 @@ before the first cut (future work).
   (decoupled-helper re-attach) is future M-mech-2. The HA path masks the
   gap with a single ~60ms VRRP failover per node.
 - Kernel/OS upgrades are #1930; a signed/hosted apt repo is #1924.
+
+## LANE-1 HA kernel roll (#1930 INC-2)
+
+A kernel bump can't be cut over in place (the running kernel can't be
+swapped while live), so the kernel channel uses a fixed A/B UEFI boot
+slot pair. `xpfd upgrade kernel` arms the INACTIVE slot's selector at the
+candidate kernel and reboots one-shot (`efibootmgr --bootnext`, which the
+firmware clears on the next boot — the loop-safety floor). On the
+candidate boot, `xpf-kernel-promote.service` runs the kernel-space
+`verify-dataplane` gate plus a forward beacon; on success it promotes
+(non-destructive `BootOrder` front), on failure it reverts (bounded by
+`maxPromoteAttempts`, then `restoreKnownGood`). The journal at
+`/var/lib/xpf/kernel-upgrade.state` makes the trial crash-safe and
+idempotent across the reboot.
+
+In a cluster the roll is driven ONE NODE AT A TIME by the external
+orchestrator (`scripts/deploy/xpf-deploy.py kernel-roll`): drain
+secondary-first (`xpfd upgrade kernel drain`, which confirms the peer
+holds every RG before returning), arm+reboot into the candidate, poll
+until `status` reports `promoted=<ver>` AND `uname -r` matches, then
+`rejoin` (which confirms sync re-established before touching the peer).
+A reverted node boots the OLD kernel and reports `promoted!=<ver>` → the
+driver STOPS and never touches the peer (never-both-down).
+
+Three independent safety nets keep an UNVERIFIED candidate from ever
+carrying traffic:
+
+1. **Election hold (`kernelUpgradeHold`).** A candidate boot sets an
+   unconditional SECONDARY hold in `pkg/cluster` election BEFORE
+   `cluster.Start()` (the orchestrator's in-memory `ForceSecondary` drain
+   is lost across the reboot, and `peerAlive` is still false at boot so a
+   ForceSecondary call would be a no-op). Unlike `ManualFailover` this
+   hold is NOT auto-cleared for an isolated node — a candidate with a
+   broken dataplane stays secondary even if it can't see the peer. It is
+   set BEFORE `cluster.UpdateConfig` (which itself runs the first
+   election) — not merely before `Start()` — so a candidate can never win
+   even the initial single-node election. `SetKernelUpgradeHold` also
+   DEMOTES any already-primary group as defense in depth. The hold is
+   released only when the candidate is affirmatively VERIFIED+PROMOTED:
+   the promotion gate runs in a SEPARATE process
+   (`xpf-kernel-promote.service`, `After=xpfd`) and writes a durable
+   promotion marker for the running kernel, so the daemon reconciles the
+   hold on a 5s cadence and releases it only once the marker NAMES THE
+   RUNNING KERNEL. A bare "no longer armed" test would be unsafe on the
+   revert path: `revert()` clears the journal and THEN reboots, so a
+   not-armed test could release the hold while the broken candidate is
+   still running (transient split-brain) — the marker test fails safe (a
+   reverted node reboots to known-good, where the hold is never set).
+   On a gate HANG/timeout the unit's `OnFailure=` triggers
+   `xpf-kernel-promote-failed.service`, which reboots once to known-good
+   (the firmware-cleared BootNext + un-reordered BootOrder land it there)
+   so a hung verify never leaves the node held secondary forever.
+2. **Lease-suppressed self-recovery.** If the orchestrator CRASHES while a
+   node is drained+rebooting, the node would sit passive forever. The
+   bounded local self-recovery (`pkg/upgrade/KernelSelfRecovery`,
+   30s safety-net loop) auto-rejoins ONLY on the unambiguous crashed-roll
+   fingerprint: an EXPIRED roll lease naming this node
+   (`/var/lib/xpf/kernel-roll.lease`), a drained local node, and a
+   healthy primary peer, held continuously for the grace window. A
+   manually drained node or a #1917 binary-rolling drain never wrote a
+   kernel-roll lease (`leaseNone`) and is left alone.
+3. **Still-armed gate.** Self-recovery refuses to rejoin while the kernel
+   journal is still ARMED even if the lease has expired — a legitimately
+   long-hanging roll (one that outran its lease TTL) is still a trial in
+   flight; the promote/revert oneshot owns the resolution, and the
+   election hold keeps the node secondary meanwhile.
+
+### Persistence precondition
+
+The kernel channel REQUIRES `/var/lib/xpf` to be PERSISTENT across
+reboots. The candidate journal (`kernel-upgrade.state`) is the only
+record that a boot is a candidate trial; if it were on tmpfs/volatile
+storage it would vanish on the candidate reboot, the election hold would
+not be set (the node would not know it is a candidate), and an unverified
+candidate could become primary. The journaled state machine for the
+#1917 binary roll has the same requirement. This is a platform invariant
+of the appliance image (`docs/install-images.md`), not a tunable.

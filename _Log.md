@@ -1,5 +1,112 @@
 # Action Log
 
+## 2026-06-16 — #1930 INC-2: Codex 2 HIGH (arm-fail drain leak, rejoin/hold race)
+- **Timestamp**: 2026-06-16 UTC
+- **Action**: Fixed Codex's two HIGH findings. HIGH-1 (arm-failure leaves
+  node drained): `arm` is called check=False (a successful arm reboots →
+  nonzero exit), so an arm preflight FAILURE that never reboots left the
+  node ForceSecondary-drained with no lease; a retry could drain the peer
+  → no-primary window. Fix: track drained/completed/rebooted in roll_one;
+  the finally REJOINS a drained node that never rebooted (best-effort),
+  restoring forwarding. A rebooted node already lost the in-memory drain
+  so it is left alone. HIGH-2 (rejoin returns before hold clears →
+  both-secondary up to 5s): made Manager.ResetFailover (the gRPC rejoin
+  path) drop kernelUpgradeHold INLINE per-RG, so the node is
+  election-eligible the instant rejoin returns. Tests:
+  TestResetFailover_ClearsKernelUpgradeHold.
+- **File(s)**: scripts/deploy/xpf-deploy.py, pkg/cluster/failover.go,
+  pkg/cluster/kernel_selfrecover.go, pkg/cluster/election_test.go
+
+## 2026-06-16 — #1930 INC-2: Copilot findings (orchestrator + drain + lease)
+- **Timestamp**: 2026-06-16 UTC
+- **Action**: Addressed Copilot review findings on the final diff. (Stale,
+  already fixed: hold-before-UpdateConfig.) Fixed: (1) xpf-deploy.py
+  IndexError on a single --node + identical-node collapse — validate the
+  pair before indexing; (2) REVERT detection falsely firing on a transient
+  status-read failure — require the `armed` key present AND == "none"
+  (affirmative read), not a missing key; (3) ssh backend hang on
+  host-key/password prompt — BatchMode=yes + ConnectTimeout=15;
+  (4) DrainAndConfirm/RejoinAndConfirm deadline overshoot — sleepBounded
+  caps the final sleep to remaining time; (5) readLeaseState swallowed
+  non-NotExist read errors silently — now logs them (still leaseNone =
+  safe no-op in the leaseExpiredOurs-only Tick).
+- **File(s)**: scripts/deploy/xpf-deploy.py, pkg/upgrade/kernel_drain.go,
+  pkg/upgrade/kernel_selfrecover.go
+
+## 2026-06-16 — #1930 INC-2: AGY r2 Findings 1/2/3 (demote, revert race, timeout)
+- **Timestamp**: 2026-06-16 UTC
+- **Action**: Addressed AGY r2's three findings. F1 (CRITICAL, already
+  fixed by the pre-UpdateConfig ordering) + defense-in-depth:
+  SetKernelUpgradeHold now also DEMOTES any already-primary group so the
+  hold is correct regardless of call ordering. F2 (HIGH, real race I
+  introduced): reconcileKernelUpgradeHold released the hold on a bare
+  "not armed" test, but revert() clears the journal THEN reboots — the
+  broken candidate could transiently claim primary in that window.
+  Changed the release predicate to "promotion marker NAMES THE RUNNING
+  KERNEL" (written only on PROMOTE); a reverted node reboots to
+  known-good where the hold is never set, so it fails safe. F3 (MEDIUM):
+  a gate HANG/timeout left the node held SECONDARY forever; added
+  OnFailure=xpf-kernel-promote-failed.service (new unit) that reboots
+  once to known-good, plus bake.py copy-in. Tests:
+  TestElection_KernelUpgradeHold_DemotesAlreadyPrimary.
+- **File(s)**: pkg/cluster/kernel_selfrecover.go,
+  pkg/daemon/kernel_selfrecover.go, pkg/cluster/election_test.go,
+  scripts/image/xpf-kernel-promote.service,
+  scripts/image/xpf-kernel-promote-failed.service, scripts/image/bake.py,
+  docs/in-place-upgrade.md
+
+## 2026-06-16 — #1930 INC-2: set hold BEFORE UpdateConfig (election window) (SMR)
+- **Timestamp**: 2026-06-16 UTC
+- **Action**: Claude SMR caught a residual election window: the hold was
+  set AFTER `cluster.UpdateConfig(cc)`, but UpdateConfig ITSELF runs an
+  election (single-node path on a candidate boot, no peer up yet) and
+  promotes the node to StatePrimary before the hold takes effect — then
+  Start()'s heartbeat/VRRP would advertise primary and preempt the
+  healthy peer (the exact CRITICAL). Moved
+  holdSecondaryIfKernelCandidateArmed() to run right after NewManager
+  (pure construction, no election) and BEFORE UpdateConfig. Verified
+  NewManager triggers no election/goroutine, so this fully closes the
+  window: the first election (inside UpdateConfig) now sees the hold.
+- **File(s)**: pkg/daemon/daemon_run.go
+
+## 2026-06-16 — #1930 INC-2: fix leaked election hold after promote (SMR)
+- **Timestamp**: 2026-06-16 UTC
+- **Action**: Claude SMR caught a leaked-hold: the promotion gate runs in
+  a SEPARATE process (`xpf-kernel-promote.service`, After=xpfd) that
+  clears only the on-disk journal, so the running daemon's in-memory
+  `kernelUpgradeHold` would never clear after a SUCCESSFUL promote — the
+  verified candidate would stay SECONDARY forever. Added
+  `Manager.KernelUpgradeHeld()` getter + a 5s daemon reconcile loop
+  (`reconcileKernelUpgradeHold`) that releases the hold once the journal
+  is no longer ARMED (promoted/reverted). 5s cadence (not the 30s
+  self-recovery tick) for fast failback. Hold persists while still armed.
+- **File(s)**: pkg/cluster/kernel_selfrecover.go,
+  pkg/daemon/kernel_selfrecover.go, pkg/cluster/election_test.go,
+  docs/in-place-upgrade.md
+
+## 2026-06-16 — #1930 INC-2: AGY r2 candidate-preempt fix (/engineer)
+- **Timestamp**: 2026-06-16 UTC
+- **Action**: Fixed AGY r2 CRITICAL — the r1 candidate-preempt fix
+  (`ForceSecondary` at startup) was a no-op because `peerAlive` is false
+  before heartbeats start, leaving a kernel candidate election-eligible
+  at boot. Replaced with an unconditional `kernelUpgradeHold` election
+  flag honored in BOTH `electRG` (peer-aware) and `electSingleNode`
+  (isolated) paths — the isolated path was the real hole (a candidate
+  with no peer yet auto-promotes). Hold is set BEFORE `cluster.Start()`,
+  is NOT auto-cleared (unlike ManualFailover), cleared only by
+  promote/rejoin/revert. `ClearKernelUpgradeHold` re-elects via the same
+  peer-aware dispatch so an isolated cleared node promotes. Also
+  addressed AGY r2's long-hanging-roll TTL split-brain: self-recovery
+  now refuses to rejoin while the kernel journal is STILL ARMED even on
+  an expired lease (the promote/revert oneshot owns the resolution).
+  Documented the `/var/lib/xpf` persistence precondition + the three
+  candidate safety nets in docs/in-place-upgrade.md.
+- **File(s)**: pkg/cluster/election.go, pkg/cluster/manager.go,
+  pkg/cluster/kernel_selfrecover.go, pkg/cluster/election_test.go,
+  pkg/daemon/daemon_run.go, pkg/daemon/kernel_selfrecover.go,
+  pkg/upgrade/kernel_selfrecover.go,
+  pkg/upgrade/kernel_selfrecover_test.go, docs/in-place-upgrade.md
+
 ## 2026-06-16 — #1922 PR-1 (Item 1a): commit-confirmed service-mode rollback executor (/engineer)
 - **Timestamp**: 2026-06-16 UTC
 - **Action**: Made the commit-confirmed timeout rollback atomic and
@@ -5495,3 +5602,19 @@ top.
 - **Timestamp**: 2026-06-16
   - **Action**: #1930 INC-1 (PR-2) — LANE-1 A4 kernel channel: Go state machine + static substrate. Added pkg/upgrade/kernel.go (KernelState/KernelJournal/KernelSystem interface + slot consts), pkg/upgrade/kernel_run.go (Arm: preflight→install→arm→reboot; Promote: BootCurrent+uname+verify-dataplane+forward-beacon gates → non-destructive BootOrder reorder, else revert; journaled/idempotent), pkg/upgrade/kernel_test.go (17 tests, fake KernelSystem; happy promote, 5 revert paths, 6 fail-closed preflight aborts, default-move + rehold aborts, idempotent re-arm, no-op-when-not-armed). Static substrate: scripts/image/grub.d/09_xpf ($cmdpath-branched menuentry, grub-script-check OK on real Ubuntu GRUB), scripts/image/xpf-uefi-slots(+.service) (separate non-blocking idempotent NVRAM slot registration, NOT Before=xpfd), bake.py stages A/B slot dirs (shim+grub+seeded GRUB-script selector) + GRUB_DISABLE_SUBMENU=y + enables the oneshot + watchdog-persistence README + kernel-channel dir. realKernelSystem (kernel_linux.go) delegated to Codex.
   - **File(s)**: pkg/upgrade/kernel.go, pkg/upgrade/kernel_run.go, pkg/upgrade/kernel_test.go, scripts/image/grub.d/09_xpf, scripts/image/xpf-uefi-slots, scripts/image/xpf-uefi-slots.service, scripts/image/bake.py, _Log.md
+
+- **Timestamp**: 2026-06-16
+  - **Action**: #1930 INC-2 (PR-3) signal surface — durable promotion marker. Added KernelSystem.WritePromotionMarker/ReadPromotionMarker (kernel.go interface + kernel_linux.go /var/lib/xpf/kernel-promoted via fsatomic); Promote() writes it before clearing the journal; `xpfd upgrade kernel status` now reports machine-parseable promoted=<uname>/none + armed=true/none so the external HA orchestrator can poll the post-reboot version-check. Fake updated.
+  - **File(s)**: pkg/upgrade/kernel.go, pkg/upgrade/kernel_run.go, pkg/upgrade/kernel_linux.go, cmd/xpfd/upgrade_kernel.go, pkg/upgrade/kernel_test.go, _Log.md
+
+- **Timestamp**: 2026-06-16
+  - **Action**: #1930 INC-2 bounded local self-recovery. pkg/upgrade/kernel_selfrecover.go (KernelSelfRecovery: lease-suppressed, drained+healthy-peer+grace -> auto ResetFailover; 7 unit tests). pkg/cluster/kernel_selfrecover.go (Manager.LocalDrained/PeerHealthyPrimary/ResetAllFailover predicates). pkg/daemon/kernel_selfrecover.go (adapter + HA-only 30s safety-net loop, wired after cluster.Start). Guards the orchestrator-crash-mid-roll case (r2 AGY).
+  - **File(s)**: pkg/upgrade/kernel_selfrecover.go, pkg/upgrade/kernel_selfrecover_test.go, pkg/cluster/kernel_selfrecover.go, pkg/daemon/kernel_selfrecover.go, pkg/daemon/daemon_run.go, _Log.md
+
+- **Timestamp**: 2026-06-16
+  - **Action**: #1930 INC-2 external HA kernel-rolling driver. xpf-deploy.py `kernel-roll --node A --node B --version V [--backend incus|ssh] [--node0-id/--node1-id] [--lease-ttl] [--boot-deadline]`: per-node lease-on-both (suppresses the node's local self-recovery + cluster lock) -> drain -> `xpfd upgrade kernel arm` (reboot into candidate) -> poll `xpfd upgrade kernel status` for promoted==version + uname==version (STOP+leave-peer-primary on revert/timeout) -> rejoin -> release lease, node0 then node1. Dry-run validated.
+  - **File(s)**: scripts/deploy/xpf-deploy.py, _Log.md
+
+- **Timestamp**: 2026-06-16
+  - **Action**: #1930 INC-2 Codex review fixes (3 Critical + 2 High). Added non-interactive `xpfd upgrade kernel drain` (ForceSecondary + CONFIRM strong drain predicate, pre-checks peer-takeover-ready + HA-compat) and `rejoin` (ResetFailover-all + CONFIRM sync) verbs (pkg/upgrade/kernel_drain.go DrainAndConfirm/RejoinAndConfirm + 8 tests). Driver now: checks for an active lease on both nodes before writing (cluster mutex); drains via the verb (was a TTY-broken `cli -c`); rejoins+confirms sync before touching the peer (never-both-down); writes lease expiry in the NODE's clock (date -d, clock-skew safe). Arm() clears a stale promotion marker (ClearPromotionMarker). INC-2 validation doc written.
+  - **File(s)**: cmd/xpfd/upgrade_kernel.go, pkg/upgrade/kernel_drain.go, pkg/upgrade/kernel_drain_test.go, pkg/upgrade/kernel.go, pkg/upgrade/kernel_linux.go, pkg/upgrade/kernel_run.go, pkg/upgrade/kernel_test.go, scripts/deploy/xpf-deploy.py, docs/pr/1930-inc2-ha-kernel-roll/validation.md, _Log.md

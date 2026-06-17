@@ -338,6 +338,9 @@ def virt_customize(work_qcow, xpf_deb):
         # gate + reboot-on-revert on a candidate trial boot.
         "--copy-in", f"{HERE}/xpf-kernel-promote:/usr/local/sbin",
         "--copy-in", f"{HERE}/xpf-kernel-promote.service:/usr/lib/systemd/system",
+        # OnFailure recovery unit: reboots to known-good if the gate hangs/times
+        # out (r2 AGY Finding 3). Triggered via OnFailure= — no enable needed.
+        "--copy-in", f"{HERE}/xpf-kernel-promote-failed.service:/usr/lib/systemd/system",
         "--run-command", "chmod 0755 /usr/local/sbin/xpf-kernel-promote",
         "--run-command", "systemctl enable xpf-kernel-promote.service",
         # Stage the A/B slot dirs: copy the signed shim+grub (so each slot boots
