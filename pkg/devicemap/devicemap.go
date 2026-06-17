@@ -121,9 +121,11 @@ func Resolve(entries []config.DeviceMapEntry, nics []PresentNIC, rethMembers map
 			}
 		}
 
+		pciTried := false
 		for _, key := range keySequence(e, allowPCI, allowMAC) {
 			switch key {
 			case config.DeviceMapKeyPCI:
+				pciTried = true
 				pm := byPCI[strings.ToLower(e.PCIAddr)]
 				if len(pm) > 1 {
 					// Two present NICs share one PCI address — ambiguous,
@@ -144,13 +146,13 @@ func Resolve(entries []config.DeviceMapEntry, nics []PresentNIC, rethMembers map
 			case config.DeviceMapKeyMAC:
 				matches := byPermMAC[strings.ToLower(e.MAC)]
 				if len(matches) == 1 {
-					// BindBoundViaMAC means MAC matched as a FALLBACK after PCI
-					// missed. Only set it when the effective key order is
-					// pci-then-mac (PCI was tried first). For key=mac or
-					// key=mac-then-pci, MAC is the primary identity key and
-					// BindBound is the correct status.
+					// "via MAC fallback (PCI moved, re-pin)" is only true when
+					// MAC was reached as a FALLBACK after a PCI miss — i.e. PCI
+					// was tried first and did not bind (Copilot). For a MAC-
+					// primary key order (key mac / mac-then-pci) the MAC bind
+					// is the intended primary, so report a clean BindBound.
 					st := BindBound
-					if allowPCI && e.EffectiveKeyOrder() == config.DeviceMapKeyPCIThenMAC {
+					if pciTried {
 						st = BindBoundViaMAC
 					}
 					rb.Status, rb.CurrentNIC, rb.Logical = st, matches[0].Name, logical
