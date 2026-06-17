@@ -1,9 +1,12 @@
 # Upgrade-subsystem hardening — plan of action (review-011)
 
-**Status:** DRAFT v2.1 — r1 was PLAN-NEEDS-MAJOR from all three reviewers
-(Codex, AGY, Claude SMR). v2 folded every r1 finding; v2.1 corrects the
-staged-overwrite-race resolution (the CopyTree checksum does NOT close it —
-verified; the fix is a preinst lock gate). Pending r2.
+**Status:** DRAFT v2.2 — r1 all-three PLAN-NEEDS-MAJOR (folded in v2);
+r2 Claude SMR + AGY both PLAN-NEEDS-MINOR (folded here in v2.2); Codex r2
+infra-dropped, retried on v2.2. v2.2 adds: verify-dataplane as the real
+torn-binary backstop (not the preinst gate), C as an unconditional pre-STOP
+invariant, preinst idempotency hardening, lock re-entrancy for the rolling
+path, flip-failure non-nil return, postrm purge handling, preinst exec
+fallback.
 **Base:** `3cd181323` (origin/master)
 **Issues:** #1964 (F1, HIGH), #1965 (F2, HIGH), #1966 (F3, LOW), #1967 (C1–C4 +
 two new must-fixes, MEDIUM). `/research` only — no code is written here.
@@ -90,11 +93,20 @@ versioned rollback target, because it does not know those paths exist.
   `debian/xpf.preinst` — running *before* unpack, using only old on-disk files
   + coreutils — copies the OLD `staged/*` into `versions/<oldver>/` via a
   `.partial` dir + atomic rename, sets `versions/current → <oldver>`, and
-  atomically repoints sbin through `versions/current`. **Idempotent:** if
-  `versions/current` already exists, no-op; additionally guard against a prior
-  crashed attempt by recording the snapshot only when the staged binary's
-  runtime version still equals `<oldver>` (AGY-1). Writes **no** upgrade
-  journal (preserves journal idempotency).
+  atomically repoints sbin through `versions/current`. **Idempotency /
+  crash-safety (AGY-r2-1):** the no-op gate must check **both** that
+  `versions/current` exists **AND** that every `sbin/*` already resolves
+  through `versions/current` — a crash *after* `current` is created but
+  *before* sbin is repointed must, on retry, still complete the sbin repoint
+  (otherwise unpack overwrites `staged/` under a daemon still pointed there).
+  Simplest robust form: always run the (idempotent, fast) sbin repoint
+  unconditionally, and gate only the snapshot-copy on `versions/current`
+  absence. Always `rm -rf versions/<oldver>.partial` before copying. Snapshot
+  only when the staged runtime version still equals `<oldver>` (AGY-1).
+  **`<oldver>` source (AGY-r2-4):** try `staged/xpfd version` (validated safe
+  segment); if the old binary will not exec (corrupt / lib / arch mismatch),
+  **fall back to a sanitized dpkg `$2`** and do NOT fail the transaction on
+  exec failure. Writes **no** upgrade journal.
 - **C — refuse-before-STOP (Go, runner.go).** Before `StopUnit`, hard-fail the
   cut when `PreviousVersion==""` and the run is not an explicitly sanctioned
   no-rollback first cut. Guarantees a healthy daemon is never stopped without a
@@ -105,11 +117,12 @@ versioned rollback target, because it does not know those paths exist.
 postinst/runner-side logic + tests. The legacy preinst migration (B) is shell
 in `debian/xpf.preinst` (cannot use the not-yet-unpacked Go binary).
 
-**postrm:** extend `debian/xpf.postrm` to also remove sbin links pointing
-through `versions/current`. `versions/` is runtime state — treat like
-`/etc/xpf`: leave on `remove`, and either leave on `purge` or remove only the
-maintainer-managed tree (decide in r2; default: leave, like other runtime
-state).
+**postrm (AGY-r2-§5.3):** extend `debian/xpf.postrm` to also remove sbin links
+pointing through `versions/current`. `versions/` is package-derived (not user
+config): **leave on `remove`, remove the maintainer-managed `versions/` tree on
+`purge`** (Debian Policy §6.8 — purge removes all package state). Unlike
+`/etc/xpf` (master.key/configdb — deliberately never touched), `versions/` is
+just copied binaries, so purge-removal is correct.
 
 **Version key:** `staged/xpfd version` (runtime), validated as a safe single
 path segment (shared with C1).
@@ -127,12 +140,17 @@ path segment (shared with C1).
 - **One host-wide lock** `/run/xpf/upgrade.lock` via `unix.Flock(LOCK_EX|
   LOCK_NB)`, covering `xpfd upgrade`, `xpfd upgrade --rolling`, postinst cut,
   and mutating `xpfd upgrade kernel …`. `/run` tmpfs → reboot-clear (resume is
-  journal-driven, not lock-driven). Owner metadata (PID, subcommand, target,
-  start time) in the lock file; busy errors name the owner. Status / kernel
-  `status` stay lock-free (or `LOCK_SH`).
-- **Rolling scope (AGY-3):** acquire at `RunRolling` entry, hold through
-  rejoin — covers the peer-check + ForceSecondary + ≤30 s drain window, not
-  just `r.Run()`.
+  journal-driven, not lock-driven); `mkdir -p /run/xpf` before acquire (tmpfs
+  may lack the dir after reboot — AGY-r2-§5.6). Owner metadata (PID, subcommand,
+  target, start time) in the lock file; busy errors name the owner. Status /
+  kernel `status` stay lock-free (or `LOCK_SH`).
+- **Rolling scope (AGY-3) + re-entrancy (AGY-r2-4):** acquire at `RunRolling`
+  entry, hold through rejoin — covers the peer-check + ForceSecondary + ≤30 s
+  drain window, not just `r.Run()`. **`r.Run()` invoked under `RunRolling` must
+  NOT re-acquire** (a second `flock` on a new fd of the same file would
+  `EWOULDBLOCK` and abort the rolling upgrade): thread an
+  `Options.LockAlreadyHeld` (or pass the held lock handle) so the inner cut
+  skips acquisition.
 - **dpkg-clobbers-staged (Codex-3 / SMR-M3) — CORRECTED in v2.1.** The rollback
   target is safe (it lives in `versions/`, dpkg-untracked — §4). But the *source
   race* — dpkg overwriting `staged/` while a concurrent operator `xpfd upgrade`
@@ -141,15 +159,20 @@ path segment (shared with C1).
   **source bytes as it reads them**, and `verifySum` re-reads the **dest**; a
   concurrent source overwrite yields matching torn bytes on both sides
   (undetected). The checksum catches copy/disk corruption, not concurrent
-  source mutation. **Real fix:** `debian/xpf.preinst` acquires
-  `/run/xpf/upgrade.lock` (`LOCK_NB`) and **fails the package operation before
-  unpack** if busy — serializing dpkg's `staged/` overwrite against an
-  in-flight operator `xpfd upgrade`. Failing at preinst (before any mutation)
-  is the clean place for fail-loud: the apt transaction aborts before unpack,
-  no half-configured state. Caveat: a flock fd does not survive the preinst→
-  postinst process boundary, so preinst check-and-release leaves a tiny TOCTOU
-  window (operator grabs the lock between preinst and postinst) — covered by
-  postinst's own `LOCK_NB` acquire (next bullet).
+  source mutation. **Fix (layered, corrected per SMR-r2-m1):**
+  (i) `debian/xpf.preinst` acquires `/run/xpf/upgrade.lock` (`LOCK_NB`) and
+  **fails the package operation before unpack** if busy — this blocks the case
+  where an operator *already holds* the lock when apt starts (clean fail-loud,
+  apt aborts before any mutation). It does **NOT** fully serialize unpack vs a
+  concurrent operator copy: a flock fd dies at preinst exit, so the lock is not
+  held *during* dpkg's unpack, and an operator who acquires the (now-free) lock
+  *during* unpack can still read a torn `staged/`. (ii) **The real torn-binary
+  backstop is `verify-dataplane`** (cutover.go:151), which runs the kernel
+  verify gate against the COPIED binary **before** StopUnit — a torn/non-
+  execable ELF fails verify (or fails to exec) and aborts the cut while the
+  daemon is still up. (iii) Document operator guidance: do not run `xpfd
+  upgrade` during `apt upgrade`. So the outcome is safe (no bad cut commits),
+  even though the preinst gate alone does not close the read window.
 - **postinst contention policy (residual after the preinst guard):** in the
   rare TOCTOU case where the lock became busy between the preinst check and
   postinst, post-unpack `LOCK_NB` failure logs loudly "another upgrade in
@@ -176,15 +199,21 @@ the drain window.
   (system_linux.go:123). MEDIUM robustness (defense-in-depth + benign
   format-drift).
 - **NEW must-fix — flip-failure rollback (AGY-5):** on `flip()` failure
-  (cutover.go:174-177), trigger rollback to `PreviousVersion` (or, where none
-  exists, C has already prevented the STOP). Closes the stranded-offline-daemon
-  path. **Add to #1967.**
+  (cutover.go:174-177), trigger rollback to `PreviousVersion`. This is safe
+  because **C is an unconditional pre-STOP invariant** (§8): the unit is never
+  stopped unless a restorable target exists OR it is a sanctioned no-rollback
+  first cut. In the sanctioned-first-cut case (`PreviousVersion==""`) a flip
+  failure has no prior daemon to preserve, but must still restart the
+  first-install binary (present in `versions/current` via A/B). **The
+  rollback-after-flip-failure path must return a non-nil error** (AGY-r2-4b) so
+  `postinst` does not treat a rolled-back upgrade as success. **Add to #1967.**
 - **NEW — postrm versioned-link cleanup (Codex):** §4. **Add to #1967.**
-- **C2:** largely redundant — flip.go:52 already returns daemon-reload failure;
-  keep only the resumed-flip re-validation nuance, or drop.
-- **C3:** verify `versions/<ver>/` before StartUnit — optional, diagnostic /
-  HA-fail-fast value (outcome already covered by START-failure auto-rollback,
-  cutover.go:183).
+- **C2: DROP** (converged, SMR-r2 + AGY-r2 + Codex-r1) — flip.go:52 already
+  returns daemon-reload failure; no added safety.
+- **C3: KEEP as diagnostic only** — verify `versions/<ver>/` before StartUnit
+  for clearer errors / HA fail-fast; the outcome is already covered by
+  START-failure auto-rollback (cutover.go:183), so this is not a correctness
+  fix.
 - **C4:** `SyncDir(VersionsDir)` immediately after `removeAllPartials()`.
 
 ## 7. Public API / contract preservation
@@ -200,8 +229,15 @@ the drain window.
 
 - First install leaves the daemon launchable immediately (seed before
   `#DEBHELPER#`, no cut at install).
-- The running daemon is never stopped without a restorable on-disk target
-  (C + flip-failure rollback + the `versions/` contract).
+- **C is an unconditional pre-STOP invariant (SMR-r2-m2):** no cut path calls
+  `StopUnit` unless (a) a restorable target exists (`PreviousVersion!=""` →
+  flip-failure rollback can recover) OR (b) it is an explicitly sanctioned
+  no-rollback first cut (no prior daemon to preserve; flip failure restarts the
+  first-install binary from `versions/current`). Together with flip-failure
+  rollback (§6) and the `versions/` contract, the daemon is never stopped
+  without a recovery path. This coupling must be provably exhaustive (a test
+  asserting no `StopUnit` is reachable with `PreviousVersion==""` outside the
+  sanctioned first cut).
 - `versions/` is maintainer-script-managed, dpkg-untracked → never clobbered by
   unpack; dpkg only writes `staged/`.
 - Resume-after-crash stays journal-driven; lock is reboot-clearing (`/run`).
@@ -224,21 +260,26 @@ the drain window.
 True zero-gap cut-over (M-mech-2); cluster-orchestration changes; #1961 /
 #1962 / #1960; #1966 doc edit (ship-direct).
 
-## 11. Open questions for r2
+## 11. Resolutions (r2) + residual confirmations
 
-1. **preinst lock gate (§5):** is failing the apt transaction at preinst
-   (non-zero, before unpack) when `/run/xpf/upgrade.lock` is busy the right
-   apt-citizen behavior, vs letting unpack proceed and deferring at postinst?
-   And is the preinst-check / postinst-reacquire TOCTOU acceptable given flock
-   fds don't survive the process boundary?
-2. **RESOLVED in v2.1:** the CopyTree checksum does NOT close the
-   staged-overwrite source race (verified, cutover.go:321-334) — the preinst
-   lock gate is the fix. r2: confirm there is no other concurrent writer of
-   `staged/` besides dpkg that the preinst gate would miss.
-3. **postrm on purge (§4):** leave `versions/` (like `/etc/xpf`) or remove the
-   maintainer-managed tree?
-4. **preinst `<oldver>` source under format drift:** `staged/xpfd version`
-   validated as safe-segment; fallback if the old binary won't exec?
-5. **C2/C3 final disposition:** drop C2 (redundant with flip.go:52) and keep C3
-   diagnostic-only, or drop both and rely on auto-rollback + the new
-   flip-failure rollback?
+Resolved in r2 (Codex r1 + AGY r1/r2 + SMR r1/r2):
+1. **preinst lock gate** — fail-loud non-zero at preinst (system unmodified) is
+   the right apt-citizen behavior (AGY-r2-3); it does not fully serialize unpack
+   vs a concurrent operator copy — `verify-dataplane` is the torn-binary
+   backstop (SMR-r2-m1, §5).
+2. **CopyTree checksum** — does NOT close the staged source race (verified
+   cutover.go:321-334); `staged/` has no writer besides dpkg (AGY-r2-§5.2).
+3. **postrm** — leave `versions/` on `remove`, remove on `purge` (Policy §6.8,
+   AGY-r2-§5.3).
+4. **preinst `<oldver>`** — `staged/xpfd version` (safe segment); fall back to
+   sanitized dpkg `$2`, don't fail on exec error (AGY-r2-§5.4).
+5. **C2/C3** — drop C2, keep C3 diagnostic-only (§6).
+6. **lock re-entrancy** — `r.Run()` under `RunRolling` must not re-acquire
+   (`Options.LockAlreadyHeld`, AGY-r2-4); `mkdir -p /run/xpf` before acquire.
+
+Residual for the final confirmation round:
+- Codex r2 was infra-dropped; retried on v2.2 (per `feedback_codex_infra_must
+  _retry`). If Codex stays infra-blocked, convergence rests on SMR + AGY (both
+  PLAN-NEEDS-MINOR on v2.1, all minors folded here) with documented retries.
+- Implementation-time: prove the C-pre-STOP-exhaustiveness test (§8) and the
+  preinst crash-interleaving matrix (§4) actually hold.
