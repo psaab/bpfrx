@@ -58,6 +58,7 @@ type kaOps struct {
 	setDownErr error
 
 	byNameErr error
+	delErr    error
 
 	// blockDown, when non-nil, makes LinkSetDown block until released is
 	// closed; entered is closed once LinkSetDown is inside the block.
@@ -76,8 +77,12 @@ func (o *kaOps) LinkByName(name string) (netlink.Link, error) {
 	return &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: name, Index: 1}}, nil
 }
 
-func (o *kaOps) LinkAdd(netlink.Link) error                     { return nil }
-func (o *kaOps) LinkDel(netlink.Link) error                     { return nil }
+func (o *kaOps) LinkAdd(netlink.Link) error { return nil }
+func (o *kaOps) LinkDel(netlink.Link) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.delErr
+}
 func (o *kaOps) LinkSetMaster(netlink.Link, netlink.Link) error { return nil }
 func (o *kaOps) LinkSetNoMaster(netlink.Link) error             { return nil }
 func (o *kaOps) LinkSetMTU(netlink.Link, int) error             { return nil }
@@ -501,6 +506,46 @@ func TestKeepaliveUnknownReasonSurfacedInStatus(t *testing.T) {
 			t.Fatalf("structural status must carry the reason, got %q", s.KeepaliveInfo)
 		}
 	}
+}
+
+// --- Copilot PR #1947 r3: a present-but-changed link whose LinkDel
+// fails transiently must NOT silently leave the tunnel with no keepalive
+// — the runner is restarted against the surviving link. ---
+func TestApplyRecreateDelFailRestartsKeepalive(t *testing.T) {
+	ops := newKaOps()
+	ops.delErr = errors.New("transient LinkDel failure") // recreate aborts
+	tm := &tunnelManager{ops: ops, vrfBinder: noopVRFBinder{}}
+	tm.ensureReconcileStateLocked()
+
+	// Seed a live keepalive runner. LinkByName returns a *netlink.Dummy,
+	// which legacyTunnelMatches(Dummy, Gretun) treats as CHANGED → recreate
+	// path → drain → LinkDel (fails).
+	state, gen := newKAState(true, 3, 5)
+	tm.linkGen["gr0"] = gen
+	// Seed with a pre-closed done so stopKeepaliveLocked's drain returns
+	// immediately (no real goroutine backs this fake runner).
+	seededDone := make(chan struct{})
+	close(seededDone)
+	tm.keepalives["gr0"] = &keepaliveRunner{
+		cancel: func() {}, state: state, done: seededDone,
+		remote: "203.0.113.1", source: "198.51.100.1", interval: 5, maxRetries: 3,
+		linkGen: gen,
+	}
+
+	tc := &config.TunnelConfig{
+		Name: "gr0", Mode: "gre",
+		Source: "198.51.100.1", Destination: "203.0.113.1",
+		Keepalive: 5, KeepaliveRetry: 3,
+	}
+	tm.applyKernelTunnelLocked(tc)
+
+	if _, ok := tm.keepalives["gr0"]; !ok {
+		t.Fatal("LinkDel failure on recreate must restart the keepalive, not leave it absent")
+	}
+	// Drain the restarted runner so the goroutine does not leak into other
+	// tests (it uses the real prober but a 5s interval, so it parks on the
+	// ticker; cancel it).
+	tm.stopKeepaliveLocked("gr0")
 }
 
 // --- prober errno classification ---

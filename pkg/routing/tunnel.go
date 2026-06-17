@@ -595,6 +595,17 @@ func (t *tunnelManager) applyKernelTunnelLocked(tc *config.TunnelConfig) {
 			if delErr := t.ops.LinkDel(existing); delErr != nil {
 				slog.Warn("failed to replace existing tunnel link",
 					"name", tc.Name, "existing_type", existing.Type(), "err", delErr)
+				// The recreate failed but the OLD link is still live. We
+				// already drained its keepalive runner before the LinkDel
+				// (F7 ordering). Restart it against the surviving link so a
+				// transient LinkDel failure does not silently leave the
+				// tunnel running with NO keepalive until the next successful
+				// apply (Copilot PR #1947 r3). Safe because the link was NOT
+				// recreated — the restarted runner captures the just-bumped
+				// generation and probes the same device.
+				if tc.Keepalive > 0 {
+					t.startKeepalive(tc.Name, tc.Source, tc.Destination, tc.Keepalive, tc.KeepaliveRetry)
+				}
 				return
 			}
 			slog.Info("replaced tunnel link with changed parameters",
