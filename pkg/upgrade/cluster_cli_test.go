@@ -43,6 +43,31 @@ func TestParsers_AgainstRealFormatInformation(t *testing.T) {
 		t.Fatalf("FormatInformation() lacks 'Local state:' line the parsers key on:\n%s", info)
 	}
 
+	// parseSyncEstablished scopes its Status match to the sync/fabric link
+	// section. That scoping assumes FormatInformation never emits MORE than one
+	// "Status:" line (here sync is unconfigured → "Not configured" → zero; with
+	// sync configured it renders exactly one). Assert at-most-one so the day a
+	// second "Status:" section (e.g. IP monitoring) is folded into
+	// FormatInformation, THIS test fails loudly — forcing a re-check of the
+	// drain gate (AGY review-011 Part I) rather than a silent mis-read.
+	statusLines := 0
+	for _, line := range strings.Split(info, "\n") {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(line)), "status:") {
+			statusLines++
+		}
+	}
+	if statusLines > 1 {
+		t.Fatalf("FormatInformation() emits %d 'Status:' lines, want at most 1 (the sync "+
+			"link); parseSyncEstablished's section scoping assumes a single Status — a "+
+			"second breaks the drain gate:\n%s", statusLines, info)
+	}
+
+	// Real-format coverage of the drain gate: sync is unconfigured here, so
+	// the sync link is not established and a drain must NOT be green-lit.
+	if parseSyncEstablished(info) {
+		t.Errorf("parseSyncEstablished true with sync unconfigured (no Status line):\n%s", info)
+	}
+
 	// No peer configured => remote lost => peer not alive.
 	if parsePeerAlive(info) {
 		t.Errorf("parsePeerAlive true with no peer (remote should be lost):\n%s", info)
@@ -213,6 +238,63 @@ func TestSyncParser_Fixtures(t *testing.T) {
 	}
 	if parseSyncEstablished(noStatus) {
 		t.Error("missing Status line must fail closed")
+	}
+}
+
+// TestSyncParser_ScopedAndExact covers the AGY review-011 Part I hardening:
+// the Status match is scoped to the sync/fabric link section (so a pre-sync
+// section that also emits "Status:" cannot be mis-read), and the value is
+// matched EXACTLY as "up" (so "startup" is not accepted). Both are latent on
+// today's FormatInformation (single sync "Status:" line) but guard against
+// format drift that would otherwise wrongly green-light a drain.
+func TestSyncParser_ScopedAndExact(t *testing.T) {
+	// A pre-sync section emitting "Status: up" must NOT be read as the sync
+	// link when the actual sync link is Down. The old first-"status:"-wins
+	// parser would have returned true here and drained with sync down.
+	preSyncUp := strings.Join([]string{
+		"  Remote node: healthy (node1)",
+		"IP monitoring:",
+		"  Status: up",
+		"",
+		"Sync link statistics (control-link):",
+		"  Status: Down",
+	}, "\n")
+	if parseSyncEstablished(preSyncUp) {
+		t.Error("a pre-sync 'Status: up' must not be read as the sync link when sync is Down")
+	}
+
+	// Exact-match: "startup" must not satisfy the up gate.
+	startup := strings.Join([]string{
+		"  Remote node: healthy (node1)",
+		"Sync link statistics (control-link):",
+		"  Status: startup",
+	}, "\n")
+	if parseSyncEstablished(startup) {
+		t.Error("'Status: startup' must not be read as up (exact match required)")
+	}
+
+	// Scoping still finds the sync Status when a benign pre-sync Status
+	// precedes it and the sync link is genuinely Up.
+	preSyncThenUp := strings.Join([]string{
+		"  Remote node: healthy (node1)",
+		"IP monitoring:",
+		"  Status: unreachable",
+		"",
+		"Sync link statistics (control-link):",
+		"  Status: Up",
+	}, "\n")
+	if !parseSyncEstablished(preSyncThenUp) {
+		t.Error("sync 'Status: Up' must be read as established despite a pre-sync Status line")
+	}
+
+	// The fabric-link header variant is honored too.
+	fabricUp := strings.Join([]string{
+		"  Remote node: healthy (node1)",
+		"Fabric link statistics:",
+		"  Status: Up",
+	}, "\n")
+	if !parseSyncEstablished(fabricUp) {
+		t.Error("'Fabric link statistics:' + 'Status: Up' must read as established")
 	}
 }
 

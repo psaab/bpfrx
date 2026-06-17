@@ -181,14 +181,36 @@ func parseSyncEstablished(s string) bool {
 	if !lineHasAll(s, "Remote node:", "healthy") {
 		return false
 	}
-	// Find the sync-link "Status:" line.
+	// Find the sync-link "Status:" line, SCOPED to the sync/fabric link
+	// section. FormatInformation renders the section under a "Fabric link
+	// statistics:" or "Sync link statistics (control-link):" header and ends
+	// it with a blank line (status.go). Scoping (vs the first "status:"
+	// anywhere) means a future pre-sync section that also emits "Status:"
+	// (e.g. IP-monitoring, FormatIPMonitoringStatus) can never be mis-read as
+	// the sync link — which would wrongly green-light a drain (AGY review-011
+	// Part I). Within the section, require the value to be EXACTLY "up", not a
+	// substring, so a future "Status: startup" is not accepted as up.
+	inSync := false
 	for _, line := range strings.Split(s, "\n") {
 		ll := strings.ToLower(strings.TrimSpace(line))
+		if !inSync {
+			if strings.HasPrefix(ll, "sync link statistics") ||
+				strings.HasPrefix(ll, "fabric link statistics") {
+				inSync = true
+			}
+			continue
+		}
+		if ll == "" {
+			// Reached the end of the sync section with no Status line (e.g.
+			// "Not configured"): fail closed.
+			break
+		}
 		if strings.HasPrefix(ll, "status:") {
-			return strings.Contains(ll, "up")
+			val := strings.TrimSpace(strings.TrimPrefix(ll, "status:"))
+			return val == "up"
 		}
 	}
-	// No Status line rendered: fail closed (do not assume sync is up).
+	// No sync-link Status line rendered: fail closed (do not assume sync is up).
 	return false
 }
 
