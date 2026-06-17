@@ -7,7 +7,7 @@
 ## 🚨 RESOLVED: Unmapped Management Interface Immediate Lockout / Stranding
 
 > [!NOTE]
-> **Vulnerability Type**: Management Lockout / Immediate Network Disconnect (Resolved)  
+> **Vulnerability Type**: Management Lockout / Immediate Network Disconnect (Resolved)
 > **Files**: [pkg/daemon/device_map.go:L321-348](file:///home/ps/git/bpfrx/pkg/daemon/device_map.go#L321-L348), [pkg/daemon/device_map_test.go:L213-260](file:///home/ps/git/bpfrx/pkg/daemon/device_map_test.go#L213-L260)
 
 ### Resolution
@@ -29,7 +29,7 @@ All tests compile and pass successfully.
 
 ### 1. HIGH-1 MAC format: `compileDeviceMap` normalization
 - **Status**: **RESOLVED**
-- **Evidence**: 
+- **Evidence**:
   - `pkg/config/compiler_chassis.go:41` compiles the configured MAC with `normalizeMAC`, which uses `net.ParseMAC` and returns a standard colon-separated lowercase format (`hw.String()`).
   - `pkg/devicemap/devicemap.go:93` builds `byPermMAC` using `strings.ToLower(n.PermMAC)`. `n.PermMAC` is populated using `a.PermHWAddr.String()` which strictly returns the same colon-separated lowercase format.
   - The lookup at `devicemap.go:145` uses `strings.ToLower(e.MAC)`. Mismatch checks use `strings.EqualFold(pm[0].PermMAC, e.MAC)`. String format drift is eliminated.

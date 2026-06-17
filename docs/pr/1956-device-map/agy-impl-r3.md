@@ -1,6 +1,6 @@
 # AGY Adversarial Review: Bare-Metal Device-Map
 
-**Target:** `branch diff origin/master...HEAD` (`origin/engineer/1956-device-map`)  
+**Target:** `branch diff origin/master...HEAD` (`origin/engineer/1956-device-map`)
 **Verdict:** **NEEDS-MAJOR**
 
 This document evaluates the device-map implementation changes introduced in branch `origin/engineer/1956-device-map` against the round-3 feedback and security invariants. It specifically targets the safety of management lifelines, lockouts, topology changes, peer-sync admission safety, and predictable-name recovery.

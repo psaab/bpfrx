@@ -75,10 +75,8 @@ func (c *CLI) showChassisDeviceMap(args []string) error {
 		return c.showChassisDeviceMapCandidates()
 	}
 
-	nics, err := devicemap.EnumeratePresentNICs()
-	if err != nil {
-		return fmt.Errorf("enumerate NICs: %w", err)
-	}
+	// Check device-map presence BEFORE enumerating NICs (Codex r3 LOW:
+	// match the gRPC server's safer order — no sysfs walk when not configured).
 	cfg := c.store.ActiveConfig()
 	var dm *config.DeviceMapConfig
 	if cfg != nil {
@@ -91,6 +89,10 @@ func (c *CLI) showChassisDeviceMap(args []string) error {
 		return nil
 	}
 
+	nics, err := devicemap.EnumeratePresentNICs()
+	if err != nil {
+		return fmt.Errorf("enumerate NICs: %w", err)
+	}
 	bindings := devicemap.Resolve(dm.Entries, nics, devicemap.RethMembersFromConfig(cfg))
 	fmt.Printf("Device-map (unmapped-interface-policy: %s):\n\n", dm.EffectiveUnmappedPolicy())
 	fmt.Printf("%-12s %-24s %-16s %s\n", "Logical", "Identity (key)", "Resolved kernel", "Status")

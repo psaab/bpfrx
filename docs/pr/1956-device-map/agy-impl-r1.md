@@ -11,7 +11,7 @@ This review pressure-tests the design and implementation of the bare-metal `devi
 > **Files**: [pkg/config/schema_validators.go](file:///home/ps/git/bpfrx/.claude/worktrees/1956-eng/pkg/config/schema_validators.go#L491-L514), [pkg/devicemap/devicemap.go](file:///home/ps/git/bpfrx/.claude/worktrees/1956-eng/pkg/devicemap/devicemap.go#L110-L115)
 
 ### Findings
-`ValidateMAC` in `schema_validators.go:491` delegates to `net.ParseMAC`, which is highly lenient. It successfully parses and accepts MAC addresses formatted with hyphens (e.g., `00-11-22-33-44-55`), periods (e.g., `0011.2233.4455`), or as bare hex strings. 
+`ValidateMAC` in `schema_validators.go:491` delegates to `net.ParseMAC`, which is highly lenient. It successfully parses and accepts MAC addresses formatted with hyphens (e.g., `00-11-22-33-44-55`), periods (e.g., `0011.2233.4455`), or as bare hex strings.
 
 However, neither the compiler nor the device-map resolver normalizes the configured `e.MAC` string to the standard colon-separated lowercase representation before lookup or comparison. This introduces two severe issues:
 
@@ -25,7 +25,7 @@ However, neither the compiler nor the device-map resolver normalizes the configu
    rb.Status, rb.CurrentNIC, rb.Logical = BindRefusedAmbig, "", ""
    ```
    During a commit, this triggers a `BindRefusedAmbig` status. The pre-flight check `deviceMapStrandsManagement` interprets this as a hostile topology swap and **hard-rejects the commit** with a misleading error, preventing configuration updates.
-   
+
 2. **Silent Unbound Interfaces (MAC-only Key)**:
    If using the `mac` key order, `Resolve` in `devicemap.go:121` looks up:
    ```go
@@ -48,7 +48,7 @@ Normalize all MAC addresses to colon-separated lowercase format inside `compiler
 During a commit, `deviceMapCommitPreflight` validates the candidate configuration against a set of protected interfaces:
 ```go
 329: 	protected := d.resolveProtectedInterfaces()
-330: 
+330:
 331: 	if reason := deviceMapStrandsManagement(candidate, nics, protected); reason != "" {
 ```
 The helper `d.resolveProtectedInterfaces()` resolves the protected set using the **currently active** configuration:
@@ -61,7 +61,7 @@ This causes a critical mismatch when the candidate configuration modifies the ma
 
 1. **Silent Lockout (False Negative)**:
    If the active configuration uses `fxp0` for management, but the candidate moves management to `ge-0-0-1` (`system management-interface ge-0-0-1`) and simultaneously introduces an invalid `device-map` that mis-pins or renames `ge-0-0-1` away, the pre-flight check only protects `fxp0`. The candidate's `ge-0-0-1` is not verified. The commit succeeds, applying the bad map, and next boot/apply completely strands the management session.
-   
+
 2. **Commit Denial (False Positive)**:
    Conversely, if an operator attempts to migrate the management interface away from `fxp0` to another interface and re-assigns the physical NIC currently named `fxp0` via `device-map`, the pre-flight check evaluates the candidate against the active config's `protected` set (which still requires `fxp0` to be untouched). The check will reject the commit as a lockout, preventing legitimate migrations.
 
@@ -86,8 +86,8 @@ func (d *Daemon) resolveProtectedInterfacesForConfig(cfg *config.Config) map[str
 > **File**: [pkg/daemon/device_map.go](file:///home/ps/git/bpfrx/.claude/worktrees/1956-eng/pkg/daemon/device_map.go#L91-L127)
 
 ### Findings
-In Phase 1 of `enumerateAndRenameMapped`, colliding NICs are moved to temp names `xpf-tmp-%d` starting with index `0`. 
-If a temp interface `xpf-tmp-0` from a previous failed rename run or unmanaged stranding is already present in the kernel, the rename command `renameInterface(n.Name, tmpName)` fails with `EEXIST`. 
+In Phase 1 of `enumerateAndRenameMapped`, colliding NICs are moved to temp names `xpf-tmp-%d` starting with index `0`.
+If a temp interface `xpf-tmp-0` from a previous failed rename run or unmanaged stranding is already present in the kernel, the rename command `renameInterface(n.Name, tmpName)` fails with `EEXIST`.
 
 The code logs a warning and proceeds with the loop:
 ```go
@@ -114,7 +114,7 @@ Verify that the generated `xpf-tmp-%d` interface name does not already exist in 
 > **Files**: [pkg/devicemap/devicemap.go](file:///home/ps/git/bpfrx/.claude/worktrees/1956-eng/pkg/devicemap/devicemap.go#L84-L95), [pkg/devicemap/devicemap.go#L230](file:///home/ps/git/bpfrx/.claude/worktrees/1956-eng/pkg/devicemap/devicemap.go#L230)
 
 ### Findings
-In virtualized setups, hypervisor configurations (such as SR-IOV VFs or partitioned NICs), multiple network interfaces can share the exact same PCI address (e.g., same slot/function but different MACs). 
+In virtualized setups, hypervisor configurations (such as SR-IOV VFs or partitioned NICs), multiple network interfaces can share the exact same PCI address (e.g., same slot/function but different MACs).
 
 `EnumeratePresentNICs` populates a slice of NICs and sorts it using `sort.Slice`:
 ```go
