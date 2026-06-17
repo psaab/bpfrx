@@ -418,9 +418,11 @@ func generateSelfSignedCertAt(dir, certPath, keyPath string) (tls.Certificate, e
 }
 
 // persistSelfSignedCert implements the #1916 D5 STRICT write sequence. Any
-// returned error means nothing durable changed in a way that could leave a
-// mismatched pair: either the strict-remove proved a {neither} start failed
-// (so no new write was attempted) or a durable write itself failed.
+// returned error means the disk state is clean: either the directory could
+// not be created, a strict-remove could not establish a provable {neither}
+// start state (so no new write was attempted), a SyncDir failed to make the
+// removes durable, or a durable write itself failed — in every case no
+// mismatched pair is left visible on disk.
 func persistSelfSignedCert(dir, certPath, keyPath string, certPEM, keyPEM []byte) error {
 	if err := tlsMkdirAllDurable(dir, 0700); err != nil {
 		return err

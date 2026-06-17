@@ -1,5 +1,18 @@
 # Action Log
 
+## 2026-06-17 — #1916 review: authorized_keys lockout fix + persistSelfSignedCert comment
+
+- **Timestamp**: 2026-06-17
+- **Action**: Address Copilot code review on PR #1916. (1) daemon_system.go:
+  when lookupUIDGID fails, refuse the authorized_keys write entirely (keep
+  prior file intact) instead of falling back to a root-owned write + later
+  chown -R — the crash window between the root-owned write and chown was
+  exactly the lockout risk D7 aimed to eliminate. (2) server.go: reword the
+  persistSelfSignedCert comment to accurately enumerate all abort cases
+  (mkdir, strict-remove failure, SyncDir failure, durable-write failure) and
+  clarify the shared guarantee: no mismatched pair is left visible on disk.
+- **File(s)**: pkg/daemon/daemon_system.go, pkg/api/server.go, _Log.md
+
 ## 2026-06-17 — #1914 tunnel-endpoint collision gate three-view union (Path 1)
 
 - **Timestamp**: 2026-06-17
