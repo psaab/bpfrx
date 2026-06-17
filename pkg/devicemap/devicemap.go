@@ -144,8 +144,13 @@ func Resolve(entries []config.DeviceMapEntry, nics []PresentNIC, rethMembers map
 			case config.DeviceMapKeyMAC:
 				matches := byPermMAC[strings.ToLower(e.MAC)]
 				if len(matches) == 1 {
+					// BindBoundViaMAC means MAC matched as a FALLBACK after PCI
+					// missed. Only set it when the effective key order is
+					// pci-then-mac (PCI was tried first). For key=mac or
+					// key=mac-then-pci, MAC is the primary identity key and
+					// BindBound is the correct status.
 					st := BindBound
-					if allowPCI {
+					if allowPCI && e.EffectiveKeyOrder() == config.DeviceMapKeyPCIThenMAC {
 						st = BindBoundViaMAC
 					}
 					rb.Status, rb.CurrentNIC, rb.Logical = st, matches[0].Name, logical

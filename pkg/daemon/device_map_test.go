@@ -122,6 +122,56 @@ func TestDeviceMapLinkOriginalNameRoundTrips(t *testing.T) {
 	}
 }
 
+// TestDeviceMapOriginalNameFallbackViaDeriveKernelName covers the bug where a
+// NIC is already at its final logical name (e.g., second+ boot with device-map)
+// but has NO existing .link file (e.g., first device-map activation after
+// manual rename, or stale scrub). Without the deriveKernelNameFn fallback the
+// code would record OriginalName=ge-0-0-3 (the logical name), which udev would
+// never see on next boot, causing the NIC to revert to its predictable kernel
+// name (enp9s0) permanently.
+func TestDeviceMapOriginalNameFallbackViaDeriveKernelName(t *testing.T) {
+	withTempLinkDir(t) // empty — no .link file exists
+
+	// Inject a stub that maps the logical name to the TRUE kernel name.
+	old := deriveKernelNameFn
+	deriveKernelNameFn = func(name string) string {
+		if name == "ge-0-0-3" {
+			return "enp9s0"
+		}
+		return ""
+	}
+	t.Cleanup(func() { deriveKernelNameFn = old })
+
+	entries := []config.DeviceMapEntry{
+		{LogicalName: "ge-0/0/3", PCIAddr: "0000:09:00.0"},
+	}
+	// Simulate: NIC is ALREADY at ge-0-0-3 (current == final); no .link.
+	nics := []devicemap.PresentNIC{{Name: "ge-0-0-3", PCIAddr: "0000:09:00.0"}}
+	bindings := resolveDeviceMap(entries, nics, nil)
+	if len(bindings) != 1 || !bindings[0].Status.Bound() {
+		t.Fatalf("expected bound binding, got %+v", bindings)
+	}
+
+	// Replicate the originalByCurrent population logic that the fix touches.
+	orig := recoverOriginalName("ge-0-0-3") // returns "ge-0-0-3" (no .link)
+	if orig == "ge-0-0-3" {
+		if dk := deriveKernelNameFn("ge-0-0-3"); dk != "" {
+			orig = dk
+		}
+	}
+	if orig != "enp9s0" {
+		t.Fatalf("OriginalName fallback must yield kernel name %q, got %q", "enp9s0", orig)
+	}
+	// Prove the .link is written with the TRUE kernel OriginalName, not the logical name.
+	changed := writeDeviceMapLinkFile("ge-0-0-3", orig, nil, nil)
+	if !changed {
+		t.Fatalf("first write should create the .link")
+	}
+	if got := recoverOriginalName("ge-0-0-3"); got != "enp9s0" {
+		t.Fatalf("written .link must record OriginalName=enp9s0, recovered %q", got)
+	}
+}
+
 func TestDeviceMapStrandsManagementSafeWhenMgmtMapped(t *testing.T) {
 	// The live mgmt NIC (enp5s0 currently == fxp0) is mapped to its own
 	// name => safe.

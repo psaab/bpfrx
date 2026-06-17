@@ -78,7 +78,19 @@ func enumerateAndRenameMapped(dm *config.DeviceMapConfig, cfg *config.Config) er
 		switch {
 		case b.Status.Bound():
 			desiredByCurrent[b.CurrentNIC] = b.Logical
-			originalByCurrent[b.CurrentNIC] = recoverOriginalName(b.CurrentNIC)
+			orig := recoverOriginalName(b.CurrentNIC)
+			if orig == b.CurrentNIC {
+				// recoverOriginalName found no existing .link for this name.
+				// The NIC may already carry its final logical name (second+ boot
+				// with device-map) but the .link was absent. Derive the true
+				// pre-rename kernel name (e.g. enp9s0) from sysfs so the .link
+				// is written with the correct OriginalName= that udev will match
+				// on next boot, not the logical name that udev would never see.
+				if dk := deriveKernelNameFn(b.CurrentNIC); dk != "" {
+					orig = dk
+				}
+			}
+			originalByCurrent[b.CurrentNIC] = orig
 			desiredNames[b.Logical] = true
 			slog.Info("device-map: resolved binding",
 				"logical", b.Entry.LogicalName, "current", b.CurrentNIC, "status", b.Status.String())
@@ -468,6 +480,11 @@ func teardownUnmappedManaged(dm *config.DeviceMapConfig) {
 // host's own predictable name. Empty result => caller leaves it under the
 // temp name (never guesses a name that could collide — V-6).
 var predictableNameLookup = udevPredictableName
+
+// deriveKernelNameFn is the sysfs-based PCI→kernel-name resolver, injectable
+// for tests (the real deriveKernelName in daemon_reth.go reads /sys/class/net
+// which is unavailable in the unit sandbox).
+var deriveKernelNameFn = deriveKernelName
 
 // predictableName resolves the host-predictable name for a stranded NIC via
 // the udev database, using the PUBLIC `udevadm info` interface rather than

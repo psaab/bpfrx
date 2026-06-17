@@ -143,20 +143,62 @@ func TestResolveMACFirstStillRefusesSlotSwap(t *testing.T) {
 
 func TestResolveKeyOrderMACThenPCI(t *testing.T) {
 	// mac-then-pci tries MAC first; a MAC hit binds as primary (not flagged
-	// as fallback).
+	// as "via MAC fallback" — MAC IS the primary key here).
 	nics := []PresentNIC{nic("enp9s0", "0000:09:00.0", "00:11:22:33:44:55")}
 	entries := []config.DeviceMapEntry{
 		{LogicalName: "ge-0/0/3", PCIAddr: "0000:bb:00.0", MAC: "00:11:22:33:44:55",
 			KeyOrder: config.DeviceMapKeyMACThenPCI},
 	}
 	got := Resolve(entries, nics, nil)
-	if got[0].Status != BindBoundViaMAC {
-		// PCI is present in the entry, so the MAC bind is reported as a
-		// fallback-class outcome; the key point is it binds the right NIC.
-		t.Logf("status=%v", got[0].Status)
+	// MAC matched first and MAC is primary for mac-then-pci — must be BindBound,
+	// not BindBoundViaMAC (which only applies to the pci-then-mac fallback path).
+	if got[0].Status != BindBound {
+		t.Fatalf("mac-then-pci with MAC hit must be BindBound (MAC is primary), got %v", got[0].Status)
 	}
 	if got[0].CurrentNIC != "enp9s0" {
 		t.Fatalf("mac-then-pci bound wrong NIC: %+v", got[0])
+	}
+}
+
+// TestResolveMACPrimaryKeyIsNotFlagged covers the bug where any entry with a
+// PCI address was (incorrectly) flagged BindBoundViaMAC even when MAC is the
+// primary identity key (key=mac or key=mac-then-pci). Only pci-then-mac (the
+// default) should report BindBoundViaMAC — for MAC-primary entries, a MAC hit
+// is a clean BindBound.
+func TestResolveMACPrimaryKeyIsNotFlagged(t *testing.T) {
+	nics := []PresentNIC{nic("enp9s0", "0000:09:00.0", "00:11:22:33:44:55")}
+
+	// key=mac: MAC is the ONLY key; PCI addr present but never tried.
+	entries := []config.DeviceMapEntry{
+		{LogicalName: "ge-0/0/3", PCIAddr: "0000:09:00.0", MAC: "00:11:22:33:44:55",
+			KeyOrder: config.DeviceMapKeyMAC},
+	}
+	got := Resolve(entries, nics, nil)
+	if got[0].Status != BindBound {
+		t.Errorf("key=mac with PCI addr set must be BindBound (not via-MAC-fallback), got %v", got[0].Status)
+	}
+
+	// key=mac-then-pci: MAC is primary; PCI is fallback.
+	entries[0].KeyOrder = config.DeviceMapKeyMACThenPCI
+	got = Resolve(entries, nics, nil)
+	if got[0].Status != BindBound {
+		t.Errorf("key=mac-then-pci with MAC hit must be BindBound (MAC is primary), got %v", got[0].Status)
+	}
+}
+
+// TestResolvePCIThenMACFallbackFlagged verifies that the pci-then-mac (default)
+// key order DOES report BindBoundViaMAC when PCI misses and MAC matches — the
+// "re-pin" signal is valid only on the fallback path.
+func TestResolvePCIThenMACFallbackFlagged(t *testing.T) {
+	// NIC is at a DIFFERENT PCI address than the entry pins, but MAC matches.
+	nics := []PresentNIC{nic("enp10s0", "0000:0a:00.0", "00:11:22:33:44:55")}
+	entries := []config.DeviceMapEntry{
+		// default key order = pci-then-mac; PCI (0000:09:00.0) misses
+		{LogicalName: "ge-0/0/3", PCIAddr: "0000:09:00.0", MAC: "00:11:22:33:44:55"},
+	}
+	got := Resolve(entries, nics, nil)
+	if got[0].Status != BindBoundViaMAC {
+		t.Fatalf("pci-then-mac with PCI miss + MAC hit must be BindBoundViaMAC, got %v", got[0].Status)
 	}
 }
 
