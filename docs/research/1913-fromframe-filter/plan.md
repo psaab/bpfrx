@@ -1,6 +1,6 @@
 # Plan of Action — #1913: trailing `maybe_reinject_slow_path_from_frame` runs for ALL non-forward dispositions (incl. PolicyDenied)
 
-- **Revision**: r1 (DRAFT — pre-review)
+- **Revision**: r2 (post round-1: Codex + AGY + Claude SMR)
 - **Issue**: #1913 (bug)
 - **Branch**: `research/1913-fromframe-filter`
 - **Mode**: `/research` — STOP at PLAN-READY. No PR, no production source touched.
@@ -40,22 +40,32 @@ dropped.
 
 ### 2.1 The trailing chokepoint (mod.rs:2156–2820)
 
+**First**: the `match` at `:2156` is inside the `else` of the FORWARD branch.
+The forward branch at `mod.rs:1794-1798` is `if matches!(disposition,
+ForwardCandidate | FabricRedirect)` — so **`ForwardCandidate` and
+`FabricRedirect` are consumed by the forward `if` and NEVER enter the `else`
+block** that contains the `:2156` match or the `:2814` trailing call (Codex +
+AGY r1, verified). They cannot reach :2814. (r1 table erratum — corrected
+below.)
+
 The `match` at `:2156` falls through to `record_forwarding_disposition(...)`
 (`:2802`) and then unconditionally `maybe_reinject_slow_path_from_frame(...,
 packet_frame, meta, decision, "slow_path", ...)` at `:2814`. Per-arm exit
-behavior verified end-to-end:
+behavior verified end-to-end (corrected after r1):
 
-| Arm | Early `continue`? | Reaches :2814 with disposition |
+| Arm | Early `continue`/exit? | Reaches :2814 with disposition |
 |-----|-------------------|--------------------------------|
 | `LocalDelivery` (:2157) | no | `LocalDelivery` ✅ in allow-list |
 | `NoRoute` (:2186) | no | `NoRoute` ✅ in allow-list |
-| `MissingNeighbor` (:2204) | **sometimes** — `neg_neigh_gate` fast-fail and resolved-wins paths `continue` (recycle+skip); the buffered (`recycle_now=false`) and capacity-drop paths fall through | `MissingNeighbor` ✅ in allow-list |
+| `MissingNeighbor` (:2204) | **sometimes** — `neg_neigh_gate` fast-fail (:~2245) and resolved-wins paths `continue` (recycle+skip); **SNAT-allocation-failure** paths `scratch_recycle.push` + `continue` at **:2533 and :2564** (AGY + Codex r1, verified); the buffered (`recycle_now=false`) and capacity-drop paths fall through | `MissingNeighbor` ✅ in allow-list |
 | `PolicyDenied` (:2799) | **no** | **`PolicyDenied` ✗ NOT in allow-list — LEAK** |
 | `HAInactive` (:2800) | no | **`HAInactive` ✗ NOT in allow-list — LEAK** |
-| `_` catch-all (:2801) | no | covers **`DiscardRoute`** (✗ NOT in allow-list — LEAK), plus `ForwardCandidate`/`FabricRedirect`/`NextTableUnsupported` |
+| `_` catch-all (:2801) | no | covers **`DiscardRoute`** (✗ NOT in allow-list — LEAK), plus `NextTableUnsupported` (✅ in allow-list). `ForwardCandidate`/`FabricRedirect` do NOT reach here (consumed at :1794-1798). |
 
 So three dispositions reach the unfiltered enqueue that the wrapper would
-reject: **`PolicyDenied`, `HAInactive`, `DiscardRoute`**.
+reject: **`PolicyDenied`, `HAInactive`, `DiscardRoute`**. (`NextTableUnsupported`
+also flows through the `_` arm but IS in the allow-list, so it is correctly
+reinject-eligible.)
 
 ### 2.2 What reinjecting a `PolicyDenied` frame actually does today
 
@@ -123,6 +133,12 @@ default-route it). Another should-drop-but-forwarded leak. NOTE: `DiscardRoute`
 is ALSO absent from the wrapper allow-list, confirming the intended contract
 is "drop".
 
+**`DiscardRoute` is the cleanest proof the unfiltered reinject is a bug**
+(Claude SMR r1, F1): unlike PolicyDenied (which has the "deny is logged"
+partial mitigation) there is no plausible "intentional" reading — a discard
+route's entire purpose is to drop. Path A fixes PolicyDenied, HAInactive, and
+DiscardRoute identically.
+
 ### 2.5 Buffered-MissingNeighbor duplicate (issue Q3)
 
 For the `PendingNeighAdmission::Buffer` path the frame is inserted into
@@ -140,27 +156,59 @@ intent. This is a SECONDARY concern; the primary bug is PolicyDenied/
 HAInactive/DiscardRoute. The plan addresses it explicitly (see §5 Path A
 sub-decision) but does not block on it.
 
+**Explicit scope statement (Claude SMR r1, F2):** Path A keeps
+`MissingNeighbor` in the allow-list, so the §2.5 duplicate-delivery is
+**UNCHANGED** by this fix. Issue Q3 is acknowledged and **DEFERRED** — #1913
+does NOT close it. If the duplicate is judged undesirable it is a separate
+follow-up (file a new issue at /engineer time). The converged issue comment
+must say this plainly so a reader does not assume #1913 resolves Q3.
+
 ### 2.6 Why a fix inside `_from_frame` is WRONG (critical finding)
 
 `maybe_reinject_slow_path_from_frame` has **5 production call sites** (grep):
 - `slow_path.rs:61` (build-failure fallback, via `handle_forward_build_failure`)
 - `slow_path.rs:113` (the desc-wrapper's tail, AFTER its own allow-list filter)
 - `poll_stages.rs:452` (IPsec local-delivery — synthesizes `LocalDelivery`)
-- `tx/dispatch/mod.rs:225` (**"no XSK binding" fallback — passes
-  `FabricRedirect`, which is NOT in the allow-list, ON PURPOSE**)
+- `tx/dispatch/mod.rs:225` ("no XSK binding" fallback — passes `FabricRedirect`
+  via the Owned-frame branch; NOT in the allow-list. See the correction below
+  re: the asymmetric `:238` desc branch.)
 - `poll_descriptor/mod.rs:2814` (the buggy trailing call)
 
-The `dispatch/mod.rs:225` site deliberately uses the unfiltered `_from_frame`
-variant to reinject a `FabricRedirect` when the target binding is missing —
-the immediately-following `else` branch (`:238`) uses the FILTERED wrapper
-`maybe_reinject_slow_path` for the desc path, which would REJECT
-`FabricRedirect`. The `_from_frame` choice there is the bypass. So:
+Two of these callers pass dispositions OUTSIDE the wrapper allow-list, so the
+unfiltered `_from_frame` variant is load-bearing for them:
 
-> **Adding the allow-list inside `_from_frame` would break the
-> `dispatch/mod.rs:225` FabricRedirect fallback** (FabricRedirect is not in
-> the allow-list). This rules out the "filter inside `_from_frame`" option as
-> a drop-in. The fix belongs at the `mod.rs:2814` call site (or via a shared
-> predicate applied there), NOT inside the shared helper.
+1. **`dispatch/mod.rs:225` — FabricRedirect, Owned-frame fallback.** Guarded by
+   `if request.decision.resolution.disposition == FabricRedirect` (:223) AND
+   `matches!(request.frame, PendingForwardFrame::Owned(_))` (:224). When the
+   target binding is missing and the frame is owned, it reinjects a
+   `FabricRedirect` via unfiltered `_from_frame`. (Codex + AGY r1, verified.)
+2. **`handle_forward_build_failure` → `slow_path.rs:61` — ForwardCandidate
+   build-failure fallback.** When the forward-build returns `None`
+   (`dispatch/mod.rs:855-857` sets `fallback_to_slow_path = true`),
+   `handle_forward_build_failure` (`:887`) calls `_from_frame` unfiltered with
+   a `ForwardCandidate` decision (Codex r1, verified). `ForwardCandidate` is
+   NOT in the wrapper allow-list either.
+
+**Correction to the r1 framing (Codex + AGY r1):** the r1 plan argued "the
+immediately-following `else` at dispatch/mod.rs:238 proves the bypass is
+intentional." That is over-stated and partly wrong. The `:238` `else` branch
+(non-Owned/desc frame) calls the FILTERED wrapper `maybe_reinject_slow_path`,
+which REJECTS `FabricRedirect` → the desc-frame `FabricRedirect` fallback is
+**silently dropped today**. So dispatch/mod.rs treats `FabricRedirect`
+ASYMMETRICALLY: Owned → reinjected, Desc → dropped. This asymmetry is a
+**pre-existing inconsistency** (likely a latent bug), NOT a clean "intentional
+bypass." It is OUT OF SCOPE for #1913 (the trailing call at :2814 is a distinct
+chokepoint), but the plan must NOT mischaracterize it as deliberate, and the
+shared predicate must be defined so it does not silently "fix" or worsen it.
+
+> **Conclusion (unchanged):** Adding the allow-list INSIDE `_from_frame` would
+> break BOTH the `dispatch/mod.rs:225` FabricRedirect-Owned fallback AND the
+> `slow_path.rs:61` ForwardCandidate build-failure fallback (neither
+> disposition is in the allow-list). This rules out the "filter inside
+> `_from_frame`" option (Path B). The fix belongs at the `mod.rs:2814` call
+> site via a shared predicate, NOT inside the shared helper — and the helper
+> should be explicitly documented as the RAW/unchecked primitive whose callers
+> own the eligibility decision (altitude fix, see Path A + §6).
 
 ## 3. Severity
 
@@ -209,12 +257,22 @@ disposition_is_slow_path_eligible(d: ForwardingDisposition) -> bool` (or
    }
    ```
 
-- **Pros**: minimal, surgical; fixes the exact leak; preserves the
-  intentional `dispatch/mod.rs:225` bypass (that site does NOT call the
-  predicate); one SSOT for the allow-list; trivially testable.
-- **Cons**: the predicate now lives at two call sites (wrapper + 2814) — a
-  third future caller could forget it. Mitigated by the shared `const fn`
-  name making the contract obvious + a doc comment.
+3. **Altitude fix (Codex + AGY r1):** add a doc comment to
+   `maybe_reinject_slow_path_from_frame` stating it is the RAW/unchecked
+   primitive — callers are responsible for applying
+   `is_slow_path_eligible` unless they have a documented reason to bypass it
+   (the two intentional/legacy bypass sites: `dispatch/mod.rs:225`
+   FabricRedirect-Owned fallback and `slow_path.rs:61` ForwardCandidate
+   build-failure fallback). This makes the "next caller forgets the gate"
+   footgun explicit at the helper definition.
+
+- **Pros**: minimal, surgical; fixes the exact leak; preserves the two
+  load-bearing unfiltered callers (neither calls the predicate); one SSOT for
+  the allow-list; trivially testable; the altitude doc-comment closes the
+  footgun the r1 reviewers flagged.
+- **Cons**: the predicate now lives at two ENFORCING call sites (wrapper +
+  2814) — a third future caller could forget it. Mitigated by the shared
+  `const fn` name + the raw-primitive doc comment on `_from_frame`.
 - **Buffered-MissingNeighbor (§2.5)**: `MissingNeighbor` stays in the
   allow-list, so the §2.5 duplicate behavior is UNCHANGED by Path A. Sub-
   decision: leave as-is (it is the documented #1901 recovery story) and
@@ -229,10 +287,13 @@ disposition_is_slow_path_eligible(d: ForwardingDisposition) -> bool` (or
 Add the allow-list to `maybe_reinject_slow_path_from_frame` itself.
 
 - **Pros**: every `_from_frame` caller is covered automatically.
-- **Cons / FATAL**: breaks `dispatch/mod.rs:225`, which passes `FabricRedirect`
-  on purpose to bypass the filter. Would require simultaneously rewriting that
-  call site to a different mechanism. Larger blast radius, changes 5 call
-  sites' contract for one buggy site. **Rejected** per §2.6.
+- **Cons / FATAL**: breaks BOTH `dispatch/mod.rs:225` (FabricRedirect-Owned
+  fallback) AND `slow_path.rs:61`/`handle_forward_build_failure`
+  (ForwardCandidate build-failure fallback) — neither disposition is in the
+  allow-list, and both rely on the unfiltered helper. Would require
+  simultaneously rewriting two call sites to a different mechanism. Larger
+  blast radius, changes 5 call sites' contract for one buggy site.
+  **Rejected** per §2.6.
 
 ### Path C — convert the trailing `_from_frame` call to the filtered wrapper `maybe_reinject_slow_path`
 
@@ -256,12 +317,17 @@ Conclude the unfiltered behavior is intentional and just add comments.
 
 ## 6. Recommended path
 
-**Path A.** Shared `const fn` predicate, gate at the `mod.rs:2814` call site,
-wrapper refactored to call the same predicate (SSOT). Leave the intentional
-`dispatch/mod.rs:225` FabricRedirect bypass untouched. Leave the
-MissingNeighbor buffered-duplicate behavior unchanged (document it; optional
-follow-up). Add an observability counter for the now-dropped
-PolicyDenied/HAInactive/DiscardRoute case if cheap (see §8).
+**Path A.** Shared `const fn`/enum-method predicate, gate at the `mod.rs:2814`
+call site, wrapper refactored to call the same predicate (SSOT). Leave the two
+load-bearing unfiltered callers untouched (`dispatch/mod.rs:225`
+FabricRedirect-Owned fallback; `slow_path.rs:61` ForwardCandidate
+build-failure fallback). Add a raw-primitive doc comment to `_from_frame`
+documenting that callers own the eligibility decision. Leave the
+MissingNeighbor buffered-duplicate behavior (Q3) unchanged + DEFERRED. Do NOT
+attempt to fix the dispatch/mod.rs:238 FabricRedirect desc-branch asymmetry in
+#1913 (out of scope; note it for a follow-up). Add an observability counter for
+the now-dropped PolicyDenied/HAInactive/DiscardRoute case only if a reviewer
+wants it (the per-disposition counters at :2802 already tell the story).
 
 ## 7. Implementation sketch (for the eventual /engineer pass — NOT executed here)
 
@@ -346,16 +412,38 @@ Build/lint: `make build-userspace-dp`, `cargo test -p` the userspace-dp crate.
 
 ---
 
-## Open questions for reviewers (hostile pass)
+## Open questions for reviewers (hostile pass) — resolved in r1
 
-1. Is the §2.2 PolicyDenied→kernel-FIB forward trace correct, or is there an
-   earlier enforcement point (BPF map, session refusal) that I missed that
-   drops denied packets before they reach mod.rs:2156?
-2. Is `tunnel_endpoint_id == 0` actually guaranteed for a denied transit flow,
-   or can a denied flow carry a non-zero tunnel id (which would make the #1873
-   gate the de-facto drop)?
-3. Path A vs. a stricter "gate inside `_from_frame` + rewrite dispatch/mod.rs:225
-   to a non-filtered primitive" — is the call-site fix the right altitude, or
-   does leaving `_from_frame` unfiltered invite the next regression?
-4. Should the buffered-MissingNeighbor duplicate (§2.5) be fixed in the same
-   change or deferred?
+1. §2.2 PolicyDenied→kernel-FIB trace — **CONFIRMED correct** by Codex + AGY +
+   Claude SMR (no earlier drop point; the `_from_frame` enqueue reaches the TUN).
+2. `tunnel_endpoint_id == 0` for a denied transit flow — confirmed the typical
+   case; if a denied flow DID carry a tunnel id, the #1873 gate would drop it
+   (counted) — that is the safe direction, so it does not weaken the fix.
+3. Altitude — reviewers agreed Path A (call-site gate) is correct PROVIDED the
+   `_from_frame` helper is documented as the raw/unchecked primitive (folded
+   into Path A step 3 + §6). Filtering inside `_from_frame` (Path B) is fatal
+   — breaks TWO load-bearing callers (FabricRedirect-Owned + ForwardCandidate
+   build-failure).
+4. Buffered-MissingNeighbor duplicate (§2.5 / issue Q3) — **DEFERRED** (not
+   fixed by #1913); follow-up at /engineer time if undesirable.
+
+## Round-1 reviewer findings (Codex + AGY + Claude SMR) — folded into r2
+
+- **§2.1 table erratum (Codex + AGY):** `ForwardCandidate`/`FabricRedirect` are
+  consumed by the forward `if` at mod.rs:1794-1798 and NEVER reach :2814 — they
+  were wrongly listed in the `_` arm. CORRECTED.
+- **MissingNeighbor SNAT-failure early continues (Codex + AGY):** :2533 and
+  :2564 `scratch_recycle.push` + `continue`, skipping :2814 — omitted in r1.
+  ADDED to the table.
+- **§2.6 over-broad proof (Codex + AGY):** the r1 "the :238 else proves it's
+  intentional" framing is wrong — the :238 desc branch calls the FILTERED
+  wrapper which DROPS FabricRedirect, an asymmetry/pre-existing bug, not a
+  clean bypass. ALSO the `slow_path.rs:61` ForwardCandidate build-failure
+  fallback relies on unfiltered `_from_frame`. Both corrected; Path B is fatal
+  for BOTH callers.
+- **Altitude (Codex + AGY):** document `_from_frame` as the raw/unchecked
+  primitive. FOLDED into Path A step 3.
+- **F1 (Claude SMR):** DiscardRoute is the cleanest leak proof. ADDED to §2.4.
+- **F2 (Claude SMR):** Q3 deferral made explicit. ADDED to §2.5.
+- All three reviewers CONFIRMED the core diagnosis (real policy bypass, not
+  benign) and the Path C rejection (re-introduces #1885).
