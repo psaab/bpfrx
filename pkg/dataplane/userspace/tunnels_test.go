@@ -268,3 +268,122 @@ func TestBuildTunnelEndpointSnapshotsDropsLaterSortingCollider(t *testing.T) {
 		t.Fatalf("kept id %d, want %d", endpoints[0].ID, config.StableTunnelEndpointID("wg1408.0"))
 	}
 }
+
+// #1914 SSOT parity: the builder's configured-name set MUST equal the
+// emitter's Name set (before runtime-iface intersect + usedIDs). This pins
+// buildTunnelEndpointSnapshots to config.EmitTunnelEndpointNames so the
+// commit-time collision gate (which drives Views 2/3 through the emitter)
+// and the dataplane builder can never drift (the #1910 r2-r6 drift class).
+//
+// Methodology: for each corpus config, take the emitter's Name set, build a
+// runtime InterfaceSnapshot for every emitted ref (distinct ifindex, no
+// fold collision among the corpus names) so the builder's runtime intersect
+// is a no-op and no usedIDs drop fires, then assert the builder's emitted
+// Interface set equals the emitter's Name set exactly.
+func TestEmitTunnelEndpointNamesMatchesBuilder(t *testing.T) {
+	mkIface := func(name string, tun *config.TunnelConfig, units map[int]*config.InterfaceUnit) *config.InterfaceConfig {
+		return &config.InterfaceConfig{Name: name, Tunnel: tun, Units: units}
+	}
+	wg := func() *config.TunnelConfig { return &config.TunnelConfig{Mode: "wireguard", WgListenPort: 51820} }
+	greComplete := func() *config.TunnelConfig {
+		return &config.TunnelConfig{Mode: "gre", Source: "10.0.0.1", Destination: "10.0.0.2"}
+	}
+	greIncomplete := func() *config.TunnelConfig { return &config.TunnelConfig{Mode: "gre"} }
+
+	corpus := []struct {
+		name  string
+		cfg   *config.Config
+		wantN int // sanity: expected emitted count
+	}{
+		{
+			name: "interface-level-wg-multi-unit-lowest-only",
+			cfg: cfgWith(map[string]*config.InterfaceConfig{
+				"wg0": mkIface("wg0", wg(), map[int]*config.InterfaceUnit{
+					0: {Number: 0}, 1: {Number: 1}, 2: {Number: 2},
+				}),
+			}),
+			wantN: 1, // only wg0.0
+		},
+		{
+			name: "interface-level-wg-no-units-bare",
+			cfg: cfgWith(map[string]*config.InterfaceConfig{
+				"wg5": mkIface("wg5", wg(), nil),
+			}),
+			wantN: 1, // bare "wg5"
+		},
+		{
+			name: "non-wg-multi-unit-complete-per-unit",
+			cfg: cfgWith(map[string]*config.InterfaceConfig{
+				"gr-0/0/0": mkIface("gr-0/0/0", greComplete(), map[int]*config.InterfaceUnit{
+					0: {Number: 0}, 3: {Number: 3},
+				}),
+			}),
+			wantN: 2, // gr-0/0/0.0, gr-0/0/0.3
+		},
+		{
+			name: "non-wg-incomplete-dropped",
+			cfg: cfgWith(map[string]*config.InterfaceConfig{
+				"gr-1/0/0": mkIface("gr-1/0/0", greIncomplete(), nil),
+			}),
+			wantN: 0, // dropped by src/dest gate
+		},
+		{
+			name: "per-unit-tunnels-mixed",
+			cfg: cfgWith(map[string]*config.InterfaceConfig{
+				"gr-2/0/0": mkIface("gr-2/0/0", nil, map[int]*config.InterfaceUnit{
+					0: {Number: 0, Tunnel: greComplete()},
+					1: {Number: 1}, // no tunnel — not emitted
+					2: {Number: 2, Tunnel: greIncomplete()}, // dropped
+				}),
+			}),
+			wantN: 1, // only gr-2/0/0.0
+		},
+		{
+			name: "no-tunnels",
+			cfg: cfgWith(map[string]*config.InterfaceConfig{
+				"ge-0/0/0": mkIface("ge-0/0/0", nil, map[int]*config.InterfaceUnit{0: {Number: 0}}),
+			}),
+			wantN: 0,
+		},
+	}
+
+	for _, tc := range corpus {
+		t.Run(tc.name, func(t *testing.T) {
+			emitted := config.EmitTunnelEndpointNames(tc.cfg)
+			emitNames := make(map[string]struct{}, len(emitted))
+			ifaces := make([]InterfaceSnapshot, 0, len(emitted))
+			idx := 100
+			for _, ep := range emitted {
+				emitNames[ep.Name] = struct{}{}
+				ifaces = append(ifaces, InterfaceSnapshot{
+					Name:      ep.Name,
+					LinuxName: ep.Name,
+					Ifindex:   idx,
+				})
+				idx++
+			}
+			if len(emitNames) != tc.wantN {
+				t.Fatalf("emitter produced %d names %v, want %d", len(emitNames), emitNames, tc.wantN)
+			}
+			snaps := buildTunnelEndpointSnapshots(tc.cfg, ifaces)
+			builderNames := make(map[string]struct{}, len(snaps))
+			for _, s := range snaps {
+				builderNames[s.Interface] = struct{}{}
+			}
+			if len(builderNames) != len(emitNames) {
+				t.Fatalf("builder names %v != emitter names %v", builderNames, emitNames)
+			}
+			for n := range emitNames {
+				if _, ok := builderNames[n]; !ok {
+					t.Fatalf("emitter ref %q missing from builder set %v", n, builderNames)
+				}
+			}
+		})
+	}
+}
+
+func cfgWith(ifaces map[string]*config.InterfaceConfig) *config.Config {
+	c := &config.Config{}
+	c.Interfaces.Interfaces = ifaces
+	return c
+}

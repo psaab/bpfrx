@@ -35,11 +35,6 @@ func buildTunnelEndpointSnapshots(cfg *config.Config, interfaces []InterfaceSnap
 	if len(ifaceByName) == 0 {
 		return nil
 	}
-	names := make([]string, 0, len(cfg.Interfaces.Interfaces))
-	for name := range cfg.Interfaces.Interfaces {
-		names = append(names, name)
-	}
-	sort.Strings(names)
 	out := make([]TunnelEndpointSnapshot, 0)
 	// #1873: ids are content-derived (config.StableTunnelEndpointID of
 	// the unit-qualified interface name), NOT positional — adding or
@@ -58,6 +53,11 @@ func buildTunnelEndpointSnapshots(cfg *config.Config, interfaces []InterfaceSnap
 		// WireGuard endpoints carry the peer in WgEndpoint and need no
 		// Source/Destination (#1432 S2a); a WG endpoint configured with
 		// only WgEndpoint must not be dropped by the GRE source/dest gate.
+		// The non-WG source/dest gate and the interface-level-WG
+		// single-lowest-unit pick now live in the SSOT emitter
+		// (config.EmitTunnelEndpointNames), so addEndpoint trusts the
+		// emitter's filtering; the redundant guard is retained as a
+		// defense-in-depth no-op against future call paths.
 		isWireguard := tunnel.Mode == "wireguard"
 		if !isWireguard && (tunnel.Source == "" || tunnel.Destination == "") {
 			return
@@ -130,65 +130,18 @@ func buildTunnelEndpointSnapshots(cfg *config.Config, interfaces []InterfaceSnap
 		out = append(out, snap)
 		usedIDs[id] = ifName
 	}
-	for _, name := range names {
-		iface := cfg.Interfaces.Interfaces[name]
-		if iface == nil {
-			continue
-		}
-		if iface.Tunnel != nil {
-			if len(iface.Units) == 0 {
-				addEndpoint(name, iface.Tunnel)
-				continue
-			}
-			unitNums := make([]int, 0, len(iface.Units))
-			for unitNum := range iface.Units {
-				unitNums = append(unitNums, unitNum)
-			}
-			sort.Ints(unitNums)
-			if iface.Tunnel.Mode == "wireguard" {
-				// Interface-level WireGuard is ONE persistent TUN with
-				// ONE listen port shared by every unit (#1910 r2 Codex
-				// High): now that TunnelNameMap resolves every unit ref
-				// of an interface-level wg to the base device, per-unit
-				// emission would produce N live endpoints with the SAME
-				// ifindex + listen port — the Rust side overwrites
-				// tunnel_endpoint_by_ifindex with the later id and the
-				// second control thread tombstones on the duplicate UDP
-				// bind, so routes can select an engine whose control
-				// thread never came up. Emit exactly one endpoint,
-				// keyed by the LOWEST CONFIGURED unit ref — a pure
-				// function of config, never of runtime snapshot rows,
-				// so both HA nodes compute the same endpoint id from
-				// the same config (#1873) and the commit-time collision
-				// gate (collectTunnelEndpointNamesAST) can mirror the
-				// selection exactly. The common single-unit-0 shape
-				// keeps its existing stable id. Rows for every unit of
-				// an interface-level wg share one LinuxName/ifindex, so
-				// row presence is all-or-nothing: if the device is
-				// absent, addEndpoint drops the ref like it always did.
-				addEndpoint(fmt.Sprintf("%s.%d", name, unitNums[0]), iface.Tunnel)
-				continue
-			}
-			for _, unitNum := range unitNums {
-				addEndpoint(fmt.Sprintf("%s.%d", name, unitNum), iface.Tunnel)
-			}
-			continue
-		}
-		if len(iface.Units) == 0 {
-			continue
-		}
-		unitNums := make([]int, 0, len(iface.Units))
-		for unitNum := range iface.Units {
-			unitNums = append(unitNums, unitNum)
-		}
-		sort.Ints(unitNums)
-		for _, unitNum := range unitNums {
-			unit := iface.Units[unitNum]
-			if unit == nil || unit.Tunnel == nil {
-				continue
-			}
-			addEndpoint(fmt.Sprintf("%s.%d", name, unitNum), unit.Tunnel)
-		}
+	// #1914: the configured tunnel-endpoint NAME set (which refs the
+	// builder would emit, including the interface-level-WG
+	// single-lowest-unit pick and the non-WG source/dest gate) is owned by
+	// the SSOT emitter config.EmitTunnelEndpointNames. The builder then
+	// intersects with the runtime InterfaceSnapshot rows (addEndpoint's
+	// ifaceByName lookup) and applies the usedIDs collision drop. The
+	// commit-time collision gate (validateTunnelEndpointIDCollisionAST)
+	// drives its per-node views through the same emitter, so the gate and
+	// the builder can never drift (parity-pinned by
+	// TestEmitTunnelEndpointNamesMatchesBuilder).
+	for _, ep := range config.EmitTunnelEndpointNames(cfg) {
+		addEndpoint(ep.Name, ep.Tunnel)
 	}
 	return out
 }
