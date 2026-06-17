@@ -1,0 +1,9 @@
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+PLACEHOLDER-xpf-archive-keyring-not-yet-issued
+This is a #1924 placeholder OpenPGP archive public key. The release build
+(after OQ-2 decides the signing identity) replaces this file with the real
+ASCII-armored archive public key, and the same key block is substituted into
+scripts/dist/install.sh between its BEGIN/END markers. With this placeholder
+in place, apt rejects the repo signature — the correct fail-safe.
+-----END PGP PUBLIC KEY BLOCK-----

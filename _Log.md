@@ -5465,6 +5465,25 @@ top.
   - **Action**: README getting-started restructure (PR #1937) — rewrote README into install/getting-started guide (3 paths: .deb, incus image, kvm/libvirt) cross-checked against Makefile deb/image targets, debian/control+postinst, scripts/image/bake.py + make_config_drive.py, scripts/deploy/xpf-deploy.py. Moved deep reference content into new docs/architecture.md, docs/feature-coverage.md, docs/network-topology.md, docs/critical-patterns.md, docs/README.md. Docs-only.
   - **File(s)**: README.md, docs/architecture.md, docs/feature-coverage.md, docs/network-topology.md, docs/critical-patterns.md, docs/README.md, docs/pr/readme-getting-started/reviewer-ids.md
 
+## #1924 signed/hosted appliance distribution (engineer)
+- **Timestamp**: 2026-06-16
+- **Action**: Add minisign image-signing mechanism: shared scripts/dist/sign.py
+  (sign/verify + per-version manifest, per-file verification), wire signing into
+  scripts/image/bake.py (per-version xpf-<ver>.SHA256SUMS + .minisig, fail-open),
+  wire verification into scripts/image/validate.py (--verify-sig/--no-verify-sig,
+  verify exact qcow2+metadata before import). Placeholder pinned pubkey.
+- **File(s)**: scripts/dist/sign.py, scripts/dist/README.md,
+  scripts/dist/xpf-image.pub.placeholder, scripts/image/bake.py,
+  scripts/image/validate.py
+- **Timestamp**: 2026-06-16
+- **Action**: Add apt repo build tooling (flat signed default + reprepro opt-in),
+  Tailscale-style install.sh (preflight/keyring/source), fail-closed publish gate
+  + signed latest.json + XPF_PUBLISH_CMD dispatch, xpf-deploy.py fetch (verify
+  exact bytes at import), debian/xpf keyring payload (rotation), Makefile dist-*
+  targets, selftest.sh roundtrip gate (13/13), docs/distribution.md + install-images.md.
+- **File(s)**: scripts/dist/{build-apt-repo.sh,install.sh,publish.py,selftest.sh,
+  xpf-archive-keyring.asc.placeholder}, scripts/deploy/xpf-deploy.py, debian/rules,
+  Makefile, docs/distribution.md, docs/install-images.md
 - **Timestamp**: 2026-06-16
   - **Action**: #1930 INC-0 (PR-1 first slice) — image kernel hold + apt safety. bake.py now `apt-mark hold`s the installed linux-* set (dpkg-query enumeration, not a bare glob; HARD-ASSERTs ≥2 held), writes an unattended-upgrades Package-Blacklist for linux-*, and a needrestart blacklist for xpfd + the runtime version dirs. Closes the "unattended apt moves the verifier floor" hole with no daemon code.
   - **File(s)**: scripts/image/bake.py, docs/install-images.md, _Log.md

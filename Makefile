@@ -105,6 +105,40 @@ audit-check:
 image:
 	python3 scripts/image/bake.py
 
+# ── signed, hosted distribution (#1924) ───────────────────────────────────
+# Hosting URL + signing key are CONFIG INPUTS, never hardcoded:
+#   XPF_SIGN_SECKEY    path to the minisign image secret key (sign step)
+#   XPF_GPG_KEY        OpenPGP key id that signs the apt Release
+#   XPF_IMAGE_BASE_URL / XPF_APT_BASE_URL   publish destinations
+#   XPF_PUBLISH_CMD    backend shim: $CMD <local-dir> <dest-base-url>
+.PHONY: dist-sign dist-repo dist-publish dist-selftest
+
+# Sign already-baked dist/ image artifacts (re-emit the per-version manifest
+# signature). The bake also signs inline when XPF_SIGN_SECKEY is set; this is
+# the standalone re-sign / rotation entry point.
+dist-sign:
+	@test -n "$(XPF_SIGN_SECKEY)" || { echo "set XPF_SIGN_SECKEY=<minisign seckey path>"; exit 1; }
+	@for m in dist/xpf-*.SHA256SUMS; do \
+	    [ -f "$$m" ] || { echo "no dist/xpf-*.SHA256SUMS (run 'make image' first)"; exit 1; }; \
+	    python3 scripts/dist/sign.py sign-manifest --manifest "$$m" \
+	        --seckey "$(XPF_SIGN_SECKEY)" \
+	        $$(awk '{print "dist/" $$2}' "$$m"); \
+	done
+
+# Build the signed apt repo (flat default; XPF_APT_TOOL=reprepro to opt in).
+dist-repo:
+	XPF_GPG_KEY="$(XPF_GPG_KEY)" sh scripts/dist/build-apt-repo.sh
+
+# Fail-closed publish: verifies every artifact is signed, then dispatches
+# XPF_PUBLISH_CMD once per URL. Refuses to upload anything unsigned.
+dist-publish:
+	python3 scripts/dist/publish.py --channel $${XPF_CHANNEL:-stable}
+
+# Self-contained roundtrip gate: throwaway key -> sign -> verify ->
+# tamper-fails -> flat repo build -> install.sh dry-run. No real key, no host.
+dist-selftest:
+	sh scripts/dist/selftest.sh
+
 clean:
 	rm -f $(BINARY) cli xpf-userspace-dp
 	# Narrowed glob (#1476): the retained Rust shim object lives at

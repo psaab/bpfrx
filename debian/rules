@@ -73,6 +73,24 @@ override_dh_auto_install:
 	install -d debian/xpf/etc/needrestart/conf.d
 	install -m 0644 debian/xpf.needrestart \
 	                debian/xpf/etc/needrestart/conf.d/xpf.conf
+	@# Ship the apt archive keyring in the package payload (#1924 NIT-2) so
+	@# existing hosts get a ROTATED key via `apt upgrade` even though they
+	@# never re-run install.sh. Install under /usr/share/keyrings (NOT
+	@# /etc): a file under /etc is a dpkg CONFFILE — install.sh writes the
+	@# key before `apt install`, so dpkg would hit a conffile prompt (hangs
+	@# unattended installs) and `force-confnew` would clobber the real key
+	@# with the placeholder (fleet lockout). /usr/share/keyrings is
+	@# package-owned and updates seamlessly on upgrade (AGY-A1). Prefer the
+	@# real key when the release build has dropped it in; otherwise ship the
+	@# placeholder (apt rejects the signature — the correct fail-safe).
+	install -d debian/xpf/usr/share/keyrings
+	if [ -f scripts/dist/xpf-archive-keyring.asc ]; then \
+	    install -m 0644 scripts/dist/xpf-archive-keyring.asc \
+	            debian/xpf/usr/share/keyrings/xpf-archive-keyring.asc; \
+	else \
+	    install -m 0644 scripts/dist/xpf-archive-keyring.asc.placeholder \
+	            debian/xpf/usr/share/keyrings/xpf-archive-keyring.asc; \
+	fi
 
 # Disable the auto-restart-on-upgrade block dh_installsystemd would
 # otherwise append to postinst. A plain `apt upgrade xpf` must NOT

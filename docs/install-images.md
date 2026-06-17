@@ -15,7 +15,14 @@ Two deliverables, same root disk:
 |---|---|---|
 | `dist/xpf-<ver>.qcow2` | libvirt/KVM, plain QEMU | `virt-install --import --disk path=...` |
 | `dist/xpf-<ver>.incus-metadata.tar.gz` + the same qcow2 | incus (VM) | `incus image import <meta> <qcow2> --alias xpf-appliance` |
-| `dist/SHA256SUMS` | both | `sha256sum -c` |
+| `dist/xpf-<ver>.SHA256SUMS` (+ `.minisig`) | both | minisign-verified, per-file (#1924) |
+
+> **Signed distribution (#1924):** the bake emits a per-version, minisign-signed
+> checksum manifest. Fetch + verify from a trusted signed source instead of
+> copying files by hand — `xpf-deploy.py fetch --version <ver> --image-url
+> $XPF_IMAGE_BASE_URL` downloads, verifies the exact bytes against the signed
+> manifest, and imports. The one-command `install.sh` + signed apt repo are the
+> package path. See `docs/distribution.md`.
 
 ## Bake
 
@@ -72,7 +79,11 @@ Pipeline (offline — the image is never booted to provision it):
    increment.
 5. `virt-sysprep` seal: machine-id, ssh host keys, logs, tmp files,
    bash history, package caches, random seed; `/etc/xpf` factory-empty.
-6. Export compressed qcow2 + incus metadata tarball + SHA256SUMS.
+6. Export compressed qcow2 + incus metadata tarball + the per-version
+   `xpf-<ver>.SHA256SUMS` manifest, minisign-signed to
+   `xpf-<ver>.SHA256SUMS.minisig` when `XPF_SIGN_SECKEY` (a path) is set
+   (#1924). An unsigned dev bake warns "not publishable"; `make dist-publish`
+   refuses it.
 7. **Validation gate** (default on): the image is imported into local
    incus and the FULL first-boot matrix runs — factory boot (fxp0
    DHCP, sshd posture via `sshd -T`, -generic kernel flavor + full
@@ -184,8 +195,12 @@ commit-check and refuses to build an ISO the appliance would reject.
   there, or use the console once and `commit` a config.
 - The image ships no ssh host keys, no machine-id, no logs; both are
   regenerated per-instance at first boot.
-- Verify artifacts with `sha256sum -c dist/SHA256SUMS`. (Detached
-  signing — minisign — is a follow-up; see the #1879 deferred list.)
+- Verify artifacts with their minisign-signed per-version manifest
+  (#1924): `xpf-deploy.py fetch` verifies the exact bytes against
+  `xpf-<ver>.SHA256SUMS` + `.minisig`, or verify manually with
+  `minisign -V -p scripts/dist/xpf-image.pub -m xpf-<ver>.SHA256SUMS
+  -x xpf-<ver>.SHA256SUMS.minisig` then check each file's hash. The signed
+  apt repo + `install.sh` are the package path — see `docs/distribution.md`.
 
 ## Upgrades
 
