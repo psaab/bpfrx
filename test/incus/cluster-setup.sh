@@ -82,8 +82,16 @@ VM0="${VM0:-xpf-fw0}"
 VM1="${VM1:-xpf-fw1}"
 LAN_HOST="${LAN_HOST:-cluster-lan-host}"
 PROFILE="${PROFILE:-xpf-cluster}"
-IMAGE_VM="${IMAGE_VM:-images:debian/13}"
-IMAGE_CT="${IMAGE_CT:-images:debian/13}"
+# Ubuntu 26.04 to match the production appliance base (scripts/image/bake.py),
+# same as the standalone test/incus/setup.sh (#1943). XPF_BASE_RELEASE pins the
+# Ubuntu release; IMAGE_VM/IMAGE_CT stay env-overridable for a different *Ubuntu*
+# release, NOT a Debian fallback (the script now uses Ubuntu package names + a
+# >= 6.18 kernel floor). Rollback is `git revert`, not a runtime IMAGE_VM swap.
+# VM uses the /cloud (cloud-init) variant; the LAN-host container uses the
+# plain non-cloud alias (no need for cloud-init in a container) — Copilot r2.
+XPF_BASE_RELEASE="${XPF_BASE_RELEASE:-26.04}"
+IMAGE_VM="${IMAGE_VM:-images:ubuntu/${XPF_BASE_RELEASE}/cloud}"
+IMAGE_CT="${IMAGE_CT:-images:ubuntu/${XPF_BASE_RELEASE}}"
 LAN_ADDR="${LAN_ADDR:-}"
 LAN_GW="${LAN_GW:-}"
 
@@ -455,39 +463,41 @@ net.ipv6.neigh.default.retrans_time_ms = 250
 EOF'
 	incus exec "$rinst" -- sysctl --system
 
+	# Ubuntu 26.04 package names, version-exact against the stock image kernel
+	# (#1943) — see the matching rationale in setup.sh. Deltas vs the old Debian
+	# list: linux-headers-amd64 -> linux-headers-$(uname -r); linux-perf ->
+	# linux-tools-$(uname -r); host -> bind9-host; golang dropped. NO
+	# linux-modules-extra: the mlx5 SR-IOV VF drivers ship in the in-image
+	# linux-modules package and no linux-modules-extra-* exists for this kernel.
+	# frr-pythontools and ethtool exist on Ubuntu with the same names.
 	info "Installing packages ($vm, this may take a few minutes)..."
-	incus exec "$rinst" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential clang llvm libbpf-dev linux-headers-amd64 golang tcpdump iproute2 iperf3 bpftool frr frr-pythontools strongswan strongswan-swanctl kea-dhcp4-server kea-dhcp6-server chrony ethtool mtr-tiny linux-perf host pciutils curl wget ripgrep'
+	incus exec "$rinst" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential clang llvm libbpf-dev linux-headers-$(uname -r) linux-tools-$(uname -r) tcpdump iproute2 iperf3 bpftool frr frr-pythontools strongswan strongswan-swanctl kea-dhcp4-server kea-dhcp6-server chrony ethtool mtr-tiny bind9-host pciutils curl wget ripgrep'
 
-	# Upgrade kernel to latest from Debian unstable
-	info "Adding Debian unstable repo for kernel upgrade ($vm)..."
-	incus exec "$rinst" -- bash -c 'cat > /etc/apt/sources.list.d/unstable.list <<EOF
-deb http://deb.debian.org/debian unstable main
-EOF
-cat > /etc/apt/preferences.d/pin-stable <<EOF
-Package: *
-Pin: release a=trixie
-Pin-Priority: 900
+	# Ubuntu 26.04 ships a stock kernel >= 6.18, so the Debian-unstable kernel
+	# dance is gone. Assert the floor and the SR-IOV VF driver presence (mlx5),
+	# mirroring bake.py:227-242, so a regressed base fails loudly.
+	info "Asserting kernel >= 6.18 and mlx5 driver present ($vm)..."
+	incus exec "$rinst" -- bash -c 'kver=$(uname -r); dpkg --compare-versions "${kver%%-*}" ge 6.18 || { echo "FATAL: base kernel $kver < 6.18 (verifier floor)" >&2; exit 1; }; test -d /lib/modules/$kver/kernel/drivers/net/ethernet/mellanox || { echo "FATAL: mlx5 driver modules missing" >&2; exit 1; }' \
+		|| die "base image kernel < 6.18 or mlx5 driver modules missing ($vm)"
 
-Package: linux-image-amd64 linux-headers-amd64 linux-image-* linux-headers-*
-Pin: release a=unstable
-Pin-Priority: 990
+	# Disable init_on_alloc via a grub.d drop-in (NOT a sed) — the Ubuntu
+	# image's 50-*.cfg re-sets GRUB_CMDLINE_LINUX_DEFAULT, so a sed is lost.
+	# Mirrors bake.py's GRUB_DROPIN. Keep a reboot so the change goes live.
+	info "Disabling init_on_alloc for XDP performance ($vm, grub.d drop-in)..."
+	incus exec "$rinst" -- bash -c 'cat > /etc/default/grub.d/99-xpf.cfg <<EOF
+# xpf (#1943/#1879): init_on_alloc=0 in the virtio-net XDP path.
+GRUB_CMDLINE_LINUX_DEFAULT="\$GRUB_CMDLINE_LINUX_DEFAULT init_on_alloc=0"
 EOF'
-	info "Installing latest kernel from unstable ($vm)..."
-	incus exec "$rinst" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq linux-image-amd64 linux-headers-amd64'
-
-	# Disable init_on_alloc for XDP performance
-	info "Disabling init_on_alloc for XDP performance ($vm)..."
-	incus exec "$rinst" -- sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="[^"]*"/GRUB_CMDLINE_LINUX_DEFAULT="quiet init_on_alloc=0"/' /etc/default/grub
 	incus exec "$rinst" -- update-grub
 
-	info "Rebooting VM for new kernel ($vm)..."
+	info "Rebooting VM to apply the init_on_alloc=0 grub change ($vm)..."
 	incus restart "$(r "$vm")"
 	local ktries=0
 	while ! incus exec "$rinst" -- true &>/dev/null; do
 		sleep 2
 		ktries=$((ktries + 1))
 		if [[ $ktries -ge 30 ]]; then
-			warn "VM $vm did not come back after kernel upgrade reboot"
+			warn "VM $vm did not come back after the grub-apply reboot"
 			break
 		fi
 	done

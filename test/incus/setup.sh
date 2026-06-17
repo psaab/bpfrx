@@ -15,18 +15,41 @@
 
 set -euo pipefail
 
-# Re-exec under incus-admin group if needed
+# Re-exec under incus-admin group if needed. Forward XPF_* scalar vars
+# (e.g. XPF_BASE_RELEASE / IMAGE_VM / IMAGE_CT) across the re-exec: sg's
+# env preservation is not guaranteed on every platform, so without this a
+# `XPF_BASE_RELEASE=... make test-vm` would silently fall back to the
+# default after the sg re-exec (Copilot r2). Mirrors cluster-setup.sh.
 if ! incus list &>/dev/null 2>&1; then
 	if getent group incus-admin &>/dev/null && id -nG | grep -qw incus-admin; then
-		exec sg incus-admin -c "$(printf '%q ' "$0" "$@")"
+		local_env=""
+		for _v in "${!XPF_@}" "${!IMAGE_@}"; do
+			local_env+="${_v}=$(printf '%q' "${!_v}") "
+		done
+		exec sg incus-admin -c "${local_env}$(printf '%q ' "$0" "$@")"
 	fi
 fi
 
 INSTANCE_NAME="xpf-fw"
 VM_PROFILE="xpf-vm"
 CT_PROFILE="xpf-container"
-IMAGE_VM="images:debian/13"
-IMAGE_CT="images:debian/13"
+# Ubuntu 26.04 to match the production appliance base (scripts/image/bake.py).
+# XPF_BASE_RELEASE pins the Ubuntu release the way bake.py's same-named knob
+# does; the *test* VM must track whatever release production was last baked at
+# (a deliberate, reviewed bump), NOT silently follow the newest Ubuntu the day
+# you run `make test-vm`. IMAGE_VM/IMAGE_CT stay env-overridable for pinning a
+# different *Ubuntu* release — they are NOT a Debian fallback path (#1943): the
+# script now uses Ubuntu package names and a >= 6.18 kernel floor, so a Debian
+# image would fail. Rollback is `git revert`, not a runtime IMAGE_VM override.
+#
+# VM uses the /cloud (cloud-init) variant to match bake.py's cloudimg base; the
+# container uses the plain non-cloud alias — both aliases publish a CONTAINER
+# rootfs, but the non-cloud one avoids dragging cloud-init into a container that
+# does not need it (Copilot r2). Both are env-overridable for a different Ubuntu
+# release (NOT a Debian fallback — Ubuntu package names + the 6.18 floor apply).
+XPF_BASE_RELEASE="${XPF_BASE_RELEASE:-26.04}"
+IMAGE_VM="${IMAGE_VM:-images:ubuntu/${XPF_BASE_RELEASE}/cloud}"
+IMAGE_CT="${IMAGE_CT:-images:ubuntu/${XPF_BASE_RELEASE}}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
@@ -118,6 +141,15 @@ create_vm_profile() {
 config:
   limits.cpu: "4"
   limits.memory: 4GB
+  # Secure Boot ON to match the production posture (#1943). The Ubuntu 26.04
+  # base ships a Canonical-signed shim->grub->kernel chain that boots under
+  # OVMF Secure Boot with no MOK enrollment, and the kernel locks down. The
+  # AF_XDP shim is a BPF_PROG_TYPE_XDP program (not a signed kernel module), so
+  # lockdown does not reject it. Validated on images:ubuntu/26.04/cloud.
+  # NOTE: a vanilla Secure-Boot VM proves only "shim->grub->kernel boots + the
+  # AF_XDP shim loads under SB"; the #1930 A4 promote/rollback channel needs the
+  # baked qcow2 (xpf-uefi-slots/09_xpf A/B-ESP substrate) — see XPF_BAKED_IMAGE.
+  security.secureboot: "true"
 devices:
   root:
     path: /
@@ -277,44 +309,84 @@ net.ipv6.conf.default.accept_ra=0
 EOF'
 	incus exec "$INSTANCE_NAME" -- sysctl --system
 
+	# Userspace tooling installed in BOTH the VM and the container. Ubuntu 26.04
+	# package names (#1943): host -> bind9-host; golang dropped (the instance
+	# never compiles Go — `make build` runs on the host, `test-deploy` pushes the
+	# binary). clang/llvm/libbpf-dev kept for ad-hoc in-instance debugging.
 	info "Installing packages (this may take a few minutes)..."
-	incus exec "$INSTANCE_NAME" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential clang llvm libbpf-dev linux-headers-amd64 golang tcpdump iproute2 iperf3 bpftool frr strongswan strongswan-swanctl kea-dhcp4-server kea-dhcp6-server chrony mtr-tiny linux-perf host pciutils curl wget ripgrep'
+	incus exec "$INSTANCE_NAME" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential clang llvm libbpf-dev tcpdump iproute2 iperf3 bpftool frr strongswan strongswan-swanctl kea-dhcp4-server kea-dhcp6-server chrony mtr-tiny bind9-host pciutils curl wget ripgrep'
 
-	# Upgrade kernel to latest from Debian unstable for full BPF verifier support
-	info "Adding Debian unstable repo for kernel upgrade..."
-	incus exec "$INSTANCE_NAME" -- bash -c 'cat > /etc/apt/sources.list.d/unstable.list <<EOF
-deb http://deb.debian.org/debian unstable main
-EOF
-cat > /etc/apt/preferences.d/pin-stable <<EOF
-Package: *
-Pin: release a=trixie
-Pin-Priority: 900
+	# Kernel-coupled provisioning is VM-ONLY (Codex r1 HIGH). A container shares
+	# the HOST kernel, so `uname -r` inside it is the host's (here a Debian
+	# kernel) — installing linux-headers/linux-tools-$(uname -r), asserting guest
+	# module dirs, editing grub, or rebooting are all meaningless or actively
+	# wrong in a container. Containers get only the userspace tooling above; the
+	# frr/chrony enable below still runs for both instance types.
+	if [[ "$type" == "vm" ]]; then
+		# Kernel-version-exact packages so `perf`/headers match `uname -r` and
+		# no metapackage pulls a NEWER kernel (bake.py ships exactly one kernel).
+		# Deltas vs the old Debian list: linux-headers-amd64 ->
+		# linux-headers-$(uname -r); linux-perf -> linux-tools-$(uname -r). NO
+		# linux-modules-extra: on images:ubuntu/26.04/cloud the NIC drivers
+		# (mlx5/i40e/ixgbe) ship in the base linux-modules package already in the
+		# image, and no linux-modules-extra-* exists for this kernel (verified by
+		# live `apt-cache policy`, #1943).
+		info "Installing kernel-version-exact packages (VM)..."
+		incus exec "$INSTANCE_NAME" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq linux-headers-$(uname -r) linux-tools-$(uname -r)'
 
-Package: linux-image-amd64 linux-headers-amd64 linux-image-* linux-headers-*
-Pin: release a=unstable
-Pin-Priority: 990
+		# Ubuntu 26.04 already ships a stock kernel >= 6.18 (the AF_XDP shim
+		# verifier floor), so the old Debian-unstable kernel-pinning dance is
+		# gone. Assert the floor so the VM fails loudly if the base ever
+		# regresses below it, mirroring bake.py:233-242.
+		info "Asserting kernel >= 6.18 (AF_XDP shim verifier floor)..."
+		incus exec "$INSTANCE_NAME" -- bash -c 'kver=$(uname -r); dpkg --compare-versions "${kver%%-*}" ge 6.18 || { echo "FATAL: base kernel $kver < 6.18 (verifier floor)" >&2; exit 1; }' \
+			|| die "base image kernel below the 6.18 AF_XDP verifier floor"
+
+		# Assert the dataplane NIC drivers are present. On Ubuntu these ship in
+		# the in-image linux-modules package, NOT a separate linux-modules-extra;
+		# without them the WAN/loss PFs never bind. Gate on the mellanox (mlx5)
+		# directory only, mirroring the production image gate
+		# (scripts/image/validate.py:188 + bake.py:227-228) — the full ethernet
+		# driver set (i40e/ixgbe/iavf/ice) ships in the same linux-modules
+		# package, so the mellanox dir presence is the representative check and
+		# a stricter AND on i40e could false-negative on an otherwise-fine base.
+		info "Asserting dataplane NIC driver modules present..."
+		incus exec "$INSTANCE_NAME" -- bash -c 'test -d "/lib/modules/$(uname -r)/kernel/drivers/net/ethernet/mellanox" || { echo "FATAL: mlx5 driver modules missing" >&2; exit 1; }' \
+			|| die "dataplane NIC driver modules missing from base image"
+
+		# Disable init_on_alloc — the default CONFIG_INIT_ON_ALLOC_DEFAULT_ON
+		# zeros every allocated page, costing ~20% CPU in the virtio-net XDP
+		# path. Use a grub.d drop-in (NOT a sed on /etc/default/grub): the Ubuntu
+		# image's /etc/default/grub.d/50-*.cfg re-sets GRUB_CMDLINE_LINUX_DEFAULT,
+		# so a sed is silently lost. The drop-in appends instead of fighting that
+		# override. Mirrors bake.py's GRUB_DROPIN. Verified to reach
+		# /proc/cmdline on images:ubuntu/26.04/cloud (#1943).
+		info "Disabling init_on_alloc for XDP performance (grub.d drop-in)..."
+		incus exec "$INSTANCE_NAME" -- bash -c 'cat > /etc/default/grub.d/99-xpf.cfg <<EOF
+# xpf (#1943/#1879): init_on_alloc=0 in the virtio-net XDP path.
+GRUB_CMDLINE_LINUX_DEFAULT="\$GRUB_CMDLINE_LINUX_DEFAULT init_on_alloc=0"
 EOF'
-	info "Installing latest kernel from unstable..."
-	incus exec "$INSTANCE_NAME" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq linux-image-amd64 linux-headers-amd64'
+		incus exec "$INSTANCE_NAME" -- update-grub
 
-	# Disable init_on_alloc — Debian enables CONFIG_INIT_ON_ALLOC_DEFAULT_ON which
-	# zeros every allocated page, costing ~20% CPU in the virtio-net XDP path.
-	info "Disabling init_on_alloc for XDP performance..."
-	incus exec "$INSTANCE_NAME" -- sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="[^"]*"/GRUB_CMDLINE_LINUX_DEFAULT="quiet init_on_alloc=0"/' /etc/default/grub
-	incus exec "$INSTANCE_NAME" -- update-grub
-
-	info "Rebooting VM for new kernel..."
-	incus restart "$INSTANCE_NAME"
-	local ktries=0
-	while ! incus exec "$INSTANCE_NAME" -- true &>/dev/null; do
-		sleep 2
-		ktries=$((ktries + 1))
-		if [[ $ktries -ge 30 ]]; then
-			warn "VM did not come back after kernel upgrade reboot"
-			break
-		fi
-	done
-	incus exec "$INSTANCE_NAME" -- uname -r
+		# A reboot is still required so the init_on_alloc=0 cmdline takes
+		# effect — the kernel-install dance is gone, but the grub change is not
+		# live until the next boot. Skipping it leaves every test running with
+		# init_on_alloc=1.
+		info "Rebooting VM to apply the init_on_alloc=0 grub change..."
+		incus restart "$INSTANCE_NAME"
+		local ktries=0
+		while ! incus exec "$INSTANCE_NAME" -- true &>/dev/null; do
+			sleep 2
+			ktries=$((ktries + 1))
+			if [[ $ktries -ge 30 ]]; then
+				warn "VM did not come back after the grub-apply reboot"
+				break
+			fi
+		done
+		incus exec "$INSTANCE_NAME" -- uname -r
+		# Confirm the tuning actually reached the running kernel cmdline.
+		incus exec "$INSTANCE_NAME" -- bash -c 'grep -q init_on_alloc=0 /proc/cmdline || echo "WARNING: init_on_alloc=0 not in /proc/cmdline" >&2'
+	fi
 
 	incus exec "$INSTANCE_NAME" -- systemctl enable frr
 

@@ -416,15 +416,16 @@ make cluster-start/stop/restart  # Service lifecycle (NODE=0|1|all)
 
 ### What `create` does per VM
 
-1. Launch Debian 13 VM with `xpf-cluster` profile (4 virtio NICs)
+1. Launch Ubuntu 26.04 VM with `xpf-cluster` profile (4 virtio NICs)
 2. Add SR-IOV VF via PCI passthrough (stop VM → add device → restart)
 3. Write `.link` files for vSRX-style interface renaming (MAC-based)
 4. Install packages: FRR, strongSwan, tcpdump, iperf3, bpftool, ethtool, etc.
-5. Upgrade kernel to 6.18+ from Debian unstable
-6. Set GRUB: `init_on_alloc=0` for XDP performance
+5. Assert the Ubuntu 26.04 stock kernel is >= 6.18 and the mlx5 driver dir is
+   present (#1943; no more Debian-unstable kernel upgrade)
+6. Set GRUB (grub.d drop-in): `init_on_alloc=0` for XDP performance
 7. Configure sysctl: legacy BPF JIT, IP forwarding, RA disable
 8. Write `/etc/xpf/node-id` (0 or 1)
-9. Reboot for new kernel
+9. Reboot so the `init_on_alloc=0` cmdline takes effect
 
 ### What `deploy` does per VM
 

@@ -587,7 +587,7 @@ sg incus-admin -c 'incus exec xpf-fw0 -- grep -l OriginalName /etc/systemd/netwo
 ## Makefile Targets
 ```
 make test-env-init   # Install incus, create networks + profiles
-make test-vm         # Create Debian 13 VM with FRR, strongSwan
+make test-vm         # Create Ubuntu 26.04 VM with FRR, strongSwan
 make test-deploy     # Build -> push binary + config + unit -> systemctl enable --now
 make test-ssh        # Shell into VM
 make test-status     # Instance + service + network info
