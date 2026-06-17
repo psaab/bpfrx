@@ -42,3 +42,15 @@ Convergence requires Claude SMR + Codex + AGY all PLAN-READY on the FINAL rev.
 - Codex LOW: WithOwner vs WithPreserveExisting precedence
 - AGY #3: timezone early-return crash loophole (check both halves)
 - AGY #6a: cgo-free lookupUIDGID, no os/user
+
+## r3 verdicts
+| Round | Reviewer | Task/Job ID | Verdict | Artifact |
+|---|---|---|---|---|
+| r3 | Codex | foreground nohup pid 3124282, log /tmp/1916-codex-r3.log | PLAN-NEEDS-REVISION (1 new MED: timezone control-flow) | codex-plan-r3.md |
+| r3 | AGY | adversarial-review-mqi2o2iw-sdrhj3 | PLAN-READY | agy-plan-r3.md |
+| r3 | Claude SMR | n/a | PLAN-READY | claude-smr-plan-r3.md |
+
+## r4 (final) — pending re-review (only Step 2b timezone case-split changed)
+| r4 | Codex | (pending) | | codex-plan-r4.md |
+| r4 | AGY | (pending) | | agy-plan-r4.md |
+| r4 | Claude SMR | n/a | | claude-smr-plan-r4.md |

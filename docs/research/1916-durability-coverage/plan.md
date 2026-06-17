@@ -3,9 +3,10 @@
 - **Issue**: #1916 — Durability coverage gap: fsatomic canary excludes
   `pkg/daemon` + `pkg/api`; TLS cert/key persisted non-atomically with
   ignored errors.
-- **Revision**: r3 (addresses all r2 findings: Claude SMR M1 +
-  Codex HIGH×2/MED×2/LOW + AGY timezone/cgo/keying). r2 changelog at §12,
-  r3 changelog at §13.
+- **Revision**: r4 (r3 reached AGY PLAN-READY + Claude SMR PLAN-READY +
+  Codex PLAN-NEEDS-REVISION on ONE new MEDIUM — the timezone control-flow
+  regression in the Step 2b fix; r4 applies Codex's pre-specified
+  case-split). r2 changelog §12, r3 §13, r4 §14.
 - **Branch**: `research/1916-durability-coverage`
 - **Base**: `origin/master` @ `26e4a112d` (post-#1944 #1949 merge, post-#1950)
 - **Scope class**: bug / durability hardening + test-coverage extension.
@@ -391,19 +392,38 @@ durable write there is still caught.
 - AtomicGeneratedConfig → `WriteFileAtomic`: chrony (304), ssh_known_hosts
   (476), rsyslog (636), sshd drop-in (844), timezone (510 — Step 2b).
 
-### Step 2b — timezone (AGY r2 #3 early-return crash loophole)
+### Step 2b — timezone (AGY r2 #3 early-return loophole + Codex r3 control-flow fix)
 Classify `/etc/timezone` as **AtomicGeneratedConfig** (`WriteFileAtomic`):
 it is re-derived and re-applied every boot from active config, so a
 power-cut loss self-heals next apply; not worth DurableState + a
-symlink-durability redesign. **BUT fix the early-return loophole
-(AGY r2 #3):** `applyTimezone` currently returns early when
-`/etc/localtime` already points at the target — so if a prior crash wrote
-the symlink but NOT `/etc/timezone`, the next boot short-circuits and
-`/etc/timezone` stays stale forever. **Change the early-return guard to
-require BOTH `/etc/localtime` target matches AND `/etc/timezone` content
-matches** before skipping; otherwise fall through and (re)write
-`/etc/timezone`. (Leave the `os.Remove`+`os.Symlink` localtime logic
-otherwise unchanged — out of scope.)
+symlink-durability redesign.
+
+**AGY r2 #3 (early-return loophole):** `applyTimezone` returns early when
+`/etc/localtime` already points at the target — so a prior crash that
+wrote the symlink but NOT `/etc/timezone` leaves `/etc/timezone` stale
+forever.
+
+**Codex r3 MEDIUM (control-flow regression in the naive fix):** simply
+"requiring both to match before skipping, else fall through unchanged" is
+WRONG — the existing body re-runs `os.Remove("/etc/localtime")` +
+`os.Symlink` even when localtime is ALREADY correct (its own
+`if current == target { return }` at `daemon_system.go:492` is bypassed by
+the new outer guard), so a crash after the remove turns a correct-localtime
++ stale-timezone state into a broken-localtime state. **r4 fix — split the
+cases explicitly (do NOT re-run the symlink mutation when localtime is
+already correct):**
+1. if `/etc/localtime` target matches AND `/etc/timezone` content matches
+   → return (nothing to do);
+2. if `/etc/localtime` target does NOT match → perform the existing
+   `os.Remove`+`os.Symlink` localtime path (unchanged);
+3. **always** write `/etc/timezone` via `fsatomic.WriteFileAtomic` when its
+   content differs — **including** the branch where localtime was already
+   correct (so case 1's "timezone-only stale" is repaired WITHOUT touching
+   the good symlink).
+This preserves the AGY early-return repair while removing the
+remove-correct-localtime crash window Codex flagged. (The `/etc/localtime`
+symlink atomicity itself remains out of scope — only the control flow and
+the `/etc/timezone` writer change.)
 
 ### Step 3 — `pkg/daemon` networkd / lifeline / marker
 - AtomicGeneratedConfig → `WriteFileAtomic`: `fixRethLinkFile` (reth 26),
@@ -524,6 +544,7 @@ writes stay direct knobs). No proto, no Rust, no HA-timing logic.
 | TLS persistence failure silently disables HTTPS (Codex r2 MED#1) | Helper returns in-memory cert + nil error on persistence failure; caller installs httpsServer; server-level test asserts httpsServer != nil on disk-write failure. |
 | TLS cert churn breaks remote pins (Claude SMR M1; non-loopback https-interface bind) | D6 r3: cert = DurableState (survives power loss). |
 | timezone stale forever after crash-between-symlink-and-file (AGY r2 #3) | Step 2b: early-return guard requires BOTH localtime target AND /etc/timezone content match before skipping. |
+| New crash window: re-removing an already-correct /etc/localtime (Codex r3 MED) | Step 2b r4 case-split: re-run symlink path ONLY when localtime mismatches; write /etc/timezone atomically whenever its content differs, including the localtime-already-correct branch. |
 | D7-a pulls in cgo via os/user (AGY r2 #6a) | Step 0b: extend cgo-free /etc/passwd parser (lookupUIDGID); no os/user. |
 | Canary same-package same-name false-negative (Codex r2 MED#2) | D1 r3: receiver-aware keying relpath::recv.method. |
 | Canary Path A noisy/incomplete (Claude C1/AGY#2/Codex#4) | §2.C/§2.D exhaustive inventory; seed all knob helpers; extract embedded procfs writes so big functions are never allowlisted. Run `go test ./pkg/fsatomic/` green before commit. |
@@ -643,3 +664,20 @@ re-review the FINAL revision (r3) and reach PLAN-READY.
 - Confirmed-resolved by all r2 reviewers (no r3 change needed): cert
   ownership design (D7-a chownTemp seam), helper extraction (§2.D),
   sshd class (D2), failover (D8), DNS B-route (D3).
+
+---
+
+## 14. r3 → r4 changelog
+
+- **Codex r3 MEDIUM (timezone control-flow regression)** → Step 2b
+  rewritten to the explicit case-split Codex specified: (1) both match →
+  return; (2) localtime mismatch → run existing remove+symlink; (3) always
+  write `/etc/timezone` atomically when its content differs, including the
+  localtime-already-correct branch. This removes the
+  remove-an-already-correct-localtime crash window the naive r3 fix
+  introduced while keeping the AGY r2 #3 early-return repair.
+- r3 reviewer verdicts: **AGY PLAN-READY**, **Claude SMR PLAN-READY**,
+  **Codex PLAN-NEEDS-REVISION (this one item only — all r2 findings + D6
+  reversal + cgo-free lookupUIDGID explicitly verified resolved/accepted
+  with citations).** r4 is the final convergence revision; all three
+  re-review.
