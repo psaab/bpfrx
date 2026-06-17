@@ -12,6 +12,14 @@ Subcommands:
                                   against the signed manifest (#1924), then
                                   import it to a local incus alias. Verify
                                   happens here, not at deploy/launch.
+  kernel-roll --node A --node B   LANE-1 HA kernel roll (#1930 INC-2): drive a
+              --version V          verify-gated kernel bump across the HA pair
+                                  ONE NODE AT A TIME (drain -> arm+reboot into
+                                  the candidate -> poll until promoted -> rejoin,
+                                  then the peer). Survives the per-node reboots;
+                                  holds a leased lock; STOPS (leaving the peer
+                                  primary) if a node reverts. The per-node
+                                  arm/verify/promote is `xpfd upgrade kernel`.
 
 Interface naming is POSITIONAL (matches pkg/daemon/linksetup.go assignName):
 
@@ -578,6 +586,163 @@ def cmd_fetch(args):
     return 0
 
 
+# ── LANE-1 HA kernel-rolling orchestration (#1930 INC-2) ──────────────────
+#
+# Drive a verify-gated kernel bump across an HA pair ONE NODE AT A TIME so the
+# cluster keeps forwarding. Per the converged plan (§3.1-HA): the per-node
+# arm/verify/promote/revert is owned by the in-guest `xpfd upgrade kernel`
+# (INC-1, merged); this EXTERNAL driver survives the per-node reboots (an
+# in-process driver would die at the reboot it triggers) and owns the cross-node
+# sequencing + the "never both down" gate.
+#
+# Sequence per node N (peer P stays primary throughout):
+#   1. hold a LEASE naming N (TTL) on BOTH nodes — suppresses N's local
+#      self-recovery (INC-2 Go side) so it won't fight the roll, and is the
+#      cluster-wide lock (a crashed driver's lease expires, freeing future rolls).
+#   2. drain N -> P (xpfd upgrade kernel relies on the node being secondary; we
+#      demote via the cluster CLI) and confirm P holds the RGs.
+#   3. `xpfd upgrade kernel arm <ver>` on N -> N installs+arms+reboots into the
+#      candidate; the in-guest promotion oneshot verifies+promotes or reverts.
+#   4. poll N until it is back AND `uname -r == <ver>` AND `xpfd upgrade kernel
+#      status` reports `promoted=<ver>` (a REVERTED node boots the OLD kernel and
+#      reports promoted!=<ver> -> we STOP and leave P primary, never touch P).
+#   5. rejoin N (clear failover) + confirm sync re-established.
+#   6. release N's lease, then repeat for P.
+#
+# If a true cross-node reboot-roll cannot be driven (e.g. --dry-run, or a node
+# is unreachable), the driver aborts BEFORE draining the second node, so the
+# cluster never ends up with both nodes down.
+
+def _node_exec(runner, backend, node, argv, check=True):
+    """Run argv inside `node` via the chosen backend (incus|ssh)."""
+    if backend == "ssh":
+        full = ["ssh", node, "--"] + argv
+    else:
+        full = ["incus", "exec", node, "--"] + argv
+    if runner.dry:
+        print("   " + " ".join(shlex.quote(a) for a in full))
+        return ""
+    r = subprocess.run(full, capture_output=True, text=True)
+    if check and r.returncode != 0:
+        die(f"{node}: command failed ({' '.join(argv)}): "
+            f"{r.stdout.strip()} {r.stderr.strip()}")
+    return r.stdout
+
+
+def _write_lease(runner, backend, node, target_node_id, holder, ttl_secs):
+    import json as _json
+    import time as _time
+    lease = _json.dumps({
+        "node_id": target_node_id,
+        "holder": holder,
+        "expires_at": _time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", _time.gmtime(_time.time() + ttl_secs)),
+    })
+    # write atomically in-guest (temp + mv); /var/lib/xpf exists (xpfd owns it).
+    _node_exec(runner, backend, node, [
+        "sh", "-c",
+        "umask 022; printf %s " + shlex.quote(lease) +
+        " > /var/lib/xpf/.kernel-roll.lease.tmp && "
+        "mv -f /var/lib/xpf/.kernel-roll.lease.tmp /var/lib/xpf/kernel-roll.lease"])
+
+
+def _clear_lease(runner, backend, node):
+    _node_exec(runner, backend, node,
+               ["rm", "-f", "/var/lib/xpf/kernel-roll.lease"], check=False)
+
+
+def _kernel_status(runner, backend, node):
+    """Return dict parsed from `xpfd upgrade kernel status` (promoted=, armed=)."""
+    out = _node_exec(runner, backend, node,
+                     ["xpfd", "upgrade", "kernel", "status"], check=False)
+    st = {}
+    for line in out.splitlines():
+        for tok in line.split():
+            if "=" in tok:
+                k, v = tok.split("=", 1)
+                st[k] = v
+    return st
+
+
+def _running_kernel(runner, backend, node):
+    return _node_exec(runner, backend, node, ["uname", "-r"], check=False).strip()
+
+
+def cmd_kernel_roll(args):
+    import time as _time
+    runner = Runner(args.dry_run)
+    backend = args.backend
+    nodes = args.nodes               # ordered [first-to-roll, second]
+    node_ids = {nodes[0]: args.node0_id, nodes[1]: args.node1_id}
+    version = args.version
+    holder = f"{os.uname().nodename}:pid{os.getpid()}"
+    lease_ttl = args.lease_ttl
+    poll_deadline = args.boot_deadline
+
+    if len(nodes) != 2:
+        die("kernel-roll needs exactly two --node arguments (the HA pair)")
+
+    print(f"==> LANE-1 HA kernel roll to {version}: {nodes[0]} then {nodes[1]} "
+          f"(one node at a time; peer keeps forwarding)")
+
+    def roll_one(node, peer):
+        nid = node_ids[node]
+        print(f"\n--- rolling {node} (node-id {nid}); {peer} stays primary ---")
+        # 1. lease on BOTH nodes (suppress self-recovery on `node`, cluster lock)
+        _write_lease(runner, backend, node, nid, holder, lease_ttl)
+        _write_lease(runner, backend, peer, nid, holder, lease_ttl)
+        try:
+            # 2. drain node -> peer (in-service-upgrade demote) + confirm
+            _node_exec(runner, backend, node,
+                       ["cli", "-c", "request system in-service-upgrade"], check=False)
+            # 3. arm+install+reboot into the candidate (in-guest verb).
+            #    `arm` reboots on success and does not return 0 cleanly over
+            #    exec; treat a transport drop as the expected reboot.
+            print(f"   arming candidate {version} on {node} (will reboot)...")
+            _node_exec(runner, backend, node,
+                       ["xpfd", "upgrade", "kernel", "arm", version], check=False)
+            # 4. poll until back + promoted==version (or STOP on revert/timeout)
+            if runner.dry:
+                print(f"   (dry-run) would poll {node} for promoted={version}")
+                return True
+            deadline = _time.time() + poll_deadline
+            promoted = False
+            while _time.time() < deadline:
+                _time.sleep(10)
+                st = _kernel_status(runner, backend, node)
+                running = _running_kernel(runner, backend, node)
+                if not running:
+                    continue  # node still rebooting / unreachable
+                if st.get("promoted") == version and running == version:
+                    promoted = True
+                    break
+                if running and running != version and st.get("armed") in (None, "none"):
+                    # node booted a NON-candidate kernel and nothing is armed ->
+                    # it REVERTED. STOP: leave peer primary, do NOT roll peer.
+                    die(f"{node} REVERTED (running {running}, not {version}); "
+                        f"stopping the roll — {peer} stays primary, {node} is on "
+                        f"its known-good kernel. Investigate before retrying.")
+            if not promoted:
+                die(f"{node} did not promote {version} within {poll_deadline}s "
+                    f"(running={running}); stopping — {peer} stays primary.")
+            print(f"   {node} promoted {version}")
+            # 5. rejoin + confirm sync
+            _node_exec(runner, backend, node,
+                       ["cli", "-c", "request chassis cluster failover reset "
+                        "redundancy-group 0"], check=False)
+            return True
+        finally:
+            # 6. release this node's lease on both nodes (best-effort)
+            _clear_lease(runner, backend, node)
+            _clear_lease(runner, backend, peer)
+
+    roll_one(nodes[0], nodes[1])
+    print(f"\n==> {nodes[0]} done; rolling the second node")
+    roll_one(nodes[1], nodes[0])
+    print(f"\n==> LANE-1 HA kernel roll to {version} COMPLETE on both nodes")
+    return 0
+
+
 def main():
     argv = sys.argv[1:]
     if "-h" in argv or "--help" in argv or not argv:
@@ -599,7 +764,7 @@ def main():
     # `rest` now holds only the subcommand + its own args. The first token
     # is the subcommand; if it isn't one, treat the whole of `rest` as
     # YAML files for `deploy` (the bare-`xpf-deploy.py foo.yaml` shorthand).
-    if rest and rest[0] in ("deploy", "launch", "inventory", "fetch"):
+    if rest and rest[0] in ("deploy", "launch", "inventory", "fetch", "kernel-roll"):
         cmd, cmd_argv = rest[0], rest[1:]
     else:
         cmd, cmd_argv = "deploy", rest
@@ -633,6 +798,26 @@ def main():
         sub.add_argument("--config")
         sub.add_argument("--nic", action="append", default=[])
         args = sub.parse_args(cmd_argv)
+    elif cmd == "kernel-roll":
+        sub = argparse.ArgumentParser(prog="xpf-deploy.py kernel-roll", add_help=False)
+        sub.add_argument("--node", dest="nodes", action="append", default=[],
+                         required=True,
+                         help="HA node (incus name or ssh host); give it TWICE "
+                              "in roll order (first-to-roll then second)")
+        sub.add_argument("--version", required=True,
+                         help="candidate kernel uname -r to roll to")
+        sub.add_argument("--backend", default="incus", choices=["incus", "ssh"])
+        sub.add_argument("--node0-id", type=int, default=0,
+                         help="cluster node-id of the FIRST --node (default 0)")
+        sub.add_argument("--node1-id", type=int, default=1,
+                         help="cluster node-id of the SECOND --node (default 1)")
+        sub.add_argument("--lease-ttl", type=int, default=1800,
+                         help="kernel-roll lease TTL seconds (suppresses the "
+                              "node's local self-recovery during the roll)")
+        sub.add_argument("--boot-deadline", type=int, default=600,
+                         help="seconds to wait for a node to boot + promote the "
+                              "candidate before STOPPING the roll")
+        args = sub.parse_args(cmd_argv)
     else:  # deploy
         sub = argparse.ArgumentParser(prog="xpf-deploy.py deploy", add_help=False)
         sub.add_argument("yamls", nargs="*")
@@ -651,6 +836,8 @@ def main():
         return cmd_inventory(args)
     if cmd == "launch":
         return cmd_launch(args)
+    if cmd == "kernel-roll":
+        return cmd_kernel_roll(args)
     return cmd_deploy(args)
 
 

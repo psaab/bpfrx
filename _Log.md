@@ -5503,3 +5503,7 @@ top.
 - **Timestamp**: 2026-06-16
   - **Action**: #1930 INC-2 bounded local self-recovery. pkg/upgrade/kernel_selfrecover.go (KernelSelfRecovery: lease-suppressed, drained+healthy-peer+grace -> auto ResetFailover; 7 unit tests). pkg/cluster/kernel_selfrecover.go (Manager.LocalDrained/PeerHealthyPrimary/ResetAllFailover predicates). pkg/daemon/kernel_selfrecover.go (adapter + HA-only 30s safety-net loop, wired after cluster.Start). Guards the orchestrator-crash-mid-roll case (r2 AGY).
   - **File(s)**: pkg/upgrade/kernel_selfrecover.go, pkg/upgrade/kernel_selfrecover_test.go, pkg/cluster/kernel_selfrecover.go, pkg/daemon/kernel_selfrecover.go, pkg/daemon/daemon_run.go, _Log.md
+
+- **Timestamp**: 2026-06-16
+  - **Action**: #1930 INC-2 external HA kernel-rolling driver. xpf-deploy.py `kernel-roll --node A --node B --version V [--backend incus|ssh] [--node0-id/--node1-id] [--lease-ttl] [--boot-deadline]`: per-node lease-on-both (suppresses the node's local self-recovery + cluster lock) -> drain -> `xpfd upgrade kernel arm` (reboot into candidate) -> poll `xpfd upgrade kernel status` for promoted==version + uname==version (STOP+leave-peer-primary on revert/timeout) -> rejoin -> release lease, node0 then node1. Dry-run validated.
+  - **File(s)**: scripts/deploy/xpf-deploy.py, _Log.md
