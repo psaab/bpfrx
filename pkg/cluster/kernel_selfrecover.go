@@ -67,10 +67,11 @@ func (m *Manager) SetKernelUpgradeHold() {
 }
 
 // KernelUpgradeHeld reports whether the kernel-upgrade election hold is set.
-// Used by the daemon's self-recovery loop to reconcile the hold against the
-// journal: the promotion gate runs in a SEPARATE process (xpf-kernel-promote.
-// service, After=xpfd) and clears only the on-disk journal, so the running
-// daemon must notice "held but no longer armed" and release the hold itself.
+// Used by the daemon's reconcile loop to release the hold against the durable
+// promotion marker: the promotion gate runs in a SEPARATE process
+// (xpf-kernel-promote.service, After=xpfd) that clears only the on-disk journal
+// and writes the marker, so the running daemon must notice the verified
+// promotion (marker == running kernel) and release the hold itself.
 func (m *Manager) KernelUpgradeHeld() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -78,9 +79,16 @@ func (m *Manager) KernelUpgradeHeld() bool {
 }
 
 // ClearKernelUpgradeHold releases the kernel-upgrade election hold and re-runs
-// election so the node can take its normal role. Called on promote success
-// (the candidate is verified) and on revert (the node is rebooting to known-good
-// anyway). Also implied by ResetAllFailover so the rejoin path clears it.
+// election so the node can take its normal role. The two real callers are
+// (1) the daemon's reconcileKernelUpgradeHold once the promotion marker confirms
+// THIS kernel was verified+promoted, and (2) ResetAllFailover (the local
+// self-recovery rejoin). NOTE: the orchestrator's gRPC `rejoin` clears manual
+// failover PER-RG (Manager.ResetFailover, not ResetAllFailover) and does NOT go
+// through here — that is fine, because the orchestrator only issues rejoin after
+// status reports promoted==version, by which point the marker-driven reconcile
+// has already released the hold. A reverted/failed roll deliberately KEEPS the
+// hold (fail-safe); the hold is then dropped by the reboot to known-good, where
+// it is never re-set.
 func (m *Manager) ClearKernelUpgradeHold() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
