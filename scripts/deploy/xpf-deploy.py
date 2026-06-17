@@ -813,17 +813,32 @@ def cmd_kernel_roll(args):
                 # falsely `die` a revert). Only declare revert when status was
                 # actually read (`armed` key present) and explicitly == "none"
                 # while running a non-candidate kernel.
-                if (running != version and "armed" in st
+                #
+                # AND it requires rebooted==True (r2 Codex): a genuine revert
+                # means the node REBOOTED to known-good (the reboot cleared the
+                # in-memory ForceSecondary drain, so no rejoin is needed). But an
+                # `arm` that FAILED its preflight BEFORE rebooting shows the SAME
+                # signature (running==known-good, armed=none) while still drained
+                # — it must NOT be classified as a revert, or `completed=True`
+                # would suppress the finally-rejoin and strand the node drained.
+                if (rebooted and running != version and "armed" in st
                         and st.get("armed") == "none"):
-                    # node booted a NON-candidate kernel and nothing is armed ->
-                    # it REVERTED. The revert reboot already cleared the in-memory
-                    # drain (ManualFailover is lost across a reboot), so the node
+                    # node REBOOTED to a NON-candidate kernel and nothing is armed
+                    # -> it REVERTED. drain state is gone via the reboot, the node
                     # self-recovers on its known-good boot — no rejoin needed.
                     # STOP: leave peer primary, do NOT roll peer.
                     completed = True   # drain state gone via the revert reboot
                     die(f"{node} REVERTED (running {running}, not {version}); "
                         f"stopping the roll — {peer} stays primary, {node} is on "
                         f"its known-good kernel. Investigate before retrying.")
+                # NOT rebooted + armed=none + running==known-good post-drain ->
+                # `arm` failed its preflight without rebooting. Stop polling now;
+                # `completed` stays False + `rebooted` stays False, so the finally
+                # rejoins the still-drained node and the timeout `die` below
+                # reports the arm failure.
+                if (not rebooted and "armed" in st
+                        and st.get("armed") == "none" and running != version):
+                    break
             if not promoted:
                 # If the node rebooted (revert/hang) the drain is already gone and
                 # the finally must NOT rejoin a possibly-candidate node; if it
