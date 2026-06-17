@@ -1,14 +1,35 @@
 # #1930 INC-2 (external HA kernel-rolling) — validation
 
 ## Unit / logic (green)
-- `go build ./...`, `go vet`, gofmt clean (my files).
-- pkg/upgrade self-recovery: 7 tests (recover-after-grace, active-lease-suppress,
+- `go build ./...`, `go vet` (pre-existing daemon_flow lock-copy aside), gofmt
+  clean (my files).
+- pkg/upgrade self-recovery: 10 tests (recover-after-grace, active-lease-suppress,
   expired/other-node lease, not-drained no-op, unhealthy-peer no-op,
-  timer-reset-on-lapse).
+  timer-reset-on-lapse, STILL-ARMED-suppresses-on-expired-lease,
+  not-armed-expired-lease-recovers).
+- pkg/upgrade drain/rejoin: 8 tests (DrainAndConfirm pre-checks + fail-back,
+  RejoinAndConfirm sync-confirm).
+- pkg/cluster candidate-preempt election hold: 2 tests
+  (KernelUpgradeHold_IsolatedStaysSecondary — isolated candidate stays secondary
+  across re-election, promotes on clear, getter round-trip;
+  KernelUpgradeHold_DemotesAlreadyPrimary — demote-on-arm defense in depth).
 - pkg/cluster + pkg/upgrade full suites green (HA suite, no regression).
 - `xpf-deploy.py kernel-roll --dry-run`: full sequence verified
   (lease-on-both → drain → arm+reboot → poll promoted== → rejoin → release;
   node0 then node1; correct node-ids + lease JSON).
+
+## Candidate-preempt safety (the r2 AGY CRITICAL chain)
+A kernel-candidate trial boot must never carry traffic until verified. Three
+nets, all unit-covered + traced in smr-review.md:
+- **Election hold** set BEFORE the first election (`holdSecondaryIfKernelCandidateArmed`
+  before `cluster.UpdateConfig`), honored in both `electRG` and `electSingleNode`,
+  not auto-cleared for an isolated node, and `SetKernelUpgradeHold` demotes any
+  already-primary group.
+- **Marker-based release**: the daemon releases the hold only when the durable
+  promotion marker names the running kernel (race-free vs revert, which clears
+  the journal then reboots to known-good where the hold is never set).
+- **Gate-timeout recovery**: `OnFailure=xpf-kernel-promote-failed.service`
+  reboots once to known-good if the gate hangs.
 
 ## Cluster no-regression (loss userspace cluster, serialized lock cell)
 - INC-2 binary DEPLOYED to both nodes (verify-dataplane PASS gate); `make
