@@ -619,10 +619,19 @@ def _node_exec(runner, backend, node, argv, check=True):
         # Non-interactive automation: never hang on a host-key / password prompt
         # or a dead host (Copilot). BatchMode disables all prompts (fail fast
         # instead), ConnectTimeout bounds the TCP connect.
+        #
+        # ssh space-JOINS its remote-command argv into one string and the
+        # REMOTE login shell re-splits it, so a multi-word element (notably
+        # `sh -c "<script with spaces>"` used by the lease helpers and the
+        # --allow-mixed-ha probe) is shredded — `sh -c echo hi` would run an
+        # empty `sh -c` then `hi` as a separate command (r2 AGY HIGH). incus
+        # exec passes argv through verbatim, so this only bites the ssh backend.
+        # Quote each element so the remote shell reconstructs the exact argv.
+        remote = " ".join(shlex.quote(a) for a in argv)
         full = ["ssh",
                 "-o", "BatchMode=yes",
                 "-o", "ConnectTimeout=15",
-                node, "--"] + argv
+                node, "--", remote]
     else:
         full = ["incus", "exec", node, "--"] + argv
     if runner.dry:
@@ -917,14 +926,16 @@ def _node_drain_supports_mixed_ha(runner, backend, node):
     usage there) WITHOUT performing a drain; absence of the token (or any probe
     failure) is treated as unsupported (fail safe: omit the flag, fall back to
     the exact-equality precheck). stderr is merged via `sh -c` so the backend
-    captures the usage text (_node_exec returns stdout only)."""
+    captures the usage text (_node_exec returns stdout only). Match the bare
+    `allow-mixed-ha` token: Go's flag usage prints it single-dash
+    (`-allow-mixed-ha`) even though the flag accepts `--allow-mixed-ha`."""
     if runner.dry:
         return True  # dry-run prints the planned command; assume new image
     out = _node_exec(runner, backend, node,
                      ["sh", "-c",
                       "xpfd upgrade kernel drain --help 2>&1 || true"],
                      check=False)
-    return "--allow-mixed-ha" in out
+    return "allow-mixed-ha" in out
 
 
 def _read_image_manifest_versions(path):

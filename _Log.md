@@ -19,6 +19,20 @@
   pkg/upgrade/imageversions_test.go, scripts/image/bake.py,
   docs/in-place-upgrade.md, docs/pr/1930-inc3-image-replace/*
 
+## 2026-06-16 — #1930 INC-3: r2 fix — SSH backend arg-splitting + probe token
+- **Timestamp**: 2026-06-16 UTC
+- **Action**: AGY r2 confirmed the r1 fixes and raised a HIGH: `_node_exec`
+  space-joins the ssh remote argv, so `sh -c "<script>"` (the lease helpers and
+  the new --allow-mixed-ha probe) is shredded on the ssh backend (incus exec is
+  fine). Fixed `_node_exec` to `shlex.quote`-join the ssh remote command into a
+  single string the remote shell reconstructs verbatim — fixes the new probe
+  AND the pre-existing `_acquire_lease`/`_clear_lease`. While verifying, found
+  the probe matched `--allow-mixed-ha` but Go's flag usage prints the
+  single-dash `-allow-mixed-ha`; switched to the bare `allow-mixed-ha` token.
+  Verified detection over both incus- and ssh-style pipelines.
+- **File(s)**: scripts/deploy/xpf-deploy.py,
+  docs/pr/1930-inc3-image-replace/reviewer-ids.md
+
 ## 2026-06-16 — #1930 INC-3: address Codex r1 (6 HIGH + 2 MED + 1 LOW)
 - **Timestamp**: 2026-06-16 UTC
 - **Action**: Fixed Codex review findings on INC-3. HIGH: (1)

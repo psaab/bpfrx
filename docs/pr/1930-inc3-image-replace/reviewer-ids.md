@@ -27,4 +27,20 @@ Final increment of the #1930 kernel/OS-upgrade umbrella. PR body carries
 - Codex LOW-1: corrected the bake.py warning — the gate reads ONLY the manifest
   and FAILS CLOSED; there is no staged-binary re-run fallback.
 
-## Round 2 (re-review on the fixed rev) — recorded inline below as posted.
+## Round 2 (re-review on rev ca6b493f0)
+
+| Reviewer | ID / handle | Verdict | Findings |
+|----------|-------------|---------|----------|
+| AGY adversarial | `adversarial-review-mqhldwad-flea8q` | r1 fixes CONFIRMED; 1 new HIGH | SSH backend arg-splitting: `_node_exec` space-joins ssh remote argv so `sh -c "<script>"` (lease helpers + the new --allow-mixed-ha probe) is shredded. Pre-existing pattern, also affects the new probe. |
+| Codex | `task-mqh5wz5m-b4ic03` (companion) | round 2 in progress | (folded below when posted) |
+| Claude SMR | (in-conversation, r2 doc) | MERGE-READY r2 | all r1 fixes verified correct |
+
+### Round-2 fix (rev 3)
+- AGY HIGH (SSH arg-splitting): `_node_exec` now `shlex.quote`-joins the ssh
+  remote argv into one string the remote shell reconstructs verbatim — fixes
+  the new probe AND the pre-existing `_acquire_lease`/`_clear_lease` `sh -c`
+  helpers over the ssh backend (incus backend was already fine).
+- Latent probe bug found while verifying: Go's flag usage prints
+  `-allow-mixed-ha` (single dash), so the probe now matches the bare
+  `allow-mixed-ha` token rather than `--allow-mixed-ha`. Verified the probe
+  detects the flag over BOTH incus- and ssh-style pipelines.
