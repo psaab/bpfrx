@@ -123,6 +123,24 @@ func TestResolveAmbiguousMACRefuses(t *testing.T) {
 	}
 }
 
+func TestResolveMACFirstStillRefusesSlotSwap(t *testing.T) {
+	// Codex HIGH-1: with key mac-then-pci AND both pci+mac set, a card
+	// swapped into the pinned PCI slot (PCI present, perm-MAC mismatch) must
+	// REFUSE even though the MAC leg would run first — the topology-change
+	// invariant is order-independent. Here the entry's MAC matches NO present
+	// NIC (the original card is gone) but its PCI slot now holds a different
+	// card; the order-independent pre-check must catch it.
+	nics := []PresentNIC{nic("enp9s0", "0000:09:00.0", "de:ad:be:ef:00:01")}
+	entries := []config.DeviceMapEntry{
+		{LogicalName: "ge-0/0/3", PCIAddr: "0000:09:00.0", MAC: "00:11:22:33:44:55",
+			KeyOrder: config.DeviceMapKeyMACThenPCI},
+	}
+	got := Resolve(entries, nics, nil)
+	if got[0].Status != BindRefusedAmbig {
+		t.Fatalf("mac-first slot swap must REFUSE (order-independent), got %v", got[0].Status)
+	}
+}
+
 func TestResolveKeyOrderMACThenPCI(t *testing.T) {
 	// mac-then-pci tries MAC first; a MAC hit binds as primary (not flagged
 	// as fallback).
