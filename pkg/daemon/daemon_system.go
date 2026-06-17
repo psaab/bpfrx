@@ -680,7 +680,23 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) {
 				continue
 			}
 			slog.Info("created system user", "user", user.Name, "uid", user.UID)
+			// Record provenance keyed by the account's actual UID so a
+			// later directive removal can lock THIS exact account (D2),
+			// while an out-of-band userdel+recreate with a different UID
+			// is left untouched (#1944 §5.4).
+			if uid, ok := lookupUID(user.Name); ok {
+				if err := markProvisioned(user.Name, uid); err != nil {
+					slog.Warn("failed to write provisioned-user marker",
+						"user", user.Name, "err", err)
+				}
+			}
 		}
+
+		// Apply / lock the login password (#1944). Mirrors applyRootAuth's
+		// `chpasswd -e` idiom; idempotent via a direct /etc/shadow read;
+		// D2-locks the account when the directive is removed but ONLY for
+		// the exact xpf-provisioned account (UID-keyed marker).
+		d.reconcileUserPassword(user)
 
 		// Grant sudo for super-user class
 		if user.Class == "super-user" {
@@ -718,6 +734,57 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) {
 				}
 				slog.Info("SSH keys updated", "user", user.Name, "keys", len(user.SSHKeys))
 			}
+		}
+	}
+}
+
+// reconcileUserPassword applies, leaves, or locks a login user's OS
+// password per the declarative #1944 lifecycle. It runs inside
+// applySystemLogin (under the apply lock, so there is no marker/shadow
+// race) and never touches root (excluded by the applySystemLogin loop).
+//
+//   - encrypted-password set → write it via `chpasswd -e` unless the
+//     on-disk shadow hash already equals it (idempotent); a successful
+//     apply (re)records the UID-keyed provenance marker.
+//   - encrypted-password absent → LOCK the account (Path D2) so removing
+//     the directive disables password login instead of orphaning a live
+//     credential — but only for the exact xpf-provisioned account (marker
+//     UID matches the current UID) and never on a shadow read error.
+func (d *Daemon) reconcileUserPassword(user *config.LoginUser) {
+	desired := user.EncryptedPassword
+	curUID, uidOK := lookupUID(user.Name)
+	cur, ok := currentShadowHash(user.Name)
+
+	switch passwordAction(cur, ok, desired) {
+	case pwApply:
+		stdin := strings.NewReader(user.Name + ":" + desired + "\n")
+		if out, err := runCommandStdinTimeout(stdin, "chpasswd", "-e"); err != nil {
+			slog.Warn("failed to set user password",
+				"user", user.Name, "err", err, "output", strings.TrimSpace(string(out)))
+		} else {
+			// xpf now manages this exact account's password — mark it so a
+			// later directive removal locks it (covers a pre-existing or
+			// marker-wiped account, #1944 §5.4).
+			if uidOK {
+				if err := markProvisioned(user.Name, curUID); err != nil {
+					slog.Warn("failed to write provisioned-user marker",
+						"user", user.Name, "err", err)
+				}
+			}
+			slog.Info("user encrypted-password applied", "user", user.Name)
+		}
+	case pwLock:
+		// Only lock the exact account xpf provisioned (UID-keyed marker).
+		if !uidOK || !xpfProvisioned(user.Name, curUID) {
+			break
+		}
+		stdin := strings.NewReader(user.Name + ":!\n")
+		if out, err := runCommandStdinTimeout(stdin, "chpasswd", "-e"); err != nil {
+			slog.Warn("failed to lock user password",
+				"user", user.Name, "err", err, "output", strings.TrimSpace(string(out)))
+		} else {
+			slog.Info("user password locked (no encrypted-password in config)",
+				"user", user.Name)
 		}
 	}
 }
