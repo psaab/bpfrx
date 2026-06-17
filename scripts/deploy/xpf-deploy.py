@@ -465,11 +465,24 @@ def cmd_fetch(args):
     wm_path = os.path.join(state_home, "xpf", "image-watermark.json")
 
     def _ver_key(v):
-        # Compare dotted numeric components; non-numeric tail compares as text.
-        out_parts = []
-        for tok in str(v).replace("-", ".").split("."):
-            out_parts.append((0, int(tok)) if tok.isdigit() else (1, tok))
-        return out_parts
+        # Compare on the dotted-numeric RELEASE, then a pre-release rank so a
+        # pre-release sorts BEFORE its base release (AGY: 1.2.3-rc1 < 1.2.3, so
+        # upgrading rc -> final is NOT a rollback). git-describe tails like
+        # "-N-gHASH-dirty" are post-release commits ahead of the tag → rank
+        # them AFTER the base. Split on the FIRST '-': left = release, right =
+        # suffix.
+        s = str(v)
+        rel, _, suffix = s.partition("-")
+        rel_key = []
+        for tok in rel.split("."):
+            rel_key.append((0, int(tok)) if tok.isdigit() else (1, tok))
+        if not suffix:
+            pre_rank = (1,)           # base release: after any pre-release
+        elif suffix[:1].isdigit():
+            pre_rank = (2, suffix)    # git-describe "N-gHASH": post-release
+        else:
+            pre_rank = (0, suffix)    # rc/alpha/beta/...: before the base
+        return (rel_key, pre_rank)
 
     def read_watermark():
         try:
