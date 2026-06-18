@@ -35,6 +35,8 @@ func TestValidateVersionSegment(t *testing.T) {
 		"del\x7fchar",      // DEL
 		"trailing ",        // trailing space
 		"...current.partial", // leading-dot dotfile collision
+		"1.0.0é",           // non-ASCII (parity with shell tr -d [:graph:])
+		"veré",             // non-ASCII rune
 	}
 	for _, v := range invalid {
 		if err := ValidateVersionSegment(v); err == nil {

@@ -26,6 +26,11 @@ import (
 //   - any "/" (path traversal / escape from VersionsDir)
 //   - any whitespace (space, tab, newline, CR, vertical tab, form feed)
 //   - any ASCII control char (< 0x20) or DEL (0x7f)
+//   - any non-ASCII byte (>= 0x80). Debian/semver versions are ASCII; this
+//     keeps EXACT parity with the preinst's shell is_safe_segment, which
+//     rejects high bytes via `tr -d '[:graph:]'` under the C locale. Keeping
+//     the two validators identical avoids a host where the Go seed accepts a
+//     version the shell migration would reject (or vice versa).
 func ValidateVersionSegment(ver string) error {
 	if ver == "" {
 		return fmt.Errorf("version is empty")
@@ -46,6 +51,9 @@ func ValidateVersionSegment(ver string) error {
 			return fmt.Errorf("version %q contains whitespace", ver)
 		case r < 0x20 || r == 0x7f:
 			return fmt.Errorf("version %q contains a control character (0x%02x)", ver, r)
+		case r >= 0x80:
+			return fmt.Errorf("version %q contains a non-ASCII character (%q); "+
+				"Debian/semver versions are ASCII", ver, r)
 		}
 	}
 	return nil
