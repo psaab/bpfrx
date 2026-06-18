@@ -87,7 +87,8 @@ EOF
     chmod +x "$STAGED/xpfd"
 }
 
-# remove leaves versions/ but removes the through-current sbin links.
+# remove leaves versions/ but removes the through-current sbin links AND the
+# runtime unit drop-in (#1967).
 scenario_remove_keeps_versions() {
     build_hardened "1.0.0"
     "$ROOT/postrm" remove
@@ -96,9 +97,14 @@ scenario_remove_keeps_versions() {
     done
     [ -d "$VERSIONS/1.0.0" ] || { echo "FAIL: versions/ removed on remove"; exit 1; }
     [ -L "$CURRENT" ] || { echo "FAIL: current removed on remove"; exit 1; }
+    # #1967: the versioned-runtime unit drop-in must be removed on remove.
+    [ -e "$DROPIN" ] && { echo "FAIL: drop-in not removed on remove"; exit 1; } || true
+    # The empty .service.d dir should be rmdir'd too.
+    [ -d "$(dirname "$DROPIN")" ] && { echo "FAIL: empty .service.d not rmdir'd on remove"; exit 1; } || true
 }
 
-# purge removes the through-current sbin links AND the versions/ tree.
+# purge removes the through-current sbin links, the runtime drop-in (#1967),
+# AND the versions/ tree.
 scenario_purge_removes_versions() {
     build_hardened "1.0.0"
     "$ROOT/postrm" purge
@@ -106,6 +112,31 @@ scenario_purge_removes_versions() {
         [ -L "$SBIN/$b" ] && { echo "FAIL: sbin $b not removed"; exit 1; } || true
     done
     [ -e "$VERSIONS" ] && { echo "FAIL: versions/ not removed on purge"; exit 1; } || true
+    [ -e "$DROPIN" ] && { echo "FAIL: drop-in not removed on purge"; exit 1; } || true
+}
+
+# remove with a NON-empty .service.d (a foreign drop-in) removes only OUR
+# drop-in and leaves the dir + foreign file intact (#1967 rmdir is best-effort).
+scenario_remove_keeps_foreign_dropin() {
+    build_hardened "1.0.0"
+    foreign="$(dirname "$DROPIN")/99-operator.conf"
+    echo "[Service]" > "$foreign"
+    "$ROOT/postrm" remove
+    [ -e "$DROPIN" ] && { echo "FAIL: our drop-in not removed"; exit 1; } || true
+    [ -e "$foreign" ] || { echo "FAIL: foreign drop-in removed"; exit 1; }
+    [ -d "$(dirname "$DROPIN")" ] || { echo "FAIL: non-empty .service.d rmdir'd"; exit 1; }
+}
+
+# remove on a legacy/never-seeded host (no drop-in present) is a clean no-op
+# for the drop-in step (#1967 — must be safe if absent).
+scenario_remove_no_dropin_ok() {
+    mkdir -p "$STAGED" "$SBIN"
+    for b in $BINS; do echo x > "$STAGED/$b"; ln -sf "$STAGED/$b" "$SBIN/$b"; done
+    # No DROPIN, no versions/.
+    "$ROOT/postrm" remove
+    for b in $BINS; do
+        [ -L "$SBIN/$b" ] && { echo "FAIL: legacy sbin $b not removed"; exit 1; } || true
+    done
 }
 
 # downgrade to a pre-hardened package: drop-in removed, sbin repointed to
@@ -171,6 +202,8 @@ scenario_downgrade_skips_foreign_link() {
 
 run_scenario remove_keeps_versions
 run_scenario purge_removes_versions
+run_scenario remove_keeps_foreign_dropin
+run_scenario remove_no_dropin_ok
 run_scenario downgrade_to_prehardened
 run_scenario downgrade_skips_foreign_link
 run_scenario upgrade_to_hardened_noop
