@@ -217,8 +217,18 @@ pub(crate) fn run() -> Result<(), String> {
                 while running.load(Ordering::SeqCst) {
                     match session_listener.accept() {
                         Ok((stream, _)) => {
-                            let _ =
-                                handle_stream(stream, &state_file, state.clone(), running.clone());
+                            // Log handle_stream failures rather than discarding
+                            // them: a request that fails to decode (e.g. a
+                            // wire-type mismatch) closes the socket with no
+                            // response, and the Go side sees only a bare EOF.
+                            // Surfacing the error here turns a silent
+                            // multi-session debugging chase into one log line
+                            // (#1961).
+                            if let Err(err) =
+                                handle_stream(stream, &state_file, state.clone(), running.clone())
+                            {
+                                eprintln!("xpf-userspace-dp: session request failed: {err}");
+                            }
                         }
                         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                             thread::sleep(Duration::from_millis(10));
@@ -236,7 +246,15 @@ pub(crate) fn run() -> Result<(), String> {
     while running.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _)) => {
-                let _ = handle_stream(stream, &args.state_file, state.clone(), running.clone());
+                // See the session-socket note above: surface decode/handler
+                // failures instead of discarding them. This is the socket that
+                // carries apply_snapshot, where a wire-type mismatch silently
+                // left the helper disabled and forwarding nothing (#1961).
+                if let Err(err) =
+                    handle_stream(stream, &args.state_file, state.clone(), running.clone())
+                {
+                    eprintln!("xpf-userspace-dp: control request failed: {err}");
+                }
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(50));
