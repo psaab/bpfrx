@@ -635,14 +635,25 @@ func (r *Runner) cleanupFailedVerifyCopy(j *Journal) {
 	j.DBSnapshotPath = ""
 	j.AdvancedStateFloor = false
 	if err := r.saveJournal(j); err != nil {
-		r.logf("upgrade: WARN reset journal after verify-fail cleanup: %v", err)
+		// The journal rewrite did NOT persist (Codex r3): the on-disk record
+		// may still be StateCopied with DBSnapshotPath set. Do NOT delete the
+		// snapshot now — that would leave the persisted journal referencing a
+		// removed snapshot (the exact bug the persist-before-remove ordering
+		// closes). Leave the snapshot in place; the next run re-runs cleanup
+		// (verify will fail again), and gc() also sweeps orphan .dbsnap
+		// dotfiles defensively.
+		r.logf("upgrade: WARN reset journal after verify-fail cleanup failed (%v); "+
+			"leaving the DB snapshot in place to avoid a journal->removed-snapshot "+
+			"reference", err)
+		return
 	}
 	// Drop the now-orphan DB snapshot taken at the original preflight (the
 	// retry re-snapshots from the possibly-changed live DB). Best-effort, and
-	// done AFTER the journal no longer references it. Derive the path from the
-	// validated TargetVersion rather than trusting the persisted
-	// DBSnapshotPath as an os.RemoveAll target (Codex r2): ver is validated as
-	// a safe path segment in Run() before any cut, so this is the same path
-	// preflight wrote. gc() also sweeps orphan .dbsnap dotfiles defensively.
+	// done AFTER the journal is durably rewound so it no longer references the
+	// snapshot. Derive the path from the validated TargetVersion rather than
+	// trusting the persisted DBSnapshotPath as an os.RemoveAll target (Codex
+	// r2): ver is validated as a safe path segment in Run() before any cut, so
+	// this is the same path preflight wrote. gc() also sweeps orphan .dbsnap
+	// dotfiles defensively.
 	_ = os.RemoveAll(filepath.Join(r.cfg.VersionsDir, "."+ver+".dbsnap"))
 }

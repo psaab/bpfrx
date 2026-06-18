@@ -194,6 +194,53 @@ func TestPreStartVersionDirCheck_RollsBack(t *testing.T) {
 	}
 }
 
+// TestVerifyFailCleanup_SaveJournalFailureKeepsSnapshot proves the Codex r3
+// fix: if the journal rewrite does NOT persist, cleanupFailedVerifyCopy must
+// NOT remove the orphan DB snapshot — else the persisted (still StateCopied,
+// DBSnapshotPath set) journal would reference a deleted snapshot. We force a
+// saveJournal failure by pointing JournalPath under a read-only directory and
+// assert the snapshot dotfile survives.
+func TestVerifyFailCleanup_SaveJournalFailureKeepsSnapshot(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("running as root: a read-only dir does not block writes")
+	}
+	fs := newFakeSystem(t, "2.0.0")
+	r, cfg := testEnv(t, fs)
+	if err := os.MkdirAll(cfg.VersionsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Plant a DB snapshot dotfile for the target version.
+	snap := filepath.Join(cfg.VersionsDir, ".2.0.0.dbsnap")
+	if err := os.MkdirAll(snap, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Plant a (non-active) version dir so the unlink branch runs.
+	verDir := filepath.Join(cfg.VersionsDir, "2.0.0")
+	if err := os.MkdirAll(verDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Make the journal directory read-only so saveJournal fails.
+	jdir := filepath.Dir(cfg.JournalPath)
+	if err := os.MkdirAll(jdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(jdir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(jdir, 0o755) })
+
+	j := &Journal{State: StateCopied, TargetVersion: "2.0.0", PreviousVersion: "1.0.0",
+		DBSnapshotPath: snap, AdvancedStateFloor: true}
+	r.cleanupFailedVerifyCopy(j)
+
+	// The snapshot MUST survive: saveJournal failed, so removing it would leave
+	// the persisted journal referencing a deleted snapshot.
+	if _, err := os.Stat(snap); err != nil {
+		t.Fatalf("orphan snapshot removed despite a saveJournal failure: %v", err)
+	}
+}
+
 // TestStaleHalfCut_VanishedDirRollsBack proves the stale-half-cut resume path
 // also honors the C3 diagnostic (#1967, Codex r1 High): when a NEWER apt
 // install supersedes a crashed FLIPPED cut whose target dir has since

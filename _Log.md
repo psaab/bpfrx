@@ -5932,3 +5932,8 @@ top.
   - Nit: _Log.md said StatePreflight (now StateStaged) — corrected.
 - **Test**: verify-fail recopy test now asserts the orphan .dbsnap dotfile is removed + persisted journal fields cleared (persist-before-remove ordering).
 - Codex r2 also re-verified C1/C4/postrm/stale-half-cut as correct.
+
+## 2026-06-17 — #1967 PR #1974 review round 3
+- **AGY r3 MERGE-READY** — confirmed persist-before-remove ordering correct, no regression.
+- **Codex r3 NEEDS-CHANGES (1 finding, fixed)**: cleanupFailedVerifyCopy still removed the orphan snapshot even when saveJournal FAILED — leaving the persisted (StateCopied/DBSnapshotPath-set) journal referencing a deleted snapshot. FIX: on saveJournal error, log + RETURN before removing the snapshot (leave it; next-run cleanup + gc orphan-sweep handle it). Codex confirmed path-derivation + TargetVersion validation correct.
+- **Test**: TestVerifyFailCleanup_SaveJournalFailureKeepsSnapshot (read-only journal dir forces saveJournal failure; asserts the snapshot survives).
