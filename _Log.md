@@ -5917,3 +5917,9 @@ top.
   - Medium (seed.go stagedVersion kept the raw-output fallback): now hard-fails an unrecognized format (C1 parity with realSystem.BinaryVersion); caller already validates via ValidateVersionSegment.
 - **Tests added**: TestStaleHalfCut_VanishedDirRollsBack; TestStagedVersion_RejectsGarbageFormat; verify-fail recopy test asserts rewind < PREFLIGHT + snapshot fields cleared.
 - **Validation**: go build/vet clean; full Go suite no failures; new tests 5x no flake.
+
+## 2026-06-17 — #1967 PR #1974 review round 1 (AGY)
+- **AGY r1 NEEDS-MINOR (2 findings)**:
+  - Low (test-only): system_linux_test.go shellEscape doubled `%` -> `%%` for the printf VALUE arg (format is the fixed first arg, so the value is literal). Removed the `%` replacement; added a `%`-in-metadata valid case.
+  - Low: seed.go stagedVersion raw-output fallback — ALREADY fixed in the Codex r1 fix commit (AGY reviewed pre-fix code).
+- AGY independently confirmed: verify-fail crash-interleaving converges safely; C1 Debian/semver parity; C4 gating; postrm boot-guard + foreign-dropin protection + downgrade refactor ordering; C3 no new HA failure mode.

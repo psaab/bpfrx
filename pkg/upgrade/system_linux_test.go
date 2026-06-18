@@ -42,14 +42,16 @@ func itoa(n int) string {
 	return string(b)
 }
 
-// shellEscape escapes a string for embedding inside a double-quoted printf
-// format. We only need to neutralize backslash, double-quote, and percent
-// (printf format) and dollar.
+// shellEscape escapes a string for embedding inside the double-quoted VALUE
+// argument of `printf '%s' "<value>"`. The format string is the FIXED first
+// arg ('%s'); the value is the second arg and printf emits it literally, so
+// `%` must NOT be doubled (AGY r1 — doubling would print `%%`). We only
+// neutralize the characters the shell would otherwise interpret inside the
+// double quotes: backslash, double-quote, dollar, and backtick.
 func shellEscape(s string) string {
 	r := strings.NewReplacer(
 		`\`, `\\`,
 		`"`, `\"`,
-		`%`, `%%`,
 		`$`, `\$`,
 		"`", "\\`",
 	)
@@ -68,6 +70,10 @@ func TestBinaryVersion_ValidExtracted(t *testing.T) {
 		"xpfd 0.0.1~beta1\n":               "0.0.1~beta1",
 		"xpfd v1.2.3":                      "v1.2.3",
 		"xpfd dev (commit deadbeef)\n\n":   "dev",
+		// A literal '%' in the trailing metadata must survive the test's
+		// printf helper unchanged (AGY r1 shellEscape fix); the token itself
+		// stays clean.
+		"xpfd 1.0.0 (commit 100%coverage)": "1.0.0",
 	}
 	s := &realSystem{systemdUnitDir: t.TempDir(), unit: "xpfd"}
 	dir := t.TempDir()
