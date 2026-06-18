@@ -115,8 +115,11 @@ case "$1" in
             # 1. remove the runtime unit drop-in (else systemd keeps the
             #    concrete newer-version ExecStart).
             rm -f "$DROPIN"
-            # rmdir the .d dir if it is now empty (best-effort).
-            rmdir /etc/systemd/system/xpfd.service.d 2>/dev/null || true
+            # rmdir the .d dir if it is now empty (best-effort). Derive it
+            # from $DROPIN (Copilot) so it tracks the single drop-in path
+            # definition and the test harness's $DROPIN rewrite, with no
+            # hard-coded path drift.
+            rmdir "$(dirname "$DROPIN")" 2>/dev/null || true
             # 2. repoint OWNED sbin links back to staged (atomic) so the
             #    daemon resolves the downgraded binaries — skipping any
             #    foreign/operator-repointed link (Codex).

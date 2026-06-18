@@ -162,6 +162,31 @@ scenario_stale_tmp_dir() {
     done
 }
 
+# A non-symlink $CURRENT (corruption / manual edit) must NOT cause sbin to be
+# repointed to "$CURRENT/<bin>" (which would not resolve). Best-effort:
+# leave the legacy direct-staged links untouched (Copilot).
+scenario_current_is_regular_file() {
+    build_legacy "1.0.0"
+    mkdir -p "$VERSIONS"
+    : > "$CURRENT"   # a regular file where the symlink should be
+    migrate_legacy_layout upgrade "0.9.0"
+    # sbin must still point at staged (legacy), NOT at $CURRENT/<bin>.
+    for b in $BINS; do
+        [ "$(readlink "$SBIN/$b")" = "$STAGED/$b" ] || { echo "FAIL: sbin $b repointed despite non-symlink current ($(readlink "$SBIN/$b"))"; exit 1; }
+    done
+    # The bogus file is left as-is (we don't clobber unknown state).
+    [ -f "$CURRENT" ] || { echo "FAIL: removed the non-symlink current"; exit 1; }
+}
+
+scenario_current_is_dir() {
+    build_legacy "1.0.0"
+    mkdir -p "$CURRENT"   # a directory where the symlink should be
+    migrate_legacy_layout upgrade "0.9.0"
+    for b in $BINS; do
+        [ "$(readlink "$SBIN/$b")" = "$STAGED/$b" ] || { echo "FAIL: sbin $b repointed despite directory current"; exit 1; }
+    done
+}
+
 run_scenario basic
 run_scenario idempotent
 run_scenario resume_after_current
@@ -170,4 +195,6 @@ run_scenario fallback_dpkg_version
 run_scenario no_safe_version
 run_scenario no_staged
 run_scenario stale_tmp_dir
+run_scenario current_is_regular_file
+run_scenario current_is_dir
 echo "ALL PREINST-MIGRATE SCENARIOS PASSED"

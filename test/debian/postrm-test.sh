@@ -26,7 +26,6 @@ patched_postrm() {
       -e "s#^VERSIONS=.*#VERSIONS=$ROOT/var/lib/xpf/versions#" \
       -e "s#^CURRENT=.*#CURRENT=\"\$VERSIONS/current\"#" \
       -e "s#^DROPIN=.*#DROPIN=$ROOT/etc/systemd/system/xpfd.service.d/10-xpf-version.conf#" \
-      -e "s#rmdir /etc/systemd/system/xpfd.service.d#rmdir $ROOT/etc/systemd/system/xpfd.service.d#" \
       -e "s#\\[ -d /run/systemd/system \\]#false#" \
       "$POSTRM" > "$ROOT/postrm"
     chmod +x "$ROOT/postrm"
@@ -116,6 +115,8 @@ scenario_downgrade_to_prehardened() {
     make_staged_prehardened
     "$ROOT/postrm" upgrade "0.9.0"
     [ -e "$DROPIN" ] && { echo "FAIL: drop-in not removed"; exit 1; } || true
+    # The .d dir must be rmdir'd when empty (exercises dirname "$DROPIN").
+    [ -e "$(dirname "$DROPIN")" ] && { echo "FAIL: empty drop-in .d dir not removed"; exit 1; } || true
     for b in $BINS; do
         tgt=$(readlink "$SBIN/$b")
         [ "$tgt" = "$STAGED/$b" ] || { echo "FAIL: sbin $b -> $tgt, want staged"; exit 1; }
