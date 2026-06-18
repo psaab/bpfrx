@@ -5981,3 +5981,6 @@ top.
 - **Timestamp**: 2026-06-18
 - **Action**: Add pkg/upgrade/stagedgen — Publish/ResolveCurrent/GC/RemoveAll for staged-gen/<genid> + current-gen, durable copy + atomic symlink. Foundation for #1981 Option B.
 - **File(s)**: pkg/upgrade/stagedgen/stagedgen.go, pkg/upgrade/stagedgen/fsutil.go, pkg/upgrade/stagedgen/stagedgen_test.go
+- **Timestamp**: 2026-06-18
+- **Action**: Wire stagedgen into the cut: Journal.SourceGeneration, resolveSource (pin genid at INIT, refuse if no published gen), copyStaged reads pinned generation + B-P3b OPT1 (.srcgen stamp, genid-aware skip, refuse-or-guarded-replace), GC staged-gen protecting journal gen, verify-fail cleanup re-resolves current-gen.
+- **File(s)**: pkg/upgrade/state.go, pkg/upgrade/runner.go, pkg/upgrade/cutover.go, pkg/upgrade/flip.go, pkg/upgrade/runner_test.go, pkg/upgrade/verify_cleanup_test.go

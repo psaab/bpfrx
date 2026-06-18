@@ -147,4 +147,19 @@ type Journal struct {
 	// this, a re-run without the flag would proceed past a STOPPED empty-prev
 	// journal on the original run's sanction alone, which it could not prove.
 	FirstCutSanctioned bool `json:"first_cut_sanctioned,omitempty"`
+
+	// SourceGeneration is the staged-gen/<genid> the cut copies FROM (#1981
+	// Option B). It is resolved ONCE at INIT (from staged-gen/current-gen) and
+	// recorded so copyStaged reads the PINNED generation directory — never live
+	// staged/ and never re-reading current-gen — closing the dpkg-unpack vs
+	// operator-cut torn-read window by construction. A resume keys the SAME
+	// genid, so the cut continues against its original source even if a
+	// concurrent publish has advanced current-gen.
+	//
+	// Empty is the legacy back-compat case: a pre-#1981 journal resumed under a
+	// B-aware runner has no SourceGeneration. The runner treats an empty
+	// SourceGeneration in an already-copied journal (State >= COPIED) as valid
+	// legacy state and copies from live staged/ only as the pre-B fallback —
+	// it never blocks recovery of an in-flight pre-B cut (plan §10 AGY r4).
+	SourceGeneration string `json:"source_generation,omitempty"`
 }

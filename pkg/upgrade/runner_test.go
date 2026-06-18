@@ -114,8 +114,10 @@ func (f *fakeSystem) HelperHealthy(ver string, _ time.Duration) error {
 }
 func (f *fakeSystem) Now() time.Time { return f.now }
 
-// testEnv builds a populated staged tree + config DB and returns a Runner
-// wired to the fake system.
+// testEnv builds a populated staged tree + config DB, PUBLISHES a staged
+// generation (mirroring the production postinst publish -> cut flow, #1981
+// Option B — the cut reads staged-gen/<genid>/, not live staged/), and returns
+// a Runner wired to the fake system.
 func testEnv(t *testing.T, fs *fakeSystem) (*Runner, Config) {
 	t.Helper()
 	root := t.TempDir()
@@ -129,6 +131,7 @@ func testEnv(t *testing.T, fs *fakeSystem) (*Runner, Config) {
 	cfg := Config{
 		StagedDir:           staged,
 		VersionsDir:         filepath.Join(root, "versions"),
+		StagedGenDir:        filepath.Join(root, "staged-gen"),
 		SbinDir:             filepath.Join(root, "sbin"),
 		ConfigDBDir:         cfgdb,
 		JournalPath:         filepath.Join(root, "versions", "upgrade.state"),
@@ -141,7 +144,21 @@ func testEnv(t *testing.T, fs *fakeSystem) (*Runner, Config) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Publish the initial generation so a fresh cut has a source (production
+	// does this in the postinst before the cut).
+	publishStagedGen(t, r)
 	return r, cfg
+}
+
+// publishStagedGen publishes a generation from the runner's current StagedDir,
+// returning the genid (mirrors the production postinst publish step).
+func publishStagedGen(t *testing.T, r *Runner) string {
+	t.Helper()
+	genid, err := r.stagedGenConfig().Publish()
+	if err != nil {
+		t.Fatalf("publish staged generation: %v", err)
+	}
+	return genid
 }
 
 func writeFakeBin(t *testing.T, path, content string) {
