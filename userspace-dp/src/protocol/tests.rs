@@ -1636,3 +1636,75 @@ fn apply_snapshot_rejects_base64_dscp_string_1961() {
         "unexpected error: {err}"
     );
 }
+
+// #1977: NUM_WIDTH sibling of #1961. FlowSnapshot/FlowExportSnapshot carry Go
+// `int` fields that are Rust unsigned (u16/u32/u64). A max-range value must
+// decode; a negative value must abort the whole apply_snapshot decode (the
+// mechanism the Go-side build-boundary guard in flow.go defends against).
+#[test]
+fn apply_snapshot_decodes_max_range_flow_numbers_1977() {
+    let json = r#"{
+      "type": "apply_snapshot",
+      "snapshot": {
+        "version": 3, "generation": 1, "generated_at": "2026-06-18T00:00:00Z",
+        "summary": {"host_name":"fw","dataplane_type":"userspace","interface_count":0,"zone_count":0,"policy_count":0,"scheduler_count":0,"ha_enabled":false},
+        "flow": {
+          "tcp_mss_gre_in": 65535, "tcp_mss_all_tcp": 65535,
+          "tcp_session_timeout": 9223372036, "udp_session_timeout": 9223372036,
+          "icmp_session_timeout": 9223372036
+        },
+        "flow_export": {
+          "collector_address": "10.0.0.1", "collector_port": 65535,
+          "sampling_rate": 4294967295, "active_timeout": 4294967295,
+          "inactive_timeout": 4294967295
+        }
+      }
+    }"#;
+    let req: ControlRequest = serde_json::from_str(json).expect("max-range flow numbers decode");
+    let snap = req.snapshot.expect("snapshot present");
+    assert_eq!(snap.flow.tcp_mss_gre_in, 65535);
+    assert_eq!(snap.flow.tcp_session_timeout, 9_223_372_036);
+    let fe = snap.flow_export.expect("flow_export present");
+    assert_eq!(fe.sampling_rate, 4_294_967_295);
+    assert_eq!(fe.collector_port, 65535);
+    assert_eq!(fe.inactive_timeout, 4_294_967_295);
+}
+
+#[test]
+fn apply_snapshot_rejects_negative_flow_number_1977() {
+    let json = r#"{
+      "type": "apply_snapshot",
+      "snapshot": {
+        "version": 3, "generation": 1, "generated_at": "2026-06-18T00:00:00Z",
+        "summary": {"host_name":"fw","dataplane_type":"userspace","interface_count":0,"zone_count":0,"policy_count":0,"scheduler_count":0,"ha_enabled":false},
+        "flow": { "tcp_session_timeout": -1 }
+      }
+    }"#;
+    let err = serde_json::from_str::<ControlRequest>(json)
+        .expect_err("negative u64 session timeout must abort the whole-request decode");
+    assert!(
+        err.to_string().contains("invalid value") || err.to_string().contains("expected"),
+        "unexpected error: {err}"
+    );
+}
+
+// #1977: a collector_port exceeding u16 (what Go would emit pre-#1977 for a
+// `port 70000` typo) must abort the whole apply_snapshot decode — the mechanism
+// the Go-side skip-and-coerce guard defends against.
+#[test]
+fn apply_snapshot_rejects_oversize_collector_port_1977() {
+    let json = r#"{
+      "type": "apply_snapshot",
+      "snapshot": {
+        "version": 3, "generation": 1, "generated_at": "2026-06-18T00:00:00Z",
+        "summary": {"host_name":"fw","dataplane_type":"userspace","interface_count":0,"zone_count":0,"policy_count":0,"scheduler_count":0,"ha_enabled":false},
+        "flow_export": { "collector_address": "10.0.0.1", "collector_port": 70000, "sampling_rate": 1000 }
+      }
+    }"#;
+    let err = serde_json::from_str::<ControlRequest>(json)
+        .expect_err("collector_port > u16 max must abort the whole-request decode");
+    assert!(
+        err.to_string().contains("invalid value") || err.to_string().contains("expected"),
+        "unexpected error: {err}"
+    );
+}
