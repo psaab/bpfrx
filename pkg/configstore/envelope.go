@@ -12,10 +12,27 @@ import (
 // unreadable active.json — a JSON parse error, a decrypt failure, or a
 // config compatibility envelope that this build cannot read (too-new
 // min-reader / format). It is distinct from an absent DB (start-fresh) and
-// from a compile error (handled leniently). The daemon makes this FATAL at
-// startup so an unparseable or too-new DB is never silently overwritten by
-// a blind bootstrap (#1917 increment B, plan §6.4 / D1 fatal-on-parse).
+// from a compile error (ErrConfigCompile, below). The daemon makes this
+// FATAL at startup so an unparseable or too-new DB is never silently
+// overwritten by a blind bootstrap (#1917 increment B, plan §6.4 / D1
+// fatal-on-parse).
 var ErrConfigDBUnreadable = errors.New("config DB present but unreadable")
+
+// ErrConfigCompile tags a Store.Load failure where a PRESENT active.json
+// read+parsed fine but the persisted tree failed to COMPILE (even through
+// the tolerant compileTreeLenient path). It is distinct from
+// ErrConfigDBUnreadable (the bytes were fine) and from an absent DB
+// (start-fresh, no error).
+//
+// This is the #1960 fail-closed signal: a previously-committed config that
+// no longer compiles must NOT silently fall back to positional claim-all
+// interface naming. The daemon distinguishes this case with errors.Is so it
+// can refuse takeover and enter the #1922 bootstrap/lifeline safe state
+// (mgmt preserved, no claim-all, control plane up) instead of treating the
+// store as "no active config => normal boot". A daemon hard-exit is the
+// wrong remedy: it also strands management, which this sentinel exists to
+// avoid. See pkg/daemon/daemon_run.go.
+var ErrConfigCompile = errors.New("config DB present but does not compile")
 
 // Config-DB compatibility envelope (#1917 increment B, plan §6.4 / D1).
 //

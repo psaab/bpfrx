@@ -8,6 +8,7 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -16,7 +17,64 @@ import (
 
 	"github.com/psaab/xpf/pkg/fsatomic"
 	"github.com/vishvananda/netlink"
+
+	"github.com/psaab/xpf/pkg/configstore"
 )
+
+// loadErrorClass categorizes a Store.Load error for the boot path (#1917 D1
+// fatal-on-parse + #1960 fail-closed-on-compile). Keeping the classification
+// in one pure helper makes the boot decision unit-testable without standing
+// up the whole daemon.
+type loadErrorClass int
+
+const (
+	// loadOK — Load returned nil (absent DB start-fresh, or a valid loaded
+	// config). The caller proceeds with bootstrapFromFile / normal boot.
+	loadOK loadErrorClass = iota
+	// loadFatalUnreadable — ErrConfigDBUnreadable (#1917 D1): present but
+	// unparseable/too-new bytes. The daemon must FAIL CLOSED by exiting Run,
+	// so the unreadable DB is never overwritten by a blind bootstrap.
+	loadFatalUnreadable
+	// loadCompileFailed — ErrConfigCompile (#1960): present, valid bytes,
+	// previously committed, but the tree no longer compiles. The daemon must
+	// NOT exit (that strands mgmt too) and must NOT positional-claim-all;
+	// instead it enters the #1922 bootstrap/lifeline safe state.
+	loadCompileFailed
+	// loadOtherError — any other Load error (logged as a warning; the daemon
+	// proceeds and the boot predicate decides bootstrap vs normal as usual).
+	loadOtherError
+)
+
+// classifyLoadError maps a Store.Load error to its boot-path class. err==nil
+// returns loadOK.
+func classifyLoadError(err error) loadErrorClass {
+	switch {
+	case err == nil:
+		return loadOK
+	case errors.Is(err, configstore.ErrConfigDBUnreadable):
+		return loadFatalUnreadable
+	case errors.Is(err, configstore.ErrConfigCompile):
+		return loadCompileFailed
+	default:
+		return loadOtherError
+	}
+}
+
+// shouldBootstrapFromFile reports whether Run should import the text config
+// file (xpf.conf) after Store.Load. The import runs only when there is no
+// active config to boot from AND the Load did not fail closed on a compile
+// error.
+//
+// #1960: the `!configCompileFailed` clause is load-bearing, not cosmetic. On a
+// compile-failed load ActiveConfig() is nil (compiled stayed nil), so without
+// this guard the import would fire — silently swapping a DIFFERENT config
+// (whatever xpf.conf holds) in over the broken committed DB and then taking
+// over interfaces from it, defeating the fail-closed intent. This predicate is
+// the single source of truth for that decision (daemon_run.go calls it) so the
+// guard cannot be dropped without TestShouldBootstrapFromFile failing.
+func shouldBootstrapFromFile(hasActiveConfig, configCompileFailed bool) bool {
+	return !hasActiveConfig && !configCompileFailed
+}
 
 // lifelineRecordFile persists the management-NIC identity (PCI bus address +
 // MAC) so the protected set (Item 4) survives the rename that turns the
@@ -86,10 +144,29 @@ func hasNodeIDFile() bool {
 //     loaded (case 2 import-clean or case 3 valid-active.json).
 //   - everCommitted: store.EverCommitted() — the #1922 step-0 marker.
 //   - nodeID: /etc/xpf/node-id presence (the HA-node guard, C2/C8).
+//   - configCompileFailed: a PRESENT, previously-committed active.json
+//     read+parsed fine but no longer COMPILES (#1960, Store.Load returned
+//     ErrConfigCompile). This is the highest-priority signal — see below.
 //
 // Case 4 (corrupt/too-new) is handled by #1917 D1 fatal-on-parse in Run
 // BEFORE this is called, so it never reaches here.
-func computeBootClass(hasActiveConfig, everCommitted, nodeIDPresent bool) bootClass {
+func computeBootClass(hasActiveConfig, everCommitted, nodeIDPresent, configCompileFailed bool) bootClass {
+	// #1960 fail-closed (checked FIRST, before the HA-node guard): a config
+	// that was previously committed but no longer compiles must NEVER drive a
+	// full takeover. With everCommitted=true and ActiveConfig()==nil (compiled
+	// stayed nil), every other branch below resolves to bootClassNormal —
+	// positional claim-all interface naming on a box whose intended config is
+	// unknown. That can mis-bind interfaces and strand management. Refusing
+	// takeover (bootstrap mode + lifeline + protected set) keeps mgmt
+	// reachable and leaves the control plane up so the operator can fix the
+	// config. This overrides EVEN the HA-node guard: claiming all NICs on a
+	// broken config is the exact lockout this issue closes, and an HA node
+	// with an uncompilable config is safer in the lifeline state than
+	// mis-binding (HA availability was already not promised in that state).
+	if configCompileFailed {
+		return bootClassBootstrap
+	}
+
 	// HA-node guard (C2 + C8): a node with /etc/xpf/node-id is HA-managed.
 	// It resolves NOT-bootstrap via its own DB/xpf.conf (case 2/3). If it
 	// has node-id but NEITHER a DB nor an importable xpf.conf, it is

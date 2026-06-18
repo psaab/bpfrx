@@ -231,7 +231,31 @@ func (s *Store) Load() error {
 	// (see compileTreeLenient for the validator downgrades).
 	compiled, err := s.compileTreeLenient(tree)
 	if err != nil {
-		return fmt.Errorf("compile config: %w", err)
+		// #1960 fail-closed: the bytes read+parsed fine (this is NOT
+		// ErrConfigDBUnreadable) but a PRESENT, previously-committed config
+		// no longer compiles. s.everCommitted was already set true above, so
+		// the daemon could otherwise see ActiveConfig()==nil + everCommitted
+		// and resolve to NORMAL boot — positional claim-all interface naming.
+		// Tag the error with ErrConfigCompile so the daemon can detect this
+		// edge with errors.Is and refuse takeover (enter the #1922
+		// bootstrap/lifeline safe state) instead.
+		//
+		// s.compiled MUST stay nil — ActiveConfig() returns s.compiled, and
+		// nil is precisely the signal that forces bootstrap (computeBootClass).
+		// BUT retain the parsed-but-broken tree as s.active and load rollback
+		// history, so the recovery the daemon advertises ("fix the config from
+		// the CLI/gRPC and commit, or roll back") actually works (Codex #1991
+		// r1): EnterConfigure clones s.active into the candidate, so `configure`
+		// + `show | compare` surface the broken stanza for the operator to fix,
+		// and Rollback(n) / `show | compare rollback n` reach the on-disk
+		// history. Without this, s.active stayed the empty New() tree and the
+		// history was never loaded — the operator saw an empty config and no
+		// rollbacks, with no in-band way to recover. s.active is always non-nil
+		// (New seeds an empty tree), so the (active non-nil, compiled nil) shape
+		// here is the same one a fresh boot already has — no new invariant.
+		s.active = tree
+		s.loadRollbackHistory()
+		return fmt.Errorf("compile config: %w: %w", ErrConfigCompile, err)
 	}
 
 	s.active = tree

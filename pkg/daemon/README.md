@@ -72,6 +72,63 @@ never lock an operator out of a remote box it manages.
   fatal via #1917 D1). The **HA-node guard** keys on `/etc/xpf/node-id` FILE
   presence (NOT the config-derived `clusterMode`): a node-id node always
   resolves NOT-bootstrap.
+- **Fail-closed on compile failure (#1960):** a PRESENT, previously-committed
+  `active.json` that is valid JSON but no longer COMPILES (even through the
+  tolerant `compileTreeLenient` path) is the dangerous tuple
+  `ActiveConfig()==nil` + `EverCommitted()==true`. Without a guard, that
+  tuple resolves to **normal** and runs the positional claim-all rename on a
+  box whose intended config is unknown. `Store.Load` now tags this error with
+  `configstore.ErrConfigCompile`; `Run` classifies it via `classifyLoadError`,
+  logs it loudly (Error), SKIPS `bootstrapFromFile` (so the text `xpf.conf` is
+  not blind-imported over the broken DB), and passes `configCompileFailed=true`
+  to `computeBootClass`, which forces **bootstrap** — overriding even the
+  HA-node guard. The control plane stays up so the operator can recover
+  in-band. A daemon hard-exit is deliberately NOT used (it would also strand
+  mgmt). Distinct from `ErrConfigDBUnreadable` (#1917 D1, which IS a fatal exit
+  because the bytes themselves cannot be read).
+  - **Why mgmt stays reachable — freeze in last-known-good, not a wipe.** This
+    path does NOT run the `enterBootstrapMode()` teardown (which removes the
+    `10-xpf-*` `.network`/`.link` files, clears the FRR managed section, and
+    tears down the dataplane); that teardown is reserved for confirmed-commit
+    rollback. On a previously-committed box the last-good networkd + FRR state
+    therefore persists untouched, so the box stays reachable at its EXISTING
+    management address (rather than dropping to bootstrap fxp0-DHCP and
+    possibly changing the IP out from under a connected operator) while the
+    config is fixed. That is a deliberate choice: the only thing the box must
+    NOT do on an uncompilable config is the *new* takeover (positional
+    claim-all / fresh apply), which bootstrap suppresses. The lifeline/protected
+    set govern the rename + apply sweeps and the fresh-install case; they are
+    not what keeps a *previously* managed box reachable here.
+    - **Transit is still fail-closed** — do not read "freeze" as "the firewall
+      keeps forwarding." Bootstrap mode suppresses `enableForwarding` and the
+      dataplane arm (`dp.Start`), so the daemon itself forwards no transit in
+      this state. A cold reboot therefore carries NO transit until the operator
+      commits a compilable config; only a daemon *restart* that leaves an
+      already-armed dataplane process running keeps enforcing the
+      last-known-good policy in the interim. Either way no traffic is forwarded
+      under an unknown/no policy — what persists is interface identity + mgmt
+      reachability, not unpoliced forwarding.
+  - **In-band recovery is real (not just "repair the DB").** On compile failure
+    `Store.Load` keeps `compiled` nil (the fail-closed signal) but retains the
+    parsed-but-broken tree as the active tree and loads the on-disk rollback
+    history. So `configure` clones the broken config into the candidate (the
+    operator can `show`/edit the offending stanza), `rollback N` /
+    `show | compare rollback N` reach prior good configs, and a
+    `commit confirmed` of either promotes a working config. Repairing/removing
+    the on-disk DB remains the out-of-band fallback.
+  - **Known limitation (#1993) — FRR keeps advertising on a cold boot.** `frr`
+    is an independent service that starts from its persisted `frr.conf` (the
+    managed section from the last good `applyConfig`), which freeze-in-last-
+    known-good leaves intact. On a *cold reboot* with a compile-failed config
+    the dataplane is unarmed (no transit) yet FRR still forms peerings and
+    advertises the last-good prefixes, so peers route transit to this node's
+    physical IPs and it blackholes them rather than failing over to the HA
+    partner. This is a pre-existing cross-daemon gap (FRR is independent of the
+    xpfd boot class; the pre-#1960 claim-all path advertised the same way and
+    was otherwise worse), and the VIP/RETH data path already fails over because
+    #1960 suppresses this node's VRRP/cluster. Tracked in #1993; the likely fix
+    is to clear/suppress only the FRR managed section on compile-failure
+    bootstrap while leaving networkd/mgmt intact.
 - **Bootstrap mode** (`d.bootstrapMode` atomic): runs gRPC/REST/CLI normally
   but SUPPRESSES interface takeover ACTIONS — the full rename loop, host
   tunables, `enableForwarding`, dataplane arm (`dp.Start`), and boot-time
