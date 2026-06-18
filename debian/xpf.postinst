@@ -1,12 +1,20 @@
 #!/bin/sh
-# xpf postinst (#1917 — increment A packaging + increment B cut-over hook).
+# xpf postinst (#1917 — increment A packaging + increment B cut-over hook;
+# #1964 — first-install versioned-runtime seed).
 #
 # dpkg installs the binary set to the dpkg-static staging path
 # /usr/local/share/xpf/staged/. The running daemon resolves its
-# binaries via /usr/local/sbin/* which are SYMLINKS. On FIRST install
-# (no previously configured version) we create those symlinks so xpfd
-# runs. On UPGRADE we leave the live symlinks untouched and hand the
-# verified cut-over to the increment-B mechanism (`xpfd upgrade`):
+# binaries via /usr/local/sbin/* which are SYMLINKS that, after #1964,
+# point THROUGH /var/lib/xpf/versions/current. On FIRST install (no
+# previously configured version) we SEED the versioned runtime layout
+# (`xpfd seed-runtime`): copy staged/* into versions/<v>/, set
+# versions/current -> <v>, and repoint /usr/local/sbin/* through
+# versions/current — so xpfd runs AND there is a real, immutable rollback
+# target before the first in-place upgrade can ever STOP the daemon.
+# versions/ is maintainer-script-managed runtime state, NEVER in dpkg's
+# file list, so dpkg never clobbers a versioned rollback target (dpkg only
+# ever writes staged/). On UPGRADE we leave the live symlinks untouched and
+# hand the verified cut-over to the increment-B mechanism (`xpfd upgrade`):
 #
 #  - STANDALONE node: the postinst invokes `xpfd upgrade` — the
 #    verified, atomic, rollback-capable STOP->FLIP->START cut to the
@@ -30,16 +38,36 @@ case "$1" in
     configure)
         # $2 is the previously-configured version, empty on first install.
         if [ -z "$2" ]; then
-            mkdir -p "$SBIN"
-            for b in $BINS; do
-                # First install: point the live path at the staged binary.
-                # ln -sfnT replaces a pre-existing symlink atomically and,
-                # crucially, FAILS (under set -e) rather than nesting a
-                # symlink INSIDE the target if it happens to be a real
-                # directory — a directory at /usr/local/sbin/xpfd would
-                # otherwise leave the daemon unlaunchable with a "success".
-                ln -sfnT "$STAGED/$b" "$SBIN/$b"
-            done
+            # === #1964 first-install seed (mechanism A) ===
+            #
+            # Seed the versioned runtime layout BEFORE #DEBHELPER# starts
+            # the unit: copy staged/* -> versions/<v>/, set versions/current
+            # -> <v>, and repoint /usr/local/sbin/* THROUGH versions/current.
+            # This gives the appliance a real, immutable rollback target so
+            # the first in-place upgrade has a restorable PreviousVersion
+            # instead of a hard-refusing first cut. No cut/verify/stop here.
+            #
+            # The seed lives in the Go binary (durable copy + atomic symlink
+            # logic, unit-tested); the postinst runs AFTER unpack so the new
+            # xpfd is on disk and runnable. It is idempotent — apt re-running
+            # the postinst converges to the same state. If seeding fails we
+            # FALL BACK to legacy direct-to-staged links so the daemon still
+            # launches (degraded: the next upgrade then takes the legacy-
+            # migration preinst path), and we do NOT fail the install (a
+            # non-zero postinst leaves dpkg half-configured).
+            if "$STAGED/xpfd" seed-runtime; then
+                :
+            else
+                echo "xpf: WARNING seed-runtime failed; falling back to" \
+                     "direct-staged sbin links (next upgrade will migrate)" >&2
+                mkdir -p "$SBIN"
+                for b in $BINS; do
+                    # ln -sfnT replaces a pre-existing symlink atomically and
+                    # FAILS (under set -e) rather than nesting a symlink
+                    # INSIDE a real directory at the link path.
+                    ln -sfnT "$STAGED/$b" "$SBIN/$b"
+                done
+            fi
         else
             # Upgrade: do NOT touch the live symlinks. Only create one that
             # is COMPLETELY absent (not even a broken symlink); never repoint

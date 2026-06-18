@@ -136,4 +136,15 @@ type Journal struct {
 
 	// StartedAtUnixNano is when this cut-over began (diagnostics only).
 	StartedAtUnixNano int64 `json:"started_at_unix_nano,omitempty"`
+
+	// FirstCutSanctioned records that this cut was an explicitly sanctioned
+	// no-rollback first cut (Options.AllowNoRollbackFirstCut) at INIT, when
+	// PreviousVersion was empty (#1964 mechanism C). It is persisted so a
+	// crash-resume PAST the STOP step — where the refuse-before-STOP guard no
+	// longer re-runs — still treats the empty-previous cut as sanctioned
+	// (recoverFromFlipFailure restarts the first-install binary), rather than
+	// silently completing a cut whose sanction was never recorded. Without
+	// this, a re-run without the flag would proceed past a STOPPED empty-prev
+	// journal on the original run's sanction alone, which it could not prove.
+	FirstCutSanctioned bool `json:"first_cut_sanctioned,omitempty"`
 }

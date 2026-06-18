@@ -19,6 +19,11 @@
 #   to protect). On upgrade dpkg only refreshes the staging path; the
 #   live symlinks are left untouched so a plain apt upgrade never cuts
 #   the dataplane (increment B drives the verified cut explicitly).
+#   #1964: on first install the postinst SEEDS the versioned runtime
+#   (xpfd seed-runtime) — copy staged/* -> versions/<v>/, current -> <v>,
+#   sbin -> versions/current/<bin> — so a real rollback target exists from
+#   the first boot. versions/ stays maintainer-script-managed (never in
+#   dpkg's file list); dpkg still owns ONLY the staging path.
 
 export DH_VERBOSE = 1
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all

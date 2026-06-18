@@ -302,13 +302,18 @@ def virt_customize(work_qcow, xpf_deb):
         "--run-command", 'sed -i "s/^pool /#pool /; s/^server /#server /" /etc/chrony/chrony.conf '
                          "&& mkdir -p /etc/chrony/sources.d",
         # Install the xpf .deb. apt resolves the package's deps (adduser,
-        # present) from the local file. The postinst stages the binaries,
-        # creates the /usr/local/sbin symlinks, and enables xpfd +
-        # xpf-day0-config — so there is no separate `systemctl enable xpfd`
-        # here. systemd is not running under virt-customize, so the
-        # postinst's deb-systemd-invoke start is a harmless no-op (the units
-        # are enabled and start on the real first boot). The xpfd version
-        # check below confirms the symlink resolves the staged binary.
+        # present) from the local file. On this FIRST install the postinst
+        # runs `xpfd seed-runtime` (#1964): it copies the dpkg-staged binary
+        # set into /var/lib/xpf/versions/<v>/, points
+        # /var/lib/xpf/versions/current at it, and makes the /usr/local/sbin
+        # links resolve THROUGH versions/current — so the baked image ships
+        # with a real, immutable rollback target for its first in-place
+        # upgrade. The postinst also enables xpfd + xpf-day0-config — so
+        # there is no separate `systemctl enable xpfd` here. systemd is not
+        # running under virt-customize, so the postinst's deb-systemd-invoke
+        # start is a harmless no-op (the units are enabled and start on the
+        # real first boot). The xpfd version check below confirms the
+        # sbin -> versions/current -> versions/<v> chain resolves.
         "--run-command", "export DEBIAN_FRONTEND=noninteractive && "
                          f"apt-get install -y -qq -o Acquire::Retries=5 /var/tmp/{deb_name} && "
                          f"rm -f /var/tmp/{deb_name}",

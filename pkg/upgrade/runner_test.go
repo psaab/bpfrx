@@ -41,6 +41,10 @@ type fakeSystem struct {
 	// startFailOnce makes the NEXT StartUnit call fail once (to simulate a
 	// post-flip start-exec failure that must trigger auto-rollback).
 	startFailOnce bool
+	// daemonReloadFailOnce makes the NEXT DaemonReload call fail once. Since
+	// DaemonReload is flip()'s last substep, this injects a flip failure
+	// AFTER STOP — exercising mechanism C's recoverFromFlipFailure (#1964).
+	daemonReloadFailOnce bool
 
 	// calls records the ordered call log for assertions.
 	calls []string
@@ -76,7 +80,15 @@ func (f *fakeSystem) StartUnit(string) error {
 	f.unitRunning = true
 	return nil
 }
-func (f *fakeSystem) DaemonReload() error { f.log("daemon-reload"); f.daemonReloaded++; return nil }
+func (f *fakeSystem) DaemonReload() error {
+	f.log("daemon-reload")
+	if f.daemonReloadFailOnce {
+		f.daemonReloadFailOnce = false
+		return fmt.Errorf("synthetic daemon-reload failure")
+	}
+	f.daemonReloaded++
+	return nil
+}
 func (f *fakeSystem) FreeBytes(string) (uint64, error) {
 	return f.free, nil
 }
@@ -154,7 +166,7 @@ func TestRun_FullFreshCutover(t *testing.T) {
 	fs := newFakeSystem(t, "2.0.0")
 	r, cfg := testEnv(t, fs)
 
-	if err := r.Run(Options{}); err != nil {
+	if err := r.Run(Options{AllowNoRollbackFirstCut: true}); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
@@ -202,6 +214,9 @@ func TestRun_VerifyRejectLeavesLiveUntouched(t *testing.T) {
 	fs := newFakeSystem(t, "2.0.0")
 	fs.verifyPass = false
 	r, cfg := testEnv(t, fs)
+	// Post-#1964: an upgrade runs against a seeded host (current exists), so
+	// the cut reaches VERIFY rather than the no-rollback-target INIT refuse.
+	seedInitialCurrent(t, r, cfg, "1.0.0")
 
 	err := r.Run(Options{})
 	if err == nil {
@@ -216,16 +231,20 @@ func TestRun_VerifyRejectLeavesLiveUntouched(t *testing.T) {
 			t.Errorf("live mutation %q happened on a verify REJECT", c)
 		}
 	}
-	// current must not exist (never flipped).
-	if _, err := os.Lstat(filepath.Join(cfg.VersionsDir, "current")); !os.IsNotExist(err) {
-		t.Errorf("current symlink created despite verify reject")
+	// current must still point at the prior version (never flipped to 2.0.0).
+	target, _ := os.Readlink(filepath.Join(cfg.VersionsDir, "current"))
+	if filepath.Base(target) != "1.0.0" {
+		t.Errorf("current moved off 1.0.0 despite verify reject: %q", target)
 	}
 }
 
 func TestRun_DiskFullAbortsPreMutation(t *testing.T) {
 	fs := newFakeSystem(t, "2.0.0")
 	fs.free = 1 // 1 byte: nowhere near enough
-	r, _ := testEnv(t, fs)
+	r, cfg := testEnv(t, fs)
+	// Post-#1964: seeded host (current exists) so the cut reaches PREFLIGHT
+	// rather than the no-rollback-target INIT refuse.
+	seedInitialCurrent(t, r, cfg, "1.0.0")
 
 	err := r.Run(Options{})
 	if err == nil {
@@ -245,7 +264,7 @@ func TestRun_AutoRollbackOnUnhealthyStart(t *testing.T) {
 	// First cut to 1.0.0 (establishes a previous version).
 	fs := newFakeSystem(t, "1.0.0")
 	r, cfg := testEnv(t, fs)
-	if err := r.Run(Options{}); err != nil {
+	if err := r.Run(Options{AllowNoRollbackFirstCut: true}); err != nil {
 		t.Fatalf("first cut: %v", err)
 	}
 
@@ -282,7 +301,7 @@ func TestRun_AutoRollbackOnUnhealthyStart(t *testing.T) {
 func TestRun_RollbackClearsJournalNoResurrectFailedTarget(t *testing.T) {
 	fs := newFakeSystem(t, "1.0.0")
 	r, cfg := testEnv(t, fs)
-	if err := r.Run(Options{}); err != nil {
+	if err := r.Run(Options{AllowNoRollbackFirstCut: true}); err != nil {
 		t.Fatalf("first cut: %v", err)
 	}
 
@@ -318,7 +337,7 @@ func TestRun_RollbackClearsJournalNoResurrectFailedTarget(t *testing.T) {
 func TestRun_StartUnitFailureTriggersRollback(t *testing.T) {
 	fs := newFakeSystem(t, "1.0.0")
 	r, cfg := testEnv(t, fs)
-	if err := r.Run(Options{}); err != nil {
+	if err := r.Run(Options{AllowNoRollbackFirstCut: true}); err != nil {
 		t.Fatalf("first cut: %v", err)
 	}
 	// Stage 2.0.0; make its post-flip StartUnit fail once.
@@ -343,7 +362,7 @@ func TestRun_StartUnitFailureTriggersRollback(t *testing.T) {
 func TestGC_SweepsOrphanDBSnapshot(t *testing.T) {
 	fs := newFakeSystem(t, "1.0.0")
 	r, cfg := testEnv(t, fs)
-	if err := r.Run(Options{}); err != nil {
+	if err := r.Run(Options{AllowNoRollbackFirstCut: true}); err != nil {
 		t.Fatalf("first cut: %v", err)
 	}
 	// Plant an orphan dbsnap for a version with no version dir.
@@ -365,7 +384,7 @@ func TestGC_SweepsOrphanDBSnapshot(t *testing.T) {
 func TestRollback_ResumeMidRollback(t *testing.T) {
 	fs := newFakeSystem(t, "1.0.0")
 	r, cfg := testEnv(t, fs)
-	if err := r.Run(Options{}); err != nil {
+	if err := r.Run(Options{AllowNoRollbackFirstCut: true}); err != nil {
 		t.Fatalf("first cut: %v", err)
 	}
 	// Stage + copy + flip 2.0.0 so the on-disk state matches a cut that
@@ -404,7 +423,7 @@ func TestRollback_ResumeMidRollback(t *testing.T) {
 func TestRun_RollbackRestoresDBBeforeReflip(t *testing.T) {
 	fs := newFakeSystem(t, "1.0.0")
 	r, cfg := testEnv(t, fs)
-	if err := r.Run(Options{}); err != nil {
+	if err := r.Run(Options{AllowNoRollbackFirstCut: true}); err != nil {
 		t.Fatalf("first cut: %v", err)
 	}
 
@@ -450,7 +469,7 @@ func TestRun_CrashResumeIdempotent(t *testing.T) {
 	// Drive the full flow once to get a reference final state.
 	fsRef := newFakeSystem(t, "3.0.0")
 	rRef, cfgRef := testEnv(t, fsRef)
-	if err := rRef.Run(Options{}); err != nil {
+	if err := rRef.Run(Options{AllowNoRollbackFirstCut: true}); err != nil {
 		t.Fatalf("reference run: %v", err)
 	}
 	refTarget, _ := os.Readlink(filepath.Join(cfgRef.VersionsDir, "current"))
@@ -467,7 +486,7 @@ func TestRun_CrashResumeIdempotent(t *testing.T) {
 			// matching on-disk side effects, then re-run.
 			seedCrashState(t, r, cfg, fs, crashAfter)
 
-			if err := r.Run(Options{}); err != nil {
+			if err := r.Run(Options{AllowNoRollbackFirstCut: true}); err != nil {
 				t.Fatalf("resume from %s: %v", crashAfter, err)
 			}
 			target, _ := os.Readlink(filepath.Join(cfg.VersionsDir, "current"))

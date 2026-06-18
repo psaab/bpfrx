@@ -282,6 +282,14 @@ func copyTree(src, dst string) (string, error) {
 			if err := os.MkdirAll(target, 0755); err != nil {
 				return "", fmt.Errorf("mkdir %s: %w", target, err)
 			}
+			// Preserve the SOURCE dir's permissions (MkdirAll applies the
+			// umask and won't chmod an existing dir) so versions/<ver>/ is
+			// not silently restricted to 0700 under a tight operator umask,
+			// which would break non-root execution of cli/etc. via the sbin
+			// links (AGY review-011 r2; parity with pkg/upgrade/runtime).
+			if err := os.Chmod(target, preservedMode(e.info.Mode())); err != nil {
+				return "", fmt.Errorf("chmod %s: %w", target, err)
+			}
 			createdDirs = append(createdDirs, target)
 		case e.info.Mode().IsRegular():
 			if err := copyFileFsync(e.path, target, e.info.Mode()); err != nil {
@@ -347,6 +355,15 @@ func fsyncDirsDeepestFirst(dirs []string) error {
 	return nil
 }
 
+// preservedMode returns the chmod-applicable mode bits of m: the rwx
+// permission bits PLUS the setuid/setgid/sticky special bits. m.Perm() alone
+// masks the special bits off (Copilot), so a setgid staged dir or setuid
+// staged binary would lose those bits in versions/<ver>/. (Staged content is
+// 0755 today, so this is forward-looking exactness, not a current bug.)
+func preservedMode(m os.FileMode) os.FileMode {
+	return m.Perm() | (m & (os.ModeSetuid | os.ModeSetgid | os.ModeSticky))
+}
+
 // copyFileFsync copies src -> dst with mode, fsyncing dst before close.
 func copyFileFsync(src, dst string, mode os.FileMode) error {
 	in, err := os.Open(src)
@@ -360,6 +377,14 @@ func copyFileFsync(src, dst string, mode os.FileMode) error {
 	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
 	if err != nil {
 		return fmt.Errorf("create %s: %w", dst, err)
+	}
+	// OpenFile applies the umask to the create mode; chmod to the exact
+	// source mode (incl. setuid/setgid/sticky) so the staged binaries stay
+	// 0755-executable through versions/<ver>/ regardless of the operator's
+	// umask (AGY review-011 r2; preservedMode keeps special bits, Copilot).
+	if err := out.Chmod(preservedMode(mode)); err != nil {
+		out.Close()
+		return fmt.Errorf("chmod %s: %w", dst, err)
 	}
 	if _, err := io.Copy(out, in); err != nil {
 		out.Close()

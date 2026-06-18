@@ -1,34 +1,141 @@
 #!/bin/sh
-# xpf postrm (increment A of #1917).
+# xpf postrm (increment A of #1917; #1964 versioned-runtime lifecycle).
 #
-# Remove ONLY the live /usr/local/sbin symlinks this package created,
-# and ONLY when they still point into our staging path (so we never
-# clobber an operator's or increment-B's relinked target). State under
-# /etc/xpf (.configdb, node-id, master.key) is runtime state and is
-# NEVER touched here, not even on purge.
+# Remove the live /usr/local/sbin symlinks this package created — both the
+# legacy direct-to-staged links AND the #1964 links that resolve through
+# /var/lib/xpf/versions/current. State under /etc/xpf (.configdb, node-id,
+# master.key) is runtime state and is NEVER touched here, not even on purge.
+#
+# versions/ is package-derived runtime state (copied binaries), NOT operator
+# config — so it is LEFT on `remove` (a reinstall reuses it) and REMOVED on
+# `purge` (Debian Policy §6.8). Unlike /etc/xpf, removing versions/ on purge
+# is correct: it is copied binaries, not user data.
+#
+# DOWNGRADE (`postrm upgrade <new-version>` to a package that PREDATES the
+# #1964 hardened layout): the pre-#1964 package points sbin directly at
+# staged/ and does not manage versions/, so a lingering hardened drop-in +
+# versions/current would keep the unit running the NEWER binaries (the
+# drop-in ExecStart pins the concrete newer version dir) — a silent version
+# mismatch. This postrm detects that case (the new staged xpfd does not
+# support the #1964 layout) and cleans up: remove the runtime drop-in,
+# repoint sbin back to staged atomically, DELETE versions/current, and
+# boot-guarded daemon-reload.
+#
+# NOTE (plan §4): drop-in removal on remove/purge is deferred to #1967
+# (which also adds it to postrm). This change adds drop-in removal ONLY in
+# the downgrade path, where it is required for correctness, and is written
+# so #1967 can extend remove/purge without conflicting.
 
 set -e
 
 STAGED=/usr/local/share/xpf/staged
 SBIN=/usr/local/sbin
+VERSIONS=/var/lib/xpf/versions
+CURRENT="$VERSIONS/current"
+DROPIN=/etc/systemd/system/xpfd.service.d/10-xpf-version.conf
 BINS="xpfd cli xpf-userspace-dp xpf-day0-config"
+
+# atomic_symlink LINK TARGET — point LINK at TARGET via temp symlink +
+# rename (atomic; no unlink-then-create window).
+atomic_symlink() {
+    _link="$1"; _target="$2"
+    mkdir -p "$(dirname "$_link")"
+    # Clear any stale temp path first (Copilot): a leftover directory at
+    # "$_link.tmp" would make `ln -sf` nest the symlink inside it and the
+    # `mv -f` act on the wrong path.
+    rm -rf "$_link.tmp"
+    ln -sf "$_target" "$_link.tmp"
+    mv -f "$_link.tmp" "$_link"
+}
+
+# link_is_owned reports (exit 0) whether $1 is a symlink WE own — its target
+# is under the staging path (legacy) OR versions/current (#1964). A link an
+# operator repointed elsewhere is NOT owned and must never be touched.
+link_is_owned() {
+    [ -L "$1" ] || return 1
+    _t=$(readlink "$1" 2>/dev/null || true)
+    case "$_t" in
+        "$STAGED"/*|"$CURRENT"/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# remove_owned_sbin_links removes each sbin link we own.
+remove_owned_sbin_links() {
+    for b in $BINS; do
+        link="$SBIN/$b"
+        if link_is_owned "$link"; then
+            rm -f "$link"
+        fi
+    done
+}
+
+# repoint_owned_sbin_to_staged points each OWNED sbin link back at staged/
+# (atomic). It SKIPS a foreign/operator-repointed link (Codex) — a downgrade
+# must not clobber an operator's custom target.
+repoint_owned_sbin_to_staged() {
+    for b in $BINS; do
+        link="$SBIN/$b"
+        if link_is_owned "$link"; then
+            atomic_symlink "$link" "$STAGED/$b"
+        else
+            echo "xpf: leaving non-package sbin link $link untouched on downgrade" >&2
+        fi
+    done
+}
 
 case "$1" in
     remove|purge)
-        for b in $BINS; do
-            link="$SBIN/$b"
-            # Only remove a symlink we own (target inside the staging path).
-            if [ -L "$link" ]; then
-                target=$(readlink "$link" 2>/dev/null || true)
-                case "$target" in
-                    "$STAGED"/*)
-                        rm -f "$link"
-                        ;;
-                esac
-            fi
-        done
+        remove_owned_sbin_links
+        if [ "$1" = "purge" ]; then
+            # versions/ is package-derived (copied binaries), not operator
+            # config — remove the whole tree on purge.
+            rm -rf "$VERSIONS"
+        fi
         ;;
-    upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+    upgrade)
+        # $2 is the version being installed. On a DOWNGRADE to a package that
+        # predates the #1964 hardened layout, tear our hardened artifacts
+        # down so the downgraded package's direct-staged links take effect.
+        #
+        # Detection is a capability probe of the NEWLY-UNPACKED staged xpfd
+        # (already on disk at old-postrm `upgrade` time, per the dpkg
+        # downgrade call order: new-preinst, unpack, OLD-postrm upgrade,
+        # new-postinst configure). A hardened xpfd supports
+        # `seed-runtime --capability-check` (exit 0, no side effects); a
+        # pre-#1964 binary has no seed-runtime subcommand and exits non-zero.
+        # We ONLY clean up when the probe says the new binary lacks the
+        # layout — never on a hardened->hardened downgrade.
+        if [ -x "$STAGED/xpfd" ] && \
+           "$STAGED/xpfd" seed-runtime --capability-check >/dev/null 2>&1; then
+            : # downgrading to another hardened package — leave the layout.
+        elif [ -L "$CURRENT" ] || [ -e "$CURRENT" ]; then
+            echo "xpf: #1964 downgrade to a pre-hardened package — removing the" \
+                 "versioned-runtime drop-in and repointing sbin back to staged." >&2
+            # 1. remove the runtime unit drop-in (else systemd keeps the
+            #    concrete newer-version ExecStart).
+            rm -f "$DROPIN"
+            # rmdir the .d dir if it is now empty (best-effort).
+            rmdir /etc/systemd/system/xpfd.service.d 2>/dev/null || true
+            # 2. repoint OWNED sbin links back to staged (atomic) so the
+            #    daemon resolves the downgraded binaries — skipping any
+            #    foreign/operator-repointed link (Codex).
+            repoint_owned_sbin_to_staged
+            # 3. delete versions/current — else a later re-upgrade sees
+            #    current present, skips the legacy-migration snapshot, and
+            #    repoints sbin to a stale version dir (AGY-r4-1). Leave the
+            #    versions/<ver> dirs (harmless; a reinstall's GC reaps them).
+            rm -f "$CURRENT"
+            # 4. boot-guarded daemon-reload so systemd drops the removed
+            #    drop-in. In a non-booted env (docker/chroot/bake)
+            #    systemctl exits non-zero and, under set -e, would fail the
+            #    postrm — guard it.
+            if [ -d /run/systemd/system ]; then
+                systemctl daemon-reload 2>/dev/null || true
+            fi
+        fi
+        ;;
+    failed-upgrade|abort-install|abort-upgrade|disappear)
         ;;
     *)
         echo "postrm called with unknown argument \`$1'" >&2

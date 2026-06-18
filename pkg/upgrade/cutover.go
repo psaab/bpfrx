@@ -31,6 +31,24 @@ type Options struct {
 	// upgrade. The standalone single-node flow (and the postinst cut) leave
 	// it false so Run owns the lock.
 	LockAlreadyHeld bool
+
+	// AllowNoRollbackFirstCut sanctions a cut whose PreviousVersion is empty
+	// (#1964 mechanism C). C is an UNCONDITIONAL pre-STOP invariant (plan §8
+	// inv. C): the cut NEVER calls StopUnit unless either a restorable
+	// rollback target exists (PreviousVersion != "" — flip/start failure can
+	// recover by re-flipping the previous version) OR this flag explicitly
+	// sanctions a no-rollback first cut (no prior daemon to preserve). In the
+	// sanctioned case a flip failure still restarts the first-install binary
+	// from versions/current so the daemon is never left offline.
+	//
+	// With the #1964 first-install seed (A) and legacy-migration snapshot
+	// (B), versions/current — and therefore a non-empty PreviousVersion —
+	// exists on every field host, so an unsanctioned PreviousVersion=="" cut
+	// is refused as an unexpected loss of the rollback target rather than
+	// silently stopping a daemon it cannot recover. This flag is set only by
+	// the deliberate first-cut path (e.g. seeding failed and the operator
+	// chose to proceed), never by the routine postinst/operator cut.
+	AllowNoRollbackFirstCut bool
 }
 
 // Run executes (or resumes) the cut-over to the staged version. It is
@@ -60,6 +78,24 @@ func (r *Runner) Run(opts Options) (err error) {
 		return err
 	}
 
+	// A loaded journal's version fields key versions/<ver>, the .dbsnap
+	// dotfile, the `current` symlink, and the unit drop-in (#1964 C1). A
+	// crafted/format-drifted journal must not escape VersionsDir, so validate
+	// them BEFORE any path use — including the rollback-resume below, whose
+	// flip(j.PreviousVersion) keys paths by the previous version. An empty
+	// PreviousVersion is the legitimate first-cut case, so it is exempt here
+	// (the refuse-before-STOP guard handles "no previous").
+	if j.TargetVersion != "" {
+		if verr := ValidateVersionSegment(j.TargetVersion); verr != nil {
+			return fmt.Errorf("journal target version unsafe: %w", verr)
+		}
+	}
+	if j.PreviousVersion != "" {
+		if verr := ValidateVersionSegment(j.PreviousVersion); verr != nil {
+			return fmt.Errorf("journal previous version unsafe: %w", verr)
+		}
+	}
+
 	// Resume an interrupted auto-rollback FIRST (Codex r1 Critical#1): a
 	// crash mid-rollback must complete the rollback to PreviousVersion, not
 	// resume the failed forward cut. rollback() clears the journal on
@@ -72,11 +108,18 @@ func (r *Runner) Run(opts Options) (err error) {
 		return nil
 	}
 
-	// Identify the staged version.
+	// Identify the staged version. It keys versions/<ver> et al. on a fresh
+	// cut, so validate it as a safe single path segment BEFORE any path use
+	// (#1964 C1) — `git describe`-derived versions can carry a `/` (a
+	// branch-named tag), which would otherwise escape VersionsDir.
 	stagedXpfd := filepath.Join(r.cfg.StagedDir, "xpfd")
 	stagedVer, err := r.cfg.Sys.BinaryVersion(stagedXpfd)
 	if err != nil {
 		return fmt.Errorf("read staged version (%s): %w", stagedXpfd, err)
+	}
+	if verr := ValidateVersionSegment(stagedVer); verr != nil {
+		return fmt.Errorf("staged version is not a safe path segment "+
+			"(refusing to key versions/ by it): %w", verr)
 	}
 
 	// Resume-vs-fresh: if a journal exists for a DIFFERENT target than the
@@ -138,9 +181,47 @@ func (r *Runner) Run(opts Options) (err error) {
 		if perr != nil {
 			return perr
 		}
+		if prev != "" {
+			if verr := ValidateVersionSegment(prev); verr != nil {
+				return fmt.Errorf("current version (rollback target) is not a safe "+
+					"path segment: %w", verr)
+			}
+		}
+		// REFUSE-AT-INIT (mechanism C, Codex r2): an unsanctioned cut with no
+		// rollback target must be refused BEFORE any journal is persisted. If
+		// we instead let it run preflight/copy/verify and only refused at the
+		// pre-STOP guard, the journal would be left at StateVerified with
+		// PreviousVersion=="" — and a re-run (even after the operator re-seeds
+		// versions/current as the error advises) would RESUME that stale
+		// journal, never re-read `current`, and stay refused forever (stuck).
+		// Refusing here writes no journal, so a post-seed re-run starts fresh,
+		// reads the new `current`, and proceeds with a real rollback target.
+		// Also clear any lingering on-disk journal from a just-completed
+		// resume-vs-fresh recovery (which resets j in memory but does not
+		// remove the stale on-disk record), so the refuse leaves a fully
+		// clean state and a re-run does not re-run recovery.
+		if prev == "" && !opts.AllowNoRollbackFirstCut {
+			if cerr := r.clearJournal(); cerr != nil {
+				r.logf("upgrade: WARN clear stale journal on refuse: %v", cerr)
+			}
+			return fmt.Errorf("refuse-before-STOP: no previous version to roll back to "+
+				"(versions/current is absent or unreadable) and this is not a sanctioned "+
+				"first cut; refusing the %s cut because a flip/start failure would leave "+
+				"the daemon offline with no recovery target. Seed the versioned runtime "+
+				"(xpfd seed-runtime), then re-run the upgrade", stagedVer)
+		}
 		j.TargetVersion = stagedVer
 		j.PreviousVersion = prev
 		j.StartedAtUnixNano = r.cfg.Sys.Now().UnixNano()
+		// Record the sanctioned-first-cut decision NOW (#1964 mechanism C,
+		// Codex r1): a no-previous cut is sanctioned only when the caller
+		// passes AllowNoRollbackFirstCut. Persisting it means a crash-resume
+		// PAST the STOP step (where the refuse guard no longer re-runs) still
+		// honors the original sanction, and recoverFromFlipFailure can prove
+		// the empty-previous flip-failure restart is legitimate.
+		if prev == "" && opts.AllowNoRollbackFirstCut {
+			j.FirstCutSanctioned = true
+		}
 		if err := r.transition(j, StateStaged); err != nil {
 			return err
 		}
@@ -183,6 +264,35 @@ func (r *Runner) Run(opts Options) (err error) {
 		}
 	}
 
+	// ---- REFUSE-BEFORE-STOP (mechanism C, plan §8 inv. C) ----
+	// The UNCONDITIONAL pre-STOP invariant: never proceed into a STOP/FLIP/
+	// START path for a cut with no restorable target (PreviousVersion=="")
+	// unless it is an explicitly sanctioned no-rollback first cut.
+	//
+	// This check is NOT gated on the cut not-yet-having-stopped (Copilot r2):
+	// a corrupted / hand-edited / older-version journal that resumes at
+	// StateStopped (or later) with PreviousVersion=="" AND
+	// FirstCutSanctioned==false would otherwise sail past STOP straight into
+	// FLIP/START, silently completing an UNSANCTIONED no-rollback cut. By
+	// evaluating it on every Run — even a post-STOP resume — an unsanctioned
+	// empty-previous cut is always refused, while a legitimately sanctioned
+	// resume passes (its FirstCutSanctioned was persisted at INIT). With the
+	// #1964 seed/migration PreviousVersion is non-empty on every field host,
+	// so this fires only on an unexpected loss of the rollback target.
+	//
+	// Sanctioned either by THIS invocation's flag or by the persisted journal
+	// decision from the original run (so a crash-resume re-entering without
+	// the flag is still honored).
+	sanctioned := opts.AllowNoRollbackFirstCut || j.FirstCutSanctioned
+	if j.State.atLeast(StateStaged) && j.PreviousVersion == "" && !sanctioned {
+		return fmt.Errorf("refuse-before-STOP: no previous version to roll back to "+
+			"(versions/current is absent or unreadable) and this is not a sanctioned "+
+			"first cut; refusing to proceed past STOP for the %s cut because a "+
+			"flip/start failure would leave the daemon offline with no recovery "+
+			"target. Re-seed the versioned runtime (xpfd seed-runtime), then re-run "+
+			"the upgrade", j.TargetVersion)
+	}
+
 	// ---- STOP (live mutation #1) ----
 	if !j.State.atLeast(StateStopped) {
 		if !opts.UnitAlreadyStopped {
@@ -197,9 +307,16 @@ func (r *Runner) Run(opts Options) (err error) {
 	}
 
 	// ---- FLIP (live mutation #2; three journaled-idempotent substeps) ----
+	// A flip failure leaves the unit STOPPED (the STOP step above already
+	// ran). The daemon must not be left offline (AGY-5): recover by rolling
+	// back to the previous version, or — for a sanctioned first cut with no
+	// previous version — by restarting the first-install binary already
+	// present in versions/current (the flip's 6a current-repoint is the only
+	// substep that could have run; current still resolves to a launchable
+	// version either way).
 	if !j.State.atLeast(StateFlipped) {
 		if err := r.flip(j.TargetVersion); err != nil {
-			return fmt.Errorf("flip: %w", err)
+			return r.recoverFromFlipFailure(j, opts, err)
 		}
 		if err := r.transition(j, StateFlipped); err != nil {
 			return err

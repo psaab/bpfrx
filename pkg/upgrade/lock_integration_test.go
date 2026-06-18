@@ -17,7 +17,7 @@ func TestRun_TakesAndReleasesLock(t *testing.T) {
 	fs := newFakeSystem(t, "2.0.0")
 	r, _ := testEnv(t, fs)
 
-	if err := r.Run(Options{}); err != nil {
+	if err := r.Run(Options{AllowNoRollbackFirstCut: true}); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if got := atomic.LoadInt32(&st.acquires); got != 1 {
@@ -99,6 +99,7 @@ func TestRolling_HoldsLockAcrossDrainAndInnerCutDoesNotReacquire(t *testing.T) {
 
 	fs := newFakeSystem(t, "2.0.0")
 	r, cfg := testEnv(t, fs)
+	seedInitialCurrent(t, r, cfg, "1.0.0") // post-#1964: node already seeded
 
 	cl := &fakeCluster{
 		peerAlive:  true,

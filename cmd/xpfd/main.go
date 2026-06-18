@@ -94,6 +94,20 @@ func main() {
 		return
 	}
 
+	// #1964 mechanism A: `xpfd seed-runtime` seeds the versioned runtime
+	// layout on FIRST `.deb` install. The postinst runs this on first
+	// install ($2 empty) AFTER unpack but BEFORE #DEBHELPER# starts the
+	// unit: it copies staged/* into versions/<v>/, sets versions/current ->
+	// <v>, and repoints /usr/local/sbin/* through versions/current — giving
+	// every appliance a real, immutable rollback target before the first
+	// in-place upgrade can ever STOP the daemon. No cut/verify/stop here.
+	// Idempotent: a re-run (apt re-running the postinst) converges to the
+	// same fully-seeded state.
+	if len(os.Args) > 1 && os.Args[1] == "seed-runtime" {
+		runSeedRuntimeSubcommand(os.Args[2:])
+		return
+	}
+
 	// #1864 deploy-time pre-flight: run the kernel BPF verifier against
 	// the shim object EMBEDDED IN THIS BINARY without touching any
 	// production state (anonymous maps, no pins, no attach, nothing

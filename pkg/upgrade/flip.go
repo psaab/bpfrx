@@ -167,6 +167,71 @@ func (r *Runner) rollback(j *Journal) error {
 	return r.clearJournal()
 }
 
+// recoverFromFlipFailure handles a flip() error. The STOP step already ran,
+// so the unit is DOWN. Recovery depends on the path:
+//
+//   - STANDALONE, PreviousVersion != "": auto-roll back to it (re-flip + DB
+//     restore + start the old daemon) so the daemon is never left offline.
+//   - STANDALONE, PreviousVersion == "" (sanctioned first cut): no prior
+//     version, but versions/current was seeded (A/B) and the flip's only
+//     possibly-completed substep (6a) repoints current to the SAME
+//     first-install version, so current still resolves to a launchable
+//     binary. Restart the unit so the first-install daemon comes back up.
+//   - HA path (SkipStartHealthRollback): rollback is OPERATOR-DRIVEN by
+//     design — an automatic re-flip mid-rolling un-coordinates the cluster
+//     (plan §8 inv. 8). This INTENTIONALLY leaves the node's unit STOPPED on
+//     a flip failure and surfaces a clear error, exactly mirroring the
+//     existing HA START-failure behavior (cutover.go: SkipStartHealthRollback
+//     returns without rollback). So on HA the mechanism-C "daemon never
+//     offline" property is delegated to the operator (and to the peer, which
+//     is still forwarding because the node was drained before the cut) — it
+//     is a documented, signed-off exception, NOT a silent contradiction.
+//
+// In all cases recoverFromFlipFailure returns a NON-NIL error (AGY-r2-4b):
+// a flip failure is never a successful cut, even after a clean recovery.
+func (r *Runner) recoverFromFlipFailure(j *Journal, opts Options, flipErr error) error {
+	// HA: rollback is operator-driven for BOTH the has-previous and
+	// first-cut cases — never auto-recover mid-rolling. Surface the stopped
+	// unit for operator action (the drained-to peer keeps forwarding).
+	if opts.SkipStartHealthRollback {
+		return fmt.Errorf("flip failed after STOP (HA: rollback is operator-driven; "+
+			"the unit is stopped — recover the node): %w", flipErr)
+	}
+	if j.PreviousVersion != "" {
+		r.logf("upgrade: flip to %s failed after STOP (%v); AUTO-ROLLBACK to %s",
+			j.TargetVersion, flipErr, j.PreviousVersion)
+		if rbErr := r.rollback(j); rbErr != nil {
+			return fmt.Errorf("flip failed (%v) AND rollback failed: %w", flipErr, rbErr)
+		}
+		return fmt.Errorf("flip to %s failed; rolled back to %s: %w",
+			j.TargetVersion, j.PreviousVersion, flipErr)
+	}
+
+	// Sanctioned first cut (PreviousVersion==""): no prior version, but the
+	// first-install binary is present in versions/current. Restart it so the
+	// daemon is not left offline.
+	r.logf("upgrade: flip to %s failed after STOP on a sanctioned first cut (%v); "+
+		"restarting the first-install daemon from versions/current", j.TargetVersion, flipErr)
+	if startErr := r.cfg.Sys.StartUnit(r.cfg.Unit); startErr != nil {
+		return fmt.Errorf("flip failed (%v) on a first cut AND restart of the first-install "+
+			"daemon failed (%v) — daemon is OFFLINE, operator intervention required",
+			flipErr, startErr)
+	}
+	// Clear the journal (Copilot r3): leaving it at StateStopped would let a
+	// subsequent Run() SKIP the STOP step (the unit is already running again),
+	// run flip/start as a no-op against the live unit, and mark the cut
+	// COMMITTED without ever restarting to the new ExecStart/drop-in. The cut
+	// failed and we restored the first-install daemon, so the attempt is
+	// abandoned — a re-run must start fresh against whatever is staged (which,
+	// after this restart, has a real PreviousVersion in versions/current).
+	if cerr := r.clearJournal(); cerr != nil {
+		r.logf("upgrade: WARN clear journal after first-cut flip-failure restart: %v", cerr)
+	}
+	return fmt.Errorf("flip to %s failed on a sanctioned first cut; restarted the "+
+		"first-install daemon from versions/current (no rollback target existed): %w",
+		j.TargetVersion, flipErr)
+}
+
 // restoreDBSnapshot replaces the live config DB dir with the snapshot taken
 // in PREFLIGHT, crash-safely. Strategy:
 //
