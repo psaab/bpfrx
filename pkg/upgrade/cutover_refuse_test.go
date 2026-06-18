@@ -82,6 +82,84 @@ func TestRefuseBeforeStop_ExhaustiveNoStopWithoutTarget(t *testing.T) {
 	}
 }
 
+// TestRun_RejectsUnsafeStagedVersion proves the cut validates the staged
+// version as a safe path segment BEFORE any path use / mutation (Codex r1
+// MAJOR #1) — a version with a path separator must not key versions/<ver>.
+func TestRun_RejectsUnsafeStagedVersion(t *testing.T) {
+	fs := newFakeSystem(t, "feature/x") // contains a '/'
+	r, cfg := testEnv(t, fs)
+
+	err := r.Run(Options{AllowNoRollbackFirstCut: true})
+	if err == nil {
+		t.Fatal("expected unsafe-version rejection")
+	}
+	if !strings.Contains(err.Error(), "not a safe path segment") {
+		t.Fatalf("error is not the version-segment rejection: %v", err)
+	}
+	// No live mutation, no journal, no version dir.
+	for _, c := range fs.calls {
+		if c == "stop" || c == "start" || c == "dropin" || c == "verify" || c == "copy" {
+			t.Errorf("phase %q ran despite an unsafe staged version", c)
+		}
+	}
+	if _, serr := os.Stat(cfg.JournalPath); !os.IsNotExist(serr) {
+		t.Error("journal written despite an unsafe staged version")
+	}
+}
+
+// TestRun_SanctionedFirstCutPersistsAndResumes proves the sanctioned-first-cut
+// decision is persisted in the journal (Codex r1 MAJOR #4): a sanctioned cut
+// that crashes at STOPPED resumes to completion on a re-run WITHOUT the flag,
+// because the journal carries FirstCutSanctioned.
+func TestRun_SanctionedFirstCutPersistsAndResumes(t *testing.T) {
+	fs := newFakeSystem(t, "1.0.0")
+	r, cfg := testEnv(t, fs)
+
+	// Drive the sanctioned cut up to STOPPED, then stop (simulate a crash
+	// before FLIP) by seeding the journal + on-disk state through STOPPED.
+	j := &Journal{State: StateInit, TargetVersion: "1.0.0"}
+	// readCurrentVersion is "" (first cut); record the sanction as Run would.
+	j.FirstCutSanctioned = true
+	must(t, r.transition(j, StateStaged))
+	must(t, r.preflight(j))
+	must(t, r.transition(j, StatePreflight))
+	must(t, r.copyStaged(j))
+	must(t, r.transition(j, StateCopied))
+	must(t, r.verify(j))
+	must(t, r.transition(j, StateVerified))
+	must(t, fs.StopUnit(cfg.Unit))
+	must(t, r.transition(j, StateStopped))
+
+	// Re-run WITHOUT AllowNoRollbackFirstCut: the persisted sanction must let
+	// it proceed past STOP to completion (NOT refuse).
+	if err := r.Run(Options{}); err != nil {
+		t.Fatalf("resume of a persisted-sanctioned first cut: %v", err)
+	}
+	target, _ := os.Readlink(filepath.Join(cfg.VersionsDir, "current"))
+	if filepath.Base(target) != "1.0.0" {
+		t.Errorf("resumed sanctioned first cut did not complete to 1.0.0: current=%q", target)
+	}
+}
+
+// TestRun_JournalRecordsFirstCutSanction proves a fresh sanctioned first cut
+// persists FirstCutSanctioned (so a crash-resume can honor it). We crash the
+// fresh run at COPIED via an injected verify error, then read the journal.
+func TestRun_JournalRecordsFirstCutSanction(t *testing.T) {
+	fs := newFakeSystem(t, "1.0.0")
+	fs.verifyErr = os.ErrInvalid // abort at VERIFY, after the journal is written
+	r, cfg := testEnv(t, fs)
+
+	_ = r.Run(Options{AllowNoRollbackFirstCut: true}) // fails at verify
+
+	data, err := os.ReadFile(cfg.JournalPath)
+	if err != nil {
+		t.Fatalf("journal not present after a mid-cut abort: %v", err)
+	}
+	if !strings.Contains(string(data), `"first_cut_sanctioned": true`) {
+		t.Errorf("journal did not record the first-cut sanction:\n%s", data)
+	}
+}
+
 // TestFlipFailure_FirstCutRestartsDaemon proves the AGY-5 fix for a
 // SANCTIONED first cut: a flip failure AFTER STOP restarts the first-install
 // daemon from versions/current rather than leaving it offline, and returns a

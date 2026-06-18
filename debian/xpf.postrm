@@ -44,19 +44,39 @@ atomic_symlink() {
     mv -f "$_link.tmp" "$_link"
 }
 
-# remove_owned_sbin_links removes each sbin link we own — one pointing
-# either into the staging path (legacy) OR through versions/current (#1964).
-# We never touch a link an operator repointed elsewhere.
+# link_is_owned reports (exit 0) whether $1 is a symlink WE own — its target
+# is under the staging path (legacy) OR versions/current (#1964). A link an
+# operator repointed elsewhere is NOT owned and must never be touched.
+link_is_owned() {
+    [ -L "$1" ] || return 1
+    _t=$(readlink "$1" 2>/dev/null || true)
+    case "$_t" in
+        "$STAGED"/*|"$CURRENT"/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# remove_owned_sbin_links removes each sbin link we own.
 remove_owned_sbin_links() {
     for b in $BINS; do
         link="$SBIN/$b"
-        [ -L "$link" ] || continue
-        target=$(readlink "$link" 2>/dev/null || true)
-        case "$target" in
-            "$STAGED"/*|"$CURRENT"/*)
-                rm -f "$link"
-                ;;
-        esac
+        if link_is_owned "$link"; then
+            rm -f "$link"
+        fi
+    done
+}
+
+# repoint_owned_sbin_to_staged points each OWNED sbin link back at staged/
+# (atomic). It SKIPS a foreign/operator-repointed link (Codex) — a downgrade
+# must not clobber an operator's custom target.
+repoint_owned_sbin_to_staged() {
+    for b in $BINS; do
+        link="$SBIN/$b"
+        if link_is_owned "$link"; then
+            atomic_symlink "$link" "$STAGED/$b"
+        else
+            echo "xpf: leaving non-package sbin link $link untouched on downgrade" >&2
+        fi
     done
 }
 
@@ -93,11 +113,10 @@ case "$1" in
             rm -f "$DROPIN"
             # rmdir the .d dir if it is now empty (best-effort).
             rmdir /etc/systemd/system/xpfd.service.d 2>/dev/null || true
-            # 2. repoint sbin back to staged (atomic) so the daemon resolves
-            #    the downgraded binaries.
-            for b in $BINS; do
-                atomic_symlink "$SBIN/$b" "$STAGED/$b"
-            done
+            # 2. repoint OWNED sbin links back to staged (atomic) so the
+            #    daemon resolves the downgraded binaries — skipping any
+            #    foreign/operator-repointed link (Codex).
+            repoint_owned_sbin_to_staged
             # 3. delete versions/current — else a later re-upgrade sees
             #    current present, skips the legacy-migration snapshot, and
             #    repoints sbin to a stale version dir (AGY-r4-1). Leave the

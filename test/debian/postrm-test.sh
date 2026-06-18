@@ -154,9 +154,24 @@ scenario_remove_legacy_links() {
     done
 }
 
+# downgrade must NOT clobber a foreign/operator-repointed sbin link (Codex).
+scenario_downgrade_skips_foreign_link() {
+    build_hardened "2.0.0"
+    make_staged_prehardened
+    # Operator repointed xpfd elsewhere; the others stay package-owned.
+    ln -sf "/opt/custom/xpfd" "$SBIN/xpfd"
+    "$ROOT/postrm" upgrade "0.9.0"
+    [ "$(readlink "$SBIN/xpfd")" = "/opt/custom/xpfd" ] || { echo "FAIL: downgrade clobbered a foreign sbin link"; exit 1; }
+    # The owned ones are repointed to staged.
+    for b in cli xpf-userspace-dp xpf-day0-config; do
+        [ "$(readlink "$SBIN/$b")" = "$STAGED/$b" ] || { echo "FAIL: owned sbin $b not repointed to staged"; exit 1; }
+    done
+}
+
 run_scenario remove_keeps_versions
 run_scenario purge_removes_versions
 run_scenario downgrade_to_prehardened
+run_scenario downgrade_skips_foreign_link
 run_scenario upgrade_to_hardened_noop
 run_scenario remove_skips_foreign_link
 run_scenario remove_legacy_links

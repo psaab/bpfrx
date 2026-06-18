@@ -90,11 +90,35 @@ func (r *Runner) Run(opts Options) (err error) {
 		return nil
 	}
 
-	// Identify the staged version.
+	// A loaded journal's version fields key versions/<ver>, the .dbsnap
+	// dotfile, the `current` symlink, and the unit drop-in (#1964 C1). A
+	// crafted/format-drifted journal must not escape VersionsDir, so validate
+	// them as safe path segments before any path use (empty PreviousVersion
+	// is the legitimate first-cut case, so it is exempt here — the
+	// refuse-before-STOP guard handles "no previous").
+	if j.TargetVersion != "" {
+		if verr := ValidateVersionSegment(j.TargetVersion); verr != nil {
+			return fmt.Errorf("journal target version unsafe: %w", verr)
+		}
+	}
+	if j.PreviousVersion != "" {
+		if verr := ValidateVersionSegment(j.PreviousVersion); verr != nil {
+			return fmt.Errorf("journal previous version unsafe: %w", verr)
+		}
+	}
+
+	// Identify the staged version. It keys versions/<ver> et al. on a fresh
+	// cut, so validate it as a safe single path segment BEFORE any path use
+	// (#1964 C1) — `git describe`-derived versions can carry a `/` (a
+	// branch-named tag), which would otherwise escape VersionsDir.
 	stagedXpfd := filepath.Join(r.cfg.StagedDir, "xpfd")
 	stagedVer, err := r.cfg.Sys.BinaryVersion(stagedXpfd)
 	if err != nil {
 		return fmt.Errorf("read staged version (%s): %w", stagedXpfd, err)
+	}
+	if verr := ValidateVersionSegment(stagedVer); verr != nil {
+		return fmt.Errorf("staged version is not a safe path segment "+
+			"(refusing to key versions/ by it): %w", verr)
 	}
 
 	// Resume-vs-fresh: if a journal exists for a DIFFERENT target than the
@@ -156,9 +180,24 @@ func (r *Runner) Run(opts Options) (err error) {
 		if perr != nil {
 			return perr
 		}
+		if prev != "" {
+			if verr := ValidateVersionSegment(prev); verr != nil {
+				return fmt.Errorf("current version (rollback target) is not a safe "+
+					"path segment: %w", verr)
+			}
+		}
 		j.TargetVersion = stagedVer
 		j.PreviousVersion = prev
 		j.StartedAtUnixNano = r.cfg.Sys.Now().UnixNano()
+		// Record the sanctioned-first-cut decision NOW (#1964 mechanism C,
+		// Codex r1): a no-previous cut is sanctioned only when the caller
+		// passes AllowNoRollbackFirstCut. Persisting it means a crash-resume
+		// PAST the STOP step (where the refuse guard no longer re-runs) still
+		// honors the original sanction, and recoverFromFlipFailure can prove
+		// the empty-previous flip-failure restart is legitimate.
+		if prev == "" && opts.AllowNoRollbackFirstCut {
+			j.FirstCutSanctioned = true
+		}
 		if err := r.transition(j, StateStaged); err != nil {
 			return err
 		}
@@ -211,7 +250,11 @@ func (r *Runner) Run(opts Options) (err error) {
 	// host, so this refusal fires only on an unexpected loss of the rollback
 	// target — exactly when a blind STOP would be catastrophic.
 	if !j.State.atLeast(StateStopped) {
-		if j.PreviousVersion == "" && !opts.AllowNoRollbackFirstCut {
+		// Sanctioned either by THIS invocation's flag or by the persisted
+		// journal decision from the original run (so a crash-resume that
+		// re-enters before STOP without the flag is still honored).
+		sanctioned := opts.AllowNoRollbackFirstCut || j.FirstCutSanctioned
+		if j.PreviousVersion == "" && !sanctioned {
 			return fmt.Errorf("refuse-before-STOP: no previous version to roll back to "+
 				"(versions/current is absent or unreadable) and this is not a sanctioned "+
 				"first cut; refusing to proceed past STOP for the %s cut because a "+

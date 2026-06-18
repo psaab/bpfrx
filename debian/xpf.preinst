@@ -202,21 +202,32 @@ case "$1" in
         # under the script's `set -e`, and several of its commands are bare
         # (mkdir -p "$VERSIONS", the atomic_symlink ln/mv, sync) — a full
         # disk / EPERM / read-only /var would otherwise abort the preinst and
-        # block the upgrade. We canNOT use `migrate_legacy_layout "$@" ||
-        # true`: under POSIX/dash a function on the left of `||` runs with
-        # `set -e` SUSPENDED for its whole body, so a failing early command
-        # would silently continue into later dangerous lines instead of
-        # aborting. Instead run it in a subshell that keeps `set -e` ACTIVE
-        # (so a failure aborts the migration EARLY) while the parent absorbs
-        # the subshell's exit and proceeds (AGY review-011).
+        # block the upgrade.
+        #
+        # Two forms that LOOK like they'd work but do NOT, verified against
+        # dash + bash (AGY review-011 + the live POSIX set -e test):
+        #   - `migrate_legacy_layout "$@" || true` — a function on the left of
+        #     `||` runs with `set -e` SUSPENDED for its WHOLE body, so a
+        #     failing early command silently continues into later dangerous
+        #     lines instead of aborting the migration.
+        #   - `if ( set -e; migrate_legacy_layout "$@" ); then` — a command in
+        #     an `if` CONDITION also runs with `set -e` suspended, and that
+        #     suspension propagates INTO the subshell, so the inner `set -e`
+        #     is ignored and early-abort is lost.
+        # The only correct form: `set +e` in the parent, run the migration in
+        # a subshell that re-enables `set -e` (so a failure aborts the
+        # migration EARLY, NOT in a condition context), capture rc, restore
+        # `set -e`, then act on rc. The parent absorbs the failure and the apt
+        # transaction proceeds.
         set +e
         ( set -e; migrate_legacy_layout "$@" )
-        if [ $? -ne 0 ]; then
+        migrate_rc=$?
+        set -e
+        if [ "$migrate_rc" -ne 0 ]; then
             echo "xpf: #1964 legacy migration did not complete (best-effort);" \
                  "the first cut's refuse-before-STOP guard still protects the" \
                  "daemon. Continuing the upgrade." >&2
         fi
-        set -e
         ;;
     install|abort-upgrade)
         ;;
