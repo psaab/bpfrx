@@ -62,15 +62,22 @@ SBIN=/usr/local/sbin
 VERSIONS=/var/lib/xpf/versions
 CURRENT="$VERSIONS/current"
 DROPIN=/etc/systemd/system/xpfd.service.d/10-xpf-version.conf
-# #1985 hardened-layout version floor. The #1964 versioned-runtime layout
-# (versions/current + the unit drop-in this postrm manages) first shipped in
-# the debian maintainer scripts at commit `ef9525e70` ("#1964: postrm
-# versioned-link cleanup, purge tree removal, downgrade"), whose `git
-# rev-list --count` is 4104. The .deb version scheme is `0.0.<commit-count>+g<sha>`
-# (Makefile DEB_VERSION), monotonic in commit count, so any incoming package
-# with version < 0.0.4104 PREDATES the layout and is a genuine pre-#1964
-# downgrade. This is a HISTORICAL fixed point (the layout already shipped), not
-# a value that drifts per build — do not bump it with new releases.
+# #1985 hardened-layout version floor. This is the first package whose postrm
+# manages the #1964 versioned-runtime layout (versions/current + the unit
+# drop-in) on downgrade and whose xpfd answers `seed-runtime
+# --capability-check` — i.e. the first package that can be classified as
+# hardened by this teardown contract. That commit is `ef9525e70` ("#1964:
+# postrm versioned-link cleanup, purge tree removal, downgrade"), whose `git
+# rev-list --count` is 4104. (Earlier #1964 commits added the postinst seed at
+# 4102 and the preinst migration at 4103, but the postrm downgrade handling
+# this floor protects landed at 4104.) The .deb version scheme is
+# `0.0.<commit-count>+g<sha>` (Makefile DEB_VERSION), monotonic in commit
+# count, so any incoming package with version < 0.0.4104 PREDATES the contract
+# and is a genuine pre-#1964 downgrade; >= 0.0.4104 (incl. the floor version
+# 0.0.4104+g<sha>, which sorts ABOVE the bare 0.0.4104 floor since `+...`
+# sorts after the empty string) is hardened. This is a HISTORICAL fixed point
+# (the contract already shipped), not a value that drifts per build — do
+# not bump it with new releases.
 HARDENED_LAYOUT_FLOOR="0.0.4104"
 # Managed-binary set (#1982). The single source of truth is the Go manifest
 # pkg/upgrade/manifest; this literal is kept self-contained on purpose (no
@@ -156,10 +163,12 @@ repoint_owned_sbin_to_staged() {
 incoming_predates_hardened_layout() {
     _v="$1"
     [ -n "$_v" ] || return 1
-    # `dpkg --compare-versions` returns 2 (not 1) on an UNPARSABLE version;
-    # only a clean 0 (true: _v lt floor) counts as a confirmed pre-#1964
-    # downgrade. Any other status (1 = not-less, 2 = parse error) => keep.
-    dpkg --compare-versions "$_v" lt "$HARDENED_LAYOUT_FLOOR" 2>/dev/null
+    # `dpkg --compare-versions` returns 0 (true: _v lt floor), 1 (not-less),
+    # or 2 (UNPARSABLE version). Only a clean 0 counts as a confirmed
+    # pre-#1964 downgrade; map anything else to return 1 (keep). The explicit
+    # `|| return 1` also keeps this helper safe under `set -e` if it is ever
+    # called outside an `if`/`&&` condition in a future edit (AGY).
+    dpkg --compare-versions "$_v" lt "$HARDENED_LAYOUT_FLOOR" 2>/dev/null || return 1
 }
 
 case "$1" in

@@ -215,12 +215,18 @@ fi
 ```
 
 `HARDENED_LAYOUT_FLOOR` is `0.0.4104` — the `.deb` version
-(`0.0.<commit-count>+g<sha>`, `Makefile` `DEB_VERSION`) of the commit
-(`ef9525e70`) where the versioned-runtime layout first shipped in the debian
-maintainer scripts. Any incoming version `< 0.0.4104` predates the layout and
-is a genuine pre-#1964 downgrade; `>= 0.0.4104` (upgrade OR hardened->hardened
-downgrade) leaves the layout alone. The floor is a HISTORICAL fixed point (the
-layout already shipped), not a per-release value — it is never bumped.
+(`0.0.<commit-count>+g<sha>`, `Makefile` `DEB_VERSION`) of commit `ef9525e70`,
+the first package whose postrm manages the versioned-runtime layout on
+downgrade and whose `xpfd` answers `seed-runtime --capability-check` — i.e.
+the first package classifiable as hardened by this teardown contract. (Earlier
+#1964 commits added the postinst seed at count 4102 and the preinst migration
+at 4103; the postrm downgrade handling this floor protects landed at 4104.)
+Any incoming version `< 0.0.4104` predates the contract and is a genuine
+pre-#1964 downgrade; `>= 0.0.4104` (upgrade OR hardened->hardened downgrade,
+including the floor version `0.0.4104+g<sha>` which sorts above the bare
+`0.0.4104` floor) leaves the layout alone. The floor is a HISTORICAL fixed
+point (the contract already shipped), not a per-release value — it is
+never bumped.
 
 - The teardown runs ONLY when `$2` is a confirmed pre-#1964 version AND a
   hardened layout is present (`versions/current`).
