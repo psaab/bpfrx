@@ -77,6 +77,13 @@ override_dh_auto_test:
 
 override_dh_auto_install:
 	install -d debian/xpf$(STAGED)
+	@# Managed-binary staging (#1982). The single source of truth for this
+	@# set is the Go manifest pkg/upgrade/manifest; this install list is kept
+	@# explicit (no generated make var sed'd into the tracked rules) so the
+	@# build never mutates the checkout. The drift canary
+	@# (TestManagedBinaryDriftCanary, pkg/upgrade/manifest) FAILS the suite if
+	@# this set diverges from manifest.Names(). Add a managed binary here AND
+	@# in the manifest.
 	install -m 0755 xpfd              debian/xpf$(STAGED)/xpfd
 	install -m 0755 cli               debian/xpf$(STAGED)/cli
 	install -m 0755 xpf-userspace-dp  debian/xpf$(STAGED)/xpf-userspace-dp

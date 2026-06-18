@@ -37,6 +37,11 @@ SBIN=/usr/local/sbin
 VERSIONS=/var/lib/xpf/versions
 CURRENT="$VERSIONS/current"
 DROPIN=/etc/systemd/system/xpfd.service.d/10-xpf-version.conf
+# Managed-binary set (#1982). The single source of truth is the Go manifest
+# pkg/upgrade/manifest; this literal is kept self-contained on purpose (no
+# build-time sed into the tracked checkout). The drift canary
+# (TestManagedBinaryDriftCanary, pkg/upgrade/manifest) FAILS the suite if this
+# list diverges from manifest.Names(). Edit both together.
 BINS="xpfd cli xpf-userspace-dp xpf-day0-config"
 
 # atomic_symlink LINK TARGET — point LINK at TARGET via temp symlink +
