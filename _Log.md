@@ -6011,3 +6011,6 @@ top.
 - **Timestamp**: 2026-06-18
 - **Action**: Address Copilot 2nd-review new findings: ReadJournalSourceGeneration now returns ("",nil) on a malformed journal (matches the best-effort docstring); stagedgen GC sort adds a genid name tie-breaker for deterministic retention on coarse-mtime ties.
 - **File(s)**: pkg/upgrade/runner.go, pkg/upgrade/stagedgen/stagedgen.go
+- **Timestamp**: 2026-06-18
+- **Action**: Address Codex r3 + Copilot 3rd review (GC current-gen protection): GC now resolves current-gen EXPLICITLY and protects it additively (never reaped even if not newest/mtime-skewed); orders by genid NAME (mtime-independent, deterministic); SKIPS non-ValidGenID stray dirs (no slot consumption, no deletion). Added 2 GC tests.
+- **File(s)**: pkg/upgrade/stagedgen/stagedgen.go, pkg/upgrade/stagedgen/stagedgen_test.go

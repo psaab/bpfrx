@@ -275,11 +275,15 @@ func (c Config) GenDir(genid string) string {
 	return c.genDir(genid)
 }
 
-// GC removes generation dirs beyond RetainGenerations (current + 1 prior),
-// NEVER removing the current-gen generation NOR any genid in protected (the
-// generations an active/resumable journal still references — plan §4.B.5 /
-// B-P3 GC-vs-resume protection). It also sweeps .partial orphans. A missing
-// staged-gen root is a no-op.
+// GC removes generation dirs beyond RetainGenerations, ordering by genid name
+// (mtime-independent, deterministic — GenID's zero-padded timestamp prefix
+// makes lexicographic name order chronological). It NEVER removes the
+// current-gen generation (resolved explicitly, protected additively) NOR any
+// genid in protected (the generations an active/resumable journal still
+// references — plan §4.B.5 / B-P3 GC-vs-resume protection), and it ignores
+// (never counts toward retention, never deletes) any directory whose name is
+// not a valid genid. It also sweeps .partial orphans. A missing staged-gen
+// root is a no-op.
 func (c Config) GC(protected map[string]bool) error {
 	c.withDefaults()
 	c.sweepPartials()
@@ -292,68 +296,55 @@ func (c Config) GC(protected map[string]bool) error {
 		return fmt.Errorf("stagedgen: read %s: %w", c.Dir, err)
 	}
 
-	// The caller's `protected` set (journal-referenced generations) is kept
-	// ADDITIVELY — outside and on top of the RetainGenerations window — so a
-	// journal-pinned OLD generation never pushes the immediate-prior-to-current
-	// generation out of the window (Copilot). The current generation is NOT in
-	// this additive set: it is naturally the newest and counts toward the
-	// window (RetainGenerations = current + N-1 prior).
+	// The caller's `protected` set (journal-referenced generations) PLUS the
+	// current generation are kept ADDITIVELY — outside and on top of the
+	// RetainGenerations window — so a journal-pinned OLD generation never
+	// pushes an in-window generation out, and the active cut source is never
+	// reaped even if directory mtimes are perturbed (Copilot). current-gen is
+	// resolved EXPLICITLY rather than relying on it being the newest by mtime.
 	extraProtected := map[string]bool{}
 	for g := range protected {
 		extraProtected[g] = true
 	}
-
-	type gen struct {
-		name string
-		mod  int64
+	if cur, rerr := c.ResolveCurrent(); rerr == nil && cur != "" {
+		extraProtected[cur] = true
 	}
-	var gens []gen
+
+	// Collect ONLY valid generation dirs (Copilot): a stray non-generation
+	// directory must neither consume a retention slot nor be deleted. Order by
+	// NAME, newest first — GenID prefixes a zero-padded nanosecond timestamp,
+	// so lexicographic name order is chronological and mtime-INDEPENDENT
+	// (deterministic even when coarse-resolution mtimes tie).
+	var gens []string
 	for _, e := range entries {
 		n := e.Name()
-		if n == CurrentGenLink {
+		if n == CurrentGenLink || strings.HasPrefix(n, ".") {
 			continue
 		}
-		if strings.HasPrefix(n, ".") { // .partial, temp symlinks
+		if !e.IsDir() || !ValidGenID(n) {
 			continue
 		}
-		if !e.IsDir() {
-			continue
-		}
-		info, ierr := e.Info()
-		if ierr != nil {
-			continue
-		}
-		gens = append(gens, gen{name: n, mod: info.ModTime().UnixNano()})
+		gens = append(gens, n)
 	}
-	// Newest first, with a genid (name) tie-breaker so retention is
-	// DETERMINISTIC when two generations share a coarse-resolution mtime
-	// (Copilot): GenID prefixes a zero-padded nanosecond timestamp, so the
-	// lexicographically-greater name is the chronologically-later generation —
-	// the right tie-break for "newest first".
-	sort.Slice(gens, func(i, j int) bool {
-		if gens[i].mod != gens[j].mod {
-			return gens[i].mod > gens[j].mod
-		}
-		return gens[i].name > gens[j].name
-	})
+	sort.Slice(gens, func(i, j int) bool { return gens[i] > gens[j] })
 
 	kept := 0
 	removedAny := false
 	for _, g := range gens {
-		// The RetainGenerations newest generations form the window (current-gen
-		// is naturally among them as the newest).
+		// The RetainGenerations newest generations form the window.
 		if kept < RetainGenerations {
 			kept++
 			continue
 		}
-		// Outside the window: keep ONLY if journal-referenced (additive
-		// protection — never reap a generation a resumable cut still pins).
-		if extraProtected[g.name] {
+		// Outside the window: keep ONLY if current-gen or journal-referenced
+		// (additive protection — never reap the active source or a generation a
+		// resumable cut still pins).
+		if extraProtected[g] {
 			continue
 		}
-		c.logf("stagedgen: gc removing old generation %s", g.name)
-		if rerr := os.RemoveAll(c.genDir(g.name)); rerr != nil {
-			c.logf("stagedgen: WARN gc remove %s: %v", g.name, rerr)
+		c.logf("stagedgen: gc removing old generation %s", g)
+		if rerr := os.RemoveAll(c.genDir(g)); rerr != nil {
+			c.logf("stagedgen: WARN gc remove %s: %v", g, rerr)
 			continue
 		}
 		removedAny = true

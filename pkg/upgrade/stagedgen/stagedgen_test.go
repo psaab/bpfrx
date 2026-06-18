@@ -324,6 +324,72 @@ func TestGCProtectedDoesNotConsumeRetentionWindow(t *testing.T) {
 	}
 }
 
+// TestGCIgnoresNonGenerationDirs pins the Copilot fix: a stray non-genid
+// directory in the staged-gen root is neither counted toward retention nor
+// deleted by GC.
+func TestGCIgnoresNonGenerationDirs(t *testing.T) {
+	root := t.TempDir()
+	staged := filepath.Join(root, "staged")
+	writeStaged(t, staged, "v1")
+	c := newConfig(t, staged)
+
+	g0, _ := c.Publish()
+	g1, _ := c.Publish()
+	g2, _ := c.Publish() // current-gen
+	// A stray foreign directory (not a valid genid).
+	stray := filepath.Join(c.Dir, "operator-scratch")
+	if err := os.MkdirAll(stray, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.GC(nil); err != nil {
+		t.Fatal(err)
+	}
+	// The stray dir is untouched (not counted, not deleted).
+	if _, err := os.Stat(stray); err != nil {
+		t.Errorf("GC deleted a non-generation directory: %v", err)
+	}
+	// Retention is computed over generations only: newest 2 (g2,g1) survive,
+	// g0 reaped — the stray did NOT consume a slot that would save g0.
+	if _, err := os.Stat(c.GenDir(g0)); err == nil {
+		t.Errorf("g0 survived — a stray dir wrongly consumed a retention slot")
+	}
+	for _, g := range []string{g1, g2} {
+		if _, err := os.Stat(c.GenDir(g)); err != nil {
+			t.Errorf("in-window generation %s wrongly GC'd: %v", g, err)
+		}
+	}
+}
+
+// TestGCProtectsCurrentGenEvenIfNotNewest pins the Copilot fix: current-gen is
+// resolved EXPLICITLY and protected additively, so it survives GC even if it
+// is NOT the lexicographically-newest generation (e.g. current-gen was
+// repointed back to an older generation).
+func TestGCProtectsCurrentGenEvenIfNotNewest(t *testing.T) {
+	root := t.TempDir()
+	staged := filepath.Join(root, "staged")
+	writeStaged(t, staged, "v1")
+	c := newConfig(t, staged)
+
+	g0, _ := c.Publish() // oldest
+	c.Publish()          // g1
+	c.Publish()          // g2 (newest, current-gen now)
+	// Repoint current-gen back to the OLDEST generation g0 (atypical, but the
+	// GC must protect whatever current-gen names).
+	if err := atomicRelSymlink(filepath.Join(c.Dir, CurrentGenLink), g0); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.GC(nil); err != nil {
+		t.Fatal(err)
+	}
+	// g0 is current-gen — must survive even though it is the oldest (outside
+	// the newest-2 name window).
+	if _, err := os.Stat(c.GenDir(g0)); err != nil {
+		t.Fatalf("GC deleted current-gen (g0) because it was not the newest: %v", err)
+	}
+}
+
 func TestRemoveAll(t *testing.T) {
 	root := t.TempDir()
 	staged := filepath.Join(root, "staged")
