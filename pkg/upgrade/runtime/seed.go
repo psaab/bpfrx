@@ -182,12 +182,21 @@ func Seed(cfg Config) (err error) {
 	//    FAILURE here is fatal to seeding (the caller falls back to legacy
 	//    direct-staged links): a later cut then refuses safely with no source
 	//    rather than reading torn staged/.
-	if _, perr := (stagedgen.Config{
+	sgCfg := stagedgen.Config{
 		StagedDir: cfg.StagedDir,
 		Dir:       cfg.StagedGenDir,
 		Logf:      cfg.Logf,
-	}).Publish(); perr != nil {
+	}
+	if _, perr := sgCfg.Publish(); perr != nil {
 		return fmt.Errorf("seed: publish initial staged generation: %w", perr)
+	}
+	// GC the staged-generation root (Copilot): a repeated seed (manual
+	// `xpfd seed-runtime` or repeated postinst retries) publishes a fresh
+	// generation each time, so without a GC they accumulate. Best-effort — a
+	// GC failure does not fail the seed (the publish already succeeded). No
+	// cut runs at first-install seed time, so no journal protection is needed.
+	if gcErr := sgCfg.GC(nil); gcErr != nil {
+		logf("seed: WARN staged-gen gc failed: %v", gcErr)
 	}
 	logf("seed: published the initial staged generation")
 	return nil

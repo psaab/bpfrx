@@ -292,13 +292,15 @@ func (c Config) GC(protected map[string]bool) error {
 		return fmt.Errorf("stagedgen: read %s: %w", c.Dir, err)
 	}
 
-	prot := map[string]bool{}
+	// The caller's `protected` set (journal-referenced generations) is kept
+	// ADDITIVELY — outside and on top of the RetainGenerations window — so a
+	// journal-pinned OLD generation never pushes the immediate-prior-to-current
+	// generation out of the window (Copilot). The current generation is NOT in
+	// this additive set: it is naturally the newest and counts toward the
+	// window (RetainGenerations = current + N-1 prior).
+	extraProtected := map[string]bool{}
 	for g := range protected {
-		prot[g] = true
-	}
-	// The current generation is always protected.
-	if cur, rerr := c.ResolveCurrent(); rerr == nil && cur != "" {
-		prot[cur] = true
+		extraProtected[g] = true
 	}
 
 	type gen struct {
@@ -329,12 +331,15 @@ func (c Config) GC(protected map[string]bool) error {
 	kept := 0
 	removedAny := false
 	for _, g := range gens {
-		if prot[g.name] {
+		// The RetainGenerations newest generations form the window (current-gen
+		// is naturally among them as the newest).
+		if kept < RetainGenerations {
 			kept++
 			continue
 		}
-		if kept < RetainGenerations {
-			kept++
+		// Outside the window: keep ONLY if journal-referenced (additive
+		// protection — never reap a generation a resumable cut still pins).
+		if extraProtected[g.name] {
 			continue
 		}
 		c.logf("stagedgen: gc removing old generation %s", g.name)

@@ -295,6 +295,35 @@ func TestGCProtectsJournalReferencedGen(t *testing.T) {
 	}
 }
 
+// TestGCProtectedDoesNotConsumeRetentionWindow pins the Copilot fix: a
+// protected (journal-pinned) OLD generation must NOT consume a retention slot,
+// so the immediate-prior-to-current generation still survives.
+func TestGCProtectedDoesNotConsumeRetentionWindow(t *testing.T) {
+	root := t.TempDir()
+	staged := filepath.Join(root, "staged")
+	writeStaged(t, staged, "v1")
+	c := newConfig(t, staged)
+
+	// Publish g0 (oldest), g1, g2 (newest = current-gen). Protect the OLDEST.
+	g0, _ := c.Publish()
+	bumpMtime(t, c.GenDir(g0), 1)
+	g1, _ := c.Publish()
+	bumpMtime(t, c.GenDir(g1), 2)
+	g2, _ := c.Publish()
+	bumpMtime(t, c.GenDir(g2), 3)
+
+	if err := c.GC(map[string]bool{g0: true}); err != nil {
+		t.Fatal(err)
+	}
+	// current-gen g2 always kept; g0 protected; AND g1 (the immediate prior to
+	// current) must survive because g0's protection did NOT eat its slot.
+	for _, g := range []string{g0, g1, g2} {
+		if _, err := os.Stat(c.GenDir(g)); err != nil {
+			t.Errorf("generation %s should survive (protected g0 must not push g1 out of the window): %v", g, err)
+		}
+	}
+}
+
 func TestRemoveAll(t *testing.T) {
 	root := t.TempDir()
 	staged := filepath.Join(root, "staged")

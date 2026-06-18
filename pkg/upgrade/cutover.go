@@ -111,8 +111,11 @@ func (r *Runner) resolveSource(j *Journal) (genid, dir string, err error) {
 		if fi, serr := os.Stat(d); serr == nil && fi.IsDir() {
 			return j.SourceGeneration, d, nil
 		}
-		return "", "", fmt.Errorf("pinned source generation %s missing and no current-gen "+
-			"(re-run after re-publishing the staged set)", j.SourceGeneration)
+		// No %w-with-nil: the error is the same whether Stat failed or the path
+		// is not a directory — the pinned generation is unusable and there is no
+		// current-gen to fall back to.
+		return "", "", fmt.Errorf("pinned source generation %s missing or not a directory "+
+			"and no current-gen (re-run after re-publishing the staged set)", j.SourceGeneration)
 	}
 
 	// Pre-#1981 legacy in-flight journal that already copied from live staged/.
@@ -705,9 +708,14 @@ func (r *Runner) copyStaged(j *Journal) error {
 				j.SourceGeneration)
 		}
 		srcDir = r.stagedGenConfig().GenDir(j.SourceGeneration)
-		if fi, serr := os.Stat(srcDir); serr != nil || !fi.IsDir() {
+		fi, serr := os.Stat(srcDir)
+		if serr != nil {
 			return fmt.Errorf("pinned source generation %s missing at %s: %w "+
 				"(it may have been GC'd — re-run after re-publishing)", j.SourceGeneration, srcDir, serr)
+		}
+		if !fi.IsDir() {
+			return fmt.Errorf("pinned source generation %s at %s is not a directory",
+				j.SourceGeneration, srcDir)
 		}
 	}
 
@@ -727,7 +735,18 @@ func (r *Runner) copyStaged(j *Journal) error {
 		// an unstamped pre-#1981 dir vs a stamped cut, or vice-versa). Replace
 		// it — unless it is live/rollback, in which case refuse (backstop; the
 		// stamped-different live case is already refused at INIT).
-		cur, _ := r.readCurrentVersion()
+		//
+		// FAIL-SAFE on an unreadable `current` (Copilot): if we cannot determine
+		// the live version, REFUSE rather than risk RemoveAll-ing a dir that may
+		// be live — an ignored read error here could destroy the running
+		// daemon's binaries.
+		cur, curErr := r.readCurrentVersion()
+		if curErr != nil {
+			return fmt.Errorf("refuse: cannot determine the live `current` version while "+
+				"deciding whether to replace %s (its source generation %q differs from this "+
+				"cut's %q); refusing to risk deleting a live version dir: %w",
+				dst, existingGen, j.SourceGeneration, curErr)
+		}
 		if ver == cur || ver == j.PreviousVersion {
 			return fmt.Errorf("refuse: cannot replace the live/rollback version dir %s "+
 				"(its bytes come from source generation %q but this cut pins %q); re-stage "+

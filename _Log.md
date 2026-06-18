@@ -6002,3 +6002,6 @@ top.
 - **Timestamp**: 2026-06-18
 - **Action**: Address Codex r5 MERGE-NEEDS-MAJOR (5 findings): (1) unstamped STALE version dir now guarded-replaced not skipped; (2) live/rollback B-P3b refusal moved to INIT pre-PREFLIGHT (no journal/dbsnap/wedge); (3) publish-generation GC protects the on-disk journal's pinned generation (new ReadJournalSourceGeneration); (4) pre-#1981 pre-copy resume re-pinned to current-gen + preflight sizes the pinned source; (5) postrm staged-gen teardown gets its own #1981 floor (0.0.4200). Added 4 regression tests.
 - **File(s)**: pkg/upgrade/cutover.go, pkg/upgrade/runner.go, cmd/xpfd/publish_generation.go, debian/xpf.postrm, pkg/upgrade/stagedgen_cut_test.go
+- **Timestamp**: 2026-06-18
+- **Action**: Address Copilot review (6 findings): split %w-with-nil Stat errors (resolveSource + copyStaged); fail-safe refuse on unreadable `current` in copyStaged replacement; GC protected (journal) generations are now ADDITIVE (don't consume the retention window) — current-gen counts in the window; seed runs staged-gen GC after publish. Added GC-window test.
+- **File(s)**: pkg/upgrade/cutover.go, pkg/upgrade/stagedgen/stagedgen.go, pkg/upgrade/stagedgen/stagedgen_test.go, pkg/upgrade/runtime/seed.go
