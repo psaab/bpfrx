@@ -65,6 +65,46 @@ func TestCompileFailureForcesBootstrapNotClaimAll(t *testing.T) {
 	}
 }
 
+// TestShouldBootstrapFromFile pins the daemon's import gate (the Run branch at
+// daemon_run.go that imports the text xpf.conf after Load). It exists because
+// the helper-level computeBootClass test cannot catch a regression in the
+// SEPARATE Run-level decision to skip bootstrapFromFile on compile failure
+// (Codex #1991 r2): removing the `!configCompileFailed` guard would still pass
+// every computeBootClass case yet would silently import a different config over
+// a broken committed DB. The (no-active, compile-failed) cell below is the one
+// that flips false→true if the guard is dropped, failing this test.
+func TestShouldBootstrapFromFile(t *testing.T) {
+	tests := []struct {
+		name          string
+		hasActive     bool
+		compileFailed bool
+		want          bool
+	}{
+		// No active config and no compile failure: fresh / never-committed
+		// boot imports the text xpf.conf (the long-standing behavior).
+		{"no-active-no-compile-failure", false, false, true},
+		// A valid active config is loaded: never import over it.
+		{"active-loaded", true, false, false},
+		// #1960 the load-bearing cell: no active config (compiled stayed nil)
+		// but the committed DB failed to compile. The import MUST be skipped —
+		// importing xpf.conf here swaps in a different config and then takes
+		// over interfaces, defeating the fail-closed intent. Dropping the
+		// `!configCompileFailed` guard flips this to true and fails the test.
+		{"no-active-compile-failed", false, true, false},
+		// Defensive: even if a compiled config were somehow present, a
+		// compile-failed load never imports.
+		{"active-and-compile-failed", true, true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldBootstrapFromFile(tt.hasActive, tt.compileFailed); got != tt.want {
+				t.Fatalf("shouldBootstrapFromFile(hasActive=%v, compileFailed=%v) = %v; want %v",
+					tt.hasActive, tt.compileFailed, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestComputeBootClass covers the #1922 five-case boot predicate table.
 // Case 4 (corrupt/too-new) is fatal via #1917 D1 before the predicate runs,
 // so it is not represented as a predicate input.

@@ -82,11 +82,30 @@ never lock an operator out of a remote box it manages.
   logs it loudly (Error), SKIPS `bootstrapFromFile` (so the text `xpf.conf` is
   not blind-imported over the broken DB), and passes `configCompileFailed=true`
   to `computeBootClass`, which forces **bootstrap** — overriding even the
-  HA-node guard. The control plane stays up and the lifeline/protected set keep
-  mgmt reachable; the operator fixes the config and `commit confirmed`s, or
-  repairs/removes the on-disk DB. A daemon hard-exit is deliberately NOT used
-  (it would also strand mgmt). Distinct from `ErrConfigDBUnreadable` (#1917 D1,
-  which IS a fatal exit because the bytes themselves cannot be read).
+  HA-node guard. The control plane stays up so the operator can recover
+  in-band. A daemon hard-exit is deliberately NOT used (it would also strand
+  mgmt). Distinct from `ErrConfigDBUnreadable` (#1917 D1, which IS a fatal exit
+  because the bytes themselves cannot be read).
+  - **Why mgmt stays reachable — freeze in last-known-good, not a wipe.** This
+    path does NOT run the `enterBootstrapMode()` teardown (which removes the
+    `10-xpf-*` `.network`/`.link` files, clears the FRR managed section, and
+    tears down the dataplane); that teardown is reserved for confirmed-commit
+    rollback. On a previously-committed box the last-good networkd + FRR state
+    therefore persists untouched, so mgmt — and any already-forwarding data
+    path — keeps working while the operator fixes the config. That is a
+    deliberate choice: the only thing the box must NOT do on an uncompilable
+    config is the *new* takeover (positional claim-all / fresh apply), which
+    bootstrap suppresses. The lifeline/protected set govern the rename + apply
+    sweeps and the fresh-install case; they are not what keeps a *previously*
+    managed box reachable here.
+  - **In-band recovery is real (not just "repair the DB").** On compile failure
+    `Store.Load` keeps `compiled` nil (the fail-closed signal) but retains the
+    parsed-but-broken tree as the active tree and loads the on-disk rollback
+    history. So `configure` clones the broken config into the candidate (the
+    operator can `show`/edit the offending stanza), `rollback N` /
+    `show | compare rollback N` reach prior good configs, and a
+    `commit confirmed` of either promotes a working config. Repairing/removing
+    the on-disk DB remains the out-of-band fallback.
 - **Bootstrap mode** (`d.bootstrapMode` atomic): runs gRPC/REST/CLI normally
   but SUPPRESSES interface takeover ACTIONS — the full rename loop, host
   tunables, `enableForwarding`, dataplane arm (`dp.Start`), and boot-time

@@ -60,6 +60,22 @@ func classifyLoadError(err error) loadErrorClass {
 	}
 }
 
+// shouldBootstrapFromFile reports whether Run should import the text config
+// file (xpf.conf) after Store.Load. The import runs only when there is no
+// active config to boot from AND the Load did not fail closed on a compile
+// error.
+//
+// #1960: the `!configCompileFailed` clause is load-bearing, not cosmetic. On a
+// compile-failed load ActiveConfig() is nil (compiled stayed nil), so without
+// this guard the import would fire — silently swapping a DIFFERENT config
+// (whatever xpf.conf holds) in over the broken committed DB and then taking
+// over interfaces from it, defeating the fail-closed intent. This predicate is
+// the single source of truth for that decision (daemon_run.go calls it) so the
+// guard cannot be dropped without TestShouldBootstrapFromFile failing.
+func shouldBootstrapFromFile(hasActiveConfig, configCompileFailed bool) bool {
+	return !hasActiveConfig && !configCompileFailed
+}
+
 // lifelineRecordFile persists the management-NIC identity (PCI bus address +
 // MAC) so the protected set (Item 4) survives the rename that turns the
 // recorded kernel name (enp5s0) into fxp0, AND survives daemon restarts and

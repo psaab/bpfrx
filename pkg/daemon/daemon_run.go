@@ -264,7 +264,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// #1960: but NOT when a present committed config failed to compile —
 	// importing the text xpf.conf there would silently swap in a different
 	// config and then take over interfaces, defeating the fail-closed intent.
-	if d.store.ActiveConfig() == nil && !configCompileFailed {
+	if shouldBootstrapFromFile(d.store.ActiveConfig() != nil, configCompileFailed) {
 		if err := d.bootstrapFromFile(); err != nil {
 			slog.Warn("failed to bootstrap config from file", "err", err)
 		}
