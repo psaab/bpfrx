@@ -16,10 +16,35 @@
 # staged/ and does not manage versions/, so a lingering hardened drop-in +
 # versions/current would keep the unit running the NEWER binaries (the
 # drop-in ExecStart pins the concrete newer version dir) — a silent version
-# mismatch. This postrm detects that case (the new staged xpfd does not
-# support the #1964 layout) and cleans up: remove the runtime drop-in,
-# repoint sbin back to staged atomically, DELETE versions/current, and
-# boot-guarded daemon-reload.
+# mismatch. This postrm detects that case and cleans up: remove the runtime
+# drop-in, repoint sbin back to staged atomically, DELETE versions/current,
+# and boot-guarded daemon-reload.
+#
+# #1985: detection keys on the dpkg-supplied INCOMING version ($2), NOT on an
+# exec of the staged binary. The original code probed
+# `"$STAGED/xpfd" seed-runtime --capability-check` and treated ANY non-zero
+# exit as "pre-#1964, tear the layout down". The `&&` short-circuited to false
+# whenever the staged xpfd could not EXEC at all (dynamic-link error during
+# unpack, corruption, libc/ABI conflict, arch mismatch) — not only when it
+# genuinely lacked the subcommand. That conflated "new binary lacks the
+# layout" with "new binary cannot run", so a non-execable staged xpfd on a
+# real UPGRADE ran the destructive teardown and broke the daemon on next boot.
+#
+# The sound, exec-free signal is the version: dpkg passes $2 = the version
+# being installed. A genuine pre-#1964 downgrade has $2 < the layout floor;
+# an upgrade or a hardened->hardened downgrade has $2 >= the floor. We compare
+# with `dpkg --compare-versions` (always present in a maintainer script).
+# A presence-only file marker was rejected: dpkg removes a file that exists
+# ONLY in the old package AFTER old-postrm runs (Debian Policy 6.6 unpack
+# order), so a marker shipped by the hardened package LINGERS on disk at
+# old-postrm time during a genuine pre-#1964 downgrade and would mis-signal
+# "incoming is hardened" — skipping the teardown that the downgrade needs.
+# The version arg has no such staleness.
+#
+# Safe-fallback posture (mirrors the sibling preinst migrate_legacy_layout):
+# if $2 is empty or unparsable we LEAVE the hardened layout intact rather than
+# destroy it — the verify-dataplane cut gate / refuse-before-STOP guard is
+# the backstop. We tear down ONLY when $2 is a confirmed pre-#1964 version.
 #
 # REMOVE/PURGE drop-in cleanup (#1967): on remove/purge the runtime unit
 # drop-in /etc/systemd/system/xpfd.service.d/10-xpf-version.conf (written by
@@ -37,6 +62,16 @@ SBIN=/usr/local/sbin
 VERSIONS=/var/lib/xpf/versions
 CURRENT="$VERSIONS/current"
 DROPIN=/etc/systemd/system/xpfd.service.d/10-xpf-version.conf
+# #1985 hardened-layout version floor. The #1964 versioned-runtime layout
+# (versions/current + the unit drop-in this postrm manages) first shipped in
+# the debian maintainer scripts at commit `ef9525e70` ("#1964: postrm
+# versioned-link cleanup, purge tree removal, downgrade"), whose `git
+# rev-list --count` is 4104. The .deb version scheme is `0.0.<commit-count>+g<sha>`
+# (Makefile DEB_VERSION), monotonic in commit count, so any incoming package
+# with version < 0.0.4104 PREDATES the layout and is a genuine pre-#1964
+# downgrade. This is a HISTORICAL fixed point (the layout already shipped), not
+# a value that drifts per build — do not bump it with new releases.
+HARDENED_LAYOUT_FLOOR="0.0.4104"
 # Managed-binary set (#1982). The single source of truth is the Go manifest
 # pkg/upgrade/manifest; this literal is kept self-contained on purpose (no
 # build-time sed into the tracked checkout). The drift canary
@@ -110,6 +145,23 @@ repoint_owned_sbin_to_staged() {
     done
 }
 
+# incoming_predates_hardened_layout VERSION reports (exit 0) whether the
+# INCOMING package version VERSION ($2 on `postrm upgrade`) predates the #1964
+# hardened layout floor — i.e. this is a genuine pre-#1964 downgrade that
+# must tear the hardened artifacts down. It is EXEC-FREE (the #1985 fix: never
+# run the staged binary) and staleness-free (uses the dpkg version, not an
+# on-disk file). Empty or unparsable VERSION returns NON-zero (false) so the
+# caller takes the SAFE branch (leave the layout intact) rather than destroy
+# it on ambiguity — mirroring the preinst migrate_legacy_layout posture.
+incoming_predates_hardened_layout() {
+    _v="$1"
+    [ -n "$_v" ] || return 1
+    # `dpkg --compare-versions` returns 2 (not 1) on an UNPARSABLE version;
+    # only a clean 0 (true: _v lt floor) counts as a confirmed pre-#1964
+    # downgrade. Any other status (1 = not-less, 2 = parse error) => keep.
+    dpkg --compare-versions "$_v" lt "$HARDENED_LAYOUT_FLOOR" 2>/dev/null
+}
+
 case "$1" in
     remove|purge)
         remove_owned_sbin_links
@@ -128,18 +180,15 @@ case "$1" in
         # predates the #1964 hardened layout, tear our hardened artifacts
         # down so the downgraded package's direct-staged links take effect.
         #
-        # Detection is a capability probe of the NEWLY-UNPACKED staged xpfd
-        # (already on disk at old-postrm `upgrade` time, per the dpkg
-        # downgrade call order: new-preinst, unpack, OLD-postrm upgrade,
-        # new-postinst configure). A hardened xpfd supports
-        # `seed-runtime --capability-check` (exit 0, no side effects); a
-        # pre-#1964 binary has no seed-runtime subcommand and exits non-zero.
-        # We ONLY clean up when the probe says the new binary lacks the
-        # layout — never on a hardened->hardened downgrade.
-        if [ -x "$STAGED/xpfd" ] && \
-           "$STAGED/xpfd" seed-runtime --capability-check >/dev/null 2>&1; then
-            : # downgrading to another hardened package — leave the layout.
-        elif [ -L "$CURRENT" ] || [ -e "$CURRENT" ]; then
+        # Detection is the EXEC-FREE incoming-version compare (#1985): tear
+        # down ONLY when $2 is a confirmed pre-#1964 version (below the layout
+        # floor) AND a hardened layout is present (versions/current). An
+        # upgrade or a hardened->hardened downgrade ($2 >= floor) — and an
+        # empty/unparsable $2 — leave the layout intact. Never exec the
+        # staged binary (the old probe tore the layout down on ANY exec
+        # failure of a hardened-but-unrunnable binary, #1985).
+        if incoming_predates_hardened_layout "$2" && \
+           { [ -L "$CURRENT" ] || [ -e "$CURRENT" ]; }; then
             echo "xpf: #1964 downgrade to a pre-hardened package — removing the" \
                  "versioned-runtime drop-in and repointing sbin back to staged." >&2
             # 1. repoint OWNED sbin links back to staged (atomic) so the
