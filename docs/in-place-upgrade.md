@@ -425,12 +425,20 @@ window for ALL FOUR managed binaries:
 - **`staged-gen/` is maintainer-script-managed runtime state** under
   `/var/lib/xpf` (a sibling of `versions/`), NEVER a dpkg payload file —
   so dpkg never writes or removes it on unpack. The postrm removes it on
-  `purge` and on a pre-#1964 downgrade (the old package never learns
-  about it).
+  `purge` and on a downgrade to ANY package below the #1981
+  staged-generation floor (`STAGED_GEN_FLOOR`, a SEPARATE, HIGHER floor
+  than the #1964 layout floor — so a post-#1964-but-pre-#1981 downgrade
+  still removes `staged-gen/` even though it keeps the #1964
+  versioned-runtime layout intact). The downgraded package never learns
+  about `staged-gen/`, so leaving it would leak permanently; the pre-B
+  cut reads live `staged/` as its only source, so removing `staged-gen/`
+  strips nothing it can use.
 - **GC retention N=2** (current + 1 prior — a superseded generation is
-  never read again, so keeping 3 is pure disk waste). GC protects
-  `current-gen` AND any genid an active/resumable journal references (the
-  GC-vs-resume race), and sweeps `.partial` orphans.
+  never read again, so keeping 3 is pure disk waste). GC keeps the newest
+  N generations (current-gen counts toward the window as the newest) PLUS,
+  ADDITIVELY, any genid an active/resumable journal references (the
+  GC-vs-resume race — a journal-pinned OLD generation never evicts an
+  in-window generation), and sweeps `.partial` orphans.
 - **Same-version replacement (B-P3b OPT1).** `versions/<ver>` carries a
   `.srcgen` stamp; the copy-skip is generation-aware. A same-version
   re-stage with NEW bytes (a new generation) RE-COPIES a stale, non-live

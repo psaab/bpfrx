@@ -297,6 +297,40 @@ func TestCut_SameVersionDifferentGenerationRefusesOnLive(t *testing.T) {
 	}
 }
 
+// TestCut_UnstampedLiveVersionDirRefusesAtInit pins Codex r6: a B-aware
+// same-version cut over an UNSTAMPED (pre-#1981) LIVE version dir must refuse
+// at INIT, pre-PREFLIGHT — NOT fall through to the copyStaged backstop (which
+// would write the journal + take a .dbsnap and then re-wedge on resume).
+func TestCut_UnstampedLiveVersionDirRefusesAtInit(t *testing.T) {
+	fs := newFakeSystem(t, "2.0.0")
+	r, cfg := testEnv(t, fs)
+	// 2.0.0 is the LIVE current with NO .srcgen stamp (a pre-#1981 layout).
+	seedInitialCurrent(t, r, cfg, "2.0.0")
+	// (seedInitialCurrent writes no .srcgen — the dir is unstamped.)
+
+	err := r.Run(Options{})
+	if err == nil {
+		t.Fatal("expected a pre-PREFLIGHT refusal over an unstamped live dir")
+	}
+	if !strings.Contains(err.Error(), "refuse-before-PREFLIGHT") ||
+		!strings.Contains(err.Error(), "cannot replace the live/rollback") {
+		t.Fatalf("error is not the pre-PREFLIGHT live-dir refusal: %v", err)
+	}
+	// No journal, no .dbsnap, no live mutation — so a re-run re-resolves rather
+	// than resuming a wedged journal (Codex r6).
+	if _, serr := os.Stat(cfg.JournalPath); !os.IsNotExist(serr) {
+		t.Errorf("journal written on the unstamped-live pre-PREFLIGHT refusal: %v", serr)
+	}
+	if matches, _ := filepath.Glob(filepath.Join(cfg.VersionsDir, ".*.dbsnap")); len(matches) != 0 {
+		t.Errorf(".dbsnap taken on the unstamped-live pre-PREFLIGHT refusal: %v", matches)
+	}
+	for _, c := range fs.calls {
+		if c == "stop" || c == "dropin" || c == "verify" {
+			t.Errorf("phase %q ran on the unstamped-live pre-PREFLIGHT refusal", c)
+		}
+	}
+}
+
 // TestCut_UnstampedStaleVersionDirIsReplaced pins Codex r5-#1: a pre-#1981
 // versions/<ver> with NO .srcgen that is STALE (non-live) must be
 // guarded-replaced from the pinned generation, NOT reused — else a pre-fix

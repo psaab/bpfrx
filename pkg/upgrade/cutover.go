@@ -342,19 +342,24 @@ func (r *Runner) Run(opts Options) (err error) {
 				"the daemon offline with no recovery target. Seed the versioned runtime "+
 				"(xpfd seed-runtime), then re-run the upgrade", stagedVer)
 		}
-		// REFUSE-AT-INIT (#1981 B-P3b OPT1, Codex r5-#2): a same-version cut
-		// whose target version dir already exists, is the LIVE current or the
-		// rollback target, and carries a DIFFERENT source generation than this
-		// cut's source cannot be safely replaced (RemoveAll-ing a live/rollback
-		// dir mid-cut violates #1967). Refuse HERE, pre-PREFLIGHT, so no journal
-		// is persisted and no .dbsnap is taken — a re-run then starts fresh and
-		// re-resolves the source rather than RESUMING a journal that re-refuses
-		// forever. Only fires when the existing dir is STAMPED with a different
-		// generation; an unstamped (pre-#1981) or same-generation dir is handled
-		// in copyStaged.
-		if srcGen != "" {
+		// REFUSE-AT-INIT (#1981 B-P3b OPT1, Codex r5-#2 / r6): a same-version cut
+		// whose target version dir already EXISTS, is the LIVE current or the
+		// rollback target, and does NOT match this cut's source generation
+		// cannot be safely replaced (RemoveAll-ing a live/rollback dir mid-cut
+		// violates #1967). Refuse HERE, pre-PREFLIGHT, so no journal is persisted
+		// and no .dbsnap is taken — a re-run then starts fresh and re-resolves
+		// the source rather than RESUMING a journal that re-refuses forever.
+		//
+		// "Does not match" covers BOTH a different stamp AND an ABSENT stamp (a
+		// pre-#1981 live dir) when this cut pins a generation (srcGen != "").
+		// The previous `existingGen != ""` exclusion left the absent-stamp live
+		// case to the copyStaged backstop, which runs AFTER PREFLIGHT/.dbsnap and
+		// thus re-wedged on resume (Codex r6). A legacy cut (srcGen == "") over
+		// an unstamped live dir matches (existingGen == "" == srcGen) and is a
+		// true resume — not refused.
+		if _, statErr := os.Stat(r.versionDir(stagedVer)); statErr == nil {
 			existingGen, gerr := r.readSrcGen(stagedVer)
-			if gerr == nil && existingGen != "" && existingGen != srcGen &&
+			if gerr == nil && existingGen != srcGen &&
 				(stagedVer == prev || stagedVer == r.mustReadCurrentVersion()) {
 				if cerr := r.clearJournal(); cerr != nil {
 					r.logf("upgrade: WARN clear stale journal on live-dir-replace refuse: %v", cerr)

@@ -6005,3 +6005,6 @@ top.
 - **Timestamp**: 2026-06-18
 - **Action**: Address Copilot review (6 findings): split %w-with-nil Stat errors (resolveSource + copyStaged); fail-safe refuse on unreadable `current` in copyStaged replacement; GC protected (journal) generations are now ADDITIVE (don't consume the retention window) — current-gen counts in the window; seed runs staged-gen GC after publish. Added GC-window test.
 - **File(s)**: pkg/upgrade/cutover.go, pkg/upgrade/stagedgen/stagedgen.go, pkg/upgrade/stagedgen/stagedgen_test.go, pkg/upgrade/runtime/seed.go
+- **Timestamp**: 2026-06-18
+- **Action**: Address Codex r6 (1 MAJOR + minors): INIT pre-PREFLIGHT refusal now covers the UNSTAMPED-live same-version case (existingGen != srcGen, gated on dir existence) so it no longer falls to the post-PREFLIGHT backstop and re-wedges; doc updated for the #1981 staged-gen floor + additive-GC; postrm-test.sh covers the staged-gen floor (purge + pre-#1981 downgrade removes, at-floor/empty keeps).
+- **File(s)**: pkg/upgrade/cutover.go, pkg/upgrade/stagedgen_cut_test.go, docs/in-place-upgrade.md, test/debian/postrm-test.sh
