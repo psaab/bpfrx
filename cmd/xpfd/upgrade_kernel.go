@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/upgrade"
+	"github.com/psaab/xpf/pkg/upgrade/lock"
 )
 
 // runUpgradeKernelSubcommand implements `xpfd upgrade kernel ...` — the LANE-1
@@ -47,6 +48,26 @@ func runUpgradeKernelSubcommand(args []string) {
 	unit := fs.String("unit", "xpfd", "systemd unit (cluster gRPC target)")
 	if err := fs.Parse(args[1:]); err != nil {
 		os.Exit(1)
+	}
+
+	// Serialize the MUTATING kernel sub-verbs (arm/promote/drain/rejoin)
+	// against every other host-local upgrade mutator via the host-wide
+	// upgrade lock (#1965). `status` is read-only and stays lock-free.
+	// Release on every return path; note that `arm` reboots on success and
+	// does not return — the reboot clears /run tmpfs so the lock is gone
+	// either way.
+	switch verb {
+	case "arm", "promote", "drain", "rejoin":
+		target := ""
+		if verb == "arm" && len(fs.Args()) == 1 {
+			target = fs.Args()[0]
+		}
+		h, lerr := lock.Acquire("upgrade kernel "+verb, target)
+		if lerr != nil {
+			fmt.Fprintf(os.Stderr, "upgrade kernel %s: %v\n", verb, lerr)
+			os.Exit(1)
+		}
+		defer func() { _ = h.Release() }()
 	}
 
 	cfg := upgrade.KernelConfig{
