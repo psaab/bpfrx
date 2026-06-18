@@ -116,13 +116,26 @@ migrate_legacy_layout() {
     # Nothing to snapshot if there is no old staged tree (a pristine box).
     [ -d "$STAGED" ] || return 0
 
-    # ALWAYS ensure sbin resolves through versions/current when current
-    # exists — a crash AFTER current was created but BEFORE sbin was
+    # ALWAYS ensure sbin resolves through versions/current when current is a
+    # valid SYMLINK — a crash AFTER current was created but BEFORE sbin was
     # repointed must complete the repoint on retry (else unpack overwrites
-    # staged/ under a daemon still pointed at the staged path). Gate ONLY
-    # the snapshot-copy on current's absence.
-    if [ -L "$CURRENT" ] || [ -e "$CURRENT" ]; then
+    # staged/ under a daemon still pointed at the staged path). Gate ONLY the
+    # snapshot-copy on current's absence.
+    #
+    # Require current to be a SYMLINK, not merely -e (Copilot): if $CURRENT is
+    # a regular file or directory (corruption / manual edit), repointing sbin
+    # to "$CURRENT/<bin>" would yield links that do not resolve and break the
+    # operator tools. This is best-effort migration, so a non-symlink at
+    # $CURRENT means "layout is not ours / is broken" — leave the legacy
+    # direct-staged links untouched (the cut's refuse-before-STOP guard still
+    # protects the daemon, and the Go seed has the matching non-dir guard).
+    if [ -L "$CURRENT" ]; then
         sbin_points_through_current || repoint_sbin_through_current
+        return 0
+    fi
+    if [ -e "$CURRENT" ]; then
+        echo "xpf: #1964 legacy migration: $CURRENT exists but is not a symlink" \
+             "(corrupt layout); leaving the legacy sbin links untouched." >&2
         return 0
     fi
 
