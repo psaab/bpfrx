@@ -5993,3 +5993,6 @@ top.
 - **Timestamp**: 2026-06-18
 - **Action**: Add #1981 cut-level regression tests (torn-source pin + counter-factual, no-source refusal, same-version recopy/refuse-on-live B-P3b, GC-vs-resume protection, aborted-unpack no-wedge, resume keeps pinned gen).
 - **File(s)**: pkg/upgrade/stagedgen_cut_test.go
+- **Timestamp**: 2026-06-18
+- **Action**: docs/in-place-upgrade.md — replace the dpkg-vs-operator caveat with the CLOSED-race contract (immutable versioned staging section: publish, pinned read, refuse-no-source, GC N=2, B-P3b OPT1, crash-safety, deferred-publish recovery, disk budget, one-time bootstrap caveat).
+- **File(s)**: docs/in-place-upgrade.md

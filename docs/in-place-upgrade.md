@@ -382,17 +382,94 @@ target. Read-only status (`xpfd upgrade kernel status`) stays lock-free.
 - **Lock ordering vs the `/tmp/xpf-cluster.lock` deploy lock (#1875):**
   the cluster/deploy lock is taken OUTSIDE, the host upgrade lock INSIDE.
   No deadlock — the two never nest in the opposite order.
-- **dpkg-vs-operator staged-source race:** `debian/xpf.preinst` runs
-  BEFORE unpack and `flock -n /run/xpf/upgrade.lock`-gates the package
-  operation, failing apt loudly (non-zero, system untouched) if an
-  operator upgrade already holds the lock. This is a fail-loud gate, not
-  full unpack serialization: a preinst fd dies at preinst exit, so the
-  lock is not held DURING dpkg's unpack. The torn-binary backstop is the
-  `verify-dataplane` kernel gate the cut runs against the COPIED binary
-  before `StopUnit`. The postinst standalone path re-checks the lock and,
-  on the narrow TOCTOU residual, drops `/run/xpf/upgrade-deferred`, logs
-  loudly, and exits 0 (a non-zero postinst leaves dpkg half-configured).
-  Operator guidance: do not run `xpfd upgrade` during `apt upgrade`.
+- **dpkg-vs-operator staged-source race — CLOSED by immutable versioned
+  staging (#1981 Option B).** The cut no longer reads the dpkg-owned
+  `staged/` path directly. `debian/xpf.preinst` still `flock`-gates the
+  package op (fail-loud if an operator cut already holds the lock), but
+  that was only a partial backstop — the preinst fd dies at preinst exit
+  so the lock is NOT held during dpkg's per-file unpack, and a cut
+  landing inside the unpack window could read a half-unpacked `staged/`
+  that mixes binaries from two dpkg generations. #1981 closes it by
+  construction; see "Immutable versioned staging" below.
+
+## Immutable versioned staging (#1981 Option B)
+
+dpkg unpacks the managed binaries into `staged/` one file at a time, so
+across an `apt upgrade` unpack window `staged/` holds a MIX of old and
+new binaries. A cut that copied directly from `staged/` could publish a
+`versions/<ver>` mixing two dpkg generations — a torn set whose
+`verify-dataplane` gate (xpfd+shim only) cannot detect a mismatched
+`xpf-userspace-dp` (a lockstep-cut dataplane binary). #1981 closes that
+window for ALL FOUR managed binaries:
+
+- **Publish after a complete unpack.** `postinst configure` (which runs
+  AFTER a complete unpack while the dpkg frontend lock serializes apt
+  transactions) runs `xpfd publish-generation`: it copies the staged set
+  into an immutable `staged-gen/<genid>/` (via `.partial` + atomic rename
+  + dir-fsync) and atomically repoints a `staged-gen/current-gen` symlink
+  (temp-symlink + rename, never `ln -sf`). `<genid>` is a monotonic
+  nanosecond timestamp + random suffix, so a same-version reinstall gets
+  a distinct generation.
+- **The cut reads the PINNED generation, never live `staged/`.** `Run`
+  resolves `current-gen` ONCE at INIT and records the genid in
+  `Journal.SourceGeneration`; `copyStaged` copies from
+  `staged-gen/<SourceGeneration>/` — the resolved DIRECTORY, never
+  re-reading the symlink — so a concurrent publish that advances
+  `current-gen` cannot redirect an in-flight cut. The source is a
+  generation dpkg is NOT touching, so it is internally a single
+  generation by construction.
+- **No published generation ⇒ refuse pre-PREFLIGHT.** A fresh cut with
+  `current-gen` absent refuses at INIT with NO journal written and NO DB
+  snapshot taken (the daemon is untouched). It never reads a torn
+  `staged/`.
+- **`staged-gen/` is maintainer-script-managed runtime state** under
+  `/var/lib/xpf` (a sibling of `versions/`), NEVER a dpkg payload file —
+  so dpkg never writes or removes it on unpack. The postrm removes it on
+  `purge` and on a pre-#1964 downgrade (the old package never learns
+  about it).
+- **GC retention N=2** (current + 1 prior — a superseded generation is
+  never read again, so keeping 3 is pure disk waste). GC protects
+  `current-gen` AND any genid an active/resumable journal references (the
+  GC-vs-resume race), and sweeps `.partial` orphans.
+- **Same-version replacement (B-P3b OPT1).** `versions/<ver>` carries a
+  `.srcgen` stamp; the copy-skip is generation-aware. A same-version
+  re-stage with NEW bytes (a new generation) RE-COPIES a stale, non-live
+  `versions/<ver>` (reusing the proven guarded-delete), or REFUSES
+  pre-PREFLIGHT if `versions/<ver>` is the live `current`/rollback target
+  (cannot safely mutate a live version dir mid-cut). Recovery on a
+  refusal: re-stage under a distinct version tag, or `dpkg-reconfigure
+  xpf` to realign the generation.
+- **Crash-safety.** A crash before the `staged-gen/<genid>` rename leaves
+  a `.partial` (pre-swept on the next publish); a crash after the dir
+  rename but before the `current-gen` repoint leaves a
+  complete-but-unreferenced generation (the PRIOR `current-gen` stays
+  valid; a re-publish is idempotent). An aborted/failed unpack publishes
+  NO new generation, so the prior generation stays the cut source — there
+  is NO permanent-wedge class.
+- **Deferred-publish recovery.** If the publish defers because the
+  host-wide upgrade lock is busy (another upgrade in progress), the
+  postinst drops `/run/xpf/upgrade-deferred`, skips the cut, and the
+  operator recovers with `xpfd publish-generation && xpfd upgrade`
+  (`dpkg-reconfigure xpf` is equivalent). A bare `xpfd upgrade` alone
+  would re-read the OLD `current-gen` and no-op, so the recovery MUST
+  publish first.
+- **Disk budget.** Each binary set is ~50-70 MB (dominated by `xpfd`
+  embedding the kernel-verified shim + `xpf-userspace-dp`). Steady-state
+  copies: `staged/` (1) + `staged-gen/` current+1 (2) + `versions/`
+  current+N=3 (4) ≈ **7 copies ≈ 350-490 MB**. A constrained appliance
+  `/var` MUST size for this; the publish's own GC + the `versions/` GC
+  bound it.
+- **One-time first-deploy bootstrap caveat (intrinsic).** #1981 only
+  protects cuts performed by a B-aware `xpfd`. During the very upgrade
+  that INSTALLS the first B-aware binary, the operator-visible
+  `xpfd upgrade` is still the OLD (pre-B) binary, which reads live
+  `staged/` — the fix cannot run before it is installed. That single hop
+  is covered by the existing backstops (the #1965 preinst lock gate +
+  the `verify-dataplane` gate against the copied xpfd + "do not run
+  `xpfd upgrade` during `apt upgrade`"). From the first B-aware version
+  onward the window is closed by construction. This is a documented,
+  bounded, one-time exposure, NOT a residual hole in the steady-state
+  guarantee.
 
 ## Peer-takeover-readiness is best-effort; DrainComplete is authoritative
 
