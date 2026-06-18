@@ -21,10 +21,14 @@
 # repoint sbin back to staged atomically, DELETE versions/current, and
 # boot-guarded daemon-reload.
 #
-# NOTE (plan §4): drop-in removal on remove/purge is deferred to #1967
-# (which also adds it to postrm). This change adds drop-in removal ONLY in
-# the downgrade path, where it is required for correctness, and is written
-# so #1967 can extend remove/purge without conflicting.
+# REMOVE/PURGE drop-in cleanup (#1967): on remove/purge the runtime unit
+# drop-in /etc/systemd/system/xpfd.service.d/10-xpf-version.conf (written by
+# writeUnitDropin, flip.go) must be removed too — otherwise systemd keeps a
+# unit drop-in whose ExecStart pins a now-deleted versions/<ver>/xpfd path,
+# leaving a broken unit referencing a removed binary. We also rmdir the
+# (now-empty) .service.d dir and boot-guard a daemon-reload so systemd drops
+# the removed drop-in. (The downgrade path below already does this for its
+# own correctness; #1967 extends it to remove/purge.)
 
 set -e
 
@@ -70,6 +74,23 @@ remove_owned_sbin_links() {
     done
 }
 
+# remove_runtime_dropin removes the #1964 versioned-runtime unit drop-in and
+# the now-empty .service.d dir, then boot-guarded daemon-reloads so systemd
+# drops the removed drop-in. Shared by the remove/purge and downgrade paths
+# (#1967). All steps are best-effort / idempotent (safe if absent).
+remove_runtime_dropin() {
+    rm -f "$DROPIN"
+    # rmdir the .d dir if it is now empty (best-effort — leave it if other
+    # drop-ins live there).
+    rmdir "$(dirname "$DROPIN")" 2>/dev/null || true
+    # Boot-guard the daemon-reload: in a non-booted env (docker/chroot/bake)
+    # systemctl exits non-zero and, under set -e, would fail the maintainer
+    # script — guard on /run/systemd/system.
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+}
+
 # repoint_owned_sbin_to_staged points each OWNED sbin link back at staged/
 # (atomic). It SKIPS a foreign/operator-repointed link (Codex) — a downgrade
 # must not clobber an operator's custom target.
@@ -87,6 +108,10 @@ repoint_owned_sbin_to_staged() {
 case "$1" in
     remove|purge)
         remove_owned_sbin_links
+        # Remove the versioned-runtime unit drop-in too (#1967): an orphaned
+        # drop-in pins ExecStart to a deleted versions/<ver>/xpfd path and
+        # leaves a broken unit. Safe if absent (legacy/never-seeded hosts).
+        remove_runtime_dropin
         if [ "$1" = "purge" ]; then
             # versions/ is package-derived (copied binaries), not operator
             # config — remove the whole tree on purge.
@@ -112,30 +137,20 @@ case "$1" in
         elif [ -L "$CURRENT" ] || [ -e "$CURRENT" ]; then
             echo "xpf: #1964 downgrade to a pre-hardened package — removing the" \
                  "versioned-runtime drop-in and repointing sbin back to staged." >&2
-            # 1. remove the runtime unit drop-in (else systemd keeps the
-            #    concrete newer-version ExecStart).
-            rm -f "$DROPIN"
-            # rmdir the .d dir if it is now empty (best-effort). Derive it
-            # from $DROPIN (Copilot) so it tracks the single drop-in path
-            # definition and the test harness's $DROPIN rewrite, with no
-            # hard-coded path drift.
-            rmdir "$(dirname "$DROPIN")" 2>/dev/null || true
-            # 2. repoint OWNED sbin links back to staged (atomic) so the
+            # 1. repoint OWNED sbin links back to staged (atomic) so the
             #    daemon resolves the downgraded binaries — skipping any
             #    foreign/operator-repointed link (Codex).
             repoint_owned_sbin_to_staged
-            # 3. delete versions/current — else a later re-upgrade sees
+            # 2. delete versions/current — else a later re-upgrade sees
             #    current present, skips the legacy-migration snapshot, and
             #    repoints sbin to a stale version dir (AGY-r4-1). Leave the
             #    versions/<ver> dirs (harmless; a reinstall's GC reaps them).
             rm -f "$CURRENT"
-            # 4. boot-guarded daemon-reload so systemd drops the removed
-            #    drop-in. In a non-booted env (docker/chroot/bake)
-            #    systemctl exits non-zero and, under set -e, would fail the
-            #    postrm — guard it.
-            if [ -d /run/systemd/system ]; then
-                systemctl daemon-reload 2>/dev/null || true
-            fi
+            # 3. remove the runtime unit drop-in + empty .service.d dir, then
+            #    boot-guarded daemon-reload (shared helper, #1967). Done LAST
+            #    so the reload reflects the repointed sbin + removed drop-in
+            #    together.
+            remove_runtime_dropin
         fi
         ;;
     failed-upgrade|abort-install|abort-upgrade|disappear)

@@ -5896,3 +5896,48 @@ top.
 - **Edit**: debian/xpf.postrm — downgrade rmdir uses `dirname "$DROPIN"` (was hard-coded /etc/systemd/system/xpfd.service.d) — single source of truth, no path drift.
 - **Edit**: test/debian/preinst-migrate-test.sh — current_is_regular_file + current_is_dir scenarios; postrm-test.sh — assert empty .d dir removed + drop obsolete sed special-case.
 - **Validation**: go build + upgrade tests green; all 3 shell harnesses 3x under sh+dash; sh -n/dash -n/shellcheck clean on all 3 scripts.
+
+## 2026-06-17 — #1967 cutover robustness (engineer/1967-cutover-robustness)
+- **Timestamp**: 2026-06-17
+- **Action**: Implement the genuinely-remaining #1967 hardening annex items (flip-failure rollback + version-validation helper + postrm downgrade-path drop-in already shipped in #1964/#1965 — SKIPPED).
+- **Edit**: pkg/upgrade/system_linux.go — C1: BinaryVersion validates the extracted `xpfd <ver>` token via ValidateVersionSegment and hard-fails an unsafe token OR an unrecognized output format. REMOVED the raw-trimmed-output fallback (a corrupt binary / format-drift can no longer key versions/ by garbage).
+- **Edit**: pkg/upgrade/cutover.go — verify-fail cleanup: cleanupFailedVerifyCopy removes versions/<TargetVersion> on a VERIFY failure with two guards (never delete current/PreviousVersion; rewind journal to StateStaged + persist so a same-version retry re-snapshots + recopies; corrected from StatePreflight in the Codex r1 round, persist-before-snapshot-remove in r2). C3 diagnostic: pre-START stat of versions/<ver>/{xpfd,xpf-userspace-dp}; a vanished dir fails fast through the existing START-failure auto-rollback with a clear cause.
+- **Edit**: pkg/upgrade/runner.go — C4: removeAllPartials fsyncs VersionsDir after sweeping any .partial (gated on a real removal) via partialSweepSyncDir seam.
+- **Edit**: debian/xpf.postrm — remove/purge now also remove the runtime unit drop-in (10-xpf-version.conf) + rmdir empty .service.d + boot-guarded daemon-reload (shared remove_runtime_dropin helper; downgrade path refactored to reuse it). Header comment updated (#1967 no longer deferred).
+- **Write**: pkg/upgrade/system_linux_test.go — BinaryVersion accepts real Debian/semver shapes, rejects unsafe tokens + garbage formats + exec failure (no raw-output leak).
+- **Write**: pkg/upgrade/verify_cleanup_test.go — verify-fail recopies on retry; never deletes active or PreviousVersion dir + resets journal; C3 pre-start-missing rolls back to previous; C4 fsync fires after sweep (and NOT on the no-partials path).
+- **Edit**: test/debian/postrm-test.sh — remove/purge drop-in removal asserted; non-empty .service.d (foreign drop-in) preserved; legacy/never-seeded no-drop-in no-op.
+- **Edit**: docs/in-place-upgrade.md — document C1/C3/C4 + verify-fail cleanup + remove/purge drop-in removal.
+- **Validation**: go build ./... clean; go vet ./pkg/upgrade/... clean; full Go suite no failures; new tests 5x no flake; postrm-test.sh green under sh + dash; sh -n + dash -n clean on debian/xpf.postrm. Baked-image dogfood not runnable here (noted in PR).
+
+## 2026-06-17 — #1967 PR #1974 review round 1 (Codex)
+- **Codex r1 NEEDS-CHANGES (3 findings, all addressed)**:
+  - High (verify-fail rewind preserved DBSnapshotPath): cutover.go cleanupFailedVerifyCopy now rewinds to StateStaged (below PREFLIGHT), clears DBSnapshotPath+AdvancedStateFloor, and removes the stale snapshot — so a same-version retry re-snapshots the (possibly operator-changed) live DB. Prevents a later rollback restoring a stale pre-failure snapshot.
+  - High (stale-FLIPPED resume bypassed C3 + returned on StartUnit error without rollback): extracted versionDirComplete() helper; the resume-vs-fresh "finish stale half-cut" branch now stats the target dir + routes a StartUnit/health/missing-dir failure through its existing auto-rollback (was a bare return that could strand the unit).
+  - Medium (seed.go stagedVersion kept the raw-output fallback): now hard-fails an unrecognized format (C1 parity with realSystem.BinaryVersion); caller already validates via ValidateVersionSegment.
+- **Tests added**: TestStaleHalfCut_VanishedDirRollsBack; TestStagedVersion_RejectsGarbageFormat; verify-fail recopy test asserts rewind < PREFLIGHT + snapshot fields cleared.
+- **Validation**: go build/vet clean; full Go suite no failures; new tests 5x no flake.
+
+## 2026-06-17 — #1967 PR #1974 review round 1 (AGY)
+- **AGY r1 NEEDS-MINOR (2 findings)**:
+  - Low (test-only): system_linux_test.go shellEscape doubled `%` -> `%%` for the printf VALUE arg (format is the fixed first arg, so the value is literal). Removed the `%` replacement; added a `%`-in-metadata valid case.
+  - Low: seed.go stagedVersion raw-output fallback — ALREADY fixed in the Codex r1 fix commit (AGY reviewed pre-fix code).
+- AGY independently confirmed: verify-fail crash-interleaving converges safely; C1 Debian/semver parity; C4 gating; postrm boot-guard + foreign-dropin protection + downgrade refactor ordering; C3 no new HA failure mode.
+
+## 2026-06-17 — #1967 PR #1974 review round 2
+- **AGY r2 MERGE-READY** — confirmed verify-fail crash-interleaving convergence, stale-half-cut HA rollback correctness, seed parity, postrm safety. The 2 r1 findings (shellEscape %, seed parity) verified fixed.
+- **Codex r2 NEEDS-CHANGES (2 findings, addressed)**:
+  - cleanupFailedVerifyCopy removed j.DBSnapshotPath BEFORE persisting the rewound journal — a crash in between leaves the persisted journal at StateCopied/AdvancedStateFloor=true pointing at a removed snapshot. FIX: persist the cleared/rewound journal FIRST, then remove the orphan snapshot (so the on-disk journal never references a deleted snapshot).
+  - DBSnapshotPath used as an os.RemoveAll target unvalidated. FIX: derive the path from the validated TargetVersion (filepath.Join(VersionsDir, "."+ver+".dbsnap")), matching what preflight wrote.
+  - Nit: _Log.md said StatePreflight (now StateStaged) — corrected.
+- **Test**: verify-fail recopy test now asserts the orphan .dbsnap dotfile is removed + persisted journal fields cleared (persist-before-remove ordering).
+- Codex r2 also re-verified C1/C4/postrm/stale-half-cut as correct.
+
+## 2026-06-17 — #1967 PR #1974 review round 3
+- **AGY r3 MERGE-READY** — confirmed persist-before-remove ordering correct, no regression.
+- **Codex r3 NEEDS-CHANGES (1 finding, fixed)**: cleanupFailedVerifyCopy still removed the orphan snapshot even when saveJournal FAILED — leaving the persisted (StateCopied/DBSnapshotPath-set) journal referencing a deleted snapshot. FIX: on saveJournal error, log + RETURN before removing the snapshot (leave it; next-run cleanup + gc orphan-sweep handle it). Codex confirmed path-derivation + TargetVersion validation correct.
+- **Test**: TestVerifyFailCleanup_SaveJournalFailureKeepsSnapshot (read-only journal dir forces saveJournal failure; asserts the snapshot survives).
+
+## 2026-06-17 — #1967 PR #1974 review round 4
+- **Codex r4 NEEDS-CHANGES (TEST-only, prod code confirmed correct)**: TestVerifyFailCleanup_SaveJournalFailureKeepsSnapshot chmod'd VersionsDir read-only, but JournalPath lived UNDER VersionsDir (testEnv), so it blocked BOTH the version-dir removal AND the snapshot removal — the old buggy code would have "passed" for the wrong reason (not a true regression test). FIX: build a custom Runner with JournalPath in a SEPARATE dir; chmod ONLY the journal dir read-only, leaving VersionsDir writable. Now the version dir IS removed (unlink branch proven), saveJournal fails, and the snapshot survives. Codex confirmed the production fix (return-before-snapshot-remove) closes the window by inspection.
+- Also rebased onto origin/master (PR #1973 #1964 follow-up merged): resolved append-only _Log.md + the postrm downgrade-branch conflict (my shared remove_runtime_dropin helper subsumes #1973's rmdir-dirname change).

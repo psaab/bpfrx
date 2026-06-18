@@ -299,3 +299,40 @@ func TestSeed_RejectsUnsafeVersion(t *testing.T) {
 		}
 	}
 }
+
+// TestStagedVersion_RejectsGarbageFormat proves stagedVersion (the seed-side
+// reader) hard-fails an unrecognized `xpfd version` output instead of
+// returning the raw trimmed string — #1967 C1 parity with
+// realSystem.BinaryVersion, so a corrupt binary cannot seed versions/<token>
+// by a wrong-shaped string.
+func TestStagedVersion_RejectsGarbageFormat(t *testing.T) {
+	mkStaged := func(out string) string {
+		dir := t.TempDir()
+		script := "#!/bin/sh\nprintf '%s' \"" + out + "\"\nexit 0\n"
+		if err := os.WriteFile(filepath.Join(dir, "xpfd"), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+
+	// Valid shape: token returned as-is.
+	if got, err := stagedVersion(mkStaged("xpfd 1.2.3 (commit x)")); err != nil || got != "1.2.3" {
+		t.Errorf("stagedVersion(valid) = %q, %v; want 1.2.3, nil", got, err)
+	}
+
+	// Garbage formats: hard-fail, never return the raw output.
+	for _, out := range []string{
+		"totally unexpected output",
+		"xpfd", // only one field
+		"some random text without the xpfd prefix",
+		"",
+	} {
+		got, err := stagedVersion(mkStaged(out))
+		if err == nil {
+			t.Errorf("stagedVersion(%q) = %q, want error (unrecognized format)", out, got)
+		}
+		if got != "" {
+			t.Errorf("stagedVersion(%q) leaked %q on error", out, got)
+		}
+	}
+}
