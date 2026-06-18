@@ -36,6 +36,7 @@ func runPublishGenerationSubcommand(args []string) {
 	fs := flag.NewFlagSet("publish-generation", flag.ContinueOnError)
 	stagedDir := fs.String("staged-dir", upgrade.DefaultStagedDir, "dpkg-staged binary set dir")
 	stagedGenDir := fs.String("staged-gen-dir", upgrade.DefaultStagedGenDir, "staged-generation root")
+	journalPath := fs.String("journal", upgrade.DefaultJournalPath, "upgrade journal path (its pinned generation is protected from GC)")
 	if err := fs.Parse(args); err != nil {
 		os.Exit(1)
 	}
@@ -67,10 +68,21 @@ func runPublishGenerationSubcommand(args []string) {
 		fmt.Fprintf(os.Stderr, "publish-generation: %v\n", err)
 		os.Exit(1)
 	}
-	// GC the staged-generation root (current + 1 prior). No active cut runs
-	// concurrently (we hold the lock), so no generation needs journal
-	// protection here; the cut's own GC protects its in-flight source.
-	if gcErr := cfg.GC(nil); gcErr != nil {
+	// GC the staged-generation root (current + 1 prior), PROTECTING any
+	// generation a crashed/resumable cut's journal still pins. The host-wide
+	// lock serializes us against a RUNNING cut, but a CRASHED cut leaves a
+	// durable journal with the lock released — so the GC must read the journal
+	// and protect its SourceGeneration, else a resume hard-fails on a GC'd
+	// source (and a crash-after-STOP would be left daemon-down with no
+	// recoverable cut). Best-effort: a journal read error does not block the
+	// publish (the cut's own GC also protects its source).
+	protected := map[string]bool{}
+	if pinned, jerr := upgrade.ReadJournalSourceGeneration(*journalPath); jerr != nil {
+		fmt.Fprintf(os.Stderr, "publish-generation: WARN read journal for GC protection: %v\n", jerr)
+	} else if pinned != "" {
+		protected[pinned] = true
+	}
+	if gcErr := cfg.GC(protected); gcErr != nil {
 		fmt.Fprintf(os.Stderr, "publish-generation: WARN gc: %v\n", gcErr)
 	}
 	fmt.Printf("publish-generation complete (generation %s)\n", genid)

@@ -211,6 +211,21 @@ func (r *Runner) Run(opts Options) (err error) {
 		return srcErr
 	}
 
+	// Re-pin a pre-#1981 legacy resume that has NOT yet copied (Codex r5-#4):
+	// a journal at STAGED/PREFLIGHT with an empty SourceGeneration was written
+	// by an old (pre-B) binary. If a generation is now published, adopt it as
+	// the pinned source (and persist) so copyStaged reads the pinned generation
+	// rather than falling back to live staged/. A State >= COPIED legacy
+	// journal already copied from live staged/, so it keeps the legacy source
+	// (its bytes are already on disk); only the not-yet-copied case is re-pinned.
+	if srcGen != "" && j.SourceGeneration == "" && j.State.atLeast(StateStaged) && !j.State.atLeast(StateCopied) {
+		r.logf("upgrade: re-pinning a pre-#1981 resume (state %s) to published generation %s", j.State, srcGen)
+		j.SourceGeneration = srcGen
+		if serr := r.saveJournal(j); serr != nil {
+			return fmt.Errorf("persist re-pinned source generation: %w", serr)
+		}
+	}
+
 	// Identify the staged version from the RESOLVED source (the pinned
 	// generation, never live staged/). It keys versions/<ver> et al. on a
 	// fresh cut, so validate it as a safe single path segment BEFORE any path
@@ -323,6 +338,29 @@ func (r *Runner) Run(opts Options) (err error) {
 				"first cut; refusing the %s cut because a flip/start failure would leave "+
 				"the daemon offline with no recovery target. Seed the versioned runtime "+
 				"(xpfd seed-runtime), then re-run the upgrade", stagedVer)
+		}
+		// REFUSE-AT-INIT (#1981 B-P3b OPT1, Codex r5-#2): a same-version cut
+		// whose target version dir already exists, is the LIVE current or the
+		// rollback target, and carries a DIFFERENT source generation than this
+		// cut's source cannot be safely replaced (RemoveAll-ing a live/rollback
+		// dir mid-cut violates #1967). Refuse HERE, pre-PREFLIGHT, so no journal
+		// is persisted and no .dbsnap is taken — a re-run then starts fresh and
+		// re-resolves the source rather than RESUMING a journal that re-refuses
+		// forever. Only fires when the existing dir is STAMPED with a different
+		// generation; an unstamped (pre-#1981) or same-generation dir is handled
+		// in copyStaged.
+		if srcGen != "" {
+			existingGen, gerr := r.readSrcGen(stagedVer)
+			if gerr == nil && existingGen != "" && existingGen != srcGen &&
+				(stagedVer == prev || stagedVer == r.mustReadCurrentVersion()) {
+				if cerr := r.clearJournal(); cerr != nil {
+					r.logf("upgrade: WARN clear stale journal on live-dir-replace refuse: %v", cerr)
+				}
+				return fmt.Errorf("refuse-before-PREFLIGHT: cannot replace the live/rollback "+
+					"version dir %s (its bytes come from source generation %q but this cut pins "+
+					"%q); re-stage under a DISTINCT version tag, or `dpkg-reconfigure xpf` to "+
+					"realign the generation", r.versionDir(stagedVer), existingGen, srcGen)
+			}
 		}
 		j.TargetVersion = stagedVer
 		j.PreviousVersion = prev
@@ -553,7 +591,10 @@ func (r *Runner) preflight(j *Journal) error {
 	}
 	r.removeAllPartials()
 
-	stagedSize, err := dirSize(r.cfg.StagedDir)
+	// Size the ACTUAL copy source (the pinned generation, #1981), not live
+	// staged/ — the cut copies the pinned generation into versions/<ver>
+	// (Codex r5-#4b).
+	stagedSize, err := dirSize(r.sourceDir(j))
 	if err != nil {
 		return fmt.Errorf("size staged: %w", err)
 	}
@@ -624,16 +665,34 @@ func (r *Runner) preflight(j *Journal) error {
 // documented pre-B legacy/bootstrap fallback (copy from live staged/).
 //
 // Same-version destination identity + SAFE replacement (B-P3b OPT1): the
-// version-keyed skip is GENERATION-AWARE. An existing versions/<ver> whose
-// .srcgen matches this cut's SourceGeneration is a true resume — skip the copy.
-// An existing versions/<ver> from a DIFFERENT generation (a same-version
-// re-stage with new bytes) must be REPLACED: if it is the live `current` or
-// the rollback (`PreviousVersion`) target, REFUSE (cannot safely mutate a live
-// version dir mid-cut, #1967); otherwise it is a stale non-live dir and is
-// safe to RemoveAll + recopy via the proven guarded-delete in
-// cleanupFailedVerifyCopy. A pre-#1981 versions/<ver> has no .srcgen at all; we
-// treat an absent stamp as a true resume of the legacy copy (do not destroy a
-// live dir on a layout that predates the stamp).
+// version-keyed skip is GENERATION-AWARE.
+//
+//   - An existing versions/<ver> whose .srcgen MATCHES this cut's source
+//     generation (or both are empty on the legacy same-cut resume) is a true
+//     resume — skip the copy.
+//   - Otherwise the existing dir's bytes may NOT match this cut's source —
+//     whether it carries a different .srcgen stamp OR no stamp at all (a stale
+//     pre-#1981 dir, or a legacy cut over a now-stamped dir). It must be
+//     REPLACED. If it is the live `current` or rollback (PreviousVersion)
+//     target, REFUSE (cannot safely RemoveAll a live version dir mid-cut,
+//     #1967) — though the primary refusal for a stamped-different live dir is
+//     pre-PREFLIGHT at INIT; this is the backstop for a resume and for the
+//     unstamped-live case. Otherwise it is a stale non-live dir and is safe to
+//     RemoveAll + recopy via the proven guarded-delete shape (Codex r5-#1: an
+//     unstamped STALE dir must be replaced, NOT reused — a pre-fix torn
+//     versions/<ver> must not be committed under a fresh generation).
+//
+// sourceDir returns the directory the cut copies FROM for journal j: the
+// pinned staged-gen/<SourceGeneration>/ (#1981 Option B) or, on the pre-B
+// legacy path (empty SourceGeneration), live staged/. It does NOT validate
+// existence; copyStaged stats it.
+func (r *Runner) sourceDir(j *Journal) string {
+	if j.SourceGeneration != "" {
+		return r.stagedGenConfig().GenDir(j.SourceGeneration)
+	}
+	return r.cfg.StagedDir
+}
+
 func (r *Runner) copyStaged(j *Journal) error {
 	ver := j.TargetVersion
 	dst := r.versionDir(ver)
@@ -658,35 +717,28 @@ func (r *Runner) copyStaged(j *Journal) error {
 		if gerr != nil {
 			return fmt.Errorf("read source-generation stamp of %s: %w", dst, gerr)
 		}
-		switch {
-		case existingGen == j.SourceGeneration:
+		if existingGen == j.SourceGeneration {
 			// True resume (same generation, or both empty on the legacy path):
 			// the copy already landed; skip.
 			r.logf("upgrade: version dir %s already present (same source generation); skipping copy", dst)
 			return nil
-		case existingGen == "":
-			// A pre-#1981 version dir with no stamp. Treat as a legacy resume —
-			// do NOT destroy what may be a live dir on a layout predating the
-			// stamp. Skip the copy; verify still gates the bytes.
-			r.logf("upgrade: version dir %s present without a source-generation stamp "+
-				"(pre-#1981 layout); skipping copy", dst)
-			return nil
-		default:
-			// A same-version re-stage with DIFFERENT bytes (generation differs).
-			// Replace it ONLY if it is a stale, non-live dir; otherwise refuse.
-			cur, _ := r.readCurrentVersion()
-			if ver == cur || ver == j.PreviousVersion {
-				return fmt.Errorf("refuse-before-PREFLIGHT: cannot replace the live/rollback "+
-					"version dir %s (its bytes come from source generation %q but this cut pins "+
-					"%q); re-stage under a DISTINCT version tag, or `dpkg-reconfigure xpf` to "+
-					"realign the generation", dst, existingGen, j.SourceGeneration)
-			}
-			// Stale non-live: reuse the proven guarded delete, then recopy.
-			r.logf("upgrade: replacing stale version dir %s (source generation %q -> %q)",
-				dst, existingGen, j.SourceGeneration)
-			if rerr := r.removeStaleVersionDir(ver); rerr != nil {
-				return rerr
-			}
+		}
+		// The existing dir does NOT match this cut's source (different stamp, or
+		// an unstamped pre-#1981 dir vs a stamped cut, or vice-versa). Replace
+		// it — unless it is live/rollback, in which case refuse (backstop; the
+		// stamped-different live case is already refused at INIT).
+		cur, _ := r.readCurrentVersion()
+		if ver == cur || ver == j.PreviousVersion {
+			return fmt.Errorf("refuse: cannot replace the live/rollback version dir %s "+
+				"(its bytes come from source generation %q but this cut pins %q); re-stage "+
+				"under a DISTINCT version tag, or `dpkg-reconfigure xpf` to realign the "+
+				"generation", dst, existingGen, j.SourceGeneration)
+		}
+		// Stale non-live: reuse the proven guarded delete, then recopy.
+		r.logf("upgrade: replacing stale version dir %s (source generation %q -> %q)",
+			dst, existingGen, j.SourceGeneration)
+		if rerr := r.removeStaleVersionDir(ver); rerr != nil {
+			return rerr
 		}
 	}
 

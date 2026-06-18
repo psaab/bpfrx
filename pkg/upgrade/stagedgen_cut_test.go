@@ -149,6 +149,34 @@ func TestCut_SupersededByNewVersionGenerationStartsFresh(t *testing.T) {
 	}
 }
 
+// TestReadJournalSourceGeneration pins the GC-protection seam the
+// publish-generation verb uses (Codex r5-#3): the verb reads the on-disk
+// journal's pinned generation so its GC does not reap a crashed/resumable
+// cut's source.
+func TestReadJournalSourceGeneration(t *testing.T) {
+	fs := newFakeSystem(t, "2.0.0")
+	r, cfg := testEnv(t, fs)
+
+	// Absent journal -> "".
+	if g, err := ReadJournalSourceGeneration(cfg.JournalPath); err != nil || g != "" {
+		t.Fatalf("absent journal: got (%q,%v), want (\"\",nil)", g, err)
+	}
+	// A journal pinning g0 -> g0.
+	if err := r.saveJournal(&Journal{TargetVersion: "2.0.0", State: StateCopied, SourceGeneration: "g0-deadbeef"}); err != nil {
+		t.Fatal(err)
+	}
+	if g, err := ReadJournalSourceGeneration(cfg.JournalPath); err != nil || g != "g0-deadbeef" {
+		t.Fatalf("pinned journal: got (%q,%v), want (g0-deadbeef,nil)", g, err)
+	}
+	// A legacy journal with no pin -> "".
+	if err := r.saveJournal(&Journal{TargetVersion: "2.0.0", State: StateCopied}); err != nil {
+		t.Fatal(err)
+	}
+	if g, err := ReadJournalSourceGeneration(cfg.JournalPath); err != nil || g != "" {
+		t.Fatalf("legacy journal: got (%q,%v), want (\"\",nil)", g, err)
+	}
+}
+
 // TestCut_NoSourceGenerationRefusesAtInit pins plan §7.2: a fresh cut with NO
 // published generation refuses at INIT — no journal written, no DB snapshot
 // taken, daemon untouched.
@@ -253,11 +281,94 @@ func TestCut_SameVersionDifferentGenerationRefusesOnLive(t *testing.T) {
 	if !strings.Contains(err.Error(), "cannot replace the live/rollback version dir") {
 		t.Fatalf("error is not the live-dir replacement refusal: %v", err)
 	}
-	// No live mutation (pure pre-PREFLIGHT refusal).
+	// The refusal is pre-PREFLIGHT (Codex r5-#2): no journal, no .dbsnap, no
+	// live mutation — a re-run then re-resolves rather than resuming a journal
+	// that would re-refuse forever.
+	if _, serr := os.Stat(cfg.JournalPath); !os.IsNotExist(serr) {
+		t.Errorf("journal written on a pre-PREFLIGHT live-dir refusal: %v", serr)
+	}
+	if matches, _ := filepath.Glob(filepath.Join(cfg.VersionsDir, ".*.dbsnap")); len(matches) != 0 {
+		t.Errorf(".dbsnap taken on a pre-PREFLIGHT live-dir refusal: %v", matches)
+	}
 	for _, c := range fs.calls {
-		if c == "stop" || c == "dropin" {
-			t.Errorf("live mutation %q on a live-dir replacement refusal", c)
+		if c == "stop" || c == "dropin" || c == "verify" {
+			t.Errorf("phase %q ran on a pre-PREFLIGHT live-dir refusal", c)
 		}
+	}
+}
+
+// TestCut_UnstampedStaleVersionDirIsReplaced pins Codex r5-#1: a pre-#1981
+// versions/<ver> with NO .srcgen that is STALE (non-live) must be
+// guarded-replaced from the pinned generation, NOT reused — else a pre-fix
+// torn copy could be committed under a fresh generation.
+func TestCut_UnstampedStaleVersionDirIsReplaced(t *testing.T) {
+	fs := newFakeSystem(t, "2.0.0")
+	r, cfg := testEnv(t, fs)
+	seedInitialCurrent(t, r, cfg, "1.0.0") // 1.0.0 is live; 2.0.0 is stale.
+
+	// A STALE, UNSTAMPED versions/2.0.0 (a pre-#1981 torn/abandoned copy).
+	staleDir := filepath.Join(cfg.VersionsDir, "2.0.0")
+	if err := os.MkdirAll(staleDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range managedBins {
+		if err := os.WriteFile(filepath.Join(staleDir, b), []byte("STALE-pre1981-"+b), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// No .srcgen stamp (pre-#1981 layout).
+
+	if err := r.Run(Options{}); err != nil {
+		t.Fatalf("cut: %v", err)
+	}
+	// The committed dir must hold the FRESH published bytes (recopied), not the
+	// stale unstamped bytes.
+	got, err := os.ReadFile(filepath.Join(cfg.VersionsDir, "2.0.0", "xpfd"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "binary-xpfd-2.0.0" {
+		t.Fatalf("cut REUSED a stale unstamped version dir: %q (want fresh recopy)", got)
+	}
+	// And it now carries the .srcgen stamp.
+	if _, serr := os.Stat(filepath.Join(cfg.VersionsDir, "2.0.0", stagedgen.SrcGenFile)); serr != nil {
+		t.Errorf("recopied dir missing .srcgen stamp: %v", serr)
+	}
+}
+
+// TestCut_RepinsPreB981ResumeBeforeCopy pins Codex r5-#4: a pre-#1981 journal
+// resumed at STAGED/PREFLIGHT (empty SourceGeneration, not yet COPIED) is
+// RE-PINNED to the published generation, so the copy reads the pinned
+// generation, not live staged/.
+func TestCut_RepinsPreB981ResumeBeforeCopy(t *testing.T) {
+	fs := newFakeSystem(t, "2.0.0")
+	r, cfg := testEnv(t, fs)
+	seedInitialCurrent(t, r, cfg, "1.0.0")
+
+	// A pre-#1981 journal at STAGED with NO SourceGeneration (as the old binary
+	// would have written).
+	jLegacy := &Journal{TargetVersion: "2.0.0", PreviousVersion: "1.0.0", State: StateStaged}
+	if err := r.saveJournal(jLegacy); err != nil {
+		t.Fatal(err)
+	}
+
+	// Tear live staged/ so a live-staged read would be detectable.
+	if err := os.WriteFile(filepath.Join(cfg.StagedDir, "xpf-userspace-dp"), []byte("TORN"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.Run(Options{}); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	// The committed dir must hold the CLEAN published bytes (re-pinned), not the
+	// torn live staged/ bytes.
+	got, _ := os.ReadFile(filepath.Join(cfg.VersionsDir, "2.0.0", "xpf-userspace-dp"))
+	if string(got) != "binary-xpf-userspace-dp-2.0.0" {
+		t.Fatalf("pre-#1981 resume read torn live staged/ instead of the re-pinned generation: %q", got)
+	}
+	// The version dir carries a .srcgen stamp (the resume was re-pinned).
+	if _, serr := os.Stat(filepath.Join(cfg.VersionsDir, "2.0.0", stagedgen.SrcGenFile)); serr != nil {
+		t.Errorf("re-pinned resume missing .srcgen stamp: %v", serr)
 	}
 }
 

@@ -5999,3 +5999,6 @@ top.
 - **Timestamp**: 2026-06-18
 - **Action**: SMR self-review fix: resolveSource must read the version-comparison source from current-gen (latest published), not the pinned old generation, so a new-version republish supersedes an abandoned cut. Added superseded-resume regression test.
 - **File(s)**: pkg/upgrade/cutover.go, pkg/upgrade/stagedgen_cut_test.go
+- **Timestamp**: 2026-06-18
+- **Action**: Address Codex r5 MERGE-NEEDS-MAJOR (5 findings): (1) unstamped STALE version dir now guarded-replaced not skipped; (2) live/rollback B-P3b refusal moved to INIT pre-PREFLIGHT (no journal/dbsnap/wedge); (3) publish-generation GC protects the on-disk journal's pinned generation (new ReadJournalSourceGeneration); (4) pre-#1981 pre-copy resume re-pinned to current-gen + preflight sizes the pinned source; (5) postrm staged-gen teardown gets its own #1981 floor (0.0.4200). Added 4 regression tests.
+- **File(s)**: pkg/upgrade/cutover.go, pkg/upgrade/runner.go, cmd/xpfd/publish_generation.go, debian/xpf.postrm, pkg/upgrade/stagedgen_cut_test.go

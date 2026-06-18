@@ -84,6 +84,18 @@ DROPIN=/etc/systemd/system/xpfd.service.d/10-xpf-version.conf
 # (the contract already shipped), not a value that drifts per build — do
 # not bump it with new releases.
 HARDENED_LAYOUT_FLOOR="0.0.4104"
+# #1981 staged-generation floor. staged-gen/ (immutable versioned staging) is
+# written ONLY by a #1981+ package; a pre-#1981 package — whether pre- OR
+# post-#1964 — never manages it, so on a downgrade BELOW this floor we must
+# remove staged-gen/ (else it leaks permanently: the downgraded postrm never
+# learns about it). This is a SEPARATE, HIGHER floor than the #1964 layout
+# floor above, so a post-#1964-but-pre-#1981 downgrade still tears staged-gen/
+# down even though it leaves the #1964 versioned-runtime layout intact. The
+# value is a conservative LOWER BOUND: the last pre-#1981 master commit count
+# was 4199, so 0.0.4200 classifies every pre-#1981 build (<= 4199) as below the
+# floor while the first #1981 package (commit count well above 4200) sorts at
+# or above it. HISTORICAL fixed point — do not bump per build.
+STAGED_GEN_FLOOR="0.0.4200"
 # Managed-binary set (#1982). The single source of truth is the Go manifest
 # pkg/upgrade/manifest; this literal is kept self-contained on purpose (no
 # build-time sed into the tracked checkout). The drift canary
@@ -176,6 +188,17 @@ incoming_predates_hardened_layout() {
     dpkg --compare-versions "$_v" lt "$HARDENED_LAYOUT_FLOOR" 2>/dev/null || return 1
 }
 
+# incoming_predates_staged_gen VERSION reports (exit 0) whether the INCOMING
+# package version predates the #1981 staged-generation floor — a downgrade to a
+# package that does not manage staged-gen/, so we must remove it (else it leaks
+# permanently). Same exec-free, staleness-free, safe-on-ambiguity posture as
+# incoming_predates_hardened_layout, against the higher STAGED_GEN_FLOOR.
+incoming_predates_staged_gen() {
+    _v="$1"
+    [ -n "$_v" ] || return 1
+    dpkg --compare-versions "$_v" lt "$STAGED_GEN_FLOOR" 2>/dev/null || return 1
+}
+
 case "$1" in
     remove|purge)
         remove_owned_sbin_links
@@ -217,17 +240,22 @@ case "$1" in
             #    repoints sbin to a stale version dir (AGY-r4-1). Leave the
             #    versions/<ver> dirs (harmless; a reinstall's GC reaps them).
             rm -f "$CURRENT"
-            # 2b. remove the #1981 staged-generation tree (B-P6): the
-            #     downgraded pre-B package's postrm never learns about
-            #     staged-gen/, so it would leak permanently. The pre-B cut reads
-            #     live staged/ (its only source), so removing staged-gen/ does
-            #     not strip a source the downgraded package can use.
-            rm -rf "$STAGED_GEN"
             # 3. remove the runtime unit drop-in + empty .service.d dir, then
             #    boot-guarded daemon-reload (shared helper, #1967). Done LAST
             #    so the reload reflects the repointed sbin + removed drop-in
             #    together.
             remove_runtime_dropin
+        fi
+        # #1981 staged-generation teardown (B-P6) — a SEPARATE, HIGHER floor
+        # than the #1964 layout teardown above (Codex r5-#5): staged-gen/ is
+        # written only by a #1981+ package, so on a downgrade to ANY pre-#1981
+        # package — including a post-#1964-but-pre-#1981 one that keeps the
+        # versioned-runtime layout intact above — we remove staged-gen/ (else
+        # the downgraded postrm never learns about it and it leaks
+        # permanently). The pre-B cut reads live staged/ (its only source), so
+        # removing staged-gen/ strips nothing the downgraded package uses.
+        if incoming_predates_staged_gen "$2"; then
+            rm -rf "$STAGED_GEN"
         fi
         ;;
     failed-upgrade|abort-install|abort-upgrade|disappear)

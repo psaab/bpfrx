@@ -214,6 +214,14 @@ func (r *Runner) currentPath() string {
 	return filepath.Join(r.cfg.VersionsDir, currentLink)
 }
 
+// mustReadCurrentVersion resolves the `current` version, returning "" on any
+// error (used where a read failure should be treated as "no current version"
+// rather than aborting — e.g. the B-P3b live-dir guard).
+func (r *Runner) mustReadCurrentVersion() string {
+	cur, _ := r.readCurrentVersion()
+	return cur
+}
+
 // readCurrentVersion resolves the version the `current` symlink points at,
 // or "" if it does not exist (very first cut).
 func (r *Runner) readCurrentVersion() (string, error) {
@@ -260,6 +268,30 @@ func (r *Runner) saveJournal(j *Journal) error {
 		return fmt.Errorf("persist upgrade journal: %w", err)
 	}
 	return nil
+}
+
+// ReadJournalSourceGeneration returns the SourceGeneration recorded in the
+// upgrade journal at path, or "" if the journal is absent or has no pinned
+// generation. It is used by `xpfd publish-generation` to PROTECT a crashed/
+// resumable cut's pinned generation from the publish GC (the journal is
+// durable; the host-wide lock that would otherwise serialize the cut is NOT
+// held across a crash). A parse error returns "" (best-effort protection — the
+// cut's own GC also protects it, and a malformed journal can't name a genid to
+// protect). Validation of the returned genid is the caller's (it is only used
+// as a GC-protection key, never as a path).
+func ReadJournalSourceGeneration(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("read upgrade journal: %w", err)
+	}
+	j := &Journal{}
+	if uerr := json.Unmarshal(data, j); uerr != nil {
+		return "", fmt.Errorf("parse upgrade journal: %w", uerr)
+	}
+	return j.SourceGeneration, nil
 }
 
 // clearJournal removes the journal on terminal success.
