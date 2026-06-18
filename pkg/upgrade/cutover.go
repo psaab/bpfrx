@@ -196,7 +196,14 @@ func (r *Runner) Run(opts Options) (err error) {
 		// journal, never re-read `current`, and stay refused forever (stuck).
 		// Refusing here writes no journal, so a post-seed re-run starts fresh,
 		// reads the new `current`, and proceeds with a real rollback target.
+		// Also clear any lingering on-disk journal from a just-completed
+		// resume-vs-fresh recovery (which resets j in memory but does not
+		// remove the stale on-disk record), so the refuse leaves a fully
+		// clean state and a re-run does not re-run recovery.
 		if prev == "" && !opts.AllowNoRollbackFirstCut {
+			if cerr := r.clearJournal(); cerr != nil {
+				r.logf("upgrade: WARN clear stale journal on refuse: %v", cerr)
+			}
 			return fmt.Errorf("refuse-before-STOP: no previous version to roll back to "+
 				"(versions/current is absent or unreadable) and this is not a sanctioned "+
 				"first cut; refusing the %s cut because a flip/start failure would leave "+
