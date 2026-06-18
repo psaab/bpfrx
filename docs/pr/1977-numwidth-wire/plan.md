@@ -1,13 +1,14 @@
 # #1977 — NUM_WIDTH Go↔Rust snapshot wire mismatches (flow/flow-export)
 
-**Status:** PLAN v2 — pending re-review. Folds Codex r1 PLAN-NEEDS-MAJOR + AGY r1
-PLAN-NEEDS-MINOR + Claude SMR r1 PLAN-NEEDS-MINOR. Key changes: inventory
-corrected to **11** fields (both reviewers caught `TCPMSSAllTCP` +
-`SamplingRate`); session-timeout cap is `MaxDurationSeconds` not u64-max (Rust
-`from_seconds` does `secs*1e9` unchecked → overflow); per-field coercion made
-explicit; **Layer B (commit-time validation) deferred to a follow-up** because
-the target schema nodes are `children: nil` and need non-trivial expansion —
-Layer A alone is the dataplane-safety guarantee.
+**Status:** PLAN-READY v2.1 (converged 2026-06-18). AGY r2 PLAN-READY + Codex r2
+PLAN-NEEDS-MINOR (3 doc-precision minors — Q1 usize-count wording,
+`address_count` is status-side, `TCPMSSAllTCP` test via helper — all folded) +
+Claude SMR r2 PLAN-READY. Design unanimously sound. Inventory **11** fields
+(`TCPMSSAllTCP` + `SamplingRate` added in r1); session-timeout cap
+`MaxDurationSeconds` (Codex r2 confirmed `9.22e9 × 1e9 < u64max`, saturating
+downstream); per-field coercion explicit; **Layer B (commit-time validation)
+deferred to a follow-up** (target schema nodes are `children: nil`; Layer A
+alone is the dataplane-safety guarantee on all paths).
 **Base:** origin/master (`28e7309f7`, post-#1976)
 **Issue:** #1977 (sibling class of #1961, found by the #1961 Q5 type-parity audit)
 
@@ -126,12 +127,15 @@ ones that ever worked). No HA session-sync wire change (#1917).
 
 ## 8. Test plan
 
-1. Go unit tests covering **all 11 fields**: a config with `-1` and (for u16)
-   `70000` / (for SamplingRate) `>u32max` / (for session timeouts) `>
-   MaxDurationSeconds` → build via the **real** `buildFlowSnapshot` /
-   `buildFlowExportSnapshot`, marshal the full `ControlRequest`, assert each
-   numeric is within `[0, typeMax]` (and ≤ `MaxDurationSeconds` for u64
-   timeouts), and that an out-of-range CollectorPort skips that server.
+1. Go unit tests covering **all 11 fields**. For the 10 builder-populated fields,
+   feed a config with `-1` and (for u16) `70000` / (for SamplingRate) `>u32max` /
+   (for session timeouts) `> MaxDurationSeconds` through the **real**
+   `buildFlowSnapshot` / `buildFlowExportSnapshot`, marshal the full
+   `ControlRequest`, and assert each numeric is within `[0, typeMax]` (≤
+   `MaxDurationSeconds` for u64 timeouts), and that an out-of-range CollectorPort
+   skips that server. `TCPMSSAllTCP` is NOT populated by `buildFlowSnapshot`
+   today (Codex r2 #3) — cover its coercion with a direct helper/table test
+   (contract-only defensive coverage), not via the real builder.
 2. Rust test (extends the #1961 full-`ControlRequest` decode test): a
    FlowSnapshot/FlowExportSnapshot with max-valid values (65535, u32max,
    MaxDurationSeconds) decodes; a negative `sampling_rate`/timeout is rejected
@@ -150,14 +154,18 @@ ones that ever worked). No HA session-sync wire change (#1917).
 
 ## 10. Open questions for adversarial review
 
-- **Q1:** Inventory completeness. SMR re-checked all other request-side `int`
-  json fields: the topology/NAT/CoS ones use Rust **signed** types — `vlan_id`,
-  `mtu`, `ttl`, `ifindex`, `parent_ifindex`, `queue` are all `i32`, NAT
-  timeouts `i64` (no mismatch). The only other unsigned request-side field is
-  `SourceNatPoolSnapshot.address_count` → Rust `usize`, but it is a
-  builder-computed count (never negative or > usize), so not reachable
-  out-of-range. ⇒ the 11 flow/flow-export fields are the complete
-  **reachable-FATAL** set. Reviewers: confirm or refute this cross-domain check.
+- **Q1:** Inventory completeness — RESOLVED (Codex r1/r2 + AGY + SMR). Other
+  request-side `int` json fields split into: (a) Rust **signed** (`vlan_id`,
+  `mtu`, `ttl`, `ifindex`, `parent_ifindex`, `queue` = `i32`; no mismatch); and
+  (b) Rust **usize** but **builder-derived counts** that are never negative or
+  out-of-range — `SnapshotSummary` interface/zone/policy/scheduler counts
+  (protocol.go:115 → snapshot.rs:25), `InterfaceSnapshot.RXQueues`/`UnitCount`
+  (snapshot.rs:50), `FabricSnapshot.RXQueues` (snapshot.rs:298). None are
+  operator-controlled, so none is reachable-FATAL. (`SourceNatPoolSnapshot.
+  address_count` is **status-side**, not a `ControlRequest` field — out of scope
+  for the decode path.) ⇒ the 11 flow/flow-export fields are the complete
+  **reachable-FATAL** set; the usize count fields are a non-reachable theoretical
+  tail noted for the record.
 - **Q2:** Coercion semantics per field (§4) — all safe fail-open? Any field
   where clamping silently corrupts worse than the (deferred) commit rejection?
   Specifically: SamplingRate cap vs reject; GRE-out 0⇒MTU-derived.
