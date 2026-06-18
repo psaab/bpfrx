@@ -271,14 +271,20 @@ func (r *Runner) saveJournal(j *Journal) error {
 }
 
 // ReadJournalSourceGeneration returns the SourceGeneration recorded in the
-// upgrade journal at path, or "" if the journal is absent or has no pinned
-// generation. It is used by `xpfd publish-generation` to PROTECT a crashed/
-// resumable cut's pinned generation from the publish GC (the journal is
-// durable; the host-wide lock that would otherwise serialize the cut is NOT
-// held across a crash). A parse error returns "" (best-effort protection — the
-// cut's own GC also protects it, and a malformed journal can't name a genid to
-// protect). Validation of the returned genid is the caller's (it is only used
-// as a GC-protection key, never as a path).
+// upgrade journal at path, or "" if the journal is absent, unparsable, or has
+// no pinned generation. It is used by `xpfd publish-generation` to PROTECT a
+// crashed/resumable cut's pinned generation from the publish GC (the journal
+// is durable; the host-wide lock that would otherwise serialize the cut is NOT
+// held across a crash).
+//
+// Both a missing journal AND a malformed (unparsable) one return ("", nil): a
+// journal that does not parse cannot name a genid to protect, and this is a
+// best-effort GC-protection seam (the cut's own gc(j) protects its source from
+// the authoritative in-memory journal). Only a genuine READ error (I/O,
+// permission) surfaces — that is worth logging, and the caller treats it as
+// "no protection" without failing the publish. The returned genid is only ever
+// used as a GC-protection key, never as a path, so the caller need not
+// validate it.
 func ReadJournalSourceGeneration(path string) (string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -289,7 +295,10 @@ func ReadJournalSourceGeneration(path string) (string, error) {
 	}
 	j := &Journal{}
 	if uerr := json.Unmarshal(data, j); uerr != nil {
-		return "", fmt.Errorf("parse upgrade journal: %w", uerr)
+		// A malformed journal names no genid to protect; degrade to "no
+		// protection" rather than surfacing an error a best-effort caller would
+		// only log-and-ignore.
+		return "", nil
 	}
 	return j.SourceGeneration, nil
 }

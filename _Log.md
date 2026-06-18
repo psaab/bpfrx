@@ -6008,3 +6008,6 @@ top.
 - **Timestamp**: 2026-06-18
 - **Action**: Address Codex r6 (1 MAJOR + minors): INIT pre-PREFLIGHT refusal now covers the UNSTAMPED-live same-version case (existingGen != srcGen, gated on dir existence) so it no longer falls to the post-PREFLIGHT backstop and re-wedges; doc updated for the #1981 staged-gen floor + additive-GC; postrm-test.sh covers the staged-gen floor (purge + pre-#1981 downgrade removes, at-floor/empty keeps).
 - **File(s)**: pkg/upgrade/cutover.go, pkg/upgrade/stagedgen_cut_test.go, docs/in-place-upgrade.md, test/debian/postrm-test.sh
+- **Timestamp**: 2026-06-18
+- **Action**: Address Copilot 2nd-review new findings: ReadJournalSourceGeneration now returns ("",nil) on a malformed journal (matches the best-effort docstring); stagedgen GC sort adds a genid name tie-breaker for deterministic retention on coarse-mtime ties.
+- **File(s)**: pkg/upgrade/runner.go, pkg/upgrade/stagedgen/stagedgen.go

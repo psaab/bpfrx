@@ -325,8 +325,17 @@ func (c Config) GC(protected map[string]bool) error {
 		}
 		gens = append(gens, gen{name: n, mod: info.ModTime().UnixNano()})
 	}
-	// Newest first.
-	sort.Slice(gens, func(i, j int) bool { return gens[i].mod > gens[j].mod })
+	// Newest first, with a genid (name) tie-breaker so retention is
+	// DETERMINISTIC when two generations share a coarse-resolution mtime
+	// (Copilot): GenID prefixes a zero-padded nanosecond timestamp, so the
+	// lexicographically-greater name is the chronologically-later generation —
+	// the right tie-break for "newest first".
+	sort.Slice(gens, func(i, j int) bool {
+		if gens[i].mod != gens[j].mod {
+			return gens[i].mod > gens[j].mod
+		}
+		return gens[i].name > gens[j].name
+	})
 
 	kept := 0
 	removedAny := false
