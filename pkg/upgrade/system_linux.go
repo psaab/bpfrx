@@ -116,11 +116,26 @@ func (s *realSystem) BinaryVersion(bin string) (string, error) {
 		return "", fmt.Errorf("%s version: %w (output: %s)", bin, err, strings.TrimSpace(out.String()))
 	}
 	// Output shape: "xpfd <version> (commit <c>, built <t>)".
+	//
+	// The extracted token keys the on-disk runtime layout (versions/<ver>/,
+	// the `current` symlink target, the per-version DB-snapshot dotfile, the
+	// unit drop-in ExecStart). A corrupt binary, an arch/lib mismatch that
+	// still execs but prints garbage, or a benign future change to the
+	// `version` output format must NOT yield a path-escaping or whitespace-
+	// laden "version" that strands the cut or escapes VersionsDir (#1967 C1).
+	// So validate the extracted token as a safe single path segment and hard-
+	// fail otherwise — NEVER fall back to returning the whole trimmed output.
+	trimmed := strings.TrimSpace(out.String())
 	fields := strings.Fields(out.String())
 	if len(fields) >= 2 && fields[0] == "xpfd" {
+		if verr := ValidateVersionSegment(fields[1]); verr != nil {
+			return "", fmt.Errorf("%s version: token %q is not a safe path "+
+				"segment: %w (full output: %q)", bin, fields[1], verr, trimmed)
+		}
 		return fields[1], nil
 	}
-	return strings.TrimSpace(out.String()), nil
+	return "", fmt.Errorf("%s version: unrecognized output format "+
+		"(want \"xpfd <version> ...\"): %q", bin, trimmed)
 }
 
 func (s *realSystem) HelperHealthy(expectVersion string, deadline time.Duration) error {
