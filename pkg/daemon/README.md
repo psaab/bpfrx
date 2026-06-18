@@ -116,6 +116,19 @@ never lock an operator out of a remote box it manages.
     `show | compare rollback N` reach prior good configs, and a
     `commit confirmed` of either promotes a working config. Repairing/removing
     the on-disk DB remains the out-of-band fallback.
+  - **Known limitation (#1993) — FRR keeps advertising on a cold boot.** `frr`
+    is an independent service that starts from its persisted `frr.conf` (the
+    managed section from the last good `applyConfig`), which freeze-in-last-
+    known-good leaves intact. On a *cold reboot* with a compile-failed config
+    the dataplane is unarmed (no transit) yet FRR still forms peerings and
+    advertises the last-good prefixes, so peers route transit to this node's
+    physical IPs and it blackholes them rather than failing over to the HA
+    partner. This is a pre-existing cross-daemon gap (FRR is independent of the
+    xpfd boot class; the pre-#1960 claim-all path advertised the same way and
+    was otherwise worse), and the VIP/RETH data path already fails over because
+    #1960 suppresses this node's VRRP/cluster. Tracked in #1993; the likely fix
+    is to clear/suppress only the FRR managed section on compile-failure
+    bootstrap while leaving networkd/mgmt intact.
 - **Bootstrap mode** (`d.bootstrapMode` atomic): runs gRPC/REST/CLI normally
   but SUPPRESSES interface takeover ACTIONS — the full rename loop, host
   tunables, `enableForwarding`, dataplane arm (`dp.Start`), and boot-time
