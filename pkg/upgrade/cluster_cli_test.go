@@ -296,6 +296,21 @@ func TestSyncParser_ScopedAndExact(t *testing.T) {
 	if !parseSyncEstablished(fabricUp) {
 		t.Error("'Fabric link statistics:' + 'Status: Up' must read as established")
 	}
+
+	// An UNCONFIGURED sync section ("Not configured", no Status) ends at its
+	// blank line; a later out-of-section "Status: Up" must NOT be adopted as
+	// the sync status (Codex r1). Sync is not established here → fail closed.
+	notConfiguredThenLaterUp := strings.Join([]string{
+		"  Remote node: healthy (node1)",
+		"Fabric link statistics:",
+		"  Not configured",
+		"",
+		"Some later section:",
+		"  Status: Up",
+	}, "\n")
+	if parseSyncEstablished(notConfiguredThenLaterUp) {
+		t.Error("unconfigured sync section must fail closed even if a later section says Status: Up")
+	}
 }
 
 // TestParseRGIDs proves ResetFailover enumerates ALL configured RGs

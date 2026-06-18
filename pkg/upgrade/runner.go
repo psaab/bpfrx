@@ -298,17 +298,42 @@ func copyTree(src, dst string) (string, error) {
 	// orphan nested entries and a later rollback would restore a corrupt
 	// snapshot. Latent today (.configdb and staged are both flat — AGY
 	// review-011 Part I) but this makes copyTree durable for any future
-	// nesting. Deepest-first so each child dir's entries are committed before
-	// the parent dir entry that references it.
-	sort.Slice(createdDirs, func(i, j int) bool {
-		return len(createdDirs[i]) > len(createdDirs[j])
-	})
-	for _, d := range createdDirs {
-		if err := fsatomic.SyncDir(d); err != nil {
-			return "", fmt.Errorf("fsync copied dir %s: %w", d, err)
-		}
+	// nesting.
+	if err := fsyncDirsDeepestFirst(createdDirs); err != nil {
+		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// copyTreeSyncDir is the directory-fsync primitive used by
+// fsyncDirsDeepestFirst. It is a package var so tests can substitute a
+// recorder and prove copyTree actually fsyncs each copied directory (and in
+// deepest-first order, and that an error propagates) — otherwise deleting the
+// fsync loop would not fail any test (Codex/Copilot r1).
+var copyTreeSyncDir = fsatomic.SyncDir
+
+// fsyncDirsDeepestFirst fsyncs each directory deepest-first (by path-component
+// depth, NOT string length — a deeper path can be shorter, Copilot r1) so a
+// child dir's entries are committed before the parent dir entry that
+// references it. Correctness does not depend on order (every dir is fsynced,
+// so every dentry becomes durable); the ordering only tightens the crash
+// window.
+func fsyncDirsDeepestFirst(dirs []string) error {
+	ordered := append([]string(nil), dirs...)
+	sort.Slice(ordered, func(i, j int) bool {
+		di := strings.Count(ordered[i], string(os.PathSeparator))
+		dj := strings.Count(ordered[j], string(os.PathSeparator))
+		if di != dj {
+			return di > dj
+		}
+		return ordered[i] > ordered[j]
+	})
+	for _, d := range ordered {
+		if err := copyTreeSyncDir(d); err != nil {
+			return fmt.Errorf("fsync copied dir %s: %w", d, err)
+		}
+	}
+	return nil
 }
 
 // copyFileFsync copies src -> dst with mode, fsyncing dst before close.

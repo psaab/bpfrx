@@ -607,3 +607,78 @@ func TestCopyTree_NestedDirsDurable(t *testing.T) {
 		t.Errorf("copyTree checksum non-deterministic: %s != %s", sum1, sum2)
 	}
 }
+
+// TestCopyTree_FsyncsEachDirDeepestFirst proves copyTree actually fsyncs every
+// copied directory, deepest-first (Codex/Copilot r1: the durability test must
+// fail if the fsync loop is removed). It substitutes the copyTreeSyncDir hook
+// with a recorder and asserts every nested dir is synced and that depth is
+// non-increasing across the recorded order.
+func TestCopyTree_FsyncsEachDirDeepestFirst(t *testing.T) {
+	src := t.TempDir()
+	for _, rel := range []string{"top.txt", "a/d.txt", "a/b/c.txt", "a/b/e/leaf.txt"} {
+		full := filepath.Join(src, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatalf("mkdir src: %v", err)
+		}
+		if err := os.WriteFile(full, []byte("x"), 0644); err != nil {
+			t.Fatalf("write src: %v", err)
+		}
+	}
+
+	var synced []string
+	orig := copyTreeSyncDir
+	copyTreeSyncDir = func(d string) error { synced = append(synced, d); return nil }
+	defer func() { copyTreeSyncDir = orig }()
+
+	dst := filepath.Join(t.TempDir(), "copy")
+	if _, err := copyTree(src, dst); err != nil {
+		t.Fatalf("copyTree: %v", err)
+	}
+
+	// Every created directory must have been fsynced (root + a + a/b + a/b/e).
+	wantDirs := []string{dst, filepath.Join(dst, "a"), filepath.Join(dst, "a/b"), filepath.Join(dst, "a/b/e")}
+	syncedSet := map[string]bool{}
+	for _, d := range synced {
+		syncedSet[d] = true
+	}
+	for _, d := range wantDirs {
+		if !syncedSet[d] {
+			t.Errorf("copied dir %s was not fsynced (synced=%v)", d, synced)
+		}
+	}
+	if len(synced) == 0 {
+		t.Fatal("copyTree fsynced no directories — the durability loop did not run")
+	}
+
+	// Depth (path-separator count) must be non-increasing across the order.
+	prevDepth := strings.Count(synced[0], string(os.PathSeparator))
+	for _, d := range synced[1:] {
+		depth := strings.Count(d, string(os.PathSeparator))
+		if depth > prevDepth {
+			t.Errorf("fsync order not deepest-first: %s (depth %d) followed a shallower dir (depth %d): %v",
+				d, depth, prevDepth, synced)
+		}
+		prevDepth = depth
+	}
+}
+
+// TestCopyTree_FsyncDirErrorPropagates proves a directory-fsync failure aborts
+// copyTree (so a non-durable copy never silently becomes a rollback target).
+func TestCopyTree_FsyncDirErrorPropagates(t *testing.T) {
+	src := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(src, "a/b"), 0755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "a/b/c.txt"), []byte("x"), 0644); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+
+	orig := copyTreeSyncDir
+	copyTreeSyncDir = func(d string) error { return fmt.Errorf("injected fsync failure") }
+	defer func() { copyTreeSyncDir = orig }()
+
+	dst := filepath.Join(t.TempDir(), "copy")
+	if _, err := copyTree(src, dst); err == nil {
+		t.Fatal("copyTree returned nil despite a directory-fsync failure")
+	}
+}

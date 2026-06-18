@@ -5850,3 +5850,4 @@ top.
 - **Edit**: pkg/upgrade/cluster_cli_test.go — TestSyncParser_ScopedAndExact + at-most-one-Status assertion in TestParsers_AgainstRealFormatInformation.
 - **Edit**: pkg/upgrade/runner.go — copyTree: fsync each copied directory (deepest-first) so nested entries survive power loss.
 - **Edit**: pkg/upgrade/runner_test.go — TestCopyTree_NestedDirsDurable.
+- **Edit** (r1 review fixes): runner.go — extract fsyncDirsDeepestFirst (true depth via separator count, not string length) + copyTreeSyncDir test seam; runner_test.go — TestCopyTree_FsyncsEachDirDeepestFirst (recorder proves loop runs + deepest-first) + TestCopyTree_FsyncDirErrorPropagates; cluster_cli_test.go — Not-configured-then-later-Status fixture.
