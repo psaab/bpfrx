@@ -362,3 +362,68 @@ func TestStatusEmitsProtocolLines(t *testing.T) {
 		t.Fatalf("FormatStatus lacks 'HA protocol version:' the parser keys on:\n%s", st)
 	}
 }
+
+// TestNewCLICluster_RejectsNonDefaultUnit is the #1983 regression: the
+// rolling/kernel-drain cluster control RPCs target a hard-coded
+// 127.0.0.1:50051, but the systemd action side honors --unit. A non-default
+// --unit therefore would cut one daemon while driving cluster failover
+// against ANOTHER (wrong-daemon control). NewCLICluster is the single
+// construction chokepoint for all three callers (RunRolling + `upgrade
+// kernel drain`/`rejoin`), so the guard lives here. The seam used by the
+// rolling tests (runRollingWith) injects a fake cluster and bypasses
+// construction, so this MUST be exercised at the constructor directly
+// (Codex plan fold).
+func TestNewCLICluster_RejectsNonDefaultUnit(t *testing.T) {
+	// A non-default unit must be REJECTED — no cluster, an error, and the
+	// error must NOT silently hand back a client pointed at the default
+	// endpoint. This is the core invariant the bug violated.
+	for _, unit := range []string{
+		"xpfd-test",    // an alternate unit an integration test would pass
+		"xpfd.service", // --unit takes the BARE name; ".service" is non-default
+		"xpfd-staging",
+	} {
+		cl, err := NewCLICluster(unit)
+		if err == nil {
+			t.Fatalf("NewCLICluster(%q): want error, got nil (would silently "+
+				"control the default daemon while systemd hits %q)", unit, unit)
+		}
+		if cl != nil {
+			t.Fatalf("NewCLICluster(%q): want nil cluster on reject, got %#v "+
+				"(a non-nil client could dial 127.0.0.1:50051)", unit, cl)
+		}
+		// The error must name the offending unit so the operator knows what
+		// was rejected and why.
+		if !strings.Contains(err.Error(), unit) {
+			t.Errorf("NewCLICluster(%q) error must name the unit; got: %v", unit, err)
+		}
+		if !strings.Contains(err.Error(), "127.0.0.1:50051") {
+			t.Errorf("NewCLICluster(%q) error must explain the hard-coded "+
+				"control endpoint; got: %v", unit, err)
+		}
+	}
+}
+
+// TestNewCLICluster_AcceptsDefaultUnit confirms the default unit (and the
+// empty-string shorthand the cmd layer normalizes to DefaultUnit) still
+// constructs a working client pointed at the local control endpoint —
+// default-unit rolling behavior is unchanged (#1983 invariant 8).
+func TestNewCLICluster_AcceptsDefaultUnit(t *testing.T) {
+	for _, unit := range []string{"", DefaultUnit} {
+		cl, err := NewCLICluster(unit)
+		if err != nil {
+			t.Fatalf("NewCLICluster(%q): want a client, got error: %v", unit, err)
+		}
+		if cl == nil {
+			t.Fatalf("NewCLICluster(%q): want a non-nil client, got nil", unit)
+		}
+		// The accepted client targets the local control endpoint. Inspect the
+		// concrete type's addr WITHOUT dialing (no daemon runs under test).
+		g, ok := cl.(*grpcCluster)
+		if !ok {
+			t.Fatalf("NewCLICluster(%q): want *grpcCluster, got %T", unit, cl)
+		}
+		if g.addr != "127.0.0.1:50051" {
+			t.Errorf("NewCLICluster(%q): addr = %q, want 127.0.0.1:50051", unit, g.addr)
+		}
+	}
+}
