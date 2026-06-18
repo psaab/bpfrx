@@ -5990,3 +5990,6 @@ top.
 - **Timestamp**: 2026-06-18
 - **Action**: debian postinst publishes the staged generation after unpack before the cut (gates the cut on publish success/deferral); postrm removes staged-gen/ on purge + pre-B downgrade. rules unchanged (dpkg owns only staged/).
 - **File(s)**: debian/xpf.postinst, debian/xpf.postrm
+- **Timestamp**: 2026-06-18
+- **Action**: Add #1981 cut-level regression tests (torn-source pin + counter-factual, no-source refusal, same-version recopy/refuse-on-live B-P3b, GC-vs-resume protection, aborted-unpack no-wedge, resume keeps pinned gen).
+- **File(s)**: pkg/upgrade/stagedgen_cut_test.go
