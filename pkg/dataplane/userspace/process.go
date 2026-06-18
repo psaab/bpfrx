@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -206,6 +207,17 @@ func (m *Manager) requestDetailedLocked(req ControlRequest) (ControlResponse, er
 	}
 	var resp ControlResponse
 	if err := json.NewDecoder(bufio.NewReader(conn)).Decode(&resp); err != nil {
+		// A bare EOF here means the helper closed the socket without writing a
+		// response — it rejected the request before replying (e.g. a request
+		// that failed to decode, like the #1961 wire-type mismatch). Surface an
+		// actionable hint instead of the opaque "EOF" that masked #1961 across
+		// multiple sessions.
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return ControlResponse{}, fmt.Errorf(
+				"control socket closed with no response to %q request (EOF); the "+
+					"helper rejected it before replying — check the helper log "+
+					"for a decode/handler error: %w", req.Type, err)
+		}
 		return ControlResponse{}, err
 	}
 	if !resp.OK {
