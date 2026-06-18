@@ -72,6 +72,21 @@ never lock an operator out of a remote box it manages.
   fatal via #1917 D1). The **HA-node guard** keys on `/etc/xpf/node-id` FILE
   presence (NOT the config-derived `clusterMode`): a node-id node always
   resolves NOT-bootstrap.
+- **Fail-closed on compile failure (#1960):** a PRESENT, previously-committed
+  `active.json` that is valid JSON but no longer COMPILES (even through the
+  tolerant `compileTreeLenient` path) is the dangerous tuple
+  `ActiveConfig()==nil` + `EverCommitted()==true` — without a guard that
+  resolves to **normal** and runs the positional claim-all rename on a box
+  whose intended config is unknown. `Store.Load` now tags this error with
+  `configstore.ErrConfigCompile`; `Run` classifies it via `classifyLoadError`,
+  logs it loudly (Error), SKIPS `bootstrapFromFile` (so the text `xpf.conf` is
+  not blind-imported over the broken DB), and passes `configCompileFailed=true`
+  to `computeBootClass`, which forces **bootstrap** — overriding even the
+  HA-node guard. The control plane stays up and the lifeline/protected set keep
+  mgmt reachable; the operator fixes the config and `commit confirmed`s, or
+  repairs/removes the on-disk DB. A daemon hard-exit is deliberately NOT used
+  (it would also strand mgmt). Distinct from `ErrConfigDBUnreadable` (#1917 D1,
+  which IS a fatal exit because the bytes themselves cannot be read).
 - **Bootstrap mode** (`d.bootstrapMode` atomic): runs gRPC/REST/CLI normally
   but SUPPRESSES interface takeover ACTIONS — the full rename loop, host
   tunables, `enableForwarding`, dataplane arm (`dp.Start`), and boot-time

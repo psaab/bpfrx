@@ -157,6 +157,32 @@ persistence failures on every persist path;
 `SetWriteActiveMarkerForTesting` observes the step-0 committed bit;
 `SetPersistRetryBackoffForTesting` makes the retry loop deterministic.
 
+### `Store.Load` error sentinels (fail-closed boot)
+
+`Load` returns one of three error shapes the daemon distinguishes with
+`errors.Is`:
+
+- **`ErrConfigDBUnreadable` (#1917 D1)** — a PRESENT `active.json` whose
+  bytes cannot be read (JSON parse error, decrypt failure, or a too-new
+  compatibility envelope). The daemon FAILS CLOSED by exiting `Run`, so an
+  unreadable/too-new DB is never overwritten by a blind bootstrap.
+- **`ErrConfigCompile` (#1960)** — a PRESENT `active.json` that read+parsed
+  fine but no longer COMPILES, even through the tolerant `compileTreeLenient`
+  path (e.g. a committed config whose referenced apply-group was later
+  deleted in a partially-edited DB). `Load` has already set
+  `everCommitted=true` from the on-disk `committed=` marker but leaves
+  `compiled` nil, so `ActiveConfig()` returns nil. Without a guard that
+  tuple (`ActiveConfig()==nil` + `EverCommitted()==true`) drives the daemon
+  boot predicate to NORMAL and positional claim-all interface naming. The
+  daemon detects `ErrConfigCompile`, skips the text-config bootstrap import,
+  and enters the #1922 bootstrap/lifeline safe state (mgmt preserved, no
+  claim-all, control plane up) instead of exiting (a hard exit would also
+  strand mgmt). See `pkg/daemon` `classifyLoadError` / `computeBootClass`.
+- **any other error** — logged as a warning; the daemon proceeds and the
+  boot predicate decides bootstrap vs normal as usual.
+
+An ABSENT DB is NOT an error (`Load` returns nil; start-fresh).
+
 ## Audit journal (#1896)
 
 `.config.journal` (next to the config file) is a JSONL audit trail
