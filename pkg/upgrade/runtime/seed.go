@@ -269,8 +269,9 @@ func copyTreeFsync(src, dst string) error {
 			// Preserve the SOURCE dir's permissions (MkdirAll applies the
 			// umask and won't chmod an existing dir, so set it explicitly) —
 			// otherwise versions/<ver>/ could end up more permissive than
-			// staged/ for a non-0755 staged subdir (Copilot).
-			if err := os.Chmod(target, e.info.Mode().Perm()); err != nil {
+			// staged/ for a non-0755 staged subdir. preservedMode keeps the
+			// setuid/setgid/sticky bits too (Copilot).
+			if err := os.Chmod(target, preservedMode(e.info.Mode())); err != nil {
 				return fmt.Errorf("chmod %s: %w", target, err)
 			}
 			createdDirs = append(createdDirs, target)
@@ -300,6 +301,14 @@ func copyTreeFsync(src, dst string) error {
 	return nil
 }
 
+// preservedMode returns the chmod-applicable mode bits of m: the rwx
+// permission bits PLUS setuid/setgid/sticky. m.Perm() alone masks the
+// special bits off (Copilot). Staged content is 0755 today, so this is
+// forward-looking exactness rather than a current bug.
+func preservedMode(m os.FileMode) os.FileMode {
+	return m.Perm() | (m & (os.ModeSetuid | os.ModeSetgid | os.ModeSticky))
+}
+
 func copyFileFsync(src, dst string, mode os.FileMode) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -316,7 +325,8 @@ func copyFileFsync(src, dst string, mode os.FileMode) error {
 	// OpenFile applies the umask to the create mode, so chmod to the exact
 	// source mode — the staged binaries are 0755 and must stay executable
 	// through versions/<ver>/ regardless of the installing process's umask.
-	if err := out.Chmod(mode.Perm()); err != nil {
+	// preservedMode keeps any setuid/setgid/sticky bits too (Copilot).
+	if err := out.Chmod(preservedMode(mode)); err != nil {
 		out.Close()
 		return fmt.Errorf("chmod %s: %w", dst, err)
 	}

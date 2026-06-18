@@ -183,6 +183,22 @@ func TestSeed_PreservesModes(t *testing.T) {
 	if err := os.Chmod(rofile, 0o640); err != nil {
 		t.Fatal(err)
 	}
+	// A setgid directory: the special bit must be preserved (Copilot r3).
+	// NOTE: Go's os.FileMode does NOT map octal 0o2000 to setgid — the
+	// setgid flag is os.ModeSetgid (a high bit), so chmod with that flag.
+	sgiddir := filepath.Join(cfg.StagedDir, "shared")
+	if err := os.MkdirAll(sgiddir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(sgiddir, 0o775|os.ModeSetgid); err != nil {
+		t.Fatal(err)
+	}
+	// Skip the assertion if the staging filesystem dropped the setgid bit
+	// (some tmpfs configs do); only assert preservation when the source
+	// actually carries it.
+	if sfi, _ := os.Stat(sgiddir); sfi.Mode()&os.ModeSetgid == 0 {
+		t.Skip("staging filesystem does not preserve the setgid bit; cannot test preservation")
+	}
 	if err := Seed(cfg); err != nil {
 		t.Fatalf("Seed: %v", err)
 	}
@@ -207,6 +223,17 @@ func TestSeed_PreservesModes(t *testing.T) {
 	}
 	if binInfo.Mode().Perm()&0o111 == 0 {
 		t.Errorf("seeded xpfd not executable: mode %o", binInfo.Mode().Perm())
+	}
+	// The setgid special bit must survive (Copilot r3: chmod must not mask it).
+	sgidInfo, err := os.Stat(filepath.Join(cfg.VersionsDir, "1.0.0", "shared"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sgidInfo.Mode()&os.ModeSetgid == 0 {
+		t.Errorf("seeded setgid dir lost its setgid bit: mode %o", sgidInfo.Mode())
+	}
+	if sgidInfo.Mode().Perm() != 0o775 {
+		t.Errorf("seeded setgid dir perm = %o, want 0775", sgidInfo.Mode().Perm())
 	}
 }
 
