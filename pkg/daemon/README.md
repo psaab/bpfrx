@@ -75,9 +75,9 @@ never lock an operator out of a remote box it manages.
 - **Fail-closed on compile failure (#1960):** a PRESENT, previously-committed
   `active.json` that is valid JSON but no longer COMPILES (even through the
   tolerant `compileTreeLenient` path) is the dangerous tuple
-  `ActiveConfig()==nil` + `EverCommitted()==true` — without a guard that
-  resolves to **normal** and runs the positional claim-all rename on a box
-  whose intended config is unknown. `Store.Load` now tags this error with
+  `ActiveConfig()==nil` + `EverCommitted()==true`. Without a guard, that
+  tuple resolves to **normal** and runs the positional claim-all rename on a
+  box whose intended config is unknown. `Store.Load` now tags this error with
   `configstore.ErrConfigCompile`; `Run` classifies it via `classifyLoadError`,
   logs it loudly (Error), SKIPS `bootstrapFromFile` (so the text `xpf.conf` is
   not blind-imported over the broken DB), and passes `configCompileFailed=true`

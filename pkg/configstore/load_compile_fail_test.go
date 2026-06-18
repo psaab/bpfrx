@@ -22,8 +22,8 @@ import (
 // That (ActiveConfig()==nil, EverCommitted()==true) tuple is exactly the
 // state that, before #1960, drove the boot predicate to NORMAL boot and the
 // positional claim-all interface rename. The daemon-side test
-// (TestBootCompileFailureEntersBootstrap) proves the boot path now refuses
-// takeover; this test proves the signal those decisions rely on.
+// (TestCompileFailureForcesBootstrapNotClaimAll) proves the boot path now
+// refuses takeover; this test proves the signal those decisions rely on.
 func TestLoadCommittedConfigCompileFailureFailsClosed(t *testing.T) {
 	dir := t.TempDir()
 
