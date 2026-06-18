@@ -8,7 +8,7 @@ Below is the adversarial review of the proposed [plan.md](file:///home/ps/git/bp
 
 ### 1. Root Cause Validation & Rust Serde Adapter Check
 
-The hypothesis that the `virtio no transit` issue is caused by a JSON wire-type mismatch is **correct**. 
+The hypothesis that the `virtio no transit` issue is caused by a JSON wire-type mismatch is **correct**.
 * **Go encoding:** In Go, the default JSON encoding for `[]byte` and `[]uint8` is a base64-encoded string (e.g., `"dscp_values":"Lg=="`).
 * **Rust expectations:** Standard Rust Serde sequence types expect a JSON array/sequence of values (e.g. `[46]`) when deserializing into `Vec<u8>`.
 * **Serde adapter check:** A grep search for `deserialize_with` or custom `Deserialize` traits in `userspace-dp` returned **0 results**. There is no base64 adapter logic or dependency configured on the Rust helper side.
@@ -29,31 +29,31 @@ A search for literal `[]` slices in [protocol.go](file:///home/ps/git/bpfrx/pkg/
 1. `CoSDSCPClassifierEntrySnapshot.DSCPValues` in [protocol.go:L191-195](file:///home/ps/git/bpfrx/pkg/dataplane/userspace/protocol.go#L191-L195):
    ```go
    type CoSDSCPClassifierEntrySnapshot struct {
-   	ForwardingClass string  `json:"forwarding_class,omitempty"`
-   	LossPriority    string  `json:"loss_priority,omitempty"`
-   	DSCPValues      []uint8 `json:"dscp_values,omitempty"`
+	ForwardingClass string  `json:"forwarding_class,omitempty"`
+	LossPriority    string  `json:"loss_priority,omitempty"`
+	DSCPValues      []uint8 `json:"dscp_values,omitempty"`
    }
    ```
 2. `CoSIEEE8021ClassifierEntrySnapshot.CodePoints` in [protocol.go:L202-206](file:///home/ps/git/bpfrx/pkg/dataplane/userspace/protocol.go#L202-L206):
    ```go
    type CoSIEEE8021ClassifierEntrySnapshot struct {
-   	ForwardingClass string  `json:"forwarding_class,omitempty"`
-   	LossPriority    string  `json:"loss_priority,omitempty"`
-   	CodePoints      []uint8 `json:"code_points,omitempty"`
+	ForwardingClass string  `json:"forwarding_class,omitempty"`
+	LossPriority    string  `json:"loss_priority,omitempty"`
+	CodePoints      []uint8 `json:"code_points,omitempty"`
    }
    ```
 3. `FirewallTermSnapshot.DSCPValues` in [protocol.go:L410-418](file:///home/ps/git/bpfrx/pkg/dataplane/userspace/protocol.go#L410-L418):
    ```go
    type FirewallTermSnapshot struct {
        ...
-   	DSCPValues      []uint8  `json:"dscp_values,omitempty"`
+	DSCPValues      []uint8  `json:"dscp_values,omitempty"`
    ```
 
 No other `[]byte` or `[]uint8` fields exist on the control plane wire interface.
 
 ### 3. Q1: Treating Virtio Forwarding as "UNPROVEN"
 
-Treating the virtio forwarding path as **UNPROVEN** is **correct and critical**. 
+Treating the virtio forwarding path as **UNPROVEN** is **correct and critical**.
 * **Reasoning:** Since `apply_snapshot` failed on bootstrap configurations containing classifiers/firewall filters, the helper has never transitioned to `enabled:true` or `forwarding_armed` on virtio VMs. Thus, the packet-loop binding and rx/tx logic have never successfully run on virtio.
 * **Risk:** Virtio-net uses `XDP_COPY` mode (or auto-mode falling back to copy) where kernel NAPI drives packet delivery. We must prove via a live transit test that standard forwarding actually delivers packets on copy-mode virtio interfaces once armed, rather than silently failing due to driver/NAPI issues.
 
