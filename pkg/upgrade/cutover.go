@@ -256,7 +256,11 @@ func (r *Runner) Run(opts Options) (err error) {
 	// ---- VERIFY (pure) ----
 	if !j.State.atLeast(StateVerified) {
 		if err := r.verify(j); err != nil {
-			// A REJECT or verify failure leaves live state untouched.
+			// A REJECT or verify failure leaves live state untouched. Clean up
+			// the just-copied versions/<ver> so a same-version retry recopies
+			// a corrected staged binary instead of re-verifying the stale
+			// failing copy (#1967 verify-fail cleanup).
+			r.cleanupFailedVerifyCopy(j)
 			return fmt.Errorf("verify-dataplane: %w", err)
 		}
 		if err := r.transition(j, StateVerified); err != nil {
@@ -325,13 +329,40 @@ func (r *Runner) Run(opts Options) (err error) {
 
 	// ---- START ----
 	if !j.State.atLeast(StateStarted) {
+		// C3 (diagnostic): confirm the flipped-in version dir is still
+		// complete before StartUnit (#1967). A concurrent GC or disk event in
+		// the FLIP->START window could remove versions/<ver>/xpfd, making
+		// systemd exec a missing binary. The outcome is ALREADY covered by the
+		// START-failure auto-rollback below (a missing ExecStart fails the
+		// start), so this is not a new correctness path — it only converts an
+		// opaque systemd "exec format/no such file" into a clear, actionable
+		// error and lets the rollback fire from a known cause. Routed through
+		// the SAME firstNonNil/rollback machinery so HA semantics are
+		// unchanged.
+		var preStartErr error
+		for _, b := range []string{"xpfd", "xpf-userspace-dp"} {
+			p := filepath.Join(r.versionDir(j.TargetVersion), b)
+			if _, serr := os.Stat(p); serr != nil {
+				preStartErr = fmt.Errorf("flipped-in version dir incomplete before "+
+					"start: %s: %w (versions/%s vanished in the FLIP->START window?)",
+					p, serr, j.TargetVersion)
+				break
+			}
+		}
 		// A StartUnit exec failure is treated the SAME as an unhealthy
 		// start (AGY r3 Medium): the binary is already flipped-in, so a
 		// failure to start leaves the daemon OFFLINE unless we roll back.
 		// Both the start-exec error and the health error route through the
 		// standalone auto-rollback (or surface for operator-driven HA
 		// rollback when SkipStartHealthRollback is set).
-		startErr := r.cfg.Sys.StartUnit(r.cfg.Unit)
+		var startErr error
+		if preStartErr != nil {
+			// Skip the doomed StartUnit; surface the concrete missing-binary
+			// cause and let the shared failure path roll back.
+			startErr = preStartErr
+		} else {
+			startErr = r.cfg.Sys.StartUnit(r.cfg.Unit)
+		}
 		var healthErr error
 		if startErr == nil {
 			healthErr = r.cfg.Sys.HelperHealthy(j.TargetVersion, r.cfg.StartHealthDeadline)
@@ -514,4 +545,60 @@ func (r *Runner) verify(j *Journal) error {
 			"refusing to cut over to %s (live dataplane untouched)", j.TargetVersion)
 	}
 	return nil
+}
+
+// cleanupFailedVerifyCopy removes the just-copied versions/<TargetVersion>
+// after a VERIFY failure so a subsequent run keyed by the SAME version string
+// recopies the (presumably corrected) staged tree rather than re-verifying the
+// stale failing copy (#1967 verify-fail cleanup). copyStaged skips the copy
+// when versions/<ver> already exists, so without this a dev/test/reinstall
+// retry under the same version would re-verify the bad copy forever.
+//
+// Two MANDATORY guards (plan §6 AGY-r4-2/3):
+//
+//   - NEVER delete the active version. Removing it would destroy the RUNNING
+//     daemon's binaries. We only remove versions/<TargetVersion> when it is
+//     neither the previous (rollback) version NOR the live `current` target.
+//     VERIFY is a pure pre-STOP step, so the only way TargetVersion could be
+//     active is a degenerate same-version re-stage; the guard makes that safe.
+//   - RESET the journal so the next run re-runs copyStaged. After a successful
+//     COPY the journal is at StateCopied; if we delete the dir but leave the
+//     journal there, the next run SKIPS copyStaged (state already >= Copied)
+//     and VERIFY then fails file-not-found. We rewind to StatePreflight (the
+//     DB snapshot from preflight is still valid) and persist.
+//
+// Best-effort: a cleanup failure is logged, never masking the verify error
+// the caller is about to return. If the dir was protected (active), we still
+// reset the journal so a retry re-enters cleanly.
+func (r *Runner) cleanupFailedVerifyCopy(j *Journal) {
+	ver := j.TargetVersion
+	if ver == "" {
+		return
+	}
+	cur, _ := r.readCurrentVersion()
+	if ver == j.PreviousVersion || ver == cur {
+		// Guard (a): the target version is the rollback target or the live
+		// `current` — its dir backs a runnable daemon. NEVER delete it. A
+		// same-version re-stage that fails verify against the active version
+		// is a no-op for the running daemon; nothing to clean.
+		r.logf("upgrade: verify-fail cleanup SKIPPED for %s (it is the active/"+
+			"rollback version; refusing to delete a live version dir)", ver)
+	} else if err := os.RemoveAll(r.versionDir(ver)); err != nil {
+		r.logf("upgrade: WARN verify-fail cleanup of %s failed: %v", r.versionDir(ver), err)
+	} else {
+		// Make the unlink durable so a crash cannot resurrect the failing copy
+		// and re-trip the copyStaged-skip on a retry.
+		if serr := partialSweepSyncDir(r.cfg.VersionsDir); serr != nil {
+			r.logf("upgrade: WARN fsync versions dir after verify-fail cleanup: %v", serr)
+		}
+		r.logf("upgrade: removed copied version dir %s after verify failure "+
+			"(a retry will recopy from staged)", r.versionDir(ver))
+	}
+	// Guard (b): rewind the journal so the retry re-runs copyStaged. Without
+	// this the journal stays at StateCopied and the retry would skip the copy
+	// and fail verify with file-not-found.
+	j.State = StatePreflight
+	if err := r.saveJournal(j); err != nil {
+		r.logf("upgrade: WARN reset journal after verify-fail cleanup: %v", err)
+	}
 }
