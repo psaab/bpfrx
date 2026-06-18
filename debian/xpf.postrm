@@ -40,6 +40,10 @@ BINS="xpfd cli xpf-userspace-dp xpf-day0-config"
 atomic_symlink() {
     _link="$1"; _target="$2"
     mkdir -p "$(dirname "$_link")"
+    # Clear any stale temp path first (Copilot): a leftover directory at
+    # "$_link.tmp" would make `ln -sf` nest the symlink inside it and the
+    # `mv -f` act on the wrong path.
+    rm -rf "$_link.tmp"
     ln -sf "$_target" "$_link.tmp"
     mv -f "$_link.tmp" "$_link"
 }

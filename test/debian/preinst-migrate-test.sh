@@ -143,6 +143,25 @@ scenario_no_staged() {
     [ ! -e "$CURRENT" ] || { echo "FAIL: created current with no staged"; exit 1; }
 }
 
+# atomic_symlink must tolerate a STALE DIRECTORY at "$link.tmp" (Copilot):
+# without rm -rf, `ln -sf` would nest the symlink inside it and `mv -f` would
+# misbehave. Pre-plant a stale .tmp dir at every sbin + the current temp path.
+scenario_stale_tmp_dir() {
+    build_legacy "1.0.0"
+    mkdir -p "$CURRENT.tmp"          # stale dir where current's temp goes
+    for b in $BINS; do
+        mkdir -p "$SBIN/$b.tmp"      # stale dir where each sbin temp goes
+    done
+    migrate_legacy_layout upgrade "0.9.0"
+    assert_seeded_to "1.0.0"
+    # The temp dirs must be gone (consumed by mv) — not lingering with a
+    # symlink nested inside.
+    [ ! -e "$CURRENT.tmp" ] || { echo "FAIL: stale current.tmp survived"; exit 1; }
+    for b in $BINS; do
+        [ ! -d "$SBIN/$b.tmp" ] || { echo "FAIL: stale $b.tmp dir survived"; exit 1; }
+    done
+}
+
 run_scenario basic
 run_scenario idempotent
 run_scenario resume_after_current
@@ -150,4 +169,5 @@ run_scenario rename_collision
 run_scenario fallback_dpkg_version
 run_scenario no_safe_version
 run_scenario no_staged
+run_scenario stale_tmp_dir
 echo "ALL PREINST-MIGRATE SCENARIOS PASSED"

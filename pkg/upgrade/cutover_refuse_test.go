@@ -249,7 +249,7 @@ func TestRun_JournalRecordsFirstCutSanction(t *testing.T) {
 // non-nil error so the caller does not treat it as success.
 func TestFlipFailure_FirstCutRestartsDaemon(t *testing.T) {
 	fs := newFakeSystem(t, "2.0.0")
-	r, _ := testEnv(t, fs)
+	r, cfg := testEnv(t, fs)
 	// Sanctioned first cut; make the flip (daemon-reload substep) fail once.
 	fs.daemonReloadFailOnce = true
 
@@ -266,6 +266,31 @@ func TestFlipFailure_FirstCutRestartsDaemon(t *testing.T) {
 	}
 	// Order: stop happened, then a start to bring it back.
 	assertOrder(t, fs.calls, "stop", "start")
+	// The journal must be CLEARED (Copilot r3): leaving it at StateStopped
+	// would let a re-run skip STOP, run flip/start as a no-op against the
+	// already-running unit, and mark the cut COMMITTED without a real restart.
+	if _, serr := os.Stat(cfg.JournalPath); !os.IsNotExist(serr) {
+		t.Error("journal not cleared after a first-cut flip-failure restart "+
+			"(a re-run would skip STOP and falsely commit)")
+	}
+	// Prove it: a clean re-run (daemon-reload now succeeds) must do a REAL
+	// fresh cut — STOP the unit again — not skip into a no-op commit. There is
+	// no current yet (the failed first cut never flipped it), so without a
+	// sanction the re-run is correctly refused; with the sanction it cuts.
+	fs.calls = nil
+	if rerr := r.Run(Options{AllowNoRollbackFirstCut: true}); rerr != nil {
+		t.Fatalf("clean re-run after first-cut flip failure: %v", rerr)
+	}
+	sawStop := false
+	for _, c := range fs.calls {
+		if c == "stop" {
+			sawStop = true
+		}
+	}
+	if !sawStop {
+		t.Error("re-run did not STOP the unit — it resumed a stale journal and "+
+			"committed without a real restart")
+	}
 }
 
 // TestFlipFailure_RollsBackWhenPreviousExists proves a flip failure AFTER

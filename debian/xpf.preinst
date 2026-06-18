@@ -79,6 +79,11 @@ atomic_symlink() {
     _link="$1"; _target="$2"
     _dir=$(dirname "$_link")
     mkdir -p "$_dir"
+    # Clear any stale temp path first (Copilot): if a directory exists at
+    # "$_link.tmp", `ln -sf` would create the symlink INSIDE it and the
+    # following `mv -f` would move the wrong thing. rm -rf makes the temp an
+    # unambiguously fresh symlink target.
+    rm -rf "$_link.tmp"
     ln -sf "$_target" "$_link.tmp"
     mv -f "$_link.tmp" "$_link"
 }

@@ -217,6 +217,16 @@ func (r *Runner) recoverFromFlipFailure(j *Journal, opts Options, flipErr error)
 			"daemon failed (%v) — daemon is OFFLINE, operator intervention required",
 			flipErr, startErr)
 	}
+	// Clear the journal (Copilot r3): leaving it at StateStopped would let a
+	// subsequent Run() SKIP the STOP step (the unit is already running again),
+	// run flip/start as a no-op against the live unit, and mark the cut
+	// COMMITTED without ever restarting to the new ExecStart/drop-in. The cut
+	// failed and we restored the first-install daemon, so the attempt is
+	// abandoned — a re-run must start fresh against whatever is staged (which,
+	// after this restart, has a real PreviousVersion in versions/current).
+	if cerr := r.clearJournal(); cerr != nil {
+		r.logf("upgrade: WARN clear journal after first-cut flip-failure restart: %v", cerr)
+	}
 	return fmt.Errorf("flip to %s failed on a sanctioned first cut; restarted the "+
 		"first-install daemon from versions/current (no rollback target existed): %w",
 		j.TargetVersion, flipErr)

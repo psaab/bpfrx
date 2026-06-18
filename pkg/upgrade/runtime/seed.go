@@ -39,10 +39,13 @@ import (
 )
 
 // Default layout, shared with pkg/upgrade. Overridable in Config for tests.
+// Default layout paths are the SINGLE source of truth in pkg/upgrade; the
+// runtime package references them (Copilot) so a future layout change updates
+// both the cut machine and the first-install seed together.
 const (
-	defaultStagedDir   = "/usr/local/share/xpf/staged"
-	defaultVersionsDir = "/var/lib/xpf/versions"
-	defaultSbinDir     = "/usr/local/sbin"
+	defaultStagedDir   = upgrade.DefaultStagedDir
+	defaultVersionsDir = upgrade.DefaultVersionsDir
+	defaultSbinDir     = upgrade.DefaultSbinDir
 
 	currentLink = "current"
 )
