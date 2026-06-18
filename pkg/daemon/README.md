@@ -91,13 +91,23 @@ never lock an operator out of a remote box it manages.
     `10-xpf-*` `.network`/`.link` files, clears the FRR managed section, and
     tears down the dataplane); that teardown is reserved for confirmed-commit
     rollback. On a previously-committed box the last-good networkd + FRR state
-    therefore persists untouched, so mgmt — and any already-forwarding data
-    path — keeps working while the operator fixes the config. That is a
-    deliberate choice: the only thing the box must NOT do on an uncompilable
-    config is the *new* takeover (positional claim-all / fresh apply), which
-    bootstrap suppresses. The lifeline/protected set govern the rename + apply
-    sweeps and the fresh-install case; they are not what keeps a *previously*
-    managed box reachable here.
+    therefore persists untouched, so the box stays reachable at its EXISTING
+    management address (rather than dropping to bootstrap fxp0-DHCP and
+    possibly changing the IP out from under a connected operator) while the
+    config is fixed. That is a deliberate choice: the only thing the box must
+    NOT do on an uncompilable config is the *new* takeover (positional
+    claim-all / fresh apply), which bootstrap suppresses. The lifeline/protected
+    set govern the rename + apply sweeps and the fresh-install case; they are
+    not what keeps a *previously* managed box reachable here.
+    - **Transit is still fail-closed** — do not read "freeze" as "the firewall
+      keeps forwarding." Bootstrap mode suppresses `enableForwarding` and the
+      dataplane arm (`dp.Start`), so the daemon itself forwards no transit in
+      this state. A cold reboot therefore carries NO transit until the operator
+      commits a compilable config; only a daemon *restart* that leaves an
+      already-armed dataplane process running keeps enforcing the
+      last-known-good policy in the interim. Either way no traffic is forwarded
+      under an unknown/no policy — what persists is interface identity + mgmt
+      reachability, not unpoliced forwarding.
   - **In-band recovery is real (not just "repair the DB").** On compile failure
     `Store.Load` keeps `compiled` nil (the fail-closed signal) but retains the
     parsed-but-broken tree as the active tree and loads the on-disk rollback
