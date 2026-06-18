@@ -80,11 +80,27 @@ func (c *RollingConfig) withDefaults() {
 // If the drain predicate cannot be met within the deadline, ABORT WITHOUT
 // cutting — the node is still forwarding, so no harm.
 func RunRolling(r *Runner, cfg Config) error {
+	// Acquire the host-wide upgrade lock at the rolling-driver ENTRY and
+	// hold it through rejoin (#1965, plan §5). This covers the whole
+	// window — peer-check + ForceSecondary + the drain wait + the cut +
+	// the rejoin — not just the inner r.Run(). The inner r.Run() is
+	// invoked with LockAlreadyHeld so it does NOT re-flock the same file
+	// (a second flock on a fresh fd of the same path returns EWOULDBLOCK
+	// and would abort the rolling upgrade). Release on every exit path.
+	h, err := acquireUpgradeLock("upgrade --rolling", "")
+	if err != nil {
+		return fmt.Errorf("upgrade --rolling: %w", err)
+	}
+	defer func() { _ = h.Release() }()
+
 	cl := NewCLICluster(cfg.Unit)
 	return runRollingWith(r, cl, RollingConfig{})
 }
 
-// runRollingWith is the testable core (cluster + timing injected).
+// runRollingWith is the testable core (cluster + timing injected). It does
+// NOT acquire the upgrade lock — its only caller, RunRolling, holds it for
+// the whole rolling window, and the inner r.Run() it invokes runs with
+// LockAlreadyHeld so it does not re-flock (#1965).
 func runRollingWith(r *Runner, cl RollingCluster, rc RollingConfig) error {
 	rc.withDefaults()
 	logf := r.logf
@@ -149,7 +165,10 @@ func runRollingWith(r *Runner, cl RollingCluster, rc RollingConfig) error {
 
 	// 5. Single-node cut on the fully-drained node. Auto-rollback is
 	//    DISABLED: HA rollback is operator-driven (plan §8 inv. 8).
-	if err := r.Run(Options{SkipStartHealthRollback: true}); err != nil {
+	//    LockAlreadyHeld: RunRolling holds the host-wide upgrade lock for
+	//    the whole rolling window, so the inner cut must NOT re-flock the
+	//    same file (it would EWOULDBLOCK and abort) — #1965.
+	if err := r.Run(Options{SkipStartHealthRollback: true, LockAlreadyHeld: true}); err != nil {
 		return fmt.Errorf("rolling: single-node cut failed (HA rollback is "+
 			"operator-driven — inspect the node): %w", err)
 	}
