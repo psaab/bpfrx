@@ -138,9 +138,25 @@ def ensure_memlock():
             "(sudo prlimit --memlock=unlimited:unlimited --pid $$) and re-run")
 
 
+# The production appliance base is pinned to Ubuntu 26.04 LTS (#1943). Bumping
+# it is a DELIBERATE, REVIEWED decision — not auto-latest (CLAUDE.md "Ubuntu
+# 26.04 parity": "the test VM tracks whatever release production was last baked
+# at — a deliberate, reviewed bump, not auto-latest"). The old default scraped
+# cloud-images.ubuntu.com and took the highest-numbered listing, which silently
+# selects whatever the mirror lists as newest — a non-LTS (e.g. 26.10) or, when
+# an LTS image lags publication, the previous release (25.10). That drift is
+# exactly what the contract forbids, so the default is the pinned LTS. The
+# reviewed bump is a code change to PINNED_BASE_RELEASE below (lands via PR);
+# XPF_BASE_RELEASE=<rel> is a one-off runtime override, and
+# XPF_UBUNTU_AUTODISCOVER=1 opts back into mirror-latest discovery.
+PINNED_BASE_RELEASE = "26.04"
+
+
 def discover_base_release():
     if os.environ.get("XPF_BASE_RELEASE"):
         return os.environ["XPF_BASE_RELEASE"]
+    if os.environ.get("XPF_UBUNTU_AUTODISCOVER") != "1":
+        return PINNED_BASE_RELEASE
     url = os.environ.get("XPF_UBUNTU_RELEASES_URL",
                          "https://cloud-images.ubuntu.com/releases")
     import re
