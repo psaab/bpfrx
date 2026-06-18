@@ -16,9 +16,10 @@ import (
 	"github.com/psaab/xpf/pkg/upgrade/lock"
 )
 
-// upgradeLock is the host-wide advisory lock surface, indirected through a
-// package var so tests can substitute a fake that records acquire/release
-// ordering and can be forced busy (#1965). Production calls lock.Acquire.
+// lockHandle is the host-wide advisory lock surface used by the upgrade
+// runner. acquireUpgradeLock is indirected through a package var so tests
+// can substitute a fake that records acquire/release ordering and can be
+// forced busy (#1965). Production calls lock.Acquire.
 type lockHandle interface{ Release() error }
 
 var acquireUpgradeLock = func(subcommand, target string) (lockHandle, error) {
