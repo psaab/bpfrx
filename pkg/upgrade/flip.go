@@ -167,6 +167,57 @@ func (r *Runner) rollback(j *Journal) error {
 	return r.clearJournal()
 }
 
+// recoverFromFlipFailure handles a flip() error. The STOP step already ran,
+// so the unit is DOWN; we must not leave the daemon offline (AGY-5,
+// mechanism C). Recovery depends on whether a rollback target exists:
+//
+//   - PreviousVersion != "": roll back to it (re-flip + DB restore + start
+//     the old daemon). On the HA path (SkipStartHealthRollback) auto-
+//     rollback is operator-driven, so we surface the flip error instead of
+//     re-flipping — but only when there is genuinely a peer-owned recovery;
+//     the daemon is still expected back up via operator action.
+//   - PreviousVersion == "" (sanctioned first cut): there is no prior
+//     version to roll back to, but versions/current was seeded (A/B) and the
+//     flip's only possibly-completed substep (6a) repoints current to the
+//     SAME first-install version, so current still resolves to a launchable
+//     binary. Restart the unit so the first-install daemon comes back up,
+//     then return the flip error so the caller does not treat the cut as a
+//     success.
+//
+// In all cases recoverFromFlipFailure returns a NON-NIL error (AGY-r2-4b):
+// a flip failure is never a successful cut, even after a clean recovery.
+func (r *Runner) recoverFromFlipFailure(j *Journal, opts Options, flipErr error) error {
+	if j.PreviousVersion != "" {
+		if opts.SkipStartHealthRollback {
+			// HA path: rollback is operator-driven. Surface the failure with
+			// the unit's state made explicit so the operator can recover.
+			return fmt.Errorf("flip failed after STOP (HA: rollback is operator-driven; "+
+				"the unit is stopped — recover the node): %w", flipErr)
+		}
+		r.logf("upgrade: flip to %s failed after STOP (%v); AUTO-ROLLBACK to %s",
+			j.TargetVersion, flipErr, j.PreviousVersion)
+		if rbErr := r.rollback(j); rbErr != nil {
+			return fmt.Errorf("flip failed (%v) AND rollback failed: %w", flipErr, rbErr)
+		}
+		return fmt.Errorf("flip to %s failed; rolled back to %s: %w",
+			j.TargetVersion, j.PreviousVersion, flipErr)
+	}
+
+	// Sanctioned first cut (PreviousVersion==""): no prior version, but the
+	// first-install binary is present in versions/current. Restart it so the
+	// daemon is not left offline.
+	r.logf("upgrade: flip to %s failed after STOP on a sanctioned first cut (%v); "+
+		"restarting the first-install daemon from versions/current", j.TargetVersion, flipErr)
+	if startErr := r.cfg.Sys.StartUnit(r.cfg.Unit); startErr != nil {
+		return fmt.Errorf("flip failed (%v) on a first cut AND restart of the first-install "+
+			"daemon failed (%v) — daemon is OFFLINE, operator intervention required",
+			flipErr, startErr)
+	}
+	return fmt.Errorf("flip to %s failed on a sanctioned first cut; restarted the "+
+		"first-install daemon from versions/current (no rollback target existed): %w",
+		j.TargetVersion, flipErr)
+}
+
 // restoreDBSnapshot replaces the live config DB dir with the snapshot taken
 // in PREFLIGHT, crash-safely. Strategy:
 //

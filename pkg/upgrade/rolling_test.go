@@ -2,6 +2,8 @@ package upgrade
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -52,9 +54,31 @@ func fastRC() RollingConfig {
 	}
 }
 
+// seedInitialCurrent models the post-#1964 reality that every node — HA
+// included — has its versioned runtime seeded at install (mechanism A), so
+// versions/current exists and the rolling cut has a real rollback target
+// (PreviousVersion != ""). Without it a rolling cut would hit the
+// refuse-before-STOP invariant (#1964 mechanism C), which is exactly the
+// behavior an UNSEEDED node should get. The rolling tests that proceed to
+// the cut seed an initial current; the abort-early tests do not need it.
+func seedInitialCurrent(t *testing.T, r *Runner, cfg Config, ver string) {
+	t.Helper()
+	verDir := filepath.Join(cfg.VersionsDir, ver)
+	for _, b := range managedBins {
+		writeFakeBin(t, filepath.Join(verDir, b), "binary-"+b+"-"+ver)
+	}
+	if err := os.MkdirAll(cfg.VersionsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(ver, filepath.Join(cfg.VersionsDir, currentLink)); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRolling_HappyPath(t *testing.T) {
 	fs := newFakeSystem(t, "2.0.0")
-	r, _ := testEnv(t, fs)
+	r, cfg := testEnv(t, fs)
+	seedInitialCurrent(t, r, cfg, "1.0.0") // post-#1964: node already seeded
 	cl := &fakeCluster{peerAlive: true, synced: true, compatible: true, peerReady: true, drainAfter: 2}
 
 	if err := runRollingWith(r, cl, fastRC()); err != nil {
@@ -150,7 +174,8 @@ func TestRolling_AbortsAndFailsBackIfDrainTimesOut(t *testing.T) {
 // 127.0.0.1:50051" surfaced ~immediately, never using RejoinDeadline).
 func TestRolling_RejoinToleratesTransientSyncErr(t *testing.T) {
 	fs := newFakeSystem(t, "2.0.0")
-	r, _ := testEnv(t, fs)
+	r, cfg := testEnv(t, fs)
+	seedInitialCurrent(t, r, cfg, "1.0.0") // post-#1964: node already seeded
 	// SyncEstablished errors (connection refused) for the first 5 polls,
 	// then succeeds — mimicking the daemon coming up ~6 polls after the cut.
 	cl := &fakeCluster{peerAlive: true, synced: true, compatible: true, peerReady: true, drainAfter: 2, syncErrPolls: 5}
@@ -174,7 +199,8 @@ func TestRolling_RejoinToleratesTransientSyncErr(t *testing.T) {
 // the last observed error for operator diagnosis.
 func TestRolling_RejoinTimesOutSurfacesLastErr(t *testing.T) {
 	fs := newFakeSystem(t, "2.0.0")
-	r, _ := testEnv(t, fs)
+	r, cfg := testEnv(t, fs)
+	seedInitialCurrent(t, r, cfg, "1.0.0") // post-#1964: node already seeded
 	// Never re-establishes sync (huge syncErrPolls), short RejoinDeadline.
 	cl := &fakeCluster{peerAlive: true, synced: true, compatible: true, peerReady: true, drainAfter: 2, syncErrPolls: 1 << 30}
 

@@ -12,9 +12,9 @@ subcommand, the postinst HA-mode contract, and the dogfood deploy.
 
 ```
 /usr/local/share/xpf/staged/          dpkg-static staging (increment A) — apt's write target
-/var/lib/xpf/versions/<ver>/          non-dpkg runtime version dirs (retain N=3)
+/var/lib/xpf/versions/<ver>/          non-dpkg runtime version dirs (retain N=3); maintainer-script-managed, NEVER in dpkg's file list (#1964) — seeded at first install
 /var/lib/xpf/versions/current -> <ver># bookkeeping pointer (the verified-live version)
-/usr/local/sbin/{xpfd,cli,...} -> versions/current/<bin>   operator-tool links
+/usr/local/sbin/{xpfd,cli,...} -> versions/current/<bin>   live + operator links (resolve THROUGH current, #1964)
 /var/lib/xpf/upgrade.state            crash-safe state-machine journal
 /etc/systemd/system/xpfd.service.d/10-xpf-version.conf     ExecStart pinned to the CONCRETE version
 ```
@@ -71,6 +71,73 @@ would boot an N daemon that fatal-rejects the N+1 envelope DB (a brick).
 The HA path disables auto-rollback — HA rollback is operator-driven (an
 auto re-flip mid-rolling un-coordinates the cluster).
 
+## First-install seed + legacy migration + refuse-before-STOP (#1964)
+
+The cut needs a real, immutable rollback target. Before #1964 the very
+first `.deb` install seeded none: the first (or legacy-migration) upgrade
+had `PreviousVersion==""` and `rollback()` hard-refused — but dpkg had
+already overwritten the old binary in `staged/`, so there was no recovery
+path. #1964 closes this with three composed mechanisms (A/B/C) and one
+layout invariant.
+
+**Layout invariant:** `versions/<ver>/` and the `current` symlink are
+runtime state OWNED BY THE MAINTAINER SCRIPTS, never in dpkg's file list.
+dpkg only ever writes `staged/`. `/usr/local/sbin/*` resolve THROUGH
+`versions/current`. Consequence: dpkg can never clobber a versioned
+rollback target on a later unpack, because it does not know those paths
+exist.
+
+- **A — first-install seed (`xpfd seed-runtime`, `pkg/upgrade/runtime`).**
+  On first install (`$2` empty) the postinst runs `seed-runtime` AFTER
+  unpack but BEFORE `#DEBHELPER#` starts the unit: copy `staged/*` →
+  `versions/<v>/`, set `versions/current → <v>`, repoint sbin through
+  `versions/current`. No cut/verify/stop. Idempotent + crash-safe (`.partial`
+  + atomic rename; symlinks via temp+rename; a re-run converges). If
+  seeding fails the postinst falls back to legacy direct-staged links (the
+  next upgrade migrates) and never fails the install.
+- **B — legacy-migration snapshot (`debian/xpf.preinst`, self-contained
+  shell).** A host installed BEFORE this layout has sbin → `staged/` and no
+  `versions/current`. On its next upgrade the preinst — running BEFORE
+  unpack, so the new Go-seed-capable `xpfd` is not on disk yet — snapshots
+  the OLD `staged/*` into `versions/<oldver>/`, sets `current`, and
+  repoints sbin, all in the SAME `upgrade` case as the #1965 lock gate,
+  AFTER that gate passes. Idempotency: no-op the copy when `current` exists;
+  ALWAYS (idempotently) complete the sbin repoint (a crash after `current`
+  but before sbin still completes on retry). Rename-collision retry: if
+  `versions/<oldver>` already exists, skip copy+rename and jump to creating
+  `current` (avoid ENOTEMPTY blocking apt). Atomic symlink repoint via
+  `ln -sf … .tmp && mv -f` (NOT `ln -sfnT`, which unlinks-then-creates).
+  `<oldver>` is `staged/xpfd version` (validated a safe path segment),
+  falling back to a sanitized dpkg `$2` if the old binary won't exec; never
+  fails the transaction. Writes NO upgrade journal.
+- **C — refuse-before-STOP (unconditional pre-STOP invariant).** The cut
+  NEVER calls `StopUnit` unless a restorable target exists
+  (`PreviousVersion != ""`) OR it is an explicitly sanctioned no-rollback
+  first cut (`Options.AllowNoRollbackFirstCut`). With A/B this is
+  unreachable in the field (`current` always exists), so the refusal fires
+  only on an unexpected loss of the rollback target — exactly when a blind
+  STOP would brick the daemon. On a flip failure AFTER STOP (the unit is
+  already down), `recoverFromFlipFailure` rolls back to the previous
+  version, or — for a sanctioned first cut — restarts the first-install
+  binary from `versions/current`; it always returns a non-nil error so a
+  flip failure is never reported as success.
+
+Version strings that key `versions/<ver>` are validated as safe single path
+segments (`ValidateVersionSegment`: no `/`, `..`, leading dot, whitespace,
+or control chars — but `+`/`:`/`~`/`-` are allowed, so Debian/semver
+versions pass).
+
+**Lifecycle (`debian/xpf.postrm`):** remove/purge also remove sbin links
+that resolve through `versions/current` (in addition to legacy direct-staged
+links), only when owned. `versions/` is left on `remove` (a reinstall
+reuses it) and removed on `purge` (it is copied binaries, not operator
+config — Policy §6.8). A downgrade to a package predating this layout
+(detected via a `seed-runtime --capability-check` probe of the
+newly-unpacked staged `xpfd`) removes the runtime unit drop-in, repoints
+sbin back to `staged/` atomically, deletes `versions/current`, and
+boot-guarded `daemon-reload` — so the downgraded binaries actually take
+effect. (Drop-in removal on remove/purge is deferred to #1967.)
+
 ## HA rolling upgrade (`xpfd upgrade --rolling`)
 
 Cuts the LOCAL clustered node with a controlled drain so the cluster
@@ -117,10 +184,17 @@ case (NOT implemented here — see #1922).
 
 ## postinst HA-mode contract
 
-- STANDALONE node (no `/etc/xpf/node-id`): the postinst invokes
+- FIRST install (`$2` empty, any node type): the postinst runs `xpfd
+  seed-runtime` (#1964 mechanism A) — seed the versioned runtime + sbin
+  links, NO cut. The daemon comes up resolving `versions/current` with a
+  real rollback target in place.
+- STANDALONE node (no `/etc/xpf/node-id`), UPGRADE: the postinst invokes
   `xpfd upgrade` (verified single-node cut). `XPF_NO_POSTINST_CUT=1`
-  suppresses it.
-- CLUSTERED node (node-id present): STAGE-ONLY. Cut ONLY via
+  suppresses it. The cut's refuse-before-STOP guard (#1964 mechanism C)
+  keeps the daemon up if no rollback target exists (e.g. a host where
+  seeding/migration was skipped) — the postinst logs the non-zero cut and
+  leaves the old daemon running.
+- CLUSTERED node (node-id present), UPGRADE: STAGE-ONLY. Cut ONLY via
   `xpfd upgrade --rolling`. Keyed on node-id ALONE so a degraded-HA node
   never falls through to an uncoordinated standalone cut.
 

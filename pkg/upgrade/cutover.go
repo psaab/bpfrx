@@ -31,6 +31,24 @@ type Options struct {
 	// upgrade. The standalone single-node flow (and the postinst cut) leave
 	// it false so Run owns the lock.
 	LockAlreadyHeld bool
+
+	// AllowNoRollbackFirstCut sanctions a cut whose PreviousVersion is empty
+	// (#1964 mechanism C). C is an UNCONDITIONAL pre-STOP invariant (plan §8
+	// inv. C): the cut NEVER calls StopUnit unless either a restorable
+	// rollback target exists (PreviousVersion != "" — flip/start failure can
+	// recover by re-flipping the previous version) OR this flag explicitly
+	// sanctions a no-rollback first cut (no prior daemon to preserve). In the
+	// sanctioned case a flip failure still restarts the first-install binary
+	// from versions/current so the daemon is never left offline.
+	//
+	// With the #1964 first-install seed (A) and legacy-migration snapshot
+	// (B), versions/current — and therefore a non-empty PreviousVersion —
+	// exists on every field host, so an unsanctioned PreviousVersion=="" cut
+	// is refused as an unexpected loss of the rollback target rather than
+	// silently stopping a daemon it cannot recover. This flag is set only by
+	// the deliberate first-cut path (e.g. seeding failed and the operator
+	// chose to proceed), never by the routine postinst/operator cut.
+	AllowNoRollbackFirstCut bool
 }
 
 // Run executes (or resumes) the cut-over to the staged version. It is
@@ -183,6 +201,26 @@ func (r *Runner) Run(opts Options) (err error) {
 		}
 	}
 
+	// ---- REFUSE-BEFORE-STOP (mechanism C, plan §8 inv. C) ----
+	// This is the UNCONDITIONAL pre-STOP invariant: the cut must never stop a
+	// healthy daemon without a recovery path. A cut with no restorable target
+	// (PreviousVersion=="") is refused UNLESS it is an explicitly sanctioned
+	// no-rollback first cut. We check it before STOP (not at flip/start) so a
+	// healthy daemon is never even stopped in the unrecoverable case. With
+	// the #1964 seed/migration, PreviousVersion is non-empty on every field
+	// host, so this refusal fires only on an unexpected loss of the rollback
+	// target — exactly when a blind STOP would be catastrophic.
+	if !j.State.atLeast(StateStopped) {
+		if j.PreviousVersion == "" && !opts.AllowNoRollbackFirstCut {
+			return fmt.Errorf("refuse-before-STOP: no previous version to roll back to "+
+				"(versions/current is absent or unreadable) and this is not a sanctioned "+
+				"first cut; refusing to stop the running daemon for the %s cut because a "+
+				"flip/start failure would leave it offline with no recovery target. "+
+				"Re-seed the versioned runtime (xpfd seed-runtime) or pass the sanctioned "+
+				"first-cut option", j.TargetVersion)
+		}
+	}
+
 	// ---- STOP (live mutation #1) ----
 	if !j.State.atLeast(StateStopped) {
 		if !opts.UnitAlreadyStopped {
@@ -197,9 +235,16 @@ func (r *Runner) Run(opts Options) (err error) {
 	}
 
 	// ---- FLIP (live mutation #2; three journaled-idempotent substeps) ----
+	// A flip failure leaves the unit STOPPED (the STOP step above already
+	// ran). The daemon must not be left offline (AGY-5): recover by rolling
+	// back to the previous version, or — for a sanctioned first cut with no
+	// previous version — by restarting the first-install binary already
+	// present in versions/current (the flip's 6a current-repoint is the only
+	// substep that could have run; current still resolves to a launchable
+	// version either way).
 	if !j.State.atLeast(StateFlipped) {
 		if err := r.flip(j.TargetVersion); err != nil {
-			return fmt.Errorf("flip: %w", err)
+			return r.recoverFromFlipFailure(j, opts, err)
 		}
 		if err := r.transition(j, StateFlipped); err != nil {
 			return err
