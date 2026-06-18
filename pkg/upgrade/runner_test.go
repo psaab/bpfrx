@@ -214,6 +214,9 @@ func TestRun_VerifyRejectLeavesLiveUntouched(t *testing.T) {
 	fs := newFakeSystem(t, "2.0.0")
 	fs.verifyPass = false
 	r, cfg := testEnv(t, fs)
+	// Post-#1964: an upgrade runs against a seeded host (current exists), so
+	// the cut reaches VERIFY rather than the no-rollback-target INIT refuse.
+	seedInitialCurrent(t, r, cfg, "1.0.0")
 
 	err := r.Run(Options{})
 	if err == nil {
@@ -228,16 +231,20 @@ func TestRun_VerifyRejectLeavesLiveUntouched(t *testing.T) {
 			t.Errorf("live mutation %q happened on a verify REJECT", c)
 		}
 	}
-	// current must not exist (never flipped).
-	if _, err := os.Lstat(filepath.Join(cfg.VersionsDir, "current")); !os.IsNotExist(err) {
-		t.Errorf("current symlink created despite verify reject")
+	// current must still point at the prior version (never flipped to 2.0.0).
+	target, _ := os.Readlink(filepath.Join(cfg.VersionsDir, "current"))
+	if filepath.Base(target) != "1.0.0" {
+		t.Errorf("current moved off 1.0.0 despite verify reject: %q", target)
 	}
 }
 
 func TestRun_DiskFullAbortsPreMutation(t *testing.T) {
 	fs := newFakeSystem(t, "2.0.0")
 	fs.free = 1 // 1 byte: nowhere near enough
-	r, _ := testEnv(t, fs)
+	r, cfg := testEnv(t, fs)
+	// Post-#1964: seeded host (current exists) so the cut reaches PREFLIGHT
+	// rather than the no-rollback-target INIT refuse.
+	seedInitialCurrent(t, r, cfg, "1.0.0")
 
 	err := r.Run(Options{})
 	if err == nil {

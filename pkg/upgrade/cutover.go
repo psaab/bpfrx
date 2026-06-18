@@ -187,6 +187,22 @@ func (r *Runner) Run(opts Options) (err error) {
 					"path segment: %w", verr)
 			}
 		}
+		// REFUSE-AT-INIT (mechanism C, Codex r2): an unsanctioned cut with no
+		// rollback target must be refused BEFORE any journal is persisted. If
+		// we instead let it run preflight/copy/verify and only refused at the
+		// pre-STOP guard, the journal would be left at StateVerified with
+		// PreviousVersion=="" — and a re-run (even after the operator re-seeds
+		// versions/current as the error advises) would RESUME that stale
+		// journal, never re-read `current`, and stay refused forever (stuck).
+		// Refusing here writes no journal, so a post-seed re-run starts fresh,
+		// reads the new `current`, and proceeds with a real rollback target.
+		if prev == "" && !opts.AllowNoRollbackFirstCut {
+			return fmt.Errorf("refuse-before-STOP: no previous version to roll back to "+
+				"(versions/current is absent or unreadable) and this is not a sanctioned "+
+				"first cut; refusing the %s cut because a flip/start failure would leave "+
+				"the daemon offline with no recovery target. Seed the versioned runtime "+
+				"(xpfd seed-runtime), then re-run the upgrade", stagedVer)
+		}
 		j.TargetVersion = stagedVer
 		j.PreviousVersion = prev
 		j.StartedAtUnixNano = r.cfg.Sys.Now().UnixNano()

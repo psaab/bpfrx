@@ -37,6 +37,51 @@ func TestRefuseBeforeStop_NoPreviousVersion(t *testing.T) {
 	if _, lerr := os.Lstat(filepath.Join(cfg.VersionsDir, "current")); !os.IsNotExist(lerr) {
 		t.Error("current symlink created despite refuse-before-STOP")
 	}
+	// No journal persisted (Codex r2): the refuse happens at INIT before any
+	// transition, so a re-run after re-seeding does NOT resume a stale
+	// empty-prev journal and get stuck.
+	if _, serr := os.Stat(cfg.JournalPath); !os.IsNotExist(serr) {
+		t.Error("a journal was persisted on the unsanctioned-first-cut refusal "+
+			"(a re-run after re-seeding would resume it and stay stuck)")
+	}
+}
+
+// TestRefuseBeforeStop_ThenSeedThenRerunSucceeds is the Codex r2 regression:
+// a fresh unsanctioned cut with no rollback target refuses WITHOUT persisting
+// a journal; after the operator seeds versions/current, a plain re-run reads
+// the new current, gets a real PreviousVersion, and completes the cut. The
+// pre-fix bug left a StateVerified empty-prev journal that a re-run resumed
+// without re-reading current, staying refused forever.
+func TestRefuseBeforeStop_ThenSeedThenRerunSucceeds(t *testing.T) {
+	fs := newFakeSystem(t, "2.0.0")
+	r, cfg := testEnv(t, fs)
+
+	// 1. Unsanctioned cut, no current => refuse, no journal.
+	if err := r.Run(Options{}); err == nil {
+		t.Fatal("expected refuse on the first (no-current) cut")
+	}
+	if _, serr := os.Stat(cfg.JournalPath); !os.IsNotExist(serr) {
+		t.Fatal("refusal left a journal behind — re-run would get stuck")
+	}
+
+	// 2. Operator seeds versions/current at a prior version (as
+	//    `xpfd seed-runtime` would on the same host).
+	prevDir := filepath.Join(cfg.VersionsDir, "1.0.0")
+	for _, b := range managedBins {
+		writeFakeBin(t, filepath.Join(prevDir, b), "binary-"+b+"-1.0.0")
+	}
+	if err := os.Symlink("1.0.0", filepath.Join(cfg.VersionsDir, "current")); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Plain re-run now has a real rollback target (1.0.0) and completes.
+	if err := r.Run(Options{}); err != nil {
+		t.Fatalf("re-run after seeding current: %v", err)
+	}
+	target, _ := os.Readlink(filepath.Join(cfg.VersionsDir, "current"))
+	if filepath.Base(target) != "2.0.0" {
+		t.Errorf("re-run did not cut to 2.0.0: current=%q", target)
+	}
 }
 
 // TestRefuseBeforeStop_ExhaustiveNoStopWithoutTarget is the exhaustive
