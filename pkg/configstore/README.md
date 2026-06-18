@@ -178,6 +178,14 @@ persistence failures on every persist path;
   and enters the #1922 bootstrap/lifeline safe state (mgmt preserved, no
   claim-all, control plane up) instead of exiting (a hard exit would also
   strand mgmt). See `pkg/daemon` `classifyLoadError` / `computeBootClass`.
+  - **`Load` still populates for in-band recovery.** `compiled` MUST stay nil
+    (that is the bootstrap signal), but on this path `Load` assigns the
+    parsed-but-broken tree to `active` and calls `loadRollbackHistory()`
+    anyway. So the operator's recovery is real: `EnterConfigure` clones the
+    broken tree (the candidate shows the config to fix, not an empty tree),
+    and `Rollback(n)` reaches the on-disk history. `active` is always non-nil
+    (the constructor seeds an empty tree), so `(active non-nil, compiled nil)`
+    here is the same shape a fresh boot already has — no new invariant.
 - **any other error** — logged as a warning; the daemon proceeds and the
   boot predicate decides bootstrap vs normal as usual.
 
