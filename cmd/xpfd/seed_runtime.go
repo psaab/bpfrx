@@ -23,8 +23,23 @@ func runSeedRuntimeSubcommand(args []string) {
 	stagedDir := fs.String("staged-dir", upgrade.DefaultStagedDir, "dpkg-staged binary set dir")
 	versionsDir := fs.String("versions-dir", upgrade.DefaultVersionsDir, "runtime versioned dir")
 	sbinDir := fs.String("sbin-dir", upgrade.DefaultSbinDir, "operator-tool symlink dir")
+	// --capability-check is a pure, side-effect-free probe used by the .deb
+	// postrm to tell whether the newly-unpacked staged binary supports the
+	// #1964 hardened versioned-runtime layout. A hardened xpfd exits 0
+	// without touching the filesystem; a pre-#1964 binary has no
+	// seed-runtime subcommand at all and exits non-zero ("unknown command").
+	// The postrm downgrade cleanup keys on this so it ONLY tears down the
+	// hardened layout when downgrading to a package that genuinely lacks it
+	// (never when downgrading hardened->hardened).
+	capCheck := fs.Bool("capability-check", false,
+		"probe-only: exit 0 if this binary supports the #1964 versioned-runtime "+
+			"layout, without touching the filesystem")
 	if err := fs.Parse(args); err != nil {
 		os.Exit(1)
+	}
+	if *capCheck {
+		fmt.Println("seed-runtime supported")
+		return
 	}
 
 	if err := upruntime.Seed(upruntime.Config{
