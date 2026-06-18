@@ -145,9 +145,10 @@ def ensure_memlock():
 # cloud-images.ubuntu.com and took the highest-numbered listing, which silently
 # selects whatever the mirror lists as newest — a non-LTS (e.g. 26.10) or, when
 # an LTS image lags publication, the previous release (25.10). That drift is
-# exactly what the contract forbids, so the default is the pinned LTS. Set
-# XPF_BASE_RELEASE=<rel> for a reviewed bump, or XPF_UBUNTU_AUTODISCOVER=1 to
-# opt back into mirror-latest discovery.
+# exactly what the contract forbids, so the default is the pinned LTS. The
+# reviewed bump is a code change to PINNED_BASE_RELEASE below (lands via PR);
+# XPF_BASE_RELEASE=<rel> is a one-off runtime override, and
+# XPF_UBUNTU_AUTODISCOVER=1 opts back into mirror-latest discovery.
 PINNED_BASE_RELEASE = "26.04"
 
 
