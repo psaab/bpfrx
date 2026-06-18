@@ -252,25 +252,32 @@ case "$1" in`
 // TestManifestShape locks the manifest's basic invariants so a careless edit
 // (empty list, duplicate name, blank field) is caught at the SSOT itself.
 func TestManifestShape(t *testing.T) {
-	if len(Managed) == 0 {
-		t.Fatal("manifest.Managed is empty")
+	all := All()
+	if len(all) == 0 {
+		t.Fatal("manifest is empty")
 	}
 	seen := map[string]bool{}
-	for i, b := range Managed {
+	for i, b := range all {
 		if b.Name == "" {
-			t.Errorf("Managed[%d] has empty Name", i)
+			t.Errorf("managed[%d] has empty Name", i)
 		}
 		if b.StagedSrc == "" {
-			t.Errorf("Managed[%d] (%s) has empty StagedSrc", i, b.Name)
+			t.Errorf("managed[%d] (%s) has empty StagedSrc", i, b.Name)
 		}
 		if seen[b.Name] {
-			t.Errorf("Managed[%d] duplicate Name %q", i, b.Name)
+			t.Errorf("managed[%d] duplicate Name %q", i, b.Name)
 		}
 		seen[b.Name] = true
 	}
-	if Managed[0].Name != "xpfd" {
-		t.Errorf("Managed[0].Name=%q, want \"xpfd\" (callers rely on the daemon "+
-			"being first)", Managed[0].Name)
+	if all[0].Name != "xpfd" {
+		t.Errorf("manifest[0].Name=%q, want \"xpfd\" (callers rely on the daemon "+
+			"being first)", all[0].Name)
+	}
+	// All() must return a defensive copy: mutating it must not change the SSOT.
+	all[0].Name = "MUTATED"
+	if All()[0].Name != "xpfd" {
+		t.Error("All() does not return a defensive copy — mutating the result " +
+			"changed the source of truth")
 	}
 	if got, want := ShellBINS(), strings.Join(Names(), " "); got != want {
 		t.Errorf("ShellBINS()=%q, want %q", got, want)

@@ -44,39 +44,50 @@ type Binary struct {
 	LockstepCut bool
 }
 
-// Managed is the ordered SSOT list of managed upgrade binaries.
+// managed is the ordered SSOT list of managed upgrade binaries.
 //
-// Order matters only for deterministic rendering (ShellBINS, debian/rules);
-// the maintainer-script and Go copy/link/cleanup loops are order-free. Keep
-// xpfd first — several callers and tests rely on managedBins[0] being the
-// daemon, and the cut verifies versions/<ver>/{xpfd,xpf-userspace-dp} exist.
-var Managed = []Binary{
+// It is UNEXPORTED so no importing package can mutate or reorder the source of
+// truth at runtime (Copilot); callers reach it only through the read-only
+// accessors below, all of which return fresh slices. Order matters only for
+// deterministic rendering (ShellBINS, debian/rules); the maintainer-script and
+// Go copy/link/cleanup loops are order-free. Keep xpfd first — several callers
+// and tests rely on managedBins[0] being the daemon, and the cut verifies
+// versions/<ver>/{xpfd,xpf-userspace-dp} exist.
+var managed = []Binary{
 	{Name: "xpfd", StagedSrc: "xpfd", LockstepCut: true},
 	{Name: "cli", StagedSrc: "cli", LockstepCut: false},
 	{Name: "xpf-userspace-dp", StagedSrc: "xpf-userspace-dp", LockstepCut: true},
 	{Name: "xpf-day0-config", StagedSrc: "scripts/image/xpf-day0-config", LockstepCut: false},
 }
 
-// Names returns the managed-binary basenames in Managed order. Callers that
-// want the slice for a copy/link/cleanup loop use this; it allocates a fresh
-// slice each call so a caller can never mutate the SSOT.
+// All returns a copy of the managed-binary list (with metadata) in SSOT order.
+// It returns a fresh slice so a caller can inspect the metadata without being
+// able to mutate the source of truth.
+func All() []Binary {
+	return append([]Binary(nil), managed...)
+}
+
+// Names returns the managed-binary basenames in SSOT order. Callers that want
+// the slice for a copy/link/cleanup loop use this; it allocates a fresh slice
+// each call so a caller can never mutate the source of truth through the
+// returned slice.
 func Names() []string {
-	out := make([]string, len(Managed))
-	for i, b := range Managed {
+	out := make([]string, len(managed))
+	for i, b := range managed {
 		out[i] = b.Name
 	}
 	return out
 }
 
 // LockstepNames returns the basenames of the binaries cut in version lockstep
-// with the daemon (LockstepCut == true), in Managed order. These are the
+// with the daemon (LockstepCut == true), in SSOT order. These are the
 // binaries whose presence in the flipped-in version dir is verified just
 // before StartUnit (the dataplane mismatches if any is missing), so the cut's
 // pre-start completeness check derives its list from here rather than
 // re-hardcoding the subset.
 func LockstepNames() []string {
 	var out []string
-	for _, b := range Managed {
+	for _, b := range managed {
 		if b.LockstepCut {
 			out = append(out, b.Name)
 		}
