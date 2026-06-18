@@ -5987,3 +5987,6 @@ top.
 - **Timestamp**: 2026-06-18
 - **Action**: Add `xpfd publish-generation` verb (lock-taking, GC; deferred-publish recovery) + register in main. Seed publishes initial generation on first install. Wire --staged-gen-dir flags through upgrade/seed-runtime.
 - **File(s)**: cmd/xpfd/publish_generation.go, cmd/xpfd/main.go, cmd/xpfd/upgrade.go, cmd/xpfd/seed_runtime.go, pkg/upgrade/runtime/seed.go, pkg/upgrade/runtime/seed_test.go
+- **Timestamp**: 2026-06-18
+- **Action**: debian postinst publishes the staged generation after unpack before the cut (gates the cut on publish success/deferral); postrm removes staged-gen/ on purge + pre-B downgrade. rules unchanged (dpkg owns only staged/).
+- **File(s)**: debian/xpf.postinst, debian/xpf.postrm

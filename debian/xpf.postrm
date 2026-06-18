@@ -61,6 +61,11 @@ STAGED=/usr/local/share/xpf/staged
 SBIN=/usr/local/sbin
 VERSIONS=/var/lib/xpf/versions
 CURRENT="$VERSIONS/current"
+# #1981 Option B staged-generation root: maintainer-script-managed runtime
+# state (a sibling of versions/), NEVER a dpkg payload file — so dpkg never
+# removes it. We must remove it on purge (else an orphan dir survives, a Policy
+# violation) and on a pre-B downgrade (the old postrm never learns about it).
+STAGED_GEN=/var/lib/xpf/staged-gen
 DROPIN=/etc/systemd/system/xpfd.service.d/10-xpf-version.conf
 # #1985 hardened-layout version floor. This is the first package whose postrm
 # manages the #1964 versioned-runtime layout (versions/current + the unit
@@ -179,9 +184,12 @@ case "$1" in
         # leaves a broken unit. Safe if absent (legacy/never-seeded hosts).
         remove_runtime_dropin
         if [ "$1" = "purge" ]; then
-            # versions/ is package-derived (copied binaries), not operator
-            # config — remove the whole tree on purge.
+            # versions/ and staged-gen/ are package-derived (copied binaries),
+            # not operator config — remove the whole trees on purge. staged-gen/
+            # (#1981) is a never-recorded runtime dir, so dpkg's own cleanup
+            # never touches it; an orphan would survive purge (Policy 6.8).
             rm -rf "$VERSIONS"
+            rm -rf "$STAGED_GEN"
         fi
         ;;
     upgrade)
@@ -209,6 +217,12 @@ case "$1" in
             #    repoints sbin to a stale version dir (AGY-r4-1). Leave the
             #    versions/<ver> dirs (harmless; a reinstall's GC reaps them).
             rm -f "$CURRENT"
+            # 2b. remove the #1981 staged-generation tree (B-P6): the
+            #     downgraded pre-B package's postrm never learns about
+            #     staged-gen/, so it would leak permanently. The pre-B cut reads
+            #     live staged/ (its only source), so removing staged-gen/ does
+            #     not strip a source the downgraded package can use.
+            rm -rf "$STAGED_GEN"
             # 3. remove the runtime unit drop-in + empty .service.d dir, then
             #    boot-guarded daemon-reload (shared helper, #1967). Done LAST
             #    so the reload reflects the repointed sbin + removed drop-in

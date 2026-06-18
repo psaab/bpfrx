@@ -89,6 +89,41 @@ case "$1" in
                 fi
             done
 
+            # === #1981 Option B: PUBLISH the staged generation BEFORE the cut.
+            #
+            # dpkg has finished unpacking staged/ (Debian Policy 6.7: postinst
+            # configure runs after a COMPLETE unpack, while the dpkg frontend
+            # lock serializes apt transactions), so the staged set is now whole.
+            # Publish it into an immutable staged-gen/<genid>/ and repoint
+            # current-gen so the cut reads a single-generation source dpkg is
+            # NOT rewriting — closing the dpkg-unpack vs operator-cut torn-read
+            # race for ALL FOUR managed binaries. `xpfd publish-generation`
+            # takes the host-wide upgrade lock itself; exit 0 = published, exit
+            # 2 = lock busy (deferred — another upgrade owns the lock), other =
+            # error. A failed/deferred publish must NOT run the auto-cut (the
+            # prior generation stays the source; the operator re-publishes and
+            # cuts). A publish failure does NOT fail configure (a non-zero
+            # postinst half-configures dpkg, worse than a deferred cut).
+            PUBLISH_OK=0
+            if "$STAGED/xpfd" publish-generation; then
+                PUBLISH_OK=1
+            else
+                rc=$?
+                if [ "$rc" = "2" ]; then
+                    # Lock busy: defer. Drop the same marker the cut-contention
+                    # branch drops so recovery is recorded consistently.
+                    mkdir -p /run/xpf
+                    : > /run/xpf/upgrade-deferred 2>/dev/null || true
+                    echo "xpf: staged-generation publish deferred (another upgrade" \
+                         "holds the lock) — staged only; after it completes run:" \
+                         "xpfd publish-generation && xpfd upgrade" >&2
+                else
+                    echo "xpf: WARNING staged-generation publish failed (rc=$rc) —" \
+                         "no new generation published; the cut will read the prior" \
+                         "generation or refuse. Re-run: xpfd publish-generation" >&2
+                fi
+            fi
+
             # === increment-B cut-over (HA-mode contract, plan §6.3) ===
             #
             # dpkg has refreshed the staging path. Whether we now CUT OVER
@@ -114,7 +149,14 @@ case "$1" in
             #    over a blind binary swap. The operator can suppress the
             #    auto-cut with XPF_NO_POSTINST_CUT=1 and run `xpfd upgrade`
             #    manually.
-            if [ -f /etc/xpf/node-id ]; then
+            if [ "$PUBLISH_OK" != "1" ]; then
+                # The staged generation was not published (failed or deferred,
+                # logged above). Do NOT cut: a cut now would read the PRIOR
+                # generation (not this upgrade) or refuse. The operator
+                # re-publishes + cuts once the blocker clears.
+                echo "xpf: staged generation not published — skipping the cut;" \
+                     "recover with: xpfd publish-generation && xpfd upgrade" >&2
+            elif [ -f /etc/xpf/node-id ]; then
                 echo "xpf: clustered node (node-id present) — staged only;" \
                      "cut over with: xpfd upgrade --rolling" >&2
             elif [ "${XPF_NO_POSTINST_CUT:-}" = "1" ]; then
