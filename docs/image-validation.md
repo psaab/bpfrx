@@ -76,23 +76,28 @@ self-contained on one incus host: the appliance is the L3 gateway, the
 LAN/WAN segments are pure L2 bridges, and interface SNAT means the WAN
 endpoint needs no route back.
 
-> **VENUE NOTE (updated 2026-06-17, #1921 RESOLVED).** The earlier warning
-> here — that the AF_XDP userspace dataplane could not forward over
-> **virtio** NICs in a plain incus VM (helper looping on `libxdp private
-> bind: Device or resource busy` against virtio multi-queue, L3 transit
-> yielding 0 sessions) — described the **#1921 bug, now fixed**. The cause
-> was threefold: a rebind double-stop EBUSY loop and a physical+unit
-> candidate double-bind (#1927), plus the actual transit outage — a
-> standalone node replaying 16 phantom inactive HA groups so the helper
-> gated all transit as HA-inactive and dropped it after XSK RX (#1929,
-> guard startup HA replay behind `if m.clusterHA`). With both merged,
-> virtio multi-queue AF_XDP forwards on a plain incus VM (proven: AUTO
-> bind flags=0 + the HA-gate fix forwards 5000 pps). Tier 2 forwarding
-> assertions therefore now run on incus/virtio as well as on a real
-> AF_XDP NIC venue (**mlx5 SR-IOV VFs** — the loss userspace cluster — or
-> **i40e PF passthrough** — the standalone test VM). Treat a virtio
-> `Device or resource busy` rebind loop or `0 sessions` transit as a
-> regression of #1921, not an expected venue limitation.
+> **VENUE WARNING (re-confirmed 2026-06-17 live — #1955's "resolved"
+> claim was wrong; #1961).** The AF_XDP userspace dataplane does NOT
+> forward L3 transit over **virtio** NICs in a plain incus VM. The
+> #1927/#1929 fixes did clear the *earlier* failure mode (the `libxdp
+> private bind: Device or resource busy` rebind loop), so the bind now
+> succeeds — but a deeper gap remains: the XDP shim attaches native and
+> redirects, yet the helper's XSK **receives 0 frames** (`show security
+> flow statistics` → `Packets received: 0`, `Sessions created: 0`).
+> Everything up to the control plane works — boot, day-0 install/commit,
+> interface bring-up, and the gateway is pingable (host-inbound) — but
+> **L3 transit forwarding yields 0 sessions**. This was verified on clean
+> master (xpfd `4f453c98`, helper `cb83da9f`) against a virtio
+> trust→untrust path on TWO kernels (6.17 / Ubuntu 25.10 and 6.18 /
+> Debian 13), with BOTH `AUTO` (flags=0) and forced `COPY` bind flags,
+> and with BOTH `busy-poll` and `interrupt` poll modes — none deliver to
+> the XSK. The #1928/#1929 "AUTO bind + HA-gate fix forwards 5000 pps on
+> virtio" claim did NOT reproduce here. Run the *forwarding* assertions
+> only on a venue with a real AF_XDP NIC: **mlx5 SR-IOV VFs** (the loss
+> userspace cluster, proven daily) or **i40e PF passthrough** (the
+> standalone test VM's WAN). On incus/virtio, treat Tier 2 as a
+> **control-plane + day-0 + interface-bring-up** check (steps through
+> "confirm the interface map" below), not a forwarding proof.
 
 ### Topology
 
@@ -112,11 +117,11 @@ endpoint needs no route back.
 NIC order = interface name (positional contract). Names are shown in
 config/CLI slash form (`ge-0/0/0`); the Linux link name is the dash form
 (`ge-0-0-0`) that `assignName()` produces — the config layer translates
-between them. NOTE (per the venue note above, #1921 resolved): incus/virtio
-multi-queue AF_XDP now converges and forwards, so this topology validates
-transit forwarding as well as control-plane + day-0 + interface bring-up.
-A virtio bind loop / 0-session transit here is a #1921 regression, not a
-venue limitation; mlx5-VF / i40e-PF remain the line-rate venues.
+between them. NOTE (per the venue warning above, #1961): on incus/virtio
+the AF_XDP dataplane binds but does NOT deliver to the XSK (transit yields
+0 sessions), so this topology validates control-plane + day-0 + interface
+bring-up, NOT transit forwarding. Run the forwarding assertions on
+mlx5-VF / i40e-PF.
 
 ### Host networks
 
@@ -273,21 +278,25 @@ Delete `fw0`/`fw1` and the five `xpf-ha-*` networks.
 
 ## Honest scope
 
-- **virtio IS a forwarding venue (since #1921 fixed, 2026-06-17).** On local
-  incus/virtio bridges the AF_XDP dataplane now binds virtio multi-queue and
-  forwards transit traffic; the earlier `Device or resource busy` bind loop /
-  0-session transit (observed 2026-06-15) was the #1921 bug, fixed in #1927
-  (rebind double-stop + physical+unit double-bind) and #1929 (standalone
-  phantom-HA-group transit gate). So Tiers 2–3 on virtio validate boot +
-  day-0 + interface bring-up + control-plane reachability AND transit
-  forwarding/NAT/HA. *Line-rate* numbers still require a real AF_XDP NIC —
-  the loss userspace cluster's mlx5 SR-IOV VFs, or i40e PF passthrough on the
-  standalone test VM — because virtio caps below line rate; but functional
-  forwarding correctness is now testable on virtio. The loss SR-IOV smoke
-  matrix (`docs/`) tests the *deployed binaries*; an image-based forwarding
-  test can run on virtio for correctness and on a NIC venue for throughput.
-- The image is hardware-agnostic for these tiers: `verify-dataplane`
-  and forwarding run against the image's own kernel + the userspace
-  dataplane, so local KVM is a faithful functional venue.
+- **virtio is NOT a forwarding venue (#1961, re-confirmed 2026-06-17).**
+  #1927/#1929 cleared the earlier `Device or resource busy` bind loop, so
+  the helper now binds virtio multi-queue cleanly — but it still does NOT
+  forward transit: the XDP shim attaches native and redirects, yet the
+  helper's XSK receives 0 frames (`Packets received: 0`, `Sessions
+  created: 0`). Re-verified on clean master against a virtio trust→untrust
+  path on kernels 6.17 and 6.18, with both `AUTO` and `COPY` bind flags
+  and both `busy-poll` and `interrupt` poll modes; the #1928/#1929 "AUTO
+  bind forwards 5000 pps on virtio" claim did not reproduce. So Tiers 2–3
+  on virtio validate only boot + day-0 + interface bring-up + control-plane
+  reachability — NOT transit forwarding/NAT/HA. Functional forwarding (and
+  line-rate numbers) require a real AF_XDP NIC: the loss userspace
+  cluster's mlx5 SR-IOV VFs, or i40e PF passthrough on the standalone test
+  VM. The loss SR-IOV smoke matrix (`docs/`) tests the *deployed binaries*;
+  an image-based forwarding test needs the image booted on one of those NIC
+  venues. Tracked in #1961 (reopened from the #1928 "resolved" claim).
+- The image is hardware-agnostic for the control-plane tiers, but transit
+  forwarding is NOT venue-agnostic: `verify-dataplane` and forwarding
+  exercise the real userspace AF_XDP path, which does not deliver on
+  virtio. Local KVM/virtio is a faithful *control-plane* venue only.
 - None of these tiers touch the shared `loss` cluster; Tier-1 and the
   functional tiers use dedicated throwaway instances + networks.
