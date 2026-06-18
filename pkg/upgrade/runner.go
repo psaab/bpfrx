@@ -14,6 +14,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/fsatomic"
 	"github.com/psaab/xpf/pkg/upgrade/lock"
+	"github.com/psaab/xpf/pkg/upgrade/manifest"
 )
 
 // lockHandle is the host-wide advisory lock surface used by the upgrade
@@ -50,8 +51,13 @@ const (
 
 // managedBins are the binaries copied into each version dir and linked
 // from /usr/local/sbin. xpfd and xpf-userspace-dp are the matched set cut
-// in lockstep; cli and xpf-day0-config are operator tools.
-var managedBins = []string{"xpfd", "cli", "xpf-userspace-dp", "xpf-day0-config"}
+// in lockstep; cli and xpf-day0-config are operator tools. The list is
+// derived from the single source of truth in pkg/upgrade/manifest (#1982) so
+// the cut machine, the first-install seed, the maintainer scripts, and
+// debian/rules can never silently drift (the manifest drift canary enforces
+// the shell sites). manifest.Names returns a fresh slice, so package-level
+// mutation here cannot leak back into the SSOT.
+var managedBins = manifest.Names()
 
 // System abstracts the OS / systemd / clock surface so the state machine
 // is unit-testable without a live host. The production implementation is

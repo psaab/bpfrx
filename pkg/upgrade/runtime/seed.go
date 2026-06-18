@@ -36,6 +36,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/fsatomic"
 	"github.com/psaab/xpf/pkg/upgrade"
+	"github.com/psaab/xpf/pkg/upgrade/manifest"
 )
 
 // Default layout, shared with pkg/upgrade. Overridable in Config for tests.
@@ -51,11 +52,13 @@ const (
 )
 
 // managedBins are the binaries copied into the version dir and linked from
-// /usr/local/sbin. Kept in lockstep with upgrade.managedBins (xpfd and
-// xpf-userspace-dp are the matched cut set; cli + xpf-day0-config are
-// operator tools). Defined here too because upgrade.managedBins is
-// unexported.
-var managedBins = []string{"xpfd", "cli", "xpf-userspace-dp", "xpf-day0-config"}
+// /usr/local/sbin. Derived from the single source of truth in
+// pkg/upgrade/manifest (#1982): the cut machine (pkg/upgrade), this
+// first-install seed, the maintainer scripts, and debian/rules all draw the
+// managed-binary set from one place, and the manifest drift canary fails the
+// suite if any shell site diverges. manifest.Names returns a fresh slice each
+// call, so this package-level copy cannot mutate the SSOT.
+var managedBins = manifest.Names()
 
 // Config configures a Seed. Zero values fall back to the production layout.
 type Config struct {
