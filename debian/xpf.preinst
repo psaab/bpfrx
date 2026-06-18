@@ -1,5 +1,6 @@
 #!/bin/sh
-# xpf preinst (#1965 — host-wide upgrade-lock gate, before unpack).
+# xpf preinst (#1965 — host-wide upgrade-lock gate, before unpack;
+# #1964 — legacy-migration versioned-runtime snapshot, before unpack).
 #
 # A concurrent operator `xpfd upgrade` (or `xpfd upgrade --rolling`, or a
 # `xpfd upgrade kernel arm`) holds the host-wide advisory lock
@@ -19,10 +20,160 @@
 # StopUnit (a torn/non-execable ELF fails verify and aborts the cut while
 # the daemon is still up). Operator guidance: do not run `xpfd upgrade`
 # during `apt upgrade`.
+#
+# #1964 mechanism B (legacy-migration snapshot): a host installed BEFORE
+# the #1964 layout existed has /usr/local/sbin/* pointing DIRECTLY at
+# staged/, and no versions/current. On such a host the very next upgrade's
+# in-place cut would have no rollback target (PreviousVersion==""), and dpkg
+# is about to overwrite staged/ — the only copy of the running binaries. So
+# BEFORE unpack we snapshot the OLD staged/* into versions/<oldver>/, set
+# versions/current -> <oldver>, and atomically repoint sbin THROUGH
+# versions/current. This must be SELF-CONTAINED SHELL: the preinst runs
+# before the new package is unpacked, so the new (Go-seed-capable) xpfd is
+# not on disk yet — only the OLD on-disk binaries + coreutils are available.
+# The migration writes NO upgrade journal (the journal is owned by the Go
+# cut state machine; a preinst-written journal would confuse a later cut).
 
 set -e
 
 LOCK=/run/xpf/upgrade.lock
+STAGED=/usr/local/share/xpf/staged
+SBIN=/usr/local/sbin
+VERSIONS=/var/lib/xpf/versions
+CURRENT="$VERSIONS/current"
+BINS="xpfd cli xpf-userspace-dp xpf-day0-config"
+
+# is_safe_segment reports (exit 0) whether $1 is a safe single path segment:
+# non-empty, not "." / "..", no leading dot (collides with the runtime
+# dotfile namespace + hidden from GC), no "/", no whitespace/control chars.
+# Mirrors pkg/upgrade.ValidateVersionSegment so the shell migration keys
+# versions/<ver> by the same rule the Go cut machine enforces.
+is_safe_segment() {
+    seg="$1"
+    [ -n "$seg" ] || return 1
+    case "$seg" in
+        .|..) return 1 ;;
+        .*) return 1 ;;          # leading dot
+        */*) return 1 ;;         # path separator
+    esac
+    # Reject whitespace / control chars. `case` with a glob can't match a
+    # class portably, so strip the safe set and see if anything remains;
+    # printf|tr keeps it POSIX. A leftover char (incl. space/tab/newline,
+    # which tr's [:graph:] excludes) means unsafe.
+    stripped=$(printf '%s' "$seg" | tr -d '[:graph:]')
+    [ -z "$stripped" ] || return 1
+    return 0
+}
+
+# atomic_symlink LINK TARGET — point LINK at TARGET via a temp symlink +
+# rename. NOT `ln -sfnT` (which unlinks-then-creates: a non-atomic window
+# where a respawn finds no path). mv -f over an existing symlink is atomic.
+atomic_symlink() {
+    _link="$1"; _target="$2"
+    _dir=$(dirname "$_link")
+    mkdir -p "$_dir"
+    ln -sf "$_target" "$_link.tmp"
+    mv -f "$_link.tmp" "$_link"
+}
+
+# sbin_points_through_current reports (exit 0) whether EVERY sbin link
+# already resolves through versions/current (so the repoint is a no-op).
+sbin_points_through_current() {
+    for _b in $BINS; do
+        _tgt=$(readlink "$SBIN/$_b" 2>/dev/null || true)
+        [ "$_tgt" = "$CURRENT/$_b" ] || return 1
+    done
+    return 0
+}
+
+# repoint_sbin_through_current points every sbin link at
+# versions/current/<bin> atomically. Idempotent.
+repoint_sbin_through_current() {
+    for _b in $BINS; do
+        atomic_symlink "$SBIN/$_b" "$CURRENT/$_b"
+    done
+}
+
+# migrate_legacy_layout snapshots the OLD staged binaries into
+# versions/<oldver>/ and repoints current+sbin through it, so the imminent
+# in-place cut has a real rollback target. Idempotent and crash-safe; never
+# fails the transaction (best-effort — a failure leaves the legacy layout
+# untouched, and the cut's own refuse-before-STOP guard (#1964 mechanism C)
+# still prevents a no-rollback STOP).
+migrate_legacy_layout() {
+    # Nothing to snapshot if there is no old staged tree (a pristine box).
+    [ -d "$STAGED" ] || return 0
+
+    # ALWAYS ensure sbin resolves through versions/current when current
+    # exists — a crash AFTER current was created but BEFORE sbin was
+    # repointed must complete the repoint on retry (else unpack overwrites
+    # staged/ under a daemon still pointed at the staged path). Gate ONLY
+    # the snapshot-copy on current's absence.
+    if [ -L "$CURRENT" ] || [ -e "$CURRENT" ]; then
+        sbin_points_through_current || repoint_sbin_through_current
+        return 0
+    fi
+
+    # Determine <oldver>. Prefer the running binary's reported version; fall
+    # back to a sanitized dpkg $2 if the old binary won't exec (corrupt /
+    # lib / arch mismatch). NEVER fail the transaction on an exec error.
+    oldver=""
+    if [ -x "$STAGED/xpfd" ]; then
+        oldver=$("$STAGED/xpfd" version 2>/dev/null | awk '$1=="xpfd"{print $2; exit}' || true)
+    fi
+    if ! is_safe_segment "$oldver"; then
+        # $2 is the old (being-replaced) version on upgrade. Sanitize: keep
+        # only the safe path-segment characters; reject if nothing usable
+        # remains.
+        oldver=$(printf '%s' "${2:-}" | tr -cd 'A-Za-z0-9.:+~_-' || true)
+    fi
+    if ! is_safe_segment "$oldver"; then
+        echo "xpf: #1964 legacy migration: cannot determine a safe old" \
+             "version (staged xpfd unrunnable and dpkg version unusable);" \
+             "skipping snapshot — the first cut's refuse-before-STOP guard" \
+             "still protects the daemon." >&2
+        return 0
+    fi
+
+    verdir="$VERSIONS/$oldver"
+    partial="$verdir.partial"
+
+    mkdir -p "$VERSIONS"
+
+    # Rename-collision retry: a crash AFTER the .partial -> versions/<oldver>
+    # rename but BEFORE current was created leaves a populated
+    # versions/<oldver> + absent current. A naive re-copy+rename fails
+    # ENOTEMPTY and blocks apt. If versions/<oldver> already exists, SKIP
+    # copy+rename and jump straight to creating current.
+    if [ ! -d "$verdir" ]; then
+        rm -rf "$partial"
+        mkdir -p "$partial"
+        # cp -a preserves modes/timestamps; copy the CONTENTS of staged/.
+        if ! cp -a "$STAGED/." "$partial/"; then
+            echo "xpf: #1964 legacy migration: copy staged -> partial failed;" \
+                 "skipping snapshot (legacy layout left intact)." >&2
+            rm -rf "$partial"
+            return 0
+        fi
+        sync
+        if ! mv -f "$partial" "$verdir"; then
+            echo "xpf: #1964 legacy migration: atomic rename failed;" \
+                 "skipping snapshot (legacy layout left intact)." >&2
+            rm -rf "$partial"
+            return 0
+        fi
+        sync
+    fi
+
+    # current -> <oldver> (relative, within VERSIONS), atomically.
+    atomic_symlink "$CURRENT" "$oldver"
+    sync
+    # Repoint sbin THROUGH versions/current, atomically.
+    repoint_sbin_through_current
+    sync
+    echo "xpf: #1964 legacy migration: snapshotted running version" \
+         "$oldver into $verdir; sbin now resolves through versions/current." >&2
+}
 
 case "$1" in
     upgrade)
@@ -41,6 +192,12 @@ case "$1" in
             cat "$LOCK" 2>/dev/null >&2 || true
             exit 1
         fi
+
+        # #1964 mechanism B: legacy-migration snapshot. Runs AFTER the lock
+        # gate (so a contended upgrade still aborts first) and BEFORE unpack
+        # (so the OLD staged/ is still on disk to snapshot). Best-effort: a
+        # failure never aborts the transaction.
+        migrate_legacy_layout "$@"
         ;;
     install|abort-upgrade)
         ;;
