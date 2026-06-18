@@ -58,48 +58,70 @@ type Options struct {
 // with no journal written and no DB snapshot taken.
 var errNoSourceGeneration = fmt.Errorf("no published staged generation")
 
-// resolveSource determines the directory the cut copies FROM and the source
-// generation it pins (#1981 Option B). Resolution:
+// resolveSource determines the VERSION-COMPARISON source and the source
+// generation a FRESH cut would pin (#1981 Option B). The returned dir is used
+// only to read the staged version (which keys the resume-vs-fresh decision);
+// the COPY itself reads j.SourceGeneration (pinned at INIT) — copyStaged
+// resolves that independently. The returned genid is what the INIT block pins
+// into j.SourceGeneration for a fresh cut.
 //
-//   - A RESUMING B-aware journal (SourceGeneration != ""): use that pinned
-//     generation directory (validated; must exist) so the resume continues
-//     against its original source even if a concurrent publish advanced
-//     current-gen. Returns (genid, genDir, nil).
-//   - A RESUMING pre-#1981 journal that already COPIED from live staged/
-//     (State >= COPIED, empty SourceGeneration): back-compat — keep reading
-//     live staged/ so the runner never blocks recovery of an in-flight pre-B
-//     cut (plan §10 AGY r4). Returns ("", StagedDir, nil).
-//   - A FRESH cut (State below STAGED, or a recovery just reset j to INIT):
-//     resolve staged-gen/current-gen. Present -> (genid, genDir, nil); absent
-//     -> errNoSourceGeneration (the caller refuses pre-PREFLIGHT).
+// Resolution prefers the LATEST published generation (current-gen) for BOTH
+// fresh and resume, so that a newer apt install that PUBLISHED a new generation
+// is detected by the resume-vs-fresh version compare (a superseded cut then
+// recovers + starts fresh against the new generation) rather than silently
+// resuming the abandoned one. A same-version republish leaves the version
+// unchanged, so the resume-vs-fresh compare does NOT trip and the resume keeps
+// its ORIGINALLY-pinned generation (B-P3: a resume never switches sources
+// mid-cut — copyStaged still reads j.SourceGeneration).
+//
+//   - current-gen present: comparison source = current-gen dir; the genid a
+//     FRESH cut would pin = current-gen.
+//   - current-gen ABSENT but the journal pinned a generation that still exists
+//     (a resume whose generation has not been GC'd): comparison source = the
+//     pinned generation dir, so a resume is NOT blocked by a missing
+//     current-gen. genid = the pinned generation.
+//   - current-gen ABSENT, no pinned generation, but an already-COPIED journal:
+//     the pre-#1981 legacy in-flight case — comparison source = live staged/,
+//     genid = "" (copyStaged keeps reading live staged/). Back-compat so the
+//     runner never blocks recovery of an in-flight pre-B cut (plan §10 AGY r4).
+//   - current-gen ABSENT, fresh cut: errNoSourceGeneration (the caller refuses
+//     pre-PREFLIGHT — no journal, no DB snapshot).
 func (r *Runner) resolveSource(j *Journal) (genid, dir string, err error) {
 	sg := r.stagedGenConfig()
-	if j.SourceGeneration != "" {
-		if !stagedgen.ValidGenID(j.SourceGeneration) {
-			return "", "", fmt.Errorf("journal source generation %q is not a safe path segment",
-				j.SourceGeneration)
-		}
-		d := sg.GenDir(j.SourceGeneration)
-		if fi, serr := os.Stat(d); serr != nil || !fi.IsDir() {
-			return "", "", fmt.Errorf("pinned source generation %s missing at %s: %w "+
-				"(re-run after re-publishing the staged set)", j.SourceGeneration, d, serr)
-		}
-		return j.SourceGeneration, d, nil
+
+	if j.SourceGeneration != "" && !stagedgen.ValidGenID(j.SourceGeneration) {
+		return "", "", fmt.Errorf("journal source generation %q is not a safe path segment",
+			j.SourceGeneration)
 	}
-	// Empty SourceGeneration on an already-copied journal is the pre-#1981
-	// legacy in-flight case: read from live staged/ (the original source).
-	if j.State.atLeast(StateCopied) {
-		return "", r.cfg.StagedDir, nil
-	}
-	// Fresh cut: resolve the published current generation.
+
 	cur, rerr := sg.ResolveCurrent()
 	if rerr != nil {
 		return "", "", fmt.Errorf("resolve staged generation: %w", rerr)
 	}
-	if cur == "" {
-		return "", "", errNoSourceGeneration
+	if cur != "" {
+		// Latest published generation drives the version compare AND the
+		// fresh-INIT pin.
+		return cur, sg.GenDir(cur), nil
 	}
-	return cur, sg.GenDir(cur), nil
+
+	// No current-gen. Do not block a resume whose pinned generation still
+	// exists (defensive: it is protected from GC while journaled).
+	if j.SourceGeneration != "" {
+		d := sg.GenDir(j.SourceGeneration)
+		if fi, serr := os.Stat(d); serr == nil && fi.IsDir() {
+			return j.SourceGeneration, d, nil
+		}
+		return "", "", fmt.Errorf("pinned source generation %s missing and no current-gen "+
+			"(re-run after re-publishing the staged set)", j.SourceGeneration)
+	}
+
+	// Pre-#1981 legacy in-flight journal that already copied from live staged/.
+	if j.State.atLeast(StateCopied) {
+		return "", r.cfg.StagedDir, nil
+	}
+
+	// Fresh cut with no published generation.
+	return "", "", errNoSourceGeneration
 }
 
 // Run executes (or resumes) the cut-over to the staged version. It is

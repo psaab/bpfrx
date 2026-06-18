@@ -91,6 +91,64 @@ func TestCut_CounterFactual_LegacyReadsTornStaged(t *testing.T) {
 	}
 }
 
+// TestCut_SupersededByNewVersionGenerationStartsFresh pins the resume-vs-fresh
+// interplay with #1981: a journal pinned to an OLD generation/version is
+// SUPERSEDED when a newer apt install publishes a NEW-version generation. The
+// resume must detect the version mismatch (via current-gen, not the pinned
+// generation) and start fresh against the new generation — not silently resume
+// the abandoned cut.
+func TestCut_SupersededByNewVersionGenerationStartsFresh(t *testing.T) {
+	fs := newFakeSystem(t, "2.0.0")
+	r, cfg := testEnv(t, fs) // publishes gen of 2.0.0
+	seedInitialCurrent(t, r, cfg, "1.0.0")
+
+	sg := r.stagedGenConfig()
+	gOld, _ := sg.ResolveCurrent()
+
+	// A pure-phase journal pinned to the OLD 2.0.0 generation (e.g. a cut that
+	// reached COPIED then was abandoned).
+	verDir := filepath.Join(cfg.VersionsDir, "2.0.0")
+	for _, b := range managedBins {
+		writeFakeBin(t, filepath.Join(verDir, b), "binary-"+b+"-2.0.0")
+	}
+	if err := os.WriteFile(filepath.Join(verDir, stagedgen.SrcGenFile), []byte(gOld+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	jStale := &Journal{TargetVersion: "2.0.0", PreviousVersion: "1.0.0",
+		State: StateCopied, SourceGeneration: gOld}
+	if err := r.saveJournal(jStale); err != nil {
+		t.Fatal(err)
+	}
+
+	// A newer apt install stages + publishes a NEW-version generation (3.0.0).
+	fs.stagedVersion = "3.0.0"
+	for _, b := range managedBins {
+		writeFakeBin(t, filepath.Join(cfg.StagedDir, b), "binary-"+b+"-3.0.0")
+	}
+	gNew, err := sg.Publish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gNew == gOld {
+		t.Fatal("publish did not advance the generation")
+	}
+
+	// Resume: the version compare (current-gen = 3.0.0 != journal 2.0.0)
+	// supersedes the stale cut and starts fresh against 3.0.0.
+	if err := r.Run(Options{}); err != nil {
+		t.Fatalf("superseded resume: %v", err)
+	}
+	cur, _ := os.Readlink(filepath.Join(cfg.VersionsDir, currentLink))
+	if filepath.Base(cur) != "3.0.0" {
+		t.Fatalf("current = %q after superseded resume, want 3.0.0", cur)
+	}
+	// The 3.0.0 version dir's .srcgen names the NEW generation.
+	stamp, _ := os.ReadFile(filepath.Join(cfg.VersionsDir, "3.0.0", stagedgen.SrcGenFile))
+	if strings.TrimSpace(string(stamp)) != gNew {
+		t.Fatalf("3.0.0 .srcgen = %q, want the new generation %q", stamp, gNew)
+	}
+}
+
 // TestCut_NoSourceGenerationRefusesAtInit pins plan §7.2: a fresh cut with NO
 // published generation refuses at INIT — no journal written, no DB snapshot
 // taken, daemon untouched.

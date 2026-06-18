@@ -5996,3 +5996,6 @@ top.
 - **Timestamp**: 2026-06-18
 - **Action**: docs/in-place-upgrade.md — replace the dpkg-vs-operator caveat with the CLOSED-race contract (immutable versioned staging section: publish, pinned read, refuse-no-source, GC N=2, B-P3b OPT1, crash-safety, deferred-publish recovery, disk budget, one-time bootstrap caveat).
 - **File(s)**: docs/in-place-upgrade.md
+- **Timestamp**: 2026-06-18
+- **Action**: SMR self-review fix: resolveSource must read the version-comparison source from current-gen (latest published), not the pinned old generation, so a new-version republish supersedes an abandoned cut. Added superseded-resume regression test.
+- **File(s)**: pkg/upgrade/cutover.go, pkg/upgrade/stagedgen_cut_test.go
