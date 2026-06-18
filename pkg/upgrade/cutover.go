@@ -78,6 +78,24 @@ func (r *Runner) Run(opts Options) (err error) {
 		return err
 	}
 
+	// A loaded journal's version fields key versions/<ver>, the .dbsnap
+	// dotfile, the `current` symlink, and the unit drop-in (#1964 C1). A
+	// crafted/format-drifted journal must not escape VersionsDir, so validate
+	// them BEFORE any path use — including the rollback-resume below, whose
+	// flip(j.PreviousVersion) keys paths by the previous version. An empty
+	// PreviousVersion is the legitimate first-cut case, so it is exempt here
+	// (the refuse-before-STOP guard handles "no previous").
+	if j.TargetVersion != "" {
+		if verr := ValidateVersionSegment(j.TargetVersion); verr != nil {
+			return fmt.Errorf("journal target version unsafe: %w", verr)
+		}
+	}
+	if j.PreviousVersion != "" {
+		if verr := ValidateVersionSegment(j.PreviousVersion); verr != nil {
+			return fmt.Errorf("journal previous version unsafe: %w", verr)
+		}
+	}
+
 	// Resume an interrupted auto-rollback FIRST (Codex r1 Critical#1): a
 	// crash mid-rollback must complete the rollback to PreviousVersion, not
 	// resume the failed forward cut. rollback() clears the journal on
@@ -88,23 +106,6 @@ func (r *Runner) Run(opts Options) (err error) {
 			return fmt.Errorf("resume rollback: %w", rbErr)
 		}
 		return nil
-	}
-
-	// A loaded journal's version fields key versions/<ver>, the .dbsnap
-	// dotfile, the `current` symlink, and the unit drop-in (#1964 C1). A
-	// crafted/format-drifted journal must not escape VersionsDir, so validate
-	// them as safe path segments before any path use (empty PreviousVersion
-	// is the legitimate first-cut case, so it is exempt here — the
-	// refuse-before-STOP guard handles "no previous").
-	if j.TargetVersion != "" {
-		if verr := ValidateVersionSegment(j.TargetVersion); verr != nil {
-			return fmt.Errorf("journal target version unsafe: %w", verr)
-		}
-	}
-	if j.PreviousVersion != "" {
-		if verr := ValidateVersionSegment(j.PreviousVersion); verr != nil {
-			return fmt.Errorf("journal previous version unsafe: %w", verr)
-		}
 	}
 
 	// Identify the staged version. It keys versions/<ver> et al. on a fresh
