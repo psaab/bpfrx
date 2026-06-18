@@ -57,8 +57,8 @@ type grpcCluster struct {
 // non-default spelling and is rejected.
 func NewCLICluster(unit string) (RollingCluster, error) {
 	if unit != "" && unit != DefaultUnit {
-		return nil, fmt.Errorf("rolling/kernel-drain cluster control for "+
-			"systemd unit %q is unsupported: the control RPCs target the "+
+		return nil, fmt.Errorf("cluster control for systemd unit %q is "+
+			"unsupported: the rolling/kernel upgrade control RPCs target the "+
 			"default daemon at 127.0.0.1:50051, so a non-default --unit would "+
 			"drive cluster failover against the WRONG daemon while systemd "+
 			"actions hit %q (a per-unit control endpoint is not yet mapped; "+
