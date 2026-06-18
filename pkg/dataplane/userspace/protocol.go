@@ -189,9 +189,9 @@ type CoSDSCPClassifierSnapshot struct {
 }
 
 type CoSDSCPClassifierEntrySnapshot struct {
-	ForwardingClass string  `json:"forwarding_class,omitempty"`
-	LossPriority    string  `json:"loss_priority,omitempty"`
-	DSCPValues      []uint8 `json:"dscp_values,omitempty"`
+	ForwardingClass string        `json:"forwarding_class,omitempty"`
+	LossPriority    string        `json:"loss_priority,omitempty"`
+	DSCPValues      WireUint8List `json:"dscp_values,omitempty"`
 }
 
 type CoSIEEE8021ClassifierSnapshot struct {
@@ -200,9 +200,9 @@ type CoSIEEE8021ClassifierSnapshot struct {
 }
 
 type CoSIEEE8021ClassifierEntrySnapshot struct {
-	ForwardingClass string  `json:"forwarding_class,omitempty"`
-	LossPriority    string  `json:"loss_priority,omitempty"`
-	CodePoints      []uint8 `json:"code_points,omitempty"`
+	ForwardingClass string        `json:"forwarding_class,omitempty"`
+	LossPriority    string        `json:"loss_priority,omitempty"`
+	CodePoints      WireUint8List `json:"code_points,omitempty"`
 }
 
 type CoSDSCPRewriteRuleSnapshot struct {
@@ -408,20 +408,20 @@ type FirewallFilterSnapshot struct {
 }
 
 type FirewallTermSnapshot struct {
-	Name            string   `json:"name"`
-	SourceAddresses []string `json:"source_addresses,omitempty"`
-	DestAddresses   []string `json:"destination_addresses,omitempty"`
-	Protocols       []string `json:"protocols,omitempty"`
-	SourcePorts     []string `json:"source_ports,omitempty"` // "80" or "1024-65535"
-	DestPorts       []string `json:"destination_ports,omitempty"`
-	DSCPValues      []uint8  `json:"dscp_values,omitempty"`
-	Action          string   `json:"action"` // "accept", "discard", "reject"
-	Count           string   `json:"count,omitempty"`
-	Log             bool     `json:"log,omitempty"`
-	PolicerName     string   `json:"policer,omitempty"`
-	RoutingInstance string   `json:"routing_instance,omitempty"`
-	ForwardingClass string   `json:"forwarding_class,omitempty"`
-	DSCPRewrite     *uint8   `json:"dscp_rewrite,omitempty"`
+	Name            string        `json:"name"`
+	SourceAddresses []string      `json:"source_addresses,omitempty"`
+	DestAddresses   []string      `json:"destination_addresses,omitempty"`
+	Protocols       []string      `json:"protocols,omitempty"`
+	SourcePorts     []string      `json:"source_ports,omitempty"` // "80" or "1024-65535"
+	DestPorts       []string      `json:"destination_ports,omitempty"`
+	DSCPValues      WireUint8List `json:"dscp_values,omitempty"`
+	Action          string        `json:"action"` // "accept", "discard", "reject"
+	Count           string        `json:"count,omitempty"`
+	Log             bool          `json:"log,omitempty"`
+	PolicerName     string        `json:"policer,omitempty"`
+	RoutingInstance string        `json:"routing_instance,omitempty"`
+	ForwardingClass string        `json:"forwarding_class,omitempty"`
+	DSCPRewrite     *uint8        `json:"dscp_rewrite,omitempty"`
 }
 
 type PolicerSnapshot struct {
@@ -651,14 +651,14 @@ type ProcessStatus struct {
 	// default — an empty slice (and an absent gauge family) does NOT mean
 	// the mirror is empty, only that the debug dump was not enabled. All
 	// are omitempty for wire-compat with older helpers.
-	NegNeighFastFailTotal           uint64   `json:"neg_neigh_fast_fail_total,omitempty"`
-	PendingNeighDuplicateDropsTotal uint64   `json:"pending_neigh_duplicate_drops_total,omitempty"`
+	NegNeighFastFailTotal           uint64 `json:"neg_neigh_fast_fail_total,omitempty"`
+	PendingNeighDuplicateDropsTotal uint64 `json:"pending_neigh_duplicate_drops_total,omitempty"`
 	// #1902: GRE-decapped MissingNeighbor packets refused pending_neigh
 	// admission — buffering the outer UMEM frame with the post-decap
 	// inner meta would retry-TX a mis-rewritten outer packet once the
 	// neighbor resolves.
 	PendingNeighDecapDropsTotal uint64   `json:"pending_neigh_decap_drops_total,omitempty"`
-	DynamicNeighborKeys             []string `json:"dynamic_neighbor_keys,omitempty"`
+	DynamicNeighborKeys         []string `json:"dynamic_neighbor_keys,omitempty"`
 	// #1789: total failed USERSPACE_SESSIONS BPF-map publishes (per-binding
 	// worker-poll sites summed with the shared no-binding sites: HA upsert,
 	// session-glue worker publish, post-reconcile replay, activation/reverse
@@ -1370,37 +1370,37 @@ type BindingStatus struct {
 	// Together: VMinThrottles = "fairness brake fired",
 	// VMinThrottleHardCapOverrides = "brake too tight, escape hatch
 	// rescued throughput". Ratio is the LAG_THRESHOLD diagnostic.
-	VMinThrottleHardCapOverrides      uint64 `json:"v_min_throttle_hard_cap_overrides,omitempty"`
-	VMinThrottles                     uint64 `json:"v_min_throttles,omitempty"`
-	SessionHits                       uint64 `json:"session_hits,omitempty"`
-	SessionMisses                     uint64 `json:"session_misses,omitempty"`
-	SessionCreates                    uint64 `json:"session_creates,omitempty"`
-	SessionExpires                    uint64 `json:"session_expires,omitempty"`
-	SessionDeltaPending               uint64 `json:"session_delta_pending,omitempty"`
-	SessionDeltaGenerated             uint64 `json:"session_delta_generated,omitempty"`
-	SessionDeltaDropped               uint64 `json:"session_delta_dropped,omitempty"`
-	SessionDeltaDrained               uint64 `json:"session_delta_drained,omitempty"`
-	PolicyDeniedPackets               uint64 `json:"policy_denied_packets,omitempty"`
-	ScreenDrops                       uint64 `json:"screen_drops,omitempty"`
-	SYNCookieChallenges               uint64 `json:"syn_cookie_challenges,omitempty"`
-	SYNCookieSecretUnavailable        uint64 `json:"syn_cookie_secret_unavailable,omitempty"`
-	SYNCookieSynAckSent               uint64 `json:"syn_cookie_syn_ack_sent,omitempty"`
-	SYNCookieAckRstSent               uint64 `json:"syn_cookie_ack_rst_sent,omitempty"`
-	SYNCookieReplyBudgetDrops         uint64 `json:"syn_cookie_reply_budget_drops,omitempty"`
-	SYNCookieAckValid                 uint64 `json:"syn_cookie_ack_valid,omitempty"`
-	SYNCookieAckInvalid               uint64 `json:"syn_cookie_ack_invalid,omitempty"`
-	SYNCookieBypass                   uint64 `json:"syn_cookie_bypass,omitempty"`
-	SNATPackets                       uint64 `json:"snat_packets,omitempty"`
-	DNATPackets                       uint64 `json:"dnat_packets,omitempty"`
-	SlowPathPackets                   uint64 `json:"slow_path_packets,omitempty"`
-	SlowPathBytes                     uint64 `json:"slow_path_bytes,omitempty"`
-	SlowPathLocalDeliveryPackets      uint64 `json:"slow_path_local_delivery_packets,omitempty"`
-	SlowPathMissingNeighborPackets    uint64 `json:"slow_path_missing_neighbor_packets,omitempty"`
-	SlowPathNoRoutePackets            uint64 `json:"slow_path_no_route_packets,omitempty"`
-	SlowPathNextTablePackets          uint64 `json:"slow_path_next_table_packets,omitempty"`
-	SlowPathForwardBuildPackets       uint64 `json:"slow_path_forward_build_packets,omitempty"`
-	SlowPathDrops                     uint64 `json:"slow_path_drops,omitempty"`
-	SlowPathRateLimited               uint64 `json:"slow_path_rate_limited,omitempty"`
+	VMinThrottleHardCapOverrides   uint64 `json:"v_min_throttle_hard_cap_overrides,omitempty"`
+	VMinThrottles                  uint64 `json:"v_min_throttles,omitempty"`
+	SessionHits                    uint64 `json:"session_hits,omitempty"`
+	SessionMisses                  uint64 `json:"session_misses,omitempty"`
+	SessionCreates                 uint64 `json:"session_creates,omitempty"`
+	SessionExpires                 uint64 `json:"session_expires,omitempty"`
+	SessionDeltaPending            uint64 `json:"session_delta_pending,omitempty"`
+	SessionDeltaGenerated          uint64 `json:"session_delta_generated,omitempty"`
+	SessionDeltaDropped            uint64 `json:"session_delta_dropped,omitempty"`
+	SessionDeltaDrained            uint64 `json:"session_delta_drained,omitempty"`
+	PolicyDeniedPackets            uint64 `json:"policy_denied_packets,omitempty"`
+	ScreenDrops                    uint64 `json:"screen_drops,omitempty"`
+	SYNCookieChallenges            uint64 `json:"syn_cookie_challenges,omitempty"`
+	SYNCookieSecretUnavailable     uint64 `json:"syn_cookie_secret_unavailable,omitempty"`
+	SYNCookieSynAckSent            uint64 `json:"syn_cookie_syn_ack_sent,omitempty"`
+	SYNCookieAckRstSent            uint64 `json:"syn_cookie_ack_rst_sent,omitempty"`
+	SYNCookieReplyBudgetDrops      uint64 `json:"syn_cookie_reply_budget_drops,omitempty"`
+	SYNCookieAckValid              uint64 `json:"syn_cookie_ack_valid,omitempty"`
+	SYNCookieAckInvalid            uint64 `json:"syn_cookie_ack_invalid,omitempty"`
+	SYNCookieBypass                uint64 `json:"syn_cookie_bypass,omitempty"`
+	SNATPackets                    uint64 `json:"snat_packets,omitempty"`
+	DNATPackets                    uint64 `json:"dnat_packets,omitempty"`
+	SlowPathPackets                uint64 `json:"slow_path_packets,omitempty"`
+	SlowPathBytes                  uint64 `json:"slow_path_bytes,omitempty"`
+	SlowPathLocalDeliveryPackets   uint64 `json:"slow_path_local_delivery_packets,omitempty"`
+	SlowPathMissingNeighborPackets uint64 `json:"slow_path_missing_neighbor_packets,omitempty"`
+	SlowPathNoRoutePackets         uint64 `json:"slow_path_no_route_packets,omitempty"`
+	SlowPathNextTablePackets       uint64 `json:"slow_path_next_table_packets,omitempty"`
+	SlowPathForwardBuildPackets    uint64 `json:"slow_path_forward_build_packets,omitempty"`
+	SlowPathDrops                  uint64 `json:"slow_path_drops,omitempty"`
+	SlowPathRateLimited            uint64 `json:"slow_path_rate_limited,omitempty"`
 	// TunnelEncapUnresolvedDrops counts tunnel-marked inner packets
 	// dropped at the slow-path chokepoint / pending-neigh exclusion
 	// instead of plaintext kernel reinjection (#1873 R-C/R-E).
@@ -1411,7 +1411,7 @@ type BindingStatus struct {
 	// fabric XSK binding, or the forward-frame build/enqueue failed)
 	// instead of being reinjected to the local kernel FIB (#1946).
 	// Wire-additive: older helpers omit it.
-	FabricRedirectUnsendableDrops uint64 `json:"fabric_redirect_unsendable_drops,omitempty"`
+	FabricRedirectUnsendableDrops     uint64 `json:"fabric_redirect_unsendable_drops,omitempty"`
 	KernelRXDropped                   uint64 `json:"kernel_rx_dropped,omitempty"`
 	KernelRXInvalidDescs              uint64 `json:"kernel_rx_invalid_descs,omitempty"`
 	TXPackets                         uint64 `json:"tx_packets,omitempty"`
