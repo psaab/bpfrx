@@ -1,6 +1,13 @@
 # #1961 — virtio "no transit" is a Go↔Rust snapshot wire-type bug (not XSK delivery)
 
-**Status:** DRAFT v1 — pending adversarial plan review (Codex + AGY + Claude SMR)
+**Status:** PLAN-READY v2 (converged 2026-06-18). **Codex PLAN-KILL** — "premise
+is correct; kill the research *loop* and send straight to `/engineer`" (not a
+premise rejection; a Q8 vote that more research rounds add nothing). **Claude
+SMR PLAN-NEEDS-MINOR** (3 strengthening items, folded below). **AGY
+infra-blocked** — companion timed out `queued` without starting (consistent
+all-session failure; one documented retry, `adversarial-review-mqjk9cff-z56ylw`).
+Sanctioned infra-blocked convergence on Codex + Claude SMR per
+`feedback_codex_infra_must_retry`. All r1 feedback folded into v2.
 **Base:** origin/master (`fc4ba8eb7`)
 **Issue:** #1961 (plain-virtio AF_XDP firewall does not forward transit). This
 plan **supersedes** the prior converged plan
@@ -14,12 +21,20 @@ On a plain virtio incus VM the firewall does not forward transit. The prior
 research localized this to "the redirect→XSK delivery layer" and proposed
 diagnosing *which shim gate* drops the frame. That framing was **wrong**.
 
-This session reproduced the failure end-to-end and found the real cause is
-**upstream of the dataplane entirely**: the Go control plane's `apply_snapshot`
-control-socket request **fails to deserialize on the Rust helper**, so the
-helper never leaves bootstrap (`enabled:false`) and **no packet path is ever
-armed**. The "virtio delivers 0 packets to the XSK" observation is an artifact
-of measuring a dataplane that was never enabled.
+This session reproduced the failure end-to-end and found the **proven current
+blocker** is **upstream of the dataplane entirely**: the Go control plane's
+`apply_snapshot` control-socket request **fails to deserialize on the Rust
+helper**, so the helper never leaves bootstrap (`enabled:false`) and **no
+packet path is ever armed**. The "virtio delivers 0 packets to the XSK"
+observation is an artifact of measuring a dataplane that was never enabled.
+
+> **Precision (Codex r1):** what is *refuted* is the prior plan's claim that the
+> EOF / no-transit is explained by an XSK redirect→delivery-layer drop. The
+> wire-type bug is the **proven current blocker**, not necessarily the *only*
+> root cause. Whether virtio's XSK actually delivers once the snapshot publishes
+> is **still unproven** and is gated by the live transit test (§8.3, Q1). Until
+> that test passes, the superseded XSK-delivery plan stays referenced, not
+> deleted.
 
 ### Proven root cause: `[]uint8` ⇒ base64 string vs Rust `Vec<u8>` ⇒ sequence
 
@@ -99,9 +114,11 @@ unjustified; the diagnosis stands regardless.*
   `engineer/1961-virtio-xsk-delivery`): a `request chassis cluster data-plane
   userspace status` subcommand (`pkg/cli/cli_request.go`) + cmdtree leaf
   (`pkg/cmdtree/tree.go`) that surface the binding/XSK inventory + degraded-path
-  counters without mutating dataplane state. Useful observability — proposed to
-  carry into the fix PR (with the childless-leaf dispatch quirk fixed and
-  `socket_queue_id` added to `FormatBindings`). Reviewers: in or out of scope?
+  counters without mutating dataplane state. Useful observability, but **out of
+  scope for the fix PR unless the §8.3 live validation actually needs it**
+  (Codex r1: do not drag it in otherwise). If kept for validation, fix the
+  childless-leaf dispatch quirk and add `socket_queue_id` to `FormatBindings`;
+  otherwise it lands as its own follow-up. It must not gate or expand the fix.
 
 ## 4. Concrete design (fix shape deferred to quad-review)
 
@@ -109,13 +126,18 @@ Rust stays `Vec<u8>` (already correct — it always wanted a numeric array). The
 fix is on the **Go** side so it stops emitting base64 for these 3 fields.
 
 - **Option A — named type + custom (Un)MarshalJSON.** Define one Go type over
-  `[]uint8` (e.g. `type dscpByteList []uint8`) with `MarshalJSON` that emits a
-  numeric array `[46]` and `UnmarshalJSON` that parses one (and, defensively,
-  still accepts a base64 string so Go's own round-trip / any persisted blob is
-  tolerant). Change the 3 fields to that type. Assignment sites
-  (`filters.go:89,91`, `cos.go:58`) keep assigning `[]uint8{…}` (assignable to a
-  named type with that underlying type → no caller churn). Self-documenting,
-  type-safe, uniform.
+  `[]uint8` with `MarshalJSON` that emits a numeric array `[46]` and
+  `UnmarshalJSON` that parses one (and, defensively, still accepts a base64
+  string so Go's own round-trip / any persisted blob is tolerant — Codex:
+  accepting legacy base64 on unmarshal is harmless). Change the 3 fields to that
+  type. Assignment sites (`filters.go:89,91`, `cos.go:58`) keep assigning
+  `[]uint8{…}` (assignable to a named type with that underlying type → no caller
+  churn). Self-documenting, type-safe, uniform.
+  - **Name it generically** (Codex r1): the type carries both DSCP values *and*
+    802.1p code points, so call it e.g. `wireUint8List`, not `dscpByteList`.
+  - **`MarshalJSON` must NOT** convert back to `[]uint8` and call
+    `json.Marshal` — that re-triggers the base64 special-case and recreates the
+    bug. Convert to `[]uint16`/`[]int`, or write the numeric array directly.
 - **Option B — `[]uint16`.** Change the 3 fields to `[]uint16`; Go marshals
   **and** unmarshals these as numeric arrays natively (no custom marshaler).
   Rust `Vec<u8>` decodes `[46]` cleanly (values ≤ 63). Mechanical churn at
@@ -123,19 +145,23 @@ fix is on the **Go** side so it stops emitting base64 for these 3 fields.
 
 Both keep the Rust side untouched. **The quad-review picks** (Q2).
 
-Separately, two hardening items the bug exposed:
-- The helper **silently discards** `handle_stream` errors (`let _ =` at
-  `lifecycle.rs:221,239`). Logging that `Err` (decode/read failure) would have
-  collapsed this multi-session chase to one line. Proposed: log it (Q3).
-- The Go side surfaces a bare `EOF`. Proposed: when the control socket closes
-  with no response, emit a more actionable hint (Q4).
+Separately, two hardening items the bug exposed (Codex r1: both in scope as
+small hardening in the same PR):
+- **In scope:** the helper **silently discards** `handle_stream` errors (`let _
+  =` at `lifecycle.rs:220,239`). Logging that `Err` (decode/read failure) would
+  have collapsed this multi-session chase to one line. **Log it (Q3).**
+- **In scope if cheap:** the Go side surfaces a bare `EOF`. When the control
+  socket closes with no response, emit a more actionable hint (Q4) — but do not
+  let it expand the fix.
 
 ## 5. Public API / wire-compat preservation
 
 The wire encoding of these 3 fields changes from base64-string to
 numeric-array. Compatibility analysis (reviewers verify, Q7):
-- **Old Go (base64) → any Rust**: already always failed (the bug). No working
-  combination is regressed.
+- **Old Go → any Rust**: failed **only when one of these `[]uint8` fields was
+  populated** (Codex r1 — the earlier "always failed" wording was too broad;
+  empty/omitted configs worked, which is why the loss cluster and minimal
+  configs were fine). No working combination is regressed.
 - **New Go (numeric) → old Rust**: old Rust already expects a sequence →
   **works** (this is in fact the first time it works).
 - **Rust → Go direction**: these fields are Go→Rust only (CoS/firewall
@@ -168,15 +194,26 @@ numeric-array. Compatibility analysis (reviewers verify, Q7):
 
 1. **Self-contained Go↔Rust round-trip regression** (the headline gap — the
    prior bug shipped because no test exercised a populated `dscp_values` over
-   the wire):
+   the wire). Codex r1 tightenings folded:
    - Go: build a `ConfigSnapshot` with a firewall term + a DSCP classifier + an
-     802.1p classifier all populated; `json.Marshal`; assert each field is a
-     numeric array (not a base64 string).
-   - Rust: deserialize the **same bytes** into `ControlRequest`; assert the
-     three fields equal the expected `Vec<u8>`. Embed the JSON inline (no
-     `/tmp` dependency).
+     802.1p classifier all populated; `json.Marshal`; assert each field's JSON
+     **token type is an array** (parse and type-check, not a `strings.Contains`
+     substring match — the existing default fixtures only ever exercise empty
+     vectors).
+   - Rust: deserialize a **full `ControlRequest`** (not the leaf structs in
+     isolation — the failure is at whole-request decode); assert the three
+     fields equal the expected `Vec<u8>`. Embed the JSON inline (no `/tmp`
+     dependency). Separate Go-emits-arrays + Rust-decodes-full-request tests are
+     acceptable; "same bytes" need not be mechanically identical.
+   - **Class-level guard (SMR r1):** add a Go reflection test that walks the
+     snapshot wire structs and **fails if any exported field is `[]uint8`/
+     `[]byte` with a `json:` tag**. The per-field test prevents *this*
+     regression; the guard prevents a *fourth* such field silently
+     reintroducing the whole bug class.
 2. `cargo test --release` full suite + 5× flake on the new test; `go test ./...`.
-3. **Live virtio verification on xpf-fwd** (standalone, plain virtio):
+3. **Live virtio verification on a plain-virtio VM** — **recreated on Ubuntu
+   26.04** (production parity, per `feedback_ubuntu_vms_always_2604`; the ad-hoc
+   `xpf-fwd` was 25.10 and must not be the verification venue):
    - Restore the full `xpf-test.conf`; confirm `apply_snapshot` now publishes
      (`enabled:true`, generation increments, no `EOF` in the journal).
    - **Run a real transit-forwarding test** through a zone pair with a permit
@@ -184,6 +221,10 @@ numeric-array. Compatibility analysis (reviewers verify, Q7):
      decisive answer to the residual question (Q1): does virtio actually forward
      once the snapshot publishes, or is there *also* an XSK-delivery issue
      underneath?
+   - **Hard gate (SMR r1):** if transit still shows 0 sessions after a *clean*
+     publish, the fix is necessary-but-not-sufficient — **reopen the
+     XSK-delivery investigation** (resurrect the superseded plan); do not
+     declare #1961 fixed.
 4. **Loss-cluster smoke (no regression)**: standard Pass A (CoS off) + Pass B
    (CoS on), v4+v6, push+reverse. Additionally exercise fields 194/205 by
    adding a DSCP/802.1p classifier to a smoke config and confirming it publishes
@@ -212,10 +253,12 @@ numeric-array. Compatibility analysis (reviewers verify, Q7):
   (`lifecycle.rs let _ =`)? In scope for this PR or a separate hardening issue?
 - **Q4:** Should Go translate a "socket closed with no response" into a more
   actionable error than bare `EOF`?
-- **Q5:** Beyond `[]uint8`, are there other Go↔Rust **type-parity** mismatches
-  on the snapshot wire (enum variants, int-vs-string, optional handling) that
-  could fail the same way on some unexercised config? Worth a bounded parity
-  audit?
+- **Q5 (resolved → DO it):** Beyond `[]uint8`, there may be other Go↔Rust
+  **type-parity** mismatches on the snapshot wire (enum variants, int-vs-string,
+  optional handling) that fail the same way on some unexercised config. SMR r1:
+  perform a **bounded Go-struct↔Rust-struct field-by-field parity pass** during
+  `/engineer` — shipping the DSCP fix and then hitting a different decode-EOF on
+  the next config would be a poor outcome. In scope for the fix PR.
 - **Q6:** Confirm `inject_packet` (and any other control verb) has no
   base64-by-design `[]byte` field that the fix would wrongly "correct," and no
   symmetric field that *should* stay base64.
