@@ -93,7 +93,10 @@ func RunRolling(r *Runner, cfg Config) error {
 	}
 	defer func() { _ = h.Release() }()
 
-	cl := NewCLICluster(cfg.Unit)
+	cl, err := NewCLICluster(cfg.Unit)
+	if err != nil {
+		return fmt.Errorf("upgrade --rolling: %w", err)
+	}
 	return runRollingWith(r, cl, RollingConfig{})
 }
 

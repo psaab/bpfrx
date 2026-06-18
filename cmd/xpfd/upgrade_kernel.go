@@ -152,7 +152,11 @@ func runUpgradeKernelSubcommand(args []string) {
 		// gRPC SystemAction) and CONFIRMS the STRONG drain predicate (peer holds
 		// the RGs + sync clean) before reporting success — so the orchestrator
 		// never arms+reboots an undrained primary.
-		cl := upgrade.NewCLICluster(*unit)
+		cl, err := upgrade.NewCLICluster(*unit)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "upgrade kernel drain: %v\n", err)
+			os.Exit(1)
+		}
 		if err := upgrade.DrainAndConfirm(cl, *drainDeadline, *allowMixedHA); err != nil {
 			fmt.Fprintf(os.Stderr, "upgrade kernel drain: %v\n", err)
 			os.Exit(1)
@@ -164,7 +168,11 @@ func runUpgradeKernelSubcommand(args []string) {
 		// the node is back as an eligible cluster member with sync re-established
 		// (so the orchestrator never advances to the peer until this node is
 		// fully rejoined — r1 Codex Critical "never both down").
-		cl := upgrade.NewCLICluster(*unit)
+		cl, err := upgrade.NewCLICluster(*unit)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "upgrade kernel rejoin: %v\n", err)
+			os.Exit(1)
+		}
 		if err := upgrade.RejoinAndConfirm(cl, *drainDeadline); err != nil {
 			fmt.Fprintf(os.Stderr, "upgrade kernel rejoin: %v\n", err)
 			os.Exit(1)

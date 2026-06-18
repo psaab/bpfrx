@@ -284,6 +284,30 @@ both); exactly one node is primary throughout.
    post-promotion check (`make test-failover`) — a passive node
    structurally cannot forward, so it is never "verified while passive".
 
+### `--unit` and the cluster control endpoint (#1983)
+
+`--unit <name>` (default `xpfd`) selects the systemd unit the
+stop/start/flip actions target. The cluster control RPCs the rolling
+driver uses — `PeerAlive` / `SyncEstablished` / `DrainComplete` /
+`ForceSecondary` / `ResetFailover`, and the same RPCs in `xpfd upgrade
+kernel drain`/`rejoin` — all dial a single hard-coded LOCAL endpoint,
+`127.0.0.1:50051`. There is no unit→endpoint mapping yet, so a
+non-default `--unit` would cut ONE daemon (systemd actions honor the
+unit) while driving cluster failover against ANOTHER (the default daemon
+on `127.0.0.1:50051`) — wrong-daemon control.
+
+To keep that contract honest, `upgrade.NewCLICluster` — the single
+construction chokepoint for all three callers — REJECTS any unit other
+than the default (`xpfd`) with a clear error rather than silently
+dialing the default endpoint. `--unit` takes the BARE unit name; the
+systemd layer appends `.service` itself, so `--unit xpfd.service` is a
+non-default spelling and is rejected. Mapping a selected unit to its own
+control endpoint (so an alternate unit can be driven safely, e.g. for
+integration tests, with an explicit `--grpc-addr` override) is a tracked
+follow-up enhancement (#1983 §4.2 / a future `pkg/upgrade/clusterclient`)
+— not implemented here. This is a CLI control-TARGET + validation change
+only; it does not alter VRRP / session-sync / cluster RUNTIME behavior.
+
 ## Config compatibility envelope (D1, `pkg/configstore`)
 
 `active.json` carries a magic header LINE

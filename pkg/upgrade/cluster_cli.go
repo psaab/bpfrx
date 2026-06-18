@@ -37,11 +37,34 @@ type grpcCluster struct {
 	dialTimeout time.Duration
 }
 
-// NewCLICluster returns a RollingCluster driving the local node's xpfd via
-// gRPC. The name is retained for the cmd wiring; the implementation is the
-// gRPC client (not the interactive `cli`).
-func NewCLICluster(unit string) RollingCluster {
-	return &grpcCluster{addr: "127.0.0.1:50051", dialTimeout: 5 * time.Second}
+// NewCLICluster returns a RollingCluster driving the SELECTED systemd unit's
+// xpfd via gRPC. The name is retained for the cmd wiring; the implementation
+// is the gRPC client (not the interactive `cli`).
+//
+// The cluster control RPCs (PeerAlive / SyncEstablished / DrainComplete /
+// ForceSecondary / ResetFailover) target a single hard-coded local endpoint
+// (127.0.0.1:50051). The systemd action side (stop/start/flip) honors the
+// --unit selection, so a non-default --unit would cut one daemon while the
+// drain predicate and ForceSecondary control ANOTHER — wrong-daemon control
+// (#1983). Until a unit->endpoint mapping exists, only the default unit is
+// supported; any other unit is REJECTED here at the single construction
+// chokepoint so cluster RPCs can never silently target the wrong daemon
+// while systemd actions hit a different one. Centralizing the guard in the
+// constructor covers ALL callers (RunRolling + `xpfd upgrade kernel
+// drain`/`rejoin`, which also pass --unit through) and any future caller
+// automatically. --unit takes the BARE unit name (e.g. "xpfd"); the systemd
+// layer appends ".service" itself (system_linux.go), so "xpfd.service" is a
+// non-default spelling and is rejected.
+func NewCLICluster(unit string) (RollingCluster, error) {
+	if unit != "" && unit != DefaultUnit {
+		return nil, fmt.Errorf("cluster control for systemd unit %q is "+
+			"unsupported: the rolling/kernel upgrade control RPCs target the "+
+			"default daemon at 127.0.0.1:50051, so a non-default --unit would "+
+			"drive cluster failover against the WRONG daemon while systemd "+
+			"actions hit %q (a per-unit control endpoint is not yet mapped; "+
+			"use the default unit %q)", unit, unit, DefaultUnit)
+	}
+	return &grpcCluster{addr: "127.0.0.1:50051", dialTimeout: 5 * time.Second}, nil
 }
 
 func (g *grpcCluster) dial() (pb.BpfrxServiceClient, func(), error) {
