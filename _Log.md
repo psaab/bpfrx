@@ -5901,7 +5901,7 @@ top.
 - **Timestamp**: 2026-06-17
 - **Action**: Implement the genuinely-remaining #1967 hardening annex items (flip-failure rollback + version-validation helper + postrm downgrade-path drop-in already shipped in #1964/#1965 — SKIPPED).
 - **Edit**: pkg/upgrade/system_linux.go — C1: BinaryVersion validates the extracted `xpfd <ver>` token via ValidateVersionSegment and hard-fails an unsafe token OR an unrecognized output format. REMOVED the raw-trimmed-output fallback (a corrupt binary / format-drift can no longer key versions/ by garbage).
-- **Edit**: pkg/upgrade/cutover.go — verify-fail cleanup: cleanupFailedVerifyCopy removes versions/<TargetVersion> on a VERIFY failure with two guards (never delete current/PreviousVersion; rewind journal to StatePreflight + persist so a same-version retry recopies). C3 diagnostic: pre-START stat of versions/<ver>/{xpfd,xpf-userspace-dp}; a vanished dir fails fast through the existing START-failure auto-rollback with a clear cause.
+- **Edit**: pkg/upgrade/cutover.go — verify-fail cleanup: cleanupFailedVerifyCopy removes versions/<TargetVersion> on a VERIFY failure with two guards (never delete current/PreviousVersion; rewind journal to StateStaged + persist so a same-version retry re-snapshots + recopies; corrected from StatePreflight in the Codex r1 round, persist-before-snapshot-remove in r2). C3 diagnostic: pre-START stat of versions/<ver>/{xpfd,xpf-userspace-dp}; a vanished dir fails fast through the existing START-failure auto-rollback with a clear cause.
 - **Edit**: pkg/upgrade/runner.go — C4: removeAllPartials fsyncs VersionsDir after sweeping any .partial (gated on a real removal) via partialSweepSyncDir seam.
 - **Edit**: debian/xpf.postrm — remove/purge now also remove the runtime unit drop-in (10-xpf-version.conf) + rmdir empty .service.d + boot-guarded daemon-reload (shared remove_runtime_dropin helper; downgrade path refactored to reuse it). Header comment updated (#1967 no longer deferred).
 - **Write**: pkg/upgrade/system_linux_test.go — BinaryVersion accepts real Debian/semver shapes, rejects unsafe tokens + garbage formats + exec failure (no raw-output leak).
@@ -5923,3 +5923,12 @@ top.
   - Low (test-only): system_linux_test.go shellEscape doubled `%` -> `%%` for the printf VALUE arg (format is the fixed first arg, so the value is literal). Removed the `%` replacement; added a `%`-in-metadata valid case.
   - Low: seed.go stagedVersion raw-output fallback — ALREADY fixed in the Codex r1 fix commit (AGY reviewed pre-fix code).
 - AGY independently confirmed: verify-fail crash-interleaving converges safely; C1 Debian/semver parity; C4 gating; postrm boot-guard + foreign-dropin protection + downgrade refactor ordering; C3 no new HA failure mode.
+
+## 2026-06-17 — #1967 PR #1974 review round 2
+- **AGY r2 MERGE-READY** — confirmed verify-fail crash-interleaving convergence, stale-half-cut HA rollback correctness, seed parity, postrm safety. The 2 r1 findings (shellEscape %, seed parity) verified fixed.
+- **Codex r2 NEEDS-CHANGES (2 findings, addressed)**:
+  - cleanupFailedVerifyCopy removed j.DBSnapshotPath BEFORE persisting the rewound journal — a crash in between leaves the persisted journal at StateCopied/AdvancedStateFloor=true pointing at a removed snapshot. FIX: persist the cleared/rewound journal FIRST, then remove the orphan snapshot (so the on-disk journal never references a deleted snapshot).
+  - DBSnapshotPath used as an os.RemoveAll target unvalidated. FIX: derive the path from the validated TargetVersion (filepath.Join(VersionsDir, "."+ver+".dbsnap")), matching what preflight wrote.
+  - Nit: _Log.md said StatePreflight (now StateStaged) — corrected.
+- **Test**: verify-fail recopy test now asserts the orphan .dbsnap dotfile is removed + persisted journal fields cleared (persist-before-remove ordering).
+- Codex r2 also re-verified C1/C4/postrm/stale-half-cut as correct.

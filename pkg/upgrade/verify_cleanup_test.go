@@ -40,6 +40,15 @@ func TestVerifyFailCleanup_RecopiesOnRetry(t *testing.T) {
 		t.Errorf("snapshot fields not cleared after verify-fail cleanup: path=%q floor=%v",
 			j.DBSnapshotPath, j.AdvancedStateFloor)
 	}
+	// The orphan DB snapshot dotfile must be gone, and — critically — the
+	// PERSISTED journal must not reference any snapshot (persist-before-remove
+	// ordering, Codex r2): on disk, a snapshot is never referenced after it is
+	// deleted. We already reloaded j from disk above, so the cleared fields
+	// prove the persisted record; assert the dotfile removal too.
+	snap := filepath.Join(cfg.VersionsDir, ".2.0.0.dbsnap")
+	if _, serr := os.Stat(snap); !os.IsNotExist(serr) {
+		t.Errorf("orphan DB snapshot %s not removed after verify-fail cleanup: %v", snap, serr)
+	}
 
 	// Operator drops a CORRECTED staged binary under the SAME version and the
 	// verifier now passes. The retry must recopy and complete the cut.

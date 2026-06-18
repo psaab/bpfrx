@@ -622,19 +622,27 @@ func (r *Runner) cleanupFailedVerifyCopy(j *Journal) {
 		r.logf("upgrade: removed copied version dir %s after verify failure "+
 			"(a retry will recopy from staged)", r.versionDir(ver))
 	}
-	// Drop the now-stale DB snapshot taken at the original preflight (the
-	// retry re-snapshots from the possibly-changed live DB). Best-effort.
-	if j.DBSnapshotPath != "" {
-		_ = os.RemoveAll(j.DBSnapshotPath)
-	}
 	// Guard (b): rewind the journal BELOW PREFLIGHT so the retry re-runs BOTH
-	// preflight (fresh DB snapshot) AND copyStaged. Clear the snapshot fields
-	// so a crash between here and the retry's preflight cannot leave a journal
-	// pointing at a removed snapshot.
+	// preflight (fresh DB snapshot) AND copyStaged, and PERSIST it FIRST
+	// (Codex r2): the journal rewrite is the durable source of truth. If we
+	// instead removed the snapshot before persisting, a crash (or a
+	// saveJournal failure) in between would leave the persisted journal at
+	// StateCopied / AdvancedStateFloor=true pointing at an already-removed
+	// snapshot — exactly the stale-snapshot bug this fix targets. By clearing
+	// the fields and persisting first, the on-disk journal never references a
+	// snapshot we are about to delete.
 	j.State = StateStaged
 	j.DBSnapshotPath = ""
 	j.AdvancedStateFloor = false
 	if err := r.saveJournal(j); err != nil {
 		r.logf("upgrade: WARN reset journal after verify-fail cleanup: %v", err)
 	}
+	// Drop the now-orphan DB snapshot taken at the original preflight (the
+	// retry re-snapshots from the possibly-changed live DB). Best-effort, and
+	// done AFTER the journal no longer references it. Derive the path from the
+	// validated TargetVersion rather than trusting the persisted
+	// DBSnapshotPath as an os.RemoveAll target (Codex r2): ver is validated as
+	// a safe path segment in Run() before any cut, so this is the same path
+	// preflight wrote. gc() also sweeps orphan .dbsnap dotfiles defensively.
+	_ = os.RemoveAll(filepath.Join(r.cfg.VersionsDir, "."+ver+".dbsnap"))
 }
