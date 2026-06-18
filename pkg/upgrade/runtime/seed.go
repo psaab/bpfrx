@@ -219,12 +219,17 @@ func atomicAbsSymlink(link, absTarget string) error {
 func atomicSymlink(link, target string) error {
 	dir := filepath.Dir(link)
 	tmp := filepath.Join(dir, "."+filepath.Base(link)+".tmp")
-	_ = os.Remove(tmp)
+	// RemoveAll, not Remove (Copilot): a stale DIRECTORY at the temp path
+	// (manual intervention / a previous failed run) makes os.Remove fail and
+	// the subsequent Symlink fail EEXIST, breaking the idempotent/crash-safe
+	// seed and forcing an unnecessary legacy fallback. Matches the maintainer
+	// scripts' `rm -rf "$link.tmp"`.
+	_ = os.RemoveAll(tmp)
 	if err := os.Symlink(target, tmp); err != nil {
 		return fmt.Errorf("create temp symlink: %w", err)
 	}
 	if err := os.Rename(tmp, link); err != nil {
-		_ = os.Remove(tmp)
+		_ = os.RemoveAll(tmp)
 		return fmt.Errorf("rename symlink into place: %w", err)
 	}
 	if err := fsatomic.SyncDir(dir); err != nil {

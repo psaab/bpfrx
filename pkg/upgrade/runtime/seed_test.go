@@ -237,6 +237,32 @@ func TestSeed_PreservesModes(t *testing.T) {
 	}
 }
 
+// TestSeed_ToleratesStaleTempDir proves atomicSymlink uses RemoveAll, so a
+// stale DIRECTORY at a symlink's temp path (manual intervention / a prior
+// failed run) does not break seeding with EEXIST (Copilot r3).
+func TestSeed_ToleratesStaleTempDir(t *testing.T) {
+	cfg := seedEnv(t, "1.0.0")
+	if err := os.MkdirAll(cfg.VersionsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Plant a stale directory where the `current` symlink's temp goes
+	// (versions/.current.tmp) and where an sbin link's temp goes
+	// (sbin/.xpfd.tmp).
+	if err := os.MkdirAll(filepath.Join(cfg.VersionsDir, "."+currentLink+".tmp"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(cfg.SbinDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(cfg.SbinDir, ".xpfd.tmp"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := Seed(cfg); err != nil {
+		t.Fatalf("Seed with stale temp dirs: %v", err)
+	}
+	assertSeeded(t, cfg, "1.0.0")
+}
+
 // TestSeed_RejectsNonDirVersionPath proves Seed fails (rather than seeding
 // through a broken layout) when versions/<ver> exists but is NOT a directory
 // (corruption / manual edit) — so the postinst can fall back to legacy links
