@@ -116,7 +116,17 @@ func Seed(cfg Config) (err error) {
 	}
 
 	verDir := filepath.Join(cfg.VersionsDir, ver)
-	if _, statErr := os.Stat(verDir); statErr == nil {
+	if fi, statErr := os.Stat(verDir); statErr == nil {
+		// An existing versions/<ver> is treated as a completed prior copy and
+		// the copy is skipped (resume-after-crash). But a NON-directory entry
+		// there (corruption / manual edit) would make `current` and the sbin
+		// links resolve to a broken launch path. Fail seeding so the postinst
+		// falls back to legacy direct-staged links rather than leaving the
+		// daemon unlaunchable (Copilot).
+		if !fi.IsDir() {
+			return fmt.Errorf("seed: %s exists but is not a directory (corrupt "+
+				"runtime layout); refusing to seed through it", verDir)
+		}
 		logf("seed: version dir %s already present; skipping copy", verDir)
 	} else if !os.IsNotExist(statErr) {
 		return fmt.Errorf("seed: stat version dir: %w", statErr)

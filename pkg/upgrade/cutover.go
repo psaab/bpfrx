@@ -242,27 +242,32 @@ func (r *Runner) Run(opts Options) (err error) {
 	}
 
 	// ---- REFUSE-BEFORE-STOP (mechanism C, plan §8 inv. C) ----
-	// This is the UNCONDITIONAL pre-STOP invariant: the cut must never stop a
-	// healthy daemon without a recovery path. A cut with no restorable target
-	// (PreviousVersion=="") is refused UNLESS it is an explicitly sanctioned
-	// no-rollback first cut. We check it before STOP (not at flip/start) so a
-	// healthy daemon is never even stopped in the unrecoverable case. With
-	// the #1964 seed/migration, PreviousVersion is non-empty on every field
-	// host, so this refusal fires only on an unexpected loss of the rollback
-	// target — exactly when a blind STOP would be catastrophic.
-	if !j.State.atLeast(StateStopped) {
-		// Sanctioned either by THIS invocation's flag or by the persisted
-		// journal decision from the original run (so a crash-resume that
-		// re-enters before STOP without the flag is still honored).
-		sanctioned := opts.AllowNoRollbackFirstCut || j.FirstCutSanctioned
-		if j.PreviousVersion == "" && !sanctioned {
-			return fmt.Errorf("refuse-before-STOP: no previous version to roll back to "+
-				"(versions/current is absent or unreadable) and this is not a sanctioned "+
-				"first cut; refusing to proceed past STOP for the %s cut because a "+
-				"flip/start failure would leave the daemon offline with no recovery "+
-				"target. Re-seed the versioned runtime (xpfd seed-runtime) or pass the "+
-				"sanctioned first-cut option", j.TargetVersion)
-		}
+	// The UNCONDITIONAL pre-STOP invariant: never proceed into a STOP/FLIP/
+	// START path for a cut with no restorable target (PreviousVersion=="")
+	// unless it is an explicitly sanctioned no-rollback first cut.
+	//
+	// This check is NOT gated on the cut not-yet-having-stopped (Copilot r2):
+	// a corrupted / hand-edited / older-version journal that resumes at
+	// StateStopped (or later) with PreviousVersion=="" AND
+	// FirstCutSanctioned==false would otherwise sail past STOP straight into
+	// FLIP/START, silently completing an UNSANCTIONED no-rollback cut. By
+	// evaluating it on every Run — even a post-STOP resume — an unsanctioned
+	// empty-previous cut is always refused, while a legitimately sanctioned
+	// resume passes (its FirstCutSanctioned was persisted at INIT). With the
+	// #1964 seed/migration PreviousVersion is non-empty on every field host,
+	// so this fires only on an unexpected loss of the rollback target.
+	//
+	// Sanctioned either by THIS invocation's flag or by the persisted journal
+	// decision from the original run (so a crash-resume re-entering without
+	// the flag is still honored).
+	sanctioned := opts.AllowNoRollbackFirstCut || j.FirstCutSanctioned
+	if j.State.atLeast(StateStaged) && j.PreviousVersion == "" && !sanctioned {
+		return fmt.Errorf("refuse-before-STOP: no previous version to roll back to "+
+			"(versions/current is absent or unreadable) and this is not a sanctioned "+
+			"first cut; refusing to proceed past STOP for the %s cut because a "+
+			"flip/start failure would leave the daemon offline with no recovery "+
+			"target. Re-seed the versioned runtime (xpfd seed-runtime), then re-run "+
+			"the upgrade", j.TargetVersion)
 	}
 
 	// ---- STOP (live mutation #1) ----

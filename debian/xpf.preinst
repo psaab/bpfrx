@@ -56,11 +56,18 @@ is_safe_segment() {
         .*) return 1 ;;          # leading dot
         */*) return 1 ;;         # path separator
     esac
-    # Reject whitespace / control chars. `case` with a glob can't match a
-    # class portably, so strip the safe set and see if anything remains;
-    # printf|tr keeps it POSIX. A leftover char (incl. space/tab/newline,
-    # which tr's [:graph:] excludes) means unsafe.
-    stripped=$(printf '%s' "$seg" | tr -d '[:graph:]')
+    # Reject whitespace / control chars AND non-ASCII high bytes. `case` with
+    # a glob can't match a class portably, so strip the safe set and see if
+    # anything remains; printf|tr keeps it POSIX. A leftover char (incl.
+    # space/tab/newline + any byte >= 0x80, all of which [:graph:] excludes
+    # under the C locale) means unsafe.
+    #
+    # LC_ALL=C is MANDATORY (Copilot): [:graph:] membership is locale-
+    # dependent — under a UTF-8 locale a multibyte char can be classified as
+    # graph and stripped, letting a non-ASCII version slip through and break
+    # parity with the Go ValidateVersionSegment (which rejects rune >= 0x80).
+    # dpkg runs maintainer scripts under the inherited locale, so we pin C.
+    stripped=$(printf '%s' "$seg" | LC_ALL=C tr -d '[:graph:]')
     [ -z "$stripped" ] || return 1
     return 0
 }

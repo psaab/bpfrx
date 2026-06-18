@@ -210,6 +210,28 @@ func TestSeed_PreservesModes(t *testing.T) {
 	}
 }
 
+// TestSeed_RejectsNonDirVersionPath proves Seed fails (rather than seeding
+// through a broken layout) when versions/<ver> exists but is NOT a directory
+// (corruption / manual edit) — so the postinst can fall back to legacy links
+// instead of leaving current/sbin pointing at a non-launchable path (Copilot).
+func TestSeed_RejectsNonDirVersionPath(t *testing.T) {
+	cfg := seedEnv(t, "1.0.0")
+	if err := os.MkdirAll(cfg.VersionsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Plant a regular file where the version DIR should be.
+	if err := os.WriteFile(filepath.Join(cfg.VersionsDir, "1.0.0"), []byte("not a dir"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Seed(cfg); err == nil {
+		t.Fatal("Seed accepted a non-directory versions/<ver>")
+	}
+	// current must NOT have been repointed to the broken layout.
+	if _, err := os.Lstat(filepath.Join(cfg.VersionsDir, currentLink)); err == nil {
+		t.Error("Seed repointed current despite a non-directory version path")
+	}
+}
+
 // TestSeed_RejectsUnsafeVersion proves a version that is not a safe path
 // segment is rejected before any filesystem mutation.
 func TestSeed_RejectsUnsafeVersion(t *testing.T) {

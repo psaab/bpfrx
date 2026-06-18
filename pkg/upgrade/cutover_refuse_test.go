@@ -107,6 +107,44 @@ func TestRun_RejectsUnsafeStagedVersion(t *testing.T) {
 	}
 }
 
+// TestRun_RefusesCorruptStoppedUnsanctionedJournal proves the refuse guard
+// is evaluated even on a resume PAST StateStopped (Copilot r2): a corrupted /
+// hand-edited / older-version journal at StateStopped with PreviousVersion==""
+// and FirstCutSanctioned==false must NOT sail into FLIP/START — it must be
+// refused, never silently completing an unsanctioned no-rollback cut.
+func TestRun_RefusesCorruptStoppedUnsanctionedJournal(t *testing.T) {
+	fs := newFakeSystem(t, "2.0.0")
+	r, cfg := testEnv(t, fs)
+
+	// Hand-write a journal at STOPPED with empty prev and NO sanction (as a
+	// corruption / older-version artifact would look). The target matches the
+	// staged version so the resume-vs-fresh recovery does not reset it.
+	j := &Journal{
+		State:              StateStopped,
+		TargetVersion:      "2.0.0",
+		PreviousVersion:    "",
+		FirstCutSanctioned: false,
+	}
+	must(t, r.saveJournal(j))
+
+	err := r.Run(Options{}) // no flag
+	if err == nil {
+		t.Fatal("expected refuse on a corrupt STOPPED unsanctioned empty-prev journal")
+	}
+	if !strings.Contains(err.Error(), "refuse-before-STOP") {
+		t.Fatalf("error is not the refuse guard: %v", err)
+	}
+	// Must not have flipped (no dropin) or started.
+	for _, c := range fs.calls {
+		if c == "dropin" || c == "start" {
+			t.Errorf("live mutation %q happened despite refuse on a corrupt journal", c)
+		}
+	}
+	if _, lerr := os.Lstat(filepath.Join(cfg.VersionsDir, "current")); !os.IsNotExist(lerr) {
+		t.Error("current created despite refuse on a corrupt journal")
+	}
+}
+
 // TestRun_SanctionedFirstCutPersistsAndResumes proves the sanctioned-first-cut
 // decision is persisted in the journal (Codex r1 MAJOR #4): a sanctioned cut
 // that crashes at STOPPED resumes to completion on a re-run WITHOUT the flag,
