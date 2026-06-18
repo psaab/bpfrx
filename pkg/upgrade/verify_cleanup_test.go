@@ -148,7 +148,9 @@ func TestPreStartVersionDirCheck_RollsBack(t *testing.T) {
 	for _, b := range managedBins {
 		writeFakeBin(t, filepath.Join(verDir, b), "binary-"+b+"-2.0.0")
 	}
-	// DB snapshot so rollback can restore (matches a real preflight).
+	// No DB snapshot / AdvancedStateFloor=false: rollback here is a pure
+	// re-flip to PreviousVersion (no config-DB restore needed). The point of
+	// this test is the C3 pre-START dir check + the re-flip, not DB restore.
 	j := &Journal{
 		State:              StateFlipped,
 		TargetVersion:      "2.0.0",
