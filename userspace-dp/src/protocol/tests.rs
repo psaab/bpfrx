@@ -1567,3 +1567,72 @@ fn process_status_wg_tunnels_roundtrip_and_compat() {
     assert_eq!(future_row.tunnel, "wg9");
     assert_eq!(future_row.hs_send_errors, 0);
 }
+
+// #1961: a full apply_snapshot ControlRequest carrying DSCP/code-point lists as
+// numeric arrays must decode, and the three Vec<u8> fields must carry the
+// values. The Go control plane emits these as numeric arrays via the
+// WireUint8List type; before #1961 it emitted base64 strings, which serde
+// rejects (the whole-request decode aborts — see the negative test below). The
+// JSON is a full ControlRequest, not leaf structs, because the failure was at
+// whole-request decode.
+#[test]
+fn apply_snapshot_decodes_numeric_dscp_lists_1961() {
+    let json = r#"{
+      "type": "apply_snapshot",
+      "snapshot": {
+        "version": 3,
+        "generation": 7,
+        "generated_at": "2026-06-18T00:00:00Z",
+        "summary": {"host_name":"fw","dataplane_type":"userspace","interface_count":0,"zone_count":0,"policy_count":0,"scheduler_count":0,"ha_enabled":false},
+        "class_of_service": {
+          "dscp_classifiers": [
+            {"name": "dc", "entries": [{"forwarding_class": "ef", "dscp_values": [46, 10]}]}
+          ],
+          "ieee8021_classifiers": [
+            {"name": "ic", "entries": [{"forwarding_class": "ef", "code_points": [5]}]}
+          ]
+        },
+        "filters": [
+          {"name": "f", "family": "inet", "terms": [
+            {"name": "mark-ef", "protocols": [], "dscp_values": [46],
+             "action": "accept", "count": "", "log": false, "policer": ""}
+          ]}
+        ]
+      }
+    }"#;
+    let req: ControlRequest = serde_json::from_str(json).expect("full apply_snapshot decodes");
+    assert_eq!(req.request_type, "apply_snapshot");
+    let snap = req.snapshot.expect("snapshot present");
+    let cos = snap.class_of_service.expect("class_of_service present");
+    assert_eq!(cos.dscp_classifiers[0].entries[0].dscp_values, vec![46u8, 10]);
+    assert_eq!(cos.ieee8021_classifiers[0].entries[0].code_points, vec![5u8]);
+    assert_eq!(snap.filters[0].terms[0].dscp_values, vec![46u8]);
+}
+
+// #1961 negative: a base64 STRING for dscp_values (what Go's default []uint8
+// marshaler emitted pre-fix) must FAIL the whole-request decode — this is the
+// exact mechanism that left the helper disabled. Guards against anyone
+// "helpfully" adding a base64 adapter on the Rust side instead of the numeric
+// wire contract.
+#[test]
+fn apply_snapshot_rejects_base64_dscp_string_1961() {
+    let json = r#"{
+      "type": "apply_snapshot",
+      "snapshot": {
+        "version": 3, "generation": 7, "generated_at": "2026-06-18T00:00:00Z", "summary": {"host_name":"fw","dataplane_type":"userspace","interface_count":0,"zone_count":0,"policy_count":0,"scheduler_count":0,"ha_enabled":false},
+        "filters": [
+          {"name": "f", "family": "inet", "terms": [
+            {"name": "mark-ef", "protocols": [], "dscp_values": "Lg==",
+             "action": "accept", "count": "", "log": false, "policer": ""}
+          ]}
+        ]
+      }
+    }"#;
+    let err = serde_json::from_str::<ControlRequest>(json)
+        .expect_err("base64 dscp_values string must be rejected");
+    assert!(
+        err.to_string().contains("expected a sequence")
+            || err.to_string().contains("invalid type"),
+        "unexpected error: {err}"
+    );
+}
