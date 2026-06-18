@@ -1,0 +1,355 @@
+package stagedgen
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+// writeStaged builds a staged tree with one file per managed binary, each
+// carrying the given tag so a published generation's contents are
+// distinguishable.
+func writeStaged(t *testing.T, dir, tag string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range ManagedNames() {
+		p := filepath.Join(dir, b)
+		if err := os.WriteFile(p, []byte("binary-"+b+"-"+tag), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func newConfig(t *testing.T, staged string) Config {
+	t.Helper()
+	return Config{
+		StagedDir: staged,
+		Dir:       filepath.Join(t.TempDir(), "staged-gen"),
+		Logf:      func(f string, a ...any) { t.Logf("stagedgen: "+f, a...) },
+	}
+}
+
+func TestPublishAndResolve(t *testing.T) {
+	root := t.TempDir()
+	staged := filepath.Join(root, "staged")
+	writeStaged(t, staged, "v1")
+	c := newConfig(t, staged)
+
+	genid, err := c.Publish()
+	if err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if !ValidGenID(genid) {
+		t.Fatalf("Publish returned an invalid genid %q", genid)
+	}
+
+	// current-gen resolves to the published genid.
+	got, err := c.ResolveCurrent()
+	if err != nil {
+		t.Fatalf("ResolveCurrent: %v", err)
+	}
+	if got != genid {
+		t.Fatalf("ResolveCurrent = %q, want %q", got, genid)
+	}
+
+	// The generation dir holds every managed binary with the v1 tag.
+	for _, b := range ManagedNames() {
+		data, rerr := os.ReadFile(filepath.Join(c.GenDir(genid), b))
+		if rerr != nil {
+			t.Fatalf("read published %s: %v", b, rerr)
+		}
+		if string(data) != "binary-"+b+"-v1" {
+			t.Fatalf("published %s = %q, want v1 tag", b, data)
+		}
+	}
+	// No .partial leaked.
+	assertNoPartials(t, c.Dir)
+}
+
+func TestResolveCurrentAbsent(t *testing.T) {
+	c := newConfig(t, t.TempDir())
+	got, err := c.ResolveCurrent()
+	if err != nil {
+		t.Fatalf("ResolveCurrent on absent: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("ResolveCurrent on absent = %q, want empty", got)
+	}
+}
+
+func TestPublishDistinctGenerations(t *testing.T) {
+	root := t.TempDir()
+	staged := filepath.Join(root, "staged")
+	writeStaged(t, staged, "v1")
+	c := newConfig(t, staged)
+
+	g1, err := c.Publish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Re-publish the SAME staged bytes: a same-version reinstall must still
+	// yield a DISTINCT generation (B-P5 random suffix), and current-gen must
+	// advance to it.
+	g2, err := c.Publish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g1 == g2 {
+		t.Fatalf("two publishes produced the same genid %q", g1)
+	}
+	cur, _ := c.ResolveCurrent()
+	if cur != g2 {
+		t.Fatalf("current-gen = %q after second publish, want %q", cur, g2)
+	}
+	// Both generation dirs survive (retention N=2 keeps current + 1 prior).
+	for _, g := range []string{g1, g2} {
+		if fi, err := os.Stat(c.GenDir(g)); err != nil || !fi.IsDir() {
+			t.Fatalf("generation dir %s missing after two publishes", g)
+		}
+	}
+}
+
+// TestPublishIsImmutableSource is the crux of #1981: a published generation is
+// a SNAPSHOT. Mutating live staged/ AFTER a publish must NOT change the
+// published generation's bytes — the cut reads the snapshot, not the live tree.
+func TestPublishIsImmutableSource(t *testing.T) {
+	root := t.TempDir()
+	staged := filepath.Join(root, "staged")
+	writeStaged(t, staged, "clean")
+	c := newConfig(t, staged)
+
+	genid, err := c.Publish()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Tear the live staged tree: replace one binary with a "torn" payload, as
+	// dpkg would mid-unpack.
+	torn := filepath.Join(staged, "xpf-userspace-dp")
+	if err := os.WriteFile(torn, []byte("TORN-half-unpacked"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// The published generation is unchanged.
+	data, err := os.ReadFile(filepath.Join(c.GenDir(genid), "xpf-userspace-dp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "binary-xpf-userspace-dp-clean" {
+		t.Fatalf("published generation was mutated by a live staged/ change: %q", data)
+	}
+}
+
+func TestResolveCurrentDanglingIsError(t *testing.T) {
+	root := t.TempDir()
+	staged := filepath.Join(root, "staged")
+	writeStaged(t, staged, "v1")
+	c := newConfig(t, staged)
+	genid, err := c.Publish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Remove the gen dir but leave current-gen dangling — a corrupt layout.
+	if err := os.RemoveAll(c.GenDir(genid)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ResolveCurrent(); err == nil {
+		t.Fatal("ResolveCurrent on a dangling current-gen should error")
+	}
+}
+
+// TestCrashBeforeCurrentGenRepoint simulates a publish crash after the gen dir
+// rename but before the current-gen repoint: the PRIOR current-gen stays
+// valid, and a re-publish converges.
+func TestCrashBeforeCurrentGenRepoint(t *testing.T) {
+	root := t.TempDir()
+	staged := filepath.Join(root, "staged")
+	writeStaged(t, staged, "v1")
+	c := newConfig(t, staged)
+	g1, err := c.Publish()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a crashed second publish: a complete-but-unreferenced gen dir
+	// exists, but current-gen still names g1.
+	orphan := filepath.Join(c.Dir, GenID())
+	if err := copyTreeFsync(staged, orphan); err != nil {
+		t.Fatal(err)
+	}
+	// current-gen must still resolve to g1 (prior generation valid).
+	cur, err := c.ResolveCurrent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur != g1 {
+		t.Fatalf("current-gen = %q, want the prior valid generation %q", cur, g1)
+	}
+	// A re-publish converges current-gen to a fresh generation.
+	g3, err := c.Publish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur, _ = c.ResolveCurrent()
+	if cur != g3 {
+		t.Fatalf("current-gen = %q after re-publish, want %q", cur, g3)
+	}
+}
+
+func TestSweepPartialsOnPublish(t *testing.T) {
+	root := t.TempDir()
+	staged := filepath.Join(root, "staged")
+	writeStaged(t, staged, "v1")
+	c := newConfig(t, staged)
+	if _, err := c.Publish(); err != nil {
+		t.Fatal(err)
+	}
+	// Drop a stale .partial as a crashed prior publish would.
+	stale := filepath.Join(c.Dir, GenID()+partialSuffix)
+	if err := os.MkdirAll(stale, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stale, "junk"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The next publish pre-sweeps it.
+	if _, err := c.Publish(); err != nil {
+		t.Fatal(err)
+	}
+	assertNoPartials(t, c.Dir)
+}
+
+func TestGCRetainsCurrentPlusOne(t *testing.T) {
+	root := t.TempDir()
+	staged := filepath.Join(root, "staged")
+	writeStaged(t, staged, "v1")
+	c := newConfig(t, staged)
+
+	var gens []string
+	for i := 0; i < 4; i++ {
+		g, err := c.Publish()
+		if err != nil {
+			t.Fatal(err)
+		}
+		gens = append(gens, g)
+		// Bump the mtime so the sort order is unambiguous (publishes can land
+		// in the same coarse mtime tick).
+		bumpMtime(t, c.GenDir(g), int64(i+1))
+	}
+	if err := c.GC(nil); err != nil {
+		t.Fatalf("GC: %v", err)
+	}
+	// Newest two survive (current + 1 prior); the older two are gone.
+	for i, g := range gens {
+		_, err := os.Stat(c.GenDir(g))
+		surviving := i >= len(gens)-RetainGenerations
+		if surviving && err != nil {
+			t.Errorf("generation %s should survive GC but is gone", g)
+		}
+		if !surviving && err == nil {
+			t.Errorf("generation %s should be GC'd but survives", g)
+		}
+	}
+}
+
+// TestGCProtectsJournalReferencedGen pins the GC-vs-resume race (plan §7.7): a
+// generation an in-flight cut still references must NOT be GC'd even when it is
+// older than the retention window.
+func TestGCProtectsJournalReferencedGen(t *testing.T) {
+	root := t.TempDir()
+	staged := filepath.Join(root, "staged")
+	writeStaged(t, staged, "v1")
+	c := newConfig(t, staged)
+
+	// g0 is the cut's pinned source; publish three newer generations so g0
+	// would normally fall outside the N=2 window.
+	g0, err := c.Publish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bumpMtime(t, c.GenDir(g0), 1)
+	for i := 0; i < 3; i++ {
+		g, err := c.Publish()
+		if err != nil {
+			t.Fatal(err)
+		}
+		bumpMtime(t, c.GenDir(g), int64(i+2))
+	}
+	// Protect g0 as a journal-referenced generation.
+	if err := c.GC(map[string]bool{g0: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(c.GenDir(g0)); err != nil {
+		t.Fatalf("GC removed a journal-referenced generation %s: %v", g0, err)
+	}
+
+	// Counter-factual: WITHOUT the protection, g0 is reaped.
+	if err := c.GC(nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(c.GenDir(g0)); err == nil {
+		t.Fatalf("g0 survived an unprotected GC — the protection test is tautological")
+	}
+}
+
+func TestRemoveAll(t *testing.T) {
+	root := t.TempDir()
+	staged := filepath.Join(root, "staged")
+	writeStaged(t, staged, "v1")
+	c := newConfig(t, staged)
+	if _, err := c.Publish(); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.RemoveAll(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(c.Dir); !os.IsNotExist(err) {
+		t.Fatalf("RemoveAll left %s present", c.Dir)
+	}
+	// Idempotent on an absent root.
+	if err := c.RemoveAll(); err != nil {
+		t.Fatalf("RemoveAll on absent root: %v", err)
+	}
+}
+
+func TestValidGenID(t *testing.T) {
+	if !ValidGenID(GenID()) {
+		t.Fatal("GenID produced an invalid id")
+	}
+	bad := []string{
+		"", "current-gen", "..", "../escape", "a/b", ".hidden",
+		"00000000000000000000-aabb-ccdd", // two dashes
+		"00000000000000000000-XYZ",       // uppercase / non-hex
+		"00000000000000000000",           // no dash
+	}
+	for _, s := range bad {
+		if ValidGenID(s) {
+			t.Errorf("ValidGenID(%q) = true, want false", s)
+		}
+	}
+}
+
+func assertNoPartials(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) == partialSuffix {
+			t.Errorf("leftover partial %s", e.Name())
+		}
+	}
+}
+
+func bumpMtime(t *testing.T, path string, secs int64) {
+	t.Helper()
+	base := int64(1_700_000_000)
+	mt := time.Unix(base+secs, 0)
+	if err := os.Chtimes(path, mt, mt); err != nil {
+		t.Fatal(err)
+	}
+}

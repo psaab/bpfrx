@@ -5976,3 +5976,8 @@ top.
 - **File(s)**: pkg/upgrade/cluster_cli.go, pkg/upgrade/rolling.go,
   cmd/xpfd/upgrade_kernel.go, pkg/upgrade/cluster_cli_test.go,
   docs/in-place-upgrade.md
+
+## 2026-06-18 — #1981 Option B immutable versioned staging
+- **Timestamp**: 2026-06-18
+- **Action**: Add pkg/upgrade/stagedgen — Publish/ResolveCurrent/GC/RemoveAll for staged-gen/<genid> + current-gen, durable copy + atomic symlink. Foundation for #1981 Option B.
+- **File(s)**: pkg/upgrade/stagedgen/stagedgen.go, pkg/upgrade/stagedgen/fsutil.go, pkg/upgrade/stagedgen/stagedgen_test.go
