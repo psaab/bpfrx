@@ -211,10 +211,16 @@ scenario_downgrade_skips_foreign_link() {
 # exec-probe gate tore the runtime down here.
 scenario_upgrade_nonexecable_staged_survives() {
     build_hardened "0.0.5000+gaaaa"
-    # Staged xpfd present but non-executable (exec would ENOEXEC). The gate
-    # never execs it; only $2 matters.
-    : > "$STAGED/xpfd"
-    chmod -x "$STAGED/xpfd"
+    # Staged xpfd present and STILL marked executable, but unrunnable: a file
+    # with a bogus ELF magic + the exec bit set exec()s to ENOEXEC ("Exec
+    # format error") (Copilot). This is the true #1985 failure mode -- a
+    # binary the OLD code probed with `[ -x ] && "$STAGED/xpfd" ...` that
+    # PASSES the -x test but fails to actually run (dynamic-link error /
+    # corruption / arch mismatch). The version-floor gate never execs it;
+    # only $2 matters.
+    printf '\177ELF\001bogus-unrunnable' > "$STAGED/xpfd"
+    chmod +x "$STAGED/xpfd"
+    [ -x "$STAGED/xpfd" ] || { echo "FAIL: precondition: staged xpfd should be -x (executable bit set)"; exit 1; }
     "$ROOT/postrm" upgrade "0.0.5500+gbbbb"
     [ -e "$DROPIN" ] || { echo "FAIL: drop-in removed on upgrade w/ non-execable staged xpfd"; exit 1; }
     [ -e "$(dirname "$DROPIN")" ] || { echo "FAIL: .service.d removed on upgrade w/ non-execable staged xpfd"; exit 1; }
@@ -230,8 +236,11 @@ scenario_upgrade_nonexecable_staged_survives() {
 # pre-#1964 downgrade.
 scenario_downgrade_hardened_nonexecable_survives() {
     build_hardened "0.0.5500+gaaaa"
-    : > "$STAGED/xpfd"
-    chmod -x "$STAGED/xpfd"
+    # Executable bit set but unrunnable (bogus ELF magic -> ENOEXEC), same as
+    # the upgrade scenario (Copilot): exercises the real "executable but
+    # cannot exec" case, not the [ -x ] short-circuit.
+    printf '\177ELF\001bogus-unrunnable' > "$STAGED/xpfd"
+    chmod +x "$STAGED/xpfd"
     "$ROOT/postrm" upgrade "0.0.5000+gbbbb"
     [ -e "$DROPIN" ] || { echo "FAIL: drop-in removed on hardened->hardened downgrade w/ non-execable staged xpfd"; exit 1; }
     [ -L "$CURRENT" ] || { echo "FAIL: current deleted on hardened->hardened downgrade w/ non-execable staged xpfd"; exit 1; }
