@@ -87,15 +87,34 @@ case "$1" in
             elif [ "${XPF_NO_POSTINST_CUT:-}" = "1" ]; then
                 echo "xpf: XPF_NO_POSTINST_CUT=1 — staged only;" \
                      "cut over with: xpfd upgrade" >&2
+            elif ! flock -n /run/xpf/upgrade.lock true 2>/dev/null && [ -e /run/xpf/upgrade.lock ]; then
+                # #1965 postinst contention residual: in the rare TOCTOU
+                # case where the host-wide upgrade lock became busy between
+                # the preinst gate (which released its fd at preinst exit)
+                # and now, another upgrade is in progress. The new binary
+                # set is already staged. Do NOT cut (that would race the
+                # other mutator's journal/symlink state) and do NOT fail the
+                # postinst (a non-zero postinst leaves dpkg half-configured,
+                # worse than a deferred cut on a host still running the old
+                # in-memory daemon). Log loudly, drop a deferred marker, and
+                # exit 0; the operator runs `xpfd upgrade` once the other
+                # operation completes.
+                mkdir -p /run/xpf
+                : > /run/xpf/upgrade-deferred 2>/dev/null || true
+                echo "xpf: another upgrade is in progress — staged only;" \
+                     "run 'xpfd upgrade' after it completes." >&2
+                cat /run/xpf/upgrade.lock 2>/dev/null >&2 || true
             else
                 echo "xpf: standalone node — performing verified in-place cut-over" >&2
                 # Run the staged binary's upgrade subcommand: it copies
                 # staging into the versioned runtime dir, runs the kernel
                 # verify-dataplane gate, and on PASS does the atomic
-                # STOP->FLIP->START with rollback. A REJECT/abort leaves the
-                # running daemon untouched. We do NOT fail the package
-                # install on a cut-over abort (the operator can re-run
-                # xpf-upgrade); surface it loudly instead.
+                # STOP->FLIP->START with rollback. The binary itself takes
+                # the host-wide upgrade lock (#1965); the flock pre-check
+                # above only narrows the TOCTOU window. A REJECT/abort
+                # leaves the running daemon untouched. We do NOT fail the
+                # package install on a cut-over abort (the operator can
+                # re-run xpf-upgrade); surface it loudly instead.
                 if ! "$STAGED/xpfd" upgrade; then
                     echo "xpf: WARNING in-place cut-over did not complete." >&2
                     # Safety net (Copilot): the cut STOPs the unit before it
@@ -106,7 +125,10 @@ case "$1" in
                     # and START could leave the unit stopped. If it is not
                     # active, try to bring it back up so the node is not left
                     # offline after `apt upgrade`.
-                    if ! systemctl is-active --quiet xpfd; then
+                    # Boot-guard the systemctl calls (#1965): in a
+                    # non-booted env (docker/chroot/bake) systemctl exits
+                    # non-zero and, under set -e, would fail the postinst.
+                    if [ -d /run/systemd/system ] && ! systemctl is-active --quiet xpfd; then
                         echo "xpf: unit not active after a failed cut-over; restarting" >&2
                         systemctl start xpfd 2>/dev/null || \
                             echo "xpf: WARNING could not restart xpfd; run: xpfd upgrade" >&2

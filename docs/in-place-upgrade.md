@@ -133,6 +133,51 @@ raw push+restart path (and `XPF_DEPLOY_FAST`) is unchanged for the dev
 inner loop. The deb path is opt-in until validated live; it then becomes
 the CI/smoke default.
 
+## Host-wide upgrade lock (#1965)
+
+Every MUTATING upgrade operation on a host takes one host-wide advisory
+lock — `/run/xpf/upgrade.lock`, a non-blocking exclusive `flock(2)`
+(`pkg/upgrade/lock`). It serializes the standalone binary cut
+(`xpfd upgrade`), the rolling driver (`xpfd upgrade --rolling`), the
+postinst auto-cut, and the mutating `xpfd upgrade kernel`
+sub-verbs (`arm`/`promote`/`drain`/`rejoin`). Without it two mutators
+silently corrupt the crash-safe journal: both load the same snapshot,
+modify independent copies, and last-write-wins, losing the rollback
+target. Read-only status (`xpfd upgrade kernel status`) stays lock-free.
+
+- `/run` is tmpfs and reboot-clearing — exactly right: the lock guards
+  CONCURRENT mutators, while crash recovery stays journal-driven (the
+  durable journal lives under `/var/lib/xpf`). A reboot mid-upgrade
+  leaves no stale lock; the resume reads the journal, not the lock.
+  `mkdir -p /run/xpf` runs before every acquire (a fresh boot's tmpfs may
+  lack the dir).
+- Owner metadata (PID, subcommand, target, start time) is written into
+  the lock file after the flock succeeds, so a busy acquirer's error
+  NAMES the current owner.
+- The lock is released on every exit path (normal/error/panic) via defer;
+  the kernel also drops the flock on process exit, so a crashed holder
+  never wedges the host.
+- **Rolling re-entrancy:** `RunRolling` takes the lock at entry and holds
+  it through rejoin (covering the peer-check + `ForceSecondary` + drain
+  window, not just the inner cut). The inner `r.Run()` runs with
+  `Options{LockAlreadyHeld: true}` so it does NOT re-flock the same file
+  (a second flock on a fresh fd of the same path returns `EWOULDBLOCK`
+  and would abort the rolling upgrade).
+- **Lock ordering vs the `/tmp/xpf-cluster.lock` deploy lock (#1875):**
+  the cluster/deploy lock is taken OUTSIDE, the host upgrade lock INSIDE.
+  No deadlock — the two never nest in the opposite order.
+- **dpkg-vs-operator staged-source race:** `debian/xpf.preinst` runs
+  BEFORE unpack and `flock -n /run/xpf/upgrade.lock`-gates the package
+  operation, failing apt loudly (non-zero, system untouched) if an
+  operator upgrade already holds the lock. This is a fail-loud gate, not
+  full unpack serialization: a preinst fd dies at preinst exit, so the
+  lock is not held DURING dpkg's unpack. The torn-binary backstop is the
+  `verify-dataplane` kernel gate the cut runs against the COPIED binary
+  before `StopUnit`. The postinst standalone path re-checks the lock and,
+  on the narrow TOCTOU residual, drops `/run/xpf/upgrade-deferred`, logs
+  loudly, and exits 0 (a non-zero postinst leaves dpkg half-configured).
+  Operator guidance: do not run `xpfd upgrade` during `apt upgrade`.
+
 ## Peer-takeover-readiness is best-effort; DrainComplete is authoritative
 
 The local control socket renders the LOCAL node's view, so the
