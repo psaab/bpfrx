@@ -13,7 +13,18 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/fsatomic"
+	"github.com/psaab/xpf/pkg/upgrade/lock"
 )
+
+// lockHandle is the host-wide advisory lock surface used by the upgrade
+// runner. acquireUpgradeLock is indirected through a package var so tests
+// can substitute a fake that records acquire/release ordering and can be
+// forced busy (#1965). Production calls lock.Acquire.
+type lockHandle interface{ Release() error }
+
+var acquireUpgradeLock = func(subcommand, target string) (lockHandle, error) {
+	return lock.Acquire(subcommand, target)
+}
 
 // Default filesystem layout (plan §6.1). Overridable in Config for tests.
 const (

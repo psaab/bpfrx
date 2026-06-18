@@ -21,6 +21,16 @@ type Options struct {
 	// drained to its peer via the cluster state machine, so the cluster
 	// keeps forwarding regardless.
 	UnitAlreadyStopped bool
+
+	// LockAlreadyHeld tells Run NOT to acquire the host-wide upgrade lock
+	// because a caller higher in the stack already holds it (#1965). The
+	// `--rolling` driver (RunRolling) acquires the lock at its entry and
+	// holds it through the peer-check + drain + cut + rejoin; the inner
+	// r.Run() it invokes MUST set this, because a second flock on a fresh
+	// fd of the same file returns EWOULDBLOCK and would abort the rolling
+	// upgrade. The standalone single-node flow (and the postinst cut) leave
+	// it false so Run owns the lock.
+	LockAlreadyHeld bool
 }
 
 // Run executes (or resumes) the cut-over to the staged version. It is
@@ -29,6 +39,22 @@ type Options struct {
 // The standalone single-node flow. The HA rolling driver wraps this with
 // a controlled drain (rolling.go).
 func (r *Runner) Run(opts Options) (err error) {
+	// Acquire the host-wide upgrade lock BEFORE any journal read or live
+	// mutation, unless a caller higher in the stack already holds it (the
+	// --rolling driver — #1965). Holding the lock from here through return
+	// serializes this cut against a concurrent operator cut, the postinst
+	// cut, and a `kernel arm`. Release on every exit path (normal, error,
+	// panic) via defer. The standalone single-node flow owns the lock; the
+	// rolling driver sets LockAlreadyHeld so the inner cut does not try to
+	// re-flock the same file (which would EWOULDBLOCK and abort).
+	if !opts.LockAlreadyHeld {
+		h, lerr := acquireUpgradeLock("upgrade", "")
+		if lerr != nil {
+			return fmt.Errorf("upgrade: %w", lerr)
+		}
+		defer func() { _ = h.Release() }()
+	}
+
 	j, err := r.loadJournal()
 	if err != nil {
 		return err

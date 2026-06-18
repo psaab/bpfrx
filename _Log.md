@@ -5851,3 +5851,13 @@ top.
 - **Edit**: pkg/upgrade/runner.go — copyTree: fsync each copied directory (deepest-first) so nested entries survive power loss.
 - **Edit**: pkg/upgrade/runner_test.go — TestCopyTree_NestedDirsDurable.
 - **Edit** (r1 review fixes): runner.go — extract fsyncDirsDeepestFirst (true depth via separator count, not string length) + copyTreeSyncDir test seam; runner_test.go — TestCopyTree_FsyncsEachDirDeepestFirst (recorder proves loop runs + deepest-first) + TestCopyTree_FsyncDirErrorPropagates; cluster_cli_test.go — Not-configured-then-later-Status fixture.
+
+## 2026-06-18 — #1965 host-wide upgrade lock (finish + quad review, PR #1971)
+- **Timestamp**: 2026-06-18
+- **Action**: Finish #1965 (host-wide advisory upgrade lock) — committed the crash-point pending maintainer-script + docs work, drove the 4-way review, and fixed two review findings.
+- **Edit**: debian/xpf.preinst (new) — pre-unpack `flock -n /run/xpf/upgrade.lock` gate; exits non-zero on busy so apt aborts before any mutation. No systemctl.
+- **Edit**: debian/xpf.postinst — TOCTOU contention residual (drop /run/xpf/upgrade-deferred, exit 0, never non-zero) + boot-guard the failed-cut systemctl with `[ -d /run/systemd/system ]`; later also drop the deferred marker when the inner cut fails busy (Codex MINOR).
+- **Edit**: docs/in-place-upgrade.md — document the lock contract, rolling re-entrancy, cluster-lock-OUTSIDE/host-lock-INSIDE order, dpkg-vs-operator staged-source race + verify-dataplane backstop.
+- **Edit**: pkg/upgrade/lock/lock.go — make owner-metadata write strictly best-effort (Codex MAJOR/Copilot): on writeOwnerFn failure log to stderr and return (handle, nil), never a held-handle-plus-error pair that callers would drop (fd leak). Added writeOwnerFn test seam.
+- **Edit**: pkg/upgrade/lock/lock_test.go — TestMetadataWriteFailureStillHoldsLock (held lock + nil error + busy second acquire + release/reacquire).
+- **Validation**: go build/vet clean; full Go suite green; lock tests pass 5x; sh -n clean on both maintainer scripts. Quad review: Claude SMR MERGE-READY, AGY MERGE-READY (r2), Codex MERGE-READY (r2, no findings), Copilot single finding fixed.

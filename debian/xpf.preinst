@@ -1,0 +1,55 @@
+#!/bin/sh
+# xpf preinst (#1965 — host-wide upgrade-lock gate, before unpack).
+#
+# A concurrent operator `xpfd upgrade` (or `xpfd upgrade --rolling`, or a
+# `xpfd upgrade kernel arm`) holds the host-wide advisory lock
+# /run/xpf/upgrade.lock for its whole cut. If apt unpacked the new package
+# while one of those was mid-copy, dpkg would overwrite the dpkg-staged
+# binary set under /usr/local/share/xpf/staged/ that the operator's cut is
+# reading — a torn source. The preinst runs BEFORE unpack (Debian Policy
+# §6.5/§6.6), so this is the correct place to FAIL the package operation
+# loudly and atomically (apt aborts before any mutation) if an upgrade is
+# already in progress.
+#
+# This is a non-blocking gate, not full serialization: a flock fd dies when
+# preinst exits, so the lock is NOT held during dpkg's unpack, and an
+# operator who acquires the (now-free) lock DURING unpack could still read a
+# torn staged tree. The torn-binary backstop is the `verify-dataplane`
+# kernel gate the in-place cut runs against the COPIED binary before
+# StopUnit (a torn/non-execable ELF fails verify and aborts the cut while
+# the daemon is still up). Operator guidance: do not run `xpfd upgrade`
+# during `apt upgrade`.
+
+set -e
+
+LOCK=/run/xpf/upgrade.lock
+
+case "$1" in
+    upgrade)
+        # /run is tmpfs and may lack our subdir on a fresh boot.
+        mkdir -p /run/xpf
+
+        # Non-blocking exclusive lock. If another upgrade holds it, flock
+        # exits non-zero and (under set -e) fails the preinst, so apt aborts
+        # BEFORE unpacking — the system is left untouched. We immediately
+        # release (the subshell exits); the gate only needs to PROVE the
+        # lock is free at this instant, not hold it through the unpack (which
+        # a preinst fd cannot do across the dpkg boundary anyway).
+        if ! flock -n "$LOCK" true; then
+            echo "xpf: another in-place upgrade is in progress (holds $LOCK)." >&2
+            echo "xpf: refusing to unpack — wait for it to finish, then re-run apt." >&2
+            cat "$LOCK" 2>/dev/null >&2 || true
+            exit 1
+        fi
+        ;;
+    install|abort-upgrade)
+        ;;
+    *)
+        echo "preinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0
