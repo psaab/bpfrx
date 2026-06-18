@@ -34,6 +34,33 @@
 //     while another fd holds LOCK_EX. The lock is released by closing the
 //     fd (Handle.Release), and the kernel also releases it on process
 //     exit, so a crashed holder never wedges the host.
+//
+// Stale-owner-metadata correctness (#1984): the owner metadata is the only
+// thing a busy acquirer reads to NAME the holder, and it is written AFTER
+// the flock. Without care a busy acquirer can read a PREVIOUS owner's JSON
+// as if it were the current holder's, misreporting a long-exited process.
+// The mutual exclusion (the flock) is unaffected — this is diagnostics
+// correctness. Two truncations, both performed WHILE THE FLOCK IS HELD,
+// keep the file empty across the entire ownerless interval (best-effort: a
+// truncate failure is logged/ignored, never failing acquire or release —
+// the other truncate and the next acquirer's truncate are the backstops, so
+// the worst case degrades to the pre-fix stale read, never a mutex fault):
+//   - truncate-on-acquire: the instant AcquireAt holds the flock it
+//     Truncate(0)s the file, so the acquire->write window (before the new
+//     owner records its own metadata) and a swallowed metadata-write
+//     failure both leave an EMPTY file rather than stale JSON. readOwner
+//     returns nil on an empty file, so a concurrent busy reader degrades
+//     to "busy, owner unknown".
+//   - truncate-on-release-under-lock: Release Truncate(0)s the file BEFORE
+//     dropping the flock, so the file is already empty the instant the
+//     NEXT acquirer can flock it — closing the flock->truncate scheduling
+//     gap that truncate-on-acquire alone would leave open.
+// Both are f.Truncate(0) on the HELD fd. os.Remove is deliberately NOT
+// used: flock binds the inode (open file description), so unlinking the
+// path while another fd has it open / awaits it lets a fresh O_CREAT
+// acquirer flock a DIFFERENT inode — a split mutex (the #1875 "never rm
+// the lock file" lesson). /run is tmpfs (reboot-clearing), so a lingering
+// zero-length lock file is harmless.
 package lock
 
 import (
@@ -149,6 +176,22 @@ func AcquireAt(path, subcommand, target string) (*Handle, error) {
 
 	h := &Handle{f: f}
 
+	// We hold the flock. Zero the file IMMEDIATELY, before recording our own
+	// metadata (#1984). Any concurrent busy reader that races into the
+	// acquire->write window now sees an EMPTY file (readOwner returns nil),
+	// degrading to "busy, owner unknown" rather than naming the PREVIOUS
+	// owner. This also closes the write-failure window below: if writeOwnerFn
+	// fails, the file is already empty instead of holding stale JSON. The
+	// truncate is on the HELD fd, so no concurrent writer can race it. It is
+	// non-fatal — the lock is the flock, not the file contents — so a failure
+	// is logged and execution continues (writeOwner's own Truncate(0) retries
+	// the clear, and a Release-time truncate is the final backstop).
+	if terr := f.Truncate(0); terr != nil {
+		fmt.Fprintf(os.Stderr,
+			"upgrade lock: held %s but failed to clear stale owner metadata: %v\n",
+			path, terr)
+	}
+
 	// We hold the lock — record owner metadata. Truncate first so a stale
 	// (larger) prior record never leaves trailing bytes. The metadata write
 	// is TRULY best-effort: a write failure is non-fatal to holding the lock
@@ -180,12 +223,44 @@ func (h *Handle) Release() error {
 		return nil
 	}
 	h.released = true
-	// Closing the fd releases the flock (the lock is tied to the open file
-	// description). Explicitly LOCK_UN first is redundant but harmless and
-	// makes the release intent obvious; ignore its error since Close is the
-	// authoritative drop.
-	_ = unix.Flock(int(h.f.Fd()), unix.LOCK_UN)
+	// Zero the file BEFORE dropping the flock (#1984). The next acquirer can
+	// only flock this inode after we LOCK_UN/Close, so truncating here means
+	// the file is already empty the instant ownership becomes available —
+	// closing the flock->truncate scheduling gap that truncate-on-acquire
+	// alone would leave (a racing reader in the next owner's acquire->write
+	// window would otherwise read OUR now-stale metadata). We still hold the
+	// flock, so no concurrent writer can race this truncate. This is
+	// f.Truncate(0) on the HELD fd, NOT os.Remove: unlinking the path would
+	// let a fresh O_CREAT acquirer flock a different inode and split the
+	// mutex (the #1875 lesson). The truncate error is ignored — release must
+	// not fail on a best-effort metadata clear, and the kernel drops the
+	// flock on Close regardless. We still log a failure so an operator can
+	// see the (rare) case where the next owner's busy errors could name us.
+	if terr := h.f.Truncate(0); terr != nil {
+		fmt.Fprintf(os.Stderr,
+			"upgrade lock: failed to clear owner metadata on release (the next owner's busy errors may briefly name this one): %v\n",
+			terr)
+	}
+	// releaseUnlockFn is the seam through which Release drops the flock. It
+	// runs AFTER the truncate and BEFORE Close, so a test can assert the file
+	// is already empty at the instant ownership is about to be handed off —
+	// proving the truncate happened under the held flock (not after unlock).
+	releaseUnlockFn(h.f)
 	return h.f.Close()
+}
+
+// releaseUnlockFn drops the flock during Release. Production uses
+// releaseUnlock (an explicit LOCK_UN); tests substitute a hook that first
+// asserts the file is already empty, proving Release truncates BEFORE it
+// unlocks (i.e. while the flock is still held).
+var releaseUnlockFn = releaseUnlock
+
+// releaseUnlock drops the BSD advisory lock. Explicit LOCK_UN is redundant
+// with the Close that follows (closing the fd releases the lock tied to the
+// open file description) but makes the release intent obvious; its error is
+// ignored since Close is the authoritative drop.
+func releaseUnlock(f *os.File) {
+	_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
 }
 
 // writeOwnerFn is the seam through which AcquireAt records owner metadata.
