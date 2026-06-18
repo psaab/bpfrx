@@ -498,7 +498,7 @@ cmd_deploy() {
 
 		local local_sum vm_sum
 		local_sum=$(sha256sum "$PROJECT_ROOT/xpf-userspace-dp" | awk '{print $1}')
-		vm_sum=$(incus exec "$INSTANCE_NAME" -- sha256sum /usr/local/sbin/xpf-userspace-dp 2>/dev/null | awk '{print $1}')
+		vm_sum=$(incus exec "$INSTANCE_NAME" -- sha256sum /usr/local/sbin/xpf-userspace-dp 2>/dev/null | awk '{print $1}' || true)
 		if [[ -z "$vm_sum" ]]; then
 			die "xpf-userspace-dp not present on $INSTANCE_NAME after push (sha256 readback empty)"
 		fi
