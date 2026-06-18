@@ -55,7 +55,8 @@ func (w WireUint8List) MarshalJSON() ([]byte, error) {
 
 // UnmarshalJSON accepts the canonical numeric array form ([46,10]) and, for
 // backward compatibility with any blob written by the old default marshaler, a
-// base64 string ("LAo="). A JSON null decodes to a nil list.
+// base64 string ("Lgo=" is the base64 of bytes 46,10). A JSON null decodes to a
+// nil list.
 func (w *WireUint8List) UnmarshalJSON(data []byte) error {
 	// Trim leading ASCII whitespace without pulling in bytes just for this.
 	i := 0
