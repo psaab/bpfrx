@@ -117,6 +117,20 @@ case "$1" in
                 # re-run xpf-upgrade); surface it loudly instead.
                 if ! "$STAGED/xpfd" upgrade; then
                     echo "xpf: WARNING in-place cut-over did not complete." >&2
+                    # #1965 (Codex MINOR): an operator could have acquired the
+                    # host-wide lock AFTER the shell precheck above but BEFORE
+                    # this inner cut, so the cut aborted busy. Drop the same
+                    # deferred marker the explicit contention branch drops so
+                    # the residual is recorded consistently regardless of which
+                    # window the contention landed in. Best-effort: if the lock
+                    # is still busy now, mark it deferred.
+                    if [ -e /run/xpf/upgrade.lock ] && \
+                       ! flock -n /run/xpf/upgrade.lock true 2>/dev/null; then
+                        mkdir -p /run/xpf
+                        : > /run/xpf/upgrade-deferred 2>/dev/null || true
+                        echo "xpf: another upgrade is in progress — staged only;" \
+                             "run 'xpfd upgrade' after it completes." >&2
+                    fi
                     # Safety net (Copilot): the cut STOPs the unit before it
                     # FLIPs. Most failures (preflight/copy/verify) abort
                     # BEFORE the stop and leave the daemon running; the

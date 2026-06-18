@@ -110,8 +110,13 @@ func IsBusy(err error) bool {
 // Handle whose Release drops it. It is a non-blocking exclusive flock: if
 // another process holds the lock, it returns an *ErrBusy naming the owner.
 //
-// The owner metadata (PID, subcommand, target, start time) is recorded in
-// the lock file after the flock succeeds.
+// On success Acquire returns (handle, nil): once the flock is held, the
+// returned error is always nil. The owner metadata (PID, subcommand,
+// target, start time) is recorded in the lock file best-effort AFTER the
+// flock succeeds; a metadata-write failure is logged to stderr and never
+// surfaced as an Acquire error (it would otherwise tempt callers to discard
+// the held handle and leak the fd). A nil error therefore unambiguously
+// means "lock held".
 func Acquire(subcommand, target string) (*Handle, error) {
 	return AcquireAt(DefaultPath, subcommand, target)
 }
@@ -145,19 +150,24 @@ func AcquireAt(path, subcommand, target string) (*Handle, error) {
 	h := &Handle{f: f}
 
 	// We hold the lock — record owner metadata. Truncate first so a stale
-	// (larger) prior record never leaves trailing bytes. A metadata-write
-	// failure is non-fatal to holding the lock (the lock is the flock, not
-	// the file contents) — we keep the lock but surface the write error so
-	// the caller can log it; the busy path then degrades to a nil Owner.
-	if err := writeOwner(f, Owner{
+	// (larger) prior record never leaves trailing bytes. The metadata write
+	// is TRULY best-effort: a write failure is non-fatal to holding the lock
+	// (the lock is the flock, not the file contents), so we must NOT return a
+	// non-nil error here. Callers uniformly treat a non-nil Acquire error as
+	// "lock not held" and return WITHOUT deferring Release — returning the
+	// held handle alongside an error would leak the held fd until process
+	// exit (Codex MAJOR #1). Instead we swallow the write error and log it to
+	// stderr; the busy path then simply degrades to a nil Owner (busy, owner
+	// unknown). The flock — the actual mutual exclusion — is fully held.
+	if werr := writeOwnerFn(f, Owner{
 		PID:        os.Getpid(),
 		Subcommand: subcommand,
 		Target:     target,
 		StartedAt:  time.Now(),
-	}); err != nil {
-		// Keep the lock; report a non-fatal metadata error wrapped so the
-		// caller may log it but the Handle is still valid.
-		return h, fmt.Errorf("upgrade lock: acquired but failed to record owner metadata: %w", err)
+	}); werr != nil {
+		fmt.Fprintf(os.Stderr,
+			"upgrade lock: held %s but failed to record owner metadata (busy errors will not name this owner): %v\n",
+			path, werr)
 	}
 	return h, nil
 }
@@ -177,6 +187,12 @@ func (h *Handle) Release() error {
 	_ = unix.Flock(int(h.f.Fd()), unix.LOCK_UN)
 	return h.f.Close()
 }
+
+// writeOwnerFn is the seam through which AcquireAt records owner metadata.
+// Production uses writeOwner; tests substitute a failing writer to prove the
+// best-effort contract (a metadata-write failure still yields a held lock and
+// a nil Acquire error).
+var writeOwnerFn = writeOwner
 
 // writeOwner truncates the lock file and writes the owner metadata as
 // pretty JSON. The fd already holds the flock.

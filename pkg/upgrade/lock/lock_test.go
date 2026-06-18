@@ -159,6 +159,46 @@ func TestReleaseOnProcessExit(t *testing.T) {
 	}
 }
 
+// TestMetadataWriteFailureStillHoldsLock proves the best-effort contract
+// (Codex MAJOR #1): when recording owner metadata fails, Acquire must STILL
+// return a held lock with a NIL error, because callers treat a non-nil
+// Acquire error as "lock not held" and return WITHOUT deferring Release — a
+// (held handle, non-nil error) pair would leak the fd until process exit.
+func TestMetadataWriteFailureStillHoldsLock(t *testing.T) {
+	p := lockPath(t)
+
+	prev := writeOwnerFn
+	writeOwnerFn = func(*os.File, Owner) error {
+		return os.ErrInvalid // force the metadata write to fail
+	}
+	t.Cleanup(func() { writeOwnerFn = prev })
+
+	h, err := AcquireAt(p, "upgrade", "meta-fail")
+	if err != nil {
+		t.Fatalf("metadata-write failure must NOT fail Acquire (would tempt callers to leak the held fd); got err=%v", err)
+	}
+	if h == nil {
+		t.Fatal("Acquire returned a nil handle on a successful flock")
+	}
+
+	// The lock must genuinely be held: a second acquire is busy. Restore the
+	// real writer first so the busy probe behaves normally.
+	writeOwnerFn = prev
+	if _, err2 := AcquireAt(p, "upgrade", "second"); !IsBusy(err2) {
+		t.Fatalf("lock not actually held after a metadata-write failure; second acquire err=%v", err2)
+	}
+
+	// Releasing the held handle frees the lock.
+	if rerr := h.Release(); rerr != nil {
+		t.Fatalf("release: %v", rerr)
+	}
+	h2, err := AcquireAt(p, "upgrade", "after-release")
+	if err != nil {
+		t.Fatalf("reacquire after release: %v", err)
+	}
+	_ = h2.Release()
+}
+
 func TestMkdirCreatesRunDir(t *testing.T) {
 	// Point at a nested non-existent dir; Acquire must mkdir -p it.
 	p := filepath.Join(t.TempDir(), "xpf", "nested", "upgrade.lock")
