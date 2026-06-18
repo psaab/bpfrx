@@ -142,9 +142,10 @@ scenario_remove_no_dropin_ok() {
 # downgrade to a pre-hardened package: drop-in removed, sbin repointed to
 # staged, current deleted.
 scenario_downgrade_to_prehardened() {
-    build_hardened "2.0.0"
+    build_hardened "0.0.5000+gaaaa"
     make_staged_prehardened
-    "$ROOT/postrm" upgrade "0.9.0"
+    # $2 is a pre-#1964 version (< the 0.0.4104 floor) -> genuine downgrade.
+    "$ROOT/postrm" upgrade "0.0.4000+gbbbb"
     [ -e "$DROPIN" ] && { echo "FAIL: drop-in not removed"; exit 1; } || true
     # The .d dir must be rmdir'd when empty (exercises dirname "$DROPIN").
     [ -e "$(dirname "$DROPIN")" ] && { echo "FAIL: empty drop-in .d dir not removed"; exit 1; } || true
@@ -155,11 +156,11 @@ scenario_downgrade_to_prehardened() {
     [ -e "$CURRENT" ] && { echo "FAIL: current not deleted"; exit 1; } || true
 }
 
-# downgrade/upgrade to ANOTHER hardened package: layout untouched.
+# upgrade to a newer hardened package ($2 >= floor): layout untouched.
 scenario_upgrade_to_hardened_noop() {
-    build_hardened "1.0.0"
-    # staged xpfd still supports the capability check (build_hardened set it).
-    "$ROOT/postrm" upgrade "0.9.0"
+    build_hardened "0.0.5000+gaaaa"
+    # $2 is a post-#1964 version (>= the 0.0.4104 floor) -> NOT a downgrade.
+    "$ROOT/postrm" upgrade "0.0.5500+gbbbb"
     [ -e "$DROPIN" ] || { echo "FAIL: drop-in removed on hardened->hardened"; exit 1; }
     for b in $BINS; do
         tgt=$(readlink "$SBIN/$b")
@@ -188,15 +189,107 @@ scenario_remove_legacy_links() {
 
 # downgrade must NOT clobber a foreign/operator-repointed sbin link (Codex).
 scenario_downgrade_skips_foreign_link() {
-    build_hardened "2.0.0"
+    build_hardened "0.0.5000+gaaaa"
     make_staged_prehardened
     # Operator repointed xpfd elsewhere; the others stay package-owned.
     ln -sf "/opt/custom/xpfd" "$SBIN/xpfd"
-    "$ROOT/postrm" upgrade "0.9.0"
+    # $2 < floor -> genuine pre-#1964 downgrade.
+    "$ROOT/postrm" upgrade "0.0.4000+gbbbb"
     [ "$(readlink "$SBIN/xpfd")" = "/opt/custom/xpfd" ] || { echo "FAIL: downgrade clobbered a foreign sbin link"; exit 1; }
     # The owned ones are repointed to staged.
     for b in cli xpf-userspace-dp xpf-day0-config; do
         [ "$(readlink "$SBIN/$b")" = "$STAGED/$b" ] || { echo "FAIL: owned sbin $b not repointed to staged"; exit 1; }
+    done
+}
+
+# === #1985 regression scenarios: downgrade decision is EXEC-FREE + version-keyed ===
+
+# CORE #1985 BUG CASE: a real UPGRADE ($2 >= the 0.0.4104 floor) whose staged
+# xpfd cannot EXEC (dynamic-link error / corruption / arch mismatch) must NOT
+# be misclassified as a pre-#1964 downgrade. The version arg says "upgrade",
+# so the layout MUST survive regardless of the staged binary's health. The old
+# exec-probe gate tore the runtime down here.
+scenario_upgrade_nonexecable_staged_survives() {
+    build_hardened "0.0.5000+gaaaa"
+    # Staged xpfd present but non-executable (exec would ENOEXEC). The gate
+    # never execs it; only $2 matters.
+    : > "$STAGED/xpfd"
+    chmod -x "$STAGED/xpfd"
+    "$ROOT/postrm" upgrade "0.0.5500+gbbbb"
+    [ -e "$DROPIN" ] || { echo "FAIL: drop-in removed on upgrade w/ non-execable staged xpfd"; exit 1; }
+    [ -e "$(dirname "$DROPIN")" ] || { echo "FAIL: .service.d removed on upgrade w/ non-execable staged xpfd"; exit 1; }
+    [ -L "$CURRENT" ] || { echo "FAIL: current deleted on upgrade w/ non-execable staged xpfd"; exit 1; }
+    for b in $BINS; do
+        tgt=$(readlink "$SBIN/$b")
+        [ "$tgt" = "$CURRENT/$b" ] || { echo "FAIL: sbin $b repointed on upgrade ($tgt) w/ non-execable staged xpfd"; exit 1; }
+    done
+}
+
+# A hardened->hardened DOWNGRADE ($2 lower but still >= floor) where the staged
+# xpfd cannot exec also keeps the layout: $2 is above the floor, so it is not a
+# pre-#1964 downgrade.
+scenario_downgrade_hardened_nonexecable_survives() {
+    build_hardened "0.0.5500+gaaaa"
+    : > "$STAGED/xpfd"
+    chmod -x "$STAGED/xpfd"
+    "$ROOT/postrm" upgrade "0.0.5000+gbbbb"
+    [ -e "$DROPIN" ] || { echo "FAIL: drop-in removed on hardened->hardened downgrade w/ non-execable staged xpfd"; exit 1; }
+    [ -L "$CURRENT" ] || { echo "FAIL: current deleted on hardened->hardened downgrade w/ non-execable staged xpfd"; exit 1; }
+}
+
+# A genuine pre-#1964 downgrade is detected by $2 < floor even when the staged
+# binary EXECs fine -- the gate no longer trusts (or runs) exec at all. The
+# staged xpfd here is a perfectly runnable pre-hardened binary; the layout must
+# still be torn down because $2 is below the floor.
+scenario_downgrade_below_floor_execable_tears_down() {
+    build_hardened "0.0.5000+gaaaa"
+    make_staged_prehardened   # runnable pre-hardened binary
+    [ -x "$STAGED/xpfd" ] || { echo "FAIL: precondition: staged xpfd should be execable"; exit 1; }
+    "$ROOT/postrm" upgrade "0.0.4000+gbbbb"
+    [ -e "$DROPIN" ] && { echo "FAIL: drop-in not removed on below-floor downgrade"; exit 1; } || true
+    [ -e "$(dirname "$DROPIN")" ] && { echo "FAIL: empty .service.d not removed on below-floor downgrade"; exit 1; } || true
+    for b in $BINS; do
+        tgt=$(readlink "$SBIN/$b")
+        [ "$tgt" = "$STAGED/$b" ] || { echo "FAIL: sbin $b -> $tgt, want staged on below-floor downgrade"; exit 1; }
+    done
+    [ -e "$CURRENT" ] && { echo "FAIL: current not deleted on below-floor downgrade"; exit 1; } || true
+}
+
+# Boundary: $2 exactly AT the floor is the first hardened version -> NOT a
+# pre-#1964 downgrade -> layout survives (the comparison is strictly less-than).
+scenario_upgrade_at_floor_survives() {
+    build_hardened "0.0.5000+gaaaa"
+    "$ROOT/postrm" upgrade "0.0.4104"
+    [ -e "$DROPIN" ] || { echo "FAIL: drop-in removed at exactly the floor version"; exit 1; }
+    [ -L "$CURRENT" ] || { echo "FAIL: current deleted at exactly the floor version"; exit 1; }
+}
+
+# Empty $2 (should not happen on a normal upgrade, but be defensive): SAFE
+# default is to leave the layout intact, never tear down.
+scenario_upgrade_empty_version_survives() {
+    build_hardened "0.0.5000+gaaaa"
+    "$ROOT/postrm" upgrade ""
+    [ -e "$DROPIN" ] || { echo "FAIL: drop-in removed on empty \$2"; exit 1; }
+    [ -L "$CURRENT" ] || { echo "FAIL: current deleted on empty \$2"; exit 1; }
+}
+
+# Unparsable $2: dpkg --compare-versions errors (status 2); SAFE default is to
+# leave the layout intact (only a confirmed lt comparison tears down).
+scenario_upgrade_unparsable_version_survives() {
+    build_hardened "0.0.5000+gaaaa"
+    "$ROOT/postrm" upgrade "not a version!!"
+    [ -e "$DROPIN" ] || { echo "FAIL: drop-in removed on unparsable \$2"; exit 1; }
+    [ -L "$CURRENT" ] || { echo "FAIL: current deleted on unparsable \$2"; exit 1; }
+}
+
+# Below-floor $2 but NO hardened layout present (legacy/never-seeded host, no
+# versions/current): the AND guard short-circuits -> clean no-op under set -e.
+scenario_downgrade_below_floor_no_layout_noop() {
+    mkdir -p "$STAGED" "$SBIN"
+    for b in $BINS; do echo x > "$STAGED/$b"; ln -sf "$STAGED/$b" "$SBIN/$b"; done
+    "$ROOT/postrm" upgrade "0.0.4000+gbbbb"
+    for b in $BINS; do
+        [ "$(readlink "$SBIN/$b")" = "$STAGED/$b" ] || { echo "FAIL: legacy sbin $b disturbed on below-floor no-layout upgrade"; exit 1; }
     done
 }
 
@@ -207,6 +300,13 @@ run_scenario remove_no_dropin_ok
 run_scenario downgrade_to_prehardened
 run_scenario downgrade_skips_foreign_link
 run_scenario upgrade_to_hardened_noop
+run_scenario upgrade_nonexecable_staged_survives
+run_scenario downgrade_hardened_nonexecable_survives
+run_scenario downgrade_below_floor_execable_tears_down
+run_scenario upgrade_at_floor_survives
+run_scenario upgrade_empty_version_survives
+run_scenario upgrade_unparsable_version_survives
+run_scenario downgrade_below_floor_no_layout_noop
 run_scenario remove_skips_foreign_link
 run_scenario remove_legacy_links
 echo "ALL POSTRM SCENARIOS PASSED"
