@@ -41,7 +41,10 @@
 // as if it were the current holder's, misreporting a long-exited process.
 // The mutual exclusion (the flock) is unaffected — this is diagnostics
 // correctness. Two truncations, both performed WHILE THE FLOCK IS HELD,
-// keep the file empty across the entire ownerless interval:
+// keep the file empty across the entire ownerless interval (best-effort: a
+// truncate failure is logged/ignored, never failing acquire or release —
+// the other truncate and the next acquirer's truncate are the backstops, so
+// the worst case degrades to the pre-fix stale read, never a mutex fault):
 //   - truncate-on-acquire: the instant AcquireAt holds the flock it
 //     Truncate(0)s the file, so the acquire->write window (before the new
 //     owner records its own metadata) and a swallowed metadata-write
@@ -231,14 +234,33 @@ func (h *Handle) Release() error {
 	// let a fresh O_CREAT acquirer flock a different inode and split the
 	// mutex (the #1875 lesson). The truncate error is ignored — release must
 	// not fail on a best-effort metadata clear, and the kernel drops the
-	// flock on Close regardless.
-	_ = h.f.Truncate(0)
-	// Closing the fd releases the flock (the lock is tied to the open file
-	// description). Explicitly LOCK_UN first is redundant but harmless and
-	// makes the release intent obvious; ignore its error since Close is the
-	// authoritative drop.
-	_ = unix.Flock(int(h.f.Fd()), unix.LOCK_UN)
+	// flock on Close regardless. We still log a failure so an operator can
+	// see the (rare) case where the next owner's busy errors could name us.
+	if terr := h.f.Truncate(0); terr != nil {
+		fmt.Fprintf(os.Stderr,
+			"upgrade lock: failed to clear owner metadata on release (the next owner's busy errors may briefly name this one): %v\n",
+			terr)
+	}
+	// releaseUnlockFn is the seam through which Release drops the flock. It
+	// runs AFTER the truncate and BEFORE Close, so a test can assert the file
+	// is already empty at the instant ownership is about to be handed off —
+	// proving the truncate happened under the held flock (not after unlock).
+	releaseUnlockFn(h.f)
 	return h.f.Close()
+}
+
+// releaseUnlockFn drops the flock during Release. Production uses
+// releaseUnlock (an explicit LOCK_UN); tests substitute a hook that first
+// asserts the file is already empty, proving Release truncates BEFORE it
+// unlocks (i.e. while the flock is still held).
+var releaseUnlockFn = releaseUnlock
+
+// releaseUnlock drops the BSD advisory lock. Explicit LOCK_UN is redundant
+// with the Close that follows (closing the fd releases the lock tied to the
+// open file description) but makes the release intent obvious; its error is
+// ignored since Close is the authoritative drop.
+func releaseUnlock(f *os.File) {
+	_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
 }
 
 // writeOwnerFn is the seam through which AcquireAt records owner metadata.

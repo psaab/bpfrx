@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -211,10 +212,14 @@ const staleOwnerJSON = `{
 }`
 
 // TestReleaseTruncatesUnderLock proves Release zeroes the lock file BEFORE
-// dropping the flock (#1984). After a normal acquire+release the file must be
-// empty so the NEXT acquirer's busy readers never name the just-released
-// owner. This test FAILS if the release-time Truncate(0) is removed — the
-// file would still hold the released owner's JSON.
+// dropping the flock (#1984), and that it does so WHILE THE FLOCK IS STILL
+// HELD (not merely "empty after Release returns"). After a normal
+// acquire+release the file must be empty so the NEXT acquirer's busy readers
+// never name the just-released owner. This test FAILS if the release-time
+// Truncate(0) is removed — the file would still hold the released owner's
+// JSON — AND, via the releaseUnlockFn seam, FAILS if the truncate were
+// reordered to AFTER the flock drop (a plain "read after Release" assertion
+// could not catch that reordering — Codex review #1995).
 func TestReleaseTruncatesUnderLock(t *testing.T) {
 	p := lockPath(t)
 
@@ -227,9 +232,30 @@ func TestReleaseTruncatesUnderLock(t *testing.T) {
 		t.Fatalf("held lock file should carry owner metadata; len=%d err=%v", len(data), rerr)
 	}
 
+	// Intercept the flock drop: at the instant Release is about to unlock, the
+	// truncate must already have run (file empty) — proving the truncate is
+	// under the held flock, before the next acquirer can ever flock the inode.
+	prevUnlock := releaseUnlockFn
+	var emptyAtUnlock, unlockSeen bool
+	releaseUnlockFn = func(f *os.File) {
+		unlockSeen = true
+		if data, rerr := os.ReadFile(f.Name()); rerr == nil && len(data) == 0 {
+			emptyAtUnlock = true
+		}
+		prevUnlock(f)
+	}
+	t.Cleanup(func() { releaseUnlockFn = prevUnlock })
+
 	if rerr := h.Release(); rerr != nil {
 		t.Fatalf("release: %v", rerr)
 	}
+	if !unlockSeen {
+		t.Fatal("releaseUnlockFn was not invoked — Release no longer drops the flock through the seam")
+	}
+	if !emptyAtUnlock {
+		t.Fatal("Release dropped the flock with the file still non-empty — the truncate must run BEFORE unlock, under the held flock")
+	}
+	releaseUnlockFn = prevUnlock
 
 	// The released file must be empty (the inode is kept; only contents are
 	// cleared). os.Remove is intentionally NOT used, so the file still exists.
@@ -285,6 +311,14 @@ func TestAcquireTruncatesStaleMetadataBeforeWrite(t *testing.T) {
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
+	// unblock frees the blocked holder goroutine. Wrapped in sync.Once so the
+	// happy-path close and the t.Cleanup safety close are both safe — without
+	// the deferred cleanup a t.Fatalf before the happy-path close would leak
+	// the goroutine blocked on <-release (Codex/AGY review #1995).
+	var unblockOnce sync.Once
+	unblock := func() { unblockOnce.Do(func() { close(release) }) }
+	t.Cleanup(unblock)
+
 	prev := writeOwnerFn
 	writeOwnerFn = func(f *os.File, o Owner) error {
 		// We are now PAST the acquire-truncate and the flock is held. Signal
@@ -335,7 +369,7 @@ func TestAcquireTruncatesStaleMetadataBeforeWrite(t *testing.T) {
 
 	// Let the new holder finish writing its metadata, then confirm a busy
 	// read now correctly names IT.
-	close(release)
+	unblock()
 	select {
 	case h := <-acquired:
 		defer h.Release()
