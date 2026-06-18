@@ -5861,3 +5861,19 @@ top.
 - **Edit**: pkg/upgrade/lock/lock.go — make owner-metadata write strictly best-effort (Codex MAJOR/Copilot): on writeOwnerFn failure log to stderr and return (handle, nil), never a held-handle-plus-error pair that callers would drop (fd leak). Added writeOwnerFn test seam.
 - **Edit**: pkg/upgrade/lock/lock_test.go — TestMetadataWriteFailureStillHoldsLock (held lock + nil error + busy second acquire + release/reacquire).
 - **Validation**: go build/vet clean; full Go suite green; lock tests pass 5x; sh -n clean on both maintainer scripts. Quad review: Claude SMR MERGE-READY, AGY MERGE-READY (r2), Codex MERGE-READY (r2, no findings), Copilot single finding fixed.
+
+## 2026-06-17 — #1964 seed versioned runtime on first install (mechanism A/B/C)
+- **Timestamp**: 2026-06-17
+- **Action**: Engineer #1964 — seed a real, immutable rollback target so the first/legacy-migration in-place upgrade always has a restorable PreviousVersion. Integrated ON TOP of #1965's preinst lock gate + postinst contention residual (added, did not replace). Highest-blast-radius upgrade fix.
+- **Write**: pkg/upgrade/runtime/seed.go (+ seed_test.go) — mechanism A first-install seed (copy staged -> versions/<v>, current -> <v>, sbin through current; idempotent, crash-safe, version-validated). New `xpfd seed-runtime` subcommand.
+- **Write**: pkg/upgrade/version.go (+ version_test.go) — ValidateVersionSegment (safe single path segment; allows +/:/~/- for Debian/semver).
+- **Edit**: cmd/xpfd/main.go, cmd/xpfd/seed_runtime.go — seed-runtime dispatch + `--capability-check` probe (postrm downgrade detection).
+- **Edit**: debian/xpf.postinst — first-install runs `xpfd seed-runtime` (fall back to legacy direct-staged links on failure; never fail the install).
+- **Edit**: debian/xpf.preinst — mechanism B legacy-migration snapshot (self-contained shell, AFTER #1965 lock gate, BEFORE unpack): snapshot old staged -> versions/<oldver> via .partial+rename, current+sbin atomic repoint; no-op-when-current-exists + always-complete-sbin idempotency, rename-collision retry, ln -sf+mv atomic symlink, staged/xpfd-version with sanitized-dpkg-$2 fallback, never-fail-transaction. No upgrade journal.
+- **Edit**: pkg/upgrade/cutover.go, flip.go — mechanism C refuse-before-STOP (unconditional pre-STOP invariant: never StopUnit without PreviousVersion!="" OR Options.AllowNoRollbackFirstCut) + recoverFromFlipFailure (AGY-5: flip failure after STOP rolls back, or restarts first-install binary for a sanctioned first cut; always returns non-nil).
+- **Edit**: debian/xpf.postrm — remove/purge also remove sbin links through versions/current; purge removes versions/ tree (leave on remove); downgrade-to-prehardened cleanup (drop-in remove + sbin->staged + delete current + boot-guarded daemon-reload), detected via seed-runtime --capability-check probe.
+- **Write**: pkg/upgrade/cutover_refuse_test.go — refuse-before-STOP (daemon stays up), exhaustive no-stop-without-target matrix, flip-failure first-cut-restart / rollback / HA-surface.
+- **Write**: test/debian/preinst-migrate-test.sh, test/debian/postrm-test.sh — shell crash-interleaving matrices (sh + dash).
+- **Edit**: pkg/upgrade/{runner,rolling,lock_integration}_test.go — first-cut calls sanctioned; rolling/lock cuts seed initial current; daemonReloadFailOnce fake hook.
+- **Edit**: docs/in-place-upgrade.md, scripts/image/bake.py — document A/B/C + layout invariant + lifecycle; bake comment reflects seeding.
+- **Validation**: go build ./... clean; go vet ./pkg/upgrade/... ./cmd/xpfd/ clean; full Go suite no failures; 5x flake on new tests green; shell harnesses 5x green under sh+dash; sh -n + dash -n + shellcheck clean on all 3 maintainer scripts. Baked-image dogfood is the ideal validation but not runnable here (noted in PR); Go-gate auto-merge approved.
