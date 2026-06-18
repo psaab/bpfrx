@@ -5958,3 +5958,21 @@ top.
   on mismatch/empty-readback (a push can silently no-op / the build can be
   stale). Existing `bpfrx-userspace-dp` cleanup + pkill kept.
 - **File(s)**: test/incus/setup.sh
+
+- **Timestamp**: 2026-06-18 (#1983)
+- **Action**: Fix #1983 — `xpfd upgrade --rolling --unit <name>` (and `upgrade
+  kernel drain`/`rejoin`) applied systemd stop/start/flip to the SELECTED
+  unit but always drove the cluster control RPCs (PeerAlive / SyncEstablished /
+  DrainComplete / ForceSecondary / ResetFailover) against the DEFAULT daemon at
+  hard-coded `127.0.0.1:50051`. `NewCLICluster(unit)` silently DISCARDED the
+  unit param, so a non-default `--unit` would cut one daemon while forcing-
+  secondary another — wrong-daemon control.
+- **Change**: `NewCLICluster` now returns `(RollingCluster, error)` and REJECTS
+  any non-default unit at the single construction chokepoint (covers all three
+  callers: RunRolling + the two `upgrade kernel` sub-verbs + any future caller).
+  Default unit (and empty-string normalized to it) is unchanged. Endpoint
+  mapping (#1983 §4.2) is a tracked follow-up. Control-TARGET + CLI validation
+  only — NO failover/VRRP/session-sync runtime change.
+- **File(s)**: pkg/upgrade/cluster_cli.go, pkg/upgrade/rolling.go,
+  cmd/xpfd/upgrade_kernel.go, pkg/upgrade/cluster_cli_test.go,
+  docs/in-place-upgrade.md
