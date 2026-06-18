@@ -19,9 +19,17 @@ Description: Junos-style firewall with AF_XDP userspace dataplane
  This package ships the binary set (xpfd, xpf-userspace-dp, cli),
  the day-0 config-drive loader, and the systemd units. Binaries are
  installed to a dpkg-static staging path; the live /usr/local/sbin
- symlinks are created on first install (the in-place upgrade cut-over
- mechanism that flips them after a verify gate is a separate increment
- and is intentionally not part of this package's postinst).
+ symlinks are created on first install.
+ .
+ On UPGRADE the postinst behaviour depends on the node role. A
+ STANDALONE node (no /etc/xpf/node-id) performs an automatic verified
+ in-place cut-over from postinst by invoking `xpfd upgrade` — the
+ atomic, rollback-capable STOP->FLIP->START cut to the staged version,
+ gated by the kernel verify-dataplane check. Set XPF_NO_POSTINST_CUT=1
+ to suppress the auto-cut and run `xpfd upgrade` manually. A CLUSTERED
+ node (/etc/xpf/node-id present) is staged only: the postinst never cuts
+ a clustered node, which is cut over with `xpfd upgrade --rolling` so
+ the cluster keeps forwarding through a controlled per-node drain.
  .
  The AF_XDP shim is embedded into the xpfd binary (go:embed), so no
  separate shim object is shipped.
