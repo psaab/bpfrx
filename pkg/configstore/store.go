@@ -231,7 +231,15 @@ func (s *Store) Load() error {
 	// (see compileTreeLenient for the validator downgrades).
 	compiled, err := s.compileTreeLenient(tree)
 	if err != nil {
-		return fmt.Errorf("compile config: %w", err)
+		// #1960 fail-closed: the bytes read+parsed fine (this is NOT
+		// ErrConfigDBUnreadable) but a PRESENT, previously-committed config
+		// no longer compiles. s.everCommitted was already set true above, so
+		// the daemon could otherwise see ActiveConfig()==nil + everCommitted
+		// and resolve to NORMAL boot — positional claim-all interface naming.
+		// Tag the error with ErrConfigCompile so the daemon can detect this
+		// edge with errors.Is and refuse takeover (enter the #1922
+		// bootstrap/lifeline safe state) instead. s.compiled stays nil.
+		return fmt.Errorf("compile config: %w: %w", ErrConfigCompile, err)
 	}
 
 	s.active = tree
