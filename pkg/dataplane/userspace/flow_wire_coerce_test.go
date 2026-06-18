@@ -157,3 +157,34 @@ func TestFullSnapshotMarshalsInRange_1977(t *testing.T) {
 	assertInRange(t, "Flow.TCPMSSGreIn", snap.Flow.TCPMSSGreIn, math.MaxUint16)
 	assertInRange(t, "Flow.TCPSessionTimeout", snap.Flow.TCPSessionTimeout, config.MaxDurationSeconds)
 }
+
+// TestFlowExportSkipsInvalidPortContinuesToValid_1977 pins the skip-and-continue
+// semantics (Codex r-code hardening): an out-of-range flow-server is skipped and
+// scanning continues to the next valid server, rather than aborting the export.
+func TestFlowExportSkipsInvalidPortContinuesToValid_1977(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Services.FlowMonitoring = &config.FlowMonitoringConfig{
+		Version9: &config.NetFlowV9Config{
+			Templates: map[string]*config.NetFlowV9Template{
+				"t1": {Name: "t1", FlowActiveTimeout: 60, FlowInactiveTimeout: 15},
+			},
+		},
+	}
+	cfg.ForwardingOptions.Sampling = &config.SamplingConfig{
+		Instances: map[string]*config.SamplingInstance{
+			"i1": {Name: "i1", InputRate: 1000, FamilyInet: &config.SamplingFamily{
+				FlowServers: []*config.FlowServer{
+					{Address: "10.0.0.1", Port: 70000, Version9Template: "t1"}, // invalid -> skip
+					{Address: "10.0.0.2", Port: 9995, Version9Template: "t1"},  // valid -> use
+				},
+			}},
+		},
+	}
+	snap := buildFlowExportSnapshot(cfg)
+	if snap == nil {
+		t.Fatal("expected the valid second server to be used after skipping the invalid first")
+	}
+	if snap.CollectorAddress != "10.0.0.2" || snap.CollectorPort != 9995 {
+		t.Fatalf("expected 10.0.0.2:9995, got %s:%d", snap.CollectorAddress, snap.CollectorPort)
+	}
+}

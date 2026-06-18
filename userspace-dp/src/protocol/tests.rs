@@ -1687,3 +1687,24 @@ fn apply_snapshot_rejects_negative_flow_number_1977() {
         "unexpected error: {err}"
     );
 }
+
+// #1977: a collector_port exceeding u16 (what Go would emit pre-#1977 for a
+// `port 70000` typo) must abort the whole apply_snapshot decode — the mechanism
+// the Go-side skip-and-coerce guard defends against.
+#[test]
+fn apply_snapshot_rejects_oversize_collector_port_1977() {
+    let json = r#"{
+      "type": "apply_snapshot",
+      "snapshot": {
+        "version": 3, "generation": 1, "generated_at": "2026-06-18T00:00:00Z",
+        "summary": {"host_name":"fw","dataplane_type":"userspace","interface_count":0,"zone_count":0,"policy_count":0,"scheduler_count":0,"ha_enabled":false},
+        "flow_export": { "collector_address": "10.0.0.1", "collector_port": 70000, "sampling_rate": 1000 }
+      }
+    }"#;
+    let err = serde_json::from_str::<ControlRequest>(json)
+        .expect_err("collector_port > u16 max must abort the whole-request decode");
+    assert!(
+        err.to_string().contains("invalid value") || err.to_string().contains("expected"),
+        "unexpected error: {err}"
+    );
+}
