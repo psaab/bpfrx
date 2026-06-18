@@ -189,6 +189,13 @@ func copyStagedToVersion(stagedDir, versionsDir, verDir string) error {
 
 // stagedVersion runs `<staged>/xpfd version` and returns the version token.
 // Output shape: "xpfd <version> (commit <c>, built <t>)".
+//
+// It hard-fails an unrecognized output format instead of returning the raw
+// trimmed output (#1967 C1 parity with realSystem.BinaryVersion): a corrupt
+// binary or a benign `version`-format drift must NOT seed versions/<token>
+// by a wrong-shaped string. The caller (Seed) additionally validates the
+// returned token via upgrade.ValidateVersionSegment, so the two readers keep
+// the same package-wide invariant.
 func stagedVersion(stagedDir string) (string, error) {
 	bin := filepath.Join(stagedDir, "xpfd")
 	out, err := exec.Command(bin, "version").Output()
@@ -199,7 +206,8 @@ func stagedVersion(stagedDir string) (string, error) {
 	if len(fields) >= 2 && fields[0] == "xpfd" {
 		return fields[1], nil
 	}
-	return strings.TrimSpace(string(out)), nil
+	return "", fmt.Errorf("%s version: unrecognized output format "+
+		"(want \"xpfd <version> ...\"): %q", bin, strings.TrimSpace(string(out)))
 }
 
 // atomicRelSymlink atomically points link at a RELATIVE target (basename in

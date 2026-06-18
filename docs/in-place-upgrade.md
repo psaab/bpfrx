@@ -52,8 +52,11 @@ the running daemon and config untouched).
   RE-copies and re-verifies rather than re-verifying the stale failing copy
   (#1967). Two guards: the cleanup NEVER deletes the active or rollback
   version dir (only when `<ver>` is neither `current` nor PreviousVersion),
-  and the journal reset prevents a subsequent run from skipping COPY and
-  failing VERIFY with file-not-found.
+  and the journal is rewound BELOW PREFLIGHT (with the stale DB-snapshot
+  fields cleared and the snapshot removed) so the retry takes a FRESH
+  config-DB snapshot and recopies — the daemon stays live across a verify
+  failure, so a config change before the retry must not be captured by the
+  pre-failure snapshot (a later rollback would otherwise lose it).
 - **STOP → FLIP → START** — stop the old daemon (closes the
   respawn-mismatch race: no live process can re-resolve the flipped
   helper), flip `current` + the `/usr/local/sbin` links + the unit

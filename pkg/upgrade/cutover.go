@@ -138,14 +138,24 @@ func (r *Runner) Run(opts Options) (err error) {
 			// half-cut as the next rollback base.
 			r.logf("upgrade: finishing a stale half-cut to %s before the new %s cut",
 				j.TargetVersion, stagedVer)
-			if err := r.cfg.Sys.StartUnit(r.cfg.Unit); err != nil {
-				return fmt.Errorf("finish stale half-cut: start unit: %w", err)
+			// C3 diagnostic (#1967): if the stale half-cut's flipped-in dir
+			// vanished (GC/disk event) starting it is doomed; treat that exactly
+			// like an unhealthy half-cut and route to its auto-rollback rather
+			// than letting systemd exec a missing binary. Skip the doomed
+			// StartUnit and reuse the unhealthy path below.
+			startErr := r.versionDirComplete(j.TargetVersion)
+			if startErr == nil {
+				startErr = r.cfg.Sys.StartUnit(r.cfg.Unit)
 			}
-			if healthErr := r.cfg.Sys.HelperHealthy(j.TargetVersion, r.cfg.StartHealthDeadline); healthErr != nil {
-				r.logf("upgrade: stale half-cut %s unhealthy (%v); AUTO-ROLLBACK before the new cut",
-					j.TargetVersion, healthErr)
+			var healthErr error
+			if startErr == nil {
+				healthErr = r.cfg.Sys.HelperHealthy(j.TargetVersion, r.cfg.StartHealthDeadline)
+			}
+			if finishErr := firstNonNil(startErr, healthErr); finishErr != nil {
+				r.logf("upgrade: stale half-cut %s failed to come up (%v); AUTO-ROLLBACK before the new cut",
+					j.TargetVersion, finishErr)
 				if rbErr := r.rollback(j); rbErr != nil {
-					return fmt.Errorf("stale half-cut unhealthy (%v) AND rollback failed: %w", healthErr, rbErr)
+					return fmt.Errorf("stale half-cut unhealthy (%v) AND rollback failed: %w", finishErr, rbErr)
 				}
 				// Rollback cleared the journal and restored PreviousVersion;
 				// re-enter fresh for the new staged version.
@@ -339,16 +349,7 @@ func (r *Runner) Run(opts Options) (err error) {
 		// error and lets the rollback fire from a known cause. Routed through
 		// the SAME firstNonNil/rollback machinery so HA semantics are
 		// unchanged.
-		var preStartErr error
-		for _, b := range []string{"xpfd", "xpf-userspace-dp"} {
-			p := filepath.Join(r.versionDir(j.TargetVersion), b)
-			if _, serr := os.Stat(p); serr != nil {
-				preStartErr = fmt.Errorf("flipped-in version dir incomplete before "+
-					"start: %s: %w (versions/%s vanished in the FLIP->START window?)",
-					p, serr, j.TargetVersion)
-				break
-			}
-		}
+		preStartErr := r.versionDirComplete(j.TargetVersion)
 		// A StartUnit exec failure is treated the SAME as an unhealthy
 		// start (AGY r3 Medium): the binary is already flipped-in, so a
 		// failure to start leaves the daemon OFFLINE unless we roll back.
@@ -396,6 +397,26 @@ func (r *Runner) Run(opts Options) (err error) {
 	}
 	r.logf("upgrade: committed version %s", j.TargetVersion)
 	return r.clearJournal()
+}
+
+// versionDirComplete reports a diagnostic error if the flipped-in version
+// dir is missing a managed lockstep binary just before StartUnit (#1967 C3).
+// A concurrent GC or disk event in the FLIP->START window could remove
+// versions/<ver>/{xpfd,xpf-userspace-dp}, making systemd exec a missing
+// binary. Returning a clear cause here (rather than relying on an opaque
+// systemd exec failure) lets the caller's existing START-failure rollback
+// fire from a known cause. The outcome was already covered by that rollback,
+// so this is diagnostic-only — it never changes which recovery path runs.
+// Returns nil when the dir is complete.
+func (r *Runner) versionDirComplete(ver string) error {
+	for _, b := range []string{"xpfd", "xpf-userspace-dp"} {
+		p := filepath.Join(r.versionDir(ver), b)
+		if _, serr := os.Stat(p); serr != nil {
+			return fmt.Errorf("flipped-in version dir incomplete before start: "+
+				"%s: %w (versions/%s vanished in the FLIP->START window?)", p, serr, ver)
+		}
+	}
+	return nil
 }
 
 // firstNonNil returns the first non-nil error.
@@ -564,8 +585,15 @@ func (r *Runner) verify(j *Journal) error {
 //   - RESET the journal so the next run re-runs copyStaged. After a successful
 //     COPY the journal is at StateCopied; if we delete the dir but leave the
 //     journal there, the next run SKIPS copyStaged (state already >= Copied)
-//     and VERIFY then fails file-not-found. We rewind to StatePreflight (the
-//     DB snapshot from preflight is still valid) and persist.
+//     and VERIFY then fails file-not-found. We rewind BELOW PREFLIGHT (to
+//     StateStaged) and clear the DB-snapshot fields so the retry re-runs
+//     preflight and takes a FRESH config-DB snapshot. Rewinding only to
+//     PREFLIGHT would reuse the snapshot taken at the original preflight; but
+//     the daemon stays LIVE across a verify failure (verify is pure), so an
+//     operator may change the config DB before the retry — a later rollback
+//     would then restore the stale pre-failure snapshot and silently lose
+//     those changes (Codex r1 High). The orphan snapshot is removed here; GC
+//     also sweeps orphan .dbsnap dotfiles defensively.
 //
 // Best-effort: a cleanup failure is logged, never masking the verify error
 // the caller is about to return. If the dir was protected (active), we still
@@ -594,10 +622,18 @@ func (r *Runner) cleanupFailedVerifyCopy(j *Journal) {
 		r.logf("upgrade: removed copied version dir %s after verify failure "+
 			"(a retry will recopy from staged)", r.versionDir(ver))
 	}
-	// Guard (b): rewind the journal so the retry re-runs copyStaged. Without
-	// this the journal stays at StateCopied and the retry would skip the copy
-	// and fail verify with file-not-found.
-	j.State = StatePreflight
+	// Drop the now-stale DB snapshot taken at the original preflight (the
+	// retry re-snapshots from the possibly-changed live DB). Best-effort.
+	if j.DBSnapshotPath != "" {
+		_ = os.RemoveAll(j.DBSnapshotPath)
+	}
+	// Guard (b): rewind the journal BELOW PREFLIGHT so the retry re-runs BOTH
+	// preflight (fresh DB snapshot) AND copyStaged. Clear the snapshot fields
+	// so a crash between here and the retry's preflight cannot leave a journal
+	// pointing at a removed snapshot.
+	j.State = StateStaged
+	j.DBSnapshotPath = ""
+	j.AdvancedStateFloor = false
 	if err := r.saveJournal(j); err != nil {
 		r.logf("upgrade: WARN reset journal after verify-fail cleanup: %v", err)
 	}

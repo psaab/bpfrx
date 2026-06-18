@@ -5909,3 +5909,11 @@ top.
 - **Edit**: test/debian/postrm-test.sh — remove/purge drop-in removal asserted; non-empty .service.d (foreign drop-in) preserved; legacy/never-seeded no-drop-in no-op.
 - **Edit**: docs/in-place-upgrade.md — document C1/C3/C4 + verify-fail cleanup + remove/purge drop-in removal.
 - **Validation**: go build ./... clean; go vet ./pkg/upgrade/... clean; full Go suite no failures; new tests 5x no flake; postrm-test.sh green under sh + dash; sh -n + dash -n clean on debian/xpf.postrm. Baked-image dogfood not runnable here (noted in PR).
+
+## 2026-06-17 — #1967 PR #1974 review round 1 (Codex)
+- **Codex r1 NEEDS-CHANGES (3 findings, all addressed)**:
+  - High (verify-fail rewind preserved DBSnapshotPath): cutover.go cleanupFailedVerifyCopy now rewinds to StateStaged (below PREFLIGHT), clears DBSnapshotPath+AdvancedStateFloor, and removes the stale snapshot — so a same-version retry re-snapshots the (possibly operator-changed) live DB. Prevents a later rollback restoring a stale pre-failure snapshot.
+  - High (stale-FLIPPED resume bypassed C3 + returned on StartUnit error without rollback): extracted versionDirComplete() helper; the resume-vs-fresh "finish stale half-cut" branch now stats the target dir + routes a StartUnit/health/missing-dir failure through its existing auto-rollback (was a bare return that could strand the unit).
+  - Medium (seed.go stagedVersion kept the raw-output fallback): now hard-fails an unrecognized format (C1 parity with realSystem.BinaryVersion); caller already validates via ValidateVersionSegment.
+- **Tests added**: TestStaleHalfCut_VanishedDirRollsBack; TestStagedVersion_RejectsGarbageFormat; verify-fail recopy test asserts rewind < PREFLIGHT + snapshot fields cleared.
+- **Validation**: go build/vet clean; full Go suite no failures; new tests 5x no flake.

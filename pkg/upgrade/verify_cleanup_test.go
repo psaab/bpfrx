@@ -27,13 +27,18 @@ func TestVerifyFailCleanup_RecopiesOnRetry(t *testing.T) {
 	if _, err := os.Stat(verDir); !os.IsNotExist(err) {
 		t.Fatalf("versions/2.0.0 not removed after verify failure: stat err=%v", err)
 	}
-	// The journal must be rewound below StateCopied so the retry recopies.
+	// The journal must be rewound BELOW PREFLIGHT (so the retry re-snapshots
+	// the DB and recopies) and the stale snapshot fields cleared.
 	j, err := r.loadJournal()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if j.State.atLeast(StateCopied) {
-		t.Fatalf("journal at %s after verify-fail cleanup; want < COPIED so retry recopies", j.State)
+	if j.State.atLeast(StatePreflight) {
+		t.Fatalf("journal at %s after verify-fail cleanup; want < PREFLIGHT so retry re-snapshots + recopies", j.State)
+	}
+	if j.DBSnapshotPath != "" || j.AdvancedStateFloor {
+		t.Errorf("snapshot fields not cleared after verify-fail cleanup: path=%q floor=%v",
+			j.DBSnapshotPath, j.AdvancedStateFloor)
 	}
 
 	// Operator drops a CORRECTED staged binary under the SAME version and the
@@ -175,6 +180,52 @@ func TestPreStartVersionDirCheck_RollsBack(t *testing.T) {
 	cur, _ := os.Readlink(filepath.Join(cfg.VersionsDir, currentLink))
 	if filepath.Base(cur) != "1.0.0" {
 		t.Errorf("current = %q after pre-start failure, want rollback to 1.0.0", cur)
+	}
+}
+
+// TestStaleHalfCut_VanishedDirRollsBack proves the stale-half-cut resume path
+// also honors the C3 diagnostic (#1967, Codex r1 High): when a NEWER apt
+// install supersedes a crashed FLIPPED cut whose target dir has since
+// vanished, finishing it is doomed — the resume must route to auto-rollback
+// (not a bare StartUnit error that strands the unit). This exercises the
+// resume-vs-fresh "finish a stale half-cut" branch with a missing target dir.
+func TestStaleHalfCut_VanishedDirRollsBack(t *testing.T) {
+	// staged is the NEW version (3.0.0); the journal records a crashed FLIPPED
+	// cut to a DIFFERENT, now-vanished target (2.0.0).
+	fs := newFakeSystem(t, "3.0.0")
+	r, cfg := testEnv(t, fs)
+	for _, b := range managedBins {
+		writeFakeBin(t, filepath.Join(cfg.StagedDir, b), "binary-"+b+"-3.0.0")
+	}
+	seedInitialCurrent(t, r, cfg, "1.0.0")
+	// Flip current to 2.0.0 as the crashed half-cut would have, then remove
+	// the 2.0.0 dir (the GC/disk event), leaving a stale FLIPPED journal.
+	verDir := filepath.Join(cfg.VersionsDir, "2.0.0")
+	for _, b := range managedBins {
+		writeFakeBin(t, filepath.Join(verDir, b), "binary-"+b+"-2.0.0")
+	}
+	if err := r.flip("2.0.0"); err != nil {
+		t.Fatal(err)
+	}
+	j := &Journal{State: StateFlipped, TargetVersion: "2.0.0", PreviousVersion: "1.0.0"}
+	if err := r.saveJournal(j); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(verDir); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run with the new 3.0.0 staged: the resume must finish-or-rollback the
+	// stale 2.0.0 half-cut, then cut to 3.0.0. With the vanished dir it must
+	// roll back to 1.0.0, then proceed to a fresh 3.0.0 cut.
+	if err := r.Run(Options{}); err != nil {
+		t.Fatalf("resume + fresh cut should succeed: %v", err)
+	}
+	// The end state: current must be 3.0.0 (the fresh cut completed after the
+	// stale half-cut was rolled back, NOT stranded).
+	cur, _ := os.Readlink(filepath.Join(cfg.VersionsDir, currentLink))
+	if filepath.Base(cur) != "3.0.0" {
+		t.Errorf("current = %q after stale-half-cut recovery + fresh cut, want 3.0.0", cur)
 	}
 }
 
