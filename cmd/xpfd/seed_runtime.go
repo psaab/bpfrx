@@ -23,14 +23,21 @@ func runSeedRuntimeSubcommand(args []string) {
 	stagedDir := fs.String("staged-dir", upgrade.DefaultStagedDir, "dpkg-staged binary set dir")
 	versionsDir := fs.String("versions-dir", upgrade.DefaultVersionsDir, "runtime versioned dir")
 	sbinDir := fs.String("sbin-dir", upgrade.DefaultSbinDir, "operator-tool symlink dir")
-	// --capability-check is a pure, side-effect-free probe used by the .deb
-	// postrm to tell whether the newly-unpacked staged binary supports the
-	// #1964 hardened versioned-runtime layout. A hardened xpfd exits 0
-	// without touching the filesystem; a pre-#1964 binary has no
+	// --capability-check is a pure, side-effect-free probe: a hardened xpfd
+	// exits 0 without touching the filesystem; a pre-#1964 binary has no
 	// seed-runtime subcommand at all and exits non-zero ("unknown command").
-	// The postrm downgrade cleanup keys on this so it ONLY tears down the
-	// hardened layout when downgrading to a package that genuinely lacks it
-	// (never when downgrading hardened->hardened).
+	//
+	// HISTORICAL (#1985): the .deb postrm USED to gate the downgrade teardown
+	// on this probe, but EXECUTING the staged binary conflated "new binary
+	// lacks the layout" with "new binary cannot run" (link/corruption/arch
+	// errors), tearing the versioned runtime down on a real UPGRADE. The
+	// postrm now keys the decision on the dpkg-supplied INCOMING version
+	// (`$2` compared against the hardened-layout floor, exec-free) and never
+	// runs this probe. The flag is RETAINED because dpkg runs the OLD
+	// package's postrm during an upgrade, so a pre-#1985 postrm still invokes
+	// it during the one-hop buggy->fixed transition; removing it would break
+	// that call. See docs/in-place-upgrade.md ("Downgrade detection is
+	// exec-free and version-keyed").
 	capCheck := fs.Bool("capability-check", false,
 		"probe-only: exit 0 if this binary supports the #1964 versioned-runtime "+
 			"layout, without touching the filesystem")

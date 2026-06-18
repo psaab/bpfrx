@@ -184,11 +184,77 @@ drop-in removal is safe on legacy/never-seeded hosts (absent file) and leaves a
 non-empty `.service.d` (a foreign operator drop-in) intact. `versions/` is left
 on `remove` (a reinstall reuses it) and removed on `purge` (it is copied
 binaries, not operator config — Policy §6.8). A downgrade to a package
-predating this layout (detected via a `seed-runtime --capability-check` probe
-of the newly-unpacked staged `xpfd`) repoints sbin back to `staged/`
-atomically, deletes `versions/current`, then removes the runtime unit drop-in
-+ boot-guarded `daemon-reload` (shared helper) — so the downgraded binaries
-actually take effect.
+predating this layout repoints sbin back to `staged/` atomically, deletes
+`versions/current`, then removes the runtime unit drop-in + boot-guarded
+`daemon-reload` (shared helper) — so the downgraded binaries actually take
+effect.
+
+### Downgrade detection is exec-free and version-keyed (#1985)
+
+The postrm must decide whether the package being installed predates the #1964
+hardened layout (and so the lingering `versions/current` + drop-in must be torn
+down). It originally did this by EXECUTING the staged binary
+(`"$STAGED/xpfd" seed-runtime --capability-check`) and treating any non-zero
+exit as "pre-hardened, tear the layout down". That conflated two different
+things: a binary that genuinely lacks the subcommand, and a binary that cannot
+EXEC AT ALL (dynamic-link error during unpack, corruption, libc/ABI conflict,
+architecture mismatch). On a genuine UPGRADE where the new staged `xpfd`
+happened to be non-execable, the `&&` short-circuited to false and the
+destructive branch ran — deleting `versions/current`, repointing sbin to
+`staged/`, and removing the drop-in — breaking the daemon on next boot.
+
+The decision is now keyed on the dpkg-supplied INCOMING version (`$2`), which
+is exec-free and has no staleness hazard:
+
+```sh
+if incoming_predates_hardened_layout "$2" \
+   && { [ -L "$CURRENT" ] || [ -e "$CURRENT" ]; }; then
+    ... tear down ...
+fi
+# incoming_predates_hardened_layout: dpkg --compare-versions "$2" lt FLOOR
+```
+
+`HARDENED_LAYOUT_FLOOR` is `0.0.4104` — the `.deb` version
+(`0.0.<commit-count>+g<sha>`, `Makefile` `DEB_VERSION`) of commit `ef9525e70`,
+the first package whose postrm manages the versioned-runtime layout on
+downgrade and whose `xpfd` answers `seed-runtime --capability-check` — i.e.
+the first package classifiable as hardened by this teardown contract. (Earlier
+#1964 commits added the postinst seed at count 4102 and the preinst migration
+at 4103; the postrm downgrade handling this floor protects landed at 4104.)
+Any incoming version `< 0.0.4104` predates the contract and is a genuine
+pre-#1964 downgrade; `>= 0.0.4104` (upgrade OR hardened->hardened downgrade,
+including the floor version `0.0.4104+g<sha>` which sorts above the bare
+`0.0.4104` floor) leaves the layout alone. The floor is a HISTORICAL fixed
+point (the contract already shipped), not a per-release value — it is
+never bumped.
+
+- The teardown runs ONLY when `$2` is a confirmed pre-#1964 version AND a
+  hardened layout is present (`versions/current`).
+- An empty or unparsable `$2` (`dpkg --compare-versions` exits 2) leaves the
+  layout intact — the safe default, never a teardown on ambiguity. This
+  mirrors the sibling `preinst migrate_legacy_layout` posture
+  (skip-don't-destroy). The verify-dataplane cut gate / refuse-before-STOP
+  guard (`pkg/upgrade/cutover.go`) is the backstop for a hardened-but-
+  unrunnable staged binary.
+
+A presence-only file marker (a sentinel the hardened package ships) was
+considered and REJECTED: dpkg removes a file present ONLY in the old package
+AFTER the old-postrm runs (Debian Policy 6.6 unpack order), so a marker shipped
+by the hardened package LINGERS on disk at old-postrm time during a genuine
+pre-#1964 downgrade and would mis-signal "incoming is hardened", skipping the
+teardown the downgrade needs. The version argument has no such staleness.
+
+**One-time buggy->fixed exposure.** dpkg runs the OLD package's `postrm
+upgrade <new>` during an upgrade. Upgrading FROM a pre-#1985 (exec-probe)
+package therefore still runs that OLD buggy postrm; the version-floor gate
+cannot protect its own rollout for that single hop — the fix cannot run
+before it is installed. The exposure fires ONLY if, at OLD-postrm time, the
+new staged `xpfd` is non-execable AND `versions/current` exists. The realistic
+trigger is an OS/libc bump in the SAME apt transaction making the new binary
+temporarily unloadable; stage xpf upgrades separately from OS/libc bumps.
+**Recovery** if the old postrm did tear the layout down: re-run `xpfd
+seed-runtime` (or reinstall the package) to rebuild `versions/current` + the
+unit drop-in before the next cut.
 
 ## HA rolling upgrade (`xpfd upgrade --rolling`)
 
