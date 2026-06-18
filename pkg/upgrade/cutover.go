@@ -214,10 +214,10 @@ func (r *Runner) Run(opts Options) (err error) {
 		if j.PreviousVersion == "" && !opts.AllowNoRollbackFirstCut {
 			return fmt.Errorf("refuse-before-STOP: no previous version to roll back to "+
 				"(versions/current is absent or unreadable) and this is not a sanctioned "+
-				"first cut; refusing to stop the running daemon for the %s cut because a "+
-				"flip/start failure would leave it offline with no recovery target. "+
-				"Re-seed the versioned runtime (xpfd seed-runtime) or pass the sanctioned "+
-				"first-cut option", j.TargetVersion)
+				"first cut; refusing to proceed past STOP for the %s cut because a "+
+				"flip/start failure would leave the daemon offline with no recovery "+
+				"target. Re-seed the versioned runtime (xpfd seed-runtime) or pass the "+
+				"sanctioned first-cut option", j.TargetVersion)
 		}
 	}
 

@@ -256,6 +256,13 @@ func copyTreeFsync(src, dst string) error {
 			if err := os.MkdirAll(target, 0o755); err != nil {
 				return fmt.Errorf("mkdir %s: %w", target, err)
 			}
+			// Preserve the SOURCE dir's permissions (MkdirAll applies the
+			// umask and won't chmod an existing dir, so set it explicitly) —
+			// otherwise versions/<ver>/ could end up more permissive than
+			// staged/ for a non-0755 staged subdir (Copilot).
+			if err := os.Chmod(target, e.info.Mode().Perm()); err != nil {
+				return fmt.Errorf("chmod %s: %w", target, err)
+			}
 			createdDirs = append(createdDirs, target)
 		case e.info.Mode().IsRegular():
 			if err := copyFileFsync(e.path, target, e.info.Mode()); err != nil {
@@ -295,6 +302,13 @@ func copyFileFsync(src, dst string, mode os.FileMode) error {
 	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
 	if err != nil {
 		return fmt.Errorf("create %s: %w", dst, err)
+	}
+	// OpenFile applies the umask to the create mode, so chmod to the exact
+	// source mode — the staged binaries are 0755 and must stay executable
+	// through versions/<ver>/ regardless of the installing process's umask.
+	if err := out.Chmod(mode.Perm()); err != nil {
+		out.Close()
+		return fmt.Errorf("chmod %s: %w", dst, err)
 	}
 	if _, err := io.Copy(out, in); err != nil {
 		out.Close()

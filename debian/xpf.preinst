@@ -195,9 +195,28 @@ case "$1" in
 
         # #1964 mechanism B: legacy-migration snapshot. Runs AFTER the lock
         # gate (so a contended upgrade still aborts first) and BEFORE unpack
-        # (so the OLD staged/ is still on disk to snapshot). Best-effort: a
-        # failure never aborts the transaction.
-        migrate_legacy_layout "$@"
+        # (so the OLD staged/ is still on disk to snapshot).
+        #
+        # Best-effort: a migration failure must NEVER fail the apt
+        # transaction (the function comment promises this). The function runs
+        # under the script's `set -e`, and several of its commands are bare
+        # (mkdir -p "$VERSIONS", the atomic_symlink ln/mv, sync) — a full
+        # disk / EPERM / read-only /var would otherwise abort the preinst and
+        # block the upgrade. We canNOT use `migrate_legacy_layout "$@" ||
+        # true`: under POSIX/dash a function on the left of `||` runs with
+        # `set -e` SUSPENDED for its whole body, so a failing early command
+        # would silently continue into later dangerous lines instead of
+        # aborting. Instead run it in a subshell that keeps `set -e` ACTIVE
+        # (so a failure aborts the migration EARLY) while the parent absorbs
+        # the subshell's exit and proceeds (AGY review-011).
+        set +e
+        ( set -e; migrate_legacy_layout "$@" )
+        if [ $? -ne 0 ]; then
+            echo "xpf: #1964 legacy migration did not complete (best-effort);" \
+                 "the first cut's refuse-before-STOP guard still protects the" \
+                 "daemon. Continuing the upgrade." >&2
+        fi
+        set -e
         ;;
     install|abort-upgrade)
         ;;

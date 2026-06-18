@@ -163,6 +163,53 @@ func TestSeed_ResumeAfterCurrentCrash(t *testing.T) {
 	assertSeeded(t, cfg, "1.0.0")
 }
 
+// TestSeed_PreservesModes proves the seeded version dir preserves the
+// SOURCE file/dir permissions (Copilot): a 0700 staged subdir and a 0644
+// staged file must not be silently widened to 0755 in versions/<ver>/.
+func TestSeed_PreservesModes(t *testing.T) {
+	cfg := seedEnv(t, "1.0.0")
+	// Add a non-0755 subdir + a non-0755 file under staged.
+	subdir := filepath.Join(cfg.StagedDir, "data")
+	if err := os.MkdirAll(subdir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(subdir, 0o700); err != nil { // MkdirAll applies umask
+		t.Fatal(err)
+	}
+	rofile := filepath.Join(subdir, "ro.txt")
+	if err := os.WriteFile(rofile, []byte("x"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(rofile, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := Seed(cfg); err != nil {
+		t.Fatalf("Seed: %v", err)
+	}
+	gotDir, err := os.Stat(filepath.Join(cfg.VersionsDir, "1.0.0", "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotDir.Mode().Perm() != 0o700 {
+		t.Errorf("seeded subdir mode = %o, want 0700", gotDir.Mode().Perm())
+	}
+	gotFile, err := os.Stat(filepath.Join(cfg.VersionsDir, "1.0.0", "data", "ro.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotFile.Mode().Perm() != 0o640 {
+		t.Errorf("seeded file mode = %o, want 0640", gotFile.Mode().Perm())
+	}
+	// And the binaries stay executable (0755 staged).
+	binInfo, err := os.Stat(filepath.Join(cfg.VersionsDir, "1.0.0", "xpfd"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binInfo.Mode().Perm()&0o111 == 0 {
+		t.Errorf("seeded xpfd not executable: mode %o", binInfo.Mode().Perm())
+	}
+}
+
 // TestSeed_RejectsUnsafeVersion proves a version that is not a safe path
 // segment is rejected before any filesystem mutation.
 func TestSeed_RejectsUnsafeVersion(t *testing.T) {
