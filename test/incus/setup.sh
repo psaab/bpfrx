@@ -448,6 +448,19 @@ cmd_deploy() {
 	info "Building xpfd and cli..."
 	make -C "$PROJECT_ROOT" build build-ctl
 
+	# Build the Rust AF_XDP helper. xpfd is NOT statically linked against it;
+	# it execs xpf-userspace-dp from a search path that includes
+	# filepath.Dir(os.Args[0]) — i.e. /usr/local/sbin/xpf-userspace-dp next to
+	# the daemon (pkg/dataplane/userspace/process.go findBinary). Without it the
+	# standalone VM comes up with no dataplane (#1962). Mirror the cluster-setup
+	# guard: skip cleanly if no Rust toolchain is present.
+	if [[ -x "$HOME/.cargo/bin/cargo" || -n "$(command -v cargo 2>/dev/null)" ]]; then
+		info "Building xpf-userspace-dp helper..."
+		make -C "$PROJECT_ROOT" build-userspace-dp
+	else
+		warn "Rust toolchain not found; skipping xpf-userspace-dp build"
+	fi
+
 	# Migrate from old bpfrxd naming if present.
 	incus exec "$INSTANCE_NAME" -- systemctl stop bpfrxd 2>/dev/null || true
 	incus exec "$INSTANCE_NAME" -- /usr/local/sbin/bpfrxd cleanup 2>/dev/null || true
@@ -474,6 +487,28 @@ cmd_deploy() {
 
 	info "Pushing cli to $INSTANCE_NAME..."
 	incus file push "$PROJECT_ROOT/cli" "$INSTANCE_NAME/usr/local/sbin/cli" --mode 0755
+
+	# Push the Rust AF_XDP helper next to xpfd (see the findBinary search path
+	# above), then verify the on-VM sha256 matches the local binary. A push can
+	# silently no-op and the build can be stale, either of which leaves xpfd
+	# without a working dataplane — fail the deploy loudly if they differ (#1962).
+	if [[ -f "$PROJECT_ROOT/xpf-userspace-dp" ]]; then
+		info "Pushing xpf-userspace-dp to $INSTANCE_NAME..."
+		incus file push "$PROJECT_ROOT/xpf-userspace-dp" "$INSTANCE_NAME/usr/local/sbin/xpf-userspace-dp" --mode 0755
+
+		local local_sum vm_sum
+		local_sum=$(sha256sum "$PROJECT_ROOT/xpf-userspace-dp" | awk '{print $1}')
+		vm_sum=$(incus exec "$INSTANCE_NAME" -- sha256sum /usr/local/sbin/xpf-userspace-dp 2>/dev/null | awk '{print $1}')
+		if [[ -z "$vm_sum" ]]; then
+			die "xpf-userspace-dp not present on $INSTANCE_NAME after push (sha256 readback empty)"
+		fi
+		if [[ "$local_sum" != "$vm_sum" ]]; then
+			die "xpf-userspace-dp sha256 mismatch after push to $INSTANCE_NAME (local=$local_sum vm=$vm_sum) — push silently no-op'd or the build is stale"
+		fi
+		info "Verified xpf-userspace-dp sha256 on $INSTANCE_NAME ($local_sum)."
+	else
+		warn "xpf-userspace-dp not found locally ($PROJECT_ROOT/xpf-userspace-dp); helper not pushed — xpfd will have no dataplane"
+	fi
 
 	# Push test config if it exists
 	if [[ -f "${SCRIPT_DIR}/xpf-test.conf" ]]; then

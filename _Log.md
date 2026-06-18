@@ -5941,3 +5941,20 @@ top.
 ## 2026-06-17 — #1967 PR #1974 review round 4
 - **Codex r4 NEEDS-CHANGES (TEST-only, prod code confirmed correct)**: TestVerifyFailCleanup_SaveJournalFailureKeepsSnapshot chmod'd VersionsDir read-only, but JournalPath lived UNDER VersionsDir (testEnv), so it blocked BOTH the version-dir removal AND the snapshot removal — the old buggy code would have "passed" for the wrong reason (not a true regression test). FIX: build a custom Runner with JournalPath in a SEPARATE dir; chmod ONLY the journal dir read-only, leaving VersionsDir writable. Now the version dir IS removed (unlink branch proven), saveJournal fails, and the snapshot survives. Codex confirmed the production fix (return-before-snapshot-remove) closes the window by inspection.
 - Also rebased onto origin/master (PR #1973 #1964 follow-up merged): resolved append-only _Log.md + the postrm downgrade-branch conflict (my shared remove_runtime_dropin helper subsumes #1973's rmdir-dirname change).
+
+## 2026-06-18 — #1962 standalone deploy pushes the userspace-dp helper
+- **Timestamp**: 2026-06-18 10:53
+- **Action**: Fix #1962 — `test/incus/setup.sh cmd_deploy()` never built/pushed
+  the Rust `xpf-userspace-dp` helper, so standalone test VMs came up with no
+  dataplane (xpfd execs the helper from a search path that includes
+  `filepath.Dir(os.Args[0])` = `/usr/local/sbin/xpf-userspace-dp`; the helper
+  is not linked into xpfd). The deploy even removed the OLD `bpfrx-userspace-dp`
+  without installing the new binary.
+- **Change**: After `make build build-ctl`, build the helper via
+  `make build-userspace-dp` (guarded on cargo presence, mirroring
+  cluster-setup.sh). After pushing xpfd+cli, push
+  `$PROJECT_ROOT/xpf-userspace-dp` to `/usr/local/sbin/xpf-userspace-dp --mode
+  0755`, then verify the on-VM sha256 matches the local binary and `die` loudly
+  on mismatch/empty-readback (a push can silently no-op / the build can be
+  stale). Existing `bpfrx-userspace-dp` cleanup + pkill kept.
+- **File(s)**: test/incus/setup.sh
