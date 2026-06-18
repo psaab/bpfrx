@@ -19,6 +19,31 @@ subcommand, the postinst HA-mode contract, and the dogfood deploy.
 /etc/systemd/system/xpfd.service.d/10-xpf-version.conf     ExecStart pinned to the CONCRETE version
 ```
 
+### Managed-binary manifest (single source of truth, #1982)
+
+The set of binaries the upgrade treats as a version-locked unit —
+`xpfd`, `cli`, `xpf-userspace-dp`, `xpf-day0-config` — is declared ONCE
+in `pkg/upgrade/manifest` (`manifest.Managed` / `manifest.Names()`).
+Everything that touches the set derives from it:
+
+- the cut machine (`pkg/upgrade`, `managedBins = manifest.Names()`) —
+  copy, flip, verify, GC; its pre-start completeness check
+  (`versionDirComplete`) derives the lockstep subset
+  (`xpfd`, `xpf-userspace-dp`) from `manifest.LockstepNames()`;
+- the first-install seed (`pkg/upgrade/runtime`, same derivation);
+- the maintainer scripts (`debian/xpf.{preinst,postinst,postrm}`) and
+  `debian/rules` keep a self-contained `BINS="..."` literal / install
+  set (no build-time mutation of tracked files — a sed-into-the-checkout
+  step would dirty git and double-edit on re-run);
+- the shell test fixtures under `test/debian/`.
+
+A Go drift canary (`pkg/upgrade/manifest`'s
+`TestManagedBinaryDriftCanary`) parses every shell site and FAILS the
+suite if any list diverges from `manifest.Names()`, fail-closed (a site
+that drops its `BINS=` literal trips the canary rather than passing
+vacuously). To add a managed binary: edit `manifest.Managed`, then
+update each shell site to match — the canary tells you which ones.
+
 ## State machine (`pkg/upgrade`)
 
 ```
