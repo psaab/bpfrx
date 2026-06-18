@@ -5844,3 +5844,10 @@ top.
 - **Timestamp**: 2026-06-17
   - **Action**: #1956 boot-path investigation — REFUTED the stale-ActiveConfig() bug (device-map applies on every boot path; proven on live xpf-devmap VM + Codex code trace). Added testable seam `deviceMapNamingActive` + startup-decision regression test (the gap that let the feature "look dead" on the demo's pre-commit boot).
   - **File(s)**: pkg/daemon/device_map.go, pkg/daemon/daemon_run.go, pkg/daemon/device_map_startup_test.go, docs/pr/1956-device-map/reviewers.md
+
+## 2026-06-17 — #1968 upgrade latent defensive hardening (AGY review-011 Part I)
+- **Edit**: pkg/upgrade/cluster_cli.go — parseSyncEstablished: scope Status match to sync/fabric link section + require exact "up" (was first-status-anywhere + contains("up")).
+- **Edit**: pkg/upgrade/cluster_cli_test.go — TestSyncParser_ScopedAndExact + at-most-one-Status assertion in TestParsers_AgainstRealFormatInformation.
+- **Edit**: pkg/upgrade/runner.go — copyTree: fsync each copied directory (deepest-first) so nested entries survive power loss.
+- **Edit**: pkg/upgrade/runner_test.go — TestCopyTree_NestedDirsDurable.
+- **Edit** (r1 review fixes): runner.go — extract fsyncDirsDeepestFirst (true depth via separator count, not string length) + copyTreeSyncDir test seam; runner_test.go — TestCopyTree_FsyncsEachDirDeepestFirst (recorder proves loop runs + deepest-first) + TestCopyTree_FsyncDirErrorPropagates; cluster_cli_test.go — Not-configured-then-later-Status fixture.
