@@ -401,15 +401,39 @@ func copyFileFsync(src, dst string, mode os.FileMode) error {
 }
 
 // removeAllPartials sweeps any leftover .partial dirs (safe on re-run).
+//
+// After removing any partial it fsyncs VersionsDir (#1967 C4): os.RemoveAll
+// unlinks the directory entries but the parent-directory metadata change is
+// not durable until the parent dir fd is fsynced. Without this a crash
+// between the sweep and the later parent fsync (in copyStaged / preflight's
+// snapshot path) could RESURRECT a stale `.partial` entry on remount — a
+// torn copy a subsequent run would have to re-sweep. The fsync is gated on
+// an actual removal so the common no-partials case costs nothing.
 func (r *Runner) removeAllPartials() {
 	entries, err := os.ReadDir(r.cfg.VersionsDir)
 	if err != nil {
 		return
 	}
+	removedAny := false
 	for _, e := range entries {
 		n := e.Name()
 		if strings.HasPrefix(n, partialPrefix) && strings.HasSuffix(n, partialSuffix) {
 			_ = os.RemoveAll(filepath.Join(r.cfg.VersionsDir, n))
+			removedAny = true
+		}
+	}
+	if removedAny {
+		// Make the unlinks durable so they cannot be resurrected by a crash
+		// before the next parent fsync (#1967 C4).
+		if err := partialSweepSyncDir(r.cfg.VersionsDir); err != nil {
+			r.logf("upgrade: WARN fsync versions dir after partial sweep: %v", err)
 		}
 	}
 }
+
+// partialSweepSyncDir is the directory-fsync primitive removeAllPartials uses
+// to make a partial-dir unlink durable (#1967 C4). It is a package var so a
+// test can substitute a recorder and prove the fsync actually fires after a
+// partial is swept (and targets VersionsDir) — without the seam, deleting the
+// fsync would not fail any test.
+var partialSweepSyncDir = fsatomic.SyncDir
