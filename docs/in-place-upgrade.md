@@ -36,14 +36,33 @@ the running daemon and config untouched).
   config-DB snapshot (`.partial`+rename, never torn) for rollback.
 - **COPY** — `staged/` → `.<ver>.partial/` + checksum + atomic rename to
   `versions/<ver>/`. A crash never leaves a half-populated version dir;
-  stray `.partial` dirs are swept on re-run.
+  stray `.partial` dirs are swept on re-run, and the sweep fsyncs the
+  parent `versions/` dir so the unlink cannot be resurrected by a crash
+  before the next parent fsync (#1967 C4). The version key (`<ver>`) comes
+  from `staged/xpfd version` and is validated as a safe single path segment
+  (no `/`, `..`, leading dot, whitespace, control/high bytes) — a corrupt
+  binary or a benign `version`-format drift hard-fails the cut rather than
+  keying `versions/` by garbage (#1967 C1; `BinaryVersion` never falls back
+  to the raw output).
 - **VERIFY** — `versions/<ver>/xpfd verify-dataplane` against the running
   kernel with throwaway socket/state/pin env paths. A REJECT aborts with
-  the live dataplane untouched.
+  the live dataplane untouched. On a verify failure the just-copied
+  `versions/<ver>/` is removed and the journal is rewound below COPIED, so
+  a same-version retry (operator drops a corrected binary into `staged/`)
+  RE-copies and re-verifies rather than re-verifying the stale failing copy
+  (#1967). Two guards: the cleanup NEVER deletes the active or rollback
+  version dir (only when `<ver>` is neither `current` nor PreviousVersion),
+  and the journal reset prevents a subsequent run from skipping COPY and
+  failing VERIFY with file-not-found.
 - **STOP → FLIP → START** — stop the old daemon (closes the
   respawn-mismatch race: no live process can re-resolve the flipped
   helper), flip `current` + the `/usr/local/sbin` links + the unit
-  ExecStart drop-in, then start the new daemon.
+  ExecStart drop-in, then start the new daemon. Before START a diagnostic
+  check confirms `versions/<ver>/{xpfd,xpf-userspace-dp}` still exist
+  (a concurrent GC/disk event in the FLIP→START window) — a missing binary
+  fails fast with a clear cause and routes through the same START-failure
+  auto-rollback (#1967 C3, diagnostic only; the outcome was already covered
+  by the START-failure rollback).
 
 ### Respawn-mismatch closure (two structural guards)
 
@@ -127,16 +146,21 @@ segments (`ValidateVersionSegment`: no `/`, `..`, leading dot, whitespace,
 or control chars — but `+`/`:`/`~`/`-` are allowed, so Debian/semver
 versions pass).
 
-**Lifecycle (`debian/xpf.postrm`):** remove/purge also remove sbin links
-that resolve through `versions/current` (in addition to legacy direct-staged
-links), only when owned. `versions/` is left on `remove` (a reinstall
-reuses it) and removed on `purge` (it is copied binaries, not operator
-config — Policy §6.8). A downgrade to a package predating this layout
-(detected via a `seed-runtime --capability-check` probe of the
-newly-unpacked staged `xpfd`) removes the runtime unit drop-in, repoints
-sbin back to `staged/` atomically, deletes `versions/current`, and
-boot-guarded `daemon-reload` — so the downgraded binaries actually take
-effect. (Drop-in removal on remove/purge is deferred to #1967.)
+**Lifecycle (`debian/xpf.postrm`):** remove/purge remove sbin links that
+resolve through `versions/current` (in addition to legacy direct-staged
+links), only when owned, AND remove the runtime unit drop-in
+`/etc/systemd/system/xpfd.service.d/10-xpf-version.conf` + rmdir the now-empty
+`.service.d` dir + boot-guarded `daemon-reload` (#1967) — otherwise systemd is
+left with a drop-in whose ExecStart pins a deleted `versions/<ver>/xpfd`. The
+drop-in removal is safe on legacy/never-seeded hosts (absent file) and leaves a
+non-empty `.service.d` (a foreign operator drop-in) intact. `versions/` is left
+on `remove` (a reinstall reuses it) and removed on `purge` (it is copied
+binaries, not operator config — Policy §6.8). A downgrade to a package
+predating this layout (detected via a `seed-runtime --capability-check` probe
+of the newly-unpacked staged `xpfd`) repoints sbin back to `staged/`
+atomically, deletes `versions/current`, then removes the runtime unit drop-in
++ boot-guarded `daemon-reload` (shared helper) — so the downgraded binaries
+actually take effect.
 
 ## HA rolling upgrade (`xpfd upgrade --rolling`)
 

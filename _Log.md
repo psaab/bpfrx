@@ -5896,3 +5896,16 @@ top.
 - **Edit**: debian/xpf.postrm — downgrade rmdir uses `dirname "$DROPIN"` (was hard-coded /etc/systemd/system/xpfd.service.d) — single source of truth, no path drift.
 - **Edit**: test/debian/preinst-migrate-test.sh — current_is_regular_file + current_is_dir scenarios; postrm-test.sh — assert empty .d dir removed + drop obsolete sed special-case.
 - **Validation**: go build + upgrade tests green; all 3 shell harnesses 3x under sh+dash; sh -n/dash -n/shellcheck clean on all 3 scripts.
+
+## 2026-06-17 — #1967 cutover robustness (engineer/1967-cutover-robustness)
+- **Timestamp**: 2026-06-17
+- **Action**: Implement the genuinely-remaining #1967 hardening annex items (flip-failure rollback + version-validation helper + postrm downgrade-path drop-in already shipped in #1964/#1965 — SKIPPED).
+- **Edit**: pkg/upgrade/system_linux.go — C1: BinaryVersion validates the extracted `xpfd <ver>` token via ValidateVersionSegment and hard-fails an unsafe token OR an unrecognized output format. REMOVED the raw-trimmed-output fallback (a corrupt binary / format-drift can no longer key versions/ by garbage).
+- **Edit**: pkg/upgrade/cutover.go — verify-fail cleanup: cleanupFailedVerifyCopy removes versions/<TargetVersion> on a VERIFY failure with two guards (never delete current/PreviousVersion; rewind journal to StatePreflight + persist so a same-version retry recopies). C3 diagnostic: pre-START stat of versions/<ver>/{xpfd,xpf-userspace-dp}; a vanished dir fails fast through the existing START-failure auto-rollback with a clear cause.
+- **Edit**: pkg/upgrade/runner.go — C4: removeAllPartials fsyncs VersionsDir after sweeping any .partial (gated on a real removal) via partialSweepSyncDir seam.
+- **Edit**: debian/xpf.postrm — remove/purge now also remove the runtime unit drop-in (10-xpf-version.conf) + rmdir empty .service.d + boot-guarded daemon-reload (shared remove_runtime_dropin helper; downgrade path refactored to reuse it). Header comment updated (#1967 no longer deferred).
+- **Write**: pkg/upgrade/system_linux_test.go — BinaryVersion accepts real Debian/semver shapes, rejects unsafe tokens + garbage formats + exec failure (no raw-output leak).
+- **Write**: pkg/upgrade/verify_cleanup_test.go — verify-fail recopies on retry; never deletes active or PreviousVersion dir + resets journal; C3 pre-start-missing rolls back to previous; C4 fsync fires after sweep (and NOT on the no-partials path).
+- **Edit**: test/debian/postrm-test.sh — remove/purge drop-in removal asserted; non-empty .service.d (foreign drop-in) preserved; legacy/never-seeded no-drop-in no-op.
+- **Edit**: docs/in-place-upgrade.md — document C1/C3/C4 + verify-fail cleanup + remove/purge drop-in removal.
+- **Validation**: go build ./... clean; go vet ./pkg/upgrade/... clean; full Go suite no failures; new tests 5x no flake; postrm-test.sh green under sh + dash; sh -n + dash -n clean on debian/xpf.postrm. Baked-image dogfood not runnable here (noted in PR).
