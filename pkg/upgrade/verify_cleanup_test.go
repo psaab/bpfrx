@@ -197,45 +197,72 @@ func TestPreStartVersionDirCheck_RollsBack(t *testing.T) {
 // TestVerifyFailCleanup_SaveJournalFailureKeepsSnapshot proves the Codex r3
 // fix: if the journal rewrite does NOT persist, cleanupFailedVerifyCopy must
 // NOT remove the orphan DB snapshot — else the persisted (still StateCopied,
-// DBSnapshotPath set) journal would reference a deleted snapshot. We force a
-// saveJournal failure by pointing JournalPath under a read-only directory and
-// assert the snapshot dotfile survives.
+// DBSnapshotPath set) journal would reference a deleted snapshot.
+//
+// The journal directory is kept SEPARATE from VersionsDir and ONLY the journal
+// dir is made read-only (Codex r4): the prior version of this test chmod'd
+// VersionsDir, which blocked BOTH the version-dir removal AND the snapshot
+// removal, so the old buggy code would have "passed" for the wrong reason.
+// With VersionsDir writable and only the journal dir read-only, the version
+// dir IS removed (proving the unlink branch ran), saveJournal fails, and the
+// snapshot must still survive — a true regression test for the r3 bug.
 func TestVerifyFailCleanup_SaveJournalFailureKeepsSnapshot(t *testing.T) {
 	if os.Getuid() == 0 {
 		t.Skip("running as root: a read-only dir does not block writes")
 	}
-	fs := newFakeSystem(t, "2.0.0")
-	r, cfg := testEnv(t, fs)
-	if err := os.MkdirAll(cfg.VersionsDir, 0o755); err != nil {
+	root := t.TempDir()
+	versionsDir := filepath.Join(root, "versions") // writable
+	journalDir := filepath.Join(root, "journal")   // made read-only below
+	if err := os.MkdirAll(versionsDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// Plant a DB snapshot dotfile for the target version.
-	snap := filepath.Join(cfg.VersionsDir, ".2.0.0.dbsnap")
+	if err := os.MkdirAll(journalDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fs := newFakeSystem(t, "2.0.0")
+	r, err := NewRunner(Config{
+		StagedDir:   filepath.Join(root, "staged"),
+		VersionsDir: versionsDir,
+		SbinDir:     filepath.Join(root, "sbin"),
+		ConfigDBDir: filepath.Join(root, "cfgdb"),
+		JournalPath: filepath.Join(journalDir, "upgrade.state"),
+		Unit:        "xpfd",
+		Sys:         fs,
+		Logf:        func(format string, a ...any) { t.Logf("LOG "+format, a...) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Plant a DB snapshot dotfile + a (non-active, current is absent) version
+	// dir under the WRITABLE VersionsDir, so the removal branch genuinely runs.
+	snap := filepath.Join(versionsDir, ".2.0.0.dbsnap")
 	if err := os.MkdirAll(snap, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// Plant a (non-active) version dir so the unlink branch runs.
-	verDir := filepath.Join(cfg.VersionsDir, "2.0.0")
+	verDir := filepath.Join(versionsDir, "2.0.0")
 	if err := os.MkdirAll(verDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
-	// Make the journal directory read-only so saveJournal fails.
-	jdir := filepath.Dir(cfg.JournalPath)
-	if err := os.MkdirAll(jdir, 0o755); err != nil {
+	// Make ONLY the journal directory read-only so saveJournal fails while
+	// VersionsDir operations succeed.
+	if err := os.Chmod(journalDir, 0o500); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(jdir, 0o500); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(jdir, 0o755) })
+	t.Cleanup(func() { _ = os.Chmod(journalDir, 0o755) })
 
 	j := &Journal{State: StateCopied, TargetVersion: "2.0.0", PreviousVersion: "1.0.0",
 		DBSnapshotPath: snap, AdvancedStateFloor: true}
 	r.cleanupFailedVerifyCopy(j)
 
+	// The version dir MUST be removed (the unlink branch ran — VersionsDir is
+	// writable), proving we reached the saveJournal step.
+	if _, err := os.Stat(verDir); !os.IsNotExist(err) {
+		t.Fatalf("version dir not removed (unlink branch did not run): stat err=%v", err)
+	}
 	// The snapshot MUST survive: saveJournal failed, so removing it would leave
-	// the persisted journal referencing a deleted snapshot.
+	// the persisted journal referencing a deleted snapshot (the r3 bug).
 	if _, err := os.Stat(snap); err != nil {
 		t.Fatalf("orphan snapshot removed despite a saveJournal failure: %v", err)
 	}
