@@ -23,7 +23,6 @@ import (
 	"github.com/psaab/xpf/pkg/cli"
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
-	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/dhcp"
@@ -222,26 +221,54 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// lifeline keeps mgmt reachable through a fail-closed boot; #1922 hardens
 	// the foreign/non-appliance host case (noted in the PR; not implemented
 	// here).
-	if err := d.store.Load(); err != nil {
-		if errors.Is(err, configstore.ErrConfigDBUnreadable) {
-			// Point recovery at the actual unreadable artifact — the config
-			// DB under .configdb/, NOT the text config file (Copilot).
-			dbPath := filepath.Join(filepath.Dir(d.opts.ConfigFile), ".configdb", "active.json")
-			return fmt.Errorf("config DB is present but unreadable; refusing to "+
-				"start and overwrite it (fail closed). Inspect/repair %s (the on-disk "+
-				"config DB, NOT the text config file) or roll the xpf binary forward "+
-				"to a build that can read it: %w",
-				dbPath, err)
-		}
-		slog.Warn("failed to load config from db", "err", err)
+	// configCompileFailed records the #1960 fail-closed case: a PRESENT,
+	// previously-committed active.json read+parsed fine but no longer
+	// compiles. It must NOT fall back to bootstrapFromFile() (which would
+	// blind-import the text config file over a broken-but-present committed
+	// DB — the same silently-wrong takeover this issue closes) and it forces
+	// bootstrap mode below regardless of computeBootClass's other inputs.
+	configCompileFailed := false
+	switch loadErr := d.store.Load(); classifyLoadError(loadErr) {
+	case loadFatalUnreadable:
+		// Point recovery at the actual unreadable artifact — the config
+		// DB under .configdb/, NOT the text config file (Copilot).
+		dbPath := filepath.Join(filepath.Dir(d.opts.ConfigFile), ".configdb", "active.json")
+		return fmt.Errorf("config DB is present but unreadable; refusing to "+
+			"start and overwrite it (fail closed). Inspect/repair %s (the on-disk "+
+			"config DB, NOT the text config file) or roll the xpf binary forward "+
+			"to a build that can read it: %w",
+			dbPath, loadErr)
+	case loadCompileFailed:
+		// #1960 fail-closed: a previously-committed config no longer
+		// compiles. Store.Load set everCommitted=true but left compiled
+		// nil, so without this the boot predicate would resolve to NORMAL
+		// (ActiveConfig()==nil + everCommitted) and run the positional
+		// claim-all interface rename — exactly the safety hole this fixes.
+		// Surface it LOUDLY (Error, not the ignored Warn) and route into
+		// the #1922 bootstrap/lifeline safe state below.
+		configCompileFailed = true
+		dbPath := filepath.Join(filepath.Dir(d.opts.ConfigFile), ".configdb", "active.json")
+		slog.Error("active config DB is present but no longer compiles; refusing interface "+
+			"takeover and entering BOOTSTRAP/lifeline safe state (management preserved, NO "+
+			"positional claim-all). Fix the config from the CLI/gRPC and 'commit confirmed', "+
+			"or repair/remove the on-disk config DB",
+			"db_path", dbPath, "err", loadErr)
+	case loadOtherError:
+		slog.Warn("failed to load config from db", "err", loadErr)
+	case loadOK:
+		// nil error: absent DB (start-fresh) or a valid loaded config.
 	}
 
-	// If DB had no active config, bootstrap from the text config file
-	if d.store.ActiveConfig() == nil {
+	// If DB had no active config, bootstrap from the text config file.
+	//
+	// #1960: but NOT when a present committed config failed to compile —
+	// importing the text xpf.conf there would silently swap in a different
+	// config and then take over interfaces, defeating the fail-closed intent.
+	if d.store.ActiveConfig() == nil && !configCompileFailed {
 		if err := d.bootstrapFromFile(); err != nil {
 			slog.Warn("failed to bootstrap config from file", "err", err)
 		}
-	} else {
+	} else if d.store.ActiveConfig() != nil {
 		slog.Info("configuration loaded from db")
 	}
 
@@ -252,15 +279,27 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// TAKEOVER actions (but not the management control surfaces or manager
 	// construction — C1). Every existing deployment resolves NOT-bootstrap
 	// (case 2/3, or case 5 committed-empty) → zero behavior change.
+	//
+	// #1960: configCompileFailed forces bootstrap here — a previously-committed
+	// config that no longer compiles must fail closed (no positional claim-all)
+	// regardless of the other inputs, including the HA-node guard.
 	nodeIDPresent := hasNodeIDFile()
-	bootClass := computeBootClass(d.store.ActiveConfig() != nil, d.store.EverCommitted(), nodeIDPresent)
+	bootClass := computeBootClass(d.store.ActiveConfig() != nil, d.store.EverCommitted(), nodeIDPresent, configCompileFailed)
 	if bootClass == bootClassBootstrap {
 		d.bootstrapMode.Store(true)
-		slog.Warn("xpf daemon entering BOOTSTRAP mode: no committed configuration found",
-			"detail", "management control plane (gRPC/REST/CLI) runs normally, but interface "+
-				"rename/takeover, dataplane arm, and FRR/VRRP takeover are SUPPRESSED until the "+
-				"first 'commit confirmed' (+ confirm) or cluster config sync. This keeps a "+
-				"foreign/non-appliance host reachable on its existing management NIC.")
+		detail := "management control plane (gRPC/REST/CLI) runs normally, but interface " +
+			"rename/takeover, dataplane arm, and FRR/VRRP takeover are SUPPRESSED until the " +
+			"first 'commit confirmed' (+ confirm) or cluster config sync. This keeps a " +
+			"foreign/non-appliance host reachable on its existing management NIC."
+		if configCompileFailed {
+			// #1960: distinct cause — not "no config", but "committed config no
+			// longer compiles". The Error log above already named the DB path.
+			slog.Warn("xpf daemon entering BOOTSTRAP mode: committed configuration no longer compiles",
+				"detail", detail)
+		} else {
+			slog.Warn("xpf daemon entering BOOTSTRAP mode: no committed configuration found",
+				"detail", detail)
+		}
 	} else if nodeIDPresent && d.store.ActiveConfig() == nil {
 		// HA-node guard (C2/C8): node-id present but NEITHER a DB nor an
 		// importable xpf.conf. Resolved to NOT-bootstrap so takeover is not
