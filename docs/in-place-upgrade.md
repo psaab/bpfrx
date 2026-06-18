@@ -27,7 +27,9 @@ in `pkg/upgrade/manifest` (`manifest.Managed` / `manifest.Names()`).
 Everything that touches the set derives from it:
 
 - the cut machine (`pkg/upgrade`, `managedBins = manifest.Names()`) —
-  copy, flip, verify, GC;
+  copy, flip, verify, GC; its pre-start completeness check
+  (`versionDirComplete`) derives the lockstep subset
+  (`xpfd`, `xpf-userspace-dp`) from `manifest.LockstepNames()`;
 - the first-install seed (`pkg/upgrade/runtime`, same derivation);
 - the maintainer scripts (`debian/xpf.{preinst,postinst,postrm}`) and
   `debian/rules` keep a self-contained `BINS="..."` literal / install

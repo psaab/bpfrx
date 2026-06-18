@@ -68,6 +68,22 @@ func Names() []string {
 	return out
 }
 
+// LockstepNames returns the basenames of the binaries cut in version lockstep
+// with the daemon (LockstepCut == true), in Managed order. These are the
+// binaries whose presence in the flipped-in version dir is verified just
+// before StartUnit (the dataplane mismatches if any is missing), so the cut's
+// pre-start completeness check derives its list from here rather than
+// re-hardcoding the subset.
+func LockstepNames() []string {
+	var out []string
+	for _, b := range Managed {
+		if b.LockstepCut {
+			out = append(out, b.Name)
+		}
+	}
+	return out
+}
+
 // ShellBINS renders the space-separated basename list exactly as the
 // maintainer scripts' BINS shell variable carries it, e.g.:
 //

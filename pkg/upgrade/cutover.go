@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 
 	"github.com/psaab/xpf/pkg/fsatomic"
+	"github.com/psaab/xpf/pkg/upgrade/manifest"
 )
 
 // Options modify a single Run.
@@ -409,7 +410,10 @@ func (r *Runner) Run(opts Options) (err error) {
 // so this is diagnostic-only — it never changes which recovery path runs.
 // Returns nil when the dir is complete.
 func (r *Runner) versionDirComplete(ver string) error {
-	for _, b := range []string{"xpfd", "xpf-userspace-dp"} {
+	// The lockstep set (xpfd, xpf-userspace-dp) comes from the manifest SSOT
+	// (#1982) rather than a hardcoded list, so it cannot silently drift from
+	// the managed-binary declaration.
+	for _, b := range manifest.LockstepNames() {
 		p := filepath.Join(r.versionDir(ver), b)
 		if _, serr := os.Stat(p); serr != nil {
 			return fmt.Errorf("flipped-in version dir incomplete before start: "+

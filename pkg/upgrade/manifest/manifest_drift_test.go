@@ -276,3 +276,28 @@ func TestManifestShape(t *testing.T) {
 		t.Errorf("ShellBINS()=%q, want %q", got, want)
 	}
 }
+
+// TestLockstepNames locks the lockstep subset the cut's pre-start
+// completeness check (pkg/upgrade.versionDirComplete) derives from the
+// manifest. The set must be exactly the daemon + the dataplane helper; a
+// regression that flips a LockstepCut flag would change which binaries the
+// cut requires present before StartUnit.
+func TestLockstepNames(t *testing.T) {
+	got := LockstepNames()
+	want := []string{"xpfd", "xpf-userspace-dp"}
+	if !sortedEqual(got, want) {
+		t.Errorf("LockstepNames()=%q, want %q (xpfd + xpf-userspace-dp are the "+
+			"version-locked dataplane set)", got, want)
+	}
+	// Every lockstep name must also be a managed name (a lockstep binary that
+	// is not in the managed set would never be staged/copied).
+	managed := map[string]bool{}
+	for _, n := range Names() {
+		managed[n] = true
+	}
+	for _, n := range got {
+		if !managed[n] {
+			t.Errorf("LockstepNames() returned %q which is not in Names()", n)
+		}
+	}
+}
