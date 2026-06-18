@@ -32,6 +32,8 @@ func runUpgradeSubcommand(args []string) {
 			"cluster keeps forwarding (one node down at a time)")
 	stagedDir := fs.String("staged-dir", upgrade.DefaultStagedDir, "dpkg-staged binary set dir")
 	versionsDir := fs.String("versions-dir", upgrade.DefaultVersionsDir, "runtime versioned dir")
+	stagedGenDir := fs.String("staged-gen-dir", upgrade.DefaultStagedGenDir,
+		"staged-generation root the cut copies from (#1981 Option B)")
 	sbinDir := fs.String("sbin-dir", upgrade.DefaultSbinDir, "operator-tool symlink dir")
 	configDBDir := fs.String("configdb-dir", upgrade.DefaultConfigDBDir, "config DB dir (for rollback snapshot)")
 	journalPath := fs.String("journal", upgrade.DefaultJournalPath, "crash-safe state journal path")
@@ -45,6 +47,7 @@ func runUpgradeSubcommand(args []string) {
 	cfg := upgrade.Config{
 		StagedDir:           *stagedDir,
 		VersionsDir:         *versionsDir,
+		StagedGenDir:        *stagedGenDir,
 		SbinDir:             *sbinDir,
 		ConfigDBDir:         *configDBDir,
 		JournalPath:         *journalPath,

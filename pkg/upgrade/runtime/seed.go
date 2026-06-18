@@ -37,6 +37,7 @@ import (
 	"github.com/psaab/xpf/pkg/fsatomic"
 	"github.com/psaab/xpf/pkg/upgrade"
 	"github.com/psaab/xpf/pkg/upgrade/manifest"
+	"github.com/psaab/xpf/pkg/upgrade/stagedgen"
 )
 
 // Default layout, shared with pkg/upgrade. Overridable in Config for tests.
@@ -44,9 +45,10 @@ import (
 // runtime package references them (Copilot) so a future layout change updates
 // both the cut machine and the first-install seed together.
 const (
-	defaultStagedDir   = upgrade.DefaultStagedDir
-	defaultVersionsDir = upgrade.DefaultVersionsDir
-	defaultSbinDir     = upgrade.DefaultSbinDir
+	defaultStagedDir    = upgrade.DefaultStagedDir
+	defaultVersionsDir  = upgrade.DefaultVersionsDir
+	defaultStagedGenDir = upgrade.DefaultStagedGenDir
+	defaultSbinDir      = upgrade.DefaultSbinDir
 
 	currentLink = "current"
 )
@@ -64,7 +66,11 @@ var managedBins = manifest.Names()
 type Config struct {
 	StagedDir   string
 	VersionsDir string
-	SbinDir     string
+	// StagedGenDir is the staged-generation root (#1981 Option B). Seed
+	// publishes an initial generation here so a first manual `xpfd upgrade`
+	// has a pinned source.
+	StagedGenDir string
+	SbinDir      string
 
 	// Logf is an optional progress sink (defaults to no-op).
 	Logf func(format string, args ...any)
@@ -80,6 +86,9 @@ func (c *Config) withDefaults() {
 	}
 	if c.VersionsDir == "" {
 		c.VersionsDir = defaultVersionsDir
+	}
+	if c.StagedGenDir == "" {
+		c.StagedGenDir = defaultStagedGenDir
 	}
 	if c.SbinDir == "" {
 		c.SbinDir = defaultSbinDir
@@ -163,6 +172,24 @@ func Seed(cfg Config) (err error) {
 		}
 	}
 	logf("seed: seeded versioned runtime %s (current + sbin resolve through versions/)", ver)
+
+	// 5. Publish the FIRST staged generation (#1981 Option B) so a first manual
+	//    `xpfd upgrade` has a pinned source even though first-install runs no
+	//    cut. dpkg has finished unpacking staged/ before the postinst configure
+	//    step runs, so this publishes a complete, single-generation source.
+	//    Idempotent: a re-run publishes a fresh (distinct) generation and the
+	//    GC keeps current + 1 prior. Best-effort idempotence aside, a publish
+	//    FAILURE here is fatal to seeding (the caller falls back to legacy
+	//    direct-staged links): a later cut then refuses safely with no source
+	//    rather than reading torn staged/.
+	if _, perr := (stagedgen.Config{
+		StagedDir: cfg.StagedDir,
+		Dir:       cfg.StagedGenDir,
+		Logf:      cfg.Logf,
+	}).Publish(); perr != nil {
+		return fmt.Errorf("seed: publish initial staged generation: %w", perr)
+	}
+	logf("seed: published the initial staged generation")
 	return nil
 }
 

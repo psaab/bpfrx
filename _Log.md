@@ -5984,3 +5984,6 @@ top.
 - **Timestamp**: 2026-06-18
 - **Action**: Wire stagedgen into the cut: Journal.SourceGeneration, resolveSource (pin genid at INIT, refuse if no published gen), copyStaged reads pinned generation + B-P3b OPT1 (.srcgen stamp, genid-aware skip, refuse-or-guarded-replace), GC staged-gen protecting journal gen, verify-fail cleanup re-resolves current-gen.
 - **File(s)**: pkg/upgrade/state.go, pkg/upgrade/runner.go, pkg/upgrade/cutover.go, pkg/upgrade/flip.go, pkg/upgrade/runner_test.go, pkg/upgrade/verify_cleanup_test.go
+- **Timestamp**: 2026-06-18
+- **Action**: Add `xpfd publish-generation` verb (lock-taking, GC; deferred-publish recovery) + register in main. Seed publishes initial generation on first install. Wire --staged-gen-dir flags through upgrade/seed-runtime.
+- **File(s)**: cmd/xpfd/publish_generation.go, cmd/xpfd/main.go, cmd/xpfd/upgrade.go, cmd/xpfd/seed_runtime.go, pkg/upgrade/runtime/seed.go, pkg/upgrade/runtime/seed_test.go

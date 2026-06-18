@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/psaab/xpf/pkg/upgrade/stagedgen"
 )
 
 // seedEnv builds a populated staged tree and returns a Config wired to
@@ -17,11 +19,12 @@ func seedEnv(t *testing.T, ver string) Config {
 		mkfile(t, filepath.Join(staged, b), "bin-"+b+"-"+ver)
 	}
 	return Config{
-		StagedDir:   staged,
-		VersionsDir: filepath.Join(root, "versions"),
-		SbinDir:     filepath.Join(root, "sbin"),
-		Logf:        func(format string, a ...any) { t.Logf("LOG "+format, a...) },
-		version:     ver,
+		StagedDir:    staged,
+		VersionsDir:  filepath.Join(root, "versions"),
+		StagedGenDir: filepath.Join(root, "staged-gen"),
+		SbinDir:      filepath.Join(root, "sbin"),
+		Logf:         func(format string, a ...any) { t.Logf("LOG "+format, a...) },
+		version:      ver,
 	}
 }
 
@@ -86,6 +89,33 @@ func TestSeed_FirstInstallLayout(t *testing.T) {
 		t.Fatalf("Seed: %v", err)
 	}
 	assertSeeded(t, cfg, "1.0.0")
+}
+
+// TestSeed_PublishesInitialGeneration proves the #1981 Option B seed step: a
+// first install publishes a resolvable staged generation containing the
+// staged bytes, so a first manual `xpfd upgrade` has a pinned source.
+func TestSeed_PublishesInitialGeneration(t *testing.T) {
+	cfg := seedEnv(t, "1.0.0")
+	if err := Seed(cfg); err != nil {
+		t.Fatalf("Seed: %v", err)
+	}
+	sg := stagedgen.Config{StagedDir: cfg.StagedDir, Dir: cfg.StagedGenDir}
+	genid, err := sg.ResolveCurrent()
+	if err != nil {
+		t.Fatalf("ResolveCurrent after seed: %v", err)
+	}
+	if genid == "" {
+		t.Fatal("seed did not publish an initial generation (current-gen absent)")
+	}
+	for _, b := range managedBins {
+		data, rerr := os.ReadFile(filepath.Join(sg.GenDir(genid), b))
+		if rerr != nil {
+			t.Fatalf("published generation missing %s: %v", b, rerr)
+		}
+		if string(data) != "bin-"+b+"-1.0.0" {
+			t.Errorf("published %s = %q, want seeded bytes", b, data)
+		}
+	}
 }
 
 // TestSeed_Idempotent re-runs Seed and asserts the layout is unchanged and

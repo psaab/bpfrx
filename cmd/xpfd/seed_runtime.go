@@ -22,6 +22,8 @@ func runSeedRuntimeSubcommand(args []string) {
 	fs := flag.NewFlagSet("seed-runtime", flag.ContinueOnError)
 	stagedDir := fs.String("staged-dir", upgrade.DefaultStagedDir, "dpkg-staged binary set dir")
 	versionsDir := fs.String("versions-dir", upgrade.DefaultVersionsDir, "runtime versioned dir")
+	stagedGenDir := fs.String("staged-gen-dir", upgrade.DefaultStagedGenDir,
+		"staged-generation root to publish the initial generation into (#1981)")
 	sbinDir := fs.String("sbin-dir", upgrade.DefaultSbinDir, "operator-tool symlink dir")
 	// --capability-check is a pure, side-effect-free probe: a hardened xpfd
 	// exits 0 without touching the filesystem; a pre-#1964 binary has no
@@ -50,10 +52,11 @@ func runSeedRuntimeSubcommand(args []string) {
 	}
 
 	if err := upruntime.Seed(upruntime.Config{
-		StagedDir:   *stagedDir,
-		VersionsDir: *versionsDir,
-		SbinDir:     *sbinDir,
-		Logf:        func(format string, a ...any) { fmt.Printf(format+"\n", a...) },
+		StagedDir:    *stagedDir,
+		VersionsDir:  *versionsDir,
+		StagedGenDir: *stagedGenDir,
+		SbinDir:      *sbinDir,
+		Logf:         func(format string, a ...any) { fmt.Printf(format+"\n", a...) },
 	}); err != nil {
 		fmt.Fprintf(os.Stderr, "seed-runtime: %v\n", err)
 		os.Exit(1)
