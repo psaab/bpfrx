@@ -5890,7 +5890,7 @@ top.
 - **Edit (r3 Copilot pass-2, 27e0ab1a9)**: flip.go clear journal after first-cut flip-failure restart (else re-run skips STOP→no-op commit); preinst+postrm atomic_symlink rm -rf stale .tmp; seed.go reference upgrade.Default* constants (dedup). Tests: FirstCutRestartsDaemon asserts journal cleared + re-run STOPs; preinst stale_tmp_dir scenario.
 - **Edit (r3 Copilot pass-3, cded94d63)**: seed.go atomicSymlink os.Remove->os.RemoveAll (stale-temp-dir tolerance, Go analog of the shell rm -rf fix); TestSeed_ToleratesStaleTempDir. AGY r4 MERGE-READY; Codex r4 in flight.
 
-## 2026-06-17 — #1964 post-merge follow-up (Copilot pass-7, PR TBD)
+## 2026-06-17 — #1964 post-merge follow-up (Copilot pass-7, PR #1973)
 - **Action**: Two post-merge Copilot robustness/maintainability findings on the #1964 maintainer scripts (PR #1972 merged d58a06783); fixed in a follow-up.
 - **Edit**: debian/xpf.preinst — migrate_legacy_layout fast-path requires `[ -L "$CURRENT" ]` (was `-L || -e`): a regular file/dir at $CURRENT (corruption) no longer repoints sbin to a non-resolving $CURRENT/<bin>; non-symlink → leave legacy links untouched (best-effort). Matches the Go seed's non-dir guard.
 - **Edit**: debian/xpf.postrm — downgrade rmdir uses `dirname "$DROPIN"` (was hard-coded /etc/systemd/system/xpfd.service.d) — single source of truth, no path drift.
