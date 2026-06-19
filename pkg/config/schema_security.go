@@ -140,9 +140,18 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 					"zone": {desc: "Source zone name", args: 1, multi: true, valueHint: ValueHintZoneName, placeholder: "<zone-name>", children: nil},
 				}},
 				"rule": {desc: "Static NAT rule name", args: 1, placeholder: "<rule-name>", children: map[string]*schemaNode{
+					// M3 (#2008): the static-NAT rule `match` reads
+					// `destination-address` and `source-address` children
+					// at compile (compiler_nat.go static loop ~762-771),
+					// but the schema left `match.children: nil` — so those
+					// keywords fell through with no structural completion
+					// and schema_walk.go skipped the subtree entirely. The
+					// values are address prefixes OR address-book names
+					// (consumed verbatim by nodeVal), so they stay untyped
+					// like the source/destination-NAT match leaves above.
 					"match": {desc: "Match criteria", children: map[string]*schemaNode{
-						"source-address":      {desc: "Source address prefix to match", args: 1, multi: true, placeholder: "<prefix>", children: nil},
 						"destination-address": {desc: "Destination address prefix to match", args: 1, multi: true, placeholder: "<prefix>", children: nil},
+						"source-address":      {desc: "Source address prefix to match", args: 1, multi: true, placeholder: "<prefix>", children: nil},
 					}},
 					"then": {desc: "Static NAT action", children: map[string]*schemaNode{
 						"static-nat": {desc: "Static NAT translation (prefix|nptv6-prefix|inet)", children: nil},
@@ -187,6 +196,21 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			"format":         {desc: "Per-stream format override", args: 1, placeholder: "<format>", children: nil},
 			"category":       {desc: "Event category filter (all or a specific category)", args: 1, placeholder: "<category>", children: nil},
 			"source-address": {desc: "Source IP for this stream", args: 1, placeholder: "<address>", children: nil},
+			// H8 (#2008): transport is fully compiled
+			// (compiler_security.go stream loop) and runtime-honored
+			// (pkg/logging/syslog.go dial), but the schema declared no
+			// `transport` child — so `protocol`/`tls-profile` got no
+			// commit-time validation or `?` completion. The protocol enum
+			// mirrors the runtime switch (tcp/tls handled, everything else
+			// silently falls back to UDP), so a typo like `protocol tpc`
+			// committed and then quietly used UDP. Validate it.
+			"transport": {desc: "Stream transport (protocol + optional TLS profile)", children: map[string]*schemaNode{
+				"protocol": {desc: "Transport protocol (udp|tcp|tls)", args: 1, placeholder: "<protocol>",
+					valueType: ValueEnumOf, valueDesc: "syslog transport protocol",
+					valueExamples: []string{"udp", "tcp", "tls"},
+					validator:     ValidateEnum([]string{"udp", "tcp", "tls"}), children: nil},
+				"tls-profile": {desc: "TLS profile name (for protocol tls)", args: 1, placeholder: "<tls-profile-name>", children: nil},
+			}},
 		}},
 	}},
 	"flow": {desc: "Flow and session settings", children: map[string]*schemaNode{
@@ -215,7 +239,31 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		"tftp": {desc: "TFTP ALG (disable)", children: nil},
 	}},
 	"ike": {desc: "IKE (Phase 1) configuration", children: map[string]*schemaNode{
-		"proposal": {desc: "IKE proposal name", args: 1, placeholder: "<proposal-name>", children: nil},
+		// M2 (#2008): the IKE (Phase 1) proposal body is fully compiled
+		// (compiler_ipsec.go compileIKE proposal loop) and rendered to
+		// swanctl (pkg/ipsec/ipsec.go), but the schema left
+		// `proposal.children: nil` — so authentication-method/dh-group/
+		// lifetime-seconds got no commit-time validation or `?`
+		// completion. A bad authentication-method errors only later at
+		// swanctl-generation time (authMethodToSwan); a 0/garbage
+		// dh-group or lifetime-seconds silently compiles to 0 and drops
+		// the term. encryption/authentication-algorithm stay untyped:
+		// the renderer normalizes arbitrary algorithm spellings by string
+		// substitution, so an enum here would false-reject valid configs.
+		"proposal": {desc: "IKE proposal name", args: 1, placeholder: "<proposal-name>", children: map[string]*schemaNode{
+			"authentication-method": {desc: "IKE authentication method", args: 1, placeholder: "<method>",
+				valueType: ValueEnumOf, valueDesc: "IKE phase 1 authentication method",
+				valueExamples: []string{"pre-shared-keys", "rsa-signatures", "ecdsa-signatures"},
+				validator:     ValidateEnum([]string{"pre-shared-keys", "rsa-signatures", "ecdsa-signatures"}), children: nil},
+			"dh-group": {desc: "Diffie-Hellman group (e.g. 14 or group14)", args: 1, placeholder: "<dh-group>",
+				valueType: ValueDHGroup, valueDesc: "Diffie-Hellman group",
+				valueExamples: []string{"2", "14", "group19"}, validator: ValidateDHGroup, children: nil},
+			"encryption-algorithm":     {desc: "Encryption algorithm (e.g. aes-256-cbc, aes-256-gcm)", args: 1, placeholder: "<algorithm>", children: nil},
+			"authentication-algorithm": {desc: "Authentication/integrity algorithm (e.g. sha-256, hmac-sha-256-128)", args: 1, placeholder: "<algorithm>", children: nil},
+			"lifetime-seconds": {desc: "IKE SA lifetime in seconds", args: 1, placeholder: "<seconds>",
+				valueType: ValueInteger, valueDesc: "IKE SA lifetime in seconds",
+				valueExamples: []string{"3600", "28800"}, validator: ValidateIntegerMin(1), children: nil},
+		}},
 		"policy": {desc: "IKE policy name", args: 1, placeholder: "<policy-name>", children: map[string]*schemaNode{
 			"mode":           {desc: "IKE phase 1 mode (main|aggressive)", args: 1, placeholder: "<mode>", children: nil},
 			"proposals":      {desc: "IKE proposal reference", args: 1, placeholder: "<proposal-name>", children: nil},
@@ -243,7 +291,24 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		}},
 	}},
 	"ipsec": {desc: "IPsec configuration", children: map[string]*schemaNode{
-		"proposal": {desc: "IPsec (Phase 2) proposal name", args: 1, placeholder: "<proposal-name>", children: nil},
+		// M2 (#2008): IPsec (Phase 2) proposal mirror of the IKE proposal
+		// above. The Phase 2 proposal carries `protocol` (esp|ah) instead
+		// of authentication-method and has no DPD; it is compiled by
+		// compiler_ipsec.go compileIPsec proposal loop and rendered by
+		// buildESPProposal. Same typing rationale: validate dh-group and
+		// lifetime-seconds (silent-zero footgun), leave the algorithm and
+		// protocol spellings untyped (the renderer accepts a wide set).
+		"proposal": {desc: "IPsec (Phase 2) proposal name", args: 1, placeholder: "<proposal-name>", children: map[string]*schemaNode{
+			"protocol":                 {desc: "IPsec protocol (esp|ah)", args: 1, placeholder: "<protocol>", children: nil},
+			"encryption-algorithm":     {desc: "Encryption algorithm (e.g. aes-256-cbc, aes-256-gcm)", args: 1, placeholder: "<algorithm>", children: nil},
+			"authentication-algorithm": {desc: "Authentication/integrity algorithm (e.g. hmac-sha-256-128)", args: 1, placeholder: "<algorithm>", children: nil},
+			"dh-group": {desc: "Diffie-Hellman group for PFS (e.g. 14 or group14)", args: 1, placeholder: "<dh-group>",
+				valueType: ValueDHGroup, valueDesc: "Diffie-Hellman group",
+				valueExamples: []string{"2", "14", "group19"}, validator: ValidateDHGroup, children: nil},
+			"lifetime-seconds": {desc: "IPsec SA lifetime in seconds", args: 1, placeholder: "<seconds>",
+				valueType: ValueInteger, valueDesc: "IPsec SA lifetime in seconds",
+				valueExamples: []string{"3600", "28800"}, validator: ValidateIntegerMin(1), children: nil},
+		}},
 		"policy": {desc: "IPsec policy name", args: 1, placeholder: "<policy-name>", children: map[string]*schemaNode{
 			"perfect-forward-secrecy": {desc: "Perfect forward secrecy (keys group<N>)", children: nil},
 			"proposals":               {desc: "IPsec proposal reference", args: 1, placeholder: "<proposal-name>", children: nil},

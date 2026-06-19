@@ -270,3 +270,36 @@ reserved for whole-dataplane selection where a rewrite shim
   empty-tree-compiles-non-nil trap). The pure identity resolver +
   host-NIC enumeration live in `pkg/devicemap` (shared by the daemon rename
   / pre-flight and the CLI `show`).
+- **#2008 (Tier-1.5 schema-hardening sweep):** declared typed children on
+  five subtrees whose leaves were fully parsed + compiled + honored at
+  runtime but whose `setSchema` node carried `children: nil`, so the gate
+  skipped them and an invalid value committed silently:
+  - `security log stream transport` — `protocol` (enum `udp|tcp|tls`,
+    matching the `pkg/logging/syslog.go` dial switch) + `tls-profile`.
+  - IKE (`security ike proposal`) and IPsec (`security ipsec proposal`)
+    crypto leaves — `authentication-method` (IKE only, enum
+    `pre-shared-keys|rsa-signatures|ecdsa-signatures`, matching
+    `authMethodToSwan`), `dh-group` (new `ValueDHGroup` + `ValidateDHGroup`:
+    accepts both the bare-integer and Junos `group<N>` spellings the
+    compiler strips, rejects 0/garbage that silently drops the modp term),
+    and `lifetime-seconds` (`ValidateIntegerMin(1)` — 0/garbage silently
+    compiles to 0). `protocol` and `encryption-algorithm` /
+    `authentication-algorithm` stay UNTYPED: the swanctl renderer
+    normalizes arbitrary algorithm spellings by string substitution, so an
+    enum there would false-reject valid configs.
+  - `security nat static rule-set rule match` — declared the
+    `source-address` / `destination-address` children the static-NAT
+    compiler reads (the subtree was previously unreachable by the walker).
+  - `protocols router-advertisement interface` — typed the
+    second-denominated leaves (`max/min-advertisement-interval`,
+    `default-lifetime`, `link-mtu` via `ValidateIntegerMin(1)`) and
+    declared the remaining compiler-consumed structural children
+    (managed/other-stateful-configuration, dns-server-address, prefix
+    flags/lifetimes).
+  - `system syslog host/file/user` — a wildcard `<facility>` child (the
+    facility namespace is open-ended) whose value slot is the fixed Junos
+    severity vocabulary (`syslogFacilitySeverityLeaf`), so a misspelled
+    severity that `ParseSeverity` would silently treat as "no filter" now
+    fails at commit; `allow-duplicates` is an explicit presence-only flag.
+  Pure schema hardening — no runtime behavior change. Regression coverage:
+  `pkg/config/schema_validate_2008_test.go`.
