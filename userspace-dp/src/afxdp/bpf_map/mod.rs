@@ -337,6 +337,10 @@ pub(super) struct ConntrackCtx<'a> {
     pub(super) v4_fd: c_int,
     pub(super) v6_fd: c_int,
     pub(super) zone_name_to_id: &'a FastMap<String, u16>,
+    /// `security alg <proto> disable` bitfield (#2008 H3/H4), carried from
+    /// ForwardingState so the mirrored conntrack entry's alg_type honours
+    /// the operator's disable knobs.
+    pub(super) alg_disable_flags: u8,
 }
 
 // ── BPF conntrack map structs (mirrors C struct session_key / session_value) ──
@@ -453,6 +457,10 @@ pub(super) fn publish_bpf_conntrack_entry(
     decision: SessionDecision,
     metadata: &SessionMetadata,
     _zone_name_to_id: &FastMap<String, u16>,
+    // `security alg <proto> disable` bitfield (#2008 H3/H4). Carried from
+    // ForwardingState so the session's alg_type honours the operator's
+    // disable knobs instead of being hardcoded to 0.
+    alg_disable_flags: u8,
 ) {
     // #919: zones are now u16 in SessionMetadata; the round-trip
     // name→id lookup the old code did is gone.
@@ -482,6 +490,7 @@ pub(super) fn publish_bpf_conntrack_entry(
                 ingress_zone_id,
                 egress_zone_id,
                 now_secs,
+                alg_disable_flags,
             );
         }
         (libc::AF_INET6, IpAddr::V6(src), IpAddr::V6(dst)) if conntrack_v6_fd >= 0 => {
@@ -496,6 +505,7 @@ pub(super) fn publish_bpf_conntrack_entry(
                 ingress_zone_id,
                 egress_zone_id,
                 now_secs,
+                alg_disable_flags,
             );
         }
         _ => {}
@@ -694,6 +704,7 @@ pub(super) fn publish_session_map_entry_for_session_with_conntrack(
                 decision,
                 metadata,
                 ctx.zone_name_to_id,
+                ctx.alg_disable_flags,
             );
         }
         return Ok(());
@@ -708,6 +719,7 @@ pub(super) fn publish_session_map_entry_for_session_with_conntrack(
             decision,
             metadata,
             ctx.zone_name_to_id,
+            ctx.alg_disable_flags,
         );
     }
     result

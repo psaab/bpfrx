@@ -159,6 +159,14 @@ pub(crate) struct FlowSnapshot {
     pub lo0_filter_input_v4: String,
     #[serde(rename = "lo0_filter_input_v6", default)]
     pub lo0_filter_input_v6: String,
+    /// `security alg <proto> disable` bitfield (#2008 H3/H4): bit 0 DNS,
+    /// bit 1 FTP, bit 2 SIP, bit 3 TFTP. Matches the Go `algDisableFlags`
+    /// encoding. Absent / 0 on snapshots from old Go binaries (additive
+    /// field). The dataplane reads this to suppress ALG-type tagging for a
+    /// disabled ALG; Junos `alg disable` turns the ALG off, it never drops
+    /// traffic.
+    #[serde(rename = "alg_disable_flags", default)]
+    pub alg_disable_flags: u8,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

@@ -328,6 +328,7 @@ pub(super) fn poll_binding_process_descriptor(
                                     resolved.decision,
                                     &resolved.metadata,
                                     &worker_ctx.forwarding.zone_name_to_id,
+                                    worker_ctx.forwarding.alg_disable_flags,
                                 );
                             }
                             // Log first N session hits from WAN (return path)
@@ -907,6 +908,7 @@ pub(super) fn poll_binding_process_descriptor(
                                         decision,
                                         &local_metadata,
                                         &worker_ctx.forwarding.zone_name_to_id,
+                                        worker_ctx.forwarding.alg_disable_flags,
                                     );
                                 }
                             }
@@ -2805,6 +2807,7 @@ pub(super) fn poll_binding_process_descriptor(
                                             pending_decision,
                                             &entry.metadata,
                                             &worker_ctx.forwarding.zone_name_to_id,
+                                            worker_ctx.forwarding.alg_disable_flags,
                                         );
                                         publish_dnat_table_entry(
                                             &worker_ctx.dnat_fds,
