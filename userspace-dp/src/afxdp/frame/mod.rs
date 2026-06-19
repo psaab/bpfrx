@@ -203,6 +203,7 @@ pub(super) fn build_nat64_forwarded_frame(
     meta: impl Into<ForwardPacketMeta>,
     decision: &SessionDecision,
     nat64_reverse: Option<&Nat64ReverseInfo>,
+    no_v6_frag_header: bool,
 ) -> Option<Vec<u8>> {
     let meta = meta.into();
     let dst_mac = decision.resolution.neighbor_mac?;
@@ -221,7 +222,13 @@ pub(super) fn build_nat64_forwarded_frame(
                 _ => return None,
             };
             crate::nat64::build_nat64_v6_to_v4_frame(
-                frame, snat_v4, dst_v4, dst_mac, src_mac, vlan_id,
+                frame,
+                snat_v4,
+                dst_v4,
+                dst_mac,
+                src_mac,
+                vlan_id,
+                no_v6_frag_header,
             )
         }
         libc::AF_INET => {

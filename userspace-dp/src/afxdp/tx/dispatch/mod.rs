@@ -531,6 +531,7 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                 request.meta,
                                 &request.decision,
                                 request.nat64_reverse.as_ref(),
+                                forwarding.nat64.no_v6_frag_header,
                             )
                         } else {
                             build_forwarded_frame_from_frame(
@@ -811,6 +812,7 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                 request.meta,
                                 &request.decision,
                                 request.nat64_reverse.as_ref(),
+                                forwarding.nat64.no_v6_frag_header,
                             )
                         } else {
                             build_forwarded_frame_from_frame(

@@ -76,6 +76,14 @@ pub(crate) struct NAT64RuleSnapshot {
     pub prefix: String,
     #[serde(rename = "pool_addresses", default)]
     pub pool_addresses: Vec<String>,
+    /// Mirrors `security nat natv6v4 no-v6-frag-header`. This is an
+    /// option-gated LOCAL DF policy (not the size-driven RFC 7915 5.1
+    /// selection): when set, the IPv6->IPv4 translator clears DF so the
+    /// translated IPv4 packet stays fragmentable (DF=0, non-atomic) and carries
+    /// a generated non-zero, non-repeating Identification (RFC 6864 4.1),
+    /// instead of the default DF=1 atomic framing.
+    #[serde(rename = "no_v6_frag_header", default)]
+    pub no_v6_frag_header: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

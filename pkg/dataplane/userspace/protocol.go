@@ -373,6 +373,15 @@ type NAT64RuleSnapshot struct {
 	Name          string   `json:"name"`
 	Prefix        string   `json:"prefix"`         // e.g. "64:ff9b::/96"
 	PoolAddresses []string `json:"pool_addresses"` // resolved IPv4 pool addresses
+	// NoV6FragHeader mirrors the global `security nat natv6v4
+	// no-v6-frag-header` knob. This is an option-gated LOCAL DF policy (not the
+	// size-driven RFC 7915 5.1 selection): when set, the IPv6->IPv4 translator
+	// clears DF so the translated IPv4 packet stays fragmentable (DF=0,
+	// non-atomic) and carries a generated non-zero, non-repeating
+	// Identification (RFC 6864 4.1) instead of the default DF=1 atomic framing.
+	// Replicated onto every NAT64 rule because the option is configured once at
+	// the natv6v4 level, not per rule-set.
+	NoV6FragHeader bool `json:"no_v6_frag_header,omitempty"`
 }
 
 // Nptv6RuleSnapshot captures an NPTv6 (RFC 6296) stateless prefix translation
