@@ -216,6 +216,19 @@ xpf has TCP session timeouts (established, initial, closing, time-wait), UDP/ICM
 
 xpf has ALG disable flags for DNS, FTP, SIP, TFTP. The vSRX supports many more ALGs.
 
+The `security alg <proto> disable` knobs reach the userspace dataplane via
+`FlowSnapshot.alg_disable_flags` (#2008 H3/H4): the bitfield is packed by
+`pkg/dataplane/userspace.algDisableFlags` (DNS=0x01, FTP=0x02, SIP=0x04,
+TFTP=0x08) and read in the session-create path by
+`alg_type_for_session` (`userspace-dp/src/afxdp/bpf_map/publish_conntrack.rs`).
+A session on a well-known ALG service port (DNS UDP/53, FTP TCP/21, SIP
+UDP+TCP/5060) is tagged with its ALG type in the conntrack `alg_type` field
+*unless* that ALG is disabled, in which case it is tagged `none`. This matches
+the Junos semantics of `alg disable` — the ALG is turned **off**, traffic is
+**never dropped**. (xpf does not yet implement the active ALG transforms
+themselves — payload doctoring / dynamic pinholes — so a non-disabled ALG only
+sets the type; see "DNS ALG with NAT" below.)
+
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
 | **H.323 ALG** | `security alg h323 ...` | VoIP: H.323 session tracking, media pinhole management, NAT for H.245/RAS | Low | Missing |

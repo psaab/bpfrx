@@ -48,6 +48,12 @@ pub(in crate::afxdp) struct ForwardingState {
     pub(in crate::afxdp) fabrics: Vec<FabricLink>,
     pub(in crate::afxdp) allow_dns_reply: bool,
     pub(in crate::afxdp) allow_embedded_icmp: bool,
+    /// `security alg <proto> disable` bitfield (#2008 H3/H4): bit 0 DNS,
+    /// bit 1 FTP, bit 2 SIP, bit 3 TFTP. Read at session-create time to
+    /// suppress ALG-type tagging for a disabled ALG. Junos `alg disable`
+    /// turns the ALG off; it never drops traffic, so a set bit only
+    /// changes the session's reported alg_type to 0 (none).
+    pub(in crate::afxdp) alg_disable_flags: u8,
     pub(in crate::afxdp) session_timeouts: crate::session::SessionTimeouts,
     pub(in crate::afxdp) policy: PolicyState,
     pub(in crate::afxdp) source_nat_rules: Vec<SourceNatRule>,

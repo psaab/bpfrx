@@ -204,6 +204,7 @@
     "fib_generation": 0,
     "filters": [],
     "flow": {
+      "alg_disable_flags": 0,
       "allow_dns_reply": false,
       "allow_embedded_icmp": false,
       "gre_acceleration": false,
@@ -485,6 +486,7 @@
     "sampling_rate": 0
   },
   "flow_snapshot": {
+    "alg_disable_flags": 0,
     "allow_dns_reply": false,
     "allow_embedded_icmp": false,
     "gre_acceleration": false,

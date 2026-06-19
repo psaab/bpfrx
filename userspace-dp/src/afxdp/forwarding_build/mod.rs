@@ -172,6 +172,7 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     )?;
     state.allow_dns_reply = snapshot.flow.allow_dns_reply;
     state.allow_embedded_icmp = snapshot.flow.allow_embedded_icmp;
+    state.alg_disable_flags = snapshot.flow.alg_disable_flags;
     state.session_timeouts = crate::session::SessionTimeouts::from_seconds(
         snapshot.flow.tcp_session_timeout,
         snapshot.flow.udp_session_timeout,

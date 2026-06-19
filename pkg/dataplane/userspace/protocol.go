@@ -107,6 +107,14 @@ type FlowSnapshot struct {
 	GREAcceleration    bool   `json:"gre_acceleration,omitempty"`     // extract GRE key into session ports
 	Lo0FilterInputV4   string `json:"lo0_filter_input_v4,omitempty"`  // lo0 inet input filter name
 	Lo0FilterInputV6   string `json:"lo0_filter_input_v6,omitempty"`  // lo0 inet6 input filter name
+	// ALGDisableFlags carries the `security alg <proto> disable` bitfield
+	// (bit 0: DNS, bit 1: FTP, bit 2: SIP, bit 3: TFTP — same layout as the
+	// legacy flow_config_map FlowConfigValue.ALGFlags). The userspace
+	// dataplane reads this to suppress ALG-type tagging for disabled ALGs
+	// (#2008 H3/H4). Junos `alg disable` turns the ALG off; it does NOT drop
+	// traffic, so the only enforced effect is that a session matching a
+	// disabled ALG is no longer tagged with that ALG type.
+	ALGDisableFlags uint8 `json:"alg_disable_flags,omitempty"`
 }
 
 type SnapshotSummary struct {
