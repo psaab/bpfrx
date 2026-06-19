@@ -201,3 +201,41 @@ func TestTCPMSSRange_StrictVsLenient(t *testing.T) {
 		t.Fatalf("lenient must WARN-LOAD hierarchical out-of-range MSS: %v", err)
 	}
 }
+
+// --- Lenient warning wording distinguishes out-of-range vs non-integer
+// (Copilot review): an out-of-range INTEGER is coerced by Layer A, but a
+// NON-INTEGER token is read as unset/0 and never reaches the dataplane, so
+// the warning must not claim "the dataplane coerces it" for that case. ---
+
+func TestTCPMSSRange_LenientWarningKind(t *testing.T) {
+	mssWarn := func(t *testing.T, tree *config.ConfigTree) string {
+		t.Helper()
+		cfg, err := config.CompileConfigLenient(tree)
+		if err != nil {
+			t.Fatalf("lenient compile must not hard-fail: %v", err)
+		}
+		for _, w := range cfg.Warnings {
+			if strings.Contains(w, "tcp-mss") {
+				return w
+			}
+		}
+		t.Fatalf("expected a tcp-mss lenient warning, got: %v", cfg.Warnings)
+		return ""
+	}
+
+	// Out-of-range integer -> coercion wording; strict rejects.
+	oor := mssWarn(t, mssFlatTree(t, "set security flow tcp-mss gre-in 70000"))
+	if !strings.Contains(oor, "coerces") {
+		t.Fatalf("out-of-range lenient warning should mention dataplane coercion, got: %q", oor)
+	}
+
+	// Non-integer token -> unset/0 wording (NOT coercion); strict rejects.
+	nonInt := mssFlatTree(t, "set security flow tcp-mss gre-in bogus")
+	if _, err := config.CompileConfig(nonInt); err == nil {
+		t.Fatal("strict must REJECT a non-integer tcp-mss token")
+	}
+	w := mssWarn(t, nonInt)
+	if !strings.Contains(w, "unset") || strings.Contains(w, "coerces") {
+		t.Fatalf("non-integer lenient warning should say unset/0 and NOT claim coercion, got: %q", w)
+	}
+}
