@@ -42,13 +42,23 @@ type usmUser struct {
 	privKey   []byte
 }
 
-// initV3Users builds USM user entries from config, localizing passwords with the engine ID.
+// initV3Users builds USM user entries from a.cfg at agent construction,
+// localizing passwords with the engine ID. It is the startup-only seam;
+// commit-time reconfigure goes through UpdateConfig -> deriveV3Users.
 func (a *Agent) initV3Users() {
-	if a.cfg == nil || len(a.cfg.V3Users) == 0 {
-		return
+	a.v3Users = a.deriveV3Users(a.cfg)
+}
+
+// deriveV3Users builds the USM user table from cfg, localizing each user's
+// auth/priv passwords against the agent's engine ID. It does NOT touch agent
+// state, so UpdateConfig can compute the new table before taking cfgMu and
+// swap it in atomically. Returns nil when no v3 users are configured.
+func (a *Agent) deriveV3Users(cfg *config.SNMPConfig) map[string]*usmUser {
+	if cfg == nil || len(cfg.V3Users) == 0 {
+		return nil
 	}
-	a.v3Users = make(map[string]*usmUser, len(a.cfg.V3Users))
-	for _, cu := range a.cfg.V3Users {
+	users := make(map[string]*usmUser, len(cfg.V3Users))
+	for _, cu := range cfg.V3Users {
 		u := &usmUser{name: cu.Name, authProto: cu.AuthProtocol, privProto: cu.PrivProtocol}
 		hashFn, hashLen := authHashFunc(cu.AuthProtocol)
 		if hashFn != nil && cu.AuthPassword != "" {
@@ -57,8 +67,9 @@ func (a *Agent) initV3Users() {
 		if hashFn != nil && cu.PrivPassword != "" {
 			u.privKey = passwordToKey(cu.PrivPassword, a.engineID, hashFn, hashLen)
 		}
-		a.v3Users[cu.Name] = u
+		users[cu.Name] = u
 	}
+	return users
 }
 
 // authHashFunc returns the hash constructor and key length for an auth protocol.
@@ -218,8 +229,9 @@ func (a *Agent) handleV3Packet(msgBody []byte) []byte {
 		return a.buildV3Discovery(msgID)
 	}
 
-	// Lookup user.
-	user := a.v3Users[userName]
+	// Lookup user (under cfgMu so a commit-time UpdateConfig can't race the
+	// USM user-table swap mid-request).
+	user := a.snapshotV3User(userName)
 	if user == nil {
 		slog.Debug("SNMPv3: unknown user", "user", userName)
 		return nil

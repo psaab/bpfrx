@@ -23,6 +23,26 @@ struct; SET requests (`pduSetRequest`, 0xa3) are gated on it:
 SNMPv3 SET requests are uniformly refused with `notWritable` (the USM users
 in this config carry no read-write authorization).
 
+## Live reconfigure (commit-time reconcile)
+
+The agent is created once at daemon startup and keeps serving on UDP/161.
+`UpdateConfig(cfg *config.SNMPConfig)` swaps the live authorization/identity
+config and rederives the USM v3 user table in place, so a commit that changes
+community authorization (`read-write` -> `read-only`, or a deleted community)
+or the v3 user set reaches the running agent without a restart — restarting
+would drop the UDP listener and interrupt in-flight polls. The daemon calls it
+from `applyConfigLocked` (guarded on a non-nil agent; enabling SNMP for the
+first time still requires a restart, like the other start-once subsystems).
+
+Concurrency: `cfg` and the derived `v3Users` are guarded by `cfgMu`
+(`sync.RWMutex`). The request-serving goroutine reads them through
+`snapshotCfg` / `snapshotV3User` / `hasV3Users` under `RLock`; `UpdateConfig`
+swaps both under `Lock`, so a request never observes a half-applied config
+(new community map with stale v3 users, or vice versa). `engineID` /
+`engineBoots` / `startTime` are the agent's stable identity and are never
+swapped. A `nil` cfg (the whole `snmp` stanza removed) disables the agent's
+authorization surface: every request is dropped because no community matches.
+
 ## Entry points
 
 - `Agent` — `agent.go`.

@@ -123,16 +123,25 @@ type IfData struct {
 
 // Agent is an SNMP v2c/v3 agent that serves the system MIB and ifTable.
 type Agent struct {
-	cfg         *config.SNMPConfig
 	conn        *net.UDPConn
 	startTime   time.Time
 	ifDataFn    func() []IfData // callback for live interface data
 	mu          sync.Mutex
 	stopped     bool
-	engineID    []byte               // SNMPv3 engine ID
-	engineBoots int                  // SNMPv3 engine boots counter
-	v3Users     map[string]*usmUser  // SNMPv3 USM users (keyed by name)
-	lastPacket  []byte               // raw packet for v3 auth verification
+	engineID    []byte // SNMPv3 engine ID (immutable after initEngine)
+	engineBoots int    // SNMPv3 engine boots counter (immutable after initEngine)
+	lastPacket  []byte // raw packet for v3 auth verification
+
+	// cfgMu guards the live authorization/identity configuration (cfg) and
+	// the derived USM user table (v3Users). The request-serving goroutine
+	// reads both under RLock; UpdateConfig swaps both under Lock so a commit
+	// that changes community authorization or v3 users takes effect on the
+	// running agent without dropping the UDP listener. Keeping this separate
+	// from mu (which guards conn/stopped/ifDataFn) avoids holding the
+	// listener lock across config reads on every request.
+	cfgMu   sync.RWMutex
+	cfg     *config.SNMPConfig  // authorization + sysContact/Location/Description
+	v3Users map[string]*usmUser // SNMPv3 USM users (keyed by name)
 }
 
 // NewAgent creates a new SNMP agent with the given configuration.
@@ -144,6 +153,51 @@ func NewAgent(cfg *config.SNMPConfig) *Agent {
 	a.initEngine()
 	a.initV3Users()
 	return a
+}
+
+// UpdateConfig atomically swaps the agent's live authorization/identity
+// configuration and rederives the USM v3 user table to match. It is the
+// commit-time reconcile entry point (called from the daemon's
+// applyConfigLocked) so that a config change to community authorization
+// (read-write -> read-only, or a deleted community) or to the v3 user set
+// reaches the running agent without a restart.
+//
+// In-place reconfigure is preferred over restart: restarting the agent would
+// tear down the UDP/161 listener and interrupt in-flight polls. The swap is
+// done under cfgMu.Lock so the request-serving goroutine (which reads cfg and
+// v3Users under cfgMu.RLock) always observes a consistent pair: it never sees
+// the new community map with the stale v3 users, or vice versa.
+//
+// engineID/engineBoots/startTime are intentionally NOT touched — they are the
+// agent's stable identity. The v3 user keys are re-localized against the
+// existing engineID, matching how initV3Users derived them at startup.
+func (a *Agent) UpdateConfig(cfg *config.SNMPConfig) {
+	v3 := a.deriveV3Users(cfg)
+	a.cfgMu.Lock()
+	a.cfg = cfg
+	a.v3Users = v3
+	a.cfgMu.Unlock()
+}
+
+// snapshotCfg returns the live config pointer under cfgMu.RLock.
+func (a *Agent) snapshotCfg() *config.SNMPConfig {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
+	return a.cfg
+}
+
+// snapshotV3User looks up a USM user by name under cfgMu.RLock.
+func (a *Agent) snapshotV3User(name string) *usmUser {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
+	return a.v3Users[name]
+}
+
+// hasV3Users reports whether any USM user is configured, under cfgMu.RLock.
+func (a *Agent) hasV3Users() bool {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
+	return len(a.v3Users) > 0
 }
 
 // initEngine generates a deterministic engine ID from the hostname.
@@ -261,7 +315,7 @@ func (a *Agent) handlePacket(data []byte) []byte {
 	case snmpVersion2c:
 		return a.handleV2cPacket(rest)
 	case snmpVersion3:
-		if len(a.v3Users) == 0 {
+		if !a.hasV3Users() {
 			slog.Debug("SNMP: v3 not configured")
 			return nil
 		}
@@ -463,10 +517,11 @@ func (a *Agent) handleGetBulk(community []byte, pduBody []byte) []byte {
 // nil if none matches. The returned struct carries the authorization level
 // (read-only / read-write) used to gate SET requests.
 func (a *Agent) getCommunity(community string) *config.SNMPCommunity {
-	if a.cfg == nil || a.cfg.Communities == nil {
+	cfg := a.snapshotCfg()
+	if cfg == nil || cfg.Communities == nil {
 		return nil
 	}
-	for _, c := range a.cfg.Communities {
+	for _, c := range cfg.Communities {
 		if c.Name == community {
 			return c
 		}
@@ -481,11 +536,12 @@ func (a *Agent) isValidCommunity(community string) bool {
 
 // getOIDValue returns the encoded value and BER tag for a given OID.
 func (a *Agent) getOIDValue(oid []int) ([]byte, byte) {
+	cfg := a.snapshotCfg()
 	// System MIB group
 	if oidEqual(oid, oidSysDescr) {
 		desc := "xpf stateful firewall"
-		if a.cfg != nil && a.cfg.Description != "" {
-			desc = a.cfg.Description
+		if cfg != nil && cfg.Description != "" {
+			desc = cfg.Description
 		}
 		return []byte(desc), tagOctetString
 	}
@@ -499,8 +555,8 @@ func (a *Agent) getOIDValue(oid []int) ([]byte, byte) {
 	}
 	if oidEqual(oid, oidSysContact) {
 		contact := ""
-		if a.cfg != nil {
-			contact = a.cfg.Contact
+		if cfg != nil {
+			contact = cfg.Contact
 		}
 		return []byte(contact), tagOctetString
 	}
@@ -513,8 +569,8 @@ func (a *Agent) getOIDValue(oid []int) ([]byte, byte) {
 	}
 	if oidEqual(oid, oidSysLocation) {
 		location := ""
-		if a.cfg != nil {
-			location = a.cfg.Location
+		if cfg != nil {
+			location = cfg.Location
 		}
 		return []byte(location), tagOctetString
 	}

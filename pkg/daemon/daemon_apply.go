@@ -1148,6 +1148,21 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 	// 16. Update flow traceoptions (trace file + filters)
 	d.updateFlowTrace(cfg)
 
+	// 16b. Reconcile the SNMP agent's live authorization/identity config
+	// (#2008 H17). The agent is created once at startup (daemon_run.go) and
+	// keeps serving on UDP/161; without this step a commit that flips a
+	// community read-write -> read-only, deletes a community, or changes the
+	// v3 user set would not reach the running agent until a daemon restart,
+	// leaving the SET access-control gate reading stale authorization. The
+	// swap is in-place (UpdateConfig holds the agent's cfgMu) so the UDP
+	// listener and in-flight polls are not interrupted. Guarded on a
+	// non-nil agent: if SNMP was not enabled at startup there is no running
+	// listener to reconcile (enabling SNMP for the first time still requires
+	// a restart, matching the other start-once subsystems).
+	if d.snmpAgent != nil {
+		d.snmpAgent.UpdateConfig(cfg.System.SNMP)
+	}
+
 	// 17. Update event-options policies (RPM-driven failover)
 	if d.eventEngine != nil {
 		d.eventEngine.Apply(cfg.EventOptions)

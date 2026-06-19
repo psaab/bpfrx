@@ -131,9 +131,9 @@ func (a *Agent) NotifyLinkUp(ifindex int, ifname string) {
 
 // sendLinkTraps builds and sends link traps to all configured trap group targets.
 func (a *Agent) sendLinkTraps(linkUp bool, ifindex int, ifname string) {
-	a.mu.Lock()
-	cfg := a.cfg
-	a.mu.Unlock()
+	// Read the live config under cfgMu — the same lock UpdateConfig swaps it
+	// under — so a commit-time reconcile cannot race trap delivery.
+	cfg := a.snapshotCfg()
 
 	if cfg == nil || len(cfg.TrapGroups) == 0 {
 		return
