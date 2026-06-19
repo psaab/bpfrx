@@ -81,7 +81,6 @@ mod ha;
 #[path = "icmp.rs"]
 mod icmp;
 mod icmp_embed;
-#[path = "mirror.rs"]
 mod mirror;
 #[path = "mpsc_inbox.rs"]
 mod mpsc_inbox;
