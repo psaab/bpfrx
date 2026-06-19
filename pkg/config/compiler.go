@@ -95,6 +95,20 @@ type compileOpts struct {
 	// SyncApply admission gate (V-1), not by this compile flag.
 	lenientDeviceMap bool
 
+	// lenientTCPMSSRange (#1979 Layer B Tier 3) downgrades the tcp-mss
+	// commit-time range gate (validateTCPMSSRanges) from a hard compile
+	// error to a cfg.Warnings entry. Set ONLY on the tolerant load /
+	// peer-sync paths (CompileConfigLenient / CompileConfigForNodeLenient):
+	// a persisted or peer-synced config carrying an out-of-range MSS value
+	// an OLDER binary accepted (before this gate existed) must still boot,
+	// not blackout the upgraded node — the dataplane coerces it safely
+	// (Layer A, flow.go coerceWireU16) and the operator's next strict commit
+	// rejects it loudly. Same doctrine as lenientVRRPTrackDuplicates. Like
+	// the other lenient gates this is an AST-level compile decision (the MSS
+	// value can live in two positions) and deliberately does NOT live in
+	// SchemaValidate (tcp-mss stays opaque there).
+	lenientTCPMSSRange bool
+
 	// lenientPolicyMatchAddress (#2008) downgrades the policy match-
 	// address validator (validatePolicyMatchAddressesStrict) from a hard
 	// compile error to a cfg.Warnings entry. The strict commit /
@@ -136,6 +150,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientVRRPTrackDuplicates:   true,
 		lenientDeviceMap:             true,
 		lenientPolicyMatchAddress:    true,
+		lenientTCPMSSRange:           true,
 	})
 }
 
@@ -202,6 +217,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientVRRPTrackDuplicates:   true,
 		lenientDeviceMap:             true,
 		lenientPolicyMatchAddress:    true,
+		lenientTCPMSSRange:           true,
 	})
 }
 
@@ -262,6 +278,20 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 
+	// #1979 Layer B Tier 3: tcp-mss range AST pre-walk. tcp-mss carries its
+	// MSS value in either the kind node's flat Keys[1] or a hierarchical
+	// `mss` child — a dual value-location the declarative SchemaValidate
+	// walker cannot express, so it stays opaque in setSchema and is
+	// range-checked here on the group-expanded tree (apply-groups-inherited
+	// values covered), BEFORE the snapshot builder's Layer-A coercion would
+	// see it. Strict (commit / commit-check): out-of-range hard-rejects.
+	// Lenient (load / peer-sync): warn + let Layer A coerce so an upgraded
+	// node loading a legacy out-of-range MSS still boots.
+	mssWarnings, err := validateTCPMSSRanges(tree.Children, "", opts.lenientTCPMSSRange)
+	if err != nil {
+		return nil, err
+	}
+
 	cfg := &Config{
 		Security: SecurityConfig{
 			Zones:  make(map[string]*ZoneConfig),
@@ -285,6 +315,7 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	}
 	cfg.Warnings = append(cfg.Warnings, ctrlCharWarnings...)
 	cfg.Warnings = append(cfg.Warnings, trackWarnings...)
+	cfg.Warnings = append(cfg.Warnings, mssWarnings...)
 
 	for _, node := range tree.Children {
 		switch node.Name() {

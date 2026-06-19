@@ -131,6 +131,19 @@ const MaxDurationMillis = int64(math.MaxInt64) / int64(time.Millisecond)
 // invert the damping behaviour).
 const MaxDurationSeconds = int64(math.MaxInt64) / int64(time.Second)
 
+// maxWireU16 / maxWireU32 are the inclusive ceilings for typed leaves
+// whose value lands in a Rust u16 / u32 wire field. #1979 Layer B uses
+// these so the commit-time range gate agrees EXACTLY with the build-time
+// coercion in pkg/dataplane/userspace/flow.go (Layer A, #1977): a value
+// Layer B accepts is one Layer A leaves unchanged, and a value Layer B
+// rejects is one Layer A would have coerced. (math.MaxUint16 /
+// math.MaxUint32 are untyped constants; naming them keeps the schema
+// aspect files import-free and the bound self-documenting.)
+const (
+	maxWireU16 = int64(math.MaxUint16)
+	maxWireU32 = int64(math.MaxUint32)
+)
+
 // ValidateIntegerMin returns a closure that accepts any bare integer
 // >= min — the "no upper bound" spelling for typed leaves whose runtime
 // consumes the full integer range. The representational maximum is

@@ -475,8 +475,17 @@ var schemaServices = &schemaNode{desc: "Services configuration", children: map[s
 	"flow-monitoring": {desc: "Flow export (NetFlow v9 / IPFIX) template configuration", children: map[string]*schemaNode{
 		"version9": {desc: "NetFlow version 9 export", children: map[string]*schemaNode{
 			"template": {desc: "NetFlow v9 flow record template", args: 1, placeholder: "<template-name>", children: map[string]*schemaNode{
-				"flow-active-timeout":   {desc: "Active flow export timeout in seconds (default 60)", args: 1, placeholder: "<seconds>", children: nil},
-				"flow-inactive-timeout": {desc: "Inactive flow export timeout in seconds (default 15)", args: 1, placeholder: "<seconds>", children: nil},
+				// #1979 Layer B (Tier 1): FlowActiveTimeout/InactiveTimeout
+				// reach the Rust u32 ActiveTimeout/InactiveTimeout wire fields
+				// via buildFlowExportSnapshot (Layer A caps <0->0, >u32max->
+				// u32max, flow.go coerceWireU32Timeout). Reject the out-of-
+				// range value at commit instead of silently coercing it.
+				"flow-active-timeout": {desc: "Active flow export timeout in seconds (default 60)", args: 1, placeholder: "<seconds>",
+					valueType: ValueInteger, valueDesc: "Active flow export timeout in seconds (0..4294967295)",
+					valueExamples: []string{"60"}, validator: ValidateInteger(0, maxWireU32), children: nil},
+				"flow-inactive-timeout": {desc: "Inactive flow export timeout in seconds (default 15)", args: 1, placeholder: "<seconds>",
+					valueType: ValueInteger, valueDesc: "Inactive flow export timeout in seconds (0..4294967295)",
+					valueExamples: []string{"15"}, validator: ValidateInteger(0, maxWireU32), children: nil},
 				"template-refresh-rate": {desc: "Interval between template re-exports", children: map[string]*schemaNode{
 					"seconds": {desc: "Template refresh interval in seconds (default 60)", args: 1, placeholder: "<seconds>", children: nil},
 				}},
@@ -484,8 +493,18 @@ var schemaServices = &schemaNode{desc: "Services configuration", children: map[s
 		}},
 		"version-ipfix": {desc: "IPFIX flow export", children: map[string]*schemaNode{
 			"template": {desc: "IPFIX flow record template", args: 1, placeholder: "<template-name>", children: map[string]*schemaNode{
-				"flow-active-timeout":   {desc: "Active flow export timeout in seconds (default 60)", args: 1, placeholder: "<seconds>", children: nil},
-				"flow-inactive-timeout": {desc: "Inactive flow export timeout in seconds (default 15)", args: 1, placeholder: "<seconds>", children: nil},
+				// #1979 Layer B (Tier 1, §4b): the IPFIX timeouts do NOT reach
+				// the wire (buildFlowExportSnapshot reads only fm.Version9,
+				// flow.go), so this is UX parity only — but typing them is the
+				// same one-line change and keeps the two template families
+				// consistent. The Layer-A-agreement property test EXCLUDES
+				// these (not wire-reaching); plain accept/reject covers them.
+				"flow-active-timeout": {desc: "Active flow export timeout in seconds (default 60)", args: 1, placeholder: "<seconds>",
+					valueType: ValueInteger, valueDesc: "Active flow export timeout in seconds (0..4294967295)",
+					valueExamples: []string{"60"}, validator: ValidateInteger(0, maxWireU32), children: nil},
+				"flow-inactive-timeout": {desc: "Inactive flow export timeout in seconds (default 15)", args: 1, placeholder: "<seconds>",
+					valueType: ValueInteger, valueDesc: "Inactive flow export timeout in seconds (0..4294967295)",
+					valueExamples: []string{"15"}, validator: ValidateInteger(0, maxWireU32), children: nil},
 				"template-refresh-rate": {desc: "Interval between template re-exports", children: map[string]*schemaNode{
 					"seconds": {desc: "Template refresh interval in seconds (default 60)", args: 1, placeholder: "<seconds>", children: nil},
 				}},
