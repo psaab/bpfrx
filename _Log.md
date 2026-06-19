@@ -6020,3 +6020,6 @@ top.
 - **Timestamp**: 2026-06-18
 - **Action**: Address Copilot r4 (2 code findings): INIT B-P3b refusal uses authoritative `prev` (drops the error-discarding mustReadCurrentVersion which could skip the guard on a transient unreadable current → wedge); removed now-dead mustReadCurrentVersion. ResolveCurrent rejects a current-gen symlink target with path components (../<genid> escape) before base-naming. Added path-escape test.
 - **File(s)**: pkg/upgrade/cutover.go, pkg/upgrade/runner.go, pkg/upgrade/stagedgen/stagedgen.go, pkg/upgrade/stagedgen/stagedgen_test.go
+- **Timestamp**: 2026-06-18
+- **Action**: Address Codex r5 minor (comment-only): GenID doc comment no longer says "monotonic" — wall-clock UnixNano, GC ordering hint, correctness independent of genid order.
+- **File(s)**: pkg/upgrade/stagedgen/stagedgen.go

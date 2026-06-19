@@ -116,12 +116,16 @@ func (c *Config) withDefaults() {
 	}
 }
 
-// GenID returns a fresh generation identifier: a monotonic nanosecond
-// timestamp (zero-padded so lexicographic order matches chronological order)
-// joined with a random suffix. The timestamp keeps mtime-independent ordering
-// stable; the random suffix makes a same-version reinstall (or two publishes
-// in the same nanosecond) yield DISTINCT generations (plan B-P5). The result
-// is a safe single path segment (lowercase hex + a single '-').
+// GenID returns a fresh generation identifier: a zero-padded wall-clock
+// nanosecond timestamp (time.Now().UnixNano(), so lexicographic order USUALLY
+// matches chronological order) joined with a random suffix. The timestamp is
+// NOT strictly monotonic — an NTP step can move the wall clock backward — so
+// it is only a generation key + a stable, mtime-independent GC ordering hint;
+// correctness never depends on genid ordering (GC protects current-gen and
+// journal-referenced generations explicitly). The random suffix makes a
+// same-version reinstall (or two publishes in the same nanosecond) yield
+// DISTINCT generations (plan B-P5). The result is a safe single path segment
+// (lowercase hex + a single '-').
 func GenID() string {
 	var b [8]byte
 	// crypto/rand never fails on Linux; if it ever did, fall back to a
