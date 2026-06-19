@@ -459,7 +459,16 @@ var schemaServices = &schemaNode{desc: "Services configuration", children: map[s
 
 var schemaSNMP = &schemaNode{desc: "SNMP configuration", children: map[string]*schemaNode{
 	"community": {desc: "SNMP community", args: 1, placeholder: "<community-name>", children: map[string]*schemaNode{
-		"authorization": {desc: "Authorization level", args: 1, placeholder: "<level>", children: nil},
+		"authorization": {
+			desc:          "Authorization level",
+			args:          1,
+			placeholder:   "<level>",
+			valueType:     ValueEnumOf,
+			valueDesc:     "Access level granted to the community (read-only | read-write)",
+			valueExamples: []string{"read-only", "read-write"},
+			validator:     ValidateEnum([]string{"read-only", "read-write"}),
+			children:      nil,
+		},
 	}},
 	"trap-group": {desc: "Trap group", args: 1, placeholder: "<group-name>", children: nil},
 	"v3": {desc: "SNMPv3", children: map[string]*schemaNode{

@@ -180,6 +180,16 @@ var systemLeafMatrix = []systemLeafCase{
 		accept:   []string{"0", "10"},
 		reject:   []string{"-1", "asd", ""},
 	},
+	{
+		// #2008 H17: only read-only / read-write are honored at runtime;
+		// any other value silently defaulted to read-only before the enum
+		// gate, masking operator typos like "read-wrote".
+		name:     "snmp-community-authorization",
+		leaf:     "authorization",
+		template: "set snmp community public authorization %s",
+		accept:   []string{"read-only", "read-write"},
+		reject:   []string{"read-wrote", "rw", "full", "asd", ""},
+	},
 }
 
 func TestSchemaValidate_SystemServices_Matrix(t *testing.T) {

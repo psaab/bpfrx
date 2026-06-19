@@ -24,13 +24,16 @@ const (
 	pduGetRequest     = 0xa0
 	pduGetNextRequest = 0xa1
 	pduGetResponse    = 0xa2
+	pduSetRequest     = 0xa3
 	pduGetBulkRequest = 0xa5
 
-	// SNMP error codes.
-	errNoError    = 0
-	errTooBig     = 1
-	errNoSuchName = 2
-	errGenErr     = 5
+	// SNMP error codes (RFC 3416 error-status values).
+	errNoError     = 0
+	errTooBig      = 1
+	errNoSuchName  = 2
+	errGenErr      = 5
+	errNoAccess    = 6
+	errNotWritable = 17
 
 	// Implicit tags for exception values (context-specific, primitive).
 	tagNoSuchObject   = 0x80
@@ -120,16 +123,25 @@ type IfData struct {
 
 // Agent is an SNMP v2c/v3 agent that serves the system MIB and ifTable.
 type Agent struct {
-	cfg         *config.SNMPConfig
 	conn        *net.UDPConn
 	startTime   time.Time
 	ifDataFn    func() []IfData // callback for live interface data
 	mu          sync.Mutex
 	stopped     bool
-	engineID    []byte               // SNMPv3 engine ID
-	engineBoots int                  // SNMPv3 engine boots counter
-	v3Users     map[string]*usmUser  // SNMPv3 USM users (keyed by name)
-	lastPacket  []byte               // raw packet for v3 auth verification
+	engineID    []byte // SNMPv3 engine ID (immutable after initEngine)
+	engineBoots int    // SNMPv3 engine boots counter (immutable after initEngine)
+	lastPacket  []byte // raw packet for v3 auth verification
+
+	// cfgMu guards the live authorization/identity configuration (cfg) and
+	// the derived USM user table (v3Users). The request-serving goroutine
+	// reads both under RLock; UpdateConfig swaps both under Lock so a commit
+	// that changes community authorization or v3 users takes effect on the
+	// running agent without dropping the UDP listener. Keeping this separate
+	// from mu (which guards conn/stopped/ifDataFn) avoids holding the
+	// listener lock across config reads on every request.
+	cfgMu   sync.RWMutex
+	cfg     *config.SNMPConfig  // authorization + sysContact/Location/Description
+	v3Users map[string]*usmUser // SNMPv3 USM users (keyed by name)
 }
 
 // NewAgent creates a new SNMP agent with the given configuration.
@@ -141,6 +153,51 @@ func NewAgent(cfg *config.SNMPConfig) *Agent {
 	a.initEngine()
 	a.initV3Users()
 	return a
+}
+
+// UpdateConfig atomically swaps the agent's live authorization/identity
+// configuration and rederives the USM v3 user table to match. It is the
+// commit-time reconcile entry point (called from the daemon's
+// applyConfigLocked) so that a config change to community authorization
+// (read-write -> read-only, or a deleted community) or to the v3 user set
+// reaches the running agent without a restart.
+//
+// In-place reconfigure is preferred over restart: restarting the agent would
+// tear down the UDP/161 listener and interrupt in-flight polls. The swap is
+// done under cfgMu.Lock so the request-serving goroutine (which reads cfg and
+// v3Users under cfgMu.RLock) always observes a consistent pair: it never sees
+// the new community map with the stale v3 users, or vice versa.
+//
+// engineID/engineBoots/startTime are intentionally NOT touched — they are the
+// agent's stable identity. The v3 user keys are re-localized against the
+// existing engineID, matching how initV3Users derived them at startup.
+func (a *Agent) UpdateConfig(cfg *config.SNMPConfig) {
+	v3 := a.deriveV3Users(cfg)
+	a.cfgMu.Lock()
+	a.cfg = cfg
+	a.v3Users = v3
+	a.cfgMu.Unlock()
+}
+
+// snapshotCfg returns the live config pointer under cfgMu.RLock.
+func (a *Agent) snapshotCfg() *config.SNMPConfig {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
+	return a.cfg
+}
+
+// snapshotV3User looks up a USM user by name under cfgMu.RLock.
+func (a *Agent) snapshotV3User(name string) *usmUser {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
+	return a.v3Users[name]
+}
+
+// hasV3Users reports whether any USM user is configured, under cfgMu.RLock.
+func (a *Agent) hasV3Users() bool {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
+	return len(a.v3Users) > 0
 }
 
 // initEngine generates a deterministic engine ID from the hostname.
@@ -258,7 +315,7 @@ func (a *Agent) handlePacket(data []byte) []byte {
 	case snmpVersion2c:
 		return a.handleV2cPacket(rest)
 	case snmpVersion3:
-		if len(a.v3Users) == 0 {
+		if !a.hasV3Users() {
 			slog.Debug("SNMP: v3 not configured")
 			return nil
 		}
@@ -278,8 +335,9 @@ func (a *Agent) handleV2cPacket(rest []byte) []byte {
 		return nil
 	}
 
-	// Verify community string.
-	if !a.isValidCommunity(string(community)) {
+	// Verify community string and resolve its authorization level.
+	comm := a.getCommunity(string(community))
+	if comm == nil {
 		slog.Debug("SNMP: invalid community", "community", string(community))
 		return nil
 	}
@@ -298,10 +356,82 @@ func (a *Agent) handleV2cPacket(rest []byte) []byte {
 		return a.handleGetNext(community, pduBody)
 	case pduGetBulkRequest:
 		return a.handleGetBulk(community, pduBody)
+	case pduSetRequest:
+		return a.handleSet(community, comm, pduBody)
 	default:
 		slog.Debug("SNMP: unsupported PDU type", "type", pduTag)
 		return nil
 	}
+}
+
+// communityCanWrite reports whether the community is authorized for SET
+// (write) operations. Only "read-write" grants write access; the compiler
+// defaults an unspecified authorization to "read-only".
+func communityCanWrite(c *config.SNMPCommunity) bool {
+	return c != nil && c.Authorization == "read-write"
+}
+
+// SETAuthorized reports whether the named community would pass the SET
+// access-control gate against the agent's CURRENTLY LIVE config — i.e. it
+// resolves the community from the same snapshotCfg() the request-serving path
+// uses (getCommunity) and applies the same communityCanWrite predicate
+// handleSet enforces. An unknown community returns false (handleSet drops it).
+//
+// This is a read-only observation of the live authorization gate, exported so
+// the daemon-package reconcile wiring test can assert that a committed
+// read-write -> read-only downgrade actually reached the running agent via
+// applyConfigLocked -> UpdateConfig. It takes no listener lock (getCommunity
+// reads cfg under cfgMu.RLock), so it is safe to call while the agent serves.
+func (a *Agent) SETAuthorized(community string) bool {
+	return communityCanWrite(a.getCommunity(community))
+}
+
+// handleSet processes a SET request (RFC 3416 pduSetRequest, 0xa3).
+//
+// Access control comes first: a community without "read-write" authorization
+// is denied with noAccess before any write is attempted. This is the
+// security boundary the operator configures with
+// `set snmp community <name> authorization read-write` — without this gate
+// the agent would honor SET from any valid community regardless of the
+// configured authorization (a Junos divergence).
+//
+// A read-write community passes the authorization gate, but the agent serves
+// only read-only MIB objects (system group, ifTable, ifXTable), so the write
+// itself is refused per-varbind with notWritable. No served object is
+// mutable, so a successful SET is never produced here — but the read-only vs
+// read-write distinction is enforced and observable in the error-status.
+func (a *Agent) handleSet(community []byte, comm *config.SNMPCommunity, pduBody []byte) []byte {
+	requestID, _, _, oids, err := decodePDUFields(pduBody)
+	if err != nil {
+		slog.Debug("SNMP: failed to decode SET PDU", "err", err)
+		return nil
+	}
+
+	// Echo the requested OIDs back in the response varbind list (with null
+	// values) so the response is well-formed regardless of outcome.
+	var varbinds []varbind
+	for _, oid := range oids {
+		varbinds = append(varbinds, varbind{oid: oid, tag: tagNull, value: nil})
+	}
+
+	if !communityCanWrite(comm) {
+		// Read-only (or unspecified) community: deny write access.
+		slog.Debug("SNMP: SET denied, community not authorized read-write",
+			"community", string(community), "authorization", comm.Authorization)
+		errIdx := 0
+		if len(oids) > 0 {
+			errIdx = 1
+		}
+		return a.buildResponse(community, requestID, errNoAccess, errIdx, varbinds)
+	}
+
+	// Authorized for write, but the agent exposes no writable objects. Refuse
+	// the first varbind with notWritable per RFC 3416.
+	errIdx := 0
+	if len(oids) > 0 {
+		errIdx = 1
+	}
+	return a.buildResponse(community, requestID, errNotWritable, errIdx, varbinds)
 }
 
 // handleGet processes a GET request.
@@ -398,26 +528,35 @@ func (a *Agent) handleGetBulk(community []byte, pduBody []byte) []byte {
 	return a.buildResponse(community, requestID, errNoError, 0, varbinds)
 }
 
-// isValidCommunity checks if the given community string is configured.
-func (a *Agent) isValidCommunity(community string) bool {
-	if a.cfg == nil || a.cfg.Communities == nil {
-		return false
+// getCommunity returns the configured community matching the given string, or
+// nil if none matches. The returned struct carries the authorization level
+// (read-only / read-write) used to gate SET requests.
+func (a *Agent) getCommunity(community string) *config.SNMPCommunity {
+	cfg := a.snapshotCfg()
+	if cfg == nil || cfg.Communities == nil {
+		return nil
 	}
-	for _, c := range a.cfg.Communities {
+	for _, c := range cfg.Communities {
 		if c.Name == community {
-			return true
+			return c
 		}
 	}
-	return false
+	return nil
+}
+
+// isValidCommunity checks if the given community string is configured.
+func (a *Agent) isValidCommunity(community string) bool {
+	return a.getCommunity(community) != nil
 }
 
 // getOIDValue returns the encoded value and BER tag for a given OID.
 func (a *Agent) getOIDValue(oid []int) ([]byte, byte) {
+	cfg := a.snapshotCfg()
 	// System MIB group
 	if oidEqual(oid, oidSysDescr) {
 		desc := "xpf stateful firewall"
-		if a.cfg != nil && a.cfg.Description != "" {
-			desc = a.cfg.Description
+		if cfg != nil && cfg.Description != "" {
+			desc = cfg.Description
 		}
 		return []byte(desc), tagOctetString
 	}
@@ -431,8 +570,8 @@ func (a *Agent) getOIDValue(oid []int) ([]byte, byte) {
 	}
 	if oidEqual(oid, oidSysContact) {
 		contact := ""
-		if a.cfg != nil {
-			contact = a.cfg.Contact
+		if cfg != nil {
+			contact = cfg.Contact
 		}
 		return []byte(contact), tagOctetString
 	}
@@ -445,8 +584,8 @@ func (a *Agent) getOIDValue(oid []int) ([]byte, byte) {
 	}
 	if oidEqual(oid, oidSysLocation) {
 		location := ""
-		if a.cfg != nil {
-			location = a.cfg.Location
+		if cfg != nil {
+			location = cfg.Location
 		}
 		return []byte(location), tagOctetString
 	}
