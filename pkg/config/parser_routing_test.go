@@ -1,6 +1,7 @@
 package config
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -3299,5 +3300,84 @@ func TestWireGuardTunnelSetSyntax(t *testing.T) {
 	}
 	if tc.WgKeepaliveSecs != 25 {
 		t.Errorf("WgKeepaliveSecs = %d, want 25", tc.WgKeepaliveSecs)
+	}
+}
+
+// TestPolicyTermMultiProtocolFlatSet exercises the flat-set / inline-keys
+// compile path: "from protocol [ bgp ospf static ]" must keep ALL listed
+// protocols, not just the first. Regression for #2008 H18 — the old scalar
+// FromProtocol field silently discarded every protocol after the first.
+func TestPolicyTermMultiProtocolFlatSet(t *testing.T) {
+	tree := &ConfigTree{}
+	cmds := []string{
+		"set policy-options policy-statement EXPORT-ALL term t1 from protocol [ bgp ospf static ]",
+		"set policy-options policy-statement EXPORT-ALL term t1 then accept",
+	}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	ps := cfg.PolicyOptions.PolicyStatements["EXPORT-ALL"]
+	if ps == nil {
+		t.Fatal("EXPORT-ALL policy-statement not found")
+	}
+	if len(ps.Terms) != 1 {
+		t.Fatalf("got %d terms, want 1", len(ps.Terms))
+	}
+	got := ps.Terms[0].FromProtocols
+	want := []string{"bgp", "ospf", "static"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("FromProtocols (flat-set) = %v, want %v", got, want)
+	}
+	if ps.Terms[0].Action != "accept" {
+		t.Errorf("action = %q, want accept", ps.Terms[0].Action)
+	}
+}
+
+// TestPolicyTermMultiProtocolHierarchical exercises the hierarchical compile
+// path for the same multi-protocol "from protocol [ ... ]" list. Both the
+// flat-set and hierarchical walks must collect every protocol (#2008 H18).
+func TestPolicyTermMultiProtocolHierarchical(t *testing.T) {
+	input := `
+policy-options {
+    policy-statement EXPORT-ALL {
+        term t1 {
+            from {
+                protocol [ bgp ospf static ];
+            }
+            then accept;
+        }
+    }
+}
+`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("Parse: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	ps := cfg.PolicyOptions.PolicyStatements["EXPORT-ALL"]
+	if ps == nil {
+		t.Fatal("EXPORT-ALL policy-statement not found")
+	}
+	if len(ps.Terms) != 1 {
+		t.Fatalf("got %d terms, want 1", len(ps.Terms))
+	}
+	got := ps.Terms[0].FromProtocols
+	want := []string{"bgp", "ospf", "static"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("FromProtocols (hierarchical) = %v, want %v", got, want)
 	}
 }

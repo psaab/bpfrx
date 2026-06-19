@@ -243,8 +243,10 @@ func (s *Server) showPolicyOptions(cfg *config.Config, buf *strings.Builder) {
 			buf.WriteString("\n")
 			for _, t := range ps.Terms {
 				fmt.Fprintf(buf, "    term %s:\n", t.Name)
-				if t.FromProtocol != "" {
-					fmt.Fprintf(buf, "      from protocol %s\n", t.FromProtocol)
+				if len(t.FromProtocols) == 1 {
+					fmt.Fprintf(buf, "      from protocol %s\n", t.FromProtocols[0])
+				} else if len(t.FromProtocols) > 1 {
+					fmt.Fprintf(buf, "      from protocol [ %s ]\n", strings.Join(t.FromProtocols, " "))
 				}
 				if t.PrefixList != "" {
 					fmt.Fprintf(buf, "      from prefix-list %s\n", t.PrefixList)

@@ -72,8 +72,7 @@ func (m *Manager) resolveRedistribute(export string, po *config.PolicyOptionsCon
 		if ps, ok := po.PolicyStatements[export]; ok {
 			protocols := make(map[string]bool)
 			for _, term := range ps.Terms {
-				if term.FromProtocol != "" {
-					proto := term.FromProtocol
+				for _, proto := range term.FromProtocols {
 					if proto == "direct" {
 						proto = "connected"
 					}
@@ -638,8 +637,11 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 				fmt.Fprintf(&b, " match ip address prefix-list %s\n", term.PrefixList)
 			}
 
-			if term.FromProtocol != "" {
-				proto := term.FromProtocol
+			// Junos "from protocol [ bgp ospf static ]" matches ANY listed
+			// protocol. FRR's "match source-protocol" only accepts a single
+			// protocol per line, but repeated lines within one route-map entry
+			// are OR'd, so render one line per protocol.
+			for _, proto := range term.FromProtocols {
 				if proto == "direct" {
 					proto = "connected"
 				}

@@ -783,8 +783,10 @@ func (c *CLI) showPolicyOptions() error {
 			fmt.Println()
 			for _, t := range ps.Terms {
 				fmt.Printf("    term %s:\n", t.Name)
-				if t.FromProtocol != "" {
-					fmt.Printf("      from protocol %s\n", t.FromProtocol)
+				if len(t.FromProtocols) == 1 {
+					fmt.Printf("      from protocol %s\n", t.FromProtocols[0])
+				} else if len(t.FromProtocols) > 1 {
+					fmt.Printf("      from protocol [ %s ]\n", strings.Join(t.FromProtocols, " "))
 				}
 				if t.PrefixList != "" {
 					fmt.Printf("      from prefix-list %s\n", t.PrefixList)

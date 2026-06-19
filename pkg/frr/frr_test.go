@@ -703,8 +703,8 @@ func TestGeneratePolicyOptions(t *testing.T) {
 				Name: "export-connected",
 				Terms: []*config.PolicyTerm{
 					{
-						Name:         "t1",
-						FromProtocol: "direct",
+						Name:          "t1",
+						FromProtocols: []string{"direct"},
 						RouteFilters: []*config.RouteFilter{
 							{Prefix: "10.0.0.0/8", MatchType: "exact"},
 						},
@@ -732,6 +732,49 @@ func TestGeneratePolicyOptions(t *testing.T) {
 	}
 }
 
+// TestGeneratePolicyOptionsMultiProtocol verifies that a term matching
+// multiple protocols ("from protocol [ bgp ospf static ]") renders a
+// "match source-protocol" line for EVERY protocol. Regression for #2008
+// H18 — the old single-FromProtocol render emitted only one match line, so
+// a multi-protocol policy silently matched only the first protocol.
+func TestGeneratePolicyOptionsMultiProtocol(t *testing.T) {
+	m := &Manager{frrConf: "/dev/null"}
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"EXPORT-ALL": {
+				Name: "EXPORT-ALL",
+				Terms: []*config.PolicyTerm{
+					{
+						Name:          "t1",
+						FromProtocols: []string{"bgp", "ospf", "direct"},
+						Action:        "accept",
+					},
+				},
+				DefaultAction: "reject",
+			},
+		},
+	}
+
+	got := m.generatePolicyOptions(po)
+
+	// "direct" maps to FRR "connected"; all three must render.
+	checks := []string{
+		"route-map EXPORT-ALL permit 10",
+		"match source-protocol bgp",
+		"match source-protocol ospf",
+		"match source-protocol connected",
+	}
+	for _, want := range checks {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+	// Sanity: exactly three match lines (no extra, none dropped).
+	if n := strings.Count(got, "match source-protocol "); n != 3 {
+		t.Errorf("got %d match source-protocol lines, want 3:\n%s", n, got)
+	}
+}
+
 func TestGeneratePolicyOptionsRouteMapAttributes(t *testing.T) {
 	m := &Manager{frrConf: "/dev/null"}
 	po := &config.PolicyOptionsConfig{
@@ -741,7 +784,7 @@ func TestGeneratePolicyOptionsRouteMapAttributes(t *testing.T) {
 				Terms: []*config.PolicyTerm{
 					{
 						Name:            "t1",
-						FromProtocol:    "bgp",
+						FromProtocols:   []string{"bgp"},
 						Action:          "accept",
 						LocalPreference: 200,
 						Metric:          100,
@@ -1837,7 +1880,7 @@ func TestResolveRedistribute_PolicyStatement(t *testing.T) {
 			"export-connected": {
 				Name: "export-connected",
 				Terms: []*config.PolicyTerm{
-					{Name: "t1", FromProtocol: "direct", Action: "accept", PrefixList: "internal"},
+					{Name: "t1", FromProtocols: []string{"direct"}, Action: "accept", PrefixList: "internal"},
 				},
 			},
 		},
@@ -1856,8 +1899,8 @@ func TestResolveRedistribute_MultiProtocol(t *testing.T) {
 			"export-all": {
 				Name: "export-all",
 				Terms: []*config.PolicyTerm{
-					{Name: "connected", FromProtocol: "direct", Action: "accept"},
-					{Name: "static", FromProtocol: "static", Action: "accept"},
+					{Name: "connected", FromProtocols: []string{"direct"}, Action: "accept"},
+					{Name: "static", FromProtocols: []string{"static"}, Action: "accept"},
 				},
 			},
 		},
@@ -1882,7 +1925,7 @@ func TestGenerateProtocols_OSPFExportRouteMap(t *testing.T) {
 			"export-direct": {
 				Name: "export-direct",
 				Terms: []*config.PolicyTerm{
-					{Name: "t1", FromProtocol: "direct", PrefixList: "trusted-nets", Action: "accept"},
+					{Name: "t1", FromProtocols: []string{"direct"}, PrefixList: "trusted-nets", Action: "accept"},
 				},
 				DefaultAction: "reject",
 			},
@@ -1912,8 +1955,8 @@ func TestGenerateProtocols_BGPExportRouteMap(t *testing.T) {
 			"bgp-export": {
 				Name: "bgp-export",
 				Terms: []*config.PolicyTerm{
-					{Name: "connected", FromProtocol: "direct", Action: "accept"},
-					{Name: "static", FromProtocol: "static", Action: "accept"},
+					{Name: "connected", FromProtocols: []string{"direct"}, Action: "accept"},
+					{Name: "static", FromProtocols: []string{"static"}, Action: "accept"},
 				},
 			},
 		},
@@ -1942,7 +1985,7 @@ func TestGenerateProtocols_MixedBareAndRouteMap(t *testing.T) {
 			"filter-connected": {
 				Name: "filter-connected",
 				Terms: []*config.PolicyTerm{
-					{Name: "t1", FromProtocol: "direct", Action: "accept"},
+					{Name: "t1", FromProtocols: []string{"direct"}, Action: "accept"},
 				},
 			},
 		},
@@ -2069,7 +2112,7 @@ func TestGeneratePolicyOptionsCommunityListAndMetricType(t *testing.T) {
 				Terms: []*config.PolicyTerm{
 					{
 						Name:          "t1",
-						FromProtocol:  "direct",
+						FromProtocols: []string{"direct"},
 						FromCommunity: "MY-COMM",
 						Action:        "accept",
 						MetricType:    1,
@@ -2276,8 +2319,8 @@ func TestNextHopPeerAddress(t *testing.T) {
 				Name: "to-vpn-mesh",
 				Terms: []*config.PolicyTerm{
 					{
-						Name:         "v6",
-						FromProtocol: "direct",
+						Name:          "v6",
+						FromProtocols: []string{"direct"},
 						RouteFilters: []*config.RouteFilter{
 							{Prefix: "2001:559:8585::/48", MatchType: "exact"},
 						},
@@ -2285,8 +2328,8 @@ func TestNextHopPeerAddress(t *testing.T) {
 						Action:  "accept",
 					},
 					{
-						Name:         "v4",
-						FromProtocol: "direct",
+						Name:          "v4",
+						FromProtocols: []string{"direct"},
 						RouteFilters: []*config.RouteFilter{
 							{Prefix: "172.16.0.0/20", MatchType: "exact"},
 						},
@@ -2344,8 +2387,8 @@ func TestRouteFilterExactFRR(t *testing.T) {
 				Name: "to-firewall",
 				Terms: []*config.PolicyTerm{
 					{
-						Name:         "default_v4",
-						FromProtocol: "direct",
+						Name:          "default_v4",
+						FromProtocols: []string{"direct"},
 						RouteFilters: []*config.RouteFilter{
 							{Prefix: "192.168.50.0/24", MatchType: "exact"},
 							{Prefix: "192.168.99.0/24", MatchType: "exact"},

@@ -3514,8 +3514,8 @@ func TestMetricTypeAndCommunityListSetSyntax(t *testing.T) {
 		t.Fatalf("got %d terms, want 2", len(ps.Terms))
 	}
 	t1 := ps.Terms[0]
-	if t1.FromProtocol != "direct" {
-		t.Errorf("t1 from protocol = %q, want direct", t1.FromProtocol)
+	if len(t1.FromProtocols) != 1 || t1.FromProtocols[0] != "direct" {
+		t.Errorf("t1 from protocol = %v, want [direct]", t1.FromProtocols)
 	}
 	if t1.FromCommunity != "MY-COMM" {
 		t.Errorf("t1 from community = %q, want MY-COMM", t1.FromCommunity)
