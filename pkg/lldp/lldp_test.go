@@ -70,6 +70,11 @@ func TestBuildFrame_FailsClosedOnOverlengthIdentity(t *testing.T) {
 	if _, err := BuildFrame(mac, "trust0", 120, "xpf", huge); err == nil {
 		t.Fatal("BuildFrame must fail closed on an overlength system-description TLV")
 	}
+	// An overlength port name must also fail closed (not panic), since portName
+	// is caller-supplied and BuildFrame now routes it through EncodeTLV (#2036).
+	if _, err := BuildFrame(mac, huge, 120, "xpf", "ok"); err == nil {
+		t.Fatal("BuildFrame must fail closed on an overlength port name TLV")
+	}
 	// A bounded frame still builds cleanly.
 	if _, err := BuildFrame(mac, "trust0", 120, "xpf", "ok"); err != nil {
 		t.Fatalf("bounded frame should build, got: %v", err)

@@ -323,9 +323,15 @@ func (m *Manager) expiryLoop(ctx context.Context) {
 // advertisement (#2036).
 func BuildFrame(srcMAC net.HardwareAddr, portName string, ttl int, sysName, sysDesc string) ([]byte, error) {
 	var tlvs []byte
-	// Fixed / OS-bounded TLVs (chassis ID = MAC, port ID = ifname, TTL, End).
+	// Chassis ID (MAC = 7 bytes) and TTL (2 bytes) are compile-time bounded.
 	tlvs = append(tlvs, mustEncodeTLV(tlvChassisID, encodeChassisID(srcMAC))...)
-	tlvs = append(tlvs, mustEncodeTLV(tlvPortID, encodePortID(portName))...)
+	// Port ID carries portName which is caller-supplied: propagate error rather
+	// than panic so BuildFrame stays consistently fail-closed (#2036).
+	portIDEnc, err := EncodeTLV(tlvPortID, encodePortID(portName))
+	if err != nil {
+		return nil, err
+	}
+	tlvs = append(tlvs, portIDEnc...)
 	tlvs = append(tlvs, mustEncodeTLV(tlvTTL, encodeTTL(ttl))...)
 	// Variable-length identity TLVs: fail closed on overlength rather than
 	// shipping a frame whose wrapped 9-bit length desynchronizes the receiver.
@@ -387,10 +393,10 @@ func EncodeTLV(tlvType int, value []byte) ([]byte, error) {
 }
 
 // mustEncodeTLV is EncodeTLV for callers whose value length is bounded at
-// compile time (the End TLV) or by a hard OS limit (chassis ID = MAC, port ID =
-// interface name, TTL = 2 bytes) and so can never exceed the 9-bit limit. It
-// panics if that invariant is ever violated rather than returning a malformed
-// frame.
+// compile time (the End TLV) or by a hard OS/protocol limit (chassis ID = MAC
+// = 7 bytes, TTL = 2 bytes) and so can never exceed the 9-bit limit. It panics
+// if that invariant is ever violated rather than returning a malformed frame.
+// Caller-supplied strings such as port ID must use EncodeTLV directly.
 func mustEncodeTLV(tlvType int, value []byte) []byte {
 	out, err := EncodeTLV(tlvType, value)
 	if err != nil {
