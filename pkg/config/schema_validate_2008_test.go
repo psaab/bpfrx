@@ -152,6 +152,62 @@ func TestSchema2008_IPsecProposalDHGroup_RejectsBad(t *testing.T) {
 	}
 }
 
+// Phase-2 IPsec dh-group must be a PLAIN positive integer: the compiler
+// (compiler_ipsec.go compileIPsec) uses a bare strconv.Atoi and does NOT
+// strip the "group" prefix, so "group14" would compile to DHGroup=0 and
+// silently drop the PFS/modp term. The schema must reject the group<N>
+// spelling for Phase-2 to stay compiler-faithful — unlike IKE Phase-1
+// below, which DOES strip the prefix and accepts both spellings.
+func TestSchema2008_IPsecProposalDHGroup_RejectsGroupSpelling(t *testing.T) {
+	err := schemaCheck(t, `security {
+    ipsec {
+        proposal esp1 {
+            protocol esp;
+            dh-group group14;
+        }
+    }
+}`)
+	if err == nil {
+		t.Fatal("expected error for ipsec dh-group group14 (Phase-2 compiler does not strip group prefix), got nil")
+	}
+	if !strings.Contains(err.Error(), "dh-group") {
+		t.Fatalf("error should reference dh-group: %v", err)
+	}
+}
+
+func TestSchema2008_IPsecProposalDHGroup_RejectsZero(t *testing.T) {
+	err := schemaCheck(t, `security {
+    ipsec {
+        proposal esp1 {
+            protocol esp;
+            dh-group 0;
+        }
+    }
+}`)
+	if err == nil {
+		t.Fatal("expected error for ipsec dh-group 0, got nil")
+	}
+	if !strings.Contains(err.Error(), "dh-group") {
+		t.Fatalf("error should reference dh-group: %v", err)
+	}
+}
+
+// Conversely, the IKE Phase-1 dh-group DOES accept the group<N> spelling
+// because compiler_ipsec.go compileIKE strips the prefix before Atoi.
+// This locks the deliberate IKE-vs-IPsec asymmetry so a future refactor
+// cannot silently flip one of the two validators.
+func TestSchema2008_IKEProposalDHGroup_AcceptsGroupSpelling(t *testing.T) {
+	if err := schemaCheck(t, `security {
+    ike {
+        proposal p1 {
+            dh-group group14;
+        }
+    }
+}`); err != nil {
+		t.Fatalf("IKE dh-group group14 should be accepted (compiler strips prefix): %v", err)
+	}
+}
+
 func TestSchema2008_IPsecProposal_AcceptsValid(t *testing.T) {
 	if err := schemaCheck(t, `security {
     ipsec {
@@ -230,6 +286,47 @@ func TestSchema2008_RAAdvertisementInterval_AcceptsValid(t *testing.T) {
     }
 }`); err != nil {
 		t.Fatalf("unexpected error for valid router-advertisement: %v", err)
+	}
+}
+
+// Prefix valid-lifetime/preferred-lifetime are now typed as non-negative
+// integers. The compiler used a bare strconv.Atoi (garbage silently became
+// 0 = SLAAC default), so a misspelled lifetime must now fail at commit.
+func TestSchema2008_RAPrefixLifetime_RejectsBad(t *testing.T) {
+	for _, leaf := range []string{"valid-lifetime", "preferred-lifetime"} {
+		err := schemaCheck(t, `protocols {
+    router-advertisement {
+        interface ge-0-0-0 {
+            prefix 2001:db8::/64 {
+                `+leaf+` abc;
+            }
+        }
+    }
+}`)
+		if err == nil {
+			t.Fatalf("expected error for prefix %s abc, got nil", leaf)
+		}
+		if !strings.Contains(err.Error(), leaf) {
+			t.Fatalf("error should reference %s: %v", leaf, err)
+		}
+	}
+}
+
+// 0 must still be accepted: it is the explicit "use the SLAAC default"
+// sentinel the compiler/sender honor (ValidateIntegerMin(0), not Min(1)).
+func TestSchema2008_RAPrefixLifetime_AcceptsZero(t *testing.T) {
+	if err := schemaCheck(t, `protocols {
+    router-advertisement {
+        interface ge-0-0-0 {
+            prefix 2001:db8::/64 {
+                autonomous;
+                valid-lifetime 0;
+                preferred-lifetime 0;
+            }
+        }
+    }
+}`); err != nil {
+		t.Fatalf("prefix lifetimes of 0 (= SLAAC default) should be accepted: %v", err)
 	}
 }
 

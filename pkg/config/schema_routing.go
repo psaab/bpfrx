@@ -254,12 +254,24 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 			"dns-server-address": {desc: "RDNSS DNS server address advertised to hosts", args: 1, multi: true, placeholder: "<address>", children: nil},
 			"preference":         {desc: "Default router preference (high|medium|low)", args: 1, placeholder: "<preference>", children: nil},
 			"prefix": {desc: "Advertised on-link prefix", args: 1, placeholder: "<prefix>", children: map[string]*schemaNode{ // prefix <prefix/len>
-				"on-link":            {desc: "Set the on-link (L) flag (default)", children: nil},
-				"autonomous":         {desc: "Set the autonomous (A) flag (default)", children: nil},
-				"no-onlink":          {desc: "Clear the on-link (L) flag", children: nil},
-				"no-autonomous":      {desc: "Clear the autonomous (A) flag", children: nil},
-				"valid-lifetime":     {desc: "Prefix valid lifetime (seconds)", args: 1, placeholder: "<seconds>", children: nil},
-				"preferred-lifetime": {desc: "Prefix preferred lifetime (seconds)", args: 1, placeholder: "<seconds>", children: nil},
+				"on-link":       {desc: "Set the on-link (L) flag (default)", children: nil},
+				"autonomous":    {desc: "Set the autonomous (A) flag (default)", children: nil},
+				"no-onlink":     {desc: "Clear the on-link (L) flag", children: nil},
+				"no-autonomous": {desc: "Clear the autonomous (A) flag", children: nil},
+				// Prefix lifetimes compile with a bare strconv.Atoi
+				// (compiler_protocols.go) and treat 0 as "use the SLAAC
+				// default" (types_routing.go RAPrefix; pkg/ra sender clamps
+				// <=0 to defaultValid/PreferredLifetime). Type them as
+				// non-negative integers so the gate rejects garbage (e.g.
+				// `valid-lifetime abc`, which previously stayed at 0 and
+				// silently fell back to the default) while still accepting
+				// an explicit 0.
+				"valid-lifetime": {desc: "Prefix valid lifetime in seconds (0 = SLAAC default)", args: 1, placeholder: "<seconds>",
+					valueType: ValueInteger, valueDesc: "prefix valid lifetime in seconds",
+					valueExamples: []string{"0", "86400", "2592000"}, validator: ValidateIntegerMin(0), children: nil},
+				"preferred-lifetime": {desc: "Prefix preferred lifetime in seconds (0 = SLAAC default)", args: 1, placeholder: "<seconds>",
+					valueType: ValueInteger, valueDesc: "prefix preferred lifetime in seconds",
+					valueExamples: []string{"0", "604800", "86400"}, validator: ValidateIntegerMin(0), children: nil},
 			}},
 			"nat-prefix": {desc: "NAT prefix", args: 1, placeholder: "<prefix>", children: map[string]*schemaNode{
 				"lifetime": {desc: "Lifetime", args: 1, placeholder: "<seconds>", children: nil},
