@@ -6026,3 +6026,6 @@ top.
 - **Timestamp**: 2026-06-18
 - **Action**: Soften GC "chronological" comments to "usually chronological (wall-clock; NTP step can reorder, correctness independent)" for consistency with the GenID comment — comment-only.
 - **File(s)**: pkg/upgrade/stagedgen/stagedgen.go
+- **Timestamp**: 2026-06-18
+- **Action**: #2008 H18: routing-policy `from protocol [ ... ]` multi-protocol fix. PolicyTerm.FromProtocol (scalar) → FromProtocols ([]string); collectProtocolList flattens both AST shapes (block parse = all keys; flat-set SetPath = nested single-child chain); inline-keys path consumes consecutive protocol tokens; FRR render emits one `match source-protocol` per protocol (and the redistribute resolver iterates all). Show consumers (cli/grpc) render `[ ... ]` for multi. Regression tests: TestPolicyTermMultiProtocolFlatSet / TestPolicyTermMultiProtocolHierarchical (config compile), TestGeneratePolicyOptionsMultiProtocol (frr render) — all mutation-verified to fail on revert.
+- **File(s)**: pkg/config/types_routing.go, pkg/config/compiler_routing.go, pkg/frr/policy_render.go, pkg/cli/cli_show_routing.go, pkg/grpcapi/server_show_policies_text.go, pkg/config/parser_routing_test.go, pkg/frr/frr_test.go, pkg/config/parser_security_test.go, pkg/config/parser_ast_test.go

@@ -41,8 +41,9 @@ type PolicyStatement struct {
 
 // PolicyTerm is a single match+action clause within a policy-statement.
 type PolicyTerm struct {
-	Name            string
-	FromProtocol    string         // "direct", "static", "bgp", "ospf"
+	Name          string
+	FromProtocols []string // "direct", "static", "bgp", "ospf" — Junos
+	// "from protocol [ bgp ospf static ]" matches ANY listed protocol.
 	PrefixList      string         // from prefix-list <name>
 	FromCommunity   string         // from community <name> (match against community-list)
 	FromASPath      string         // from as-path <name> (match against as-path access-list)

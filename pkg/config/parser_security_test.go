@@ -2126,8 +2126,8 @@ func TestPolicyOptions(t *testing.T) {
 	if term.Name != "default_v4" {
 		t.Errorf("term name: got %q, want default_v4", term.Name)
 	}
-	if term.FromProtocol != "direct" {
-		t.Errorf("from protocol: got %q, want direct", term.FromProtocol)
+	if len(term.FromProtocols) != 1 || term.FromProtocols[0] != "direct" {
+		t.Errorf("from protocol: got %v, want [direct]", term.FromProtocols)
 	}
 	if len(term.RouteFilters) != 2 {
 		t.Fatalf("expected 2 route-filters, got %d", len(term.RouteFilters))
@@ -3071,8 +3071,8 @@ func TestPolicyStatementNextHopAndLoadBalance(t *testing.T) {
 		t.Fatalf("got %d terms, want 1", len(peer.Terms))
 	}
 	term := peer.Terms[0]
-	if term.FromProtocol != "direct" {
-		t.Errorf("from protocol = %q, want direct", term.FromProtocol)
+	if len(term.FromProtocols) != 1 || term.FromProtocols[0] != "direct" {
+		t.Errorf("from protocol = %v, want [direct]", term.FromProtocols)
 	}
 	if term.PrefixList != "management-hosts" {
 		t.Errorf("prefix-list = %q, want management-hosts", term.PrefixList)
@@ -3154,8 +3154,8 @@ func TestPolicyStatementRouteMapAttributesSetSyntax(t *testing.T) {
 		t.Fatalf("got %d terms, want 1", len(ps.Terms))
 	}
 	term := ps.Terms[0]
-	if term.FromProtocol != "bgp" {
-		t.Errorf("from protocol = %q, want bgp", term.FromProtocol)
+	if len(term.FromProtocols) != 1 || term.FromProtocols[0] != "bgp" {
+		t.Errorf("from protocol = %v, want [bgp]", term.FromProtocols)
 	}
 	if term.LocalPreference != 200 {
 		t.Errorf("local-preference = %d, want 200", term.LocalPreference)

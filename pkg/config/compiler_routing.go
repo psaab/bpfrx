@@ -464,6 +464,35 @@ func compilePolicyOptions(node *Node, po *PolicyOptionsConfig) error {
 	return nil
 }
 
+// collectProtocolList flattens a single "from protocol ..." node into the
+// protocol names it carries. After the lexer strips the brackets, a protocol
+// node reaches the compiler in one of three shapes:
+//   - block parse, bracket list: every protocol is a key on the node itself
+//     (Keys = ["protocol", "bgp", "ospf", "static"]).
+//   - flat-set SetPath, bracket list: the first protocol is Keys[1] and the
+//     remaining protocols hang off a nested single-child chain
+//     (Keys = ["protocol", "bgp"] -> child Keys = ["ospf", "static"] -> ...).
+//   - flat-set SetPath, separate "set ... from protocol <X>" commands: each
+//     command lands its own leaf (Keys = ["protocol", "<X>"]) as a sibling
+//     under the term's "from" block. The caller iterates those siblings and
+//     calls this helper once per node, which then returns the single protocol.
+//
+// All three shapes (and arbitrarily long lists) are handled by taking
+// Keys[1:] of the protocol node, then appending every key of each descendant
+// in the single-child chain.
+func collectProtocolList(protoNode *Node) []string {
+	var protocols []string
+	if len(protoNode.Keys) >= 2 {
+		protocols = append(protocols, protoNode.Keys[1:]...)
+	}
+	for n := protoNode; len(n.Children) > 0; {
+		child := n.Children[0]
+		protocols = append(protocols, child.Keys...)
+		n = child
+	}
+	return protocols
+}
+
 // parsePolicyTermChildren handles hierarchical form of policy term
 // where "from" and "then" are child nodes.
 func parsePolicyTermChildren(term *PolicyTerm, children []*Node) {
@@ -473,9 +502,17 @@ func parsePolicyTermChildren(term *PolicyTerm, children []*Node) {
 			for _, fc := range tc.Children {
 				switch fc.Name() {
 				case "protocol":
-					if len(fc.Keys) >= 2 {
-						term.FromProtocol = fc.Keys[1]
-					}
+					// Junos "from protocol [ bgp ospf static ]" matches any
+					// listed protocol. The lexer strips the brackets, so the
+					// protocol list arrives in one of two AST shapes:
+					//  - hierarchical block parse: all protocols land in
+					//    fc.Keys (Keys=["protocol","bgp","ospf","static"]);
+					//  - flat-set SetPath: the first protocol is fc.Keys[1]
+					//    and the rest form a nested child chain
+					//    (Keys=["protocol","bgp"] -> child Keys=["ospf","static"]).
+					// Collect every protocol from both shapes, not just the
+					// first (#2008 H18).
+					term.FromProtocols = append(term.FromProtocols, collectProtocolList(fc)...)
 				case "prefix-list":
 					if v := nodeVal(fc); v != "" {
 						term.PrefixList = v
@@ -540,6 +577,17 @@ func parsePolicyTermChildren(term *PolicyTerm, children []*Node) {
 	}
 }
 
+// policyTermInlineKeywords is the set of clause keywords recognized by
+// parsePolicyTermInlineKeys. It is used to find where a variable-length
+// value run (e.g. a multi-protocol "from protocol [ ... ]" list) ends.
+var policyTermInlineKeywords = map[string]bool{
+	"from": true, "then": true, "protocol": true, "prefix-list": true,
+	"route-filter": true, "next-hop": true, "load-balance": true,
+	"local-preference": true, "metric": true, "metric-type": true,
+	"community": true, "as-path": true, "origin": true,
+	"accept": true, "reject": true,
+}
+
 // parsePolicyTermInlineKeys handles flat set syntax where remaining keys
 // after the term name are inline key-value pairs like:
 // "from", "protocol", "direct" or "from", "route-filter", "10.0.0.0/8", "exact"
@@ -558,9 +606,13 @@ func parsePolicyTermInlineKeys(term *PolicyTerm, keys []string) {
 				term.Action = keys[i]
 			}
 		case "protocol":
-			if i+1 < len(keys) {
+			// "from protocol [ bgp ospf static ]" — the lexer strips the
+			// brackets, so every protocol arrives as a separate key. Consume
+			// all consecutive values until the next clause keyword, so a
+			// multi-protocol list keeps every protocol (not just the first).
+			for i+1 < len(keys) && !policyTermInlineKeywords[keys[i+1]] {
 				i++
-				term.FromProtocol = keys[i]
+				term.FromProtocols = append(term.FromProtocols, keys[i])
 			}
 		case "prefix-list":
 			if i+1 < len(keys) {
