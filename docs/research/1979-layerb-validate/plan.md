@@ -1,6 +1,12 @@
 # #1979 — Flow/flow-export NUM_WIDTH: commit-time ValidateInteger (Layer B of #1977)
 
-**Status:** PLAN v2 (research; folds Claude SMR r1 + AGY r1 PLAN-NEEDS-MINOR + Codex r1 PLAN-NEEDS-MAJOR). Awaiting r2 reverify.
+**Status:** PLAN v3 — **PLAN-READY (3-way converged).** SMR r2 = PLAN-READY,
+AGY r2 = PLAN-READY, Codex r2 = PLAN-NEEDS-MINOR (2 doc/test-contract nits, no
+architectural blocker — both folded into v3: §8 item 1 now routes Tier-3
+`tcp-mss` accept/reject through `CompileConfig`/`compileTreeStrict` not
+`SchemaValidate`; §8 item 5 reworded to the directional "Layer B never rejects
+what Layer A accepts" invariant with the sampling-`0` normalization exception).
+Awaiting manual approval — type `/engineer 1979` to implement.
 **Base:** origin/master (`a75c970d8`, post-#1977/#1978 Layer A merge). NOTE:
 master has since advanced (e.g. `86435d4a1`) in unrelated subsystems (ipsec,
 snmp, flowexport — NOT pkg/config schema), shifting some LINE numbers below
@@ -475,10 +481,16 @@ change.
 
 ## 8. Test plan
 
-1. **Tier 1/2/3 acceptance (the gate):** for EVERY leaf, assert the **valid**
+1. **Tier 1/2/3 acceptance (the gate):** for every leaf, assert the **valid**
    value (both flat and hierarchical AST shapes where the leaf supports both)
-   PASSES `SchemaValidate`, and the **out-of-range** value (negative, >u16/u32,
-   >MaxDurationSeconds) is REJECTED with a range error. Drive via
+   is ACCEPTED and the **out-of-range** value (negative, >u16/u32,
+   >MaxDurationSeconds) is REJECTED with a range error. **Use the correct
+   harness per tier (Codex r2 #1):** Tier 1/2 are typed `setSchema` leaves, so
+   accept/reject is asserted through `SchemaValidate`. Tier 3 (`tcp-mss`) stays
+   OPAQUE in `setSchema` by design — its validation runs in the compiler
+   AST pre-walk (`validateTCPMSSRanges`), so its accept/reject MUST be asserted
+   through `CompileConfig` / `compileTreeStrict`, NOT `SchemaValidate` (which
+   never descends into the opaque `tcp-mss` node). Drive input via
    `ParseSetCommand`+`SetPath` (flat) and `NewParser().Parse()` (hierarchical) —
    never `NewParser` for set-syntax per the dual-AST testing rule (CLAUDE.md).
 2. **Tier 3 dual-shape, both positions:** `gre-in 70000` (flat) REJECTED;
@@ -491,9 +503,15 @@ change.
    still offers every compiler-read child (no silent drop).
 5. **Layer-A agreement:** a property test feeding the SAME boundary values
    (65535, 65536, MaxDurationSeconds, MaxDurationSeconds+1, u32max, u32max+1)
-   to BOTH the Layer-B validators and the Layer-A coercion, asserting: every
-   value Layer B accepts is left unchanged by Layer A; every value Layer B
-   rejects is one Layer A coerces. **Scope (Codex r1 #6):** this test covers
+   to BOTH the Layer-B validators and the Layer-A coercion, asserting: **Layer B
+   never rejects a value Layer A accepts** (the directional invariant — Codex
+   r2 #2), and every value Layer B rejects is one Layer A coerces. NOTE the
+   asymmetry under the Q3 default `[0,u32max]`: Layer B ACCEPTS sampling `0` but
+   Layer A NORMALIZES `0 → 1` (flow.go:138), so the invariant is "does not
+   reject what Layer A accepts", NOT "leaves accepted values unchanged" —
+   sampling `0` is the explicit, documented exception (sample-all sentinel). If
+   the user instead chooses the stricter Q3 `[1,u32max]`, Layer B rejects `0`
+   and no exception is needed. **Scope (Codex r1 #6):** this test covers
    ONLY the wire-reaching fields (the 8 leaves / 11 fields). version-ipfix
    timeouts do NOT reach Layer A (builder reads `fm.Version9` only,
    flow.go:176), so they are EXCLUDED from the Layer-A-agreement test — their
