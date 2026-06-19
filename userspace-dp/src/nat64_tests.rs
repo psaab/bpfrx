@@ -706,7 +706,8 @@ fn translate_v4_to_v6_total_len_below_ihl_returns_none() {
 // flag never reached the dataplane snapshot and translate_v6_to_v4 always set
 // the Don't-Fragment (DF) bit. These tests pin the runtime enforcement: the
 // flags+frag-offset word (IPv4 header bytes 6-7) must be DF=1 (0x4000) by
-// default and DF=0 (0x0000) when the option is set, per RFC 7915 5.1.
+// default and DF=0 (0x0000) when the option is set. The DF clearing is an
+// option-gated LOCAL policy, not the size-driven RFC 7915 5.1 selection.
 //
 // They also pin the DF/Identification consistency the Copilot review on #2014
 // flagged: a DF=1 atomic datagram keeps Identification=0 (legal per RFC 6864
@@ -806,28 +807,66 @@ fn translate_v6_to_v4_no_v6_frag_header_identification_is_unique() {
     // RFC 6864 4.1: a source emitting non-atomic (DF=0) datagrams MUST NOT
     // repeat the Identification for a given src/dst/proto tuple within one MDL.
     // The per-translator generator advances on every fragmentable translation,
-    // so two back-to-back DF=0 translations must carry DISTINCT non-zero IDs.
-    // A constant-ID implementation (the pre-fix bug pinned ID=0) fails here.
+    // so successive DF=0 translations must carry DISTINCT non-zero IDs.
+    //
+    // This test is DETERMINISTIC and robust to the process-global counter's
+    // start value (it does not assume the generator begins at any particular
+    // raw value): it exercises the pure mapping `map_frag_id` over a CONTROLLED
+    // consecutive sequence that crosses the 0/1 boundary AND a full 16-bit wrap,
+    // and asserts the cycle invariants directly. The old test passed only by
+    // accident — other tests advanced the shared atomic before it ran, so it
+    // FAILED in isolation (`cargo test <name> -- --exact`).
+    //
+    // Mutation check: the pre-fix mapping `if raw==0 {1} else {raw as u16}`
+    // maps BOTH raw=0 and raw=1 to 1, so the raw=0->raw=1 step below produces a
+    // consecutive duplicate and the no-repeat assertion fails.
+    let mut prev: Option<u16> = None;
+    // 0..=65536 covers the first two values (raw=0,1 — the boundary that the
+    // pre-fix remap collided), the top of the cycle (raw=65534 -> 65535), and
+    // the wrap (raw=65535 -> 1, raw=65536 -> 2). Iterating one full period plus
+    // a step proves there is no consecutive duplicate ANYWHERE, including the
+    // 65535 -> 1 jump.
+    for raw in 0u32..=65536 {
+        let id = map_frag_id(raw);
+        assert_ne!(id, 0, "Identification must be non-zero (raw={raw})");
+        assert!(
+            (1..=65535).contains(&id),
+            "Identification must lie in 1..=65535 (raw={raw}, id={id})"
+        );
+        if let Some(p) = prev {
+            assert_ne!(
+                p, id,
+                "successive Identifications must differ (RFC 6864 4.1 no-repeat): \
+                 raw={raw} produced {id} == previous {p}"
+            );
+        }
+        prev = Some(id);
+    }
+    // Spot-check the boundary and wrap values the pre-fix mapping got wrong.
+    assert_eq!(map_frag_id(0), 1);
+    assert_eq!(map_frag_id(1), 2, "raw=1 must NOT collide with raw=0 (the bug)");
+    assert_eq!(map_frag_id(65534), 65535, "top of the cycle");
+    assert_eq!(map_frag_id(65535), 1, "wrap is a jump 65535 -> 1, not a repeat");
+    assert_eq!(map_frag_id(65536), 2);
+
+    // End-to-end smoke: two back-to-back fragmentable translations both carry
+    // non-zero IDs and stay DF=0 with valid checksums. (The no-consecutive-dup
+    // proof lives in the deterministic loop above; this only confirms the
+    // generator is actually wired into the DF=0 translation path.)
     let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
     let dst_v6: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
     let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
     let dst_v4 = Ipv4Addr::new(198, 51, 100, 50);
-
     let ipv6_pkt = make_ipv6_tcp_packet(src_v6, dst_v6, 12345, 80, b"uniq");
     let a = translate_v6_to_v4(&ipv6_pkt, snat_v4, dst_v4, true).expect("translate a");
     let b = translate_v6_to_v4(&ipv6_pkt, snat_v4, dst_v4, true).expect("translate b");
-
-    let id_a = ipv4_identification(&a);
-    let id_b = ipv4_identification(&b);
-    assert_ne!(id_a, 0, "first fragmentable ID must be non-zero");
-    assert_ne!(id_b, 0, "second fragmentable ID must be non-zero");
+    assert_ne!(ipv4_identification(&a), 0, "first fragmentable ID must be non-zero");
+    assert_ne!(ipv4_identification(&b), 0, "second fragmentable ID must be non-zero");
     assert_ne!(
-        id_a, id_b,
-        "successive fragmentable translations must use distinct Identifications \
-         (RFC 6864 4.1 no-repeat requirement)"
+        ipv4_identification(&a),
+        ipv4_identification(&b),
+        "two back-to-back fragmentable translations must use distinct IDs"
     );
-    // Both must still be DF=0 fragmentable datagrams with a valid header
-    // checksum despite the differing ID.
     assert_eq!(ipv4_frag_word(&a), 0x0000);
     assert_eq!(ipv4_frag_word(&b), 0x0000);
     assert_eq!(checksum16(&a[..20]), 0, "header checksum must verify (a)");

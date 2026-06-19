@@ -146,28 +146,49 @@ use std::sync::atomic::AtomicU32;
 /// Process-global IPv4 Fragment Identification generator for translated,
 /// *fragmentable* (DF=0) IPv6->IPv4 packets.
 ///
-/// RFC 7915 5.1: when the source IPv6 packet has no Fragment Header, the
-/// translator sets the IPv4 Identification "according to a Fragment
-/// Identification generator at the translator". RFC 6864 4.1 then *requires*
-/// that a source emitting non-atomic datagrams (DF=0) MUST NOT repeat the ID
-/// for a given source/destination/protocol tuple within one Maximum Datagram
-/// Lifetime. A constant ID (e.g. 0) violates that: if a downstream router
-/// fragments two such datagrams between the same hosts, their fragments share
-/// an ID and reassemble incorrectly. A monotonically incrementing counter is a
+/// Whenever this translator emits a DF=0 (non-atomic) datagram it draws the
+/// Identification from a per-translator generator, as RFC 7915 5.1 prescribes
+/// for the no-Fragment-Header case. RFC 6864 4.1 then *requires* that a source
+/// emitting non-atomic datagrams (DF=0) MUST NOT repeat the ID for a given
+/// source/destination/protocol tuple within one Maximum Datagram Lifetime. A
+/// constant ID (e.g. 0) violates that: if a downstream router fragments two
+/// such datagrams between the same hosts, their fragments share an ID and
+/// reassemble incorrectly. A monotonically incrementing counter is a
 /// conforming, cheap generator. Atomic datagrams (DF=1) are exempt — RFC 6864
 /// lets them carry any ID, so the default DF=1 path keeps ID=0.
+///
+/// Note this generator only governs the *Identification* value. WHEN DF is
+/// cleared is a deliberate LOCAL policy (the operator-gated
+/// `no-v6-frag-header` option), not the size-driven DF selection RFC 7915 5.1
+/// itself describes (clear DF only when the translated IPv4 packet is <= 1260
+/// bytes); see `translate_v6_to_v4`.
 static NAT64_FRAG_ID: AtomicU32 = AtomicU32::new(0);
 
 /// Return the next non-zero 16-bit Fragment Identification value for a
-/// fragmentable translated datagram. Skips 0 so a fragmentable packet never
-/// carries the all-zero ID that is reserved (by convention) for atomic
-/// datagrams in this translator.
+/// fragmentable translated datagram. The value cycles over the full non-zero
+/// 16-bit space `1..=65535` with NO two consecutive values equal (including
+/// across the wrap: the value after 65535 is 1, a jump, not a repeat). Skipping
+/// 0 keeps the all-zero ID reserved (by convention) for the atomic DF=1 path.
 fn next_frag_id() -> u16 {
     // Relaxed is sufficient: we only need a distinct, non-repeating sequence,
-    // not ordering against other memory. Truncate the 32-bit counter to 16
-    // bits (the IPv4 ID width) and remap a 0 result to 1.
-    let raw = NAT64_FRAG_ID.fetch_add(1, Ordering::Relaxed) as u16;
-    if raw == 0 { 1 } else { raw }
+    // not ordering against other memory. Map the monotonic 32-bit counter onto
+    // 1..=65535 via `(raw % 65535) + 1`. This is what makes the sequence
+    // collision-free for RFC 6864 4.1: a naive `truncate-to-u16 then remap 0->1`
+    // maps BOTH raw=0 and raw=1 to 1, so two back-to-back DF=0 translations
+    // would share an Identification (and the same dup recurs at every 16-bit
+    // wrap). `% 65535 + 1` instead yields 1,2,...,65535,1,2,... — every adjacent
+    // pair differs.
+    let raw = NAT64_FRAG_ID.fetch_add(1, Ordering::Relaxed);
+    map_frag_id(raw)
+}
+
+/// Pure mapping from a monotonic 32-bit counter value to the 1..=65535
+/// Identification space. Factored out of `next_frag_id` so the cycle invariant
+/// (non-zero, in-range, no consecutive duplicates including the wrap) can be
+/// unit-tested deterministically without touching the process-global counter.
+#[inline]
+fn map_frag_id(raw: u32) -> u16 {
+    (raw % 65535) as u16 + 1
 }
 
 /// Translate an IPv6 packet to IPv4 (forward direction: client→server).
@@ -176,17 +197,21 @@ fn next_frag_id() -> u16 {
 /// `snat_v4` = pool IPv4 source, `dst_v4` = extracted destination.
 ///
 /// `no_v6_frag_header` mirrors the `security nat natv6v4 no-v6-frag-header`
-/// option. When `false` (the default) the translated IPv4 packet is emitted as
-/// an *atomic* datagram: the Don't-Fragment (DF) flag is set and the
-/// Identification field is left at 0 (RFC 6864 4.1 permits any ID for an atomic
-/// datagram). When `true`, the DF flag is cleared so the packet remains
-/// fragmentable in transit, per RFC 7915 5.1 (no IPv6 Fragment Header present
-/// on the source packet => the translator emits a fragmentable IPv4 packet).
-/// In that fragmentable case DF and Identification MUST be mutually
-/// consistent: a DF=0 datagram is non-atomic, so RFC 7915 5.1 / RFC 6864 4.1
-/// require a non-zero Identification drawn from a per-translator generator
-/// (`next_frag_id`) so a downstream fragmenter produces reassemblable
-/// fragments rather than colliding on a constant ID.
+/// option and selects between two DF policies. This is a deliberate LOCAL,
+/// option-gated choice — NOT the literal RFC 7915 5.1 algorithm, which keys DF
+/// off the *translated* IPv4 size (clear DF only when the result is <= 1260
+/// bytes). The two modes are:
+///   * `false` (the default): emit an *atomic* datagram — set the
+///     Don't-Fragment (DF) flag and leave Identification at 0 (RFC 6864 4.1
+///     permits any ID for an atomic datagram).
+///   * `true`: clear DF so the packet stays fragmentable in transit (the
+///     operator opts into this when downstream PMTU handling needs it).
+///
+/// Whichever mode clears DF, the Identification MUST stay consistent with it: a
+/// DF=0 datagram is non-atomic, so RFC 6864 4.1 forbids a constant/repeated ID
+/// and RFC 7915 5.1 prescribes drawing it from a per-translator generator
+/// (`next_frag_id`) so a downstream fragmenter produces reassemblable fragments
+/// rather than colliding on a constant ID.
 ///
 /// Returns the translated IPv4 packet (L3 only, no Ethernet header).
 pub(crate) fn translate_v6_to_v4(
@@ -230,16 +255,17 @@ pub(crate) fn translate_v6_to_v4(
     out[0] = 0x45; // version=4, IHL=5
     out[1] = traffic_class; // DSCP/ECN copied from IPv6 traffic class (RFC 7915 §5)
     out[2..4].copy_from_slice(&ipv4_total_len.to_be_bytes());
-    // Flags + fragment-offset word (bytes 6-7) and the Identification field
-    // (bytes 4-5) must stay mutually consistent:
+    // DF policy is the option-gated LOCAL choice (not the size-driven RFC 7915
+    // 5.1 selection). Either way the flags+frag-offset word (bytes 6-7) and the
+    // Identification field (bytes 4-5) must stay mutually consistent:
     //   * Default (DF=1, 0x4000): an *atomic* datagram (non-fragmentable).
     //     RFC 6864 4.1 permits any ID for an atomic datagram, so leave ID=0.
     //   * no-v6-frag-header (DF=0, 0x0000): a *fragmentable* (non-atomic)
-    //     datagram, per RFC 7915 5.1. A non-atomic datagram MUST carry a
-    //     non-zero Identification from a per-translator generator (RFC 7915
-    //     5.1 / RFC 6864 4.1) so a downstream fragmenter does not collide
-    //     distinct datagrams on a constant ID. Pinning ID=0 here while
-    //     clearing DF was the bug fixed in #2008 H16.
+    //     datagram. A non-atomic datagram MUST carry a non-zero Identification
+    //     from a per-translator generator (RFC 7915 5.1 / RFC 6864 4.1) so a
+    //     downstream fragmenter does not collide distinct datagrams on a
+    //     constant ID. Pinning ID=0 here while clearing DF was the bug fixed in
+    //     #2008 H16.
     let (frag_word, identification): (u16, u16) = if no_v6_frag_header {
         (0x0000, next_frag_id())
     } else {
