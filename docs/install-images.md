@@ -71,12 +71,12 @@ Pipeline (offline — the image is never booted to provision it):
    The package's `postinst` always stages the binary set into
    `/usr/local/share/xpf/staged`, then sets up the live
    `/usr/local/sbin/{xpfd,cli,xpf-userspace-dp,xpf-day0-config}` symlinks
-   (normally through `versions/current`; see the four behaviors below), and enables
-   `xpfd` + `xpf-day0-config` (so the bake no longer hand-copies
-   binaries/units or runs `systemctl enable xpfd`). The four
-   postinst behaviors are version-dependent (`$2` is the
-   previously-configured version, empty on first install) — the full
-   split is:
+   (normally through `versions/current`; see the fallback below) and
+   enables `xpfd` + `xpf-day0-config` (so the bake no longer hand-copies
+   binaries/units or runs `systemctl enable xpfd`). This bake is a FIRST
+   install, so it takes the seed path. The four postinst behaviors are
+   version-dependent (`$2` is the previously-configured version, empty on
+   first install) — the full split is:
 
    - **First install (#1964 seed)** — `postinst` runs `xpfd seed-runtime`
      (`pkg/upgrade/runtime`), which copies `staged/*` into
