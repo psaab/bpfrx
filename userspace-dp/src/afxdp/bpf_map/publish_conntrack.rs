@@ -31,6 +31,14 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 const ALG_DISABLE_DNS: u8 = 0x01;
 const ALG_DISABLE_FTP: u8 = 0x02;
 const ALG_DISABLE_SIP: u8 = 0x04;
+// TFTP's disable bit is carried on the wire for layout parity with the Go
+// `algDisableFlags` packer (DNS 0x01 / FTP 0x02 / SIP 0x04 / TFTP 0x08), but
+// it has no consumer here: the dataplane has no TFTP conntrack alg_type to
+// suppress (`alg_type` is one of none/FTP/SIP/DNS — see xpf_conntrack.h), so
+// `alg_type_for_session` never reads this bit. Defined to document the full
+// bit layout consistently across Go and Rust; intentionally unused.
+#[allow(dead_code)]
+const ALG_DISABLE_TFTP: u8 = 0x08;
 
 const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
@@ -373,6 +381,43 @@ mod alg_type_tests {
         assert_eq!(
             alg_type_for_session(PROTO_UDP, 41234, 53, ALG_DISABLE_FTP),
             ALG_TYPE_DNS
+        );
+    }
+
+    // A session keyed in the REVERSE direction carries the well-known ALG
+    // service port in the SRC slot (server -> client), not the dst. The
+    // `on_port` helper checks `src_port == p || dst_port == p`, so the ALG
+    // type must still resolve. Both directions of one ALG session map to the
+    // same alg_type, which is required for the reverse conntrack entry the
+    // publisher installs alongside the forward entry.
+    #[test]
+    fn dns_reverse_keyed_session_tagged_on_src_port() {
+        // UDP 53 (server) -> ephemeral (client): well-known port in src slot.
+        assert_eq!(
+            alg_type_for_session(PROTO_UDP, 53, 41234, 0),
+            ALG_TYPE_DNS,
+            "reverse-keyed DNS session must match the well-known port on the src slot"
+        );
+        // The disable bit still suppresses it in the reverse direction.
+        assert_eq!(
+            alg_type_for_session(PROTO_UDP, 53, 41234, ALG_DISABLE_DNS),
+            ALG_TYPE_NONE,
+            "`security alg dns disable` must apply to reverse-keyed sessions too"
+        );
+    }
+
+    #[test]
+    fn ftp_reverse_keyed_session_tagged_on_src_port() {
+        // TCP 21 (server) -> ephemeral (client): well-known port in src slot.
+        assert_eq!(
+            alg_type_for_session(PROTO_TCP, 21, 51000, 0),
+            ALG_TYPE_FTP,
+            "reverse-keyed FTP session must match the well-known port on the src slot"
+        );
+        assert_eq!(
+            alg_type_for_session(PROTO_TCP, 21, 51000, ALG_DISABLE_FTP),
+            ALG_TYPE_NONE,
+            "`security alg ftp disable` must apply to reverse-keyed sessions too"
         );
     }
 

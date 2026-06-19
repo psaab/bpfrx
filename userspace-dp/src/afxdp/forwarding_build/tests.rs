@@ -2433,3 +2433,29 @@ fn tunnel_remap_purge_ids_from_owners_semantics() {
     // Pristine first apply (empty owners + flag false): nothing purged.
     assert!(tunnel_remap_purge_ids_from_owners(&[], &next, false).is_empty());
 }
+
+// #2008 H3/H4: pin the snapshot -> runtime read of the ALG-disable
+// bitfield in forwarding_build/mod.rs (`state.alg_disable_flags =
+// snapshot.flow.alg_disable_flags`). Without this assertion the wire
+// plumbing is untested end to end: the Go-packing tests and the pure
+// `alg_type_for_session` tests both stay green even if the build step
+// is reverted to a hardcoded 0, so the flag would silently never reach
+// the conntrack publisher. MUTATION-VERIFY: hardcoding line 175 to 0
+// (or dropping the assignment) must fail this test.
+#[test]
+fn build_forwarding_state_carries_alg_disable_flags() {
+    // DNS (0x01) + FTP (0x02) disabled.
+    let flags: u8 = 0x01 | 0x02;
+    let snapshot = ConfigSnapshot {
+        flow: crate::FlowSnapshot {
+            alg_disable_flags: flags,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    assert_eq!(
+        state.alg_disable_flags, flags,
+        "ForwardingState.alg_disable_flags must equal snapshot.flow.alg_disable_flags"
+    );
+}
