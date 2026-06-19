@@ -173,6 +173,7 @@ func TestManagedBinaryDriftCanary(t *testing.T) {
 		"debian/xpf.postrm",
 		"test/debian/preinst-migrate-test.sh",
 		"test/debian/postrm-test.sh",
+		"test/debian/postinst-test.sh",
 	}
 	for _, rel := range binsSites {
 		got := extractBINS(t, rel, readFile(t, root, rel))

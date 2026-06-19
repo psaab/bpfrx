@@ -364,6 +364,23 @@ case (NOT implemented here — see #1922).
 - CLUSTERED node (node-id present), UPGRADE: STAGE-ONLY. Cut ONLY via
   `xpfd upgrade --rolling`. Keyed on node-id ALONE so a degraded-HA node
   never falls through to an uncoordinated standalone cut.
+- UPGRADE (any node type): the postinst NEVER repoints an existing or
+  dangling sbin link (that would let the running daemon resolve a
+  different-version helper, or steal an increment-B-staged dangling link
+  and bypass its verify gate). It only RECOVERS a link that is COMPLETELY
+  absent, and it recovers it THROUGH `versions/current/<bin>` — the same
+  verified-live target the seed and the flip use — NOT direct to
+  `staged/<bin>` (#2000). Recovering direct to staged would create a mixed
+  state before the cut's VERIFY/STOP/FLIP: most tools resolve the verified
+  live version while the recovered one resolves the just-unpacked,
+  unverified staged version (a recovered `cli` would run against the old
+  daemon; a recovered `xpf-userspace-dp` would expose the unverified staged
+  helper). A NEWLY-INTRODUCED managed binary whose target does not yet
+  exist under `versions/current` (its first upgrade), and any absent link
+  on a legacy/never-seeded host with no `versions/current`, is LEFT ABSENT
+  until the verified cut (or the preinst migration) populates
+  `versions/<v>/` and flips — early exposure of an unverified staged binary
+  is exactly what this avoids.
 
 ## Dogfood deploy
 

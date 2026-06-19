@@ -74,7 +74,7 @@ case "$1" in
                 done
             fi
         else
-            # Upgrade: do NOT touch the live symlinks. Only create one that
+            # Upgrade: do NOT touch the live symlinks. Only recover one that
             # is COMPLETELY absent (not even a broken symlink); never repoint
             # an existing OR dangling link. Repointing while the daemon is up
             # would let the running xpfd resolve a different-version helper,
@@ -82,10 +82,41 @@ case "$1" in
             # transiently-missing /var/lib/xpf/versions/<v>/ target would
             # bypass its verify gate. -e alone follows the link (a broken
             # link reads as absent), so guard with -L too.
+            #
+            # #2000: an ABSENT link is recovered THROUGH versions/current, NOT
+            # direct to $STAGED. The hardened layout (#1964 seed, increment-B
+            # flip) resolves every live/operator sbin link as
+            # /usr/local/sbin/<bin> -> versions/current/<bin>, which is the
+            # verified-live version. Recreating an absent link straight to the
+            # just-unpacked staged/<bin> would produce a MIXED state before the
+            # cut's VERIFY/STOP/FLIP runs: most tools resolve the verified live
+            # version while the recovered one resolves the UNVERIFIED staged
+            # version (a recovered `cli` would run against the old daemon; a
+            # recovered `xpf-userspace-dp` would expose the unverified staged
+            # helper). So recover through versions/current/<bin> instead — the
+            # same target the flip uses, so the cut's flip is a no-op-shaped
+            # repoint. A NEWLY-INTRODUCED managed binary whose target does not
+            # yet exist under versions/current (its first upgrade) is LEFT
+            # ABSENT until the verified cut populates versions/<v>/ and flips —
+            # exposing the unverified staged binary early is exactly what this
+            # fix prevents. On a legacy/never-seeded host (no versions/current)
+            # all absent links are likewise left for the preinst migration +
+            # the cut to establish, never pointed direct to staged here.
+            CURRENT_DIR=/var/lib/xpf/versions/current
             for b in $BINS; do
                 if [ ! -e "$SBIN/$b" ] && [ ! -L "$SBIN/$b" ]; then
-                    mkdir -p "$SBIN"
-                    ln -sfnT "$STAGED/$b" "$SBIN/$b"
+                    if [ -e "$CURRENT_DIR/$b" ]; then
+                        mkdir -p "$SBIN"
+                        # ln -sfnT replaces a pre-existing symlink atomically
+                        # and FAILS (under set -e) rather than nesting a link
+                        # INSIDE a real directory at the link path.
+                        ln -sfnT "$CURRENT_DIR/$b" "$SBIN/$b"
+                    else
+                        echo "xpf: sbin link $b absent and no" \
+                             "$CURRENT_DIR/$b yet — leaving absent until the" \
+                             "verified cut establishes it (not exposing the" \
+                             "unverified staged binary early)" >&2
+                    fi
                 fi
             done
 
