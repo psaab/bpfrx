@@ -195,6 +195,13 @@ type PolicyMatch struct {
 	SourceAddresses      []string // address-book names or "any"
 	DestinationAddresses []string
 	Applications         []string // application names or "any"
+	// SourceAddressExcluded inverts the source-address match sense:
+	// when true the policy matches every source EXCEPT those named in
+	// SourceAddresses (Junos `match source-address-excluded`).
+	SourceAddressExcluded bool
+	// DestinationAddressExcluded inverts the destination-address match
+	// sense (Junos `match destination-address-excluded`).
+	DestinationAddressExcluded bool
 }
 
 // PolicyAction is the action to take when a policy matches.

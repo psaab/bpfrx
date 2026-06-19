@@ -493,6 +493,12 @@ type PolicyRuleSnapshot struct {
 	Applications        []string                    `json:"applications,omitempty"`
 	ApplicationTerms    []PolicyApplicationSnapshot `json:"application_terms,omitempty"`
 	Action              string                      `json:"action,omitempty"`
+	// #2008 H2: invert the source/destination match sense — the
+	// rule matches every address EXCEPT those named in the
+	// corresponding address set (Junos `source-address-excluded` /
+	// `destination-address-excluded`).
+	SourceAddressExcluded      bool `json:"source_address_excluded,omitempty"`
+	DestinationAddressExcluded bool `json:"destination_address_excluded,omitempty"`
 }
 
 type InterfaceAddressSnapshot struct {

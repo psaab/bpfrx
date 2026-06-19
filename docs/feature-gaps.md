@@ -51,7 +51,7 @@ Last updated: 2026-05-24
 
 ## 1. Security Policies (Unified/Advanced)
 
-xpf has zone-based policies with source/dest address, application match, permit/deny/reject actions, logging, counting, and schedulers. These gaps represent vSRX-specific advanced policy features.
+xpf has zone-based policies with source/dest address, application match, permit/deny/reject actions, logging, counting, and schedulers. Match also supports the family-scoped wildcards `any-ipv4` / `any-ipv6` (normalized to `0.0.0.0/0` / `::/0` at compile time) and the `source-address-excluded` / `destination-address-excluded` modifiers (invert the per-side match in the dataplane), per #2008 H11/H2. These gaps represent vSRX-specific advanced policy features.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|

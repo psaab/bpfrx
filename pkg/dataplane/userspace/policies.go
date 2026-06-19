@@ -98,6 +98,9 @@ func buildOneRuleSnapshot(
 		Applications:         append([]string(nil), pol.Match.Applications...),
 		ApplicationTerms:     applicationTerms,
 		Action:               policyActionString(pol.Action),
+		// #2008 H2: carry the match-inversion flags to the dataplane.
+		SourceAddressExcluded:      pol.Match.SourceAddressExcluded,
+		DestinationAddressExcluded: pol.Match.DestinationAddressExcluded,
 	}
 }
 
