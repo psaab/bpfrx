@@ -238,4 +238,16 @@ func TestTCPMSSRange_LenientWarningKind(t *testing.T) {
 	if !strings.Contains(w, "unset") || strings.Contains(w, "coerces") {
 		t.Fatalf("non-integer lenient warning should say unset/0 and NOT claim coercion, got: %q", w)
 	}
+
+	// Negative integer -> unset/0 wording too (Codex re-review): -1 parses
+	// but compileFlow only assigns MSS when v > 0, so it never reaches Layer
+	// A — "coerces" would be wrong. Strict still rejects (< min 0).
+	neg := mssFlatTree(t, "set security flow tcp-mss gre-in -1")
+	if _, err := config.CompileConfig(neg); err == nil {
+		t.Fatal("strict must REJECT a negative tcp-mss token")
+	}
+	wn := mssWarn(t, neg)
+	if !strings.Contains(wn, "unset") || strings.Contains(wn, "coerces") {
+		t.Fatalf("negative lenient warning should say unset/0 and NOT claim coercion, got: %q", wn)
+	}
 }

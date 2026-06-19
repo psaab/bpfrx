@@ -645,13 +645,15 @@ func checkTCPMSSKind(node *Node, nodePath string, lenient bool) ([]string, error
 		if !lenient {
 			return nil, fmt.Errorf("%s", msg)
 		}
-		// Tailor the lenient suffix to the failure kind (Copilot review):
-		// an out-of-RANGE integer is clamped by Layer A at the wire
-		// boundary (flow.go coerceWireU16), so "the dataplane coerces it"
-		// is accurate; a NON-INTEGER token never yields a value — the
-		// compiler reads 0 (unset) — so claiming coercion would mislead.
+		// Tailor the lenient suffix to the failure kind (Codex/Copilot
+		// review). Only a parseable POSITIVE-but-too-large integer reaches
+		// Layer A to be clamped (flow.go coerceWireU16) — compileFlow only
+		// assigns the MSS when v > 0. A non-integer token OR a negative
+		// value yields no MSS: the compiler reads 0 (unset), nothing
+		// reaches the dataplane, so "the dataplane coerces it" would
+		// mislead. Branch on the parsed value, not just parseability.
 		suffix := " (kept; the dataplane coerces it — a strict commit would reject this)"
-		if _, perr := strconv.Atoi(tok); perr != nil {
+		if v, perr := strconv.Atoi(tok); perr != nil || v < 0 {
 			suffix = " (treated as unset/0 by the compiler — a strict commit would reject this)"
 		}
 		return []string{msg + suffix}, nil
