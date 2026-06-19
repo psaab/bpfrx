@@ -725,20 +725,36 @@ func parseTunnelWireguardPeer(tc *TunnelConfig, peerNode *Node) {
 	}
 }
 
-// parseMSSValue extracts MSS value from either "node { mss VALUE; }" or "node VALUE;" syntax.
-func parseMSSValue(node *Node) int {
+// selectMSSToken returns the raw MSS token the compiler would actually
+// select for a tcp-mss kind node (ipsec-vpn / gre-in / gre-out / all-tcp),
+// using the SAME precedence as parseMSSValue: the hierarchical `mss` child's
+// Keys[1] FIRST (if present), else the node's own flat Keys[1]. The bool is
+// false when neither position carries a token. #1979 Layer B shares this so
+// the Tier-3 commit-time validator (validateTCPMSSRanges) can never diverge
+// from what the compiler reads — it must range-check the SELECTED value, not
+// "both positions" (a mixed shape like `gre-in 70000 { mss 1360; }` compiles
+// the child 1360 and discards the flat 70000, so validating both would
+// wrongly reject it).
+func selectMSSToken(node *Node) (string, bool) {
 	// Hierarchical: ipsec-vpn { mss 1360; } or gre-in { mss 1360; }
-	mssChild := node.FindChild("mss")
-	if mssChild != nil && len(mssChild.Keys) >= 2 {
-		if v, err := strconv.Atoi(mssChild.Keys[1]); err == nil {
-			return v
-		}
+	if mssChild := node.FindChild("mss"); mssChild != nil && len(mssChild.Keys) >= 2 {
+		return mssChild.Keys[1], true
 	}
 	// Flat: ipsec-vpn 1360; (set syntax)
 	if len(node.Keys) >= 2 {
-		if v, err := strconv.Atoi(node.Keys[1]); err == nil {
-			return v
-		}
+		return node.Keys[1], true
+	}
+	return "", false
+}
+
+// parseMSSValue extracts MSS value from either "node { mss VALUE; }" or "node VALUE;" syntax.
+func parseMSSValue(node *Node) int {
+	tok, ok := selectMSSToken(node)
+	if !ok {
+		return 0
+	}
+	if v, err := strconv.Atoi(tok); err == nil {
+		return v
 	}
 	return 0
 }

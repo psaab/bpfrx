@@ -572,6 +572,84 @@ func compileLog(node *Node, sec *SecurityConfig) error {
 	return nil
 }
 
+// tcpMSSKinds are the four tcp-mss sub-kinds the compiler reads
+// (compileFlow MSS switch). Each carries a u16 MSS value that lands in a
+// Rust u16 wire field (TCPMSS{IPsecVPN,GreIn,GreOut}; all-tcp fans out into
+// all three) via buildFlowSnapshot (Layer A coerceWireU16, #1977).
+var tcpMSSKinds = []string{"ipsec-vpn", "gre-in", "gre-out", "all-tcp"}
+
+// validateTCPMSSRanges is the #1979 Layer-B Tier-3 commit-time range gate
+// for `security flow tcp-mss {ipsec-vpn|gre-in|gre-out|all-tcp} <n>`. It is
+// the compiler AST pre-walk counterpart of validateVRRPTrackInterfaceAST:
+// tcp-mss's MSS value can live in EITHER the kind node's own flat Keys[1]
+// (`gre-in 1400`) OR a hierarchical `mss` sub-child (`gre-in { mss 1360; }`),
+// a dual value-location the declarative schema walker (SchemaValidate)
+// cannot express — so tcp-mss stays OPAQUE in setSchema and is validated
+// here instead.
+//
+// It range-checks the COMPILER-SELECTED token (selectMSSToken, shared with
+// parseMSSValue) against [0, 65535] — the same Layer-A bound (coerceWireU16
+// out-of-range -> 0). Validating only the selected value means a mixed shape
+// like `gre-in 70000 { mss 1360; }` PASSES (the compiler selects the child
+// 1360; the flat 70000 is discarded), exactly matching what compileFlow
+// reads.
+//
+// Strict path (commit / commit-check, lenient=false): an out-of-range or
+// non-integer selected value is a hard compile error. Lenient path (load /
+// peer-sync, lenient=true): it is downgraded to a warning and Layer A coerces
+// it — a legacy persisted/peer config carrying `tcp-mss gre-in 70000` (a
+// value an older binary accepted) must still boot, exactly like the VRRP
+// lenient gate. Runs on the group-expanded tree so apply-groups-inherited
+// MSS values are covered.
+func validateTCPMSSRanges(nodes []*Node, prefix string, lenient bool) ([]string, error) {
+	var warnings []string
+	for _, n := range nodes {
+		nodePath := joinNodePath(prefix, n.Keys)
+		if n.Name() == "security" {
+			for _, flow := range n.FindChildren("flow") {
+				flowPath := joinNodePath(nodePath, []string{"flow"})
+				for _, mss := range flow.FindChildren("tcp-mss") {
+					mssPath := joinNodePath(flowPath, []string{"tcp-mss"})
+					for _, kind := range tcpMSSKinds {
+						for _, kn := range mss.FindChildren(kind) {
+							w, err := checkTCPMSSKind(kn, joinNodePath(mssPath, []string{kind}), lenient)
+							warnings = append(warnings, w...)
+							if err != nil {
+								return nil, err
+							}
+						}
+					}
+				}
+			}
+		}
+		w, err := validateTCPMSSRanges(n.Children, nodePath, lenient)
+		warnings = append(warnings, w...)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return warnings, nil
+}
+
+// checkTCPMSSKind range-checks one tcp-mss kind node's compiler-selected MSS
+// value. See validateTCPMSSRanges.
+func checkTCPMSSKind(node *Node, nodePath string, lenient bool) ([]string, error) {
+	tok, ok := selectMSSToken(node)
+	if !ok {
+		// No value token in either position — the compiler reads 0 (the
+		// "unset" sentinel). Not a range violation; leave it.
+		return nil, nil
+	}
+	if err := ValidateInteger(0, maxWireU16)(tok, nil); err != nil {
+		msg := fmt.Sprintf("%s: invalid tcp-mss value: %v", nodePath, err)
+		if !lenient {
+			return nil, fmt.Errorf("%s", msg)
+		}
+		return []string{msg + " (kept; the dataplane coerces it — a strict commit would reject this)"}, nil
+	}
+	return nil, nil
+}
+
 func compileFlow(node *Node, sec *SecurityConfig) error {
 	// Aggressive session aging
 	if agingNode := node.FindChild("aging"); agingNode != nil {
