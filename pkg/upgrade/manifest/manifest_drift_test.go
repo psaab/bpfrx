@@ -357,6 +357,39 @@ func TestStagedSrcCounterfactual(t *testing.T) {
 	if msgs := stagedSrcMismatches(bad); len(msgs) == 0 {
 		t.Fatal("a managed binary with no debian/rules install line must be flagged")
 	}
+
+	// Parse-path counterfactual (AGY review): exercise the actual text parser
+	// (extractRulesInstallPairs) on a synthetic debian/rules whose recipe
+	// installs a WRONG source under a correct managed basename, so the full
+	// parse->compare path is covered — the map-only checks above don't run the
+	// regex / line-continuation join.
+	const wrongRules = "override_dh_auto_install:\n" +
+		"\tinstall -d debian/xpf$(STAGED)\n" +
+		"\tinstall -m 0755 wrong/path/xpfd debian/xpf$(STAGED)/xpfd\n" +
+		"\tinstall -m 0755 cli              debian/xpf$(STAGED)/cli\n" +
+		"\tinstall -m 0755 xpf-userspace-dp debian/xpf$(STAGED)/xpf-userspace-dp\n" +
+		"\tinstall -m 0755 scripts/image/xpf-day0-config \\\n" +
+		"\t                                 debian/xpf$(STAGED)/xpf-day0-config\n" +
+		"\n" +
+		"override_dh_auto_test:\n"
+	parsed := extractRulesInstallPairs(t, wrongRules)
+	if parsed["xpfd"] != "wrong/path/xpfd" {
+		t.Fatalf("parser should capture the wrong source, got %q", parsed["xpfd"])
+	}
+	// The wrapped (line-continued) xpf-day0-config install must still parse to
+	// its source — confirms the `\`-join handles the real recipe shape.
+	if parsed["xpf-day0-config"] != "scripts/image/xpf-day0-config" {
+		t.Fatalf("wrapped install should parse to its source, got %q", parsed["xpf-day0-config"])
+	}
+	foundWrong := false
+	for _, m := range stagedSrcMismatches(parsed) {
+		if strings.Contains(m, "xpfd") && strings.Contains(m, "wrong/path/xpfd") {
+			foundWrong = true
+		}
+	}
+	if !foundWrong {
+		t.Fatal("the parse->compare path must flag the wrong xpfd source in debian/rules text")
+	}
 }
 
 // TestManifestShape locks the manifest's basic invariants so a careless edit
