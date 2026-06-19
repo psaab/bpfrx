@@ -10,13 +10,15 @@
 // emit_close_delta_with_origin, delete, demote_owner_rg). Bodies are
 // byte-for-byte identical; only the file boundary changed.
 //
-// No visibility was widened: every moved method keeps its original `pub`
-// / `pub(crate)` visibility (callable crate-wide off the pub(crate)
-// SessionTable type), and the private helpers/structs these methods
-// touch — remove_entry, next_epoch, index_forward_nat_key, push_delta,
-// entry_by_key_mut, session_timeout_ns, SessionRecord/SessionEntry — live
-// in the parent mod.rs and are visible to this descendant; push_to_wheel
-// (in expire.rs) and owner_rg_session_keys (in lookup.rs) are reached via
+// No visibility was widened in this file: every moved method keeps its
+// original `pub` / `pub(crate)` visibility (callable crate-wide off the
+// pub(crate) SessionTable type). (The one widening in the overall split
+// is `push_to_wheel` in expire.rs, not any method here.) The private
+// helpers/structs these methods touch — remove_entry, next_epoch,
+// index_forward_nat_key, push_delta, entry_by_key_mut,
+// session_timeout_ns, SessionRecord/SessionEntry — live in the parent
+// mod.rs and are visible to this descendant; push_to_wheel (in
+// expire.rs) and owner_rg_session_keys (in lookup.rs) are reached via
 // their existing pub/pub(in crate::session) visibility.
 //
 // The #1752/#1855 in-place-refresh contract (update_session,

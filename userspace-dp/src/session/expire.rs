@@ -3,10 +3,11 @@
 // cursor initialization, the throttled per-entry wheel scheduling, and
 // the per-tick bucket drain / lazy-delete expiry pass — lives here.
 // Bodies are byte-for-byte identical to the prior in-`mod.rs` form;
-// `push_to_wheel` was widened from a file-private `fn` to
+// `push_to_wheel` was widened from a module-private `fn` to
 // `pub(in crate::session)` because the in-place-refresh contract that
 // stays in `mod.rs` (and the install/lookup submodules) call it across
-// the module boundary. The `SessionWheel` machinery itself remains in
+// the submodule boundary into `expire`.
+// The `SessionWheel` machinery itself remains in
 // `wheel.rs`; this file holds the `SessionTable` methods that drive it.
 
 use super::wheel::{WHEEL_TICK_NS, WheelEntry, bucket_for_tick, target_tick_for};
@@ -41,10 +42,10 @@ impl SessionTable {
     /// wheel entries.
     ///
     /// MUST be called only AFTER `last_seen_ns` / `expires_after_ns`
-    /// have been written and the &mut borrow on `self.sessions` has
+    /// have been written and the `&mut` borrow on `self.entries` has
     /// dropped — otherwise the borrow checker will reject the
     /// `self.wheel.buckets[bucket].push_back(...)` line because it
-    /// aliases `self` through both `self.sessions` and `self.wheel`.
+    /// aliases `self` through both `self.entries` and `self.wheel`.
     #[inline]
     pub(in crate::session) fn push_to_wheel(&mut self, key: &SessionKey, now_ns: u64) {
         self.wheel_observe(now_ns);
@@ -74,7 +75,7 @@ impl SessionTable {
 
     /// #965: GC pass over the timer wheel.
     ///
-    /// Replaces the prior O(N) scan over `self.sessions` with a wheel
+    /// Replaces the prior O(N) scan over all sessions with a wheel
     /// pop. For each tick that has elapsed since the last call (up to
     /// `now_ns / WHEEL_TICK_NS`), drain the bucket at the current
     /// cursor and process its entries via the lazy-delete discriminator:

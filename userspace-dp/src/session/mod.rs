@@ -110,7 +110,7 @@ macro_rules! debug_log {
 // contract (update_session / refresh_for_ha_transition + the
 // secondary-index re-assert + #964 eager cleanup helpers) stay in
 // mod.rs. Submodule methods keep their original visibility; the only
-// widening is `push_to_wheel` (file-private `fn` → `pub(in
+// widening is `push_to_wheel` (module-private `fn` → `pub(in
 // crate::session)`) because callers in mod.rs / install / lookup cross
 // the module boundary into `expire`.
 mod expire;
