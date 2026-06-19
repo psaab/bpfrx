@@ -1529,3 +1529,254 @@ fn test_nonempty_excluded_still_inverts_after_fail_closed_guard() {
         "a source inside the (non-empty) excluded set must NOT match"
     );
 }
+
+// #2008 — Copilot match_any-under-exclusion finding (PR #2013).
+// `source-address any; source-address-excluded;` is the degenerate but
+// valid idiom "match if the source is NOT in `any`" — which is NOTHING.
+// The `any` literal compiles to MatchAny, so source_v4_match_any is set,
+// yet the excluded branch deliberately DROPS the match_any short-circuit
+// and instead asks `!(MatchAny.contains(src))`, which is `!true` = false
+// for every source → fail-closed deny. This pins that an excluded-`any`
+// rule denies ALL v4 traffic (NOT match-all, the bug Copilot worried
+// about). Mutation: if the excluded branch reused
+// `source_v4_match_any || ...` as the in-set predicate it would still be
+// correct here (MatchAny contains everything); the real regression guard
+// is that the excluded branch never short-circuits to src_ok=true on
+// match_any — verified by the Permit assertion in case 4 below.
+#[test]
+fn test_policy_source_any_excluded_denies_all_v4() {
+    let mut snap = v3_rule("r-any-excl-src-v4", &[], &["any"]);
+    snap.source_address_excluded = true;
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        std::slice::from_ref(&snap),
+        &test_zone_name_to_id(),
+        &[],
+        &counter_store,
+    )
+    .expect("parse");
+    // `any` → MatchAny on both families, so match_any is set but NOT
+    // empty (MatchAny is not MatchNone). The deny comes from the inner
+    // `!contains`, not from the empty fail-closed guard.
+    assert!(
+        state.rules[0].source_v4_match_any,
+        "an excluded `any` source must still flag v4 match_any"
+    );
+    assert!(
+        !state.rules[0].source_v4_empty,
+        "an excluded `any` source is NOT the empty set (MatchAny != MatchNone)"
+    );
+    for src in ["8.8.8.8", "10.5.5.5", "192.168.1.5"] {
+        assert_eq!(
+            evaluate_policy(
+                &state,
+                TEST_LAN_ZONE_ID,
+                TEST_WAN_ZONE_ID,
+                src.parse().expect("src"),
+                "172.16.80.200".parse().expect("dst"),
+                PROTO_TCP,
+                12345,
+                5201,
+            ),
+            PolicyAction::Deny,
+            "`source-address any; excluded;` must deny ALL v4 sources, not match-all"
+        );
+    }
+}
+
+// #2008 — v6 mirror of the excluded-`any` case. `any` covers both
+// families, so an excluded `any` source must also deny ALL v6 traffic.
+#[test]
+fn test_policy_source_any_excluded_denies_all_v6() {
+    let mut snap = v3_rule("r-any-excl-src-v6", &[], &["any"]);
+    snap.source_address_excluded = true;
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        std::slice::from_ref(&snap),
+        &test_zone_name_to_id(),
+        &[],
+        &counter_store,
+    )
+    .expect("parse");
+    assert!(
+        state.rules[0].source_v6_match_any,
+        "an excluded `any` source must still flag v6 match_any"
+    );
+    assert!(
+        !state.rules[0].source_v6_empty,
+        "an excluded `any` source is NOT the empty set on v6 either"
+    );
+    for src in ["2001:db8::1", "fe80::1", "::1"] {
+        assert_eq!(
+            evaluate_policy(
+                &state,
+                TEST_LAN_ZONE_ID,
+                TEST_WAN_ZONE_ID,
+                src.parse().expect("src"),
+                "2001:db8::2".parse().expect("dst"),
+                PROTO_TCP,
+                12345,
+                5201,
+            ),
+            PolicyAction::Deny,
+            "`source-address any; excluded;` must deny ALL v6 sources, not match-all"
+        );
+    }
+}
+
+// #2008 — destination mirror of the excluded-`any` case.
+#[test]
+fn test_policy_destination_any_excluded_denies_all_v4() {
+    let mut snap = v3_rule("r-any-excl-dst-v4", &[], &["any"]);
+    // destination defaults to `any` in v3_rule; mark it excluded.
+    snap.destination_address_excluded = true;
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        std::slice::from_ref(&snap),
+        &test_zone_name_to_id(),
+        &[],
+        &counter_store,
+    )
+    .expect("parse");
+    assert!(
+        state.rules[0].destination_v4_match_any,
+        "an excluded `any` destination must still flag v4 match_any"
+    );
+    assert!(
+        !state.rules[0].destination_v4_empty,
+        "an excluded `any` destination is NOT the empty set"
+    );
+    for dst in ["8.8.8.8", "172.16.80.200", "1.1.1.1"] {
+        assert_eq!(
+            evaluate_policy(
+                &state,
+                TEST_LAN_ZONE_ID,
+                TEST_WAN_ZONE_ID,
+                "10.0.61.100".parse().expect("src"),
+                dst.parse().expect("dst"),
+                PROTO_TCP,
+                12345,
+                5201,
+            ),
+            PolicyAction::Deny,
+            "`destination-address any; excluded;` must deny ALL v4 destinations"
+        );
+    }
+}
+
+// #2008 — regression sentinel for Copilot's concern: `source-address
+// any;` WITHOUT exclusion MUST still match every source (the match_any
+// short-circuit is preserved on the non-excluded path). This is the
+// case that would break if a fix naively dropped match_any handling
+// outright; the excluded-`any` deny tests above MUST coexist with this
+// match-all behavior. v4 and v6.
+#[test]
+fn test_policy_source_any_not_excluded_matches_all() {
+    let snap = v3_rule("r-any-incl-src", &[], &["any"]);
+    let counter_store = PolicyCounterStore::default();
+    // Default action is `deny` so a Permit can ONLY come from the rule
+    // matching (match-all), never from the default fallback — without
+    // this a non-matching rule would also return Permit and the test
+    // would not detect a broken match path.
+    let state = parse_policy_state_with_counters(
+        "deny",
+        std::slice::from_ref(&snap),
+        &test_zone_name_to_id(),
+        &[],
+        &counter_store,
+    )
+    .expect("parse");
+    assert!(
+        !state.rules[0].source_excluded,
+        "non-excluded `any` source must not set the excluded flag"
+    );
+    // v4: every source matches via match_any.
+    for (src, dst) in [
+        ("8.8.8.8", "1.1.1.1"),
+        ("10.5.5.5", "172.16.80.200"),
+        ("192.168.1.5", "203.0.113.7"),
+    ] {
+        assert_eq!(
+            evaluate_policy(
+                &state,
+                TEST_LAN_ZONE_ID,
+                TEST_WAN_ZONE_ID,
+                src.parse().expect("src"),
+                dst.parse().expect("dst"),
+                PROTO_TCP,
+                12345,
+                5201,
+            ),
+            PolicyAction::Permit,
+            "`source-address any;` (no exclusion) must match every v4 source"
+        );
+    }
+    // v6: every source matches via match_any (both-family `any`).
+    for (src, dst) in [("2001:db8::1", "2001:db8::2"), ("fe80::1", "2001:db8::9")] {
+        assert_eq!(
+            evaluate_policy(
+                &state,
+                TEST_LAN_ZONE_ID,
+                TEST_WAN_ZONE_ID,
+                src.parse().expect("src"),
+                dst.parse().expect("dst"),
+                PROTO_TCP,
+                12345,
+                5201,
+            ),
+            PolicyAction::Permit,
+            "`source-address any;` (no exclusion) must match every v6 source"
+        );
+    }
+}
+
+// #2008 — v6 mirror of the source-excluded inversion (case 1): a v6
+// literal set with `source-address-excluded` matches every v6 source
+// EXCEPT those in the set. The existing inversion test covers v4 only.
+#[test]
+fn test_policy_source_address_excluded_inverts_match_v6() {
+    let mut snap = v3_rule("r-excl-src-v6", &[], &["2001:db8:dead::/48"]);
+    snap.source_address_excluded = true;
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        std::slice::from_ref(&snap),
+        &test_zone_name_to_id(),
+        &[],
+        &counter_store,
+    )
+    .expect("parse");
+    // Source INSIDE the excluded v6 set → must NOT match → default-deny.
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            "2001:db8:dead::5".parse().expect("excluded v6 src"),
+            "2001:db8::2".parse().expect("dst"),
+            PROTO_TCP,
+            12345,
+            5201,
+        ),
+        PolicyAction::Deny,
+        "a v6 source inside the excluded set must NOT match"
+    );
+    // Source OUTSIDE the excluded v6 set → matches → permit.
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            "2001:db8:beef::5".parse().expect("non-excluded v6 src"),
+            "2001:db8::2".parse().expect("dst"),
+            PROTO_TCP,
+            12345,
+            5201,
+        ),
+        PolicyAction::Permit,
+        "a v6 source outside the excluded set must match"
+    );
+}
