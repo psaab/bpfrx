@@ -4058,6 +4058,60 @@ func TestBuildFlowSnapshotNilTCPSession(t *testing.T) {
 	}
 }
 
+// TestBuildFlowSnapshotPacksALGDisableFlags verifies the `security alg <proto>
+// disable` knobs reach the dataplane wire snapshot (#2008 H3/H4). Before the
+// fix the flags were written only to the legacy flow_config_map (no userspace
+// reader) and FlowSnapshot did not carry them at all, so `alg disable` was a
+// silent no-op. The bit layout MUST match pkg/dataplane/compiler.go and the
+// Rust ALG_DISABLE_* constants: DNS=0x01, FTP=0x02, SIP=0x04, TFTP=0x08.
+func TestBuildFlowSnapshotPacksALGDisableFlags(t *testing.T) {
+	cases := []struct {
+		name string
+		set  func(*config.ALGConfig)
+		want uint8
+	}{
+		{"none", func(*config.ALGConfig) {}, 0x00},
+		{"dns", func(a *config.ALGConfig) { a.DNSDisable = true }, 0x01},
+		{"ftp", func(a *config.ALGConfig) { a.FTPDisable = true }, 0x02},
+		{"sip", func(a *config.ALGConfig) { a.SIPDisable = true }, 0x04},
+		{"tftp", func(a *config.ALGConfig) { a.TFTPDisable = true }, 0x08},
+		{"dns+ftp", func(a *config.ALGConfig) {
+			a.DNSDisable = true
+			a.FTPDisable = true
+		}, 0x03},
+		{"all", func(a *config.ALGConfig) {
+			a.DNSDisable = true
+			a.FTPDisable = true
+			a.SIPDisable = true
+			a.TFTPDisable = true
+		}, 0x0f},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{}
+			tc.set(&cfg.Security.ALG)
+			snap := buildFlowSnapshot(cfg)
+			if snap.ALGDisableFlags != tc.want {
+				t.Fatalf("ALGDisableFlags = 0x%02x, want 0x%02x", snap.ALGDisableFlags, tc.want)
+			}
+			// The flags must survive the JSON wire encoding the helper
+			// decodes; a missing/renamed tag would silently drop them
+			// (the #1961 failure class).
+			data, err := json.Marshal(snap)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			var rt FlowSnapshot
+			if err := json.Unmarshal(data, &rt); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if rt.ALGDisableFlags != tc.want {
+				t.Fatalf("round-trip ALGDisableFlags = 0x%02x, want 0x%02x", rt.ALGDisableFlags, tc.want)
+			}
+		})
+	}
+}
+
 func TestBuildInterfaceSnapshotSetsTunnelFlag(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{

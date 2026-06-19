@@ -91,7 +91,32 @@ func buildFlowSnapshot(cfg *config.Config) FlowSnapshot {
 		snap.TCPSessionTimeout = coerceWireSessionTimeout(
 			"tcp_session_timeout", cfg.Security.Flow.TCPSession.EstablishedTimeout)
 	}
+	snap.ALGDisableFlags = algDisableFlags(&cfg.Security.ALG)
 	return snap
+}
+
+// algDisableFlags packs the `security alg <proto> disable` knobs into the
+// bitfield the userspace dataplane consumes (#2008 H3/H4). The bit layout
+// MUST match pkg/dataplane/compiler.go's legacy flow_config_map encoding and
+// the Rust ALG_DISABLE_* constants: DNS=0x01, FTP=0x02, SIP=0x04, TFTP=0x08.
+func algDisableFlags(alg *config.ALGConfig) uint8 {
+	if alg == nil {
+		return 0
+	}
+	var flags uint8
+	if alg.DNSDisable {
+		flags |= 0x01
+	}
+	if alg.FTPDisable {
+		flags |= 0x02
+	}
+	if alg.SIPDisable {
+		flags |= 0x04
+	}
+	if alg.TFTPDisable {
+		flags |= 0x08
+	}
+	return flags
 }
 
 func buildFlowExportSnapshot(cfg *config.Config) *FlowExportSnapshot {
