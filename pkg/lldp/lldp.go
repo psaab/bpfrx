@@ -53,15 +53,15 @@ const (
 
 // Neighbor represents a discovered LLDP neighbor on an interface.
 type Neighbor struct {
-	ChassisID   string // chassis identifier (MAC or string)
-	PortID      string // port identifier (interface name)
-	TTL         int    // advertised hold time in seconds
-	SystemName  string
-	SystemDesc  string
-	PortDesc    string
-	LastSeen    time.Time
-	ExpiresAt   time.Time
-	Interface   string // local interface where neighbor was seen
+	ChassisID  string // chassis identifier (MAC or string)
+	PortID     string // port identifier (interface name)
+	TTL        int    // advertised hold time in seconds
+	SystemName string
+	SystemDesc string
+	PortDesc   string
+	LastSeen   time.Time
+	ExpiresAt  time.Time
+	Interface  string // local interface where neighbor was seen
 }
 
 // LLDPInterface holds per-interface LLDP configuration.
@@ -209,7 +209,13 @@ func (m *Manager) txLoop(ctx context.Context, iface *net.Interface, interval tim
 
 // sendFrame builds and sends a single LLDP frame on the interface.
 func (m *Manager) sendFrame(iface *net.Interface, ttl int, sysName, sysDesc string) {
-	frame := BuildFrame(iface.HardwareAddr, iface.Name, ttl, sysName, sysDesc)
+	frame, err := BuildFrame(iface.HardwareAddr, iface.Name, ttl, sysName, sysDesc)
+	if err != nil {
+		// Fail closed: skip this advertisement rather than send a malformed
+		// frame with a wrapped TLV length (#2036).
+		slog.Warn("LLDP TX: skipping frame with overlength TLV", "interface", iface.Name, "err", err)
+		return
+	}
 
 	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_ALL)))
 	if err != nil {
@@ -311,22 +317,38 @@ func (m *Manager) expiryLoop(ctx context.Context) {
 	}
 }
 
-// BuildFrame constructs a complete LLDP Ethernet frame.
-func BuildFrame(srcMAC net.HardwareAddr, portName string, ttl int, sysName, sysDesc string) []byte {
+// BuildFrame constructs a complete LLDP Ethernet frame. It fails closed if any
+// variable-length identity TLV (system name/description, port description)
+// exceeds the 9-bit TLV length limit, rather than emitting a malformed
+// advertisement (#2036).
+func BuildFrame(srcMAC net.HardwareAddr, portName string, ttl int, sysName, sysDesc string) ([]byte, error) {
 	var tlvs []byte
-	tlvs = append(tlvs, EncodeTLV(tlvChassisID, encodeChassisID(srcMAC))...)
-	tlvs = append(tlvs, EncodeTLV(tlvPortID, encodePortID(portName))...)
-	tlvs = append(tlvs, EncodeTLV(tlvTTL, encodeTTL(ttl))...)
-	if sysName != "" {
-		tlvs = append(tlvs, EncodeTLV(tlvSystemName, []byte(sysName))...)
+	// Fixed / OS-bounded TLVs (chassis ID = MAC, port ID = ifname, TTL, End).
+	tlvs = append(tlvs, mustEncodeTLV(tlvChassisID, encodeChassisID(srcMAC))...)
+	tlvs = append(tlvs, mustEncodeTLV(tlvPortID, encodePortID(portName))...)
+	tlvs = append(tlvs, mustEncodeTLV(tlvTTL, encodeTTL(ttl))...)
+	// Variable-length identity TLVs: fail closed on overlength rather than
+	// shipping a frame whose wrapped 9-bit length desynchronizes the receiver.
+	optional := []struct {
+		typ int
+		val []byte
+		on  bool
+	}{
+		{tlvSystemName, []byte(sysName), sysName != ""},
+		{tlvSystemDesc, []byte(sysDesc), sysDesc != ""},
+		{tlvPortDesc, []byte(portName), portName != ""},
 	}
-	if sysDesc != "" {
-		tlvs = append(tlvs, EncodeTLV(tlvSystemDesc, []byte(sysDesc))...)
+	for _, o := range optional {
+		if !o.on {
+			continue
+		}
+		enc, err := EncodeTLV(o.typ, o.val)
+		if err != nil {
+			return nil, err
+		}
+		tlvs = append(tlvs, enc...)
 	}
-	if portName != "" {
-		tlvs = append(tlvs, EncodeTLV(tlvPortDesc, []byte(portName))...)
-	}
-	tlvs = append(tlvs, EncodeTLV(tlvEnd, nil)...) // End TLV
+	tlvs = append(tlvs, mustEncodeTLV(tlvEnd, nil)...) // End TLV
 
 	// Build Ethernet frame: dst(6) + src(6) + ethertype(2) + payload.
 	frame := make([]byte, 0, ethHdrLen+len(tlvs))
@@ -338,17 +360,42 @@ func BuildFrame(srcMAC net.HardwareAddr, portName string, ttl int, sysName, sysD
 	}
 	frame = append(frame, byte(etherTypeLLDP>>8), byte(etherTypeLLDP&0xff))
 	frame = append(frame, tlvs...)
-	return frame
+	return frame, nil
 }
 
-// EncodeTLV encodes a single LLDP TLV (type-length-value).
+// maxTLVValueLen is the largest value an LLDP TLV can carry: the length field
+// is 9 bits, so 511 bytes. A larger value would wrap the header length while
+// the full payload stayed in the frame, so a receiver would misparse the
+// overflow as following TLVs — a malformed advertisement (#2036).
+const maxTLVValueLen = 0x1ff
+
+// EncodeTLV encodes a single LLDP TLV (type-length-value). It FAILS CLOSED on
+// an overlength value rather than masking the 9-bit length and emitting a
+// malformed frame — advertised identity must not be silently lossy.
 // TLV header: 7 bits type + 9 bits length = 2 bytes.
-func EncodeTLV(tlvType int, value []byte) []byte {
+func EncodeTLV(tlvType int, value []byte) ([]byte, error) {
 	length := len(value)
+	if length > maxTLVValueLen {
+		return nil, fmt.Errorf("lldp: TLV type %d value is %d bytes, exceeds the %d-byte (9-bit) length limit",
+			tlvType, length, maxTLVValueLen)
+	}
 	header := uint16(tlvType&0x7f)<<9 | uint16(length&0x1ff)
 	out := make([]byte, 2+length)
 	binary.BigEndian.PutUint16(out[:2], header)
 	copy(out[2:], value)
+	return out, nil
+}
+
+// mustEncodeTLV is EncodeTLV for callers whose value length is bounded at
+// compile time (the End TLV) or by a hard OS limit (chassis ID = MAC, port ID =
+// interface name, TTL = 2 bytes) and so can never exceed the 9-bit limit. It
+// panics if that invariant is ever violated rather than returning a malformed
+// frame.
+func mustEncodeTLV(tlvType int, value []byte) []byte {
+	out, err := EncodeTLV(tlvType, value)
+	if err != nil {
+		panic(err)
+	}
 	return out
 }
 
