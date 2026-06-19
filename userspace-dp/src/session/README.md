@@ -9,9 +9,27 @@ structure.)
 
 ## Files
 
-- `mod.rs` — `SessionTable`: slab-allocated `SessionEntry`s, three
-  `FxHashMap`s indexing by canonical / forward / reverse key. Slab +
-  integer-handle layout shipped in #964 Step 1.
+- `mod.rs` — `SessionTable` coordinator: the slab + `FxHashMap`
+  secondary indices (canonical / forward / reverse key), the delta
+  queue, and the #1752/#1855 in-place-refresh contract
+  (`update_session` / `refresh_for_ha_transition` + the secondary-index
+  re-assert + the #964 eager-cleanup `remove_entry`/`index_*` helpers).
+  Slab + integer-handle layout shipped in #964 Step 1; the impl is
+  split across `lookup.rs` / `install.rs` / `expire.rs` (#2005,
+  pure code-motion — all submodules attach `impl SessionTable` blocks).
+- `lookup.rs` — forward/reverse tuple match read path: the `lookup`
+  family (primary + NAT-translated-reverse alias), the NAT/wire reverse
+  finders (`find_forward_nat_match` / `find_forward_wire_match`), the
+  single-entry / owner-RG / iteration read accessors, and
+  `take_synced_local`.
+- `install.rs` — session-creation path: the #1861 capacity preflight
+  (`can_admit` + counters), the new-flow installs
+  (`install_with_protocol*` / `upsert_synced*`), and the delta-emit /
+  `delete` / owner-RG demotion helpers. These build fresh records; the
+  in-place-refresh path stays in `mod.rs`.
+- `expire.rs` — timer-wheel sweeps + eviction: `expire_stale_entries`
+  (the per-tick bucket drain / lazy-delete GC pass), the throttled
+  `push_to_wheel` scheduler, and `wheel_observe`.
 - `key.rs` — `SessionKey`, `forward_wire_key` (ingress 5-tuple),
   `reverse_canonical_key` (post-NAT lookup), and
   `reply_matches_forward_session` (the predicate used to detect "this
