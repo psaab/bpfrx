@@ -1,10 +1,14 @@
-// Package flowexport implements NetFlow v9 flow data export.
 package flowexport
 
 import (
+	"context"
 	"encoding/binary"
 	"net"
+	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/psaab/xpf/pkg/logging"
 )
 
 // NetFlow v9 field type IDs (RFC 3954).
@@ -158,27 +162,6 @@ func recordSize(fields []templateField) int {
 	// Pad to 4-byte boundary
 	pad := (4 - size%4) % 4
 	return size + pad
-}
-
-// FlowRecord holds the data for a single NetFlow record.
-type FlowRecord struct {
-	SrcIP     net.IP
-	DstIP     net.IP
-	SrcPort   uint16
-	DstPort   uint16
-	Protocol  uint8
-	TOS       uint8
-	TCPFlags  uint8
-	Direction uint8
-	InIf      uint32
-	OutIf     uint32
-	Packets   uint64
-	Bytes     uint64
-	StartTime time.Time
-	EndTime   time.Time
-	SrcMask   uint8
-	DstMask   uint8
-	IsIPv6    bool
 }
 
 // nfHeader is the 20-byte NetFlow v9 packet header.
@@ -410,4 +393,197 @@ func uptimeMs(boot, t time.Time) uint32 {
 		return 0
 	}
 	return uint32(d.Milliseconds())
+}
+
+// Exporter sends NetFlow v9 packets to configured collectors.
+type Exporter struct {
+	cfg             ExportConfig
+	bootTime        time.Time
+	sourceID        uint32
+	fieldsV4        []templateField
+	fieldsV6        []templateField
+	recSizeV4       int
+	recSizeV6       int
+	templateFlowSet []byte
+
+	mu    sync.Mutex
+	seq   uint32
+	conns *collectorConns
+
+	// Batching: accumulate records, flush periodically
+	batch flowBatch
+
+	// Stats
+	exportedFlows atomic.Uint64
+	exportedPkts  atomic.Uint64
+}
+
+// NewExporter creates a new NetFlow v9 exporter.
+func NewExporter(cfg ExportConfig) (*Exporter, error) {
+	e := &Exporter{
+		cfg:      cfg,
+		bootTime: time.Now(),
+		sourceID: 1,
+		fieldsV4: buildTemplateFieldsV4(cfg.V9TemplateOpts),
+		fieldsV6: buildTemplateFieldsV6(cfg.V9TemplateOpts),
+	}
+	e.recSizeV4 = recordSize(e.fieldsV4)
+	e.recSizeV6 = recordSize(e.fieldsV6)
+	e.templateFlowSet = encodeTemplateFlowSet(cfg.V9TemplateOpts)
+
+	conns, err := dialCollectors(cfg.Collectors)
+	if err != nil {
+		return nil, err
+	}
+	e.conns = conns
+
+	return e, nil
+}
+
+// Run starts the exporter's background goroutines. Blocks until ctx is cancelled.
+func (e *Exporter) Run(ctx context.Context) {
+	// Send initial template
+	e.sendTemplates()
+
+	templateTicker := time.NewTicker(e.cfg.TemplateRefreshRate)
+	defer templateTicker.Stop()
+
+	batchTicker := time.NewTicker(100 * time.Millisecond)
+	defer batchTicker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Flush remaining batches
+			e.flushBatches()
+			return
+		case <-templateTicker.C:
+			e.sendTemplates()
+		case <-batchTicker.C:
+			e.flushBatches()
+		}
+	}
+}
+
+// ExportSessionClose converts a session-close event into a flow record and queues it.
+func (e *Exporter) ExportSessionClose(rec logging.EventRecord, evt SessionCloseData) {
+	fr := FlowRecord{
+		SrcIP:     evt.SrcIP,
+		DstIP:     evt.DstIP,
+		SrcPort:   evt.SrcPort,
+		DstPort:   evt.DstPort,
+		Protocol:  evt.Protocol,
+		Packets:   rec.SessionPkts,
+		Bytes:     rec.SessionBytes,
+		StartTime: rec.Time.Add(-estimateSessionDuration(rec.SessionPkts, evt.Protocol)),
+		EndTime:   rec.Time,
+		IsIPv6:    evt.IsIPv6,
+	}
+
+	e.batch.add(fr)
+}
+
+// Stats returns export statistics.
+func (e *Exporter) Stats() (flows, packets uint64) {
+	return e.exportedFlows.Load(), e.exportedPkts.Load()
+}
+
+// Close shuts down all collector connections.
+func (e *Exporter) Close() {
+	e.conns.close()
+}
+
+func (e *Exporter) sendTemplates() {
+	e.mu.Lock()
+	seq := e.seq
+	e.seq++
+	e.mu.Unlock()
+
+	now := time.Now()
+	hdr := nfHeader{
+		Version:   9,
+		Count:     2, // 2 templates
+		SysUptime: uptimeMs(e.bootTime, now),
+		UnixSecs:  uint32(now.Unix()),
+		SeqNumber: seq,
+		SourceID:  e.sourceID,
+	}
+
+	pkt := make([]byte, 20+len(e.templateFlowSet))
+	encodeHeaderInto(pkt[:20], hdr)
+	copy(pkt[20:], e.templateFlowSet)
+	e.conns.writeAll(pkt, "netflow template send failed")
+}
+
+func (e *Exporter) flushBatches() {
+	v4, v6 := e.batch.drain()
+
+	if len(v4) > 0 {
+		e.sendRecords(v4)
+	}
+	if len(v6) > 0 {
+		e.sendRecords(v6)
+	}
+}
+
+func (e *Exporter) sendRecords(records []FlowRecord) {
+	if len(records) == 0 {
+		return
+	}
+
+	isV6 := records[0].IsIPv6
+	var (
+		fields  []templateField
+		recSize int
+		tmplID  uint16
+	)
+	if isV6 {
+		fields = e.fieldsV6
+		recSize = e.recSizeV6
+		tmplID = templateIDv6
+	} else {
+		fields = e.fieldsV4
+		recSize = e.recSizeV4
+		tmplID = templateIDv4
+	}
+
+	// Split into chunks that fit in maxPayload
+	// Reserve 20 bytes for header + 4 bytes for flowset header
+	maxRecords := (maxPayload - 20 - 4) / recSize
+	if maxRecords < 1 {
+		maxRecords = 1
+	}
+
+	for i := 0; i < len(records); i += maxRecords {
+		end := i + maxRecords
+		if end > len(records) {
+			end = len(records)
+		}
+		batch := records[i:end]
+		dataLen := dataFlowSetLen(len(batch), recSize)
+
+		e.mu.Lock()
+		seq := e.seq
+		e.seq++
+		e.mu.Unlock()
+
+		now := time.Now()
+		hdr := nfHeader{
+			Version:   9,
+			Count:     uint16(len(batch)),
+			SysUptime: uptimeMs(e.bootTime, now),
+			UnixSecs:  uint32(now.Unix()),
+			SeqNumber: seq,
+			SourceID:  e.sourceID,
+		}
+
+		pkt := make([]byte, 20+dataLen)
+		encodeHeaderInto(pkt[:20], hdr)
+		encodeDataFlowSetInto(pkt[20:], batch, e.bootTime,
+			tmplID, fields, recSize)
+		e.conns.writeAll(pkt, "netflow data send failed")
+
+		e.exportedFlows.Add(uint64(len(batch)))
+		e.exportedPkts.Add(1)
+	}
 }

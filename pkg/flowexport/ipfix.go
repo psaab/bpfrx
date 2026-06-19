@@ -1,17 +1,13 @@
-// Package flowexport implements IPFIX (RFC 7011 / NetFlow v10) flow data export.
 package flowexport
 
 import (
 	"context"
 	"encoding/binary"
-	"fmt"
-	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/logging"
 )
 
@@ -293,11 +289,9 @@ type IPFIXExporter struct {
 
 	mu    sync.Mutex
 	seq   uint32 // cumulative data record count
-	conns []net.Conn
+	conns *collectorConns
 
-	batchMu sync.Mutex
-	batchV4 []FlowRecord
-	batchV6 []FlowRecord
+	batch flowBatch
 
 	exportedFlows atomic.Uint64
 	exportedPkts  atomic.Uint64
@@ -311,27 +305,11 @@ func NewIPFIXExporter(cfg ExportConfig) (*IPFIXExporter, error) {
 		templateSet: encodeIPFIXTemplateSet(),
 	}
 
-	for _, cc := range cfg.Collectors {
-		var conn net.Conn
-		var err error
-		if cc.SourceAddress != "" {
-			laddr, _ := net.ResolveUDPAddr("udp", cc.SourceAddress+":0")
-			raddr, err2 := net.ResolveUDPAddr("udp", cc.Address)
-			if err2 != nil {
-				return nil, fmt.Errorf("resolve collector %s: %w", cc.Address, err2)
-			}
-			conn, err = net.DialUDP("udp", laddr, raddr)
-		} else {
-			conn, err = net.Dial("udp", cc.Address)
-		}
-		if err != nil {
-			for _, c := range e.conns {
-				c.Close()
-			}
-			return nil, fmt.Errorf("dial collector %s: %w", cc.Address, err)
-		}
-		e.conns = append(e.conns, conn)
+	conns, err := dialCollectors(cfg.Collectors)
+	if err != nil {
+		return nil, err
 	}
+	e.conns = conns
 
 	return e, nil
 }
@@ -374,13 +352,7 @@ func (e *IPFIXExporter) ExportSessionClose(rec logging.EventRecord, evt SessionC
 		IsIPv6:    evt.IsIPv6,
 	}
 
-	e.batchMu.Lock()
-	if fr.IsIPv6 {
-		e.batchV6 = append(e.batchV6, fr)
-	} else {
-		e.batchV4 = append(e.batchV4, fr)
-	}
-	e.batchMu.Unlock()
+	e.batch.add(fr)
 }
 
 // Stats returns export statistics.
@@ -390,9 +362,7 @@ func (e *IPFIXExporter) Stats() (flows, packets uint64) {
 
 // Close shuts down all collector connections.
 func (e *IPFIXExporter) Close() {
-	for _, c := range e.conns {
-		c.Close()
-	}
+	e.conns.close()
 }
 
 func (e *IPFIXExporter) sendTemplates() {
@@ -408,20 +378,11 @@ func (e *IPFIXExporter) sendTemplates() {
 	pkt := make([]byte, 16+len(e.templateSet))
 	encodeIPFIXHeaderInto(pkt[:16], hdr)
 	copy(pkt[16:], e.templateSet)
-	for _, c := range e.conns {
-		if _, err := c.Write(pkt); err != nil {
-			slog.Debug("ipfix template send failed", "err", err)
-		}
-	}
+	e.conns.writeAll(pkt, "ipfix template send failed")
 }
 
 func (e *IPFIXExporter) flushBatches() {
-	e.batchMu.Lock()
-	v4 := e.batchV4
-	v6 := e.batchV6
-	e.batchV4 = nil
-	e.batchV6 = nil
-	e.batchMu.Unlock()
+	v4, v6 := e.batch.drain()
 
 	if len(v4) > 0 {
 		e.sendRecords(v4)
@@ -480,96 +441,9 @@ func (e *IPFIXExporter) sendRecords(records []FlowRecord) {
 		pkt := make([]byte, 16+dataLen)
 		encodeIPFIXHeaderInto(pkt[:16], hdr)
 		encodeIPFIXDataSetInto(pkt[16:], batch, tmplID, recSize)
-		for _, c := range e.conns {
-			if _, err := c.Write(pkt); err != nil {
-				slog.Debug("ipfix data send failed", "err", err)
-			}
-		}
+		e.conns.writeAll(pkt, "ipfix data send failed")
 
 		e.exportedFlows.Add(uint64(len(batch)))
 		e.exportedPkts.Add(1)
 	}
-}
-
-// BuildIPFIXExportConfig resolves IPFIX config into an ExportConfig.
-// Falls back to v9 collectors/sampling if no IPFIX-specific overrides.
-func BuildIPFIXExportConfig(svc *config.ServicesConfig, fo *config.ForwardingOptionsConfig) *ExportConfig {
-	if fo == nil || fo.Sampling == nil || len(fo.Sampling.Instances) == 0 {
-		return nil
-	}
-	if svc == nil || svc.FlowMonitoring == nil || svc.FlowMonitoring.VersionIPFIX == nil {
-		return nil
-	}
-
-	activeTimeout := 60 * time.Second
-	inactiveTimeout := 15 * time.Second
-	refreshRate := 60 * time.Second
-
-	for _, tmpl := range svc.FlowMonitoring.VersionIPFIX.Templates {
-		if tmpl.FlowActiveTimeout > 0 {
-			activeTimeout = time.Duration(tmpl.FlowActiveTimeout) * time.Second
-		}
-		if tmpl.FlowInactiveTimeout > 0 {
-			inactiveTimeout = time.Duration(tmpl.FlowInactiveTimeout) * time.Second
-		}
-		if tmpl.TemplateRefreshRate > 0 {
-			refreshRate = time.Duration(tmpl.TemplateRefreshRate) * time.Second
-		}
-		break // use first template
-	}
-
-	ec := &ExportConfig{
-		FlowActiveTimeout:   activeTimeout,
-		FlowInactiveTimeout: inactiveTimeout,
-		TemplateRefreshRate: refreshRate,
-	}
-
-	// Reuse same sampling rate + collectors as v9 (shared forwarding-options)
-	for _, inst := range fo.Sampling.Instances {
-		if inst.InputRate > 0 {
-			ec.SamplingRate = inst.InputRate
-			break
-		}
-	}
-
-	for _, inst := range fo.Sampling.Instances {
-		families := []*config.SamplingFamily{inst.FamilyInet, inst.FamilyInet6}
-		for _, fam := range families {
-			if fam == nil {
-				continue
-			}
-			for _, fs := range fam.FlowServers {
-				addr := fs.Address
-				if fs.Port > 0 {
-					addr = fmt.Sprintf("%s:%d", fs.Address, fs.Port)
-				}
-				srcAddr := fam.SourceAddress
-				if srcAddr == "" {
-					srcAddr = fam.InlineJflowSourceAddress
-				}
-				ec.Collectors = append(ec.Collectors, CollectorConfig{
-					Address:       addr,
-					SourceAddress: srcAddr,
-				})
-			}
-		}
-	}
-
-	if len(ec.Collectors) == 0 {
-		return nil
-	}
-
-	// Deduplicate collectors
-	seen := make(map[string]bool)
-	deduped := ec.Collectors[:0]
-	for _, c := range ec.Collectors {
-		key := collectorKey(c)
-		if !seen[key] {
-			seen[key] = true
-			deduped = append(deduped, c)
-		}
-	}
-	ec.Collectors = deduped
-
-	return ec
 }
