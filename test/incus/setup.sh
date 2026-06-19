@@ -103,8 +103,12 @@ die()   { echo "ERROR: $*" >&2; exit 1; }
 # not exist.
 instances_on_bridge() {
 	local bridge="$1"
+	# Tolerate leading whitespace: some incus/YAML renderings indent the
+	# used_by list items (`  - /1.0/instances/...`). Anchoring at column 0
+	# would silently emit nothing and disable the isolation guard (Copilot
+	# #2018). Allow optional indentation.
 	incus network show "$bridge" 2>/dev/null \
-		| sed -n 's#^- /1\.0/instances/##p'
+		| sed -n 's#^[[:space:]]*- /1\.0/instances/##p'
 }
 
 # Refuse to bring up / deploy to $INSTANCE_NAME while ANOTHER instance is
