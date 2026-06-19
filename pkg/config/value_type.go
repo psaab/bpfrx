@@ -67,6 +67,10 @@ const (
 	// ValueMAC is a MAC address (xx:xx:xx:xx:xx:xx), the #1956 device-map
 	// permanent-MAC fallback identity key. Validated by ValidateMAC.
 	ValueMAC
+	// ValueDHGroup is an IKE/IPsec Diffie-Hellman group as either a bare
+	// positive integer ("14") or the Junos "group<N>" spelling
+	// ("group14"). Both spellings compile; validated by ValidateDHGroup.
+	ValueDHGroup
 )
 
 // Placeholder returns the angle-bracket placeholder name shown in `?`
@@ -99,6 +103,8 @@ func (v ValueType) Placeholder() string {
 		return "<pci-address>"
 	case ValueMAC:
 		return "<mac-address>"
+	case ValueDHGroup:
+		return "<dh-group>"
 	}
 	return ""
 }
