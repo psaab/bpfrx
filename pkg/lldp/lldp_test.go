@@ -9,7 +9,10 @@ import (
 
 func TestEncodeTLV(t *testing.T) {
 	// End TLV: type=0, length=0 → 0x0000
-	end := EncodeTLV(tlvEnd, nil)
+	end, err := EncodeTLV(tlvEnd, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(end) != 2 {
 		t.Fatalf("expected 2 bytes, got %d", len(end))
 	}
@@ -18,7 +21,10 @@ func TestEncodeTLV(t *testing.T) {
 	}
 
 	// System Name TLV: type=5, value="test"
-	name := EncodeTLV(tlvSystemName, []byte("test"))
+	name, err := EncodeTLV(tlvSystemName, []byte("test"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(name) != 6 {
 		t.Fatalf("expected 6 bytes, got %d", len(name))
 	}
@@ -33,6 +39,45 @@ func TestEncodeTLV(t *testing.T) {
 	}
 	if string(name[2:]) != "test" {
 		t.Errorf("expected value 'test', got %q", string(name[2:]))
+	}
+}
+
+func TestEncodeTLV_FailsClosedOnOverlength(t *testing.T) {
+	// 511 bytes: the maximum a 9-bit length can express — accepted, and the
+	// encoded header length matches.
+	maxVal := make([]byte, maxTLVValueLen) // 511
+	enc, err := EncodeTLV(tlvSystemDesc, maxVal)
+	if err != nil {
+		t.Fatalf("511-byte value should encode, got: %v", err)
+	}
+	if got := int(binary.BigEndian.Uint16(enc[:2]) & 0x1ff); got != maxTLVValueLen {
+		t.Fatalf("encoded length should be %d, got %d", maxTLVValueLen, got)
+	}
+	// 512 and 600 bytes: would wrap the 9-bit length field — must be REJECTED,
+	// not silently masked into a malformed frame (#2036).
+	for _, n := range []int{maxTLVValueLen + 1, 600} {
+		if _, err := EncodeTLV(tlvSystemDesc, make([]byte, n)); err == nil {
+			t.Errorf("a %d-byte value must be rejected (would wrap the 9-bit length), got nil error", n)
+		}
+	}
+}
+
+func TestBuildFrame_FailsClosedOnOverlengthIdentity(t *testing.T) {
+	mac := net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55}
+	// An overlength variable-length identity TLV (system description) must fail
+	// the whole frame rather than emit a malformed advertisement.
+	huge := string(make([]byte, 600))
+	if _, err := BuildFrame(mac, "trust0", 120, "xpf", huge); err == nil {
+		t.Fatal("BuildFrame must fail closed on an overlength system-description TLV")
+	}
+	// An overlength port name must also fail closed (not panic), since portName
+	// is caller-supplied and BuildFrame now routes it through EncodeTLV (#2036).
+	if _, err := BuildFrame(mac, huge, 120, "xpf", "ok"); err == nil {
+		t.Fatal("BuildFrame must fail closed on an overlength port name TLV")
+	}
+	// A bounded frame still builds cleanly.
+	if _, err := BuildFrame(mac, "trust0", 120, "xpf", "ok"); err != nil {
+		t.Fatalf("bounded frame should build, got: %v", err)
 	}
 }
 
@@ -76,7 +121,10 @@ func TestEncodeTTL(t *testing.T) {
 
 func TestBuildFrame(t *testing.T) {
 	mac := net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55}
-	frame := BuildFrame(mac, "trust0", 120, "xpf", "stateful firewall")
+	frame, err := BuildFrame(mac, "trust0", 120, "xpf", "stateful firewall")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Check Ethernet header.
 	if len(frame) < ethHdrLen {
@@ -130,9 +178,9 @@ func TestParseTLVs_Incomplete(t *testing.T) {
 	// Missing Port ID — should return nil.
 	mac := net.HardwareAddr{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff}
 	var data []byte
-	data = append(data, EncodeTLV(tlvChassisID, encodeChassisID(mac))...)
-	data = append(data, EncodeTLV(tlvTTL, encodeTTL(60))...)
-	data = append(data, EncodeTLV(tlvEnd, nil)...)
+	data = append(data, mustEncodeTLV(tlvChassisID, encodeChassisID(mac))...)
+	data = append(data, mustEncodeTLV(tlvTTL, encodeTTL(60))...)
+	data = append(data, mustEncodeTLV(tlvEnd, nil)...)
 
 	n := ParseTLVs(data)
 	if n != nil {
@@ -142,7 +190,10 @@ func TestParseTLVs_Incomplete(t *testing.T) {
 
 func TestParseTLVs_Truncated(t *testing.T) {
 	// Header says 100 bytes but only 2 bytes available.
-	data := EncodeTLV(tlvSystemName, []byte("test"))
+	data, err := EncodeTLV(tlvSystemName, []byte("test"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	// Corrupt the length to be larger than available.
 	binary.BigEndian.PutUint16(data[:2], uint16(tlvSystemName)<<9|100)
 
@@ -241,7 +292,10 @@ func TestNeighborExpiry(t *testing.T) {
 func TestRoundTripTLVs(t *testing.T) {
 	// Build a frame and parse it back — full round-trip test.
 	mac := net.HardwareAddr{0xde, 0xad, 0xbe, 0xef, 0x00, 0x01}
-	frame := BuildFrame(mac, "ge-0/0/1", 300, "switch1", "Juniper EX4300")
+	frame, err := BuildFrame(mac, "ge-0/0/1", 300, "switch1", "Juniper EX4300")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	n := ParseTLVs(frame[ethHdrLen:])
 	if n == nil {
