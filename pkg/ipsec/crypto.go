@@ -3,9 +3,13 @@ package ipsec
 import (
 	"bytes"
 	"errors"
-	"fmt"
 	"strings"
 )
+
+// This file isolates the Junos $9$ pre-shared-key decryption surface so the
+// decryption logic can be audited and unit-tested independently of swanctl
+// config generation and XFRM netlink bindings (#1989). Do not add unrelated
+// config-rendering helpers here.
 
 // Portions of the $9$ decoder in this file are adapted from the MIT-licensed
 // github.com/nadddy/jcrypt project:
@@ -129,41 +133,4 @@ func junosGapDecode(gaps []byte, decode []int) byte {
 		num += int(gaps[i]) * decode[i]
 	}
 	return byte(num % 256)
-}
-
-func sanitizeChildName(name string) string {
-	if name == "" {
-		return "traffic-selector"
-	}
-	var b strings.Builder
-	for _, r := range name {
-		switch {
-		case r >= 'a' && r <= 'z':
-			b.WriteRune(r)
-		case r >= 'A' && r <= 'Z':
-			b.WriteRune(r)
-		case r >= '0' && r <= '9':
-			b.WriteRune(r)
-		case r == '-' || r == '_' || r == '.':
-			b.WriteRune(r)
-		default:
-			b.WriteByte('-')
-		}
-	}
-	out := b.String()
-	if out == "" {
-		return "traffic-selector"
-	}
-	return out
-}
-
-func authMethodToSwan(method string) (string, error) {
-	switch method {
-	case "", "pre-shared-keys":
-		return "psk", nil
-	case "rsa-signatures", "ecdsa-signatures":
-		return "pubkey", nil
-	default:
-		return "", fmt.Errorf("unsupported IKE authentication-method %q", method)
-	}
 }

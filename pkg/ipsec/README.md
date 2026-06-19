@@ -10,12 +10,37 @@ the apply path pays no fsync (the file is regenerated on every apply).
 
 ## Entry points
 
-- `Manager` — `ipsec.go`.
-- `New()` — `ipsec.go`. Default swanctl conf dir
+- `Manager` — `manager.go`.
+- `New()` — `manager.go`. Default swanctl conf dir
   `/etc/swanctl/conf.d`.
-- `Apply(ipsecCfg *config.IPsecConfig) error` — `ipsec.go`. Generate config and reload strongSwan.
-- `Clear() error` — `ipsec.go`.
-- `SAStatus`, `TerminateAllSAs`, `InitiateConnection`.
+- `Apply(ipsecCfg *config.IPsecConfig) error` — `manager.go`. Generate config and reload strongSwan.
+- `Clear() error` — `manager.go`.
+- `SAStatus`, `TerminateAllSAs`, `InitiateConnection`, `GetSAStatus`,
+  `ActiveConnectionNames` — `ike.go`.
+- `PrepareConfig(cfg *config.Config) *config.IPsecConfig` — `policy.go`.
+
+## Module layout (#1989)
+
+The package is split by responsibility (one responsibility per module);
+all files stay in `package ipsec`, so the public API is unchanged.
+
+- `manager.go` — transactional SA-config reconciler: `Manager`
+  lifecycle (`New`/`Apply`/`Clear`/`reload`) and the `swanctl`
+  shell-out helper (`runSwanctl`, `swanctlTimeout`).
+- `ike.go` — IKE/ESP settings resolution + proposal builders
+  (`resolveIKESettings`/`resolveESPSettings`/`deriveDPD`/`buildESPProposal`/
+  `dhGroupBits`) and the SA-status query + `swanctl --list-sas` SPI
+  parsing (`SAStatus`/`GetSAStatus`/`parseSAOutput`/`TerminateAllSAs`/
+  `InitiateConnection`/`ActiveConnectionNames`).
+- `crypto.go` — **isolated** Junos `$9$` pre-shared-key decryption
+  (`normalizePSK`/`decodeJunosSecret`/`junosGap`/`junosGapDecode` and the
+  `$9$` alphabet tables). Kept in its own file so the decryption surface
+  is auditable and unit-testable without pulling in the swanctl/XFRM
+  machinery.
+- `policy.go` — swanctl config generation (`renderConfig`/`generateConfig`,
+  traffic-selector resolution, value sanitizers, identity formatting,
+  `authMethodToSwan`, `xfrmiIfID`) plus XFRM bind-interface preparation
+  (`PrepareConfig` and its interface-address resolvers).
 
 ## Callers
 
