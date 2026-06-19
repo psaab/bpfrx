@@ -34,6 +34,18 @@ would drop the UDP listener and interrupt in-flight polls. The daemon calls it
 from `applyConfigLocked` (guarded on a non-nil agent; enabling SNMP for the
 first time still requires a restart, like the other start-once subsystems).
 
+The reconcile runs **early** in `applyConfigLocked` — before the dataplane
+apply, which can abort the reconcile pipeline early (it returns on
+`ErrPolicySchedulerProtocolIncompatible`). `Store.Commit()` has already
+promoted and persisted the compiled config by the time `applyConfigLocked`
+runs, so the committed authorization is live regardless of whether the later
+dataplane apply succeeds. Reconciling only at the tail would let an
+early-aborting apply leave a committed-downgraded community still serving the
+old (read-write) SET gate. The daemon-package test
+`TestApplyConfigLockedReconcilesSNMPBeforeDataplaneAbort` pins this ordering
+(it drives `applyConfigLocked` with a dataplane that returns the aborting
+sentinel and asserts the live gate still reflects the downgrade).
+
 Concurrency: `cfg` and the derived `v3Users` are guarded by `cfgMu`
 (`sync.RWMutex`). The request-serving goroutine reads them through
 `snapshotCfg` / `snapshotV3User` / `hasV3Users` under `RLock`; `UpdateConfig`

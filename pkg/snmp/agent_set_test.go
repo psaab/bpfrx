@@ -340,6 +340,51 @@ func buildV3DiscoveryRequest() []byte {
 	return berEncodeTLV(tagSequence, msgBody)
 }
 
+// TestSETAuthorized_MatchesLiveHandlerGate verifies that the exported
+// SETAuthorized observation matches what the actual SET handler decides against
+// the live config — across an UpdateConfig downgrade. This makes SETAuthorized
+// a faithful proxy for the live SET access-control gate, which the daemon
+// package's reconcile-wiring test relies on (it cannot reach the unexported
+// handlePacket / packet builders). For each community state the two must agree:
+// SETAuthorized == (handleSet did NOT return noAccess).
+func TestSETAuthorized_MatchesLiveHandlerGate(t *testing.T) {
+	a := NewAgent(&config.SNMPConfig{
+		Communities: map[string]*config.SNMPCommunity{
+			"c": {Name: "c", Authorization: "read-write"},
+		},
+	})
+
+	check := func(stage string, wantAuthorized bool) {
+		t.Helper()
+		gotAuthorized := a.SETAuthorized("c")
+		if gotAuthorized != wantAuthorized {
+			t.Fatalf("%s: SETAuthorized(c) = %v, want %v", stage, gotAuthorized, wantAuthorized)
+		}
+		resp := a.handlePacket(buildV2cSetRequest("c", 1, oidSysContact))
+		if resp == nil {
+			t.Fatalf("%s: SET produced no response", stage)
+		}
+		handlerAllowed := decodeResponseErrorStatus(t, resp) != errNoAccess
+		if handlerAllowed != gotAuthorized {
+			t.Fatalf("%s: live handler allowed=%v but SETAuthorized=%v (proxy diverged from gate)",
+				stage, handlerAllowed, gotAuthorized)
+		}
+	}
+
+	check("read-write", true)
+
+	a.UpdateConfig(&config.SNMPConfig{
+		Communities: map[string]*config.SNMPCommunity{
+			"c": {Name: "c", Authorization: "read-only"},
+		},
+	})
+	check("downgraded-read-only", false)
+
+	if a.SETAuthorized("missing") {
+		t.Error("SETAuthorized(missing) = true, want false for unknown community")
+	}
+}
+
 // TestGetCommunity_Authorization verifies getCommunity returns the community
 // struct with its authorization level intact, the lookup that backs the SET
 // access-control gate.

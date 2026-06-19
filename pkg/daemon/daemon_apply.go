@@ -338,6 +338,35 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 		return nil
 	}
 
+	// Reconcile the SNMP agent's live authorization/identity config FIRST
+	// (#2008 H17, Codex r2). The agent is created once at startup
+	// (daemon_run.go) and keeps serving on UDP/161; without this step a
+	// commit that flips a community read-write -> read-only, deletes a
+	// community, or changes the v3 user set would not reach the running agent
+	// until a daemon restart, leaving the SET access-control gate reading
+	// stale authorization.
+	//
+	// This MUST run before any reconcile step that can abort applyConfigLocked
+	// early — specifically the dataplane apply below, which returns early on
+	// ErrPolicySchedulerProtocolIncompatible (compileErrorMustAbortApply).
+	// Store.Commit() has ALREADY promoted and persisted this compiled config
+	// before applyConfigLocked runs, so the committed authorization is live
+	// regardless of whether the later dataplane apply succeeds. Reconciling
+	// only at the tail would leave a committed-downgraded community serving
+	// the OLD (read-write) gate on an apply that aborts early. Placed here it
+	// is unconditionally before every early-return path in the body (the only
+	// aborting one is the dataplane apply at compileErrorMustAbortApply).
+	//
+	// The swap is in-place (UpdateConfig holds the agent's cfgMu) so the UDP
+	// listener and in-flight polls are not interrupted, and it is idempotent —
+	// an atomic pointer/table swap, safe to call once per apply. Guarded on a
+	// non-nil agent: if SNMP was not enabled at startup there is no running
+	// listener to reconcile (enabling SNMP for the first time still requires a
+	// restart, matching the other start-once subsystems).
+	if d.snmpAgent != nil {
+		d.snmpAgent.UpdateConfig(cfg.System.SNMP)
+	}
+
 	// #1922 Item 2 bootstrap exit: the FIRST apply of a non-empty config
 	// (an interface-claiming confirmed commit, or a cluster SyncApply from
 	// the primary) leaves bootstrap mode and runs the one-time startup
@@ -1147,21 +1176,6 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 
 	// 16. Update flow traceoptions (trace file + filters)
 	d.updateFlowTrace(cfg)
-
-	// 16b. Reconcile the SNMP agent's live authorization/identity config
-	// (#2008 H17). The agent is created once at startup (daemon_run.go) and
-	// keeps serving on UDP/161; without this step a commit that flips a
-	// community read-write -> read-only, deletes a community, or changes the
-	// v3 user set would not reach the running agent until a daemon restart,
-	// leaving the SET access-control gate reading stale authorization. The
-	// swap is in-place (UpdateConfig holds the agent's cfgMu) so the UDP
-	// listener and in-flight polls are not interrupted. Guarded on a
-	// non-nil agent: if SNMP was not enabled at startup there is no running
-	// listener to reconcile (enabling SNMP for the first time still requires
-	// a restart, matching the other start-once subsystems).
-	if d.snmpAgent != nil {
-		d.snmpAgent.UpdateConfig(cfg.System.SNMP)
-	}
 
 	// 17. Update event-options policies (RPM-driven failover)
 	if d.eventEngine != nil {

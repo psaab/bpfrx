@@ -371,6 +371,21 @@ func communityCanWrite(c *config.SNMPCommunity) bool {
 	return c != nil && c.Authorization == "read-write"
 }
 
+// SETAuthorized reports whether the named community would pass the SET
+// access-control gate against the agent's CURRENTLY LIVE config — i.e. it
+// resolves the community from the same snapshotCfg() the request-serving path
+// uses (getCommunity) and applies the same communityCanWrite predicate
+// handleSet enforces. An unknown community returns false (handleSet drops it).
+//
+// This is a read-only observation of the live authorization gate, exported so
+// the daemon-package reconcile wiring test can assert that a committed
+// read-write -> read-only downgrade actually reached the running agent via
+// applyConfigLocked -> UpdateConfig. It takes no listener lock (getCommunity
+// reads cfg under cfgMu.RLock), so it is safe to call while the agent serves.
+func (a *Agent) SETAuthorized(community string) bool {
+	return communityCanWrite(a.getCommunity(community))
+}
+
 // handleSet processes a SET request (RFC 3416 pduSetRequest, 0xa3).
 //
 // Access control comes first: a community without "read-write" authorization
