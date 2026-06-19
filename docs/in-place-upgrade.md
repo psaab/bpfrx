@@ -192,10 +192,17 @@ drop-in removal is safe on legacy/never-seeded hosts (absent file) and leaves a
 non-empty `.service.d` (a foreign operator drop-in) intact. `versions/` is left
 on `remove` (a reinstall reuses it) and removed on `purge` (it is copied
 binaries, not operator config — Policy §6.8). A downgrade to a package
-predating this layout repoints sbin back to `staged/` atomically, deletes
-`versions/current`, then removes the runtime unit drop-in + boot-guarded
-`daemon-reload` (shared helper) — so the downgraded binaries actually take
-effect.
+predating this layout repoints sbin back to `staged/` atomically, removes the
+runtime unit drop-in + boot-guarded `daemon-reload` (shared helper), and
+finally deletes `versions/current` — so the downgraded binaries actually take
+effect. The destructive `versions/current` delete runs LAST (#1997): a kill
+mid-teardown after `rm current` but before the drop-in removal used to leave an
+orphan `10-xpf-version.conf` that a postrm RERUN skipped (the rerun saw
+`current` gone and took the false branch), pinning an `ExecStart` for a layout
+the downgraded package no longer manages. Removing the drop-in before the
+`current` delete shrinks the single-run window to nothing, and the rerun
+presence guard now also keys on the drop-in's presence so a rerun re-enters and
+converges (all three teardown steps are idempotent).
 
 ### Downgrade detection is exec-free and version-keyed (#1985)
 
@@ -216,11 +223,17 @@ is exec-free and has no staleness hazard:
 
 ```sh
 if incoming_predates_hardened_layout "$2" \
-   && { [ -L "$CURRENT" ] || [ -e "$CURRENT" ]; }; then
-    ... tear down ...
+   && { [ -L "$CURRENT" ] || [ -e "$CURRENT" ] || [ -e "$DROPIN" ]; }; then
+    repoint_owned_sbin_to_staged   # 1. owned sbin -> staged (idempotent)
+    remove_runtime_dropin          # 2. drop-in + daemon-reload (idempotent)
+    rm -f "$CURRENT"               # 3. delete current LAST (idempotent, #1997)
 fi
 # incoming_predates_hardened_layout: dpkg --compare-versions "$2" lt FLOOR
 ```
+
+The `|| [ -e "$DROPIN" ]` arm is the #1997 crash-rerun fix: it lets a postrm
+RERUN re-enter the teardown to finish removing an orphaned drop-in even after
+`versions/current` is already gone.
 
 `HARDENED_LAYOUT_FLOOR` is `0.0.4104` — the `.deb` version
 (`0.0.<commit-count>+g<sha>`, `Makefile` `DEB_VERSION`) of commit `ef9525e70`,
@@ -237,7 +250,8 @@ point (the contract already shipped), not a per-release value — it is
 never bumped.
 
 - The teardown runs ONLY when `$2` is a confirmed pre-#1964 version AND a
-  hardened layout is present (`versions/current`).
+  hardened artifact is present — `versions/current` OR (for the #1997
+  crash-rerun case) the runtime drop-in.
 - An empty or unparsable `$2` (`dpkg --compare-versions` exits 2) leaves the
   layout intact — the safe default, never a teardown on ambiguity. This
   mirrors the sibling `preinst migrate_legacy_layout` posture

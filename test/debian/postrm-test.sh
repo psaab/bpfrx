@@ -338,6 +338,94 @@ scenario_downgrade_below_floor_no_layout_noop() {
     done
 }
 
+# === #1997 regression: crash mid-teardown -> postrm RERUN completes drop-in cleanup ===
+
+# Reconstruct the EXACT on-disk state left by a kill mid-downgrade-teardown,
+# AFTER `rm versions/current` but BEFORE the drop-in was removed: current is
+# gone, the drop-in still exists, and sbin is already repointed to staged (the
+# repoint ran first). This is the orphan window the bug left behind. A postrm
+# RERUN of the same pre-#1964 downgrade MUST finish the job: remove the
+# orphaned 10-xpf-version.conf (and rmdir the empty .service.d), without
+# tripping over the now-absent current. Before #1997 the rerun saw current
+# gone, took the false branch on the versions/current-only guard, and left the
+# orphan drop-in pinning a stale ExecStart.
+build_crashed_midteardown() {
+    # Start from a full pre-#1964 downgrade source state, then simulate the
+    # crash: sbin already repointed to staged, current already removed, drop-in
+    # still present.
+    build_hardened "0.0.5000+gaaaa"
+    make_staged_prehardened
+    # Step 1 of the teardown already ran: sbin points at staged.
+    for b in $BINS; do ln -sf "$STAGED/$b" "$SBIN/$b"; done
+    # Step "rm current" already ran: current is gone.
+    rm -f "$CURRENT"
+    # The drop-in removal had NOT run yet: orphan still on disk.
+    [ -e "$DROPIN" ] || { echo "FAIL: precondition: drop-in should still exist before rerun"; exit 1; }
+    [ -e "$CURRENT" ] && { echo "FAIL: precondition: current should already be gone"; exit 1; } || true
+}
+
+scenario_rerun_after_crash_removes_orphan_dropin() {
+    build_crashed_midteardown
+    # Rerun the SAME pre-#1964 downgrade postrm.
+    "$ROOT/postrm" upgrade "0.0.4000+gbbbb"
+    [ -e "$DROPIN" ] && { echo "FAIL: rerun did not remove the orphan drop-in"; exit 1; } || true
+    [ -e "$(dirname "$DROPIN")" ] && { echo "FAIL: rerun did not rmdir the empty .service.d"; exit 1; } || true
+    # sbin stays repointed to staged (idempotent).
+    for b in $BINS; do
+        [ "$(readlink "$SBIN/$b")" = "$STAGED/$b" ] || { echo "FAIL: sbin $b not at staged after rerun"; exit 1; }
+    done
+    # current stays gone.
+    [ -e "$CURRENT" ] && { echo "FAIL: current resurrected on rerun"; exit 1; } || true
+}
+
+# NON-TAUTOLOGY PROOF: synthesize the PRE-#1997 (buggy) postrm by patching the
+# fixed script back to the old behavior — guard on versions/current ALONE and
+# delete current BEFORE the drop-in removal — then run the SAME rerun scenario
+# and assert it LEAVES the orphan. This proves scenario_rerun_after_crash_*
+# discriminates the fix: it FAILS on the old order/guard and PASSES on the new
+# one. If a future edit makes the new guard accidentally equivalent to the old
+# one, this scenario starts failing (the old script would no longer leave an
+# orphan), flagging the regression.
+patched_postrm_oldbug() {
+    # Reproduce the pre-#1997 two defects on top of the patched temp postrm:
+    #   1. drop the `|| [ -e "$DROPIN" ]` arm from the presence guard, AND
+    #   2. restore the old step order (rm current, THEN remove_runtime_dropin),
+    # by replacing the whole teardown if-body with the historical sequence.
+    # We do it with awk so the rewrite is robust to comment churn: between the
+    # guard `if incoming_predates_hardened_layout` line and its closing `fi`,
+    # emit the legacy body.
+    awk '
+      BEGIN { in_block = 0 }
+      /^[[:space:]]*if incoming_predates_hardened_layout "\$2" && \\$/ {
+        print "        if incoming_predates_hardened_layout \"$2\" && \\"
+        print "           { [ -L \"$CURRENT\" ] || [ -e \"$CURRENT\" ]; }; then"
+        print "            repoint_owned_sbin_to_staged"
+        print "            rm -f \"$CURRENT\""
+        print "            remove_runtime_dropin"
+        print "        fi"
+        in_block = 1
+        next
+      }
+      in_block == 1 {
+        # Skip original body lines until the closing `fi` of the if-block.
+        if ($0 ~ /^[[:space:]]*fi[[:space:]]*$/) { in_block = 0 }
+        next
+      }
+      { print }
+    ' "$ROOT/postrm" > "$ROOT/postrm.oldbug"
+    chmod +x "$ROOT/postrm.oldbug"
+}
+
+scenario_oldbug_leaves_orphan_proves_nontautology() {
+    build_crashed_midteardown
+    patched_postrm_oldbug
+    # Sanity: the synthesized old script must be valid shell.
+    sh -n "$ROOT/postrm.oldbug" || { echo "FAIL: synthesized old-bug postrm has a syntax error"; exit 1; }
+    "$ROOT/postrm.oldbug" upgrade "0.0.4000+gbbbb"
+    # The OLD behavior: rerun sees current gone, guard is false, drop-in stays.
+    [ -e "$DROPIN" ] || { echo "FAIL(non-tautology): old-bug postrm UNEXPECTEDLY removed the orphan drop-in — the rerun test would not discriminate the fix"; exit 1; }
+}
+
 run_scenario remove_keeps_versions
 run_scenario purge_removes_versions
 run_scenario remove_keeps_foreign_dropin
@@ -357,4 +445,6 @@ run_scenario remove_legacy_links
 run_scenario downgrade_removes_staged_gen_below_floor
 run_scenario downgrade_keeps_staged_gen_at_floor
 run_scenario downgrade_empty_version_keeps_staged_gen
+run_scenario rerun_after_crash_removes_orphan_dropin
+run_scenario oldbug_leaves_orphan_proves_nontautology
 echo "ALL POSTRM SCENARIOS PASSED"
