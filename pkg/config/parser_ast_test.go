@@ -51,7 +51,18 @@ security {
 }
 
 func TestBracketList(t *testing.T) {
+	// server1/2/3 are declared as address-book entries so the policy
+	// match-address strict validator (#2008) accepts the bracket-list
+	// references; this test only asserts bracket-list parsing yields
+	// three tokens.
 	input := `security {
+    address-book {
+        global {
+            address server1 10.0.0.1/32;
+            address server2 10.0.0.2/32;
+            address server3 10.0.0.3/32;
+        }
+    }
     policies {
         from-zone trust to-zone untrust {
             policy allow-all {
@@ -1355,9 +1366,14 @@ security {
 	if len(errs) > 0 {
 		t.Fatalf("parse errors: %v", errs)
 	}
-	cfg, err := CompileConfig(tree)
+	// #2008: a typo'd policy match address is a HARD error on the strict
+	// commit path. This test asserts the soft-warning surfacing of
+	// nonexistent zone / bad address / bad app, so it uses the tolerant
+	// (load / peer-sync) compile path where the address typo is
+	// downgraded to a warning alongside the other validation warnings.
+	cfg, err := CompileConfigLenient(tree)
 	if err != nil {
-		t.Fatalf("CompileConfig: %v", err)
+		t.Fatalf("CompileConfigLenient: %v", err)
 	}
 	if len(cfg.Warnings) == 0 {
 		t.Fatal("expected validation warnings, got none")
@@ -1382,6 +1398,12 @@ security {
 	}
 	if !foundApp {
 		t.Error("missing warning for bad-app")
+	}
+
+	// The same typo'd address MUST be a hard error on the strict commit
+	// path (#2008 fail-open gate).
+	if _, strictErr := CompileConfig(tree); strictErr == nil {
+		t.Error("strict CompileConfig must reject the typo'd policy address")
 	}
 }
 

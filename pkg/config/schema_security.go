@@ -26,9 +26,11 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			"policy": {desc: "Policy name", args: 1, valueHint: ValueHintPolicyName, placeholder: "<policy-name>", children: map[string]*schemaNode{
 				"description": {desc: "Policy description", args: 1, placeholder: "<text>", children: nil},
 				"match": {desc: "Match criteria", children: map[string]*schemaNode{
-					"source-address":      {desc: "Source address", args: 1, multi: true, valueHint: ValueHintPolicyAddress, placeholder: "<address>", children: nil},
-					"destination-address": {desc: "Destination address", args: 1, multi: true, valueHint: ValueHintPolicyAddress, placeholder: "<address>", children: nil},
-					"application":         {desc: "Application", args: 1, multi: true, valueHint: ValueHintPolicyApp, placeholder: "<application>", children: nil},
+					"source-address":               {desc: "Source address", args: 1, multi: true, valueHint: ValueHintPolicyAddress, placeholder: "<address>", children: nil},
+					"destination-address":          {desc: "Destination address", args: 1, multi: true, valueHint: ValueHintPolicyAddress, placeholder: "<address>", children: nil},
+					"source-address-excluded":      {desc: "Match all sources except source-address", children: nil},
+					"destination-address-excluded": {desc: "Match all destinations except destination-address", children: nil},
+					"application":                  {desc: "Application", args: 1, multi: true, valueHint: ValueHintPolicyApp, placeholder: "<application>", children: nil},
 				}},
 				"then": {desc: "Action", children: map[string]*schemaNode{
 					"log": {desc: "Log session", children: nil},
@@ -40,9 +42,11 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			"policy": {desc: "Policy name", args: 1, valueHint: ValueHintPolicyName, placeholder: "<policy-name>", children: map[string]*schemaNode{
 				"description": {desc: "Policy description", args: 1, placeholder: "<text>", children: nil},
 				"match": {desc: "Match criteria", children: map[string]*schemaNode{
-					"source-address":      {desc: "Source address", args: 1, multi: true, valueHint: ValueHintPolicyAddress, placeholder: "<address>", children: nil},
-					"destination-address": {desc: "Destination address", args: 1, multi: true, valueHint: ValueHintPolicyAddress, placeholder: "<address>", children: nil},
-					"application":         {desc: "Application", args: 1, multi: true, valueHint: ValueHintPolicyApp, placeholder: "<application>", children: nil},
+					"source-address":               {desc: "Source address", args: 1, multi: true, valueHint: ValueHintPolicyAddress, placeholder: "<address>", children: nil},
+					"destination-address":          {desc: "Destination address", args: 1, multi: true, valueHint: ValueHintPolicyAddress, placeholder: "<address>", children: nil},
+					"source-address-excluded":      {desc: "Match all sources except source-address", children: nil},
+					"destination-address-excluded": {desc: "Match all destinations except destination-address", children: nil},
+					"application":                  {desc: "Application", args: 1, multi: true, valueHint: ValueHintPolicyApp, placeholder: "<application>", children: nil},
 				}},
 				"then": {desc: "Action", children: map[string]*schemaNode{
 					"log": {desc: "Log session", children: nil},

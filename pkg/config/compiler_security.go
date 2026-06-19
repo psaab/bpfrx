@@ -193,6 +193,34 @@ func compilePolicies(node *Node, sec *SecurityConfig) error {
 	return nil
 }
 
+// normalizePolicyAddrToken rewrites the Junos wildcard policy-match
+// address keywords `any-ipv4` and `any-ipv6` into their concrete CIDR
+// equivalents (`0.0.0.0/0` and `::/0`). Without this rewrite the
+// tokens reach the dataplane as opaque strings that fail CIDR parsing
+// and are silently dropped, so a policy keyed on `any-ipv4` would
+// never match v4 traffic (#2008 H11). The plain `any` keyword is left
+// intact — the dataplane already treats it as match-any on both
+// families. All other tokens (address-book names, literal CIDRs) pass
+// through unchanged.
+func normalizePolicyAddrToken(tok string) string {
+	switch tok {
+	case "any-ipv4":
+		return "0.0.0.0/0"
+	case "any-ipv6":
+		return "::/0"
+	default:
+		return tok
+	}
+}
+
+func normalizePolicyAddrTokens(toks []string) []string {
+	out := make([]string, 0, len(toks))
+	for _, t := range toks {
+		out = append(out, normalizePolicyAddrToken(t))
+	}
+	return out
+}
+
 // compilePolicy extracts a Policy from a named policy instance.
 func compilePolicy(polInst struct {
 	name string
@@ -206,20 +234,24 @@ func compilePolicy(polInst struct {
 			switch m.Name() {
 			case "source-address":
 				if len(m.Keys) >= 2 {
-					pol.Match.SourceAddresses = append(pol.Match.SourceAddresses, m.Keys[1:]...)
+					pol.Match.SourceAddresses = append(pol.Match.SourceAddresses, normalizePolicyAddrTokens(m.Keys[1:])...)
 				} else {
 					for _, c := range m.Children {
-						pol.Match.SourceAddresses = append(pol.Match.SourceAddresses, c.Name())
+						pol.Match.SourceAddresses = append(pol.Match.SourceAddresses, normalizePolicyAddrToken(c.Name()))
 					}
 				}
 			case "destination-address":
 				if len(m.Keys) >= 2 {
-					pol.Match.DestinationAddresses = append(pol.Match.DestinationAddresses, m.Keys[1:]...)
+					pol.Match.DestinationAddresses = append(pol.Match.DestinationAddresses, normalizePolicyAddrTokens(m.Keys[1:])...)
 				} else {
 					for _, c := range m.Children {
-						pol.Match.DestinationAddresses = append(pol.Match.DestinationAddresses, c.Name())
+						pol.Match.DestinationAddresses = append(pol.Match.DestinationAddresses, normalizePolicyAddrToken(c.Name()))
 					}
 				}
+			case "source-address-excluded":
+				pol.Match.SourceAddressExcluded = true
+			case "destination-address-excluded":
+				pol.Match.DestinationAddressExcluded = true
 			case "application":
 				if len(m.Keys) >= 2 {
 					pol.Match.Applications = append(pol.Match.Applications, m.Keys[1:]...)

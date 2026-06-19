@@ -205,6 +205,14 @@ pub(crate) struct PolicyRuleSnapshot {
     pub application_terms: Vec<PolicyApplicationSnapshot>,
     #[serde(default)]
     pub action: String,
+    /// #2008 H2: invert the source/destination match sense. When set,
+    /// the rule matches every address EXCEPT those in the source /
+    /// destination set (Junos `source-address-excluded` /
+    /// `destination-address-excluded`).
+    #[serde(rename = "source_address_excluded", default)]
+    pub source_address_excluded: bool,
+    #[serde(rename = "destination_address_excluded", default)]
+    pub destination_address_excluded: bool,
 }
 
 /// #1606: snapshot row for a unique address-book content.
