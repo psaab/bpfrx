@@ -1,4 +1,3 @@
-// Package ipsec generates strongSwan (swanctl) configuration and queries SA status.
 package ipsec
 
 import (
@@ -6,302 +5,24 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
 	"os/exec"
-	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
-	"github.com/psaab/xpf/pkg/fsatomic"
 )
 
-// swanctlTimeout bounds every swanctl shell-out. reload() runs on the
-// config-apply path under applyConfigLocked's applySem (daemon_apply.go
-// d.ipsec.Apply), so a hung swanctl (wedged charon, stuck vici socket)
-// would otherwise block every commit indefinitely. The operator-RPC
-// sites (--terminate / --initiate / --list-sas) hang the gRPC/CLI show
-// and request paths the same way. Mirrors the 15s FRR reload precedent
-// (pkg/frr/manager.go reloadTimeout). #1794/#1800.
-const swanctlTimeout = 15 * time.Second
-
-// runSwanctl runs `swanctl <args...>` under swanctlTimeout and returns
-// CombinedOutput, preserving the historical error-message shape at the
-// call sites.
-func runSwanctl(args ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), swanctlTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "swanctl", args...)
-	// WaitDelay caps the post-SIGKILL pipe-drain window (a charon child
-	// inheriting the pipe could otherwise hold CombinedOutput open).
-	cmd.WaitDelay = 5 * time.Second
-	return cmd.CombinedOutput()
-}
-
-const (
-	// DefaultSwanctlDir is where swanctl reads conf.d snippets.
-	DefaultSwanctlDir = "/etc/swanctl/conf.d"
-	// BPFRXConfFile is the config file xpf manages.
-	BPFRXConfFile = "xpf.conf"
-)
-
-// Manager handles strongSwan config generation and SA queries.
-type Manager struct {
-	configDir  string
-	configPath string
-}
-
-// New creates a new IPsec manager.
-func New() *Manager {
-	dir := DefaultSwanctlDir
-	return &Manager{
-		configDir:  dir,
-		configPath: filepath.Join(dir, BPFRXConfFile),
-	}
-}
-
-// Apply generates swanctl config and reloads strongSwan.
-func (m *Manager) Apply(ipsecCfg *config.IPsecConfig) error {
-	if ipsecCfg == nil || len(ipsecCfg.VPNs) == 0 {
-		return m.Clear()
-	}
-
-	cfg, err := m.renderConfig(ipsecCfg)
-	if err != nil {
-		return err
-	}
-
-	if err := os.MkdirAll(m.configDir, 0755); err != nil {
-		return fmt.Errorf("create config dir: %w", err)
-	}
-
-	// AtomicGeneratedConfig (#1894): regenerated on every apply — a
-	// torn file must never reach the strongSwan parser, but fsync is
-	// deliberately skipped on this hot apply path.
-	if err := fsatomic.WriteFileAtomic(m.configPath, []byte(cfg), 0600); err != nil {
-		return fmt.Errorf("write config: %w", err)
-	}
-
-	slog.Info("swanctl config written", "path", m.configPath)
-
-	if err := m.reload(); err != nil {
-		slog.Warn("swanctl reload failed", "err", err)
-		return err
-	}
-
-	return nil
-}
-
-// Clear removes the xpf config and reloads strongSwan.
-func (m *Manager) Clear() error {
-	if err := os.Remove(m.configPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("remove config: %w", err)
-	}
-	_ = m.reload()
-	return nil
-}
-
-func (m *Manager) generateConfig(ipsecCfg *config.IPsecConfig) string {
-	cfg, _ := m.renderConfig(ipsecCfg)
-	return cfg
-}
-
-func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, error) {
-	var b strings.Builder
-
-	b.WriteString("# xpf managed config - do not edit\n\n")
-
-	// Connections
-	b.WriteString("connections {\n")
-	for _, name := range sortedVPNNames(ipsecCfg.VPNs) {
-		vpn := ipsecCfg.VPNs[name]
-		fmt.Fprintf(&b, "  %s {\n", sanitizeSwanctlValue(name))
-
-		// Resolve gateway reference
-		remoteAddr := vpn.Gateway
-		localAddr := vpn.LocalAddr
-		var gw *config.IPsecGateway
-		if g, ok := ipsecCfg.Gateways[vpn.Gateway]; ok {
-			gw = g
-			if gw.Address != "" {
-				remoteAddr = gw.Address
-			} else if gw.DynamicHostname != "" {
-				remoteAddr = gw.DynamicHostname
-			}
-			if gw.LocalAddress != "" && localAddr == "" {
-				localAddr = gw.LocalAddress
-			}
-		}
-		authMethod, ikeProposals, ikeLifetime, aggressive, err := resolveIKESettings(ipsecCfg, gw)
-		if err != nil {
-			return "", fmt.Errorf("vpn %s: %w", name, err)
-		}
-		espProposals, espLifetime := resolveESPSettings(ipsecCfg, vpn)
-		dpd := deriveDPD(gw, vpn)
-
-		// IKE version
-		if gw != nil && gw.Version == "v2-only" {
-			b.WriteString("    version = 2\n")
-		} else if gw != nil && gw.Version == "v1-only" {
-			b.WriteString("    version = 1\n")
-		}
-
-		if aggressive {
-			b.WriteString("    aggressive = yes\n")
-		}
-
-		if localAddr != "" {
-			fmt.Fprintf(&b, "    local_addrs = %s\n", localAddr)
-		}
-		if remoteAddr != "" {
-			fmt.Fprintf(&b, "    remote_addrs = %s\n", remoteAddr)
-		}
-
-		// NAT traversal
-		if gw != nil {
-			switch gw.NATTraversal {
-			case "disable":
-				b.WriteString("    encap = no\n")
-			case "force":
-				b.WriteString("    encap = yes\n")
-				b.WriteString("    forceencaps = yes\n")
-			default:
-				// "enable" or empty = strongSwan default (auto-detect NAT)
-				if gw.NoNATTraversal {
-					b.WriteString("    encap = no\n")
-				}
-			}
-		}
-
-		if dpd.Delay > 0 {
-			fmt.Fprintf(&b, "    dpd_delay = %ds\n", dpd.Delay)
-		}
-		if dpd.Timeout > 0 {
-			fmt.Fprintf(&b, "    dpd_timeout = %ds\n", dpd.Timeout)
-		}
-
-		// Local auth section
-		b.WriteString("    local {\n")
-		fmt.Fprintf(&b, "      auth = %s\n", authMethod)
-		if gw != nil && gw.LocalCertificate != "" {
-			fmt.Fprintf(&b, "      certs = %s\n", sanitizeSwanctlValue(gw.LocalCertificate))
-		}
-		if gw != nil && gw.LocalIDValue != "" {
-			fmt.Fprintf(&b, "      id = %s\n", sanitizeSwanctlValue(formatIdentity(gw.LocalIDType, gw.LocalIDValue)))
-		}
-		b.WriteString("    }\n")
-
-		// Remote auth section
-		b.WriteString("    remote {\n")
-		fmt.Fprintf(&b, "      auth = %s\n", authMethod)
-		if gw != nil && gw.RemoteIDValue != "" {
-			fmt.Fprintf(&b, "      id = %s\n", sanitizeSwanctlValue(formatIdentity(gw.RemoteIDType, gw.RemoteIDValue)))
-		}
-		b.WriteString("    }\n")
-
-		if ikeProposals != "" {
-			fmt.Fprintf(&b, "    proposals = %s\n", ikeProposals)
-		}
-		if ikeLifetime > 0 {
-			fmt.Fprintf(&b, "    rekey_time = %ds\n", ikeLifetime)
-			b.WriteString("    rand_time = 0s\n")
-		}
-
-		// Start immediately?
-		if vpn.EstablishTunnels == "immediately" {
-			b.WriteString("    start_action = start\n")
-		}
-
-		// Compute XFRM interface ID from bind-interface name
-		ifID := xfrmiIfID(vpn.BindInterface)
-
-		fmt.Fprintf(&b, "    children {\n")
-		for _, child := range effectiveTrafficSelectors(name, vpn) {
-			fmt.Fprintf(&b, "      %s {\n", sanitizeSwanctlValue(child.Name))
-			if child.LocalTS != "" {
-				fmt.Fprintf(&b, "        local_ts = %s\n", child.LocalTS)
-			}
-			if child.RemoteTS != "" {
-				fmt.Fprintf(&b, "        remote_ts = %s\n", child.RemoteTS)
-			}
-			fmt.Fprintf(&b, "        esp_proposals = %s\n", espProposals)
-			if espLifetime > 0 {
-				fmt.Fprintf(&b, "        rekey_time = %ds\n", espLifetime)
-				b.WriteString("        rand_time = 0s\n")
-			}
-			if vpn.DFBit == "copy" {
-				fmt.Fprintf(&b, "        copy_df = yes\n")
-			} else if vpn.DFBit == "set" {
-				fmt.Fprintf(&b, "        copy_df = no\n")
-			}
-			if vpn.EstablishTunnels == "immediately" {
-				fmt.Fprintf(&b, "        start_action = start\n")
-			}
-			if dpd.Action != "" {
-				fmt.Fprintf(&b, "        dpd_action = %s\n", dpd.Action)
-			}
-			if ifID > 0 {
-				fmt.Fprintf(&b, "        if_id_in = %d\n", ifID)
-				fmt.Fprintf(&b, "        if_id_out = %d\n", ifID)
-			}
-			fmt.Fprintf(&b, "      }\n")
-		}
-		fmt.Fprintf(&b, "    }\n")
-
-		fmt.Fprintf(&b, "  }\n")
-	}
-	b.WriteString("}\n\n")
-
-	// Secrets — resolve PSK from IKE policy chain
-	b.WriteString("secrets {\n")
-	for _, name := range sortedVPNNames(ipsecCfg.VPNs) {
-		vpn := ipsecCfg.VPNs[name]
-		secret := vpn.PSK
-		// Resolve PSK from IKE policy chain: VPN -> gateway -> IKE policy -> PSK
-		if secret == "" {
-			if gw, ok := ipsecCfg.Gateways[vpn.Gateway]; ok {
-				if ikePol, ok := ipsecCfg.IKEPolicies[gw.IKEPolicy]; ok {
-					secret = ikePol.PSK
-				}
-			}
-		}
-		if secret != "" {
-			decoded, err := normalizePSK(secret)
-			if err != nil {
-				return "", fmt.Errorf("vpn %s: %w", name, err)
-			}
-			fmt.Fprintf(&b, "  ike-%s {\n", sanitizeSwanctlValue(name))
-			fmt.Fprintf(&b, "    secret = \"%s\"\n", sanitizeSwanctlValue(decoded))
-			fmt.Fprintf(&b, "  }\n")
-		}
-	}
-	b.WriteString("}\n")
-
-	return b.String(), nil
-}
-
-type childSelector struct {
-	Name     string
-	LocalTS  string
-	RemoteTS string
-}
-
+// dpdSettings holds the resolved dead-peer-detection parameters for a
+// connection (derived from the gateway + VPN config).
 type dpdSettings struct {
 	Delay   int
 	Timeout int
 	Action  string
 }
 
-func sortedVPNNames(vpns map[string]*config.IPsecVPN) []string {
-	names := make([]string, 0, len(vpns))
-	for name := range vpns {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return names
-}
-
+// resolveIKESettings resolves the IKE (Phase 1) auth method, proposal
+// string, lifetime, and aggressive-mode flag from the gateway's IKE policy
+// chain.
 func resolveIKESettings(cfg *config.IPsecConfig, gw *config.IPsecGateway) (authMethod, proposals string, lifetime int, aggressive bool, err error) {
 	authMethod = "psk"
 	if gw == nil || gw.IKEPolicy == "" {
@@ -328,6 +49,8 @@ func resolveIKESettings(cfg *config.IPsecConfig, gw *config.IPsecGateway) (authM
 	return authMethod, "", 0, aggressive, nil
 }
 
+// resolveESPSettings resolves the ESP (Phase 2) proposal string and lifetime
+// from the VPN's IPsec policy chain.
 func resolveESPSettings(cfg *config.IPsecConfig, vpn *config.IPsecVPN) (string, int) {
 	espProposals := "default"
 	pfsGroup := 0
@@ -348,6 +71,7 @@ func resolveESPSettings(cfg *config.IPsecConfig, vpn *config.IPsecVPN) (string, 
 	return espProposals, 0
 }
 
+// deriveDPD computes the dead-peer-detection settings for a connection.
 func deriveDPD(gw *config.IPsecGateway, vpn *config.IPsecVPN) dpdSettings {
 	if gw == nil || gw.DeadPeerDetect == "" {
 		return dpdSettings{}
@@ -391,41 +115,6 @@ func deriveDPD(gw *config.IPsecGateway, vpn *config.IPsecVPN) dpdSettings {
 	}
 }
 
-func effectiveTrafficSelectors(connName string, vpn *config.IPsecVPN) []childSelector {
-	if vpn == nil || len(vpn.TrafficSelectors) == 0 {
-		return []childSelector{{
-			Name:     connName,
-			LocalTS:  vpn.LocalID,
-			RemoteTS: vpn.RemoteID,
-		}}
-	}
-
-	names := make([]string, 0, len(vpn.TrafficSelectors))
-	for name := range vpn.TrafficSelectors {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-
-	children := make([]childSelector, 0, len(names))
-	for _, name := range names {
-		ts := vpn.TrafficSelectors[name]
-		localTS := vpn.LocalID
-		remoteTS := vpn.RemoteID
-		if ts.LocalIP != "" {
-			localTS = ts.LocalIP
-		}
-		if ts.RemoteIP != "" {
-			remoteTS = ts.RemoteIP
-		}
-		children = append(children, childSelector{
-			Name:     connName + "-" + sanitizeChildName(name),
-			LocalTS:  localTS,
-			RemoteTS: remoteTS,
-		})
-	}
-	return children
-}
-
 // hasIKEChain checks if the IKE policy -> IKE proposal chain is available.
 func hasIKEChain(cfg *config.IPsecConfig, ikePolicyName string) bool {
 	if cfg.IKEPolicies == nil {
@@ -440,45 +129,6 @@ func hasIKEChain(cfg *config.IPsecConfig, ikePolicyName string) bool {
 	}
 	_, ok = cfg.IKEProposals[pol.Proposals]
 	return ok
-}
-
-// sanitizeSwanctlValue strips ASCII control characters — the C0 set
-// (0x00-0x1F, including newline) and DEL (0x7F), each replaced by a
-// space — from a free-text config value (connection name, IKE
-// identity, certificate name, pre-shared key) before it is
-// interpolated into a generated swanctl.conf line. Render-side belt
-// for #1798: an embedded newline must not be able to inject extra
-// swanctl sections/keys even if the commit-time validation layer were
-// bypassed.
-func sanitizeSwanctlValue(s string) string {
-	clean := true
-	for i := 0; i < len(s); i++ {
-		if s[i] < 0x20 || s[i] == 0x7f {
-			clean = false
-			break
-		}
-	}
-	if clean {
-		return s
-	}
-	b := []byte(s)
-	for i := range b {
-		if b[i] < 0x20 || b[i] == 0x7f {
-			b[i] = ' '
-		}
-	}
-	return string(b)
-}
-
-// formatIdentity formats an IKE identity for strongSwan.
-
-func formatIdentity(idType, idValue string) string {
-	switch idType {
-	case "hostname", "fqdn":
-		return "@" + idValue
-	default: // "inet", "ipv4", etc.
-		return idValue
-	}
 }
 
 // buildIKEProposalFromIKE builds a swanctl IKE proposal string from an IKE proposal.
@@ -567,12 +217,6 @@ func buildESPProposal(prop *config.IPsecProposal, pfsGroup int) string {
 	return strings.Join(parts, "-")
 }
 
-// xfrmiIfID derives the XFRM interface ID from a bind-interface name.
-func xfrmiIfID(bindIface string) uint32 {
-	_, ifID := config.XFRMIfNameAndID(bindIface)
-	return ifID
-}
-
 func dhGroupBits(group int) int {
 	switch group {
 	case 1:
@@ -594,15 +238,6 @@ func dhGroupBits(group int) int {
 	default:
 		return group
 	}
-}
-
-func (m *Manager) reload() error {
-	output, err := runSwanctl("--load-all")
-	if err != nil {
-		return fmt.Errorf("swanctl --load-all: %w: %s", err, string(output))
-	}
-	slog.Info("swanctl config reloaded")
-	return nil
 }
 
 // SAStatus represents an IPsec Security Association.
