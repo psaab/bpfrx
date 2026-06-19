@@ -6,6 +6,12 @@
 
 use crate::test_zone_ids::*;
 use super::*;
+// #2005 split: the timer-wheel constants used by the GC tests below were
+// previously reachable via `super::*` through mod.rs's `use wheel::{...}`
+// glob. mod.rs no longer imports them directly (the wheel-driving methods
+// moved to session/expire.rs), so reference them explicitly here. Same
+// symbols, same values — no behavior change.
+use super::wheel::{FAR_FUTURE_OFFSET, WHEEL_BUCKETS, WHEEL_TICK_NS};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 fn key_v4() -> SessionKey {
