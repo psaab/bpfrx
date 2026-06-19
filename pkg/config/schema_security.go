@@ -129,8 +129,21 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		}},
 		"static": {desc: "Static NAT configuration", children: map[string]*schemaNode{
 			"rule-set": {desc: "Static NAT rule-set name", args: 1, placeholder: "<rule-set-name>", children: map[string]*schemaNode{
+				// `from zone` scopes the rule-set to an ingress zone. The
+				// dataplane enforces it on the inbound (DNAT) direction
+				// (static_nat.rs match_dnat). Junos static NAT has no `to`
+				// clause (unlike source/destination NAT) — only `from`
+				// (zone | interface | routing-instance). xpf compiles the
+				// zone scope; declaring it here restores commit-time
+				// validation and CLI completion (#2008 H15).
+				"from": {desc: "Source of traffic to match", children: map[string]*schemaNode{
+					"zone": {desc: "Source zone name", args: 1, multi: true, valueHint: ValueHintZoneName, placeholder: "<zone-name>", children: nil},
+				}},
 				"rule": {desc: "Static NAT rule name", args: 1, placeholder: "<rule-name>", children: map[string]*schemaNode{
-					"match": {desc: "Match criteria", children: nil},
+					"match": {desc: "Match criteria", children: map[string]*schemaNode{
+						"source-address":      {desc: "Source address prefix to match", args: 1, multi: true, placeholder: "<prefix>", children: nil},
+						"destination-address": {desc: "Destination address prefix to match", args: 1, multi: true, placeholder: "<prefix>", children: nil},
+					}},
 					"then": {desc: "Static NAT action", children: map[string]*schemaNode{
 						"static-nat": {desc: "Static NAT translation (prefix|nptv6-prefix|inet)", children: nil},
 					}},

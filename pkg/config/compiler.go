@@ -986,6 +986,22 @@ func ValidateConfig(cfg *Config) []string {
 				"source-nat ruleset %q: to-zone %q not defined", rs.Name, rs.ToZone))
 		}
 	}
+	// Static NAT rule-sets carry a `from zone` scope that the dataplane
+	// enforces on the inbound (DNAT) direction (static_nat.rs match_dnat:
+	// the entry is skipped unless its from_zone matches the ingress zone
+	// name exactly). A typo'd or undefined zone therefore yields a rule
+	// that silently never matches, with no other operator signal — mirror
+	// the source-NAT zone validation above so the divergence surfaces at
+	// commit (#2008 H15).
+	for _, rs := range cfg.Security.NAT.Static {
+		if rs == nil {
+			continue
+		}
+		if rs.FromZone != "" && !zones[rs.FromZone] {
+			warnings = append(warnings, fmt.Sprintf(
+				"static-nat ruleset %q: from-zone %q not defined", rs.Name, rs.FromZone))
+		}
+	}
 
 	// Validate screen references in zones
 	for name, zone := range cfg.Security.Zones {
