@@ -58,6 +58,51 @@ VM:   Ubuntu 26.04, stock kernel >= 6.18 (#1943; bake.py parity)
 
 All interfaces renamed at boot by `xpf-link-setup.service` (PCI bus order → vSRX names), configured via `.network` files by xpfd.
 
+### DUT Isolation — Exactly One Firewall Per Gateway (#1992)
+
+**Before any forwarding or stall measurement, isolate the DUT: exactly ONE
+firewall may answer the dataplane gateway IPs at a time.**
+
+The standalone firewall claims the SAME static gateway IPs on every run —
+`10.0.1.10` on `ge-0-0-0` (trust bridge) and `10.0.2.10` on `ge-0-0-1`
+(untrust bridge), per `test/incus/xpf-test.conf`. The `trust-host` and
+`untrust-host` test containers default-route through those IPs. If a SECOND
+firewall VM is attached to the same trust/untrust bridges, it claims the same
+gateway IPs, and the test hosts' gateway ARP resolves **nondeterministically
+to whichever firewall last answered or GARP'd**.
+
+During a sustained flow the gateway MAC can flip mid-stream to a firewall that
+is not forwarding to the other side, producing a classic "~4 Gbps → 0 for
+several seconds → recover with a retransmit burst" pattern and making the
+intended DUT's RX-queue irq counter read 0 (the traffic went elsewhere). This
+was **misdiagnosed as a virtio_net per-queue NAPI-quiesce kernel bug** in
+#1961 before an isolated run — stop the other firewalls, only the DUT
+answering, kernel `ip_forward=0` — proved plain-virtio forwards rock-steady at
+~4 Gbit/s, 0 stalls, both directions.
+
+`test/incus/setup.sh` now enforces this: `create-vm`, `create-ct`, and
+`deploy` call `assert_sole_dataplane_owner` first and **refuse to proceed**
+when another instance is attached to BOTH the trust and untrust bridges
+(single-sided test hosts like `trust-host`/`untrust-host` are not flagged —
+they do not claim the gateway IP). Set `XPF_FORCE_TEARDOWN_PEERS=1` to stop and
+delete the conflicting firewall(s) automatically:
+
+```bash
+# Refused with guidance if another firewall holds the gateways:
+make test-deploy
+
+# Or remove the colliding firewall(s) and proceed:
+XPF_FORCE_TEARDOWN_PEERS=1 ./test/incus/setup.sh deploy
+
+# Manual isolation:
+incus stop <other-firewall> && incus delete --force <other-firewall>
+```
+
+When you cannot tear a peer down, pin static ARP for the gateway to the DUT's
+MAC on the test host (or assert exactly one ARP answerer for the gateway)
+before measuring — never trust a forwarding/stall number taken while two
+firewalls share the gateway.
+
 ### WAN Interface (PF Passthrough)
 - Intel X710 PF (enp10s0f0np0 on host) passed through via PCI/VFIO
 - i40e driver has **native XDP** — no generic mode overhead

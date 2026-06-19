@@ -12,6 +12,14 @@
 #   ./test/incus/setup.sh deploy      # Build xpf, push binary to instance
 #   ./test/incus/setup.sh ssh         # Shell into the instance
 #   ./test/incus/setup.sh status      # Show instance and network status
+#
+# DUT isolation (#1992): exactly ONE firewall may answer the dataplane gateway
+# IPs (10.0.1.10 / 10.0.2.10) on the trust/untrust bridges at a time. create-vm,
+# create-ct, and deploy refuse to run while another firewall is attached to both
+# gateway bridges (it would race for the gateway ARP and produce false "stall"
+# readings — see #1961). Set XPF_FORCE_TEARDOWN_PEERS=1 to remove the
+# conflicting firewall(s) automatically. ALWAYS isolate the DUT before any
+# forwarding or stall measurement.
 
 set -euo pipefail
 
@@ -61,9 +69,107 @@ NETWORKS=(
 	"xpf-dmz:none:false"
 )
 
+# Dataplane gateway bridges (#1992). The firewall claims the SAME static
+# gateway IPs on these bridges every time — ge-0/0/0 = 10.0.1.10 on trust,
+# ge-0/0/1 = 10.0.2.10 on untrust (xpf-test.conf) — and the trust-host /
+# untrust-host test containers default-route via those IPs. If a SECOND
+# firewall is attached to BOTH of these bridges it claims the same gateway
+# IPs, so the test hosts' gateway ARP resolves nondeterministically to
+# whichever firewall last answered or GARP'd. Mid-stream the gateway MAC can
+# flip to a firewall that is not forwarding, producing a false "~4 Gbps -> 0
+# for several seconds -> recover with a retransmit burst" stall and an
+# RX-queue irq=0 reading on the intended DUT. This was misdiagnosed as a
+# virtio_net NAPI-quiesce kernel bug in #1961 before an isolated run (stop the
+# other firewalls; only the DUT answering; ip_forward=0) proved plain-virtio
+# forwards rock-steady at ~4 Gbit/s, 0 stalls, both directions.
+#
+# LESSON: isolate the DUT (exactly ONE firewall answering each gateway IP)
+# before any forwarding/stall measurement. create-vm / create-ct / deploy call
+# assert_sole_dataplane_owner first and refuse to proceed when another
+# firewall holds these gateways, unless XPF_FORCE_TEARDOWN_PEERS=1 is set (then
+# the conflicting firewall instances are stopped and deleted).
+DATAPLANE_GW_BRIDGES=(xpf-trust xpf-untrust)
+
 info()  { echo "==> $*"; }
 warn()  { echo "WARNING: $*" >&2; }
 die()   { echo "ERROR: $*" >&2; exit 1; }
+
+# ── DUT isolation guard (#1992) ───────────────────────────────────────
+
+# List instance names attached to an incus network bridge. Parses the
+# `used_by:` block of `incus network show` (entries look like
+# `- /1.0/instances/<name>` and `- /1.0/profiles/<name>`); profile entries
+# are skipped — only instances answer ARP. Emits nothing if the bridge does
+# not exist.
+instances_on_bridge() {
+	local bridge="$1"
+	incus network show "$bridge" 2>/dev/null \
+		| sed -n 's#^- /1\.0/instances/##p'
+}
+
+# Refuse to bring up / deploy to $INSTANCE_NAME while ANOTHER instance is
+# attached to BOTH dataplane gateway bridges. An instance on both gateway
+# bridges behaves like a firewall: it claims the same static gateway IPs
+# (10.0.1.10 / 10.0.2.10) the test hosts default-route through, so two such
+# instances race for the gateway ARP. Single-sided test containers
+# (trust-host on trust only, untrust-host on untrust only) are NOT flagged —
+# they do not claim the gateway IP. Set XPF_FORCE_TEARDOWN_PEERS=1 to stop and
+# delete the conflicting instances automatically instead of aborting.
+assert_sole_dataplane_owner() {
+	# If neither gateway bridge exists yet, there is nothing to collide with.
+	local any_bridge=0 b
+	for b in "${DATAPLANE_GW_BRIDGES[@]}"; do
+		if incus network show "$b" &>/dev/null 2>&1; then
+			any_bridge=1
+		fi
+	done
+	[[ "$any_bridge" -eq 1 ]] || return 0
+
+	# An instance is a gateway peer when it is attached to EVERY gateway
+	# bridge. Count per-instance bridge attachments and select those that
+	# reach the full count, excluding $INSTANCE_NAME itself.
+	local -A seen=()
+	for b in "${DATAPLANE_GW_BRIDGES[@]}"; do
+		local inst
+		while IFS= read -r inst; do
+			[[ -n "$inst" ]] || continue
+			seen["$inst"]=$(( ${seen["$inst"]:-0} + 1 ))
+		done < <(instances_on_bridge "$b")
+	done
+
+	local need="${#DATAPLANE_GW_BRIDGES[@]}"
+	local peers=() name
+	for name in "${!seen[@]}"; do
+		[[ "$name" == "$INSTANCE_NAME" ]] && continue
+		if [[ "${seen[$name]}" -ge "$need" ]]; then
+			peers+=("$name")
+		fi
+	done
+
+	[[ "${#peers[@]}" -eq 0 ]] && return 0
+
+	if [[ "${XPF_FORCE_TEARDOWN_PEERS:-0}" == "1" ]]; then
+		warn "Tearing down conflicting firewall instance(s) on ${DATAPLANE_GW_BRIDGES[*]}: ${peers[*]} (XPF_FORCE_TEARDOWN_PEERS=1)"
+		for name in "${peers[@]}"; do
+			info "Removing $name (holds the dataplane gateway IPs)..."
+			incus stop "$name" --force 2>/dev/null || true
+			incus delete "$name" --force
+		done
+		return 0
+	fi
+
+	warn "Another firewall is attached to the dataplane gateway bridges (${DATAPLANE_GW_BRIDGES[*]}):"
+	for name in "${peers[@]}"; do
+		warn "  - $name"
+	done
+	warn "Those instances claim the SAME gateway IPs (10.0.1.10 / 10.0.2.10) that"
+	warn "the test hosts default-route through, so gateway ARP resolves"
+	warn "nondeterministically and forwarding/stall measurements are invalid"
+	warn "(see #1992 / #1961). Isolate the DUT first:"
+	warn "  incus stop ${peers[*]}            # or 'incus delete --force ...'"
+	warn "  XPF_FORCE_TEARDOWN_PEERS=1 $0 ${1:-<command>}   # remove them automatically"
+	die "refusing to run with multiple firewalls on the gateway bridges"
+}
 
 # ── Install & Initialize ──────────────────────────────────────────────
 
@@ -214,6 +320,7 @@ cmd_create_vm() {
 	if incus info "$INSTANCE_NAME" &>/dev/null 2>&1; then
 		die "Instance $INSTANCE_NAME already exists. Run '$0 destroy' first."
 	fi
+	assert_sole_dataplane_owner create-vm
 	info "Launching VM $INSTANCE_NAME..."
 	incus launch "$IMAGE_VM" "$INSTANCE_NAME" --vm --profile "$VM_PROFILE"
 
@@ -401,6 +508,7 @@ cmd_create_ct() {
 	if incus info "$INSTANCE_NAME" &>/dev/null 2>&1; then
 		die "Instance $INSTANCE_NAME already exists. Run '$0 destroy' first."
 	fi
+	assert_sole_dataplane_owner create-ct
 	info "Launching container $INSTANCE_NAME..."
 	incus launch "$IMAGE_CT" "$INSTANCE_NAME" --profile "$CT_PROFILE"
 	info "Waiting for container to start..."
@@ -444,6 +552,7 @@ cmd_deploy() {
 	if ! incus info "$INSTANCE_NAME" &>/dev/null 2>&1; then
 		die "Instance $INSTANCE_NAME does not exist. Run '$0 create-vm' or '$0 create-ct' first."
 	fi
+	assert_sole_dataplane_owner deploy
 
 	info "Building xpfd and cli..."
 	make -C "$PROJECT_ROOT" build build-ctl
@@ -613,6 +722,11 @@ usage() {
 	echo "  restart     Restart xpfd service"
 	echo "  logs        Show recent xpfd logs"
 	echo "  journal     Follow xpfd logs (live)"
+	echo ""
+	echo "Env:"
+	echo "  XPF_FORCE_TEARDOWN_PEERS=1  On create-vm/create-ct/deploy, remove any"
+	echo "                              OTHER firewall holding the dataplane gateway"
+	echo "                              IPs instead of aborting (DUT isolation, #1992)"
 	exit 1
 }
 
