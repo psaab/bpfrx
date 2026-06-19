@@ -278,6 +278,12 @@ func buildNAT64Snapshots(cfg *config.Config) []NAT64RuleSnapshot {
 	if cfg == nil || len(cfg.Security.NAT.NAT64) == 0 {
 		return nil
 	}
+	// `security nat natv6v4 no-v6-frag-header` is a global option, but the
+	// dataplane consumes NAT64 state per rule-set. Replicate the flag onto
+	// every emitted rule so the IPv6->IPv4 translator can honor it (RFC 7915
+	// 5.1: emit a fragmentable DF=0 atomic IPv4 packet rather than the default
+	// DF=1 framing).
+	noV6FragHeader := cfg.Security.NAT.NATv6v4 != nil && cfg.Security.NAT.NATv6v4.NoV6FragHeader
 	out := make([]NAT64RuleSnapshot, 0, len(cfg.Security.NAT.NAT64))
 	for _, rs := range cfg.Security.NAT.NAT64 {
 		if rs == nil || rs.Prefix == "" {
@@ -293,9 +299,10 @@ func buildNAT64Snapshots(cfg *config.Config) []NAT64RuleSnapshot {
 			}
 		}
 		out = append(out, NAT64RuleSnapshot{
-			Name:          rs.Name,
-			Prefix:        rs.Prefix,
-			PoolAddresses: poolAddresses,
+			Name:           rs.Name,
+			Prefix:         rs.Prefix,
+			PoolAddresses:  poolAddresses,
+			NoV6FragHeader: noV6FragHeader,
 		})
 	}
 	return out
