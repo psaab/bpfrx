@@ -1,5 +1,18 @@
 # Action Log
 
+## 2026-06-19 — #2000 review follow-up on postinst test harness
+
+- **Timestamp**: 2026-06-19
+- **Action**: Address Copilot review on the new `postinst` shell harness.
+  Harden the temp-root rewrite by making the `CURRENT_DIR=` substitution
+  whitespace-tolerant and failing fast unless the patched copy proves the
+  rewritten `STAGED`, `SBIN`, `CURRENT_DIR`, clustered `node-id`, and
+  neutralized `systemd` gates are present. Correct the `build_hardened`
+  comment to match the actual clustered/stage-only cut suppression and
+  simplify the touched precondition checks into plain `if` blocks for a
+  cleaner shellcheck signal.
+- **File(s)**: test/debian/postinst-test.sh, _Log.md
+
 ## 2026-06-18 — #2006 group pkg/vrrp into manager/instance/packet/track
 
 - **Timestamp**: 2026-06-18

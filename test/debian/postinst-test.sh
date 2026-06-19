@@ -16,7 +16,7 @@
 # to staged (so the assertion discriminates the fix).
 set -e
 
-HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 POSTINST="${1:-$HERE/../../debian/xpf.postinst}"
 [ -f "$POSTINST" ] || { echo "postinst not found: $POSTINST" >&2; exit 1; }
 
@@ -30,11 +30,24 @@ patched_postinst() {
     sed \
       -e "s#^STAGED=.*#STAGED=$ROOT/usr/local/share/xpf/staged#" \
       -e "s#^SBIN=.*#SBIN=$ROOT/usr/local/sbin#" \
-      -e "s#^            CURRENT_DIR=.*#            CURRENT_DIR=$ROOT/var/lib/xpf/versions/current#" \
+      -e "s#^\([[:space:]]*\)CURRENT_DIR=.*#\1CURRENT_DIR=$ROOT/var/lib/xpf/versions/current#" \
       -e "s#/etc/xpf/node-id#$ROOT/etc/xpf/node-id#g" \
       -e "s#\\[ -d /run/systemd/system \\]#false#g" \
       "$POSTINST" > "$ROOT/postinst"
     chmod +x "$ROOT/postinst"
+    [ "$(grep -E '^STAGED=' "$ROOT/postinst" || true)" = "STAGED=$ROOT/usr/local/share/xpf/staged" ] || {
+        echo "FAIL: patched postinst missing rewritten STAGED assignment"; exit 1; }
+    [ "$(grep -E '^SBIN=' "$ROOT/postinst" || true)" = "SBIN=$ROOT/usr/local/sbin" ] || {
+        echo "FAIL: patched postinst missing rewritten SBIN assignment"; exit 1; }
+    current_line=$(grep -E '^[[:space:]]*CURRENT_DIR=' "$ROOT/postinst" || true)
+    case "$current_line" in
+        *"CURRENT_DIR=$ROOT/var/lib/xpf/versions/current") ;;
+        *) echo "FAIL: patched postinst missing rewritten CURRENT_DIR assignment"; exit 1 ;;
+    esac
+    grep -Fqx "            elif [ -f $ROOT/etc/xpf/node-id ]; then" "$ROOT/postinst" || {
+        echo "FAIL: patched postinst missing rewritten node-id gate"; exit 1; }
+    grep -Fqx "                    if false && ! systemctl is-active --quiet xpfd; then" "$ROOT/postinst" || {
+        echo "FAIL: patched postinst missing neutralized systemd gate"; exit 1; }
 }
 
 run_scenario() {
@@ -53,10 +66,10 @@ run_scenario() {
 # Build a hardened layout: versions/<ver>/<bin>, current -> <ver>, sbin ->
 # versions/current/<bin>. The staged xpfd is a stub that answers the two
 # subcommands the upgrade branch invokes (`publish-generation`, `upgrade`).
-# publish-generation exits 2 (lock busy) so the postinst SKIPS the cut — this
-# test isolates the absent-link recovery loop, not the cut machine. A node-id
-# file is also dropped so the node is treated as CLUSTERED (stage-only),
-# belt-and-braces against the cut ever running here.
+# publish-generation exits 0 here; the postinst still SKIPS the cut because the
+# test drops a node-id file so the node is treated as CLUSTERED (stage-only).
+# That keeps the scenarios focused on the absent-link recovery loop, not the
+# cut machine.
 build_hardened() {
     ver="$1"
     mkdir -p "$STAGED" "$SBIN" "$VERSIONS/$ver" "$ROOT/etc/xpf"
@@ -93,7 +106,10 @@ assert_recovers_through_current() {
     missing="$1"
     build_hardened "1.0.0"
     rm -f "$SBIN/$missing"
-    [ -L "$SBIN/$missing" ] && { echo "FAIL: precondition: $missing link should be gone"; exit 1; } || true
+    if [ -L "$SBIN/$missing" ]; then
+        echo "FAIL: precondition: $missing link should be gone"
+        exit 1
+    fi
     "$ROOT/postinst" configure "0.9.0"
     [ -L "$SBIN/$missing" ] || { echo "FAIL: $missing link not recreated"; exit 1; }
     tgt=$(readlink "$SBIN/$missing")
@@ -142,10 +158,19 @@ scenario_new_managed_binary_stays_absent() {
     # Simulate `cli` being newly introduced: present in staged, ABSENT from
     # versions/current, and its sbin link absent.
     rm -f "$SBIN/cli" "$CURRENT/cli"
-    [ -e "$CURRENT/cli" ] && { echo "FAIL: precondition: current/cli should be absent"; exit 1; } || true
+    if [ -e "$CURRENT/cli" ]; then
+        echo "FAIL: precondition: current/cli should be absent"
+        exit 1
+    fi
     "$ROOT/postinst" configure "0.9.0"
-    [ -e "$SBIN/cli" ] && { echo "FAIL: new-managed-binary cli link created (exposes unverified staged)"; exit 1; } || true
-    [ -L "$SBIN/cli" ] && { echo "FAIL: new-managed-binary cli link created as symlink"; exit 1; } || true
+    if [ -e "$SBIN/cli" ]; then
+        echo "FAIL: new-managed-binary cli link created (exposes unverified staged)"
+        exit 1
+    fi
+    if [ -L "$SBIN/cli" ]; then
+        echo "FAIL: new-managed-binary cli link created as symlink"
+        exit 1
+    fi
     # The others are unchanged.
     for b in xpfd xpf-userspace-dp xpf-day0-config; do
         [ "$(readlink "$SBIN/$b")" = "$CURRENT/$b" ] || {
@@ -174,11 +199,20 @@ EOF
     for b in cli xpf-userspace-dp xpf-day0-config; do
         ln -sf "$STAGED/$b" "$SBIN/$b"
     done
-    [ -e "$CURRENT" ] && { echo "FAIL: precondition: no versions/current expected"; exit 1; } || true
+    if [ -e "$CURRENT" ]; then
+        echo "FAIL: precondition: no versions/current expected"
+        exit 1
+    fi
     "$ROOT/postinst" configure "0.9.0"
     # The absent xpfd link must NOT be recreated direct to staged.
-    [ -e "$SBIN/xpfd" ] && { echo "FAIL: legacy host absent xpfd link recreated direct to staged"; exit 1; } || true
-    [ -L "$SBIN/xpfd" ] && { echo "FAIL: legacy host absent xpfd link recreated"; exit 1; } || true
+    if [ -e "$SBIN/xpfd" ]; then
+        echo "FAIL: legacy host absent xpfd link recreated direct to staged"
+        exit 1
+    fi
+    if [ -L "$SBIN/xpfd" ]; then
+        echo "FAIL: legacy host absent xpfd link recreated"
+        exit 1
+    fi
     # The existing legacy links are NOT disturbed (only absent links acted on).
     for b in cli xpf-userspace-dp xpf-day0-config; do
         [ "$(readlink "$SBIN/$b")" = "$STAGED/$b" ] || {
@@ -229,8 +263,10 @@ scenario_oldbug_repairs_to_staged_proves_nontautology() {
     patched_postinst_oldbug
     grep -q '__OLDBUG_SYNTH__=1' "$ROOT/postinst.oldbug.synth" || {
         echo "FAIL(non-tautology): awk did not match the recovery loop — no old-bug script synthesized (proof vacuous)"; exit 1; }
-    cmp -s "$ROOT/postinst" "$ROOT/postinst.oldbug" && {
-        echo "FAIL(non-tautology): synthesized old-bug postinst is identical to the fixed one"; exit 1; } || true
+    if cmp -s "$ROOT/postinst" "$ROOT/postinst.oldbug"; then
+        echo "FAIL(non-tautology): synthesized old-bug postinst is identical to the fixed one"
+        exit 1
+    fi
     sh -n "$ROOT/postinst.oldbug" || { echo "FAIL: synthesized old-bug postinst has a syntax error"; exit 1; }
     rm -f "$SBIN/cli"
     "$ROOT/postinst.oldbug" configure "0.9.0"
