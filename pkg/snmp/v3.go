@@ -359,6 +359,25 @@ func (a *Agent) handleV3Packet(msgBody []byte) []byte {
 			}
 		}
 
+	case pduSetRequest:
+		// The agent exposes no writable objects; refuse SET with notWritable
+		// rather than silently dropping the request. SNMPv3 access control is
+		// per-USM-user and carries no read-write authorization in this config,
+		// so every SET is refused uniformly.
+		var oids [][]int
+		requestID, _, _, oids, err = decodePDUFields(pduBody)
+		if err != nil {
+			return nil
+		}
+		for _, oid := range oids {
+			respVarbinds = append(respVarbinds, varbind{oid: oid, tag: tagNull})
+		}
+		errIdx := 0
+		if len(oids) > 0 {
+			errIdx = 1
+		}
+		return a.buildV3Response(msgID, msgFlags, user, requestID, errNotWritable, errIdx, respVarbinds)
+
 	default:
 		slog.Debug("SNMPv3: unsupported PDU type", "type", pduTag)
 		return nil

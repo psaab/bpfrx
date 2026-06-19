@@ -24,13 +24,16 @@ const (
 	pduGetRequest     = 0xa0
 	pduGetNextRequest = 0xa1
 	pduGetResponse    = 0xa2
+	pduSetRequest     = 0xa3
 	pduGetBulkRequest = 0xa5
 
-	// SNMP error codes.
-	errNoError    = 0
-	errTooBig     = 1
-	errNoSuchName = 2
-	errGenErr     = 5
+	// SNMP error codes (RFC 3416 error-status values).
+	errNoError     = 0
+	errTooBig      = 1
+	errNoSuchName  = 2
+	errGenErr      = 5
+	errNoAccess    = 6
+	errNotWritable = 17
 
 	// Implicit tags for exception values (context-specific, primitive).
 	tagNoSuchObject   = 0x80
@@ -278,8 +281,9 @@ func (a *Agent) handleV2cPacket(rest []byte) []byte {
 		return nil
 	}
 
-	// Verify community string.
-	if !a.isValidCommunity(string(community)) {
+	// Verify community string and resolve its authorization level.
+	comm := a.getCommunity(string(community))
+	if comm == nil {
 		slog.Debug("SNMP: invalid community", "community", string(community))
 		return nil
 	}
@@ -298,10 +302,67 @@ func (a *Agent) handleV2cPacket(rest []byte) []byte {
 		return a.handleGetNext(community, pduBody)
 	case pduGetBulkRequest:
 		return a.handleGetBulk(community, pduBody)
+	case pduSetRequest:
+		return a.handleSet(community, comm, pduBody)
 	default:
 		slog.Debug("SNMP: unsupported PDU type", "type", pduTag)
 		return nil
 	}
+}
+
+// communityCanWrite reports whether the community is authorized for SET
+// (write) operations. Only "read-write" grants write access; the compiler
+// defaults an unspecified authorization to "read-only".
+func communityCanWrite(c *config.SNMPCommunity) bool {
+	return c != nil && c.Authorization == "read-write"
+}
+
+// handleSet processes a SET request (RFC 3416 pduSetRequest, 0xa3).
+//
+// Access control comes first: a community without "read-write" authorization
+// is denied with noAccess before any write is attempted. This is the
+// security boundary the operator configures with
+// `set snmp community <name> authorization read-write` — without this gate
+// the agent would honor SET from any valid community regardless of the
+// configured authorization (a Junos divergence).
+//
+// A read-write community passes the authorization gate, but the agent serves
+// only read-only MIB objects (system group, ifTable, ifXTable), so the write
+// itself is refused per-varbind with notWritable. No served object is
+// mutable, so a successful SET is never produced here — but the read-only vs
+// read-write distinction is enforced and observable in the error-status.
+func (a *Agent) handleSet(community []byte, comm *config.SNMPCommunity, pduBody []byte) []byte {
+	requestID, _, _, oids, err := decodePDUFields(pduBody)
+	if err != nil {
+		slog.Debug("SNMP: failed to decode SET PDU", "err", err)
+		return nil
+	}
+
+	// Echo the requested OIDs back in the response varbind list (with null
+	// values) so the response is well-formed regardless of outcome.
+	var varbinds []varbind
+	for _, oid := range oids {
+		varbinds = append(varbinds, varbind{oid: oid, tag: tagNull, value: nil})
+	}
+
+	if !communityCanWrite(comm) {
+		// Read-only (or unspecified) community: deny write access.
+		slog.Debug("SNMP: SET denied, community not authorized read-write",
+			"community", string(community), "authorization", comm.Authorization)
+		errIdx := 0
+		if len(oids) > 0 {
+			errIdx = 1
+		}
+		return a.buildResponse(community, requestID, errNoAccess, errIdx, varbinds)
+	}
+
+	// Authorized for write, but the agent exposes no writable objects. Refuse
+	// the first varbind with notWritable per RFC 3416.
+	errIdx := 0
+	if len(oids) > 0 {
+		errIdx = 1
+	}
+	return a.buildResponse(community, requestID, errNotWritable, errIdx, varbinds)
 }
 
 // handleGet processes a GET request.
@@ -398,17 +459,24 @@ func (a *Agent) handleGetBulk(community []byte, pduBody []byte) []byte {
 	return a.buildResponse(community, requestID, errNoError, 0, varbinds)
 }
 
-// isValidCommunity checks if the given community string is configured.
-func (a *Agent) isValidCommunity(community string) bool {
+// getCommunity returns the configured community matching the given string, or
+// nil if none matches. The returned struct carries the authorization level
+// (read-only / read-write) used to gate SET requests.
+func (a *Agent) getCommunity(community string) *config.SNMPCommunity {
 	if a.cfg == nil || a.cfg.Communities == nil {
-		return false
+		return nil
 	}
 	for _, c := range a.cfg.Communities {
 		if c.Name == community {
-			return true
+			return c
 		}
 	}
-	return false
+	return nil
+}
+
+// isValidCommunity checks if the given community string is configured.
+func (a *Agent) isValidCommunity(community string) bool {
+	return a.getCommunity(community) != nil
 }
 
 // getOIDValue returns the encoded value and BER tag for a given OID.
