@@ -1133,6 +1133,128 @@ fn test_policy_any_ipv6_token_matches_v6_only() {
     );
 }
 
+// #2008 H11 (legacy path): the non-v3-shaped fallback that reads
+// `source_addresses` / `destination_addresses` must family-scope
+// `any-ipv4` / `any-ipv6` exactly like the v3 path. Before the fix the
+// opposite family was built with `from_prefixes(empty)` == MatchAny, so
+// a legacy rule keyed on `any-ipv4` STILL matched IPv6 (and the reverse
+// for `any-ipv6`) — a cross-family leak.
+//
+// These tests drive the LEGACY field (no source_book_ids /
+// source_literals → source_is_v3_shaped == false), which the v3-path
+// tests above do not exercise.
+
+fn legacy_addr_rule(name: &str, src: &[&str], dst: &[&str]) -> PolicyRuleSnapshot {
+    PolicyRuleSnapshot {
+        name: name.to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: src.iter().map(|s| s.to_string()).collect(),
+        destination_addresses: dst.iter().map(|s| s.to_string()).collect(),
+        applications: vec!["any".to_string()],
+        action: "permit".to_string(),
+        ..Default::default()
+    }
+}
+
+fn eval_legacy(rule: PolicyRuleSnapshot, src: &str, dst: &str) -> PolicyAction {
+    let state = parse_policy_state("deny", std::slice::from_ref(&rule), &test_zone_name_to_id());
+    evaluate_policy(
+        &state,
+        TEST_LAN_ZONE_ID,
+        TEST_WAN_ZONE_ID,
+        src.parse().expect("src"),
+        dst.parse().expect("dst"),
+        PROTO_TCP,
+        12345,
+        5201,
+    )
+}
+
+#[test]
+fn test_legacy_source_any_ipv4_denies_ipv6() {
+    // source_addresses=["any-ipv4"], destination_addresses=["any"].
+    // v4 src must permit; v6 src must NOT match (opposite family is
+    // MatchNone, not MatchAny). Mutation sentinel: if the v6 set were
+    // left MatchAny, the v6 case below would return Permit.
+    let rule = legacy_addr_rule("legacy-any4-src", &["any-ipv4"], &["any"]);
+    assert_eq!(
+        eval_legacy(rule.clone(), "10.0.61.100", "172.16.80.200"),
+        PolicyAction::Permit,
+        "legacy any-ipv4 source must permit v4"
+    );
+    assert_eq!(
+        eval_legacy(rule, "2001:db8::1", "2001:db8::2"),
+        PolicyAction::Deny,
+        "legacy any-ipv4 source must NOT match v6 (cross-family leak)"
+    );
+}
+
+#[test]
+fn test_legacy_source_any_ipv6_denies_ipv4() {
+    let rule = legacy_addr_rule("legacy-any6-src", &["any-ipv6"], &["any"]);
+    assert_eq!(
+        eval_legacy(rule.clone(), "2001:db8::1", "2001:db8::2"),
+        PolicyAction::Permit,
+        "legacy any-ipv6 source must permit v6"
+    );
+    assert_eq!(
+        eval_legacy(rule, "10.0.61.100", "172.16.80.200"),
+        PolicyAction::Deny,
+        "legacy any-ipv6 source must NOT match v4 (cross-family leak)"
+    );
+}
+
+#[test]
+fn test_legacy_destination_any_ipv4_denies_ipv6() {
+    // Same leak on the destination side. source is "any" (both
+    // families); only the family scoping of the destination set gates.
+    let rule = legacy_addr_rule("legacy-any4-dst", &["any"], &["any-ipv4"]);
+    assert_eq!(
+        eval_legacy(rule.clone(), "10.0.61.100", "172.16.80.200"),
+        PolicyAction::Permit,
+        "legacy any-ipv4 destination must permit v4"
+    );
+    assert_eq!(
+        eval_legacy(rule, "2001:db8::1", "2001:db8::2"),
+        PolicyAction::Deny,
+        "legacy any-ipv4 destination must NOT match v6 (cross-family leak)"
+    );
+}
+
+#[test]
+fn test_legacy_destination_any_ipv6_denies_ipv4() {
+    let rule = legacy_addr_rule("legacy-any6-dst", &["any"], &["any-ipv6"]);
+    assert_eq!(
+        eval_legacy(rule.clone(), "2001:db8::1", "2001:db8::2"),
+        PolicyAction::Permit,
+        "legacy any-ipv6 destination must permit v6"
+    );
+    assert_eq!(
+        eval_legacy(rule, "10.0.61.100", "172.16.80.200"),
+        PolicyAction::Deny,
+        "legacy any-ipv6 destination must NOT match v4 (cross-family leak)"
+    );
+}
+
+#[test]
+fn test_legacy_empty_source_still_match_any_both_families() {
+    // Regression guard: with NO family-scoped wildcard, the legacy
+    // empty→MatchAny convention must hold for BOTH families (the fix
+    // must not over-tighten the unconstrained case to MatchNone).
+    let rule = legacy_addr_rule("legacy-empty-src", &[], &["any"]);
+    assert_eq!(
+        eval_legacy(rule.clone(), "10.0.61.100", "172.16.80.200"),
+        PolicyAction::Permit,
+        "empty legacy source must match v4 (legacy MatchAny)"
+    );
+    assert_eq!(
+        eval_legacy(rule, "2001:db8::1", "2001:db8::2"),
+        PolicyAction::Permit,
+        "empty legacy source must match v6 (legacy MatchAny)"
+    );
+}
+
 // #2008 H2: `source-address-excluded` inverts the source match —
 // the rule matches every source EXCEPT those in source_literals.
 // Before the fix the snapshot flag did not exist, so the rule matched
@@ -1273,5 +1395,137 @@ fn test_policy_destination_address_excluded_inverts_match() {
         ),
         PolicyAction::Permit,
         "a destination outside the excluded set must match"
+    );
+}
+
+// #2008 fail-open hardening: an `*-excluded` side whose configured
+// address set is unexpectedly EMPTY (e.g. a typo'd address that was
+// silently dropped during parse) must fail CLOSED — it must NOT
+// invert into match-ALL. The Go compiler now rejects such typos at
+// commit, but the dataplane is hardened as defense-in-depth.
+#[test]
+fn test_empty_excluded_source_fails_closed_v4() {
+    // source_literals=["totally-bogus"] drops to nothing → MatchNone →
+    // source_v4_empty == true. With source_address_excluded, the side
+    // must NOT match any v4 source (fail-closed), not match-all.
+    let mut snap = v3_rule("r-empty-excl-src", &[], &["totally-bogus"]);
+    snap.source_address_excluded = true;
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        std::slice::from_ref(&snap),
+        &test_zone_name_to_id(),
+        &[],
+        &counter_store,
+    )
+    .expect("parse");
+    // The dropped-typo set leaves the side empty; confirm the
+    // precomputed flag agrees so the fail-closed branch is exercised.
+    assert!(
+        state.rules[0].source_v4_empty,
+        "an all-dropped excluded source set must be flagged empty"
+    );
+    // Any v4 source → fail-closed → default-deny (NOT match-all).
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            "8.8.8.8".parse().expect("src"),
+            "1.1.1.1".parse().expect("dst"),
+            PROTO_TCP,
+            12345,
+            5201,
+        ),
+        PolicyAction::Deny,
+        "an empty excluded source set must fail-closed, not match-all"
+    );
+}
+
+#[test]
+fn test_empty_excluded_destination_fails_closed_v6() {
+    let mut snap = v3_rule("r-empty-excl-dst", &[], &["any"]);
+    snap.destination_literals = vec!["not-an-address".to_string()];
+    snap.destination_address_excluded = true;
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        std::slice::from_ref(&snap),
+        &test_zone_name_to_id(),
+        &[],
+        &counter_store,
+    )
+    .expect("parse");
+    assert!(
+        state.rules[0].destination_v6_empty,
+        "an all-dropped excluded destination set must be flagged empty (v6)"
+    );
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            "2001:db8::1".parse().expect("src"),
+            "2001:db8::2".parse().expect("dst"),
+            PROTO_TCP,
+            12345,
+            5201,
+        ),
+        PolicyAction::Deny,
+        "an empty excluded destination set must fail-closed, not match-all"
+    );
+}
+
+// Mutation sentinel for the fail-closed change: a NON-empty excluded
+// set must STILL invert (this passes only because the fail-closed
+// guard is gated on the empty flag, not applied unconditionally — if
+// the guard were `false &&` the non-excluded-address case below would
+// wrongly become Deny).
+#[test]
+fn test_nonempty_excluded_still_inverts_after_fail_closed_guard() {
+    let mut snap = v3_rule("r-nonempty-excl", &[], &["10.0.0.0/8"]);
+    snap.source_address_excluded = true;
+    let counter_store = PolicyCounterStore::default();
+    let state = parse_policy_state_with_counters(
+        "deny",
+        std::slice::from_ref(&snap),
+        &test_zone_name_to_id(),
+        &[],
+        &counter_store,
+    )
+    .expect("parse");
+    assert!(
+        !state.rules[0].source_v4_empty,
+        "a non-empty excluded set must NOT be flagged empty"
+    );
+    // Outside the excluded set → still matches (inversion intact).
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            "192.168.1.5".parse().expect("non-excluded src"),
+            "172.16.80.200".parse().expect("dst"),
+            PROTO_TCP,
+            12345,
+            5201,
+        ),
+        PolicyAction::Permit,
+        "a non-empty excluded set must still invert (outside set matches)"
+    );
+    // Inside the excluded set → no match.
+    assert_eq!(
+        evaluate_policy(
+            &state,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            "10.5.5.5".parse().expect("excluded src"),
+            "172.16.80.200".parse().expect("dst"),
+            PROTO_TCP,
+            12345,
+            5201,
+        ),
+        PolicyAction::Deny,
+        "a source inside the (non-empty) excluded set must NOT match"
     );
 }

@@ -94,6 +94,23 @@ type compileOpts struct {
 	// that lenient must NOT swallow is handled by the daemon's passive-node
 	// SyncApply admission gate (V-1), not by this compile flag.
 	lenientDeviceMap bool
+
+	// lenientPolicyMatchAddress (#2008) downgrades the policy match-
+	// address validator (validatePolicyMatchAddressesStrict) from a hard
+	// compile error to a cfg.Warnings entry. The strict commit /
+	// commit-check path hard-rejects a policy source-address /
+	// destination-address token that is neither a known address-book
+	// name, the `any` keyword, nor a parseable CIDR / IP — a typo would
+	// otherwise reach the dataplane, be silently dropped to an empty
+	// set, and (under `*-address-excluded` inversion) FAIL OPEN to
+	// match-all. The tolerant load / peer-sync paths downgrade to a
+	// warning so an already-persisted or peer-synced config still boots
+	// (the dataplane is independently hardened to fail CLOSED on an
+	// empty excluded set, so a slipped-through typo denies rather than
+	// opens). Like the other lenient gates this is an AST/typed-config
+	// compile decision and deliberately does NOT live in SchemaValidate
+	// (which only warns on the tolerant paths since #1319 PR 2).
+	lenientPolicyMatchAddress bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -118,6 +135,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		sanitizeFreeTextControlChars: true,
 		lenientVRRPTrackDuplicates:   true,
 		lenientDeviceMap:             true,
+		lenientPolicyMatchAddress:    true,
 	})
 }
 
@@ -183,6 +201,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		sanitizeFreeTextControlChars: true,
 		lenientVRRPTrackDuplicates:   true,
 		lenientDeviceMap:             true,
+		lenientPolicyMatchAddress:    true,
 	})
 }
 
@@ -478,6 +497,22 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
+	// #2008 policy match-address fail-open gate. Strict on commit /
+	// commit-check (hard-reject a typo'd source/destination address
+	// that would be silently dropped and — under `*-address-excluded`
+	// inversion — fail open to match-all); lenient on load / peer-sync
+	// (warn so an already-persisted or peer-synced config still boots).
+	// Runs AFTER the strict accumulator + device-map so a structural
+	// CoS/policer/device-map error still wins the first-error slot.
+	if err := validatePolicyMatchAddressesStrict(cfg); err != nil {
+		if opts.lenientPolicyMatchAddress {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("policy match-address (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
 	if warnings := ValidateConfig(cfg); len(warnings) > 0 {
 		for _, w := range warnings {
 			cfg.Warnings = append(cfg.Warnings, w)
@@ -611,6 +646,96 @@ func validatePolicySchedulerReferencesStrict(cfg *Config) error {
 		}
 	}
 	return nil
+}
+
+// validatePolicyMatchAddressesStrict hard-rejects a policy
+// source-address / destination-address token that is neither a known
+// address-book name (Address or AddressSet), the `any` keyword, nor a
+// parseable CIDR / bare IP (#2008). Such a token (a typo) reaches the
+// dataplane as an opaque string, fails CIDR/IP parsing in the Rust
+// literal parser, and is silently dropped to an empty set. Under
+// `*-address-excluded` inversion an empty set evaluates to MATCH-ALL —
+// a silent fail-open security bypass (a policy meant to exclude one
+// address ends up matching every address). Failing the typo at commit
+// turns the bypass into an operator-visible error.
+//
+// Legitimate forms accepted: address-book names, `any` (and the
+// family-scoped `any-ipv4` / `any-ipv6`, which compilePolicy already
+// normalizes to `0.0.0.0/0` / `::/0` and which parse as CIDRs anyway),
+// literal CIDRs, and bare IPv4 / IPv6 addresses. Junos address RANGES
+// are an address-book construct (expanded to /32s under the book) and
+// are referenced from a policy only by book NAME, so no range form
+// reaches this token list.
+func validatePolicyMatchAddressesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	// Collect valid address-book names (Addresses + AddressSets).
+	bookNames := make(map[string]bool)
+	if ab := cfg.Security.AddressBook; ab != nil {
+		for name := range ab.Addresses {
+			bookNames[name] = true
+		}
+		for name := range ab.AddressSets {
+			bookNames[name] = true
+		}
+	}
+	validToken := func(tok string) bool {
+		switch tok {
+		case "", "any", "any-ipv4", "any-ipv6":
+			return true
+		}
+		if bookNames[tok] {
+			return true
+		}
+		if _, _, err := net.ParseCIDR(tok); err == nil {
+			return true
+		}
+		return net.ParseIP(tok) != nil
+	}
+	check := func(scope string, pol *Policy) error {
+		if pol == nil {
+			return nil
+		}
+		for _, addr := range pol.Match.SourceAddresses {
+			if !validToken(addr) {
+				return policyMatchAddressError(scope, pol.Name, "source-address", addr)
+			}
+		}
+		for _, addr := range pol.Match.DestinationAddresses {
+			if !validToken(addr) {
+				return policyMatchAddressError(scope, pol.Name, "destination-address", addr)
+			}
+		}
+		return nil
+	}
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil {
+			continue
+		}
+		for _, pol := range zpp.Policies {
+			if err := check("", pol); err != nil {
+				return err
+			}
+		}
+	}
+	for _, pol := range cfg.Security.GlobalPolicies {
+		if err := check("global", pol); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func policyMatchAddressError(scope, polName, field, addr string) error {
+	if scope != "" {
+		return fmt.Errorf(
+			"%s policy %q: %s %q is not a defined address-book entry, the `any` keyword, or a valid CIDR/IP address",
+			scope, polName, field, addr)
+	}
+	return fmt.Errorf(
+		"policy %q: %s %q is not a defined address-book entry, the `any` keyword, or a valid CIDR/IP address",
+		polName, field, addr)
 }
 
 func validateClassOfServiceStrict(cos *ClassOfServiceConfig) error {
