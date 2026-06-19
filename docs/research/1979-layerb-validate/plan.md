@@ -1,6 +1,6 @@
 # #1979 — Flow/flow-export NUM_WIDTH: commit-time ValidateInteger (Layer B of #1977)
 
-**Status:** PLAN DRAFT v1.2 (research; folds Claude SMR r1 + strict/lenient finding; Codex+AGY r1 pending)
+**Status:** PLAN v2 (research; folds Claude SMR r1 + AGY r1 PLAN-NEEDS-MINOR + Codex r1 PLAN-NEEDS-MAJOR). Awaiting r2 reverify.
 **Base:** origin/master (`a75c970d8`, post-#1977/#1978 Layer A merge)
 **Issue:** #1979 (follow-up to #1977 / PR #1978)
 **Branch:** research/1979-layerb-validate
@@ -77,14 +77,19 @@ ceiling. The existing `hold-down` leaf (schema_system.go:420) already uses
 `ValidateInteger(0, MaxDurationSeconds)` for exactly this reason — Layer B
 reuses that established bound verbatim.
 
-**Q-RATE (sampling input rate lower bound):** Layer A normalizes `rate <= 0 →
-1` (a documented Junos semantic: 1-in-1 = sample every packet). Layer B has a
-choice: (a) validate `[1, 4294967295]` (reject 0/negative as a clear error), or
-(b) `[0, 4294967295]` (accept 0 and let Layer A normalize it to 1, preserving
-the current silent behaviour). **Recommended: (a) `[1, 4294967295]`** — a `rate
-0` is meaningless and Junos itself rejects it; rejecting at commit is the
-clearer UX and Layer A still defends the gRPC/file path. This is an explicit
-reviewer question (Q3).
+**Q-RATE (sampling input rate lower bound) — USER DECISION, Codex r1 #5:** the
+config type documents `InputRate ... 0 = sample all` (types_system.go:569) and
+Layer A ACCEPTS 0 (normalizes `rate <= 0 → 1`, flow.go). So:
+- (a) `[1, 4294967295]` — reject 0 at commit. Clearer UX, BUT this is genuine
+  **behavior drift** (stricter than Layer A, which accepts a documented `0`).
+- (b) `[0, 4294967295]` — accept 0, let Layer A normalize. **Exact Layer-A
+  mirror**, no drift; only catches the actual decode-aborting case (>u32max).
+Codex r1 (precise) flagged (a) as drift needing explicit sign-off; AGY r1 read
+(a) as a Layer-A match (it is not — Layer A accepts 0). **This plan now defers
+the choice to the user.** Default recommendation: **(b) `[0, 4294967295]`** to
+keep Layer A and Layer B in EXACT agreement (the §6 invariant: Layer B must not
+reject what Layer A accepts), unless the user prefers the stricter (a) UX and
+accepts documenting the `0 = sample all` drift.
 
 ---
 
@@ -114,13 +119,28 @@ complete reachable set (Q1 resolved). The config surface to validate is:
 `tcp-session` compiles four timeout sub-leaves (compiler_security.go:589-597):
 `established-timeout`, `initial-timeout`, `closing-timeout`, `time-wait-timeout`.
 Only `established-timeout` reaches the wire `FlowSnapshot.TCPSessionTimeout`. The
-other three are stored in `TCPSessionConfig` and consumed elsewhere (or not yet
-wired). For UX consistency — and because expanding `tcp-session` to a container
-*requires* declaring its known children anyway (otherwise completion regresses,
-see §6) — **all four `tcp-session` integer sub-leaves should be typed** with
-`[0, MaxDurationSeconds]` (the same Duration-overflow ceiling). The three
-non-wire ones are config-correctness, not a wire-decode defense, but they share
-the bound and cost nothing extra. Reviewer Q4 confirms this scope is intended.
+other three are stored in `TCPSessionConfig`. For UX consistency — and because
+expanding `tcp-session` to a container *requires* declaring its known children
+anyway (otherwise completion regresses, see §6) — **all four `tcp-session`
+integer sub-leaves should be typed** with `[0, MaxDurationSeconds]` (the same
+Duration-overflow ceiling). The three non-wire ones are config-correctness, not
+a wire-decode defense, but they share the bound and cost nothing extra.
+
+**AGY r1 #2 — BPF `uint32` truncation of the siblings: VERIFIED DEAD PATH, keep
+`[0, MaxDurationSeconds]`.** AGY noted `compileFlowTimeouts` casts the four TCP
+timeouts (and UDP/ICMP) to `uint32` at pkg/dataplane/compiler.go:1006-1012 →
+`dp.SetFlowTimeout`, arguing a `MaxDurationSeconds`-bounded value would silently
+truncate. I traced it: the LIVE userspace implementation of `SetFlowTimeout` is a
+NO-OP STUB — `func (d userspaceShimCompileDataplane) SetFlowTimeout(uint32,
+uint32) error { return nil }` (pkg/dataplane/loader.go:391). That u32 map-write
+was the legacy eBPF path retired in #1476; on the only live dataplane it does
+nothing, and the three siblings don't reach FlowSnapshot either, so there is NO
+live u32 consumer to truncate. The three WIRE-reaching session timeouts
+(`established`/`udp`/`icmp`) ARE Rust **u64** (snapshot.rs:151-155), so
+`[0, MaxDurationSeconds]` is REQUIRED there to match Layer A — AGY's `[0,u32max]`
+would be WRONG for those (rejecting valid u64 values Layer A accepts). DECISION:
+`[0, MaxDurationSeconds]` for ALL six; note the dead-path cast (Q8) so a
+hypothetical eBPF revival (none planned) would re-tighten the non-wire siblings.
 
 ### §4b — version-ipfix (parallel but NOT wired)
 
@@ -173,10 +193,13 @@ presence-only nodes. Example for `udp-session`:
 }},
 ```
 
-`tcp-session` additionally declares `established/initial/closing/time-wait-timeout`
-(all typed `[0, MaxDurationSeconds]`) plus the three presence flags
-`no-syn-check`, `no-syn-check-in-tunnel`, `rst-invalidate-session` (declared as
-`{children: nil}` so completion still offers them and the walker accepts them).
+`tcp-session` additionally declares the four FULLY-SPELLED timeout keys
+`established-timeout`, `initial-timeout`, `closing-timeout`, `time-wait-timeout`
+(all typed `[0, MaxDurationSeconds]` — AGY r1 #1: spell them out, the compiler
+matches the full `-timeout` names, compiler_security.go:589-597) plus the three
+presence flags `no-syn-check`, `no-syn-check-in-tunnel`, `rst-invalidate-session`
+(declared `{children: nil}` so completion still offers them and the walker
+accepts them).
 `input` declares `rate` (typed u32). `flow-server` (keeps `args:1` for the
 address) declares `port` (typed `[1,65535]`) plus the existing free-form
 children `version9-template`, `version9 { template }`, `source-address`.
@@ -192,17 +215,23 @@ out-of-range rejected with clear errors; round-trip byte-stable; two bare
 `flow-server` entries still append (not replace) — which is correct, multiple
 collectors are valid.
 
-**SetPath grouping note (flow-server):** `flow-server` already has `args:1`.
-Adding a `children` map flips its `i >= len(path)` terminal behaviour
-(ast_edit.go:196) from "single-value REPLACE" to "named-container APPEND". For
-`flow-server`, APPEND is the *desired* behaviour (an operator can configure
-multiple collectors), and a bare `flow-server <addr>` with no port is a
-degenerate config the compiler skips anyway (port is required). The
-golden-grouping test will be extended to pin this. `input`/`tcp-session`/
-`udp-session`/`icmp-session` have `args:0`, so the line-196 REPLACE branch never
-applied to them (it requires `args > 0`); adding children only changes them from
-"flag leaf" to "container", which is correct since they were always traversed
-deeper.
+**SetPath grouping note (flow-server) — scoped per Codex r1 #4:** `flow-server`
+already has `args:1`. Adding a `children` map flips its `i >= len(path)` TERMINAL
+behaviour (ast_edit.go:194-196) — but ONLY for a *bare* terminal
+`set … flow-server <addr>` with no trailing tokens — from "single-value REPLACE"
+to "named-container APPEND". This flip is NOT load-bearing for normal use:
+- Real collectors carry sub-tokens (`flow-server <addr> port <n>`), so they
+  ALREADY take the container-creation path (ast_edit.go:270-280) and the
+  compiler already appends each (`FlowServers = append(...)`,
+  compiler_services.go:900) — multi-collector support does not depend on this
+  flip.
+- A bare no-port `flow-server <addr>` compiles `Port == 0` and the snapshot
+  builder skips it (flow.go port==0 skip) — so it is a harmless no-op either way.
+The flip is therefore a benign side-effect to PIN (extended golden), not a
+feature to sell. `input`/`tcp-session`/`udp-session`/`icmp-session` have
+`args:0`, so the line-196 REPLACE branch never applied (it requires `args > 0`);
+adding children only changes them from "flag leaf" to "container", correct since
+they were always traversed deeper.
 
 ### Tier 3 — `tcp-mss` dual value-location (THE HARD CASE — design decision)
 
@@ -253,13 +282,29 @@ if err := validateTCPMSSRanges(tree.Children); err != nil {
 }
 ```
 
-`validateTCPMSSRanges` finds `security flow tcp-mss` and, for each
+`validateTCPMSSRanges` finds every `security flow tcp-mss` node (recursing /
+filtering ALL `security`→`flow`→`tcp-mss` occurrences in the candidate AST — NOT
+`FindChild`-first-match, which would miss a second block in a pre-merge
+candidate; AGY r1 note) and, for each
 `ipsec-vpn`/`gre-in`/`gre-out`/`all-tcp` child, range-checks `[0, 65535]`
-against **whichever position carries the value** — mirroring `parseMSSValue`'s
-exact dual read (compiler_interfaces.go:729-744): the `mss` sub-child's `Keys[1]`
-if present, else the node's own `Keys[1]`. It reuses `ValidateInteger(0, 65535)`
-for the check but, unlike `parseMSSValue` (which silently returns 0 on a bad
-value), it returns a descriptive error.
+against **the value the compiler would actually select** — it MUST mirror
+`parseMSSValue`'s exact PRECEDENCE (compiler_interfaces.go:729-744): the `mss`
+sub-child's `Keys[1]` **first** (if it parses), and only **fall back** to the
+node's own flat `Keys[1]` otherwise.
+
+**Codex r1 #3 — the precedence trap (experimentally confirmed):**
+`parseMSSValue` prefers the `mss` child and returns immediately if it parses,
+ignoring any flat value. So `gre-in 70000 { mss 1360; }` compiles
+`TCPMSSGreIn = 1360` (the child wins; the flat 70000 is DISCARDED) — verified by
+compiling that exact config. A naive "validate BOTH positions" helper would
+**wrongly reject** that config on the discarded 70000. The fix: validate ONLY
+the compiler-selected value — ideally by SHARING `parseMSSValue`'s selection
+(extract a `selectMSSToken(node) (string, bool)` from `parseMSSValue` so the
+compiler and validator can never diverge), then `ValidateInteger(0, 65535)` on
+the chosen token. Unlike `parseMSSValue` (which silently returns 0 on a bad
+value), the validator returns a descriptive error. A mixed-shape test
+(`gre-in 70000 { mss 1360 }` PASSES — selected value 1360;
+`gre-in 1360 { mss 70000 }` REJECTS — selected value 70000) pins the precedence.
 
 - **Pros:** validates BOTH valid shapes and rejects neither; mirrors
   `parseMSSValue` precisely (same value-location logic, so it can never diverge
@@ -374,15 +419,24 @@ blackout-boots an upgraded node):
    `tcp-mss` stays opaque ⇒ no grouping change at all for Tier 3.
 2. **Completion must not regress (#1319 two-SSOT):** expanding an opaque node to
    a container means `?`/tab completion now offers ONLY the declared children.
-   Every child the compiler reads MUST be declared, or completion silently drops
-   a previously-completable keyword. Verified compiler-read children to declare:
-   - `tcp-session`: established/initial/closing/time-wait-timeout, no-syn-check,
-     no-syn-check-in-tunnel, rst-invalidate-session.
-   - `udp-session`/`icmp-session`: timeout.
-   - `input`: rate.
-   - `flow-server`: port, version9-template, version9{template}, source-address.
-   (`tcp-mss` children only need declaring if Option T3-A(i) or completion
-   parity for MSS is pursued; T3-A(ii) leaves it opaque.)
+   Every child the compiler reads under THE EXPANDED NODE must be declared, or
+   completion silently drops a previously-completable keyword. **Scope note
+   (Codex r1 #7):** this claim covers ONLY the nodes Layer B expands — Layer B
+   does NOT touch the `flow` node itself, so a pre-existing `flow`-level
+   completion gap (`syn-flood-protection-mode` is read by
+   compiler_security.go:702 but not declared as a `flow` child today) is
+   PRE-EXISTING and OUT OF SCOPE; do not claim "all compiler-read children are
+   declared" repo-wide. Per expanded node, the full child keys to declare are
+   (spelled out fully — AGY r1 #1, no shorthand):
+   - `tcp-session`: `established-timeout`, `initial-timeout`, `closing-timeout`,
+     `time-wait-timeout` (typed), plus presence flags `no-syn-check`,
+     `no-syn-check-in-tunnel`, `rst-invalidate-session`.
+   - `udp-session` / `icmp-session`: `timeout`.
+   - `input`: `rate`.
+   - `flow-server`: `port`, `version9-template`, `version9` (→ `template`),
+     `source-address`.
+   (`tcp-mss` stays opaque under T3-A — the compiler-pre-walk needs no schema
+   children; MSS completion parity is a separable optional follow-up, §9.)
 3. **No valid config may start failing commit.** Both AST shapes (flat +
    hierarchical) of every leaf must still pass. This is THE acceptance gate —
    the Tier-3 trap is exactly a violation of it, which is why T3-A is required
@@ -430,9 +484,14 @@ change.
    still offers every compiler-read child (no silent drop).
 5. **Layer-A agreement:** a property test feeding the SAME boundary values
    (65535, 65536, MaxDurationSeconds, MaxDurationSeconds+1, u32max, u32max+1)
-   to BOTH `SchemaValidate` and the Layer-A coercion, asserting: every value
-   Layer B accepts is left unchanged by Layer A; every value Layer B rejects is
-   one Layer A coerces. (Pins the §3 contract.)
+   to BOTH the Layer-B validators and the Layer-A coercion, asserting: every
+   value Layer B accepts is left unchanged by Layer A; every value Layer B
+   rejects is one Layer A coerces. **Scope (Codex r1 #6):** this test covers
+   ONLY the wire-reaching fields (the 8 leaves / 11 fields). version-ipfix
+   timeouts do NOT reach Layer A (builder reads `fm.Version9` only,
+   flow.go:176), so they are EXCLUDED from the Layer-A-agreement test — their
+   typing is UX parity only, validated by the plain accept/reject test (item 1),
+   not the agreement property. (Pins the §3 contract.)
 6. **Strict-vs-lenient (boot/HA safety — MANDATORY):** an out-of-range value
    (e.g. `tcp-mss gre-in 70000`, `flow-active-timeout -1`) (a) HARD-REJECTS on
    the strict path (`compileTreeStrict` / `commit check`) with a clear error,
@@ -470,7 +529,10 @@ zero SSOT-grouping change). This validates all 8 config leaves / 11 wire fields
 at commit with clear errors, rejects no valid config, and keeps the grammar
 blast radius minimal. Locked decisions (from Q3/Q4/Q5, see §11):
 
-- Sampling `input rate`: **`[1, 4294967295]`** (reject 0 at commit).
+- Sampling `input rate`: **USER DECISION pending** — default **`[0, 4294967295]`**
+  (exact Layer-A mirror; rejects only the decode-aborting >u32max). Switch to
+  `[1, u32max]` only if the user wants the stricter reject-0 UX (documented
+  drift from `0 = sample all`). See Q3.
 - `tcp-session`: type **all four** timeouts (`established`/`initial`/`closing`/
   `time-wait`) at `[0, MaxDurationSeconds]` (declaring them is required for
   completion anyway; only `established-timeout` is wire-reaching).
@@ -492,26 +554,39 @@ still a clean win and MSS stays safe via Layer A, but it is an explicit partial
   interface-level/per-unit `tcp-mss` feeding any of these 11 flow fields. The
   8-leaf / 11-field set is the complete reachable surface. (Confirmed by SMR r1
   + independent grep of all `parseMSSValue` call sites.)
-- **Q2 (Tier 3 mechanism) — DECIDED.** Compiler-side AST pre-walk
-  `validateTCPMSSRanges` modeled on `validateVRRPTrackInterfaceAST`
-  (compiler_interfaces.go:746, wired compiler.go:225). Chosen over a
-  schemaNode-field/walker hook (touches the schemaNode type + golden + docs for
-  one leaf family) and over deferring (T3-C leaves the headline case
-  unvalidated). Reviewers: is the compiler pre-walk the right home, and is
-  reusing `parseMSSValue`'s dual-read logic (range-check both positions) the
-  correct semantics?
-- **Q3 (sampling rate) — DECIDED `[1, 4294967295]`.** Reject 0 at commit (Junos
-  rejects it; Layer A's `<=0→1` stays as the gRPC/file defense). Reviewers:
-  agree, or keep `[0, u32max]` to mirror Layer A's accept-and-normalize?
+- **Q2 (Tier 3 mechanism) — DECIDED + hook specified (Codex r1 #2/#3 folded).**
+  Compiler-side AST pre-walk `validateTCPMSSRanges` wired in `CompileConfig`
+  alongside `validateVRRPTrackInterfaceAST` (compiler.go:225), taking the
+  `lenient` flag — NOT a SchemaValidate addition (SchemaValidate is generic and
+  `tcp-mss` stays opaque, so the declarative walker would never reach it; Codex
+  #2). It validates the COMPILER-SELECTED MSS value via the same precedence as
+  `parseMSSValue` (mss-child-first, flat-fallback — shared selector so it can
+  never diverge; Codex #3), not "both positions." Chosen over a
+  schemaNode-field/walker hook and over deferring. Remaining reviewer question:
+  is `CompileConfig` the right home vs a configstore-level call beside
+  SchemaValidate?
+- **Q3 (sampling rate) — USER DECISION (Codex r1 #5 reopened my earlier
+  "decided").** `InputRate 0 = sample all` is documented (types_system.go:569)
+  and Layer A ACCEPTS 0 → rejecting it at commit is real drift, not a mirror.
+  Default recommend **`[0, u32max]`** (exact Layer-A agreement); choose
+  `[1, u32max]` only with explicit sign-off on the reject-0 UX drift.
 - **Q4 (§4a tcp-session) — DECIDED: type all four timeouts.** Declaring the
   container's children is required for completion parity anyway; the three
   non-wire timeouts share `[0, MaxDurationSeconds]`. Reviewers: agree?
 - **Q5 (§4b version-ipfix) — DECIDED: type the pair too.** Same one-line change,
   UX parity, future-proofs IPFIX wiring. Reviewers: agree, or version9-only?
-- **Q6 (grouping):** Is flipping `flow-server` to container/APPEND acceptable
-  (it enables multiple collectors, matches compiler `FindChildren`), and is the
-  extended golden the right pin?
+- **Q6 (grouping) — scoped (Codex r1 #4).** The `flow-server` REPLACE→APPEND
+  flip affects ONLY a bare terminal `set … flow-server <addr>` (no trailing
+  tokens). Real collectors (with `port`) already append via the container path;
+  bare no-port servers compile `Port==0` and the builder skips them. Benign;
+  pin in the extended golden, do not sell as load-bearing. Reviewers: agree it
+  is a no-op-in-practice side effect?
 - **Q7 (PLAN-KILL):** Given Layer A already closed the safety hole, is the UX
   gain worth the (now minimal, mostly-declarative) grammar churn? Honest framing:
   UX-only. Recommended scope is justified because the issue headline case is the
   Tier-3 flat path — a Tier-1-only or T3-C scope would read as a half-fix.
+- **Q8 (BPF dead-path cast) — NOTED, no action.** `compileFlowTimeouts` casts
+  the session timeouts to `uint32` (pkg/dataplane/compiler.go:1006-1012), but the
+  live userspace `SetFlowTimeout` is a no-op stub (loader.go:391) — a legacy
+  eBPF artifact (#1476). No live truncation; `[0, MaxDurationSeconds]` stands. If
+  the eBPF path is ever revived (not planned), re-tighten the non-wire siblings.
