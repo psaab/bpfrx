@@ -6,12 +6,29 @@ session sampling. Wired off `pkg/logging.EventReader` SESSION_CLOSE
 events in `pkg/daemon/daemon_flow.go`, not the conntrack GC delete
 callback. No per-packet sampling path.
 
+## File layout
+
+The package is split by responsibility (#1988):
+
+- `manager.go` — resolved export config (`ExportConfig`,
+  `CollectorConfig`, `SamplingDir`), the sampling scheduler
+  (`ShouldExport`), the shared `FlowRecord`/`SessionCloseData` shapes,
+  and the `BuildExportConfig` / `BuildIPFIXExportConfig` /
+  `BuildSamplingZones` config resolvers.
+- `netflow.go` — NetFlow v9 template/record encoding and the `Exporter`
+  that drives it.
+- `ipfix.go` — IPFIX (v10) template/record encoding and the
+  `IPFIXExporter` that drives it.
+- `transport.go` — shared collector connection management
+  (`collectorConns`: dial / fan-out write / close) and the per-family
+  batch accumulator (`flowBatch`) used by both exporters.
+
 ## Entry points
 
 NetFlow v9:
-- `Exporter` — `exporter.go`.
-- `NewExporter(cfg ExportConfig) (*Exporter, error)` — `exporter.go`.
-- `Run(ctx context.Context)` — `exporter.go`. Main export loop.
+- `Exporter` — `netflow.go`.
+- `NewExporter(cfg ExportConfig) (*Exporter, error)` — `netflow.go`.
+- `Run(ctx context.Context)` — `netflow.go`. Main export loop.
 - `Exporter.ExportSessionClose(rec, evt)` — emit one record.
 
 IPFIX:
@@ -21,11 +38,13 @@ IPFIX:
 - `IPFIXExporter.ExportSessionClose(rec, evt)` — emit one record.
 
 Shared:
-- `ExportConfig` — `exporter.go`. Resolved per-collector config.
-- `BuildExportConfig(svc *config.ServicesConfig, fo *config.ForwardingOptionsConfig) *ExportConfig` — `exporter.go`.
-- `SamplingDir` — `exporter.go`. Direction enum.
-- `SessionCloseData` — wire shape built from `logging.EventReader`
-  SESSION_CLOSE records (in `pkg/daemon/daemon_flow.go`).
+- `ExportConfig` — `manager.go`. Resolved per-collector config.
+- `BuildExportConfig(svc *config.ServicesConfig, fo *config.ForwardingOptionsConfig) *ExportConfig` — `manager.go`.
+- `BuildIPFIXExportConfig(...)` / `BuildSamplingZones(...)` — `manager.go`.
+- `SamplingDir` — `manager.go`. Direction enum.
+- `SessionCloseData` — `manager.go`. Wire shape built from
+  `logging.EventReader` SESSION_CLOSE records (in
+  `pkg/daemon/daemon_flow.go`).
 
 ## Callers
 
@@ -46,9 +65,9 @@ the `logging.EventReader` SESSION_CLOSE callback.
 - NetFlow v9 templates refresh every 60 s. If a collector restarts and
   misses a refresh it sees opaque records until the next cycle —
   configure the collector to handle template re-resolution.
-- Two batches are maintained: `batchV4` and `batchV6` (split by
-  family, not by zone). Both flush on a 100 ms ticker or on
-  shutdown.
+- Two batches are maintained inside `flowBatch` (`v4` and `v6`, split
+  by family, not by zone — `transport.go`). Both flush on a 100 ms
+  ticker or on shutdown.
 - `ExportSessionClose` builds the flow record synchronously from the
   event-reader callback. The export goroutine (started in `Run(ctx)`)
   is what actually transmits and refreshes templates; record assembly
