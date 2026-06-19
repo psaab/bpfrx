@@ -22,6 +22,7 @@ use super::{
     BpfSessionKeyV4, BpfSessionKeyV6, BpfSessionValueV4, BpfSessionValueV6, SESS_STATE_ESTABLISHED,
     SessionDecision, SessionKey, SessionMetadata, reverse_session_key,
 };
+use crate::ip_proto::{PROTO_TCP, PROTO_UDP};
 use core::ffi::{c_int, c_void};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -39,9 +40,6 @@ const ALG_DISABLE_SIP: u8 = 0x04;
 // bit layout consistently across Go and Rust; intentionally unused.
 #[allow(dead_code)]
 const ALG_DISABLE_TFTP: u8 = 0x08;
-
-const PROTO_TCP: u8 = 6;
-const PROTO_UDP: u8 = 17;
 
 // alg_type codes written into the conntrack session value, matching
 // bpf/headers/xpf_conntrack.h: 0=none, 1=FTP, 2=SIP, 3=DNS.

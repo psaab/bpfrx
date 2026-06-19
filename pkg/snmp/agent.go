@@ -536,12 +536,8 @@ func (a *Agent) getCommunity(community string) *config.SNMPCommunity {
 	if cfg == nil || cfg.Communities == nil {
 		return nil
 	}
-	for _, c := range cfg.Communities {
-		if c.Name == community {
-			return c
-		}
-	}
-	return nil
+	// Communities is keyed by community name, so look it up directly.
+	return cfg.Communities[community]
 }
 
 // isValidCommunity checks if the given community string is configured.
