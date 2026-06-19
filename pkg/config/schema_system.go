@@ -5,6 +5,33 @@ package config
 // `snmp`, and `event-options`. The root composition, the schemaNode
 // type, and the split rationale live in schema.go.
 
+// junosSyslogSeverities is the fixed Junos syslog severity vocabulary used
+// for the value slot of a `<facility> <severity>` system-syslog pair. The
+// facility keyword itself is open-ended (a wildcard schema child), but the
+// severity is one of these names; anything else is a typo the runtime would
+// silently treat as "no severity filter" (logging.ParseSeverity returns 0
+// for unknown names). #2008.
+var junosSyslogSeverities = []string{
+	"any", "none", "emergency", "alert", "critical",
+	"error", "warning", "notice", "info", "debug",
+}
+
+// syslogFacilitySeverityLeaf builds the wildcard typed leaf used for a
+// system-syslog `<facility> <severity>` pair. It is a fresh node per call so
+// that each destination (host/file/user) owns an independent wildcard and a
+// future edit to one does not alias the others. #2008.
+func syslogFacilitySeverityLeaf() *schemaNode {
+	return &schemaNode{
+		desc:          "Syslog facility (value is the severity threshold)",
+		args:          1,
+		placeholder:   "<severity>",
+		valueType:     ValueEnumOf,
+		valueDesc:     "syslog severity threshold",
+		valueExamples: []string{"any", "info", "warning", "error"},
+		validator:     ValidateEnum(junosSyslogSeverities),
+	}
+}
+
 var schemaSystem = &schemaNode{desc: "System configuration", children: map[string]*schemaNode{
 	"host-name":     {desc: "System hostname", args: 1, placeholder: "<hostname>", children: nil},
 	"domain-name":   {desc: "Domain name", args: 1, placeholder: "<domain>", children: nil},
@@ -63,9 +90,26 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 		}},
 	}},
 	"syslog": {desc: "Syslog configuration", children: map[string]*schemaNode{
-		"user": {desc: "Syslog user", args: 1, placeholder: "<user>", children: nil},
-		"host": {desc: "Syslog host", args: 1, placeholder: "<host>", children: nil},
-		"file": {desc: "Syslog file", args: 1, placeholder: "<filename>", children: nil},
+		// #2008 (syslog schema-only): a system syslog host/file/user
+		// destination body is a set of `<facility> <severity>` pairs
+		// (compiler_system.go syslog loop reads Keys[0]=facility,
+		// Keys[1]=severity for every non-`allow-duplicates` child). The
+		// facility namespace is open-ended (kern, daemon, auth, local0-7,
+		// any, ...) so the FACILITY keyword stays a wildcard — but the
+		// SEVERITY value slot is a fixed Junos vocabulary, so a typed
+		// wildcard leaf catches a misspelled severity (e.g. `kernel
+		// informational`) that the runtime would otherwise treat as "no
+		// filter" (ParseSeverity returns 0 for anything it does not know).
+		// `allow-duplicates` is an explicit presence-only flag so it is
+		// not mistaken for a facility with a missing severity.
+		"user": {desc: "Syslog user destination", args: 1, placeholder: "<user>",
+			wildcard: syslogFacilitySeverityLeaf()},
+		"host": {desc: "Syslog host destination", args: 1, placeholder: "<host>",
+			wildcard: syslogFacilitySeverityLeaf(), children: map[string]*schemaNode{
+				"allow-duplicates": {desc: "Do not suppress duplicate messages", children: nil},
+			}},
+		"file": {desc: "Syslog file destination", args: 1, placeholder: "<filename>",
+			wildcard: syslogFacilitySeverityLeaf()},
 	}},
 	"login": {desc: "Login configuration", children: map[string]*schemaNode{
 		"user": {desc: "User name", args: 1, placeholder: "<username>", children: map[string]*schemaNode{

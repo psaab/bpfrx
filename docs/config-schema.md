@@ -270,3 +270,54 @@ reserved for whole-dataplane selection where a rewrite shim
   empty-tree-compiles-non-nil trap). The pure identity resolver +
   host-NIC enumeration live in `pkg/devicemap` (shared by the daemon rename
   / pre-flight and the CLI `show`).
+- **#2008 (Tier-1.5 schema-hardening sweep):** declared typed children on
+  five subtrees whose leaves were fully parsed + compiled + honored at
+  runtime but whose `setSchema` node carried `children: nil`, so the gate
+  skipped them and an invalid value committed silently:
+  - `security log stream transport` — `protocol` (enum `udp|tcp|tls`,
+    matching the `pkg/logging/syslog.go` dial switch) + `tls-profile`.
+  - IKE (`security ike proposal`) and IPsec (`security ipsec proposal`)
+    crypto leaves — `authentication-method` (IKE only, enum
+    `pre-shared-keys|rsa-signatures|ecdsa-signatures`, matching
+    `authMethodToSwan`), `dh-group`, and `lifetime-seconds`
+    (`ValidateIntegerMin(1)` — 0/garbage previously silently compiled to
+    0). The two `dh-group` leaves are validated DIFFERENTLY, on purpose, to
+    stay compiler-faithful (the gate must match what each compiler loop
+    actually parses):
+    - IKE `dh-group` — `ValueDHGroup` + `ValidateDHGroup`. The IKE compiler
+      loop (`compiler_ipsec.go` `compileIKE`) strips a leading `group`
+      prefix before `strconv.Atoi`, so both the bare-integer (`14`) and the
+      Junos `group<N>` (`group14`) spellings compile identically; the
+      validator accepts both and rejects 0/garbage that would drop the
+      modp term.
+    - IPsec Phase-2 `dh-group` — plain positive integer (`ValueInteger` +
+      `ValidateIntegerMin(1)`). The Phase-2 compiler loop (`compileIPsec`)
+      parses it with a bare `strconv.Atoi` and does NOT strip the `group`
+      prefix, so `group14` would compile to `DHGroup=0` and silently drop
+      PFS/modp. The schema rejects the `group<N>` spelling for Phase-2 PFS
+      rather than admit a value the compiler cannot honor.
+    `protocol` and `encryption-algorithm` / `authentication-algorithm` stay
+    UNTYPED: the swanctl renderer normalizes arbitrary algorithm spellings
+    by string substitution, so an enum there would false-reject valid
+    configs.
+  - `security nat static rule-set rule match` — declared the
+    `source-address` / `destination-address` children the static-NAT
+    compiler reads (the subtree was previously unreachable by the walker).
+  - `protocols router-advertisement interface` — typed the
+    second-denominated leaves (`max/min-advertisement-interval`,
+    `default-lifetime`, `link-mtu` via `ValidateIntegerMin(1)`) and
+    declared the remaining compiler-consumed structural children
+    (managed/other-stateful-configuration, dns-server-address, prefix
+    flags). The per-`prefix` `valid-lifetime` / `preferred-lifetime` leaves
+    are typed as non-negative integers (`ValidateIntegerMin(0)`): the
+    compiler parses them with a bare `strconv.Atoi` and 0 means "use the
+    SLAAC default" (`pkg/ra` clamps `<=0`), so 0 is accepted but garbage
+    (e.g. `valid-lifetime abc`, which previously silently became 0) now
+    fails at commit.
+  - `system syslog host/file/user` — a wildcard `<facility>` child (the
+    facility namespace is open-ended) whose value slot is the fixed Junos
+    severity vocabulary (`syslogFacilitySeverityLeaf`), so a misspelled
+    severity that `ParseSeverity` would silently treat as "no filter" now
+    fails at commit; `allow-duplicates` is an explicit presence-only flag.
+  Pure schema hardening — no runtime behavior change. Regression coverage:
+  `pkg/config/schema_validate_2008_test.go`.
