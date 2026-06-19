@@ -104,6 +104,62 @@ func extractRulesInstall(t *testing.T, src string) []string {
 	return names
 }
 
+// rulesInstallPair matches a single `install -m 0755 <src> debian/xpf$(STAGED)/<dest>`
+// command, capturing BOTH the build-output SOURCE and the staged DEST basename.
+// The install command may wrap across two physical lines (xpf-day0-config does),
+// so callers join `\`-continuations before matching.
+var rulesInstallPair = regexp.MustCompile(`install\s+-m\s+0755\s+(\S+)\s+debian/xpf\$\(STAGED\)/([A-Za-z0-9._-]+)`)
+
+// extractRulesInstallPairs returns the dest->src map debian/rules installs into
+// the staging dir. Unlike extractRulesInstall (dest basenames only) it keeps the
+// SOURCE path so the canary can catch a wrong artifact shipped under the correct
+// staged basename — StagedSrc was previously dead manifest metadata (#1999).
+func extractRulesInstallPairs(t *testing.T, src string) map[string]string {
+	t.Helper()
+	const startMarker = "override_dh_auto_install:"
+	start := strings.Index(src, startMarker)
+	if start < 0 {
+		t.Fatalf("debian/rules: %q recipe not found", startMarker)
+	}
+	body := src[start+len(startMarker):]
+	if end := nextTopLevel(body); end >= 0 {
+		body = body[:end]
+	}
+	// Join line continuations so a wrapped install command matches as one.
+	joined := strings.ReplaceAll(body, "\\\n", " ")
+	pairs := map[string]string{}
+	for _, m := range rulesInstallPair.FindAllStringSubmatch(joined, -1) {
+		pairs[m[2]] = m[1] // dest basename -> source path
+	}
+	if len(pairs) == 0 {
+		t.Fatal("debian/rules: no `install -m 0755 <src> debian/xpf$(STAGED)/<name>` " +
+			"pairs found in override_dh_auto_install")
+	}
+	return pairs
+}
+
+// stagedSrcMismatches compares debian/rules' dest->src install pairs against the
+// manifest's Name->StagedSrc mapping, returning one message per divergence. A
+// wrong source under the correct basename (the #1999 hazard) is caught here even
+// though the destination-basename set still equals manifest.Names().
+func stagedSrcMismatches(pairs map[string]string) []string {
+	var msgs []string
+	for _, b := range All() {
+		got, ok := pairs[b.Name]
+		if !ok {
+			msgs = append(msgs, b.Name+": no `install ... debian/xpf$(STAGED)/"+
+				b.Name+"` line in debian/rules")
+			continue
+		}
+		if got != b.StagedSrc {
+			msgs = append(msgs, b.Name+": debian/rules installs source "+got+
+				" but manifest StagedSrc is "+b.StagedSrc+
+				" (a wrong artifact under the correct basename ships silently)")
+		}
+	}
+	return msgs
+}
+
 // nextTopLevel returns the offset of the first line in body that begins a new
 // top-level make construct (column-0, non-blank, non-comment, non-recipe), or
 // -1 if none. Recipe lines are TAB-indented; a directory `install -d` that is
@@ -184,10 +240,17 @@ func TestManagedBinaryDriftCanary(t *testing.T) {
 	}
 
 	// debian/rules install set.
-	gotRules := extractRulesInstall(t, readFile(t, root, "debian/rules"))
+	rulesSrc := readFile(t, root, "debian/rules")
+	gotRules := extractRulesInstall(t, rulesSrc)
 	if !sortedEqual(gotRules, want) {
 		t.Errorf("debian/rules: install set %q diverges from manifest.Names()=%q",
 			gotRules, want)
+	}
+	// Install SOURCE must also match manifest StagedSrc (#1999), not just the
+	// destination basename — otherwise a wrong artifact under the correct
+	// staged name ships silently (the StagedSrc field used to be unchecked).
+	for _, msg := range stagedSrcMismatches(extractRulesInstallPairs(t, rulesSrc)) {
+		t.Error("debian/rules: " + msg)
 	}
 
 	// preinst-besteffort-test.sh literal for-loop.
@@ -247,6 +310,85 @@ case "$1" in`
 	if !sortedEqual(strings.Fields(m[1]), want) {
 		t.Fatalf("comparator rejected an IN-SYNC BINS literal %q vs manifest %q "+
 			"— the canary would false-positive", strings.Fields(m[1]), want)
+	}
+}
+
+// TestStagedSrcCounterfactual proves the StagedSrc check is not vacuous: a
+// debian/rules that installs the WRONG source under the correct staged basename
+// (the #1999 hazard) must be flagged, even though the destination-basename set
+// still equals manifest.Names().
+func TestStagedSrcCounterfactual(t *testing.T) {
+	// Pairs derived faithfully from the manifest must pass.
+	good := map[string]string{}
+	for _, b := range All() {
+		good[b.Name] = b.StagedSrc
+	}
+	if msgs := stagedSrcMismatches(good); len(msgs) != 0 {
+		t.Fatalf("manifest-derived install pairs should pass, got: %v", msgs)
+	}
+
+	// Swap one source to a wrong path while keeping the destination basename —
+	// exactly the failure mode #1999 guards against.
+	bad := map[string]string{}
+	for k, v := range good {
+		bad[k] = v
+	}
+	const victim = "xpf-day0-config"
+	if _, ok := bad[victim]; !ok {
+		t.Fatalf("manifest missing %q; update this counterfactual", victim)
+	}
+	bad[victim] = "scripts/image/old-" + victim
+	msgs := stagedSrcMismatches(bad)
+	if len(msgs) == 0 {
+		t.Fatal("a wrong source under the correct basename must be flagged")
+	}
+	found := false
+	for _, m := range msgs {
+		if strings.Contains(m, victim) && strings.Contains(m, "old-"+victim) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("mismatch message should name the wrong source, got: %v", msgs)
+	}
+
+	// A missing install line for a managed binary is also flagged.
+	delete(bad, victim)
+	if msgs := stagedSrcMismatches(bad); len(msgs) == 0 {
+		t.Fatal("a managed binary with no debian/rules install line must be flagged")
+	}
+
+	// Parse-path counterfactual (AGY review): exercise the actual text parser
+	// (extractRulesInstallPairs) on a synthetic debian/rules whose recipe
+	// installs a WRONG source under a correct managed basename, so the full
+	// parse->compare path is covered — the map-only checks above don't run the
+	// regex / line-continuation join.
+	const wrongRules = "override_dh_auto_install:\n" +
+		"\tinstall -d debian/xpf$(STAGED)\n" +
+		"\tinstall -m 0755 wrong/path/xpfd debian/xpf$(STAGED)/xpfd\n" +
+		"\tinstall -m 0755 cli              debian/xpf$(STAGED)/cli\n" +
+		"\tinstall -m 0755 xpf-userspace-dp debian/xpf$(STAGED)/xpf-userspace-dp\n" +
+		"\tinstall -m 0755 scripts/image/xpf-day0-config \\\n" +
+		"\t                                 debian/xpf$(STAGED)/xpf-day0-config\n" +
+		"\n" +
+		"override_dh_auto_test:\n"
+	parsed := extractRulesInstallPairs(t, wrongRules)
+	if parsed["xpfd"] != "wrong/path/xpfd" {
+		t.Fatalf("parser should capture the wrong source, got %q", parsed["xpfd"])
+	}
+	// The wrapped (line-continued) xpf-day0-config install must still parse to
+	// its source — confirms the `\`-join handles the real recipe shape.
+	if parsed["xpf-day0-config"] != "scripts/image/xpf-day0-config" {
+		t.Fatalf("wrapped install should parse to its source, got %q", parsed["xpf-day0-config"])
+	}
+	foundWrong := false
+	for _, m := range stagedSrcMismatches(parsed) {
+		if strings.Contains(m, "xpfd") && strings.Contains(m, "wrong/path/xpfd") {
+			foundWrong = true
+		}
+	}
+	if !foundWrong {
+		t.Fatal("the parse->compare path must flag the wrong xpfd source in debian/rules text")
 	}
 }
 
