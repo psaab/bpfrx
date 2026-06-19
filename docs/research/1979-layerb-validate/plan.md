@@ -1,6 +1,6 @@
 # #1979 — Flow/flow-export NUM_WIDTH: commit-time ValidateInteger (Layer B of #1977)
 
-**Status:** PLAN DRAFT v1 (research, not yet reviewer-converged)
+**Status:** PLAN DRAFT v1.1 (research; folds Claude SMR r1; Codex+AGY r1 pending)
 **Base:** origin/master (`a75c970d8`, post-#1977/#1978 Layer A merge)
 **Issue:** #1979 (follow-up to #1977 / PR #1978)
 **Branch:** research/1979-layerb-validate
@@ -93,7 +93,10 @@ reviewer question (Q3).
 Eight distinct config leaves feed the 11 wire fields. `TCPMSSAllTCP` is **not a
 distinct config leaf** — `tcp-mss all-tcp <n>` fans out into the three MSS
 fields in the compiler (compiler_security.go:640-645); the wire `TCPMSSAllTCP`
-field is never builder-populated. So the config surface to validate is:
+field is never builder-populated. `parseMSSValue` has exactly four callers — all
+the `tcp-mss` switch arms in compiler_security.go — so there is NO interface- or
+per-unit `tcp-mss` feeding any of these flow fields; the surface below is the
+complete reachable set (Q1 resolved). The config surface to validate is:
 
 | # | Config leaf (set path) | Wire field(s) | Schema node | Currently | Tier |
 |---|---|---|---|---|---|
@@ -234,31 +237,50 @@ value. **Three path options (§5-OPT).**
 
 ## 5-OPT. Path options for Tier 3 (`tcp-mss`)
 
-### Option T3-A — custom dual-shape validator for the MSS leaves (RECOMMENDED)
+### Option T3-A — compiler-side AST pre-walk validator (RECOMMENDED)
 
-Model `gre-in`/`gre-out`/`ipsec-vpn`/`all-tcp` as **containers** with a typed
-`mss` child (covers the hierarchical form), AND add a small **node-level custom
-validator hook** that the walker invokes for these containers to validate a flat
-value packed in the container's own `Keys[1]`. Minimal, surgical: either
-(i) a new optional `schemaNode` field — e.g. `selfValueValidator LeafValidator`
-— that the container branch of `walkSchemaNode` runs against `Keys[1]` when
-present (a few lines, additive, opt-in, no effect on any node that doesn't set
-it); or (ii) a dedicated AST pre-pass in `compileSecurity`/`SchemaValidate` that
-walks `tcp-mss` children and runs `ValidateInteger(0,65535)` over both positions
-(self-contained, no walker change, mirrors `parseMSSValue`'s dual read exactly).
+**There is an established project precedent for exactly this "the schema walker
+cannot express it" case: `validateVRRPTrackInterfaceAST`** (compiler_interfaces.go:746),
+wired into `CompileConfig` at compiler.go:225 — it walks the (group-expanded)
+AST BEFORE section compilation and returns an `error` that aborts the commit
+(which surfaces as the `commit check` failure). Layer B's Tier 3 follows that
+pattern verbatim:
 
-- **Pros:** validates BOTH shapes; rejects neither valid form; matches
-  `parseMSSValue` semantics precisely. Option (ii) needs zero walker change.
-- **Cons:** the only tier needing more than declarative schema; (i) adds a
-  schemaNode field (must be documented + golden-tested); (ii) duplicates the
-  dual-shape read logic (acceptable — it is small and mirrors the compiler).
-- **Recommendation:** Option (ii) — a focused `validateTCPMSS(node)` helper
-  invoked from the security-flow walk, reusing `parseMSSValue`'s exact dual
-  read but range-checking instead of silently returning 0. No `setSchema`
-  structural change for `tcp-mss` is strictly required for *validation* under
-  (ii); the schema node can stay opaque, or be expanded only for completion
-  (a separable, optional improvement). This keeps the SSOT-grouping blast radius
-  zero for Tier 3.
+```go
+// compiler.go, alongside the VRRP pre-walk (~line 225):
+if err := validateTCPMSSRanges(tree.Children); err != nil {
+    return nil, err
+}
+```
+
+`validateTCPMSSRanges` finds `security flow tcp-mss` and, for each
+`ipsec-vpn`/`gre-in`/`gre-out`/`all-tcp` child, range-checks `[0, 65535]`
+against **whichever position carries the value** — mirroring `parseMSSValue`'s
+exact dual read (compiler_interfaces.go:729-744): the `mss` sub-child's `Keys[1]`
+if present, else the node's own `Keys[1]`. It reuses `ValidateInteger(0, 65535)`
+for the check but, unlike `parseMSSValue` (which silently returns 0 on a bad
+value), it returns a descriptive error.
+
+- **Pros:** validates BOTH valid shapes and rejects neither; mirrors
+  `parseMSSValue` precisely (same value-location logic, so it can never diverge
+  from what the compiler reads); **zero `setSchema` structural change** for
+  `tcp-mss` ⇒ zero SSOT-grouping/completion blast radius for Tier 3; uses an
+  EXISTING, reviewed project pattern (no new walker concept). Runs on the
+  group-expanded tree like the VRRP walk, so apply-groups-inherited MSS values
+  are covered.
+- **Cons:** Tier 3 validation lives in the compiler, not the schema walker, so
+  it does NOT also give value-slot `?` completion for the MSS leaves (the
+  schema node stays opaque). Completion typing for `tcp-mss` is a separable,
+  optional follow-up and is explicitly out of scope here (§9).
+- **Why not the schema-walker route for Tier 3:** the walker's typed-leaf
+  contract (validateTypedLeaf, schema_walk.go:464) requires the value in the
+  leaf's own `Keys[1]`; the container contract (walkSchemaNode:270-284)
+  deliberately IGNORES tokens packed into a container's Keys beyond its
+  identity. Neither expresses "value may live in self OR a named child." Adding
+  a new schemaNode field/walker branch to express it (the earlier "T3-A(i)"
+  idea) would touch the schemaNode type + golden + docs/config-schema.md for a
+  single leaf family — strictly worse than reusing the VRRP-style AST pre-walk.
+  REJECTED in favour of the compiler pre-walk.
 
 ### Option T3-B — flat-only validation (cover the headline typo, skip hierarchical)
 
@@ -284,11 +306,29 @@ MSS commit-UX is later wanted.
   the one path left un-validated at commit — arguably the most operator-reachable
   typo. Half the headline value.
 
-**This plan's recommendation:** **Option T3-A(ii)** if reviewers accept the
-small focused `validateTCPMSS` helper (it is ~20 lines mirroring the existing
-`parseMSSValue`, fully testable, no SSOT-grouping risk). Fallback to **T3-C** if
-reviewers judge the custom helper not worth it — Tiers 1+2 alone are a clean,
-low-risk, high-coverage win and Layer A keeps MSS safe.
+**This plan's recommendation:** **Option T3-A** (compiler-side AST pre-walk
+`validateTCPMSSRanges`, modeled on `validateVRRPTrackInterfaceAST`, ~25 lines,
+fully testable, zero SSOT-grouping/completion risk). Fallback to **T3-C** only
+if reviewers judge even that focused helper not worth it — but note T3-C leaves
+the issue's HEADLINE example (`tcp-mss gre-in 70000`, the flat shape) unvalidated
+at commit, so it is an explicit partial, not a full close.
+
+### Architecture note — two validation families (which leaf goes where)
+
+Layer B uses BOTH of xpf's existing commit-check validation mechanisms,
+choosing per-leaf by whether the value sits in a normal single slot:
+
+- **Schema-walker declarative typed leaves (Tiers 1+2):** the value always lands
+  in a sub-leaf's `Keys[1]` (both AST shapes), so the `#1319` typed-leaf path
+  expresses it cleanly AND gives free value-slot `?`/tab completion. This is the
+  preferred path and covers 7 of 8 leaves.
+- **Compiler AST pre-walk (Tier 3 only):** `tcp-mss`'s dual value-location can
+  NOT be expressed in the walker, so it uses the `validateVRRPTrackInterfaceAST`
+  precedent — an AST validator in `CompileConfig` returning a commit error.
+  Covers the 1 remaining leaf family.
+
+Both run before the snapshot is built, so both reject the bad value at `commit
+check` before Layer A's coercion would ever see it.
 
 ---
 
@@ -385,38 +425,55 @@ change.
 
 ## 10. Recommendation
 
-Ship **Tiers 1 + 2** (leaves #1-#7, declarative schema + bounds = Layer-A caps)
-plus **Tier 3 via Option T3-A(ii)** (focused `validateTCPMSS` dual-shape helper,
-no SSOT grouping change). This validates all 8 config leaves / 11 wire fields at
-commit with clear errors, rejects no valid config, and keeps the grammar blast
-radius minimal. If reviewers reject the Tier-3 helper, fall back to **T3-C**
-(Tiers 1+2 only) — still a clean win; MSS stays safe via Layer A.
+Ship **Tiers 1 + 2** (leaves #1-#7, declarative schema typed leaves; bounds =
+Layer-A caps) plus **Tier 3 via Option T3-A** (compiler-side
+`validateTCPMSSRanges` AST pre-walk modeled on `validateVRRPTrackInterfaceAST`,
+zero SSOT-grouping change). This validates all 8 config leaves / 11 wire fields
+at commit with clear errors, rejects no valid config, and keeps the grammar
+blast radius minimal. Locked decisions (from Q3/Q4/Q5, see §11):
+
+- Sampling `input rate`: **`[1, 4294967295]`** (reject 0 at commit).
+- `tcp-session`: type **all four** timeouts (`established`/`initial`/`closing`/
+  `time-wait`) at `[0, MaxDurationSeconds]` (declaring them is required for
+  completion anyway; only `established-timeout` is wire-reaching).
+- version-ipfix `flow-active/inactive-timeout`: **type them too** (UX parity;
+  not wire-reaching).
+
+If reviewers reject the Tier-3 helper, fall back to **T3-C** (Tiers 1+2 only) —
+still a clean win and MSS stays safe via Layer A, but it is an explicit partial
+(the headline `tcp-mss gre-in 70000` flat typo stays unvalidated at commit).
 
 ---
 
 ## 11. Open questions for adversarial review
 
-- **Q1 (completeness):** Is leaf #8's `all-tcp` correctly handled as a fan-out
-  (not a distinct wire field)? Any OTHER config path to these 11 wire fields I
-  missed (e.g. a gRPC-only setter, an interface-level tcp-mss)? [Explore agent
-  found interface-level `family inet tcp-mss` exists for INTERFACE MSS — does it
-  reach any of THESE flow fields, or a separate per-unit field? Confirm it is
-  out of scope.]
-- **Q2 (Tier 3 trap):** Is the experimentally-proven dual-value-location trap
-  correctly characterized, and is T3-A(ii) (focused helper mirroring
-  `parseMSSValue`) the right resolution vs T3-A(i) (schemaNode field) vs T3-C
-  (defer)? Does adding a `validateTCPMSS` pre-pass fit the SchemaValidate
-  architecture, or should it be a schemaNode-level hook for consistency?
-- **Q3 (Q-RATE):** sampling `input rate` bound — `[1, u32max]` (reject 0 at
-  commit, recommended) vs `[0, u32max]` (accept 0, let Layer A normalize)?
-- **Q4 (§4a):** Type all four `tcp-session` timeouts (only `established-timeout`
-  is wire-reaching) for UX consistency — agreed, or restrict to the wire-reaching
-  one?
-- **Q5 (§4b):** Type the version-ipfix `flow-active/inactive-timeout` pair too
-  (NOT wire-reaching) for UX parity — agreed, or version9 only?
+- **Q1 (completeness) — RESOLVED.** `all-tcp` is a fan-out into the three MSS
+  fields (compiler_security.go:640-645), not a distinct wire field; `TCPMSSAllTCP`
+  is never builder-populated. `parseMSSValue` has exactly four callers, ALL in
+  compiler_security.go's `security flow tcp-mss` switch — there is NO
+  interface-level/per-unit `tcp-mss` feeding any of these 11 flow fields. The
+  8-leaf / 11-field set is the complete reachable surface. (Confirmed by SMR r1
+  + independent grep of all `parseMSSValue` call sites.)
+- **Q2 (Tier 3 mechanism) — DECIDED.** Compiler-side AST pre-walk
+  `validateTCPMSSRanges` modeled on `validateVRRPTrackInterfaceAST`
+  (compiler_interfaces.go:746, wired compiler.go:225). Chosen over a
+  schemaNode-field/walker hook (touches the schemaNode type + golden + docs for
+  one leaf family) and over deferring (T3-C leaves the headline case
+  unvalidated). Reviewers: is the compiler pre-walk the right home, and is
+  reusing `parseMSSValue`'s dual-read logic (range-check both positions) the
+  correct semantics?
+- **Q3 (sampling rate) — DECIDED `[1, 4294967295]`.** Reject 0 at commit (Junos
+  rejects it; Layer A's `<=0→1` stays as the gRPC/file defense). Reviewers:
+  agree, or keep `[0, u32max]` to mirror Layer A's accept-and-normalize?
+- **Q4 (§4a tcp-session) — DECIDED: type all four timeouts.** Declaring the
+  container's children is required for completion parity anyway; the three
+  non-wire timeouts share `[0, MaxDurationSeconds]`. Reviewers: agree?
+- **Q5 (§4b version-ipfix) — DECIDED: type the pair too.** Same one-line change,
+  UX parity, future-proofs IPFIX wiring. Reviewers: agree, or version9-only?
 - **Q6 (grouping):** Is flipping `flow-server` to container/APPEND acceptable
   (it enables multiple collectors, matches compiler `FindChildren`), and is the
   extended golden the right pin?
 - **Q7 (PLAN-KILL):** Given Layer A already closed the safety hole, is the UX
-  gain worth ANY grammar churn? Is Tier 1 (zero-risk) the only justified slice,
-  or is the full Tier 1+2+3-A scope warranted?
+  gain worth the (now minimal, mostly-declarative) grammar churn? Honest framing:
+  UX-only. Recommended scope is justified because the issue headline case is the
+  Tier-3 flat path — a Tier-1-only or T3-C scope would read as a half-fix.
