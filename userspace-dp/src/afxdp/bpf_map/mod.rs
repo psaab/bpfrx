@@ -11,28 +11,6 @@ pub(super) fn uses_kernel_local_session_map_entry(
         && decision.resolution.tunnel_endpoint_id == 0
 }
 
-pub(super) struct OwnedFd {
-    pub(super) fd: c_int,
-}
-
-impl OwnedFd {
-    pub(super) fn open_bpf_map(path: &str) -> io::Result<Self> {
-        let path = CString::new(path)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid map path"))?;
-        let fd = unsafe { libbpf_sys::bpf_obj_get(path.as_ptr()) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Self { fd })
-    }
-}
-
-impl Drop for OwnedFd {
-    fn drop(&mut self) {
-        let _ = unsafe { libc::close(self.fd) };
-    }
-}
-
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(super) struct UserspaceSessionMapKey {
@@ -533,60 +511,6 @@ pub(super) fn verify_session_key_in_bpf(map_fd: c_int, key: &SessionKey) -> bool
     rc == 0
 }
 
-// The pinned map path keeps the historical "fallback" spelling for
-// mixed-version shim compatibility. Operator-facing names use
-// degraded-path terminology.
-//
-// #1776: the only production reader (the per-second degraded-path
-// dump in worker/loop_body/debug_report.rs) is debug-log-gated, so
-// these items are cfg-gated to match (REASON_NAMES is also asserted
-// by unit tests, hence `any(test, ...)`).
-#[cfg(feature = "debug-log")]
-pub(super) const DEGRADED_PATH_STATS_PIN_PATH: &str = "/sys/fs/bpf/xpf/userspace_fallback_stats";
-#[cfg(any(test, feature = "debug-log"))]
-pub(super) const DEGRADED_PATH_REASON_NAMES: &[&str] = &[
-    "ctrl_disabled",            // 0
-    "parse_fail",               // 1
-    "binding_missing",          // 2
-    "binding_not_ready",        // 3
-    "heartbeat_missing",        // 4
-    "heartbeat_stale",          // 5
-    "icmp",                     // 6
-    "early_filter",             // 7
-    "adjust_meta",              // 8
-    "meta_bounds",              // 9
-    "redirect_err",             // 10
-    "interface_nat_no_session", // 11
-    "no_session",               // 12
-    "strict_drop",              // 13
-    "pass_to_kernel",           // 14
-    "transit_drop",             // 15
-];
-
-#[cfg(feature = "debug-log")]
-pub(super) fn read_degraded_path_stats() -> Option<Vec<(String, u64)>> {
-    let fd = OwnedFd::open_bpf_map(DEGRADED_PATH_STATS_PIN_PATH).ok()?;
-    let mut result = Vec::new();
-    for idx in 0u32..16 {
-        let mut value = 0u64;
-        let rc = unsafe {
-            libbpf_sys::bpf_map_lookup_elem(
-                fd.fd,
-                (&idx as *const u32).cast::<c_void>(),
-                (&mut value as *mut u64).cast::<c_void>(),
-            )
-        };
-        if rc == 0 && value > 0 {
-            let name = DEGRADED_PATH_REASON_NAMES
-                .get(idx as usize)
-                .copied()
-                .unwrap_or("unknown");
-            result.push((name.to_string(), value));
-        }
-    }
-    Some(result)
-}
-
 pub(super) fn delete_live_session_key(map_fd: c_int, key: &SessionKey) {
     let map_key = session_map_key(key);
     let _ = unsafe {
@@ -717,13 +641,17 @@ mod publish_conntrack;
 // #2003: behaviour-preserving code motion. Each submodule owns one
 // cluster — `ha.rs` the HA liveness-slot writes (XSK + heartbeat map
 // updates that gate active-binding state), `metrics.rs` the telemetry
-// counters plus the raw-ring / session-map diagnostics. Items keep their
-// original `pub(in crate::afxdp)` visibility and are re-exported so the
-// parent `afxdp` glob (`use self::bpf_map::*`) and the relocated
-// `bpf_map_tests.rs` (`use super::*`) resolve them by bare name exactly as
-// before. Mirrors the `publish_conntrack.rs` precedent (#1356).
+// counters plus the raw-ring / session-map diagnostics, `pin.rs` the
+// libbpf fd-pinning RAII wrapper and the pinned degraded-path stats
+// reader. Items keep their original `pub(in crate::afxdp)` visibility and
+// are re-exported so the parent `afxdp` glob (`use self::bpf_map::*`) and
+// the relocated `bpf_map_tests.rs` (`use super::*`) resolve them by bare
+// name exactly as before. Mirrors the `publish_conntrack.rs` precedent
+// (#1356).
 mod ha;
 mod metrics;
+mod pin;
 
 pub(in crate::afxdp) use ha::*;
 pub(in crate::afxdp) use metrics::*;
+pub(in crate::afxdp) use pin::*;
