@@ -313,8 +313,6 @@ case "$1" in`
 	}
 }
 
-// TestManifestShape locks the manifest's basic invariants so a careless edit
-// (empty list, duplicate name, blank field) is caught at the SSOT itself.
 // TestStagedSrcCounterfactual proves the StagedSrc check is not vacuous: a
 // debian/rules that installs the WRONG source under the correct staged basename
 // (the #1999 hazard) must be flagged, even though the destination-basename set
@@ -361,6 +359,8 @@ func TestStagedSrcCounterfactual(t *testing.T) {
 	}
 }
 
+// TestManifestShape locks the manifest's basic invariants so a careless edit
+// (empty list, duplicate name, blank field) is caught at the SSOT itself.
 func TestManifestShape(t *testing.T) {
 	all := All()
 	if len(all) == 0 {
