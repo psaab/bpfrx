@@ -16,9 +16,12 @@
 # staged/ and does not manage versions/, so a lingering hardened drop-in +
 # versions/current would keep the unit running the NEWER binaries (the
 # drop-in ExecStart pins the concrete newer version dir) — a silent version
-# mismatch. This postrm detects that case and cleans up: remove the runtime
-# drop-in, repoint sbin back to staged atomically, DELETE versions/current,
-# and boot-guarded daemon-reload.
+# mismatch. This postrm detects that case and cleans up: repoint sbin back to
+# staged atomically, remove the runtime drop-in (with a boot-guarded
+# daemon-reload), and DELETE versions/current LAST. The destructive current
+# delete runs after the drop-in removal (#1997) so a kill mid-teardown never
+# leaves an orphan drop-in that a postrm RERUN would skip; the rerun guard
+# also keys on the drop-in's presence so a rerun re-enters and converges.
 #
 # #1985: detection keys on the dpkg-supplied INCOMING version ($2), NOT on an
 # exec of the staged binary. The original code probed
@@ -222,29 +225,58 @@ case "$1" in
         #
         # Detection is the EXEC-FREE incoming-version compare (#1985): tear
         # down ONLY when $2 is a confirmed pre-#1964 version (below the layout
-        # floor) AND a hardened layout is present (versions/current). An
-        # upgrade or a hardened->hardened downgrade ($2 >= floor) — and an
-        # empty/unparsable $2 — leave the layout intact. Never exec the
-        # staged binary (the old probe tore the layout down on ANY exec
-        # failure of a hardened-but-unrunnable binary, #1985).
+        # floor) AND a hardened artifact is present. An upgrade or a
+        # hardened->hardened downgrade ($2 >= floor) — and an empty/unparsable
+        # $2 — leave the layout intact. Never exec the staged binary (the old
+        # probe tore the layout down on ANY exec failure of a
+        # hardened-but-unrunnable binary, #1985).
+        #
+        # The presence guard fires when EITHER versions/current OR the runtime
+        # drop-in is still on disk (#1997). The drop-in arm is the crash-rerun
+        # fix: the teardown is three idempotent steps, and an earlier release
+        # gated the WHOLE block on versions/current alone while deleting
+        # current BEFORE removing the drop-in. A kill in that window (current
+        # already gone, drop-in still present) left an orphan
+        # 10-xpf-version.conf pinning an ExecStart for a layout the downgraded
+        # package no longer manages — and a postrm RERUN saw current gone, took
+        # the false branch, and never cleaned the orphan up. Keying the guard
+        # on the drop-in too lets a rerun re-enter and converge. We also remove
+        # the drop-in BEFORE deleting current so the destructive `rm` is the
+        # LAST step, shrinking the single-run orphan window to nothing for the
+        # common case (the guard still covers the residual rerun case).
+        #
+        # Each artifact is probed with BOTH -L and -e (Copilot): a bare -e is
+        # FALSE for a dangling symlink, so a drop-in (or current) that is a
+        # broken symlink would otherwise slip past the guard and skip the
+        # cleanup. -L catches the symlink-exists case; -e catches a regular
+        # file / resolvable link — together they mean "the artifact is present
+        # in any form" and the teardown's rm -f handles either.
         if incoming_predates_hardened_layout "$2" && \
-           { [ -L "$CURRENT" ] || [ -e "$CURRENT" ]; }; then
+           { [ -L "$CURRENT" ] || [ -e "$CURRENT" ] || \
+             [ -L "$DROPIN" ] || [ -e "$DROPIN" ]; }; then
             echo "xpf: #1964 downgrade to a pre-hardened package — removing the" \
                  "versioned-runtime drop-in and repointing sbin back to staged." >&2
             # 1. repoint OWNED sbin links back to staged (atomic) so the
             #    daemon resolves the downgraded binaries — skipping any
-            #    foreign/operator-repointed link (Codex).
+            #    foreign/operator-repointed link (Codex). Idempotent: a rerun
+            #    that already repointed (or that finds current gone but a link
+            #    still naming the removed current/<bin>, which link_is_owned
+            #    still matches by target string) re-points to the same staged
+            #    target.
             repoint_owned_sbin_to_staged
-            # 2. delete versions/current — else a later re-upgrade sees
+            # 2. remove the runtime unit drop-in + empty .service.d dir, then
+            #    boot-guarded daemon-reload (shared helper, #1967). Done BEFORE
+            #    the current delete (#1997) so the only step that can flip the
+            #    presence guard false runs LAST — a kill before this point
+            #    leaves current present and a rerun re-enters via either arm.
+            remove_runtime_dropin
+            # 3. delete versions/current — else a later re-upgrade sees
             #    current present, skips the legacy-migration snapshot, and
             #    repoints sbin to a stale version dir (AGY-r4-1). Leave the
             #    versions/<ver> dirs (harmless; a reinstall's GC reaps them).
+            #    This is the last destructive step: after it the drop-in is
+            #    already gone, so no orphan can outlive a completed run.
             rm -f "$CURRENT"
-            # 3. remove the runtime unit drop-in + empty .service.d dir, then
-            #    boot-guarded daemon-reload (shared helper, #1967). Done LAST
-            #    so the reload reflects the repointed sbin + removed drop-in
-            #    together.
-            remove_runtime_dropin
         fi
         # #1981 staged-generation teardown (B-P6) — a SEPARATE, HIGHER floor
         # than the #1964 layout teardown above (Codex r5-#5): staged-gen/ is
