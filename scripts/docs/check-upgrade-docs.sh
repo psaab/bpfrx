@@ -40,7 +40,11 @@ status=0
 # occurrence is the stale pre-#1964 layout language.
 phrase_staging="symlinks into the staging path"
 doc_install="docs/install-images.md"
-if [ -f "$doc_install" ] && grep -nF -- "$phrase_staging" "$doc_install"; then
+if [ ! -f "$doc_install" ]; then
+	echo "ERROR: $doc_install not found — install-layout canary is vacuous." >&2
+	echo "       If the file was renamed, update this script's doc_install variable." >&2
+	status=1
+elif grep -nF -- "$phrase_staging" "$doc_install" >&2; then
 	echo "ERROR ($doc_install): the literal \"$phrase_staging\" describes the" >&2
 	echo "       pre-#1964 layout. On a normal install the sbin symlinks resolve" >&2
 	echo "       THROUGH versions/current (xpfd seed-runtime); only the degraded" >&2
@@ -51,7 +55,11 @@ fi
 # Phrase 2: banned across all docs. manifest.Managed is a phantom symbol;
 # the SSOT is the unexported `managed` slice + All()/Names()/LockstepNames().
 phrase_symbol="manifest.Managed"
-if grep -rnF -- "$phrase_symbol" docs/; then
+if [ ! -d "docs" ]; then
+	echo "ERROR: docs/ directory not found at $(pwd)/docs — manifest-symbol canary is vacuous." >&2
+	echo "       If the directory was moved, update this script's repo_root detection." >&2
+	status=1
+elif grep -rnF -- "$phrase_symbol" docs/ >&2; then
 	echo "ERROR (docs/): \"$phrase_symbol\" does not exist. The managed-binary" >&2
 	echo "       SSOT is the unexported \`managed\` slice in" >&2
 	echo "       pkg/upgrade/manifest/manifest.go; callers use the exported" >&2
