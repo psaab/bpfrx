@@ -29,10 +29,11 @@ impl Clone for Nat64Prefix {
 pub(crate) struct Nat64State {
     pub(crate) prefixes: Vec<Nat64Prefix>,
     /// Mirrors the global `security nat natv6v4 no-v6-frag-header` option. When
-    /// set, the IPv6->IPv4 translator emits a fragmentable (DF=0) atomic IPv4
-    /// packet per RFC 7915 5.1 rather than the default DF=1 framing. The option
-    /// is configured once at the natv6v4 level; the Go side replicates it onto
-    /// every NAT64 rule snapshot, so any rule carrying it enables it globally.
+    /// set, the IPv6->IPv4 translator emits a fragmentable (DF=0, non-atomic)
+    /// IPv4 packet per RFC 7915 5.1 rather than the default DF=1 atomic framing.
+    /// The option is configured once at the natv6v4 level; the Go side
+    /// replicates it onto every NAT64 rule snapshot, so any rule carrying it
+    /// enables it globally.
     pub(crate) no_v6_frag_header: bool,
 }
 
@@ -140,6 +141,34 @@ const ICMPV6_ECHO_REPLY: u8 = 129;
 const ICMP_ECHO_REQUEST: u8 = 8;
 const ICMP_ECHO_REPLY: u8 = 0;
 use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
+use std::sync::atomic::AtomicU32;
+
+/// Process-global IPv4 Fragment Identification generator for translated,
+/// *fragmentable* (DF=0) IPv6->IPv4 packets.
+///
+/// RFC 7915 5.1: when the source IPv6 packet has no Fragment Header, the
+/// translator sets the IPv4 Identification "according to a Fragment
+/// Identification generator at the translator". RFC 6864 4.1 then *requires*
+/// that a source emitting non-atomic datagrams (DF=0) MUST NOT repeat the ID
+/// for a given source/destination/protocol tuple within one Maximum Datagram
+/// Lifetime. A constant ID (e.g. 0) violates that: if a downstream router
+/// fragments two such datagrams between the same hosts, their fragments share
+/// an ID and reassemble incorrectly. A monotonically incrementing counter is a
+/// conforming, cheap generator. Atomic datagrams (DF=1) are exempt — RFC 6864
+/// lets them carry any ID, so the default DF=1 path keeps ID=0.
+static NAT64_FRAG_ID: AtomicU32 = AtomicU32::new(0);
+
+/// Return the next non-zero 16-bit Fragment Identification value for a
+/// fragmentable translated datagram. Skips 0 so a fragmentable packet never
+/// carries the all-zero ID that is reserved (by convention) for atomic
+/// datagrams in this translator.
+fn next_frag_id() -> u16 {
+    // Relaxed is sufficient: we only need a distinct, non-repeating sequence,
+    // not ordering against other memory. Truncate the 32-bit counter to 16
+    // bits (the IPv4 ID width) and remap a 0 result to 1.
+    let raw = NAT64_FRAG_ID.fetch_add(1, Ordering::Relaxed) as u16;
+    if raw == 0 { 1 } else { raw }
+}
 
 /// Translate an IPv6 packet to IPv4 (forward direction: client→server).
 ///
@@ -147,13 +176,17 @@ use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
 /// `snat_v4` = pool IPv4 source, `dst_v4` = extracted destination.
 ///
 /// `no_v6_frag_header` mirrors the `security nat natv6v4 no-v6-frag-header`
-/// option. When `false` (the default) the translated IPv4 packet is emitted
-/// with the Don't-Fragment (DF) flag set, marking it as a non-fragmentable
-/// atomic datagram. When `true`, the DF flag is cleared so the packet remains
+/// option. When `false` (the default) the translated IPv4 packet is emitted as
+/// an *atomic* datagram: the Don't-Fragment (DF) flag is set and the
+/// Identification field is left at 0 (RFC 6864 4.1 permits any ID for an atomic
+/// datagram). When `true`, the DF flag is cleared so the packet remains
 /// fragmentable in transit, per RFC 7915 5.1 (no IPv6 Fragment Header present
-/// on the source packet => the translator MAY emit a fragmentable IPv4 packet
-/// instead of an atomic one). The Identification field stays zero in both
-/// cases since these are non-fragmented translations.
+/// on the source packet => the translator emits a fragmentable IPv4 packet).
+/// In that fragmentable case DF and Identification MUST be mutually
+/// consistent: a DF=0 datagram is non-atomic, so RFC 7915 5.1 / RFC 6864 4.1
+/// require a non-zero Identification drawn from a per-translator generator
+/// (`next_frag_id`) so a downstream fragmenter produces reassemblable
+/// fragments rather than colliding on a constant ID.
 ///
 /// Returns the translated IPv4 packet (L3 only, no Ethernet header).
 pub(crate) fn translate_v6_to_v4(
@@ -197,13 +230,22 @@ pub(crate) fn translate_v6_to_v4(
     out[0] = 0x45; // version=4, IHL=5
     out[1] = traffic_class; // DSCP/ECN copied from IPv6 traffic class (RFC 7915 §5)
     out[2..4].copy_from_slice(&ipv4_total_len.to_be_bytes());
-    // Identification = 0 (this is a non-fragmented translation). The flags +
-    // fragment-offset word carries the DF bit. Default: DF=1 (0x4000), marking
-    // the packet as a non-fragmentable atomic datagram. With no-v6-frag-header
-    // set, clear DF (0x0000) so the translated packet remains fragmentable in
-    // transit per RFC 7915 5.1.
-    out[4..6].copy_from_slice(&0u16.to_be_bytes()); // identification
-    let frag_word: u16 = if no_v6_frag_header { 0x0000 } else { 0x4000 };
+    // Flags + fragment-offset word (bytes 6-7) and the Identification field
+    // (bytes 4-5) must stay mutually consistent:
+    //   * Default (DF=1, 0x4000): an *atomic* datagram (non-fragmentable).
+    //     RFC 6864 4.1 permits any ID for an atomic datagram, so leave ID=0.
+    //   * no-v6-frag-header (DF=0, 0x0000): a *fragmentable* (non-atomic)
+    //     datagram, per RFC 7915 5.1. A non-atomic datagram MUST carry a
+    //     non-zero Identification from a per-translator generator (RFC 7915
+    //     5.1 / RFC 6864 4.1) so a downstream fragmenter does not collide
+    //     distinct datagrams on a constant ID. Pinning ID=0 here while
+    //     clearing DF was the bug fixed in #2008 H16.
+    let (frag_word, identification): (u16, u16) = if no_v6_frag_header {
+        (0x0000, next_frag_id())
+    } else {
+        (0x4000, 0)
+    };
+    out[4..6].copy_from_slice(&identification.to_be_bytes()); // identification
     out[6..8].copy_from_slice(&frag_word.to_be_bytes()); // flags + frag offset
     out[8] = new_ttl;
     out[9] = ipv4_protocol;

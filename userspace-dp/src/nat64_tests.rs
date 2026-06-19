@@ -707,12 +707,24 @@ fn translate_v4_to_v6_total_len_below_ihl_returns_none() {
 // the Don't-Fragment (DF) bit. These tests pin the runtime enforcement: the
 // flags+frag-offset word (IPv4 header bytes 6-7) must be DF=1 (0x4000) by
 // default and DF=0 (0x0000) when the option is set, per RFC 7915 5.1.
+//
+// They also pin the DF/Identification consistency the Copilot review on #2014
+// flagged: a DF=1 atomic datagram keeps Identification=0 (legal per RFC 6864
+// 4.1), while a DF=0 fragmentable datagram MUST carry a non-zero, non-repeating
+// Identification drawn from the per-translator generator (RFC 7915 5.1 / RFC
+// 6864 4.1) — pinning ID=0 while clearing DF was the original bug.
 // ---------------------------------------------------------------------------
 
 /// Helper: read the IPv4 flags + fragment-offset word from a translated L3
 /// packet (bytes 6-7).
 fn ipv4_frag_word(pkt: &[u8]) -> u16 {
     u16::from_be_bytes([pkt[6], pkt[7]])
+}
+
+/// Helper: read the IPv4 Identification field (bytes 4-5) from a translated L3
+/// packet.
+fn ipv4_identification(pkt: &[u8]) -> u16 {
+    u16::from_be_bytes([pkt[4], pkt[5]])
 }
 
 #[test]
@@ -731,8 +743,12 @@ fn translate_v6_to_v4_default_sets_df_bit() {
         0x4000,
         "default translation must set the DF bit (atomic, non-fragmentable)"
     );
-    // Identification stays zero for non-fragmented translations.
-    assert_eq!(u16::from_be_bytes([v4[4], v4[5]]), 0);
+    // ID=0 is legal for an ATOMIC datagram (DF=1) per RFC 6864 4.1.
+    assert_eq!(
+        ipv4_identification(&v4),
+        0,
+        "atomic (DF=1) translation keeps Identification=0"
+    );
     // Header checksum must still verify.
     assert_eq!(checksum16(&v4[..20]), 0, "IPv4 header checksum must verify");
 }
@@ -753,25 +769,69 @@ fn translate_v6_to_v4_no_v6_frag_header_clears_df_bit() {
         0x0000,
         "no-v6-frag-header must clear the DF bit (fragmentable, per RFC 7915 5.1)"
     );
-    assert_eq!(u16::from_be_bytes([v4[4], v4[5]]), 0);
+    // A fragmentable (DF=0) datagram is NON-ATOMIC. RFC 7915 5.1 sets the
+    // Identification from a per-translator generator, and RFC 6864 4.1 forbids
+    // a constant/repeated ID for non-atomic datagrams. A pinned ID=0 (the
+    // pre-fix bug) would mis-reassemble distinct datagrams when a downstream
+    // router fragments them, so the ID MUST be non-zero here.
+    assert_ne!(
+        ipv4_identification(&v4),
+        0,
+        "fragmentable (DF=0) translation MUST carry a non-zero Identification \
+         (RFC 7915 5.1 / RFC 6864 4.1)"
+    );
     // The change must not break the IPv4 header checksum.
     assert_eq!(checksum16(&v4[..20]), 0, "IPv4 header checksum must verify");
 
     // Everything else (TTL, protocol, addresses, payload) must be unchanged
-    // relative to the default translation — only the DF bit (bytes 6-7) and
-    // the resulting IPv4 header checksum (bytes 10-11) differ.
+    // relative to the default translation — only the DF bit (bytes 6-7), the
+    // Identification (bytes 4-5), and the resulting header checksum (bytes
+    // 10-11) differ.
     let v4_default = translate_v6_to_v4(&ipv6_pkt, snat_v4, dst_v4, false).expect("translate");
     assert_eq!(v4.len(), v4_default.len());
     assert_eq!(v4[8], v4_default[8], "TTL unchanged");
     assert_eq!(v4[9], v4_default[9], "protocol unchanged");
     assert_eq!(&v4[12..20], &v4_default[12..20], "src/dst addresses unchanged");
     assert_eq!(&v4[20..], &v4_default[20..], "L4 payload unchanged");
-    // The frag word is the only header field that should differ.
+    // The frag word is one header field that must differ.
     assert_ne!(
         ipv4_frag_word(&v4),
         ipv4_frag_word(&v4_default),
         "frag word must differ between the two modes"
     );
+}
+
+#[test]
+fn translate_v6_to_v4_no_v6_frag_header_identification_is_unique() {
+    // RFC 6864 4.1: a source emitting non-atomic (DF=0) datagrams MUST NOT
+    // repeat the Identification for a given src/dst/proto tuple within one MDL.
+    // The per-translator generator advances on every fragmentable translation,
+    // so two back-to-back DF=0 translations must carry DISTINCT non-zero IDs.
+    // A constant-ID implementation (the pre-fix bug pinned ID=0) fails here.
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(198, 51, 100, 50);
+
+    let ipv6_pkt = make_ipv6_tcp_packet(src_v6, dst_v6, 12345, 80, b"uniq");
+    let a = translate_v6_to_v4(&ipv6_pkt, snat_v4, dst_v4, true).expect("translate a");
+    let b = translate_v6_to_v4(&ipv6_pkt, snat_v4, dst_v4, true).expect("translate b");
+
+    let id_a = ipv4_identification(&a);
+    let id_b = ipv4_identification(&b);
+    assert_ne!(id_a, 0, "first fragmentable ID must be non-zero");
+    assert_ne!(id_b, 0, "second fragmentable ID must be non-zero");
+    assert_ne!(
+        id_a, id_b,
+        "successive fragmentable translations must use distinct Identifications \
+         (RFC 6864 4.1 no-repeat requirement)"
+    );
+    // Both must still be DF=0 fragmentable datagrams with a valid header
+    // checksum despite the differing ID.
+    assert_eq!(ipv4_frag_word(&a), 0x0000);
+    assert_eq!(ipv4_frag_word(&b), 0x0000);
+    assert_eq!(checksum16(&a[..20]), 0, "header checksum must verify (a)");
+    assert_eq!(checksum16(&b[..20]), 0, "header checksum must verify (b)");
 }
 
 #[test]

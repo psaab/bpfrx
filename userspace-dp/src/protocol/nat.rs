@@ -77,8 +77,9 @@ pub(crate) struct NAT64RuleSnapshot {
     #[serde(rename = "pool_addresses", default)]
     pub pool_addresses: Vec<String>,
     /// Mirrors `security nat natv6v4 no-v6-frag-header`. When set, the
-    /// IPv6->IPv4 translator emits a fragmentable (DF=0) atomic IPv4 packet
-    /// per RFC 7915 5.1 instead of the default DF=1 framing.
+    /// IPv6->IPv4 translator emits a fragmentable (DF=0, non-atomic) IPv4
+    /// packet — with a generated non-zero Identification — per RFC 7915 5.1
+    /// instead of the default DF=1 atomic framing.
     #[serde(rename = "no_v6_frag_header", default)]
     pub no_v6_frag_header: bool,
 }
