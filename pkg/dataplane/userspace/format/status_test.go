@@ -1,15 +1,17 @@
-package userspace
+package format
 
 import (
 	"fmt"
 	"strings"
 	"testing"
 	"time"
+
+	userspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
 func TestFormatStatusSummary(t *testing.T) {
 	now := time.Now().UTC()
-	status := ProcessStatus{
+	status := userspace.ProcessStatus{
 		PID:                    1234,
 		HelperMode:             "rust-bootstrap",
 		ForwardingArmed:        false,
@@ -25,35 +27,35 @@ func TestFormatStatusSummary(t *testing.T) {
 		MaxSessions:            100,
 		FlowCacheCapacity:      8192,
 		RouteEntries:           4,
-		HAGroups: []HAGroupStatus{
+		HAGroups: []userspace.HAGroupStatus{
 			{RGID: 0, Active: true, WatchdogTimestamp: 100},
 			{RGID: 1, Active: false, WatchdogTimestamp: 0},
 			{RGID: 2, Active: false, WatchdogTimestamp: 0},
 		},
-		Fabrics: []FabricSnapshot{
+		Fabrics: []userspace.FabricSnapshot{
 			{Name: "fab0", ParentLinuxName: "ge-0-0-0", ParentIfindex: 7, OverlayLinux: "fab0", OverlayIfindex: 17, RXQueues: 4, PeerAddress: "10.99.1.2"},
 		},
-		LastResolution: &PacketResolution{
+		LastResolution: &userspace.PacketResolution{
 			Disposition:   "forward_candidate",
 			EgressIfindex: 11,
 			NextHop:       "172.16.50.1",
 			NeighborMAC:   "00:10:db:ff:10:01",
 		},
 		WorkerHeartbeats: []time.Time{now.Add(-500 * time.Millisecond), now.Add(-700 * time.Millisecond)},
-		Queues: []QueueStatus{
+		Queues: []userspace.QueueStatus{
 			{QueueID: 0, Armed: false, Ready: true},
 			{QueueID: 1, Armed: false, Ready: false},
 		},
-		Bindings: []BindingStatus{
+		Bindings: []userspace.BindingStatus{
 			{Slot: 0, Armed: false, Ready: true, Bound: true, XSKRegistered: true, XSKBindMode: "zerocopy", ZeroCopy: true, SharedUMEMMode: "cross-nic", SharedUMEMSocketRole: "owner", SharedUMEMGroup: "cross-nic:w0:ge-0-0-1,ge-0-0-2", RXPackets: 10, ValidatedPackets: 8, ExceptionPackets: 1, ScreenDrops: 2, SYNCookieChallenges: 3, SYNCookieSecretUnavailable: 1, SYNCookieAckValid: 5, SYNCookieAckInvalid: 7, SYNCookieBypass: 11, TXPackets: 3, TXBytes: 420, TXCompletions: 2, MirroredPackets: 4, MirroredBytes: 512, MirrorDropsNoFrame: 1, KernelRXDropped: 9, KernelRXInvalidDescs: 1, DirectTXPackets: 2, InPlaceTXPackets: 1, InPlaceVLANPushDescPackets: 8, InPlaceVLANPopDescPackets: 9, InPlaceVLANPushNoHeadroomPackets: 10, InPlaceL2MemmoveFallbackPackets: 11, DirectTXNoFrameFallbackPackets: 5, DirectTXBuildFallbackPackets: 6, DebugPendingFillFrames: 10, DebugSpareFillFrames: 11, DebugFreeTXFrames: 12, DebugPendingTXPrepared: 13, DebugPendingTXLocal: 14, DebugOutstandingTX: 15, DebugInFlightRecycles: 16},
 			{Slot: 1, Armed: false, Ready: false, Bound: true, XSKRegistered: false, RXPackets: 5, ValidatedPackets: 4, ExceptionPackets: 2, ScreenDrops: 4, SYNCookieChallenges: 13, SYNCookieAckValid: 17, SYNCookieAckInvalid: 19, SYNCookieBypass: 23, TXErrors: 1, TXSharedRecycleUnknownSlotDrops: 1, TXCompletions: 3, MirroredPackets: 6, MirroredBytes: 768, MirrorDropsNoBinding: 2, MirrorDropsQueueFull: 3, KernelRXDropped: 4, KernelRXInvalidDescs: 2, CopyTXPackets: 4, InPlaceVLANPushDescPackets: 3, InPlaceVLANPopDescPackets: 4, InPlaceVLANPushNoHeadroomPackets: 5, InPlaceL2MemmoveFallbackPackets: 6, DirectTXDisallowedFallbackPackets: 7, DebugPendingFillFrames: 20, DebugSpareFillFrames: 21, DebugFreeTXFrames: 22, DebugPendingTXPrepared: 23, DebugPendingTXLocal: 24, DebugOutstandingTX: 25, DebugInFlightRecycles: 26},
 		},
-		RecentExceptions: []ExceptionStatus{
+		RecentExceptions: []userspace.ExceptionStatus{
 			{Timestamp: now, Slot: 1, QueueID: 0, Interface: "ge-0-0-2", Reason: "metadata_parse", PacketLength: 128},
 		},
 		EventStreamSent:    101,
 		EventStreamDropped: 7,
-		EventStream: &EventStreamStatus{
+		EventStream: &userspace.EventStreamStatus{
 			FramesRead:        11,
 			FramesWritten:     5,
 			DecodeErrors:      2,
@@ -138,8 +140,12 @@ func TestFormatStatusSummary(t *testing.T) {
 }
 
 func TestFormatStatusSummaryShowsPersistentSourceNATHABoundary(t *testing.T) {
-	status := ProcessStatus{
-		Capabilities: UserspaceCapabilities{
+	// Mirrors the unexported persistentSourceNATHAUnsupportedReason constant
+	// in the parent userspace package (manager.go); the formatter only echoes
+	// whatever UnsupportedReasons string the manager supplies.
+	const persistentSourceNATHAUnsupportedReason = "userspace persistent-nat source pool leases are not HA-synchronized"
+	status := userspace.ProcessStatus{
+		Capabilities: userspace.UserspaceCapabilities{
 			ForwardingSupported: false,
 			UnsupportedReasons:  []string{persistentSourceNATHAUnsupportedReason},
 		},
@@ -157,7 +163,7 @@ func TestFormatStatusSummaryShowsPersistentSourceNATHABoundary(t *testing.T) {
 }
 
 func TestFormatStatusSummaryShowsDegradedPathCounters(t *testing.T) {
-	status := ProcessStatus{
+	status := userspace.ProcessStatus{
 		DegradedPathCounters: map[string]uint64{
 			"transit_drop":  5,
 			"ctrl_disabled": 1,
@@ -176,8 +182,8 @@ func TestFormatStatusSummaryShowsDegradedPathCounters(t *testing.T) {
 }
 
 func TestFormatSYNCookieCounterRows(t *testing.T) {
-	status := ProcessStatus{
-		Bindings: []BindingStatus{
+	status := userspace.ProcessStatus{
+		Bindings: []userspace.BindingStatus{
 			{
 				SYNCookieChallenges:        3,
 				SYNCookieSecretUnavailable: 5,
@@ -226,8 +232,8 @@ func TestFormatStatusSummaryWorkerRuntimeRolling60sColumn(t *testing.T) {
 	// Three workers: w0 has a fully-populated window (45s CPU over 60s = 75%);
 	// w1 has only cumulative data and no rotation yet (window_ns=0, show "-");
 	// w2 is dead (windowed column suppressed by DEAD row).
-	status := ProcessStatus{
-		WorkerRuntime: []WorkerRuntimeStatus{
+	status := userspace.ProcessStatus{
+		WorkerRuntime: []userspace.WorkerRuntimeStatus{
 			{
 				WorkerID:       0,
 				TID:            111,
@@ -278,8 +284,8 @@ func TestFormatStatusSummaryWorkerRuntimeRolling60sColumn(t *testing.T) {
 }
 
 func TestFormatStatusSummaryIncludesThreeColorPolicerCounters(t *testing.T) {
-	status := ProcessStatus{
-		ThreeColorPolicerCounters: []ThreeColorPolicerStatus{
+	status := userspace.ProcessStatus{
+		ThreeColorPolicerCounters: []userspace.ThreeColorPolicerStatus{
 			{
 				ID:            2,
 				Name:          "wan-egress",
@@ -316,9 +322,9 @@ func TestFormatStatusSummaryIncludesThreeColorPolicerCounters(t *testing.T) {
 }
 
 func TestFormatStatusSummaryReportsStandbyArmedRole(t *testing.T) {
-	status := ProcessStatus{
+	status := userspace.ProcessStatus{
 		ForwardingArmed: true,
-		HAGroups: []HAGroupStatus{
+		HAGroups: []userspace.HAGroupStatus{
 			{RGID: 0, Active: false, WatchdogTimestamp: 100},
 			{RGID: 1, Active: false, WatchdogTimestamp: 0},
 			{RGID: 2, Active: false, WatchdogTimestamp: 0},
@@ -332,8 +338,8 @@ func TestFormatStatusSummaryReportsStandbyArmedRole(t *testing.T) {
 }
 
 func TestFormatStatusSummaryDoesNotCountDisabledSharedUMEMFallback(t *testing.T) {
-	status := ProcessStatus{
-		Bindings: []BindingStatus{
+	status := userspace.ProcessStatus{
+		Bindings: []userspace.BindingStatus{
 			{
 				SharedUMEMMode:           "cross-nic",
 				SharedUMEMSocketRole:     "owner",
@@ -353,13 +359,13 @@ func TestFormatStatusSummaryDoesNotCountDisabledSharedUMEMFallback(t *testing.T)
 }
 
 func TestFormatStatusSummaryAttributesCoSAdmissionTXErrors(t *testing.T) {
-	status := ProcessStatus{
-		Bindings: []BindingStatus{
+	status := userspace.ProcessStatus{
+		Bindings: []userspace.BindingStatus{
 			{TXErrors: 100, DbgCoSQueueOverflow: 50},
 		},
-		CoSInterfaces: []CoSInterfaceStatus{
+		CoSInterfaces: []userspace.CoSInterfaceStatus{
 			{
-				Queues: []CoSQueueStatus{
+				Queues: []userspace.CoSQueueStatus{
 					{AdmissionFlowShareDrops: 3, AdmissionBufferDrops: 2, AdmissionEcnMarked: 7},
 					{AdmissionFlowShareDrops: 1, AdmissionBufferDrops: 4, AdmissionEcnMarked: 11},
 				},
@@ -384,13 +390,13 @@ func TestFormatStatusSummaryAttributesCoSAdmissionTXErrors(t *testing.T) {
 }
 
 func TestFormatStatusSummaryUsesBindingLifetimeForCoSErrorResidual(t *testing.T) {
-	status := ProcessStatus{
-		Bindings: []BindingStatus{
+	status := userspace.ProcessStatus{
+		Bindings: []userspace.BindingStatus{
 			{TXErrors: 100, DbgCoSQueueOverflow: 80},
 		},
-		CoSInterfaces: []CoSInterfaceStatus{
+		CoSInterfaces: []userspace.CoSInterfaceStatus{
 			{
-				Queues: []CoSQueueStatus{
+				Queues: []userspace.CoSQueueStatus{
 					{AdmissionFlowShareDrops: 5, AdmissionBufferDrops: 5},
 				},
 			},
@@ -414,13 +420,13 @@ func TestFormatStatusSummaryUsesBindingLifetimeForCoSErrorResidual(t *testing.T)
 }
 
 func TestFormatStatusSummarySaturatesCoSAdmissionAttribution(t *testing.T) {
-	status := ProcessStatus{
-		Bindings: []BindingStatus{
+	status := userspace.ProcessStatus{
+		Bindings: []userspace.BindingStatus{
 			{TXErrors: 1, DbgCoSQueueOverflow: 2},
 		},
-		CoSInterfaces: []CoSInterfaceStatus{
+		CoSInterfaces: []userspace.CoSInterfaceStatus{
 			{
-				Queues: []CoSQueueStatus{
+				Queues: []userspace.CoSQueueStatus{
 					{AdmissionFlowShareDrops: ^uint64(0) - 1, AdmissionBufferDrops: 10},
 				},
 			},
@@ -442,9 +448,9 @@ func TestFormatStatusSummarySaturatesCoSAdmissionAttribution(t *testing.T) {
 }
 
 func TestFormatFairnessRSS(t *testing.T) {
-	status := ProcessStatus{
+	status := userspace.ProcessStatus{
 		CoSActiveFlowCountsTruncated: true,
-		CoSActiveFlowCounts: []CoSActiveFlowCountStatus{
+		CoSActiveFlowCounts: []userspace.CoSActiveFlowCountStatus{
 			{Ifindex: 80, QueueID: 4, WorkerID: 0, ActiveFlowCount: 1},
 			{Ifindex: 80, QueueID: 4, WorkerID: 1, ActiveFlowCount: 3},
 			{Ifindex: 80, QueueID: 4, WorkerID: 2, ActiveFlowCount: 0},
@@ -453,7 +459,7 @@ func TestFormatFairnessRSS(t *testing.T) {
 		},
 	}
 
-	out := FormatFairnessRSS(status, []FairnessRSSExpectation{
+	out := FormatFairnessRSS(status, []userspace.FairnessRSSExpectation{
 		{Ifindex: 80, QueueID: 4, RSSExpectation: "balanced"},
 		{Ifindex: 80, QueueID: 5, RSSExpectation: "max-worker-flow-share:50%"},
 	})
@@ -478,7 +484,7 @@ func TestFormatFairnessRSS(t *testing.T) {
 }
 
 func TestFormatFairnessRSSShowsExpectationsWithoutRows(t *testing.T) {
-	out := FormatFairnessRSS(ProcessStatus{Workers: 4}, []FairnessRSSExpectation{
+	out := FormatFairnessRSS(userspace.ProcessStatus{Workers: 4}, []userspace.FairnessRSSExpectation{
 		{Ifindex: 80, QueueID: 4, RSSExpectation: "cstruct-max:0.25"},
 	})
 	for _, want := range []string{
@@ -498,9 +504,9 @@ func TestFormatFairnessRSSShowsExpectationsWithoutRows(t *testing.T) {
 func TestFormatFlowWorkerMap(t *testing.T) {
 	cosQueue := uint8(4)
 	dscpRewrite := uint8(46)
-	status := ProcessStatus{
+	status := userspace.ProcessStatus{
 		FlowWorkerMapTruncated: true,
-		FlowWorkerMap: []FlowWorkerStatus{
+		FlowWorkerMap: []userspace.FlowWorkerStatus{
 			{
 				Slot:           3,
 				QueueID:        2,
@@ -514,21 +520,21 @@ func TestFormatFlowWorkerMap(t *testing.T) {
 				DSCPRewrite:    &dscpRewrite,
 				AgeEpochs:      7,
 				ObservedBytes:  123456,
-				SessionKey: FlowTupleStatus{
+				SessionKey: userspace.FlowTupleStatus{
 					Protocol: 6,
 					SrcIP:    "172.16.80.10",
 					SrcPort:  40000,
 					DstIP:    "172.16.80.200",
 					DstPort:  5201,
 				},
-				ForwardWireKey: FlowTupleStatus{
+				ForwardWireKey: userspace.FlowTupleStatus{
 					Protocol: 6,
 					SrcIP:    "172.16.80.10",
 					SrcPort:  40000,
 					DstIP:    "172.16.80.200",
 					DstPort:  5201,
 				},
-				ReverseCanonicalKey: FlowTupleStatus{
+				ReverseCanonicalKey: userspace.FlowTupleStatus{
 					Protocol: 6,
 					SrcIP:    "172.16.80.200",
 					SrcPort:  5201,
@@ -540,7 +546,7 @@ func TestFormatFlowWorkerMap(t *testing.T) {
 				Slot:     1,
 				QueueID:  1,
 				WorkerID: 0,
-				SessionKey: FlowTupleStatus{
+				SessionKey: userspace.FlowTupleStatus{
 					Protocol: 17,
 					SrcIP:    "2001:db8::1",
 					SrcPort:  12345,
@@ -623,18 +629,18 @@ func TestParseFlowWorkerMapLimitSpec(t *testing.T) {
 }
 
 func TestFormatBindings(t *testing.T) {
-	status := ProcessStatus{
-		Fabrics: []FabricSnapshot{
+	status := userspace.ProcessStatus{
+		Fabrics: []userspace.FabricSnapshot{
 			{Name: "fab0", ParentLinuxName: "ge-0-0-0", ParentIfindex: 7, OverlayLinux: "fab0", OverlayIfindex: 17, RXQueues: 4, PeerAddress: "10.99.1.2"},
 		},
-		Queues: []QueueStatus{
+		Queues: []userspace.QueueStatus{
 			{QueueID: 0, WorkerID: 0, Interfaces: []string{"ge-0-0-1", "ge-0-0-2"}, Registered: true, Armed: false, Ready: false},
 		},
-		Bindings: []BindingStatus{
+		Bindings: []userspace.BindingStatus{
 			{Slot: 0, QueueID: 0, WorkerID: 0, Registered: true, Armed: false, Ready: false, Bound: true, XSKRegistered: true, XSKBindMode: "zerocopy", ZeroCopy: true, Ifindex: 5, Interface: "ge-0-0-1", SharedUMEMMode: "cross-nic", SharedUMEMSocketRole: "owner", SharedUMEMGroup: "cross-nic:w0:ge-0-0-1,ge-0-0-2", RXPackets: 99, TXPackets: 7, DirectTXPackets: 5, CopyTXPackets: 1, InPlaceTXPackets: 1, ExceptionPackets: 3},
 			{Slot: 1, QueueID: 0, WorkerID: 0, Registered: true, Armed: false, Ready: false, Bound: true, XSKRegistered: false, Ifindex: 6, Interface: "ge-0-0-2", ExceptionPackets: 1, LastError: "xsk map update failed"},
 		},
-		RecentExceptions: []ExceptionStatus{
+		RecentExceptions: []userspace.ExceptionStatus{
 			{Timestamp: time.Unix(0, 0).UTC(), Slot: 1, QueueID: 0, Interface: "ge-0-0-2", Reason: "fib_generation_mismatch", PacketLength: 512, AddrFamily: 10, Protocol: 6, ConfigGeneration: 11, FIBGeneration: 9, RuleName: "snat-a", PoolName: "pool-a"},
 		},
 	}

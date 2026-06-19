@@ -1,4 +1,4 @@
-package userspace
+package format
 
 // saturatingAddU64 avoids silent wraparound in telemetry renderers.
 // Hot-path this is not (called at status/scrape cadence), but

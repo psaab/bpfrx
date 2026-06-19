@@ -1,18 +1,20 @@
-package userspace
+package format
 
 import (
 	"fmt"
 	"strings"
 	"testing"
+
+	userspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
 func TestFormatSystemBuffersUsesPerBindingAggregatesBeforeDetails(t *testing.T) {
-	status := ProcessStatus{
-		Bindings: []BindingStatus{
+	status := userspace.ProcessStatus{
+		Bindings: []userspace.BindingStatus{
 			{Slot: 10, WorkerID: 1, QueueID: 2, Ifindex: 7, Interface: "ge-0-0-1"},
 			{Slot: 11, WorkerID: 1, QueueID: 3, Ifindex: 8, Interface: "ge-0-0-2"},
 		},
-		PerBinding: []BindingCountersSnapshot{
+		PerBinding: []userspace.BindingCountersSnapshot{
 			{WorkerID: 1, QueueID: 2, Ifindex: 7, UmemTotalFrames: 1000, UmemInflightFrames: 800, TxRingCapacity: 100, OutstandingTX: 90},
 			{WorkerID: 1, QueueID: 3, Ifindex: 8, UmemTotalFrames: 1000, UmemInflightFrames: 100, TxRingCapacity: 100, OutstandingTX: 10},
 		},
@@ -47,8 +49,8 @@ func TestFormatSystemBuffersUsesPerBindingAggregatesBeforeDetails(t *testing.T) 
 }
 
 func TestFormatSystemBuffersFallsBackToBindingsAndWarnsAtEighty(t *testing.T) {
-	status := ProcessStatus{
-		Bindings: []BindingStatus{
+	status := userspace.ProcessStatus{
+		Bindings: []userspace.BindingStatus{
 			{Slot: 0, WorkerID: 0, QueueID: 0, Interface: "ge-0-0-0", UmemTotalFrames: 100, UmemInflightFrames: 80},
 		},
 	}
@@ -73,11 +75,11 @@ func TestFormatSystemBuffersFallsBackToBindingsAndWarnsAtEighty(t *testing.T) {
 }
 
 func TestFormatSystemBuffersFallsBackWhenPerBindingLacksCapacity(t *testing.T) {
-	status := ProcessStatus{
-		Bindings: []BindingStatus{
+	status := userspace.ProcessStatus{
+		Bindings: []userspace.BindingStatus{
 			{Slot: 2, WorkerID: 1, QueueID: 0, Interface: "ge-0-0-1", UmemTotalFrames: 256, UmemInflightFrames: 64},
 		},
-		PerBinding: []BindingCountersSnapshot{
+		PerBinding: []userspace.BindingCountersSnapshot{
 			{WorkerID: 1, QueueID: 0, OutstandingTX: 10},
 		},
 	}
@@ -96,12 +98,12 @@ func TestFormatSystemBuffersFallsBackWhenPerBindingLacksCapacity(t *testing.T) {
 }
 
 func TestFormatSystemBuffersFallsBackPerSparsePerBindingRow(t *testing.T) {
-	status := ProcessStatus{
-		Bindings: []BindingStatus{
+	status := userspace.ProcessStatus{
+		Bindings: []userspace.BindingStatus{
 			{Slot: 2, WorkerID: 1, QueueID: 0, Ifindex: 7, Interface: "ge-0-0-1", UmemTotalFrames: 256, UmemInflightFrames: 64},
 			{Slot: 3, WorkerID: 1, QueueID: 1, Ifindex: 8, Interface: "ge-0-0-2", UmemTotalFrames: 512, UmemInflightFrames: 128},
 		},
-		PerBinding: []BindingCountersSnapshot{
+		PerBinding: []userspace.BindingCountersSnapshot{
 			{WorkerID: 1, QueueID: 0, Ifindex: 7, UmemTotalFrames: 1000, UmemInflightFrames: 500},
 			{WorkerID: 1, QueueID: 1, Ifindex: 8, OutstandingTX: 10},
 		},
@@ -122,8 +124,8 @@ func TestFormatSystemBuffersFallsBackPerSparsePerBindingRow(t *testing.T) {
 }
 
 func TestFormatSystemBuffersDocumentsMissingStatusFields(t *testing.T) {
-	out := FormatSystemBuffers(ProcessStatus{
-		PerBinding: []BindingCountersSnapshot{{WorkerID: 0, QueueID: 0, OutstandingTX: 10}},
+	out := FormatSystemBuffers(userspace.ProcessStatus{
+		PerBinding: []userspace.BindingCountersSnapshot{{WorkerID: 0, QueueID: 0, OutstandingTX: 10}},
 	}, false)
 
 	for _, want := range []string{
@@ -141,9 +143,9 @@ func TestFormatSystemBuffersDocumentsMissingStatusFields(t *testing.T) {
 
 func TestFormatSystemBuffersIncludesCoSAndRuntimePressure(t *testing.T) {
 	owner := uint32(2)
-	status := ProcessStatus{
+	status := userspace.ProcessStatus{
 		NeighborEntries: 12,
-		Bindings: []BindingStatus{
+		Bindings: []userspace.BindingStatus{
 			{
 				Slot:                        4,
 				WorkerID:                    2,
@@ -170,11 +172,11 @@ func TestFormatSystemBuffersIncludesCoSAndRuntimePressure(t *testing.T) {
 				TxSubmitErrorDrops:          47,
 			},
 		},
-		CoSInterfaces: []CoSInterfaceStatus{
+		CoSInterfaces: []userspace.CoSInterfaceStatus{
 			{
 				Ifindex:       9,
 				InterfaceName: "ge-0-0-9",
-				Queues: []CoSQueueStatus{
+				Queues: []userspace.CoSQueueStatus{
 					{
 						QueueID:         2,
 						OwnerWorkerID:   &owner,
@@ -219,12 +221,12 @@ func TestFormatSystemBuffersIncludesCoSAndRuntimePressure(t *testing.T) {
 }
 
 func TestFormatSystemBuffersKeepsDynamicCountsOutOfUtilizationTable(t *testing.T) {
-	status := ProcessStatus{
+	status := userspace.ProcessStatus{
 		NeighborEntries: 42,
-		Bindings: []BindingStatus{
+		Bindings: []userspace.BindingStatus{
 			{Slot: 1, WorkerID: 0, QueueID: 0, Interface: "ge-0-0-0", UmemTotalFrames: 1000, UmemInflightFrames: 250},
 		},
-		PerBinding: []BindingCountersSnapshot{
+		PerBinding: []userspace.BindingCountersSnapshot{
 			{WorkerID: 0, QueueID: 0, ActiveFlowCount: 128},
 		},
 	}
@@ -249,12 +251,12 @@ func TestFormatSystemBuffersKeepsDynamicCountsOutOfUtilizationTable(t *testing.T
 }
 
 func TestFormatSystemBuffersUsesHelperPublishedDynamicCapacities(t *testing.T) {
-	status := ProcessStatus{
+	status := userspace.ProcessStatus{
 		SessionTableEntries:   90,
 		MaxSessions:           100,
 		NeighborEntries:       42,
 		NeighborCacheCapacity: 50,
-		PerBinding: []BindingCountersSnapshot{
+		PerBinding: []userspace.BindingCountersSnapshot{
 			{WorkerID: 0, QueueID: 0, ActiveFlowCount: 9, FlowCacheCapacity: 10},
 			{WorkerID: 1, QueueID: 0, ActiveFlowCount: 1, FlowCacheCapacity: 10},
 		},
@@ -301,9 +303,9 @@ func TestFormatSystemBuffersUsesHelperPublishedDynamicCapacities(t *testing.T) {
 }
 
 func TestFormatSystemBuffersUsesStatusFlowCacheCapacityFallback(t *testing.T) {
-	status := ProcessStatus{
+	status := userspace.ProcessStatus{
 		FlowCacheCapacity: 20,
-		PerBinding: []BindingCountersSnapshot{
+		PerBinding: []userspace.BindingCountersSnapshot{
 			{WorkerID: 0, QueueID: 0, ActiveFlowCount: 9},
 			{WorkerID: 1, QueueID: 0, ActiveFlowCount: 3},
 		},
@@ -330,8 +332,8 @@ func TestFormatSystemBuffersUsesStatusFlowCacheCapacityFallback(t *testing.T) {
 }
 
 func TestFormatSystemBuffersIncludesSYNCookieCounters(t *testing.T) {
-	status := ProcessStatus{
-		Bindings: []BindingStatus{
+	status := userspace.ProcessStatus{
+		Bindings: []userspace.BindingStatus{
 			{
 				Slot:                       0,
 				WorkerID:                   0,
@@ -392,12 +394,12 @@ func TestFormatSystemBuffersIncludesSYNCookieCounters(t *testing.T) {
 }
 
 func TestFormatSystemBuffersCoSAggregateSumsCapacityWithUsage(t *testing.T) {
-	status := ProcessStatus{
-		CoSInterfaces: []CoSInterfaceStatus{
+	status := userspace.ProcessStatus{
+		CoSInterfaces: []userspace.CoSInterfaceStatus{
 			{
 				Ifindex:       80,
 				InterfaceName: "reth0.80",
-				Queues: []CoSQueueStatus{
+				Queues: []userspace.CoSQueueStatus{
 					{QueueID: 4, ForwardingClass: "iperf-a", BufferBytes: 1000, QueuedBytes: 700},
 					{QueueID: 5, ForwardingClass: "iperf-b", BufferBytes: 1000, QueuedBytes: 100},
 				},

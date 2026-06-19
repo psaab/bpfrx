@@ -12,6 +12,7 @@ import (
 	"time"
 
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
 )
 
 func (s *Server) systemInfoHandler(w http.ResponseWriter, r *http.Request) {
@@ -203,7 +204,7 @@ func (s *Server) systemBuffersHandler(w http.ResponseWriter, _ *http.Request) {
 			writeError(w, http.StatusServiceUnavailable, msg)
 			return
 		}
-		rows := dpuserspace.StructuredSystemBufferRows(status, false)
+		rows := dpformat.StructuredSystemBufferRows(status, false)
 		if len(rows.Utilization) == 0 {
 			msg := "userspace buffer status missing bounded capacity fields"
 			writeError(w, http.StatusServiceUnavailable, msg)

@@ -9,6 +9,7 @@ import (
 	"github.com/psaab/xpf/pkg/appid"
 	"github.com/psaab/xpf/pkg/cmdtree"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
 	"github.com/psaab/xpf/pkg/dhcp"
 	"github.com/psaab/xpf/pkg/dhcpserver"
 	"github.com/psaab/xpf/pkg/ipmon"
@@ -171,7 +172,7 @@ func (c *CLI) showClassOfServiceInterface(selector string) error {
 	if userspaceStatus, err := c.userspaceDataplaneStatus(); err == nil {
 		status = &userspaceStatus
 	}
-	fmt.Print(dpuserspace.FormatCoSInterfaceSummary(cfg, status, selector))
+	fmt.Print(dpformat.FormatCoSInterfaceSummary(cfg, status, selector))
 	return nil
 }
 

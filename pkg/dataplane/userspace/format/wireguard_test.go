@@ -1,14 +1,16 @@
-package userspace
+package format
 
 import (
 	"strings"
 	"testing"
 	"time"
+
+	userspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
-func wgFmtFixture() ProcessStatus {
-	return ProcessStatus{
-		WgTunnels: []WgTunnelStatus{{
+func wgFmtFixture() userspace.ProcessStatus {
+	return userspace.ProcessStatus{
+		WgTunnels: []userspace.WgTunnelStatus{{
 			Tunnel:                 "wg0",
 			TunnelEndpointID:       3,
 			ListenPort:             51820,
@@ -77,11 +79,11 @@ func TestFormatWireguardStatusDetailReasonTables(t *testing.T) {
 }
 
 func TestFormatWireguardStatusNeverAndEmpty(t *testing.T) {
-	out := FormatWireguardStatus(ProcessStatus{}, false, time.Now())
+	out := FormatWireguardStatus(userspace.ProcessStatus{}, false, time.Now())
 	if !strings.Contains(out, "No WireGuard tunnels configured") {
 		t.Errorf("empty status rendering = %q", out)
 	}
-	status := ProcessStatus{WgTunnels: []WgTunnelStatus{{Tunnel: "wg1"}}}
+	status := userspace.ProcessStatus{WgTunnels: []userspace.WgTunnelStatus{{Tunnel: "wg1"}}}
 	out = FormatWireguardStatus(status, false, time.Now())
 	if !strings.Contains(out, "Latest handshake:   never") {
 		t.Errorf("never-handshaked tunnel must render 'never':\n%s", out)

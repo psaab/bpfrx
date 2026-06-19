@@ -29,7 +29,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
-	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
 	"github.com/psaab/xpf/pkg/feeds"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"github.com/psaab/xpf/pkg/ipmon"
@@ -45,7 +45,7 @@ func (s *Server) screenSYNCookieCounterRows() string {
 	if err != nil {
 		return ""
 	}
-	return dpuserspace.FormatSYNCookieCounterRows(dpuserspace.SumSYNCookieCounters(status))
+	return dpformat.FormatSYNCookieCounterRows(dpformat.SumSYNCookieCounters(status))
 }
 
 // showIPsecStatistics renders the IPsec SA table with active-tunnel
@@ -871,7 +871,7 @@ func writeRPMConfig(buf *strings.Builder, cfg *config.Config) {
 // showWireguard renders `show security wireguard [detail]` for the
 // remote CLI from the userspace helper's per-tunnel telemetry rows
 // (#1865). Shared rendering with the local CLI via
-// dpuserspace.FormatWireguardStatus.
+// dpformat.FormatWireguardStatus.
 func (s *Server) showWireguard(buf *strings.Builder, detail bool) {
 	if s.dp == nil {
 		buf.WriteString("Dataplane not loaded\n")
@@ -887,5 +887,5 @@ func (s *Server) showWireguard(buf *strings.Builder, detail bool) {
 		fmt.Fprintf(buf, "WireGuard telemetry unavailable: %v\n", err)
 		return
 	}
-	buf.WriteString(dpuserspace.FormatWireguardStatus(status, detail, time.Now()))
+	buf.WriteString(dpformat.FormatWireguardStatus(status, detail, time.Now()))
 }

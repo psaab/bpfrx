@@ -1,9 +1,11 @@
-package userspace
+package format
 
 import (
 	"fmt"
 	"strings"
 	"time"
+
+	userspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
 // FormatWireguardStatus renders the #1865 per-WG-tunnel telemetry rows
@@ -19,7 +21,7 @@ import (
 // detail view adds the full per-reason drop tables — the one-glance
 // diagnosis for the #1736 class of failures (silent sends, MTU
 // blackholes, wrong-key peers).
-func FormatWireguardStatus(status ProcessStatus, detail bool, now time.Time) string {
+func FormatWireguardStatus(status userspace.ProcessStatus, detail bool, now time.Time) string {
 	if len(status.WgTunnels) == 0 {
 		return "No WireGuard tunnels configured\n"
 	}

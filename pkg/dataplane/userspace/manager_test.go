@@ -505,8 +505,34 @@ func TestStatusIPCRecordsSYNCookieBindingCounters(t *testing.T) {
 		t.Fatal("helper did not finish status response")
 	}
 
-	got := SumSYNCookieCounters(m.lastStatus)
-	want := SYNCookieCounters{
+	// Aggregate the per-binding SYN-cookie counters the manager recorded.
+	// The shared SumSYNCookieCounters/SYNCookieCounters helpers now live in
+	// the format subpackage (which imports this package), so this manager
+	// test sums inline to assert the recording behavior without creating an
+	// import cycle. The summation helper itself is covered by the format
+	// package tests.
+	type synCookieTotals struct {
+		Challenges        uint64
+		SecretUnavailable uint64
+		SynAckSent        uint64
+		AckRstSent        uint64
+		ReplyBudgetDrops  uint64
+		AckValid          uint64
+		AckInvalid        uint64
+		Bypass            uint64
+	}
+	var got synCookieTotals
+	for _, binding := range m.lastStatus.Bindings {
+		got.Challenges += binding.SYNCookieChallenges
+		got.SecretUnavailable += binding.SYNCookieSecretUnavailable
+		got.SynAckSent += binding.SYNCookieSynAckSent
+		got.AckRstSent += binding.SYNCookieAckRstSent
+		got.ReplyBudgetDrops += binding.SYNCookieReplyBudgetDrops
+		got.AckValid += binding.SYNCookieAckValid
+		got.AckInvalid += binding.SYNCookieAckInvalid
+		got.Bypass += binding.SYNCookieBypass
+	}
+	want := synCookieTotals{
 		Challenges:        20,
 		SecretUnavailable: 24,
 		SynAckSent:        36,

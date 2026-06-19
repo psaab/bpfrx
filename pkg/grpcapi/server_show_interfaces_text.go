@@ -23,6 +23,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"github.com/vishvananda/netlink"
 	"google.golang.org/grpc/codes"
@@ -277,7 +278,7 @@ func (s *Server) showClassOfService(req *pb.ShowTextRequest, cfg *config.Config,
 	if userspaceStatus, err := s.userspaceDataplaneStatus(); err == nil {
 		status = &userspaceStatus
 	}
-	buf.WriteString(dpuserspace.FormatCoSInterfaceSummary(cfg, status, selector))
+	buf.WriteString(dpformat.FormatCoSInterfaceSummary(cfg, status, selector))
 	return &pb.ShowTextResponse{Output: buf.String()}, nil
 }
 

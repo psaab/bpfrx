@@ -18,6 +18,7 @@ import (
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"github.com/psaab/xpf/pkg/monitoriface"
 	"golang.org/x/sys/unix"
@@ -919,7 +920,7 @@ func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) 
 			if err != nil {
 				return nil, status.Errorf(codes.FailedPrecondition, "userspace inject: %v", err)
 			}
-			msg := dpuserspace.FormatStatusSummary(statusAfter) + "\n" + dpuserspace.FormatBindings(statusAfter)
+			msg := dpformat.FormatStatusSummary(statusAfter) + "\n" + dpformat.FormatBindings(statusAfter)
 			return &pb.SystemActionResponse{Message: msg}, nil
 		}
 		if strings.HasPrefix(req.Action, "userspace-forwarding:") {
@@ -935,7 +936,7 @@ func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) 
 			if err != nil {
 				return nil, status.Errorf(codes.FailedPrecondition, "userspace forwarding control: %v", err)
 			}
-			msg := dpuserspace.FormatStatusSummary(statusAfter) + "\n" + dpuserspace.FormatBindings(statusAfter)
+			msg := dpformat.FormatStatusSummary(statusAfter) + "\n" + dpformat.FormatBindings(statusAfter)
 			return &pb.SystemActionResponse{Message: msg}, nil
 		}
 		if strings.HasPrefix(req.Action, "userspace-queue:") {
@@ -960,7 +961,7 @@ func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) 
 			if err != nil {
 				return nil, status.Errorf(codes.FailedPrecondition, "userspace queue control: %v", err)
 			}
-			msg := dpuserspace.FormatStatusSummary(statusAfter) + "\n" + dpuserspace.FormatBindings(statusAfter)
+			msg := dpformat.FormatStatusSummary(statusAfter) + "\n" + dpformat.FormatBindings(statusAfter)
 			return &pb.SystemActionResponse{Message: msg}, nil
 		}
 		if strings.HasPrefix(req.Action, "userspace-binding:") {
@@ -985,7 +986,7 @@ func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) 
 			if err != nil {
 				return nil, status.Errorf(codes.FailedPrecondition, "userspace binding control: %v", err)
 			}
-			msg := dpuserspace.FormatStatusSummary(statusAfter) + "\n" + dpuserspace.FormatBindings(statusAfter)
+			msg := dpformat.FormatStatusSummary(statusAfter) + "\n" + dpformat.FormatBindings(statusAfter)
 			return &pb.SystemActionResponse{Message: msg}, nil
 		}
 		return nil, status.Errorf(codes.InvalidArgument, "unknown action: %s", req.Action)

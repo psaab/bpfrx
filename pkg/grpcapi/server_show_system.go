@@ -30,7 +30,7 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
-	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -418,7 +418,7 @@ func (s *Server) showBuffers(cfg *config.Config, buf *strings.Builder) {
 			if err != nil {
 				fmt.Fprintf(buf, "Userspace buffer metrics unavailable: %v\n", err)
 			} else {
-				buf.WriteString(dpuserspace.FormatSystemBuffers(status, false))
+				buf.WriteString(dpformat.FormatSystemBuffers(status, false))
 				v4, v6 := s.dp.SessionCount()
 				if v4 > 0 || v6 > 0 {
 					fmt.Fprintf(buf, "\nActive sessions: %d IPv4, %d IPv6, %d total\n", v4, v6, v4+v6)
@@ -473,7 +473,7 @@ func (s *Server) showBuffersDetail(cfg *config.Config, buf *strings.Builder) {
 			if err != nil {
 				fmt.Fprintf(buf, "Userspace buffer metrics unavailable: %v\n", err)
 			} else {
-				buf.WriteString(dpuserspace.FormatSystemBuffers(status, true))
+				buf.WriteString(dpformat.FormatSystemBuffers(status, true))
 				v4, v6 := s.dp.SessionCount()
 				if v4 > 0 || v6 > 0 {
 					fmt.Fprintf(buf, "\nActive sessions: %d IPv4, %d IPv6, %d total\n", v4, v6, v4+v6)
