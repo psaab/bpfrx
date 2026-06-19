@@ -6,6 +6,36 @@ package config
 // `bridge-domains`, and `routing-instances`. The root composition, the
 // schemaNode type, and the split rationale live in schema.go.
 
+// samplingFlowServerNode builds the typed `flow-server <address>` leaf for
+// a sampling output block (#1979 Layer B, Tier 2). It is a fresh node per
+// call so the inet and inet6 families own independent subtrees (mirrors
+// syslogFacilitySeverityLeaf). flow-server KEEPS args:1 for the collector
+// address; adding a children map deliberately flips its bare-terminal
+// `set ... flow-server <addr>` behaviour from single-value REPLACE to
+// named-container APPEND (ast_edit.go) — benign: a bare no-port server
+// compiles Port==0 and the snapshot builder skips it, and real collectors
+// carry `port` (taking the container path already). The `port` value feeds
+// the Rust u16 CollectorPort wire field; Layer A skips a server whose port
+// is <1 or >65535, so the bound is [1, 65535]. version9-template /
+// version9 { template } / source-address are the other children the
+// sampling compiler reads (compiler_services.go compileSamplingFamily) —
+// declared so completion does not silently drop them.
+func samplingFlowServerNode() *schemaNode {
+	return &schemaNode{
+		desc: "Flow collector address", args: 1, placeholder: "<address>",
+		children: map[string]*schemaNode{
+			"port": {desc: "Flow collector UDP port", args: 1, placeholder: "<port>",
+				valueType: ValueInteger, valueDesc: "Flow collector UDP port (1..65535)",
+				valueExamples: []string{"2055", "9995"}, validator: ValidateInteger(1, maxWireU16), children: nil},
+			"version9-template": {desc: "NetFlow v9 template name for this collector", args: 1, placeholder: "<template-name>", children: nil},
+			"version9": {desc: "NetFlow v9 export options", children: map[string]*schemaNode{
+				"template": {desc: "NetFlow v9 template name", args: 1, placeholder: "<template-name>", children: nil},
+			}},
+			"source-address": {desc: "Source address for exported flows", args: 1, placeholder: "<address>", children: nil},
+		},
+	}
+}
+
 var schemaRoutingOptions = &schemaNode{desc: "Routing options", children: map[string]*schemaNode{
 	"static": {desc: "Static routes", children: map[string]*schemaNode{
 		"route": {desc: "Static route", args: 1, placeholder: "<destination>", children: nil},
@@ -299,17 +329,27 @@ var schemaForwardingOptions = &schemaNode{desc: "Packet forwarding options", chi
 	}},
 	"sampling": {desc: "Traffic sampling for flow export", children: map[string]*schemaNode{
 		"instance": {desc: "Sampling instance", args: 1, placeholder: "<instance-name>", children: map[string]*schemaNode{
-			"input": {desc: "Sampling input properties (rate)", children: nil},
+			// #1979 Layer B (Tier 2): `input rate <n>` feeds the Rust u32
+			// SamplingRate wire field (buildFlowExportSnapshot, Layer A caps
+			// >u32max). Q3 DECISION: bound is [0, u32max] — EXACT Layer-A
+			// agreement. Accept 0 (the documented `0 = sample all` sentinel,
+			// types_system.go; Layer A normalizes rate<=0 -> 1), reject only
+			// the decode-aborting >u32max.
+			"input": {desc: "Sampling input properties (rate)", children: map[string]*schemaNode{
+				"rate": {desc: "Sample 1-in-N packets (0 = sample all)", args: 1, placeholder: "<rate>",
+					valueType: ValueInteger, valueDesc: "Sampling rate 1-in-N (0..4294967295; 0 = sample all)",
+					valueExamples: []string{"1", "1000"}, validator: ValidateInteger(0, maxWireU32), children: nil},
+			}},
 			"family": {desc: "Address family to sample", compoundKey: true, children: map[string]*schemaNode{
 				"inet": {desc: "IPv4 flow sampling", children: map[string]*schemaNode{
 					"output": {desc: "Sampling output configuration", children: map[string]*schemaNode{
-						"flow-server":  {desc: "Flow collector address", args: 1, placeholder: "<address>", children: nil},
+						"flow-server":  samplingFlowServerNode(),
 						"inline-jflow": {desc: "Inline flow export (jflow)", children: nil},
 					}},
 				}},
 				"inet6": {desc: "IPv6 flow sampling", children: map[string]*schemaNode{
 					"output": {desc: "Sampling output configuration", children: map[string]*schemaNode{
-						"flow-server":  {desc: "Flow collector address", args: 1, placeholder: "<address>", children: nil},
+						"flow-server":  samplingFlowServerNode(),
 						"inline-jflow": {desc: "Inline flow export (jflow)", children: nil},
 					}},
 				}},

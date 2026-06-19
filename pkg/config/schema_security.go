@@ -214,10 +214,52 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 		}},
 	}},
 	"flow": {desc: "Flow and session settings", children: map[string]*schemaNode{
-		"aging":                        {desc: "Aggressive session aging thresholds", children: nil},
-		"tcp-session":                  {desc: "TCP session options (timeouts, SYN checks)", children: nil},
-		"udp-session":                  {desc: "UDP session timeout (default 60 seconds)", children: nil},
-		"icmp-session":                 {desc: "ICMP session timeout (default 60 seconds)", children: nil},
+		"aging": {desc: "Aggressive session aging thresholds", children: nil},
+		// #1979 Layer B (Tier 2): expand the opaque session-timeout
+		// containers to real containers whose value-bearing sub-leaves are
+		// typed. The compiler reads tcp-session's four `<kind>-timeout`
+		// sub-leaves (compiler_security.go) + three presence flags;
+		// EstablishedTimeout reaches the Rust u64 TCPSessionTimeout wire
+		// field, the other three are stored only in TCPSessionConfig (not
+		// wire-reaching) but share the same Duration-overflow ceiling and
+		// declaring them is required for completion parity anyway. The bound
+		// is MaxDurationSeconds (NOT u64-max): Rust SessionTimeouts::
+		// from_seconds multiplies secs*1e9 unchecked (Layer A,
+		// coerceWireSessionTimeout). The presence flags are declared
+		// presence-only so completion still offers them.
+		"tcp-session": {desc: "TCP session options (timeouts, SYN checks)", children: map[string]*schemaNode{
+			"established-timeout": {desc: "Established TCP session timeout in seconds", args: 1, placeholder: "<seconds>",
+				valueType: ValueInteger, valueDesc: "Established TCP session timeout in seconds (0..9223372036)",
+				valueExamples: []string{"1800"}, validator: ValidateInteger(0, MaxDurationSeconds), children: nil},
+			"initial-timeout": {desc: "Initial (pre-established) TCP session timeout in seconds", args: 1, placeholder: "<seconds>",
+				valueType: ValueInteger, valueDesc: "Initial TCP session timeout in seconds (0..9223372036)",
+				valueExamples: []string{"20"}, validator: ValidateInteger(0, MaxDurationSeconds), children: nil},
+			"closing-timeout": {desc: "Closing TCP session timeout in seconds", args: 1, placeholder: "<seconds>",
+				valueType: ValueInteger, valueDesc: "Closing TCP session timeout in seconds (0..9223372036)",
+				valueExamples: []string{"4"}, validator: ValidateInteger(0, MaxDurationSeconds), children: nil},
+			"time-wait-timeout": {desc: "TIME_WAIT TCP session timeout in seconds", args: 1, placeholder: "<seconds>",
+				valueType: ValueInteger, valueDesc: "TIME_WAIT TCP session timeout in seconds (0..9223372036)",
+				valueExamples: []string{"150"}, validator: ValidateInteger(0, MaxDurationSeconds), children: nil},
+			"no-syn-check":           {desc: "Disable SYN check for TCP sessions", children: nil},
+			"no-syn-check-in-tunnel": {desc: "Disable SYN check for tunneled TCP sessions", children: nil},
+			"rst-invalidate-session": {desc: "Invalidate session on TCP RST", children: nil},
+		}},
+		"udp-session": {desc: "UDP session timeout (default 60 seconds)", children: map[string]*schemaNode{
+			"timeout": {desc: "UDP session timeout in seconds", args: 1, placeholder: "<seconds>",
+				valueType: ValueInteger, valueDesc: "UDP session timeout in seconds (0..9223372036)",
+				valueExamples: []string{"60"}, validator: ValidateInteger(0, MaxDurationSeconds), children: nil},
+		}},
+		"icmp-session": {desc: "ICMP session timeout (default 60 seconds)", children: map[string]*schemaNode{
+			"timeout": {desc: "ICMP session timeout in seconds", args: 1, placeholder: "<seconds>",
+				valueType: ValueInteger, valueDesc: "ICMP session timeout in seconds (0..9223372036)",
+				valueExamples: []string{"60"}, validator: ValidateInteger(0, MaxDurationSeconds), children: nil},
+		}},
+		// #1979 Layer B (Tier 3): tcp-mss stays OPAQUE here by design. Its
+		// MSS value can live in EITHER position (flat `gre-in 1400` OR
+		// hierarchical `gre-in { mss 1360; }`), which the declarative schema
+		// walker cannot express. Validation runs in the compiler AST pre-walk
+		// validateTCPMSSRanges (compiler.go), modeled on
+		// validateVRRPTrackInterfaceAST. See compiler_security.go.
 		"tcp-mss":                      {desc: "TCP MSS clamping (ipsec-vpn|gre-in|gre-out|all-tcp)", children: nil},
 		"allow-dns-reply":              {desc: "Allow unsolicited DNS reply packets", children: nil},
 		"allow-embedded-icmp":          {desc: "Allow ICMP error packets for existing sessions", children: nil},
