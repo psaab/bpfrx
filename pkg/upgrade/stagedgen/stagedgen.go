@@ -289,9 +289,11 @@ func (c Config) GenDir(genid string) string {
 }
 
 // GC removes generation dirs beyond RetainGenerations, ordering by genid name
-// (mtime-independent, deterministic — GenID's zero-padded timestamp prefix
-// makes lexicographic name order chronological). It NEVER removes the
-// current-gen generation (resolved explicitly, protected additively) NOR any
+// (mtime-independent and deterministic — GenID's zero-padded wall-clock
+// timestamp prefix makes lexicographic name order USUALLY chronological; an
+// NTP step can reorder, but correctness never depends on it — see below). It
+// NEVER removes the current-gen generation (resolved explicitly, protected
+// additively) NOR any
 // genid in protected (the generations an active/resumable journal still
 // references — plan §4.B.5 / B-P3 GC-vs-resume protection), and it ignores
 // (never counts toward retention, never deletes) any directory whose name is
@@ -325,9 +327,13 @@ func (c Config) GC(protected map[string]bool) error {
 
 	// Collect ONLY valid generation dirs (Copilot): a stray non-generation
 	// directory must neither consume a retention slot nor be deleted. Order by
-	// NAME, newest first — GenID prefixes a zero-padded nanosecond timestamp,
-	// so lexicographic name order is chronological and mtime-INDEPENDENT
-	// (deterministic even when coarse-resolution mtimes tie).
+	// NAME, greatest first — GenID prefixes a zero-padded wall-clock nanosecond
+	// timestamp, so lexicographic name order is mtime-INDEPENDENT and
+	// deterministic (even when coarse-resolution mtimes tie), and USUALLY
+	// chronological. A backward wall-clock step (NTP) can reorder, but
+	// correctness never depends on it: current-gen and journal-referenced
+	// generations are protected EXPLICITLY (below), so a misordering at most
+	// changes which NON-protected, non-live generation is reaped first.
 	var gens []string
 	for _, e := range entries {
 		n := e.Name()

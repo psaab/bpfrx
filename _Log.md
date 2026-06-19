@@ -6023,3 +6023,6 @@ top.
 - **Timestamp**: 2026-06-18
 - **Action**: Address Codex r5 minor (comment-only): GenID doc comment no longer says "monotonic" — wall-clock UnixNano, GC ordering hint, correctness independent of genid order.
 - **File(s)**: pkg/upgrade/stagedgen/stagedgen.go
+- **Timestamp**: 2026-06-18
+- **Action**: Soften GC "chronological" comments to "usually chronological (wall-clock; NTP step can reorder, correctness independent)" for consistency with the GenID comment — comment-only.
+- **File(s)**: pkg/upgrade/stagedgen/stagedgen.go
