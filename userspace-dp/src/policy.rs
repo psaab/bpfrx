@@ -110,6 +110,13 @@ pub(crate) struct PolicyRule {
     pub(crate) source_v6_match_any: bool,
     pub(crate) destination_v4_match_any: bool,
     pub(crate) destination_v6_match_any: bool,
+    /// #2008 H2: invert the per-side address match. When set, the
+    /// side matches iff the address is NOT in the configured set
+    /// (Junos `source-address-excluded` / `destination-address-
+    /// excluded`). The match-any short-circuit is intentionally NOT
+    /// applied when excluded — see `try_match_rule`.
+    pub(crate) source_excluded: bool,
+    pub(crate) destination_excluded: bool,
     pub(crate) applications: Vec<ApplicationMatch>,
     /// Precompiled application matcher (protocol-indexed, exact-port sets).
     compiled_apps: CompiledApplications,
@@ -136,6 +143,8 @@ impl Default for PolicyRule {
             source_v6_match_any: true,
             destination_v4_match_any: true,
             destination_v6_match_any: true,
+            source_excluded: false,
+            destination_excluded: false,
             applications: Vec::new(),
             compiled_apps: CompiledApplications {
                 match_any: true,
@@ -166,6 +175,8 @@ impl Clone for PolicyRule {
             source_v6_match_any: self.source_v6_match_any,
             destination_v4_match_any: self.destination_v4_match_any,
             destination_v6_match_any: self.destination_v6_match_any,
+            source_excluded: self.source_excluded,
+            destination_excluded: self.destination_excluded,
             applications: self.applications.clone(),
             compiled_apps: self.compiled_apps.clone(),
             action: self.action,
@@ -524,6 +535,8 @@ pub(crate) fn parse_policy_state_with_counters(
             source_v6_match_any,
             destination_v4_match_any,
             destination_v6_match_any,
+            source_excluded: snap.source_address_excluded,
+            destination_excluded: snap.destination_address_excluded,
             applications,
             compiled_apps,
             action: parse_action(&snap.action),
@@ -571,8 +584,13 @@ fn parse_v3_literal_set(literals: &[String]) -> (PrefixSetV4, PrefixSetV6) {
                 any_v4 = true;
                 any_v6 = true;
             }
-            "any4" => any_v4 = true,
-            "any6" => any_v6 = true,
+            // `any4`/`any6` are the internal short forms; `any-ipv4`/
+            // `any-ipv6` are the Junos config keywords. The Go
+            // compiler normalizes the latter to `0.0.0.0/0`/`::/0`,
+            // but accept them here too so any path that bypasses that
+            // normalization still matches (#2008 H11).
+            "any4" | "any-ipv4" => any_v4 = true,
+            "any6" | "any-ipv6" => any_v6 = true,
             "" => {}
             s => parse_literal_cidr_into(s, &mut v4, &mut v6),
         }
@@ -596,6 +614,20 @@ fn parse_literal_cidr_into(
     out_v6: &mut Vec<PrefixV6>,
 ) {
     if prefix.is_empty() || prefix == "any" {
+        return;
+    }
+    // #2008 H11: the Junos family-scoped wildcards expand to the
+    // concrete all-addresses prefix of their family (v4-only / v6-only).
+    if prefix == "any-ipv4" {
+        out_v4.push(PrefixV4::from_net(
+            ipnet::Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("v4 /0"),
+        ));
+        return;
+    }
+    if prefix == "any-ipv6" {
+        out_v6.push(PrefixV6::from_net(
+            ipnet::Ipv6Net::new(Ipv6Addr::UNSPECIFIED, 0).expect("v6 /0"),
+        ));
         return;
     }
     match prefix.parse::<IpNet>() {
@@ -738,36 +770,48 @@ fn try_match_rule(
     if !rule.compiled_apps.matches(protocol, src_port, dst_port) {
         return None;
     }
+    // #2008 H2: when a side is `*-excluded`, the rule matches every
+    // address EXCEPT those in the configured set, so the match-any
+    // short-circuit must NOT apply (it would always-match and the
+    // inversion would always-FAIL the side). Compute the raw
+    // "address is in the set" predicate, then XOR with the excluded
+    // flag: matched != excluded.
     let (src_ok, dst_ok) = match (src_ip, dst_ip) {
         (IpAddr::V4(src), IpAddr::V4(dst)) => {
-            let s = rule.source_v4_match_any
+            let src_in = (!rule.source_excluded && rule.source_v4_match_any)
                 || rule.source_literal_v4.contains(src)
                 || rule
                     .source_book_idxs
                     .iter()
                     .any(|&i| state.books[i as usize].v4.contains(src));
-            let d = rule.destination_v4_match_any
+            let dst_in = (!rule.destination_excluded && rule.destination_v4_match_any)
                 || rule.destination_literal_v4.contains(dst)
                 || rule
                     .destination_book_idxs
                     .iter()
                     .any(|&i| state.books[i as usize].v4.contains(dst));
-            (s, d)
+            (
+                src_in != rule.source_excluded,
+                dst_in != rule.destination_excluded,
+            )
         }
         (IpAddr::V6(src), IpAddr::V6(dst)) => {
-            let s = rule.source_v6_match_any
+            let src_in = (!rule.source_excluded && rule.source_v6_match_any)
                 || rule.source_literal_v6.contains(src)
                 || rule
                     .source_book_idxs
                     .iter()
                     .any(|&i| state.books[i as usize].v6.contains(src));
-            let d = rule.destination_v6_match_any
+            let dst_in = (!rule.destination_excluded && rule.destination_v6_match_any)
                 || rule.destination_literal_v6.contains(dst)
                 || rule
                     .destination_book_idxs
                     .iter()
                     .any(|&i| state.books[i as usize].v6.contains(dst));
-            (s, d)
+            (
+                src_in != rule.source_excluded,
+                dst_in != rule.destination_excluded,
+            )
         }
         _ => return None,
     };
@@ -799,6 +843,19 @@ fn parse_action(action: &str) -> PolicyAction {
 
 fn parse_address(prefix: &str, out_v4: &mut Vec<PrefixV4>, out_v6: &mut Vec<PrefixV6>) {
     if prefix.is_empty() || prefix == "any" {
+        return;
+    }
+    // #2008 H11: family-scoped wildcards (see parse_literal_cidr_into).
+    if prefix == "any-ipv4" {
+        out_v4.push(PrefixV4::from_net(
+            ipnet::Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("v4 /0"),
+        ));
+        return;
+    }
+    if prefix == "any-ipv6" {
+        out_v6.push(PrefixV6::from_net(
+            ipnet::Ipv6Net::new(Ipv6Addr::UNSPECIFIED, 0).expect("v6 /0"),
+        ));
         return;
     }
     match prefix.parse::<IpNet>() {
