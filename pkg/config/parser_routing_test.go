@@ -3381,3 +3381,54 @@ policy-options {
 		t.Errorf("FromProtocols (hierarchical) = %v, want %v", got, want)
 	}
 }
+
+// TestPolicyTermMultiProtocolSeparateSetCommands exercises the dual-AST
+// flat-set hazard called out by Copilot on #2011: an operator can add each
+// protocol with its own "set ... from protocol <X>" command rather than a
+// single bracket-list. Each separate SetPath lands a distinct
+// ["protocol","<X>"] node under the term's "from" block. Before the fix the
+// schema marked "from protocol" as a single-value leaf, so SetPath REPLACED
+// the previous protocol on each command and only the last one survived; the
+// term silently matched a single protocol instead of the operator's three.
+// With "from protocol" marked multi the protocols become sibling leaves and
+// the compiler collects every one.
+func TestPolicyTermMultiProtocolSeparateSetCommands(t *testing.T) {
+	tree := &ConfigTree{}
+	// IMPORTANT: build via ParseSetCommand + SetPath in a loop (the documented
+	// way to test flat-set syntax). NewParser() with newlines would merge all
+	// lines into one node and would not reproduce the separate-command shape.
+	cmds := []string{
+		"set policy-options policy-statement EXPORT-ALL term t1 from protocol bgp",
+		"set policy-options policy-statement EXPORT-ALL term t1 from protocol ospf",
+		"set policy-options policy-statement EXPORT-ALL term t1 from protocol static",
+		"set policy-options policy-statement EXPORT-ALL term t1 then accept",
+	}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	ps := cfg.PolicyOptions.PolicyStatements["EXPORT-ALL"]
+	if ps == nil {
+		t.Fatal("EXPORT-ALL policy-statement not found")
+	}
+	if len(ps.Terms) != 1 {
+		t.Fatalf("got %d terms, want 1", len(ps.Terms))
+	}
+	got := ps.Terms[0].FromProtocols
+	want := []string{"bgp", "ospf", "static"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("FromProtocols (separate set commands) = %v, want %v", got, want)
+	}
+	if ps.Terms[0].Action != "accept" {
+		t.Errorf("action = %q, want accept", ps.Terms[0].Action)
+	}
+}

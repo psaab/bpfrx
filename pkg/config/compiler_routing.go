@@ -464,16 +464,22 @@ func compilePolicyOptions(node *Node, po *PolicyOptionsConfig) error {
 	return nil
 }
 
-// collectProtocolList flattens a "from protocol [ ... ]" node into the full
-// list of protocol names. After the lexer strips the brackets, two AST shapes
-// reach the compiler:
-//   - block parse: every protocol is a key on the node itself
+// collectProtocolList flattens a single "from protocol ..." node into the
+// protocol names it carries. After the lexer strips the brackets, a protocol
+// node reaches the compiler in one of three shapes:
+//   - block parse, bracket list: every protocol is a key on the node itself
 //     (Keys = ["protocol", "bgp", "ospf", "static"]).
-//   - flat-set SetPath: the first protocol is Keys[1] and the remaining
-//     protocols hang off a nested single-child chain
+//   - flat-set SetPath, bracket list: the first protocol is Keys[1] and the
+//     remaining protocols hang off a nested single-child chain
 //     (Keys = ["protocol", "bgp"] -> child Keys = ["ospf", "static"] -> ...).
-// Both shapes (and arbitrarily long lists) are handled by taking Keys[1:] of
-// the protocol node, then appending every key of each descendant in the chain.
+//   - flat-set SetPath, separate "set ... from protocol <X>" commands: each
+//     command lands its own leaf (Keys = ["protocol", "<X>"]) as a sibling
+//     under the term's "from" block. The caller iterates those siblings and
+//     calls this helper once per node, which then returns the single protocol.
+//
+// All three shapes (and arbitrarily long lists) are handled by taking
+// Keys[1:] of the protocol node, then appending every key of each descendant
+// in the single-child chain.
 func collectProtocolList(protoNode *Node) []string {
 	var protocols []string
 	if len(protoNode.Keys) >= 2 {

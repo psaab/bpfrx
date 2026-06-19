@@ -45,7 +45,14 @@ var schemaPolicyOptions = &schemaNode{desc: "Policy options", children: map[stri
 	"policy-statement": {desc: "Policy statement", args: 1, placeholder: "<name>", children: map[string]*schemaNode{
 		"term": {desc: "Term name", args: 1, placeholder: "<term-name>", children: map[string]*schemaNode{
 			"from": {desc: "Match condition", children: map[string]*schemaNode{
-				"protocol":     {desc: "Protocol", args: 1, placeholder: "<protocol>", children: nil},
+				// "from protocol" is a multi-value match: Junos accepts
+				// "from protocol [ bgp ospf static ]" and, equivalently, a
+				// sequence of separate "set ... from protocol <X>" commands.
+				// Mark it multi so SetPath keeps every protocol as a sibling
+				// leaf instead of replacing the previous one (#2008 H18 /
+				// Copilot #2011). A single-value leaf collapses separate set
+				// commands down to only the last protocol.
+				"protocol":     {desc: "Protocol", args: 1, multi: true, placeholder: "<protocol>", children: nil},
 				"prefix-list":  {desc: "Prefix list", args: 1, placeholder: "<list-name>", children: nil},
 				"route-filter": {desc: "Route filter", args: 2, placeholder: "<prefix>", children: nil},
 				"community":    {desc: "Community", args: 1, placeholder: "<community>", children: nil},
