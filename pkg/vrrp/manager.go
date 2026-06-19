@@ -25,15 +25,15 @@ type instanceKey struct {
 
 // Manager manages all VRRP instances.
 type Manager struct {
-	mu              sync.RWMutex
-	instances       map[instanceKey]*vrrpInstance
-	eventCh         chan VRRPEvent
-	closeEventOnce  sync.Once   // guards closing eventCh
-	cancel          context.CancelFunc
-	syncHold        bool        // suppress preemption until session sync completes
-	syncHoldTimer   *time.Timer // safety timeout to release hold
-	syncHoldReason  string      // "bulk-sync-complete" or "timeout-degraded"
-	onEventDrop     func()      // called when an event is dropped (full channel)
+	mu             sync.RWMutex
+	instances      map[instanceKey]*vrrpInstance
+	eventCh        chan VRRPEvent
+	closeEventOnce sync.Once // guards closing eventCh
+	cancel         context.CancelFunc
+	syncHold       bool        // suppress preemption until session sync completes
+	syncHoldTimer  *time.Timer // safety timeout to release hold
+	syncHoldReason string      // "bulk-sync-complete" or "timeout-degraded"
+	onEventDrop    func()      // called when an event is dropped (full channel)
 
 	// Interface tracking (#1814): ONE singleton link-watcher goroutine
 	// feeds trackDown into instances whose cfg.TrackInterface matches.
@@ -285,154 +285,6 @@ func (m *Manager) UpdateInstances(desired []*Instance) error {
 	}
 
 	return nil
-}
-
-// ensureLinkWatcherLocked starts the singleton link-watcher goroutine.
-// Caller MUST hold m.mu: watcherRunning latches under the manager mutex
-// so UpdateInstances churn can never spawn a second watcher (#1814).
-func (m *Manager) ensureLinkWatcherLocked() {
-	if m.watcherRunning {
-		return
-	}
-	m.watcherRunning = true
-	m.watcherStarts++
-	go m.runLinkWatcher()
-}
-
-// runLinkWatcher is the singleton tracked-link watcher (#1814). It
-// subscribes to netlink link updates and pushes trackDown into every
-// instance tracking the affected interface. The tracked-ifname →
-// instance mapping is re-read from the manager under lock on EVERY
-// event — instance churn is never captured stale. Cancellation follows
-// the done-channel pattern (pkg/daemon/daemon_flow.go): m.watcherStop
-// is closed from Manager.Stop and the netlink subscription observes the
-// same channel. On subscribe failure (or unexpected subscription close)
-// it degrades to a 1 s poll that runs only while tracked instances
-// exist.
-func (m *Manager) runLinkWatcher() {
-	ch := make(chan netlink.LinkUpdate, 64)
-	if err := m.subscribeLinks(ch, m.watcherStop); err != nil {
-		slog.Warn("vrrp: link subscribe failed, falling back to 1s link polling", "err", err)
-		m.runLinkPoller()
-		return
-	}
-	slog.Info("vrrp: link watcher started (interface tracking)")
-	for {
-		select {
-		case <-m.watcherStop:
-			return
-		case u, ok := <-ch:
-			if !ok {
-				select {
-				case <-m.watcherStop:
-					return
-				default:
-				}
-				slog.Warn("vrrp: link subscription closed, falling back to 1s link polling")
-				m.runLinkPoller()
-				return
-			}
-			attrs := u.Attrs()
-			if attrs == nil {
-				continue
-			}
-			up := u.Header.Type != unix.RTM_DELLINK && linkAttrsUp(attrs)
-			m.applyTrackedLinkState(attrs.Name, up)
-		}
-	}
-}
-
-// runLinkPoller is the subscribe-failure fallback: poll tracked link
-// state at 1 s. pollTrackedLinks performs no netlink queries while no
-// instance tracks an interface.
-func (m *Manager) runLinkPoller() {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-m.watcherStop:
-			return
-		case <-ticker.C:
-			m.pollTrackedLinks()
-		}
-	}
-}
-
-// pollTrackedLinks queries link state once for each distinct tracked
-// interface and applies it to the tracking instances.
-func (m *Manager) pollTrackedLinks() {
-	m.mu.RLock()
-	tracked := make(map[string][]*vrrpInstance)
-	for _, vi := range m.instances {
-		if name := vi.trackedInterface(); name != "" {
-			tracked[name] = append(tracked[name], vi)
-		}
-	}
-	m.mu.RUnlock()
-	for name, vis := range tracked {
-		up, err := m.linkState(name)
-		down := err != nil || !up
-		for _, vi := range vis {
-			vi.setTrackDown(down)
-		}
-	}
-}
-
-// applyTrackedLinkState updates trackDown on every instance tracking
-// ifName. Takes only the manager read lock; setTrackDown takes the
-// per-instance lock (no reverse ordering exists — instances never take
-// m.mu).
-func (m *Manager) applyTrackedLinkState(ifName string, up bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	for _, vi := range m.instances {
-		if vi.trackedInterface() == ifName {
-			vi.setTrackDown(!up)
-		}
-	}
-}
-
-// seedTrackState initializes an instance's trackDown from current
-// kernel link state at instance create/update time (the netlink
-// subscription only streams future updates). A missing tracked
-// interface counts as down.
-func (m *Manager) seedTrackState(vi *vrrpInstance, trackIface string) {
-	if trackIface == "" {
-		vi.setTrackDown(false)
-		return
-	}
-	up, err := m.linkState(trackIface)
-	if err != nil {
-		slog.Warn("vrrp: tracked interface lookup failed, treating as down",
-			"key", vi.key(), "track_interface", trackIface, "err", err)
-		vi.setTrackDown(true)
-		return
-	}
-	vi.setTrackDown(!up)
-}
-
-// netlinkLinkState is the production linkState seam: report whether the
-// named link is operationally up.
-func netlinkLinkState(name string) (bool, error) {
-	link, err := netlink.LinkByName(name)
-	if err != nil {
-		return false, err
-	}
-	return linkAttrsUp(link.Attrs()), nil
-}
-
-// linkAttrsUp interprets link operational state. OperUnknown is common
-// on virtual devices that report no carrier state — fall back to the
-// IFF_UP admin flag there.
-func linkAttrsUp(attrs *netlink.LinkAttrs) bool {
-	switch attrs.OperState {
-	case netlink.OperUp:
-		return true
-	case netlink.OperUnknown:
-		return attrs.Flags&net.FlagUp != 0
-	default:
-		return false
-	}
 }
 
 // ResignRG forces all VRRP instances for the given redundancy group
@@ -750,36 +602,36 @@ func openAfPacketReceiver(ifIndex int) (int, error) {
 	//
 	// Jump offsets (Jt/Jf) are relative to the NEXT instruction.
 	filter := []unix.SockFilter{
-		{Code: 0x28, K: 12},                     //  0: ldh [12] — ethertype
+		{Code: 0x28, K: 12},                    //  0: ldh [12] — ethertype
 		{Code: 0x15, Jt: 7, Jf: 0, K: 0x0800},  //  1: jeq 0x0800 → 9 (check_ipv4)
 		{Code: 0x15, Jt: 10, Jf: 0, K: 0x86DD}, //  2: jeq 0x86DD → 13 (check_ipv6)
 		{Code: 0x15, Jt: 1, Jf: 0, K: 0x8100},  //  3: jeq 0x8100 → 5 (check_vlan); else reject
-		{Code: 0x06, K: 0},                      //  4: ret reject
+		{Code: 0x06, K: 0},                     //  4: ret reject
 		// check_vlan:
-		{Code: 0x28, K: 16},                     //  5: ldh [16] — real ethertype
+		{Code: 0x28, K: 16},                    //  5: ldh [16] — real ethertype
 		{Code: 0x15, Jt: 10, Jf: 0, K: 0x0800}, //  6: jeq 0x0800 → 17 (check_ipv4_vlan)
 		{Code: 0x15, Jt: 13, Jf: 0, K: 0x86DD}, //  7: jeq 0x86DD → 21 (check_ipv6_vlan)
-		{Code: 0x06, K: 0},                      //  8: ret reject
+		{Code: 0x06, K: 0},                     //  8: ret reject
 		// check_ipv4: proto at 14+9=23
-		{Code: 0x30, K: 23},                     //  9: ldb [23]
-		{Code: 0x15, Jt: 0, Jf: 1, K: 112},     // 10: jeq 112 → accept; else reject
-		{Code: 0x06, K: 0xFFFFFFFF},             // 11: ret accept
-		{Code: 0x06, K: 0},                      // 12: ret reject
+		{Code: 0x30, K: 23},                //  9: ldb [23]
+		{Code: 0x15, Jt: 0, Jf: 1, K: 112}, // 10: jeq 112 → accept; else reject
+		{Code: 0x06, K: 0xFFFFFFFF},        // 11: ret accept
+		{Code: 0x06, K: 0},                 // 12: ret reject
 		// check_ipv6: next-header at 14+6=20
-		{Code: 0x30, K: 20},                     // 13: ldb [20]
-		{Code: 0x15, Jt: 0, Jf: 1, K: 112},     // 14: jeq 112 → accept; else reject
-		{Code: 0x06, K: 0xFFFFFFFF},             // 15: ret accept
-		{Code: 0x06, K: 0},                      // 16: ret reject
+		{Code: 0x30, K: 20},                // 13: ldb [20]
+		{Code: 0x15, Jt: 0, Jf: 1, K: 112}, // 14: jeq 112 → accept; else reject
+		{Code: 0x06, K: 0xFFFFFFFF},        // 15: ret accept
+		{Code: 0x06, K: 0},                 // 16: ret reject
 		// check_ipv4_vlan: proto at 18+9=27
-		{Code: 0x30, K: 27},                     // 17: ldb [27]
-		{Code: 0x15, Jt: 0, Jf: 1, K: 112},     // 18: jeq 112 → accept; else reject
-		{Code: 0x06, K: 0xFFFFFFFF},             // 19: ret accept
-		{Code: 0x06, K: 0},                      // 20: ret reject
+		{Code: 0x30, K: 27},                // 17: ldb [27]
+		{Code: 0x15, Jt: 0, Jf: 1, K: 112}, // 18: jeq 112 → accept; else reject
+		{Code: 0x06, K: 0xFFFFFFFF},        // 19: ret accept
+		{Code: 0x06, K: 0},                 // 20: ret reject
 		// check_ipv6_vlan: next-header at 18+6=24
-		{Code: 0x30, K: 24},                     // 21: ldb [24]
-		{Code: 0x15, Jt: 0, Jf: 1, K: 112},     // 22: jeq 112 → accept; else reject
-		{Code: 0x06, K: 0xFFFFFFFF},             // 23: ret accept
-		{Code: 0x06, K: 0},                      // 24: ret reject
+		{Code: 0x30, K: 24},                // 21: ldb [24]
+		{Code: 0x15, Jt: 0, Jf: 1, K: 112}, // 22: jeq 112 → accept; else reject
+		{Code: 0x06, K: 0xFFFFFFFF},        // 23: ret accept
+		{Code: 0x06, K: 0},                 // 24: ret reject
 	}
 	if err := unix.SetsockoptSockFprog(fd, unix.SOL_SOCKET, unix.SO_ATTACH_FILTER, &unix.SockFprog{
 		Len:    uint16(len(filter)),

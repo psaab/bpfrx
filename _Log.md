@@ -1,5 +1,23 @@
 # Action Log
 
+## 2026-06-18 — #2006 group pkg/vrrp into manager/instance/packet/track
+
+- **Timestamp**: 2026-06-18
+- **Action**: Pure code-motion refactor of the flat `pkg/vrrp` package
+  (same package, no import-path or visibility change). Extracted the
+  interface-tracking cluster (#1814) into a new `track.go`: the
+  per-instance effective-priority primitives `getPriority`,
+  `setTrackDown`, `trackedInterface` (from `instance.go`) and the
+  manager-side singleton link-watcher / poller `ensureLinkWatcherLocked`,
+  `runLinkWatcher`, `runLinkPoller`, `pollTrackedLinks`,
+  `applyTrackedLinkState`, `seedTrackState`, `netlinkLinkState`,
+  `linkAttrsUp` (from `manager.go`). Function bodies moved byte-identical
+  (verified by awk-extract diff). gofmt re-aligned a few struct-comment
+  columns in the touched files (cosmetic, tokens unchanged). README
+  updated with a file-layout section and track.go references.
+- **File(s)**: pkg/vrrp/track.go (new), pkg/vrrp/instance.go,
+  pkg/vrrp/manager.go, pkg/vrrp/README.md, _Log.md
+
 ## 2026-06-17 — #1956 startup naming helper coverage
 
 - **Timestamp**: 2026-06-17

@@ -27,6 +27,22 @@ This is the package that drives chassis-cluster failover.
 - `ResignRG(rgID int)` — `manager.go`. Forces this node out of master
   for the given redundancy group ID.
 
+## File layout
+
+- `manager.go` — redundancy-group coordinator: `Manager`, instance
+  diff/lifecycle, sync-hold, RG force/resign helpers, socket helpers.
+- `instance.go` — per-instance state machine, RX receivers, advert
+  send, VIP add/remove, GARP/NA.
+- `packet.go` — VRRPv3 advert parser/builder + IPv4/IPv6 checksums.
+- `track.go` — interface tracking (#1814): the per-instance
+  effective-priority primitives (`getPriority`, `setTrackDown`,
+  `trackedInterface`) and the manager-side singleton link-watcher /
+  poller (`runLinkWatcher`, `runLinkPoller`, `pollTrackedLinks`,
+  `applyTrackedLinkState`, `seedTrackState`, `netlinkLinkState`,
+  `linkAttrsUp`).
+- `vrrp.go` — `Instance` config type plus `CollectInstances` /
+  `CollectRethInstances` config extraction.
+
 ## Callers
 
 `pkg/daemon`, `pkg/api`, `pkg/grpcapi`, `pkg/cli`.
@@ -57,7 +73,7 @@ present. Multiple `track-interface` statements in one group are rejected
 at commit (strict) and first-wins with a warning on the tolerant
 load/peer-sync compile paths.
 
-- **Effective priority** — `getPriority()` (`instance.go`) returns
+- **Effective priority** — `getPriority()` (`track.go`) returns
   `Priority - TrackPriorityCost` clamped to **[1, 254]** while the
   tracked link is down. Tracking can never fabricate the priority-0
   resignation sentinel (priority 0 passes through unchanged), and
@@ -65,7 +81,7 @@ load/peer-sync compile paths.
   while still holding the address invites duplicate-IP conflicts; the
   compiler warns instead.
 - **Link watcher** — ONE singleton goroutine per Manager
-  (`runLinkWatcher`, `manager.go`), started lazily when an instance
+  (`runLinkWatcher`, `track.go`), started lazily when an instance
   tracks an interface; latched under the manager mutex so
   `UpdateInstances` churn never spawns a second. Subscribes via
   `netlink.LinkSubscribe` with done-channel cancellation closed from
