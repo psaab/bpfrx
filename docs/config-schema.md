@@ -321,3 +321,76 @@ reserved for whole-dataplane selection where a rewrite shim
     fails at commit; `allow-duplicates` is an explicit presence-only flag.
   Pure schema hardening — no runtime behavior change. Regression coverage:
   `pkg/config/schema_validate_2008_test.go`.
+
+### #1979 — flow / flow-export NUM_WIDTH commit-time validation (Layer B)
+
+Layer A (#1977, `pkg/dataplane/userspace/flow.go` `buildFlowSnapshot` /
+`buildFlowExportSnapshot`) coerces every flow/flow-export wire field into its
+Rust `u16`/`u32`/`u64` range at the snapshot boundary so an out-of-range value
+cannot abort the `apply_snapshot` decode (the #1961 failure class). Layer B
+adds the commit-time companion: reject the bad value at `commit check` with a
+clear range error instead of silently coercing it. The bounds equal the
+Layer-A caps EXACTLY (a value Layer B accepts is one Layer A leaves unchanged;
+a value Layer B rejects is one Layer A would have coerced).
+
+Layer B uses BOTH commit-check validation families, chosen per leaf by whether
+the value sits in a single typed slot:
+
+- **Typed `setSchema` leaves (Tiers 1+2 — the declarative `#1319` path):**
+  - `services flow-monitoring version9 template <t> flow-active-timeout` /
+    `flow-inactive-timeout` — `ValidateInteger(0, maxWireU32)` (Rust u32
+    ActiveTimeout/InactiveTimeout). The parallel `version-ipfix` pair is typed
+    identically for UX parity even though it does NOT reach the wire
+    (`buildFlowExportSnapshot` reads `fm.Version9` only).
+  - `security flow tcp-session` expanded to a container: `established-timeout`
+    (Rust u64 TCPSessionTimeout), `initial-timeout`, `closing-timeout`,
+    `time-wait-timeout` (config-only, not wire-reaching) all
+    `ValidateInteger(0, MaxDurationSeconds)` — the Duration-overflow ceiling,
+    NOT u64-max, because the helper multiplies `secs*1e9` unchecked; plus the
+    presence flags `no-syn-check`, `no-syn-check-in-tunnel`,
+    `rst-invalidate-session` declared presence-only for completion parity.
+  - `security flow udp-session` / `icmp-session` expanded to a container with a
+    typed `timeout` (`ValidateInteger(0, MaxDurationSeconds)`).
+  - `forwarding-options sampling instance <i> input rate` —
+    `ValidateInteger(0, maxWireU32)`. **0 is accepted** (the documented
+    `0 = sample all` sentinel, `types_system.go`; Layer A normalizes
+    `rate<=0 -> 1`) — EXACT Layer-A agreement, rejecting only the
+    decode-aborting `>u32max`.
+  - `forwarding-options sampling … output flow-server <addr> port` —
+    `ValidateInteger(1, maxWireU16)` (Rust u16 CollectorPort; Layer A skips a
+    server whose port is `<1` or `>65535`). `flow-server` keeps `args:1` for
+    the collector address and gains a children map (the typed `port` plus the
+    other compiler-read children `version9-template`, `version9 { template }`,
+    `source-address`), which deliberately flips a BARE `flow-server <addr>`
+    from single-value REPLACE to named-container APPEND — benign: a bare
+    no-port server compiles `Port==0` and the snapshot builder skips it, and
+    real multi-collector configs already take the container path.
+
+- **Compiler AST pre-walk (Tier 3 — the `validateVRRPTrackInterfaceAST`
+  precedent):** `security flow tcp-mss {ipsec-vpn|gre-in|gre-out|all-tcp}`
+  stays OPAQUE in `setSchema` because its MSS value can live in EITHER the
+  kind node's flat `Keys[1]` (`gre-in 1400`) OR a hierarchical `mss` sub-child
+  (`gre-in { mss 1360; }`) — a dual value-location the declarative walker
+  cannot express. `validateTCPMSSRanges` (`compiler_security.go`, wired into
+  `compileExpanded` next to the VRRP pre-walk) range-checks the
+  COMPILER-SELECTED token via `selectMSSToken` (shared with `parseMSSValue` so
+  it can never diverge: `mss` child first, flat fallback) against
+  `[0, 65535]`. A mixed shape `gre-in 70000 { mss 1360; }` therefore PASSES
+  (the compiler selects the child 1360 and discards the flat 70000).
+
+**Strict vs lenient (boot/HA safety):** Tiers 1+2 get the strict/lenient split
+for free (a typed-leaf `SchemaValidate` violation hard-rejects on the strict
+commit path and downgrades to a warning on `Store.Load` / `Store.SyncApply`,
+`configstore.compileTreeLenient`). Tier 3's `validateTCPMSSRanges` takes a
+`lenient` flag (the `lenientTCPMSSRange` `compileOpt`, set by
+`CompileConfigLenient` / `CompileConfigForNodeLenient`) exactly like the VRRP
+validator: strict commit hard-rejects, but the tolerant load/peer-sync path
+WARNS and lets Layer A coerce, so an upgraded node loading a legacy
+`tcp-mss gre-in 70000` (a value an older binary accepted) still boots.
+
+Pure commit-time validation — no Layer A / Rust / wire change. Regression
+coverage: `pkg/config/schema_validate_flow_numwidth_test.go` (Tiers 1+2 via
+`SchemaValidate`), `pkg/config/compiler_tcp_mss_range_test.go` (Tier 3 via
+`CompileConfig`, dual-shape + mixed-shape precedence + strict/lenient), and
+`pkg/dataplane/userspace/flow_numwidth_agreement_test.go` (the directional
+Layer-A agreement property).
