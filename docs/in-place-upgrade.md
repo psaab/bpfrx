@@ -223,7 +223,8 @@ is exec-free and has no staleness hazard:
 
 ```sh
 if incoming_predates_hardened_layout "$2" \
-   && { [ -L "$CURRENT" ] || [ -e "$CURRENT" ] || [ -e "$DROPIN" ]; }; then
+   && { [ -L "$CURRENT" ] || [ -e "$CURRENT" ] \
+        || [ -L "$DROPIN" ] || [ -e "$DROPIN" ]; }; then
     repoint_owned_sbin_to_staged   # 1. owned sbin -> staged (idempotent)
     remove_runtime_dropin          # 2. drop-in + daemon-reload (idempotent)
     rm -f "$CURRENT"               # 3. delete current LAST (idempotent, #1997)
@@ -231,9 +232,11 @@ fi
 # incoming_predates_hardened_layout: dpkg --compare-versions "$2" lt FLOOR
 ```
 
-The `|| [ -e "$DROPIN" ]` arm is the #1997 crash-rerun fix: it lets a postrm
-RERUN re-enter the teardown to finish removing an orphaned drop-in even after
-`versions/current` is already gone.
+The `[ -L "$DROPIN" ] || [ -e "$DROPIN" ]` arm is the #1997 crash-rerun fix: it
+lets a postrm RERUN re-enter the teardown to finish removing an orphaned drop-in
+even after `versions/current` is already gone. Each artifact is probed with both
+`-L` and `-e` so a dangling symlink (which `-e` alone reports as absent) still
+trips the guard.
 
 `HARDENED_LAYOUT_FLOOR` is `0.0.4104` — the `.deb` version
 (`0.0.<commit-count>+g<sha>`, `Makefile` `DEB_VERSION`) of commit `ef9525e70`,

@@ -244,8 +244,16 @@ case "$1" in
         # the drop-in BEFORE deleting current so the destructive `rm` is the
         # LAST step, shrinking the single-run orphan window to nothing for the
         # common case (the guard still covers the residual rerun case).
+        #
+        # Each artifact is probed with BOTH -L and -e (Copilot): a bare -e is
+        # FALSE for a dangling symlink, so a drop-in (or current) that is a
+        # broken symlink would otherwise slip past the guard and skip the
+        # cleanup. -L catches the symlink-exists case; -e catches a regular
+        # file / resolvable link — together they mean "the artifact is present
+        # in any form" and the teardown's rm -f handles either.
         if incoming_predates_hardened_layout "$2" && \
-           { [ -L "$CURRENT" ] || [ -e "$CURRENT" ] || [ -e "$DROPIN" ]; }; then
+           { [ -L "$CURRENT" ] || [ -e "$CURRENT" ] || \
+             [ -L "$DROPIN" ] || [ -e "$DROPIN" ]; }; then
             echo "xpf: #1964 downgrade to a pre-hardened package — removing the" \
                  "versioned-runtime drop-in and repointing sbin back to staged." >&2
             # 1. repoint OWNED sbin links back to staged (atomic) so the

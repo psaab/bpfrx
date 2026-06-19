@@ -393,10 +393,16 @@ patched_postrm_oldbug() {
     # by replacing the whole teardown if-body with the historical sequence.
     # We do it with awk so the rewrite is robust to comment churn: between the
     # guard `if incoming_predates_hardened_layout` line and its closing `fi`,
-    # emit the legacy body.
+    # emit the legacy body. SYNTH count is exported via a sentinel line so the
+    # caller can FAIL LOUD if the pattern matched nothing (else the meta-test
+    # would be tautological — synthesizing the SAME fixed script and "proving"
+    # nothing). The guard-line match tolerates trailing whitespace after the
+    # line-continuation backslash (Copilot): `&&[[:space:]]*\\[[:space:]]*$`
+    # rather than anchoring `\\$` hard at EOL, so a stray trailing space does
+    # not silently skip the rewrite.
     awk '
-      BEGIN { in_block = 0 }
-      /^[[:space:]]*if incoming_predates_hardened_layout "\$2" && \\$/ {
+      BEGIN { in_block = 0; synth = 0 }
+      /^[[:space:]]*if incoming_predates_hardened_layout "\$2" &&[[:space:]]*\\[[:space:]]*$/ {
         print "        if incoming_predates_hardened_layout \"$2\" && \\"
         print "           { [ -L \"$CURRENT\" ] || [ -e \"$CURRENT\" ]; }; then"
         print "            repoint_owned_sbin_to_staged"
@@ -404,6 +410,7 @@ patched_postrm_oldbug() {
         print "            remove_runtime_dropin"
         print "        fi"
         in_block = 1
+        synth = 1
         next
       }
       in_block == 1 {
@@ -412,13 +419,23 @@ patched_postrm_oldbug() {
         next
       }
       { print }
-    ' "$ROOT/postrm" > "$ROOT/postrm.oldbug"
+      END { print "# __OLDBUG_SYNTH__=" synth > "/dev/stderr" }
+    ' "$ROOT/postrm" > "$ROOT/postrm.oldbug" 2> "$ROOT/postrm.oldbug.synth"
     chmod +x "$ROOT/postrm.oldbug"
 }
 
 scenario_oldbug_leaves_orphan_proves_nontautology() {
     build_crashed_midteardown
     patched_postrm_oldbug
+    # The awk MUST have matched the guard line and rewritten the block. If it
+    # synthesized nothing (pattern drift / trailing-ws regression), the
+    # "old-bug" script would be identical to the fixed one and the proof would
+    # be vacuous — fail loud.
+    grep -q '__OLDBUG_SYNTH__=1' "$ROOT/postrm.oldbug.synth" || {
+        echo "FAIL(non-tautology): awk did not match the guard line — no old-bug script was synthesized (the proof would be vacuous)"; exit 1; }
+    # And the synthesized script must actually DIFFER from the fixed one.
+    cmp -s "$ROOT/postrm" "$ROOT/postrm.oldbug" && {
+        echo "FAIL(non-tautology): synthesized old-bug postrm is identical to the fixed postrm"; exit 1; } || true
     # Sanity: the synthesized old script must be valid shell.
     sh -n "$ROOT/postrm.oldbug" || { echo "FAIL: synthesized old-bug postrm has a syntax error"; exit 1; }
     "$ROOT/postrm.oldbug" upgrade "0.0.4000+gbbbb"
