@@ -1,6 +1,6 @@
 # #1979 — Flow/flow-export NUM_WIDTH: commit-time ValidateInteger (Layer B of #1977)
 
-**Status:** PLAN DRAFT v1.1 (research; folds Claude SMR r1; Codex+AGY r1 pending)
+**Status:** PLAN DRAFT v1.2 (research; folds Claude SMR r1 + strict/lenient finding; Codex+AGY r1 pending)
 **Base:** origin/master (`a75c970d8`, post-#1977/#1978 Layer A merge)
 **Issue:** #1979 (follow-up to #1977 / PR #1978)
 **Branch:** research/1979-layerb-validate
@@ -330,6 +330,37 @@ choosing per-leaf by whether the value sits in a normal single slot:
 Both run before the snapshot is built, so both reject the bad value at `commit
 check` before Layer A's coercion would ever see it.
 
+### Strict vs lenient — the MANDATORY boot/HA-safety split (verified)
+
+xpf already separates the operator-commit path from the tolerant ingress path,
+and Layer B MUST respect it (this is non-negotiable — getting it wrong
+blackout-boots an upgraded node):
+
+- **Strict** (`compileTreeStrict`, store.go:446 — every operator commit /
+  `commit check` / `xpfd check-config`): SchemaValidate violations
+  **hard-reject**. This is where Layer B's clear error fires.
+- **Lenient** (`compileTreeLenient`, store.go:475 — `Store.Load` on boot and
+  `Store.SyncApply` HA peer-sync): SchemaValidate violations **downgrade to a
+  `slog.Warn` and continue** (store.go:488-490). Rationale (store.go:463-470): a
+  persisted/peer config authored by an OLDER binary (before this leaf's range
+  was typed) may carry a value the new gate rejects; hard-failing would
+  blackout-boot the node or alarm-loop HA config sync. The operator's next
+  strict commit rejects it loudly. Same doctrine as #1798/#1814/#1319.
+
+**Consequence per mechanism:**
+- **Tiers 1+2 (schema-walker typed leaves):** get the strict/lenient split
+  **for free** — `schemaValidateExpandedTree` is already downgraded on the
+  lenient path (store.go:488). No extra work; a legacy `flow-active-timeout -1`
+  warns-and-loads on boot/sync, rejects on the next commit. ✓
+- **Tier 3 (`validateTCPMSSRanges` compiler pre-walk):** MUST take a `lenient`
+  flag exactly like `validateVRRPTrackInterfaceAST(…, lenient)` and, on the
+  lenient path, **warn (and let Layer A coerce) instead of returning an error**.
+  This is precisely why the VRRP precedent is the right model — it already
+  carries the strict/lenient mechanism (`opts.lenientVRRPTrackDuplicates`,
+  compiler.go:225). A naive hard-reject `validateTCPMSSRanges` would blackout an
+  upgraded node loading a legacy `tcp-mss gre-in 70000`. **This is a first-class
+  acceptance requirement, pinned by a lenient-load test.**
+
 ---
 
 ## 6. Hidden invariants / things that must not regress
@@ -402,10 +433,17 @@ change.
    to BOTH `SchemaValidate` and the Layer-A coercion, asserting: every value
    Layer B accepts is left unchanged by Layer A; every value Layer B rejects is
    one Layer A coerces. (Pins the §3 contract.)
-6. **Regression:** existing `TestTCPMSSHierarchical`, parser_security_test.go
+6. **Strict-vs-lenient (boot/HA safety — MANDATORY):** an out-of-range value
+   (e.g. `tcp-mss gre-in 70000`, `flow-active-timeout -1`) (a) HARD-REJECTS on
+   the strict path (`compileTreeStrict` / `commit check`) with a clear error,
+   AND (b) WARN-LOADS (does NOT error) on the lenient path
+   (`compileTreeLenient` — `Store.Load` / `Store.SyncApply`). For Tier 3 this
+   requires `validateTCPMSSRanges` to honor the `lenient` flag like the VRRP
+   validator; a test must prove a legacy out-of-range MSS config still loads.
+7. **Regression:** existing `TestTCPMSSHierarchical`, parser_security_test.go
    MSS tests, dual_ast_differential_test.go, schema_validate_* suites all pass.
-7. `go build ./...` + `go test ./pkg/config/... ./pkg/cli/...` green.
-8. **No smoke needed** (commit-time-only, no dataplane/wire change) — but a
+8. `go build ./...` + `go test ./pkg/config/... ./pkg/cli/...` green.
+9. **No smoke needed** (commit-time-only, no dataplane/wire change) — but a
    `commit check` on docs/ha-cluster.conf + test/incus/xpf-test.conf (both carry
    real tcp-mss configs) must pass unchanged.
 
