@@ -394,6 +394,18 @@ supports protocol + port ranges. `rule.inactive` is the policy-scheduler result
 published by the Go daemon; inactive scheduled rules are skipped before any
 match side effects or counters.
 
+#### Static NAT zone scoping (`nat/static_nat.rs`)
+
+A static 1:1 rule-set may carry a `from zone <name>` scope. The dataplane
+enforces it on the inbound (DNAT) direction only: `match_dnat` skips an entry
+whose `from_zone` does not exactly match the ingress zone name. The outbound
+(SNAT) direction is intentionally not zone-filtered — the internal-IP match is
+sufficient since the host originates the traffic regardless of ingress zone.
+Because a typo'd or undefined zone produces a rule that silently matches no
+inbound traffic, the Go compiler validates static-NAT `from-zone` references
+against the defined zones at commit and warns on an undefined zone (mirroring
+the source-NAT zone validation). Junos static NAT has no `to` clause.
+
 #### Slow Path (`slowpath.rs`)
 
 A TUN device (`xpf-usp0`) for packets that need kernel processing:
@@ -423,6 +435,7 @@ ConfigSnapshot {
     policies:        [{rule_id, from_zone, to_zone, src/dst, apps, action,
                        scheduler_name, inactive}]
     source_nat_rules:[{from_zone, to_zone, src/dst, interface/pool metadata}]
+    static_nat_rules:[{name, from_zone, external_ip, internal_ip}]
     flow:            {allow_dns_reply, allow_embedded_icmp}
     map_pins:        {xsk_map, heartbeat_map, sessions_map}
     ha_groups:       [{rg_id, active, watchdog_ts}]
