@@ -28,6 +28,12 @@ impl Clone for Nat64Prefix {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Nat64State {
     pub(crate) prefixes: Vec<Nat64Prefix>,
+    /// Mirrors the global `security nat natv6v4 no-v6-frag-header` option. When
+    /// set, the IPv6->IPv4 translator emits a fragmentable (DF=0) atomic IPv4
+    /// packet per RFC 7915 5.1 rather than the default DF=1 framing. The option
+    /// is configured once at the natv6v4 level; the Go side replicates it onto
+    /// every NAT64 rule snapshot, so any rule carrying it enables it globally.
+    pub(crate) no_v6_frag_header: bool,
 }
 
 /// Reverse-direction state stored with NAT64 sessions so IPv4 replies can be
@@ -42,6 +48,10 @@ impl Nat64State {
     /// Build from config snapshot NAT64 rules.
     pub(crate) fn from_snapshots(snaps: &[NAT64RuleSnapshot]) -> Self {
         let mut prefixes = Vec::with_capacity(snaps.len());
+        // The natv6v4 no-v6-frag-header option is global; the Go side stamps it
+        // onto every rule snapshot. Treat the state as enabled if any rule
+        // carries the flag (they all carry the same value in practice).
+        let no_v6_frag_header = snaps.iter().any(|s| s.no_v6_frag_header);
         for snap in snaps {
             if snap.prefix.is_empty() {
                 continue;
@@ -71,7 +81,10 @@ impl Nat64State {
                 pool_index: AtomicUsize::new(0),
             });
         }
-        Self { prefixes }
+        Self {
+            prefixes,
+            no_v6_frag_header,
+        }
     }
 
     /// Returns true if any NAT64 prefixes are configured.
@@ -133,11 +146,21 @@ use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
 /// Input: `packet` starts at L3 (IPv6 header), not Ethernet.
 /// `snat_v4` = pool IPv4 source, `dst_v4` = extracted destination.
 ///
+/// `no_v6_frag_header` mirrors the `security nat natv6v4 no-v6-frag-header`
+/// option. When `false` (the default) the translated IPv4 packet is emitted
+/// with the Don't-Fragment (DF) flag set, marking it as a non-fragmentable
+/// atomic datagram. When `true`, the DF flag is cleared so the packet remains
+/// fragmentable in transit, per RFC 7915 5.1 (no IPv6 Fragment Header present
+/// on the source packet => the translator MAY emit a fragmentable IPv4 packet
+/// instead of an atomic one). The Identification field stays zero in both
+/// cases since these are non-fragmented translations.
+///
 /// Returns the translated IPv4 packet (L3 only, no Ethernet header).
 pub(crate) fn translate_v6_to_v4(
     packet: &[u8],
     snat_v4: Ipv4Addr,
     dst_v4: Ipv4Addr,
+    no_v6_frag_header: bool,
 ) -> Option<Vec<u8>> {
     if packet.len() < 40 {
         return None;
@@ -174,9 +197,14 @@ pub(crate) fn translate_v6_to_v4(
     out[0] = 0x45; // version=4, IHL=5
     out[1] = traffic_class; // DSCP/ECN copied from IPv6 traffic class (RFC 7915 §5)
     out[2..4].copy_from_slice(&ipv4_total_len.to_be_bytes());
-    // ID = 0, flags = DF (0x4000)
+    // Identification = 0 (this is a non-fragmented translation). The flags +
+    // fragment-offset word carries the DF bit. Default: DF=1 (0x4000), marking
+    // the packet as a non-fragmentable atomic datagram. With no-v6-frag-header
+    // set, clear DF (0x0000) so the translated packet remains fragmentable in
+    // transit per RFC 7915 5.1.
     out[4..6].copy_from_slice(&0u16.to_be_bytes()); // identification
-    out[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // flags + frag offset: DF
+    let frag_word: u16 = if no_v6_frag_header { 0x0000 } else { 0x4000 };
+    out[6..8].copy_from_slice(&frag_word.to_be_bytes()); // flags + frag offset
     out[8] = new_ttl;
     out[9] = ipv4_protocol;
     // Checksum = 0 (computed below)
@@ -454,11 +482,12 @@ pub(crate) fn build_nat64_v6_to_v4_frame(
     eth_dst: [u8; 6],
     eth_src: [u8; 6],
     vlan_id: u16,
+    no_v6_frag_header: bool,
 ) -> Option<Vec<u8>> {
     // Find L3 offset.
     let l3 = frame_l3_offset(frame)?;
     let ipv6_packet = frame.get(l3..)?;
-    let ipv4_packet = translate_v6_to_v4(ipv6_packet, snat_v4, dst_v4)?;
+    let ipv4_packet = translate_v6_to_v4(ipv6_packet, snat_v4, dst_v4, no_v6_frag_header)?;
     let eth_len = if vlan_id > 0 { 18 } else { 14 };
     let total = eth_len + ipv4_packet.len();
     let mut out = vec![0u8; total];

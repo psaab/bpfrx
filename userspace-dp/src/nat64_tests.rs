@@ -10,6 +10,7 @@ fn well_known_prefix() -> NAT64RuleSnapshot {
         name: "nat64-wkp".to_string(),
         prefix: "64:ff9b::/96".to_string(),
         pool_addresses: vec!["198.51.100.1".to_string(), "198.51.100.2".to_string()],
+        no_v6_frag_header: false,
     }
 }
 
@@ -59,6 +60,7 @@ fn empty_pool_returns_none() {
         name: "no-pool".to_string(),
         prefix: "64:ff9b::/96".to_string(),
         pool_addresses: vec![],
+        no_v6_frag_header: false,
     }]);
     assert!(state.allocate_v4_source(0).is_none());
 }
@@ -69,6 +71,7 @@ fn invalid_prefix_length_ignored() {
         name: "bad".to_string(),
         prefix: "64:ff9b::/64".to_string(),
         pool_addresses: vec!["1.2.3.4".to_string()],
+        no_v6_frag_header: false,
     }]);
     assert!(!state.is_active());
 }
@@ -149,7 +152,7 @@ fn translate_v6_to_v4_tcp() {
     let dst_v4 = Ipv4Addr::new(198, 51, 100, 50);
 
     let ipv6_pkt = make_ipv6_tcp_packet(src_v6, dst_v6, 12345, 80, b"hello");
-    let ipv4_pkt = translate_v6_to_v4(&ipv6_pkt, snat_v4, dst_v4).expect("translate");
+    let ipv4_pkt = translate_v6_to_v4(&ipv6_pkt, snat_v4, dst_v4, false).expect("translate");
 
     // Verify IPv4 header.
     assert_eq!(ipv4_pkt[0], 0x45);
@@ -234,7 +237,7 @@ fn translate_v6_to_v4_udp() {
     let sum = checksum16_ipv6_pseudo(src_v6, dst_v6, PROTO_UDP, &pkt[40..]);
     pkt[46..48].copy_from_slice(&sum.to_be_bytes());
 
-    let v4 = translate_v6_to_v4(&pkt, snat_v4, dst_v4).expect("translate");
+    let v4 = translate_v6_to_v4(&pkt, snat_v4, dst_v4, false).expect("translate");
     assert_eq!(v4[9], PROTO_UDP);
     assert_eq!(checksum16(&v4[..20]), 0);
 }
@@ -264,7 +267,7 @@ fn translate_v6_to_v4_icmp_echo() {
     let sum = checksum16_ipv6_pseudo(src_v6, dst_v6, PROTO_ICMPV6, &pkt[40..]);
     pkt[42..44].copy_from_slice(&sum.to_be_bytes());
 
-    let v4 = translate_v6_to_v4(&pkt, snat_v4, dst_v4).expect("translate");
+    let v4 = translate_v6_to_v4(&pkt, snat_v4, dst_v4, false).expect("translate");
     assert_eq!(v4[9], PROTO_ICMP);
     assert_eq!(v4[20], ICMP_ECHO_REQUEST); // type mapped
     assert_eq!(checksum16(&v4[..20]), 0);
@@ -322,6 +325,7 @@ fn packet_size_delta() {
         &pkt,
         Ipv4Addr::new(198, 51, 100, 1),
         Ipv4Addr::new(198, 51, 100, 50),
+        false,
     )
     .expect("translate");
     assert_eq!(v4.len(), 45); // 20 + 20 + 5
@@ -359,6 +363,7 @@ fn frame_building_v6_to_v4() {
         [0x11; 6],
         [0x22; 6],
         0,
+        false,
     )
     .expect("build");
 
@@ -401,7 +406,7 @@ fn ttl_expired_returns_none() {
                 // Need to recompute TCP checksum after modifying hop limit
                 // (hop limit isn't in pseudo-header so checksum is still valid).
     assert!(
-        translate_v6_to_v4(&pkt, Ipv4Addr::new(1, 2, 3, 4), Ipv4Addr::new(5, 6, 7, 8),).is_none()
+        translate_v6_to_v4(&pkt, Ipv4Addr::new(1, 2, 3, 4), Ipv4Addr::new(5, 6, 7, 8), false).is_none()
     );
 }
 
@@ -424,6 +429,7 @@ fn frame_building_v6_to_v4_with_vlan() {
         [0x11; 6],
         [0x22; 6],
         100, // VLAN 100
+        false,
     )
     .expect("build");
 
@@ -585,7 +591,7 @@ fn translate_v6_to_v4_copies_traffic_class() {
     let in_tc = ((ipv6_pkt[0] & 0x0f) << 4) | (ipv6_pkt[1] >> 4);
     assert_eq!(in_tc, TC_EF_ECT0);
 
-    let v4 = translate_v6_to_v4(&ipv6_pkt, snat_v4, dst_v4).expect("translate");
+    let v4 = translate_v6_to_v4(&ipv6_pkt, snat_v4, dst_v4, false).expect("translate");
 
     // IPv4 TOS byte must equal the source traffic class exactly (DSCP+ECN).
     assert_eq!(v4[1], TC_EF_ECT0, "IPv4 TOS must copy the IPv6 traffic class");
@@ -636,7 +642,7 @@ fn nat64_traffic_class_round_trips() {
     ipv6_pkt[0] = (ipv6_pkt[0] & 0xf0) | (TC_EF_ECT0 >> 4);
     ipv6_pkt[1] = (ipv6_pkt[1] & 0x0f) | ((TC_EF_ECT0 & 0x0f) << 4);
 
-    let v4 = translate_v6_to_v4(&ipv6_pkt, snat_v4, dst_v4).expect("v6->v4");
+    let v4 = translate_v6_to_v4(&ipv6_pkt, snat_v4, dst_v4, false).expect("v6->v4");
     assert_eq!(v4[1], TC_EF_ECT0);
 
     // Translate the IPv4 packet back to IPv6 (reply direction reuses the same
@@ -662,7 +668,7 @@ fn nat64_traffic_class_round_trips() {
     let v6_reverse_tc = ((v6_reverse[0] & 0x0f) << 4) | (v6_reverse[1] >> 4);
     assert_eq!(v6_reverse_tc, TC_EF_ECT0);
 
-    let v4_reverse = translate_v6_to_v4(&v6_reverse, server_v4, client_v4).expect("v6->v4");
+    let v4_reverse = translate_v6_to_v4(&v6_reverse, server_v4, client_v4, false).expect("v6->v4");
     assert_eq!(
         v4_reverse[1], TC_EF_ECT0,
         "traffic class must survive v4->v6->v4 round trip"
@@ -690,5 +696,128 @@ fn translate_v4_to_v6_total_len_below_ihl_returns_none() {
     assert!(
         translate_v4_to_v6(&packet, src_v6, dst_v6).is_none(),
         "total_len below the IPv4 header length must be rejected"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #2008 H16: `security nat natv6v4 no-v6-frag-header` must be honored by the
+// IPv6->IPv4 translator. Before the fix the option parsed, compiled into typed
+// config, and rode the snapshot wire but had NO runtime consumer: the global
+// flag never reached the dataplane snapshot and translate_v6_to_v4 always set
+// the Don't-Fragment (DF) bit. These tests pin the runtime enforcement: the
+// flags+frag-offset word (IPv4 header bytes 6-7) must be DF=1 (0x4000) by
+// default and DF=0 (0x0000) when the option is set, per RFC 7915 5.1.
+// ---------------------------------------------------------------------------
+
+/// Helper: read the IPv4 flags + fragment-offset word from a translated L3
+/// packet (bytes 6-7).
+fn ipv4_frag_word(pkt: &[u8]) -> u16 {
+    u16::from_be_bytes([pkt[6], pkt[7]])
+}
+
+#[test]
+fn translate_v6_to_v4_default_sets_df_bit() {
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(198, 51, 100, 50);
+
+    let ipv6_pkt = make_ipv6_tcp_packet(src_v6, dst_v6, 12345, 80, b"df");
+    let v4 = translate_v6_to_v4(&ipv6_pkt, snat_v4, dst_v4, false).expect("translate");
+
+    // Default (no-v6-frag-header NOT set): DF=1, no fragment offset.
+    assert_eq!(
+        ipv4_frag_word(&v4),
+        0x4000,
+        "default translation must set the DF bit (atomic, non-fragmentable)"
+    );
+    // Identification stays zero for non-fragmented translations.
+    assert_eq!(u16::from_be_bytes([v4[4], v4[5]]), 0);
+    // Header checksum must still verify.
+    assert_eq!(checksum16(&v4[..20]), 0, "IPv4 header checksum must verify");
+}
+
+#[test]
+fn translate_v6_to_v4_no_v6_frag_header_clears_df_bit() {
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(198, 51, 100, 50);
+
+    let ipv6_pkt = make_ipv6_tcp_packet(src_v6, dst_v6, 12345, 80, b"nofrag");
+    let v4 = translate_v6_to_v4(&ipv6_pkt, snat_v4, dst_v4, true).expect("translate");
+
+    // With no-v6-frag-header set: DF cleared so the packet stays fragmentable.
+    assert_eq!(
+        ipv4_frag_word(&v4),
+        0x0000,
+        "no-v6-frag-header must clear the DF bit (fragmentable, per RFC 7915 5.1)"
+    );
+    assert_eq!(u16::from_be_bytes([v4[4], v4[5]]), 0);
+    // The change must not break the IPv4 header checksum.
+    assert_eq!(checksum16(&v4[..20]), 0, "IPv4 header checksum must verify");
+
+    // Everything else (TTL, protocol, addresses, payload) must be unchanged
+    // relative to the default translation — only the DF bit (bytes 6-7) and
+    // the resulting IPv4 header checksum (bytes 10-11) differ.
+    let v4_default = translate_v6_to_v4(&ipv6_pkt, snat_v4, dst_v4, false).expect("translate");
+    assert_eq!(v4.len(), v4_default.len());
+    assert_eq!(v4[8], v4_default[8], "TTL unchanged");
+    assert_eq!(v4[9], v4_default[9], "protocol unchanged");
+    assert_eq!(&v4[12..20], &v4_default[12..20], "src/dst addresses unchanged");
+    assert_eq!(&v4[20..], &v4_default[20..], "L4 payload unchanged");
+    // The frag word is the only header field that should differ.
+    assert_ne!(
+        ipv4_frag_word(&v4),
+        ipv4_frag_word(&v4_default),
+        "frag word must differ between the two modes"
+    );
+}
+
+#[test]
+fn build_nat64_v6_to_v4_frame_honors_no_v6_frag_header() {
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
+
+    let pkt = make_ipv6_tcp_packet(src_v6, dst_v6, 12345, 80, b"frame");
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&[0xaa; 6]);
+    frame.extend_from_slice(&[0xbb; 6]);
+    frame.extend_from_slice(&0x86ddu16.to_be_bytes());
+    frame.extend_from_slice(&pkt);
+
+    // no_v6_frag_header = true: the inner IPv4 header (after the 14B Ethernet
+    // header) must carry DF=0.
+    let result = build_nat64_v6_to_v4_frame(
+        &frame,
+        Ipv4Addr::new(198, 51, 100, 1),
+        Ipv4Addr::new(198, 51, 100, 50),
+        [0x11; 6],
+        [0x22; 6],
+        0,
+        true,
+    )
+    .expect("build");
+    let ipv4 = &result[14..];
+    assert_eq!(
+        ipv4_frag_word(ipv4),
+        0x0000,
+        "frame builder must thread no-v6-frag-header into the IPv4 framing"
+    );
+}
+
+#[test]
+fn nat64_state_threads_no_v6_frag_header_from_snapshot() {
+    // The flag rides on the per-rule snapshot (the Go side stamps the global
+    // natv6v4 option onto every rule). from_snapshots must surface it.
+    let mut snap = well_known_prefix();
+    assert!(
+        !Nat64State::from_snapshots(&[snap.clone()]).no_v6_frag_header,
+        "default snapshot must leave no_v6_frag_header unset"
+    );
+    snap.no_v6_frag_header = true;
+    assert!(
+        Nat64State::from_snapshots(&[snap]).no_v6_frag_header,
+        "from_snapshots must surface the no_v6_frag_header flag"
     );
 }

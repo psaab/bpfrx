@@ -5520,6 +5520,7 @@ fn txn_nat64_refusal_at_cap_drops_translated_packet() {
         name: "nat64".to_string(),
         prefix: "64:ff9b::/96".to_string(),
         pool_addresses: vec!["172.16.80.50".to_string()],
+        no_v6_frag_header: false,
     }];
     let forwarding = build_forwarding_state(&snapshot);
     let ha_state = txn_ha_state();

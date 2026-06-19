@@ -627,6 +627,7 @@
   },
   "nat64_rule_snapshot": {
     "name": "",
+    "no_v6_frag_header": false,
     "pool_addresses": [],
     "prefix": ""
   },
