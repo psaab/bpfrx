@@ -94,6 +94,17 @@ audit-check:
 	}; \
 	echo "audit-check: refactoring-audit-current.txt is up to date"
 
+# Upgrade/install docs canary (#2001). Fails if either of the two
+# misleading upgrade-install doc phrasings reappears: "symlinks into the
+# staging path" in the install-layout doc (the live sbin links resolve
+# THROUGH versions/current after the #1964 seed, not into staging) or
+# the phantom symbol `manifest.Managed` (the managed-binary SSOT is the
+# unexported `managed` slice + All()/Names()/LockstepNames()). Standalone
+# by design — same posture as audit-check; NOT a dependency of `test`.
+.PHONY: docs-check
+docs-check:
+	bash scripts/docs/check-upgrade-docs.sh
+
 # Bake the distributable appliance image (#1879 Path C): one
 # offline-built bootable root disk (LATEST Ubuntu server cloudimg base
 # discovered at bake time — XPF_BASE_RELEASE pins; linux-generic

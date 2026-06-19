@@ -68,15 +68,44 @@ Pipeline (offline — the image is never booted to provision it):
    `sources.d/xpf.sources`), sysctls, `init_on_alloc=0` (via an
    `/etc/default/grub.d` drop-in — Ubuntu cloud images override
    `GRUB_CMDLINE_LINUX_DEFAULT` there), and `apt-get install ./xpf.deb`.
-   The package's `postinst` stages the binary set, creates the live
+   The package's `postinst` always stages the binary set into
+   `/usr/local/share/xpf/staged`, then sets up the live
    `/usr/local/sbin/{xpfd,cli,xpf-userspace-dp,xpf-day0-config}` symlinks
-   into the staging path, and enables `xpfd` + `xpf-day0-config` (so the
-   bake no longer hand-copies binaries/units or runs `systemctl enable
-   xpfd`). The incus-agent loader is still copied in and enabled
-   directly. A plain `apt upgrade xpf` only refreshes the staging path
-   and never restarts xpfd (`dh_installsystemd --no-stop-on-upgrade` + a
-   `needrestart` blacklist); the verified in-place cut-over is a separate
-   increment.
+   (normally through `versions/current`; see the fallback below) and
+   enables `xpfd` + `xpf-day0-config` (so the bake no longer hand-copies
+   binaries/units or runs `systemctl enable xpfd`). This bake is a FIRST
+   install, so it takes the seed path. The four postinst behaviors are
+   version-dependent (`$2` is the previously-configured version, empty on
+   first install) — the full split is:
+
+   - **First install (#1964 seed)** — `postinst` runs `xpfd seed-runtime`
+     (`pkg/upgrade/runtime`), which copies `staged/*` into
+     `/var/lib/xpf/versions/<ver>/`, points `versions/current -> <ver>`,
+     and repoints each `/usr/local/sbin/*` symlink THROUGH
+     `versions/current`. This is what a fresh bake gets: a real, immutable
+     rollback target before the first in-place upgrade can ever stop the
+     daemon. `versions/` is maintainer-script-managed runtime state, never
+     in dpkg's file list, so dpkg only ever writes `staged/`.
+   - **Direct-staged fallback** — if `seed-runtime` FAILS, `postinst`
+     prints a warning and points the sbin symlinks straight at
+     `staged/*` so the daemon still launches (degraded: the next upgrade
+     takes the legacy-migration `preinst` path). This is the ONLY case
+     where the live symlinks point into the staging path.
+   - **Clustered upgrade (stage-only)** — on an upgrade where
+     `/etc/xpf/node-id` is present, `postinst` STAGES only and does NOT
+     cut. A clustered node is cut solely by `xpfd upgrade --rolling`,
+     which sequences a controlled per-node drain so the cluster keeps
+     forwarding.
+   - **Standalone upgrade (verified cut-over)** — on an upgrade with no
+     `node-id`, `postinst` publishes the staged generation and invokes
+     `xpfd upgrade`, the verified, atomic, rollback-capable
+     STOP->FLIP->START cut to the staged version (kernel verify gate, then
+     a unit `ExecStart` pinned to the concrete version so a respawn never
+     resolves a mismatched helper).
+
+   The incus-agent loader is still copied in and enabled directly. The
+   verified in-place cut-over is owned by the package itself; see
+   `docs/in-place-upgrade.md` for the full state machine.
 5. `virt-sysprep` seal: machine-id, ssh host keys, logs, tmp files,
    bash history, package caches, random seed; `/etc/xpf` factory-empty.
 6. Export compressed qcow2 + incus metadata tarball + the per-version
@@ -220,11 +249,15 @@ replace the secondary, wait for session sync, fail over, replace the
 primary. Kernel + userspace move as one tested unit.
 
 In-place binary upgrades inside a running appliance follow the #1869
-ordering invariant: push the new `xpfd` to a temp path, run
-`xpfd verify-dataplane` there FIRST, and only on PASS stop/replace
-(see `test/incus/cluster-setup.sh deploy_vm()` for the reference
-implementation). A native .deb + `xpf-upgrade` wrapper is the M1a
-follow-up, not part of this deliverable.
+ordering invariant: copy the new binaries into a versioned runtime dir,
+run `xpfd verify-dataplane` against the staged version FIRST, and only on
+PASS stop/flip/start. The `xpf` package owns this verified cut path: a
+plain `apt install ./xpf.deb` (or `apt upgrade xpf`) stages the new
+binaries and then runs the cut itself — `xpfd upgrade` on a standalone
+node, or stage-only (cut deferred to `xpfd upgrade --rolling`) on a
+clustered node. There is no separate `xpf-upgrade` wrapper. See
+`docs/in-place-upgrade.md` for the full state machine and rollback
+contract (`test/incus/cluster-setup.sh deploy_vm()` exercises it).
 
 ## Recovery
 

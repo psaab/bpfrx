@@ -23,8 +23,15 @@ subcommand, the postinst HA-mode contract, and the dogfood deploy.
 
 The set of binaries the upgrade treats as a version-locked unit —
 `xpfd`, `cli`, `xpf-userspace-dp`, `xpf-day0-config` — is declared ONCE
-in `pkg/upgrade/manifest` (`manifest.Managed` / `manifest.Names()`).
-Everything that touches the set derives from it:
+in `pkg/upgrade/manifest`. The source list is the UNEXPORTED `managed`
+slice (`pkg/upgrade/manifest/manifest.go`) — `[]manifest.Binary`
+carrying `Name`, `StagedSrc`, and the `LockstepCut` class. It is
+unexported so no importer can mutate or reorder the SSOT at runtime;
+callers reach it only through the read-only accessors `manifest.All()`
+(a fresh `[]Binary` copy with metadata), `manifest.Names()` (basenames
+in SSOT order), and `manifest.LockstepNames()` (the
+`LockstepCut == true` subset). Everything that touches the set derives
+from it:
 
 - the cut machine (`pkg/upgrade`, `managedBins = manifest.Names()`) —
   copy, flip, verify, GC; its pre-start completeness check
@@ -41,8 +48,9 @@ A Go drift canary (`pkg/upgrade/manifest`'s
 `TestManagedBinaryDriftCanary`) parses every shell site and FAILS the
 suite if any list diverges from `manifest.Names()`, fail-closed (a site
 that drops its `BINS=` literal trips the canary rather than passing
-vacuously). To add a managed binary: edit `manifest.Managed`, then
-update each shell site to match — the canary tells you which ones.
+vacuously). To add a managed binary: add an entry to the `managed`
+slice in `pkg/upgrade/manifest/manifest.go`, then update each shell
+site to match — the canary tells you which ones.
 
 ## State machine (`pkg/upgrade`)
 
@@ -301,12 +309,12 @@ construction chokepoint for all three callers — REJECTS any unit other
 than the default (`xpfd`) with a clear error rather than silently
 dialing the default endpoint. `--unit` takes the BARE unit name; the
 systemd layer appends `.service` itself, so `--unit xpfd.service` is a
-non-default spelling and is rejected. Mapping a selected unit to its own
-control endpoint (so an alternate unit can be driven safely, e.g. for
-integration tests, with an explicit `--grpc-addr` override) is a tracked
-follow-up enhancement (#1983 §4.2 / a future `pkg/upgrade/clusterclient`)
-— not implemented here. This is a CLI control-TARGET + validation change
-only; it does not alter VRRP / session-sync / cluster RUNTIME behavior.
+non-default spelling and is rejected. The rejection IS the whole
+contract: an alternate unit's cluster control would have to dial that
+unit's OWN gRPC endpoint, and there is no unit→endpoint mapping, so a
+non-default `--unit` is refused rather than driving failover against the
+wrong daemon. This is a CLI control-TARGET + validation change only; it
+does not alter VRRP / session-sync / cluster RUNTIME behavior.
 
 ## Config compatibility envelope (D1, `pkg/configstore`)
 
