@@ -114,7 +114,7 @@ complete reachable set (Q1 resolved). The config surface to validate is:
 |---|---|---|---|---|---|
 | 1 | `services flow-monitoring version9 template <t> flow-active-timeout <n>` | ActiveTimeout (u32) | schema_system.go:434 | `args:1, children:nil` (value slot exists) | **1** |
 | 2 | `… version9 template <t> flow-inactive-timeout <n>` | InactiveTimeout (u32) | schema_system.go:435 | `args:1, children:nil` | **1** |
-| 3 | `security flow tcp-session established-timeout <n>` (+ initial/closing/time-wait — see §4a) | TCPSessionTimeout (u64) | schema_security.go:177 `tcp-session` | **opaque `children:nil`** | **2** |
+| 3 | `security flow tcp-session established-timeout <n>` (+ `initial-timeout`/`closing-timeout`/`time-wait-timeout` — see §4a) | TCPSessionTimeout (u64) | schema_security.go:177 `tcp-session` | **opaque `children:nil`** | **2** |
 | 4 | `security flow udp-session timeout <n>` | UDPSessionTimeout (u64) | schema_security.go:178 `udp-session` | **opaque `children:nil`** | **2** |
 | 5 | `security flow icmp-session timeout <n>` | ICMPSessionTimeout (u64) | schema_security.go:179 `icmp-session` | **opaque `children:nil`** | **2** |
 | 6 | `forwarding-options sampling instance <i> input rate <n>` | SamplingRate (u32) | schema_routing.go:252 `input` | **opaque `children:nil`** | **2** |
@@ -540,9 +540,10 @@ blast radius minimal. Locked decisions (from Q3/Q4/Q5, see §11):
   (exact Layer-A mirror; rejects only the decode-aborting >u32max). Switch to
   `[1, u32max]` only if the user wants the stricter reject-0 UX (documented
   drift from `0 = sample all`). See Q3.
-- `tcp-session`: type **all four** timeouts (`established`/`initial`/`closing`/
-  `time-wait`) at `[0, MaxDurationSeconds]` (declaring them is required for
-  completion anyway; only `established-timeout` is wire-reaching).
+- `tcp-session`: type **all four** timeouts — `established-timeout`,
+  `initial-timeout`, `closing-timeout`, `time-wait-timeout` (FULL keys, AGY r2) —
+  at `[0, MaxDurationSeconds]` (declaring them is required for completion anyway;
+  only `established-timeout` is wire-reaching).
 - version-ipfix `flow-active/inactive-timeout`: **type them too** (UX parity;
   not wire-reaching).
 
