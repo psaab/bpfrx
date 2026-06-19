@@ -38,6 +38,16 @@ No `/etc/xpf/node-id`, no `em0`:
     dmz-host      10.0.30.101 (2001:559:8585:bf03::101)  — xpf-dmz bridge
 ```
 
+> **DUT isolation (#1992).** The `10.0.1.10` / `10.0.2.10` gateway IPs above
+> are static and identical on every standalone firewall, and the test hosts
+> default-route through them. Only ONE firewall may be attached to the
+> trust/untrust bridges at a time — a second firewall claims the same gateway
+> IPs and the hosts' gateway ARP flips nondeterministically, producing false
+> "stall" readings (this caused the #1961 misdiagnosis). `setup.sh`
+> create-vm/create-ct/deploy refuse to run while another firewall holds these
+> gateways (override: `XPF_FORCE_TEARDOWN_PEERS=1`). See the "DUT Isolation"
+> section of [`testing.md`](testing.md).
+
 ## HA cluster (`loss:xpf-userspace-fw0/fw1`)
 
 Different topology from the standalone VM above. Do NOT extrapolate the
