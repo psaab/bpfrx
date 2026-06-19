@@ -51,11 +51,14 @@ func TestVerifyFailCleanup_RecopiesOnRetry(t *testing.T) {
 	}
 
 	// Operator drops a CORRECTED staged binary under the SAME version and the
-	// verifier now passes. The retry must recopy and complete the cut.
+	// verifier now passes. Under #1981 Option B a corrected re-stage PUBLISHES
+	// a NEW generation; the retry re-resolves current-gen, recopies the
+	// corrected bytes, and completes the cut.
 	fs.verifyPass = true
 	// Mark staged content as "corrected" so we can confirm the version dir was
 	// recopied from the fresh staged bytes (not a leftover).
 	writeFakeBin(t, filepath.Join(cfg.StagedDir, "xpfd"), "binary-xpfd-corrected")
+	publishStagedGen(t, r) // re-publish the corrected staged set (postinst step).
 
 	if err := r.Run(Options{}); err != nil {
 		t.Fatalf("retry after corrected staged should succeed: %v", err)

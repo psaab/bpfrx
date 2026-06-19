@@ -15,6 +15,7 @@ import (
 	"github.com/psaab/xpf/pkg/fsatomic"
 	"github.com/psaab/xpf/pkg/upgrade/lock"
 	"github.com/psaab/xpf/pkg/upgrade/manifest"
+	"github.com/psaab/xpf/pkg/upgrade/stagedgen"
 )
 
 // lockHandle is the host-wide advisory lock surface used by the upgrade
@@ -29,12 +30,13 @@ var acquireUpgradeLock = func(subcommand, target string) (lockHandle, error) {
 
 // Default filesystem layout (plan §6.1). Overridable in Config for tests.
 const (
-	DefaultStagedDir   = "/usr/local/share/xpf/staged"
-	DefaultVersionsDir = "/var/lib/xpf/versions"
-	DefaultSbinDir     = "/usr/local/sbin"
-	DefaultConfigDBDir = "/etc/xpf/.configdb"
-	DefaultJournalPath = "/var/lib/xpf/upgrade.state"
-	DefaultUnit        = "xpfd"
+	DefaultStagedDir    = "/usr/local/share/xpf/staged"
+	DefaultVersionsDir  = "/var/lib/xpf/versions"
+	DefaultStagedGenDir = stagedgen.DefaultDir
+	DefaultSbinDir      = "/usr/local/sbin"
+	DefaultConfigDBDir  = "/etc/xpf/.configdb"
+	DefaultJournalPath  = "/var/lib/xpf/upgrade.state"
+	DefaultUnit         = "xpfd"
 
 	// currentLink is the bookkeeping pointer inside VersionsDir.
 	currentLink = "current"
@@ -93,10 +95,14 @@ type System interface {
 type Config struct {
 	StagedDir   string
 	VersionsDir string
-	SbinDir     string
-	ConfigDBDir string
-	JournalPath string
-	Unit        string
+	// StagedGenDir is the staged-generation root (#1981 Option B). The cut
+	// copies from staged-gen/<SourceGeneration>/ here, NEVER from live
+	// StagedDir, closing the dpkg-unpack torn-read window.
+	StagedGenDir string
+	SbinDir      string
+	ConfigDBDir  string
+	JournalPath  string
+	Unit         string
 
 	// DiskMarginBytes is the headroom required on /var beyond the staged
 	// size + DB snapshot size in PREFLIGHT.
@@ -119,6 +125,9 @@ func (c *Config) withDefaults() {
 	}
 	if c.VersionsDir == "" {
 		c.VersionsDir = DefaultVersionsDir
+	}
+	if c.StagedGenDir == "" {
+		c.StagedGenDir = DefaultStagedGenDir
 	}
 	if c.SbinDir == "" {
 		c.SbinDir = DefaultSbinDir
@@ -162,6 +171,37 @@ func (r *Runner) logf(format string, args ...any) { r.cfg.Logf(format, args...) 
 // versionDir returns the runtime dir for ver.
 func (r *Runner) versionDir(ver string) string {
 	return filepath.Join(r.cfg.VersionsDir, ver)
+}
+
+// stagedGenConfig builds the staged-generation surface (#1981 Option B) wired
+// to this runner's StagedDir + StagedGenDir + log sink.
+func (r *Runner) stagedGenConfig() stagedgen.Config {
+	return stagedgen.Config{
+		StagedDir: r.cfg.StagedDir,
+		Dir:       r.cfg.StagedGenDir,
+		Logf:      r.cfg.Logf,
+	}
+}
+
+// srcGenPath returns the path of the source-generation stamp inside
+// versions/<ver>/ (#1981 B-P3b OPT1). It lives INSIDE the version dir so GC
+// removes it with the dir (not a sibling dotfile).
+func (r *Runner) srcGenPath(ver string) string {
+	return filepath.Join(r.versionDir(ver), stagedgen.SrcGenFile)
+}
+
+// readSrcGen returns the source generation stamped into versions/<ver>/, or ""
+// if the stamp is absent (a pre-#1981 version dir, or one mid-copy). A read
+// error other than not-exist is reported.
+func (r *Runner) readSrcGen(ver string) (string, error) {
+	data, err := os.ReadFile(r.srcGenPath(ver))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
 }
 
 // partialDir returns the in-progress copy dir for ver.
@@ -220,6 +260,39 @@ func (r *Runner) saveJournal(j *Journal) error {
 		return fmt.Errorf("persist upgrade journal: %w", err)
 	}
 	return nil
+}
+
+// ReadJournalSourceGeneration returns the SourceGeneration recorded in the
+// upgrade journal at path, or "" if the journal is absent, unparsable, or has
+// no pinned generation. It is used by `xpfd publish-generation` to PROTECT a
+// crashed/resumable cut's pinned generation from the publish GC (the journal
+// is durable; the host-wide lock that would otherwise serialize the cut is NOT
+// held across a crash).
+//
+// Both a missing journal AND a malformed (unparsable) one return ("", nil): a
+// journal that does not parse cannot name a genid to protect, and this is a
+// best-effort GC-protection seam (the cut's own gc(j) protects its source from
+// the authoritative in-memory journal). Only a genuine READ error (I/O,
+// permission) surfaces — that is worth logging, and the caller treats it as
+// "no protection" without failing the publish. The returned genid is only ever
+// used as a GC-protection key, never as a path, so the caller need not
+// validate it.
+func ReadJournalSourceGeneration(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("read upgrade journal: %w", err)
+	}
+	j := &Journal{}
+	if uerr := json.Unmarshal(data, j); uerr != nil {
+		// A malformed journal names no genid to protect; degrade to "no
+		// protection" rather than surfacing an error a best-effort caller would
+		// only log-and-ignore.
+		return "", nil
+	}
+	return j.SourceGeneration, nil
 }
 
 // clearJournal removes the journal on terminal success.

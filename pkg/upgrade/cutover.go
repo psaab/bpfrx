@@ -7,6 +7,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/fsatomic"
 	"github.com/psaab/xpf/pkg/upgrade/manifest"
+	"github.com/psaab/xpf/pkg/upgrade/stagedgen"
 )
 
 // Options modify a single Run.
@@ -50,6 +51,80 @@ type Options struct {
 	// the deliberate first-cut path (e.g. seeding failed and the operator
 	// chose to proceed), never by the routine postinst/operator cut.
 	AllowNoRollbackFirstCut bool
+}
+
+// errNoSourceGeneration is the INIT sentinel for "no published staged
+// generation to cut from" (#1981 Option B). The caller refuses pre-PREFLIGHT
+// with no journal written and no DB snapshot taken.
+var errNoSourceGeneration = fmt.Errorf("no published staged generation")
+
+// resolveSource determines the VERSION-COMPARISON source and the source
+// generation a FRESH cut would pin (#1981 Option B). The returned dir is used
+// only to read the staged version (which keys the resume-vs-fresh decision);
+// the COPY itself reads j.SourceGeneration (pinned at INIT) — copyStaged
+// resolves that independently. The returned genid is what the INIT block pins
+// into j.SourceGeneration for a fresh cut.
+//
+// Resolution prefers the LATEST published generation (current-gen) for BOTH
+// fresh and resume, so that a newer apt install that PUBLISHED a new generation
+// is detected by the resume-vs-fresh version compare (a superseded cut then
+// recovers + starts fresh against the new generation) rather than silently
+// resuming the abandoned one. A same-version republish leaves the version
+// unchanged, so the resume-vs-fresh compare does NOT trip and the resume keeps
+// its ORIGINALLY-pinned generation (B-P3: a resume never switches sources
+// mid-cut — copyStaged still reads j.SourceGeneration).
+//
+//   - current-gen present: comparison source = current-gen dir; the genid a
+//     FRESH cut would pin = current-gen.
+//   - current-gen ABSENT but the journal pinned a generation that still exists
+//     (a resume whose generation has not been GC'd): comparison source = the
+//     pinned generation dir, so a resume is NOT blocked by a missing
+//     current-gen. genid = the pinned generation.
+//   - current-gen ABSENT, no pinned generation, but an already-COPIED journal:
+//     the pre-#1981 legacy in-flight case — comparison source = live staged/,
+//     genid = "" (copyStaged keeps reading live staged/). Back-compat so the
+//     runner never blocks recovery of an in-flight pre-B cut (plan §10 AGY r4).
+//   - current-gen ABSENT, fresh cut: errNoSourceGeneration (the caller refuses
+//     pre-PREFLIGHT — no journal, no DB snapshot).
+func (r *Runner) resolveSource(j *Journal) (genid, dir string, err error) {
+	sg := r.stagedGenConfig()
+
+	if j.SourceGeneration != "" && !stagedgen.ValidGenID(j.SourceGeneration) {
+		return "", "", fmt.Errorf("journal source generation %q is not a safe path segment",
+			j.SourceGeneration)
+	}
+
+	cur, rerr := sg.ResolveCurrent()
+	if rerr != nil {
+		return "", "", fmt.Errorf("resolve staged generation: %w", rerr)
+	}
+	if cur != "" {
+		// Latest published generation drives the version compare AND the
+		// fresh-INIT pin.
+		return cur, sg.GenDir(cur), nil
+	}
+
+	// No current-gen. Do not block a resume whose pinned generation still
+	// exists (defensive: it is protected from GC while journaled).
+	if j.SourceGeneration != "" {
+		d := sg.GenDir(j.SourceGeneration)
+		if fi, serr := os.Stat(d); serr == nil && fi.IsDir() {
+			return j.SourceGeneration, d, nil
+		}
+		// No %w-with-nil: the error is the same whether Stat failed or the path
+		// is not a directory — the pinned generation is unusable and there is no
+		// current-gen to fall back to.
+		return "", "", fmt.Errorf("pinned source generation %s missing or not a directory "+
+			"and no current-gen (re-run after re-publishing the staged set)", j.SourceGeneration)
+	}
+
+	// Pre-#1981 legacy in-flight journal that already copied from live staged/.
+	if j.State.atLeast(StateCopied) {
+		return "", r.cfg.StagedDir, nil
+	}
+
+	// Fresh cut with no published generation.
+	return "", "", errNoSourceGeneration
 }
 
 // Run executes (or resumes) the cut-over to the staged version. It is
@@ -109,11 +184,57 @@ func (r *Runner) Run(opts Options) (err error) {
 		return nil
 	}
 
-	// Identify the staged version. It keys versions/<ver> et al. on a fresh
-	// cut, so validate it as a safe single path segment BEFORE any path use
-	// (#1964 C1) — `git describe`-derived versions can carry a `/` (a
+	// Resolve the SOURCE the cut copies from (#1981 Option B). A B-aware cut
+	// reads a PINNED, immutable staged-gen/<genid>/ that dpkg is NOT rewriting,
+	// never live staged/. resolveSource returns:
+	//   - a non-empty srcGen + its directory when current-gen is present (a
+	//     fresh cut) or the journal already pinned a generation (a resume);
+	//   - ("", StagedDir, nil) for a pre-#1981 legacy in-flight journal that
+	//     was already copied from live staged/ — back-compat so a B-aware
+	//     runner never blocks recovery of an old cut (plan §10 AGY r4);
+	//   - noSrcGen for a fresh cut with NO published generation — the caller
+	//     refuses pre-PREFLIGHT (no journal, no DB snapshot).
+	srcGen, srcDir, srcErr := r.resolveSource(j)
+	if srcErr == errNoSourceGeneration {
+		// REFUSE-AT-INIT, no source generation: a fresh cut cannot proceed
+		// without a published staged-gen/current-gen. Refuse BEFORE any journal
+		// write or DB snapshot (Codex r1-#3 closed by construction). Clear any
+		// lingering on-disk journal from a just-completed resume-vs-fresh
+		// recovery so a re-run starts clean.
+		if cerr := r.clearJournal(); cerr != nil {
+			r.logf("upgrade: WARN clear stale journal on no-source refuse: %v", cerr)
+		}
+		return fmt.Errorf("refuse-before-PREFLIGHT: no published staged generation "+
+			"(%s/%s is absent); the package operation has not finished publishing the "+
+			"staged set, or the runtime needs seeding. Let `apt`/`dpkg` finish, run "+
+			"`xpfd publish-generation` (or `dpkg-reconfigure xpf`), then re-run the "+
+			"upgrade", r.cfg.StagedGenDir, stagedgen.CurrentGenLink)
+	}
+	if srcErr != nil {
+		return srcErr
+	}
+
+	// Re-pin a pre-#1981 legacy resume that has NOT yet copied (Codex r5-#4):
+	// a journal at STAGED/PREFLIGHT with an empty SourceGeneration was written
+	// by an old (pre-B) binary. If a generation is now published, adopt it as
+	// the pinned source (and persist) so copyStaged reads the pinned generation
+	// rather than falling back to live staged/. A State >= COPIED legacy
+	// journal already copied from live staged/, so it keeps the legacy source
+	// (its bytes are already on disk); only the not-yet-copied case is re-pinned.
+	if srcGen != "" && j.SourceGeneration == "" && j.State.atLeast(StateStaged) && !j.State.atLeast(StateCopied) {
+		r.logf("upgrade: re-pinning a pre-#1981 resume (state %s) to published generation %s", j.State, srcGen)
+		j.SourceGeneration = srcGen
+		if serr := r.saveJournal(j); serr != nil {
+			return fmt.Errorf("persist re-pinned source generation: %w", serr)
+		}
+	}
+
+	// Identify the staged version from the RESOLVED source (the pinned
+	// generation, never live staged/). It keys versions/<ver> et al. on a
+	// fresh cut, so validate it as a safe single path segment BEFORE any path
+	// use (#1964 C1) — `git describe`-derived versions can carry a `/` (a
 	// branch-named tag), which would otherwise escape VersionsDir.
-	stagedXpfd := filepath.Join(r.cfg.StagedDir, "xpfd")
+	stagedXpfd := filepath.Join(srcDir, "xpfd")
 	stagedVer, err := r.cfg.Sys.BinaryVersion(stagedXpfd)
 	if err != nil {
 		return fmt.Errorf("read staged version (%s): %w", stagedXpfd, err)
@@ -221,9 +342,53 @@ func (r *Runner) Run(opts Options) (err error) {
 				"the daemon offline with no recovery target. Seed the versioned runtime "+
 				"(xpfd seed-runtime), then re-run the upgrade", stagedVer)
 		}
+		// REFUSE-AT-INIT (#1981 B-P3b OPT1, Codex r5-#2 / r6): a same-version cut
+		// whose target version dir already EXISTS, is the LIVE current or the
+		// rollback target, and does NOT match this cut's source generation
+		// cannot be safely replaced (RemoveAll-ing a live/rollback dir mid-cut
+		// violates #1967). Refuse HERE, pre-PREFLIGHT, so no journal is persisted
+		// and no .dbsnap is taken — a re-run then starts fresh and re-resolves
+		// the source rather than RESUMING a journal that re-refuses forever.
+		//
+		// "Does not match" covers BOTH a different stamp AND an ABSENT stamp (a
+		// pre-#1981 live dir) when this cut pins a generation (srcGen != "").
+		// The previous `existingGen != ""` exclusion left the absent-stamp live
+		// case to the copyStaged backstop, which runs AFTER PREFLIGHT/.dbsnap and
+		// thus re-wedged on resume (Codex r6). A legacy cut (srcGen == "") over
+		// an unstamped live dir matches (existingGen == "" == srcGen) and is a
+		// true resume — not refused.
+		// `prev` was just read authoritatively from readCurrentVersion() above
+		// (errors handled), so it IS the live `current` version here (we hold
+		// the upgrade lock, so it cannot change under us). Use `prev` for the
+		// live/rollback test rather than re-reading via an error-discarding
+		// helper — that would return "" on a transient unreadable `current` and
+		// SKIP this guard, letting the run persist a journal + take a .dbsnap
+		// before refusing in copyStaged (re-introducing the wedge this guard
+		// prevents). `prev` is both the rollback target AND the live current
+		// here, so a single comparison covers both (Copilot r4).
+		if _, statErr := os.Stat(r.versionDir(stagedVer)); statErr == nil {
+			existingGen, gerr := r.readSrcGen(stagedVer)
+			if gerr == nil && existingGen != srcGen && stagedVer == prev {
+				if cerr := r.clearJournal(); cerr != nil {
+					r.logf("upgrade: WARN clear stale journal on live-dir-replace refuse: %v", cerr)
+				}
+				return fmt.Errorf("refuse-before-PREFLIGHT: cannot replace the live/rollback "+
+					"version dir %s (its bytes come from source generation %q but this cut pins "+
+					"%q); re-stage under a DISTINCT version tag, or `dpkg-reconfigure xpf` to "+
+					"realign the generation", r.versionDir(stagedVer), existingGen, srcGen)
+			}
+		}
 		j.TargetVersion = stagedVer
 		j.PreviousVersion = prev
 		j.StartedAtUnixNano = r.cfg.Sys.Now().UnixNano()
+		// Pin the source generation NOW (#1981 Option B, B-P3): the cut copies
+		// from staged-gen/<SourceGeneration>/ — the resolved DIRECTORY, never
+		// re-reading current-gen — so a concurrent publish that advances
+		// current-gen cannot redirect this in-flight cut. srcGen is "" only on
+		// the pre-#1981 legacy-staged fallback (no published generation exists
+		// yet on a freshly-seeded host whose seed predates B); in that case the
+		// copy reads live staged/, the documented one-hop bootstrap window.
+		j.SourceGeneration = srcGen
 		// Record the sanctioned-first-cut decision NOW (#1964 mechanism C,
 		// Codex r1): a no-previous cut is sanctioned only when the caller
 		// passes AllowNoRollbackFirstCut. Persisting it means a crash-resume
@@ -442,7 +607,10 @@ func (r *Runner) preflight(j *Journal) error {
 	}
 	r.removeAllPartials()
 
-	stagedSize, err := dirSize(r.cfg.StagedDir)
+	// Size the ACTUAL copy source (the pinned generation, #1981), not live
+	// staged/ — the cut copies the pinned generation into versions/<ver>
+	// (Codex r5-#4b).
+	stagedSize, err := dirSize(r.sourceDir(j))
 	if err != nil {
 		return fmt.Errorf("size staged: %w", err)
 	}
@@ -502,25 +670,115 @@ func (r *Runner) preflight(j *Journal) error {
 	return nil
 }
 
-// copyStaged copies staged/ -> .<ver>.partial/ then atomic-renames to
-// versions/<ver>/. Pure: leaves live untouched.
+// copyStaged copies the PINNED source generation
+// (staged-gen/<SourceGeneration>/, never live staged/) -> .<ver>.partial/ then
+// atomic-renames it to versions/<ver>/ and stamps the source generation into
+// versions/<ver>/.srcgen. Pure: leaves live untouched.
+//
+// Source resolution (#1981 Option B): the cut reads from the generation pinned
+// at INIT — a directory dpkg is NOT rewriting — so the copy is internally a
+// single generation by construction. j.SourceGeneration == "" is the
+// documented pre-B legacy/bootstrap fallback (copy from live staged/).
+//
+// Same-version destination identity + SAFE replacement (B-P3b OPT1): the
+// version-keyed skip is GENERATION-AWARE.
+//
+//   - An existing versions/<ver> whose .srcgen MATCHES this cut's source
+//     generation (or both are empty on the legacy same-cut resume) is a true
+//     resume — skip the copy.
+//   - Otherwise the existing dir's bytes may NOT match this cut's source —
+//     whether it carries a different .srcgen stamp OR no stamp at all (a stale
+//     pre-#1981 dir, or a legacy cut over a now-stamped dir). It must be
+//     REPLACED. If it is the live `current` or rollback (PreviousVersion)
+//     target, REFUSE (cannot safely RemoveAll a live version dir mid-cut,
+//     #1967) — though the primary refusal for a stamped-different live dir is
+//     pre-PREFLIGHT at INIT; this is the backstop for a resume and for the
+//     unstamped-live case. Otherwise it is a stale non-live dir and is safe to
+//     RemoveAll + recopy via the proven guarded-delete shape (Codex r5-#1: an
+//     unstamped STALE dir must be replaced, NOT reused — a pre-fix torn
+//     versions/<ver> must not be committed under a fresh generation).
+//
+// sourceDir returns the directory the cut copies FROM for journal j: the
+// pinned staged-gen/<SourceGeneration>/ (#1981 Option B) or, on the pre-B
+// legacy path (empty SourceGeneration), live staged/. It does NOT validate
+// existence; copyStaged stats it.
+func (r *Runner) sourceDir(j *Journal) string {
+	if j.SourceGeneration != "" {
+		return r.stagedGenConfig().GenDir(j.SourceGeneration)
+	}
+	return r.cfg.StagedDir
+}
+
 func (r *Runner) copyStaged(j *Journal) error {
 	ver := j.TargetVersion
 	dst := r.versionDir(ver)
 	partial := r.partialDir(ver)
 
-	// If the final dir already exists (resume after a crash post-rename),
-	// nothing to copy.
+	srcDir := r.cfg.StagedDir
+	if j.SourceGeneration != "" {
+		if !stagedgen.ValidGenID(j.SourceGeneration) {
+			return fmt.Errorf("journal source generation %q is not a safe path segment",
+				j.SourceGeneration)
+		}
+		srcDir = r.stagedGenConfig().GenDir(j.SourceGeneration)
+		fi, serr := os.Stat(srcDir)
+		if serr != nil {
+			return fmt.Errorf("pinned source generation %s missing at %s: %w "+
+				"(it may have been GC'd — re-run after re-publishing)", j.SourceGeneration, srcDir, serr)
+		}
+		if !fi.IsDir() {
+			return fmt.Errorf("pinned source generation %s at %s is not a directory",
+				j.SourceGeneration, srcDir)
+		}
+	}
+
+	// Resume / same-version replacement decision (B-P3b OPT1).
 	if _, err := os.Stat(dst); err == nil {
-		r.logf("upgrade: version dir %s already present; skipping copy", dst)
-		return nil
+		existingGen, gerr := r.readSrcGen(ver)
+		if gerr != nil {
+			return fmt.Errorf("read source-generation stamp of %s: %w", dst, gerr)
+		}
+		if existingGen == j.SourceGeneration {
+			// True resume (same generation, or both empty on the legacy path):
+			// the copy already landed; skip.
+			r.logf("upgrade: version dir %s already present (same source generation); skipping copy", dst)
+			return nil
+		}
+		// The existing dir does NOT match this cut's source (different stamp, or
+		// an unstamped pre-#1981 dir vs a stamped cut, or vice-versa). Replace
+		// it — unless it is live/rollback, in which case refuse (backstop; the
+		// stamped-different live case is already refused at INIT).
+		//
+		// FAIL-SAFE on an unreadable `current` (Copilot): if we cannot determine
+		// the live version, REFUSE rather than risk RemoveAll-ing a dir that may
+		// be live — an ignored read error here could destroy the running
+		// daemon's binaries.
+		cur, curErr := r.readCurrentVersion()
+		if curErr != nil {
+			return fmt.Errorf("refuse: cannot determine the live `current` version while "+
+				"deciding whether to replace %s (its source generation %q differs from this "+
+				"cut's %q); refusing to risk deleting a live version dir: %w",
+				dst, existingGen, j.SourceGeneration, curErr)
+		}
+		if ver == cur || ver == j.PreviousVersion {
+			return fmt.Errorf("refuse: cannot replace the live/rollback version dir %s "+
+				"(its bytes come from source generation %q but this cut pins %q); re-stage "+
+				"under a DISTINCT version tag, or `dpkg-reconfigure xpf` to realign the "+
+				"generation", dst, existingGen, j.SourceGeneration)
+		}
+		// Stale non-live: reuse the proven guarded delete, then recopy.
+		r.logf("upgrade: replacing stale version dir %s (source generation %q -> %q)",
+			dst, existingGen, j.SourceGeneration)
+		if rerr := r.removeStaleVersionDir(ver); rerr != nil {
+			return rerr
+		}
 	}
 
 	_ = os.RemoveAll(partial)
-	sum, err := copyTree(r.cfg.StagedDir, partial)
+	sum, err := copyTree(srcDir, partial)
 	if err != nil {
 		_ = os.RemoveAll(partial)
-		return fmt.Errorf("copy staged -> partial: %w", err)
+		return fmt.Errorf("copy source -> partial: %w", err)
 	}
 	// Re-checksum the partial to confirm the copy is intact.
 	verifySum, err := copyTreeChecksum(partial)
@@ -532,6 +790,17 @@ func (r *Runner) copyStaged(j *Journal) error {
 		_ = os.RemoveAll(partial)
 		return fmt.Errorf("partial checksum mismatch (copy corrupted)")
 	}
+	// Stamp the source generation INSIDE the partial (B-P3b OPT1) so it lands
+	// atomically with the version dir and GC removes it with the dir. Skip the
+	// stamp on the legacy path (empty SourceGeneration) so a pre-B dir stays
+	// stamp-free and is recognized as legacy on a later resume.
+	if j.SourceGeneration != "" {
+		stampPath := filepath.Join(partial, stagedgen.SrcGenFile)
+		if werr := fsatomic.WriteFileDurable(stampPath, []byte(j.SourceGeneration+"\n"), 0o644); werr != nil {
+			_ = os.RemoveAll(partial)
+			return fmt.Errorf("stamp source generation into partial: %w", werr)
+		}
+	}
 	if err := fsatomic.SyncDir(partial); err != nil {
 		_ = os.RemoveAll(partial)
 		return fmt.Errorf("fsync partial: %w", err)
@@ -542,6 +811,20 @@ func (r *Runner) copyStaged(j *Journal) error {
 	}
 	if err := fsatomic.SyncDir(r.cfg.VersionsDir); err != nil {
 		return fmt.Errorf("fsync versions dir after rename: %w", err)
+	}
+	return nil
+}
+
+// removeStaleVersionDir removes a NON-live versions/<ver> (B-P3b OPT1
+// guarded-replace) so a same-version-different-generation cut can recopy. The
+// caller has ALREADY proven ver is neither `current` nor PreviousVersion; this
+// mirrors the durable-unlink shape of cleanupFailedVerifyCopy.
+func (r *Runner) removeStaleVersionDir(ver string) error {
+	if err := os.RemoveAll(r.versionDir(ver)); err != nil {
+		return fmt.Errorf("remove stale version dir %s: %w", r.versionDir(ver), err)
+	}
+	if serr := partialSweepSyncDir(r.cfg.VersionsDir); serr != nil {
+		r.logf("upgrade: WARN fsync versions dir after stale-version removal: %v", serr)
 	}
 	return nil
 }
@@ -589,15 +872,19 @@ func (r *Runner) verify(j *Journal) error {
 //   - RESET the journal so the next run re-runs copyStaged. After a successful
 //     COPY the journal is at StateCopied; if we delete the dir but leave the
 //     journal there, the next run SKIPS copyStaged (state already >= Copied)
-//     and VERIFY then fails file-not-found. We rewind BELOW PREFLIGHT (to
-//     StateStaged) and clear the DB-snapshot fields so the retry re-runs
-//     preflight and takes a FRESH config-DB snapshot. Rewinding only to
-//     PREFLIGHT would reuse the snapshot taken at the original preflight; but
-//     the daemon stays LIVE across a verify failure (verify is pure), so an
-//     operator may change the config DB before the retry — a later rollback
-//     would then restore the stale pre-failure snapshot and silently lose
-//     those changes (Codex r1 High). The orphan snapshot is removed here; GC
-//     also sweeps orphan .dbsnap dotfiles defensively.
+//     and VERIFY then fails file-not-found. We rewind to INIT and clear the
+//     DB-snapshot fields AND the pinned SourceGeneration so the retry re-runs
+//     INIT (re-resolving staged-gen/current-gen), preflight (FRESH config-DB
+//     snapshot), and copyStaged. Rewinding only to PREFLIGHT would reuse the
+//     snapshot taken at the original preflight; but the daemon stays LIVE
+//     across a verify failure (verify is pure), so an operator may change the
+//     config DB before the retry — a later rollback would then restore the
+//     stale pre-failure snapshot and silently lose those changes (Codex r1
+//     High). Clearing SourceGeneration is the #1981 addition: an operator who
+//     re-stages CORRECTED bytes publishes a NEW generation, so the retry must
+//     re-resolve current-gen rather than re-cutting the failed generation.
+//     The orphan snapshot is removed here; GC also sweeps orphan .dbsnap
+//     dotfiles defensively.
 //
 // Best-effort: a cleanup failure is logged, never masking the verify error
 // the caller is about to return. If the dir was protected (active), we still
@@ -626,16 +913,19 @@ func (r *Runner) cleanupFailedVerifyCopy(j *Journal) {
 		r.logf("upgrade: removed copied version dir %s after verify failure "+
 			"(a retry will recopy from staged)", r.versionDir(ver))
 	}
-	// Guard (b): rewind the journal BELOW PREFLIGHT so the retry re-runs BOTH
-	// preflight (fresh DB snapshot) AND copyStaged, and PERSIST it FIRST
-	// (Codex r2): the journal rewrite is the durable source of truth. If we
-	// instead removed the snapshot before persisting, a crash (or a
-	// saveJournal failure) in between would leave the persisted journal at
-	// StateCopied / AdvancedStateFloor=true pointing at an already-removed
-	// snapshot — exactly the stale-snapshot bug this fix targets. By clearing
-	// the fields and persisting first, the on-disk journal never references a
-	// snapshot we are about to delete.
-	j.State = StateStaged
+	// Guard (b): rewind the journal to INIT so the retry re-runs INIT
+	// (re-resolving current-gen), preflight (fresh DB snapshot), AND
+	// copyStaged, and PERSIST it FIRST (Codex r2): the journal rewrite is the
+	// durable source of truth. If we instead removed the snapshot before
+	// persisting, a crash (or a saveJournal failure) in between would leave the
+	// persisted journal at StateCopied / AdvancedStateFloor=true pointing at an
+	// already-removed snapshot — exactly the stale-snapshot bug this fix
+	// targets. By clearing the fields and persisting first, the on-disk journal
+	// never references a snapshot we are about to delete. SourceGeneration is
+	// cleared too (#1981): a corrected re-stage publishes a new generation, so
+	// the retry must re-resolve current-gen, not re-cut the failed generation.
+	j.State = StateInit
+	j.SourceGeneration = ""
 	j.DBSnapshotPath = ""
 	j.AdvancedStateFloor = false
 	if err := r.saveJournal(j); err != nil {

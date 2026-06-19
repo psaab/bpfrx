@@ -25,6 +25,7 @@ patched_postrm() {
       -e "s#^SBIN=.*#SBIN=$ROOT/usr/local/sbin#" \
       -e "s#^VERSIONS=.*#VERSIONS=$ROOT/var/lib/xpf/versions#" \
       -e "s#^CURRENT=.*#CURRENT=\"\$VERSIONS/current\"#" \
+      -e "s#^STAGED_GEN=.*#STAGED_GEN=$ROOT/var/lib/xpf/staged-gen#" \
       -e "s#^DROPIN=.*#DROPIN=$ROOT/etc/systemd/system/xpfd.service.d/10-xpf-version.conf#" \
       -e "s#\\[ -d /run/systemd/system \\]#false#" \
       "$POSTRM" > "$ROOT/postrm"
@@ -38,6 +39,7 @@ run_scenario() {
     SBIN="$ROOT/usr/local/sbin"
     VERSIONS="$ROOT/var/lib/xpf/versions"
     CURRENT="$VERSIONS/current"
+    STAGED_GEN="$ROOT/var/lib/xpf/staged-gen"
     DROPIN="$ROOT/etc/systemd/system/xpfd.service.d/10-xpf-version.conf"
     BINS="xpfd cli xpf-userspace-dp xpf-day0-config"
     patched_postrm
@@ -75,6 +77,10 @@ EOF
         ln -sf "$CURRENT/$b" "$SBIN/$b"
     done
     echo "[Service]" > "$DROPIN"
+    # #1981 staged-generation tree (a published generation + current-gen).
+    mkdir -p "$STAGED_GEN/00000000000000000001-aabbccddeeff0011"
+    echo "bin" > "$STAGED_GEN/00000000000000000001-aabbccddeeff0011/xpfd"
+    ln -sf "00000000000000000001-aabbccddeeff0011" "$STAGED_GEN/current-gen"
 }
 
 # Replace staged/xpfd with a PRE-#1964 binary (no seed-runtime support).
@@ -104,7 +110,7 @@ scenario_remove_keeps_versions() {
 }
 
 # purge removes the through-current sbin links, the runtime drop-in (#1967),
-# AND the versions/ tree.
+# the versions/ tree, AND the #1981 staged-gen/ tree.
 scenario_purge_removes_versions() {
     build_hardened "1.0.0"
     "$ROOT/postrm" purge
@@ -112,7 +118,37 @@ scenario_purge_removes_versions() {
         [ -L "$SBIN/$b" ] && { echo "FAIL: sbin $b not removed"; exit 1; } || true
     done
     [ -e "$VERSIONS" ] && { echo "FAIL: versions/ not removed on purge"; exit 1; } || true
+    [ -e "$STAGED_GEN" ] && { echo "FAIL: staged-gen/ not removed on purge"; exit 1; } || true
     [ -e "$DROPIN" ] && { echo "FAIL: drop-in not removed on purge"; exit 1; } || true
+}
+
+# #1981 B-P6: a downgrade to a package BELOW the staged-gen floor (0.0.4200) —
+# including a post-#1964 (>= 0.0.4104) but pre-#1981 package, which keeps the
+# #1964 versioned-runtime layout intact — must remove staged-gen/.
+scenario_downgrade_removes_staged_gen_below_floor() {
+    build_hardened "1.0.0"
+    # Post-#1964 but pre-#1981 ($2 in [4104, 4200)): the #1964 layout survives,
+    # but staged-gen/ must be removed.
+    "$ROOT/postrm" upgrade "0.0.4150"
+    [ -e "$STAGED_GEN" ] && { echo "FAIL: staged-gen/ not removed on a pre-#1981 downgrade"; exit 1; } || true
+    # The #1964 layout is untouched (above the 0.0.4104 floor).
+    [ -L "$CURRENT" ] || { echo "FAIL: #1964 current wrongly deleted on a post-#1964 downgrade"; exit 1; }
+    [ -e "$DROPIN" ] || { echo "FAIL: #1964 drop-in wrongly removed on a post-#1964 downgrade"; exit 1; }
+}
+
+# A hardened->hardened downgrade at or above the staged-gen floor keeps
+# staged-gen/ (the incoming package manages it).
+scenario_downgrade_keeps_staged_gen_at_floor() {
+    build_hardened "1.0.0"
+    "$ROOT/postrm" upgrade "0.0.4200"
+    [ -d "$STAGED_GEN" ] || { echo "FAIL: staged-gen/ removed on an at-floor (>=#1981) downgrade"; exit 1; }
+}
+
+# An empty/unparsable $2 leaves staged-gen/ intact (safe-on-ambiguity).
+scenario_downgrade_empty_version_keeps_staged_gen() {
+    build_hardened "1.0.0"
+    "$ROOT/postrm" upgrade ""
+    [ -d "$STAGED_GEN" ] || { echo "FAIL: staged-gen/ removed on empty incoming version"; exit 1; }
 }
 
 # remove with a NON-empty .service.d (a foreign drop-in) removes only OUR
@@ -318,4 +354,7 @@ run_scenario upgrade_unparsable_version_survives
 run_scenario downgrade_below_floor_no_layout_noop
 run_scenario remove_skips_foreign_link
 run_scenario remove_legacy_links
+run_scenario downgrade_removes_staged_gen_below_floor
+run_scenario downgrade_keeps_staged_gen_at_floor
+run_scenario downgrade_empty_version_keeps_staged_gen
 echo "ALL POSTRM SCENARIOS PASSED"

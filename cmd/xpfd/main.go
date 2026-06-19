@@ -108,6 +108,18 @@ func main() {
 		return
 	}
 
+	// #1981 Option B: `xpfd publish-generation` copies the dpkg-staged binary
+	// set into an immutable staged-gen/<genid>/ and repoints current-gen, so a
+	// later cut reads a whole, single-generation source dpkg is not rewriting
+	// (closing the dpkg-unpack vs operator-cut torn-read race). The postinst
+	// runs it after a complete unpack before the cut; an operator runs it as
+	// the deferred-publish recovery verb (when the postinst deferred the
+	// publish because the upgrade lock was busy) before `xpfd upgrade`.
+	if len(os.Args) > 1 && os.Args[1] == "publish-generation" {
+		runPublishGenerationSubcommand(os.Args[2:])
+		return
+	}
+
 	// #1864 deploy-time pre-flight: run the kernel BPF verifier against
 	// the shim object EMBEDDED IN THIS BINARY without touching any
 	// production state (anonymous maps, no pins, no attach, nothing

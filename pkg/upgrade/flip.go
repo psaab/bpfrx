@@ -388,6 +388,19 @@ func (r *Runner) gc(j *Journal) error {
 		r.logf("upgrade: gc removing orphan DB snapshot %s", n)
 		_ = os.RemoveAll(filepath.Join(r.cfg.VersionsDir, n))
 	}
+
+	// GC the staged-generation root too (#1981 Option B): keep current-gen +
+	// 1 prior, protecting any generation THIS cut still references (its pinned
+	// SourceGeneration) so a commit/preflight GC cannot delete the source a
+	// resumable cut is reading (the GC-vs-resume race). Best-effort: a
+	// staged-gen GC failure is logged, never failing the cut.
+	protectedGens := map[string]bool{}
+	if j.SourceGeneration != "" {
+		protectedGens[j.SourceGeneration] = true
+	}
+	if sgErr := r.stagedGenConfig().GC(protectedGens); sgErr != nil {
+		r.logf("upgrade: WARN staged-gen gc failed: %v", sgErr)
+	}
 	return nil
 }
 

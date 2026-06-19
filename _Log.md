@@ -5976,3 +5976,53 @@ top.
 - **File(s)**: pkg/upgrade/cluster_cli.go, pkg/upgrade/rolling.go,
   cmd/xpfd/upgrade_kernel.go, pkg/upgrade/cluster_cli_test.go,
   docs/in-place-upgrade.md
+
+## 2026-06-18 — #1981 Option B immutable versioned staging
+- **Timestamp**: 2026-06-18
+- **Action**: Add pkg/upgrade/stagedgen — Publish/ResolveCurrent/GC/RemoveAll for staged-gen/<genid> + current-gen, durable copy + atomic symlink. Foundation for #1981 Option B.
+- **File(s)**: pkg/upgrade/stagedgen/stagedgen.go, pkg/upgrade/stagedgen/fsutil.go, pkg/upgrade/stagedgen/stagedgen_test.go
+- **Timestamp**: 2026-06-18
+- **Action**: Wire stagedgen into the cut: Journal.SourceGeneration, resolveSource (pin genid at INIT, refuse if no published gen), copyStaged reads pinned generation + B-P3b OPT1 (.srcgen stamp, genid-aware skip, refuse-or-guarded-replace), GC staged-gen protecting journal gen, verify-fail cleanup re-resolves current-gen.
+- **File(s)**: pkg/upgrade/state.go, pkg/upgrade/runner.go, pkg/upgrade/cutover.go, pkg/upgrade/flip.go, pkg/upgrade/runner_test.go, pkg/upgrade/verify_cleanup_test.go
+- **Timestamp**: 2026-06-18
+- **Action**: Add `xpfd publish-generation` verb (lock-taking, GC; deferred-publish recovery) + register in main. Seed publishes initial generation on first install. Wire --staged-gen-dir flags through upgrade/seed-runtime.
+- **File(s)**: cmd/xpfd/publish_generation.go, cmd/xpfd/main.go, cmd/xpfd/upgrade.go, cmd/xpfd/seed_runtime.go, pkg/upgrade/runtime/seed.go, pkg/upgrade/runtime/seed_test.go
+- **Timestamp**: 2026-06-18
+- **Action**: debian postinst publishes the staged generation after unpack before the cut (gates the cut on publish success/deferral); postrm removes staged-gen/ on purge + pre-B downgrade. rules unchanged (dpkg owns only staged/).
+- **File(s)**: debian/xpf.postinst, debian/xpf.postrm
+- **Timestamp**: 2026-06-18
+- **Action**: Add #1981 cut-level regression tests (torn-source pin + counter-factual, no-source refusal, same-version recopy/refuse-on-live B-P3b, GC-vs-resume protection, aborted-unpack no-wedge, resume keeps pinned gen).
+- **File(s)**: pkg/upgrade/stagedgen_cut_test.go
+- **Timestamp**: 2026-06-18
+- **Action**: docs/in-place-upgrade.md — replace the dpkg-vs-operator caveat with the CLOSED-race contract (immutable versioned staging section: publish, pinned read, refuse-no-source, GC N=2, B-P3b OPT1, crash-safety, deferred-publish recovery, disk budget, one-time bootstrap caveat).
+- **File(s)**: docs/in-place-upgrade.md
+- **Timestamp**: 2026-06-18
+- **Action**: SMR self-review fix: resolveSource must read the version-comparison source from current-gen (latest published), not the pinned old generation, so a new-version republish supersedes an abandoned cut. Added superseded-resume regression test.
+- **File(s)**: pkg/upgrade/cutover.go, pkg/upgrade/stagedgen_cut_test.go
+- **Timestamp**: 2026-06-18
+- **Action**: Address Codex r5 MERGE-NEEDS-MAJOR (5 findings): (1) unstamped STALE version dir now guarded-replaced not skipped; (2) live/rollback B-P3b refusal moved to INIT pre-PREFLIGHT (no journal/dbsnap/wedge); (3) publish-generation GC protects the on-disk journal's pinned generation (new ReadJournalSourceGeneration); (4) pre-#1981 pre-copy resume re-pinned to current-gen + preflight sizes the pinned source; (5) postrm staged-gen teardown gets its own #1981 floor (0.0.4200). Added 4 regression tests.
+- **File(s)**: pkg/upgrade/cutover.go, pkg/upgrade/runner.go, cmd/xpfd/publish_generation.go, debian/xpf.postrm, pkg/upgrade/stagedgen_cut_test.go
+- **Timestamp**: 2026-06-18
+- **Action**: Address Copilot review (6 findings): split %w-with-nil Stat errors (resolveSource + copyStaged); fail-safe refuse on unreadable `current` in copyStaged replacement; GC protected (journal) generations are now ADDITIVE (don't consume the retention window) — current-gen counts in the window; seed runs staged-gen GC after publish. Added GC-window test.
+- **File(s)**: pkg/upgrade/cutover.go, pkg/upgrade/stagedgen/stagedgen.go, pkg/upgrade/stagedgen/stagedgen_test.go, pkg/upgrade/runtime/seed.go
+- **Timestamp**: 2026-06-18
+- **Action**: Address Codex r6 (1 MAJOR + minors): INIT pre-PREFLIGHT refusal now covers the UNSTAMPED-live same-version case (existingGen != srcGen, gated on dir existence) so it no longer falls to the post-PREFLIGHT backstop and re-wedges; doc updated for the #1981 staged-gen floor + additive-GC; postrm-test.sh covers the staged-gen floor (purge + pre-#1981 downgrade removes, at-floor/empty keeps).
+- **File(s)**: pkg/upgrade/cutover.go, pkg/upgrade/stagedgen_cut_test.go, docs/in-place-upgrade.md, test/debian/postrm-test.sh
+- **Timestamp**: 2026-06-18
+- **Action**: Address Copilot 2nd-review new findings: ReadJournalSourceGeneration now returns ("",nil) on a malformed journal (matches the best-effort docstring); stagedgen GC sort adds a genid name tie-breaker for deterministic retention on coarse-mtime ties.
+- **File(s)**: pkg/upgrade/runner.go, pkg/upgrade/stagedgen/stagedgen.go
+- **Timestamp**: 2026-06-18
+- **Action**: Address Codex r3 + Copilot 3rd review (GC current-gen protection): GC now resolves current-gen EXPLICITLY and protects it additively (never reaped even if not newest/mtime-skewed); orders by genid NAME (mtime-independent, deterministic); SKIPS non-ValidGenID stray dirs (no slot consumption, no deletion). Added 2 GC tests.
+- **File(s)**: pkg/upgrade/stagedgen/stagedgen.go, pkg/upgrade/stagedgen/stagedgen_test.go
+- **Timestamp**: 2026-06-18
+- **Action**: Address Codex r4 MERGE-NEEDS-MINOR (doc-only): in-place-upgrade.md no longer says current-gen "counts toward the window" (now additive) and no longer calls genid "monotonic" (wall-clock UnixNano, treated as a GC ordering hint; correctness never depends on genid order).
+- **File(s)**: docs/in-place-upgrade.md
+- **Timestamp**: 2026-06-18
+- **Action**: Address Copilot r4 (2 code findings): INIT B-P3b refusal uses authoritative `prev` (drops the error-discarding mustReadCurrentVersion which could skip the guard on a transient unreadable current → wedge); removed now-dead mustReadCurrentVersion. ResolveCurrent rejects a current-gen symlink target with path components (../<genid> escape) before base-naming. Added path-escape test.
+- **File(s)**: pkg/upgrade/cutover.go, pkg/upgrade/runner.go, pkg/upgrade/stagedgen/stagedgen.go, pkg/upgrade/stagedgen/stagedgen_test.go
+- **Timestamp**: 2026-06-18
+- **Action**: Address Codex r5 minor (comment-only): GenID doc comment no longer says "monotonic" — wall-clock UnixNano, GC ordering hint, correctness independent of genid order.
+- **File(s)**: pkg/upgrade/stagedgen/stagedgen.go
+- **Timestamp**: 2026-06-18
+- **Action**: Soften GC "chronological" comments to "usually chronological (wall-clock; NTP step can reorder, correctness independent)" for consistency with the GenID comment — comment-only.
+- **File(s)**: pkg/upgrade/stagedgen/stagedgen.go
