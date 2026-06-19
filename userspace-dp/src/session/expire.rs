@@ -176,9 +176,9 @@ impl SessionTable {
                     // Case 4: still alive — long-timeout (>= 256s) case
                     // or a session re-scheduled to exactly this tick.
                     // Re-bucket at the new absolute target tick. The
-                    // entry was just read via `self.sessions.get(&key)`
-                    // immediately above with no intervening mutation,
-                    // so `get_mut(&key)` is a hard invariant — use
+                    // entry was just read by key immediately above with
+                    // no intervening mutation, so the matching mutable
+                    // lookup is a hard invariant — use
                     // `expect` instead of `if let Some` so an invariant
                     // violation surfaces loudly instead of silently
                     // pushing a stale-tick wheel entry (Copilot review).
