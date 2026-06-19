@@ -1,7 +1,14 @@
 # #1979 — Flow/flow-export NUM_WIDTH: commit-time ValidateInteger (Layer B of #1977)
 
 **Status:** PLAN v2 (research; folds Claude SMR r1 + AGY r1 PLAN-NEEDS-MINOR + Codex r1 PLAN-NEEDS-MAJOR). Awaiting r2 reverify.
-**Base:** origin/master (`a75c970d8`, post-#1977/#1978 Layer A merge)
+**Base:** origin/master (`a75c970d8`, post-#1977/#1978 Layer A merge). NOTE:
+master has since advanced (e.g. `86435d4a1`) in unrelated subsystems (ipsec,
+snmp, flowexport — NOT pkg/config schema), shifting some LINE numbers below
+(`tcp-session`/`tcp-mss` are now ~schema_security.go:218-221; the VRRP pre-walk
+is ~compiler.go:260). All SYMBOLIC references (node names, function names,
+`parseMSSValue`/`validateVRRPTrackInterfaceAST`/`SetFlowTimeout` stub) are
+canonical and stable; /engineer should resolve line numbers freshly against the
+then-current master. No schema-package conflict exists with the moved commits.
 **Issue:** #1979 (follow-up to #1977 / PR #1978)
 **Branch:** research/1979-layerb-validate
 **Mode:** /research — STOP at PLAN-READY/PLAN-KILL; no production code, no PR.
