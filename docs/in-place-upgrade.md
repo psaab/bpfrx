@@ -407,9 +407,15 @@ window for ALL FOUR managed binaries:
   transactions) runs `xpfd publish-generation`: it copies the staged set
   into an immutable `staged-gen/<genid>/` (via `.partial` + atomic rename
   + dir-fsync) and atomically repoints a `staged-gen/current-gen` symlink
-  (temp-symlink + rename, never `ln -sf`). `<genid>` is a monotonic
-  nanosecond timestamp + random suffix, so a same-version reinstall gets
-  a distinct generation.
+  (temp-symlink + rename, never `ln -sf`). `<genid>` is a zero-padded
+  nanosecond wall-clock timestamp (`time.Now().UnixNano()`) + random
+  suffix, so a same-version reinstall gets a distinct generation. The
+  timestamp is NOT strictly monotonic (an NTP step can move the wall
+  clock backward), so it is treated only as a generation key + a stable
+  GC ordering hint; correctness never depends on `genid` ordering — GC
+  protects `current-gen` and journal-referenced generations explicitly,
+  so a backward clock step at most affects which NON-protected, non-live
+  generation is reaped first, never the active source.
 - **The cut reads the PINNED generation, never live `staged/`.** `Run`
   resolves `current-gen` ONCE at INIT and records the genid in
   `Journal.SourceGeneration`; `copyStaged` copies from
@@ -434,11 +440,16 @@ window for ALL FOUR managed binaries:
   cut reads live `staged/` as its only source, so removing `staged-gen/`
   strips nothing it can use.
 - **GC retention N=2** (current + 1 prior — a superseded generation is
-  never read again, so keeping 3 is pure disk waste). GC keeps the newest
-  N generations (current-gen counts toward the window as the newest) PLUS,
-  ADDITIVELY, any genid an active/resumable journal references (the
-  GC-vs-resume race — a journal-pinned OLD generation never evicts an
-  in-window generation), and sweeps `.partial` orphans.
+  never read again, so keeping 3 is pure disk waste). GC orders valid
+  generation dirs by `genid` NAME (the zero-padded timestamp prefix makes
+  name order chronological and mtime-independent) and keeps the newest N
+  PLUS, ADDITIVELY, the explicitly-resolved `current-gen` generation AND
+  any genid an active/resumable journal references (the GC-vs-resume race
+  — a journal-pinned OLD generation never evicts an in-window generation,
+  and `current-gen` is never reaped even if it is not the newest by name
+  or mtimes are perturbed). It ignores (never counts, never deletes) any
+  directory whose name is not a valid `genid`, and sweeps `.partial`
+  orphans.
 - **Same-version replacement (B-P3b OPT1).** `versions/<ver>` carries a
   `.srcgen` stamp; the copy-skip is generation-aware. A same-version
   re-stage with NEW bytes (a new generation) RE-COPIES a stale, non-live

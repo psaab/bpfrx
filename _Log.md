@@ -6014,3 +6014,6 @@ top.
 - **Timestamp**: 2026-06-18
 - **Action**: Address Codex r3 + Copilot 3rd review (GC current-gen protection): GC now resolves current-gen EXPLICITLY and protects it additively (never reaped even if not newest/mtime-skewed); orders by genid NAME (mtime-independent, deterministic); SKIPS non-ValidGenID stray dirs (no slot consumption, no deletion). Added 2 GC tests.
 - **File(s)**: pkg/upgrade/stagedgen/stagedgen.go, pkg/upgrade/stagedgen/stagedgen_test.go
+- **Timestamp**: 2026-06-18
+- **Action**: Address Codex r4 MERGE-NEEDS-MINOR (doc-only): in-place-upgrade.md no longer says current-gen "counts toward the window" (now additive) and no longer calls genid "monotonic" (wall-clock UnixNano, treated as a GC ordering hint; correctness never depends on genid order).
+- **File(s)**: docs/in-place-upgrade.md
