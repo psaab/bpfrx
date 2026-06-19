@@ -129,6 +129,33 @@ func TestTCPMSSRange_MixedShapePrecedence(t *testing.T) {
 }`))
 }
 
+// --- The parse-failure fallback (Codex r2 MAJOR): an unparseable mss CHILD
+// must fall through to the flat token, matching parseMSSValue's original
+// precedence ("child only if it parses, else flat"). selectMSSToken returning
+// the unparseable child unconditionally regressed the compiled value to 0 and
+// made strict validation reject a config the old compiler accepted. ---
+
+func TestTCPMSSRange_UnparseableChildFallsBackToFlat(t *testing.T) {
+	// gre-in 1360 { mss bogus; }: the child "bogus" does not parse, so both
+	// the compiler and the validator must fall back to the flat 1360 (exactly
+	// as the pre-#1979 parseMSSValue did). Must NOT false-reject, and the
+	// compiled value is the flat 1360 — NOT 0.
+	tree := mssHierTree(t, `security {
+    flow { tcp-mss { gre-in 1360 { mss bogus; } } }
+}`)
+	cfg, err := config.CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("gre-in 1360 { mss bogus } must fall back to the flat 1360, not reject: %v", err)
+	}
+	if cfg.Security.Flow.TCPMSSGreIn != 1360 {
+		t.Fatalf("unparseable mss child must fall back to flat 1360, got %d", cfg.Security.Flow.TCPMSSGreIn)
+	}
+	// Lenient (boot/HA) path also accepts the fallback cleanly.
+	if _, err := config.CompileConfigLenient(tree); err != nil {
+		t.Fatalf("lenient compile of the unparseable-child fallback must succeed: %v", err)
+	}
+}
+
 // --- Strict vs lenient (boot/HA safety — MANDATORY per plan §6) ---
 
 func TestTCPMSSRange_StrictVsLenient(t *testing.T) {

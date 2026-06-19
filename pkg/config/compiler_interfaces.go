@@ -736,9 +736,17 @@ func parseTunnelWireguardPeer(tc *TunnelConfig, peerNode *Node) {
 // the child 1360 and discards the flat 70000, so validating both would
 // wrongly reject it).
 func selectMSSToken(node *Node) (string, bool) {
-	// Hierarchical: ipsec-vpn { mss 1360; } or gre-in { mss 1360; }
+	// Hierarchical: ipsec-vpn { mss 1360; } or gre-in { mss 1360; }.
+	// Prefer the child ONLY when it parses — an unparseable child
+	// (e.g. `gre-in 1360 { mss bogus; }`) must fall through to the flat
+	// token so the value selected here matches what parseMSSValue/the
+	// compiler actually use (the flat 1360), not the discarded child.
+	// Returning the unparseable child unconditionally was a precedence
+	// regression vs the original parseMSSValue (#1979).
 	if mssChild := node.FindChild("mss"); mssChild != nil && len(mssChild.Keys) >= 2 {
-		return mssChild.Keys[1], true
+		if _, err := strconv.Atoi(mssChild.Keys[1]); err == nil {
+			return mssChild.Keys[1], true
+		}
 	}
 	// Flat: ipsec-vpn 1360; (set syntax)
 	if len(node.Keys) >= 2 {
