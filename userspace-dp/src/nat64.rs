@@ -166,9 +166,19 @@ static NAT64_FRAG_ID: AtomicU32 = AtomicU32::new(0);
 
 /// Return the next non-zero 16-bit Fragment Identification value for a
 /// fragmentable translated datagram. The value cycles over the full non-zero
-/// 16-bit space `1..=65535` with NO two consecutive values equal (including
-/// across the wrap: the value after 65535 is 1, a jump, not a repeat). Skipping
-/// 0 keeps the all-zero ID reserved (by convention) for the atomic DF=1 path.
+/// 16-bit space `1..=65535` with no two consecutive values equal WITHIN the
+/// 65535-value cycle (the value after 65535 is 1, a jump, not a repeat).
+/// Skipping 0 keeps the all-zero ID reserved (by convention) for the atomic
+/// DF=1 path.
+///
+/// CAVEAT: at the outer `AtomicU32` counter wrap — once per 2^32 fragmentable
+/// translations — two ADJACENT values do collide: `(2^32 - 1) % 65535 == 0`
+/// and the wrapped `0 % 65535 == 0` both map to ID 1. This is deliberately
+/// accepted (#2014 r3, Codex+AGY): IPv4's 16-bit Identification inherently
+/// repeats every 65535 packets regardless, so one extra adjacent duplicate per
+/// ~4.3e9 translations is operationally negligible and not worth replacing the
+/// lock-free `fetch_add` with a CAS/modulo-65535 counter that would bounce a
+/// cache line on this path.
 fn next_frag_id() -> u16 {
     // Relaxed is sufficient: we only need a distinct, non-repeating sequence,
     // not ordering against other memory. Map the monotonic 32-bit counter onto
@@ -184,7 +194,8 @@ fn next_frag_id() -> u16 {
 
 /// Pure mapping from a monotonic 32-bit counter value to the 1..=65535
 /// Identification space. Factored out of `next_frag_id` so the cycle invariant
-/// (non-zero, in-range, no consecutive duplicates including the wrap) can be
+/// (non-zero, in-range, no consecutive duplicates within the 65535-value cycle
+/// — see the `next_frag_id` caveat for the accepted 2^32-boundary edge) can be
 /// unit-tested deterministically without touching the process-global counter.
 #[inline]
 fn map_frag_id(raw: u32) -> u16 {
