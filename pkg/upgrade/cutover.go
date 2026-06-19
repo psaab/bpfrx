@@ -357,10 +357,18 @@ func (r *Runner) Run(opts Options) (err error) {
 		// thus re-wedged on resume (Codex r6). A legacy cut (srcGen == "") over
 		// an unstamped live dir matches (existingGen == "" == srcGen) and is a
 		// true resume — not refused.
+		// `prev` was just read authoritatively from readCurrentVersion() above
+		// (errors handled), so it IS the live `current` version here (we hold
+		// the upgrade lock, so it cannot change under us). Use `prev` for the
+		// live/rollback test rather than re-reading via an error-discarding
+		// helper — that would return "" on a transient unreadable `current` and
+		// SKIP this guard, letting the run persist a journal + take a .dbsnap
+		// before refusing in copyStaged (re-introducing the wedge this guard
+		// prevents). `prev` is both the rollback target AND the live current
+		// here, so a single comparison covers both (Copilot r4).
 		if _, statErr := os.Stat(r.versionDir(stagedVer)); statErr == nil {
 			existingGen, gerr := r.readSrcGen(stagedVer)
-			if gerr == nil && existingGen != srcGen &&
-				(stagedVer == prev || stagedVer == r.mustReadCurrentVersion()) {
+			if gerr == nil && existingGen != srcGen && stagedVer == prev {
 				if cerr := r.clearJournal(); cerr != nil {
 					r.logf("upgrade: WARN clear stale journal on live-dir-replace refuse: %v", cerr)
 				}

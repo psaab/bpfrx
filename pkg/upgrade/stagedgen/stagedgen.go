@@ -254,7 +254,16 @@ func (c Config) ResolveCurrent() (string, error) {
 		}
 		return "", fmt.Errorf("stagedgen: read current-gen: %w", err)
 	}
-	genid := filepath.Base(target)
+	// current-gen MUST be a BARE in-tree generation name — a single path
+	// segment with NO directory components (Copilot r4). A corrupt/hand-edited
+	// symlink target like "../<genid>" or "/tmp/<genid>" would pass
+	// ValidGenID(filepath.Base(target)) yet escape the staged-gen root, so we
+	// require target == its own base (no separators) BEFORE deriving the genid.
+	if target != filepath.Base(target) {
+		return "", fmt.Errorf("stagedgen: current-gen target %q is not a bare in-tree "+
+			"generation name (must have no path components)", target)
+	}
+	genid := target
 	if !ValidGenID(genid) {
 		return "", fmt.Errorf("stagedgen: current-gen names an unsafe generation %q", genid)
 	}

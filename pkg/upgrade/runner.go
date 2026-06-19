@@ -214,14 +214,6 @@ func (r *Runner) currentPath() string {
 	return filepath.Join(r.cfg.VersionsDir, currentLink)
 }
 
-// mustReadCurrentVersion resolves the `current` version, returning "" on any
-// error (used where a read failure should be treated as "no current version"
-// rather than aborting — e.g. the B-P3b live-dir guard).
-func (r *Runner) mustReadCurrentVersion() string {
-	cur, _ := r.readCurrentVersion()
-	return cur
-}
-
 // readCurrentVersion resolves the version the `current` symlink points at,
 // or "" if it does not exist (very first cut).
 func (r *Runner) readCurrentVersion() (string, error) {

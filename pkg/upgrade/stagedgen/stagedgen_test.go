@@ -143,6 +143,31 @@ func TestPublishIsImmutableSource(t *testing.T) {
 	}
 }
 
+// TestResolveCurrentRejectsPathEscape pins the Copilot r4 hardening: a
+// current-gen symlink whose target carries path components (../<genid>,
+// /abs/<genid>) is rejected, not silently base-named into an in-tree genid.
+func TestResolveCurrentRejectsPathEscape(t *testing.T) {
+	root := t.TempDir()
+	staged := filepath.Join(root, "staged")
+	writeStaged(t, staged, "v1")
+	c := newConfig(t, staged)
+	genid, err := c.Publish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"../" + genid, "/tmp/" + genid, "sub/" + genid} {
+		// Repoint current-gen at a path-bearing target.
+		link := filepath.Join(c.Dir, CurrentGenLink)
+		_ = os.Remove(link)
+		if err := os.Symlink(bad, link); err != nil {
+			t.Fatal(err)
+		}
+		if _, rerr := c.ResolveCurrent(); rerr == nil {
+			t.Errorf("ResolveCurrent accepted a path-escaping current-gen target %q", bad)
+		}
+	}
+}
+
 func TestResolveCurrentDanglingIsError(t *testing.T) {
 	root := t.TempDir()
 	staged := filepath.Join(root, "staged")

@@ -6017,3 +6017,6 @@ top.
 - **Timestamp**: 2026-06-18
 - **Action**: Address Codex r4 MERGE-NEEDS-MINOR (doc-only): in-place-upgrade.md no longer says current-gen "counts toward the window" (now additive) and no longer calls genid "monotonic" (wall-clock UnixNano, treated as a GC ordering hint; correctness never depends on genid order).
 - **File(s)**: docs/in-place-upgrade.md
+- **Timestamp**: 2026-06-18
+- **Action**: Address Copilot r4 (2 code findings): INIT B-P3b refusal uses authoritative `prev` (drops the error-discarding mustReadCurrentVersion which could skip the guard on a transient unreadable current → wedge); removed now-dead mustReadCurrentVersion. ResolveCurrent rejects a current-gen symlink target with path components (../<genid> escape) before base-naming. Added path-escape test.
+- **File(s)**: pkg/upgrade/cutover.go, pkg/upgrade/runner.go, pkg/upgrade/stagedgen/stagedgen.go, pkg/upgrade/stagedgen/stagedgen_test.go
