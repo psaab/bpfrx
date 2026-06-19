@@ -1,4 +1,4 @@
-package userspace
+package format
 
 import (
 	"encoding/json"
@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
+	userspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
 func testCoSConfig() *config.Config {
@@ -61,7 +62,7 @@ func testCoSConfig() *config.Config {
 }
 
 func TestFormatCoSInterfaceSummaryPreservesOldJSONGuaranteeFallback(t *testing.T) {
-	var status ProcessStatus
+	var status userspace.ProcessStatus
 	raw := []byte(`{
 		"cos_interfaces": [{
 			"interface_name": "reth0.80",
@@ -108,7 +109,7 @@ func TestFormatCoSInterfaceSummaryRendersPercentBufferFromConfigPool(t *testing.
 	cfg.ClassOfService.Schedulers["10mb"].BufferSizePercent = 10
 	cfg.ClassOfService.Interfaces["reth0"].Units[80].BurstSizeBytes = 200_000
 
-	out := FormatCoSInterfaceSummary(cfg, &ProcessStatus{}, "reth0.80")
+	out := FormatCoSInterfaceSummary(cfg, &userspace.ProcessStatus{}, "reth0.80")
 	for _, want := range []string{"bandwidth-10mb", "19.53 KiB"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("missing %q in output:\n%s", want, out)
@@ -120,7 +121,7 @@ func TestFormatCoSInterfaceSummaryOldJSONDoesNotInferGuaranteeFromEffectiveRate(
 	cfg := testCoSConfig()
 	cfg.ClassOfService.Schedulers["be"].TransmitRateBytes = 0
 
-	var status ProcessStatus
+	var status userspace.ProcessStatus
 	raw := []byte(`{
 		"cos_interfaces": [{
 			"interface_name": "reth0.80",
@@ -169,7 +170,7 @@ func TestFormatCoSInterfaceSummaryOldJSONInfersSyntheticDefaultQueueGuarantee(t 
 	cfg.ClassOfService.SchedulerMaps = nil
 	cfg.ClassOfService.Interfaces["reth0"].Units[80].SchedulerMap = ""
 
-	var status ProcessStatus
+	var status userspace.ProcessStatus
 	raw := []byte(`{
 		"cos_interfaces": [{
 			"interface_name": "reth0.80",
@@ -232,8 +233,8 @@ func TestFormatCoSInterfaceSummaryShowsConfigOnlyInterface(t *testing.T) {
 
 func TestFormatCoSInterfaceSummaryIncludesRuntimeQueueState(t *testing.T) {
 	owner := uint32(7)
-	status := &ProcessStatus{
-		CoSInterfaces: []CoSInterfaceStatus{
+	status := &userspace.ProcessStatus{
+		CoSInterfaces: []userspace.CoSInterfaceStatus{
 			{
 				InterfaceName:       "reth0.80",
 				OwnerWorkerID:       &owner,
@@ -242,7 +243,7 @@ func TestFormatCoSInterfaceSummaryIncludesRuntimeQueueState(t *testing.T) {
 				RunnableQueues:      1,
 				TimerLevel0Sleepers: 1,
 				TimerLevel1Sleepers: 0,
-				Queues: []CoSQueueStatus{
+				Queues: []userspace.CoSQueueStatus{
 					{
 						QueueID:             4,
 						OwnerWorkerID:       &owner,
@@ -322,11 +323,11 @@ func TestFormatCoSInterfaceSummaryJoinsUnitZeroRuntimeByIfindex(t *testing.T) {
 			},
 		},
 	}
-	status := &ProcessStatus{
-		Bindings: []BindingStatus{
+	status := &userspace.ProcessStatus{
+		Bindings: []userspace.BindingStatus{
 			{Interface: "ge-0-0-1", Ifindex: 5, Bound: true},
 		},
-		CoSInterfaces: []CoSInterfaceStatus{{
+		CoSInterfaces: []userspace.CoSInterfaceStatus{{
 			Ifindex:             5,
 			InterfaceName:       "reth0.80",
 			OwnerWorkerID:       &owner,
@@ -334,7 +335,7 @@ func TestFormatCoSInterfaceSummaryJoinsUnitZeroRuntimeByIfindex(t *testing.T) {
 			NonemptyQueues:      1,
 			RunnableQueues:      1,
 			TimerLevel0Sleepers: 2,
-			Queues: []CoSQueueStatus{{
+			Queues: []userspace.CoSQueueStatus{{
 				QueueID:                 5,
 				OwnerWorkerID:           &owner,
 				ForwardingClass:         "iperf-b",
@@ -410,17 +411,17 @@ func TestFormatCoSInterfaceSummaryPrefersVLANBindingIfindexForUnitZero(t *testin
 			},
 		},
 	}
-	status := &ProcessStatus{
-		Bindings: []BindingStatus{
+	status := &userspace.ProcessStatus{
+		Bindings: []userspace.BindingStatus{
 			{Interface: "ge-0-0-1", Ifindex: 5, Bound: true},
 			{Interface: "ge-0-0-1.80", Ifindex: 10, Bound: true},
 		},
-		CoSInterfaces: []CoSInterfaceStatus{
+		CoSInterfaces: []userspace.CoSInterfaceStatus{
 			{
 				Ifindex:       5,
 				InterfaceName: "reth-parent",
 				OwnerWorkerID: &parentOwner,
-				Queues: []CoSQueueStatus{{
+				Queues: []userspace.CoSQueueStatus{{
 					QueueID:              5,
 					OwnerWorkerID:        &parentOwner,
 					ForwardingClass:      "wrong-parent",
@@ -434,7 +435,7 @@ func TestFormatCoSInterfaceSummaryPrefersVLANBindingIfindexForUnitZero(t *testin
 				Ifindex:       10,
 				InterfaceName: "reth-vlan",
 				OwnerWorkerID: &vlanOwner,
-				Queues: []CoSQueueStatus{{
+				Queues: []userspace.CoSQueueStatus{{
 					QueueID:                 5,
 					OwnerWorkerID:           &vlanOwner,
 					ForwardingClass:         "iperf-b",
@@ -504,12 +505,12 @@ func TestFormatCoSInterfaceSummaryRendersSurplusSharingLineOnExactQueues(t *test
 		}},
 	}
 	owner := uint32(0)
-	status := &ProcessStatus{
-		CoSInterfaces: []CoSInterfaceStatus{{
+	status := &userspace.ProcessStatus{
+		CoSInterfaces: []userspace.CoSInterfaceStatus{{
 			InterfaceName:   "reth0.80",
 			OwnerWorkerID:   &owner,
 			WorkerInstances: 1,
-			Queues: []CoSQueueStatus{
+			Queues: []userspace.CoSQueueStatus{
 				{QueueID: 4, OwnerWorkerID: &owner, ForwardingClass: "iperf-a", Priority: 5, Exact: true, TransmitRateBytes: 125_000_000, BufferBytes: 65536},
 				{QueueID: 5, OwnerWorkerID: &owner, ForwardingClass: "iperf-b", Priority: 5, Exact: true, TransmitRateBytes: 1_250_000_000, BufferBytes: 65536},
 				{QueueID: 0, OwnerWorkerID: &owner, ForwardingClass: "be", Priority: 5, Exact: false, TransmitRateBytes: 12_500_000, BufferBytes: 65536},
@@ -536,12 +537,12 @@ func TestFormatCoSInterfaceSummaryRendersEqualFlowEnforcementLine(t *testing.T) 
 	cfg := testCoSConfig()
 	cfg.ClassOfService.Schedulers["10mb"].EqualFlowEnforcement = true
 	owner := uint32(7)
-	status := &ProcessStatus{
-		CoSInterfaces: []CoSInterfaceStatus{{
+	status := &userspace.ProcessStatus{
+		CoSInterfaces: []userspace.CoSInterfaceStatus{{
 			InterfaceName:   "reth0.80",
 			OwnerWorkerID:   &owner,
 			WorkerInstances: 1,
-			Queues: []CoSQueueStatus{{
+			Queues: []userspace.CoSQueueStatus{{
 				QueueID:                       4,
 				OwnerWorkerID:                 &owner,
 				ForwardingClass:               "bandwidth-10mb",
@@ -584,12 +585,12 @@ func TestFormatCoSInterfaceSummaryRendersEqualFlowTargetPolicy(t *testing.T) {
 	cfg := testCoSConfig()
 	cfg.ClassOfService.Schedulers["10mb"].EqualFlowEnforcement = true
 	owner := uint32(7)
-	status := &ProcessStatus{
-		CoSInterfaces: []CoSInterfaceStatus{{
+	status := &userspace.ProcessStatus{
+		CoSInterfaces: []userspace.CoSInterfaceStatus{{
 			InterfaceName:   "reth0.80",
 			OwnerWorkerID:   &owner,
 			WorkerInstances: 1,
-			Queues: []CoSQueueStatus{{
+			Queues: []userspace.CoSQueueStatus{{
 				QueueID:               4,
 				OwnerWorkerID:         &owner,
 				ForwardingClass:       "bandwidth-10mb",
@@ -611,8 +612,8 @@ func TestFormatCoSInterfaceSummaryRendersEqualFlowTargetPolicy(t *testing.T) {
 }
 
 func TestFormatCoSInterfaceSummaryShowsUnknownOwnerAsDash(t *testing.T) {
-	status := &ProcessStatus{
-		CoSInterfaces: []CoSInterfaceStatus{
+	status := &userspace.ProcessStatus{
+		CoSInterfaces: []userspace.CoSInterfaceStatus{
 			{
 				InterfaceName:   "reth0.80",
 				WorkerInstances: 1,
@@ -638,13 +639,13 @@ func TestFormatCoSInterfaceSummaryFiltersByBaseInterface(t *testing.T) {
 // no way to tell which admission decision is firing on the live system.
 func TestFormatCoSInterfaceSummaryRendersAdmissionDropCounters(t *testing.T) {
 	owner := uint32(1)
-	status := &ProcessStatus{
-		CoSInterfaces: []CoSInterfaceStatus{
+	status := &userspace.ProcessStatus{
+		CoSInterfaces: []userspace.CoSInterfaceStatus{
 			{
 				InterfaceName:   "reth0.80",
 				OwnerWorkerID:   &owner,
 				WorkerInstances: 1,
-				Queues: []CoSQueueStatus{
+				Queues: []userspace.CoSQueueStatus{
 					{
 						QueueID:                 4,
 						OwnerWorkerID:           &owner,
@@ -678,13 +679,13 @@ func TestFormatCoSInterfaceSummaryRendersAdmissionDropCounters(t *testing.T) {
 // the single-queue tests above would still pass.
 func TestFormatCoSInterfaceSummaryInterleavesPerQueueDropsInOrder(t *testing.T) {
 	owner := uint32(1)
-	status := &ProcessStatus{
-		CoSInterfaces: []CoSInterfaceStatus{
+	status := &userspace.ProcessStatus{
+		CoSInterfaces: []userspace.CoSInterfaceStatus{
 			{
 				InterfaceName:   "reth0.80",
 				OwnerWorkerID:   &owner,
 				WorkerInstances: 1,
-				Queues: []CoSQueueStatus{
+				Queues: []userspace.CoSQueueStatus{
 					{
 						QueueID:                 0,
 						OwnerWorkerID:           &owner,
@@ -773,13 +774,13 @@ func TestFormatCoSInterfaceSummaryRendersOwnerProfileLineForExactQueues(t *testi
 	redirectHist := make([]uint64, 16)
 	redirectHist[2] = 10 // p99 of redirect-acquire → bucket 2 = ~2us
 
-	status := &ProcessStatus{
-		CoSInterfaces: []CoSInterfaceStatus{
+	status := &userspace.ProcessStatus{
+		CoSInterfaces: []userspace.CoSInterfaceStatus{
 			{
 				InterfaceName:   "reth0.80",
 				OwnerWorkerID:   &owner,
 				WorkerInstances: 1,
-				Queues: []CoSQueueStatus{
+				Queues: []userspace.CoSQueueStatus{
 					{
 						QueueID:              4,
 						OwnerWorkerID:        &owner,
@@ -849,13 +850,13 @@ func TestFormatCoSInterfaceSummaryRendersDistinctPerQueueOwnerProfiles(t *testin
 	q6Hist := make([]uint64, 16)
 	q6Hist[5] = 200 // p50 & p99 in bucket 5 → "16us"
 
-	status := &ProcessStatus{
-		CoSInterfaces: []CoSInterfaceStatus{
+	status := &userspace.ProcessStatus{
+		CoSInterfaces: []userspace.CoSInterfaceStatus{
 			{
 				InterfaceName:   "reth0.80",
 				OwnerWorkerID:   &owner,
 				WorkerInstances: 1,
-				Queues: []CoSQueueStatus{
+				Queues: []userspace.CoSQueueStatus{
 					{
 						QueueID:           4,
 						OwnerWorkerID:     &owner,
@@ -906,13 +907,13 @@ func TestFormatCoSInterfaceSummaryRendersDistinctPerQueueOwnerProfiles(t *testin
 // the Drops line still renders.
 func TestFormatCoSInterfaceSummaryOmitsOwnerProfileForQueuesWithoutOwner(t *testing.T) {
 	owner := uint32(2)
-	status := &ProcessStatus{
-		CoSInterfaces: []CoSInterfaceStatus{
+	status := &userspace.ProcessStatus{
+		CoSInterfaces: []userspace.CoSInterfaceStatus{
 			{
 				InterfaceName:   "reth0.80",
 				OwnerWorkerID:   &owner,
 				WorkerInstances: 1,
-				Queues: []CoSQueueStatus{
+				Queues: []userspace.CoSQueueStatus{
 					{
 						QueueID: 4,
 						// OwnerWorkerID intentionally nil: shared_exact
@@ -956,13 +957,13 @@ func TestFormatCoSInterfaceSummaryOmitsOwnerProfileForQueuesWithoutOwner(t *test
 // catch it.
 func TestFormatCoSInterfaceSummarySuppressesZeroedOwnerProfile(t *testing.T) {
 	owner := uint32(1)
-	status := &ProcessStatus{
-		CoSInterfaces: []CoSInterfaceStatus{
+	status := &userspace.ProcessStatus{
+		CoSInterfaces: []userspace.CoSInterfaceStatus{
 			{
 				InterfaceName:   "reth0.80",
 				OwnerWorkerID:   &owner,
 				WorkerInstances: 1,
-				Queues: []CoSQueueStatus{
+				Queues: []userspace.CoSQueueStatus{
 					{
 						QueueID:           4,
 						OwnerWorkerID:     &owner,
@@ -994,12 +995,12 @@ func TestFormatCoSInterfaceSummarySuppressesZeroedOwnerProfile(t *testing.T) {
 }
 
 func TestFormatCoSInterfaceSummaryRendersDrainShapeForNonExactQueue(t *testing.T) {
-	status := &ProcessStatus{
-		CoSInterfaces: []CoSInterfaceStatus{
+	status := &userspace.ProcessStatus{
+		CoSInterfaces: []userspace.CoSInterfaceStatus{
 			{
 				InterfaceName:   "reth0.80",
 				WorkerInstances: 1,
-				Queues: []CoSQueueStatus{
+				Queues: []userspace.CoSQueueStatus{
 					{
 						QueueID:                 0,
 						ForwardingClass:         "best-effort",
@@ -1033,13 +1034,13 @@ func TestFormatCoSInterfaceSummaryRendersDrainShapeForNonExactQueue(t *testing.T
 // "counter missing from the pipeline" when chasing #718 / #722.
 func TestFormatCoSInterfaceSummaryRendersZeroAdmissionCounters(t *testing.T) {
 	owner := uint32(1)
-	status := &ProcessStatus{
-		CoSInterfaces: []CoSInterfaceStatus{
+	status := &userspace.ProcessStatus{
+		CoSInterfaces: []userspace.CoSInterfaceStatus{
 			{
 				InterfaceName:   "reth0.80",
 				OwnerWorkerID:   &owner,
 				WorkerInstances: 1,
-				Queues: []CoSQueueStatus{
+				Queues: []userspace.CoSQueueStatus{
 					{
 						QueueID:         4,
 						OwnerWorkerID:   &owner,
@@ -1063,13 +1064,13 @@ func TestFormatCoSInterfaceSummaryRendersZeroAdmissionCounters(t *testing.T) {
 // noise line. win_min is the standing-queue gate metric.
 func TestFormatCoSInterfaceSummaryRendersSojournLine(t *testing.T) {
 	owner := uint32(1)
-	status := &ProcessStatus{
-		CoSInterfaces: []CoSInterfaceStatus{
+	status := &userspace.ProcessStatus{
+		CoSInterfaces: []userspace.CoSInterfaceStatus{
 			{
 				InterfaceName:   "reth0.80",
 				OwnerWorkerID:   &owner,
 				WorkerInstances: 1,
-				Queues: []CoSQueueStatus{
+				Queues: []userspace.CoSQueueStatus{
 					{
 						QueueID:              4,
 						OwnerWorkerID:        &owner,

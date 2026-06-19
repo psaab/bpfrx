@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
-	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
 	"golang.org/x/sys/unix"
 )
 
@@ -29,7 +29,7 @@ func (c *CLI) showSystemBuffers() error {
 			fmt.Printf("Userspace buffer metrics unavailable: %v\n", err)
 			return nil
 		}
-		fmt.Print(dpuserspace.FormatSystemBuffers(status, false))
+		fmt.Print(dpformat.FormatSystemBuffers(status, false))
 		v4, v6 := c.dp.SessionCount()
 		if v4 > 0 || v6 > 0 {
 			fmt.Printf("\nActive sessions: %d IPv4, %d IPv6, %d total\n", v4, v6, v4+v6)
@@ -89,7 +89,7 @@ func (c *CLI) showSystemBuffersDetail() error {
 			fmt.Printf("Userspace buffer metrics unavailable: %v\n", err)
 			return nil
 		}
-		fmt.Print(dpuserspace.FormatSystemBuffers(status, true))
+		fmt.Print(dpformat.FormatSystemBuffers(status, true))
 		v4, v6 := c.dp.SessionCount()
 		if v4 > 0 || v6 > 0 {
 			fmt.Printf("\nActive sessions: %d IPv4, %d IPv6, %d total\n", v4, v6, v4+v6)

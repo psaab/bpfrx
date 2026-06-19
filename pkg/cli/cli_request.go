@@ -12,6 +12,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/cluster"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
 	"github.com/psaab/xpf/pkg/routing"
 )
 
@@ -755,9 +756,9 @@ func (c *CLI) handleRequestChassisClusterDataPlane(args []string) error {
 		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["chassis"].Children["cluster"].Children["data-plane"].Children["userspace"].Children))
 		return nil
 	}
-	fmt.Print(dpuserspace.FormatStatusSummary(status))
+	fmt.Print(dpformat.FormatStatusSummary(status))
 	fmt.Println()
-	fmt.Print(dpuserspace.FormatBindings(status))
+	fmt.Print(dpformat.FormatBindings(status))
 	return nil
 }
 

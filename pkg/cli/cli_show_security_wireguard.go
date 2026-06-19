@@ -4,13 +4,13 @@ import (
 	"fmt"
 	"time"
 
-	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
 )
 
 // showSecurityWireguard renders `show security wireguard [detail]`
 // from the userspace helper's per-tunnel telemetry rows (#1865). The
 // rendering is shared with the remote CLI via
-// dpuserspace.FormatWireguardStatus (the FormatSystemBuffers pattern),
+// dpformat.FormatWireguardStatus (the FormatSystemBuffers pattern),
 // so local and gRPC output are identical.
 func (c *CLI) showSecurityWireguard(detail bool) error {
 	if c.dp == nil {
@@ -27,6 +27,6 @@ func (c *CLI) showSecurityWireguard(detail bool) error {
 		fmt.Printf("WireGuard telemetry unavailable: %v\n", err)
 		return nil
 	}
-	fmt.Print(dpuserspace.FormatWireguardStatus(status, detail, time.Now()))
+	fmt.Print(dpformat.FormatWireguardStatus(status, detail, time.Now()))
 	return nil
 }

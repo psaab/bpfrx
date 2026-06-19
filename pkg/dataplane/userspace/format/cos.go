@@ -1,4 +1,4 @@
-package userspace
+package format
 
 import (
 	"fmt"
@@ -9,6 +9,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/psaab/xpf/pkg/config"
+	userspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
 type cosInterfaceView struct {
@@ -16,7 +17,7 @@ type cosInterfaceView struct {
 	unit           int
 	cosUnit        *config.CoSInterfaceUnit
 	interfaceUnit  *config.InterfaceUnit
-	interfaceState *CoSInterfaceStatus
+	interfaceState *userspace.CoSInterfaceStatus
 }
 
 type cosQueueView struct {
@@ -87,7 +88,7 @@ type cosQueueView struct {
 	sojournWindowedMinNS uint64
 }
 
-func FormatCoSInterfaceSummary(cfg *config.Config, status *ProcessStatus, selector string) string {
+func FormatCoSInterfaceSummary(cfg *config.Config, status *userspace.ProcessStatus, selector string) string {
 	if cfg == nil {
 		return "No active configuration\n"
 	}
@@ -494,7 +495,7 @@ func bucketLowerBoundMicros(bucket int) string {
 	return fmt.Sprintf("%dus", us)
 }
 
-func configuredCoSInterfaceViews(cfg *config.Config, status *ProcessStatus, selector string) []cosInterfaceView {
+func configuredCoSInterfaceViews(cfg *config.Config, status *userspace.ProcessStatus, selector string) []cosInterfaceView {
 	runtimeIndex := buildCoSRuntimeIndex(status)
 	selector = strings.TrimSpace(selector)
 	views := make([]cosInterfaceView, 0)
@@ -524,15 +525,15 @@ func configuredCoSInterfaceViews(cfg *config.Config, status *ProcessStatus, sele
 }
 
 type cosRuntimeIndex struct {
-	byName               map[string]*CoSInterfaceStatus
-	byIfindex            map[int]*CoSInterfaceStatus
+	byName               map[string]*userspace.CoSInterfaceStatus
+	byIfindex            map[int]*userspace.CoSInterfaceStatus
 	bindingIfindexByName map[string]int
 }
 
-func buildCoSRuntimeIndex(status *ProcessStatus) cosRuntimeIndex {
+func buildCoSRuntimeIndex(status *userspace.ProcessStatus) cosRuntimeIndex {
 	idx := cosRuntimeIndex{
-		byName:               make(map[string]*CoSInterfaceStatus),
-		byIfindex:            make(map[int]*CoSInterfaceStatus),
+		byName:               make(map[string]*userspace.CoSInterfaceStatus),
+		byIfindex:            make(map[int]*userspace.CoSInterfaceStatus),
 		bindingIfindexByName: make(map[string]int),
 	}
 	if status == nil {
@@ -558,7 +559,7 @@ func buildCoSRuntimeIndex(status *ProcessStatus) cosRuntimeIndex {
 	return idx
 }
 
-func (idx cosRuntimeIndex) lookup(ifName, logicalName string, unitNum int, unit *config.InterfaceUnit) *CoSInterfaceStatus {
+func (idx cosRuntimeIndex) lookup(ifName, logicalName string, unitNum int, unit *config.InterfaceUnit) *userspace.CoSInterfaceStatus {
 	candidates := cosRuntimeCandidateNames(ifName, logicalName, unitNum, unit)
 	for _, name := range candidates {
 		if runtime := idx.byName[name]; runtime != nil {
@@ -690,7 +691,7 @@ func buildCoSQueueViews(cfg *config.Config, view cosInterfaceView) []cosQueueVie
 			qv.ownerPPS = runtimeQueue.OwnerPPS
 			qv.peerPPS = runtimeQueue.PeerPPS
 			// #760 copy-through. See field comments on cosQueueView
-			// and on the Rust CoSQueueStatus. A queue that never got
+			// and on the Rust userspace.CoSQueueStatus. A queue that never got
 			// drained leaves these at zero; the renderer gates on
 			// drainInvocations > 0 so a silent queue stays silent.
 			qv.drainSentBytes = runtimeQueue.DrainSentBytes
@@ -730,7 +731,7 @@ func buildCoSQueueViews(cfg *config.Config, view cosInterfaceView) []cosQueueVie
 	return out
 }
 
-func isOldJSONSyntheticDefaultQueue(view cosInterfaceView, runtimeQueue CoSQueueStatus, configuredQueueCount int) bool {
+func isOldJSONSyntheticDefaultQueue(view cosInterfaceView, runtimeQueue userspace.CoSQueueStatus, configuredQueueCount int) bool {
 	return configuredQueueCount == 0 &&
 		view.cosUnit != nil &&
 		view.cosUnit.ShapingRateBytes > 0 &&

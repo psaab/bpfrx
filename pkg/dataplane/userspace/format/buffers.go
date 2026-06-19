@@ -1,9 +1,11 @@
-package userspace
+package format
 
 import (
 	"fmt"
 	"sort"
 	"strings"
+
+	userspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
 const (
@@ -125,14 +127,14 @@ type systemBufferCounterRow struct {
 // SystemBufferUtilizationRows returns the same bounded helper-status capacity
 // rows used by FormatSystemBuffers. Missing helper capacity fields produce no
 // synthetic fill rows rather than falling back to BPF map statistics.
-func SystemBufferUtilizationRows(status ProcessStatus, detail bool) []SystemBufferUtilizationRow {
+func SystemBufferUtilizationRows(status userspace.ProcessStatus, detail bool) []SystemBufferUtilizationRow {
 	return StructuredSystemBufferRows(status, detail).Utilization
 }
 
 // StructuredSystemBufferRows returns helper-backed userspace buffer rows and
 // unbounded status counters using the same sampling and fallback logic as the
 // CLI/gRPC text formatter.
-func StructuredSystemBufferRows(status ProcessStatus, detail bool) SystemBufferRows {
+func StructuredSystemBufferRows(status userspace.ProcessStatus, detail bool) SystemBufferRows {
 	samples := systemBufferSamples(status)
 	rows, knownUMEM, knownTX := systemBufferRows(status, samples, detail)
 	counterRows := systemBufferCounterRows(status, samples, detail)
@@ -176,7 +178,7 @@ func exportedSystemBufferCounterRows(rows []systemBufferCounterRow) []SystemBuff
 // `show system buffers`. Capacity rows only use bounded gauges published in
 // helper status; unbounded helper counters/gauges render in a separate section
 // so missing denominators are not mistaken for real fill percentages.
-func FormatSystemBuffers(status ProcessStatus, detail bool) string {
+func FormatSystemBuffers(status userspace.ProcessStatus, detail bool) string {
 	samples := systemBufferSamples(status)
 	rows, knownUMEM, knownTX := systemBufferRows(status, samples, detail)
 	counterRows := systemBufferCounterRows(status, samples, detail)
@@ -222,7 +224,7 @@ func FormatSystemBuffers(status ProcessStatus, detail bool) string {
 }
 
 func systemBufferRows(
-	status ProcessStatus,
+	status userspace.ProcessStatus,
 	samples []systemBufferSample,
 	detail bool,
 ) ([]systemBufferRow, int, int) {
@@ -320,7 +322,7 @@ func systemBufferRows(
 }
 
 func systemBufferFlowCacheAggregate(
-	status ProcessStatus,
+	status userspace.ProcessStatus,
 	samples []systemBufferSample,
 ) (uint64, uint64, int) {
 	var used, capacity uint64
@@ -360,7 +362,7 @@ func systemBufferUsage(row systemBufferRow) (float64, string) {
 	}
 }
 
-func systemBufferCoSRows(status ProcessStatus, detail bool) []systemBufferRow {
+func systemBufferCoSRows(status userspace.ProcessStatus, detail bool) []systemBufferRow {
 	var rows []systemBufferRow
 	var aggregateCap, aggregateUsed uint64
 	var queueCount int
@@ -402,7 +404,7 @@ func systemBufferCoSRows(status ProcessStatus, detail bool) []systemBufferRow {
 	return rows
 }
 
-func systemBufferCounterRows(status ProcessStatus, samples []systemBufferSample, detail bool) []systemBufferCounterRow {
+func systemBufferCounterRows(status userspace.ProcessStatus, samples []systemBufferSample, detail bool) []systemBufferCounterRow {
 	var activeFlowCount uint64
 	var flowCacheCollisionEvictions uint64
 	var debugPendingFillFrames uint64
@@ -536,8 +538,8 @@ func systemBufferCounterRows(status ProcessStatus, samples []systemBufferSample,
 	return rows
 }
 
-func systemBufferSamples(status ProcessStatus) []systemBufferSample {
-	bindings := make(map[systemBufferBindingKey]BindingStatus, len(status.Bindings))
+func systemBufferSamples(status userspace.ProcessStatus) []systemBufferSample {
+	bindings := make(map[systemBufferBindingKey]userspace.BindingStatus, len(status.Bindings))
 	for _, binding := range status.Bindings {
 		bindings[systemBufferBindingKey{
 			WorkerID: binding.WorkerID,
@@ -659,7 +661,7 @@ func systemBufferSamples(status ProcessStatus) []systemBufferSample {
 	return samples
 }
 
-func (sample *systemBufferSample) applyBindingStatusFallback(binding BindingStatus) {
+func (sample *systemBufferSample) applyBindingStatusFallback(binding userspace.BindingStatus) {
 	if sample.ActiveFlowCount == 0 {
 		sample.ActiveFlowCount = binding.ActiveFlowCount
 	}
@@ -753,7 +755,7 @@ func systemBufferSampleScope(sample systemBufferSample) string {
 	return strings.Join(parts, "/")
 }
 
-func systemBufferCoSQueueScope(iface CoSInterfaceStatus, queue CoSQueueStatus) string {
+func systemBufferCoSQueueScope(iface userspace.CoSInterfaceStatus, queue userspace.CoSQueueStatus) string {
 	var parts []string
 	if iface.InterfaceName != "" {
 		parts = append(parts, iface.InterfaceName)

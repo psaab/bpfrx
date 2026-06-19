@@ -1,4 +1,4 @@
-package userspace
+package format
 
 import (
 	"fmt"
@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	userspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
 const defaultFlowWorkerMapLimit = 128
@@ -36,7 +38,7 @@ func (c SYNCookieCounters) Any() bool {
 }
 
 // SumSYNCookieCounters sums SYN-cookie counters across all bindings in status.
-func SumSYNCookieCounters(status ProcessStatus) SYNCookieCounters {
+func SumSYNCookieCounters(status userspace.ProcessStatus) SYNCookieCounters {
 	var counters SYNCookieCounters
 	for _, binding := range status.Bindings {
 		counters.Challenges += binding.SYNCookieChallenges
@@ -70,7 +72,7 @@ func FormatSYNCookieCounterRows(counters SYNCookieCounters) string {
 	return b.String()
 }
 
-func localHAForwardingRole(status ProcessStatus) string {
+func localHAForwardingRole(status userspace.ProcessStatus) string {
 	if len(status.HAGroups) == 0 {
 		return ""
 	}
@@ -98,7 +100,7 @@ func formatStatusCounterMap(counters map[string]uint64) string {
 	return strings.Join(parts, " ")
 }
 
-func FormatStatusSummary(status ProcessStatus) string {
+func FormatStatusSummary(status userspace.ProcessStatus) string {
 	var b strings.Builder
 	now := time.Now()
 	readyQueues := 0
@@ -288,7 +290,7 @@ func FormatStatusSummary(status ProcessStatus) string {
 	currentRuntimeCoSAdmissionDrops := saturatingAddU64(currentRuntimeCoSFlowShareDrops, currentRuntimeCoSBufferDrops)
 	// The residual must use the binding-lifetime CoS subset counter, not
 	// current-runtime queue reason counters; CoS runtimes reset on config
-	// changes while BindingStatus.TXErrors does not.
+	// changes while userspace.BindingStatus.TXErrors does not.
 	nonAdmissionTXErrors := saturatingSubU64(txErrors, bindingLifetimeCoSQueueDrops)
 
 	fmt.Fprintln(&b, "Userspace dataplane helper:")
@@ -434,7 +436,7 @@ func FormatStatusSummary(status ProcessStatus) string {
 	fmt.Fprintf(&b, "  SNAT packets:              %d\n", snatPackets)
 	fmt.Fprintf(&b, "  DNAT packets:              %d\n", dnatPackets)
 	if len(status.SourceNATPools) > 0 {
-		rows := append([]SourceNATPoolStatus(nil), status.SourceNATPools...)
+		rows := append([]userspace.SourceNATPoolStatus(nil), status.SourceNATPools...)
 		sort.Slice(rows, func(i, j int) bool {
 			if rows[i].PoolName != rows[j].PoolName {
 				return rows[i].PoolName < rows[j].PoolName
@@ -470,7 +472,7 @@ func FormatStatusSummary(status ProcessStatus) string {
 		fmt.Fprintf(&b, "  CoS ECN marked:            %d\n", cosAdmissionEcnMarked)
 	}
 	if len(status.ThreeColorPolicerCounters) > 0 {
-		rows := append([]ThreeColorPolicerStatus(nil), status.ThreeColorPolicerCounters...)
+		rows := append([]userspace.ThreeColorPolicerStatus(nil), status.ThreeColorPolicerCounters...)
 		sort.Slice(rows, func(i, j int) bool {
 			if rows[i].ID != rows[j].ID {
 				return rows[i].ID < rows[j].ID
@@ -596,9 +598,9 @@ func FormatStatusSummary(status ProcessStatus) string {
 	return b.String()
 }
 
-func FormatFairnessRSS(status ProcessStatus, expectations []FairnessRSSExpectation) string {
+func FormatFairnessRSS(status userspace.ProcessStatus, expectations []userspace.FairnessRSSExpectation) string {
 	var b strings.Builder
-	rows := CoSFairnessRSSSummaries(status)
+	rows := userspace.CoSFairnessRSSSummaries(status)
 	fmt.Fprintln(&b, "Userspace fairness RSS structure:")
 	if status.CoSActiveFlowCountsTruncated {
 		fmt.Fprintln(&b, "  warning: CoS active-flow snapshot truncated; derived values are partial")
@@ -620,7 +622,7 @@ func FormatFairnessRSS(status ProcessStatus, expectations []FairnessRSSExpectati
 			)
 		}
 	}
-	if results := EvaluateFairnessRSSExpectations(status, expectations); len(results) > 0 {
+	if results := userspace.EvaluateFairnessRSSExpectations(status, expectations); len(results) > 0 {
 		fmt.Fprintln(&b)
 		fmt.Fprintln(&b, "RSS expectations:")
 		fmt.Fprintf(&b, "  %-8s %-7s %-28s %-6s %-11s %-13s %-10s %s\n",
@@ -641,9 +643,9 @@ func FormatFairnessRSS(status ProcessStatus, expectations []FairnessRSSExpectati
 	return b.String()
 }
 
-func FormatFlowWorkerMap(status ProcessStatus, limit int) string {
+func FormatFlowWorkerMap(status userspace.ProcessStatus, limit int) string {
 	var b strings.Builder
-	rows := append([]FlowWorkerStatus(nil), status.FlowWorkerMap...)
+	rows := append([]userspace.FlowWorkerStatus(nil), status.FlowWorkerMap...)
 	sort.Slice(rows, func(i, j int) bool { return flowWorkerStatusLess(rows[i], rows[j]) })
 	if limit == 0 {
 		limit = defaultFlowWorkerMapLimit
@@ -731,7 +733,7 @@ func parsePositiveFlowWorkerMapLimit(value string) (int, error) {
 	return limit, nil
 }
 
-func flowWorkerStatusLess(a, b FlowWorkerStatus) bool {
+func flowWorkerStatusLess(a, b userspace.FlowWorkerStatus) bool {
 	if a.WorkerID != b.WorkerID {
 		return a.WorkerID < b.WorkerID
 	}
@@ -744,7 +746,7 @@ func flowWorkerStatusLess(a, b FlowWorkerStatus) bool {
 	return flowTupleLess(a.SessionKey, b.SessionKey)
 }
 
-func flowTupleLess(a, b FlowTupleStatus) bool {
+func flowTupleLess(a, b userspace.FlowTupleStatus) bool {
 	if a.Protocol != b.Protocol {
 		return a.Protocol < b.Protocol
 	}
@@ -760,7 +762,7 @@ func flowTupleLess(a, b FlowTupleStatus) bool {
 	return a.DstPort < b.DstPort
 }
 
-func FormatBindings(status ProcessStatus) string {
+func FormatBindings(status userspace.ProcessStatus) string {
 	var b strings.Builder
 
 	fmt.Fprintln(&b, "Userspace queues:")
@@ -877,7 +879,7 @@ func formatOptionalUint8(value *uint8) string {
 	return fmt.Sprintf("%d", *value)
 }
 
-func formatFlowTuple(tuple FlowTupleStatus) string {
+func formatFlowTuple(tuple userspace.FlowTupleStatus) string {
 	if tuple.SrcIP == "" && tuple.DstIP == "" && tuple.SrcPort == 0 && tuple.DstPort == 0 && tuple.Protocol == 0 {
 		return "-"
 	}

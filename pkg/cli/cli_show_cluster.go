@@ -11,6 +11,7 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
 	"github.com/psaab/xpf/pkg/devicemap"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -182,7 +183,7 @@ func (c *CLI) showChassisCluster(args []string) error {
 				case "fairness":
 					return c.showChassisClusterDataPlaneFairness()
 				case "flows":
-					limit, err := dpuserspace.ParseFlowWorkerMapLimitSpec(strings.Join(args[2:], " "))
+					limit, err := dpformat.ParseFlowWorkerMapLimitSpec(strings.Join(args[2:], " "))
 					if err != nil {
 						return err
 					}
@@ -315,7 +316,7 @@ func (c *CLI) showChassisClusterDataPlaneStats() error {
 	fmt.Print(c.cluster.FormatDataPlaneStatistics())
 	if status, err := c.userspaceDataplaneStatus(); err == nil {
 		fmt.Println()
-		fmt.Print(dpuserspace.FormatStatusSummary(status))
+		fmt.Print(dpformat.FormatStatusSummary(status))
 	}
 	return nil
 }
@@ -328,7 +329,7 @@ func (c *CLI) showChassisClusterDataPlaneInterfaces() error {
 	fmt.Print(c.cluster.FormatDataPlaneInterfaces())
 	if status, err := c.userspaceDataplaneStatus(); err == nil {
 		fmt.Println()
-		fmt.Print(dpuserspace.FormatBindings(status))
+		fmt.Print(dpformat.FormatBindings(status))
 	}
 	return nil
 }
@@ -342,7 +343,7 @@ func (c *CLI) showChassisClusterDataPlaneFairness() error {
 	if err != nil {
 		return err
 	}
-	fmt.Print(dpuserspace.FormatFairnessRSS(status, dpuserspace.FairnessRSSExpectationsFromConfig(c.store.ActiveConfig())))
+	fmt.Print(dpformat.FormatFairnessRSS(status, dpuserspace.FairnessRSSExpectationsFromConfig(c.store.ActiveConfig())))
 	return nil
 }
 
@@ -355,7 +356,7 @@ func (c *CLI) showChassisClusterDataPlaneFlows(limit int) error {
 	if err != nil {
 		return err
 	}
-	fmt.Print(dpuserspace.FormatFlowWorkerMap(status, limit))
+	fmt.Print(dpformat.FormatFlowWorkerMap(status, limit))
 	return nil
 }
 

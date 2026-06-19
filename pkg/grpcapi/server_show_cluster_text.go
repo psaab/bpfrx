@@ -23,6 +23,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
 	"google.golang.org/grpc/metadata"
 )
 
@@ -142,7 +143,7 @@ func (s *Server) showChassisClusterDataPlaneStatistics(buf *strings.Builder) {
 	buf.WriteString(s.cluster.FormatDataPlaneStatistics())
 	if status, err := s.userspaceDataplaneStatus(); err == nil {
 		buf.WriteString("\n")
-		buf.WriteString(dpuserspace.FormatStatusSummary(status))
+		buf.WriteString(dpformat.FormatStatusSummary(status))
 	}
 }
 
@@ -157,7 +158,7 @@ func (s *Server) showChassisClusterDataPlaneInterfaces(buf *strings.Builder) {
 	buf.WriteString(s.cluster.FormatDataPlaneInterfaces())
 	if status, err := s.userspaceDataplaneStatus(); err == nil {
 		buf.WriteString("\n")
-		buf.WriteString(dpuserspace.FormatBindings(status))
+		buf.WriteString(dpformat.FormatBindings(status))
 	}
 }
 
@@ -173,7 +174,7 @@ func (s *Server) showChassisClusterDataPlaneFairness(buf *strings.Builder) {
 		fmt.Fprintf(buf, "Userspace status unavailable: %v\n", err)
 		return
 	}
-	buf.WriteString(dpuserspace.FormatFairnessRSS(status, dpuserspace.FairnessRSSExpectationsFromConfig(s.store.ActiveConfig())))
+	buf.WriteString(dpformat.FormatFairnessRSS(status, dpuserspace.FairnessRSSExpectationsFromConfig(s.store.ActiveConfig())))
 }
 
 // showChassisClusterDataPlaneFlows renders the bounded active
@@ -183,7 +184,7 @@ func (s *Server) showChassisClusterDataPlaneFlows(filter string, buf *strings.Bu
 		fmt.Fprintln(buf, "Cluster not configured")
 		return
 	}
-	limit, err := dpuserspace.ParseFlowWorkerMapLimitSpec(filter)
+	limit, err := dpformat.ParseFlowWorkerMapLimitSpec(filter)
 	if err != nil {
 		fmt.Fprintf(buf, "syntax error: %v\n", err)
 		return
@@ -193,7 +194,7 @@ func (s *Server) showChassisClusterDataPlaneFlows(filter string, buf *strings.Bu
 		fmt.Fprintf(buf, "Userspace status unavailable: %v\n", err)
 		return
 	}
-	buf.WriteString(dpuserspace.FormatFlowWorkerMap(status, limit))
+	buf.WriteString(dpformat.FormatFlowWorkerMap(status, limit))
 }
 
 // showChassisClusterIPMonitoringStatus renders the IP-monitoring

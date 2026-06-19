@@ -12,6 +12,7 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
 	"github.com/psaab/xpf/pkg/feeds"
 	"github.com/psaab/xpf/pkg/logging"
 )
@@ -778,7 +779,7 @@ func (c *CLI) screenSYNCookieCounterRows() string {
 	if err != nil {
 		return ""
 	}
-	return dpuserspace.FormatSYNCookieCounterRows(dpuserspace.SumSYNCookieCounters(status))
+	return dpformat.FormatSYNCookieCounterRows(dpformat.SumSYNCookieCounters(status))
 }
 
 func (c *CLI) showAddressBook(args []string) error {
