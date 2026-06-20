@@ -1,6 +1,49 @@
 # #2089 — Security-policy `reject` action: emit TCP RST / ICMP unreachable instead of silent drop
 
-**Status:** DRAFT v1 — pending adversarial plan review
+**Status:** v2 — revised after two hostile plan reviews (A: PLAN-NEEDS-MINOR,
+B: PLAN-NEEDS-MAJOR). Both reviewers verified the dataplane-only premise,
+the reuse of existing primitives, the type-agnostic v6 ICMP checksum, and
+the "rejected flows are never cached/session-installed" claim as TRUE
+against source. v2 resolves the three valid findings: (1) the reject
+behavior is pinned to the project's OWN validated legacy-eBPF reject
+prior art (commits `8400e23`, `3fc0a58` — "matching Junos reject
+behavior") rather than to an ambiguous docs reading; (2) per-site inline
+reject-enqueue instead of a shared deny/reject terminal (the two deny
+sites are structurally asymmetric); (3) the RST seq/ack spec is stated
+independently of the cookie path. See §11 for the review disposition.
+
+## 0. Authoritative reference: the legacy eBPF reject (prior art)
+
+xpf already shipped this exact feature on the retired eBPF dataplane
+(`git show 8400e23`, `git show 3fc0a58`; `docs/session-history.md:56,206`).
+That implementation is the canonical reference for the wire behavior —
+its commit message states it generates "proper ICMP/ICMPv6 Destination
+Unreachable (admin prohibited) responses for UDP, ICMP queries, and
+other non-TCP traffic, **matching Junos reject behavior**." The exact
+legacy dispatch (verbatim from `3fc0a58`, the post-#1476-deleted
+`bpf/xdp` source) is:
+
+```
+if (rule->action == ACTION_REJECT) {
+    if (meta->protocol == PROTO_TCP)        // TCP -> RST (v4/v6)
+        return send_tcp_rst_v{4,6}(...);
+    // RFC 792/4443: never send ICMP error about an ICMP error.
+    // ICMPv4 error types: 3,4,5,11,12.  ICMPv6: all types < 128 are errors.
+    if (meta->protocol == PROTO_ICMP &&
+        (icmp_type == 3 || 4 || 5 || 11 || 12)) return XDP_DROP;
+    if (meta->protocol == PROTO_ICMPV6 && icmp_type < 128) return XDP_DROP;
+    // UDP, ICMP queries (echo/etc.), and other non-TCP -> ICMP unreachable
+    return send_icmp_unreach_v{4,6}(...);   // v4 type 3 code 13; v6 type 1 code 1
+}
+return XDP_DROP;
+```
+
+This **settles** the parity question raised by review B-C1: xpf's intended
+parity behavior is ICMPv4 type 3 **code 13** / ICMPv6 type 1 **code 1**
+(administratively prohibited) for non-TCP, with replies generated for UDP
++ ICMP *query* types + other non-TCP, and suppressed only for inbound
+ICMP/ICMPv6 *error* types. This plan reproduces that legacy behavior on
+the userspace dataplane.
 
 ## 1. Issue framing
 
@@ -97,29 +140,36 @@ Add `build_reject_rst_frame(frame: &[u8]) -> Option<Vec<u8>>`:
 
 - Parse via `parse_tcp_reply_source` (already returns
   `seq`, `ack`, `flags`, ports, family, l3).
-- Compute RST fields per RFC 793 §3.4 ("Reset Generation"):
-  - If the incoming segment has **no ACK** (e.g. a SYN): the RST
-    carries `seq = 0`, `ack = incoming_seq + segment_len`, and flags
-    `RST|ACK`. For a bare SYN, segment_len counts the SYN as 1, so
-    `ack = incoming_seq + 1`. (We treat all reject-RST as 0-payload;
-    SYN/FIN each consume one sequence number — see open question Q3 for
-    the exact `seg_len` handling. For the common bare-SYN case
-    `ack = seq + 1`.)
-  - If the incoming segment **has an ACK**: the RST carries
-    `seq = incoming_ack`, no ACK flag, flags `RST`. (Same as the
-    existing `build_syn_cookie_ack_rst_frame`.)
+- Compute RST fields per RFC 9293 §3.5.2 / RFC 793 §3.4 "Reset
+  Generation" — stated here **independently of the cookie path** (review
+  A-M1/B-M1: the existing `build_syn_cookie_ack_rst_frame` emits
+  `RST|ACK` with `ack=seq+1`, which is the validated-cookie special
+  case, NOT the general reset rule — do not copy it):
+  - If the incoming segment carries **no ACK** (e.g. a bare SYN): the
+    RST has `seq = 0`, `ack = incoming_seq + seg_len`, flags `RST|ACK`.
+    `seg_len` counts the SYN (and FIN, if present) as 1 plus any payload
+    bytes; for a bare SYN `ack = incoming_seq + 1`. (Computing the exact
+    `seg_len` from the inbound frame — payload length from IP total-len
+    minus headers, plus SYN/FIN — is part of the builder; the dominant
+    bare-SYN case is `seq+1`.)
+  - If the incoming segment **carries an ACK**: the RST has
+    `seq = incoming_ack`, **no ACK flag**, flags `RST` only. This is the
+    canonical RFC reset for an ACK-bearing segment to a closed port and
+    is **deliberately different** from the cookie builder's `RST|ACK`.
 - Reuse `build_syn_cookie_tcp_reply_v4/v6` for the L2/L3/L4 assembly
   (it already swaps identity + checksums). The RST window is already
   forced to 0 in `write_syn_cookie_tcp_header` when `TCP_FLAG_RST` is
-  set, which is correct.
-- Do **not** reply to an incoming RST (`flags & RST != 0` → return
-  `None`); never RST-storm.
+  set, which is correct. (`write_syn_cookie_tcp_header` always writes
+  the ack field; for the no-ACK-flag case the ack value is ignored by
+  the receiver because the ACK bit is clear — confirm the data-offset
+  byte and flags are written exactly, with the ACK bit cleared.)
+- Do **not** reply to an incoming RST (`incoming flags & RST != 0` →
+  return `None`); never RST-storm.
 
 This is a thin wrapper that selects seq/ack/flags then delegates to the
-existing assembly. `build_syn_cookie_ack_rst_frame` can optionally be
-re-expressed in terms of the general builder (decided at impl time;
-default is to leave it untouched to keep the cookie path byte-identical
-and avoid expanding the diff).
+existing assembly. `build_syn_cookie_ack_rst_frame` is left **untouched**
+(cookie path stays byte-identical; the general builder does not subsume
+it because the cookie case intentionally uses `RST|ACK`).
 
 **`userspace-dp/src/afxdp/icmp.rs` — admin-prohibited builders**
 
@@ -170,10 +220,19 @@ Behavior:
    (or a sibling) so reject replies never starve the TX ring.
 2. If `meta.protocol == PROTO_TCP`: build via `build_reject_rst_frame`.
    Else build via `build_reject_icmp_unreachable`.
-   - **Never reply to an ICMP/ICMPv6 error message** (`is_icmp_error`)
-     and never reply to a non-first fragment (no L4 header) — return
-     without sending. (Junos likewise does not generate an unreachable
-     for an inbound ICMP error or a fragment with no transport header.)
+   - **ICMP-error suppression must match the legacy prior art exactly**
+     (§0) — do NOT reuse `is_icmp_error`, whose type sets differ
+     (`is_icmp_error` is v4 `{3,11,12}` / v6 `{1,2,3,4}`, used for the
+     embedded-ICMP-NAT path). The reject guard is:
+     - `PROTO_ICMP` and `icmp_type ∈ {3,4,5,11,12}` → no reply (drop).
+     - `PROTO_ICMPV6` and `icmp_type < 128` → no reply (drop).
+     - all other non-TCP (UDP, ICMP *query* types like echo, GRE, …) →
+       send the unreachable.
+     `icmp_type` is read from `frame.get(meta.l4_offset)` (same parse as
+     `poll_descriptor/mod.rs:850-853`), with bounds-check → fail-closed
+     to silent drop if absent.
+   - Never reply to a non-first fragment (no L4 header) — return without
+     sending (the inbound has no transport header to quote/key).
 3. On a successful build, push a `TxRequest` (host-generated frame
    shape, as the SYN-cookie path does) onto
    `tx_pipeline.pending_tx_local`, bump a new
@@ -198,18 +257,32 @@ There are three policy-deny code paths in
   re-confirmed at impl time** (open question Q4) — if a denied flow
   can re-enter via the cache, the reject must fire there too.
 
-At A and B, **before** recycling the frame, when
-`matches!(action, PolicyAction::Reject)` call
-`enqueue_policy_reject_reply(...)`. The drop/recycle (`scratch_recycle.push;
-continue;`) is unchanged — the reply is an addition, the original
-packet is still dropped. `Deny` is completely unchanged (still a silent
-drop).
+**Per-site inline insertion — NOT a shared deny/reject terminal**
+(reviews A-finding-6 / B-M2). The two deny sites are structurally
+**asymmetric** (verified against source):
 
-To avoid duplicating the gate at both A and B, factor the
-"deny-or-reject terminal" handling into one helper that: emits the
-deny/reject event, sets `ForwardingDisposition::PolicyDenied`, and (for
-`Reject`) enqueues the reply. Both sites call it. This keeps A/B
-behavior identical for `Deny` and centralizes the `Reject` branch.
+- **Site A** (`~2374-2406`): handles the deny terminal *inline* — emits
+  the deny event, sets `PolicyDenied`, calls `record_forwarding_disposition`,
+  then `scratch_recycle.push(desc.addr); continue;`. `policy_result.action`,
+  `flow`, `meta`, `packet_frame`, `binding.tx_pipeline`,
+  `worker_ctx.forwarding`, and `worker_ctx.ident` are all in scope.
+- **Site B** (`~1719-1750`): only emits the deny event, bumps debug
+  counters, and sets `decision.resolution.disposition = PolicyDenied`,
+  then **falls through** to the centralized disposition epilogue
+  (`PolicyDenied` arm at `~3007`, `record_forwarding_disposition` at
+  `~3011`, recycle in the shared epilogue). At that epilogue
+  `policy_result.action` and the non-Option `flow` are **out of scope**.
+
+A single "deny terminal" helper would therefore either double-record at
+A or break B's fall-through, and cannot reach the reply state at B's
+epilogue. So v2 inserts the reject-reply **inline at each site**,
+gated `if matches!(policy_result.action, PolicyAction::Reject)`,
+**before that site's existing recycle/disposition-set**, calling
+`enqueue_policy_reject_reply(...)`. The existing `Deny` code at both
+sites is left **byte-for-byte unchanged** — the reply is a pure
+addition on the `Reject` sub-branch. (Site B's reply must be enqueued
+at `~1719` where `action`/`flow`/`packet_frame` are live, before the
+fall-through, not at the shared epilogue.)
 
 ### 4.4 Event / RT_FLOW correctness
 
@@ -277,6 +350,15 @@ Existing Rust signatures preserved:
    ingress interface address (`egress.primary_v4/v6`), matching the
    time-exceeded builder and Junos behavior (the RE/interface address,
    not a spoof of the original destination).
+8. **Frame provenance — reflect the ORIGINAL, pre-NAT inbound packet**
+   (review B-m2; verified). The policy decision precedes NAT apply (NAT
+   is in the `Permit` arm at `~1161+`), and the deny sites use the
+   ingress frame (`owned_packet_frame.as_deref().unwrap_or(raw_frame)`,
+   `mod.rs:~280`). The RST/ICMP must therefore reflect the un-NAT'd
+   client tuple — which it does, because the builders read
+   `packet_frame` at the deny site (pre-NAT). Reflecting a mutated frame
+   would be a silent correctness bug; the plan asserts this invariant
+   explicitly so impl + tests guard it.
 
 ## 7. Risk assessment
 
@@ -310,14 +392,27 @@ Existing Rust signatures preserved:
 - **Smoke on loss userspace cluster** (per skill, v4+v6 × push+reverse,
   Pass A CoS-disabled + Pass B per-class) to prove **no permit
   fast-path regression** — full 30-measurement matrix.
-- **Reject directional matrix** (the issue's acceptance test):
-  configure a zone policy `then reject`; from the client side
-  (`cluster-userspace-host`) attempt a TCP connection through it and
-  `tcpdump` on the client for an inbound **RST**; send a UDP/ICMP
-  probe and capture an inbound **ICMP/ICMPv6 unreachable** (v4 type 3
-  code 13 / v6 type 1 code 1). Confirm `show security flow` /
-  Prometheus `policy_reject_sent` increments. Confirm a `then deny`
-  policy still produces **no** reply (silent drop preserved).
+- **Reject directional matrix** (the issue's acceptance test; expanded
+  per review B test-gaps):
+  - **TCP v4 + v6**: connect through a `then reject` policy; `tcpdump`
+    on the client for an inbound **RST** (both families — v6 explicitly,
+    not implied).
+  - **UDP v4 + v6**: probe through reject; capture an inbound **ICMP/
+    ICMPv6 unreachable** (v4 type 3 **code 13** / v6 type 1 **code 1** —
+    the prior-art admin-prohibited codes from §0).
+  - **ICMP *query* (echo) through reject**: capture an inbound
+    unreachable (a query is replied to, per §0).
+  - **Inbound ICMP *error* through reject**: confirm **no** reply
+    (silent drop — the §0 suppression guard).
+  - **`then deny` control**: confirm **no** reply (silent drop
+    preserved) — proves Deny is unchanged.
+  - **Budget / flood fail-closed**: drive a rejected-SYN flood and
+    confirm reject replies are budget-gated (drop to silent under
+    pressure, `policy_reject_budget_drops` increments) without starving
+    transit TX.
+  - Confirm `show security flow` / Prometheus `policy_reject_sent`
+    increments and the syslog RT_FLOW renders action `reject` (not
+    `deny`).
 
 ## 9. Out of scope (explicitly)
 
@@ -383,3 +478,49 @@ Existing Rust signatures preserved:
    the builder returns `None` and we fail-closed to a silent drop — is
    that the right fallback, or should we fall back to another interface
    address?
+
+## 11. Disposition of round-1 hostile plan reviews
+
+Two independent hostile reviewers (substituting for the infra-degraded
+Codex/AGY companion lane) reviewed plan v1 against source.
+
+**Reviewer A — VERDICT: PLAN-NEEDS-MINOR.** Verified the reuse premise,
+ICMP/RST correctness, hot-path gating, and — most importantly — that
+**rejected flows are never cached/session-installed** (`is_cacheable()`
+returns true only for `ForwardCandidate|FabricRedirect`;
+`flow_cache.rs:231/248`, `forwarding.rs:305-310`), so the cache-hit path
+needs no reject wiring (plan Q4 confirmed TRUE). Findings adopted:
+- *MAJOR (finding 6):* the two deny sites are structurally asymmetric;
+  a shared deny terminal risks regressing `Deny`. → **Adopted:** §4.3
+  rewritten to per-site inline insertion, `Deny` byte-unchanged.
+- *MINOR (M1):* the v1 RST ACK-case "same as `build_syn_cookie_ack_rst_frame`"
+  claim was false. → **Adopted:** §4.1 now specifies the RFC reset rule
+  independently and leaves the cookie builder untouched.
+
+**Reviewer B — VERDICT: PLAN-NEEDS-MAJOR.** Verified all internal
+claims (reject reaches the dataplane as a distinct action; no
+control-plane/wire change; `RT_FLOW_ACTION_REJECT=2` round-trips and
+renders "reject"; v6 ICMP checksum is type-agnostic so parameterizing
+the type byte is safe). Findings disposed:
+- *CRITICAL (C1):* claimed vSRX default is UDP→type-3-**code-3**
+  (port-unreachable) and **silent** for other non-TCP, so code 13 /
+  reply-for-all is wrong. → **Resolved via the project's own validated
+  prior art (§0):** the retired eBPF reject (`8400e23`/`3fc0a58`,
+  explicitly "matching Junos reject behavior") used type 3 **code 13** /
+  type 1 **code 1** and replied for UDP + ICMP queries + other non-TCP,
+  suppressing only inbound ICMP *errors*. The plan reproduces that exact
+  behavior. (The reviewer's docs reading is noted but the project's
+  shipped-and-tested intent is authoritative for parity; configurable
+  reject-code remains an explicit out-of-scope enhancement.) The
+  precise suppression guard (v4 `{3,4,5,11,12}`, v6 `<128`) from the
+  prior art is adopted in §4.2 in place of v1's vague `is_icmp_error`.
+- *MAJOR (M1, M2):* same as A's M1/finding-6 — adopted (above).
+- *MINOR (m2):* assert pre-NAT frame provenance. → **Adopted** as
+  invariant 8 (§6).
+- *Test gaps:* UDP reject, ICMP-query-vs-ICMP-error, v6 RST, budget
+  flood. → **Adopted** in the §8 directional matrix.
+
+**Net:** the architectural premise (dataplane-only, reuse existing
+primitives, per-site insertion) is confirmed sound by both reviewers
+and pinned to the project's own prior-art wire behavior. v2 is ready for
+implementation.
