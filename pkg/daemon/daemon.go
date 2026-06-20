@@ -32,6 +32,7 @@ import (
 	"github.com/psaab/xpf/pkg/ipsec"
 	"github.com/psaab/xpf/pkg/lldp"
 	"github.com/psaab/xpf/pkg/logging"
+	"github.com/psaab/xpf/pkg/natpoolalarm"
 	"github.com/psaab/xpf/pkg/networkd"
 	"github.com/psaab/xpf/pkg/ra"
 	"github.com/psaab/xpf/pkg/routing"
@@ -127,6 +128,12 @@ type Daemon struct {
 	// d.routing.ApplyProbePins (#1895).
 	probePinApply func([]routing.ProbePin) map[string]error
 	ipmon         *ipmon.Engine
+	// natPoolAlarm is the #2079 NAT source pool-utilization-alarm monitor:
+	// a slow (10s) loop over the helper's last-applied NAT pool snapshot
+	// that raises/clears `show security alarms` entries with hysteresis and
+	// emits one structured RT_NAT syslog line per transition. Nil in
+	// NoDataplane mode (no helper to sample).
+	natPoolAlarm *natpoolalarm.Monitor
 	// pendingFIBBump records an UNCONFIRMED FIB-generation bump after a
 	// successful route-overlay publish (#1844, Codex plan r2-1): the
 	// bump_fib_generation control message failed, so the next actuation

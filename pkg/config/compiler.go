@@ -110,6 +110,21 @@ type compileOpts struct {
 	// SchemaValidate (tcp-mss stays opaque there).
 	lenientTCPMSSRange bool
 
+	// lenientNATPoolAlarmThreshold (#2079) downgrades the
+	// security-nat-source pool-utilization-alarm threshold gate
+	// (validatePoolUtilizationAlarm) from a hard compile error to a
+	// cfg.Warnings entry. Set ONLY on the tolerant load / peer-sync paths
+	// (CompileConfigLenient / CompileConfigForNodeLenient): the thresholds
+	// had NO validation before #2079, so an operator could (and would) have
+	// committed a bare `pool-utilization-alarm;` (raise=0/clear=0) or an
+	// inverted/equal pair, persisted to active.json. After upgrade that
+	// config must still LOAD (warn) instead of failing the daemon closed on
+	// restart (fail-closed-on-compile-failure, #1960); the operator's next
+	// strict commit rejects it loudly. The runtime monitor treats raise<=0 as
+	// "feature disabled", so a leniently-loaded bad config is inert, not
+	// always-firing. Same doctrine as lenientTCPMSSRange.
+	lenientNATPoolAlarmThreshold bool
+
 	// lenientPolicyMatchAddress (#2008) downgrades the policy match-
 	// address validator (validatePolicyMatchAddressesStrict) from a hard
 	// compile error to a cfg.Warnings entry. The strict commit /
@@ -201,6 +216,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientIPsecPolicyProposalRef: true,
 		lenientIPsecGatewayRefs:       true,
 		lenientLogProfileStreamRef:    true,
+		lenientNATPoolAlarmThreshold:  true,
 	})
 }
 
@@ -282,6 +298,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientIPsecPolicyProposalRef: true,
 		lenientIPsecGatewayRefs:       true,
 		lenientLogProfileStreamRef:    true,
+		lenientNATPoolAlarmThreshold:  true,
 	})
 }
 
@@ -700,6 +717,19 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	// tracking on an address-owner group (priority 255) where the
 	// runtime ignores tracking.
 	cfg.Warnings = append(cfg.Warnings, vrrpTrackConfigWarnings(cfg)...)
+
+	// #2079: NAT source pool-utilization-alarm threshold gate. Require
+	// 0 < clear < raise <= 100. Strict (commit / commit-check): hard-reject a
+	// bare `pool-utilization-alarm;` (raise=0/clear=0, always-firing) or an
+	// inverted/equal pair. Lenient (load / peer-sync): warn + let the runtime
+	// monitor treat raise<=0 as disabled, so an upgraded node loading a legacy
+	// config committed before this gate existed still boots (#1960
+	// fail-closed-on-compile-failure would otherwise brick it).
+	napWarnings, err := validatePoolUtilizationAlarm(cfg, opts.lenientNATPoolAlarmThreshold)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Warnings = append(cfg.Warnings, napWarnings...)
 
 	// #1892: retired DPDK-era `system dataplane` knobs (cores, memory,
 	// socket-mem, rx-mode, ports) parse for stored-config compatibility

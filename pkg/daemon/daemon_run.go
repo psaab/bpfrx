@@ -37,6 +37,7 @@ import (
 	"github.com/psaab/xpf/pkg/ipsec"
 	"github.com/psaab/xpf/pkg/lldp"
 	"github.com/psaab/xpf/pkg/logging"
+	"github.com/psaab/xpf/pkg/natpoolalarm"
 	"github.com/psaab/xpf/pkg/networkd"
 	"github.com/psaab/xpf/pkg/ra"
 	"github.com/psaab/xpf/pkg/routing"
@@ -867,6 +868,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 				d.runUserspaceEventStream(ctx)
 			}()
 		}
+
+		// #2079: start the NAT source pool-utilization-alarm monitor HERE —
+		// after d.dp and d.eventReader are both fully assigned above — so the
+		// monitor goroutine's sampler (reads d.dp) and emitter (reads
+		// d.eventReader) never race with their initialization. Slow (10s) loop
+		// over the helper's last-applied NAT pool snapshot; raises/clears
+		// `show security alarms` entries with hysteresis and emits one
+		// structured RT_NAT syslog line per transition. (The whole block is
+		// gated on a non-NoDataplane dataplane being present.)
+		d.natPoolAlarm = natpoolalarm.New(d.natPoolAlarmSampler(), d.natPoolAlarmEmitter())
+		d.natPoolAlarm.Start()
 	}
 
 	// Start cluster heartbeat + sync after event fanout is initialized.
@@ -1265,6 +1277,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 				}
 				return nil
 			},
+			// #2079: active NAT pool-utilization alarms for
+			// `show security alarms`.
+			NATPoolAlarmsFn: d.natPoolAlarms,
 			FeedsFn: func() map[string]feeds.FeedInfo {
 				if d.feeds != nil {
 					return d.feeds.AllFeeds()
@@ -1383,6 +1398,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}
 			return nil
 		})
+		// #2079: active NAT pool-utilization alarms for `show security alarms`.
+		shell.SetNATPoolAlarmsFn(d.natPoolAlarms)
 		shell.SetFeedsFn(func() map[string]feeds.FeedInfo {
 			if d.feeds != nil {
 				return d.feeds.AllFeeds()
@@ -1488,6 +1505,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// arrive during teardown).
 	if d.ipmon != nil {
 		d.ipmon.Stop()
+	}
+
+	// #2079: stop the NAT pool-utilization-alarm monitor.
+	if d.natPoolAlarm != nil {
+		d.natPoolAlarm.Stop()
 	}
 
 	// Stop the FRR manager (after ipmon, whose actuator is an FRR

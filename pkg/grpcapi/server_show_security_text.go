@@ -33,6 +33,7 @@ import (
 	"github.com/psaab/xpf/pkg/feeds"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"github.com/psaab/xpf/pkg/ipmon"
+	"github.com/psaab/xpf/pkg/natpoolalarm"
 	"github.com/psaab/xpf/pkg/rpm"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -350,6 +351,11 @@ func (s *Server) showSecurityAlarms(cfg *config.Config, topic string, buf *strin
 				}
 			}
 		}
+	}
+
+	// #2079: NAT source pool-utilization alarms from the daemon monitor.
+	if s.natPoolAlarmsFn != nil {
+		alarmCount = natpoolalarm.RenderAlarms(buf, s.natPoolAlarmsFn(), alarmCount, detail)
 	}
 
 	if alarmCount == 0 {

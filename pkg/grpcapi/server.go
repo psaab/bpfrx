@@ -28,6 +28,7 @@ import (
 	"github.com/psaab/xpf/pkg/ipsec"
 	"github.com/psaab/xpf/pkg/lldp"
 	"github.com/psaab/xpf/pkg/logging"
+	"github.com/psaab/xpf/pkg/natpoolalarm"
 	"github.com/psaab/xpf/pkg/ra"
 	"github.com/psaab/xpf/pkg/routing"
 	"github.com/psaab/xpf/pkg/rpm"
@@ -36,18 +37,21 @@ import (
 
 // Config configures the gRPC server.
 type Config struct {
-	Store           *configstore.Store
-	DP              grpcRuntime
-	EventBuf        *logging.EventBuffer
-	GC              *conntrack.GC
-	Routing         *routing.Manager
-	FRR             *frr.Manager
-	IPsec           *ipsec.Manager
-	Cluster         *cluster.Manager
-	DHCP            *dhcp.Manager
-	DHCPServer      *dhcpserver.Manager
-	RPMResultsFn    func() []*rpm.ProbeResult        // returns live RPM results
-	IPMonStatusFn   func() []ipmon.PolicyStatus      // returns live ip-monitoring policy status (#1827)
+	Store         *configstore.Store
+	DP            grpcRuntime
+	EventBuf      *logging.EventBuffer
+	GC            *conntrack.GC
+	Routing       *routing.Manager
+	FRR           *frr.Manager
+	IPsec         *ipsec.Manager
+	Cluster       *cluster.Manager
+	DHCP          *dhcp.Manager
+	DHCPServer    *dhcpserver.Manager
+	RPMResultsFn  func() []*rpm.ProbeResult   // returns live RPM results
+	IPMonStatusFn func() []ipmon.PolicyStatus // returns live ip-monitoring policy status (#1827)
+	// NATPoolAlarmsFn returns the active NAT pool-utilization alarms for
+	// `show security alarms` (#2079). nil when no monitor is wired.
+	NATPoolAlarmsFn func() []natpoolalarm.ActiveAlarm
 	FeedsFn         func() map[string]feeds.FeedInfo // returns live feed status
 	LLDPNeighborsFn func() []*lldp.Neighbor          // returns live LLDP neighbors
 	// #1387 inc-2: DHCP dynamic-DNS status sources for
@@ -86,6 +90,7 @@ type Server struct {
 	dhcpServer         *dhcpserver.Manager
 	rpmResultsFn       func() []*rpm.ProbeResult
 	ipmonStatusFn      func() []ipmon.PolicyStatus
+	natPoolAlarmsFn    func() []natpoolalarm.ActiveAlarm
 	feedsFn            func() map[string]feeds.FeedInfo
 	lldpNeighborsFn    func() []*lldp.Neighbor
 	ddnsStatsFn        func() *dhcpserver.DDNSStats
@@ -137,6 +142,7 @@ func NewServer(addr string, cfg Config) *Server {
 		dhcpServer:         cfg.DHCPServer,
 		rpmResultsFn:       cfg.RPMResultsFn,
 		ipmonStatusFn:      cfg.IPMonStatusFn,
+		natPoolAlarmsFn:    cfg.NATPoolAlarmsFn,
 		feedsFn:            cfg.FeedsFn,
 		lldpNeighborsFn:    cfg.LLDPNeighborsFn,
 		ddnsStatsFn:        cfg.DDNSStatsFn,

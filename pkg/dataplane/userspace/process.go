@@ -288,6 +288,10 @@ func (m *Manager) syncSnapshotLocked() error {
 		hash, hashOK := snapshotContentHash(m.lastSnapshot)
 		m.publishedSnapshot = m.lastSnapshot.Generation
 		m.publishedPlanKey = planKey
+		// #2079: the helper already reports this generation as applied
+		// (status.LastSnapshotGeneration >= m.lastSnapshot.Generation
+		// gated this branch), so it IS the applied snapshot.
+		m.markAppliedSnapshotLocked()
 		if hashOK {
 			m.lastSnapshotHash = hash
 		}
@@ -361,6 +365,8 @@ func (m *Manager) syncSnapshotLocked() error {
 	m.rebuildMonitoredIfindexes()
 	m.publishedSnapshot = m.lastSnapshot.Generation
 	m.publishedPlanKey = planKey
+	// #2079: deferred full apply_snapshot succeeded — record applied.
+	m.markAppliedSnapshotLocked()
 	if hashOK {
 		m.lastSnapshotHash = hash
 	}
@@ -573,6 +579,10 @@ func (m *Manager) stopLocked() {
 	m.lastBindingsAutoRebind = time.Time{}
 	m.publishedSnapshot = 0
 	m.publishedPlanKey = ""
+	// #2079: forget the applied snapshot when the helper stops so a
+	// restarted helper does not expose a stale applied config before its
+	// first apply lands (AppliedNATView also guards on m.proc == nil).
+	m.appliedSnapshot = appliedSnapshot{}
 	m.sessionMirrorFailed = false
 	m.sessionMirrorErr = ""
 }
@@ -1066,6 +1076,15 @@ func (m *Manager) NotifyLinkCycle() {
 		return
 	}
 	_ = m.applyHelperStatusLocked(&status)
+	// #2079 r11: the deferred apply (DeferWorkers) skipped the appliedSnapshot
+	// capture because the helper had not reconciled its forwarding state. The
+	// rebind above reconciles the bindings (and swaps the coordinator
+	// forwarding state to the applied generation), so NOW record the applied
+	// snapshot — its config + generation are coherent with the NAT pool
+	// counters the helper will report. m.deferWorkers is cleared by the daemon
+	// before NotifyLinkCycle, so markAppliedSnapshotLocked's defer-skip does
+	// not suppress this capture.
+	m.markAppliedSnapshotLocked()
 	ready := 0
 	for _, b := range status.Bindings {
 		if b.Ready {

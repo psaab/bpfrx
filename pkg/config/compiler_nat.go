@@ -8,6 +8,39 @@ import (
 	"strings"
 )
 
+// validatePoolUtilizationAlarm is the #2079 strict-vs-lenient gate for the
+// `security nat source pool-utilization-alarm raise-threshold/clear-threshold`
+// thresholds. Junos requires raise > clear; a bare `pool-utilization-alarm;`
+// compiles to raise=0/clear=0 (an always-firing alarm) and inverted/equal
+// thresholds make hysteresis meaningless. Strict (commit / commit-check):
+// hard-reject. Lenient (load / peer-sync, #1979 doctrine): return the message
+// as a warning so a config committed before this gate existed still boots
+// (#1960 fail-closed-on-compile-failure would otherwise brick the daemon on
+// restart). The runtime monitor treats raise<=0 as disabled, so a leniently
+// loaded bad config is inert, not always-firing.
+func validatePoolUtilizationAlarm(cfg *Config, lenient bool) ([]string, error) {
+	if cfg == nil {
+		return nil, nil
+	}
+	a := cfg.Security.NAT.PoolUtilizationAlarm
+	if a == nil {
+		return nil, nil
+	}
+	var msg string
+	switch {
+	case a.RaiseThreshold <= 0 || a.RaiseThreshold > 100:
+		msg = fmt.Sprintf("pool-utilization-alarm: raise-threshold must be in 1..100, got %d", a.RaiseThreshold)
+	case a.ClearThreshold <= 0 || a.ClearThreshold >= a.RaiseThreshold:
+		msg = fmt.Sprintf("pool-utilization-alarm: clear-threshold must be in 1..raise-threshold-1 (0 < clear < raise), got clear=%d raise=%d", a.ClearThreshold, a.RaiseThreshold)
+	default:
+		return nil, nil
+	}
+	if lenient {
+		return []string{msg + " (ignored: alarm disabled until corrected)"}, nil
+	}
+	return nil, fmt.Errorf("%s", msg)
+}
+
 func compileNAT(node *Node, sec *SecurityConfig) error {
 	// Initialize SourcePools map
 	if sec.NAT.SourcePools == nil {
@@ -421,6 +454,13 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 			return fmt.Errorf("pool %q: deterministic and address-persistent are mutually exclusive", pool.Name)
 		}
 	}
+
+	// #2079: pool-utilization-alarm threshold validation is NOT performed
+	// here — it is a strict-vs-lenient gate (validatePoolUtilizationAlarm,
+	// compiler.go typed-config phase) so the strict commit path hard-rejects
+	// while the tolerant load/peer-sync path WARNS. Doing it here would hard-
+	// fail CompileConfigLenient and brick a daemon restart on a legacy config
+	// that was committed before #2079 added validation (#1979 doctrine).
 
 	// Parse source NAT rule-sets
 	for _, rsInst := range namedInstances(node.FindChildren("rule-set")) {

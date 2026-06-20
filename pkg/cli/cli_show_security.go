@@ -15,6 +15,7 @@ import (
 	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
 	"github.com/psaab/xpf/pkg/feeds"
 	"github.com/psaab/xpf/pkg/logging"
+	"github.com/psaab/xpf/pkg/natpoolalarm"
 )
 
 func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) error {
@@ -1834,6 +1835,11 @@ func (c *CLI) showSecurityAlarms(args []string) error {
 				}
 			}
 		}
+	}
+
+	// #2079: NAT source pool-utilization alarms from the daemon monitor.
+	if c.natPoolAlarmsFn != nil {
+		alarmCount = natpoolalarm.RenderAlarms(os.Stdout, c.natPoolAlarmsFn(), alarmCount, detail)
 	}
 
 	if alarmCount == 0 {
