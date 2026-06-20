@@ -573,7 +573,9 @@ func (s *Server) completeConfigPairs(words []string, partial string) []completio
 	}
 
 	switch resolvedTop {
-	case "set", "delete", "show", "edit":
+	case "set", "delete", "activate", "deactivate", "show", "edit":
+		// #2051: activate/deactivate complete with schema parity to delete
+		// (paths to existing nodes), reusing the shared schema completer.
 		pathWords := words[1:]
 		if resolvedPath, resolved := config.ResolveConsumedSetPathTokens(pathWords); resolved {
 			pathWords = resolvedPath

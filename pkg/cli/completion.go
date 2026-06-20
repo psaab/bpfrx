@@ -140,7 +140,10 @@ func (c *CLI) completeConfigWithDesc(words []string, partial string) []completio
 	}
 
 	switch resolvedTop {
-	case "set", "delete", "show", "edit":
+	case "set", "delete", "activate", "deactivate", "show", "edit":
+		// #2051: activate/deactivate complete with schema parity to delete
+		// (paths to existing nodes); CompleteSetPathWithValues is the
+		// schema-driven completer all path verbs share.
 		pathWords := words[1:]
 		if resolvedPath, resolved := config.ResolveConsumedSetPathTokens(pathWords); resolved {
 			pathWords = resolvedPath

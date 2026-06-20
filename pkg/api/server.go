@@ -234,6 +234,8 @@ func NewServer(cfg Config) *Server {
 	mux.HandleFunc("GET /api/v1/config/status", s.configStatusHandler)
 	mux.HandleFunc("POST /api/v1/config/set", s.configSetHandler)
 	mux.HandleFunc("POST /api/v1/config/delete", s.configDeleteHandler)
+	mux.HandleFunc("POST /api/v1/config/deactivate", s.configDeactivateHandler)
+	mux.HandleFunc("POST /api/v1/config/activate", s.configActivateHandler)
 	mux.HandleFunc("POST /api/v1/config/load", s.configLoadHandler)
 	mux.HandleFunc("POST /api/v1/config/commit", s.configCommitHandler)
 	mux.HandleFunc("POST /api/v1/config/commit-check", s.configCommitCheckHandler)

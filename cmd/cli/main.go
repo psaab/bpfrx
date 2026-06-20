@@ -380,8 +380,8 @@ func (c *ctl) handleLoad(args []string) error {
 	}
 
 	mode := args[0]
-	if mode != "override" && mode != "merge" {
-		return fmt.Errorf("load: unknown mode %q (use 'override' or 'merge')", mode)
+	if mode != "override" && mode != "merge" && mode != "set" {
+		return fmt.Errorf("load: unknown mode %q (use 'override', 'merge', or 'set')", mode)
 	}
 
 	source := args[1]

@@ -553,3 +553,26 @@ replay paths (`LoadSet`, `LoadMerge`, and the hierarchical
 output round-trips: an inactive node reloads inactive rather than being
 skipped (and silently reactivated) or parsed as a junk path beginning
 "deactivate".
+
+**Interactive `activate` / `deactivate` config-mode verbs (#2051).** The two
+verbs are first-class config-mode edits on all four surfaces. The store
+exposes `DeactivateFromInput` / `ActivateFromInput` (`configstore/store.go`),
+thin wrappers that prepend the verb and route through the same
+`applyEditLine` switch the replay paths use, so the verb logic lives in one
+place. Local CLI (`cli_dispatch.go`) and remote CLI (`cmd/cli/shared.go`
+`dispatchConfig`) dispatch the verbs; the remote CLI rides the gRPC `Set` RPC
+with the verb kept as the input prefix, and `Server.Set`
+(`grpcapi/server_config.go`) prefix-routes `deactivate `/`activate ` to the
+store wrappers BEFORE the `SetFromInput` fall-through — otherwise the
+fall-through would parse `set deactivate <path>` and create a junk node named
+"deactivate". REST exposes `POST /api/v1/config/deactivate` and
+`/config/activate`. Path completion has schema parity with `delete` (paths to
+existing nodes via `CompleteSetPathWithValues`); cmdtree lists both verbs in
+`ConfigTopLevel`.
+
+**`load set` is a real service-mode op (#2052).** `load set` now works on the
+remote CLI, gRPC, and REST (previously local-CLI-only) via
+`LoadRequest.mode == "set"` → `store.LoadSet`. The applied-count is logged
+(no response field). This makes `show | display set` output — including the
+`deactivate <path>` lines above — round-trippable through every service
+surface.

@@ -311,6 +311,18 @@ func (c *CLI) dispatchConfig(line string) error {
 		}
 		fullPath := append(c.store.GetEditPath(), parts[1:]...)
 		return c.store.DeleteFromInput(strings.Join(fullPath, " "))
+	case "deactivate":
+		if len(parts) < 2 {
+			return fmt.Errorf("deactivate: missing path")
+		}
+		fullPath := append(c.store.GetEditPath(), parts[1:]...)
+		return c.store.DeactivateFromInput(strings.Join(fullPath, " "))
+	case "activate":
+		if len(parts) < 2 {
+			return fmt.Errorf("activate: missing path")
+		}
+		fullPath := append(c.store.GetEditPath(), parts[1:]...)
+		return c.store.ActivateFromInput(strings.Join(fullPath, " "))
 	case "copy", "rename":
 		return c.handleCopyRename(parts)
 	case "insert":
