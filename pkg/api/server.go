@@ -22,6 +22,7 @@ import (
 	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/conntrack"
 	"github.com/psaab/xpf/pkg/dhcp"
+	"github.com/psaab/xpf/pkg/feeds"
 	"github.com/psaab/xpf/pkg/frr"
 	"github.com/psaab/xpf/pkg/fsatomic"
 	"github.com/psaab/xpf/pkg/ipmon"
@@ -105,6 +106,13 @@ type Config struct {
 	// xpf_frr_reload_degraded gauge (0/1, no labels). Optional; if nil,
 	// the gauge is not emitted.
 	FRRReloadDegradedFn func() bool
+	// FeedsFn surfaces live dynamic-address feed status for the
+	// xpf_feed_seconds_since_last_success / xpf_feed_stale gauges (#2050).
+	// A feed that has never fetched successfully, or whose last-good
+	// snapshot is being retained as stale, is the operator's signal that an
+	// enforced address set is frozen (retain-forever default). Optional; if
+	// nil, the feed gauges are omitted.
+	FeedsFn func() map[string]feeds.FeedInfo
 }
 
 // Server is the HTTP API server.
@@ -128,6 +136,7 @@ type Server struct {
 	frrReloadDegradedFn     func() bool
 	ipmonStatusFn           func() []ipmon.PolicyStatus
 	rpmPinFailedFn          func() float64
+	feedsFn                 func() map[string]feeds.FeedInfo
 	startTime               time.Time
 }
 
@@ -151,6 +160,7 @@ func NewServer(cfg Config) *Server {
 		frrReloadDegradedFn:     cfg.FRRReloadDegradedFn,
 		ipmonStatusFn:           cfg.IPMonStatusFn,
 		rpmPinFailedFn:          cfg.RPMPinFailedFn,
+		feedsFn:                 cfg.FeedsFn,
 		startTime:               time.Now(),
 	}
 

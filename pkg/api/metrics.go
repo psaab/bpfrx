@@ -3,6 +3,7 @@ package api
 import (
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -100,6 +101,13 @@ type xpfCollector struct {
 	// rule / pinned route failed to install (affected tests hold
 	// state instead of probing the default path).
 	rpmPinInstallFailures *prometheus.Desc
+
+	// #2050: dynamic-address feed staleness. seconds-since-last-success
+	// climbs while a feed cannot be refreshed (retain-forever default
+	// keeps the last-good snapshot enforced indefinitely); the stale
+	// gauge is 1 while a retained snapshot is being served as stale.
+	feedSecondsSinceSuccess *prometheus.Desc
+	feedStale               *prometheus.Desc
 
 	// #709: CoS owner-profile telemetry (userspace dataplane only).
 	// Cardinality estimate per plan §5: num_queues (≤ 64) × num_interfaces
@@ -416,6 +424,8 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.ipmonRoutesApplied
 	ch <- c.ipmonUnresolvedNextHops
 	ch <- c.rpmPinInstallFailures
+	ch <- c.feedSecondsSinceSuccess
+	ch <- c.feedStale
 	ch <- c.cosDrainLatencyBucket
 	ch <- c.cosDrainInvocationsTotal
 	ch <- c.cosRedirectAcquireBucket
@@ -612,6 +622,28 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 		}
 		ch <- prometheus.MustNewConstMetric(c.frrReloadDegraded,
 			prometheus.GaugeValue, v)
+	}
+
+	// #2050: dynamic-address feed staleness is a control-plane signal (the
+	// feed manager runs even in config-only mode) — emit it BEFORE the
+	// dataplane gate so a frozen enforced address set stays visible when the
+	// dataplane is not loaded.
+	if c.srv.feedsFn != nil {
+		now := time.Now()
+		for name, info := range c.srv.feedsFn() {
+			secs := -1.0
+			if !info.LastSuccess.IsZero() {
+				secs = now.Sub(info.LastSuccess).Seconds()
+			}
+			ch <- prometheus.MustNewConstMetric(c.feedSecondsSinceSuccess,
+				prometheus.GaugeValue, secs, name)
+			stale := 0.0
+			if !info.StaleSince.IsZero() {
+				stale = 1
+			}
+			ch <- prometheus.MustNewConstMetric(c.feedStale,
+				prometheus.GaugeValue, stale, name)
+		}
 	}
 
 	dp := c.srv.dp
