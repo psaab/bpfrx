@@ -698,6 +698,9 @@ func compileFlow(node *Node, sec *SecurityConfig) error {
 			case "rst-invalidate-session":
 				sec.Flow.TCPSession.RstInvalidateSession = true
 				continue
+			case "no-sequence-check":
+				sec.Flow.TCPSession.NoSequenceCheck = true
+				continue
 			}
 			if len(opt.Keys) < 2 {
 				continue

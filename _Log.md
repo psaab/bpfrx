@@ -33,6 +33,19 @@
   userspace-dp/src/afxdp/forwarding_build/mod.rs,
   userspace-dp/src/afxdp/forwarding_build/tests.rs,
   userspace-dp/tests/fixtures/protocol_wire_v1.json, docs/feature-gaps.md
+- **Timestamp**: 2026-06-20
+- **Action**: M9 — add `security flow tcp-session no-sequence-check`. Added the
+  schema child, the TCPSessionConfig.NoSequenceCheck field, and the compiler
+  case, mirroring the no-syn-check / rst-invalidate-session presence flags.
+  Typed-config only (the userspace dataplane performs no TCP sequence
+  validation today, same as its siblings). Updated the schema completion-parity
+  + accept tests and added a dedicated compiler test
+  (TestCompileTCPSessionNoSequenceCheck).
+- **File(s)**: pkg/config/schema_security.go, pkg/config/types_security.go,
+  pkg/config/compiler_security.go,
+  pkg/config/compiler_tcp_session_seqcheck_test.go,
+  pkg/config/schema_validate_flow_numwidth_test.go, docs/config-schema.md,
+  docs/feature-gaps.md
 
 ## 2026-06-20 — #2049 enforce dynamic-address feed prefixes in the userspace dataplane
 

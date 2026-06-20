@@ -569,3 +569,12 @@ drift) closed in `fix/2008-quickwins-batch1`:
   express datapath; the userspace dataplane has a single forwarding path, so
   the flag is carried for config truth/parity and does not currently switch
   packet behavior (there is no express/regular split to select between).
+- **M9 `security flow tcp-session no-sequence-check`** — DONE (typed). Added
+  the schema child (`pkg/config/schema_security.go`), the
+  `TCPSessionConfig.NoSequenceCheck` field (`pkg/config/types_security.go`),
+  and the compiler case (`pkg/config/compiler_security.go`), at full parity
+  with the existing `no-syn-check` / `rst-invalidate-session` presence flags.
+  Like those siblings it is typed-config only: the userspace AF_XDP dataplane
+  performs no TCP sequence-number window validation today, so there is nothing
+  to skip. The field gives commit-time validation + completion and is the seam
+  a future sequence-checking dataplane would read.
