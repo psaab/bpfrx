@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -366,15 +367,39 @@ type Lease struct {
 
 // GetLeases4 reads Kea DHCPv4 lease file and returns active leases.
 func (m *Manager) GetLeases4() ([]Lease, error) {
-	return parseLeaseCSV("/var/lib/kea/kea-leases4.csv")
+	return parseLeaseCSV("/var/lib/kea/kea-leases4.csv", time.Now())
 }
 
 // GetLeases6 reads Kea DHCPv6 lease file and returns active leases.
 func (m *Manager) GetLeases6() ([]Lease, error) {
-	return parseLeaseCSV("/var/lib/kea/kea-leases6.csv")
+	return parseLeaseCSV("/var/lib/kea/kea-leases6.csv", time.Now())
 }
 
-func parseLeaseCSV(path string) ([]Lease, error) {
+// parseLeaseCSV parses Kea's append-only memfile CSV and returns the
+// CURRENT, ACTIVE leases for display (`show dhcp server leases`).
+//
+// Kea never rewrites the memfile in place between lease-file-cleanup
+// (LFC) compactions: every renewal, re-allocation, release, decline,
+// and expiry-reclaim is APPENDED as a new row, so the same address
+// appears multiple times and superseded/stale rows linger until the
+// next LFC. A naive "emit every row with a non-empty address" therefore
+// shows duplicate and stale leases (#2085). This parser collapses the
+// append log to one row per address (the LAST, i.e. newest, row wins —
+// rows are chronological) and drops rows that are not currently active:
+//
+//   - state != 0 (declined / expired-reclaimed): Kea writes a
+//     non-default state but often a FUTURE expire epoch on
+//     release/decline, so an expire-only filter would still show it.
+//   - expire <= now: a genuinely lapsed lease.
+//
+// It is LENIENT by design (this is a non-destructive display path,
+// unlike the destructive DDNS reconciler's parseActiveLeases, which
+// hard-errors on a mangled header): an absent or unparseable state /
+// expire column degrades to "treat the row as active", preserving the
+// pre-#2085 behaviour for older Kea or exotic headers rather than
+// blanking the whole `show` on one odd row. now is injected so the
+// expiry comparison is deterministic in tests.
+func parseLeaseCSV(path string, now time.Time) ([]Lease, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -400,31 +425,76 @@ func parseLeaseCSV(path string) ([]Lease, error) {
 	for i, h := range records[0] {
 		cols[h] = i
 	}
+	field := func(fields []string, name string) string {
+		if idx, ok := cols[name]; ok && idx >= 0 && idx < len(fields) {
+			return fields[idx]
+		}
+		return ""
+	}
 
-	var leases []Lease
+	// latest holds the final disposition per address; a zero Lease
+	// (empty Address) is a TOMBSTONE meaning the last row for that
+	// address was inactive/expired. order keeps first-appearance order
+	// so the display is stable and deterministic. Re-recording the
+	// disposition on every row lets a later active append RECLAIM an
+	// address an earlier row tombstoned (release-then-reallocate).
+	latest := make(map[string]Lease, len(records)-1)
+	order := make([]string, 0, len(records)-1)
+	seen := make(map[string]struct{}, len(records)-1)
+	nowUnix := now.Unix()
+
 	for _, fields := range records[1:] {
-		l := Lease{}
-		if idx, ok := cols["address"]; ok && idx < len(fields) {
-			l.Address = fields[idx]
+		addr := field(fields, "address")
+		if addr == "" {
+			continue
 		}
-		if idx, ok := cols["hwaddr"]; ok && idx < len(fields) {
-			l.HWAddress = fields[idx]
+		if _, ok := seen[addr]; !ok {
+			seen[addr] = struct{}{}
+			order = append(order, addr)
 		}
-		if idx, ok := cols["hostname"]; ok && idx < len(fields) {
-			l.Hostname = fields[idx]
+
+		// State filter (lenient): only Kea's default state (0 = active)
+		// is displayable. A declined (1) or expired-reclaimed (2) lease
+		// can still carry a FUTURE expire epoch, so this must precede the
+		// expire check. An absent/unparseable state ⇒ active (Kea
+		// default). A non-active row tombstones the address; a later
+		// active append can still reclaim it.
+		if s := field(fields, "state"); s != "" {
+			if st, e := strconv.Atoi(s); e == nil && st != 0 {
+				latest[addr] = Lease{}
+				continue
+			}
 		}
-		if idx, ok := cols["valid_lifetime"]; ok && idx < len(fields) {
-			l.ValidLife = fields[idx]
+
+		// Expire filter (lenient): drop a lease whose expire epoch has
+		// lapsed. Absent/unparseable/zero expire ⇒ keep (don't hide a
+		// lease over an exotic value on a display).
+		expireStr := field(fields, "expire")
+		if expireStr != "" {
+			if exp, e := strconv.ParseInt(expireStr, 10, 64); e == nil && exp > 0 && nowUnix >= exp {
+				latest[addr] = Lease{}
+				continue
+			}
 		}
-		if idx, ok := cols["expire"]; ok && idx < len(fields) {
-			l.ExpireTime = fields[idx]
+
+		latest[addr] = Lease{
+			Address:    addr,
+			HWAddress:  field(fields, "hwaddr"),
+			Hostname:   field(fields, "hostname"),
+			ValidLife:  field(fields, "valid_lifetime"),
+			ExpireTime: expireStr,
+			SubnetID:   field(fields, "subnet_id"),
 		}
-		if idx, ok := cols["subnet_id"]; ok && idx < len(fields) {
-			l.SubnetID = fields[idx]
-		}
-		if l.Address != "" {
+	}
+
+	leases := make([]Lease, 0, len(order))
+	for _, addr := range order {
+		if l := latest[addr]; l.Address != "" {
 			leases = append(leases, l)
 		}
+	}
+	if len(leases) == 0 {
+		return nil, nil
 	}
 	return leases, nil
 }
