@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +34,13 @@ type Engine struct {
 
 	// Cooldown tracking: policy name → last trigger time
 	lastTrigger map[string]time.Time
+
+	// Compiled attributes-match regexes, keyed by the raw pattern string.
+	// Built once at Apply() time so the hot HandleEvent path never compiles
+	// a regex per event. Patterns are also validated at commit
+	// (config.ValidateConfig), so a bad pattern never reaches here; the
+	// fallback in attributesMatch is defensive only.
+	regexCache map[string]*regexp.Regexp
 }
 
 // Minimum time between successive triggers of the same policy.
@@ -48,16 +56,41 @@ func New(store *configstore.Store, commitFn CommitFn) *Engine {
 		commitFn:    commitFn,
 		windows:     make(map[string]map[string][]time.Time),
 		lastTrigger: make(map[string]time.Time),
+		regexCache:  make(map[string]*regexp.Regexp),
 	}
 }
 
-// Apply loads new event-options policies. Resets temporal state.
+// Apply loads new event-options policies. Resets temporal state and
+// rebuilds the compiled-regex cache for every attributes-match pattern so
+// the event hot path (HandleEvent) never compiles a regex per event.
 func (e *Engine) Apply(policies []*config.EventPolicy) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.policies = policies
 	e.windows = make(map[string]map[string][]time.Time)
 	e.lastTrigger = make(map[string]time.Time)
+	e.regexCache = make(map[string]*regexp.Regexp)
+	for _, pol := range policies {
+		for _, attr := range pol.AttributesMatch {
+			pattern, ok := config.EventAttributesMatchPattern(attr)
+			if !ok {
+				continue
+			}
+			if _, cached := e.regexCache[pattern]; cached {
+				continue
+			}
+			// Patterns are validated at commit; a compile failure here
+			// should not happen. Log and skip so a single bad pattern
+			// can never wedge the engine.
+			re, err := regexp.Compile(pattern)
+			if err != nil {
+				slog.Warn("event-options: skipping uncompilable attributes-match pattern",
+					"policy", pol.Name, "pattern", pattern, "err", err)
+				continue
+			}
+			e.regexCache[pattern] = re
+		}
+	}
 }
 
 // HandleEvent is the callback for RPM events.
@@ -124,24 +157,29 @@ func (e *Engine) eventMatches(pol *config.EventPolicy, ev rpm.Event) bool {
 }
 
 // attributesMatch checks if the event attributes match the policy's filters.
-// Format: "ping_test_failed.test-owner matches <pattern>"
+// Format: "ping_test_failed.test-owner matches <pattern>".
+//
+// Junos `attributes-match ... matches ...` semantics are a REGEX match, not
+// literal equality (this was a parity defect, #2008 M7). The operator's
+// pattern is treated as an RE2 regular expression compiled once at Apply()
+// time and cached here. An unanchored pattern is a substring match (Junos
+// behavior): `foo` matches `foobar`; anchor with `^foo$` for exact match.
+//
+// Note this is NOT a behavior-preserving change from the previous literal
+// equality: a stored pattern containing regex metacharacters (`.`, `*`,
+// `[`, ...) now matches as a regex. That is the correct Junos behavior;
+// commit-time validation (config.ValidateEventAttributesMatch) rejects an
+// invalid regex so the operator gets immediate feedback.
 func (e *Engine) attributesMatch(pol *config.EventPolicy, ev rpm.Event) bool {
 	for _, attr := range pol.AttributesMatch {
-		// Parse "event.field matches pattern"
-		parts := strings.SplitN(attr, " matches ", 2)
-		if len(parts) != 2 {
+		field, pattern, ok := config.ParseEventAttributesMatch(attr)
+		if !ok {
 			continue
 		}
-		fieldSpec := parts[0]
-		pattern := parts[1]
 
-		// Extract field name from "event_name.field_name"
-		dotIdx := strings.LastIndex(fieldSpec, ".")
-		if dotIdx < 0 {
-			continue
-		}
-		field := fieldSpec[dotIdx+1:]
-
+		// Only test-owner and test-name are currently exposed on the event
+		// (rpm.Event). Any other field reference is silently ignored, as it
+		// was before — there is nothing to match it against yet.
 		var value string
 		switch field {
 		case "test-owner":
@@ -152,7 +190,24 @@ func (e *Engine) attributesMatch(pol *config.EventPolicy, ev rpm.Event) bool {
 			continue
 		}
 
-		if value != pattern {
+		re := e.regexCache[pattern]
+		if re == nil {
+			// Defensive: pattern was not cached (commit validation should
+			// have rejected an uncompilable pattern, and Apply caches every
+			// valid one). Compile on demand rather than silently dropping
+			// the constraint; on failure fall back to literal equality so a
+			// pathological pattern fails closed (constraint stays in force).
+			compiled, err := regexp.Compile(pattern)
+			if err != nil {
+				if value != pattern {
+					return false
+				}
+				continue
+			}
+			re = compiled
+		}
+
+		if !re.MatchString(value) {
 			return false
 		}
 	}

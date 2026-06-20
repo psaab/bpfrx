@@ -588,3 +588,25 @@ drift) closed in `fix/2008-quickwins-batch1`:
   `config-viewer` RBAC entry (PermView) so the schema enum and the runtime RBAC
   table cannot drift. Mirrors the SNMP `authorization` enum leaf. See
   `docs/system-login.md`.
+
+## #2008 vSRX config-parity closures (Increment 2)
+
+Tier-2 gaps from the `#2008` parity audit researched in
+`docs/research/2008-tier2/plan.md`:
+
+- **M7 `event-options policy attributes-match`** — DONE (literal → regex).
+  Junos `attributes-match "<event>.<attribute> matches <pattern>"` is a regex
+  match; xpf previously did literal string equality
+  (`pkg/eventengine/engine.go` `attributesMatch`). The matcher now treats the
+  pattern as an RE2 regex (unanchored = substring, like Junos), compiled once
+  at `Apply()` time and cached by pattern string so the event hot path never
+  recompiles. Commit-time validation rejects an uncompilable pattern
+  (`config.ValidateEventAttributesMatch` via `CompileConfig`,
+  `pkg/config/event_options_match.go`). The parse/validate seam
+  (`config.ParseEventAttributesMatch`) is shared between the compiler and the
+  engine so they cannot drift. **Behavior-change note:** this is NOT
+  behavior-preserving for a stored literal containing regex metacharacters —
+  but regex IS the correct Junos behavior. The supported attribute set stays
+  `test-owner` / `test-name` (the only fields on `rpm.Event`); widening the
+  field surface is deferred until more attributes are exposed. See
+  `pkg/eventengine/README.md`.

@@ -561,6 +561,16 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
+	// #2008 M7: event-options attributes-match patterns are RE2 regexes
+	// (Junos `matches` semantics). Reject an uncompilable pattern at commit
+	// so the operator gets immediate feedback instead of the event engine
+	// silently dropping the constraint at runtime. Strict on every path: a
+	// pattern that does not compile can never have a useful runtime effect,
+	// so there is nothing to be lenient about.
+	if err := ValidateEventAttributesMatch(cfg); err != nil {
+		return nil, err
+	}
+
 	if warnings := ValidateConfig(cfg); len(warnings) > 0 {
 		for _, w := range warnings {
 			cfg.Warnings = append(cfg.Warnings, w)
