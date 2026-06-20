@@ -15,31 +15,54 @@ type collectorConns struct {
 	conns []net.Conn
 }
 
+// dialUDP and resolveUDPAddr are indirection seams so tests can inject
+// dial/resolve failures and observe connection teardown. They default to
+// the net package and are only overridden by tests. dialUDP returns a
+// net.Conn (not *net.UDPConn) so tests can substitute a recording fake
+// and assert that connections opened before a mid-loop failure are
+// closed.
+var (
+	dialUDP = func(network string, laddr, raddr *net.UDPAddr) (net.Conn, error) {
+		return net.DialUDP(network, laddr, raddr)
+	}
+	resolveUDPAddr = net.ResolveUDPAddr
+)
+
 // dialCollectors opens a UDP connection to every collector in the list.
 // When a collector specifies a SourceAddress the local bind address is
-// pinned; otherwise the OS selects it. On any dial error all already
-// opened connections are closed and the error is returned.
+// pinned; otherwise the OS selects it. On any resolve or dial error all
+// already opened connections are closed and the error is returned, so a
+// partial failure mid-loop never leaks the connections opened before it.
 func dialCollectors(collectors []CollectorConfig) (*collectorConns, error) {
 	cc := &collectorConns{}
+	// fail closes every connection opened so far and wraps err. Callers
+	// must return its result without retaining cc, so no descriptor opened
+	// in this loop survives an error return.
+	fail := func(err error) (*collectorConns, error) {
+		cc.close()
+		return nil, err
+	}
 	for _, c := range collectors {
 		var conn net.Conn
 		var err error
 		if c.SourceAddress != "" {
-			laddr, _ := net.ResolveUDPAddr("udp", c.SourceAddress+":0")
-			raddr, err2 := net.ResolveUDPAddr("udp", c.Address)
+			// A misconfigured SourceAddress must be surfaced, not
+			// silently dropped to a nil local bind (which would let the
+			// OS pick an arbitrary source and mask the misconfiguration).
+			laddr, err2 := resolveUDPAddr("udp", c.SourceAddress+":0")
 			if err2 != nil {
-				return nil, fmt.Errorf("resolve collector %s: %w", c.Address, err2)
+				return fail(fmt.Errorf("resolve collector %s source-address %s: %w", c.Address, c.SourceAddress, err2))
 			}
-			conn, err = net.DialUDP("udp", laddr, raddr)
+			raddr, err2 := resolveUDPAddr("udp", c.Address)
+			if err2 != nil {
+				return fail(fmt.Errorf("resolve collector %s: %w", c.Address, err2))
+			}
+			conn, err = dialUDP("udp", laddr, raddr)
 		} else {
 			conn, err = net.Dial("udp", c.Address)
 		}
 		if err != nil {
-			// Close already-opened connections.
-			for _, opened := range cc.conns {
-				opened.Close()
-			}
-			return nil, fmt.Errorf("dial collector %s: %w", c.Address, err)
+			return fail(fmt.Errorf("dial collector %s: %w", c.Address, err))
 		}
 		cc.conns = append(cc.conns, conn)
 	}

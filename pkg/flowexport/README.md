@@ -21,7 +21,12 @@ The package is split by responsibility (#1988):
   `IPFIXExporter` that drives it.
 - `transport.go` — shared collector connection management
   (`collectorConns`: dial / fan-out write / close) and the per-family
-  batch accumulator (`flowBatch`) used by both exporters.
+  batch accumulator (`flowBatch`) used by both exporters. `dialCollectors`
+  surfaces any `SourceAddress`/destination resolve error (a bad configured
+  source-address is never silently dropped to an OS-chosen bind) and, on
+  any mid-loop resolve or dial failure, closes the connections opened
+  earlier in the loop before returning — no descriptor leak on partial
+  failure.
 
 ## Entry points
 
