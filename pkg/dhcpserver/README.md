@@ -53,13 +53,153 @@ parses a torn file, no fsync on the apply path.
   `systemctl` seams + config paths, per the `pkg/dhcp/test_seams.go`
   convention.
 
+## Dynamic DNS (DDNS) — #1387, increment 1
+
+Opt-in publishing of forward (`A`/`AAAA`) and reverse (`PTR`) DNS records
+for active DHCP leases, with stale-record cleanup on expire / release /
+decline / reclaim / reassign. Default OFF — an absent `dynamic-dns` block
+is byte-for-byte today's behaviour. This is the FIRST increment of the
+multi-increment plan in `docs/research/1387-dhcp-ddns/plan.md`
+(recommended Path C: a pluggable `DNSUpdater` backend, RFC 2136 first).
+
+What increment 1 ships (the fully unit-testable, lab-free slice):
+
+- **Config model** — `config.DHCPDynamicDNSConfig` (a nilable field on
+  `DHCPServerConfig`), compiled from both AST shapes by
+  `compileDHCPDynamicDNS` (`pkg/config/compiler_services.go`), typed
+  schema leaves under `dhcp-local-server`/`dhcpv6-local-server`
+  (`pkg/config/schema_system.go`). TSIG secret is redacted in
+  `DHCPDynamicDNSConfig.String()`. The block can appear under BOTH
+  families; the typed model carries a single config, and the two blocks are
+  MERGED field-by-field (`mergeDHCPDynamicDNS`) — a field set in either
+  family wins, `enable` latches on — so a partial second-family block never
+  clears the first family's settings (a whole-struct overwrite would
+  silently disable DDNS).
+- **State-aware lease parser** — `parseActiveLeases4/6` (`ddns_leases.go`)
+  honors Kea's `state` column (default/declined/expired-reclaimed), the
+  `expire` epoch, and the `fqdn_fwd` split between host-name and
+  client-supplied FQDN, and extracts the v6 DUID/IAID identity. SEPARATE
+  from the display-only `parseLeaseCSV` (reusing that would publish/retain
+  stale records — the exact bug this feature fixes). Header columns are
+  matched CASE-INSENSITIVELY (both the header keys AND the lookup name are
+  lower-cased in `leaseColumnValue`; field values are data and stay
+  verbatim). A header maps to columns UNAMBIGUOUSLY: a DUPLICATE column name
+  (case-insensitive) is rejected with an error (Codex r5) — a healthy Kea
+  memfile has all-unique columns, and a duplicate would otherwise overwrite
+  the earlier index with the last occurrence, so a lookup could resolve to
+  the wrong/empty column → wrong desired set → destructive delete. We reject
+  ANY duplicate (not just duplicate required columns). Extra/unknown columns
+  and a reordered header are TOLERATED (lookups are by name, not position).
+  The header is VALIDATED against a FAMILY-SPECIFIC
+  `requiredLeaseColumns` set: any column whose absence would silently change
+  whether a lease is published (naming), how it is keyed for ownership
+  (identity), or whether it is active (state) is REQUIRED, because a mangled
+  header parses with no error and the reconciler then deletes/churns owned
+  records on the basis of an empty or wrongly-keyed desired set. If any
+  required column is missing/renamed the parser returns an ERROR, so
+  `Reconcile` marks the family untrusted and SKIPS the destructive diff —
+  never mass-delete or record-loss on an unrecognizable header. Required:
+  `address`, `state`, `hostname` (both families) + `client_id`,`hwaddr`
+  (v4 identity) / `duid`,`iaid` (v6 identity). Deliberately OPTIONAL
+  (absence degrades safely, no record loss): `fqdn_fwd` (defaults to
+  host-name semantics), `expire` (no expiry tombstoning — `state` still
+  gates active/tombstone; over-retain, not delete), `subnet_id` (pure
+  metadata, not compared by `recordsEqual`). The header is validated BEFORE
+  the zero-data-row early return (Codex r4), so the trusted-empty result —
+  which is what PERMITS `Reconcile` to clear a family's owned records — is
+  returned ONLY when the lease set is provably empty: the file is genuinely
+  MISSING (`os.IsNotExist`, "no leases yet"), OR the header is present AND
+  valid AND there are simply no active data rows (a genuinely-drained Kea).
+  A present-but-mangled header errors WITH OR WITHOUT data rows (so a
+  header-only mangled file cannot short-circuit to trusted-empty), and a
+  0-record EXISTING file (no header at all — anomalous, mid-write/corrupt)
+  fails SAFE as an error rather than trusted-empty. Per-ROW conformance
+  (Codex r6) complements the header-schema check: a DATA ROW too short to
+  supply every required column (a torn/truncated memfile append — the CSV
+  reader allows ragged rows) would otherwise read a required column as ""
+  (bounds-safe via `leaseColumnValue`'s `idx < len(fields)`, but NOT
+  delete-safe — the lease silently drops and its owned record is deleted).
+  So a row with `len(fields) <= maxRequiredIdx` (the max index among the
+  family's required columns) is a hard parse error → the whole family's
+  source is untrusted → the destructive diff is skipped; we do NOT silently
+  skip just the row (we cannot know which lease it is, and skipping still
+  drops its record). A row with MORE fields than the header is tolerated
+  (extra trailing fields ignored by name-based lookup). The fail direction
+  (over-mark-untrusted for an exotic/unreadable file → no publish/clean,
+  operator-visible) is SAFE; silent mass-delete/record-loss is not. The
+  destructive-delete class is now closed at BOTH the header level (required
+  columns present, each once, no duplicates) and the row level (every data
+  row long enough to supply every required column).
+- **Hostname normalization** — `deriveFQDN` / `finalizeFQDN`
+  (`ddns_hostname.go`) ALWAYS contains the published name in the configured
+  zone: the client picks the host part, the firewall picks the domain. A
+  client-offered dotted name (e.g. `host.attacker.tld`, a trailing-dot or
+  double-dot escape) that is not already within the configured domain is
+  relabeled to `<first-label>.<domain>`; a name already inside the zone is
+  kept verbatim. With no configured domain, only the first label is kept. A
+  client can never publish outside the configured zone.
+- **`DNSUpdater` interface** (`ddns_dns.go`) + the pure record/PTR-name
+  construction. PTR names are built from the TEXTUAL address (reversed
+  octets / nibbles), NOT the dataplane native-endian `__be32` convention. A
+  nil updater (the increment-1 default — the live backend is deferred) is
+  substituted with a `nopUpdater`: every upsert/delete is a LOGGED no-op,
+  never a panic, and a no-op upsert does NOT record phantom ownership (so a
+  later real backend still publishes the record).
+- **Reconciler core** — `DDNSManager.reconcileOnceLocked` (`ddns.go`):
+  build-desired / diff-owned / add-move-reassign-expire transitions,
+  cleaning the old owner before the new one, with bounded retry that never
+  wedges the loop. FAIL-SAFE: when a lease family's CSV cannot be
+  read/parsed, that family is marked untrusted and its destructive diff is
+  SKIPPED this cycle (a transient malformed CSV can never mass-delete a
+  family's owned records); the parse error is surfaced to the caller.
+- **Ownership state store** — `ddns_state.go`, JSON via
+  `fsatomic.WriteFileDurable` (fsync-on-write; slow-path). This is the
+  PROTECTION BOUNDARY for never-delete-a-record-xpf-did-not-create:
+  `deleteOwnedLocked` re-derives the EXACT (name, type, address) from the
+  store and is the sole delete authority. A corrupt store fails OPEN
+  (reset to empty + log), never blocking commit/boot/DHCP serving. The
+  stored `version` is validated on load: an unknown (future) non-zero
+  version is treated like a corrupt store (fail-open to empty + warn), so a
+  later format bump cannot be mis-decoded into wrong-tuple deletes. (A
+  fail-open store may LEAK previously-owned records — they stay in DNS until
+  authoritatively removed; record TTL is resolver caching, not removal — but
+  never deletes records xpf did not create.)
+- **Counters** via `DDNSManager.Stats()` (the future `show ... dynamic-dns`
+  + Prometheus surface reads this).
+
+DELIBERATELY DEFERRED to later increments (see plan §12):
+
+- The LIVE rfc2136 `DNSUpdater` backend — lab-gated (needs a throwaway
+  authoritative BIND/Knot + TSIG; no such fixture exists in CI yet). The
+  `backend` leaf (and `update-server` / TSIG leaves) are PARSED and
+  VALIDATED in this increment but NOT yet wired to a live updater — nothing
+  is published to DNS. Enabling DDNS emits a commit-time warning
+  (`config.ValidateConfig` → `validateDDNSDeferredBackendWarnings`), stronger
+  when an `update-server` / TSIG is configured, so the operator is not
+  surprised by the absence of records.
+- HA ownership coupling to the per-RG VRRP MASTER/BACKUP gate — must pass
+  `make test-failover`. The deterministic owner-id watermark
+  (`ownerWatermark`) is laid down now so the state store is
+  forward-compatible.
+- The Kea D2 backend (reserved `backend kea-d2` enum; D2 is not in the
+  image, `bake.py`).
+- The daemon reconcile loop + `show ... dynamic-dns` CLI/gRPC plumbing +
+  Prometheus emission. (The API collector is a CHECKED collector — a
+  declared descriptor MUST be emitted or the descriptor-coverage canary
+  fails — so counters live in `DDNSManager` until increment 2 wires a
+  value source on the server.)
+
+Net behaviour change for existing users in increment 1: zero.
+
 ## Callers
 
-`pkg/daemon`, `pkg/cli`, `pkg/grpcapi`.
+`pkg/daemon`, `pkg/cli`, `pkg/grpcapi`. (The `DDNSManager` reconcile loop
+is wired into `pkg/daemon` in increment 2; increment 1 is library-level.)
 
 ## Dependencies
 
-`pkg/config` only.
+`pkg/config` and `pkg/fsatomic` (the latter for the Kea config writes and
+the #1387 DDNS ownership state store).
 
 ## Gotchas
 

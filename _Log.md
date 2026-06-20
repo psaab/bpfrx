@@ -1,5 +1,71 @@
 # Action Log
 
+## 2026-06-19 — #1387 DDNS PR #2043: Copilot findings (dual-family merge, version, comments)
+
+- **Timestamp**: 2026-06-19
+- **Action**: Fix Copilot's inline-review findings outside the (now-closed)
+  mass-delete-via-header class. (MAJOR) dynamic-dns block overwrite:
+  compileDHCPLocalServer did `dhcp.DynamicDNS = compileDHCPDynamicDNS(...)`
+  for whichever family it found, so when BOTH dhcp-local-server and
+  dhcpv6-local-server carried a block, the second whole-struct overwrote
+  the first — a PARTIAL second block (e.g. only `domain` under v6) compiled
+  to Enabled=false and cleared the v4 block's enable/server/ttl → DDNS
+  silently disabled. Fix: `mergeDHCPDynamicDNS` merges field-by-field — a
+  field set in either family wins (first-family-wins on a genuine conflict,
+  matching the intra-block first-value rule), presence-only `enable`
+  LATCHES on (a partial block can never flip it false). (ROBUSTNESS)
+  loadDDNSState now validates `ddnsStateFile.Version`: an unknown non-zero
+  version is treated like a corrupt store (fail-open to empty + error/warn)
+  so a future format bump can't be mis-decoded into wrong-tuple deletes;
+  version 0 (pre-versioning / zero-value) still loads. (COMMENTS, no logic
+  change) reworded the stale `addrOwner` tracker comment (reassignment is
+  handled by the owned-state delete pass + blocked maps), the nonexistent
+  `collectDHCPDDNSProps` reference (it is compileDHCPDynamicDNS's internal
+  walker), the corrupt-store "age out by TTL" claim (TTL is caching not
+  removal — records persist until authoritatively removed), and clarified
+  the nopUpdater deleteOwnedLocked comment (correct for inc-1; noted the
+  inc-2 downgrade-orphan caveat). REFUTED Copilot's "Pass 2 upserts when
+  Pass 1 delete failed" — already handled by blockedIdentity/Address/FQDN
+  (left unchanged). Three new non-tautological tests (dual-family merge
+  keeps enable+server+ttl+gains domain; enable-latch either order; state
+  version fail-open + v0 tolerated) — all FAIL against pre-fix. README
+  updated.
+- **File(s)**: pkg/config/compiler_services.go, pkg/dhcpserver/ddns.go,
+  pkg/dhcpserver/ddns_state.go, pkg/config/compiler_dhcp_ddns_test.go,
+  pkg/dhcpserver/ddns_test.go, pkg/dhcpserver/README.md, _Log.md
+
+## 2026-06-19 — #1387 DDNS PR #2043: per-row conformance check (Codex r6)
+
+- **Timestamp**: 2026-06-19
+- **Action**: Fix Codex round-6's one MAJOR — the row-level complement to
+  the now-complete header-schema validation. Row values are read via
+  leaseColumnValue, which returns "" when a data row is SHORTER than a
+  required column's index (FieldsPerRecord=-1 allows ragged rows). A
+  torn/truncated Kea memfile append leaves a row that does not reach a
+  required column → that column reads "" → the lease is mis-read (address=""
+  → row skipped; hostname="" → unnamed-skip) → it drops out of the desired
+  set → its owned DNS record is deleted. Bounds-safe but not delete-safe.
+  Fix: after the header validates, compute maxRequiredIdx = the max index
+  among the family's required columns; in the per-row loop, a row with
+  len(fields) <= maxRequiredIdx cannot supply a required column, so it makes
+  the SOURCE unreliable → return a parse error → Reconcile marks the family
+  untrusted → SKIPS the destructive diff. We do NOT silently skip just the
+  row (we cannot know which lease a torn row is, and skipping still drops
+  its record). A row with MORE fields than the header is tolerated (extra
+  trailing fields ignored by name-based lookup). Reasoned through remaining
+  structural shapes: extra/reordered columns (by-name, fine), comment/blank
+  lines (r.Comment + CSV skips them), garbage VALUES (per-row lenient data —
+  drops/mis-keys at most that one lease, not a structural class). Assessment:
+  the unreliable-source → destructive-delete class is now FULLY closed at
+  both header (required present, each once, no duplicates) AND row (every
+  data row long enough for every required column) level. Five new tests
+  (ragged v4 too-short, v4 missing trailing required col, v6 ragged,
+  end-to-end no-mass-delete via Reconcile — all FAIL pre-fix a107b90c3; plus
+  extra-trailing-field tolerated, passes pre+post proving not over-broad).
+  README updated.
+- **File(s)**: pkg/dhcpserver/ddns_leases.go,
+  pkg/dhcpserver/ddns_test.go, pkg/dhcpserver/README.md, _Log.md
+
 ## 2026-06-19 — #1925 review r2: declare growpart dep + mktemp guard
 
 - **Timestamp**: 2026-06-19
@@ -233,6 +299,125 @@
   verified: a no-standalone mutant fails T7c+T2b; an always-standalone mutant
   fails T7d (double goodbye).
 - **File(s)**: pkg/ra/serialize_test.go, _Log.md
+## 2026-06-19 — #1387 DDNS PR #2043: reject duplicate header columns (Codex r5)
+
+- **Timestamp**: 2026-06-19
+- **Action**: Fix Codex round-5's one MAJOR (same mass-delete class,
+  duplicate-column trigger). Building `cols` with
+  `for i,h := range records[0] { cols[lower(h)] = i }` OVERWRITES an earlier
+  index with a later duplicate name, and the required-column validation only
+  checked that the key EXISTS, not that it is unambiguous. A header with a
+  duplicated column (e.g. two "address" or two "state", or a corruption that
+  repeats a column) made cols[name] point at the LAST occurrence — possibly
+  the wrong/empty column → leases read empty/wrong → wrong desired set → the
+  destructive delete pass removed owned records. Fix (close the class, not
+  the trigger): while building cols, DETECT duplicates case-insensitively
+  and return a parse ERROR for ANY duplicate column name (not just required
+  ones) — a healthy Kea memfile has all-unique columns, so a header is
+  trusted only if it maps UNAMBIGUOUSLY; an ambiguous header → untrusted →
+  Reconcile SKIPS the destructive diff. Reasoned through the remaining
+  header shapes: extra/unknown columns (ignored by name) and reordered
+  columns (resolved by name) are tolerated; ragged rows are bounds-checked
+  in leaseColumnValue (idx < len(fields)). Assessment: the
+  mass-delete-via-header class is now FULLY CLOSED (missing column r3,
+  header-only/zero-row r4, duplicate column r5; extra/reorder/ragged all
+  non-destructive). Eight new tests: duplicate required (address/state),
+  case-insensitive duplicate, duplicate optional, v6 duplicate identity,
+  end-to-end no-mass-delete via Reconcile (all FAIL pre-fix 7708d1b40), plus
+  extra-column-tolerated + reordered-tolerated (pass pre+post, proving the
+  rejection is not over-broad). README updated.
+- **File(s)**: pkg/dhcpserver/ddns_leases.go,
+  pkg/dhcpserver/ddns_test.go, pkg/dhcpserver/README.md, _Log.md
+
+## 2026-06-19 — #1387 DDNS PR #2043: validate header before empty return (Codex r4)
+
+- **Timestamp**: 2026-06-19
+- **Action**: Fix Codex round-4's one MAJOR: the required-column validation
+  was BYPASSED for header-only / zero-data-row files. parseActiveLeases
+  returned `nil, nil` on `len(records) < 2` BEFORE building the cols map
+  and running the required-column check, so a file with ONLY a header (no
+  data rows) and a MANGLED header (missing hostname/identity) was treated
+  as a TRUSTED zero-lease result → Reconcile ran the destructive pass →
+  mass-delete of the family's owned records. Same destructive class,
+  header-only trigger. Fix: REORDER so a present header is ALWAYS validated
+  before any trusted-empty return. (1) A 0-record EXISTING file (no header
+  — Kea always writes one, so this is mid-write/corrupt) now ERRORS
+  (fail-safe untrusted), not trusted-empty; a genuinely MISSING file keeps
+  its `os.IsNotExist` → nil,nil. (2) Build cols + run required-column
+  validation FIRST; a mangled header errors with or without data rows. (3)
+  Only AFTER the header validates good is a header-with-zero-data-rows
+  returned as a legitimate trusted zero-lease (so a genuinely-drained Kea
+  still clears owned records). Net: trusted-empty (which permits deleting
+  owned records) is returned ONLY when the file is missing, OR the header
+  is present AND valid AND there are no active data rows. Five new
+  non-tautological tests (header-only mangled v4/v6 errors + end-to-end
+  no-mass-delete; valid header-only is trusted-empty + clears owned via
+  Reconcile; 0-byte existing file errors; missing file stays trusted).
+  The mangled/0-byte cases FAIL against pre-fix head b45c80c2; the
+  legitimate cases pass both pre- and post-fix (not over-broad). README
+  updated.
+- **File(s)**: pkg/dhcpserver/ddns_leases.go,
+  pkg/dhcpserver/ddns_test.go, pkg/dhcpserver/README.md, _Log.md
+
+## 2026-06-19 — #1387 DDNS PR #2043: generalize header validation (Codex r3)
+
+- **Timestamp**: 2026-06-19
+- **Action**: Fix Codex round-3's two MAJORs + one MINOR. The
+  `requiredLeaseColumns={address,state}` fix closed the address/state
+  trigger, but the mass-delete/record-loss class GENERALIZES to any header
+  column the reconciler depends on. (MAJOR A) A missing/renamed `hostname`
+  column parses with no error but empties HostName/ClientFQDN, so
+  `deriveFQDN` errors for every lease and the reconciler skips them all as
+  unnamed → empty desired set → Pass-1 mass-deletes all owned records.
+  (MAJOR B) Missing identity columns (v4 client_id/hwaddr, v6 duid/iaid)
+  collapse the identity to the address fallback → owned records keyed by
+  the prior identity no longer match → delete+re-add churn → record LOST
+  if the re-add upsert fails. (MINOR) the case-insensitivity fix
+  lower-cased the cols map keys but not the lookup name in get(), so the
+  invariant held only because callers pass lower-case literals. Fix: made
+  `requiredLeaseColumns` a FAMILY-SPECIFIC map (v4: address,state,
+  hostname,client_id,hwaddr; v6: address,state,hostname,duid,iaid) so a
+  missing column for that family errors → Reconcile marks the family
+  untrusted → SKIPS the destructive diff; extracted the column lookup into
+  `leaseColumnValue` which lower-cases the name argument (cols keys already
+  lower-cased), making the invariant hold at the call site and unit-
+  testable. fqdn_fwd / expire / subnet_id stay OPTIONAL with documented
+  non-destructive rationale (defaults to host-name; state still gates
+  active/tombstone; metadata not compared by recordsEqual). Five new
+  non-tautological tests (naming-required v4/v6 + end-to-end no-mass-
+  delete; identity-required v4/v6 + end-to-end no-churn; optional-degrade;
+  leaseColumnValue mixed-case lookup). All FAIL against pre-fix head
+  07ab9f5f. Adjusted one existing fixture (ClientIDPreferred) to carry the
+  now-required hostname column. README updated.
+- **File(s)**: pkg/dhcpserver/ddns_leases.go,
+  pkg/dhcpserver/ddns_test.go, pkg/dhcpserver/README.md, _Log.md
+
+## 2026-06-19 — #1387 DDNS PR #2043: close MAJOR-4 header-validation re-open
+
+- **Timestamp**: 2026-06-19
+- **Action**: Fix the AGY-found residual that re-opened the MAJOR-4
+  mass-delete vector through a different trigger. `parseActiveLeases`
+  built its header->index map from `records[0]` with raw, case-sensitive
+  keys and never validated that the columns it reads exist. A MANGLED Kea
+  memfile header — a required column missing/renamed, or a case
+  difference (`Address` vs `address`) — made `get(fields,"address")`
+  return "" for every row, so the main loop skipped all rows and returned
+  an EMPTY lease set with NO error. Reconcile's MAJOR-4 protection only
+  marks a family untrusted on a parse ERROR, so an empty-but-no-error
+  result was treated as "zero active leases" → the destructive delete
+  pass ran → ALL owned records for that family were mass-deleted. Fix:
+  (1) lower-case the header keys when building `cols` and the get()
+  lookup name (values stay verbatim) for case-insensitive matching;
+  (2) after building `cols`, validate `requiredLeaseColumns` (`address`,
+  `state`) are present and return a non-nil error if any is missing, so
+  Reconcile marks the family untrusted and SKIPS the destructive diff.
+  An empty FILE (`len(records) < 2`) is still a legitimate zero-lease,
+  no-error case; a present-but-mangled header now ERRORS. Two new
+  non-tautological tests (mangled header errors + does-not-mass-delete
+  via Reconcile; mixed-case header parses correctly) — both FAIL against
+  pre-fix head fd79778b8. README updated.
+- **File(s)**: pkg/dhcpserver/ddns_leases.go,
+  pkg/dhcpserver/ddns_test.go, pkg/dhcpserver/README.md, _Log.md
 
 ## 2026-06-20 — #1993 FRR clear MAJOR fix: require LIVE forwarding, not just pins
 
@@ -329,6 +514,40 @@
   still emitted — fails against the bump-then-unlock gap). Mutation-verified
   both fail against the respective pre-fix code.
 - **File(s)**: pkg/ra/serialize_test.go, _Log.md
+## 2026-06-19 — #1387 DDNS PR #2043 review: fix four MAJORs + one MINOR
+
+- **Timestamp**: 2026-06-19
+- **Action**: Address Codex's four MAJOR findings + one MINOR on the
+  #1387 DHCP DDNS increment-1 PR. (M1) Enforce zone-suffix containment
+  in `finalizeFQDN`: a client-offered dotted name that is not within the
+  configured domain is relabeled to `<first-label>.<domain>` (no domain
+  -> first label only), so a client can never publish outside the
+  configured zone (escape vectors: foreign TLD, trailing dot, double
+  dot, deep foreign subtree). (M2) Make a nil `DNSUpdater` a logged
+  `nopUpdater` (the increment-1 default — live backend deferred) instead
+  of a nil-pointer panic on first publish/withdraw; a no-op upsert does
+  NOT record phantom ownership, and a new `skippedNoBackend` counter
+  surfaces the no-op activity. (M3) Fix the Kea lease parser so an
+  active row reclaims an address that an earlier inactive/expired row
+  tombstoned (last-row-wins now lets active supersede a prior tombstone
+  and re-enter output order via an `inOrder` set; this also removed a
+  pre-fix duplicate-in-order bug). (M4) Make `Reconcile` fail-safe on a
+  lease-CSV parse error: the failing family is marked untrusted and its
+  destructive diff (deletes) is SKIPPED that cycle so a transient
+  malformed CSV can never mass-delete that family's owned records; the
+  parse error is surfaced to the caller. (m5) Reword the `backend`
+  schema help + type doc to say the value is parsed/validated but the
+  live updater is deferred, and emit a commit-time warning
+  (`validateDDNSDeferredBackendWarnings`) when DDNS is enabled (stronger
+  when an update-server / TSIG is configured). Six new
+  non-tautological tests (each proven to fail/panic against pre-fix
+  code). README + schema/type docs updated.
+- **File(s)**: pkg/dhcpserver/ddns_hostname.go,
+  pkg/dhcpserver/ddns_dns.go, pkg/dhcpserver/ddns.go,
+  pkg/dhcpserver/ddns_leases.go, pkg/dhcpserver/ddns_test.go,
+  pkg/dhcpserver/README.md, pkg/config/compiler.go,
+  pkg/config/schema_system.go, pkg/config/types_system.go,
+  pkg/config/compiler_dhcp_ddns_test.go, _Log.md
 
 ## 2026-06-20 — #2034 RA link-local review follow-up (regression test)
 
@@ -509,6 +728,44 @@
 - **Action**: Documented the single-owner + draining-tombstone shutdown
   contract and the Status "draining" state in the module README.
 - **File(s)**: pkg/ra/README.md, _Log.md
+## 2026-06-19 — #1387 DHCP dynamic-DNS (increment 1)
+
+- **Timestamp**: 2026-06-19
+- **Action**: Implement increment 1 of #1387 per
+  `docs/research/1387-dhcp-ddns/plan.md` (recommended Path C — pluggable
+  `DNSUpdater` backend, RFC 2136 first). Config model
+  (`config.DHCPDynamicDNSConfig`, nilable, default-off, dual-AST compile,
+  TSIG redaction) + typed schema leaves (enable/ttl/hostname-source/
+  conflict-policy/backend) + state-aware Kea lease parser
+  (state+expire+v6 DUID/IAID) + `DNSUpdater` interface + reconciler core
+  (build-desired/diff-owned/add-move-reassign-expire, retry-no-wedge) +
+  never-delete-non-owned ownership state store (JSON via
+  `fsatomic.WriteFileDurable`) + `DDNSManager.Stats()` counters. NO live
+  rfc2136 backend, NO HA wiring, NO Kea D2, NO daemon loop / show
+  plumbing / Prometheus emission (deferred to lab-/test-failover-gated
+  increments 2-4; the API collector is checked so an unemitted descriptor
+  would break the coverage canary). Net behaviour change with DDNS absent:
+  zero. 26 new tests (config dual-AST/redaction/schema; dhcpserver
+  hostname/PTR/parser/reconciler/state). Full `go test ./...` green.
+- **File(s)**: pkg/config/types_system.go, pkg/config/compiler_services.go,
+  pkg/config/schema_system.go, pkg/config/compiler_dhcp_ddns_test.go,
+  pkg/dhcpserver/ddns.go, pkg/dhcpserver/ddns_hostname.go,
+  pkg/dhcpserver/ddns_dns.go, pkg/dhcpserver/ddns_leases.go,
+  pkg/dhcpserver/ddns_state.go, pkg/dhcpserver/ddns_test.go,
+  pkg/dhcpserver/README.md, docs/config-schema.md, _Log.md
+
+## 2026-06-20 — #1387 DDNS review follow-up
+
+- **Timestamp**: 2026-06-20
+- **Action**: Address Copilot review on the DDNS increment-1 core. Make the
+  reconciler preserve the documented clean-old-owner-before-new ordering by
+  suppressing replacement upserts when the old owned delete fails, so the
+  next reconcile retries cleanup first. Teach the state-aware Kea lease
+  parser to use `fqdn_fwd` to distinguish the host-name option from a
+  client-supplied FQDN, and extend the DDNS unit tests to cover both
+  behaviors.
+- **File(s)**: pkg/dhcpserver/ddns.go, pkg/dhcpserver/ddns_leases.go,
+  pkg/dhcpserver/ddns_test.go, pkg/dhcpserver/README.md, _Log.md
 
 ## 2026-06-19 — #2000 review follow-up on postinst test harness
 

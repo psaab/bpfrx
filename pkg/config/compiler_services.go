@@ -121,6 +121,21 @@ func compileDHCPLocalServer(node *Node, dhcp *DHCPServerConfig, isV6 bool) error
 		dhcp.DHCPLocalServer = lsc
 	}
 
+	// #1387: the dynamic-dns block is a server-level policy shared by all
+	// pools of the family. It can appear under dhcp-local-server and/or
+	// dhcpv6-local-server; the typed model carries a single
+	// DHCPDynamicDNSConfig (the reconciler walks both families' leases).
+	// When BOTH families carry a block we MERGE field-by-field rather than
+	// whole-struct overwrite: a partial second block (e.g. only `domain`
+	// under v6) must NOT clear the v4 block's Enabled/server/ttl. A field
+	// set in either block wins; presence-only `enable` latches on (once any
+	// family enables DDNS it stays enabled). See mergeDHCPDynamicDNS.
+	if ddnsNode := node.FindChild("dynamic-dns"); ddnsNode != nil {
+		if ddns := compileDHCPDynamicDNS(ddnsNode); ddns != nil {
+			dhcp.DynamicDNS = mergeDHCPDynamicDNS(dhcp.DynamicDNS, ddns)
+		}
+	}
+
 	for _, groupInst := range namedInstances(node.FindChildren("group")) {
 		group := &DHCPServerGroup{Name: groupInst.name}
 
@@ -171,6 +186,140 @@ func compileDHCPLocalServer(node *Node, dhcp *DHCPServerConfig, isV6 bool) error
 		lsc.Groups[group.Name] = group
 	}
 	return nil
+}
+
+// mergeDHCPDynamicDNS merges a freshly-compiled dynamic-dns block (src)
+// into the existing one (dst), field-by-field, so a partial block under the
+// second family does not clobber settings the first family established
+// (#1387). dst may be nil (first family seen). A field set in EITHER block
+// wins: for strings/ttl, a non-zero src value fills an empty dst field (dst
+// keeps its own non-zero value — first-family-wins on a genuine conflict,
+// matching compileDHCPDynamicDNS's first-value-wins intra-block rule). The
+// presence-only Enabled flag LATCHES: once any family enables DDNS it stays
+// enabled (a partial second block can never flip it false). src is non-nil
+// (compileDHCPDynamicDNS returned a real block).
+func mergeDHCPDynamicDNS(dst, src *DHCPDynamicDNSConfig) *DHCPDynamicDNSConfig {
+	if dst == nil {
+		return src
+	}
+	dst.Enabled = dst.Enabled || src.Enabled
+	if dst.Domain == "" {
+		dst.Domain = src.Domain
+	}
+	if dst.HostnameSource == "" {
+		dst.HostnameSource = src.HostnameSource
+	}
+	if dst.ConflictPolicy == "" {
+		dst.ConflictPolicy = src.ConflictPolicy
+	}
+	if dst.Backend == "" {
+		dst.Backend = src.Backend
+	}
+	if dst.UpdateServer == "" {
+		dst.UpdateServer = src.UpdateServer
+	}
+	if dst.TSIGKeyName == "" {
+		dst.TSIGKeyName = src.TSIGKeyName
+	}
+	if dst.TSIGAlgorithm == "" {
+		dst.TSIGAlgorithm = src.TSIGAlgorithm
+	}
+	if dst.TSIGSecret == "" {
+		dst.TSIGSecret = src.TSIGSecret
+	}
+	if dst.TTLSeconds == 0 {
+		dst.TTLSeconds = src.TTLSeconds
+	}
+	return dst
+}
+
+// dhcpDDNSStringProps are the dynamic-dns leaves that carry a string
+// value (everything except the valueless `enable` flag and the integer
+// `ttl`). Used by compileDHCPDynamicDNS's internal subtree walker to
+// recognize a "<leaf> <value>" pair at any depth regardless of the AST
+// shape.
+var dhcpDDNSStringProps = map[string]bool{
+	"domain":          true,
+	"hostname-source": true,
+	"conflict-policy": true,
+	"backend":         true,
+	"update-server":   true,
+	"tsig-key":        true,
+	"tsig-algorithm":  true,
+	"tsig-secret":     true,
+}
+
+// compileDHCPDynamicDNS converts a parsed `dynamic-dns` subtree into a
+// typed *DHCPDynamicDNSConfig (#1387). It handles BOTH the hierarchical
+// shape (`dynamic-dns { enable; ttl 300; domain corp.example.com; }`,
+// each leaf a separate child node) and the flat-set shape
+// (`set ... dynamic-dns ttl 300`, where SetPath may pack trailing
+// property tokens into a single leaf node's Keys). Returns nil for a
+// truly empty block so an empty/garbage stanza does not force DDNS on;
+// the runtime keys "configured" on a non-nil block AND Enabled.
+func compileDHCPDynamicDNS(node *Node) *DHCPDynamicDNSConfig {
+	d := &DHCPDynamicDNSConfig{}
+	props := map[string]string{}
+	enabled := false
+
+	// Walk the subtree. A leaf can appear as a child node (Keys[0]==leaf,
+	// value at Keys[1]) or be packed into a parent node's Keys at any
+	// depth (e.g. flat-set `dynamic-dns ttl 300 domain x` collapses into
+	// one node with Keys=[..., ttl, 300, domain, x]). First value wins so
+	// a later malformed re-set cannot clobber a good one.
+	var walk func(n *Node, isRoot bool)
+	walk = func(n *Node, isRoot bool) {
+		start := 0
+		if isRoot {
+			start = 1 // skip the "dynamic-dns" identifier itself
+		}
+		for i := start; i < len(n.Keys); i++ {
+			k := n.Keys[i]
+			switch {
+			case k == "enable":
+				enabled = true
+			case k == "ttl" && i+1 < len(n.Keys):
+				if _, ok := props["ttl"]; !ok {
+					props["ttl"] = n.Keys[i+1]
+				}
+				i++
+			case dhcpDDNSStringProps[k] && i+1 < len(n.Keys):
+				if _, ok := props[k]; !ok {
+					props[k] = n.Keys[i+1]
+				}
+				i++
+			}
+		}
+		for _, c := range n.Children {
+			walk(c, false)
+		}
+	}
+	walk(node, true)
+
+	d.Enabled = enabled
+	d.Domain = props["domain"]
+	d.HostnameSource = props["hostname-source"]
+	d.ConflictPolicy = props["conflict-policy"]
+	d.Backend = props["backend"]
+	d.UpdateServer = props["update-server"]
+	d.TSIGKeyName = props["tsig-key"]
+	d.TSIGAlgorithm = props["tsig-algorithm"]
+	d.TSIGSecret = props["tsig-secret"]
+	if v := props["ttl"]; v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			d.TTLSeconds = n
+		}
+	}
+
+	// Empty block -> treat as absent (no DDNS). A block with only
+	// `enable` is meaningful (defaults apply), so check the union.
+	if !d.Enabled && d.Domain == "" && d.HostnameSource == "" &&
+		d.ConflictPolicy == "" && d.Backend == "" && d.UpdateServer == "" &&
+		d.TSIGKeyName == "" && d.TSIGAlgorithm == "" && d.TSIGSecret == "" &&
+		d.TTLSeconds == 0 {
+		return nil
+	}
+	return d
 }
 
 func compileDynamicAddress(node *Node, sec *SecurityConfig) error {
