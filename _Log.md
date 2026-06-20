@@ -28,6 +28,40 @@
   pkg/daemon/frr_failclosed_boot_test.go,
   pkg/dataplane/userspace/boot_probe.go,
   pkg/dataplane/userspace/boot_probe_test.go, pkg/daemon/README.md, _Log.md
+## 2026-06-20 — #2008 H1 review follow-up: two MAJOR fixes on PR #2042
+
+- **Timestamp**: 2026-06-20
+- **Action**: Fix two Codex MAJOR findings on the `inactive:` marker work.
+  MAJOR 1: the configstore commit-check / schema gate
+  (`schemaValidateExpandedTreeForNode`) cloned the RAW tree and expanded
+  apply-groups BEFORE stripping inactive — but `ExpandGroups` collects
+  `apply-groups` nodes by name without checking `Inactive`, so an
+  `inactive: apply-groups missing` still failed commit-check as an undefined
+  group and an `inactive: apply-groups g` still schema-validated inherited
+  content the compiler never applies. Now strip with `WithoutInactive()`
+  BEFORE expansion, mirroring the compile path (strip -> expand -> validate
+  holds everywhere a tree is compiled OR schema-validated). MAJOR 2:
+  FormatSet emitted `deactivate <path>` lines but `ParseSetCommand` only
+  knew `set` / `delete`, so `show | display set` did NOT round-trip — a
+  `deactivate` line reloaded as a junk path or was skipped (node reloaded
+  ACTIVE). Added `ParseSetVerb` (verb + path), `ConfigTree.DeactivatePath`
+  / `ActivatePath`, and a shared `applyEditLine` verb switch wired into
+  `LoadSet` and `LoadMerge` (flat + hierarchical-via-FormatSet); `LoadSet`
+  no longer skips `deactivate` / `activate` lines. MINOR 3: reworded the
+  false "strip can only REMOVE nodes so a previously-compiling config cannot
+  become non-compilable" doc/comment — deactivating a REFERENCED definition
+  can surface a (correct, intended) dangling-reference commit error. Added
+  non-tautological regression tests
+  (`TestInactive_FormatSetRoundTripsDeactivate`,
+  `pkg/configstore/inactive_test.go`: active-vs-inactive apply-groups
+  commit-check, display-set round trip), each verified to FAIL when its fix
+  is reverted. Replaced the manual `pol.Inactive = true` flip in
+  `TestInactive_DualASTFlatSet` with the real `deactivate`/`activate` verb
+  apply path.
+- **File(s)**: pkg/config/parser.go, pkg/config/ast_edit.go,
+  pkg/config/inactive.go, pkg/config/inactive_test.go,
+  pkg/config/README.md, pkg/configstore/store.go,
+  pkg/configstore/inactive_test.go, docs/config-schema.md, _Log.md
 
 ## 2026-06-20 — #2034 RA link-local review follow-up (regression test)
 

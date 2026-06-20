@@ -18,10 +18,20 @@ package config
 //
 // Strip runs on a CLONE before group expansion (see the compile entry
 // points in compiler.go and schemaValidateExpandedTreeForNode in
-// configstore/store.go), so an `inactive: apply-groups foo` correctly
-// suppresses the inherited config and an inactive node inside a `groups {}`
-// body is pruned consistently. Because strip can only REMOVE nodes from the
-// compiled set, a config that compiled before cannot become non-compilable.
+// configstore/store.go — both strip BEFORE ExpandGroups, which collects
+// apply-groups nodes by name without checking Inactive), so an
+// `inactive: apply-groups foo` correctly suppresses the inherited config and
+// an inactive node inside a `groups {}` body is pruned consistently.
+//
+// Strip only REMOVES nodes from the compiled set, but that does NOT
+// guarantee a previously-compiling config stays compilable: deactivating a
+// REFERENCED definition (e.g. an address-book entry a policy still matches,
+// or a group an active apply-groups still applies) can leave that active
+// reference dangling and surface a dangling-reference commit error. That is
+// correct and expected — deactivating an object an active statement depends
+// on is operator intent — and the schema gate enforces it for schema
+// cross-references and policy address references (the active reference is
+// validated against the inactive-stripped definitions source).
 
 // HasInactiveNodes reports whether the tree contains any node (at any
 // depth) marked inactive. Used to skip the strip clone on the common

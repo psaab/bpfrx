@@ -418,7 +418,17 @@ subtrees and runs at two coordinated entry points:
    deactivated typed leaf with a deliberately-invalid value does not fail
    `commit check`, and a deactivated definition neither satisfies an active
    reference nor is itself validated.
-2. Both `compileConfig*` entry points (`compiler.go`) strip FIRST — before
+2. The commit-check / schema gate in `configstore`
+   (`schemaValidateExpandedTreeForNode`, `store.go`) strips inactive
+   subtrees BEFORE group expansion, mirroring the compile path. This matters
+   because `ExpandGroups` (`ast_groups.go`) collects every `apply-groups`
+   node by name WITHOUT checking `Inactive`: stripping only inside
+   `SchemaValidateWithDefinitions` (which runs AFTER expansion) would let an
+   `inactive: apply-groups missing` still fail commit-check as an undefined
+   group, and an `inactive: apply-groups g` still schema-validate inherited
+   content the compiler will never apply. Strip → expand → validate now
+   holds everywhere a tree is compiled OR schema-validated.
+3. Both `compileConfig*` entry points (`compiler.go`) strip FIRST — before
    the pre-expansion tunnel-id collision gate, group expansion, and section
    compilation — so `inactive: apply-groups foo` suppresses the inherited
    config, inactive nodes inside `groups {}` bodies are pruned, and the
@@ -427,7 +437,27 @@ subtrees and runs at two coordinated entry points:
    BOTH cluster nodes compile the identical active set from the same
    JSON-synced (`Inactive`-flag-carrying) tree — no split-brain posture.
 
-Strip can only REMOVE nodes from the compiled set, so a config that
-compiled before cannot become non-compilable. `WithoutInactive` is a
-clone-free no-op when nothing is deactivated, so the all-active path is
-unchanged. Regression coverage: `pkg/config/inactive_test.go`.
+Strip only REMOVES nodes from the compiled set, but that is NOT a guarantee
+that a previously-compiling config stays compilable: deactivating a
+*referenced definition* (an address-book entry a policy still matches, a
+group an active `apply-groups` still applies, a scheduler a scheduler-map
+still names, etc.) can leave that active reference dangling and surface a
+dangling-reference commit error. That behavior is correct and expected —
+deactivating an object an active statement depends on is operator intent,
+and the schema gate deliberately enforces it for schema cross-references and
+policy address references (the active reference is validated against the
+stripped definitions, so a deactivated definition no longer satisfies it).
+`WithoutInactive` is a clone-free no-op when nothing is deactivated, so the
+all-active path is unchanged. Regression coverage:
+`pkg/config/inactive_test.go`, `pkg/configstore/inactive_test.go`.
+
+**Round-trippable `deactivate` / `activate`.** `show | display set` emits a
+`deactivate <path>` line after each inactive node's `set` line(s)
+(`ast_format.go`). `ParseSetVerb` (`parser.go`) recognizes `deactivate` and
+`activate` as real verbs alongside `set` / `delete`, and the configstore
+replay paths (`LoadSet`, `LoadMerge`, and the hierarchical
+`FormatSet`-replay inside `LoadMerge`) apply them via
+`ConfigTree.DeactivatePath` / `ActivatePath` (`ast_edit.go`). So display-set
+output round-trips: an inactive node reloads inactive rather than being
+skipped (and silently reactivated) or parsed as a junk path beginning
+"deactivate".
