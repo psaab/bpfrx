@@ -1,5 +1,46 @@
 # Action Log
 
+## 2026-06-20 — #2051 + #2052 config-mode edit/load surface parity (one PR)
+
+- **Timestamp**: 2026-06-20
+- **Action**: #2051 expose `activate` / `deactivate` as first-class
+  config-mode edits across all four surfaces, building on the shipped
+  #2008 primitives (`ConfigTree.DeactivatePath` / `ActivatePath`,
+  `applyEditLine`). Added store wrappers `DeactivateFromInput` /
+  `ActivateFromInput` (route through `applyEditLine` so verb logic stays
+  in one place; NOT through `ParseSetCommand("set "+input)` which would
+  mangle the path into a junk node named "deactivate"). Wired local CLI
+  dispatch (`cli_dispatch.go`), remote CLI `dispatchConfig`
+  (`cmd/cli/shared.go`, rides the gRPC `Set` RPC with the verb kept as
+  input prefix), gRPC `Set` prefix-routing (`grpcapi/server_config.go`,
+  BEFORE the `SetFromInput` fall-through — the anti-mangling fix), and
+  REST `POST /api/v1/config/{deactivate,activate}` (`pkg/api/config.go` +
+  `server.go` routes). cmdtree `ConfigTopLevel` lists both verbs;
+  completion has schema parity with `delete` (reuses
+  `CompleteSetPathWithValues` in both `pkg/cli/completion.go` and
+  `grpcapi/server_cluster.go`). #2052 made `load set` a real service-mode
+  op: `mode == "set"` → `store.LoadSet` on gRPC `Load`
+  (`server_config.go`) and REST `configLoadHandler` (`pkg/api/config.go`),
+  applied-count log-only; widened remote CLI `handleLoad`
+  (`cmd/cli/main.go`) to accept `set` (terminal + file); fixed the proto
+  comment drift (`proto/xpf/v1/xpf.proto` LoadRequest.mode: drop the
+  nonexistent `replace`, document `set`) and regenerated `xpf.pb.go`
+  (comment-only diff, no wire change). Tests assert ACTUAL inactivation
+  (display-set `deactivate <path>` line, proxy for `node.Inactive`), not
+  no-error; the gRPC anti-mangling regression verified non-tautological
+  (fails when the prefix-route is removed → junk `set deactivate ...`
+  node). Docs: `docs/config-schema.md`, `pkg/config/README.md`.
+- **File(s)**: `pkg/configstore/store.go`, `pkg/cli/cli_dispatch.go`,
+  `pkg/cli/completion.go`, `cmd/cli/shared.go`, `cmd/cli/main.go`,
+  `pkg/grpcapi/server_config.go`, `pkg/grpcapi/server_cluster.go`,
+  `pkg/api/config.go`, `pkg/api/server.go`, `pkg/cmdtree/tree.go`,
+  `proto/xpf/v1/xpf.proto`, `pkg/grpcapi/xpfv1/xpf.pb.go`,
+  `docs/config-schema.md`, `pkg/config/README.md`,
+  `pkg/configstore/activate_test.go`,
+  `pkg/grpcapi/server_config_activate_test.go`,
+  `pkg/api/config_activate_test.go`, `pkg/cli/cli_activate_test.go`,
+  `pkg/cli/completion_activate_test.go`.
+
 ## 2026-06-19 — #2053 redact all config secrets at JSON/YAML marshal time
 
 - **Timestamp**: 2026-06-19

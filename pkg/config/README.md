@@ -117,10 +117,12 @@ nothing internal.
   `LoadSet` / `LoadMerge` replay loops), so an inactive node reloads inactive
   rather than being skipped (silently reactivated) or parsed as a junk path.
   Regression coverage: `pkg/config/inactive_test.go`,
-  `pkg/configstore/inactive_test.go`. NOTE: interactive standalone
-  `activate` / `deactivate` config-mode commands (a typed CLI verb that edits
-  the candidate directly, distinct from `load set` replay) remain a separate
-  increment.
+  `pkg/configstore/inactive_test.go`. The interactive standalone
+  `activate` / `deactivate` config-mode verbs (editing the candidate directly,
+  distinct from `load set` replay) shipped in #2051 across all four config
+  surfaces (local CLI, remote CLI, gRPC, REST) on top of these primitives —
+  the store wrappers `configstore.Store.DeactivateFromInput` /
+  `ActivateFromInput` route through the same `applyEditLine` verb switch.
 
 ## Callers
 
