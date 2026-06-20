@@ -208,6 +208,22 @@ func (a *LegacyDataPlaneAdapter) SetRouteOverlay(overlay []config.RouteOverlayEn
 	m.SetRouteOverlay(overlay)
 }
 
+// SetFeedSnapshots forwards the dynamic-address feed overlay (#2049).
+//
+// The daemon's feedSnapshotSetter hand-off asserts on the runtime
+// dataplane, which on the default path is *LegacyDataPlaneAdapter (from
+// dpuserspace.Boot -> NewLegacyDataPlaneAdapter). Without this method the
+// type assertion fails and SetFeedSnapshots is never reached, leaving
+// m.feedOverlay empty so feed enforcement is a no-op on the real runtime
+// path. Mirrors SetRouteOverlay exactly.
+func (a *LegacyDataPlaneAdapter) SetFeedSnapshots(overlay map[string][]string) {
+	m, err := a.managerOrErr()
+	if err != nil {
+		return
+	}
+	m.SetFeedSnapshots(overlay)
+}
+
 // PublishRouteOverlaySnapshot forwards the routes-only partial
 // republish (#1827). Returns whether a snapshot was actually
 // published (duplicate-skips and helperless caching return false).
