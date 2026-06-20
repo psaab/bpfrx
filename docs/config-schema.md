@@ -347,6 +347,34 @@ reserved for whole-dataplane selection where a rewrite shim
   parity but not yet used to alter the emitted structured-data field set.
   Regression coverage: `pkg/config/log_profile_test.go` +
   `pkg/config/log_profile_schema_test.go`.
+- **#2008 H9/H10 (interface silent-drop reject):** two interface stanzas
+  that parsed-accepted and were silently dropped (no schema child, no
+  compiler case, no dataplane consumer) are now hard-rejected at commit /
+  commit-check by an AST pre-walk
+  (`validateUnsupportedInterfaceStanzasAST`,
+  `compiler_interfaces_unsupported.go`):
+    - **H9** `interfaces <if> unit <n> family inet|inet6 policer arp
+      <name>` — xpf has no per-interface ARP policer (`feature-gaps.md`
+      "Interface Policer ... Missing").
+    - **H10** `interfaces <if> [unit <n>] mac <addr>` — the interface MAC
+      is read-only (cluster RETH MAC is computed deterministically per
+      node via `programRethMAC`), so a static override diverges from
+      Junos and is unimplemented.
+  Unlike H7 these are NOT given schema children — advertising a stanza
+  that is rejected would be misleading; the honest contract for an
+  unenforceable stanza is a commit rejection. Strict on commit /
+  commit-check, downgraded to a warning on the tolerant load / peer-sync
+  paths (`lenientUnsupportedInterfaceStanzas`, #1960 fail-closed-on-load
+  doctrine) so an older-binary-persisted or peer-synced config that
+  silently accepted these stanzas still boots, and an `inactive:` /
+  apply-groups-inherited stanza is handled correctly (the walk runs after
+  the inactive prune + group expansion). Detection is scoped to the
+  `interfaces` stanza so the firewall `policer <name>` definition and the
+  chassis `device-map interface ... mac` identity key are untouched. M1
+  (`commit persist-groups-inheritance`) stays warn-only — it is a daemon
+  no-op knob, not a false dataplane/identity promise — and its real
+  implementation is split to /research. Regression coverage:
+  `pkg/config/compiler_interfaces_unsupported_test.go`.
 - **#1387 (DHCP dynamic-DNS, increment 1):** added an opt-in
   `dynamic-dns` subtree under BOTH `services dhcp-local-server` and
   `services dhcpv6-local-server` (a single shared `config.DHCPDynamicDNSConfig`

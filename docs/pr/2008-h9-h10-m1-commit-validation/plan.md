@@ -1,6 +1,10 @@
 # #2008 H9 / H10 / M1 — commit-validation quick-wins
 
-Status: DRAFT v1 — pending adversarial plan review
+Status: PLAN-READY v2 — Codex PLAN-NEEDS-MINOR (task-mqmx7m0r-4nmff6),
+all three minor points folded (citation reproducibility, dual-AST H9
+tests added + passing, M1-vs-H9/H10 strictness rationale). Gemini Code
+Assist companion is deprecated (client unsupported) — second independent
+review to be dispatched by the parent.
 Base: origin/master c7b5800a4
 Branch: refactor/2008-h9-h10-m1-commit-validation
 
@@ -47,9 +51,28 @@ The three audit rows:
   `types_system.go:47`), and **commit-warned**
   (`compiler.go:1533-1534`). The silent-drop is already closed; the only
   remaining work is real daemon-side group-membership persistence — a
-  large feature the Tier-2 research (`research/2008-tier2`) graded
+  large feature the #2008 "Tier-2 parity research" comment graded
   "large-needs-design / likely reject ... prove apply-groups
-  equivalence first ... lowest value. NOT Increment-2."
+  equivalence first ... lowest value. NOT Increment-2." (The full Tier-2
+  plan doc lives on the `research/2008-tier2` branch, not master; the
+  disposition is reproduced verbatim in the #2008 issue comment thread.)
+
+### Why H9/H10 are stricter (reject) than M1 (warn)
+
+M1 is a daemon *behaviour* knob that is harmless as a no-op: a config
+that sets `persist-groups-inheritance` still produces a correct firewall
+posture (xpf's eager group expansion already yields the persisted
+result), so a warning is honest. H9 and H10 are *false promises about
+dataplane enforcement / interface identity*: a committed `policer arp`
+claims ARP is rate-limited and a committed `mac` claims a specific
+hardware address — neither of which the running firewall delivers.
+Silently accepting (or only warning at commit on) such a stanza lets an
+operator deploy a config they believe is enforcing security/identity
+when it is not. The split: strict on commit/commit-check (block a new
+operator edit that would deploy a fake guarantee), lenient on
+load/peer-sync (an already-imported or peer-synced config that an older
+binary silently accepted must still boot — import-compatibility, the
+PR #659 precedent — and the stanza is a harmless no-op once booted).
 
 ## Disposition
 
