@@ -146,7 +146,12 @@ var failClosedBootForwardingArmed = detectFailClosedBootForwardingArmed
 
 func detectFailClosedBootForwardingArmed() (bool, error) {
 	// Active config is nil on a compile-failed boot; DefaultControlSocketPath
-	// returns the default control-socket path in that case.
+	// returns the default control-socket path in that case. A surviving helper
+	// that the previous (now-uncompilable) config had pointed at a NON-default
+	// control-socket path is therefore not probed here and reads as not-armed,
+	// which CLEARS FRR. That is the fail-safe direction (peers fail over rather
+	// than blackhole): this can only over-clear on an exotic custom-socket
+	// config, never wrongly preserve FRR for a dead dataplane.
 	sock := dpuserspace.DefaultControlSocketPath(nil)
 	return dpuserspace.ProbeForwardingArmed(sock, failClosedBootArmedProbeTimeout)
 }
