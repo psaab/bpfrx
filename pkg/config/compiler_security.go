@@ -844,6 +844,9 @@ func compileFlow(node *Node, sec *SecurityConfig) error {
 			if dpNode := pfInst.node.FindChild("destination-prefix"); dpNode != nil {
 				pf.DestinationPrefix = nodeVal(dpNode)
 			}
+			if protoNode := pfInst.node.FindChild("protocol"); protoNode != nil {
+				pf.Protocol = nodeVal(protoNode)
+			}
 			to.PacketFilters = append(to.PacketFilters, pf)
 		}
 		sec.Flow.Traceoptions = to

@@ -230,7 +230,10 @@ reserved for whole-dataplane selection where a rewrite shim
   commit; same-commit definition + reference passes; `best-effort` is
   always resolvable; the other Junos default classes are deliberately NOT
   implicit — xpf's runtime does not define them); (c) **system/services**:
-  22 typed slots (name-server, ssh root-login enum, the dataplane
+  22 typed slots (name-server, ssh root-login enum, ssh key-exchange
+  multi-value list (H5/#2008; renders to sshd `KexAlgorithms` —
+  `pkg/daemon/daemon_system.go` `buildSSHDConfig`; left untyped/no enum
+  because sshd validates the algorithm spellings at reload), the dataplane
   workers/ring-entries/poll-mode/rss-indirection/claim-host-tunables/
   netdev-budget/coalescence knobs, the rpm probe knobs, ip-monitoring
   hold-down / preferred-metric) plus the `validateMultiValueLeaf`

@@ -322,6 +322,11 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 			if rl := sshNode.FindChild("root-login"); rl != nil && len(rl.Keys) >= 2 {
 				sys.Services.SSH.RootLogin = rl.Keys[1]
 			}
+			for _, kx := range sshNode.FindChildren("key-exchange") {
+				if v := nodeVal(kx); v != "" {
+					sys.Services.SSH.KeyExchange = append(sys.Services.SSH.KeyExchange, v)
+				}
+			}
 		}
 		// DNS service
 		if dnsNode := svcNode.FindChild("dns"); dnsNode != nil {

@@ -58,6 +58,35 @@
 - **File(s)**: pkg/config/schema_system.go, pkg/config/types_system.go,
   pkg/config/schema_validate_2008_test.go, docs/system-login.md,
   docs/feature-gaps.md
+## 2026-06-20 — #2008 Increment-1 quick-wins BATCH 2 (M8 traceoptions packet-filter protocol, H5 ssh key-exchange)
+
+- **Timestamp**: 2026-06-20
+- **Action**: Close two vSRX config-parity gaps from #2008 on the
+  render/match paths. **M8** — traceoptions `packet-filter protocol`:
+  added the `protocol` child to the packet-filter schema, extract into
+  `TracePacketFilter.Protocol`, and an ANDed compare in
+  `matchFilters()` (`pkg/logging/trace.go`) via a `normalizeTraceProto`
+  helper that canonicalizes both Junos protocol names (tcp/udp/icmp/icmp6)
+  and numbers (6/17/1/58) to the same string `protoName` renders, so a
+  config filter value matches the EventRecord protocol regardless of name
+  vs number spelling. **H5** — `system services ssh key-exchange`: added a
+  repeatable (`multi: true`) typed leaf, extract into
+  `SSHServiceConfig.KeyExchange []string`, and render to the sshd
+  `KexAlgorithms` drop-in line. Extracted the render body-building into a
+  pure `buildSSHDConfig` helper so it is unit-testable and so key-exchange
+  renders independently of root-login (the old `applySSHConfig`
+  early-returned when root-login was unset).
+- **File(s)**: pkg/config/types_security.go, pkg/config/schema_security.go,
+  pkg/config/compiler_security.go, pkg/config/types_system.go,
+  pkg/config/schema_system.go, pkg/config/compiler_system.go,
+  pkg/logging/trace.go, pkg/logging/trace_test.go,
+  pkg/config/parser_ast_test.go, pkg/config/parser_system_test.go,
+  pkg/daemon/daemon_system.go, pkg/daemon/daemon_ssh_test.go,
+  docs/feature-gaps.md, docs/config-schema.md, _Log.md
+- **Validation**: `go build ./...` clean; `go vet ./pkg/config
+  ./pkg/logging ./pkg/daemon` clean except two PRE-EXISTING
+  daemon_flow.go:152,216 lock-copy warnings present on origin/master;
+  `go test ./pkg/config ./pkg/logging ./pkg/daemon -count=1` all pass.
 
 ## 2026-06-20 — #2049 enforce dynamic-address feed prefixes in the userspace dataplane
 
