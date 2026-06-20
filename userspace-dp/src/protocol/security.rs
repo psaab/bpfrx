@@ -243,6 +243,31 @@ pub(crate) struct PolicyApplicationSnapshot {
     pub destination_port: String,
 }
 
+/// One row of the L3/L4 application-identification catalog (#2008 M5). Mirrors
+/// the Go `AppCatalogEntrySnapshot` (`pkg/dataplane/userspace/protocol.go`). The
+/// dataplane scans these on session create and stamps the matching `app_id` on
+/// the conntrack session so `show security flow session` resolves a real
+/// application name. Inclusive port boundaries; a `(0, 0)` dst-port pair means
+/// "no destination-port constraint" (match on protocol alone, e.g. ICMP) and a
+/// `(0, 0)` src-port pair means "no source-port constraint". `app_id` is never
+/// 0 (0 is the reserved unknown sentinel). All numeric fields default so a
+/// snapshot omitting `app_catalog` (old Go binary) decodes to an empty catalog.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct AppCatalogEntry {
+    #[serde(rename = "app_id", default)]
+    pub app_id: u16,
+    #[serde(default)]
+    pub protocol: u8,
+    #[serde(rename = "dst_port_low", default)]
+    pub dst_port_low: u16,
+    #[serde(rename = "dst_port_high", default)]
+    pub dst_port_high: u16,
+    #[serde(rename = "src_port_low", default)]
+    pub src_port_low: u16,
+    #[serde(rename = "src_port_high", default)]
+    pub src_port_high: u16,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub(crate) struct PolicyRuleCounterStatus {
     #[serde(rename = "rule_id", default)]

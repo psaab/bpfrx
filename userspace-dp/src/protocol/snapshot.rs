@@ -12,8 +12,8 @@ use super::nat::{
     StaticNATRuleSnapshot,
 };
 use super::security::{
-    AddressBookSnapshot, FirewallFilterSnapshot, FlowExportSnapshot, PolicerSnapshot,
-    PolicyRuleSnapshot, ScreenProfileSnapshot, ThreeColorPolicerSnapshot,
+    AddressBookSnapshot, AppCatalogEntry, FirewallFilterSnapshot, FlowExportSnapshot,
+    PolicerSnapshot, PolicyRuleSnapshot, ScreenProfileSnapshot, ThreeColorPolicerSnapshot,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -229,6 +229,11 @@ pub(crate) struct ConfigSnapshot {
     /// Empty on snapshots from old Go binaries (v3-additive field).
     #[serde(rename = "address_books", default)]
     pub address_books: Vec<AddressBookSnapshot>,
+    /// #2008 M5: L3/L4 application-identification catalog. Empty on snapshots
+    /// from old Go binaries (additive field) — every session then keeps app_id
+    /// 0, the existing unknown default.
+    #[serde(rename = "app_catalog", default)]
+    pub app_catalog: Vec<AppCatalogEntry>,
     #[serde(rename = "source_nat_rules", default)]
     pub source_nat_rules: Vec<SourceNATRuleSnapshot>,
     #[serde(rename = "static_nat_rules", default)]

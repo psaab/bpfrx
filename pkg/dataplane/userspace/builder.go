@@ -62,7 +62,8 @@ func buildSnapshotWithSchedulerState(cfg *config.Config, ucfg config.UserspaceCo
 			books, _ := buildAddressBookTableWithFeeds(cfg, feedOverlay)
 			return books
 		}(),
-		Config: cfg,
+		AppCatalog: buildAppCatalogSnapshot(cfg),
+		Config:     cfg,
 		Summary: SnapshotSummary{
 			HostName:       cfg.System.HostName,
 			DataplaneType:  cfg.System.DataplaneType,

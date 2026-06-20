@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"math"
 
+	"github.com/psaab/xpf/pkg/appid"
 	"github.com/psaab/xpf/pkg/config"
 )
 
@@ -118,6 +119,45 @@ func algDisableFlags(alg *config.ALGConfig) uint8 {
 		flags |= 0x08
 	}
 	return flags
+}
+
+// buildAppCatalogSnapshot ships the L3/L4 application-identification catalog to
+// the userspace dataplane (#2008 M5). The catalog assigns each configured
+// application a numeric app_id and carries its protocol/port match rule; the
+// dataplane stamps that app_id on a matching session at create time so `show
+// security flow session` resolves a real application name instead of a port
+// guess. The app_id values are produced by appid.BuildCatalog in the SAME
+// sorted order with the SAME id assignment that pkg/dataplane.compileApplications
+// uses for CompileResult.AppNames (the map ResolveSessionName consumes), so the
+// stamped id resolves to the matching name on the show path. A build error (a
+// malformed application-set reference) yields an empty catalog and a warning
+// rather than aborting the snapshot — the commit-time compiler already
+// hard-errors the same input, so reaching here means the config compiled.
+func buildAppCatalogSnapshot(cfg *config.Config) []AppCatalogEntrySnapshot {
+	if cfg == nil {
+		return nil
+	}
+	cat, err := appid.BuildCatalog(cfg)
+	if err != nil {
+		slog.Warn("userspace: app catalog build failed; sessions will not be app-identified (#2008 M5)",
+			"err", err)
+		return nil
+	}
+	if len(cat.Entries) == 0 {
+		return nil
+	}
+	out := make([]AppCatalogEntrySnapshot, 0, len(cat.Entries))
+	for _, e := range cat.Entries {
+		out = append(out, AppCatalogEntrySnapshot{
+			AppID:       e.AppID,
+			Protocol:    e.Protocol,
+			DstPortLow:  e.DstPortLow,
+			DstPortHigh: e.DstPortHigh,
+			SrcPortLow:  e.SrcPortLow,
+			SrcPortHigh: e.SrcPortHigh,
+		})
+	}
+	return out
 }
 
 func buildFlowExportSnapshot(cfg *config.Config) *FlowExportSnapshot {
