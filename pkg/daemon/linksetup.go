@@ -19,6 +19,22 @@ const linkPrefix = "10-xpf-"
 // tests can redirect it to a temp dir; production never reassigns it.
 var linkDir = "/etc/systemd/network"
 
+// netlink link operations used by renameInterface, indirected through
+// package vars so tests can inject failures (e.g. a LinkSetUp error) and
+// record the exact call sequence. They default to the real
+// vishvananda/netlink functions; production never reassigns them. This
+// mirrors the package's existing function-var seam idiom (deriveKernelNameFn
+// in device_map.go) and the testLink/mockLinkByName scaffold in
+// vip_readiness_test.go. Tests that swap these vars MUST restore them via
+// t.Cleanup and MUST NOT call t.Parallel() — the vars are package-global
+// mutable state.
+var (
+	nlLinkByName  = netlink.LinkByName
+	nlLinkSetDown = netlink.LinkSetDown
+	nlLinkSetName = netlink.LinkSetName
+	nlLinkSetUp   = netlink.LinkSetUp
+)
+
 // pciNIC holds enumeration data for one physical NIC.
 type pciNIC struct {
 	sortKey int    // 0 = virtio, 1 = hardware
@@ -326,24 +342,56 @@ UseRoutes=yes`
 }
 
 // renameInterface brings the interface down, renames it, and brings it back up.
+//
+// Failure recovery is asymmetric by design:
+//
+//   - LinkSetDown failure: the interface is untouched; return immediately.
+//   - LinkSetName failure: the rename did NOT happen, so bring the link back
+//     up under its original name and return.
+//   - LinkSetUp failure (final step): the rename DID happen — the link is now
+//     correctly named but DOWN. We must NOT rename it back: doing so would
+//     re-create collisions that callers such as the device-map phase-1 path
+//     (device_map.go) deliberately broke. Instead retry the bring-up once on
+//     the same handle (netlink set operations act on the cached, stable
+//     ifindex — not the name — so the handle remains valid across the rename;
+//     this holds because LinkByName populates a non-zero Index, making
+//     netlink's internal ensureIndex a no-op). On persistent failure return
+//     an actionable error: the interface is left correctly named, and the
+//     next config reconcile (networkd.Apply) brings it up — it is never
+//     stranded under the old name. (The immediate networkctl reload after the
+//     caller's rename loop only brings up links that already have a managed
+//     .network; the first-boot ge-* case is recovered at the first config
+//     apply.)
 func renameInterface(oldName, newName string) error {
-	link, err := netlink.LinkByName(oldName)
+	link, err := nlLinkByName(oldName)
 	if err != nil {
 		return fmt.Errorf("link %s not found: %w", oldName, err)
 	}
 
-	if err := netlink.LinkSetDown(link); err != nil {
+	if err := nlLinkSetDown(link); err != nil {
 		return fmt.Errorf("link down %s: %w", oldName, err)
 	}
 
-	if err := netlink.LinkSetName(link, newName); err != nil {
-		// Bring back up on rename failure.
-		_ = netlink.LinkSetUp(link)
+	if err := nlLinkSetName(link, newName); err != nil {
+		// Rename did not happen — bring the link back up under its
+		// original name.
+		_ = nlLinkSetUp(link)
 		return fmt.Errorf("rename %s -> %s: %w", oldName, newName, err)
 	}
 
-	if err := netlink.LinkSetUp(link); err != nil {
-		return fmt.Errorf("link up %s: %w", newName, err)
+	if err := nlLinkSetUp(link); err != nil {
+		// The rename already succeeded; the link is correctly named but
+		// DOWN. Retry the bring-up once (acts by ifindex; the handle is
+		// still valid). Do NOT rename back — that would re-create
+		// collisions the device-map collision-break path relies on having
+		// broken.
+		if retryErr := nlLinkSetUp(link); retryErr != nil {
+			return fmt.Errorf(
+				"renamed %s -> %s but could not bring it up; interface is "+
+					"correctly named but DOWN — next config reconcile will "+
+					"retry: %w",
+				oldName, newName, retryErr)
+		}
 	}
 
 	return nil
