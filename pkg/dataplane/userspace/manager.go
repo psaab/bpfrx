@@ -116,7 +116,17 @@ type Manager struct {
 	// (buildSnapshotWithSchedulerState in ApplyConfig) preserves the
 	// overlay across operator commits while a policy is FAILED.
 	// Updated by SetRouteOverlay / PublishRouteOverlaySnapshot.
-	routeOverlay      []config.RouteOverlayEntry
+	routeOverlay []config.RouteOverlayEntry
+	// feedOverlay is the dynamic-address feed-prefix overlay (#2049):
+	// address-name -> union of live feed-backed CIDR strings. Cached so
+	// the FULL apply path (buildSnapshotWithSchedulerState in ApplyConfig)
+	// merges the current feed prefixes into the address book the helper
+	// enforces. Set by SetFeedSnapshots (daemon, from feeds.Manager) under
+	// m.mu, mirroring routeOverlay. A feed onUpdate re-runs applyConfig
+	// against the SAME *config.Config; the overlay is what makes the
+	// rebuilt snapshot's AddressBooks (and thus the content hash) shift on
+	// a feed change so the duplicate-publish gate lets the refresh through.
+	feedOverlay       map[string][]string
 	haGroups          map[int]HAGroupStatus
 	lastIngressIfaces []uint32
 	lastRSTv4         []netip.Addr
@@ -568,7 +578,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	// #1827: include the cached ip-monitoring route overlay so a full
 	// apply (operator commit) while a policy is FAILED preserves the
 	// injected route instead of reverting traffic to the dead uplink.
-	snap := buildSnapshotWithSchedulerState(cfg, ucfg, m.bumpGeneration(), m.readFIBGeneration(), activeState, m.routeOverlaySnapshot())
+	snap := buildSnapshotWithSchedulerState(cfg, ucfg, m.bumpGeneration(), m.readFIBGeneration(), activeState, m.routeOverlaySnapshot(), m.feedSnapshotOverlay())
 	// #1620: stamp the cold-path sample mask onto the snapshot. The
 	// daemon called SetColdPathSampleMask once at startup with the
 	// validated CLI flag value (or nil for "use default"). A nil
@@ -822,6 +832,41 @@ func (m *Manager) SetRouteOverlay(overlay []config.RouteOverlayEntry) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.routeOverlay = cloneRouteOverlay(overlay)
+}
+
+// feedSnapshotOverlay returns a deep copy of the cached dynamic-address
+// feed-prefix overlay (#2049). Read under m.mu, mirroring
+// routeOverlaySnapshot, so the full snapshot build sees a stable view.
+func (m *Manager) feedSnapshotOverlay() map[string][]string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return cloneFeedOverlay(m.feedOverlay)
+}
+
+func cloneFeedOverlay(overlay map[string][]string) map[string][]string {
+	if overlay == nil {
+		return nil
+	}
+	out := make(map[string][]string, len(overlay))
+	for name, prefixes := range overlay {
+		cp := make([]string, len(prefixes))
+		copy(cp, prefixes)
+		out[name] = cp
+	}
+	return out
+}
+
+// SetFeedSnapshots caches the dynamic-address feed-prefix overlay for the
+// next full snapshot build WITHOUT publishing (#2049). The daemon calls this
+// at the top of applyConfigLocked (holding applySem) with the live feed
+// snapshots joined to the address-name bindings, so an operator commit OR a
+// feed onUpdate rebuilds the address book with the current feed prefixes.
+// Mirrors SetRouteOverlay. The overlay is deep-copied so the caller may reuse
+// or mutate its map afterwards.
+func (m *Manager) SetFeedSnapshots(overlay map[string][]string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.feedOverlay = cloneFeedOverlay(overlay)
 }
 
 // PublishRouteOverlaySnapshot republishes the userspace snapshot with

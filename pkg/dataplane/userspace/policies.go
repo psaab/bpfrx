@@ -14,14 +14,24 @@ import (
 )
 
 func buildPolicySnapshots(cfg *config.Config) []PolicyRuleSnapshot {
-	return buildPolicySnapshotsWithSchedulerState(cfg, nil)
+	return buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg, nil, nil)
 }
 
 func buildPolicySnapshotsWithSchedulerState(cfg *config.Config, activeState map[string]bool) []PolicyRuleSnapshot {
+	return buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg, activeState, nil)
+}
+
+// buildPolicySnapshotsWithSchedulerStateAndFeeds builds the policy snapshots,
+// classifying address tokens against the address-book ID map that INCLUDES the
+// dynamic-address feed-prefix overlay (#2049). A policy token that names a
+// feed-backed address-name resolves through nameToID to a SourceBookIDs /
+// DestinationBookIDs reference (instead of falling through to a no-match
+// literal), so the helper enforces the feed prefixes.
+func buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg *config.Config, activeState map[string]bool, feedOverlay map[string][]string) []PolicyRuleSnapshot {
 	if cfg == nil || (len(cfg.Security.Policies) == 0 && len(cfg.Security.GlobalPolicies) == 0) {
 		return nil
 	}
-	_, nameToID := buildAddressBookTable(cfg)
+	_, nameToID := buildAddressBookTableWithFeeds(cfg, feedOverlay)
 	out := make([]PolicyRuleSnapshot, 0)
 	policySetID := uint32(0)
 	for _, zpp := range cfg.Security.Policies {
@@ -153,20 +163,64 @@ func classifyPolicyAddresses(cfg *config.Config, nameToID map[string]uint32, add
 // (hash64, canonical_bytes) so collision-resolution is fully
 // deterministic across HA peers.
 func buildAddressBookTable(cfg *config.Config) ([]AddressBookSnapshot, map[string]uint32) {
-	if cfg == nil || cfg.Security.AddressBook == nil {
+	return buildAddressBookTableWithFeeds(cfg, nil)
+}
+
+// buildAddressBookTableWithFeeds is buildAddressBookTable plus the
+// dynamic-address feed-prefix overlay (#2049). feedOverlay maps an
+// address-name (a `security dynamic-address address-name ... profile
+// feed-name` binding) to the union of its live feed-backed CIDR strings
+// (resolved by the daemon from feeds.Manager.SnapshotForBindings).
+//
+// For each overlay name the feed CIDRs are merged into that name's content
+// bucket BEFORE canonicalize/dedup/sort/hash/ID-assign, so:
+//   - the name gets an AddressBookSnapshot row carrying the feed prefixes,
+//   - nameToID[name] is populated, so classifyPolicyAddresses routes a policy
+//     token naming the feed into SourceBookIDs/DestinationBookIDs (it was a
+//     no-match literal before #2049),
+//   - a feed-backed name with identical content to a static book shares an ID
+//     (the content-equality invariant is preserved — feed CIDRs flow through
+//     the same expand/normalize/dedup path),
+//   - a feed content change shifts the row → the snapshot content hash shifts
+//     → the duplicate-publish gate (snapshotContentHash) lets the refresh
+//     through. This is why the join MUST live in the snapshot builder.
+//
+// An overlay name with no prefixes (startup before first fetch, or an
+// operator-opted hold-interval drop) still produces a (possibly empty) bucket
+// and a nameToID entry, so the policy token is routed as a book reference that
+// matches nothing (fail-closed) rather than a no-match literal — either way it
+// matches nothing, but routing it as a book keeps the wire shape consistent
+// and lets a later refresh populate the same name without re-classifying.
+//
+// When the static AddressBook is nil but a feed overlay is present, the table
+// is still built from the overlay alone (the pre-#2049 early-return only fired
+// because there were no static books to enumerate).
+func buildAddressBookTableWithFeeds(cfg *config.Config, feedOverlay map[string][]string) ([]AddressBookSnapshot, map[string]uint32) {
+	if cfg == nil {
 		return nil, nil
 	}
 	ab := cfg.Security.AddressBook
-
-	// Collect all unique names (Addresses + AddressSets) and sort.
-	allNames := make([]string, 0, len(ab.Addresses)+len(ab.AddressSets))
-	for name := range ab.Addresses {
-		allNames = append(allNames, name)
+	if ab == nil && len(feedOverlay) == 0 {
+		return nil, nil
 	}
-	for name := range ab.AddressSets {
-		if _, dup := ab.Addresses[name]; !dup {
-			allNames = append(allNames, name)
+
+	// Collect all unique names: static Addresses + AddressSets ∪ feed-overlay
+	// names. A feed-backed name need not exist in the static book at all.
+	nameSet := make(map[string]struct{})
+	if ab != nil {
+		for name := range ab.Addresses {
+			nameSet[name] = struct{}{}
 		}
+		for name := range ab.AddressSets {
+			nameSet[name] = struct{}{}
+		}
+	}
+	for name := range feedOverlay {
+		nameSet[name] = struct{}{}
+	}
+	allNames := make([]string, 0, len(nameSet))
+	for name := range nameSet {
+		allNames = append(allNames, name)
 	}
 	sort.Strings(allNames)
 
@@ -180,6 +234,16 @@ func buildAddressBookTable(cfg *config.Config) ([]AddressBookSnapshot, map[strin
 	contentToBucket := make(map[string]*bucket)
 	for _, name := range allNames {
 		v4, v6 := expandBookNameToCIDRs(cfg, name)
+		// #2049: merge the live feed prefixes bound to this name. Feed CIDRs
+		// are already canonical (masked) strings; split by family. They join
+		// the same dedup/sort/canonicalize path as static members, so a
+		// feed-backed name with content identical to a static book shares an
+		// ID by the existing content-equality invariant.
+		if feeds := feedOverlay[name]; len(feeds) > 0 {
+			fv4, fv6 := splitFeedPrefixesByFamily(feeds)
+			v4 = append(v4, fv4...)
+			v6 = append(v6, fv6...)
+		}
 		// Normalise "any" → 0.0.0.0/0 + ::/0 (Codex r6 refinement).
 		v4, v6 = normalizeAnyInCIDRs(v4, v6)
 		// Canonical sort + dedup within each family. Without
@@ -266,6 +330,37 @@ func buildAddressBookTable(cfg *config.Config) ([]AddressBookSnapshot, map[strin
 		}
 	}
 	return out, nameToID
+}
+
+// splitFeedPrefixesByFamily classifies feed-backed CIDR strings into v4 and
+// v6 lists (#2049). Feed prefixes are already canonicalized to masked CIDR
+// form by the feed manager (192.0.2.0/24, 2001:db8::/32), and a bare IP is
+// normalized to /32 or /128 there, so this is a pure family split. A prefix
+// that fails to parse (defensive — should not happen for canonical feed
+// content) is dropped.
+func splitFeedPrefixesByFamily(prefixes []string) (v4, v6 []string) {
+	for _, p := range prefixes {
+		if p == "" {
+			continue
+		}
+		if isV4CIDR(p) {
+			v4 = append(v4, p)
+			continue
+		}
+		if isV6CIDR(p) {
+			v6 = append(v6, p)
+			continue
+		}
+		// Not a CIDR — try a bare IP for robustness.
+		if ip := net.ParseIP(p); ip != nil {
+			if ip.To4() != nil {
+				v4 = append(v4, ip.String()+"/32")
+			} else {
+				v6 = append(v6, ip.String()+"/128")
+			}
+		}
+	}
+	return v4, v6
 }
 
 // expandBookNameToCIDRs resolves a single address-book name

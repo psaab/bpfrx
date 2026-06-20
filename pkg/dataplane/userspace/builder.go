@@ -11,10 +11,10 @@ import (
 )
 
 func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation uint64, fibGeneration uint32) *ConfigSnapshot {
-	return buildSnapshotWithSchedulerState(cfg, ucfg, generation, fibGeneration, nil, nil)
+	return buildSnapshotWithSchedulerState(cfg, ucfg, generation, fibGeneration, nil, nil, nil)
 }
 
-func buildSnapshotWithSchedulerState(cfg *config.Config, ucfg config.UserspaceConfig, generation uint64, fibGeneration uint32, activeState map[string]bool, routeOverlay []config.RouteOverlayEntry) *ConfigSnapshot {
+func buildSnapshotWithSchedulerState(cfg *config.Config, ucfg config.UserspaceConfig, generation uint64, fibGeneration uint32, activeState map[string]bool, routeOverlay []config.RouteOverlayEntry, feedOverlay map[string][]string) *ConfigSnapshot {
 	if cfg == nil {
 		return &ConfigSnapshot{
 			Version:       ProtocolVersion,
@@ -44,7 +44,7 @@ func buildSnapshotWithSchedulerState(cfg *config.Config, ucfg config.UserspaceCo
 		Routes:             buildRouteSnapshots(cfg, interfaces, routeOverlay),
 		Flow:               buildFlowSnapshot(cfg),
 		DefaultPolicy:      policyActionString(cfg.Security.DefaultPolicy),
-		Policies:           buildPolicySnapshotsWithSchedulerState(cfg, activeState),
+		Policies:           buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg, activeState, feedOverlay),
 		SourceNAT:          buildSourceNATSnapshots(cfg),
 		StaticNAT:          buildStaticNATSnapshots(cfg),
 		DestinationNAT:     buildDestinationNATSnapshots(cfg),
@@ -59,7 +59,7 @@ func buildSnapshotWithSchedulerState(cfg *config.Config, ucfg config.UserspaceCo
 		FlowExport:         buildFlowExportSnapshot(cfg),
 		MirrorConfigs:      buildMirrorConfigSnapshotsFailClosed(cfg, interfaces),
 		AddressBooks: func() []AddressBookSnapshot {
-			books, _ := buildAddressBookTable(cfg)
+			books, _ := buildAddressBookTableWithFeeds(cfg, feedOverlay)
 			return books
 		}(),
 		Config: cfg,
