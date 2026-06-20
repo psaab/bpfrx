@@ -73,19 +73,32 @@ func policyFromConfig(c *config.DHCPDynamicDNSConfig) ddnsPolicy {
 }
 
 // DDNSStats is the observable counter snapshot surfaced by `show` (and,
-// in increment 2, the Prometheus collector). All counters are monotonic.
+// since increment 2, the Prometheus collector). All counters are monotonic.
 type DDNSStats struct {
-	Enabled        bool
-	Backend        string
+	Enabled          bool
+	Backend          string
 	UpsertOK         uint64
 	UpsertFail       uint64
 	DeleteOK         uint64
 	DeleteFail       uint64
 	SkippedNoName    uint64
 	SkippedNoBackend uint64 // records skipped because no live backend is wired
-	OwnedRecords     int
-	LastReconcile    time.Time
-	LastReconcileN   int // active leases seen on the last reconcile
+	// SkippedPTRNotAuth counts reverse-zone PTR updates skipped because the
+	// authoritative server returned NOTAUTH/REFUSED for the reverse zone —
+	// a reverse zone we do not own (e.g. delegated to an ISP). The forward
+	// A/AAAA add still succeeded; the lease's reconcile is not failed
+	// (#1387 inc-2, plan §11 Q6).
+	SkippedPTRNotAuth uint64
+	// SkippedConflict counts adds skipped under conflict-policy skip-existing
+	// because the exact RR already existed at the server (plan §4.1).
+	SkippedConflict uint64
+	// ReconcileOK / ReconcileFail count whole reconcile passes by outcome
+	// (a pass is "fail" when at least one record op errored this cycle).
+	ReconcileOK    uint64
+	ReconcileFail  uint64
+	OwnedRecords   int
+	LastReconcile  time.Time
+	LastReconcileN int // active leases seen on the last reconcile
 }
 
 // DDNSManager owns the DDNS reconcile loop and the ownership store. It is
@@ -95,6 +108,18 @@ type DDNSManager struct {
 	mu      sync.Mutex
 	state   *ddnsState
 	updater DNSUpdater
+
+	// newUpdater resolves the live DNS-update backend from the policy +
+	// config resolved at the start of each Reconcile (plan §6 fork 1:
+	// resolve-per-Reconcile). When nil (tests that inject a fixed updater,
+	// or the always-on idle-when-disabled production manager before its
+	// first enabled reconcile) the manager uses the static `updater` field.
+	// Resolving per cycle means a backend-config change at commit takes
+	// effect on the next reconcile with no swap race and no stale capture;
+	// it also lets ONE always-constructed manager serve both the disabled
+	// (nopUpdater) and enabled (rfc2136Updater) states so enabled→disabled
+	// still runs withdrawAllLocked through a live backend (plan §4.2).
+	newUpdater func(pol ddnsPolicy, c *config.DHCPDynamicDNSConfig) (DNSUpdater, error)
 
 	// nodeID is the deterministic-owner-id seed (plan §5 invariant 2):
 	// the owner watermark is derived from the lease identity so EITHER HA
@@ -111,12 +136,16 @@ type DDNSManager struct {
 	now func() time.Time
 
 	// counters
-	upsertOK         atomic.Uint64
-	upsertFail       atomic.Uint64
-	deleteOK         atomic.Uint64
-	deleteFail       atomic.Uint64
-	skippedNoName    atomic.Uint64
-	skippedNoBackend atomic.Uint64 // upsert/delete skipped: no live backend wired
+	upsertOK          atomic.Uint64
+	upsertFail        atomic.Uint64
+	deleteOK          atomic.Uint64
+	deleteFail        atomic.Uint64
+	skippedNoName     atomic.Uint64
+	skippedNoBackend  atomic.Uint64 // upsert/delete skipped: no live backend wired
+	skippedPTRNotAuth atomic.Uint64 // reverse-zone PTR skipped (NOTAUTH/REFUSED)
+	skippedConflict   atomic.Uint64 // add skipped: exact RR already exists
+	reconcileOK       atomic.Uint64 // reconcile passes with no record-op error
+	reconcileFail     atomic.Uint64 // reconcile passes with >=1 record-op error
 
 	lastReconcile  atomic.Int64 // unix nanos
 	lastReconcileN atomic.Int64
@@ -149,6 +178,33 @@ func NewDDNSManager(updater DNSUpdater, nodeID string) *DDNSManager {
 		leasePath6: "/var/lib/kea/kea-leases6.csv",
 		now:        time.Now,
 	}
+}
+
+// NewProductionDDNSManager constructs the always-on production manager
+// (#1387 increment 2, plan §4.2). It is built UNCONDITIONALLY at daemon
+// start regardless of whether DDNS is currently enabled, and resolves the
+// live RFC 2136 backend from the policy at the START OF EACH Reconcile so a
+// commit-time backend-config change takes effect on the next cycle, and so
+// the SAME manager can withdraw records when DDNS is turned off (it always
+// has a running loop). When the active config has no usable backend the
+// manager resolves to the nopUpdater and keeps reconciling (idle).
+func NewProductionDDNSManager(nodeID string) *DDNSManager {
+	m := NewDDNSManager(nopUpdater{}, nodeID)
+	m.newUpdater = func(pol ddnsPolicy, c *config.DHCPDynamicDNSConfig) (DNSUpdater, error) {
+		// Only the live rfc2136 backend is wired in inc-2 (kea-d2 reserved).
+		if pol.backend != "rfc2136" {
+			return nopUpdater{}, nil
+		}
+		if c == nil || c.UpdateServer == "" {
+			// Enabled but nothing to update — stay no-op (the commit warning
+			// already told the operator). Counts as no-backend skips.
+			return nopUpdater{}, nil
+		}
+		return newRFC2136Updater(pol, c, nil,
+			func() { m.skippedPTRNotAuth.Add(1) },
+			func() { m.skippedConflict.Add(1) })
+	}
+	return m
 }
 
 // newDDNSManagerForTesting builds a manager with an in-memory state store
@@ -194,8 +250,43 @@ func (m *DDNSManager) Reconcile(ctx context.Context, cfg *config.DHCPServerConfi
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// Resolve the live backend from the policy resolved THIS cycle (plan §6
+	// fork 1: resolve-per-Reconcile). A nil factory keeps the static updater
+	// (tests inject a fixed fakeUpdater). A factory error (bad TSIG /
+	// unusable policy) falls back to the no-op so reconcile never wedges and
+	// a malformed backend cannot crash the loop — it is logged + counted as
+	// a no-backend cycle. This MUST run even when disabled so a turn-off
+	// resolves the live backend that published the records and can withdraw
+	// them (else the static nop would silently no-op the withdraw).
+	if m.newUpdater != nil {
+		up, err := m.newUpdater(pol, ddns)
+		if err != nil {
+			slog.Warn("ddns: cannot build DNS-update backend; staying no-op this cycle", "err", err)
+			up = nopUpdater{}
+		}
+		// Do NOT replace a LIVE updater with a nop while owned records still
+		// need withdrawing. The whole-stanza removal (DynamicDNS=nil) resolves
+		// the factory to a nopUpdater (no update-server/TSIG left to build the
+		// live backend from), and the !pol.enabled branch below would then run
+		// withdrawAllLocked THROUGH the nop — dropping ownership entries while
+		// sending no real DNS delete, orphaning the records this firewall
+		// published. Keep the existing live updater for THIS withdraw cycle so
+		// the backend that published the records also withdraws them; the swap
+		// to nop happens on the next cycle once nothing is owned. (Disable via
+		// Enabled=false while keeping the backend config still resolves a live
+		// updater here, so that path is unaffected.)
+		if isNopUpdater(up) && !isNopUpdater(m.updater) && len(m.state.records) > 0 {
+			slog.Debug("ddns: keeping live updater this cycle to withdraw owned records " +
+				"before swapping to no-op")
+		} else {
+			m.updater = up
+		}
+	}
+
 	if !pol.enabled {
-		return m.withdrawAllLocked(ctx)
+		err := m.withdrawAllLocked(ctx)
+		m.recordReconcilePass(err)
+		return err
 	}
 
 	now := m.now()
@@ -222,13 +313,31 @@ func (m *DDNSManager) Reconcile(ctx context.Context, cfg *config.DHCPServerConfi
 	if err6 != nil {
 		untrusted[6] = true
 	}
-	if err := m.reconcileOnceLocked(ctx, pol, leases, untrusted); err != nil {
-		return err
+	recErr := m.reconcileOnceLocked(ctx, pol, leases, untrusted)
+	// A reconcile pass "fails" when any record op errored OR a family's lease
+	// CSV was unreadable (its destructive diff was suppressed — an incomplete
+	// pass). Surface the first error to the loop for logging.
+	passErr := recErr
+	if passErr == nil {
+		if err4 != nil {
+			passErr = err4
+		} else if err6 != nil {
+			passErr = err6
+		}
 	}
-	if err4 != nil {
-		return err4
+	m.recordReconcilePass(passErr)
+	return passErr
+}
+
+// recordReconcilePass tallies a whole reconcile pass by outcome (plan §4.4
+// reconcile_runs_total{result}). A nil err is an "ok" pass; a non-nil err
+// (record-op failure or an unreadable lease family) is a "fail" pass.
+func (m *DDNSManager) recordReconcilePass(err error) {
+	if err != nil {
+		m.reconcileFail.Add(1)
+		return
 	}
-	return err6
+	m.reconcileOK.Add(1)
 }
 
 // reconcileOnceLocked is the pure reconcile algorithm (plan §4.5): build
@@ -461,6 +570,38 @@ func recordsEqual(a, b ownedRecord) bool {
 		a.TTL == b.TTL
 }
 
+// DDNSOwnedRecordView is a read-only projection of one owned record for
+// `show ... dynamic-dns detail`. It deliberately omits the owner watermark
+// (an internal hash) and exposes only the published tuple.
+type DDNSOwnedRecordView struct {
+	Family      int
+	FQDN        string
+	ForwardType string
+	Address     string
+	PTRName     string
+	TTL         int
+}
+
+// OwnedRecordViews returns a stable-ordered snapshot of the records this
+// node currently owns (published into DNS). Used by the show command.
+func (m *DDNSManager) OwnedRecordViews() []DDNSOwnedRecordView {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	all := m.state.all()
+	out := make([]DDNSOwnedRecordView, 0, len(all))
+	for _, r := range all {
+		out = append(out, DDNSOwnedRecordView{
+			Family:      r.Family,
+			FQDN:        r.FQDN,
+			ForwardType: r.ForwardType,
+			Address:     r.Address,
+			PTRName:     r.PTRName,
+			TTL:         r.TTL,
+		})
+	}
+	return out
+}
+
 // Stats returns the current observable counters for `show ... dynamic-dns`.
 func (m *DDNSManager) Stats() DDNSStats {
 	m.mu.Lock()
@@ -468,14 +609,18 @@ func (m *DDNSManager) Stats() DDNSStats {
 	m.mu.Unlock()
 
 	st := DDNSStats{
-		UpsertOK:         m.upsertOK.Load(),
-		UpsertFail:       m.upsertFail.Load(),
-		DeleteOK:         m.deleteOK.Load(),
-		DeleteFail:       m.deleteFail.Load(),
-		SkippedNoName:    m.skippedNoName.Load(),
-		SkippedNoBackend: m.skippedNoBackend.Load(),
-		OwnedRecords:     n,
-		LastReconcileN:   int(m.lastReconcileN.Load()),
+		UpsertOK:          m.upsertOK.Load(),
+		UpsertFail:        m.upsertFail.Load(),
+		DeleteOK:          m.deleteOK.Load(),
+		DeleteFail:        m.deleteFail.Load(),
+		SkippedNoName:     m.skippedNoName.Load(),
+		SkippedNoBackend:  m.skippedNoBackend.Load(),
+		SkippedPTRNotAuth: m.skippedPTRNotAuth.Load(),
+		SkippedConflict:   m.skippedConflict.Load(),
+		ReconcileOK:       m.reconcileOK.Load(),
+		ReconcileFail:     m.reconcileFail.Load(),
+		OwnedRecords:      n,
+		LastReconcileN:    int(m.lastReconcileN.Load()),
 	}
 	if ns := m.lastReconcile.Load(); ns > 0 {
 		st.LastReconcile = time.Unix(0, ns)

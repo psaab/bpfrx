@@ -30,6 +30,50 @@ func (c *xpfCollector) collectDHCPMetrics(ch chan<- prometheus.Metric) {
 		float64(inet6), "inet6")
 }
 
+// collectDDNSMetrics emits the xpf_dhcp_ddns_* family from the DDNS
+// manager's counter snapshot (#1387 inc-2). The family is omitted entirely
+// when no DDNSStatsFn is wired or it returns nil (NoDataplane). Label
+// cardinality is CLOSED: result in {ok,fail}; reason in
+// {no-name,no-backend,conflict,ptr-notauth}.
+func (c *xpfCollector) collectDDNSMetrics(ch chan<- prometheus.Metric) {
+	if c.srv.ddnsStatsFn == nil {
+		return
+	}
+	st := c.srv.ddnsStatsFn()
+	if st == nil {
+		return
+	}
+	ch <- prometheus.MustNewConstMetric(c.dhcpDDNSUpsertsTotal, prometheus.CounterValue,
+		float64(st.UpsertOK), "ok")
+	ch <- prometheus.MustNewConstMetric(c.dhcpDDNSUpsertsTotal, prometheus.CounterValue,
+		float64(st.UpsertFail), "fail")
+	ch <- prometheus.MustNewConstMetric(c.dhcpDDNSDeletesTotal, prometheus.CounterValue,
+		float64(st.DeleteOK), "ok")
+	ch <- prometheus.MustNewConstMetric(c.dhcpDDNSDeletesTotal, prometheus.CounterValue,
+		float64(st.DeleteFail), "fail")
+	ch <- prometheus.MustNewConstMetric(c.dhcpDDNSReconcileRunsTotal, prometheus.CounterValue,
+		float64(st.ReconcileOK), "ok")
+	ch <- prometheus.MustNewConstMetric(c.dhcpDDNSReconcileRunsTotal, prometheus.CounterValue,
+		float64(st.ReconcileFail), "fail")
+	ch <- prometheus.MustNewConstMetric(c.dhcpDDNSSkippedTotal, prometheus.CounterValue,
+		float64(st.SkippedNoName), "no-name")
+	ch <- prometheus.MustNewConstMetric(c.dhcpDDNSSkippedTotal, prometheus.CounterValue,
+		float64(st.SkippedNoBackend), "no-backend")
+	ch <- prometheus.MustNewConstMetric(c.dhcpDDNSSkippedTotal, prometheus.CounterValue,
+		float64(st.SkippedConflict), "conflict")
+	ch <- prometheus.MustNewConstMetric(c.dhcpDDNSSkippedTotal, prometheus.CounterValue,
+		float64(st.SkippedPTRNotAuth), "ptr-notauth")
+	ch <- prometheus.MustNewConstMetric(c.dhcpDDNSOwnedRecords, prometheus.GaugeValue,
+		float64(st.OwnedRecords))
+	var lastTs float64
+	if !st.LastReconcile.IsZero() {
+		lastTs = float64(st.LastReconcile.Unix())
+	}
+	ch <- prometheus.MustNewConstMetric(c.dhcpDDNSLastReconcileTs, prometheus.GaugeValue, lastTs)
+	ch <- prometheus.MustNewConstMetric(c.dhcpDDNSLastReconcileN, prometheus.GaugeValue,
+		float64(st.LastReconcileN))
+}
+
 func (c *xpfCollector) collectSystemMetrics(ch chan<- prometheus.Metric) {
 	// Daemon uptime
 	ch <- prometheus.MustNewConstMetric(c.daemonUptime, prometheus.GaugeValue,

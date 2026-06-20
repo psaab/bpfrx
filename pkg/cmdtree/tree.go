@@ -529,6 +529,9 @@ var OperationalTree = map[string]*Node{
 		"dhcp-relay": {Desc: "Show DHCP relay status"},
 		"dhcp-server": {Desc: "Show DHCP server leases", Children: map[string]*Node{
 			"detail": {Desc: "Show detailed DHCP server information with pool utilization"},
+			"dynamic-dns": {Desc: "Show DHCP dynamic-DNS status and counters", Children: map[string]*Node{
+				"detail": {Desc: "Show owned DHCP dynamic-DNS records"},
+			}},
 		}},
 		"snmp": {Desc: "Show SNMP statistics", Children: map[string]*Node{
 			"v3": {Desc: "Show SNMPv3 USM user information"},

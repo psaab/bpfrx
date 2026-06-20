@@ -164,42 +164,135 @@ What increment 1 ships (the fully unit-testable, lab-free slice):
   fail-open store may LEAK previously-owned records — they stay in DNS until
   authoritatively removed; record TTL is resolver caching, not removal — but
   never deletes records xpf did not create.)
-- **Counters** via `DDNSManager.Stats()` (the future `show ... dynamic-dns`
+- **Counters** via `DDNSManager.Stats()` (the `show ... dynamic-dns`
   + Prometheus surface reads this).
-
-DELIBERATELY DEFERRED to later increments (see plan §12):
-
-- The LIVE rfc2136 `DNSUpdater` backend — lab-gated (needs a throwaway
-  authoritative BIND/Knot + TSIG; no such fixture exists in CI yet). The
-  `backend` leaf (and `update-server` / TSIG leaves) are PARSED and
-  VALIDATED in this increment but NOT yet wired to a live updater — nothing
-  is published to DNS. Enabling DDNS emits a commit-time warning
-  (`config.ValidateConfig` → `validateDDNSDeferredBackendWarnings`), stronger
-  when an `update-server` / TSIG is configured, so the operator is not
-  surprised by the absence of records.
-- HA ownership coupling to the per-RG VRRP MASTER/BACKUP gate — must pass
-  `make test-failover`. The deterministic owner-id watermark
-  (`ownerWatermark`) is laid down now so the state store is
-  forward-compatible.
-- The Kea D2 backend (reserved `backend kea-d2` enum; D2 is not in the
-  image, `bake.py`).
-- The daemon reconcile loop + `show ... dynamic-dns` CLI/gRPC plumbing +
-  Prometheus emission. (The API collector is a CHECKED collector — a
-  declared descriptor MUST be emitted or the descriptor-coverage canary
-  fails — so counters live in `DDNSManager` until increment 2 wires a
-  value source on the server.)
 
 Net behaviour change for existing users in increment 1: zero.
 
+## Dynamic DNS (DDNS) — #1387, increment 2 (live backend + loop + HA gate)
+
+Increment 2 (`docs/research/1387-inc2-ddns-backend/plan.md`) turns the
+lights on: a LIVE RFC 2136 backend, a daemon reconcile loop driving it from
+real Kea lease events, a NODE-LEVEL HA single-writer gate, and the
+Prometheus + `show` observability surface. The increment-1 reconciler core,
+ownership store, and `DNSUpdater` interface are UNCHANGED — Inc-2 only wires
+a real updater behind them and a real loop in front.
+
+What increment 2 ships (the feasible, CI-testable slice):
+
+- **Live RFC 2136 backend** — `rfc2136Updater` (`ddns_rfc2136.go`),
+  implementing the existing `DNSUpdater` interface with `github.com/miekg/dns`.
+  An UpsertLease is an idempotent EXACT-RR ADD of the A/AAAA forward record
+  + the PTR reverse record; a DeleteLease is the symmetric EXACT-RR delete
+  (RFC 2136 §2.5.4, TTL=0 / CLASS=NONE). The backend NEVER issues a
+  delete-RRset or delete-name, so a manually-added co-resident record on the
+  same name is never collateral — the R1 cardinal-sin boundary holds on the
+  wire. TSIG (when a key is configured) is signed via `TSIGSecret.Reveal()`
+  with a supported HMAC algorithm (sha1/224/256/384/512; hmac-md5 rejected as
+  insecure; default hmac-sha256). UDP-first with a TCP retry on truncation
+  that is derived from the CALLER's context (so a canceled/deadline'd reconcile
+  pass cancels the in-flight retry), a bounded per-call timeout, and
+  conflict-policy handling (replace-owned =
+  bare add; skip-existing = no-RRset prerequisite, skip on collision;
+  strict-fail = error on collision). The backend is STATELESS beyond its
+  config — all ownership lives in the unchanged state store.
+- **Zone surface** (plan §11 Q1): the forward zone is the configured
+  `Domain` ONLY when the lease's FQDN is actually under it (an out-of-domain
+  `ClientFQDN` derives its own parent zone instead of being misrouted into the
+  domain, which the authoritative server would reject NOTAUTH); the reverse
+  zone is the canonical in-addr.arpa/ip6.arpa derived from the PTR name. A
+  reverse-zone NOTAUTH/REFUSED (a reverse zone we do not own, e.g. delegated to
+  an ISP) is a COUNTED SKIP
+  (`skipped_total{reason="ptr-notauth"}`), NOT a blocking error — the forward
+  add still succeeds and the lease's reconcile is not failed (plan §11 Q6).
+  The zone-resolution helpers take an optional explicit zone list (always
+  empty in Inc-2) so explicit `forward-zone`/`reverse-zone` leaves are a
+  purely additive follow-up.
+- **Resolve-per-Reconcile** (plan §6 fork 1): the always-on production
+  manager (`NewProductionDDNSManager`) rebuilds the live backend from the
+  current policy at the START of each Reconcile, so a commit-time
+  backend-config change takes effect on the next cycle with no swap race, and
+  the SAME manager serves both the disabled (nopUpdater) and enabled states —
+  an enabled→disabled commit (keeping the backend config) still resolves a
+  live backend and runs `withdrawAllLocked` through it.
+- **Withdraw never goes through the nop while records are owned**: removing the
+  WHOLE `dynamic-dns` stanza leaves no update-server/TSIG to build the live
+  backend from, so the per-Reconcile factory resolves a `nopUpdater`. Reconcile
+  must NOT replace a still-live updater with that nop before withdrawing —
+  doing so would drop the ownership entries while sending NO real DNS delete,
+  orphaning the published records. The guard in `Reconcile` keeps the existing
+  live updater for the withdraw cycle when the newly-resolved updater is a nop
+  AND records are still owned; the swap to nop happens on the next cycle once
+  nothing is owned.
+- **Daemon reconcile loop** (`pkg/daemon/daemon_ddns.go`,
+  `runDDNSReconcileLoop`): an ALWAYS-ON guarded background goroutine modeled
+  on the neighbor periodic loop. It ticks on a 30s poll AND is nudged for an
+  immediate pass on config commit and on VRRP MASTER takeover. Each pass runs
+  in a guarded skip-if-in-flight goroutine with a per-pass context timeout, so
+  a hung DNS server can never wedge the loop or starve the nudge channel. It
+  does FILE I/O (the Kea memfile CSVs) + DNS network ONLY — it NEVER touches
+  the userspace-helper control socket, so it cannot starve session installs
+  (CLAUDE.md control-socket rule).
+- **NODE-LEVEL HA single-writer gate** (`ddnsWriterGateOpen`, plan §4.3): this
+  node reconciles DDNS from its own Kea memfile(s) IFF it is MASTER for ≥1 RG
+  (standalone is always the writer). This is SOUND without any per-lease RG
+  attribution because the Kea config each node serves is rendered
+  MASTER-FILTERED (`filterDHCPConfigForMasterRGs`), so a node's memfile holds
+  ONLY its own MASTER-RG leases — the two nodes' input sets are disjoint by RG
+  ownership, so dueling writers are impossible. The gate reads
+  `snapshotRethMasterState` ONLY (the same source the Kea manager uses), never
+  the map-order-assigned, per-render-unstable `subnet_id`. A BACKUP-for-all
+  node STOPS WRITING — it does NOT withdraw valid records (the peer MASTER
+  owns them; deletion is lease-state / config-removal driven only). The
+  async-takeover ordering (Kea `ApplyAsync` may lag the DDNS nudge) is benign:
+  the reconcile is store-driven and add-only-from-current-leases, so a
+  too-early pass against a not-yet-repopulated memfile issues ZERO deletes.
+- **Observability** — `xpf_dhcp_ddns_*` metrics through the CHECKED API
+  collector (`collectDDNSMetrics`, `pkg/api/metrics_system.go`):
+  `upserts_total{result}`, `deletes_total{result}`,
+  `reconcile_runs_total{result}`, `skipped_total{reason}`, `owned_records`,
+  `last_reconcile_timestamp_seconds`, `last_reconcile_leases`. Label
+  cardinality is CLOSED: `result` ∈ {ok,fail}; `reason` ∈
+  {no-name,no-backend,conflict,ptr-notauth}. `show system services
+  dhcp-server dynamic-dns [detail]` renders the config summary + counters
+  (and, in detail, the owned records) via the in-process CLI and the gRPC
+  `ShowText` topic.
+- **Retired the deferred-backend commit warning** and replaced it with live
+  WARN-only validation (`validateDDNSBackendWarnings`, `pkg/config/compiler.go`):
+  enabled rfc2136 with no update-server, a malformed update-server, an
+  unsupported TSIG algorithm, and the still-deferred kea-d2 backend each WARN
+  (never error, so a previously-inert malformed value cannot brick a boot —
+  plan §7 Q-C).
+
+LAB-GATED (NOT in this PR — flagged for the merge gate, plan §9.2/§9.3):
+
+- Live Kea→DNS end-to-end on the loss cluster (a real kea-dhcp{4,6}-server
+  handing a real lease, publishing to a throwaway authoritative BIND/Knot,
+  `dig` resolving the A + PTR, then expiry/reassign removing them).
+- `make test-failover` WITH DDNS enabled — the mandatory cluster gate
+  (CLAUDE.md: any change touching the HA/VRRP transition path). The
+  in-process responder proves the wire format + single-writer correctness;
+  the lab proves the no-dueling-writes + reconcile-on-takeover timing.
+
+Still deferred (Inc-3+):
+
+- The Kea D2 backend (reserved `backend kea-d2` enum; D2 is not in the
+  image, `bake.py`) — still WARN-deferred.
+- Explicit `forward-zone`/`reverse-zone` + `publish-ptr` config leaves — an
+  additive follow-up; the zone-resolution helpers already take the optional
+  list so the follow-up wires straight in.
+
 ## Callers
 
-`pkg/daemon`, `pkg/cli`, `pkg/grpcapi`. (The `DDNSManager` reconcile loop
-is wired into `pkg/daemon` in increment 2; increment 1 is library-level.)
+`pkg/daemon` (constructs the always-on `DDNSManager`, runs the reconcile
+loop, owns the node-level HA gate, exposes `DDNSStats`/`OwnedDDNSRecords` to
+the API/CLI), `pkg/cli`, `pkg/grpcapi`, `pkg/api`.
 
 ## Dependencies
 
 `pkg/config` and `pkg/fsatomic` (the latter for the Kea config writes and
-the #1387 DDNS ownership state store).
+the #1387 DDNS ownership state store). The #1387 inc-2 live RFC 2136 backend
+adds `github.com/miekg/dns` (DNS UPDATE construction + TSIG signing).
 
 ## Gotchas
 

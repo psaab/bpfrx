@@ -1,6 +1,11 @@
 package dhcpserver
 
-import "log/slog"
+import (
+	"log/slog"
+	"time"
+
+	"github.com/psaab/xpf/pkg/config"
+)
 
 // Test-only helpers for pkg/dhcpserver.Manager, following the
 // pkg/dhcp/test_seams.go convention: they live in the production
@@ -36,4 +41,30 @@ func NewManagerForTesting(
 // warnings — e.g. ambiguous Kea subnet selection (#1835 F1) — fire.
 func (m *Manager) SetWarnForTesting(fn func(msg string, args ...any)) {
 	m.warn = fn
+}
+
+// NewDDNSManagerForTesting builds a DDNSManager with injectable state +
+// lease paths, clock, and a per-Reconcile updater factory (#1387 inc-2).
+// It is used by OTHER packages' tests (e.g. pkg/daemon) to drive the
+// production resolve-per-Reconcile manager without real /var/lib paths.
+// updater is the fixed fallback used when newUpdater is nil.
+func NewDDNSManagerForTesting(
+	updater DNSUpdater,
+	statePath, leasePath4, leasePath6, nodeID string,
+	now func() time.Time,
+	newUpdater func(c *config.DHCPDynamicDNSConfig) (DNSUpdater, error),
+) *DDNSManager {
+	m := newDDNSManagerForTesting(updater, statePath, leasePath4, leasePath6, nodeID, now)
+	if newUpdater != nil {
+		m.newUpdater = func(_ ddnsPolicy, c *config.DHCPDynamicDNSConfig) (DNSUpdater, error) {
+			return newUpdater(c)
+		}
+	}
+	return m
+}
+
+// DDNSLeasePaths returns the manager's lease CSV paths so a cross-package
+// test can write synthetic memfiles the reconcile loop will read.
+func (m *DDNSManager) DDNSLeasePaths() (leasePath4, leasePath6 string) {
+	return m.leasePath4, m.leasePath6
 }

@@ -165,6 +165,10 @@ func (c *CLI) handleShow(args []string) error {
 		return c.showDHCPRelay()
 
 	case "dhcp-server":
+		if len(args) >= 2 && args[1] == "dynamic-dns" {
+			detail := len(args) >= 3 && args[2] == "detail"
+			return c.showDHCPDynamicDNS(detail)
+		}
 		detail := len(args) >= 2 && args[1] == "detail"
 		return c.showDHCPServer(detail)
 

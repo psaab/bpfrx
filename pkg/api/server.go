@@ -22,6 +22,7 @@ import (
 	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/conntrack"
 	"github.com/psaab/xpf/pkg/dhcp"
+	"github.com/psaab/xpf/pkg/dhcpserver"
 	"github.com/psaab/xpf/pkg/feeds"
 	"github.com/psaab/xpf/pkg/frr"
 	"github.com/psaab/xpf/pkg/fsatomic"
@@ -113,6 +114,12 @@ type Config struct {
 	// enforced address set is frozen (retain-forever default). Optional; if
 	// nil, the feed gauges are omitted.
 	FeedsFn func() map[string]feeds.FeedInfo
+	// DDNSStatsFn surfaces the DHCP dynamic-DNS counter snapshot for the
+	// xpf_dhcp_ddns_* metric family (#1387 inc-2). The daemon owns the
+	// always-on DDNS manager; the API reads it through this function so the
+	// api package does not import the manager type. Optional; if nil (or it
+	// returns nil), the family is omitted.
+	DDNSStatsFn func() *dhcpserver.DDNSStats
 }
 
 // Server is the HTTP API server.
@@ -137,6 +144,7 @@ type Server struct {
 	ipmonStatusFn           func() []ipmon.PolicyStatus
 	rpmPinFailedFn          func() float64
 	feedsFn                 func() map[string]feeds.FeedInfo
+	ddnsStatsFn             func() *dhcpserver.DDNSStats
 	startTime               time.Time
 }
 
@@ -161,6 +169,7 @@ func NewServer(cfg Config) *Server {
 		ipmonStatusFn:           cfg.IPMonStatusFn,
 		rpmPinFailedFn:          cfg.RPMPinFailedFn,
 		feedsFn:                 cfg.FeedsFn,
+		ddnsStatsFn:             cfg.DDNSStatsFn,
 		startTime:               time.Now(),
 	}
 

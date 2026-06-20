@@ -927,6 +927,14 @@ func (d *Daemon) applyRethServicesForRG(rgID int) {
 			slog.Info("vrrp: DHCP server apply enqueued (MASTER)", "rg", rgID)
 		}
 	}
+	// #1387 inc-2: nudge the DDNS reconcile loop on MASTER takeover so
+	// records are re-published/refreshed within one loop iteration. The
+	// gate (ddnsWriterGateOpen) now reports MASTER for this RG, so the
+	// nudged pass publishes. Async-takeover ordering is benign: the Kea
+	// ApplyAsync above may lag this nudge, so a too-early pass sees fewer
+	// leases and only adds on the next cycle — it never deletes on the
+	// strength of a not-yet-written lease (daemon_ddns.go nudge note).
+	d.nudgeDDNSReconcile()
 }
 
 // clearRethServicesForRG withdraws RA senders and stops DHCP server only

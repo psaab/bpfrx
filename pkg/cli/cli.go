@@ -19,6 +19,7 @@ import (
 	"github.com/psaab/xpf/pkg/dataplane"
 	"github.com/psaab/xpf/pkg/dhcp"
 	"github.com/psaab/xpf/pkg/dhcprelay"
+	"github.com/psaab/xpf/pkg/dhcpserver"
 	"github.com/psaab/xpf/pkg/feeds"
 	"github.com/psaab/xpf/pkg/frr"
 	"github.com/psaab/xpf/pkg/fwdstatus"
@@ -33,26 +34,28 @@ import (
 
 // CLI is the interactive command-line interface.
 type CLI struct {
-	rl              *readline.Instance
-	store           *configstore.Store
-	dp              cliRuntime
-	eventBuf        *logging.EventBuffer
-	eventReader     *logging.EventReader
-	routing         *routing.Manager
-	frr             *frr.Manager
-	ipsec           *ipsec.Manager
-	dhcp            *dhcp.Manager
-	dhcpRelay       *dhcprelay.Manager
-	cluster         *cluster.Manager
-	rpmResultsFn    func() []*rpm.ProbeResult
-	ipmonStatusFn   func() []ipmon.PolicyStatus
-	feedsFn         func() map[string]feeds.FeedInfo
-	lldpNeighborsFn func() []*lldp.Neighbor
-	hostname        string
-	username        string
-	userClass       string
-	version         string
-	startTime       time.Time
+	rl                 *readline.Instance
+	store              *configstore.Store
+	dp                 cliRuntime
+	eventBuf           *logging.EventBuffer
+	eventReader        *logging.EventReader
+	routing            *routing.Manager
+	frr                *frr.Manager
+	ipsec              *ipsec.Manager
+	dhcp               *dhcp.Manager
+	dhcpRelay          *dhcprelay.Manager
+	cluster            *cluster.Manager
+	rpmResultsFn       func() []*rpm.ProbeResult
+	ipmonStatusFn      func() []ipmon.PolicyStatus
+	feedsFn            func() map[string]feeds.FeedInfo
+	lldpNeighborsFn    func() []*lldp.Neighbor
+	ddnsStatsFn        func() *dhcpserver.DDNSStats
+	ddnsOwnedRecordsFn func() []dhcpserver.DDNSOwnedRecordView
+	hostname           string
+	username           string
+	userClass          string
+	version            string
+	startTime          time.Time
 
 	vrrpMgr *vrrp.Manager
 
@@ -159,6 +162,18 @@ func (c *CLI) SetFeedsFn(fn func() map[string]feeds.FeedInfo) {
 // SetLLDPNeighborsFn sets a callback for retrieving live LLDP neighbor data.
 func (c *CLI) SetLLDPNeighborsFn(fn func() []*lldp.Neighbor) {
 	c.lldpNeighborsFn = fn
+}
+
+// SetDDNSStatsFn sets a callback for retrieving live DHCP dynamic-DNS
+// counters (#1387 inc-2). Nil leaves the show config-only.
+func (c *CLI) SetDDNSStatsFn(fn func() *dhcpserver.DDNSStats) {
+	c.ddnsStatsFn = fn
+}
+
+// SetDDNSOwnedRecordsFn sets a callback for retrieving the DHCP
+// dynamic-DNS records this node currently owns (#1387 inc-2).
+func (c *CLI) SetDDNSOwnedRecordsFn(fn func() []dhcpserver.DDNSOwnedRecordView) {
+	c.ddnsOwnedRecordsFn = fn
 }
 
 // SetVersion sets the software version string for show version.

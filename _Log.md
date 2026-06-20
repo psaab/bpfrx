@@ -1,5 +1,57 @@
 # Action Log
 
+## 2026-06-20 — #1387 Increment-2 (DDNS live RFC 2136 backend + loop + HA gate)
+
+- **Timestamp**: 2026-06-20
+- **Action**: #1387 inc-2 — turned the lights on for DHCP dynamic DNS. (1)
+  LIVE RFC 2136 backend `rfc2136Updater` (`ddns_rfc2136.go`) behind the
+  existing `DNSUpdater` interface: exact-RR A/AAAA + PTR add and exact-RR
+  delete (TTL=0/CLASS=NONE, never delete-RRset — R1 cardinal-sin holds on the
+  wire), TSIG via `TSIGSecret.Reveal()` (sha1/224/256/384/512, hmac-md5
+  rejected, default sha256), UDP→TCP-on-truncation, bounded timeout,
+  conflict-policy (replace-owned/skip-existing/strict-fail), Domain-derived
+  forward zone + canonical in-addr.arpa/ip6.arpa reverse, reverse NOTAUTH/
+  REFUSED → counted skip not blocking error. Added `github.com/miekg/dns`.
+  (2) Always-on daemon reconcile loop (`daemon_ddns.go`,
+  `runDDNSReconcileLoop`) modeled on the neighbor guarded-phase loop: 30s
+  poll + commit/MASTER-takeover nudge, skip-if-in-flight guard, file-I/O +
+  DNS only (NO control-socket calls). Manager constructed UNCONDITIONALLY
+  (`NewProductionDDNSManager`), updater resolved per-Reconcile so
+  enabled→disabled withdraws. (3) NODE-LEVEL HA single-writer gate
+  (`ddnsWriterGateOpen`): MASTER for ≥1 RG (standalone always open) via
+  `snapshotRethMasterState`; sound without per-lease attribution because the
+  Kea render is master-filtered; BACKUP = stop-writing (no withdraw). (4)
+  `xpf_dhcp_ddns_*` checked-collector metrics (closed-cardinality result/
+  reason incl. ptr-notauth) + `show system services dhcp-server dynamic-dns
+  [detail]` (CLI + gRPC). (5) Retired the inc-1 deferred-backend commit
+  warning; replaced with WARN-only live validation (no update-server,
+  malformed update-server, bad TSIG algorithm, kea-d2 still-deferred).
+- **Validation**: `go build ./...`, `go vet ./pkg/dhcpserver ./pkg/daemon`
+  (only pre-existing daemon_flow.go lock-copy findings), `go test
+  ./pkg/dhcpserver ./pkg/daemon ./pkg/config ./pkg/api ./pkg/cli
+  ./pkg/grpcapi ./pkg/cmdtree ./cmd/cli` all green. New tests: in-process
+  miekg/dns responder (real UDP/TCP + TSIG verify) for add/delete/exact-RR/
+  conflict/NOTAUTH-skip/TSIG-fail-no-leak/timeout; manager resolve-per-
+  Reconcile + reconcile-pass + steady-state-no-churn + enable→disable-
+  withdraw-once; daemon HA gate (standalone/MASTER/BACKUP) + reconcileDDNSOnce
+  MASTER-publishes/BACKUP-zero-ops/early-nudge-zero-deletes; config WARN-only
+  matrix. LAB-GATED (flagged, not in PR): live Kea→DNS e2e + `make
+  test-failover`-with-DDNS.
+- **File(s)**: pkg/dhcpserver/ddns_rfc2136.go (new),
+  pkg/dhcpserver/ddns_rfc2136_test.go (new),
+  pkg/dhcpserver/ddns_manager_inc2_test.go (new), pkg/dhcpserver/ddns.go,
+  pkg/dhcpserver/test_seams.go, pkg/daemon/daemon_ddns.go (new),
+  pkg/daemon/daemon_ddns_test.go (new), pkg/daemon/daemon.go,
+  pkg/daemon/daemon_run.go, pkg/daemon/daemon_apply.go,
+  pkg/daemon/daemon_ha.go, pkg/api/server.go, pkg/api/metrics.go,
+  pkg/api/metrics_descriptors.go, pkg/api/metrics_system.go,
+  pkg/api/metrics_descriptor_coverage_test.go, pkg/grpcapi/server.go,
+  pkg/grpcapi/server_show.go, pkg/grpcapi/server_show_dhcp_lldp_snmp.go,
+  pkg/cli/cli.go, pkg/cli/cli_show.go, pkg/cli/cli_show_services.go,
+  cmd/cli/show.go, pkg/cmdtree/tree.go, pkg/config/compiler.go,
+  pkg/config/compiler_dhcp_ddns_test.go, go.mod, go.sum,
+  pkg/dhcpserver/README.md, docs/feature-gaps.md
+
 ## 2026-06-20 — #2008 Increment-2 (M7 + H13 Stage 1)
 
 - **Timestamp**: 2026-06-20
@@ -7199,3 +7251,6 @@ top.
 - **Timestamp**: 2026-06-20
 - **Action**: #2049 (PR #2058 Copilot review) — fix TWO confirmed showstopper/correctness bugs that made feed enforcement a no-op on the real runtime path. BUG 1 (showstopper): the daemon's feedSnapshotSetter hand-off asserts on the runtime dataplane, which on the default path is *LegacyDataPlaneAdapter (dpuserspace.Boot -> NewLegacyDataPlaneAdapter). The adapter forwarded SetRouteOverlay but had NO SetFeedSnapshots, so the type assertion in daemon_apply.go returned ok==false, SetFeedSnapshots was never called, m.feedOverlay stayed empty, and enforcement never reached the helper (the prior #2049 tests passed only because they called the Manager directly, bypassing the adapter). Fix: added LegacyDataPlaneAdapter.SetFeedSnapshots forwarding the overlay to the Manager, mirroring SetRouteOverlay's nil/err guard exactly. BUG 2: Manager.UpdatePolicyScheduleState (the CoS scheduler-only republish) rebuilt next.Policies/AddressBooks with a nil overlay (buildPolicySnapshotsWithSchedulerState + buildAddressBookTable), so a scheduler-state change republished a snapshot that DROPPED feed enforcement until the next full apply. Fix: read the cached overlay under the already-held m.mu via cloneFeedOverlay(m.feedOverlay) (NOT feedSnapshotOverlay(), which re-locks m.mu and would deadlock) and pass it to buildPolicySnapshotsWithSchedulerStateAndFeeds + buildAddressBookTableWithFeeds. Tests (the gap that let both bugs through — drive the ADAPTER + scheduler paths, not just the Manager): TestLegacyAdapterForwardsFeedSnapshots drives adapter.SetFeedSnapshots and asserts Manager.feedOverlay was set + a subsequent build enforces the book row/ID (FAILS pre-fix: undefined method -> build failure); TestSchedulerRepublishRetainsFeedEnforcement stands up a fake control socket, calls UpdatePolicyScheduleState with a stored overlay, captures the published apply_snapshot, and asserts the feed-backed book row + book-reference (SourceBookIDs not SourceLiterals) survived (FAILS pre-fix: "scheduler republish DROPPED the feed-backed book row; AddressBooks=[]"). Both failures verified by reverting each fix in isolation. Existing #2049 tests retained. Validation: GOCACHE=/dev/shm/cache go build ./... clean; go vet ./pkg/dataplane/userspace/ clean (the pkg/daemon ExportConfig lock-by-value warnings in daemon_flow.go are PRE-EXISTING, unmodified by this change); go test ./pkg/dataplane/userspace/ ./pkg/feeds/ ./pkg/daemon/ -count=1 all green. COMPANION-FREE per directive.
 - **File(s)**: pkg/dataplane/userspace/legacy_dataplane.go, pkg/dataplane/userspace/manager.go, pkg/dataplane/userspace/feed_enforcement_test.go, _Log.md
+- **Timestamp**: 2026-06-20
+- **Action**: #1387 Inc-2 DDNS (PR #2066 Copilot review) — fixed 5 reported bugs, COMPANION-FREE, each with a test that FAILS pre-fix. (1) STANZA-REMOVAL ORPHANS RECORDS (most important): removing the whole `dynamic-dns` stanza (DynamicDNS=nil) made policyFromConfig resolve backend="" so the per-Reconcile factory returned a nopUpdater; Reconcile swapped m.updater to that nop BEFORE the !pol.enabled withdrawAllLocked, so the withdraw ran through the nop — ownership entries dropped but NO real DNS delete sent (orphaned records). Fix (pkg/dhcpserver/ddns.go Reconcile): when the newly-resolved updater is a nop AND the existing m.updater is live AND records are still owned (len(m.state.records)>0), keep the live updater for this withdraw cycle; swap to nop only on the next cycle once nothing is owned. Disable-via-flag (Enabled=false keeping Backend+UpdateServer) still resolves a LIVE updater, so that already-working path is unaffected — verified by the retained TestManagerEnabledThenDisabledWithdrawsOnce. (2) normalizeUpdateServer (ddns_rfc2136.go) double-bracketed a bracketed IPv6 literal without a port ("[2001:db8::1]" -> "[[2001:db8::1]]:53"): now strips an existing surrounding bracket pair before JoinHostPort. (3) resolveForwardZone (ddns_rfc2136.go) returned dns.Fqdn(defaultDomain) for ANY fqdn when Domain was set, misrouting an out-of-domain ClientFQDN into the domain zone: now uses defaultDomain only when fqdn is a suffix-match under it (via longestZoneSuffix), else derives parentZone(fqdn). (4) TCP-retry-on-truncation (exchange(), ddns_rfc2136.go) replaced the caller ctx with context.Background(), so a canceled/deadline'd reconcile pass could not cancel the retry: now derives the TCP retry ctx from the caller ctx (per-exchange timeout still applied on top). (5) Imprecise test comment (ddns_manager_inc2_test.go) said "a nil DynamicDNS block" for a disable that is actually DynamicDNS!=nil with Enabled=false — corrected. Tests added (all mutation-verified to FAIL pre-fix): TestManagerStanzaRemovalWithdrawsThroughLiveBackend (fakeUpdater RECEIVES the deletes + ownership cleared; pre-fix 0 deletes), TestNormalizeUpdateServer extended with bracketed/bare IPv6 + host:port, TestResolveForwardZone (under-domain -> domain zone; out-of-domain -> own parent), TestExchangeTCPRetryHonorsCallerCancellation (300ms caller deadline bounds the 2s-stalled TCP retry post-fix at ~300ms; pre-fix runs on Background+u.timeout and waits ~2s). Also fixed a PRE-EXISTING (HEAD) test-harness data race in the in-process fake DNS server: test bodies wrote srv.rcodeForZone/conflictPrereq/conflictZones unlocked while the handler reads them under srv.mu — added locked setRcode/clearRcode/setConflict/setTruncate helpers and routed all call sites through them; `go test -race ./pkg/dhcpserver/` is now clean (was failing pre-change). Docs: updated pkg/dhcpserver/README.md (stanza-removal withdraw-through-live-backend guard, forward-zone suffix-match, caller-ctx TCP retry). Validation: GOCACHE=/dev/shm/cache go build ./... clean; go vet ./pkg/dhcpserver/ clean (pkg/daemon ExportConfig lock-by-value warnings are PRE-EXISTING in unmodified daemon_flow.go); go test ./pkg/dhcpserver/ ./pkg/daemon/ -count=1 green; go test -race ./pkg/dhcpserver/ green. COMPANION-FREE per directive; NOT merged.
+- **File(s)**: pkg/dhcpserver/ddns.go, pkg/dhcpserver/ddns_rfc2136.go, pkg/dhcpserver/ddns_manager_inc2_test.go, pkg/dhcpserver/ddns_rfc2136_test.go, pkg/dhcpserver/README.md, _Log.md

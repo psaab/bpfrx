@@ -16,6 +16,7 @@ import (
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/dhcp"
+	"github.com/psaab/xpf/pkg/dhcpserver"
 	"github.com/psaab/xpf/pkg/ipmon"
 )
 
@@ -324,7 +325,7 @@ func populatedCoverageStatus() dpuserspace.ProcessStatus {
 		PendingNeighDuplicateDropsTotal: 4,
 		// #1902: decap-refusal gate counter (always emits).
 		PendingNeighDecapDropsTotal: 2,
-		DynamicNeighborKeys:             []string{"7 10.0.61.1", "9 172.16.80.200"},
+		DynamicNeighborKeys:         []string{"7 10.0.61.1", "9 172.16.80.200"},
 		// #1789: failed USERSPACE_SESSIONS publish counter (always emits).
 		SessionPublishErrorsTotal: 5,
 		// #1760 W3': shared-map reverse-key displacement counter (always
@@ -405,6 +406,22 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 				// unresolved-next-hops gauge emits a non-zero value.
 				UnresolvedRoutes: []string{"10.0.0.0/8"},
 			}}
+		},
+		// #1387 inc-2: wire a non-nil DDNS stats source so the
+		// xpf_dhcp_ddns_* family emits and the canary covers its
+		// descriptor declarations.
+		ddnsStatsFn: func() *dhcpserver.DDNSStats {
+			return &dhcpserver.DDNSStats{
+				Enabled:           true,
+				Backend:           "rfc2136",
+				UpsertOK:          5,
+				DeleteOK:          1,
+				ReconcileOK:       3,
+				SkippedPTRNotAuth: 1,
+				OwnedRecords:      4,
+				LastReconcile:     time.Now(),
+				LastReconcileN:    4,
+			}
 		},
 	}
 	// dhcp.New opens a netlink handle, which a restricted sandbox may

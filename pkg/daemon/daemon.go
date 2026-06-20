@@ -83,12 +83,28 @@ type Daemon struct {
 	// `name-server` / expiring the last lease clears the file). Written
 	// once after the boot apply and read only under applySem in
 	// reconcileDNSLocked.
-	dnsBootDone   bool
-	dhcpServer    *dhcpserver.Manager
-	feeds         *feeds.Manager
-	rpm           *rpm.Manager
-	rpmMu         sync.Mutex // serializes reconcileRPM callers (#1827)
-	activeRPMHash [32]byte   // config-hash gate for RPM re-apply (#1827)
+	dnsBootDone bool
+	dhcpServer  *dhcpserver.Manager
+	// ddns is the always-on DHCP dynamic-DNS manager (#1387 inc-2). It is
+	// constructed UNCONDITIONALLY at daemon start (plan §4.2) — even when
+	// DDNS is disabled — so an enabled→disabled commit always has a running
+	// loop to withdraw the records it published. The reconcile loop is
+	// file-I/O + DNS-network only (no control-socket calls), gated to the
+	// HA-active node, and nudged on commit + MASTER transition.
+	ddns *dhcpserver.DDNSManager
+	// ddnsReconcileNowCh nudges the DDNS reconcile loop for an immediate
+	// pass (config commit / VRRP MASTER takeover). Buffered depth 1 +
+	// non-blocking send: coalesces a burst into one pending wakeup.
+	ddnsReconcileNowCh chan struct{}
+	// ddnsReconcileInFlight is the no-freeze guard for the DDNS loop: a
+	// reconcile pass runs in a guarded goroutine (mirrors the neighbor
+	// loop) so a hung DNS server can never wedge the loop or starve the
+	// nudge channel.
+	ddnsReconcileInFlight atomic.Bool
+	feeds                 *feeds.Manager
+	rpm                   *rpm.Manager
+	rpmMu                 sync.Mutex // serializes reconcileRPM callers (#1827)
+	activeRPMHash         [32]byte   // config-hash gate for RPM re-apply (#1827)
 	// rpmPinsFailed records that the last probe-pin install left at
 	// least one pin unprogrammed (#1895): the install is retried
 	// (without restarting probes) on hash-gated reconcileRPM calls AND
@@ -427,6 +443,7 @@ func New(opts Options) (*Daemon, error) {
 		rgStates:                   make(map[int]*rgStateMachine),
 		blackholeRoutes:            make(map[int][]netlink.Route),
 		reconcileNowCh:             make(chan struct{}, 1),
+		ddnsReconcileNowCh:         make(chan struct{}, 1),
 		syncReadyTimeout:           5 * time.Second,
 		linkByNameFn:               netlink.LinkByName,
 		directAnnounceSchedule:     []time.Duration{0, 250 * time.Millisecond, 1 * time.Second, 2 * time.Second, 4 * time.Second, 6 * time.Second},

@@ -437,6 +437,7 @@ xpf has hostname, domain-name, domain-search, timezone, name-servers, NTP, servi
 | **NTP Threshold Action** | `system ntp threshold ... action ...` | Action when NTP offset exceeds threshold (accept or reject large time jumps) | Low | Done (maps to chrony `logchange` for `accept` and `logchange` + `maxchange` for `reject`, and is shown in operational output) |
 | **Master Password** | `system master-password ...` | Encrypted password storage with master key for config secrets | Low | Done (active/candidate/rollback config trees are encrypted at rest with a node-local master key derived using the configured PRF) |
 | **DNS Proxy** | `system services dns dns-proxy ...` | DNS proxy/caching server on firewall for client DNS resolution | Low | Missing |
+| **DHCP Dynamic DNS** | `system services dhcp-local-server dynamic-dns ...` | Publish forward A/AAAA + reverse PTR records for active DHCP leases and clean them on expire/release/reassign/config-removal | Medium | Done (#1387 — inc-1 config + reconciler + never-delete-non-owned store; inc-2 LIVE RFC 2136 backend via miekg/dns, always-on daemon reconcile loop, NODE-LEVEL HA single-writer gate (MASTER for ≥1 RG), `xpf_dhcp_ddns_*` metrics + `show system services dhcp-server dynamic-dns`; live Kea→DNS e2e + `make test-failover`-with-DDNS are lab-gated. See [pkg/dhcpserver/README.md](../pkg/dhcpserver/README.md)). Deferred: Kea D2 backend, explicit forward-zone/reverse-zone/publish-ptr leaves |
 
 ---
 
