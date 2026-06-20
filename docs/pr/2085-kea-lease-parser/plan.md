@@ -1,6 +1,13 @@
 # #2085 — Display lease parser returns stale/expired and duplicate Kea memfile rows
 
-**Status:** DRAFT v1 — pending adversarial plan review
+**Status:** v2 — folds in adversarial plan-review round 1 (two hostile
+Claude reviewers: PLAN-NEEDS-MAJOR + PLAN-NEEDS-MINOR). Changes from v1:
+(1) state-column filtering pulled IN scope — expire-only is incomplete
+because released (state=2) and declined (state=1) Kea leases carry
+FUTURE expire epochs and would still display as live; (2) test-fixture
+`now` contradiction fixed (legacy call sites use a `now` BEFORE the
+2024-02 fixture expiries); (3) call-site count corrected to FOUR;
+(4) README update added.
 
 ## Issue framing
 
@@ -88,31 +95,57 @@ buried in the parser.
 ### Body (replaces the `for _, fields := range records[1:]` accumulate)
 
 Keep the existing header-map build and per-field extraction. Replace
-the final `if l.Address != "" { leases = append(...) }` block with:
+the final `if l.Address != "" { leases = append(...) }` block with, per
+row, in this order:
 
 1. Skip rows with empty `address` (unchanged — empty address is not a
-   displayable lease).
-2. **Expire filter (lenient):** parse the `expire` field as a Unix
+   displayable lease). Otherwise note the address into the
+   first-appearance `order` slice (tombstone or not) so a later live
+   append can reclaim it.
+2. **State filter (lenient) — FOLDED IN per review:** read the `state`
+   column. If it parses to a non-default value (`state != 0` — Kea
+   `state=1` declined, `state=2` expired-reclaimed), the lease is NOT
+   active — record a TOMBSTONE for the address and do not emit. A
+   released or declined Kea lease is written with a non-default state
+   but often a FUTURE `expire` epoch, so the expire filter alone would
+   leave it visible — exactly the "stale row shown" symptom the issue
+   is about. An absent/unparseable state is treated as active (Kea's
+   default; lenient — matches the DDNS parser ddns_leases.go:264-273).
+3. **Expire filter (lenient):** parse the `expire` field as a Unix
    epoch (`strconv.ParseInt(.., 10, 64)`). If it parses AND
    `expire > 0` AND `now.Unix() >= expire`, the row is expired — record
    it as a TOMBSTONE for that address (so a later append for the same
    address can supersede it) and do not emit. If `expire` is absent or
    unparseable, treat the row as live (lenient — display path must not
    hide a lease just because Kea wrote an exotic/blank expire).
-3. **Dedup (last-write-wins):** keep a `map[string]Lease` keyed by
+4. **Dedup (last-write-wins):** keep a `map[string]Lease` keyed by
    address, overwriting on each row so the LAST row for an address wins
-   (append-only memfile ⇒ chronological ⇒ newest last), plus a
+   (append-only memfile ⇒ chronological ⇒ newest last), plus the
    first-appearance `order []string` slice so display order is stable
-   and deterministic. An expired row writes a zero `Lease{}` tombstone;
-   a live row writes the populated `Lease`.
-4. **Emit:** walk `order`, skip tombstones (`l.Address == ""`), append
+   and deterministic. A non-active or expired row writes a zero
+   `Lease{}` tombstone; a live row writes the populated `Lease`.
+5. **Emit:** walk `order`, skip tombstones (`l.Address == ""`), append
    the rest. This is the exact emit pattern `parseActiveLeases`
    already uses — proven over six #1387 review rounds.
 
-Crucially the tombstone-and-reclaim shape (an expired row tombstones
-the address; a later live append for the same address re-populates it)
-matches the DDNS parser so a re-allocated address that Kea appended a
-fresh live row for is shown live, not hidden by an earlier expired row.
+Crucially the tombstone-and-reclaim shape (a non-active/expired row
+tombstones the address; a later live append for the same address
+re-populates it) matches the DDNS parser so a re-allocated address that
+Kea appended a fresh live row for is shown live, not hidden by an
+earlier expired/reclaimed row. State is filtered BEFORE expire so a
+declined lease with a future expire is correctly tombstoned.
+
+### Why state filtering is lenient, not the DDNS hard-fail
+
+The DDNS parser hard-errors on a mangled header because its empty
+result authorizes a destructive DNS-record delete. The display path
+copies ONLY the per-row lenient state/expire tombstone logic
+(ddns_leases.go:255-287) — NOT the required-column header validation,
+the duplicate-column rejection, or the ragged-row error. An absent
+`state` column (older Kea, exotic header) therefore degrades to
+"treat all rows as active" (today's behaviour), never blanks the
+`show`. This keeps display leniency intact while closing the
+state-stale gap.
 
 ### now boundary semantics
 
@@ -154,7 +187,7 @@ display-only and immaterial.
 
 | Class | Level | Notes |
 |-------|-------|-------|
-| Behavioral regression | LOW | Only the display set shrinks (expired + duplicate rows removed). Live, unique rows are unchanged. Two test-only call sites updated for the new param. |
+| Behavioral regression | LOW | Only the display set shrinks (expired + non-active state + duplicate rows removed). Live, unique, state=0 rows are unchanged. Four test-only call sites updated for the new param. Absent state/expire columns ⇒ today's behaviour (lenient). |
 | Lifetime / borrow (Go: aliasing) | LOW | Pure value copies into a `map[string]Lease`; `Lease` has no pointers/slices. No aliasing hazard. |
 | Performance regression | LOW | Display path, ~1/s operator-driven, never hot. O(rows) map+slice replaces O(rows) slice append. |
 | Architectural mismatch | LOW | Reuses the proven `parseActiveLeases` tombstone/order/emit shape in-place; does NOT merge the two parsers (which would be the mismatch). |
@@ -163,69 +196,112 @@ display-only and immaterial.
 
 Control-plane display bug — **NO smoke** (no dataplane change; the
 loss-cluster CoS matrix is irrelevant here). Coverage is a focused
-`pkg/dhcpserver` unit test, non-tautological (fails against pre-fix code):
+`pkg/dhcpserver` unit test, non-tautological (fails against pre-fix code).
+
+**Existing call sites (FOUR, corrected from v1):** `dhcpserver_test.go`
+lines 265 (`TestParseLeaseCSV`), 292 (`TestParseLeaseCSV_NoFile`), 308
+(`TestParseLeaseCSV_Empty`), 329 (`TestParseLeaseCSV_QuotedHostname`).
+The existing fixtures (`TestParseLeaseCSV`, `TestParseLeaseCSV_QuotedHostname`)
+use expire epochs `1707868800` / `1707955200` (2024-02) with `state=0`,
+so the legacy call sites MUST pass a `now` BEFORE `1707868800` (use a
+named constant, e.g. `time.Unix(1707800000, 0)`) so those rows stay live
+and the pre-existing assertions still hold. `NoFile` and `Empty` take any
+`now`. This is the F1/F2 fix: a `now` past the fixtures would silently
+drop them and neuter the existing assertions.
 
 1. New `TestParseLeaseCSV_ExpiredAndDuplicate`: synthetic append-only
-   CSV with (a) the SAME address appearing twice with different
-   `expire`/hostname (newer row last) and (b) a separate expired
-   address (`expire` well in the past). Assert:
-   - the duplicate address appears EXACTLY once, carrying the NEWEST
-     row's fields;
-   - the expired address is ABSENT;
-   - a normal live address is present unchanged;
-   - injects a fixed `now` (e.g. `time.Unix(1707900000, 0)`) so the
-     test is deterministic and the boundary is explicit. Fails pre-fix
-     (pre-fix returns 4 rows incl. the dup + expired).
-2. Edge: absent/blank/garbage `expire` ⇒ row kept (lenient).
-3. Edge: expired row for an address SUPERSEDED by a later live append
-   ⇒ address shown live (tombstone-reclaim).
-4. Update the three existing `parseLeaseCSV` call sites in
-   `dhcpserver_test.go` to pass a `now` (use a fixed time past the
-   1707955200 expiries in the existing fixtures so those rows stay live
-   — preserves the existing assertions). The existing fixture expires
-   (1707868800 / 1707955200 = 2024-02) need a `now` BEFORE them, or the
-   existing 2-lease test would now correctly drop them; pick a `now`
-   that keeps the existing fixtures live so those tests still assert the
-   pre-existing behaviour.
-5. Gates: `go build ./...`, `go vet ./pkg/dhcpserver/...`,
-   `go test ./pkg/dhcpserver/...` (named test 5x for flake), full
+   CSV (its OWN `now`, e.g. `time.Unix(1707900000, 0)`, with fixtures
+   built relative to it) covering:
+   - the SAME address appearing twice (state=0) with different
+     `expire`/hostname (newer row last, future expire) ⇒ appears
+     EXACTLY once, carrying the NEWEST row's fields;
+   - a separate address whose only row has a PAST `expire` ⇒ ABSENT;
+   - a normal live address (state=0, future expire) ⇒ present unchanged.
+   - Assert `len(leases)` is the post-fix count and that against pre-fix
+     code it would have returned MORE rows (comment the pre-fix vs
+     post-fix expectation so the non-tautology is explicit).
+2. New `TestParseLeaseCSV_StateFiltered`: a declined (`state=1`) and an
+   expired-reclaimed (`state=2`) row, BOTH with a FUTURE `expire` (the
+   gap expire-only misses), ⇒ both ABSENT; plus a state=2 row for an
+   address SUPERSEDED by a later state=0 live append ⇒ shown live
+   (state tombstone-reclaim). Fails an expire-only fix.
+3. Edge: absent/blank/garbage `expire` with state=0 ⇒ row kept
+   (lenient); absent/garbage `state` ⇒ row kept (lenient, default
+   active). Optionally a header with NO `state` column ⇒ all rows kept
+   (proves the lenient degrade-to-today path).
+4. Edge: expired row for an address SUPERSEDED by a later live append
+   ⇒ address shown live (expire tombstone-reclaim).
+5. Update the FOUR existing call sites per the note above.
+6. Gates: `go build ./...`, `go vet ./pkg/dhcpserver/...`,
+   `go test ./pkg/dhcpserver/...` (named tests 5x for flake), full
    `go test ./...`.
+
+## Docs
+
+`pkg/dhcpserver/README.md` must be updated (CLAUDE.md mandates module
+docs in the same work item):
+
+- Lines 78-92 currently contrast the state-aware DDNS parser against
+  "the display-only `parseLeaseCSV`" and assert reusing the display
+  parser "would publish/retain stale records." Post-fix the display
+  parser ALSO filters expired + non-active + dedups, so the rationale
+  for keeping them separate shifts from "display has no filtering" to
+  "display is lenient/non-destructive (never blanks the `show` on a bad
+  row) vs DDNS is hard-fail/destructive (must error on a mangled
+  header)." Update that paragraph.
+- The lease-queries paragraph (lines 318-322) should note that the
+  display now returns only active, non-expired leases, deduplicated
+  per-address to the newest memfile row.
 
 ## Out of scope (explicitly)
 
-- The Kea `state` column (declined/expired-reclaimed) — the display
-  path stays lenient and address+expire-based. Adding state filtering
-  to the display is a separate enhancement; DDNS already handles state
-  for the destructive path. (Open question 4 invites a reviewer to
-  argue this should be in scope.)
 - Merging the display and DDNS parsers — explicitly rejected above.
+  The per-row lenient state/expire/dedup logic is COPIED, not shared,
+  so the destructive DDNS header-validation invariants are untouched.
 - Any change to how `expire`/`valid_lifetime` are RENDERED (epoch vs
   human time) — out of scope; only the row SET changes.
+- DDNS-grade header/duplicate-column/ragged-row validation — the
+  display path stays lenient by design (a bad row degrades, never
+  aborts the `show`).
 
-## Open questions for adversarial review
+## Plan-review round 1 — resolutions
 
-1. **Time seam vs. param:** is adding `now time.Time` to a
-   package-private function the right seam, or should the clock be a
-   `Manager` field? (The function is package-private with two trivial
-   callers and the sibling `parseActiveLeases` already uses the param
-   form — but argue if a `Manager` clock field is cleaner.)
-2. **Lenient expire:** is "unparseable/absent expire ⇒ keep" correct
-   for a display, or should an unparseable expire DROP the row
-   (fail-safe)? DDNS keeps such a row too (line 275-280: expire stays
-   0, no drop). Argue if display should differ.
-3. **Boundary `>=` vs `>`:** `now.Unix() >= expire` treats expiring-now
-   as expired (matches DDNS). Is `>` (still valid at the instant of
-   expiry) more correct for a display? PLAN-KILL-adjacent if the
-   boundary matters operationally.
-4. **State column:** should the display ALSO drop declined /
-   expired-reclaimed (state != 0) rows, not just past-`expire` rows? A
-   reclaimed lease can have a future `expire` but a non-default state.
-   Is expire-only filtering an incomplete fix?
-5. **Dedup key:** is `address` the right dedup key for v6 (where the
-   same address is effectively unique per lease) and v4? Could two
-   genuinely-distinct live leases ever share an address in a healthy
-   memfile such that last-write-wins hides a real lease?
-6. **Should this fix instead just call `parseActiveLeases`?** Argue the
-   merge case if you believe the two-parser split is wrong — the plan
-   rejects it (destructive vs lenient semantics) but invites the
-   counter-argument.
+Two hostile Claude reviewers (PLAN-NEEDS-MAJOR + PLAN-NEEDS-MINOR):
+
+1. **Time seam vs. param** — RESOLVED: param. Both reviewers confirmed
+   `now time.Time` mirrors the sibling `parseActiveLeases` and a
+   `Manager` field would be inconsistent over-engineering for a
+   package-private two-caller function.
+2. **Lenient expire** — RESOLVED: keep (unparseable/absent ⇒ live),
+   matches DDNS. Display must not hide a lease over an exotic expire.
+3. **Boundary `>=` vs `>`** — RESOLVED: keep `>=`, matches DDNS
+   (ddns_leases.go:284); immaterial for a 1/s display, consistency
+   between the two parsers is the tie-breaker.
+4. **State column** — RESOLVED **IN SCOPE** (both reviewers, MAJOR/MINOR):
+   released (state=2) and declined (state=1) Kea leases carry FUTURE
+   `expire`, so expire-only leaves them visible — the issue's own
+   symptom. State filter folded in (lenient, copied from
+   ddns_leases.go:265-273).
+5. **Dedup key** — RESOLVED: `address` is sound for v4 and v6 (IA_NA
+   address is the row identity; IA_PD delegated prefix is unique per
+   row). Kea never double-allocates one address concurrently in a
+   healthy memfile, so last-write-wins only collapses genuine
+   duplicates. v4/v6 are separate files/calls, no cross-family
+   collision.
+6. **Merge with `parseActiveLeases`** — RESOLVED: NO. Both reviewers
+   confirmed the destructive-vs-lenient split is correct; merging would
+   either re-open the #1387 mass-delete or blank the display on one bad
+   row. Copy the lenient per-row logic, not the header-validation.
+
+Also fixed: F1 test-fixture `now` contradiction, F2 call-site count
+(FOUR), F5 README update.
+
+## Open questions for round 2
+
+- Is the lenient state filter correctly placed BEFORE the expire filter
+  (so a declined lease with future expire is tombstoned by state, not
+  missed)? Verify the order in the implementation.
+- Does the new `TestParseLeaseCSV_StateFiltered` genuinely fail an
+  expire-only fix (non-tautological against the half-fix)?
+- Any remaining inaccuracy in the README rewrite of the two-parser
+  rationale?
