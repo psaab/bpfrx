@@ -265,6 +265,23 @@ func newCollector(srv *Server) *xpfCollector {
 				"health-checked (#1895).",
 			nil, nil,
 		),
+		feedSecondsSinceSuccess: prometheus.NewDesc(
+			"xpf_feed_seconds_since_last_success",
+			"Seconds since a dynamic-address feed last fetched successfully. "+
+				"Climbs while the feed cannot be refreshed; the last-good "+
+				"snapshot is retained indefinitely by default (#2050). -1 "+
+				"means the feed has never had a successful fetch (no snapshot "+
+				"installed; fail-closed).",
+			[]string{"feed"}, nil,
+		),
+		feedStale: prometheus.NewDesc(
+			"xpf_feed_stale",
+			"1 while a dynamic-address feed's last-good snapshot is being "+
+				"retained as stale (a fetch has failed since the last good "+
+				"one and the snapshot is still enforced); 0 while fresh "+
+				"(#2050).",
+			[]string{"feed"}, nil,
+		),
 		ipmonPolicyFailed: prometheus.NewDesc(
 			"xpf_ipmon_policy_failed",
 			"1 while the services ip-monitoring policy is in FAIL state "+

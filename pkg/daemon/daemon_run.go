@@ -1139,6 +1139,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// reads 1) while the running active config is not durable on
 			// disk (failed HA sync / auto-rollback persist, retry pending).
 			ConfigPersistDegradedFn: d.store.ConfigPersistDegraded,
+			// #2050: surface dynamic-address feed staleness so the
+			// xpf_feed_seconds_since_last_success / xpf_feed_stale gauges
+			// read live status. A frozen enforced address set (retain-forever
+			// default) is otherwise invisible to monitoring.
+			FeedsFn: func() map[string]feeds.FeedInfo {
+				if d.feeds != nil {
+					return d.feeds.AllFeeds()
+				}
+				return nil
+			},
 		}
 		// Resolve interface bindings from web-management config
 		if cfg := d.store.ActiveConfig(); cfg != nil && cfg.System.Services != nil &&

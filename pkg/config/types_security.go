@@ -26,7 +26,7 @@ type FeedServer struct {
 	URL            string      // explicit url (takes precedence)
 	Hostname       string      // hostname for building URLs with per-feed paths
 	UpdateInterval int         // seconds (0 = default 3600)
-	HoldInterval   int         // seconds (0 = default 7200)
+	HoldInterval   int         // seconds; 0/unset = retain last-good forever on failure, >0 = drop to empty after N seconds (#2050)
 	FeedName       string      // single feed-name (backward compat, no path)
 	FeedEntries    []FeedEntry // named feeds with per-feed paths
 }
