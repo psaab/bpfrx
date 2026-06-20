@@ -113,6 +113,11 @@ func (c *CLI) handleShowSecurity(args []string) error {
 	case "wireguard":
 		// #1865: dataplane WG telemetry — works without an active
 		// config (reads helper status only, like statistics).
+		// #1434 Increment 1: `public-key` prints the local public key
+		// per tunnel (the key to hand the peer).
+		if len(args) >= 2 && args[1] == "public-key" {
+			return c.showSecurityWireguardPublicKey()
+		}
 		return c.showSecurityWireguard(len(args) >= 2 && args[1] == "detail")
 
 	case "zones":

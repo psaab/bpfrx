@@ -14,6 +14,7 @@ import (
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
 	"github.com/psaab/xpf/pkg/routing"
+	"github.com/psaab/xpf/pkg/wgkey"
 )
 
 func (c *CLI) handlePing(args []string) error {
@@ -1002,21 +1003,46 @@ func (c *CLI) handleRequestSecurity(args []string) error {
 		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["security"].Children))
 		return nil
 	}
-	if args[0] != "ipsec" {
+	switch args[0] {
+	case "ipsec":
+		if len(args) < 3 || args[1] != "sa" || args[2] != "clear" {
+			fmt.Println("request security ipsec sa:")
+			writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["security"].Children["ipsec"].Children["sa"].Children))
+			return nil
+		}
+		if c.ipsec == nil {
+			return fmt.Errorf("IPsec manager not available")
+		}
+		count, err := c.ipsec.TerminateAllSAs()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Cleared %d IPsec SA(s)\n", count)
+		return nil
+	case "wireguard":
+		return c.handleRequestSecurityWireguard(args[1:])
+	default:
 		return fmt.Errorf("unknown request security target: %s", args[0])
 	}
-	if len(args) < 3 || args[1] != "sa" || args[2] != "clear" {
-		fmt.Println("request security ipsec sa:")
-		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["security"].Children["ipsec"].Children["sa"].Children))
+}
+
+// handleRequestSecurityWireguard implements `request security wireguard
+// generate-private-key` (#1434 Increment 1): a stateless utility that
+// prints a fresh WireGuard key pair for the operator to paste into
+// config. Junos `request` semantics — it does NOT mutate config and
+// needs no dataplane (pure-Go X25519 keygen). Mirrors `wg genkey` /
+// `wg pubkey` output in WireGuard-canonical base64.
+func (c *CLI) handleRequestSecurityWireguard(args []string) error {
+	if len(args) == 0 || args[0] != "generate-private-key" {
+		fmt.Println("request security wireguard:")
+		writeCompletionHelp(os.Stdout, treeHelpCandidates(operationalTree["request"].Children["security"].Children["wireguard"].Children))
 		return nil
 	}
-	if c.ipsec == nil {
-		return fmt.Errorf("IPsec manager not available")
-	}
-	count, err := c.ipsec.TerminateAllSAs()
+	kp, err := wgkey.Generate()
 	if err != nil {
-		return err
+		return fmt.Errorf("generate WireGuard key: %w", err)
 	}
-	fmt.Printf("Cleared %d IPsec SA(s)\n", count)
+	fmt.Printf("Private key: %s\n", kp.PrivateKey)
+	fmt.Printf("Public key:  %s\n", kp.PublicKey)
 	return nil
 }

@@ -446,7 +446,8 @@ var OperationalTree = map[string]*Node{
 			}},
 			"vrrp": {Desc: "Show VRRP high availability status"},
 			"wireguard": {Desc: "Show WireGuard tunnel status", Children: map[string]*Node{
-				"detail": {Desc: "Show per-reason drop counters and handshake activity"},
+				"detail":     {Desc: "Show per-reason drop counters and handshake activity"},
+				"public-key": {Desc: "Show local public key per tunnel (give this to the peer)"},
 			}},
 			"match-policies": {Desc: "Match 5-tuple against policies"},
 		}},
@@ -875,6 +876,9 @@ var OperationalTree = map[string]*Node{
 				"sa": {Desc: "IPsec SA operations", Children: map[string]*Node{
 					"clear": {Desc: "Clear all IPsec SAs"},
 				}},
+			}},
+			"wireguard": {Desc: "WireGuard operations", Children: map[string]*Node{
+				"generate-private-key": {Desc: "Generate a fresh WireGuard private key and its public key"},
 			}},
 		}},
 		"system": {Desc: "Perform system-level operations", Children: map[string]*Node{

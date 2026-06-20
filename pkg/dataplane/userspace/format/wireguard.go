@@ -6,6 +6,7 @@ import (
 	"time"
 
 	userspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	"github.com/psaab/xpf/pkg/wgkey"
 )
 
 // FormatWireguardStatus renders the #1865 per-WG-tunnel telemetry rows
@@ -115,6 +116,43 @@ func FormatWireguardStatus(status userspace.ProcessStatus, detail bool, now time
 		fmt.Fprintf(&b, "  Keepalives:         %d received\n", t.DecapKeepalives)
 	}
 	return b.String()
+}
+
+// FormatWireguardPublicKeys renders `show security wireguard
+// public-key` (#1434 Increment 1): the LOCAL public key per configured
+// WG tunnel, in the WireGuard-canonical base64 an operator pastes into
+// the peer's `[Peer] PublicKey =`. The status wire carries the key as
+// hex (local_pubkey_hex); this converts it to base64 for display. A
+// tunnel whose helper has not yet surfaced a local key (older payload,
+// or an engine that has not derived one) renders "(unavailable)" rather
+// than being dropped.
+//
+// Shared by the local CLI (pkg/cli) and the gRPC text server
+// (pkg/grpcapi) so both surfaces render identically — the
+// FormatWireguardStatus pattern.
+func FormatWireguardPublicKeys(status userspace.ProcessStatus) string {
+	if len(status.WgTunnels) == 0 {
+		return "No WireGuard tunnels configured\n"
+	}
+	var b strings.Builder
+	for _, t := range status.WgTunnels {
+		fmt.Fprintf(&b, "Tunnel: %s (endpoint id %d)\n", t.Tunnel, t.TunnelEndpointID)
+		fmt.Fprintf(&b, "  Listen port:        %d\n", t.ListenPort)
+		fmt.Fprintf(&b, "  Local public key:   %s\n", renderWgPublicKey(t.LocalPubkeyHex))
+	}
+	return b.String()
+}
+
+// renderWgPublicKey converts a hex WG public key to WireGuard-canonical
+// base64 for operator display. An empty key (helper has not surfaced
+// one) or a malformed hex value renders "(unavailable)" — the row is
+// never dropped, so an operator always sees the tunnel exists.
+func renderWgPublicKey(hexKey string) string {
+	b64, err := wgkey.HexToBase64(hexKey)
+	if err != nil || b64 == "" {
+		return "(unavailable)"
+	}
+	return b64
 }
 
 type wgReasonRow struct {

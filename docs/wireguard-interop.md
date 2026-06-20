@@ -85,3 +85,48 @@ ip link set wgref up
 The peer VM attaches to the same SR-IOV LAN segment as the cluster host
 (`mlx1` / VLAN 3667 on the loss userspace cluster); S2 must verify a free VF
 exists before launching the peer, or reuse an existing real VM on that segment.
+
+## Operator CLI surface (key handling)
+
+These operational commands support bringing a tunnel up against a peer.
+They are read-only / stateless (`request` prints, it does not mutate
+config), so both work on a standalone box and through the remote `cli`.
+
+- **`show security wireguard public-key`** (#1434 Increment 1) — prints
+  the **local** static public key per configured WG tunnel, in
+  WireGuard-canonical base64 (the form a peer pastes into its
+  `[Peer] PublicKey =`). The key is derived once by the helper from the
+  local private key at engine construction and surfaced on the per-tunnel
+  status row (`local_pubkey_hex`, hex on the wire; the CLI re-renders it
+  as base64). A tunnel whose helper has not yet surfaced a key renders
+  `(unavailable)` rather than being dropped. Complements
+  `show security wireguard [detail]` (#1865 telemetry), which already
+  shows the **peer** public key and handshake/transfer counters.
+
+- **`request security wireguard generate-private-key`** (#1434
+  Increment 1) — generates a fresh Curve25519/X25519 private key and
+  prints it with its derived public key, both in WireGuard-canonical
+  base64 — equivalent to `wg genkey` + `wg pubkey`. The key is generated
+  locally in pure Go (`pkg/wgkey`, stdlib `crypto/ecdh`); it needs no
+  dataplane and issues no control-socket / gRPC round-trip. The printed
+  private key is clamped per the Curve25519 convention
+  (`priv[0]&=248; priv[31]&=127; priv[31]|=64`) so it is byte-identical
+  to what `wg genkey` emits. Paste the private key under the tunnel's
+  `tunnel wireguard local-private-key`; hand the public key to the peer.
+
+### Multi-tunnel status (#1434 scope note)
+
+The dataplane is already multi-engine: one `Arc<WgEngine>` and one
+control thread per configured WG tunnel-endpoint id (`wg_engines`,
+`spawn_wg_control_threads`), per-tunnel telemetry rows, and
+engine-by-id encap. **Increment 1** (this change) adds the local-key
+telemetry + the two CLI commands above; it is additive and does not
+touch the hot path or the AF_XDP shim. **Increment 2 — generalizing the
+shim's single-port WG-RX steering so a *second* WG tunnel on a different
+listen port has its inbound transport UDP steered to the kernel — is
+DEFERRED and lab-gated** (it is a verifier-gated `userspace-xdp` shim
+edit with a documented v6-line-rate sensitivity, and must pass the loss
+cluster + perf + `make test-failover` before merge). Until Increment 2
+lands, only the first configured WG listen port is steered, so a second
+tunnel on a different port will not receive inbound transport packets.
+Design of record: `docs/research/1434-multi-tunnel-wireguard/plan.md`.

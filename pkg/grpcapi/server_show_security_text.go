@@ -889,3 +889,25 @@ func (s *Server) showWireguard(buf *strings.Builder, detail bool) {
 	}
 	buf.WriteString(dpformat.FormatWireguardStatus(status, detail, time.Now()))
 }
+
+// showWireguardPublicKey renders `show security wireguard public-key`
+// for the remote CLI (#1434 Increment 1): the local public key per WG
+// tunnel in WireGuard-canonical base64. Shared rendering with the local
+// CLI via dpformat.FormatWireguardPublicKeys.
+func (s *Server) showWireguardPublicKey(buf *strings.Builder) {
+	if s.dp == nil {
+		buf.WriteString("Dataplane not loaded\n")
+		return
+	}
+	provider, ok := s.dp.(userspaceStatusProvider)
+	if !ok {
+		buf.WriteString("WireGuard telemetry requires the userspace dataplane\n")
+		return
+	}
+	status, err := provider.Status()
+	if err != nil {
+		fmt.Fprintf(buf, "WireGuard telemetry unavailable: %v\n", err)
+		return
+	}
+	buf.WriteString(dpformat.FormatWireguardPublicKeys(status))
+}

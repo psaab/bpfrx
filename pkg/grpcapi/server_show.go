@@ -424,6 +424,10 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 	case "wireguard-detail":
 		s.showWireguard(&buf, true)
 
+	case "wireguard-public-key":
+		// #1434 Increment 1: local public key per tunnel.
+		s.showWireguardPublicKey(&buf)
+
 	case "bfd-peers":
 		if err := s.showBFDPeers(&buf); err != nil {
 			return nil, err

@@ -15,6 +15,7 @@ func wgFmtFixture() userspace.ProcessStatus {
 			TunnelEndpointID:       3,
 			ListenPort:             51820,
 			PeerPubkeyHex:          strings.Repeat("ab", 32),
+			LocalPubkeyHex:         strings.Repeat("cd", 32),
 			PeerEndpoint:           "192.0.2.10:51820",
 			SessionConfirmed:       true,
 			LastHandshakeUnixSecs:  1_770_000_000,
@@ -93,6 +94,50 @@ func TestFormatWireguardStatusNeverAndEmpty(t *testing.T) {
 	}
 	if !strings.Contains(out, "(responder-only; learned at runtime)") {
 		t.Errorf("empty endpoint placeholder missing:\n%s", out)
+	}
+}
+
+// #1434 Increment 1: `show security wireguard public-key` renders the
+// LOCAL public key per tunnel in WireGuard-canonical base64. The wire
+// carries it as hex; the formatter must convert to base64 (the form a
+// peer pastes). The expected base64 is the canonical encoding of the
+// cd-ladder hex key — a tautology-proof fixed value.
+func TestFormatWireguardPublicKeys(t *testing.T) {
+	// base64.StdEncoding of bytes.fromhex("cd"*32).
+	const wantB64 = "zc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc0="
+	out := FormatWireguardPublicKeys(wgFmtFixture())
+	for _, want := range []string{
+		"Tunnel: wg0 (endpoint id 3)",
+		"Listen port:        51820",
+		"Local public key:   " + wantB64,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("public-key view missing %q in:\n%s", want, out)
+		}
+	}
+	// It must NOT render the hex form — base64 is the operator surface.
+	if strings.Contains(out, strings.Repeat("cd", 32)) {
+		t.Errorf("public-key view must render base64, not hex:\n%s", out)
+	}
+}
+
+// No tunnels → the same placeholder as the status view.
+func TestFormatWireguardPublicKeysEmpty(t *testing.T) {
+	out := FormatWireguardPublicKeys(userspace.ProcessStatus{})
+	if !strings.Contains(out, "No WireGuard tunnels configured") {
+		t.Errorf("empty public-key rendering = %q", out)
+	}
+}
+
+// A tunnel whose helper has not surfaced a local key (empty hex) renders
+// "(unavailable)" rather than an empty line or a panic.
+func TestFormatWireguardPublicKeysUnavailable(t *testing.T) {
+	status := userspace.ProcessStatus{
+		WgTunnels: []userspace.WgTunnelStatus{{Tunnel: "wg1", LocalPubkeyHex: ""}},
+	}
+	out := FormatWireguardPublicKeys(status)
+	if !strings.Contains(out, "Local public key:   (unavailable)") {
+		t.Errorf("missing-key tunnel must render (unavailable):\n%s", out)
 	}
 }
 
