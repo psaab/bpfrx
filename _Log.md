@@ -14,6 +14,25 @@
   disabled.
 - **File(s)**: pkg/api/metrics_counters.go, pkg/api/metrics_test.go,
   docs/feature-gaps.md
+- **Timestamp**: 2026-06-20
+- **Action**: H14 — thread `security flow power-mode-disable` into the
+  dataplane. Mirrored the GREAcceleration plumbing end to end: Go
+  `FlowSnapshot.PowerModeDisable` (protocol.go) populated in buildFlowSnapshot
+  (flow.go), Rust `FlowSnapshot.power_mode_disable` (snapshot.rs) and
+  `ForwardingState.power_mode_disable` (forwarding.rs) assigned in
+  forwarding_build/mod.rs. Regenerated protocol_wire_v1.json (two
+  `power_mode_disable: false` additions only). Added Go thread-through test +
+  Rust `build_forwarding_state_carries_power_mode_disable` mutation-verify
+  test. Flag is carried for config truth/parity (single forwarding path; no
+  express/regular split to switch).
+- **File(s)**: pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/flow.go,
+  pkg/dataplane/userspace/flow_wire_coerce_test.go,
+  userspace-dp/src/protocol/snapshot.rs,
+  userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding_build/mod.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json, docs/feature-gaps.md
 
 ## 2026-06-20 — #2049 enforce dynamic-address feed prefixes in the userspace dataplane
 

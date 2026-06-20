@@ -80,6 +80,7 @@ func buildFlowSnapshot(cfg *config.Config) FlowSnapshot {
 		UDPSessionTimeout:  coerceWireSessionTimeout("udp_session_timeout", cfg.Security.Flow.UDPSessionTimeout),
 		ICMPSessionTimeout: coerceWireSessionTimeout("icmp_session_timeout", cfg.Security.Flow.ICMPSessionTimeout),
 		GREAcceleration:    cfg.Security.Flow.GREPerformanceAcceleration,
+		PowerModeDisable:   cfg.Security.Flow.PowerModeDisable,
 		Lo0FilterInputV4:   cfg.System.Lo0FilterInputV4,
 		Lo0FilterInputV6:   cfg.System.Lo0FilterInputV6,
 	}

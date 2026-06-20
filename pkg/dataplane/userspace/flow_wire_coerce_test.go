@@ -188,3 +188,17 @@ func TestFlowExportSkipsInvalidPortContinuesToValid_1977(t *testing.T) {
 		t.Fatalf("expected 10.0.0.2:9995, got %s:%d", snap.CollectorAddress, snap.CollectorPort)
 	}
 }
+
+// TestBuildFlowSnapshotThreadsPowerModeDisable pins the #2008 H14 thread-through:
+// `security flow power-mode-disable` (cfg.Security.Flow.PowerModeDisable) must
+// reach FlowSnapshot.PowerModeDisable, mirroring the GREAcceleration plumbing.
+func TestBuildFlowSnapshotThreadsPowerModeDisable(t *testing.T) {
+	cfg := &config.Config{}
+	if snap := buildFlowSnapshot(cfg); snap.PowerModeDisable {
+		t.Fatal("PowerModeDisable should be false when unset")
+	}
+	cfg.Security.Flow.PowerModeDisable = true
+	if snap := buildFlowSnapshot(cfg); !snap.PowerModeDisable {
+		t.Fatal("PowerModeDisable should be threaded into FlowSnapshot")
+	}
+}

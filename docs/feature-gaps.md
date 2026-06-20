@@ -561,3 +561,11 @@ drift) closed in `fix/2008-quickwins-batch1`:
   is now gated on `cfg.Security.PolicyStatsEnabled`. Previously the flag
   compiled into typed state but counters were always collected; Junos only
   maintains per-policy stats when the knob is enabled (default off).
+- **H14 `security flow power-mode-disable`** — DONE (threaded). The parsed
+  `cfg.Security.Flow.PowerModeDisable` now reaches the dataplane via
+  `FlowSnapshot.PowerModeDisable` (`pkg/dataplane/userspace/protocol.go` +
+  `buildFlowSnapshot`) and the Rust `FlowSnapshot`/`ForwardingState`
+  (`power_mode_disable`, mirroring `gre_acceleration`). vSRX power-mode is an
+  express datapath; the userspace dataplane has a single forwarding path, so
+  the flag is carried for config truth/parity and does not currently switch
+  packet behavior (there is no express/regular split to select between).

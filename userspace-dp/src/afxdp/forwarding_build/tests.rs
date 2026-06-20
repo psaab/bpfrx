@@ -2459,3 +2459,24 @@ fn build_forwarding_state_carries_alg_disable_flags() {
         "ForwardingState.alg_disable_flags must equal snapshot.flow.alg_disable_flags"
     );
 }
+
+// #2008 H14: pin the snapshot -> runtime read of `power_mode_disable` in
+// forwarding_build/mod.rs (`state.power_mode_disable =
+// snapshot.flow.power_mode_disable`). MUTATION-VERIFY: dropping that
+// assignment (leaving the ForwardingState default of false) must fail this
+// test.
+#[test]
+fn build_forwarding_state_carries_power_mode_disable() {
+    let snapshot = ConfigSnapshot {
+        flow: crate::FlowSnapshot {
+            power_mode_disable: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    assert!(
+        state.power_mode_disable,
+        "ForwardingState.power_mode_disable must equal snapshot.flow.power_mode_disable"
+    );
+}

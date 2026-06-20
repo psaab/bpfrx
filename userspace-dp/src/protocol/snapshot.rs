@@ -155,6 +155,13 @@ pub(crate) struct FlowSnapshot {
     pub icmp_session_timeout: u64,
     #[serde(rename = "gre_acceleration", default)]
     pub gre_acceleration: bool,
+    /// `security flow power-mode-disable` (#2008 H14). On vSRX power-mode is
+    /// an express datapath; disabling it forces the regular flow path. The
+    /// userspace dataplane has a single forwarding path, so this is threaded
+    /// into ForwardingState for parity and config truth. Absent / false on
+    /// snapshots from old Go binaries (additive field).
+    #[serde(rename = "power_mode_disable", default)]
+    pub power_mode_disable: bool,
     #[serde(rename = "lo0_filter_input_v4", default)]
     pub lo0_filter_input_v4: String,
     #[serde(rename = "lo0_filter_input_v6", default)]
