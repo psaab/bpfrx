@@ -776,11 +776,18 @@ func (m *Manager) UpdatePolicyScheduleState(cfg *config.Config, activeState map[
 	next.FIBGeneration = m.readFIBGeneration()
 	next.GeneratedAt = time.Now().UTC()
 	next.Config = cfg
-	next.Policies = buildPolicySnapshotsWithSchedulerState(cfg, activeCopy)
+	// #2049: thread the cached dynamic-address feed overlay through the
+	// scheduler-only republish so a CoS scheduler-state change does not
+	// drop feed enforcement until the next full apply. m.mu is already
+	// held here, so read m.feedOverlay directly via cloneFeedOverlay
+	// rather than feedSnapshotOverlay() (which re-locks m.mu and would
+	// deadlock). Matches how the full snapshot build reads the overlay.
+	feedOverlay := cloneFeedOverlay(m.feedOverlay)
+	next.Policies = buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg, activeCopy, feedOverlay)
 	// #1606: refresh the address-book table alongside the policies
 	// so book IDs cited in the new policies always resolve on the
 	// dataplane side.
-	books, _ := buildAddressBookTable(cfg)
+	books, _ := buildAddressBookTableWithFeeds(cfg, feedOverlay)
 	next.AddressBooks = books
 
 	publishSnap := next
