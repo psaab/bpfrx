@@ -557,7 +557,7 @@ evidence, not as active eBPF source-removal blockers.
 Quick-win gaps from the `#2008` parity audit (stored-but-unenforced / schema
 drift) closed in `fix/2008-quickwins-batch1`:
 
-- **M4 `security policies policy-stats system-wide`** — DONE. Per-policy hit
+- **M4 `security policy-stats system-wide`** — DONE. Per-policy hit
   counter collection (`collectPolicyCounters` in `pkg/api/metrics_counters.go`)
   is now gated on `cfg.Security.PolicyStatsEnabled`. Previously the flag
   compiled into typed state but counters were always collected; Junos only

@@ -581,7 +581,7 @@ func TestCollectPolicyCountersExposesSparseAndGlobalPolicyIDs(t *testing.T) {
 }
 
 // TestCollectPolicyCountersGatedOnPolicyStats verifies the #2008 M4 gate: when
-// `security policies policy-stats system-wide enable` is absent (the Junos
+// `security policy-stats system-wide enable` is absent (the Junos
 // default), collectPolicyCounters must emit no per-policy hit counters even
 // though the dataplane has nonzero values, matching Junos which does not
 // maintain those counters unless the knob is on.

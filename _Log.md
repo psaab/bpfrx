@@ -4,7 +4,7 @@
 
 - **Timestamp**: 2026-06-20
 - **Action**: M4 — gate per-policy hit-counter collection on the
-  `security policies policy-stats system-wide enable` knob. The compiler
+  `security policy-stats system-wide enable` knob. The compiler
   already set `cfg.Security.PolicyStatsEnabled`, but
   `collectPolicyCounters` read the dataplane counters unconditionally. Added
   an early return when the flag is false (Junos default), closing the
