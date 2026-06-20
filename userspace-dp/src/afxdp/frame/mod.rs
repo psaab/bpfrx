@@ -69,7 +69,8 @@ pub(super) use inspect::{
 //     the clamp helpers, which are only used inside frame/mod.rs).
 #[allow(unused_imports)]
 pub(in crate::afxdp) use tcp::{
-    build_syn_cookie_ack_rst_frame, build_syn_cookie_syn_ack_frame, frame_has_tcp_rst,
+    build_reject_rst_frame, build_syn_cookie_ack_rst_frame, build_syn_cookie_syn_ack_frame,
+    frame_has_tcp_rst,
 };
 pub(super) use tcp::{extract_tcp_flags_and_window, extract_tcp_window, tcp_flags_str};
 // #1352: clamp_tcp_mss_frame is now imported directly by the per-family
