@@ -324,6 +324,29 @@ reserved for whole-dataplane selection where a rewrite shim
     fails at commit; `allow-duplicates` is an explicit presence-only flag.
   Pure schema hardening — no runtime behavior change. Regression coverage:
   `pkg/config/schema_validate_2008_test.go`.
+- **#2008 H7 (security log profile):** declared the `security log
+  profile <name>` stanza — `stream-name` (`ValueHintStreamName`
+  completion), `default-profile` (presence flag), and
+  `category session field-extra-name`. Before H7 the whole stanza parsed
+  but was silently dropped (no schema child, no compiler case), so a real
+  imported config such as `vsrx-ha.conf`'s `profile default-syslog {
+  stream-name syslog-container; default-profile; }` committed with no
+  validation and no effect. It now compiles to typed `LogConfig.Profiles`
+  (`LogProfile{Name, StreamName, DefaultProfile}`) and the compiler
+  cross-references `stream-name` against the configured streams
+  (`validateLogProfileStreamReferencesStrict`): a profile naming an
+  undefined stream is rejected at commit / commit-check (strict) and
+  downgraded to a warning on the tolerant load / peer-sync paths
+  (`lenientLogProfileStreamRef`, mirroring the IPsec proposal/gateway
+  cross-ref gates and the #1960 fail-closed-on-load doctrine). **No
+  runtime/dataplane change:** xpf per-stream routing is already a Junos
+  superset (every stream whose category/severity filter matches receives
+  the event), so a profile's `stream-name` designates the stream that
+  carries its events; the `default-profile` flag records the operator's
+  default designation and `category field-extra-name` is accepted for
+  parity but not yet used to alter the emitted structured-data field set.
+  Regression coverage: `pkg/config/log_profile_test.go` +
+  `pkg/config/log_profile_schema_test.go`.
 - **#1387 (DHCP dynamic-DNS, increment 1):** added an opt-in
   `dynamic-dns` subtree under BOTH `services dhcp-local-server` and
   `services dhcpv6-local-server` (a single shared `config.DHCPDynamicDNSConfig`
