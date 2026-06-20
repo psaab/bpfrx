@@ -362,12 +362,21 @@ Per the task: this is config compile/render; no cluster smoke needed.
   legitimate config relies on the dangling-ref→default fallback. R1's
   caveat (a PFS-policy with no explicit `proposals` leaf must not be blamed
   for a phantom proposal) is handled by the dual-message branch in §5.1.
-- **Q2 — RESOLVED: `aes256-sha256128-modp<bits>`.** Non-AEAD ESP requires
-  an integrity alg (both reviewers); the fallback seeds
-  `EncryptionAlg: aes256-cbc, AuthAlg: hmac-sha256-128` so the emitted
-  token is byte-identical to the codebase's normal proposal output and
-  introduces no new keyword spelling. The earlier `aes256-modpN`
-  (no-integrity) draft was wrong and is removed.
+- **Q2 — RESOLVED (corrected after CODE review): `aes256-sha256-modp<bits>`.**
+  Non-AEAD ESP requires an integrity alg (both plan reviewers). The first
+  implementation seeded `aes256-cbc / hmac-sha256-128` to match the
+  codebase's normal output token — but a hostile CODE reviewer caught that
+  buildESPProposal's normalization emits the NON-canonical `sha256128`,
+  which strongSwan's proposal keyword table does not recognize (only
+  `sha256`/`sha2_256` map to AUTH_HMAC_SHA2_256_128). Verified against the
+  upstream `proposal_keywords_static.txt`: a `sha256128` token is rejected
+  and the whole proposal discarded (tunnel down). FIX: build the fallback
+  string directly with the canonical `aes256-sha256-modp<bits>` spelling,
+  NOT via buildESPProposal. The earlier `aes256-modpN` (no-integrity) and
+  `aes256-sha256128-modpN` (bad keyword) drafts are both wrong and removed.
+  FOLLOW-UP: the package-wide `sha256128` spelling on buildESPProposal's
+  NORMAL path is a separate pre-existing concern (out of scope for #2073),
+  to be filed as its own issue.
 - **Q3 — RESOLVED: both lenient entry points.** Set the flag in
   `CompileConfigLenient` AND `CompileConfigForNodeLenient`; the node-aware
   one backs HA peer-sync (`Store.SyncApply`) and standby boot.
