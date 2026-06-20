@@ -1399,7 +1399,85 @@ func TestParseActiveLeasesExtraAndReorderedColumnsTolerated(t *testing.T) {
 	})
 }
 
-// ---- state store persistence ----
+// TestParseActiveLeasesRaggedRowUntrusted proves the Codex-r6 MAJOR: a data
+// row too SHORT to supply a required column makes the source unreliable, so
+// the parser errors (untrusted → Reconcile skips the destructive diff) rather
+// than silently mis-reading the row and dropping its lease. A torn/truncated
+// Kea memfile append leaves a ragged row; reading a required column past the
+// row's length returns "" (bounds-safe but NOT delete-safe), which would drop
+// the lease and delete its owned DNS record. Against the pre-fix code the
+// ragged row reads "" for the missing fields → lease dropped → record deleted.
+func TestParseActiveLeasesRaggedRowUntrusted(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+
+	t.Run("v4 row too short for a required column errors", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "l4.csv")
+		// Valid header; the data row is truncated before reaching hostname
+		// and state (a torn append). It contains address but not the later
+		// required columns.
+		writeCSV(t, path, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
+10.0.0.10,aa,,3600
+`)
+		if _, err := parseActiveLeases4(path, now); err == nil {
+			t.Fatal("a ragged v4 row (too short for required columns) must error (untrusted)")
+		}
+	})
+
+	t.Run("v4 row reaches address but not state/hostname errors", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "l4.csv")
+		// Required v4 columns include hostname (idx 6) and state (idx 7); a
+		// row of 7 fields (idx 0..6) reaches hostname but not state.
+		writeCSV(t, path, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
+10.0.0.10,aa,,3600,1900000000,1,host-a
+`)
+		if _, err := parseActiveLeases4(path, now); err == nil {
+			t.Fatal("a row missing the trailing required 'state' column must error")
+		}
+	})
+
+	t.Run("v6 ragged row errors", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "l6.csv")
+		writeCSV(t, path, `address,duid,valid_lifetime,expire,subnet_id,iaid,hostname,state
+2001:db8::5,00:01,3600
+`)
+		if _, err := parseActiveLeases6(path, now); err == nil {
+			t.Fatal("a ragged v6 row must error (untrusted)")
+		}
+	})
+
+	// End to end: a ragged row must NOT mass-delete owned records.
+	t.Run("ragged row does not mass-delete via Reconcile", func(t *testing.T) {
+		assertReconcilePreservesOwnedRow(t, 4,
+			"address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state",
+			"10.0.0.10,aa,,3600,1900000000,1,host-a,0",
+			"address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state", // valid header
+			"10.0.0.10,aa,,3600", // ragged data row
+			"mac:aa", "10.0.0.10")
+	})
+}
+
+// TestParseActiveLeasesExtraFieldRowTolerated proves the boundary is not
+// over-broad: a data row with MORE fields than the header (extra trailing
+// fields) is TOLERATED — only too-SHORT-for-a-required-column rows trigger
+// untrust. Lookups are by name/index, so trailing extras are ignored.
+func TestParseActiveLeasesExtraFieldRowTolerated(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "l4.csv")
+	// The data row has two extra trailing fields beyond the header width.
+	writeCSV(t, path, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
+10.0.0.10,aa,,3600,1900000000,1,host-a,0,extra1,extra2
+`)
+	leases, err := parseActiveLeases4(path, time.Unix(1_700_000_000, 0))
+	if err != nil {
+		t.Fatalf("a row with extra trailing fields should be tolerated, got error: %v", err)
+	}
+	if len(leases) != 1 || leases[0].Address != "10.0.0.10" || leases[0].HostName != "host-a" {
+		t.Fatalf("extra-field row parsed wrong: %+v", leases)
+	}
+}
 
 // ---- state store persistence ----
 

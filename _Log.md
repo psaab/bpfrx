@@ -1,5 +1,37 @@
 # Action Log
 
+## 2026-06-19 — #1387 DDNS PR #2043: per-row conformance check (Codex r6)
+
+- **Timestamp**: 2026-06-19
+- **Action**: Fix Codex round-6's one MAJOR — the row-level complement to
+  the now-complete header-schema validation. Row values are read via
+  leaseColumnValue, which returns "" when a data row is SHORTER than a
+  required column's index (FieldsPerRecord=-1 allows ragged rows). A
+  torn/truncated Kea memfile append leaves a row that does not reach a
+  required column → that column reads "" → the lease is mis-read (address=""
+  → row skipped; hostname="" → unnamed-skip) → it drops out of the desired
+  set → its owned DNS record is deleted. Bounds-safe but not delete-safe.
+  Fix: after the header validates, compute maxRequiredIdx = the max index
+  among the family's required columns; in the per-row loop, a row with
+  len(fields) <= maxRequiredIdx cannot supply a required column, so it makes
+  the SOURCE unreliable → return a parse error → Reconcile marks the family
+  untrusted → SKIPS the destructive diff. We do NOT silently skip just the
+  row (we cannot know which lease a torn row is, and skipping still drops
+  its record). A row with MORE fields than the header is tolerated (extra
+  trailing fields ignored by name-based lookup). Reasoned through remaining
+  structural shapes: extra/reordered columns (by-name, fine), comment/blank
+  lines (r.Comment + CSV skips them), garbage VALUES (per-row lenient data —
+  drops/mis-keys at most that one lease, not a structural class). Assessment:
+  the unreliable-source → destructive-delete class is now FULLY closed at
+  both header (required present, each once, no duplicates) AND row (every
+  data row long enough for every required column) level. Five new tests
+  (ragged v4 too-short, v4 missing trailing required col, v6 ragged,
+  end-to-end no-mass-delete via Reconcile — all FAIL pre-fix a107b90c3; plus
+  extra-trailing-field tolerated, passes pre+post proving not over-broad).
+  README updated.
+- **File(s)**: pkg/dhcpserver/ddns_leases.go,
+  pkg/dhcpserver/ddns_test.go, pkg/dhcpserver/README.md, _Log.md
+
 ## 2026-06-19 — #1925 review r2: declare growpart dep + mktemp guard
 
 - **Timestamp**: 2026-06-19

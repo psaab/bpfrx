@@ -108,9 +108,23 @@ What increment 1 ships (the fully unit-testable, lab-free slice):
   A present-but-mangled header errors WITH OR WITHOUT data rows (so a
   header-only mangled file cannot short-circuit to trusted-empty), and a
   0-record EXISTING file (no header at all — anomalous, mid-write/corrupt)
-  fails SAFE as an error rather than trusted-empty. The fail direction
+  fails SAFE as an error rather than trusted-empty. Per-ROW conformance
+  (Codex r6) complements the header-schema check: a DATA ROW too short to
+  supply every required column (a torn/truncated memfile append — the CSV
+  reader allows ragged rows) would otherwise read a required column as ""
+  (bounds-safe via `leaseColumnValue`'s `idx < len(fields)`, but NOT
+  delete-safe — the lease silently drops and its owned record is deleted).
+  So a row with `len(fields) <= maxRequiredIdx` (the max index among the
+  family's required columns) is a hard parse error → the whole family's
+  source is untrusted → the destructive diff is skipped; we do NOT silently
+  skip just the row (we cannot know which lease it is, and skipping still
+  drops its record). A row with MORE fields than the header is tolerated
+  (extra trailing fields ignored by name-based lookup). The fail direction
   (over-mark-untrusted for an exotic/unreadable file → no publish/clean,
-  operator-visible) is SAFE; silent mass-delete/record-loss is not.
+  operator-visible) is SAFE; silent mass-delete/record-loss is not. The
+  destructive-delete class is now closed at BOTH the header level (required
+  columns present, each once, no duplicates) and the row level (every data
+  row long enough to supply every required column).
 - **Hostname normalization** — `deriveFQDN` / `finalizeFQDN`
   (`ddns_hostname.go`) ALWAYS contains the published name in the configured
   zone: the client picks the host part, the firewall picks the domain. A

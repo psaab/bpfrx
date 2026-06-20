@@ -191,6 +191,27 @@ func parseActiveLeases(path string, family int, now time.Time) ([]ddnsLease, err
 			path, missing, familyLabel(family))
 	}
 
+	// Per-row conformance bound (Codex r6): the header validation above
+	// guarantees the SCHEMA is sound, but a DATA ROW can still be too short
+	// to actually supply a required column (FieldsPerRecord=-1 allows ragged
+	// rows; a torn/truncated Kea append leaves a row that does not reach a
+	// required column's index). leaseColumnValue returns "" for an
+	// out-of-range index, so a ragged row would silently mis-read a required
+	// column (e.g. address="" → row dropped; hostname="" → unnamed-skip),
+	// dropping that lease from the desired set → its owned DNS record is
+	// deleted. We cannot tell WHICH lease a torn row is, so we must NOT just
+	// skip the row — that still drops its record. Instead, a row too short to
+	// supply every required column makes the SOURCE unreliable for this
+	// family: error → Reconcile marks the family untrusted → SKIPS the
+	// destructive diff. Compute the max index among the required columns; a
+	// row with len(fields) <= maxRequiredIdx cannot reliably be read.
+	maxRequiredIdx := -1
+	for _, req := range requiredLeaseColumns[family] {
+		if idx := cols[req]; idx > maxRequiredIdx {
+			maxRequiredIdx = idx
+		}
+	}
+
 	// Header is present AND valid. A file with only a header (zero data rows)
 	// is now a LEGITIMATE trusted zero-lease result — return early before the
 	// per-row loop so a genuinely-empty Kea correctly clears owned records.
@@ -218,7 +239,19 @@ func parseActiveLeases(path string, family int, now time.Time) ([]ddnsLease, err
 			order = append(order, addr)
 		}
 	}
-	for _, fields := range records[1:] {
+	for rowNum, fields := range records[1:] {
+		// Row-conformance (Codex r6): a row too short to supply every
+		// required column cannot be read reliably. Treat the whole family's
+		// source as unreliable (torn/truncated memfile) rather than silently
+		// mis-reading the row, which would drop a lease and delete its owned
+		// record. A row with MORE fields than the header is fine (extra
+		// trailing fields are ignored by name-based lookup). rowNum is
+		// 0-based over the data rows (records[1:]); +2 gives the 1-based file
+		// line number including the header.
+		if len(fields) <= maxRequiredIdx {
+			return nil, fmt.Errorf("parse %s: Kea %s lease row %d has %d field(s), too short for required columns (need > %d; ragged/truncated source)",
+				path, familyLabel(family), rowNum+2, len(fields), maxRequiredIdx)
+		}
 		addr := get(fields, "address")
 		if addr == "" {
 			continue
