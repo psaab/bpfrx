@@ -496,10 +496,16 @@ func collectProtocolList(protoNode *Node) []string {
 // parseRouteFilterLen parses a Junos route-filter length token of the
 // form "/24" (the leading slash is how Junos writes "upto /24") or a
 // bare "24". It returns (n, true) only for a well-formed length in the
-// IPv4/IPv6 range; a malformed token yields (0, false) so the caller
-// leaves UptoLen at 0 and the renderer degrades safely (#2072). Upper
-// bound is 128 (IPv6 max); the renderer separately clamps against the
-// per-family max and the prefix length.
+// valid range 1..128; a malformed or out-of-range token yields
+// (0, false) so the caller leaves UptoLen at 0 and the renderer
+// degrades safely (#2072). Upper bound is 128 (IPv6 max); the renderer
+// separately clamps against the per-family max and the prefix length.
+//
+// Zero is REJECTED on purpose (Codex #2102 MAJOR): "upto /0" is not a
+// meaningful length, and UptoLen is a plain int with no presence bit, so
+// accepting 0 would make an explicit "upto /0" indistinguishable from an
+// unset UptoLen. Keeping 0 strictly as "unset" lets the renderer treat
+// UptoLen==0 unambiguously as the degrade case.
 func parseRouteFilterLen(tok string) (int, bool) {
 	tok = strings.TrimPrefix(tok, "/")
 	// Require digits only — strconv.Atoi would also accept signed forms
@@ -515,7 +521,7 @@ func parseRouteFilterLen(tok string) (int, bool) {
 		}
 	}
 	n, err := strconv.Atoi(tok)
-	if err != nil || n < 0 || n > 128 {
+	if err != nil || n < 1 || n > 128 {
 		return 0, false
 	}
 	return n, true
