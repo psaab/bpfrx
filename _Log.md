@@ -1,5 +1,34 @@
 # Action Log
 
+## 2026-06-20 — #1993 FRR clear MAJOR fix: require LIVE forwarding, not just pins
+
+- **Timestamp**: 2026-06-20
+- **Action**: Fixed the PR #2041 MAJOR review finding. The pin-only restart
+  guard preserved FRR whenever `xdp_*` pins existed, but pins only prove a
+  link is ATTACHED, not that forwarding is LIVE — a graceful hitless shutdown
+  preserves the pins while `Close()` stops forwarding, so the pin-only guard
+  recreated the blackhole on a graceful restart. Added a control-socket armed
+  probe as the authoritative restart-preserve signal: a lightweight one-shot
+  `status` query against any PRE-EXISTING helper, preserving FRR only when it
+  reports `Enabled && ForwardingArmed`. New `pkg/dataplane/userspace`
+  `ProbeForwardingArmed` + `DefaultControlSocketPath` (reuse
+  `deriveUserspaceConfig` for the path). Reworked
+  `clearFRRForFailClosedBoot` into a two-stage decision behind the pure,
+  testable `failClosedBootShouldClearFRR`: pins absent → CLEAR (cheap
+  pre-filter, skip the probe); pins present (or pin-probe error) → consult
+  the armed probe; preserve only when armed, else CLEAR (fail toward
+  fail-over on socket-missing / refused / timeout / not-armed / error).
+  Added `failClosedBootForwardingArmed` package-var seam. Tests:
+  pins-present-but-NOT-armed → CLEAR (the exact gap; proven to FAIL against
+  pin-only code), pins-present+armed → PRESERVE, armed-probe-unreachable →
+  CLEAR, pin-error-falls-through-to-armed, plus 8 probe unit tests
+  (armed/enabled-only/armed-only/!ok/missing/empty + default-path
+  resolution). Updated `pkg/daemon/README.md`.
+- **File(s)**: pkg/daemon/bootstrap.go,
+  pkg/daemon/frr_failclosed_boot_test.go,
+  pkg/dataplane/userspace/boot_probe.go,
+  pkg/dataplane/userspace/boot_probe_test.go, pkg/daemon/README.md, _Log.md
+
 ## 2026-06-20 — #2034 RA link-local review follow-up (regression test)
 
 - **Timestamp**: 2026-06-20
@@ -69,6 +98,40 @@
   test/incus/mouse_latency_orchestrate_test.py,
   test/incus/test_mouse_latency_shell_test.py,
   test/incus/test-mouse-latency.sh, docs/fairness-regimes.md, _Log.md
+
+## 2026-06-20 — #1993 review follow-up on FRR clear guard
+
+- **Timestamp**: 2026-06-20
+- **Action**: Addressed review feedback on the compile-failed boot FRR clear.
+  The original `configCompileFailed` gate also fired on daemon restarts,
+  which could drop FRR peerings even when hitless-restart pinned XDP links
+  showed the last-known-good dataplane was still live. Added a pinned-link
+  probe (`/sys/fs/bpf/xpf/links`, `xdp_*`) so the managed-section clear now
+  runs only when the boot is compile-failed AND unarmed. Also hedged the
+  degraded/write-failure warning text and added restart/probe-error
+  regression tests. Updated `pkg/daemon/README.md`.
+- **File(s)**: pkg/daemon/bootstrap.go, pkg/daemon/daemon_run.go,
+  pkg/daemon/frr_failclosed_boot_test.go, pkg/daemon/README.md, _Log.md
+
+## 2026-06-19 — #1993 clear FRR managed section on compile-failed cold boot
+
+- **Timestamp**: 2026-06-19
+- **Action**: On a compile-failure cold-boot bootstrap (the #1960
+  fail-closed tuple), the last-good `frr.conf` managed section is still on
+  disk and FRR (an independent service) re-advertises last-good prefixes
+  for routes this unarmed node cannot forward — a transit blackhole.
+  Added `clearFRRForFailClosedBoot(compileFailed)` (reuses the
+  `enterBootstrapMode()` `d.frr.Clear()` primitive, managed-section only)
+  and wired it into the boot path right after `d.frr = frr.New()`, gated
+  on `configCompileFailed`. Preserves freeze-in-last-known-good mgmt (no
+  networkd/.link removal, no link-cycle); does NOT change the
+  daemon-restart freeze. Added a cross-package `pkg/frr` test seam
+  (`NewForTest`, `RecordingExecutor`, `ManagedSectionMarkersForTest`) so
+  the daemon unit tests drive the real Clear() wiring against a temp
+  frr.conf without shelling out. Updated `pkg/daemon/README.md`.
+- **File(s)**: pkg/daemon/bootstrap.go, pkg/daemon/daemon_run.go,
+  pkg/daemon/frr_failclosed_boot_test.go, pkg/frr/testseam.go,
+  pkg/daemon/README.md, _Log.md
 
 ## 2026-06-19 — #2000 review follow-up on postinst test harness
 

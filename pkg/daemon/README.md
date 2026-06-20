@@ -116,19 +116,65 @@ never lock an operator out of a remote box it manages.
     `show | compare rollback N` reach prior good configs, and a
     `commit confirmed` of either promotes a working config. Repairing/removing
     the on-disk DB remains the out-of-band fallback.
-  - **Known limitation (#1993) — FRR keeps advertising on a cold boot.** `frr`
-    is an independent service that starts from its persisted `frr.conf` (the
-    managed section from the last good `applyConfig`), which freeze-in-last-
-    known-good leaves intact. On a *cold reboot* with a compile-failed config
-    the dataplane is unarmed (no transit) yet FRR still forms peerings and
-    advertises the last-good prefixes, so peers route transit to this node's
-    physical IPs and it blackholes them rather than failing over to the HA
-    partner. This is a pre-existing cross-daemon gap (FRR is independent of the
-    xpfd boot class; the pre-#1960 claim-all path advertised the same way and
-    was otherwise worse), and the VIP/RETH data path already fails over because
-    #1960 suppresses this node's VRRP/cluster. Tracked in #1993; the likely fix
-    is to clear/suppress only the FRR managed section on compile-failure
-    bootstrap while leaving networkd/mgmt intact.
+  - **FRR managed section is cleared on a compile-failed boot unless forwarding
+    is genuinely live (#1993).** `frr` is an independent service that starts from
+    its persisted `frr.conf` (the managed section from the last good
+    `applyConfig`), which freeze-in-last-known-good leaves intact. On a
+    compile-failed boot where the dataplane is unarmed (no transit), FRR would
+    otherwise still form peerings and advertise the last-good prefixes — peers
+    route transit to this node's physical IPs and it blackholes them rather than
+    failing over to the HA partner. To close that cross-daemon gap, the
+    compile-failure boot path calls
+    `clearFRRForFailClosedBoot(configCompileFailed)` immediately after the FRR
+    manager is constructed (`d.frr = frr.New()`).
+    - **The preserve decision requires LIVE FORWARDING, not just pins.** Pins on
+      `/sys/fs/bpf/xpf/links` prove only that an XDP link is *attached*, not that
+      forwarding is *live*: a graceful hitless shutdown (`dp.Close()` →
+      helper `Close()` → `stopLocked` disables `ctrl.enabled`; the BPF `Close()`
+      deliberately leaves pinned maps/links for the next daemon to reuse) leaves
+      the pins in place while forwarding is STOPPED. A pin-only guard would read
+      "pins exist" and wrongly preserve FRR on a graceful restart, recreating the
+      blackhole. The decision is therefore two stages: (1) **pins are a cheap
+      pre-filter** — no `xdp_*` pins (e.g. a cold reboot cleared the bpffs tmpfs)
+      ⇒ no surviving dataplane ⇒ CLEAR, skipping the socket probe (a pin-probe
+      *error* does not preserve; it falls through to stage 2); (2) **the
+      authoritative signal** is a lightweight one-shot status query against any
+      PRE-EXISTING helper on its control socket
+      (`dpuserspace.ProbeForwardingArmed` → `ProcessStatus.Enabled &&
+      ForwardingArmed`, the same pair the runtime gates forwarding on). FRR is
+      preserved **only** when that probe says forwarding is live. Every other
+      outcome — socket missing / connect-refused / timeout / `Enabled=false` /
+      `ForwardingArmed=false` / probe error — **clears** (fail toward fail-over:
+      an unarmed/unknown helper is not forwarding). The control-socket path is
+      resolved the same way the runtime Manager resolves it
+      (`DefaultControlSocketPath` → `deriveUserspaceConfig`); a compile-failed
+      boot has a nil active config, so it uses the default path (matching a
+      surviving helper from a default-config deployment), and a custom-path
+      deployment falls back to the default → probe finds nothing → clears
+      (safe direction). Both the pin pre-filter
+      (`failClosedBootHasPinnedXDPLinks`) and the armed probe
+      (`failClosedBootForwardingArmed`) are package-var seams so the decision is
+      unit-tested without a real helper; the pure decision is
+      `failClosedBootShouldClearFRR`.
+    - When the decision is CLEAR, `d.frr.Clear()` strips ONLY the managed
+      section and reloads FRR. Dropping those peerings makes upstream/peers fail
+      over to the HA partner instead of blackholing transit. This is the SAME
+      primitive `enterBootstrapMode()` uses, but it deliberately runs *only* the
+      FRR-clear step — NOT the `.network`/`.link` removal or link-cycle — so
+      freeze-in-last-known-good MANAGEMENT reachability (the existing mgmt IP) is
+      preserved. Normal/fresh-install boots remain byte-identical, and it is
+      fully reversible: the first compilable `commit confirmed` (or a cluster
+      `SyncApply`) re-renders FRR via `applyFRRConfig` and re-installs the
+      managed section. A degraded reload (`ErrFRRReloadDegraded`) is logged, not
+      fatal — `Clear()` has already written the empty managed section to disk, so
+      a later FRR restart converges. The VIP/RETH data path already failed over
+      before this fix because #1960 suppresses this node's VRRP/cluster.
+    - **Residual (cross-daemon ordering):** FRR is an independent systemd
+      service and may advertise last-good prefixes from its OWN start before
+      xpfd reaches the clear. The clear collapses that window once the peerings
+      drop (peer hold-down then carries transit on the partner). A unit-ordering
+      change (`xpfd` clears FRR before FRR forms peerings) would shrink the
+      window further but is a separable follow-up, not required for the Go fix.
 - **Bootstrap mode** (`d.bootstrapMode` atomic): runs gRPC/REST/CLI normally
   but SUPPRESSES interface takeover ACTIONS — the full rename loop, host
   tunables, `enableForwarding`, dataplane arm (`dp.Start`), and boot-time

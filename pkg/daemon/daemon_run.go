@@ -420,6 +420,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}
 		}
 		d.frr = frr.New()
+		// #1993: on a compile-failure boot with NO preserved XDP attachments,
+		// the last-good frr.conf managed section is still on disk and FRR (an
+		// independent service) will form peerings + re-advertise prefixes for
+		// routes this unarmed node cannot forward — a transit blackhole. Clear
+		// ONLY the managed section, right after the manager exists and BEFORE
+		// the run loop settles, so peers fail over to the HA partner. The
+		// predicate PRESERVES the managed section on a hitless restart only when
+		// the helper control socket reports forwarding is genuinely live
+		// (enabled+armed); pinned XDP links are merely a cheap pre-filter, NOT
+		// proof of live forwarding (a graceful stop leaves the pins but disarms
+		// forwarding). Freeze-in-last-known-good for management (#1960) is
+		// preserved: no .network/.link removal, no link-cycle.
+		d.clearFRRForFailClosedBoot(configCompileFailed)
 		d.ipsec = ipsec.New()
 		d.ra = ra.New()
 		d.networkd = networkd.New()
