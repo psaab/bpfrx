@@ -635,8 +635,8 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 
 			if term.PrefixList != "" {
 				// Choose the address-family matcher from the referenced
-				// prefix-list's entries, mirroring the route-filter path
-				// above (lines ~619-633). FRR keeps `ip` and `ipv6`
+				// prefix-list's entries, mirroring the route-filter match
+				// branch above. FRR keeps `ip` and `ipv6`
 				// prefix-lists in independent namespaces; emitting the
 				// IPv4 `match ip address` for an IPv6 list makes the
 				// filter a silent no-op in an IPv6 routing-policy context
