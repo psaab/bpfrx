@@ -77,14 +77,15 @@ func policyFromConfig(c *config.DHCPDynamicDNSConfig) ddnsPolicy {
 type DDNSStats struct {
 	Enabled        bool
 	Backend        string
-	UpsertOK       uint64
-	UpsertFail     uint64
-	DeleteOK       uint64
-	DeleteFail     uint64
-	SkippedNoName  uint64
-	OwnedRecords   int
-	LastReconcile  time.Time
-	LastReconcileN int // active leases seen on the last reconcile
+	UpsertOK         uint64
+	UpsertFail       uint64
+	DeleteOK         uint64
+	DeleteFail       uint64
+	SkippedNoName    uint64
+	SkippedNoBackend uint64 // records skipped because no live backend is wired
+	OwnedRecords     int
+	LastReconcile    time.Time
+	LastReconcileN   int // active leases seen on the last reconcile
 }
 
 // DDNSManager owns the DDNS reconcile loop and the ownership store. It is
@@ -110,11 +111,12 @@ type DDNSManager struct {
 	now func() time.Time
 
 	// counters
-	upsertOK      atomic.Uint64
-	upsertFail    atomic.Uint64
-	deleteOK      atomic.Uint64
-	deleteFail    atomic.Uint64
-	skippedNoName atomic.Uint64
+	upsertOK         atomic.Uint64
+	upsertFail       atomic.Uint64
+	deleteOK         atomic.Uint64
+	deleteFail       atomic.Uint64
+	skippedNoName    atomic.Uint64
+	skippedNoBackend atomic.Uint64 // upsert/delete skipped: no live backend wired
 
 	lastReconcile  atomic.Int64 // unix nanos
 	lastReconcileN atomic.Int64
@@ -131,6 +133,14 @@ func NewDDNSManager(updater DNSUpdater, nodeID string) *DDNSManager {
 	if err != nil {
 		slog.Warn("ddns: ownership state load failed; starting empty", "err", err)
 	}
+	if updater == nil {
+		// Increment 1 defers the live backend: a nil updater becomes a
+		// logged no-op rather than a nil-pointer panic on first publish or
+		// withdraw. The reconciler stays nil-safe end to end.
+		slog.Info("ddns: no DNS-update backend wired; running in no-op mode " +
+			"(record reconcile logged-and-skipped until a backend exists)")
+		updater = nopUpdater{}
+	}
 	return &DDNSManager{
 		state:      st,
 		updater:    updater,
@@ -146,6 +156,9 @@ func NewDDNSManager(updater DNSUpdater, nodeID string) *DDNSManager {
 // test_seams.go.
 func newDDNSManagerForTesting(updater DNSUpdater, statePath, leasePath4, leasePath6, nodeID string, now func() time.Time) *DDNSManager {
 	st, _ := loadDDNSState(statePath)
+	if updater == nil {
+		updater = nopUpdater{}
+	}
 	return &DDNSManager{
 		state:      st,
 		updater:    updater,
@@ -334,11 +347,21 @@ func (m *DDNSManager) withdrawAllLocked(ctx context.Context) error {
 	return firstErr
 }
 
-// upsertLocked publishes a record and records ownership on success.
+// upsertLocked publishes a record and records ownership on success. With no
+// live backend (nopUpdater), the upsert is a logged no-op AND ownership is
+// deliberately NOT recorded: recording ownership for a record that never
+// reached a real backend would (a) leave the store claiming records that do
+// not exist in DNS and (b) cause a later real backend to skip them as
+// "already owned". So the no-op path counts the skip and returns success
+// (reconcile must not wedge) without mutating the ownership store.
 func (m *DDNSManager) upsertLocked(ctx context.Context, rec LeaseDNSRecord, ow ownedRecord) error {
 	if err := m.updater.UpsertLease(ctx, rec); err != nil {
 		m.upsertFail.Add(1)
 		return err
+	}
+	if isNopUpdater(m.updater) {
+		m.skippedNoBackend.Add(1)
+		return nil
 	}
 	m.upsertOK.Add(1)
 	m.state.put(ow)
@@ -368,6 +391,15 @@ func (m *DDNSManager) deleteOwnedLocked(ctx context.Context, owned ownedRecord) 
 		m.deleteFail.Add(1)
 		return err
 	}
+	if isNopUpdater(m.updater) {
+		// No live backend: the delete was a logged no-op. Still drop the
+		// ownership entry so a disabled/withdrawn record does not linger in
+		// the store forever — the store tracks what xpf intends to own, and
+		// without a backend there is nothing in DNS to leak.
+		m.skippedNoBackend.Add(1)
+		m.state.delete(owned.Identity, owned.Address)
+		return nil
+	}
 	m.deleteOK.Add(1)
 	m.state.delete(owned.Identity, owned.Address)
 	return nil
@@ -391,13 +423,14 @@ func (m *DDNSManager) Stats() DDNSStats {
 	m.mu.Unlock()
 
 	st := DDNSStats{
-		UpsertOK:       m.upsertOK.Load(),
-		UpsertFail:     m.upsertFail.Load(),
-		DeleteOK:       m.deleteOK.Load(),
-		DeleteFail:     m.deleteFail.Load(),
-		SkippedNoName:  m.skippedNoName.Load(),
-		OwnedRecords:   n,
-		LastReconcileN: int(m.lastReconcileN.Load()),
+		UpsertOK:         m.upsertOK.Load(),
+		UpsertFail:       m.upsertFail.Load(),
+		DeleteOK:         m.deleteOK.Load(),
+		DeleteFail:       m.deleteFail.Load(),
+		SkippedNoName:    m.skippedNoName.Load(),
+		SkippedNoBackend: m.skippedNoBackend.Load(),
+		OwnedRecords:     n,
+		LastReconcileN:   int(m.lastReconcileN.Load()),
 	}
 	if ns := m.lastReconcile.Load(); ns > 0 {
 		st.LastReconcile = time.Unix(0, ns)

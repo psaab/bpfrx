@@ -505,6 +505,66 @@ func TestWithdrawOnDisable(t *testing.T) {
 	}
 }
 
+// TestNilUpdaterIsNopNotPanic proves the #1387 MAJOR-2 boundary: increment 1
+// defers the live backend, so a manager built with a nil DNSUpdater must run
+// as a logged no-op, NOT panic on the first publish or on a withdraw. Against
+// the pre-fix code (m.updater.UpsertLease called unguarded on a nil
+// interface) the enabled reconcile panics with a nil-pointer dereference, so
+// this test is non-tautological.
+func TestNilUpdaterIsNopNotPanic(t *testing.T) {
+	// Construction with nil must not panic and must substitute a no-op
+	// backend (the production constructor path).
+	prod := NewDDNSManager(nil, "node0")
+	if prod.updater == nil {
+		t.Fatal("NewDDNSManager(nil, ...) left a nil updater")
+	}
+	if !isNopUpdater(prod.updater) {
+		t.Fatalf("NewDDNSManager(nil, ...) did not install a nopUpdater: %T", prod.updater)
+	}
+
+	// Enabled reconcile + withdraw on a manager with no live backend: both
+	// must complete without panicking. Use the testing constructor so the
+	// state/lease paths are temp dirs.
+	m := testDDNS(t, nil) // nil -> nopUpdater
+	if !isNopUpdater(m.updater) {
+		t.Fatalf("nil updater not converted to nopUpdater: %T", m.updater)
+	}
+	pol := enabledPolicy()
+
+	// Publish path: an active lease must be processed (logged-skipped), with
+	// NO ownership recorded for a record that never reached a real backend.
+	if err := runReconcile(t, m, pol, []ddnsLease{leaseV4("10.0.0.10", "mac:aa", "host-a")}); err != nil {
+		t.Fatalf("reconcile with no backend errored: %v", err)
+	}
+	if n := len(m.state.records); n != 0 {
+		t.Fatalf("no-backend reconcile recorded %d phantom ownership entries", n)
+	}
+	if m.skippedNoBackend.Load() == 0 {
+		t.Fatal("no-backend upsert was not counted as skipped")
+	}
+	if m.upsertOK.Load() != 0 {
+		t.Fatalf("no-backend upsert counted as upsertOK = %d", m.upsertOK.Load())
+	}
+
+	// Withdraw path: disabling DDNS while owned state exists must also be a
+	// safe no-op. Seed a stale owned record (as if a prior backend wrote it),
+	// then run the disabled (withdraw-all) reconcile.
+	m.mu.Lock()
+	m.state.put(ownedRecord{
+		Family: 4, Identity: "mac:bb", Address: "10.0.0.20",
+		FQDN: "host-b.example.com", ForwardType: "A",
+		PTRName: "20.0.0.10.in-addr.arpa", TTL: 300,
+	})
+	err := m.withdrawAllLocked(context.Background())
+	m.mu.Unlock()
+	if err != nil {
+		t.Fatalf("withdraw with no backend errored: %v", err)
+	}
+	if _, ok := m.state.get("mac:bb", "10.0.0.20"); ok {
+		t.Fatal("withdraw did not drop the owned entry under no-backend mode")
+	}
+}
+
 // ---- state-aware lease parser ----
 
 func writeCSV(t *testing.T, path, content string) {

@@ -3,6 +3,7 @@ package dhcpserver
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/netip"
 	"strings"
 )
@@ -40,6 +41,39 @@ type LeaseDNSRecord struct {
 type DNSUpdater interface {
 	UpsertLease(ctx context.Context, rec LeaseDNSRecord) error
 	DeleteLease(ctx context.Context, rec LeaseDNSRecord) error
+}
+
+// nopUpdater is the no-op backend used when no live DNSUpdater is wired
+// (increment 1 defers the live rfc2136 backend; NewDDNSManager substitutes
+// this when nil is passed). Every call is a LOGGED no-op rather than a
+// crash: a missing backend must never turn lease processing into a panic.
+// Both methods return nil so the reconciler treats the (skipped) record as
+// processed — it does NOT record ownership for an upsert that never reached
+// a real backend (upsertLocked records ownership only on a nil-error return,
+// and a no-op upsert that recorded ownership would let a later real backend
+// believe it already published the record). To keep the never-publish/never-
+// orphan invariants intact, the nopUpdater reports success so reconcile does
+// not wedge, and the manager-level guard (see DDNSManager.upsertLocked) is
+// what keeps a no-op upsert from recording phantom ownership.
+type nopUpdater struct{}
+
+func (nopUpdater) UpsertLease(_ context.Context, rec LeaseDNSRecord) error {
+	slog.Debug("ddns: no DNS backend wired; skipping upsert (no-op)",
+		"fqdn", rec.FQDN, "addr", rec.Addr.String(), "type", rec.ForwardType)
+	return nil
+}
+
+func (nopUpdater) DeleteLease(_ context.Context, rec LeaseDNSRecord) error {
+	slog.Debug("ddns: no DNS backend wired; skipping delete (no-op)",
+		"fqdn", rec.FQDN, "addr", rec.Addr.String(), "type", rec.ForwardType)
+	return nil
+}
+
+// isNopUpdater reports whether the manager has no live backend wired, so the
+// reconciler can avoid recording phantom ownership for a no-op upsert.
+func isNopUpdater(u DNSUpdater) bool {
+	_, ok := u.(nopUpdater)
+	return ok
 }
 
 // buildLeaseRecord constructs the forward+reverse record for an address +
