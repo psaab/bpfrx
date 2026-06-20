@@ -145,9 +145,25 @@ func parseActiveLeases(path string, family int, now time.Time) ([]ddnsLease, err
 	// mangled header ("Address"/"ADDRESS") silently resolving to no column.
 	// Only the header KEYS and the get() lookup name are lower-cased; field
 	// VALUES (addresses, identities, hostnames) are data and stay verbatim.
+	//
+	// DUPLICATE-column rejection (Codex r5): a name appearing more than once
+	// in the header would silently OVERWRITE the earlier index with the LAST
+	// occurrence, so cols[name] could point at the wrong/empty column and
+	// leases would read empty/wrong → wrong desired set → the destructive
+	// pass deletes owned records. A healthy Kea memfile has all-unique column
+	// names, so we reject ANY duplicate column name in the header (not just
+	// duplicates of the columns we read): a header is trusted only if it maps
+	// UNAMBIGUOUSLY. Reject before any column lookup so an ambiguous header
+	// can never drive a destructive diff. Names compared case-insensitively
+	// (two "Address"/"address" columns collide).
 	cols := make(map[string]int)
 	for i, h := range records[0] {
-		cols[strings.ToLower(strings.TrimSpace(h))] = i
+		key := strings.ToLower(strings.TrimSpace(h))
+		if _, dup := cols[key]; dup {
+			return nil, fmt.Errorf("parse %s: duplicate column %q in Kea %s lease header (ambiguous)",
+				path, key, familyLabel(family))
+		}
+		cols[key] = i
 	}
 	get := func(fields []string, name string) string {
 		return leaseColumnValue(cols, fields, name)

@@ -233,6 +233,36 @@
   verified: a no-standalone mutant fails T7c+T2b; an always-standalone mutant
   fails T7d (double goodbye).
 - **File(s)**: pkg/ra/serialize_test.go, _Log.md
+## 2026-06-19 — #1387 DDNS PR #2043: reject duplicate header columns (Codex r5)
+
+- **Timestamp**: 2026-06-19
+- **Action**: Fix Codex round-5's one MAJOR (same mass-delete class,
+  duplicate-column trigger). Building `cols` with
+  `for i,h := range records[0] { cols[lower(h)] = i }` OVERWRITES an earlier
+  index with a later duplicate name, and the required-column validation only
+  checked that the key EXISTS, not that it is unambiguous. A header with a
+  duplicated column (e.g. two "address" or two "state", or a corruption that
+  repeats a column) made cols[name] point at the LAST occurrence — possibly
+  the wrong/empty column → leases read empty/wrong → wrong desired set → the
+  destructive delete pass removed owned records. Fix (close the class, not
+  the trigger): while building cols, DETECT duplicates case-insensitively
+  and return a parse ERROR for ANY duplicate column name (not just required
+  ones) — a healthy Kea memfile has all-unique columns, so a header is
+  trusted only if it maps UNAMBIGUOUSLY; an ambiguous header → untrusted →
+  Reconcile SKIPS the destructive diff. Reasoned through the remaining
+  header shapes: extra/unknown columns (ignored by name) and reordered
+  columns (resolved by name) are tolerated; ragged rows are bounds-checked
+  in leaseColumnValue (idx < len(fields)). Assessment: the
+  mass-delete-via-header class is now FULLY CLOSED (missing column r3,
+  header-only/zero-row r4, duplicate column r5; extra/reorder/ragged all
+  non-destructive). Eight new tests: duplicate required (address/state),
+  case-insensitive duplicate, duplicate optional, v6 duplicate identity,
+  end-to-end no-mass-delete via Reconcile (all FAIL pre-fix 7708d1b40), plus
+  extra-column-tolerated + reordered-tolerated (pass pre+post, proving the
+  rejection is not over-broad). README updated.
+- **File(s)**: pkg/dhcpserver/ddns_leases.go,
+  pkg/dhcpserver/ddns_test.go, pkg/dhcpserver/README.md, _Log.md
+
 ## 2026-06-19 — #1387 DDNS PR #2043: validate header before empty return (Codex r4)
 
 - **Timestamp**: 2026-06-19

@@ -1276,6 +1276,131 @@ func TestParseActiveLeasesEmptyFileIsUntrusted(t *testing.T) {
 	})
 }
 
+// TestParseActiveLeasesDuplicateColumnErrors proves the Codex-r5 MAJOR: a
+// header with a DUPLICATED column name is AMBIGUOUS — building cols would
+// overwrite the earlier index with the last occurrence, so cols[name] could
+// point at the wrong/empty column → leases read empty/wrong → wrong desired
+// set → the destructive pass deletes owned records. A healthy Kea header has
+// all-unique column names, so the parser rejects ANY duplicate column (not
+// just duplicate required columns) BEFORE any lookup. Against the pre-fix code
+// the duplicate silently overwrites and parsing proceeds (no error), so these
+// assertions fail.
+func TestParseActiveLeasesDuplicateColumnErrors(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+
+	t.Run("duplicate required column (two address) errors", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "l4.csv")
+		// Two "address" columns; the second (empty) would win under overwrite.
+		writeCSV(t, path, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state,address
+10.0.0.10,aa,,3600,1900000000,1,host-a,0,
+`)
+		if _, err := parseActiveLeases4(path, now); err == nil {
+			t.Fatal("duplicate 'address' column must error (ambiguous header)")
+		}
+	})
+
+	t.Run("duplicate required column (two state) errors", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "l4.csv")
+		writeCSV(t, path, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state,state
+10.0.0.10,aa,,3600,1900000000,1,host-a,0,2
+`)
+		if _, err := parseActiveLeases4(path, now); err == nil {
+			t.Fatal("duplicate 'state' column must error (ambiguous header)")
+		}
+	})
+
+	t.Run("duplicate case-insensitive (Address + address) errors", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "l4.csv")
+		writeCSV(t, path, `Address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state,ADDRESS
+10.0.0.10,aa,,3600,1900000000,1,host-a,0,
+`)
+		if _, err := parseActiveLeases4(path, now); err == nil {
+			t.Fatal("case-insensitive duplicate 'address' columns must error")
+		}
+	})
+
+	t.Run("duplicate optional column also errors (reject ANY duplicate)", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "l4.csv")
+		// subnet_id is OPTIONAL, but a duplicate makes the header ambiguous,
+		// so we reject ANY duplicate column name (not just required ones).
+		writeCSV(t, path, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state,subnet_id
+10.0.0.10,aa,,3600,1900000000,1,host-a,0,2
+`)
+		if _, err := parseActiveLeases4(path, now); err == nil {
+			t.Fatal("duplicate optional column must error (any duplicate => ambiguous)")
+		}
+	})
+
+	t.Run("v6 duplicate identity column errors", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "l6.csv")
+		writeCSV(t, path, `address,duid,valid_lifetime,expire,subnet_id,iaid,hostname,state,duid
+2001:db8::5,00:01,3600,1900000000,1,7,host-6,0,bad
+`)
+		if _, err := parseActiveLeases6(path, now); err == nil {
+			t.Fatal("v6 duplicate 'duid' column must error")
+		}
+	})
+
+	// End to end: a duplicated required column must NOT mass-delete owned
+	// records (the same destructive vector, duplicate-column trigger).
+	t.Run("duplicate column does not mass-delete via Reconcile", func(t *testing.T) {
+		assertReconcilePreservesOwnedRow(t, 4,
+			"address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state",
+			"10.0.0.10,aa,,3600,1900000000,1,host-a,0",
+			"address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state,address", // dup address
+			"10.0.0.10,aa,,3600,1900000000,1,host-a,0,",
+			"mac:aa", "10.0.0.10")
+	})
+}
+
+// TestParseActiveLeasesExtraAndReorderedColumnsTolerated proves the deliberate
+// boundary: extra/unknown columns and a reordered header are TOLERATED (parse
+// succeeds) because lookups are by name, not position. Only ambiguity
+// (duplicate) and missing required columns are errors. This documents that the
+// duplicate rejection does not over-broadly reject healthy-but-unusual headers.
+func TestParseActiveLeasesExtraAndReorderedColumnsTolerated(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+
+	t.Run("extra unknown column tolerated", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "l4.csv")
+		writeCSV(t, path, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state,user_context,pool_id
+10.0.0.10,aa,,3600,1900000000,1,host-a,0,{},5
+`)
+		leases, err := parseActiveLeases4(path, now)
+		if err != nil {
+			t.Fatalf("extra columns should be tolerated, got error: %v", err)
+		}
+		if len(leases) != 1 || leases[0].HostName != "host-a" {
+			t.Fatalf("extra-column lease parsed wrong: %+v", leases)
+		}
+	})
+
+	t.Run("reordered columns tolerated", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "l4.csv")
+		// Columns in a non-standard order; resolved by name.
+		writeCSV(t, path, `state,hostname,address,client_id,hwaddr,expire,subnet_id
+0,host-a,10.0.0.10,01cafe,aa,1900000000,1
+`)
+		leases, err := parseActiveLeases4(path, now)
+		if err != nil {
+			t.Fatalf("reordered columns should be tolerated, got error: %v", err)
+		}
+		if len(leases) != 1 || leases[0].Address != "10.0.0.10" ||
+			leases[0].HostName != "host-a" || leases[0].Identity != "cid:01cafe" {
+			t.Fatalf("reordered-column lease parsed wrong: %+v", leases)
+		}
+	})
+}
+
+// ---- state store persistence ----
+
 // ---- state store persistence ----
 
 func TestStateStorePersistsAndReloads(t *testing.T) {

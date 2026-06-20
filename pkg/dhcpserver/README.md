@@ -78,7 +78,14 @@ What increment 1 ships (the fully unit-testable, lab-free slice):
   stale records — the exact bug this feature fixes). Header columns are
   matched CASE-INSENSITIVELY (both the header keys AND the lookup name are
   lower-cased in `leaseColumnValue`; field values are data and stay
-  verbatim). The header is VALIDATED against a FAMILY-SPECIFIC
+  verbatim). A header maps to columns UNAMBIGUOUSLY: a DUPLICATE column name
+  (case-insensitive) is rejected with an error (Codex r5) — a healthy Kea
+  memfile has all-unique columns, and a duplicate would otherwise overwrite
+  the earlier index with the last occurrence, so a lookup could resolve to
+  the wrong/empty column → wrong desired set → destructive delete. We reject
+  ANY duplicate (not just duplicate required columns). Extra/unknown columns
+  and a reordered header are TOLERATED (lookups are by name, not position).
+  The header is VALIDATED against a FAMILY-SPECIFIC
   `requiredLeaseColumns` set: any column whose absence would silently change
   whether a lease is published (naming), how it is keyed for ownership
   (identity), or whether it is active (state) is REQUIRED, because a mangled
