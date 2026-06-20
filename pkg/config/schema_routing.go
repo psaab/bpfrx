@@ -84,7 +84,7 @@ var schemaPolicyOptions = &schemaNode{desc: "Policy options", children: map[stri
 				// commands down to only the last protocol.
 				"protocol":     {desc: "Protocol", args: 1, multi: true, placeholder: "<protocol>", children: nil},
 				"prefix-list":  {desc: "Prefix list", args: 1, placeholder: "<list-name>", children: nil},
-				"route-filter": {desc: "Route filter", args: 2, placeholder: "<prefix>", children: nil},
+				"route-filter": {desc: "Route filter", args: 2, placeholder: "<prefix>", keyValidator: ValidateRouteFilterArg, children: nil},
 				"community":    {desc: "Community", args: 1, placeholder: "<community>", children: nil},
 				"as-path":      {desc: "AS path", args: 1, placeholder: "<name>", children: nil},
 			}},
