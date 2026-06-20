@@ -329,6 +329,20 @@ func (m *Manager) handlePeerTimeout() {
 	if !m.peerAlive {
 		return // already marked lost while guard ran
 	}
+	// Re-check heartbeat STALENESS, not just peerAlive. m.mu is released
+	// across the guard call above, so the receiver read path can run
+	// handlePeerHeartbeat — setting peerAlive and advancing lastSeen — for
+	// ANY guard duration, not only a slow guard fn (a configured slow guard
+	// merely widens the window). peerAlive is essentially always true here
+	// (it was true on entry and a fresh heartbeat only keeps it true), so
+	// checking it cannot detect that a heartbeat landed during the window —
+	// re-reading lastSeen against the live clock can. If the heartbeat is
+	// fresh again, the peer is not lost: abort to avoid a spurious peer-loss
+	// and the unnecessary failover churn that follows (#2080).
+	if m.peerHeartbeatFreshLocked() {
+		slog.Debug("cluster: aborting peer heartbeat timeout, fresh heartbeat arrived during guard window")
+		return
+	}
 	if suppress, reason := m.suppressPeerTimeoutForTransferCommitLocked(time.Now()); suppress {
 		slog.Debug("cluster: suppressing peer heartbeat timeout", "reason", reason)
 		return

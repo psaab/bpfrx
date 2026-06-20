@@ -495,6 +495,25 @@ func heartbeatStale(lastSeenMono, nowMono int64, timeout time.Duration) bool {
 	return time.Duration(nowMono-lastSeenMono) > timeout
 }
 
+// peerHeartbeatFresh reports whether a peer heartbeat has been received and is
+// currently within the timeout window — i.e. NOT stale. It re-reads lastSeen
+// against the live monotonic clock, so a heartbeat that landed since the
+// timeout was first declared is observed. A receiver that has never seen a
+// heartbeat (lastSeen == 0) is not "fresh".
+//
+// This is the truth source for handlePeerTimeout's post-guard re-check: after a
+// slow guard window, the only correct question is "is the heartbeat fresh
+// again?", not "is peerAlive still set?" (peerAlive is essentially always true
+// at that point — a fresh heartbeat only keeps it true).
+func (r *heartbeatReceiver) peerHeartbeatFresh() bool {
+	lastNano := r.lastSeen.Load()
+	if lastNano == 0 {
+		return false
+	}
+	timeout := time.Duration(r.threshold) * r.interval
+	return !heartbeatStale(lastNano, MonotonicNanos(), timeout)
+}
+
 func (r *heartbeatReceiver) stop() {
 	close(r.stopCh)
 	r.conn.Close()

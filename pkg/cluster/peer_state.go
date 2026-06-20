@@ -7,6 +7,25 @@ func (m *Manager) PeerAlive() bool {
 	return m.peerAlive
 }
 
+// peerHeartbeatFreshLocked reports whether a peer heartbeat is currently within
+// the timeout window (NOT stale). It is the truth source for
+// handlePeerTimeout's post-guard re-check. Must be called with m.mu held (it
+// reads m.peerHeartbeatFreshFn and m.hbReceiver).
+//
+// The test seam (m.peerHeartbeatFreshFn) takes precedence so tests can inject a
+// fresh/stale heartbeat without a real socket. Otherwise it defers to the live
+// receiver. A nil receiver (no heartbeat path wired) reports "not fresh" so the
+// peer-lost transition proceeds exactly as before this re-check existed.
+func (m *Manager) peerHeartbeatFreshLocked() bool {
+	if m.peerHeartbeatFreshFn != nil {
+		return m.peerHeartbeatFreshFn()
+	}
+	if m.hbReceiver != nil {
+		return m.hbReceiver.peerHeartbeatFresh()
+	}
+	return false
+}
+
 // PeerNodeID returns the peer's node ID (valid only when PeerAlive is true).
 func (m *Manager) PeerNodeID() int {
 	m.mu.RLock()
