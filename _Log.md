@@ -1,5 +1,26 @@
 # Action Log
 
+## 2026-06-20 — #2034 RA link-local review follow-up (regression test)
+
+- **Timestamp**: 2026-06-20
+- **Action**: Extract the `AddrAdd` result decision in `ensureLinkLocal`
+  into the pure `classifyAddrAddResult` helper so the EEXIST-race
+  behavior is unit-testable off-lab, and add `TestClassifyAddrAddResult`
+  (proven non-tautological: a mutant treating EEXIST as a logged add
+  fails the test). The "added link-local" INFO log now fires only on a
+  genuine add; a racing EEXIST is a silent success; other errors still
+  return.
+- **File(s)**: pkg/ra/sender.go, pkg/ra/sender_linklocal_test.go, _Log.md
+
+## 2026-06-20 — #2034 RA link-local review follow-up
+
+- **Timestamp**: 2026-06-20
+- **Action**: Address Copilot review on `pkg/ra/sender.go` by making
+  the "added link-local" INFO log accurate under `AddrAdd` races: a
+  concurrent `EEXIST` now returns silently instead of claiming a new
+  address was added.
+- **File(s)**: pkg/ra/sender.go, _Log.md
+
 ## 2026-06-19 — #2000 review follow-up on postinst test harness
 
 - **Timestamp**: 2026-06-19
@@ -6075,3 +6096,6 @@ top.
 - **Timestamp**: 2026-06-19
 - **Action**: #1359 surplus-sharing mouse-latency telemetry (offline increment) — export the four per-queue park-reason counters that the Rust helper already carried on the CoS snapshot (RootTokenStarvationParks / QueueTokenStarvationParks / DrainParkRootTokens / DrainParkQueueTokens, protocol.go) but that were never surfaced to Prometheus. These are the existing dataplane evidence that attributes acceptance item 2 (root-surplus arbitration vs per-queue token starvation vs worker scheduling): a rising root_token_starvation_parks delta on a best-effort/mouse queue while a surplus-sharing borrower drains is the fingerprint of root-surplus arbitration (the borrower holds the shared root rate), distinct from the queue hitting its OWN cap (queue_token_*). Wired four new *prometheus.Desc (xpf_userspace_cos_{root,queue}_token_starvation_parks_total + xpf_userspace_cos_drain_park_{root,queue}_tokens_total, labels ifindex/queue_id, CounterValue) through the struct decl + Describe() in metrics.go, NewDesc construction in metrics_descriptors.go, and a new emitCoSParkReasonTelemetry per-queue emit in metrics_userspace.go invoked from Collect alongside the #1369 drain-phase emit. No behavior change — diagnostic, write-only counters from a single Status() snapshot per scrape; no hot-path/dataplane change, no HA/wire-type change (scalar u64, additive). Non-tautological unit test TestEmitCoSParkReasonTelemetry_DistinctValuesAndCounterType gives the four snapshot fields DISTINCT values (111/222/333/444) so a dropped emit drops its series and a swapped field/desc mismatches the expected value, asserts CounterValue typing and ifindex/queue_id labels; the existing pedantic-registry descriptor-coverage canary (TestCollectorDescriptorCoverage) additionally proves every new emitted Desc is declared in Describe(). Docs: pkg/api/README.md CoS-metrics bullet + a new "Reading the park-reason counters for surplus-sharing tail latency (#1359)" section in docs/cos-validation-notes.md (how to take a windowed delta on the mouse queue to confirm/refute root-surplus arbitration). Scope: offline telemetry+doc slice only; the B-class scheduler tuning + the gate verdict remain lab-gated (DEFER-NEEDS-LAB, blocked by #1365) per the research disposition. Validation: go build ./... clean; go test ./pkg/api/... PASS; go vet ./pkg/api/... clean.
 - **File(s)**: pkg/api/metrics.go, pkg/api/metrics_descriptors.go, pkg/api/metrics_userspace.go, pkg/api/metrics_test.go, pkg/api/README.md, docs/cos-validation-notes.md, _Log.md
+- **Timestamp**: 2026-06-20
+- **Action**: #2034 ra ensureLinkLocal — stop re-enabling addr_gen_mode / link-cycling RETH to create RA link-locals. Rewrote pkg/ra/sender.go ensureLinkLocal (Path A): when an interface has no IPv6 link-local for the NDP socket, synthesize the EUI-64 fe80::/64 from the interface MAC and add it directly via netlink.AddrAdd with IFA_F_NODAD (EEXIST-tolerant), mirroring the daemon's ensureRethLinkLocal/addStableLLToInterface. Removed all three destructive operations of the old fallback: the os.WriteFile to /proc/.../addr_gen_mode (undid the RETH setRethIPv6Knobs addr_gen_mode=1 suppression contract for the process lifetime), the ignored-error accept_dad write (replaced by the address-scoped IFA_F_NODAD), and the unguarded link DOWN/UP (which raced the AF_XDP NotifyLinkCycle rebind and un-reconciled VIPs/stable LLAs on a live HA NIC). MAC-less interfaces now return an explicit error (soft-logged at the start() call site; SourceLinkLocal config + 10x200ms ndp.Listen retry remain the recovery path). Extracted eui64LinkLocal as a pure helper for off-lab unit testing. Deleted the now-obsolete ra::ensureLinkLocal fsatomic canary allowlist entry so any re-added procfs write in this func is caught. A follow-up commit corrected the NODAD rationale comment (Codex #2039 r1: RethMAC folds node_id so each node's EUI-64 LLA is distinct; the genuinely-shared address is the daemon's stable fe80::bf:72:CC:RR LLA). Tests: pkg/ra/sender_linklocal_test.go — TestEUI64LinkLocal (byte-pattern + RETH-virtual-MAC vectors, link-local-unicast assertion), TestEUI64LinkLocalBadMAC (nil/short/8-byte -> nil), TestEnsureLinkLocalNoProcfsWrites (AST scan of ensureLinkLocal bans WriteFile/addr_gen_mode/accept_dad/LinkSetDown/LinkSetUp), TestClassifyAddrAddResult (EEXIST silent success via errors.Is). Both regression guards proven non-tautological: the AST test FAILS when a forbidden token is reintroduced; the fsatomic canary FAILS on a re-added os.WriteFile now that the allowlist entry is gone (restore -> both pass). go build ./... clean; go test ./pkg/ra/... ./pkg/fsatomic/... and full ./... green. Lab gate (make test-failover on the loss cluster) PASSED 14/0. Docs: pkg/ra/README.md gotcha updated to describe the NODAD AddrAdd mechanism and the no-addr_gen_mode/no-link-cycle contract.
+- **File(s)**: pkg/ra/sender.go, pkg/ra/sender_linklocal_test.go, pkg/ra/README.md, pkg/fsatomic/canary_test.go, _Log.md

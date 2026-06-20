@@ -1,12 +1,13 @@
 package ra
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"net"
 	"net/netip"
-	"os"
+	"syscall"
 	"time"
 
 	"github.com/mdlayher/ndp"
@@ -363,11 +364,33 @@ func (s *sender) randomAdvInterval() time.Duration {
 	return time.Duration(interval) * time.Second
 }
 
-// ensureLinkLocal checks whether the interface has a link-local IPv6 address.
-// RETH interfaces have addr_gen_mode=1 (stable-privacy) set to suppress
-// automatic link-local generation, but the RA sender needs one for its NDP
-// socket. If no link-local exists, this computes one via EUI-64 from the
-// interface MAC and adds it with IFA_F_NODAD.
+// eui64LinkLocal derives the EUI-64 IPv6 link-local address (fe80::/64) from a
+// 6-byte MAC. It returns nil if the MAC is not exactly 6 bytes. This mirrors
+// the daemon's ensureRethLinkLocal (pkg/daemon/daemon_reth.go) so the RA sender
+// and the apply path converge on one well-reviewed derivation. Kept as a pure
+// function so the byte math is unit-testable without a netlink socket.
+func eui64LinkLocal(mac net.HardwareAddr) net.IP {
+	if len(mac) != 6 {
+		return nil
+	}
+	return net.IP{0xfe, 0x80, 0, 0, 0, 0, 0, 0,
+		mac[0] ^ 0x02, mac[1], mac[2], 0xff, 0xfe, mac[3], mac[4], mac[5]}
+}
+
+// ensureLinkLocal makes sure the interface has an IPv6 link-local address for
+// the RA sender's NDP socket. RETH members run with addr_gen_mode=1
+// (stable-privacy) to suppress kernel EUI-64 auto-generation and the MLDv2
+// noise it creates (pkg/daemon setRethIPv6Knobs), so on those interfaces no
+// link-local may exist yet when the sender starts.
+//
+// If a link-local is already present (a daemon-managed stable or EUI-64 LLA, or
+// a kernel-generated one on a non-suppressed interface), this returns early. If
+// none exists, it adds the EUI-64 link-local directly via netlink with
+// IFA_F_NODAD — the same primitive the daemon uses in ensureRethLinkLocal /
+// addStableLLToInterface. It never mutates addr_gen_mode and never cycles the
+// link: addr_gen_mode=1 is a contract the apply path sets deliberately, and an
+// out-of-band link DOWN/UP from inside the RA manager would un-reconcile VIPs /
+// stable LLAs and race the AF_XDP dataplane rebind.
 func ensureLinkLocal(iface *net.Interface) error {
 	link, err := netlink.LinkByName(iface.Name)
 	if err != nil {
@@ -383,42 +406,50 @@ func ensureLinkLocal(iface *net.Interface) error {
 		}
 	}
 
-	// No link-local. Set addr_gen_mode=0 (EUI-64) so kernel generates one
-	// on next link toggle, then toggle the link.
-	addrGenPath := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/addr_gen_mode", iface.Name)
-	if err := os.WriteFile(addrGenPath, []byte("0"), 0644); err != nil {
-		return fmt.Errorf("set addr_gen_mode=0: %w", err)
+	// No link-local. Synthesize the EUI-64 fe80::/64 from the MAC and add it
+	// with NODAD — the same primitive the daemon uses for RETH link-locals
+	// (ensureRethLinkLocal / addStableLLToInterface). NODAD is set for
+	// consistency with that apply path and to suppress the DAD / MLDv2 solicit
+	// noise on addr_gen_mode=1 interfaces; it is not required to avoid a
+	// peer collision here, because the EUI-64 derivation folds in the RETH
+	// virtual MAC's node_id byte (RethMAC -> 02:bf:72:CC:RR:NN), so each node
+	// derives a distinct LLA. (The address that *is* shared across nodes is
+	// the daemon's stable fe80::bf:72:CC:RR LLA, which carries no node_id and
+	// is added NODAD for exactly that reason — a different address than this
+	// fallback.)
+	ll := eui64LinkLocal(iface.HardwareAddr)
+	if ll == nil {
+		return fmt.Errorf("ensure link-local: interface %s has no usable MAC", iface.Name)
 	}
-
-	// Disable DAD for the link-local — virtual MAC may conflict with peer.
-	dadPath := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/accept_dad", iface.Name)
-	os.WriteFile(dadPath, []byte("0"), 0644)
-
-	// Toggle link to trigger link-local generation.
-	netlink.LinkSetDown(link)
-	time.Sleep(50 * time.Millisecond)
-	if err := netlink.LinkSetUp(link); err != nil {
-		return fmt.Errorf("link up: %w", err)
+	addr := &netlink.Addr{
+		IPNet: &net.IPNet{IP: ll, Mask: net.CIDRMask(64, 128)},
+		Flags: unix.IFA_F_NODAD,
 	}
-
-	// Wait for kernel to assign the address (may take >500ms on some systems).
-	for i := 0; i < 20; i++ {
-		time.Sleep(100 * time.Millisecond)
-		addrs, _ = netlink.AddrList(link, netlink.FAMILY_V6)
-		for _, a := range addrs {
-			if a.IP.IsLinkLocalUnicast() {
-				// Mark it NODAD to avoid MLDv2 DAD probes.
-				if a.Flags&unix.IFA_F_NODAD == 0 {
-					netlink.AddrDel(link, &a)
-					a.Flags = unix.IFA_F_NODAD
-					netlink.AddrAdd(link, &a)
-				}
-				slog.Info("ra: added link-local for RA sender",
-					"interface", iface.Name, "addr", a.IP)
-				return nil
-			}
-		}
+	logAdded, err := classifyAddrAddResult(netlink.AddrAdd(link, addr))
+	if err != nil {
+		return fmt.Errorf("add link-local %s on %s: %w", ll, iface.Name, err)
 	}
+	if logAdded {
+		slog.Info("ra: added link-local for RA sender",
+			"interface", iface.Name, "addr", ll)
+	}
+	return nil
+}
 
-	return fmt.Errorf("link-local did not appear after addr_gen_mode=0 + link toggle")
+// classifyAddrAddResult interprets the result of netlink.AddrAdd for the RA
+// link-local fallback. ensureLinkLocal already lists existing IPv6 link-locals
+// before attempting the add, but another goroutine or process can still win the
+// race between the list and the add. A nil error is a genuine add (log it). An
+// EEXIST means the address is already present — a silent success: do NOT log
+// "added", since claiming a new address was created makes the RA startup trace
+// inaccurate during debugging. Any other error is a real failure.
+func classifyAddrAddResult(addErr error) (logAdded bool, err error) {
+	switch {
+	case addErr == nil:
+		return true, nil
+	case errors.Is(addErr, syscall.EEXIST):
+		return false, nil
+	default:
+		return false, addErr
+	}
 }
