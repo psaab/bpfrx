@@ -7308,3 +7308,17 @@ top.
 - **Timestamp**: 2026-06-20
 - **Action**: #2068 nested application-set members silently dropped (HIGH, audit-found, COMPANION-FREE). compileApplications' (pkg/config/compiler.go ~1875) member loop read ONLY children named "application", so a nested `application-set <child>` member was never appended to the parent set — even though the schema accepts the nested form (schema_security.go:457, children:nil) and ExpandApplicationSet (predefined.go ~184) already recurses into nested sets (max depth 3). Result: a security policy matching the parent under-matched — applications defined only in the child set produced NO app-match rule and traffic was never matched. Fix: added an `application-set` arm to the member switch (mirroring compileAddressBook's `address`/`address-set` dual handling); the referenced child-set name is appended to the parent's Applications slice (whose comment already documents it as "references to Application or ApplicationSet names"), and ExpandApplicationSet resolves it via the existing recursion. nodeVal handles both AST shapes so flat-set and hierarchical both populate it. No new commit-time check added: ExpandApplicationSet already errors on unknown members (at dataplane compile, consistent with predefined sets) and the existing depth-3 guard bounds cyclic/over-deep nests (proven by test). Tests (mutation-verified FAIL pre-fix): pkg/config TestNestedApplicationSet{FlatSet,Hierarchical,Deep,Cycle} (flat-set via ParseSetCommand+SetPath per CLAUDE.md, plus hierarchical, 3-level deep, and a cycle hitting the depth bound); pkg/dataplane/userspace TestNestedApplicationSetPolicyMatch drives flat-set config through config.CompileConfig (NOT a hand-built struct — that would bypass the buggy compiler and be tautological) then asserts buildPolicySnapshots emits an app-match term for app2's tcp/443 (reachable only via the nested child set). Pre-fix: parent.Applications==[app1], expand drops app2, the policy emits only the tcp/80 term. Validation: GOCACHE=/dev/shm/cache go build ./... clean; go vet ./pkg/config/ clean; go test ./pkg/config/ ./pkg/dataplane/... -count=1 all green. Doc: docs/services-application-identification.md application-set bullet now documents nested-member support + the #2068 fix.
 - **File(s)**: pkg/config/compiler.go, pkg/config/application_set_nested_test.go, pkg/dataplane/userspace/nested_app_set_policy_test.go, docs/services-application-identification.md, _Log.md
+
+## #2073 IPsec PFS silently dropped on dangling proposal ref (PR #2099)
+- **Timestamp**: 2026-06-20
+- **Action**: Two-layer fix — commit-time strict cross-ref validator
+  (validateIPsecPolicyProposalReferencesStrict, lenient on load/peer-sync)
+  + render-path PFS-preserving fallback (aes256-sha256-modp<bits>) in
+  resolveESPSettings. Quad-ish review: 2 hostile plan reviews (folded),
+  2 hostile code reviews (caught + fixed sha256128 BLOCKER), both
+  MERGE-READY. Copilot pending. ECP-group modp<bits> + normal-path
+  sha256128 noted as pre-existing follow-ups.
+- **File(s)**: pkg/config/compiler.go, pkg/ipsec/ike.go,
+  pkg/config/ipsec_proposal_ref_test.go, pkg/ipsec/ipsec_test.go,
+  pkg/config/parser_security_test.go, pkg/ipsec/README.md,
+  docs/pr/2073-ipsec-pfs/plan.md
