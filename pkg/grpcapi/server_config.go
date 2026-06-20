@@ -61,14 +61,26 @@ func (s *Server) Set(_ context.Context, req *pb.SetRequest) (*pb.SetResponse, er
 	// the junk path "set deactivate <path>" (a config node named after the
 	// verb) and the node is never marked inactive. The store wrappers strip
 	// the verb and route through applyEditLine (the centralized verb switch).
-	if rest, ok := strings.CutPrefix(input, "deactivate "); ok {
-		if err := s.store.DeactivateFromInput(rest); err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	// Match the verb as the first whitespace-delimited token (not just an
+	// exact "deactivate "/"activate " prefix) so a tab separator or extra
+	// spaces still route, and a bare verb with no path returns an error
+	// instead of falling through to SetFromInput and creating a junk
+	// "deactivate"/"activate" node.
+	if fields := strings.Fields(input); len(fields) > 0 &&
+		(fields[0] == "deactivate" || fields[0] == "activate") {
+		verb := fields[0]
+		rest := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(input), verb))
+		if rest == "" {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"%s requires a configuration path", verb)
 		}
-		return &pb.SetResponse{}, nil
-	}
-	if rest, ok := strings.CutPrefix(input, "activate "); ok {
-		if err := s.store.ActivateFromInput(rest); err != nil {
+		var err error
+		if verb == "deactivate" {
+			err = s.store.DeactivateFromInput(rest)
+		} else {
+			err = s.store.ActivateFromInput(rest)
+		}
+		if err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 		}
 		return &pb.SetResponse{}, nil

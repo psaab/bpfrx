@@ -112,3 +112,42 @@ func TestLoadRPCModeSetAppliesDeactivate(t *testing.T) {
 		t.Fatalf("Load mode=set dropped an active node:\n%s", out)
 	}
 }
+
+// #2059 (Copilot): the verb routing must match the first whitespace token, not
+// just an exact "deactivate "/"activate " prefix, so a bare verb errors instead
+// of falling through to SetFromInput (which would create a junk "deactivate"
+// node) and a tab-separated path still routes.
+func TestSetRPCDeactivateBareVerbErrorsNotMangled(t *testing.T) {
+	store := newGRPCConfigStore(t)
+	s := &Server{store: store}
+
+	// Bare verb, no path: must error, must NOT create a junk node.
+	if _, err := s.Set(context.Background(), &pb.SetRequest{Input: "deactivate"}); err == nil {
+		t.Fatal("Set(\"deactivate\") with no path must return an error")
+	}
+	out := store.ShowCandidateSet()
+	if strings.Contains(out, "set deactivate") || strings.Contains(out, "deactivate;") {
+		t.Fatalf("bare deactivate created a junk node:\n%s", out)
+	}
+	if !strings.Contains(out, "set system name-server 9.9.9.9") {
+		t.Fatalf("bare deactivate must not disturb existing config:\n%s", out)
+	}
+}
+
+func TestSetRPCDeactivateTabSeparatorRoutes(t *testing.T) {
+	store := newGRPCConfigStore(t)
+	s := &Server{store: store}
+
+	if _, err := s.Set(context.Background(), &pb.SetRequest{
+		Input: "deactivate\tsystem name-server 9.9.9.9",
+	}); err != nil {
+		t.Fatalf("Set(deactivate<tab>...) error = %v", err)
+	}
+	out := store.ShowCandidateSet()
+	if !strings.Contains(out, "deactivate system name-server 9.9.9.9") {
+		t.Fatalf("tab-separated deactivate did not mark the node inactive:\n%s", out)
+	}
+	if strings.Contains(out, "set deactivate") {
+		t.Fatalf("tab-separated deactivate mangled into a junk set path:\n%s", out)
+	}
+}
