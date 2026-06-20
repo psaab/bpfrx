@@ -1,8 +1,10 @@
 # #2071 — IPv6 prefix-list rendered with the IPv4 `match ip address` matcher
 
-**Status:** DRAFT v3 — scoped to mirror the route-filter precedent exactly
-after round-2 review (two-sequence machinery collided with co-resident
-route-filters; reverted to a single family-chosen matcher)
+**Status:** PLAN-READY v3 — round-3 both reviewers agree the single
+family-chosen matcher is correct (A: NEEDS-MINOR ×3 honesty/coverage
+items, all folded; B: PLAN-READY). Mirrors the route-filter precedent
+exactly; two-sequence machinery (v2) abandoned after it collided with
+co-resident route-filters.
 
 ## Issue framing
 
@@ -142,13 +144,21 @@ strictly local to the single match line that #2071 reports.
   undefined list regardless of the keyword, so the default is cosmetic for
   the miss case; v4 preserves byte-identity for existing configs.)
 - **mixed list** (a genuinely rare config — `from prefix-list` of a list
-  holding both families): picks `ipv6` (any v6 entry wins). This is the
-  SAME homogeneous-family limitation the route-filter path already has, no
-  better and no worse, and it strictly improves the reported failure
-  (a v6 list referenced in a v6 context now matches). A fully correct
-  mixed-list render cannot be expressed in one route-map index (FRR AND)
-  and is out of scope — see Out of scope; the route-filter path shares
-  this limitation and is the cited precedent.
+  holding both families): picks `ipv6` (any v6 entry wins). This is a
+  **behavior change** vs master, and it is a TRADE, not a strict
+  improvement: master renders `match ip address` for a mixed list, so
+  today the v4 entries match (in a v4 context) and the v6 entries are the
+  reported no-op; v3 renders `match ipv6 address`, so the v6 entries now
+  match (in a v6 context) but the v4 entries STOP matching. A single FRR
+  route-map index cannot serve both families (the round-1 AND finding), so
+  one direction must be chosen; v3 chooses the family the #2071 report is
+  about (v6). The same dual-stack route-map is attached under BOTH
+  `address-family ipv4 unicast` and `address-family ipv6 unicast` for BGP
+  (`policy_render.go` ~342/361), so a mixed list referenced by a dual-stack
+  export will, after v3, filter v6 routes and no longer filter v4 routes
+  via that term. This is the SAME homogeneous-family limitation the
+  adjacent route-filter path already has (it keys on `RouteFilters[0]`),
+  and a fully correct mixed-list render is out of scope (see Out of scope).
 
 ### Why "any v6 entry → ipv6" rather than "first entry's family"
 
@@ -191,7 +201,13 @@ touched. No config schema, AST, or compiler change.
   exact line directly (the two existing tests `internal`/`trusted-nets`
   assert only the `redistribute route-map` line, NOT the match line, so
   they do not by themselves guarantee byte-identity — round-2 reviewer A's
-  MAJOR-2; the new test closes that gap).
+  MAJOR-2; the new test closes that gap). NOTE the byte-identity claim is
+  scoped to v4-only / unknown / empty lists ONLY: a **v6-only list**
+  changes output unconditionally (master `match ip address` → v3
+  `match ipv6 address`) — that IS the fix — including the (benign) case of
+  a v6-only list referenced from a v4-only-attached route-map, where the
+  v6 matcher was already matching nothing useful under the v4 keyword
+  (round-3 MINOR-2).
 - **Single match line only:** exactly one `match ... address prefix-list`
   line per `from prefix-list`, in the term's single sequence. No term-body
   duplication, no second route-map sequence, no seq renumbering — so NO
@@ -212,7 +228,7 @@ touched. No config schema, AST, or compiler change.
 
 | Class | Level | Notes |
 |---|---|---|
-| Behavioral regression | LOW | v4-only and unknown/empty lists render byte-identically; only v6 lists change (from broken→correct); mixed lists pick ipv6, same homogeneous-family limitation the route-filter precedent already has |
+| Behavioral regression | LOW | v4-only and unknown/empty lists render byte-identically; v6 lists change broken→correct. ONE regression vector: a **mixed** list (v4+v6 entries) referenced by `from prefix-list` flips master's v4 matcher to ipv6, so v4 routes that matched via that term stop matching (the v6 routes start). Rare config; same homogeneous-family limitation the route-filter precedent already has; documented in Out of scope |
 | Lifetime / borrow-checker | N/A | Go, no borrow checker; no allocation beyond one stack string |
 | Performance regression | NONE | Control-plane render at commit time; one map lookup + early-exit slice scan per term |
 | Architectural mismatch (#961 / #946-P2) | NONE | Mirrors the adjacent route-filter family branch exactly; no new abstraction, no helper extraction |
@@ -244,8 +260,12 @@ cluster deploy, no iperf3. Coverage is a Go unit test in `pkg/frr`.
      renders the route-filter's `match ip address ...-<term>` clause AND
      the prefix-list's `match ipv6 address prefix-list <name>` clause in
      the term's single sequence, with the route-filter inline definition
-     emitted exactly once. (This documents the accepted homogeneous-family
-     limitation and confirms no term-body duplication — round-2 F1.)
+     emitted exactly once. The test asserts exactly ONE
+     `route-map <name> permit <seq>` header for the term (count == 1, e.g.
+     `strings.Count`) — guarding against any regression to the rejected v2
+     two-sequence design — and that the route-filter `ip prefix-list
+     <name>-<term> seq ...` definition line appears exactly once
+     (round-2 F1 / round-3 MINOR-3, confirming no term-body duplication).
    - **unknown prefix-list name** (not in `po.PrefixLists`) → falls back
      to `match ip address`, one sequence (no panic, no regression).
    Non-tautology: the v6 and mixed cases FAIL against pre-fix code (which
@@ -325,6 +345,22 @@ by the new v4-only test that asserts the exact `match ip address` line.
 F2's e2e-test-package guidance is folded into the test plan. The mixed
 case is explicitly scoped to the route-filter-equivalent homogeneous-family
 limitation (Out of scope).
+
+**Round 3 (on the v3 single-matcher design) — BOTH AGREE:**
+- Reviewer A — PLAN-NEEDS-MINOR (×3, all honesty/coverage, no design
+  change): MINOR-1 drop the "strictly improves" overclaim and name the
+  mixed-list v4→ipv6 flip as the explicit regression vector; MINOR-2 scope
+  the byte-identity claim to exclude the v6-list-in-v4-context emit change;
+  MINOR-3 tighten the co-resident test to assert exactly one route-map
+  sequence for the term. ALL FOLDED above.
+- Reviewer B — PLAN-READY: verified the exact snippet compiles and is
+  correct for all six edge cases, byte-identity proven against the master
+  line, non-tautology proven, the e2e compile path verified live, and the
+  no-doc-change claim accurate.
+
+Both reviewers confirm v3 closes round-1 and round-2 by construction (one
+matcher only → no AND-in-index; no body duplication → no route-filter
+interaction). PROCEED TO IMPLEMENT.
 
 ## Open questions for adversarial review (round 3 — on the v3 single-matcher design)
 
