@@ -6,7 +6,13 @@
 package userspace
 
 import (
+	"encoding/json"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/psaab/xpf/pkg/config"
 )
@@ -265,5 +271,150 @@ func TestFeedOverlayMergesWithStaticBook(t *testing.T) {
 	}
 	if !contains(row.PrefixesV4, "10.0.0.0/8") || !contains(row.PrefixesV4, "198.51.100.0/24") {
 		t.Fatalf("mixed row must carry BOTH static and feed prefixes; got %v", row.PrefixesV4)
+	}
+}
+
+// TestLegacyAdapterForwardsFeedSnapshots proves the daemon hand-off reaches
+// the runtime dataplane on the REAL path. The daemon asserts the runtime
+// dataplane to feedSnapshotSetter and calls SetFeedSnapshots; on the default
+// path the runtime dataplane is *LegacyDataPlaneAdapter (dpuserspace.Boot ->
+// NewLegacyDataPlaneAdapter). Before the adapter forwarding method existed the
+// assertion failed silently and m.feedOverlay stayed empty — feed enforcement
+// was a no-op. This test drives the ADAPTER (not the Manager directly), which
+// is the gap the prior #2049 tests missed: it FAILS to compile / leaves the
+// overlay empty without LegacyDataPlaneAdapter.SetFeedSnapshots.
+func TestLegacyAdapterForwardsFeedSnapshots(t *testing.T) {
+	m := New()
+	adapter := NewLegacyDataPlaneAdapter(m)
+
+	overlay := map[string][]string{
+		"bad-actors": {"198.51.100.0/24", "2001:db8:bad::/48"},
+	}
+	adapter.SetFeedSnapshots(overlay)
+
+	got := m.feedSnapshotOverlay()
+	if !contains(got["bad-actors"], "198.51.100.0/24") || !contains(got["bad-actors"], "2001:db8:bad::/48") {
+		t.Fatalf("adapter SetFeedSnapshots did not reach Manager.feedOverlay; got %v", got)
+	}
+
+	// Prove enforcement actually follows: the full snapshot build under the
+	// stored overlay emits the feed-backed book row. Mirrors the daemon path
+	// where the next Compile/Apply consumes the cached overlay.
+	cfg := feedPolicyCfg("bad-actors", "any")
+	books, nameToID := buildAddressBookTableWithFeeds(cfg, m.feedSnapshotOverlay())
+	if findBookByName(books, "bad-actors") == nil {
+		t.Fatalf("feed overlay forwarded through the adapter must enforce a book row")
+	}
+	if id, ok := nameToID["bad-actors"]; !ok || id == 0 {
+		t.Fatalf("feed overlay forwarded through the adapter must populate nameToID (ok=%v id=%d)", ok, id)
+	}
+
+	// Nil-manager adapter must not panic (mirrors SetRouteOverlay's guard).
+	(&LegacyDataPlaneAdapter{}).SetFeedSnapshots(overlay)
+}
+
+// TestSchedulerRepublishRetainsFeedEnforcement proves a CoS scheduler-state
+// change (UpdatePolicyScheduleState) republishes a snapshot that STILL carries
+// feed enforcement. Before the fix the scheduler-only republish rebuilt the
+// policies/address-book with a nil overlay, dropping the feed-backed book rows
+// until the next full apply. The test stands up a fake control socket, captures
+// the published apply_snapshot, and asserts the feed-backed book row + ID
+// survived. It FAILS against the nil-overlay republish.
+func TestSchedulerRepublishRetainsFeedEnforcement(t *testing.T) {
+	dir := t.TempDir()
+	controlSock := filepath.Join(dir, "control.sock")
+	ln, err := net.Listen("unix", controlSock)
+	if err != nil {
+		t.Fatalf("listen control socket: %v", err)
+	}
+	defer ln.Close()
+
+	type captured struct {
+		req ControlRequest
+	}
+	capCh := make(chan captured, 4)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			func() {
+				defer conn.Close()
+				var req ControlRequest
+				if err := json.NewDecoder(conn).Decode(&req); err != nil {
+					return
+				}
+				capCh <- captured{req: req}
+				_ = json.NewEncoder(conn).Encode(ControlResponse{
+					OK:     true,
+					Status: &ProcessStatus{PID: 4321, Enabled: true},
+				})
+			}()
+		}
+	}()
+
+	proc, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatalf("FindProcess: %v", err)
+	}
+
+	cfg := feedPolicyCfg("bad-actors", "any")
+	overlay := map[string][]string{
+		"bad-actors": {"198.51.100.0/24", "2001:db8:bad::/48"},
+	}
+
+	m := New()
+	m.proc = &exec.Cmd{Process: proc}
+	m.cfg.ControlSocket = controlSock
+	// Seed the manager with the stored feed overlay (as SetFeedSnapshots does)
+	// and a prior published snapshot for the scheduler republish to clone.
+	m.SetFeedSnapshots(overlay)
+	m.lastSnapshot = &ConfigSnapshot{Config: cfg, Generation: 5}
+
+	// A CoS scheduler-state change with NO config change: must NOT drop the feed.
+	m.UpdatePolicyScheduleState(cfg, map[string]bool{})
+
+	var snap *ConfigSnapshot
+	deadline := time.After(2 * time.Second)
+	for snap == nil {
+		select {
+		case c := <-capCh:
+			if c.req.Type == "apply_snapshot" && c.req.Snapshot != nil {
+				snap = c.req.Snapshot
+			}
+		case <-deadline:
+			t.Fatal("helper did not receive an apply_snapshot republish")
+		}
+	}
+
+	row := findBookByName(snap.AddressBooks, "bad-actors")
+	if row == nil {
+		t.Fatalf("scheduler republish DROPPED the feed-backed book row; AddressBooks=%+v", snap.AddressBooks)
+	}
+	if !contains(row.PrefixesV4, "198.51.100.0/24") {
+		t.Fatalf("scheduler republish lost the v4 feed prefix; PrefixesV4=%v", row.PrefixesV4)
+	}
+	if !contains(row.PrefixesV6, "2001:db8:bad::/48") {
+		t.Fatalf("scheduler republish lost the v6 feed prefix; PrefixesV6=%v", row.PrefixesV6)
+	}
+
+	// And the policy still routes the feed token as a book reference, not a
+	// no-match literal.
+	if len(snap.Policies) != 1 {
+		t.Fatalf("expected 1 republished policy rule, got %d", len(snap.Policies))
+	}
+	_, nameToID := buildAddressBookTableWithFeeds(cfg, overlay)
+	wantID := nameToID["bad-actors"]
+	if wantID == 0 {
+		t.Fatalf("precondition: feed name must have an ID")
+	}
+	if !containsID(snap.Policies[0].SourceBookIDs, wantID) {
+		t.Fatalf("scheduler republish must keep the feed source as a book reference; SourceBookIDs=%v want %d",
+			snap.Policies[0].SourceBookIDs, wantID)
+	}
+	if contains(snap.Policies[0].SourceLiterals, "bad-actors") {
+		t.Fatalf("scheduler republish must NOT demote the feed source to a no-match literal; SourceLiterals=%v",
+			snap.Policies[0].SourceLiterals)
 	}
 }
