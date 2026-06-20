@@ -56,11 +56,24 @@ type vrrpInstance struct {
 	desiredPreempt   bool // configured preempt value (may differ from cfg.Preempt during sync hold)
 	forcePreemptOnce bool // one-shot preempt override from ForceRGMaster (auto-cleared after use)
 	trackDown        bool // tracked interface (cfg.TrackInterface) is down (#1814); guarded by mu
-	state            VRRPState
-	iface            *net.Interface
-	eventCh          chan<- VRRPEvent
-	localIP          net.IP // our IPv4 address on this interface (for filtering self-sent)
-	localIPv6        net.IP // our link-local IPv6 address (source for IPv6 VRRP adverts)
+
+	// Last-seen master advertisement (#2082). Recorded by handleBackupRx /
+	// handleMasterRx for every non-zero-priority advert from a peer, and read
+	// by shouldPreemptObservedMaster to gate the non-force sync-hold preempt
+	// shortcut on a strictly-higher effective priority (RFC 5798 §6.4.2). Both
+	// writers and the gate reader run in the run-loop goroutine, so they are
+	// already serialized with respect to each other; mu makes the writes/reads
+	// race-clean for any future cross-goroutine reader. Priority-0
+	// (resignation) adverts are NOT recorded — post-resign takeover flows
+	// through the ungated masterDownTimer path. Guarded by mu.
+	lastMasterPriority int       // last non-zero peer advert priority
+	lastMasterSeen     time.Time // when lastMasterPriority was recorded
+
+	state     VRRPState
+	iface     *net.Interface
+	eventCh   chan<- VRRPEvent
+	localIP   net.IP // our IPv4 address on this interface (for filtering self-sent)
+	localIPv6 net.IP // our link-local IPv6 address (source for IPv6 VRRP adverts)
 
 	// Per-instance raw socket and receiver.
 	conn    net.PacketConn
@@ -255,6 +268,82 @@ func (vi *vrrpInstance) getPreempt() bool {
 	return vi.cfg.Preempt
 }
 
+// shouldPreemptObservedMaster decides whether the non-force sync-hold preempt
+// shortcut (the preemptNowCh case in run) may transition this BACKUP instance
+// to MASTER (#2082). It encodes RFC 5798 §6.4.2 preemption: a BACKUP preempts
+// only on a STRICTLY higher priority than the currently-observed master. It
+// returns true iff:
+//
+//   - preempt is configured (a non-preempting node never preempts on the
+//     shortcut), AND
+//   - either no live master has been observed recently (lastMasterSeen is zero
+//     or older than masterDownInterval — the cold-start / peer-down /
+//     silent-master-death rescue, where becoming MASTER is correct), OR a
+//     recent master was observed AND our effective priority is strictly greater
+//     than its last advertised priority.
+//
+// Equal priority returns false (RFC 5798 §6.4.2 — an equal-priority BACKUP does
+// not preempt; the address tie-break in handleMasterRx resolves a MASTER-MASTER
+// collision, a different state than preemption). The ForceRGMaster path
+// (force=true) is gated OUTSIDE this helper (the run-loop short-circuits it),
+// so cluster-authoritative promotion is unaffected.
+//
+// Lock discipline (BINDING — Go's sync.RWMutex is non-reentrant): this helper
+// snapshots everything it needs under ONE vi.mu.RLock(), releases, then
+// computes the effective priority and the staleness horizon from the locals.
+// It MUST NOT call getPriority()/getPreempt()/masterDownInterval() (each of
+// which RLocks vi.mu) while holding the lock. RLock (not Lock) is used so it
+// never blocks concurrent external readers such as Status().
+func (vi *vrrpInstance) shouldPreemptObservedMaster() bool {
+	vi.mu.RLock()
+	preempt := vi.cfg.Preempt
+	priority := vi.cfg.Priority
+	trackDown := vi.trackDown
+	trackIface := vi.cfg.TrackInterface
+	trackCost := vi.cfg.TrackPriorityCost
+	advertMS := vi.cfg.AdvertiseInterval
+	lastMasterPriority := vi.lastMasterPriority
+	lastMasterSeen := vi.lastMasterSeen
+	vi.mu.RUnlock()
+
+	if !preempt {
+		return false
+	}
+
+	// Effective advertised priority — replicates getPriority() (track.go)
+	// from the snapshot: priority 0/255 pass through unchanged; otherwise
+	// while the tracked link is down, TrackPriorityCost is subtracted and
+	// clamped to [1, 254].
+	effective := priority
+	if priority != 0 && priority != 255 && trackDown && trackIface != "" {
+		effective -= trackCost
+		if effective < 1 {
+			effective = 1
+		} else if effective > 254 {
+			effective = 254
+		}
+	}
+
+	// masterDownInterval staleness horizon — replicates masterDownInterval()
+	// (3*advert + skew) from the snapshot using the effective priority.
+	advert := time.Duration(advertMS) * time.Millisecond
+	if advertMS <= 0 {
+		advert = 1000 * time.Millisecond
+	}
+	skew := time.Duration(256-effective) * advert / 256
+	masterDown := 3*advert + skew
+
+	// No live master observed (cold-start) or the last advert is older than
+	// the master-down horizon (silent death / peer-down) → no master to
+	// respect, becoming MASTER is correct.
+	if lastMasterSeen.IsZero() || time.Since(lastMasterSeen) > masterDown {
+		return true
+	}
+
+	// A live master was observed — preempt only on STRICTLY higher priority.
+	return effective > lastMasterPriority
+}
+
 func (vi *vrrpInstance) getState() VRRPState {
 	vi.mu.RLock()
 	defer vi.mu.RUnlock()
@@ -284,6 +373,46 @@ func (vi *vrrpInstance) masterDownInterval() time.Duration {
 	advert := vi.advertInterval()
 	skew := time.Duration(256-vi.getPriority()) * advert / 256
 	return 3*advert + skew
+}
+
+// stepBackup runs one iteration of the StateBackup select. It is called by the
+// run loop AND directly by unit tests (the run() preamble unconditionally
+// spawns a receiver goroutine that nil-derefs vi.conn on a test instance, so
+// tests must not call run() — they drive this seam instead). It returns true
+// when the instance has been told to stop (the caller's run loop should
+// return).
+func (vi *vrrpInstance) stepBackup(masterDownTimer, advertTimer *time.Timer) (stop bool) {
+	select {
+	case <-vi.stopCh:
+		return true
+	case pkt := <-vi.rxCh:
+		vi.handleBackupRx(pkt, masterDownTimer)
+	case <-masterDownTimer.C:
+		// Master timed out — become Master.
+		vi.becomeMaster()
+		advertTimer.Reset(vi.advertInterval())
+	case <-vi.preemptNowCh:
+		// Coordinated preemption from ReleaseSyncHold or forced transition
+		// from ForceRGMaster. The forcePreemptOnce flag allows a one-shot
+		// preemption even when preempt=false, without leaking into the
+		// configured preempt value.
+		//
+		// force=true (ForceRGMaster) is cluster-authoritative and bypasses
+		// the peer-priority gate unconditionally. The non-force sync-hold
+		// path is gated on shouldPreemptObservedMaster (#2082): a
+		// lower-priority preempt-enabled node no longer transiently becomes
+		// a second MASTER while a higher-priority peer is legitimately MASTER.
+		vi.mu.Lock()
+		force := vi.forcePreemptOnce
+		vi.forcePreemptOnce = false
+		vi.mu.Unlock()
+		if force || vi.shouldPreemptObservedMaster() {
+			vi.becomeMaster()
+			advertTimer.Reset(vi.advertInterval())
+			masterDownTimer.Stop()
+		}
+	}
+	return false
 }
 
 // run is the main state machine loop. Must be called as a goroutine.
@@ -348,29 +477,8 @@ func (vi *vrrpInstance) run() {
 
 		switch state {
 		case StateBackup:
-			select {
-			case <-vi.stopCh:
+			if vi.stepBackup(masterDownTimer, advertTimer) {
 				return
-			case pkt := <-vi.rxCh:
-				vi.handleBackupRx(pkt, masterDownTimer)
-			case <-masterDownTimer.C:
-				// Master timed out — become Master.
-				vi.becomeMaster()
-				advertTimer.Reset(vi.advertInterval())
-			case <-vi.preemptNowCh:
-				// Coordinated preemption from ReleaseSyncHold or forced
-				// transition from ForceRGMaster. The forcePreemptOnce flag
-				// allows a one-shot preemption even when preempt=false,
-				// without leaking into the configured preempt value.
-				vi.mu.Lock()
-				force := vi.forcePreemptOnce
-				vi.forcePreemptOnce = false
-				vi.mu.Unlock()
-				if vi.getPreempt() || force {
-					vi.becomeMaster()
-					advertTimer.Reset(vi.advertInterval())
-					masterDownTimer.Stop()
-				}
 			}
 
 		case StateMaster:
@@ -714,8 +822,25 @@ func (vi *vrrpInstance) parseAfPacketIPv6(buf []byte, n, ethHeaderLen int) {
 	}
 }
 
+// recordMasterAdvert records a peer's last advertised priority for the
+// sync-hold preempt gate (#2082). Priority-0 (resignation) adverts are NOT
+// recorded — leaving a stale lastMasterPriority is safe because post-resign
+// takeover flows through the ungated masterDownTimer path, not the gated
+// preemptNowCh shortcut. Called from handleBackupRx/handleMasterRx, which run
+// in the run-loop goroutine; mu only guards external readers.
+func (vi *vrrpInstance) recordMasterAdvert(pkt *VRRPPacket) {
+	if pkt.Priority == 0 {
+		return
+	}
+	vi.mu.Lock()
+	vi.lastMasterPriority = int(pkt.Priority)
+	vi.lastMasterSeen = time.Now()
+	vi.mu.Unlock()
+}
+
 // handleBackupRx processes a received advertisement while in Backup state.
 func (vi *vrrpInstance) handleBackupRx(pkt *VRRPPacket, masterDownTimer *time.Timer) {
+	vi.recordMasterAdvert(pkt)
 	pri := vi.getPriority()
 	if pkt.Priority == 0 {
 		// Master is explicitly resigning — become Master immediately.
@@ -739,6 +864,7 @@ func (vi *vrrpInstance) handleBackupRx(pkt *VRRPPacket, masterDownTimer *time.Ti
 // Per RFC 5798 §6.4.3: if priority is higher, step down. If equal,
 // the node with the higher source IP stays Master (tie-breaking).
 func (vi *vrrpInstance) handleMasterRx(pkt *VRRPPacket, masterDownTimer, advertTimer *time.Timer) {
+	vi.recordMasterAdvert(pkt)
 	pri := vi.getPriority()
 	if pkt.Priority == 0 {
 		// Peer resigning — send immediate advert and stay Master.

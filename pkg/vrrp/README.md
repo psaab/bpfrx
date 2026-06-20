@@ -63,6 +63,25 @@ This is the package that drives chassis-cluster failover.
 - Sync hold: VRRP starts with `preempt=false`; released after bulk
   session sync (or 10 s timeout). `preemptNowCh` triggers instant
   preemption when sync completes early.
+- Sync-hold preempt gate (#2082): the non-force `preemptNowCh` shortcut
+  is peer-priority gated. `becomeMaster()` runs on the kick only when the
+  node's **effective** priority is **strictly greater** than the last
+  observed master's (RFC 5798 §6.4.2 — equal priority does NOT preempt;
+  no IP tie-break, that resolves a MASTER-MASTER collision in
+  `handleMasterRx`, not preemption). A lower-priority preempt-enabled node
+  (e.g. a rejoining cluster Secondary at priority 100) therefore no longer
+  transiently becomes a second MASTER on sync-hold release while a
+  higher-priority peer is legitimately MASTER. `handleBackupRx` /
+  `handleMasterRx` record each non-zero peer advert
+  (`lastMasterPriority`/`lastMasterSeen`); priority-0 resignation adverts
+  are not recorded (post-resign takeover flows through the ungated
+  `masterDownTimer` path). Staleness — no master seen, or last seen older
+  than `masterDownInterval` — is treated as "no live master", allowing
+  cold-start / silent-master-death takeover. `ForceRGMaster` (force=true,
+  cluster-authoritative Secondary→Primary promotion) bypasses the gate
+  unchanged, so the ~60 ms failover path is untouched. The gate only
+  governs the shortcut: a denied gate never stops `masterDownTimer`, so the
+  normal RFC election still promotes the node when the real master dies.
 
 ## Interface tracking (#1814)
 
