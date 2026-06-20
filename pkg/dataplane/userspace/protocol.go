@@ -69,6 +69,15 @@ type ConfigSnapshot struct {
 	FlowExport         *FlowExportSnapshot          `json:"flow_export,omitempty"`
 	MirrorConfigs      []MirrorConfigSnapshot       `json:"mirror_configs,omitempty"`
 	AddressBooks       []AddressBookSnapshot        `json:"address_books,omitempty"`
+	// AppCatalog is the L3/L4 application-identification catalog (#2008 M5):
+	// the ordered (protocol, port-range) -> app_id classification table the
+	// dataplane uses to stamp app_id on a new session. Additive field — an
+	// old Rust helper that does not know it simply ignores it (serde does not
+	// require it), and an old Go binary that does not emit it leaves Rust's
+	// catalog empty (every session keeps app_id 0, the existing default). The
+	// app_id values match CompileResult.AppNames so `show security flow
+	// session` resolves them back to names.
+	AppCatalog         []AppCatalogEntrySnapshot    `json:"app_catalog,omitempty"`
 	Config             *config.Config               `json:"config,omitempty"`
 	Userspace          config.UserspaceConfig       `json:"userspace"`
 	DeferWorkers       bool                         `json:"defer_workers,omitempty"`
@@ -492,6 +501,23 @@ type PolicyApplicationSnapshot struct {
 	Protocol        string `json:"protocol,omitempty"`
 	SourcePort      string `json:"source_port,omitempty"`
 	DestinationPort string `json:"destination_port,omitempty"`
+}
+
+// AppCatalogEntrySnapshot is one row of the application-identification catalog
+// (#2008 M5). The dataplane scans these on session create and stamps the
+// matching AppID on the conntrack session so `show security flow session`
+// resolves a real application name. Inclusive port boundaries; a zero
+// DstPortLow/DstPortHigh pair means "no destination-port constraint" (match on
+// protocol alone, e.g. ICMP), and a zero SrcPortLow/SrcPortHigh pair means "no
+// source-port constraint". AppID is never 0 (0 is the reserved unknown
+// sentinel). Rust mirror: AppCatalogEntry in protocol/snapshot.rs.
+type AppCatalogEntrySnapshot struct {
+	AppID       uint16 `json:"app_id"`
+	Protocol    uint8  `json:"protocol"`
+	DstPortLow  uint16 `json:"dst_port_low,omitempty"`
+	DstPortHigh uint16 `json:"dst_port_high,omitempty"`
+	SrcPortLow  uint16 `json:"src_port_low,omitempty"`
+	SrcPortHigh uint16 `json:"src_port_high,omitempty"`
 }
 
 type PolicyRuleSnapshot struct {

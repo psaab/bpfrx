@@ -54,6 +54,12 @@ pub(in crate::afxdp) struct ForwardingState {
     /// turns the ALG off; it never drops traffic, so a set bit only
     /// changes the session's reported alg_type to 0 (none).
     pub(in crate::afxdp) alg_disable_flags: u8,
+    /// #2008 M5: L3/L4 application-identification catalog. Resolves a session's
+    /// 5-tuple to the numeric app_id stamped on the conntrack session at
+    /// create time, so `show security flow session` reports a real application
+    /// name. Empty when the Go snapshot carries no catalog (AppID disabled or
+    /// an old Go binary) — sessions then keep app_id 0 (unknown).
+    pub(in crate::afxdp) app_catalog: AppCatalog,
     pub(in crate::afxdp) session_timeouts: crate::session::SessionTimeouts,
     pub(in crate::afxdp) policy: PolicyState,
     pub(in crate::afxdp) source_nat_rules: Vec<SourceNatRule>,

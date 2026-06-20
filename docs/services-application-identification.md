@@ -37,24 +37,45 @@ upfront what they're getting and not getting.
 ## How session app names are assigned today
 
 1. **Compile time**: `pkg/appid/runtime.go:CatalogNames` builds
-   the application catalog from policies + the predefined
-   junos-* application list + user-defined applications. The
-   `pkg/dataplane/compiler.go` then assigns each application a
-   `u32 app_id` and writes:
-   - The `applications` BPF map: key
-     `(protocol u8, dst_port __be16, src_port_low u16,
-     src_port_high u16)` → `app_id u32 + timeout u32`.
-   - The `app_ranges` BPF map: ordered list of
-     `(protocol, port_low, port_high, src_port_low, src_port_high)
-     → app_id` for `applications` that match port ranges.
-2. **Session create (XDP policy stage)**:
-   `bpf/xdp/xdp_policy.c:resolve_pkt_app_id` does a single
-   `bpf_map_lookup_elem(&applications, &ak)` keyed on
-   `(meta->protocol, meta->dst_port)`. If no match, walk
-   `app_ranges` for a port-range match. The resulting `app_id`
-   (or 0 = no match) is stamped on the session entry along
-   with the optional inactivity timeout.
-3. **Show output**:
+   the application catalog name set from policies + the
+   predefined junos-* application list + user-defined
+   applications. Each name is assigned a `u16 app_id`
+   sequentially (from 1, in sorted-name order) — done in
+   `pkg/dataplane/compiler.go:compileApplications`
+   (`CompileResult.AppNames`, the `app_id → name` map the show
+   path consumes) and, in lock-step, in
+   `pkg/appid/catalog.go:BuildCatalog`, which also carries each
+   application's `(protocol, dst-port-range, src-port-range)`
+   match rule. A Go test
+   (`pkg/dataplane/appid_catalog_parity_test.go`) pins that the
+   two id assignments are identical, so an id stamped by the
+   dataplane always resolves to the right name.
+2. **Snapshot ship**: `buildAppCatalogSnapshot`
+   (`pkg/dataplane/userspace/flow.go`) emits the catalog as the
+   `app_catalog` field of the config snapshot — an ordered list
+   of `(app_id u16, protocol u8, dst_port_low/high u16,
+   src_port_low/high u16)`. It is an additive wire field with
+   `omitempty` on the Go side and `#[serde(default)]` on the
+   Rust side (`AppCatalogEntry` in
+   `userspace-dp/src/protocol/security.rs`), so an old snapshot
+   without it decodes to an empty catalog (HA/upgrade-safe).
+3. **Session create (userspace dataplane)**: the snapshot
+   catalog is compiled into `ForwardingState.app_catalog`
+   (`AppCatalog` in `userspace-dp/src/policy.rs`). When a worker
+   creates a new session (`poll_descriptor`), it calls
+   `AppCatalog::lookup(protocol, src_port, dst_port)` and the
+   resolved `app_id` (0 = no match) is stamped on the conntrack
+   session value in `publish_conntrack.rs` (previously hardcoded
+   to 0). The well-known service port is probed on both the src
+   and dst slot so the forward and reverse conntrack entries
+   resolve to the same `app_id`. **Note**: only the local
+   session-owner stamps `app_id` in the conntrack map (the same
+   property as `alg_type`); an HA-synced session on the standby
+   peer is not mirrored into the conntrack map, and a session
+   re-created locally after failover is re-stamped from the
+   catalog (the catalog is shipped to both nodes), so `app_id`
+   is re-derived rather than carried on the session-sync wire.
+4. **Show output**:
    `pkg/appid/runtime.go:ResolveSessionName` resolves the
    `app_id` back to a name via the `compiler.go` `AppNames`
    map. If `app_id == 0`:
@@ -67,13 +88,16 @@ upfront what they're getting and not getting.
 
 ## What's parsed but not implemented
 
-These config paths are accepted at commit time but their
-runtime effect is limited to "the catalog lookup above":
+These config paths are accepted at commit time and their
+runtime effect is the L3/L4 catalog classification above
+(catalog ship + per-session `app_id` stamp + name resolution):
 
-- `services application-identification` — toggles the
-  show-output `UNKNOWN` vs port-guess behaviour.
+- `services application-identification` — enables catalog
+  classification and toggles the show-output `UNKNOWN` vs
+  port-guess behaviour for no-match sessions.
 - `applications application <name>` — populates the catalog
-  for port-based matching.
+  for port-based matching; a session matching it is stamped
+  with this application's `app_id`.
 - `applications application-set` — expands into individual
   applications at compile time.
 

@@ -113,6 +113,13 @@ pub(super) struct ConntrackCtx<'a> {
     /// ForwardingState so the mirrored conntrack entry's alg_type honours
     /// the operator's disable knobs.
     pub(super) alg_disable_flags: u8,
+    /// Resolved application-identification id (#2008 M5) for the session, 0 =
+    /// unknown. Carried so a mirrored conntrack entry stamps app_id. NOTE: in
+    /// the current code base every production conntrack mirror is the live
+    /// session-create path in poll_descriptor, which calls
+    /// `publish_bpf_conntrack_entry` directly (not via this ctx); this field
+    /// keeps the ctx contract complete for any future `Some(ctx)` caller.
+    pub(super) app_id: u16,
 }
 
 // ── BPF conntrack map structs (mirrors C struct session_key / session_value) ──
@@ -233,6 +240,11 @@ pub(super) fn publish_bpf_conntrack_entry(
     // ForwardingState so the session's alg_type honours the operator's
     // disable knobs instead of being hardcoded to 0.
     alg_disable_flags: u8,
+    // Resolved application-identification id (#2008 M5). 0 = unknown (the
+    // existing default). Computed by the caller from
+    // ForwardingState.app_catalog so both the v4 and v6 publish stamp the
+    // session's app_id, letting `show security flow session` report a name.
+    app_id: u16,
 ) {
     // #919: zones are now u16 in SessionMetadata; the round-trip
     // name→id lookup the old code did is gone.
@@ -263,6 +275,7 @@ pub(super) fn publish_bpf_conntrack_entry(
                 egress_zone_id,
                 now_secs,
                 alg_disable_flags,
+                app_id,
             );
         }
         (libc::AF_INET6, IpAddr::V6(src), IpAddr::V6(dst)) if conntrack_v6_fd >= 0 => {
@@ -278,6 +291,7 @@ pub(super) fn publish_bpf_conntrack_entry(
                 egress_zone_id,
                 now_secs,
                 alg_disable_flags,
+                app_id,
             );
         }
         _ => {}
@@ -477,6 +491,7 @@ pub(super) fn publish_session_map_entry_for_session_with_conntrack(
                 metadata,
                 ctx.zone_name_to_id,
                 ctx.alg_disable_flags,
+                ctx.app_id,
             );
         }
         return Ok(());
@@ -492,6 +507,7 @@ pub(super) fn publish_session_map_entry_for_session_with_conntrack(
             metadata,
             ctx.zone_name_to_id,
             ctx.alg_disable_flags,
+            ctx.app_id,
         );
     }
     result

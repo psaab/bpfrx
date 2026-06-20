@@ -1054,6 +1054,70 @@ fn v_min_throttle_binding_status_backward_compat() {
     assert_eq!(status.v_min_throttles, 0);
 }
 
+// #2008 M5: the application-identification catalog must decode from the Go
+// snapshot's `app_catalog` field with the exact field names the Go side emits.
+#[test]
+fn config_snapshot_decodes_app_catalog() {
+    let json = r#"{
+        "version": 3,
+        "generation": 1,
+        "generated_at": "2024-01-01T00:00:00Z",
+        "summary": {"host_name":"h","dataplane_type":"userspace","interface_count":0,
+                    "zone_count":0,"policy_count":0,"scheduler_count":0,"ha_enabled":false},
+        "app_catalog": [
+            {"app_id": 7, "protocol": 6, "dst_port_low": 443, "dst_port_high": 443},
+            {"app_id": 9, "protocol": 6, "dst_port_low": 9000, "dst_port_high": 9100,
+             "src_port_low": 1024, "src_port_high": 65535},
+            {"app_id": 3, "protocol": 1}
+        ]
+    }"#;
+    let snap: ConfigSnapshot = serde_json::from_str(json).expect("decode snapshot");
+    assert_eq!(snap.app_catalog.len(), 3);
+    assert_eq!(snap.app_catalog[0].app_id, 7);
+    assert_eq!(snap.app_catalog[0].protocol, 6);
+    assert_eq!(snap.app_catalog[0].dst_port_high, 443);
+    assert_eq!(snap.app_catalog[1].src_port_high, 65535);
+    // Protocol-only ICMP entry: ports default to 0.
+    assert_eq!(snap.app_catalog[2].app_id, 3);
+    assert_eq!(snap.app_catalog[2].protocol, 1);
+    assert_eq!(snap.app_catalog[2].dst_port_low, 0);
+}
+
+// HA/upgrade compat: a snapshot from an OLD Go binary that does not know the
+// app_catalog field must still decode (serde(default) -> empty vec), not abort
+// the whole apply (the #1961 failure class).
+#[test]
+fn config_snapshot_decodes_without_app_catalog() {
+    let json = r#"{
+        "version": 3,
+        "generation": 1,
+        "generated_at": "2024-01-01T00:00:00Z",
+        "summary": {"host_name":"h","dataplane_type":"userspace","interface_count":0,
+                    "zone_count":0,"policy_count":0,"scheduler_count":0,"ha_enabled":false}
+    }"#;
+    let snap: ConfigSnapshot = serde_json::from_str(json).expect("decode old snapshot");
+    assert!(snap.app_catalog.is_empty(),
+        "snapshot without app_catalog must decode to an empty catalog (HA/upgrade compat)");
+}
+
+#[test]
+fn app_catalog_entry_roundtrip() {
+    let e = AppCatalogEntry {
+        app_id: 42,
+        protocol: 17,
+        dst_port_low: 53,
+        dst_port_high: 53,
+        src_port_low: 0,
+        src_port_high: 0,
+    };
+    let v = serde_json::to_value(&e).expect("serialize");
+    assert_eq!(v["app_id"], 42);
+    assert_eq!(v["protocol"], 17);
+    let back: AppCatalogEntry = serde_json::from_value(v).expect("deserialize");
+    assert_eq!(back.app_id, 42);
+    assert_eq!(back.dst_port_low, 53);
+}
+
 // ---------------------------------------------------------------------------
 // #1325: differential wire-format invariant.
 //
@@ -1095,6 +1159,7 @@ fn wire_invariant_default_specimens() {
     s.insert("binding_control_request".into(), dump(&BindingControlRequest::default()));
     s.insert("binding_counters_snapshot".into(), dump(&BindingCountersSnapshot::default()));
     s.insert("binding_status".into(), dump(&BindingStatus::default()));
+    s.insert("app_catalog_entry".into(), dump(&AppCatalogEntry::default()));
     s.insert("class_of_service_snapshot".into(), dump(&ClassOfServiceSnapshot::default()));
     s.insert("config_snapshot".into(), dump(&ConfigSnapshot::default()));
     s.insert("control_request".into(), dump(&ControlRequest::default()));

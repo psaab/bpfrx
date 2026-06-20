@@ -1780,3 +1780,84 @@ fn test_policy_source_address_excluded_inverts_match_v6() {
         "a v6 source outside the excluded set must match"
     );
 }
+
+// ── #2008 M5: application-identification catalog matcher ──
+
+fn cat_entry(app_id: u16, proto: u8, dlo: u16, dhi: u16) -> crate::AppCatalogEntry {
+    crate::AppCatalogEntry {
+        app_id,
+        protocol: proto,
+        dst_port_low: dlo,
+        dst_port_high: dhi,
+        src_port_low: 0,
+        src_port_high: 0,
+    }
+}
+
+// The core stamp behaviour: a session on a catalog application's service port
+// resolves to that app_id. This is the assertion that regresses to 0 if the
+// session-create path stops calling AppCatalog::lookup (mutation-verify of the
+// #2008 M5 stamp).
+#[test]
+fn app_catalog_exact_dst_port_resolves_id() {
+    let cat = AppCatalog::from_snapshot(&[cat_entry(7, 6, 443, 443)]);
+    // forward session: client ephemeral src -> server dst 443.
+    assert_eq!(cat.lookup(6, 51000, 443), 7);
+    // reverse-keyed session carries the service port in the src slot.
+    assert_eq!(cat.lookup(6, 443, 51000), 7);
+    // wrong protocol on the same port is not the app.
+    assert_eq!(cat.lookup(17, 51000, 443), 0);
+    // unrelated port resolves to unknown (0).
+    assert_eq!(cat.lookup(6, 51000, 80), 0);
+}
+
+#[test]
+fn app_catalog_port_range_resolves_id() {
+    let cat = AppCatalog::from_snapshot(&[cat_entry(9, 6, 9000, 9100)]);
+    assert_eq!(cat.lookup(6, 40000, 9000), 9); // low edge
+    assert_eq!(cat.lookup(6, 40000, 9100), 9); // high edge
+    assert_eq!(cat.lookup(6, 40000, 9050), 9); // interior
+    assert_eq!(cat.lookup(6, 40000, 8999), 0); // below
+    assert_eq!(cat.lookup(6, 40000, 9101), 0); // above
+    // reverse-keyed: service-port range in the src slot still resolves.
+    assert_eq!(cat.lookup(6, 9050, 40000), 9);
+}
+
+// A (0,0) dst-port pair means "protocol-only" (e.g. ICMP) — match on protocol
+// regardless of ports.
+#[test]
+fn app_catalog_protocol_only_entry() {
+    let cat = AppCatalog::from_snapshot(&[cat_entry(3, 1, 0, 0)]); // ICMP
+    assert_eq!(cat.lookup(1, 0, 0), 3);
+    assert_eq!(cat.lookup(1, 1234, 5678), 3);
+    assert_eq!(cat.lookup(6, 1234, 5678), 0); // different protocol
+}
+
+// app_id 0 is the reserved unknown sentinel and must never be indexed even if a
+// malformed snapshot carries it.
+#[test]
+fn app_catalog_skips_zero_app_id() {
+    let cat = AppCatalog::from_snapshot(&[cat_entry(0, 6, 443, 443)]);
+    assert!(cat.is_empty());
+    assert_eq!(cat.lookup(6, 51000, 443), 0);
+}
+
+// Overlapping entries: first/lowest app_id wins, deterministically (the Go
+// builder emits ascending ids in sorted-name order).
+#[test]
+fn app_catalog_overlap_lowest_id_wins() {
+    // Two apps both claiming tcp/80 — exact-port path.
+    let cat = AppCatalog::from_snapshot(&[cat_entry(5, 6, 80, 80), cat_entry(11, 6, 80, 80)]);
+    assert_eq!(cat.lookup(6, 40000, 80), 5);
+
+    // Range vs exact overlap — lowest id still wins.
+    let cat = AppCatalog::from_snapshot(&[cat_entry(2, 6, 8000, 8100), cat_entry(20, 6, 8050, 8050)]);
+    assert_eq!(cat.lookup(6, 40000, 8050), 2);
+}
+
+#[test]
+fn app_catalog_empty_resolves_unknown() {
+    let cat = AppCatalog::default();
+    assert!(cat.is_empty());
+    assert_eq!(cat.lookup(6, 51000, 443), 0);
+}

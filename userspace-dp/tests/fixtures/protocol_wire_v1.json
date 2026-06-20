@@ -1,4 +1,12 @@
 {
+  "app_catalog_entry": {
+    "app_id": 0,
+    "dst_port_high": 0,
+    "dst_port_low": 0,
+    "protocol": 0,
+    "src_port_high": 0,
+    "src_port_low": 0
+  },
   "binding_control_request": {
     "armed": false,
     "registered": false,
@@ -191,6 +199,7 @@
   },
   "config_snapshot": {
     "address_books": [],
+    "app_catalog": [],
     "capabilities": {
       "forwarding_supported": false,
       "unsupported_reasons": []
