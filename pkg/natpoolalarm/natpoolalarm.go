@@ -20,10 +20,9 @@
 //   - No new control-socket request: the sampler reads the manager's cached
 //     status + applied snapshot (AppliedNATView), no socket I/O (CLAUDE.md
 //     control-socket-contention rule).
-//   - Generation coherency: numeric raise/clear runs only when the sampled
-//     view is Available AND HelperCoherent (config and counters are the same
-//     applied generation). Config-derived clears (unreference / removal /
-//     deterministic-convert / feature-disabled / nil-config) run regardless.
+//   - Generation coherency: all raise/clear/prune logic runs only when the
+//     sampled view is Available AND HelperCoherent (config and counters are
+//     the same applied generation); otherwise the monitor HOLDs all alarms.
 package natpoolalarm
 
 import (
@@ -211,7 +210,9 @@ func (m *Monitor) evaluate() {
 		return
 	}
 	alarmCfg := cfg.Security.NAT.PoolUtilizationAlarm
-	if alarmCfg == nil || alarmCfg.RaiseThreshold <= 0 {
+	if alarmCfg == nil ||
+		alarmCfg.RaiseThreshold <= 0 || alarmCfg.RaiseThreshold > 100 ||
+		alarmCfg.ClearThreshold <= 0 || alarmCfg.ClearThreshold >= alarmCfg.RaiseThreshold {
 		// Feature disabled / unset: clear every active alarm and return.
 		m.clearAll("pool-utilization-alarm disabled")
 		return

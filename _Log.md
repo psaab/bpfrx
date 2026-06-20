@@ -1,5 +1,21 @@
 # Action Log
 
+## 2026-06-20 — #2079 nat pool-utilization-alarm lenient-disable runtime parity
+
+- **Timestamp**: 2026-06-20
+- **Action**: Adversarial re-review of c927f50 found a runtime parity gap:
+  leniently-loaded invalid positive thresholds (for example `clear >= raise`)
+  were warned as "disabled until corrected" but the monitor only disabled on
+  `raise <= 0`, so invalid configs could still raise/clear flap every tick.
+  Fixed monitor gating to treat any invalid threshold relation
+  (`raise<=0 || raise>100 || clear<=0 || clear>=raise`) as disabled, corrected
+  the package-level coherency comment to match HOLD behavior, and added
+  non-tautological tests proving invalid thresholds do not raise and clear any
+  prior active alarm once then remain inert. Also fixed a stale helper comment
+  in tests.
+- **File(s)**: pkg/natpoolalarm/natpoolalarm.go,
+  pkg/natpoolalarm/natpoolalarm_test.go, _Log.md
+
 ## 2026-06-20 — #2089 policy reject action: TCP RST / ICMP unreachable
 
 - **Timestamp**: 2026-06-20

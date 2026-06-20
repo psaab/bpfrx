@@ -59,8 +59,7 @@ const (
 
 // cfgWith builds a config with a single source pool referenced by one
 // source-NAT rule, with the given alarm thresholds. deterministic marks the
-// pool deterministic. If poolMissing is true the rule references a name that
-// does not exist in SourcePools.
+// pool deterministic.
 func cfgWith(raise, clear int, deterministic bool) *config.Config {
 	cfg := &config.Config{}
 	cfg.Security.NAT.PoolUtilizationAlarm = &config.PoolUtilizationAlarmConfig{
@@ -413,6 +412,56 @@ func TestFeatureDisabledClearsAll(t *testing.T) {
 	if got := countMatch(rec.snapshot(), clearedTag); got != 1 {
 		t.Fatalf("feature-disable must emit clear, got %d", got)
 	}
+}
+
+// TestInvalidThresholdsDisableAndClearAll: invalid threshold relations are
+// treated as disabled in runtime, so they neither raise new alarms nor keep a
+// previously-raised alarm active.
+func TestInvalidThresholdsDisableAndClearAll(t *testing.T) {
+	t.Run("invalid config does not raise", func(t *testing.T) {
+		m, rec, vb := newMon()
+		// Invalid (clear >= raise), but both positive: this is what lenient
+		// load can carry post-#2079.
+		cfgInvalid := cfgWith(70, 80, false)
+		vb.set(coherentView(cfgInvalid, poolStatus("p1", 1, 1, 100, 95)))
+		m.evaluate()
+		if len(m.ActiveAlarms()) != 0 {
+			t.Fatal("invalid thresholds must behave as disabled (no raise)")
+		}
+		if len(rec.snapshot()) != 0 {
+			t.Fatal("invalid thresholds must emit nothing when no alarm is active")
+		}
+	})
+
+	t.Run("invalid config clears prior alarm once and stays cleared", func(t *testing.T) {
+		m, rec, vb := newMon()
+		cfgValid := cfgWith(80, 70, false)
+		vb.set(coherentView(cfgValid, poolStatus("p1", 1, 1, 100, 95)))
+		m.evaluate() // raise
+		if len(m.ActiveAlarms()) != 1 {
+			t.Fatal("precondition: alarm should be raised")
+		}
+		rec.reset()
+
+		cfgInvalid := cfgWith(70, 80, false) // clear >= raise
+		vb.set(coherentView(cfgInvalid, poolStatus("p1", 1, 1, 100, 95)))
+		m.evaluate()
+		if len(m.ActiveAlarms()) != 0 {
+			t.Fatal("invalid thresholds must clear active alarms")
+		}
+		if got := countMatch(rec.snapshot(), clearedTag); got != 1 {
+			t.Fatalf("invalid thresholds should clear once, got %d", got)
+		}
+
+		rec.reset()
+		m.evaluate()
+		if len(m.ActiveAlarms()) != 0 {
+			t.Fatal("invalid thresholds must stay disabled")
+		}
+		if len(rec.snapshot()) != 0 {
+			t.Fatal("disabled state must not re-emit transitions")
+		}
+	})
 }
 
 // TestUnavailableHoldsAll: !Available (dp nil / helper down) HOLDs every alarm,
