@@ -1,5 +1,41 @@
 # Action Log
 
+## 2026-06-19 — #2053 redact all config secrets at JSON/YAML marshal time
+
+- **Timestamp**: 2026-06-19
+- **Action**: Close the live plaintext-secret leak on `GET /api/v1/config`
+  (`pkg/api/config.go` `configHandler` JSON-encodes the full compiled
+  `*config.Config`). Introduced a type-enforced `config.Secret` named-string
+  type (`pkg/config/secret.go`) with value-receiver `MarshalJSON` /
+  `MarshalYAML` → `<redacted>` (empty → ""), `Reveal()` for the
+  render/reconcile cleartext path, redacting `String()`, and a fail-closed
+  `UnmarshalJSON` that refuses the sentinel. Converted 16 secret-bearing
+  config fields to `config.Secret` (IKE/IPsec PSK, OSPF/RIP/IS-IS-area/
+  IS-IS-iface/VRRP `AuthKey`, BGP `AuthPassword`, WireGuard privkey, root/
+  login crypt hashes, REST `Password` + `APIKeys` `[]Secret`, SNMPv3 auth/
+  priv passwords, TSIG secret). SNMP community string handled specially
+  (it is the secret AND the `Communities` map key): kept `SNMPCommunity.Name`
+  a plain string and added targeted `SNMPCommunity.MarshalJSON` (redacts the
+  Name field) + `SNMPConfig.MarshalJSON`/`MarshalYAML` (renders Communities
+  as a sorted slice so the secret never leaks as a JSON map key). Fixed all
+  compiler producers (`Secret(...)` wraps) and render/reconcile consumers
+  (`.Reveal()` in `pkg/ipsec`, `pkg/frr`, `pkg/snmp`, `pkg/vrrp`,
+  `pkg/dataplane/userspace`, `pkg/daemon`). `show configuration` / text
+  show paths unchanged (out of scope). Verified the leak-regression test
+  FAILS against simulated pre-fix marshalling (all 16 secrets dumped in
+  plaintext) and PASSES after the fix.
+- **File(s)**: pkg/config/secret.go (new), pkg/config/secret_test.go (new),
+  pkg/api/config_secret_redaction_test.go (new), pkg/config/types_security.go,
+  pkg/config/types_routing.go, pkg/config/types_interfaces.go,
+  pkg/config/types_system.go, pkg/config/compiler.go,
+  pkg/config/compiler_interfaces.go, pkg/config/compiler_ipsec.go,
+  pkg/config/compiler_protocols.go, pkg/config/compiler_system.go,
+  pkg/config/compiler_services.go, pkg/ipsec/policy.go,
+  pkg/frr/policy_render.go, pkg/snmp/v3.go, pkg/vrrp/vrrp.go,
+  pkg/dataplane/userspace/screens.go, pkg/dataplane/userspace/tunnels.go,
+  pkg/daemon/daemon_run.go, pkg/daemon/daemon_system.go,
+  docs/config-schema.md, _Log.md
+
 ## 2026-06-19 — #2022 ipsec effectiveTrafficSelectors nil-deref guard
 
 - **Timestamp**: 2026-06-19

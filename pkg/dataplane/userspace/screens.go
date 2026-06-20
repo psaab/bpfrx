@@ -120,7 +120,7 @@ func synCookieSecretMaterial(cfg *config.Config) string {
 	// Use already cluster-synced secret material. Do not use
 	// system master-password: it is a PRF selector for configstore
 	// at-rest encryption, not a dataplane secret.
-	return cfg.System.RootAuthentication.EncryptedPassword
+	return cfg.System.RootAuthentication.EncryptedPassword.Reveal()
 }
 
 func userspaceSynCookieProtectionActive(cfg *config.Config) bool {

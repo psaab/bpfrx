@@ -173,12 +173,12 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, error) {
 	b.WriteString("secrets {\n")
 	for _, name := range sortedVPNNames(ipsecCfg.VPNs) {
 		vpn := ipsecCfg.VPNs[name]
-		secret := vpn.PSK
+		secret := vpn.PSK.Reveal()
 		// Resolve PSK from IKE policy chain: VPN -> gateway -> IKE policy -> PSK
 		if secret == "" {
 			if gw, ok := ipsecCfg.Gateways[vpn.Gateway]; ok {
 				if ikePol, ok := ipsecCfg.IKEPolicies[gw.IKEPolicy]; ok {
-					secret = ikePol.PSK
+					secret = ikePol.PSK.Reveal()
 				}
 			}
 		}

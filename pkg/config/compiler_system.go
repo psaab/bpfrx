@@ -96,7 +96,7 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 						for _, authChild := range prop.Children {
 							switch authChild.Name() {
 							case "encrypted-password":
-								user.EncryptedPassword = nodeVal(authChild)
+								user.EncryptedPassword = Secret(nodeVal(authChild))
 							case "ssh-ed25519", "ssh-rsa", "ssh-dsa":
 								if v := nodeVal(authChild); v != "" {
 									user.SSHKeys = append(user.SSHKeys, v)
@@ -135,7 +135,7 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 			for _, prop := range child.Children {
 				switch prop.Name() {
 				case "encrypted-password":
-					sys.RootAuthentication.EncryptedPassword = nodeVal(prop)
+					sys.RootAuthentication.EncryptedPassword = Secret(nodeVal(prop))
 				case "ssh-ed25519", "ssh-rsa", "ssh-dsa":
 					if v := nodeVal(prop); v != "" {
 						sys.RootAuthentication.SSHKeys = append(sys.RootAuthentication.SSHKeys, v)
@@ -360,12 +360,12 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 					if pwNode := inst.node.FindChild("password"); pwNode != nil {
 						auth.Users = append(auth.Users, &APIAuthUser{
 							Username: inst.name,
-							Password: nodeVal(pwNode),
+							Password: Secret(nodeVal(pwNode)),
 						})
 					}
 				}
 				for _, ch := range authNode.FindChildren("api-key") {
-					auth.APIKeys = append(auth.APIKeys, nodeVal(ch))
+					auth.APIKeys = append(auth.APIKeys, Secret(nodeVal(ch)))
 				}
 				sys.Services.WebManagement.APIAuth = auth
 			}
@@ -785,27 +785,27 @@ func compileSNMPv3(node *Node, snmp *SNMPConfig) {
 			case "authentication-md5":
 				user.AuthProtocol = "md5"
 				if pw := prop.FindChild("authentication-password"); pw != nil {
-					user.AuthPassword = nodeVal(pw)
+					user.AuthPassword = Secret(nodeVal(pw))
 				}
 			case "authentication-sha":
 				user.AuthProtocol = "sha"
 				if pw := prop.FindChild("authentication-password"); pw != nil {
-					user.AuthPassword = nodeVal(pw)
+					user.AuthPassword = Secret(nodeVal(pw))
 				}
 			case "authentication-sha256":
 				user.AuthProtocol = "sha256"
 				if pw := prop.FindChild("authentication-password"); pw != nil {
-					user.AuthPassword = nodeVal(pw)
+					user.AuthPassword = Secret(nodeVal(pw))
 				}
 			case "privacy-des":
 				user.PrivProtocol = "des"
 				if pw := prop.FindChild("privacy-password"); pw != nil {
-					user.PrivPassword = nodeVal(pw)
+					user.PrivPassword = Secret(nodeVal(pw))
 				}
 			case "privacy-aes128":
 				user.PrivProtocol = "aes128"
 				if pw := prop.FindChild("privacy-password"); pw != nil {
-					user.PrivPassword = nodeVal(pw)
+					user.PrivPassword = Secret(nodeVal(pw))
 				}
 			}
 		}
@@ -823,27 +823,27 @@ func parseSNMPv3UserKeys(keys []string, user *SNMPv3User) {
 	case "authentication-md5":
 		user.AuthProtocol = "md5"
 		if len(keys) >= 3 && keys[1] == "authentication-password" {
-			user.AuthPassword = keys[2]
+			user.AuthPassword = Secret(keys[2])
 		}
 	case "authentication-sha":
 		user.AuthProtocol = "sha"
 		if len(keys) >= 3 && keys[1] == "authentication-password" {
-			user.AuthPassword = keys[2]
+			user.AuthPassword = Secret(keys[2])
 		}
 	case "authentication-sha256":
 		user.AuthProtocol = "sha256"
 		if len(keys) >= 3 && keys[1] == "authentication-password" {
-			user.AuthPassword = keys[2]
+			user.AuthPassword = Secret(keys[2])
 		}
 	case "privacy-des":
 		user.PrivProtocol = "des"
 		if len(keys) >= 3 && keys[1] == "privacy-password" {
-			user.PrivPassword = keys[2]
+			user.PrivPassword = Secret(keys[2])
 		}
 	case "privacy-aes128":
 		user.PrivProtocol = "aes128"
 		if len(keys) >= 3 && keys[1] == "privacy-password" {
-			user.PrivPassword = keys[2]
+			user.PrivPassword = Secret(keys[2])
 		}
 	}
 }

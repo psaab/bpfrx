@@ -927,7 +927,7 @@ func ValidateConfig(cfg *Config) []string {
 			// (any value beginning with "!", e.g. "!$6$salt$hash"). A
 			// leading "!" means the account cannot password-login until it
 			// is unlocked, so it does not count (Codex #1944 r1 Low).
-			pw := u.EncryptedPassword
+			pw := u.EncryptedPassword.Reveal()
 			usablePassword := pw != "" && pw != "*" && !strings.HasPrefix(pw, "!")
 			if len(u.SSHKeys) == 0 && !usablePassword {
 				warnings = append(warnings, fmt.Sprintf(

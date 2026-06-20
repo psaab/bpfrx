@@ -304,7 +304,7 @@ func compileDHCPDynamicDNS(node *Node) *DHCPDynamicDNSConfig {
 	d.UpdateServer = props["update-server"]
 	d.TSIGKeyName = props["tsig-key"]
 	d.TSIGAlgorithm = props["tsig-algorithm"]
-	d.TSIGSecret = props["tsig-secret"]
+	d.TSIGSecret = Secret(props["tsig-secret"])
 	if v := props["ttl"]; v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			d.TTLSeconds = n

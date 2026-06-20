@@ -347,14 +347,72 @@ reserved for whole-dataplane selection where a rewrite shim
   constrain `update-server` (host[:port]) lands in increment 2, and a
   hostname / base64 secret is not validatable by the existing IP/identifier
   validators without false-rejecting valid input. `tsig-secret` is
-  SENSITIVE: it is redacted in `DHCPDynamicDNSConfig.String()` and must
-  never be logged. Compile lives in `compileDHCPDynamicDNS`
+  SENSITIVE: it is redacted in `DHCPDynamicDNSConfig.String()` (logging) AND,
+  since #2053, by its `config.Secret` field type on every JSON/YAML marshal
+  (so the compiled-config dump on `GET /api/v1/config` never leaks it — see
+  "Config secret redaction" below). Compile lives in `compileDHCPDynamicDNS`
   (`compiler_services.go`), handling both the hierarchical and flat-set AST
   shapes (walk + first-value-wins, mirroring `collectDeviceMapProps`); an
   empty/garbage block returns nil (positional/disabled, closing the
   empty-tree-compiles-non-nil trap). Regression coverage:
   `pkg/config/compiler_dhcp_ddns_test.go` (dual-AST equality, absent-default,
   TSIG redaction, enum/ttl accept+reject).
+
+### #2053 — Config secret redaction at JSON/YAML marshal time
+
+The compiled `*config.Config` carries every operator secret verbatim in
+memory (it must — the reconciler/render paths need the cleartext). The
+hazard is that a *marshaller* of that struct leaks it. There was a live
+leak: `GET /api/v1/config` (`pkg/api/config.go` `configHandler` →
+`writeOK(w, store.ActiveConfig())`) JSON-encodes the whole compiled config,
+so before #2053 it returned every secret in plaintext to any authorized
+REST client (loopback by default, but bindable non-loopback over HTTPS via
+`web-management https interface`). The per-struct `String()` redaction
+(logging hygiene) did NOT close this — `encoding/json` ignores `Stringer`.
+
+The fix is type-enforced, not by-convention. **`config.Secret`**
+(`pkg/config/secret.go`) is a named `string` type whose value-receiver
+`MarshalJSON` / `MarshalYAML` emit the sentinel `config.SecretRedacted`
+(`<redacted>`) for a non-empty value and `""` for empty (so unset stays
+distinguishable). `Reveal()` returns the cleartext for render/reconcile
+sites; `String()` redacts for `%v`/`%s`/slog; `UnmarshalJSON` accepts a
+plain string but REFUSES the sentinel (fail-closed if a compiled-config
+JSON ingest is ever added — none exists today, the SSOT is the `*ConfigTree`
+AST). Because the receiver is a value, redaction fires for a `Secret` struct
+field, in a `[]Secret` slice (`APIKeys`), and as a map value.
+
+**Converted fields (16):** `IKEPolicy.PSK`, `IPsecVPN.PSK`
+(`types_security.go`); `OSPFInterface.AuthKey`, `RIPConfig.AuthKey`,
+`ISISConfig.AuthKey`, `ISISInterface.AuthKey`, `BGPNeighbor.AuthPassword`,
+`TunnelConfig.WgLocalPrivkeyHex` (`types_routing.go`); `VRRPGroup.AuthKey`
+(`types_interfaces.go`); `RootAuthConfig.EncryptedPassword`,
+`LoginUser.EncryptedPassword`, `APIAuthUser.Password`, `APIAuthConfig.APIKeys`
+(`[]Secret`), `SNMPv3User.AuthPassword`, `SNMPv3User.PrivPassword`,
+`DHCPDynamicDNSConfig.TSIGSecret` (`types_system.go`).
+
+**SNMP community string** is a special case: it is the secret AND the
+`SNMPConfig.Communities` map key, so `SNMPCommunity.Name` stays a plain
+`string` (map lookup in `pkg/snmp` is by the on-wire community string) and
+redaction is done with targeted marshallers — `SNMPCommunity.MarshalJSON`
+redacts the `Name` field, and `SNMPConfig.MarshalJSON` renders the
+`Communities` map as a sorted slice so the secret never leaks as a JSON
+object key. Text `show snmp` / `show configuration` print the map key, not
+the marshalled struct, and are deliberately OUT OF SCOPE (operators read
+their own secrets — Junos parity; `show configuration` redaction is a
+separate concern).
+
+**Borderline fields left as plain string** (rulings): `MasterPassword`
+(commit-encryption PRF selector, not a user secret), `ArchiveSitesWithPassword`
+(URLs whose inline password was already discarded), `SSHKeys` /
+`LoginUser.SSHKeys` (public keys). **Round-trip is safe** — nothing
+unmarshals a compiled `*config.Config` (persistence/HA-sync ship the AST
+tree, not the compiled struct), so a redacting marshaller cannot starve any
+consumer. **Adding a new secret config field is one annotation:** type it
+`config.Secret` and call `.Reveal()` at the render site (the compiler finds
+every reader). Do NOT feed `Reveal()` output into a log line. Regression
+coverage: `pkg/config/secret_test.go` (marshal/unmarshal/slice/map/SNMP) and
+`pkg/api/config_secret_redaction_test.go` (the live `GET /api/v1/config`
+leak net + in-memory-cleartext-preserved render guard).
 
 ### #1979 — flow / flow-export NUM_WIDTH commit-time validation (Layer B)
 

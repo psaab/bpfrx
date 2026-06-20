@@ -1167,10 +1167,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 					APIKeys: make(map[string]bool),
 				}
 				for _, u := range wm.APIAuth.Users {
-					authCfg.Users[u.Username] = u.Password
+					authCfg.Users[u.Username] = u.Password.Reveal()
 				}
 				for _, k := range wm.APIAuth.APIKeys {
-					authCfg.APIKeys[k] = true
+					authCfg.APIKeys[k.Reveal()] = true
 				}
 				apiCfg.Auth = authCfg
 				slog.Info("HTTP API authentication enabled", "users", len(wm.APIAuth.Users), "api_keys", len(wm.APIAuth.APIKeys))

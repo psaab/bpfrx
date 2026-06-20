@@ -62,10 +62,10 @@ func (a *Agent) deriveV3Users(cfg *config.SNMPConfig) map[string]*usmUser {
 		u := &usmUser{name: cu.Name, authProto: cu.AuthProtocol, privProto: cu.PrivProtocol}
 		hashFn, hashLen := authHashFunc(cu.AuthProtocol)
 		if hashFn != nil && cu.AuthPassword != "" {
-			u.authKey = passwordToKey(cu.AuthPassword, a.engineID, hashFn, hashLen)
+			u.authKey = passwordToKey(cu.AuthPassword.Reveal(), a.engineID, hashFn, hashLen)
 		}
 		if hashFn != nil && cu.PrivPassword != "" {
-			u.privKey = passwordToKey(cu.PrivPassword, a.engineID, hashFn, hashLen)
+			u.privKey = passwordToKey(cu.PrivPassword.Reveal(), a.engineID, hashFn, hashLen)
 		}
 		users[cu.Name] = u
 	}

@@ -121,7 +121,7 @@ func buildTunnelEndpointSnapshots(cfg *config.Config, interfaces []InterfaceSnap
 		}
 		if isWireguard {
 			snap.WgListenPort = tunnel.WgListenPort
-			snap.WgLocalPrivkeyHex = tunnel.WgLocalPrivkeyHex
+			snap.WgLocalPrivkeyHex = tunnel.WgLocalPrivkeyHex.Reveal()
 			snap.WgPeerPubkeyHex = tunnel.WgPeerPubkeyHex
 			snap.WgAllowedIPs = tunnel.WgAllowedIPs
 			snap.WgEndpoint = tunnel.WgEndpoint
