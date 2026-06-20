@@ -321,6 +321,40 @@ reserved for whole-dataplane selection where a rewrite shim
     fails at commit; `allow-duplicates` is an explicit presence-only flag.
   Pure schema hardening — no runtime behavior change. Regression coverage:
   `pkg/config/schema_validate_2008_test.go`.
+- **#1387 (DHCP dynamic-DNS, increment 1):** added an opt-in
+  `dynamic-dns` subtree under BOTH `services dhcp-local-server` and
+  `services dhcpv6-local-server` (a single shared `config.DHCPDynamicDNSConfig`
+  on `DHCPServerConfig`; absent block == nil == today's behaviour). The
+  schema tree is built by `dhcpDynamicDNSSchema()` in `schema_system.go`
+  and shared by both parents (returned fresh per call so the two parents
+  do not alias a mutable map). Typed leaves, validated where the
+  reconciler/runtime consume them:
+  - `enable` — presence-only flag (turns the reconciler on).
+  - `ttl` — `ValueInteger` + `ValidateIntegerMin(1)` (record TTL seconds;
+    the runtime defaults an unset/<=0 value to 300 in `policyFromConfig`,
+    so the schema enforces only the positive floor).
+  - `hostname-source` — `ValueEnumOf` + `ValidateEnum(client-hostname |
+    fqdn | mac-fallback)`, matching `deriveFQDN`'s three modes.
+  - `conflict-policy` — `ValueEnumOf` + `ValidateEnum(replace-owned |
+    skip-existing | strict-fail)`.
+  - `backend` — `ValueEnumOf` + `ValidateEnum(rfc2136 | kea-d2)`. `kea-d2`
+    is a RESERVED enum value (the live backend is `rfc2136`, increment 2;
+    Kea D2 is not in the image). The enum accepts it so a config naming it
+    commits, but increment 1 implements only `rfc2136`.
+  Deliberately UNTYPED (free-form `args:1` leaves), with reasons in
+  `schema_system.go`: `domain`, `update-server`, `tsig-key`,
+  `tsig-algorithm`, `tsig-secret`. The live rfc2136 backend that would
+  constrain `update-server` (host[:port]) lands in increment 2, and a
+  hostname / base64 secret is not validatable by the existing IP/identifier
+  validators without false-rejecting valid input. `tsig-secret` is
+  SENSITIVE: it is redacted in `DHCPDynamicDNSConfig.String()` and must
+  never be logged. Compile lives in `compileDHCPDynamicDNS`
+  (`compiler_services.go`), handling both the hierarchical and flat-set AST
+  shapes (walk + first-value-wins, mirroring `collectDeviceMapProps`); an
+  empty/garbage block returns nil (positional/disabled, closing the
+  empty-tree-compiles-non-nil trap). Regression coverage:
+  `pkg/config/compiler_dhcp_ddns_test.go` (dual-AST equality, absent-default,
+  TSIG redaction, enum/ttl accept+reject).
 
 ### #1979 — flow / flow-export NUM_WIDTH commit-time validation (Layer B)
 

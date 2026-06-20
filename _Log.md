@@ -509,6 +509,31 @@
 - **Action**: Documented the single-owner + draining-tombstone shutdown
   contract and the Status "draining" state in the module README.
 - **File(s)**: pkg/ra/README.md, _Log.md
+## 2026-06-19 — #1387 DHCP dynamic-DNS (increment 1)
+
+- **Timestamp**: 2026-06-19
+- **Action**: Implement increment 1 of #1387 per
+  `docs/research/1387-dhcp-ddns/plan.md` (recommended Path C — pluggable
+  `DNSUpdater` backend, RFC 2136 first). Config model
+  (`config.DHCPDynamicDNSConfig`, nilable, default-off, dual-AST compile,
+  TSIG redaction) + typed schema leaves (enable/ttl/hostname-source/
+  conflict-policy/backend) + state-aware Kea lease parser
+  (state+expire+v6 DUID/IAID) + `DNSUpdater` interface + reconciler core
+  (build-desired/diff-owned/add-move-reassign-expire, retry-no-wedge) +
+  never-delete-non-owned ownership state store (JSON via
+  `fsatomic.WriteFileDurable`) + `DDNSManager.Stats()` counters. NO live
+  rfc2136 backend, NO HA wiring, NO Kea D2, NO daemon loop / show
+  plumbing / Prometheus emission (deferred to lab-/test-failover-gated
+  increments 2-4; the API collector is checked so an unemitted descriptor
+  would break the coverage canary). Net behaviour change with DDNS absent:
+  zero. 26 new tests (config dual-AST/redaction/schema; dhcpserver
+  hostname/PTR/parser/reconciler/state). Full `go test ./...` green.
+- **File(s)**: pkg/config/types_system.go, pkg/config/compiler_services.go,
+  pkg/config/schema_system.go, pkg/config/compiler_dhcp_ddns_test.go,
+  pkg/dhcpserver/ddns.go, pkg/dhcpserver/ddns_hostname.go,
+  pkg/dhcpserver/ddns_dns.go, pkg/dhcpserver/ddns_leases.go,
+  pkg/dhcpserver/ddns_state.go, pkg/dhcpserver/ddns_test.go,
+  pkg/dhcpserver/README.md, docs/config-schema.md, _Log.md
 
 ## 2026-06-19 — #2000 review follow-up on postinst test harness
 

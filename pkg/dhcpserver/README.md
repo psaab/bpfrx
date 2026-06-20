@@ -53,13 +53,71 @@ parses a torn file, no fsync on the apply path.
   `systemctl` seams + config paths, per the `pkg/dhcp/test_seams.go`
   convention.
 
+## Dynamic DNS (DDNS) — #1387, increment 1
+
+Opt-in publishing of forward (`A`/`AAAA`) and reverse (`PTR`) DNS records
+for active DHCP leases, with stale-record cleanup on expire / release /
+decline / reclaim / reassign. Default OFF — an absent `dynamic-dns` block
+is byte-for-byte today's behaviour. This is the FIRST increment of the
+multi-increment plan in `docs/research/1387-dhcp-ddns/plan.md`
+(recommended Path C: a pluggable `DNSUpdater` backend, RFC 2136 first).
+
+What increment 1 ships (the fully unit-testable, lab-free slice):
+
+- **Config model** — `config.DHCPDynamicDNSConfig` (a nilable field on
+  `DHCPServerConfig`), compiled from both AST shapes by
+  `compileDHCPDynamicDNS` (`pkg/config/compiler_services.go`), typed
+  schema leaves under `dhcp-local-server`/`dhcpv6-local-server`
+  (`pkg/config/schema_system.go`). TSIG secret is redacted in
+  `DHCPDynamicDNSConfig.String()`.
+- **State-aware lease parser** — `parseActiveLeases4/6` (`ddns_leases.go`)
+  honors Kea's `state` column (default/declined/expired-reclaimed) and the
+  `expire` epoch, and extracts the v6 DUID/IAID identity. SEPARATE from
+  the display-only `parseLeaseCSV` (reusing that would publish/retain
+  stale records — the exact bug this feature fixes).
+- **`DNSUpdater` interface** (`ddns_dns.go`) + the pure record/PTR-name
+  construction. PTR names are built from the TEXTUAL address (reversed
+  octets / nibbles), NOT the dataplane native-endian `__be32` convention.
+- **Reconciler core** — `DDNSManager.reconcileOnceLocked` (`ddns.go`):
+  build-desired / diff-owned / add-move-reassign-expire transitions,
+  cleaning the old owner before the new one, with bounded retry that never
+  wedges the loop.
+- **Ownership state store** — `ddns_state.go`, JSON via
+  `fsatomic.WriteFileDurable` (fsync-on-write; slow-path). This is the
+  PROTECTION BOUNDARY for never-delete-a-record-xpf-did-not-create:
+  `deleteOwnedLocked` re-derives the EXACT (name, type, address) from the
+  store and is the sole delete authority. A corrupt store fails OPEN
+  (reset to empty + log), never blocking commit/boot/DHCP serving.
+- **Counters** via `DDNSManager.Stats()` (the future `show ... dynamic-dns`
+  + Prometheus surface reads this).
+
+DELIBERATELY DEFERRED to later increments (see plan §12):
+
+- The LIVE rfc2136 `DNSUpdater` backend — lab-gated (needs a throwaway
+  authoritative BIND/Knot + TSIG; no such fixture exists in CI yet).
+- HA ownership coupling to the per-RG VRRP MASTER/BACKUP gate — must pass
+  `make test-failover`. The deterministic owner-id watermark
+  (`ownerWatermark`) is laid down now so the state store is
+  forward-compatible.
+- The Kea D2 backend (reserved `backend kea-d2` enum; D2 is not in the
+  image, `bake.py`).
+- The daemon reconcile loop + `show ... dynamic-dns` CLI/gRPC plumbing +
+  Prometheus emission. (The API collector is a CHECKED collector — a
+  declared descriptor MUST be emitted or the descriptor-coverage canary
+  fails — so counters live in `DDNSManager` until increment 2 wires a
+  value source on the server.)
+
+Net behaviour change for existing users in increment 1: zero.
+
 ## Callers
 
-`pkg/daemon`, `pkg/cli`, `pkg/grpcapi`.
+`pkg/daemon`, `pkg/cli`, `pkg/grpcapi`. (The `DDNSManager` reconcile loop
+is wired into `pkg/daemon` in increment 2; increment 1 is library-level.)
 
 ## Dependencies
 
-`pkg/config` only.
+`pkg/config` and `pkg/fsatomic` (the latter for the Kea config writes and
+the #1387 DDNS ownership state store).
 
 ## Gotchas
 
