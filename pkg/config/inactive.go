@@ -75,6 +75,24 @@ func (t *ConfigTree) WithoutInactive() *ConfigTree {
 	return &ConfigTree{Children: stripInactiveNodes(t.Children)}
 }
 
+// cloneForExpansion returns a deep, freely-mutable copy of t with inactive
+// subtrees pruned, doing exactly ONE deep copy. WithoutInactive already returns
+// a fresh clone when it prunes (reused here), so only the all-active path —
+// where WithoutInactive returns the receiver — needs an explicit Clone. The
+// result NEVER aliases t, so a caller that expands groups in place on it cannot
+// mutate the caller's tree (which must retain groups/apply-groups nodes for
+// `show configuration`). This avoids the double deep-copy of
+// t.WithoutInactive().Clone() on the has-inactive path.
+func (t *ConfigTree) cloneForExpansion() *ConfigTree {
+	if t == nil {
+		return nil
+	}
+	if stripped := t.WithoutInactive(); stripped != t {
+		return stripped // already a fresh prune-clone, safe to mutate in place
+	}
+	return t.Clone()
+}
+
 // stripInactiveNodes returns a deep copy of nodes with inactive subtrees
 // removed. Active container nodes are cloned and recursively pruned.
 func stripInactiveNodes(nodes []*Node) []*Node {
