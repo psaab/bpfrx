@@ -347,9 +347,9 @@ func TestParseLeaseCSV_QuotedHostname(t *testing.T) {
 	}
 }
 
-// indexLeasesByAddr collapses a lease slice to address→Lease and also
-// returns the count, so the #2085 tests can assert both presence and
-// that an address appears exactly once.
+// indexLeasesByAddr collapses a lease slice to an address→Lease map so
+// the #2085 tests can assert per-address presence and field values; the
+// expected lease count is asserted separately via len(leases).
 func indexLeasesByAddr(leases []Lease) map[string]Lease {
 	m := make(map[string]Lease, len(leases))
 	for _, l := range leases {
