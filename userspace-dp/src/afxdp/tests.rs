@@ -1607,6 +1607,124 @@ fn build_local_time_exceeded_v6_quotes_original_packet() {
     assert_eq!(out[quoted_ip_start + 7], 1);
 }
 
+// --- #2089 reject ICMP-unreachable builder tests ---
+
+fn reject_egress_forwarding(v4: Option<Ipv4Addr>, v6: Option<Ipv6Addr>) -> ForwardingState {
+    let mut forwarding = ForwardingState::default();
+    forwarding.egress.insert(
+        5,
+        EgressInterface {
+            bind_ifindex: 5,
+            vlan_id: 0,
+            mtu: 1500,
+            src_mac: [0x02, 0xbf, 0x72, 0x00, 0x61, 0x01],
+            zone_id: TEST_LAN_ZONE_ID,
+            redundancy_group: 1,
+            primary_v4: v4,
+            primary_v6: v6,
+        },
+    );
+    forwarding
+}
+
+/// Build an IPv4 UDP frame: [Eth][IP src=client dst=server proto=UDP][UDP].
+fn build_udp_frame_v4(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&[
+        0x00, 0x25, 0x90, 0x12, 0x34, 0x56, // dst mac (firewall)
+        0x02, 0x11, 0x22, 0x33, 0x44, 0x55, // src mac (client)
+        0x08, 0x00,
+    ]);
+    frame.extend_from_slice(&[0x45, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x40, 0x00, 64, PROTO_UDP, 0, 0]);
+    frame.extend_from_slice(&src.octets());
+    frame.extend_from_slice(&dst.octets());
+    frame.extend_from_slice(&[0xc0, 0x00, 0x00, 0x35, 0x00, 0x08, 0x00, 0x00]); // UDP hdr
+    frame
+}
+
+#[test]
+fn reject_icmp_unreachable_v4_is_type3_code13_admin_prohibited() {
+    let client_ip = Ipv4Addr::new(10, 0, 61, 102);
+    let dst_ip = Ipv4Addr::new(1, 1, 1, 1);
+    let frame = build_udp_frame_v4(client_ip, dst_ip);
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset: 34,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_UDP,
+        ..UserspaceDpMeta::default()
+    };
+    let forwarding = reject_egress_forwarding(Some(Ipv4Addr::new(10, 0, 61, 1)), None);
+    let out = build_reject_icmp_unreachable(&frame, meta, 5, &forwarding)
+        .expect("reject ICMP unreachable v4");
+    // MAC reflect: reply dst = inbound src (client).
+    assert_eq!(&out[0..6], &[0x02, 0x11, 0x22, 0x33, 0x44, 0x55]);
+    assert_eq!(&out[6..12], &[0x02, 0xbf, 0x72, 0x00, 0x61, 0x01]);
+    // IP: src = firewall ingress primary, dst = client.
+    assert_eq!(
+        Ipv4Addr::new(out[26], out[27], out[28], out[29]),
+        Ipv4Addr::new(10, 0, 61, 1)
+    );
+    assert_eq!(Ipv4Addr::new(out[30], out[31], out[32], out[33]), client_ip);
+    // ICMP type 3 (dest unreachable), code 13 (admin prohibited).
+    assert_eq!(out[34], 3);
+    assert_eq!(out[35], 13);
+}
+
+#[test]
+fn reject_icmp_unreachable_v6_is_type1_code1_admin_prohibited() {
+    let client_ip: Ipv6Addr = "2001:559:8585:ef00::102".parse().unwrap();
+    let dst_ip: Ipv6Addr = "2606:4700:4700::1111".parse().unwrap();
+    // Reuse the echo-frame helper (ICMPv6 echo request = a query, not an
+    // error) so the suppression guard does NOT fire: a rejected query
+    // gets an unreachable.
+    let frame = build_icmp_echo_frame_v6(client_ip, dst_ip, 64);
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset: 54,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_ICMPV6,
+        ..UserspaceDpMeta::default()
+    };
+    let forwarding =
+        reject_egress_forwarding(None, Some("2001:559:8585:ef00::1".parse().unwrap()));
+    let out = build_reject_icmp_unreachable(&frame, meta, 5, &forwarding)
+        .expect("reject ICMPv6 unreachable v6");
+    // ICMPv6 type 1 (dest unreachable), code 1 (admin prohibited).
+    assert_eq!(out[54], 1);
+    assert_eq!(out[55], 1);
+}
+
+#[test]
+fn reject_icmp_unreachable_suppressed_for_inbound_icmp_error() {
+    // An inbound ICMPv4 error (type 3) must NOT draw a reject reply.
+    let client_ip = Ipv4Addr::new(10, 0, 61, 102);
+    let dst_ip = Ipv4Addr::new(1, 1, 1, 1);
+    let mut frame = build_icmp_echo_frame_v4(client_ip, dst_ip, 64);
+    // Rewrite the ICMP type byte (at l4_offset = 34) to 3 (dest unreach).
+    frame[34] = 3;
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset: 34,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        ..UserspaceDpMeta::default()
+    };
+    let forwarding = reject_egress_forwarding(Some(Ipv4Addr::new(10, 0, 61, 1)), None);
+    assert!(
+        build_reject_icmp_unreachable(&frame, meta, 5, &forwarding).is_none(),
+        "must not reply to an inbound ICMP error"
+    );
+    // Direct guard checks.
+    assert!(reject_icmp_reply_suppressed(PROTO_ICMP, 3));
+    assert!(reject_icmp_reply_suppressed(PROTO_ICMP, 11));
+    assert!(!reject_icmp_reply_suppressed(PROTO_ICMP, 8)); // echo request: reply
+    assert!(reject_icmp_reply_suppressed(PROTO_ICMPV6, 1));
+    assert!(reject_icmp_reply_suppressed(PROTO_ICMPV6, 127));
+    assert!(!reject_icmp_reply_suppressed(PROTO_ICMPV6, 128)); // echo request: reply
+    assert!(!reject_icmp_reply_suppressed(PROTO_UDP, 0));
+}
+
 // --- ICMP error NAT reversal tests ---
 
 /// Build an IPv4 ICMP Time Exceeded frame with an embedded TCP packet.

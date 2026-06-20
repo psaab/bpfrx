@@ -10,6 +10,39 @@
   SYN-cookie TCP reply builder (frame/tcp.rs) and ICMP error builder
   (afxdp/icmp.rs) + the host-frame TX enqueue path (cookie_reply.rs).
 - **File(s)**: docs/pr/2089-reject-action/plan.md (new), _Log.md
+- **Action**: Plan v2 — folded two hostile plan reviews. Pinned reject
+  wire behavior to the legacy eBPF prior art (type 3/13 + type 1/1,
+  reply for UDP+ICMP-query+other, suppress inbound ICMP errors); chose
+  per-site inline enqueue over a shared deny terminal; fixed RST seq/ack
+  spec; expanded test matrix.
+- **File(s)**: docs/pr/2089-reject-action/plan.md
+- **Action**: Implement #2089 — `build_reject_rst_frame` (frame/tcp.rs)
+  + generalized ICMP error builders + `build_reject_icmp_unreachable` /
+  `reject_icmp_reply_suppressed` (afxdp/icmp.rs) +
+  `enqueue_policy_reject_reply` cold helper (new
+  poll_descriptor/reject_reply.rs) wired inline at both policy-deny
+  sites; flipped `PolicyAction::Reject` RT_FLOW mapping to
+  RT_FLOW_ACTION_REJECT; added `policy_reject_sent` /
+  `policy_reject_reply_budget_drops` counters end-to-end (BatchCounters
+  → BindingLiveState → snapshot → protocol status → Go). Unit tests for
+  RST v4/v6 (SYN vs ACK), ICMP unreachable v4/v6 codes + suppression
+  guard; TE byte-identity preserved by re-expressing TE over the
+  generalized builders. Regenerated protocol_wire_v1.json fixture (2
+  new fields). Rust + Go suites green (1 pre-existing
+  worker_queue concurrency flake, proven flaky on clean origin/master).
+- **File(s)**: userspace-dp/src/afxdp/frame/tcp.rs,
+  userspace-dp/src/afxdp/icmp.rs,
+  userspace-dp/src/afxdp/poll_descriptor/reject_reply.rs (new),
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/event_emit.rs, userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/frame/mod.rs,
+  userspace-dp/src/afxdp/umem/{mod,snapshot}.rs,
+  userspace-dp/src/afxdp/worker/mod.rs,
+  userspace-dp/src/afxdp/coordinator/refresh_bindings.rs,
+  userspace-dp/src/protocol/binding.rs,
+  userspace-dp/src/afxdp/{tests,frame/tcp_tests}.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  pkg/dataplane/userspace/protocol.go
 
 ## 2026-06-20 — #2062 ssh sshd_config.d drop-in lifecycle
 
