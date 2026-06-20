@@ -615,6 +615,40 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 						}
 					case "orlonger":
 						// orlonger = this prefix or any more specific (default le 32/128)
+					case "upto":
+						// upto /N = this prefix or any more specific, but no
+						// longer than /N. FRR renders this as a bare "le N":
+						// the implicit lower bound of a le clause is the
+						// prefix's own mask length, so "le N" matches the
+						// prefix itself plus every more-specific down to /N.
+						// This mirrors the orlonger case (bare "le max"), just
+						// capped at N.
+						//
+						// FRR requires len < le-value (and len < ge-value); a
+						// le/ge equal to or below the prefix length is REJECTED
+						// by FRR's prefix-list validator
+						// ("make sure: len < ge-value <= le-value") and an
+						// invalid line can fail the whole frr-reload. So:
+						//   - UptoLen == plen -> "" (exact: only the prefix)
+						//   - UptoLen >  plen -> "le N" (the normal case)
+						//   - else (UptoLen < plen, or 0/unset, or > max) ->
+						//     leave the orlonger-equivalent default; degrade-
+						//     safe, never an invalid line. (#2072)
+						parts := strings.SplitN(rf.Prefix, "/", 2)
+						if len(parts) == 2 {
+							if plen, err := strconv.Atoi(parts[1]); err == nil {
+								maxLen := 32
+								if strings.Contains(rf.Prefix, ":") {
+									maxLen = 128
+								}
+								switch {
+								case rf.UptoLen == plen:
+									matchStr = ""
+								case rf.UptoLen > plen && rf.UptoLen <= maxLen:
+									matchStr = fmt.Sprintf("le %d", rf.UptoLen)
+								}
+							}
+						}
 					}
 					if strings.Contains(rf.Prefix, ":") {
 						fmt.Fprintf(&b, "ipv6 prefix-list %s seq %d permit %s", plName, (i+1)*5, rf.Prefix)
