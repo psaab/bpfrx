@@ -1,7 +1,9 @@
 # #2075 — Reconcile NetFlow v9 / IPFIX exporters on config commit
 
-**Status:** v2 — both hostile reviewers PLAN-NEEDS-MINOR (no kill); all
-findings folded in below. Ready to implement.
+**Status:** IMPLEMENTED — both hostile plan reviewers PLAN-NEEDS-MINOR
+(no kill), all findings folded in (changelog below). Code shipped in
+`pkg/daemon/daemon_flowexport.go` + tests; full Go suite green, new
+tests 5/5 flake-clean + `-race` clean, apply-wiring mutation-verified.
 
 ### Review-fold changelog (v1 → v2)
 

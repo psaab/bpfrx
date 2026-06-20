@@ -27,6 +27,53 @@
   (new), pkg/api/README.md, pkg/grpcapi/README.md,
   docs/pr/2084-ping-traceroute-separator/plan.md (new)
 
+## 2026-06-20 — #2075 NetFlow v9 / IPFIX exporters never reconciled on commit
+
+- **Timestamp**: 2026-06-20
+- **Action**: Fixed #2075 (MEDIUM, audit-found, stored-but-never-enforced
+  observability config). The NetFlow v9 / IPFIX exporters
+  (`pkg/flowexport`) were started only at daemon boot and stopped only at
+  shutdown; the apply path (`daemon_apply.go`) had zero flowexport
+  references, so any commit changing `forwarding-options sampling`
+  (collector, source-address, 1-in-N rate, sampled zones) or a
+  `services flow-monitoring` export-extension was silently ignored until a
+  daemon restart — and flow export ADDED in a later commit never started.
+  Added `reconcileFlowExporters` (new `pkg/daemon/daemon_flowexport.go`),
+  called from `applyConfigLocked` (step 16b) and from the post-EventReader
+  boot block (replacing the old boot-only `startFlowExporter`/
+  `startIPFIXExporter`, which were deleted). Config-hash-gated PER FAMILY
+  so an unrelated commit never bounces a healthy exporter (preserving its
+  template-refresh cadence + 1-in-N sampling counter). The EventReader
+  callback list is append-only (clear-all only, no per-callback removal),
+  so a naive stop/start would leak a closure per commit; instead a single
+  stable indirection callback per family is registered exactly once
+  (`flowCBOnce`/`ipfixCBOnce`) and reads the live `(exporter, config)`
+  pair lock-free from an `atomic.Pointer` bundle that reconcile swaps
+  atomically. The daemon-held `*ExportConfig` is the sole 1-in-N counter
+  owner (the exporter never reads `sampleCounter`), so it is held by
+  pointer in the bundle.
+- **File(s)**: `pkg/daemon/daemon_flowexport.go` (new),
+  `pkg/daemon/daemon_flow.go` (deleted start funcs, hardened stop funcs),
+  `pkg/daemon/daemon.go` (bundle/hash/once/mutex fields),
+  `pkg/daemon/daemon_run.go` (boot call sites),
+  `pkg/daemon/daemon_apply.go` (step 16b),
+  `pkg/logging/ringbuf.go` (`CallbackCount` test accessor),
+  `pkg/daemon/daemon_flowexport_reconcile_test.go` (new, 8 tests incl. a
+  non-tautological apply-wiring guard that drives the REAL
+  `applyConfigLocked` and fails iff the reconcile call is removed —
+  mutation-verified, plus a create-failure retry test),
+  `pkg/flowexport/README.md` (lifecycle),
+  `docs/pr/2075-flowexport-reconcile/plan.md` (plan + folded plan reviews).
+  A hostile-code-review MINOR was folded: a transient `NewExporter`
+  failure now leaves the per-family hash UNSET so the next commit retries
+  (no permanently-dead exporter), instead of recording the hash.
+- **Validation**: full Go suite green; `pkg/daemon`/`pkg/logging`/
+  `pkg/flowexport` pass; new tests 5/5 flake-clean and `-race` clean;
+  mutation check confirms the apply-wiring test fails when the call is
+  deleted; `go vet` shows no NEW copylocks beyond the pre-existing
+  `NewExporter(*ec)` (count unchanged 2→2). Control-plane fix — no
+  dataplane smoke (no forwarding path touched).
+
 ## 2026-06-20 — #2070 interface-monitor carrier-state read (HIGH, failover-class)
 
 - **Timestamp**: 2026-06-20
