@@ -863,6 +863,47 @@ func (s *Store) DeleteFromInput(input string) error {
 	return s.Delete(path)
 }
 
+// DeactivateFromInput marks the candidate node at the given path inactive
+// (#2051), implementing the interactive Junos `deactivate <path>` verb. input
+// is the bare path WITHOUT the verb (mirroring SetFromInput/DeleteFromInput).
+//
+// It routes through applyEditLine — the same centralized verb switch used by
+// LoadSet / LoadMerge flat-line replay (store.go applyEditLine) — so the verb
+// logic lives in exactly one place. It deliberately does NOT go through
+// ParseSetCommand("set "+input): that parser would build the junk path
+// "deactivate <path>" (a config node literally named "deactivate"), never
+// reaching DeactivatePath. The node must already exist; DeactivatePath on an
+// already-inactive node is idempotent (it re-sets a bool).
+func (s *Store) DeactivateFromInput(input string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.candidate == nil {
+		return fmt.Errorf("not in configuration mode")
+	}
+	if err := applyEditLine(s.candidate, "deactivate "+input); err != nil {
+		return err
+	}
+	s.dirty = true
+	return nil
+}
+
+// ActivateFromInput clears the inactive marker on the candidate node at the
+// given path (#2051), implementing the interactive Junos `activate <path>`
+// verb. Symmetric with DeactivateFromInput; ActivatePath on an already-active
+// node is idempotent.
+func (s *Store) ActivateFromInput(input string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.candidate == nil {
+		return fmt.Errorf("not in configuration mode")
+	}
+	if err := applyEditLine(s.candidate, "activate "+input); err != nil {
+		return err
+	}
+	s.dirty = true
+	return nil
+}
+
 // Copy duplicates a config subtree from srcPath to dstPath.
 func (s *Store) Copy(srcPath, dstPath []string) error {
 	s.mu.Lock()
