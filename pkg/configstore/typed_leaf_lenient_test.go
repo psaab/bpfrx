@@ -370,3 +370,77 @@ func TestLoad_ToleratesStoredBareInterfaceAddress(t *testing.T) {
 		t.Fatalf("CommitCheck error should reference address: %v", err)
 	}
 }
+
+// #2105 — boot safety for the route-filter prefix CIDR validator. A
+// stored MALFORMED route-filter prefix (legal when persisted by a
+// pre-#2105 binary, before the keyValidator existed) must NOT fail
+// Store.Load — it must WARN-boot (lenient path) so the standby/upgraded
+// node keeps an active config, while the next STRICT operator commit
+// rejects it. The FRR renderer's belt-and-suspenders skip keeps the
+// stored garbage from reaching an FRR line meanwhile.
+func TestLoad_ToleratesStoredMalformedRouteFilterPrefix(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config")
+	writeStoredConfig(t, cfgPath,
+		"set policy-options policy-statement P term T from route-filter 10.0.0.0 exact")
+
+	s := newTestStoreAt(t, cfgPath)
+	if err := s.Load(); err != nil {
+		t.Fatalf("Load() must tolerate a stored malformed route-filter prefix, got: %v", err)
+	}
+	if s.ActiveConfig() == nil {
+		t.Fatal("ActiveConfig() is nil after tolerated Load")
+	}
+
+	// The next STRICT operator commit must still reject the stale value.
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	_, err := s.CommitCheck()
+	if err == nil {
+		t.Fatal("CommitCheck must stay strict after a tolerated Load, got nil")
+	}
+	if !strings.Contains(err.Error(), "route-filter") {
+		t.Fatalf("CommitCheck error should reference route-filter: %v", err)
+	}
+}
+
+// #2105 — HA config sync from a primary carrying a malformed
+// route-filter prefix must not alarm-loop the standby: SyncApply uses
+// the same lenient path as Load.
+func TestSyncApply_ToleratesMalformedRouteFilterPrefix(t *testing.T) {
+	s := newTestStoreAt(t, filepath.Join(t.TempDir(), "config"))
+	cfg, err := s.SyncApply(`policy-options {
+    policy-statement P {
+        term T {
+            from {
+                route-filter 10.0.0.0 exact;
+            }
+            then accept;
+        }
+    }
+}`, nil)
+	if err != nil {
+		t.Fatalf("SyncApply must tolerate a malformed route-filter prefix, got: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("SyncApply returned nil config on tolerated violation")
+	}
+}
+
+// #2105 — strict-path e2e: an operator committing a malformed
+// route-filter prefix is rejected at both CommitCheck and Commit.
+func TestCommitCheck_RejectsMalformedRouteFilterPrefix(t *testing.T) {
+	s := newTestStoreAt(t, filepath.Join(t.TempDir(), "config"))
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	if err := s.SetFromInput("policy-options policy-statement P term T from route-filter 10.0.0.0/99 exact"); err != nil {
+		t.Fatalf("SetFromInput: %v", err)
+	}
+	if _, err := s.CommitCheck(); err == nil {
+		t.Fatal("expected CommitCheck to reject an out-of-range route-filter mask, got nil")
+	}
+	if _, err := s.Commit(); err == nil {
+		t.Fatal("expected Commit to reject an out-of-range route-filter mask, got nil")
+	}
+}
