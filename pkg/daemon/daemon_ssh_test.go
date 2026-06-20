@@ -98,16 +98,28 @@ type sshdSeamRecorder struct {
 	writes  [][]byte // each WriteFileAtomic payload, in order
 	removed int      // number of successful Remove calls
 	reloads int      // number of reload attempts
+	writeN  int      // number of write attempts (including failed ones)
+
+	// readErr, when set, makes sshdReadFile return (nil, readErr) even though
+	// present is non-nil — models an existing-but-unreadable drop-in
+	// (permission/IO error). Distinct from present==nil (truly absent).
+	readErr error
 
 	// reloadErr, when set, makes the NEXT reload fail; reloads after the
 	// nth (failNthReload) succeed. failNthReload<=0 means every reload
 	// returns reloadErr.
 	reloadErr     error
 	failNthReload int
+
+	// writeErr, when set, makes the nth write (failNthWrite) fail; other
+	// writes succeed. failNthWrite<=0 means every write returns writeErr.
+	writeErr     error
+	failNthWrite int
 }
 
-// install swaps the package-level seam vars to route through the recorder and
-// returns a restore func (registered via t.Cleanup).
+// installSSHDSeam swaps the package-level seam vars to route through the
+// recorder and registers a t.Cleanup that restores the originals when the test
+// ends.
 func installSSHDSeam(t *testing.T, r *sshdSeamRecorder) {
 	t.Helper()
 	origPath := sshdConfPath
@@ -122,10 +134,19 @@ func installSSHDSeam(t *testing.T, r *sshdSeamRecorder) {
 		if r.present == nil {
 			return nil, os.ErrNotExist
 		}
+		// Existing file that cannot be read (permission/IO): present stays
+		// non-nil but the read surfaces a non-NotExist error.
+		if r.readErr != nil {
+			return nil, r.readErr
+		}
 		// Return a copy so callers cannot mutate the backing store.
 		return append([]byte(nil), r.present...), nil
 	}
 	sshdWriteFile = func(_ string, data []byte, _ os.FileMode, _ ...fsatomic.Option) error {
+		r.writeN++
+		if r.writeErr != nil && (r.failNthWrite <= 0 || r.writeN == r.failNthWrite) {
+			return r.writeErr
+		}
 		cp := append([]byte(nil), data...)
 		r.writes = append(r.writes, cp)
 		r.present = cp
@@ -316,6 +337,62 @@ func TestApplySSHConfig_NormalWrite(t *testing.T) {
 	}
 	if r.removed != 0 {
 		t.Errorf("unexpected Remove: %d", r.removed)
+	}
+}
+
+// TestApplySSHConfig_RemoveOnConfigRemovedUnreadablePrior verifies that an
+// existing-but-UNREADABLE drop-in is treated as present and removed when the
+// config is cleared (#2067 fold 1). Fails pre-fix: hadDropIn := priorErr == nil
+// treated the read error as "absent", so the content=="" path returned early
+// and left the stale drop-in enforcing old settings.
+func TestApplySSHConfig_RemoveOnConfigRemovedUnreadablePrior(t *testing.T) {
+	r := &sshdSeamRecorder{
+		present: []byte("# Managed by xpf\nPermitRootLogin no\n"),
+		readErr: os.ErrPermission, // exists, but cannot be read
+	}
+	installSSHDSeam(t, r)
+
+	d := &Daemon{}
+	d.applySSHConfig(sshConfig(nil)) // ssh stanza gone
+
+	if r.present != nil {
+		t.Fatalf("unreadable-but-present drop-in not removed on config removal: %q", r.present)
+	}
+	if r.removed != 1 {
+		t.Errorf("Remove called %d times, want 1", r.removed)
+	}
+	if r.reloads != 1 {
+		t.Errorf("reload called %d times, want 1", r.reloads)
+	}
+}
+
+// TestApplySSHConfig_RevertWriteFailureRemovesBadContent verifies the
+// fail-safe in fold 3: when the post-write reload fails AND restoring the prior
+// content also fails (the restore write errors), the bad just-written drop-in
+// is REMOVED rather than left on disk to break the next sshd restart. Fails
+// pre-fix: the restore failure was only logged, leaving the bad content.
+func TestApplySSHConfig_RevertWriteFailureRemovesBadContent(t *testing.T) {
+	priorContent := buildSSHDConfig(&config.SSHServiceConfig{RootLogin: "deny"})
+	r := &sshdSeamRecorder{
+		present:       []byte(priorContent),
+		reloadErr:     errors.New("sshd: bad configuration"),
+		failNthReload: 1, // post-write reload fails
+		writeErr:      errors.New("write failed"),
+		failNthWrite:  2, // first (new content) write OK; revert write (2nd) fails
+	}
+	installSSHDSeam(t, r)
+
+	d := &Daemon{}
+	d.applySSHConfig(sshConfig(&config.SSHServiceConfig{
+		RootLogin:   "deny",
+		KeyExchange: []string{"bogus-kex-algorithm"},
+	}))
+
+	if r.present != nil {
+		t.Fatalf("bad content left on disk after failed restore; want drop-in removed: %q", r.present)
+	}
+	if r.removed != 1 {
+		t.Errorf("Remove called %d times after failed restore, want 1", r.removed)
 	}
 }
 

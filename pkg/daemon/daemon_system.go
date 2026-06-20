@@ -905,10 +905,12 @@ var (
 // xpf-managed ssh settings, and REMOVED when there are none — including when
 // the whole ssh stanza is deleted (cfg.System.Services / .SSH == nil) — so
 // clearing the config reverts sshd to the base-image defaults instead of
-// leaving stale PermitRootLogin/KexAlgorithms enforced. If the reload fails
-// after a write, the drop-in is reverted to its prior content (or removed if
-// there was none) so a bad config never persists to break the next sshd
-// restart.
+// leaving stale PermitRootLogin/KexAlgorithms enforced — an existing drop-in
+// that cannot be read (permission/IO error) is still treated as present so it
+// gets removed. If the reload fails after a write, the drop-in is reverted to
+// its prior content (or removed if there was none, the prior was unreadable,
+// or the restore write itself fails) so a bad config never persists to break
+// the next sshd restart.
 func (d *Daemon) applySSHConfig(cfg *config.Config) {
 	var ssh *config.SSHServiceConfig
 	if cfg.System.Services != nil {
@@ -922,8 +924,17 @@ func (d *Daemon) applySSHConfig(cfg *config.Config) {
 
 	// Read the prior content once: needed both to skip no-op writes and to
 	// restore the file if a reload fails after we change it.
+	//
+	// Distinguish "absent" from "exists but unreadable": a permission/IO error
+	// reading an existing drop-in is NOT the same as no drop-in. Treating an
+	// unreadable-but-present file as absent would skip removal and leave a
+	// stale drop-in enforcing PermitRootLogin/KexAlgorithms after the config
+	// was cleared. hadDropIn = the file exists (read OK, or failed with
+	// something other than not-exist); priorReadable = we actually have its
+	// content (only then can we restore it on a reload failure).
 	prior, priorErr := sshdReadFile(sshdConfPath)
-	hadDropIn := priorErr == nil
+	priorReadable := priorErr == nil
+	hadDropIn := priorReadable || !os.IsNotExist(priorErr)
 
 	if content == "" {
 		// No xpf-managed ssh settings. Remove any existing drop-in and reload
@@ -944,11 +955,17 @@ func (d *Daemon) applySSHConfig(cfg *config.Config) {
 		return
 	}
 
-	if hadDropIn && string(prior) == content {
+	if priorReadable && string(prior) == content {
 		return // no change
 	}
 
-	sshdMkdirAll("/etc/ssh/sshd_config.d", 0755)
+	// Best-effort create the drop-in directory before writing. If this fails
+	// the write below will also fail, but the mkdir error is the real cause
+	// (e.g. a read-only /etc) so surface it rather than only the opaque write
+	// error.
+	if err := sshdMkdirAll("/etc/ssh/sshd_config.d", 0755); err != nil {
+		slog.Warn("failed to create sshd config drop-in directory", "err", err)
+	}
 	// AtomicGeneratedConfig (D2): regenerated each apply and reloaded
 	// immediately. A power-cut loss reverts PermitRootLogin to the base
 	// image default (prohibit-password) until the next boot apply — that
@@ -965,9 +982,18 @@ func (d *Daemon) applySSHConfig(cfg *config.Config) {
 	if out, err := sshdReloadCmd(); err != nil {
 		slog.Error("failed to reload sshd",
 			"err", err, "output", strings.TrimSpace(string(out)))
-		if hadDropIn {
+		// Revert. Only restore the prior content when we actually read it
+		// (priorReadable); an unreadable-but-present prior is unknown, so
+		// fail safe by removing the drop-in instead of restoring garbage.
+		if priorReadable {
 			if rerr := sshdWriteFile(sshdConfPath, prior, 0644); rerr != nil {
-				slog.Warn("failed to restore prior sshd config after reload failure", "err", rerr)
+				// Restoring the prior content failed too. No drop-in is safer
+				// than the known-bad content we just wrote (which would break
+				// the next sshd restart), so fall back to removing the file.
+				slog.Warn("failed to restore prior sshd config after reload failure; removing drop-in", "err", rerr)
+				if rmErr := sshdRemoveFile(sshdConfPath); rmErr != nil && !os.IsNotExist(rmErr) {
+					slog.Warn("failed to remove bad sshd config after failed restore", "err", rmErr)
+				}
 			}
 		} else {
 			if rerr := sshdRemoveFile(sshdConfPath); rerr != nil && !os.IsNotExist(rerr) {
