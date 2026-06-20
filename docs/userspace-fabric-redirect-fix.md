@@ -80,6 +80,31 @@ this flag:
 Each path skips the TTL decrement and TTL<=1 expiry check when the
 flag is set.
 
+**Segmentation TTL-gate symmetry follow-up (#2077):** the
+segmentation builders
+(`frame/tcp_segmentation.rs::segment_forwarded_tcp_frames_from_frame`
+and the local-owner fast-path twin
+`tx/tcp_segmentation.rs::segment_forwarded_tcp_frames_into_prepared`)
+honoured the fabric-ingress flag on the *decrement* but not on the
+IPv4 *expiry check*: the IPv4 arm dropped unconditionally on
+`packet[8] <= 1` while the IPv6 arm correctly gated the
+hop-limit==1 drop on `(meta.meta_flags & 0x80) == 0`. The result was
+v4/v6-asymmetric: a fabric-ingress oversized IPv4 TCP segment that
+legitimately arrived with TTL==1 (the peer already decremented it)
+was wrongly dropped, while the equivalent IPv6 segment was correctly
+forwarded. The fabric crossing is an internal cross-chassis redirect,
+not an IP hop, so neither the decrement nor the expiry drop applies.
+The fix gates the IPv4 expiry drop on `(meta.meta_flags & 0x80) == 0`
+in both segmentation copies, restoring symmetry with the IPv6 arm and
+with the canonical `build/ipv4.rs`, `frame/mod.rs`, and
+`rewrite/ipv4.rs` paths. Regression coverage lives in
+`frame/tests.rs::segment_forwarded_tcp_frames_keeps_fabric_ingress_low_ttl_both_families`
+(fabric-ingress TTL==1 must segment, not drop),
+`..._drops_non_fabric_low_ttl_both_families` (non-fabric TTL==1 still
+drops — TTL expiry preserved), and
+`..._decrements_non_fabric_healthy_ttl_both_families` (normal
+decrement path intact).
+
 ## Architecture: Fabric Redirect Flow (Fixed)
 
 ```
