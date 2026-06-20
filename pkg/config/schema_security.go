@@ -271,7 +271,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			"packet-filter": {desc: "Trace packet filter name", args: 1, placeholder: "<filter-name>", children: map[string]*schemaNode{
 				"source-prefix":      {desc: "Source prefix to trace", args: 1, placeholder: "<prefix>", children: nil},
 				"destination-prefix": {desc: "Destination prefix to trace", args: 1, placeholder: "<prefix>", children: nil},
-				"protocol":           {desc: "Protocol to trace (name or number)", args: 1, placeholder: "<tcp|udp|icmp|number>", children: nil},
+				"protocol":           {desc: "Protocol to trace (name or number)", args: 1, placeholder: "<tcp|udp|icmp|icmp6|number>", children: nil},
 			}},
 		}},
 	}},
