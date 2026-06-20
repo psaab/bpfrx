@@ -7,11 +7,21 @@ and resolves session display names from the dataplane's assigned `app_id`.
 ## Entry points
 
 - `CatalogNames(cfg *config.Config, includeAll bool) ([]string, error)` — `runtime.go`.
-  Returns the list of application names the BPF compiler must lower
-  into the policy `app_id` table. `includeAll=false` returns only
+  Returns the list of application names the compiler must lower
+  into the `app_id` catalog. `includeAll=false` returns only
   apps referenced by policies; `true` returns every defined app.
   Returns an error if application-set expansion fails — callers must
   handle it.
+- `BuildCatalog(cfg *config.Config) (Catalog, error)` — `catalog.go`.
+  Returns the ordered application catalog: `Entries` (each carrying
+  `AppID` + `(protocol, dst-port-range, src-port-range)` match rule)
+  plus `AppNames` (`app_id → name`). The id assignment is in
+  lock-step with `pkg/dataplane.compileApplications` (sorted-name
+  order, ids from 1), so an `app_id` stamped on a session by the
+  dataplane resolves through `ResolveSessionName` to the same name.
+  `pkg/dataplane/userspace` ships `Entries` to the Rust dataplane as
+  the snapshot `app_catalog` field (#2008 M5); the dataplane stamps
+  the matched `app_id` on each new session.
 - `ResolveSessionName(appNames map[uint16]string, cfg *config.Config, proto uint8, dstPort uint16, appID uint16) string` —
   `runtime.go`. Lookup order: dataplane `app_id` (authoritative from
   BPF) → exact `(proto, dstPort)` match → narrow built-in fallback
@@ -26,7 +36,8 @@ and resolves session display names from the dataplane's assigned `app_id`.
 
 ## Callers
 
-`pkg/cli`, `pkg/dataplane` (compilation), `pkg/grpcapi`, `pkg/daemon`.
+`pkg/cli`, `pkg/dataplane` (compilation), `pkg/dataplane/userspace`
+(catalog ship via `BuildCatalog`), `pkg/grpcapi`, `pkg/daemon`.
 
 ## Dependencies
 

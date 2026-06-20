@@ -41,6 +41,54 @@
   pkg/config/allow_dataplane_sleep_test.go, docs/feature-gaps.md,
   docs/config-schema.md
 
+## 2026-06-20 — #2008 Tier-2 M5: application-identification app_id end-to-end
+
+- **Timestamp**: 2026-06-20
+- **Action**: M5 — light up the inert AppID plumbing chain. Before this
+  change the Go control plane built the `AppNames` catalog and the show
+  path consumed `val.AppID`, but the userspace dataplane hardcoded
+  `app_id: 0` and the catalog was never shipped to Rust, so every session
+  resolved to a port guess or `UNKNOWN`. Added `pkg/appid.BuildCatalog`
+  (ordered `(proto, port-range) → app_id` catalog whose id assignment is in
+  lock-step with `compileApplications`' `AppNames`); shipped it as the new
+  `app_catalog` snapshot field (Go `AppCatalogEntrySnapshot` ↔ Rust
+  `AppCatalogEntry`, additive + `omitempty`/`serde(default)` for HA/upgrade
+  compat); compiled it on the Rust side into `ForwardingState.app_catalog`
+  (`AppCatalog` matcher in policy.rs); and stamped the resolved `app_id` at
+  the three live session-create sites in poll_descriptor by threading it
+  through `publish_bpf_conntrack_entry` → `publish_v4/v6_session`
+  (replacing the hardcoded 0). Both port slots are probed so forward +
+  reverse conntrack entries resolve to the same id.
+- **HA**: app_id is NOT on the session-sync wire and does not need to be —
+  HA-synced sessions are never mirrored into the BPF conntrack map (the
+  synced install path passes `None` ConntrackCtx, same as alg_type), and a
+  session re-created locally after failover is re-stamped from the catalog
+  (shipped to both nodes). Documented as re-derivable in
+  services-application-identification.md.
+- **Tests**: Go parity test asserting `BuildCatalog.AppNames` ==
+  `compileApplications`' `AppNames` (the make-or-break id↔name guard) +
+  port/proto-shape test; userspace snapshot ship + JSON round-trip +
+  omitempty-when-empty tests; Rust `AppCatalog::lookup` matcher tests
+  (mutation-verify the stamp regresses to 0 if lookup is dropped) +
+  `app_catalog` decode / old-snapshot-tolerance / entry round-trip tests;
+  regenerated `protocol_wire_v1.json`.
+- **File(s)**: pkg/appid/catalog.go (new), pkg/appid/README.md,
+  pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/builder.go,
+  pkg/dataplane/userspace/flow.go,
+  pkg/dataplane/appid_catalog_parity_test.go (new),
+  pkg/dataplane/userspace/app_catalog_test.go (new),
+  userspace-dp/src/protocol/security.rs,
+  userspace-dp/src/protocol/snapshot.rs, userspace-dp/src/policy.rs,
+  userspace-dp/src/policy_tests.rs, userspace-dp/src/protocol/tests.rs,
+  userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding_build/mod.rs,
+  userspace-dp/src/afxdp/bpf_map/mod.rs,
+  userspace-dp/src/afxdp/bpf_map/publish_conntrack.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  docs/feature-gaps.md, docs/services-application-identification.md
+
 ## 2026-06-20 — #2008 Increment-1 quick-wins batch 1
 
 - **Timestamp**: 2026-06-20
