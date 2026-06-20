@@ -56,6 +56,22 @@ under the daemon's errgroup. Nothing else imports this package.
   enqueue and completion paths; metric collection still reads from a single
   `Status()` snapshot per scrape rather than instrumenting the scrape path
   itself.
+- Per-queue park-reason counters
+  (`xpf_userspace_cos_root_token_starvation_parks_total`,
+  `xpf_userspace_cos_queue_token_starvation_parks_total`,
+  `xpf_userspace_cos_drain_park_root_tokens_total`,
+  `xpf_userspace_cos_drain_park_queue_tokens_total`) attribute *why* a CoS
+  queue stalled (#1642/#760, exported for #1359). A rising
+  `root_token_starvation_parks` delta on a best-effort / mouse queue while a
+  surplus-sharing borrower drains is the fingerprint of root-surplus
+  arbitration — the borrower is holding the shared root tokens — and pins a
+  surplus-sharing mouse-latency tail to *that* cause rather than this queue's
+  own per-queue cap (`queue_token_*`) or worker scheduling. The Rust helper
+  already carried these on the CoS snapshot; #1359 surfaced them to
+  Prometheus. The `root_token_starvation_parks` / `queue_token_starvation_parks`
+  pair is shaper-side; the `drain_park_root_tokens` / `drain_park_queue_tokens`
+  pair counts the per-batch drain-loop decision (see
+  `docs/cos-validation-notes.md`).
 - The SSE handler reads from `pkg/logging.EventBuffer`. The buffer is
   bounded; if a consumer stops reading, events are dropped silently — by
   design.

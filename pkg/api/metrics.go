@@ -119,6 +119,18 @@ type xpfCollector struct {
 	cosDrainGuaranteeSentBytes                    *prometheus.Desc
 	cosDrainSurplusSentBytes                      *prometheus.Desc
 	cosDrainNonExactSentBytesWhileExactBacklogged *prometheus.Desc
+	// #1359: per-queue drain-loop / shaper park-reason counters. The
+	// Rust helper already carries these on the CoS snapshot (protocol.go
+	// RootTokenStarvationParks / QueueTokenStarvationParks /
+	// DrainParkRootTokens / DrainParkQueueTokens) but they were never
+	// exported. Surfacing them lets an operator attribute a surplus-
+	// sharing mouse-latency tail to ROOT-surplus arbitration (a borrower
+	// holds the shared root tokens — *_root_*) versus per-queue token
+	// starvation (this queue's own bucket is empty — *_queue_*).
+	cosRootTokenStarvationParks  *prometheus.Desc
+	cosQueueTokenStarvationParks *prometheus.Desc
+	cosDrainParkRootTokens       *prometheus.Desc
+	cosDrainParkQueueTokens      *prometheus.Desc
 	// #1628: per-class waterfill-selector trace counters. Per-queue
 	// (admissions/visits) plus per-interface (epochs/breaks/min-epochs).
 	cosWaterfillPhase1Admissions   *prometheus.Desc
@@ -412,6 +424,10 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.cosDrainGuaranteeSentBytes
 	ch <- c.cosDrainSurplusSentBytes
 	ch <- c.cosDrainNonExactSentBytesWhileExactBacklogged
+	ch <- c.cosRootTokenStarvationParks
+	ch <- c.cosQueueTokenStarvationParks
+	ch <- c.cosDrainParkRootTokens
+	ch <- c.cosDrainParkQueueTokens
 	ch <- c.cosWaterfillPhase1Admissions
 	ch <- c.cosWaterfillPhase2Admissions
 	ch <- c.cosWaterfillEligibleVisits

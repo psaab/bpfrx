@@ -28,6 +28,7 @@ func (c *xpfCollector) collectUserspaceStatus(ch chan<- prometheus.Metric, dp ap
 	}
 	c.emitCoSOwnerProfile(ch, status)
 	c.emitCoSDrainPhaseTelemetry(ch, status)
+	c.emitCoSParkReasonTelemetry(ch, status)
 	c.emitCoSWaterfillTelemetry(ch, status)
 	c.emitCoSLeaseClaimFlow(ch, status)
 	c.emitCoSEqualFlowEnforcement(ch, status)
@@ -1272,6 +1273,50 @@ func (c *xpfCollector) emitCoSDrainPhaseTelemetry(ch chan<- prometheus.Metric, s
 				c.cosDrainNonExactSentBytesWhileExactBacklogged,
 				prometheus.CounterValue,
 				float64(queue.DrainNonExactSentBytesWhileExactBacklogged),
+				ifindexLabel, queueLabel,
+			)
+		}
+	}
+}
+
+// #1359: per-queue park-reason counters. The Rust helper already carries
+// these on the CoS snapshot (root_token_starvation_parks /
+// queue_token_starvation_parks at the shaper, drain_park_root_tokens /
+// drain_park_queue_tokens in the per-batch drain loop) but they were
+// never exported to Prometheus. They are the existing dataplane evidence
+// that ATTRIBUTES a surplus-sharing mouse-latency tail: a best-effort/
+// mouse queue parked on ROOT-token starvation while a surplus-sharing
+// borrower drains points at root-surplus arbitration, NOT this queue's
+// own per-queue cap or worker scheduling. Not gated on OwnerWorkerID:
+// the queue row is already owner-attributed, and a parked best-effort
+// queue is precisely the row an operator needs to see.
+func (c *xpfCollector) emitCoSParkReasonTelemetry(ch chan<- prometheus.Metric, status dpuserspace.ProcessStatus) {
+	for _, iface := range status.CoSInterfaces {
+		ifindexLabel := strconv.Itoa(iface.Ifindex)
+		for _, queue := range iface.Queues {
+			queueLabel := strconv.Itoa(queue.QueueID)
+			ch <- prometheus.MustNewConstMetric(
+				c.cosRootTokenStarvationParks,
+				prometheus.CounterValue,
+				float64(queue.RootTokenStarvationParks),
+				ifindexLabel, queueLabel,
+			)
+			ch <- prometheus.MustNewConstMetric(
+				c.cosQueueTokenStarvationParks,
+				prometheus.CounterValue,
+				float64(queue.QueueTokenStarvationParks),
+				ifindexLabel, queueLabel,
+			)
+			ch <- prometheus.MustNewConstMetric(
+				c.cosDrainParkRootTokens,
+				prometheus.CounterValue,
+				float64(queue.DrainParkRootTokens),
+				ifindexLabel, queueLabel,
+			)
+			ch <- prometheus.MustNewConstMetric(
+				c.cosDrainParkQueueTokens,
+				prometheus.CounterValue,
+				float64(queue.DrainParkQueueTokens),
 				ifindexLabel, queueLabel,
 			)
 		}

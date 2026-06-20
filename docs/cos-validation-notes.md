@@ -353,6 +353,50 @@ without reading them is how we ship dormant code.
   `xpf_userspace_cos_drain_nonexact_sent_bytes_while_exact_backlogged_total{...}`.
   Expected cardinality per the plan: ≤ 8192 series per histogram.
 
+## Reading the park-reason counters for surplus-sharing tail latency (#1359)
+
+The four per-queue park-reason counters carried on the CoS snapshot are
+also exported to Prometheus (#1359 surfaced them — they were previously
+wire-only). They attribute *why* a CoS queue stalled, which is the
+diagnostic acceptance item for the #1359 surplus-sharing mouse-latency
+investigation:
+
+- `xpf_userspace_cos_root_token_starvation_parks_total{ifindex, queue_id}`
+  — the queue was parked at the shaper because the **shared root** token
+  bucket was empty (someone else is holding the shared root rate).
+- `xpf_userspace_cos_queue_token_starvation_parks_total{ifindex, queue_id}`
+  — the queue was parked because its **own per-queue** token bucket was
+  empty (this queue is hitting its own rate cap — a *different* cause).
+- `xpf_userspace_cos_drain_park_root_tokens_total{...}` /
+  `xpf_userspace_cos_drain_park_queue_tokens_total{...}` — the per-batch
+  drain-loop equivalents (a finer-grained view of the same root-vs-queue
+  split, counted inside `drain_shaped_tx` rather than at the shaper).
+
+**How to read the surplus-sharing tail.** Under the reduced 100E100M
+matrix, strict-exact passes the p99.9 mouse gate (~7-8 ms) while
+surplus-sharing produces 29-51 ms tails. To attribute the tail, take a
+windowed delta (snapshot before/after the loaded cell, subtract) on the
+best-effort / mouse queue row:
+
+- A **rising `root_token_starvation_parks`** delta on the mouse queue
+  while a surplus-sharing borrower (the elephant) is draining is the
+  fingerprint of **root-surplus arbitration**: the borrower spent the
+  shared root tokens the mouse needed, so the mouse parked waiting for
+  the root bucket to refill. This is the leading #1359 hypothesis
+  (work-conservation borrows root rate → standing queue → mouse tail),
+  and these counters confirm or refute it without a code change.
+- A rising `queue_token_starvation_parks` with a *flat*
+  `root_token_starvation_parks` would instead point at the mouse hitting
+  its OWN cap — not a surplus side effect — and would refute the
+  borrow-starvation story.
+
+This is diagnostic telemetry only; it changes no scheduling decision.
+Pair it with `queued_bytes` (standing-queue residence) and the
+`drain_surplus_sent_bytes` borrow volume to separate root-surplus
+arbitration from CPU contention or timer-wheel wake delay. See the #1359
+research plan (`research/1359-surplus-sharing-mouse-latency`) for the
+full candidate-cause table.
+
 ## Reading the sojourn telemetry (#1829 Phase 1)
 
 Every shaped queue now measures per-packet **sojourn** — the time an
