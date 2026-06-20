@@ -27,6 +27,34 @@ The password directive takes a **pre-computed crypt(3) hash**, never
 plaintext — exactly like `root-authentication encrypted-password`. xpf
 does not hash plaintext for you.
 
+## Login class (RBAC) and commit-time validation (#2008 H6)
+
+```
+set system login user <name> class <class>
+```
+
+The `class` value is **enum-validated at commit** against the set of
+system-defined Junos login classes xpf supports. An unrecognized class
+(e.g. `superuser`, `admin`) is hard-rejected by the `#1319` typed-leaf
+gate, closing the previous commit-accepts-any-string hole. The accepted
+classes are:
+
+| Class | Permissions |
+|---|---|
+| `super-user` | everything |
+| `operator` | view, clear, control (request/test) |
+| `read-only` | view only |
+| `config-viewer` | view only (can display config; cannot enter `configure` to modify) |
+| `unauthorized` | nothing |
+
+RBAC is enforced at runtime by `checkPermission` (`pkg/cli/permissions.go`),
+invoked by the dispatch layer before each top-level command. The accepted
+enum is **derived from** `LoginClassPermissions`
+(`config.ValidLoginClasses()`), so the commit-time validator and the
+runtime RBAC table can never drift apart: adding a class in one place
+without the other is impossible. An empty/unset class keeps the legacy
+allow-everything behavior (no class configured = no RBAC restriction).
+
 ### Generating a hash
 
 ```

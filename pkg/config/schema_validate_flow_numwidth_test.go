@@ -107,6 +107,7 @@ func TestNumWidth_Tier2_SessionTimeouts(t *testing.T) {
 	// tcp-session presence flags still accepted (declared presence-only).
 	rangeAccept(t, "set security flow tcp-session no-syn-check")
 	rangeAccept(t, "set security flow tcp-session rst-invalidate-session")
+	rangeAccept(t, "set security flow tcp-session no-sequence-check") // #2008 M9
 
 	// udp-session / icmp-session timeout.
 	rangeAccept(t, "set security flow udp-session timeout 60")
@@ -259,7 +260,7 @@ func TestNumWidth_CompletionParity(t *testing.T) {
 	}
 	want(t, []string{"security", "flow", "tcp-session"},
 		"established-timeout", "initial-timeout", "closing-timeout", "time-wait-timeout",
-		"no-syn-check", "no-syn-check-in-tunnel", "rst-invalidate-session")
+		"no-syn-check", "no-syn-check-in-tunnel", "rst-invalidate-session", "no-sequence-check")
 	want(t, []string{"security", "flow", "udp-session"}, "timeout")
 	want(t, []string{"security", "flow", "icmp-session"}, "timeout")
 	want(t, []string{"forwarding-options", "sampling", "instance", "i1", "input"}, "rate")

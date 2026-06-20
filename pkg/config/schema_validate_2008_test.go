@@ -20,6 +20,8 @@ package config_test
 import (
 	"strings"
 	"testing"
+
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // --- H8: security log stream transport protocol -------------------------
@@ -384,5 +386,66 @@ func TestSchema2008_FlatSet_LogStreamTransport_RejectsBad(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "sctp") {
 		t.Fatalf("error should quote the bad protocol: %v", err)
+	}
+}
+
+// --- H6 residual: system login class enum validation -------------------
+//
+// RBAC is already enforced (pkg/cli/permissions.go); this closes the
+// commit-accepts-any-string hole by enum-validating the `class` value against
+// the system-defined Junos classes (derived from LoginClassPermissions).
+
+func TestSchema2008_LoginClass_RejectsBad(t *testing.T) {
+	err := schemaCheck(t, `system {
+    login {
+        user alice {
+            class superuser;
+        }
+    }
+}`)
+	if err == nil {
+		t.Fatal("expected error for login class superuser, got nil")
+	}
+	if !strings.Contains(err.Error(), "class") || !strings.Contains(err.Error(), "superuser") {
+		t.Fatalf("error should reference class + bad value: %v", err)
+	}
+}
+
+func TestSchema2008_LoginClass_AcceptsValid(t *testing.T) {
+	for _, class := range config.ValidLoginClasses() {
+		if err := schemaCheck(t, `system {
+    login {
+        user alice {
+            class `+class+`;
+        }
+    }
+}`); err != nil {
+			t.Fatalf("unexpected error for login class %q: %v", class, err)
+		}
+	}
+}
+
+// config-viewer must be accepted (it was missing entirely before #2008 H6 and
+// must also be backed by an RBAC entry so it does not fail at runtime).
+func TestSchema2008_LoginClass_ConfigViewerAccepted(t *testing.T) {
+	if err := flatSchemaCheck(t,
+		"set system login user viewer class config-viewer",
+	); err != nil {
+		t.Fatalf("config-viewer should be a valid login class: %v", err)
+	}
+	if _, ok := config.LoginClassPermissions["config-viewer"]; !ok {
+		t.Fatal("config-viewer must have an RBAC entry so checkPermission does not reject it as unknown")
+	}
+}
+
+func TestSchema2008_FlatSet_LoginClass_RejectsBad(t *testing.T) {
+	err := flatSchemaCheck(t,
+		"set system login user bob class admin",
+	)
+	if err == nil {
+		t.Fatal("expected error for flat-set login class admin, got nil")
+	}
+	if !strings.Contains(err.Error(), "admin") {
+		t.Fatalf("error should quote the bad class: %v", err)
 	}
 }

@@ -115,6 +115,15 @@ type TCPSessionConfig struct {
 	NoSynCheck           bool // allow mid-stream TCP session creation
 	NoSynCheckInTunnel   bool // allow mid-stream TCP for tunnel traffic only
 	RstInvalidateSession bool // immediately expire session on RST
+	// NoSequenceCheck disables TCP sequence-number validation for flow
+	// sessions (`set security flow tcp-session no-sequence-check`, #2008 M9).
+	// Typed-config only today, exactly like NoSynCheck / RstInvalidateSession:
+	// the userspace AF_XDP dataplane does not currently perform TCP
+	// sequence-number window validation, so there is nothing to skip yet. The
+	// field captures operator intent at commit (with schema validation +
+	// completion) and is the single seam a future sequence-checking dataplane
+	// would read.
+	NoSequenceCheck bool
 }
 
 // LogConfig holds logging/syslog configuration.

@@ -243,6 +243,7 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 			"no-syn-check":           {desc: "Disable SYN check for TCP sessions", children: nil},
 			"no-syn-check-in-tunnel": {desc: "Disable SYN check for tunneled TCP sessions", children: nil},
 			"rst-invalidate-session": {desc: "Invalidate session on TCP RST", children: nil},
+			"no-sequence-check":      {desc: "Disable TCP sequence-number checking for sessions", children: nil},
 		}},
 		"udp-session": {desc: "UDP session timeout (default 60 seconds)", children: map[string]*schemaNode{
 			"timeout": {desc: "UDP session timeout in seconds", args: 1, placeholder: "<seconds>",

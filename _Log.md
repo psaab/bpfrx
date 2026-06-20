@@ -1,5 +1,63 @@
 # Action Log
 
+## 2026-06-20 — #2008 Increment-1 quick-wins batch 1
+
+- **Timestamp**: 2026-06-20
+- **Action**: M4 — gate per-policy hit-counter collection on the
+  `security policy-stats system-wide enable` knob. The compiler
+  already set `cfg.Security.PolicyStatsEnabled`, but
+  `collectPolicyCounters` read the dataplane counters unconditionally. Added
+  an early return when the flag is false (Junos default), closing the
+  stored-but-unenforced divergence. Updated the existing metrics test config
+  to enable policy-stats (so it still exercises counter exposure) and added
+  `TestCollectPolicyCountersGatedOnPolicyStats` asserting zero counters when
+  disabled.
+- **File(s)**: pkg/api/metrics_counters.go, pkg/api/metrics_test.go,
+  docs/feature-gaps.md
+- **Timestamp**: 2026-06-20
+- **Action**: H14 — thread `security flow power-mode-disable` into the
+  dataplane. Mirrored the GREAcceleration plumbing end to end: Go
+  `FlowSnapshot.PowerModeDisable` (protocol.go) populated in buildFlowSnapshot
+  (flow.go), Rust `FlowSnapshot.power_mode_disable` (snapshot.rs) and
+  `ForwardingState.power_mode_disable` (forwarding.rs) assigned in
+  forwarding_build/mod.rs. Regenerated protocol_wire_v1.json (two
+  `power_mode_disable: false` additions only). Added Go thread-through test +
+  Rust `build_forwarding_state_carries_power_mode_disable` mutation-verify
+  test. Flag is carried for config truth/parity (single forwarding path; no
+  express/regular split to switch).
+- **File(s)**: pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/flow.go,
+  pkg/dataplane/userspace/flow_wire_coerce_test.go,
+  userspace-dp/src/protocol/snapshot.rs,
+  userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding_build/mod.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json, docs/feature-gaps.md
+- **Timestamp**: 2026-06-20
+- **Action**: M9 — add `security flow tcp-session no-sequence-check`. Added the
+  schema child, the TCPSessionConfig.NoSequenceCheck field, and the compiler
+  case, mirroring the no-syn-check / rst-invalidate-session presence flags.
+  Typed-config only (the userspace dataplane performs no TCP sequence
+  validation today, same as its siblings). Updated the schema completion-parity
+  + accept tests and added a dedicated compiler test
+  (TestCompileTCPSessionNoSequenceCheck).
+- **File(s)**: pkg/config/schema_security.go, pkg/config/types_security.go,
+  pkg/config/compiler_security.go,
+  pkg/config/compiler_tcp_session_seqcheck_test.go,
+  pkg/config/schema_validate_flow_numwidth_test.go, docs/config-schema.md,
+  docs/feature-gaps.md
+- **Timestamp**: 2026-06-20
+- **Action**: H6 residual — enum-validate the `system login user class` value.
+  RBAC was already enforced; closed the commit-accepts-any-string hole. Added
+  ValidateEnum on the `class` schema leaf (allowed set derived from
+  LoginClassPermissions via new config.ValidLoginClasses()), added a
+  `config-viewer` RBAC entry (PermView) so the schema enum and runtime RBAC
+  table can't drift, mirroring the SNMP authorization enum. Added accept/reject
+  + config-viewer + flat-set tests in schema_validate_2008_test.go and the
+  login-class section to docs/system-login.md.
+- **File(s)**: pkg/config/schema_system.go, pkg/config/types_system.go,
+  pkg/config/schema_validate_2008_test.go, docs/system-login.md,
+  docs/feature-gaps.md
 ## 2026-06-20 — #2008 Increment-1 quick-wins BATCH 2 (M8 traceoptions packet-filter protocol, H5 ssh key-exchange)
 
 - **Timestamp**: 2026-06-20

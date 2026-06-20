@@ -549,3 +549,42 @@ evidence, not as active eBPF source-removal blockers.
 - Consider using `openconfig/gnmic` or `netopeer2` for NETCONF server
 - Map to existing gRPC RPCs for config get/set
 - YANG models can be generated from existing config types
+
+---
+
+## #2008 vSRX config-parity closures (Increment 1, batch 1)
+
+Quick-win gaps from the `#2008` parity audit (stored-but-unenforced / schema
+drift) closed in `fix/2008-quickwins-batch1`:
+
+- **M4 `security policy-stats system-wide`** — DONE. Per-policy hit
+  counter collection (`collectPolicyCounters` in `pkg/api/metrics_counters.go`)
+  is now gated on `cfg.Security.PolicyStatsEnabled`. Previously the flag
+  compiled into typed state but counters were always collected; Junos only
+  maintains per-policy stats when the knob is enabled (default off).
+- **H14 `security flow power-mode-disable`** — DONE (threaded). The parsed
+  `cfg.Security.Flow.PowerModeDisable` now reaches the dataplane via
+  `FlowSnapshot.PowerModeDisable` (`pkg/dataplane/userspace/protocol.go` +
+  `buildFlowSnapshot`) and the Rust `FlowSnapshot`/`ForwardingState`
+  (`power_mode_disable`, mirroring `gre_acceleration`). vSRX power-mode is an
+  express datapath; the userspace dataplane has a single forwarding path, so
+  the flag is carried for config truth/parity and does not currently switch
+  packet behavior (there is no express/regular split to select between).
+- **M9 `security flow tcp-session no-sequence-check`** — DONE (typed). Added
+  the schema child (`pkg/config/schema_security.go`), the
+  `TCPSessionConfig.NoSequenceCheck` field (`pkg/config/types_security.go`),
+  and the compiler case (`pkg/config/compiler_security.go`), at full parity
+  with the existing `no-syn-check` / `rst-invalidate-session` presence flags.
+  Like those siblings it is typed-config only: the userspace AF_XDP dataplane
+  performs no TCP sequence-number window validation today, so there is nothing
+  to skip. The field gives commit-time validation + completion and is the seam
+  a future sequence-checking dataplane would read.
+- **H6 residual — `system login user <name> class` enum validation** — DONE.
+  RBAC was already enforced (`pkg/cli/permissions.go`); the remaining hole was
+  that the `class` leaf accepted any string at commit and `config-viewer` was
+  missing. Added `ValidateEnum` on the `class` schema leaf
+  (`pkg/config/schema_system.go`) with the allowed set derived from
+  `LoginClassPermissions` (`config.ValidLoginClasses()`), and added a
+  `config-viewer` RBAC entry (PermView) so the schema enum and the runtime RBAC
+  table cannot drift. Mirrors the SNMP `authorization` enum leaf. See
+  `docs/system-login.md`.

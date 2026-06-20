@@ -70,6 +70,13 @@ pub(in crate::afxdp) struct ForwardingState {
     pub(in crate::afxdp) tx_selection_enabled_v6: bool,
     #[allow(dead_code)]
     pub(in crate::afxdp) gre_acceleration: bool,
+    /// `security flow power-mode-disable` (#2008 H14). vSRX power-mode is an
+    /// express datapath; this flag forces the regular flow path when set. The
+    /// userspace dataplane has a single forwarding path, so the flag is held
+    /// for config truth/parity and does not currently switch behavior (there
+    /// is no express/regular split to select between).
+    #[allow(dead_code)]
+    pub(in crate::afxdp) power_mode_disable: bool,
     pub(in crate::afxdp) flow_export_config: Option<crate::flowexport::FlowExportConfig>,
     pub(in crate::afxdp) mirror_configs: FastMap<i32, MirrorRuntimeConfig>,
     pub(in crate::afxdp) tcp_mss_all_tcp: u16,
