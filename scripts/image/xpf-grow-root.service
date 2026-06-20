@@ -1,0 +1,52 @@
+# xpf root-partition auto-grow (#1925 Item 1, Path A).
+#
+# First-boot-only one-shot: grow the root partition + ext4 filesystem to
+# fill an operator-resized disk, then stamp /etc/xpf/.root-grown so it
+# never runs again. Restores the cloud-init growpart/resizefs behavior
+# the bake purged. Uses growpart + resize2fs (already in the image) — NOT
+# systemd-repart — so it CANNOT create/reformat/shrink/move a partition.
+#
+# Safety (see the wrapper header + #1925 §6.3): the root partition is the
+# physically LAST partition; growing it into trailing free space cannot
+# touch the ESP (which holds the #1930 A/B kernel slots + selectors), the
+# BIOS-boot/`/boot` partitions, or any partition number.
+[Unit]
+Description=xpf grow root partition + filesystem to fill the provisioned disk (#1925)
+Documentation=https://github.com/psaab/xpf/blob/master/docs/install-images.md
+# Run early, before the filesystem targets settle and well before xpfd /
+# the day-0 loader, so /var is full-size before xpf stages the runtime
+# (#1964 versions/) or writes the config DB. DefaultDependencies=no keeps
+# this out of the normal basic.target ordering so it can run before
+# local-fs.target; the explicit After/Before below order it precisely.
+DefaultDependencies=no
+Conflicts=shutdown.target
+Before=shutdown.target
+# systemd-remount-fs remounts / read-write; resize2fs runs on the mounted
+# root, so it must follow the rw remount.
+After=systemd-remount-fs.service
+Before=local-fs.target xpfd.service xpf-day0-config.service
+# First-boot-only: the seal does NOT create this stamp (it only removes
+# /etc/xpf state), so the grow fires on the operator's first boot and the
+# unit's ExecStartPost writes the stamp on success.
+ConditionPathExists=!/etc/xpf/.root-grown
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Bounded: a partition-end edit + online ext4 resize of empty trailing
+# space is sub-second to a few seconds; this backstops a pathological
+# hang so a stuck grow never wedges the boot.
+TimeoutStartSec=120
+# /etc/xpf must exist before ExecStartPost touches the stamp into it (the
+# bake creates it, but make the unit self-contained for foreign hosts).
+ExecStartPre=/bin/mkdir -p /etc/xpf
+ExecStart=/usr/local/sbin/xpf-grow-root
+# Stamp ONLY on a clean ExecStart exit — a failed/timed-out grow leaves
+# the stamp absent so a later boot retries.
+ExecStartPost=/bin/touch /etc/xpf/.root-grown
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=xpf-grow-root
+
+[Install]
+WantedBy=sysinit.target
