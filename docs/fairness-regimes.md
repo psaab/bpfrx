@@ -652,6 +652,45 @@ root surplus arbitration or dataplane queue residence. The per-rep
 `cos-interface-post.txt` snapshots preserve the CoS queue counters needed
 for that cross-check.
 
+#### Env-shape consistency guard (#1365)
+
+`SHAPER_BPS` MUST move with `ELEPHANT_PORT`: the cwnd-settle gate
+requires the elephant aggregate to reach `0.7 * SHAPER_BPS`, but the
+forwarding class implied by `ELEPHANT_PORT` (per
+`test/incus/cos-iperf-config.set`) can only ever deliver up to its
+configured cap — the scheduler `transmit-rate` for `exact` classes, or
+the interface `shaping-rate` for the non-exact best-effort / uncapped
+classes. When the settle floor exceeds that cap the gate is
+*arithmetically unsatisfiable*: every loaded rep INVALIDates with
+`cwnd-not-settled` before the mouse probe ever starts, regardless of
+dataplane or scheduler health. That is the #1365 footgun — the matrix
+was run with `ELEPHANT_PORT=5202` (the 1 Gbps `iperf-1g` exact class)
+paired with `SHAPER_BPS=10000000000`, so the 7 Gbps floor could never
+be met against a 1 Gbps cap and the cell reported `INSUFFICIENT-DATA`.
+
+`test-mouse-latency.sh` now runs a static consistency guard before each
+rep:
+`mouse_latency_orchestrate.py check-env-consistency <port> <shaper_bps>`.
+It parses the applied CoS fixture as its single source of truth (so the
+table cannot drift from the fixture) and `ABORT`s with an actionable
+message — naming the class, its cap, the computed floor, and a hint to
+either set `SHAPER_BPS` to the class cap or pick a port whose class cap
+is `>= floor` — instead of burning a whole matrix cell on an impossible
+pairing. A classified port whose forwarding-class has no scheduler-map
+entry is treated as a hard fixture error (not silently defaulted to the
+interface shaper), keeping the table honest. The floor is computed with
+ceiling rounding (`ceil(0.7 * SHAPER_BPS)`) so the guard never
+under-reports it: the real gate compares the aggregate against the float
+threshold `0.7 * SHAPER_BPS`, and a borderline pairing whose threshold
+sits just above the integer cap is correctly rejected rather than passed
+by truncation. To exercise a genuinely high-rate class, point at a high-rate
+port with the matching bps, e.g. `ELEPHANT_PORT=5205 SHAPER_BPS=9000000000`
+(the 9 Gbps `iperf-9g` exact class). The guard is purely static (no
+cluster contact) and is covered by `mouse_latency_orchestrate_test.py`
+(`parse_cos_class_caps` / `check_settle_threshold_satisfiable`),
+including a drift guard that cross-checks the parsed table against the
+canonical port→rate map.
+
 ```bash
 MOUSE_COS_SURPLUS_SHARING=1 \
 MOUSE_LATENCY_CELLS=$'0 100\n100 100' \
