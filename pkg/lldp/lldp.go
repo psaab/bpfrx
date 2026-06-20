@@ -359,6 +359,12 @@ func (m *Manager) rxLoop(ctx context.Context, sess *ifSession) {
 	for {
 		n, err := sess.recv(buf)
 		if err != nil {
+			// EINTR can be delivered to a goroutine in rare cases (e.g. from a
+			// signal forwarded through the Go runtime before it can be masked).
+			// Retry rather than silently terminating neighbor discovery.
+			if err == unix.EINTR {
+				continue
+			}
 			// recv was unblocked. If the context is cancelled, this is the
 			// expected close-to-unblock on Stop(); return. Otherwise it is an
 			// unexpected socket error (e.g. interface gone) — also return, since

@@ -10,12 +10,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// newSocketpairSession builds an ifSession whose rxFD is one end of a
-// socketpair(2) and whose txFD is the other end. A parked unix.Recvfrom on rxFD
-// blocks until a byte is written to peerFD or rxFD is closed, so it faithfully
-// reproduces the AF_PACKET RX socket's blocking behaviour without CAP_NET_RAW or
-// a real interface. peerFD lets a test feed a frame to recv or just sit idle to
-// keep recv parked. The caller owns peerFD and must close it.
+// newSocketpairSession builds an ifSession whose rxFD and txFD are both set
+// to one end of a socketpair(2) (fds[0]). A parked unix.Recvfrom on rxFD
+// blocks until bytes are written to peerFD (fds[1]) or rxFD is closed, so it
+// faithfully reproduces the AF_PACKET RX socket's blocking behaviour without
+// CAP_NET_RAW or a real interface. peerFD lets a test feed a frame to recv or
+// just sit idle to keep recv parked. The caller owns peerFD and must close it.
 func newSocketpairSession(t *testing.T, iface *net.Interface) (sess *ifSession, peerFD int) {
 	t.Helper()
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
@@ -34,15 +34,18 @@ func TestSessionRecvUnblocksOnClose(t *testing.T) {
 	sess, peerFD := newSocketpairSession(t, &net.Interface{Name: "test0", Index: 1})
 	defer unix.Close(peerFD)
 
+	started := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
 		buf := make([]byte, 64)
-		_, _ = sess.recv(buf) // blocks until close() reclaims the fd
+		close(started)               // signal: about to enter recv
+		_, _ = sess.recv(buf)        // blocks until close() unblocks the fd
 		close(done)
 	}()
 
-	// Let the goroutine actually park in Recvfrom.
-	time.Sleep(20 * time.Millisecond)
+	// Wait until the goroutine has signalled it is about to call recv, then
+	// verify it has not returned yet (it should be blocked on the empty socket).
+	<-started
 	select {
 	case <-done:
 		t.Fatal("recv returned before close() — it should block while no data and fd open")
@@ -107,8 +110,35 @@ func TestStopUnblocksParkedRX(t *testing.T) {
 	}
 	m.Apply(context.Background(), cfg)
 
-	// Give the RX goroutine time to park in recv.
-	time.Sleep(30 * time.Millisecond)
+	// Inject a valid LLDP frame on each peer fd so rxLoop processes it and
+	// then parks in recv again — this proves the goroutine has actually entered
+	// the recv syscall at least once before Stop() is called, making the
+	// timing assertion meaningful.  A bare sleep cannot guarantee this.
+	frame, frameErr := BuildFrame(lo.HardwareAddr, lo.Name, 120, "test-node", "")
+	if frameErr != nil {
+		t.Fatalf("BuildFrame: %v", frameErr)
+	}
+	mu.Lock()
+	peers := make([]int, len(peerFDs))
+	copy(peers, peerFDs)
+	mu.Unlock()
+	for _, fd := range peers {
+		if _, err := unix.Write(fd, frame); err != nil {
+			t.Fatalf("write LLDP frame to peer fd: %v", err)
+		}
+	}
+	// Poll until rxLoop has processed the frame (proves recv ran at least once).
+	const pollLimit = 500 * time.Millisecond
+	pollDeadline := time.Now().Add(pollLimit)
+	for time.Now().Before(pollDeadline) {
+		if len(m.Neighbors()) > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if len(m.Neighbors()) == 0 {
+		t.Fatalf("rxLoop did not process the injected LLDP frame within %v", pollLimit)
+	}
 
 	start := time.Now()
 	doneCh := make(chan struct{})
